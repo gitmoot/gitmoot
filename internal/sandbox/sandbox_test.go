@@ -80,6 +80,108 @@ func TestSandboxExecKernelE2E(t *testing.T) {
 	}
 }
 
+func TestSandboxExecReadOnlyWorkdirE2E(t *testing.T) {
+	requireLandlockABI(t)
+	gitmoot := buildGitmootBinary(t)
+	base := t.TempDir()
+	workdir := filepath.Join(base, "review-worktree")
+	cacheDir := filepath.Join(base, "review-cache")
+	gitMetadataDir := filepath.Join(base, "linked-gitdir")
+	outsideDir := filepath.Join(base, "outside")
+	for _, dir := range []string{workdir, cacheDir, filepath.Join(cacheDir, "tmp"), gitMetadataDir, outsideDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cleanupProbeDir := filepath.Join(cacheDir, "go-mod", ".cleanup-probe")
+	// The go command installs downloaded toolchains as read-only modules. Make
+	// their directories removable before testing.TempDir cleans the sandbox.
+	t.Cleanup(func() {
+		err := filepath.Walk(cacheDir, func(path string, info os.FileInfo, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if info.IsDir() {
+				return os.Chmod(path, 0o700)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Errorf("make sandbox tool cache removable: %v", err)
+			return
+		}
+		if info, statErr := os.Stat(cleanupProbeDir); statErr == nil {
+			if info.Mode().Perm()&0o200 == 0 {
+				t.Errorf("sandbox tool cache cleanup left probe directory read-only: %v", info.Mode().Perm())
+			}
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			t.Errorf("inspect sandbox tool cache cleanup probe: %v", statErr)
+		}
+	})
+	source := filepath.Join(workdir, "source.txt")
+	if err := os.WriteFile(source, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	metadataFile := filepath.Join(gitMetadataDir, "index")
+	if err := os.WriteFile(metadataFile, []byte("metadata-unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outsideFile := filepath.Join(outsideDir, "credential")
+	if err := os.WriteFile(outsideFile, []byte("must-stay-hidden"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workdir, "go.mod"), []byte("module reviewtest\n\ngo 1.22\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workdir, "review_test.go"), []byte("package reviewtest\n\nimport \"testing\"\n\nfunc TestReviewerCanRunTests(t *testing.T) {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cacheArtifact := filepath.Join(cacheDir, "test-result")
+	script := `set -eu
+go test -count=1 .
+printf passed > "$1"
+if { printf mutated > "$2"; } 2>/dev/null; then exit 41; fi
+if { printf metadata-mutated > "$3"; } 2>/dev/null; then exit 42; fi
+if cat "$4" >/dev/null 2>&1; then exit 43; fi
+`
+	command := exec.Command(gitmoot, "sandbox-exec", "--read-only-workdir", "--read", workdir, "--read", gitMetadataDir, "--write", cacheDir, "--", "/bin/sh", "-c", script, "gitmoot-test", cacheArtifact, source, metadataFile, outsideFile)
+	command.Dir = workdir
+	command.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + filepath.Join(cacheDir, "home"),
+		"GOTOOLCHAIN=go1.26.0",
+		"GOFLAGS=" + os.Getenv("GOFLAGS"),
+		"GOCACHE=" + filepath.Join(cacheDir, "go-build"),
+		"GOMODCACHE=" + filepath.Join(cacheDir, "go-mod"),
+		"GOPATH=" + filepath.Join(cacheDir, "gopath"),
+		"TMPDIR=" + filepath.Join(cacheDir, "tmp"),
+	}
+	if combined, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("executable read-only review sandbox failed: %v\n%s", err, combined)
+	}
+	if data, err := os.ReadFile(cacheArtifact); err != nil || string(data) != "passed" {
+		t.Fatalf("cache artifact = %q, err=%v", data, err)
+	}
+	if data, err := os.ReadFile(source); err != nil || string(data) != "unchanged" {
+		t.Fatalf("review worktree changed to %q, err=%v", data, err)
+	}
+	if data, err := os.ReadFile(metadataFile); err != nil || string(data) != "metadata-unchanged" {
+		t.Fatalf("linked git metadata changed to %q, err=%v", data, err)
+	}
+	// Exercise the cleanup contract even when the host already has the requested
+	// Go toolchain and therefore does not download a read-only toolchain module.
+	if err := os.MkdirAll(cleanupProbeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cleanupProbeDir, "artifact"), []byte("probe"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(cleanupProbeDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSandboxExecReadOnlyInputE2E(t *testing.T) {
 	requireLandlockABI(t)
 	gitmoot := buildGitmootBinary(t)

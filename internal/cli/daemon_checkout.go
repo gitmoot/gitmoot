@@ -112,6 +112,103 @@ func (w jobWorker) defaultCheckoutForRunner(ctx context.Context, job db.Job, pay
 	return checkout, nil
 }
 
+// prepareNativeReviewWorktreeForRunner gives a native PR review leg that reached
+// the worker WITHOUT a dispatch-time worktree the same exact-head isolation as a
+// deliberate `agent review` dispatch. Since the engine hoisted the ROUTINE leg's
+// allocation to before enqueue (prepareNativeReviewWorktree), the remaining
+// callers are the configurations where no engine allocation happens at all: an
+// engine with no read-only worktree manager or no Home/DelegationCheckout (the
+// routine leg and the high-risk lens child both arrive path-less there). A leg
+// born with a WorktreePath fails the last gate conjunct below and returns
+// untouched, so no configuration has two live allocation paths. It runs after
+// scheduler admission, including the disk guard, and before checkout validation.
+// The persisted marker lets the existing terminal cleanup reclaim the detached
+// worktree.
+func (w jobWorker) prepareNativeReviewWorktreeForRunner(ctx context.Context, job db.Job, payload workflow.JobPayload, runner subprocess.Runner) (workflow.JobPayload, error) {
+	if job.Type != "review" ||
+		payload.PullRequest <= 0 ||
+		strings.TrimSpace(payload.HeadSHA) == "" ||
+		strings.TrimSpace(payload.ReviewRound) == "" ||
+		len(payload.Reviewers) == 0 ||
+		strings.TrimSpace(payload.WorktreePath) != "" {
+		return payload, nil
+	}
+	repoRecord, err := w.Store.GetRepo(ctx, payload.Repo)
+	if err != nil {
+		return payload, err
+	}
+	checkout := strings.TrimSpace(repoRecord.CheckoutPath)
+	if checkout == "" {
+		return payload, fmt.Errorf("native review repo %s has no registered checkout", payload.Repo)
+	}
+	client := jobGitClient(checkout, runner)
+	allocate := func() (string, error) {
+		return workflow.AllocateReadOnlyWorktree(
+			ctx,
+			w.Store,
+			w.workflowHome(),
+			payload.Repo,
+			checkout,
+			job.ID,
+			"readonly-seat",
+			0,
+			strings.TrimSpace(payload.HeadSHA),
+			// Short budget, like every other read-only allocation site: passing 0
+			// expanded to the ~2-minute checkoutMutationWaitTimeout, stalling this
+			// worker slot on a lock another worker holds for a short shared-.git op.
+			// The caller now DEFERS a spent budget for re-dispatch instead of waiting.
+			workflow.ReadOnlyWorktreeDispatchLockWaitBudget,
+			client,
+		)
+	}
+	path, err := allocate()
+	if err != nil {
+		// A spent checkout-mutation-lock budget is contention, not a cold checkout: a
+		// fetch cannot help it, and the caller defers the leg for re-dispatch. Return
+		// it unwrapped-in-kind so that classification still sees the BlockedError.
+		if workflow.CheckoutMutationLockContention(err) {
+			return payload, fmt.Errorf("allocate native review worktree: %w", err)
+		}
+		fetchErr := client.FetchPullRequest(ctx, "origin", payload.PullRequest)
+		if fetchErr != nil {
+			return payload, fmt.Errorf("allocate native review worktree: %w; fetch PR ref: %v", err, fetchErr)
+		}
+		path, err = allocate()
+		if err != nil {
+			return payload, fmt.Errorf("allocate native review worktree after fetch: %w", err)
+		}
+	}
+	cleanup := func() {
+		_ = client.RemoveWorktreeForce(context.WithoutCancel(ctx), path)
+	}
+	payload.WorktreePath = path
+	payload.ReadOnlyWorktree = true
+	payload.ReadOnlySeat = true
+	if note := workflow.ReadOnlyWorktreeContextNote(checkout); note != "" {
+		payload.Instructions += note
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		cleanup()
+		return payload, err
+	}
+	written, err := w.Store.UpdateJobPayloadAtGeneration(ctx, job.ID, string(encoded), job.LifecycleGeneration)
+	if err != nil {
+		cleanup()
+		return payload, err
+	}
+	if !written {
+		cleanup()
+		return payload, fmt.Errorf("native review job %s advanced while allocating its exact-head worktree", job.ID)
+	}
+	_ = w.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   job.ID,
+		Kind:    "review_worktree_allocated_exact_head",
+		Message: fmt.Sprintf("allocated owned read-only worktree at review head %s", strings.TrimSpace(payload.HeadSHA)),
+	})
+	return payload, nil
+}
+
 func (w jobWorker) resolveJobCheckout(ctx context.Context, job db.Job, payload workflow.JobPayload) (string, error) {
 	return w.resolveJobCheckoutForRunner(ctx, job, payload, subprocess.ExecRunner{})
 }

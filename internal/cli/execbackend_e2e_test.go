@@ -147,18 +147,16 @@ func execBackendAppendConfig(t *testing.T, home string, section string) {
 // ran the shell fixture to terminal succeeded, the event-kind sequence is the
 // pinned main baseline IN ORDER, and the stored payload carries no
 // exec_backend key (byte-identical serialization).
-func assertExecBackendLocalSucceeded(t *testing.T, store *db.Store, jobID, marker string) {
+func assertExecBackendLocalSucceeded(t *testing.T, store *db.Store, jobID string) {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("shell fixture did not run (marker missing): %v", err)
-	}
 	job, err := store.GetJob(ctx, jobID)
 	if err != nil {
 		t.Fatalf("GetJob: %v", err)
 	}
 	if job.State != string(workflow.JobSucceeded) {
-		t.Fatalf("job state = %q, want succeeded", job.State)
+		events, _ := store.ListJobEvents(ctx, jobID)
+		t.Fatalf("job state = %q, want succeeded; payload=%s events=%+v", job.State, job.Payload, events)
 	}
 	if strings.Contains(job.Payload, "exec_backend") {
 		t.Fatalf("payload carries exec_backend: %s\nwant byte-identical serialization for a local job", job.Payload)
@@ -178,23 +176,21 @@ func assertExecBackendLocalSucceeded(t *testing.T, store *db.Store, jobID, marke
 // TestExecBackendLocalDefaultDaemonE2E is ACCEPTANCE 1: no [remote_exec]
 // config at all — the default path is byte-for-byte main.
 func TestExecBackendLocalDefaultDaemonE2E(t *testing.T) {
-	marker := filepath.Join(t.TempDir(), "shell-ran-default")
-	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
+	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(""))
 	jobID := execBackendDispatchAsk(t, home)
 	execBackendRunOneTick(t, home, store)
-	assertExecBackendLocalSucceeded(t, store, jobID, marker)
+	assertExecBackendLocalSucceeded(t, store, jobID)
 }
 
 // TestExecBackendLocalExplicitDaemonE2E is ACCEPTANCE 2: an explicit
 // backend = "local" behaves IDENTICALLY to the default path — same event
 // sequence, same result contract.
 func TestExecBackendLocalExplicitDaemonE2E(t *testing.T) {
-	marker := filepath.Join(t.TempDir(), "shell-ran-explicit-local")
-	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
+	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(""))
 	execBackendAppendConfig(t, home, "\n[remote_exec]\nbackend = \"local\"\n")
 	jobID := execBackendDispatchAsk(t, home)
 	execBackendRunOneTick(t, home, store)
-	assertExecBackendLocalSucceeded(t, store, jobID, marker)
+	assertExecBackendLocalSucceeded(t, store, jobID)
 }
 
 // TestExecBackendUnknownFailsLoudDaemonE2E is ACCEPTANCE 3: an unknown

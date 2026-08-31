@@ -102,11 +102,7 @@ func (e Engine) dispatchFix(ctx context.Context, reviewer string, payload JobPay
 		ReviewRound:   payload.ReviewRound,
 		Sender:        reviewer,
 		ActingOrgRole: payload.ActingOrgRole,
-		Instructions: fmt.Sprintf(
-			"Address requested changes from %s: %s",
-			reviewer,
-			result.Summary,
-		),
+		Instructions:  reviewFixInstructions(reviewer, result),
 	}
 	if request.ID == "" {
 		request.ID = e.jobID(request)
@@ -209,6 +205,7 @@ func (e Engine) allRequiredReviewersApproved(ctx context.Context, currentReviewe
 		return true, nil
 	}
 
+	blockingSeverity := e.reviewBlockingSeverity(payload.Repo)
 	approved := map[string]bool{}
 	if currentReviewer != "" {
 		approved[currentReviewer] = true
@@ -229,7 +226,7 @@ func (e Engine) allRequiredReviewersApproved(ctx context.Context, currentReviewe
 		if !sameTask(payload, jobPayload) || !sameReviewRound(payload, jobPayload) || jobPayload.Result == nil {
 			continue
 		}
-		if jobPayload.Result.Decision == "approved" {
+		if effectiveReviewDecisionForPayload(jobPayload, blockingSeverity) == "approved" {
 			approved[reviewDecisionAgent(job, jobPayload)] = true
 		}
 	}
@@ -600,6 +597,7 @@ func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string,
 		WorkflowID:              payload.WorkflowID,
 		Reviewer:                reviewer,
 		ReviewOptional:          !reviewRequired,
+		ReviewBlockingSeverity:  e.reviewBlockingSeverity(payload.Repo),
 		HumanMergeRequested:     humanMergeRequested,
 	})
 	if err != nil {

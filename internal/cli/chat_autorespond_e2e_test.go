@@ -125,7 +125,8 @@ chat_autorespond = true
 
 		done := chatE2EDriveUntilTerminal(t, ctx, worker, store, job.ID)
 		if done.State != string(workflow.JobSucceeded) {
-			t.Fatalf("cycle %d: auto-respond job state=%q, want succeeded", i, done.State)
+			events, _ := store.ListJobEvents(ctx, job.ID)
+			t.Fatalf("cycle %d: auto-respond job state=%q, want succeeded; payload=%s events=%+v", i, done.State, done.Payload, events)
 		}
 		// The reply back-linked as a job_result authored by the responder — the count
 		// grows by exactly one per cycle (it is what CountChatAgentAutoResponses reads).

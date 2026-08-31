@@ -134,6 +134,12 @@ func (e Engine) mailbox() Mailbox {
 	mb.RuntimeDefaultEffort = e.RuntimeDefaultEffort
 	mb.routerContextEnabled = e.RouterContextEnabled
 	mb.resultCheckMode = normalizeResultCheckMode(e.ResultCheckMode)
+	// Session review jobs close through the Mailbox and never run AdvanceJob, so
+	// they need the same repository policy the advancement path uses in order to
+	// record the folded outcome (#1685-adjacent): without it the merge gate folds
+	// their sub-threshold verdict into an approval while gitmoot proof, which keys
+	// its claim on the durable event, renders "0 approved".
+	mb.reviewBlockingSeverity = e.reviewBlockingSeverity
 	mb.produceCheckDir = e.ProduceCheckDir
 	// Wire the off-by-default memory hooks (#626). When e.Memory is nil (every
 	// non-enrolled path) both hooks stay nil, so Run's prompt assembly and terminal
@@ -169,24 +175,46 @@ func (e Engine) mailbox() Mailbox {
 			e.now(),
 			RedactCommentText,
 		)
-		wakeTargetRole := NormalizeActingOrgRole(payload.ActingOrgRole)
+		requesterRole := NormalizeActingOrgRole(payload.ActingOrgRole)
+		wakeTargetRole := requesterRole
 		if state == JobSucceeded && payload.PullRequest > 0 && payload.Result != nil && e.Store != nil {
-			decision := strings.ToLower(strings.TrimSpace(payload.Result.Decision))
 			job, jobErr := e.Store.GetJob(ctx, jobID)
-			if jobErr == nil &&
-				strings.EqualFold(strings.TrimSpace(job.Type), "review") &&
-				(decision == "approved" || decision == "changes_requested") {
-				owner := ""
-				resolved, resolveErr := e.Store.ResolvePullRequestOwner(
-					ctx, payload.Repo, payload.Branch, payload.PullRequest, payload.TaskID,
-				)
-				if resolveErr == nil {
-					owner = NormalizeActingOrgRole(resolved)
+			if jobErr == nil && strings.EqualFold(strings.TrimSpace(job.Type), "review") {
+				decision := effectiveReviewDecisionForPayload(payload, e.reviewBlockingSeverity(payload.Repo))
+				if decision == "approved" || decision == "changes_requested" {
+					owner := ""
+					resolved, resolveErr := e.Store.ResolvePullRequestOwner(
+						ctx, payload.Repo, payload.Branch, payload.PullRequest, payload.TaskID,
+					)
+					if resolveErr == nil {
+						owner = NormalizeActingOrgRole(resolved)
+					}
+					if resolveErr == nil && owner == "" {
+						// Persistent seats implement directly rather than through
+						// implement jobs. Review dispatch still persists the
+						// registered implementing seat as LeadAgent.
+						owner = NormalizeActingOrgRole(payload.LeadAgent)
+					}
+					event.Cause = events.EventCauseReviewVerdict
+					wakeTargetRole = owner
+					event.PullRequest = payload.PullRequest
+					event.ReviewDecision = decision
+					if decision == "changes_requested" {
+						// Sender is a transport or agent identity, not necessarily a
+						// routable org role. ActingOrgRole is the persisted requester
+						// role paired with that sender; legacy jobs without one keep
+						// the resolved PR owner fallback above (#1712).
+						if requesterRole != "" {
+							wakeTargetRole = requesterRole
+						}
+					}
+					if requesterRole != "" {
+						event.WakeTargetRoles = append(event.WakeTargetRoles, requesterRole)
+					}
+					if owner != "" && !strings.EqualFold(owner, requesterRole) {
+						event.WakeTargetRoles = append(event.WakeTargetRoles, owner)
+					}
 				}
-				event.Cause = events.EventCauseReviewVerdict
-				wakeTargetRole = owner
-				event.PullRequest = payload.PullRequest
-				event.ReviewDecision = decision
 			}
 		}
 		event.WakeTargetRole = wakeTargetRole
@@ -288,6 +316,9 @@ type MergeRequest struct {
 	WorkflowID              string
 	Reviewer                string
 	ReviewOptional          bool
+	// ReviewBlockingSeverity is the resolved repository threshold carried into
+	// the merge gate. Empty preserves the historical block-all behavior.
+	ReviewBlockingSeverity string
 	// HumanMergeRequested is an explicit, authorized human instruction. It is
 	// evaluated inside PolicyMergeGate, never by a caller-side bypass.
 	HumanMergeRequested bool

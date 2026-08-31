@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,11 +18,11 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// This file is the no-LLM, no-network end-to-end proof for the #739 fix:
-// background read-only (ask) jobs — moot seats, chat-task promotions, autorespond,
-// `agent ask --background` — are each allocated a dedicated DETACHED committed-tip
-// worktree at DISPATCH time, so their checkout key is worktree:<path> and same-repo
-// seats run CONCURRENTLY instead of serializing on the shared repo:<repo> key.
+// This file is the no-LLM end-to-end proof for the #739 fix. Background
+// read-only jobs each receive a dedicated detached committed-tip worktree, so
+// their worktree:<path> keys run concurrently instead of serializing on the
+// shared repo key. The hard-sandbox ask proof uses loopback only for its
+// rendezvous; moot seats retain their relay-backed chat path.
 //
 // The #739 condition is reproduced faithfully: the repo checkout is parked on a
 // NON-MAIN / stale odd branch (the live symptom was on a repo sitting on
@@ -88,6 +89,49 @@ printf '%%s' '%s'`, stateDir, self, stateDir, peers, failResult, okResult)
 		return prefix + "\n" + body
 	}
 	return body
+}
+func loopbackRendezvous(t *testing.T, peers int) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		if tcp, ok := listener.(*net.TCPListener); ok {
+			_ = tcp.SetDeadline(time.Now().Add(5 * time.Second))
+		}
+		connections := make([]net.Conn, 0, peers)
+		defer func() {
+			for _, connection := range connections {
+				_ = connection.Close()
+			}
+		}()
+		for len(connections) < peers {
+			connection, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			connections = append(connections, connection)
+		}
+		for _, connection := range connections {
+			_, _ = connection.Write([]byte{1})
+		}
+	}()
+	return listener.Addr().String()
+}
+
+func loopbackRendezvousSeatScript(address, self, okResult string) string {
+	failResult := rendezvousResult("failed", "rendezvous timeout: seat "+self+" serialized (#739 regression)")
+	probe := `import socket,sys; host,port=sys.argv[1].rsplit(":",1); s=socket.create_connection((host,int(port)),2); s.settimeout(2); s.sendall(sys.argv[2].encode()); ok=s.recv(1); s.close(); sys.exit(0 if ok else 1)`
+	return fmt.Sprintf(
+		"if python3 -c %s %s %s; then sleep 0.3; printf '%%s' %s; else printf '%%s' %s; fi",
+		shellQuote(probe, "posix"),
+		shellQuote(address, "posix"),
+		shellQuote(self, "posix"),
+		shellQuote(okResult, "posix"),
+		shellQuote(failResult, "posix"),
+	)
 }
 
 // readonlyPoolWorker builds a REAL pool-scheduler jobWorker on the isolated home:
@@ -178,11 +222,11 @@ func TestReadOnlyWorktreeConcurrentAsksE2E(t *testing.T) {
 	checkout := staleBranchGitCheckout(t, "owner/repo")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 
-	stateDir := t.TempDir()
+	rendezvous := loopbackRendezvous(t, 2)
 	seedDaemonWorkerAgent(t, store, "alice", runtime.ShellRuntime,
-		rendezvousSeatScript(stateDir, "alice", 2, rendezvousResult("approved", "alice ran beside bob"), ""), []string{"ask"}, "owner/repo")
+		loopbackRendezvousSeatScript(rendezvous, "alice", rendezvousResult("approved", "alice ran beside bob")), []string{"ask"}, "owner/repo")
 	seedDaemonWorkerAgent(t, store, "bob", runtime.ShellRuntime,
-		rendezvousSeatScript(stateDir, "bob", 2, rendezvousResult("approved", "bob ran beside alice"), ""), []string{"ask"}, "owner/repo")
+		loopbackRendezvousSeatScript(rendezvous, "bob", rendezvousResult("approved", "bob ran beside alice")), []string{"ask"}, "owner/repo")
 
 	// Dispatch two BACKGROUND read-only asks on the SAME stale-branch repo through
 	// the REAL dispatch entry (the moot-seat / chat-task / autorespond shape).
@@ -429,21 +473,20 @@ func TestLoneUncontendedBackgroundAskE2E(t *testing.T) {
 	}
 }
 
-// TestBackgroundAskCapturesDiffBeforeWorktreeCleanupE2E reproduces #1152 through
-// the real background dispatch and worker paths: an ask edits its isolated
-// worktree, terminal cleanup removes that worktree synchronously, and the
-// bounded diff remains readable from both job detail and list output afterward.
-func TestBackgroundAskCapturesDiffBeforeWorktreeCleanupE2E(t *testing.T) {
+// TestBackgroundAskRejectsMutationBeforeWorktreeCleanupE2E proves the hard
+// read-only seat blocks checkout writes even when the registered agent requests
+// workspace-write, then still removes the disposable worktree synchronously.
+func TestBackgroundAskRejectsMutationBeforeWorktreeCleanupE2E(t *testing.T) {
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := staleBranchGitCheckout(t, "owner/repo")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	result := rendezvousResult("implemented", "edited the isolated checkout")
-	script := fmt.Sprintf("printf 'changed by ask\\n' > README.md\nprintf '%%s' '%s'", result)
+	result := rendezvousResult("approved", "hard sandbox preserved the checkout")
+	script := fmt.Sprintf("if { printf 'changed by ask\\n' > README.md; } 2>/dev/null; then exit 41; fi\nprintf '%%s' '%s'", result)
 	seedDaemonWorkerAgentWithPolicy(t, store, "writer", runtime.ShellRuntime, script, []string{"ask"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
 
 	out, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
-		RepoFlag: "owner/repo", Agent: "writer", Action: "ask", Instructions: "make the requested edit", Background: true, Home: home,
+		RepoFlag: "owner/repo", Agent: "writer", Action: "ask", Instructions: "attempt the requested edit", Background: true, Home: home,
 	})
 	if err != nil {
 		t.Fatalf("dispatch writer: %v", err)
@@ -456,89 +499,42 @@ func TestBackgroundAskCapturesDiffBeforeWorktreeCleanupE2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worktree := queuedPayload.WorktreePath
 	terminal := chatE2EDriveUntilTerminal(t, ctx, readonlyPoolWorker(store, home), store, out.JobID)
 	if terminal.State != string(workflow.JobSucceeded) {
-		t.Fatalf("writer state = %q, want succeeded", terminal.State)
+		t.Fatalf("writer state = %q, want succeeded after denied mutation", terminal.State)
 	}
-	if _, statErr := os.Stat(worktree); !os.IsNotExist(statErr) {
+	if _, statErr := os.Stat(queuedPayload.WorktreePath); !os.IsNotExist(statErr) {
 		t.Fatalf("isolated worktree still exists after terminal cleanup: %v", statErr)
 	}
 	persisted, err := daemonJobPayload(terminal)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"## git status --short", " M README.md", "## git diff HEAD", "+changed by ask"} {
-		if !strings.Contains(persisted.ReadOnlyWorktreeDiff, want) {
-			t.Fatalf("captured diff missing %q:\n%s", want, persisted.ReadOnlyWorktreeDiff)
-		}
-	}
-	if persisted.ReadOnlyWorktreeDiffTruncated || persisted.ReadOnlyWorktreeDiffError != "" {
-		t.Fatalf("unexpected diff metadata: truncated=%v error=%q", persisted.ReadOnlyWorktreeDiffTruncated, persisted.ReadOnlyWorktreeDiffError)
+	if persisted.ReadOnlyWorktreeDiff != "" || persisted.ReadOnlyWorktreeDiffTruncated || persisted.ReadOnlyWorktreeDiffError != "" {
+		t.Fatalf("denied mutation produced diff metadata: %+v", persisted)
 	}
 	if got := gitOutput(t, checkout, "status", "--porcelain"); got != "" {
 		t.Fatalf("registered checkout was mutated: %q", got)
 	}
-
-	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"job", "show", out.JobID, "--home", home, "--json"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("job show --json exit=%d stderr=%s", code, stderr.String())
-	}
-	var shown jobShowOutput
-	if err := json.Unmarshal(stdout.Bytes(), &shown); err != nil {
-		t.Fatal(err)
-	}
-	if shown.ReadOnlyWorktreeDiff != persisted.ReadOnlyWorktreeDiff || shown.Payload.ReadOnlyWorktreeDiff != persisted.ReadOnlyWorktreeDiff {
-		t.Fatal("job show --json did not surface the persisted diff")
-	}
-
-	stdout.Reset()
-	stderr.Reset()
-	if code := Run([]string{"job", "list", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("job list --json exit=%d stderr=%s", code, stderr.String())
-	}
-	var listed []jobListEntry
-	if err := json.Unmarshal(stdout.Bytes(), &listed); err != nil {
-		t.Fatal(err)
-	}
-	if len(listed) != 1 || listed[0].ReadOnlyWorktreeDiff != persisted.ReadOnlyWorktreeDiff {
-		t.Fatalf("job list --json diff = %+v, want captured diff", listed)
-	}
-
-	stdout.Reset()
-	stderr.Reset()
-	if code := Run([]string{"job", "list", "--home", home}, &stdout, &stderr); code != 0 {
-		t.Fatalf("job list exit=%d stderr=%s", code, stderr.String())
-	}
-	if !strings.Contains(stdout.String(), "DIFF: ") || !strings.Contains(stdout.String(), " bytes captured") {
-		t.Fatalf("job list text did not surface diff summary:\n%s", stdout.String())
-	}
-
-	stdout.Reset()
-	stderr.Reset()
-	if code := Run([]string{"job", "show", out.JobID, "--home", home}, &stdout, &stderr); code != 0 {
-		t.Fatalf("job show exit=%d stderr=%s", code, stderr.String())
-	}
-	if !strings.Contains(stdout.String(), "read_only_worktree_diff: captured") {
-		t.Fatalf("job show text did not surface captured diff summary:\n%s", stdout.String())
+	if n := countCLIJobEvents(t, store, out.JobID, "delegation_worktree_removed"); n != 1 {
+		t.Fatalf("delegation_worktree_removed events = %d, want 1", n)
 	}
 }
 
-// TestBackgroundAskDiffCaptureFailureDoesNotBlockCleanupE2E corrupts only the
-// throwaway worktree's index, forcing capture to fail without invalidating the
-// worktree registration used for removal. The engine must record the hook event
-// and still remove the actual worktree.
-func TestBackgroundAskDiffCaptureFailureDoesNotBlockCleanupE2E(t *testing.T) {
+// TestBackgroundAskRejectsGitMetadataCorruptionBeforeCleanupE2E proves the hard
+// seat also protects linked git metadata without turning terminal cleanup into
+// a pre-cleanup capture failure.
+func TestBackgroundAskRejectsGitMetadataCorruptionBeforeCleanupE2E(t *testing.T) {
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := staleBranchGitCheckout(t, "owner/repo")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	result := rendezvousResult("approved", "capture failure fixture")
-	script := fmt.Sprintf("index=$(git rev-parse --git-path index)\nprintf x > \"$index\"\nprintf '%%s' '%s'", result)
+	result := rendezvousResult("approved", "hard sandbox preserved git metadata")
+	script := fmt.Sprintf("index=$(git rev-parse --git-path index)\nif { printf x > \"$index\"; } 2>/dev/null; then exit 42; fi\nprintf '%%s' '%s'", result)
 	seedDaemonWorkerAgent(t, store, "breaker", runtime.ShellRuntime, script, []string{"ask"}, "owner/repo")
 
 	out, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
-		RepoFlag: "owner/repo", Agent: "breaker", Action: "ask", Instructions: "exercise cleanup failure handling", Background: true, Home: home,
+		RepoFlag: "owner/repo", Agent: "breaker", Action: "ask", Instructions: "attempt metadata corruption", Background: true, Home: home,
 	})
 	if err != nil {
 		t.Fatalf("dispatch breaker: %v", err)
@@ -553,42 +549,39 @@ func TestBackgroundAskDiffCaptureFailureDoesNotBlockCleanupE2E(t *testing.T) {
 	}
 	terminal := chatE2EDriveUntilTerminal(t, ctx, readonlyPoolWorker(store, home), store, out.JobID)
 	if terminal.State != string(workflow.JobSucceeded) {
-		t.Fatalf("breaker state = %q, want succeeded", terminal.State)
+		t.Fatalf("breaker state = %q, want succeeded after denied metadata write", terminal.State)
 	}
 	if _, statErr := os.Stat(queuedPayload.WorktreePath); !os.IsNotExist(statErr) {
-		t.Fatalf("worktree cleanup was blocked by diff capture failure: %v", statErr)
+		t.Fatalf("worktree cleanup was blocked: %v", statErr)
 	}
 	persisted, err := daemonJobPayload(terminal)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if persisted.ReadOnlyWorktreeDiffError == "" {
-		t.Fatal("diff capture failure marker was not persisted")
+	if persisted.ReadOnlyWorktreeDiff != "" || persisted.ReadOnlyWorktreeDiffError != "" {
+		t.Fatalf("denied metadata write produced capture diagnostics: %+v", persisted)
 	}
-	if n := countCLIJobEvents(t, store, out.JobID, "readonly_worktree_precleanup_failed"); n != 1 {
-		t.Fatalf("readonly_worktree_precleanup_failed events = %d, want 1", n)
+	if n := countCLIJobEvents(t, store, out.JobID, "readonly_worktree_precleanup_failed"); n != 0 {
+		t.Fatalf("readonly_worktree_precleanup_failed events = %d, want 0", n)
 	}
 	if n := countCLIJobEvents(t, store, out.JobID, "delegation_worktree_removed"); n != 1 {
 		t.Fatalf("delegation_worktree_removed events = %d, want 1", n)
 	}
 }
 
-// TestReadOnlyWorktreeAllocFailIsFailOpenE2E proves the FAIL-OPEN contract: when
-// the dispatch-time worktree allocation genuinely fails, the ask is still enqueued
-// unchanged (no worktree, shared repo:<repo> checkout key), a loud
-// readonly_worktree_skipped event is recorded, and the job still runs to a terminal
-// decision on the shared checkout. Dispatch NEVER fails for a lost-parallelism
-// optimization. The allocation is forced to fail by planting a FILE where the
-// per-repo worktree directory must be created (git worktree add can never mkdir it).
-func TestReadOnlyWorktreeAllocFailIsFailOpenE2E(t *testing.T) {
+// TestReadOnlyWorktreeAllocFailIsFailClosedE2E proves allocation is part of the
+// taskless background ask's security boundary. A real filesystem failure must
+// refuse dispatch before enqueue rather than run the prompt on the shared checkout.
+// The allocation is forced to fail by planting a file where the per-repo worktree
+// directory must be created.
+func TestReadOnlyWorktreeAllocFailIsFailClosedE2E(t *testing.T) {
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := staleBranchGitCheckout(t, "owner/repo")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "solo", runtime.ShellRuntime,
-		fmt.Sprintf("printf '%%s' '%s'", rendezvousResult("approved", "ran on the shared checkout")), []string{"ask"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "solo", runtime.ShellRuntime, "true", []string{"ask"}, "owner/repo")
 
-	// Plant a FILE at <home>/.gitmoot/worktrees/owner--repo so os.MkdirAll of the
+	// Plant a file at <home>/.gitmoot/worktrees/owner--repo so os.MkdirAll of the
 	// deterministic worktree parent (…/owner--repo/delegations/<jobID>) fails ENOTDIR.
 	wtDir := filepath.Join(home, ".gitmoot", "worktrees")
 	if err := os.MkdirAll(wtDir, 0o755); err != nil {
@@ -598,40 +591,12 @@ func TestReadOnlyWorktreeAllocFailIsFailOpenE2E(t *testing.T) {
 		t.Fatalf("plant blocking file: %v", err)
 	}
 
-	out, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
+	_, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
 		RepoFlag: "owner/repo", Agent: "solo", Action: "ask", Instructions: "audit anyway", Background: true, Home: home})
-	if err != nil {
-		t.Fatalf("dispatch must NOT fail on a worktree alloc error (fail-open): %v", err)
+	if err == nil || !strings.Contains(err.Error(), "allocate read-only ask worktree") {
+		t.Fatalf("allocation error = %v, want fail-closed taskless ask refusal", err)
 	}
-	job, err := store.GetJob(ctx, out.JobID)
-	if err != nil {
-		t.Fatalf("GetJob: %v", err)
-	}
-	payload, err := daemonJobPayload(job)
-	if err != nil {
-		t.Fatalf("payload: %v", err)
-	}
-	if strings.TrimSpace(payload.WorktreePath) != "" {
-		t.Fatalf("fail-open payload has WorktreePath %q, want empty (allocation failed)", payload.WorktreePath)
-	}
-	if payload.ReadOnlyWorktree {
-		t.Fatal("fail-open payload ReadOnlyWorktree = true, want false (no worktree allocated)")
-	}
-	// The job stays on the shared checkout key, and the loud skip event is recorded.
-	if key := queuedJobCheckoutKey(ctx, store, job); key != "repo:owner/repo" {
-		t.Fatalf("fail-open checkout key = %q, want repo:owner/repo (serialized on the shared checkout)", key)
-	}
-	if n := countCLIJobEvents(t, store, out.JobID, "readonly_worktree_skipped"); n != 1 {
-		t.Fatalf("readonly_worktree_skipped events = %d, want 1 (loud fail-open)", n)
-	}
-	if n := countCLIJobEvents(t, store, out.JobID, "readonly_worktree_allocated"); n != 0 {
-		t.Fatalf("readonly_worktree_allocated events = %d, want 0 (allocation failed)", n)
-	}
-
-	// The job still runs to a terminal decision on the shared checkout.
-	worker := readonlyPoolWorker(store, home)
-	terminal := chatE2EDriveUntilTerminal(t, ctx, worker, store, out.JobID)
-	if terminal.State != string(workflow.JobSucceeded) {
-		t.Fatalf("fail-open job state = %q, want succeeded (must run on the shared checkout)", terminal.State)
+	if jobs, listErr := store.ListJobs(ctx); listErr != nil || len(jobs) != 0 {
+		t.Fatalf("jobs after allocation refusal=%+v err=%v, want none", jobs, listErr)
 	}
 }

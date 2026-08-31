@@ -350,6 +350,12 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// Stamp the already-resolved decision on the in-memory job agent so every
 	// secondary adapter rebuild consumes the same backend selection.
 	agent.ExecBackend = string(execBackend)
+	readOnlySeat := payload.ReadOnlySeat && !payload.MootSeat
+	runtimeConfigDir := strings.TrimSpace(payload.RuntimeConfigDir)
+	if readOnlySeat && runtimeConfigDir == "" {
+		runtimeConfigDir = selectedRuntimeConfigDir(agent.Runtime)
+	}
+	applyReadOnlySeat(readOnlySeat, runtimeConfigDir, &agent)
 	preflightRequest := runtime.RuntimeContractRequest{Plan: payload.Plan}
 	if result, checked, preflightErr := w.runtimeContractPreflight(ctx, execBackend, execConfig, agent, preflightRequest); preflightErr != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, preflightErr); finishErr != nil {
@@ -412,6 +418,48 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			return err
 		}
 		return nil
+	}
+	nativeReviewDeliveryStarted := false
+	payload, err = w.prepareNativeReviewWorktreeForRunner(ctx, job, payload, jobRunner)
+	if err != nil {
+		// An exact-head allocation that spent its checkout-mutation-lock budget is
+		// TRANSIENT: the holder is another worker's short shared-.git op. Terminally
+		// failing the leg here BURNED the verdict — the payload is left unmutated, so
+		// the next poll's re-enqueue matches it and is a silent no-op, and
+		// FindRepeatedReviewers only re-enlists SUCCEEDED verdicts, so nothing ever
+		// re-attempts it. Hold the still-queued leg for re-dispatch instead, exactly
+		// like the checkout-preflight site below. Every other allocation failure (a
+		// missing commit object, an unwritable path) is unclassified and keeps the
+		// terminal path, and the hold itself is bounded by maxOperationalBlockerRetries.
+		//
+		// This site uses deferPreDeliveryAllocationContention rather than the general
+		// helper because a high-risk LENS CHILD reaches this same path-less fallback
+		// (TestNativeReviewWorktreePreparationCoversHighRiskLensChild), and the general
+		// helper's delegation-child exclusion would route it to
+		// finishQueuedJob(JobFailed) → finalizePreflightDelegationChild, advancing the
+		// delegation DAG with a synthetic `failed` verdict on a lock another worker
+		// holds for a sub-second op. The narrowing is typed and pre-delivery only; see
+		// the helper's own comment for why that is the safe boundary.
+		if deferred, deferErr := w.deferPreDeliveryAllocationContention(ctx, job, payload, err); deferErr != nil {
+			writeLine(w.Stdout, "job %s review-worktree contention deferral failed: %v", job.ID, deferErr)
+		} else if deferred {
+			writeLine(w.Stdout, "job %s deferred on review-worktree contention: %v", job.ID, err)
+			return nil
+		}
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
+		return nil
+	}
+	nativeReviewWorktreeOwned := payload.ReadOnlyWorktree && strings.TrimSpace(payload.WorktreePath) != ""
+	if nativeReviewWorktreeOwned {
+		defer func() {
+			if nativeReviewDeliveryStarted {
+				return
+			}
+			w.cleanupUndeliveredNativeReviewWorktree(context.WithoutCancel(ctx), job.ID, payload, jobRunner)
+		}()
 	}
 	checkout, err := w.checkoutForJob(ctx, job, payload, agent, jobRunner)
 	if err != nil {
@@ -609,21 +657,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
 	}
-	// Shared tool-cache grant (#1113 lever 1): disk hygiene, not a security
-	// precondition, so any failure is fail-open (logged, job proceeds without the
-	// cache redirect) rather than failing the job like the produce grants above.
-	// MUST run after applyProduceRuntimeGrants: that call overwrites
-	// agent.WritablePaths for produce jobs, so appending earlier would be lost.
-	var toolCacheEnv []string
-	if execBackend == execbackend.Local {
-		if cachePaths, cacheErr := w.configPaths(); cacheErr != nil {
-			writeLine(w.Stdout, "job %s tool cache config load failed: %v", job.ID, cacheErr)
-		} else if env, grantErr := applyIsolatedToolCacheGrants(cachePaths, payload, &agent); grantErr != nil {
-			writeLine(w.Stdout, "job %s tool cache grant failed: %v", job.ID, grantErr)
-		} else {
-			toolCacheEnv = env
-		}
-	}
 	// Acquire the execution-backend lifecycle only after checkout validation and
 	// runtime-session admission. The instance then survives every Mailbox repair
 	// delivery and is destroyed synchronously on every return path. Host checkout,
@@ -662,6 +695,32 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			return nil
 		}
 	}
+	// Cache grants are keyed to the checkout the runtime actually receives. A
+	// local execution backend may replace the source worktree with an instance
+	// workspace, so constructing this grant before provisioning creates two
+	// different hard-seat cache roots.
+	var toolCacheEnv []string
+	var toolCacheErr error
+	if execBackend == execbackend.Local {
+		if cachePaths, cacheErr := w.configPaths(); cacheErr != nil {
+			toolCacheErr = cacheErr
+		} else {
+			cachePayload := payload
+			cachePayload.WorktreePath = deliveryCheckout
+			toolCacheEnv, toolCacheErr = applyIsolatedToolCacheGrants(cachePaths, cachePayload, &agent)
+		}
+	}
+	if toolCacheErr != nil {
+		if agent.ReadOnlySeat {
+			err := fmt.Errorf("prepare read-only tool cache: %w", toolCacheErr)
+			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+				return finishErr
+			}
+			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
+			return nil
+		}
+		writeLine(w.Stdout, "job %s tool cache grant failed: %v", job.ID, toolCacheErr)
+	}
 	adapter, err = wrapProduceSandboxAdapter(job.Type, agent, adapter)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
@@ -669,6 +728,26 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
+	}
+	adapter, err = wrapReadOnlySandboxAdapter(w.ConfigHome, agent, deliveryCheckout, adapter)
+	if err != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
+		return nil
+	}
+	var readOnlyState *readOnlyRuntimeAdapter
+	readOnlyStateCleaned := false
+	if stateAdapter, ok := adapter.(readOnlyRuntimeAdapter); ok {
+		readOnlyState = &stateAdapter
+		defer func() {
+			if !readOnlyStateCleaned {
+				if cleanupErr := readOnlyState.cleanup(); cleanupErr != nil {
+					writeLine(w.Stdout, "job %s read-only runtime state cleanup failed: %v", job.ID, cleanupErr)
+				}
+			}
+		}()
 	}
 	if execBackend == execbackend.Local && len(toolCacheEnv) > 0 {
 		if envAdapter, envErr := injectDeliveryAdapterEnv(adapter, toolCacheEnv); envErr != nil {
@@ -872,9 +951,14 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			<-done
 		}
 	}
+	nativeReviewDeliveryStarted = true
 	_, err = engine.RunJob(runCtx, job.ID, agent, adapter)
 	stopKillPending()
 	stopProgress()
+	if readOnlyState != nil {
+		err = errors.Join(err, readOnlyState.cleanup())
+		readOnlyStateCleaned = true
+	}
 	if err != nil {
 		if quotaErr := w.quotaRoleUnavailableHooks().recordRuntimeOutcome(ctx, job, payload, agent, err, time.Now().UTC()); quotaErr != nil {
 			writeLine(w.Stdout, "job %s org-role quota unavailability capture failed: %v", job.ID, quotaErr)
@@ -929,6 +1013,23 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	_ = w.postJobResultComment(ctx, job.ID, agent, checkout, nil)
 	writeLine(w.Stdout, "job %s completed", job.ID)
 	return nil
+}
+
+func (w jobWorker) cleanupUndeliveredNativeReviewWorktree(ctx context.Context, jobID string, payload workflow.JobPayload, runner subprocess.Runner) {
+	job, err := w.Store.GetJob(ctx, jobID)
+	if err != nil {
+		writeLine(w.Stdout, "job %s native review pre-delivery cleanup lookup failed: %v", jobID, err)
+		return
+	}
+	switch workflow.JobState(job.State) {
+	case workflow.JobFailed, workflow.JobCancelled:
+	default:
+		return
+	}
+	engine := w.workflowForJob(strings.TrimSpace(payload.WorktreePath), runner)
+	if err := engine.ReclaimTerminalDelegationWorktree(ctx, jobID); err != nil {
+		writeLine(w.Stdout, "job %s native review pre-delivery cleanup failed: %v", jobID, err)
+	}
 }
 
 const implementationPreflightAttemptLimit = 3
@@ -1324,9 +1425,464 @@ func wrapProduceSandboxAdapter(action string, agent runtime.Agent, adapter workf
 	case *runtime.KimiAdapter:
 		a.Runner = landlockProduceRunner(a.Runner, reads, readFiles, writes, env)
 		return a, nil
+
 	default:
 		return nil, fmt.Errorf("produce Landlock sandbox cannot wrap %s adapter %T", agent.Runtime, adapter)
 	}
+}
+
+const maxReadOnlyRuntimeStateFileBytes = 1 << 20
+
+type readOnlySandboxGrants struct {
+	reads     []string
+	readFiles []string
+	writes    []string
+	env       []string
+	cacheRoot string
+	stateDir  string
+}
+
+type readOnlyRuntimeAdapter struct {
+	runtime.Adapter
+	cleanupRoot string
+}
+
+func (a readOnlyRuntimeAdapter) PermissionPolicyApplication(agent runtime.Agent) runtime.PermissionPolicyApplication {
+	return runtime.ResolvePermissionPolicyApplication(a.Adapter, agent)
+}
+
+func (a readOnlyRuntimeAdapter) Deliver(ctx context.Context, agent runtime.Agent, job runtime.Job) (runtime.Result, error) {
+	// Mailbox repair turns reuse this adapter. Keep its isolated credentials and
+	// session state until RunJob returns; the worker owns job-boundary cleanup.
+	return a.Adapter.Deliver(ctx, agent, job)
+}
+
+func (a readOnlyRuntimeAdapter) cleanup() error {
+	// The prompt can move or rewrite anything under the job-private writable
+	// cache. Delete that entire root so renamed credentials cannot escape cleanup;
+	// never synchronize untrusted state back to the shared runtime profile.
+	if a.cleanupRoot == "" {
+		return nil
+	}
+	if err := os.RemoveAll(a.cleanupRoot); err != nil {
+		return fmt.Errorf("remove read-only seat cache: %w", err)
+	}
+	return nil
+}
+
+func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout string, adapter workflow.DeliveryAdapter) (workflow.DeliveryAdapter, error) {
+	if !agent.ReadOnlySeat {
+		return adapter, nil
+	}
+	_, gatewayMode := adapter.(modelGatewayRuntimeAdapter)
+	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, gatewayMode)
+	if err != nil {
+		return nil, err
+	}
+	wrap := func(runner subprocess.Runner) subprocess.Runner {
+		curated := graftRuntimeBaseRunner(runner, subprocess.CuratedGroupRunner{
+			BaseEnv: readOnlyRuntimeBaseEnv(agent.Runtime, os.Environ(), filepath.Join(grants.cacheRoot, "gh")),
+		})
+		return landlockReadOnlyRunner(curated, grants.reads, grants.readFiles, grants.writes, grants.env)
+	}
+	wrapped, err := wrapReadOnlyAdapterRunner(agent.Runtime, adapter, grants.stateDir, wrap)
+	if err != nil {
+		return nil, err
+	}
+	if grants.stateDir == "" {
+		return wrapped, nil
+	}
+	runtimeAdapter, ok := wrapped.(runtime.Adapter)
+	if !ok {
+		return nil, fmt.Errorf("read-only Landlock sandbox returned incompatible %T adapter", wrapped)
+	}
+	return readOnlyRuntimeAdapter{
+		Adapter:     runtimeAdapter,
+		cleanupRoot: grants.cacheRoot,
+	}, nil
+}
+
+func wrapReadOnlyAdapterRunner(runtimeName string, adapter workflow.DeliveryAdapter, stateDir string, wrap func(subprocess.Runner) subprocess.Runner) (workflow.DeliveryAdapter, error) {
+	switch a := adapter.(type) {
+	case modelGatewayRuntimeAdapter:
+		a.runner.ChildConfigDir = stateDir
+		wrapped, err := wrapReadOnlyAdapterRunner(runtimeName, a.Adapter, stateDir, wrap)
+		if err != nil {
+			return nil, err
+		}
+		runtimeAdapter, ok := wrapped.(runtime.Adapter)
+		if !ok {
+			return nil, fmt.Errorf("read-only Landlock sandbox returned incompatible %T adapter", wrapped)
+		}
+		a.Adapter = runtimeAdapter
+		return a, nil
+	case runtime.ClaudeAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	case *runtime.ClaudeAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	case runtime.CodexAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	case *runtime.CodexAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	case runtime.KimiAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	case *runtime.KimiAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	case runtime.KimiCLIAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	case *runtime.KimiCLIAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	case runtime.OmpAdapter, *runtime.OmpAdapter:
+		return nil, errors.New("read-only seats cannot use omp without an isolated credential broker")
+	case runtime.ShellAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	case *runtime.ShellAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	default:
+		return nil, fmt.Errorf("read-only Landlock sandbox cannot wrap %s adapter %T", runtimeName, adapter)
+	}
+}
+
+func applyReadOnlySeat(readOnlySeat bool, configDir string, agent *runtime.Agent) {
+	if agent == nil || !readOnlySeat {
+		return
+	}
+	agent.ReadOnlySeat = true
+	agent.RuntimeConfigDir = strings.TrimSpace(configDir)
+	agent.WritablePaths = nil
+	agent.ReadablePaths = nil
+	agent.ReadableFiles = nil
+}
+
+func selectedRuntimeConfigDir(runtimeName string) string {
+	switch runtimeName {
+	case runtime.ClaudeRuntime:
+		return strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR"))
+	case runtime.CodexRuntime:
+		return strings.TrimSpace(os.Getenv("CODEX_HOME"))
+	default:
+		return ""
+	}
+}
+
+func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout string, gatewayMode bool) (readOnlySandboxGrants, error) {
+	var grants readOnlySandboxGrants
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		return grants, fmt.Errorf("resolve read-only sandbox config paths: %w", err)
+	}
+	toolEnv, err := applyIsolatedToolCacheGrants(paths, workflow.JobPayload{WorktreePath: checkout}, &agent)
+	if err != nil {
+		return grants, err
+	}
+	if len(agent.WritablePaths) != 1 {
+		return grants, fmt.Errorf("read-only seat requires exactly one isolated cache grant, got %d: %q", len(agent.WritablePaths), agent.WritablePaths)
+	}
+	grants.cacheRoot = agent.WritablePaths[0]
+	grants.writes = []string{grants.cacheRoot}
+	grants.env = append(grants.env, toolEnv...)
+
+	grants.reads = append(grants.reads, checkout)
+	metadata, err := reviewGitMetadataPaths(checkout)
+	if err != nil {
+		return grants, err
+	}
+	grants.reads = append(grants.reads, metadata...)
+
+	stateDir, stateEnv, err := prepareReadOnlyRuntimeState(agent, grants.cacheRoot, gatewayMode)
+	if err != nil {
+		return grants, err
+	}
+	grants.stateDir = stateDir
+	grants.env = append(grants.env, stateEnv...)
+
+	tempDir := filepath.Join(grants.cacheRoot, "tmp")
+	grants.env = append(grants.env,
+		"HOME="+filepath.Join(grants.cacheRoot, "home"),
+		"XDG_CONFIG_HOME="+filepath.Join(grants.cacheRoot, "xdg-config"),
+		"XDG_CACHE_HOME="+filepath.Join(grants.cacheRoot, "xdg-cache"),
+		"XDG_DATA_HOME="+filepath.Join(grants.cacheRoot, "xdg-data"),
+		"XDG_STATE_HOME="+filepath.Join(grants.cacheRoot, "xdg-state"),
+		"GOPATH="+filepath.Join(grants.cacheRoot, "go"),
+		"GH_CONFIG_DIR="+filepath.Join(grants.cacheRoot, "gh"),
+		"GH_PROMPT_DISABLED=1",
+		"TMPDIR="+tempDir,
+		"TMP="+tempDir,
+		"TEMP="+tempDir,
+	)
+	if err := validateReadOnlyWritablePaths(checkout, grants.writes); err != nil {
+		return grants, err
+	}
+	for _, path := range append([]string{tempDir, filepath.Join(grants.cacheRoot, "home")}, grants.writes...) {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			return grants, fmt.Errorf("create read-only sandbox write directory %q: %w", path, err)
+		}
+	}
+	grants.reads = compactCleanPaths(grants.reads)
+	grants.readFiles = compactCleanPaths(grants.readFiles)
+	grants.writes = compactCleanPaths(grants.writes)
+	return grants, nil
+}
+
+func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string, gatewayMode bool) (string, []string, error) {
+	userHome, err := os.UserHomeDir()
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve read-only runtime state home: %w", err)
+	}
+	sourceDir := strings.TrimSpace(agent.RuntimeConfigDir)
+	var relativeState, credentialFile, credentialSection string
+	stateRoot := filepath.Join(cacheRoot, "runtime-state")
+	switch agent.Runtime {
+	case runtime.ClaudeRuntime:
+		if sourceDir == "" {
+			sourceDir = filepath.Join(userHome, ".claude")
+		}
+		relativeState = ".claude"
+		if !gatewayMode {
+			credentialFile = ".credentials.json"
+			credentialSection = "claudeAiOauth"
+		}
+	case runtime.CodexRuntime:
+		if sourceDir == "" {
+			sourceDir = filepath.Join(userHome, ".codex")
+		}
+		relativeState = ".codex"
+		credentialFile = "auth.json"
+	case runtime.KimiRuntime, runtime.KimiCLIRuntime:
+		if sourceDir == "" {
+			sourceDir = filepath.Join(userHome, ".kimi-code")
+		}
+		// Kimi reads HOME/.kimi-code. The sandbox supplies HOME=cacheRoot/home,
+		// so stage its isolated profile at that exact path.
+		stateRoot = cacheRoot
+		relativeState = filepath.Join("home", ".kimi-code")
+		credentialFile = filepath.Join("credentials", "kimi-code.json")
+	case runtime.ShellRuntime:
+		return "", nil, nil
+	case runtime.OmpRuntime:
+		return "", nil, errors.New("read-only seats cannot use omp without an isolated credential broker")
+	default:
+		return "", nil, fmt.Errorf("read-only seat runtime %q has no isolated state policy", agent.Runtime)
+	}
+	sourceDir, err = filepath.Abs(sourceDir)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve runtime state directory %q: %w", sourceDir, err)
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(sourceDir); resolveErr == nil {
+		sourceDir = resolved
+	}
+	stateDir := filepath.Join(stateRoot, relativeState)
+	if err := os.RemoveAll(stateDir); err != nil {
+		return "", nil, fmt.Errorf("reset isolated runtime state %q: %w", stateDir, err)
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return "", nil, fmt.Errorf("create isolated runtime state %q: %w", stateDir, err)
+	}
+	if credentialFile != "" {
+		if err := stageReadOnlyRuntimeCredential(
+			filepath.Join(sourceDir, credentialFile),
+			filepath.Join(stateDir, credentialFile),
+			credentialSection,
+		); err != nil {
+			return "", nil, err
+		}
+	}
+	var stateEnv []string
+	switch agent.Runtime {
+	case runtime.ClaudeRuntime:
+		stateEnv = append(stateEnv, "CLAUDE_CONFIG_DIR="+stateDir)
+	case runtime.CodexRuntime:
+		stateEnv = append(stateEnv, "CODEX_HOME="+stateDir)
+	}
+	return stateDir, stateEnv, nil
+}
+
+func stageReadOnlyRuntimeCredential(source, destination, section string) error {
+	info, err := os.Lstat(source)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect runtime state file %q: %w", source, err)
+	}
+	if !info.Mode().IsRegular() || info.Size() > maxReadOnlyRuntimeStateFileBytes {
+		return fmt.Errorf("runtime state file %q must be a regular file no larger than %d bytes", source, maxReadOnlyRuntimeStateFileBytes)
+	}
+	data, err := os.ReadFile(source)
+	if err != nil {
+		return fmt.Errorf("read runtime state file %q: %w", source, err)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err != nil || object == nil {
+		if err == nil {
+			err = errors.New("credential must be a JSON object")
+		}
+		return fmt.Errorf("validate runtime credential %q: %w", source, err)
+	}
+	if section != "" {
+		value, ok := object[section]
+		if !ok {
+			return fmt.Errorf("runtime credential %q lacks required %q section", source, section)
+		}
+		data, err = json.Marshal(map[string]json.RawMessage{section: value})
+		if err != nil {
+			return fmt.Errorf("isolate runtime credential %q: %w", source, err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		return fmt.Errorf("create isolated runtime state directory: %w", err)
+	}
+	if err := os.WriteFile(destination, data, 0o600); err != nil {
+		return fmt.Errorf("stage runtime state file %q: %w", destination, err)
+	}
+	return nil
+}
+
+func readOnlyRuntimeBaseEnv(runtimeName string, environ []string, githubDir string) []string {
+	allowed := make(map[string]struct{}, len(curatedBaseEnvNames)+2)
+	for _, name := range curatedBaseEnvNames {
+		allowed[name] = struct{}{}
+	}
+	switch runtimeName {
+	case runtime.ClaudeRuntime:
+		allowed["CLAUDE_CONFIG_DIR"] = struct{}{}
+	case runtime.CodexRuntime:
+		allowed["CODEX_HOME"] = struct{}{}
+	}
+	base := make([]string, 0, len(environ)+2)
+	for _, entry := range environ {
+		name, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		if strings.HasPrefix(name, "GH_") || strings.HasPrefix(name, "GITHUB_") {
+			continue
+		}
+		if _, ok := allowed[name]; ok || strings.HasPrefix(name, "LC_") {
+			base = append(base, entry)
+		}
+	}
+	return append(base, "GH_CONFIG_DIR="+githubDir, "GH_PROMPT_DISABLED=1")
+}
+
+func validateReadOnlyWritablePaths(checkout string, writes []string) error {
+	type protectedRoot struct {
+		kind string
+		path string
+	}
+	protected := []protectedRoot{{kind: "read-only worktree", path: checkout}}
+	metadata, err := reviewGitMetadataPaths(checkout)
+	if err != nil {
+		return err
+	}
+	for _, path := range metadata {
+		protected = append(protected, protectedRoot{kind: "protected git metadata", path: path})
+	}
+	for i := range protected {
+		resolved, err := resolvePathForContainment(protected[i].path)
+		if err != nil {
+			return fmt.Errorf("resolve %s %q: %w", protected[i].kind, protected[i].path, err)
+		}
+		protected[i].path = resolved
+	}
+	for _, path := range compactCleanPaths(writes) {
+		if !filepath.IsAbs(path) {
+			return fmt.Errorf("read-only sandbox write path %q must be absolute", path)
+		}
+		resolvedWrite, err := resolvePathForContainment(path)
+		if err != nil {
+			return fmt.Errorf("resolve read-only sandbox write path %q: %w", path, err)
+		}
+		for _, root := range protected {
+			if pathsOverlap(root.path, resolvedWrite) {
+				return fmt.Errorf("read-only sandbox write path %q overlaps %s %q", path, root.kind, root.path)
+			}
+		}
+	}
+	return nil
+}
+
+func reviewGitMetadataPaths(checkout string) ([]string, error) {
+	dotGit := filepath.Join(checkout, ".git")
+	info, err := os.Stat(dotGit)
+	if err != nil {
+		return nil, fmt.Errorf("resolve review git metadata %q: %w", dotGit, err)
+	}
+	if info.IsDir() {
+		return []string{dotGit}, nil
+	}
+	content, err := os.ReadFile(dotGit)
+	if err != nil {
+		return nil, fmt.Errorf("read review gitdir file %q: %w", dotGit, err)
+	}
+	gitDirText := strings.TrimSpace(string(content))
+	const prefix = "gitdir:"
+	if !strings.HasPrefix(gitDirText, prefix) {
+		return nil, fmt.Errorf("review gitdir file %q has invalid contents", dotGit)
+	}
+	gitDir := strings.TrimSpace(strings.TrimPrefix(gitDirText, prefix))
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(checkout, gitDir)
+	}
+	gitDir = filepath.Clean(gitDir)
+	commonDir := gitDir
+	commonContent, err := os.ReadFile(filepath.Join(gitDir, "commondir"))
+	if err == nil {
+		commonDir = strings.TrimSpace(string(commonContent))
+		if !filepath.IsAbs(commonDir) {
+			commonDir = filepath.Join(gitDir, commonDir)
+		}
+		commonDir = filepath.Clean(commonDir)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("read review common-dir file for %q: %w", gitDir, err)
+	}
+	return compactCleanPaths([]string{gitDir, commonDir}), nil
+}
+
+func resolvePathForContainment(path string) (string, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	path = filepath.Clean(path)
+	current := path
+	var suffix []string
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			for i := len(suffix) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, suffix[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", err
+		}
+		suffix = append(suffix, filepath.Base(current))
+		current = parent
+	}
+}
+
+func pathsOverlap(left, right string) bool {
+	contains := func(parent, child string) bool {
+		rel, err := filepath.Rel(parent, child)
+		return err == nil && (rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))))
+	}
+	return contains(left, right) || contains(right, left)
 }
 
 func produceRuntimeSandboxGrants(runtimeName string, readable, readFiles, writable []string) ([]string, []string, []string, []string, error) {
@@ -1382,17 +1938,28 @@ func compactCleanPaths(paths []string) []string {
 }
 
 func landlockProduceRunner(runner subprocess.Runner, reads, readFiles, writes, env []string) subprocess.Runner {
+	return landlockRuntimeRunner(runner, reads, readFiles, writes, env, false)
+}
+
+func landlockReadOnlyRunner(runner subprocess.Runner, reads, readFiles, writes, env []string) subprocess.Runner {
+	return landlockRuntimeRunner(runner, reads, readFiles, writes, env, true)
+}
+
+func landlockRuntimeRunner(runner subprocess.Runner, reads, readFiles, writes, env []string, readOnlyWorkdir bool) subprocess.Runner {
 	readable := append([]string(nil), reads...)
 	files := append([]string(nil), readFiles...)
 	writable := append([]string(nil), writes...)
 	runtimeEnv := append([]string(nil), env...)
+	wrap := func(inner subprocess.Runner) subprocess.WrappingRunner {
+		return subprocess.WrappingRunner{Inner: inner, ReadablePaths: readable, ReadableFiles: files, WritablePaths: writable, ReadOnlyWorkdir: readOnlyWorkdir, Env: runtimeEnv}
+	}
 	if tee, ok := runner.(subprocess.TeeRunner); ok {
 		inner := tee.Inner
 		if inner == nil {
 			inner = subprocess.GroupRunner{}
 		}
 		if _, wrapped := inner.(subprocess.WrappingRunner); !wrapped {
-			tee.Inner = subprocess.WrappingRunner{Inner: inner, ReadablePaths: readable, ReadableFiles: files, WritablePaths: writable, Env: runtimeEnv}
+			tee.Inner = wrap(inner)
 		}
 		return tee
 	}
@@ -1402,7 +1969,7 @@ func landlockProduceRunner(runner subprocess.Runner, reads, readFiles, writes, e
 			inner = subprocess.GroupRunner{}
 		}
 		if _, wrapped := inner.(subprocess.WrappingRunner); !wrapped {
-			tee.Inner = subprocess.WrappingRunner{Inner: inner, ReadablePaths: readable, ReadableFiles: files, WritablePaths: writable, Env: runtimeEnv}
+			tee.Inner = wrap(inner)
 		}
 		return tee
 	}
@@ -1412,7 +1979,7 @@ func landlockProduceRunner(runner subprocess.Runner, reads, readFiles, writes, e
 	if _, wrapped := runner.(subprocess.WrappingRunner); wrapped {
 		return runner
 	}
-	return subprocess.WrappingRunner{Inner: runner, ReadablePaths: readable, ReadableFiles: files, WritablePaths: writable, Env: runtimeEnv}
+	return wrap(runner)
 }
 
 // configPaths resolves this worker's config.Paths for READ-ONLY policy loading

@@ -136,6 +136,11 @@ type Mailbox struct {
 	// foreground path — is byte-identical. The daemon resolves the real mode
 	// (default warn) from config and wires it through Engine.ResultCheckMode.
 	resultCheckMode ResultCheckMode
+	// reviewBlockingSeverity resolves the repository review policy for session
+	// review jobs, which close through CloseExternalJobWithUsage and never reach
+	// AdvanceJob. nil fails closed to block-all, under which the effective
+	// decision equals the raw one and no outcome event is owed.
+	reviewBlockingSeverity func(repo string) string
 	// produceCheckDir is the resolved stage checkout used as cwd for trusted
 	// operator checks when the payload has no explicit disposable worktree.
 	produceCheckDir string
@@ -200,6 +205,14 @@ type PipelineKeyAccess struct {
 	Mode   string `json:"mode"`
 }
 
+// ReviewScope is the bounded input for a follow-up review. PreviousHeadSHA is
+// always the exact head this reviewer last saw, never the PR base.
+type ReviewScope struct {
+	PreviousHeadSHA string   `json:"previous_head_sha"`
+	Findings        []string `json:"findings,omitempty"`
+	ChangedFiles    []string `json:"changed_files,omitempty"`
+}
+
 type JobRequest struct {
 	ID string
 	// PolicyExempt is enqueue-only policy routing; it is never persisted.
@@ -222,6 +235,7 @@ type JobRequest struct {
 	LeadAgent        string
 	Reviewers        []string
 	ReviewRound      string
+	ReviewScope      *ReviewScope
 	Sender           string
 	// ActingOrgRole attributes a fresh local dispatch to an organization role.
 	// It is persisted for audit provenance, then inherited by engine children.
@@ -246,14 +260,16 @@ type JobRequest struct {
 	SynthesisRule         string
 	DelegationArtifactDir string
 	WorktreePath          string
-	// ReadOnlyWorktree marks a job whose WorktreePath is a throwaway detached
-	// committed-tip worktree allocated for read-only (ask) isolation at DISPATCH
-	// time (#739) — as opposed to a delegation child's fan-out worktree (which
-	// carries a DelegationID) or an implement/task worktree (which carries a
-	// Branch). It is the explicit signal the terminal cleanup uses to dispose a
-	// TOP-LEVEL read-only worktree that has no DelegationID. Additive/omitempty:
-	// false leaves the enqueued payload byte-identical.
+	// ReadOnlyWorktree is the historical disposal marker for a top-level
+	// throwaway detached worktree with no DelegationID. Terminal cleanup owns it.
+	// It says nothing about runtime writability: produce and service-shell stages
+	// also use disposable worktrees. ReadOnlySeat carries the security policy.
+	// Additive/omitempty: false leaves legacy requests byte-identical.
 	ReadOnlyWorktree bool
+	// ReadOnlySeat marks an untrusted ask/review runtime that requires the hard
+	// filesystem sandbox and isolated runtime profile. It is independent of
+	// ReadOnlyWorktree, which owns only disposable-worktree lifecycle.
+	ReadOnlySeat bool
 	// FixWorktree marks an engine-dispatched review fix whose WorktreePath is an
 	// independent writable clone checked out on Branch. It is distinct from both
 	// detached read-only worktrees and linked delegation worktrees because its
@@ -293,6 +309,9 @@ type JobRequest struct {
 	// the engine never persists a refreshed session ref for an overridden job.
 	RuntimeOverride    string
 	RuntimeOverrideRef string
+	// RuntimeConfigDir records the non-secret runtime state directory selected at
+	// dispatch so a detached worker uses the same credential store.
+	RuntimeConfigDir string
 	// EffectiveRuntime may be set when the caller intends to execute an already-
 	// resolved runtime inline. Background callers leave it empty; a foreground
 	// job later deferred to a worker is re-recorded at actual execution time.
@@ -379,32 +398,33 @@ type JobPayload struct {
 	PullRequestReady bool   `json:"pull_request_ready,omitempty"`
 	// PullRequestDraft is the forge-observed state, kept separate from requested
 	// intent so routing decisions consume what the forge actually reports.
-	PullRequestDraft        bool     `json:"pull_request_draft,omitempty"`
-	PullRequestDraftUnknown bool     `json:"pull_request_draft_unknown,omitempty"`
-	HeadSHA                 string   `json:"head_sha,omitempty"`
-	GoalID                  string   `json:"goal_id,omitempty"`
-	TaskID                  string   `json:"task_id"`
-	TaskTitle               string   `json:"task_title"`
-	LeadAgent               string   `json:"lead_agent,omitempty"`
-	Reviewers               []string `json:"reviewers,omitempty"`
-	ReviewRound             string   `json:"review_round,omitempty"`
-	Sender                  string   `json:"sender"`
-	ActingOrgRole           string   `json:"acting_org_role,omitempty"`
-	Instructions            string   `json:"instructions"`
-	Constraints             []string `json:"constraints"`
-	ParentJobID             string   `json:"parent_job_id,omitempty"`
-	DelegationID            string   `json:"delegation_id,omitempty"`
-	DelegationDepth         int      `json:"delegation_depth,omitempty"`
-	DelegatedBy             string   `json:"delegated_by,omitempty"`
-	RootJobID               string   `json:"root_job_id,omitempty"`
-	Deps                    []string `json:"deps,omitempty"`
-	JobTimeout              string   `json:"job_timeout,omitempty"`
-	RetryCount              int      `json:"retry_count,omitempty"`
-	Fingerprint             string   `json:"fingerprint,omitempty"`
-	FailurePolicy           string   `json:"failure_policy,omitempty"`
-	SynthesisRule           string   `json:"synthesis_rule,omitempty"`
-	DelegationArtifactDir   string   `json:"delegation_artifact_dir,omitempty"`
-	WorktreePath            string   `json:"worktree_path,omitempty"`
+	PullRequestDraft        bool         `json:"pull_request_draft,omitempty"`
+	PullRequestDraftUnknown bool         `json:"pull_request_draft_unknown,omitempty"`
+	HeadSHA                 string       `json:"head_sha,omitempty"`
+	GoalID                  string       `json:"goal_id,omitempty"`
+	TaskID                  string       `json:"task_id"`
+	TaskTitle               string       `json:"task_title"`
+	LeadAgent               string       `json:"lead_agent,omitempty"`
+	Reviewers               []string     `json:"reviewers,omitempty"`
+	ReviewRound             string       `json:"review_round,omitempty"`
+	ReviewScope             *ReviewScope `json:"review_scope,omitempty"`
+	Sender                  string       `json:"sender"`
+	ActingOrgRole           string       `json:"acting_org_role,omitempty"`
+	Instructions            string       `json:"instructions"`
+	Constraints             []string     `json:"constraints"`
+	ParentJobID             string       `json:"parent_job_id,omitempty"`
+	DelegationID            string       `json:"delegation_id,omitempty"`
+	DelegationDepth         int          `json:"delegation_depth,omitempty"`
+	DelegatedBy             string       `json:"delegated_by,omitempty"`
+	RootJobID               string       `json:"root_job_id,omitempty"`
+	Deps                    []string     `json:"deps,omitempty"`
+	JobTimeout              string       `json:"job_timeout,omitempty"`
+	RetryCount              int          `json:"retry_count,omitempty"`
+	Fingerprint             string       `json:"fingerprint,omitempty"`
+	FailurePolicy           string       `json:"failure_policy,omitempty"`
+	SynthesisRule           string       `json:"synthesis_rule,omitempty"`
+	DelegationArtifactDir   string       `json:"delegation_artifact_dir,omitempty"`
+	WorktreePath            string       `json:"worktree_path,omitempty"`
 	// RuntimePID is the exact subprocess started by the runtime runner for the
 	// current delivery. RuntimePIDStartTime is Linux /proc starttime field 22,
 	// captured at the same moment so liveness checks cannot mistake a recycled
@@ -413,13 +433,16 @@ type JobPayload struct {
 	RuntimePID          int    `json:"runtime_pid,omitempty"`
 	RuntimePIDStartTime string `json:"runtime_pid_start_time,omitempty"`
 	RuntimePGID         int    `json:"runtime_pgid,omitempty"`
-	// ReadOnlyWorktree marks a top-level read-only (ask) worktree allocated at
-	// dispatch time (#739): its WorktreePath is a throwaway detached committed-tip
-	// worktree with no DelegationID and no Branch. Additive/omitempty so a payload
-	// without it serializes byte-identically. The terminal cleanup keys off it to
-	// dispose top-level read-only worktrees that the DelegationID-gated read-only
-	// delegation cleanup would otherwise orphan.
+	// ReadOnlyWorktree is the historical terminal-cleanup marker for a top-level
+	// throwaway detached worktree with no DelegationID. It may be writable; runtime
+	// security must consume ReadOnlySeat instead. Additive/omitempty preserves
+	// legacy payloads.
 	ReadOnlyWorktree bool `json:"read_only_worktree,omitempty"`
+	// ReadOnlySeat selects the hard runtime sandbox and isolated provider state
+	// for untrusted ask/review delivery. It is deliberately separate from the
+	// disposable-worktree cleanup marker above: produce and service-shell jobs
+	// may own throwaway writable worktrees without being read-only runtime seats.
+	ReadOnlySeat bool `json:"read_only_seat,omitempty"`
 	// FixWorktree marks a per-job writable clone allocated for a review fix round.
 	// The clone owns its git directory, is attached to Branch, and is reclaimed by
 	// the delegation-worktree TTL machinery without deleting that real branch.
@@ -462,6 +485,7 @@ type JobPayload struct {
 	WorkflowID         string `json:"workflow_id,omitempty"`
 	RuntimeOverride    string `json:"runtime_override,omitempty"`
 	RuntimeOverrideRef string `json:"runtime_override_ref,omitempty"`
+	RuntimeConfigDir   string `json:"runtime_config_dir,omitempty"`
 	// ExecBackend is the per-job execution-backend override (#1536 P1): when
 	// set it wins over the [remote_exec].backend config value at dispatch.
 	// "local" (the only implemented backend) is a byte-for-byte passthrough;
@@ -653,6 +677,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		LeadAgent:              request.LeadAgent,
 		Reviewers:              compactStrings(request.Reviewers),
 		ReviewRound:            request.ReviewRound,
+		ReviewScope:            cloneReviewScope(request.ReviewScope),
 		Sender:                 request.Sender,
 		ActingOrgRole:          strings.TrimSpace(request.ActingOrgRole),
 		Instructions:           request.Instructions,
@@ -671,6 +696,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		DelegationArtifactDir:  request.DelegationArtifactDir,
 		WorktreePath:           request.WorktreePath,
 		ReadOnlyWorktree:       request.ReadOnlyWorktree,
+		ReadOnlySeat:           request.ReadOnlySeat,
 		FixWorktree:            request.FixWorktree,
 		TemplateID:             snapshot.ID,
 		TemplateResolvedCommit: snapshot.ResolvedCommit,
@@ -691,6 +717,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		WorkflowID:             strings.TrimSpace(request.WorkflowID),
 		RuntimeOverride:        strings.TrimSpace(request.RuntimeOverride),
 		RuntimeOverrideRef:     strings.TrimSpace(request.RuntimeOverrideRef),
+		RuntimeConfigDir:       strings.TrimSpace(request.RuntimeConfigDir),
 		EffectiveRuntime:       strings.TrimSpace(request.EffectiveRuntime),
 		ShellEnv:               append([]string(nil), request.ShellEnv...),
 		PipelineInputEnv:       append([]string(nil), request.PipelineInputEnv...),
@@ -2211,6 +2238,17 @@ func compactStrings(values []string) []string {
 		}
 	}
 	return compacted
+}
+
+func cloneReviewScope(scope *ReviewScope) *ReviewScope {
+	if scope == nil {
+		return nil
+	}
+	return &ReviewScope{
+		PreviousHeadSHA: strings.TrimSpace(scope.PreviousHeadSHA),
+		Findings:        compactStrings(scope.Findings),
+		ChangedFiles:    compactStrings(scope.ChangedFiles),
+	}
 }
 
 func compactPipelineKeyAccess(values []PipelineKeyAccess) []PipelineKeyAccess {

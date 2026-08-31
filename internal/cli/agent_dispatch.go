@@ -18,6 +18,7 @@ import (
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/sandbox"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -29,7 +30,19 @@ var newAgentDispatchGitHubClient = func(checkout string) github.Client {
 type foregroundRuntimeAdapterFactory func(string, runtime.Agent, string) (runtime.Adapter, error)
 
 var localAgentDispatchRuntimeAdapterFor foregroundRuntimeAdapterFactory = func(home string, agent runtime.Agent, checkout string) (runtime.Adapter, error) {
-	return runtimeAdapterFor(home, agent.Runtime, checkout)
+	adapter, err := runtimeAdapterFor(home, agent.Runtime, checkout)
+	if err != nil {
+		return nil, err
+	}
+	delivery, err := wrapReadOnlySandboxAdapter(home, agent, checkout, adapter)
+	if err != nil {
+		return nil, err
+	}
+	wrapped, ok := delivery.(runtime.Adapter)
+	if !ok {
+		return nil, fmt.Errorf("foreground runtime adapter has incompatible type %T", delivery)
+	}
+	return wrapped, nil
 }
 
 var localAgentDispatchExecBackendFor = func(home string) (execbackend.Backend, error) {
@@ -49,6 +62,8 @@ func foregroundRuntimeAdapterFactoryFor(backend execbackend.Backend) (foreground
 var dispatchPromptHeadContradictionWarnings = promptHeadContradictionWarnings
 
 var allocateDispatchReadOnlyWorktree = workflow.AllocateReadOnlyWorktree
+
+var reviewReadOnlyWorkdirSupported = sandbox.ReadOnlyWorkdirSupported
 
 var fetchDispatchReviewPullRequest = func(ctx context.Context, git gitutil.Client, pullRequest int) error {
 	return git.FetchPullRequest(ctx, "origin", pullRequest)
@@ -165,7 +180,7 @@ type localAgentJobOutput struct {
 	AdvanceError string `json:"advance_error,omitempty"`
 }
 
-func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAgentDispatchRequest) (localAgentJobOutput, error) {
+func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAgentDispatchRequest) (output localAgentJobOutput, err error) {
 	// Validate a requested per-job runtime override FIRST — an unknown runtime
 	// (or a shell override without a session command) must fail with a clear
 	// error before any job is enqueued or any repo/agent state is touched.
@@ -375,25 +390,33 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		}
 		recipeTemplate = &tmpl
 	}
-	// Give an eligible read-only job its own detached worktree BEFORE enqueue so
-	// its checkout key is worktree:<path> (queuedJobCheckoutKey) and same-repo
-	// seats (moot, chat-task, autorespond, `agent ask --background`) run
-	// concurrently instead of serializing on the shared repo:<repo> key. Foreground
-	// asks run inline and never serialize, so they are left untouched. Ask remains
-	// FAIL-OPEN because its isolation is a throughput optimization. Review is
-	// FAIL-CLOSED because falling back to its shared checkout would review a commit
-	// other than the requested head.
+	// Give every eligible read-only job its own detached worktree BEFORE enqueue.
+	// The worktree is both its checkout key and its hard filesystem boundary.
+	// Falling back to the shared checkout would silently drop that boundary, so
+	// allocation failure refuses both exact-head reviews and taskless background
+	// asks. Foreground and task-bearing asks keep their existing checkout policy.
 	jobID := localAgentJobID(request.Action, agent.Name)
 	readOnlyWorktreePath, readOnlyWorktreeErr := maybeAllocateDispatchReadOnlyWorktree(ctx, store, request, repo.FullName(), record.CheckoutPath, jobID)
-	if request.Action == "review" {
+	if dispatchReadOnlyWorktreeEligible(request) {
+		kind := "read-only ask"
+		if request.Action == "review" {
+			kind = "exact-head review"
+		}
 		if readOnlyWorktreeErr != nil {
-			return localAgentJobOutput{}, fmt.Errorf("allocate exact-head review worktree: %w", readOnlyWorktreeErr)
+			return localAgentJobOutput{}, fmt.Errorf("allocate %s worktree: %w", kind, readOnlyWorktreeErr)
 		}
 		if strings.TrimSpace(readOnlyWorktreePath) == "" {
-			return localAgentJobOutput{}, errors.New("allocate exact-head review worktree: no worktree was allocated")
+			return localAgentJobOutput{}, fmt.Errorf("allocate %s worktree: no worktree was allocated", kind)
 		}
+	}
+	if request.Action == "review" {
 		checkoutPath = readOnlyWorktreePath
 		promptHeadWarnings = dispatchPromptHeadContradictionWarnings(ctx, jobGitClient(checkoutPath, localDispatchJobRunner(request)), request.Instructions, request.HeadSHA)
+	}
+	// Moot seats have a separate relay-backed chat sandbox. Its socket and
+	// current-binary grants are owned by that path, not this review/ask policy.
+	if readOnlyWorktreePath != "" && !request.MootSeat {
+		applyReadOnlySeat(true, selectedRuntimeConfigDir(effectiveAgent.Runtime), &effectiveAgent)
 	}
 	if readOnlyWorktreePath != "" {
 		if request.Action != "review" {
@@ -448,6 +471,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		WorkflowID:             request.WorkflowID,
 		RuntimeOverride:        overrideRuntime,
 		RuntimeOverrideRef:     overrideRef,
+		RuntimeConfigDir:       effectiveAgent.RuntimeConfigDir,
 		EffectiveRuntime:       effectiveRuntimeAtEnqueue,
 		RequiredEvents:         requiredEvents,
 		Cockpit:                request.Cockpit,
@@ -460,6 +484,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		MootSeat:               request.MootSeat,
 		WorktreePath:           readOnlyWorktreePath,
 		ReadOnlyWorktree:       readOnlyWorktreePath != "",
+		ReadOnlySeat:           readOnlyWorktreePath != "" && !request.MootSeat,
 	})
 	if err != nil {
 		// #739: the read-only worktree is created on disk BEFORE Enqueue. If Enqueue
@@ -488,13 +513,10 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "route_selected", Message: routeSelectedMessage(request)}); err != nil {
 		return localAgentJobOutput{}, err
 	}
-	// Emit the #739 read-only isolation outcome now that the job row exists (job
-	// events carry a JobID FK). Allocated → observable worktree:<path> key; a
-	// fail-open skip → loud event so a lost-parallelism serialize is never silent.
+	// Emit the #739 read-only allocation after the job row exists because job
+	// events carry a JobID foreign key. Allocation failures returned before enqueue.
 	if readOnlyWorktreePath != "" {
 		_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "readonly_worktree_allocated", Message: fmt.Sprintf("read-only worktree %s allocated at dispatch (#739); job keyed worktree:<path> to run beside same-repo seats", readOnlyWorktreePath)})
-	} else if readOnlyWorktreeErr != nil {
-		_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "readonly_worktree_skipped", Message: fmt.Sprintf("read-only worktree isolation skipped (#739); job runs serialized in the shared checkout: %v", readOnlyWorktreeErr)})
 	}
 	if overrideRuntime == "" {
 		effectiveAgent = scopeRegisteredFreshRefForJob(effectiveAgent, job.ID)
@@ -569,12 +591,26 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	// AdvanceJob, which fires while this lock is still held) recognizes its own lock
 	// and does not refuse the healthy-path cleanup as a foreign live owner (#536).
 	ctx = workflow.WithRuntimeSelfOwnerToken(ctx, ownerToken)
+	if effectiveAgent.ReadOnlySeat {
+		cachePaths, err := pathsFromFlag(request.Home)
+		if err != nil {
+			return localAgentJobOutput{}, fmt.Errorf("resolve read-only tool cache paths: %w", err)
+		}
+		if _, err := applyIsolatedToolCacheGrants(cachePaths, workflow.JobPayload{WorktreePath: readOnlyWorktreePath}, &effectiveAgent); err != nil {
+			return localAgentJobOutput{}, fmt.Errorf("prepare read-only tool cache: %w", err)
+		}
+	}
 	// Adapter selection uses the complete EFFECTIVE agent: runtime overrides
 	// select the adapter (#531), while the resolved execution backend selects
 	// where that adapter runs (#1536). Neither decision may be discarded here.
 	adapter, err := foregroundAdapterFactory(request.Home, effectiveAgent, checkoutPath)
 	if err != nil {
 		return localAgentJobOutput{}, err
+	}
+	if stateAdapter, ok := adapter.(readOnlyRuntimeAdapter); ok {
+		defer func() {
+			err = errors.Join(err, stateAdapter.cleanup())
+		}()
 	}
 	// Foreground dispatch bypasses the daemon worker, so attach opt-in retained
 	// capture explicitly. Open/composition failures remain fail-open.
@@ -1814,9 +1850,8 @@ func dispatchReadOnlyWorktreeEligible(request localAgentDispatchRequest) bool {
 // with a distinct worktree:<path> checkout key (#739). It resolves the ref to the
 // checkout HEAD for ask and to HeadSHA for review via the shared
 // workflow.AllocateReadOnlyWorktree primitive, holding the checkout mutation
-// lock. Ask remains fail-open at the call site. Review retries after fetching the
-// PR ref for a cold checkout, then fails closed at the call site rather than
-// falling back to the stale shared checkout.
+// lock. Both callers fail closed. Review additionally retries after fetching the
+// PR ref for a cold checkout.
 func maybeAllocateDispatchReadOnlyWorktree(ctx context.Context, store *db.Store, request localAgentDispatchRequest, repo string, checkout string, jobID string) (string, error) {
 	if !dispatchReadOnlyWorktreeEligible(request) {
 		return "", nil
@@ -1854,6 +1889,9 @@ func maybeAllocateDispatchReadOnlyWorktree(ctx context.Context, store *db.Store,
 }
 
 func reviewReadOnlyWorktreeCapacity(home string) error {
+	if !reviewReadOnlyWorkdirSupported() {
+		return errors.New("exact-head review sandbox is supported only on Linux")
+	}
 	paths, err := pathsFromFlag(home)
 	if err != nil {
 		return err

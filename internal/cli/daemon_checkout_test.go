@@ -213,6 +213,30 @@ func TestTaskWorktreeCheckoutPrefersDelegationPayloadWorktree(t *testing.T) {
 	}
 }
 
+func TestQueuedPRReviewCheckoutKeyNeverFallsBackToOwningTaskWorktree(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	taskCheckout := t.TempDir()
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-1", RepoFullName: "owner/repo", Branch: "feature/review", WorktreePath: taskCheckout,
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	job := db.Job{
+		ID:   "review-job",
+		Type: "review",
+		Payload: mustJobPayload(t, workflow.JobPayload{
+			Repo: "owner/repo", Branch: "feature/review", PullRequest: 42,
+			HeadSHA: "exact-review-head", TaskID: "task-1", ReviewRound: "1",
+			Reviewers: []string{"reviewer"},
+		}),
+	}
+
+	if key := queuedJobCheckoutKey(ctx, store, job); key != "job:review-job" {
+		t.Fatalf("pathless PR review checkout key = %q, want job-local key; task checkout %q is not the review head", key, taskCheckout)
+	}
+}
+
 func TestResolveJobCheckoutSelfHealsDanglingLinkedWorktree(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()

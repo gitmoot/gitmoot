@@ -457,14 +457,17 @@ func TestAddresslessBlockedWakeMatchesObserversOnly(t *testing.T) {
 
 func TestBlockedWakeTargetsRecordedOrResolvedOwnerPlusObservers(t *testing.T) {
 	tests := []struct {
-		name        string
-		repo        string
-		jobRole     string
-		wantRoles   []string
-		wantTarget  string
-		useTerminal bool
+		name           string
+		repo           string
+		jobRole        string
+		wantRoles      []string
+		wantTarget     string
+		useTerminal    bool
+		archiveJobRole bool
 	}{
-		{name: "terminal uses recorded workflow role", repo: "gitmoot/gitmoot", jobRole: "lane", useTerminal: true, wantRoles: []string{"jarvis", "lane"}, wantTarget: "lane"},
+		{name: "terminal uses current recorded workflow role", repo: "gitmoot/gitmoot", jobRole: "lane", useTerminal: true, wantRoles: []string{"jarvis", "lane"}, wantTarget: "lane"},
+		{name: "terminal falls back from removed workflow role", repo: "gitmoot/gitmoot", jobRole: "retired", useTerminal: true, wantRoles: []string{"jarvis", "lane"}, wantTarget: "lane"},
+		{name: "terminal falls back from archived workflow role", repo: "gitmoot/gitmoot", jobRole: "lane", useTerminal: true, archiveJobRole: true, wantRoles: []string{"jarvis", "owner"}, wantTarget: "owner"},
 		{name: "blocked-since resolves repo owner", repo: "gitmoot/gitmoot", wantRoles: []string{"jarvis", "lane"}, wantTarget: "lane"},
 		{name: "repo without owner is observers only", repo: "unknown/repo", wantRoles: []string{"jarvis"}},
 	}
@@ -503,6 +506,7 @@ pane="w1:p4"
 			ctx := context.Background()
 			for _, rule := range []db.EventRule{
 				{ID: "addressed-lane", OnKind: "blocked", WakeRole: "lane", Scope: db.EventRuleScopeAddressed, Enabled: true},
+				{ID: "addressed-owner", OnKind: "blocked", WakeRole: "owner", Scope: db.EventRuleScopeAddressed, Enabled: true},
 				{ID: "addressed-other", OnKind: "blocked", WakeRole: "other", Scope: db.EventRuleScopeAddressed, Enabled: true},
 				{ID: "observer-jarvis", OnKind: "blocked", WakeRole: "jarvis", Scope: db.EventRuleScopeObserver, Enabled: true},
 			} {
@@ -512,6 +516,14 @@ pane="w1:p4"
 			}
 			recorded := &recordingSink{}
 			sink := &eventRuleSink{inner: recorded, store: store, home: home}
+			if test.archiveJobRole {
+				if err := store.UpsertOrgRoleArchived(ctx, db.OrgRoleArchived{
+					Role: test.jobRole, ArchivedAt: "2026-08-31T00:00:00Z",
+					ArchivedBy: "herdr-app", ObservedAt: "2026-08-31T00:00:00Z",
+				}); err != nil {
+					t.Fatalf("UpsertOrgRoleArchived: %v", err)
+				}
+			}
 			if test.useTerminal {
 				if err := store.CreateJob(ctx, db.Job{
 					ID: "blocked-job", Agent: "worker", Type: "ask", State: string(workflow.JobBlocked),
@@ -861,7 +873,7 @@ func TestEventRuleWakeFiresEachMatchingRule(t *testing.T) {
 		t.Fatalf("want a wake for each of the 2 matching rules, got %d", wake.promptCalls)
 	}
 }
-func TestReviewVerdictWakeTargetsOwnerAndObservers(t *testing.T) {
+func TestReviewVerdictWakeTargetsRequesterImplementerAndObservers(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
 	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
@@ -875,6 +887,10 @@ pane="w1:p0"
 parent="owner"
 scope=["*"]
 pane="w1:p1"
+[org.roles."requester"]
+parent="owner"
+scope=["*"]
+pane="w1:p4"
 [org.roles."other"]
 parent="owner"
 scope=["*"]
@@ -894,6 +910,7 @@ pane="w1:p3"
 	defer store.Close()
 	for _, rule := range []db.EventRule{
 		{ID: "author", OnKind: eventRuleKindReviewVerdict, WakeRole: "author", Scope: db.EventRuleScopeAddressed, Enabled: true},
+		{ID: "requester", OnKind: eventRuleKindReviewVerdict, WakeRole: "requester", Scope: db.EventRuleScopeAddressed, Enabled: true},
 		{ID: "other", OnKind: eventRuleKindReviewVerdict, WakeRole: "other", Scope: db.EventRuleScopeAddressed, Enabled: true},
 		{ID: "auditor", OnKind: eventRuleKindReviewVerdict, WakeRole: "auditor", Scope: db.EventRuleScopeObserver, Enabled: true},
 	} {
@@ -904,17 +921,18 @@ pane="w1:p3"
 	wake := &fakeEventWake{}
 	sink := &eventRuleSink{store: store, home: home, wake: wake}
 	sink.evaluate(context.Background(), events.Event{
-		Type:           events.EventJobFinished,
-		Cause:          events.EventCauseReviewVerdict,
-		JobID:          "review-42",
-		Repo:           "owner/repo",
-		WakeTargetRole: "author",
-		PullRequest:    42,
-		ReviewDecision: "approved",
+		Type:            events.EventJobFinished,
+		Cause:           events.EventCauseReviewVerdict,
+		JobID:           "review-42",
+		Repo:            "owner/repo",
+		WakeTargetRole:  "author",
+		WakeTargetRoles: []string{"requester", "author"},
+		PullRequest:     42,
+		ReviewDecision:  "approved",
 	})
 
 	sort.Strings(wake.panes)
-	if got, want := fmt.Sprint(wake.panes), "[w1:p1 w1:p3]"; got != want {
+	if got, want := fmt.Sprint(wake.panes), "[w1:p1 w1:p3 w1:p4]"; got != want {
 		t.Fatalf("woken panes = %s, want %s", got, want)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,7 +17,9 @@ import (
 )
 
 const (
-	gitmootMergeGateContext = "gitmoot/merge-gate"
+	// GitmootMergeGateContext is the canonical commit-status context for the
+	// native merge gate and every observer of its current-head verdict.
+	GitmootMergeGateContext = "gitmoot/merge-gate"
 	gitmootNoCIContext      = "gitmoot/ci"
 	// MergeLeaveOpenAutoMergeKillSwitchReason is persisted with a parked task so
 	// a later explicit auto_merge=false -> true config flip can re-arm only this
@@ -25,6 +28,20 @@ const (
 	commitStatusDescriptionMaxRunes         = 140
 	mergeQueueLockTTL                       = 30 * time.Minute
 )
+
+// NativeMergeGateDisabled reports whether the operator handed the merge decision
+// to an external gate via GITMOOT_DISABLE_NATIVE_MERGE_GATE (#545). It is the
+// single source for that answer: the native gate abstains, and every observer of
+// the gate's commit status must stay silent rather than publish a verdict-shaped
+// status no Gitmoot code path will ever resolve.
+func NativeMergeGateDisabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GITMOOT_DISABLE_NATIVE_MERGE_GATE"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
 
 type MergeGateGitHub interface {
 	GetPullRequest(ctx context.Context, repo github.Repository, number int64) (github.PullRequest, error)
@@ -249,7 +266,7 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 		Repo:        repo,
 		SHA:         headSHA,
 		State:       "success",
-		Context:     gitmootMergeGateContext,
+		Context:     GitmootMergeGateContext,
 		Description: "Gitmoot merge gate passed",
 	})
 	return g.finishMerged(ctx, request, pr, strings.TrimSpace(result.SHA))
@@ -550,7 +567,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 				"review at evaluated head from %s (job %s) declares %d unreported delegation(s); a fan-out is a coordinator continuation, not a verdict",
 				review.job.Agent, review.job.ID, len(review.payload.Result.Delegations))}
 		}
-		switch review.payload.Result.Decision {
+		switch effectiveReviewDecisionForPayload(review.payload, request.ReviewBlockingSeverity) {
 		case "changes_requested", "blocked", "failed":
 			return mergeBlocked{reason: fmt.Sprintf("review at evaluated head has blocking result from %s", review.job.Agent)}
 		}
@@ -567,9 +584,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			if review.payload.Result == nil {
 				return fmt.Errorf("abstaining reviewer %s at evaluated head has no recognized decision (job %s); requeue or reassign the review", reviewer, review.job.ID)
 			}
-			switch review.payload.Result.Decision {
+			switch effectiveReviewDecisionForPayload(review.payload, request.ReviewBlockingSeverity) {
 			case "approved":
-				if err := ensureDelegatedReviewEvidence(review.job, delegationChildrenByParent[review.job.ID]); err != nil {
+				if err := ensureDelegatedReviewEvidence(review.job, delegationChildrenByParent[review.job.ID], request.ReviewBlockingSeverity); err != nil {
 					return err
 				}
 				switch {
@@ -650,7 +667,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if _, superseded := supersededReviewIDs[job.ID]; superseded {
 			continue
 		}
-		if payload.Result.Decision == "approved" {
+		if effectiveReviewDecisionForPayload(payload, request.ReviewBlockingSeverity) == "approved" {
 			reviewerAgent := strings.TrimSpace(job.Agent)
 			switch {
 			case reviewerAgent == "":
@@ -683,9 +700,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			}
 			return err
 		}
-		switch payload.Result.Decision {
+		switch effectiveReviewDecisionForPayload(payload, request.ReviewBlockingSeverity) {
 		case "approved":
-			if err := ensureDelegatedReviewEvidence(job, delegationChildrenByParent[job.ID]); err != nil {
+			if err := ensureDelegatedReviewEvidence(job, delegationChildrenByParent[job.ID], request.ReviewBlockingSeverity); err != nil {
 				return err
 			}
 			approved = true
@@ -706,7 +723,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	return nil
 }
 
-func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job) error {
+func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job, blockingSeverity string) error {
 	if len(children) == 0 {
 		return nil
 	}
@@ -732,7 +749,7 @@ func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job) error {
 				unrecognized = append(unrecognized, fmt.Sprintf("%s (nil result)", childID))
 				continue
 			}
-			decision := strings.TrimSpace(payload.Result.Decision)
+			decision := effectiveDelegationDecision(payload.Result, child.Type, "", blockingSeverity)
 			switch decision {
 			case "approved":
 				hasApproval = true
@@ -1065,7 +1082,7 @@ func (g PolicyMergeGate) evaluateStatuses(ctx context.Context, repo github.Repos
 	externalStatusCount := 0
 	for _, item := range status.Statuses {
 		if strings.HasPrefix(item.Context, "gitmoot/") {
-			if item.Context == gitmootMergeGateContext {
+			if item.Context == GitmootMergeGateContext {
 				continue
 			}
 			if statusPending(item.State) {
@@ -1092,7 +1109,7 @@ func (g PolicyMergeGate) evaluateStatuses(ctx context.Context, repo github.Repos
 	externalCheckCount := 0
 	for _, check := range checks {
 		name := strings.TrimSpace(check.Name)
-		if name == gitmootMergeGateContext {
+		if name == GitmootMergeGateContext {
 			continue
 		}
 		externalCheckCount++
@@ -1283,7 +1300,7 @@ func (g PolicyMergeGate) block(ctx context.Context, request MergeRequest, sha st
 			Repo:        repo,
 			SHA:         sha,
 			State:       "failure",
-			Context:     gitmootMergeGateContext,
+			Context:     GitmootMergeGateContext,
 			Description: commitStatusDescription(reason),
 		}); err != nil {
 			return MergeDecision{}, err
@@ -1308,7 +1325,7 @@ func (g PolicyMergeGate) pending(ctx context.Context, request MergeRequest, sha 
 			Repo:        repo,
 			SHA:         sha,
 			State:       "pending",
-			Context:     gitmootMergeGateContext,
+			Context:     GitmootMergeGateContext,
 			Description: commitStatusDescription(reason),
 		})
 	}

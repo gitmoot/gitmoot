@@ -227,6 +227,128 @@ func TestPollOnceRoutesPullRequestUpdatesToWorkflow(t *testing.T) {
 	}
 }
 
+func TestPollOnceDegradesUnscopableHeadToRecordedFullReview(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	for _, agent := range []db.Agent{
+		{Name: "lead", Role: "lead", Runtime: "codex", RuntimeRef: "last", RepoScope: repo.FullName(), Capabilities: []string{"implement"}, AutonomyPolicy: "workspace-write", HealthStatus: "ok"},
+		{Name: "audit", Role: "reviewer", Runtime: "codex", RuntimeRef: "last", RepoScope: repo.FullName(), Capabilities: []string{"review"}, AutonomyPolicy: "auto", HealthStatus: "ok"},
+	} {
+		if err := store.UpsertAgent(ctx, agent); err != nil {
+			t.Fatalf("UpsertAgent %s: %v", agent.Name, err)
+		}
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "task-7", Owner: "lead"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock acquired=%v err=%v", acquired, err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-007", RepoFullName: repo.FullName(), GoalID: "goal-1", Title: "Task 7",
+		State: string(workflow.TaskPullRequestOpen), Branch: "task-7",
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	priorPayload, err := json.Marshal(workflow.JobPayload{
+		Repo: repo.FullName(), Branch: "task-7", PullRequest: 7, HeadSHA: "head-one",
+		TaskID: "task-007", TaskTitle: "Task 7", LeadAgent: "lead", Reviewers: []string{"audit"},
+		ReviewRound: "review-1", Result: &workflow.AgentResult{Decision: "changes_requested", Summary: "fix it"},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal prior review: %v", err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "prior-review", Agent: "audit", Type: "review", State: string(workflow.JobSucceeded), Payload: string(priorPayload),
+	}); err != nil {
+		t.Fatalf("CreateJob prior review: %v", err)
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: repo.FullName(), Number: 7, HeadBranch: "task-7", BaseBranch: "main",
+		HeadSHA: "head-one", State: "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest: %v", err)
+	}
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{
+			Number: 7, Title: "Task 7", State: "open", URL: "https://github.com/gitmoot/gitmoot/pull/7",
+			HeadRef: "task-7", BaseRef: "main", HeadSHA: "head-two",
+		}},
+		comments: map[int64][]github.IssueComment{7: {}},
+	}
+	resolverCalls := 0
+	engine := workflow.Engine{
+		Store: store, RequiredReviewers: []string{"audit"},
+		ReviewChangedFiles: func(context.Context, string, int, string, string) ([]string, error) {
+			resolverCalls++
+			return nil, workflow.ReviewScopeUnavailableError{Reason: `review scope compare is "diverged", not a direct follow-up`}
+		},
+	}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce 1: %v", err)
+	}
+	// One derivation for this head, not one per consumer: the dispatch invalidates
+	// the poll's review-job snapshot, so reconcileReviewingPullRequest sees the
+	// review that was just enqueued instead of re-entering the lifecycle.
+	if resolverCalls != 1 {
+		t.Fatalf("changed-files resolver calls in poll 1 = %d, want 1", resolverCalls)
+	}
+	for poll := range 4 {
+		if err := daemon.PollOnce(ctx); err != nil {
+			t.Fatalf("PollOnce %d: %v", poll+2, err)
+		}
+	}
+	// The degraded review is dispatched AT this head, so routing stops seeing the
+	// PR as changed. A range that keeps re-resolving every poll is the wedge this
+	// replaced.
+	if resolverCalls != 1 {
+		t.Fatalf("changed-files resolver calls = %d after 5 polls, want no re-fire beyond the first", resolverCalls)
+	}
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	var dispatched []db.Job
+	for _, job := range jobs {
+		if job.ID != "prior-review" {
+			dispatched = append(dispatched, job)
+		}
+	}
+	if len(dispatched) != 1 {
+		t.Fatalf("jobs dispatched after unscopable head = %+v, want exactly one full review", dispatched)
+	}
+	var payload workflow.JobPayload
+	if err := json.Unmarshal([]byte(dispatched[0].Payload), &payload); err != nil {
+		t.Fatalf("unmarshal dispatched payload: %v", err)
+	}
+	if payload.HeadSHA != "head-two" {
+		t.Fatalf("dispatched review head = %q, want head-two (re-anchors the prior head)", payload.HeadSHA)
+	}
+	if strings.Contains(payload.Instructions, "scoped follow-up") {
+		t.Fatalf("dispatched instructions = %q, want an unscoped full review", payload.Instructions)
+	}
+	task, err := store.GetTask(ctx, "task-007")
+	if err != nil || task.State != string(workflow.TaskReviewing) {
+		t.Fatalf("task after unscopable head = %+v err=%v, want reviewing, not a permanent block", task, err)
+	}
+	events, err := store.ListTaskEvents(ctx, "task-007")
+	if err != nil {
+		t.Fatalf("ListTaskEvents: %v", err)
+	}
+	scopeEvents := 0
+	for _, event := range events {
+		if event.Kind == "review_scope_unavailable" {
+			scopeEvents++
+		}
+	}
+	if scopeEvents != 1 {
+		t.Fatalf("review_scope_unavailable events = %d, want 1", scopeEvents)
+	}
+	stored, err := store.GetPullRequest(ctx, repo.FullName(), 7)
+	if err != nil || stored.HeadSHA != "head-two" {
+		t.Fatalf("stored baseline = %+v err=%v, want head-two", stored, err)
+	}
+}
+
 func TestHandlePullRequestWorkflowSkipsReviewFanoutWhenLockSet(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
@@ -1079,6 +1201,421 @@ func TestPollOnceDismissedEscalationDoesNotBlockEligibleMerge(t *testing.T) {
 	}
 }
 
+func TestPollOnceClearedMergeGateSupersedesInitialMarker(t *testing.T) {
+	ctx := context.Background()
+	_, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskReadyToMerge)
+	client.checks[0].Bucket = "pass"
+	client.checks[0].State = "COMPLETED"
+	client.checks[0].CompletedAt = "2026-08-31T03:20:15Z"
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(client.statuses) != 2 {
+		t.Fatalf("statuses = %+v, want initial pending marker followed by success", client.statuses)
+	}
+	if marker := client.statuses[0]; marker.Context != "gitmoot/merge-gate" ||
+		marker.State != "pending" ||
+		marker.Description != "Gitmoot merge gate has not cleared this head" {
+		t.Fatalf("initial status = %+v, want uncleared-head pending marker", marker)
+	}
+	if cleared := client.statuses[1]; cleared.Context != "gitmoot/merge-gate" || cleared.State != "success" {
+		t.Fatalf("final status = %+v, want cleared-head success", cleared)
+	}
+	if len(client.merges) != 1 {
+		t.Fatalf("merge inputs = %+v, want one merge", client.merges)
+	}
+}
+
+func TestPollOnceMarksManagedHeadBeforeMergeGateIsEligible(t *testing.T) {
+	ctx := context.Background()
+	store, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskChangesRequested)
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(client.statuses) != 1 {
+		t.Fatalf("statuses = %+v, want one pending marker", client.statuses)
+	}
+	if marker := client.statuses[0]; marker.Context != "gitmoot/merge-gate" ||
+		marker.State != "pending" ||
+		marker.Description != "Gitmoot merge gate has not cleared this head" {
+		t.Fatalf("status = %+v, want uncleared-head pending marker", marker)
+	}
+	if len(client.merges) != 0 {
+		t.Fatalf("merge inputs = %+v, want none", client.merges)
+	}
+	observation, err := store.GetMergeGateStatusObservation(ctx, "gitmoot/gitmoot", 7)
+	if err != nil {
+		t.Fatalf("GetMergeGateStatusObservation returned error: %v", err)
+	}
+	if observation.HeadSHA != "abc123" || observation.Kind != mergeGateStatusMarker {
+		t.Fatalf("status observation = %+v, want current-head marker", observation)
+	}
+	if _, err := store.GetMergeGate(ctx, "gitmoot/gitmoot", 7); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetMergeGate error = %v, want marker bookkeeping separate from gate decisions", err)
+	}
+}
+
+func TestMergeGateMarkerRetriesAfterHeadStorageAdvances(t *testing.T) {
+	ctx := context.Background()
+	store, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskChangesRequested)
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: "gitmoot/gitmoot",
+		Number:       7,
+		HeadBranch:   "task-7",
+		BaseBranch:   "main",
+		HeadSHA:      "old123",
+		State:        "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+	blocked := db.MergeGate{
+		RepoFullName: "gitmoot/gitmoot",
+		PullRequest:  7,
+		State:        "blocked",
+		Reason:       "external commit status ci is not successful",
+	}
+	if err := store.UpsertMergeGate(ctx, blocked); err != nil {
+		t.Fatalf("UpsertMergeGate returned error: %v", err)
+	}
+	client.statusErrs = []error{errors.New("transient status failure")}
+	pull := client.pulls[0]
+
+	daemon.ensureMergeGateStatus(ctx, pull)
+	if err := daemon.recordPullRequest(ctx, pull); err != nil {
+		t.Fatalf("recordPullRequest returned error: %v", err)
+	}
+	daemon.ensureMergeGateStatus(ctx, pull)
+
+	if len(client.statuses) != 2 || client.statusSucceeded[0] || !client.statusSucceeded[1] {
+		t.Fatalf("status attempts = %+v succeeded=%v, want failed write followed by retry", client.statuses, client.statusSucceeded)
+	}
+	observation, err := store.GetMergeGateStatusObservation(ctx, "gitmoot/gitmoot", 7)
+	if err != nil {
+		t.Fatalf("GetMergeGateStatusObservation returned error: %v", err)
+	}
+	if observation.HeadSHA != "abc123" || observation.Kind != mergeGateStatusMarker {
+		t.Fatalf("status observation = %+v, want successful retry at current head", observation)
+	}
+	gate, err := store.GetMergeGate(ctx, "gitmoot/gitmoot", 7)
+	if err != nil {
+		t.Fatalf("GetMergeGate returned error: %v", err)
+	}
+	if gate != blocked {
+		t.Fatalf("merge gate = %+v, want blocked verdict preserved as %+v", gate, blocked)
+	}
+}
+
+func TestPollOnceAutoMergeDisabledDoesNotPublishMarker(t *testing.T) {
+	ctx := context.Background()
+	store, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskChangesRequested)
+	daemon.AutoMergeEnabled = func(string) bool { return false }
+
+	for poll := 1; poll <= 2; poll++ {
+		if err := daemon.PollOnce(ctx); err != nil {
+			t.Fatalf("poll %d PollOnce returned error: %v", poll, err)
+		}
+	}
+	if len(client.statuses) != 0 {
+		t.Fatalf("statuses = %+v, want no marker when auto-merge is disabled", client.statuses)
+	}
+	if client.combinedStatusCalls != 1 {
+		t.Fatalf("GetCombinedStatus calls = %d, want one inactive-head probe", client.combinedStatusCalls)
+	}
+	observation, err := store.GetMergeGateStatusObservation(ctx, "gitmoot/gitmoot", 7)
+	if err != nil {
+		t.Fatalf("GetMergeGateStatusObservation returned error: %v", err)
+	}
+	if observation.HeadSHA != "abc123" || observation.Kind != mergeGateStatusInactive {
+		t.Fatalf("status observation = %+v, want inactive current head", observation)
+	}
+}
+
+func TestPollOnceExternalMergeGateDoesNotPublishMarker(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("GITMOOT_DISABLE_NATIVE_MERGE_GATE", "1")
+	store, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskChangesRequested)
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(client.statuses) != 0 {
+		t.Fatalf("statuses = %+v, want no marker when an external gate owns the decision", client.statuses)
+	}
+	observation, err := store.GetMergeGateStatusObservation(ctx, "gitmoot/gitmoot", 7)
+	if err != nil {
+		t.Fatalf("GetMergeGateStatusObservation returned error: %v", err)
+	}
+	if observation.Kind != mergeGateStatusInactive {
+		t.Fatalf("status observation = %+v, want inactive under an external gate", observation)
+	}
+}
+
+func TestPollOnceExternalMergeGateClearsGenericMarker(t *testing.T) {
+	ctx := context.Background()
+	t.Setenv("GITMOOT_DISABLE_NATIVE_MERGE_GATE", "1")
+	_, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskChangesRequested)
+	if _, err := client.CreateCommitStatus(ctx, github.CommitStatusInput{
+		Repo:        daemon.Repo,
+		SHA:         "abc123",
+		State:       "pending",
+		Context:     workflow.GitmootMergeGateContext,
+		Description: mergeGateUnclearedDescription,
+	}); err != nil {
+		t.Fatalf("seed CreateCommitStatus returned error: %v", err)
+	}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(client.statuses) != 2 {
+		t.Fatalf("statuses = %+v, want seeded marker followed by not-applied success", client.statuses)
+	}
+	cleared := client.statuses[1]
+	if cleared.State != "success" || cleared.Description != mergeGateNotAppliedDescription {
+		t.Fatalf("clearance status = %+v, want not-applied success", cleared)
+	}
+}
+
+func TestPollOnceAwaitingHumanClearsOnlyGenericMarker(t *testing.T) {
+	ctx := context.Background()
+	store, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskAwaitingHumanMerge)
+	if _, err := client.CreateCommitStatus(ctx, github.CommitStatusInput{
+		Repo:        daemon.Repo,
+		SHA:         "abc123",
+		State:       "pending",
+		Context:     workflow.GitmootMergeGateContext,
+		Description: mergeGateUnclearedDescription,
+	}); err != nil {
+		t.Fatalf("seed CreateCommitStatus returned error: %v", err)
+	}
+	if err := store.UpsertMergeGateStatusObservation(ctx, db.MergeGateStatusObservation{
+		RepoFullName: "gitmoot/gitmoot",
+		PullRequest:  7,
+		HeadSHA:      "abc123",
+		Kind:         mergeGateStatusMarker,
+	}); err != nil {
+		t.Fatalf("UpsertMergeGateStatusObservation returned error: %v", err)
+	}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(client.statuses) != 2 {
+		t.Fatalf("statuses = %+v, want marker followed by not-applied success", client.statuses)
+	}
+	cleared := client.statuses[1]
+	if cleared.State != "success" ||
+		cleared.Context != workflow.GitmootMergeGateContext ||
+		cleared.Description != mergeGateNotAppliedDescription {
+		t.Fatalf("clearance status = %+v, want not-applied success", cleared)
+	}
+	observation, err := store.GetMergeGateStatusObservation(ctx, "gitmoot/gitmoot", 7)
+	if err != nil {
+		t.Fatalf("GetMergeGateStatusObservation returned error: %v", err)
+	}
+	if observation.Kind != mergeGateStatusInactive {
+		t.Fatalf("status observation = %+v, want inactive", observation)
+	}
+}
+
+func TestPollOnceInactiveTaskPreservesRealGateVerdict(t *testing.T) {
+	ctx := context.Background()
+	store, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskAwaitingHumanMerge)
+	if _, err := client.CreateCommitStatus(ctx, github.CommitStatusInput{
+		Repo:        daemon.Repo,
+		SHA:         "abc123",
+		State:       "failure",
+		Context:     workflow.GitmootMergeGateContext,
+		Description: "external CI failed",
+	}); err != nil {
+		t.Fatalf("seed CreateCommitStatus returned error: %v", err)
+	}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(client.statuses) != 1 || client.statuses[0].State != "failure" {
+		t.Fatalf("statuses = %+v, want real gate verdict preserved", client.statuses)
+	}
+	observation, err := store.GetMergeGateStatusObservation(ctx, "gitmoot/gitmoot", 7)
+	if err != nil {
+		t.Fatalf("GetMergeGateStatusObservation returned error: %v", err)
+	}
+	if observation.Kind != mergeGateStatusInactive {
+		t.Fatalf("status observation = %+v, want reconciled inactive head", observation)
+	}
+}
+
+func TestPollOnceForkHeadCollidingWithReadyTaskRequestsNoMerge(t *testing.T) {
+	ctx := context.Background()
+	store, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskReadyToMerge)
+	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{Ready: true, Merged: true}}
+	daemon.Workflow = &workflow.Engine{Store: store, MergeGate: gate}
+	// Only the fork pull request is open: the local ready task's own PR is gone
+	// from the listing, so nothing but branch-name collision can reach the gate.
+	fork := client.pulls[0]
+	fork.Number = 99
+	fork.HeadRepoFullName = "fork/gitmoot"
+	fork.HeadSHA = "fork123"
+	client.pulls = []github.PullRequest{fork}
+	client.comments = map[int64][]github.IssueComment{99: {}}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: "gitmoot/gitmoot",
+		Number:       99,
+		HeadBranch:   "task-7",
+		BaseBranch:   "main",
+		HeadSHA:      "fork123",
+		State:        "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(gate.requests) != 0 {
+		t.Fatalf("merge gate requests = %+v, want none for a fork head", gate.requests)
+	}
+	task, err := store.GetTask(ctx, "task-7")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskReadyToMerge) {
+		t.Fatalf("task state = %q, want %q left untouched by a fork pull request", task.State, workflow.TaskReadyToMerge)
+	}
+}
+
+func TestPollOnceForkHeadCollidingWithManagedBranchGetsNoMarker(t *testing.T) {
+	ctx := context.Background()
+	store, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskChangesRequested)
+	// A fork pull request whose head branch TEXT collides with the managed
+	// task-7 branch. Seeded in the local mirror at its own head so routing sees
+	// no change and the marker reconciler is the only consumer under test.
+	fork := client.pulls[0]
+	fork.Number = 99
+	fork.HeadRepoFullName = "fork/gitmoot"
+	fork.HeadSHA = "fork123"
+	client.pulls = append(client.pulls, fork)
+	client.comments[99] = []github.IssueComment{}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: "gitmoot/gitmoot",
+		Number:       99,
+		HeadBranch:   "task-7",
+		BaseBranch:   "main",
+		HeadSHA:      "fork123",
+		State:        "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	// Non-vacuity: the poll must actually have iterated BOTH pulls. Without this
+	// the test would also pass if the fake silently stopped returning the fork PR,
+	// which is the one way a fork-rejection assertion can pass for the wrong reason.
+	if client.listIssueCommentsCalls != 2 {
+		t.Fatalf("per-PR ListIssueComments calls = %d, want 2 (managed PR and fork PR both polled)", client.listIssueCommentsCalls)
+	}
+	// The managed same-repo head is still marked in this very poll, so the guard
+	// rejects fork identity rather than disabling the feature.
+	if client.combinedStatusCalls != 1 || len(client.statuses) != 1 {
+		t.Fatalf("GetCombinedStatus calls = %d statuses = %+v, want exactly the managed head reconciled", client.combinedStatusCalls, client.statuses)
+	}
+	if client.statuses[0].SHA != "abc123" {
+		t.Fatalf("status SHA = %q, want the managed head abc123 and never the fork head", client.statuses[0].SHA)
+	}
+	if _, err := store.GetMergeGateStatusObservation(ctx, "gitmoot/gitmoot", 99); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetMergeGateStatusObservation error = %v, want no observation for a fork pull request", err)
+	}
+}
+
+func TestPollOnceMarkerObservationAvoidsRepeatedStatusReads(t *testing.T) {
+	ctx := context.Background()
+	_, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskChangesRequested)
+
+	for poll := 1; poll <= 2; poll++ {
+		if err := daemon.PollOnce(ctx); err != nil {
+			t.Fatalf("poll %d PollOnce returned error: %v", poll, err)
+		}
+	}
+	if len(client.statuses) != 1 {
+		t.Fatalf("statuses = %+v, want one marker write", client.statuses)
+	}
+	if client.combinedStatusCalls != 1 {
+		t.Fatalf("GetCombinedStatus calls = %d, want one current-head probe", client.combinedStatusCalls)
+	}
+}
+
+func TestPollOncePreservesExistingCurrentHeadGateStatus(t *testing.T) {
+	ctx := context.Background()
+	store, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskChangesRequested)
+	if _, err := client.CreateCommitStatus(ctx, github.CommitStatusInput{
+		Repo:        daemon.Repo,
+		SHA:         "abc123",
+		State:       "pending",
+		Context:     workflow.GitmootMergeGateContext,
+		Description: "external CI check is pending",
+	}); err != nil {
+		t.Fatalf("seed CreateCommitStatus returned error: %v", err)
+	}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(client.statuses) != 1 || client.statuses[0].Description != "external CI check is pending" {
+		t.Fatalf("statuses = %+v, want existing verdict unchanged", client.statuses)
+	}
+	observation, err := store.GetMergeGateStatusObservation(ctx, "gitmoot/gitmoot", 7)
+	if err != nil {
+		t.Fatalf("GetMergeGateStatusObservation returned error: %v", err)
+	}
+	if observation.Kind != mergeGateStatusObserved {
+		t.Fatalf("status observation = %+v, want observed gate verdict", observation)
+	}
+}
+
+func TestPollOnceUnmanagedPullRequestSkipsMergeGateStatusProbe(t *testing.T) {
+	ctx := context.Background()
+	_, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskChangesRequested)
+	client.pulls[0].HeadRef = "unmanaged"
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if client.combinedStatusCalls != 0 || len(client.statuses) != 0 {
+		t.Fatalf("GetCombinedStatus calls = %d statuses = %+v, want unmanaged PR untouched", client.combinedStatusCalls, client.statuses)
+	}
+}
+
+func TestPollOnceMarkerWriteFailureDoesNotBlockClearedHead(t *testing.T) {
+	ctx := context.Background()
+	store, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskReadyToMerge)
+	client.checks[0].Bucket = "pass"
+	client.checks[0].State = "COMPLETED"
+	client.checks[0].CompletedAt = "2026-08-31T03:20:15Z"
+	client.statusErrs = []error{errors.New("marker status bookkeeping unavailable")}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(client.statuses) != 2 || client.statuses[0].State != "pending" || client.statuses[1].State != "success" {
+		t.Fatalf("statuses = %+v, want failed pending attempt followed by success", client.statuses)
+	}
+	if len(client.merges) != 1 {
+		t.Fatalf("merge inputs = %+v, want one merge despite marker write failure", client.merges)
+	}
+	task, err := store.GetTask(ctx, "task-7")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskMerged) {
+		t.Fatalf("task state = %q, want %q", task.State, workflow.TaskMerged)
+	}
+}
+
 func TestMergeGateSkippedFanoutStaysPendingWhileNamedCheckRuns(t *testing.T) {
 	ctx := context.Background()
 	store, client, daemon, gate := newSkippedFanoutPendingGateDaemon(t, workflow.TaskReadyToMerge)
@@ -1182,8 +1719,11 @@ func TestPollOnceSkippedFanoutRetriesAfterPendingStatusWriteFailure(t *testing.T
 	if err := daemon.PollOnce(ctx); err != nil {
 		t.Fatalf("retry PollOnce returned error: %v", err)
 	}
-	if len(client.statuses) != 2 || client.statuses[1].State != "success" {
-		t.Fatalf("retry PollOnce statuses = %+v", client.statuses)
+	if len(client.statuses) != 3 ||
+		client.statuses[1].State != "pending" ||
+		client.statuses[1].Description != mergeGateUnclearedDescription ||
+		client.statuses[2].State != "success" {
+		t.Fatalf("retry PollOnce statuses = %+v, want failed pending, visible retry marker, then success", client.statuses)
 	}
 	if len(client.merges) != 1 {
 		t.Fatalf("retry PollOnce merge inputs = %+v", client.merges)
@@ -1297,14 +1837,28 @@ func newSkippedFanoutPendingGateDaemon(t *testing.T, initialState workflow.TaskS
 
 type mergeGateRaceGitHub struct {
 	*fakeGitHub
-	checks     []github.PullRequestCheck
-	statuses   []github.CommitStatusInput
-	statusErrs []error
-	merges     []github.MergePullRequestInput
+	checks              []github.PullRequestCheck
+	statuses            []github.CommitStatusInput
+	statusSucceeded     []bool
+	statusErrs          []error
+	combinedStatusCalls int
+	merges              []github.MergePullRequestInput
 }
 
-func (f *mergeGateRaceGitHub) GetCombinedStatus(context.Context, github.Repository, string) (github.CombinedStatus, error) {
-	return github.CombinedStatus{State: "success"}, nil
+func (f *mergeGateRaceGitHub) GetCombinedStatus(_ context.Context, _ github.Repository, ref string) (github.CombinedStatus, error) {
+	f.combinedStatusCalls++
+	statuses := make([]github.CommitStatus, 0, len(f.statuses))
+	for i, input := range f.statuses {
+		if i >= len(f.statusSucceeded) || !f.statusSucceeded[i] || input.SHA != ref {
+			continue
+		}
+		statuses = append(statuses, github.CommitStatus{
+			State:       input.State,
+			Context:     input.Context,
+			Description: input.Description,
+		})
+	}
+	return github.CombinedStatus{Statuses: statuses}, nil
 }
 
 func (f *mergeGateRaceGitHub) ListCheckRunsForRef(context.Context, github.Repository, string) ([]github.PullRequestCheck, error) {
@@ -1318,7 +1872,8 @@ func (f *mergeGateRaceGitHub) CreateCommitStatus(_ context.Context, input github
 		err = f.statusErrs[0]
 		f.statusErrs = f.statusErrs[1:]
 	}
-	return github.CommitStatus{Context: input.Context, State: input.State}, err
+	f.statusSucceeded = append(f.statusSucceeded, err == nil)
+	return github.CommitStatus{Context: input.Context, State: input.State, Description: input.Description}, err
 }
 
 func (f *mergeGateRaceGitHub) CompareCommits(context.Context, github.Repository, string, string) (github.CompareResult, error) {

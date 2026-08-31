@@ -139,6 +139,9 @@ func TestPipelineForkedShellIsolationEventWindowsE2E(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				if payload.ReadOnlySeat {
+					t.Fatalf("shell stage misclassified as a read-only runtime seat: %+v", payload)
+				}
 				key := queuedJobCheckoutKey(ctx, store, job)
 				if tc.isolate {
 					if payload.WorktreePath == "" || !payload.ReadOnlyWorktree || !strings.HasPrefix(key, "worktree:") {

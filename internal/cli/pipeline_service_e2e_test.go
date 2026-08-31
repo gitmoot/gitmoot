@@ -149,6 +149,9 @@ func TestPipelineServiceAcceptanceE2E(t *testing.T) {
 	if strings.TrimSpace(payload.WorktreePath) == "" || !payload.ReadOnlyWorktree || payload.WorktreePath == checkout || !strings.HasPrefix(payload.WorktreePath, filepath.Clean(paths.Home)+string(filepath.Separator)) {
 		t.Fatalf("service shell did not use a detached home-contained worktree: %+v", payload)
 	}
+	if payload.ReadOnlySeat {
+		t.Fatal("writable service shell was misclassified as a read-only runtime seat")
+	}
 	if !strings.Contains(payload.ReadOnlyWorktreeDiff, "?? out/kit.txt") {
 		t.Fatalf("composed pre-cleanup hooks did not capture the service worktree status: %q", payload.ReadOnlyWorktreeDiff)
 	}

@@ -12,11 +12,12 @@ import (
 // It is intended to wrap the innermost GroupRunner, beneath TeeRunner, so live
 // output and process-group cancellation retain their existing behavior.
 type WrappingRunner struct {
-	Inner         Runner
-	Executable    string
-	ReadablePaths []string
-	ReadableFiles []string
-	WritablePaths []string
+	Inner           Runner
+	Executable      string
+	ReadablePaths   []string
+	ReadableFiles   []string
+	WritablePaths   []string
+	ReadOnlyWorkdir bool
 	// Env is appended to the sandbox-exec process environment and inherited by
 	// the exec'd runtime. It is empty for every existing wrapper except Claude
 	// produce, which relocates its mutable config into its granted state dir.
@@ -40,6 +41,9 @@ func (r WrappingRunner) command(command string, args []string) (string, []string
 		}
 	}
 	wrapped := []string{"sandbox-exec"}
+	if r.ReadOnlyWorkdir {
+		wrapped = append(wrapped, "--read-only-workdir")
+	}
 	for _, path := range r.ReadablePaths {
 		wrapped = append(wrapped, "--read", path)
 	}

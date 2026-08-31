@@ -362,6 +362,9 @@ type Engine struct {
 	// whose default is false. Nil preserves the legacy enabled behavior for direct
 	// Engine constructions that do not participate in host configuration.
 	NativeReviewFanoutEnabled func(repo string) bool
+	// ReviewBlockingSeverity resolves the least severe review finding that may
+	// restart the fix loop for a repository. Nil preserves block-all behavior.
+	ReviewBlockingSeverity func(repo string) string
 	// RiskTiersEnabled gates the opt-in risk-tiered adaptive review (#650). When
 	// false (the default), HandlePullRequestOpened NEVER classifies a PR and runs
 	// the single-review fan-out byte-identically. When true, a PR opened event is
@@ -391,6 +394,13 @@ type Engine struct {
 	// wired only in cli (a GitHub read), keeping the engine free of the github
 	// client coupling.
 	PullRequestSignals func(ctx context.Context, repo string, number int) (labels []string, changedPaths []string, err error)
+	// ReviewChangedFiles resolves the repository-relative files changed from the
+	// exact head a reviewer last saw to the current PR head. A scoped follow-up
+	// never degrades SILENTLY: when this seam is unavailable or cannot scope the
+	// range, HandlePullRequestOpened records a review_scope_unavailable task event
+	// and re-reviews the full PR at that head, which re-anchors the prior head so
+	// the next round is scoped again.
+	ReviewChangedFiles func(ctx context.Context, repo string, pullRequest int, previousHead string, currentHead string) ([]string, error)
 }
 
 func (e Engine) block(ctx context.Context, ref taskRef, reason string) error {

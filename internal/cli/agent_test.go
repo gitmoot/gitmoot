@@ -1346,6 +1346,7 @@ func TestRunAgentAskBackgroundQueuesWithoutRuntimeDelivery(t *testing.T) {
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "branch", "-m", "main")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	seedGitHead(t, repoDir)
 	t.Chdir(repoDir)
 
 	var stdout, stderr bytes.Buffer
@@ -1401,7 +1402,7 @@ func TestRunAgentAskBackgroundQueuesWithoutRuntimeDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("daemonJobPayload returned error: %v", err)
 	}
-	if payload.Instructions != "Write a plan" || payload.Result != nil || len(payload.RawOutputs) != 0 {
+	if payload.Instructions != "Write a plan"+workflow.ReadOnlyWorktreeContextNote(repoDir) || payload.Result != nil || len(payload.RawOutputs) != 0 {
 		t.Fatalf("background payload = %+v", payload)
 	}
 }
@@ -1412,6 +1413,7 @@ func TestRunAgentAskBackgroundJSON(t *testing.T) {
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "branch", "-m", "main")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	seedGitHead(t, repoDir)
 	t.Chdir(repoDir)
 
 	var stdout, stderr bytes.Buffer
@@ -1448,6 +1450,7 @@ func TestRunAgentTypeSetListShowAndManagedBackgroundAsk(t *testing.T) {
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "branch", "-m", "main")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	seedGitHead(t, repoDir)
 	t.Chdir(repoDir)
 
 	var stdout, stderr bytes.Buffer
@@ -1802,6 +1805,7 @@ func TestDispatchManagedAgentStartsFreshInstanceWhenPolicyChanges(t *testing.T) 
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "branch", "-m", "main")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	seedGitHead(t, repoDir)
 	t.Chdir(repoDir)
 
 	var stdout, stderr bytes.Buffer
@@ -2066,6 +2070,7 @@ func TestRunAgentTypeSetMaxBackgroundCreatesSecondBusyInstance(t *testing.T) {
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "branch", "-m", "main")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	seedGitHead(t, repoDir)
 	t.Chdir(repoDir)
 
 	var stdout, stderr bytes.Buffer
@@ -2105,10 +2110,12 @@ func TestRunAgentTypeSetMaxBackgroundCapsAcrossRepos(t *testing.T) {
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "branch", "-m", "main")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	seedGitHead(t, repoDir)
 	otherRepoDir := t.TempDir()
 	runGit(t, otherRepoDir, "init")
 	runGit(t, otherRepoDir, "branch", "-m", "main")
 	runGit(t, otherRepoDir, "remote", "add", "origin", "https://github.com/owner/other.git")
+	seedGitHead(t, otherRepoDir)
 	t.Chdir(repoDir)
 
 	var stdout, stderr bytes.Buffer
@@ -2160,6 +2167,7 @@ func TestRunAgentTypeSetMaxBackgroundUsesOnlyActiveFallback(t *testing.T) {
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "branch", "-m", "main")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	seedGitHead(t, repoDir)
 	t.Chdir(repoDir)
 
 	var stdout, stderr bytes.Buffer
@@ -2251,6 +2259,7 @@ func TestRunAgentTypeSetMaxBackgroundCountsQueuedExpiredInstance(t *testing.T) {
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "branch", "-m", "main")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	seedGitHead(t, repoDir)
 	t.Chdir(repoDir)
 
 	var stdout, stderr bytes.Buffer

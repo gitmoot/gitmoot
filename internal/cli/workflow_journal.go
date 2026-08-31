@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -33,6 +35,8 @@ func runWorkflowJournal(args []string, stdout, stderr io.Writer) int {
 		return runWorkflowList(args[1:], stdout, stderr)
 	case "show":
 		return runWorkflowShow(args[1:], stdout, stderr)
+	case "show-note":
+		return runWorkflowNoteShow(args[1:], stdout, stderr)
 	case "describe":
 		return runWorkflowDescribe(args[1:], stdout, stderr)
 	case "note":
@@ -51,6 +55,7 @@ func printWorkflowJournalUsage(w io.Writer) {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot workflow list [--json]")
+	fmt.Fprintln(w, "  gitmoot workflow show-note <id> [--json]")
 	fmt.Fprintln(w, "  gitmoot workflow show <label> [--json] [--limit N]")
 	fmt.Fprintln(w, "  gitmoot workflow describe <label> \"<text>\" [--json]")
 	fmt.Fprintln(w, "  gitmoot workflow note <label> \"<body>\" [--author A] [--pane P] [--session ID] [--workdir PATH] [--no-auto] [--summary DESCRIPTION] [--status STATUS] [--remember [--remember-status] [--agent NAME] [--repo R]]")
@@ -426,6 +431,14 @@ func terminalSafeWorkflowText(value string) string {
 	return string(out)
 }
 
+func terminalSafeWorkflowBody(value string) string {
+	rendered := terminalSafeWorkflowText(value)
+	if utf8.RuneCountInString(value) > workflowTextLineMaxRunes {
+		return rendered + " [truncated; use --json for the full body]"
+	}
+	return rendered
+}
+
 func mergeWorkflowTimeline(jobs []db.Job, notes []db.WorkflowNote) []workflowTimelineEntry {
 	entries := make([]workflowTimelineEntry, 0, len(jobs)+len(notes))
 	for _, job := range jobs {
@@ -460,6 +473,62 @@ type workflowNoteOutput struct {
 	MemoryKey      string          `json:"memory_key,omitempty"`
 	AutoConfirmed  bool            `json:"auto_confirmed,omitempty"`
 	SkippedRetired bool            `json:"skipped_retired,omitempty"`
+}
+
+func runWorkflowNoteShow(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("workflow show-note", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	jsonOutput := fs.Bool("json", false, "print the stored note as JSON")
+	parsedArgs, err := reorderFlagArgs(args, map[string]struct{}{"home": {}}, map[string]struct{}{"json": {}})
+	if err != nil {
+		fmt.Fprintf(stderr, "workflow show-note: %v\n", err)
+		return 2
+	}
+	if err := fs.Parse(parsedArgs); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(stderr, "workflow show-note requires exactly one note id")
+		return 2
+	}
+	noteID, err := strconv.ParseInt(strings.TrimSpace(fs.Arg(0)), 10, 64)
+	if err != nil || noteID <= 0 {
+		fmt.Fprintf(stderr, "workflow show-note: invalid note id %q\n", fs.Arg(0))
+		return 2
+	}
+	var note db.WorkflowNote
+	if err := withStore(*home, func(store *db.Store) error {
+		var err error
+		note, err = store.GetWorkflowNote(context.Background(), noteID)
+		return err
+	}); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			fmt.Fprintf(stderr, "workflow note %d not found\n", noteID)
+			return 1
+		}
+		fmt.Fprintf(stderr, "workflow show-note: %v\n", err)
+		return 1
+	}
+	if *jsonOutput {
+		if err := writeJSON(stdout, note); err != nil {
+			fmt.Fprintf(stderr, "workflow show-note: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	writeLine(stdout, "note: %d", note.ID)
+	writeLine(stdout, "workflow: %s", note.WorkflowID)
+	writeLine(stdout, "author: %s", terminalSafeWorkflowText(note.Author))
+	if note.Repo != "" {
+		writeLine(stdout, "repo: %s", terminalSafeWorkflowText(note.Repo))
+	}
+	writeLine(stdout, "created: %s", note.CreatedAt)
+	writeLine(stdout, "body: %s", terminalSafeWorkflowBody(note.Body))
+	return 0
 }
 
 func runWorkflowNote(args []string, stdout, stderr io.Writer) int {

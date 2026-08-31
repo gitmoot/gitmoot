@@ -57,9 +57,12 @@ func assertEffectiveRuntimeRecordedWithoutOverride(t *testing.T, store *db.Store
 	t.Helper()
 	ctx := context.Background()
 
-	// The shell fixture really ran and the job reached terminal succeeded.
-	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("shell fixture did not run (marker missing): %v", err)
+	// A marker is only available on foreground paths. Detached read-only seats
+	// prove delivery through the persisted shell result below.
+	if marker != "" {
+		if _, err := os.Stat(marker); err != nil {
+			t.Fatalf("shell fixture did not run (marker missing): %v", err)
+		}
 	}
 	job, err := store.GetJob(ctx, jobID)
 	if err != nil {
@@ -194,7 +197,7 @@ func TestEffectiveRuntimeRecordedWithoutOverrideForegroundE2E(t *testing.T) {
 func TestEffectiveRuntimeRecordedWithoutOverrideDaemonE2E(t *testing.T) {
 	ctx := context.Background()
 	marker := filepath.Join(t.TempDir(), "shell-default-ran-daemon")
-	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
+	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(""))
 
 	var out, errBuf bytes.Buffer
 	code := Run([]string{
@@ -223,7 +226,7 @@ func TestEffectiveRuntimeRecordedWithoutOverrideDaemonE2E(t *testing.T) {
 	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, time.Now().UTC(), nil, nil); err != nil {
 		t.Fatalf("worker tick: %v", err)
 	}
-	assertEffectiveRuntimeRecordedWithoutOverride(t, store, output.JobID, marker)
+	assertEffectiveRuntimeRecordedWithoutOverride(t, store, output.JobID, "")
 }
 
 func TestEffectiveRuntimePersistenceFailureBlocksDaemonExecution(t *testing.T) {

@@ -680,6 +680,7 @@ func TestTranscriptRetentionForegroundAndDaemonShellE2E(t *testing.T) {
 	runGit(t, checkout, "init")
 	runGit(t, checkout, "branch", "-m", "main")
 	runGit(t, checkout, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	seedGitHead(t, checkout)
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 	script := `printf '%s\n' '{"gitmoot_result":{"decision":"approved","summary":"captured","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`
 	seedDaemonWorkerAgent(t, store, "capture-shell", runtime.ShellRuntime, script, []string{"ask"}, "owner/repo")

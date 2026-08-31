@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"sync"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
+	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
@@ -56,14 +58,6 @@ func TestEngineEmitsJobFinishedOnSucceededTerminal(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
-		RepoFullName:  "gitmoot/gitmoot",
-		Branch:        "task-9",
-		Owner:         "audit",
-		ActingOrgRole: "author",
-	}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
 	sink := &recordingSink{}
 	engine := testEngine(store)
 	engine.EventSink = sink
@@ -80,6 +74,7 @@ func TestEngineEmitsJobFinishedOnSucceededTerminal(t *testing.T) {
 		PullRequest:   42,
 		TaskID:        "task-9",
 		TaskTitle:     "Review",
+		LeadAgent:     "author",
 		ActingOrgRole: "reviewer",
 	}); err != nil {
 		t.Fatalf("Enqueue returned error: %v", err)
@@ -100,6 +95,9 @@ func TestEngineEmitsJobFinishedOnSucceededTerminal(t *testing.T) {
 	if ev.WakeTargetRole != "author" {
 		t.Fatalf("wake target role = %q, want author", ev.WakeTargetRole)
 	}
+	if got := ev.WakeTargetRoles; len(got) != 2 || got[0] != "reviewer" || got[1] != "author" {
+		t.Fatalf("wake target roles = %v, want [reviewer author]", got)
+	}
 	if ev.Cause != events.EventCauseReviewVerdict || ev.PullRequest != 42 || ev.ReviewDecision != "approved" {
 		t.Fatalf("review verdict metadata = %+v", ev)
 	}
@@ -111,9 +109,66 @@ func TestEngineEmitsJobFinishedOnSucceededTerminal(t *testing.T) {
 	}
 }
 
-func TestEngineEmitsChangesRequestedReviewVerdict(t *testing.T) {
+func TestEngineReviewVerdictResolverErrorDoesNotFallbackToLead(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "review-resolver-error", Agent: "audit", Type: "review", State: string(JobSucceeded), Payload: "{}",
+	}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("open raw database: %v", err)
+	}
+	defer raw.Close()
+	if _, err := raw.ExecContext(ctx, `DROP TABLE branch_locks`); err != nil {
+		t.Fatalf("drop branch_locks: %v", err)
+	}
+
+	sink := &recordingSink{}
+	engine := testEngine(store)
+	engine.EventSink = sink
+	engine.mailbox().emitTerminal(ctx, "review-resolver-error", JobSucceeded, JobPayload{
+		Repo:          "gitmoot/gitmoot",
+		Branch:        "task-resolver-error",
+		PullRequest:   46,
+		TaskID:        "task-resolver-error",
+		LeadAgent:     "stale-lead",
+		ActingOrgRole: "requester",
+		Result:        &AgentResult{Decision: "approved", Summary: "lookup failed"},
+	})
+
+	finished := sink.byType(events.EventJobFinished)
+	if len(finished) != 1 {
+		t.Fatalf("job.finished emissions = %d, want 1; all=%+v", len(finished), sink.snapshot())
+	}
+	event := finished[0]
+	if event.Cause != events.EventCauseReviewVerdict {
+		t.Fatalf("review verdict metadata = %+v", event)
+	}
+	if event.WakeTargetRole != "" {
+		t.Fatalf("primary wake target = %q, want empty after resolver error", event.WakeTargetRole)
+	}
+	if got := event.WakeTargetRoles; len(got) != 1 || got[0] != "requester" {
+		t.Fatalf("wake target roles = %v, want [requester]", got)
+	}
+}
+func TestEngineReturnsChangesRequestedToRequesterWithoutDefaultAutoFix(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+
+	seedAgent(t, store, "author", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "task-43",
+		RepoFullName: "gitmoot/gitmoot",
+		Title:        "Review routing",
+		State:        string(TaskReviewing),
+		Branch:       "task-43",
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
 	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
 		RepoFullName:  "gitmoot/gitmoot",
 		Branch:        "task-43",
@@ -122,27 +177,65 @@ func TestEngineEmitsChangesRequestedReviewVerdict(t *testing.T) {
 	}); err != nil || !acquired {
 		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
 	}
-	if err := store.CreateJob(ctx, db.Job{
-		ID: "review-43", Agent: "audit", Type: "review", State: string(JobSucceeded), Payload: "{}",
-	}); err != nil {
-		t.Fatalf("CreateJob returned error: %v", err)
-	}
 	sink := &recordingSink{}
 	engine := testEngine(store)
 	engine.EventSink = sink
-	mailbox := engine.mailbox()
-
-	mailbox.emitTerminal(ctx, "review-43", JobSucceeded, JobPayload{
+	if _, err := engine.mailbox().Enqueue(ctx, JobRequest{
+		ID:            "review-43",
+		Agent:         "audit",
+		Action:        "review",
 		Repo:          "gitmoot/gitmoot",
 		Branch:        "task-43",
 		PullRequest:   43,
-		ActingOrgRole: "auditor",
-		Result: &AgentResult{
-			Decision: "changes_requested",
-			Summary:  "one blocking issue",
-		},
-	})
+		HeadSHA:       "head43",
+		TaskID:        "task-43",
+		TaskTitle:     "Review routing",
+		LeadAgent:     "author",
+		Reviewers:     []string{"audit"},
+		ReviewRound:   "review-1",
+		Sender:        "local",
+		ActingOrgRole: "requester",
+	}); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+	agent := runtime.Agent{
+		Name:       "audit",
+		Runtime:    runtime.ShellRuntime,
+		RuntimeRef: "printf ok",
+		RepoScope:  "gitmoot/gitmoot",
+		Role:       "reviewer",
+	}
+	adapter := &fakeDelivery{outputs: []string{
+		`{"gitmoot_result":{"decision":"changes_requested","severity":"P2","summary":"one blocking issue","findings":[{"severity":"P2","file":"x.go","line":1,"title":"edge","body":"fix it"}],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+	}}
 
+	result, err := engine.RunJob(ctx, "review-43", agent, adapter)
+	if err != nil {
+		t.Fatalf("RunJob returned error: %v", err)
+	}
+	if result.Decision != "changes_requested" || result.Summary != "one blocking issue" {
+		t.Fatalf("result = %+v", result)
+	}
+	reviewJob := mustJob(t, store, "review-43")
+	persisted, err := ParseJobPayload(reviewJob.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload returned error: %v", err)
+	}
+	if persisted.Result == nil ||
+		persisted.Result.Decision != "changes_requested" ||
+		len(persisted.Result.Findings) != 1 {
+		t.Fatalf("persisted requester verdict = %+v", persisted.Result)
+	}
+	assertTaskState(t, store, "task-43", TaskChangesRequested)
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	for _, job := range jobs {
+		if job.Type == "implement" {
+			t.Fatalf("default changes_requested route dispatched implement job %s", job.ID)
+		}
+	}
 	finished := sink.byType(events.EventJobFinished)
 	if len(finished) != 1 {
 		t.Fatalf("job.finished emissions = %d, want 1; all=%+v", len(finished), sink.snapshot())
@@ -151,8 +244,95 @@ func TestEngineEmitsChangesRequestedReviewVerdict(t *testing.T) {
 	if event.Cause != events.EventCauseReviewVerdict ||
 		event.ReviewDecision != "changes_requested" ||
 		event.PullRequest != 43 ||
-		event.WakeTargetRole != "author" {
+		event.WakeTargetRole != "requester" ||
+		event.Detail != "one blocking issue" {
 		t.Fatalf("changes-requested verdict event = %+v", event)
+	}
+	if got := event.WakeTargetRoles; len(got) != 2 || got[0] != "requester" || got[1] != "author" {
+		t.Fatalf("wake target roles = %v, want [requester author]", got)
+	}
+}
+
+func TestEngineEmitsSubthresholdReviewVerdictAsApproved(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName:  "gitmoot/gitmoot",
+		Branch:        "task-45",
+		Owner:         "audit",
+		ActingOrgRole: "author",
+	}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "review-45", Agent: "audit", Type: "review", State: string(JobSucceeded), Payload: "{}",
+	}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	sink := &recordingSink{}
+	engine := testEngine(store)
+	engine.EventSink = sink
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+
+	engine.mailbox().emitTerminal(ctx, "review-45", JobSucceeded, JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		Branch:      "task-45",
+		PullRequest: 45,
+		Result: &AgentResult{
+			Decision: "changes_requested",
+			Severity: reviewseverity.P2,
+			Summary:  "non-blocking polish",
+		},
+	})
+
+	finished := sink.byType(events.EventJobFinished)
+	if len(finished) != 1 {
+		t.Fatalf("job.finished emissions = %d, want 1; all=%+v", len(finished), sink.snapshot())
+	}
+	if got := finished[0].ReviewDecision; got != "approved" {
+		t.Fatalf("sub-threshold review decision = %q, want approved", got)
+	}
+}
+
+func TestEngineEmitsPipelineReviewVerdictWithRawDecision(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName:  "gitmoot/gitmoot",
+		Branch:        "task-46",
+		Owner:         "audit",
+		ActingOrgRole: "author",
+	}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "pipeline-review-46", Agent: "audit", Type: "review", State: string(JobSucceeded), Payload: "{}",
+	}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	sink := &recordingSink{}
+	engine := testEngine(store)
+	engine.EventSink = sink
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+
+	engine.mailbox().emitTerminal(ctx, "pipeline-review-46", JobSucceeded, JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		Branch:      "task-46",
+		PullRequest: 46,
+		Sender:      PipelineJobSender,
+		Result: &AgentResult{
+			Decision: "changes_requested",
+			Severity: reviewseverity.P2,
+			Summary:  "pipeline stage failed",
+		},
+	})
+
+	finished := sink.byType(events.EventJobFinished)
+	if len(finished) != 1 {
+		t.Fatalf("job.finished emissions = %d, want 1; all=%+v", len(finished), sink.snapshot())
+	}
+	if got := finished[0].ReviewDecision; got != "changes_requested" {
+		t.Fatalf("pipeline review decision = %q, want raw changes_requested", got)
 	}
 }
 func TestEngineDoesNotClassifyNonReviewApprovedResult(t *testing.T) {

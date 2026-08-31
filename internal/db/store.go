@@ -11,12 +11,39 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/reviewseverity"
+
 	_ "modernc.org/sqlite"
 )
 
 type Store struct {
 	db   *sql.DB
 	path string
+	// reviewBlockingSeverity resolves the repository [review] blocking-severity
+	// policy. It exists only so awaited review-verdict facts wake their waiter
+	// with the SAME effective decision the engine acted on and the job.finished
+	// event carries; the db package cannot read config itself. nil (every store
+	// that never resolves review facts, and every test store) fails closed to
+	// block-all, under which the effective decision equals the raw one.
+	reviewBlockingSeverity func(repo string) string
+}
+
+// SetReviewBlockingSeverity installs the repository review-severity policy
+// resolver. Call it immediately after opening a store that will transition
+// review jobs; leaving it unset keeps the historical block-all reporting.
+func (s *Store) SetReviewBlockingSeverity(resolve func(repo string) string) {
+	s.reviewBlockingSeverity = resolve
+}
+
+func (s *Store) blockingSeverityFor(repo string) string {
+	if s == nil || s.reviewBlockingSeverity == nil {
+		return reviewseverity.DefaultBlocking
+	}
+	severity := strings.ToUpper(strings.TrimSpace(s.reviewBlockingSeverity(repo)))
+	if !reviewseverity.Valid(severity) {
+		return reviewseverity.DefaultBlocking
+	}
+	return severity
 }
 
 // CockpitPane records one live Herdr pane opened for a delegation subagent's

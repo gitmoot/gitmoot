@@ -314,41 +314,62 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 // eventRuleMatchesAddressee is the single scope gate shared by durable enqueue
 // and live evaluation. Addressed rules require positive target evidence;
 // observer rules deliberately retain fleet-wide oversight for address-less and
-// directed events alike.
+// directed events alike. Multi-address events match any listed role.
 func eventRuleMatchesAddressee(rule db.EventRule, event events.Event) bool {
 	if rule.Scope == db.EventRuleScopeObserver {
 		return true
 	}
-	target := strings.TrimSpace(event.WakeTargetRole)
-	return target != "" && strings.EqualFold(strings.TrimSpace(rule.WakeRole), target)
+	role := strings.TrimSpace(rule.WakeRole)
+	if role == "" {
+		return false
+	}
+	if target := strings.TrimSpace(event.WakeTargetRole); target != "" && strings.EqualFold(role, target) {
+		return true
+	}
+	for _, target := range event.WakeTargetRoles {
+		if target = strings.TrimSpace(target); target != "" && strings.EqualFold(role, target) {
+			return true
+		}
+	}
+	return false
 }
 
 // addressBlockedEvent enriches every blocked event at the event-sink source
 // boundary before webhook fanout or durable routing. Persisted job attribution
-// is the strongest ownership evidence; synthesized blocked-since events fall
-// back to the most-specific org role scoped to the event repository.
+// remains strongest only while that role belongs to the current live roster.
+// Archived or removed attribution falls back to the current live role selected
+// for the event repository.
 func (s *eventRuleSink) addressBlockedEvent(ctx context.Context, event events.Event) events.Event {
-	if event.Type != events.EventJobBlocked || strings.TrimSpace(event.WakeTargetRole) != "" {
+	if event.Type != events.EventJobBlocked {
 		return event
 	}
-	targetRole := ""
+	targetRole := workflow.NormalizeActingOrgRole(event.WakeTargetRole)
+	persistedRole := ""
 	if s.store != nil && strings.TrimSpace(event.JobID) != "" {
 		if job, err := s.store.GetJob(ctx, event.JobID); err == nil {
 			if payload, err := daemonJobPayload(job); err == nil {
-				if role := workflow.NormalizeActingOrgRole(payload.ActingOrgRole); role != "" {
-					targetRole = role
-				}
+				persistedRole = workflow.NormalizeActingOrgRole(payload.ActingOrgRole)
 			}
 		}
 	}
-	if targetRole == "" {
-		if cfg, ok := s.loadOrgConfig(); ok {
-			targetRole, _ = repoOrgOwner(cfg, event.Repo)
-		}
+	// A pre-addressed blocked event that did not copy persisted attribution is
+	// explicit routing from another producer and remains authoritative.
+	if targetRole != "" && (persistedRole == "" || !strings.EqualFold(targetRole, persistedRole)) {
+		return event
 	}
-	if targetRole != "" {
-		event.WakeTargetRole = targetRole
+	cfg, cfgOK := s.loadOrgConfig()
+	var roster orgRoster
+	if cfgOK {
+		roster = loadOrgRoster(ctx, s.store, cfg)
 	}
+	targetRole = ""
+	if cfgOK && orgRosterHasMember(roster, persistedRole) {
+		targetRole = persistedRole
+	}
+	if targetRole == "" && cfgOK {
+		targetRole, _ = repoOrgOwner(roster, cfg, event.Repo)
+	}
+	event.WakeTargetRole = targetRole
 	return event
 }
 
@@ -519,9 +540,13 @@ func eventRuleWakePrompt(kind string, event events.Event) string {
 		detail := truncateForWake(strings.TrimSpace(event.Detail), 320)
 		return fmt.Sprintf("gitmoot awaited fact for %s: %s", event.WakeTargetRole, detail)
 	}
-	// event.Detail is already redacted + absolute-path-scrubbed by events.NewEvent,
-	// so it is used as-is here (only trimmed and rune-safe truncated for the arg).
-	detail := truncateForWake(strings.TrimSpace(event.Detail), 320)
+	// event.Detail is already redacted and absolute-path-scrubbed by
+	// events.NewEvent. Reply batches are count-bounded and retain every retrieval
+	// command; other wake kinds keep the established argument cap.
+	detail := strings.TrimSpace(event.Detail)
+	if !strings.EqualFold(strings.TrimSpace(kind), db.WakeOutboxKindReply) {
+		detail = truncateForWake(detail, 320)
+	}
 	prompt := fmt.Sprintf("gitmoot %s event for job %s", kind, event.JobID)
 	if detail != "" {
 		prompt += ": " + detail

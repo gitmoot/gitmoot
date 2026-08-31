@@ -47,6 +47,23 @@ func TestWrappingRunnerRewritesArgvExactly(t *testing.T) {
 	}
 }
 
+func TestWrappingRunnerReadOnlyWorkdirArgv(t *testing.T) {
+	capture := &wrappingCaptureRunner{}
+	runner := WrappingRunner{
+		Inner:           capture,
+		Executable:      "/opt/gitmoot",
+		WritablePaths:   []string{"/cache"},
+		ReadOnlyWorkdir: true,
+	}
+	if _, err := runner.Run(context.Background(), "/review", "go", "test", "./..."); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"sandbox-exec", "--read-only-workdir", "--write", "/cache", "--", "go", "test", "./..."}
+	if capture.dir != "/review" || capture.command != "/opt/gitmoot" || !reflect.DeepEqual(capture.args, want) {
+		t.Fatalf("wrapped review call = dir %q command %q args %v, want /review /opt/gitmoot %v", capture.dir, capture.command, capture.args, want)
+	}
+}
+
 func TestWrappingRunnerPIDMethodsFallBackToPlainRunner(t *testing.T) {
 	tests := []struct {
 		name string

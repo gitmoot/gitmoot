@@ -21,6 +21,7 @@ func TestRunOrchestrateForwardsToBackgroundRun(t *testing.T) {
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "branch", "-m", "main")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	seedGitHead(t, repoDir)
 	t.Chdir(repoDir)
 
 	var stdout, stderr bytes.Buffer
@@ -121,6 +122,7 @@ func TestRunOrchestrateIgnoresMessageKeywords(t *testing.T) {
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "branch", "-m", "main")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	seedGitHead(t, repoDir)
 	t.Chdir(repoDir)
 
 	var stdout, stderr bytes.Buffer

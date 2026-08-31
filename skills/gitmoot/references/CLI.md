@@ -400,6 +400,7 @@ gitmoot repo auto-fix owner/repo --pr <number> --enable --by <role-or-agent> --r
 gitmoot repo set-interval --all (<duration>|default)
 gitmoot repo remove owner/repo
 gitmoot repo doctor owner/repo
+gitmoot repo collisions owner/repo [--limit N] [--json]
 gitmoot daemon start --poll 30s --workers 1
 gitmoot daemon start --session <root-job-id>
 gitmoot daemon start
@@ -412,6 +413,14 @@ gitmoot daemon stop
 For structured local state, use `gitmoot dashboard --json` or
 `gitmoot task list --repo owner/repo --json`. `gitmoot status --json` and
 `gitmoot task show` are not valid commands.
+
+`gitmoot repo collisions owner/repo` inspects at most the newest `--limit` open
+pull requests (default 25, maximum 100), compares each selected pair's current
+changed-filename sets, and prints one warning per non-empty intersection with
+both PR numbers and the sorted shared paths. It exits 1 when collisions exist, 0
+when every inspected pair is disjoint, and supports structured output with
+`--json`; a clean result is the iterable empty array `[]`. Rename history is not
+available, so a concurrent edit of a renamed path's old name may be missed.
 
 `gitmoot daemon status` always prints the configured daemon log path. For a
 running daemon, it also compares that file's last write with the daemon's
@@ -465,10 +474,11 @@ resolved `--poll` / `[daemon].poll` cadence; an explicit `--poll` stores a
 per-repo override. `repo list` renders the sentinel as `inherit`.
 `repo set-interval owner/repo <duration>` changes an override, `default` restores
 inheritance, and `--all` applies either value to every registered repo.
-`repo auto-fix` is a durable, per-PR scheduler control. `--disable` prevents a
-changes-requested auto-fix before ownership resolution or worktree allocation;
-`--enable` explicitly resumes it. Both forms require `--by` and `--reason`, and
-the latest attributed decision remains stored for that PR.
+`repo auto-fix` stores a durable, per-PR opt-in for unattended fix dispatch.
+By default, a changes-requested review reports its verdict to the requester and
+does not create an implement job. `--enable` opts that PR into auto-fix;
+`--disable` revokes the opt-in. Both forms require `--by` and `--reason`, and the
+latest attributed decision remains stored for that PR.
 `repo doctor owner/repo` checks a single repo's checkout/config health. If the
 registered checkout is missing or is no longer a Git worktree, Gitmoot verifies
 the recorded primary checkout, repairs the registration, and reports the
@@ -757,11 +767,38 @@ transition **instead of** `job.failed` (no preceding `job.failed`); the rule
 still holds and is forward-compatible with the older `job.failed`→`job.deferred`
 flap. See `docs/events.md` for the full contract.
 
-## Risk-Tiered Adaptive Review
+## Review Policy
 
-Scale review depth to a change's blast radius via the off-by-default `[review]`
-config section — it is **not** in the generated default config, so this is its
-discovery surface:
+Review severity controls whether a reported finding restarts the fix loop. The
+default preserves the existing block-all behavior:
+
+```toml
+[review]
+blocking_severity = "P3"
+
+[repos."themartianapp/keephair".review]
+blocking_severity = "P1"
+```
+
+The threshold is inclusive. `P1` blocks `P0` and `P1`; `P2` and `P3` still post
+their findings and record the raw `changes_requested` result, but Gitmoot treats
+the round as approved-with-notes and does not dispatch a fix. The global default
+is `P3`, so every valid finding blocks unless a repository overrides it.
+Configured values must be `P0`, `P1`, `P2`, or `P3`.
+An invalid `blocking_severity` value falls back to `P3` while other valid review
+fields remain active. Any other review-policy parse or read error rejects the
+entire applied review policy, restoring `P3` with native fanout and risk tiers
+off.
+
+The threshold applies to native review rounds only. A pipeline review stage is
+report-only — the pipeline advancer owns folding its verdict — so its raw
+`changes_requested` keeps blocking the merge gate at every threshold and never
+counts toward required-reviewer approval.
+
+### Risk-Tiered Adaptive Review
+
+Set `risk_tiers_enabled = true` in `[review]` to scale review depth to a
+change's blast radius:
 
 ```toml
 [review]
@@ -772,20 +809,21 @@ risk_label_high = "risk:high"                 # PR label that forces the high ti
 risk_label_routine = "risk:routine"           # PR label that forces the routine tier
 ```
 
-With `risk_tiers_enabled = true`, each opened PR is classified — **explicit PR
+With `risk_tiers_enabled = true`, each opened PR is classified: **explicit PR
 label > changed-path glob match > default routine** (a `risk:high`/`risk:routine`
 label wins over paths; a high label wins a label tie). A `routine` PR keeps the
 unchanged single-reviewer fan-out. A `high` PR instead fans out a delegation
-batch of **refutation-framed lens reviewers** (correctness, security, and — with
-≥3 configured reviewers — regression), each prompted to *disprove* the change and
-return structured findings `{lens, refuted, severity, confidence, evidence}` in
-`gitmoot_result.findings`. The lenses are synthesized by the existing delegation
-`synthesis_rule = quorum` engine: **any critical-severity refutation (a `blocked`
-lens decision) fails the quorum and blocks the merge**; unanimous approval
-satisfies it. The resolved tier is recorded as a `risk_tier_resolved` job event so
-an escalation is explainable in the report/dashboard. With the section absent or
-`risk_tiers_enabled` off, PR review is byte-identical to the single-reviewer path.
-The competition tier (two implementations + a judge) is a planned follow-up.
+batch of **refutation-framed lens reviewers** (correctness, security, and, with
+three or more configured reviewers, regression), each prompted to *disprove*
+the change and return structured findings `{lens, refuted, severity, confidence,
+evidence}` in `gitmoot_result.findings`. The lenses are synthesized by the
+existing delegation `synthesis_rule = quorum` engine: **any blocking refutation
+fails the quorum and blocks the merge**; the configured quorum of effective
+approvals satisfies it. The resolved tier is recorded as a
+`risk_tier_resolved` job event so an escalation is explainable in the
+report/dashboard. With `risk_tiers_enabled`
+off, PR review uses the single-reviewer path. The competition tier (two
+implementations + a judge) is a planned follow-up.
 
 ## Bug Reports
 
@@ -1118,14 +1156,16 @@ from PR comments continue to validate their fix target when the workflow
 advances until [gitmoot#1433](https://github.com/gitmoot/gitmoot/issues/1433)
 adds the corresponding ingress preflight.
 
-When an engine review returns `changes_requested`, its implement fix job gets an
-independent writable per-job clone checked out on the task branch at the fetched
-remote head. It does not execute in the review Task's empty worktree path or the
-registered checkout, so it cannot interleave with an operator's uncommitted
-files. Allocation fails closed before enqueue; there is no registered-checkout
-fallback. The clone stays attached to the real branch so the fix can commit and
-push, then terminal cleanup (with the delegation-worktree TTL as a backstop)
-removes only the clone.
+When an engine review returns `changes_requested`, Gitmoot persists the verdict
+and wakes the requester's org role without creating an implement job. If that
+PR has an explicit `repo auto-fix --enable` policy, the resulting implement fix
+job gets an independent writable per-job clone checked out on the task branch
+at the fetched remote head. It does not execute in the review Task's empty
+worktree path or the registered checkout, so it cannot interleave with an
+operator's uncommitted files. Allocation fails closed before enqueue; there is
+no registered-checkout fallback. The clone stays attached to the real branch so
+the fix can commit and push, then terminal cleanup (with the
+delegation-worktree TTL as a backstop) removes only the clone.
 
 Before delivery, these dispatch commands scan commit-shaped tokens against the
 target repository. Ask and implement preserve their existing scanner input;
@@ -1540,12 +1580,29 @@ claimed by any role; each failure includes category counts and a reason.
 `org brief --role` defaults to `GITMOOT_ORG_ROLE`; an explicit flag wins.
 `gitmoot org show [--home PATH]` prints the resolved role table.
 
-`gitmoot org seat add <name> --pane <label> [--parent ROLE] [--scope REPO,...]
-[--merge-rule owner|self|none] [--home DIR]` claims the one live Herdr pane
-with that exact label, writes or repairs the role's `pane` binding, and installs
-addressed `reply`, `blocked`, `directive`, `escalation`, and `fact` routes with stable
-IDs `org-seat-<name>-<kind>`. Duplicate labels hard-fail instead of choosing a
-pane.
+`gitmoot org seat add <name> [--pane ID_OR_LABEL] [--parent ROLE]
+[--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]` creates or
+repairs a role and installs addressed `reply`, `blocked`, `directive`,
+`escalation`, and `fact` routes with stable IDs `org-seat-<name>-<kind>`.
+
+With `--pane`, Gitmoot resolves a literal live pane id first, then a unique
+exact live label, and stores the resolved pane id. Existing label-based commands
+therefore keep working; re-running one for the same resolved pane canonicalizes
+that existing binding to the pane id. Later cosmetic label changes do not
+retarget or break bindings written by this command. Duplicate labels, unknown
+references, and a supplied but empty `--pane` hard-fail before any role or route
+is written.
+Omit `--pane` to create an unbound role and the same routes; re-run the command
+with `--pane ID_OR_LABEL` to bind that role later. If a configured binding stops
+resolving, for example after Herdr recreates a pane with a new id, the same
+command can rebind the role to a live unclaimed pane while preserving its policy
+and routes. A configured binding that still resolves is immutable. An ambiguous
+label binding must be disambiguated in Herdr before rebinding. Every successful
+add validates the affected role and five routes. Bound creation and repair also
+validate the live binding without making unrelated intentionally unbound roles
+decide the exit code. Unbound creation reports the deferred bind command and an
+`ok role NAME unbound enabled_routes=5` verdict. The global `org validate` command
+continues to report every unbound role until it is attached.
 
 For a new non-owner seat, the acting role comes from `GITMOOT_ORG_ROLE` and
 falls back to `owner` only when the variable is unset. The new seat inherits
@@ -1554,19 +1611,28 @@ role and cannot create a cycle. An explicit `--scope` must stay within both the
 acting role's scope and the selected parent's scope. Merge authority defaults
 to empty; an explicit `--merge-rule` cannot exceed the acting role's authority.
 The empty-registry `owner` bootstrap keeps its `*` scope and `owner` merge rule.
-The three role flags initialize new seats only; re-running the command repairs
-missing owned pieces without rewriting existing role policy or duplicating
-routes. The command finishes with the same reality validation as `org validate`,
-so success includes a green live-pane and route verdict rather than only
-confirming that config parsed.
+The three policy flags initialize new seats only. An existing role accepts an
+explicit policy value only when it matches the stored value; `--scope` matches
+as an unordered set, and a changed value is rejected instead of being silently
+ignored. An invalid `--merge-rule` is always rejected as invalid, on new and
+existing roles alike. Re-running with matching values or without those flags
+repairs missing owned pieces, fills an empty pane binding, canonicalizes a
+matching label binding, or replaces a non-empty binding only when its former
+target no longer resolves. It does not rewrite existing policy or duplicate
+routes.
 
-`gitmoot org seat rm <name> [--home DIR]` resolves the role's live pane and
-checks every distinct Git checkout reported by that pane's `cwd` and
-`foreground_cwd`. It refuses a dirty checkout or a branch whose `HEAD` is not
-merged into the locally known `origin/HEAD` (falling back to `origin/main`);
-unreadable branch state also fails closed. A safe removal deletes the role and
-all of its wake routes, closes the pane, and then runs the same reality
-validation. Roles that still parent another role cannot be removed.
+`gitmoot org seat rm <name> [--home DIR]` resolves the role's live pane when it
+has a binding and checks every distinct Git checkout reported by that pane's
+`cwd` and `foreground_cwd`. It refuses a dirty checkout or a branch whose `HEAD`
+is not merged into the locally known `origin/HEAD` (falling back to
+`origin/main`); unreadable branch state also fails closed. A safe removal deletes
+the role and all of its wake routes, closes a resolved live pane, and validates
+that the role, routes, and closed pane are absent. A role with no configured
+binding has no pane to inspect or close, so removal deletes only that role and
+its routes. A configured binding that is stale, absent, or ambiguous fails
+closed before mutation and reports the `org seat add` rebind command. A provider
+error for a configured binding also fails closed. Roles that still parent
+another role cannot be removed.
 
 The five provisioned routes are enabled, addressed, and have an empty match
 filter. Remove one by its stable ID with `org events rule rm` to quiet that kind;
@@ -1578,10 +1644,13 @@ The registry uses `[org] enforce = "warn"|"block"` and
 cosmetic `display_name`, an optional `model` runtime pin, an optional per-role
 `recycle_after` duration override, and an optional `pane` Herdr binding (used by
 live presence and org event-rule wakes).
-The binding resolves as a unique exact live pane label or a currently live
-literal pane id. Roles without a binding report unknown live presence, and event
-wakes for them are skipped with an observable log and increment the role's
-missed-wake counter rather than being inferred from a pane label. There is
+For backward compatibility, a configured binding resolves as a literal pane id
+or a unique exact live label. A literal id tracks one pane; a label tracks
+whichever current pane uniquely carries that cosmetic value. `org seat add`
+canonicalizes new bindings to ids. Roles without a binding report unknown live
+presence, and event wakes for them are skipped with an observable log and
+increment the role's missed-wake counter rather than being inferred from a pane
+label. There is
 exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
 `owner/repo`, and each child scope must be covered by its parent. Malformed
 org configuration fails closed and loudly. `brief` records passive last-seen
@@ -1698,6 +1767,20 @@ practice of typing organization questions into notes or panes; there is no
 code-level marker to migrate. The note and a `pending` wake outbox row commit
 atomically. With an opt-in `reply` rule, a daemon tick wakes the addressed role
 through its configured Herdr pane.
+
+`gitmoot org message send --to <role> --workflow <label> [--org-role
+<from-role>] [--repo <owner/repo>] [--json] "<message>"` records a durable
+sender-attributed heads-up between two distinct configured roles. The roles may
+message each other if and only if their non-empty `parent` values are equal.
+Repository scope does not grant this channel, and `owner` has no special case.
+The typed note
+`[org:message to=<to> from=<from> wf=<workflow>] <message>` and its addressed
+`reply:<role>` wake row commit atomically. The wake includes the exact
+`gitmoot workflow show-note <id>` retrieval command; that command renders the
+citable row's workflow, author, optional repository, timestamp, and body, or
+returns the row as JSON. Plain output marks bodies above 512 runes as truncated
+and points to `--json`; JSON preserves the full stored body. Messages create no
+directive, acknowledgment, completion, TTL, or nag obligation.
 
 `gitmoot org escalate resolve <escalation-note-id> [--by <role>] [--note
 <answer-note-id>] [--home <dir>]` appends a typed resolution marker to the same
@@ -1822,9 +1905,12 @@ gitmoot org events rule rm --home /alternate/home <rule-id>
 `review-verdict`, `blocked`, `recycle-overdue`, `pane_input_pending`, `reply`,
 `directive`, or `fact`. A successful review terminal whose decision is
 `approved` or `changes_requested` matches both `job-terminal` and
-`review-verdict` and addresses the resolved pull request owner. If no owner can
-be resolved, addressed rules fail closed while observer rules remain eligible.
-`pane_input_pending` matches the
+`review-verdict` and addresses both the requesting org role and the resolved
+implementing role. When a successful ownership lookup finds no implement job
+or branch lock attribution, the review's persisted lead identifies a
+persistent implementing seat; lookup errors remain fail-closed. If neither
+role can be resolved, addressed rules fail closed while observer rules remain
+eligible. `pane_input_pending` matches the
 `org.input_pending` event emitted when Herdr continuously reports
 `input_pending: true` for a role's pane longer than
 `[orchestrate].blocked_role_wake_after`; it re-nudges at most once per that
@@ -1918,6 +2004,7 @@ gitmoot workflow list
 gitmoot workflow show fable/dashboard-redesign --limit 100
 gitmoot workflow describe fable/dashboard-redesign "Coordinate and ship the dashboard redesign."
 gitmoot workflow note fable/dashboard-redesign "Implementation started." --author operator --status active
+gitmoot workflow show-note 42
 gitmoot workflow close fable/dashboard-redesign --reason "Shipped and verified."
 ```
 
@@ -2668,7 +2755,12 @@ disables it (a negative value is rejected). Unlike `[orchestrate].escalation_ttl
 
 Native task auto-merge is enabled by default only behind an exact-head approved
 review and green SHA-scoped commit statuses/check-runs. A gate miss parks the
-task as `awaiting_human_merge`, records an org escalation, and wakes `jarvis`.
+task as `awaiting_human_merge` and records an org escalation. It selects the
+most-specific live role whose scope matches the repo and addresses that role's
+nearest live chart ancestor. With no live scope match it addresses a live
+`owner`; a root match addresses itself. With no live upward recipient, the gate
+fails closed without journaling an addressed note. Archive filtering does not
+predict delivery; `org validate` reports missing wake routes and pane bindings.
 Set `[repos."owner/repo".merge_gate] auto_merge = false` as an explicit
 kill-switch; that deliberate hold does not escalate. Pipeline `allow_auto_merge`
 is independent, and an authorized `@gitmoot merge` remains an explicit override.

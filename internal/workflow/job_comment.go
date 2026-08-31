@@ -12,13 +12,25 @@ const maxCommentFieldRunes = 2000
 const maxCommentBodyRunes = 60000
 
 type JobResultComment struct {
-	AgentName  string
-	Runtime    string
-	JobID      string
-	JobState   string
-	Payload    JobPayload
-	Result     *AgentResult
-	Diagnostic string
+	AgentName              string
+	Runtime                string
+	JobID                  string
+	JobType                string
+	JobState               string
+	Payload                JobPayload
+	Result                 *AgentResult
+	ReviewBlockingSeverity string
+	Diagnostic             string
+}
+
+// commentReviewPayload adapts a render request to the stored-payload shape the
+// folding authority takes. Result is threaded from the comment because callers
+// pass an OUTWARD result (delivery-blocked results are redacted) that can differ
+// from the one embedded in Payload.
+func commentReviewPayload(comment JobResultComment) JobPayload {
+	payload := comment.Payload
+	payload.Result = comment.Result
+	return payload
 }
 
 func RenderJobResultComment(comment JobResultComment) string {
@@ -52,6 +64,28 @@ func RenderJobResultComment(comment JobResultComment) string {
 	}
 	writeScalar(&builder, "Decision", "`"+markdownInline(decision)+"`")
 	writeScalar(&builder, "Summary", limitCommentText(summary))
+	if comment.Result != nil && strings.TrimSpace(comment.Result.Severity) != "" {
+		writeScalar(&builder, "Severity", "`"+markdownInline(comment.Result.Severity)+"`")
+	}
+	// The renderer folds the payload, not the bare result: the daemon separately
+	// zeroes ReviewBlockingSeverity for pipeline senders, but relying on that
+	// distant guard is what let the pipeline exemption go missing at other call
+	// sites. Keeping the invariant local makes it hold regardless of the caller.
+	if comment.Result != nil && strings.EqualFold(strings.TrimSpace(comment.JobType), "review") {
+		effective := effectiveReviewDecisionForPayload(commentReviewPayload(comment), comment.ReviewBlockingSeverity)
+		rawDecision := strings.TrimSpace(comment.Result.Decision)
+		if strings.EqualFold(rawDecision, "changes_requested") &&
+			strings.EqualFold(strings.TrimSpace(effective), "approved") {
+			outcome := "`approved-with-notes`"
+			severity := strings.TrimSpace(comment.Result.Severity)
+			threshold := normalizedReviewBlockingSeverity(comment.ReviewBlockingSeverity)
+			if severity != "" {
+				outcome += " (`" + markdownInline(severity) + "` is below repository blocking severity `" +
+					markdownInline(threshold) + "`; findings remain posted)"
+			}
+			writeScalar(&builder, "Review Outcome", outcome)
+		}
+	}
 
 	if comment.Result != nil {
 		writeFindings(&builder, comment.Result.Findings)

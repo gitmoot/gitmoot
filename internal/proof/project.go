@@ -267,7 +267,16 @@ func (p *projector) factNodes(job db.Job, projection payloadProjection, result *
 			if comparable {
 				attrs["independent"] = strconv.FormatBool(independent)
 			}
-			if result.Decision == "approved" {
+			effectiveDecision := strings.TrimSpace(result.Decision)
+			approvalSource := "jobs.review"
+			if effectiveDecision == "changes_requested" &&
+				hasJobEvent(p.events[job.ID], workflow.ReviewApprovedWithNotesEventKind) {
+				effectiveDecision = "approved"
+				attrs["effective_decision"] = effectiveDecision
+				attrs["review_outcome"] = "approved-with-notes"
+				approvalSource = "job_event." + workflow.ReviewApprovedWithNotesEventKind
+			}
+			if effectiveDecision == "approved" {
 				claimType := "review.approved"
 				if independent {
 					claimType = "review.independent_approved"
@@ -275,7 +284,7 @@ func (p *projector) factNodes(job db.Job, projection payloadProjection, result *
 					claimType = "review.self_approved"
 				}
 				claims = append(claims, Claim{
-					Type: claimType, Grade: GradeObserved, Source: "jobs.review",
+					Type: claimType, Grade: GradeObserved, Source: approvalSource,
 					EvidenceRef: job.ID, AsOf: job.UpdatedAt,
 				})
 			}
@@ -615,6 +624,15 @@ func eventRef(event db.JobEvent) string {
 	}{event.JobID, event.Kind, event.Message, event.CreatedAt})
 	sum := sha256.Sum256(raw)
 	return hashPrefix + hex.EncodeToString(sum[:])
+}
+
+func hasJobEvent(events []db.JobEvent, kind string) bool {
+	for _, event := range events {
+		if event.Kind == kind {
+			return true
+		}
+	}
+	return false
 }
 
 func sortedEvents(events []db.JobEvent) []db.JobEvent {
