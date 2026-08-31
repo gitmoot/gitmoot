@@ -1191,7 +1191,7 @@ func reclaimTerminalTaskWorktrees(ctx context.Context, worker jobWorker, repoFil
 			writeLine(stdout, "terminal task worktree reclaim candidate %s has an empty registered repo checkout", task.ID)
 			continue
 		}
-		engine := worker.workflowForJob(checkout, subprocess.ExecRunner{})
+		engine := worker.workflowForHost(checkout)
 		manager, ok := engine.DelegationWorktrees.(workflow.WritableWorktreeLineageManager)
 		if !ok || manager == nil {
 			writeLine(stdout, "terminal task worktree reclaim candidate %s has no writable worktree manager", task.ID)

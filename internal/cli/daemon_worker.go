@@ -3191,6 +3191,12 @@ func (w jobWorker) defaultStartAdapter(backend execbackend.Backend, runtimeName 
 func (w jobWorker) defaultWorkflow(checkout string) workflow.Engine {
 	return w.defaultWorkflowForRunner(checkout, subprocess.ExecRunner{})
 }
+func (w jobWorker) workflowForHost(checkout string) workflow.Engine {
+	if w.WorkflowFactory != nil {
+		return w.WorkflowFactory(checkout)
+	}
+	return w.defaultWorkflow(checkout)
+}
 
 func (w jobWorker) defaultWorkflowForRunner(checkout string, runner subprocess.Runner) workflow.Engine {
 	engine := daemonWorkflowEngineForRunner(w.Store, github.NewClient(checkout), checkout, w.workflowHome(), runner)
