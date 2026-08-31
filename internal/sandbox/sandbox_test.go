@@ -126,6 +126,7 @@ if cat "$4" >/dev/null 2>&1; then exit 43; fi
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + filepath.Join(cacheDir, "home"),
 		"GOTOOLCHAIN=go1.26.0",
+		"GOFLAGS=-modcacherw",
 		"GOCACHE=" + filepath.Join(cacheDir, "go-build"),
 		"GOMODCACHE=" + filepath.Join(cacheDir, "go-mod"),
 		"GOPATH=" + filepath.Join(cacheDir, "gopath"),
