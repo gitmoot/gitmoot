@@ -599,7 +599,8 @@ func (w jobWorker) recordSupersededSettlement(ctx context.Context, jobID string,
 }
 
 func (w jobWorker) reviewBlockingSeverityForComment(job db.Job, payload workflow.JobPayload) string {
-	if !strings.EqualFold(strings.TrimSpace(job.Type), "review") {
+	if !strings.EqualFold(strings.TrimSpace(job.Type), "review") ||
+		strings.EqualFold(strings.TrimSpace(payload.Sender), workflow.PipelineJobSender) {
 		return ""
 	}
 	return loadReviewConfig(w.ConfigHome).For(payload.Repo).BlockingSeverity

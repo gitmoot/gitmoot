@@ -506,24 +506,19 @@ func TestReviewDelegationQuorumThresholdOnlyAppliesToReviewChildren(t *testing.T
 	}
 }
 
-func TestDelegationVoteBlockingSeverityOnlyAppliesToReviewChildren(t *testing.T) {
+func TestDelegationVotePreservesSucceededStateContract(t *testing.T) {
 	delegations := []Delegation{{
-		ID: "verdict", Action: "review", SynthesisRule: "vote",
+		ID: "verdict", Action: "ask", SynthesisRule: "vote",
 	}}
 	children := map[string]db.Job{
-		"verdict": {ID: "verdict", Type: "review", State: string(JobSucceeded)},
+		"verdict": {ID: "verdict", Type: "ask", State: string(JobSucceeded)},
 	}
-	payloads := map[string]JobPayload{
-		"verdict": {Result: &AgentResult{Decision: "changes_requested", Severity: reviewseverity.P2}},
-	}
-	if !delegationVoteSatisfied(delegations, children, payloads, reviewseverity.P1) {
-		t.Fatal("sub-threshold review child must satisfy a vote")
-	}
-	for _, action := range []string{"ask", "implement"} {
-		delegations[0].Action = action
-		children["verdict"] = db.Job{ID: "verdict", Type: action, State: string(JobSucceeded)}
-		if delegationVoteSatisfied(delegations, children, payloads, reviewseverity.P1) {
-			t.Fatalf("sub-threshold %s child must retain its raw non-approving decision", action)
+	for _, decision := range []string{"skipped", "changes_requested"} {
+		payloads := map[string]JobPayload{
+			"verdict": {Result: &AgentResult{Decision: decision, Severity: reviewseverity.P2}},
+		}
+		if !delegationVoteSatisfied(delegations, children, payloads) {
+			t.Fatalf("succeeded child with decision %q must satisfy the documented vote contract", decision)
 		}
 	}
 }

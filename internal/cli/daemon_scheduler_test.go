@@ -615,6 +615,45 @@ func TestRunQueuedReviewCommentExplainsApprovedWithNotes(t *testing.T) {
 	}
 }
 
+func TestPipelineReviewCommentDoesNotClaimApprovedWithNotes(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[review]\nblocking_severity = \"P1\"\n"), 0o600); err != nil {
+		t.Fatalf("write review config: %v", err)
+	}
+	worker := defaultJobWorker(nil, io.Discard, home)
+	payload := workflow.JobPayload{
+		Repo:   "owner/repo",
+		Sender: workflow.PipelineJobSender,
+	}
+	job := db.Job{ID: "pipeline-review", Type: "review", State: string(workflow.JobSucceeded)}
+	threshold := worker.reviewBlockingSeverityForComment(job, payload)
+	if threshold != "" {
+		t.Fatalf("pipeline review comment threshold = %q, want raw report-only handling", threshold)
+	}
+	body := workflow.RenderJobResultComment(workflow.JobResultComment{
+		JobID:                  job.ID,
+		JobType:                job.Type,
+		JobState:               job.State,
+		Payload:                payload,
+		ReviewBlockingSeverity: threshold,
+		Result: &workflow.AgentResult{
+			Decision: "changes_requested",
+			Severity: "P2",
+			Summary:  "pipeline stage failed",
+		},
+	})
+	if !strings.Contains(body, "**Decision:** `changes_requested`") {
+		t.Fatalf("pipeline review comment lost raw decision:\n%s", body)
+	}
+	if strings.Contains(body, "**Review Outcome:**") {
+		t.Fatalf("pipeline review comment claimed an engine-level outcome:\n%s", body)
+	}
+}
+
 func TestRunQueuedJobsPostsMalformedOutputDiagnosticComment(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)

@@ -73,7 +73,7 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 	// succeeded. The default ("" / "summary") concatenates child summaries into
 	// the continuation prompt below.
 	if delegationSynthesisRequiresVote(parentResult.Delegations) &&
-		!delegationVoteSatisfied(parentResult.Delegations, children, childPayloads, e.reviewBlockingSeverity(parentPayload.Repo)) {
+		!delegationVoteSatisfied(parentResult.Delegations, children, childPayloads) {
 		reason := fmt.Sprintf("delegation synthesis_rule vote failed: not all delegated children for %s were approved/succeeded", parentJob.ID)
 		// #758: a pipeline-orchestrate root has no task; a synthesis-gate block would
 		// strand its chain with no foldable tail. Route to the finalize continuation
@@ -1273,24 +1273,23 @@ func delegationSynthesisRequiresVote(delegations []Delegation) bool {
 	return false
 }
 
-// delegationVoteSatisfied reports whether every delegation's child reached an
-// approving outcome. Parsed results are decision-first because a review's
-// changes_requested result maps to a succeeded job state. Review legs apply the
-// repository blocking threshold; ask and implement legs retain raw decisions.
-func delegationVoteSatisfied(delegations []Delegation, children map[string]db.Job, childPayloads map[string]JobPayload, blockingSeverity string) bool {
+// delegationVoteSatisfied preserves the vote contract: a succeeded child counts
+// regardless of its result decision. This intentionally differs from quorum and
+// verify, where skipped abstains and parsed review decisions are threshold-aware.
+func delegationVoteSatisfied(delegations []Delegation, children map[string]db.Job, childPayloads map[string]JobPayload) bool {
 	for _, d := range delegations {
 		child, ok := children[d.ID]
 		if !ok {
 			return false
 		}
-		if payload, ok := childPayloads[d.ID]; ok && payload.Result != nil {
-			decision := effectiveDelegationDecision(payload.Result, child.Type, d.Action, blockingSeverity)
-			if !delegationDecisionApproves(decision) {
-				return false
-			}
+		if child.State == string(JobSucceeded) {
 			continue
 		}
-		if child.State != string(JobSucceeded) {
+		payload, ok := childPayloads[d.ID]
+		if !ok || payload.Result == nil {
+			return false
+		}
+		if !delegationDecisionApproves(payload.Result.Decision) {
 			return false
 		}
 	}

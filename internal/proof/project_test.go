@@ -301,6 +301,59 @@ func TestReviewIndependenceRequiresNormalizedNonEmptyAgents(t *testing.T) {
 	}
 }
 
+func TestApprovedWithNotesProofUsesDurableOutcomeEvent(t *testing.T) {
+	root, jobs, results, receipts, events := proofFixture(t, false)
+	results["review-job"] = &workflow.AgentResult{
+		Decision: "changes_requested",
+		Severity: "P2",
+		Summary:  "non-blocking polish",
+	}
+
+	withoutEvent := Project(root, jobs, results, receipts, events)
+	for _, node := range withoutEvent.Nodes {
+		if node.Kind != KindReview {
+			continue
+		}
+		if node.Attrs["decision"] != "changes_requested" {
+			t.Fatalf("raw review decision = %q, want changes_requested", node.Attrs["decision"])
+		}
+		if node.Attrs["effective_decision"] != "" {
+			t.Fatalf("review without durable outcome event gained effective decision %q", node.Attrs["effective_decision"])
+		}
+		for _, claim := range node.Claims {
+			if claim.Type == "review.independent_approved" {
+				t.Fatal("review without durable outcome event gained an approval claim")
+			}
+		}
+	}
+
+	events["review-job"] = []db.JobEvent{{
+		JobID: "review-job", Kind: reviewApprovedWithNotesEventKind,
+		Message:   "review severity P2 is below repository blocking severity P1",
+		CreatedAt: "2026-07-17 01:09:30",
+	}}
+	withEvent := Project(root, jobs, results, receipts, events)
+	assertClaim(t, withEvent, KindReview, "review.independent_approved", GradeObserved)
+	for _, node := range withEvent.Nodes {
+		if node.Kind != KindReview {
+			continue
+		}
+		if node.Attrs["decision"] != "changes_requested" {
+			t.Fatalf("approved-with-notes raw decision = %q, want changes_requested", node.Attrs["decision"])
+		}
+		if node.Attrs["effective_decision"] != "approved" ||
+			node.Attrs["review_outcome"] != "approved-with-notes" {
+			t.Fatalf("approved-with-notes attrs = %+v", node.Attrs)
+		}
+		for _, claim := range node.Claims {
+			if claim.Type == "review.independent_approved" &&
+				claim.Source != "job_event."+reviewApprovedWithNotesEventKind {
+				t.Fatalf("approved-with-notes claim source = %q", claim.Source)
+			}
+		}
+	}
+}
+
 func TestProjectHonestGapsRenderDash(t *testing.T) {
 	result := &workflow.AgentResult{Decision: "implemented", Summary: "done"}
 	root := db.Job{
