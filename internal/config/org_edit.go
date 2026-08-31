@@ -26,9 +26,11 @@ func (e OrgSeatConfigEdit) Restore() error {
 	return writeConfigAtomic(e.path, e.original)
 }
 
-// UpsertOrgSeatRole adds a role section or fills its previously-empty pane
-// binding. A new role may be unbound; existing non-empty fields are not rewritten.
-func UpsertOrgSeatRole(paths Paths, desired OrgRole) (OrgSeatConfigEdit, bool, error) {
+// UpsertOrgSeatRole adds a role section, fills an empty pane binding, or
+// replaces rebindFromPane with the desired binding. Matching the previous
+// binding prevents a concurrent config update from being overwritten. Other
+// existing role fields are never rewritten.
+func UpsertOrgSeatRole(paths Paths, desired OrgRole, rebindFromPane string) (OrgSeatConfigEdit, bool, error) {
 	desired.Name = strings.ToLower(strings.TrimSpace(desired.Name))
 	desired.Pane = strings.TrimSpace(desired.Pane)
 	if desired.Name == "" {
@@ -42,13 +44,15 @@ func UpsertOrgSeatRole(paths Paths, desired OrgRole) (OrgSeatConfigEdit, bool, e
 	if exists {
 		currentPane := strings.TrimSpace(current.Pane)
 		if currentPane != "" {
-			if desired.Pane != "" && currentPane != desired.Pane {
+			if desired.Pane == "" || currentPane == desired.Pane {
+				return OrgSeatConfigEdit{path: paths.ConfigFile}, false, nil
+			}
+			if strings.TrimSpace(rebindFromPane) != currentPane {
 				return OrgSeatConfigEdit{}, false, fmt.Errorf(
-					"org role %q already binds pane %q, not %q",
-					desired.Name, current.Pane, desired.Pane,
+					"org role %q already binds pane %q, not expected pane %q",
+					desired.Name, current.Pane, rebindFromPane,
 				)
 			}
-			return OrgSeatConfigEdit{path: paths.ConfigFile}, false, nil
 		}
 		if desired.Pane == "" {
 			return OrgSeatConfigEdit{path: paths.ConfigFile}, false, nil

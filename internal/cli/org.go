@@ -292,7 +292,15 @@ func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "org seat add: %v\n", err)
 		return 2
 	}
-	configEdit, roleCreated, err := config.UpsertOrgSeatRole(paths, desired)
+	rebindFromPane := ""
+	if current, ok := cfg.Role(name); ok {
+		currentPane := strings.TrimSpace(current.Pane)
+		desiredPane := strings.TrimSpace(desired.Pane)
+		if currentPane != "" && desiredPane != "" && currentPane != desiredPane {
+			rebindFromPane = currentPane
+		}
+	}
+	configEdit, roleCreated, err := config.UpsertOrgSeatRole(paths, desired, rebindFromPane)
 	if err != nil {
 		store.Close()
 		fmt.Fprintf(stderr, "org seat add: write role: %v\n", err)
@@ -402,18 +410,24 @@ func runOrgSeatRemove(args []string, stdout, stderr io.Writer) int {
 		}
 		binding := snapshot.PaneBindings[role.Name]
 		unresolvedDetail = firstNonEmpty(binding.Detail, "no live pane binding")
-		if strings.TrimSpace(binding.PaneID) != "" {
-			pane, ok = orgSeatPaneByID(snapshot.Panes, binding.PaneID)
-			if !ok {
-				fmt.Fprintf(stderr, "org seat rm: resolved pane %s is absent from the live snapshot\n", binding.PaneID)
-				return 1
-			}
-			if err := orgSeatBranchCheck(ctx, pane); err != nil {
-				fmt.Fprintf(stderr, "org seat rm: refusing to remove %q: %v\n", role.Name, err)
-				return 1
-			}
-			hasLivePane = true
+		if strings.TrimSpace(binding.PaneID) == "" {
+			fmt.Fprintf(
+				stderr,
+				"org seat rm: role %q pane is unresolved: %s; rebind with gitmoot org seat add %s --pane ID_OR_LABEL\n",
+				role.Name, unresolvedDetail, role.Name,
+			)
+			return 1
 		}
+		pane, ok = orgSeatPaneByID(snapshot.Panes, binding.PaneID)
+		if !ok {
+			fmt.Fprintf(stderr, "org seat rm: resolved pane %s is absent from the live snapshot\n", binding.PaneID)
+			return 1
+		}
+		if err := orgSeatBranchCheck(ctx, pane); err != nil {
+			fmt.Fprintf(stderr, "org seat rm: refusing to remove %q: %v\n", role.Name, err)
+			return 1
+		}
+		hasLivePane = true
 	}
 	store, err := db.Open(paths.Database)
 	if err != nil {
@@ -535,10 +549,20 @@ func orgSeatDesiredRole(cfg config.OrgConfig, snapshot org.Snapshot, name, paneR
 			return current, true, nil
 		}
 		binding := snapshot.PaneBindings[current.Name]
+		if strings.TrimSpace(binding.PaneID) == "" {
+			if binding.Ambiguous {
+				return config.OrgRole{}, true, fmt.Errorf(
+					"role %q binding %q is ambiguous (%s); disambiguate live pane labels before rebinding",
+					current.Name, current.Pane, firstNonEmpty(binding.Detail, "multiple live panes match"),
+				)
+			}
+			current.Pane = paneID
+			return current, true, nil
+		}
 		if binding.PaneID != paneID {
 			return config.OrgRole{}, true, fmt.Errorf(
-				"role %q already binds %q (%s), not pane %s referenced by %q",
-				current.Name, current.Pane, firstNonEmpty(binding.Detail, "resolved to "+binding.PaneID), paneID, paneReference,
+				"role %q already binds %q (resolved to %s), not pane %s referenced by %q",
+				current.Name, current.Pane, binding.PaneID, paneID, paneReference,
 			)
 		}
 		return current, true, nil

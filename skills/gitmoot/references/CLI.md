@@ -1536,11 +1536,15 @@ therefore keep working, while later cosmetic label changes do not retarget or
 break bindings created by this command. Duplicate labels, unknown references,
 and a supplied but empty `--pane` hard-fail before any role or route is written.
 Omit `--pane` to create an unbound role and the same routes; re-run the command
-with `--pane ID_OR_LABEL` to bind that role later. Bound creation validates the
-affected role's live binding and five routes without making unrelated
-intentionally unbound roles decide its exit code. Unbound creation reports the
-deferred bind command. The global `org validate` command continues to report
-every unbound role until it is attached.
+with `--pane ID_OR_LABEL` to bind that role later. If a configured binding stops
+resolving, for example after Herdr recreates a pane with a new id, the same
+command can rebind the role to a live unclaimed pane while preserving its policy
+and routes. A configured binding that still resolves is immutable. An ambiguous
+label binding must be disambiguated in Herdr before rebinding. Bound creation or
+repair validates the affected role's live binding and five routes without
+making unrelated intentionally unbound roles decide its exit code. Unbound
+creation reports the deferred bind command. The global `org validate` command
+continues to report every unbound role until it is attached.
 
 For a new non-owner seat, the acting role comes from `GITMOOT_ORG_ROLE` and
 falls back to `owner` only when the variable is unset. The new seat inherits
@@ -1550,8 +1554,9 @@ acting role's scope and the selected parent's scope. Merge authority defaults
 to empty; an explicit `--merge-rule` cannot exceed the acting role's authority.
 The empty-registry `owner` bootstrap keeps its `*` scope and `owner` merge rule.
 The three policy flags initialize new seats only; re-running the command repairs
-missing owned pieces or fills an empty pane binding without rewriting existing
-policy, rebinding an attached role, or duplicating routes.
+missing owned pieces, fills an empty pane binding, or replaces a non-empty
+binding only when its former target no longer resolves. It does not rewrite
+existing policy or duplicate routes.
 
 `gitmoot org seat rm <name> [--home DIR]` resolves the role's live pane when it
 has a binding and checks every distinct Git checkout reported by that pane's
@@ -1559,11 +1564,12 @@ has a binding and checks every distinct Git checkout reported by that pane's
 is not merged into the locally known `origin/HEAD` (falling back to
 `origin/main`); unreadable branch state also fails closed. A safe removal deletes
 the role and all of its wake routes, closes a resolved live pane, and validates
-that the role, routes, and closed pane are absent. If the binding is unset,
-stale, or ambiguous in an otherwise successful live snapshot, removal deletes
-only the role and routes; it skips branch checks and pane close because no live
-pane was identified. A provider error for a configured binding still fails
-closed. Roles that still parent another role cannot be removed.
+that the role, routes, and closed pane are absent. A role with no configured
+binding has no pane to inspect or close, so removal deletes only that role and
+its routes. A configured binding that is stale, absent, or ambiguous fails
+closed before mutation and reports the `org seat add` rebind command. A provider
+error for a configured binding also fails closed. Roles that still parent
+another role cannot be removed.
 
 The five provisioned routes are enabled, addressed, and have an empty match
 filter. Remove one by its stable ID with `org events rule rm` to quiet that kind;
