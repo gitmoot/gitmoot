@@ -1217,7 +1217,7 @@ func TestClaudeDeliverReviewSeatCanRunToolsAndNetwork(t *testing.T) {
 	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"}); err != nil {
 		t.Fatalf("Deliver returned error: %v", err)
 	}
-	runner.want(t, 0, "claude", "--restricted", "--permission-mode", "dontAsk", "--allowedTools", "Bash,WebFetch,WebSearch", "--resume", "550e8400-e29b-41d4-a716-446655440002", "-p", "--output-format", "json", "--", "review")
+	runner.want(t, 0, "claude", "--restricted", "--tools", "Bash,WebFetch,WebSearch", "--permission-mode", "dontAsk", "--allowedTools", "Bash,WebFetch,WebSearch", "--resume", "550e8400-e29b-41d4-a716-446655440002", "-p", "--output-format", "json", "--", "review")
 }
 
 func TestClaudeDeliverFallsBackToText(t *testing.T) {

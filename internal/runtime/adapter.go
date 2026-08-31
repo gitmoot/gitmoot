@@ -1934,7 +1934,7 @@ func claudePermissionArgs(agent Agent) ([]string, PermissionPolicyApplication) {
 	var args []string
 	property := PermissionPolicyNotApplied
 	if agent.ReviewSeat {
-		args = []string{"--restricted", "--permission-mode", "dontAsk", "--allowedTools", "Bash,WebFetch,WebSearch"}
+		args = []string{"--restricted", "--tools", "Bash,WebFetch,WebSearch", "--permission-mode", "dontAsk", "--allowedTools", "Bash,WebFetch,WebSearch"}
 		property = PermissionPolicyWidened
 	} else {
 		switch NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {

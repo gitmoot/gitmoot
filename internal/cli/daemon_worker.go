@@ -1486,9 +1486,24 @@ func reviewRuntimeSandboxGrants(home string, agent runtime.Agent, checkout strin
 }
 
 func validateReviewWritablePaths(checkout string, writes []string) error {
-	resolvedCheckout, err := resolvePathForContainment(checkout)
+	type protectedRoot struct {
+		kind string
+		path string
+	}
+	protected := []protectedRoot{{kind: "read-only worktree", path: checkout}}
+	metadata, err := reviewGitMetadataPaths(checkout)
 	if err != nil {
-		return fmt.Errorf("resolve review worktree %q: %w", checkout, err)
+		return err
+	}
+	for _, path := range metadata {
+		protected = append(protected, protectedRoot{kind: "protected git metadata", path: path})
+	}
+	for i := range protected {
+		resolved, err := resolvePathForContainment(protected[i].path)
+		if err != nil {
+			return fmt.Errorf("resolve %s %q: %w", protected[i].kind, protected[i].path, err)
+		}
+		protected[i].path = resolved
 	}
 	for _, path := range compactCleanPaths(writes) {
 		if !filepath.IsAbs(path) {
@@ -1498,11 +1513,50 @@ func validateReviewWritablePaths(checkout string, writes []string) error {
 		if err != nil {
 			return fmt.Errorf("resolve review sandbox write path %q: %w", path, err)
 		}
-		if pathsOverlap(resolvedCheckout, resolvedWrite) {
-			return fmt.Errorf("review sandbox write path %q overlaps read-only worktree %q", path, checkout)
+		for _, root := range protected {
+			if pathsOverlap(root.path, resolvedWrite) {
+				return fmt.Errorf("review sandbox write path %q overlaps %s %q", path, root.kind, root.path)
+			}
 		}
 	}
 	return nil
+}
+
+func reviewGitMetadataPaths(checkout string) ([]string, error) {
+	dotGit := filepath.Join(checkout, ".git")
+	info, err := os.Stat(dotGit)
+	if err != nil {
+		return nil, fmt.Errorf("resolve review git metadata %q: %w", dotGit, err)
+	}
+	if info.IsDir() {
+		return []string{dotGit}, nil
+	}
+	content, err := os.ReadFile(dotGit)
+	if err != nil {
+		return nil, fmt.Errorf("read review gitdir file %q: %w", dotGit, err)
+	}
+	gitDirText := strings.TrimSpace(string(content))
+	const prefix = "gitdir:"
+	if !strings.HasPrefix(gitDirText, prefix) {
+		return nil, fmt.Errorf("review gitdir file %q has invalid contents", dotGit)
+	}
+	gitDir := strings.TrimSpace(strings.TrimPrefix(gitDirText, prefix))
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(checkout, gitDir)
+	}
+	gitDir = filepath.Clean(gitDir)
+	commonDir := gitDir
+	commonContent, err := os.ReadFile(filepath.Join(gitDir, "commondir"))
+	if err == nil {
+		commonDir = strings.TrimSpace(string(commonContent))
+		if !filepath.IsAbs(commonDir) {
+			commonDir = filepath.Join(gitDir, commonDir)
+		}
+		commonDir = filepath.Clean(commonDir)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("read review common-dir file for %q: %w", gitDir, err)
+	}
+	return compactCleanPaths([]string{gitDir, commonDir}), nil
 }
 
 func resolvePathForContainment(path string) (string, error) {

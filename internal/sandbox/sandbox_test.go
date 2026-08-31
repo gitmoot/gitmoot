@@ -86,13 +86,18 @@ func TestSandboxExecReadOnlyWorkdirE2E(t *testing.T) {
 	base := t.TempDir()
 	workdir := filepath.Join(base, "review-worktree")
 	cacheDir := filepath.Join(base, "review-cache")
-	for _, dir := range []string{workdir, cacheDir, filepath.Join(cacheDir, "tmp")} {
+	gitMetadataDir := filepath.Join(base, "linked-gitdir")
+	for _, dir := range []string{workdir, cacheDir, filepath.Join(cacheDir, "tmp"), gitMetadataDir} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
 	source := filepath.Join(workdir, "source.txt")
 	if err := os.WriteFile(source, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	metadataFile := filepath.Join(gitMetadataDir, "index")
+	if err := os.WriteFile(metadataFile, []byte("metadata-unchanged"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(workdir, "go.mod"), []byte("module reviewtest\n\ngo 1.22\n"), 0o600); err != nil {
@@ -107,8 +112,9 @@ func TestSandboxExecReadOnlyWorkdirE2E(t *testing.T) {
 go test -count=1 .
 printf passed > "$1"
 if { printf mutated > "$2"; } 2>/dev/null; then exit 41; fi
+if { printf metadata-mutated > "$3"; } 2>/dev/null; then exit 42; fi
 `
-	command := exec.Command(gitmoot, "sandbox-exec", "--read-only-workdir", "--write", cacheDir, "--", "/bin/sh", "-c", script, "gitmoot-test", cacheArtifact, source)
+	command := exec.Command(gitmoot, "sandbox-exec", "--read-only-workdir", "--write", cacheDir, "--", "/bin/sh", "-c", script, "gitmoot-test", cacheArtifact, source, metadataFile)
 	command.Dir = workdir
 	command.Env = append(os.Environ(),
 		"GOTOOLCHAIN=local",
@@ -125,6 +131,9 @@ if { printf mutated > "$2"; } 2>/dev/null; then exit 41; fi
 	}
 	if data, err := os.ReadFile(source); err != nil || string(data) != "unchanged" {
 		t.Fatalf("review worktree changed to %q, err=%v", data, err)
+	}
+	if data, err := os.ReadFile(metadataFile); err != nil || string(data) != "metadata-unchanged" {
+		t.Fatalf("linked git metadata changed to %q, err=%v", data, err)
 	}
 }
 

@@ -221,7 +221,7 @@ func TestWrapReviewSandboxAdapterPinsReadOnlyCheckoutAndRuntimeState(t *testing.
 	configHome := t.TempDir()
 	checkout := filepath.Join(t.TempDir(), "review-worktree")
 	stateDir := filepath.Join(t.TempDir(), "claude-state")
-	if err := os.MkdirAll(checkout, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	agent := runtime.Agent{
@@ -255,6 +255,9 @@ func TestWrapReviewSandboxAdapterPinsReadOnlyCheckoutAndRuntimeState(t *testing.
 
 func TestWrapReviewSandboxAdapterRejectsWritableRuntimeStateInsideCheckout(t *testing.T) {
 	checkout := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	stateDir := filepath.Join(checkout, ".claude")
 	agent := runtime.Agent{
 		Runtime:          runtime.ClaudeRuntime,
@@ -267,6 +270,38 @@ func TestWrapReviewSandboxAdapterRejectsWritableRuntimeStateInsideCheckout(t *te
 	}
 	if _, statErr := os.Stat(stateDir); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("unsafe state directory was created before refusal: %v", statErr)
+	}
+}
+
+func TestWrapReviewSandboxAdapterRejectsWritableLinkedGitMetadata(t *testing.T) {
+	base := t.TempDir()
+	commonDir := filepath.Join(base, "main", ".git")
+	gitDir := filepath.Join(commonDir, "worktrees", "review")
+	checkout := filepath.Join(base, "review")
+	for _, dir := range []string{commonDir, gitDir, checkout} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(checkout, ".git"), []byte("gitdir: "+gitDir+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "commondir"), []byte("../..\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, protected := range []string{gitDir, commonDir} {
+		t.Run(filepath.Base(protected), func(t *testing.T) {
+			agent := runtime.Agent{
+				Runtime:       runtime.ShellRuntime,
+				ReviewSeat:    true,
+				WritablePaths: []string{protected},
+			}
+			_, err := wrapReviewSandboxAdapter(t.TempDir(), agent, checkout, runtime.ShellAdapter{})
+			if err == nil || !strings.Contains(err.Error(), "overlaps protected git metadata") {
+				t.Fatalf("metadata overlap error = %v", err)
+			}
+		})
 	}
 }
 
