@@ -108,10 +108,8 @@ func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueue
 			return createFailedPipelineProduceJob(ctx, store, request, reason)
 		}
 		// A source-bound review is pinned to the implement job's immutable PR head.
-		// Unlike a generic read-only stage, it must never fail open onto the shared
-		// checkout: that checkout may be on the default branch, which would review the
-		// wrong tree. Keep generic #739 allocation fail-open, but fail this one binding
-		// closed unless the pinned detached worktree was allocated successfully.
+		// Handle it before the generic fail-closed seat check so its error preserves
+		// the exact requested SHA; both paths refuse the shared checkout.
 		if pipelineStageSourceBoundReviewRequest(request) && strings.TrimSpace(request.WorktreePath) == "" {
 			if worktreeErr != nil {
 				return db.Job{}, fmt.Errorf("allocate PR-bound pipeline review worktree at %s: %w", request.HeadSHA, worktreeErr)
@@ -125,12 +123,9 @@ func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueue
 			return db.Job{}, fmt.Errorf("allocate read-only pipeline %s worktree: managed repo checkout is unavailable", request.Action)
 		}
 		// #768: a MUTATING implement stage takes the WRITABLE task-worktree path
-		// instead of the read-only committed-tip worktree — it must commit + push. Unlike
-		// the read-only allocator (fail-OPEN), this one is fail-CLOSED: on an active
-		// implement job / live process / uncommitted changes it errors and the stage is
-		// NOT enqueued, so a retry can never duplicate or clobber a branch/PR (`gitmoot
-		// task recover` is the operator escape hatch). The two allocators are mutually
-		// exclusive — read-only eligibility excludes the implement action.
+		// instead of the read-only committed-tip worktree — it must commit + push.
+		// This allocation is also fail-closed, preventing retries from duplicating
+		// or clobbering a branch/PR (`gitmoot task recover` is the escape hatch).
 		var writableErr error
 		request, writableErr = allocatePipelineStageWritableWorktreeForRunner(ctx, store, home, request, runner)
 		if writableErr != nil {
