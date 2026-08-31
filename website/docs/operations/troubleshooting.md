@@ -598,10 +598,11 @@ completed removal while such a sibling survives, and `gitmoot doctor` counts tho
 siblings. Every retention records its reason once per job:
 `delegation_worktree_retained_unpublished` (with obligation reason
 `unpublished_commits`; squash-merged branches land here by design, because a
-squash publishes the content and not the commits),
-`delegation_worktree_retained_dirty` (tracked or untracked content; ignored
-content is deliberately not consulted), `delegation_worktree_retained_live` (a
-live process holds a working directory inside it), and
+squash publishes the content and not the commits; ignored nested repositories
+and submodule object databases land here because the outer clone cannot prove
+their commits), `delegation_worktree_retained_dirty` (tracked or untracked
+content; ordinary ignored build output remains reclaimable),
+`delegation_worktree_retained_live` (a live process holds a working directory inside it), and
 `delegation_worktree_liveness_unknown` (the process table could not be read,
 which is what makes the pass inert). Both passes are bounded at eight proofs per
 tick with a rotating window, and the shared checkout lock covers only the rename,

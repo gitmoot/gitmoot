@@ -538,9 +538,11 @@ absent original path as a completed removal while such a sibling exists, and
 `gitmoot doctor` counts those siblings. Every retention records its reason once:
 `delegation_worktree_retained_unpublished` with obligation reason
 `unpublished_commits` (the normal outcome for a squash-merged branch, whose
-content is published while its commits are not),
-`delegation_worktree_retained_dirty` when the tree still holds tracked or untracked
-content, `delegation_worktree_retained_live` when a process still has a
+content is published while its commits are not, and for an ignored nested
+repository or submodule object database whose commits the outer clone cannot
+prove), `delegation_worktree_retained_dirty` when the tree still holds tracked
+or untracked content; ordinary ignored build output remains reclaimable.
+`delegation_worktree_retained_live` records a process with a
 working directory inside the clone, and `delegation_worktree_liveness_unknown`
 when the process table cannot be read — the state that makes the whole pass inert.
 The shared checkout lock is held only across the rename, re-proof and delete, not

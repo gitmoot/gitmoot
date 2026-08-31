@@ -1741,6 +1741,158 @@ func TestEngineReclaimAgedFixCloneRequiresPublishedObjectDatabase(t *testing.T) 
 	}
 }
 
+// These regressions enter through the destructive production path. Git status
+// can hide every input completely, but each carries a separate object database
+// that the outer clone's reachability proof cannot inspect.
+func TestEngineReclaimAgedFixCloneRetainsIgnoredNestedRepositories(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, path string) string
+	}{
+		{
+			name: "global excludes nested repository",
+			setup: func(t *testing.T, path string) string {
+				excludes := filepath.Join(t.TempDir(), "global-excludes")
+				if err := os.WriteFile(excludes, []byte("/repos/\n"), 0o644); err != nil {
+					t.Fatalf("write global excludes: %v", err)
+				}
+				runWorktreeGit(t, path, "config", "core.excludesFile", excludes)
+				nested := filepath.Join(path, "repos", "nested")
+				if err := os.MkdirAll(nested, 0o755); err != nil {
+					t.Fatalf("MkdirAll nested repository: %v", err)
+				}
+				runWorktreeGit(t, nested, "init", "-q", "-b", "main")
+				runWorktreeGit(t, nested, "config", "user.email", "gitmoot@example.com")
+				runWorktreeGit(t, nested, "config", "user.name", "Gitmoot")
+				if err := os.WriteFile(filepath.Join(nested, "unique.txt"), []byte("only copy\n"), 0o644); err != nil {
+					t.Fatalf("write nested work: %v", err)
+				}
+				runWorktreeGit(t, nested, "add", "unique.txt")
+				runWorktreeGit(t, nested, "commit", "-q", "-m", "unique nested commit")
+				return filepath.Join("repos", "nested", ".git")
+			},
+		},
+		{
+			name: "global excludes bare object database",
+			setup: func(t *testing.T, path string) string {
+				excludes := filepath.Join(t.TempDir(), "global-excludes")
+				if err := os.WriteFile(excludes, []byte("/cache/\n"), 0o644); err != nil {
+					t.Fatalf("write global excludes: %v", err)
+				}
+				runWorktreeGit(t, path, "config", "core.excludesFile", excludes)
+				bare := filepath.Join(path, "cache", "objects.git")
+				if err := os.MkdirAll(filepath.Dir(bare), 0o755); err != nil {
+					t.Fatalf("MkdirAll bare repository parent: %v", err)
+				}
+				runWorktreeGit(t, filepath.Dir(bare), "init", "-q", "--bare", bare)
+				return filepath.Join("cache", "objects.git", "objects")
+			},
+		},
+		{
+			name: "submodule ignore all",
+			setup: func(t *testing.T, path string) string {
+				submodule := filepath.Join(t.TempDir(), "submodule")
+				runWorktreeGit(t, filepath.Dir(submodule), "init", "-q", "-b", "main", submodule)
+				runWorktreeGit(t, submodule, "config", "user.email", "gitmoot@example.com")
+				runWorktreeGit(t, submodule, "config", "user.name", "Gitmoot")
+				if err := os.WriteFile(filepath.Join(submodule, "base.txt"), []byte("base\n"), 0o644); err != nil {
+					t.Fatalf("write submodule base: %v", err)
+				}
+				runWorktreeGit(t, submodule, "add", "base.txt")
+				runWorktreeGit(t, submodule, "commit", "-q", "-m", "submodule base")
+				runWorktreeGit(t, path, "-c", "protocol.file.allow=always", "submodule", "add", "-q", submodule, "libs/sub")
+				runWorktreeGit(t, path, "commit", "-q", "-am", "add submodule")
+				runWorktreeGit(t, filepath.Join(path, "libs", "sub"), "config", "user.email", "gitmoot@example.com")
+				runWorktreeGit(t, filepath.Join(path, "libs", "sub"), "config", "user.name", "Gitmoot")
+				if err := os.WriteFile(filepath.Join(path, "libs", "sub", "local.txt"), []byte("only copy\n"), 0o644); err != nil {
+					t.Fatalf("write submodule work: %v", err)
+				}
+				runWorktreeGit(t, filepath.Join(path, "libs", "sub"), "add", "local.txt")
+				runWorktreeGit(t, filepath.Join(path, "libs", "sub"), "commit", "-q", "-m", "local-only submodule commit")
+				runWorktreeGit(t, path, "config", "submodule.libs/sub.ignore", "all")
+				return filepath.Join(".git", "modules", "libs", "sub", "objects")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			home := t.TempDir()
+			jobID := "fix-ignored-" + strings.ReplaceAll(tc.name, " ", "-")
+			path, err := FixWorktreePath(home, "owner/repo", jobID)
+			if err != nil {
+				t.Fatalf("FixWorktreePath: %v", err)
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatalf("MkdirAll fix parent: %v", err)
+			}
+			runWorktreeGit(t, filepath.Dir(path), "init", "-q", "-b", "main", path)
+			runWorktreeGit(t, path, "config", "user.email", "gitmoot@example.com")
+			runWorktreeGit(t, path, "config", "user.name", "Gitmoot")
+			if err := os.WriteFile(filepath.Join(path, "base.txt"), []byte("base\n"), 0o644); err != nil {
+				t.Fatalf("write outer base: %v", err)
+			}
+			runWorktreeGit(t, path, "add", "base.txt")
+			runWorktreeGit(t, path, "commit", "-q", "-m", "outer base")
+			wantNested := tc.setup(t, path)
+			remote := filepath.Join(home, jobID+"-origin.git")
+			runWorktreeGit(t, home, "init", "-q", "--bare", remote)
+			runWorktreeGit(t, path, "remote", "add", "origin", remote)
+			runWorktreeGit(t, path, "push", "-q", "-u", "origin", "main")
+
+			manager := gitutil.NewHostClient(path)
+			clean, err := manager.WorktreeCleanAt(ctx, path)
+			if err != nil || !clean {
+				t.Fatalf("trigger is not hidden from outer status: clean=%v err=%v", clean, err)
+			}
+			nested, err := nestedGitObjectDatabase(ctx, path)
+			if err != nil {
+				t.Fatalf("nestedGitObjectDatabase: %v", err)
+			}
+			if nested != wantNested {
+				t.Fatalf("nested object database = %q, want %q", nested, wantNested)
+			}
+
+			payload, err := marshalPayload(JobPayload{
+				Repo: "owner/repo", Branch: "feature/fix", WorktreePath: path, FixWorktree: true,
+			})
+			if err != nil {
+				t.Fatalf("marshalPayload: %v", err)
+			}
+			if err := store.CreateJobWithEvent(ctx, db.Job{
+				ID: jobID, Agent: "fixer", Type: "implement", State: string(JobSucceeded),
+				Repo: "owner/repo", Payload: payload,
+			}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
+				t.Fatalf("CreateJobWithEvent: %v", err)
+			}
+			engine := testEngine(store)
+			engine.Home = home
+			engine.DelegationCheckout = path
+			engine.DelegationWorktrees = manager
+			reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
+			if err != nil {
+				t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
+			}
+			if reclaimed {
+				t.Fatal("ignored nested repository was reclaimed")
+			}
+			if _, err := os.Stat(filepath.Join(path, wantNested)); err != nil {
+				t.Fatalf("nested repository was not retained: %v", err)
+			}
+			obligation, err := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID(jobID, path))
+			if err != nil {
+				t.Fatalf("GetCleanupObligation: %v", err)
+			}
+			if obligation.Reason != db.CleanupReasonUnpublishedCommits {
+				t.Fatalf("obligation reason = %q, want %q", obligation.Reason, db.CleanupReasonUnpublishedCommits)
+			}
+		})
+	}
+}
+
 // TestEngineReclaimAgedFixCloneQuarantinesBeforeRemoval pins the atomicity
 // boundary: a commit that lands after the first proof is caught by the proof
 // repeated on the quarantined copy, and the clone is put back where it was.
@@ -1813,6 +1965,74 @@ func TestEngineReclaimAgedFixCloneQuarantinesBeforeRemoval(t *testing.T) {
 	}
 	if len(manager.cloneOnlyCalls) < 2 || manager.cloneOnlyCalls[1] == path {
 		t.Fatalf("clone-only probes = %v, want a re-proof on the quarantined path", manager.cloneOnlyCalls)
+	}
+}
+
+// A nested repository can appear after the initial scan just like an outer
+// commit can appear after the initial reachability proof. The quarantined scan
+// must catch it before RemoveAll and restore the clone.
+func TestEngineReclaimAgedFixCloneRechecksNestedRepositoriesAfterQuarantine(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	jobID := "fix-nested-quarantine-race"
+	path, err := FixWorktreePath(home, "owner/repo", jobID)
+	if err != nil {
+		t.Fatalf("FixWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("MkdirAll fix worktree: %v", err)
+	}
+	payload, err := marshalPayload(JobPayload{
+		Repo: "owner/repo", Branch: "feature/fix", WorktreePath: path, FixWorktree: true,
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: jobID, Agent: "fixer", Type: "implement", State: string(JobSucceeded),
+		Repo: "owner/repo", Payload: payload,
+	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent: %v", err)
+	}
+	manager := &fakeWorktreeManager{cleanSet: true, clean: true}
+	manager.cloneOnlyHook = func(probed string) {
+		if probed != path {
+			return
+		}
+		nested := filepath.Join(path, "late", ".git")
+		if err := os.MkdirAll(nested, 0o755); err != nil {
+			t.Fatalf("MkdirAll late nested repository: %v", err)
+		}
+	}
+	engine := testEngine(store)
+	engine.Home = home
+	engine.DelegationCheckout = t.TempDir()
+	engine.DelegationWorktrees = manager
+
+	reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
+	}
+	if reclaimed {
+		t.Fatal("clone with a nested repository landing after the first scan was reclaimed")
+	}
+	if _, err := os.Stat(filepath.Join(path, "late", ".git")); err != nil {
+		t.Fatalf("restored clone lost late nested repository: %v", err)
+	}
+	if len(manager.cloneOnlyCalls) != 1 {
+		t.Fatalf("clone-only probes = %v, want the quarantined nested scan to retain before a second outer proof", manager.cloneOnlyCalls)
+	}
+	leftovers, err := FixCloneQuarantines(path)
+	if err != nil || len(leftovers) != 0 {
+		t.Fatalf("clone was left quarantined: %v (err %v)", leftovers, err)
+	}
+	obligation, err := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID(jobID, path))
+	if err != nil {
+		t.Fatalf("GetCleanupObligation: %v", err)
+	}
+	if obligation.Reason != db.CleanupReasonUnpublishedCommits {
+		t.Fatalf("obligation reason = %q, want %q", obligation.Reason, db.CleanupReasonUnpublishedCommits)
 	}
 }
 

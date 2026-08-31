@@ -777,10 +777,10 @@ Every retention records **why**, once per reason per job, so an inert deployment
 is visible instead of silent: `delegation_worktree_retained_unpublished` (also
 sets cleanup-obligation reason `unpublished_commits`; a squash merge publishes the
 content under a new commit while the branch commits stay clone-only, so a
-squash-merged clone is retained by design), `delegation_worktree_retained_dirty`
-(tracked or untracked content — unsaved work; ignored content is deliberately
-not consulted, because the repository declares it regenerable and requiring a
-clone with no build output made the pass inert),
+squash-merged clone is retained by design; an ignored nested repository or
+submodule object database lands here too because the outer clone cannot prove
+its commits), `delegation_worktree_retained_dirty` (tracked or untracked
+content — unsaved work; ordinary ignored build output remains reclaimable),
 `delegation_worktree_retained_live` (a live process holds a working directory
 inside it) and `delegation_worktree_liveness_unknown` (the process table could not
 be read, which is what makes the whole pass inert).

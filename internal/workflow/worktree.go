@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1742,6 +1743,58 @@ func pathPresent(path string) (bool, error) {
 	}
 }
 
+// nestedGitObjectDatabase returns the first Git repository or object database
+// below a clone's root object database. CloneOnlyCommit proves only the root
+// repository: ignored nested repositories, initialized submodules, and bare
+// repositories carry separate commit graphs that disappear with the clone.
+func nestedGitObjectDatabase(ctx context.Context, path string) (string, error) {
+	path = filepath.Clean(path)
+	var nested string
+	err := filepath.WalkDir(path, func(candidate string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(path, candidate)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+
+		// Do not walk the root repository's proven object database. Everything
+		// else under .git remains visible: submodules and tool-managed nested
+		// repositories can keep separate object databases there.
+		if entry.IsDir() && rel == filepath.Join(".git", "objects") {
+			return fs.SkipDir
+		}
+		if rel != ".git" && entry.Name() == ".git" {
+			nested = rel
+			return fs.SkipAll
+		}
+		if !entry.IsDir() || entry.Name() != "objects" {
+			return nil
+		}
+		info, infoErr := os.Stat(filepath.Join(candidate, "info"))
+		pack, packErr := os.Stat(filepath.Join(candidate, "pack"))
+		if infoErr == nil && packErr == nil && info.IsDir() && pack.IsDir() {
+			nested = rel
+			return fs.SkipAll
+		}
+		if (infoErr != nil && !os.IsNotExist(infoErr)) || (packErr != nil && !os.IsNotExist(packErr)) {
+			return fmt.Errorf("inspect possible Git object database %s: info: %v; pack: %v", candidate, infoErr, packErr)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return nested, nil
+}
+
 // reclaimAgedTerminalFixClone removes a terminal fix worktree's independent
 // clone only after proving that its object database holds nothing unpublished.
 // A fix worktree is a standalone clone, so removal takes its objects with it:
@@ -1799,16 +1852,22 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 		return false, errors.New("delegation worktree manager cannot prove fix worktree lineage")
 	}
 	// Cleanliness here means NO UNSAVED WORK — tracked modifications and untracked
-	// files. Ignored content is deliberately not consulted: the repository itself
-	// declares it regenerable, and requiring a clone with zero build output made
-	// the whole pass inert on ordinary repositories. Committed work is covered by
-	// the object-database proof below, which is the real guarantee.
+	// files. Ignored build output is allowed only after the separate scan below
+	// proves that it contains no nested Git repository or object database. The
+	// root object-database proof cannot see commits stored in those databases.
 	clean, err := manager.WorktreeCleanAt(ctx, path)
 	if err != nil {
 		return false, fmt.Errorf("prove aged terminal fix worktree clean: %w", err)
 	}
 	if !clean {
 		return false, e.recordFixCloneRetainedDirty(ctx, jobID, path)
+	}
+	nested, err := nestedGitObjectDatabase(ctx, path)
+	if err != nil {
+		return false, fmt.Errorf("inspect aged terminal fix worktree for nested Git object databases: %w", err)
+	}
+	if nested != "" {
+		return false, e.retainFixCloneWithNestedRepository(ctx, jobID, path, nested)
 	}
 	// The clone's own `origin` is writable by whatever ran inside it, so it is not
 	// evidence: the registered repository checkout supplies the trusted URL.
@@ -1893,6 +1952,16 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 		}
 		return false, e.recordFixCloneRetainedDirty(ctx, jobID, path)
 	}
+	nested, err = nestedGitObjectDatabase(ctx, quarantine)
+	if err != nil {
+		return restore(fmt.Errorf("recheck quarantined fix clone for nested Git object databases: %w", err))
+	}
+	if nested != "" {
+		if _, restoreErr := restore(nil); restoreErr != nil {
+			return false, restoreErr
+		}
+		return false, e.retainFixCloneWithNestedRepository(ctx, jobID, path, nested)
+	}
 	unpublished, err = manager.CloneOnlyCommit(ctx, quarantine)
 	if err != nil {
 		return restore(fmt.Errorf("recheck quarantined fix clone for unpublished commits: %w", err))
@@ -1920,6 +1989,14 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 func (e Engine) retainFixCloneWithUnpublishedCommits(ctx context.Context, jobID, path, sha string) error {
 	if err := e.recordFixCloneRetention(ctx, jobID, "delegation_worktree_retained_unpublished",
 		fmt.Sprintf("fix clone %s retained after TTL: commit %s is in no trusted remote ref", path, sha)); err != nil {
+		return err
+	}
+	return e.deferDelegationCleanupObligation(context.WithoutCancel(ctx), jobID, path, db.CleanupReasonUnpublishedCommits)
+}
+
+func (e Engine) retainFixCloneWithNestedRepository(ctx context.Context, jobID, path, nested string) error {
+	if err := e.recordFixCloneRetention(ctx, jobID, "delegation_worktree_retained_unpublished",
+		fmt.Sprintf("fix clone %s retained after TTL: nested Git object database %s has unproved recoverability", path, nested)); err != nil {
 		return err
 	}
 	return e.deferDelegationCleanupObligation(context.WithoutCancel(ctx), jobID, path, db.CleanupReasonUnpublishedCommits)
