@@ -51,6 +51,7 @@ func chatE2EGitCheckout(t *testing.T, fullName string) string {
 	runGit(t, dir, "init")
 	runGit(t, dir, "branch", "-m", "main")
 	runGit(t, dir, "remote", "add", "origin", "https://github.com/"+fullName+".git")
+	seedGitHead(t, dir)
 	return dir
 }
 
@@ -186,7 +187,8 @@ func TestChatPromotionLoopE2E(t *testing.T) {
 	worker := blockerE2EWorker(store, home, checkout)
 	job := chatE2EDriveUntilTerminal(t, ctx, worker, store, promoted.JobID)
 	if job.State != string(workflow.JobSucceeded) {
-		t.Fatalf("promoted job state = %q, want succeeded", job.State)
+		events, _ := store.ListJobEvents(ctx, promoted.JobID)
+		t.Fatalf("promoted job state = %q, want succeeded; payload=%s events=%+v", job.State, job.Payload, events)
 	}
 
 	// --- the result is back-linked into the thread as a job_result -----------

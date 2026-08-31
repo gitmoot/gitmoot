@@ -2627,12 +2627,18 @@ func TestRunQueuedJobsPoolIsolatesContendedReadJob(t *testing.T) {
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	store := daemonWorkerStore(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, `printf '%s\n' '{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`, []string{"ask"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-1", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-2", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 2})
-	adapter := &cliWorkerFakeAdapter{output: poolSchedulerAskResult}
-	worker := poolSchedulerWorker(t, store, adapter, true)
+	worker := poolSchedulerWorker(t, store, nil, true)
 	worker.ConfigHome = home // enable isolation
+	worker.CheckoutValidator = func(_ context.Context, _ db.Job, payload workflow.JobPayload, _ runtime.Agent) (string, error) {
+		if isolated := strings.TrimSpace(payload.WorktreePath); payload.ReadOnlySeat && isolated != "" {
+			return isolated, nil
+		}
+		return checkout, nil
+	}
+	worker.AdapterFactory = worker.defaultAdapter
 
 	if err := runQueuedJobsForRepo(ctx, worker, 2, "", ""); err != nil {
 		t.Fatalf("pool run: %v", err)

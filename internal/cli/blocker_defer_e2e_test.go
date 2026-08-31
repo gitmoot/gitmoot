@@ -57,7 +57,10 @@ func blockerE2EHome(t *testing.T) (*db.Store, string) {
 // the REAL ShellAdapter built by the default factory from the agent's runtime.
 func blockerE2EWorker(store *db.Store, home string, checkout string) jobWorker {
 	worker := defaultJobWorker(store, io.Discard, home)
-	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+	worker.CheckoutValidator = func(_ context.Context, _ db.Job, payload workflow.JobPayload, _ runtime.Agent) (string, error) {
+		if isolated := strings.TrimSpace(payload.WorktreePath); payload.ReadOnlySeat && isolated != "" {
+			return isolated, nil
+		}
 		return checkout, nil
 	}
 	return worker

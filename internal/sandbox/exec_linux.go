@@ -191,8 +191,22 @@ func readableRoots(paths []string, executable string) ([]string, error) {
 			return nil, err
 		}
 	}
-	if err := add(filepath.Dir(executable), true); err != nil {
+	if err := addExecutableReadRoots(add, executable); err != nil {
 		return nil, err
+	}
+	if goExecutable, err := execLookPath("go"); err == nil {
+		if root := optionalSystemToolchainRoot(goExecutable); root != "" {
+			if err := add(root, true); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return roots, nil
+}
+
+func addExecutableReadRoots(add func(string, bool) error, executable string) error {
+	if err := add(filepath.Dir(executable), true); err != nil {
+		return err
 	}
 	resolvedExecutable := executable
 	if resolved, err := filepath.EvalSymlinks(executable); err == nil {
@@ -200,17 +214,37 @@ func readableRoots(paths []string, executable string) ([]string, error) {
 	}
 	executableDir := filepath.Dir(resolvedExecutable)
 	if err := add(executableDir, true); err != nil {
-		return nil, err
+		return err
 	}
 	if base := filepath.Base(executableDir); base == "bin" || base == "sbin" {
 		installRoot := filepath.Dir(executableDir)
 		if installRoot != "/" && installRoot != "/usr" {
-			if err := add(installRoot, true); err != nil {
-				return nil, err
-			}
+			return add(installRoot, true)
 		}
 	}
-	return roots, nil
+	return nil
+}
+
+// optionalSystemToolchainRoot grants the Go installation selected by PATH when
+// it lives under a system package root. Review agents must be able to run the
+// repository's toolchain, while a user-controlled binary under /root or /home
+// must not turn its credential-bearing parent into a readable subtree.
+func optionalSystemToolchainRoot(executable string) string {
+	if resolved, err := filepath.EvalSymlinks(executable); err == nil {
+		executable = resolved
+	}
+	binDir := filepath.Dir(filepath.Clean(executable))
+	if base := filepath.Base(binDir); base != "bin" && base != "sbin" {
+		return ""
+	}
+	root := filepath.Dir(binDir)
+	for _, allowed := range []string{"/opt", "/usr/local", "/nix/store", "/snap"} {
+		rel, err := filepath.Rel(allowed, root)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return root
+		}
+	}
+	return ""
 }
 
 func writableRoots(paths []string, workdir string, includeImplicitRoots bool) ([]string, error) {

@@ -72,7 +72,11 @@ func runtimeOverrideE2EHome(t *testing.T) (string, *db.Store, string) {
 // executed (the marker file) and emits a valid approved gitmoot_result so the
 // job runs to terminal succeeded with no LLM and no network.
 func runtimeOverrideShellScript(marker string) string {
-	return fmt.Sprintf(`touch %q; printf '%%s' '{"gitmoot_result":{"decision":"approved","summary":"ran on shell override","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`, marker)
+	result := `printf '%s' '{"gitmoot_result":{"decision":"approved","summary":"ran on shell override","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`
+	if strings.TrimSpace(marker) == "" {
+		return result
+	}
+	return fmt.Sprintf("touch %q; %s", marker, result)
 }
 
 // assertRuntimeOverrideInvariants holds the shared post-run assertions for
@@ -81,10 +85,12 @@ func assertRuntimeOverrideInvariants(t *testing.T, store *db.Store, home string,
 	t.Helper()
 	ctx := context.Background()
 
-	// The SHELL adapter executed the fixture (mutation-sensitive: a codex
-	// dispatch never runs the script).
-	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("shell fixture did not run (marker missing): %v", err)
+	// A marker is only available on foreground paths. Detached read-only seats
+	// cannot write to arbitrary host paths; their persisted result proves delivery.
+	if marker != "" {
+		if _, err := os.Stat(marker); err != nil {
+			t.Fatalf("shell fixture did not run (marker missing): %v", err)
+		}
 	}
 
 	// Terminal succeeded with the script's result persisted.
@@ -197,7 +203,7 @@ func TestRuntimeOverrideDaemonBackgroundShellE2E(t *testing.T) {
 	ctx := context.Background()
 	home, store, _ := runtimeOverrideE2EHome(t)
 	marker := filepath.Join(t.TempDir(), "shell-override-ran-daemon")
-	script := runtimeOverrideShellScript(marker)
+	script := runtimeOverrideShellScript("")
 
 	var out, errBuf bytes.Buffer
 	code := Run([]string{
@@ -229,7 +235,7 @@ func TestRuntimeOverrideDaemonBackgroundShellE2E(t *testing.T) {
 	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, time.Now().UTC(), nil, nil); err != nil {
 		t.Fatalf("worker tick: %v", err)
 	}
-	assertRuntimeOverrideInvariants(t, store, home, output.JobID, marker)
+	assertRuntimeOverrideInvariants(t, store, home, output.JobID, "")
 }
 
 // TestRuntimeOverrideValidationBeforeEnqueue: an unknown --runtime (or a shell

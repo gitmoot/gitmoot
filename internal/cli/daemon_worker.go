@@ -652,29 +652,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
 	}
-	// Shared cache failures remain fail-open for ordinary isolated jobs. A
-	// read-only seat uses its per-worktree cache as part of the hard sandbox and
-	// therefore fails closed when that grant cannot be constructed.
-	var toolCacheEnv []string
-	var toolCacheErr error
-	if execBackend == execbackend.Local {
-		if cachePaths, cacheErr := w.configPaths(); cacheErr != nil {
-			toolCacheErr = cacheErr
-		} else {
-			toolCacheEnv, toolCacheErr = applyIsolatedToolCacheGrants(cachePaths, payload, &agent)
-		}
-	}
-	if toolCacheErr != nil {
-		if agent.ReadOnlySeat {
-			err := fmt.Errorf("prepare read-only tool cache: %w", toolCacheErr)
-			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
-				return finishErr
-			}
-			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
-			return nil
-		}
-		writeLine(w.Stdout, "job %s tool cache grant failed: %v", job.ID, toolCacheErr)
-	}
 	// Acquire the execution-backend lifecycle only after checkout validation and
 	// runtime-session admission. The instance then survives every Mailbox repair
 	// delivery and is destroyed synchronously on every return path. Host checkout,
@@ -712,6 +689,32 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 			return nil
 		}
+	}
+	// Cache grants are keyed to the checkout the runtime actually receives. A
+	// local execution backend may replace the source worktree with an instance
+	// workspace, so constructing this grant before provisioning creates two
+	// different hard-seat cache roots.
+	var toolCacheEnv []string
+	var toolCacheErr error
+	if execBackend == execbackend.Local {
+		if cachePaths, cacheErr := w.configPaths(); cacheErr != nil {
+			toolCacheErr = cacheErr
+		} else {
+			cachePayload := payload
+			cachePayload.WorktreePath = deliveryCheckout
+			toolCacheEnv, toolCacheErr = applyIsolatedToolCacheGrants(cachePaths, cachePayload, &agent)
+		}
+	}
+	if toolCacheErr != nil {
+		if agent.ReadOnlySeat {
+			err := fmt.Errorf("prepare read-only tool cache: %w", toolCacheErr)
+			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+				return finishErr
+			}
+			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
+			return nil
+		}
+		writeLine(w.Stdout, "job %s tool cache grant failed: %v", job.ID, toolCacheErr)
 	}
 	adapter, err = wrapProduceSandboxAdapter(job.Type, agent, adapter)
 	if err != nil {
@@ -1577,7 +1580,7 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 		return grants, err
 	}
 	if len(agent.WritablePaths) != 1 {
-		return grants, fmt.Errorf("read-only seat requires exactly one isolated cache grant, got %d", len(agent.WritablePaths))
+		return grants, fmt.Errorf("read-only seat requires exactly one isolated cache grant, got %d: %q", len(agent.WritablePaths), agent.WritablePaths)
 	}
 	grants.cacheRoot = agent.WritablePaths[0]
 	grants.writes = []string{grants.cacheRoot}

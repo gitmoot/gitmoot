@@ -473,21 +473,20 @@ func TestLoneUncontendedBackgroundAskE2E(t *testing.T) {
 	}
 }
 
-// TestBackgroundAskCapturesDiffBeforeWorktreeCleanupE2E reproduces #1152 through
-// the real background dispatch and worker paths: an ask edits its isolated
-// worktree, terminal cleanup removes that worktree synchronously, and the
-// bounded diff remains readable from both job detail and list output afterward.
-func TestBackgroundAskCapturesDiffBeforeWorktreeCleanupE2E(t *testing.T) {
+// TestBackgroundAskRejectsMutationBeforeWorktreeCleanupE2E proves the hard
+// read-only seat blocks checkout writes even when the registered agent requests
+// workspace-write, then still removes the disposable worktree synchronously.
+func TestBackgroundAskRejectsMutationBeforeWorktreeCleanupE2E(t *testing.T) {
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := staleBranchGitCheckout(t, "owner/repo")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	result := rendezvousResult("implemented", "edited the isolated checkout")
-	script := fmt.Sprintf("printf 'changed by ask\\n' > README.md\nprintf '%%s' '%s'", result)
+	result := rendezvousResult("approved", "hard sandbox preserved the checkout")
+	script := fmt.Sprintf("if { printf 'changed by ask\\n' > README.md; } 2>/dev/null; then exit 41; fi\nprintf '%%s' '%s'", result)
 	seedDaemonWorkerAgentWithPolicy(t, store, "writer", runtime.ShellRuntime, script, []string{"ask"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
 
 	out, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
-		RepoFlag: "owner/repo", Agent: "writer", Action: "ask", Instructions: "make the requested edit", Background: true, Home: home,
+		RepoFlag: "owner/repo", Agent: "writer", Action: "ask", Instructions: "attempt the requested edit", Background: true, Home: home,
 	})
 	if err != nil {
 		t.Fatalf("dispatch writer: %v", err)
@@ -500,89 +499,42 @@ func TestBackgroundAskCapturesDiffBeforeWorktreeCleanupE2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worktree := queuedPayload.WorktreePath
 	terminal := chatE2EDriveUntilTerminal(t, ctx, readonlyPoolWorker(store, home), store, out.JobID)
 	if terminal.State != string(workflow.JobSucceeded) {
-		t.Fatalf("writer state = %q, want succeeded", terminal.State)
+		t.Fatalf("writer state = %q, want succeeded after denied mutation", terminal.State)
 	}
-	if _, statErr := os.Stat(worktree); !os.IsNotExist(statErr) {
+	if _, statErr := os.Stat(queuedPayload.WorktreePath); !os.IsNotExist(statErr) {
 		t.Fatalf("isolated worktree still exists after terminal cleanup: %v", statErr)
 	}
 	persisted, err := daemonJobPayload(terminal)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"## git status --short", " M README.md", "## git diff HEAD", "+changed by ask"} {
-		if !strings.Contains(persisted.ReadOnlyWorktreeDiff, want) {
-			t.Fatalf("captured diff missing %q:\n%s", want, persisted.ReadOnlyWorktreeDiff)
-		}
-	}
-	if persisted.ReadOnlyWorktreeDiffTruncated || persisted.ReadOnlyWorktreeDiffError != "" {
-		t.Fatalf("unexpected diff metadata: truncated=%v error=%q", persisted.ReadOnlyWorktreeDiffTruncated, persisted.ReadOnlyWorktreeDiffError)
+	if persisted.ReadOnlyWorktreeDiff != "" || persisted.ReadOnlyWorktreeDiffTruncated || persisted.ReadOnlyWorktreeDiffError != "" {
+		t.Fatalf("denied mutation produced diff metadata: %+v", persisted)
 	}
 	if got := gitOutput(t, checkout, "status", "--porcelain"); got != "" {
 		t.Fatalf("registered checkout was mutated: %q", got)
 	}
-
-	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"job", "show", out.JobID, "--home", home, "--json"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("job show --json exit=%d stderr=%s", code, stderr.String())
-	}
-	var shown jobShowOutput
-	if err := json.Unmarshal(stdout.Bytes(), &shown); err != nil {
-		t.Fatal(err)
-	}
-	if shown.ReadOnlyWorktreeDiff != persisted.ReadOnlyWorktreeDiff || shown.Payload.ReadOnlyWorktreeDiff != persisted.ReadOnlyWorktreeDiff {
-		t.Fatal("job show --json did not surface the persisted diff")
-	}
-
-	stdout.Reset()
-	stderr.Reset()
-	if code := Run([]string{"job", "list", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("job list --json exit=%d stderr=%s", code, stderr.String())
-	}
-	var listed []jobListEntry
-	if err := json.Unmarshal(stdout.Bytes(), &listed); err != nil {
-		t.Fatal(err)
-	}
-	if len(listed) != 1 || listed[0].ReadOnlyWorktreeDiff != persisted.ReadOnlyWorktreeDiff {
-		t.Fatalf("job list --json diff = %+v, want captured diff", listed)
-	}
-
-	stdout.Reset()
-	stderr.Reset()
-	if code := Run([]string{"job", "list", "--home", home}, &stdout, &stderr); code != 0 {
-		t.Fatalf("job list exit=%d stderr=%s", code, stderr.String())
-	}
-	if !strings.Contains(stdout.String(), "DIFF: ") || !strings.Contains(stdout.String(), " bytes captured") {
-		t.Fatalf("job list text did not surface diff summary:\n%s", stdout.String())
-	}
-
-	stdout.Reset()
-	stderr.Reset()
-	if code := Run([]string{"job", "show", out.JobID, "--home", home}, &stdout, &stderr); code != 0 {
-		t.Fatalf("job show exit=%d stderr=%s", code, stderr.String())
-	}
-	if !strings.Contains(stdout.String(), "read_only_worktree_diff: captured") {
-		t.Fatalf("job show text did not surface captured diff summary:\n%s", stdout.String())
+	if n := countCLIJobEvents(t, store, out.JobID, "delegation_worktree_removed"); n != 1 {
+		t.Fatalf("delegation_worktree_removed events = %d, want 1", n)
 	}
 }
 
-// TestBackgroundAskDiffCaptureFailureDoesNotBlockCleanupE2E corrupts only the
-// throwaway worktree's index, forcing capture to fail without invalidating the
-// worktree registration used for removal. The engine must record the hook event
-// and still remove the actual worktree.
-func TestBackgroundAskDiffCaptureFailureDoesNotBlockCleanupE2E(t *testing.T) {
+// TestBackgroundAskRejectsGitMetadataCorruptionBeforeCleanupE2E proves the hard
+// seat also protects linked git metadata without turning terminal cleanup into
+// a pre-cleanup capture failure.
+func TestBackgroundAskRejectsGitMetadataCorruptionBeforeCleanupE2E(t *testing.T) {
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := staleBranchGitCheckout(t, "owner/repo")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	result := rendezvousResult("approved", "capture failure fixture")
-	script := fmt.Sprintf("index=$(git rev-parse --git-path index)\nprintf x > \"$index\"\nprintf '%%s' '%s'", result)
+	result := rendezvousResult("approved", "hard sandbox preserved git metadata")
+	script := fmt.Sprintf("index=$(git rev-parse --git-path index)\nif { printf x > \"$index\"; } 2>/dev/null; then exit 42; fi\nprintf '%%s' '%s'", result)
 	seedDaemonWorkerAgent(t, store, "breaker", runtime.ShellRuntime, script, []string{"ask"}, "owner/repo")
 
 	out, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
-		RepoFlag: "owner/repo", Agent: "breaker", Action: "ask", Instructions: "exercise cleanup failure handling", Background: true, Home: home,
+		RepoFlag: "owner/repo", Agent: "breaker", Action: "ask", Instructions: "attempt metadata corruption", Background: true, Home: home,
 	})
 	if err != nil {
 		t.Fatalf("dispatch breaker: %v", err)
@@ -597,20 +549,20 @@ func TestBackgroundAskDiffCaptureFailureDoesNotBlockCleanupE2E(t *testing.T) {
 	}
 	terminal := chatE2EDriveUntilTerminal(t, ctx, readonlyPoolWorker(store, home), store, out.JobID)
 	if terminal.State != string(workflow.JobSucceeded) {
-		t.Fatalf("breaker state = %q, want succeeded", terminal.State)
+		t.Fatalf("breaker state = %q, want succeeded after denied metadata write", terminal.State)
 	}
 	if _, statErr := os.Stat(queuedPayload.WorktreePath); !os.IsNotExist(statErr) {
-		t.Fatalf("worktree cleanup was blocked by diff capture failure: %v", statErr)
+		t.Fatalf("worktree cleanup was blocked: %v", statErr)
 	}
 	persisted, err := daemonJobPayload(terminal)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if persisted.ReadOnlyWorktreeDiffError == "" {
-		t.Fatal("diff capture failure marker was not persisted")
+	if persisted.ReadOnlyWorktreeDiff != "" || persisted.ReadOnlyWorktreeDiffError != "" {
+		t.Fatalf("denied metadata write produced capture diagnostics: %+v", persisted)
 	}
-	if n := countCLIJobEvents(t, store, out.JobID, "readonly_worktree_precleanup_failed"); n != 1 {
-		t.Fatalf("readonly_worktree_precleanup_failed events = %d, want 1", n)
+	if n := countCLIJobEvents(t, store, out.JobID, "readonly_worktree_precleanup_failed"); n != 0 {
+		t.Fatalf("readonly_worktree_precleanup_failed events = %d, want 0", n)
 	}
 	if n := countCLIJobEvents(t, store, out.JobID, "delegation_worktree_removed"); n != 1 {
 		t.Fatalf("delegation_worktree_removed events = %d, want 1", n)
