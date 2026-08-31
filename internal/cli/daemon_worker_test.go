@@ -546,3 +546,37 @@ func TestPermissionBlockedJobCannotResurrectDismissedTask(t *testing.T) {
 		t.Fatalf("task resurrected to %s", task.State)
 	}
 }
+
+func TestPermissionBlockedJobWritesCurrentTaskOwnership(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-2", RepoFullName: "owner/repo",
+		State: string(workflow.TaskImplementing), Branch: "feature/two",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(workflow.JobPayload{
+		TaskID: "task-2", Repo: "owner/repo", Branch: "feature/two",
+		Result: &workflow.AgentResult{Decision: "blocked", Summary: "permission denied"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := blockTaskForPermissionBlockedJob(ctx, store, db.Job{ID: "job-2", Payload: string(payload)}); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.GetTask(ctx, "task-2")
+	if err != nil || task.State != string(workflow.TaskBlocked) {
+		t.Fatalf("task = %+v err %v, want blocked", task, err)
+	}
+	events, err := store.ListTaskEvents(ctx, "task-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Kind != "permission_job_blocked" ||
+		events[0].FromState != string(workflow.TaskImplementing) ||
+		events[0].ToState != string(workflow.TaskBlocked) {
+		t.Fatalf("task events = %+v, want permission block ownership", events)
+	}
+}

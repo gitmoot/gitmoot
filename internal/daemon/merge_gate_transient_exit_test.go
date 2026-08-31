@@ -2,7 +2,12 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
@@ -22,6 +27,11 @@ import (
 // would therefore pass against a fix that never runs.
 func seedBlockedReviewTask(t *testing.T, store *db.Store, repo github.Repository, class workflow.MergeBlockClass, reason string) github.PullRequest {
 	t.Helper()
+	return seedBlockedReviewTaskAttributed(t, store, repo, class, reason, true)
+}
+
+func seedBlockedReviewTaskAttributed(t *testing.T, store *db.Store, repo github.Repository, class workflow.MergeBlockClass, reason string, attribute bool) github.PullRequest {
+	t.Helper()
 	ctx := context.Background()
 	if err := store.UpsertTask(ctx, db.Task{
 		ID:           "review-pr-1699-3f3a1026",
@@ -32,6 +42,20 @@ func seedBlockedReviewTask(t *testing.T, store *db.Store, repo github.Repository
 	}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
+	payload, err := json.Marshal(workflow.JobPayload{
+		Repo: repo.FullName(), Branch: "task-1699", PullRequest: 1699,
+		HeadSHA: "3f3a1026", TaskID: "review-pr-1699-3f3a1026",
+		Result: &workflow.AgentResult{Decision: "approved", Summary: "approved current head"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "review-current-1699", Agent: "reviewer", Type: "review",
+		State: string(workflow.JobSucceeded), Payload: string(payload),
+	}); err != nil {
+		t.Fatalf("CreateJob(review-current-1699) returned error: %v", err)
+	}
 	if err := store.UpsertMergeGate(ctx, db.MergeGate{
 		RepoFullName: repo.FullName(),
 		PullRequest:  1699,
@@ -41,16 +65,15 @@ func seedBlockedReviewTask(t *testing.T, store *db.Store, repo github.Repository
 	}); err != nil {
 		t.Fatalf("UpsertMergeGate returned error: %v", err)
 	}
-	// The merge gate attributes its own block on the task (blockMergeGate), which is
-	// what distinguishes it from a coordinator block_parent or quorum failure
-	// reaching the same state through the shared e.block helper.
-	if err := store.AddTaskEvent(ctx, db.TaskEvent{
-		TaskID:  "review-pr-1699-3f3a1026",
-		Kind:    "merge_gate_blocked",
-		ToState: string(workflow.TaskBlocked),
-		Reason:  reason,
-	}); err != nil {
-		t.Fatalf("AddTaskEvent(merge_gate_blocked) returned error: %v", err)
+	if attribute {
+		if err := store.AddTaskEvent(ctx, db.TaskEvent{
+			TaskID:  "review-pr-1699-3f3a1026",
+			Kind:    "merge_gate_blocked",
+			ToState: string(workflow.TaskBlocked),
+			Reason:  reason,
+		}); err != nil {
+			t.Fatalf("AddTaskEvent(merge_gate_blocked) returned error: %v", err)
+		}
 	}
 	return github.PullRequest{
 		Number:  1699,
@@ -74,6 +97,20 @@ func blockedReviewTaskDaemon(t *testing.T, store *db.Store, repo github.Reposito
 	return Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}, gate
 }
 
+type delayedClearanceMergeGateGit struct {
+	clean  bool
+	checks int
+}
+
+func (g *delayedClearanceMergeGateGit) WorktreeClean(context.Context) (bool, error) {
+	g.checks++
+	return g.clean, nil
+}
+
+func (*delayedClearanceMergeGateGit) UpdateBase(context.Context, string, string) error {
+	return nil
+}
+
 func hasTaskEventKind(events []db.TaskEvent, kind string) bool {
 	for _, event := range events {
 		if event.Kind == kind {
@@ -83,21 +120,42 @@ func hasTaskEventKind(events []db.TaskEvent, kind string) bool {
 	return false
 }
 
+func seedReadyBranchlessReviewTask(t *testing.T, store *db.Store, repo github.Repository, taskID string, pull github.PullRequest, headSHA string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: taskID, RepoFullName: repo.FullName(), State: string(workflow.TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(workflow.JobPayload{
+		Repo: repo.FullName(), Branch: pull.HeadRef, PullRequest: int(pull.Number),
+		HeadSHA: headSHA, TaskID: taskID,
+		Result: &workflow.AgentResult{Decision: "approved", Summary: "approved"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "review-" + taskID, Agent: "reviewer", Type: "review",
+		State: string(workflow.JobSucceeded), Payload: string(payload),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestPollOnceLeavesTaskBlockedByDelegationFailureBlocked is the cause-attribution
 // direction, found by gm-omp-fanout while we coordinated the PR #1731 collision.
 //
-// e.block is SHARED: the merge gate uses it, and so do the coordinator failure
-// paths — block_parent and the vote/quorum synthesis gates in
-// engine_continuation_synthesis.go. So `state == blocked` says nothing about WHICH
-// mechanism blocked the task. A task carrying a stale transient merge-gate row from
-// an earlier evaluation, then blocked by a delegation quorum failure, satisfies
-// every other test in the reconciler — and releasing it would discard a quorum
-// failure as though it were self-clearing infrastructure. The gate row describes the
+// All real block paths now converge on the shared blockTask choke point, but the
+// latest ownership event still matters: a task carrying a stale transient
+// merge-gate row and then blocked by a delegation quorum failure satisfies every
+// state/gate check in the reconciler. Releasing it would discard a quorum failure
+// as though it were self-clearing infrastructure. The gate row describes the
 // CONDITION; only the task's latest blocking event establishes the CURRENT CAUSE.
 //
-// Mutant M5 ("cause ignored"): delete the mergeGateOwnsCurrentBlock guard from
-// reconcileTransientlyBlockedMergeGates. Only this test fails; every other
-// direction, including both two-poll tests, still passes.
+// Compile-valid mutant M5 ("cause ignored"): force the ownership result to true.
+// This test and the unknown-blocker direction both fail.
 func TestPollOnceLeavesTaskBlockedByDelegationFailureBlocked(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
@@ -140,22 +198,17 @@ func TestPollOnceLeavesTaskBlockedByDelegationFailureBlocked(t *testing.T) {
 }
 
 // TestPollOnceHealsPreAttributionBlockOnce is the UPGRADE path, raised by
-// gm-omp-fanout: every task blocked before this change has no attributed blocking
-// event, because neither the merge gate nor the synthesis gates wrote one — both
-// reached blocked through the shared e.block. A strict "no event means not
-// gate-owned" rule would refuse exactly the population that motivated #1562,
-// including the 95-minute review-pr-1699-3f3a1026 wedge, and the feature would
-// clear only blocks created after the deploy.
+// gm-omp-fanout: tasks blocked by an old binary may have no ownership event. A
+// strict "no event means not gate-owned" rule would refuse exactly the population
+// that motivated #1562, including the 95-minute review-pr-1699-3f3a1026 wedge.
 //
-// So a row with a transient gate row and NO competing blocking event is healed
-// once. "Once" is structural rather than counted: the release writes
-// merge_gate_transient_retry, so the row is no longer unattributed, and any later
-// real block arrives through an attributed path.
+// A row with a transient gate row and no competing blocking event is healed once.
+// The release writes merge_gate_transient_retry, and the reconciler treats that
+// durable marker as a consumed retry even if a later gate evaluation blocks the
+// task again.
 //
-// Mutant M6 ("no upgrade path"): make mergeGateOwnsCurrentBlock return
-// (false, false, nil) for an unattributed row. Only this test fails — every other
-// direction, including the delegation-failure refusal, still passes, which is what
-// makes the two behaviours distinguishable rather than a matter of opinion.
+// Compile-valid mutant M6 ("no upgrade path"): return unattributed=false for a
+// row with no blocking event. This test fails while attributed release remains.
 func TestPollOnceHealsPreAttributionBlockOnce(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
@@ -224,6 +277,7 @@ func TestPollOnceLeavesTaskBlockedByUnknownMechanismBlocked(t *testing.T) {
 		t.Fatalf("merge gate evaluations = %d, want 0", len(gate.requests))
 	}
 }
+
 // TestPollOnceReleasesTransientlyBlockedReviewTask is the release direction of
 // #1562. A task blocked on "local worktree is not clean" — a condition the gate
 // itself classified MergeBlockTransient — must regain an exit from the ordinary
@@ -338,9 +392,9 @@ func TestSecondPollEvaluatesGateAfterTransientRelease(t *testing.T) {
 // consumes. The one-row fixture cannot see this, which is why it passed against
 // the branch-first version at head 9ba794d8.
 //
-// Mutant M4 ("branch owner wins"): in lookupReadyPullRequestTask, return branchTask
-// whenever branchFound, before the branchless scan. Only this test fails; the
-// single-row two-poll test still passes.
+// Compile-valid mutant M4 ("branch owner wins"): return branchTask whenever
+// branchErr == nil before the branchless scan. This and the current-head
+// branchless selection test fail; the single-row two-poll direction still passes.
 func TestSecondPollEvaluatesGateWhenBranchOwnerIsNotReady(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
@@ -397,6 +451,230 @@ func TestSecondPollEvaluatesGateWhenBranchOwnerIsNotReady(t *testing.T) {
 	}
 	if implementation.State != string(workflow.TaskPullRequestOpen) {
 		t.Fatalf("implementation task state = %q, want pull_request_open left alone", implementation.State)
+	}
+}
+
+func TestTransientMergeGateRetryRecoversAfterDelayedClearanceAndStaysBounded(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	pull := seedBlockedReviewTask(t, store, repo, workflow.MergeBlockTransient, "local worktree is not clean")
+	initialTask, err := store.GetTask(ctx, "review-pr-1699-3f3a1026")
+	if err != nil {
+		t.Fatal(err)
+	}
+	implementPayload, err := json.Marshal(workflow.JobPayload{
+		Repo: repo.FullName(), Branch: pull.HeadRef, PullRequest: int(pull.Number),
+		HeadSHA: pull.HeadSHA, TaskID: initialTask.ID,
+		Result: &workflow.AgentResult{Decision: "implemented", Summary: "implemented current head"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "implement-current-1699", Agent: "implementer", Type: "implement",
+		State: string(workflow.JobSucceeded), Payload: string(implementPayload),
+	}); err != nil {
+		t.Fatalf("CreateJob(implement-current-1699) returned error: %v", err)
+	}
+	baseClient := &fakeGitHub{
+		pulls:    []github.PullRequest{pull},
+		comments: map[int64][]github.IssueComment{pull.Number: {}},
+	}
+	client := &mergeGateRaceGitHub{
+		fakeGitHub: baseClient,
+		checks: []github.PullRequestCheck{{
+			Name: "ci", Bucket: "pass", State: "SUCCESS",
+		}},
+		statuses: []github.CommitStatusInput{{
+			Repo: repo, SHA: pull.HeadSHA, State: "success", Context: "ci",
+		}},
+		statusSucceeded: []bool{true},
+	}
+	git := &delayedClearanceMergeGateGit{}
+	gate := &workflow.PolicyMergeGate{
+		AutoMerge: true, Store: store, GitHub: client, Git: git,
+	}
+	engine := workflow.Engine{Store: store, MergeGate: gate}
+	now := time.Now().UTC().Add(time.Hour)
+	daemon := Daemon{
+		Repo: repo, Store: store, GitHub: client, Workflow: &engine,
+		Now: func() time.Time { return now },
+	}
+	poll := func(label string) {
+		t.Helper()
+		pollErr := daemon.PollOnce(ctx)
+		var blocked workflow.BlockedError
+		if pollErr != nil && !errors.As(pollErr, &blocked) {
+			t.Fatalf("%s: %v", label, pollErr)
+		}
+	}
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		poll(fmt.Sprintf("release %d", attempt))
+		poll(fmt.Sprintf("dirty evaluation %d", attempt))
+		task, loadErr := store.GetTask(ctx, initialTask.ID)
+		if loadErr != nil || task.State != string(workflow.TaskBlocked) {
+			events, _ := store.ListTaskEvents(ctx, initialTask.ID)
+			t.Fatalf("attempt %d task=%+v err=%v checks=%d auto_merge=%v events=%+v, want still blocked",
+				attempt, task, loadErr, git.checks, gate.AutoMerge, events)
+		}
+		now = now.Add(transientMergeGateRetryInterval + time.Second)
+	}
+	if git.checks != 3 {
+		t.Fatalf("dirty worktree evaluations = %d, want 3 beyond the former lifetime budget", git.checks)
+	}
+	blockedTask, err := store.GetTask(ctx, initialTask.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blockedTask.UpdatedAt != initialTask.UpdatedAt {
+		t.Fatalf("blocked age refreshed from %q to %q across transient retries", initialTask.UpdatedAt, blockedTask.UpdatedAt)
+	}
+
+	git.clean = true
+	poll("release after real condition clearance")
+	poll("merge after real condition clearance")
+	mergedTask, err := store.GetTask(ctx, initialTask.ID)
+	if err != nil || mergedTask.State != string(workflow.TaskMerged) {
+		t.Fatalf("task after delayed clearance = %+v err=%v, want merged", mergedTask, err)
+	}
+	if git.checks != 4 || len(client.merges) != 1 {
+		t.Fatalf("worktree evaluations=%d merges=%d, want four evaluations and one merge", git.checks, len(client.merges))
+	}
+	events, err := store.ListTaskEvents(ctx, initialTask.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retries := 0
+	for _, event := range events {
+		if event.Kind == "merge_gate_transient_retry" {
+			retries++
+		}
+	}
+	if retries != 4 {
+		t.Fatalf("transient retry events = %d, want recurring release through delayed clearance", retries)
+	}
+}
+
+func TestPollOnceBindsBranchlessReadyTaskToCurrentHead(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	pull := github.PullRequest{
+		Number: 1699, State: "open", HeadRef: "task-1699", BaseRef: "main",
+		HeadSHA: "current-head",
+	}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "implementation-task", RepoFullName: repo.FullName(),
+		Branch: pull.HeadRef, State: string(workflow.TaskPullRequestOpen),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	seedReadyBranchlessReviewTask(t, store, repo, "review-pr-1699-legacy", pull, "stale-head")
+	seedReadyBranchlessReviewTask(t, store, repo, "review-pr-1699-current", pull, pull.HeadSHA)
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: repo.FullName(), Number: pull.Number, HeadBranch: pull.HeadRef,
+		BaseBranch: pull.BaseRef, HeadSHA: pull.HeadSHA, State: "open",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	daemon, gate := blockedReviewTaskDaemon(t, store, repo, pull)
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(gate.requests) != 1 || gate.requests[0].TaskID != "review-pr-1699-current" ||
+		gate.requests[0].HeadSHA != pull.HeadSHA {
+		t.Fatalf("merge gate requests = %+v, want current-head task only", gate.requests)
+	}
+}
+
+func TestReadyResolverRejectsBranchTaskBoundToStaleHead(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	pull := github.PullRequest{
+		Number: 1699, State: "open", HeadRef: "task-1699", BaseRef: "main",
+		HeadSHA: "current-head",
+	}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "implementation-task", RepoFullName: repo.FullName(),
+		Branch: pull.HeadRef, State: string(workflow.TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: repo.FullName(), Number: pull.Number, HeadBranch: pull.HeadRef,
+		BaseBranch: pull.BaseRef, HeadSHA: "stale-head", State: "open",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	daemon, gate := blockedReviewTaskDaemon(t, store, repo, pull)
+
+	ready, err := daemon.pullRequestReadyToMerge(ctx, pull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready {
+		t.Fatal("stale-head branch task reported ready for current PR head")
+	}
+	if len(gate.requests) != 0 {
+		t.Fatalf("merge gate requests = %+v, want none for stale-head task", gate.requests)
+	}
+}
+
+func TestPollOnceRejectsAmbiguousBranchlessReadyTasks(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	pull := github.PullRequest{
+		Number: 1699, State: "open", HeadRef: "task-1699", BaseRef: "main",
+		HeadSHA: "current-head",
+	}
+	seedReadyBranchlessReviewTask(t, store, repo, "review-pr-1699-first", pull, pull.HeadSHA)
+	seedReadyBranchlessReviewTask(t, store, repo, "review-pr-1699-second", pull, pull.HeadSHA)
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: repo.FullName(), Number: pull.Number, HeadBranch: pull.HeadRef,
+		BaseBranch: pull.BaseRef, HeadSHA: pull.HeadSHA, State: "open",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	daemon, gate := blockedReviewTaskDaemon(t, store, repo, pull)
+
+	err := daemon.PollOnce(ctx)
+	if err == nil || !strings.Contains(err.Error(), "ambiguous ready tasks") {
+		t.Fatalf("PollOnce error = %v, want ambiguous ready tasks", err)
+	}
+	if len(gate.requests) != 0 {
+		t.Fatalf("merge gate requests = %+v, want none on ambiguous identity", gate.requests)
+	}
+}
+
+func TestReadyHandlerRevalidatesResolvedTaskBeforeGate(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	pull := github.PullRequest{
+		Number: 1699, State: "open", HeadRef: "task-1699", BaseRef: "main",
+		HeadSHA: "current-head",
+	}
+	seedReadyBranchlessReviewTask(t, store, repo, "review-pr-1699-current", pull, pull.HeadSHA)
+	daemon, gate := blockedReviewTaskDaemon(t, store, repo, pull)
+	task, err := daemon.lookupReadyPullRequestTask(ctx, pull, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task.State = string(workflow.TaskBlocked)
+	if err := store.UpsertTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := daemon.handleReadyToMergeWorkflow(ctx, pull, task); err != nil {
+		t.Fatal(err)
+	}
+	if len(gate.requests) != 0 {
+		t.Fatalf("merge gate requests = %+v, want none after ready state changed", gate.requests)
 	}
 }
 

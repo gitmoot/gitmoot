@@ -215,7 +215,7 @@ func TestRunMergeGateDeferredLeavesTaskReadyToMerge(t *testing.T) {
 	}, taskRef{
 		ID: "task-deferred", Repo: "gitmoot/gitmoot", GoalID: "goal-1",
 		Title: "Deferred merge", Branch: "fix-round",
-	})
+	}, TaskReadyToMerge)
 	if err != nil {
 		t.Fatalf("runMergeGate returned error for deferred decision: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestRunMergeGateDeferredParksPullRequestOpenTaskAtReadyToMerge(t *testing.T
 	}, taskRef{
 		ID: "task-pr-open", Repo: "gitmoot/gitmoot", GoalID: "goal-1",
 		Title: "No-reviewers merge", Branch: "auto-round",
-	})
+	}, TaskPullRequestOpen)
 	if err != nil {
 		t.Fatalf("runMergeGate returned error for deferred decision: %v", err)
 	}
@@ -283,7 +283,7 @@ func TestRunMergeGateNonDeferredNotReadyStillBlocks(t *testing.T) {
 	}, taskRef{
 		ID: "task-blocked", Repo: "gitmoot/gitmoot", GoalID: "goal-1",
 		Title: "Blocked merge", Branch: "blocked-round",
-	})
+	}, TaskReadyToMerge)
 	var blocked BlockedError
 	if !errors.As(err, &blocked) || blocked.Reason != "external CI failed" {
 		t.Fatalf("runMergeGate error = %v, want BlockedError for unchanged block path", err)

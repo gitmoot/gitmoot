@@ -400,6 +400,7 @@ type JobPayload struct {
 	// intent so routing decisions consume what the forge actually reports.
 	PullRequestDraft        bool         `json:"pull_request_draft,omitempty"`
 	PullRequestDraftUnknown bool         `json:"pull_request_draft_unknown,omitempty"`
+	PullRequestMerged       bool         `json:"pull_request_merged,omitempty"`
 	HeadSHA                 string       `json:"head_sha,omitempty"`
 	GoalID                  string       `json:"goal_id,omitempty"`
 	TaskID                  string       `json:"task_id"`

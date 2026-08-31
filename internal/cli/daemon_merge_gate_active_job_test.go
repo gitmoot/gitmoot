@@ -2,14 +2,22 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -633,5 +641,448 @@ func seedDaemonMergeGateJob(t *testing.T, store *db.Store, job db.Job, payload w
 	job.Payload = string(raw)
 	if err := store.CreateJobWithEvent(context.Background(), job, db.JobEvent{Kind: job.State, Message: "test fixture"}); err != nil {
 		t.Fatalf("CreateJobWithEvent(%s): %v", job.ID, err)
+	}
+}
+
+func TestPollOnceDaemonMergeGateRecoversMergedClaimDespiteActiveBranchJob(t *testing.T) {
+	runDaemonMergeGateTerminalPolls(t, true, false)
+}
+
+func TestPollOnceDaemonMergeGateRunsTerminalEffectsOnceForTwoReadyIdentities(t *testing.T) {
+	runDaemonMergeGateTerminalPolls(t, false, true)
+}
+
+func runDaemonMergeGateTerminalPolls(t *testing.T, withActiveJob, withAdditionalReadyTask bool) {
+	t.Helper()
+	t.Setenv("GITMOOT_DISABLE_NATIVE_MERGE_GATE", "")
+	ctx := context.Background()
+	const (
+		repoName     = "owner/repo"
+		taskID       = "review-pr-1732-retained"
+		additionalID = "task-1732"
+		workflowID   = "gitmoot4/daemon-wrapper-1732"
+		headBranch   = "fix/1732"
+		headSHA      = "head-1732"
+		pullRequest  = int64(1732)
+		mergeCommit  = "merge-1732"
+	)
+	repo := github.Repository{Owner: "owner", Name: "repo"}
+	store := daemonWorkerStore(t)
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	seedDaemonWorkerRepo(t, store, repoName, checkout)
+	worktreePath := t.TempDir()
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: taskID, RepoFullName: repoName, GoalID: workflowID, Title: "Review PR 1732",
+		State: string(workflow.TaskReadyToMerge), WorktreePath: worktreePath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName: repoName, Branch: headBranch, Owner: "builder",
+	}); err != nil || !acquired {
+		t.Fatalf("AcquireLock = acquired %v err %v", acquired, err)
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: repoName, Number: pullRequest,
+		URL: "https://github.com/owner/repo/pull/1732", HeadBranch: headBranch,
+		BaseBranch: "main", HeadSHA: headSHA, State: "open",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	seedDaemonMergeGateJob(t, store, db.Job{
+		ID: "implement-1732", Agent: "builder", Type: "implement", State: string(workflow.JobSucceeded),
+	}, workflow.JobPayload{
+		Repo: repoName, Branch: headBranch, PullRequest: int(pullRequest), HeadSHA: headSHA,
+		TaskID: taskID, WorkflowID: workflowID,
+		Result: &workflow.AgentResult{Decision: "implemented", Summary: "implemented"},
+	})
+	seedDaemonMergeGateJob(t, store, db.Job{
+		ID: "review-1732", Agent: "reviewer", Type: "review", State: string(workflow.JobSucceeded),
+	}, workflow.JobPayload{
+		Repo: repoName, Branch: headBranch, PullRequest: int(pullRequest), HeadSHA: headSHA,
+		TaskID: taskID, WorkflowID: workflowID, ReviewRound: "review-1",
+		Result: &workflow.AgentResult{Decision: "approved", Summary: "approved"},
+	})
+	mergeable := true
+	gh := &terminalPollMergeGateGitHub{pr: github.PullRequest{
+		Number: pullRequest, Title: "PR 1732", State: "open",
+		URL:     "https://github.com/owner/repo/pull/1732",
+		HeadRef: headBranch, BaseRef: "main", BaseSHA: "base-1732", HeadSHA: headSHA,
+		Mergeable: &mergeable,
+	}}
+	mergeRunner := &terminalPollGitHubRunner{poll: gh}
+	mergeClient := &github.GhClient{Runner: mergeRunner, MaxRetries: 1}
+	postMergeGit := &terminalPollMergeGateGit{}
+	worktrees := &terminalPollWorktreeCleaner{}
+	nextTasks := &terminalPollNextTasks{}
+	effects := newTerminalPollEffects()
+	gate := daemonMergeGate{
+		Store: store, GitHub: mergeClient, FallbackCheckout: checkout, Runner: mergeRunner,
+		Home: daemonMergeGateLiveOrgHome(t), Git: postMergeGit,
+		Worktrees: worktrees, NextTasks: nextTasks,
+	}
+	engine := workflow.Engine{
+		Store: store, MergeGate: gate, RequiredReviewers: []string{"reviewer"},
+		OutcomeHarvester: effects, ReviewLegDispatcher: effects,
+		DeterministicCheckerDispatcher: effects, HardVerifierDispatcher: effects,
+	}
+	poller := daemon.Daemon{Repo: repo, Store: store, GitHub: gh, Workflow: &engine}
+
+	if err := poller.PollOnce(ctx); err != nil {
+		t.Fatalf("queued PollOnce: %v", err)
+	}
+	queuedTask, err := store.GetTask(ctx, taskID)
+	if err != nil || queuedTask.State != string(workflow.TaskReadyToMerge) || queuedTask.Branch != "" {
+		t.Fatalf("queued task = %+v err=%v, want retained branchless ready task", queuedTask, err)
+	}
+	claimed, err := store.HasTaskStateClaim(ctx, taskID)
+	if err != nil || !claimed {
+		t.Fatalf("queued claim = %v err=%v, want durable claim", claimed, err)
+	}
+	queuedGate, err := store.GetMergeGate(ctx, repoName, pullRequest)
+	if err != nil || queuedGate.State != "pending" {
+		t.Fatalf("queued gate = %+v err=%v, want pending", queuedGate, err)
+	}
+	if mergeRunner.mergeCommands != 1 {
+		t.Fatalf("queued merge commands = %d, want 1", mergeRunner.mergeCommands)
+	}
+	if len(worktrees.paths) != 0 || len(postMergeGit.updates) != 0 || len(nextTasks.taskIDs) != 0 {
+		t.Fatalf("queued terminal effects removals=%v updates=%v continuations=%v, want none",
+			worktrees.paths, postMergeGit.updates, nextTasks.taskIDs)
+	}
+
+	if withAdditionalReadyTask {
+		if err := store.UpsertTask(ctx, db.Task{
+			ID: additionalID, RepoFullName: repoName, GoalID: workflowID,
+			Title: "Implement PR 1732", State: string(workflow.TaskReadyToMerge), Branch: headBranch,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if withActiveJob {
+		seedDaemonMergeGateJob(t, store, db.Job{
+			ID: "active-branch-job", Agent: "worker", Type: "ask", State: string(workflow.JobQueued),
+		}, workflow.JobPayload{Repo: repoName, Branch: headBranch, TaskID: "active-task"})
+		active, found, err := findActiveJobForBranch(ctx, store, repoName, headBranch)
+		if err != nil || !found || active.ID != "active-branch-job" {
+			t.Fatalf("active branch job = %+v found=%v err=%v", active, found, err)
+		}
+	}
+	gh.pr.State = "closed"
+	gh.pr.Merged = true
+	gh.pr.MergeSHA = mergeCommit
+
+	if err := poller.PollOnce(ctx); err != nil {
+		t.Fatalf("merged PollOnce: %v", err)
+	}
+	assertTerminalPollTask(t, store, taskID)
+	if withAdditionalReadyTask {
+		assertTerminalPollTask(t, store, additionalID)
+	}
+	claimed, err = store.HasTaskStateClaim(ctx, taskID)
+	if err != nil || claimed {
+		t.Fatalf("terminal claim = %v err=%v, want removed", claimed, err)
+	}
+	pr, err := store.GetPullRequest(ctx, repoName, pullRequest)
+	if err != nil || pr.State != "merged" || pr.MergeCommitSHA != mergeCommit {
+		t.Fatalf("terminal PR = %+v err=%v, want merged %s", pr, err, mergeCommit)
+	}
+	terminalGate, err := store.GetMergeGate(ctx, repoName, pullRequest)
+	if err != nil || terminalGate.State != "merged" {
+		t.Fatalf("terminal gate = %+v err=%v, want merged", terminalGate, err)
+	}
+	if _, err := store.GetBranchLock(ctx, repoName, headBranch); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("terminal branch lock error = %v, want released", err)
+	}
+	lockEvents, err := store.ListBranchLockEvents(ctx, repoName, headBranch)
+	if err != nil || len(lockEvents) != 1 || lockEvents[0].Kind != "released" {
+		t.Fatalf("terminal lock events = %+v err=%v, want one release", lockEvents, err)
+	}
+	terminalTask, err := store.GetTask(ctx, taskID)
+	if err != nil || terminalTask.WorktreePath != "" ||
+		!reflect.DeepEqual(worktrees.paths, []string{worktreePath}) {
+		t.Fatalf("terminal worktree task=%+v removals=%v err=%v, want one cleanup", terminalTask, worktrees.paths, err)
+	}
+	if !reflect.DeepEqual(postMergeGit.updates, []string{"origin/main"}) {
+		t.Fatalf("terminal base updates = %v, want [origin/main]", postMergeGit.updates)
+	}
+	if !reflect.DeepEqual(nextTasks.taskIDs, []string{taskID}) {
+		t.Fatalf("terminal continuations = %v, want [%s]", nextTasks.taskIDs, taskID)
+	}
+	if mergeRunner.mergeCommands != 1 {
+		t.Fatalf("terminal merge commands = %d, want 1 total", mergeRunner.mergeCommands)
+	}
+	effects.waitForDetached(t)
+	effectSnapshot := effects.snapshot()
+	if !reflect.DeepEqual(effectSnapshot.harvestKinds, []workflow.OutcomeKind{workflow.OutcomeMerged}) ||
+		effectSnapshot.reviewCalls != 1 || effectSnapshot.checkerCalls != 1 || effectSnapshot.verifierCalls != 1 {
+		t.Fatalf("terminal engine effects = %+v, want one merge harvest and one of each detached leg", effectSnapshot)
+	}
+	taskEvents := terminalPollTaskEvents(t, store, taskID)
+	additionalEvents := []db.TaskEvent(nil)
+	if withAdditionalReadyTask {
+		additionalEvents = terminalPollTaskEvents(t, store, additionalID)
+	}
+	notes, err := store.ListWorkflowNotes(ctx, workflowID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := poller.PollOnce(ctx); err != nil {
+		t.Fatalf("stable PollOnce: %v", err)
+	}
+	assertTerminalPollTask(t, store, taskID)
+	if withAdditionalReadyTask {
+		assertTerminalPollTask(t, store, additionalID)
+	}
+	claimed, err = store.HasTaskStateClaim(ctx, taskID)
+	if err != nil || claimed {
+		t.Fatalf("stable claim = %v err=%v, want absent", claimed, err)
+	}
+	if _, err := store.GetBranchLock(ctx, repoName, headBranch); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("stable branch lock error = %v, want absent", err)
+	}
+	stablePR, err := store.GetPullRequest(ctx, repoName, pullRequest)
+	if err != nil || !reflect.DeepEqual(stablePR, pr) {
+		t.Fatalf("stable PR = %+v err=%v, want %+v", stablePR, err, pr)
+	}
+	stableGate, err := store.GetMergeGate(ctx, repoName, pullRequest)
+	if err != nil || stableGate.State != terminalGate.State || stableGate.Reason != terminalGate.Reason {
+		t.Fatalf("stable gate = %+v err=%v, want %+v", stableGate, err, terminalGate)
+	}
+	if got := terminalPollTaskEvents(t, store, taskID); !reflect.DeepEqual(got, taskEvents) {
+		t.Fatalf("stable canonical task events = %+v, want %+v", got, taskEvents)
+	}
+	if withAdditionalReadyTask {
+		if got := terminalPollTaskEvents(t, store, additionalID); !reflect.DeepEqual(got, additionalEvents) {
+			t.Fatalf("stable additional task events = %+v, want %+v", got, additionalEvents)
+		}
+	}
+	stableNotes, err := store.ListWorkflowNotes(ctx, workflowID, 0)
+	if err != nil || !reflect.DeepEqual(stableNotes, notes) {
+		t.Fatalf("stable notes = %+v err=%v, want %+v", stableNotes, err, notes)
+	}
+	stableLockEvents, err := store.ListBranchLockEvents(ctx, repoName, headBranch)
+	if err != nil || !reflect.DeepEqual(stableLockEvents, lockEvents) {
+		t.Fatalf("stable lock events = %+v err=%v, want %+v", stableLockEvents, err, lockEvents)
+	}
+	if mergeRunner.mergeCommands != 1 ||
+		!reflect.DeepEqual(worktrees.paths, []string{worktreePath}) ||
+		!reflect.DeepEqual(postMergeGit.updates, []string{"origin/main"}) ||
+		!reflect.DeepEqual(nextTasks.taskIDs, []string{taskID}) ||
+		!reflect.DeepEqual(effects.snapshot(), effectSnapshot) {
+		t.Fatalf("stable effects merges=%d removals=%v updates=%v continuations=%v engine=%+v",
+			mergeRunner.mergeCommands, worktrees.paths, postMergeGit.updates, nextTasks.taskIDs, effects.snapshot())
+	}
+}
+
+func assertTerminalPollTask(t *testing.T, store *db.Store, taskID string) {
+	t.Helper()
+	task, err := store.GetTask(context.Background(), taskID)
+	if err != nil || task.State != string(workflow.TaskMerged) {
+		t.Fatalf("task %s = %+v err=%v, want merged", taskID, task, err)
+	}
+	events := terminalPollTaskEvents(t, store, taskID)
+	mergedEvents := 0
+	for _, event := range events {
+		if event.Kind == "pull_request_merged" {
+			mergedEvents++
+		}
+	}
+	if mergedEvents != 1 {
+		t.Fatalf("task %s events = %+v, want one pull_request_merged", taskID, events)
+	}
+}
+
+func terminalPollTaskEvents(t *testing.T, store *db.Store, taskID string) []db.TaskEvent {
+	t.Helper()
+	events, err := store.ListTaskEvents(context.Background(), taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return events
+}
+
+type terminalPollMergeGateGitHub struct {
+	github.NoopClient
+	pr       github.PullRequest
+	statuses []github.CommitStatusInput
+}
+
+func (g *terminalPollMergeGateGitHub) ListPullRequests(_ context.Context, _ github.Repository, state string) ([]github.PullRequest, error) {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "open":
+		if strings.EqualFold(g.pr.State, "open") {
+			return []github.PullRequest{g.pr}, nil
+		}
+	case "closed":
+		if strings.EqualFold(g.pr.State, "closed") {
+			return []github.PullRequest{g.pr}, nil
+		}
+	}
+	return nil, nil
+}
+
+func (g *terminalPollMergeGateGitHub) ListIssueComments(context.Context, github.Repository, int64) ([]github.IssueComment, error) {
+	return nil, nil
+}
+
+func (g *terminalPollMergeGateGitHub) GetPullRequest(context.Context, github.Repository, int64) (github.PullRequest, error) {
+	return g.pr, nil
+}
+
+func (g *terminalPollMergeGateGitHub) GetCombinedStatus(context.Context, github.Repository, string) (github.CombinedStatus, error) {
+	return github.CombinedStatus{State: "success"}, nil
+}
+
+func (g *terminalPollMergeGateGitHub) CreateCommitStatus(_ context.Context, input github.CommitStatusInput) (github.CommitStatus, error) {
+	g.statuses = append(g.statuses, input)
+	return github.CommitStatus{State: input.State, Context: input.Context}, nil
+}
+
+type terminalPollGitHubRunner struct {
+	poll          *terminalPollMergeGateGitHub
+	mergeCommands int
+}
+
+func (r *terminalPollGitHubRunner) Run(_ context.Context, _ string, _ string, args ...string) (subprocess.Result, error) {
+	if len(args) >= 2 && args[0] == "pr" && args[1] == "merge" {
+		r.mergeCommands++
+		return subprocess.Result{Stdout: "queued"}, nil
+	}
+	joined := strings.Join(args, " ")
+	switch {
+	case strings.Contains(joined, "/pulls/1732"):
+		pr := r.poll.pr
+		body := fmt.Sprintf(
+			`{"number":%d,"title":%q,"state":%q,"merged":%t,"html_url":%q,"merge_commit_sha":%q,"mergeable":true,"head":{"ref":%q,"sha":%q},"base":{"ref":%q,"sha":%q}}`,
+			pr.Number, pr.Title, pr.State, pr.Merged, pr.URL, pr.MergeSHA,
+			pr.HeadRef, pr.HeadSHA, pr.BaseRef, pr.BaseSHA,
+		)
+		return subprocess.Result{Stdout: body}, nil
+	case strings.Contains(joined, "/commits/head-1732/status"):
+		return subprocess.Result{Stdout: `{"state":"success","statuses":[]}`}, nil
+	case strings.Contains(joined, "/commits/head-1732/check-runs"):
+		return subprocess.Result{Stdout: `{"name":"build","status":"completed","conclusion":"success"}`}, nil
+	case strings.Contains(joined, "/compare/"):
+		return subprocess.Result{Stdout: `{"status":"ahead","ahead_by":1,"behind_by":0}`}, nil
+	case len(args) >= 2 && args[0] == "pr" && args[1] == "checks":
+		return subprocess.Result{Stdout: `[{"name":"build","state":"SUCCESS","bucket":"pass"}]`}, nil
+	case strings.Contains(joined, "/statuses/head-1732"):
+		return subprocess.Result{Stdout: `{"state":"pending","context":"gitmoot/merge-gate"}`}, nil
+	default:
+		return subprocess.Result{}, fmt.Errorf("unexpected production GitHub adapter call: %s", joined)
+	}
+}
+
+func (*terminalPollGitHubRunner) LookPath(file string) (string, error) {
+	return file, nil
+}
+
+type terminalPollMergeGateGit struct {
+	updates []string
+}
+
+func (*terminalPollMergeGateGit) WorktreeClean(context.Context) (bool, error) {
+	return true, nil
+}
+
+func (g *terminalPollMergeGateGit) UpdateBase(_ context.Context, remote, branch string) error {
+	g.updates = append(g.updates, remote+"/"+branch)
+	return nil
+}
+
+type terminalPollWorktreeCleaner struct {
+	paths []string
+}
+
+func (c *terminalPollWorktreeCleaner) RemoveWorktree(_ context.Context, path string) error {
+	c.paths = append(c.paths, path)
+	return nil
+}
+
+type terminalPollNextTasks struct {
+	taskIDs []string
+}
+
+func (n *terminalPollNextTasks) EnqueueNextTask(_ context.Context, taskID string) error {
+	n.taskIDs = append(n.taskIDs, taskID)
+	return nil
+}
+
+type terminalPollEffectSnapshot struct {
+	harvestKinds  []workflow.OutcomeKind
+	reviewCalls   int
+	checkerCalls  int
+	verifierCalls int
+}
+
+type terminalPollEffects struct {
+	mu            sync.Mutex
+	harvestKinds  []workflow.OutcomeKind
+	reviewCalls   int
+	checkerCalls  int
+	verifierCalls int
+	reviewDone    chan struct{}
+	checkerDone   chan struct{}
+	verifierDone  chan struct{}
+}
+
+func newTerminalPollEffects() *terminalPollEffects {
+	return &terminalPollEffects{
+		reviewDone: make(chan struct{}, 1), checkerDone: make(chan struct{}, 1), verifierDone: make(chan struct{}, 1),
+	}
+}
+
+func (e *terminalPollEffects) Harvest(_ context.Context, _ db.Job, _ workflow.JobPayload, outcome workflow.Outcome) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.harvestKinds = append(e.harvestKinds, outcome.Kind)
+	return nil
+}
+
+func (e *terminalPollEffects) Review(context.Context, db.Job, workflow.JobPayload, string) (workflow.Outcome, bool, error) {
+	e.mu.Lock()
+	e.reviewCalls++
+	e.mu.Unlock()
+	e.reviewDone <- struct{}{}
+	return workflow.Outcome{}, false, nil
+}
+
+func (e *terminalPollEffects) Check(context.Context, db.Job, workflow.JobPayload, string) (workflow.Outcome, bool, error) {
+	e.mu.Lock()
+	e.checkerCalls++
+	e.mu.Unlock()
+	e.checkerDone <- struct{}{}
+	return workflow.Outcome{}, false, nil
+}
+
+func (e *terminalPollEffects) Verify(context.Context, db.Job, workflow.JobPayload, string) (workflow.Outcome, bool, error) {
+	e.mu.Lock()
+	e.verifierCalls++
+	e.mu.Unlock()
+	e.verifierDone <- struct{}{}
+	return workflow.Outcome{}, false, nil
+}
+
+func (e *terminalPollEffects) waitForDetached(t *testing.T) {
+	t.Helper()
+	for name, done := range map[string]<-chan struct{}{
+		"review": e.reviewDone, "checker": e.checkerDone, "verifier": e.verifierDone,
+	} {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for detached %s effect", name)
+		}
+	}
+}
+
+func (e *terminalPollEffects) snapshot() terminalPollEffectSnapshot {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return terminalPollEffectSnapshot{
+		harvestKinds: append([]workflow.OutcomeKind(nil), e.harvestKinds...),
+		reviewCalls:  e.reviewCalls, checkerCalls: e.checkerCalls, verifierCalls: e.verifierCalls,
 	}
 }

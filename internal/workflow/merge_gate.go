@@ -27,7 +27,14 @@ const (
 	MergeLeaveOpenAutoMergeKillSwitchReason = "native auto-merge is disabled by the repository kill-switch; leave the pull request open for a human merge"
 	commitStatusDescriptionMaxRunes         = 140
 	mergeQueueLockTTL                       = 30 * time.Minute
+	// The initial lease outlives the maximum eight-hour worker context by one
+	// hour. Hourly renewal also protects daemon-owned calls without a deadline.
+	mergeTaskStateClaimTTL             = 9 * time.Hour
+	mergeTaskStateClaimRenewalInterval = time.Hour
+	mergeOutcomeConfirmationTimeout    = 30 * time.Second
 )
+
+var ErrMergeTaskStateChanged = errors.New("merge task state changed before external merge")
 
 // NativeMergeGateDisabled reports whether the operator handed the merge decision
 // to an external gate via GITMOOT_DISABLE_NATIVE_MERGE_GATE (#545). It is the
@@ -98,7 +105,12 @@ type PolicyMergeGate struct {
 	// of wedging forever. Zero means use the built-in default (defaultMaxCIWait).
 	MaxCIWait time.Duration
 	// Clock is injectable for deterministic tests. Nil means time.Now.
-	Clock func() time.Time
+	Clock                      func() time.Time
+	taskClaimTTL               time.Duration
+	taskClaimRenewalInterval   time.Duration
+	taskClaimRenewalTicks      func(context.Context, time.Duration) <-chan time.Time
+	afterTaskClaimRenewal      func()
+	outcomeConfirmationTimeout time.Duration
 }
 
 // defaultMinCIWait is the built-in grace window used when MinCIWait is unset. It
@@ -135,6 +147,94 @@ func (g PolicyMergeGate) maxCIWait() time.Duration {
 	return defaultMaxCIWait
 }
 
+func (g PolicyMergeGate) taskStateClaimTTL() time.Duration {
+	if g.taskClaimTTL > 0 {
+		return g.taskClaimTTL
+	}
+	return mergeTaskStateClaimTTL
+}
+
+func (g PolicyMergeGate) taskStateClaimRenewalInterval() time.Duration {
+	if g.taskClaimRenewalInterval > 0 {
+		return g.taskClaimRenewalInterval
+	}
+	return mergeTaskStateClaimRenewalInterval
+}
+
+func (g PolicyMergeGate) taskStateClaimRenewalTickSource(ctx context.Context, interval time.Duration) <-chan time.Time {
+	if g.taskClaimRenewalTicks != nil {
+		return g.taskClaimRenewalTicks(ctx, interval)
+	}
+	out := make(chan time.Time)
+	go func() {
+		defer close(out)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case tick := <-ticker.C:
+				select {
+				case out <- tick:
+				case <-ctx.Done():
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
+}
+
+func (g PolicyMergeGate) startTaskStateClaimRenewal(taskID, token string) func() error {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		ticks := g.taskStateClaimRenewalTickSource(ctx, g.taskStateClaimRenewalInterval())
+		var lastErr error
+		for {
+			select {
+			case _, ok := <-ticks:
+				if !ok {
+					if ctx.Err() != nil {
+						done <- lastErr
+					} else {
+						done <- errors.Join(lastErr, errors.New("task claim renewal clock stopped"))
+					}
+					return
+				}
+				renewed, err := g.Store.RenewTaskStateClaim(context.Background(), taskID, token, g.taskStateClaimTTL())
+				if err != nil {
+					lastErr = fmt.Errorf("renew task state claim: %w", err)
+					continue
+				}
+				if !renewed {
+					done <- fmt.Errorf("%w: durable task claim for %s expired or changed owners", ErrMergeTaskStateChanged, taskID)
+					return
+				}
+				lastErr = nil
+				if g.afterTaskClaimRenewal != nil {
+					g.afterTaskClaimRenewal()
+				}
+			case <-ctx.Done():
+				done <- lastErr
+				return
+			}
+		}
+	}()
+	return func() error {
+		cancel()
+		return <-done
+	}
+}
+
+func (g PolicyMergeGate) mergeOutcomeConfirmationTimeout() time.Duration {
+	if g.outcomeConfirmationTimeout > 0 {
+		return g.outcomeConfirmationTimeout
+	}
+	return mergeOutcomeConfirmationTimeout
+}
+
 // workflowAwareGitHub is an OPTIONAL capability the merge gate probes for on its
 // GitHub client (#596, layer 2). The real *github.GhClient implements it; a
 // client that does not is treated as "workflows unknown", which fails safe
@@ -169,6 +269,18 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	pr, err := g.GitHub.GetPullRequest(ctx, repo, int64(request.PullRequest))
 	if err != nil {
 		return MergeDecision{}, err
+	}
+	if !pullRequestMerged(pr) && strings.TrimSpace(pr.State) == "closed" &&
+		strings.TrimSpace(request.TaskID) != "" && strings.TrimSpace(request.ExpectedTaskState) != "" {
+		released, _, releaseErr := g.Store.ReleaseRetainedTaskStateClaim(ctx,
+			request.TaskID, request.ExpectedTaskState, db.TaskStateClaimKindExternalMergeUncertain)
+		if releaseErr != nil {
+			return MergeDecision{}, fmt.Errorf("resolve retained task claim after authoritative non-merged observation: %w", releaseErr)
+		}
+		if released {
+			log.Printf("merge gate released retained external merge claim for task %s after pull request #%d reached a terminal non-merge state",
+				request.TaskID, request.PullRequest)
+		}
 	}
 	headSHA := strings.TrimSpace(pr.HeadSHA)
 	if headSHA == "" {
@@ -208,6 +320,12 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 		}()
 	}
 	if pullRequestMerged(pr) {
+		if strings.TrimSpace(request.TaskID) != "" && strings.TrimSpace(request.ExpectedTaskState) != "" {
+			if _, _, err := g.Store.RecoverClaimedTaskState(ctx, request.TaskID, string(TaskMerged),
+				"pull_request_merged", fmt.Sprintf("recovered merged pull request #%d from durable task claim", request.PullRequest)); err != nil {
+				return MergeDecision{}, err
+			}
+		}
 		return g.finishMerged(ctx, request, pr, strings.TrimSpace(pr.MergeSHA))
 	}
 	if strings.TrimSpace(pr.State) == "closed" {
@@ -241,7 +359,7 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	if pr.Mergeable != nil && !*pr.Mergeable {
 		return g.block(ctx, request, headSHA, "pull request is not mergeable; rebase or update the branch", MergeBlockTransient)
 	}
-	result, err := executePullRequestMerge(ctx, g.GitHub, github.MergePullRequestInput{
+	result, err := g.executePullRequestMergeFenced(ctx, request, github.MergePullRequestInput{
 		Repo:            repo,
 		Number:          int64(request.PullRequest),
 		Method:          mergeMethod(g.MergeMethod),
@@ -317,6 +435,92 @@ func (g PolicyMergeGate) reviewAndCIGateMiss(ctx context.Context, repo github.Re
 		}
 	}
 	return MergeDecision{}, false, miss, nil
+}
+
+// executePullRequestMergeFenced durably claims the task's expected state before
+// the irreversible GitHub merge. The active lease renews while the external
+// call is in flight. Accepted queued merges and outcomes that cannot be
+// confirmed remain fenced without expiry until a later authoritative merged or
+// terminal non-merge observation resolves them.
+func (g PolicyMergeGate) executePullRequestMergeFenced(ctx context.Context, request MergeRequest, input github.MergePullRequestInput) (github.MergeResult, error) {
+	expectedState := strings.TrimSpace(request.ExpectedTaskState)
+	taskID := strings.TrimSpace(request.TaskID)
+	if expectedState == "" || taskID == "" {
+		return executePullRequestMerge(ctx, g.GitHub, input)
+	}
+	token, claimed, currentState, err := g.Store.ClaimTaskState(
+		ctx, taskID, expectedState, db.TaskStateClaimKindExternalMerge, g.taskStateClaimTTL())
+	if err != nil {
+		return github.MergeResult{}, err
+	}
+	if !claimed {
+		return github.MergeResult{}, fmt.Errorf("%w: task %s expected %q, current %q",
+			ErrMergeTaskStateChanged, taskID, expectedState, currentState)
+	}
+	stopRenewal := g.startTaskStateClaimRenewal(taskID, token)
+	result, mergeErr := executePullRequestMerge(ctx, g.GitHub, input)
+	renewalErr := stopRenewal()
+
+	if mergeErr != nil {
+		confirmedPR, confirmationErr := g.confirmExternalMergeOutcome(ctx, input)
+		switch {
+		case confirmationErr == nil && pullRequestMerged(confirmedPR):
+			result = github.MergeResult{Merged: true, SHA: strings.TrimSpace(confirmedPR.MergeSHA)}
+			mergeErr = nil
+		case confirmationErr == nil && strings.TrimSpace(confirmedPR.State) == "closed":
+			releaseErr := g.Store.ReleaseTaskStateClaim(ctx, taskID, token)
+			return result, errors.Join(mergeErr, renewalErr, releaseErr)
+		default:
+			retained, retainErr := g.Store.RetainTaskStateClaim(ctx, taskID, token,
+				expectedState, db.TaskStateClaimKindExternalMergeUncertain)
+			outcomeErr := errors.Join(mergeErr, renewalErr, retainErr)
+			if confirmationErr != nil {
+				outcomeErr = errors.Join(outcomeErr, fmt.Errorf("confirm external merge outcome: %w", confirmationErr))
+			}
+			if !retained {
+				return result, fmt.Errorf("external merge outcome is unresolved and durable task ownership could not be retained: %w",
+					errors.Join(outcomeErr, ErrMergeTaskStateChanged))
+			}
+			if confirmationErr == nil {
+				return result, fmt.Errorf("external merge returned an error while the pull request remains open; durable task ownership retained for reconciliation: %w",
+					outcomeErr)
+			}
+			return result, fmt.Errorf("external merge outcome is ambiguous; durable task ownership retained for reconciliation: %w",
+				outcomeErr)
+		}
+	}
+	if !result.Merged {
+		retained, retainErr := g.Store.RetainTaskStateClaim(ctx, taskID, token,
+			expectedState, db.TaskStateClaimKindExternalMergeUncertain)
+		if !retained {
+			return result, fmt.Errorf("external merge is pending and durable task ownership could not be retained: %w",
+				errors.Join(renewalErr, retainErr, ErrMergeTaskStateChanged))
+		}
+		if renewalErr != nil {
+			log.Printf("merge gate retained pending task %s after claim renewal warning: %v", taskID, renewalErr)
+		}
+		return result, nil
+	}
+	changed, currentState, err := g.Store.CompleteTaskStateClaim(ctx, taskID, token,
+		string(TaskMerged), "pull_request_merged",
+		fmt.Sprintf("merged pull request #%d while holding durable task-state claim", request.PullRequest))
+	if err != nil {
+		return result, fmt.Errorf("external merge succeeded but task %s claim completion failed: %w", taskID, err)
+	}
+	if !changed {
+		return result, fmt.Errorf("external merge succeeded but %w: task %s expected %q, current %q",
+			ErrMergeTaskStateChanged, taskID, expectedState, currentState)
+	}
+	if renewalErr != nil {
+		log.Printf("merge gate completed task %s after claim renewal warning: %v", taskID, renewalErr)
+	}
+	return result, nil
+}
+
+func (g PolicyMergeGate) confirmExternalMergeOutcome(ctx context.Context, input github.MergePullRequestInput) (github.PullRequest, error) {
+	confirmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), g.mergeOutcomeConfirmationTimeout())
+	defer cancel()
+	return g.GitHub.GetPullRequest(confirmCtx, input.Repo, input.Number)
 }
 
 // executePullRequestMerge is the single low-level GitHub merge path shared by

@@ -187,70 +187,31 @@ func (e Engine) fixBranchLockOwner(ctx context.Context, payload JobPayload, exec
 }
 
 func (e Engine) blockAutoFix(ctx context.Context, ref taskRef, reason string) error {
-	if strings.TrimSpace(ref.ID) != "" {
-		if err := e.Store.AddTaskEvent(ctx, db.TaskEvent{
-			TaskID: ref.ID,
-			Kind:   "review_auto_fix_blocked",
-			Reason: reason,
-		}); err != nil {
-			return fmt.Errorf("record auto-fix block: %w", err)
-		}
-	}
-	return e.block(ctx, ref, reason)
+	return e.blockAttributed(ctx, ref, "review_auto_fix_blocked", reason, "auto-fix")
 }
 
-// blockMergeGate attributes a merge-gate block on the task itself before making
-// the transition (#1562). e.block is shared with the coordinator failure paths —
-// block_parent and the vote/quorum synthesis gates in
-// engine_continuation_synthesis.go — so `state == blocked` alone cannot say WHICH
-// mechanism blocked a task. Without this event an exit path can only see that a
-// task is blocked and that some merge-gate row exists, and would clear a quorum
-// failure as though it were self-clearing infrastructure. Mirrors blockAutoFix.
+// blockMergeGate attributes a merge-gate block on the task itself (#1562).
+// All block writers converge on blockTask, so the event naming the owner is
+// written only after the durable blocked transition.
 func (e Engine) blockMergeGate(ctx context.Context, ref taskRef, reason string) error {
 	return e.blockAttributed(ctx, ref, "merge_gate_blocked", reason, "merge-gate")
 }
 
 // blockSynthesisGate attributes a coordinator synthesis-gate block (vote or
 // quorum unmet) on the task, mirroring blockMergeGate and blockAutoFix (#1562).
-//
-// Attributing BOTH sides is what makes absence meaningful. With only the merge
-// gate attributed, a task carrying no blocking event is ambiguous — it could be a
-// pre-attribution legacy block OR a fresh quorum failure — so an exit path can
-// neither release legacy wedges nor refuse quorum failures without guessing. Once
-// both write an event, "no blocking event at all" identifies exactly one
-// population: rows blocked before this shipped.
+// Generic workflow blocks use workflow_blocked at the same choke point, making
+// the latest blocking event a complete ownership record rather than a selective
+// list of callers.
 func (e Engine) blockSynthesisGate(ctx context.Context, ref taskRef, kind string, reason string) error {
 	return e.blockAttributed(ctx, ref, kind, reason, "synthesis-gate")
 }
 
-// blockAttributed blocks the task and records WHICH mechanism did it, in that
-// order. The order is load-bearing: e.block signals success by returning a
-// BlockedError and a store failure by returning a plain error, so writing the
-// attribution first would leave a durable "this task is blocked by X" event behind
-// a transition that never happened — and a later block from a mechanism that
-// writes no event of its own would then be released on the strength of that stale
-// claim. Attribution failure is logged into the returned error but never converts a
-// successful block into a failure, because the block itself is already durable.
+// blockAttributed routes named blockers through the shared block-first,
+// attribute-second choke point.
 func (e Engine) blockAttributed(ctx context.Context, ref taskRef, kind string, reason string, label string) error {
-	blockErr := e.block(ctx, ref, reason)
-	var blocked BlockedError
-	if !errors.As(blockErr, &blocked) {
-		// The transition itself failed; there is no block to attribute.
-		return blockErr
-	}
-	if strings.TrimSpace(ref.ID) == "" {
-		return blockErr
-	}
-	if err := e.Store.AddTaskEvent(ctx, db.TaskEvent{
-		TaskID:  ref.ID,
-		Kind:    kind,
-		ToState: string(TaskBlocked),
-		Reason:  reason,
-	}); err != nil {
-		return fmt.Errorf("record %s block for task %s: %w", label, ref.ID, err)
-	}
-	return blockErr
+	return e.blockTask(ctx, ref, kind, reason, label)
 }
+
 func (e Engine) allRequiredReviewersApproved(ctx context.Context, currentReviewer string, payload JobPayload) (bool, error) {
 	required := e.requiredReviewers(payload)
 	if len(required) == 0 {
@@ -626,11 +587,14 @@ func (e Engine) ensureBranchLock(ctx context.Context, repo string, branch string
 	return nil
 }
 
-func (e Engine) runMergeGate(ctx context.Context, reviewer string, payload JobPayload, ref taskRef) (MergeDecision, error) {
-	return e.runMergeGateWithHumanMerge(ctx, reviewer, payload, ref, false)
+func (e Engine) runMergeGate(ctx context.Context, reviewer string, payload JobPayload, ref taskRef, expectedTaskState TaskState) (MergeDecision, error) {
+	return e.runMergeGateWithHumanMerge(ctx, reviewer, payload, ref, false, string(expectedTaskState))
 }
 
-func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string, payload JobPayload, ref taskRef, humanMergeRequested bool) (MergeDecision, error) {
+func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string, payload JobPayload, ref taskRef, humanMergeRequested bool, expectedTaskState string) (MergeDecision, error) {
+	if strings.TrimSpace(ref.ID) != "" && strings.TrimSpace(expectedTaskState) == "" {
+		return MergeDecision{}, errors.New("task-owned merge gate requires an expected task state")
+	}
 	if e.MergeGate == nil {
 		return MergeDecision{Ready: true}, e.setTaskState(ctx, ref, TaskReadyToMerge)
 	}
@@ -644,12 +608,14 @@ func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string,
 		PullRequest:             payload.PullRequest,
 		PullRequestDraft:        payload.PullRequestDraft,
 		PullRequestDraftUnknown: payload.PullRequestDraftUnknown,
+		PullRequestMerged:       payload.PullRequestMerged,
 		HeadSHA:                 payload.HeadSHA,
 		TaskID:                  payload.TaskID,
 		WorkflowID:              payload.WorkflowID,
 		Reviewer:                reviewer,
 		ReviewOptional:          !reviewRequired,
 		ReviewBlockingSeverity:  e.reviewBlockingSeverity(payload.Repo),
+		ExpectedTaskState:       expectedTaskState,
 		HumanMergeRequested:     humanMergeRequested,
 	})
 	if err != nil {

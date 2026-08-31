@@ -2306,4 +2306,42 @@ CREATE TABLE IF NOT EXISTS merge_gates (
 );
 ALTER TABLE merge_gates ADD COLUMN block_class INTEGER NOT NULL DEFAULT 0;
 	`,
+	// Durable cross-process task-state claim for the irreversible native merge
+	// boundary. SQLite triggers make every state writer participate, including
+	// independent processes. An unresolved external outcome remains fenced
+	// without expiry until an authoritative remote observation resolves it.
+	`
+CREATE TABLE task_state_claims (
+	task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+	kind TEXT NOT NULL,
+	token TEXT NOT NULL UNIQUE,
+	expected_state TEXT NOT NULL,
+	acquired_at INTEGER NOT NULL,
+	expires_at INTEGER NOT NULL
+);
+CREATE INDEX idx_task_state_claims_expires_at ON task_state_claims(expires_at);
+CREATE TRIGGER guard_claimed_task_state_update
+BEFORE UPDATE OF state ON tasks
+WHEN OLD.state <> NEW.state
+	AND EXISTS (
+		SELECT 1 FROM task_state_claims
+		WHERE task_id = OLD.id
+			AND (kind = 'external_merge_uncertain'
+				OR expires_at > CAST(strftime('%s', 'now') AS INTEGER))
+	)
+BEGIN
+	SELECT RAISE(ABORT, 'task state is claimed for an external merge');
+END;
+CREATE TRIGGER guard_claimed_task_delete
+BEFORE DELETE ON tasks
+WHEN EXISTS (
+	SELECT 1 FROM task_state_claims
+	WHERE task_id = OLD.id
+		AND (kind = 'external_merge_uncertain'
+			OR expires_at > CAST(strftime('%s', 'now') AS INTEGER))
+)
+BEGIN
+	SELECT RAISE(ABORT, 'task state is claimed for an external merge');
+END;
+	`,
 }

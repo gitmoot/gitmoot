@@ -247,13 +247,17 @@ type PullRequestEvent struct {
 	// merge-gate eligible and do not represent a pending human merge decision.
 	PullRequestDraft        bool
 	PullRequestDraftUnknown bool
-	HeadSHA                 string
-	GoalID                  string
-	TaskID                  string
-	TaskTitle               string
-	LeadAgent               string
-	Sender                  string
-	RequiredReviewers       []string
+	// PullRequestMerged is an authoritative forge observation. It permits only
+	// the production wrapper's active-job deferral bypass; PolicyMergeGate still
+	// re-reads the pull request before applying terminal effects.
+	PullRequestMerged bool
+	HeadSHA           string
+	GoalID            string
+	TaskID            string
+	TaskTitle         string
+	LeadAgent         string
+	Sender            string
+	RequiredReviewers []string
 	// ActingOrgRole is the org attribution carried from the branch lock (#1250).
 	// BOTH PR-open triggers read it from that one durable source, so native review
 	// fanout children inherit an attribution instead of being enqueued
@@ -311,11 +315,18 @@ type MergeRequest struct {
 	PullRequest             int
 	PullRequestDraft        bool
 	PullRequestDraftUnknown bool
-	HeadSHA                 string
-	TaskID                  string
-	WorkflowID              string
-	Reviewer                string
-	ReviewOptional          bool
+	// PullRequestMerged carries an authoritative forge observation through the
+	// production wrapper. It never decides the merge outcome by itself.
+	PullRequestMerged bool
+	HeadSHA           string
+	TaskID            string
+	// ExpectedTaskState asks PolicyMergeGate to revalidate and hold this task
+	// state through the irreversible MergePullRequest call. Empty preserves
+	// callers that do not own a task-state precondition.
+	ExpectedTaskState string
+	WorkflowID        string
+	Reviewer          string
+	ReviewOptional    bool
 	// ReviewBlockingSeverity is the resolved repository threshold carried into
 	// the merge gate. Empty preserves the historical block-all behavior.
 	ReviewBlockingSeverity string

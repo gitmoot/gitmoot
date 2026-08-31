@@ -1794,19 +1794,19 @@ func blockTaskForDirtyWorktree(ctx context.Context, store *db.Store, task db.Tas
 	if task.Title == "" {
 		task.Title = request.TaskTitle
 	}
-	if err := store.UpsertTask(ctx, task); err != nil {
-		return err
-	}
-	if err := store.AddTaskEvent(ctx, db.TaskEvent{
-		TaskID:    task.ID,
+	blockErr := BlockedError{Reason: reason}
+	blocked, err := store.BlockTaskWithEvent(ctx, task, db.TaskEvent{
 		Kind:      "stale_worktree_dirty_blocked",
 		FromState: fromState,
-		ToState:   string(TaskBlocked),
 		Reason:    reason,
-	}); err != nil {
-		return err
+	})
+	if err != nil {
+		if !blocked {
+			return err
+		}
+		return errors.Join(blockErr, fmt.Errorf("record dirty-worktree block for task %s: %w", task.ID, err))
 	}
-	return BlockedError{Reason: reason}
+	return blockErr
 }
 
 func TaskWorktreePath(home string, repo string, taskID string) (string, error) {
