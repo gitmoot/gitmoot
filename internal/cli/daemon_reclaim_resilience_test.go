@@ -574,6 +574,16 @@ func TestReclaimTerminalTaskWorktreesRemovesCleanDismissedTask(t *testing.T) {
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 	worker := defaultJobWorker(store, io.Discard, home)
+	livenessCalls := 0
+	baseWorkflowFactory := worker.defaultWorkflow
+	worker.WorkflowFactory = func(checkout string) workflow.Engine {
+		engine := baseWorkflowFactory(checkout)
+		engine.WorktreeLiveness = func(string) (bool, bool) {
+			livenessCalls++
+			return false, true
+		}
+		return engine
+	}
 	path, err := workflow.TaskWorktreePath(worker.workflowHome(), "owner/repo", "adhoc-finished")
 	if err != nil {
 		t.Fatalf("TaskWorktreePath: %v", err)
@@ -596,6 +606,9 @@ func TestReclaimTerminalTaskWorktreesRemovesCleanDismissedTask(t *testing.T) {
 
 	if err := reclaimTerminalTaskWorktrees(ctx, worker, "owner/repo", nil, newTickCandidates(store), io.Discard); err != nil {
 		t.Fatalf("reclaimTerminalTaskWorktrees: %v", err)
+	}
+	if livenessCalls != 2 {
+		t.Fatalf("worktree liveness checks = %d, want 2", livenessCalls)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("terminal task worktree remains: stat err=%v", err)

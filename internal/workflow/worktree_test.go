@@ -992,6 +992,10 @@ func TestEngineReclaimTerminalTaskWorktreeKeepsLiveDirtyAdhocAtAnyAge(t *testing
 		t.Fatalf("kill live worktree process: %v", err)
 	}
 	_ = liveProcess.Wait()
+	// The live-process arm above uses the real /proc scan. After the child exits,
+	// make the no-live premise deterministic so an unrelated unreadable host PID
+	// cannot prevent this same test from reaching the content guards.
+	engine.WorktreeLiveness = func(string) (bool, bool) { return false, true }
 	outcome, err = engine.ReclaimTerminalTaskWorktreeOutcome(ctx, home, checkout, "adhoc-old-live", manager)
 	if err != nil {
 		t.Fatalf("dirty ReclaimTerminalTaskWorktreeOutcome: %v", err)
