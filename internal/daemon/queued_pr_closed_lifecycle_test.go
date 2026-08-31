@@ -176,6 +176,142 @@ END;`); err != nil {
 	}
 }
 
+// TestPollOnceRecoversASupersededChildWhoseParentAdvanceFailed covers the OTHER
+// half of the window, and the branch the first version of this file never
+// executed on the production path: the synthetic result IS written and the PARENT
+// ADVANCE is what fails.
+//
+// On the retry the finalizer short-circuits — a job that already carries a result
+// is not re-finalized — so it reports "nothing done" and the parent advance is the
+// only step still owed. A recovery that trusted that report would record the debt
+// paid and strand the coordinator anyway; the finalized=false branch is what
+// drives AdvanceJob itself.
+//
+// The injected fault aborts the task write block_parent performs, which is
+// downstream of the result and inside AdvanceJob. The task starts `implementing`
+// so no other reconciler in the poll can block it — the state change is
+// attributable to this advance alone.
+//
+// MUTATION PROOF: delete the `if !finalized && finalizeErr == nil` AdvanceJob
+// fallback in completeSupersedeFinalization and the task never reaches blocked.
+func TestPollOnceRecoversASupersededChildWhoseParentAdvanceFailed(t *testing.T) {
+	ctx := context.Background()
+	store, repo, client := closedPullRequestSweepFixture(t)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-7", RepoFullName: repo.FullName(), GoalID: "goal-1", Title: "Task 7",
+		State: string(workflow.TaskImplementing), Branch: "task-7",
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	const coordinator = "review-coordinator/task-7/review-1"
+	// Default failure policy (block_parent): releasing the coordinator writes the
+	// task's blocked state, which is the observable this test keys on.
+	coordinatorPayload, err := json.Marshal(workflow.JobPayload{
+		Repo: repo.FullName(), Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "lead",
+		Result: &workflow.AgentResult{
+			Decision: "approved",
+			Summary:  "fan out",
+			Delegations: []workflow.Delegation{
+				{ID: "correctness", Agent: "audit", Action: "review", Prompt: "review correctness"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(coordinator): %v", err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: coordinator, Agent: "lead", Type: "ask", State: string(workflow.JobSucceeded), Payload: string(coordinatorPayload),
+	}); err != nil {
+		t.Fatalf("CreateJob(coordinator): %v", err)
+	}
+	const child = coordinator + "/delegation/correctness"
+	seedQueuedJob(t, store, child, "audit", "review", workflow.JobPayload{
+		Repo: repo.FullName(), Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "lead",
+		ParentJobID: coordinator, DelegationID: "correctness",
+	})
+
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("open trigger connection: %v", err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	if _, err := raw.Exec(`
+CREATE TRIGGER fail_parent_advance
+BEFORE UPDATE ON tasks
+WHEN NEW.state = 'blocked'
+BEGIN
+  SELECT RAISE(ABORT, 'injected parent advance failure');
+END;`); err != nil {
+		t.Fatalf("create parent advance failure trigger: %v", err)
+	}
+
+	engine := workflow.Engine{Store: store}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+	if err := daemon.PollOnce(ctx); err == nil {
+		t.Fatal("PollOnce hid the injected parent advance failure")
+	}
+
+	failed, err := store.GetJob(ctx, child)
+	if err != nil {
+		t.Fatalf("GetJob(child): %v", err)
+	}
+	if failed.State != string(workflow.JobFailed) {
+		t.Fatalf("child state = %q, want failed", failed.State)
+	}
+	if !childCarriesResult(t, failed) {
+		t.Fatal("the synthetic result was not written; this test must fail AFTER it, not before")
+	}
+	if countJobEventKind(t, store, child, workflow.JobEventSupersedeFinalizeCompleted) != 0 {
+		t.Fatal("the debt was recorded paid while the parent advance kept failing")
+	}
+	if got := mustTaskState(t, store, "task-7"); got != string(workflow.TaskImplementing) {
+		t.Fatalf("task state = %q, want implementing: the advance must not have landed", got)
+	}
+
+	if _, err := raw.Exec(`DROP TRIGGER fail_parent_advance`); err != nil {
+		t.Fatalf("drop parent advance failure trigger: %v", err)
+	}
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("recovery PollOnce: %v", err)
+	}
+
+	if got := mustTaskState(t, store, "task-7"); got != string(workflow.TaskBlocked) {
+		t.Fatalf("task state = %q, want blocked: the finalized=false branch must drive the parent advance", got)
+	}
+	if got := countJobEventKind(t, store, child, workflow.JobEventSupersedeFinalizeCompleted); got != 1 {
+		t.Fatalf("completed markers = %d, want exactly 1", got)
+	}
+	// The finalizer must NOT have re-run: exactly one synthetic finalization for the
+	// whole recovery, so the parent was advanced once rather than twice.
+	if got := countJobEventKind(t, store, child, "delegation_timeout_finalized"); got != 1 {
+		t.Fatalf("delegation_timeout_finalized events = %d, want exactly 1", got)
+	}
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("third PollOnce: %v", err)
+	}
+	if got := countJobEventKind(t, store, child, workflow.JobEventSupersedeFinalizeCompleted); got != 1 {
+		t.Fatalf("completed markers = %d after an extra poll, want 1", got)
+	}
+}
+
+func childCarriesResult(t *testing.T, job db.Job) bool {
+	t.Helper()
+	var payload workflow.JobPayload
+	if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
+		t.Fatalf("unmarshal child payload: %v", err)
+	}
+	return payload.Result != nil
+}
+
+func mustTaskState(t *testing.T, store *db.Store, taskID string) string {
+	t.Helper()
+	task, err := store.GetTask(context.Background(), taskID)
+	if err != nil {
+		t.Fatalf("GetTask(%s): %v", taskID, err)
+	}
+	return task.State
+}
+
 func mustJobEvents(t *testing.T, store *db.Store, jobID string) []db.JobEvent {
 	t.Helper()
 	events, err := store.ListJobEvents(context.Background(), jobID)

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -503,10 +504,43 @@ func SupersedeStaleHeadJob(ctx context.Context, store *db.Store, jobID string, r
 // pending marker is written in the SAME transaction as the state write, so the
 // debt is durable from the instant the job stops being queued;
 // CompletePendingSupersedeFinalization pays it and records completion.
+//
+// The pending marker's message CARRIES THE LIFECYCLE GENERATION it was written
+// for, because the debt is about one run and `gitmoot job retry` can start
+// another. Paying an old PR-closed debt against a newer lifecycle would stamp
+// that run with the old synthetic failure and advance the parent on it, and a
+// newer run that SUCCEEDS would leave the marker outstanding forever. A debt
+// whose generation no longer matches is therefore VOIDED, never paid.
 const (
 	JobEventSupersedeFinalizePending   = "supersede_finalize_pending"
 	JobEventSupersedeFinalizeCompleted = "supersede_finalize_completed"
+
+	supersedeFinalizeGenerationPrefix = "generation="
 )
+
+// formatSupersedeFinalizeDebt and parseSupersedeFinalizeDebt are the marker's
+// wire format. db.JobEvent carries no numeric column, so the generation rides in
+// the message behind a fixed prefix; the reason follows it verbatim so the
+// retry's synthetic result reads exactly as the original attempt's would have.
+func formatSupersedeFinalizeDebt(generation int64, reason string) string {
+	return fmt.Sprintf("%s%d: %s", supersedeFinalizeGenerationPrefix, generation, reason)
+}
+
+func parseSupersedeFinalizeDebt(message string) (int64, string, bool) {
+	if !strings.HasPrefix(message, supersedeFinalizeGenerationPrefix) {
+		return 0, message, false
+	}
+	rest := message[len(supersedeFinalizeGenerationPrefix):]
+	separator := strings.Index(rest, ": ")
+	if separator < 0 {
+		return 0, message, false
+	}
+	generation, err := strconv.ParseInt(rest[:separator], 10, 64)
+	if err != nil {
+		return 0, message, false
+	}
+	return generation, rest[separator+2:], true
+}
 
 // SupersedeClosedPullRequestJob terminates a QUEUED job whose pull request is no
 // longer open (#1673). It is deliberately narrower than SupersedeStaleHeadJob in
@@ -549,7 +583,7 @@ func SupersedeClosedPullRequestJob(ctx context.Context, store *db.Store, observe
 	}, db.JobEvent{
 		JobID:   observed.ID,
 		Kind:    JobEventSupersedeFinalizePending,
-		Message: reason,
+		Message: formatSupersedeFinalizeDebt(observed.LifecycleGeneration, reason),
 	})
 	if err != nil {
 		return db.Job{}, false, err
@@ -608,7 +642,7 @@ func (e Engine) FinalizeClosedPullRequestDelegationChild(ctx context.Context, ob
 	}, db.JobEvent{
 		JobID:   observed.ID,
 		Kind:    JobEventSupersedeFinalizePending,
-		Message: reason,
+		Message: formatSupersedeFinalizeDebt(observed.LifecycleGeneration, reason),
 	})
 	if err != nil {
 		return false, err
@@ -620,15 +654,27 @@ func (e Engine) FinalizeClosedPullRequestDelegationChild(ctx context.Context, ob
 }
 
 // CompletePendingSupersedeFinalization re-drives the follow-up work a supersession
-// recorded and did not finish. It is idempotent by construction: the cleanups are
-// individually idempotent, and finalizeTimedOutJob refuses a job that already
-// carries a result, so a job whose only unpaid step was the completion marker
-// simply records it.
+// recorded and did not finish, for the LIFECYCLE THAT INCURRED IT.
 //
-// It reads the job fresh rather than trusting the marker, and skips a row that is
-// back in a live state: a re-queued job's next supersession writes its own
-// pending marker, and paying an OLD debt against a NEW run is the very confusion
-// the generation anchoring exists to prevent.
+// The debt names its generation, and `gitmoot job retry` can put the job back in
+// queued at a newer one. Three outcomes, and only the first does any work:
+//
+//	SAME generation, terminal state -> pay it. The cleanups are individually
+//	idempotent and finalizeTimedOutJob refuses a job that already carries a
+//	result, so re-running a partly-paid debt is safe.
+//
+//	DIFFERENT generation -> VOID it. A newer run owns the job. Paying would stamp
+//	that run with the old PR-closed failure and advance the parent on it; and if
+//	the newer run succeeds, leaving the marker would keep this job a candidate on
+//	every poll forever. The newer run settles through its own normal path, so the
+//	right answer is to close the debt without acting.
+//
+//	LIVE state (queued/running) -> VOID it, for the same reason: a re-queue bumps
+//	the generation, so a live row is by construction a different lifecycle.
+//
+// An unparseable marker predates this format (only reachable on a development
+// database, since the marker is written and read by this same code) and is voided
+// too: closing one stale debt is bounded, mislabeling a live run is not.
 func (e Engine) CompletePendingSupersedeFinalization(ctx context.Context, jobID string) (bool, error) {
 	if err := e.validate(); err != nil {
 		return false, err
@@ -637,16 +683,69 @@ func (e Engine) CompletePendingSupersedeFinalization(ctx context.Context, jobID 
 	if err != nil {
 		return false, err
 	}
-	switch job.State {
-	case string(JobCancelled), string(JobFailed):
-	default:
+	debt, err := latestSupersedeFinalizeDebt(ctx, e.Store, jobID)
+	if err != nil {
+		return false, err
+	}
+	if !debt.pending {
 		return false, nil
 	}
-	reason := strings.TrimSpace(latestSupersedeFinalizeReason(ctx, e.Store, jobID))
-	if reason == "" {
-		reason = "queued job superseded: its pull request is no longer open"
+	terminal := job.State == string(JobCancelled) || job.State == string(JobFailed)
+	if !debt.anchored || !terminal || debt.generation != job.LifecycleGeneration {
+		return true, recordSupersedeFinalizationVoided(ctx, e.Store, job, debt)
 	}
-	return true, completeSupersedeFinalization(ctx, &e, e.Store, job, reason)
+	return true, completeSupersedeFinalization(ctx, &e, e.Store, job, debt.reason)
+}
+
+// supersedeFinalizeDebt is the state of a job's supersession debt: whether one is
+// outstanding, which lifecycle incurred it, and the reason to reuse when paying.
+type supersedeFinalizeDebt struct {
+	pending    bool
+	anchored   bool
+	generation int64
+	reason     string
+}
+
+// latestSupersedeFinalizeDebt applies the same last-one-wins rule as the store's
+// candidate query: the highest-id event among exactly the two marker kinds
+// decides. Reading it in Go as well keeps a direct caller honest, and lets the
+// reason and generation come from the marker the sweep actually wrote.
+func latestSupersedeFinalizeDebt(ctx context.Context, store *db.Store, jobID string) (supersedeFinalizeDebt, error) {
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		return supersedeFinalizeDebt{}, err
+	}
+	debt := supersedeFinalizeDebt{}
+	for _, event := range events {
+		switch event.Kind {
+		case JobEventSupersedeFinalizePending:
+			generation, reason, anchored := parseSupersedeFinalizeDebt(event.Message)
+			debt = supersedeFinalizeDebt{pending: true, anchored: anchored, generation: generation, reason: reason}
+		case JobEventSupersedeFinalizeCompleted:
+			debt = supersedeFinalizeDebt{}
+		}
+	}
+	if debt.pending && strings.TrimSpace(debt.reason) == "" {
+		debt.reason = "queued job superseded: its pull request is no longer open"
+	}
+	return debt, nil
+}
+
+// recordSupersedeFinalizationVoided closes a debt that belongs to a lifecycle
+// this job no longer has. It writes the same completion kind — the marker family
+// is what the candidate query reads — with a message that says plainly no work
+// was done, so the audit trail never implies a stale finalization ran.
+func recordSupersedeFinalizationVoided(ctx context.Context, store *db.Store, job db.Job, debt supersedeFinalizeDebt) error {
+	detail := fmt.Sprintf("generation %d", debt.generation)
+	if !debt.anchored {
+		detail = "an unanchored marker"
+	}
+	return store.AddJobEvent(ctx, db.JobEvent{
+		JobID: job.ID,
+		Kind:  JobEventSupersedeFinalizeCompleted,
+		Message: fmt.Sprintf("voided without action: the debt was incurred by %s, and the job is now %s at generation %d",
+			detail, job.State, job.LifecycleGeneration),
+	})
 }
 
 // completeSupersedeFinalization pays the recorded debt and, only once every step
@@ -664,7 +763,6 @@ func completeSupersedeFinalization(ctx context.Context, engine *Engine, store *d
 	// carries, where the targeted review legs hold none of the others) would leak
 	// locks that block the next same-repo work.
 	releaseAbortedJobResources(ctx, store, job, abortCauseSupersede)
-	var finalizeErr error
 	if engine == nil {
 		return recordSupersedeFinalizationCompleted(ctx, store, job.ID, reason, nil)
 	}
@@ -715,22 +813,4 @@ func recordSupersedeFinalizationCompleted(ctx context.Context, store *db.Store, 
 		return err
 	}
 	return outcome
-}
-
-// latestSupersedeFinalizeReason recovers the reason a supersession recorded so a
-// retry's synthetic result and events read the same as the original attempt's
-// would have. Best-effort: an unreadable history falls back to the generic reason
-// rather than blocking the recovery.
-func latestSupersedeFinalizeReason(ctx context.Context, store *db.Store, jobID string) string {
-	events, err := store.ListJobEvents(ctx, jobID)
-	if err != nil {
-		return ""
-	}
-	reason := ""
-	for _, event := range events {
-		if event.Kind == JobEventSupersedeFinalizePending {
-			reason = event.Message
-		}
-	}
-	return reason
 }
