@@ -174,7 +174,7 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 		// round. The event write is propagated, not ignored: it is the only durable
 		// record that this head's review was unscoped.
 		reason := fmt.Sprintf("repo=%s pull_request=%d head_sha=%s: %s: %v", event.Repo, event.PullRequest, event.HeadSHA, ReviewScopeUnavailableMarker, err)
-		recorded, recordedErr := e.reviewScopeUnavailableRecorded(ctx, event.TaskID, reason)
+		recorded, recordedErr := e.reviewScopeUnavailableRecorded(ctx, event.TaskID, event.PullRequest, event.HeadSHA)
 		if recordedErr != nil {
 			return recordedErr
 		}
@@ -216,6 +216,27 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 		if classification.Tier == RiskTierHigh {
 			return e.dispatchHighRiskReview(ctx, event, reviewers, reviewScopes, classification, reviewRound, ref)
 		}
+	}
+	// A reviewer that already HAS a review job at this exact head and round gets no
+	// second one, whatever state that job is in. The deterministic id encodes
+	// reviewer + head + round, but the idempotent-enqueue collision check compares
+	// DERIVED content (payloadMatchesRequest compares Instructions and WorktreePath),
+	// so a round that scoped on one derivation and degraded to an unscoped review on
+	// another surfaced a raw `UNIQUE constraint failed: jobs.id` out of this function
+	// and re-fired it every poll. Skipping on identity is the idempotent answer.
+	// FindRepeatedReviewers cannot serve this: it queries succeeded verdicts only, so
+	// it never sees a queued, running or failed leg.
+	if existing := reviewLegsAtHead(reviewJobs, event, reviewRound); len(existing) > 0 {
+		remaining := make([]string, 0, len(reviewers))
+		for _, reviewer := range reviewers {
+			if _, dispatched := existing[strings.ToLower(strings.TrimSpace(reviewer))]; !dispatched {
+				remaining = append(remaining, reviewer)
+			}
+		}
+		if len(remaining) == 0 {
+			return e.recordPullRequestBaseline(ctx, event)
+		}
+		reviewers = remaining
 	}
 	requests := make([]JobRequest, 0, len(reviewers))
 	for _, reviewer := range reviewers {
@@ -427,7 +448,7 @@ func (e Engine) releaseNativeReviewWorktree(ctx context.Context, path string) {
 // from the stable review round for this head SHA, and the lens children are
 // review jobs the daemon's PR-watcher routing already recognizes, so a re-poll at
 // the same head never re-dispatches.
-func (e Engine) dispatchHighRiskReview(ctx context.Context, event PullRequestEvent, reviewers []string, reviewScopes map[string]*ReviewScope, classification RiskClassification, round string, ref taskRef) error {
+func (e Engine) dispatchHighRiskReview(ctx context.Context, event PullRequestEvent, reviewers []string, reviewScopes map[reviewScopeKey]*ReviewScope, classification RiskClassification, round string, ref taskRef) error {
 	coordID := "review-coordinator/" + event.Branch + "/" + round
 	if _, err := e.Store.GetJob(ctx, coordID); err == nil {
 		// Already dispatched for this head SHA/round: idempotent no-op.

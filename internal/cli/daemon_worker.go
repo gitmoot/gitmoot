@@ -425,7 +425,16 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		// like the checkout-preflight site below. Every other allocation failure (a
 		// missing commit object, an unwritable path) is unclassified and keeps the
 		// terminal path, and the hold itself is bounded by maxOperationalBlockerRetries.
-		if deferred, deferErr := w.deferCheckoutContention(ctx, job, payload, err); deferErr != nil {
+		//
+		// This site uses deferPreDeliveryAllocationContention rather than the general
+		// helper because a high-risk LENS CHILD reaches this same path-less fallback
+		// (TestNativeReviewWorktreePreparationCoversHighRiskLensChild), and the general
+		// helper's delegation-child exclusion would route it to
+		// finishQueuedJob(JobFailed) → finalizePreflightDelegationChild, advancing the
+		// delegation DAG with a synthetic `failed` verdict on a lock another worker
+		// holds for a sub-second op. The narrowing is typed and pre-delivery only; see
+		// the helper's own comment for why that is the safe boundary.
+		if deferred, deferErr := w.deferPreDeliveryAllocationContention(ctx, job, payload, err); deferErr != nil {
 			writeLine(w.Stdout, "job %s review-worktree contention deferral failed: %v", job.ID, deferErr)
 		} else if deferred {
 			writeLine(w.Stdout, "job %s deferred on review-worktree contention: %v", job.ID, err)

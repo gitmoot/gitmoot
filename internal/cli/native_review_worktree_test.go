@@ -581,3 +581,238 @@ func TestNativeReviewWorktreeHardFailureStaysTerminal(t *testing.T) {
 		t.Fatal("a non-transient allocation failure recorded a blocker_deferred event")
 	}
 }
+
+// TestNativeReviewWorktreeContentionDefersLensChild is the delegation-child half of
+// F3. TestNativeReviewWorktreeContentionDefersInsteadOfBurningTheLeg covers a
+// ROUTINE path-less leg; a high-risk LENS CHILD reaches the very same path-less
+// allocation site (TestNativeReviewWorktreePreparationCoversHighRiskLensChild
+// proves it) but carries a ParentJobID, and deferCheckoutContention excludes every
+// ParentJobID-bearing job. So a transient mutation-lock hold used to route the
+// child through finishQueuedJob(JobFailed) -> finalizePreflightDelegationChild,
+// advancing the delegation DAG with a synthetic failed verdict on a lock another
+// worker holds for a sub-second shared-.git op.
+//
+// MUTATION PROOF: see the fix comment in daemon_checkout.go; the two mutants are
+// dropping payload.BlockerPreDeliveryAllocation (the pre-delivery allocation
+// marker) and reverting the ParentJobID exclusion to its unconditional form.
+func TestNativeReviewWorktreeContentionDefersLensChild(t *testing.T) {
+	ctx := context.Background()
+	store, home := blockerE2EHome(t)
+	sharedCheckout, reviewHead, _ := readonlyReviewWorktreeGitCheckout(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", sharedCheckout)
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime, runtime.LastRef, []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	const jobID = "review-coordinator/task-1698/review-1/delegation/correctness"
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: jobID, Agent: "reviewer", Action: "review", Repo: "owner/repo", Branch: "feature/review",
+		PullRequest: 1698, HeadSHA: reviewHead, TaskID: "task-1698", TaskTitle: "Contended lens child",
+		LeadAgent: "implementer", Reviewers: []string{"reviewer"}, ReviewRound: "review-1",
+		ParentJobID: "review-coordinator/task-1698/review-1", DelegationID: "correctness",
+		DelegationDepth: 1, Instructions: "Review the correctness lens at the exact head.",
+	})
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"lens re-attempted after contention","findings":[],"changes_made":[],"tests_run":["lens smoke"],"needs":[],"delegations":[]}}`}
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.AdapterFactory = func(_ runtime.Agent, _ string) (workflow.DeliveryAdapter, error) {
+		return adapter, nil
+	}
+	gate := &cliWorkerFakeMergeGate{decision: workflow.MergeDecision{Ready: true}}
+	worker.WorkflowFactory = func(checkout string) workflow.Engine {
+		engine := daemonWorkflowEngine(store, github.NoopClient{}, checkout, worker.workflowHome())
+		engine.MergeGate = gate
+		return engine
+	}
+
+	// Phase 1: the mutation lock is genuinely held by another worker.
+	release, err := workflow.AcquireCheckoutMutationLock(ctx, store, sharedCheckout, "other-worker", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("AcquireCheckoutMutationLock: %v", err)
+	}
+	if err := worker.run(ctx, job); err != nil {
+		t.Fatalf("worker.run under contention: %v", err)
+	}
+	held, payload := blockerE2EJobPayload(t, store, jobID)
+	if held.State != string(workflow.JobQueued) {
+		t.Fatalf("contended lens child state = %q, want queued; payload=%+v", held.State, payload)
+	}
+	// The DAG must NOT have advanced: finalizePreflightDelegationChild attaches a
+	// synthetic failed result, and that verdict is what strands the round.
+	if payload.Result != nil {
+		t.Fatalf("transient lock advanced the delegation DAG with result %+v", payload.Result)
+	}
+	if payload.BlockerClass != string(blockerClassCheckoutContention) || payload.BlockerAttempts != 1 ||
+		payload.BlockerRetryAt == "" || !payload.BlockerPreDelivery {
+		t.Fatalf("contended lens child hold = %+v, want a pre-delivery checkout_contention deferral", payload)
+	}
+	if !blockerE2EHasEventKind(t, store, jobID, blockerDeferredEventKind) {
+		t.Fatalf("missing %s event for the deferred lens child", blockerDeferredEventKind)
+	}
+	if blockerE2EHasEventKind(t, store, jobID, string(workflow.JobFailed)) {
+		t.Fatal("transient lock recorded a terminal job failure for the lens child")
+	}
+	if adapter.calls != 0 {
+		t.Fatalf("lens deliveries under contention = %d, want 0", adapter.calls)
+	}
+
+	// Phase 2: the holder finishes and the SAME child is re-attemptable.
+	if err := release(ctx); err != nil {
+		t.Fatalf("release checkout mutation lock: %v", err)
+	}
+	if err := worker.run(ctx, held); err != nil {
+		t.Fatalf("worker.run after the lock cleared: %v", err)
+	}
+	reloaded, after := blockerE2EJobPayload(t, store, jobID)
+	cleanupNativeReviewWorktrees(t, sharedCheckout, after.WorktreePath)
+	if reloaded.State != string(workflow.JobSucceeded) || adapter.calls != 1 {
+		t.Fatalf("re-attempted lens child state=%q deliveries=%d, want succeeded with one delivery", reloaded.State, adapter.calls)
+	}
+	if strings.TrimSpace(after.WorktreePath) == "" || !after.ReadOnlyWorktree {
+		t.Fatalf("re-attempted lens child payload = %+v, want the exact-head worktree it was denied", after)
+	}
+}
+
+// TestNativeReviewWorktreeHardFailureStaysTerminalForLensChild is the other side of
+// the narrowing above, for the LENS CHILD class specifically:
+// TestNativeReviewWorktreeHardFailureStaysTerminal proves a non-transient allocation
+// failure settles terminally for a routine leg, but the ParentJobID exclusion is what
+// used to guarantee that for a child, and this round removes it for one typed family.
+// A head the checkout does not carry and cannot fetch must therefore STILL run the
+// DAG's terminal routing — finishQueuedJob(JobFailed) → finalizePreflightDelegationChild
+// — rather than be held on a hold that can never clear.
+//
+// MUTATION PROOF: replace deferPreDeliveryAllocationContention's typed guard with a
+// bare `true` and this child is held queued with no synthetic verdict instead of
+// failing.
+func TestNativeReviewWorktreeHardFailureStaysTerminalForLensChild(t *testing.T) {
+	ctx := context.Background()
+	store, home := blockerE2EHome(t)
+	sharedCheckout, _, _ := readonlyReviewWorktreeGitCheckout(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", sharedCheckout)
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime, runtime.LastRef, []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	const parentID = "review-coordinator/task-1698/review-1"
+	const jobID = parentID + "/delegation/correctness"
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: jobID, Agent: "reviewer", Action: "review", Repo: "owner/repo", Branch: "feature/review",
+		PullRequest: 1698, HeadSHA: "0123456789abcdef0123456789abcdef01234567", TaskID: "task-1698",
+		TaskTitle: "Unreachable head lens child", LeadAgent: "implementer", Reviewers: []string{"reviewer"},
+		ReviewRound: "review-1", ParentJobID: parentID, DelegationID: "correctness",
+		DelegationDepth: 1, Instructions: "Review the correctness lens at the exact head.",
+	})
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.AdapterFactory = func(_ runtime.Agent, _ string) (workflow.DeliveryAdapter, error) {
+		return nil, errors.New("adapter must never be built for an unallocatable head")
+	}
+	worker.WorkflowFactory = func(checkout string) workflow.Engine {
+		return daemonWorkflowEngine(store, github.NoopClient{}, checkout, worker.workflowHome())
+	}
+	// The parent coordinator row is deliberately absent, so AdvanceJob's parent
+	// lookup is the LAST step of the terminal routing and its error is the witness
+	// that the routing ran end to end. Everything before it — the queued→failed
+	// transition and the synthetic verdict — is asserted directly below.
+	runErr := worker.run(ctx, job)
+	reloaded, payload := blockerE2EJobPayload(t, store, jobID)
+	if reloaded.State != string(workflow.JobFailed) {
+		t.Fatalf("unallocatable-head lens child state = %q, want failed (run err=%v)", reloaded.State, runErr)
+	}
+	if payload.BlockerClass != "" || payload.BlockerRetryAt != "" {
+		t.Fatalf("unallocatable-head lens child was HELD: %+v", payload)
+	}
+	if blockerE2EHasEventKind(t, store, jobID, blockerDeferredEventKind) {
+		t.Fatal("a non-transient allocation failure recorded a blocker_deferred event for the lens child")
+	}
+	// The DAG's terminal routing must still fire: a synthetic failed verdict is what
+	// lets the parent's failure_policy run instead of stranding the round (#409).
+	if payload.Result == nil || payload.Result.Decision != "failed" {
+		t.Fatalf("unallocatable-head lens child result = %+v, want a synthetic failed verdict", payload.Result)
+	}
+	if !blockerE2EHasEventKind(t, store, jobID, "delegation_timeout_finalized") {
+		t.Fatal("unallocatable-head lens child never ran finalizePreflightDelegationChild")
+	}
+	if runErr == nil || !strings.Contains(runErr.Error(), parentID) {
+		t.Fatalf("worker.run err = %v, want the absent-parent error proving the DAG advance was attempted", runErr)
+	}
+}
+
+// TestNativeReviewWorktreeContentionOnLensChildIsBudgetBounded is the ceiling on the
+// narrowing: a deferred lens child must not hold the coordinator forever. Nothing
+// else can terminalize it while it waits — the engine's finalizeTimedOutJob switch
+// (engine_run_budgets.go) accepts only JobRunning/JobFailed/JobBlocked, so neither
+// FinalizeTimedOutJob nor FinalizeTimedOutDelegationChild touches a QUEUED held
+// child. The only bound is maxOperationalBlockerRetries, shared with every other
+// blocker class: three holds, then blocker_exhausted and the SAME terminal DAG
+// routing the child has today.
+//
+// MUTATION PROOF: drop the `attempt > maxOperationalBlockerRetries` branch from
+// holdCheckoutContention and the fourth run holds again instead of settling.
+func TestNativeReviewWorktreeContentionOnLensChildIsBudgetBounded(t *testing.T) {
+	ctx := context.Background()
+	store, home := blockerE2EHome(t)
+	sharedCheckout, reviewHead, _ := readonlyReviewWorktreeGitCheckout(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", sharedCheckout)
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime, runtime.LastRef, []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	const parentID = "review-coordinator/task-1698/review-1"
+	const jobID = parentID + "/delegation/correctness"
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: jobID, Agent: "reviewer", Action: "review", Repo: "owner/repo", Branch: "feature/review",
+		PullRequest: 1698, HeadSHA: reviewHead, TaskID: "task-1698", TaskTitle: "Wedged lock lens child",
+		LeadAgent: "implementer", Reviewers: []string{"reviewer"}, ReviewRound: "review-1",
+		ParentJobID: parentID, DelegationID: "correctness", DelegationDepth: 1,
+		Instructions: "Review the correctness lens at the exact head.",
+	})
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.AdapterFactory = func(_ runtime.Agent, _ string) (workflow.DeliveryAdapter, error) {
+		return nil, errors.New("adapter must never be built while the lock is wedged")
+	}
+	worker.WorkflowFactory = func(checkout string) workflow.Engine {
+		return daemonWorkflowEngine(store, github.NoopClient{}, checkout, worker.workflowHome())
+	}
+	// The lock is never released: the worst case the narrowing has to survive.
+	if _, err := workflow.AcquireCheckoutMutationLock(ctx, store, sharedCheckout, "wedged-worker", time.Now().UTC()); err != nil {
+		t.Fatalf("AcquireCheckoutMutationLock: %v", err)
+	}
+	for attempt := 1; attempt <= maxOperationalBlockerRetries; attempt++ {
+		job, err := store.GetJob(ctx, jobID)
+		if err != nil {
+			t.Fatalf("GetJob before attempt %d: %v", attempt, err)
+		}
+		if err := worker.run(ctx, job); err != nil {
+			t.Fatalf("worker.run attempt %d: %v", attempt, err)
+		}
+		held, payload := blockerE2EJobPayload(t, store, jobID)
+		if held.State != string(workflow.JobQueued) || payload.BlockerAttempts != attempt {
+			t.Fatalf("attempt %d: state=%q attempts=%d, want queued with attempts=%d", attempt, held.State, payload.BlockerAttempts, attempt)
+		}
+		if payload.Result != nil {
+			t.Fatalf("attempt %d advanced the delegation DAG with result %+v", attempt, payload.Result)
+		}
+	}
+	// Budget spent: the next attempt must settle terminally and hand the round back
+	// to the delegation DAG rather than hold a fourth time.
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob before the exhausting attempt: %v", err)
+	}
+	runErr := worker.run(ctx, job)
+	settled, payload := blockerE2EJobPayload(t, store, jobID)
+	if settled.State != string(workflow.JobFailed) {
+		t.Fatalf("state after the budget was spent = %q, want failed (run err=%v)", settled.State, runErr)
+	}
+	if payload.BlockerAttempts != maxOperationalBlockerRetries {
+		t.Fatalf("blocker attempts = %d, want the budget %d (a fourth hold was written)", payload.BlockerAttempts, maxOperationalBlockerRetries)
+	}
+	if !blockerE2EHasEventKind(t, store, jobID, blockerExhaustedEventKind) {
+		t.Fatalf("missing %s event: the hold ran past its ceiling silently", blockerExhaustedEventKind)
+	}
+	if payload.Result == nil || payload.Result.Decision != "failed" {
+		t.Fatalf("exhausted lens child result = %+v, want the synthetic failed verdict that releases the coordinator", payload.Result)
+	}
+	if runErr == nil || !strings.Contains(runErr.Error(), parentID) {
+		t.Fatalf("worker.run err = %v, want the absent-parent error proving the DAG advance was attempted", runErr)
+	}
+}

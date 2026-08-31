@@ -274,7 +274,7 @@ func lensPrompt(lens string, event PullRequestEvent, scope *ReviewScope) string 
 // refutation, reported as `blocked`) fails the quorum and blocks the merge, while
 // unanimous approval satisfies it. Reviewers are assigned round-robin; with a
 // single configured reviewer every lens runs as a distinct job on that reviewer.
-func highRiskLensDelegations(reviewers []string, event PullRequestEvent, reviewScopes map[string]*ReviewScope) []Delegation {
+func highRiskLensDelegations(reviewers []string, event PullRequestEvent, reviewScopes map[reviewScopeKey]*ReviewScope) []Delegation {
 	reviewers = compactStrings(reviewers)
 	if len(reviewers) == 0 {
 		return nil

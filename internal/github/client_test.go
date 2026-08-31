@@ -705,6 +705,9 @@ func TestCompareCommitsUsesEscapedCompareEndpoint(t *testing.T) {
 		len(compare.Files) != 1 || compare.Files[0].Filename != "internal/review.go" {
 		t.Fatalf("compare = %+v", compare)
 	}
+	if compare.Truncated {
+		t.Fatal("a compare BELOW the file cap enumerates the whole range and must NOT be flagged truncated")
+	}
 	if len(runner.calls) != 1 {
 		t.Fatalf("a compare below the file cap must be ONE request; calls = %v", runner.calls)
 	}
@@ -712,7 +715,7 @@ func TestCompareCommitsUsesEscapedCompareEndpoint(t *testing.T) {
 }
 
 // comparePayload renders a compare response whose files array carries paths and
-// a patch body, so a test can prove first-page metadata survives recovery.
+// a patch body, so a test can prove first-page metadata survives.
 func comparePayload(t *testing.T, status string, aheadBy int, paths []string) string {
 	t.Helper()
 	files := make([]PullRequestFile, 0, len(paths))
@@ -726,177 +729,48 @@ func comparePayload(t *testing.T, status string, aheadBy int, paths []string) st
 	return string(payload)
 }
 
-func compareDiffPayload(paths []string) string {
-	var out strings.Builder
-	for _, path := range paths {
-		fmt.Fprintf(&out,
-			"diff --git a/%s b/%s\nindex 1111111..2222222 100644\n--- a/%s\n+++ b/%s\n@@ -1 +1 @@\n-old\n+new\n",
-			path, path, path, path)
-	}
-	return out.String()
-}
-
-func compareCapFixture(t *testing.T, extra int) (capped []string, all []string) {
+func compareCapFixture(t *testing.T) []string {
 	t.Helper()
-	capped = make([]string, compareFilesCap)
+	capped := make([]string, compareFilesCap)
 	for i := range capped {
 		capped[i] = fmt.Sprintf("internal/capped/%04d.go", i)
 	}
-	all = append(all, capped...)
-	for i := range extra {
-		all = append(all, fmt.Sprintf("internal/beyond/%04d.go", i))
-	}
-	return capped, all
+	return capped
 }
 
-// A compare that hits GitHub's 300-file cap must still yield the WHOLE range:
-// the compare endpoint shows files on the first page only ("up to 300 changed
-// files for the entire comparison"), so the remainder comes from the diff media
-// type, and the object-level fields stay those of the compare response.
-func TestCompareCommitsRecoversFileListPastCompareCap(t *testing.T) {
-	capped, all := compareCapFixture(t, 900)
+// A compare that hits GitHub's 300-file cap has an UNKNOWN remainder, and no
+// part of any compare response can make it known: the payload declares no total
+// file count, and the diff media type truncates silently (measured 2026-08-31:
+// five identical requests for torvalds/linux v6.5...v6.6 returned HTTP 200 with
+// 8451, 12792, 13158, 13279 and 13897 `diff --git` headers, and a truncated body
+// still named every path the capped page named, so any cross-check between the
+// two sources reports "complete" on a body missing thousands of files). So the
+// cap must be reported as Truncated, in ONE request — a caller reading only the
+// object-level status must not pay a multi-megabyte second fetch for a list
+// nobody can trust.
+func TestCompareCommitsFlagsCappedFileListTruncatedInOneRequest(t *testing.T) {
+	capped := compareCapFixture(t)
 	runner := &fakeRunner{
-		results: []subprocess.Result{
-			{Stdout: comparePayload(t, "ahead", 7, capped)},
-			{Stdout: compareDiffPayload(all)},
-		},
+		results: []subprocess.Result{{Stdout: comparePayload(t, "ahead", 7, capped)}},
 	}
 	client := GhClient{Runner: runner}
 
 	compare, err := client.CompareCommits(context.Background(), Repository{Owner: "gitmoot", Name: "gitmoot"}, "reviewer-head", "new-head")
 	if err != nil {
-		t.Fatalf("CompareCommits returned error: %v", err)
+		t.Fatalf("CompareCommits must not fail a status-only caller on a large range: %v", err)
 	}
-	if compare.Truncated {
-		t.Fatal("a fully recovered compare must NOT be flagged truncated")
+	if !compare.Truncated {
+		t.Fatal("a compare page AT the 300-file cap has an unknown remainder and must be flagged truncated")
 	}
-	if compare.Status != "ahead" || compare.AheadBy != 7 || compare.BehindBy != 0 {
-		t.Fatalf("first-page object fields lost: %+v", CompareResult{Status: compare.Status, AheadBy: compare.AheadBy, BehindBy: compare.BehindBy})
+	if compare.Status != "ahead" || compare.AheadBy != 7 || len(compare.Files) != compareFilesCap {
+		t.Fatalf("compare = %s ahead_by=%d with %d files, want the capped page and its object fields preserved",
+			compare.Status, compare.AheadBy, len(compare.Files))
 	}
-	if len(compare.Files) != len(all) {
-		t.Fatalf("compare files = %d, want the %d-file union", len(compare.Files), len(all))
-	}
-	got := make(map[string]PullRequestFile, len(compare.Files))
-	for _, file := range compare.Files {
-		if _, dup := got[file.Filename]; dup {
-			t.Fatalf("duplicate file in union: %s", file.Filename)
-		}
-		got[file.Filename] = file
-	}
-	for _, want := range all {
-		if _, ok := got[want]; !ok {
-			t.Fatalf("union is missing %s", want)
-		}
-	}
-	if patch := got[capped[0]].Patch; patch != "@@ -1 +1 @@" {
+	if patch := compare.Files[0].Patch; patch != "@@ -1 +1 @@" {
 		t.Fatalf("first-page file metadata lost for %s: patch = %q", capped[0], patch)
 	}
-	if len(runner.calls) != 2 {
-		t.Fatalf("calls = %v, want compare + diff", runner.calls)
-	}
-	runner.wantArgs(t, 1, "api", "-H", "Accept: application/vnd.github.diff",
-		"repos/gitmoot/gitmoot/compare/reviewer-head...new-head")
-}
-
-// When the range's diff cannot be fetched the file list is unknown, and that has
-// to be reported as truncated (never as complete, and never as a hard error that
-// would break the merge gate's status-only freshness read).
-func TestCompareCommitsFlagsTruncatedWhenCompareDiffUnavailable(t *testing.T) {
-	capped, _ := compareCapFixture(t, 0)
-	runner := &fakeRunner{
-		results: []subprocess.Result{
-			{Stdout: comparePayload(t, "ahead", 7, capped)},
-			{Stderr: "diff exceeded the maximum number of files"},
-		},
-		errs: []error{nil, errors.New("gh api failed")},
-	}
-	client := GhClient{Runner: runner}
-
-	compare, err := client.CompareCommits(context.Background(), Repository{Owner: "gitmoot", Name: "gitmoot"}, "reviewer-head", "new-head")
-	if err != nil {
-		t.Fatalf("CompareCommits must not fail a status-only caller: %v", err)
-	}
-	if !compare.Truncated {
-		t.Fatal("an unrecoverable capped file list must be flagged truncated")
-	}
-	if compare.Status != "ahead" || len(compare.Files) != compareFilesCap {
-		t.Fatalf("compare = %s with %d files, want the capped page preserved", compare.Status, len(compare.Files))
-	}
-}
-
-// A diff that does not even account for the files the capped page already named
-// is not a trustworthy superset of the range, so the union must not be presented
-// as complete.
-func TestCompareCommitsFlagsTruncatedWhenCompareDiffMissesCappedFiles(t *testing.T) {
-	capped, _ := compareCapFixture(t, 0)
-	runner := &fakeRunner{
-		results: []subprocess.Result{
-			{Stdout: comparePayload(t, "ahead", 7, capped)},
-			{Stdout: compareDiffPayload(capped[:5])},
-		},
-	}
-	client := GhClient{Runner: runner}
-
-	compare, err := client.CompareCommits(context.Background(), Repository{Owner: "gitmoot", Name: "gitmoot"}, "reviewer-head", "new-head")
-	if err != nil {
-		t.Fatalf("CompareCommits returned error: %v", err)
-	}
-	if !compare.Truncated {
-		t.Fatal("a diff that misses capped-page files must be flagged truncated")
-	}
-}
-
-func TestParseDiffFilesNamesEveryChangeShape(t *testing.T) {
-	diff := strings.Join([]string{
-		"diff --git a/internal/plain.go b/internal/plain.go",
-		"index 1111111..2222222 100644",
-		"--- a/internal/plain.go",
-		"+++ b/internal/plain.go",
-		"@@ -1 +1 @@",
-		"-old",
-		"+new",
-		"diff --git a/docs/new file.md b/docs/new file.md",
-		"new file mode 100644",
-		"--- /dev/null",
-		"+++ b/docs/new file.md",
-		"@@ -0,0 +1 @@",
-		"+added",
-		"diff --git a/internal/gone.go b/internal/gone.go",
-		"deleted file mode 100644",
-		"--- a/internal/gone.go",
-		"+++ /dev/null",
-		"@@ -1 +0,0 @@",
-		"-gone",
-		"diff --git a/old/name.go b/new/name.go",
-		"similarity index 100%",
-		"rename from old/name.go",
-		"rename to new/name.go",
-		`diff --git "a/docs/caf\303\251.md" "b/docs/caf\303\251.md"`,
-		"index 5555555..6666666 100644",
-		`--- "a/docs/caf\303\251.md"`,
-		`+++ "b/docs/caf\303\251.md"`,
-		"@@ -1 +1 @@",
-		"-old",
-		"+new",
-		"diff --git a/assets/logo.png b/assets/logo.png",
-		"index 3333333..4444444 100644",
-		"Binary files a/assets/logo.png and b/assets/logo.png differ",
-	}, "\n")
-
-	files, err := parseDiffFiles(diff)
-	if err != nil {
-		t.Fatalf("parseDiffFiles: %v", err)
-	}
-	want := []PullRequestFile{
-		{Filename: "internal/plain.go", Status: "modified"},
-		{Filename: "docs/new file.md", Status: "added"},
-		{Filename: "internal/gone.go", Status: "removed"},
-		{Filename: "new/name.go", Status: "renamed"},
-		{Filename: "docs/café.md", Status: "modified"},
-		{Filename: "assets/logo.png", Status: "modified"},
-	}
-	if !reflect.DeepEqual(files, want) {
-		t.Fatalf("parseDiffFiles = %+v\nwant %+v", files, want)
+	if len(runner.calls) != 1 {
+		t.Fatalf("calls = %v, want exactly the compare request and no diff-media fetch", runner.calls)
 	}
 }
 

@@ -125,6 +125,38 @@ func checkoutLockBackoff(attempt int) time.Duration {
 // the caller skips finishQueuedJob. Every non-matching / excluded / budget-spent
 // case returns false so the existing terminal path runs unchanged.
 func (w jobWorker) deferCheckoutContention(ctx context.Context, job db.Job, payload workflow.JobPayload, cause error) (bool, error) {
+	return w.holdCheckoutContention(ctx, job, payload, cause, false)
+}
+
+// deferPreDeliveryAllocationContention is the ONE narrowing of the delegation-child
+// exclusion, and it exists for exactly one seam: the worker's PRE-DELIVERY exact-head
+// worktree allocation (prepareNativeReviewWorktreeForRunner), which a high-risk LENS
+// CHILD reaches path-less on the same fallback the routine leg uses.
+//
+// Why widening it here is safe where widening deferCheckoutContention would not be:
+//
+//   - It is typed, not textual. Only workflow.CheckoutMutationLockContention — the
+//     BlockedError carrying the mutation-busy reason — unlocks the child. Every other
+//     allocation failure (a missing commit object, an unwritable path, a dirty
+//     checkout, a branch lock) still hits the unconditional exclusion below and keeps
+//     the DAG's terminal routing byte-identically.
+//   - It is PRE-DELIVERY. This runs before any adapter is built and before the job
+//     leaves JobQueued, so the child produced no verdict, pushed nothing, and the
+//     parent DAG has observed nothing to advance on. The exclusion exists so the DAG
+//     owns TERMINAL routing for children; a transient lock is not a terminal outcome,
+//     and finalizePreflightDelegationChild would otherwise stamp a synthetic
+//     `failed` verdict on the round because another worker held a shared-.git lock
+//     for a sub-second op.
+//   - It is bounded. The hold shares maxOperationalBlockerRetries with every other
+//     blocker class, so a lock that genuinely never clears spends the budget, records
+//     blocker_exhausted, and falls through to the SAME finishQueuedJob →
+//     finalizePreflightDelegationChild routing it has today. The DAG still advances;
+//     it just no longer advances on the first transient tick.
+func (w jobWorker) deferPreDeliveryAllocationContention(ctx context.Context, job db.Job, payload workflow.JobPayload, cause error) (bool, error) {
+	return w.holdCheckoutContention(ctx, job, payload, cause, workflow.CheckoutMutationLockContention(cause))
+}
+
+func (w jobWorker) holdCheckoutContention(ctx context.Context, job db.Job, payload workflow.JobPayload, cause error, allowDelegationChild bool) (bool, error) {
 	// A fix round has no shared-checkout fallback: allocation already succeeded
 	// before enqueue, and any later checkout failure must settle visibly rather
 	// than masquerade as contention in a registered checkout it never uses.
@@ -136,8 +168,10 @@ func (w jobWorker) deferCheckoutContention(ctx context.Context, job db.Job, payl
 		return false, nil
 	}
 	// Delegation children keep the DAG's own routing (finishQueuedJob →
-	// finalizePreflightDelegationChild); never divert them here.
-	if strings.TrimSpace(payload.ParentJobID) != "" {
+	// finalizePreflightDelegationChild); never divert them here. The single
+	// exception is deferPreDeliveryAllocationContention's typed, pre-delivery
+	// mutation-lock case, documented there.
+	if !allowDelegationChild && strings.TrimSpace(payload.ParentJobID) != "" {
 		return false, nil
 	}
 	// The pre-flight runs before the mailbox claims the job, so only a still-queued

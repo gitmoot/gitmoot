@@ -168,96 +168,146 @@ func (e ReviewScopeUnavailableError) Error() string {
 	return strings.TrimSpace(e.Reason)
 }
 
-func reviewScopeKey(reviewer, delegationID string) string {
-	reviewer = strings.ToLower(strings.TrimSpace(reviewer))
-	delegationID = strings.ToLower(strings.TrimSpace(delegationID))
-	if delegationID == "" {
-		return reviewer
-	}
-	return reviewer + "\x00" + delegationID
+// reviewScopeKey identifies one reviewer's follow-up scope. A high-risk round runs a
+// single reviewer across several lenses (risk.go maps reviewers round-robin), so the
+// lens id is part of the identity, and a ROUTINE round reads a separate aggregate.
+// It is a struct, not a concatenated string: nothing validates delegation ids against
+// control bytes, so a lens id carrying the reserved separator could otherwise collide
+// with another key and overwrite that child's scope.
+type reviewScopeKey struct {
+	reviewer string
+	lens     string
+	// routine marks the aggregate a non-lens round reads. It is a distinct field
+	// rather than a reserved lens value so no delegation id can name it.
+	routine bool
 }
 
-func reviewScopeFor(scopes map[string]*ReviewScope, reviewer, delegationID string) *ReviewScope {
-	if scope := scopes[reviewScopeKey(reviewer, delegationID)]; scope != nil {
+func lensScopeKey(reviewer, delegationID string) reviewScopeKey {
+	return reviewScopeKey{
+		reviewer: strings.ToLower(strings.TrimSpace(reviewer)),
+		lens:     strings.ToLower(strings.TrimSpace(delegationID)),
+	}
+}
+
+// routineScopeKey names the union scope a ROUTINE (non-lens) round reads.
+func routineScopeKey(reviewer string) reviewScopeKey {
+	return reviewScopeKey{reviewer: strings.ToLower(strings.TrimSpace(reviewer)), routine: true}
+}
+
+func reviewScopeFor(scopes map[reviewScopeKey]*ReviewScope, reviewer, delegationID string) *ReviewScope {
+	if scope := scopes[lensScopeKey(reviewer, delegationID)]; scope != nil {
 		return scope
 	}
-	return scopes[reviewScopeKey(reviewer, "")]
+	// A lens with no prior verdict of its own falls back to this reviewer's prior
+	// ROUTINE verdict, never to the routine union: a lens must not inherit findings
+	// raised by a sibling lens.
+	return scopes[lensScopeKey(reviewer, "")]
 }
 
-// reviewScopeUnavailableRecorded reports whether this exact head already carries a
-// review_scope_unavailable record. One poll can reach HandlePullRequestOpened
-// twice — reconcileReviewingPullRequest re-enters with the poll's PRE-dispatch
-// review-job snapshot — so the audit record is claimed at most once per head
-// instead of once per invocation.
-func (e Engine) reviewScopeUnavailableRecorded(ctx context.Context, taskID, reason string) (bool, error) {
+// reviewScopeUnavailableRecorded reports whether this task already carries a
+// review_scope_unavailable record for this PR at this exact head. It matches on that
+// IDENTITY, not on the whole reason: the reason embeds the resolver's error text, so a
+// second observation of the same unscopable head with a differently-worded transport
+// error would otherwise add a duplicate audit row for one head.
+//
+// This is a read-then-write, so two lifecycle calls racing on the same head can both
+// insert. There is no unique key on task_events to claim against, and the cost of the
+// race is bounded to a duplicate AUDIT ROW: the dispatch itself is idempotent, and
+// duplicate review legs are prevented separately by the exact-head/round guard in
+// HandlePullRequestOpened.
+func (e Engine) reviewScopeUnavailableRecorded(ctx context.Context, taskID string, pullRequest int, headSHA string) (bool, error) {
 	events, err := e.Store.ListTaskEvents(ctx, taskID)
 	if err != nil {
 		return false, err
 	}
+	identity := fmt.Sprintf("pull_request=%d head_sha=%s:", pullRequest, strings.TrimSpace(headSHA))
 	for i := len(events) - 1; i >= 0; i-- {
-		if events[i].Kind == "review_scope_unavailable" && events[i].Reason == reason {
+		if events[i].Kind == "review_scope_unavailable" && strings.Contains(events[i].Reason, identity) {
 			return true, nil
 		}
 	}
 	return false, nil
 }
 
-// routineReviewScopeKey names the aggregate scope a ROUTINE round reads when a
-// reviewer's only prior verdicts are LENS children of a high-risk round.
-// Delegation ids never contain a NUL byte, so this key cannot collide with
-// reviewScopeKey(reviewer, lens).
-func routineReviewScopeKey(reviewer string) string {
-	return reviewScopeKey(reviewer, "") + "\x00\x00routine"
-}
-
-// reviewScopeForRoutine resolves the scope for a ROUTINE (non-lens) round: the
-// reviewer's own prior routine verdict when it has one, else the aggregate of the
-// lens verdicts that same reviewer produced in a preceding high-risk round.
-// Without the aggregate, a high-risk round followed by a routine round (label
-// removed, or RiskTiersEnabled flipped) missed every lens-keyed candidate on the
-// bare-reviewer lookup and silently dispatched an unscoped full-PR re-review.
-func reviewScopeForRoutine(scopes map[string]*ReviewScope, reviewer string) *ReviewScope {
-	if scope := scopes[reviewScopeKey(reviewer, "")]; scope != nil {
-		return scope
+// reviewLegsAtHead returns the reviewers that already have a review job for this task
+// at this exact head and round, keyed lowercase, mapped to that job's state.
+//
+// Two distinct cases, one answer. A QUEUED or RUNNING leg is work in flight, so a
+// second leg is a duplicate. A TERMINAL leg cannot be revived by re-enqueue either:
+// Enqueue fails on the existing id and the collision check compares derived content
+// (payloadMatchesRequest compares Instructions and WorktreePath), so a re-derivation
+// whose scope resolved differently — scoped on one poll, degraded to unscoped on the
+// next — surfaced a raw `UNIQUE constraint failed: jobs.id` out of the lifecycle and
+// re-fired it every poll. Identity is reviewer + head + round, and the deterministic
+// id encodes exactly that, so skipping on identity is the idempotent answer to both.
+// Re-attempting a HELD leg is the worker's path — the row stays queued and is
+// re-dispatched — and nothing here silently retries a terminal verdict, which is the
+// pre-existing contract.
+func reviewLegsAtHead(jobs []db.Job, event PullRequestEvent, round string) map[string]string {
+	current := JobPayload{Repo: event.Repo, PullRequest: event.PullRequest, TaskID: event.TaskID}
+	head := strings.TrimSpace(event.HeadSHA)
+	round = strings.TrimSpace(round)
+	legs := map[string]string{}
+	for _, job := range jobs {
+		if job.Type != "review" {
+			continue
+		}
+		payload, err := unmarshalPayload(job.Payload)
+		if err != nil {
+			// An unparseable payload cannot prove a leg exists; the enqueue path stays
+			// authoritative for it.
+			continue
+		}
+		if !sameTask(current, payload) {
+			continue
+		}
+		if strings.TrimSpace(payload.HeadSHA) != head || strings.TrimSpace(payload.ReviewRound) != round {
+			continue
+		}
+		if agent := strings.ToLower(strings.TrimSpace(reviewDecisionAgent(job, payload))); agent != "" {
+			legs[agent] = job.State
+		}
 	}
-	return scopes[routineReviewScopeKey(reviewer)]
+	return legs
 }
 
-// routineScopeAggregates unions each reviewer's LENS scopes into one routine
-// scope keyed by routineReviewScopeKey. Findings and changed files are merged and
-// the OLDEST baseline head is named, because its changed-file range is the
-// superset a routine round must cover. A reviewer that already has a bare
-// routine scope needs no aggregate.
-func routineScopeAggregates(candidates map[string]reviewScopeCandidate, scopes map[string]*ReviewScope) map[string]*ReviewScope {
-	merged := make(map[string]*ReviewScope, len(candidates))
-	rounds := make(map[string]int, len(candidates))
-	for _, candidate := range candidates {
-		lens := strings.TrimSpace(candidate.payload.DelegationID)
-		if lens == "" {
-			continue
-		}
-		reviewer := strings.ToLower(strings.TrimSpace(reviewDecisionAgent(candidate.job, candidate.payload)))
-		if scopes[reviewScopeKey(reviewer, "")] != nil {
-			continue
-		}
-		scope := scopes[reviewScopeKey(reviewer, lens)]
+// reviewScopeForRoutine resolves the scope for a ROUTINE (non-lens) round. It reads
+// one key: the union routineScopeAggregates builds from EVERY candidate that reviewer
+// has, lens or not. Reading the bare-reviewer key instead lost a preceding high-risk
+// round's lens findings entirely (routine -> lens -> routine dropped the lens round),
+// and choosing between bare and lens by recency would have dropped whichever side lost.
+func reviewScopeForRoutine(scopes map[reviewScopeKey]*ReviewScope, reviewer string) *ReviewScope {
+	return scopes[routineScopeKey(reviewer)]
+}
+
+// routineScopeAggregates unions ALL of a reviewer's scopes — its bare routine verdict
+// and every lens verdict, whatever round each came from — into the one scope a routine
+// round reads. Findings and changed files are merged, so no round's live findings are
+// dropped, and the OLDEST baseline head is named because its changed-file range is the
+// superset that covers every merged baseline. A reviewer with a single bare candidate
+// aggregates to a copy of it, so the no-lens path is unchanged.
+func routineScopeAggregates(candidates map[reviewScopeKey]reviewScopeCandidate, scopes map[reviewScopeKey]*ReviewScope) map[reviewScopeKey]*ReviewScope {
+	merged := make(map[reviewScopeKey]*ReviewScope, len(candidates))
+	rounds := make(map[reviewScopeKey]int, len(candidates))
+	for key, candidate := range candidates {
+		scope := scopes[key]
 		if scope == nil {
 			continue
 		}
-		key := routineReviewScopeKey(reviewer)
-		prior, ok := merged[key]
+		routineKey := routineScopeKey(key.reviewer)
+		prior, ok := merged[routineKey]
 		if !ok {
-			merged[key] = &ReviewScope{
+			merged[routineKey] = &ReviewScope{
 				PreviousHeadSHA: scope.PreviousHeadSHA,
 				Findings:        append([]string(nil), scope.Findings...),
 				ChangedFiles:    append([]string(nil), scope.ChangedFiles...),
 			}
-			rounds[key] = candidate.round
+			rounds[routineKey] = candidate.round
 			continue
 		}
-		if olderRoutineBaseline(candidate.round, scope.PreviousHeadSHA, rounds[key], prior.PreviousHeadSHA) {
+		if olderRoutineBaseline(candidate.round, scope.PreviousHeadSHA, rounds[routineKey], prior.PreviousHeadSHA) {
 			prior.PreviousHeadSHA = scope.PreviousHeadSHA
-			rounds[key] = candidate.round
+			rounds[routineKey] = candidate.round
 		}
 		prior.Findings = append(prior.Findings, scope.Findings...)
 		prior.ChangedFiles = append(prior.ChangedFiles, scope.ChangedFiles...)
@@ -269,9 +319,9 @@ func routineScopeAggregates(candidates map[string]reviewScopeCandidate, scopes m
 	return merged
 }
 
-// olderRoutineBaseline reports whether a candidate lens scope is the older
-// baseline: the earlier round wins, then the lexicographically smaller head so
-// map iteration order cannot change which head the aggregate names.
+// olderRoutineBaseline reports whether a candidate scope is the older baseline: the
+// earlier round wins, then the lexicographically smaller head so map iteration order
+// cannot change which head the aggregate names.
 func olderRoutineBaseline(round int, head string, priorRound int, priorHead string) bool {
 	if round != priorRound {
 		return round < priorRound
@@ -279,13 +329,13 @@ func olderRoutineBaseline(round int, head string, priorRound int, priorHead stri
 	return head < priorHead
 }
 
-func (e Engine) followUpReviewScopes(ctx context.Context, event PullRequestEvent, reviewers []string, jobs []db.Job) (map[string]*ReviewScope, error) {
+func (e Engine) followUpReviewScopes(ctx context.Context, event PullRequestEvent, reviewers []string, jobs []db.Job) (map[reviewScopeKey]*ReviewScope, error) {
 	wanted := make(map[string]struct{}, len(reviewers))
 	for _, reviewer := range reviewers {
 		wanted[strings.ToLower(strings.TrimSpace(reviewer))] = struct{}{}
 	}
 	current := JobPayload{Repo: event.Repo, PullRequest: event.PullRequest, TaskID: event.TaskID}
-	candidates := make(map[string]reviewScopeCandidate, len(wanted))
+	candidates := make(map[reviewScopeKey]reviewScopeCandidate, len(wanted))
 	for _, job := range jobs {
 		if job.Type != "review" {
 			continue
@@ -324,7 +374,7 @@ func (e Engine) followUpReviewScopes(ctx context.Context, event PullRequestEvent
 			round:    reviewRoundCount(payload.ReviewRound),
 			findings: findings,
 		}
-		scopeKey := reviewScopeKey(reviewerKey, payload.DelegationID)
+		scopeKey := lensScopeKey(reviewerKey, payload.DelegationID)
 		if prior, ok := candidates[scopeKey]; !ok || laterReviewScopeCandidate(candidate, prior) {
 			candidates[scopeKey] = candidate
 		}
@@ -336,7 +386,7 @@ func (e Engine) followUpReviewScopes(ctx context.Context, event PullRequestEvent
 		return nil, fmt.Errorf("scoped follow-up review requires a changed-files resolver")
 	}
 	filesByHead := make(map[string][]string, len(candidates))
-	scopes := make(map[string]*ReviewScope, len(candidates))
+	scopes := make(map[reviewScopeKey]*ReviewScope, len(candidates))
 	for scopeKey, candidate := range candidates {
 		previousHead := strings.TrimSpace(candidate.payload.HeadSHA)
 		files, ok := filesByHead[previousHead]
