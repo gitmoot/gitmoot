@@ -11897,8 +11897,9 @@ The typed note
 `reply:<role>` wake row commit atomically. The wake includes the exact
 `gitmoot workflow show-note <id>` retrieval command; that command renders the
 citable row's workflow, author, optional repository, timestamp, and body, or
-returns the row as JSON. Messages create no directive, acknowledgment,
-completion, TTL, or nag obligation.
+returns the row as JSON. Plain output marks bodies above 512 runes as truncated
+and points to `--json`; JSON preserves the full stored body. Messages create no
+directive, acknowledgment, completion, TTL, or nag obligation.
 
 `gitmoot org escalate resolve <escalation-note-id> [--by <role>] [--note
 <answer-note-id>] [--home <dir>]` appends a typed resolution marker to the same

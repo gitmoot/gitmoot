@@ -107,8 +107,12 @@ func TestOrgMessageSendAllowsDifferentlyScopedSameParentSiblings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := "gitmoot workflow show-note " + strconv.FormatInt(note.ID, 10); !strings.Contains(wakeEvent.Detail, want) {
-		t.Fatalf("wake detail=%q, want retrieval command %q", wakeEvent.Detail, want)
+	retrievalCommand := "gitmoot workflow show-note " + strconv.FormatInt(note.ID, 10)
+	if !strings.Contains(wakeEvent.Detail, retrievalCommand) {
+		t.Fatalf("wake detail=%q, want retrieval command %q", wakeEvent.Detail, retrievalCommand)
+	}
+	if prompt := eventRuleWakePrompt("reply", wakeEvent); !strings.Contains(prompt, retrievalCommand) {
+		t.Fatalf("recipient prompt=%q, want retrieval command %q", prompt, retrievalCommand)
 	}
 	unacknowledged, err := store.ListUnacknowledgedOrgDirectives(context.Background(), "gm-omp-impl")
 	if err != nil || len(unacknowledged) != 0 {

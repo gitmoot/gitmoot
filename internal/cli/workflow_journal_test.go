@@ -1240,3 +1240,36 @@ func TestWorkflowRememberHonorsAutoConfirmInSharedPool(t *testing.T) {
 		t.Fatalf("confirmed=%+v err=%v", confirmed, err)
 	}
 }
+
+func TestWorkflowShowNoteMarksTruncatedPlainBody(t *testing.T) {
+	home, store := workflowJournalTestHome(t)
+	body := strings.Repeat("x", workflowTextLineMaxRunes+20)
+	note, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+		WorkflowID: "gitmoot/long-message",
+		Author:     "gm-omp-nag",
+		Body:       body,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runWorkflowJournal([]string{"show-note", fmt.Sprint(note.ID), "--home", home}, &stdout, &stderr)
+	if code != 0 || !strings.Contains(stdout.String(), "[truncated; use --json for the full body]") {
+		t.Fatalf("plain show-note code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = runWorkflowJournal([]string{"show-note", fmt.Sprint(note.ID), "--home", home, "--json"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("JSON show-note code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	var decoded db.WorkflowNote
+	if err := json.Unmarshal(stdout.Bytes(), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Body != body {
+		t.Fatalf("JSON body length=%d, want %d verbatim bytes", len(decoded.Body), len(body))
+	}
+}

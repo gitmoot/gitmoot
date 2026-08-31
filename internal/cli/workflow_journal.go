@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -430,6 +431,14 @@ func terminalSafeWorkflowText(value string) string {
 	return string(out)
 }
 
+func terminalSafeWorkflowBody(value string) string {
+	rendered := terminalSafeWorkflowText(value)
+	if utf8.RuneCountInString(value) > workflowTextLineMaxRunes {
+		return rendered + " [truncated; use --json for the full body]"
+	}
+	return rendered
+}
+
 func mergeWorkflowTimeline(jobs []db.Job, notes []db.WorkflowNote) []workflowTimelineEntry {
 	entries := make([]workflowTimelineEntry, 0, len(jobs)+len(notes))
 	for _, job := range jobs {
@@ -518,7 +527,7 @@ func runWorkflowNoteShow(args []string, stdout, stderr io.Writer) int {
 		writeLine(stdout, "repo: %s", terminalSafeWorkflowText(note.Repo))
 	}
 	writeLine(stdout, "created: %s", note.CreatedAt)
-	writeLine(stdout, "body: %s", terminalSafeWorkflowText(note.Body))
+	writeLine(stdout, "body: %s", terminalSafeWorkflowBody(note.Body))
 	return 0
 }
 
