@@ -1,0 +1,247 @@
+package daemon
+
+import (
+	"context"
+	"testing"
+
+	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/workflow"
+)
+
+// seedBlockedReviewTask stages the exact live shape from #1562: the local review
+// task review-pr-1699-3f3a1026, blocked by the merge gate while its pull request
+// is still open.
+//
+// The empty Branch is load-bearing, not incidental. A local review task
+// deliberately carries no branch so it cannot collide with the implement task that
+// owns (repo, head branch), and that is precisely why the wedge survived: every
+// branch-keyed path — daemon.pullRequestReadyToMerge, handleReadyToMergeWorkflow,
+// reconcilePROpenTasks — resolves tasks from pull.HeadRef and cannot see this row.
+// A fixture with a branch would be released by reconcilePROpenTasks instead and
+// would therefore pass against a fix that never runs.
+func seedBlockedReviewTask(t *testing.T, store *db.Store, repo github.Repository, class workflow.MergeBlockClass, reason string) github.PullRequest {
+	t.Helper()
+	ctx := context.Background()
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "review-pr-1699-3f3a1026",
+		RepoFullName: repo.FullName(),
+		GoalID:       "goal-1699",
+		Title:        "Review PR #1699",
+		State:        string(workflow.TaskBlocked),
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	if err := store.UpsertMergeGate(ctx, db.MergeGate{
+		RepoFullName: repo.FullName(),
+		PullRequest:  1699,
+		State:        "blocked",
+		Reason:       reason,
+		BlockClass:   int(class),
+	}); err != nil {
+		t.Fatalf("UpsertMergeGate returned error: %v", err)
+	}
+	return github.PullRequest{
+		Number:  1699,
+		Title:   "Review PR #1699",
+		State:   "open",
+		URL:     "https://github.com/gitmoot/gitmoot/pull/1699",
+		HeadRef: "task-1699",
+		BaseRef: "main",
+		HeadSHA: "3f3a1026",
+	}
+}
+
+func blockedReviewTaskDaemon(t *testing.T, store *db.Store, repo github.Repository, pull github.PullRequest) (Daemon, *fakeWorkflowMergeGate) {
+	t.Helper()
+	client := &fakeGitHub{
+		pulls:    []github.PullRequest{pull},
+		comments: map[int64][]github.IssueComment{pull.Number: {}},
+	}
+	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{Ready: true}}
+	engine := workflow.Engine{Store: store, MergeGate: gate}
+	return Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}, gate
+}
+
+func hasTaskEventKind(events []db.TaskEvent, kind string) bool {
+	for _, event := range events {
+		if event.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// TestPollOnceReleasesTransientlyBlockedReviewTask is the release direction of
+// #1562. A task blocked on "local worktree is not clean" — a condition the gate
+// itself classified MergeBlockTransient — must regain an exit from the ordinary
+// poll, WITHOUT a human merging the pull request. ready_to_merge is that exit: it
+// is the documented retry authority and it is also the state `task resume-work`
+// accepts, so the row becomes reachable both automatically and by an operator.
+//
+// Mutant M1 ("releases nothing"): delete the
+// reconcileTransientlyBlockedMergeGates call from PollOnce, or invert its class
+// test to MergeBlockQuality. The task then stays blocked and this test fails,
+// while TestPollOnceLeavesQualityBlockedReviewTaskBlocked still passes.
+func TestPollOnceReleasesTransientlyBlockedReviewTask(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	pull := seedBlockedReviewTask(t, store, repo, workflow.MergeBlockTransient, "local worktree is not clean")
+	daemon, _ := blockedReviewTaskDaemon(t, store, repo, pull)
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+
+	task, err := store.GetTask(ctx, "review-pr-1699-3f3a1026")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskReadyToMerge) {
+		t.Fatalf("task state = %q, want ready_to_merge once the transient block is re-evaluated", task.State)
+	}
+	events, err := store.ListTaskEvents(ctx, "review-pr-1699-3f3a1026")
+	if err != nil {
+		t.Fatalf("ListTaskEvents returned error: %v", err)
+	}
+	if !hasTaskEventKind(events, "merge_gate_transient_retry") {
+		t.Fatalf("task events = %+v, want an auditable merge_gate_transient_retry release", events)
+	}
+}
+
+// TestPollOnceLeavesQualityBlockedReviewTaskBlocked is the direction that stops
+// the obvious wrong fix. An authoritative quality rejection must stay blocked.
+//
+// Mutant M2 ("releases everything"): drop the BlockClass condition from
+// reconcileTransientlyBlockedMergeGates so any blocked row with a blocked gate is
+// released. This test then fails while
+// TestPollOnceReleasesTransientlyBlockedReviewTask still passes.
+func TestPollOnceLeavesQualityBlockedReviewTaskBlocked(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	pull := seedBlockedReviewTask(t, store, repo, workflow.MergeBlockQuality, "external CI failed")
+	daemon, _ := blockedReviewTaskDaemon(t, store, repo, pull)
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+
+	task, err := store.GetTask(ctx, "review-pr-1699-3f3a1026")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskBlocked) {
+		t.Fatalf("task state = %q, want blocked to persist for an authoritative quality rejection", task.State)
+	}
+}
+
+// TestPollOnceLeavesUnclassifiedBlockedReviewTaskBlocked covers the migration
+// boundary: every merge-gate row that predates the block_class column reads 0
+// (MergeBlockNone). Those rows must not be released, because an unclassified block
+// is not evidence of a self-clearing condition.
+func TestPollOnceLeavesUnclassifiedBlockedReviewTaskBlocked(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	pull := seedBlockedReviewTask(t, store, repo, workflow.MergeBlockNone, "legacy row with no class")
+	daemon, _ := blockedReviewTaskDaemon(t, store, repo, pull)
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+
+	task, err := store.GetTask(ctx, "review-pr-1699-3f3a1026")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskBlocked) {
+		t.Fatalf("task state = %q, want an unclassified legacy block to stay blocked", task.State)
+	}
+}
+
+// TestPollOnceLeavesTransientBlockOnClosedPullRequestBlocked pins the open-PR
+// requirement. A closed PR cannot clear a transient condition, and releasing it to
+// ready_to_merge would hand a moot subject to the merge path; that population
+// belongs to the external-merge and closed-reviewing reconcilers.
+func TestPollOnceLeavesTransientBlockOnClosedPullRequestBlocked(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	// Seed the blocked row, then present a poll in which PR #1699 is NOT open.
+	_ = seedBlockedReviewTask(t, store, repo, workflow.MergeBlockTransient, "local worktree is not clean")
+	closed := github.PullRequest{Number: 1699, State: "closed", HeadRef: "task-1699", BaseRef: "main", HeadSHA: "3f3a1026"}
+	client := &fakeGitHub{
+		pulls:         []github.PullRequest{},
+		comments:      map[int64][]github.IssueComment{},
+		pullsByNumber: map[int64]github.PullRequest{1699: closed},
+	}
+	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{Ready: true}}
+	engine := workflow.Engine{Store: store, MergeGate: gate}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+
+	task, err := store.GetTask(ctx, "review-pr-1699-3f3a1026")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskBlocked) {
+		t.Fatalf("task state = %q, want blocked while the pull request is not open", task.State)
+	}
+}
+
+// TestMergeGateBlockClassSurvivesTheBlockingCallStack pins the #1562 root cause
+// directly: before this fix the class existed only on the returned MergeDecision,
+// so no exit path outside the blocking call stack could read it.
+func TestMergeGateBlockClassSurvivesTheBlockingCallStack(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	for _, tt := range []struct {
+		name  string
+		class workflow.MergeBlockClass
+	}{
+		{"transient", workflow.MergeBlockTransient},
+		{"quality", workflow.MergeBlockQuality},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := store.UpsertMergeGate(ctx, db.MergeGate{
+				RepoFullName: repo.FullName(),
+				PullRequest:  4242,
+				State:        "blocked",
+				Reason:       tt.name,
+				BlockClass:   int(tt.class),
+			}); err != nil {
+				t.Fatalf("UpsertMergeGate returned error: %v", err)
+			}
+			gate, err := store.GetMergeGate(ctx, repo.FullName(), 4242)
+			if err != nil {
+				t.Fatalf("GetMergeGate returned error: %v", err)
+			}
+			if gate.BlockClass != int(tt.class) {
+				t.Fatalf("persisted block class = %d, want %d", gate.BlockClass, int(tt.class))
+			}
+		})
+	}
+	// A pending row is not a block: it must store the zero class so it can never be
+	// selected for release.
+	if err := store.UpsertMergeGate(ctx, db.MergeGate{
+		RepoFullName: repo.FullName(),
+		PullRequest:  4242,
+		State:        "pending",
+		Reason:       "waiting on CI",
+	}); err != nil {
+		t.Fatalf("UpsertMergeGate(pending) returned error: %v", err)
+	}
+	gate, err := store.GetMergeGate(ctx, repo.FullName(), 4242)
+	if err != nil {
+		t.Fatalf("GetMergeGate returned error: %v", err)
+	}
+	if gate.BlockClass != int(workflow.MergeBlockNone) {
+		t.Fatalf("pending row block class = %d, want MergeBlockNone", gate.BlockClass)
+	}
+}

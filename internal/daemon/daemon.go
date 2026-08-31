@@ -274,6 +274,9 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 	if err := d.reconcileExternallyMergedTasks(ctx, openPullNumbers); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	if err := d.reconcileTransientlyBlockedMergeGates(ctx, openPullNumbers); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	if err := d.retryClosedReadyToMerge(ctx, openBranches); err != nil && firstErr == nil {
 		firstErr = err
 	}
@@ -519,6 +522,94 @@ func (d Daemon) reconcilePROpenTasks(ctx context.Context, pulls []github.PullReq
 			PullRequest: int(pull.Number),
 		}, workflow.PullRequestJournalOpened); err != nil {
 			d.logf("workflow journal PR-open breadcrumb failed for %s#%d: %v", d.Repo.FullName(), pull.Number, err)
+		}
+	}
+	return firstErr
+}
+
+// reconcileTransientlyBlockedMergeGates gives a TRANSIENTLY blocked task an exit
+// (#1562). The merge gate already separates an operational/branch-staleness/infra
+// condition from an authoritative quality rejection, but that classification used
+// to live only on the returned decision, so nothing outside the blocking call
+// stack could act on it: daemon.pullRequestReadyToMerge admits ready_to_merge
+// only, engine_pr_lifecycle's non-merged close branch omits blocked, and
+// `task resume-work` refuses blocked. Measured on review-pr-1699-3f3a1026, whose
+// dirty-worktree block outlived the dirt by 95 minutes and cleared only when a
+// human merged the PR by hand.
+//
+// Release requires BOTH halves. The persisted class is the SELECTION filter — the
+// gate's own statement that this condition is self-clearing — and returning the
+// row to ready_to_merge is what restores it to the population that is
+// re-evaluated, which is the same remedy the engine already applies to a deferred
+// decision for the identical wedge ("a state that poll does not re-evaluate",
+// engine_routing_merge.go). The gate is NOT re-run here: it runs on the
+// ready_to_merge path, so a condition that has not actually cleared blocks again
+// and the row simply returns here next tick. A quality-classed row is never
+// selected, so an authoritative rejection stays blocked by construction rather
+// than by a re-evaluation happening to agree.
+//
+// PR-number resolution mirrors reconcileExternallyMergedTasks exactly, because
+// the wedged population is precisely the branchless local review task: a
+// pull.HeadRef lookup cannot find it, which is why the branch-keyed poll predicate
+// is the wrong seam for this exit.
+func (d Daemon) reconcileTransientlyBlockedMergeGates(ctx context.Context, openPullNumbers map[int64]struct{}) error {
+	tasks, err := d.Store.ListTasksByRepo(ctx, d.Repo.FullName())
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, task := range tasks {
+		if task.State != string(workflow.TaskBlocked) {
+			continue
+		}
+		branch := strings.TrimSpace(task.Branch)
+		var number int64
+		if branch == "" {
+			var ok bool
+			number, ok = reviewTaskPullRequestNumber(task.ID)
+			if !ok {
+				continue
+			}
+		} else {
+			stored, storedErr := d.Store.GetPullRequestByRepoBranch(ctx, d.Repo.FullName(), branch)
+			if storedErr != nil {
+				if errors.Is(storedErr, sql.ErrNoRows) {
+					continue
+				}
+				return storedErr
+			}
+			number = stored.Number
+		}
+		if number <= 0 {
+			continue
+		}
+		// Only a still-open PR can clear a transient condition. A closed or merged
+		// PR belongs to the external-merge and closed-reviewing reconcilers.
+		if _, open := openPullNumbers[number]; !open {
+			continue
+		}
+		gate, gateErr := d.Store.GetMergeGate(ctx, d.Repo.FullName(), number)
+		if gateErr != nil {
+			if errors.Is(gateErr, sql.ErrNoRows) {
+				continue
+			}
+			return gateErr
+		}
+		if gate.State != "blocked" || gate.BlockClass != int(workflow.MergeBlockTransient) {
+			continue
+		}
+		changed, _, transitionErr := d.Store.TransitionTaskStateWithEvent(ctx, task.ID,
+			[]string{string(workflow.TaskBlocked)},
+			string(workflow.TaskReadyToMerge), "merge_gate_transient_retry",
+			fmt.Sprintf("re-evaluating transient merge-gate block on open PR #%d: %s", number, gate.Reason))
+		if transitionErr != nil {
+			if firstErr == nil {
+				firstErr = transitionErr
+			}
+			continue
+		}
+		if changed {
+			d.logf("task %s released blocked -> ready_to_merge: transient merge-gate block on open PR #%d (%s)", task.ID, number, gate.Reason)
 		}
 	}
 	return firstErr
@@ -1244,6 +1335,11 @@ func (d Daemon) pullRequestReadyToMerge(ctx context.Context, pull github.PullReq
 	// TaskReadyToMerge is the retry authority. SkipNativeReviewFanout controls
 	// PR-open review routing only; a direct review can leave this task pending
 	// on CI, and suppressing its poll here strands gitmoot/merge-gate (#1708).
+	//
+	// This predicate is deliberately NOT the #1562 transient-block exit: it
+	// resolves its task from pull.HeadRef, and the population that actually wedges
+	// is the branchless local review-pr-<number>-<hash> task, which no HeadRef
+	// lookup can find. reconcileTransientlyBlockedMergeGates owns that exit.
 	return task.State == string(workflow.TaskReadyToMerge), nil
 }
 

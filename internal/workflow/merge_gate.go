@@ -1270,12 +1270,15 @@ func reviewRoundAfter(left string, right string) bool {
 }
 
 // block records a not-ready block at the given quality classification (#465). The
-// class is advisory metadata for the Mode-A trace-harvester only; it never changes
-// the block transition itself. Call sites pass MergeBlockQuality for authoritative
-// template-quality rejections (external CI failed, blocking review captured, closed
-// without merge) and MergeBlockTransient for branch-staleness/infra conditions.
+// class drives the Mode-A trace-harvester AND is persisted on the merge-gate row
+// (#1562): a transient/infra block is self-clearing, so an exit path outside this
+// call stack must be able to tell it apart from an authoritative rejection. It
+// still never changes the block transition itself. Call sites pass
+// MergeBlockQuality for authoritative template-quality rejections (external CI
+// failed, blocking review captured, closed without merge) and MergeBlockTransient
+// for branch-staleness/infra conditions.
 func (g PolicyMergeGate) block(ctx context.Context, request MergeRequest, sha string, reason string, class MergeBlockClass) (MergeDecision, error) {
-	if err := g.Store.UpsertMergeGate(ctx, db.MergeGate{RepoFullName: request.Repo, PullRequest: int64(request.PullRequest), State: "blocked", Reason: reason}); err != nil {
+	if err := g.Store.UpsertMergeGate(ctx, db.MergeGate{RepoFullName: request.Repo, PullRequest: int64(request.PullRequest), State: "blocked", Reason: reason, BlockClass: int(class)}); err != nil {
 		return MergeDecision{}, err
 	}
 	if sha != "" {

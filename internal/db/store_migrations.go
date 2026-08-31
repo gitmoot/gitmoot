@@ -2281,4 +2281,29 @@ CREATE TABLE merge_gate_status_observations (
 	PRIMARY KEY (repo_full_name, pull_request)
 );
 	`,
+	// #1562 durable merge-gate block classification. The gate already separates a
+	// transient/infra block from an authoritative quality rejection, but that
+	// classification lived only in the returned decision, so no exit path could
+	// read it and a transient block became permanent. Existing rows default to 0
+	// (MergeBlockNone), which is never selected for automatic re-evaluation.
+	//
+	// The CREATE is not redundant. A database can legitimately reach this version
+	// without merge_gates: seeding schema_migrations forward past the migration
+	// that created it leaves the table absent, and a bare ALTER then fails the
+	// whole Migrate call, which is a refusal to start rather than a test artifact.
+	// Both paths converge on the same shape, and this migration is APPENDED, never
+	// reordered, so an already-migrated database still applies exactly this step.
+	`
+CREATE TABLE IF NOT EXISTS merge_gates (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	repo_full_name TEXT NOT NULL,
+	pull_request INTEGER NOT NULL,
+	state TEXT NOT NULL,
+	reason TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	UNIQUE(repo_full_name, pull_request)
+);
+ALTER TABLE merge_gates ADD COLUMN block_class INTEGER NOT NULL DEFAULT 0;
+	`,
 }
