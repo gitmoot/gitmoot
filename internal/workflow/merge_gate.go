@@ -515,7 +515,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			latestReviewByReviewer[reviewer] = review
 			continue
 		}
-		if reviewJobRecordedAfter(review.job, latest.job) {
+		if reviewJobSupersedes(review.job, review.payload, latest.job, latest.payload) {
 			latestReviewByReviewer[reviewer] = review
 		}
 	}
@@ -541,7 +541,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			if candidate.payload.Result != nil &&
 				strings.TrimSpace(candidate.job.Agent) == reviewer &&
 				isReviewReplacementDecision(candidate.payload.Result.Decision) &&
-				reviewJobRecordedAfter(candidate.job, review.job) {
+				reviewJobSupersedes(candidate.job, candidate.payload, review.job, review.payload) {
 				supersededReviewIDs[review.job.ID] = struct{}{}
 				break
 			}
@@ -911,6 +911,17 @@ func reviewJobRecordedAfter(left db.Job, right db.Job) bool {
 		return after
 	}
 	return false
+}
+func reviewJobSupersedes(leftJob db.Job, leftPayload JobPayload, rightJob db.Job, rightPayload JobPayload) bool {
+	leftRound := reviewRoundKeyForJob(leftJob, leftPayload)
+	rightRound := reviewRoundKeyForJob(rightJob, rightPayload)
+	if reviewRoundKeyAfter(leftRound, rightRound) {
+		return true
+	}
+	if reviewRoundKeyAfter(rightRound, leftRound) || !sameReviewRoundKey(leftRound, rightRound) {
+		return false
+	}
+	return reviewJobRecordedAfter(leftJob, rightJob)
 }
 
 type reviewRoundKey struct {

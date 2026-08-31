@@ -940,7 +940,7 @@ func (e Engine) nextReviewRound(ctx context.Context, event PullRequestEvent) (st
 		return "", nil, err
 	}
 	current := JobPayload{Repo: event.Repo, PullRequest: event.PullRequest, TaskID: event.TaskID}
-	rounds := map[string]bool{}
+	maxReviewRound := 0
 	existingHeadRound := ""
 	for _, job := range jobs {
 		if job.Type != "review" {
@@ -954,18 +954,20 @@ func (e Engine) nextReviewRound(ctx context.Context, event PullRequestEvent) (st
 			continue
 		}
 		round := strings.TrimSpace(payload.ReviewRound)
+		if number, ok := reviewRoundNumber(round); ok && number > maxReviewRound {
+			maxReviewRound = number
+		}
 		if round == "" {
 			round = job.ID
 		}
 		if payload.HeadSHA != "" && payload.HeadSHA == event.HeadSHA {
 			existingHeadRound = round
 		}
-		rounds[round] = true
 	}
 	if existingHeadRound != "" {
 		return existingHeadRound, jobs, nil
 	}
-	return "review-" + strconv.Itoa(len(rounds)+1), jobs, nil
+	return "review-" + strconv.Itoa(maxReviewRound+1), jobs, nil
 }
 
 func (e Engine) reviewApprovalAlreadyAdvanced(ctx context.Context, ref taskRef) (bool, error) {

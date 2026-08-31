@@ -797,6 +797,67 @@ func TestPolicyMergeGateEmptyReviewRoundUsesRecordedRecency(t *testing.T) {
 	}
 }
 
+func TestPolicyMergeGateExplicitRoundPrecedesNewerSameReviewerVerdict(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		newerRound string
+	}{
+		{name: "empty round", newerRound: ""},
+		{name: "lower explicit round", newerRound: "review-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			basePayload := JobPayload{
+				Repo:        "gitmoot/gitmoot",
+				Branch:      "task-9",
+				PullRequest: 9,
+				TaskID:      "task-9",
+			}
+			implementPayload := basePayload
+			implementPayload.Result = &AgentResult{Decision: "implemented", Summary: "implemented"}
+			insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: "implementer", Type: "implement"}, implementPayload)
+
+			blockingReview := basePayload
+			blockingReview.HeadSHA = "head123"
+			blockingReview.ReviewRound = "review-2"
+			blockingReview.Result = &AgentResult{Decision: "changes_requested", Summary: "blocking"}
+			insertCompletedJob(t, store, db.Job{ID: "review-blocking", Agent: "audit", Type: "review"}, blockingReview)
+			setMergeGateJobTimestamps(t, store, "review-blocking", "2026-08-31 10:00:00")
+
+			newerApproval := basePayload
+			newerApproval.HeadSHA = "head123"
+			newerApproval.ReviewRound = tc.newerRound
+			newerApproval.Result = &AgentResult{Decision: "approved", Summary: "lower round approval"}
+			insertCompletedJob(t, store, db.Job{ID: "review-newer", Agent: "audit", Type: "review"}, newerApproval)
+			setMergeGateJobTimestamps(t, store, "review-newer", "2026-08-31 11:00:00")
+
+			mergeable := true
+			gh := &fakeMergeGateGitHub{
+				pr: github.PullRequest{
+					Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+					HeadSHA: "head123", Mergeable: &mergeable,
+				},
+				status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+				checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+				mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+			}
+			gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+			decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if !decision.LeaveOpen || decision.Merged {
+				t.Fatalf("decision = %+v, want blocking review to keep PR open", decision)
+			}
+			if !strings.Contains(decision.Reason.Render(), "blocking result from audit") {
+				t.Fatalf("decision reason = %q, want higher explicit round's blocking verdict", decision.Reason)
+			}
+		})
+	}
+}
+
 func TestPolicyMergeGatePreservesSelfApprovalReasonWhenHeadMismatchSortsFirst(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
