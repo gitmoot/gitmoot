@@ -1352,7 +1352,12 @@ func reviewDelegationQuorumSatisfied(delegations []Delegation, children map[stri
 			continue
 		}
 		if payload, ok := childPayloads[d.ID]; ok && payload.Result != nil {
-			if delegationDecisionApproves(effectiveReviewDecision(payload.Result, blockingSeverity)) {
+			decision := strings.TrimSpace(payload.Result.Decision)
+			if strings.EqualFold(strings.TrimSpace(d.Action), "review") ||
+				strings.EqualFold(strings.TrimSpace(child.Type), "review") {
+				decision = effectiveReviewDecision(payload.Result, blockingSeverity)
+			}
+			if delegationDecisionApproves(decision) {
 				approving++
 			}
 			continue
