@@ -149,8 +149,8 @@ func TestEngineReturnsChangesRequestedToRequesterWithoutDefaultAutoFix(t *testin
 		LeadAgent:     "author",
 		Reviewers:     []string{"audit"},
 		ReviewRound:   "review-1",
-		Sender:        "requester",
-		ActingOrgRole: "author",
+		Sender:        "local",
+		ActingOrgRole: "requester",
 	}); err != nil {
 		t.Fatalf("Enqueue returned error: %v", err)
 	}

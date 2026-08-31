@@ -11,6 +11,9 @@ This file is the machine-readable index of the Gitmoot docs — agents should
 start here, then open [`llms-full.txt`](https://gitmoot.io/llms-full.txt) for the
 full expanded context.
 
+Native review verdicts return `changes_requested` to the requester's org role
+by default. Unattended implement fix dispatch is a durable per-PR opt-in.
+
 ## Start Here
 
 - [Introduction](https://gitmoot.io/docs/intro): What Gitmoot is and when to use it.
