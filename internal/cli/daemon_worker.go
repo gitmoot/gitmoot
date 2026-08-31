@@ -350,7 +350,12 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// Stamp the already-resolved decision on the in-memory job agent so every
 	// secondary adapter rebuild consumes the same backend selection.
 	agent.ExecBackend = string(execBackend)
-	applyReadOnlySeat(payload.ReadOnlySeat && !payload.MootSeat, payload.RuntimeConfigDir, &agent)
+	readOnlySeat := payload.ReadOnlySeat && !payload.MootSeat
+	runtimeConfigDir := strings.TrimSpace(payload.RuntimeConfigDir)
+	if readOnlySeat && runtimeConfigDir == "" {
+		runtimeConfigDir = selectedRuntimeConfigDir(agent.Runtime)
+	}
+	applyReadOnlySeat(readOnlySeat, runtimeConfigDir, &agent)
 	preflightRequest := runtime.RuntimeContractRequest{Plan: payload.Plan}
 	if result, checked, preflightErr := w.runtimeContractPreflight(ctx, execBackend, execConfig, agent, preflightRequest); preflightErr != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, preflightErr); finishErr != nil {

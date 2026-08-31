@@ -180,7 +180,7 @@ type localAgentJobOutput struct {
 	AdvanceError string `json:"advance_error,omitempty"`
 }
 
-func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAgentDispatchRequest) (localAgentJobOutput, error) {
+func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAgentDispatchRequest) (output localAgentJobOutput, err error) {
 	// Validate a requested per-job runtime override FIRST — an unknown runtime
 	// (or a shell override without a session command) must fail with a clear
 	// error before any job is enqueued or any repo/agent state is touched.
@@ -606,6 +606,11 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	adapter, err := foregroundAdapterFactory(request.Home, effectiveAgent, checkoutPath)
 	if err != nil {
 		return localAgentJobOutput{}, err
+	}
+	if stateAdapter, ok := adapter.(readOnlyRuntimeAdapter); ok {
+		defer func() {
+			err = errors.Join(err, stateAdapter.cleanup())
+		}()
 	}
 	// Foreground dispatch bypasses the daemon worker, so attach opt-in retained
 	// capture explicitly. Open/composition failures remain fail-open.

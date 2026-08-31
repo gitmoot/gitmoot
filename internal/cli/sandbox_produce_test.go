@@ -12,6 +12,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/sandbox"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
@@ -445,18 +446,22 @@ func TestWorkerReadOnlyRuntimeStateSurvivesMailboxRepair(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(sourceDir, ".credentials.json"), []byte(sourceCredential), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("CLAUDE_CONFIG_DIR", sourceDir)
 	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime,
 		"550e8400-e29b-41d4-a716-446655440002", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: "repair-review", Agent: "reviewer", Action: "review", Repo: "owner/repo",
-		WorktreePath: checkout, ReadOnlySeat: true, RuntimeConfigDir: sourceDir,
+		WorktreePath: checkout, ReadOnlySeat: true,
 	})
 	runner := &repairStateRunner{}
 	worker := defaultJobWorker(store, io.Discard, home)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		return checkout, nil
 	}
-	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+	worker.AdapterFactory = func(agent runtime.Agent, _ string) (workflow.DeliveryAdapter, error) {
+		if agent.RuntimeConfigDir != sourceDir {
+			t.Fatalf("worker runtime config dir = %q, want configured profile %q", agent.RuntimeConfigDir, sourceDir)
+		}
 		return runtime.ClaudeAdapter{Runner: runner}, nil
 	}
 	job, err := store.GetJob(ctx, "repair-review")
@@ -478,6 +483,64 @@ func TestWorkerReadOnlyRuntimeStateSurvivesMailboxRepair(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Dir(runner.stateDir)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("isolated runtime state survived job boundary: %v", err)
+	}
+}
+
+func TestForegroundReviewRuntimeStateSurvivesRepairAndCleansAtBoundary(t *testing.T) {
+	ctx := context.Background()
+	store, home := blockerE2EHome(t)
+	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime,
+		"550e8400-e29b-41d4-a716-446655440002", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "implementer", runtime.ShellRuntime,
+		"true", []string{"implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
+
+	sourceDir := t.TempDir()
+	const sourceCredential = `{"claudeAiOauth":{"accessToken":"host"}}`
+	if err := os.WriteFile(filepath.Join(sourceDir, ".credentials.json"), []byte(sourceCredential), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", sourceDir)
+	head := readonlyWorktreeHead(t, checkout)
+	runner := &repairStateRunner{}
+
+	previousAdapterFactory := localAgentDispatchRuntimeAdapterFor
+	localAgentDispatchRuntimeAdapterFor = func(configHome string, agent runtime.Agent, deliveryCheckout string) (runtime.Adapter, error) {
+		delivery, err := wrapReadOnlySandboxAdapter(configHome, agent, deliveryCheckout, runtime.ClaudeAdapter{Runner: runner})
+		if err != nil {
+			return nil, err
+		}
+		adapter, ok := delivery.(runtime.Adapter)
+		if !ok {
+			return nil, errors.New("foreground read-only adapter does not implement runtime.Adapter")
+		}
+		return adapter, nil
+	}
+	t.Cleanup(func() { localAgentDispatchRuntimeAdapterFor = previousAdapterFactory })
+	previousGitHubFactory := newAgentDispatchGitHubClient
+	newAgentDispatchGitHubClient = func(string) github.Client { return github.NoopClient{} }
+	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
+
+	output, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
+		RepoFlag: "owner/repo", Agent: "reviewer", LeadAgent: "implementer",
+		Action: "review", Instructions: "Review the exact head.", PullRequest: 7,
+		Branch: "main", HeadSHA: head, Home: home,
+	})
+	if err != nil {
+		t.Fatalf("foreground review: %v", err)
+	}
+	if output.Result == nil || output.Result.Decision != "approved" {
+		t.Fatalf("foreground review result = %+v, want approved", output.Result)
+	}
+	if runner.calls != 2 || !runner.repairStateObserved {
+		t.Fatalf("foreground repair calls=%d stateObserved=%v", runner.calls, runner.repairStateObserved)
+	}
+	if data, err := os.ReadFile(filepath.Join(sourceDir, ".credentials.json")); err != nil || string(data) != sourceCredential {
+		t.Fatalf("shared credential changed to %q, err=%v", data, err)
+	}
+	if _, err := os.Stat(filepath.Dir(runner.stateDir)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("foreground isolated runtime state survived job boundary: %v", err)
 	}
 }
 
