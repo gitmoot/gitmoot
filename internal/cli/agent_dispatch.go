@@ -483,6 +483,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		MootSeat:               request.MootSeat,
 		WorktreePath:           readOnlyWorktreePath,
 		ReadOnlyWorktree:       readOnlyWorktreePath != "",
+		ReadOnlySeat:           readOnlyWorktreePath != "" && !request.MootSeat,
 	})
 	if err != nil {
 		// #739: the read-only worktree is created on disk BEFORE Enqueue. If Enqueue

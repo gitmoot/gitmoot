@@ -85,22 +85,14 @@ func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueue
 				return db.Job{}, errors.New("service shell stage requires a detached worktree; managed repo checkout is unavailable")
 			}
 		}
-		// #757 read-only isolation: a repo-bound AGENT stage (ask/review) is born
-		// with its OWN detached committed-tip worktree (the #739 shape) so it keys
-		// worktree:<path> instead of the shared repo:<repo>. Same-repo agent stages
-		// then run CONCURRENTLY and never touch the live checkout. Pipeline stage
-		// jobs are enqueued straight through the mailbox (NOT dispatchLocalAgentJob),
-		// so they do not get the born-isolated #739 worktree that background asks do;
-		// the reactive pool-isolation would only kick in on contention and still
-		// leaves one seat on the live checkout. Allocating here closes that gap. The
-		// The generic read-only allocator is FAIL-OPEN (the #739 lesson): it waits at
-		// most ReadOnlyWorktreeDispatchLockWaitBudget for the checkout mutation lock,
-		// and any failure leaves ask/review requests unchanged (serialized on the shared
-		// checkout) rather than stalling the pipeline scan loop. Produce is the explicit
-		// fail-closed exception below. Shell stages carry a RuntimeOverride and stay
-		// excluded from this agent path; opted-in non-service shell stages use their
-		// own fail-open allocator so the three policies remain independent.
+		// Repo-bound agent stages are born in detached committed-tip worktrees
+		// before enqueue. For ask/review, that worktree is a security boundary:
+		// allocation must fail closed rather than silently run the prompt against
+		// the shared checkout. Produce keeps its separate fail-closed writable
+		// worktree policy. Shell stages carry a RuntimeOverride and use their own
+		// service/non-service allocation policies.
 		isolateShell := !serviceShell && pipelineShellStageReadOnlyWorktreeEligible(request)
+		isolateAgentSeat := !serviceShell && pipelineStageReadOnlySeatEligible(request)
 		if !serviceShell {
 			if isolateShell {
 				request, worktreePath, worktreeErr = allocatePipelineShellStageReadOnlyWorktreeForRunner(ctx, store, home, request, runner)
@@ -125,6 +117,12 @@ func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueue
 				return db.Job{}, fmt.Errorf("allocate PR-bound pipeline review worktree at %s: %w", request.HeadSHA, worktreeErr)
 			}
 			return db.Job{}, fmt.Errorf("allocate PR-bound pipeline review worktree at %s: managed repo checkout is unavailable", request.HeadSHA)
+		}
+		if isolateAgentSeat && strings.TrimSpace(request.WorktreePath) == "" {
+			if worktreeErr != nil {
+				return db.Job{}, fmt.Errorf("allocate read-only pipeline %s worktree: %w", request.Action, worktreeErr)
+			}
+			return db.Job{}, fmt.Errorf("allocate read-only pipeline %s worktree: managed repo checkout is unavailable", request.Action)
 		}
 		// #768: a MUTATING implement stage takes the WRITABLE task-worktree path
 		// instead of the read-only committed-tip worktree — it must commit + push. Unlike
@@ -285,6 +283,18 @@ func pipelineStageReadOnlyWorktreeEligible(request workflow.JobRequest) bool {
 	return strings.TrimSpace(request.WorktreePath) == ""
 }
 
+func pipelineStageReadOnlySeatEligible(request workflow.JobRequest) bool {
+	if !pipelineStageReadOnlyWorktreeEligible(request) {
+		return false
+	}
+	switch strings.TrimSpace(request.Action) {
+	case "ask", "review":
+		return true
+	default:
+		return false
+	}
+}
+
 // pipelineShellStageReadOnlyWorktreeEligible reports whether a non-service shell
 // stage explicitly opted into fail-open committed-tip isolation. Service shell
 // stages are detected before this seam and retain their fail-closed #1011 path.
@@ -366,6 +376,10 @@ func allocatePipelineStageReadOnlyWorktreeForRunner(ctx context.Context, store *
 	}
 	request.WorktreePath = path
 	request.ReadOnlyWorktree = true
+	switch strings.TrimSpace(request.Action) {
+	case "ask", "review":
+		request.ReadOnlySeat = true
+	}
 	// The detached worktree is the committed tip, so it omits gitignored paths
 	// (repos/**) and uncommitted changes; point the read-only stage at the canonical
 	// checkout for those (#654), exactly as the delegation/dispatch paths do.

@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -106,6 +107,51 @@ func (r *sandboxAdapterCaptureRunner) RunEnv(_ context.Context, dir string, env 
 }
 
 func (r *sandboxAdapterCaptureRunner) LookPath(file string) (string, error) { return file, nil }
+
+type repairStateRunner struct {
+	calls               int
+	stateDir            string
+	repairStateObserved bool
+}
+
+func (r *repairStateRunner) Run(context.Context, string, string, ...string) (subprocess.Result, error) {
+	return subprocess.Result{}, errors.New("repair-state runner requires explicit environment")
+}
+
+func (r *repairStateRunner) RunEnv(_ context.Context, _ string, env []string, command string, args ...string) (subprocess.Result, error) {
+	r.calls++
+	stateDir := envValue(env, "CLAUDE_CONFIG_DIR")
+	if stateDir == "" {
+		return subprocess.Result{}, errors.New("missing isolated CLAUDE_CONFIG_DIR")
+	}
+	credential := filepath.Join(stateDir, ".credentials.json")
+	if _, err := os.ReadFile(credential); err != nil {
+		return subprocess.Result{}, err
+	}
+	marker := filepath.Join(stateDir, "repair.marker")
+	switch r.calls {
+	case 1:
+		r.stateDir = stateDir
+		if err := os.WriteFile(marker, []byte("first-delivery"), 0o600); err != nil {
+			return subprocess.Result{}, err
+		}
+		return subprocess.Result{Command: command, Args: args, Stdout: `{"result":"review complete, no json"}`}, nil
+	case 2:
+		if stateDir != r.stateDir {
+			return subprocess.Result{}, errors.New("repair delivery changed isolated state directory")
+		}
+		data, err := os.ReadFile(marker)
+		if err != nil || string(data) != "first-delivery" {
+			return subprocess.Result{}, errors.New("repair delivery lost first-delivery state")
+		}
+		r.repairStateObserved = true
+		return subprocess.Result{Command: command, Args: args, Stdout: `{"result":"{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"clean after repair\",\"findings\":[],\"changes_made\":[],\"tests_run\":[],\"needs\":[],\"delegations\":[]}}"}`}, nil
+	default:
+		return subprocess.Result{}, errors.New("unexpected extra repair delivery")
+	}
+}
+
+func (r *repairStateRunner) LookPath(file string) (string, error) { return file, nil }
 
 func TestWorkerClaudeKimiProduceDispatchWrappedArgv(t *testing.T) {
 	for _, tc := range []struct {
@@ -354,40 +400,84 @@ func TestWrapReadOnlySandboxAdapterKeepsModelGatewayCredentialFree(t *testing.T)
 	}
 }
 
-func TestReadOnlyRuntimeAdapterRemovesStagedState(t *testing.T) {
-	for _, test := range []struct {
-		name      string
-		runnerErr error
-		wantErr   bool
-	}{
-		{name: "success"},
-		{name: "runtime failure", runnerErr: errors.New("runtime failed"), wantErr: true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			stateRoot := filepath.Join(t.TempDir(), "runtime-state")
-			if err := os.MkdirAll(stateRoot, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(stateRoot, "credential"), []byte("secret"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			runner := &sandboxAdapterCaptureRunner{stdout: `{"result":"done"}`, err: test.runnerErr}
-			adapter := readOnlyRuntimeAdapter{
-				Adapter:   runtime.ClaudeAdapter{Runner: runner},
-				stateRoot: stateRoot,
-			}
-			_, err := adapter.Deliver(context.Background(), runtime.Agent{
-				Name: "reviewer", Role: "reviewer", Runtime: runtime.ClaudeRuntime,
-				RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "owner/repo",
-				AutonomyPolicy: runtime.AutonomyPolicyReadOnly,
-			}, runtime.Job{Prompt: "review"})
-			if (err != nil) != test.wantErr {
-				t.Fatalf("Deliver error = %v, wantErr=%v", err, test.wantErr)
-			}
-			if _, err := os.Stat(stateRoot); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("staged runtime state survived delivery: %v", err)
-			}
-		})
+func TestReadOnlyRuntimeStateSurvivesRepairDeliveries(t *testing.T) {
+	stateRoot := filepath.Join(t.TempDir(), "runtime-state")
+	if err := os.MkdirAll(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	credential := filepath.Join(stateRoot, "credential")
+	if err := os.WriteFile(credential, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &sandboxAdapterCaptureRunner{stdout: `{"result":"done"}`}
+	adapter := readOnlyRuntimeAdapter{
+		Adapter:   runtime.ClaudeAdapter{Runner: runner},
+		stateRoot: stateRoot,
+	}
+	agent := runtime.Agent{
+		Name: "reviewer", Role: "reviewer", Runtime: runtime.ClaudeRuntime,
+		RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "owner/repo",
+		AutonomyPolicy: runtime.AutonomyPolicyReadOnly,
+	}
+	for delivery := 1; delivery <= 2; delivery++ {
+		if _, err := adapter.Deliver(context.Background(), agent, runtime.Job{Prompt: "review"}); err != nil {
+			t.Fatalf("delivery %d: %v", delivery, err)
+		}
+		if data, err := os.ReadFile(credential); err != nil || string(data) != "secret" {
+			t.Fatalf("delivery %d lost repair state: data=%q err=%v", delivery, data, err)
+		}
+	}
+	if err := adapter.cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stateRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staged runtime state survived job cleanup: %v", err)
+	}
+}
+
+func TestWorkerReadOnlyRuntimeStateSurvivesMailboxRepair(t *testing.T) {
+	ctx := context.Background()
+	store, home := blockerE2EHome(t)
+	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	sourceDir := t.TempDir()
+	const sourceCredential = `{"claudeAiOauth":{"accessToken":"host"}}`
+	if err := os.WriteFile(filepath.Join(sourceDir, ".credentials.json"), []byte(sourceCredential), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime,
+		"550e8400-e29b-41d4-a716-446655440002", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "repair-review", Agent: "reviewer", Action: "review", Repo: "owner/repo",
+		WorktreePath: checkout, ReadOnlySeat: true, RuntimeConfigDir: sourceDir,
+	})
+	runner := &repairStateRunner{}
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return runtime.ClaudeAdapter{Runner: runner}, nil
+	}
+	job, err := store.GetJob(ctx, "repair-review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.run(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != string(workflow.JobSucceeded) || runner.calls != 2 || !runner.repairStateObserved {
+		t.Fatalf("repair job state=%q calls=%d stateObserved=%v payload=%s", stored.State, runner.calls, runner.repairStateObserved, stored.Payload)
+	}
+	if data, err := os.ReadFile(filepath.Join(sourceDir, ".credentials.json")); err != nil || string(data) != sourceCredential {
+		t.Fatalf("shared credential changed to %q, err=%v", data, err)
+	}
+	if _, err := os.Stat(filepath.Dir(runner.stateDir)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("isolated runtime state survived job boundary: %v", err)
 	}
 }
 
@@ -429,8 +519,14 @@ func TestReadOnlyRuntimeAdapterNeverPersistsStagedCredential(t *testing.T) {
 	if data, err := os.ReadFile(source); err != nil || string(data) != sourceCredential {
 		t.Fatalf("shared credential changed to %q, err=%v", data, err)
 	}
+	if _, err := os.Stat(adapter.stateRoot); err != nil {
+		t.Fatalf("staged runtime state removed before job boundary: %v", err)
+	}
+	if err := adapter.cleanup(); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := os.Stat(adapter.stateRoot); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("staged runtime state survived delivery: %v", err)
+		t.Fatalf("staged runtime state survived job cleanup: %v", err)
 	}
 }
 
@@ -475,16 +571,16 @@ func TestWrapReadOnlySandboxAdapterRejectsOmpWithoutCredentialBroker(t *testing.
 	}
 }
 
-func TestApplyReadOnlySeatRequiresOwnedWorktree(t *testing.T) {
+func TestApplyReadOnlySeatClearsInheritedGrants(t *testing.T) {
 	for _, test := range []struct {
 		name       string
-		readOnly   bool
+		marked     bool
 		wantSeat   bool
 		wantConfig string
 	}{
-		{name: "review worktree", readOnly: true, wantSeat: true, wantConfig: "/profiles/reviewer"},
-		{name: "ask worktree", readOnly: true, wantSeat: true, wantConfig: "/profiles/reviewer"},
-		{name: "shared checkout", readOnly: false},
+		{name: "review seat", marked: true, wantSeat: true, wantConfig: "/profiles/reviewer"},
+		{name: "ask seat", marked: true, wantSeat: true, wantConfig: "/profiles/reviewer"},
+		{name: "ordinary job", marked: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			agent := runtime.Agent{
@@ -492,7 +588,7 @@ func TestApplyReadOnlySeatRequiresOwnedWorktree(t *testing.T) {
 				ReadablePaths: []string{"/host"},
 				ReadableFiles: []string{"/host/secret"},
 			}
-			applyReadOnlySeat(test.readOnly, " /profiles/reviewer ", &agent)
+			applyReadOnlySeat(test.marked, " /profiles/reviewer ", &agent)
 			if agent.ReadOnlySeat != test.wantSeat || agent.RuntimeConfigDir != test.wantConfig {
 				t.Fatalf("read-only marker = %v config = %q, want %v %q", agent.ReadOnlySeat, agent.RuntimeConfigDir, test.wantSeat, test.wantConfig)
 			}

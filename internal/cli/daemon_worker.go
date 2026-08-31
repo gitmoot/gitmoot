@@ -347,7 +347,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// Stamp the already-resolved decision on the in-memory job agent so every
 	// secondary adapter rebuild consumes the same backend selection.
 	agent.ExecBackend = string(execBackend)
-	applyReadOnlySeat(payload.ReadOnlyWorktree && !payload.MootSeat, payload.RuntimeConfigDir, &agent)
+	applyReadOnlySeat(payload.ReadOnlySeat && !payload.MootSeat, payload.RuntimeConfigDir, &agent)
 	preflightRequest := runtime.RuntimeContractRequest{Plan: payload.Plan}
 	if result, checked, preflightErr := w.runtimeContractPreflight(ctx, execBackend, agent, preflightRequest); preflightErr != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, preflightErr); finishErr != nil {
@@ -684,6 +684,18 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
 	}
+	var readOnlyState *readOnlyRuntimeAdapter
+	readOnlyStateCleaned := false
+	if stateAdapter, ok := adapter.(readOnlyRuntimeAdapter); ok {
+		readOnlyState = &stateAdapter
+		defer func() {
+			if !readOnlyStateCleaned {
+				if cleanupErr := readOnlyState.cleanup(); cleanupErr != nil {
+					writeLine(w.Stdout, "job %s read-only runtime state cleanup failed: %v", job.ID, cleanupErr)
+				}
+			}
+		}()
+	}
 	if execBackend == execbackend.Local && len(toolCacheEnv) > 0 {
 		if envAdapter, envErr := injectDeliveryAdapterEnv(adapter, toolCacheEnv); envErr != nil {
 			writeLine(w.Stdout, "job %s tool cache env inject failed: %v", job.ID, envErr)
@@ -889,6 +901,10 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	_, err = engine.RunJob(runCtx, job.ID, agent, adapter)
 	stopKillPending()
 	stopProgress()
+	if readOnlyState != nil {
+		err = errors.Join(err, readOnlyState.cleanup())
+		readOnlyStateCleaned = true
+	}
 	if err != nil {
 		if quotaErr := w.quotaRoleUnavailableHooks().recordRuntimeOutcome(ctx, job, payload, agent, err, time.Now().UTC()); quotaErr != nil {
 			writeLine(w.Stdout, "job %s org-role quota unavailability capture failed: %v", job.ID, quotaErr)
@@ -1359,16 +1375,21 @@ func (a readOnlyRuntimeAdapter) PermissionPolicyApplication(agent runtime.Agent)
 }
 
 func (a readOnlyRuntimeAdapter) Deliver(ctx context.Context, agent runtime.Agent, job runtime.Job) (runtime.Result, error) {
-	result, deliverErr := a.Adapter.Deliver(ctx, agent, job)
-	// The prompt can rewrite every file under stateRoot. Never synchronize that
-	// untrusted state back to the shared runtime profile; refreshes are job-local.
-	var cleanupErr error
-	if a.stateRoot != "" {
-		if err := os.RemoveAll(a.stateRoot); err != nil {
-			cleanupErr = fmt.Errorf("remove read-only seat runtime state: %w", err)
-		}
+	// Mailbox repair turns reuse this adapter. Keep its isolated credentials and
+	// session state until RunJob returns; the worker owns job-boundary cleanup.
+	return a.Adapter.Deliver(ctx, agent, job)
+}
+
+func (a readOnlyRuntimeAdapter) cleanup() error {
+	// The prompt can rewrite every file under stateRoot. Delete it, but never
+	// synchronize that untrusted state back to the shared runtime profile.
+	if a.stateRoot == "" {
+		return nil
 	}
-	return result, errors.Join(deliverErr, cleanupErr)
+	if err := os.RemoveAll(a.stateRoot); err != nil {
+		return fmt.Errorf("remove read-only seat runtime state: %w", err)
+	}
+	return nil
 }
 
 func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout string, adapter workflow.DeliveryAdapter) (workflow.DeliveryAdapter, error) {
@@ -1454,8 +1475,8 @@ func wrapReadOnlyAdapterRunner(runtimeName string, adapter workflow.DeliveryAdap
 	}
 }
 
-func applyReadOnlySeat(readOnlyWorktree bool, configDir string, agent *runtime.Agent) {
-	if agent == nil || !readOnlyWorktree {
+func applyReadOnlySeat(readOnlySeat bool, configDir string, agent *runtime.Agent) {
+	if agent == nil || !readOnlySeat {
 		return
 	}
 	agent.ReadOnlySeat = true

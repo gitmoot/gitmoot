@@ -790,6 +790,10 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 				return err
 			}
 			request.WorktreePath = path
+			switch strings.TrimSpace(request.Action) {
+			case "ask", "review":
+				request.ReadOnlySeat = true
+			}
 			// The detached worktree is created at the parent base-branch tip, which
 			// may have advanced past the inherited HeadSHA. Clear it so the child
 			// validates against its own fresh worktree HEAD (see isDelegationWorktreeChild).

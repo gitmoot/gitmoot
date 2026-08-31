@@ -83,6 +83,9 @@ func TestDispatchBackgroundAskAllocatesReadOnlyWorktree(t *testing.T) {
 	if !payload.ReadOnlyWorktree {
 		t.Fatal("background ask payload ReadOnlyWorktree = false, want true (disposal marker for a top-level read-only worktree)")
 	}
+	if !payload.ReadOnlySeat {
+		t.Fatal("background ask payload ReadOnlySeat = false, want hard runtime isolation")
+	}
 	if payload.RuntimeConfigDir != configDir {
 		t.Fatalf("background ask RuntimeConfigDir = %q, want dispatch profile %q", payload.RuntimeConfigDir, configDir)
 	}
@@ -166,8 +169,8 @@ func TestDispatchReviewAllocatesDistinctExactHeadWorktrees(t *testing.T) {
 		{name: "first", payload: first, head: firstHead},
 		{name: "second", payload: second, head: secondHead},
 	} {
-		if !got.payload.ReadOnlyWorktree || strings.TrimSpace(got.payload.WorktreePath) == "" {
-			t.Fatalf("%s payload lacks owned read-only worktree: %+v", got.name, got.payload)
+		if !got.payload.ReadOnlyWorktree || !got.payload.ReadOnlySeat || strings.TrimSpace(got.payload.WorktreePath) == "" {
+			t.Fatalf("%s payload lacks owned worktree or read-only seat marker: %+v", got.name, got.payload)
 		}
 		if got.payload.HeadSHA != got.head {
 			t.Fatalf("%s payload HeadSHA=%q, want preserved %q", got.name, got.payload.HeadSHA, got.head)
@@ -275,8 +278,8 @@ func TestDispatchTaskBearingAskDoesNotAllocateReviewWorktree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if payload.ReadOnlyWorktree || payload.WorktreePath != "" {
-		t.Fatalf("task-bearing ask unexpectedly allocated per-job worktree: %+v", payload)
+	if payload.ReadOnlyWorktree || payload.ReadOnlySeat || payload.WorktreePath != "" {
+		t.Fatalf("task-bearing ask unexpectedly allocated or marked a per-job read-only seat: %+v", payload)
 	}
 	wantPath, err := normalizeTaskWorktreePath(checkout)
 	if err != nil {

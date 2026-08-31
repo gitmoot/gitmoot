@@ -246,14 +246,16 @@ type JobRequest struct {
 	SynthesisRule         string
 	DelegationArtifactDir string
 	WorktreePath          string
-	// ReadOnlyWorktree marks a job whose WorktreePath is a throwaway detached
-	// committed-tip worktree allocated for read-only (ask) isolation at DISPATCH
-	// time (#739) — as opposed to a delegation child's fan-out worktree (which
-	// carries a DelegationID) or an implement/task worktree (which carries a
-	// Branch). It is the explicit signal the terminal cleanup uses to dispose a
-	// TOP-LEVEL read-only worktree that has no DelegationID. Additive/omitempty:
-	// false leaves the enqueued payload byte-identical.
+	// ReadOnlyWorktree is the historical disposal marker for a top-level
+	// throwaway detached worktree with no DelegationID. Terminal cleanup owns it.
+	// It says nothing about runtime writability: produce and service-shell stages
+	// also use disposable worktrees. ReadOnlySeat carries the security policy.
+	// Additive/omitempty: false leaves legacy requests byte-identical.
 	ReadOnlyWorktree bool
+	// ReadOnlySeat marks an untrusted ask/review runtime that requires the hard
+	// filesystem sandbox and isolated runtime profile. It is independent of
+	// ReadOnlyWorktree, which owns only disposable-worktree lifecycle.
+	ReadOnlySeat bool
 	// FixWorktree marks an engine-dispatched review fix whose WorktreePath is an
 	// independent writable clone checked out on Branch. It is distinct from both
 	// detached read-only worktrees and linked delegation worktrees because its
@@ -416,13 +418,16 @@ type JobPayload struct {
 	RuntimePID          int    `json:"runtime_pid,omitempty"`
 	RuntimePIDStartTime string `json:"runtime_pid_start_time,omitempty"`
 	RuntimePGID         int    `json:"runtime_pgid,omitempty"`
-	// ReadOnlyWorktree marks a top-level read-only (ask) worktree allocated at
-	// dispatch time (#739): its WorktreePath is a throwaway detached committed-tip
-	// worktree with no DelegationID and no Branch. Additive/omitempty so a payload
-	// without it serializes byte-identically. The terminal cleanup keys off it to
-	// dispose top-level read-only worktrees that the DelegationID-gated read-only
-	// delegation cleanup would otherwise orphan.
+	// ReadOnlyWorktree is the historical terminal-cleanup marker for a top-level
+	// throwaway detached worktree with no DelegationID. It may be writable; runtime
+	// security must consume ReadOnlySeat instead. Additive/omitempty preserves
+	// legacy payloads.
 	ReadOnlyWorktree bool `json:"read_only_worktree,omitempty"`
+	// ReadOnlySeat selects the hard runtime sandbox and isolated provider state
+	// for untrusted ask/review delivery. It is deliberately separate from the
+	// disposable-worktree cleanup marker above: produce and service-shell jobs
+	// may own throwaway writable worktrees without being read-only runtime seats.
+	ReadOnlySeat bool `json:"read_only_seat,omitempty"`
 	// FixWorktree marks a per-job writable clone allocated for a review fix round.
 	// The clone owns its git directory, is attached to Branch, and is reclaimed by
 	// the delegation-worktree TTL machinery without deleting that real branch.
@@ -675,6 +680,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		DelegationArtifactDir:  request.DelegationArtifactDir,
 		WorktreePath:           request.WorktreePath,
 		ReadOnlyWorktree:       request.ReadOnlyWorktree,
+		ReadOnlySeat:           request.ReadOnlySeat,
 		FixWorktree:            request.FixWorktree,
 		TemplateID:             snapshot.ID,
 		TemplateResolvedCommit: snapshot.ResolvedCommit,
