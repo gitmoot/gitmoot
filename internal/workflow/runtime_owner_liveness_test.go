@@ -149,13 +149,12 @@ func TestWorktreeLivenessBooleanSeamIsAuthoritative(t *testing.T) {
 			}
 		})
 	}
-	if _, known := (Engine{}).worktreeLiveness(worktree); known != mustHostLivenessKnown(t, worktree) {
-		t.Fatal("unwired engine did not fall through to the strict host scan")
+	// Compare against the STRICT scan, which is what the unwired engine calls.
+	// The exported WorktreeLiveness is the best-effort variant and reports
+	// known=true where the strict scan reports inconclusive, so comparing against
+	// it tests two different functions and fails on any host where they disagree.
+	wantLive, wantKnown := strictWorktreeLiveness(worktree)
+	if live, known := (Engine{}).worktreeLiveness(worktree); live != wantLive || known != wantKnown {
+		t.Fatalf("unwired engine = (%v, %v), want the strict scan's (%v, %v)", live, known, wantLive, wantKnown)
 	}
-}
-
-func mustHostLivenessKnown(t *testing.T, path string) bool {
-	t.Helper()
-	_, known := WorktreeLiveness(path)
-	return known
 }
