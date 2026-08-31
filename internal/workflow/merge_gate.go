@@ -908,7 +908,23 @@ func reviewJobSupersedes(leftJob db.Job, leftPayload JobPayload, rightJob db.Job
 	leftRound := reviewRoundKeyForJob(leftJob, leftPayload)
 	rightRound := reviewRoundKeyForJob(rightJob, rightPayload)
 	if (leftRound.name != "") != (rightRound.name != "") {
-		return false
+		// The two rows come from different dispatch paths and their rounds cannot be
+		// ordered against each other: the engine always stamps review-N, while
+		// `gitmoot agent review <reviewer> --repo <o/r> --pr <N> --head-sha <H>`
+		// creates a row with the head set and NO round. Ranking them would let one
+		// path hide the other's live or blocking evidence, so a real verdict may
+		// resolve only a row that has already settled WITHOUT one -- no result at
+		// all, or a decision that is not a verdict (for example "skipped").
+		//
+		// That single exception is load-bearing: such a row is a settled non-answer,
+		// so nothing is hidden by resolving it, and it is otherwise inescapable.
+		// `gitmoot job retry` and `gitmoot job cancel` both refuse a succeeded job,
+		// and re-polling the same head dispatches nothing because the round already
+		// has a job, so the CLI re-review this gate's own error message asks for is
+		// the only exit. Queued, running, failed and cancelled rows keep blocking:
+		// their exits are settlement and `gitmoot job retry`, which mutate the row
+		// itself rather than adding a second one.
+		return isSettledNonVerdictReview(rightJob, rightPayload) && reviewJobRecordedAfter(leftJob, rightJob)
 	}
 	if reviewRoundKeyAfter(leftRound, rightRound) {
 		return true
@@ -917,6 +933,20 @@ func reviewJobSupersedes(leftJob db.Job, leftPayload JobPayload, rightJob db.Job
 		return false
 	}
 	return reviewJobRecordedAfter(leftJob, rightJob)
+}
+
+// isSettledNonVerdictReview reports whether a review row has reached a terminal
+// state carrying no verdict: succeeded with no result, or with a decision the
+// gate does not recognize as one. Such a row can never become a verdict on its
+// own, and its state alone proves no reviewer work is still in flight.
+func isSettledNonVerdictReview(job db.Job, payload JobPayload) bool {
+	if JobState(job.State) != JobSucceeded {
+		return false
+	}
+	if payload.Result == nil {
+		return true
+	}
+	return !isReviewReplacementDecision(payload.Result.Decision)
 }
 
 // isRoundHistoryDuplicate reports whether a delegated review row is a SUB-REVIEW

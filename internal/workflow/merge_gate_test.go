@@ -2741,6 +2741,12 @@ func TestPolicyMergeGateLatestCrashOverridesStaleApproval(t *testing.T) {
 	}
 }
 
+// TestPolicyMergeGateRequeueClearsCrashedReviewerPark pins the PRODUCTION requeue
+// shape. `gitmoot job retry` transitions the SAME row in place and preserves its
+// id, head and round, so a requeue is one row whose state changes -- never a
+// second row sharing the first's explicit round, which no dispatch path can
+// create. Pinning the two-row shape hid a regression that refused every
+// cross-round supersession.
 func TestPolicyMergeGateRequeueClearsCrashedReviewerPark(t *testing.T) {
 	store, gh, gate, request := newMergeGateQuorumScenario(t)
 	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
@@ -2764,10 +2770,9 @@ func TestPolicyMergeGateRequeueClearsCrashedReviewerPark(t *testing.T) {
 		t.Fatalf("first decision reason = %q, want crashed reviewer and job", parked.Reason)
 	}
 
-	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
-		id: "review-requeued-approved", agent: "reviewer-b", hasResult: true, decision: "approved",
-		recorded: "2026-07-31 12:02:00",
-	})
+	settleMergeGateReviewInPlace(t, store, "review-crashed", JobSucceeded,
+		&AgentResult{Decision: "approved", Summary: "requeued verdict"}, "2026-07-31 12:02:00")
+
 	merged, err := gate.Evaluate(context.Background(), request)
 	if err != nil {
 		t.Fatalf("second Evaluate returned error: %v", err)
@@ -2777,6 +2782,118 @@ func TestPolicyMergeGateRequeueClearsCrashedReviewerPark(t *testing.T) {
 	}
 	if len(gh.merges) != 1 {
 		t.Fatalf("merge calls = %+v, want one after requeue approval", gh.merges)
+	}
+}
+
+// TestPolicyMergeGateCLIReviewResolvesOnlySettledNonVerdictEngineRound pins the
+// exception that makes the mixed-round refusal survivable. The engine always
+// stamps review-N; `gitmoot agent review <reviewer> --repo gitmoot/gitmoot
+// --pr <N> --head-sha <H>` creates a second row with the head set and NO round.
+// A later CLI verdict may resolve an engine round that SETTLED WITHOUT a verdict
+// -- no result, or a decision like "skipped" -- because that row is inescapable
+// otherwise: `gitmoot job retry` and `gitmoot job cancel` both refuse a succeeded
+// job and a re-poll of the same head dispatches nothing. It must NOT resolve a
+// live, crashed or blocking row: those exits mutate the row itself.
+func TestPolicyMergeGateCLIReviewResolvesOnlySettledNonVerdictEngineRound(t *testing.T) {
+	const engineJobID = "review-audit-task-9-review-1"
+	const cliJobID = "local-review-audit-18d0f3d229cc7aa3"
+	for _, tc := range []struct {
+		name        string
+		state       JobState
+		hasResult   bool
+		decision    string
+		cliRecorded string
+		wantMerged  bool
+		wantPending bool
+		wantReason  string
+	}{
+		{
+			name: "unrecognized decision is resolved", hasResult: true, decision: "skipped",
+			cliRecorded: "2026-07-31 12:02:00", wantMerged: true,
+		},
+		{
+			name:        "missing result is resolved",
+			cliRecorded: "2026-07-31 12:02:00", wantMerged: true,
+		},
+		{
+			name: "unrecognized decision parks without a cli review", hasResult: true, decision: "skipped",
+			wantReason: `unrecognized decision "skipped"`,
+		},
+		{
+			name:       "missing result parks without a cli review",
+			wantReason: "abstaining reviewer audit",
+		},
+		{
+			name: "earlier cli review does not resolve", hasResult: true, decision: "skipped",
+			cliRecorded: "2026-07-31 12:00:00", wantReason: `unrecognized decision "skipped"`,
+		},
+		{
+			name: "crashed row keeps blocking", state: JobFailed,
+			cliRecorded: "2026-07-31 12:02:00", wantReason: "crashed reviewer audit",
+		},
+		{
+			name: "cancelled row keeps blocking", state: JobCancelled,
+			cliRecorded: "2026-07-31 12:02:00", wantReason: "crashed reviewer audit",
+		},
+		{
+			name: "queued row keeps waiting", state: JobQueued,
+			cliRecorded: "2026-07-31 12:02:00", wantPending: true, wantReason: "waiting for reviewer audit",
+		},
+		{
+			name: "running row keeps waiting", state: JobRunning,
+			cliRecorded: "2026-07-31 12:02:00", wantPending: true, wantReason: "waiting for reviewer audit",
+		},
+		{
+			name: "blocking verdict is not a non-verdict", hasResult: true, decision: "changes_requested",
+			cliRecorded: "2026-07-31 12:02:00", wantReason: "blocking result from audit",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, gh, gate, request := newMergeGateQuorumScenario(t)
+			state := tc.state
+			if state == "" {
+				state = JobSucceeded
+			}
+			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+				id: engineJobID, agent: "audit", state: state,
+				hasResult: tc.hasResult, decision: tc.decision,
+				recorded: "2026-07-31 12:01:00",
+			})
+			if tc.cliRecorded != "" {
+				insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+					id: cliJobID, agent: "audit", hasResult: true, decision: "approved",
+					recorded: tc.cliRecorded, emptyRound: true,
+				})
+			}
+
+			decision, err := gate.Evaluate(context.Background(), request)
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			switch {
+			case tc.wantMerged:
+				if !decision.Merged {
+					t.Fatalf("decision = %+v, want cli verdict to resolve the settled non-verdict round", decision)
+				}
+				if len(gh.merges) != 1 {
+					t.Fatalf("merge calls = %+v, want one", gh.merges)
+				}
+			case tc.wantPending:
+				if decision.Merged || decision.Reason.IsGateMiss() {
+					t.Fatalf("decision = %+v, want live reviewer slot to wait without escalating", decision)
+				}
+			default:
+				if decision.Merged || !decision.LeaveOpen || !decision.Reason.IsGateMiss() {
+					t.Fatalf("decision = %+v, want the engine round to keep holding the merge", decision)
+				}
+			}
+			if !strings.Contains(decision.Reason.Render(), tc.wantReason) {
+				t.Fatalf("decision reason = %q, want %q", decision.Reason, tc.wantReason)
+			}
+			if !tc.wantMerged && len(gh.merges) != 0 {
+				t.Fatalf("merge calls = %+v, want none", gh.merges)
+			}
+		})
 	}
 }
 
@@ -3894,4 +4011,32 @@ func setMergeGateJobTimestamps(t *testing.T, store *db.Store, jobID string, time
 	if err != nil || affected != 1 {
 		t.Fatalf("set job %s timestamps affected=%d, err=%v; want 1", jobID, affected, err)
 	}
+}
+
+// settleMergeGateReviewInPlace mirrors `gitmoot job retry` settling a review row:
+// the SAME row transitions to a terminal state carrying a result, keeping its id,
+// head and round. No production path adds a second row for the same round.
+func settleMergeGateReviewInPlace(t *testing.T, store *db.Store, jobID string, state JobState, result *AgentResult, recorded string) {
+	t.Helper()
+	ctx := context.Background()
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob(%s) returned error: %v", jobID, err)
+	}
+	payload, err := unmarshalPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(%s) returned error: %v", jobID, err)
+	}
+	payload.Result = result
+	encoded, err := marshalPayload(payload)
+	if err != nil {
+		t.Fatalf("marshalPayload(%s) returned error: %v", jobID, err)
+	}
+	if err := store.UpdateJobPayload(ctx, jobID, encoded); err != nil {
+		t.Fatalf("UpdateJobPayload(%s) returned error: %v", jobID, err)
+	}
+	if err := store.UpdateJobState(ctx, jobID, string(state)); err != nil {
+		t.Fatalf("UpdateJobState(%s) returned error: %v", jobID, err)
+	}
+	setMergeGateJobTimestamps(t, store, jobID, recorded)
 }
