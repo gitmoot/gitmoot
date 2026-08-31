@@ -1863,6 +1863,36 @@ func TestEngineReclaimAgedFixCloneRefusesLeftoverQuarantine(t *testing.T) {
 	}
 }
 
+// A managed path may contain glob metacharacters (a home or repo directory named
+// with brackets). Discovery must not silently return "no quarantine" there: every
+// caller reads that as a completed removal.
+func TestFixCloneQuarantinesFindsPathsWithGlobMetacharacters(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "home[a]", "worktrees", "owner--repo", "fixes")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		t.Fatalf("MkdirAll parent: %v", err)
+	}
+	path := filepath.Join(parent, "job-1")
+	quarantine := path + fixCloneQuarantinePrefix + "0123456789abcdef"
+	if err := os.MkdirAll(quarantine, 0o755); err != nil {
+		t.Fatalf("MkdirAll quarantine: %v", err)
+	}
+	// A sibling clone must not be mistaken for this clone's quarantine.
+	if err := os.MkdirAll(filepath.Join(parent, "job-2"+fixCloneQuarantinePrefix+"ff"), 0o755); err != nil {
+		t.Fatalf("MkdirAll sibling quarantine: %v", err)
+	}
+	quarantines, err := FixCloneQuarantines(path)
+	if err != nil {
+		t.Fatalf("FixCloneQuarantines: %v", err)
+	}
+	if len(quarantines) != 1 || quarantines[0] != quarantine {
+		t.Fatalf("quarantines = %v, want [%s]", quarantines, quarantine)
+	}
+	if found, err := FixCloneQuarantines(filepath.Join(parent, "job-3")); err != nil || len(found) != 0 {
+		t.Fatalf("quarantines for an untouched clone = %v (err %v), want none", found, err)
+	}
+}
+
 // The ordinary (non-TTL) fix-clone cleanup runs on every terminal advance and on
 // the skipped-cleanup pass, so it must make the same inference as the TTL pass:
 // an absent path is not a completed removal while a quarantine of it survives.

@@ -1204,15 +1204,17 @@ func (e Engine) cleanupFixWorktree(ctx context.Context, jobID string, jobType st
 	// interrupted-removal quarantine of this clone survives. The TTL pass renames
 	// the clone aside before deleting it, so "path absent, clone alive" is a real
 	// state and marking the obligation removed here would retire the candidate
-	// before the TTL pass can restore it.
-	quarantines, quarantineErr := FixCloneQuarantines(path)
-	if quarantineErr != nil {
-		if persistErr := e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", quarantineErr); persistErr != nil {
-			return errors.Join(quarantineErr, persistErr)
-		}
-		return fmt.Errorf("inspect fix clone quarantines beside %s: %w", path, quarantineErr)
-	}
+	// before the TTL pass can restore it. Absence is stat'd BEFORE the quarantine
+	// scan: a rename needs the path to exist, so a path already seen absent cannot
+	// acquire a quarantine afterwards.
 	if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
+		quarantines, quarantineErr := FixCloneQuarantines(path)
+		if quarantineErr != nil {
+			if persistErr := e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", quarantineErr); persistErr != nil {
+				return errors.Join(quarantineErr, persistErr)
+			}
+			return fmt.Errorf("inspect fix clone quarantines beside %s: %w", path, quarantineErr)
+		}
 		if len(quarantines) > 0 {
 			if err := e.deferDelegationCleanupObligation(opCtx, jobID, path, db.CleanupReasonTerminalDeferred); err != nil {
 				return err
@@ -1676,19 +1678,39 @@ func (e Engine) completeAgedTerminalFixWorktreeReclaim(ctx context.Context, jobI
 //
 // The suffix carries RANDOM bytes because the quarantine path is documented: a
 // predictable name is a name a process can open between the final proof and the
-// removal. Callers therefore discover quarantines by globbing this prefix rather
-// than reconstructing one name.
+// removal. Callers therefore discover quarantines by this prefix rather than
+// reconstructing one name.
 const fixCloneQuarantinePrefix = ".ttl-reclaiming-"
 
 // FixCloneQuarantines lists the interrupted-removal siblings of a fix clone. The
-// daemon needs this too: an absent clone path is only evidence of a completed
-// removal when no quarantine of it survives.
+// daemon and doctor need this too: an absent clone path is only evidence of a
+// completed removal when no quarantine of it survives.
+//
+// The parent directory is READ rather than globbed, because a managed path may
+// legitimately contain glob metacharacters (a repo or home directory named with
+// brackets), and a pattern that silently matches nothing would be read as "no
+// quarantine" by callers that then delete.
 func FixCloneQuarantines(path string) ([]string, error) {
-	path = strings.TrimSpace(path)
-	if path == "" {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if path == "" || path == "." {
 		return nil, nil
 	}
-	return filepath.Glob(filepath.Clean(path) + fixCloneQuarantinePrefix + "*")
+	parent, base := filepath.Dir(path), filepath.Base(path)
+	entries, err := os.ReadDir(parent)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	prefix := base + fixCloneQuarantinePrefix
+	var quarantines []string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), prefix) {
+			quarantines = append(quarantines, filepath.Join(parent, entry.Name()))
+		}
+	}
+	return quarantines, nil
 }
 
 func newFixCloneQuarantinePath(path string) (string, error) {
@@ -1722,18 +1744,18 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 	if err != nil || filepath.Clean(path) != filepath.Clean(expected) {
 		return false, fmt.Errorf("refusing TTL reclaim for unmanaged fix worktree %s", path)
 	}
-	// The quarantine is inspected BEFORE the absent-path completion, because a
-	// crash between the rename and the removal produces exactly that state: an
-	// absent path beside a quarantined clone. Completing the reclaim there would
-	// record the removal, retire the candidate, and leave the clone on disk with
-	// nothing left to find it.
-	quarantines, err := FixCloneQuarantines(path)
-	if err != nil {
-		return false, fmt.Errorf("inspect fix clone quarantines beside %s: %w", path, err)
-	}
+	// Absence is observed FIRST, then the quarantines. That order is what makes the
+	// inference sound against a concurrent pass: a rename requires the path to
+	// exist, so a path already seen absent cannot acquire a quarantine afterwards,
+	// while the reverse order lets a rename slip between the scan and the stat and
+	// makes this pass record a completed removal for a clone that is still alive.
 	present, err := pathPresent(path)
 	if err != nil {
 		return false, fmt.Errorf("inspect aged terminal fix worktree %s: %w", path, err)
+	}
+	quarantines, err := FixCloneQuarantines(path)
+	if err != nil {
+		return false, fmt.Errorf("inspect fix clone quarantines beside %s: %w", path, err)
 	}
 	switch {
 	case len(quarantines) > 1:
@@ -1795,7 +1817,9 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 	if unpublished != "" {
 		return false, e.retainFixCloneWithUnpublishedCommits(ctx, jobID, path, unpublished)
 	}
-	if live, known := e.worktreeLiveness(path); !known || live {
+	if live, known := e.worktreeLiveness(path); !known {
+		return false, e.recordFixCloneLivenessUnknown(ctx, jobID, path)
+	} else if live {
 		return false, nil
 	}
 	quarantine, err := newFixCloneQuarantinePath(path)
@@ -1814,7 +1838,12 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 		}
 		return false, reason
 	}
-	if live, known := e.worktreeLiveness(quarantine); !known || live {
+	if live, known := e.worktreeLiveness(quarantine); !known {
+		if _, restoreErr := restore(nil); restoreErr != nil {
+			return false, restoreErr
+		}
+		return false, e.recordFixCloneLivenessUnknown(ctx, jobID, path)
+	} else if live {
 		return restore(nil)
 	}
 	clean, err = manager.WorktreePristineAt(ctx, quarantine)

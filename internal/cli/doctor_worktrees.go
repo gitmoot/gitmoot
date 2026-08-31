@@ -43,10 +43,12 @@ const (
 	worktreeUnproven
 )
 
-// inspectDelegationWorktreeUsage accounts only for per-delegation/read-only
-// worktrees under <home>/worktrees. Ordinary task worktrees are excluded. It
-// combines recorded job ownership with an exact-depth directory scan so a
-// crash-before-enqueue orphan is still visible as unproven, never reclaimed.
+// inspectDelegationWorktreeUsage accounts for per-delegation/read-only worktrees
+// under <home>/worktrees, plus the interrupted-removal quarantine siblings of fix
+// clones — a quarantine is unowned garbage on disk that no other surface reports.
+// Ordinary task worktrees are excluded. It combines recorded job ownership with an
+// exact-depth directory scan so a crash-before-enqueue orphan is still visible as
+// unproven, never reclaimed.
 func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, store *db.Store, now time.Time, ttl time.Duration) (delegationWorktreeUsage, error) {
 	root := filepath.Join(paths.Home, "worktrees")
 	usage := delegationWorktreeUsage{Root: root}
@@ -60,12 +62,14 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 	}
 
 	owned := map[string]delegationWorktreeClass{}
+	fixClones := map[string]delegationWorktreeClass{}
 	for _, job := range jobs {
 		payload, err := workflow.ParseJobPayload(job.Payload)
 		if err != nil || strings.TrimSpace(payload.WorktreePath) == "" {
 			continue
 		}
-		if strings.TrimSpace(payload.DelegationID) == "" && !payload.ReadOnlyWorktree {
+		fixClone := payload.FixWorktree
+		if strings.TrimSpace(payload.DelegationID) == "" && !payload.ReadOnlyWorktree && !fixClone {
 			continue // ordinary task/shared-checkout payload
 		}
 		path, ok := worktreePathUnderRoot(root, payload.WorktreePath)
@@ -87,25 +91,29 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 				class = worktreeRecentTerminal
 			}
 		}
+		// A fix clone's own directory stays out of this metric — it is the engine's
+		// managed clone, not a delegation worktree — but its interrupted-removal
+		// quarantine siblings are counted below, because nothing else reports them.
+		target := owned
+		if fixClone && strings.TrimSpace(payload.DelegationID) == "" && !payload.ReadOnlyWorktree {
+			target = fixClones
+		}
 		// A path referenced by multiple rows is pinned if ANY owner is resumable;
 		// safety wins over an older terminal record for the same deterministic path.
-		if prior, exists := owned[path]; !exists || worktreeClassPriority(class) > worktreeClassPriority(prior) {
-			owned[path] = class
+		if prior, exists := target[path]; !exists || worktreeClassPriority(class) > worktreeClassPriority(prior) {
+			target[path] = class
 		}
 	}
 
 	pathsOnDisk := map[string]struct{}{}
 	quarantineClasses := map[string]delegationWorktreeClass{}
-	for path, class := range owned {
-		if info, err := os.Stat(path); err == nil && info.IsDir() {
-			pathsOnDisk[path] = struct{}{}
-		}
-		// A fix clone mid-removal lives at a quarantine sibling, not at the
-		// recorded path. Counting only recorded paths hides exactly the directory
-		// an interrupted removal leaves behind.
+	scanQuarantines := func(path string, class delegationWorktreeClass) {
+		// A fix clone mid-removal lives at a quarantine sibling, not at the recorded
+		// path. Counting only recorded paths hides exactly the directory an
+		// interrupted removal leaves behind.
 		quarantines, err := workflow.FixCloneQuarantines(path)
 		if err != nil {
-			continue
+			return
 		}
 		for _, quarantine := range quarantines {
 			if info, err := os.Stat(quarantine); err == nil && info.IsDir() {
@@ -113,6 +121,15 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 				quarantineClasses[quarantine] = class
 			}
 		}
+	}
+	for path, class := range owned {
+		if info, err := os.Stat(path); err == nil && info.IsDir() {
+			pathsOnDisk[path] = struct{}{}
+		}
+		scanQuarantines(path, class)
+	}
+	for path, class := range fixClones {
+		scanQuarantines(path, class)
 	}
 	for quarantine, class := range quarantineClasses {
 		if _, classified := owned[quarantine]; !classified {

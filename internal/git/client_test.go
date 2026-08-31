@@ -672,6 +672,38 @@ func TestClientCloneOnlyCommitIgnoresCloneLocalAncestryRewrites(t *testing.T) {
 	}
 }
 
+// Git reads grafts from the COMMON directory, so a linked worktree's own admin
+// directory is the wrong place to look: probing it would miss an active graft and
+// let rewritten ancestry hide an unpublished commit.
+func TestClientCloneOnlyCommitDetectsCommonDirGrafts(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	ctx := context.Background()
+	root := t.TempDir()
+	main := filepath.Join(root, "main")
+	linked := filepath.Join(root, "linked")
+	runGit(t, root, "init", "-q", main)
+	runGit(t, main, "config", "user.email", "gitmoot@example.com")
+	runGit(t, main, "config", "user.name", "Gitmoot")
+	runGit(t, main, "commit", "--allow-empty", "-m", "base")
+	runGit(t, main, "worktree", "add", linked, "-b", "linked")
+	infoDir := filepath.Join(main, ".git", "info")
+	if err := os.MkdirAll(infoDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll info: %v", err)
+	}
+	head, err := NewHostClient(main).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("HeadSHA: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(infoDir, "grafts"), []byte(head+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile grafts: %v", err)
+	}
+	if _, err := NewHostClient(main).CloneOnlyCommit(ctx, linked); err == nil || !strings.Contains(err.Error(), "grafts file") {
+		t.Fatalf("CloneOnlyCommit on a linked worktree = %v, want a refusal naming the common-directory grafts file", err)
+	}
+}
+
 func TestClientCloneOnlyCommitDistrustsCloneOrigin(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")

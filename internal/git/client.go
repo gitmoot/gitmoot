@@ -662,7 +662,7 @@ func (c Client) CloneOnlyCommit(ctx context.Context, path string) (string, error
 	if err != nil {
 		return "", err
 	}
-	graftFile, grafted, err := cloneGraftFile(path)
+	graftFile, grafted, err := cloneGraftFile(ctx, NewClient(path, c.runner), path)
 	if err != nil {
 		return "", err
 	}
@@ -687,21 +687,21 @@ func (c Client) CloneOnlyCommit(ctx context.Context, path string) (string, error
 }
 
 // cloneGraftFile locates a clone's deprecated grafts file and reports whether it
-// holds any content.
-func cloneGraftFile(path string) (string, bool, error) {
-	gitDir := filepath.Join(path, ".git")
-	info, err := os.Stat(gitDir)
-	switch {
-	case err == nil && !info.IsDir():
-		resolved, resolveErr := worktreeGitDir(path)
-		if resolveErr != nil {
-			return "", false, fmt.Errorf("resolve git directory for %s: %w", path, resolveErr)
-		}
-		gitDir = resolved
-	case err != nil && !os.IsNotExist(err):
-		return "", false, fmt.Errorf("inspect git directory for %s: %w", path, err)
+// holds any content. The path comes from `git rev-parse --git-path`, because git
+// reads grafts from the COMMON directory: a linked worktree's own admin directory
+// is the wrong place to look, and probing it would miss an active graft.
+func cloneGraftFile(ctx context.Context, worktree Client, path string) (string, bool, error) {
+	result, err := worktree.run(ctx, "rev-parse", "--git-path", "info/grafts")
+	if err != nil {
+		return "", false, err
 	}
-	graftFile := filepath.Join(gitDir, "info", "grafts")
+	graftFile := strings.TrimSpace(result.Stdout)
+	if graftFile == "" {
+		return "", false, fmt.Errorf("resolve grafts path for %s: git returned no path", path)
+	}
+	if !filepath.IsAbs(graftFile) {
+		graftFile = filepath.Join(path, graftFile)
+	}
 	graftInfo, err := os.Stat(graftFile)
 	if os.IsNotExist(err) {
 		return graftFile, false, nil
