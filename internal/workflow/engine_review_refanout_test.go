@@ -84,10 +84,14 @@ func TestFollowUpReviewScopesFindingsAndFilesFromReviewerHead(t *testing.T) {
 	if !strings.Contains(fixPayload.Instructions, `"id":"F-1"`) {
 		t.Fatalf("fix instructions lost the named finding: %q", fixPayload.Instructions)
 	}
+	// scopeOnlySentinel appears ONLY in the changed-file range: no finding, summary or
+	// fixed prompt sentence mentions it. That is what makes the changed-file section
+	// assertion below non-vacuous.
+	const scopeOnlySentinel = "internal/sentinel_changed_files_only.go"
 	var gotPrevious, gotCurrent string
 	engine.ReviewChangedFiles = func(_ context.Context, _ string, _ int, previousHead, currentHead string) ([]string, error) {
 		gotPrevious, gotCurrent = previousHead, currentHead
-		return []string{"internal/z.go", "internal/boundary.go", "internal/boundary.go"}, nil
+		return []string{"internal/z.go", "internal/boundary.go", "internal/boundary.go", scopeOnlySentinel}, nil
 	}
 
 	if err := engine.HandlePullRequestOpened(ctx, reviewRefanoutEvent("head-two")); err != nil {
@@ -110,13 +114,27 @@ func TestFollowUpReviewScopesFindingsAndFilesFromReviewerHead(t *testing.T) {
 	if len(payload.ReviewScope.Findings) != 1 || !strings.Contains(payload.ReviewScope.Findings[0], `"id":"F-1"`) {
 		t.Fatalf("scope findings = %#v, want named F-1", payload.ReviewScope.Findings)
 	}
-	wantFiles := []string{"internal/boundary.go", "internal/z.go"}
+	wantFiles := []string{"internal/boundary.go", scopeOnlySentinel, "internal/z.go"}
 	if strings.Join(payload.ReviewScope.ChangedFiles, ",") != strings.Join(wantFiles, ",") {
 		t.Fatalf("scope changed files = %#v, want %#v", payload.ReviewScope.ChangedFiles, wantFiles)
 	}
-	if !strings.Contains(payload.Instructions, "Do not re-review the full PR-to-base diff") ||
-		!strings.Contains(payload.Instructions, "internal/boundary.go") {
+	if !strings.Contains(payload.Instructions, "Do not re-review the full PR-to-base diff") {
 		t.Fatalf("scoped review instructions do not constrain the follow-up: %q", payload.Instructions)
+	}
+	// The changed-file SECTION of the prompt, pinned as exact text. The assertion this
+	// replaces — Contains(Instructions, "internal/boundary.go") — was vacuous: that path
+	// is also embedded in the F-1 finding JSON rendered in the findings section above,
+	// so mutating the section's guard so the prompt always said "- none" still passed.
+	wantSection := "Files changed since the reviewer last saw the branch:\n" +
+		"- internal/boundary.go\n" +
+		"- " + scopeOnlySentinel + "\n" +
+		"- internal/z.go\n"
+	if !strings.Contains(payload.Instructions, wantSection) {
+		t.Fatalf("scoped review instructions omit the changed-file range: %q", payload.Instructions)
+	}
+	// The sentinel really is reachable only through that section.
+	if got := strings.Count(payload.Instructions, scopeOnlySentinel); got != 1 {
+		t.Fatalf("sentinel path occurs %d times in the prompt, want exactly 1: %q", got, payload.Instructions)
 	}
 }
 
