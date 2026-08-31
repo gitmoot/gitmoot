@@ -286,10 +286,16 @@ func reviewScopeForRoutine(scopes map[reviewScopeKey]*ReviewScope, reviewer stri
 // dropped, and the OLDEST baseline head is named because its changed-file range is the
 // superset that covers every merged baseline. A reviewer with a single bare candidate
 // aggregates to a copy of it, so the no-lens path is unchanged.
+//
+// Candidates are visited in a SORTED order rather than in map order. The merged finding
+// list keeps first-seen order, so map-order iteration made the union's finding order —
+// and therefore the reviewer's prompt, and therefore Engine.jobID, which hashes
+// Instructions — differ between runs on identical inputs.
 func routineScopeAggregates(candidates map[reviewScopeKey]reviewScopeCandidate, scopes map[reviewScopeKey]*ReviewScope) map[reviewScopeKey]*ReviewScope {
 	merged := make(map[reviewScopeKey]*ReviewScope, len(candidates))
 	rounds := make(map[reviewScopeKey]int, len(candidates))
-	for key, candidate := range candidates {
+	for _, key := range sortedReviewScopeKeys(candidates) {
+		candidate := candidates[key]
 		scope := scopes[key]
 		if scope == nil {
 			continue
@@ -317,6 +323,28 @@ func routineScopeAggregates(candidates map[reviewScopeKey]reviewScopeCandidate, 
 		scope.ChangedFiles = sortedUniqueStrings(scope.ChangedFiles)
 	}
 	return merged
+}
+
+// sortedReviewScopeKeys orders a candidate set so every derived union is byte-identical
+// across runs. The order groups by reviewer, then that reviewer's own bare routine
+// verdict (its lens id is empty, which sorts first), then each lens id: sorting the
+// CANDIDATES rather than the merged finding text keeps the grouping the reviewer reads
+// in its prompt — its own routine findings, then one stable block per lens.
+func sortedReviewScopeKeys(candidates map[reviewScopeKey]reviewScopeCandidate) []reviewScopeKey {
+	keys := make([]reviewScopeKey, 0, len(candidates))
+	for key := range candidates {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].reviewer != keys[j].reviewer {
+			return keys[i].reviewer < keys[j].reviewer
+		}
+		if keys[i].routine != keys[j].routine {
+			return !keys[i].routine
+		}
+		return keys[i].lens < keys[j].lens
+	})
+	return keys
 }
 
 // olderRoutineBaseline reports whether a candidate scope is the older baseline: the
