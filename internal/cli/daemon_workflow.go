@@ -854,8 +854,13 @@ func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request work
 		label = "pr-" + strings.ReplaceAll(request.Repo, "/", "-") + "-" + fmt.Sprint(request.PullRequest)
 	}
 	cfg, _ := loadMergeGateOrgConfig(g.Home)
-	from := mergeGateEscalationFrom(cfg, request.Repo)
-	body := workflow.FormatOrgEscalateNote(from, "jarvis", label, reason.Render())
+	roster := loadOrgRoster(ctx, g.Store, cfg)
+	from, fromDeclared := mergeGateEscalationFrom(roster, cfg, request.Repo)
+	to := mergeGateEscalationTo(roster, cfg, from, fromDeclared)
+	if to == "" {
+		return errors.New("resolve merge-gate escalation recipient: no live org role is available on the upward route")
+	}
+	body := workflow.FormatOrgEscalateNote(from, to, label, reason.Render())
 	if body == "" {
 		return errors.New("format merge-gate escalation note")
 	}
@@ -863,12 +868,18 @@ func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request work
 	if !parsed {
 		return errors.New("parse merge-gate escalation note")
 	}
+	// The stable miss identity is workflow + question + accountable recipient.
+	// The roster-derived author is deliberately excluded: equal-scope seat churn
+	// must not duplicate an open escalation. The recipient is deliberately included:
+	// a reorg must enqueue the still-open miss for the newly accountable branch.
 	notes, err := g.Store.ListWorkflowNotes(ctx, label, 0)
 	if err != nil {
 		return err
 	}
+	question := reason.Render()
 	for _, note := range notes {
-		if note.Body == body {
+		_, existingTo, existingWF, existingQuestion, ok := workflow.ParseOrgEscalateNote(note.Body)
+		if ok && existingTo == to && existingWF == label && existingQuestion == question {
 			return nil
 		}
 	}
@@ -890,27 +901,95 @@ func loadMergeGateOrgConfig(home string) (config.OrgConfig, bool) {
 	return cfg, err == nil
 }
 
-func mergeGateEscalationFrom(cfg config.OrgConfig, repo string) string {
-	if owner, ok := repoOrgOwner(cfg, repo); ok {
-		return owner
+// mergeGateEscalationFrom names the escalating role and reports whether the CHART
+// placed it. The bool is load-bearing: an unplaced name is synthesized from the
+// repo, and this fleet has repos and roles sharing names (vetrina, joltra), so a
+// synthesized name can collide with an unrelated declared role. Routing off that
+// collision would escalate into a branch that owns nothing here.
+func mergeGateEscalationFrom(roster orgRoster, cfg config.OrgConfig, repo string) (string, bool) {
+	if owner, ok := repoOrgOwner(roster, cfg, repo); ok {
+		return owner, true
 	}
 	parts := strings.Split(strings.TrimSpace(repo), "/")
 	if len(parts) == 2 && parts[1] != "" {
-		return parts[1]
+		return parts[1], false
 	}
-	return "gitmoot"
+	return "gitmoot", false
 }
 
-func repoOrgOwner(cfg config.OrgConfig, repo string) (string, bool) {
-	best, bestDepth := "", -1
-	for _, role := range loadOrgRoster(context.Background(), nil, cfg).Members() {
-		if config.ScopeMatches(role.Scope, repo) {
-			if depth := len(cfg.Path(role.Name)); depth > bestDepth {
-				best, bestDepth = role.Name, depth
-			}
+// mergeGateEscalationTo resolves the nearest LIVE role that may act on a gate
+// miss. A declared sender walks upward through its chart ancestors, skipping
+// archived roles. A root sender addresses itself because no higher role exists.
+// An unplaced sender may use the single owner root only while that root is live.
+// No live upward role returns an empty target so the caller fails closed instead
+// of journaling an escalation to an archived or missing role.
+//
+// This lifecycle filter is not a deliverability prediction. It uses the same
+// archive mirror that defines roster membership, not wake routes or pane state.
+// Actual delivery remains the outbox drain's responsibility.
+func mergeGateEscalationTo(roster orgRoster, cfg config.OrgConfig, from string, fromDeclared bool) string {
+	if !fromDeclared {
+		if orgRosterHasMember(roster, orgChartRootRole) {
+			return orgChartRootRole
+		}
+		return ""
+	}
+	ancestors := cfg.Ancestors(from)
+	for _, ancestor := range ancestors {
+		if orgRosterHasMember(roster, ancestor) {
+			return ancestor
+		}
+	}
+	if len(ancestors) == 0 && orgRosterHasMember(roster, from) {
+		return from
+	}
+	return ""
+}
+
+// orgChartRootRole is the single root name ValidateOrg admits.
+const orgChartRootRole = "owner"
+
+// repoOrgOwner returns the most-specific live role whose scope matches repo.
+// Exact repo scope outranks owner-wide scope, which outranks global scope.
+// Chart depth and then the roster's stable name order break equal-specificity
+// ties without allowing a deeper wildcard branch to defeat an exact owner.
+func repoOrgOwner(roster orgRoster, cfg config.OrgConfig, repo string) (string, bool) {
+	best, bestSpecificity, bestDepth := "", -1, -1
+	for _, role := range roster.Members() {
+		specificity := repoScopeSpecificity(role.Scope, repo)
+		if specificity < 0 {
+			continue
+		}
+		depth := len(cfg.Path(role.Name))
+		if specificity > bestSpecificity || (specificity == bestSpecificity && depth > bestDepth) {
+			best, bestSpecificity, bestDepth = role.Name, specificity, depth
 		}
 	}
 	return best, best != ""
+}
+
+func repoScopeSpecificity(scope []string, repo string) int {
+	repo = strings.ToLower(strings.TrimSpace(repo))
+	parts := strings.Split(repo, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return -1
+	}
+	best := -1
+	for _, raw := range scope {
+		switch strings.ToLower(strings.TrimSpace(raw)) {
+		case repo:
+			return 2
+		case parts[0] + "/*":
+			if best < 1 {
+				best = 1
+			}
+		case "*":
+			if best < 0 {
+				best = 0
+			}
+		}
+	}
+	return best
 }
 
 func (g daemonMergeGate) githubClient(checkout string) github.Client {

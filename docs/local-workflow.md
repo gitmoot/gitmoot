@@ -591,8 +591,16 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    Agents review, request fixes, and rerun work through comments and job output.
    Native task auto-merge is enabled by default, but only with an approved review
    verdict for the exact current head SHA and green SHA-scoped commit statuses
-   and check-runs. A miss leaves the PR open, records an org escalation, and wakes
-   `jarvis`. Set `[merge_gate] auto_merge = false` globally or per repository as
+   and check-runs. A miss leaves the PR open, records an org escalation, and
+   enqueues an addressed workflow-note wake. The sender is the most-specific live
+   org role whose scope matches the repo, and the recipient is its nearest live
+   chart ancestor. With no live scope match, the recipient is the live `owner`
+   root; when the match is already the root, the note addresses that root itself.
+   If no live upward recipient exists, the gate fails closed without journaling
+   an addressed note. Archive filtering does not predict delivery; `org validate`
+   reports missing wake routes and pane bindings. Set
+   `[merge_gate] auto_merge = false` globally or per
+   repository as
    an explicit kill-switch. The merge gate also checks local worktree cleanliness,
    branch freshness, and mergeability. Final merge work
    is serialized per repository base branch. Before the policy gate can issue

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
@@ -84,4 +85,17 @@ var loadOrgRosterObservations = func(ctx context.Context, store *db.Store) (arch
 func loadOrgRoster(ctx context.Context, store *db.Store, cfg config.OrgConfig) orgRoster {
 	archived, paused := loadOrgRosterObservations(ctx, store)
 	return resolveOrgRoster(cfg, archived, paused)
+}
+
+func orgRosterHasMember(roster orgRoster, name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	for _, role := range roster.Members() {
+		if strings.EqualFold(strings.TrimSpace(role.Name), name) {
+			return true
+		}
+	}
+	return false
 }

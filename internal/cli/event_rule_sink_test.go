@@ -457,14 +457,17 @@ func TestAddresslessBlockedWakeMatchesObserversOnly(t *testing.T) {
 
 func TestBlockedWakeTargetsRecordedOrResolvedOwnerPlusObservers(t *testing.T) {
 	tests := []struct {
-		name        string
-		repo        string
-		jobRole     string
-		wantRoles   []string
-		wantTarget  string
-		useTerminal bool
+		name           string
+		repo           string
+		jobRole        string
+		wantRoles      []string
+		wantTarget     string
+		useTerminal    bool
+		archiveJobRole bool
 	}{
-		{name: "terminal uses recorded workflow role", repo: "gitmoot/gitmoot", jobRole: "lane", useTerminal: true, wantRoles: []string{"jarvis", "lane"}, wantTarget: "lane"},
+		{name: "terminal uses current recorded workflow role", repo: "gitmoot/gitmoot", jobRole: "lane", useTerminal: true, wantRoles: []string{"jarvis", "lane"}, wantTarget: "lane"},
+		{name: "terminal falls back from removed workflow role", repo: "gitmoot/gitmoot", jobRole: "retired", useTerminal: true, wantRoles: []string{"jarvis", "lane"}, wantTarget: "lane"},
+		{name: "terminal falls back from archived workflow role", repo: "gitmoot/gitmoot", jobRole: "lane", useTerminal: true, archiveJobRole: true, wantRoles: []string{"jarvis", "owner"}, wantTarget: "owner"},
 		{name: "blocked-since resolves repo owner", repo: "gitmoot/gitmoot", wantRoles: []string{"jarvis", "lane"}, wantTarget: "lane"},
 		{name: "repo without owner is observers only", repo: "unknown/repo", wantRoles: []string{"jarvis"}},
 	}
@@ -503,6 +506,7 @@ pane="w1:p4"
 			ctx := context.Background()
 			for _, rule := range []db.EventRule{
 				{ID: "addressed-lane", OnKind: "blocked", WakeRole: "lane", Scope: db.EventRuleScopeAddressed, Enabled: true},
+				{ID: "addressed-owner", OnKind: "blocked", WakeRole: "owner", Scope: db.EventRuleScopeAddressed, Enabled: true},
 				{ID: "addressed-other", OnKind: "blocked", WakeRole: "other", Scope: db.EventRuleScopeAddressed, Enabled: true},
 				{ID: "observer-jarvis", OnKind: "blocked", WakeRole: "jarvis", Scope: db.EventRuleScopeObserver, Enabled: true},
 			} {
@@ -512,6 +516,14 @@ pane="w1:p4"
 			}
 			recorded := &recordingSink{}
 			sink := &eventRuleSink{inner: recorded, store: store, home: home}
+			if test.archiveJobRole {
+				if err := store.UpsertOrgRoleArchived(ctx, db.OrgRoleArchived{
+					Role: test.jobRole, ArchivedAt: "2026-08-31T00:00:00Z",
+					ArchivedBy: "herdr-app", ObservedAt: "2026-08-31T00:00:00Z",
+				}); err != nil {
+					t.Fatalf("UpsertOrgRoleArchived: %v", err)
+				}
+			}
 			if test.useTerminal {
 				if err := store.CreateJob(ctx, db.Job{
 					ID: "blocked-job", Agent: "worker", Type: "ask", State: string(workflow.JobBlocked),

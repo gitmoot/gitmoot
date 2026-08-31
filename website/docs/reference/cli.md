@@ -2414,8 +2414,13 @@ auto-finalizes a whole paused delegation *tree* and is on by default (24h);
 
 Native task auto-merge is enabled by default only behind an exact-head approved
 review and green SHA-scoped commit statuses/check-runs. A miss parks the task as
-`awaiting_human_merge`, records an org escalation, and wakes `jarvis`. Set
-`[repos."owner/repo".merge_gate] auto_merge = false` as an explicit kill-switch;
+`awaiting_human_merge` and records an org escalation. It selects the
+most-specific live role whose scope matches the repo and addresses that role's
+nearest live chart ancestor. With no live scope match it addresses a live
+`owner`; a root match addresses itself. With no live upward recipient, the gate
+fails closed without journaling an addressed note. Archive filtering does not
+predict delivery; `org validate` reports missing wake routes and pane bindings.
+Set `[repos."owner/repo".merge_gate] auto_merge = false` as an explicit kill-switch;
 that deliberate hold does not escalate. Pipeline `allow_auto_merge` is independent.
 
 When review independence cannot be verified, the merge gate names the evidence
