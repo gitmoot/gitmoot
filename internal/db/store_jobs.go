@@ -528,12 +528,20 @@ func (s *Store) CountQueuedJobsForRepo(ctx context.Context, repo string) (int, e
 // projected `Gitmoot/Gitmoot` against a daemon registered as `gitmoot/gitmoot` would
 // otherwise be invisible to every poll, forever. It costs nothing here — repo is a
 // residual over the queued rows, not the indexed term.
-const listQueuedJobsForRepoSQL = `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, repo, pull_request
+const listQueuedJobsForRepoSQL = `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, repo, pull_request, lifecycle_generation
 		FROM jobs INDEXED BY idx_jobs_queued_created
 		WHERE state = 'queued' AND externally_driven = 0 AND lower(repo) = lower(?) ORDER BY created_at, rowid`
 
 // ListQueuedJobsForRepo returns this repo's queued engine-owned jobs in created_at
-// (then rowid) order, with the repo and pull_request projections populated.
+// (then rowid) order, with the repo, pull_request and lifecycle_generation
+// projections populated.
+//
+// lifecycle_generation rides along because a sweep that decides a job is
+// terminable has formed that verdict about the run it OBSERVED. Settling on the
+// state string alone cannot tell "still that run" from "it completed, was
+// re-queued, and is queued again", so a slow sweep could cancel a newer
+// lifecycle. Every settlement from this list must be anchored on the generation
+// returned here.
 //
 // It exists because ListQueuedJobs is HOME-WIDE and projects neither column, so a
 // repo-scoped caller had to decode every payload in the home just to discover whose
@@ -550,7 +558,7 @@ func (s *Store) ListQueuedJobsForRepo(ctx context.Context, repo string) ([]Job, 
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.Repo, &job.PullRequest); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.Repo, &job.PullRequest, &job.LifecycleGeneration); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -758,7 +766,13 @@ func (s *Store) TransitionJobStateWithEvent(ctx context.Context, id string, from
 // It returns false, with no event written, when the row is not in `from` state OR
 // not at `fromGeneration` -- the caller cannot tell the two apart from the return
 // value alone and should re-read the row to classify what happened.
-func (s *Store) TransitionJobStateWithEventAtGeneration(ctx context.Context, id string, from string, fromGeneration int64, to string, event JobEvent) (bool, error) {
+//
+// additionalEvents land in the SAME transaction as the state write. A caller that
+// owes follow-up work after the transition (cleanup, a synthetic result, a parent
+// advance) uses one to record that debt durably, so a crash between the
+// transition and the follow-up leaves a marker a later sweep can rediscover
+// rather than a silently half-finished settlement.
+func (s *Store) TransitionJobStateWithEventAtGeneration(ctx context.Context, id string, from string, fromGeneration int64, to string, event JobEvent, additionalEvents ...JobEvent) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -781,6 +795,14 @@ func (s *Store) TransitionJobStateWithEventAtGeneration(ctx context.Context, id 
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
 		return false, err
+	}
+	for _, additional := range additionalEvents {
+		if additional.JobID == "" {
+			additional.JobID = id
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, additional.JobID, additional.Kind, additional.Message); err != nil {
+			return false, err
+		}
 	}
 	return true, tx.Commit()
 }
@@ -1761,6 +1783,15 @@ const (
 			GROUP BY job_id
 		)
 		ORDER BY job_id`
+
+	jobIDsWithPendingSupersedeFinalizationSQL = `SELECT job_id FROM job_events
+		WHERE kind = 'supersede_finalize_pending'
+		  AND id IN (
+			SELECT MAX(id) FROM job_events
+			WHERE kind IN ('supersede_finalize_pending', 'supersede_finalize_completed')
+			GROUP BY job_id
+		)
+		ORDER BY job_id`
 )
 
 // JobIDsWithPendingDelegationWorktreeReclaim returns the IDs of jobs whose most
@@ -1895,6 +1926,25 @@ func (s *Store) JobIDsWithPendingAdvanceRetry(ctx context.Context) ([]string, er
 // only has to be a superset; it is in fact exact.
 func (s *Store) JobIDsWithPendingCommentRetry(ctx context.Context) ([]string, error) {
 	return s.jobIDsByQuery(ctx, jobIDsWithPendingCommentRetrySQL)
+}
+
+// JobIDsWithPendingSupersedeFinalization returns the IDs of jobs whose closed-PR
+// supersession recorded its follow-up debt (supersede_finalize_pending) in the
+// same transaction as the terminal state write and has not yet recorded that the
+// debt was paid (supersede_finalize_completed).
+//
+// It exists because the terminal write moves the job OUT of queued, and the
+// closed-PR sweep selects only queued jobs: a crash or error after the
+// transition but before the cleanups, the synthetic result and the parent
+// advance left a child that no sweep could ever rediscover, stranding its
+// coordinator forever. The marker makes that window recoverable — this is the
+// set a later poll re-drives.
+//
+// Same last-one-wins shape as the other bounded marker queries: the highest-id
+// event among exactly the two tracked kinds decides, so a job that was finalized,
+// re-queued and superseded again is a candidate again.
+func (s *Store) JobIDsWithPendingSupersedeFinalization(ctx context.Context) ([]string, error) {
+	return s.jobIDsByQuery(ctx, jobIDsWithPendingSupersedeFinalizationSQL)
 }
 
 // JobIDsWithOpenEscalation returns the IDs of coordinator jobs with an OPEN

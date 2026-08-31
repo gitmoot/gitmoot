@@ -472,23 +472,53 @@ func (e Engine) writeTaskState(ctx context.Context, task db.Task, state TaskStat
 	return err
 }
 
-// PersistTaskState writes a task state while preserving a concurrent `merged`
-// state from stale writers that would claim the work is not done.
+// PersistTaskState is the single task-state write point for automated
+// advancement. Every exclusion it enforces lives on the conflict UPDATE, so a
+// caller's advisory pre-read cannot be invalidated between the read and the
+// write by another daemon — or by the same daemon earlier in the same poll.
 //
-// The predicate is part of the conflict UPDATE, so a caller's advisory pre-read
-// cannot race a merge. A refused write returns false and leaves a best-effort
-// TaskEventMergedRegressionRefused trace; it is not an error because callers
-// still need to settle the job or delegation that requested the stale state.
+// Two exclusion families, and they are refused differently because they mean
+// different things:
+//
+//	DISPOSED (dismissed/superseded/stranded) is an explicit operator or audit
+//	disposition. Automation never moves a task out of one, so a refusal is an
+//	ERROR naming the state — the same answer the pre-reads in setTaskState and
+//	blockTaskForPermissionBlockedJob give, now unwinnable by a race. Writing the
+//	SAME disposed state is permitted, so a disposal is idempotent.
+//
+//	MERGED, for a target that would claim the work is not done
+//	(IsMergedWorkRegressionTarget), is refused SILENTLY with a durable
+//	TaskEventMergedRegressionRefused trace: the failure policy that requested it
+//	still has to release its coordinator, so this must not become an error.
 func PersistTaskState(ctx context.Context, store *db.Store, task db.Task, state TaskState) (bool, error) {
 	task.State = string(state)
-	if !IsMergedWorkRegressionTarget(string(state)) {
-		return true, store.UpsertTask(ctx, task)
+	forbidden := make([]string, 0, 4)
+	for _, disposed := range []TaskState{TaskDismissed, TaskSuperseded, TaskStranded} {
+		if disposed != state {
+			forbidden = append(forbidden, string(disposed))
+		}
 	}
-	written, err := store.UpsertTaskUnlessStates(ctx, task, []string{string(TaskMerged)})
+	mergedGuarded := IsMergedWorkRegressionTarget(string(state))
+	if mergedGuarded {
+		forbidden = append(forbidden, string(TaskMerged))
+	}
+	written, err := store.UpsertTaskUnlessStates(ctx, task, forbidden)
 	if err != nil {
 		return false, err
 	}
-	if !written {
+	if written {
+		return true, nil
+	}
+	// The write lost. Classify against the state that actually won, because the
+	// two families answer differently and only the row can say which one refused.
+	existing, getErr := store.GetTask(ctx, task.ID)
+	if getErr != nil {
+		return false, getErr
+	}
+	if IsDisposedTaskState(existing.State) && existing.State != string(state) {
+		return false, fmt.Errorf("task %s is %s; automated advancement cannot move it to %s", task.ID, existing.State, state)
+	}
+	if mergedGuarded {
 		_ = store.AddTaskEvent(ctx, db.TaskEvent{
 			TaskID: task.ID,
 			Kind:   TaskEventMergedRegressionRefused,
@@ -496,7 +526,7 @@ func PersistTaskState(ctx context.Context, store *db.Store, task db.Task, state 
 				TaskMerged, state),
 		})
 	}
-	return written, nil
+	return false, nil
 }
 
 func (e Engine) jobID(request JobRequest) string {

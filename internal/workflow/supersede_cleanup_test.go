@@ -63,7 +63,7 @@ func TestSupersedeClosedPullRequestJobReleasesAbortedResources(t *testing.T) {
 		t.Fatalf("AcquireResourceLock acquired=%v err=%v", locked, err)
 	}
 
-	job, superseded, err := SupersedeClosedPullRequestJob(ctx, store, jobID,
+	job, superseded, err := SupersedeClosedPullRequestJob(ctx, store, mustJob(t, store, jobID),
 		"queued implement job superseded: owner/repo pull request #7 is no longer open")
 	if err != nil {
 		t.Fatalf("SupersedeClosedPullRequestJob returned error: %v", err)
@@ -170,7 +170,7 @@ func TestFinalizeClosedPullRequestDelegationChildReleasesAbortedResources(t *tes
 	// The parent's failure_policy decides what a dead child means; the default
 	// block_parent surfaces as a BlockedError, which is the DAG deciding, not the
 	// sweep failing.
-	finalized, err := engine.FinalizeClosedPullRequestDelegationChild(ctx, child,
+	finalized, err := engine.FinalizeClosedPullRequestDelegationChild(ctx, mustJob(t, store, child),
 		"queued implement job superseded: "+burst617Repo+" pull request #7 is no longer open")
 	var blocked BlockedError
 	if err != nil && !errors.As(err, &blocked) {

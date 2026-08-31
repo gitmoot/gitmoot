@@ -281,6 +281,13 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 	if err := d.supersedeQueuedJobsForClosedPullRequests(ctx, openPullNumbers); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	// Supersessions whose follow-up work did not finish (#1673). It runs right
+	// after the sweep that creates that debt so a failure recorded this poll is
+	// retried on the next one, and BEFORE the remaining reconcilers so a
+	// coordinator released here is visible to them.
+	if err := d.completePendingSupersedeFinalizations(ctx); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	if err := d.retryClosedReadyToMerge(ctx, openBranches); err != nil && firstErr == nil {
 		firstErr = err
 	}
@@ -1327,8 +1334,11 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 			}
 			// A delegation child must also release its coordinator; see
 			// FinalizeClosedPullRequestDelegationChild for why its terminal state
-			// differs from the top-level path.
-			if _, err := engine.FinalizeClosedPullRequestDelegationChild(ctx, job.ID, reason); err != nil {
+			// differs from the top-level path. The OBSERVED row is passed, not its
+			// id: the verdict is about the run this poll listed, and the settlement
+			// is anchored on that row's lifecycle generation so a job that
+			// completed and re-queued in the meantime is left alone.
+			if _, err := engine.FinalizeClosedPullRequestDelegationChild(ctx, job, reason); err != nil {
 				// The parent's failure_policy decides what a dead child means, and it
 				// RECORDS that decision: block_parent surfaces as BlockedError,
 				// escalate_human as AwaitingHumanError. Both are the DAG acting, not this
@@ -1344,8 +1354,67 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 			}
 			continue
 		}
-		if _, _, err := workflow.SupersedeClosedPullRequestJob(ctx, d.Store, job.ID, reason); err != nil && firstErr == nil {
+		if _, _, err := workflow.SupersedeClosedPullRequestJob(ctx, d.Store, job, reason); err != nil && firstErr == nil {
 			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// completePendingSupersedeFinalizations pays supersession debt that a previous
+// poll recorded and did not finish (#1673).
+//
+// The terminal state write moves a superseded job out of `queued`, and
+// supersedeQueuedJobsForClosedPullRequests selects only queued jobs — so before
+// this pass, a child whose cleanup, synthetic result or parent advance failed
+// after the transition was UNREACHABLE by any later sweep and its coordinator
+// waited forever. The pending marker written inside that transition is what makes
+// the window recoverable, and this is the pass that closes it.
+//
+// Bounded by the store's marker query, so a poll with no outstanding debt costs
+// one indexed read. A BlockedError/AwaitingHumanError is the parent's
+// failure_policy acting — the same classification the creating sweep uses.
+func (d Daemon) completePendingSupersedeFinalizations(ctx context.Context) error {
+	ids, err := d.Store.JobIDsWithPendingSupersedeFinalization(ctx)
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, id := range ids {
+		job, err := d.Store.GetJob(ctx, id)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		// The PAYLOAD names the repo. GetJob does not project the denormalized
+		// jobs.repo column, so comparing job.Repo here would compare against an
+		// always-empty string: a filter that can never match, silently skipping
+		// every candidate and reporting a clean poll.
+		payload, perr := workflowPayload(job)
+		if perr != nil {
+			d.logf("supersede-finalization recovery: skipping %s: %v", id, perr)
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(payload.Repo), d.Repo.FullName()) {
+			// Another watched repo's row. Its own daemon owns it, and the marker
+			// query is home-wide.
+			continue
+		}
+		engine, err := d.workflowForJob(ctx, job)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if _, err := engine.CompletePendingSupersedeFinalization(ctx, id); err != nil {
+			var blocked workflow.BlockedError
+			var awaiting workflow.AwaitingHumanError
+			if !errors.As(err, &blocked) && !errors.As(err, &awaiting) && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	return firstErr

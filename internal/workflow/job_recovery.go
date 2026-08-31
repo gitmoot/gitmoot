@@ -492,6 +492,22 @@ func SupersedeStaleHeadJob(ctx context.Context, store *db.Store, jobID string, r
 	return updated, true, err
 }
 
+// JobEventSupersedeFinalizePending and JobEventSupersedeFinalizeCompleted bracket
+// the follow-up work a closed-PR supersession owes AFTER its terminal state
+// write: the abort cleanups, and for a delegation child the synthetic result and
+// the parent advance.
+//
+// They exist because the terminal write moves the job out of `queued` while the
+// closed-PR sweep selects only queued jobs. A crash or error in between left a
+// child no sweep could rediscover and a coordinator that waited forever. The
+// pending marker is written in the SAME transaction as the state write, so the
+// debt is durable from the instant the job stops being queued;
+// CompletePendingSupersedeFinalization pays it and records completion.
+const (
+	JobEventSupersedeFinalizePending   = "supersede_finalize_pending"
+	JobEventSupersedeFinalizeCompleted = "supersede_finalize_completed"
+)
+
 // SupersedeClosedPullRequestJob terminates a QUEUED job whose pull request is no
 // longer open (#1673). It is deliberately narrower than SupersedeStaleHeadJob in
 // two ways.
@@ -506,43 +522,49 @@ func SupersedeStaleHeadJob(ctx context.Context, store *db.Store, jobID string, r
 // cancelled child would never advance its coordinator and the strand would move
 // from the child to the parent. The daemon routes children through
 // FinalizeClosedPullRequestDelegationChild instead.
-func SupersedeClosedPullRequestJob(ctx context.Context, store *db.Store, jobID string, reason string) (db.Job, bool, error) {
+//
+// It takes the OBSERVED row rather than an id because the caller's verdict — this
+// pull request is no longer open, so this leg is pointless — is about the run it
+// saw. Anchoring the write on that row's lifecycle generation means a job that
+// completed and was re-queued between the observation and the write loses the
+// CAS instead of having its newer run cancelled.
+func SupersedeClosedPullRequestJob(ctx context.Context, store *db.Store, observed db.Job, reason string) (db.Job, bool, error) {
 	if store == nil {
 		return db.Job{}, false, fmt.Errorf("store is required")
 	}
-	job, err := store.GetJob(ctx, jobID)
-	if err != nil {
-		return db.Job{}, false, err
+	if strings.TrimSpace(observed.ID) == "" {
+		return db.Job{}, false, fmt.Errorf("observed job id is required")
 	}
-	if job.State != string(JobQueued) {
-		return job, false, nil
+	if observed.State != string(JobQueued) {
+		return observed, false, nil
 	}
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		reason = "queued job superseded: its pull request is no longer open"
 	}
-	transitioned, err := store.TransitionJobStateWithEvent(ctx, job.ID, job.State, string(JobCancelled), db.JobEvent{
-		JobID:   job.ID,
+	transitioned, err := store.TransitionJobStateWithEventAtGeneration(ctx, observed.ID, observed.State, observed.LifecycleGeneration, string(JobCancelled), db.JobEvent{
+		JobID:   observed.ID,
 		Kind:    JobEventSupersededPullRequestClosed,
+		Message: reason,
+	}, db.JobEvent{
+		JobID:   observed.ID,
+		Kind:    JobEventSupersedeFinalizePending,
 		Message: reason,
 	})
 	if err != nil {
 		return db.Job{}, false, err
 	}
 	if !transitioned {
-		latest, getErr := store.GetJob(ctx, job.ID)
+		latest, getErr := store.GetJob(ctx, observed.ID)
 		if getErr != nil {
 			return db.Job{}, false, getErr
 		}
 		return latest, false, nil
 	}
-	// A queued job dying here owes the SAME cleanups a cancel does — resource locks,
-	// a per-delegation branch lock, the task lane lock, a dispatch-time read-only
-	// worktree. Copying only the worktree half (the shape SupersedeStaleHeadJob
-	// carries, where the targeted review legs hold none of the others) would leak
-	// locks that block the next same-repo work.
-	releaseAbortedJobResources(ctx, store, job, abortCauseSupersede)
-	updated, err := store.GetJob(ctx, job.ID)
+	if err := completeSupersedeFinalization(ctx, nil, store, observed, reason); err != nil {
+		return db.Job{}, true, err
+	}
+	updated, err := store.GetJob(ctx, observed.ID)
 	return updated, true, err
 }
 
@@ -557,24 +579,35 @@ func SupersedeClosedPullRequestJob(ctx context.Context, store *db.Store, jobID s
 // running/failed/blocked and REJECTS cancelled, so `failed` is the only terminal
 // state from which a child can still advance its parent. The event kind, not the
 // state, is what makes the reason legible.
-func (e Engine) FinalizeClosedPullRequestDelegationChild(ctx context.Context, jobID string, reason string) (bool, error) {
+//
+// Like the top-level path it settles the OBSERVED lifecycle generation, and it
+// records the finalization debt atomically with the state write so a failure
+// anywhere after the transition is recoverable rather than a permanent strand.
+func (e Engine) FinalizeClosedPullRequestDelegationChild(ctx context.Context, observed db.Job, reason string) (bool, error) {
 	if err := e.validate(); err != nil {
 		return false, err
 	}
-	job, payload, err := e.jobPayload(ctx, jobID)
+	if strings.TrimSpace(observed.ID) == "" {
+		return false, fmt.Errorf("observed job id is required")
+	}
+	payload, err := unmarshalPayload(observed.Payload)
 	if err != nil {
 		return false, err
 	}
-	if strings.TrimSpace(payload.ParentJobID) == "" || job.State != string(JobQueued) {
+	if strings.TrimSpace(payload.ParentJobID) == "" || observed.State != string(JobQueued) {
 		return false, nil
 	}
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		reason = "queued delegation child superseded: its pull request is no longer open"
 	}
-	transitioned, err := e.Store.TransitionJobStateWithEvent(ctx, job.ID, job.State, string(JobFailed), db.JobEvent{
-		JobID:   job.ID,
+	transitioned, err := e.Store.TransitionJobStateWithEventAtGeneration(ctx, observed.ID, observed.State, observed.LifecycleGeneration, string(JobFailed), db.JobEvent{
+		JobID:   observed.ID,
 		Kind:    JobEventSupersededPullRequestClosed,
+		Message: reason,
+	}, db.JobEvent{
+		JobID:   observed.ID,
+		Kind:    JobEventSupersedeFinalizePending,
 		Message: reason,
 	})
 	if err != nil {
@@ -583,6 +616,121 @@ func (e Engine) FinalizeClosedPullRequestDelegationChild(ctx context.Context, jo
 	if !transitioned {
 		return false, nil
 	}
-	releaseAbortedJobResources(ctx, e.Store, job, abortCauseSupersede)
-	return e.FinalizeTimedOutDelegationChild(ctx, job.ID, reason)
+	return true, completeSupersedeFinalization(ctx, &e, e.Store, observed, reason)
+}
+
+// CompletePendingSupersedeFinalization re-drives the follow-up work a supersession
+// recorded and did not finish. It is idempotent by construction: the cleanups are
+// individually idempotent, and finalizeTimedOutJob refuses a job that already
+// carries a result, so a job whose only unpaid step was the completion marker
+// simply records it.
+//
+// It reads the job fresh rather than trusting the marker, and skips a row that is
+// back in a live state: a re-queued job's next supersession writes its own
+// pending marker, and paying an OLD debt against a NEW run is the very confusion
+// the generation anchoring exists to prevent.
+func (e Engine) CompletePendingSupersedeFinalization(ctx context.Context, jobID string) (bool, error) {
+	if err := e.validate(); err != nil {
+		return false, err
+	}
+	job, err := e.Store.GetJob(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	switch job.State {
+	case string(JobCancelled), string(JobFailed):
+	default:
+		return false, nil
+	}
+	reason := strings.TrimSpace(latestSupersedeFinalizeReason(ctx, e.Store, jobID))
+	if reason == "" {
+		reason = "queued job superseded: its pull request is no longer open"
+	}
+	return true, completeSupersedeFinalization(ctx, &e, e.Store, job, reason)
+}
+
+// completeSupersedeFinalization pays the recorded debt and, only once every step
+// has succeeded, records that it is paid. engine is nil for a top-level job,
+// which owes cleanups but no parent propagation.
+//
+// A BlockedError or AwaitingHumanError from the child finalizer is the parent's
+// failure_policy ACTING, not this path failing, so the debt is settled and the
+// error is returned for the caller to classify. Any other error leaves the
+// pending marker in place, which is what makes the next poll retry it.
+func completeSupersedeFinalization(ctx context.Context, engine *Engine, store *db.Store, job db.Job, reason string) error {
+	// A queued job dying here owes the SAME cleanups a cancel does — resource locks,
+	// a per-delegation branch lock, the task lane lock, a dispatch-time read-only
+	// worktree. Copying only the worktree half (the shape SupersedeStaleHeadJob
+	// carries, where the targeted review legs hold none of the others) would leak
+	// locks that block the next same-repo work.
+	releaseAbortedJobResources(ctx, store, job, abortCauseSupersede)
+	var finalizeErr error
+	if engine == nil {
+		return recordSupersedeFinalizationCompleted(ctx, store, job.ID, reason, nil)
+	}
+	payload, perr := unmarshalPayload(job.Payload)
+	if perr != nil || strings.TrimSpace(payload.ParentJobID) == "" {
+		return recordSupersedeFinalizationCompleted(ctx, store, job.ID, reason, nil)
+	}
+	finalized, finalizeErr := engine.FinalizeTimedOutDelegationChild(ctx, job.ID, reason)
+	if finalizeErr != nil && !isDelegationPolicyOutcome(finalizeErr) {
+		return finalizeErr
+	}
+	// finalized == false with no error means the child ALREADY carries a synthetic
+	// result: a previous attempt stamped it and then failed. The finalizer
+	// short-circuits on that, so the step still owed is the parent advance — and
+	// skipping it here is exactly the strand this whole marker exists to prevent.
+	// AdvanceJob is re-entrant (the post-delivery retry pass re-calls it on the
+	// same job), so driving it again on an already-advanced parent is a no-op.
+	if !finalized && finalizeErr == nil {
+		if err := engine.AdvanceJob(ctx, job.ID); err != nil {
+			if !isDelegationPolicyOutcome(err) {
+				return err
+			}
+			finalizeErr = err
+		}
+	}
+	return recordSupersedeFinalizationCompleted(ctx, store, job.ID, reason, finalizeErr)
+}
+
+// isDelegationPolicyOutcome reports whether an error is the parent's
+// failure_policy ACTING rather than the finalization failing. block_parent
+// surfaces as BlockedError and escalate_human as AwaitingHumanError; both mean
+// the DAG reached a decision, so the debt is paid and the caller classifies.
+func isDelegationPolicyOutcome(err error) bool {
+	var blocked BlockedError
+	var awaiting AwaitingHumanError
+	return errors.As(err, &blocked) || errors.As(err, &awaiting)
+}
+
+// recordSupersedeFinalizationCompleted closes the durable debt. It runs only once
+// every owed step has either succeeded or ended in a policy outcome; any other
+// failure returns earlier and leaves the pending marker for the next poll.
+func recordSupersedeFinalizationCompleted(ctx context.Context, store *db.Store, jobID string, reason string, outcome error) error {
+	if err := store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   jobID,
+		Kind:    JobEventSupersedeFinalizeCompleted,
+		Message: reason,
+	}); err != nil {
+		return err
+	}
+	return outcome
+}
+
+// latestSupersedeFinalizeReason recovers the reason a supersession recorded so a
+// retry's synthetic result and events read the same as the original attempt's
+// would have. Best-effort: an unreadable history falls back to the generic reason
+// rather than blocking the recovery.
+func latestSupersedeFinalizeReason(ctx context.Context, store *db.Store, jobID string) string {
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		return ""
+	}
+	reason := ""
+	for _, event := range events {
+		if event.Kind == JobEventSupersedeFinalizePending {
+			reason = event.Message
+		}
+	}
+	return reason
 }
