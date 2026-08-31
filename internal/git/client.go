@@ -235,6 +235,30 @@ func (c Client) RemoteBranches(ctx context.Context, branches []string) (map[stri
 	return out, nil
 }
 
+// RemoteDefaultBranch resolves origin's symbolic HEAD to a branch name.
+func (c Client) RemoteDefaultBranch(ctx context.Context) (string, error) {
+	result, err := c.run(ctx, "ls-remote", "--symref", "origin", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 3 || fields[0] != "ref:" || fields[2] != "HEAD" {
+			continue
+		}
+		const heads = "refs/heads/"
+		if !strings.HasPrefix(fields[1], heads) {
+			return "", fmt.Errorf("origin HEAD points outside %s: %s", heads, fields[1])
+		}
+		branch := strings.TrimPrefix(fields[1], heads)
+		if err := validateBranch(branch); err != nil {
+			return "", err
+		}
+		return branch, nil
+	}
+	return "", errors.New("origin has no symbolic default branch")
+}
+
 func (c Client) RemoveWorktree(ctx context.Context, path string) error {
 	return c.removeWorktree(ctx, path, false)
 }
@@ -561,8 +585,12 @@ func (c Client) worktreeStatusEmptyAt(ctx context.Context, path string, includeI
 		if _, statErr := os.Stat(gitDir); os.IsNotExist(statErr) {
 			return false, terminalWorktreeRemovalError{err: fmt.Errorf("%w: worktree admin directory %s is missing", err, gitDir)}
 		}
-	} else if _, statErr := os.Stat(filepath.Join(path, ".git")); statErr == nil || os.IsNotExist(statErr) {
-		return false, terminalWorktreeRemovalError{err: fmt.Errorf("%w: worktree has no valid .git pointer: %v", err, gitDirErr)}
+	} else {
+		gitMarker := filepath.Join(path, ".git")
+		info, statErr := os.Stat(gitMarker)
+		if os.IsNotExist(statErr) || (statErr == nil && !info.IsDir()) {
+			return false, terminalWorktreeRemovalError{err: fmt.Errorf("%w: worktree has no valid .git pointer: %v", err, gitDirErr)}
+		}
 	}
 	owner, ownerErr := worktreeOwnerCheckout(path)
 	if ownerErr == nil && filepath.Clean(owner) != filepath.Clean(c.dir) {
@@ -572,29 +600,37 @@ func (c Client) worktreeStatusEmptyAt(ctx context.Context, path string, includeI
 }
 
 // WorktreeHeadReachableFromRemote proves that removing an independent writable
-// clone will not discard commits that exist only in that clone.
-func (c Client) WorktreeHeadReachableFromRemote(ctx context.Context, path string, branch string) (bool, error) {
-	path, err := validateWorktreePath(path)
+// clone will not discard commits that exist only in that clone. It returns the
+// refreshed local tracking ref so callers can repeat a final local-only proof.
+// When the recorded branch was deleted after merge, origin's default branch is
+// the authoritative fallback.
+func (c Client) WorktreeHeadReachableFromRemote(ctx context.Context, path string, branch string) (trackingRef string, reachable bool, err error) {
+	path, err = validateWorktreePath(path)
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
 	if err := validateBranch(branch); err != nil {
-		return false, err
+		return "", false, err
 	}
 	worktree := NewClient(path, c.runner)
 	remoteBranches, err := worktree.RemoteBranches(ctx, []string{branch})
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
+	targetBranch := branch
 	if _, ok := remoteBranches[branch]; !ok {
-		return false, nil
+		targetBranch, err = worktree.RemoteDefaultBranch(ctx)
+		if err != nil {
+			return "", false, err
+		}
 	}
-	remoteRef := "refs/heads/" + branch
-	trackingRef := "refs/remotes/origin/" + branch
+	remoteRef := "refs/heads/" + targetBranch
+	trackingRef = "refs/remotes/origin/" + targetBranch
 	if _, err := worktree.run(ctx, "fetch", "--no-tags", "origin", "+"+remoteRef+":"+trackingRef); err != nil {
-		return false, err
+		return "", false, err
 	}
-	return worktree.WorktreeHeadReachableFromRef(ctx, path, trackingRef)
+	reachable, err = worktree.WorktreeHeadReachableFromRef(ctx, path, trackingRef)
+	return trackingRef, reachable, err
 }
 
 // WorktreeHeadReachableFromRef performs the final local-only ancestry proof

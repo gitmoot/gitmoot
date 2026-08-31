@@ -550,8 +550,10 @@ period the daemon force-removes dirty terminal-owned read-only and delegation
 worktrees. For an independent fix clone, Gitmoot refreshes the recorded branch
 from its real `origin` within a two-minute probe deadline, then requires a clean
 tree whose HEAD is still reachable from that refreshed remote branch immediately
-before removal. A branch absent from `origin` keeps the clone without counting
-as a cleanup failure. An already-absent managed fix path completes cleanup
+before removal. If the recorded branch was deleted after merge, Gitmoot
+refreshes `origin`'s symbolic default branch and requires the same ancestry
+proof there. An unavailable default branch or unreachable HEAD keeps the clone.
+An already-absent managed fix path completes cleanup
 bookkeeping instead of consuming retries or entering quarantine. A successful
 removal or already-absent reconciliation records
 `delegation_worktree_reclaimed_ttl`. Set the TTL to `"0"` to disable this pass.

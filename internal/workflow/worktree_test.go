@@ -1846,24 +1846,26 @@ func (f *fakeWorktreeManager) WorktreePristineAt(ctx context.Context, path strin
 	return f.WorktreeCleanAt(ctx, path)
 }
 
-func (f *fakeWorktreeManager) WorktreeHeadReachableFromRemote(ctx context.Context, path string, branch string) (bool, error) {
+func (f *fakeWorktreeManager) WorktreeHeadReachableFromRemote(ctx context.Context, path string, branch string) (string, bool, error) {
 	if f.requireDeadline {
 		if _, ok := ctx.Deadline(); !ok {
-			return false, errors.New("remote reachability probe has no deadline")
+			return "", false, errors.New("remote reachability probe has no deadline")
 		}
 	}
 	if f.reachableErr != nil {
-		return false, f.reachableErr
+		return "", false, f.reachableErr
 	}
 	head, err := f.HeadSHAAt(ctx, path)
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
-	remoteHead, err := f.RevParse(ctx, "origin/"+branch)
+	trackingRef := "refs/remotes/origin/" + branch
+	remoteHead, err := f.RevParse(ctx, trackingRef)
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
-	return f.IsAncestor(ctx, head, remoteHead)
+	reachable, err := f.IsAncestor(ctx, head, remoteHead)
+	return trackingRef, reachable, err
 }
 
 func (f *fakeWorktreeManager) WorktreeHeadReachableFromRef(ctx context.Context, path string, ref string) (bool, error) {

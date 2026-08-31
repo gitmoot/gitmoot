@@ -35,6 +35,26 @@ func TestWorktreeLiveness(t *testing.T) {
 		}
 	})
 
+	t.Run("unreadable kernel-thread cwd is safely irrelevant", func(t *testing.T) {
+		worktree := t.TempDir()
+		procRoot := t.TempDir()
+		processDir := filepath.Join(procRoot, "999999997")
+		if err := os.Mkdir(processDir, 0o755); err != nil {
+			t.Fatalf("Mkdir process dir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(processDir, "cwd"), []byte("not a symlink"), 0o644); err != nil {
+			t.Fatalf("WriteFile cwd: %v", err)
+		}
+		const stat = "999999997 (kworker/0:0) I 0 0 0 0 0 2097152 0\n"
+		if err := os.WriteFile(filepath.Join(processDir, "stat"), []byte(stat), 0o644); err != nil {
+			t.Fatalf("WriteFile stat: %v", err)
+		}
+		live, known := worktreeLiveness(worktree, procRoot)
+		if live || !known {
+			t.Fatalf("worktreeLiveness with unreadable kernel-thread cwd = (%v, %v), want (false, true)", live, known)
+		}
+	})
+
 	t.Run("live cwd wins after an unreadable process", func(t *testing.T) {
 		worktree := t.TempDir()
 		procRoot := t.TempDir()

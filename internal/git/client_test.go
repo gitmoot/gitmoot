@@ -465,13 +465,14 @@ func TestClientWorktreeHeadReachableFromRemote(t *testing.T) {
 	runGit(t, seed, "add", "base.txt")
 	runGit(t, seed, "commit", "-m", "base")
 	runGit(t, seed, "push", "-u", "origin", "feature/fix")
+	runGit(t, remote, "symbolic-ref", "HEAD", "refs/heads/feature/fix")
 	runGit(t, root, "clone", remote, worktree)
 	runGit(t, worktree, "switch", "feature/fix")
 	runGit(t, worktree, "config", "user.email", "gitmoot@example.com")
 	runGit(t, worktree, "config", "user.name", "Gitmoot")
 
 	client := NewHostClient(seed)
-	reachable, err := client.WorktreeHeadReachableFromRemote(ctx, worktree, "feature/fix")
+	_, reachable, err := client.WorktreeHeadReachableFromRemote(ctx, worktree, "feature/fix")
 	if err != nil || !reachable {
 		t.Fatalf("pushed head reachable=%v err=%v, want true", reachable, err)
 	}
@@ -480,12 +481,22 @@ func TestClientWorktreeHeadReachableFromRemote(t *testing.T) {
 	}
 	runGit(t, worktree, "add", "local.txt")
 	runGit(t, worktree, "commit", "-m", "local only")
-	reachable, err = client.WorktreeHeadReachableFromRemote(ctx, worktree, "feature/fix")
+	_, reachable, err = client.WorktreeHeadReachableFromRemote(ctx, worktree, "feature/fix")
 	if err != nil {
 		t.Fatalf("local head reachability: %v", err)
 	}
 	if reachable {
 		t.Fatal("unpushed local head reported reachable from remote")
+	}
+	trackingRef, reachable, err := client.WorktreeHeadReachableFromRemote(ctx, worktree, "feature/missing")
+	if err != nil {
+		t.Fatalf("missing branch default-fallback reachability: %v", err)
+	}
+	if reachable {
+		t.Fatal("unpushed local head reported reachable from remote default branch")
+	}
+	if trackingRef != "refs/remotes/origin/feature/fix" {
+		t.Fatalf("fallback tracking ref = %q, want origin feature branch", trackingRef)
 	}
 }
 
@@ -509,6 +520,7 @@ func TestClientWorktreeHeadReachableFromRemoteRefreshesLocalFixClone(t *testing.
 	runGit(t, source, "commit", "-m", "base")
 	runGit(t, source, "branch", "-M", "main")
 	runGit(t, source, "push", "-u", "origin", "main")
+	runGit(t, remote, "symbolic-ref", "HEAD", "refs/heads/main")
 	runGit(t, source, "switch", "-c", "feature/fix")
 	if err := os.WriteFile(filepath.Join(source, "fix.txt"), []byte("fix\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile fix: %v", err)
@@ -521,6 +533,9 @@ func TestClientWorktreeHeadReachableFromRemoteRefreshesLocalFixClone(t *testing.
 		t.Fatalf("feature HeadSHA: %v", err)
 	}
 	runGit(t, source, "switch", "main")
+	runGit(t, source, "merge", "--ff-only", "feature/fix")
+	runGit(t, source, "push", "origin", "main")
+	runGit(t, source, "push", "origin", "--delete", "feature/fix")
 	runGit(t, source, "branch", "-D", "feature/fix")
 
 	sourceClient := NewHostClient(source)
@@ -538,16 +553,15 @@ func TestClientWorktreeHeadReachableFromRemoteRefreshesLocalFixClone(t *testing.
 		t.Fatal("local fix clone unexpectedly began with the remote-tracking feature ref")
 	}
 
-	reachable, err := sourceClient.WorktreeHeadReachableFromRemote(ctx, fixClone, "feature/fix")
+	trackingRef, reachable, err := sourceClient.WorktreeHeadReachableFromRemote(ctx, fixClone, "feature/fix")
 	if err != nil || !reachable {
-		t.Fatalf("local fix clone reachable=%v err=%v, want true after refresh", reachable, err)
+		t.Fatalf("merged head reachable=%v err=%v, want true through default branch", reachable, err)
 	}
-	if _, err := fixClient.RevParse(ctx, "refs/remotes/origin/feature/fix"); err != nil {
-		t.Fatalf("refreshed remote-tracking feature ref: %v", err)
+	if trackingRef != "refs/remotes/origin/main" {
+		t.Fatalf("fallback tracking ref = %q, want refs/remotes/origin/main", trackingRef)
 	}
-	reachable, err = sourceClient.WorktreeHeadReachableFromRemote(ctx, fixClone, "feature/missing")
-	if err != nil || reachable {
-		t.Fatalf("missing remote branch reachable=%v err=%v, want false nil", reachable, err)
+	if _, err := fixClient.RevParse(ctx, trackingRef); err != nil {
+		t.Fatalf("refreshed default-branch tracking ref: %v", err)
 	}
 }
 
@@ -733,6 +747,24 @@ func TestClientWorktreePristineAtClassifiesMissingGitPointer(t *testing.T) {
 	if !errors.As(err, &terminal) {
 		t.Fatalf("WorktreePristineAt error = %v, want terminal worktree removal error", err)
 	}
+}
+
+func TestClientWorktreePristineAtPreservesStandaloneCloneStatusError(t *testing.T) {
+	path := t.TempDir()
+	if err := os.Mkdir(filepath.Join(path, ".git"), 0o755); err != nil {
+		t.Fatalf("Mkdir .git: %v", err)
+	}
+	cause := errors.New("transient git status failure")
+	runner := &fakeRunner{errs: []error{cause}}
+	_, err := NewClient(path, runner).WorktreePristineAt(context.Background(), path)
+	if !errors.Is(err, cause) {
+		t.Fatalf("WorktreePristineAt error = %v, want original status error", err)
+	}
+	var terminal terminalWorktreeRemovalError
+	if errors.As(err, &terminal) {
+		t.Fatalf("standalone clone status failure was classified terminal: %v", err)
+	}
+	runner.wantArgs(t, 0, "git", "status", "--porcelain", "--ignored")
 }
 
 func TestClientWorktreeCleanSmoke(t *testing.T) {

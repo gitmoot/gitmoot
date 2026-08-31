@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -124,6 +125,29 @@ func bestEffortWorktreeLiveness(path string, procRoot string) (live bool, known 
 	return scanWorktreeLiveness(path, procRoot, false)
 }
 
+const linuxPFKThread = uint64(0x00200000)
+
+func procEntryIsKernelThread(procEntry string) (bool, error) {
+	data, err := os.ReadFile(filepath.Join(procEntry, "stat"))
+	if err != nil {
+		return false, err
+	}
+	stat := string(data)
+	closeParen := strings.LastIndexByte(stat, ')')
+	if closeParen < 0 {
+		return false, errors.New("process stat has no command terminator")
+	}
+	fields := strings.Fields(stat[closeParen+1:])
+	if len(fields) <= 6 {
+		return false, fmt.Errorf("process stat has %d fields after command, want at least 7", len(fields))
+	}
+	flags, err := strconv.ParseUint(fields[6], 10, 64)
+	if err != nil {
+		return false, fmt.Errorf("parse process stat flags: %w", err)
+	}
+	return flags&linuxPFKThread != 0, nil
+}
+
 func scanWorktreeLiveness(path string, procRoot string, requireEveryCWD bool) (live bool, known bool) {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -156,7 +180,10 @@ func scanWorktreeLiveness(path string, procRoot string, requireEveryCWD bool) (l
 		}
 		if err != nil {
 			if requireEveryCWD {
-				conclusive = false
+				kernelThread, statErr := procEntryIsKernelThread(filepath.Join(procRoot, name))
+				if statErr != nil || !kernelThread {
+					conclusive = false
+				}
 			}
 			continue
 		}

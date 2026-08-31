@@ -38,7 +38,7 @@ type WritableWorktreeLineageManager interface {
 	IsAncestor(ctx context.Context, ancestor, descendant string) (bool, error)
 	WorktreeCleanAt(ctx context.Context, path string) (bool, error)
 	WorktreePristineAt(ctx context.Context, path string) (bool, error)
-	WorktreeHeadReachableFromRemote(ctx context.Context, path string, branch string) (bool, error)
+	WorktreeHeadReachableFromRemote(ctx context.Context, path string, branch string) (trackingRef string, reachable bool, err error)
 	WorktreeHeadReachableFromRef(ctx context.Context, path string, ref string) (bool, error)
 	RemoveWorktree(ctx context.Context, path string) error
 	DeleteBranch(ctx context.Context, branch string) error
@@ -1624,12 +1624,13 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktree(ctx context.Context, jobID
 }
 
 func (e Engine) completeAgedTerminalFixWorktreeReclaim(ctx context.Context, jobID, path string) (bool, error) {
-	err := e.Store.AddJobEvent(context.WithoutCancel(ctx), db.JobEvent{
+	opCtx := context.WithoutCancel(ctx)
+	err := e.Store.AddJobEvent(opCtx, db.JobEvent{
 		JobID: jobID, Kind: "delegation_worktree_reclaimed_ttl",
 		Message: fmt.Sprintf("aged terminal fix worktree %s reconciled after TTL", path),
 	})
 	if err == nil {
-		err = e.markDelegationCleanupRemoved(ctx, jobID, path)
+		err = e.markDelegationCleanupRemoved(opCtx, jobID, path)
 	}
 	return err == nil, err
 }
@@ -1723,7 +1724,7 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context
 			return false, nil
 		}
 		probeCtx, cancelProbe := context.WithTimeout(ctx, remoteWorktreeReachabilityTimeout)
-		reachable, err := manager.WorktreeHeadReachableFromRemote(probeCtx, path, payload.Branch)
+		trackingRef, reachable, err := manager.WorktreeHeadReachableFromRemote(probeCtx, path, payload.Branch)
 		cancelProbe()
 		if err != nil {
 			return false, fmt.Errorf("prove aged terminal fix worktree head reachable from remote: %w", err)
@@ -1742,7 +1743,9 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context
 		if !clean {
 			return false, nil
 		}
-		trackingRef := "refs/remotes/origin/" + strings.TrimSpace(payload.Branch)
+		if strings.TrimSpace(trackingRef) == "" {
+			return false, errors.New("remote reachability proof returned no tracking ref")
+		}
 		reachable, err = manager.WorktreeHeadReachableFromRef(ctx, path, trackingRef)
 		if err != nil {
 			return false, fmt.Errorf("recheck aged terminal fix worktree head reachable from remote: %w", err)
