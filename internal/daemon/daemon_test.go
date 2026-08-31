@@ -1352,6 +1352,12 @@ func TestPollOnceForkHeadCollidingWithManagedBranchGetsNoMarker(t *testing.T) {
 	if err := daemon.PollOnce(ctx); err != nil {
 		t.Fatalf("PollOnce returned error: %v", err)
 	}
+	// Non-vacuity: the poll must actually have iterated BOTH pulls. Without this
+	// the test would also pass if the fake silently stopped returning the fork PR,
+	// which is the one way a fork-rejection assertion can pass for the wrong reason.
+	if client.listIssueCommentsCalls != 2 {
+		t.Fatalf("per-PR ListIssueComments calls = %d, want 2 (managed PR and fork PR both polled)", client.listIssueCommentsCalls)
+	}
 	// The managed same-repo head is still marked in this very poll, so the guard
 	// rejects fork identity rather than disabling the feature.
 	if client.combinedStatusCalls != 1 || len(client.statuses) != 1 {
