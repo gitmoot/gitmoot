@@ -29,19 +29,19 @@ var newAgentDispatchGitHubClient = func(checkout string) github.Client {
 type foregroundRuntimeAdapterFactory func(string, runtime.Agent, string) (runtime.Adapter, error)
 
 var localAgentDispatchRuntimeAdapterFor foregroundRuntimeAdapterFactory = func(home string, agent runtime.Agent, checkout string) (runtime.Adapter, error) {
-	delivery, err := buildRuntimeAdapter(home, agent, checkout, nil)
+	adapter, err := runtimeAdapterFor(home, agent.Runtime, checkout)
 	if err != nil {
 		return nil, err
 	}
-	delivery, err = wrapReviewSandboxAdapter(home, agent, checkout, delivery)
+	delivery, err := wrapReviewSandboxAdapter(home, agent, checkout, adapter)
 	if err != nil {
 		return nil, err
 	}
-	adapter, ok := delivery.(runtime.Adapter)
+	wrapped, ok := delivery.(runtime.Adapter)
 	if !ok {
 		return nil, fmt.Errorf("foreground runtime adapter has incompatible type %T", delivery)
 	}
-	return adapter, nil
+	return wrapped, nil
 }
 
 var localAgentDispatchExecBackendFor = func(home string) (execbackend.Backend, error) {
