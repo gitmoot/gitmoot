@@ -1739,6 +1739,46 @@ func TestEngineAdvanceReviewSubthresholdRecordsOutcomeBeforeAskGate(t *testing.T
 	}
 }
 
+// The DELEGATED-CHILD ask-gate (engine_run_budgets.go, inside the ParentJobID
+// block) returns before the top-level review path is reached at all — it is a
+// second, earlier ask-gate. It was the fifth distinct early return found to skip
+// a positionally-placed outcome write, which is why the write now runs at the top
+// of AdvanceJob instead of at a position relative to any of them.
+func TestEngineAdvanceDelegatedReviewChildAskGateRecordsFoldedOutcome(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+
+	parent := JobPayload{
+		Repo: "mobile/app", Branch: "task-8", PullRequest: 8, TaskID: "task-8",
+		TaskTitle: "Mobile App", LeadAgent: "lead",
+		Result:    &AgentResult{Decision: "approved", Summary: "coordinated"},
+	}
+	insertCompletedJob(t, store, db.Job{ID: "coord", Agent: "lead", Type: "ask"}, parent)
+
+	child := parent
+	child.ParentJobID = "coord"
+	child.DelegationID = "lens-a"
+	child.Sender = "lead"
+	child.Result = &AgentResult{
+		Decision: "changes_requested", Severity: reviewseverity.P2,
+		Summary:        "non-blocking, one question",
+		HumanQuestions: []HumanQuestion{{ID: "q1", Prompt: "docs-only too?"}},
+	}
+	insertCompletedJob(t, store, db.Job{ID: "coord/delegation/lens-a", Agent: "audit", Type: "review"}, child)
+
+	err := engine.AdvanceJob(ctx, "coord/delegation/lens-a")
+	var awaiting AwaitingHumanError
+	if err != nil && !errors.As(err, &awaiting) {
+		t.Fatalf("AdvanceJob returned unexpected error: %v", err)
+	}
+	if got := countJobEvents(t, store, "coord/delegation/lens-a", ReviewApprovedWithNotesEventKind); got != 1 {
+		t.Fatalf("%s events = %d, want 1 despite the delegated-child ask-gate returning early",
+			ReviewApprovedWithNotesEventKind, got)
+	}
+}
+
 func TestEngineAdvancePipelineReviewIsReportOnly(t *testing.T) {
 	for _, decision := range []string{"changes_requested", "approved"} {
 		t.Run(decision, func(t *testing.T) {
