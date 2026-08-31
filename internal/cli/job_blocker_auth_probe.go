@@ -160,7 +160,7 @@ func (w jobWorker) defaultAuthProbe(ctx context.Context, job db.Job, payload wor
 		return authProbeUnknown
 	}
 	jobBackend, jobBackendPresent := payload.ExecBackendOverride()
-	backend, err := daemonJobExecBackendFor(w, jobBackend, jobBackendPresent)
+	backend, _, err := daemonJobExecBackendFor(w, jobBackend, jobBackendPresent)
 	if err != nil {
 		// run() owns the loud terminal selector failure. This scheduler gate is
 		// advisory; an unresolved backend must not launch a host probe, and Unknown

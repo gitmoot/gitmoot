@@ -20,9 +20,9 @@ local_root = "/var/tmp/gitmoot-local"
 # credential_gateway_url = "https://broker.example.com:8443"
 ```
 
-`local` is the default and the only currently provisioned backend. `remote` is
-parseable, but its provider is not configured in this slice; unsupported routes
-refuse explicitly rather than falling back to host execution. For an
+`local` is the default. `remote` provisions E2B for engine-driven shell
+implement jobs; unsupported job types and model runtimes refuse before
+provider allocation. For an
 engine-driven daemon job, Gitmoot provisions one job-scoped instance, syncs the selected host
 checkout into a distinct detached Git worktree, streams runtime commands there,
 collects changes, and destroys the instance after the job. The same instance
@@ -61,6 +61,13 @@ traversable location and put that location first in the daemon's `PATH`; do not
 make `/root` traversable just to satisfy this requirement. An inaccessible
 runtime fails command startup rather than falling back to root.
 
+For daemon jobs that own an execution-backend lifecycle, runtime contract
+preflight evaluates UID-dependent requirements against configured `local_uid`.
+This lets a root daemon dispatch Claude with `danger-full-access` to a non-root
+local backend without weakening Claude's root refusal. Host-only paths such as
+`gitmoot job run` do not provision that lifecycle and still evaluate the host
+process identity. When `local_uid` is absent, daemon jobs do the same.
+
 The local worktree's `.git` file points at an absolute gitdir in the source
 repository. That pointer resolves on the same filesystem, so `local` needs no
 bundle/base-ref hydration; hydration remains a remote-provider concern. Cancel
@@ -68,6 +75,48 @@ kills active command groups and destroys the instance. A restarted daemon reaps
 instances whose recorded owner process is gone. A partially-created non-empty
 directory that Git never registered remains the known orphaned-but-present
 cleanup limitation tracked in #1572.
+
+## Proving a Parallel Local Wave
+
+Run the proof with a dedicated `--home`; never point it at the live Gitmoot
+home. Keep the source checkout under a path the configured identity can
+traverse, set `backend = "local"`, and give every Claude leg a distinct
+`fresh:<suffix>` session:
+
+```sh
+gitmoot agent subscribe gate-a --runtime claude --session fresh:gate-a \
+  --role implementer --repo OWNER/REPO --policy danger-full-access \
+  --capability implement --home "$PROOF_HOME"
+```
+
+Keep the daemon running in its own shell:
+
+```sh
+gitmoot daemon run --repo OWNER/REPO --parallel 4 --poll 1s \
+  --home "$PROOF_HOME"
+```
+
+From the dispatch shell, submit every leg together:
+
+```sh
+gitmoot agent implement gate-a "record uid, gid, pwd, start, end, and visible markers" \
+  --repo OWNER/REPO --base HEAD --background --skip-native-review-fanout \
+  --home "$PROOF_HOME"
+```
+
+Dispatch the other legs together, not after the first settles. Every leg's
+`gitmoot_result` should include its UID, GID, workspace, start and end
+timestamps, and visible marker set in `summary`; its marker in `changes_made`;
+and the read-back and visibility checks in `tests_run`.
+
+The proof passes only when all of these are independently observed:
+
+- every runtime delivery returns a parsed `gitmoot_result`;
+- the reported UID/GID equal the configured non-root identity;
+- the intervals overlap with measured peak concurrency equal to the leg count;
+- every workspace path is distinct, and each leg sees only its own marker;
+- the isolated ledger contains zero remote execution attempts, and no E2B
+  credential or `remote` selector is present.
 
 Gitmoot reads `[remote_exec]` when it dispatches a job. Once the process starts
 a remote credential listener for a home, those listener coordinates are
@@ -104,5 +153,4 @@ an absent selector defaults to `local`, while `backend = ""` or an explicit
 Any value outside the allowed set (`local`, `remote`) **fails the job
 loudly at dispatch**: the failure names the offending value and the allowed
 set (for example `unknown execution backend "e2b" (allowed: local, remote)`).
-There is no silent fallback. Provider construction for `remote` lands in later
-phases of the parallel-isolated-execution epic (#1529).
+There is no silent fallback.
