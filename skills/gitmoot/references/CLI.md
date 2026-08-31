@@ -465,10 +465,11 @@ resolved `--poll` / `[daemon].poll` cadence; an explicit `--poll` stores a
 per-repo override. `repo list` renders the sentinel as `inherit`.
 `repo set-interval owner/repo <duration>` changes an override, `default` restores
 inheritance, and `--all` applies either value to every registered repo.
-`repo auto-fix` is a durable, per-PR scheduler control. `--disable` prevents a
-changes-requested auto-fix before ownership resolution or worktree allocation;
-`--enable` explicitly resumes it. Both forms require `--by` and `--reason`, and
-the latest attributed decision remains stored for that PR.
+`repo auto-fix` stores a durable, per-PR opt-in for unattended fix dispatch.
+By default, a changes-requested review reports its verdict to the requester and
+does not create an implement job. `--enable` opts that PR into auto-fix;
+`--disable` revokes the opt-in. Both forms require `--by` and `--reason`, and the
+latest attributed decision remains stored for that PR.
 `repo doctor owner/repo` checks a single repo's checkout/config health. If the
 registered checkout is missing or is no longer a Git worktree, Gitmoot verifies
 the recorded primary checkout, repairs the registration, and reports the
@@ -1118,14 +1119,16 @@ from PR comments continue to validate their fix target when the workflow
 advances until [gitmoot#1433](https://github.com/gitmoot/gitmoot/issues/1433)
 adds the corresponding ingress preflight.
 
-When an engine review returns `changes_requested`, its implement fix job gets an
-independent writable per-job clone checked out on the task branch at the fetched
-remote head. It does not execute in the review Task's empty worktree path or the
-registered checkout, so it cannot interleave with an operator's uncommitted
-files. Allocation fails closed before enqueue; there is no registered-checkout
-fallback. The clone stays attached to the real branch so the fix can commit and
-push, then terminal cleanup (with the delegation-worktree TTL as a backstop)
-removes only the clone.
+When an engine review returns `changes_requested`, Gitmoot persists the verdict
+and wakes the requester's org role without creating an implement job. If that
+PR has an explicit `repo auto-fix --enable` policy, the resulting implement fix
+job gets an independent writable per-job clone checked out on the task branch
+at the fetched remote head. It does not execute in the review Task's empty
+worktree path or the registered checkout, so it cannot interleave with an
+operator's uncommitted files. Allocation fails closed before enqueue; there is
+no registered-checkout fallback. The clone stays attached to the real branch so
+the fix can commit and push, then terminal cleanup (with the
+delegation-worktree TTL as a backstop) removes only the clone.
 
 Before delivery, these dispatch commands scan commit-shaped tokens against the
 target repository. Ask and implement preserve their existing scanner input;

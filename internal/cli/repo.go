@@ -349,8 +349,8 @@ func runRepoAutoFix(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	pullRequest := fs.Int("pr", 0, "pull request number")
-	disable := fs.Bool("disable", false, "disable automatic changes-requested fix dispatch")
-	enable := fs.Bool("enable", false, "re-enable automatic changes-requested fix dispatch")
+	disable := fs.Bool("disable", false, "revoke the changes-requested auto-fix opt-in (report-only default)")
+	enable := fs.Bool("enable", false, "opt in to automatic changes-requested fix dispatch")
 	actor := fs.String("by", "", "role or agent recording the decision")
 	reason := fs.String("reason", "", "durable reason for the decision")
 	repoArg, code := parseRepoPositional(

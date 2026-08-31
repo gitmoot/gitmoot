@@ -658,6 +658,16 @@ func TestReviewDispatchRoutesChangesRequestedFixToTaskImplementer(t *testing.T) 
 			home := t.TempDir()
 			store := openCLIJobStore(t, home)
 			defer store.Close()
+			if err := store.SetPullRequestAutoFixPolicy(
+				context.Background(),
+				"owner/repo",
+				7,
+				false,
+				"test",
+				"explicit autonomous-chain opt-in",
+			); err != nil {
+				t.Fatalf("SetPullRequestAutoFixPolicy returned error: %v", err)
+			}
 			checkout := createDaemonWorkerGitCheckout(t, "main")
 			makeReviewFixOriginFetchable(t, checkout, "feature/review")
 			seedDaemonWorkerRepo(t, store, "owner/repo", checkout)

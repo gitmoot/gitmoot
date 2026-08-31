@@ -81,10 +81,12 @@ Parallelism under `pool` is bounded by **two** independent locks, not one:
    get their own worktree from the workflow engine, so they parallelize. Every
    local `review` gets a detached per-job worktree at its requested head;
    background taskless `ask` jobs can be auto-isolated at checkout `HEAD`.
-   An engine review that requests changes dispatches its fix into an independent
-   writable per-job clone attached to the task branch at its fetched remote head;
-   failure to allocate refuses the dispatch instead of falling back to the
-   registered checkout.
+   An engine review that requests changes reports the verdict back to the
+   requester's org role and allocates no implement job by default. If that PR
+   has an explicit `repo auto-fix --enable` policy, Gitmoot dispatches the fix
+   into an independent writable per-job clone attached to the task branch at its
+   fetched remote head; failure to allocate refuses the dispatch instead of
+   falling back to the registered checkout.
    A plain, top-level same-repo `implement` job with **no** worktree still shares
    the `repo:<repo>` key and serializes even under `pool`.
 
