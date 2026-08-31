@@ -1877,9 +1877,12 @@ gitmoot org events rule rm --home /alternate/home <rule-id>
 `review-verdict`, `blocked`, `recycle-overdue`, `pane_input_pending`, `reply`,
 `directive`, or `fact`. A successful review terminal whose decision is
 `approved` or `changes_requested` matches both `job-terminal` and
-`review-verdict` and addresses the resolved pull request owner. If no owner can
-be resolved, addressed rules fail closed while observer rules remain eligible.
-`pane_input_pending` matches the
+`review-verdict` and addresses both the requesting org role and the resolved
+implementing role. When a successful ownership lookup finds no implement job
+or branch lock attribution, the review's persisted lead identifies a
+persistent implementing seat; lookup errors remain fail-closed. If neither
+role can be resolved, addressed rules fail closed while observer rules remain
+eligible. `pane_input_pending` matches the
 `org.input_pending` event emitted when Herdr continuously reports
 `input_pending: true` for a role's pane longer than
 `[orchestrate].blocked_role_wake_after`; it re-nudges at most once per that
