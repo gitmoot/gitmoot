@@ -854,8 +854,12 @@ func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request work
 		label = "pr-" + strings.ReplaceAll(request.Repo, "/", "-") + "-" + fmt.Sprint(request.PullRequest)
 	}
 	cfg, _ := loadMergeGateOrgConfig(g.Home)
-	from, fromDeclared := mergeGateEscalationFrom(ctx, g.Store, cfg, request.Repo)
-	to := mergeGateEscalationTo(cfg, from, fromDeclared)
+	roster := loadOrgRoster(ctx, g.Store, cfg)
+	from, fromDeclared := mergeGateEscalationFrom(roster, cfg, request.Repo)
+	to := mergeGateEscalationTo(roster, cfg, from, fromDeclared)
+	if to == "" {
+		return errors.New("resolve merge-gate escalation recipient: no live org role is available on the upward route")
+	}
 	body := workflow.FormatOrgEscalateNote(from, to, label, reason.Render())
 	if body == "" {
 		return errors.New("format merge-gate escalation note")
@@ -902,8 +906,8 @@ func loadMergeGateOrgConfig(home string) (config.OrgConfig, bool) {
 // repo, and this fleet has repos and roles sharing names (vetrina, joltra), so a
 // synthesized name can collide with an unrelated declared role. Routing off that
 // collision would escalate into a branch that owns nothing here.
-func mergeGateEscalationFrom(ctx context.Context, store *db.Store, cfg config.OrgConfig, repo string) (string, bool) {
-	if owner, ok := repoOrgOwner(ctx, store, cfg, repo); ok {
+func mergeGateEscalationFrom(roster orgRoster, cfg config.OrgConfig, repo string) (string, bool) {
+	if owner, ok := repoOrgOwner(roster, cfg, repo); ok {
 		return owner, true
 	}
 	parts := strings.Split(strings.TrimSpace(repo), "/")
@@ -913,40 +917,33 @@ func mergeGateEscalationFrom(ctx context.Context, store *db.Store, cfg config.Or
 	return "gitmoot", false
 }
 
-// mergeGateEscalationTo resolves the role that must ACT on a gate miss: the
-// nearest ancestor of the escalating role. That is the same upward rule org
-// escalate enforces on the CLI path (it refuses a --to outside cfg.Ancestors),
-// and before #1727 it was the literal "jarvis", so every engine escalation
-// bypassed the chart.
+// mergeGateEscalationTo resolves the nearest LIVE role that may act on a gate
+// miss. A declared sender walks upward through its chart ancestors, skipping
+// archived roles. A root sender addresses itself because no higher role exists.
+// An unplaced sender may use the single owner root only while that root is live.
+// No live upward role returns an empty target so the caller fails closed instead
+// of journaling an escalation to an archived or missing role.
 //
-// IT DOES NOT PREDICT DELIVERABILITY, DELIBERATELY (#1728 review, P1b). Two
-// rounds tried: first asking for an escalation-kind route, which delivery never
-// demands, then asking with an event missing the JobID a MatchFilter is tested
-// against. Both disagreed with the drain, and pane resolvability -- the next
-// input -- cannot be predicted at all, because a pane can vanish between this
-// write and the delivery attempt. Rerouting on a guess also moves accountability:
-// an operator seating a role would silently change who owns a gate miss.
-//
-// A recipient that cannot be woken is an org-config gap, and org validate already
-// reports it as unresolved_roles and roles_without_routes (org.go). Restating it
-// from here would be a second representation of one fact, which is the drift this
-// package keeps paying for (#1381).
-//
-// ValidateOrg admits exactly one root and requires it be named "owner"
-// (config/org.go), so the unplaced-sender case is that constant rather than a
-// Roots() lookup; if that invariant is ever relaxed, this returns the wrong role.
-func mergeGateEscalationTo(cfg config.OrgConfig, from string, fromDeclared bool) string {
+// This lifecycle filter is not a deliverability prediction. It uses the same
+// archive mirror that defines roster membership, not wake routes or pane state.
+// Actual delivery remains the outbox drain's responsibility.
+func mergeGateEscalationTo(roster orgRoster, cfg config.OrgConfig, from string, fromDeclared bool) string {
 	if !fromDeclared {
-		return orgChartRootRole
+		if orgRosterHasMember(roster, orgChartRootRole) {
+			return orgChartRootRole
+		}
+		return ""
 	}
 	ancestors := cfg.Ancestors(from)
-	if len(ancestors) == 0 {
-		// from IS the root: nobody is above it, so it is the actor. org escalate
-		// refuses a self-addressed question between humans; here there is no
-		// higher role to name and a note addressed anywhere else would be a guess.
+	for _, ancestor := range ancestors {
+		if orgRosterHasMember(roster, ancestor) {
+			return ancestor
+		}
+	}
+	if len(ancestors) == 0 && orgRosterHasMember(roster, from) {
 		return from
 	}
-	return ancestors[0]
+	return ""
 }
 
 // orgChartRootRole is the single root name ValidateOrg admits.
@@ -956,9 +953,9 @@ const orgChartRootRole = "owner"
 // Exact repo scope outranks owner-wide scope, which outranks global scope.
 // Chart depth and then the roster's stable name order break equal-specificity
 // ties without allowing a deeper wildcard branch to defeat an exact owner.
-func repoOrgOwner(ctx context.Context, store *db.Store, cfg config.OrgConfig, repo string) (string, bool) {
+func repoOrgOwner(roster orgRoster, cfg config.OrgConfig, repo string) (string, bool) {
 	best, bestSpecificity, bestDepth := "", -1, -1
-	for _, role := range loadOrgRoster(ctx, store, cfg).Members() {
+	for _, role := range roster.Members() {
 		specificity := repoScopeSpecificity(role.Scope, repo)
 		if specificity < 0 {
 			continue

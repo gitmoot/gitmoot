@@ -336,30 +336,40 @@ func eventRuleMatchesAddressee(rule db.EventRule, event events.Event) bool {
 
 // addressBlockedEvent enriches every blocked event at the event-sink source
 // boundary before webhook fanout or durable routing. Persisted job attribution
-// is the strongest ownership evidence; synthesized blocked-since events fall
-// back to the most-specific org role scoped to the event repository.
+// remains strongest only while that role belongs to the current live roster.
+// Archived or removed attribution falls back to the current live role selected
+// for the event repository.
 func (s *eventRuleSink) addressBlockedEvent(ctx context.Context, event events.Event) events.Event {
-	if event.Type != events.EventJobBlocked || strings.TrimSpace(event.WakeTargetRole) != "" {
+	if event.Type != events.EventJobBlocked {
 		return event
 	}
-	targetRole := ""
+	targetRole := workflow.NormalizeActingOrgRole(event.WakeTargetRole)
+	persistedRole := ""
 	if s.store != nil && strings.TrimSpace(event.JobID) != "" {
 		if job, err := s.store.GetJob(ctx, event.JobID); err == nil {
 			if payload, err := daemonJobPayload(job); err == nil {
-				if role := workflow.NormalizeActingOrgRole(payload.ActingOrgRole); role != "" {
-					targetRole = role
-				}
+				persistedRole = workflow.NormalizeActingOrgRole(payload.ActingOrgRole)
 			}
 		}
 	}
-	if targetRole == "" {
-		if cfg, ok := s.loadOrgConfig(); ok {
-			targetRole, _ = repoOrgOwner(ctx, s.store, cfg, event.Repo)
-		}
+	// A pre-addressed blocked event that did not copy persisted attribution is
+	// explicit routing from another producer and remains authoritative.
+	if targetRole != "" && (persistedRole == "" || !strings.EqualFold(targetRole, persistedRole)) {
+		return event
 	}
-	if targetRole != "" {
-		event.WakeTargetRole = targetRole
+	cfg, cfgOK := s.loadOrgConfig()
+	var roster orgRoster
+	if cfgOK {
+		roster = loadOrgRoster(ctx, s.store, cfg)
 	}
+	targetRole = ""
+	if cfgOK && orgRosterHasMember(roster, persistedRole) {
+		targetRole = persistedRole
+	}
+	if targetRole == "" && cfgOK {
+		targetRole, _ = repoOrgOwner(roster, cfg, event.Repo)
+	}
+	event.WakeTargetRole = targetRole
 	return event
 }
 

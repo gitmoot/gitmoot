@@ -253,6 +253,53 @@ scope = ["owner/repo"]
 	}
 }
 
+func TestDaemonMergeGateEscalationSkipsArchivedAncestor(t *testing.T) {
+	store, checkout, gh, request := daemonMergeGateActiveJobFixture(t, false)
+	request.WorkflowID = "goal-archived-ancestor"
+	if err := store.UpsertOrgRoleArchived(context.Background(), db.OrgRoleArchived{
+		Role: "coordinator", ArchivedAt: "2026-08-31T00:00:00Z",
+		ArchivedBy: "herdr-app", ObservedAt: "2026-08-31T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("UpsertOrgRoleArchived: %v", err)
+	}
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	content := config.DefaultConfig(paths) + `
+[org.roles."owner"]
+scope = ["*"]
+[org.roles."coordinator"]
+parent = "owner"
+scope = ["owner/*"]
+[org.roles."worker"]
+parent = "coordinator"
+scope = ["owner/repo"]
+`
+	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	decision, err := newHostDaemonMergeGate(store, gh, checkout, paths.Home).Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() {
+		t.Fatalf("decision = %+v, want gate miss", decision)
+	}
+	notes, err := store.ListWorkflowNotes(context.Background(), request.WorkflowID, 0)
+	if err != nil || len(notes) != 1 {
+		t.Fatalf("notes = %+v, err=%v; want one escalation", notes, err)
+	}
+	from, to, _, _, ok := workflow.ParseOrgEscalateNote(notes[0].Body)
+	if !ok || from != "worker" || to != "owner" {
+		t.Fatalf("archived-ancestor escalation = from=%q to=%q ok=%v, want worker->owner", from, to, ok)
+	}
+	outbox, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
+	if err != nil || len(outbox) != 1 || outbox[0].TargetRole != "owner" {
+		t.Fatalf("archived-ancestor outbox = %+v, err=%v; want live owner", outbox, err)
+	}
+}
+
 // The end-to-end test above pins mutable author and recipient behavior through
 // gate.Evaluate. This table pins the remaining target-selection branches.
 func TestMergeGateEscalationToResolvesChartBranches(t *testing.T) {
@@ -309,16 +356,46 @@ scope = ["other/repo"]
 			from: "vetrina", declared: false, want: "owner",
 		},
 		{
-			name: "absent chart falls back to the root name", body: "",
-			from: "appkit-demo", declared: false, want: "owner",
+			name: "absent chart has no live fallback", body: "",
+			from: "appkit-demo", declared: false, want: "",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			got := mergeGateEscalationTo(chart(t, test.body), test.from, test.declared)
+			cfg := chart(t, test.body)
+			got := mergeGateEscalationTo(loadOrgRoster(context.Background(), nil, cfg), cfg, test.from, test.declared)
 			if got != test.want {
 				t.Fatalf("mergeGateEscalationTo(%q, declared=%t) = %q, want %q", test.from, test.declared, got, test.want)
 			}
 		})
+	}
+}
+
+func TestMergeGateEscalationToRejectsArchivedOwnerFallback(t *testing.T) {
+	store := daemonWorkerStore(t)
+	if err := store.UpsertOrgRoleArchived(context.Background(), db.OrgRoleArchived{
+		Role: "owner", ArchivedAt: "2026-08-31T00:00:00Z",
+		ArchivedBy: "herdr-app", ObservedAt: "2026-08-31T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("UpsertOrgRoleArchived: %v", err)
+	}
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	content := config.DefaultConfig(paths) + `
+[org.roles."owner"]
+scope = ["*"]
+`
+	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadOrg(paths)
+	if err != nil {
+		t.Fatalf("LoadOrg: %v", err)
+	}
+	roster := loadOrgRoster(context.Background(), store, cfg)
+	if got := mergeGateEscalationTo(roster, cfg, "repo", false); got != "" {
+		t.Fatalf("mergeGateEscalationTo archived fallback = %q, want no recipient", got)
 	}
 }
 
@@ -350,7 +427,8 @@ scope = ["*"]
 	if err != nil {
 		t.Fatalf("LoadOrg: %v", err)
 	}
-	from, declared := mergeGateEscalationFrom(context.Background(), daemonWorkerStore(t), cfg, "owner/repo")
+	roster := loadOrgRoster(context.Background(), daemonWorkerStore(t), cfg)
+	from, declared := mergeGateEscalationFrom(roster, cfg, "owner/repo")
 	if from != "exact" || !declared {
 		t.Fatalf("mergeGateEscalationFrom = (%q, %t), want exact repo scope over deeper wildcard", from, declared)
 	}
@@ -385,7 +463,7 @@ scope = ["owner/repo"]
 	if err != nil {
 		t.Fatalf("LoadOrg: %v", err)
 	}
-	from, declared := mergeGateEscalationFrom(context.Background(), store, cfg, "owner/repo")
+	from, declared := mergeGateEscalationFrom(loadOrgRoster(context.Background(), store, cfg), cfg, "owner/repo")
 	if from != "coordinator" || !declared {
 		t.Fatalf("mergeGateEscalationFrom = (%q, %t), want live coordinator instead of archived alpha", from, declared)
 	}

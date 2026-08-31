@@ -636,11 +636,12 @@ path = ""
 # default, but only when an approved review verdict matches the exact current
 # head SHA and all SHA-scoped commit statuses and check-runs are green. A missing
 # review or CI signal leaves the PR open and escalates the specific miss from the
-# most-specific live role whose scope matches the repo to its nearest ancestor.
-# With no live match it addresses owner; a root match addresses itself. Routing
-# does not change based on predicted deliverability; org validate reports missing
-# wake routes and pane bindings. Set auto_merge = false globally or per repo as an
-# explicit
+# most-specific live role whose scope matches the repo to its nearest live
+# ancestor. With no live scope match it addresses a live owner; a root match
+# addresses itself. With no live upward recipient, the gate fails closed without
+# journaling an addressed note. Archive filtering does not predict delivery; org
+# validate reports missing wake routes and pane bindings. Set auto_merge = false
+# globally or per repo as an explicit
 # kill-switch; that deliberate operator choice leaves PRs open without escalation.
 # All keys can be set globally and overridden per repo under
 # [repos."owner/repo".merge_gate].

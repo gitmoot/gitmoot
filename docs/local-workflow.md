@@ -593,11 +593,13 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    verdict for the exact current head SHA and green SHA-scoped commit statuses
    and check-runs. A miss leaves the PR open, records an org escalation, and
    enqueues an addressed workflow-note wake. The sender is the most-specific live
-   org role whose scope matches the repo, and the recipient is its nearest chart
-   ancestor. With no live match, the recipient is the `owner` root; when the match
-   is already the root, the note addresses that root itself. Routing never changes
-   based on predicted deliverability; `org validate` reports missing wake routes
-   and pane bindings. Set `[merge_gate] auto_merge = false` globally or per
+   org role whose scope matches the repo, and the recipient is its nearest live
+   chart ancestor. With no live scope match, the recipient is the live `owner`
+   root; when the match is already the root, the note addresses that root itself.
+   If no live upward recipient exists, the gate fails closed without journaling
+   an addressed note. Archive filtering does not predict delivery; `org validate`
+   reports missing wake routes and pane bindings. Set
+   `[merge_gate] auto_merge = false` globally or per
    repository as
    an explicit kill-switch. The merge gate also checks local worktree cleanliness,
    branch freshness, and mergeability. Final merge work

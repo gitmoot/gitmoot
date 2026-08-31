@@ -2729,10 +2729,11 @@ Native task auto-merge is enabled by default only behind an exact-head approved
 review and green SHA-scoped commit statuses/check-runs. A gate miss parks the
 task as `awaiting_human_merge` and records an org escalation. It selects the
 most-specific live role whose scope matches the repo and addresses that role's
-nearest chart ancestor. With no live match it addresses `owner`; a root match
-addresses itself. Routing does not change based on predicted deliverability;
-`org validate` reports missing wake routes and pane bindings. Set
-`[repos."owner/repo".merge_gate] auto_merge = false` as an explicit
+nearest live chart ancestor. With no live scope match it addresses a live
+`owner`; a root match addresses itself. With no live upward recipient, the gate
+fails closed without journaling an addressed note. Archive filtering does not
+predict delivery; `org validate` reports missing wake routes and pane bindings.
+Set `[repos."owner/repo".merge_gate] auto_merge = false` as an explicit
 kill-switch; that deliberate hold does not escalate. Pipeline `allow_auto_merge`
 is independent, and an authorized `@gitmoot merge` remains an explicit override.
 
