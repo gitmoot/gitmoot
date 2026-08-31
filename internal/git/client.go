@@ -692,17 +692,42 @@ func (c Client) CloneOnlyCommit(ctx context.Context, path string) (string, error
 // not a proof that removal loses nothing: the object database goes with the
 // directory. Any unreachable commit is by construction absent from the trusted
 // remote's refs, since those are refs of this clone too.
+//
+// It FAILS CLOSED on anything it cannot parse. `git fsck` exits 0 while reporting
+// `unreachable unknown <sha>` for a corrupt object and while printing unpack or
+// missing-alternate errors on stderr, and an empty result read as "nothing to
+// preserve" would authorise deleting exactly the object stores that are already
+// damaged. Silence, and only silence, means the clone is disposable.
 func cloneUnreachableCommit(ctx context.Context, worktree Client) (string, error) {
 	result, err := worktree.run(ctx, "--no-replace-objects",
 		"fsck", "--unreachable", "--connectivity-only", "--no-progress", "--no-dangling")
 	if err != nil {
 		return "", err
 	}
-	for _, line := range strings.Split(result.Stdout, "\n") {
-		fields := strings.Fields(strings.TrimSpace(line))
-		if len(fields) == 3 && fields[0] == "unreachable" && fields[1] == "commit" {
-			return fields[2], nil
+	var unparsed []string
+	for _, stream := range []string{result.Stdout, result.Stderr} {
+		for _, raw := range strings.Split(stream, "\n") {
+			line := strings.TrimSpace(raw)
+			if line == "" || strings.HasPrefix(line, "Checking ") || strings.HasPrefix(line, "notice: ") {
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) == 3 && fields[0] == "unreachable" {
+				if fields[1] == "commit" {
+					return fields[2], nil
+				}
+				if fields[1] == "blob" || fields[1] == "tree" || fields[1] == "tag" {
+					// Unreachable non-commit objects are ordinary garbage: a commit that
+					// referenced them would itself be reported.
+					continue
+				}
+			}
+			unparsed = append(unparsed, line)
 		}
+	}
+	if len(unparsed) > 0 {
+		return "", fmt.Errorf("git fsck reported %d line(s) this proof cannot interpret, so the object database is unprovable: %s",
+			len(unparsed), strings.Join(unparsed[:min(len(unparsed), 3)], "; "))
 	}
 	return "", nil
 }

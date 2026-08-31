@@ -235,6 +235,26 @@ func recordDelegationCleanupFailure(ctx context.Context, worker jobWorker, mode,
 	return obligation, nil
 }
 
+// deferDelegationCleanupContention reschedules a candidate whose only problem was
+// a busy checkout lock. Contention is not failure: counting it spends the
+// three-attempt retry budget and quarantines an obligation that would have
+// succeeded as soon as the lock cleared.
+func deferDelegationCleanupContention(ctx context.Context, worker jobWorker, mode, jobID, path string, err error, now time.Time) error {
+	if _, deferErr := worker.Store.DeferCleanupObligation(
+		context.WithoutCancel(ctx), jobID, path, db.CleanupReasonCheckoutLock, now, now.Add(delegationCleanupRetryDelay),
+	); deferErr != nil {
+		logDelegationReclaimFailure(worker.Stdout, mode, "lock", jobID, path, fmt.Errorf("%w (persist cleanup obligation: %v)", err, deferErr))
+		return fmt.Errorf("defer contended cleanup obligation for %s: %w", jobID, deferErr)
+	}
+	logDelegationReclaimFailure(worker.Stdout, mode, "lock", jobID, path, err)
+	return nil
+}
+
+func delegationCleanupContended(err error) bool {
+	var blocked workflow.BlockedError
+	return errors.As(err, &blocked)
+}
+
 func delegationCleanupTargetContained(worker jobWorker, job db.Job, obligation db.CleanupObligation) error {
 	payload, err := workflow.ParseJobPayload(job.Payload)
 	if err != nil {
@@ -1212,6 +1232,12 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 		attempts++
 		reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, now.Add(-ttl))
 		if err != nil {
+			if delegationCleanupContended(err) {
+				if deferErr := deferDelegationCleanupContention(ctx, worker, "aged", job.ID, path, err, now); deferErr != nil {
+					return stopDelegationCleanupPass(deferErr)
+				}
+				continue
+			}
 			if _, persistErr := recordDelegationCleanupFailure(ctx, worker, "aged", "reclaim", job.ID, path, err, now); persistErr != nil {
 				return stopDelegationCleanupPass(persistErr)
 			}

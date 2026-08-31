@@ -1798,9 +1798,12 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 	if !ok || manager == nil {
 		return false, errors.New("delegation worktree manager cannot prove fix worktree lineage")
 	}
-	// The proof is ref-based, not branch-based, so a payload without a branch is
-	// provable: the trusted remote's refs decide, never the recorded branch name.
-	clean, err := manager.WorktreePristineAt(ctx, path)
+	// Cleanliness here means NO UNSAVED WORK — tracked modifications and untracked
+	// files. Ignored content is deliberately not consulted: the repository itself
+	// declares it regenerable, and requiring a clone with zero build output made
+	// the whole pass inert on ordinary repositories. Committed work is covered by
+	// the object-database proof below, which is the real guarantee.
+	clean, err := manager.WorktreeCleanAt(ctx, path)
 	if err != nil {
 		return false, fmt.Errorf("prove aged terminal fix worktree clean: %w", err)
 	}
@@ -1836,6 +1839,13 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 	// double-daemon overlap). The read-only proofs and the remote fetch above stay
 	// outside the lock: holding a shared checkout lock across a two-minute network
 	// timeout would delay every other pass that takes the same key.
+	//
+	// An empty checkout path makes that lock a silent no-op, so the removal refuses
+	// rather than proceeding unserialised: an unenforceable claim is worse than a
+	// retained directory.
+	if strings.TrimSpace(e.DelegationCheckout) == "" {
+		return false, errors.New("refusing TTL fix clone removal: no registered checkout to serialise reclaimers on")
+	}
 	lockCtx := context.WithoutCancel(ctx)
 	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(lockCtx, e.Store, e.DelegationCheckout, "worktree-ttl-reclaim:"+jobID, time.Now().UTC())
 	if err != nil {
@@ -1873,7 +1883,7 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 		}
 		return false, e.recordFixCloneRetainedLive(ctx, jobID, path)
 	}
-	clean, err = manager.WorktreePristineAt(ctx, quarantine)
+	clean, err = manager.WorktreeCleanAt(ctx, quarantine)
 	if err != nil {
 		return restore(fmt.Errorf("recheck quarantined fix clone clean: %w", err))
 	}
@@ -1943,24 +1953,18 @@ func (e Engine) recordFixCloneRetainedLive(ctx context.Context, jobID, path stri
 		fmt.Sprintf("fix clone %s retained after TTL: a live process holds a working directory inside it", path))
 }
 
-// recordFixCloneRetention appends a retention event once PER REASON PER JOB. It
-// dedupes on the event KIND rather than the message, because a later retention
-// for the same reason naming a different commit is the same standing fact, and it
-// dedupes on the event log rather than the cleanup obligation, because the
-// obligation reason is rewritten by the daemon's generic per-pass deferral and a
-// crash between the two writes must not re-announce on the next pass.
+// recordFixCloneRetention appends a retention event once PER REASON PER JOB.
+//
+// It dedupes on the event KIND, because a later retention for the same reason
+// naming a different commit is the same standing fact; on the event LOG rather
+// than the cleanup obligation, because the obligation reason is rewritten by the
+// daemon's generic per-pass deferral and a crash between two writes must not
+// re-announce; and in ONE statement, because a read-then-write pair lets two
+// concurrent reclaimers both see no event and both insert.
 func (e Engine) recordFixCloneRetention(ctx context.Context, jobID, kind, message string) error {
-	opCtx := context.WithoutCancel(ctx)
-	events, err := e.Store.ListJobEvents(opCtx, jobID)
-	if err != nil {
-		return err
-	}
-	for _, event := range events {
-		if event.Kind == kind {
-			return nil
-		}
-	}
-	return e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: kind, Message: message})
+	return e.Store.AddJobEventIfAbsent(context.WithoutCancel(ctx), db.JobEvent{
+		JobID: jobID, Kind: kind, Message: message,
+	})
 }
 
 // ReclaimAgedTerminalDelegationWorktreeOutcome is the reporting form used by

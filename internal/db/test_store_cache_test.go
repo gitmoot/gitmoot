@@ -55,6 +55,7 @@ func TestStoreOpenPolicy(t *testing.T) {
 		"TestCanaryMigrationOnPreExistingDB":                                     true,
 		"TestCleanupObligationsMigrationFreshAndUpgrade":                         true,
 		"TestCleanupObligationsRebuildPreservesLegacyRows":                       true,
+		"TestMigrationsUpgradeFromPreviousReleasedVersion":                       true,
 		"TestExecBackendAttemptsMigrationFreshAndCached":                         true,
 		"TestExternallyDrivenColumnMigratesOnPreExistingDB":                      true,
 		"TestIncrementalVacuumReclaimsOnlyRequestedPages":                        true,

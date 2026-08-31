@@ -599,8 +599,8 @@ siblings. Every retention records its reason once per job:
 `delegation_worktree_retained_unpublished` (with obligation reason
 `unpublished_commits`; squash-merged branches land here by design, because a
 squash publishes the content and not the commits),
-`delegation_worktree_retained_dirty` (tracked, untracked or ignored content — the
-pristine check includes ignored files), `delegation_worktree_retained_live` (a
+`delegation_worktree_retained_dirty` (tracked or untracked content; ignored
+content is deliberately not consulted), `delegation_worktree_retained_live` (a
 live process holds a working directory inside it), and
 `delegation_worktree_liveness_unknown` (the process table could not be read,
 which is what makes the pass inert). Both passes are bounded at eight proofs per

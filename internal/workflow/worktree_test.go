@@ -1665,6 +1665,7 @@ func TestEngineReclaimAgedFixCloneRequiresPublishedObjectDatabase(t *testing.T) 
 			}
 			engine := testEngine(store)
 			engine.Home = home
+			engine.DelegationCheckout = t.TempDir()
 			engine.DelegationWorktrees = manager
 
 			reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
@@ -1793,6 +1794,7 @@ func TestEngineReclaimAgedFixCloneQuarantinesBeforeRemoval(t *testing.T) {
 	}
 	engine := testEngine(store)
 	engine.Home = home
+	engine.DelegationCheckout = t.TempDir()
 	engine.DelegationWorktrees = manager
 
 	reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
@@ -1852,6 +1854,7 @@ func TestEngineReclaimAgedFixCloneRefusesLeftoverQuarantine(t *testing.T) {
 	}
 	engine := testEngine(store)
 	engine.Home = home
+	engine.DelegationCheckout = t.TempDir()
 	engine.DelegationWorktrees = &fakeWorktreeManager{cleanSet: true, clean: true, cloneOnly: map[string]string{}}
 
 	if _, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour)); err == nil ||
@@ -1929,6 +1932,7 @@ func TestEngineReclaimAgedFixCloneRecordsDirtyRetention(t *testing.T) {
 	}
 	engine := testEngine(store)
 	engine.Home = home
+	engine.DelegationCheckout = t.TempDir()
 	engine.DelegationWorktrees = &fakeWorktreeManager{cleanSet: true, clean: false}
 
 	for attempt := 0; attempt < 2; attempt++ {
@@ -1993,6 +1997,7 @@ func TestEngineReclaimAgedFixCloneRecordsLiveRetentionOncePerReason(t *testing.T
 	}
 	engine := testEngine(store)
 	engine.Home = home
+	engine.DelegationCheckout = t.TempDir()
 	engine.DelegationWorktrees = &fakeWorktreeManager{cleanSet: true, clean: true}
 	engine.WorktreeHasLiveProcess = func(string) bool { return true }
 
@@ -2191,6 +2196,7 @@ func TestEngineReclaimAgedFixCloneRecordsInconclusiveLiveness(t *testing.T) {
 	}
 	engine := testEngine(store)
 	engine.Home = home
+	engine.DelegationCheckout = t.TempDir()
 	engine.DelegationWorktrees = &fakeWorktreeManager{cleanSet: true, clean: true}
 	engine.WorktreeHasLiveProcess = nil
 	engine.WorktreeLiveness = func(string) (bool, bool) { return false, false }
@@ -2260,6 +2266,7 @@ func TestEngineReclaimAgedFixCloneRestoresInterruptedQuarantine(t *testing.T) {
 	}
 	engine := testEngine(store)
 	engine.Home = home
+	engine.DelegationCheckout = t.TempDir()
 	engine.DelegationWorktrees = &fakeWorktreeManager{cleanSet: true, clean: true, cloneOnly: map[string]string{}}
 
 	reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))

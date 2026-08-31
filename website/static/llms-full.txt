@@ -2886,8 +2886,9 @@ is visible instead of silent: `delegation_worktree_retained_unpublished` (also
 sets cleanup-obligation reason `unpublished_commits`; a squash merge publishes the
 content under a new commit while the branch commits stay clone-only, so a
 squash-merged clone is retained by design), `delegation_worktree_retained_dirty`
-(tracked, untracked or ignored content — the pristine check includes ignored
-files, so leftover build output keeps the clone),
+(tracked or untracked content — unsaved work; ignored content is deliberately
+not consulted, because the repository declares it regenerable and requiring a
+clone with no build output made the pass inert),
 `delegation_worktree_retained_live` (a live process holds a working directory
 inside it) and `delegation_worktree_liveness_unknown` (the process table could not
 be read, which is what makes the whole pass inert).
@@ -17274,8 +17275,8 @@ absent original path as a completed removal while such a sibling exists, and
 `delegation_worktree_retained_unpublished` with obligation reason
 `unpublished_commits` (the normal outcome for a squash-merged branch, whose
 content is published while its commits are not),
-`delegation_worktree_retained_dirty` when the tree still holds tracked, untracked
-or ignored content, `delegation_worktree_retained_live` when a process still has a
+`delegation_worktree_retained_dirty` when the tree still holds tracked or untracked
+content, `delegation_worktree_retained_live` when a process still has a
 working directory inside the clone, and `delegation_worktree_liveness_unknown`
 when the process table cannot be read — the state that makes the whole pass inert.
 The shared checkout lock is held only across the rename, re-proof and delete, not

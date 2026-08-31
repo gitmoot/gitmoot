@@ -122,6 +122,53 @@ func TestCleanupObligationsRebuildPreservesLegacyRows(t *testing.T) {
 	}
 }
 
+// A positional migration list must be a strict prefix-extension of the released
+// one: a database already at the previous version has to upgrade by applying only
+// the NEW tail. A fresh-init test cannot fail on a mis-ordered tail, which is
+// exactly how a merge can brick every existing database while every test passes.
+func TestMigrationsUpgradeFromPreviousReleasedVersion(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "previous-release.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	previous := &Store{db: raw}
+	// Everything except this branch's own tail: the state of a released database.
+	for version, migration := range migrations[:len(migrations)-1] {
+		if err := previous.applyMigration(ctx, version+1, migration); err != nil {
+			t.Fatalf("applyMigration(%d): %v", version+1, err)
+		}
+	}
+	var applied int
+	if err := raw.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&applied); err != nil {
+		t.Fatalf("read applied version: %v", err)
+	}
+	if applied != len(migrations)-1 {
+		t.Fatalf("applied version = %d, want %d", applied, len(migrations)-1)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close previous-release store: %v", err)
+	}
+
+	upgraded, err := openRealTestStore(t, path)
+	if err != nil {
+		t.Fatalf("upgrade a database at the previous released version: %v", err)
+	}
+	t.Cleanup(func() { _ = upgraded.Close() })
+	var final int
+	if err := upgraded.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&final); err != nil {
+		t.Fatalf("read upgraded version: %v", err)
+	}
+	if final != len(migrations) {
+		t.Fatalf("upgraded version = %d, want %d", final, len(migrations))
+	}
+	now := time.Now().UTC()
+	if _, err := upgraded.DeferCleanupObligation(ctx, "job-upgraded", "/tmp/managed/upgraded", CleanupReasonUnpublishedCommits, now, now.Add(time.Minute)); err != nil {
+		t.Fatalf("widened reason after upgrade: %v", err)
+	}
+}
+
 func TestCleanupObligationAcceptsUnpublishedCommitsReason(t *testing.T) {
 	ctx := context.Background()
 	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))

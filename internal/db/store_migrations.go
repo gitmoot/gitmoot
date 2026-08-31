@@ -2268,6 +2268,19 @@ CREATE TABLE pull_request_auto_fix_policies (
 	PRIMARY KEY (repo_full_name, pull_request)
 );
 	`,
+	// #1714 current-head observation for the visible gitmoot/merge-gate status.
+	// This state is intentionally separate from merge_gates: status bookkeeping
+	// must never overwrite or gate the policy decision it describes.
+	`
+CREATE TABLE merge_gate_status_observations (
+	repo_full_name TEXT NOT NULL COLLATE NOCASE,
+	pull_request INTEGER NOT NULL CHECK(pull_request > 0),
+	head_sha TEXT NOT NULL,
+	kind TEXT NOT NULL,
+	updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+	PRIMARY KEY (repo_full_name, pull_request)
+);
+	`,
 	// #1684 disposable clones retained because their object database still holds
 	// unpublished commits. SQLite cannot extend a CHECK in place, so the table is
 	// rebuilt; every existing row keeps its state, reason and retry accounting.
@@ -2308,18 +2321,5 @@ CREATE UNIQUE INDEX idx_cleanup_obligations_owner_path
 CREATE INDEX idx_cleanup_obligations_due
 	ON cleanup_obligations(state, next_attempt_at, owner_job_id)
 	WHERE state IN ('pending', 'retryable');
-	`,
-	// #1714 current-head observation for the visible gitmoot/merge-gate status.
-	// This state is intentionally separate from merge_gates: status bookkeeping
-	// must never overwrite or gate the policy decision it describes.
-	`
-CREATE TABLE merge_gate_status_observations (
-	repo_full_name TEXT NOT NULL COLLATE NOCASE,
-	pull_request INTEGER NOT NULL CHECK(pull_request > 0),
-	head_sha TEXT NOT NULL,
-	kind TEXT NOT NULL,
-	updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-	PRIMARY KEY (repo_full_name, pull_request)
-);
 	`,
 }

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -741,6 +742,50 @@ func TestFinishDelegationCleanupAttemptKeepsQuarantinedCloneUnfinished(t *testin
 	}
 	if obligation.State != db.CleanupObligationRemoved {
 		t.Fatalf("obligation = %+v, want removed once no quarantine survives", obligation)
+	}
+}
+
+// Lock contention is not failure. Counting it spends the three-attempt retry
+// budget and quarantines an obligation that would have succeeded once the lock
+// cleared, so a contended pass must DEFER instead of recording a failure.
+func TestDeferDelegationCleanupContentionKeepsRetryBudget(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	})
+	worker := defaultJobWorker(store, io.Discard, home)
+	now := time.Now().UTC()
+	path := filepath.Join(home, "worktrees", "owner--repo", "fixes", "job-contended")
+	contended := fmt.Errorf("lock checkout for TTL fix clone reclaim: %w",
+		workflow.BlockedError{Reason: "This checkout is already being mutated by another Gitmoot task."})
+	if !delegationCleanupContended(contended) {
+		t.Fatal("wrapped BlockedError was not classified as contention")
+	}
+	if delegationCleanupContended(errors.New("remove failed")) {
+		t.Fatal("an ordinary failure was classified as contention")
+	}
+
+	for attempt := 0; attempt < delegationCleanupRetryBudget+1; attempt++ {
+		if err := deferDelegationCleanupContention(ctx, worker, "aged", "job-contended", path, contended, now); err != nil {
+			t.Fatalf("deferDelegationCleanupContention: %v", err)
+		}
+	}
+	obligation, err := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID("job-contended", path))
+	if err != nil {
+		t.Fatalf("GetCleanupObligation: %v", err)
+	}
+	if obligation.State != db.CleanupObligationRetryable {
+		t.Fatalf("obligation state = %q, want retryable after repeated contention", obligation.State)
+	}
+	if obligation.AttemptCount != 0 {
+		t.Fatalf("attempt count = %d, want 0: contention must not spend the retry budget", obligation.AttemptCount)
+	}
+	if obligation.Reason != db.CleanupReasonCheckoutLock {
+		t.Fatalf("reason = %q, want %q", obligation.Reason, db.CleanupReasonCheckoutLock)
 	}
 }
 
