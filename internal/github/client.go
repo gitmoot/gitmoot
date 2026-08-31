@@ -1085,9 +1085,14 @@ func (c *GhClient) UpdatePullRequestBranch(ctx context.Context, input UpdatePull
 	return response, nil
 }
 
+// GetCombinedStatus reads the combined commit status for a ref. per_page=100
+// matches ListCheckRunsForRef below: GitHub returns at most 30 statuses by
+// default, and a truncated page makes a real gitmoot/merge-gate verdict look
+// ABSENT to callers, which now causes a marker WRITE over that verdict rather
+// than a harmless no-op (#1714 round-8 review).
 func (c *GhClient) GetCombinedStatus(ctx context.Context, repo Repository, ref string) (CombinedStatus, error) {
 	var status CombinedStatus
-	err := c.apiJSON(ctx, false, &status, endpoint(repo, "commits", ref, "status"))
+	err := c.apiJSON(ctx, false, &status, endpoint(repo, "commits", ref, "status")+"?per_page=100")
 	return status, err
 }
 
