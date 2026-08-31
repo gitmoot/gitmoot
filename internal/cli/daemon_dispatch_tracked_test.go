@@ -480,14 +480,30 @@ func TestTrackedPoolIsolationHonorsSamePassRuntimeSibling(t *testing.T) {
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 	// ONE codex agent with a session ref: both jobs share runtime key
-	// "runtime:codex:sess-1", so only one may run at a time.
-	seedDaemonWorkerAgent(t, store, "coder", runtime.CodexRuntime, "sess-1", []string{"ask"}, "owner/repo")
+	// "runtime:codex:550e8400-e29b-41d4-a716-446655440055".
+	seedDaemonWorkerAgent(t, store, "coder", runtime.CodexRuntime, "550e8400-e29b-41d4-a716-446655440055", []string{"ask"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-wt", Agent: "coder", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1, WorktreePath: filepath.Join(t.TempDir(), "wt-job-wt")})
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-iso", Agent: "coder", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 2})
 
 	adapter := newWedgeBlockingAdapter("job-wt")
 	worker := poolSchedulerWorker(t, store, adapter, true)
 	worker.ConfigHome = home // enable pool isolation worktrees
+	worker.CheckoutValidator = func(_ context.Context, _ db.Job, payload workflow.JobPayload, _ runtime.Agent) (string, error) {
+		if isolated := strings.TrimSpace(payload.WorktreePath); payload.ReadOnlySeat && isolated != "" {
+			return isolated, nil
+		}
+		return checkout, nil
+	}
+	codexTranscript := `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440055"}` + "\n" +
+		`{"type":"turn.started"}` + "\n" +
+		`{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":` + strconv.Quote(poolSchedulerAskResult) + `}}` + "\n" +
+		`{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}`
+	worker.AdapterFactory = func(_ runtime.Agent, deliveryCheckout string) (workflow.DeliveryAdapter, error) {
+		if sameCheckoutPath(deliveryCheckout, checkout) {
+			return adapter, nil
+		}
+		return runtime.CodexAdapter{Runner: &sandboxAdapterCaptureRunner{stdout: codexTranscript}, Dir: deliveryCheckout}, nil
+	}
 	tracker := newInflightJobTracker(ctx)
 	// An external in-flight job holds the shared checkout for the whole test, so
 	// job-iso is always checkout-contended (isolation is its only way to run).
@@ -528,7 +544,8 @@ func TestTrackedPoolIsolationHonorsSamePassRuntimeSibling(t *testing.T) {
 		t.Fatalf("job-wt state = %q after release, want succeeded", got)
 	}
 	if got := waitForJobState(t, store, "job-iso", string(workflow.JobSucceeded), 10*time.Second); got != string(workflow.JobSucceeded) {
-		t.Fatalf("job-iso state = %q after the session freed, want succeeded (held back forever instead of isolated)", got)
+		events, _ := store.ListJobEvents(ctx, "job-iso")
+		t.Fatalf("job-iso state = %q after the session freed, want succeeded (held back forever instead of isolated); events=%+v", got, events)
 	}
 	job, err = store.GetJob(ctx, "job-iso")
 	if err != nil {

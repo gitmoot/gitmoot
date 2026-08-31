@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -43,56 +44,57 @@ var toolCacheEnvSubdirs = []struct{ env, subdir string }{
 // widening WritablePaths for them is a harmless no-op — nothing reads it — and
 // the env vars alone suffice to redirect their cache.
 //
-// codex only honors WritablePaths under the workspace-write autonomy policy
-// (codexSandboxArgs' --add-dir loop; read-only mode grants nothing). Pointing
-// UV_CACHE_DIR/GOCACHE/etc. at the shared dir for a read-only codex job would
-// redirect tools to a directory their sandbox cannot write, breaking Go builds
-// and degrading uv/pip/npm — worse than leaving the env unset. So a read-only
-// (or unrecognized) codex autonomy policy is a no-op here; danger-full-access
-// is unrestricted and proceeds like any other job. A ChatSeat is ALSO a no-op:
-// codexSandboxArgs returns workspace-write for a ChatSeat WITHOUT ever reaching
-// the --add-dir loop (its only implicit writable roots are workdir/tmp), so a
-// chat seat never gets the shared directory writable regardless of policy —
-// injecting the env for it would reproduce the exact same-directory-unwritable
-// failure this gate exists to prevent (#1113 finder, confirmed against
-// TestCodexDeliverChatSeatSandbox).
-//
-// Errors here are the caller's to treat as fail-open: this is disk hygiene, not
-// a security precondition, and must never fail a job.
+// Read-only seats are the exception: each worktree receives its own cache root,
+// because an untrusted review or ask must not poison state consumed by another
+// job. Their cache grant is a security boundary and therefore fails closed.
 func applyIsolatedToolCacheGrants(paths config.Paths, payload workflow.JobPayload, agent *runtime.Agent) ([]string, error) {
-	if strings.TrimSpace(payload.WorktreePath) == "" {
+	worktree := strings.TrimSpace(payload.WorktreePath)
+	if worktree == "" {
 		return nil, nil
 	}
 	if agent.Runtime == runtime.CodexRuntime {
 		if agent.ChatSeat {
 			return nil, nil
 		}
-		switch runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {
-		case runtime.AutonomyPolicyWorkspaceWrite, runtime.AutonomyPolicyDangerFullAccess:
-			// proceeds below
-		default:
-			return nil, nil
+		if !agent.ReadOnlySeat {
+			switch runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {
+			case runtime.AutonomyPolicyWorkspaceWrite, runtime.AutonomyPolicyDangerFullAccess:
+				// proceeds below
+			default:
+				return nil, nil
+			}
 		}
 	}
 	policy, err := config.LoadToolCache(paths)
 	if err != nil {
 		return nil, fmt.Errorf("load tool cache config: %w", err)
 	}
-	if !policy.Enabled || strings.TrimSpace(policy.Dir) == "" {
+	if !policy.Enabled && !agent.ReadOnlySeat {
 		return nil, nil
 	}
-	if err := os.MkdirAll(policy.Dir, 0o700); err != nil {
-		return nil, fmt.Errorf("create shared tool cache dir %s: %w", policy.Dir, err)
+	cacheRoot := strings.TrimSpace(policy.Dir)
+	if cacheRoot == "" {
+		cacheRoot = filepath.Join(paths.Home, "cache", "review-tools")
+	}
+	if agent.ReadOnlySeat {
+		sum := sha256.Sum256([]byte(filepath.Clean(worktree)))
+		cacheRoot = filepath.Join(cacheRoot, "read-only", fmt.Sprintf("%x", sum[:8]))
+		if err := validateReadOnlyWritablePaths(worktree, []string{cacheRoot}); err != nil {
+			return nil, err
+		}
+	}
+	if err := os.MkdirAll(cacheRoot, 0o700); err != nil {
+		return nil, fmt.Errorf("create tool cache dir %s: %w", cacheRoot, err)
 	}
 	env := make([]string, 0, len(toolCacheEnvSubdirs))
 	for _, e := range toolCacheEnvSubdirs {
-		dir := filepath.Join(policy.Dir, e.subdir)
+		dir := filepath.Join(cacheRoot, e.subdir)
 		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return nil, fmt.Errorf("create shared tool cache subdir %s: %w", dir, err)
+			return nil, fmt.Errorf("create tool cache subdir %s: %w", dir, err)
 		}
 		env = append(env, e.env+"="+dir)
 	}
-	agent.WritablePaths = appendUniquePath(agent.WritablePaths, policy.Dir)
+	agent.WritablePaths = appendUniquePath(agent.WritablePaths, cacheRoot)
 	return env, nil
 }
 

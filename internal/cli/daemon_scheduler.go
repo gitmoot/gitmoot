@@ -2163,6 +2163,10 @@ func (w jobWorker) allocatePoolIsolationWorktree(ctx context.Context, job db.Job
 		return poolIsolatedDispatch{}, false, nil
 	}
 	payload.WorktreePath = path
+	switch strings.TrimSpace(job.Type) {
+	case "ask", "review":
+		payload.ReadOnlySeat = true
+	}
 	// The detached worktree is the COMMITTED TIP of the base ref, so it omits
 	// gitignored paths (e.g. vendored repos/**) and uncommitted working-tree
 	// changes. Point the isolated read-only job at the canonical repo checkout so an

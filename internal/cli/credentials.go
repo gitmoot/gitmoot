@@ -267,6 +267,12 @@ func graftRuntimeBaseRunner(outer subprocess.Runner, curated subprocess.Runner) 
 		runner.ScratchDirs = append([]string(nil), base.ScratchDirs...)
 		runner.MaxOutputBytes = base.MaxOutputBytes
 		return runner
+	case *credgw.Runner:
+		if runner.Inner == nil {
+			runner.Inner = subprocess.GroupRunner{}
+		}
+		runner.Inner = graftRuntimeBaseRunner(runner.Inner, curated)
+		return runner
 	case subprocess.GroupRunner:
 		return curated
 	case *subprocess.GroupRunner:

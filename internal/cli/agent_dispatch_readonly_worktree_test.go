@@ -54,10 +54,10 @@ func TestDispatchBackgroundAskAllocatesReadOnlyWorktree(t *testing.T) {
 	store, home := blockerE2EHome(t)
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	// Shell runtime, ask-only: a background dispatch enqueues and returns before any
-	// delivery, so the command body is irrelevant here.
-	seedDaemonWorkerAgent(t, store, "responder", runtime.ShellRuntime, "printf '%s' '{}'", []string{"ask"}, "owner/repo")
-
+	configDir := filepath.Join(t.TempDir(), "claude-profile")
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	// A background dispatch enqueues and returns before any delivery.
+	seedDaemonWorkerAgent(t, store, "responder", runtime.ClaudeRuntime, "550e8400-e29b-41d4-a716-446655440002", []string{"ask"}, "owner/repo")
 	out, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
 		RepoFlag:     "owner/repo",
 		Agent:        "responder",
@@ -82,6 +82,12 @@ func TestDispatchBackgroundAskAllocatesReadOnlyWorktree(t *testing.T) {
 	}
 	if !payload.ReadOnlyWorktree {
 		t.Fatal("background ask payload ReadOnlyWorktree = false, want true (disposal marker for a top-level read-only worktree)")
+	}
+	if !payload.ReadOnlySeat {
+		t.Fatal("background ask payload ReadOnlySeat = false, want hard runtime isolation")
+	}
+	if payload.RuntimeConfigDir != configDir {
+		t.Fatalf("background ask RuntimeConfigDir = %q, want dispatch profile %q", payload.RuntimeConfigDir, configDir)
 	}
 	if payload.HeadSHA != "" {
 		t.Fatalf("background ask payload HeadSHA = %q, want cleared (validate against the fresh worktree HEAD)", payload.HeadSHA)
@@ -110,6 +116,9 @@ func TestDispatchReviewAllocatesDistinctExactHeadWorktrees(t *testing.T) {
 	store, home := blockerE2EHome(t)
 	checkout, firstHead, secondHead := readonlyReviewWorktreeGitCheckout(t)
 	seedReviewDispatchFixture(t, store, checkout)
+	configDir := filepath.Join(t.TempDir(), "claude-profile")
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime, "550e8400-e29b-41d4-a716-446655440002", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
 		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
 	})
@@ -160,11 +169,14 @@ func TestDispatchReviewAllocatesDistinctExactHeadWorktrees(t *testing.T) {
 		{name: "first", payload: first, head: firstHead},
 		{name: "second", payload: second, head: secondHead},
 	} {
-		if !got.payload.ReadOnlyWorktree || strings.TrimSpace(got.payload.WorktreePath) == "" {
-			t.Fatalf("%s payload lacks owned read-only worktree: %+v", got.name, got.payload)
+		if !got.payload.ReadOnlyWorktree || !got.payload.ReadOnlySeat || strings.TrimSpace(got.payload.WorktreePath) == "" {
+			t.Fatalf("%s payload lacks owned worktree or read-only seat marker: %+v", got.name, got.payload)
 		}
 		if got.payload.HeadSHA != got.head {
 			t.Fatalf("%s payload HeadSHA=%q, want preserved %q", got.name, got.payload.HeadSHA, got.head)
+		}
+		if got.payload.RuntimeConfigDir != configDir {
+			t.Fatalf("%s payload RuntimeConfigDir=%q, want dispatch profile %q", got.name, got.payload.RuntimeConfigDir, configDir)
 		}
 		if actual := readonlyWorktreeHead(t, got.payload.WorktreePath); actual != got.head {
 			t.Fatalf("%s worktree HEAD=%q, want %q", got.name, actual, got.head)
@@ -190,6 +202,17 @@ func TestDispatchReviewAllocatesDistinctExactHeadWorktrees(t *testing.T) {
 		if scannerInputs[i] != want {
 			t.Fatalf("review scanner input[%d]=%+v, want %+v", i, scannerInputs[i], want)
 		}
+	}
+}
+
+func TestReviewReadOnlyWorktreeCapacityRejectsUnsupportedPlatform(t *testing.T) {
+	original := reviewReadOnlyWorkdirSupported
+	reviewReadOnlyWorkdirSupported = func() bool { return false }
+	t.Cleanup(func() { reviewReadOnlyWorkdirSupported = original })
+
+	err := reviewReadOnlyWorktreeCapacity(t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "supported only on Linux") {
+		t.Fatalf("reviewReadOnlyWorktreeCapacity error = %v, want early Linux-only rejection", err)
 	}
 }
 
@@ -255,8 +278,8 @@ func TestDispatchTaskBearingAskDoesNotAllocateReviewWorktree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if payload.ReadOnlyWorktree || payload.WorktreePath != "" {
-		t.Fatalf("task-bearing ask unexpectedly allocated per-job worktree: %+v", payload)
+	if payload.ReadOnlyWorktree || payload.ReadOnlySeat || payload.WorktreePath != "" {
+		t.Fatalf("task-bearing ask unexpectedly allocated or marked a per-job read-only seat: %+v", payload)
 	}
 	wantPath, err := normalizeTaskWorktreePath(checkout)
 	if err != nil {

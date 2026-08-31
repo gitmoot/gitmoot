@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -489,7 +490,7 @@ func TestRuntimeCredentialCurationForegroundAndDaemonE2E(t *testing.T) {
 		for _, background := range []bool{false, true} {
 			name := fmt.Sprintf("curation-%t/background-%t", enabled, background)
 			t.Run(name, func(t *testing.T) {
-				home, store, checkout := runtimeOverrideE2EHome(t)
+				home, store, _ := runtimeOverrideE2EHome(t)
 				paths := config.PathsForHome(home)
 				body := "\n[credentials]\nenv_curation = false\n"
 				if enabled {
@@ -498,16 +499,18 @@ func TestRuntimeCredentialCurationForegroundAndDaemonE2E(t *testing.T) {
 				if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+body), 0o600); err != nil {
 					t.Fatal(err)
 				}
-				evidence := filepath.Join(checkout, "credential-env.txt")
-				script := fmt.Sprintf(`env | sort > %q
-if test "$GH_CONFIG_DIR" != /tmp/ambient-gh-config && test -n "$GH_CONFIG_DIR"; then
-  printf 'GH_EMPTY=' >> %q
-  test -z "$(find "$GH_CONFIG_DIR" -mindepth 1 -print -quit)" && echo yes >> %q || echo no >> %q
-  printf 'GH_MODE=' >> %q
-  stat -c %%a "$GH_CONFIG_DIR" >> %q
+				script := `gh_empty=na
+gh_mode=na
+if test "${GH_CONFIG_DIR-unset}" != /tmp/ambient-gh-config && test -n "${GH_CONFIG_DIR:-}"; then
+  test -z "$(find "$GH_CONFIG_DIR" -mindepth 1 -print -quit)" && gh_empty=yes || gh_empty=no
+  gh_mode=$(stat -c %a "$GH_CONFIG_DIR")
 fi
-printf '%%s' '{"gitmoot_result":{"decision":"approved","summary":"credential e2e","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`,
-					evidence, evidence, evidence, evidence, evidence, evidence)
+path_set=no
+home_set=no
+test -n "${PATH:-}" && path_set=yes
+test -n "${HOME:-}" && home_set=yes
+printf '{"gitmoot_result":{"decision":"approved","summary":"PATH_SET=%s|HOME_SET=%s|GH_TOKEN=%s|GITHUB_TOKEN=%s|CLAUDE_CODE_OAUTH_TOKEN=%s|SSH_AUTH_SOCK=%s|GH_CONFIG_DIR=%s|GH_PROMPT_DISABLED=%s|GH_EMPTY=%s|GH_MODE=%s","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}' \
+  "$path_set" "$home_set" "${GH_TOKEN-unset}" "${GITHUB_TOKEN-unset}" "${CLAUDE_CODE_OAUTH_TOKEN-unset}" "${SSH_AUTH_SOCK-unset}" "${GH_CONFIG_DIR-unset}" "${GH_PROMPT_DISABLED-unset}" "$gh_empty" "$gh_mode"`
 				args := []string{
 					"agent", "ask", "maintainer", "inspect environment",
 					"--home", home,
@@ -523,33 +526,52 @@ printf '%%s' '{"gitmoot_result":{"decision":"approved","summary":"credential e2e
 				if code := Run(args, &stdout, &stderr); code != 0 {
 					t.Fatalf("agent ask exit=%d stderr=%s", code, stderr.String())
 				}
+				var output localAgentJobOutput
+				if err := json.Unmarshal([]byte(stdout.String()), &output); err != nil {
+					t.Fatalf("decode dispatch output: %v\n%s", err, stdout.String())
+				}
+				var got string
 				if background {
 					worker := defaultJobWorker(store, io.Discard, home)
 					if err := runEnabledRepoWorkerTicksTracked(context.Background(), store, worker, 1, "", io.Discard, time.Now().UTC(), nil, nil); err != nil {
 						t.Fatalf("worker tick: %v", err)
 					}
+					job, err := store.GetJob(context.Background(), output.JobID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					payload, err := daemonJobPayload(job)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if payload.Result == nil {
+						t.Fatalf("background credential result missing: state=%s payload=%s", job.State, job.Payload)
+					}
+					got = payload.Result.Summary
+				} else {
+					if output.Result == nil {
+						t.Fatalf("foreground credential result missing: %+v", output)
+					}
+					got = output.Result.Summary
 				}
-				data, err := os.ReadFile(evidence)
-				if err != nil {
-					t.Fatalf("read evidence: %v", err)
-				}
-				got := string(data)
 				seeded := []string{"GH_TOKEN=seed-gh", "GITHUB_TOKEN=seed-github", "CLAUDE_CODE_OAUTH_TOKEN=seed-claude", "SSH_AUTH_SOCK=/tmp/seed-ssh"}
-				if enabled {
+				// A detached ask is a hard read-only seat. Its minimal environment is
+				// mandatory even when ordinary credential curation is disabled.
+				if enabled || background {
 					for _, secret := range seeded {
 						if strings.Contains(got, secret) {
 							t.Fatalf("curated E2E leaked %s:\n%s", secret, got)
 						}
 					}
-					for _, want := range []string{"PATH=", "HOME=", "GH_CONFIG_DIR=", "GH_PROMPT_DISABLED=1", "GH_EMPTY=yes", "GH_MODE=700"} {
+					for _, want := range []string{"PATH_SET=yes", "HOME_SET=yes", "GH_CONFIG_DIR=", "GH_PROMPT_DISABLED=1", "GH_EMPTY=yes"} {
 						if !strings.Contains(got, want) {
 							t.Fatalf("curated E2E missing %s:\n%s", want, got)
 						}
 					}
 					var scratch string
-					for _, line := range strings.Split(got, "\n") {
-						if strings.HasPrefix(line, "GH_CONFIG_DIR=") {
-							scratch = strings.TrimPrefix(line, "GH_CONFIG_DIR=")
+					for _, field := range strings.Split(got, "|") {
+						if strings.HasPrefix(field, "GH_CONFIG_DIR=") {
+							scratch = strings.TrimPrefix(field, "GH_CONFIG_DIR=")
 						}
 					}
 					if _, err := os.Stat(scratch); !os.IsNotExist(err) {
