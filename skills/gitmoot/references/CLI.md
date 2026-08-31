@@ -2729,7 +2729,8 @@ Native task auto-merge is enabled by default only behind an exact-head approved
 review and green SHA-scoped commit statuses/check-runs. A gate miss parks the
 task as `awaiting_human_merge`, records an org escalation, and addresses the
 parent of the org role that owns the repo. The recipient comes from the chart
-alone: an unroutable or unbound one is reported in a second note, never swapped.
+alone and is never swapped for a reachable role; `org validate` reports one with
+no wake route or pane binding.
 Set `[repos."owner/repo".merge_gate] auto_merge = false` as an explicit
 kill-switch; that deliberate hold does not escalate. Pipeline `allow_auto_merge`
 is independent, and an authorized `@gitmoot merge` remains an explicit override.

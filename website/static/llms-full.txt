@@ -1235,8 +1235,8 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    verdict for the exact current head SHA and green SHA-scoped commit statuses
    and check-runs. A miss leaves the PR open, records an org escalation, and wakes
    the parent of the org role that owns the repo. That recipient comes from the
-   chart alone; if it has no wake route or pane binding, the gate records a second
-   note saying so rather than quietly waking somebody else.
+   chart alone and is never swapped for a reachable role; `org validate` reports a
+   recipient that has no wake route or pane binding.
    Set `[merge_gate] auto_merge = false` globally or per repository as
    an explicit kill-switch. The merge gate also checks local worktree cleanliness,
    branch freshness, and mergeability. Final merge work
@@ -13019,7 +13019,8 @@ Native task auto-merge is enabled by default only behind an exact-head approved
 review and green SHA-scoped commit statuses/check-runs. A gate miss parks the
 task as `awaiting_human_merge`, records an org escalation, and addresses the
 parent of the org role that owns the repo. The recipient comes from the chart
-alone: an unroutable or unbound one is reported in a second note, never swapped.
+alone and is never swapped for a reachable role; `org validate` reports one with
+no wake route or pane binding.
 Set `[repos."owner/repo".merge_gate] auto_merge = false` as an explicit
 kill-switch; that deliberate hold does not escalate. Pipeline `allow_auto_merge`
 is independent, and an authorized `@gitmoot merge` remains an explicit override.
@@ -16711,7 +16712,7 @@ Gitmoot enables native task auto-merge by default, but only when an affirmative
 review verdict matches the exact current head SHA and all SHA-scoped commit
 statuses and check-runs are green. Missing or failing evidence parks the task in
 `awaiting_human_merge`, journals the reason, and addresses the parent of the org
-role that owns the repo, reporting rather than swapping an unreachable one.
+role that owns the repo; `org validate` reports an unreachable recipient.
 Set `auto_merge = false` globally or per repo as an explicit kill-switch:
 
 ```toml

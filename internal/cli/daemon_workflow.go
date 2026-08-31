@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/daemon"
@@ -886,31 +885,6 @@ func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request work
 	}); err != nil {
 		return fmt.Errorf("record merge-gate escalation: %w", err)
 	}
-	// An escalation nobody can receive must be VISIBLE rather than rerouted: the
-	// chart names who is accountable, and quietly waking somebody else would hide
-	// an unseated role instead of reporting it.
-	rules, err := g.Store.ListEventRules(ctx)
-	if err != nil {
-		return fmt.Errorf("resolve merge-gate escalation routes: %w", err)
-	}
-	blocker := mergeGateEscalationUnreachable(cfg, rules, to, time.Now().UTC())
-	if blocker == "" {
-		return nil
-	}
-	warning := fmt.Sprintf(
-		"merge-gate escalation for %s is addressed to org role %q, which %s; it will not wake anyone until that is fixed",
-		label, to, blocker,
-	)
-	for _, note := range notes {
-		if note.Body == warning {
-			return nil
-		}
-	}
-	if _, err := g.Store.InsertWorkflowNote(ctx, db.WorkflowNote{
-		WorkflowID: label, Author: from, Body: warning, Repo: request.Repo,
-	}); err != nil {
-		return fmt.Errorf("record merge-gate escalation routing warning: %w", err)
-	}
 	return nil
 }
 
@@ -951,9 +925,12 @@ func mergeGateEscalationFrom(cfg config.OrgConfig, repo string) (string, bool) {
 // against. Both disagreed with the drain, and pane resolvability -- the next
 // input -- cannot be predicted at all, because a pane can vanish between this
 // write and the delivery attempt. Rerouting on a guess also moves accountability:
-// an operator seating a role would silently change who owns a gate miss. The
-// chart answer is stable, and an unroutable recipient is surfaced instead
-// (mergeGateEscalationUnroutable) rather than quietly reassigned.
+// an operator seating a role would silently change who owns a gate miss.
+//
+// A recipient that cannot be woken is an org-config gap, and org validate already
+// reports it as unresolved_roles and roles_without_routes (org.go). Restating it
+// from here would be a second representation of one fact, which is the drift this
+// package keeps paying for (#1381).
 //
 // ValidateOrg admits exactly one root and requires it be named "owner"
 // (config/org.go), so the unplaced-sender case is that constant rather than a
@@ -974,32 +951,6 @@ func mergeGateEscalationTo(cfg config.OrgConfig, from string, fromDeclared bool)
 
 // orgChartRootRole is the single root name ValidateOrg admits.
 const orgChartRootRole = "owner"
-
-// mergeGateEscalationUnreachable names a DEFINITE, statically visible reason an
-// addressed note to role cannot be delivered, or "" when none is visible. It
-// informs an operator note and NEVER chooses the recipient.
-//
-// It asks about routes with the event the drain itself builds, so it cannot
-// disagree with delivery about MatchFilter the way a hand-rolled predicate did
-// (#1728 review, P1a).
-//
-// IT IS NOT A REACHABILITY GUARANTEE and "" must not be read as one: a role with
-// a route and a non-empty binding still parks as stalled if that binding no
-// longer resolves to a live pane. That case (#1728 review, P1b) is NOT fixed by
-// this function.
-func mergeGateEscalationUnreachable(cfg config.OrgConfig, rules []db.EventRule, role string, now time.Time) string {
-	if len(matchingWakeRules(rules, addressedNoteWakeEvent(role, "", "", now))) == 0 {
-		return fmt.Sprintf("has no enabled wake route; seat it with gitmoot org seat add %s --pane ID_OR_LABEL", role)
-	}
-	declared, ok := cfg.Role(role)
-	if !ok {
-		return "is not declared in the org chart"
-	}
-	if strings.TrimSpace(declared.Pane) == "" {
-		return fmt.Sprintf("has no pane binding, so its wake parks as stalled; bind it with gitmoot org seat add %s --pane ID_OR_LABEL", role)
-	}
-	return ""
-}
 
 func repoOrgOwner(cfg config.OrgConfig, repo string) (string, bool) {
 	best, bestDepth := "", -1

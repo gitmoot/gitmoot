@@ -593,8 +593,8 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    verdict for the exact current head SHA and green SHA-scoped commit statuses
    and check-runs. A miss leaves the PR open, records an org escalation, and wakes
    the parent of the org role that owns the repo. That recipient comes from the
-   chart alone; if it has no wake route or pane binding, the gate records a second
-   note saying so rather than quietly waking somebody else.
+   chart alone and is never swapped for a reachable role; `org validate` reports a
+   recipient that has no wake route or pane binding.
    Set `[merge_gate] auto_merge = false` globally or per repository as
    an explicit kill-switch. The merge gate also checks local worktree cleanliness,
    branch freshness, and mergeability. Final merge work

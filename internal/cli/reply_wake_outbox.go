@@ -375,7 +375,17 @@ func wakeOutboxEvent(batch []db.WakeOutboxObligation, now time.Time) (events.Eve
 		if len(retrievalCommands) > 0 {
 			detail += "; inspect with " + strings.Join(retrievalCommands, "; ")
 		}
-		event = addressedNoteWakeEvent(role, oldest.SourceKind+":"+oldest.SourceID, detail, now)
+		event = events.NewEvent(
+			events.EventOrgReply,
+			"org-reply:"+role,
+			oldest.SourceKind+":"+oldest.SourceID,
+			"",
+			db.WakeOutboxStateAttempted,
+			detail,
+			now,
+			workflow.RedactCommentText,
+		)
+		event.Cause = "addressed_note"
 	case db.WakeOutboxSourceBlocked:
 		if err := json.Unmarshal([]byte(oldest.SourceID), &event); err != nil {
 			return events.Event{}, fmt.Errorf("decode blocked wake outbox event for row %d: %w", oldest.ID, err)
@@ -414,30 +424,6 @@ func wakeOutboxEvent(batch []db.WakeOutboxObligation, now time.Time) (events.Eve
 	event.WakeKind = wakeKind
 	event.WakeTargetRole = role
 	return event, nil
-}
-
-// addressedNoteWakeEvent builds the event an addressed workflow-note or chat
-// wake is delivered as. It exists so a caller that needs to know whether a role
-// WOULD be woken asks with the same event the drain will actually present to the
-// rules: JobID is what a MatchFilter is tested against (eventRuleMatches), and a
-// predictor that omitted it disagreed with this function on filtered rules
-// (#1728 review, P1a). One constructor, so the two cannot drift.
-func addressedNoteWakeEvent(role, rootID, detail string, now time.Time) events.Event {
-	role = strings.ToLower(strings.TrimSpace(role))
-	event := events.NewEvent(
-		events.EventOrgReply,
-		"org-reply:"+role,
-		rootID,
-		"",
-		db.WakeOutboxStateAttempted,
-		detail,
-		now,
-		workflow.RedactCommentText,
-	)
-	event.Cause = "addressed_note"
-	event.WakeKind = db.WakeOutboxKindReply
-	event.WakeTargetRole = role
-	return event
 }
 
 // Deliberately scope-blind pending a later durable-outbox slice: among enabled,

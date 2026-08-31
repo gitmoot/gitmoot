@@ -47,7 +47,7 @@ Gitmoot enables native task auto-merge by default, but only when an affirmative
 review verdict matches the exact current head SHA and all SHA-scoped commit
 statuses and check-runs are green. Missing or failing evidence parks the task in
 `awaiting_human_merge`, journals the reason, and addresses the parent of the org
-role that owns the repo, reporting rather than swapping an unreachable one.
+role that owns the repo; `org validate` reports an unreachable recipient.
 Set `auto_merge = false` globally or per repo as an explicit kill-switch:
 
 ```toml
