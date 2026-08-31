@@ -470,3 +470,26 @@ func TestScopeSubset(t *testing.T) {
 		}
 	}
 }
+
+func TestUpsertOrgSeatRoleRejectsChangedRebindSource(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	content := "[org.roles.\"owner\"]\nscope = [\"*\"]\n[org.roles.\"worker\"]\nparent = \"owner\"\nscope = [\"*\"]\npane = \"w1:p9\"\n"
+	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := UpsertOrgSeatRole(paths, OrgRole{Name: "worker", Pane: "w1:p2"}, "w1:p8")
+	if err == nil || !strings.Contains(err.Error(), `already binds pane "w1:p9", not expected pane "w1:p8"`) {
+		t.Fatalf("UpsertOrgSeatRole error = %v", err)
+	}
+	unchanged, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(unchanged) != content {
+		t.Fatalf("config changed after rejected rebind:\n%s", unchanged)
+	}
+}

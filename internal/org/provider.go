@@ -55,9 +55,11 @@ type SessionActivity struct {
 }
 
 // PaneBinding records whether a configured role resolves to a live pane.
+// Ambiguous is true only when multiple live labels match and no literal id did.
 type PaneBinding struct {
-	PaneID string
-	Detail string
+	PaneID    string
+	Detail    string
+	Ambiguous bool
 }
 
 // LivePane carries the live identity used by validation plus the two directories

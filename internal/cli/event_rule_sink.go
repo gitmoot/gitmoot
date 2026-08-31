@@ -519,9 +519,13 @@ func eventRuleWakePrompt(kind string, event events.Event) string {
 		detail := truncateForWake(strings.TrimSpace(event.Detail), 320)
 		return fmt.Sprintf("gitmoot awaited fact for %s: %s", event.WakeTargetRole, detail)
 	}
-	// event.Detail is already redacted + absolute-path-scrubbed by events.NewEvent,
-	// so it is used as-is here (only trimmed and rune-safe truncated for the arg).
-	detail := truncateForWake(strings.TrimSpace(event.Detail), 320)
+	// event.Detail is already redacted and absolute-path-scrubbed by
+	// events.NewEvent. Reply batches are count-bounded and retain every retrieval
+	// command; other wake kinds keep the established argument cap.
+	detail := strings.TrimSpace(event.Detail)
+	if !strings.EqualFold(strings.TrimSpace(kind), db.WakeOutboxKindReply) {
+		detail = truncateForWake(detail, 320)
+	}
 	prompt := fmt.Sprintf("gitmoot %s event for job %s", kind, event.JobID)
 	if detail != "" {
 		prompt += ": " + detail

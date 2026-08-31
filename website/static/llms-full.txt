@@ -1967,9 +1967,9 @@ local_root = "/var/tmp/gitmoot-local"
 # credential_gateway_url = "https://broker.example.com:8443"
 ```
 
-`local` is the default and the only currently provisioned backend. `remote` is
-parseable, but its provider is not configured in this slice; unsupported routes
-refuse explicitly rather than falling back to host execution. For an
+`local` is the default. `remote` provisions E2B for engine-driven shell
+implement jobs; unsupported job types and model runtimes refuse before
+provider allocation. For an
 engine-driven daemon job, Gitmoot provisions one job-scoped instance, syncs the selected host
 checkout into a distinct detached Git worktree, streams runtime commands there,
 collects changes, and destroys the instance after the job. The same instance
@@ -2008,6 +2008,13 @@ traversable location and put that location first in the daemon's `PATH`; do not
 make `/root` traversable just to satisfy this requirement. An inaccessible
 runtime fails command startup rather than falling back to root.
 
+For daemon jobs that own an execution-backend lifecycle, runtime contract
+preflight evaluates UID-dependent requirements against configured `local_uid`.
+This lets a root daemon dispatch Claude with `danger-full-access` to a non-root
+local backend without weakening Claude's root refusal. Host-only paths such as
+`gitmoot job run` do not provision that lifecycle and still evaluate the host
+process identity. When `local_uid` is absent, daemon jobs do the same.
+
 The local worktree's `.git` file points at an absolute gitdir in the source
 repository. That pointer resolves on the same filesystem, so `local` needs no
 bundle/base-ref hydration; hydration remains a remote-provider concern. Cancel
@@ -2015,6 +2022,48 @@ kills active command groups and destroys the instance. A restarted daemon reaps
 instances whose recorded owner process is gone. A partially-created non-empty
 directory that Git never registered remains the known orphaned-but-present
 cleanup limitation tracked in #1572.
+
+## Proving a Parallel Local Wave
+
+Run the proof with a dedicated `--home`; never point it at the live Gitmoot
+home. Keep the source checkout under a path the configured identity can
+traverse, set `backend = "local"`, and give every Claude leg a distinct
+`fresh:<suffix>` session:
+
+```sh
+gitmoot agent subscribe gate-a --runtime claude --session fresh:gate-a \
+  --role implementer --repo OWNER/REPO --policy danger-full-access \
+  --capability implement --home "$PROOF_HOME"
+```
+
+Keep the daemon running in its own shell:
+
+```sh
+gitmoot daemon run --repo OWNER/REPO --parallel 4 --poll 1s \
+  --home "$PROOF_HOME"
+```
+
+From the dispatch shell, submit every leg together:
+
+```sh
+gitmoot agent implement gate-a "record uid, gid, pwd, start, end, and visible markers" \
+  --repo OWNER/REPO --base HEAD --background --skip-native-review-fanout \
+  --home "$PROOF_HOME"
+```
+
+Dispatch the other legs together, not after the first settles. Every leg's
+`gitmoot_result` should include its UID, GID, workspace, start and end
+timestamps, and visible marker set in `summary`; its marker in `changes_made`;
+and the read-back and visibility checks in `tests_run`.
+
+The proof passes only when all of these are independently observed:
+
+- every runtime delivery returns a parsed `gitmoot_result`;
+- the reported UID/GID equal the configured non-root identity;
+- the intervals overlap with measured peak concurrency equal to the leg count;
+- every workspace path is distinct, and each leg sees only its own marker;
+- the isolated ledger contains zero remote execution attempts, and no E2B
+  credential or `remote` selector is present.
 
 Gitmoot reads `[remote_exec]` when it dispatches a job. Once the process starts
 a remote credential listener for a home, those listener coordinates are
@@ -2051,8 +2100,7 @@ an absent selector defaults to `local`, while `backend = ""` or an explicit
 Any value outside the allowed set (`local`, `remote`) **fails the job
 loudly at dispatch**: the failure names the offending value and the allowed
 set (for example `unknown execution backend "e2b" (allowed: local, remote)`).
-There is no silent fallback. Provider construction for `remote` lands in later
-phases of the parallel-isolated-execution epic (#1529).
+There is no silent fallback.
 
 ---
 
@@ -2748,95 +2796,32 @@ Fixes:
   then abstains from its native merge gate — fail-closed, it never merges
   gatelessly; the external gate makes the call.
 
-## Worktrees consume too much disk
-
-The daemon checks task-owned worktrees every five minutes. A task is eligible
-only in `merged`, `dismissed`, `superseded`, or `stranded`. Age is not an
-eligibility signal. Before removal, Gitmoot re-reads the task under the checkout
-mutation lock and requires all of these checks to pass:
-
-- no non-final job names the task or path
-- no branch lock owns the task branch
-- the `/proc/<pid>/cwd` scan was conclusive and no process has a cwd in the worktree
-- the recorded path is the deterministic task path
-- `git status --porcelain --ignored` reports no tracked, untracked, or ignored content
-- the worktree HEAD is reachable from the recorded task branch, so removing a
-  clean detached worktree cannot orphan a local commit
-
-A malformed payload on any non-final job also counts as an active owner because
-Gitmoot cannot prove that it refers to another worktree. The bounded retention
-log names one malformed job responsible for this global safety pin.
-
-Removal uses `git worktree remove` without `--force` and preserves the branch.
-Gitmoot then clears the task's stored path and records
-`terminal_worktree_reclaimed`. A live process, unreadable process table, dirty
-tree, unreachable HEAD, active owner, or failed proof retains the path.
-Retention decisions are logged three times per path and classification before
-identical messages are suppressed.
-
-If the worktree belongs to an older checkout root, Gitmoot retries removal
-through the owner named by the worktree's `.git` pointer. An owner mismatch that
-cannot be inspected or removed is recorded as `terminal_worktree_unremovable`
-and excluded from later passes. A later task update makes it eligible again.
+## Delegation worktrees consume too much disk
 
 `gitmoot doctor` reports delegation-worktree usage as
-`N stale worktrees / X GB under <home>/worktrees`. It does not include ordinary
-task worktrees; use the bounded `terminal task worktree retained` daemon lines
-for those paths. Doctor detail separates aged final delegation owners that are
-**reclaimable**, resumable/non-final owners that are **pinned**, and directories
-whose owner is **unproven**. Pinned includes `blocked`, `queued`, and `running`;
-Gitmoot never force-removes those.
+`N stale worktrees / X GB under <home>/worktrees`. The detail separates aged
+final owners that are **reclaimable**, resumable/non-final owners that are
+**pinned**, and directories whose owner is **unproven**. Pinned includes
+`blocked`, `queued`, and `running`; Gitmoot never force-removes those.
 
 `[workflow].delegation_worktree_ttl = "72h"` is default-on because a final
 delegation owner cannot resume, while the grace period preserves short-term
-debugging access. Set it to `"0"` to disable the TTL pass. Aged read-only and
-delegation worktrees are force-removed even when dirty. An independent fix
-clone is different: removing it deletes its object database, so a clean working
-tree and a published HEAD are not sufficient evidence. Gitmoot mirrors every
-branch and tag of the **registered repository checkout's** remote URL into the
-clone's own proof namespace (`refs/remotes/gitmoot-reclaim-proof/*`, pruned each
-pass) within a two-minute probe deadline, then requires that no commit reachable
-from any local ref or reflog is missing from those refs. The trusted URL comes
-from the registered checkout, never from the clone's own `origin`, which
-whatever ran in the clone could have rewritten.
+debugging access. Set it to `"0"` to disable the TTL pass. Aged final owners are
+force-removed even when dirty, Git worktree metadata is pruned, and
+`delegation_worktree_reclaimed_ttl` is recorded. The dashboard `/api/health`
+response exposes the same count, bytes, path, breakdown, and summary in its
+top-level `worktrees` field, including the number of cleanup obligations in
+terminal quarantine.
 
-The proven-disposable clone is then **renamed to a sibling
-`<path>.ttl-reclaiming` before deletion** and every proof is repeated there:
-the rename is a single filesystem operation, so a commit racing the final proof
-lands in a path that no longer exists, and anything that followed the directory
-is caught by the re-proof. A failed re-proof renames the clone back. A leftover
-`.ttl-reclaiming` directory from an interrupted removal is reported, never
-deleted.
-
-A retained clone records **why**: the `delegation_worktree_retained_unpublished`
-job event names the offending commit, and the cleanup obligation carries reason
-`unpublished_commits` until the state changes. A squash merge publishes the
-content under a new commit while the branch commits stay clone-only, so a
-squash-merged fix clone is retained by design rather than silently retried
-forever.
-
-An already-absent managed fix path completes the same bookkeeping instead of
-consuming retries or entering quarantine. `delegation_worktree_reclaimed_ttl`
-is recorded after removal or this already-absent reconciliation. The dashboard
-`/api/health` response exposes the same count, bytes, path, breakdown, and
-summary in its top-level `worktrees` field, including the number of cleanup
-obligations in terminal quarantine.
-
-Terminal-task reclaim failures use the same three-message path limit before
-suppressing identical repeats. The pass proves at most eight candidates per
-tick — each proof takes the checkout mutation lock and walks the ignored tree
-twice — and rotates its window through the candidate list so a permanently
-retained worktree cannot starve the ones behind it.
-
-One unreclaimable delegation candidate does not stop the pass. Candidate-local
-lookup, runner, and removal failures are skipped while later paths continue.
-The daemon logs the first three failures for a path and suppresses repeats.
+One unreclaimable candidate does not stop the pass: candidate-local lookup,
+runner, and removal failures are skipped while later paths continue. The daemon
+logs the first three failures for a path and suppresses repeats.
 Each failure advances a durable, restart-safe cleanup obligation. Retries wait
 one minute and stop after the third failure in `quarantined`; quarantined paths
 are not selected again until an operator inspects `gitmoot job cleanup list
 --state quarantined` and runs `gitmoot job cleanup reopen <resource-id>`.
-The five-minute worktree cadence advances after every attempted pass, including
-passes with candidate failures, so a failed cleanup cannot hot-loop.
+Candidate-query and store-wide lookup failures still abort the pass and surface
+normally.
 
 For immediate manual relief, list paths and then prove the owner is final. Do
 not infer safety from directory age alone:
@@ -4780,10 +4765,11 @@ Parallelism under `pool` is bounded by **two** independent locks:
    their own worktree from the workflow engine, so they parallelize. Every local
    `review` gets a detached per-job worktree at its requested head; background
    taskless `ask` jobs can be auto-isolated at checkout `HEAD`. An engine review
-   that requests changes dispatches its fix into an independent writable
-   per-job clone attached to the task branch at its fetched remote head; failure
-   to allocate refuses the dispatch instead of falling back to the registered
-   checkout. A
+   reports requested changes back to the requester's org role by default. If
+   that PR has explicit auto-fix opt-in, Gitmoot dispatches the fix into an
+   independent writable per-job clone attached to the task branch at its
+   fetched remote head; allocation failure refuses the dispatch instead of
+   falling back to the registered checkout. A
    plain, top-level same-repo `implement` job with no worktree still shares the
    `repo:<repo>` key and serializes even under `pool`.
 
@@ -10600,6 +10586,21 @@ an accessible location and put it first in the daemon's `PATH`; do not loosen
 `/root` permissions. An inaccessible executable fails startup with no root
 fallback.
 
+For daemon jobs that own an execution-backend lifecycle, runtime contract
+preflight evaluates UID-dependent requirements against configured `local_uid`.
+This lets a root daemon dispatch Claude with `danger-full-access` to a non-root
+local backend without weakening Claude's root refusal. Host-only paths such as
+`gitmoot job run` do not provision that lifecycle and still evaluate the host
+process identity. When `local_uid` is absent, daemon jobs do the same.
+
+To prove a parallel local wave, use an isolated `--home`, one distinct
+`fresh:<suffix>` session per Claude leg, and a daemon started with `--parallel
+N`. Dispatch all implement legs together with `--background` and
+`--skip-native-review-fanout`. Each parsed `gitmoot_result` should report UID,
+GID, workspace, start/end timestamps, and visible markers. The gate passes only
+when peak overlap is N, workspace paths are distinct, each leg sees only its own
+marker, and the isolated ledger contains zero remote execution attempts.
+
 ## Transcript Retention
 
 Runtime transcript retention is default-on. Every engine delivery appends its
@@ -10662,6 +10663,7 @@ gitmoot repo auto-fix owner/repo --pr <number> --enable --by <role-or-agent> --r
 gitmoot repo set-interval --all (<duration>|default)
 gitmoot repo remove owner/repo
 gitmoot repo doctor owner/repo
+gitmoot repo collisions owner/repo [--limit N] [--json]
 gitmoot daemon start --poll 30s --workers 1
 gitmoot daemon start --session <root-job-id>
 gitmoot daemon start
@@ -10674,6 +10676,14 @@ gitmoot daemon stop
 For structured local state, use `gitmoot dashboard --json` or
 `gitmoot task list --repo owner/repo --json`. `gitmoot status --json` and
 `gitmoot task show` are not valid commands.
+
+`gitmoot repo collisions owner/repo` inspects at most the newest `--limit` open
+pull requests (default 25, maximum 100), compares each selected pair's current
+changed-filename sets, and prints one warning per non-empty intersection with
+both PR numbers and the sorted shared paths. It exits 1 when collisions exist, 0
+when every inspected pair is disjoint, and supports structured output with
+`--json`; a clean result is the iterable empty array `[]`. Rename history is not
+available, so a concurrent edit of a renamed path's old name may be missed.
 
 `gitmoot daemon status` always prints the configured daemon log path. For a
 running daemon, it also compares that file's last write with the daemon's
@@ -10727,10 +10737,11 @@ resolved `--poll` / `[daemon].poll` cadence; an explicit `--poll` stores a
 per-repo override. `repo list` renders the sentinel as `inherit`.
 `repo set-interval owner/repo <duration>` changes an override, `default` restores
 inheritance, and `--all` applies either value to every registered repo.
-`repo auto-fix` is a durable, per-PR scheduler control. `--disable` prevents a
-changes-requested auto-fix before ownership resolution or worktree allocation;
-`--enable` explicitly resumes it. Both forms require `--by` and `--reason`, and
-the latest attributed decision remains stored for that PR.
+`repo auto-fix` stores a durable, per-PR opt-in for unattended fix dispatch.
+By default, a changes-requested review reports its verdict to the requester and
+does not create an implement job. `--enable` opts that PR into auto-fix;
+`--disable` revokes the opt-in. Both forms require `--by` and `--reason`, and the
+latest attributed decision remains stored for that PR.
 `repo doctor owner/repo` checks a single repo's checkout/config health. If the
 registered checkout is missing or is no longer a Git worktree, Gitmoot verifies
 the recorded primary checkout, repairs the registration, and reports the
@@ -11380,14 +11391,16 @@ from PR comments continue to validate their fix target when the workflow
 advances until [gitmoot#1433](https://github.com/gitmoot/gitmoot/issues/1433)
 adds the corresponding ingress preflight.
 
-When an engine review returns `changes_requested`, its implement fix job gets an
-independent writable per-job clone checked out on the task branch at the fetched
-remote head. It does not execute in the review Task's empty worktree path or the
-registered checkout, so it cannot interleave with an operator's uncommitted
-files. Allocation fails closed before enqueue; there is no registered-checkout
-fallback. The clone stays attached to the real branch so the fix can commit and
-push, then terminal cleanup (with the delegation-worktree TTL as a backstop)
-removes only the clone.
+When an engine review returns `changes_requested`, Gitmoot persists the verdict
+and wakes the requester's org role without creating an implement job. If that
+PR has an explicit `repo auto-fix --enable` policy, the resulting implement fix
+job gets an independent writable per-job clone checked out on the task branch
+at the fetched remote head. It does not execute in the review Task's empty
+worktree path or the registered checkout, so it cannot interleave with an
+operator's uncommitted files. Allocation fails closed before enqueue; there is
+no registered-checkout fallback. The clone stays attached to the real branch so
+the fix can commit and push, then terminal cleanup (with the
+delegation-worktree TTL as a backstop) removes only the clone.
 
 Before delivery, these dispatch commands scan commit-shaped tokens against the
 target repository. Ask and implement preserve their existing scanner input;
@@ -11802,12 +11815,29 @@ claimed by any role; each failure includes category counts and a reason.
 `org brief --role` defaults to `GITMOOT_ORG_ROLE`; an explicit flag wins.
 `gitmoot org show [--home PATH]` prints the resolved role table.
 
-`gitmoot org seat add <name> --pane <label> [--parent ROLE] [--scope REPO,...]
-[--merge-rule owner|self|none] [--home DIR]` claims the one live Herdr pane
-with that exact label, writes or repairs the role's `pane` binding, and installs
-addressed `reply`, `blocked`, `directive`, `escalation`, and `fact` routes with stable
-IDs `org-seat-<name>-<kind>`. Duplicate labels hard-fail instead of choosing a
-pane.
+`gitmoot org seat add <name> [--pane ID_OR_LABEL] [--parent ROLE]
+[--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]` creates or
+repairs a role and installs addressed `reply`, `blocked`, `directive`,
+`escalation`, and `fact` routes with stable IDs `org-seat-<name>-<kind>`.
+
+With `--pane`, Gitmoot resolves a literal live pane id first, then a unique
+exact live label, and stores the resolved pane id. Existing label-based commands
+therefore keep working; re-running one for the same resolved pane canonicalizes
+that existing binding to the pane id. Later cosmetic label changes do not
+retarget or break bindings written by this command. Duplicate labels, unknown
+references, and a supplied but empty `--pane` hard-fail before any role or route
+is written.
+Omit `--pane` to create an unbound role and the same routes; re-run the command
+with `--pane ID_OR_LABEL` to bind that role later. If a configured binding stops
+resolving, for example after Herdr recreates a pane with a new id, the same
+command can rebind the role to a live unclaimed pane while preserving its policy
+and routes. A configured binding that still resolves is immutable. An ambiguous
+label binding must be disambiguated in Herdr before rebinding. Every successful
+add validates the affected role and five routes. Bound creation and repair also
+validate the live binding without making unrelated intentionally unbound roles
+decide the exit code. Unbound creation reports the deferred bind command and an
+`ok role NAME unbound enabled_routes=5` verdict. The global `org validate` command
+continues to report every unbound role until it is attached.
 
 For a new non-owner seat, the acting role comes from `GITMOOT_ORG_ROLE` and
 falls back to `owner` only when the variable is unset. The new seat inherits
@@ -11816,19 +11846,28 @@ role and cannot create a cycle. An explicit `--scope` must stay within both the
 acting role's scope and the selected parent's scope. Merge authority defaults
 to empty; an explicit `--merge-rule` cannot exceed the acting role's authority.
 The empty-registry `owner` bootstrap keeps its `*` scope and `owner` merge rule.
-The three role flags initialize new seats only; re-running the command repairs
-missing owned pieces without rewriting existing role policy or duplicating
-routes. The command finishes with the same reality validation as `org validate`,
-so success includes a green live-pane and route verdict rather than only
-confirming that config parsed.
+The three policy flags initialize new seats only. An existing role accepts an
+explicit policy value only when it matches the stored value; `--scope` matches
+as an unordered set, and a changed value is rejected instead of being silently
+ignored. An invalid `--merge-rule` is always rejected as invalid, on new and
+existing roles alike. Re-running with matching values or without those flags
+repairs missing owned pieces, fills an empty pane binding, canonicalizes a
+matching label binding, or replaces a non-empty binding only when its former
+target no longer resolves. It does not rewrite existing policy or duplicate
+routes.
 
-`gitmoot org seat rm <name> [--home DIR]` resolves the role's live pane and
-checks every distinct Git checkout reported by that pane's `cwd` and
-`foreground_cwd`. It refuses a dirty checkout or a branch whose `HEAD` is not
-merged into the locally known `origin/HEAD` (falling back to `origin/main`);
-unreadable branch state also fails closed. A safe removal deletes the role and
-all of its wake routes, closes the pane, and then runs the same reality
-validation. Roles that still parent another role cannot be removed.
+`gitmoot org seat rm <name> [--home DIR]` resolves the role's live pane when it
+has a binding and checks every distinct Git checkout reported by that pane's
+`cwd` and `foreground_cwd`. It refuses a dirty checkout or a branch whose `HEAD`
+is not merged into the locally known `origin/HEAD` (falling back to
+`origin/main`); unreadable branch state also fails closed. A safe removal deletes
+the role and all of its wake routes, closes a resolved live pane, and validates
+that the role, routes, and closed pane are absent. A role with no configured
+binding has no pane to inspect or close, so removal deletes only that role and
+its routes. A configured binding that is stale, absent, or ambiguous fails
+closed before mutation and reports the `org seat add` rebind command. A provider
+error for a configured binding also fails closed. Roles that still parent
+another role cannot be removed.
 
 The five provisioned routes are enabled, addressed, and have an empty match
 filter. Remove one by its stable ID with `org events rule rm` to quiet that kind;
@@ -11840,11 +11879,14 @@ The registry uses `[org] enforce = "warn"|"block"` and
 cosmetic `display_name`, an optional `model` runtime pin, an optional per-role
 `recycle_after` duration override, and an optional `pane` Herdr binding (used by
 live presence and org event-rule wakes).
-The binding resolves as a unique exact live pane label or a currently live
-literal pane id. Roles without a binding report unknown live presence, and event
-wakes for them are skipped with an observable log and increment the role's
-missed-wake counter rather than being inferred from a pane label. There is
-exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
+For backward compatibility, a configured binding resolves as a literal pane id
+or a unique exact live label. A literal id tracks one pane; a label tracks
+whichever current pane uniquely carries that cosmetic value. `org seat add`
+canonicalizes new bindings to ids. Roles without a binding report unknown live
+presence, and event wakes for them are skipped with an observable log and
+increment the role's missed-wake counter rather than being inferred from a pane
+label. There is exactly one root named `owner`; accepted scopes are `*`,
+`owner/*`, and
 `owner/repo`, and each child scope must be covered by its parent. Malformed
 org configuration fails closed and loudly. `brief` records passive last-seen
 presence for its role and can render static context with provider state
@@ -11960,6 +12002,20 @@ practice of typing organization questions into notes or panes; there is no
 code-level marker to migrate. The note and a `pending` wake outbox row commit
 atomically. With an opt-in `reply` rule, a daemon tick wakes the addressed role
 through its configured Herdr pane.
+
+`gitmoot org message send --to <role> --workflow <label> [--org-role
+<from-role>] [--repo <owner/repo>] [--json] "<message>"` records a durable
+sender-attributed heads-up between two distinct configured roles. The roles may
+message each other if and only if their non-empty `parent` values are equal.
+Repository scope does not grant this channel, and `owner` has no special case.
+The typed note
+`[org:message to=<to> from=<from> wf=<workflow>] <message>` and its addressed
+`reply:<role>` wake row commit atomically. The wake includes the exact
+`gitmoot workflow show-note <id>` retrieval command; that command renders the
+citable row's workflow, author, optional repository, timestamp, and body, or
+returns the row as JSON. Plain output marks bodies above 512 runes as truncated
+and points to `--json`; JSON preserves the full stored body. Messages create no
+directive, acknowledgment, completion, TTL, or nag obligation.
 
 `gitmoot org escalate resolve <escalation-note-id> [--by <role>] [--note
 <answer-note-id>] [--home <dir>]` appends a typed resolution marker to the same
@@ -12180,6 +12236,7 @@ gitmoot workflow list
 gitmoot workflow show fable/dashboard-redesign --limit 100
 gitmoot workflow describe fable/dashboard-redesign "Coordinate and ship the dashboard redesign."
 gitmoot workflow note fable/dashboard-redesign "Implementation started." --author operator --status active
+gitmoot workflow show-note 42
 gitmoot workflow close fable/dashboard-redesign --reason "Shipped and verified."
 ```
 

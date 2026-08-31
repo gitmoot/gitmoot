@@ -33,7 +33,8 @@ var localAgentDispatchRuntimeAdapterFor foregroundRuntimeAdapterFactory = func(h
 }
 
 var localAgentDispatchExecBackendFor = func(home string) (execbackend.Backend, error) {
-	return (jobWorker{ConfigHome: home, ConfigHomeExplicit: true}).resolveExecBackend("", false)
+	backend, _, err := (jobWorker{ConfigHome: home, ConfigHomeExplicit: true}).resolveExecBackend("", false)
+	return backend, err
 }
 
 func foregroundRuntimeAdapterFactoryFor(backend execbackend.Backend) (foregroundRuntimeAdapterFactory, error) {
