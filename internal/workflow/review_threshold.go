@@ -37,6 +37,27 @@ func effectiveReviewDecision(result *AgentResult, blockingSeverity string) strin
 	return decision
 }
 
+// IsPipelineReviewPayload reports whether a review job was dispatched by the
+// pipeline advancer rather than the native review lifecycle.
+func IsPipelineReviewPayload(payload JobPayload) bool {
+	return strings.EqualFold(strings.TrimSpace(payload.Sender), PipelineJobSender)
+}
+
+// effectiveReviewDecisionForPayload is the single authority for turning a stored
+// review payload into the decision gitmoot acts on. Repository severity policy
+// applies to NATIVE reviews only: a pipeline-sender review is report-only, the
+// pipeline advancer owns folding its verdict, and no gitmoot surface — the merge
+// gate included — may re-interpret it into an approval the pipeline never gave.
+func effectiveReviewDecisionForPayload(payload JobPayload, blockingSeverity string) string {
+	if payload.Result == nil {
+		return ""
+	}
+	if IsPipelineReviewPayload(payload) {
+		return strings.TrimSpace(payload.Result.Decision)
+	}
+	return effectiveReviewDecision(payload.Result, blockingSeverity)
+}
+
 // effectiveDelegationDecision applies repository review policy only to
 // delegations that are reviews. Ask and implement legs retain their raw
 // decisions even when they happen to report a review-shaped severity.

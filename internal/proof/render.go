@@ -87,11 +87,24 @@ func RenderTree(w io.Writer, manifest Manifest) error {
 				case "false":
 					independence = "self"
 				}
-				if review.Attrs["decision"] == "approved" {
+				// The projection keeps attrs["decision"] at the RAW verdict and records
+				// the folded outcome alongside it, so counting/printing the raw value
+				// alone renders "0 approved" for a manifest that carries a review.approved
+				// claim. Count the EFFECTIVE decision and show both: the reader sees the
+				// verdict the reviewer wrote and the outcome gitmoot acted on.
+				decision := dash(review.Attrs["decision"])
+				if effective := strings.TrimSpace(review.Attrs["effective_decision"]); effective != "" {
+					if outcome := strings.TrimSpace(review.Attrs["review_outcome"]); outcome != "" {
+						decision = fmt.Sprintf("%s (%s)", decision, outcome)
+					}
+					if effective == "approved" {
+						approvedReviews++
+					}
+				} else if review.Attrs["decision"] == "approved" {
 					approvedReviews++
 				}
 				fmt.Fprintf(w, "      %s · %s · findings %s · %s [%s]\n",
-					dash(review.Attrs["agent"]), dash(review.Attrs["decision"]),
+					dash(review.Attrs["agent"]), decision,
 					dash(review.Attrs["findings_count"]), independence, reviewClaimGrade(review))
 			}
 		}

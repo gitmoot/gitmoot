@@ -554,7 +554,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if _, superseded := supersededReviewIDs[review.job.ID]; superseded {
 			continue
 		}
-		switch effectiveReviewDecision(review.payload.Result, request.ReviewBlockingSeverity) {
+		switch effectiveReviewDecisionForPayload(review.payload, request.ReviewBlockingSeverity) {
 		case "changes_requested", "blocked", "failed":
 			return mergeBlocked{reason: fmt.Sprintf("review at evaluated head has blocking result from %s", review.job.Agent)}
 		}
@@ -571,7 +571,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			if review.payload.Result == nil {
 				return fmt.Errorf("abstaining reviewer %s at evaluated head has no recognized decision (job %s); requeue or reassign the review", reviewer, review.job.ID)
 			}
-			switch effectiveReviewDecision(review.payload.Result, request.ReviewBlockingSeverity) {
+			switch effectiveReviewDecisionForPayload(review.payload, request.ReviewBlockingSeverity) {
 			case "approved":
 				if err := ensureDelegatedReviewEvidence(review.job, delegationChildrenByParent[review.job.ID], request.ReviewBlockingSeverity); err != nil {
 					return err

@@ -352,6 +352,32 @@ func TestApprovedWithNotesProofUsesDurableOutcomeEvent(t *testing.T) {
 			}
 		}
 	}
+
+	// The rendered tree is the surface a human reads before merging, so it must
+	// not contradict the claim graph it was built from: an approval claim with a
+	// "0 approved" summary is a false negative in exactly that direction.
+	var rendered bytes.Buffer
+	if err := RenderTree(&rendered, withEvent); err != nil {
+		t.Fatalf("RenderTree returned error: %v", err)
+	}
+	out := rendered.String()
+	if !strings.Contains(out, "1 reviews / 1 approved") {
+		t.Fatalf("approved-with-notes render did not count the approval:\n%s", out)
+	}
+	if !strings.Contains(out, "changes_requested (approved-with-notes)") {
+		t.Fatalf("approved-with-notes render lost the raw verdict or the outcome:\n%s", out)
+	}
+
+	// Without the durable event the same review must still render as raw
+	// changes_requested and count zero approvals.
+	rendered.Reset()
+	if err := RenderTree(&rendered, withoutEvent); err != nil {
+		t.Fatalf("RenderTree returned error: %v", err)
+	}
+	if raw := rendered.String(); !strings.Contains(raw, "1 reviews / 0 approved") ||
+		strings.Contains(raw, "approved-with-notes") {
+		t.Fatalf("blocking review render = \n%s", raw)
+	}
 }
 
 func TestProjectHonestGapsRenderDash(t *testing.T) {

@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 )
 
 func openAwaitedFactTestStore(t *testing.T) *Store {
@@ -183,6 +186,72 @@ func TestAwaitedFactOldHeadDoesNotSatisfyNewHead(t *testing.T) {
 	}
 	if got.State != AwaitedFactStateWaiting {
 		t.Fatalf("new-head subscription state = %q after old-head verdict, want waiting", got.State)
+	}
+}
+
+// The engine folds a sub-threshold changes_requested review into an approval and
+// dispatches no fix round; job.finished reports that effective decision. A waiter
+// woken through the awaited-fact channel must read the same thing, or it starts
+// the fix round the engine deliberately suppressed. Pipeline reviews are
+// report-only and keep their raw verdict at every threshold.
+func TestAwaitedReviewFactDetailReportsEffectiveDecision(t *testing.T) {
+	cases := []struct {
+		name       string
+		threshold  string
+		sender     string
+		wantDetail string
+	}{
+		{name: "sub-threshold folds to approved", threshold: reviewseverity.P1, wantDetail: "review verdict approved"},
+		{name: "at-threshold stays blocking", threshold: reviewseverity.P2, wantDetail: "review verdict changes_requested"},
+		{name: "unset policy fails closed", threshold: "", wantDetail: "review verdict changes_requested"},
+		{name: "pipeline verdict stays raw", threshold: reviewseverity.P1, sender: "pipeline", wantDetail: "review verdict changes_requested"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openAwaitedFactTestStore(t)
+			if tc.threshold != "" {
+				store.SetReviewBlockingSeverity(func(repo string) string {
+					if repo != "acme/widget" {
+						t.Fatalf("blocking severity repo = %q, want acme/widget", repo)
+					}
+					return tc.threshold
+				})
+			}
+			ctx := context.Background()
+			seed := func(decision string) string {
+				t.Helper()
+				encoded, err := json.Marshal(map[string]any{
+					"repo": "acme/widget", "pull_request": 46, "head_sha": "head-notes",
+					"sender": tc.sender,
+					"result": map[string]any{"decision": decision, "severity": "P2"},
+				})
+				if err != nil {
+					t.Fatalf("Marshal review payload: %v", err)
+				}
+				return string(encoded)
+			}
+			if err := store.CreateJobWithEvent(ctx, Job{
+				ID: "review-notes", Agent: "audit", Type: "review", State: "running", Payload: seed(""),
+			}, JobEvent{Kind: "running", Message: "started"}); err != nil {
+				t.Fatalf("CreateJobWithEvent: %v", err)
+			}
+			fact := subscribeReviewFact(t, store, "lane", "acme/widget", 46, "head-notes")
+			changed, err := store.TransitionJobStatePayloadWithEvent(ctx, "review-notes", "running", "succeeded",
+				seed("changes_requested"), JobEvent{Kind: "succeeded", Message: "verdict"})
+			if err != nil || !changed {
+				t.Fatalf("TransitionJobStatePayloadWithEvent changed=%v err=%v", changed, err)
+			}
+			got, err := store.GetAwaitedFact(ctx, fact.ID)
+			if err != nil {
+				t.Fatalf("GetAwaitedFact: %v", err)
+			}
+			if got.State != AwaitedFactStateSatisfied {
+				t.Fatalf("state = %q, want satisfied", got.State)
+			}
+			if !strings.HasPrefix(got.ResolutionDetail, tc.wantDetail) {
+				t.Fatalf("resolution detail = %q, want prefix %q", got.ResolutionDetail, tc.wantDetail)
+			}
+		})
 	}
 }
 

@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 )
 
 const (
@@ -144,7 +146,7 @@ VALUES (?, ?, ?, ?)`, request.WaiterRole, request.SubjectKind, request.SubjectKe
 	if err != nil {
 		return AwaitedFact{}, err
 	}
-	if detail, ok, err := canonicalAwaitedFactTx(ctx, tx, request.SubjectKind, request.SubjectKey); err != nil {
+	if detail, ok, err := canonicalAwaitedFactTx(ctx, tx, request.SubjectKind, request.SubjectKey, s.blockingSeverityFor); err != nil {
 		return AwaitedFact{}, err
 	} else if ok {
 		if _, err := satisfyAwaitedFactTx(ctx, tx, id, request.WaiterRole, request.SubjectKind, request.SubjectKey, detail, time.Now().UTC()); err != nil {
@@ -157,7 +159,7 @@ VALUES (?, ?, ?, ?)`, request.WaiterRole, request.SubjectKind, request.SubjectKe
 	return s.GetAwaitedFact(ctx, id)
 }
 
-func canonicalAwaitedFactTx(ctx context.Context, tx *sql.Tx, kind, key string) (string, bool, error) {
+func canonicalAwaitedFactTx(ctx context.Context, tx *sql.Tx, kind, key string, blockingSeverity func(repo string) string) (string, bool, error) {
 	switch kind {
 	case AwaitedFactSubjectReviewVerdict:
 		repo, pullRequest, headSHA, err := parseReviewVerdictSubjectKey(key)
@@ -178,7 +180,7 @@ ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 			if err := rows.Scan(&jobID, &agent, &payload); err != nil {
 				return "", false, err
 			}
-			fact, ok := reviewVerdictFact(jobID, agent, "succeeded", payload)
+			fact, ok := reviewVerdictFact(jobID, agent, "succeeded", payload, blockingSeverity)
 			if ok && fact.headSHA == headSHA {
 				return fact.detail, true, nil
 			}
@@ -197,6 +199,10 @@ type reviewVerdictPayload struct {
 	// persisted by dispatch for every job. Empty for jobs predating #1528; the
 	// review-loop family resolver then falls back to the agent registry default.
 	EffectiveRuntime string `json:"effective_runtime"`
+	// Sender identifies a pipeline-dispatched review, whose verdict is
+	// report-only and is therefore never re-interpreted against repository
+	// severity policy.
+	Sender string `json:"sender"`
 	Result           *struct {
 		Decision string `json:"decision"`
 		Severity string `json:"severity,omitempty"`
@@ -277,7 +283,16 @@ type reviewVerdictObservation struct {
 	pullRequest           int
 }
 
-func reviewVerdictFact(jobID, agent, state, payload string) (reviewVerdictObservation, bool) {
+// pipelineReviewSender mirrors workflow.PipelineJobSender. It is duplicated
+// rather than imported because workflow depends on db, never the reverse.
+const pipelineReviewSender = "pipeline"
+
+// reviewVerdictFact renders the awaited-fact observation for one review job.
+// The detail reports the EFFECTIVE decision — the raw verdict folded against
+// blockingSeverity exactly as the engine folds it — so a coordinator woken
+// through this channel cannot dispatch a fix round the engine suppressed.
+// Pipeline-sender reviews are report-only and keep their raw decision.
+func reviewVerdictFact(jobID, agent, state, payload string, blockingSeverity func(repo string) string) (reviewVerdictObservation, bool) {
 	if state != "succeeded" {
 		return reviewVerdictObservation{}, false
 	}
@@ -291,15 +306,20 @@ func reviewVerdictFact(jobID, agent, state, payload string) (reviewVerdictObserv
 	if decoded.Repo == "" || decoded.PullRequest <= 0 || decoded.HeadSHA == "" || decision == "" {
 		return reviewVerdictObservation{}, false
 	}
+	if decision == "changes_requested" &&
+		!strings.EqualFold(strings.TrimSpace(decoded.Sender), pipelineReviewSender) &&
+		!reviewseverity.Blocks(strings.ToUpper(strings.TrimSpace(decoded.Result.Severity)), blockingSeverity(decoded.Repo)) {
+		decision = "approved"
+	}
 	detail := fmt.Sprintf("review verdict %s from %s job %s at head %s", decision, strings.TrimSpace(agent), strings.TrimSpace(jobID), decoded.HeadSHA)
 	return reviewVerdictObservation{repo: decoded.Repo, pullRequest: decoded.PullRequest, headSHA: decoded.HeadSHA, detail: detail}, true
 }
 
-func resolveAwaitedReviewFactTx(ctx context.Context, tx *sql.Tx, jobID, agent, jobType, state, payload string, now time.Time) error {
+func resolveAwaitedReviewFactTx(ctx context.Context, tx *sql.Tx, jobID, agent, jobType, state, payload string, blockingSeverity func(repo string) string, now time.Time) error {
 	if strings.TrimSpace(jobType) != "review" {
 		return nil
 	}
-	fact, ok := reviewVerdictFact(jobID, agent, state, payload)
+	fact, ok := reviewVerdictFact(jobID, agent, state, payload, blockingSeverity)
 	if !ok {
 		return nil
 	}

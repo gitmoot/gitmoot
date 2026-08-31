@@ -398,6 +398,24 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		// delegations[] must NOT also dispatch and no second continuation enqueues.
 		return nil
 	}
+	// A sub-threshold changes-requested review is recorded as approved-with-notes
+	// BEFORE the approval replay guard below. Once the task has already reached
+	// ready_to_merge that guard returns early, so a write on its far side silently
+	// drops the only durable evidence the proof projector keys the approval claim
+	// on, leaving proof contradicting the PR comment. AddJobEventIfAbsent keeps the
+	// replay path idempotent; PullRequest<=0 reviews are excluded because that arm
+	// terminates at advance_skipped_no_pr without a review outcome at all.
+	if job.Type == "review" && payload.PullRequest > 0 &&
+		payload.Result.Decision == "changes_requested" && effectiveDecision == "approved" {
+		if err := e.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
+			JobID: job.ID,
+			Kind:  ReviewApprovedWithNotesEventKind,
+			Message: fmt.Sprintf("review severity %s is below repository blocking severity %s; findings remain recorded and no fix is dispatched",
+				payload.Result.Severity, blockingSeverity),
+		}); err != nil {
+			return err
+		}
+	}
 	if job.Type == "review" && effectiveDecision == "approved" {
 		done, err := e.reviewApprovalAlreadyAdvanced(ctx, ref)
 		if err != nil {
@@ -524,18 +542,6 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			return e.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_skipped_no_pr", Message: "no pull request is attached; skipping review advancement"})
 		}
 		reviewer := reviewDecisionAgent(job, payload)
-		// blockingSeverity and effectiveDecision are resolved before the approval
-		// replay guard so approved-with-notes follows the same idempotent path.
-		if payload.Result.Decision == "changes_requested" && effectiveDecision == "approved" {
-			if err := e.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
-				JobID: job.ID,
-				Kind:  ReviewApprovedWithNotesEventKind,
-				Message: fmt.Sprintf("review severity %s is below repository blocking severity %s; findings remain recorded and no fix is dispatched",
-					payload.Result.Severity, blockingSeverity),
-			}); err != nil {
-				return err
-			}
-		}
 		switch effectiveDecision {
 		case "changes_requested":
 			if err := e.setTaskState(ctx, ref, TaskChangesRequested); err != nil {

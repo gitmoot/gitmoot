@@ -460,6 +460,42 @@ func TestPolicyMergeGateTreatsSubthresholdReviewAsIndependentApproval(t *testing
 	}
 }
 
+// A pipeline review stage binds its job to the task/PR/head under Sender=pipeline
+// (internal/pipeline/run.go), so it lands in the merge gate's reviewsAtHead beside
+// native reviews. AdvanceJob, the job.finished event and the PR comment renderer
+// all leave a pipeline verdict raw; the gate is the surface with merge authority
+// and must not be the one place that re-interprets it into an approval the
+// pipeline never gave.
+func TestPolicyMergeGateKeepsPipelineReviewVerdictRaw(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	base := JobPayload{
+		Repo: "mobile/app", Branch: "task-9", PullRequest: 9, HeadSHA: "head123",
+		TaskID: "task-9", ReviewRound: "review-1",
+	}
+	nativeApproval := base
+	nativeApproval.Result = &AgentResult{Decision: "approved", Summary: "ok"}
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-native", Agent: "audit", Type: "review"}, nativeApproval)
+
+	pipelineReview := base
+	pipelineReview.Sender = PipelineJobSender
+	pipelineReview.Result = &AgentResult{
+		Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "stage refused",
+	}
+	insertCompletedJob(t, store, db.Job{ID: "review-pipeline", Agent: "stagebot", Type: "review"}, pipelineReview)
+
+	for _, threshold := range []string{reviewseverity.P3, reviewseverity.P1} {
+		err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
+			Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "audit",
+			ReviewBlockingSeverity: threshold,
+		}, "head123")
+		var blocked mergeBlocked
+		if !errors.As(err, &blocked) || !strings.Contains(blocked.reason, "stagebot") {
+			t.Fatalf("threshold %s: ensureFinalReviewCaptured = %v, want block naming stagebot", threshold, err)
+		}
+	}
+}
+
 func TestPolicyMergeGatePassesBlockingSeverityToDelegatedReviewEvidence(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

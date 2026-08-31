@@ -1531,6 +1531,50 @@ func TestEngineAdvanceReviewSubthresholdEventIsIdempotentAfterMergeError(t *test
 	}
 }
 
+// proof/project.go keys the review approval claim on the durable
+// review_approved_with_notes event, so a sub-threshold review that advances once
+// the task has ALREADY reached ready_to_merge must still record it. Writing it on
+// the far side of the approval replay guard drops it silently and leaves
+// `gitmoot proof` contradicting the PR comment for the same job.
+func TestEngineAdvanceReviewSubthresholdRecordsOutcomeAfterTaskReadyToMerge(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+	engine.MergeGate = &fakeMergeGate{decision: MergeDecision{Ready: true}}
+	base := JobPayload{
+		Repo: "mobile/app", Branch: "task-8", PullRequest: 8,
+		TaskID: "task-8", TaskTitle: "Mobile App", LeadAgent: "lead",
+	}
+	first := base
+	first.Result = &AgentResult{Decision: "approved", Summary: "ship it"}
+	insertCompletedJob(t, store, db.Job{ID: "review-first", Agent: "audit", Type: "review"}, first)
+	if err := engine.AdvanceJob(ctx, "review-first"); err != nil {
+		t.Fatalf("AdvanceJob(review-first) returned error: %v", err)
+	}
+	assertTaskState(t, store, "task-8", TaskReadyToMerge)
+
+	second := base
+	second.Result = &AgentResult{
+		Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "non-blocking polish",
+	}
+	insertCompletedJob(t, store, db.Job{ID: "review-second", Agent: "sec", Type: "review"}, second)
+	if err := engine.AdvanceJob(ctx, "review-second"); err != nil {
+		t.Fatalf("AdvanceJob(review-second) returned error: %v", err)
+	}
+	if got := countJobEvents(t, store, "review-second", ReviewApprovedWithNotesEventKind); got != 1 {
+		t.Fatalf("%s events = %d, want 1 despite the task already being ready_to_merge",
+			ReviewApprovedWithNotesEventKind, got)
+	}
+	// The replay guard must still hold: advancing again records no second event.
+	if err := engine.AdvanceJob(ctx, "review-second"); err != nil {
+		t.Fatalf("replayed AdvanceJob(review-second) returned error: %v", err)
+	}
+	if got := countJobEvents(t, store, "review-second", ReviewApprovedWithNotesEventKind); got != 1 {
+		t.Fatalf("%s events = %d after replay, want 1", ReviewApprovedWithNotesEventKind, got)
+	}
+}
+
 func TestEngineAdvancePipelineReviewIsReportOnly(t *testing.T) {
 	for _, decision := range []string{"changes_requested", "approved"} {
 		t.Run(decision, func(t *testing.T) {

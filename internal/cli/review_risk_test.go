@@ -11,8 +11,10 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
@@ -426,5 +428,67 @@ func TestWireReviewChangedFilesMarksDivergedRangeUnscopable(t *testing.T) {
 	var unavailable workflow.ReviewScopeUnavailableError
 	if !errors.As(err, &unavailable) {
 		t.Fatalf("ReviewChangedFiles error = %v, want ReviewScopeUnavailableError", err)
+	}
+}
+
+// The awaited review-verdict fact is satisfied inside the job state-transition
+// transaction, so its wake detail is rendered by the STORE, not the engine. Every
+// gitmoot command — the daemon included — takes its store from withStoreAndPaths,
+// so this pins the wiring: without it the fix is inert and that one wake channel
+// silently reports a raw verdict the engine has already folded.
+func TestWithStoreInstallsReviewBlockingSeverity(t *testing.T) {
+	home := t.TempDir()
+	root := config.PathsForHome(home).Home
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, config.ConfigName),
+		[]byte("[review]\nblocking_severity = \"P1\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	payload := func(decision string) string {
+		t.Helper()
+		encoded, err := json.Marshal(workflow.JobPayload{
+			Repo: "acme/widget", PullRequest: 46, HeadSHA: "head-notes", TaskID: "task-46",
+			Result: &workflow.AgentResult{Decision: decision, Severity: reviewseverity.P2, Summary: "polish"},
+		})
+		if err != nil {
+			t.Fatalf("Marshal payload: %v", err)
+		}
+		return string(encoded)
+	}
+	if err := withStore(home, func(store *db.Store) error {
+		if err := store.CreateJob(ctx, db.Job{
+			ID: "review-notes", Agent: "audit", Type: "review", State: "running", Payload: payload(""),
+		}); err != nil {
+			return err
+		}
+		key, err := db.ReviewVerdictSubjectKey("acme/widget", 46, "head-notes")
+		if err != nil {
+			return err
+		}
+		fact, err := store.SubscribeAwaitedFact(ctx, db.AwaitedFactSubscription{
+			WaiterRole: "lane", SubjectKind: db.AwaitedFactSubjectReviewVerdict,
+			SubjectKey: key, Deadline: time.Now().UTC().Add(time.Hour),
+		})
+		if err != nil {
+			return err
+		}
+		if _, err := store.TransitionJobStatePayloadWithEvent(ctx, "review-notes", "running", "succeeded",
+			payload("changes_requested"), db.JobEvent{Kind: "succeeded", Message: "verdict"}); err != nil {
+			return err
+		}
+		satisfied, err := store.GetAwaitedFact(ctx, fact.ID)
+		if err != nil {
+			return err
+		}
+		if !strings.HasPrefix(satisfied.ResolutionDetail, "review verdict approved") {
+			t.Fatalf("resolution detail = %q, want the effective approved verdict under blocking_severity P1",
+				satisfied.ResolutionDetail)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withStore returned error: %v", err)
 	}
 }
