@@ -427,9 +427,12 @@ gitmoot task list --repo owner/repo
 Fix: nothing to do. A later gate evaluation replaces the marker with the
 specific pending, failure, or success verdict for the same head. Gitmoot marks
 heads only while it owns the merge decision: with `[merge_gate] auto_merge =
-false`, with `GITMOOT_DISABLE_NATIVE_MERGE_GATE=1`, or once a task is parked for
-a human, it replaces only its own generic marker with `Gitmoot merge gate is not
-applied to this head` and leaves any real gate verdict untouched. A draft pull
+false`, with `GITMOOT_DISABLE_NATIVE_MERGE_GATE=1`, or once a task reaches
+`awaiting_human_merge`, `dismissed`, `superseded`, `stranded` or `merged`, it
+replaces only its own generic marker with `Gitmoot merge gate is not applied to
+this head` and leaves any real gate verdict untouched. A `blocked` or
+`awaiting_human` task keeps the marker, because that head genuinely has not been
+cleared and Gitmoot can still resolve it when the task resumes. A draft pull
 request keeps the marker until it is undrafted.
 
 ## Dashboard Blank Or Noninteractive

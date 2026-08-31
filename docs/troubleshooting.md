@@ -647,9 +647,13 @@ Fixes:
   success verdict for that same head.
 - Gitmoot publishes it only while it owns the merge decision. With
   `[merge_gate] auto_merge = false`, with `GITMOOT_DISABLE_NATIVE_MERGE_GATE=1`,
-  or once a task is parked for a human or terminal, Gitmoot replaces only its own
-  generic marker with `Gitmoot merge gate is not applied to this head` and
-  preserves a real gate failure or a specific pending verdict.
+  or once a task reaches `awaiting_human_merge`, `dismissed`, `superseded`,
+  `stranded` or `merged`, Gitmoot replaces only its own generic marker with
+  `Gitmoot merge gate is not applied to this head` and preserves a real gate
+  failure or a specific pending verdict.
+- A `blocked` or `awaiting_human` task KEEPS the generic marker, because that
+  head genuinely has not been cleared and Gitmoot can still resolve it when the
+  task resumes.
 - A draft pull request keeps the generic marker until it is undrafted, because
   the gate deliberately withholds a verdict on a draft head.
 - Clean the local worktree before the daemon attempts the merge.
