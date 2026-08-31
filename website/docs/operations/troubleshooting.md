@@ -524,9 +524,10 @@ Every five minutes, the daemon checks task-owned worktrees whose task is
 `merged`, `dismissed`, `superseded`, or `stranded`. Age alone never qualifies a
 task worktree. Gitmoot retains it unless the recorded path is deterministic,
 there is no non-final job or branch lock, the `/proc/<pid>/cwd` scan is
-conclusive with no live process inside it, and `git status --porcelain --ignored`
-reports no tracked, untracked, or ignored content. Removal is non-force and
-preserves the branch.
+conclusive with no live process inside it, the worktree HEAD is reachable from
+the recorded task branch, and `git status --porcelain --ignored` reports no
+tracked, untracked, or ignored content. Removal is non-force and preserves the
+branch.
 
 A malformed payload on any non-final job also pins task worktrees because
 Gitmoot cannot prove that the job owns some other path.
@@ -554,6 +555,9 @@ cannot hot-loop. Cleanup obligations still retry once per minute and stop in
 `quarantined` after the third failure. Inspect them with `gitmoot job cleanup
 list --state quarantined` and reopen a repaired target with
 `gitmoot job cleanup reopen <resource-id>`.
+
+Repeated terminal-task failures log three times per path before identical
+messages are suppressed.
 
 For immediate relief, list candidate directories and prove ownership before
 removing anything:

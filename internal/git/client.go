@@ -561,6 +561,8 @@ func (c Client) worktreeStatusEmptyAt(ctx context.Context, path string, includeI
 		if _, statErr := os.Stat(gitDir); os.IsNotExist(statErr) {
 			return false, terminalWorktreeRemovalError{err: fmt.Errorf("%w: worktree admin directory %s is missing", err, gitDir)}
 		}
+	} else if _, statErr := os.Stat(filepath.Join(path, ".git")); statErr == nil || os.IsNotExist(statErr) {
+		return false, terminalWorktreeRemovalError{err: fmt.Errorf("%w: worktree has no valid .git pointer: %v", err, gitDirErr)}
 	}
 	owner, ownerErr := worktreeOwnerCheckout(path)
 	if ownerErr == nil && filepath.Clean(owner) != filepath.Clean(c.dir) {

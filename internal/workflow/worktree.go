@@ -54,6 +54,7 @@ const (
 	TaskWorktreeReclaimLivenessUnknown TaskWorktreeReclaimClassification = "liveness_unknown"
 	TaskWorktreeReclaimLiveProcess     TaskWorktreeReclaimClassification = "live_process"
 	TaskWorktreeReclaimDirty           TaskWorktreeReclaimClassification = "dirty"
+	TaskWorktreeReclaimHeadUnreachable TaskWorktreeReclaimClassification = "head_unreachable"
 	TaskWorktreeReclaimUnremovable     TaskWorktreeReclaimClassification = "terminal_unremovable"
 )
 
@@ -328,6 +329,14 @@ func (e Engine) ReclaimTerminalTaskWorktreeOutcome(ctx context.Context, home, ch
 		outcome.Classification = TaskWorktreeReclaimDirty
 		return outcome, nil
 	}
+	reachable, err := taskWorktreeHeadReachableFromBranch(opCtx, task, path, manager)
+	if err != nil {
+		return outcome, fmt.Errorf("prove terminal task worktree head reachable from branch: %w", err)
+	}
+	if !reachable {
+		outcome.Classification = TaskWorktreeReclaimHeadUnreachable
+		return outcome, nil
+	}
 	if err := manager.RemoveWorktree(opCtx, path); err != nil {
 		if isTerminalWorktreeRemovalError(err) {
 			return e.classifyTerminalTaskWorktreeUnremovable(opCtx, task.ID, path, outcome)
@@ -341,6 +350,22 @@ func (e Engine) ReclaimTerminalTaskWorktreeOutcome(ctx context.Context, home, ch
 	outcome.Reclaimed = changed
 	outcome.Classification = TaskWorktreeReclaimReclaimed
 	return outcome, nil
+}
+
+func taskWorktreeHeadReachableFromBranch(ctx context.Context, task db.Task, path string, manager WritableWorktreeLineageManager) (bool, error) {
+	branch := strings.TrimSpace(task.Branch)
+	if branch == "" {
+		return false, nil
+	}
+	head, err := manager.HeadSHAAt(ctx, path)
+	if err != nil {
+		return false, err
+	}
+	branchHead, err := manager.RevParse(ctx, "refs/heads/"+branch)
+	if err != nil {
+		return false, err
+	}
+	return manager.IsAncestor(ctx, head, branchHead)
 }
 
 func (e Engine) classifyTerminalTaskWorktreeUnremovable(ctx context.Context, taskID, path string, outcome TaskWorktreeReclaimOutcome) (TaskWorktreeReclaimOutcome, error) {

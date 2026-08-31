@@ -181,6 +181,17 @@ func logDelegationReclaimFailure(stdout io.Writer, mode string, phase string, jo
 		writeLine(stdout, "job %s delegation worktree reclaim path=%s reached %d failures; further identical-path failures are suppressed", jobID, path, count)
 	}
 }
+func logTaskWorktreeReclaimFailure(stdout io.Writer, taskID string, path string, err error) {
+	path = filepath.Clean(path)
+	count, shouldLog := recordDelegationReclaimFailure(path, time.Now().UTC())
+	if !shouldLog {
+		return
+	}
+	writeLine(stdout, "terminal task worktree reclaim failed task=%s path=%s attempt=%d: %v", taskID, path, count, err)
+	if count == delegationReclaimFailureLogLimit {
+		writeLine(stdout, "terminal task worktree reclaim task=%s path=%s reached %d failures; further identical-path failures are suppressed", taskID, path, count)
+	}
+}
 
 func recordDelegationCleanupFailure(ctx context.Context, worker jobWorker, mode, phase, jobID, path string, err error, now time.Time) (db.CleanupObligation, error) {
 	reason := db.ClassifyCleanupObligationFailure(phase, err)
@@ -1199,9 +1210,10 @@ func reclaimTerminalTaskWorktrees(ctx context.Context, worker jobWorker, repoFil
 		}
 		outcome, err := engine.ReclaimTerminalTaskWorktreeOutcome(ctx, home, checkout, task.ID, manager)
 		if err != nil {
-			writeLine(stdout, "terminal task worktree reclaim candidate %s failed: %v", task.ID, err)
+			logTaskWorktreeReclaimFailure(stdout, task.ID, path, err)
 			continue
 		}
+		clearDelegationReclaimFailure(filepath.Clean(path))
 		switch {
 		case outcome.Reclaimed:
 			writeLine(stdout, "terminal task worktree reclaimed: task=%s path=%s classification=%s", task.ID, outcome.Path, outcome.Classification)

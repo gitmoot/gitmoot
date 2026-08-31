@@ -201,6 +201,21 @@ func TestDelegationReclaimRepeatedFailureStopsRelogging(t *testing.T) {
 	}
 }
 
+func TestTerminalTaskReclaimRepeatedFailureStopsRelogging(t *testing.T) {
+	resetDelegationReclaimAccountingForTest(t)
+	path := filepath.Join(t.TempDir(), "task-poison")
+	var output bytes.Buffer
+	for range delegationReclaimFailureLogLimit + 2 {
+		logTaskWorktreeReclaimFailure(&output, "task-poison", path, errors.New("persistent poison"))
+	}
+	if got := strings.Count(output.String(), "terminal task worktree reclaim failed"); got != delegationReclaimFailureLogLimit {
+		t.Fatalf("failure log count = %d, want %d before suppression:\n%s", got, delegationReclaimFailureLogLimit, output.String())
+	}
+	if !strings.Contains(output.String(), "further identical-path failures are suppressed") {
+		t.Fatalf("missing suppression notice: %s", output.String())
+	}
+}
+
 func TestDelegationReclaimStoreFailureStillAborts(t *testing.T) {
 	resetDelegationReclaimAccountingForTest(t)
 	ctx := context.Background()

@@ -723,6 +723,18 @@ func TestClientCreateBranchSmoke(t *testing.T) {
 	}
 }
 
+func TestClientWorktreePristineAtClassifiesMissingGitPointer(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	path := t.TempDir()
+	_, err := NewHostClient(path).WorktreePristineAt(context.Background(), path)
+	var terminal terminalWorktreeRemovalError
+	if !errors.As(err, &terminal) {
+		t.Fatalf("WorktreePristineAt error = %v, want terminal worktree removal error", err)
+	}
+}
+
 func TestClientWorktreeCleanSmoke(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")

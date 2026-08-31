@@ -700,6 +700,8 @@ mutation lock and requires all of these checks to pass:
 - the `/proc/<pid>/cwd` scan was conclusive and no process has a cwd in the worktree
 - the recorded path is the deterministic task path
 - `git status --porcelain --ignored` reports no tracked, untracked, or ignored content
+- the worktree HEAD is reachable from the recorded task branch, so removing a
+  clean detached worktree cannot orphan a local commit
 
 A malformed payload on any non-final job also counts as an active owner because
 Gitmoot cannot prove that it refers to another worktree.
@@ -707,7 +709,7 @@ Gitmoot cannot prove that it refers to another worktree.
 Removal uses `git worktree remove` without `--force` and preserves the branch.
 Gitmoot then clears the task's stored path and records
 `terminal_worktree_reclaimed`. A live process, unreadable process table, dirty
-tree, active owner, or failed cleanliness proof retains the path.
+tree, unreachable HEAD, active owner, or failed proof retains the path.
 
 If the worktree belongs to an older checkout root, Gitmoot retries removal
 through the owner named by the worktree's `.git` pointer. An owner mismatch that
@@ -732,6 +734,9 @@ the absence as a cleanup error, so TTL alone cannot discard local commits.
 `/api/health` response exposes the same count, bytes, path, breakdown, and
 summary in its top-level `worktrees` field, including the number of cleanup
 obligations in terminal quarantine.
+
+Terminal-task reclaim failures use the same three-message path limit before
+suppressing identical repeats.
 
 One unreclaimable delegation candidate does not stop the pass. Candidate-local
 lookup, runner, and removal failures are skipped while later paths continue.

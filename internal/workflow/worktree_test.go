@@ -1042,6 +1042,46 @@ func TestEngineReclaimTerminalTaskWorktreeKeepsLiveDirtyAdhocAtAnyAge(t *testing
 			t.Fatalf("ignored content %s was removed: %v", ignored, err)
 		}
 	}
+	if err := os.RemoveAll(filepath.Join(path, "GOALS")); err != nil {
+		t.Fatalf("RemoveAll ignored GOALS: %v", err)
+	}
+	if err := os.Remove(filepath.Join(path, "CLAUDE.local.md")); err != nil {
+		t.Fatalf("remove ignored instructions: %v", err)
+	}
+	runWorktreeGit(t, path, "checkout", "--detach")
+	if err := os.WriteFile(filepath.Join(path, "detached.txt"), []byte("detached commit\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile detached commit: %v", err)
+	}
+	runWorktreeGit(t, path, "add", "detached.txt")
+	runWorktreeGit(t, path, "commit", "-m", "detached local commit")
+	if pristine, err := manager.WorktreePristineAt(ctx, path); err != nil || !pristine {
+		t.Fatalf("detached committed WorktreePristineAt = %v, err=%v, want true nil", pristine, err)
+	}
+	detachedHead, err := manager.HeadSHAAt(ctx, path)
+	if err != nil {
+		t.Fatalf("detached HeadSHAAt: %v", err)
+	}
+	branchHead, err := manager.RevParse(ctx, "refs/heads/adhoc-old-live")
+	if err != nil {
+		t.Fatalf("task branch RevParse: %v", err)
+	}
+	if reachable, err := manager.IsAncestor(ctx, detachedHead, branchHead); err != nil || reachable {
+		t.Fatalf("detached head reachable from task branch = %v, err=%v, want false nil", reachable, err)
+	}
+	outcome, err = engine.ReclaimTerminalTaskWorktreeOutcome(ctx, home, checkout, "adhoc-old-live", manager)
+	if err != nil {
+		t.Fatalf("detached-head ReclaimTerminalTaskWorktreeOutcome: %v", err)
+	}
+	if outcome.Reclaimed || outcome.Classification != TaskWorktreeReclaimHeadUnreachable {
+		t.Fatalf("detached-head outcome = %+v, want retained unreachable head", outcome)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("detached-head worktree was removed: %v", err)
+	}
+	task, err = store.GetTask(ctx, "adhoc-old-live")
+	if err != nil || task.WorktreePath != path {
+		t.Fatalf("detached-head task = %+v, err=%v, want preserved path %q", task, err, path)
+	}
 }
 
 func TestEngineReclaimTerminalTaskWorktreeReclaimsTaskKinds(t *testing.T) {
@@ -1197,6 +1237,7 @@ func TestEngineReclaimTerminalTaskWorktreeClassifiesUnremovableOnce(t *testing.T
 		ID:           "review-pr-unremovable",
 		RepoFullName: "owner/repo",
 		State:        string(TaskMerged),
+		Branch:       "review-pr-unremovable",
 		WorktreePath: path,
 	}); err != nil {
 		t.Fatalf("UpsertTask: %v", err)
