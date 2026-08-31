@@ -1753,7 +1753,7 @@ func TestEngineAdvanceDelegatedReviewChildAskGateRecordsFoldedOutcome(t *testing
 	parent := JobPayload{
 		Repo: "mobile/app", Branch: "task-8", PullRequest: 8, TaskID: "task-8",
 		TaskTitle: "Mobile App", LeadAgent: "lead",
-		Result:    &AgentResult{Decision: "approved", Summary: "coordinated"},
+		Result: &AgentResult{Decision: "approved", Summary: "coordinated"},
 	}
 	insertCompletedJob(t, store, db.Job{ID: "coord", Agent: "lead", Type: "ask"}, parent)
 
@@ -1776,6 +1776,143 @@ func TestEngineAdvanceDelegatedReviewChildAskGateRecordsFoldedOutcome(t *testing
 	if got := countJobEvents(t, store, "coord/delegation/lens-a", ReviewApprovedWithNotesEventKind); got != 1 {
 		t.Fatalf("%s events = %d, want 1 despite the delegated-child ask-gate returning early",
 			ReviewApprovedWithNotesEventKind, got)
+	}
+}
+
+// Negative controls for the hoisted write. Moving it to the top of AdvanceJob put
+// it AHEAD of the guards that used to sit between the function entry and the old
+// write site — the pipeline report-only return and the stale-review-round return.
+// Each exclusion therefore has to be a property of recordFoldedReviewOutcome
+// itself, not of where it is called. These pin that.
+func TestRecordFoldedReviewOutcomeExclusionsSurviveTheHoist(t *testing.T) {
+	base := func() JobPayload {
+		return JobPayload{
+			Repo: "mobile/app", Branch: "task-8", PullRequest: 8, TaskID: "task-8",
+			TaskTitle: "Mobile App", LeadAgent: "lead",
+		}
+	}
+	cases := []struct {
+		name    string
+		jobType string
+		mutate  func(*JobPayload)
+		want    int
+	}{
+		{
+			name: "pipeline-sender verdict is never folded", jobType: "review",
+			mutate: func(p *JobPayload) {
+				p.Sender = PipelineJobSender
+				p.Result = &AgentResult{Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "stage refused"}
+			},
+			want: 0,
+		},
+		{
+			name: "blocked review records nothing", jobType: "review",
+			mutate: func(p *JobPayload) {
+				p.Result = &AgentResult{Decision: "blocked", Severity: reviewseverity.P2, Summary: "stuck", Needs: []string{"a checkout"}}
+			},
+			want: 0,
+		},
+		{
+			name: "failed review records nothing", jobType: "review",
+			mutate: func(p *JobPayload) {
+				p.Result = &AgentResult{Decision: "failed", Severity: reviewseverity.P2, Summary: "crashed"}
+			},
+			want: 0,
+		},
+		{
+			name: "at-threshold review records nothing", jobType: "review",
+			mutate: func(p *JobPayload) {
+				p.Result = &AgentResult{Decision: "changes_requested", Severity: reviewseverity.P1, Summary: "blocking"}
+			},
+			want: 0,
+		},
+		{
+			name: "an ask job is never folded", jobType: "ask",
+			mutate: func(p *JobPayload) {
+				p.Result = &AgentResult{Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "not a review"}
+			},
+			want: 0,
+		},
+		{
+			name: "an implement job is never folded", jobType: "implement",
+			mutate: func(p *JobPayload) {
+				p.Result = &AgentResult{Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "not a review"}
+			},
+			want: 0,
+		},
+		{
+			name: "the shape that SHOULD be recorded still is", jobType: "review",
+			mutate: func(p *JobPayload) {
+				p.Result = &AgentResult{Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "non-blocking"}
+			},
+			want: 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			engine := testEngine(store)
+			engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+			payload := base()
+			tc.mutate(&payload)
+			job := db.Job{ID: "j-" + tc.jobType, Agent: "audit", Type: tc.jobType}
+			if err := engine.recordFoldedReviewOutcome(ctx, job, payload); err != nil {
+				t.Fatalf("recordFoldedReviewOutcome returned error: %v", err)
+			}
+			if got := countJobEvents(t, store, job.ID, ReviewApprovedWithNotesEventKind); got != tc.want {
+				t.Fatalf("%s events = %d, want %d", ReviewApprovedWithNotesEventKind, got, tc.want)
+			}
+		})
+	}
+}
+
+// The one BEHAVIOUR CHANGE the hoist introduces: the write now runs ahead of the
+// stale-review-round return, so a stale round records its own folded outcome
+// where previously it recorded nothing. That is defensible — the event is a fact
+// about THAT job's verdict, not about whether its round is current — but it is
+// only safe if it cannot buy merge eligibility. This pins that: a superseded
+// review carrying the event must still not satisfy the gate.
+func TestStaleRoundOutcomeEventDoesNotGrantMergeEligibility(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+
+	stale := JobPayload{
+		Repo: "mobile/app", Branch: "task-9", PullRequest: 9, HeadSHA: "head123",
+		TaskID: "task-9", ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "old round",
+		},
+	}
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-stale", Agent: "audit", Type: "review"}, stale)
+
+	// The stale round records its outcome under the hoisted write.
+	if err := engine.recordFoldedReviewOutcome(ctx,
+		db.Job{ID: "review-stale", Agent: "audit", Type: "review"}, stale); err != nil {
+		t.Fatalf("recordFoldedReviewOutcome returned error: %v", err)
+	}
+	if got := countJobEvents(t, store, "review-stale", ReviewApprovedWithNotesEventKind); got != 1 {
+		t.Fatalf("%s events = %d, want 1", ReviewApprovedWithNotesEventKind, got)
+	}
+
+	// A LATER round from the same reviewer supersedes it with a real blocking
+	// verdict. The gate must block despite the stale round's recorded fold.
+	current := stale
+	current.ReviewRound = "review-2"
+	current.Result = &AgentResult{
+		Decision: "changes_requested", Severity: reviewseverity.P0, Summary: "blocking now",
+	}
+	insertCompletedJob(t, store, db.Job{ID: "review-current", Agent: "audit", Type: "review"}, current)
+
+	err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
+		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "audit",
+		ReviewBlockingSeverity: reviewseverity.P1,
+	}, "head123")
+	var blocked mergeBlocked
+	if !errors.As(err, &blocked) {
+		t.Fatalf("ensureFinalReviewCaptured = %v, want the current blocking round to block", err)
 	}
 }
 
