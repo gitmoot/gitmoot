@@ -1079,7 +1079,7 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 		// can never appear in a list of PRs. Require a second, independent instrument:
 		// a recorded pull_requests row for this number. Absence means NO EVIDENCE and
 		// the job stays queued, matching every sibling reconciler's ErrNoRows skip.
-		known, err := d.pullRequestIsKnown(ctx, payload.PullRequest)
+		known, err := d.pullRequestNumberIsAPullRequest(ctx, payload.PullRequest)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -1128,20 +1128,33 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 	return firstErr
 }
 
-// pullRequestIsKnown reports whether this repo has a recorded pull_requests row for
-// the number. It is the second instrument that separates a genuinely closed PR from
-// a number that was never a PR at all: the payload field carries ISSUE numbers too,
-// and an issue number is absent from a PR listing for a reason that has nothing to do
-// with being closed. A missing row is NO EVIDENCE, never a licence to act, which is
-// how every sibling reconciler treats sql.ErrNoRows.
-func (d Daemon) pullRequestIsKnown(ctx context.Context, number int) (bool, error) {
-	if _, err := d.Store.GetPullRequest(ctx, d.Repo.FullName(), int64(number)); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
+// pullRequestNumberIsAPullRequest reports whether this number names a PULL REQUEST in
+// this repo. It is the second instrument, independent of the open-PR listing, and it
+// exists because "absent from the open list" was doing two jobs at once: the payload
+// field carries ISSUE numbers too (handleIssueAsk stores one there, and
+// delegationRequest copies it onto every child), and an issue number is absent from a
+// list of pull requests for a reason that has nothing to do with being closed.
+//
+// A recorded pull_requests row answers it for free. Its ABSENCE is not an answer,
+// though: a PR the daemon never observed while open — a fresh home, a restored
+// database, a PR opened and closed between polls — has no row either, and treating
+// that as "leave it queued" would strand exactly the legs this sweep exists to clear.
+// So fall back to asking the forge about that one number. Any error, including the 404
+// an issue number produces, is NO EVIDENCE and leaves the job queued: a transient
+// forge failure must never be read as licence to terminate, and the next poll retries.
+func (d Daemon) pullRequestNumberIsAPullRequest(ctx context.Context, number int) (bool, error) {
+	_, err := d.Store.GetPullRequest(ctx, d.Repo.FullName(), int64(number))
+	if err == nil {
+		return true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
 		return false, err
 	}
-	return true, nil
+	pull, forgeErr := d.GitHub.GetPullRequest(ctx, d.Repo, int64(number))
+	if forgeErr != nil {
+		return false, nil
+	}
+	return pull.Number == int64(number), nil
 }
 
 // queuedChildCanReleaseCoordinator reports whether terminating this queued job

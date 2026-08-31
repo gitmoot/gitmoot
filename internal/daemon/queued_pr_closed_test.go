@@ -35,6 +35,12 @@ func TestPollOnceSupersedesQueuedLegsWhosePullRequestClosed(t *testing.T) {
 			HeadRef: "task-9", BaseRef: "main", HeadSHA: "head-nine",
 		}},
 		comments: map[int64][]github.IssueComment{9: {}},
+		// #11 is a real CLOSED pull request the store never recorded — a PR opened and
+		// closed between polls, a fresh home, a restored database. Issue #12 is absent
+		// from here too, which is what a 404 looks like.
+		pullsByNumber: map[int64]github.PullRequest{
+			11: {Number: 11, State: "closed", HeadRef: "task-11", BaseRef: "main", HeadSHA: "head-eleven"},
+		},
 	}
 	// The recorded pull_requests row is the second instrument: it is what proves #7
 	// is a PULL REQUEST rather than an issue number that can never appear in a PR
@@ -106,6 +112,11 @@ func TestPollOnceSupersedesQueuedLegsWhosePullRequestClosed(t *testing.T) {
 		Repo: repo.FullName(), Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "lead",
 		Sender: "local",
 	})
+	seedQueuedJob(t, store, "unrecorded-pr-review", "audit", "review", workflow.JobPayload{
+		// Closed on the forge, never recorded in the store: leaving it queued would
+		// strand exactly the leg this sweep exists to clear, so the forge answers.
+		Repo: repo.FullName(), Branch: "task-11", PullRequest: 11, TaskID: "task-11", LeadAgent: "lead",
+	})
 
 	engine := workflow.Engine{Store: store}
 	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
@@ -131,6 +142,7 @@ func TestPollOnceSupersedesQueuedLegsWhosePullRequestClosed(t *testing.T) {
 		{"coordinator-job/continuation", workflow.JobQueued, "a continuation synthesizes work that already happened"},
 		{"issue-ask-child", workflow.JobQueued, "issue #12 is not a pull request at all"},
 		{"cli-dispatched-review", workflow.JobQueued, "an operator dispatched it by name"},
+		{"unrecorded-pr-review", workflow.JobCancelled, "a closed PR the store never recorded is still a closed PR"},
 	} {
 		job, err := store.GetJob(ctx, tc.id)
 		if err != nil {
