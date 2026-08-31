@@ -1,11 +1,20 @@
 package cli
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -66,5 +75,270 @@ func TestApplyReviewPolicyEmptyHomeIsOff(t *testing.T) {
 	}
 	if engine.NativeReviewFanoutEnabled == nil || engine.NativeReviewFanoutEnabled("owner/repo") {
 		t.Fatal("empty home must resolve native fanout OFF")
+	}
+}
+
+type reviewCompareClient struct {
+	github.NoopClient
+	base   string
+	head   string
+	calls  int
+	result github.CompareResult
+}
+
+func (c *reviewCompareClient) CompareCommits(_ context.Context, _ github.Repository, base string, head string) (github.CompareResult, error) {
+	c.base, c.head = base, head
+	c.calls++
+	return c.result, nil
+}
+
+func TestWireReviewChangedFilesUsesExactReviewerHead(t *testing.T) {
+	client := &reviewCompareClient{result: github.CompareResult{Status: "ahead", Files: []github.PullRequestFile{
+		{Filename: "internal/z.go"},
+		{Filename: "internal/a.go"},
+		{Filename: "internal/a.go"},
+	}}}
+	var engine workflow.Engine
+	wireReviewChangedFiles(&engine, client, "", nil)
+	if engine.ReviewChangedFiles == nil {
+		t.Fatal("ReviewChangedFiles was not wired")
+	}
+	files, err := engine.ReviewChangedFiles(context.Background(), "owner/repo", 17, "reviewer-head", "current-head")
+	if err != nil {
+		t.Fatalf("ReviewChangedFiles: %v", err)
+	}
+	if client.base != "reviewer-head" || client.head != "current-head" {
+		t.Fatalf("compare range = %s...%s, want reviewer-head...current-head", client.base, client.head)
+	}
+	if len(files) != 2 || files[0] != "internal/a.go" || files[1] != "internal/z.go" {
+		t.Fatalf("changed files = %#v, want sorted exact-head paths", files)
+	}
+}
+
+// reviewScopeCheckout builds a real two-commit repository whose follow-up range
+// changes `changed` files, and returns the checkout plus the two head SHAs.
+func reviewScopeCheckout(t *testing.T, changed int) (checkout string, base string, head string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	runGit(t, dir, "init", "-b", "main")
+	runGit(t, dir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, dir, "config", "user.name", "Gitmoot")
+	writeFile(t, filepath.Join(dir, "README.md"), "base\n")
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-m", "base")
+	base = reviewScopeHead(t, dir)
+
+	for i := range changed {
+		path := filepath.Join(dir, fmt.Sprintf("internal/pkg%04d/file.go", i+1))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("MkdirAll returned error: %v", err)
+		}
+		writeFile(t, path, "package p\n")
+	}
+	runGit(t, dir, "add", "-A")
+	runGit(t, dir, "commit", "-m", "follow-up")
+	return dir, base, reviewScopeHead(t, dir)
+}
+
+func reviewScopeHead(t *testing.T, dir string) string {
+	t.Helper()
+	return strings.TrimSpace(runGitOutput(t, dir, "rev-parse", "HEAD"))
+}
+
+// The acceptance case for the whole design: a follow-up range LARGER than
+// GitHub's 300-file compare cap must scope COMPLETELY. No compare response can
+// prove that (the JSON page stops at 300 and the diff media type truncates
+// silently at HTTP 200), so the completeness proof comes from the daemon's own
+// checkout. The API client here would fail the scope closed, which is what makes
+// this test attribute the complete list to local git and nothing else.
+func TestWireReviewChangedFilesScopesCompleteRangeBeyondCompareCapViaLocalGit(t *testing.T) {
+	const changed = 350
+	checkout, base, head := reviewScopeCheckout(t, changed)
+	capped := make([]github.PullRequestFile, 300)
+	for i := range capped {
+		capped[i].Filename = fmt.Sprintf("internal/pkg%04d/file.go", i+1)
+	}
+	client := &reviewCompareClient{result: github.CompareResult{Status: "ahead", Files: capped, Truncated: true}}
+	var engine workflow.Engine
+	wireReviewChangedFiles(&engine, client, checkout, subprocess.ExecRunner{})
+
+	paths, err := engine.ReviewChangedFiles(context.Background(), "owner/repo", 17, base, head)
+	if err != nil {
+		t.Fatalf("a %d-file follow-up range must scope from the local checkout: %v", changed, err)
+	}
+	if client.calls != 0 {
+		t.Fatalf("compare API calls = %d, want 0: local git already proved the range complete", client.calls)
+	}
+	if len(paths) != changed {
+		t.Fatalf("changed files = %d, want all %d paths past the 300-file compare cap", len(paths), changed)
+	}
+	if !sort.StringsAreSorted(paths) {
+		t.Fatalf("changed files are not sorted: %v...", paths[:3])
+	}
+	if paths[0] != "internal/pkg0001/file.go" || paths[len(paths)-1] != fmt.Sprintf("internal/pkg%04d/file.go", changed) {
+		t.Fatalf("changed files bounds = %q..%q", paths[0], paths[len(paths)-1])
+	}
+}
+
+// The test above enters through wireReviewChangedFiles, which is a HELPER: a
+// wiring mutant that stops handing the seam the daemon's checkout leaves it
+// green while production silently loses the only instrument that can prove a
+// range complete. So pin the PATH too — build the engine the daemon actually
+// builds and scope the same >300-file range through it.
+func TestDaemonWorkflowEngineScopesReviewFromTheDaemonCheckout(t *testing.T) {
+	const changed = 350
+	checkout, base, head := reviewScopeCheckout(t, changed)
+	home := config.PathsForHome(t.TempDir()).Home
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	capped := make([]github.PullRequestFile, 300)
+	for i := range capped {
+		capped[i].Filename = fmt.Sprintf("internal/pkg%04d/file.go", i+1)
+	}
+	client := &reviewCompareClient{result: github.CompareResult{Status: "ahead", Files: capped, Truncated: true}}
+
+	engine := daemonWorkflowEngineForRunner(daemonWorkerStore(t), client, checkout, home, subprocess.ExecRunner{})
+	if engine.ReviewChangedFiles == nil {
+		t.Fatal("the daemon engine did not wire ReviewChangedFiles")
+	}
+	paths, err := engine.ReviewChangedFiles(context.Background(), "owner/repo", 17, base, head)
+	if err != nil {
+		t.Fatalf("the daemon engine must scope a %d-file range from its own checkout: %v", changed, err)
+	}
+	if client.calls != 0 {
+		t.Fatalf("compare API calls = %d, want 0: the daemon checkout was in scope at the wiring site", client.calls)
+	}
+	if len(paths) != changed {
+		t.Fatalf("changed files = %d, want all %d paths — the wiring site dropped the checkout", len(paths), changed)
+	}
+}
+
+// reviewScopeGhRunner answers every `gh` invocation with one canned payload so a
+// test can drive the REAL github.GhClient. That matters here: the assertion is
+// about the cap -> Truncated -> fail-closed chain, and a hand-set Truncated flag
+// would not prove CompareCommits still sets it.
+type reviewScopeGhRunner struct {
+	stdout string
+	calls  [][]string
+}
+
+func (r *reviewScopeGhRunner) Run(_ context.Context, _ string, command string, args ...string) (subprocess.Result, error) {
+	r.calls = append(r.calls, append([]string{command}, args...))
+	return subprocess.Result{Command: command, Args: args, Stdout: r.stdout}, nil
+}
+
+func (r *reviewScopeGhRunner) LookPath(file string) (string, error) { return file, nil }
+
+// The other acceptance case: with NO local checkout and a compare page sitting
+// on the 300-file cap, the scope is UNKNOWN. It must fail closed to
+// ReviewScopeUnavailableError — which HandlePullRequestOpened degrades to an
+// unscoped full review at the same head — never to a silently incomplete list.
+func TestWireReviewChangedFilesRejectsCappedCompareWithoutLocalCheckout(t *testing.T) {
+	files := make([]github.PullRequestFile, 300)
+	for i := range files {
+		files[i] = github.PullRequestFile{Filename: fmt.Sprintf("internal/pkg%04d/file.go", i+1), Status: "modified"}
+	}
+	payload, err := json.Marshal(github.CompareResult{Status: "ahead", AheadBy: 4, Files: files})
+	if err != nil {
+		t.Fatalf("marshal compare payload: %v", err)
+	}
+	runner := &reviewScopeGhRunner{stdout: string(payload)}
+	var engine workflow.Engine
+	wireReviewChangedFiles(&engine, github.NewClientWithRunner(t.TempDir(), runner), "", nil)
+
+	paths, err := engine.ReviewChangedFiles(context.Background(), "owner/repo", 17, "reviewer-head", "current-head")
+	var unavailable workflow.ReviewScopeUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("ReviewChangedFiles = (%d paths, %v), want ReviewScopeUnavailableError for a capped compare with no local proof", len(paths), err)
+	}
+	if paths != nil {
+		t.Fatalf("a failed scope must return no paths; got %d", len(paths))
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("gh calls = %v, want exactly the compare request", runner.calls)
+	}
+}
+
+// Local ancestry is a PROOF that a range is not a direct follow-up, so a
+// diverged range must fail closed without spending a compare call that could
+// only agree.
+func TestWireReviewChangedFilesProvesDivergedRangeLocally(t *testing.T) {
+	checkout, base, _ := reviewScopeCheckout(t, 2)
+	runGit(t, checkout, "switch", "-c", "sibling", base)
+	writeFile(t, filepath.Join(checkout, "sibling.go"), "package p\n")
+	runGit(t, checkout, "add", "-A")
+	runGit(t, checkout, "commit", "-m", "sibling")
+	sibling := reviewScopeHead(t, checkout)
+	runGit(t, checkout, "switch", "main")
+	main := reviewScopeHead(t, checkout)
+
+	client := &reviewCompareClient{result: github.CompareResult{Status: "ahead", Files: []github.PullRequestFile{{Filename: "wrong.go"}}}}
+	var engine workflow.Engine
+	wireReviewChangedFiles(&engine, client, checkout, subprocess.ExecRunner{})
+
+	_, err := engine.ReviewChangedFiles(context.Background(), "owner/repo", 17, sibling, main)
+	var unavailable workflow.ReviewScopeUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("ReviewChangedFiles error = %v, want ReviewScopeUnavailableError for a locally diverged range", err)
+	}
+	if client.calls != 0 {
+		t.Fatalf("compare API calls = %d, want 0: the local objects already disproved the range", client.calls)
+	}
+}
+
+// A checkout that cannot supply the range (cold clone, no fetchable remote) is
+// an instrument that could not RUN, not a proof of anything, so the seam must
+// fall back to the API rather than report an empty or partial scope.
+func TestWireReviewChangedFilesFallsBackToAPIWhenLocalObjectsAreMissing(t *testing.T) {
+	checkout, _, _ := reviewScopeCheckout(t, 1)
+	client := &reviewCompareClient{result: github.CompareResult{Status: "ahead", Files: []github.PullRequestFile{
+		{Filename: "internal/b.go"},
+		{Filename: "internal/a.go"},
+	}}}
+	var engine workflow.Engine
+	wireReviewChangedFiles(&engine, client, checkout, subprocess.ExecRunner{})
+
+	paths, err := engine.ReviewChangedFiles(context.Background(), "owner/repo", 17,
+		"1111111111111111111111111111111111111111", "2222222222222222222222222222222222222222")
+	if err != nil {
+		t.Fatalf("ReviewChangedFiles must fall back to the API when the objects are absent: %v", err)
+	}
+	if client.calls != 1 {
+		t.Fatalf("compare API calls = %d, want 1", client.calls)
+	}
+	if len(paths) != 2 || paths[0] != "internal/a.go" || paths[1] != "internal/b.go" {
+		t.Fatalf("changed files = %#v, want the sorted API list", paths)
+	}
+}
+
+func TestWireReviewChangedFilesRejectsTruncatedCompare(t *testing.T) {
+	files := make([]github.PullRequestFile, 300)
+	for i := range files {
+		files[i].Filename = fmt.Sprintf("internal/pkg%04d/file.go", i)
+	}
+	client := &reviewCompareClient{result: github.CompareResult{Status: "ahead", Files: files, Truncated: true}}
+	var engine workflow.Engine
+	wireReviewChangedFiles(&engine, client, "", nil)
+
+	_, err := engine.ReviewChangedFiles(context.Background(), "owner/repo", 17, "reviewer-head", "current-head")
+	var unavailable workflow.ReviewScopeUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("ReviewChangedFiles error = %v, want ReviewScopeUnavailableError", err)
+	}
+}
+
+func TestWireReviewChangedFilesMarksDivergedRangeUnscopable(t *testing.T) {
+	client := &reviewCompareClient{result: github.CompareResult{Status: "diverged"}}
+	var engine workflow.Engine
+	wireReviewChangedFiles(&engine, client, "", nil)
+
+	_, err := engine.ReviewChangedFiles(context.Background(), "owner/repo", 17, "reviewer-head", "current-head")
+	var unavailable workflow.ReviewScopeUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("ReviewChangedFiles error = %v, want ReviewScopeUnavailableError", err)
 	}
 }

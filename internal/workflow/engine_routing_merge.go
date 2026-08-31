@@ -102,11 +102,7 @@ func (e Engine) dispatchFix(ctx context.Context, reviewer string, payload JobPay
 		ReviewRound:   payload.ReviewRound,
 		Sender:        reviewer,
 		ActingOrgRole: payload.ActingOrgRole,
-		Instructions: fmt.Sprintf(
-			"Address requested changes from %s: %s",
-			reviewer,
-			result.Summary,
-		),
+		Instructions:  reviewFixInstructions(reviewer, result),
 	}
 	if request.ID == "" {
 		request.ID = e.jobID(request)

@@ -86,6 +86,180 @@ func TestHighRiskPRFansOutLensReviewers(t *testing.T) {
 	}
 }
 
+func TestHighRiskFollowUpScopesAndPinsLensWorktreesToReviewerHead(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "sec", []string{"review"}, "gitmoot/gitmoot")
+	insertCompletedJob(t, store, db.Job{ID: "prior-audit", Agent: "audit", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, HeadSHA: "head-one",
+		TaskID: "task-7", ReviewRound: "review-1", Result: &AgentResult{
+			Decision: "changes_requested",
+			Summary:  "Close F-1.",
+			Findings: []json.RawMessage{json.RawMessage(`{"id":"F-1","summary":"Close F-1."}`)},
+		},
+	})
+	insertCompletedJob(t, store, db.Job{ID: "prior-sec", Agent: "sec", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, HeadSHA: "head-one",
+		TaskID: "task-7", ReviewRound: "review-1",
+		Result: &AgentResult{Decision: "approved", Summary: "Prior approval is not a finding."},
+	})
+	engine := testEngine(store)
+	engine.RiskTiersEnabled = true
+	engine.Home = t.TempDir()
+	engine.DelegationCheckout = t.TempDir()
+	manager := &fakeWorktreeManager{}
+	engine.DelegationWorktrees = manager
+	engine.ReviewChangedFiles = func(_ context.Context, _ string, _ int, previousHead, currentHead string) ([]string, error) {
+		if previousHead != "head-one" || currentHead != "head-two" {
+			t.Fatalf("scope compare = %s..%s, want head-one..head-two", previousHead, currentHead)
+		}
+		return []string{"internal/auth/session.go"}, nil
+	}
+	event := highRiskEvent()
+	event.HeadSHA = "head-two"
+
+	if err := engine.HandlePullRequestOpened(ctx, event); err != nil {
+		t.Fatalf("HandlePullRequestOpened: %v", err)
+	}
+	if len(manager.detachedCalls) != 2 {
+		t.Fatalf("detached lens worktrees = %d, want 2", len(manager.detachedCalls))
+	}
+	for _, call := range manager.detachedCalls {
+		if call.base != "head-two" {
+			t.Fatalf("lens worktree base = %q, want exact head-two", call.base)
+		}
+	}
+	coordID := "review-coordinator/task-7/review-2"
+	for _, tc := range []struct {
+		lens        string
+		wantFinding bool
+	}{
+		{lens: LensCorrectness, wantFinding: true},
+		{lens: LensSecurity, wantFinding: false},
+	} {
+		job := mustJob(t, store, coordID+"/delegation/"+tc.lens)
+		payload, err := unmarshalPayload(job.Payload)
+		if err != nil {
+			t.Fatalf("unmarshal %s lens payload: %v", tc.lens, err)
+		}
+		if payload.HeadSHA != "head-two" || payload.WorktreePath == "" {
+			t.Fatalf("%s lens exact-head isolation = head %q worktree %q", tc.lens, payload.HeadSHA, payload.WorktreePath)
+		}
+		if payload.ReviewScope == nil || payload.ReviewScope.PreviousHeadSHA != "head-one" ||
+			len(payload.ReviewScope.ChangedFiles) != 1 || payload.ReviewScope.ChangedFiles[0] != "internal/auth/session.go" {
+			t.Fatalf("%s lens scope = %+v", tc.lens, payload.ReviewScope)
+		}
+		hasFinding := len(payload.ReviewScope.Findings) > 0
+		if hasFinding != tc.wantFinding {
+			t.Fatalf("%s lens findings = %#v, wantFinding=%t", tc.lens, payload.ReviewScope.Findings, tc.wantFinding)
+		}
+		if !strings.Contains(payload.Instructions, "Do not re-review the full PR-to-base diff") {
+			t.Fatalf("%s lens lost scoped follow-up instructions: %q", tc.lens, payload.Instructions)
+		}
+	}
+}
+
+func TestHighRiskFollowUpScopesStayBoundToLensForOneReviewer(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
+	insertPriorLensReview(t, store, "prior-correctness", LensCorrectness, JobSucceeded, "changes_requested",
+		json.RawMessage(`{"lens":"correctness","id":"C-1","summary":"correctness finding"}`))
+	insertPriorLensReview(t, store, "prior-security", LensSecurity, JobSucceeded, "changes_requested",
+		json.RawMessage(`{"lens":"security","id":"S-9","summary":"security finding"}`))
+
+	engine := testEngine(store)
+	engine.RiskTiersEnabled = true
+	engine.ReviewChangedFiles = func(context.Context, string, int, string, string) ([]string, error) {
+		return nil, nil
+	}
+	event := highRiskEvent()
+	event.RequiredReviewers = []string{"audit"}
+	event.HeadSHA = "head-two"
+	if err := engine.HandlePullRequestOpened(ctx, event); err != nil {
+		t.Fatalf("HandlePullRequestOpened: %v", err)
+	}
+
+	coordID := "review-coordinator/task-7/review-2"
+	for _, tc := range []struct {
+		lens       string
+		wantID     string
+		rejectedID string
+	}{
+		{lens: LensCorrectness, wantID: `"id":"C-1"`, rejectedID: `"id":"S-9"`},
+		{lens: LensSecurity, wantID: `"id":"S-9"`, rejectedID: `"id":"C-1"`},
+	} {
+		payload, err := unmarshalPayload(mustJob(t, store, coordID+"/delegation/"+tc.lens).Payload)
+		if err != nil {
+			t.Fatalf("unmarshal %s lens payload: %v", tc.lens, err)
+		}
+		if payload.ReviewScope == nil || len(payload.ReviewScope.Findings) != 1 ||
+			!strings.Contains(payload.ReviewScope.Findings[0], tc.wantID) ||
+			strings.Contains(payload.ReviewScope.Findings[0], tc.rejectedID) {
+			t.Fatalf("%s lens scope collapsed across delegations: %+v", tc.lens, payload.ReviewScope)
+		}
+	}
+}
+
+func TestHighRiskFollowUpCarriesBlockedCriticalLensFinding(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
+	insertPriorLensReview(t, store, "prior-correctness", LensCorrectness, JobBlocked, "blocked",
+		json.RawMessage(`{"lens":"correctness","id":"C-critical","refuted":true,"severity":"critical","evidence":"auth bypass"}`))
+	insertPriorLensReview(t, store, "prior-security", LensSecurity, JobSucceeded, "approved")
+
+	engine := testEngine(store)
+	engine.RiskTiersEnabled = true
+	engine.ReviewChangedFiles = func(context.Context, string, int, string, string) ([]string, error) {
+		return nil, nil
+	}
+	event := highRiskEvent()
+	event.RequiredReviewers = []string{"audit"}
+	event.HeadSHA = "head-two"
+	if err := engine.HandlePullRequestOpened(ctx, event); err != nil {
+		t.Fatalf("HandlePullRequestOpened: %v", err)
+	}
+
+	coordID := "review-coordinator/task-7/review-2"
+	correctness, err := unmarshalPayload(mustJob(t, store, coordID+"/delegation/"+LensCorrectness).Payload)
+	if err != nil {
+		t.Fatalf("unmarshal correctness lens payload: %v", err)
+	}
+	if correctness.ReviewScope == nil || len(correctness.ReviewScope.Findings) != 1 ||
+		!strings.Contains(correctness.ReviewScope.Findings[0], `"id":"C-critical"`) ||
+		!strings.Contains(correctness.Instructions, `"id":"C-critical"`) ||
+		strings.Contains(correctness.Instructions, "The scope is empty") {
+		t.Fatalf("blocked critical finding was dropped: scope=%+v instructions=%q", correctness.ReviewScope, correctness.Instructions)
+	}
+	security, err := unmarshalPayload(mustJob(t, store, coordID+"/delegation/"+LensSecurity).Payload)
+	if err != nil {
+		t.Fatalf("unmarshal security lens payload: %v", err)
+	}
+	if security.ReviewScope == nil || len(security.ReviewScope.Findings) != 0 ||
+		!strings.Contains(security.Instructions, "The scope is empty") {
+		t.Fatalf("approved security lens scope = %+v instructions=%q", security.ReviewScope, security.Instructions)
+	}
+}
+
+func insertPriorLensReview(t *testing.T, store *db.Store, id, lens string, state JobState, decision string, findings ...json.RawMessage) {
+	t.Helper()
+	insertCompletedJob(t, store, db.Job{ID: id, Agent: "audit", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, HeadSHA: "head-one",
+		TaskID: "task-7", ReviewRound: "review-1", DelegationID: lens, RiskTier: RiskTierHigh,
+		Result: &AgentResult{Decision: decision, Findings: findings},
+	})
+	if state != JobSucceeded {
+		if err := store.UpdateJobState(context.Background(), id, string(state)); err != nil {
+			t.Fatalf("UpdateJobState %s: %v", id, err)
+		}
+	}
+}
+
 // TestHighRiskReviewLoopBlocksBeforeCoordinator kills a guard placed below the
 // risk-tier diversion. A stable exact-head verdict must block before either the
 // synthetic coordinator or any lens review job is created.

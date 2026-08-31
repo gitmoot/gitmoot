@@ -2,7 +2,9 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -689,7 +691,7 @@ func TestListRecentClosedPullRequestsDecodesMergedAt(t *testing.T) {
 func TestCompareCommitsUsesEscapedCompareEndpoint(t *testing.T) {
 	runner := &fakeRunner{
 		results: []subprocess.Result{{
-			Stdout: `{"status": "ahead", "ahead_by": 3, "behind_by": 0}`,
+			Stdout: `{"status": "ahead", "ahead_by": 3, "behind_by": 0, "files": [{"filename": "internal/review.go", "status": "modified"}]}`,
 		}},
 	}
 	client := GhClient{Runner: runner}
@@ -699,10 +701,77 @@ func TestCompareCommitsUsesEscapedCompareEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CompareCommits returned error: %v", err)
 	}
-	if compare.Status != "ahead" || compare.AheadBy != 3 || compare.BehindBy != 0 {
+	if compare.Status != "ahead" || compare.AheadBy != 3 || compare.BehindBy != 0 ||
+		len(compare.Files) != 1 || compare.Files[0].Filename != "internal/review.go" {
 		t.Fatalf("compare = %+v", compare)
 	}
+	if compare.Truncated {
+		t.Fatal("a compare BELOW the file cap enumerates the whole range and must NOT be flagged truncated")
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("a compare below the file cap must be ONE request; calls = %v", runner.calls)
+	}
 	runner.wantArgs(t, 0, "api", "repos/gitmoot/gitmoot/compare/release%2F1.0...head123")
+}
+
+// comparePayload renders a compare response whose files array carries paths and
+// a patch body, so a test can prove first-page metadata survives.
+func comparePayload(t *testing.T, status string, aheadBy int, paths []string) string {
+	t.Helper()
+	files := make([]PullRequestFile, 0, len(paths))
+	for _, path := range paths {
+		files = append(files, PullRequestFile{Filename: path, Status: "modified", SHA: "sha-" + path, Patch: "@@ -1 +1 @@"})
+	}
+	payload, err := json.Marshal(CompareResult{Status: status, AheadBy: aheadBy, Files: files})
+	if err != nil {
+		t.Fatalf("marshal compare payload: %v", err)
+	}
+	return string(payload)
+}
+
+func compareCapFixture(t *testing.T) []string {
+	t.Helper()
+	capped := make([]string, compareFilesCap)
+	for i := range capped {
+		capped[i] = fmt.Sprintf("internal/capped/%04d.go", i)
+	}
+	return capped
+}
+
+// A compare that hits GitHub's 300-file cap has an UNKNOWN remainder, and no
+// part of any compare response can make it known: the payload declares no total
+// file count, and the diff media type truncates silently (measured 2026-08-31:
+// five identical requests for torvalds/linux v6.5...v6.6 returned HTTP 200 with
+// 8451, 12792, 13158, 13279 and 13897 `diff --git` headers, and a truncated body
+// still named every path the capped page named, so any cross-check between the
+// two sources reports "complete" on a body missing thousands of files). So the
+// cap must be reported as Truncated, in ONE request — a caller reading only the
+// object-level status must not pay a multi-megabyte second fetch for a list
+// nobody can trust.
+func TestCompareCommitsFlagsCappedFileListTruncatedInOneRequest(t *testing.T) {
+	capped := compareCapFixture(t)
+	runner := &fakeRunner{
+		results: []subprocess.Result{{Stdout: comparePayload(t, "ahead", 7, capped)}},
+	}
+	client := GhClient{Runner: runner}
+
+	compare, err := client.CompareCommits(context.Background(), Repository{Owner: "gitmoot", Name: "gitmoot"}, "reviewer-head", "new-head")
+	if err != nil {
+		t.Fatalf("CompareCommits must not fail a status-only caller on a large range: %v", err)
+	}
+	if !compare.Truncated {
+		t.Fatal("a compare page AT the 300-file cap has an unknown remainder and must be flagged truncated")
+	}
+	if compare.Status != "ahead" || compare.AheadBy != 7 || len(compare.Files) != compareFilesCap {
+		t.Fatalf("compare = %s ahead_by=%d with %d files, want the capped page and its object fields preserved",
+			compare.Status, compare.AheadBy, len(compare.Files))
+	}
+	if patch := compare.Files[0].Patch; patch != "@@ -1 +1 @@" {
+		t.Fatalf("first-page file metadata lost for %s: patch = %q", capped[0], patch)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("calls = %v, want exactly the compare request and no diff-media fetch", runner.calls)
+	}
 }
 
 func TestUpdatePullRequestBranchUsesExpectedHeadSHA(t *testing.T) {
