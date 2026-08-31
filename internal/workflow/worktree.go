@@ -1935,13 +1935,14 @@ func (e Engine) recordFixCloneLivenessUnknown(ctx context.Context, jobID, path s
 		fmt.Sprintf("fix clone %s retained after TTL: process liveness could not be proven", path))
 }
 
-// recordFixCloneRetainedDirty records the retention reason most clones will
-// actually hit: the pristine check includes ignored files, so any build output
-// left behind keeps the clone. That branch used to be a silent keep, which is the
-// same defect as an unrecorded inconclusive liveness probe.
+// recordFixCloneRetainedDirty records the retention a clone with UNSAVED WORK
+// hits: tracked modifications or untracked files. Ignored content never reaches
+// this branch — the gate is WorktreeCleanAt, which does not consult it — because
+// the repository declares ignored paths regenerable and demanding a pristine tree
+// made the whole pass inert on any repo with build output.
 func (e Engine) recordFixCloneRetainedDirty(ctx context.Context, jobID, path string) error {
 	return e.recordFixCloneRetention(ctx, jobID, "delegation_worktree_retained_dirty",
-		fmt.Sprintf("fix clone %s retained after TTL: working tree holds tracked, untracked or ignored content", path))
+		fmt.Sprintf("fix clone %s retained after TTL: working tree holds unsaved work (tracked or untracked content)", path))
 }
 
 // recordFixCloneRetainedLive records the ordinary, expected retention: something

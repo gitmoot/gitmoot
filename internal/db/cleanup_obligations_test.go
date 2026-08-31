@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -125,17 +126,44 @@ func TestCleanupObligationsRebuildPreservesLegacyRows(t *testing.T) {
 // A positional migration list must be a strict prefix-extension of the released
 // one: a database already at the previous version has to upgrade by applying only
 // the NEW tail. A fresh-init test cannot fail on a mis-ordered tail, which is
-// exactly how a merge can brick every existing database while every test passes.
+// exactly how a merge bricked every existing database here while every suite
+// stayed green.
+//
+// The released prefix is identified by REMOVING this branch's own migration, not
+// by slicing off the last element. Slicing would make a reordered list produce a
+// synthetic "released" database that already contains the new migration, so the
+// test would pass on precisely the mutant it exists to kill.
 func TestMigrationsUpgradeFromPreviousReleasedVersion(t *testing.T) {
 	ctx := context.Background()
+	const branchMigrationMarker = "'identity_or_containment', 'unpublished_commits', 'unknown'"
+	branchIndex := -1
+	for index, migration := range migrations {
+		if strings.Contains(migration, branchMigrationMarker) {
+			if branchIndex >= 0 {
+				t.Fatalf("migration marker %q matches indexes %d and %d", branchMigrationMarker, branchIndex, index)
+			}
+			branchIndex = index
+		}
+	}
+	if branchIndex < 0 {
+		t.Fatalf("migration marker %q matches no migration", branchMigrationMarker)
+	}
+	// The new migration must be LAST, or a database at the released version would
+	// apply somebody else's already-applied migration and fail to open.
+	if branchIndex != len(migrations)-1 {
+		t.Fatalf("branch migration is at index %d of %d; a new migration must be appended last", branchIndex, len(migrations)-1)
+	}
+	released := make([]string, 0, len(migrations)-1)
+	released = append(released, migrations[:branchIndex]...)
+	released = append(released, migrations[branchIndex+1:]...)
+
 	path := filepath.Join(t.TempDir(), "previous-release.db")
 	raw, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
 	previous := &Store{db: raw}
-	// Everything except this branch's own tail: the state of a released database.
-	for version, migration := range migrations[:len(migrations)-1] {
+	for version, migration := range released {
 		if err := previous.applyMigration(ctx, version+1, migration); err != nil {
 			t.Fatalf("applyMigration(%d): %v", version+1, err)
 		}
@@ -144,8 +172,8 @@ func TestMigrationsUpgradeFromPreviousReleasedVersion(t *testing.T) {
 	if err := raw.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&applied); err != nil {
 		t.Fatalf("read applied version: %v", err)
 	}
-	if applied != len(migrations)-1 {
-		t.Fatalf("applied version = %d, want %d", applied, len(migrations)-1)
+	if applied != len(released) {
+		t.Fatalf("applied version = %d, want %d", applied, len(released))
 	}
 	if err := raw.Close(); err != nil {
 		t.Fatalf("close previous-release store: %v", err)
