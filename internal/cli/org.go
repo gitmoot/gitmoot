@@ -140,7 +140,7 @@ func printOrgUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org chart [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org status [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org recycle ROLE --kind KIND --handoff NOTE [--pane ID] [--json] [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot org seat add NAME --pane LABEL [--parent ROLE] [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org seat add NAME [--pane ID_OR_LABEL] [--parent ROLE] [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org escalate --to ROLE --workflow LABEL [--org-role ROLE] [--repo OWNER/REPO] [--json] [--home DIR] \"QUESTION\"")
 	fmt.Fprintln(w, "  gitmoot org escalate resolve NOTE_ID [--by ROLE] [--note ANSWER_NOTE_ID] [--home DIR]")
@@ -178,7 +178,7 @@ func runOrgSeat(args []string, stdout, stderr io.Writer) int {
 
 func printOrgSeatUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot org seat add NAME --pane LABEL [--parent ROLE] [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org seat add NAME [--pane ID_OR_LABEL] [--parent ROLE] [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--home DIR]")
 }
 
@@ -186,7 +186,7 @@ func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("org seat add", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	paneFlag := fs.String("pane", "", "exact live Herdr pane label to claim")
+	paneFlag := fs.String("pane", "", "live Herdr pane id or unique exact label to claim; omit to create an unbound role")
 	parentFlag := fs.String("parent", "", "parent role (defaults to GITMOOT_ORG_ROLE, then owner)")
 	scopeFlag := fs.String("scope", "", "comma-separated repository scope (defaults to the acting role's scope)")
 	mergeRuleFlag := fs.String("merge-rule", "", "merge authority to grant explicitly: owner, self, or none")
@@ -212,11 +212,7 @@ func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "org seat add: invalid role name %q; use lowercase letters, digits, and hyphens\n", nameArg)
 		return 2
 	}
-	paneLabel := strings.TrimSpace(*paneFlag)
-	if paneLabel == "" {
-		fmt.Fprintln(stderr, "org seat add requires --pane with an exact live Herdr pane label")
-		return 2
-	}
+	paneRef := strings.TrimSpace(*paneFlag)
 	scopeSet := hasFlag(flagArgs, "scope")
 	requestedScope, err := parseOrgSeatScope(*scopeFlag, scopeSet)
 	if err != nil {
@@ -239,26 +235,30 @@ func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	ctx := context.Background()
-	snapshotCtx, cancel := context.WithTimeout(ctx, orgSeatExternalTimeout)
-	snapshot, err := orgProviderSnapshot(snapshotCtx, cfg)
-	cancel()
-	if err != nil {
-		fmt.Fprintf(stderr, "org seat add: inspect live Herdr panes: %v\n", err)
-		return 1
-	}
-	pane, err := uniqueOrgSeatPaneByLabel(snapshot.Panes, paneLabel)
-	if err != nil {
-		fmt.Fprintf(stderr, "org seat add: %v\n", err)
-		return 2
-	}
-	for roleName, binding := range snapshot.PaneBindings {
-		if roleName != name && strings.TrimSpace(binding.PaneID) == pane.PaneID {
-			fmt.Fprintf(stderr, "org seat add: pane %s (%q) is already claimed by role %q\n", pane.PaneID, paneLabel, roleName)
+	var snapshot org.Snapshot
+	var pane org.LivePane
+	if paneRef != "" {
+		snapshotCtx, cancel := context.WithTimeout(ctx, orgSeatExternalTimeout)
+		snapshot, err = orgProviderSnapshot(snapshotCtx, cfg)
+		cancel()
+		if err != nil {
+			fmt.Fprintf(stderr, "org seat add: inspect live Herdr panes: %v\n", err)
+			return 1
+		}
+		pane, err = uniqueOrgSeatPaneByReference(snapshot.Panes, paneRef)
+		if err != nil {
+			fmt.Fprintf(stderr, "org seat add: %v\n", err)
 			return 2
+		}
+		for roleName, binding := range snapshot.PaneBindings {
+			if roleName != name && strings.TrimSpace(binding.PaneID) == pane.PaneID {
+				fmt.Fprintf(stderr, "org seat add: pane %s (%q) is already claimed by role %q\n", pane.PaneID, pane.Label, roleName)
+				return 2
+			}
 		}
 	}
 
-	desired, roleExists, err := orgSeatDesiredRole(cfg, snapshot, name, paneLabel, pane.PaneID, orgSeatRoleOptions{
+	desired, roleExists, err := orgSeatDesiredRole(cfg, snapshot, name, paneRef, pane.PaneID, orgSeatRoleOptions{
 		ActingRole: strings.TrimSpace(os.Getenv("GITMOOT_ORG_ROLE")),
 		Parent:     *parentFlag,
 		Scope:      requestedScope,
@@ -304,7 +304,9 @@ func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	fmt.Fprintf(stdout, "pane %s claimed label=%q\n", pane.PaneID, paneLabel)
+	if paneRef != "" {
+		fmt.Fprintf(stdout, "pane %s claimed label=%q\n", pane.PaneID, pane.Label)
+	}
 	roleStatus := "existed"
 	if roleCreated || !roleExists {
 		roleStatus = "created"
@@ -323,6 +325,10 @@ func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "org seat add: reload org registry: %v\n", err)
 		return 1
+	}
+	if strings.TrimSpace(desired.Pane) == "" {
+		fmt.Fprintf(stdout, "role %s is unbound; bind with gitmoot org seat add %s --pane ID_OR_LABEL\n", name, name)
+		return 0
 	}
 	return runOrgValidateReality(ctx, paths, fresh, stdout, stderr)
 }
@@ -460,22 +466,25 @@ func validOrgSeatName(name string) bool {
 	return true
 }
 
-func uniqueOrgSeatPaneByLabel(panes []org.LivePane, label string) (org.LivePane, error) {
+func uniqueOrgSeatPaneByReference(panes []org.LivePane, reference string) (org.LivePane, error) {
+	if pane, ok := orgSeatPaneByID(panes, reference); ok && pane.PaneID != "" {
+		return pane, nil
+	}
 	var match org.LivePane
 	count := 0
 	for _, pane := range panes {
-		if pane.PaneID != "" && pane.Label == label {
+		if pane.PaneID != "" && pane.Label == reference {
 			match = pane
 			count++
 		}
 	}
 	switch count {
 	case 0:
-		return org.LivePane{}, fmt.Errorf("no live Herdr pane has exact label %q", label)
+		return org.LivePane{}, fmt.Errorf("no live Herdr pane has id or exact label %q", reference)
 	case 1:
 		return match, nil
 	default:
-		return org.LivePane{}, fmt.Errorf("%d live Herdr panes have label %q; refusing ambiguous adoption", count, label)
+		return org.LivePane{}, fmt.Errorf("%d live Herdr panes have label %q; refusing ambiguous adoption", count, reference)
 	}
 }
 
@@ -496,17 +505,20 @@ type orgSeatRoleOptions struct {
 	MergeRule  string
 }
 
-func orgSeatDesiredRole(cfg config.OrgConfig, snapshot org.Snapshot, name, paneLabel, paneID string, options orgSeatRoleOptions) (config.OrgRole, bool, error) {
+func orgSeatDesiredRole(cfg config.OrgConfig, snapshot org.Snapshot, name, paneReference, paneID string, options orgSeatRoleOptions) (config.OrgRole, bool, error) {
 	if current, ok := cfg.Role(name); ok {
+		if paneID == "" {
+			return current, true, nil
+		}
 		if strings.TrimSpace(current.Pane) == "" {
-			current.Pane = paneLabel
+			current.Pane = paneID
 			return current, true, nil
 		}
 		binding := snapshot.PaneBindings[current.Name]
 		if binding.PaneID != paneID {
 			return config.OrgRole{}, true, fmt.Errorf(
-				"role %q already binds %q (%s), not pane %s labeled %q",
-				current.Name, current.Pane, firstNonEmpty(binding.Detail, "resolved to "+binding.PaneID), paneID, paneLabel,
+				"role %q already binds %q (%s), not pane %s referenced by %q",
+				current.Name, current.Pane, firstNonEmpty(binding.Detail, "resolved to "+binding.PaneID), paneID, paneReference,
 			)
 		}
 		return current, true, nil
@@ -515,7 +527,7 @@ func orgSeatDesiredRole(cfg config.OrgConfig, snapshot org.Snapshot, name, paneL
 		if cfg.Enabled() {
 			return config.OrgRole{}, false, errors.New("owner role is missing from a non-empty registry")
 		}
-		return config.OrgRole{Name: name, Scope: []string{"*"}, MergeRule: "owner", Pane: paneLabel}, false, nil
+		return config.OrgRole{Name: name, Scope: []string{"*"}, MergeRule: "owner", Pane: paneID}, false, nil
 	}
 
 	actingRoleName := strings.ToLower(strings.TrimSpace(options.ActingRole))
@@ -566,7 +578,7 @@ func orgSeatDesiredRole(cfg config.OrgConfig, snapshot org.Snapshot, name, paneL
 
 	return config.OrgRole{
 		Name: name, Parent: parentName, Scope: scope,
-		MergeRule: mergeRule, Pane: paneLabel,
+		MergeRule: mergeRule, Pane: paneID,
 	}, false, nil
 }
 

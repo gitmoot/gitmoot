@@ -1525,12 +1525,21 @@ claimed by any role; each failure includes category counts and a reason.
 `org brief --role` defaults to `GITMOOT_ORG_ROLE`; an explicit flag wins.
 `gitmoot org show [--home PATH]` prints the resolved role table.
 
-`gitmoot org seat add <name> --pane <label> [--parent ROLE] [--scope REPO,...]
-[--merge-rule owner|self|none] [--home DIR]` claims the one live Herdr pane
-with that exact label, writes or repairs the role's `pane` binding, and installs
-addressed `reply`, `blocked`, `directive`, `escalation`, and `fact` routes with stable
-IDs `org-seat-<name>-<kind>`. Duplicate labels hard-fail instead of choosing a
-pane.
+`gitmoot org seat add <name> [--pane ID_OR_LABEL] [--parent ROLE]
+[--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]` creates or
+repairs a role and installs addressed `reply`, `blocked`, `directive`,
+`escalation`, and `fact` routes with stable IDs `org-seat-<name>-<kind>`.
+
+With `--pane`, Gitmoot resolves a literal live pane id first, then a unique
+exact live label, and stores the resolved pane id. Existing label-based commands
+therefore keep working, while later cosmetic label changes do not retarget or
+break bindings created by this command. Duplicate labels and unknown references
+hard-fail before any role or route is written. Without `--pane`, the command
+creates an unbound role and the same routes; re-run it with `--pane ID_OR_LABEL`
+to bind that role later. Bound creation finishes with the same live reality
+validation as `org validate`. Unbound creation skips that impossible live check
+and reports the deferred bind command; `org validate` continues to report the
+role as unbound until it is attached.
 
 For a new non-owner seat, the acting role comes from `GITMOOT_ORG_ROLE` and
 falls back to `owner` only when the variable is unset. The new seat inherits
@@ -1539,11 +1548,9 @@ role and cannot create a cycle. An explicit `--scope` must stay within both the
 acting role's scope and the selected parent's scope. Merge authority defaults
 to empty; an explicit `--merge-rule` cannot exceed the acting role's authority.
 The empty-registry `owner` bootstrap keeps its `*` scope and `owner` merge rule.
-The three role flags initialize new seats only; re-running the command repairs
-missing owned pieces without rewriting existing role policy or duplicating
-routes. The command finishes with the same reality validation as `org validate`,
-so success includes a green live-pane and route verdict rather than only
-confirming that config parsed.
+The three policy flags initialize new seats only; re-running the command repairs
+missing owned pieces or fills an empty pane binding without rewriting existing
+policy, rebinding an attached role, or duplicating routes.
 
 `gitmoot org seat rm <name> [--home DIR]` resolves the role's live pane and
 checks every distinct Git checkout reported by that pane's `cwd` and
@@ -1563,10 +1570,13 @@ The registry uses `[org] enforce = "warn"|"block"` and
 cosmetic `display_name`, an optional `model` runtime pin, an optional per-role
 `recycle_after` duration override, and an optional `pane` Herdr binding (used by
 live presence and org event-rule wakes).
-The binding resolves as a unique exact live pane label or a currently live
-literal pane id. Roles without a binding report unknown live presence, and event
-wakes for them are skipped with an observable log and increment the role's
-missed-wake counter rather than being inferred from a pane label. There is
+For backward compatibility, a configured binding resolves as a literal pane id
+or a unique exact live label. A literal id tracks one pane; a label tracks
+whichever current pane uniquely carries that cosmetic value. `org seat add`
+canonicalizes new bindings to ids. Roles without a binding report unknown live
+presence, and event wakes for them are skipped with an observable log and
+increment the role's missed-wake counter rather than being inferred from a pane
+label. There is
 exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
 `owner/repo`, and each child scope must be covered by its parent. Malformed
 org configuration fails closed and loudly. `brief` records passive last-seen

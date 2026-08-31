@@ -27,26 +27,32 @@ func (e OrgSeatConfigEdit) Restore() error {
 }
 
 // UpsertOrgSeatRole adds a role section or fills its previously-empty pane
-// binding. Existing non-empty role fields are never rewritten.
+// binding. A new role may be unbound; existing non-empty fields are not rewritten.
 func UpsertOrgSeatRole(paths Paths, desired OrgRole) (OrgSeatConfigEdit, bool, error) {
 	desired.Name = strings.ToLower(strings.TrimSpace(desired.Name))
 	desired.Pane = strings.TrimSpace(desired.Pane)
-	if desired.Name == "" || desired.Pane == "" {
-		return OrgSeatConfigEdit{}, false, fmt.Errorf("org seat role name and pane are required")
+	if desired.Name == "" {
+		return OrgSeatConfigEdit{}, false, fmt.Errorf("org seat role name is required")
 	}
 	cfg, err := LoadOrg(paths)
 	if err != nil {
 		return OrgSeatConfigEdit{}, false, err
 	}
 	current, exists := cfg.Role(desired.Name)
-	if exists && strings.TrimSpace(current.Pane) != "" {
-		if strings.TrimSpace(current.Pane) != desired.Pane {
-			return OrgSeatConfigEdit{}, false, fmt.Errorf(
-				"org role %q already binds pane %q, not %q",
-				desired.Name, current.Pane, desired.Pane,
-			)
+	if exists {
+		currentPane := strings.TrimSpace(current.Pane)
+		if currentPane != "" {
+			if desired.Pane != "" && currentPane != desired.Pane {
+				return OrgSeatConfigEdit{}, false, fmt.Errorf(
+					"org role %q already binds pane %q, not %q",
+					desired.Name, current.Pane, desired.Pane,
+				)
+			}
+			return OrgSeatConfigEdit{path: paths.ConfigFile}, false, nil
 		}
-		return OrgSeatConfigEdit{path: paths.ConfigFile}, false, nil
+		if desired.Pane == "" {
+			return OrgSeatConfigEdit{path: paths.ConfigFile}, false, nil
+		}
 	}
 
 	original, err := os.ReadFile(paths.ConfigFile)
@@ -139,7 +145,9 @@ func appendOrgRoleSection(contents string, role OrgRole) string {
 	if role.MergeRule != "" {
 		fmt.Fprintf(&section, "merge_rule = %s\n", strconv.Quote(role.MergeRule))
 	}
-	fmt.Fprintf(&section, "pane = %s\n", strconv.Quote(role.Pane))
+	if role.Pane != "" {
+		fmt.Fprintf(&section, "pane = %s\n", strconv.Quote(role.Pane))
+	}
 	if contents != "" && !strings.HasSuffix(contents, "\n") {
 		contents += "\n"
 	}

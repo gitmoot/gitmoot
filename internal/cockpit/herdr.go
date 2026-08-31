@@ -294,9 +294,10 @@ func (c herdrClient) paneList(ctx context.Context) ([]string, error) {
 	return ids, nil
 }
 
-// resolvePaneByLabel returns the CURRENT pane id matching an exact label or
-// literal pane id. It is resolved at call (wake) time so stale and absent ids
-// fail while a recycled pane's stable label reaches its fresh id.
+// resolvePaneByLabel returns the CURRENT pane id matching a literal pane id or
+// exact label. It is resolved at call (wake) time: ids stay pinned to one live
+// pane, while labels follow whichever live pane uniquely has that cosmetic
+// value. Stale ids, absent labels, and ambiguous labels fail.
 func (c herdrClient) resolvePaneByLabel(ctx context.Context, binding string) (string, bool, error) {
 	binding = strings.TrimSpace(binding)
 	if binding == "" {
