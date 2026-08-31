@@ -765,14 +765,24 @@ could have rewritten.
 The proven-disposable clone is then **renamed to a sibling
 `<path>.ttl-reclaiming-<random>`** and every proof is repeated there. After the
 final Git proof, Gitmoot renames it to a second random sibling before the last
-nested-object-database scan. That seals the only quarantine path passed to Git:
-a path-based writer racing the proof can create a new sibling, but cannot add
-content to the directory being removed. The final liveness gate scans both
-process working directories and open file descriptors; an inconclusive `/proc`
-scan retains the clone. A failed proof renames the current quarantine back.
-An interrupted removal leaves a `.ttl-reclaiming-*` sibling; the next pass
-restores it (`delegation_worktree_quarantine_restored`) and re-proves it from
-scratch rather than treating the absent original path as a completed removal.
+nested-object-database scan, so the only path Git ever ran in is no longer the
+path being deleted. Both names a writer could have observed are then **fenced
+with a zero-byte file**: `mkdir` on the name fails, and any path below it fails
+with `ENOTDIR`, so a writer that recreates a quarantine name after the final scan
+cannot orphan content there. A name a writer wins first is never deleted — the
+clone is restored and the obligation stays open. The final liveness gate scans
+both process working directories and open file descriptors; an inconclusive
+`/proc` scan retains the clone. A failed proof renames the current quarantine
+back. An interrupted removal leaves a `.ttl-reclaiming-*` DIRECTORY; the next
+pass restores it (`delegation_worktree_quarantine_restored`) and re-proves it
+from scratch rather than treating the absent original path as a completed
+removal. Fence files are not quarantines and are never counted as one.
+
+A nested object database is recognised by its BYTES, not its layout: a loose
+candidate must decompress to a `commit`/`tree`/`blob`/`tag` header and a pack
+candidate must carry the `PACK` magic. Ordinary ignored content-addressed build
+output uses the same hex-fanout and `pack-<hash>.pack` naming, and classifying it
+as Git data would retain every clone with a build cache.
 
 Every retention records **why**, once per reason per job, so an inert deployment
 is visible instead of silent: `delegation_worktree_retained_unpublished` (also

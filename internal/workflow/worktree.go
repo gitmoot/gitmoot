@@ -1,6 +1,8 @@
 package workflow
 
 import (
+	"bytes"
+	"compress/zlib"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -8,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -1716,11 +1719,40 @@ func FixCloneQuarantines(path string) ([]string, error) {
 	prefix := base + fixCloneQuarantinePrefix
 	var quarantines []string
 	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), prefix) {
-			quarantines = append(quarantines, filepath.Join(parent, entry.Name()))
+		if !strings.HasPrefix(entry.Name(), prefix) {
+			continue
 		}
+		// Only a DIRECTORY is a surviving clone. A regular file with the same
+		// name is a fence written after a completed removal (see
+		// fenceFixCloneQuarantineName): it holds no content and exists precisely
+		// so that the name can never become a directory again.
+		if !entry.IsDir() {
+			continue
+		}
+		quarantines = append(quarantines, filepath.Join(parent, entry.Name()))
 	}
 	return quarantines, nil
+}
+
+// fenceFixCloneQuarantineName makes a quarantine name permanently unusable as a
+// directory. A writer that learned the name while the proofs ran can otherwise
+// recreate it AFTER the final survivor scan, and that late directory is invisible
+// to every later pass because the reclaim completion event retires the job.
+//
+// A zero-byte regular file closes that window without a scan: `mkdir` on the name
+// fails with EEXIST and any path BELOW it fails with ENOTDIR, so no content can
+// ever be orphaned there. It returns false when the name is already taken, which
+// is the writer having won the race — the caller then retains instead of
+// completing.
+func fenceFixCloneQuarantineName(path string) (bool, error) {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o444)
+	if err == nil {
+		return true, file.Close()
+	}
+	if os.IsExist(err) {
+		return false, nil
+	}
+	return false, fmt.Errorf("fence fix clone quarantine name %s: %w", path, err)
 }
 
 func newFixCloneQuarantinePath(path string) (string, error) {
@@ -1764,30 +1796,90 @@ func isHexObjectName(value string, lengths ...int) bool {
 	return true
 }
 
-func looseGitObjectDatabase(rel string, entry fs.DirEntry) string {
+// looseGitObjectDatabase reports the object database owning a loose object.
+// A hex-fanout NAME is not evidence: ordinary ignored content-addressed build
+// output uses the same layout, so the candidate's bytes must decompress to a
+// Git object header before the clone is retained.
+func looseGitObjectDatabase(absolute, rel string, entry fs.DirEntry) (string, error) {
 	if entry.IsDir() || !isHexObjectName(entry.Name(), 38, 62) {
-		return ""
+		return "", nil
 	}
-	fanout := filepath.Base(filepath.Dir(rel))
-	if !isHexObjectName(fanout, 2) {
-		return ""
+	if !isHexObjectName(filepath.Base(filepath.Dir(rel)), 2) {
+		return "", nil
 	}
-	return filepath.Dir(filepath.Dir(rel))
+	file, err := os.Open(absolute)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("inspect possible loose Git object %s: %w", absolute, err)
+	}
+	defer file.Close()
+	reader, err := zlib.NewReader(file)
+	if err != nil {
+		return "", nil // not zlib: ordinary content-addressed content
+	}
+	defer reader.Close()
+	// A Git object begins "<type> <size>\x00"; the longest type is "commit".
+	header := make([]byte, 32)
+	read, err := io.ReadFull(reader, header)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return "", nil // corrupt deflate stream: not a readable Git object
+	}
+	if !isGitObjectHeader(header[:read]) {
+		return "", nil
+	}
+	return filepath.Dir(filepath.Dir(rel)), nil
 }
 
-func packedGitObjectDatabase(rel string, entry fs.DirEntry) string {
+func isGitObjectHeader(header []byte) bool {
+	space := bytes.IndexByte(header, ' ')
+	if space <= 0 {
+		return false
+	}
+	switch string(header[:space]) {
+	case "commit", "tree", "blob", "tag":
+	default:
+		return false
+	}
+	terminator := bytes.IndexByte(header[space+1:], 0)
+	if terminator <= 0 {
+		return false
+	}
+	for _, digit := range header[space+1 : space+1+terminator] {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// packedGitObjectDatabase requires the PACK magic, not merely the pack naming
+// convention, for the same reason looseGitObjectDatabase reads its candidate.
+func packedGitObjectDatabase(absolute, rel string, entry fs.DirEntry) (string, error) {
 	if entry.IsDir() || filepath.Base(filepath.Dir(rel)) != "pack" {
-		return ""
+		return "", nil
 	}
 	name := entry.Name()
 	if !strings.HasPrefix(name, "pack-") || !strings.HasSuffix(name, ".pack") {
-		return ""
+		return "", nil
 	}
-	hash := strings.TrimSuffix(strings.TrimPrefix(name, "pack-"), ".pack")
-	if !isHexObjectName(hash, 40, 64) {
-		return ""
+	if !isHexObjectName(strings.TrimSuffix(strings.TrimPrefix(name, "pack-"), ".pack"), 40, 64) {
+		return "", nil
 	}
-	return filepath.Dir(filepath.Dir(rel))
+	file, err := os.Open(absolute)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("inspect possible Git pack %s: %w", absolute, err)
+	}
+	defer file.Close()
+	magic := make([]byte, 4)
+	if read, err := io.ReadFull(file, magic); err != nil || string(magic[:read]) != "PACK" {
+		return "", nil
+	}
+	return filepath.Dir(filepath.Dir(rel)), nil
 }
 
 // nestedGitObjectDatabase returns the first Git repository or object database
@@ -1822,11 +1914,16 @@ func nestedGitObjectDatabase(ctx context.Context, path string) (string, error) {
 			nested = rel
 			return fs.SkipAll
 		}
-		if objectDB := looseGitObjectDatabase(rel, entry); objectDB != "" {
-			nested = objectDB
-			return fs.SkipAll
+		objectDB, err := looseGitObjectDatabase(candidate, rel, entry)
+		if err != nil {
+			return err
 		}
-		if objectDB := packedGitObjectDatabase(rel, entry); objectDB != "" {
+		if objectDB == "" {
+			if objectDB, err = packedGitObjectDatabase(candidate, rel, entry); err != nil {
+				return err
+			}
+		}
+		if objectDB != "" {
 			nested = objectDB
 			return fs.SkipAll
 		}
@@ -2018,9 +2115,8 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 		return false, e.retainFixCloneWithUnpublishedCommits(ctx, jobID, path, unpublished)
 	}
 	// Seal the proof path before the final content scan. CloneOnlyCommit is the
-	// last operation that legitimately knows the first random quarantine name.
-	// Renaming it again means a path-based writer racing after that proof can only
-	// create a NEW sibling; it cannot add content to the directory we remove.
+	// last operation that legitimately knows the first random quarantine name, so
+	// after this rename a path-based writer can only act on names we then FENCE.
 	sealed, err := newFixCloneQuarantinePath(path)
 	if err != nil {
 		return restore(err)
@@ -2028,7 +2124,20 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 	if err := os.Rename(quarantine, sealed); err != nil {
 		return restore(fmt.Errorf("seal proved fix clone %s as %s: %w", quarantine, sealed, err))
 	}
+	freed := quarantine
 	quarantine = sealed
+	// The rename freed the first name, and a writer that learned it can recreate
+	// it at any later instant — including after the final survivor scan, where no
+	// later pass would ever look again. Fencing it with a zero-byte file makes that
+	// impossible rather than merely unobserved.
+	if fenced, err := fenceFixCloneQuarantineName(freed); err != nil {
+		return restore(err)
+	} else if !fenced {
+		if _, restoreErr := restore(nil); restoreErr != nil {
+			return false, restoreErr
+		}
+		return false, e.retainFixCloneWithRacingQuarantineWriter(ctx, jobID, path, freed)
+	}
 	nested, err = nestedGitObjectDatabase(ctx, quarantine)
 	if err != nil {
 		return restore(fmt.Errorf("recheck sealed fix clone for nested Git object databases: %w", err))
@@ -2054,6 +2163,15 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 	}
 	if err := os.RemoveAll(quarantine); err != nil {
 		return false, fmt.Errorf("remove quarantined fix clone %s: %w", quarantine, err)
+	}
+	// Fence the sealed name too: between RemoveAll and this call it is the only
+	// other name a writer could have observed. EEXIST here means the writer won
+	// that instant, so the reclaim does not complete and the surviving directory
+	// stays a candidate for the next pass.
+	if fenced, err := fenceFixCloneQuarantineName(quarantine); err != nil {
+		return false, err
+	} else if !fenced {
+		return false, nil
 	}
 	if survivors, err := FixCloneQuarantines(path); err != nil {
 		return false, fmt.Errorf("recheck fix clone quarantine siblings after removal: %w", err)
@@ -2082,6 +2200,18 @@ func (e Engine) retainFixCloneWithUnpublishedCommits(ctx context.Context, jobID,
 func (e Engine) retainFixCloneWithNestedRepository(ctx context.Context, jobID, path, nested string) error {
 	if err := e.recordFixCloneRetention(ctx, jobID, "delegation_worktree_retained_unpublished",
 		fmt.Sprintf("fix clone %s retained after TTL: nested Git object database %s has unproved recoverability", path, nested)); err != nil {
+		return err
+	}
+	return e.deferDelegationCleanupObligation(context.WithoutCancel(ctx), jobID, path, db.CleanupReasonUnpublishedCommits)
+}
+
+// retainFixCloneWithRacingQuarantineWriter records the one outcome the fence can
+// observe: something else created a directory at a quarantine name of this clone
+// while the proofs ran. Its content is unproven, so the clone is restored and the
+// obligation stays open rather than the racing directory being deleted.
+func (e Engine) retainFixCloneWithRacingQuarantineWriter(ctx context.Context, jobID, path, quarantine string) error {
+	if err := e.recordFixCloneRetention(ctx, jobID, "delegation_worktree_retained_unpublished",
+		fmt.Sprintf("fix clone %s retained after TTL: another writer created quarantine %s during the removal proof", path, quarantine)); err != nil {
 		return err
 	}
 	return e.deferDelegationCleanupObligation(context.WithoutCancel(ctx), jobID, path, db.CleanupReasonUnpublishedCommits)

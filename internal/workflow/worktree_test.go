@@ -1,6 +1,8 @@
 package workflow
 
 import (
+	"bytes"
+	"compress/zlib"
 	"context"
 	"database/sql"
 	"errors"
@@ -1816,6 +1818,47 @@ func TestEngineReclaimAgedFixCloneRetainsIgnoredNestedRepositories(t *testing.T)
 			},
 		},
 		{
+			name: "global excludes packed custom object database",
+			setup: func(t *testing.T, path string) string {
+				excludes := filepath.Join(t.TempDir(), "global-excludes")
+				if err := os.WriteFile(excludes, []byte("/vendor-cache/\n"), 0o644); err != nil {
+					t.Fatalf("write global excludes: %v", err)
+				}
+				runWorktreeGit(t, path, "config", "core.excludesFile", excludes)
+				objects := filepath.Join(path, "vendor-cache", "objects")
+				if err := os.MkdirAll(objects, 0o755); err != nil {
+					t.Fatalf("MkdirAll custom object database: %v", err)
+				}
+				gitEnv := []string{"GIT_OBJECT_DIRECTORY=" + objects}
+				tree := runWorktreeGitEnvOutput(t, path, gitEnv, "", "mktree")
+				commit := runWorktreeGitEnvOutput(t, path, gitEnv, "", "commit-tree", tree, "-m", "packed custom commit")
+				runWorktreeGitEnvOutput(t, path, gitEnv, commit+"\n", "pack-objects", "--quiet", filepath.Join(objects, "pack", "pack"))
+				// Every LOOSE object must go, or this case is also detectable by the
+				// loose arm and stops discriminating the pack path. `pack-objects`
+				// leaves the empty tree loose beside the packed commit.
+				entries, err := os.ReadDir(objects)
+				if err != nil {
+					t.Fatalf("ReadDir custom object database: %v", err)
+				}
+				for _, entry := range entries {
+					if entry.Name() == "pack" {
+						continue
+					}
+					if err := os.RemoveAll(filepath.Join(objects, entry.Name())); err != nil {
+						t.Fatalf("drop loose copy: %v", err)
+					}
+				}
+				if remaining, err := os.ReadDir(objects); err != nil || len(remaining) != 1 {
+					t.Fatalf("object database entries = %v (err %v), want only pack", remaining, err)
+				}
+				packs, err := filepath.Glob(filepath.Join(objects, "pack", "pack-*.pack"))
+				if err != nil || len(packs) != 1 {
+					t.Fatalf("packs = %v (err %v), want exactly one", packs, err)
+				}
+				return filepath.Join("vendor-cache", "objects")
+			},
+		},
+		{
 			name: "submodule ignore all",
 			setup: func(t *testing.T, path string) string {
 				submodule := filepath.Join(t.TempDir(), "submodule")
@@ -2060,11 +2103,12 @@ func TestEngineReclaimAgedFixCloneRechecksNestedRepositoriesAfterQuarantine(t *t
 	}
 }
 
-// A writer that remembers the first quarantine name can race after the sealed
-// scan. The second rename keeps that write out of the directory being removed,
-// and the survivor scan prevents completed bookkeeping until the new sibling is
-// restored and classified.
-func TestEngineReclaimAgedFixClonePreservesPostScanPathWriter(t *testing.T) {
+// The observed data-loss path: a writer that learned a quarantine name during
+// the proofs recreates it AFTER the final survivor scan, where the completed
+// reclaim event means no later pass ever looks again. Both names a writer could
+// have observed are fenced with a zero-byte file, so that write cannot land at
+// all rather than landing unobserved.
+func TestEngineReclaimAgedFixCloneFencesPostScanPathWriter(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	home := t.TempDir()
@@ -2093,43 +2137,264 @@ func TestEngineReclaimAgedFixClonePreservesPostScanPathWriter(t *testing.T) {
 	engine.Home = home
 	engine.DelegationCheckout = t.TempDir()
 	engine.DelegationWorktrees = manager
-	wrote := false
+	// Every name this clone was ever renamed to, in the order a path-based writer
+	// could have observed them: the proof quarantine, then the sealed name Git ran
+	// in last.
+	observed := map[string]struct{}{}
 	engine.WorktreeLiveness = func(probed string) (bool, bool) {
-		if !wrote && len(manager.cloneOnlyCalls) == 2 &&
-			probed != path && probed != manager.cloneOnlyCalls[1] {
-			late := filepath.Join(manager.cloneOnlyCalls[1], "late", ".git")
-			if err := os.MkdirAll(late, 0o755); err != nil {
-				t.Fatalf("MkdirAll post-scan nested repository: %v", err)
-			}
-			wrote = true
+		if probed != path {
+			observed[probed] = struct{}{}
 		}
 		return false, true
 	}
 
 	reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
 	if err != nil {
-		t.Fatalf("first reclaim pass: %v", err)
+		t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
 	}
-	if reclaimed || !wrote {
-		t.Fatalf("first pass = (reclaimed %v, wrote %v), want retained late writer", reclaimed, wrote)
+	if !reclaimed {
+		t.Fatal("proved-disposable clone was not reclaimed")
 	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("sealed clone original path = %v, want absent pending survivor restore", err)
+	for _, probed := range manager.cloneOnlyCalls {
+		if probed != path {
+			observed[probed] = struct{}{}
+		}
 	}
+	if len(observed) != 2 {
+		t.Fatalf("observed quarantine names = %v, want the proof and sealed names", observed)
+	}
+	for name := range observed {
+		info, err := os.Lstat(name)
+		if err != nil {
+			t.Fatalf("observed quarantine name %s is unfenced: %v", name, err)
+		}
+		if info.IsDir() {
+			t.Fatalf("observed quarantine name %s is still a directory", name)
+		}
+		if info.Size() != 0 {
+			t.Fatalf("fence at %s holds %d bytes, want an empty marker", name, info.Size())
+		}
+		// The write from the review's reproduction, replayed after completion.
+		if err := os.MkdirAll(filepath.Join(name, "late", ".git"), 0o755); err == nil {
+			t.Fatalf("a writer created content under the fenced name %s", name)
+		}
+		if err := os.Mkdir(name, 0o755); err == nil {
+			t.Fatalf("a writer recreated the fenced quarantine directory %s", name)
+		}
+	}
+	// Fences are not surviving clones, so they neither block this clone's
+	// bookkeeping nor inflate the operator-facing quarantine count.
 	survivors, err := FixCloneQuarantines(path)
-	if err != nil || len(survivors) != 1 {
-		t.Fatalf("post-scan writer survivors = %v (err %v), want one", survivors, err)
+	if err != nil || len(survivors) != 0 {
+		t.Fatalf("fences reported as surviving quarantines: %v (err %v)", survivors, err)
+	}
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	completed := false
+	for _, event := range events {
+		if event.Kind == "delegation_worktree_reclaimed_ttl" {
+			completed = true
+		}
+	}
+	if !completed {
+		t.Fatalf("reclaim did not record completion: %+v", events)
+	}
+}
+
+// The fence is the whole guarantee, so its two outcomes are pinned directly: it
+// creates the marker, or it reports that a directory already won the name.
+func TestFenceFixCloneQuarantineName(t *testing.T) {
+	root := t.TempDir()
+	free := filepath.Join(root, "clone"+fixCloneQuarantinePrefix+"00112233")
+	fenced, err := fenceFixCloneQuarantineName(free)
+	if err != nil || !fenced {
+		t.Fatalf("fence on a free name = (%v, %v), want (true, nil)", fenced, err)
+	}
+	if fenced, err := fenceFixCloneQuarantineName(free); err != nil || fenced {
+		t.Fatalf("re-fencing = (%v, %v), want (false, nil)", fenced, err)
 	}
 
-	reclaimed, err = engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
+	taken := filepath.Join(root, "clone"+fixCloneQuarantinePrefix+"44556677")
+	if err := os.Mkdir(taken, 0o755); err != nil {
+		t.Fatalf("Mkdir racing quarantine: %v", err)
+	}
+	fenced, err = fenceFixCloneQuarantineName(taken)
+	if err != nil || fenced {
+		t.Fatalf("fence on a racing directory = (%v, %v), want (false, nil)", fenced, err)
+	}
+	if _, err := os.Stat(taken); err != nil {
+		t.Fatalf("fence deleted the racing directory: %v", err)
+	}
+	quarantines, err := FixCloneQuarantines(filepath.Join(root, "clone"))
 	if err != nil {
-		t.Fatalf("restore pass: %v", err)
+		t.Fatalf("FixCloneQuarantines: %v", err)
 	}
-	if reclaimed {
-		t.Fatal("restored post-scan writer content was reclaimed")
+	if len(quarantines) != 1 || quarantines[0] != taken {
+		t.Fatalf("quarantines = %v, want only the racing directory %s", quarantines, taken)
 	}
-	if _, err := os.Stat(filepath.Join(path, "late", ".git")); err != nil {
-		t.Fatalf("post-scan writer content was not restored: %v", err)
+}
+
+// A writer that wins a quarantine name mid-proof retains the clone and keeps the
+// obligation open; the racing directory is never deleted.
+func TestEngineRetainFixCloneWithRacingQuarantineWriter(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	jobID := "fix-racing-quarantine"
+	path, err := FixWorktreePath(home, "owner/repo", jobID)
+	if err != nil {
+		t.Fatalf("FixWorktreePath: %v", err)
+	}
+	payload, err := marshalPayload(JobPayload{
+		Repo: "owner/repo", Branch: "feature/fix", WorktreePath: path, FixWorktree: true,
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: jobID, Agent: "fixer", Type: "implement", State: string(JobSucceeded),
+		Repo: "owner/repo", Payload: payload,
+	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent: %v", err)
+	}
+	engine := testEngine(store)
+	engine.Home = home
+	quarantine := path + fixCloneQuarantinePrefix + "8899aabb"
+	if err := engine.retainFixCloneWithRacingQuarantineWriter(ctx, jobID, path, quarantine); err != nil {
+		t.Fatalf("retainFixCloneWithRacingQuarantineWriter: %v", err)
+	}
+	obligation, err := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID(jobID, path))
+	if err != nil {
+		t.Fatalf("GetCleanupObligation: %v", err)
+	}
+	if obligation.Reason != db.CleanupReasonUnpublishedCommits {
+		t.Fatalf("obligation reason = %q, want %q", obligation.Reason, db.CleanupReasonUnpublishedCommits)
+	}
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	retained := 0
+	for _, event := range events {
+		if event.Kind == "delegation_worktree_retained_unpublished" && strings.Contains(event.Message, quarantine) {
+			retained++
+		}
+	}
+	if retained != 1 {
+		t.Fatalf("racing-writer retentions = %d, want 1: %+v", retained, events)
+	}
+}
+
+// The inverse of the nested-object-database retention: ordinary ignored
+// content-addressed build output uses exactly the same hex-fanout and pack
+// NAMING as a Git object database. Classifying it as Git data retains every
+// clone with a content-addressed cache, which makes the whole pass inert, so
+// recognition reads the candidate's bytes instead of trusting its name.
+func TestEngineReclaimAgedFixCloneReclaimsIgnoredHexFanoutOutput(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	jobID := "fix-hex-fanout-output"
+	path, err := FixWorktreePath(home, "owner/repo", jobID)
+	if err != nil {
+		t.Fatalf("FixWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll fix parent: %v", err)
+	}
+	runWorktreeGit(t, filepath.Dir(path), "init", "-q", "-b", "main", path)
+	runWorktreeGit(t, path, "config", "user.email", "gitmoot@example.com")
+	runWorktreeGit(t, path, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(path, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("write outer base: %v", err)
+	}
+	runWorktreeGit(t, path, "add", "base.txt")
+	runWorktreeGit(t, path, "commit", "-q", "-m", "outer base")
+	excludes := filepath.Join(t.TempDir(), "global-excludes")
+	if err := os.WriteFile(excludes, []byte("/build/\n"), 0o644); err != nil {
+		t.Fatalf("write global excludes: %v", err)
+	}
+	runWorktreeGit(t, path, "config", "core.excludesFile", excludes)
+	// A cache keyed by content hash: SHA-1-shaped and SHA-256-shaped loose names
+	// under a two-hex fanout, plus a file using the pack naming convention.
+	for _, cached := range []string{
+		filepath.Join("build", "ab", strings.Repeat("c", 38)),
+		filepath.Join("build", "de", strings.Repeat("f", 62)),
+		filepath.Join("build", "pack", "pack-"+strings.Repeat("a", 40)+".pack"),
+	} {
+		absolute := filepath.Join(path, cached)
+		if err := os.MkdirAll(filepath.Dir(absolute), 0o755); err != nil {
+			t.Fatalf("MkdirAll cache directory: %v", err)
+		}
+		if err := os.WriteFile(absolute, []byte("ordinary build output\n"), 0o644); err != nil {
+			t.Fatalf("write cached artifact: %v", err)
+		}
+	}
+	// The discriminating input: a ZLIB-COMPRESSED cache entry in the same layout.
+	// Rejecting it needs the decompressed header, not the deflate framing that
+	// every Git object also has.
+	compressed := filepath.Join(path, "build", "0a", strings.Repeat("1", 38))
+	if err := os.MkdirAll(filepath.Dir(compressed), 0o755); err != nil {
+		t.Fatalf("MkdirAll compressed cache directory: %v", err)
+	}
+	var deflated bytes.Buffer
+	deflater := zlib.NewWriter(&deflated)
+	if _, err := deflater.Write([]byte("cachev2 payload not a git object")); err != nil {
+		t.Fatalf("deflate cached artifact: %v", err)
+	}
+	if err := deflater.Close(); err != nil {
+		t.Fatalf("close deflater: %v", err)
+	}
+	if err := os.WriteFile(compressed, deflated.Bytes(), 0o644); err != nil {
+		t.Fatalf("write compressed cached artifact: %v", err)
+	}
+	remote := filepath.Join(home, jobID+"-origin.git")
+	runWorktreeGit(t, home, "init", "-q", "--bare", remote)
+	runWorktreeGit(t, path, "remote", "add", "origin", remote)
+	runWorktreeGit(t, path, "push", "-q", "-u", "origin", "main")
+
+	manager := gitutil.NewHostClient(path)
+	if clean, err := manager.WorktreeCleanAt(ctx, path); err != nil || !clean {
+		t.Fatalf("ignored cache is not hidden from status: clean=%v err=%v", clean, err)
+	}
+	nested, err := nestedGitObjectDatabase(ctx, path)
+	if err != nil {
+		t.Fatalf("nestedGitObjectDatabase: %v", err)
+	}
+	if nested != "" {
+		t.Fatalf("ordinary build output classified as Git object database %q", nested)
+	}
+
+	payload, err := marshalPayload(JobPayload{
+		Repo: "owner/repo", Branch: "feature/fix", WorktreePath: path, FixWorktree: true,
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: jobID, Agent: "fixer", Type: "implement", State: string(JobSucceeded),
+		Repo: "owner/repo", Payload: payload,
+	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent: %v", err)
+	}
+	engine := testEngine(store)
+	engine.Home = home
+	engine.DelegationCheckout = path
+	engine.DelegationWorktrees = manager
+	reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
+	}
+	if !reclaimed {
+		t.Fatal("clone holding only ignored build output was retained: the pass is inert")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("reclaimed clone survives: %v", err)
 	}
 }
 
