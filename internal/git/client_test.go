@@ -672,7 +672,10 @@ func TestClientWorktreeCleanSmoke(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# smoke\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
-	runGit(t, dir, "add", "README.md")
+	if err := os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("ignored.log\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile .gitignore returned error: %v", err)
+	}
+	runGit(t, dir, "add", "README.md", ".gitignore")
 	runGit(t, dir, "commit", "-m", "init")
 
 	client := NewHostClient(dir)
@@ -682,6 +685,26 @@ func TestClientWorktreeCleanSmoke(t *testing.T) {
 	}
 	if !clean {
 		t.Fatal("new repository should be clean")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ignored.log"), []byte("local-only\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile ignored returned error: %v", err)
+	}
+	clean, err = client.WorktreeCleanAt(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("ignored WorktreeCleanAt returned error: %v", err)
+	}
+	if !clean {
+		t.Fatal("WorktreeCleanAt treated ignored content as ordinary dirtiness")
+	}
+	pristine, err := client.WorktreePristineAt(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("WorktreePristineAt returned error: %v", err)
+	}
+	if pristine {
+		t.Fatal("WorktreePristineAt did not report ignored content")
+	}
+	if err := os.Remove(filepath.Join(dir, "ignored.log")); err != nil {
+		t.Fatalf("Remove ignored returned error: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("dirty\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile dirty returned error: %v", err)

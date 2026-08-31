@@ -534,11 +534,25 @@ func (c Client) WorktreeClean(ctx context.Context) (bool, error) {
 }
 
 func (c Client) WorktreeCleanAt(ctx context.Context, path string) (bool, error) {
+	return c.worktreeStatusEmptyAt(ctx, path, false)
+}
+
+// WorktreePristineAt reports whether a destructive cleanup would preserve all
+// tracked, untracked, and ignored content.
+func (c Client) WorktreePristineAt(ctx context.Context, path string) (bool, error) {
+	return c.worktreeStatusEmptyAt(ctx, path, true)
+}
+
+func (c Client) worktreeStatusEmptyAt(ctx context.Context, path string, includeIgnored bool) (bool, error) {
 	path, err := validateWorktreePath(path)
 	if err != nil {
 		return false, err
 	}
-	result, err := NewClient(path, c.runner).run(ctx, "status", "--porcelain", "--ignored")
+	args := []string{"status", "--porcelain"}
+	if includeIgnored {
+		args = append(args, "--ignored")
+	}
+	result, err := NewClient(path, c.runner).run(ctx, args...)
 	if err == nil {
 		return strings.TrimSpace(result.Stdout) == "", nil
 	}

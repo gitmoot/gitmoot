@@ -37,6 +37,7 @@ type WritableWorktreeLineageManager interface {
 	RevParse(ctx context.Context, rev string) (string, error)
 	IsAncestor(ctx context.Context, ancestor, descendant string) (bool, error)
 	WorktreeCleanAt(ctx context.Context, path string) (bool, error)
+	WorktreePristineAt(ctx context.Context, path string) (bool, error)
 	WorktreeHeadReachableFromRemote(ctx context.Context, path string, branch string) (bool, error)
 	RemoveWorktree(ctx context.Context, path string) error
 	DeleteBranch(ctx context.Context, branch string) error
@@ -271,7 +272,7 @@ func (e Engine) ReclaimTerminalTaskWorktreeOutcome(ctx context.Context, home, ch
 		outcome.Classification = TaskWorktreeReclaimPathMismatch
 		return outcome, nil
 	}
-	clean, err := manager.WorktreeCleanAt(opCtx, path)
+	clean, err := manager.WorktreePristineAt(opCtx, path)
 	if err != nil {
 		if isTerminalWorktreeRemovalError(err) {
 			return e.classifyTerminalTaskWorktreeUnremovable(opCtx, task.ID, path, outcome)
@@ -310,7 +311,7 @@ func (e Engine) ReclaimTerminalTaskWorktreeOutcome(ctx context.Context, home, ch
 		outcome.Classification = TaskWorktreeReclaimLiveProcess
 		return outcome, nil
 	}
-	clean, err = manager.WorktreeCleanAt(opCtx, path)
+	clean, err = manager.WorktreePristineAt(opCtx, path)
 	if err != nil {
 		if isTerminalWorktreeRemovalError(err) {
 			return e.classifyTerminalTaskWorktreeUnremovable(opCtx, task.ID, path, outcome)
@@ -1662,7 +1663,7 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context
 		if strings.TrimSpace(payload.Branch) == "" {
 			return false, errors.New("terminal fix worktree payload has no branch")
 		}
-		clean, err := manager.WorktreeCleanAt(ctx, path)
+		clean, err := manager.WorktreePristineAt(ctx, path)
 		if err != nil {
 			return false, fmt.Errorf("prove aged terminal fix worktree clean: %w", err)
 		}
@@ -1680,7 +1681,7 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context
 		if !known || live {
 			return false, nil
 		}
-		clean, err = manager.WorktreeCleanAt(ctx, path)
+		clean, err = manager.WorktreePristineAt(ctx, path)
 		if err != nil {
 			return false, fmt.Errorf("recheck aged terminal fix worktree clean: %w", err)
 		}

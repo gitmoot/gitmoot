@@ -139,6 +139,7 @@ func worktreeLiveness(path string, procRoot string) (live bool, known bool) {
 		return false, false
 	}
 	self := os.Getpid()
+	conclusive := true
 	for _, entry := range entries {
 		name := entry.Name()
 		if len(name) == 0 || name[0] < '0' || name[0] > '9' {
@@ -155,14 +156,15 @@ func worktreeLiveness(path string, procRoot string) (live bool, known bool) {
 			continue
 		}
 		if err != nil {
-			return false, false
+			conclusive = false
+			continue
 		}
 		cwd = strings.TrimSuffix(strings.TrimSpace(cwd), " (deleted)")
 		if cwd == abs || strings.HasPrefix(cwd, abs+string(os.PathSeparator)) {
 			return true, true
 		}
 	}
-	return false, true
+	return false, conclusive
 }
 
 // defaultOwnerPIDLive probes same-host process liveness via signal 0, mirroring

@@ -1023,8 +1023,8 @@ func TestEngineReclaimTerminalTaskWorktreeKeepsLiveDirtyAdhocAtAnyAge(t *testing
 	if outcome.Reclaimed || outcome.Classification != TaskWorktreeReclaimDirty {
 		t.Fatalf("ignored-content outcome = %+v, want retained dirty task", outcome)
 	}
-	if clean, err := manager.WorktreeCleanAt(ctx, path); err != nil || clean {
-		t.Fatalf("ignored-content WorktreeCleanAt = %v, err=%v, want false nil", clean, err)
+	if pristine, err := manager.WorktreePristineAt(ctx, path); err != nil || pristine {
+		t.Fatalf("ignored-content WorktreePristineAt = %v, err=%v, want false nil", pristine, err)
 	}
 	task, err := store.GetTask(ctx, "adhoc-old-live")
 	if err != nil {
@@ -1734,6 +1734,10 @@ func (f *fakeWorktreeManager) WorktreeCleanAt(_ context.Context, path string) (b
 		return f.clean, nil
 	}
 	return true, nil
+}
+
+func (f *fakeWorktreeManager) WorktreePristineAt(ctx context.Context, path string) (bool, error) {
+	return f.WorktreeCleanAt(ctx, path)
 }
 
 func (f *fakeWorktreeManager) WorktreeHeadReachableFromRemote(ctx context.Context, path string, branch string) (bool, error) {
