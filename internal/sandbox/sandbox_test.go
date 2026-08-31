@@ -109,18 +109,6 @@ func TestSandboxExecReadOnlyWorkdirE2E(t *testing.T) {
 			t.Errorf("make sandbox tool cache removable: %v", err)
 		}
 	})
-	// Exercise the cleanup contract even when the host already has the requested
-	// Go toolchain and therefore does not download a read-only toolchain module.
-	cleanupProbeDir := filepath.Join(cacheDir, "go-mod", ".cleanup-probe")
-	if err := os.MkdirAll(cleanupProbeDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(cleanupProbeDir, "artifact"), []byte("probe"), 0o400); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(cleanupProbeDir, 0o500); err != nil {
-		t.Fatal(err)
-	}
 	source := filepath.Join(workdir, "source.txt")
 	if err := os.WriteFile(source, []byte("unchanged"), 0o600); err != nil {
 		t.Fatal(err)
@@ -171,6 +159,18 @@ if cat "$4" >/dev/null 2>&1; then exit 43; fi
 	}
 	if data, err := os.ReadFile(metadataFile); err != nil || string(data) != "metadata-unchanged" {
 		t.Fatalf("linked git metadata changed to %q, err=%v", data, err)
+	}
+	// Exercise the cleanup contract even when the host already has the requested
+	// Go toolchain and therefore does not download a read-only toolchain module.
+	cleanupProbeDir := filepath.Join(cacheDir, "go-mod", ".cleanup-probe")
+	if err := os.MkdirAll(cleanupProbeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cleanupProbeDir, "artifact"), []byte("probe"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(cleanupProbeDir, 0o500); err != nil {
+		t.Fatal(err)
 	}
 }
 
