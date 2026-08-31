@@ -849,9 +849,13 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 				}
 			}
 			request.WorktreePath = path
+			switch strings.TrimSpace(request.Action) {
+			case "ask", "review":
+				request.ReadOnlySeat = true
+			}
 			// A review child stays pinned to the exact parent head this detached
 			// worktree was created at. Every other read-only child was allocated off
-			// the branch tip above, so the inherited head is NOT what it is looking
+			// the branch tip above, so the inherited head is not what it is looking
 			// at: clear it and let the child validate its own worktree HEAD instead.
 			if !pinExactHead {
 				request.HeadSHA = ""

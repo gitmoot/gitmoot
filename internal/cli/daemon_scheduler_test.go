@@ -2627,12 +2627,18 @@ func TestRunQueuedJobsPoolIsolatesContendedReadJob(t *testing.T) {
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	store := daemonWorkerStore(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, `printf '%s\n' '{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`, []string{"ask"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-1", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-2", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 2})
-	adapter := &cliWorkerFakeAdapter{output: poolSchedulerAskResult}
-	worker := poolSchedulerWorker(t, store, adapter, true)
+	worker := poolSchedulerWorker(t, store, nil, true)
 	worker.ConfigHome = home // enable isolation
+	worker.CheckoutValidator = func(_ context.Context, _ db.Job, payload workflow.JobPayload, _ runtime.Agent) (string, error) {
+		if isolated := strings.TrimSpace(payload.WorktreePath); payload.ReadOnlySeat && isolated != "" {
+			return isolated, nil
+		}
+		return checkout, nil
+	}
+	worker.AdapterFactory = worker.defaultAdapter
 
 	if err := runQueuedJobsForRepo(ctx, worker, 2, "", ""); err != nil {
 		t.Fatalf("pool run: %v", err)
@@ -2676,14 +2682,21 @@ func TestPoolIsolationAppendsCommittedTipNote(t *testing.T) {
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	store := daemonWorkerStore(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime,
+		fmt.Sprintf("printf '%%s' '%s'", poolSchedulerAskResult), []string{"ask"}, "owner/repo")
 	const goal = "audit the config loader"
 	for i, id := range []string{"job-1", "job-2", "job-3"} {
 		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: id, Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: i + 1, Instructions: goal})
 	}
-	adapter := &cliWorkerFakeAdapter{output: poolSchedulerAskResult}
-	worker := poolSchedulerWorker(t, store, adapter, true)
-	worker.ConfigHome = home // enable isolation
+	var workerOutput bytes.Buffer
+	worker := defaultJobWorker(store, &workerOutput, home)
+	worker.UsePool = true
+	worker.CheckoutValidator = func(_ context.Context, _ db.Job, payload workflow.JobPayload, _ runtime.Agent) (string, error) {
+		if strings.TrimSpace(payload.WorktreePath) != "" {
+			return payload.WorktreePath, nil
+		}
+		return checkout, nil
+	}
 
 	if err := runQueuedJobsForRepo(ctx, worker, 3, "", ""); err != nil {
 		t.Fatalf("pool run: %v", err)
@@ -2695,15 +2708,18 @@ func TestPoolIsolationAppendsCommittedTipNote(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetJob %s: %v", id, err)
 		}
-		if job.State != string(workflow.JobSucceeded) {
-			t.Fatalf("%s state = %q, want succeeded (all three read jobs must run concurrently, not stay queued)", id, job.State)
-		}
 		payload, err := daemonJobPayload(job)
 		if err != nil {
 			t.Fatalf("payload %s: %v", id, err)
 		}
+		if job.State != string(workflow.JobSucceeded) {
+			t.Fatalf("%s state = %q, want succeeded (all three read jobs must run concurrently, not stay queued); payload=%s worker=%s", id, job.State, job.Payload, workerOutput.String())
+		}
 		if payload.WorktreePath != "" {
 			isolated++
+			if !payload.ReadOnlySeat {
+				t.Fatalf("%s isolated without hard read-only seat marker", id)
+			}
 			if _, statErr := os.Stat(payload.WorktreePath); !os.IsNotExist(statErr) {
 				t.Fatalf("%s isolation worktree %s was not cleaned up", id, payload.WorktreePath)
 			}
@@ -2717,6 +2733,9 @@ func TestPoolIsolationAppendsCommittedTipNote(t *testing.T) {
 			}
 		} else {
 			shared++
+			if payload.ReadOnlySeat {
+				t.Fatalf("%s shared-checkout job unexpectedly marked as a read-only seat", id)
+			}
 			// The un-isolated job stays in the shared base checkout: its prompt must
 			// be byte-identical (no committed-tip note appended).
 			if payload.Instructions != goal {

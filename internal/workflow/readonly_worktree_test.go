@@ -471,6 +471,9 @@ func TestDispatchDelegationsTwoReadOnlySiblingsGetSeparateDetachedWorktrees(t *t
 	if payloadOne.WorktreePath == payloadTwo.WorktreePath {
 		t.Fatalf("read-only siblings share worktree path %q -> would serialize on the same checkout key", payloadOne.WorktreePath)
 	}
+	if !payloadOne.ReadOnlySeat || !payloadTwo.ReadOnlySeat {
+		t.Fatalf("detached read-only siblings lack hard seat markers: d1=%v d2=%v", payloadOne.ReadOnlySeat, payloadTwo.ReadOnlySeat)
+	}
 	// Read-only children are detached: no branch is created, so they keep the
 	// inherited parent branch (unlike implement children, which are rebranded).
 	if payloadOne.Branch != "task-005" || payloadTwo.Branch != "task-005" {
@@ -553,6 +556,9 @@ func TestDispatchDelegationsSingleReadOnlyDelegationStaysInSharedCheckout(t *tes
 	}
 	if strings.TrimSpace(payload.WorktreePath) != "" {
 		t.Fatalf("single read-only delegation must stay in the shared checkout, got worktree %q", payload.WorktreePath)
+	}
+	if payload.ReadOnlySeat {
+		t.Fatal("shared-checkout single delegation unexpectedly marked as a detached read-only seat")
 	}
 	if len(manager.detachedCalls) != 0 {
 		t.Fatalf("single read-only delegation must not allocate a worktree: %+v", manager.detachedCalls)

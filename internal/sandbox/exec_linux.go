@@ -19,10 +19,38 @@ import (
 // an important write operation outside the policy.
 const MinimumABI = 3
 
+// ReadOnlyWorkdirSupported reports whether this build can enforce the review
+// seat's hard read-only checkout boundary.
+func ReadOnlyWorkdirSupported() bool {
+	return true
+}
+
+// Runtime bootstrap needs these host files, but not their credential-bearing
+// parent directories. Missing platform-specific files are ignored below.
+var runtimeHostReadFiles = []string{
+	"/etc/ld.so.cache",
+	"/etc/resolv.conf",
+	"/etc/hosts",
+	"/etc/nsswitch.conf",
+	"/etc/passwd",
+	"/etc/group",
+	"/etc/localtime",
+}
+
 // Exec applies Gitmoot's strict filesystem ruleset to the current process and
 // replaces it with argv. Landlock restrictions survive execve, so the runtime
 // and every descendant inherit the same filesystem confinement.
 func Exec(readPaths, readFiles, writePaths []string, argv []string) error {
+	return execSandbox(readPaths, readFiles, writePaths, argv, false)
+}
+
+// ExecReadOnlyWorkdir applies the same strict ruleset as Exec without granting
+// the current working directory implicit write access.
+func ExecReadOnlyWorkdir(readPaths, readFiles, writePaths []string, argv []string) error {
+	return execSandbox(readPaths, readFiles, writePaths, argv, true)
+}
+
+func execSandbox(readPaths, readFiles, writePaths []string, argv []string, readOnlyWorkdir bool) error {
 	if len(argv) == 0 || strings.TrimSpace(argv[0]) == "" {
 		return errors.New("sandbox target command is required")
 	}
@@ -42,7 +70,7 @@ func Exec(readPaths, readFiles, writePaths []string, argv []string) error {
 	if err != nil {
 		return fmt.Errorf("resolve sandbox workdir: %w", err)
 	}
-	writable, err := writableRoots(writePaths, workdir)
+	writable, err := writableRoots(writePaths, workdir, !readOnlyWorkdir)
 	if err != nil {
 		return err
 	}
@@ -65,6 +93,7 @@ func Exec(readPaths, readFiles, writePaths []string, argv []string) error {
 		if len(files) > 0 {
 			rules = append(rules, landlock.ROFiles(files...))
 		}
+		rules = append(rules, landlock.ROFiles(runtimeHostReadFiles...).IgnoreIfMissing())
 	}
 	if len(writable) > 0 {
 		// WithRefer permits rename/link operations only when both the source and
@@ -152,29 +181,77 @@ func readableRoots(paths []string, executable string) ([]string, error) {
 			return nil, err
 		}
 	}
-	for _, candidate := range []string{"/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/dev", "/proc", "/sys", "/run", "/opt"} {
+	for _, candidate := range []string{
+		"/bin", "/sbin", "/lib", "/lib64", "/dev",
+		"/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64", "/usr/libexec", "/usr/share",
+		"/usr/local/bin", "/usr/local/sbin", "/usr/local/lib", "/usr/local/lib64", "/usr/local/share",
+		"/etc/ssl/certs", "/etc/pki",
+	} {
 		if err := add(candidate, false); err != nil {
 			return nil, err
 		}
 	}
-	if home, err := os.UserHomeDir(); err == nil {
-		if err := add(filepath.Join(home, ".local"), false); err != nil {
-			return nil, err
+	if err := addExecutableReadRoots(add, executable); err != nil {
+		return nil, err
+	}
+	if goExecutable, err := execLookPath("go"); err == nil {
+		if root := optionalSystemToolchainRoot(goExecutable); root != "" {
+			if err := add(root, true); err != nil {
+				return nil, err
+			}
 		}
+	}
+	return roots, nil
+}
+
+func addExecutableReadRoots(add func(string, bool) error, executable string) error {
+	if err := add(filepath.Dir(executable), true); err != nil {
+		return err
 	}
 	resolvedExecutable := executable
 	if resolved, err := filepath.EvalSymlinks(executable); err == nil {
 		resolvedExecutable = resolved
 	}
-	if err := add(filepath.Dir(resolvedExecutable), true); err != nil {
-		return nil, err
+	executableDir := filepath.Dir(resolvedExecutable)
+	if err := add(executableDir, true); err != nil {
+		return err
 	}
-	return roots, nil
+	if base := filepath.Base(executableDir); base == "bin" || base == "sbin" {
+		installRoot := filepath.Dir(executableDir)
+		if installRoot != "/" && installRoot != "/usr" {
+			return add(installRoot, true)
+		}
+	}
+	return nil
 }
 
-func writableRoots(paths []string, workdir string) ([]string, error) {
+// optionalSystemToolchainRoot grants the Go installation selected by PATH when
+// it lives under a system package root. Review agents must be able to run the
+// repository's toolchain, while a user-controlled binary under /root or /home
+// must not turn its credential-bearing parent into a readable subtree.
+func optionalSystemToolchainRoot(executable string) string {
+	if resolved, err := filepath.EvalSymlinks(executable); err == nil {
+		executable = resolved
+	}
+	binDir := filepath.Dir(filepath.Clean(executable))
+	if base := filepath.Base(binDir); base != "bin" && base != "sbin" {
+		return ""
+	}
+	root := filepath.Dir(binDir)
+	for _, allowed := range []string{"/opt", "/usr/local", "/nix/store", "/snap"} {
+		rel, err := filepath.Rel(allowed, root)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return root
+		}
+	}
+	return ""
+}
+
+func writableRoots(paths []string, workdir string, includeImplicitRoots bool) ([]string, error) {
 	candidates := append([]string{}, paths...)
-	candidates = append(candidates, workdir, os.TempDir(), "/tmp")
+	if includeImplicitRoots {
+		candidates = append(candidates, workdir, os.TempDir(), "/tmp")
+	}
 	seen := make(map[string]struct{}, len(candidates))
 	roots := make([]string, 0, len(candidates))
 	for _, path := range candidates {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -255,32 +256,29 @@ func TestPipelineAgentStageUpstreamContextE2E(t *testing.T) {
 // stage are each born with their OWN detached read-only worktree, so they key
 // worktree:<path> (never the shared repo:<repo> live checkout) and run CONCURRENTLY,
 // and each worktree is DISPOSED on terminal (the #739 acceptance shape).
-//
-// CONCURRENCY PROOF: each review seat's shell body blocks on a 2-of-2 filesystem
-// rendezvous — it emits `approved` only after BOTH seats' start markers exist. Both
-// can reach `approved` ONLY if they were live SIMULTANEOUSLY. If isolation regressed
-// (both keyed repo:owner/repo and serialized), the first seat waits out the
-// rendezvous, emits `failed`, and the both-succeeded assertion flips RED.
+// CONCURRENCY PROOF: each review seat connects to a two-peer loopback barrier
+// and emits `approved` only after both seats arrive. Loopback is reachable from
+// the hard filesystem sandbox without introducing a shared writable host path.
+// If isolation regresses and the seats serialize, the first times out and emits
+// `failed`, flipping the both-succeeded assertion red.
 func TestPipelineReviewStagesConcurrentWorktreesE2E(t *testing.T) {
 	ctx := context.Background()
 	home, _, store := heartbeatLoopE2EHome(t)
 
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-
-	stateDir := t.TempDir()
+	rendezvous := loopbackRendezvous(t, 2)
 	// Root extractor approves instantly (no rendezvous), fanning out to two reviews.
 	seedDaemonWorkerAgentWithPolicy(t, store, "extractor", runtime.ShellRuntime,
 		pipelineStageResultCmd("approved", "extracted", nil),
 		[]string{"ask"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	// Two REVIEW agent stages (need the `review` capability) that rendezvous 2-of-2.
 	seedDaemonWorkerAgentWithPolicy(t, store, "reviewa", runtime.ShellRuntime,
-		rendezvousSeatScript(stateDir, "reviewa", 2, rendezvousResult("approved", "reviewa ran beside reviewb"), ""),
+		loopbackRendezvousSeatScript(rendezvous, "reviewa", rendezvousResult("approved", "reviewa ran beside reviewb")),
 		[]string{"ask", "review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	seedDaemonWorkerAgentWithPolicy(t, store, "reviewb", runtime.ShellRuntime,
-		rendezvousSeatScript(stateDir, "reviewb", 2, rendezvousResult("approved", "reviewb ran beside reviewa"), ""),
+		loopbackRendezvousSeatScript(rendezvous, "reviewb", rendezvousResult("approved", "reviewb ran beside reviewa")),
 		[]string{"ask", "review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
-
 	specYAML := "name: review-fan\nrepo: owner/repo\nstages:\n" +
 		"  - id: extract\n    agent: extractor\n    prompt: Extract.\n" +
 		"  - id: reva\n    agent: reviewa\n    action: review\n    prompt: Review A.\n    needs: [extract]\n" +
@@ -345,8 +343,8 @@ func TestPipelineReviewStagesConcurrentWorktreesE2E(t *testing.T) {
 		if strings.TrimSpace(p.WorktreePath) == "" {
 			t.Fatalf("review stage %s has no read-only worktree (#757/#739)", name)
 		}
-		if !p.ReadOnlyWorktree {
-			t.Fatalf("review stage %s ReadOnlyWorktree = false, want true (disposal marker)", name)
+		if !p.ReadOnlyWorktree || !p.ReadOnlySeat {
+			t.Fatalf("review stage %s lacks disposal or hard-seat marker: %+v", name, p)
 		}
 	}
 	keyA := queuedJobCheckoutKey(ctx, store, jobA)
@@ -372,7 +370,7 @@ func TestPipelineReviewStagesConcurrentWorktreesE2E(t *testing.T) {
 	for _, id := range []string{reva.JobID, revb.JobID} {
 		job, decision := terminalJobDecision(t, ctx, store, id)
 		if job.State != string(workflow.JobSucceeded) {
-			t.Fatalf("review stage %s state = %q, want succeeded (a serialized seat times out the rendezvous)", id, job.State)
+			t.Fatalf("review stage %s state = %q, want succeeded (a serialized seat times out the rendezvous); payload=%s", id, job.State, job.Payload)
 		}
 		if decision != "approved" {
 			t.Fatalf("review stage %s decision = %q, want approved (ran concurrently)", id, decision)
@@ -428,5 +426,33 @@ func TestPipelineAddWarnsMissingAgentStageAgent(t *testing.T) {
 	}
 	if !strings.Contains(errBuf.String(), `agent "nonexistent" which does not exist yet`) {
 		t.Fatalf("stderr missing missing-agent warning:\n%s", errBuf.String())
+	}
+}
+
+func TestPipelineTasklessAskAllocationFailureRefusesEnqueue(t *testing.T) {
+	ctx := context.Background()
+	store, home := blockerE2EHome(t)
+	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"ask"}, "owner/repo")
+
+	worktreeRoot := filepath.Join(home, ".gitmoot", "worktrees")
+	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreeRoot, "owner--repo"), []byte("block"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	enqueue := newPipelineStageEnqueuer(store, home)
+	_, err := enqueue(ctx, workflow.JobRequest{
+		ID: "pipeline-ask-fail", Agent: "reviewer", Action: "ask",
+		Repo: "owner/repo", Sender: workflow.PipelineJobSender, Instructions: "audit",
+	})
+	if err == nil || !strings.Contains(err.Error(), "allocate read-only pipeline ask worktree") {
+		t.Fatalf("allocation error = %v, want fail-closed pipeline ask refusal", err)
+	}
+	if jobs, listErr := store.ListJobs(ctx); listErr != nil || len(jobs) != 0 {
+		t.Fatalf("jobs after allocation refusal=%+v err=%v, want none", jobs, listErr)
 	}
 }

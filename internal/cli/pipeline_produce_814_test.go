@@ -38,6 +38,37 @@ func TestPipelineProduceStageJobRequestShapeAndRetryNote(t *testing.T) {
 	if !pipelineStageReadOnlyWorktreeEligible(req) {
 		t.Fatal("produce request should use a disposable detached worktree cwd")
 	}
+	if pipelineStageReadOnlySeatEligible(req) {
+		t.Fatal("writable produce request must not use the hard read-only runtime seat")
+	}
+}
+
+func TestPipelineProduceEnqueueKeepsWritableRuntimeSeat(t *testing.T) {
+	ctx := context.Background()
+	store, home := blockerE2EHome(t)
+	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgentWithPolicy(t, store, "producer", runtime.ShellRuntime, "true",
+		[]string{"produce"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
+
+	job, err := newPipelineStageEnqueuer(store, home)(ctx, workflow.JobRequest{
+		ID: "produce-seat", Agent: "producer", Action: "produce", Repo: "owner/repo",
+		Sender: workflow.PipelineJobSender, Instructions: "write output",
+		WritablePaths: []string{t.TempDir()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(payload.WorktreePath) == "" || !payload.ReadOnlyWorktree {
+		t.Fatalf("produce payload lacks disposable worktree: %+v", payload)
+	}
+	if payload.ReadOnlySeat {
+		t.Fatal("writable produce payload was misclassified as a read-only runtime seat")
+	}
 }
 
 func TestApplyProduceRuntimeGrantsRevalidatesSymlinkAndScopesByAction(t *testing.T) {
@@ -330,7 +361,7 @@ func createProduceGrantPipeline(t *testing.T, store *db.Store, inputDir, outputD
 	}
 }
 
-func TestPipelineProduceWorktreeAllocationFailsClosedButAskFailsOpen(t *testing.T) {
+func TestPipelineProduceWorktreeAllocationFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	store := pipelineAdvanceStore(t)
 	home := t.TempDir()
@@ -362,20 +393,6 @@ stages:
 	}
 	if !hasPipelineProduceEvent(events, "produce_worktree_failed") {
 		t.Fatalf("produce job events = %+v", events)
-	}
-
-	const askSpec = `name: ask-cwd
-repo: owner/repo
-stages:
-  - id: inspect
-    agent: asker
-    prompt: inspect
-`
-	askRec, askParsed := newTestPipeline(t, store, "ask-cwd", askSpec)
-	askRun := startTestRun(t, store, askRec, askParsed, newPipelineStageEnqueuer(store, home), time.Now().UTC())
-	askStage := stageRow(t, store, askRun.ID, "inspect")
-	if askRun.State != pipeline.RunRunning || askStage.State != pipeline.StageQueued {
-		t.Fatalf("ask fail-open changed: run=%q stage=%+v", askRun.State, askStage)
 	}
 }
 

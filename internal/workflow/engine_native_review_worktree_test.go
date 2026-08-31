@@ -90,10 +90,10 @@ func routineReviewFanoutEvent() PullRequestEvent {
 
 // TestRoutineReviewLegIsEnqueuedWithExactHeadWorktree pins F1's precondition and
 // F2's mechanism at once: a ROUTINE native review leg must be BORN carrying its
-// exact-head WorktreePath, the ReadOnlyWorktree marker and the read-only context
-// note, because queuedJobCheckoutKey reads payload.WorktreePath at scheduler
-// admission and payloadMatchesRequest compares Instructions + WorktreePath on
-// every re-derivation.
+// exact-head WorktreePath, the disposal-oriented ReadOnlyWorktree marker, the
+// security-oriented ReadOnlySeat marker, and the read-only context note. The
+// scheduler reads payload.WorktreePath at admission and payloadMatchesRequest
+// compares Instructions + WorktreePath on every re-derivation.
 //
 // MUTATION PROOF: make prepareNativeReviewWorktree return the request untouched
 // (the pre-fix worker-allocates-after-enqueue shape) and every assertion below
@@ -128,6 +128,9 @@ func TestRoutineReviewLegIsEnqueuedWithExactHeadWorktree(t *testing.T) {
 	}
 	if !payload.ReadOnlyWorktree {
 		t.Fatal("payload is missing the ReadOnlyWorktree marker; terminal cleanup would orphan the worktree")
+	}
+	if !payload.ReadOnlySeat {
+		t.Fatal("payload is missing the ReadOnlySeat marker; the native review would bypass the hard sandbox")
 	}
 	if want := filepath.Join(engine.Home, "worktrees"); !strings.HasPrefix(payload.WorktreePath, want) {
 		t.Fatalf("worktree %q is not under the managed root %q", payload.WorktreePath, want)
