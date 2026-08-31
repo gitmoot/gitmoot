@@ -187,6 +187,15 @@ func (e Engine) mailbox() Mailbox {
 				wakeTargetRole = owner
 				event.PullRequest = payload.PullRequest
 				event.ReviewDecision = decision
+				if decision == "changes_requested" {
+					// The requester already has the implementation context and
+					// worktree. Wake it with the persisted verdict instead of
+					// routing a fresh fix session; legacy jobs with no sender keep
+					// the resolved PR owner fallback above (#1712).
+					if requester := NormalizeActingOrgRole(payload.Sender); requester != "" {
+						wakeTargetRole = requester
+					}
+				}
 			}
 		}
 		event.WakeTargetRole = wakeTargetRole

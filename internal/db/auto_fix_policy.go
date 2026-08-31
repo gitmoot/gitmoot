@@ -32,9 +32,9 @@ func normalizeAutoFixPolicySubject(repo string, pullRequest int) (string, error)
 	return repo, nil
 }
 
-// SetPullRequestAutoFixPolicy records an explicit disable or re-enable decision.
+// SetPullRequestAutoFixPolicy records an explicit disable or opt-in decision.
 // Rows are retained for both states so the latest operator decision remains
-// auditable instead of disappearing when auto-fix is re-enabled.
+// auditable instead of disappearing when auto-fix is disabled again.
 func (s *Store) SetPullRequestAutoFixPolicy(ctx context.Context, repo string, pullRequest int, disabled bool, actor string, reason string) error {
 	repo, err := normalizeAutoFixPolicySubject(repo, pullRequest)
 	if err != nil {

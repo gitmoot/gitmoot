@@ -111,9 +111,20 @@ func TestEngineEmitsJobFinishedOnSucceededTerminal(t *testing.T) {
 	}
 }
 
-func TestEngineEmitsChangesRequestedReviewVerdict(t *testing.T) {
+func TestEngineReturnsChangesRequestedToRequesterWithoutDefaultAutoFix(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
+	seedAgent(t, store, "author", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "task-43",
+		RepoFullName: "gitmoot/gitmoot",
+		Title:        "Review routing",
+		State:        string(TaskReviewing),
+		Branch:       "task-43",
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
 	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
 		RepoFullName:  "gitmoot/gitmoot",
 		Branch:        "task-43",
@@ -122,27 +133,65 @@ func TestEngineEmitsChangesRequestedReviewVerdict(t *testing.T) {
 	}); err != nil || !acquired {
 		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
 	}
-	if err := store.CreateJob(ctx, db.Job{
-		ID: "review-43", Agent: "audit", Type: "review", State: string(JobSucceeded), Payload: "{}",
-	}); err != nil {
-		t.Fatalf("CreateJob returned error: %v", err)
-	}
 	sink := &recordingSink{}
 	engine := testEngine(store)
 	engine.EventSink = sink
-	mailbox := engine.mailbox()
-
-	mailbox.emitTerminal(ctx, "review-43", JobSucceeded, JobPayload{
+	if _, err := engine.mailbox().Enqueue(ctx, JobRequest{
+		ID:            "review-43",
+		Agent:         "audit",
+		Action:        "review",
 		Repo:          "gitmoot/gitmoot",
 		Branch:        "task-43",
 		PullRequest:   43,
-		ActingOrgRole: "auditor",
-		Result: &AgentResult{
-			Decision: "changes_requested",
-			Summary:  "one blocking issue",
-		},
-	})
+		HeadSHA:       "head43",
+		TaskID:        "task-43",
+		TaskTitle:     "Review routing",
+		LeadAgent:     "author",
+		Reviewers:     []string{"audit"},
+		ReviewRound:   "review-1",
+		Sender:        "requester",
+		ActingOrgRole: "author",
+	}); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+	agent := runtime.Agent{
+		Name:       "audit",
+		Runtime:    runtime.ShellRuntime,
+		RuntimeRef: "printf ok",
+		RepoScope:  "gitmoot/gitmoot",
+		Role:       "reviewer",
+	}
+	adapter := &fakeDelivery{outputs: []string{
+		`{"gitmoot_result":{"decision":"changes_requested","severity":"P2","summary":"one blocking issue","findings":[{"severity":"P2","file":"x.go","line":1,"title":"edge","body":"fix it"}],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+	}}
 
+	result, err := engine.RunJob(ctx, "review-43", agent, adapter)
+	if err != nil {
+		t.Fatalf("RunJob returned error: %v", err)
+	}
+	if result.Decision != "changes_requested" || result.Summary != "one blocking issue" {
+		t.Fatalf("result = %+v", result)
+	}
+	reviewJob := mustJob(t, store, "review-43")
+	persisted, err := ParseJobPayload(reviewJob.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload returned error: %v", err)
+	}
+	if persisted.Result == nil ||
+		persisted.Result.Decision != "changes_requested" ||
+		len(persisted.Result.Findings) != 1 {
+		t.Fatalf("persisted requester verdict = %+v", persisted.Result)
+	}
+	assertTaskState(t, store, "task-43", TaskChangesRequested)
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	for _, job := range jobs {
+		if job.Type == "implement" {
+			t.Fatalf("default changes_requested route dispatched implement job %s", job.ID)
+		}
+	}
 	finished := sink.byType(events.EventJobFinished)
 	if len(finished) != 1 {
 		t.Fatalf("job.finished emissions = %d, want 1; all=%+v", len(finished), sink.snapshot())
@@ -151,7 +200,8 @@ func TestEngineEmitsChangesRequestedReviewVerdict(t *testing.T) {
 	if event.Cause != events.EventCauseReviewVerdict ||
 		event.ReviewDecision != "changes_requested" ||
 		event.PullRequest != 43 ||
-		event.WakeTargetRole != "author" {
+		event.WakeTargetRole != "requester" ||
+		event.Detail != "one blocking issue" {
 		t.Fatalf("changes-requested verdict event = %+v", event)
 	}
 }
