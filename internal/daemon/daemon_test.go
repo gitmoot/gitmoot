@@ -1081,7 +1081,7 @@ func TestPollOnceDismissedEscalationDoesNotBlockEligibleMerge(t *testing.T) {
 
 func TestMergeGateSkippedFanoutStaysPendingWhileNamedCheckRuns(t *testing.T) {
 	ctx := context.Background()
-	store, client, daemon, gate := newSkippedFanoutPendingGateDaemon(t)
+	store, client, daemon, gate := newSkippedFanoutPendingGateDaemon(t, workflow.TaskReadyToMerge)
 	request := workflow.MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 7, TaskID: "task-7"}
 
 	decision, err := gate.Evaluate(ctx, request)
@@ -1118,7 +1118,7 @@ func TestMergeGateSkippedFanoutStaysPendingWhileNamedCheckRuns(t *testing.T) {
 
 func TestPollOnceSkippedFanoutReevaluatesCompletedNamedCheck(t *testing.T) {
 	ctx := context.Background()
-	store, client, daemon, gate := newSkippedFanoutPendingGateDaemon(t)
+	store, client, daemon, gate := newSkippedFanoutPendingGateDaemon(t, workflow.TaskReadyToMerge)
 	request := workflow.MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 7, TaskID: "task-7"}
 
 	decision, err := gate.Evaluate(ctx, request)
@@ -1159,23 +1159,21 @@ func TestPollOnceSkippedFanoutReevaluatesCompletedNamedCheck(t *testing.T) {
 
 func TestPollOnceSkippedFanoutRetriesAfterPendingStatusWriteFailure(t *testing.T) {
 	ctx := context.Background()
-	store, client, daemon, gate := newSkippedFanoutPendingGateDaemon(t)
+	store, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskPullRequestOpen)
 	client.statusErrs = []error{errors.New("status bookkeeping unavailable")}
-	request := workflow.MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 7, TaskID: "task-7"}
 
-	_, err := gate.Evaluate(ctx, request)
-	if err == nil || !strings.Contains(err.Error(), "status bookkeeping unavailable") {
-		t.Fatalf("initial Evaluate error = %v", err)
+	if err := daemon.Workflow.AdvanceJob(ctx, "review-job"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
 	}
 	if len(client.statuses) != 1 || client.statuses[0].State != "pending" {
-		t.Fatalf("initial Evaluate statuses = %+v", client.statuses)
+		t.Fatalf("AdvanceJob statuses = %+v", client.statuses)
 	}
 	task, err := store.GetTask(ctx, "task-7")
 	if err != nil {
-		t.Fatalf("initial Evaluate GetTask returned error: %v", err)
+		t.Fatalf("AdvanceJob GetTask returned error: %v", err)
 	}
 	if task.State != string(workflow.TaskReadyToMerge) {
-		t.Fatalf("initial Evaluate task state = %q, want %q", task.State, workflow.TaskReadyToMerge)
+		t.Fatalf("AdvanceJob task state = %q, want %q", task.State, workflow.TaskReadyToMerge)
 	}
 
 	client.checks[0].Bucket = "pass"
@@ -1192,7 +1190,7 @@ func TestPollOnceSkippedFanoutRetriesAfterPendingStatusWriteFailure(t *testing.T
 	}
 }
 
-func newSkippedFanoutPendingGateDaemon(t *testing.T) (*db.Store, *mergeGateRaceGitHub, Daemon, *workflow.PolicyMergeGate) {
+func newSkippedFanoutPendingGateDaemon(t *testing.T, initialState workflow.TaskState) (*db.Store, *mergeGateRaceGitHub, Daemon, *workflow.PolicyMergeGate) {
 	t.Helper()
 	ctx := context.Background()
 	store := testStore(t)
@@ -1202,7 +1200,7 @@ func newSkippedFanoutPendingGateDaemon(t *testing.T) (*db.Store, *mergeGateRaceG
 		RepoFullName: repo.FullName(),
 		GoalID:       "goal-1",
 		Title:        "Task 7",
-		State:        string(workflow.TaskReadyToMerge),
+		State:        string(initialState),
 		Branch:       "task-7",
 	}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
