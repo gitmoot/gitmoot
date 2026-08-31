@@ -628,6 +628,8 @@ Symptoms:
 - The PR remains `ready_to_merge`.
 - `gitmoot/merge-gate` is pending or failing.
 - The daemon retries a queued merge.
+- `gitmoot/merge-gate` is pending with `Gitmoot merge gate has not cleared
+  this head` before the policy gate has produced a more specific verdict.
 
 Checks:
 
@@ -638,6 +640,13 @@ git status --short
 ```
 
 Fixes:
+- The generic `has not cleared this head` status makes an active managed head
+  visibly unjudged. A later gate evaluation replaces it with the specific
+  pending, failure, or success verdict for that same head.
+- Repositories with native auto-merge disabled and tasks parked for a human do
+  not retain the generic pending marker. Gitmoot replaces only that generic
+  marker with `Gitmoot merge gate is not applied to this head`; it preserves a
+  real gate failure or specific pending verdict.
 
 - Clean the local worktree before the daemon attempts the merge.
 - If the reason says an active job is in flight on the PR branch, let that queued

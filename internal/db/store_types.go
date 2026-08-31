@@ -585,6 +585,16 @@ type MergeGate struct {
 	Reason       string
 }
 
+// MergeGateStatusObservation records the exact PR head most recently reconciled
+// with the visible gitmoot/merge-gate context. Kind distinguishes a generic
+// marker, an observed policy verdict, and an inactive head that needs no marker.
+type MergeGateStatusObservation struct {
+	RepoFullName string
+	PullRequest  int64
+	HeadSHA      string
+	Kind         string
+}
+
 // NoCIObservation records the first merge-gate evaluation that saw zero external
 // CI (no external commit-statuses AND no check-runs) at a given head SHA (#596).
 // The merge gate uses it to defer concluding "no CI" until a second consecutive

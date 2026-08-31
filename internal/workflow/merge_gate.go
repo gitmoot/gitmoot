@@ -16,7 +16,9 @@ import (
 )
 
 const (
-	gitmootMergeGateContext = "gitmoot/merge-gate"
+	// GitmootMergeGateContext is the canonical commit-status context for the
+	// native merge gate and every observer of its current-head verdict.
+	GitmootMergeGateContext = "gitmoot/merge-gate"
 	gitmootNoCIContext      = "gitmoot/ci"
 	// MergeLeaveOpenAutoMergeKillSwitchReason is persisted with a parked task so
 	// a later explicit auto_merge=false -> true config flip can re-arm only this
@@ -249,7 +251,7 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 		Repo:        repo,
 		SHA:         headSHA,
 		State:       "success",
-		Context:     gitmootMergeGateContext,
+		Context:     GitmootMergeGateContext,
 		Description: "Gitmoot merge gate passed",
 	})
 	return g.finishMerged(ctx, request, pr, strings.TrimSpace(result.SHA))
@@ -1052,7 +1054,7 @@ func (g PolicyMergeGate) evaluateStatuses(ctx context.Context, repo github.Repos
 	externalStatusCount := 0
 	for _, item := range status.Statuses {
 		if strings.HasPrefix(item.Context, "gitmoot/") {
-			if item.Context == gitmootMergeGateContext {
+			if item.Context == GitmootMergeGateContext {
 				continue
 			}
 			if statusPending(item.State) {
@@ -1079,7 +1081,7 @@ func (g PolicyMergeGate) evaluateStatuses(ctx context.Context, repo github.Repos
 	externalCheckCount := 0
 	for _, check := range checks {
 		name := strings.TrimSpace(check.Name)
-		if name == gitmootMergeGateContext {
+		if name == GitmootMergeGateContext {
 			continue
 		}
 		externalCheckCount++
@@ -1270,7 +1272,7 @@ func (g PolicyMergeGate) block(ctx context.Context, request MergeRequest, sha st
 			Repo:        repo,
 			SHA:         sha,
 			State:       "failure",
-			Context:     gitmootMergeGateContext,
+			Context:     GitmootMergeGateContext,
 			Description: commitStatusDescription(reason),
 		}); err != nil {
 			return MergeDecision{}, err
@@ -1295,7 +1297,7 @@ func (g PolicyMergeGate) pending(ctx context.Context, request MergeRequest, sha 
 			Repo:        repo,
 			SHA:         sha,
 			State:       "pending",
-			Context:     gitmootMergeGateContext,
+			Context:     GitmootMergeGateContext,
 			Description: commitStatusDescription(reason),
 		})
 	}

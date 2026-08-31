@@ -189,11 +189,11 @@ func TestPolicyMergeGateMergesPassingPullRequest(t *testing.T) {
 		status: github.CombinedStatus{
 			State: "success",
 			Statuses: []github.CommitStatus{
-				{Context: gitmootMergeGateContext, State: "failure"},
+				{Context: GitmootMergeGateContext, State: "failure"},
 			},
 		},
 		checks: []github.PullRequestCheck{
-			{Name: gitmootMergeGateContext, Bucket: "fail", State: "FAILURE"},
+			{Name: GitmootMergeGateContext, Bucket: "fail", State: "FAILURE"},
 			{Name: "ci", Bucket: "pass", State: "SUCCESS"},
 		},
 		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
@@ -218,7 +218,7 @@ func TestPolicyMergeGateMergesPassingPullRequest(t *testing.T) {
 	// A PR with a passing external check merges through the gate WITHOUT the
 	// synthetic gitmoot/ci no-CI stamp (#596: that stamp is only for genuinely
 	// CI-less heads, and only after the grace window).
-	if !hasStatus(gh.statuses, gitmootMergeGateContext, "success") || hasStatus(gh.statuses, gitmootNoCIContext, "success") {
+	if !hasStatus(gh.statuses, GitmootMergeGateContext, "success") || hasStatus(gh.statuses, gitmootNoCIContext, "success") {
 		t.Fatalf("statuses = %+v", gh.statuses)
 	}
 	if len(gh.statuses) != 1 || gh.statuses[0].SHA != "head123" {
@@ -308,7 +308,7 @@ func TestPolicyMergeGateMergeFailureDoesNotPostSuccess(t *testing.T) {
 	if !errors.Is(err, mergeErr) {
 		t.Fatalf("Evaluate error = %v, want %v", err, mergeErr)
 	}
-	if hasStatus(gh.statuses, gitmootMergeGateContext, "success") {
+	if hasStatus(gh.statuses, GitmootMergeGateContext, "success") {
 		t.Fatalf("statuses after failed merge = %+v, must not contain merge-gate success", gh.statuses)
 	}
 }
@@ -1592,7 +1592,7 @@ func TestPolicyMergeGateUpdatesStaleBranchAndStaysPending(t *testing.T) {
 	if len(gh.updates) != 1 || gh.updates[0].ExpectedHeadSHA != "head123" {
 		t.Fatalf("update inputs = %+v", gh.updates)
 	}
-	if !hasStatus(gh.statuses, gitmootMergeGateContext, "pending") {
+	if !hasStatus(gh.statuses, GitmootMergeGateContext, "pending") {
 		t.Fatalf("statuses = %+v", gh.statuses)
 	}
 }
@@ -1625,7 +1625,7 @@ func TestPolicyMergeGateBlocksStaleBranchUpdateConflict(t *testing.T) {
 	if decision.Ready || !strings.Contains(decision.Reason.Render(), "conflicts with main") {
 		t.Fatalf("decision = %+v", decision)
 	}
-	if !hasStatus(gh.statuses, gitmootMergeGateContext, "failure") {
+	if !hasStatus(gh.statuses, GitmootMergeGateContext, "failure") {
 		t.Fatalf("statuses = %+v", gh.statuses)
 	}
 	if len(gh.comments) != 1 || !strings.Contains(gh.comments[0], "not retryable") ||
@@ -1664,7 +1664,7 @@ func TestPolicyMergeGateKeepsStaleHeadRacePending(t *testing.T) {
 	if !decision.Ready || decision.Merged || !strings.Contains(decision.Reason.Render(), "head changed") {
 		t.Fatalf("decision = %+v", decision)
 	}
-	if !hasStatus(gh.statuses, gitmootMergeGateContext, "pending") {
+	if !hasStatus(gh.statuses, GitmootMergeGateContext, "pending") {
 		t.Fatalf("statuses = %+v", gh.statuses)
 	}
 }
@@ -1706,7 +1706,7 @@ func TestPolicyMergeGateKeepsMergeQueueBusyPending(t *testing.T) {
 	if len(gh.merges) != 0 {
 		t.Fatalf("merge inputs = %+v", gh.merges)
 	}
-	if !hasStatus(gh.statuses, gitmootMergeGateContext, "pending") {
+	if !hasStatus(gh.statuses, GitmootMergeGateContext, "pending") {
 		t.Fatalf("statuses = %+v", gh.statuses)
 	}
 }
@@ -1741,7 +1741,7 @@ func TestPolicyMergeGateKeepsPendingCIReadyToRetry(t *testing.T) {
 	if len(gh.merges) != 0 {
 		t.Fatalf("merge inputs = %+v", gh.merges)
 	}
-	if !hasStatus(gh.statuses, gitmootMergeGateContext, "pending") {
+	if !hasStatus(gh.statuses, GitmootMergeGateContext, "pending") {
 		t.Fatalf("statuses = %+v", gh.statuses)
 	}
 }
@@ -1783,7 +1783,7 @@ func TestPolicyMergeGateKeepsQueuedMergePending(t *testing.T) {
 	if _, err := store.GetPullRequest(ctx, "gitmoot/gitmoot", 9); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("GetPullRequest after queued merge error = %v, want sql.ErrNoRows", err)
 	}
-	if !hasStatus(gh.statuses, gitmootMergeGateContext, "pending") {
+	if !hasStatus(gh.statuses, GitmootMergeGateContext, "pending") {
 		t.Fatalf("statuses = %+v", gh.statuses)
 	}
 }
@@ -1874,7 +1874,7 @@ func TestPolicyMergeGateBlocksClosedUnmergedPullRequest(t *testing.T) {
 	if len(gh.merges) != 0 {
 		t.Fatalf("merge inputs = %+v", gh.merges)
 	}
-	if !hasStatus(gh.statuses, gitmootMergeGateContext, "failure") {
+	if !hasStatus(gh.statuses, GitmootMergeGateContext, "failure") {
 		t.Fatalf("statuses = %+v", gh.statuses)
 	}
 }
