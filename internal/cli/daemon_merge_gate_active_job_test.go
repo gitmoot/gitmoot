@@ -56,7 +56,7 @@ func TestDaemonMergeGateHoldsWhileImplementJobActiveOnBranch(t *testing.T) {
 		ID: "fix-round-running", Agent: "implementer", Type: "implement", State: string(workflow.JobRunning),
 	}, workflow.JobPayload{Repo: request.Repo, Branch: request.Branch, TaskID: request.TaskID})
 
-	decision, err := (newHostDaemonMergeGate(store, gh, checkout, "")).Evaluate(context.Background(), request)
+	decision, err := (newHostDaemonMergeGate(store, gh, checkout, daemonMergeGateLiveOrgHome(t))).Evaluate(context.Background(), request)
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestDaemonMergeGateHoldsHumanMergeRequestWhileJobActiveOnBranch(t *testing.
 		ID: "fix-round-running", Agent: "implementer", Type: "implement", State: string(workflow.JobRunning),
 	}, workflow.JobPayload{Repo: request.Repo, Branch: request.Branch, TaskID: request.TaskID})
 
-	decision, err := (newHostDaemonMergeGate(store, gh, checkout, "")).Evaluate(context.Background(), request)
+	decision, err := (newHostDaemonMergeGate(store, gh, checkout, daemonMergeGateLiveOrgHome(t))).Evaluate(context.Background(), request)
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
@@ -555,6 +555,28 @@ func TestFindActiveImplementJobForTaskStillIgnoresOtherActiveTypes(t *testing.T)
 	if !found || job.ID != "z-implement" {
 		t.Fatalf("active implement job = %+v found=%v, want z-implement", job, found)
 	}
+}
+
+func daemonMergeGateLiveOrgHome(t *testing.T) string {
+	t.Helper()
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize config: %v", err)
+	}
+	content := config.DefaultConfig(paths) + `
+[org.roles."owner"]
+scope = ["*"]
+[org.roles."coordinator"]
+parent = "owner"
+scope = ["owner/repo"]
+`
+	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile org config: %v", err)
+	}
+	if _, err := config.LoadOrg(paths); err != nil {
+		t.Fatalf("LoadOrg: %v", err)
+	}
+	return paths.Home
 }
 
 func daemonMergeGateActiveJobFixture(t *testing.T, seedReview ...bool) (*db.Store, string, *activeJobMergeGateGitHub, workflow.MergeRequest) {
