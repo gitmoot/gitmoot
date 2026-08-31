@@ -1072,23 +1072,10 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 		if _, open := openPullNumbers[int64(payload.PullRequest)]; open {
 			continue
 		}
-		// "Absent from the open PR list" is not evidence the number IS a pull
-		// request. payload.PullRequest also carries ISSUE numbers — handleIssueAsk
-		// stores the issue number in that field, and delegationRequest copies it onto
-		// every child, which gets no `routed` event of its own — and an issue number
-		// can never appear in a list of PRs. Require a second, independent instrument:
-		// a recorded pull_requests row for this number. Absence means NO EVIDENCE and
-		// the job stays queued, matching every sibling reconciler's ErrNoRows skip.
-		known, err := d.pullRequestNumberIsAPullRequest(ctx, payload.PullRequest)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		if !known {
-			continue
-		}
+		// Cheapest-first, and the order is load-bearing rather than cosmetic: the
+		// exemption check reads job events from the local store, while the
+		// pull-request-evidence check can reach the forge. Testing evidence first
+		// would spend an API call on a job this sweep would never touch anyway.
 		survives, err := d.queuedJobSurvivesClosedPullRequest(ctx, job, payload)
 		if err != nil {
 			if firstErr == nil {
@@ -1097,6 +1084,22 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 			continue
 		}
 		if survives {
+			continue
+		}
+		// "Absent from the open PR list" is not evidence the number IS a pull
+		// request. payload.PullRequest also carries ISSUE numbers — handleIssueAsk
+		// stores the issue number in that field, and delegationRequest copies it onto
+		// every child, which gets no `routed` event of its own — and an issue number
+		// can never appear in a list of PRs. Require a second, independent instrument
+		// before terminating anything.
+		known, err := d.pullRequestNumberIsAPullRequest(ctx, payload.PullRequest)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if !known {
 			continue
 		}
 		reason := fmt.Sprintf("queued %s job superseded: %s pull request #%d is no longer open",

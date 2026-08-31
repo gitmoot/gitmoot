@@ -117,6 +117,12 @@ func TestPollOnceSupersedesQueuedLegsWhosePullRequestClosed(t *testing.T) {
 		// strand exactly the leg this sweep exists to clear, so the forge answers.
 		Repo: repo.FullName(), Branch: "task-11", PullRequest: 11, TaskID: "task-11", LeadAgent: "lead",
 	})
+	seedQueuedJob(t, store, "pipeline-stage-unrecorded", "audit", "review", workflow.JobPayload{
+		// Exempt AND its PR has no store row. If the evidence check ran before the
+		// exemption check, this job would spend a forge call the sweep can never use.
+		Repo: repo.FullName(), Branch: "task-11", PullRequest: 11, TaskID: "task-11", LeadAgent: "lead",
+		Sender: workflow.PipelineJobSender,
+	})
 
 	engine := workflow.Engine{Store: store}
 	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
@@ -143,6 +149,7 @@ func TestPollOnceSupersedesQueuedLegsWhosePullRequestClosed(t *testing.T) {
 		{"issue-ask-child", workflow.JobQueued, "issue #12 is not a pull request at all"},
 		{"cli-dispatched-review", workflow.JobQueued, "an operator dispatched it by name"},
 		{"unrecorded-pr-review", workflow.JobCancelled, "a closed PR the store never recorded is still a closed PR"},
+		{"pipeline-stage-unrecorded", workflow.JobQueued, "exempt regardless of what the forge would say"},
 	} {
 		job, err := store.GetJob(ctx, tc.id)
 		if err != nil {
@@ -171,6 +178,20 @@ func TestPollOnceSupersedesQueuedLegsWhosePullRequestClosed(t *testing.T) {
 		if superseded != 1 {
 			t.Fatalf("%s %s events = %d, want 1 across two polls", id, workflow.JobEventSupersededPullRequestClosed, superseded)
 		}
+	}
+
+	// Cheapest gate first: the exempt job for the same unrecorded PR must not have
+	// spent a forge call, so #11 is asked about exactly once — for the one job the
+	// sweep can actually act on. Two calls means the evidence check ran before the
+	// exemption check.
+	asked := 0
+	for _, number := range client.getPullRequestCalls {
+		if number == 11 {
+			asked++
+		}
+	}
+	if asked != 1 {
+		t.Fatalf("forge asked about PR #11 %d times, want 1 (the exempt job must not consult the forge)", asked)
 	}
 }
 
