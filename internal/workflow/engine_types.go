@@ -184,7 +184,7 @@ func (e Engine) mailbox() Mailbox {
 				if resolveErr == nil {
 					owner = NormalizeActingOrgRole(resolved)
 				}
-				if owner == "" {
+				if resolveErr == nil && owner == "" {
 					// Persistent seats implement directly rather than through
 					// implement jobs. Review dispatch still persists the
 					// registered implementing seat as LeadAgent.

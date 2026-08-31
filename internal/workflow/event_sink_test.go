@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"sync"
@@ -107,9 +108,55 @@ func TestEngineEmitsJobFinishedOnSucceededTerminal(t *testing.T) {
 	}
 }
 
+func TestEngineReviewVerdictResolverErrorDoesNotFallbackToLead(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "review-resolver-error", Agent: "audit", Type: "review", State: string(JobSucceeded), Payload: "{}",
+	}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("open raw database: %v", err)
+	}
+	defer raw.Close()
+	if _, err := raw.ExecContext(ctx, `DROP TABLE branch_locks`); err != nil {
+		t.Fatalf("drop branch_locks: %v", err)
+	}
+
+	sink := &recordingSink{}
+	engine := testEngine(store)
+	engine.EventSink = sink
+	engine.mailbox().emitTerminal(ctx, "review-resolver-error", JobSucceeded, JobPayload{
+		Repo:          "gitmoot/gitmoot",
+		Branch:        "task-resolver-error",
+		PullRequest:   46,
+		TaskID:        "task-resolver-error",
+		LeadAgent:     "stale-lead",
+		ActingOrgRole: "requester",
+		Result:        &AgentResult{Decision: "approved", Summary: "lookup failed"},
+	})
+
+	finished := sink.byType(events.EventJobFinished)
+	if len(finished) != 1 {
+		t.Fatalf("job.finished emissions = %d, want 1; all=%+v", len(finished), sink.snapshot())
+	}
+	event := finished[0]
+	if event.Cause != events.EventCauseReviewVerdict {
+		t.Fatalf("review verdict metadata = %+v", event)
+	}
+	if event.WakeTargetRole != "" {
+		t.Fatalf("primary wake target = %q, want empty after resolver error", event.WakeTargetRole)
+	}
+	if got := event.WakeTargetRoles; len(got) != 1 || got[0] != "requester" {
+		t.Fatalf("wake target roles = %v, want [requester]", got)
+	}
+}
 func TestEngineReturnsChangesRequestedToRequesterWithoutDefaultAutoFix(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
+
 	seedAgent(t, store, "author", []string{"implement"}, "gitmoot/gitmoot")
 	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
 	if err := store.UpsertTask(ctx, db.Task{
