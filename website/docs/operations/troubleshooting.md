@@ -552,9 +552,11 @@ database, so Gitmoot mirrors every branch and tag of the **registered repository
 checkout's** remote URL into the clone's proof namespace
 (`refs/remotes/gitmoot-reclaim-proof/heads/*` and `.../tags/*`, pruned each pass)
 within a two-minute probe deadline, then requires that no commit reachable from
-any local ref or reflog is absent from those refs. The traversal ignores replace
-objects and refuses outright when the clone carries a grafts file. The clone's own
-`origin` is never trusted; it is writable by whatever ran in the clone.
+any local ref or reflog is absent from those refs and that the clone holds no
+unreachable commit object (a `commit-tree` write, an interrupted rebase or a
+dropped stash leaves one, and it dies with the directory). The traversal ignores
+replace objects and refuses outright when the clone carries a grafts file. The
+clone's own `origin` is never trusted; it is writable by whatever ran in the clone.
 
 A proven-disposable clone is renamed to `<path>.ttl-reclaiming-<random>` and
 re-proven there before deletion. The rename excludes writers using the original
@@ -564,15 +566,18 @@ quarantined path, and a writer holding only an open file descriptor stays
 undetectable. A failed re-proof renames the clone back. An interrupted removal is
 restored by the next pass (`delegation_worktree_quarantine_restored`) and
 re-proven, and the scheduler does not treat the absent original path as a
-completed removal while such a sibling survives, and `gitmoot doctor` counts
-those siblings. Every retention records its reason once:
+completed removal while such a sibling survives, and `gitmoot doctor` counts those
+siblings. Every retention records its reason once per job:
 `delegation_worktree_retained_unpublished` (with obligation reason
 `unpublished_commits`; squash-merged branches land here by design, because a
 squash publishes the content and not the commits),
-`delegation_worktree_retained_dirty` (tracked, untracked or ignored content —
-the pristine check includes ignored files), and
+`delegation_worktree_retained_dirty` (tracked, untracked or ignored content — the
+pristine check includes ignored files), `delegation_worktree_retained_live` (a
+live process holds a working directory inside it), and
 `delegation_worktree_liveness_unknown` (the process table could not be read,
-which is what makes the pass inert).
+which is what makes the pass inert). Both passes are bounded at eight proofs per
+tick with a rotating window, and the shared checkout lock covers only the rename,
+re-proof and delete — never the remote fetch.
 An already-absent managed fix path completes cleanup
 bookkeeping instead of consuming retries or entering quarantine. A successful
 removal or already-absent reconciliation records

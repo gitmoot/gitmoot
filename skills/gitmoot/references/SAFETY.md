@@ -528,9 +528,10 @@ standalone clone: deleting it deletes its object database. Gitmoot mirrors the
 registered checkout's remote branches and tags into
 `refs/remotes/gitmoot-reclaim-proof/heads/*` and `.../tags/*` (pruned each pass,
 two-minute probe deadline) and removes the clone only when no commit reachable
-from any local ref or reflog is missing from those refs. The clone's own `origin`
-is never trusted, replace objects are ignored, and a grafts file makes the clone
-unprovable. The proven clone is renamed to `<path>.ttl-reclaiming-<random>`,
+from any local ref or reflog is missing from those refs AND the clone holds no
+unreachable commit object. The clone's own `origin` is never trusted, replace
+objects are ignored, and a grafts file makes the clone unprovable.
+The proven clone is renamed to `<path>.ttl-reclaiming-<random>`,
 re-proven there, and only then deleted; an interrupted removal is restored by the
 next pass (`delegation_worktree_quarantine_restored`) and no pass treats the
 absent original path as a completed removal while such a sibling exists, and
@@ -539,12 +540,16 @@ absent original path as a completed removal while such a sibling exists, and
 `unpublished_commits` (the normal outcome for a squash-merged branch, whose
 content is published while its commits are not),
 `delegation_worktree_retained_dirty` when the tree still holds tracked, untracked
-or ignored content, and `delegation_worktree_liveness_unknown` when the process
-table cannot be read — the state that makes the whole pass inert.
+or ignored content, `delegation_worktree_retained_live` when a process still has a
+working directory inside the clone, and `delegation_worktree_liveness_unknown`
+when the process table cannot be read — the state that makes the whole pass inert.
+The shared checkout lock is held only across the rename, re-proof and delete, not
+across the remote fetch.
 
-Task-owned worktrees have their own pass, driven by terminal task lifecycle state
-rather than age, and bounded at eight safety proofs per tick with a per-repo
-rotating window so a permanently retained worktree cannot starve the rest.
+Both worktree reclaim passes — aged delegation/fix and terminal-task — are bounded
+at eight safety proofs per tick with a per-repo rotating window, so a permanently
+retained worktree cannot starve the rest and maintenance cannot delay dispatch.
+The task pass is driven by terminal task lifecycle state rather than age.
 Candidate-local lookup, runner, and removal failures skip only that worktree so
 later candidates continue; candidate-query and store-wide lookup failures still
 abort. Repeated failures log three times per path before suppression. Cleanup

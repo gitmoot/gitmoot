@@ -704,6 +704,64 @@ func TestClientCloneOnlyCommitDetectsCommonDirGrafts(t *testing.T) {
 	}
 }
 
+// A commit written with commit-tree is reachable from no ref and no reflog, and a
+// ref-and-reflog traversal cannot see it. Removing the clone deletes its object
+// database, so the proof must account for unreachable commit objects too.
+func TestClientCloneOnlyCommitSeesUnreachableCommitObjects(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "origin.git")
+	seed := filepath.Join(root, "seed")
+	clone := filepath.Join(root, "fix")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "clone", remote, seed)
+	runGit(t, seed, "config", "user.email", "gitmoot@example.com")
+	runGit(t, seed, "config", "user.name", "Gitmoot")
+	runGit(t, seed, "switch", "-c", "feature/fix")
+	if err := os.WriteFile(filepath.Join(seed, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile base: %v", err)
+	}
+	runGit(t, seed, "add", "base.txt")
+	runGit(t, seed, "commit", "-m", "base")
+	runGit(t, seed, "push", "-u", "origin", "feature/fix")
+	runGit(t, root, "clone", remote, clone)
+	runGit(t, clone, "switch", "feature/fix")
+	runGit(t, clone, "config", "user.email", "gitmoot@example.com")
+	runGit(t, clone, "config", "user.name", "Gitmoot")
+
+	host := NewHostClient(seed)
+	if err := host.RefreshCloneProofRefs(ctx, clone, remote); err != nil {
+		t.Fatalf("RefreshCloneProofRefs: %v", err)
+	}
+	if unpublished, err := host.CloneOnlyCommit(ctx, clone); err != nil || unpublished != "" {
+		t.Fatalf("fully published clone = %q (err %v), want no clone-only commit", unpublished, err)
+	}
+
+	cloneClient := NewHostClient(clone)
+	tree, err := cloneClient.RevParse(ctx, "HEAD^{tree}")
+	if err != nil {
+		t.Fatalf("RevParse tree: %v", err)
+	}
+	dangling := strings.TrimSpace(runGitOutput(t, clone, "commit-tree", tree, "-m", "unreachable work"))
+	if dangling == "" {
+		t.Fatal("commit-tree produced no commit")
+	}
+	// Nothing references it: no branch, no tag, no reflog entry.
+	if refs := strings.TrimSpace(runGitOutput(t, clone, "for-each-ref", "--format=%(objectname)")); strings.Contains(refs, dangling) {
+		t.Fatalf("commit %s unexpectedly reachable from a ref", dangling)
+	}
+	unpublished, err := host.CloneOnlyCommit(ctx, clone)
+	if err != nil {
+		t.Fatalf("CloneOnlyCommit: %v", err)
+	}
+	if unpublished != dangling {
+		t.Fatalf("clone-only commit = %q, want the unreachable commit %s", unpublished, dangling)
+	}
+}
+
 func TestClientCloneOnlyCommitDistrustsCloneOrigin(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
@@ -1169,6 +1227,17 @@ func runGit(t *testing.T, dir string, args ...string) {
 	if err != nil {
 		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, output)
 	}
+}
+
+func runGitOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %s failed: %v", strings.Join(args, " "), err)
+	}
+	return string(output)
 }
 
 type fakeRunner struct {

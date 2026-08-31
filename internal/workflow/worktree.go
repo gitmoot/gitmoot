@@ -1324,7 +1324,16 @@ func (e Engine) cleanupReadOnlyDelegationWorktree(ctx context.Context, jobID str
 
 // isImplementDelegationWorktree reports whether a job ran in a per-delegation
 // implement worktree (carries a branch) that must be torn down on terminal.
+//
+// A fix clone is explicitly excluded. Fix payloads leave DelegationID empty
+// today, so the shapes never overlapped in practice — but that was incidental,
+// and an overlapping payload would take this branch first, deleting the clone
+// without the published-object-database proof and releasing a branch lock the fix
+// flow deliberately keeps. The exclusion makes the invariant enforced.
 func isImplementDelegationWorktree(jobType string, payload JobPayload) bool {
+	if isFixWorktree(jobType, payload) {
+		return false
+	}
 	return strings.TrimSpace(payload.DelegationID) != "" &&
 		strings.TrimSpace(payload.WorktreePath) != "" &&
 		strings.TrimSpace(payload.Branch) != "" &&
@@ -1783,7 +1792,7 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 	if live, known := e.worktreeLiveness(path); !known {
 		return false, e.recordFixCloneLivenessUnknown(ctx, jobID, path)
 	} else if live {
-		return false, nil
+		return false, e.recordFixCloneRetainedLive(ctx, jobID, path)
 	}
 	manager, ok := e.DelegationWorktrees.(WritableWorktreeLineageManager)
 	if !ok || manager == nil {
@@ -1820,8 +1829,23 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 	if live, known := e.worktreeLiveness(path); !known {
 		return false, e.recordFixCloneLivenessUnknown(ctx, jobID, path)
 	} else if live {
-		return false, nil
+		return false, e.recordFixCloneRetainedLive(ctx, jobID, path)
 	}
+	// Serialise only the MUTATION window — rename, re-proof, delete — against a
+	// second reclaimer on this host (the documented `gitmoot daemon restart`
+	// double-daemon overlap). The read-only proofs and the remote fetch above stay
+	// outside the lock: holding a shared checkout lock across a two-minute network
+	// timeout would delay every other pass that takes the same key.
+	lockCtx := context.WithoutCancel(ctx)
+	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(lockCtx, e.Store, e.DelegationCheckout, "worktree-ttl-reclaim:"+jobID, time.Now().UTC())
+	if err != nil {
+		return false, fmt.Errorf("lock checkout for TTL fix clone reclaim: %w", err)
+	}
+	defer func() {
+		if releaseCheckoutLock != nil {
+			_ = releaseCheckoutLock(context.Background())
+		}
+	}()
 	quarantine, err := newFixCloneQuarantinePath(path)
 	if err != nil {
 		return false, err
@@ -1844,7 +1868,10 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 		}
 		return false, e.recordFixCloneLivenessUnknown(ctx, jobID, path)
 	} else if live {
-		return restore(nil)
+		if _, restoreErr := restore(nil); restoreErr != nil {
+			return false, restoreErr
+		}
+		return false, e.recordFixCloneRetainedLive(ctx, jobID, path)
 	}
 	clean, err = manager.WorktreePristineAt(ctx, quarantine)
 	if err != nil {
@@ -1907,10 +1934,21 @@ func (e Engine) recordFixCloneRetainedDirty(ctx context.Context, jobID, path str
 		fmt.Sprintf("fix clone %s retained after TTL: working tree holds tracked, untracked or ignored content", path))
 }
 
-// recordFixCloneRetention appends a retention event once. It dedupes on the event
-// log rather than on the cleanup obligation, because the obligation reason is
-// rewritten by the daemon's generic per-pass deferral and because a crash between
-// two writes must not re-announce on the next five-minute pass.
+// recordFixCloneRetainedLive records the ordinary, expected retention: something
+// on this host still has its working directory inside the clone. It is recorded
+// for the same reason as the others — every outcome of this pass should be
+// attributable from the job log alone.
+func (e Engine) recordFixCloneRetainedLive(ctx context.Context, jobID, path string) error {
+	return e.recordFixCloneRetention(ctx, jobID, "delegation_worktree_retained_live",
+		fmt.Sprintf("fix clone %s retained after TTL: a live process holds a working directory inside it", path))
+}
+
+// recordFixCloneRetention appends a retention event once PER REASON PER JOB. It
+// dedupes on the event KIND rather than the message, because a later retention
+// for the same reason naming a different commit is the same standing fact, and it
+// dedupes on the event log rather than the cleanup obligation, because the
+// obligation reason is rewritten by the daemon's generic per-pass deferral and a
+// crash between the two writes must not re-announce on the next pass.
 func (e Engine) recordFixCloneRetention(ctx context.Context, jobID, kind, message string) error {
 	opCtx := context.WithoutCancel(ctx)
 	events, err := e.Store.ListJobEvents(opCtx, jobID)
@@ -1918,7 +1956,7 @@ func (e Engine) recordFixCloneRetention(ctx context.Context, jobID, kind, messag
 		return err
 	}
 	for _, event := range events {
-		if event.Kind == kind && event.Message == message {
+		if event.Kind == kind {
 			return nil
 		}
 	}
@@ -1986,20 +2024,6 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context
 		return false, nil
 	}
 	if fix {
-		// Two reclaimers on one host (the documented `gitmoot daemon restart`
-		// double-daemon window) would otherwise interleave inside the proof and the
-		// rename. The clone is standalone, but this is the same lock every other
-		// reclaim path takes, so it serialises them against each other.
-		lockCtx := context.WithoutCancel(ctx)
-		releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(lockCtx, e.Store, e.DelegationCheckout, "worktree-ttl-reclaim:"+jobID, time.Now().UTC())
-		if err != nil {
-			return false, fmt.Errorf("lock checkout for TTL fix clone reclaim: %w", err)
-		}
-		defer func() {
-			if releaseCheckoutLock != nil {
-				_ = releaseCheckoutLock(context.Background())
-			}
-		}()
 		return e.reclaimAgedTerminalFixClone(ctx, jobID, payload, path)
 	}
 	manager, ok := e.DelegationWorktrees.(ReadOnlyWorktreeManager)

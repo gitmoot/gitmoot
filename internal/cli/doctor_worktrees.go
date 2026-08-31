@@ -110,15 +110,24 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 	scanQuarantines := func(path string, class delegationWorktreeClass) {
 		// A fix clone mid-removal lives at a quarantine sibling, not at the recorded
 		// path. Counting only recorded paths hides exactly the directory an
-		// interrupted removal leaves behind.
+		// interrupted removal leaves behind. A scan or stat failure is reported as
+		// unproven rather than dropped: silently reporting zero would present an
+		// unreadable directory as a healthy one.
 		quarantines, err := workflow.FixCloneQuarantines(path)
 		if err != nil {
+			usage.Unproven++
+			usage.Stale++
 			return
 		}
 		for _, quarantine := range quarantines {
-			if info, err := os.Stat(quarantine); err == nil && info.IsDir() {
+			info, err := os.Stat(quarantine)
+			switch {
+			case err == nil && info.IsDir():
 				pathsOnDisk[quarantine] = struct{}{}
 				quarantineClasses[quarantine] = class
+			case err != nil && !os.IsNotExist(err):
+				usage.Unproven++
+				usage.Stale++
 			}
 		}
 	}

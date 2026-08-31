@@ -1149,7 +1149,18 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 	if err != nil {
 		return err
 	}
-	for _, jobID := range jobIDs {
+	rotated := rotateTerminalTaskWorktreeCandidates("aged:"+repoFilter, jobIDs)
+	attempts := 0
+	resume := ""
+	for i, jobID := range rotated {
+		// Each attempt can run a remote fetch under a two-minute deadline and a
+		// full-clone removal, so the pass is bounded per tick and rotates, exactly
+		// like the task pass. An unbounded list would delay dispatch behind
+		// maintenance whenever aged candidates accumulate.
+		if attempts >= terminalTaskWorktreeReclaimPassBudget {
+			resume = rotated[i]
+			break
+		}
 		job, err := delegationReclaimCandidateJob(ctx, worker, jobID)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
@@ -1198,6 +1209,7 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 			continue
 		}
 		engine := worker.workflowForJob(worker.delegationParentCheckout(ctx, job), runner)
+		attempts++
 		reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, now.Add(-ttl))
 		if err != nil {
 			if _, persistErr := recordDelegationCleanupFailure(ctx, worker, "aged", "reclaim", job.ID, path, err, now); persistErr != nil {
@@ -1209,6 +1221,7 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 			return stopDelegationCleanupPass(err)
 		}
 	}
+	setTerminalTaskWorktreeReclaimResume("aged:"+repoFilter, resume)
 	return nil
 }
 

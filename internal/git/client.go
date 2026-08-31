@@ -683,6 +683,27 @@ func (c Client) CloneOnlyCommit(ctx context.Context, path string) (string, error
 			return sha, nil
 		}
 	}
+	return cloneUnreachableCommit(ctx, NewClient(path, c.runner))
+}
+
+// cloneUnreachableCommit reports a commit object the clone holds that no ref and
+// no reflog reaches. `git commit-tree` writes exactly that, and so does an
+// interrupted rebase or a dropped stash, so a ref-and-reflog traversal alone is
+// not a proof that removal loses nothing: the object database goes with the
+// directory. Any unreachable commit is by construction absent from the trusted
+// remote's refs, since those are refs of this clone too.
+func cloneUnreachableCommit(ctx context.Context, worktree Client) (string, error) {
+	result, err := worktree.run(ctx, "--no-replace-objects",
+		"fsck", "--unreachable", "--connectivity-only", "--no-progress", "--no-dangling")
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) == 3 && fields[0] == "unreachable" && fields[1] == "commit" {
+			return fields[2], nil
+		}
+	}
 	return "", nil
 }
 

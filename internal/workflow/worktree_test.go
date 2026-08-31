@@ -1958,6 +1958,151 @@ func TestEngineReclaimAgedFixCloneRecordsDirtyRetention(t *testing.T) {
 	}
 }
 
+// Every outcome of the pass should be attributable from the job log alone, and a
+// retention reason is recorded once per job even when the offending detail changes.
+func TestEngineReclaimAgedFixCloneRecordsLiveRetentionOncePerReason(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	const jobID = "fix-live-retention"
+	path, err := FixWorktreePath(home, "owner/repo", jobID)
+	if err != nil {
+		t.Fatalf("FixWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("MkdirAll fix worktree: %v", err)
+	}
+	payload, err := marshalPayload(JobPayload{
+		Repo:         "owner/repo",
+		Branch:       "feature/fix",
+		WorktreePath: path,
+		FixWorktree:  true,
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID:      jobID,
+		Agent:   "fixer",
+		Type:    "implement",
+		State:   string(JobSucceeded),
+		Repo:    "owner/repo",
+		Payload: payload,
+	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent: %v", err)
+	}
+	engine := testEngine(store)
+	engine.Home = home
+	engine.DelegationWorktrees = &fakeWorktreeManager{cleanSet: true, clean: true}
+	engine.WorktreeHasLiveProcess = func(string) bool { return true }
+
+	for attempt := 0; attempt < 3; attempt++ {
+		reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
+		if err != nil {
+			t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
+		}
+		if reclaimed {
+			t.Fatal("live fix clone was reclaimed")
+		}
+	}
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	live := 0
+	for _, event := range events {
+		if event.Kind == "delegation_worktree_retained_live" {
+			live++
+		}
+	}
+	if live != 1 {
+		t.Fatalf("live retention events = %d, want exactly 1: %+v", live, events)
+	}
+}
+
+// The serialisation claim needs a checkout to lock: testEngine leaves
+// DelegationCheckout empty, so without this the lock was never exercised.
+func TestEngineReclaimAgedFixCloneTakesCheckoutLockForRemoval(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	checkout := t.TempDir()
+	const jobID = "fix-lock-serialisation"
+	path, err := FixWorktreePath(home, "owner/repo", jobID)
+	if err != nil {
+		t.Fatalf("FixWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("MkdirAll fix worktree: %v", err)
+	}
+	payload, err := marshalPayload(JobPayload{
+		Repo:         "owner/repo",
+		Branch:       "feature/fix",
+		WorktreePath: path,
+		FixWorktree:  true,
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID:      jobID,
+		Agent:   "fixer",
+		Type:    "implement",
+		State:   string(JobSucceeded),
+		Repo:    "owner/repo",
+		Payload: payload,
+	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent: %v", err)
+	}
+	engine := testEngine(store)
+	engine.Home = home
+	engine.DelegationCheckout = checkout
+	engine.DelegationWorktrees = &fakeWorktreeManager{cleanSet: true, clean: true}
+
+	// A foreign holder of the same checkout must keep the removal out of the rename
+	// window until it releases, rather than letting two reclaimers in together. The
+	// reclaim waits on the lock, so the holder is released while it waits instead of
+	// burning the full two-minute wait budget.
+	release, _, err := acquireCheckoutMutationLock(ctx, store, checkout, "foreign-holder", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("acquireCheckoutMutationLock: %v", err)
+	}
+	type outcome struct {
+		reclaimed bool
+		err       error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
+		done <- outcome{reclaimed: reclaimed, err: err}
+	}()
+	select {
+	case got := <-done:
+		t.Fatalf("reclaim finished while the checkout lock was held: %+v", got)
+	case <-time.After(250 * time.Millisecond):
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Fatalf("clone was removed while the checkout lock was held: %v", statErr)
+	}
+	if err := release(ctx); err != nil {
+		t.Fatalf("release checkout lock: %v", err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", got.err)
+		}
+		if !got.reclaimed {
+			t.Fatal("provable clone was not reclaimed once the checkout lock was free")
+		}
+	case <-time.After(checkoutMutationWaitTimeout):
+		t.Fatal("reclaim did not finish after the checkout lock was released")
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("clone remains after a successful reclaim: %v", statErr)
+	}
+}
+
 // The ordinary (non-TTL) fix-clone cleanup runs on every terminal advance and on
 // the skipped-cleanup pass, so it must make the same inference as the TTL pass:
 // an absent path is not a completed removal while a quarantine of it survives.
