@@ -195,6 +195,15 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 					}
 					changed = false
 				} else {
+					// The lifecycle already ran for this PR at this head in THIS poll, so
+					// reconcileReviewingPullRequest must not re-enter it: reading the
+					// poll's pre-dispatch snapshot it would see no review at the current
+					// head and derive the same round a second time, whose instructions,
+					// and therefore whose deterministic job id, can differ from the ones
+					// just enqueued. Recording that one fact is O(1); dropping the whole
+					// repo-wide snapshot instead cost a fresh ListJobsByType per changed
+					// PR, defeating the once-per-poll memo it was added to preserve.
+					reviewMemo.noteLifecycleRun(pull)
 					mergeReadinessHandled = handled
 					merged, err := d.pullRequestStoredMerged(ctx, pull)
 					if err != nil {
@@ -854,6 +863,10 @@ type reviewJobsMemo struct {
 	store reviewJobLister
 	done  bool
 	jobs  []db.Job
+	// lifecycleRuns records the head each PR's workflow lifecycle already ran at in
+	// THIS poll. It is not part of the snapshot: it is the one fact that makes the
+	// snapshot's staleness harmless, without re-fetching it.
+	lifecycleRuns map[int64]string
 }
 
 func (m *reviewJobsMemo) get(ctx context.Context) ([]db.Job, error) {
@@ -867,6 +880,27 @@ func (m *reviewJobsMemo) get(ctx context.Context) ([]db.Job, error) {
 	m.jobs = jobs
 	m.done = true
 	return m.jobs, nil
+}
+
+// noteLifecycleRun records that this PR's workflow lifecycle ran at this head in the
+// current poll. The dispatch it may have performed is invisible to the snapshot taken
+// before it, so a later consumer must not treat "no review at this head" as an
+// instruction to derive the round again.
+func (m *reviewJobsMemo) noteLifecycleRun(pull github.PullRequest) {
+	if m.lifecycleRuns == nil {
+		m.lifecycleRuns = map[int64]string{}
+	}
+	m.lifecycleRuns[pull.Number] = strings.TrimSpace(pull.HeadSHA)
+}
+
+// lifecycleRanAtHead reports whether noteLifecycleRun already recorded this PR at this
+// exact head during this poll.
+func (m *reviewJobsMemo) lifecycleRanAtHead(pull github.PullRequest) bool {
+	if m == nil || len(m.lifecycleRuns) == 0 {
+		return false
+	}
+	head, ok := m.lifecycleRuns[pull.Number]
+	return ok && head == strings.TrimSpace(pull.HeadSHA)
 }
 
 // newReviewJobsMemo is a package var (not a plain func) only so the once-per-poll
@@ -1320,7 +1354,11 @@ func (d Daemon) reconcileReviewingPullRequest(ctx context.Context, pull github.P
 			return nil
 		}
 	}
-	if hasCurrentReview {
+	// Either a review already exists at this head, or the lifecycle already ran for
+	// this PR at this head earlier in THIS poll — in which case any job it dispatched
+	// is invisible to the snapshot above, and re-entering would derive the same round
+	// twice.
+	if hasCurrentReview || memo.lifecycleRanAtHead(pull) {
 		return nil
 	}
 	return d.handlePullRequestWorkflow(ctx, pull, memo)

@@ -236,7 +236,7 @@ func SynthesizeLensDecision(findings []LensFinding) string {
 // to return the structured {lens, refuted, severity, confidence, evidence}
 // findings the synthesizer reads. A critical refutation must be reported as a
 // `blocked` decision so it fails the quorum and blocks the merge.
-func lensPrompt(lens string, event PullRequestEvent) string {
+func lensPrompt(lens string, event PullRequestEvent, scope *ReviewScope) string {
 	var axis string
 	switch lens {
 	case LensCorrectness:
@@ -251,15 +251,19 @@ func lensPrompt(lens string, event PullRequestEvent) string {
 	default:
 		axis = strings.ToUpper(lens)
 	}
-	return fmt.Sprintf(
+	prompt := fmt.Sprintf(
 		"You are the %s LENS on a HIGH-RISK review of pull request #%d for task %s. "+
 			"Adopt a refutation stance: assume the change is WRONG and try to prove it along one axis.\n\n%s\n\n"+
 			"Return gitmoot_result with a refutation-framed decision and structured findings. "+
-			"Each finding is an object {\"lens\":%q,\"refuted\":true|false,\"severity\":\"critical|high|medium|low\",\"confidence\":0..1,\"evidence\":\"file:line — why\"}. "+
+			"Each finding is an object {\"lens\":%q,\"refuted\":true|false,\"severity\":\"critical|high|medium|low\",\"confidence\":0..1,\"evidence\":\"file:line - why\"}. "+
 			"If you find a CRITICAL refutation, set decision to \"blocked\" (this blocks the merge); "+
 			"otherwise set decision to \"approved\" and record any lower-severity findings as advisory.",
 		strings.ToUpper(lens), event.PullRequest, taskLabel(event.TaskID, event.TaskTitle), axis, lens,
 	)
+	if scope != nil {
+		prompt += "\n\n" + scopedReviewInstructions(event, scope)
+	}
+	return prompt
 }
 
 // highRiskLensDelegations builds the refutation lens delegation batch for a
@@ -270,7 +274,7 @@ func lensPrompt(lens string, event PullRequestEvent) string {
 // refutation, reported as `blocked`) fails the quorum and blocks the merge, while
 // unanimous approval satisfies it. Reviewers are assigned round-robin; with a
 // single configured reviewer every lens runs as a distinct job on that reviewer.
-func highRiskLensDelegations(reviewers []string, event PullRequestEvent) []Delegation {
+func highRiskLensDelegations(reviewers []string, event PullRequestEvent, reviewScopes map[reviewScopeKey]*ReviewScope) []Delegation {
 	reviewers = compactStrings(reviewers)
 	if len(reviewers) == 0 {
 		return nil
@@ -282,15 +286,18 @@ func highRiskLensDelegations(reviewers []string, event PullRequestEvent) []Deleg
 	quorum := len(lenses)
 	dels := make([]Delegation, 0, len(lenses))
 	for i, lens := range lenses {
+		reviewer := reviewers[i%len(reviewers)]
+		scope := cloneReviewScope(reviewScopeFor(reviewScopes, reviewer, lens))
 		dels = append(dels, Delegation{
 			ID:            lens,
-			Agent:         reviewers[i%len(reviewers)],
+			Agent:         reviewer,
 			Action:        "review",
-			Prompt:        lensPrompt(lens, event),
+			Prompt:        lensPrompt(lens, event, scope),
+			ReviewScope:   scope,
 			SynthesisRule: "quorum",
 			Quorum:        quorum,
-			// A refuting lens must not fail the whole tree — its `blocked` decision is a
-			// quorum SIGNAL, not an infra failure — so let siblings finish and let the
+			// A refuting lens must not fail the whole tree - its `blocked` decision is a
+			// quorum SIGNAL, not an infra failure - so let siblings finish and let the
 			// quorum gate render the verdict.
 			FailurePolicy: "continue",
 		})

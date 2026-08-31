@@ -120,6 +120,23 @@ func checkoutMutationWaitExpired(waitBudget time.Duration) BlockedError {
 	return BlockedError{Reason: fmt.Sprintf("%s Waited up to %s for the checkout mutation lock.", checkoutMutationBusyMessage, waitBudget.Round(time.Second))}
 }
 
+// CheckoutMutationLockContention reports whether err is the self-healing
+// checkout-mutation-lock block: another worker holds the shared .git for a short
+// op (a detached `git worktree add`, the merge gate) and releases it, so a waiter
+// that spent its budget succeeds on a later attempt. It is deliberately narrow —
+// the BlockedError TYPE and the mutation-busy reason together — so a caller that
+// HOLDS a job on it cannot also hold one on an unrelated block. The daemon's
+// pre-flight uses it to defer a read-only worktree allocation for re-dispatch
+// rather than terminally failing the job; every other allocation failure (a
+// missing commit object, an unwritable path) is not this error and stays terminal.
+func CheckoutMutationLockContention(err error) bool {
+	var blocked BlockedError
+	if !errors.As(err, &blocked) {
+		return false
+	}
+	return strings.Contains(blocked.Reason, checkoutMutationBusyMessage)
+}
+
 func checkoutMutationLockKey(checkoutPath string) (string, error) {
 	checkoutPath = strings.TrimSpace(checkoutPath)
 	if checkoutPath == "" {

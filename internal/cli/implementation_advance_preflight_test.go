@@ -950,6 +950,11 @@ func expireImplementationPreflightHold(t *testing.T, store *db.Store, job db.Job
 func enqueueAdvanceCreatedHeadlessFixJob(t *testing.T, store *db.Store, jobID, branch, fixWorktree string) {
 	t.Helper()
 	ctx := context.Background()
+	if err := store.SetPullRequestAutoFixPolicy(
+		ctx, "owner/repo", 1514, false, "test", "exercise opted-in headless fix preflight",
+	); err != nil {
+		t.Fatalf("SetPullRequestAutoFixPolicy returned error: %v", err)
+	}
 	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"review"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: "original-headless-implement", Agent: "lead", Action: "implement", Repo: "owner/repo",

@@ -158,6 +158,11 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 	// byte-identical unless a home config turns it on.
 	applyReviewPolicy(&engine, home)
 	wireReviewRiskSignals(&engine, gh)
+	// The review-scope seam needs the daemon's CHECKOUT, not just the API client:
+	// no hosted compare response can prove its own file list is the whole range,
+	// so a >300-file follow-up is only scopable by enumerating it with local git.
+	// With no checkout the seam still installs and fails closed instead.
+	wireReviewChangedFiles(&engine, gh, checkout, runner)
 	if strings.TrimSpace(home) != "" {
 		// Root delegation artifacts under GITMOOT_HOME (alongside worktrees)
 		// rather than inside the repo checkout, so generated briefs stay out of

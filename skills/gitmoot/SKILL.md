@@ -244,8 +244,8 @@ can discover Gitmoot through an installed runtime plugin. Use
 adds the resolved `.gitmoot` home to the sandbox on Linux, macOS, and Windows.
 Use `gitmoot goal template` when
 writing a standard task-by-task goal file. Use `gitmoot workflow list`, `gitmoot
-workflow show`, `gitmoot workflow describe`, `gitmoot workflow note`, and
-`gitmoot workflow close` to
+workflow show`, `gitmoot workflow show-note`, `gitmoot workflow describe`,
+`gitmoot workflow note`, and `gitmoot workflow close` to
 inspect external-coordinator workflow groups, set their stable description, add
 verbatim journal entries, set a manual status escape hatch, optionally stage
 a note in persistent memory, and end a finished group. Workflow hygiene:
@@ -253,6 +253,9 @@ a note in persistent memory, and end a finished group. Workflow hygiene:
 work merges or completes — never-closed workflows accumulate and bury live
 work in the dashboard's active buckets and every workflow-picking surface. Linked PR lifecycle transitions also add deduped
 `daemon` journal notes and advance live status.
+In org mode, `gitmoot org message send --to <role> --workflow <label>
+"<message>"` gives distinct same-parent siblings a durable sender-attributed
+heads-up. It creates no acknowledgment, completion, TTL, or nag obligation.
 In org mode, obligations and questions have a full lifecycle and closing it is
 part of the work: `gitmoot org directive send --to <role> --workflow <label>`
 mints a tracked, TTL-nudged obligation; `org directive ack <id>` records

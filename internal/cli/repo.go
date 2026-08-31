@@ -39,6 +39,8 @@ func runRepo(args []string, stdout, stderr io.Writer) int {
 		return runRepoRemove(args[1:], stdout, stderr)
 	case "doctor":
 		return runRepoDoctor(args[1:], stdout, stderr)
+	case "collisions":
+		return runRepoCollisions(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown repo command %q\n\n", args[0])
 		printRepoUsage(stderr)
@@ -80,6 +82,7 @@ func printRepoUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot repo set-interval --all (<duration>|default)")
 	fmt.Fprintln(w, "  gitmoot repo remove owner/repo")
 	fmt.Fprintln(w, "  gitmoot repo doctor owner/repo")
+	fmt.Fprintln(w, "  gitmoot repo collisions owner/repo [--limit N] [--json]")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "owner/repo may be given before or after the flags.")
 }
@@ -349,8 +352,8 @@ func runRepoAutoFix(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	pullRequest := fs.Int("pr", 0, "pull request number")
-	disable := fs.Bool("disable", false, "disable automatic changes-requested fix dispatch")
-	enable := fs.Bool("enable", false, "re-enable automatic changes-requested fix dispatch")
+	disable := fs.Bool("disable", false, "revoke the changes-requested auto-fix opt-in (report-only default)")
+	enable := fs.Bool("enable", false, "opt in to automatic changes-requested fix dispatch")
 	actor := fs.String("by", "", "role or agent recording the decision")
 	reason := fs.String("reason", "", "durable reason for the decision")
 	repoArg, code := parseRepoPositional(

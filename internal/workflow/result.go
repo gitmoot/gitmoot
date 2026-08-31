@@ -90,6 +90,7 @@ type Delegation struct {
 	Action        string         `json:"action"`
 	Worktree      string         `json:"worktree,omitempty"`
 	Prompt        string         `json:"prompt"`
+	ReviewScope   *ReviewScope   `json:"review_scope,omitempty"`
 	Artifacts     []string       `json:"artifacts,omitempty"`
 	Deps          []string       `json:"deps,omitempty"`
 	Timeout       string         `json:"timeout,omitempty"`
