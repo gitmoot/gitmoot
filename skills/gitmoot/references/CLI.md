@@ -1552,12 +1552,29 @@ claimed by any role; each failure includes category counts and a reason.
 `org brief --role` defaults to `GITMOOT_ORG_ROLE`; an explicit flag wins.
 `gitmoot org show [--home PATH]` prints the resolved role table.
 
-`gitmoot org seat add <name> --pane <label> [--parent ROLE] [--scope REPO,...]
-[--merge-rule owner|self|none] [--home DIR]` claims the one live Herdr pane
-with that exact label, writes or repairs the role's `pane` binding, and installs
-addressed `reply`, `blocked`, `directive`, `escalation`, and `fact` routes with stable
-IDs `org-seat-<name>-<kind>`. Duplicate labels hard-fail instead of choosing a
-pane.
+`gitmoot org seat add <name> [--pane ID_OR_LABEL] [--parent ROLE]
+[--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]` creates or
+repairs a role and installs addressed `reply`, `blocked`, `directive`,
+`escalation`, and `fact` routes with stable IDs `org-seat-<name>-<kind>`.
+
+With `--pane`, Gitmoot resolves a literal live pane id first, then a unique
+exact live label, and stores the resolved pane id. Existing label-based commands
+therefore keep working; re-running one for the same resolved pane canonicalizes
+that existing binding to the pane id. Later cosmetic label changes do not
+retarget or break bindings written by this command. Duplicate labels, unknown
+references, and a supplied but empty `--pane` hard-fail before any role or route
+is written.
+Omit `--pane` to create an unbound role and the same routes; re-run the command
+with `--pane ID_OR_LABEL` to bind that role later. If a configured binding stops
+resolving, for example after Herdr recreates a pane with a new id, the same
+command can rebind the role to a live unclaimed pane while preserving its policy
+and routes. A configured binding that still resolves is immutable. An ambiguous
+label binding must be disambiguated in Herdr before rebinding. Every successful
+add validates the affected role and five routes. Bound creation and repair also
+validate the live binding without making unrelated intentionally unbound roles
+decide the exit code. Unbound creation reports the deferred bind command and an
+`ok role NAME unbound enabled_routes=5` verdict. The global `org validate` command
+continues to report every unbound role until it is attached.
 
 For a new non-owner seat, the acting role comes from `GITMOOT_ORG_ROLE` and
 falls back to `owner` only when the variable is unset. The new seat inherits
@@ -1566,19 +1583,28 @@ role and cannot create a cycle. An explicit `--scope` must stay within both the
 acting role's scope and the selected parent's scope. Merge authority defaults
 to empty; an explicit `--merge-rule` cannot exceed the acting role's authority.
 The empty-registry `owner` bootstrap keeps its `*` scope and `owner` merge rule.
-The three role flags initialize new seats only; re-running the command repairs
-missing owned pieces without rewriting existing role policy or duplicating
-routes. The command finishes with the same reality validation as `org validate`,
-so success includes a green live-pane and route verdict rather than only
-confirming that config parsed.
+The three policy flags initialize new seats only. An existing role accepts an
+explicit policy value only when it matches the stored value; `--scope` matches
+as an unordered set, and a changed value is rejected instead of being silently
+ignored. An invalid `--merge-rule` is always rejected as invalid, on new and
+existing roles alike. Re-running with matching values or without those flags
+repairs missing owned pieces, fills an empty pane binding, canonicalizes a
+matching label binding, or replaces a non-empty binding only when its former
+target no longer resolves. It does not rewrite existing policy or duplicate
+routes.
 
-`gitmoot org seat rm <name> [--home DIR]` resolves the role's live pane and
-checks every distinct Git checkout reported by that pane's `cwd` and
-`foreground_cwd`. It refuses a dirty checkout or a branch whose `HEAD` is not
-merged into the locally known `origin/HEAD` (falling back to `origin/main`);
-unreadable branch state also fails closed. A safe removal deletes the role and
-all of its wake routes, closes the pane, and then runs the same reality
-validation. Roles that still parent another role cannot be removed.
+`gitmoot org seat rm <name> [--home DIR]` resolves the role's live pane when it
+has a binding and checks every distinct Git checkout reported by that pane's
+`cwd` and `foreground_cwd`. It refuses a dirty checkout or a branch whose `HEAD`
+is not merged into the locally known `origin/HEAD` (falling back to
+`origin/main`); unreadable branch state also fails closed. A safe removal deletes
+the role and all of its wake routes, closes a resolved live pane, and validates
+that the role, routes, and closed pane are absent. A role with no configured
+binding has no pane to inspect or close, so removal deletes only that role and
+its routes. A configured binding that is stale, absent, or ambiguous fails
+closed before mutation and reports the `org seat add` rebind command. A provider
+error for a configured binding also fails closed. Roles that still parent
+another role cannot be removed.
 
 The five provisioned routes are enabled, addressed, and have an empty match
 filter. Remove one by its stable ID with `org events rule rm` to quiet that kind;
@@ -1590,10 +1616,13 @@ The registry uses `[org] enforce = "warn"|"block"` and
 cosmetic `display_name`, an optional `model` runtime pin, an optional per-role
 `recycle_after` duration override, and an optional `pane` Herdr binding (used by
 live presence and org event-rule wakes).
-The binding resolves as a unique exact live pane label or a currently live
-literal pane id. Roles without a binding report unknown live presence, and event
-wakes for them are skipped with an observable log and increment the role's
-missed-wake counter rather than being inferred from a pane label. There is
+For backward compatibility, a configured binding resolves as a literal pane id
+or a unique exact live label. A literal id tracks one pane; a label tracks
+whichever current pane uniquely carries that cosmetic value. `org seat add`
+canonicalizes new bindings to ids. Roles without a binding report unknown live
+presence, and event wakes for them are skipped with an observable log and
+increment the role's missed-wake counter rather than being inferred from a pane
+label. There is
 exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
 `owner/repo`, and each child scope must be covered by its parent. Malformed
 org configuration fails closed and loudly. `brief` records passive last-seen
