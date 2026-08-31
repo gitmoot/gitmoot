@@ -5258,4 +5258,18 @@ func TestTickCandidatesRetriesOnError(t *testing.T) {
 	if got := atomic.LoadInt32(&store.taskReclaimCalls); got != 2 {
 		t.Fatalf("terminal task reclaim query ran %d times, want 2", got)
 	}
+	if _, err := cand.firstMalformedNonFinalJob(ctx); !errors.Is(err, errCandidateTransient) {
+		t.Fatalf("first firstMalformedNonFinalJob err = %v, want transient", err)
+	}
+	id, err := cand.firstMalformedNonFinalJob(ctx)
+	if err != nil || id != "malformed-job" {
+		t.Fatalf("second firstMalformedNonFinalJob id=%q err=%v, want malformed-job nil", id, err)
+	}
+	id, err = cand.firstMalformedNonFinalJob(ctx)
+	if err != nil || id != "malformed-job" {
+		t.Fatalf("third firstMalformedNonFinalJob id=%q err=%v, want cached malformed-job nil", id, err)
+	}
+	if got := atomic.LoadInt32(&store.malformedOwnerCalls); got != 2 {
+		t.Fatalf("malformed owner query ran %d times, want 2", got)
+	}
 }

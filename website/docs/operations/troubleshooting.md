@@ -551,7 +551,9 @@ worktrees. For an independent fix clone, Gitmoot refreshes the recorded branch
 from its real `origin` within a two-minute probe deadline, then requires a clean
 tree whose HEAD is still reachable from that refreshed remote branch immediately
 before removal. A branch absent from `origin` keeps the clone without counting
-as a cleanup failure. A successful removal records
+as a cleanup failure. An already-absent managed fix path completes cleanup
+bookkeeping instead of consuming retries or entering quarantine. A successful
+removal or already-absent reconciliation records
 `delegation_worktree_reclaimed_ttl`. Set the TTL to `"0"` to disable this pass.
 Blocked, queued, and running owners remain pinned and are never force-removed.
 Candidate-local failures skip only that worktree, and later candidates continue.

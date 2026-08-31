@@ -637,7 +637,16 @@ func TestReclaimTerminalTaskWorktreesRemovesCleanDismissedTask(t *testing.T) {
 		t.Fatalf("UpsertTask: %v", err)
 	}
 
-	if err := reclaimTerminalTaskWorktrees(ctx, worker, "owner/repo", nil, newTickCandidates(store), io.Discard); err != nil {
+	if err := reclaimTerminalTaskWorktrees(ctx, worker, "owner/repo", "root-job", nil, newTickCandidates(store), io.Discard); err != nil {
+		t.Fatalf("session-scoped reclaimTerminalTaskWorktrees: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("session-scoped daemon removed terminal task worktree: %v", err)
+	}
+	if livenessCalls != 0 {
+		t.Fatalf("session-scoped daemon ran %d task worktree liveness checks, want 0", livenessCalls)
+	}
+	if err := reclaimTerminalTaskWorktrees(ctx, worker, "owner/repo", "", nil, newTickCandidates(store), io.Discard); err != nil {
 		t.Fatalf("reclaimTerminalTaskWorktrees: %v", err)
 	}
 	if livenessCalls != 2 {
@@ -693,7 +702,7 @@ func TestReclaimTerminalTaskWorktreesNamesMalformedGlobalPin(t *testing.T) {
 	}
 
 	var output bytes.Buffer
-	if err := reclaimTerminalTaskWorktrees(ctx, worker, "owner/repo", nil, newTickCandidates(store), &output); err != nil {
+	if err := reclaimTerminalTaskWorktrees(ctx, worker, "owner/repo", "", nil, newTickCandidates(store), &output); err != nil {
 		t.Fatalf("reclaimTerminalTaskWorktrees: %v", err)
 	}
 	if _, err := os.Stat(path); err != nil {

@@ -877,6 +877,7 @@ type tickCandidateStore interface {
 	JobIDsWithPendingDelegationWorktreeReclaim(ctx context.Context) ([]string, error)
 	JobIDsWithAgedTerminalDelegationWorktree(ctx context.Context, cutoff time.Time) ([]string, error)
 	TaskIDsWithTerminalWorktree(ctx context.Context) ([]string, error)
+	FirstMalformedNonFinalJob(ctx context.Context) (string, error)
 }
 
 // candidateMemo lazily runs one per-tick candidate query and shares its RESULT
@@ -906,13 +907,15 @@ func (m *candidateMemo) get(fetch func() ([]string, error)) ([]string, error) {
 }
 
 type tickCandidates struct {
-	store           tickCandidateStore
-	advance         candidateMemo
-	comment         candidateMemo
-	reclaim         candidateMemo
-	agedReclaim     candidateMemo
-	taskReclaim     candidateMemo
-	skipAgedReclaim bool
+	store              tickCandidateStore
+	advance            candidateMemo
+	comment            candidateMemo
+	reclaim            candidateMemo
+	agedReclaim        candidateMemo
+	taskReclaim        candidateMemo
+	malformedOwnerDone bool
+	malformedOwnerID   string
+	skipAgedReclaim    bool
 }
 
 // newTickCandidates is a package var (not a plain func) only so the once-per-tick
@@ -956,6 +959,19 @@ func (c *tickCandidates) terminalTaskWorktreeCandidates(ctx context.Context) ([]
 	return c.taskReclaim.get(func() ([]string, error) {
 		return c.store.TaskIDsWithTerminalWorktree(ctx)
 	})
+}
+
+func (c *tickCandidates) firstMalformedNonFinalJob(ctx context.Context) (string, error) {
+	if c.malformedOwnerDone {
+		return c.malformedOwnerID, nil
+	}
+	id, err := c.store.FirstMalformedNonFinalJob(ctx)
+	if err != nil {
+		return "", err
+	}
+	c.malformedOwnerID = id
+	c.malformedOwnerDone = true
+	return id, nil
 }
 
 // retryPendingJobAdvancements re-fires the post-delivery advancement for any
@@ -1187,7 +1203,10 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 // lifecycle state, never age. Each candidate is independently safety-checked by
 // the workflow engine; item failures are logged and left for the next bounded
 // pass so maintenance cannot suppress dispatch.
-func reclaimTerminalTaskWorktrees(ctx context.Context, worker jobWorker, repoFilter string, checkoutHeld func(string) bool, cand *tickCandidates, stdout io.Writer) error {
+func reclaimTerminalTaskWorktrees(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string, checkoutHeld func(string) bool, cand *tickCandidates, stdout io.Writer) error {
+	if strings.TrimSpace(rootFilter) != "" {
+		return nil
+	}
 	taskIDs, err := cand.terminalTaskWorktreeCandidates(ctx)
 	if err != nil {
 		return err
@@ -1199,7 +1218,7 @@ func reclaimTerminalTaskWorktrees(ctx context.Context, worker jobWorker, repoFil
 	if strings.TrimSpace(home) == "" {
 		return errors.New("resolve Gitmoot home for terminal task worktree reclaim")
 	}
-	malformedJobID, malformedErr := worker.Store.FirstMalformedNonFinalJob(ctx)
+	malformedJobID, malformedErr := cand.firstMalformedNonFinalJob(ctx)
 	if malformedErr != nil {
 		writeLine(stdout, "terminal task worktree reclaim could not identify malformed non-final owner: %v", malformedErr)
 	}
@@ -1394,7 +1413,7 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 		} else if err := reclaimAgedTerminalDelegationWorktrees(ctx, worker, repoFilter, rootFilter, tracker.checkoutHeld, cand, now, ttl); err != nil {
 			writeLine(stdout, "delegation_worktree_ttl reclaim failed: %v", err)
 		}
-		if err := reclaimTerminalTaskWorktrees(ctx, worker, repoFilter, tracker.checkoutHeld, cand, stdout); err != nil {
+		if err := reclaimTerminalTaskWorktrees(ctx, worker, repoFilter, rootFilter, tracker.checkoutHeld, cand, stdout); err != nil {
 			writeLine(stdout, "terminal task worktree reclaim failed: %v", err)
 		}
 	}

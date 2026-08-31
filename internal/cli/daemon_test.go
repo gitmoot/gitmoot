@@ -843,18 +843,18 @@ func resetRuntimeLockWaitEpisodes() {
 	runtimeLockWaitEpisodes = map[string]time.Time{}
 }
 
-// countingCandidateStore wraps a real *db.Store and counts how many times each of
-// the three per-tick candidate GROUP BY queries executes, delegating to the store
-// so the query still runs (returning the real, empty result on a job-free DB). It
-// backs TestTickCandidatesComputedOncePerTick's proof that the #619 hoist runs each
+// countingCandidateStore wraps a real *db.Store and counts per-tick candidate
+// queries, delegating to the store so each query still runs. It backs
+// TestTickCandidatesComputedOncePerTick's proof that the #619 hoist runs each
 // candidate query once per tick, not once per enabled repo.
 type countingCandidateStore struct {
-	inner       *db.Store
-	advance     int32
-	comment     int32
-	reclaim     int32
-	agedReclaim int32
-	taskReclaim int32
+	inner          *db.Store
+	advance        int32
+	comment        int32
+	reclaim        int32
+	agedReclaim    int32
+	taskReclaim    int32
+	malformedOwner int32
 }
 
 func (c *countingCandidateStore) JobIDsWithPendingAdvanceRetry(ctx context.Context) ([]string, error) {
@@ -882,17 +882,23 @@ func (c *countingCandidateStore) TaskIDsWithTerminalWorktree(ctx context.Context
 	return c.inner.TaskIDsWithTerminalWorktree(ctx)
 }
 
+func (c *countingCandidateStore) FirstMalformedNonFinalJob(ctx context.Context) (string, error) {
+	atomic.AddInt32(&c.malformedOwner, 1)
+	return c.inner.FirstMalformedNonFinalJob(ctx)
+}
+
 // flakyCandidateStore returns an error on the first call to each candidate query and
 // the memoized success on every later call, counting total calls per query. It backs
 // TestTickCandidatesRetriesOnError's proof that tickCandidates memoizes SUCCESSES
 // only: a query that errors on one repo's pass must be re-attempted (not replayed as
 // the same error) on the next pass within the same tick.
 type flakyCandidateStore struct {
-	advanceCalls     int32
-	commentCalls     int32
-	reclaimCalls     int32
-	agedReclaimCalls int32
-	taskReclaimCalls int32
+	advanceCalls        int32
+	commentCalls        int32
+	reclaimCalls        int32
+	agedReclaimCalls    int32
+	taskReclaimCalls    int32
+	malformedOwnerCalls int32
 }
 
 var errCandidateTransient = errors.New("transient store fault")
@@ -930,4 +936,11 @@ func (s *flakyCandidateStore) TaskIDsWithTerminalWorktree(context.Context) ([]st
 		return nil, errCandidateTransient
 	}
 	return []string{"task-reclaim"}, nil
+}
+
+func (s *flakyCandidateStore) FirstMalformedNonFinalJob(context.Context) (string, error) {
+	if atomic.AddInt32(&s.malformedOwnerCalls, 1) == 1 {
+		return "", errCandidateTransient
+	}
+	return "malformed-job", nil
 }

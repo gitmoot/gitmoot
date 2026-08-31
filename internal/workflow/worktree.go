@@ -346,11 +346,10 @@ func (e Engine) ReclaimTerminalTaskWorktreeOutcome(ctx context.Context, home, ch
 		}
 		return outcome, fmt.Errorf("remove terminal task worktree %s: %w", path, err)
 	}
-	changed, err := e.Store.CompleteTerminalTaskWorktreeReclaim(opCtx, task.ID, path)
-	if err != nil {
+	if _, err := e.Store.CompleteTerminalTaskWorktreeReclaim(opCtx, task.ID, path); err != nil {
 		return outcome, err
 	}
-	outcome.Reclaimed = changed
+	outcome.Reclaimed = true
 	outcome.Classification = TaskWorktreeReclaimReclaimed
 	return outcome, nil
 }
@@ -1624,6 +1623,17 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktree(ctx context.Context, jobID
 	return err
 }
 
+func (e Engine) completeAgedTerminalFixWorktreeReclaim(ctx context.Context, jobID, path string) (bool, error) {
+	err := e.Store.AddJobEvent(context.WithoutCancel(ctx), db.JobEvent{
+		JobID: jobID, Kind: "delegation_worktree_reclaimed_ttl",
+		Message: fmt.Sprintf("aged terminal fix worktree %s reconciled after TTL", path),
+	})
+	if err == nil {
+		err = e.markDelegationCleanupRemoved(ctx, jobID, path)
+	}
+	return err == nil, err
+}
+
 // ReclaimAgedTerminalDelegationWorktreeOutcome is the reporting form used by
 // the daemon reclaim pass. reclaimed is false for every revalidation no-op and
 // true only after the path cleanup and reclaim event complete.
@@ -1689,6 +1699,11 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context
 		if err != nil || filepath.Clean(path) != filepath.Clean(expected) {
 			return false, fmt.Errorf("refusing TTL reclaim for unmanaged fix worktree %s", path)
 		}
+		if _, statErr := os.Lstat(path); os.IsNotExist(statErr) {
+			return e.completeAgedTerminalFixWorktreeReclaim(ctx, jobID, path)
+		} else if statErr != nil {
+			return false, fmt.Errorf("inspect aged terminal fix worktree %s: %w", path, statErr)
+		}
 		live, known := e.worktreeLiveness(path)
 		if !known || live {
 			return false, nil
@@ -1738,14 +1753,7 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context
 		if err := os.RemoveAll(path); err != nil {
 			return false, fmt.Errorf("remove aged terminal fix worktree %s: %w", path, err)
 		}
-		err = e.Store.AddJobEvent(context.WithoutCancel(ctx), db.JobEvent{
-			JobID: jobID, Kind: "delegation_worktree_reclaimed_ttl",
-			Message: fmt.Sprintf("aged terminal fix worktree %s removed after TTL", path),
-		})
-		if err == nil {
-			err = e.markDelegationCleanupRemoved(ctx, jobID, path)
-		}
-		return err == nil, err
+		return e.completeAgedTerminalFixWorktreeReclaim(ctx, jobID, path)
 	}
 	manager, ok := e.DelegationWorktrees.(ReadOnlyWorktreeManager)
 	if !ok || manager == nil {

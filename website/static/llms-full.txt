@@ -2796,7 +2796,9 @@ two-minute probe deadline, then removes the clone only when it is clean and its
 HEAD is still reachable from that refreshed remote branch immediately before
 removal. A branch absent from `origin` keeps the clone without treating the
 absence as a cleanup error, so TTL alone cannot discard local commits.
-`delegation_worktree_reclaimed_ttl` is recorded after removal. The dashboard
+An already-absent managed fix path completes the same bookkeeping instead of
+consuming retries or entering quarantine. `delegation_worktree_reclaimed_ttl`
+is recorded after removal or this already-absent reconciliation. The dashboard
 `/api/health` response exposes the same count, bytes, path, breakdown, and
 summary in its top-level `worktrees` field, including the number of cleanup
 obligations in terminal quarantine.

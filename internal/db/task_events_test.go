@@ -237,3 +237,50 @@ func TestTaskHasActiveWorktreeOwnerMatchesTaskOrPath(t *testing.T) {
 		t.Fatalf("FirstMalformedNonFinalJob = %q, want malformed-active", malformedJobID)
 	}
 }
+
+func TestCompleteTerminalTaskWorktreeReclaimClearsRemovedPathAfterStateTransition(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	const taskID = "task-reclaim-race"
+	const removedPath = "/worktrees/task-reclaim-race"
+	if err := store.UpsertTask(ctx, Task{
+		ID: taskID, State: "reviewing", WorktreePath: removedPath,
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+
+	changed, err := store.CompleteTerminalTaskWorktreeReclaim(ctx, taskID, removedPath)
+	if err != nil {
+		t.Fatalf("CompleteTerminalTaskWorktreeReclaim: %v", err)
+	}
+	if !changed {
+		t.Fatal("removed path was not cleared after lifecycle transition")
+	}
+	task, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("GetTask after completion: %v", err)
+	}
+	if task.WorktreePath != "" || task.State != "reviewing" {
+		t.Fatalf("task after completion = %+v, want reviewing with empty path", task)
+	}
+
+	const replacementPath = "/worktrees/task-reclaim-race-new"
+	task.WorktreePath = replacementPath
+	if err := store.UpsertTask(ctx, task); err != nil {
+		t.Fatalf("UpsertTask replacement: %v", err)
+	}
+	changed, err = store.CompleteTerminalTaskWorktreeReclaim(ctx, taskID, removedPath)
+	if err != nil {
+		t.Fatalf("CompleteTerminalTaskWorktreeReclaim replacement: %v", err)
+	}
+	if changed {
+		t.Fatal("completion cleared a concurrent path replacement")
+	}
+	task, err = store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("GetTask after replacement: %v", err)
+	}
+	if task.WorktreePath != replacementPath {
+		t.Fatalf("replacement path = %q, want %q", task.WorktreePath, replacementPath)
+	}
+}

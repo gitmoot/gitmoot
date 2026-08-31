@@ -365,9 +365,12 @@ func (s *Store) FirstMalformedNonFinalJob(ctx context.Context) (string, error) {
 	return id, err
 }
 
-// CompleteTerminalTaskWorktreeReclaim clears the exact still-terminal task/path
-// and journals the completed removal in one transaction. A concurrent recovery
-// or path replacement makes changed false and preserves the newer metadata.
+// CompleteTerminalTaskWorktreeReclaim clears the exact task/path after removal
+// and journals completion in one transaction. The caller holds the checkout
+// mutation lock and has already removed this path, so a concurrent lifecycle
+// transition must not leave a non-terminal task pointing at the removed tree.
+// A concurrent path replacement still makes changed false and preserves the
+// newer metadata.
 func (s *Store) CompleteTerminalTaskWorktreeReclaim(ctx context.Context, taskID, path string) (changed bool, err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -381,9 +384,8 @@ func (s *Store) CompleteTerminalTaskWorktreeReclaim(ctx context.Context, taskID,
 	result, err := tx.ExecContext(ctx, `UPDATE tasks
 		SET worktree_path = '', updated_at = CURRENT_TIMESTAMP
 		WHERE id = ?
-		  AND trim(worktree_path) = ?
-		  AND state IN (`+terminalTaskWorktreeStatePlaceholders+`)`,
-		terminalTaskWorktreeQueryArgs(strings.TrimSpace(taskID), strings.TrimSpace(path))...)
+		  AND trim(worktree_path) = ?`,
+		strings.TrimSpace(taskID), strings.TrimSpace(path))
 	if err != nil {
 		return false, err
 	}
