@@ -107,6 +107,9 @@ func TestLoadReviewConfigRejectsBadBool(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for non-bool native_fanout_enabled")
 	}
+	if ReviewConfigErrorsOnlyBlockingSeverity(err) {
+		t.Fatalf("bad native_fanout_enabled error was classified as a safe threshold fallback: %v", err)
+	}
 }
 
 func TestLoadReviewConfigRejectsBadBlockingSeverityWithoutDiscardingValidFields(t *testing.T) {
@@ -124,6 +127,9 @@ high_risk_paths = ["cmd/**"]
 	if policy.BlockingSeverity != reviewseverity.P3 || !policy.NativeFanoutEnabled || !policy.RiskTiersEnabled ||
 		len(policy.HighRiskPaths) != 1 || policy.HighRiskPaths[0] != "cmd/**" {
 		t.Fatalf("partial policy = %+v, want P3 with valid review fields retained", policy)
+	}
+	if !ReviewConfigErrorsOnlyBlockingSeverity(err) {
+		t.Fatalf("bad blocking severity error was not classified as fail-closed field recovery: %v", err)
 	}
 }
 
@@ -144,6 +150,9 @@ native_fanout_enabled = true
 	sensitive := cfg.For("owner/sensitive")
 	if sensitive.BlockingSeverity != reviewseverity.P3 || !sensitive.NativeFanoutEnabled {
 		t.Fatalf("sensitive repository policy = %+v, want fail-closed P3 with valid override retained", sensitive)
+	}
+	if !ReviewConfigErrorsOnlyBlockingSeverity(err) {
+		t.Fatalf("bad repository threshold error was not classified as fail-closed field recovery: %v", err)
 	}
 }
 

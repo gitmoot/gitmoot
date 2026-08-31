@@ -59,7 +59,9 @@ func RenderJobResultComment(comment JobResultComment) string {
 	}
 	if comment.Result != nil && strings.EqualFold(strings.TrimSpace(comment.JobType), "review") {
 		effective := effectiveReviewDecision(comment.Result, comment.ReviewBlockingSeverity)
-		if !strings.EqualFold(strings.TrimSpace(decision), strings.TrimSpace(effective)) {
+		rawDecision := strings.TrimSpace(comment.Result.Decision)
+		if strings.EqualFold(rawDecision, "changes_requested") &&
+			strings.EqualFold(strings.TrimSpace(effective), "approved") {
 			outcome := "`approved-with-notes`"
 			severity := strings.TrimSpace(comment.Result.Severity)
 			threshold := normalizedReviewBlockingSeverity(comment.ReviewBlockingSeverity)

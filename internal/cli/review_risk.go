@@ -16,16 +16,16 @@ import (
 
 // loadReviewConfig reads the global and repository-scoped [review] settings for
 // a `home` that may be either an already-resolved <home>/.gitmoot root or a raw
-// --home. Invalid fields keep their safe defaults without discarding valid
-// review settings. File-level read failures fall back to blocking severity P3,
-// with native fanout and risk tiers off.
+// --home. Invalid blocking_severity fields retain unrelated valid settings
+// because the parser replaces them with fail-closed P3. Any other parse or read
+// error rejects the policy and restores P3 with native fanout and risk tiers off.
 func loadReviewConfig(home string) config.ReviewConfig {
 	cfg := resolveConfigFile(home)
 	if cfg == "" {
 		return config.ReviewConfig{Global: config.DefaultReviewPolicy()}
 	}
 	policy, err := config.LoadReviewConfig(config.Paths{ConfigFile: cfg})
-	if err != nil && policy.Global.BlockingSeverity == "" {
+	if err != nil && !config.ReviewConfigErrorsOnlyBlockingSeverity(err) {
 		return config.ReviewConfig{Global: config.DefaultReviewPolicy()}
 	}
 	return policy

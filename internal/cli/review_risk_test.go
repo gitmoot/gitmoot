@@ -101,6 +101,31 @@ func TestApplyReviewPolicyInvalidSeverityRetainsValidSafetyPolicy(t *testing.T) 
 	}
 }
 
+func TestApplyReviewPolicyMalformedNonSeverityFieldFailsClosed(t *testing.T) {
+	home := t.TempDir()
+	root := config.PathsForHome(home).Home
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "[review]\nnative_fanout_enabled = true\nblocking_severity = \"P1\"\nrisk_tiers_enabled = maybe\n"
+	if err := os.WriteFile(filepath.Join(root, config.ConfigName), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var engine workflow.Engine
+	applyReviewPolicy(&engine, root)
+
+	if engine.RiskTiersEnabled {
+		t.Fatal("malformed review config must leave risk tiers off")
+	}
+	if engine.NativeReviewFanoutEnabled == nil || engine.NativeReviewFanoutEnabled("owner/repo") {
+		t.Fatal("malformed review config must leave native fanout off")
+	}
+	if engine.ReviewBlockingSeverity == nil ||
+		engine.ReviewBlockingSeverity("owner/repo") != reviewseverity.P3 {
+		t.Fatal("malformed review config must restore fail-closed P3")
+	}
+}
+
 func TestApplyReviewPolicyInvalidRepoSeverityOverridesPermissiveGlobal(t *testing.T) {
 	home := t.TempDir()
 	root := config.PathsForHome(home).Home

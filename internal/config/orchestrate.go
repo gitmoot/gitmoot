@@ -529,6 +529,59 @@ type ReviewConfig struct {
 	repos  map[string]reviewPolicyOverride
 }
 
+type reviewConfigFieldError struct {
+	section string
+	field   string
+	err     error
+}
+
+func (e *reviewConfigFieldError) Error() string {
+	return fmt.Sprintf("parse %s.%s: %v", e.section, e.field, e.err)
+}
+
+func (e *reviewConfigFieldError) Unwrap() error {
+	return e.err
+}
+
+// ReviewConfigErrorsOnlyBlockingSeverity reports whether every parse failure is
+// a blocking_severity field. Those failures are safe to retain because the
+// parser replaces that field with the fail-closed P3 default. Any other parse
+// failure makes the applied review policy ambiguous and must reject the file.
+func ReviewConfigErrorsOnlyBlockingSeverity(err error) bool {
+	if err == nil {
+		return false
+	}
+	seen := false
+	onlyBlockingSeverity := true
+	var visit func(error)
+	visit = func(current error) {
+		if current == nil {
+			return
+		}
+		if fieldErr, ok := current.(*reviewConfigFieldError); ok {
+			seen = true
+			if fieldErr.field != "blocking_severity" {
+				onlyBlockingSeverity = false
+			}
+			return
+		}
+		if joined, ok := current.(interface{ Unwrap() []error }); ok {
+			for _, child := range joined.Unwrap() {
+				visit(child)
+			}
+			return
+		}
+		if wrapped, ok := current.(interface{ Unwrap() error }); ok {
+			visit(wrapped.Unwrap())
+			return
+		}
+		seen = true
+		onlyBlockingSeverity = false
+	}
+	visit(err)
+	return seen && onlyBlockingSeverity
+}
+
 type reviewPolicyOverride struct {
 	nativeFanoutEnabled *bool
 	blockingSeverity    *string
@@ -592,13 +645,17 @@ func LoadReviewConfig(paths Paths) (ReviewConfig, error) {
 		value = strings.TrimSpace(value)
 		if repo == "" {
 			if err := applyReviewPolicyField(&cfg.Global, key, value); err != nil {
-				parseErrors = append(parseErrors, fmt.Errorf("parse [review].%s: %w", key, err))
+				parseErrors = append(parseErrors, &reviewConfigFieldError{
+					section: "[review]", field: key, err: err,
+				})
 			}
 			continue
 		}
 		override := cfg.repos[repo]
 		if err := applyReviewPolicyOverrideField(&override, key, value); err != nil {
-			parseErrors = append(parseErrors, fmt.Errorf("parse [repos.%q.review].%s: %w", repo, key, err))
+			parseErrors = append(parseErrors, &reviewConfigFieldError{
+				section: fmt.Sprintf("[repos.%q.review]", repo), field: key, err: err,
+			})
 		}
 		cfg.repos[repo] = override
 	}

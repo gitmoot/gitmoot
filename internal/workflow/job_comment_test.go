@@ -75,6 +75,22 @@ func TestRenderJobResultCommentExplainsApprovedWithNotes(t *testing.T) {
 	}
 }
 
+func TestRenderJobResultCommentNeverInfersApprovedWithNotesFromMissingDecision(t *testing.T) {
+	body := RenderJobResultComment(JobResultComment{
+		JobID:                  "review-missing-decision",
+		JobType:                "review",
+		JobState:               string(JobSucceeded),
+		ReviewBlockingSeverity: reviewseverity.P1,
+		Result:                 &AgentResult{Summary: "missing verdict"},
+	})
+	if !strings.Contains(body, "**Decision:** `unknown`") {
+		t.Fatalf("missing-decision comment lost unknown verdict:\n%s", body)
+	}
+	if strings.Contains(body, "**Review Outcome:**") {
+		t.Fatalf("missing-decision comment invented an approved-with-notes outcome:\n%s", body)
+	}
+}
+
 func TestRenderJobResultCommentRendersFindings(t *testing.T) {
 	body := RenderJobResultComment(JobResultComment{
 		AgentName: "researcher",
