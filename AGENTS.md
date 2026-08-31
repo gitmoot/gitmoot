@@ -317,6 +317,42 @@ live-probe before close. The **OWNER holds merge authority**. Under ultracode,
 orchestrate via the Workflow tool with opus sub-agents (protect the scarcer fable
 quota).
 
+## Workload mode
+
+**Current mode: DRAIN.**
+
+Update the line above whenever the owner switches modes. The mode changes how
+much work may start; it never relaxes correctness, exact-head review, CI, or
+owner merge authority.
+
+### Throughput mode
+
+- Start independent, issue-backed work when ownership and integration order are
+  clear.
+- Parallelize genuinely independent implementation and review lanes under the
+  repository's normal safety and review rules.
+- Stop opening new lanes when work queues behind shared files, unresolved
+  integration order, or repeated review findings.
+
+### Drain mode
+
+- Finish and merge the active queue; do not expand it. Do not start new issues,
+  PRs, experiments, speculative cleanup, or review panels unless a security,
+  data-loss, or live-service incident requires it.
+- Let work already in flight reach its next stable reviewed head. After that
+  wave, cap concurrency at **two implementation seats and one independent
+  reviewer**.
+- Use one independent reviewer per corrected head. Do not fan reviews out.
+- Prioritize merge-ready work and merge-gate integrity, then serial dependency
+  chains, then resource-safety work. Rebase conflicted branches only after
+  upstream merges settle. Keep drafts and backlog work parked.
+- If another correction receives a new substantive P1, stop the patch loop and
+  re-plan the defect class before writing more code.
+- Run routine coordinator check-ins hourly. Owner messages, directives, and
+  review verdicts remain immediate.
+- Zero-model-token operational pipelines, including the hourly PR report, may
+  continue.
+
 ## Escalation: ping your org parent, and ping again
 
 When you need something from your **org parent** — a dispatch you cannot make, a
