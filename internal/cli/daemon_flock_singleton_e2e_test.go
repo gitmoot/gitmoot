@@ -22,6 +22,12 @@ import (
 const daemonRunChildHomeEnv = "GITMOOT_TEST_DAEMON_RUN_CHILD_HOME"
 
 func TestMain(m *testing.M) {
+	if len(os.Args) > 1 && os.Args[1] == "sandbox-exec" {
+		// Review jobs wrap every runtime through the current executable. Under
+		// go test that executable is cli.test, so dispatch the hidden shim before
+		// m.Run instead of recursively starting the package suite.
+		os.Exit(Run(os.Args[1:], os.Stdout, os.Stderr))
+	}
 	if home := os.Getenv(daemonRunChildHomeEnv); home != "" {
 		os.Exit(Run([]string{"daemon", "run", "--home", home}, os.Stdout, os.Stderr))
 	}

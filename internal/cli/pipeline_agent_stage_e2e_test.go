@@ -5,10 +5,12 @@ import (
 	"context"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -268,7 +270,14 @@ func TestPipelineReviewStagesConcurrentWorktreesE2E(t *testing.T) {
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 
-	stateDir := t.TempDir()
+	toolCache, err := config.LoadToolCache(config.PathsForHome(home))
+	if err != nil {
+		t.Fatalf("load tool cache: %v", err)
+	}
+	stateDir := filepath.Join(toolCache.Dir, "review-rendezvous")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatalf("mkdir review rendezvous: %v", err)
+	}
 	// Root extractor approves instantly (no rendezvous), fanning out to two reviews.
 	seedDaemonWorkerAgentWithPolicy(t, store, "extractor", runtime.ShellRuntime,
 		pipelineStageResultCmd("approved", "extracted", nil),
@@ -372,7 +381,7 @@ func TestPipelineReviewStagesConcurrentWorktreesE2E(t *testing.T) {
 	for _, id := range []string{reva.JobID, revb.JobID} {
 		job, decision := terminalJobDecision(t, ctx, store, id)
 		if job.State != string(workflow.JobSucceeded) {
-			t.Fatalf("review stage %s state = %q, want succeeded (a serialized seat times out the rendezvous)", id, job.State)
+			t.Fatalf("review stage %s state = %q, want succeeded (a serialized seat times out the rendezvous); payload=%s", id, job.State, job.Payload)
 		}
 		if decision != "approved" {
 			t.Fatalf("review stage %s decision = %q, want approved (ran concurrently)", id, decision)
