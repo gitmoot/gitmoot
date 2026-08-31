@@ -200,6 +200,14 @@ type PipelineKeyAccess struct {
 	Mode   string `json:"mode"`
 }
 
+// ReviewScope is the bounded input for a follow-up review. PreviousHeadSHA is
+// always the exact head this reviewer last saw, never the PR base.
+type ReviewScope struct {
+	PreviousHeadSHA string   `json:"previous_head_sha"`
+	Findings        []string `json:"findings,omitempty"`
+	ChangedFiles    []string `json:"changed_files,omitempty"`
+}
+
 type JobRequest struct {
 	ID string
 	// PolicyExempt is enqueue-only policy routing; it is never persisted.
@@ -222,6 +230,7 @@ type JobRequest struct {
 	LeadAgent        string
 	Reviewers        []string
 	ReviewRound      string
+	ReviewScope      *ReviewScope
 	Sender           string
 	// ActingOrgRole attributes a fresh local dispatch to an organization role.
 	// It is persisted for audit provenance, then inherited by engine children.
@@ -384,32 +393,33 @@ type JobPayload struct {
 	PullRequestReady bool   `json:"pull_request_ready,omitempty"`
 	// PullRequestDraft is the forge-observed state, kept separate from requested
 	// intent so routing decisions consume what the forge actually reports.
-	PullRequestDraft        bool     `json:"pull_request_draft,omitempty"`
-	PullRequestDraftUnknown bool     `json:"pull_request_draft_unknown,omitempty"`
-	HeadSHA                 string   `json:"head_sha,omitempty"`
-	GoalID                  string   `json:"goal_id,omitempty"`
-	TaskID                  string   `json:"task_id"`
-	TaskTitle               string   `json:"task_title"`
-	LeadAgent               string   `json:"lead_agent,omitempty"`
-	Reviewers               []string `json:"reviewers,omitempty"`
-	ReviewRound             string   `json:"review_round,omitempty"`
-	Sender                  string   `json:"sender"`
-	ActingOrgRole           string   `json:"acting_org_role,omitempty"`
-	Instructions            string   `json:"instructions"`
-	Constraints             []string `json:"constraints"`
-	ParentJobID             string   `json:"parent_job_id,omitempty"`
-	DelegationID            string   `json:"delegation_id,omitempty"`
-	DelegationDepth         int      `json:"delegation_depth,omitempty"`
-	DelegatedBy             string   `json:"delegated_by,omitempty"`
-	RootJobID               string   `json:"root_job_id,omitempty"`
-	Deps                    []string `json:"deps,omitempty"`
-	JobTimeout              string   `json:"job_timeout,omitempty"`
-	RetryCount              int      `json:"retry_count,omitempty"`
-	Fingerprint             string   `json:"fingerprint,omitempty"`
-	FailurePolicy           string   `json:"failure_policy,omitempty"`
-	SynthesisRule           string   `json:"synthesis_rule,omitempty"`
-	DelegationArtifactDir   string   `json:"delegation_artifact_dir,omitempty"`
-	WorktreePath            string   `json:"worktree_path,omitempty"`
+	PullRequestDraft        bool         `json:"pull_request_draft,omitempty"`
+	PullRequestDraftUnknown bool         `json:"pull_request_draft_unknown,omitempty"`
+	HeadSHA                 string       `json:"head_sha,omitempty"`
+	GoalID                  string       `json:"goal_id,omitempty"`
+	TaskID                  string       `json:"task_id"`
+	TaskTitle               string       `json:"task_title"`
+	LeadAgent               string       `json:"lead_agent,omitempty"`
+	Reviewers               []string     `json:"reviewers,omitempty"`
+	ReviewRound             string       `json:"review_round,omitempty"`
+	ReviewScope             *ReviewScope `json:"review_scope,omitempty"`
+	Sender                  string       `json:"sender"`
+	ActingOrgRole           string       `json:"acting_org_role,omitempty"`
+	Instructions            string       `json:"instructions"`
+	Constraints             []string     `json:"constraints"`
+	ParentJobID             string       `json:"parent_job_id,omitempty"`
+	DelegationID            string       `json:"delegation_id,omitempty"`
+	DelegationDepth         int          `json:"delegation_depth,omitempty"`
+	DelegatedBy             string       `json:"delegated_by,omitempty"`
+	RootJobID               string       `json:"root_job_id,omitempty"`
+	Deps                    []string     `json:"deps,omitempty"`
+	JobTimeout              string       `json:"job_timeout,omitempty"`
+	RetryCount              int          `json:"retry_count,omitempty"`
+	Fingerprint             string       `json:"fingerprint,omitempty"`
+	FailurePolicy           string       `json:"failure_policy,omitempty"`
+	SynthesisRule           string       `json:"synthesis_rule,omitempty"`
+	DelegationArtifactDir   string       `json:"delegation_artifact_dir,omitempty"`
+	WorktreePath            string       `json:"worktree_path,omitempty"`
 	// RuntimePID is the exact subprocess started by the runtime runner for the
 	// current delivery. RuntimePIDStartTime is Linux /proc starttime field 22,
 	// captured at the same moment so liveness checks cannot mistake a recycled
@@ -662,6 +672,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		LeadAgent:              request.LeadAgent,
 		Reviewers:              compactStrings(request.Reviewers),
 		ReviewRound:            request.ReviewRound,
+		ReviewScope:            cloneReviewScope(request.ReviewScope),
 		Sender:                 request.Sender,
 		ActingOrgRole:          strings.TrimSpace(request.ActingOrgRole),
 		Instructions:           request.Instructions,
@@ -2222,6 +2233,17 @@ func compactStrings(values []string) []string {
 		}
 	}
 	return compacted
+}
+
+func cloneReviewScope(scope *ReviewScope) *ReviewScope {
+	if scope == nil {
+		return nil
+	}
+	return &ReviewScope{
+		PreviousHeadSHA: strings.TrimSpace(scope.PreviousHeadSHA),
+		Findings:        compactStrings(scope.Findings),
+		ChangedFiles:    compactStrings(scope.ChangedFiles),
+	}
 }
 
 func compactPipelineKeyAccess(values []PipelineKeyAccess) []PipelineKeyAccess {

@@ -653,6 +653,16 @@ func (e Engine) commitDelegationLeg(ctx context.Context, job db.Job, payload Job
 	return nil
 }
 
+// PullRequestFetcher fetches a pull request's head ref (pull/<n>/head) into the
+// bound checkout. It is an OPTIONAL capability of a worktree manager: the
+// checkout-bound gitutil.Client satisfies it, an in-memory test manager need
+// not. The read-only fan-out allocation below uses it to recover a cold
+// checkout that lacks the exact PR head object, matching the fetch-then-retry
+// the two other exact-head allocation sites already perform.
+type PullRequestFetcher interface {
+	FetchPullRequest(ctx context.Context, remote string, number int) error
+}
+
 // allocateAndEnqueueDelegation allocates the per-delegation worktree (or branch
 // lock) for implement delegations and enqueues the prepared request, recording a
 // delegation_enqueued event. It is shared by enqueueDelegation (initial/deferred
@@ -757,47 +767,99 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 			})
 		}
 	} else if readOnlyFanoutNeedsWorktree(payload, d) {
+		// Only a REVIEW child runs at the coordinator's exact head: its verdict
+		// names a commit, so both the detached worktree and the payload binding are
+		// pinned to that SHA. Every other read-only action (ask) is a question about
+		// the branch as it stands and takes the branch tip, which is the same line
+		// the CLI dispatch path draws (internal/cli/agent_dispatch.go clears the
+		// inherited HeadSHA whenever request.Action != "review", because an ask
+		// worktree is the committed tip of the checkout and may legitimately have
+		// advanced past the head it inherited).
+		pinExactHead := delegationPinsExactHead(request)
+		baseRef := strings.TrimSpace(payload.Branch)
+		if pinExactHead {
+			baseRef = strings.TrimSpace(payload.HeadSHA)
+		}
 		// Read-only fan-out: >=2 read-only siblings share the parent repo and would
 		// otherwise serialize on the repo:<repo> checkout key (only one runs per
 		// daemon tick). Give this child its own detached, branch-lock-free worktree
 		// so its checkout key is worktree:<path> and the siblings run concurrently.
 		if manager, ok := e.DelegationWorktrees.(ReadOnlyWorktreeManager); !ok || strings.TrimSpace(e.Home) == "" {
-			// Isolation is unavailable (no Home/worktree manager, or the manager
-			// cannot create detached worktrees): the siblings fall back to the shared
-			// checkout and serialize. Emit a parent event so the loss of parallelism
-			// is observable rather than silent.
+			kind := "delegation_worktree_skipped"
+			message := fmt.Sprintf("delegation %q read-only fan-out runs serialized in the shared checkout: detached worktree isolation unavailable", request.DelegationID)
+			if delegationWorkerAllocatesExactHeadWorktree(request) {
+				kind = "delegation_worktree_deferred"
+				message = fmt.Sprintf("delegation %q exact-head worktree allocation deferred to the job worker; shared-checkout delivery remains forbidden", request.DelegationID)
+			}
 			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
 				JobID:   job.ID,
-				Kind:    "delegation_worktree_skipped",
-				Message: fmt.Sprintf("delegation %q read-only fan-out runs serialized in the shared checkout: detached worktree isolation unavailable", request.DelegationID),
+				Kind:    kind,
+				Message: message,
 			})
 		} else {
-			path, err := e.AllocateReadOnlyDelegationWorktree(ctx, DelegationWorktreeRequest{
-				Home:         e.Home,
-				Repo:         request.Repo,
-				ParentJobID:  job.ID,
-				DelegationID: request.DelegationID,
-				Delegation:   d,
-				BaseBranch:   payload.Branch,
-				Checkout:     e.DelegationCheckout,
-				RetryAttempt: request.RetryCount,
-			}, manager)
+			allocate := func() (string, error) {
+				return e.AllocateReadOnlyDelegationWorktree(ctx, DelegationWorktreeRequest{
+					Home:         e.Home,
+					Repo:         request.Repo,
+					ParentJobID:  job.ID,
+					DelegationID: request.DelegationID,
+					Delegation:   d,
+					BaseBranch:   baseRef,
+					Checkout:     e.DelegationCheckout,
+					RetryAttempt: request.RetryCount,
+				}, manager)
+			}
+			path, err := allocate()
 			if err != nil {
 				var blocked BlockedError
 				if errors.As(err, &blocked) {
 					return e.block(ctx, ref, blocked.Reason)
 				}
-				return err
+				// A cold checkout may not carry the PR commit object even though the
+				// forge supplied its SHA, and nothing in the daemon poll/dispatch path
+				// fetches it. `git worktree add --detach <sha>` then fails with
+				// "invalid reference", and the fan-out loop returns on the FIRST
+				// sibling (dispatchDelegations), stranding the coordinator with ZERO
+				// children on an advance that retries to the same result. Both other
+				// exact-head allocation sites carry a pull/<n>/head fetch retry for
+				// exactly this reason (maybeAllocateDispatchReadOnlyWorktree and
+				// prepareNativeReviewWorktreeForRunner); keep this one aligned.
+				//
+				// Scoped to the exact-head case only, so no other path changes: a
+				// branch-tip baseRef is a local ref, and a lock-wait BlockedError above
+				// keeps its existing fail-closed block (a fetch cannot help it).
+				fetcher, canFetch := manager.(PullRequestFetcher)
+				if !canFetch || !pinExactHead || payload.PullRequest <= 0 {
+					return err
+				}
+				if fetchErr := fetcher.FetchPullRequest(ctx, "origin", payload.PullRequest); fetchErr != nil {
+					return fmt.Errorf("allocate read-only fan-out worktree for delegation %q: %w; fetch PR ref: %v", request.DelegationID, err, fetchErr)
+				}
+				_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+					JobID:   job.ID,
+					Kind:    "delegation_worktree_pr_ref_fetched",
+					Message: fmt.Sprintf("delegation %q exact-head worktree retried after fetching pull/%d/head into the cold checkout", request.DelegationID, payload.PullRequest),
+				})
+				path, err = allocate()
+				if err != nil {
+					if errors.As(err, &blocked) {
+						return e.block(ctx, ref, blocked.Reason)
+					}
+					return fmt.Errorf("allocate read-only fan-out worktree for delegation %q after fetch: %w", request.DelegationID, err)
+				}
 			}
 			request.WorktreePath = path
 			switch strings.TrimSpace(request.Action) {
 			case "ask", "review":
 				request.ReadOnlySeat = true
 			}
-			// The detached worktree is created at the parent base-branch tip, which
-			// may have advanced past the inherited HeadSHA. Clear it so the child
-			// validates against its own fresh worktree HEAD (see isDelegationWorktreeChild).
-			request.HeadSHA = ""
+			// A review child stays pinned to the exact parent head this detached
+			// worktree was created at. Every other read-only child was allocated off
+			// the branch tip above, so the inherited head is not what it is looking
+			// at: clear it and let the child validate its own worktree HEAD instead.
+			if !pinExactHead {
+				request.HeadSHA = ""
+			}
 			// The worktree is the committed tip: it omits gitignored (repos/**) and
 			// uncommitted working-tree files. Point the child at the canonical base
 			// checkout so an analysis task does not silently report working-tree state
@@ -821,6 +883,41 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 		Message: fmt.Sprintf("delegation %q enqueued as job %s", request.DelegationID, request.ID),
 	})
 	return nil
+}
+
+// delegationPinsExactHead reports whether a read-only fan-out child must be
+// allocated at, and bound to, the coordinator's exact head instead of the branch
+// tip. Only a review qualifies: its verdict names a commit. The discriminator is
+// the ACTION, matching internal/cli/agent_dispatch.go, which clears the inherited
+// HeadSHA for every dispatch whose `request.Action != "review"`. The comparison
+// is byte-exact rather than case-folded because the downstream consumers are
+// themselves byte-exact on the same string: the daemon's `job.Type != "review"`
+// gate, and job.Type is request.Action verbatim (mailbox.go).
+func delegationPinsExactHead(request JobRequest) bool {
+	return request.Action == "review" && strings.TrimSpace(request.HeadSHA) != ""
+}
+
+// delegationWorkerAllocatesExactHeadWorktree mirrors, conjunct for conjunct, the
+// daemon worker's prepareNativeReviewWorktreeForRunner gate
+// (internal/cli/daemon_checkout.go): job.Type == "review", PullRequest > 0, a
+// non-empty HeadSHA, a non-empty ReviewRound, and at least one reviewer. Every
+// field is read off the CHILD's own request, which is what the worker will see as
+// its payload (job.Type is request.Action verbatim). The gate's sixth conjunct —
+// an empty WorktreePath — holds by construction at the only call site: it runs
+// exactly when no dispatch-time worktree could be allocated.
+//
+// It exists so the audit record tells the truth. Keyed on HeadSHA alone, the
+// engine recorded "deferred to the job worker; shared-checkout delivery remains
+// forbidden" for two classes the worker gate rejects outright — an `ask` child
+// (job.Type "ask") and a review child of a non-review coordinator (blank
+// ReviewRound, no Reviewers) — both of which then ran in the shared checkout the
+// event called forbidden.
+func delegationWorkerAllocatesExactHeadWorktree(request JobRequest) bool {
+	return request.Action == "review" &&
+		request.PullRequest > 0 &&
+		strings.TrimSpace(request.HeadSHA) != "" &&
+		strings.TrimSpace(request.ReviewRound) != "" &&
+		len(request.Reviewers) > 0
 }
 
 // requeueDelegation re-enqueues a failed delegation child as a fresh job when

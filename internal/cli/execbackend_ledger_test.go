@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
@@ -30,10 +31,10 @@ func TestProvisionExecutionBackendPreservesInstanceOnProvisionError(t *testing.T
 	inner := &ledgerTestBackend{provision: func(execbackend.JobScope) (*execbackend.Instance, error) {
 		return instance, errors.New("persist running row")
 	}}
-	worker := jobWorker{ExecutionBackendFactory: func(execbackend.Backend) (execbackend.ExecutionBackend, error) {
+	worker := jobWorker{ExecutionBackendFactory: func(_ execbackend.Backend, _ config.RemoteExecConfig) (execbackend.ExecutionBackend, error) {
 		return inner, nil
 	}}
-	lifecycle, got, lease, env, err := worker.provisionExecutionBackend(context.Background(), execbackend.Remote, "shell", db.Job{ID: instance.JobID}, time.Minute, "/checkout")
+	lifecycle, got, lease, env, err := worker.provisionExecutionBackend(context.Background(), execbackend.Remote, executionBackendConfigForTest(t, worker), "shell", db.Job{ID: instance.JobID}, time.Minute, "/checkout")
 	if err == nil || !strings.Contains(err.Error(), "persist running row") {
 		t.Fatalf("provision error = %v", err)
 	}

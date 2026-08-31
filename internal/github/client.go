@@ -389,9 +389,16 @@ type CombinedStatus struct {
 }
 
 type CompareResult struct {
-	Status   string `json:"status"`
-	AheadBy  int    `json:"ahead_by"`
-	BehindBy int    `json:"behind_by"`
+	Status   string            `json:"status"`
+	AheadBy  int               `json:"ahead_by"`
+	BehindBy int               `json:"behind_by"`
+	Files    []PullRequestFile `json:"files"`
+	// Truncated reports that Files is demonstrably INCOMPLETE for this range:
+	// the compare endpoint returned its 300-file maximum and CompareCommits
+	// could not recover the remainder. It is computed by CompareCommits and
+	// deliberately never decoded from a payload, so no API response can claim
+	// a file list is complete when it is not.
+	Truncated bool `json:"-"`
 }
 
 type CommitStatusInput struct {
@@ -1078,9 +1085,14 @@ func (c *GhClient) UpdatePullRequestBranch(ctx context.Context, input UpdatePull
 	return response, nil
 }
 
+// GetCombinedStatus reads the combined commit status for a ref. per_page=100
+// matches ListCheckRunsForRef below: GitHub returns at most 30 statuses by
+// default, and a truncated page makes a real gitmoot/merge-gate verdict look
+// ABSENT to callers, which now causes a marker WRITE over that verdict rather
+// than a harmless no-op (#1714 round-8 review).
 func (c *GhClient) GetCombinedStatus(ctx context.Context, repo Repository, ref string) (CombinedStatus, error) {
 	var status CombinedStatus
-	err := c.apiJSON(ctx, false, &status, endpoint(repo, "commits", ref, "status"))
+	err := c.apiJSON(ctx, false, &status, endpoint(repo, "commits", ref, "status")+"?per_page=100")
 	return status, err
 }
 
@@ -1147,10 +1159,49 @@ func (c *GhClient) WorkflowsExistAtRef(ctx context.Context, repo Repository, ref
 	return false, err
 }
 
+// compareFilesCap is GitHub's hard ceiling on the compare endpoint's `files`
+// array. Per the REST reference for "Compare two commits": "The list of changed
+// files is only shown on the FIRST page of results, and it includes up to 300
+// changed files FOR THE ENTIRE COMPARISON."
+// (https://docs.github.com/en/rest/commits/commits#compare-two-commits)
+//
+// So `page`/`per_page` page the COMMITS array only; page 2 of a compare carries
+// no `files` at all, and merging pages cannot recover a capped file list. There
+// is no second hosted enumeration that can witness its own completeness either:
+//
+//   - The payload carries no total-file count (`status`, `ahead_by`, `behind_by`,
+//     `total_commits`, `commits`, `files` and the URL fields are all of it), so
+//     a list cannot be checked against a declared size.
+//   - The `application/vnd.github.diff` media type is NOT capped at 300 — it
+//     enumerated 1360 of 1360 files for a 909-commit gitmoot range (22.5 MB) —
+//     but it truncates SILENTLY. Measured against api.github.com on 2026-08-31,
+//     five identical requests for torvalds/linux v6.5...v6.6 returned HTTP 200
+//     with a self-consistent Content-Length and 8451, 12792, 13158, 13279 and
+//     13897 `diff --git` headers respectively. A truncated diff still names
+//     every path the capped JSON page named, so cross-checking the two sources
+//     reports "complete" on a body that is provably missing thousands of files.
+//
+// A capped page is therefore reported as Truncated, and completeness is
+// established out of band from a local checkout (see wireReviewChangedFiles).
+const compareFilesCap = 300
+
+// CompareCommits reports the base...head comparison. `Files` carries at most
+// compareFilesCap entries because GitHub caps the compare payload there, and
+// Truncated says exactly that: no compare response proves its own file list is
+// the whole range, so a capped page is flagged rather than presented as
+// complete. Callers needing a complete list (review scoping) prove completeness
+// from a local checkout and fail closed on the flag; callers reading only the
+// object-level status (the merge gate's branch-freshness check) must not start
+// erroring on large diffs, so the cap is never an error and never a second
+// request.
 func (c *GhClient) CompareCommits(ctx context.Context, repo Repository, base string, head string) (CompareResult, error) {
 	var result CompareResult
-	err := c.apiJSON(ctx, false, &result, endpoint(repo, "compare", url.PathEscape(base+"..."+head)))
-	return result, err
+	path := endpoint(repo, "compare", url.PathEscape(base+"..."+head))
+	if err := c.apiJSON(ctx, false, &result, path); err != nil {
+		return CompareResult{}, err
+	}
+	result.Truncated = len(result.Files) >= compareFilesCap
+	return result, nil
 }
 
 func (c *GhClient) ListPullRequestChecks(ctx context.Context, repo Repository, number int64) ([]PullRequestCheck, error) {

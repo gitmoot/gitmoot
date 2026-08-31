@@ -33,7 +33,7 @@ type remoteCredentialGatewayPlan struct {
 // prepareRemoteCredentialGateway performs every check that can fail before a
 // billed sandbox exists. It starts only the host listener and does not read the
 // upstream provider credential.
-func (w jobWorker) prepareRemoteCredentialGateway(ttl time.Duration) (remoteCredentialGatewayPlan, error) {
+func (w jobWorker) prepareRemoteCredentialGateway(remoteCfg config.RemoteExecConfig, ttl time.Duration) (remoteCredentialGatewayPlan, error) {
 	paths, err := w.configPaths()
 	if err != nil {
 		return remoteCredentialGatewayPlan{}, err
@@ -47,10 +47,6 @@ func (w jobWorker) prepareRemoteCredentialGateway(ttl time.Duration) (remoteCred
 	}
 	if !credentialsCfg.ModelGateway {
 		return remoteCredentialGatewayPlan{}, nil
-	}
-	remoteCfg, err := w.executionBackendConfig()
-	if err != nil {
-		return remoteCredentialGatewayPlan{}, err
 	}
 	if strings.TrimSpace(remoteCfg.CredentialGatewayListen) == "" || strings.TrimSpace(remoteCfg.CredentialGatewayURL) == "" {
 		return remoteCredentialGatewayPlan{}, errors.New("remote model gateway requires [remote_exec].credential_gateway_listen and credential_gateway_url")

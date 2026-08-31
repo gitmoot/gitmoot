@@ -299,6 +299,7 @@ func TestRunMergeGateNonDeferredNotReadyStillBlocks(t *testing.T) {
 func TestEngineHarvestsChangesRequestedOnce(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
+	enableAutoFix(t, store, 7)
 	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
 	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
 	engine := testEngine(store)

@@ -173,6 +173,10 @@ func LoadOrg(paths Paths) (OrgConfig, error) {
 		}
 		return OrgConfig{}, err
 	}
+	return parseOrgContent(content)
+}
+
+func parseOrgContent(content []byte) (OrgConfig, error) {
 	cfg := OrgConfig{roles: map[string]OrgRole{}}
 	roleFields := map[string]map[string]bool{}
 	seenOrgSection := false

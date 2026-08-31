@@ -126,12 +126,13 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 		})
 		pane, present := paneByID[paneID]
 		if !present {
+			ambiguous := len(labelToPaneIDs[binding]) > 1
 			detail := fmt.Sprintf("no Herdr pane bound as %q", binding)
-			if len(labelToPaneIDs[binding]) > 1 {
+			if ambiguous {
 				detail = fmt.Sprintf("multiple Herdr panes labeled %q", binding)
 			}
 			states[role.Name] = org.RoleLiveState{State: org.StateUnknown, Detail: detail}
-			bindings[role.Name] = org.PaneBinding{Detail: detail}
+			bindings[role.Name] = org.PaneBinding{Detail: detail, Ambiguous: ambiguous}
 			continue
 		}
 		states[role.Name] = mapHerdrPaneState(pane)

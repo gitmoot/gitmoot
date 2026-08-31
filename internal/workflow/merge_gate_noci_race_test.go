@@ -63,7 +63,7 @@ func TestPolicyMergeGateZeroExternalCIDefersWithinGraceWindow(t *testing.T) {
 	if len(gh.merges) != 0 {
 		t.Fatalf("zero-CI gate within the grace window issued a merge: merges=%+v", gh.merges)
 	}
-	if !hasStatus(gh.statuses, gitmootMergeGateContext, "pending") {
+	if !hasStatus(gh.statuses, GitmootMergeGateContext, "pending") {
 		t.Fatalf("statuses = %+v, want a pending gitmoot/merge-gate stamp", gh.statuses)
 	}
 	if gh.prCheckCalls != 0 || len(gh.checkRefs) != 2 ||

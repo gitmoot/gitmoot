@@ -55,8 +55,9 @@ type jobWorker struct {
 	// ExecutionBackendFactory is nil on hand-built/test workers that intentionally
 	// retain the pre-P2b host-only path. executionBackendJobWorker wires it for
 	// real daemon jobs, where one lifecycle instance is acquired after runtime
-	// admission and kept alive through every Mailbox delivery attempt.
-	ExecutionBackendFactory func(execbackend.Backend) (execbackend.ExecutionBackend, error)
+	// admission and kept alive through every Mailbox delivery attempt. The factory
+	// must consume the same config snapshot used for preflight.
+	ExecutionBackendFactory func(execbackend.Backend, config.RemoteExecConfig) (execbackend.ExecutionBackend, error)
 	// GITMOOT-IMPL: RemoteEnvdEndpointResolver is an offline-test seam. Production leaves it
 	// nil and resolves envd from [remote_exec].e2b_domain or the provider response.
 	RemoteEnvdEndpointResolver func(sandboxID string, port int) string
@@ -205,18 +206,20 @@ func executionBackendJobWorker(store *db.Store, stdout io.Writer, home string) j
 	// set stranded by a switch to remote, then reconcile the configured provider.
 	// The attempts are independent so a local disk failure cannot suppress remote
 	// account reconciliation (or vice versa).
-	startupBackends := []execbackend.Backend{execbackend.Local}
-	if cfg, err := worker.executionBackendConfig(); err != nil {
+	cfg, err := worker.executionBackendConfig()
+	if err != nil {
 		writeLine(stdout, "execution backend startup config failed: %v", err)
 		return worker
-	} else if configured, err := execbackend.ParseImplemented(cfg.Backend); err != nil {
+	}
+	startupBackends := []execbackend.Backend{execbackend.Local}
+	if configured, err := execbackend.ParseImplemented(cfg.Backend); err != nil {
 		writeLine(stdout, "execution backend startup config failed: %v", err)
 		return worker
 	} else if configured != execbackend.Local {
 		startupBackends = append(startupBackends, configured)
 	}
 	for _, backend := range startupBackends {
-		if _, err := worker.ExecutionBackendFactory(backend); err != nil {
+		if _, err := worker.ExecutionBackendFactory(backend, cfg); err != nil {
 			writeLine(stdout, "execution backend startup reap failed for %s: %v", backend, err)
 		}
 	}
@@ -235,7 +238,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// runtime below, so delaying this decision until after agent lookup would let
 	// them bypass the backend boundary entirely.
 	jobExecBackend, jobExecBackendPresent := payload.ExecBackendOverride()
-	execBackend, err := daemonJobExecBackendFor(w, jobExecBackend, jobExecBackendPresent)
+	execBackend, execConfig, err := daemonJobExecBackendFor(w, jobExecBackend, jobExecBackendPresent)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
@@ -349,7 +352,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	agent.ExecBackend = string(execBackend)
 	applyReadOnlySeat(payload.ReadOnlySeat && !payload.MootSeat, payload.RuntimeConfigDir, &agent)
 	preflightRequest := runtime.RuntimeContractRequest{Plan: payload.Plan}
-	if result, checked, preflightErr := w.runtimeContractPreflight(ctx, execBackend, agent, preflightRequest); preflightErr != nil {
+	if result, checked, preflightErr := w.runtimeContractPreflight(ctx, execBackend, execConfig, agent, preflightRequest); preflightErr != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, preflightErr); finishErr != nil {
 			return finishErr
 		}
@@ -410,6 +413,48 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			return err
 		}
 		return nil
+	}
+	nativeReviewDeliveryStarted := false
+	payload, err = w.prepareNativeReviewWorktreeForRunner(ctx, job, payload, jobRunner)
+	if err != nil {
+		// An exact-head allocation that spent its checkout-mutation-lock budget is
+		// TRANSIENT: the holder is another worker's short shared-.git op. Terminally
+		// failing the leg here BURNED the verdict — the payload is left unmutated, so
+		// the next poll's re-enqueue matches it and is a silent no-op, and
+		// FindRepeatedReviewers only re-enlists SUCCEEDED verdicts, so nothing ever
+		// re-attempts it. Hold the still-queued leg for re-dispatch instead, exactly
+		// like the checkout-preflight site below. Every other allocation failure (a
+		// missing commit object, an unwritable path) is unclassified and keeps the
+		// terminal path, and the hold itself is bounded by maxOperationalBlockerRetries.
+		//
+		// This site uses deferPreDeliveryAllocationContention rather than the general
+		// helper because a high-risk LENS CHILD reaches this same path-less fallback
+		// (TestNativeReviewWorktreePreparationCoversHighRiskLensChild), and the general
+		// helper's delegation-child exclusion would route it to
+		// finishQueuedJob(JobFailed) → finalizePreflightDelegationChild, advancing the
+		// delegation DAG with a synthetic `failed` verdict on a lock another worker
+		// holds for a sub-second op. The narrowing is typed and pre-delivery only; see
+		// the helper's own comment for why that is the safe boundary.
+		if deferred, deferErr := w.deferPreDeliveryAllocationContention(ctx, job, payload, err); deferErr != nil {
+			writeLine(w.Stdout, "job %s review-worktree contention deferral failed: %v", job.ID, deferErr)
+		} else if deferred {
+			writeLine(w.Stdout, "job %s deferred on review-worktree contention: %v", job.ID, err)
+			return nil
+		}
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
+		return nil
+	}
+	nativeReviewWorktreeOwned := payload.ReadOnlyWorktree && strings.TrimSpace(payload.WorktreePath) != ""
+	if nativeReviewWorktreeOwned {
+		defer func() {
+			if nativeReviewDeliveryStarted {
+				return
+			}
+			w.cleanupUndeliveredNativeReviewWorktree(context.WithoutCancel(ctx), job.ID, payload, jobRunner)
+		}()
 	}
 	checkout, err := w.checkoutForJob(ctx, job, payload, agent, jobRunner)
 	if err != nil {
@@ -635,7 +680,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// delivery and is destroyed synchronously on every return path. Host checkout,
 	// git, observation, and finalization remain on checkout/jobRunner; only runtime
 	// delivery executes in the distinct backend workspace.
-	lifecycle, instance, credentialLease, credentialEnv, lifecycleErr := w.provisionExecutionBackend(ctx, execBackend, agent.Runtime, job, jobTimeout+runtimeLeaseTeardownGrace, checkout)
+	lifecycle, instance, credentialLease, credentialEnv, lifecycleErr := w.provisionExecutionBackend(ctx, execBackend, execConfig, agent.Runtime, job, jobTimeout+runtimeLeaseTeardownGrace, checkout)
 	if instance != nil {
 		defer w.destroyExecutionBackend(job.ID, lifecycle, instance)
 	}
@@ -898,6 +943,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			<-done
 		}
 	}
+	nativeReviewDeliveryStarted = true
 	_, err = engine.RunJob(runCtx, job.ID, agent, adapter)
 	stopKillPending()
 	stopProgress()
@@ -959,6 +1005,23 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	_ = w.postJobResultComment(ctx, job.ID, agent, checkout, nil)
 	writeLine(w.Stdout, "job %s completed", job.ID)
 	return nil
+}
+
+func (w jobWorker) cleanupUndeliveredNativeReviewWorktree(ctx context.Context, jobID string, payload workflow.JobPayload, runner subprocess.Runner) {
+	job, err := w.Store.GetJob(ctx, jobID)
+	if err != nil {
+		writeLine(w.Stdout, "job %s native review pre-delivery cleanup lookup failed: %v", jobID, err)
+		return
+	}
+	switch workflow.JobState(job.State) {
+	case workflow.JobFailed, workflow.JobCancelled:
+	default:
+		return
+	}
+	engine := w.workflowForJob(strings.TrimSpace(payload.WorktreePath), runner)
+	if err := engine.ReclaimTerminalDelegationWorktree(ctx, jobID); err != nil {
+		writeLine(w.Stdout, "job %s native review pre-delivery cleanup failed: %v", jobID, err)
+	}
 }
 
 const implementationPreflightAttemptLimit = 3
@@ -1066,9 +1129,15 @@ func runtimeContractPreflightForBackend(backend execbackend.Backend, local func(
 	return consumed.contract, consumed.checked, err
 }
 
-func (w jobWorker) runtimeContractPreflight(ctx context.Context, backend execbackend.Backend, agent runtime.Agent, request runtime.RuntimeContractRequest) (runtime.RuntimeContractResult, bool, error) {
+func (w jobWorker) runtimeContractPreflight(ctx context.Context, backend execbackend.Backend, cfg config.RemoteExecConfig, agent runtime.Agent, request runtime.RuntimeContractRequest) (runtime.RuntimeContractResult, bool, error) {
 	if w.RuntimePreflight == nil {
 		return runtime.RuntimeContractResult{}, false, nil
+	}
+	if backend == execbackend.Local && w.ExecutionBackendFactory != nil {
+		if identity := cfg.LocalIdentity(); identity != nil {
+			request.EffectiveUID = int(identity.UID)
+			request.EffectiveUIDKnown = true
+		}
 	}
 	result, checked, err := runtimeContractPreflightForBackend(backend, func() runtime.RuntimeContractResult {
 		return w.RuntimePreflight(ctx, agent, request)
@@ -1931,30 +2000,20 @@ func (w jobWorker) parallelSessionPolicy() (config.ParallelSessionPolicy, error)
 // plumbing. A missing config file or section resolves to local; an unknown
 // value (config or override) is a hard error naming the value and the allowed
 // set — the fail-loud contract, never a silent fallback.
-func (w jobWorker) resolveExecBackend(jobOverride string, jobOverridePresent bool) (execbackend.Backend, error) {
-	cfg := config.DefaultRemoteExecConfig()
-	if w.ConfigHomeExplicit || strings.TrimSpace(w.ConfigHome) != "" {
-		paths, err := w.configPaths()
-		if err != nil {
-			return "", err
-		}
-		loaded, loadErr := config.LoadRemoteExecConfig(paths)
-		switch {
-		case loadErr == nil:
-			cfg = loaded
-		case errors.Is(loadErr, os.ErrNotExist):
-			// No config file: the local default applies.
-		default:
-			return "", fmt.Errorf("load [remote_exec] config: %w", loadErr)
-		}
+func (w jobWorker) resolveExecBackend(jobOverride string, jobOverridePresent bool) (execbackend.Backend, config.RemoteExecConfig, error) {
+	cfg, err := w.executionBackendConfig()
+	if err != nil {
+		return "", config.RemoteExecConfig{}, err
 	}
 	if jobOverridePresent {
-		return execbackend.Resolve(cfg.Backend, &jobOverride)
+		backend, err := execbackend.Resolve(cfg.Backend, &jobOverride)
+		return backend, cfg, err
 	}
-	return execbackend.Resolve(cfg.Backend, nil)
+	backend, err := execbackend.Resolve(cfg.Backend, nil)
+	return backend, cfg, err
 }
 
-var daemonJobExecBackendFor = func(w jobWorker, jobOverride string, jobOverridePresent bool) (execbackend.Backend, error) {
+var daemonJobExecBackendFor = func(w jobWorker, jobOverride string, jobOverridePresent bool) (execbackend.Backend, config.RemoteExecConfig, error) {
 	return w.resolveExecBackend(jobOverride, jobOverridePresent)
 }
 
@@ -3399,7 +3458,7 @@ func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 	}
 	agent := runtimeAgent(dbAgent)
 	jobBackend, jobBackendPresent := payload.ExecBackendOverride()
-	backend, err := daemonJobExecBackendFor(w, jobBackend, jobBackendPresent)
+	backend, _, err := daemonJobExecBackendFor(w, jobBackend, jobBackendPresent)
 	if err != nil {
 		return w.recordAdvanceRetryOnce(ctx, job.ID, "post-delivery workflow retry backend resolution failed: "+err.Error())
 	}

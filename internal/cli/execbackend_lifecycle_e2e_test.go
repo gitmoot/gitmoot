@@ -77,16 +77,23 @@ func (*localProvisionBackend) Destroy(context.Context, *execbackend.Instance) er
 
 func TestProvisionExecutionBackendLocalBehaviorUnchanged(t *testing.T) {
 	backend := &localProvisionBackend{}
-	worker := jobWorker{ExecutionBackendFactory: func(got execbackend.Backend) (execbackend.ExecutionBackend, error) {
+	uid, gid := uint32(996), uint32(986)
+	cfg := config.DefaultRemoteExecConfig()
+	cfg.LocalUID, cfg.LocalGID = &uid, &gid
+	worker := jobWorker{ExecutionBackendFactory: func(got execbackend.Backend, gotCfg config.RemoteExecConfig) (execbackend.ExecutionBackend, error) {
 		if got != execbackend.Local {
 			t.Fatalf("factory backend = %q, want %q", got, execbackend.Local)
+		}
+		identity := gotCfg.LocalIdentity()
+		if identity == nil || identity.UID != uid || identity.GID != gid {
+			t.Fatalf("factory config identity = %+v, want uid %d gid %d", identity, uid, gid)
 		}
 		return backend, nil
 	}}
 	job := db.Job{ID: "local-credential-gate", LifecycleGeneration: 4}
 
 	const ttl = 9 * time.Minute
-	lifecycle, instance, lease, env, err := worker.provisionExecutionBackend(context.Background(), execbackend.Local, runtime.ShellRuntime, job, ttl, "/checkout")
+	lifecycle, instance, lease, env, err := worker.provisionExecutionBackend(context.Background(), execbackend.Local, cfg, runtime.ShellRuntime, job, ttl, "/checkout")
 	if err != nil {
 		t.Fatalf("provisionExecutionBackend(local): %v", err)
 	}
@@ -198,7 +205,13 @@ func TestDefaultExecutionBackendUsesConfiguredIdentity(t *testing.T) {
 	}
 
 	worker := jobWorker{ConfigHome: home, ConfigHomeExplicit: true}
-	lifecycle, err := worker.defaultExecutionBackend(execbackend.Local)
+	cfg := executionBackendConfigForTest(t, worker)
+	// Delivery must consume the resolved snapshot, not re-read a config that may
+	// change after preflight and select a different execution identity.
+	if err := os.WriteFile(paths.ConfigFile, []byte("[remote_exec]\nbackend = \"local\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle, err := worker.defaultExecutionBackend(execbackend.Local, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,6 +235,81 @@ func TestDefaultExecutionBackendUsesConfiguredIdentity(t *testing.T) {
 	if got, want := strings.TrimSpace(result.Stdout), strconv.FormatUint(uint64(uid), 10); got != want {
 		t.Fatalf("configured command-reported euid = %q, want %s", got, want)
 	}
+}
+
+func TestRuntimeContractPreflightUsesConfiguredExecutionIdentityOnlyForLifecycleDelivery(t *testing.T) {
+	const configured = "[remote_exec]\nbackend = \"local\"\nlocal_uid = 996\nlocal_gid = 986\nlocal_root = \"/var/tmp/gitmoot-local\"\n"
+	tests := []struct {
+		name          string
+		config        string
+		withLifecycle bool
+		wantUID       int
+		wantKnown     bool
+	}{
+		{
+			name:          "configured identity with lifecycle delivery",
+			config:        configured,
+			withLifecycle: true,
+			wantUID:       996,
+			wantKnown:     true,
+		},
+		{
+			name:   "configured identity without lifecycle delivery",
+			config: configured,
+		},
+		{
+			name:          "default daemon identity with lifecycle delivery",
+			withLifecycle: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			if tt.config != "" {
+				paths := config.PathsForHome(home)
+				if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(paths.ConfigFile, []byte(tt.config), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			calls := 0
+			worker := jobWorker{
+				ConfigHome:         home,
+				ConfigHomeExplicit: true,
+				RuntimePreflight: func(_ context.Context, _ runtime.Agent, request runtime.RuntimeContractRequest) runtime.RuntimeContractResult {
+					calls++
+					if request.EffectiveUIDKnown != tt.wantKnown || request.EffectiveUID != tt.wantUID {
+						t.Fatalf("runtime preflight effective uid = %d known %t, want %d known %t", request.EffectiveUID, request.EffectiveUIDKnown, tt.wantUID, tt.wantKnown)
+					}
+					return runtime.RuntimeContractResult{State: runtime.RuntimeContractSupported}
+				},
+			}
+			if tt.withLifecycle {
+				worker.ExecutionBackendFactory = func(execbackend.Backend, config.RemoteExecConfig) (execbackend.ExecutionBackend, error) {
+					return nil, nil
+				}
+			}
+			cfg := executionBackendConfigForTest(t, worker)
+			_, checked, err := worker.runtimeContractPreflight(context.Background(), execbackend.Local, cfg, runtime.Agent{}, runtime.RuntimeContractRequest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !checked || calls != 1 {
+				t.Fatalf("runtime preflight = checked %t calls %d, want checked with one call", checked, calls)
+			}
+		})
+	}
+}
+
+func executionBackendConfigForTest(t *testing.T, worker jobWorker) config.RemoteExecConfig {
+	t.Helper()
+	cfg, err := worker.executionBackendConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg
 }
 
 func configuredLocalTestIdentity(t *testing.T) (uint32, uint32) {
@@ -937,7 +1025,7 @@ func TestExecutionBackendJobWorkerReportsAndRetriesRemoteStartupReapFailure(t *t
 	if !strings.Contains(output.String(), "execution backend startup reap failed for remote: reap remote execution backends") {
 		t.Fatalf("startup output = %q, want loud remote reap failure", output.String())
 	}
-	if _, err := worker.ExecutionBackendFactory(execbackend.Remote); err == nil || !strings.Contains(err.Error(), "reap remote execution backends") {
+	if _, err := worker.ExecutionBackendFactory(execbackend.Remote, executionBackendConfigForTest(t, worker)); err == nil || !strings.Contains(err.Error(), "reap remote execution backends") {
 		t.Fatalf("retry remote startup reap error = %v, want loud reconciliation failure", err)
 	}
 	_, _, listCalls, _, _ := harness.snapshot()
@@ -982,7 +1070,7 @@ func TestRemoteExecutionBackendRefusesNonImplementBeforeProvision(t *testing.T) 
 	}
 	factoryCalls := 0
 	worker := defaultJobWorker(store, io.Discard, home)
-	worker.ExecutionBackendFactory = func(execbackend.Backend) (execbackend.ExecutionBackend, error) {
+	worker.ExecutionBackendFactory = func(_ execbackend.Backend, _ config.RemoteExecConfig) (execbackend.ExecutionBackend, error) {
 		factoryCalls++
 		return nil, errors.New("factory must not be called")
 	}

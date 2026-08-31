@@ -525,13 +525,22 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			if err := e.setTaskState(ctx, ref, TaskChangesRequested); err != nil {
 				return err
 			}
-			if err := e.dispatchFix(ctx, reviewer, payload, *payload.Result, ref); err != nil {
+			policy, configured, err := e.Store.PullRequestAutoFixPolicyFor(ctx, payload.Repo, payload.PullRequest)
+			if err != nil {
 				return err
 			}
+			// Report-only is the safe default: the requester already owns the
+			// context and worktree. A durable per-PR enable is the explicit
+			// unattended-chain opt-in for dispatching a fresh implement job (#1712).
+			if configured && !policy.Disabled {
+				if err := e.dispatchFix(ctx, reviewer, payload, *payload.Result, ref); err != nil {
+					return err
+				}
+			}
 			// Verifiable graded negative (#465): a review asked for changes, so the
-			// implement job's diff did not pass review. Harvested AFTER dispatchFix so a
-			// harvest error can never affect the (already-completed) fix dispatch. The
-			// fix-round count (the review round number, round 1 = first) grades severity:
+			// implement job's diff did not pass review. Harvested AFTER requester
+			// routing and optional dispatch so a harvest error can affect neither.
+			// The fix-round count (the review round number, round 1 = first) grades severity:
 			// more rounds => a worse score.
 			e.harvestOutcomeForMergeGate(ctx, payload, Outcome{
 				Kind:        OutcomeChangesRequested,
@@ -813,6 +822,7 @@ func (e Engine) delegationRequest(job db.Job, payload JobPayload, d Delegation) 
 		LeadAgent:       payload.LeadAgent,
 		Reviewers:       payload.Reviewers,
 		ReviewRound:     payload.ReviewRound,
+		ReviewScope:     cloneReviewScope(d.ReviewScope),
 		Sender:          job.Agent,
 		Instructions:    strings.TrimSpace(d.Prompt),
 		Constraints:     payload.Constraints,
