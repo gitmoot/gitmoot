@@ -1326,6 +1326,45 @@ func TestPollOnceInactiveTaskPreservesRealGateVerdict(t *testing.T) {
 	}
 }
 
+func TestPollOnceForkHeadCollidingWithReadyTaskRequestsNoMerge(t *testing.T) {
+	ctx := context.Background()
+	store, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskReadyToMerge)
+	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{Ready: true, Merged: true}}
+	daemon.Workflow = &workflow.Engine{Store: store, MergeGate: gate}
+	// Only the fork pull request is open: the local ready task's own PR is gone
+	// from the listing, so nothing but branch-name collision can reach the gate.
+	fork := client.pulls[0]
+	fork.Number = 99
+	fork.HeadRepoFullName = "fork/gitmoot"
+	fork.HeadSHA = "fork123"
+	client.pulls = []github.PullRequest{fork}
+	client.comments = map[int64][]github.IssueComment{99: {}}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: "gitmoot/gitmoot",
+		Number:       99,
+		HeadBranch:   "task-7",
+		BaseBranch:   "main",
+		HeadSHA:      "fork123",
+		State:        "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(gate.requests) != 0 {
+		t.Fatalf("merge gate requests = %+v, want none for a fork head", gate.requests)
+	}
+	task, err := store.GetTask(ctx, "task-7")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskReadyToMerge) {
+		t.Fatalf("task state = %q, want %q left untouched by a fork pull request", task.State, workflow.TaskReadyToMerge)
+	}
+}
+
 func TestPollOnceForkHeadCollidingWithManagedBranchGetsNoMarker(t *testing.T) {
 	ctx := context.Background()
 	store, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskChangesRequested)

@@ -943,7 +943,7 @@ func (d Daemon) ensureMergeGateStatus(ctx context.Context, pull github.PullReque
 	if headSHA == "" {
 		return
 	}
-	task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
+	task, err := d.lookupPolledPullRequestTask(ctx, pull)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			d.logf("merge-gate marker task lookup failed for %s#%d: %v", d.Repo.FullName(), pull.Number, err)
@@ -1087,7 +1087,7 @@ func (d Daemon) handlePullRequestWorkflowChange(ctx context.Context, pull github
 		title:  pull.Title,
 		branch: pull.HeadRef,
 	}
-	if task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef); err == nil {
+	if task, err := d.lookupPolledPullRequestTask(ctx, pull); err == nil {
 		ref.id = task.ID
 		ref.goalID = task.GoalID
 		ref.title = task.Title
@@ -1178,7 +1178,7 @@ func workflowReviewJobMatchesPull(repoFullName string, pull github.PullRequest, 
 }
 
 func (d Daemon) pullRequestReadyToMerge(ctx context.Context, pull github.PullRequest) (bool, error) {
-	task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
+	task, err := d.lookupPolledPullRequestTask(ctx, pull)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
@@ -1195,7 +1195,7 @@ func (d Daemon) handleReadyToMergeWorkflow(ctx context.Context, pull github.Pull
 	if d.Workflow == nil {
 		return nil
 	}
-	task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
+	task, err := d.lookupPolledPullRequestTask(ctx, pull)
 	if err != nil {
 		return err
 	}
@@ -1230,7 +1230,7 @@ func (d Daemon) reconcileReviewingPullRequest(ctx context.Context, pull github.P
 	if d.Workflow == nil {
 		return nil
 	}
-	task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
+	task, err := d.lookupPolledPullRequestTask(ctx, pull)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
@@ -1524,6 +1524,21 @@ func selectReconciledPull(pinnedNumber int64, pinnedHeadSHA string, pulls []gith
 func pullRequestListedAsMerged(pull github.PullRequest) bool {
 	return strings.TrimSpace(pull.MergedAt) != "" || pull.Merged ||
 		strings.EqualFold(strings.TrimSpace(pull.State), "merged")
+}
+
+// lookupPolledPullRequestTask resolves the managed task for a POLLED pull
+// request. A fork head whose HeadRef merely COLLIDES with a local branch name
+// must resolve nothing: routing it as that task lets an outside contributor's
+// pull request drive a local task's review, gate and merge. The identity check
+// lives here, in the one resolver every polled-PR consumer calls, rather than at
+// each call site, so a consumer added later cannot reintroduce the hole. A fork
+// head reports sql.ErrNoRows, which every caller already handles as "this pull
+// request has no managed task".
+func (d Daemon) lookupPolledPullRequestTask(ctx context.Context, pull github.PullRequest) (db.Task, error) {
+	if !d.pullRequestHeadIsLocal(pull) {
+		return db.Task{}, sql.ErrNoRows
+	}
+	return d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
 }
 
 func (d Daemon) lookupPullRequestTask(ctx context.Context, repoFullName string, branch string) (db.Task, error) {
@@ -2147,7 +2162,7 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 	if d.Workflow == nil {
 		return d.ack(ctx, pull.Number, "Gitmoot cannot merge this PR because the workflow engine is not configured.")
 	}
-	task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
+	task, err := d.lookupPolledPullRequestTask(ctx, pull)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot cannot merge PR #%d because branch `%s` is not registered as a task.", pull.Number, pull.HeadRef))
@@ -2276,7 +2291,7 @@ func (d Daemon) commentTaskRef(ctx context.Context, pull github.PullRequest, com
 		title:  pull.Title,
 		branch: pull.HeadRef,
 	}
-	task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
+	task, err := d.lookupPolledPullRequestTask(ctx, pull)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ref, nil
