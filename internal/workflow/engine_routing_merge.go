@@ -199,6 +199,27 @@ func (e Engine) blockAutoFix(ctx context.Context, ref taskRef, reason string) er
 	return e.block(ctx, ref, reason)
 }
 
+// blockMergeGate attributes a merge-gate block on the task itself before making
+// the transition (#1562). e.block is shared with the coordinator failure paths —
+// block_parent and the vote/quorum synthesis gates in
+// engine_continuation_synthesis.go — so `state == blocked` alone cannot say WHICH
+// mechanism blocked a task. Without this event an exit path can only see that a
+// task is blocked and that some merge-gate row exists, and would clear a quorum
+// failure as though it were self-clearing infrastructure. Mirrors blockAutoFix.
+func (e Engine) blockMergeGate(ctx context.Context, ref taskRef, reason string) error {
+	if strings.TrimSpace(ref.ID) != "" {
+		if err := e.Store.AddTaskEvent(ctx, db.TaskEvent{
+			TaskID:  ref.ID,
+			Kind:    "merge_gate_blocked",
+			ToState: string(TaskBlocked),
+			Reason:  reason,
+		}); err != nil {
+			return fmt.Errorf("record merge-gate block: %w", err)
+		}
+	}
+	return e.block(ctx, ref, reason)
+}
+
 func (e Engine) allRequiredReviewersApproved(ctx context.Context, currentReviewer string, payload JobPayload) (bool, error) {
 	required := e.requiredReviewers(payload)
 	if len(required) == 0 {
@@ -645,7 +666,7 @@ func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string,
 		// INFRA-NOISE-FILTERED). A real store error skips the harvest and returns up.
 		// Best-effort and nil-safe: a harvest error can never affect the (already-
 		// durable) block.
-		err := e.block(ctx, ref, reason)
+		err := e.blockMergeGate(ctx, ref, reason)
 		var blocked BlockedError
 		if errors.As(err, &blocked) && decision.BlockClass == MergeBlockQuality {
 			// Only an AUTHORITATIVE template-quality block (external CI failed, a

@@ -41,6 +41,17 @@ func seedBlockedReviewTask(t *testing.T, store *db.Store, repo github.Repository
 	}); err != nil {
 		t.Fatalf("UpsertMergeGate returned error: %v", err)
 	}
+	// The merge gate attributes its own block on the task (blockMergeGate), which is
+	// what distinguishes it from a coordinator block_parent or quorum failure
+	// reaching the same state through the shared e.block helper.
+	if err := store.AddTaskEvent(ctx, db.TaskEvent{
+		TaskID:  "review-pr-1699-3f3a1026",
+		Kind:    "merge_gate_blocked",
+		ToState: string(workflow.TaskBlocked),
+		Reason:  reason,
+	}); err != nil {
+		t.Fatalf("AddTaskEvent(merge_gate_blocked) returned error: %v", err)
+	}
 	return github.PullRequest{
 		Number:  1699,
 		Title:   "Review PR #1699",
@@ -70,6 +81,62 @@ func hasTaskEventKind(events []db.TaskEvent, kind string) bool {
 		}
 	}
 	return false
+}
+
+// TestPollOnceLeavesTaskBlockedByDelegationFailureBlocked is the cause-attribution
+// direction, found by gm-omp-fanout while we coordinated the PR #1731 collision.
+//
+// e.block is SHARED: the merge gate uses it, and so do the coordinator failure
+// paths — block_parent and the vote/quorum synthesis gates in
+// engine_continuation_synthesis.go. So `state == blocked` says nothing about WHICH
+// mechanism blocked the task. A task carrying a stale transient merge-gate row from
+// an earlier evaluation, then blocked by a delegation quorum failure, satisfies
+// every other test in the reconciler — and releasing it would discard a quorum
+// failure as though it were self-clearing infrastructure. The gate row describes the
+// CONDITION; only the task's latest blocking event establishes the CURRENT CAUSE.
+//
+// Mutant M5 ("cause ignored"): delete the mergeGateOwnsCurrentBlock guard from
+// reconcileTransientlyBlockedMergeGates. Only this test fails; every other
+// direction, including both two-poll tests, still passes.
+func TestPollOnceLeavesTaskBlockedByDelegationFailureBlocked(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	// A genuine transient gate block happened earlier and its row is still on disk.
+	pull := seedBlockedReviewTask(t, store, repo, workflow.MergeBlockTransient, "local worktree is not clean")
+	// Then a delegation quorum failure blocked the task through the shared helper.
+	// It is LATER, so it is the current cause.
+	if err := store.AddTaskEvent(ctx, db.TaskEvent{
+		TaskID:  "review-pr-1699-3f3a1026",
+		Kind:    "quorum_unmet",
+		ToState: string(workflow.TaskBlocked),
+		Reason:  "2 of 3 delegation children failed",
+	}); err != nil {
+		t.Fatalf("AddTaskEvent(quorum_unmet) returned error: %v", err)
+	}
+	daemon, gate := blockedReviewTaskDaemon(t, store, repo, pull)
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+
+	task, err := store.GetTask(ctx, "review-pr-1699-3f3a1026")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskBlocked) {
+		t.Fatalf("task state = %q, want blocked: a quorum failure is not a self-clearing merge-gate condition", task.State)
+	}
+	if len(gate.requests) != 0 {
+		t.Fatalf("merge gate evaluations = %d, want 0 for a task blocked by a delegation failure", len(gate.requests))
+	}
+	events, err := store.ListTaskEvents(ctx, "review-pr-1699-3f3a1026")
+	if err != nil {
+		t.Fatalf("ListTaskEvents returned error: %v", err)
+	}
+	if hasTaskEventKind(events, "merge_gate_transient_retry") {
+		t.Fatalf("task events = %+v, want no transient release recorded", events)
+	}
 }
 
 // TestPollOnceReleasesTransientlyBlockedReviewTask is the release direction of

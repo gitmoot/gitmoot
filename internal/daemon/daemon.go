@@ -598,6 +598,26 @@ func (d Daemon) reconcileTransientlyBlockedMergeGates(ctx context.Context, openP
 		if gate.State != "blocked" || gate.BlockClass != int(workflow.MergeBlockTransient) {
 			continue
 		}
+		// The gate row says the CONDITION is self-clearing. It does not say the gate
+		// is still the REASON this task is blocked. e.block is shared with the
+		// coordinator failure paths (block_parent, and the vote/quorum synthesis
+		// gates), so a task carrying a stale transient gate row and then blocked by a
+		// delegation quorum failure satisfies every test above — and releasing it
+		// would discard a quorum failure as self-clearing infrastructure. Require the
+		// task's most recent blocking event to attribute the CURRENT block to the
+		// merge gate. A task blocked before merge-gate blocks were attributed has no
+		// such event and stays blocked, which is the safe direction.
+		// (Found by gm-omp-fanout while coordinating the PR #1731 collision.)
+		attributed, attrErr := d.mergeGateOwnsCurrentBlock(ctx, task.ID)
+		if attrErr != nil {
+			if firstErr == nil {
+				firstErr = attrErr
+			}
+			continue
+		}
+		if !attributed {
+			continue
+		}
 		changed, _, transitionErr := d.Store.TransitionTaskStateWithEvent(ctx, task.ID,
 			[]string{string(workflow.TaskBlocked)},
 			string(workflow.TaskReadyToMerge), "merge_gate_transient_retry",
@@ -613,6 +633,28 @@ func (d Daemon) reconcileTransientlyBlockedMergeGates(ctx context.Context, openP
 		}
 	}
 	return firstErr
+}
+
+// mergeGateOwnsCurrentBlock reports whether the task's most recent blocking event
+// attributes the block to the merge gate (#1562). Task events are append-only, so
+// the LATEST blocking event is the current cause: a later block_parent or quorum
+// failure supersedes an earlier merge-gate block and must not be cleared by the
+// transient exit. Absence of any attributed event is not evidence of a gate block
+// and returns false.
+func (d Daemon) mergeGateOwnsCurrentBlock(ctx context.Context, taskID string) (bool, error) {
+	events, err := d.Store.ListTaskEvents(ctx, taskID)
+	if err != nil {
+		return false, err
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		switch events[i].Kind {
+		case "merge_gate_blocked":
+			return true, nil
+		case "review_auto_fix_blocked", "pr_closed_unmerged", "delegation_child_failed", "block_parent", "quorum_unmet":
+			return false, nil
+		}
+	}
+	return false, nil
 }
 
 // reconcileExternallyMergedTasks advances PR lifecycle tasks, plus blocked
