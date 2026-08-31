@@ -214,9 +214,13 @@ case-insensitive and exact. Job IDs always use case-insensitive substring
 matching, including slash-bearing delegation IDs. Without a slash, repositories
 also use substring matching; empty matches all. Pass only one of `--match` and
 `--repo`. A successful review terminal whose decision is `approved` or
-`changes_requested` matches both `job-terminal` and `review-verdict` and
-addresses the pull request owner's role. If no role can be resolved, addressed
-rules fail closed while observer rules can still receive the verdict. A plain
+`changes_requested` matches both `job-terminal` and `review-verdict`. Addressed
+rules may deliver that verdict to both the requesting org role and the pull
+request's implementing role. When a successful ownership lookup finds no
+implement job or branch lock attribution, the review's persisted lead
+identifies a persistent implementing seat; lookup errors remain fail-closed. If
+neither role can be resolved, addressed rules fail closed while observer rules
+can still receive the verdict. A plain
 `job.blocked` event matches both `job-terminal` and `blocked`, while
 guard-caused blocks match `guard` first. A synthesized `blocked_since` event
 matches only `blocked`. Task episodes due in
