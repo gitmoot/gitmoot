@@ -407,9 +407,15 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	// ready_to_merge that guard returns early, so a write on its far side silently
 	// drops the only durable evidence the proof projector keys the approval claim
 	// on, leaving proof contradicting the PR comment. AddJobEventIfAbsent keeps the
-	// replay path idempotent; PullRequest<=0 reviews are excluded because that arm
-	// terminates at advance_skipped_no_pr without a review outcome at all.
-	if job.Type == "review" && payload.PullRequest > 0 &&
+	// replay path idempotent.
+	//
+	// NOT restricted to PullRequest > 0. A PR-less review child is still FOLDED:
+	// advanceDelegations runs before this and counts a sub-threshold child toward
+	// delegation quorum and verify synthesis, so its outcome is load-bearing even
+	// though it never reaches the PR-only advancement arm. Gating this write on a
+	// pull request suppressed the only event proof/project.go recognizes for
+	// exactly those children.
+	if job.Type == "review" &&
 		payload.Result.Decision == "changes_requested" && effectiveDecision == "approved" {
 		if err := e.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
 			JobID: job.ID,

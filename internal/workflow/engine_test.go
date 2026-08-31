@@ -1679,6 +1679,34 @@ func TestAllRequiredReviewersApprovedKeepsPipelineVetoRaw(t *testing.T) {
 	}
 }
 
+// A PR-less review child is still FOLDED: advanceDelegations counts a
+// sub-threshold child toward delegation quorum and verify synthesis before the
+// PR-only advancement arm is ever reached. Gating the outcome write on
+// PullRequest > 0 therefore suppressed the only event proof/project.go
+// recognizes for exactly the children whose folded verdict is load-bearing.
+func TestEngineAdvanceReviewSubthresholdRecordsOutcomeWithoutPullRequest(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+	insertCompletedJob(t, store, db.Job{ID: "review-noprr", Agent: "audit", Type: "review"}, JobPayload{
+		Repo: "mobile/app", TaskID: "task-8", TaskTitle: "Mobile App", LeadAgent: "lead",
+		Result: &AgentResult{
+			Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "non-blocking polish",
+		},
+	})
+	if err := engine.AdvanceJob(ctx, "review-noprr"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+	if got := countJobEvents(t, store, "review-noprr", ReviewApprovedWithNotesEventKind); got != 1 {
+		t.Fatalf("%s events = %d, want 1 for a PR-less folded review", ReviewApprovedWithNotesEventKind, got)
+	}
+	// The PR-less arm still terminates without review advancement.
+	if got := countJobEvents(t, store, "review-noprr", "advance_skipped_no_pr"); got != 1 {
+		t.Fatalf("advance_skipped_no_pr events = %d, want 1", got)
+	}
+}
+
 func TestEngineAdvancePipelineReviewIsReportOnly(t *testing.T) {
 	for _, decision := range []string{"changes_requested", "approved"} {
 		t.Run(decision, func(t *testing.T) {

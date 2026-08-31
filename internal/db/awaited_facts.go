@@ -175,12 +175,19 @@ ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 			return "", false, err
 		}
 		defer rows.Close()
+		// The scan is keyed to ONE repo, but reviewVerdictFact consults the resolver
+		// per row and the resolver re-reads config from disk on every call (it must,
+		// to track a live edit). Left unmemoised this is O(history) filesystem reads
+		// while holding the transaction. Resolve once here: one fresh read per
+		// transaction, which is the same freshness the single-row producer path gets.
+		scanSeverity := blockingSeverity(repo)
+		memoized := func(string) string { return scanSeverity }
 		for rows.Next() {
 			var jobID, agent, payload string
 			if err := rows.Scan(&jobID, &agent, &payload); err != nil {
 				return "", false, err
 			}
-			fact, ok := reviewVerdictFact(jobID, agent, "succeeded", payload, blockingSeverity)
+			fact, ok := reviewVerdictFact(jobID, agent, "succeeded", payload, memoized)
 			if ok && fact.headSHA == headSHA {
 				return fact.detail, true, nil
 			}
@@ -203,7 +210,7 @@ type reviewVerdictPayload struct {
 	// report-only and is therefore never re-interpreted against repository
 	// severity policy.
 	Sender string `json:"sender"`
-	Result           *struct {
+	Result *struct {
 		Decision string `json:"decision"`
 		Severity string `json:"severity,omitempty"`
 	} `json:"result"`

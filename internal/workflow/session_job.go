@@ -192,6 +192,34 @@ func (m Mailbox) CloseExternalJobWithUsage(ctx context.Context, jobID string, re
 	if displayEvent, ok := sessionJobDisplayEvent(jobID, headSHAOverride); ok {
 		extraEvents = append(extraEvents, displayEvent)
 	}
+	// A session review job never runs AdvanceJob, so the durable outcome event that
+	// path writes would never exist for it. The merge gate folds its sub-threshold
+	// verdict into an approval regardless, while proof/project.go keys its
+	// review.approved claim on this event — so without it the two surfaces disagree
+	// about the same verdict and `gitmoot proof` renders "0 approved" for a PR the
+	// gate is willing to merge.
+	//
+	// Built BEFORE the transition and carried in extraEvents so it is ATOMIC with
+	// terminalization. Writing it as a second statement after the commit left a
+	// window where a crash or SQLite error produced a terminal sub-threshold review
+	// with no proof event, and a retry could not repair it — the terminal-state
+	// check rejects the close first. The store inserts extras only after the state
+	// CAS wins, so a losing racer still records nothing.
+	if strings.EqualFold(strings.TrimSpace(job.Type), "review") && payload.Result != nil {
+		blockingSeverity := reviewseverity.DefaultBlocking
+		if m.reviewBlockingSeverity != nil {
+			blockingSeverity = m.reviewBlockingSeverity(payload.Repo)
+		}
+		if payload.Result.Decision == "changes_requested" &&
+			effectiveReviewDecisionForPayload(payload, blockingSeverity) == "approved" {
+			extraEvents = append(extraEvents, db.JobEvent{
+				JobID: jobID,
+				Kind:  ReviewApprovedWithNotesEventKind,
+				Message: fmt.Sprintf("review severity %s is below repository blocking severity %s; findings remain recorded and no fix is dispatched",
+					payload.Result.Severity, blockingSeverity),
+			})
+		}
+	}
 	transitioned, err := m.store.TransitionJobStatePayloadUsageWithEvent(ctx, jobID, string(JobRunning), string(state), encoded,
 		strings.TrimSpace(usage.Model), usage.InputTokens, usage.OutputTokens, db.JobEvent{
 			JobID:   jobID,
@@ -207,31 +235,6 @@ func (m Mailbox) CloseExternalJobWithUsage(ctx context.Context, jobID string, re
 			return db.Job{}, getErr
 		}
 		return db.Job{}, fmt.Errorf("job %q is %s, not running; it has already been closed", jobID, latest.State)
-	}
-	// A session review job never runs AdvanceJob, so the durable outcome event that
-	// path writes would never exist for it. The merge gate folds its sub-threshold
-	// verdict into an approval regardless, while proof/project.go keys its
-	// review.approved claim on this event — so without it the two surfaces disagree
-	// about the same verdict and `gitmoot proof` renders "0 approved" for a PR the
-	// gate is willing to merge. Written AFTER the confirmed running->terminal
-	// transition so a losing racer records nothing, and AddJobEventIfAbsent keeps a
-	// retried close idempotent.
-	if strings.EqualFold(strings.TrimSpace(job.Type), "review") && payload.Result != nil {
-		blockingSeverity := reviewseverity.DefaultBlocking
-		if m.reviewBlockingSeverity != nil {
-			blockingSeverity = m.reviewBlockingSeverity(payload.Repo)
-		}
-		if payload.Result.Decision == "changes_requested" &&
-			effectiveReviewDecisionForPayload(payload, blockingSeverity) == "approved" {
-			if err := m.store.AddJobEventIfAbsent(ctx, db.JobEvent{
-				JobID: jobID,
-				Kind:  ReviewApprovedWithNotesEventKind,
-				Message: fmt.Sprintf("review severity %s is below repository blocking severity %s; findings remain recorded and no fix is dispatched",
-					payload.Result.Severity, blockingSeverity),
-			}); err != nil {
-				return db.Job{}, err
-			}
-		}
 	}
 	// Best-effort outbound emit on the genuine running->terminal transition (#446),
 	// wired the same way the engine wires finishWithPayload's terminal emit. nil-safe:
