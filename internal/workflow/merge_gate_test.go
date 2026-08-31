@@ -744,6 +744,59 @@ func TestImplementerAttributionAnomalyDeclinesRemainByteStable(t *testing.T) {
 	}
 }
 
+func TestPolicyMergeGateEmptyReviewRoundUsesRecordedRecency(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	basePayload := JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		Branch:      "task-9",
+		PullRequest: 9,
+		TaskID:      "task-9",
+	}
+	implementPayload := basePayload
+	implementPayload.Result = &AgentResult{Decision: "implemented", Summary: "implemented"}
+	insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: "implementer", Type: "implement"}, implementPayload)
+
+	olderReview := basePayload
+	olderReview.HeadSHA = "older-head"
+	olderReview.Result = &AgentResult{Decision: "approved", Summary: "older approval"}
+	const olderJobID = "local-review-zulu-older"
+	insertCompletedJob(t, store, db.Job{ID: olderJobID, Agent: "zulu-reviewer", Type: "review"}, olderReview)
+	setMergeGateJobTimestamps(t, store, olderJobID, "2026-08-31 10:00:00")
+
+	newerReview := basePayload
+	newerReview.HeadSHA = "newer-head"
+	newerReview.Result = &AgentResult{Decision: "approved", Summary: "newer approval"}
+	const newerJobID = "local-review-alpha-newer"
+	insertCompletedJob(t, store, db.Job{ID: newerJobID, Agent: "alpha-reviewer", Type: "review"}, newerReview)
+	setMergeGateJobTimestamps(t, store, newerJobID, "2026-08-31 11:00:00")
+
+	insertMergeGateDelegationChild(t, store, olderJobID, "lens-latest", JobFailed, nil)
+	setMergeGateJobTimestamps(t, store, olderJobID+"/delegation/lens-latest", "2026-08-31 12:00:00")
+
+	mergeable := true
+	gh := &fakeMergeGateGitHub{
+		pr: github.PullRequest{
+			Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+			HeadSHA: "current-head", Mergeable: &mergeable,
+		},
+		status: github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+		checks: []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+	}
+	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Ready || decision.Merged {
+		t.Fatalf("decision = %+v, want escalating LeaveOpen", decision)
+	}
+	if !strings.Contains(decision.Reason.Render(), "latest review from alpha-reviewer is for a different head SHA") {
+		t.Fatalf("decision reason = %q, want newer root review selected by recorded time", decision.Reason)
+	}
+}
+
 func TestPolicyMergeGatePreservesSelfApprovalReasonWhenHeadMismatchSortsFirst(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

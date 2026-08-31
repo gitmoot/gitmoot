@@ -475,10 +475,10 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	missingImplementerReason := implementerAttribution.failureReason()
 	delegationChildrenByParent := make(map[string][]db.Job)
 	for _, job := range jobs {
-		parentID := strings.TrimSpace(job.ParentJobID)
-		if parentID == "" || strings.TrimSpace(job.DelegationID) == "" {
+		if !isDelegationChild(job) {
 			continue
 		}
+		parentID := strings.TrimSpace(job.ParentJobID)
 		delegationChildrenByParent[parentID] = append(delegationChildrenByParent[parentID], job)
 	}
 	// A round can order remediation, but it must not hide a blocking verdict or
@@ -489,7 +489,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	}
 	var reviewsAtHead []reviewAtHead
 	for _, job := range jobs {
-		if job.Type != "review" {
+		if job.Type != "review" || isDelegationChild(job) {
 			continue
 		}
 		payload, err := unmarshalPayload(job.Payload)
@@ -601,9 +601,10 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		}
 		return nil
 	}
-	latest := ""
+	var latest reviewRoundKey
+	haveLatest := false
 	for _, job := range jobs {
-		if job.Type != "review" {
+		if job.Type != "review" || isDelegationChild(job) {
 			continue
 		}
 		payload, err := unmarshalPayload(job.Payload)
@@ -616,15 +617,13 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if _, superseded := supersededReviewIDs[job.ID]; superseded {
 			continue
 		}
-		round := strings.TrimSpace(payload.ReviewRound)
-		if round == "" {
-			round = job.ID
-		}
-		if latest == "" || reviewRoundAfter(round, latest) {
-			latest = round
+		candidate := reviewRoundKeyForJob(job, payload)
+		if !haveLatest || reviewRoundKeyAfter(candidate, latest) {
+			latest = candidate
+			haveLatest = true
 		}
 	}
-	if latest == "" {
+	if !haveLatest {
 		return errors.New("final agent review is not captured")
 	}
 	approved := false
@@ -637,18 +636,15 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	}
 	var eligible []eligibleReview
 	for _, job := range jobs {
-		if job.Type != "review" {
+		if job.Type != "review" || isDelegationChild(job) {
 			continue
 		}
 		payload, err := unmarshalPayload(job.Payload)
 		if err != nil {
 			return err
 		}
-		round := strings.TrimSpace(payload.ReviewRound)
-		if round == "" {
-			round = job.ID
-		}
-		if !sameTask(current, payload) || round != latest || payload.Result == nil {
+		candidate := reviewRoundKeyForJob(job, payload)
+		if !sameTask(current, payload) || !sameReviewRoundKey(candidate, latest) || payload.Result == nil {
 			continue
 		}
 		if _, superseded := supersededReviewIDs[job.ID]; superseded {
@@ -915,6 +911,52 @@ func reviewJobRecordedAfter(left db.Job, right db.Job) bool {
 		return after
 	}
 	return false
+}
+
+type reviewRoundKey struct {
+	name      string
+	createdAt string
+}
+
+func reviewRoundKeyForJob(job db.Job, payload JobPayload) reviewRoundKey {
+	round := strings.TrimSpace(payload.ReviewRound)
+	if round != "" {
+		return reviewRoundKey{name: round}
+	}
+	return reviewRoundKey{createdAt: job.CreatedAt}
+}
+
+func reviewRoundKeyAfter(left reviewRoundKey, right reviewRoundKey) bool {
+	leftExplicit := left.name != ""
+	rightExplicit := right.name != ""
+	if leftExplicit != rightExplicit {
+		return leftExplicit
+	}
+	if leftExplicit {
+		return reviewRoundAfter(left.name, right.name)
+	}
+	after, decided := recordedTimestampAfter(left.createdAt, right.createdAt)
+	return decided && after
+}
+
+func sameReviewRoundKey(left reviewRoundKey, right reviewRoundKey) bool {
+	leftExplicit := left.name != ""
+	rightExplicit := right.name != ""
+	if leftExplicit || rightExplicit {
+		return leftExplicit && rightExplicit && left.name == right.name
+	}
+	leftTime, leftOK := parseStoredJobTime(left.createdAt)
+	rightTime, rightOK := parseStoredJobTime(right.createdAt)
+	if !leftOK || !rightOK {
+		// An unparseable persisted timestamp cannot establish recency. Treat the
+		// fallback reviews as one conservative round instead of ordering by ID.
+		return true
+	}
+	return leftTime.Equal(rightTime)
+}
+
+func isDelegationChild(job db.Job) bool {
+	return strings.TrimSpace(job.ParentJobID) != "" && strings.TrimSpace(job.DelegationID) != ""
 }
 
 func isReviewReplacementDecision(decision string) bool {
