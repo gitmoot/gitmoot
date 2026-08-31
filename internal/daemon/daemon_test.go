@@ -1079,7 +1079,121 @@ func TestPollOnceDismissedEscalationDoesNotBlockEligibleMerge(t *testing.T) {
 	}
 }
 
-func TestPollOnceDoesNotRetryReadyToMergeWhenNativeFanoutSkipped(t *testing.T) {
+func TestMergeGateSkippedFanoutStaysPendingWhileNamedCheckRuns(t *testing.T) {
+	ctx := context.Background()
+	store, client, daemon, gate := newSkippedFanoutPendingGateDaemon(t)
+	request := workflow.MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 7, TaskID: "task-7"}
+
+	decision, err := gate.Evaluate(ctx, request)
+	if err != nil {
+		t.Fatalf("initial Evaluate returned error: %v", err)
+	}
+	if !decision.Ready || decision.Merged {
+		t.Fatalf("initial decision = %+v", decision)
+	}
+	if len(client.statuses) != 1 || client.statuses[0].Context != "gitmoot/merge-gate" || client.statuses[0].State != "pending" {
+		t.Fatalf("initial statuses = %+v", client.statuses)
+	}
+
+	for poll := 1; poll <= 2; poll++ {
+		if err := daemon.PollOnce(ctx); err != nil {
+			t.Fatalf("pending poll %d returned error: %v", poll, err)
+		}
+		status := client.statuses[len(client.statuses)-1]
+		if status.Context != "gitmoot/merge-gate" || status.State != "pending" {
+			t.Fatalf("pending poll %d status = %+v", poll, status)
+		}
+		if len(client.merges) != 0 {
+			t.Fatalf("pending poll %d merge inputs = %+v", poll, client.merges)
+		}
+		task, err := store.GetTask(ctx, "task-7")
+		if err != nil {
+			t.Fatalf("pending poll %d GetTask returned error: %v", poll, err)
+		}
+		if task.State != string(workflow.TaskReadyToMerge) {
+			t.Fatalf("pending poll %d task state = %q, want %q", poll, task.State, workflow.TaskReadyToMerge)
+		}
+	}
+}
+
+func TestPollOnceSkippedFanoutReevaluatesCompletedNamedCheck(t *testing.T) {
+	ctx := context.Background()
+	store, client, daemon, gate := newSkippedFanoutPendingGateDaemon(t)
+	request := workflow.MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 7, TaskID: "task-7"}
+
+	decision, err := gate.Evaluate(ctx, request)
+	if err != nil {
+		t.Fatalf("initial Evaluate returned error: %v", err)
+	}
+	if !decision.Ready || decision.Merged {
+		t.Fatalf("initial decision = %+v", decision)
+	}
+	if len(client.statuses) != 1 || client.statuses[0].State != "pending" {
+		t.Fatalf("initial statuses = %+v", client.statuses)
+	}
+
+	client.checks[0].Bucket = "pass"
+	client.checks[0].State = "COMPLETED"
+	client.checks[0].CompletedAt = "2026-08-31T03:20:15Z"
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("completed poll returned error: %v", err)
+	}
+	if len(client.statuses) != 2 {
+		t.Fatalf("completed poll statuses = %+v", client.statuses)
+	}
+	status := client.statuses[len(client.statuses)-1]
+	if status.Context != "gitmoot/merge-gate" || status.State != "success" {
+		t.Fatalf("completed poll status = %+v", status)
+	}
+	if len(client.merges) != 1 {
+		t.Fatalf("completed poll merge inputs = %+v", client.merges)
+	}
+	task, err := store.GetTask(ctx, "task-7")
+	if err != nil {
+		t.Fatalf("completed poll GetTask returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskMerged) {
+		t.Fatalf("completed poll task state = %q, want %q", task.State, workflow.TaskMerged)
+	}
+}
+
+func TestPollOnceSkippedFanoutRetriesAfterPendingStatusWriteFailure(t *testing.T) {
+	ctx := context.Background()
+	store, client, daemon, gate := newSkippedFanoutPendingGateDaemon(t)
+	client.statusErrs = []error{errors.New("status bookkeeping unavailable")}
+	request := workflow.MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 7, TaskID: "task-7"}
+
+	_, err := gate.Evaluate(ctx, request)
+	if err == nil || !strings.Contains(err.Error(), "status bookkeeping unavailable") {
+		t.Fatalf("initial Evaluate error = %v", err)
+	}
+	if len(client.statuses) != 1 || client.statuses[0].State != "pending" {
+		t.Fatalf("initial Evaluate statuses = %+v", client.statuses)
+	}
+	task, err := store.GetTask(ctx, "task-7")
+	if err != nil {
+		t.Fatalf("initial Evaluate GetTask returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskReadyToMerge) {
+		t.Fatalf("initial Evaluate task state = %q, want %q", task.State, workflow.TaskReadyToMerge)
+	}
+
+	client.checks[0].Bucket = "pass"
+	client.checks[0].State = "COMPLETED"
+	client.checks[0].CompletedAt = "2026-08-31T03:20:15Z"
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("retry PollOnce returned error: %v", err)
+	}
+	if len(client.statuses) != 2 || client.statuses[1].State != "success" {
+		t.Fatalf("retry PollOnce statuses = %+v", client.statuses)
+	}
+	if len(client.merges) != 1 {
+		t.Fatalf("retry PollOnce merge inputs = %+v", client.merges)
+	}
+}
+
+func newSkippedFanoutPendingGateDaemon(t *testing.T) (*db.Store, *mergeGateRaceGitHub, Daemon, *workflow.PolicyMergeGate) {
+	t.Helper()
 	ctx := context.Background()
 	store := testStore(t)
 	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
@@ -1094,8 +1208,8 @@ func TestPollOnceDoesNotRetryReadyToMergeWhenNativeFanoutSkipped(t *testing.T) {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
 	if err := store.UpsertAgent(ctx, db.Agent{
-		Name:           "builder",
-		Role:           "builder",
+		Name:           "lead",
+		Role:           "implementer",
 		Runtime:        "codex",
 		RuntimeRef:     "last",
 		RepoScope:      repo.FullName(),
@@ -1105,7 +1219,11 @@ func TestPollOnceDoesNotRetryReadyToMergeWhenNativeFanoutSkipped(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertAgent returned error: %v", err)
 	}
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "task-7", Owner: "builder"}); err != nil || !acquired {
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName: repo.FullName(),
+		Branch:       "task-7",
+		Owner:        "lead",
+	}); err != nil || !acquired {
 		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
 	}
 	if err := store.SetBranchLockReviewFanout(ctx, repo.FullName(), "task-7", true); err != nil {
@@ -1122,28 +1240,96 @@ func TestPollOnceDoesNotRetryReadyToMergeWhenNativeFanoutSkipped(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertPullRequest returned error: %v", err)
 	}
-	client := &fakeGitHub{
+	insertCompleted := func(job db.Job, payload workflow.JobPayload) {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("json.Marshal returned error: %v", err)
+		}
+		job.State = string(workflow.JobSucceeded)
+		job.Payload = string(encoded)
+		if err := store.CreateJobWithEvent(ctx, job, db.JobEvent{
+			Kind:    string(workflow.JobSucceeded),
+			Message: "done",
+		}); err != nil {
+			t.Fatalf("CreateJobWithEvent returned error: %v", err)
+		}
+	}
+	insertCompleted(db.Job{ID: "implement-job", Agent: "lead", Type: "implement"}, workflow.JobPayload{
+		Repo:        repo.FullName(),
+		PullRequest: 7,
+		HeadSHA:     "abc123",
+		TaskID:      "task-7",
+		Result:      &workflow.AgentResult{Decision: "implemented", Summary: "implemented"},
+	})
+	insertCompleted(db.Job{ID: "review-job", Agent: "audit", Type: "review"}, workflow.JobPayload{
+		Repo:        repo.FullName(),
+		PullRequest: 7,
+		HeadSHA:     "abc123",
+		TaskID:      "task-7",
+		ReviewRound: "review-1",
+		Result:      &workflow.AgentResult{Decision: "approved", Summary: "ready"},
+	})
+	mergeable := true
+	baseClient := &fakeGitHub{
 		pulls: []github.PullRequest{{
-			Number:  7,
-			Title:   "Task 7",
-			State:   "open",
-			URL:     "https://github.com/gitmoot/gitmoot/pull/7",
-			HeadRef: "task-7",
-			BaseRef: "main",
-			HeadSHA: "abc123",
+			Number:    7,
+			Title:     "Task 7",
+			State:     "open",
+			URL:       "https://github.com/gitmoot/gitmoot/pull/7",
+			HeadRef:   "task-7",
+			BaseRef:   "main",
+			HeadSHA:   "abc123",
+			Mergeable: &mergeable,
 		}},
 		comments: map[int64][]github.IssueComment{7: {}},
 	}
-	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{Ready: true, Merged: true}}
+	client := &mergeGateRaceGitHub{
+		fakeGitHub: baseClient,
+		checks: []github.PullRequestCheck{{
+			Name:   "shard 4 / test",
+			Bucket: "pending",
+			State:  "IN_PROGRESS",
+		}},
+	}
+	gate := &workflow.PolicyMergeGate{AutoMerge: true, Store: store, GitHub: client}
 	engine := workflow.Engine{Store: store, MergeGate: gate}
 	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+	return store, client, daemon, gate
+}
 
-	if err := daemon.PollOnce(ctx); err != nil {
-		t.Fatalf("PollOnce returned error: %v", err)
+type mergeGateRaceGitHub struct {
+	*fakeGitHub
+	checks     []github.PullRequestCheck
+	statuses   []github.CommitStatusInput
+	statusErrs []error
+	merges     []github.MergePullRequestInput
+}
+
+func (f *mergeGateRaceGitHub) GetCombinedStatus(context.Context, github.Repository, string) (github.CombinedStatus, error) {
+	return github.CombinedStatus{State: "success"}, nil
+}
+
+func (f *mergeGateRaceGitHub) ListCheckRunsForRef(context.Context, github.Repository, string) ([]github.PullRequestCheck, error) {
+	return append([]github.PullRequestCheck(nil), f.checks...), nil
+}
+
+func (f *mergeGateRaceGitHub) CreateCommitStatus(_ context.Context, input github.CommitStatusInput) (github.CommitStatus, error) {
+	f.statuses = append(f.statuses, input)
+	var err error
+	if len(f.statusErrs) > 0 {
+		err = f.statusErrs[0]
+		f.statusErrs = f.statusErrs[1:]
 	}
-	if len(gate.requests) != 0 {
-		t.Fatalf("merge gate requests = %+v, want none for skip-native-review-fanout branch", gate.requests)
-	}
+	return github.CommitStatus{Context: input.Context, State: input.State}, err
+}
+
+func (f *mergeGateRaceGitHub) CompareCommits(context.Context, github.Repository, string, string) (github.CompareResult, error) {
+	return github.CompareResult{Status: "ahead"}, nil
+}
+
+func (f *mergeGateRaceGitHub) MergePullRequest(_ context.Context, input github.MergePullRequestInput) (github.MergeResult, error) {
+	f.merges = append(f.merges, input)
+	return github.MergeResult{Merged: true, SHA: "merge123"}, nil
 }
 
 func TestPollOnceRetriesReadyToMergePullRequestAfterBranchUpdateHeadChange(t *testing.T) {
