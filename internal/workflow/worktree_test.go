@@ -1653,18 +1653,15 @@ func TestEngineReclaimAgedFixCloneRequiresPublishedObjectDatabase(t *testing.T) 
 				t.Fatalf("CreateJobWithEvent: %v", err)
 			}
 			manager := &fakeWorktreeManager{
-				cleanSet:        true,
-				clean:           tc.clean,
-				cleanErr:        tc.cleanErr,
-				remoteURL:       "https://example.invalid/owner/repo.git",
-				remoteURLErr:    tc.remoteURLErr,
-				refreshErr:      tc.refreshErr,
-				cloneOnlyErr:    tc.cloneOnlyErr,
-				requireDeadline: tc.requireDeadline,
-				cloneOnly: map[string]string{
-					path:                            tc.unpublished,
-					path + fixCloneQuarantineSuffix: tc.unpublished,
-				},
+				cleanSet:         true,
+				clean:            tc.clean,
+				cleanErr:         tc.cleanErr,
+				remoteURL:        "https://example.invalid/owner/repo.git",
+				remoteURLErr:     tc.remoteURLErr,
+				refreshErr:       tc.refreshErr,
+				cloneOnlyErr:     tc.cloneOnlyErr,
+				requireDeadline:  tc.requireDeadline,
+				cloneOnlyDefault: tc.unpublished,
 			}
 			engine := testEngine(store)
 			engine.Home = home
@@ -1688,8 +1685,9 @@ func TestEngineReclaimAgedFixCloneRequiresPublishedObjectDatabase(t *testing.T) 
 			if !tc.want && statErr != nil {
 				t.Fatalf("ineligible fix clone was removed: %v", statErr)
 			}
-			if _, quarantineErr := os.Stat(path + fixCloneQuarantineSuffix); !os.IsNotExist(quarantineErr) {
-				t.Fatalf("quarantine path survived the pass: %v", quarantineErr)
+			leftovers, quarantineErr := FixCloneQuarantines(path)
+			if quarantineErr != nil || len(leftovers) != 0 {
+				t.Fatalf("quarantines survived the pass: %v (err %v)", leftovers, quarantineErr)
 			}
 			if tc.want && len(manager.refreshedURLs) == 0 {
 				t.Fatal("removal proof never refreshed the trusted remote refs")
@@ -1780,17 +1778,17 @@ func TestEngineReclaimAgedFixCloneQuarantinesBeforeRemoval(t *testing.T) {
 	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
 		t.Fatalf("CreateJobWithEvent: %v", err)
 	}
-	quarantine := path + fixCloneQuarantineSuffix
 	manager := &fakeWorktreeManager{
 		cleanSet:  true,
 		clean:     true,
-		cloneOnly: map[string]string{},
+		cloneOnly: map[string]string{path: ""},
 	}
 	// The first proof sees a published clone; a commit then lands, which only the
-	// quarantined re-proof can observe.
+	// re-proof on the quarantined copy can observe. The quarantine name is random,
+	// so the default answer covers it.
 	manager.cloneOnlyHook = func(probed string) {
 		if probed == path {
-			manager.cloneOnly[quarantine] = "racing-commit"
+			manager.cloneOnlyDefault = "racing-commit"
 		}
 	}
 	engine := testEngine(store)
@@ -1807,10 +1805,11 @@ func TestEngineReclaimAgedFixCloneQuarantinesBeforeRemoval(t *testing.T) {
 	if _, statErr := os.Stat(marker); statErr != nil {
 		t.Fatalf("restored clone lost its content: %v", statErr)
 	}
-	if _, statErr := os.Stat(quarantine); !os.IsNotExist(statErr) {
-		t.Fatalf("clone was left quarantined: %v", statErr)
+	leftovers, quarantineErr := FixCloneQuarantines(path)
+	if quarantineErr != nil || len(leftovers) != 0 {
+		t.Fatalf("clone was left quarantined: %v (err %v)", leftovers, quarantineErr)
 	}
-	if len(manager.cloneOnlyCalls) < 2 || manager.cloneOnlyCalls[1] != quarantine {
+	if len(manager.cloneOnlyCalls) < 2 || manager.cloneOnlyCalls[1] == path {
 		t.Fatalf("clone-only probes = %v, want a re-proof on the quarantined path", manager.cloneOnlyCalls)
 	}
 }
@@ -1829,7 +1828,7 @@ func TestEngineReclaimAgedFixCloneRefusesLeftoverQuarantine(t *testing.T) {
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		t.Fatalf("MkdirAll fix worktree: %v", err)
 	}
-	if err := os.MkdirAll(path+fixCloneQuarantineSuffix, 0o755); err != nil {
+	if err := os.MkdirAll(path+fixCloneQuarantinePrefix+"0123456789abcdef", 0o755); err != nil {
 		t.Fatalf("MkdirAll quarantine: %v", err)
 	}
 	payload, err := marshalPayload(JobPayload{
@@ -1864,6 +1863,122 @@ func TestEngineReclaimAgedFixCloneRefusesLeftoverQuarantine(t *testing.T) {
 	}
 }
 
+// The ordinary (non-TTL) fix-clone cleanup runs on every terminal advance and on
+// the skipped-cleanup pass, so it must make the same inference as the TTL pass:
+// an absent path is not a completed removal while a quarantine of it survives.
+func TestEngineCleanupFixWorktreeKeepsObligationOpenWhileQuarantined(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	const jobID = "fix-cleanup-quarantined"
+	path, err := FixWorktreePath(home, "owner/repo", jobID)
+	if err != nil {
+		t.Fatalf("FixWorktreePath: %v", err)
+	}
+	quarantine := path + fixCloneQuarantinePrefix + "00112233445566ff"
+	if err := os.MkdirAll(quarantine, 0o755); err != nil {
+		t.Fatalf("MkdirAll quarantine: %v", err)
+	}
+	payload, err := marshalPayload(JobPayload{
+		Repo:         "owner/repo",
+		Branch:       "feature/fix",
+		WorktreePath: path,
+		FixWorktree:  true,
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID:      jobID,
+		Agent:   "fixer",
+		Type:    "implement",
+		State:   string(JobSucceeded),
+		Repo:    "owner/repo",
+		Payload: payload,
+	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent: %v", err)
+	}
+	engine := testEngine(store)
+	engine.Home = home
+
+	if _, err := engine.ReclaimTerminalDelegationWorktreeOutcome(ctx, jobID); err != nil {
+		t.Fatalf("ReclaimTerminalDelegationWorktreeOutcome: %v", err)
+	}
+	obligation, err := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID(jobID, path))
+	if err != nil {
+		t.Fatalf("GetCleanupObligation: %v", err)
+	}
+	if obligation.State == db.CleanupObligationRemoved {
+		t.Fatalf("obligation = %+v, want it open while %s holds the clone", obligation, quarantine)
+	}
+	if _, statErr := os.Stat(quarantine); statErr != nil {
+		t.Fatalf("quarantined clone was removed: %v", statErr)
+	}
+}
+
+// An unreadable process table retains every clone forever. That must be visible:
+// a silent keep is indistinguishable from a worker that is genuinely running.
+func TestEngineReclaimAgedFixCloneRecordsInconclusiveLiveness(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	const jobID = "fix-liveness-unknown"
+	path, err := FixWorktreePath(home, "owner/repo", jobID)
+	if err != nil {
+		t.Fatalf("FixWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("MkdirAll fix worktree: %v", err)
+	}
+	payload, err := marshalPayload(JobPayload{
+		Repo:         "owner/repo",
+		Branch:       "feature/fix",
+		WorktreePath: path,
+		FixWorktree:  true,
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID:      jobID,
+		Agent:   "fixer",
+		Type:    "implement",
+		State:   string(JobSucceeded),
+		Repo:    "owner/repo",
+		Payload: payload,
+	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent: %v", err)
+	}
+	engine := testEngine(store)
+	engine.Home = home
+	engine.DelegationWorktrees = &fakeWorktreeManager{cleanSet: true, clean: true}
+	engine.WorktreeHasLiveProcess = nil
+	engine.WorktreeLiveness = func(string) (bool, bool) { return false, false }
+
+	for attempt := 0; attempt < 2; attempt++ {
+		reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
+		if err != nil {
+			t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
+		}
+		if reclaimed {
+			t.Fatal("clone with unprovable liveness was reclaimed")
+		}
+	}
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	unknown := 0
+	for _, event := range events {
+		if event.Kind == "delegation_worktree_liveness_unknown" {
+			unknown++
+		}
+	}
+	if unknown != 1 {
+		t.Fatalf("liveness-unknown events = %d, want exactly 1: %+v", unknown, events)
+	}
+}
+
 // A crash between the quarantine rename and the removal leaves the clone at the
 // quarantine path with nothing at the original path. That must be RESTORED, never
 // reported as a completed reclaim: completing it retires the candidate forever
@@ -1877,7 +1992,7 @@ func TestEngineReclaimAgedFixCloneRestoresInterruptedQuarantine(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FixWorktreePath: %v", err)
 	}
-	quarantine := path + fixCloneQuarantineSuffix
+	quarantine := path + fixCloneQuarantinePrefix + "fedcba9876543210"
 	if err := os.MkdirAll(quarantine, 0o755); err != nil {
 		t.Fatalf("MkdirAll quarantine: %v", err)
 	}
@@ -2047,6 +2162,7 @@ type fakeWorktreeManager struct {
 	refreshedPaths   []string
 	refreshedURLs    []string
 	cloneOnly        map[string]string // path -> unpublished sha ("" proves published)
+	cloneOnlyDefault string            // answer for paths absent from cloneOnly
 	cloneOnlyErr     error
 	cloneOnlyCalls   []string
 	cloneOnlyHook    func(path string) // mutate the clone between proof rounds
@@ -2172,7 +2288,10 @@ func (f *fakeWorktreeManager) CloneOnlyCommit(_ context.Context, path string) (s
 	if f.cloneOnlyErr != nil {
 		return "", f.cloneOnlyErr
 	}
-	return f.cloneOnly[path], nil
+	if sha, ok := f.cloneOnly[path]; ok {
+		return sha, nil
+	}
+	return f.cloneOnlyDefault, nil
 }
 
 func (f *fakeWorktreeManager) AddDetachedWorktree(_ context.Context, path string, ref string) error {

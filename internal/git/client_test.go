@@ -593,6 +593,85 @@ func TestClientCloneOnlyCommitIgnoresUnprunableNamespaceRefs(t *testing.T) {
 	}
 }
 
+// Grafts and replace refs are clone-local ancestry rewrites. If the proof honours
+// them, a clone can attach an upstream tip to its own unpublished root and report
+// that nothing is unpublished, which authorises deleting the only copy.
+func TestClientCloneOnlyCommitIgnoresCloneLocalAncestryRewrites(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	ctx := context.Background()
+	root := t.TempDir()
+	remote := filepath.Join(root, "origin.git")
+	seed := filepath.Join(root, "seed")
+	clone := filepath.Join(root, "fix")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "clone", remote, seed)
+	runGit(t, seed, "config", "user.email", "gitmoot@example.com")
+	runGit(t, seed, "config", "user.name", "Gitmoot")
+	runGit(t, seed, "switch", "-c", "feature/fix")
+	if err := os.WriteFile(filepath.Join(seed, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile base: %v", err)
+	}
+	runGit(t, seed, "add", "base.txt")
+	runGit(t, seed, "commit", "-m", "base")
+	runGit(t, seed, "push", "-u", "origin", "feature/fix")
+	upstreamHead, err := NewHostClient(seed).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("upstream HeadSHA: %v", err)
+	}
+	runGit(t, root, "clone", remote, clone)
+	runGit(t, clone, "switch", "feature/fix")
+	runGit(t, clone, "config", "user.email", "gitmoot@example.com")
+	runGit(t, clone, "config", "user.name", "Gitmoot")
+	runGit(t, clone, "switch", "--orphan", "clone-only")
+	runGit(t, clone, "commit", "--allow-empty", "-m", "clone only root")
+	cloneOnlyRoot, err := NewHostClient(clone).HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("clone-only HeadSHA: %v", err)
+	}
+	runGit(t, clone, "switch", "feature/fix")
+
+	host := NewHostClient(seed)
+	if err := host.RefreshCloneProofRefs(ctx, clone, remote); err != nil {
+		t.Fatalf("RefreshCloneProofRefs: %v", err)
+	}
+	unpublished, err := host.CloneOnlyCommit(ctx, clone)
+	if err != nil {
+		t.Fatalf("CloneOnlyCommit: %v", err)
+	}
+	if unpublished != cloneOnlyRoot {
+		t.Fatalf("clone-only commit = %q, want %s", unpublished, cloneOnlyRoot)
+	}
+
+	// A grafts file cannot be suppressed from the command line, so the proof must
+	// refuse outright; a replace ref is disabled, and the replacement commit object
+	// it creates is itself clone-only, so the proof must still name a commit.
+	infoDir := filepath.Join(clone, ".git", "info")
+	if err := os.MkdirAll(infoDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll info: %v", err)
+	}
+	graftFile := filepath.Join(infoDir, "grafts")
+	if err := os.WriteFile(graftFile, []byte(upstreamHead+" "+cloneOnlyRoot+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile grafts: %v", err)
+	}
+	if _, err := host.CloneOnlyCommit(ctx, clone); err == nil || !strings.Contains(err.Error(), "grafts file") {
+		t.Fatalf("CloneOnlyCommit error = %v, want a refusal naming the grafts file", err)
+	}
+	if err := os.Remove(graftFile); err != nil {
+		t.Fatalf("Remove grafts: %v", err)
+	}
+
+	runGit(t, clone, "replace", "--graft", upstreamHead, cloneOnlyRoot)
+	unpublished, err = host.CloneOnlyCommit(ctx, clone)
+	if err != nil {
+		t.Fatalf("CloneOnlyCommit after replace: %v", err)
+	}
+	if unpublished == "" {
+		t.Fatal("replace-graft ancestry hid every unpublished commit")
+	}
+}
+
 func TestClientCloneOnlyCommitDistrustsCloneOrigin(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")

@@ -694,6 +694,56 @@ func TestTerminalTaskWorktreeReclaimResumeIsPerRepo(t *testing.T) {
 	}
 }
 
+// The engine renames a fix clone aside before deleting it. If the scheduler reads
+// an absent path as a completed removal while that quarantine still exists, the
+// obligation is marked removed and the clone can never be restored.
+func TestFinishDelegationCleanupAttemptKeepsQuarantinedCloneUnfinished(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	})
+	worker := defaultJobWorker(store, io.Discard, home)
+	now := time.Now().UTC()
+	path := filepath.Join(home, "worktrees", "owner--repo", "fix", "job-1")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll parent: %v", err)
+	}
+	quarantine := path + ".ttl-reclaiming-0123456789abcdef"
+	if err := os.MkdirAll(quarantine, 0o755); err != nil {
+		t.Fatalf("MkdirAll quarantine: %v", err)
+	}
+
+	if err := finishDelegationCleanupAttempt(ctx, worker, "job-1", path, false, now); err != nil {
+		t.Fatalf("finishDelegationCleanupAttempt: %v", err)
+	}
+	obligation, err := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID("job-1", path))
+	if err != nil {
+		t.Fatalf("GetCleanupObligation: %v", err)
+	}
+	if obligation.State == db.CleanupObligationRemoved {
+		t.Fatalf("obligation = %+v, want it still open while a quarantine survives", obligation)
+	}
+
+	// With the quarantine gone, an absent path is genuine evidence of removal.
+	if err := os.RemoveAll(quarantine); err != nil {
+		t.Fatalf("RemoveAll quarantine: %v", err)
+	}
+	if err := finishDelegationCleanupAttempt(ctx, worker, "job-1", path, false, now); err != nil {
+		t.Fatalf("finishDelegationCleanupAttempt after quarantine removal: %v", err)
+	}
+	obligation, err = store.GetCleanupObligation(ctx, db.CleanupObligationResourceID("job-1", path))
+	if err != nil {
+		t.Fatalf("GetCleanupObligation: %v", err)
+	}
+	if obligation.State != db.CleanupObligationRemoved {
+		t.Fatalf("obligation = %+v, want removed once no quarantine survives", obligation)
+	}
+}
+
 func TestReclaimTerminalTaskWorktreesNamesMalformedGlobalPin(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()

@@ -550,15 +550,21 @@ period the daemon force-removes dirty terminal-owned read-only and delegation
 worktrees. An independent fix clone is different: removing it deletes its object
 database, so Gitmoot mirrors every branch and tag of the **registered repository
 checkout's** remote URL into the clone's proof namespace
-(`refs/remotes/gitmoot-reclaim-proof/*`, pruned each pass) within a two-minute
-probe deadline, then requires that no commit reachable from any local ref or
-reflog is absent from those refs. The clone's own `origin` is never trusted; it
-is writable by whatever ran in the clone.
+(`refs/remotes/gitmoot-reclaim-proof/heads/*` and `.../tags/*`, pruned each pass)
+within a two-minute probe deadline, then requires that no commit reachable from
+any local ref or reflog is absent from those refs. The traversal ignores replace
+objects and refuses outright when the clone carries a grafts file. The clone's own
+`origin` is never trusted; it is writable by whatever ran in the clone.
 
-A proven-disposable clone is renamed to `<path>.ttl-reclaiming` and re-proven
-there before deletion, so a commit racing the final proof cannot be discarded; a
-failed re-proof renames it back, and a leftover `.ttl-reclaiming` directory is
-reported rather than deleted. A retained clone records the
+A proven-disposable clone is renamed to `<path>.ttl-reclaiming-<random>` and
+re-proven there before deletion. The rename excludes writers using the original
+path and the new name is unguessable; a process that already holds the directory
+can still write into it, which is why the liveness scan is repeated on the
+quarantined path, and a writer holding only an open file descriptor stays
+undetectable. A failed re-proof renames the clone back. An interrupted removal is
+restored by the next pass (`delegation_worktree_quarantine_restored`) and
+re-proven, and the scheduler does not treat the absent original path as a
+completed removal while such a sibling survives. A retained clone records the
 `delegation_worktree_retained_unpublished` event and carries cleanup-obligation
 reason `unpublished_commits`; squash-merged fix branches land here by design,
 because a squash publishes the content and not the commits. An already-absent

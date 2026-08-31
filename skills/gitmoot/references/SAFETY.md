@@ -522,6 +522,28 @@ owning job is final (`succeeded`, `failed`, or `cancelled`) and its terminal
 delay preserves a short debugging window. `blocked` is resumable and is never a
 TTL reclaim candidate. A successful force-remove and metadata prune records
 `delegation_worktree_reclaimed_ttl`.
+
+An aged fix clone is NOT force-removed on the same terms, because it is a
+standalone clone: deleting it deletes its object database. Gitmoot mirrors the
+registered checkout's remote branches and tags into
+`refs/remotes/gitmoot-reclaim-proof/heads/*` and `.../tags/*` (pruned each pass,
+two-minute probe deadline) and removes the clone only when no commit reachable
+from any local ref or reflog is missing from those refs. The clone's own `origin`
+is never trusted, replace objects are ignored, and a grafts file makes the clone
+unprovable. The proven clone is renamed to `<path>.ttl-reclaiming-<random>`,
+re-proven there, and only then deleted; an interrupted removal is restored by the
+next pass (`delegation_worktree_quarantine_restored`) and no pass treats the
+absent original path as a completed removal while such a sibling exists. A clone
+that still holds unpublished commits records
+`delegation_worktree_retained_unpublished` and obligation reason
+`unpublished_commits` — the normal outcome for a squash-merged branch, whose
+content is published while its commits are not. An inconclusive process-liveness
+probe records `delegation_worktree_liveness_unknown` so a host where the process
+table cannot be read is visibly inert rather than silently retaining everything.
+
+Task-owned worktrees have their own pass, driven by terminal task lifecycle state
+rather than age, and bounded at eight safety proofs per tick with a per-repo
+rotating window so a permanently retained worktree cannot starve the rest.
 Candidate-local lookup, runner, and removal failures skip only that worktree so
 later candidates continue; candidate-query and store-wide lookup failures still
 abort. Repeated failures log three times per path before suppression. Cleanup

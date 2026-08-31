@@ -95,9 +95,28 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 	}
 
 	pathsOnDisk := map[string]struct{}{}
-	for path := range owned {
+	quarantineClasses := map[string]delegationWorktreeClass{}
+	for path, class := range owned {
 		if info, err := os.Stat(path); err == nil && info.IsDir() {
 			pathsOnDisk[path] = struct{}{}
+		}
+		// A fix clone mid-removal lives at a quarantine sibling, not at the
+		// recorded path. Counting only recorded paths hides exactly the directory
+		// an interrupted removal leaves behind.
+		quarantines, err := workflow.FixCloneQuarantines(path)
+		if err != nil {
+			continue
+		}
+		for _, quarantine := range quarantines {
+			if info, err := os.Stat(quarantine); err == nil && info.IsDir() {
+				pathsOnDisk[quarantine] = struct{}{}
+				quarantineClasses[quarantine] = class
+			}
+		}
+	}
+	for quarantine, class := range quarantineClasses {
+		if _, classified := owned[quarantine]; !classified {
+			owned[quarantine] = class
 		}
 	}
 	// Canonical layout: <root>/<owner--repo>/delegations/<parent>/<leg>.

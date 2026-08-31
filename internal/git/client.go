@@ -650,12 +650,28 @@ func (c Client) RefreshCloneProofRefs(ctx context.Context, path string, remoteUR
 // prunes. A wider glob over the whole namespace would let any other ref under it
 // act as an exclusion tip that prune can never remove, and one such ref hides
 // every unpublished commit behind it.
+// Clone-local ancestry rewrites are neutralised, because either one lets a clone
+// attach an upstream tip to its own unpublished root and make the proof report
+// nothing. Replace objects are disabled with --no-replace-objects. A deprecated
+// grafts file cannot be disabled from the command line at all — measured on git
+// 2.43, `-c core.graftFile=/dev/null` still honours it and only the
+// GIT_GRAFT_FILE environment variable suppresses it — so its presence makes the
+// clone unprovable and the proof refuses rather than trusting the ancestry.
 func (c Client) CloneOnlyCommit(ctx context.Context, path string) (string, error) {
 	path, err := validateWorktreePath(path)
 	if err != nil {
 		return "", err
 	}
-	result, err := NewClient(path, c.runner).run(ctx, "rev-list", "--max-count=1", "--all", "--reflog",
+	graftFile, grafted, err := cloneGraftFile(path)
+	if err != nil {
+		return "", err
+	}
+	if grafted {
+		return "", fmt.Errorf("clone %s carries a grafts file (%s); its commit ancestry is rewritten locally and cannot be proven", path, graftFile)
+	}
+	result, err := NewClient(path, c.runner).run(ctx,
+		"--no-replace-objects",
+		"rev-list", "--max-count=1", "--all", "--reflog",
 		"--not",
 		"--glob="+cloneReclaimProofNamespace+"heads/*",
 		"--glob="+cloneReclaimProofNamespace+"tags/*")
@@ -668,6 +684,32 @@ func (c Client) CloneOnlyCommit(ctx context.Context, path string) (string, error
 		}
 	}
 	return "", nil
+}
+
+// cloneGraftFile locates a clone's deprecated grafts file and reports whether it
+// holds any content.
+func cloneGraftFile(path string) (string, bool, error) {
+	gitDir := filepath.Join(path, ".git")
+	info, err := os.Stat(gitDir)
+	switch {
+	case err == nil && !info.IsDir():
+		resolved, resolveErr := worktreeGitDir(path)
+		if resolveErr != nil {
+			return "", false, fmt.Errorf("resolve git directory for %s: %w", path, resolveErr)
+		}
+		gitDir = resolved
+	case err != nil && !os.IsNotExist(err):
+		return "", false, fmt.Errorf("inspect git directory for %s: %w", path, err)
+	}
+	graftFile := filepath.Join(gitDir, "info", "grafts")
+	graftInfo, err := os.Stat(graftFile)
+	if os.IsNotExist(err) {
+		return graftFile, false, nil
+	}
+	if err != nil {
+		return graftFile, false, fmt.Errorf("inspect grafts file %s: %w", graftFile, err)
+	}
+	return graftFile, graftInfo.Size() > 0, nil
 }
 
 func (c Client) StatusPorcelain(ctx context.Context) (string, error) {

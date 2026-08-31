@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -1199,7 +1200,26 @@ func (e Engine) cleanupFixWorktree(ctx context.Context, jobID string, jobType st
 		e.recordCleanupSkippedOnce(opCtx, jobID, payload, "path is not the job's managed fix-worktree path")
 		return cleanupErr
 	}
+	// An absent path is evidence of a completed removal only when no
+	// interrupted-removal quarantine of this clone survives. The TTL pass renames
+	// the clone aside before deleting it, so "path absent, clone alive" is a real
+	// state and marking the obligation removed here would retire the candidate
+	// before the TTL pass can restore it.
+	quarantines, quarantineErr := FixCloneQuarantines(path)
+	if quarantineErr != nil {
+		if persistErr := e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", quarantineErr); persistErr != nil {
+			return errors.Join(quarantineErr, persistErr)
+		}
+		return fmt.Errorf("inspect fix clone quarantines beside %s: %w", path, quarantineErr)
+	}
 	if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
+		if len(quarantines) > 0 {
+			if err := e.deferDelegationCleanupObligation(opCtx, jobID, path, db.CleanupReasonTerminalDeferred); err != nil {
+				return err
+			}
+			e.recordCleanupSkippedOnce(opCtx, jobID, payload, fmt.Sprintf("interrupted TTL removal left %s; awaiting restore", quarantines[0]))
+			return nil
+		}
 		return e.markDelegationCleanupRemoved(opCtx, jobID, path)
 	} else if statErr != nil {
 		if persistErr := e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", statErr); persistErr != nil {
@@ -1647,13 +1667,37 @@ func (e Engine) completeAgedTerminalFixWorktreeReclaim(ctx context.Context, jobI
 	return err == nil, err
 }
 
-// fixCloneQuarantineSuffix names the sibling path a proven-disposable fix clone
+// fixCloneQuarantinePrefix names the sibling path a proven-disposable fix clone
 // is renamed to before deletion. The rename is the atomicity boundary the proof
-// needs: it is a single filesystem operation on the same directory, and once it
+// needs: it is a single filesystem operation in the same directory, and once it
 // returns no `git -C <original path>` can create a commit inside the clone that
 // is about to be deleted. Anything that followed the directory instead is caught
 // by repeating every proof on the quarantined copy.
-const fixCloneQuarantineSuffix = ".ttl-reclaiming"
+//
+// The suffix carries RANDOM bytes because the quarantine path is documented: a
+// predictable name is a name a process can open between the final proof and the
+// removal. Callers therefore discover quarantines by globbing this prefix rather
+// than reconstructing one name.
+const fixCloneQuarantinePrefix = ".ttl-reclaiming-"
+
+// FixCloneQuarantines lists the interrupted-removal siblings of a fix clone. The
+// daemon needs this too: an absent clone path is only evidence of a completed
+// removal when no quarantine of it survives.
+func FixCloneQuarantines(path string) ([]string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil, nil
+	}
+	return filepath.Glob(filepath.Clean(path) + fixCloneQuarantinePrefix + "*")
+}
+
+func newFixCloneQuarantinePath(path string) (string, error) {
+	suffix := make([]byte, 8)
+	if _, err := rand.Read(suffix); err != nil {
+		return "", fmt.Errorf("generate fix clone quarantine suffix: %w", err)
+	}
+	return filepath.Clean(path) + fixCloneQuarantinePrefix + hex.EncodeToString(suffix), nil
+}
 
 // pathPresent distinguishes "absent" from "cannot tell", so a stat failure is
 // never read as an absence by a caller that deletes things.
@@ -1683,23 +1727,24 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 	// absent path beside a quarantined clone. Completing the reclaim there would
 	// record the removal, retire the candidate, and leave the clone on disk with
 	// nothing left to find it.
-	quarantine := path + fixCloneQuarantineSuffix
-	quarantined, err := pathPresent(quarantine)
+	quarantines, err := FixCloneQuarantines(path)
 	if err != nil {
-		return false, fmt.Errorf("inspect fix clone quarantine path %s: %w", quarantine, err)
+		return false, fmt.Errorf("inspect fix clone quarantines beside %s: %w", path, err)
 	}
 	present, err := pathPresent(path)
 	if err != nil {
 		return false, fmt.Errorf("inspect aged terminal fix worktree %s: %w", path, err)
 	}
 	switch {
-	case quarantined && present:
-		return false, fmt.Errorf("refusing TTL reclaim: quarantined fix clone %s from an interrupted removal still exists beside %s", quarantine, path)
-	case quarantined:
+	case len(quarantines) > 1:
+		return false, fmt.Errorf("refusing TTL reclaim: %d quarantined fix clones survive beside %s: %s", len(quarantines), path, strings.Join(quarantines, ", "))
+	case len(quarantines) == 1 && present:
+		return false, fmt.Errorf("refusing TTL reclaim: quarantined fix clone %s from an interrupted removal still exists beside %s", quarantines[0], path)
+	case len(quarantines) == 1:
 		// Interrupted removal: restore the clone and let a later pass re-prove it
 		// from scratch. The earlier proofs died with the interrupted pass.
-		if renameErr := os.Rename(quarantine, path); renameErr != nil {
-			return false, fmt.Errorf("restore interrupted quarantined fix clone %s to %s: %w", quarantine, path, renameErr)
+		if renameErr := os.Rename(quarantines[0], path); renameErr != nil {
+			return false, fmt.Errorf("restore interrupted quarantined fix clone %s to %s: %w", quarantines[0], path, renameErr)
 		}
 		return false, e.Store.AddJobEvent(context.WithoutCancel(ctx), db.JobEvent{
 			JobID: jobID, Kind: "delegation_worktree_quarantine_restored",
@@ -1709,8 +1754,13 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 		return e.completeAgedTerminalFixWorktreeReclaim(ctx, jobID, path)
 	}
 	// A live process wins before any manager capability or probe matters: the
-	// cheapest gate is also the one that must never be skipped.
-	if live, known := e.worktreeLiveness(path); !known || live {
+	// cheapest gate is also the one that must never be skipped. An INCONCLUSIVE
+	// probe retains the clone too, but it is recorded: an unreadable process table
+	// makes the whole feature inert, and a silent keep is indistinguishable from a
+	// worker that is genuinely still running.
+	if live, known := e.worktreeLiveness(path); !known {
+		return false, e.recordFixCloneLivenessUnknown(ctx, jobID, path)
+	} else if live {
 		return false, nil
 	}
 	manager, ok := e.DelegationWorktrees.(WritableWorktreeLineageManager)
@@ -1747,6 +1797,10 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 	}
 	if live, known := e.worktreeLiveness(path); !known || live {
 		return false, nil
+	}
+	quarantine, err := newFixCloneQuarantinePath(path)
+	if err != nil {
+		return false, err
 	}
 	if err := os.Rename(path, quarantine); err != nil {
 		return false, fmt.Errorf("quarantine aged terminal fix worktree %s: %w", path, err)
@@ -1786,31 +1840,49 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 	return e.completeAgedTerminalFixWorktreeReclaim(ctx, jobID, path)
 }
 
-// retainFixCloneWithUnpublishedCommits records WHY a clone survived its TTL. A
-// squash merge publishes the content and not the commits, so this is the normal
-// outcome for a squash-merged fix branch: the obligation row keeps the reason and
-// the sha visible to an operator instead of retrying silently forever.
 func (e Engine) retainFixCloneWithUnpublishedCommits(ctx context.Context, jobID, path, sha string) error {
 	opCtx := context.WithoutCancel(ctx)
-	// The reclaim pass revisits every aged candidate on a five-minute cadence, so
-	// the event is emitted on the transition into this reason, not per attempt.
-	announce := true
-	obligation, err := e.Store.GetCleanupObligation(opCtx, db.CleanupObligationResourceID(jobID, path))
-	switch {
-	case err == nil:
-		announce = obligation.Reason != db.CleanupReasonUnpublishedCommits
-	case !errors.Is(err, sql.ErrNoRows):
+	// Dedupe on the EVENT LOG, not on the obligation reason: the event and the
+	// reason are separate writes, so a crash between them would otherwise
+	// re-announce forever. The log is the record that already exists.
+	events, err := e.Store.ListJobEvents(opCtx, jobID)
+	if err != nil {
 		return err
 	}
-	if announce {
-		if err := e.Store.AddJobEvent(opCtx, db.JobEvent{
-			JobID: jobID, Kind: "delegation_worktree_retained_unpublished",
-			Message: fmt.Sprintf("fix clone %s retained after TTL: commit %s is in no trusted remote ref", path, sha),
-		}); err != nil {
-			return err
+	message := fmt.Sprintf("fix clone %s retained after TTL: commit %s is in no trusted remote ref", path, sha)
+	for _, event := range events {
+		if event.Kind == "delegation_worktree_retained_unpublished" && event.Message == message {
+			return e.deferDelegationCleanupObligation(opCtx, jobID, path, db.CleanupReasonUnpublishedCommits)
 		}
 	}
+	if err := e.Store.AddJobEvent(opCtx, db.JobEvent{
+		JobID: jobID, Kind: "delegation_worktree_retained_unpublished", Message: message,
+	}); err != nil {
+		return err
+	}
 	return e.deferDelegationCleanupObligation(opCtx, jobID, path, db.CleanupReasonUnpublishedCommits)
+}
+
+// recordFixCloneLivenessUnknown makes an inert deployment visible. A process
+// table that cannot be read (a non-root daemon seeing EACCES on another user's
+// process, or a host with no /proc at all) retains every clone forever, and
+// without this event that is indistinguishable from clones that are genuinely
+// still in use. Deduped on the event log so the five-minute pass records it once.
+func (e Engine) recordFixCloneLivenessUnknown(ctx context.Context, jobID, path string) error {
+	opCtx := context.WithoutCancel(ctx)
+	events, err := e.Store.ListJobEvents(opCtx, jobID)
+	if err != nil {
+		return err
+	}
+	message := fmt.Sprintf("fix clone %s retained after TTL: process liveness could not be proven", path)
+	for _, event := range events {
+		if event.Kind == "delegation_worktree_liveness_unknown" && event.Message == message {
+			return nil
+		}
+	}
+	return e.Store.AddJobEvent(opCtx, db.JobEvent{
+		JobID: jobID, Kind: "delegation_worktree_liveness_unknown", Message: message,
+	})
 }
 
 // ReclaimAgedTerminalDelegationWorktreeOutcome is the reporting form used by

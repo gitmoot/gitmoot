@@ -734,19 +734,24 @@ delegation worktrees are force-removed even when dirty. An independent fix
 clone is different: removing it deletes its object database, so a clean working
 tree and a published HEAD are not sufficient evidence. Gitmoot mirrors every
 branch and tag of the **registered repository checkout's** remote URL into the
-clone's own proof namespace (`refs/remotes/gitmoot-reclaim-proof/*`, pruned each
-pass) within a two-minute probe deadline, then requires that no commit reachable
-from any local ref or reflog is missing from those refs. The trusted URL comes
+clone's own proof namespace (`refs/remotes/gitmoot-reclaim-proof/heads/*` and
+`.../tags/*`, pruned each pass) within a two-minute probe deadline, then requires
+that no commit reachable from any local ref or reflog is missing from those refs.
+The traversal ignores replace objects and refuses outright when the clone carries
+a grafts file, because both rewrite ancestry locally. The trusted URL comes
 from the registered checkout, never from the clone's own `origin`, which
 whatever ran in the clone could have rewritten.
 
 The proven-disposable clone is then **renamed to a sibling
-`<path>.ttl-reclaiming` before deletion** and every proof is repeated there:
-the rename is a single filesystem operation, so a commit racing the final proof
-lands in a path that no longer exists, and anything that followed the directory
-is caught by the re-proof. A failed re-proof renames the clone back. A leftover
-`.ttl-reclaiming` directory from an interrupted removal is reported, never
-deleted.
+`<path>.ttl-reclaiming-<random>` before deletion** and every proof is repeated
+there. What the rename guarantees: a writer using the ORIGINAL path finds nothing
+there, and the name it moved to is unguessable. What it does not guarantee: a
+process that already holds the directory can still write into it, so the repeated
+liveness scan covers the quarantined path, and a writer holding only an open file
+descriptor remains undetectable. A failed re-proof renames the clone back. An
+interrupted removal leaves a `.ttl-reclaiming-*` sibling; the next pass restores
+it (`delegation_worktree_quarantine_restored`) and re-proves it from scratch
+rather than treating the absent original path as a completed removal.
 
 A retained clone records **why**: the `delegation_worktree_retained_unpublished`
 job event names the offending commit, and the cleanup obligation carries reason

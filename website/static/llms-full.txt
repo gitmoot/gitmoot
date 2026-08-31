@@ -2796,32 +2796,100 @@ Fixes:
   then abstains from its native merge gate — fail-closed, it never merges
   gatelessly; the external gate makes the call.
 
-## Delegation worktrees consume too much disk
+## Worktrees consume too much disk
+
+The daemon checks task-owned worktrees every five minutes. A task is eligible
+only in `merged`, `dismissed`, `superseded`, or `stranded`. Age is not an
+eligibility signal. Before removal, Gitmoot re-reads the task under the checkout
+mutation lock and requires all of these checks to pass:
+
+- no non-final job names the task or path
+- no branch lock owns the task branch
+- the `/proc/<pid>/cwd` scan was conclusive and no process has a cwd in the worktree
+- the recorded path is the deterministic task path
+- `git status --porcelain --ignored` reports no tracked, untracked, or ignored content
+- the worktree HEAD is reachable from the recorded task branch, so removing a
+  clean detached worktree cannot orphan a local commit
+
+A malformed payload on any non-final job also counts as an active owner because
+Gitmoot cannot prove that it refers to another worktree. The bounded retention
+log names one malformed job responsible for this global safety pin.
+
+Removal uses `git worktree remove` without `--force` and preserves the branch.
+Gitmoot then clears the task's stored path and records
+`terminal_worktree_reclaimed`. A live process, unreadable process table, dirty
+tree, unreachable HEAD, active owner, or failed proof retains the path.
+Retention decisions are logged three times per path and classification before
+identical messages are suppressed.
+
+If the worktree belongs to an older checkout root, Gitmoot retries removal
+through the owner named by the worktree's `.git` pointer. An owner mismatch that
+cannot be inspected or removed is recorded as `terminal_worktree_unremovable`
+and excluded from later passes. A later task update makes it eligible again.
 
 `gitmoot doctor` reports delegation-worktree usage as
-`N stale worktrees / X GB under <home>/worktrees`. The detail separates aged
-final owners that are **reclaimable**, resumable/non-final owners that are
-**pinned**, and directories whose owner is **unproven**. Pinned includes
-`blocked`, `queued`, and `running`; Gitmoot never force-removes those.
+`N stale worktrees / X GB under <home>/worktrees`. It does not include ordinary
+task worktrees; use the bounded `terminal task worktree retained` daemon lines
+for those paths. Doctor detail separates aged final delegation owners that are
+**reclaimable**, resumable/non-final owners that are **pinned**, and directories
+whose owner is **unproven**. Pinned includes `blocked`, `queued`, and `running`;
+Gitmoot never force-removes those.
 
 `[workflow].delegation_worktree_ttl = "72h"` is default-on because a final
 delegation owner cannot resume, while the grace period preserves short-term
-debugging access. Set it to `"0"` to disable the TTL pass. Aged final owners are
-force-removed even when dirty, Git worktree metadata is pruned, and
-`delegation_worktree_reclaimed_ttl` is recorded. The dashboard `/api/health`
-response exposes the same count, bytes, path, breakdown, and summary in its
-top-level `worktrees` field, including the number of cleanup obligations in
-terminal quarantine.
+debugging access. Set it to `"0"` to disable the TTL pass. Aged read-only and
+delegation worktrees are force-removed even when dirty. An independent fix
+clone is different: removing it deletes its object database, so a clean working
+tree and a published HEAD are not sufficient evidence. Gitmoot mirrors every
+branch and tag of the **registered repository checkout's** remote URL into the
+clone's own proof namespace (`refs/remotes/gitmoot-reclaim-proof/heads/*` and
+`.../tags/*`, pruned each pass) within a two-minute probe deadline, then requires
+that no commit reachable from any local ref or reflog is missing from those refs.
+The traversal ignores replace objects and refuses outright when the clone carries
+a grafts file, because both rewrite ancestry locally. The trusted URL comes
+from the registered checkout, never from the clone's own `origin`, which
+whatever ran in the clone could have rewritten.
 
-One unreclaimable candidate does not stop the pass: candidate-local lookup,
-runner, and removal failures are skipped while later paths continue. The daemon
-logs the first three failures for a path and suppresses repeats.
+The proven-disposable clone is then **renamed to a sibling
+`<path>.ttl-reclaiming-<random>` before deletion** and every proof is repeated
+there. What the rename guarantees: a writer using the ORIGINAL path finds nothing
+there, and the name it moved to is unguessable. What it does not guarantee: a
+process that already holds the directory can still write into it, so the repeated
+liveness scan covers the quarantined path, and a writer holding only an open file
+descriptor remains undetectable. A failed re-proof renames the clone back. An
+interrupted removal leaves a `.ttl-reclaiming-*` sibling; the next pass restores
+it (`delegation_worktree_quarantine_restored`) and re-proves it from scratch
+rather than treating the absent original path as a completed removal.
+
+A retained clone records **why**: the `delegation_worktree_retained_unpublished`
+job event names the offending commit, and the cleanup obligation carries reason
+`unpublished_commits` until the state changes. A squash merge publishes the
+content under a new commit while the branch commits stay clone-only, so a
+squash-merged fix clone is retained by design rather than silently retried
+forever.
+
+An already-absent managed fix path completes the same bookkeeping instead of
+consuming retries or entering quarantine. `delegation_worktree_reclaimed_ttl`
+is recorded after removal or this already-absent reconciliation. The dashboard
+`/api/health` response exposes the same count, bytes, path, breakdown, and
+summary in its top-level `worktrees` field, including the number of cleanup
+obligations in terminal quarantine.
+
+Terminal-task reclaim failures use the same three-message path limit before
+suppressing identical repeats. The pass proves at most eight candidates per
+tick — each proof takes the checkout mutation lock and walks the ignored tree
+twice — and rotates its window through the candidate list so a permanently
+retained worktree cannot starve the ones behind it.
+
+One unreclaimable delegation candidate does not stop the pass. Candidate-local
+lookup, runner, and removal failures are skipped while later paths continue.
+The daemon logs the first three failures for a path and suppresses repeats.
 Each failure advances a durable, restart-safe cleanup obligation. Retries wait
 one minute and stop after the third failure in `quarantined`; quarantined paths
 are not selected again until an operator inspects `gitmoot job cleanup list
 --state quarantined` and runs `gitmoot job cleanup reopen <resource-id>`.
-Candidate-query and store-wide lookup failures still abort the pass and surface
-normally.
+The five-minute worktree cadence advances after every attempted pass, including
+passes with candidate failures, so a failed cleanup cannot hot-loop.
 
 For immediate manual relief, list paths and then prove the owner is final. Do
 not infer safety from directory age alone:
@@ -9918,8 +9986,8 @@ can discover Gitmoot through an installed runtime plugin. Use
 adds the resolved `.gitmoot` home to the sandbox on Linux, macOS, and Windows.
 Use `gitmoot goal template` when
 writing a standard task-by-task goal file. Use `gitmoot workflow list`, `gitmoot
-workflow show`, `gitmoot workflow describe`, `gitmoot workflow note`, and
-`gitmoot workflow close` to
+workflow show`, `gitmoot workflow show-note`, `gitmoot workflow describe`,
+`gitmoot workflow note`, and `gitmoot workflow close` to
 inspect external-coordinator workflow groups, set their stable description, add
 verbatim journal entries, set a manual status escape hatch, optionally stage
 a note in persistent memory, and end a finished group. Workflow hygiene:
@@ -9927,6 +9995,9 @@ a note in persistent memory, and end a finished group. Workflow hygiene:
 work merges or completes — never-closed workflows accumulate and bury live
 work in the dashboard's active buckets and every workflow-picking surface. Linked PR lifecycle transitions also add deduped
 `daemon` journal notes and advance live status.
+In org mode, `gitmoot org message send --to <role> --workflow <label>
+"<message>"` gives distinct same-parent siblings a durable sender-attributed
+heads-up. It creates no acknowledgment, completion, TTL, or nag obligation.
 In org mode, obligations and questions have a full lifecycle and closing it is
 part of the work: `gitmoot org directive send --to <role> --workflow <label>`
 mints a tracked, TTL-nudged obligation; `org directive ack <id>` records
@@ -11885,8 +11956,8 @@ whichever current pane uniquely carries that cosmetic value. `org seat add`
 canonicalizes new bindings to ids. Roles without a binding report unknown live
 presence, and event wakes for them are skipped with an observable log and
 increment the role's missed-wake counter rather than being inferred from a pane
-label. There is exactly one root named `owner`; accepted scopes are `*`,
-`owner/*`, and
+label. There is
+exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
 `owner/repo`, and each child scope must be covered by its parent. Malformed
 org configuration fails closed and loudly. `brief` records passive last-seen
 presence for its role and can render static context with provider state
@@ -17154,6 +17225,28 @@ owning job is final (`succeeded`, `failed`, or `cancelled`) and its terminal
 delay preserves a short debugging window. `blocked` is resumable and is never a
 TTL reclaim candidate. A successful force-remove and metadata prune records
 `delegation_worktree_reclaimed_ttl`.
+
+An aged fix clone is NOT force-removed on the same terms, because it is a
+standalone clone: deleting it deletes its object database. Gitmoot mirrors the
+registered checkout's remote branches and tags into
+`refs/remotes/gitmoot-reclaim-proof/heads/*` and `.../tags/*` (pruned each pass,
+two-minute probe deadline) and removes the clone only when no commit reachable
+from any local ref or reflog is missing from those refs. The clone's own `origin`
+is never trusted, replace objects are ignored, and a grafts file makes the clone
+unprovable. The proven clone is renamed to `<path>.ttl-reclaiming-<random>`,
+re-proven there, and only then deleted; an interrupted removal is restored by the
+next pass (`delegation_worktree_quarantine_restored`) and no pass treats the
+absent original path as a completed removal while such a sibling exists. A clone
+that still holds unpublished commits records
+`delegation_worktree_retained_unpublished` and obligation reason
+`unpublished_commits` — the normal outcome for a squash-merged branch, whose
+content is published while its commits are not. An inconclusive process-liveness
+probe records `delegation_worktree_liveness_unknown` so a host where the process
+table cannot be read is visibly inert rather than silently retaining everything.
+
+Task-owned worktrees have their own pass, driven by terminal task lifecycle state
+rather than age, and bounded at eight safety proofs per tick with a per-repo
+rotating window so a permanently retained worktree cannot starve the rest.
 Candidate-local lookup, runner, and removal failures skip only that worktree so
 later candidates continue; candidate-query and store-wide lookup failures still
 abort. Repeated failures log three times per path before suppression. Cleanup

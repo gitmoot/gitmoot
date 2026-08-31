@@ -273,7 +273,16 @@ func prepareDelegationCleanup(ctx context.Context, worker jobWorker, mode string
 
 func finishDelegationCleanupAttempt(ctx context.Context, worker jobWorker, jobID, path string, reclaimed bool, now time.Time) error {
 	if !reclaimed {
-		if _, err := os.Stat(path); os.IsNotExist(err) {
+		// An absent path is only evidence of a completed removal when no
+		// interrupted-removal quarantine of it survives: the engine renames a fix
+		// clone aside before deleting it, and marking the obligation removed here
+		// would retire the candidate before it can be restored.
+		quarantines, err := workflow.FixCloneQuarantines(path)
+		if err != nil {
+			logDelegationReclaimFailure(worker.Stdout, "state", "quarantine-scan", jobID, path, err)
+			return err
+		}
+		if _, statErr := os.Stat(path); os.IsNotExist(statErr) && len(quarantines) == 0 {
 			reclaimed = true
 		}
 	}
