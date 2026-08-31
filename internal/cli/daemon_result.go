@@ -598,6 +598,13 @@ func (w jobWorker) recordSupersededSettlement(ctx context.Context, jobID string,
 	return w.Store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_blocked_superseded", Message: message})
 }
 
+func (w jobWorker) reviewBlockingSeverityForComment(job db.Job, payload workflow.JobPayload) string {
+	if !strings.EqualFold(strings.TrimSpace(job.Type), "review") {
+		return ""
+	}
+	return loadReviewConfig(w.ConfigHome).For(payload.Repo).BlockingSeverity
+}
+
 func (w jobWorker) postJobResultComment(ctx context.Context, jobID string, agent runtime.Agent, _ string, cause error) error {
 	job, payload, err := daemonWorkerJobPayload(ctx, w.Store, jobID)
 	if err != nil {
@@ -641,13 +648,15 @@ func (w jobWorker) postJobResultComment(ctx context.Context, jobID string, agent
 		diagnostic = w.storedJobFailureDiagnostic(ctx, job)
 	}
 	body := workflow.RenderJobResultComment(workflow.JobResultComment{
-		AgentName:  firstNonEmpty(agent.Name, job.Agent),
-		Runtime:    agent.Runtime,
-		JobID:      job.ID,
-		JobState:   job.State,
-		Payload:    payload,
-		Result:     outwardJobResult(payload.Result, resultDeliveryBlocked),
-		Diagnostic: diagnostic,
+		AgentName:              firstNonEmpty(agent.Name, job.Agent),
+		Runtime:                agent.Runtime,
+		JobID:                  job.ID,
+		JobType:                job.Type,
+		JobState:               job.State,
+		Payload:                payload,
+		Result:                 outwardJobResult(payload.Result, resultDeliveryBlocked),
+		ReviewBlockingSeverity: w.reviewBlockingSeverityForComment(job, payload),
+		Diagnostic:             diagnostic,
 	})
 	if _, err := w.CommenterFactory("").PostIssueComment(ctx, repo, int64(payload.PullRequest), body); err != nil {
 		_ = w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "comment_post_failed", Message: err.Error()})
@@ -698,13 +707,15 @@ func (w jobWorker) postChatThreadResult(ctx context.Context, job db.Job, payload
 	}
 	agentName := firstNonEmpty(agent.Name, job.Agent)
 	body := workflow.RenderJobResultComment(workflow.JobResultComment{
-		AgentName:  agentName,
-		Runtime:    agent.Runtime,
-		JobID:      job.ID,
-		JobState:   job.State,
-		Payload:    payload,
-		Result:     outwardJobResult(payload.Result, job.State == string(workflow.JobBlocked)),
-		Diagnostic: diagnostic,
+		AgentName:              agentName,
+		Runtime:                agent.Runtime,
+		JobID:                  job.ID,
+		JobType:                job.Type,
+		JobState:               job.State,
+		Payload:                payload,
+		Result:                 outwardJobResult(payload.Result, job.State == string(workflow.JobBlocked)),
+		ReviewBlockingSeverity: w.reviewBlockingSeverityForComment(job, payload),
+		Diagnostic:             diagnostic,
 	})
 	if _, err := w.Store.AddChatMessage(ctx, db.ChatMessage{
 		ThreadID:   threadID,

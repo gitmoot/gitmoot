@@ -5146,6 +5146,54 @@ func TestEngineDelegationSynthesisRuleQuorumPassesWhenMet(t *testing.T) {
 	}
 }
 
+func TestEngineRoutineReviewQuorumUsesBlockingSeverity(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "api", []string{"review"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "ui", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+
+	insertCompletedJob(t, store, db.Job{ID: "routine-parent", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:      "gitmoot/gitmoot",
+		Branch:    "task-006",
+		TaskID:    "task-6",
+		TaskTitle: "Routine parent",
+		Sender:    "coord",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "done",
+			Delegations: []Delegation{
+				{ID: "api", Agent: "api", Action: "review", Prompt: "review api", FailurePolicy: "continue", SynthesisRule: "quorum", Quorum: 2},
+				{ID: "ui", Agent: "ui", Action: "review", Prompt: "review ui", FailurePolicy: "continue", SynthesisRule: "quorum", Quorum: 2},
+			},
+		},
+	})
+	if err := engine.AdvanceJob(ctx, "routine-parent"); err != nil {
+		t.Fatalf("AdvanceJob(parent) returned error: %v", err)
+	}
+	completeDelegationChild(t, store, "routine-parent/delegation/api", JobSucceeded, AgentResult{
+		Decision: "approved", Summary: "api clean",
+	})
+	if err := engine.AdvanceJob(ctx, "routine-parent/delegation/api"); err != nil {
+		t.Fatalf("AdvanceJob(api) returned error: %v", err)
+	}
+	completeDelegationChild(t, store, "routine-parent/delegation/ui", JobSucceeded, AgentResult{
+		Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "non-blocking polish",
+	})
+	if err := engine.AdvanceJob(ctx, "routine-parent/delegation/ui"); err != nil {
+		t.Fatalf("AdvanceJob(ui) returned error: %v", err)
+	}
+
+	if !jobExists(t, store, delegationContinuationID("routine-parent")) {
+		t.Fatal("routine sub-threshold review must satisfy quorum and enqueue the continuation")
+	}
+	if state, _ := store.GetTask(ctx, "task-6"); state.State == string(TaskBlocked) {
+		t.Fatal("routine sub-threshold review must not block the parent")
+	}
+}
+
 // TestQuorumThresholdExceedingDelegationCountRejected pins that a quorum K larger
 // than the number of delegations (always unsatisfiable → would block forever) is
 // rejected at extraction, while K == len (vote-equivalent) is accepted.

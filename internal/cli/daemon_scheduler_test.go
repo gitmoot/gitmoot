@@ -564,6 +564,57 @@ func TestRunQueuedJobsPostsAttributedResultComment(t *testing.T) {
 	}
 }
 
+func TestRunQueuedReviewCommentExplainsApprovedWithNotes(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"review"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "review-comment-notes", Agent: "audit", Action: "review",
+		Repo: "owner/repo", Branch: "main", PullRequest: 7,
+	})
+
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[review]\nblocking_severity = \"P1\"\n"), 0o600); err != nil {
+		t.Fatalf("write review config: %v", err)
+	}
+
+	comments := &cliPollFakeGitHub{}
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return &cliWorkerFakeAdapter{
+			output: `{"gitmoot_result":{"decision":"changes_requested","severity":"P2","summary":"non-blocking polish","findings":[{"severity":"P2","summary":"rename helper"}],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		}, nil
+	}
+	worker.CommenterFactory = func(string) github.Client { return comments }
+
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+	if len(comments.posted) != 1 {
+		t.Fatalf("posted comments = %+v, want one", comments.posted)
+	}
+	body := comments.posted[0].body
+	for _, want := range []string{
+		"**Decision:** `changes_requested`",
+		"**Severity:** `P2`",
+		"**Review Outcome:** `approved-with-notes` (`P2` is below repository blocking severity `P1`; findings remain posted)",
+		"**rename helper** (P2)",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("review comment missing %q:\n%s", want, body)
+		}
+	}
+}
+
 func TestRunQueuedJobsPostsMalformedOutputDiagnosticComment(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)

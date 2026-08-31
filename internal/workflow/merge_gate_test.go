@@ -460,6 +460,53 @@ func TestPolicyMergeGateTreatsSubthresholdReviewAsIndependentApproval(t *testing
 	}
 }
 
+func TestPolicyMergeGatePassesBlockingSeverityToDelegatedReviewEvidence(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	parentPayload := JobPayload{
+		Repo:        "mobile/app",
+		Branch:      "task-9",
+		PullRequest: 9,
+		HeadSHA:     "head123",
+		TaskID:      "task-9",
+		ReviewRound: "review-1",
+		Result:      &AgentResult{Decision: "approved", Summary: "parent approved"},
+	}
+	insertIndependentMergeGateReview(t, store, db.Job{
+		ID: "parent-review", Agent: "audit", Type: "review",
+	}, parentPayload)
+	insertCompletedJob(t, store, db.Job{
+		ID:           "delegated-review",
+		Agent:        "specialist",
+		Type:         "review",
+		ParentJobID:  "parent-review",
+		DelegationID: "specialist-review",
+	}, JobPayload{
+		Repo:        "mobile/app",
+		PullRequest: 9,
+		TaskID:      "task-9",
+		Result: &AgentResult{
+			Decision: "changes_requested",
+			Severity: reviewseverity.P2,
+			Summary:  "non-blocking specialist note",
+		},
+	})
+
+	gate := PolicyMergeGate{Store: store}
+	if err := gate.ensureFinalReviewCaptured(ctx, MergeRequest{
+		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "audit",
+		ReviewBlockingSeverity: reviewseverity.P1,
+	}, "head123"); err != nil {
+		t.Fatalf("sub-threshold delegated review blocked final review: %v", err)
+	}
+	if err := gate.ensureFinalReviewCaptured(ctx, MergeRequest{
+		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "audit",
+		ReviewBlockingSeverity: reviewseverity.P2,
+	}, "head123"); err == nil || !strings.Contains(err.Error(), "blocking children") {
+		t.Fatalf("at-threshold delegated review error = %v, want blocking child evidence", err)
+	}
+}
+
 func TestPolicyMergeGateTreatsHeadlessSubthresholdReviewAsApproval(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

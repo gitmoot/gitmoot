@@ -171,29 +171,29 @@ func (e Engine) mailbox() Mailbox {
 		)
 		wakeTargetRole := NormalizeActingOrgRole(payload.ActingOrgRole)
 		if state == JobSucceeded && payload.PullRequest > 0 && payload.Result != nil && e.Store != nil {
-			decision := strings.ToLower(strings.TrimSpace(payload.Result.Decision))
 			job, jobErr := e.Store.GetJob(ctx, jobID)
-			if jobErr == nil &&
-				strings.EqualFold(strings.TrimSpace(job.Type), "review") &&
-				(decision == "approved" || decision == "changes_requested") {
-				owner := ""
-				resolved, resolveErr := e.Store.ResolvePullRequestOwner(
-					ctx, payload.Repo, payload.Branch, payload.PullRequest, payload.TaskID,
-				)
-				if resolveErr == nil {
-					owner = NormalizeActingOrgRole(resolved)
-				}
-				event.Cause = events.EventCauseReviewVerdict
-				wakeTargetRole = owner
-				event.PullRequest = payload.PullRequest
-				event.ReviewDecision = decision
-				if decision == "changes_requested" {
-					// Sender is a transport or agent identity, not necessarily a
-					// routable org role. ActingOrgRole is the persisted requester
-					// role paired with that sender; legacy jobs without one keep
-					// the resolved PR owner fallback above (#1712).
-					if requesterRole := NormalizeActingOrgRole(payload.ActingOrgRole); requesterRole != "" {
-						wakeTargetRole = requesterRole
+			if jobErr == nil && strings.EqualFold(strings.TrimSpace(job.Type), "review") {
+				decision := effectiveReviewDecision(payload.Result, e.reviewBlockingSeverity(payload.Repo))
+				if decision == "approved" || decision == "changes_requested" {
+					owner := ""
+					resolved, resolveErr := e.Store.ResolvePullRequestOwner(
+						ctx, payload.Repo, payload.Branch, payload.PullRequest, payload.TaskID,
+					)
+					if resolveErr == nil {
+						owner = NormalizeActingOrgRole(resolved)
+					}
+					event.Cause = events.EventCauseReviewVerdict
+					wakeTargetRole = owner
+					event.PullRequest = payload.PullRequest
+					event.ReviewDecision = decision
+					if decision == "changes_requested" {
+						// Sender is a transport or agent identity, not necessarily a
+						// routable org role. ActingOrgRole is the persisted requester
+						// role paired with that sender; legacy jobs without one keep
+						// the resolved PR owner fallback above (#1712).
+						if requesterRole := NormalizeActingOrgRole(payload.ActingOrgRole); requesterRole != "" {
+							wakeTargetRole = requesterRole
+						}
 					}
 				}
 			}

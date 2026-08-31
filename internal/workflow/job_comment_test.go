@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 )
 
 func TestRenderJobResultCommentIncludesAttributionAndResult(t *testing.T) {
@@ -41,6 +43,34 @@ func TestRenderJobResultCommentIncludesAttributionAndResult(t *testing.T) {
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("comment body missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestRenderJobResultCommentExplainsApprovedWithNotes(t *testing.T) {
+	body := RenderJobResultComment(JobResultComment{
+		AgentName:              "audit",
+		Runtime:                "claude",
+		JobID:                  "review-notes",
+		JobType:                "review",
+		JobState:               string(JobSucceeded),
+		ReviewBlockingSeverity: reviewseverity.P1,
+		Result: &AgentResult{
+			Decision: "changes_requested",
+			Severity: reviewseverity.P2,
+			Summary:  "non-blocking polish",
+			Findings: []json.RawMessage{json.RawMessage(`{"severity":"P2","summary":"rename helper"}`)},
+		},
+	})
+
+	for _, want := range []string{
+		"**Decision:** `changes_requested`",
+		"**Severity:** `P2`",
+		"**Review Outcome:** `approved-with-notes` (`P2` is below repository blocking severity `P1`; findings remain posted)",
+		"**rename helper** (P2)",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("approved-with-notes comment missing %q:\n%s", want, body)
 		}
 	}
 }

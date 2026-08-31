@@ -9,6 +9,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
+	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
@@ -203,6 +204,47 @@ func TestEngineReturnsChangesRequestedToRequesterWithoutDefaultAutoFix(t *testin
 		event.WakeTargetRole != "requester" ||
 		event.Detail != "one blocking issue" {
 		t.Fatalf("changes-requested verdict event = %+v", event)
+	}
+}
+
+func TestEngineEmitsSubthresholdReviewVerdictAsApproved(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName:  "gitmoot/gitmoot",
+		Branch:        "task-45",
+		Owner:         "audit",
+		ActingOrgRole: "author",
+	}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "review-45", Agent: "audit", Type: "review", State: string(JobSucceeded), Payload: "{}",
+	}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	sink := &recordingSink{}
+	engine := testEngine(store)
+	engine.EventSink = sink
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+
+	engine.mailbox().emitTerminal(ctx, "review-45", JobSucceeded, JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		Branch:      "task-45",
+		PullRequest: 45,
+		Result: &AgentResult{
+			Decision: "changes_requested",
+			Severity: reviewseverity.P2,
+			Summary:  "non-blocking polish",
+		},
+	})
+
+	finished := sink.byType(events.EventJobFinished)
+	if len(finished) != 1 {
+		t.Fatalf("job.finished emissions = %d, want 1; all=%+v", len(finished), sink.snapshot())
+	}
+	if got := finished[0].ReviewDecision; got != "approved" {
+		t.Fatalf("sub-threshold review decision = %q, want approved", got)
 	}
 }
 func TestEngineDoesNotClassifyNonReviewApprovedResult(t *testing.T) {

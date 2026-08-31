@@ -12,13 +12,15 @@ const maxCommentFieldRunes = 2000
 const maxCommentBodyRunes = 60000
 
 type JobResultComment struct {
-	AgentName  string
-	Runtime    string
-	JobID      string
-	JobState   string
-	Payload    JobPayload
-	Result     *AgentResult
-	Diagnostic string
+	AgentName              string
+	Runtime                string
+	JobID                  string
+	JobType                string
+	JobState               string
+	Payload                JobPayload
+	Result                 *AgentResult
+	ReviewBlockingSeverity string
+	Diagnostic             string
 }
 
 func RenderJobResultComment(comment JobResultComment) string {
@@ -52,6 +54,22 @@ func RenderJobResultComment(comment JobResultComment) string {
 	}
 	writeScalar(&builder, "Decision", "`"+markdownInline(decision)+"`")
 	writeScalar(&builder, "Summary", limitCommentText(summary))
+	if comment.Result != nil && strings.TrimSpace(comment.Result.Severity) != "" {
+		writeScalar(&builder, "Severity", "`"+markdownInline(comment.Result.Severity)+"`")
+	}
+	if comment.Result != nil && strings.EqualFold(strings.TrimSpace(comment.JobType), "review") {
+		effective := effectiveReviewDecision(comment.Result, comment.ReviewBlockingSeverity)
+		if !strings.EqualFold(strings.TrimSpace(decision), strings.TrimSpace(effective)) {
+			outcome := "`approved-with-notes`"
+			severity := strings.TrimSpace(comment.Result.Severity)
+			threshold := normalizedReviewBlockingSeverity(comment.ReviewBlockingSeverity)
+			if severity != "" {
+				outcome += " (`" + markdownInline(severity) + "` is below repository blocking severity `" +
+					markdownInline(threshold) + "`; findings remain posted)"
+			}
+			writeScalar(&builder, "Review Outcome", outcome)
+		}
+	}
 
 	if comment.Result != nil {
 		writeFindings(&builder, comment.Result.Findings)

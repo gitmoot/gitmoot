@@ -506,6 +506,28 @@ func TestReviewDelegationQuorumThresholdOnlyAppliesToReviewChildren(t *testing.T
 	}
 }
 
+func TestDelegationVoteBlockingSeverityOnlyAppliesToReviewChildren(t *testing.T) {
+	delegations := []Delegation{{
+		ID: "verdict", Action: "review", SynthesisRule: "vote",
+	}}
+	children := map[string]db.Job{
+		"verdict": {ID: "verdict", Type: "review", State: string(JobSucceeded)},
+	}
+	payloads := map[string]JobPayload{
+		"verdict": {Result: &AgentResult{Decision: "changes_requested", Severity: reviewseverity.P2}},
+	}
+	if !delegationVoteSatisfied(delegations, children, payloads, reviewseverity.P1) {
+		t.Fatal("sub-threshold review child must satisfy a vote")
+	}
+	for _, action := range []string{"ask", "implement"} {
+		delegations[0].Action = action
+		children["verdict"] = db.Job{ID: "verdict", Type: action, State: string(JobSucceeded)}
+		if delegationVoteSatisfied(delegations, children, payloads, reviewseverity.P1) {
+			t.Fatalf("sub-threshold %s child must retain its raw non-approving decision", action)
+		}
+	}
+}
+
 // TestHighRiskCriticalFindingNotPreNormalizedBlocks pins that a lens which reports
 // a CRITICAL refutation in AgentResult.Findings but leaves its OWN decision at
 // `approved` still fails the quorum: the engine wires SynthesizeLensDecision into

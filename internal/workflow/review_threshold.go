@@ -35,6 +35,20 @@ func effectiveReviewDecision(result *AgentResult, blockingSeverity string) strin
 	return decision
 }
 
+// effectiveDelegationDecision applies repository review policy only to
+// delegations that are reviews. Ask and implement legs retain their raw
+// decisions even when they happen to report a review-shaped severity.
+func effectiveDelegationDecision(result *AgentResult, childType string, action string, blockingSeverity string) string {
+	if result == nil {
+		return ""
+	}
+	if strings.EqualFold(strings.TrimSpace(action), "review") ||
+		strings.EqualFold(strings.TrimSpace(childType), "review") {
+		return effectiveReviewDecision(result, blockingSeverity)
+	}
+	return strings.TrimSpace(result.Decision)
+}
+
 func normalizedReviewBlockingSeverity(value string) string {
 	severity := strings.ToUpper(strings.TrimSpace(value))
 	if !reviewseverity.Valid(severity) {
