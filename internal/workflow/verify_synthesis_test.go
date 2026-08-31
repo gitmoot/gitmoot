@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 )
 
 // seedVerifyCoordinator inserts a completed coordinator job whose delegations are
@@ -284,9 +285,8 @@ func TestEngineVerifyReplanAttemptCapConfigurable(t *testing.T) {
 	}
 }
 
-// TestEngineVerifyMissingChildFailsVerdict pins that a verify-tagged leg with no
-// completed child (a missing verification) fails the verdict and triggers a replan
-// rather than being read as a pass.
+// TestEngineVerifyMissingChildFailsVerdict pins the missing-child fallback and
+// the review-only scope of repository blocking severity.
 func TestEngineVerifyMissingChildFailsVerdict(t *testing.T) {
 	children := map[string]db.Job{}
 	childPayloads := map[string]JobPayload{}
@@ -295,22 +295,37 @@ func TestEngineVerifyMissingChildFailsVerdict(t *testing.T) {
 	}
 	// The verify leg here has no deps, so it WAS dispatchable: a missing child is a
 	// genuinely missing verification and must fail the verdict.
-	if verifyVerdictPassed(dels, children, childPayloads, nil) {
+	if verifyVerdictPassed(dels, children, childPayloads, nil, reviewseverity.P3) {
 		t.Fatal("a missing verify child must fail the verdict")
 	}
-	// A succeeded verify child passes; a changes_requested decision fails.
-	children["check"] = db.Job{ID: "c", State: string(JobSucceeded)}
-	if !verifyVerdictPassed(dels, children, childPayloads, nil) {
+	// A succeeded verify child with no parsed result passes.
+	children["check"] = db.Job{ID: "c", Type: "review", State: string(JobSucceeded)}
+	if !verifyVerdictPassed(dels, children, childPayloads, nil, reviewseverity.P3) {
 		t.Fatal("a succeeded verify child must pass the verdict")
 	}
-	children["check"] = db.Job{ID: "c", State: string(JobFailed)}
-	childPayloads["check"] = JobPayload{Result: &AgentResult{Decision: "changes_requested"}}
-	if verifyVerdictPassed(dels, children, childPayloads, nil) {
-		t.Fatal("a changes_requested verify child must fail the verdict")
+
+	childPayloads["check"] = JobPayload{Result: &AgentResult{
+		Decision: "changes_requested",
+		Severity: reviewseverity.P2,
+	}}
+	if verifyVerdictPassed(dels, children, childPayloads, nil, reviewseverity.P3) {
+		t.Fatal("an at-threshold changes-requested review verifier must fail the verdict")
 	}
+	if !verifyVerdictPassed(dels, children, childPayloads, nil, reviewseverity.P1) {
+		t.Fatal("a sub-threshold review verifier must pass the verdict")
+	}
+
+	for _, action := range []string{"ask", "implement"} {
+		dels[0].Action = action
+		children["check"] = db.Job{ID: "c", Type: action, State: string(JobSucceeded)}
+		if verifyVerdictPassed(dels, children, childPayloads, nil, reviewseverity.P1) {
+			t.Fatalf("sub-threshold %s verifier must retain its raw non-approving decision", action)
+		}
+	}
+
 	childPayloads["check"] = JobPayload{Result: &AgentResult{Decision: "approved"}}
-	children["check"] = db.Job{ID: "c", State: string(JobFailed)}
-	if !verifyVerdictPassed(dels, children, childPayloads, nil) {
+	children["check"] = db.Job{ID: "c", Type: "ask", State: string(JobFailed)}
+	if !verifyVerdictPassed(dels, children, childPayloads, nil, reviewseverity.P3) {
 		t.Fatal("an approved verify decision must pass the verdict even when the job state is not succeeded")
 	}
 }

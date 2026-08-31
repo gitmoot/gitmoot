@@ -3,7 +3,10 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 )
 
 func writeReviewConfig(t *testing.T, body string) Paths {
@@ -27,6 +30,9 @@ func TestLoadReviewConfigDefaultsNativeFanoutOff(t *testing.T) {
 	if cfg.For("owner/repo").RiskTiersEnabled {
 		t.Fatal("missing config must default risk tiers OFF")
 	}
+	if cfg.For("owner/repo").BlockingSeverity != reviewseverity.DefaultBlocking {
+		t.Fatalf("missing config blocking severity = %q, want %q", cfg.For("owner/repo").BlockingSeverity, reviewseverity.DefaultBlocking)
+	}
 
 	cfg, err = LoadReviewConfig(writeReviewConfig(t, "[orchestrate]\ncockpit_mode = \"off\"\n"))
 	if err != nil {
@@ -35,12 +41,16 @@ func TestLoadReviewConfigDefaultsNativeFanoutOff(t *testing.T) {
 	if cfg.For("owner/repo").NativeFanoutEnabled {
 		t.Fatal("absent [review] section must default native fanout OFF")
 	}
+	if cfg.For("owner/repo").BlockingSeverity != reviewseverity.DefaultBlocking {
+		t.Fatalf("absent [review] blocking severity = %q, want %q", cfg.For("owner/repo").BlockingSeverity, reviewseverity.DefaultBlocking)
+	}
 }
 
 func TestLoadReviewConfigParsesGlobalFields(t *testing.T) {
 	body := `
 [review]
 native_fanout_enabled = true
+blocking_severity = "p2"
 risk_tiers_enabled = true
 high_risk_paths = ["**/auth/**", "cmd/**", "go.mod"]
 risk_label_high = "sev:1"
@@ -54,6 +64,9 @@ risk_label_routine = "sev:routine"
 	if !policy.NativeFanoutEnabled || !policy.RiskTiersEnabled {
 		t.Fatalf("parsed switches = %+v", policy)
 	}
+	if policy.BlockingSeverity != reviewseverity.P2 {
+		t.Fatalf("blocking_severity = %q, want P2", policy.BlockingSeverity)
+	}
 	if len(policy.HighRiskPaths) != 3 || policy.HighRiskPaths[1] != "cmd/**" {
 		t.Fatalf("high_risk_paths = %v", policy.HighRiskPaths)
 	}
@@ -66,8 +79,10 @@ func TestLoadReviewConfigRepoOverrideWins(t *testing.T) {
 	body := `
 [review]
 native_fanout_enabled = false
+blocking_severity = "P2"
 [repos."owner/enabled".review]
 native_fanout_enabled = true
+blocking_severity = "P1"
 `
 	cfg, err := LoadReviewConfig(writeReviewConfig(t, body))
 	if err != nil {
@@ -79,11 +94,95 @@ native_fanout_enabled = true
 	if !cfg.For("owner/enabled").NativeFanoutEnabled {
 		t.Fatal("repository override must enable native fanout")
 	}
+	if cfg.For("owner/disabled").BlockingSeverity != reviewseverity.P2 {
+		t.Fatalf("repository without override blocking severity = %q, want P2", cfg.For("owner/disabled").BlockingSeverity)
+	}
+	if cfg.For("owner/enabled").BlockingSeverity != reviewseverity.P1 {
+		t.Fatalf("repository override blocking severity = %q, want P1", cfg.For("owner/enabled").BlockingSeverity)
+	}
 }
 
 func TestLoadReviewConfigRejectsBadBool(t *testing.T) {
 	_, err := LoadReviewConfig(writeReviewConfig(t, "[review]\nnative_fanout_enabled = yes\n"))
 	if err == nil {
 		t.Fatal("expected error for non-bool native_fanout_enabled")
+	}
+	if ReviewConfigErrorsOnlyBlockingSeverity(err) {
+		t.Fatalf("bad native_fanout_enabled error was classified as a safe threshold fallback: %v", err)
+	}
+}
+
+func TestLoadReviewConfigRejectsBadBlockingSeverityWithoutDiscardingValidFields(t *testing.T) {
+	body := `[review]
+blocking_severity = "P4"
+native_fanout_enabled = true
+risk_tiers_enabled = true
+high_risk_paths = ["cmd/**"]
+`
+	cfg, err := LoadReviewConfig(writeReviewConfig(t, body))
+	if err == nil || !strings.Contains(err.Error(), "P0, P1, P2, P3") {
+		t.Fatalf("bad blocking severity error = %v, want canonical choices", err)
+	}
+	policy := cfg.For("owner/repo")
+	if policy.BlockingSeverity != reviewseverity.P3 || !policy.NativeFanoutEnabled || !policy.RiskTiersEnabled ||
+		len(policy.HighRiskPaths) != 1 || policy.HighRiskPaths[0] != "cmd/**" {
+		t.Fatalf("partial policy = %+v, want P3 with valid review fields retained", policy)
+	}
+	if !ReviewConfigErrorsOnlyBlockingSeverity(err) {
+		t.Fatalf("bad blocking severity error was not classified as fail-closed field recovery: %v", err)
+	}
+}
+
+func TestLoadReviewConfigDuplicateInvalidGlobalSeverityFailsClosed(t *testing.T) {
+	body := `[review]
+blocking_severity = "P1"
+blocking_severity = "bogus"
+`
+	cfg, err := LoadReviewConfig(writeReviewConfig(t, body))
+	if err == nil {
+		t.Fatal("duplicate invalid global threshold must report a parse error")
+	}
+	if !ReviewConfigErrorsOnlyBlockingSeverity(err) {
+		t.Fatalf("duplicate invalid threshold error was not classified as safe field recovery: %v", err)
+	}
+	if got := cfg.For("owner/repo").BlockingSeverity; got != reviewseverity.P3 {
+		t.Fatalf("duplicate invalid global threshold = %q, want fail-closed P3", got)
+	}
+}
+
+func TestLoadReviewConfigInvalidRepoSeverityFailsClosedWithoutDiscardingOverrides(t *testing.T) {
+	body := `[review]
+blocking_severity = "P1"
+[repos."owner/sensitive".review]
+blocking_severity = "critical"
+native_fanout_enabled = true
+`
+	cfg, err := LoadReviewConfig(writeReviewConfig(t, body))
+	if err == nil || !strings.Contains(err.Error(), "P0, P1, P2, P3") {
+		t.Fatalf("bad repository blocking severity error = %v, want canonical choices", err)
+	}
+	if got := cfg.For("owner/ordinary").BlockingSeverity; got != reviewseverity.P1 {
+		t.Fatalf("global blocking severity = %q, want P1", got)
+	}
+	sensitive := cfg.For("owner/sensitive")
+	if sensitive.BlockingSeverity != reviewseverity.P3 || !sensitive.NativeFanoutEnabled {
+		t.Fatalf("sensitive repository policy = %+v, want fail-closed P3 with valid override retained", sensitive)
+	}
+	if !ReviewConfigErrorsOnlyBlockingSeverity(err) {
+		t.Fatalf("bad repository threshold error was not classified as fail-closed field recovery: %v", err)
+	}
+}
+
+func TestDefaultConfigDocumentsReviewBlockingSeverity(t *testing.T) {
+	content := DefaultConfig(PathsForHome(t.TempDir()))
+	for _, want := range []string{
+		`# blocking_severity = "P3"`,
+		`# [repos."owner/repo".review]`,
+		`# blocking_severity = "P1"`,
+		`findings remain posted`,
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("DefaultConfig missing %q", want)
+		}
 	}
 }

@@ -362,6 +362,9 @@ type Engine struct {
 	// whose default is false. Nil preserves the legacy enabled behavior for direct
 	// Engine constructions that do not participate in host configuration.
 	NativeReviewFanoutEnabled func(repo string) bool
+	// ReviewBlockingSeverity resolves the least severe review finding that may
+	// restart the fix loop for a repository. Nil preserves block-all behavior.
+	ReviewBlockingSeverity func(repo string) string
 	// RiskTiersEnabled gates the opt-in risk-tiered adaptive review (#650). When
 	// false (the default), HandlePullRequestOpened NEVER classifies a PR and runs
 	// the single-review fan-out byte-identically. When true, a PR opened event is

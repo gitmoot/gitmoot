@@ -11,9 +11,12 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -36,6 +39,9 @@ func TestApplyReviewPolicyOffByDefault(t *testing.T) {
 	if engine.NativeReviewFanoutEnabled == nil || engine.NativeReviewFanoutEnabled("owner/repo") {
 		t.Fatal("applyReviewPolicy must install native fanout OFF when [review] is absent")
 	}
+	if engine.ReviewBlockingSeverity == nil || engine.ReviewBlockingSeverity("owner/repo") != reviewseverity.DefaultBlocking {
+		t.Fatal("applyReviewPolicy must install block-all review severity when [review] is absent")
+	}
 }
 
 func TestApplyReviewPolicyEnabledFromConfig(t *testing.T) {
@@ -44,7 +50,7 @@ func TestApplyReviewPolicyEnabledFromConfig(t *testing.T) {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	body := "[review]\nnative_fanout_enabled = true\nrisk_tiers_enabled = true\nhigh_risk_paths = [\"cmd/**\"]\nrisk_label_high = \"sev:1\"\n[repos.\"owner/off\".review]\nnative_fanout_enabled = false\n"
+	body := "[review]\nnative_fanout_enabled = true\nblocking_severity = \"P2\"\nrisk_tiers_enabled = true\nhigh_risk_paths = [\"cmd/**\"]\nrisk_label_high = \"sev:1\"\n[repos.\"owner/off\".review]\nnative_fanout_enabled = false\nblocking_severity = \"P1\"\n"
 	if err := os.WriteFile(filepath.Join(root, config.ConfigName), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -65,6 +71,85 @@ func TestApplyReviewPolicyEnabledFromConfig(t *testing.T) {
 	if engine.NativeReviewFanoutEnabled("owner/off") {
 		t.Fatal("repository native_fanout_enabled = false override was not applied")
 	}
+	if engine.ReviewBlockingSeverity == nil || engine.ReviewBlockingSeverity("owner/on") != reviewseverity.P2 {
+		t.Fatal("global blocking_severity = P2 was not applied")
+	}
+	if engine.ReviewBlockingSeverity("owner/off") != reviewseverity.P1 {
+		t.Fatal("repository blocking_severity = P1 override was not applied")
+	}
+}
+
+func TestApplyReviewPolicyInvalidSeverityRetainsValidSafetyPolicy(t *testing.T) {
+	home := t.TempDir()
+	root := config.PathsForHome(home).Home
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "[review]\nblocking_severity = \"critical\"\nnative_fanout_enabled = true\nrisk_tiers_enabled = true\nhigh_risk_paths = [\"cmd/**\"]\n"
+	if err := os.WriteFile(filepath.Join(root, config.ConfigName), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var engine workflow.Engine
+	applyReviewPolicy(&engine, root)
+
+	if !engine.RiskTiersEnabled || len(engine.HighRiskPaths) != 1 || engine.HighRiskPaths[0] != "cmd/**" {
+		t.Fatalf("invalid threshold discarded valid high-risk policy: enabled=%v paths=%v", engine.RiskTiersEnabled, engine.HighRiskPaths)
+	}
+	if engine.NativeReviewFanoutEnabled == nil || !engine.NativeReviewFanoutEnabled("owner/repo") {
+		t.Fatal("invalid threshold discarded valid native fanout policy")
+	}
+	if engine.ReviewBlockingSeverity == nil || engine.ReviewBlockingSeverity("owner/repo") != reviewseverity.P3 {
+		t.Fatal("invalid threshold must fail closed to P3")
+	}
+}
+
+func TestApplyReviewPolicyMalformedNonSeverityFieldFailsClosed(t *testing.T) {
+	home := t.TempDir()
+	root := config.PathsForHome(home).Home
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "[review]\nnative_fanout_enabled = true\nblocking_severity = \"P1\"\nrisk_tiers_enabled = maybe\n"
+	if err := os.WriteFile(filepath.Join(root, config.ConfigName), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var engine workflow.Engine
+	applyReviewPolicy(&engine, root)
+
+	if engine.RiskTiersEnabled {
+		t.Fatal("malformed review config must leave risk tiers off")
+	}
+	if engine.NativeReviewFanoutEnabled == nil || engine.NativeReviewFanoutEnabled("owner/repo") {
+		t.Fatal("malformed review config must leave native fanout off")
+	}
+	if engine.ReviewBlockingSeverity == nil ||
+		engine.ReviewBlockingSeverity("owner/repo") != reviewseverity.P3 {
+		t.Fatal("malformed review config must restore fail-closed P3")
+	}
+}
+
+func TestApplyReviewPolicyInvalidRepoSeverityOverridesPermissiveGlobal(t *testing.T) {
+	home := t.TempDir()
+	root := config.PathsForHome(home).Home
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "[review]\nblocking_severity = \"P1\"\n[repos.\"owner/sensitive\".review]\nblocking_severity = \"critical\"\nnative_fanout_enabled = true\n"
+	if err := os.WriteFile(filepath.Join(root, config.ConfigName), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var engine workflow.Engine
+	applyReviewPolicy(&engine, root)
+
+	if got := engine.ReviewBlockingSeverity("owner/ordinary"); got != reviewseverity.P1 {
+		t.Fatalf("ordinary repository blocking severity = %q, want global P1", got)
+	}
+	if got := engine.ReviewBlockingSeverity("owner/sensitive"); got != reviewseverity.P3 {
+		t.Fatalf("invalid sensitive repository threshold = %q, want fail-closed P3", got)
+	}
+	if !engine.NativeReviewFanoutEnabled("owner/sensitive") {
+		t.Fatal("invalid threshold discarded a valid repository override")
+	}
 }
 
 func TestApplyReviewPolicyEmptyHomeIsOff(t *testing.T) {
@@ -75,6 +160,9 @@ func TestApplyReviewPolicyEmptyHomeIsOff(t *testing.T) {
 	}
 	if engine.NativeReviewFanoutEnabled == nil || engine.NativeReviewFanoutEnabled("owner/repo") {
 		t.Fatal("empty home must resolve native fanout OFF")
+	}
+	if engine.ReviewBlockingSeverity == nil || engine.ReviewBlockingSeverity("owner/repo") != reviewseverity.DefaultBlocking {
+		t.Fatal("empty home must resolve blocking severity to P3")
 	}
 }
 
@@ -340,5 +428,67 @@ func TestWireReviewChangedFilesMarksDivergedRangeUnscopable(t *testing.T) {
 	var unavailable workflow.ReviewScopeUnavailableError
 	if !errors.As(err, &unavailable) {
 		t.Fatalf("ReviewChangedFiles error = %v, want ReviewScopeUnavailableError", err)
+	}
+}
+
+// The awaited review-verdict fact is satisfied inside the job state-transition
+// transaction, so its wake detail is rendered by the STORE, not the engine. Every
+// gitmoot command — the daemon included — takes its store from withStoreAndPaths,
+// so this pins the wiring: without it the fix is inert and that one wake channel
+// silently reports a raw verdict the engine has already folded.
+func TestWithStoreInstallsReviewBlockingSeverity(t *testing.T) {
+	home := t.TempDir()
+	root := config.PathsForHome(home).Home
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, config.ConfigName),
+		[]byte("[review]\nblocking_severity = \"P1\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	payload := func(decision string) string {
+		t.Helper()
+		encoded, err := json.Marshal(workflow.JobPayload{
+			Repo: "acme/widget", PullRequest: 46, HeadSHA: "head-notes", TaskID: "task-46",
+			Result: &workflow.AgentResult{Decision: decision, Severity: reviewseverity.P2, Summary: "polish"},
+		})
+		if err != nil {
+			t.Fatalf("Marshal payload: %v", err)
+		}
+		return string(encoded)
+	}
+	if err := withStore(home, func(store *db.Store) error {
+		if err := store.CreateJob(ctx, db.Job{
+			ID: "review-notes", Agent: "audit", Type: "review", State: "running", Payload: payload(""),
+		}); err != nil {
+			return err
+		}
+		key, err := db.ReviewVerdictSubjectKey("acme/widget", 46, "head-notes")
+		if err != nil {
+			return err
+		}
+		fact, err := store.SubscribeAwaitedFact(ctx, db.AwaitedFactSubscription{
+			WaiterRole: "lane", SubjectKind: db.AwaitedFactSubjectReviewVerdict,
+			SubjectKey: key, Deadline: time.Now().UTC().Add(time.Hour),
+		})
+		if err != nil {
+			return err
+		}
+		if _, err := store.TransitionJobStatePayloadWithEvent(ctx, "review-notes", "running", "succeeded",
+			payload("changes_requested"), db.JobEvent{Kind: "succeeded", Message: "verdict"}); err != nil {
+			return err
+		}
+		satisfied, err := store.GetAwaitedFact(ctx, fact.ID)
+		if err != nil {
+			return err
+		}
+		if !strings.HasPrefix(satisfied.ResolutionDetail, "review verdict approved") {
+			t.Fatalf("resolution detail = %q, want the effective approved verdict under blocking_severity P1",
+				satisfied.ResolutionDetail)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("withStore returned error: %v", err)
 	}
 }

@@ -72,7 +72,8 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 	// synthesis_rule "vote": block the parent unless every child approved or
 	// succeeded. The default ("" / "summary") concatenates child summaries into
 	// the continuation prompt below.
-	if delegationSynthesisRequiresVote(parentResult.Delegations) && !delegationVoteSatisfied(parentResult.Delegations, children, childPayloads) {
+	if delegationSynthesisRequiresVote(parentResult.Delegations) &&
+		!delegationVoteSatisfied(parentResult.Delegations, children, childPayloads) {
 		reason := fmt.Sprintf("delegation synthesis_rule vote failed: not all delegated children for %s were approved/succeeded", parentJob.ID)
 		// #758: a pipeline-orchestrate root has no task; a synthesis-gate block would
 		// strand its chain with no foldable tail. Route to the finalize continuation
@@ -87,7 +88,14 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 	// reached an approving outcome (succeeded state or an approving decision).
 	if delegationSynthesisRequiresQuorum(parentResult.Delegations) {
 		k := delegationQuorumThreshold(parentResult.Delegations)
-		if !delegationQuorumSatisfied(parentResult.Delegations, children, childPayloads, k) {
+		satisfied := reviewDelegationQuorumSatisfied(
+			parentResult.Delegations,
+			children,
+			childPayloads,
+			k,
+			e.reviewBlockingSeverity(parentPayload.Repo),
+		)
+		if !satisfied {
 			reason := fmt.Sprintf("delegation synthesis_rule quorum failed: fewer than %d delegated children for %s were approved/succeeded", k, parentJob.ID)
 			if e.isPipelineOrchestrateRoot(ctx, parentJob, parentPayload) {
 				return e.enqueueFinalizeContinuation(ctx, parentJob, parentPayload, reason)
@@ -219,7 +227,14 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 	// never owns its own child, so the verdict must resolve it against its winning
 	// sibling rather than reading the absent child as a failed verdict.
 	dedupWinners := dedupedDelegationWinners(parentResult.Delegations, children, events)
-	if delegationSynthesisRequiresVerify(parentResult.Delegations) && !verifyVerdictPassed(parentResult.Delegations, children, childPayloads, dedupWinners) {
+	if delegationSynthesisRequiresVerify(parentResult.Delegations) &&
+		!verifyVerdictPassed(
+			parentResult.Delegations,
+			children,
+			childPayloads,
+			dedupWinners,
+			e.reviewBlockingSeverity(parentPayload.Repo),
+		) {
 		attemptCap := e.verifyReplanAttemptCap()
 		if parentPayload.VerifyAttempt >= attemptCap {
 			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
@@ -1258,10 +1273,9 @@ func delegationSynthesisRequiresVote(delegations []Delegation) bool {
 	return false
 }
 
-// delegationVoteSatisfied reports whether every delegation's child reached an
-// approving outcome: a succeeded job state, or a child result decision of
-// approved/succeeded/implemented. A missing or non-approving child fails the
-// vote.
+// delegationVoteSatisfied preserves the vote contract: a succeeded child counts
+// regardless of its result decision. This intentionally differs from quorum and
+// verify, where skipped abstains and parsed review decisions are threshold-aware.
 func delegationVoteSatisfied(delegations []Delegation, children map[string]db.Job, childPayloads map[string]JobPayload) bool {
 	for _, d := range delegations {
 		child, ok := children[d.ID]
@@ -1310,17 +1324,14 @@ func delegationQuorumThreshold(delegations []Delegation) int {
 	return k
 }
 
-// delegationQuorumSatisfied reports whether at least k children reached an
-// approving outcome. It is DECISION-FIRST, mirroring verifyVerdictPassed: whenever
-// a child produced a parsed result its decision is the vote
-// (approved/succeeded/implemented approve; changes_requested/blocked/failed do
-// NOT), and only a child with no parsed result falls back to the succeeded job
-// state. Consulting the decision first is load-bearing for the high-risk review
-// quorum (#650): a review's changes_requested decision maps to a SUCCEEDED job
-// state (stateForDecision), so a succeeded-state short-circuit would count a lens
-// that asked for changes as an approving vote and let a high-risk PR clear the
-// quorum despite reviewers refuting it.
-func delegationQuorumSatisfied(delegations []Delegation, children map[string]db.Job, childPayloads map[string]JobPayload, k int) bool {
+// reviewDelegationQuorumSatisfied counts effective approving outcomes until K.
+// Parsed results are decision-first because changes_requested reviews map to a
+// succeeded job state; a state-first shortcut would count a refuting lens as an
+// approval and let a high-risk PR clear the #650 quorum. Repository blocking
+// severity applies only to review actions or review-typed children. Ask and
+// implement children retain their raw decisions. A succeeded job state is used
+// only when the child has no parsed result.
+func reviewDelegationQuorumSatisfied(delegations []Delegation, children map[string]db.Job, childPayloads map[string]JobPayload, k int, blockingSeverity string) bool {
 	approving := 0
 	for _, d := range delegations {
 		child, ok := children[d.ID]
@@ -1328,7 +1339,8 @@ func delegationQuorumSatisfied(delegations []Delegation, children map[string]db.
 			continue
 		}
 		if payload, ok := childPayloads[d.ID]; ok && payload.Result != nil {
-			if delegationDecisionApproves(payload.Result.Decision) {
+			decision := effectiveDelegationDecision(payload.Result, child.Type, d.Action, blockingSeverity)
+			if delegationDecisionApproves(decision) {
 				approving++
 			}
 			continue
@@ -1380,7 +1392,7 @@ func (e Engine) highRiskLensQuorumMet(ctx context.Context, childPayload JobPaylo
 		childPayloads[id] = payload
 	}
 	k := delegationQuorumThreshold(coordPayload.Result.Delegations)
-	return delegationQuorumSatisfied(coordPayload.Result.Delegations, children, childPayloads, k), nil
+	return reviewDelegationQuorumSatisfied(coordPayload.Result.Delegations, children, childPayloads, k, e.reviewBlockingSeverity(childPayload.Repo)), nil
 }
 
 func delegationDecisionApproves(decision string) bool {
@@ -1431,7 +1443,7 @@ func delegationSynthesisRequiresVerify(delegations []Delegation) bool {
 // are ignored here (the conservative ordering runs the vote/quorum gates first).
 // No engine-side verify subprocess or second model call is made: the engine reads
 // the already-completed verdict the verify leg reported.
-func verifyVerdictPassed(delegations []Delegation, children map[string]db.Job, childPayloads map[string]JobPayload, dedupWinners map[string]db.Job) bool {
+func verifyVerdictPassed(delegations []Delegation, children map[string]db.Job, childPayloads map[string]JobPayload, dedupWinners map[string]db.Job, blockingSeverity string) bool {
 	byID := delegationsByID(delegations)
 	for _, d := range delegations {
 		if delegationSynthesisRule(d) != "verify" {
@@ -1452,10 +1464,12 @@ func verifyVerdictPassed(delegations []Delegation, children map[string]db.Job, c
 			// crashed verification fails the verdict.
 			return false
 		}
-		// Decision-first: when the verify leg produced a parsed result, its decision
-		// is the verdict (approved => pass, changes_requested/failed/blocked => fail).
+		// Decision-first: when the verify leg produced a parsed result, its
+		// effective decision is the verdict. Repository blocking severity applies
+		// only when the verify leg is itself a review.
 		if payload, ok := childPayloads[d.ID]; ok && payload.Result != nil {
-			if !delegationDecisionApproves(payload.Result.Decision) {
+			decision := effectiveDelegationDecision(payload.Result, child.Type, d.Action, blockingSeverity)
+			if !delegationDecisionApproves(decision) {
 				return false
 			}
 			continue

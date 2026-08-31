@@ -617,13 +617,17 @@ path = ""
 
 # [review] controls native PR review scheduling. Native fanout is disabled by
 # default; request deliberate reviews with 'gitmoot agent review <agent>'.
-# Set native_fanout_enabled = true to opt in globally. A repository override at
-# [repos."owner/repo".review] wins. Enabled fanout selects the runtime family of
-# the first configured reviewer whose family resolves, then dispatches only
-# reviewers in that family. Request another family explicitly when needed.
-# Risk tiers remain independently opt-in and global.
+# Set native_fanout_enabled = true to opt in globally. blocking_severity is the
+# least severe changes-requested verdict that restarts the fix loop; P3 preserves
+# the default where every valid changes-requested review blocks. P1 lets P2/P3
+# findings remain posted while resolving the round as approved with notes.
+# Repository overrides under [repos."owner/repo".review] win. Enabled fanout
+# selects the runtime family of the first configured reviewer whose family resolves,
+# then dispatches only reviewers in that family. Risk tiers remain independently
+# opt-in and global.
 # [review]
 # native_fanout_enabled = false
+# blocking_severity = "P3"
 # risk_tiers_enabled = false
 # high_risk_paths = ["**/auth/**", "cmd/**"]
 # risk_label_high = "risk:high"
@@ -631,6 +635,7 @@ path = ""
 #
 # [repos."owner/repo".review]
 # native_fanout_enabled = true
+# blocking_severity = "P1"
 
 # [merge_gate] controls native task merges. Native auto-merge is enabled by
 # default, but only when an approved review verdict matches the exact current

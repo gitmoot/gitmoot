@@ -2616,6 +2616,18 @@ func withStoreAndPaths(home string, fn func(config.Paths, *db.Store) error) erro
 	if err != nil {
 		return err
 	}
+	// The awaited review-verdict fact is satisfied inside the job state-transition
+	// transaction, so the store — not the engine — renders its wake detail. Install
+	// the same repository policy applyReviewPolicy gives the engine, or that one
+	// wake channel would report a raw verdict the engine has already folded.
+	//
+	// Resolve from current config whenever the store renders a review-verdict
+	// fact. applyReviewPolicy captures one snapshot per engine construction, and
+	// the daemon reconstructs that engine each tick; this callback independently
+	// keeps the transactional wake detail fresh at its own invocation boundary.
+	store.SetReviewBlockingSeverity(func(repo string) string {
+		return loadReviewConfig(home).For(repo).BlockingSeverity
+	})
 	defer store.Close()
 	return fn(paths, store)
 }
