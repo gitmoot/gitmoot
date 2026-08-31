@@ -34,7 +34,7 @@ var localAgentDispatchRuntimeAdapterFor foregroundRuntimeAdapterFactory = func(h
 	if err != nil {
 		return nil, err
 	}
-	delivery, err := wrapReviewSandboxAdapter(home, agent, checkout, adapter)
+	delivery, err := wrapReadOnlySandboxAdapter(home, agent, checkout, adapter)
 	if err != nil {
 		return nil, err
 	}
@@ -408,7 +408,11 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		}
 		checkoutPath = readOnlyWorktreePath
 		promptHeadWarnings = dispatchPromptHeadContradictionWarnings(ctx, jobGitClient(checkoutPath, localDispatchJobRunner(request)), request.Instructions, request.HeadSHA)
-		applyReviewSeat(request.Action, true, selectedRuntimeConfigDir(effectiveAgent.Runtime), &effectiveAgent)
+	}
+	// Moot seats have a separate relay-backed chat sandbox. Its socket and
+	// current-binary grants are owned by that path, not this review/ask policy.
+	if readOnlyWorktreePath != "" && !request.MootSeat {
+		applyReadOnlySeat(true, selectedRuntimeConfigDir(effectiveAgent.Runtime), &effectiveAgent)
 	}
 	if readOnlyWorktreePath != "" {
 		if request.Action != "review" {
@@ -585,6 +589,15 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	// AdvanceJob, which fires while this lock is still held) recognizes its own lock
 	// and does not refuse the healthy-path cleanup as a foreign live owner (#536).
 	ctx = workflow.WithRuntimeSelfOwnerToken(ctx, ownerToken)
+	if effectiveAgent.ReadOnlySeat {
+		cachePaths, err := pathsFromFlag(request.Home)
+		if err != nil {
+			return localAgentJobOutput{}, fmt.Errorf("resolve read-only tool cache paths: %w", err)
+		}
+		if _, err := applyIsolatedToolCacheGrants(cachePaths, workflow.JobPayload{WorktreePath: readOnlyWorktreePath}, &effectiveAgent); err != nil {
+			return localAgentJobOutput{}, fmt.Errorf("prepare read-only tool cache: %w", err)
+		}
+	}
 	// Adapter selection uses the complete EFFECTIVE agent: runtime overrides
 	// select the adapter (#531), while the resolved execution backend selects
 	// where that adapter runs (#1536). Neither decision may be discarded here.

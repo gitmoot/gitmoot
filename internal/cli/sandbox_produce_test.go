@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/sandbox"
@@ -85,6 +87,7 @@ func TestWorkerProducePreflightCodexAndNonProduceNeverProbe(t *testing.T) {
 
 type sandboxAdapterCaptureRunner struct {
 	stdout  string
+	err     error
 	dir     string
 	command string
 	args    []string
@@ -95,7 +98,7 @@ func (r *sandboxAdapterCaptureRunner) Run(_ context.Context, dir, command string
 	r.dir = dir
 	r.command = command
 	r.args = append([]string(nil), args...)
-	return subprocess.Result{Command: command, Args: args, Stdout: r.stdout}, nil
+	return subprocess.Result{Command: command, Args: args, Stdout: r.stdout}, r.err
 }
 
 func (r *sandboxAdapterCaptureRunner) RunEnv(_ context.Context, dir string, env []string, command string, args ...string) (subprocess.Result, error) {
@@ -217,111 +220,285 @@ func TestProduceRunnerComposesUnderTeeAndScopesByAction(t *testing.T) {
 	}
 }
 
-func TestWrapReviewSandboxAdapterPinsReadOnlyCheckoutAndRuntimeState(t *testing.T) {
+func TestWrapReadOnlySandboxAdapterUsesExplicitReadsAndIsolatedState(t *testing.T) {
 	configHome := t.TempDir()
 	checkout := filepath.Join(t.TempDir(), "review-worktree")
 	stateDir := filepath.Join(t.TempDir(), "claude-state")
 	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"old"},"mcpOAuth":{"secret":"must-stay-hidden"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "settings.json"), []byte(`{"env":{"UNRELATED_SECRET":"must-not-copy"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GH_TOKEN", "must-not-reach-review")
+	t.Setenv("OPENAI_API_KEY", "must-not-reach-review")
 	agent := runtime.Agent{
 		Runtime:          runtime.ClaudeRuntime,
 		AutonomyPolicy:   runtime.AutonomyPolicyReadOnly,
-		ReviewSeat:       true,
+		ReadOnlySeat:     true,
 		RuntimeConfigDir: stateDir,
 	}
-	wrapped, err := wrapReviewSandboxAdapter(configHome, agent, checkout, runtime.ClaudeAdapter{Runner: subprocess.GroupRunner{}})
+	wrapped, err := wrapReadOnlySandboxAdapter(configHome, agent, checkout, runtime.ClaudeAdapter{Runner: subprocess.GroupRunner{}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	adapter, ok := wrapped.(runtime.ClaudeAdapter)
+	stateAdapter, ok := wrapped.(readOnlyRuntimeAdapter)
 	if !ok {
-		t.Fatalf("wrapped adapter = %T, want runtime.ClaudeAdapter", wrapped)
+		t.Fatalf("wrapped adapter = %T, want readOnlyRuntimeAdapter", wrapped)
+	}
+	stagedCredential, err := os.ReadFile(stateAdapter.credential.stagedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(stagedCredential), "mcpOAuth") || strings.Contains(string(stagedCredential), "must-stay-hidden") {
+		t.Fatalf("isolated Claude credential leaked unrelated profile credentials: %s", stagedCredential)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(stateAdapter.credential.stagedPath), "settings.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("isolated profile copied host settings: %v", err)
+	}
+	adapter, ok := stateAdapter.Adapter.(runtime.ClaudeAdapter)
+	if !ok {
+		t.Fatalf("inner adapter = %T, want runtime.ClaudeAdapter", stateAdapter.Adapter)
 	}
 	runner, ok := adapter.Runner.(subprocess.WrappingRunner)
 	if !ok {
 		t.Fatalf("wrapped runner = %T, want subprocess.WrappingRunner", adapter.Runner)
 	}
 	if !runner.ReadOnlyWorkdir {
-		t.Fatal("review runner ReadOnlyWorkdir = false")
+		t.Fatal("read-only runner ReadOnlyWorkdir = false")
 	}
-	if !containsPath(runner.WritablePaths, stateDir) {
-		t.Fatalf("review writes %v do not include selected runtime state %q", runner.WritablePaths, stateDir)
+	if !containsPath(runner.ReadablePaths, checkout) || !containsPath(runner.ReadablePaths, filepath.Join(checkout, ".git")) {
+		t.Fatalf("explicit reads %v do not include checkout and git metadata", runner.ReadablePaths)
 	}
-	if !containsEnv(runner.Env, "CLAUDE_CONFIG_DIR="+stateDir) || !containsEnvPrefix(runner.Env, "GOCACHE=") || !containsEnvPrefix(runner.Env, "TMPDIR=") {
-		t.Fatalf("review env %v lacks runtime state, Go cache, or temp grants", runner.Env)
+	if containsPath(runner.ReadablePaths, "/") || containsPath(runner.ReadablePaths, stateDir) {
+		t.Fatalf("explicit reads %v expose the host root or source profile", runner.ReadablePaths)
+	}
+	if len(runner.WritablePaths) != 1 || runner.WritablePaths[0] == stateDir || !strings.Contains(runner.WritablePaths[0], string(filepath.Separator)+"read-only"+string(filepath.Separator)) {
+		t.Fatalf("writes = %v, want one per-worktree cache and no source profile", runner.WritablePaths)
+	}
+	configEnv := envValue(runner.Env, "CLAUDE_CONFIG_DIR")
+	if configEnv == "" || configEnv == stateDir || !strings.HasPrefix(configEnv, runner.WritablePaths[0]+string(filepath.Separator)) {
+		t.Fatalf("CLAUDE_CONFIG_DIR = %q, want isolated state under %q", configEnv, runner.WritablePaths[0])
+	}
+	if !containsEnvPrefix(runner.Env, "GOCACHE=") || !containsEnvPrefix(runner.Env, "TMPDIR=") {
+		t.Fatalf("read-only env %v lacks Go cache or temp grants", runner.Env)
+	}
+	base, ok := runner.Inner.(subprocess.CuratedGroupRunner)
+	if !ok {
+		t.Fatalf("sandbox inner = %T, want CuratedGroupRunner", runner.Inner)
+	}
+	if containsEnvPrefix(base.BaseEnv, "GH_TOKEN=") || containsEnvPrefix(base.BaseEnv, "OPENAI_API_KEY=") {
+		t.Fatalf("curated base environment leaked credentials: %v", base.BaseEnv)
 	}
 }
 
-func TestWrapReviewSandboxAdapterRejectsWritableRuntimeStateInsideCheckout(t *testing.T) {
-	checkout := t.TempDir()
+func TestWrapReadOnlySandboxAdapterKeepsModelGatewayCredentialFree(t *testing.T) {
+	checkout := filepath.Join(t.TempDir(), "review-worktree")
+	sourceState := filepath.Join(t.TempDir(), "claude-state")
 	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	stateDir := filepath.Join(checkout, ".claude")
-	agent := runtime.Agent{
+	if err := os.MkdirAll(sourceState, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceState, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"must-not-copy"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gatewayRunner := &credgw.Runner{Inner: subprocess.GroupRunner{}}
+	adapter := modelGatewayRuntimeAdapter{
+		Adapter: runtime.ClaudeAdapter{Runner: gatewayRunner},
+		runner:  gatewayRunner,
+	}
+	wrapped, err := wrapReadOnlySandboxAdapter(t.TempDir(), runtime.Agent{
 		Runtime:          runtime.ClaudeRuntime,
-		ReviewSeat:       true,
-		RuntimeConfigDir: stateDir,
+		ReadOnlySeat:     true,
+		RuntimeConfigDir: sourceState,
+	}, checkout, adapter)
+	if err != nil {
+		t.Fatal(err)
 	}
-	_, err := wrapReviewSandboxAdapter(t.TempDir(), agent, checkout, runtime.ClaudeAdapter{})
-	if err == nil || !strings.Contains(err.Error(), "overlaps read-only worktree") {
-		t.Fatalf("overlap error = %v", err)
+	stateAdapter, ok := wrapped.(readOnlyRuntimeAdapter)
+	if !ok {
+		t.Fatalf("wrapped adapter = %T, want readOnlyRuntimeAdapter", wrapped)
 	}
-	if _, statErr := os.Stat(stateDir); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("unsafe state directory was created before refusal: %v", statErr)
+	gatewayAdapter, ok := stateAdapter.Adapter.(modelGatewayRuntimeAdapter)
+	if !ok {
+		t.Fatalf("inner adapter = %T, want modelGatewayRuntimeAdapter", stateAdapter.Adapter)
+	}
+	if gatewayAdapter.runner.ChildConfigDir == "" || gatewayAdapter.runner.ChildConfigDir == sourceState {
+		t.Fatalf("gateway ChildConfigDir = %q, want isolated credential-free state", gatewayAdapter.runner.ChildConfigDir)
+	}
+	if _, err := os.Stat(filepath.Join(gatewayAdapter.runner.ChildConfigDir, ".credentials.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("gateway child profile contains a credential: %v", err)
+	}
+	claude, ok := gatewayAdapter.Adapter.(runtime.ClaudeAdapter)
+	if !ok {
+		t.Fatalf("gateway inner adapter = %T", gatewayAdapter.Adapter)
+	}
+	shim, ok := claude.Runner.(subprocess.WrappingRunner)
+	if !ok {
+		t.Fatalf("gateway sandbox runner = %T", claude.Runner)
+	}
+	gateway, ok := shim.Inner.(*credgw.Runner)
+	if !ok {
+		t.Fatalf("sandbox inner = %T, want credential gateway", shim.Inner)
+	}
+	if _, ok := gateway.Inner.(subprocess.CuratedGroupRunner); !ok {
+		t.Fatalf("gateway inner base = %T, want curated environment", gateway.Inner)
 	}
 }
 
-func TestWrapReviewSandboxAdapterRejectsWritableLinkedGitMetadata(t *testing.T) {
-	base := t.TempDir()
-	commonDir := filepath.Join(base, "main", ".git")
-	gitDir := filepath.Join(commonDir, "worktrees", "review")
-	checkout := filepath.Join(base, "review")
-	for _, dir := range []string{commonDir, gitDir, checkout} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.WriteFile(filepath.Join(checkout, ".git"), []byte("gitdir: "+gitDir+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(gitDir, "commondir"), []byte("../..\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	for _, protected := range []string{gitDir, commonDir} {
-		t.Run(filepath.Base(protected), func(t *testing.T) {
-			agent := runtime.Agent{
-				Runtime:       runtime.ShellRuntime,
-				ReviewSeat:    true,
-				WritablePaths: []string{protected},
+func TestReadOnlyRuntimeAdapterRemovesStagedState(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		runnerErr error
+		wantErr   bool
+	}{
+		{name: "success"},
+		{name: "runtime failure", runnerErr: errors.New("runtime failed"), wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stateRoot := filepath.Join(t.TempDir(), "runtime-state")
+			if err := os.MkdirAll(stateRoot, 0o700); err != nil {
+				t.Fatal(err)
 			}
-			_, err := wrapReviewSandboxAdapter(t.TempDir(), agent, checkout, runtime.ShellAdapter{})
-			if err == nil || !strings.Contains(err.Error(), "overlaps protected git metadata") {
-				t.Fatalf("metadata overlap error = %v", err)
+			if err := os.WriteFile(filepath.Join(stateRoot, "credential"), []byte("secret"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			runner := &sandboxAdapterCaptureRunner{stdout: `{"result":"done"}`, err: test.runnerErr}
+			adapter := readOnlyRuntimeAdapter{
+				Adapter:   runtime.ClaudeAdapter{Runner: runner},
+				stateRoot: stateRoot,
+			}
+			_, err := adapter.Deliver(context.Background(), runtime.Agent{
+				Name: "reviewer", Role: "reviewer", Runtime: runtime.ClaudeRuntime,
+				RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "owner/repo",
+				AutonomyPolicy: runtime.AutonomyPolicyReadOnly,
+			}, runtime.Job{Prompt: "review"})
+			if (err != nil) != test.wantErr {
+				t.Fatalf("Deliver error = %v, wantErr=%v", err, test.wantErr)
+			}
+			if _, err := os.Stat(stateRoot); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("staged runtime state survived delivery: %v", err)
 			}
 		})
 	}
 }
 
-func TestApplyReviewSeatRequiresOwnedReviewWorktree(t *testing.T) {
+func TestReadOnlyRuntimeCredentialPersistsOnlyStableJSONSchema(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "auth.json")
+	staged := filepath.Join(dir, "staged.json")
+	if err := os.WriteFile(source, []byte(`{"token":"old"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(staged, []byte(`{"token":"refreshed"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	shape, err := jsonDocumentShape([]byte(`{"token":"old"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential := &readOnlyRuntimeCredential{
+		sourcePath: source,
+		stagedPath: staged,
+		keys:       map[string]struct{}{"token": {}},
+		shape:      shape,
+	}
+	if err := credential.persist(); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(source); err != nil || string(data) != `{"token":"refreshed"}` {
+		t.Fatalf("persisted credential = %q, err=%v", data, err)
+	}
+	if err := os.WriteFile(staged, []byte(`{"token":{"value":"poisoned"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := credential.persist(); err == nil || !strings.Contains(err.Error(), "nested schema") {
+		t.Fatalf("nested schema drift error = %v", err)
+	}
+	if err := os.WriteFile(staged, []byte(`{"token":"poisoned","extra":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := credential.persist(); err == nil || !strings.Contains(err.Error(), "top-level schema") {
+		t.Fatalf("schema drift error = %v", err)
+	}
+	if data, err := os.ReadFile(source); err != nil || string(data) != `{"token":"refreshed"}` {
+		t.Fatalf("source changed after rejected schema drift: %q, err=%v", data, err)
+	}
+}
+
+func TestClaudeCredentialRefreshPreservesUnrelatedSections(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, ".credentials.json")
+	staged := filepath.Join(dir, "isolated", ".credentials.json")
+	if err := os.WriteFile(source, []byte(`{"claudeAiOauth":{"accessToken":"old"},"mcpOAuth":{"secret":"preserve"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	credential, err := stageReadOnlyRuntimeCredential(source, staged, "claudeAiOauth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(staged, []byte(`{"claudeAiOauth":{"accessToken":"refreshed"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := credential.persist(); err != nil {
+		t.Fatal(err)
+	}
+	var result map[string]map[string]string
+	data, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result["claudeAiOauth"]["accessToken"] != "refreshed" || result["mcpOAuth"]["secret"] != "preserve" {
+		t.Fatalf("merged Claude credential = %v", result)
+	}
+}
+
+func TestWrapReadOnlySandboxAdapterRejectsOmpWithoutCredentialBroker(t *testing.T) {
+	checkout := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	agent := runtime.Agent{Runtime: runtime.OmpRuntime, ReadOnlySeat: true}
+	_, err := wrapReadOnlySandboxAdapter(t.TempDir(), agent, checkout, runtime.OmpAdapter{})
+	if err == nil || !strings.Contains(err.Error(), "isolated credential broker") {
+		t.Fatalf("omp read-only seat error = %v", err)
+	}
+}
+
+func TestApplyReadOnlySeatRequiresOwnedWorktree(t *testing.T) {
 	for _, test := range []struct {
 		name       string
-		action     string
 		readOnly   bool
-		wantReview bool
+		wantSeat   bool
 		wantConfig string
 	}{
-		{name: "review worktree", action: "review", readOnly: true, wantReview: true, wantConfig: "/profiles/reviewer"},
-		{name: "review shared checkout", action: "review", readOnly: false},
-		{name: "ask worktree", action: "ask", readOnly: true},
+		{name: "review worktree", readOnly: true, wantSeat: true, wantConfig: "/profiles/reviewer"},
+		{name: "ask worktree", readOnly: true, wantSeat: true, wantConfig: "/profiles/reviewer"},
+		{name: "shared checkout", readOnly: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			agent := runtime.Agent{}
-			applyReviewSeat(test.action, test.readOnly, " /profiles/reviewer ", &agent)
-			if agent.ReviewSeat != test.wantReview || agent.RuntimeConfigDir != test.wantConfig {
-				t.Fatalf("review marker = %v config = %q, want %v %q", agent.ReviewSeat, agent.RuntimeConfigDir, test.wantReview, test.wantConfig)
+			agent := runtime.Agent{
+				WritablePaths: []string{"/shared/cache"},
+				ReadablePaths: []string{"/host"},
+				ReadableFiles: []string{"/host/secret"},
+			}
+			applyReadOnlySeat(test.readOnly, " /profiles/reviewer ", &agent)
+			if agent.ReadOnlySeat != test.wantSeat || agent.RuntimeConfigDir != test.wantConfig {
+				t.Fatalf("read-only marker = %v config = %q, want %v %q", agent.ReadOnlySeat, agent.RuntimeConfigDir, test.wantSeat, test.wantConfig)
+			}
+			if test.wantSeat && (len(agent.WritablePaths) != 0 || len(agent.ReadablePaths) != 0 || len(agent.ReadableFiles) != 0) {
+				t.Fatalf("read-only seat retained configured grants: writes=%v readDirs=%v readFiles=%v", agent.WritablePaths, agent.ReadablePaths, agent.ReadableFiles)
 			}
 		})
 	}
@@ -350,6 +527,15 @@ func containsEnv(env []string, want string) bool {
 		}
 	}
 	return false
+}
+func envValue(env []string, name string) string {
+	prefix := name + "="
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			return strings.TrimPrefix(entry, prefix)
+		}
+	}
+	return ""
 }
 
 func containsEnvPrefix(env []string, prefix string) bool {

@@ -382,12 +382,12 @@ func TestCodexDeliverChatSeatSandbox(t *testing.T) {
 	runner.want(t, 0, "codex", "exec", "--sandbox", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "--json", "resume", "--last", "--", "converse")
 }
 
-func TestCodexDeliverReviewSeatCanRunToolsAndNetwork(t *testing.T) {
+func TestCodexDeliverReadOnlySeatCanRunToolsAndNetwork(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "ok"}}}
 	adapter := CodexAdapter{Runner: runner}
 	agent := Agent{
 		Name: "reviewer", Role: "reviewer", Runtime: CodexRuntime, RepoScope: "gitmoot/gitmoot",
-		RuntimeRef: "last", AutonomyPolicy: AutonomyPolicyReadOnly, ReviewSeat: true,
+		RuntimeRef: "last", AutonomyPolicy: AutonomyPolicyReadOnly, ReadOnlySeat: true,
 		WritablePaths: []string{"/cache/tools"},
 	}
 	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"}); err != nil {
@@ -1206,13 +1206,13 @@ func TestClaudeDeliverCommandAppliesAutonomyPolicy(t *testing.T) {
 	}
 }
 
-func TestClaudeDeliverReviewSeatCanRunToolsAndNetwork(t *testing.T) {
+func TestClaudeDeliverReadOnlySeatCanRunToolsAndNetwork(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"result":"done"}`}}}
 	adapter := ClaudeAdapter{Runner: runner}
 	agent := Agent{
 		Name: "reviewer", Role: "reviewer", Runtime: ClaudeRuntime,
 		RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "gitmoot/gitmoot",
-		AutonomyPolicy: AutonomyPolicyReadOnly, ReviewSeat: true,
+		AutonomyPolicy: AutonomyPolicyReadOnly, ReadOnlySeat: true,
 	}
 	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"}); err != nil {
 		t.Fatalf("Deliver returned error: %v", err)

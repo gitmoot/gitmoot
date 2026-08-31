@@ -25,6 +25,18 @@ func ReadOnlyWorkdirSupported() bool {
 	return true
 }
 
+// Runtime bootstrap needs these host files, but not their credential-bearing
+// parent directories. Missing platform-specific files are ignored below.
+var runtimeHostReadFiles = []string{
+	"/etc/ld.so.cache",
+	"/etc/resolv.conf",
+	"/etc/hosts",
+	"/etc/nsswitch.conf",
+	"/etc/passwd",
+	"/etc/group",
+	"/etc/localtime",
+}
+
 // Exec applies Gitmoot's strict filesystem ruleset to the current process and
 // replaces it with argv. Landlock restrictions survive execve, so the runtime
 // and every descendant inherit the same filesystem confinement.
@@ -81,6 +93,7 @@ func execSandbox(readPaths, readFiles, writePaths []string, argv []string, readO
 		if len(files) > 0 {
 			rules = append(rules, landlock.ROFiles(files...))
 		}
+		rules = append(rules, landlock.ROFiles(runtimeHostReadFiles...).IgnoreIfMissing())
 	}
 	if len(writable) > 0 {
 		// WithRefer permits rename/link operations only when both the source and
@@ -168,22 +181,34 @@ func readableRoots(paths []string, executable string) ([]string, error) {
 			return nil, err
 		}
 	}
-	for _, candidate := range []string{"/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/dev", "/proc", "/sys", "/run", "/opt"} {
+	for _, candidate := range []string{
+		"/bin", "/sbin", "/lib", "/lib64", "/dev",
+		"/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64", "/usr/libexec", "/usr/share",
+		"/usr/local/bin", "/usr/local/sbin", "/usr/local/lib", "/usr/local/lib64", "/usr/local/share",
+		"/etc/ssl/certs", "/etc/pki",
+	} {
 		if err := add(candidate, false); err != nil {
 			return nil, err
 		}
 	}
-	if home, err := os.UserHomeDir(); err == nil {
-		if err := add(filepath.Join(home, ".local"), false); err != nil {
-			return nil, err
-		}
+	if err := add(filepath.Dir(executable), true); err != nil {
+		return nil, err
 	}
 	resolvedExecutable := executable
 	if resolved, err := filepath.EvalSymlinks(executable); err == nil {
 		resolvedExecutable = resolved
 	}
-	if err := add(filepath.Dir(resolvedExecutable), true); err != nil {
+	executableDir := filepath.Dir(resolvedExecutable)
+	if err := add(executableDir, true); err != nil {
 		return nil, err
+	}
+	if base := filepath.Base(executableDir); base == "bin" || base == "sbin" {
+		installRoot := filepath.Dir(executableDir)
+		if installRoot != "/" && installRoot != "/usr" {
+			if err := add(installRoot, true); err != nil {
+				return nil, err
+			}
+		}
 	}
 	return roots, nil
 }

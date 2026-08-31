@@ -54,10 +54,10 @@ func TestDispatchBackgroundAskAllocatesReadOnlyWorktree(t *testing.T) {
 	store, home := blockerE2EHome(t)
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	// Shell runtime, ask-only: a background dispatch enqueues and returns before any
-	// delivery, so the command body is irrelevant here.
-	seedDaemonWorkerAgent(t, store, "responder", runtime.ShellRuntime, "printf '%s' '{}'", []string{"ask"}, "owner/repo")
-
+	configDir := filepath.Join(t.TempDir(), "claude-profile")
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	// A background dispatch enqueues and returns before any delivery.
+	seedDaemonWorkerAgent(t, store, "responder", runtime.ClaudeRuntime, "550e8400-e29b-41d4-a716-446655440002", []string{"ask"}, "owner/repo")
 	out, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
 		RepoFlag:     "owner/repo",
 		Agent:        "responder",
@@ -82,6 +82,9 @@ func TestDispatchBackgroundAskAllocatesReadOnlyWorktree(t *testing.T) {
 	}
 	if !payload.ReadOnlyWorktree {
 		t.Fatal("background ask payload ReadOnlyWorktree = false, want true (disposal marker for a top-level read-only worktree)")
+	}
+	if payload.RuntimeConfigDir != configDir {
+		t.Fatalf("background ask RuntimeConfigDir = %q, want dispatch profile %q", payload.RuntimeConfigDir, configDir)
 	}
 	if payload.HeadSHA != "" {
 		t.Fatalf("background ask payload HeadSHA = %q, want cleared (validate against the fresh worktree HEAD)", payload.HeadSHA)

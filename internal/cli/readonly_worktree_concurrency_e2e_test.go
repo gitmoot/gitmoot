@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,11 +18,11 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// This file is the no-LLM, no-network end-to-end proof for the #739 fix:
-// background read-only (ask) jobs — moot seats, chat-task promotions, autorespond,
-// `agent ask --background` — are each allocated a dedicated DETACHED committed-tip
-// worktree at DISPATCH time, so their checkout key is worktree:<path> and same-repo
-// seats run CONCURRENTLY instead of serializing on the shared repo:<repo> key.
+// This file is the no-LLM end-to-end proof for the #739 fix. Background
+// read-only jobs each receive a dedicated detached committed-tip worktree, so
+// their worktree:<path> keys run concurrently instead of serializing on the
+// shared repo key. The hard-sandbox ask proof uses loopback only for its
+// rendezvous; moot seats retain their relay-backed chat path.
 //
 // The #739 condition is reproduced faithfully: the repo checkout is parked on a
 // NON-MAIN / stale odd branch (the live symptom was on a repo sitting on
@@ -88,6 +89,49 @@ printf '%%s' '%s'`, stateDir, self, stateDir, peers, failResult, okResult)
 		return prefix + "\n" + body
 	}
 	return body
+}
+func loopbackRendezvous(t *testing.T, peers int) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		if tcp, ok := listener.(*net.TCPListener); ok {
+			_ = tcp.SetDeadline(time.Now().Add(5 * time.Second))
+		}
+		connections := make([]net.Conn, 0, peers)
+		defer func() {
+			for _, connection := range connections {
+				_ = connection.Close()
+			}
+		}()
+		for len(connections) < peers {
+			connection, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			connections = append(connections, connection)
+		}
+		for _, connection := range connections {
+			_, _ = connection.Write([]byte{1})
+		}
+	}()
+	return listener.Addr().String()
+}
+
+func loopbackRendezvousSeatScript(address, self, okResult string) string {
+	failResult := rendezvousResult("failed", "rendezvous timeout: seat "+self+" serialized (#739 regression)")
+	probe := `import socket,sys; host,port=sys.argv[1].rsplit(":",1); s=socket.create_connection((host,int(port)),2); s.settimeout(2); s.sendall(sys.argv[2].encode()); ok=s.recv(1); s.close(); sys.exit(0 if ok else 1)`
+	return fmt.Sprintf(
+		"if python3 -c %s %s %s; then sleep 0.3; printf '%%s' %s; else printf '%%s' %s; fi",
+		shellQuote(probe, "posix"),
+		shellQuote(address, "posix"),
+		shellQuote(self, "posix"),
+		shellQuote(okResult, "posix"),
+		shellQuote(failResult, "posix"),
+	)
 }
 
 // readonlyPoolWorker builds a REAL pool-scheduler jobWorker on the isolated home:
@@ -178,11 +222,11 @@ func TestReadOnlyWorktreeConcurrentAsksE2E(t *testing.T) {
 	checkout := staleBranchGitCheckout(t, "owner/repo")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 
-	stateDir := t.TempDir()
+	rendezvous := loopbackRendezvous(t, 2)
 	seedDaemonWorkerAgent(t, store, "alice", runtime.ShellRuntime,
-		rendezvousSeatScript(stateDir, "alice", 2, rendezvousResult("approved", "alice ran beside bob"), ""), []string{"ask"}, "owner/repo")
+		loopbackRendezvousSeatScript(rendezvous, "alice", rendezvousResult("approved", "alice ran beside bob")), []string{"ask"}, "owner/repo")
 	seedDaemonWorkerAgent(t, store, "bob", runtime.ShellRuntime,
-		rendezvousSeatScript(stateDir, "bob", 2, rendezvousResult("approved", "bob ran beside alice"), ""), []string{"ask"}, "owner/repo")
+		loopbackRendezvousSeatScript(rendezvous, "bob", rendezvousResult("approved", "bob ran beside alice")), []string{"ask"}, "owner/repo")
 
 	// Dispatch two BACKGROUND read-only asks on the SAME stale-branch repo through
 	// the REAL dispatch entry (the moot-seat / chat-task / autorespond shape).

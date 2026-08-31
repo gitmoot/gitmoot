@@ -74,14 +74,14 @@ type Agent struct {
 	// also injects a working relay env, so a seat is never elevated without a relay;
 	// never persisted.
 	ChatSeat bool
-	// ReviewSeat marks an exact-head review running in a detached read-only
-	// worktree. The CLI wraps these jobs in a hard filesystem sandbox before
-	// adapters receive the widened command and network permissions below.
+	// ReadOnlySeat marks a delivery running in a detached read-only worktree.
+	// The CLI wraps these jobs in a hard filesystem sandbox before adapters
+	// receive the widened command and network permissions below.
 	// In-memory only; never persisted on the agents table.
-	ReviewSeat bool
-	// RuntimeConfigDir is the credential and mutable state directory selected by
-	// the dispatching process for this job. It keeps detached execution on the
-	// same runtime profile without persisting any credential value.
+	ReadOnlySeat bool
+	// RuntimeConfigDir is the source profile selected by the dispatching process.
+	// Read-only seats copy only the provider authentication needed by that
+	// runtime into per-job state; the source directory is never sandbox-visible.
 	RuntimeConfigDir string
 	// ExecBackend is the execution backend resolved for THIS job at dispatch
 	// (#1536 P1) from [remote_exec].backend plus the payload's exec_backend
@@ -961,7 +961,7 @@ func effectiveEffort(agent Agent, job Job) string {
 }
 
 func codexSandboxArgs(agent Agent, workdir string) ([]string, PermissionPolicyApplication) {
-	if agent.ReviewSeat {
+	if agent.ReadOnlySeat {
 		args := []string{"--sandbox", "workspace-write"}
 		for _, path := range agent.WritablePaths {
 			if path = strings.TrimSpace(path); path != "" {
@@ -1933,7 +1933,7 @@ var claudeRuntimeContract = RuntimeContract{
 func claudePermissionArgs(agent Agent) ([]string, PermissionPolicyApplication) {
 	var args []string
 	property := PermissionPolicyNotApplied
-	if agent.ReviewSeat {
+	if agent.ReadOnlySeat {
 		args = []string{"--restricted", "--tools", "Bash,WebFetch,WebSearch", "--permission-mode", "dontAsk", "--allowedTools", "Bash,WebFetch,WebSearch"}
 		property = PermissionPolicyWidened
 	} else {

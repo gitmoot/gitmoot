@@ -87,7 +87,8 @@ func TestSandboxExecReadOnlyWorkdirE2E(t *testing.T) {
 	workdir := filepath.Join(base, "review-worktree")
 	cacheDir := filepath.Join(base, "review-cache")
 	gitMetadataDir := filepath.Join(base, "linked-gitdir")
-	for _, dir := range []string{workdir, cacheDir, filepath.Join(cacheDir, "tmp"), gitMetadataDir} {
+	outsideDir := filepath.Join(base, "outside")
+	for _, dir := range []string{workdir, cacheDir, filepath.Join(cacheDir, "tmp"), gitMetadataDir, outsideDir} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -98,6 +99,10 @@ func TestSandboxExecReadOnlyWorkdirE2E(t *testing.T) {
 	}
 	metadataFile := filepath.Join(gitMetadataDir, "index")
 	if err := os.WriteFile(metadataFile, []byte("metadata-unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outsideFile := filepath.Join(outsideDir, "credential")
+	if err := os.WriteFile(outsideFile, []byte("must-stay-hidden"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(workdir, "go.mod"), []byte("module reviewtest\n\ngo 1.22\n"), 0o600); err != nil {
@@ -113,16 +118,19 @@ go test -count=1 .
 printf passed > "$1"
 if { printf mutated > "$2"; } 2>/dev/null; then exit 41; fi
 if { printf metadata-mutated > "$3"; } 2>/dev/null; then exit 42; fi
+if cat "$4" >/dev/null 2>&1; then exit 43; fi
 `
-	command := exec.Command(gitmoot, "sandbox-exec", "--read-only-workdir", "--write", cacheDir, "--", "/bin/sh", "-c", script, "gitmoot-test", cacheArtifact, source, metadataFile)
+	command := exec.Command(gitmoot, "sandbox-exec", "--read-only-workdir", "--read", workdir, "--read", gitMetadataDir, "--write", cacheDir, "--", "/bin/sh", "-c", script, "gitmoot-test", cacheArtifact, source, metadataFile, outsideFile)
 	command.Dir = workdir
-	command.Env = append(os.Environ(),
-		"GOTOOLCHAIN=local",
-		"GOCACHE="+filepath.Join(cacheDir, "go-build"),
-		"GOMODCACHE="+filepath.Join(cacheDir, "go-mod"),
-		"GOPATH="+filepath.Join(cacheDir, "gopath"),
-		"TMPDIR="+filepath.Join(cacheDir, "tmp"),
-	)
+	command.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + filepath.Join(cacheDir, "home"),
+		"GOTOOLCHAIN=go1.26.0",
+		"GOCACHE=" + filepath.Join(cacheDir, "go-build"),
+		"GOMODCACHE=" + filepath.Join(cacheDir, "go-mod"),
+		"GOPATH=" + filepath.Join(cacheDir, "gopath"),
+		"TMPDIR=" + filepath.Join(cacheDir, "tmp"),
+	}
 	if combined, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("executable read-only review sandbox failed: %v\n%s", err, combined)
 	}

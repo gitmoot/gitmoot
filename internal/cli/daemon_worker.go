@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -347,7 +348,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// Stamp the already-resolved decision on the in-memory job agent so every
 	// secondary adapter rebuild consumes the same backend selection.
 	agent.ExecBackend = string(execBackend)
-	applyReviewSeat(job.Type, payload.ReadOnlyWorktree, payload.RuntimeConfigDir, &agent)
+	applyReadOnlySeat(payload.ReadOnlyWorktree && !payload.MootSeat, payload.RuntimeConfigDir, &agent)
 	preflightRequest := runtime.RuntimeContractRequest{Plan: payload.Plan}
 	if result, checked, preflightErr := w.runtimeContractPreflight(ctx, execBackend, agent, preflightRequest); preflightErr != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, preflightErr); finishErr != nil {
@@ -607,20 +608,28 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
 	}
-	// Shared tool-cache grant (#1113 lever 1): disk hygiene, not a security
-	// precondition, so any failure is fail-open (logged, job proceeds without the
-	// cache redirect) rather than failing the job like the produce grants above.
-	// MUST run after applyProduceRuntimeGrants: that call overwrites
-	// agent.WritablePaths for produce jobs, so appending earlier would be lost.
+	// Shared cache failures remain fail-open for ordinary isolated jobs. A
+	// read-only seat uses its per-worktree cache as part of the hard sandbox and
+	// therefore fails closed when that grant cannot be constructed.
 	var toolCacheEnv []string
+	var toolCacheErr error
 	if execBackend == execbackend.Local {
 		if cachePaths, cacheErr := w.configPaths(); cacheErr != nil {
-			writeLine(w.Stdout, "job %s tool cache config load failed: %v", job.ID, cacheErr)
-		} else if env, grantErr := applyIsolatedToolCacheGrants(cachePaths, payload, &agent); grantErr != nil {
-			writeLine(w.Stdout, "job %s tool cache grant failed: %v", job.ID, grantErr)
+			toolCacheErr = cacheErr
 		} else {
-			toolCacheEnv = env
+			toolCacheEnv, toolCacheErr = applyIsolatedToolCacheGrants(cachePaths, payload, &agent)
 		}
+	}
+	if toolCacheErr != nil {
+		if agent.ReadOnlySeat {
+			err := fmt.Errorf("prepare read-only tool cache: %w", toolCacheErr)
+			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+				return finishErr
+			}
+			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
+			return nil
+		}
+		writeLine(w.Stdout, "job %s tool cache grant failed: %v", job.ID, toolCacheErr)
 	}
 	// Acquire the execution-backend lifecycle only after checkout validation and
 	// runtime-session admission. The instance then survives every Mailbox repair
@@ -668,7 +677,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
 	}
-	adapter, err = wrapReviewSandboxAdapter(w.ConfigHome, agent, deliveryCheckout, adapter)
+	adapter, err = wrapReadOnlySandboxAdapter(w.ConfigHome, agent, deliveryCheckout, adapter)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
@@ -1330,26 +1339,97 @@ func wrapProduceSandboxAdapter(action string, agent runtime.Agent, adapter workf
 	}
 }
 
-func wrapReviewSandboxAdapter(home string, agent runtime.Agent, checkout string, adapter workflow.DeliveryAdapter) (workflow.DeliveryAdapter, error) {
-	if !agent.ReviewSeat {
+const maxReadOnlyRuntimeStateFileBytes = 1 << 20
+
+type readOnlySandboxGrants struct {
+	reads      []string
+	readFiles  []string
+	writes     []string
+	env        []string
+	cacheRoot  string
+	stateDir   string
+	credential *readOnlyRuntimeCredential
+}
+
+type readOnlyRuntimeCredential struct {
+	sourcePath string
+	stagedPath string
+	section    string
+	keys       map[string]struct{}
+	shape      any
+}
+
+type readOnlyRuntimeAdapter struct {
+	runtime.Adapter
+	credential *readOnlyRuntimeCredential
+	stateRoot  string
+}
+
+func (a readOnlyRuntimeAdapter) PermissionPolicyApplication(agent runtime.Agent) runtime.PermissionPolicyApplication {
+	return runtime.ResolvePermissionPolicyApplication(a.Adapter, agent)
+}
+
+func (a readOnlyRuntimeAdapter) Deliver(ctx context.Context, agent runtime.Agent, job runtime.Job) (runtime.Result, error) {
+	result, deliverErr := a.Adapter.Deliver(ctx, agent, job)
+	var syncErr error
+	if deliverErr == nil && a.credential != nil {
+		if err := a.credential.persist(); err != nil {
+			syncErr = fmt.Errorf("persist read-only seat runtime credential: %w", err)
+		}
+	}
+	var cleanupErr error
+	if a.stateRoot != "" {
+		if err := os.RemoveAll(a.stateRoot); err != nil {
+			cleanupErr = fmt.Errorf("remove read-only seat runtime state: %w", err)
+		}
+	}
+	return result, errors.Join(deliverErr, syncErr, cleanupErr)
+}
+
+func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout string, adapter workflow.DeliveryAdapter) (workflow.DeliveryAdapter, error) {
+	if !agent.ReadOnlySeat {
 		return adapter, nil
 	}
-	writes, env, err := reviewRuntimeSandboxGrants(home, agent, checkout)
+	_, gatewayMode := adapter.(modelGatewayRuntimeAdapter)
+	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, gatewayMode)
 	if err != nil {
 		return nil, err
 	}
 	wrap := func(runner subprocess.Runner) subprocess.Runner {
-		return landlockReviewRunner(runner, writes, env)
+		curated := graftRuntimeBaseRunner(runner, subprocess.CuratedGroupRunner{
+			BaseEnv: readOnlyRuntimeBaseEnv(agent.Runtime, os.Environ(), filepath.Join(grants.cacheRoot, "gh")),
+		})
+		return landlockReadOnlyRunner(curated, grants.reads, grants.readFiles, grants.writes, grants.env)
 	}
+	wrapped, err := wrapReadOnlyAdapterRunner(agent.Runtime, adapter, grants.stateDir, wrap)
+	if err != nil {
+		return nil, err
+	}
+	if grants.stateDir == "" && grants.credential == nil {
+		return wrapped, nil
+	}
+	runtimeAdapter, ok := wrapped.(runtime.Adapter)
+	if !ok {
+		return nil, fmt.Errorf("read-only Landlock sandbox returned incompatible %T adapter", wrapped)
+	}
+	return readOnlyRuntimeAdapter{
+		Adapter:    runtimeAdapter,
+		credential: grants.credential,
+		stateRoot:  filepath.Join(grants.cacheRoot, "runtime-state"),
+	}, nil
+}
+
+func wrapReadOnlyAdapterRunner(runtimeName string, adapter workflow.DeliveryAdapter, stateDir string, wrap func(subprocess.Runner) subprocess.Runner) (workflow.DeliveryAdapter, error) {
 	switch a := adapter.(type) {
 	case modelGatewayRuntimeAdapter:
-		wrapped, err := wrapReviewSandboxAdapter(home, agent, checkout, a.Adapter)
+		a.runner.ChildConfigDir = stateDir
+		wrapped, err := wrapReadOnlyAdapterRunner(runtimeName, a.Adapter, stateDir, wrap)
 		if err != nil {
 			return nil, err
 		}
 		runtimeAdapter, ok := wrapped.(runtime.Adapter)
 		if !ok {
-			return nil, fmt.Errorf("review Landlock sandbox returned incompatible %T adapter", wrapped)
+			return nil, fmt.Errorf("read-only Landlock sandbox returned incompatible %T adapter", wrapped)
 		}
 		a.Adapter = runtimeAdapter
 		return a, nil
@@ -1377,29 +1457,28 @@ func wrapReviewSandboxAdapter(home string, agent runtime.Agent, checkout string,
 	case *runtime.KimiCLIAdapter:
 		a.Runner = wrap(a.Runner)
 		return a, nil
-	case runtime.OmpAdapter:
-		a.Runner = wrap(a.Runner)
-		return a, nil
-	case *runtime.OmpAdapter:
-		a.Runner = wrap(a.Runner)
-		return a, nil
+	case runtime.OmpAdapter, *runtime.OmpAdapter:
+		return nil, errors.New("read-only seats cannot use omp without an isolated credential broker")
 	case runtime.ShellAdapter:
 		a.Runner = wrap(a.Runner)
 		return a, nil
-
 	case *runtime.ShellAdapter:
 		a.Runner = wrap(a.Runner)
 		return a, nil
 	default:
-		return nil, fmt.Errorf("review Landlock sandbox cannot wrap %s adapter %T", agent.Runtime, adapter)
+		return nil, fmt.Errorf("read-only Landlock sandbox cannot wrap %s adapter %T", runtimeName, adapter)
 	}
 }
-func applyReviewSeat(action string, readOnlyWorktree bool, configDir string, agent *runtime.Agent) {
-	if agent == nil || strings.TrimSpace(action) != "review" || !readOnlyWorktree {
+
+func applyReadOnlySeat(readOnlyWorktree bool, configDir string, agent *runtime.Agent) {
+	if agent == nil || !readOnlyWorktree {
 		return
 	}
-	agent.ReviewSeat = true
+	agent.ReadOnlySeat = true
 	agent.RuntimeConfigDir = strings.TrimSpace(configDir)
+	agent.WritablePaths = nil
+	agent.ReadablePaths = nil
+	agent.ReadableFiles = nil
 }
 
 func selectedRuntimeConfigDir(runtimeName string) string {
@@ -1413,79 +1492,379 @@ func selectedRuntimeConfigDir(runtimeName string) string {
 	}
 }
 
-func reviewRuntimeSandboxGrants(home string, agent runtime.Agent, checkout string) ([]string, []string, error) {
+func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout string, gatewayMode bool) (readOnlySandboxGrants, error) {
+	var grants readOnlySandboxGrants
 	paths, err := pathsFromFlag(home)
 	if err != nil {
-		return nil, nil, fmt.Errorf("resolve review sandbox config paths: %w", err)
-	}
-	policy, err := config.LoadToolCache(paths)
-	if err != nil {
-		return nil, nil, fmt.Errorf("load review tool cache config: %w", err)
-	}
-	if policy.Enabled {
-		if err := validateReviewWritablePaths(checkout, []string{policy.Dir}); err != nil {
-			return nil, nil, err
-		}
+		return grants, fmt.Errorf("resolve read-only sandbox config paths: %w", err)
 	}
 	toolEnv, err := applyIsolatedToolCacheGrants(paths, workflow.JobPayload{WorktreePath: checkout}, &agent)
 	if err != nil {
-		return nil, nil, err
+		return grants, err
 	}
-	writes := append([]string(nil), agent.WritablePaths...)
-	env := append([]string(nil), toolEnv...)
+	if len(agent.WritablePaths) != 1 {
+		return grants, fmt.Errorf("read-only seat requires exactly one isolated cache grant, got %d", len(agent.WritablePaths))
+	}
+	grants.cacheRoot = agent.WritablePaths[0]
+	grants.writes = []string{grants.cacheRoot}
+	grants.env = append(grants.env, toolEnv...)
 
-	cacheRoot := policy.Dir
-	if !policy.Enabled {
-		cacheRoot = filepath.Join(paths.Home, "cache", "review-tools")
-		for _, entry := range toolCacheEnvSubdirs {
-			dir := filepath.Join(cacheRoot, entry.subdir)
-			env = append(env, entry.env+"="+dir)
-		}
+	grants.reads = append(grants.reads, checkout)
+	metadata, err := reviewGitMetadataPaths(checkout)
+	if err != nil {
+		return grants, err
 	}
-	// Codex workspace-write admits TMPDIR as a native writable root. Pointing it
-	// at the cache root keeps the tool caches writable in foreground reviews,
-	// where the adapter receives no later daemon-side --add-dir mutation.
-	tempDir := cacheRoot
-	writes = appendUniquePath(writes, cacheRoot)
+	grants.reads = append(grants.reads, metadata...)
 
-	stateDir := strings.TrimSpace(agent.RuntimeConfigDir)
-	if stateDir == "" {
-		userHome, homeErr := os.UserHomeDir()
-		if homeErr != nil {
-			return nil, nil, fmt.Errorf("resolve review runtime state home: %w", homeErr)
-		}
-		switch agent.Runtime {
-		case runtime.ClaudeRuntime:
-			stateDir = filepath.Join(userHome, ".claude")
-		case runtime.CodexRuntime:
-			stateDir = filepath.Join(userHome, ".codex")
-		case runtime.KimiRuntime, runtime.KimiCLIRuntime:
-			stateDir = filepath.Join(userHome, ".kimi-code")
-		}
+	stateDir, credential, stateEnv, err := prepareReadOnlyRuntimeState(agent, grants.cacheRoot, gatewayMode)
+	if err != nil {
+		return grants, err
 	}
-	if stateDir != "" {
-		writes = appendUniquePath(writes, stateDir)
-		switch agent.Runtime {
-		case runtime.ClaudeRuntime:
-			env = append(env, "CLAUDE_CONFIG_DIR="+stateDir)
-		case runtime.CodexRuntime:
-			env = append(env, "CODEX_HOME="+stateDir)
-		}
+	grants.stateDir = stateDir
+	grants.credential = credential
+	grants.env = append(grants.env, stateEnv...)
+
+	tempDir := filepath.Join(grants.cacheRoot, "tmp")
+	grants.env = append(grants.env,
+		"HOME="+filepath.Join(grants.cacheRoot, "home"),
+		"XDG_CONFIG_HOME="+filepath.Join(grants.cacheRoot, "xdg-config"),
+		"XDG_CACHE_HOME="+filepath.Join(grants.cacheRoot, "xdg-cache"),
+		"XDG_DATA_HOME="+filepath.Join(grants.cacheRoot, "xdg-data"),
+		"XDG_STATE_HOME="+filepath.Join(grants.cacheRoot, "xdg-state"),
+		"GOPATH="+filepath.Join(grants.cacheRoot, "go"),
+		"GH_CONFIG_DIR="+filepath.Join(grants.cacheRoot, "gh"),
+		"GH_PROMPT_DISABLED=1",
+		"TMPDIR="+tempDir,
+		"TMP="+tempDir,
+		"TEMP="+tempDir,
+	)
+	if err := validateReadOnlyWritablePaths(checkout, grants.writes); err != nil {
+		return grants, err
 	}
-	writes = appendUniquePath(writes, tempDir)
-	if err := validateReviewWritablePaths(checkout, writes); err != nil {
-		return nil, nil, err
-	}
-	for _, path := range writes {
+	for _, path := range append([]string{tempDir, filepath.Join(grants.cacheRoot, "home")}, grants.writes...) {
 		if err := os.MkdirAll(path, 0o700); err != nil {
-			return nil, nil, fmt.Errorf("create review sandbox write directory %q: %w", path, err)
+			return grants, fmt.Errorf("create read-only sandbox write directory %q: %w", path, err)
 		}
 	}
-	env = append(env, "TMPDIR="+tempDir, "TMP="+tempDir, "TEMP="+tempDir)
-	return compactCleanPaths(writes), env, nil
+	grants.reads = compactCleanPaths(grants.reads)
+	grants.readFiles = compactCleanPaths(grants.readFiles)
+	grants.writes = compactCleanPaths(grants.writes)
+	return grants, nil
 }
 
-func validateReviewWritablePaths(checkout string, writes []string) error {
+func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string, gatewayMode bool) (string, *readOnlyRuntimeCredential, []string, error) {
+	userHome, err := os.UserHomeDir()
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("resolve read-only runtime state home: %w", err)
+	}
+	sourceDir := strings.TrimSpace(agent.RuntimeConfigDir)
+	var relativeState, credentialFile, credentialSection string
+	switch agent.Runtime {
+	case runtime.ClaudeRuntime:
+		if sourceDir == "" {
+			sourceDir = filepath.Join(userHome, ".claude")
+		}
+		relativeState = ".claude"
+		if !gatewayMode {
+			credentialFile = ".credentials.json"
+			credentialSection = "claudeAiOauth"
+		}
+	case runtime.CodexRuntime:
+		if sourceDir == "" {
+			sourceDir = filepath.Join(userHome, ".codex")
+		}
+		relativeState = ".codex"
+		credentialFile = "auth.json"
+	case runtime.KimiRuntime, runtime.KimiCLIRuntime:
+		if sourceDir == "" {
+			sourceDir = filepath.Join(userHome, ".kimi-code")
+		}
+		relativeState = filepath.Join("home", ".kimi-code")
+		credentialFile = filepath.Join("credentials", "kimi-code.json")
+	case runtime.ShellRuntime:
+		return "", nil, nil, nil
+	case runtime.OmpRuntime:
+		return "", nil, nil, errors.New("read-only seats cannot use omp without an isolated credential broker")
+	default:
+		return "", nil, nil, fmt.Errorf("read-only seat runtime %q has no isolated state policy", agent.Runtime)
+	}
+	sourceDir, err = filepath.Abs(sourceDir)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("resolve runtime state directory %q: %w", sourceDir, err)
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(sourceDir); resolveErr == nil {
+		sourceDir = resolved
+	}
+	stateDir := filepath.Join(cacheRoot, "runtime-state", relativeState)
+	if err := os.RemoveAll(stateDir); err != nil {
+		return "", nil, nil, fmt.Errorf("reset isolated runtime state %q: %w", stateDir, err)
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return "", nil, nil, fmt.Errorf("create isolated runtime state %q: %w", stateDir, err)
+	}
+	var credential *readOnlyRuntimeCredential
+	if credentialFile != "" {
+		credential, err = stageReadOnlyRuntimeCredential(
+			filepath.Join(sourceDir, credentialFile),
+			filepath.Join(stateDir, credentialFile),
+			credentialSection,
+		)
+		if err != nil {
+			return "", nil, nil, err
+		}
+	}
+	stateEnv := []string{}
+	switch agent.Runtime {
+	case runtime.ClaudeRuntime:
+		stateEnv = append(stateEnv, "CLAUDE_CONFIG_DIR="+stateDir)
+	case runtime.CodexRuntime:
+		stateEnv = append(stateEnv, "CODEX_HOME="+stateDir)
+	}
+	return stateDir, credential, stateEnv, nil
+}
+
+func copyReadOnlyRuntimeCredential(source, destination string) (map[string]struct{}, error) {
+	info, err := os.Lstat(source)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("inspect runtime state file %q: %w", source, err)
+	}
+	if !info.Mode().IsRegular() || info.Size() > maxReadOnlyRuntimeStateFileBytes {
+		return nil, fmt.Errorf("runtime state file %q must be a regular file no larger than %d bytes", source, maxReadOnlyRuntimeStateFileBytes)
+	}
+	data, err := os.ReadFile(source)
+	if err != nil {
+		return nil, fmt.Errorf("read runtime state file %q: %w", source, err)
+	}
+	keys, err := jsonObjectKeys(data)
+	if err != nil {
+		return nil, fmt.Errorf("validate runtime credential %q: %w", source, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(destination, data, 0o600); err != nil {
+		return nil, fmt.Errorf("stage runtime state file %q: %w", destination, err)
+	}
+	return keys, nil
+}
+
+func stageReadOnlyRuntimeCredential(source, destination, section string) (*readOnlyRuntimeCredential, error) {
+	keys, err := copyReadOnlyRuntimeCredential(source, destination)
+	if err != nil || keys == nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(destination)
+	if err != nil {
+		return nil, err
+	}
+	if section != "" {
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(data, &object); err != nil {
+			return nil, err
+		}
+		value, ok := object[section]
+		if !ok {
+			return nil, fmt.Errorf("runtime credential %q lacks required %q section", source, section)
+		}
+		data, err = json.Marshal(map[string]json.RawMessage{section: value})
+		if err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(destination, data, 0o600); err != nil {
+			return nil, err
+		}
+		keys = map[string]struct{}{section: {}}
+	}
+	shape, err := jsonDocumentShape(data)
+	if err != nil {
+		return nil, err
+	}
+	return &readOnlyRuntimeCredential{
+		sourcePath: source,
+		stagedPath: destination,
+		section:    section,
+		keys:       keys,
+		shape:      shape,
+	}, nil
+}
+
+func (c *readOnlyRuntimeCredential) persist() error {
+	if c == nil {
+		return nil
+	}
+	info, err := os.Lstat(c.stagedPath)
+	if err != nil {
+		return fmt.Errorf("inspect staged credential %q: %w", c.stagedPath, err)
+	}
+	if !info.Mode().IsRegular() || info.Size() > maxReadOnlyRuntimeStateFileBytes {
+		return fmt.Errorf("staged credential %q must be a regular file no larger than %d bytes", c.stagedPath, maxReadOnlyRuntimeStateFileBytes)
+	}
+	data, err := os.ReadFile(c.stagedPath)
+	if err != nil {
+		return fmt.Errorf("read staged credential %q: %w", c.stagedPath, err)
+	}
+	keys, err := jsonObjectKeys(data)
+	if err != nil {
+		return fmt.Errorf("validate staged credential %q: %w", c.stagedPath, err)
+	}
+	if !sameJSONKeySet(keys, c.keys) {
+		return fmt.Errorf("staged credential %q changed its top-level schema", c.stagedPath)
+	}
+	shape, err := jsonDocumentShape(data)
+	if err != nil {
+		return fmt.Errorf("inspect staged credential schema: %w", err)
+	}
+	if c.shape != nil && !reflect.DeepEqual(shape, c.shape) {
+		return fmt.Errorf("staged credential %q changed its nested schema", c.stagedPath)
+	}
+	sourceInfo, err := os.Lstat(c.sourcePath)
+	if err != nil {
+		return fmt.Errorf("inspect source credential %q: %w", c.sourcePath, err)
+	}
+	if !sourceInfo.Mode().IsRegular() || sourceInfo.Size() > maxReadOnlyRuntimeStateFileBytes {
+		return fmt.Errorf("source credential %q must remain a bounded regular file", c.sourcePath)
+	}
+	if c.section != "" {
+		var stagedObject, sourceObject map[string]json.RawMessage
+		if err := json.Unmarshal(data, &stagedObject); err != nil {
+			return err
+		}
+		sourceData, err := os.ReadFile(c.sourcePath)
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(sourceData, &sourceObject); err != nil {
+			return fmt.Errorf("validate source credential %q: %w", c.sourcePath, err)
+		}
+		sourceObject[c.section] = stagedObject[c.section]
+		data, err = json.Marshal(sourceObject)
+		if err != nil {
+			return err
+		}
+		if len(data) > maxReadOnlyRuntimeStateFileBytes {
+			return fmt.Errorf("merged credential %q exceeds %d bytes", c.sourcePath, maxReadOnlyRuntimeStateFileBytes)
+		}
+	}
+	temp, err := os.CreateTemp(filepath.Dir(c.sourcePath), ".gitmoot-runtime-auth-*")
+	if err != nil {
+		return fmt.Errorf("create credential replacement: %w", err)
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	if err := temp.Chmod(0o600); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if _, err := temp.Write(data); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, c.sourcePath); err != nil {
+		return fmt.Errorf("replace source credential: %w", err)
+	}
+	return nil
+}
+
+func jsonObjectKeys(data []byte) (map[string]struct{}, error) {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err != nil {
+		return nil, err
+	}
+	if object == nil {
+		return nil, errors.New("credential must be a JSON object")
+	}
+	keys := make(map[string]struct{}, len(object))
+	for key := range object {
+		keys[key] = struct{}{}
+	}
+	return keys, nil
+}
+
+func jsonDocumentShape(data []byte) (any, error) {
+	var value any
+	if err := json.Unmarshal(data, &value); err != nil {
+		return nil, err
+	}
+	return jsonValueShape(value), nil
+}
+
+func jsonValueShape(value any) any {
+	switch value := value.(type) {
+	case map[string]any:
+		shape := make(map[string]any, len(value))
+		for key, child := range value {
+			shape[key] = jsonValueShape(child)
+		}
+		return shape
+	case []any:
+		shape := make([]any, len(value))
+		for index, child := range value {
+			shape[index] = jsonValueShape(child)
+		}
+		return shape
+	case string:
+		return "string"
+	case float64:
+		return "number"
+	case bool:
+		return "boolean"
+	case nil:
+		return "null"
+	default:
+		return fmt.Sprintf("%T", value)
+	}
+}
+
+func sameJSONKeySet(left, right map[string]struct{}) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key := range left {
+		if _, ok := right[key]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func readOnlyRuntimeBaseEnv(runtimeName string, environ []string, githubDir string) []string {
+	allowed := make(map[string]struct{}, len(curatedBaseEnvNames)+2)
+	for _, name := range curatedBaseEnvNames {
+		allowed[name] = struct{}{}
+	}
+	switch runtimeName {
+	case runtime.ClaudeRuntime:
+		allowed["CLAUDE_CONFIG_DIR"] = struct{}{}
+	case runtime.CodexRuntime:
+		allowed["CODEX_HOME"] = struct{}{}
+	}
+	base := make([]string, 0, len(environ)+2)
+	for _, entry := range environ {
+		name, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		if strings.HasPrefix(name, "GH_") || strings.HasPrefix(name, "GITHUB_") {
+			continue
+		}
+		if _, ok := allowed[name]; ok || strings.HasPrefix(name, "LC_") {
+			base = append(base, entry)
+		}
+	}
+	return append(base, "GH_CONFIG_DIR="+githubDir, "GH_PROMPT_DISABLED=1")
+}
+
+func validateReadOnlyWritablePaths(checkout string, writes []string) error {
 	type protectedRoot struct {
 		kind string
 		path string
@@ -1507,15 +1886,15 @@ func validateReviewWritablePaths(checkout string, writes []string) error {
 	}
 	for _, path := range compactCleanPaths(writes) {
 		if !filepath.IsAbs(path) {
-			return fmt.Errorf("review sandbox write path %q must be absolute", path)
+			return fmt.Errorf("read-only sandbox write path %q must be absolute", path)
 		}
 		resolvedWrite, err := resolvePathForContainment(path)
 		if err != nil {
-			return fmt.Errorf("resolve review sandbox write path %q: %w", path, err)
+			return fmt.Errorf("resolve read-only sandbox write path %q: %w", path, err)
 		}
 		for _, root := range protected {
 			if pathsOverlap(root.path, resolvedWrite) {
-				return fmt.Errorf("review sandbox write path %q overlaps %s %q", path, root.kind, root.path)
+				return fmt.Errorf("read-only sandbox write path %q overlaps %s %q", path, root.kind, root.path)
 			}
 		}
 	}
@@ -1651,8 +2030,8 @@ func landlockProduceRunner(runner subprocess.Runner, reads, readFiles, writes, e
 	return landlockRuntimeRunner(runner, reads, readFiles, writes, env, false)
 }
 
-func landlockReviewRunner(runner subprocess.Runner, writes, env []string) subprocess.Runner {
-	return landlockRuntimeRunner(runner, nil, nil, writes, env, true)
+func landlockReadOnlyRunner(runner subprocess.Runner, reads, readFiles, writes, env []string) subprocess.Runner {
+	return landlockRuntimeRunner(runner, reads, readFiles, writes, env, true)
 }
 
 func landlockRuntimeRunner(runner subprocess.Runner, reads, readFiles, writes, env []string, readOnlyWorkdir bool) subprocess.Runner {
