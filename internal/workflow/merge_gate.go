@@ -537,6 +537,19 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if _, superseded := supersededReviewIDs[review.job.ID]; superseded {
 			continue
 		}
+		// #1685 layer 3: a review row that declares delegations announced a panel it
+		// did not wait for, so it is a coordinator continuation and not a verdict
+		// about this head. Block rather than skip: skipping would let a DIFFERENT
+		// row satisfy the gate, or surface as the generic "final agent review is not
+		// captured" with no way to tell which row was wrong. This repeats the result
+		// contract's refusal at the surface with merge authority, because the two
+		// guards protect different populations — the contract stops the row being
+		// written, this stops rows already persisted before the contract shipped.
+		if len(review.payload.Result.Delegations) > 0 {
+			return mergeBlocked{reason: fmt.Sprintf(
+				"review at evaluated head from %s (job %s) declares %d unreported delegation(s); a fan-out is a coordinator continuation, not a verdict",
+				review.job.Agent, review.job.ID, len(review.payload.Result.Delegations))}
+		}
 		switch review.payload.Result.Decision {
 		case "changes_requested", "blocked", "failed":
 			return mergeBlocked{reason: fmt.Sprintf("review at evaluated head has blocking result from %s", review.job.Agent)}

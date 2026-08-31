@@ -538,6 +538,28 @@ func runOneHeartbeat(ctx context.Context, store *db.Store, enqueue heartbeatEnqu
 			return store.UpsertHeartbeatState(ctx, state)
 		}
 	}
+	// Role guard (#1685): capability says an agent CAN review; role says what it
+	// IS. A coordinator enqueued on a review heartbeat fans out and reports
+	// dispatch success as "approved", which every consumer reads as a verdict.
+	// This mirrors the dispatch-time gate in ensureLocalAgentAccess because this
+	// enqueue path deliberately bypasses it — scoping that guard to the CLI file
+	// alone would leave the heartbeat door open. Skip and ADVANCE next_due so a
+	// mis-wired heartbeat no-ops visibly instead of producing vacuous verdicts on
+	// a timer.
+	if heartbeat.Action == "review" {
+		agent, err := store.GetAgent(ctx, heartbeat.Agent)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if err == nil && strings.EqualFold(strings.TrimSpace(agent.Role), coordinatorAgentRole) {
+			state.Agent = heartbeat.Agent
+			state.Name = heartbeat.Name
+			state.LastRunAt = now
+			state.NextDueAt = now.Add(interval + heartbeatJitter(jitter))
+			state.LastStatus = "role_not_reviewer"
+			return store.UpsertHeartbeatState(ctx, state)
+		}
+	}
 	// Policy gate: an implement heartbeat enqueues a WRITE job. The worker only
 	// produces files for an agent that holds the implement capability AND carries a
 	// write-granting autonomy policy (workspace-write / danger-full-access); under

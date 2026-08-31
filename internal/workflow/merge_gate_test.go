@@ -433,6 +433,66 @@ func TestPolicyMergeGateRejectsUnverifiableReviewAuthorship(t *testing.T) {
 	}
 }
 
+// #1685 layer 3. The result contract stops such a row being WRITTEN, but it
+// defaults to OFF (normalizeResultCheckMode maps the zero value to
+// ResultChecksOff), and rows persisted before it shipped are already in the
+// store. The gate is the surface with merge authority and must refuse them on
+// its own — this is what makes layer 3 distinct from layers 1 and 2 rather than
+// a second copy of them.
+func TestPolicyMergeGateRefusesReviewVerdictWithUnreportedDelegations(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-panel", Agent: "g6-review-sol", Type: "review"}, JobPayload{
+		Repo: "mobile/app", Branch: "task-9", PullRequest: 9, HeadSHA: "head123",
+		TaskID: "task-9", ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "Convening a three-reviewer panel at exact head head123",
+			Delegations: []Delegation{
+				{ID: "lens-a", Agent: "r1", Action: "review"},
+				{ID: "lens-b", Agent: "r2", Action: "review"},
+				{ID: "lens-c", Agent: "r3", Action: "review"},
+			},
+		},
+	})
+
+	err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
+		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "g6-review-sol",
+	}, "head123")
+	var blocked mergeBlocked
+	if !errors.As(err, &blocked) {
+		t.Fatalf("ensureFinalReviewCaptured = %v, want mergeBlocked for a fan-out row", err)
+	}
+	// The reason must name the offending row. A generic "final agent review is not
+	// captured" would leave an operator unable to tell WHICH row was wrong, which
+	// is why this blocks rather than skipping the row.
+	for _, want := range []string{"g6-review-sol", "review-panel", "continuation, not a verdict"} {
+		if !strings.Contains(blocked.reason, want) {
+			t.Fatalf("block reason %q must name %q", blocked.reason, want)
+		}
+	}
+}
+
+// ACCEPTANCE: the same gate must still clear a real approval. A guard that also
+// blocks honest verdicts is one that gets switched off.
+func TestPolicyMergeGateClearsReviewVerdictWithoutDelegations(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-real", Agent: "g7-review", Type: "review"}, JobPayload{
+		Repo: "mobile/app", Branch: "task-9", PullRequest: 9, HeadSHA: "head123",
+		TaskID: "task-9", ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "approved", Summary: "verified at exact head",
+			TestsRun: []string{"go test ./... -> ok"},
+		},
+	})
+	if err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
+		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "g7-review",
+	}, "head123"); err != nil {
+		t.Fatalf("a real delegation-free approval must clear the gate, got %v", err)
+	}
+}
+
 func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 	type seedImplementJobs func(*testing.T, *db.Store, JobPayload)
 	sites := []struct {

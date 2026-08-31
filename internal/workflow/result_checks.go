@@ -197,6 +197,42 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 				Explanation: explain(pass, "the review requests changes but findings[] is empty, so there is no evidence to act on"),
 			})
 		}
+		// #1685 layer 1: a terminal review verdict that declares delegations[] is a
+		// COORDINATOR CONTINUATION, not a verdict. The engine dispatches a result's
+		// delegations AFTER this seam (AdvanceJob -> dispatchDelegations), so a
+		// review result carrying delegations was, by construction, produced before
+		// any delegate could report — the panel it announces has not run. The
+		// merge gate reads `decision` and nothing else, so without this the row is
+		// indistinguishable from a real approval. Caught live twice on #1682 and
+		// #1691, both one gate tick from merging.
+		if isTerminalReviewVerdict(r.Decision) && len(r.Delegations) > 0 {
+			checks = append(checks, ResultCheck{
+				ID:       "review-verdict-not-a-continuation",
+				Action:   "review",
+				Question: "Is the review verdict its own, rather than a fan-out announcing delegates that have not reported?",
+				Pass:     false,
+				Explanation: fmt.Sprintf(
+					"the review returned terminal decision %q while declaring %d delegation(s); a fan-out is a coordinator continuation, not a verdict",
+					strings.TrimSpace(r.Decision), len(r.Delegations)),
+			})
+		}
+		// #1685 layer 2: the evidence floor, deliberately independent of layer 1.
+		// findings[] beside a POPULATED tests_run[] is a verdict; findings[] beside
+		// an EMPTY tests_run[] is a job that did not look. This needs no reasoning
+		// about delegations or roles, so it also catches vacuous verdicts whose
+		// cause nobody has thought of yet.
+		if isTerminalReviewVerdict(r.Decision) {
+			pass := len(r.Findings) > 0 || hasActionableEntries(r.TestsRun) || hasActionableEntries(r.ChangesMade)
+			checks = append(checks, ResultCheck{
+				ID:       "review-verdict-has-evidence",
+				Action:   "review",
+				Question: "Does the review verdict carry evidence that the reviewer actually looked?",
+				Pass:     pass,
+				Explanation: explain(pass, fmt.Sprintf(
+					"the review returned terminal decision %q with findings[], tests_run[] and changes_made[] all empty, so it carries no evidence of any kind",
+					strings.TrimSpace(r.Decision))),
+			})
+		}
 	case "ask":
 		// The coordinator finalize continuation is dispatched as an "ask" carrying
 		// DelegationFinalize (#305): it is a reconciliation, not a plain answer, so
@@ -289,6 +325,20 @@ func hasActionableEntries(values []string) bool {
 		}
 	}
 	return false
+}
+
+// isTerminalReviewVerdict reports whether a review decision is one the merge
+// gate and the review lifecycle treat as a settled answer about the code.
+// "blocked" and "failed" are excluded on purpose: they are self-describing
+// non-answers that no consumer mistakes for an approval, and they legitimately
+// carry no findings or tests.
+func isTerminalReviewVerdict(decision string) bool {
+	switch strings.ToLower(strings.TrimSpace(decision)) {
+	case "approved", "changes_requested":
+		return true
+	default:
+		return false
+	}
 }
 
 // explain returns the failure explanation for a failed check and "" for a passed

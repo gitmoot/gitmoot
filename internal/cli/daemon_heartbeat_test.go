@@ -623,6 +623,63 @@ func TestHeartbeatScanReviewRejectsMissingCapability(t *testing.T) {
 	}
 }
 
+// #1685: the heartbeat enqueue path deliberately bypasses ensureLocalAgentAccess,
+// so the dispatch-time role gate does not cover it. A coordinator on a review
+// heartbeat would otherwise produce a vacuous "approved" ON A TIMER — strictly
+// worse than the one-off CLI dispatches that were caught live, because nobody is
+// watching a cron. Skips WITHOUT wedging: next_due advances exactly as the
+// capability skip does.
+func TestHeartbeatScanReviewRejectsCoordinatorRole(t *testing.T) {
+	paths, store := heartbeatScanFixture(t, reviewHeartbeatBody)
+	ctx := context.Background()
+	// Registered exactly as g6-review-sol is: review-capable, but role=coordinator.
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name: "reviewer", Role: "coordinator", Runtime: "codex", RepoScope: "gitmoot/gitmoot",
+		Capabilities: []string{"ask", "review"}, RuntimeRef: "last",
+	}); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+	enq, seen := recordingEnqueuer()
+	now := time.Date(2026, 6, 30, 9, 0, 0, 0, time.UTC)
+	if err := runHeartbeatScanOnce(ctx, paths, store, enq, now); err != nil {
+		t.Fatalf("runHeartbeatScanOnce: %v", err)
+	}
+	if len(*seen) != 0 {
+		t.Fatalf("coordinator review heartbeat enqueued %d jobs", len(*seen))
+	}
+	state, found, err := store.GetHeartbeatState(ctx, "reviewer", "stale-prs")
+	if err != nil || !found {
+		t.Fatalf("expected state row, found=%v err=%v", found, err)
+	}
+	if state.LastStatus != "role_not_reviewer" {
+		t.Fatalf("last_status = %q, want role_not_reviewer", state.LastStatus)
+	}
+	if !state.NextDueAt.Equal(now.Add(12 * time.Hour)) {
+		t.Fatalf("role skip must advance next_due (no wedge): %+v", state)
+	}
+}
+
+// ACCEPTANCE: a reviewer-role heartbeat still enqueues. The role gate must not
+// take the ordinary review cron down with it.
+func TestHeartbeatScanReviewAllowsReviewerRole(t *testing.T) {
+	paths, store := heartbeatScanFixture(t, reviewHeartbeatBody)
+	ctx := context.Background()
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name: "reviewer", Role: "reviewer", Runtime: "codex", RepoScope: "gitmoot/gitmoot",
+		Capabilities: []string{"ask", "review"}, RuntimeRef: "last",
+	}); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+	enq, seen := recordingEnqueuer()
+	now := time.Date(2026, 6, 30, 9, 0, 0, 0, time.UTC)
+	if err := runHeartbeatScanOnce(ctx, paths, store, enq, now); err != nil {
+		t.Fatalf("runHeartbeatScanOnce: %v", err)
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("reviewer-role review heartbeat enqueued %d jobs, want 1", len(*seen))
+	}
+}
+
 // TestHeartbeatScanCoalescesMissedTicks proves a long outage replays only ONCE:
 // next_due is anchored to now (not the stale due time), so one scan after many
 // missed intervals enqueues a single job and schedules the next from now.
