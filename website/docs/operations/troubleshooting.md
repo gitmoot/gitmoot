@@ -587,15 +587,16 @@ replace objects and refuses outright when the clone carries a grafts file. The
 clone's own `origin` is never trusted; it is writable by whatever ran in the clone.
 
 A proven-disposable clone is renamed to `<path>.ttl-reclaiming-<random>` and
-re-proven there before deletion. The rename excludes writers using the original
-path and the new name is unguessable; a process that already holds the directory
-can still write into it, which is why the liveness scan is repeated on the
-quarantined path, and a writer holding only an open file descriptor stays
-undetectable. A failed re-proof renames the clone back. An interrupted removal is
-restored by the next pass (`delegation_worktree_quarantine_restored`) and
-re-proven, and the scheduler does not treat the absent original path as a
-completed removal while such a sibling survives, and `gitmoot doctor` counts those
-siblings. Every retention records its reason once per job:
+re-proven there. After the final Git proof, Gitmoot renames it to a second random
+sibling before the last nested-object-database scan. That seals the only random
+path passed to Git: a path-based writer racing the proof cannot add content to
+the directory being removed. The final liveness gate scans both process working
+directories and open file descriptors and retains on an inconclusive `/proc`
+scan. A failed proof renames the current quarantine back. An interrupted removal
+is restored by the next pass (`delegation_worktree_quarantine_restored`) and
+re-proven; the scheduler does not complete removal while any quarantine sibling
+survives, and `gitmoot doctor` counts those siblings. Every retention records its
+reason once per job:
 `delegation_worktree_retained_unpublished` (with obligation reason
 `unpublished_commits`; squash-merged branches land here by design, because a
 squash publishes the content and not the commits; ignored nested repositories

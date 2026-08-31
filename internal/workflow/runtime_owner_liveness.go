@@ -91,6 +91,19 @@ func (e Engine) worktreeLiveness(path string) (live bool, known bool) {
 	return strictWorktreeLiveness(path)
 }
 
+// worktreeWriterLiveness strengthens the final destructive gate with open-file
+// descriptor detection. Tests may use the same authoritative injection seam as
+// worktreeLiveness; production scans both cwd and /proc/<pid>/fd.
+func (e Engine) worktreeWriterLiveness(path string) (live bool, known bool) {
+	if e.WorktreeLiveness != nil || e.WorktreeHasLiveProcess != nil {
+		return e.worktreeLiveness(path)
+	}
+	if live, known := strictWorktreeLiveness(path); live || !known {
+		return live, known
+	}
+	return worktreeOpenFileLiveness(path, "/proc")
+}
+
 // worktreeHasLiveProcess reports whether a live process on this host still has its
 // working directory inside the worktree at path. It is the lock-independent,
 // PID-reuse- and hostname-rename-immune never-clobber gate the destructive cleanup
@@ -202,6 +215,62 @@ func scanWorktreeLiveness(path string, procRoot string, requireEveryCWD bool) (l
 		cwd = strings.TrimSuffix(strings.TrimSpace(cwd), " (deleted)")
 		if cwd == abs || strings.HasPrefix(cwd, abs+string(os.PathSeparator)) {
 			return true, true
+		}
+	}
+	return false, conclusive
+}
+
+func worktreeOpenFileLiveness(path, procRoot string) (live bool, known bool) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false, true
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	entries, err := os.ReadDir(procRoot)
+	if err != nil {
+		return false, false
+	}
+	self := os.Getpid()
+	conclusive := true
+	for _, entry := range entries {
+		name := entry.Name()
+		if len(name) == 0 || name[0] < '0' || name[0] > '9' {
+			continue
+		}
+		if pid, parseErr := strconv.Atoi(name); parseErr == nil && pid == self {
+			continue
+		}
+		procEntry := filepath.Join(procRoot, name)
+		fds, err := os.ReadDir(filepath.Join(procEntry, "fd"))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			kernelThread, statErr := procEntryIsKernelThread(procEntry)
+			if errors.Is(statErr, os.ErrNotExist) {
+				continue
+			}
+			if statErr != nil || !kernelThread {
+				conclusive = false
+			}
+			continue
+		}
+		for _, fd := range fds {
+			target, err := os.Readlink(filepath.Join(procEntry, "fd", fd.Name()))
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				conclusive = false
+				continue
+			}
+			target = strings.TrimSuffix(strings.TrimSpace(target), " (deleted)")
+			if target == abs || strings.HasPrefix(target, abs+string(os.PathSeparator)) {
+				return true, true
+			}
 		}
 	}
 	return false, conclusive

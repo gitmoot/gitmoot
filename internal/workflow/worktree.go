@@ -1743,6 +1743,53 @@ func pathPresent(path string) (bool, error) {
 	}
 }
 
+func isHexObjectName(value string, lengths ...int) bool {
+	validLength := false
+	for _, length := range lengths {
+		if len(value) == length {
+			validLength = true
+			break
+		}
+	}
+	if !validLength {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if (value[i] < '0' || value[i] > '9') &&
+			(value[i] < 'a' || value[i] > 'f') &&
+			(value[i] < 'A' || value[i] > 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+func looseGitObjectDatabase(rel string, entry fs.DirEntry) string {
+	if entry.IsDir() || !isHexObjectName(entry.Name(), 38, 62) {
+		return ""
+	}
+	fanout := filepath.Base(filepath.Dir(rel))
+	if !isHexObjectName(fanout, 2) {
+		return ""
+	}
+	return filepath.Dir(filepath.Dir(rel))
+}
+
+func packedGitObjectDatabase(rel string, entry fs.DirEntry) string {
+	if entry.IsDir() || filepath.Base(filepath.Dir(rel)) != "pack" {
+		return ""
+	}
+	name := entry.Name()
+	if !strings.HasPrefix(name, "pack-") || !strings.HasSuffix(name, ".pack") {
+		return ""
+	}
+	hash := strings.TrimSuffix(strings.TrimPrefix(name, "pack-"), ".pack")
+	if !isHexObjectName(hash, 40, 64) {
+		return ""
+	}
+	return filepath.Dir(filepath.Dir(rel))
+}
+
 // nestedGitObjectDatabase returns the first Git repository or object database
 // below a clone's root object database. CloneOnlyCommit proves only the root
 // repository: ignored nested repositories, initialized submodules, and bare
@@ -1773,6 +1820,14 @@ func nestedGitObjectDatabase(ctx context.Context, path string) (string, error) {
 		}
 		if rel != ".git" && entry.Name() == ".git" {
 			nested = rel
+			return fs.SkipAll
+		}
+		if objectDB := looseGitObjectDatabase(rel, entry); objectDB != "" {
+			nested = objectDB
+			return fs.SkipAll
+		}
+		if objectDB := packedGitObjectDatabase(rel, entry); objectDB != "" {
+			nested = objectDB
 			return fs.SkipAll
 		}
 		if !entry.IsDir() || entry.Name() != "objects" {
@@ -1952,16 +2007,6 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 		}
 		return false, e.recordFixCloneRetainedDirty(ctx, jobID, path)
 	}
-	nested, err = nestedGitObjectDatabase(ctx, quarantine)
-	if err != nil {
-		return restore(fmt.Errorf("recheck quarantined fix clone for nested Git object databases: %w", err))
-	}
-	if nested != "" {
-		if _, restoreErr := restore(nil); restoreErr != nil {
-			return false, restoreErr
-		}
-		return false, e.retainFixCloneWithNestedRepository(ctx, jobID, path, nested)
-	}
 	unpublished, err = manager.CloneOnlyCommit(ctx, quarantine)
 	if err != nil {
 		return restore(fmt.Errorf("recheck quarantined fix clone for unpublished commits: %w", err))
@@ -1972,8 +2017,48 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 		}
 		return false, e.retainFixCloneWithUnpublishedCommits(ctx, jobID, path, unpublished)
 	}
+	// Seal the proof path before the final content scan. CloneOnlyCommit is the
+	// last operation that legitimately knows the first random quarantine name.
+	// Renaming it again means a path-based writer racing after that proof can only
+	// create a NEW sibling; it cannot add content to the directory we remove.
+	sealed, err := newFixCloneQuarantinePath(path)
+	if err != nil {
+		return restore(err)
+	}
+	if err := os.Rename(quarantine, sealed); err != nil {
+		return restore(fmt.Errorf("seal proved fix clone %s as %s: %w", quarantine, sealed, err))
+	}
+	quarantine = sealed
+	nested, err = nestedGitObjectDatabase(ctx, quarantine)
+	if err != nil {
+		return restore(fmt.Errorf("recheck sealed fix clone for nested Git object databases: %w", err))
+	}
+	if nested != "" {
+		if _, restoreErr := restore(nil); restoreErr != nil {
+			return false, restoreErr
+		}
+		return false, e.retainFixCloneWithNestedRepository(ctx, jobID, path, nested)
+	}
+	// An existing cwd or open file descriptor follows the second rename. Refuse
+	// removal unless /proc conclusively shows that no such writer survives.
+	if live, known := e.worktreeWriterLiveness(quarantine); !known {
+		if _, restoreErr := restore(nil); restoreErr != nil {
+			return false, restoreErr
+		}
+		return false, e.recordFixCloneLivenessUnknown(ctx, jobID, path)
+	} else if live {
+		if _, restoreErr := restore(nil); restoreErr != nil {
+			return false, restoreErr
+		}
+		return false, e.recordFixCloneRetainedLive(ctx, jobID, path)
+	}
 	if err := os.RemoveAll(quarantine); err != nil {
 		return false, fmt.Errorf("remove quarantined fix clone %s: %w", quarantine, err)
+	}
+	if survivors, err := FixCloneQuarantines(path); err != nil {
+		return false, fmt.Errorf("recheck fix clone quarantine siblings after removal: %w", err)
+	} else if len(survivors) != 0 {
+		return false, nil
 	}
 	// A concurrent actor may have restored this clone to its original path while we
 	// held the quarantine name. Completing the reclaim then would record a removal

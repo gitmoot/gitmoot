@@ -531,11 +531,14 @@ two-minute probe deadline) and removes the clone only when no commit reachable
 from any local ref or reflog is missing from those refs AND the clone holds no
 unreachable commit object. The clone's own `origin` is never trusted, replace
 objects are ignored, and a grafts file makes the clone unprovable.
-The proven clone is renamed to `<path>.ttl-reclaiming-<random>`,
-re-proven there, and only then deleted; an interrupted removal is restored by the
-next pass (`delegation_worktree_quarantine_restored`) and no pass treats the
-absent original path as a completed removal while such a sibling exists, and
-`gitmoot doctor` counts those siblings. Every retention records its reason once:
+The proven clone is renamed to `<path>.ttl-reclaiming-<random>` and re-proven
+there. After the final Git proof it is renamed to a second random sibling, then
+scanned for nested object databases. This seals the path passed to Git before
+the final scan. The final liveness gate covers both process working directories
+and open file descriptors and retains on an inconclusive `/proc` scan. An
+interrupted removal is restored by the next pass
+(`delegation_worktree_quarantine_restored`), no pass completes removal while a
+quarantine sibling survives, and `gitmoot doctor` counts those siblings.
 `delegation_worktree_retained_unpublished` with obligation reason
 `unpublished_commits` (the normal outcome for a squash-merged branch, whose
 content is published while its commits are not, and for an ignored nested

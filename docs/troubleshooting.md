@@ -763,15 +763,16 @@ checkout, never from the clone's own `origin`, which whatever ran in the clone
 could have rewritten.
 
 The proven-disposable clone is then **renamed to a sibling
-`<path>.ttl-reclaiming-<random>` before deletion** and every proof is repeated
-there. What the rename guarantees: a writer using the ORIGINAL path finds nothing
-there, and the name it moved to is unguessable. What it does not guarantee: a
-process that already holds the directory can still write into it, so the repeated
-liveness scan covers the quarantined path, and a writer holding only an open file
-descriptor remains undetectable. A failed re-proof renames the clone back. An
-interrupted removal leaves a `.ttl-reclaiming-*` sibling; the next pass restores
-it (`delegation_worktree_quarantine_restored`) and re-proves it from scratch
-rather than treating the absent original path as a completed removal.
+`<path>.ttl-reclaiming-<random>`** and every proof is repeated there. After the
+final Git proof, Gitmoot renames it to a second random sibling before the last
+nested-object-database scan. That seals the only quarantine path passed to Git:
+a path-based writer racing the proof can create a new sibling, but cannot add
+content to the directory being removed. The final liveness gate scans both
+process working directories and open file descriptors; an inconclusive `/proc`
+scan retains the clone. A failed proof renames the current quarantine back.
+An interrupted removal leaves a `.ttl-reclaiming-*` sibling; the next pass
+restores it (`delegation_worktree_quarantine_restored`) and re-proves it from
+scratch rather than treating the absent original path as a completed removal.
 
 Every retention records **why**, once per reason per job, so an inert deployment
 is visible instead of silent: `delegation_worktree_retained_unpublished` (also

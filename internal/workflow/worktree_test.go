@@ -1792,6 +1792,30 @@ func TestEngineReclaimAgedFixCloneRetainsIgnoredNestedRepositories(t *testing.T)
 			},
 		},
 		{
+			name: "global excludes loose-only custom object database",
+			setup: func(t *testing.T, path string) string {
+				excludes := filepath.Join(t.TempDir(), "global-excludes")
+				if err := os.WriteFile(excludes, []byte("/cache/\n"), 0o644); err != nil {
+					t.Fatalf("write global excludes: %v", err)
+				}
+				runWorktreeGit(t, path, "config", "core.excludesFile", excludes)
+				objects := filepath.Join(path, "cache", "objects")
+				if err := os.MkdirAll(objects, 0o755); err != nil {
+					t.Fatalf("MkdirAll custom object database: %v", err)
+				}
+				gitEnv := []string{"GIT_OBJECT_DIRECTORY=" + objects}
+				tree := runWorktreeGitEnvOutput(t, path, gitEnv, "", "mktree")
+				commit := runWorktreeGitEnvOutput(t, path, gitEnv, "", "commit-tree", tree, "-m", "unique custom commit")
+				if commit == "" {
+					t.Fatal("commit-tree returned an empty object id")
+				}
+				if _, err := os.Stat(filepath.Join(objects, commit[:2], commit[2:])); err != nil {
+					t.Fatalf("custom commit is not loose in the ignored object database: %v", err)
+				}
+				return filepath.Join("cache", "objects")
+			},
+		},
+		{
 			name: "submodule ignore all",
 			setup: func(t *testing.T, path string) string {
 				submodule := filepath.Join(t.TempDir(), "submodule")
@@ -1968,9 +1992,9 @@ func TestEngineReclaimAgedFixCloneQuarantinesBeforeRemoval(t *testing.T) {
 	}
 }
 
-// A nested repository can appear after the initial scan just like an outer
-// commit can appear after the initial reachability proof. The quarantined scan
-// must catch it before RemoveAll and restore the clone.
+// The final root reachability proof is itself a writer-capable operation. A
+// nested repository created during it must move across the sealed rename, be
+// caught by the last content scan, and restore the clone before RemoveAll.
 func TestEngineReclaimAgedFixCloneRechecksNestedRepositoriesAfterQuarantine(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -1997,10 +2021,10 @@ func TestEngineReclaimAgedFixCloneRechecksNestedRepositoriesAfterQuarantine(t *t
 	}
 	manager := &fakeWorktreeManager{cleanSet: true, clean: true}
 	manager.cloneOnlyHook = func(probed string) {
-		if probed != path {
+		if probed == path {
 			return
 		}
-		nested := filepath.Join(path, "late", ".git")
+		nested := filepath.Join(probed, "late", ".git")
 		if err := os.MkdirAll(nested, 0o755); err != nil {
 			t.Fatalf("MkdirAll late nested repository: %v", err)
 		}
@@ -2015,13 +2039,13 @@ func TestEngineReclaimAgedFixCloneRechecksNestedRepositoriesAfterQuarantine(t *t
 		t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
 	}
 	if reclaimed {
-		t.Fatal("clone with a nested repository landing after the first scan was reclaimed")
+		t.Fatal("clone with a nested repository landing during the final root proof was reclaimed")
 	}
 	if _, err := os.Stat(filepath.Join(path, "late", ".git")); err != nil {
 		t.Fatalf("restored clone lost late nested repository: %v", err)
 	}
-	if len(manager.cloneOnlyCalls) != 1 {
-		t.Fatalf("clone-only probes = %v, want the quarantined nested scan to retain before a second outer proof", manager.cloneOnlyCalls)
+	if len(manager.cloneOnlyCalls) != 2 || manager.cloneOnlyCalls[1] == path {
+		t.Fatalf("clone-only probes = %v, want the race injected during the quarantined final proof", manager.cloneOnlyCalls)
 	}
 	leftovers, err := FixCloneQuarantines(path)
 	if err != nil || len(leftovers) != 0 {
@@ -2608,6 +2632,19 @@ func runWorktreeGit(t *testing.T, dir string, args ...string) {
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, output)
 	}
+}
+
+func runWorktreeGitEnvOutput(t *testing.T, dir string, env []string, stdin string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), env...)
+	cmd.Stdin = strings.NewReader(stdin)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, output)
+	}
+	return strings.TrimSpace(string(output))
 }
 
 type fakeWorktreeManager struct {
