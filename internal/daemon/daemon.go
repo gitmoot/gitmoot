@@ -169,51 +169,61 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 	// consumer that needs it, never retained beyond this poll.
 	reviewMemo := newReviewJobsMemo(d.Store)
 	for _, pull := range pulls {
-		if d.pullRequestHeadIsLocal(pull) {
+		// A fork head shares nothing with a local branch but its NAME. Every step
+		// below either resolves, stores or advances a local task keyed on that
+		// name, so all of them are fenced behind one identity check: routing a
+		// fork pull request as a local task lets an outside contributor's PR park
+		// or merge local work. Comment handling stays outside the fence, because a
+		// maintainer commenting on a fork PR is legitimate and the command paths
+		// resolve tasks through the guarded resolver, which refuses a fork head.
+		local := d.pullRequestHeadIsLocal(pull)
+		if local {
 			openBranches[pull.HeadRef] = struct{}{}
 		}
 		openPullNumbers[pull.Number] = struct{}{}
-		changed, err := d.pullRequestChanged(ctx, pull, reviewMemo)
-		if err != nil {
-			return err
-		}
-		d.ensureMergeGateStatus(ctx, pull)
-		mergeReadinessHandled := false
-		if changed {
-			if handled, err := d.handlePullRequestWorkflowChange(ctx, pull, reviewMemo); err != nil {
-				if firstErr == nil {
-					firstErr = err
-				}
-				changed = false
-			} else {
-				mergeReadinessHandled = handled
-				merged, err := d.pullRequestStoredMerged(ctx, pull)
-				if err != nil {
-					return err
-				}
-				if merged {
-					changed = false
-				}
-			}
-		}
-		if changed {
-			if err := d.recordPullRequest(ctx, pull); err != nil {
-				return err
-			}
-		}
-		// Change routing and merge eligibility are independent. A retained stale
-		// review can keep routing "changed" after its job is terminal, while a
-		// ready task still needs its gate re-evaluated on every poll (#1336).
-		// HandlePullRequestOpened runs the gate itself when no reviewers are
-		// configured; avoid evaluating it twice in that one composition.
-		if !mergeReadinessHandled {
-			retry, err := d.pullRequestReadyToMerge(ctx, pull)
+		if local {
+			changed, err := d.pullRequestChanged(ctx, pull, reviewMemo)
 			if err != nil {
 				return err
 			}
-			if retry {
-				if err := d.handleReadyToMergeWorkflow(ctx, pull); err != nil && firstErr == nil {
-					firstErr = err
+			d.ensureMergeGateStatus(ctx, pull)
+			mergeReadinessHandled := false
+			if changed {
+				if handled, err := d.handlePullRequestWorkflowChange(ctx, pull, reviewMemo); err != nil {
+					if firstErr == nil {
+						firstErr = err
+					}
+					changed = false
+				} else {
+					mergeReadinessHandled = handled
+					merged, err := d.pullRequestStoredMerged(ctx, pull)
+					if err != nil {
+						return err
+					}
+					if merged {
+						changed = false
+					}
+				}
+			}
+			if changed {
+				if err := d.recordPullRequest(ctx, pull); err != nil {
+					return err
+				}
+			}
+			// Change routing and merge eligibility are independent. A retained stale
+			// review can keep routing "changed" after its job is terminal, while a
+			// ready task still needs its gate re-evaluated on every poll (#1336).
+			// HandlePullRequestOpened runs the gate itself when no reviewers are
+			// configured; avoid evaluating it twice in that one composition.
+			if !mergeReadinessHandled {
+				retry, err := d.pullRequestReadyToMerge(ctx, pull)
+				if err != nil {
+					return err
+				}
+				if retry {
+					if err := d.handleReadyToMergeWorkflow(ctx, pull); err != nil && firstErr == nil {
+						firstErr = err
+					}
 				}
 			}
 		}
@@ -226,8 +236,10 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 				return err
 			}
 		}
-		if err := d.reconcileReviewingPullRequest(ctx, pull, reviewMemo); err != nil && firstErr == nil {
-			firstErr = err
+		if local {
+			if err := d.reconcileReviewingPullRequest(ctx, pull, reviewMemo); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	// Corrective revert detection (#467): OFF-BY-DEFAULT cheap short-circuit. When
@@ -433,11 +445,14 @@ func (d Daemon) logf(format string, args ...any) {
 
 // pullRequestHeadIsLocal reports whether a pull request's head branch lives in
 // the watched repository. HeadRef text can collide with a local branch name
-// without being that branch, so every consumer that resolves a task or a status
-// from HeadRef must reject a fork head through this one predicate.
+// without being that branch, so every consumer that resolves a task, stores a
+// mirror row, or writes a status from HeadRef must reject a fork head through
+// this one predicate. The comparison is case-INSENSITIVE because GitHub repo
+// names are, and rejecting a legitimate same-repo pull request over letter case
+// would silently disable routing for ordinary work.
 func (d Daemon) pullRequestHeadIsLocal(pull github.PullRequest) bool {
 	headRepo := strings.TrimSpace(pull.HeadRepoFullName)
-	return headRepo == "" || headRepo == d.Repo.FullName()
+	return headRepo == "" || strings.EqualFold(headRepo, d.Repo.FullName())
 }
 
 // reconcilePROpenTasks promotes implementing/blocked tasks whose branch carries
@@ -567,6 +582,13 @@ func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumb
 			if firstErr == nil {
 				firstErr = err
 			}
+			continue
+		}
+		// A fork pull request can carry the same HeadRef as a local task's branch,
+		// and a MERGED fork PR must never advance that task. The stored mirror row
+		// is keyed on branch text alone, so identity is re-checked here against
+		// the freshly fetched pull request.
+		if !d.pullRequestHeadIsLocal(pull) {
 			continue
 		}
 		if !pullRequestListedAsMerged(pull) {
@@ -1438,6 +1460,12 @@ func (d Daemon) reconcileClosedReviewingTasks(ctx context.Context, openBranches 
 	closedByBranch := map[string][]github.PullRequest{}
 	for _, pull := range closed {
 		if _, ok := candidates[pull.HeadRef]; !ok {
+			continue
+		}
+		// Fork heads are excluded outright: the fuzzy same-branch resolution below
+		// is keyed on branch text, so a merged fork PR would otherwise drive a
+		// local reviewing task to merged and delete its worktree.
+		if !d.pullRequestHeadIsLocal(pull) {
 			continue
 		}
 		closedByBranch[pull.HeadRef] = append(closedByBranch[pull.HeadRef], pull)
