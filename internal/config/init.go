@@ -636,7 +636,8 @@ path = ""
 # default, but only when an approved review verdict matches the exact current
 # head SHA and all SHA-scoped commit statuses and check-runs are green. A missing
 # review or CI signal leaves the PR open and escalates the specific miss to the
-# jarvis org role. Set auto_merge = false globally or per repo as an explicit
+# parent of the org role that owns the repo, falling back to the chart root.
+# Set auto_merge = false globally or per repo as an explicit
 # kill-switch; that deliberate operator choice leaves PRs open without escalation.
 # All keys can be set globally and overridden per repo under
 # [repos."owner/repo".merge_gate].

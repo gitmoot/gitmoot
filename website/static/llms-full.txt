@@ -1234,7 +1234,8 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    Native task auto-merge is enabled by default, but only with an approved review
    verdict for the exact current head SHA and green SHA-scoped commit statuses
    and check-runs. A miss leaves the PR open, records an org escalation, and wakes
-   `jarvis`. Set `[merge_gate] auto_merge = false` globally or per repository as
+   the parent of the org role that owns the repo, falling back to the chart root.
+   Set `[merge_gate] auto_merge = false` globally or per repository as
    an explicit kill-switch. The merge gate also checks local worktree cleanliness,
    branch freshness, and mergeability. Final merge work
    is serialized per repository base branch. Before the policy gate can issue
@@ -13014,7 +13015,8 @@ disables it (a negative value is rejected). Unlike `[orchestrate].escalation_ttl
 
 Native task auto-merge is enabled by default only behind an exact-head approved
 review and green SHA-scoped commit statuses/check-runs. A gate miss parks the
-task as `awaiting_human_merge`, records an org escalation, and wakes `jarvis`.
+task as `awaiting_human_merge`, records an org escalation, and wakes the parent
+of the org role that owns the repo, falling back to the chart root.
 Set `[repos."owner/repo".merge_gate] auto_merge = false` as an explicit
 kill-switch; that deliberate hold does not escalate. Pipeline `allow_auto_merge`
 is independent, and an authorized `@gitmoot merge` remains an explicit override.

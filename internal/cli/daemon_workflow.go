@@ -855,7 +855,7 @@ func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request work
 	}
 	cfg, _ := loadMergeGateOrgConfig(g.Home)
 	from := mergeGateEscalationFrom(cfg, request.Repo)
-	body := workflow.FormatOrgEscalateNote(from, "jarvis", label, reason.Render())
+	body := workflow.FormatOrgEscalateNote(from, mergeGateEscalationTo(cfg, from), label, reason.Render())
 	if body == "" {
 		return errors.New("format merge-gate escalation note")
 	}
@@ -899,6 +899,29 @@ func mergeGateEscalationFrom(cfg config.OrgConfig, repo string) string {
 		return parts[1]
 	}
 	return "gitmoot"
+}
+
+// mergeGateEscalationTo resolves the role that must act on a gate miss. It is the
+// nearest ancestor of the escalating role, which is the same upward rule the CLI
+// path already enforces -- org escalate refuses a --to that is not in
+// cfg.Ancestors(from) (org.go). Before #1727 this was the literal "jarvis", so
+// every engine escalation bypassed the chart and landed on one role regardless of
+// who actually owned the project.
+func mergeGateEscalationTo(cfg config.OrgConfig, from string) string {
+	if ancestors := cfg.Ancestors(from); len(ancestors) != 0 {
+		return ancestors[0]
+	}
+	if _, declared := cfg.Role(from); declared {
+		// from is a chart root: nobody is above it, so it is the actor. Addressing
+		// anyone else here would be a guess the chart did not make.
+		return from
+	}
+	// from was synthesized from the repo name because no role's scope matched, so
+	// the chart cannot place it. The root owns what nobody claimed.
+	if roots := cfg.Roots(); len(roots) != 0 {
+		return roots[0]
+	}
+	return "owner"
 }
 
 func repoOrgOwner(cfg config.OrgConfig, repo string) (string, bool) {

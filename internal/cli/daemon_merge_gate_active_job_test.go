@@ -114,7 +114,11 @@ func TestDaemonMergeGateDefaultPreservesMergePathWhenMandatoryGatePasses(t *test
 	}
 }
 
-func TestDaemonMergeGateMissingReviewEscalatesToJarvisOnce(t *testing.T) {
+// The chart here is built so a LITERAL "jarvis" and a correct parent lookup
+// DISAGREE: jarvis is declared, but on a branch that does not own owner/repo, so
+// the escalating role's parent is coordinator. A fixture whose parent is jarvis
+// cannot tell the two apart, which is how the hardcoded target survived (#1727).
+func TestDaemonMergeGateMissingReviewEscalatesToParentRoleOnce(t *testing.T) {
 	store, checkout, gh, request := daemonMergeGateActiveJobFixture(t, false)
 	request.WorkflowID = "goal-1017"
 	home := t.TempDir()
@@ -127,10 +131,14 @@ func TestDaemonMergeGateMissingReviewEscalatesToJarvisOnce(t *testing.T) {
 scope = ["*"]
 [org.roles."jarvis"]
 parent = "owner"
-scope = ["*"]
+scope = ["oversight/*"]
 pane = "w1:p1"
+[org.roles."coordinator"]
+parent = "owner"
+scope = ["owner/*"]
+pane = "w1:p2"
 [org.roles."worker"]
-parent = "jarvis"
+parent = "coordinator"
 scope = ["owner/repo"]
 `
 	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
@@ -160,13 +168,61 @@ scope = ["owner/repo"]
 		t.Fatalf("notes = %+v, err=%v; want one escalation", notes, err)
 	}
 	from, to, wf, question, ok := workflow.ParseOrgEscalateNote(notes[0].Body)
-	if !ok || from != "worker" || to != "jarvis" || wf != request.WorkflowID || question != renderedReason {
+	if !ok || from != "worker" || to != "coordinator" || wf != request.WorkflowID || question != renderedReason {
 		t.Fatalf("escalation = from=%q to=%q wf=%q question=%q ok=%v", from, to, wf, question, ok)
+	}
+	if strings.Contains(notes[0].Body, "jarvis") {
+		t.Fatalf("escalation addressed the pre-#1727 literal instead of the chart parent: %q", notes[0].Body)
 	}
 	outbox, err := store.ListWakeOutbox(context.Background(), "")
 	if err != nil || len(outbox) != 1 || outbox[0].State != db.WakeOutboxStatePending ||
-		outbox[0].TargetRole != "jarvis" || outbox[0].SourceID != fmt.Sprint(notes[0].ID) {
+		outbox[0].TargetRole != "coordinator" || outbox[0].SourceID != fmt.Sprint(notes[0].ID) {
 		t.Fatalf("merge-gate wake outbox = %+v, err=%v", outbox, err)
+	}
+}
+
+// The end-to-end test above pins the parent path through gate.Evaluate. These
+// pin the branches taken when the chart cannot name a parent, which no single
+// gate run can reach.
+func TestMergeGateEscalationToFallsBackWhenChartCannotNameAParent(t *testing.T) {
+	chart := func(t *testing.T, body string) config.OrgConfig {
+		t.Helper()
+		paths := config.PathsForHome(t.TempDir())
+		if err := config.Initialize(paths); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := config.LoadOrg(paths)
+		if err != nil {
+			t.Fatalf("LoadOrg: %v", err)
+		}
+		return cfg
+	}
+	populated := `
+[org.roles."owner"]
+scope = ["*"]
+[org.roles."coordinator"]
+parent = "owner"
+scope = ["owner/*"]
+`
+	for _, test := range []struct {
+		name string
+		body string
+		from string
+		want string
+	}{
+		{name: "declared child resolves its parent", body: populated, from: "coordinator", want: "owner"},
+		{name: "chart root is the actor", body: populated, from: "owner", want: "owner"},
+		{name: "undeclared role falls back to the root", body: populated, from: "appkit-demo", want: "owner"},
+		{name: "absent chart falls back to owner", body: "", from: "appkit-demo", want: "owner"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := mergeGateEscalationTo(chart(t, test.body), test.from); got != test.want {
+				t.Fatalf("mergeGateEscalationTo(%q) = %q, want %q", test.from, got, test.want)
+			}
+		})
 	}
 }
 
