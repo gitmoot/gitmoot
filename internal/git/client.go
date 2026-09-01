@@ -957,6 +957,29 @@ func (c Client) UpdateBase(ctx context.Context, remote string, branch string) er
 	return err
 }
 
+// VerifyPackIndex asks GIT whether a pack and its index are a valid, readable
+// pair, rather than reimplementing the pack format here.
+//
+// `git verify-pack` walks every object in the pack, checks the index entries and
+// offsets, and verifies the checksums — the same validation Git performs before it
+// will read objects out of the pair. Checksums alone cannot do that: a fabricated
+// but self-consistent PACK/idx passes a trailer comparison and still holds no
+// recoverable object, which is the difference between retaining a real object
+// database and retaining an ordinary cache forever.
+//
+// It runs the repository-independent form (`git verify-pack` takes the .idx path
+// directly), so it needs no checkout and reads nothing but the pair.
+func (c Client) VerifyPackIndex(ctx context.Context, indexPath string) error {
+	indexPath = strings.TrimSpace(indexPath)
+	if indexPath == "" {
+		return errors.New("pack index path is required")
+	}
+	if _, err := c.run(ctx, "verify-pack", "--stat-only", "--", indexPath); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (c Client) run(ctx context.Context, args ...string) (subprocess.Result, error) {
 	if c.runner == nil {
 		return subprocess.Result{}, errors.New("git subprocess runner is required")

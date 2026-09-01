@@ -2882,31 +2882,46 @@ could have rewritten.
 The proven-disposable clone is then **renamed to a sibling
 `<path>.ttl-reclaiming-<random>`** and every proof is repeated there. After the
 final Git proof it is renamed again, and that last scan records an **inventory**:
-the exact entries, sizes and modification times the proof saw. The removal unlinks
-only those. Content a writer creates between the proof and the unlink is not in the
-inventory, so it is never removed and the `rmdir` of its parent fails with
-`ENOTEMPTY` instead — the removal aborts, the clone is put back, and
-`delegation_worktree_retained_unpublished` records why. That is a kernel-enforced
-property, not another point-in-time check: a writer that creates and closes a file
-with no lingering cwd or descriptor still cannot lose it.
+every entry with its inode and inode-change time. The removal then walks that
+inventory with **descriptor-relative** operations — `openat`/`fstatat`/`unlinkat`
+against directory descriptors this pass opened and verified — and unlinks only
+objects that still match. Three things follow, all enforced by the kernel rather
+than sampled by a check:
+
+- content created after the proof is not in the inventory, is never unlinked, and
+  makes its parent's `rmdir` fail with `ENOTEMPTY`, so the removal aborts and the
+  clone is restored with the new bytes intact;
+- a proved file rewritten with same-size content and a restored mtime is refused,
+  because inode and ctime are compared and no unprivileged call moves ctime
+  backwards;
+- a directory swapped for another directory or a symlink cannot redirect anything,
+  because no path component is re-resolved between the proof and the unlink.
 
 Both names a writer could have observed are then **fenced**. A fence is a regular
-file carrying a fixed marker, one link, and that exact length; `mkdir` on the name
-fails and any path below it fails with `ENOTDIR`. Anything else at a quarantine
-name — a directory, a symlink, a hard link, an empty or same-length file a writer
-planted — is a SURVIVOR: it is never deleted, never followed, and blocks
-completion. Retired fences are swept on the daemon's worktree tick after 24h and
-counted by `gitmoot doctor` and `/api/health`, so they are bounded and visible.
+file whose content carries a random **nonce recorded in the job's event log**
+(`delegation_worktree_fence_written`); the public prefix alone proves nothing.
+Anything else at a quarantine name — a directory, symlink, hard link, empty file,
+same-length forgery, or a fence with no recorded nonce — is a SURVIVOR: never
+deleted, never followed, and it blocks completion. Pruning re-proves ownership
+through a descriptor and compares the inode again immediately before `unlinkat`,
+so a name swapped after classification is not removed. Retired fences are swept on
+the five-minute worktree-maintenance cadence, bounded to 256 entries per run with a
+rotating cursor, and counted by `gitmoot doctor` and `/api/health`.
 
 A nested object database is recognised by its BYTES. A loose candidate is accepted
 only when its decompressed content hashes (SHA-1 or SHA-256) to the name it is
 stored under, with the header read bounded so a malformed cache entry cannot size
-the daemon's allocation while valid large objects still stream. A pack is accepted
-only when its own trailing checksum verifies, its `.idx` verifies, and the index
-records that pack's digest — the same integrity test Git applies when it opens the
-pair. Ordinary ignored content-addressed build output uses the same hex-fanout and
-`pack-<hash>.pack` naming, and retaining on names alone would make the pass inert
-on any repo with a build cache.
+the daemon's allocation while valid large objects still stream. A pack must pass
+its own trailing checksum, its `.idx` must verify and record that pack's digest,
+and **`git verify-pack` must accept the pair** — checksums prove the files are
+intact, only Git proves they hold readable objects. Ordinary ignored
+content-addressed build output uses the same hex-fanout and `pack-<hash>.pack`
+naming, so recognising on names alone would make the pass inert on any repo with a
+build cache.
+
+On non-Linux builds the removal and the fence prune FAIL CLOSED — nothing is
+deleted — because the descriptor-relative primitives and ctime this proof depends
+on are Linux-shaped, and a weaker stand-in is exactly what these guards replaced.
 
 Every retention records **why**, once per reason per job, so an inert deployment
 is visible instead of silent: `delegation_worktree_retained_unpublished` (also

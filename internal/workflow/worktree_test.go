@@ -1694,7 +1694,7 @@ func TestEngineReclaimAgedFixCloneRequiresPublishedObjectDatabase(t *testing.T) 
 			if !tc.want && statErr != nil {
 				t.Fatalf("ineligible fix clone was removed: %v", statErr)
 			}
-			leftovers, quarantineErr := FixCloneQuarantines(path)
+			leftovers, quarantineErr := FixCloneQuarantines(path, storeFenceOwnership(t, store, jobID))
 			if quarantineErr != nil || len(leftovers) != 0 {
 				t.Fatalf("quarantines survived the pass: %v (err %v)", leftovers, quarantineErr)
 			}
@@ -1921,7 +1921,7 @@ func TestEngineReclaimAgedFixCloneRetainsIgnoredNestedRepositories(t *testing.T)
 			if err != nil || !clean {
 				t.Fatalf("trigger is not hidden from outer status: clean=%v err=%v", clean, err)
 			}
-			nested, err := nestedGitObjectDatabase(ctx, path)
+			nested, err := nestedGitObjectDatabase(ctx, path, gitPackVerifierForTest(t))
 			if err != nil {
 				t.Fatalf("nestedGitObjectDatabase: %v", err)
 			}
@@ -2032,7 +2032,7 @@ func TestEngineReclaimAgedFixCloneQuarantinesBeforeRemoval(t *testing.T) {
 	if _, statErr := os.Stat(marker); statErr != nil {
 		t.Fatalf("restored clone lost its content: %v", statErr)
 	}
-	leftovers, quarantineErr := FixCloneQuarantines(path)
+	leftovers, quarantineErr := FixCloneQuarantines(path, storeFenceOwnership(t, store, jobID))
 	if quarantineErr != nil || len(leftovers) != 0 {
 		t.Fatalf("clone was left quarantined: %v (err %v)", leftovers, quarantineErr)
 	}
@@ -2096,7 +2096,7 @@ func TestEngineReclaimAgedFixCloneRechecksNestedRepositoriesAfterQuarantine(t *t
 	if len(manager.cloneOnlyCalls) != 2 || manager.cloneOnlyCalls[1] == path {
 		t.Fatalf("clone-only probes = %v, want the race injected during the quarantined final proof", manager.cloneOnlyCalls)
 	}
-	leftovers, err := FixCloneQuarantines(path)
+	leftovers, err := FixCloneQuarantines(path, storeFenceOwnership(t, store, jobID))
 	if err != nil || len(leftovers) != 0 {
 		t.Fatalf("clone was left quarantined: %v (err %v)", leftovers, err)
 	}
@@ -2177,9 +2177,11 @@ func TestEngineReclaimAgedFixCloneFencesPostScanPathWriter(t *testing.T) {
 		if info.IsDir() {
 			t.Fatalf("observed quarantine name %s is still a directory", name)
 		}
-		content, err := os.ReadFile(name)
-		if err != nil || !bytes.Equal(content, fixCloneFenceMarker) {
-			t.Fatalf("fence at %s holds %q (err %v), want the ownership marker", name, content, err)
+		// Provenance is the recorded NONCE, not the public prefix: the same
+		// registry every later pass consults must recognise this file.
+		if !storeFenceOwnership(t, store, jobID).proven(name, info) {
+			content, _ := os.ReadFile(name)
+			t.Fatalf("fence at %s holds %q, which the job's fence records do not prove", name, content)
 		}
 		// The write from the review's reproduction, replayed after completion.
 		if err := os.MkdirAll(filepath.Join(name, "late", ".git"), 0o755); err == nil {
@@ -2191,7 +2193,7 @@ func TestEngineReclaimAgedFixCloneFencesPostScanPathWriter(t *testing.T) {
 	}
 	// Fences are not surviving clones, so they neither block this clone's
 	// bookkeeping nor inflate the operator-facing quarantine count.
-	survivors, err := FixCloneQuarantines(path)
+	survivors, err := FixCloneQuarantines(path, storeFenceOwnership(t, store, jobID))
 	if err != nil || len(survivors) != 0 {
 		t.Fatalf("fences reported as surviving quarantines: %v (err %v)", survivors, err)
 	}
@@ -2215,11 +2217,9 @@ func TestEngineReclaimAgedFixCloneFencesPostScanPathWriter(t *testing.T) {
 func TestFenceFixCloneQuarantineName(t *testing.T) {
 	root := t.TempDir()
 	free := filepath.Join(root, "clone"+fixCloneQuarantinePrefix+"00112233")
-	fenced, err := fenceFixCloneQuarantineName(free)
-	if err != nil || !fenced {
-		t.Fatalf("fence on a free name = (%v, %v), want (true, nil)", fenced, err)
-	}
-	if fenced, err := fenceFixCloneQuarantineName(free); err != nil || fenced {
+	record := fenceForTest(t, free)
+	owned := NewFixCloneFenceOwnership([]string{record})
+	if fenced, _, err := fenceFixCloneQuarantineName(free); err != nil || fenced {
 		t.Fatalf("re-fencing = (%v, %v), want (false, nil)", fenced, err)
 	}
 
@@ -2227,14 +2227,13 @@ func TestFenceFixCloneQuarantineName(t *testing.T) {
 	if err := os.Mkdir(taken, 0o755); err != nil {
 		t.Fatalf("Mkdir racing quarantine: %v", err)
 	}
-	fenced, err = fenceFixCloneQuarantineName(taken)
-	if err != nil || fenced {
+	if fenced, _, err := fenceFixCloneQuarantineName(taken); err != nil || fenced {
 		t.Fatalf("fence on a racing directory = (%v, %v), want (false, nil)", fenced, err)
 	}
 	if _, err := os.Stat(taken); err != nil {
 		t.Fatalf("fence deleted the racing directory: %v", err)
 	}
-	quarantines, err := FixCloneQuarantines(filepath.Join(root, "clone"))
+	quarantines, err := FixCloneQuarantines(filepath.Join(root, "clone"), owned)
 	if err != nil {
 		t.Fatalf("FixCloneQuarantines: %v", err)
 	}
@@ -2356,14 +2355,14 @@ func TestEngineReclaimAgedFixCloneRetainsSymlinkQuarantineWinner(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(target, "late", ".git")); err != nil {
 		t.Fatalf("writer content was deleted through the symlink: %v", err)
 	}
-	survivors, err := FixCloneQuarantines(path)
+	survivors, err := FixCloneQuarantines(path, storeFenceOwnership(t, store, jobID))
 	if err != nil {
 		t.Fatalf("FixCloneQuarantines: %v", err)
 	}
 	if len(survivors) != 1 || survivors[0] != planted {
 		t.Fatalf("symlink survivors = %v, want %s", survivors, planted)
 	}
-	if fences, err := FixCloneFences(path); err != nil || len(fences) != 0 {
+	if fences, err := FixCloneFences(path, storeFenceOwnership(t, store, jobID)); err != nil || len(fences) != 0 {
 		t.Fatalf("symlink counted as a spent fence: %v (err %v)", fences, err)
 	}
 	events, err := store.ListJobEvents(ctx, jobID)
@@ -2377,7 +2376,7 @@ func TestEngineReclaimAgedFixCloneRetainsSymlinkQuarantineWinner(t *testing.T) {
 	}
 
 	// The fence itself must also refuse the name rather than follow or clobber it.
-	if fenced, err := fenceFixCloneQuarantineName(planted); err != nil || fenced {
+	if fenced, _, err := fenceFixCloneQuarantineName(planted); err != nil || fenced {
 		t.Fatalf("fence on a symlink = (%v, %v), want (false, nil)", fenced, err)
 	}
 	if info, err := os.Lstat(planted); err != nil || info.Mode()&os.ModeSymlink == 0 {
@@ -2465,7 +2464,7 @@ func TestNestedGitObjectDatabaseRejectsCorruptGitShapedCaches(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
 			tc.setup(t, root)
-			nested, err := nestedGitObjectDatabase(ctx, root)
+			nested, err := nestedGitObjectDatabase(ctx, root, gitPackVerifierForTest(t))
 			if err != nil {
 				t.Fatalf("nestedGitObjectDatabase: %v", err)
 			}
@@ -2570,11 +2569,8 @@ func TestPruneFixCloneFences(t *testing.T) {
 	// ownership marker, so neither may be pruned or read as a spent fence.
 	planted := path + fixCloneQuarantinePrefix + "dddddddd"
 	linked := path + fixCloneQuarantinePrefix + "eeeeeeee"
-	for _, fence := range []string{aged, fresh} {
-		if fenced, err := fenceFixCloneQuarantineName(fence); err != nil || !fenced {
-			t.Fatalf("fence %s = (%v, %v), want written", fence, fenced, err)
-		}
-	}
+	records := []string{fenceForTest(t, aged), fenceForTest(t, fresh)}
+	owned := NewFixCloneFenceOwnership(records)
 	if err := os.Mkdir(survivor, 0o755); err != nil {
 		t.Fatalf("Mkdir survivor: %v", err)
 	}
@@ -2584,14 +2580,19 @@ func TestPruneFixCloneFences(t *testing.T) {
 	// Same LENGTH as the marker, different bytes: only a content check separates
 	// this from a fence, and treating it as one would prune a writer's file.
 	forged := path + fixCloneQuarantinePrefix + "ffffffff"
-	if err := os.WriteFile(forged, bytes.Repeat([]byte("x"), len(fixCloneFenceMarker)), 0o644); err != nil {
+	if err := os.WriteFile(forged, bytes.Repeat([]byte("x"), len(fixCloneFenceContent(strings.Repeat("0", 32)))), 0o644); err != nil {
 		t.Fatalf("plant same-length file: %v", err)
 	}
 	// A hard link carrying the marker's exact bytes: the writer keeps a second name
 	// for the same inode, so nlink is 2 and the file is not provably ours. It is
 	// linked from OUTSIDE the quarantine namespace so our own fences stay single-link.
 	linkSource := filepath.Join(root, "writer-copy")
-	if err := os.WriteFile(linkSource, fixCloneFenceMarker, 0o444); err != nil {
+	// The writer copies a fence's exact bytes, nonce included, and hard-links it in.
+	fenceBytes, err := os.ReadFile(fresh)
+	if err != nil {
+		t.Fatalf("read fence bytes: %v", err)
+	}
+	if err := os.WriteFile(linkSource, fenceBytes, 0o444); err != nil {
 		t.Fatalf("write marker copy: %v", err)
 	}
 	if err := os.Link(linkSource, linked); err != nil {
@@ -2604,11 +2605,11 @@ func TestPruneFixCloneFences(t *testing.T) {
 		}
 	}
 
-	fences, err := FixCloneFences(path)
+	fences, err := FixCloneFences(path, owned)
 	if err != nil || len(fences) != 2 {
 		t.Fatalf("FixCloneFences = %v (err %v), want both fences", fences, err)
 	}
-	pruned, err := PruneFixCloneFences(path, time.Now().Add(-24*time.Hour))
+	pruned, err := PruneFixCloneFences(path, time.Now().Add(-24*time.Hour), owned)
 	if err != nil || pruned != 1 {
 		t.Fatalf("PruneFixCloneFences = %d (err %v), want 1", pruned, err)
 	}
@@ -2629,7 +2630,7 @@ func TestPruneFixCloneFences(t *testing.T) {
 			t.Fatalf("pruner removed writer-planted file %s: %v", unowned, err)
 		}
 	}
-	survivors, err := FixCloneQuarantines(path)
+	survivors, err := FixCloneQuarantines(path, owned)
 	if err != nil {
 		t.Fatalf("FixCloneQuarantines: %v", err)
 	}
@@ -2649,6 +2650,7 @@ func TestPruneFixCloneFences(t *testing.T) {
 func TestPruneExpiredFixCloneFencesSweepsEveryRepo(t *testing.T) {
 	home := t.TempDir()
 	aged := map[string]string{}
+	records := []string{}
 	for _, repo := range []string{"owner--repo", "other--repo"} {
 		fixes := filepath.Join(home, "worktrees", repo, "fixes")
 		if err := os.MkdirAll(fixes, 0o755); err != nil {
@@ -2656,9 +2658,7 @@ func TestPruneExpiredFixCloneFencesSweepsEveryRepo(t *testing.T) {
 		}
 		clone := filepath.Join(fixes, "job-1")
 		fence := clone + fixCloneQuarantinePrefix + "aaaaaaaa"
-		if fenced, err := fenceFixCloneQuarantineName(fence); err != nil || !fenced {
-			t.Fatalf("fence %s = (%v, %v)", fence, fenced, err)
-		}
+		records = append(records, fenceForTest(t, fence))
 		past := time.Now().Add(-48 * time.Hour)
 		if err := os.Chtimes(fence, past, past); err != nil {
 			t.Fatalf("Chtimes: %v", err)
@@ -2668,14 +2668,17 @@ func TestPruneExpiredFixCloneFencesSweepsEveryRepo(t *testing.T) {
 		if err := os.MkdirAll(clone, 0o755); err != nil {
 			t.Fatalf("MkdirAll clone: %v", err)
 		}
-		if fenced, err := fenceFixCloneQuarantineName(clone + fixCloneQuarantinePrefix + "bbbbbbbb"); err != nil || !fenced {
-			t.Fatalf("fresh fence = (%v, %v)", fenced, err)
-		}
+		records = append(records, fenceForTest(t, clone+fixCloneQuarantinePrefix+"bbbbbbbb"))
 	}
 
-	pruned, err := PruneExpiredFixCloneFences(home, time.Now().Add(-24*time.Hour))
+	owned := NewFixCloneFenceOwnership(records)
+	ownership := func(string) (FixCloneFenceOwnership, error) { return owned, nil }
+	pruned, scanned, err := PruneExpiredFixCloneFencesBounded(home, time.Now().Add(-24*time.Hour), 256, ownership)
 	if err != nil || pruned != len(aged) {
-		t.Fatalf("PruneExpiredFixCloneFences = %d (err %v), want %d", pruned, err, len(aged))
+		t.Fatalf("PruneExpiredFixCloneFencesBounded = %d (err %v), want %d", pruned, err, len(aged))
+	}
+	if scanned == 0 {
+		t.Fatal("the sweep reported scanning nothing")
 	}
 	for repo, fence := range aged {
 		if _, err := os.Lstat(fence); !os.IsNotExist(err) {
@@ -2685,13 +2688,13 @@ func TestPruneExpiredFixCloneFencesSweepsEveryRepo(t *testing.T) {
 		if _, err := os.Stat(clone); err != nil {
 			t.Fatalf("%s: sweep removed a live clone: %v", repo, err)
 		}
-		fences, err := FixCloneFences(clone)
+		fences, err := FixCloneFences(clone, owned)
 		if err != nil || len(fences) != 1 {
 			t.Fatalf("%s: fences after sweep = %v (err %v), want the fresh one", repo, fences, err)
 		}
 	}
 	// An empty home is a no-op, not an error: a host with no fix clones is normal.
-	if pruned, err := PruneExpiredFixCloneFences(t.TempDir(), time.Now()); err != nil || pruned != 0 {
+	if pruned, _, err := PruneExpiredFixCloneFencesBounded(t.TempDir(), time.Now(), 256, ownership); err != nil || pruned != 0 {
 		t.Fatalf("sweep of an empty home = %d (err %v), want 0", pruned, err)
 	}
 }
@@ -2789,7 +2792,7 @@ func TestLooseObjectHeaderReadIsBounded(t *testing.T) {
 	// 1 MiB of NUL-free content behind a hex-fanout name: no header terminator
 	// inside the bound, so recognition rejects it without buffering the stream.
 	writeZlibFile(t, filepath.Join(root, "cache", "ab", strings.Repeat("c", 38)), strings.Repeat("x", 1<<20))
-	nested, err := nestedGitObjectDatabase(ctx, root)
+	nested, err := nestedGitObjectDatabase(ctx, root, gitPackVerifierForTest(t))
 	if err != nil {
 		t.Fatalf("nestedGitObjectDatabase: %v", err)
 	}
@@ -2816,7 +2819,7 @@ func TestLooseObjectHeaderReadIsBounded(t *testing.T) {
 	digest := sha1.Sum([]byte(header + body))
 	name := hex.EncodeToString(digest[:])
 	writeZlibFile(t, filepath.Join(root, "objects", name[:2], name[2:]), header+body)
-	nested, err = nestedGitObjectDatabase(ctx, root)
+	nested, err = nestedGitObjectDatabase(ctx, root, gitPackVerifierForTest(t))
 	if err != nil {
 		t.Fatalf("nestedGitObjectDatabase after the valid object: %v", err)
 	}
@@ -2927,7 +2930,7 @@ func TestEngineReclaimAgedFixCloneNeverDeletesContentWrittenAfterTheProof(t *tes
 			if reclaimed {
 				t.Fatal("a clone that gained content after its proof was reclaimed")
 			}
-			survivors, err := FixCloneQuarantines(path)
+			survivors, err := FixCloneQuarantines(path, storeFenceOwnership(t, store, jobID))
 			if err != nil {
 				t.Fatalf("FixCloneQuarantines: %v", err)
 			}
@@ -3045,7 +3048,7 @@ func TestEngineReclaimAgedFixCloneReclaimsIgnoredHexFanoutOutput(t *testing.T) {
 	if clean, err := manager.WorktreeCleanAt(ctx, path); err != nil || !clean {
 		t.Fatalf("ignored cache is not hidden from status: clean=%v err=%v", clean, err)
 	}
-	nested, err := nestedGitObjectDatabase(ctx, path)
+	nested, err := nestedGitObjectDatabase(ctx, path, gitPackVerifierForTest(t))
 	if err != nil {
 		t.Fatalf("nestedGitObjectDatabase: %v", err)
 	}
@@ -3149,14 +3152,14 @@ func TestFixCloneQuarantinesFindsPathsWithGlobMetacharacters(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(parent, "job-2"+fixCloneQuarantinePrefix+"ff"), 0o755); err != nil {
 		t.Fatalf("MkdirAll sibling quarantine: %v", err)
 	}
-	quarantines, err := FixCloneQuarantines(path)
+	quarantines, err := FixCloneQuarantines(path, FixCloneFenceOwnership{})
 	if err != nil {
 		t.Fatalf("FixCloneQuarantines: %v", err)
 	}
 	if len(quarantines) != 1 || quarantines[0] != quarantine {
 		t.Fatalf("quarantines = %v, want [%s]", quarantines, quarantine)
 	}
-	if found, err := FixCloneQuarantines(filepath.Join(parent, "job-3")); err != nil || len(found) != 0 {
+	if found, err := FixCloneQuarantines(filepath.Join(parent, "job-3"), FixCloneFenceOwnership{}); err != nil || len(found) != 0 {
 		t.Fatalf("quarantines for an untouched clone = %v (err %v), want none", found, err)
 	}
 }
@@ -3689,6 +3692,8 @@ type fakeWorktreeManager struct {
 	cloneOnly        map[string]string // path -> unpublished sha ("" proves published)
 	cloneOnlyDefault string            // answer for paths absent from cloneOnly
 	cloneOnlyErr     error
+	verifiedPacks    []string
+	verifyPackErr    error
 	cloneOnlyCalls   []string
 	cloneOnlyHook    func(path string) // mutate the clone between proof rounds
 	cleanCalls       []string
@@ -3805,6 +3810,14 @@ func (f *fakeWorktreeManager) RefreshCloneProofRefs(ctx context.Context, path st
 	return f.refreshErr
 }
 
+// VerifyPackIndex mirrors Git's pack validation. The fake accepts by default and
+// records what it was asked to verify, so a test can prove the production path
+// consults it and can make it refuse.
+func (f *fakeWorktreeManager) VerifyPackIndex(_ context.Context, indexPath string) error {
+	f.verifiedPacks = append(f.verifiedPacks, indexPath)
+	return f.verifyPackErr
+}
+
 func (f *fakeWorktreeManager) CloneOnlyCommit(_ context.Context, path string) (string, error) {
 	f.cloneOnlyCalls = append(f.cloneOnlyCalls, path)
 	if f.cloneOnlyHook != nil {
@@ -3913,4 +3926,44 @@ func TestTaskWorktreePathSegmentSanitizesSlashedIDs(t *testing.T) {
 	if _, err := taskWorktreePathSegment("   ", "p"); err == nil {
 		t.Fatalf("blank value should still error")
 	}
+}
+
+// fenceForTest writes a fence and returns the durable record production would
+// have logged, so a test proves ownership the same way the daemon does.
+func fenceForTest(t *testing.T, path string) string {
+	t.Helper()
+	fenced, nonce, err := fenceFixCloneQuarantineName(path)
+	if err != nil || !fenced {
+		t.Fatalf("fence %s = (%v, %v)", path, fenced, err)
+	}
+	return path + " " + nonce
+}
+
+// storeFenceOwnership loads a job's recorded fence nonces, which is what every
+// production classification consults.
+func storeFenceOwnership(t *testing.T, store *db.Store, jobID string) FixCloneFenceOwnership {
+	t.Helper()
+	events, err := store.ListJobEvents(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents(%s): %v", jobID, err)
+	}
+	records := []string{}
+	for _, event := range events {
+		if event.Kind == JobEventFixCloneFenced {
+			records = append(records, event.Message)
+		}
+	}
+	return NewFixCloneFenceOwnership(records)
+}
+
+// gitPackVerifierForTest runs the REAL git verification the production path uses,
+// so a recognition test is not silently weaker than the daemon. Without git on the
+// host it returns nil, which is the conservative fallback production also takes.
+func gitPackVerifierForTest(t *testing.T) packIndexVerifier {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		return nil
+	}
+	client := gitutil.NewHostClient(t.TempDir())
+	return client.VerifyPackIndex
 }

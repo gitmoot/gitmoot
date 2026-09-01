@@ -128,8 +128,18 @@ func TestInspectDelegationWorktreeUsageAccountsFixCloneFencesAndSurvivors(t *tes
 		t.Fatal(err)
 	}
 	// A real spent fence, written by the production helper.
-	if fenced, err := workflow.FenceFixCloneQuarantineNameForTest(clone + ".ttl-reclaiming-cccccccc"); err != nil || !fenced {
+	fencePath := clone + ".ttl-reclaiming-cccccccc"
+	fenced, nonce, err := workflow.FenceFixCloneQuarantineNameForTest(fencePath)
+	if err != nil || !fenced {
 		t.Fatalf("fence = (%v, %v)", fenced, err)
+	}
+	// Doctor proves ownership from the job's durable record, exactly as the daemon
+	// does; without this event the fence is an unproven file.
+	if err := store.AddJobEvent(context.Background(), db.JobEvent{
+		JobID: "fix-job", Kind: workflow.JobEventFixCloneFenced,
+		Message: fencePath + " " + nonce,
+	}); err != nil {
+		t.Fatal(err)
 	}
 	// Age the owner past the TTL so its surviving quarantine is stale reclaimable
 	// state rather than a recent terminal the size total excludes by design.
