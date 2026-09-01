@@ -36,6 +36,24 @@ func (c Client) Dir() string { return c.dir }
 
 const maxGitErrorStderrRunes = 4096
 
+type terminalWorktreeRemovalError struct {
+	err error
+}
+
+func (e terminalWorktreeRemovalError) Error() string {
+	return e.err.Error()
+}
+
+func (e terminalWorktreeRemovalError) Unwrap() error {
+	return e.err
+}
+
+// TerminalWorktreeRemoval marks a stale worktree-admin/registered-root mismatch
+// that cannot become healthy by retrying the same registered-root command.
+func (e terminalWorktreeRemovalError) TerminalWorktreeRemoval() bool {
+	return true
+}
+
 func (c Client) CreateBranch(ctx context.Context, branch string, base string) error {
 	if err := validateBranch(branch); err != nil {
 		return err
@@ -218,12 +236,7 @@ func (c Client) RemoteBranches(ctx context.Context, branches []string) (map[stri
 }
 
 func (c Client) RemoveWorktree(ctx context.Context, path string) error {
-	path, err := validateWorktreePath(path)
-	if err != nil {
-		return err
-	}
-	_, err = c.run(ctx, "worktree", "remove", path)
-	return err
+	return c.removeWorktree(ctx, path, false)
 }
 
 // RemoveWorktreeForce removes a worktree even when it has uncommitted or
@@ -231,20 +244,54 @@ func (c Client) RemoveWorktree(ctx context.Context, path string) error {
 // read-only delegation fan-out worktrees) whose contents are never integrated,
 // so a runtime that left scratch files behind must not block disposal.
 func (c Client) RemoveWorktreeForce(ctx context.Context, path string) error {
+	return c.removeWorktree(ctx, path, true)
+}
+
+func (c Client) removeWorktree(ctx context.Context, path string, force bool) error {
 	path, err := validateWorktreePath(path)
 	if err != nil {
 		return err
 	}
-	result, err := c.run(ctx, "worktree", "remove", "--force", path)
+	args := []string{"worktree", "remove"}
+	if force {
+		args = append(args, "--force")
+	}
+	args = append(args, path)
+	result, err := c.run(ctx, args...)
 	if err == nil || !strings.Contains(strings.ToLower(result.Stderr), "is not a working tree") {
 		return err
 	}
-	owner, ownerErr := worktreeOwnerCheckout(path)
-	if ownerErr != nil || filepath.Clean(owner) == filepath.Clean(c.dir) {
+	// A path that vanished between the caller's stat and this removal is a race,
+	// not a registration failure: the next pass sees an absent path and reconciles
+	// it. Classifying it terminal is sticky and permanently retires the candidate.
+	if _, statErr := os.Lstat(path); os.IsNotExist(statErr) {
 		return err
 	}
-	_, err = NewClient(owner, c.runner).run(ctx, "worktree", "remove", "--force", path)
-	return err
+	owner, ownerErr := worktreeOwnerCheckout(path)
+	if ownerErr != nil {
+		if errors.Is(ownerErr, os.ErrNotExist) {
+			return err
+		}
+		return terminalWorktreeRemovalError{err: fmt.Errorf("%w: resolve owning checkout: %v", err, ownerErr)}
+	}
+	if filepath.Clean(owner) == filepath.Clean(c.dir) {
+		return terminalWorktreeRemovalError{err: err}
+	}
+	fallbackResult, fallbackErr := NewClient(owner, c.runner).run(ctx, args...)
+	if fallbackErr == nil {
+		return nil
+	}
+	if terminalWorktreeRegistrationFailure(fallbackResult.Stderr) {
+		return terminalWorktreeRemovalError{err: fmt.Errorf("%w: owning checkout %s also rejected removal: %v", err, owner, fallbackErr)}
+	}
+	return fallbackErr
+}
+
+func terminalWorktreeRegistrationFailure(stderr string) bool {
+	lower := strings.ToLower(stderr)
+	return strings.Contains(lower, "is not a working tree") ||
+		strings.Contains(lower, "not a git repository") ||
+		strings.Contains(lower, "cannot change to")
 }
 
 // PruneWorktrees removes stale administrative entries left by interrupted or
@@ -496,11 +543,219 @@ func (c Client) WorktreeClean(ctx context.Context) (bool, error) {
 }
 
 func (c Client) WorktreeCleanAt(ctx context.Context, path string) (bool, error) {
+	return c.worktreeStatusEmptyAt(ctx, path, false)
+}
+
+// WorktreePristineAt reports whether a destructive cleanup would preserve all
+// tracked, untracked, and ignored content.
+func (c Client) WorktreePristineAt(ctx context.Context, path string) (bool, error) {
+	return c.worktreeStatusEmptyAt(ctx, path, true)
+}
+
+func (c Client) worktreeStatusEmptyAt(ctx context.Context, path string, includeIgnored bool) (bool, error) {
 	path, err := validateWorktreePath(path)
 	if err != nil {
 		return false, err
 	}
-	return NewClient(path, c.runner).WorktreeClean(ctx)
+	args := []string{"status", "--porcelain"}
+	if includeIgnored {
+		args = append(args, "--ignored")
+	}
+	result, err := NewClient(path, c.runner).run(ctx, args...)
+	if err == nil {
+		return strings.TrimSpace(result.Stdout) == "", nil
+	}
+	gitDir, gitDirErr := worktreeGitDir(path)
+	if gitDirErr == nil {
+		if _, statErr := os.Stat(gitDir); os.IsNotExist(statErr) {
+			return false, terminalWorktreeRemovalError{err: fmt.Errorf("%w: worktree admin directory %s is missing", err, gitDir)}
+		}
+	} else {
+		gitMarker := filepath.Join(path, ".git")
+		info, statErr := os.Stat(gitMarker)
+		if os.IsNotExist(statErr) || (statErr == nil && !info.IsDir()) {
+			return false, terminalWorktreeRemovalError{err: fmt.Errorf("%w: worktree has no valid .git pointer: %v", err, gitDirErr)}
+		}
+	}
+	owner, ownerErr := worktreeOwnerCheckout(path)
+	if ownerErr == nil && filepath.Clean(owner) != filepath.Clean(c.dir) {
+		return false, terminalWorktreeRemovalError{err: fmt.Errorf("%w: worktree is registered to %s, not %s", err, owner, c.dir)}
+	}
+	return false, err
+}
+
+// cloneReclaimProofNamespace holds the refs fetched from the TRUSTED remote URL
+// during a disposable-clone removal proof. It is deliberately separate from
+// refs/remotes/origin/*: a disposable clone's own remote configuration is
+// writable by whatever ran in it, so origin is not evidence of anything.
+const cloneReclaimProofNamespace = "refs/remotes/gitmoot-reclaim-proof/"
+
+// RemoteURL returns the URL of a remote in this client's checkout. The registered
+// repository checkout is the trust anchor for disposable-clone removal proofs.
+func (c Client) RemoteURL(ctx context.Context, remote string) (string, error) {
+	remote = strings.TrimSpace(remote)
+	if remote == "" {
+		remote = "origin"
+	}
+	if strings.HasPrefix(remote, "-") || strings.ContainsAny(remote, " \t\r\n") {
+		return "", fmt.Errorf("remote %q is invalid", remote)
+	}
+	result, err := c.run(ctx, "remote", "get-url", remote)
+	if err != nil {
+		return "", err
+	}
+	url := strings.TrimSpace(result.Stdout)
+	if url == "" {
+		return "", fmt.Errorf("remote %q has no url", remote)
+	}
+	return url, nil
+}
+
+// RefreshCloneProofRefs mirrors every branch and tag of the trusted remote URL
+// into the clone's proof namespace, pruning refs the remote no longer has. It
+// takes a URL rather than a remote name so the proof never consults the
+// disposable clone's own (mutable) remote configuration.
+func (c Client) RefreshCloneProofRefs(ctx context.Context, path string, remoteURL string) error {
+	path, err := validateWorktreePath(path)
+	if err != nil {
+		return err
+	}
+	remoteURL = strings.TrimSpace(remoteURL)
+	switch {
+	case remoteURL == "":
+		return errors.New("trusted remote url is required")
+	case strings.HasPrefix(remoteURL, "-"):
+		return fmt.Errorf("trusted remote url %q must not start with '-'", remoteURL)
+	case strings.ContainsAny(remoteURL, " \t\r\n"):
+		return fmt.Errorf("trusted remote url %q must not contain whitespace", remoteURL)
+	}
+	_, err = NewClient(path, c.runner).run(ctx, "fetch", "--prune", "--no-write-fetch-head", remoteURL,
+		"+refs/heads/*:"+cloneReclaimProofNamespace+"heads/*",
+		"+refs/tags/*:"+cloneReclaimProofNamespace+"tags/*",
+	)
+	return err
+}
+
+// CloneOnlyCommit returns the first commit that some local ref or reflog in the
+// clone reaches and no ref of the trusted remote contains, or "" when every
+// local commit is published. Removing a clone deletes its whole object database,
+// so HEAD ancestry alone is not a proof: side branches, tags, stashes and
+// reflog-only commits are exactly what a HEAD check misses.
+//
+// It is local-only, so callers can repeat it immediately before removal.
+// RefreshCloneProofRefs must have populated the proof namespace first; an empty
+// namespace makes every local commit clone-only, which retains the clone.
+//
+// The exclusion globs name EXACTLY the two subnamespaces the refresh fetches and
+// prunes. A wider glob over the whole namespace would let any other ref under it
+// act as an exclusion tip that prune can never remove, and one such ref hides
+// every unpublished commit behind it.
+// Clone-local ancestry rewrites are neutralised, because either one lets a clone
+// attach an upstream tip to its own unpublished root and make the proof report
+// nothing. Replace objects are disabled with --no-replace-objects. A deprecated
+// grafts file cannot be disabled from the command line at all — measured on git
+// 2.43, `-c core.graftFile=/dev/null` still honours it and only the
+// GIT_GRAFT_FILE environment variable suppresses it — so its presence makes the
+// clone unprovable and the proof refuses rather than trusting the ancestry.
+func (c Client) CloneOnlyCommit(ctx context.Context, path string) (string, error) {
+	path, err := validateWorktreePath(path)
+	if err != nil {
+		return "", err
+	}
+	graftFile, grafted, err := cloneGraftFile(ctx, NewClient(path, c.runner), path)
+	if err != nil {
+		return "", err
+	}
+	if grafted {
+		return "", fmt.Errorf("clone %s carries a grafts file (%s); its commit ancestry is rewritten locally and cannot be proven", path, graftFile)
+	}
+	result, err := NewClient(path, c.runner).run(ctx,
+		"--no-replace-objects",
+		"rev-list", "--max-count=1", "--all", "--reflog",
+		"--not",
+		"--glob="+cloneReclaimProofNamespace+"heads/*",
+		"--glob="+cloneReclaimProofNamespace+"tags/*")
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		if sha := strings.TrimSpace(line); sha != "" {
+			return sha, nil
+		}
+	}
+	return cloneUnreachableCommit(ctx, NewClient(path, c.runner))
+}
+
+// cloneUnreachableCommit reports a commit object the clone holds that no ref and
+// no reflog reaches. `git commit-tree` writes exactly that, and so does an
+// interrupted rebase or a dropped stash, so a ref-and-reflog traversal alone is
+// not a proof that removal loses nothing: the object database goes with the
+// directory. Any unreachable commit is by construction absent from the trusted
+// remote's refs, since those are refs of this clone too.
+//
+// It FAILS CLOSED on anything it cannot parse. `git fsck` exits 0 while reporting
+// `unreachable unknown <sha>` for a corrupt object and while printing unpack or
+// missing-alternate errors on stderr, and an empty result read as "nothing to
+// preserve" would authorise deleting exactly the object stores that are already
+// damaged. Silence, and only silence, means the clone is disposable.
+func cloneUnreachableCommit(ctx context.Context, worktree Client) (string, error) {
+	result, err := worktree.run(ctx, "--no-replace-objects",
+		"fsck", "--unreachable", "--connectivity-only", "--no-progress", "--no-dangling")
+	if err != nil {
+		return "", err
+	}
+	var unparsed []string
+	for _, stream := range []string{result.Stdout, result.Stderr} {
+		for _, raw := range strings.Split(stream, "\n") {
+			line := strings.TrimSpace(raw)
+			if line == "" || strings.HasPrefix(line, "Checking ") || strings.HasPrefix(line, "notice: ") {
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) == 3 && fields[0] == "unreachable" {
+				if fields[1] == "commit" {
+					return fields[2], nil
+				}
+				if fields[1] == "blob" || fields[1] == "tree" || fields[1] == "tag" {
+					// Unreachable non-commit objects are ordinary garbage: a commit that
+					// referenced them would itself be reported.
+					continue
+				}
+			}
+			unparsed = append(unparsed, line)
+		}
+	}
+	if len(unparsed) > 0 {
+		return "", fmt.Errorf("git fsck reported %d line(s) this proof cannot interpret, so the object database is unprovable: %s",
+			len(unparsed), strings.Join(unparsed[:min(len(unparsed), 3)], "; "))
+	}
+	return "", nil
+}
+
+// cloneGraftFile locates a clone's deprecated grafts file and reports whether it
+// holds any content. The path comes from `git rev-parse --git-path`, because git
+// reads grafts from the COMMON directory: a linked worktree's own admin directory
+// is the wrong place to look, and probing it would miss an active graft.
+func cloneGraftFile(ctx context.Context, worktree Client, path string) (string, bool, error) {
+	result, err := worktree.run(ctx, "rev-parse", "--git-path", "info/grafts")
+	if err != nil {
+		return "", false, err
+	}
+	graftFile := strings.TrimSpace(result.Stdout)
+	if graftFile == "" {
+		return "", false, fmt.Errorf("resolve grafts path for %s: git returned no path", path)
+	}
+	if !filepath.IsAbs(graftFile) {
+		graftFile = filepath.Join(path, graftFile)
+	}
+	graftInfo, err := os.Stat(graftFile)
+	if os.IsNotExist(err) {
+		return graftFile, false, nil
+	}
+	if err != nil {
+		return graftFile, false, fmt.Errorf("inspect grafts file %s: %w", graftFile, err)
+	}
+	return graftFile, graftInfo.Size() > 0, nil
 }
 
 func (c Client) StatusPorcelain(ctx context.Context) (string, error) {
@@ -702,6 +957,45 @@ func (c Client) UpdateBase(ctx context.Context, remote string, branch string) er
 	return err
 }
 
+// VerifyPackIndex asks GIT whether a pack and its index are a valid, readable
+// pair, rather than reimplementing the pack format here.
+//
+// `git verify-pack` walks every object in the pack, checks the index entries and
+// offsets, and verifies the checksums — the same validation Git performs before it
+// will read objects out of the pair.
+//
+// The two failure modes are DIFFERENT and the caller must be able to tell them
+// apart. A process that ran and rejected the pair proves the pair holds nothing
+// readable (valid=false, err=nil). A process that could not run at all — Git
+// missing, exec failure — proves nothing (err non-nil), and a caller that treats
+// that as "not a Git object database" would delete an object database it simply
+// failed to inspect.
+//
+// objectFormat is passed explicitly because a SHA-256 pair cannot be verified from
+// a SHA-1 repository context: Git rejects the index before reading it.
+func (c Client) VerifyPackIndex(ctx context.Context, indexPath string, objectFormat string) (bool, error) {
+	indexPath = strings.TrimSpace(indexPath)
+	if indexPath == "" {
+		return false, errors.New("pack index path is required")
+	}
+	args := []string{"verify-pack"}
+	if format := strings.TrimSpace(objectFormat); format != "" {
+		args = append(args, "--object-format="+format)
+	}
+	args = append(args, "--stat-only", "--", indexPath)
+	if _, err := c.run(ctx, args...); err != nil {
+		// The command RAN and rejected the pair: that is an ANSWER (the pair holds
+		// nothing readable). A process that could not run at all proves nothing, and
+		// the caller must retain rather than treat the silence as disposability.
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 func (c Client) run(ctx context.Context, args ...string) (subprocess.Result, error) {
 	if c.runner == nil {
 		return subprocess.Result{}, errors.New("git subprocess runner is required")
@@ -725,9 +1019,9 @@ func boundedGitErrorStderr(stderr string) string {
 	return string(runes[:maxGitErrorStderrRunes]) + "..."
 }
 
-// worktreeOwnerCheckout resolves the repository that owns a linked worktree
-// from the worktree's gitdir pointer, even when Client.dir is a different clone.
-func worktreeOwnerCheckout(path string) (string, error) {
+// worktreeGitDir resolves the administrative directory named by a linked
+// worktree's .git pointer.
+func worktreeGitDir(path string) (string, error) {
 	data, err := os.ReadFile(filepath.Join(path, ".git"))
 	if err != nil {
 		return "", err
@@ -741,7 +1035,16 @@ func worktreeOwnerCheckout(path string) (string, error) {
 	if !filepath.IsAbs(gitDir) {
 		gitDir = filepath.Join(path, gitDir)
 	}
-	gitDir = filepath.Clean(gitDir)
+	return filepath.Clean(gitDir), nil
+}
+
+// worktreeOwnerCheckout resolves the repository that owns a linked worktree
+// from the worktree's gitdir pointer, even when Client.dir is a different clone.
+func worktreeOwnerCheckout(path string) (string, error) {
+	gitDir, err := worktreeGitDir(path)
+	if err != nil {
+		return "", err
+	}
 	worktreesDir := filepath.Dir(gitDir)
 	if filepath.Base(worktreesDir) != "worktrees" {
 		return "", fmt.Errorf("worktree %s has unexpected gitdir %s", path, gitDir)

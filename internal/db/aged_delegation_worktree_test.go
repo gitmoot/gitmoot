@@ -116,3 +116,56 @@ func TestJobIDsWithAgedTerminalDelegationWorktree(t *testing.T) {
 		}
 	}
 }
+
+func TestAgedDelegationReclaimBatchIsBoundedAndPersistentlyFair(t *testing.T) {
+	ctx := context.Background()
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+
+	old := time.Now().UTC().Add(-96 * time.Hour)
+	total := delegationWorktreeReclaimCandidateLimit + 1
+	paths := make(map[string]string, total)
+	for i := 0; i < total; i++ {
+		jobID := fmt.Sprintf("aged-%04d", i)
+		path := filepath.Join("/tmp", jobID)
+		paths[jobID] = path
+		if err := store.CreateJob(ctx, Job{
+			ID: jobID, Agent: "reader", Type: "ask", State: "failed",
+			Payload: fmt.Sprintf(`{"worktree_path":%q,"read_only_worktree":true}`, path),
+		}); err != nil {
+			t.Fatalf("CreateJob(%s): %v", jobID, err)
+		}
+	}
+	oldStamp := old.Format("2006-01-02 15:04:05")
+	if _, err := store.db.ExecContext(ctx, `UPDATE jobs SET created_at = ?, updated_at = ? WHERE id LIKE 'aged-%'`, oldStamp, oldStamp); err != nil {
+		t.Fatalf("backdate jobs: %v", err)
+	}
+	cutoff := time.Now().UTC().Add(-72 * time.Hour)
+	first, err := store.JobIDsWithAgedTerminalDelegationWorktree(ctx, cutoff)
+	if err != nil {
+		t.Fatalf("first query: %v", err)
+	}
+	if len(first) != delegationWorktreeReclaimCandidateLimit {
+		t.Fatalf("first batch = %d, want %d", len(first), delegationWorktreeReclaimCandidateLimit)
+	}
+	now := time.Now().UTC()
+	firstSet := make(map[string]bool, len(first))
+	for _, jobID := range first {
+		firstSet[jobID] = true
+		if _, err := store.DeferCleanupObligation(
+			ctx, jobID, paths[jobID], CleanupReasonTerminalDeferred, now, now.Add(time.Hour),
+		); err != nil {
+			t.Fatalf("DeferCleanupObligation(%s): %v", jobID, err)
+		}
+	}
+	second, err := store.JobIDsWithAgedTerminalDelegationWorktree(ctx, cutoff)
+	if err != nil {
+		t.Fatalf("second query: %v", err)
+	}
+	if len(second) != 1 || firstSet[second[0]] {
+		t.Fatalf("second batch = %v, want the one candidate outside the first batch", second)
+	}
+}

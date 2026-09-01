@@ -169,10 +169,15 @@ type Engine struct {
 	// still be writing to the worktree. Removing it then would orphan the live worker
 	// onto a deleted cwd — the original #536 corruption shifted to the lease boundary.
 	// Optional and nil-safe: when nil the engine uses the default best-effort /proc
-	// cwd scan (defaultWorktreeHasLiveProcess); tests inject a fake. On a healthy
+	// cwd scan exposed by WorktreeHasLiveProcess; tests inject a fake. On a healthy
 	// terminal the worker has already exited, so the probe reports false and cleanup
 	// proceeds unchanged.
 	WorktreeHasLiveProcess func(path string) bool
+	// WorktreeLiveness is the proof-bearing form used by terminal task reclaim.
+	// known=false is a hard keep decision because an unreadable process table or
+	// cwd link cannot prove that unlinking is safe. WorktreeHasLiveProcess remains
+	// the compatibility seam for existing cleanup tests and callers.
+	WorktreeLiveness func(path string) (live bool, known bool)
 	// CanaryEnabled gates the #484 canary ROUTING seam (Mailbox.routeCanary) on the
 	// SAME [skillopt] policy.CanaryEnabled() the daemon's regression comparator
 	// (daemonOutcomeHarvesterWithCanary) is gated on, so both seams turn on/off

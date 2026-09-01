@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/rand"
 	"os/exec"
 	"path/filepath"
@@ -4434,6 +4435,63 @@ func TestJobIDsWithPendingDelegationWorktreeReclaim(t *testing.T) {
 	}
 }
 
+// The candidate set is a host-wide bounded batch. Deferring one batch writes the
+// fairness cursor into cleanup_obligations.next_attempt_at, so a later job cannot
+// be starved by the same lexicographically earlier IDs on every daemon tick.
+func TestPendingDelegationReclaimBatchIsBoundedAndPersistentlyFair(t *testing.T) {
+	ctx := context.Background()
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+
+	total := delegationWorktreeReclaimCandidateLimit + 1
+	paths := make(map[string]string, total)
+	for i := 0; i < total; i++ {
+		jobID := fmt.Sprintf("reclaim-%04d", i)
+		path := filepath.Join("/tmp", jobID)
+		paths[jobID] = path
+		if err := store.CreateJob(ctx, Job{
+			ID: jobID, Agent: "reader", Type: "ask", State: "failed",
+			Payload: fmt.Sprintf(`{"worktree_path":%q,"read_only_worktree":true}`, path),
+		}); err != nil {
+			t.Fatalf("CreateJob(%s): %v", jobID, err)
+		}
+		if err := store.AddJobEvent(ctx, JobEvent{
+			JobID: jobID, Kind: "delegation_worktree_cleanup_skipped", Message: "pending",
+		}); err != nil {
+			t.Fatalf("AddJobEvent(%s): %v", jobID, err)
+		}
+	}
+
+	first, err := store.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
+	if err != nil {
+		t.Fatalf("first query: %v", err)
+	}
+	if len(first) != delegationWorktreeReclaimCandidateLimit {
+		t.Fatalf("first batch = %d, want %d", len(first), delegationWorktreeReclaimCandidateLimit)
+	}
+	now := time.Now().UTC()
+	firstSet := make(map[string]bool, len(first))
+	for _, jobID := range first {
+		firstSet[jobID] = true
+		if _, err := store.DeferCleanupObligation(
+			ctx, jobID, paths[jobID], CleanupReasonTerminalDeferred, now, now.Add(time.Hour),
+		); err != nil {
+			t.Fatalf("DeferCleanupObligation(%s): %v", jobID, err)
+		}
+	}
+
+	second, err := store.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
+	if err != nil {
+		t.Fatalf("second query: %v", err)
+	}
+	if len(second) != 1 || firstSet[second[0]] {
+		t.Fatalf("second batch = %v, want the one candidate outside the first batch", second)
+	}
+}
+
 // TestJobIDsWithPendingDelegationWorktreeReclaimRaceSafe exercises the bounded
 // reclaim query concurrently with writers that emit and reconcile markers, the
 // way the daemon supervisor tick reads while RunJob/ReclaimTerminalDelegationWorktree
@@ -5026,15 +5084,16 @@ func TestJobEventsKindJobIDCoveringIndexPlan(t *testing.T) {
 	cases := []struct {
 		name  string
 		query string
+		args  []any
 	}{
 		{name: "advance", query: jobIDsWithPendingAdvanceRetrySQL},
 		{name: "comment", query: jobIDsWithPendingCommentRetrySQL},
-		{name: "reclaim", query: jobIDsWithPendingDelegationWorktreeReclaimSQL},
+		{name: "reclaim", query: jobIDsWithPendingDelegationWorktreeReclaimSQL, args: []any{delegationWorktreeReclaimCandidateLimit}},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			plan := explainQueryPlan(t, store, tc.query)
+			plan := explainQueryPlan(t, store, tc.query, tc.args...)
 			if !strings.Contains(plan, "COVERING INDEX idx_job_events_kind_job_id") {
 				t.Fatalf("plan does not use the covering index:\n%s", plan)
 			}

@@ -1656,8 +1656,8 @@ func (s *Store) LatestJobEventsOfKinds(ctx context.Context, kinds []string) (map
 // collects them into a slice. The bounded-candidate passes (#598) and the
 // delegation-worktree reclaim pass all share this identical rows-scan boilerplate;
 // each supplies its own SELECT and defers the row handling here.
-func (s *Store) jobIDsByQuery(ctx context.Context, query string) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, query)
+func (s *Store) jobIDsByQuery(ctx context.Context, query string, args ...any) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1678,6 +1678,8 @@ func (s *Store) jobIDsByQuery(ctx context.Context, query string) ([]string, erro
 // so the covering-index plan test (TestJobEventsKindJobIDCoveringIndexPlan) EXPLAINs
 // the PRODUCTION query text — not a hand-copied duplicate — for each. A change to any
 // of these queries is then exactly what the covering-index test asserts a plan for.
+const delegationWorktreeReclaimCandidateLimit = 256
+
 const (
 	jobIDsWithPendingDelegationWorktreeReclaimSQL = `SELECT e.job_id FROM job_events e
 		JOIN jobs j ON j.id = e.job_id
@@ -1695,7 +1697,8 @@ const (
 			o.state IN ('pending', 'retryable')
 			AND unixepoch(o.next_attempt_at) <= unixepoch('now')
 		  ))
-		ORDER BY e.job_id`
+		ORDER BY COALESCE(unixepoch(o.next_attempt_at), 0), e.job_id
+		LIMIT ?`
 
 	jobIDsWithPendingAdvanceRetrySQL = `SELECT job_id FROM job_events
 		WHERE kind IN ('advance_started', 'advance_retry')
@@ -1737,7 +1740,7 @@ const (
 // is a skip — exactly mirroring the per-job lastCleanupOutcomeIsSkip walk, but
 // set-at-once.
 func (s *Store) JobIDsWithPendingDelegationWorktreeReclaim(ctx context.Context) ([]string, error) {
-	return s.jobIDsByQuery(ctx, jobIDsWithPendingDelegationWorktreeReclaimSQL)
+	return s.jobIDsByQuery(ctx, jobIDsWithPendingDelegationWorktreeReclaimSQL, delegationWorktreeReclaimCandidateLimit)
 }
 
 // JobIDsWithAgedTerminalDelegationWorktree returns final jobs whose recorded
@@ -1805,7 +1808,8 @@ func (s *Store) JobIDsWithAgedTerminalDelegationWorktree(ctx context.Context, cu
 			obligation.state IN ('pending', 'retryable')
 			AND unixepoch(obligation.next_attempt_at) <= unixepoch('now')
 		  ))
-		ORDER BY j.id`, cutoffStr, cutoffStr)
+		ORDER BY COALESCE(unixepoch(obligation.next_attempt_at), j.ts), j.id
+		LIMIT ?`, cutoffStr, cutoffStr, delegationWorktreeReclaimCandidateLimit)
 	if err != nil {
 		return nil, err
 	}

@@ -2372,4 +2372,45 @@ CREATE TABLE pull_request_terminal_settlements (
 CREATE INDEX idx_pull_request_terminal_settlements_task
 	ON pull_request_terminal_settlements(task_id);
 	`,
+	// #1684 disposable clones retained because their object database still holds
+	// unpublished commits. SQLite cannot extend a CHECK in place, so the table is
+	// rebuilt; every existing row keeps its state, reason and retry accounting.
+	`
+ALTER TABLE cleanup_obligations RENAME TO cleanup_obligations_before_unpublished;
+
+CREATE TABLE cleanup_obligations (
+	resource_id TEXT PRIMARY KEY,
+	resource_kind TEXT NOT NULL CHECK(resource_kind = 'delegation_worktree'),
+	owner_job_id TEXT NOT NULL,
+	expected_path TEXT NOT NULL,
+	state TEXT NOT NULL CHECK(state IN ('pending', 'retryable', 'removed', 'quarantined')),
+	reason TEXT NOT NULL CHECK(reason IN (
+		'pending', 'removed', 'operator_reopened', 'terminal_cleanup_deferred',
+		'context_interrupted', 'job_lookup', 'runner_resolution', 'checkout_lock',
+		'identity_or_containment', 'unpublished_commits', 'unknown'
+	)),
+	attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+	next_attempt_at TEXT NOT NULL,
+	last_error TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO cleanup_obligations(
+	resource_id, resource_kind, owner_job_id, expected_path, state, reason,
+	attempt_count, next_attempt_at, last_error, created_at, updated_at
+)
+SELECT
+	resource_id, resource_kind, owner_job_id, expected_path, state, reason,
+	attempt_count, next_attempt_at, last_error, created_at, updated_at
+FROM cleanup_obligations_before_unpublished;
+
+DROP TABLE cleanup_obligations_before_unpublished;
+
+CREATE UNIQUE INDEX idx_cleanup_obligations_owner_path
+	ON cleanup_obligations(owner_job_id, expected_path);
+CREATE INDEX idx_cleanup_obligations_due
+	ON cleanup_obligations(state, next_attempt_at, owner_job_id)
+	WHERE state IN ('pending', 'retryable');
+	`,
 }

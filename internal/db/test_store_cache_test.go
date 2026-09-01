@@ -54,6 +54,8 @@ func TestStoreOpenPolicy(t *testing.T) {
 		"TestBackfillGhostSessionJobsReusesReaperAndIsIdempotent":                true,
 		"TestCanaryMigrationOnPreExistingDB":                                     true,
 		"TestCleanupObligationsMigrationFreshAndUpgrade":                         true,
+		"TestCleanupObligationsRebuildPreservesLegacyRows":                       true,
+		"TestMigrationsUpgradeFromPreviousReleasedVersion":                       true,
 		"TestExecBackendAttemptsMigrationFreshAndCached":                         true,
 		"TestExternallyDrivenColumnMigratesOnPreExistingDB":                      true,
 		"TestIncrementalVacuumReclaimsOnlyRequestedPages":                        true,

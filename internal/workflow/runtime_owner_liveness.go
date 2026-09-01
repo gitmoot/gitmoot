@@ -2,6 +2,8 @@ package workflow
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -70,6 +72,38 @@ func (e Engine) ownerPIDLive() func(int64) bool {
 	return defaultOwnerPIDLive
 }
 
+// worktreeLiveness reports both the cwd result and whether the process table was
+// readable. New destructive paths require known=true.
+//
+// WorktreeHasLiveProcess is an INJECTION SEAM, not a downgrade: a caller that
+// wires it is asserting an authoritative answer (tests and recovery callers that
+// already know the process state), so its result is taken as certain. Consulting
+// the host scan instead would make an injected answer depend on the machine the
+// code happens to run on, which is exactly what an injection seam exists to
+// avoid. Production wires neither field and falls through to the strict scan.
+func (e Engine) worktreeLiveness(path string) (live bool, known bool) {
+	if e.WorktreeLiveness != nil {
+		return e.WorktreeLiveness(path)
+	}
+	if e.WorktreeHasLiveProcess != nil {
+		return e.WorktreeHasLiveProcess(path), true
+	}
+	return strictWorktreeLiveness(path)
+}
+
+// worktreeWriterLiveness strengthens the final destructive gate with open-file
+// descriptor detection. Tests may use the same authoritative injection seam as
+// worktreeLiveness; production scans both cwd and /proc/<pid>/fd.
+func (e Engine) worktreeWriterLiveness(path string) (live bool, known bool) {
+	if e.WorktreeLiveness != nil || e.WorktreeHasLiveProcess != nil {
+		return e.worktreeLiveness(path)
+	}
+	if live, known := strictWorktreeLiveness(path); live || !known {
+		return live, known
+	}
+	return worktreeOpenFileLiveness(path, "/proc")
+}
+
 // worktreeHasLiveProcess reports whether a live process on this host still has its
 // working directory inside the worktree at path. It is the lock-independent,
 // PID-reuse- and hostname-rename-immune never-clobber gate the destructive cleanup
@@ -77,21 +111,19 @@ func (e Engine) ownerPIDLive() func(int64) bool {
 // force-removed even after its runtime-session lease has expired and its lock been
 // reaped (#536 finding 1).
 func (e Engine) worktreeHasLiveProcess(path string) bool {
-	if e.WorktreeHasLiveProcess != nil {
-		return e.WorktreeHasLiveProcess(path)
-	}
-	return defaultWorktreeHasLiveProcess(path)
+	live, _ := e.worktreeLiveness(path)
+	return live
 }
 
 // WorktreeLiveness reports whether a live process on this host has its cwd in
-// path and whether the /proc scan was conclusive. A false, false result means
-// the process table could not be read, so safety-sensitive recovery callers must
-// treat the worktree as potentially live.
+// path. It preserves the best-effort contract used by recovery callers:
+// known=false means the process table itself could not be read, while
+// inaccessible foreign-process cwd links are skipped.
 func WorktreeLiveness(path string) (live bool, known bool) {
-	return worktreeLiveness(path, "/proc")
+	return bestEffortWorktreeLiveness(path, "/proc")
 }
 
-// WorktreeHasLiveProcess exposes the same conservative /proc cwd liveness probe
+// WorktreeHasLiveProcess exposes the same best-effort /proc cwd liveness probe
 // used by destructive worktree cleanup to CLI recovery/dispatch paths. It is
 // intentionally best-effort: false means "no same-host cwd owner observed", not a
 // proof that no external process can write.
@@ -100,20 +132,42 @@ func WorktreeHasLiveProcess(path string) bool {
 	return live
 }
 
-// defaultWorktreeHasLiveProcess is a best-effort Linux /proc scan: it returns true
-// when any process's cwd symlink resolves to path or a descendant of it. The codex
-// resume worker in #536 ran with cwd == the delegation worktree, so its presence is
-// the decisive "still writing" signal independent of any lock or PID. On a platform
-// without a readable /proc (e.g. darwin) it returns false — it cannot detect a live
-// worker there, so it favors not stranding the worktree (the lease/lock gate still
-// applies while the lease is unexpired). A worktree mid-removal can report a cwd of
-// "<path> (deleted)"; that suffix is stripped before comparison.
-func defaultWorktreeHasLiveProcess(path string) bool {
-	live, _ := WorktreeLiveness(path)
-	return live
+func strictWorktreeLiveness(path string) (live bool, known bool) {
+	return worktreeLiveness(path, "/proc")
 }
 
 func worktreeLiveness(path string, procRoot string) (live bool, known bool) {
+	return scanWorktreeLiveness(path, procRoot, true)
+}
+
+func bestEffortWorktreeLiveness(path string, procRoot string) (live bool, known bool) {
+	return scanWorktreeLiveness(path, procRoot, false)
+}
+
+const linuxPFKThread = uint64(0x00200000)
+
+func procEntryIsKernelThread(procEntry string) (bool, error) {
+	data, err := os.ReadFile(filepath.Join(procEntry, "stat"))
+	if err != nil {
+		return false, err
+	}
+	stat := string(data)
+	closeParen := strings.LastIndexByte(stat, ')')
+	if closeParen < 0 {
+		return false, errors.New("process stat has no command terminator")
+	}
+	fields := strings.Fields(stat[closeParen+1:])
+	if len(fields) <= 6 {
+		return false, fmt.Errorf("process stat has %d fields after command, want at least 7", len(fields))
+	}
+	flags, err := strconv.ParseUint(fields[6], 10, 64)
+	if err != nil {
+		return false, fmt.Errorf("parse process stat flags: %w", err)
+	}
+	return flags&linuxPFKThread != 0, nil
+}
+
+func scanWorktreeLiveness(path string, procRoot string, requireEveryCWD bool) (live bool, known bool) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return false, true
@@ -127,6 +181,7 @@ func worktreeLiveness(path string, procRoot string) (live bool, known bool) {
 		return false, false
 	}
 	self := os.Getpid()
+	conclusive := true
 	for _, entry := range entries {
 		name := entry.Name()
 		if len(name) == 0 || name[0] < '0' || name[0] > '9' {
@@ -139,7 +194,22 @@ func worktreeLiveness(path string, procRoot string) (live bool, known bool) {
 			continue
 		}
 		cwd, err := os.Readlink(filepath.Join(procRoot, name, "cwd"))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
 		if err != nil {
+			if requireEveryCWD {
+				kernelThread, statErr := procEntryIsKernelThread(filepath.Join(procRoot, name))
+				// A process that exited during the probe cannot be holding a cwd in
+				// the worktree, so its disappearance is irrelevant rather than
+				// inconclusive: the readlink path above already skips ENOENT.
+				if errors.Is(statErr, os.ErrNotExist) {
+					continue
+				}
+				if statErr != nil || !kernelThread {
+					conclusive = false
+				}
+			}
 			continue
 		}
 		cwd = strings.TrimSuffix(strings.TrimSpace(cwd), " (deleted)")
@@ -147,7 +217,63 @@ func worktreeLiveness(path string, procRoot string) (live bool, known bool) {
 			return true, true
 		}
 	}
-	return false, true
+	return false, conclusive
+}
+
+func worktreeOpenFileLiveness(path, procRoot string) (live bool, known bool) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false, true
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	entries, err := os.ReadDir(procRoot)
+	if err != nil {
+		return false, false
+	}
+	self := os.Getpid()
+	conclusive := true
+	for _, entry := range entries {
+		name := entry.Name()
+		if len(name) == 0 || name[0] < '0' || name[0] > '9' {
+			continue
+		}
+		if pid, parseErr := strconv.Atoi(name); parseErr == nil && pid == self {
+			continue
+		}
+		procEntry := filepath.Join(procRoot, name)
+		fds, err := os.ReadDir(filepath.Join(procEntry, "fd"))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			kernelThread, statErr := procEntryIsKernelThread(procEntry)
+			if errors.Is(statErr, os.ErrNotExist) {
+				continue
+			}
+			if statErr != nil || !kernelThread {
+				conclusive = false
+			}
+			continue
+		}
+		for _, fd := range fds {
+			target, err := os.Readlink(filepath.Join(procEntry, "fd", fd.Name()))
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				conclusive = false
+				continue
+			}
+			target = strings.TrimSuffix(strings.TrimSpace(target), " (deleted)")
+			if target == abs || strings.HasPrefix(target, abs+string(os.PathSeparator)) {
+				return true, true
+			}
+		}
+	}
+	return false, conclusive
 }
 
 // defaultOwnerPIDLive probes same-host process liveness via signal 0, mirroring

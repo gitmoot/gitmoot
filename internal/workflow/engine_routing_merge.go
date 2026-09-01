@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -131,7 +130,8 @@ func (e Engine) dispatchFix(ctx context.Context, reviewer string, payload JobPay
 	request.FixWorktree = true
 	if err := e.enqueue(ctx, request); err != nil {
 		if allocation.Created {
-			_ = os.RemoveAll(request.WorktreePath)
+			// Never delete a standalone fix clone: move it aside for the operator.
+			_, _ = SetAsideFixClone(request.WorktreePath)
 		}
 		return err
 	}

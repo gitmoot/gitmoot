@@ -258,6 +258,175 @@ func (s *Store) ClearTaskWorktreePath(ctx context.Context, id string) error {
 	return err
 }
 
+// terminalTaskWorktreeStates is the single lifecycle-state source shared by
+// candidate selection, guarded completion, classification, and workflow rechecks.
+var terminalTaskWorktreeStates = [...]string{
+	"merged",
+	"dismissed",
+	"superseded",
+	"stranded",
+}
+
+var terminalTaskWorktreeStatePlaceholders = strings.TrimSuffix(strings.Repeat("?, ", len(terminalTaskWorktreeStates)), ", ")
+
+const nonFinalJobStatePredicate = "state NOT IN ('succeeded', 'failed', 'cancelled')"
+
+// IsTerminalTaskWorktreeState reports whether task worktree maintenance may
+// consider a lifecycle state terminal.
+func IsTerminalTaskWorktreeState(state string) bool {
+	for _, terminal := range terminalTaskWorktreeStates {
+		if state == terminal {
+			return true
+		}
+	}
+	return false
+}
+
+func terminalTaskWorktreeQueryArgs(prefix ...any) []any {
+	args := make([]any, 0, len(prefix)+len(terminalTaskWorktreeStates))
+	args = append(args, prefix...)
+	for _, state := range terminalTaskWorktreeStates {
+		args = append(args, state)
+	}
+	return args
+}
+
+// TaskIDsWithTerminalWorktree returns task-owned worktrees that are eligible
+// for a safety recheck. A terminal-unremovable event suppresses only the exact
+// normalized task/path episode it classified. A later task event makes the row
+// eligible again.
+func (s *Store) TaskIDsWithTerminalWorktree(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT t.id
+		FROM tasks t
+		WHERE t.state IN (`+terminalTaskWorktreeStatePlaceholders+`)
+		  AND trim(t.worktree_path) <> ''
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM task_events e
+			WHERE e.task_id = t.id
+			  AND e.kind = 'terminal_worktree_unremovable'
+			  AND e.reason = trim(t.worktree_path)
+			  AND trim(e.from_state) = ''
+			  AND trim(e.to_state) = ''
+			  AND NOT EXISTS (
+				SELECT 1 FROM task_events later
+				WHERE later.task_id = t.id AND later.id > e.id
+			  )
+		  )
+		ORDER BY t.id`, terminalTaskWorktreeQueryArgs()...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// TaskHasActiveWorktreeOwner reports whether any non-final job names the task
+// or recorded worktree. A malformed non-final payload is conservatively active
+// because destructive cleanup cannot prove that it names some other worktree.
+func (s *Store) TaskHasActiveWorktreeOwner(ctx context.Context, taskID, path string) (bool, error) {
+	var active bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1
+		FROM jobs
+		WHERE `+nonFinalJobStatePredicate+`
+		  AND CASE
+			WHEN NOT json_valid(payload) THEN 1
+			ELSE (
+				trim(COALESCE(json_extract(payload, '$.task_id'), '')) = ?
+				OR trim(COALESCE(json_extract(payload, '$.worktree_path'), '')) = ?
+			)
+		  END
+	)`, strings.TrimSpace(taskID), strings.TrimSpace(path)).Scan(&active)
+	return active, err
+}
+
+// FirstMalformedNonFinalJob returns one job responsible for the global
+// fail-closed ownership pin, or an empty ID when no such job exists.
+func (s *Store) FirstMalformedNonFinalJob(ctx context.Context) (string, error) {
+	var id string
+	err := s.db.QueryRowContext(ctx, `SELECT id
+		FROM jobs
+		WHERE `+nonFinalJobStatePredicate+`
+		  AND NOT json_valid(payload)
+		ORDER BY id
+		LIMIT 1`).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return id, err
+}
+
+// CompleteTerminalTaskWorktreeReclaim clears the exact task/path after removal
+// and journals completion in one transaction. The caller holds the checkout
+// mutation lock and has already removed this path, so a concurrent lifecycle
+// transition must not leave a non-terminal task pointing at the removed tree.
+// A concurrent path replacement still makes changed false and preserves the
+// newer metadata.
+func (s *Store) CompleteTerminalTaskWorktreeReclaim(ctx context.Context, taskID, path string) (changed bool, err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	result, err := tx.ExecContext(ctx, `UPDATE tasks
+		SET worktree_path = '', updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?
+		  AND trim(worktree_path) = ?`,
+		strings.TrimSpace(taskID), strings.TrimSpace(path))
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected != 1 {
+		if err := tx.Rollback(); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO task_events(task_id, kind, reason)
+		VALUES (?, 'terminal_worktree_reclaimed', ?)`, strings.TrimSpace(taskID), strings.TrimSpace(path)); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ClassifyTerminalTaskWorktreeUnremovable records a terminal classification
+// only while the task still owns the exact path. The candidate query uses this
+// event to avoid retrying a registered-root mismatch every daemon tick.
+func (s *Store) ClassifyTerminalTaskWorktreeUnremovable(ctx context.Context, taskID, path string) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `INSERT INTO task_events(task_id, kind, reason)
+		SELECT id, 'terminal_worktree_unremovable', trim(worktree_path)
+		FROM tasks
+		WHERE id = ?
+		  AND trim(worktree_path) = ?
+		  AND state IN (`+terminalTaskWorktreeStatePlaceholders+`)`,
+		terminalTaskWorktreeQueryArgs(strings.TrimSpace(taskID), strings.TrimSpace(path))...)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	return affected == 1, err
+}
+
 func upsertTask(ctx context.Context, execer sqlExecer, task Task) error {
 	_, err := execer.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch, worktree_path, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)

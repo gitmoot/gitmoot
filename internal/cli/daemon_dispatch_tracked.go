@@ -71,21 +71,21 @@ type inflightDispatch struct {
 // nil-receiver safe (a nil tracker means "untracked / legacy inline path" and
 // behaves as permanently idle with maintenance always due).
 type inflightJobTracker struct {
-	mu                           sync.Mutex
-	wg                           sync.WaitGroup
-	runCtx                       context.Context
-	cancelRun                    context.CancelFunc
-	draining                     bool // set once drain() starts: no new work may begin
-	jobs                         map[string]inflightDispatch
-	checkouts                    map[string]int // key -> holder count (counted to stay robust)
-	runtimes                     map[string]int
-	perRepo                      map[string]int
-	poolRuns                     map[string]bool // repos with a background pool pass in flight
-	errs                         map[string][]error
-	foreignBootRecoveryAt        time.Time
-	agedDelegationWorktreeReapAt time.Time
-	staleTaskLaneLockReapAt      time.Time
-	liveness                     *daemonLivenessSweep
+	mu                         sync.Mutex
+	wg                         sync.WaitGroup
+	runCtx                     context.Context
+	cancelRun                  context.CancelFunc
+	draining                   bool // set once drain() starts: no new work may begin
+	jobs                       map[string]inflightDispatch
+	checkouts                  map[string]int // key -> holder count (counted to stay robust)
+	runtimes                   map[string]int
+	perRepo                    map[string]int
+	poolRuns                   map[string]bool // repos with a background pool pass in flight
+	errs                       map[string][]error
+	foreignBootRecoveryAt      time.Time
+	worktreeReclaimAttemptedAt time.Time
+	staleTaskLaneLockReapAt    time.Time
+	liveness                   *daemonLivenessSweep
 }
 
 func newInflightJobTracker(ctx context.Context) *inflightJobTracker {
@@ -329,24 +329,26 @@ func (t *inflightJobTracker) markForeignBootRecoverySuccessful(now time.Time) {
 	t.foreignBootRecoveryAt = now
 }
 
-// agedDelegationWorktreeReclaimDue gates only the low-frequency TTL backstop.
-// Its zero value is due so daemon start still performs an eager cleanup pass.
-func (t *inflightJobTracker) agedDelegationWorktreeReclaimDue(now time.Time) bool {
+// worktreeReclaimDue gates the low-frequency destructive worktree maintenance
+// pass. Its zero value is due so daemon start still performs an eager pass.
+func (t *inflightJobTracker) worktreeReclaimDue(now time.Time) bool {
 	if t == nil {
 		return true
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return maintenancePassDue(t.agedDelegationWorktreeReapAt, now, agedDelegationWorktreeReclaimInterval)
+	return maintenancePassDue(t.worktreeReclaimAttemptedAt, now, worktreeReclaimInterval)
 }
 
-func (t *inflightJobTracker) markAgedDelegationWorktreeReclaimSuccessful(now time.Time) {
+// markWorktreeReclaimAttempted advances on every bounded pass attempt, including
+// passes with local failures, so a bad candidate cannot make itself hot-loop.
+func (t *inflightJobTracker) markWorktreeReclaimAttempted(now time.Time) {
 	if t == nil {
 		return
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.agedDelegationWorktreeReapAt = now
+	t.worktreeReclaimAttemptedAt = now
 }
 
 // staleTaskLaneLockReclaimDue gates the low-frequency branch-lock lifecycle
