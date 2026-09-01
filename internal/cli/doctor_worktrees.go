@@ -30,7 +30,6 @@ type delegationWorktreeUsage struct {
 	Unproven       int    `json:"unproven"`
 	RecentTerminal int    `json:"recentTerminal"`
 	Quarantined    int    `json:"quarantined"`
-	Fences         int    `json:"fences"`
 	Root           string `json:"root"`
 	Summary        string `json:"summary"`
 }
@@ -108,25 +107,13 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 
 	pathsOnDisk := map[string]struct{}{}
 	quarantineClasses := map[string]delegationWorktreeClass{}
-	// Doctor classifies the same quarantine names the daemon does, so it needs the
-	// same durable fence evidence: without it every fence-shaped file is unproven.
-	fenceOwnership, ownErr := fixCloneFenceOwnershipResolver(ctx, store)
-	if ownErr != nil {
-		return usage, ownErr
-	}
 	scanQuarantines := func(path string, class delegationWorktreeClass) {
-		owned, err := fenceOwnership(path)
-		if err != nil {
-			usage.Unproven++
-			usage.Stale++
-			return
-		}
 		// A fix clone mid-removal lives at a quarantine sibling, not at the recorded
 		// path. Counting only recorded paths hides exactly the directory an
 		// interrupted removal leaves behind. A scan or stat failure is reported as
 		// unproven rather than dropped: silently reporting zero would present an
 		// unreadable directory as a healthy one.
-		quarantines, err := workflow.FixCloneQuarantines(path, owned)
+		quarantines, err := workflow.FixCloneQuarantines(path)
 		if err != nil {
 			usage.Unproven++
 			usage.Stale++
@@ -149,16 +136,6 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 				usage.Stale++
 			}
 		}
-		// Spent fences are reported separately: they hold no bytes, but two
-		// directory entries per reclaimed fix job should be visible rather than
-		// silently accumulating.
-		fences, err := workflow.FixCloneFences(path, owned)
-		if err != nil {
-			usage.Unproven++
-			usage.Stale++
-			return
-		}
-		usage.Fences += len(fences)
 	}
 	for path, class := range owned {
 		if info, err := os.Stat(path); err == nil && info.IsDir() {
@@ -313,7 +290,7 @@ func delegationWorktreeDoctorCheck(paths config.Paths) (doctor.Check, bool) {
 }
 
 func buildDelegationWorktreeDoctorCheck(usage delegationWorktreeUsage) doctor.Check {
-	detail := fmt.Sprintf("%s (%d reclaimable, %d pinned by non-terminal owners, %d unproven; %d recent terminal within TTL; %d cleanup quarantined; %d spent removal fences)", usage.Summary, usage.Reclaimable, usage.Pinned, usage.Unproven, usage.RecentTerminal, usage.Quarantined, usage.Fences)
+	detail := fmt.Sprintf("%s (%d reclaimable, %d pinned by non-terminal owners, %d unproven; %d recent terminal within TTL; %d cleanup quarantined)", usage.Summary, usage.Reclaimable, usage.Pinned, usage.Unproven, usage.RecentTerminal, usage.Quarantined)
 	warn := usage.Stale >= delegationWorktreeWarnCount || usage.SizeBytes >= delegationWorktreeWarnBytes || usage.Quarantined > 0
 	return doctor.Check{Name: "worktrees", OK: !warn, Required: false, Detail: detail}
 }

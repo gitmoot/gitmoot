@@ -622,7 +622,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			if !ready {
 				return e.setReviewingIfNotChangesRequested(ctx, ref)
 			}
-			_, err = e.runMergeGate(ctx, reviewer, payload, ref)
+			_, err = e.runMergeGate(ctx, reviewer, payload, ref, TaskReviewing)
 			return err
 		}
 	}

@@ -596,6 +596,109 @@ func (s *Store) AddTaskEvent(ctx context.Context, event TaskEvent) error {
 	return err
 }
 
+var (
+	ErrTaskStateConflict = errors.New("task state changed before guarded transition")
+	ErrTaskStateClaimed  = errors.New("task state is claimed for an external merge")
+)
+
+const (
+	TaskStateClaimKindExternalMerge          = "external_merge"
+	TaskStateClaimKindExternalMergeUncertain = "external_merge_uncertain"
+)
+
+// BlockTaskWithEvent atomically compares the caller's observed state, persists
+// the blocked task row, and appends the event that owns that block. blocked is
+// true only after both writes commit.
+func (s *Store) BlockTaskWithEvent(ctx context.Context, task Task, event TaskEvent) (blocked bool, err error) {
+	task.ID = strings.TrimSpace(task.ID)
+	if task.ID == "" {
+		return false, errors.New("blocked task id is required")
+	}
+	if strings.TrimSpace(task.State) != "blocked" {
+		return false, fmt.Errorf("blocked task %s has state %q", task.ID, task.State)
+	}
+	event.TaskID = task.ID
+	event.ToState = "blocked"
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	var activeClaim string
+	claimErr := tx.QueryRowContext(ctx, `SELECT token FROM task_state_claims
+		WHERE task_id = ? AND expires_at > CAST(strftime('%s', 'now') AS INTEGER)`, task.ID).Scan(&activeClaim)
+	if claimErr == nil {
+		return false, fmt.Errorf("%w: task %s", ErrTaskStateClaimed, task.ID)
+	}
+	if !errors.Is(claimErr, sql.ErrNoRows) {
+		return false, claimErr
+	}
+
+	var currentState string
+	stateErr := tx.QueryRowContext(ctx, `SELECT state FROM tasks WHERE id = ?`, task.ID).Scan(&currentState)
+	switch {
+	case errors.Is(stateErr, sql.ErrNoRows):
+		if strings.TrimSpace(event.FromState) != "" {
+			return false, fmt.Errorf("%w: task %s no longer exists", ErrTaskStateConflict, task.ID)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch, worktree_path, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+			task.ID, task.RepoFullName, task.GoalID, task.Title, task.State, task.Branch, task.WorktreePath); err != nil {
+			return false, err
+		}
+	case stateErr != nil:
+		return false, stateErr
+	default:
+		switch currentState {
+		case "merged", "dismissed", "superseded", "stranded":
+			return false, fmt.Errorf("%w: task %s is terminal in state %q",
+				ErrTaskStateConflict, task.ID, currentState)
+		}
+		expectedState := strings.TrimSpace(event.FromState)
+		if expectedState == "" || currentState != expectedState {
+			return false, fmt.Errorf("%w: task %s expected %q, current %q",
+				ErrTaskStateConflict, task.ID, expectedState, currentState)
+		}
+		preserveAge := false
+		if event.Kind == "merge_gate_blocked" && expectedState == "ready_to_merge" {
+			var latestKind string
+			if err := tx.QueryRowContext(ctx, `SELECT kind FROM task_events
+				WHERE task_id = ? ORDER BY id DESC LIMIT 1`, task.ID).Scan(&latestKind); err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return false, err
+			} else {
+				preserveAge = latestKind == "merge_gate_transient_retry"
+			}
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE tasks SET
+				repo_full_name = ?, goal_id = ?, title = ?, state = ?, branch = ?,
+				worktree_path = CASE WHEN ? <> '' THEN ? ELSE worktree_path END,
+				updated_at = CASE WHEN ? THEN updated_at ELSE CURRENT_TIMESTAMP END
+			WHERE id = ? AND state = ?`,
+			task.RepoFullName, task.GoalID, task.Title, task.State, task.Branch,
+			task.WorktreePath, task.WorktreePath, preserveAge, task.ID, expectedState)
+		if err != nil {
+			return false, err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return false, err
+		}
+		if affected != 1 {
+			return false, fmt.Errorf("%w: task %s expected %q", ErrTaskStateConflict, task.ID, expectedState)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO task_events(task_id, kind, from_state, to_state, reason)
+		VALUES (?, ?, ?, ?, ?)`, task.ID, event.Kind, event.FromState, event.ToState, event.Reason); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *Store) ListTaskEvents(ctx context.Context, taskID string) ([]TaskEvent, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, task_id, kind, from_state, to_state, reason, created_at
 		FROM task_events WHERE task_id = ? ORDER BY id`, strings.TrimSpace(taskID))
@@ -640,11 +743,310 @@ func (s *Store) CompareAndSwapTaskState(ctx context.Context, taskID, from, to st
 	return false, currentState, nil
 }
 
+// RevalidateTaskState performs a single-statement compare without changing the
+// task or refreshing updated_at. It is used immediately before an external side
+// effect when an earlier read selected the task by identity.
+func (s *Store) RevalidateTaskState(ctx context.Context, taskID string, expected string) (matched bool, currentState string, err error) {
+	taskID = strings.TrimSpace(taskID)
+	expected = strings.TrimSpace(expected)
+	result, err := s.db.ExecContext(ctx, `UPDATE tasks SET state = state WHERE id = ? AND state = ?`, taskID, expected)
+	if err != nil {
+		return false, "", err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, "", err
+	}
+	if affected > 0 {
+		return true, expected, nil
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT state FROM tasks WHERE id = ?`, taskID).Scan(&currentState); err != nil {
+		return false, "", err
+	}
+	return false, currentState, nil
+}
+
+// HasTaskStateClaim reports whether a task has a durable external-merge claim.
+// Terminal PR-group reconciliation uses it to select the one claim-owning task
+// that may execute per-PR post-merge effects.
+func (s *Store) HasTaskStateClaim(ctx context.Context, taskID string) (bool, error) {
+	var exists int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM task_state_claims WHERE task_id = ?`,
+		strings.TrimSpace(taskID)).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ClaimTaskState durably fences every state-changing SQL writer across Store
+// handles and processes while an irreversible external operation is in flight.
+// The schema trigger enforces the claim; the token restricts completion to its
+// owner. Expired claims are reclaimed at acquisition.
+func (s *Store) ClaimTaskState(ctx context.Context, taskID, expectedState, kind string, ttl time.Duration) (token string, claimed bool, currentState string, err error) {
+	taskID = strings.TrimSpace(taskID)
+	expectedState = strings.TrimSpace(expectedState)
+	kind = strings.TrimSpace(kind)
+	if taskID == "" || expectedState == "" || kind == "" {
+		return "", false, "", errors.New("task claim requires task id, expected state, and kind")
+	}
+	ttlSeconds, err := taskStateClaimTTLSeconds(ttl)
+	if err != nil {
+		return "", false, "", err
+	}
+	token, err = newTaskStateClaimToken()
+	if err != nil {
+		return "", false, "", err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", false, "", err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM task_state_claims
+		WHERE task_id = ? AND kind <> ? AND expires_at <= CAST(strftime('%s', 'now') AS INTEGER)`,
+		taskID, TaskStateClaimKindExternalMergeUncertain); err != nil {
+		return "", false, "", err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT state FROM tasks WHERE id = ?`, taskID).Scan(&currentState); err != nil {
+		return "", false, "", err
+	}
+	if currentState != expectedState {
+		return "", false, currentState, tx.Commit()
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO task_state_claims(
+			task_id, kind, token, expected_state, acquired_at, expires_at
+		) VALUES (?, ?, ?, ?, CAST(strftime('%s', 'now') AS INTEGER),
+			CAST(strftime('%s', 'now') AS INTEGER) + ?)`,
+		taskID, kind, token, expectedState, ttlSeconds)
+	if err != nil {
+		var existing int
+		if queryErr := tx.QueryRowContext(ctx, `SELECT 1 FROM task_state_claims
+			WHERE task_id = ? AND (kind = ? OR expires_at > CAST(strftime('%s', 'now') AS INTEGER))`,
+			taskID, TaskStateClaimKindExternalMergeUncertain).Scan(&existing); queryErr == nil {
+			return "", false, currentState, fmt.Errorf("%w: task %s", ErrTaskStateClaimed, taskID)
+		}
+		return "", false, currentState, err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", false, currentState, err
+	}
+	return token, true, currentState, nil
+}
+
+func taskStateClaimTTLSeconds(ttl time.Duration) (int64, error) {
+	if ttl <= 0 {
+		return 0, errors.New("task claim ttl must be positive")
+	}
+	seconds := int64(ttl / time.Second)
+	if ttl%time.Second != 0 {
+		seconds++
+	}
+	if seconds == 0 {
+		seconds = 1
+	}
+	return seconds, nil
+}
+
+// ReleaseTaskStateClaim abandons an uncompleted external operation. The token
+// prevents one claimant from releasing a later claimant's lease.
+func (s *Store) ReleaseTaskStateClaim(ctx context.Context, taskID, token string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM task_state_claims WHERE task_id = ? AND token = ?`,
+		strings.TrimSpace(taskID), strings.TrimSpace(token))
+	return err
+}
+
+// RenewTaskStateClaim extends an active claim from the database clock. A claim
+// that already expired or changed owners is never revived.
+func (s *Store) RenewTaskStateClaim(ctx context.Context, taskID, token string, ttl time.Duration) (bool, error) {
+	ttlSeconds, err := taskStateClaimTTLSeconds(ttl)
+	if err != nil {
+		return false, err
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE task_state_claims
+		SET expires_at = CAST(strftime('%s', 'now') AS INTEGER) + ?
+		WHERE task_id = ? AND token = ? AND kind <> ?
+			AND expires_at > CAST(strftime('%s', 'now') AS INTEGER)`,
+		ttlSeconds, strings.TrimSpace(taskID), strings.TrimSpace(token),
+		TaskStateClaimKindExternalMergeUncertain)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	return affected == 1, err
+}
+
+// RetainTaskStateClaim marks an unresolved external outcome as non-expiring.
+// The state check and kind change share one SQL statement: either a writer won
+// after lease expiry, or every later writer observes the retained claim.
+func (s *Store) RetainTaskStateClaim(ctx context.Context, taskID, token, expectedState, retainedKind string) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE task_state_claims
+		SET kind = ?
+		WHERE task_id = ? AND token = ? AND expected_state = ?
+			AND EXISTS (SELECT 1 FROM tasks WHERE id = ? AND state = ?)`,
+		strings.TrimSpace(retainedKind), strings.TrimSpace(taskID), strings.TrimSpace(token),
+		strings.TrimSpace(expectedState), strings.TrimSpace(taskID), strings.TrimSpace(expectedState))
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	return affected == 1, err
+}
+
+// ReleaseRetainedTaskStateClaim resolves a retained claim after the caller has
+// authoritatively observed that the remote operation cannot still occur.
+// The expected-state check prevents clearing ownership after a local transition.
+func (s *Store) ReleaseRetainedTaskStateClaim(ctx context.Context, taskID, expectedState, retainedKind string) (released bool, currentState string, err error) {
+	taskID = strings.TrimSpace(taskID)
+	expectedState = strings.TrimSpace(expectedState)
+	retainedKind = strings.TrimSpace(retainedKind)
+	if taskID == "" || expectedState == "" || retainedKind == "" {
+		return false, "", errors.New("retained task claim release requires task id, expected state, and claim kind")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, "", err
+	}
+	defer tx.Rollback()
+	if err := tx.QueryRowContext(ctx, `SELECT state FROM tasks WHERE id = ?`, taskID).Scan(&currentState); err != nil {
+		return false, "", err
+	}
+	if currentState != expectedState {
+		return false, currentState, tx.Commit()
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM task_state_claims WHERE task_id = ? AND kind = ?`,
+		taskID, retainedKind)
+	if err != nil {
+		return false, currentState, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, currentState, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, currentState, err
+	}
+	return affected == 1, currentState, nil
+}
+
+// CompleteTaskStateClaim atomically removes the caller's claim, applies the
+// claimed state transition, and records its event.
+func (s *Store) CompleteTaskStateClaim(ctx context.Context, taskID, token, to, kind, reason string) (changed bool, currentState string, err error) {
+	taskID = strings.TrimSpace(taskID)
+	token = strings.TrimSpace(token)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, "", err
+	}
+	defer tx.Rollback()
+	var claimToken, expectedState string
+	if err := tx.QueryRowContext(ctx, `SELECT token, expected_state FROM task_state_claims WHERE task_id = ?`,
+		taskID).Scan(&claimToken, &expectedState); err != nil {
+		return false, "", err
+	}
+	if claimToken != token {
+		return false, "", fmt.Errorf("%w: task %s claim token changed", ErrTaskStateClaimed, taskID)
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT state FROM tasks WHERE id = ?`, taskID).Scan(&currentState); err != nil {
+		return false, "", err
+	}
+	if currentState != expectedState {
+		return false, currentState, fmt.Errorf("%w: task %s expected %q, current %q",
+			ErrTaskStateConflict, taskID, expectedState, currentState)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM task_state_claims WHERE task_id = ? AND token = ?`, taskID, token); err != nil {
+		return false, currentState, err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE tasks SET state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`,
+		strings.TrimSpace(to), taskID, expectedState)
+	if err != nil {
+		return false, currentState, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, currentState, err
+	}
+	if affected != 1 {
+		return false, currentState, fmt.Errorf("%w: task %s expected %q", ErrTaskStateConflict, taskID, expectedState)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO task_events(task_id, kind, from_state, to_state, reason)
+		VALUES (?, ?, ?, ?, ?)`, taskID, strings.TrimSpace(kind), expectedState, strings.TrimSpace(to), strings.TrimSpace(reason)); err != nil {
+		return false, currentState, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, currentState, err
+	}
+	return true, strings.TrimSpace(to), nil
+}
+
+// RecoverClaimedTaskState applies a remotely observed terminal fact after a
+// claimant crashed between the external operation and local finalization. Any
+// surviving claim is removed in the same transaction as the reconciled state.
+func (s *Store) RecoverClaimedTaskState(ctx context.Context, taskID, to, kind, reason string) (changed bool, currentState string, err error) {
+	taskID = strings.TrimSpace(taskID)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, "", err
+	}
+	defer tx.Rollback()
+	var claimToken string
+	if err := tx.QueryRowContext(ctx, `SELECT token FROM task_state_claims WHERE task_id = ?`, taskID).Scan(&claimToken); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			if stateErr := tx.QueryRowContext(ctx, `SELECT state FROM tasks WHERE id = ?`, taskID).Scan(&currentState); stateErr != nil {
+				return false, "", stateErr
+			}
+			return false, currentState, tx.Commit()
+		}
+		return false, "", err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT state FROM tasks WHERE id = ?`, taskID).Scan(&currentState); err != nil {
+		return false, "", err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM task_state_claims WHERE task_id = ?`, taskID); err != nil {
+		return false, currentState, err
+	}
+	to = strings.TrimSpace(to)
+	if currentState == to {
+		return false, currentState, tx.Commit()
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE tasks SET state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`,
+		to, taskID, currentState)
+	if err != nil {
+		return false, currentState, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, currentState, err
+	}
+	if affected != 1 {
+		return false, currentState, fmt.Errorf("%w: task %s changed during claim recovery", ErrTaskStateConflict, taskID)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO task_events(task_id, kind, from_state, to_state, reason)
+		VALUES (?, ?, ?, ?, ?)`, taskID, strings.TrimSpace(kind), currentState, to, strings.TrimSpace(reason)); err != nil {
+		return false, currentState, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, currentState, err
+	}
+	return true, to, nil
+}
+
 // TransitionTaskStateWithEvent atomically compares and moves a task state and
 // appends its audit event. A failed comparison writes no event and returns the
 // current state so callers can distinguish idempotence from a conflicting move.
 func (s *Store) TransitionTaskStateWithEvent(ctx context.Context, taskID string, fromStates []string, to string, kind string, reason string) (changed bool, currentState string, err error) {
-	changed, _, currentState, err = s.transitionTaskStateWithEvent(ctx, taskID, fromStates, to, kind, reason, false)
+	changed, _, currentState, err = s.transitionTaskStateWithEvent(ctx, taskID, fromStates, to, kind, reason, false, false, time.Time{})
+	return changed, currentState, err
+}
+
+// TransitionTaskStateWithEventPreserveAgeAt records a retry transition without
+// refreshing the task's lifecycle age. The explicit event timestamp lets a
+// daemon clock enforce retry cadence deterministically.
+func (s *Store) TransitionTaskStateWithEventPreserveAgeAt(ctx context.Context, taskID string, fromStates []string, to string, kind string, reason string, at time.Time) (changed bool, currentState string, err error) {
+	changed, _, currentState, err = s.transitionTaskStateWithEvent(ctx, taskID, fromStates, to, kind, reason, false, true, at)
 	return changed, currentState, err
 }
 
@@ -653,7 +1055,7 @@ func (s *Store) TransitionTaskStateWithEvent(ctx context.Context, taskID string,
 // observed before it attempted the update. Callers that need follow-up cleanup
 // tied to the actual transition, rather than a stale pre-read, should use it.
 func (s *Store) TransitionTaskStateWithEventObserved(ctx context.Context, taskID string, fromStates []string, to string, kind string, reason string) (changed bool, observedState string, currentState string, err error) {
-	return s.transitionTaskStateWithEvent(ctx, taskID, fromStates, to, kind, reason, false)
+	return s.transitionTaskStateWithEvent(ctx, taskID, fromStates, to, kind, reason, false, false, time.Time{})
 }
 
 // TransitionTaskStateWithEventIfNoActiveJob adds a queued/running job guard to
@@ -661,7 +1063,7 @@ func (s *Store) TransitionTaskStateWithEventObserved(ctx context.Context, taskID
 // checks before entering this transaction; this guard closes the window in
 // which a newly queued/running job could acquire the task.
 func (s *Store) TransitionTaskStateWithEventIfNoActiveJob(ctx context.Context, taskID string, fromStates []string, to string, kind string, reason string) (changed bool, currentState string, err error) {
-	changed, _, currentState, err = s.transitionTaskStateWithEvent(ctx, taskID, fromStates, to, kind, reason, true)
+	changed, _, currentState, err = s.transitionTaskStateWithEvent(ctx, taskID, fromStates, to, kind, reason, true, false, time.Time{})
 	return changed, currentState, err
 }
 
@@ -756,7 +1158,7 @@ func insertTaskDisposalEscalationTx(ctx context.Context, tx *sql.Tx, event, role
 	return nil
 }
 
-func (s *Store) transitionTaskStateWithEvent(ctx context.Context, taskID string, fromStates []string, to string, kind string, reason string, rejectActiveJob bool) (changed bool, observedState string, currentState string, err error) {
+func (s *Store) transitionTaskStateWithEvent(ctx context.Context, taskID string, fromStates []string, to string, kind string, reason string, rejectActiveJob bool, preserveUpdatedAt bool, eventAt time.Time) (changed bool, observedState string, currentState string, err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, "", "", err
@@ -786,8 +1188,10 @@ func (s *Store) transitionTaskStateWithEvent(ctx context.Context, taskID string,
 			return false, observedState, observedState, fmt.Errorf("%w: %s", ErrTaskHasActiveJob, jobID)
 		}
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE tasks SET state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`,
-		strings.TrimSpace(to), strings.TrimSpace(taskID), observedState)
+	result, err := tx.ExecContext(ctx, `UPDATE tasks
+		SET state = ?, updated_at = CASE WHEN ? THEN updated_at ELSE CURRENT_TIMESTAMP END
+		WHERE id = ? AND state = ?`,
+		strings.TrimSpace(to), preserveUpdatedAt, strings.TrimSpace(taskID), observedState)
 	if err != nil {
 		return false, observedState, "", err
 	}
@@ -801,8 +1205,14 @@ func (s *Store) transitionTaskStateWithEvent(ctx context.Context, taskID string,
 		}
 		return false, observedState, currentState, tx.Commit()
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO task_events(task_id, kind, from_state, to_state, reason)
-		VALUES (?, ?, ?, ?, ?)`, strings.TrimSpace(taskID), strings.TrimSpace(kind), observedState, strings.TrimSpace(to), strings.TrimSpace(reason)); err != nil {
+	if eventAt.IsZero() {
+		_, err = tx.ExecContext(ctx, `INSERT INTO task_events(task_id, kind, from_state, to_state, reason)
+			VALUES (?, ?, ?, ?, ?)`, strings.TrimSpace(taskID), strings.TrimSpace(kind), observedState, strings.TrimSpace(to), strings.TrimSpace(reason))
+	} else {
+		_, err = tx.ExecContext(ctx, `INSERT INTO task_events(task_id, kind, from_state, to_state, reason, created_at)
+			VALUES (?, ?, ?, ?, ?, ?)`, strings.TrimSpace(taskID), strings.TrimSpace(kind), observedState, strings.TrimSpace(to), strings.TrimSpace(reason), eventAt.UTC().Format(time.RFC3339Nano))
+	}
+	if err != nil {
 		return false, observedState, "", err
 	}
 	if err := tx.Commit(); err != nil {

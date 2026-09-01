@@ -11,7 +11,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1620,6 +1619,7 @@ func TestEngineReclaimAgedFixCloneRequiresPublishedObjectDatabase(t *testing.T) 
 		want            bool
 		wantErr         string
 		wantRetained    bool
+		wantProved      bool
 	}{
 		{name: "dirty", clean: false},
 		{name: "unpublished side branch", clean: true, unpublished: "deadbeef", wantRetained: true},
@@ -1627,7 +1627,9 @@ func TestEngineReclaimAgedFixCloneRequiresPublishedObjectDatabase(t *testing.T) 
 		{name: "trusted remote url error", clean: true, remoteURLErr: errors.New("no origin"), wantErr: "resolve trusted remote url"},
 		{name: "proof refresh error", clean: true, refreshErr: errors.New("fetch failed"), wantErr: "refresh trusted remote refs"},
 		{name: "clone-only probe error", clean: true, cloneOnlyErr: errors.New("rev-list failed"), wantErr: "holds no unpublished commits"},
-		{name: "fully published clone", clean: true, requireDeadline: true, want: true},
+		// A fully proved clone is no longer deleted: it is handed to an operator, so
+		// the pass reports "not reclaimed" and leaves the directory in place.
+		{name: "fully published clone", clean: true, requireDeadline: true, wantProved: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -1687,18 +1689,29 @@ func TestEngineReclaimAgedFixCloneRequiresPublishedObjectDatabase(t *testing.T) 
 			if reclaimed != tc.want {
 				t.Fatalf("reclaimed = %v, want %v", reclaimed, tc.want)
 			}
-			_, statErr := os.Stat(path)
-			if tc.want && !os.IsNotExist(statErr) {
-				t.Fatalf("eligible fix clone remains: %v", statErr)
+			if _, statErr := os.Stat(path); statErr != nil {
+				t.Fatalf("fix clone was removed; automatic removal is disabled: %v", statErr)
 			}
-			if !tc.want && statErr != nil {
-				t.Fatalf("ineligible fix clone was removed: %v", statErr)
+			if tc.wantProved {
+				events, eventsErr := store.ListJobEvents(ctx, jobID)
+				if eventsErr != nil {
+					t.Fatalf("ListJobEvents: %v", eventsErr)
+				}
+				proved := false
+				for _, event := range events {
+					if event.Kind == "delegation_worktree_reclaimable_manual" {
+						proved = true
+					}
+				}
+				if !proved {
+					t.Fatalf("a fully proved clone did not reach the operator handoff: %+v", events)
+				}
 			}
-			leftovers, quarantineErr := FixCloneQuarantines(path, storeFenceOwnership(t, store, jobID))
+			leftovers, quarantineErr := FixCloneQuarantines(path)
 			if quarantineErr != nil || len(leftovers) != 0 {
 				t.Fatalf("quarantines survived the pass: %v (err %v)", leftovers, quarantineErr)
 			}
-			if tc.want && len(manager.refreshedURLs) == 0 {
+			if tc.wantProved && len(manager.refreshedURLs) == 0 {
 				t.Fatal("removal proof never refreshed the trusted remote refs")
 			}
 			for _, url := range manager.refreshedURLs {
@@ -1966,427 +1979,6 @@ func TestEngineReclaimAgedFixCloneRetainsIgnoredNestedRepositories(t *testing.T)
 	}
 }
 
-// TestEngineReclaimAgedFixCloneQuarantinesBeforeRemoval pins the atomicity
-// boundary: a commit that lands after the first proof is caught by the proof
-// repeated on the quarantined copy, and the clone is put back where it was.
-func TestEngineReclaimAgedFixCloneQuarantinesBeforeRemoval(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	home := t.TempDir()
-	jobID := "fix-quarantine-race"
-	path, err := FixWorktreePath(home, "owner/repo", jobID)
-	if err != nil {
-		t.Fatalf("FixWorktreePath: %v", err)
-	}
-	if err := os.MkdirAll(path, 0o755); err != nil {
-		t.Fatalf("MkdirAll fix worktree: %v", err)
-	}
-	marker := filepath.Join(path, "marker")
-	if err := os.WriteFile(marker, []byte("clone\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile marker: %v", err)
-	}
-	payload, err := marshalPayload(JobPayload{
-		Repo:         "owner/repo",
-		Branch:       "feature/fix",
-		WorktreePath: path,
-		FixWorktree:  true,
-	})
-	if err != nil {
-		t.Fatalf("marshalPayload: %v", err)
-	}
-	if err := store.CreateJobWithEvent(ctx, db.Job{
-		ID:      jobID,
-		Agent:   "fixer",
-		Type:    "implement",
-		State:   string(JobSucceeded),
-		Repo:    "owner/repo",
-		Payload: payload,
-	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
-		t.Fatalf("CreateJobWithEvent: %v", err)
-	}
-	manager := &fakeWorktreeManager{
-		cleanSet:  true,
-		clean:     true,
-		cloneOnly: map[string]string{path: ""},
-	}
-	// The first proof sees a published clone; a commit then lands, which only the
-	// re-proof on the quarantined copy can observe. The quarantine name is random,
-	// so the default answer covers it.
-	manager.cloneOnlyHook = func(probed string) {
-		if probed == path {
-			manager.cloneOnlyDefault = "racing-commit"
-		}
-	}
-	engine := testEngine(store)
-	engine.Home = home
-	engine.DelegationCheckout = t.TempDir()
-	engine.DelegationWorktrees = manager
-
-	reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
-	if err != nil {
-		t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
-	}
-	if reclaimed {
-		t.Fatal("clone with a commit landing after the first proof was reclaimed")
-	}
-	if _, statErr := os.Stat(marker); statErr != nil {
-		t.Fatalf("restored clone lost its content: %v", statErr)
-	}
-	leftovers, quarantineErr := FixCloneQuarantines(path, storeFenceOwnership(t, store, jobID))
-	if quarantineErr != nil || len(leftovers) != 0 {
-		t.Fatalf("clone was left quarantined: %v (err %v)", leftovers, quarantineErr)
-	}
-	if len(manager.cloneOnlyCalls) < 2 || manager.cloneOnlyCalls[1] == path {
-		t.Fatalf("clone-only probes = %v, want a re-proof on the quarantined path", manager.cloneOnlyCalls)
-	}
-}
-
-// The final root reachability proof is itself a writer-capable operation. A
-// nested repository created during it must move across the sealed rename, be
-// caught by the last content scan, and restore the clone before RemoveAll.
-func TestEngineReclaimAgedFixCloneRechecksNestedRepositoriesAfterQuarantine(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	home := t.TempDir()
-	jobID := "fix-nested-quarantine-race"
-	path, err := FixWorktreePath(home, "owner/repo", jobID)
-	if err != nil {
-		t.Fatalf("FixWorktreePath: %v", err)
-	}
-	if err := os.MkdirAll(path, 0o755); err != nil {
-		t.Fatalf("MkdirAll fix worktree: %v", err)
-	}
-	payload, err := marshalPayload(JobPayload{
-		Repo: "owner/repo", Branch: "feature/fix", WorktreePath: path, FixWorktree: true,
-	})
-	if err != nil {
-		t.Fatalf("marshalPayload: %v", err)
-	}
-	if err := store.CreateJobWithEvent(ctx, db.Job{
-		ID: jobID, Agent: "fixer", Type: "implement", State: string(JobSucceeded),
-		Repo: "owner/repo", Payload: payload,
-	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
-		t.Fatalf("CreateJobWithEvent: %v", err)
-	}
-	manager := &fakeWorktreeManager{cleanSet: true, clean: true}
-	manager.cloneOnlyHook = func(probed string) {
-		if probed == path {
-			return
-		}
-		nested := filepath.Join(probed, "late", ".git")
-		if err := os.MkdirAll(nested, 0o755); err != nil {
-			t.Fatalf("MkdirAll late nested repository: %v", err)
-		}
-	}
-	engine := testEngine(store)
-	engine.Home = home
-	engine.DelegationCheckout = t.TempDir()
-	engine.DelegationWorktrees = manager
-
-	reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
-	if err != nil {
-		t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
-	}
-	if reclaimed {
-		t.Fatal("clone with a nested repository landing during the final root proof was reclaimed")
-	}
-	if _, err := os.Stat(filepath.Join(path, "late", ".git")); err != nil {
-		t.Fatalf("restored clone lost late nested repository: %v", err)
-	}
-	if len(manager.cloneOnlyCalls) != 2 || manager.cloneOnlyCalls[1] == path {
-		t.Fatalf("clone-only probes = %v, want the race injected during the quarantined final proof", manager.cloneOnlyCalls)
-	}
-	leftovers, err := FixCloneQuarantines(path, storeFenceOwnership(t, store, jobID))
-	if err != nil || len(leftovers) != 0 {
-		t.Fatalf("clone was left quarantined: %v (err %v)", leftovers, err)
-	}
-	obligation, err := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID(jobID, path))
-	if err != nil {
-		t.Fatalf("GetCleanupObligation: %v", err)
-	}
-	if obligation.Reason != db.CleanupReasonUnpublishedCommits {
-		t.Fatalf("obligation reason = %q, want %q", obligation.Reason, db.CleanupReasonUnpublishedCommits)
-	}
-}
-
-// The observed data-loss path: a writer that learned a quarantine name during
-// the proofs recreates it AFTER the final survivor scan, where the completed
-// reclaim event means no later pass ever looks again. Both names a writer could
-// have observed are fenced with a zero-byte file, so that write cannot land at
-// all rather than landing unobserved.
-func TestEngineReclaimAgedFixCloneFencesPostScanPathWriter(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	home := t.TempDir()
-	jobID := "fix-post-scan-writer"
-	path, err := FixWorktreePath(home, "owner/repo", jobID)
-	if err != nil {
-		t.Fatalf("FixWorktreePath: %v", err)
-	}
-	if err := os.MkdirAll(path, 0o755); err != nil {
-		t.Fatalf("MkdirAll fix worktree: %v", err)
-	}
-	payload, err := marshalPayload(JobPayload{
-		Repo: "owner/repo", Branch: "feature/fix", WorktreePath: path, FixWorktree: true,
-	})
-	if err != nil {
-		t.Fatalf("marshalPayload: %v", err)
-	}
-	if err := store.CreateJobWithEvent(ctx, db.Job{
-		ID: jobID, Agent: "fixer", Type: "implement", State: string(JobSucceeded),
-		Repo: "owner/repo", Payload: payload,
-	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
-		t.Fatalf("CreateJobWithEvent: %v", err)
-	}
-	manager := &fakeWorktreeManager{cleanSet: true, clean: true}
-	engine := testEngine(store)
-	engine.Home = home
-	engine.DelegationCheckout = t.TempDir()
-	engine.DelegationWorktrees = manager
-	// Every name this clone was ever renamed to, in the order a path-based writer
-	// could have observed them: the proof quarantine, then the sealed name Git ran
-	// in last.
-	observed := map[string]struct{}{}
-	engine.WorktreeLiveness = func(probed string) (bool, bool) {
-		if probed != path {
-			observed[probed] = struct{}{}
-		}
-		return false, true
-	}
-
-	reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
-	if err != nil {
-		t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
-	}
-	if !reclaimed {
-		t.Fatal("proved-disposable clone was not reclaimed")
-	}
-	for _, probed := range manager.cloneOnlyCalls {
-		if probed != path {
-			observed[probed] = struct{}{}
-		}
-	}
-	if len(observed) != 2 {
-		t.Fatalf("observed quarantine names = %v, want the proof and sealed names", observed)
-	}
-	for name := range observed {
-		info, err := os.Lstat(name)
-		if err != nil {
-			t.Fatalf("observed quarantine name %s is unfenced: %v", name, err)
-		}
-		if info.IsDir() {
-			t.Fatalf("observed quarantine name %s is still a directory", name)
-		}
-		// Provenance is the recorded NONCE, not the public prefix: the same
-		// registry every later pass consults must recognise this file.
-		if !storeFenceOwnership(t, store, jobID).proven(name, info) {
-			content, _ := os.ReadFile(name)
-			t.Fatalf("fence at %s holds %q, which the job's fence records do not prove", name, content)
-		}
-		// The write from the review's reproduction, replayed after completion.
-		if err := os.MkdirAll(filepath.Join(name, "late", ".git"), 0o755); err == nil {
-			t.Fatalf("a writer created content under the fenced name %s", name)
-		}
-		if err := os.Mkdir(name, 0o755); err == nil {
-			t.Fatalf("a writer recreated the fenced quarantine directory %s", name)
-		}
-	}
-	// Fences are not surviving clones, so they neither block this clone's
-	// bookkeeping nor inflate the operator-facing quarantine count.
-	survivors, err := FixCloneQuarantines(path, storeFenceOwnership(t, store, jobID))
-	if err != nil || len(survivors) != 0 {
-		t.Fatalf("fences reported as surviving quarantines: %v (err %v)", survivors, err)
-	}
-	events, err := store.ListJobEvents(ctx, jobID)
-	if err != nil {
-		t.Fatalf("ListJobEvents: %v", err)
-	}
-	completed := false
-	for _, event := range events {
-		if event.Kind == "delegation_worktree_reclaimed_ttl" {
-			completed = true
-		}
-	}
-	if !completed {
-		t.Fatalf("reclaim did not record completion: %+v", events)
-	}
-}
-
-// The fence is the whole guarantee, so its two outcomes are pinned directly: it
-// creates the marker, or it reports that a directory already won the name.
-func TestFenceFixCloneQuarantineName(t *testing.T) {
-	root := t.TempDir()
-	free := filepath.Join(root, "clone"+fixCloneQuarantinePrefix+"00112233")
-	record := fenceForTest(t, free)
-	owned := NewFixCloneFenceOwnership([]string{record})
-	if fenced, _, err := fenceFixCloneQuarantineName(free); err != nil || fenced {
-		t.Fatalf("re-fencing = (%v, %v), want (false, nil)", fenced, err)
-	}
-
-	taken := filepath.Join(root, "clone"+fixCloneQuarantinePrefix+"44556677")
-	if err := os.Mkdir(taken, 0o755); err != nil {
-		t.Fatalf("Mkdir racing quarantine: %v", err)
-	}
-	if fenced, _, err := fenceFixCloneQuarantineName(taken); err != nil || fenced {
-		t.Fatalf("fence on a racing directory = (%v, %v), want (false, nil)", fenced, err)
-	}
-	if _, err := os.Stat(taken); err != nil {
-		t.Fatalf("fence deleted the racing directory: %v", err)
-	}
-	quarantines, err := FixCloneQuarantines(filepath.Join(root, "clone"), owned)
-	if err != nil {
-		t.Fatalf("FixCloneQuarantines: %v", err)
-	}
-	if len(quarantines) != 1 || quarantines[0] != taken {
-		t.Fatalf("quarantines = %v, want only the racing directory %s", quarantines, taken)
-	}
-}
-
-// A writer that wins a quarantine name mid-proof retains the clone and keeps the
-// obligation open; the racing directory is never deleted.
-func TestEngineRetainFixCloneWithRacingQuarantineWriter(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	home := t.TempDir()
-	jobID := "fix-racing-quarantine"
-
-	path, err := FixWorktreePath(home, "owner/repo", jobID)
-	if err != nil {
-		t.Fatalf("FixWorktreePath: %v", err)
-	}
-	payload, err := marshalPayload(JobPayload{
-		Repo: "owner/repo", Branch: "feature/fix", WorktreePath: path, FixWorktree: true,
-	})
-	if err != nil {
-		t.Fatalf("marshalPayload: %v", err)
-	}
-	if err := store.CreateJobWithEvent(ctx, db.Job{
-		ID: jobID, Agent: "fixer", Type: "implement", State: string(JobSucceeded),
-		Repo: "owner/repo", Payload: payload,
-	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
-		t.Fatalf("CreateJobWithEvent: %v", err)
-	}
-	engine := testEngine(store)
-	engine.Home = home
-	quarantine := path + fixCloneQuarantinePrefix + "8899aabb"
-	if err := engine.retainFixCloneWithRacingQuarantineWriter(ctx, jobID, path, quarantine); err != nil {
-		t.Fatalf("retainFixCloneWithRacingQuarantineWriter: %v", err)
-	}
-	obligation, err := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID(jobID, path))
-	if err != nil {
-		t.Fatalf("GetCleanupObligation: %v", err)
-	}
-	if obligation.Reason != db.CleanupReasonUnpublishedCommits {
-		t.Fatalf("obligation reason = %q, want %q", obligation.Reason, db.CleanupReasonUnpublishedCommits)
-	}
-	events, err := store.ListJobEvents(ctx, jobID)
-	if err != nil {
-		t.Fatalf("ListJobEvents: %v", err)
-	}
-	retained := 0
-	for _, event := range events {
-		if event.Kind == "delegation_worktree_retained_unpublished" && strings.Contains(event.Message, quarantine) {
-			retained++
-		}
-	}
-	if retained != 1 {
-		t.Fatalf("racing-writer retentions = %d, want 1: %+v", retained, events)
-	}
-}
-
-// The reviewer's end state, replayed through the production path: the clone path
-// is absent and the only quarantine-named sibling is a SYMLINK a writer aimed at
-// its own directory. Classifying survivors as "not a directory" made that symlink
-// invisible, so the pass recorded a completed reclaim, retired the job, and left
-// the writer's content unreachable by any later pass.
-func TestEngineReclaimAgedFixCloneRetainsSymlinkQuarantineWinner(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	home := t.TempDir()
-	jobID := "fix-symlink-quarantine"
-	path, err := FixWorktreePath(home, "owner/repo", jobID)
-	if err != nil {
-		t.Fatalf("FixWorktreePath: %v", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatalf("MkdirAll fix parent: %v", err)
-	}
-	target := filepath.Join(t.TempDir(), "writer-target")
-	if err := os.MkdirAll(filepath.Join(target, "late", ".git"), 0o755); err != nil {
-		t.Fatalf("MkdirAll writer target: %v", err)
-	}
-	planted := path + fixCloneQuarantinePrefix + "5150c0de5150c0de"
-	if err := os.Symlink(target, planted); err != nil {
-		t.Fatalf("plant symlink quarantine: %v", err)
-	}
-	payload, err := marshalPayload(JobPayload{
-		Repo: "owner/repo", Branch: "feature/fix", WorktreePath: path, FixWorktree: true,
-	})
-	if err != nil {
-		t.Fatalf("marshalPayload: %v", err)
-	}
-	if err := store.CreateJobWithEvent(ctx, db.Job{
-		ID: jobID, Agent: "fixer", Type: "implement", State: string(JobSucceeded),
-		Repo: "owner/repo", Payload: payload,
-	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
-		t.Fatalf("CreateJobWithEvent: %v", err)
-	}
-	engine := testEngine(store)
-	engine.Home = home
-	engine.DelegationCheckout = t.TempDir()
-	engine.DelegationWorktrees = &fakeWorktreeManager{cleanSet: true, clean: true}
-
-	reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
-	if reclaimed {
-		t.Fatal("a symlink quarantine winner let the reclaim complete")
-	}
-	if err == nil {
-		t.Fatal("a surviving symlink quarantine was accepted silently")
-	}
-	// Never followed, never deleted: the writer's content is intact and the name
-	// stays visible to the scan every later pass consults.
-	info, err := os.Lstat(planted)
-	if err != nil {
-		t.Fatalf("planted symlink was removed: %v", err)
-	}
-	if info.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("planted name %s is no longer a symlink: %v", planted, info.Mode())
-	}
-	if _, err := os.Stat(filepath.Join(target, "late", ".git")); err != nil {
-		t.Fatalf("writer content was deleted through the symlink: %v", err)
-	}
-	survivors, err := FixCloneQuarantines(path, storeFenceOwnership(t, store, jobID))
-	if err != nil {
-		t.Fatalf("FixCloneQuarantines: %v", err)
-	}
-	if len(survivors) != 1 || survivors[0] != planted {
-		t.Fatalf("symlink survivors = %v, want %s", survivors, planted)
-	}
-	if fences, err := FixCloneFences(path, storeFenceOwnership(t, store, jobID)); err != nil || len(fences) != 0 {
-		t.Fatalf("symlink counted as a spent fence: %v (err %v)", fences, err)
-	}
-	events, err := store.ListJobEvents(ctx, jobID)
-	if err != nil {
-		t.Fatalf("ListJobEvents: %v", err)
-	}
-	for _, event := range events {
-		if event.Kind == "delegation_worktree_reclaimed_ttl" {
-			t.Fatalf("reclaim was recorded complete with a symlink survivor: %+v", event)
-		}
-	}
-
-	// The fence itself must also refuse the name rather than follow or clobber it.
-	if fenced, _, err := fenceFixCloneQuarantineName(planted); err != nil || fenced {
-		t.Fatalf("fence on a symlink = (%v, %v), want (false, nil)", fenced, err)
-	}
-	if info, err := os.Lstat(planted); err != nil || info.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("fence replaced the symlink: %v (err %v)", info, err)
-	}
-	if _, err := os.Stat(filepath.Join(target, "late", ".git")); err != nil {
-		t.Fatalf("fence wrote through the symlink: %v", err)
-	}
-}
-
 // Git-SHAPED is not Git: a cache entry can carry a well-formed object header or
 // the PACK magic and still hold nothing recoverable. Retaining on those keeps
 // every clone with such a cache forever, which is the inert-pass failure the
@@ -2556,233 +2148,6 @@ func writeZlibFile(t *testing.T, path, body string) {
 	}
 }
 
-// Fences are bounded and visible: an aged one is pruned, a fresh one is kept
-// because a writer from the current pass could still name it, and a survivor is
-// never touched by the pruner.
-func TestPruneFixCloneFences(t *testing.T) {
-	root := t.TempDir()
-	path := filepath.Join(root, "clone")
-	aged := path + fixCloneQuarantinePrefix + "aaaaaaaa"
-	fresh := path + fixCloneQuarantinePrefix + "bbbbbbbb"
-	survivor := path + fixCloneQuarantinePrefix + "cccccccc"
-	// A same-user writer can create files at these names too. Neither carries the
-	// ownership marker, so neither may be pruned or read as a spent fence.
-	planted := path + fixCloneQuarantinePrefix + "dddddddd"
-	linked := path + fixCloneQuarantinePrefix + "eeeeeeee"
-	records := []string{fenceForTest(t, aged), fenceForTest(t, fresh)}
-	owned := NewFixCloneFenceOwnership(records)
-	if err := os.Mkdir(survivor, 0o755); err != nil {
-		t.Fatalf("Mkdir survivor: %v", err)
-	}
-	if err := os.WriteFile(planted, nil, 0o644); err != nil {
-		t.Fatalf("plant zero-byte file: %v", err)
-	}
-	// Same LENGTH as the marker, different bytes: only a content check separates
-	// this from a fence, and treating it as one would prune a writer's file.
-	forged := path + fixCloneQuarantinePrefix + "ffffffff"
-	if err := os.WriteFile(forged, bytes.Repeat([]byte("x"), len(fixCloneFenceContent(strings.Repeat("0", 32)))), 0o644); err != nil {
-		t.Fatalf("plant same-length file: %v", err)
-	}
-	// A hard link carrying the marker's exact bytes: the writer keeps a second name
-	// for the same inode, so nlink is 2 and the file is not provably ours. It is
-	// linked from OUTSIDE the quarantine namespace so our own fences stay single-link.
-	linkSource := filepath.Join(root, "writer-copy")
-	// The writer copies a fence's exact bytes, nonce included, and hard-links it in.
-	fenceBytes, err := os.ReadFile(fresh)
-	if err != nil {
-		t.Fatalf("read fence bytes: %v", err)
-	}
-	if err := os.WriteFile(linkSource, fenceBytes, 0o444); err != nil {
-		t.Fatalf("write marker copy: %v", err)
-	}
-	if err := os.Link(linkSource, linked); err != nil {
-		t.Fatalf("plant hard link: %v", err)
-	}
-	past := time.Now().Add(-48 * time.Hour)
-	for _, unowned := range []string{aged, planted, linked, forged} {
-		if err := os.Chtimes(unowned, past, past); err != nil {
-			t.Fatalf("Chtimes %s: %v", unowned, err)
-		}
-	}
-
-	fences, err := FixCloneFences(path, owned)
-	if err != nil || len(fences) != 2 {
-		t.Fatalf("FixCloneFences = %v (err %v), want both fences", fences, err)
-	}
-	pruned, err := PruneFixCloneFences(path, time.Now().Add(-24*time.Hour), owned)
-	if err != nil || pruned != 1 {
-		t.Fatalf("PruneFixCloneFences = %d (err %v), want 1", pruned, err)
-	}
-	if _, err := os.Lstat(aged); !os.IsNotExist(err) {
-		t.Fatalf("aged fence survived pruning: %v", err)
-	}
-	if _, err := os.Lstat(fresh); err != nil {
-		t.Fatalf("fresh fence was pruned: %v", err)
-	}
-	if _, err := os.Lstat(survivor); err != nil {
-		t.Fatalf("pruner removed a surviving quarantine: %v", err)
-	}
-	// Unproven files are never pruned and never counted as fences: they are
-	// survivors, which is what stops a planted file from forging a completed
-	// removal.
-	for _, unowned := range []string{planted, linked, forged} {
-		if _, err := os.Lstat(unowned); err != nil {
-			t.Fatalf("pruner removed writer-planted file %s: %v", unowned, err)
-		}
-	}
-	survivors, err := FixCloneQuarantines(path, owned)
-	if err != nil {
-		t.Fatalf("FixCloneQuarantines: %v", err)
-	}
-	wantSurvivors := map[string]bool{survivor: true, planted: true, linked: true, forged: true}
-	if len(survivors) != len(wantSurvivors) {
-		t.Fatalf("survivors = %v, want %v", survivors, wantSurvivors)
-	}
-	for _, got := range survivors {
-		if !wantSurvivors[got] {
-			t.Fatalf("survivors = %v, want %v", survivors, wantSurvivors)
-		}
-	}
-}
-
-// The scheduled sweep is the only thing that can retire a fence: the reclaim
-// creates them and never revisits a completed clone.
-func TestPruneExpiredFixCloneFencesSweepsEveryRepo(t *testing.T) {
-	home := t.TempDir()
-	aged := map[string]string{}
-	records := []string{}
-	for _, repo := range []string{"owner--repo", "other--repo"} {
-		fixes := filepath.Join(home, "worktrees", repo, "fixes")
-		if err := os.MkdirAll(fixes, 0o755); err != nil {
-			t.Fatalf("MkdirAll fixes: %v", err)
-		}
-		clone := filepath.Join(fixes, "job-1")
-		fence := clone + fixCloneQuarantinePrefix + "aaaaaaaa"
-		records = append(records, fenceForTest(t, fence))
-		past := time.Now().Add(-48 * time.Hour)
-		if err := os.Chtimes(fence, past, past); err != nil {
-			t.Fatalf("Chtimes: %v", err)
-		}
-		aged[repo] = fence
-		// A live clone and a fresh fence in the same directory must be untouched.
-		if err := os.MkdirAll(clone, 0o755); err != nil {
-			t.Fatalf("MkdirAll clone: %v", err)
-		}
-		records = append(records, fenceForTest(t, clone+fixCloneQuarantinePrefix+"bbbbbbbb"))
-	}
-
-	owned := NewFixCloneFenceOwnership(records)
-	ownership := func(string) (FixCloneFenceOwnership, error) { return owned, nil }
-	pruned, scanned, err := PruneExpiredFixCloneFencesBounded(home, time.Now().Add(-24*time.Hour), 256, ownership)
-	if err != nil || pruned != len(aged) {
-		t.Fatalf("PruneExpiredFixCloneFencesBounded = %d (err %v), want %d", pruned, err, len(aged))
-	}
-	if scanned == 0 {
-		t.Fatal("the sweep reported scanning nothing")
-	}
-	for repo, fence := range aged {
-		if _, err := os.Lstat(fence); !os.IsNotExist(err) {
-			t.Fatalf("%s: aged fence survived the sweep: %v", repo, err)
-		}
-		clone := filepath.Join(home, "worktrees", repo, "fixes", "job-1")
-		if _, err := os.Stat(clone); err != nil {
-			t.Fatalf("%s: sweep removed a live clone: %v", repo, err)
-		}
-		fences, err := FixCloneFences(clone, owned)
-		if err != nil || len(fences) != 1 {
-			t.Fatalf("%s: fences after sweep = %v (err %v), want the fresh one", repo, fences, err)
-		}
-	}
-	// An empty home is a no-op, not an error: a host with no fix clones is normal.
-	if pruned, _, err := PruneExpiredFixCloneFencesBounded(t.TempDir(), time.Now(), 256, ownership); err != nil || pruned != 0 {
-		t.Fatalf("sweep of an empty home = %d (err %v), want 0", pruned, err)
-	}
-}
-
-// The post-removal survivor scan has to RECORD why it refused, not just return
-// false: a silent refusal leaves the obligation looking untouched and the next
-// pass cannot tell a race from an idle pass.
-//
-// MUTATION PROOF: replace the survivor branch's retention call with `return
-// false, nil` and this fails on the missing obligation and event.
-func TestEngineReclaimAgedFixCloneRecordsSurvivorRefusalAfterRemoval(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	home := t.TempDir()
-	jobID := "fix-survivor-refusal"
-	path, err := FixWorktreePath(home, "owner/repo", jobID)
-	if err != nil {
-		t.Fatalf("FixWorktreePath: %v", err)
-	}
-	if err := os.MkdirAll(path, 0o755); err != nil {
-		t.Fatalf("MkdirAll fix worktree: %v", err)
-	}
-	payload, err := marshalPayload(JobPayload{
-		Repo: "owner/repo", Branch: "feature/fix", WorktreePath: path, FixWorktree: true,
-	})
-	if err != nil {
-		t.Fatalf("marshalPayload: %v", err)
-	}
-	if err := store.CreateJobWithEvent(ctx, db.Job{
-		ID: jobID, Agent: "fixer", Type: "implement", State: string(JobSucceeded),
-		Repo: "owner/repo", Payload: payload,
-	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
-		t.Fatalf("CreateJobWithEvent: %v", err)
-	}
-	manager := &fakeWorktreeManager{cleanSet: true, clean: true}
-	engine := testEngine(store)
-	engine.Home = home
-	engine.DelegationCheckout = t.TempDir()
-	engine.DelegationWorktrees = manager
-	// A writer takes a THIRD quarantine name while the pass is mid-removal, so the
-	// clone's own removal succeeds and the survivor scan afterwards finds it.
-	planted := path + fixCloneQuarantinePrefix + "0f0f0f0f0f0f0f0f"
-	engine.WorktreeLiveness = func(probed string) (bool, bool) {
-		if probed != path {
-			if _, err := os.Stat(planted); os.IsNotExist(err) {
-				if err := os.MkdirAll(filepath.Join(planted, "writer"), 0o755); err != nil {
-					t.Fatalf("plant survivor: %v", err)
-				}
-			}
-		}
-		return false, true
-	}
-
-	reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
-	if err != nil {
-		t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
-	}
-	if reclaimed {
-		t.Fatal("the pass completed with a surviving quarantine beside the clone")
-	}
-	if _, err := os.Stat(filepath.Join(planted, "writer")); err != nil {
-		t.Fatalf("the planted survivor was deleted: %v", err)
-	}
-	obligation, err := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID(jobID, path))
-	if err != nil {
-		t.Fatalf("GetCleanupObligation: %v", err)
-	}
-	if obligation.Reason != db.CleanupReasonUnpublishedCommits {
-		t.Fatalf("obligation reason = %q, want %q", obligation.Reason, db.CleanupReasonUnpublishedCommits)
-	}
-	events, err := store.ListJobEvents(ctx, jobID)
-	if err != nil {
-		t.Fatalf("ListJobEvents: %v", err)
-	}
-	recorded := false
-	for _, event := range events {
-		if event.Kind == "delegation_worktree_retained_unpublished" {
-			recorded = true
-		}
-		if event.Kind == "delegation_worktree_reclaimed_ttl" {
-			t.Fatalf("reclaim was recorded complete with a survivor present: %+v", event)
-		}
-	}
-	if !recorded {
-		t.Fatalf("survivor refusal recorded no retention: %+v", events)
-	}
-}
-
 // A malformed loose-object candidate must not be able to size the daemon's
 // allocation: the header read is bounded, while a VALID object of any size still
 // streams through the hash.
@@ -2825,151 +2190,6 @@ func TestLooseObjectHeaderReadIsBounded(t *testing.T) {
 	}
 	if nested != "objects" {
 		t.Fatalf("valid streamed object database = %q, want objects", nested)
-	}
-}
-
-// TestEngineReclaimAgedFixCloneNeverDeletesContentWrittenAfterTheProof is the P1
-// window: a writer creates and CLOSES unique content after the final validation
-// and before removal, leaving no cwd and no open descriptor for any liveness scan
-// to find.
-//
-// The removal is authorised by an inventory taken during that final scan, so the
-// new entry is never unlinked and the rmdir of its parent fails instead. The clone
-// is put back with the content intact and the retention is recorded.
-//
-// MUTATION PROOF: swap removeInventoriedTree for os.RemoveAll and the injected
-// content is deleted.
-func TestEngineReclaimAgedFixCloneNeverDeletesContentWrittenAfterTheProof(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		write func(t *testing.T, root string) string
-	}{
-		{
-			name: "new file in an existing directory",
-			write: func(t *testing.T, root string) string {
-				target := filepath.Join(root, "src", "unique.txt")
-				if err := os.WriteFile(target, []byte("only copy\n"), 0o644); err != nil {
-					t.Fatalf("write unique content: %v", err)
-				}
-				return target
-			},
-		},
-		{
-			name: "new nested directory",
-			write: func(t *testing.T, root string) string {
-				target := filepath.Join(root, "src", "late", "unique.txt")
-				if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-					t.Fatalf("MkdirAll late directory: %v", err)
-				}
-				if err := os.WriteFile(target, []byte("only copy\n"), 0o644); err != nil {
-					t.Fatalf("write unique content: %v", err)
-				}
-				return target
-			},
-		},
-		{
-			name: "overwrite of a proved file",
-			write: func(t *testing.T, root string) string {
-				target := filepath.Join(root, "src", "tracked.txt")
-				if err := os.WriteFile(target, []byte("rewritten after the proof\n"), 0o644); err != nil {
-					t.Fatalf("overwrite proved content: %v", err)
-				}
-				return target
-			},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
-			store := openEngineStore(t)
-			home := t.TempDir()
-			jobID := "fix-post-proof-write"
-			path, err := FixWorktreePath(home, "owner/repo", jobID)
-			if err != nil {
-				t.Fatalf("FixWorktreePath: %v", err)
-			}
-			if err := os.MkdirAll(filepath.Join(path, "src"), 0o755); err != nil {
-				t.Fatalf("MkdirAll fix worktree: %v", err)
-			}
-			if err := os.WriteFile(filepath.Join(path, "src", "tracked.txt"), []byte("proved\n"), 0o644); err != nil {
-				t.Fatalf("write proved content: %v", err)
-			}
-			payload, err := marshalPayload(JobPayload{
-				Repo: "owner/repo", Branch: "feature/fix", WorktreePath: path, FixWorktree: true,
-			})
-			if err != nil {
-				t.Fatalf("marshalPayload: %v", err)
-			}
-			if err := store.CreateJobWithEvent(ctx, db.Job{
-				ID: jobID, Agent: "fixer", Type: "implement", State: string(JobSucceeded),
-				Repo: "owner/repo", Payload: payload,
-			}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
-				t.Fatalf("CreateJobWithEvent: %v", err)
-			}
-			manager := &fakeWorktreeManager{cleanSet: true, clean: true}
-			engine := testEngine(store)
-			engine.Home = home
-			engine.DelegationCheckout = t.TempDir()
-			engine.DelegationWorktrees = manager
-			// The writer runs at the last seam before removal — after the nested scan
-			// that took the inventory — and leaves nothing behind for /proc to see.
-			var written string
-			engine.WorktreeLiveness = func(probed string) (bool, bool) {
-				if probed != path && written == "" && len(manager.cloneOnlyCalls) >= 2 {
-					written = tc.write(t, probed)
-				}
-				return false, true
-			}
-
-			reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
-			if err != nil {
-				t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
-			}
-			if written == "" {
-				t.Fatal("the interleaved write never ran")
-			}
-			if reclaimed {
-				t.Fatal("a clone that gained content after its proof was reclaimed")
-			}
-			survivors, err := FixCloneQuarantines(path, storeFenceOwnership(t, store, jobID))
-			if err != nil {
-				t.Fatalf("FixCloneQuarantines: %v", err)
-			}
-			if len(survivors) != 0 {
-				t.Fatalf("clone left quarantined: %v", survivors)
-			}
-			if _, err := os.Stat(path); err != nil {
-				t.Fatalf("clone was not restored to its managed path: %v", err)
-			}
-			found := false
-			if err := filepath.WalkDir(path, func(candidate string, entry fs.DirEntry, walkErr error) error {
-				if walkErr != nil {
-					return walkErr
-				}
-				if entry.IsDir() {
-					return nil
-				}
-				content, readErr := os.ReadFile(candidate)
-				if readErr != nil {
-					return readErr
-				}
-				if strings.Contains(string(content), "only copy") || strings.Contains(string(content), "rewritten after the proof") {
-					found = true
-				}
-				return nil
-			}); err != nil {
-				t.Fatalf("walk the restored clone: %v", err)
-			}
-			if !found {
-				t.Fatal("content written after the proof was deleted by the removal")
-			}
-			obligation, err := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID(jobID, path))
-			if err != nil {
-				t.Fatalf("GetCleanupObligation: %v", err)
-			}
-			if obligation.Reason != db.CleanupReasonUnpublishedCommits {
-				t.Fatalf("obligation reason = %q, want %q", obligation.Reason, db.CleanupReasonUnpublishedCommits)
-			}
-		})
 	}
 }
 
@@ -3076,61 +2296,30 @@ func TestEngineReclaimAgedFixCloneReclaimsIgnoredHexFanoutOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
 	}
-	if !reclaimed {
-		t.Fatal("clone holding only ignored build output was retained: the pass is inert")
+	// Automatic removal is disabled, so "not inert" now means the pass reaches the
+	// PROVED-DISPOSABLE outcome instead of retaining for a content reason: the
+	// clone is handed to an operator, and nothing is deleted.
+	if reclaimed {
+		t.Fatal("the pass deleted a fix clone; automatic removal is disabled")
 	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("reclaimed clone survives: %v", err)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("proved clone was removed: %v", err)
 	}
-}
-
-// TestEngineReclaimAgedFixCloneRefusesLeftoverQuarantine keeps an interrupted
-// removal visible instead of deleting a directory nobody has proven anything about.
-func TestEngineReclaimAgedFixCloneRefusesLeftoverQuarantine(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	home := t.TempDir()
-	jobID := "fix-leftover-quarantine"
-	path, err := FixWorktreePath(home, "owner/repo", jobID)
+	events, err := store.ListJobEvents(ctx, jobID)
 	if err != nil {
-		t.Fatalf("FixWorktreePath: %v", err)
+		t.Fatalf("ListJobEvents: %v", err)
 	}
-	if err := os.MkdirAll(path, 0o755); err != nil {
-		t.Fatalf("MkdirAll fix worktree: %v", err)
+	proved := false
+	for _, event := range events {
+		if event.Kind == "delegation_worktree_reclaimable_manual" {
+			proved = true
+		}
+		if event.Kind == "delegation_worktree_retained_unpublished" {
+			t.Fatalf("ordinary build output was classified as unpublished Git data: %s", event.Message)
+		}
 	}
-	if err := os.MkdirAll(path+fixCloneQuarantinePrefix+"0123456789abcdef", 0o755); err != nil {
-		t.Fatalf("MkdirAll quarantine: %v", err)
-	}
-	payload, err := marshalPayload(JobPayload{
-		Repo:         "owner/repo",
-		Branch:       "feature/fix",
-		WorktreePath: path,
-		FixWorktree:  true,
-	})
-	if err != nil {
-		t.Fatalf("marshalPayload: %v", err)
-	}
-	if err := store.CreateJobWithEvent(ctx, db.Job{
-		ID:      jobID,
-		Agent:   "fixer",
-		Type:    "implement",
-		State:   string(JobSucceeded),
-		Repo:    "owner/repo",
-		Payload: payload,
-	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
-		t.Fatalf("CreateJobWithEvent: %v", err)
-	}
-	engine := testEngine(store)
-	engine.Home = home
-	engine.DelegationCheckout = t.TempDir()
-	engine.DelegationWorktrees = &fakeWorktreeManager{cleanSet: true, clean: true, cloneOnly: map[string]string{}}
-
-	if _, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour)); err == nil ||
-		!strings.Contains(err.Error(), "quarantined fix clone") {
-		t.Fatalf("error = %v, want a refusal naming the leftover quarantine", err)
-	}
-	if _, statErr := os.Stat(path); statErr != nil {
-		t.Fatalf("clone was removed despite the refusal: %v", statErr)
+	if !proved {
+		t.Fatalf("clone holding only ignored build output never reached the proved-disposable outcome: %+v", events)
 	}
 }
 
@@ -3152,14 +2341,14 @@ func TestFixCloneQuarantinesFindsPathsWithGlobMetacharacters(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(parent, "job-2"+fixCloneQuarantinePrefix+"ff"), 0o755); err != nil {
 		t.Fatalf("MkdirAll sibling quarantine: %v", err)
 	}
-	quarantines, err := FixCloneQuarantines(path, FixCloneFenceOwnership{})
+	quarantines, err := FixCloneQuarantines(path)
 	if err != nil {
 		t.Fatalf("FixCloneQuarantines: %v", err)
 	}
 	if len(quarantines) != 1 || quarantines[0] != quarantine {
 		t.Fatalf("quarantines = %v, want [%s]", quarantines, quarantine)
 	}
-	if found, err := FixCloneQuarantines(filepath.Join(parent, "job-3"), FixCloneFenceOwnership{}); err != nil || len(found) != 0 {
+	if found, err := FixCloneQuarantines(filepath.Join(parent, "job-3")); err != nil || len(found) != 0 {
 		t.Fatalf("quarantines for an untouched clone = %v (err %v), want none", found, err)
 	}
 }
@@ -3293,89 +2482,6 @@ func TestEngineReclaimAgedFixCloneRecordsLiveRetentionOncePerReason(t *testing.T
 	}
 }
 
-// The serialisation claim needs a checkout to lock: testEngine leaves
-// DelegationCheckout empty, so without this the lock was never exercised.
-func TestEngineReclaimAgedFixCloneTakesCheckoutLockForRemoval(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	home := t.TempDir()
-	checkout := t.TempDir()
-	const jobID = "fix-lock-serialisation"
-	path, err := FixWorktreePath(home, "owner/repo", jobID)
-	if err != nil {
-		t.Fatalf("FixWorktreePath: %v", err)
-	}
-	if err := os.MkdirAll(path, 0o755); err != nil {
-		t.Fatalf("MkdirAll fix worktree: %v", err)
-	}
-	payload, err := marshalPayload(JobPayload{
-		Repo:         "owner/repo",
-		Branch:       "feature/fix",
-		WorktreePath: path,
-		FixWorktree:  true,
-	})
-	if err != nil {
-		t.Fatalf("marshalPayload: %v", err)
-	}
-	if err := store.CreateJobWithEvent(ctx, db.Job{
-		ID:      jobID,
-		Agent:   "fixer",
-		Type:    "implement",
-		State:   string(JobSucceeded),
-		Repo:    "owner/repo",
-		Payload: payload,
-	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
-		t.Fatalf("CreateJobWithEvent: %v", err)
-	}
-	engine := testEngine(store)
-	engine.Home = home
-	engine.DelegationCheckout = checkout
-	engine.DelegationWorktrees = &fakeWorktreeManager{cleanSet: true, clean: true}
-
-	// A foreign holder of the same checkout must keep the removal out of the rename
-	// window until it releases, rather than letting two reclaimers in together. The
-	// reclaim waits on the lock, so the holder is released while it waits instead of
-	// burning the full two-minute wait budget.
-	release, _, err := acquireCheckoutMutationLock(ctx, store, checkout, "foreign-holder", time.Now().UTC())
-	if err != nil {
-		t.Fatalf("acquireCheckoutMutationLock: %v", err)
-	}
-	type outcome struct {
-		reclaimed bool
-		err       error
-	}
-	done := make(chan outcome, 1)
-	go func() {
-		reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
-		done <- outcome{reclaimed: reclaimed, err: err}
-	}()
-	select {
-	case got := <-done:
-		t.Fatalf("reclaim finished while the checkout lock was held: %+v", got)
-	case <-time.After(250 * time.Millisecond):
-	}
-	if _, statErr := os.Stat(path); statErr != nil {
-		t.Fatalf("clone was removed while the checkout lock was held: %v", statErr)
-	}
-	if err := release(ctx); err != nil {
-		t.Fatalf("release checkout lock: %v", err)
-	}
-	select {
-	case got := <-done:
-		if got.err != nil {
-			t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", got.err)
-		}
-		if !got.reclaimed {
-			t.Fatal("provable clone was not reclaimed once the checkout lock was free")
-		}
-	case <-time.After(checkoutMutationWaitTimeout):
-		t.Fatal("reclaim did not finish after the checkout lock was released")
-	}
-	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
-		t.Fatalf("clone remains after a successful reclaim: %v", statErr)
-	}
-}
-
 // The ordinary (non-TTL) fix-clone cleanup runs on every terminal advance and on
 // the skipped-cleanup pass, so it must make the same inference as the TTL pass:
 // an absent path is not a completed removal while a quarantine of it survives.
@@ -3493,81 +2599,6 @@ func TestEngineReclaimAgedFixCloneRecordsInconclusiveLiveness(t *testing.T) {
 	}
 }
 
-// A crash between the quarantine rename and the removal leaves the clone at the
-// quarantine path with nothing at the original path. That must be RESTORED, never
-// reported as a completed reclaim: completing it retires the candidate forever
-// and leaves the only copy of the commits on disk with no owner.
-func TestEngineReclaimAgedFixCloneRestoresInterruptedQuarantine(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	home := t.TempDir()
-	const jobID = "fix-interrupted-quarantine"
-	path, err := FixWorktreePath(home, "owner/repo", jobID)
-	if err != nil {
-		t.Fatalf("FixWorktreePath: %v", err)
-	}
-	quarantine := path + fixCloneQuarantinePrefix + "fedcba9876543210"
-	if err := os.MkdirAll(quarantine, 0o755); err != nil {
-		t.Fatalf("MkdirAll quarantine: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(quarantine, "only-copy"), []byte("commits\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile only-copy: %v", err)
-	}
-	payload, err := marshalPayload(JobPayload{
-		Repo:         "owner/repo",
-		Branch:       "feature/fix",
-		WorktreePath: path,
-		FixWorktree:  true,
-	})
-	if err != nil {
-		t.Fatalf("marshalPayload: %v", err)
-	}
-	if err := store.CreateJobWithEvent(ctx, db.Job{
-		ID:      jobID,
-		Agent:   "fixer",
-		Type:    "implement",
-		State:   string(JobSucceeded),
-		Repo:    "owner/repo",
-		Payload: payload,
-	}, db.JobEvent{Kind: string(JobSucceeded), Message: "seed"}); err != nil {
-		t.Fatalf("CreateJobWithEvent: %v", err)
-	}
-	engine := testEngine(store)
-	engine.Home = home
-	engine.DelegationCheckout = t.TempDir()
-	engine.DelegationWorktrees = &fakeWorktreeManager{cleanSet: true, clean: true, cloneOnly: map[string]string{}}
-
-	reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, time.Now().Add(time.Hour))
-	if err != nil {
-		t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
-	}
-	if reclaimed {
-		t.Fatal("interrupted quarantine was reported as a completed reclaim")
-	}
-	if _, statErr := os.Stat(filepath.Join(path, "only-copy")); statErr != nil {
-		t.Fatalf("clone was not restored to %s: %v", path, statErr)
-	}
-	if _, statErr := os.Stat(quarantine); !os.IsNotExist(statErr) {
-		t.Fatalf("quarantine path survived the restore: %v", statErr)
-	}
-	events, err := store.ListJobEvents(ctx, jobID)
-	if err != nil {
-		t.Fatalf("ListJobEvents: %v", err)
-	}
-	restored := false
-	for _, event := range events {
-		if event.Kind == "delegation_worktree_reclaimed_ttl" {
-			t.Fatalf("interrupted quarantine recorded a TTL reclaim: %+v", events)
-		}
-		if event.Kind == "delegation_worktree_quarantine_restored" {
-			restored = true
-		}
-	}
-	if !restored {
-		t.Fatalf("missing quarantine restore event: %+v", events)
-	}
-}
-
 func setupOffLineageTaskWorktree(t *testing.T, dirty bool) (context.Context, *db.Store, Engine, gitutil.Client, TaskWorktreeRequest, string, string, string) {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
@@ -3672,45 +2703,46 @@ func runWorktreeGitEnvOutput(t *testing.T, dir string, env []string, stdin strin
 }
 
 type fakeWorktreeManager struct {
-	err              error
-	onAdd            func()
-	existingBranches map[string]bool
-	fetchedRemotes   []string
-	pathHeads        map[string]string
-	revHeads         map[string]string
-	ancestor         bool
-	ancestorSet      bool
-	clean            bool
-	cleanSet         bool
-	cleanErr         error
-	remoteURL        string
-	remoteURLErr     error
-	refreshErr       error
-	requireDeadline  bool
-	refreshedPaths   []string
-	refreshedURLs    []string
-	cloneOnly        map[string]string // path -> unpublished sha ("" proves published)
-	cloneOnlyDefault string            // answer for paths absent from cloneOnly
-	cloneOnlyErr     error
-	verifiedPacks    []string
-	verifyPackErr    error
-	cloneOnlyCalls   []string
-	cloneOnlyHook    func(path string) // mutate the clone between proof rounds
-	cleanCalls       []string
-	ancestorCalls    [][2]string
-	calls            []worktreeCall
-	existingCalls    []worktreeCall
-	detachedCalls    []worktreeCall // AddDetachedWorktree: path in .path, ref in .base
-	removed          []string       // RemoveWorktree paths
-	removedForce     []string       // RemoveWorktreeForce paths
-	removeErr        error
-	deletedBranches  []string // DeleteBranch branches
-	deleteErr        error
-	mergeCalls       []mergeCall // MergeBranches calls
-	mergeErr         error
-	committedDirs    []string // CommitWorktree dirs
-	commitMade       bool     // value CommitWorktree returns for "committed"
-	commitErr        error
+	err               error
+	onAdd             func()
+	existingBranches  map[string]bool
+	fetchedRemotes    []string
+	pathHeads         map[string]string
+	revHeads          map[string]string
+	ancestor          bool
+	ancestorSet       bool
+	clean             bool
+	cleanSet          bool
+	cleanErr          error
+	remoteURL         string
+	remoteURLErr      error
+	refreshErr        error
+	requireDeadline   bool
+	refreshedPaths    []string
+	refreshedURLs     []string
+	cloneOnly         map[string]string // path -> unpublished sha ("" proves published)
+	cloneOnlyDefault  string            // answer for paths absent from cloneOnly
+	cloneOnlyErr      error
+	verifiedPacks     []string
+	verifyPackErr     error
+	verifyPackInvalid bool
+	cloneOnlyCalls    []string
+	cloneOnlyHook     func(path string) // mutate the clone between proof rounds
+	cleanCalls        []string
+	ancestorCalls     [][2]string
+	calls             []worktreeCall
+	existingCalls     []worktreeCall
+	detachedCalls     []worktreeCall // AddDetachedWorktree: path in .path, ref in .base
+	removed           []string       // RemoveWorktree paths
+	removedForce      []string       // RemoveWorktreeForce paths
+	removeErr         error
+	deletedBranches   []string // DeleteBranch branches
+	deleteErr         error
+	mergeCalls        []mergeCall // MergeBranches calls
+	mergeErr          error
+	committedDirs     []string // CommitWorktree dirs
+	commitMade        bool     // value CommitWorktree returns for "committed"
+	commitErr         error
 }
 
 type mergeCall struct {
@@ -3813,9 +2845,12 @@ func (f *fakeWorktreeManager) RefreshCloneProofRefs(ctx context.Context, path st
 // VerifyPackIndex mirrors Git's pack validation. The fake accepts by default and
 // records what it was asked to verify, so a test can prove the production path
 // consults it and can make it refuse.
-func (f *fakeWorktreeManager) VerifyPackIndex(_ context.Context, indexPath string) error {
-	f.verifiedPacks = append(f.verifiedPacks, indexPath)
-	return f.verifyPackErr
+func (f *fakeWorktreeManager) VerifyPackIndex(_ context.Context, indexPath string, objectFormat string) (bool, error) {
+	f.verifiedPacks = append(f.verifiedPacks, indexPath+" "+objectFormat)
+	if f.verifyPackErr != nil {
+		return false, f.verifyPackErr
+	}
+	return !f.verifyPackInvalid, nil
 }
 
 func (f *fakeWorktreeManager) CloneOnlyCommit(_ context.Context, path string) (string, error) {
@@ -3926,34 +2961,6 @@ func TestTaskWorktreePathSegmentSanitizesSlashedIDs(t *testing.T) {
 	if _, err := taskWorktreePathSegment("   ", "p"); err == nil {
 		t.Fatalf("blank value should still error")
 	}
-}
-
-// fenceForTest writes a fence and returns the durable record production would
-// have logged, so a test proves ownership the same way the daemon does.
-func fenceForTest(t *testing.T, path string) string {
-	t.Helper()
-	fenced, nonce, err := fenceFixCloneQuarantineName(path)
-	if err != nil || !fenced {
-		t.Fatalf("fence %s = (%v, %v)", path, fenced, err)
-	}
-	return path + " " + nonce
-}
-
-// storeFenceOwnership loads a job's recorded fence nonces, which is what every
-// production classification consults.
-func storeFenceOwnership(t *testing.T, store *db.Store, jobID string) FixCloneFenceOwnership {
-	t.Helper()
-	events, err := store.ListJobEvents(context.Background(), jobID)
-	if err != nil {
-		t.Fatalf("ListJobEvents(%s): %v", jobID, err)
-	}
-	records := []string{}
-	for _, event := range events {
-		if event.Kind == JobEventFixCloneFenced {
-			records = append(records, event.Message)
-		}
-	}
-	return NewFixCloneFenceOwnership(records)
 }
 
 // gitPackVerifierForTest runs the REAL git verification the production path uses,

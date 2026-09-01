@@ -477,6 +477,14 @@ func newCockpitPaneID() (string, error) {
 	return "cockpit-pane-" + hex.EncodeToString(raw[:]), nil
 }
 
+func newTaskStateClaimToken() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return "task-claim-" + hex.EncodeToString(raw[:]), nil
+}
+
 func requireAffected(result sql.Result, subject string, id string) error {
 	affected, err := result.RowsAffected()
 	if err != nil {

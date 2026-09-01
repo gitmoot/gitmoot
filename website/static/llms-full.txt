@@ -2879,49 +2879,36 @@ because both rewrite ancestry locally. The trusted URL comes from the registered
 checkout, never from the clone's own `origin`, which whatever ran in the clone
 could have rewritten.
 
-The proven-disposable clone is then **renamed to a sibling
-`<path>.ttl-reclaiming-<random>`** and every proof is repeated there. After the
-final Git proof it is renamed again, and that last scan records an **inventory**:
-every entry with its inode and inode-change time. The removal then walks that
-inventory with **descriptor-relative** operations — `openat`/`fstatat`/`unlinkat`
-against directory descriptors this pass opened and verified — and unlinks only
-objects that still match. Three things follow, all enforced by the kernel rather
-than sampled by a check:
+**A proved fix clone is NOT deleted automatically.** The pass runs every proof —
+liveness, cleanliness, published-object reachability, nested object databases —
+and then records `delegation_worktree_reclaimable_manual`, leaves the clone on
+disk, and keeps its cleanup obligation open. `gitmoot doctor` reports it and an
+operator removes it.
 
-- content created after the proof is not in the inventory, is never unlinked, and
-  makes its parent's `rmdir` fail with `ENOTEMPTY`, so the removal aborts and the
-  clone is restored with the new bytes intact;
-- a proved file rewritten with same-size content and a restored mtime is refused,
-  because inode and ctime are compared and no unprivileged call moves ctime
-  backwards;
-- a directory swapped for another directory or a symlink cannot redirect anything,
-  because no path component is re-resolved between the proof and the unlink.
+The reason is a platform limit, not an unfinished patch. A fix worktree is a
+standalone clone, so an unlink takes its object database with it, and a safe
+removal must delete exactly the bytes it proved. Linux cannot express that: unlink
+is by NAME, there is no inode-conditional `unlinkat`, and against a same-user
+writer no descriptor discipline turns stat-then-unlink into an atomic conditional
+delete. Successive reviews each found another instance of that single gap, so the
+pass keeps what is decidable and drops what is not. The cost is that this arm no
+longer frees disk on its own; the benefit is that it cannot destroy bytes it did
+not prove. The other reclaim arms are unaffected — they manage LINKED worktrees,
+where removal does not take an object database with it.
 
-Both names a writer could have observed are then **fenced**. A fence is a regular
-file whose content carries a random **nonce recorded in the job's event log**
-(`delegation_worktree_fence_written`); the public prefix alone proves nothing.
-Anything else at a quarantine name — a directory, symlink, hard link, empty file,
-same-length forgery, or a fence with no recorded nonce — is a SURVIVOR: never
-deleted, never followed, and it blocks completion. Pruning re-proves ownership
-through a descriptor and compares the inode again immediately before `unlinkat`,
-so a name swapped after classification is not removed. Retired fences are swept on
-the five-minute worktree-maintenance cadence, bounded to 256 entries per run with a
-rotating cursor, and counted by `gitmoot doctor` and `/api/health`.
+Any entry beside a managed clone with the `.ttl-reclaiming-*` prefix is a
+SURVIVOR: unowned content that blocks completion and is reported, never deleted
+and never followed.
 
-A nested object database is recognised by its BYTES. A loose candidate is accepted
-only when its decompressed content hashes (SHA-1 or SHA-256) to the name it is
-stored under, with the header read bounded so a malformed cache entry cannot size
-the daemon's allocation while valid large objects still stream. A pack must pass
-its own trailing checksum, its `.idx` must verify and record that pack's digest,
-and **`git verify-pack` must accept the pair** — checksums prove the files are
-intact, only Git proves they hold readable objects. Ordinary ignored
-content-addressed build output uses the same hex-fanout and `pack-<hash>.pack`
-naming, so recognising on names alone would make the pass inert on any repo with a
-build cache.
-
-On non-Linux builds the removal and the fence prune FAIL CLOSED — nothing is
-deleted — because the descriptor-relative primitives and ctime this proof depends
-on are Linux-shaped, and a weaker stand-in is exactly what these guards replaced.
+The proofs still matter, because they decide RETENTION reasons. A nested object
+database is recognised by its BYTES: a loose candidate must decompress and hash
+(SHA-1 or SHA-256) to the name it is stored under, with the header read bounded so
+a malformed cache entry cannot size the daemon's allocation while valid large
+objects still stream; a pack must pass its own trailing checksum, have an `.idx`
+that verifies and records that pack's digest, and be accepted by `git verify-pack`
+— invoked with `--object-format=sha256` for SHA-256 databases. If Git cannot be
+asked at all, the candidate is treated as an object database and the clone is
+retained, never classified as ordinary content.
 
 Every retention records **why**, once per reason per job, so an inert deployment
 is visible instead of silent: `delegation_worktree_retained_unpublished` (also

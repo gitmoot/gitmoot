@@ -962,22 +962,38 @@ func (c Client) UpdateBase(ctx context.Context, remote string, branch string) er
 //
 // `git verify-pack` walks every object in the pack, checks the index entries and
 // offsets, and verifies the checksums — the same validation Git performs before it
-// will read objects out of the pair. Checksums alone cannot do that: a fabricated
-// but self-consistent PACK/idx passes a trailer comparison and still holds no
-// recoverable object, which is the difference between retaining a real object
-// database and retaining an ordinary cache forever.
+// will read objects out of the pair.
 //
-// It runs the repository-independent form (`git verify-pack` takes the .idx path
-// directly), so it needs no checkout and reads nothing but the pair.
-func (c Client) VerifyPackIndex(ctx context.Context, indexPath string) error {
+// The two failure modes are DIFFERENT and the caller must be able to tell them
+// apart. A process that ran and rejected the pair proves the pair holds nothing
+// readable (valid=false, err=nil). A process that could not run at all — Git
+// missing, exec failure — proves nothing (err non-nil), and a caller that treats
+// that as "not a Git object database" would delete an object database it simply
+// failed to inspect.
+//
+// objectFormat is passed explicitly because a SHA-256 pair cannot be verified from
+// a SHA-1 repository context: Git rejects the index before reading it.
+func (c Client) VerifyPackIndex(ctx context.Context, indexPath string, objectFormat string) (bool, error) {
 	indexPath = strings.TrimSpace(indexPath)
 	if indexPath == "" {
-		return errors.New("pack index path is required")
+		return false, errors.New("pack index path is required")
 	}
-	if _, err := c.run(ctx, "verify-pack", "--stat-only", "--", indexPath); err != nil {
-		return err
+	args := []string{}
+	if format := strings.TrimSpace(objectFormat); format != "" {
+		args = append(args, "--object-format="+format)
 	}
-	return nil
+	args = append(args, "verify-pack", "--stat-only", "--", indexPath)
+	if _, err := c.run(ctx, args...); err != nil {
+		// The command RAN and rejected the pair: that is an ANSWER (the pair holds
+		// nothing readable). A process that could not run at all proves nothing, and
+		// the caller must retain rather than treat the silence as disposability.
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func (c Client) run(ctx context.Context, args ...string) (subprocess.Result, error) {

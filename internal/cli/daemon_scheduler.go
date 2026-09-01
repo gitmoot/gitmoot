@@ -291,65 +291,6 @@ func prepareDelegationCleanup(ctx context.Context, worker jobWorker, mode string
 	return obligation, true, nil
 }
 
-// fixCloneFenceOwnershipForJob loads one job's durable fence records. A fence is
-// only provably ours when its nonce is in that log, so every caller that
-// classifies quarantine names has to carry this.
-func fixCloneFenceOwnershipForJob(ctx context.Context, store *db.Store, jobID string) (workflow.FixCloneFenceOwnership, error) {
-	events, err := store.ListJobEvents(ctx, jobID)
-	if err != nil {
-		return workflow.FixCloneFenceOwnership{}, err
-	}
-	records := make([]string, 0, 2)
-	for _, event := range events {
-		if event.Kind == workflow.JobEventFixCloneFenced {
-			records = append(records, event.Message)
-		}
-	}
-	return workflow.NewFixCloneFenceOwnership(records), nil
-}
-
-// fixCloneFenceOwnershipResolver maps a fix-clone PATH to its owning job's fence
-// records. The host-wide sweep has only paths to work from, and loading every
-// job's events per clone would be O(jobs x clones); this reads the job list once
-// and each owner's events at most once.
-func fixCloneFenceOwnershipResolver(ctx context.Context, store *db.Store) (func(string) (workflow.FixCloneFenceOwnership, error), error) {
-	jobs, err := store.ListJobs(ctx)
-	if err != nil {
-		return nil, err
-	}
-	ownerByPath := map[string]string{}
-	for _, job := range jobs {
-		payload, err := workflow.ParseJobPayload(job.Payload)
-		if err != nil || !payload.FixWorktree {
-			continue
-		}
-		path := strings.TrimSpace(payload.WorktreePath)
-		if path == "" {
-			continue
-		}
-		ownerByPath[filepath.Clean(path)] = job.ID
-	}
-	cache := map[string]workflow.FixCloneFenceOwnership{}
-	return func(clone string) (workflow.FixCloneFenceOwnership, error) {
-		clone = filepath.Clean(clone)
-		if owned, ok := cache[clone]; ok {
-			return owned, nil
-		}
-		jobID, ok := ownerByPath[clone]
-		if !ok {
-			// No owner on record: nothing here is provably ours, so nothing is pruned.
-			cache[clone] = workflow.FixCloneFenceOwnership{}
-			return cache[clone], nil
-		}
-		owned, err := fixCloneFenceOwnershipForJob(ctx, store, jobID)
-		if err != nil {
-			return workflow.FixCloneFenceOwnership{}, err
-		}
-		cache[clone] = owned
-		return owned, nil
-	}, nil
-}
-
 func finishDelegationCleanupAttempt(ctx context.Context, worker jobWorker, jobID, path string, reclaimed bool, now time.Time) error {
 	if !reclaimed {
 		// An absent path is only evidence of a completed removal when no
@@ -359,12 +300,7 @@ func finishDelegationCleanupAttempt(ctx context.Context, worker jobWorker, jobID
 		// first, because a rename needs the path to exist — a path already seen
 		// absent cannot acquire a quarantine afterwards.
 		if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
-			owned, err := fixCloneFenceOwnershipForJob(ctx, worker.Store, jobID)
-			if err != nil {
-				logDelegationReclaimFailure(worker.Stdout, "state", "fence-records", jobID, path, err)
-				return err
-			}
-			quarantines, err := workflow.FixCloneQuarantines(path, owned)
+			quarantines, err := workflow.FixCloneQuarantines(path)
 			if err != nil {
 				logDelegationReclaimFailure(worker.Stdout, "state", "quarantine-scan", jobID, path, err)
 				return err
@@ -1323,39 +1259,6 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 // ahead of dispatch.
 const terminalTaskWorktreeReclaimPassBudget = 8
 
-// fixCloneFenceRetentionWindow is how long a retired fix-clone fence is kept by
-// the scheduled sweep. It only has to outlive any process that could still name
-// the quarantine the fence replaced, and the reclaim that wrote it already proved
-// no process held the clone.
-const fixCloneFenceRetentionWindow = 24 * time.Hour
-
-// fixCloneFencePruneBudget bounds one sweep. The traversal rotates, so a host with
-// more entries than this finishes across ticks instead of spending a whole tick in
-// maintenance ahead of dispatch.
-const fixCloneFencePruneBudget = 256
-
-// fixCloneFencePruneCadence matches the worktree-maintenance cadence the other
-// filesystem passes run on.
-const fixCloneFencePruneCadence = 5 * time.Minute
-
-var fixCloneFencePruneClock = struct {
-	sync.Mutex
-	lastByRepo map[string]time.Time
-}{lastByRepo: map[string]time.Time{}}
-
-// fixCloneFencePruneDue reports whether this repo worker should run the sweep on
-// this tick, and records the decision.
-func fixCloneFencePruneDue(repoFilter string, now time.Time) bool {
-	fixCloneFencePruneClock.Lock()
-	defer fixCloneFencePruneClock.Unlock()
-	last, seen := fixCloneFencePruneClock.lastByRepo[repoFilter]
-	if seen && now.Sub(last) < fixCloneFencePruneCadence {
-		return false
-	}
-	fixCloneFencePruneClock.lastByRepo[repoFilter] = now
-	return true
-}
-
 // terminalTaskWorktreeReclaimResume rotates the bounded window so a candidate
 // that can never be reclaimed cannot starve the ones behind it: the pass resumes
 // at the first id at or after the last pass's unreached candidate.
@@ -1622,28 +1525,6 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 		}
 		if err := reclaimTerminalTaskWorktrees(ctx, worker, repoFilter, rootFilter, tracker.checkoutHeld, cand, stdout); err != nil {
 			writeLine(stdout, "terminal task worktree reclaim failed: %v", err)
-		}
-		// Retired fences are bounded HERE rather than in the reclaim itself: that
-		// pass creates the current fences and never revisits a completed clone, so
-		// nothing it can do would ever remove them.
-		//
-		// It is filesystem-driven, so it is gated on the SAME five-minute
-		// maintenance cadence the other worktree passes use and bounded per run.
-		// Running it on every repository worker tick would repeat an O(repos x
-		// entries) traversal per fleet tick and delay dispatch.
-		if fixCloneFencePruneDue(repoFilter, now) {
-			ownership, err := fixCloneFenceOwnershipResolver(ctx, worker.Store)
-			if err != nil {
-				writeLine(stdout, "fix clone fence prune skipped: %v", err)
-			} else {
-				pruned, scanned, err := workflow.PruneExpiredFixCloneFencesBounded(
-					worker.workflowHome(), now.Add(-fixCloneFenceRetentionWindow), fixCloneFencePruneBudget, ownership)
-				if err != nil {
-					writeLine(stdout, "fix clone fence prune failed after %d entries: %v", scanned, err)
-				} else if pruned > 0 {
-					writeLine(stdout, "pruned %d retired fix clone fence%s from %d scanned", pruned, pluralSuffix(pruned), scanned)
-				}
-			}
 		}
 	}
 	// Comment retries only post PR comments through the commenter — they never

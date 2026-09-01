@@ -18,11 +18,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
-	"sync"
-	"syscall"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -54,7 +51,7 @@ type WritableWorktreeLineageManager interface {
 	RemoteURL(ctx context.Context, remote string) (string, error)
 	RefreshCloneProofRefs(ctx context.Context, path string, remoteURL string) error
 	CloneOnlyCommit(ctx context.Context, path string) (string, error)
-	VerifyPackIndex(ctx context.Context, indexPath string) error
+	VerifyPackIndex(ctx context.Context, indexPath string, objectFormat string) (bool, error)
 	RemoveWorktree(ctx context.Context, path string) error
 	DeleteBranch(ctx context.Context, branch string) error
 }
@@ -1220,11 +1217,7 @@ func (e Engine) cleanupFixWorktree(ctx context.Context, jobID string, jobType st
 	// scan: a rename needs the path to exist, so a path already seen absent cannot
 	// acquire a quarantine afterwards.
 	if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
-		owned, ownErr := e.fixCloneFenceOwnership(opCtx, jobID)
-		if ownErr != nil {
-			return ownErr
-		}
-		quarantines, quarantineErr := FixCloneQuarantines(path, owned)
+		quarantines, quarantineErr := FixCloneQuarantines(path)
 		if quarantineErr != nil {
 			if persistErr := e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", quarantineErr); persistErr != nil {
 				return errors.Join(quarantineErr, persistErr)
@@ -1721,22 +1714,8 @@ const fixCloneFenceRetention = 24 * time.Hour
 // legitimately contain glob metacharacters (a repo or home directory named with
 // brackets), and a pattern that silently matches nothing would be read as "no
 // quarantine" by callers that then delete.
-func FixCloneQuarantines(path string, owned FixCloneFenceOwnership) ([]string, error) {
-	quarantines, _, err := classifyFixCloneQuarantineNames(path, owned)
-	return quarantines, err
-}
-
-// FixCloneFences lists the spent quarantine names of a fix clone: zero-byte
-// regular files left behind so a delayed writer can never recreate the name.
-// Doctor and /api/health report them, because two directory entries per reclaimed
-// job are otherwise invisible inode usage.
-func FixCloneFences(path string, owned FixCloneFenceOwnership) ([]string, error) {
-	return fixCloneFences(path, owned)
-}
-
-func fixCloneFences(path string, owned FixCloneFenceOwnership) ([]string, error) {
-	_, fences, err := classifyFixCloneQuarantineNames(path, owned)
-	return fences, err
+func FixCloneQuarantines(path string) ([]string, error) {
+	return classifyFixCloneQuarantineNames(path)
 }
 
 // fixCloneFencePrefix opens the content of a spent-quarantine fence. What follows
@@ -1755,62 +1734,6 @@ const fixCloneFencePrefix = "gitmoot: spent fix-clone quarantine name; do not re
 // FixCloneFenceOwnership matches a file against.
 const JobEventFixCloneFenced = "delegation_worktree_fence_written"
 
-// FixCloneFenceOwnership is the set of fence nonces this host recorded, keyed by
-// absolute path. Callers load it from the job event log; the zero value proves
-// nothing, which makes every fence-shaped file a survivor.
-type FixCloneFenceOwnership struct {
-	nonceByPath map[string]string
-}
-
-// NewFixCloneFenceOwnership builds the registry from recorded fence events.
-func NewFixCloneFenceOwnership(records []string) FixCloneFenceOwnership {
-	owned := FixCloneFenceOwnership{nonceByPath: make(map[string]string, len(records))}
-	for _, record := range records {
-		path, nonce, ok := strings.Cut(strings.TrimSpace(record), " ")
-		if !ok || strings.TrimSpace(path) == "" || strings.TrimSpace(nonce) == "" {
-			continue
-		}
-		owned.nonceByPath[filepath.Clean(path)] = nonce
-	}
-	return owned
-}
-
-func (o FixCloneFenceOwnership) expected(path string) (string, bool) {
-	if o.nonceByPath == nil {
-		return "", false
-	}
-	nonce, ok := o.nonceByPath[filepath.Clean(path)]
-	return nonce, ok
-}
-
-// proven reports whether the file at path is a fence this host recorded.
-func (o FixCloneFenceOwnership) proven(path string, info fs.FileInfo) bool {
-	nonce, ok := o.expected(path)
-	if !ok || !info.Mode().IsRegular() || info.Size() != int64(len(fixCloneFencePrefix)+len(nonce)+1) {
-		return false
-	}
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Nlink != 1 {
-		return false
-	}
-	content, err := os.ReadFile(path)
-	if err != nil {
-		return false
-	}
-	return bytes.Equal(content, fixCloneFenceContent(nonce))
-}
-
-func fixCloneFenceContent(nonce string) []byte {
-	return []byte(fixCloneFencePrefix + nonce + "\n")
-}
-
-func newFixCloneFenceNonce() (string, error) {
-	raw := make([]byte, 16)
-	if _, err := rand.Read(raw); err != nil {
-		return "", fmt.Errorf("generate fix clone fence nonce: %w", err)
-	}
-	return hex.EncodeToString(raw), nil
-}
-
 // classifyFixCloneQuarantineNames splits the quarantine-named siblings of a clone
 // into SURVIVORS and FENCES.
 //
@@ -1819,18 +1742,18 @@ func newFixCloneFenceNonce() (string, error) {
 // device node, a non-empty file — is a survivor, because it can hold or reach
 // content and something other than this code created it. Classifying by "not a
 // directory" let a symlink win a fence name and then vanish from every scan.
-func classifyFixCloneQuarantineNames(path string, owned FixCloneFenceOwnership) (survivors, fences []string, err error) {
+func classifyFixCloneQuarantineNames(path string) (survivors []string, err error) {
 	path = filepath.Clean(strings.TrimSpace(path))
 	if path == "" || path == "." {
-		return nil, nil, nil
+		return nil, nil
 	}
 	parent, base := filepath.Dir(path), filepath.Base(path)
 	entries, err := os.ReadDir(parent)
 	if os.IsNotExist(err) {
-		return nil, nil, nil
+		return nil, nil
 	}
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	prefix := base + fixCloneQuarantinePrefix
 	for _, entry := range entries {
@@ -1847,189 +1770,17 @@ func classifyFixCloneQuarantineNames(path string, owned FixCloneFenceOwnership) 
 			if os.IsNotExist(infoErr) {
 				continue
 			}
-			return nil, nil, fmt.Errorf("classify fix clone quarantine %s: %w", candidate, infoErr)
+			return nil, fmt.Errorf("classify fix clone quarantine %s: %w", candidate, infoErr)
 		}
 		// A fence is a file this code wrote: it carries the exact marker, is
 		// exactly that long, and has ONE link. A zero-byte file, a hard link to
 		// someone else's inode, a symlink, a directory or any other content is a
 		// SURVIVOR — a writer can plant those, and treating them as owned made an
 		// unproven name look like a completed removal.
-		if owned.proven(candidate, info) {
-			fences = append(fences, candidate)
-			continue
-		}
+		_ = info
 		survivors = append(survivors, candidate)
 	}
-	return survivors, fences, nil
-}
-
-// fenceFixCloneQuarantineName makes a quarantine name permanently unusable. A
-// writer that learned the name while the proofs ran can otherwise recreate it
-// AFTER the final survivor scan, and that late entry is invisible to every later
-// pass because the reclaim completion event retires the job.
-//
-// The fence is a regular file carrying a fixed MARKER: `mkdir` on the name fails
-// with EEXIST and any path BELOW it fails with ENOTDIR, so no content can ever be
-// orphaned there. The marker is what makes the file PROVABLY ours — an empty file
-// or a hard link a same-user writer plants at the same name carries no marker and
-// is classified as a survivor, which blocks completion instead of forging one.
-//
-// It returns false when the name is already taken, which is the writer having won
-// the race — the caller then retains instead of completing. O_NOFOLLOW makes the
-// refusal explicit for an existing symlink rather than relying on O_EXCL alone.
-func fenceFixCloneQuarantineName(path string) (bool, string, error) {
-	nonce, err := newFixCloneFenceNonce()
-	if err != nil {
-		return false, "", err
-	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, 0o400)
-	if err != nil {
-		if os.IsExist(err) || errors.Is(err, syscall.ELOOP) {
-			return false, "", nil
-		}
-		return false, "", fmt.Errorf("fence fix clone quarantine name %s: %w", path, err)
-	}
-	if _, err := file.Write(fixCloneFenceContent(nonce)); err != nil {
-		file.Close()
-		_ = os.Remove(path)
-		return false, "", fmt.Errorf("write fix clone fence %s: %w", path, err)
-	}
-	if err := file.Close(); err != nil {
-		_ = os.Remove(path)
-		return false, "", fmt.Errorf("close fix clone fence %s: %w", path, err)
-	}
-	return true, nonce, nil
-}
-
-// PruneFixCloneFences removes spent fences last modified before cutoff. A fence
-// only has to outlive the writers that could still name it, and the pass that
-// wrote it already proved no process held the clone. It never touches a survivor.
-func PruneFixCloneFences(path string, cutoff time.Time, owned FixCloneFenceOwnership) (int, error) {
-	fences, err := fixCloneFences(path, owned)
-	if err != nil {
-		return 0, err
-	}
-	pruned := 0
-	for _, fence := range fences {
-		removed, err := removeOwnedFence(fence, cutoff, owned)
-		if err != nil {
-			return pruned, err
-		}
-		if removed {
-			pruned++
-		}
-	}
-	return pruned, nil
-}
-
-// PruneExpiredFixCloneFencesBounded is the SCHEDULED half of fence lifecycle: it
-// sweeps fix-clone directories and removes retired fences older than cutoff,
-// stopping after budget entries and resuming there next time.
-//
-// The in-pass prune cannot bound them on its own. It runs immediately after
-// creating the current pass's fences, so those are always newer than any cutoff,
-// and a completed reclaim never becomes a candidate again — so without this sweep
-// two directory entries per reclaimed clone would persist forever. It is driven by
-// the FILESYSTEM for that reason, and BOUNDED because that traversal is
-// proportional to accumulated entries rather than to work in flight.
-//
-// It returns what it removed and what it looked at, so an operator can see the
-// sweep making progress rather than inferring it.
-func PruneExpiredFixCloneFencesBounded(home string, cutoff time.Time, budget int, ownership func(clone string) (FixCloneFenceOwnership, error)) (pruned int, scanned int, err error) {
-	home = strings.TrimSpace(home)
-	if home == "" || budget <= 0 || ownership == nil {
-		return 0, 0, nil
-	}
-	repos, err := os.ReadDir(filepath.Join(home, "worktrees"))
-	if os.IsNotExist(err) {
-		return 0, 0, nil
-	}
-	if err != nil {
-		return 0, 0, err
-	}
-	resume := fixCloneFenceSweepResume(home)
-	// Rotate: start after the repo the last bounded run stopped at, so a host with
-	// more entries than the budget still reaches every repo across ticks.
-	ordered := make([]string, 0, len(repos))
-	for _, repo := range repos {
-		if repo.IsDir() {
-			ordered = append(ordered, repo.Name())
-		}
-	}
-	sort.Strings(ordered)
-	offset := 0
-	for i, name := range ordered {
-		if name >= resume {
-			offset = i
-			break
-		}
-	}
-	for step := 0; step < len(ordered); step++ {
-		name := ordered[(offset+step)%len(ordered)]
-		fixes := filepath.Join(home, "worktrees", name, "fixes")
-		entries, readErr := os.ReadDir(fixes)
-		if os.IsNotExist(readErr) {
-			continue
-		}
-		if readErr != nil {
-			return pruned, scanned, readErr
-		}
-		clones := map[string]struct{}{}
-		for _, entry := range entries {
-			scanned++
-			base, _, found := strings.Cut(entry.Name(), fixCloneQuarantinePrefix)
-			if !found || base == "" {
-				continue
-			}
-			clones[filepath.Join(fixes, base)] = struct{}{}
-		}
-		for clone := range clones {
-			owned, ownErr := ownership(clone)
-			if ownErr != nil {
-				return pruned, scanned, ownErr
-			}
-			count, pruneErr := PruneFixCloneFences(clone, cutoff, owned)
-			pruned += count
-			if pruneErr != nil {
-				return pruned, scanned, pruneErr
-			}
-		}
-		if scanned >= budget {
-			setFixCloneFenceSweepResume(home, ordered[(offset+step+1)%len(ordered)])
-			return pruned, scanned, nil
-		}
-	}
-	setFixCloneFenceSweepResume(home, "")
-	return pruned, scanned, nil
-}
-
-var fixCloneFenceSweepCursor = struct {
-	sync.Mutex
-	repoByHome map[string]string
-}{repoByHome: map[string]string{}}
-
-func fixCloneFenceSweepResume(home string) string {
-	fixCloneFenceSweepCursor.Lock()
-	defer fixCloneFenceSweepCursor.Unlock()
-	return fixCloneFenceSweepCursor.repoByHome[home]
-}
-
-func setFixCloneFenceSweepResume(home, repo string) {
-	fixCloneFenceSweepCursor.Lock()
-	defer fixCloneFenceSweepCursor.Unlock()
-	if repo == "" {
-		delete(fixCloneFenceSweepCursor.repoByHome, home)
-		return
-	}
-	fixCloneFenceSweepCursor.repoByHome[home] = repo
-}
-
-// FenceFixCloneQuarantineNameForTest exposes fence creation to the CLI package's
-// accounting tests. Doctor has to distinguish a fence this code wrote from a file
-// a writer planted, and a test that hand-rolls the marker would pass even if
-// production stopped writing it.
-func FenceFixCloneQuarantineNameForTest(path string) (bool, string, error) {
-	return fenceFixCloneQuarantineName(path)
+	return survivors, nil
 }
 
 func newFixCloneQuarantinePath(path string) (string, error) {
@@ -2235,7 +1986,21 @@ func packedGitObjectDatabase(ctx context.Context, absolute, rel string, entry fs
 	// digest above, so the last word belongs to Git itself, which walks the entries,
 	// offsets and CRCs before it will read from the pair.
 	if verify != nil {
-		if err := verify(ctx, indexPath); err != nil {
+		// SHA-256 pairs cannot be verified from a SHA-1 repository context, so the
+		// format is named explicitly from the digest width the index carries.
+		// SHA-1 is Git's default and naming it explicitly is rejected in some
+		// contexts; only the non-default format has to be declared.
+		format := ""
+		if len(packDigest) == sha256.Size {
+			format = "sha256"
+		}
+		valid, err := verify(ctx, indexPath, format)
+		if err != nil {
+			// Git could not be asked. That proves nothing, and treating silence as
+			// "ordinary content" would classify a real object database as deletable.
+			return filepath.Dir(filepath.Dir(rel)), nil
+		}
+		if !valid {
 			return "", nil
 		}
 	}
@@ -2360,6 +2125,11 @@ func newGitDigest(checksumSize int) hash.Hash {
 // below a clone's root object database. CloneOnlyCommit proves only the root
 // repository: ignored nested repositories, initialized submodules, and bare
 // repositories carry separate commit graphs that disappear with the clone.
+// packIndexVerifier is Git's own pack validation, injected so this package keeps
+// no Git dependency of its own. A nil verifier falls back to checksum-only
+// recognition, which is strictly more conservative: it retains more.
+type packIndexVerifier func(ctx context.Context, indexPath string, objectFormat string) (bool, error)
+
 func nestedGitObjectDatabase(ctx context.Context, path string, verify packIndexVerifier) (string, error) {
 	path = filepath.Clean(path)
 	var nested string
@@ -2421,244 +2191,62 @@ func nestedGitObjectDatabase(ctx context.Context, path string, verify packIndexV
 	return nested, nil
 }
 
-// fixCloneInventory is the exact set of entries a removal is authorised to unlink,
-// keyed by path relative to the clone root.
-type fixCloneInventory map[string]fixCloneEntry
-
-// errFixCloneTreeChanged aborts a removal whose tree no longer matches the proof.
-var errFixCloneTreeChanged = errors.New("fix clone changed after its removal proof")
-
-// scanFixCloneTree walks a proven clone ONCE, returning both answers the removal
-// needs: the first nested Git object database (empty when there is none) and, when
-// there is none, the inventory the unlink phase is allowed to act on.
-// packIndexVerifier is Git's own pack validation, injected so this package keeps
-// no Git dependency of its own. A nil verifier falls back to checksum-only
-// recognition, which is strictly more conservative (it retains more).
-type packIndexVerifier func(ctx context.Context, indexPath string) error
-
-func scanFixCloneTree(ctx context.Context, path string, verify packIndexVerifier) (string, fixCloneInventory, error) {
-	path = filepath.Clean(path)
-	var nested string
-	inventory := fixCloneInventory{}
-	err := filepath.WalkDir(path, func(candidate string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(path, candidate)
-		if err != nil {
-			return err
-		}
-		if rel == "." {
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil {
-			if os.IsNotExist(err) {
-				return nil
-			}
-			return err
-		}
-		inventory[rel] = fixCloneEntryFrom(entry, info)
-
-		// Do not walk the root repository's proven object database. Everything
-		// else under .git remains visible: submodules and tool-managed nested
-		// repositories can keep separate object databases there. Its CONTENTS are
-		// still inventoried below, because the unlink phase has to remove them.
-		if entry.IsDir() && rel == filepath.Join(".git", "objects") {
-			return inventoryUnscannedSubtree(ctx, path, rel, inventory)
-		}
-		if rel != ".git" && entry.Name() == ".git" {
-			nested = rel
-			return fs.SkipAll
-		}
-		objectDB, err := looseGitObjectDatabase(candidate, rel, entry)
-		if err != nil {
-			return err
-		}
-		if objectDB == "" {
-			if objectDB, err = packedGitObjectDatabase(ctx, candidate, rel, entry, verify); err != nil {
-				return err
-			}
-		}
-		if objectDB != "" {
-			nested = objectDB
-			return fs.SkipAll
-		}
-		if !entry.IsDir() || entry.Name() != "objects" {
-			return nil
-		}
-		info, infoErr := os.Stat(filepath.Join(candidate, "info"))
-		pack, packErr := os.Stat(filepath.Join(candidate, "pack"))
-		if infoErr == nil && packErr == nil && info.IsDir() && pack.IsDir() {
-			nested = rel
-			return fs.SkipAll
-		}
-		if (infoErr != nil && !os.IsNotExist(infoErr)) || (packErr != nil && !os.IsNotExist(packErr)) {
-			return fmt.Errorf("inspect possible Git object database %s: info: %v; pack: %v", candidate, infoErr, packErr)
-		}
-		return nil
-	})
-	if err != nil {
-		return "", nil, err
-	}
-	if nested != "" {
-		return nested, nil, nil
-	}
-	return "", inventory, nil
-}
-
-// inventoryUnscannedSubtree records a subtree the nested-database scan skips. The
-// scan skips the root object database because it is already proved by
-// CloneOnlyCommit, but every entry under it still has to be inventoried or the
-// unlink phase would refuse to remove the clone at all.
-func inventoryUnscannedSubtree(ctx context.Context, root, rel string, inventory fixCloneInventory) error {
-	err := filepath.WalkDir(filepath.Join(root, rel), func(candidate string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		child, err := filepath.Rel(root, candidate)
-		if err != nil {
-			return err
-		}
-		if child == rel {
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil {
-			if os.IsNotExist(err) {
-				return nil
-			}
-			return err
-		}
-		inventory[child] = fixCloneEntryFrom(entry, info)
-		return nil
-	})
-	if err != nil {
+// recordFixCloneReclaimableByOperator is the outcome a fully proved clone now
+// reaches. It is a RETENTION with a different reason: nothing is wrong with the
+// clone, the pass simply will not delete what it cannot delete atomically. The
+// obligation stays open so doctor keeps reporting it until an operator acts.
+func (e Engine) recordFixCloneReclaimableByOperator(ctx context.Context, jobID, path string) error {
+	if err := e.recordFixCloneRetention(ctx, jobID, "delegation_worktree_reclaimable_manual",
+		fmt.Sprintf("fix clone %s proved disposable but was NOT removed: an atomic conditional unlink is unavailable, so removal is left to an operator", path)); err != nil {
 		return err
 	}
-	return fs.SkipDir
+	return e.deferDelegationCleanupObligation(context.WithoutCancel(ctx), jobID, path, db.CleanupReasonUnpublishedCommits)
 }
 
-func isDirectoryNotEmpty(err error) bool {
-	return errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST)
-}
-
-// restoreChangedFixClone puts a partially removed clone back at its managed path
-// after a concurrent write aborted the removal. The remaining tree holds the
-// writer's new content plus whatever the proof had not yet unlinked, and the next
-// pass re-proves all of it from scratch.
-func restoreChangedFixClone(quarantine, path string) (bool, error) {
-	if err := os.Rename(quarantine, path); err != nil {
-		return false, fmt.Errorf("restore fix clone %s to %s after a concurrent write: %w", quarantine, path, err)
-	}
-	return false, nil
-}
-
-// fixCloneFenceOwnership loads the durable fence records for one job. A fence is
-// only ours if its nonce is here, so a caller with no records proves nothing and
-// every fence-shaped file stays a survivor.
-func (e Engine) fixCloneFenceOwnership(ctx context.Context, jobID string) (FixCloneFenceOwnership, error) {
-	events, err := e.Store.ListJobEvents(ctx, jobID)
-	if err != nil {
-		return FixCloneFenceOwnership{}, err
-	}
-	records := make([]string, 0, 2)
-	for _, event := range events {
-		if event.Kind == JobEventFixCloneFenced {
-			records = append(records, event.Message)
-		}
-	}
-	return NewFixCloneFenceOwnership(records), nil
-}
-
-// fenceFixCloneQuarantineNameForJob writes a fence and records its nonce in the
-// same job's event log, which is what later passes match the file against.
-func (e Engine) fenceFixCloneQuarantineNameForJob(ctx context.Context, jobID, path string) (bool, error) {
-	fenced, nonce, err := fenceFixCloneQuarantineName(path)
-	if err != nil || !fenced {
-		return false, err
-	}
-	if err := e.Store.AddJobEvent(context.WithoutCancel(ctx), db.JobEvent{
-		JobID:   jobID,
-		Kind:    JobEventFixCloneFenced,
-		Message: fmt.Sprintf("%s %s", path, nonce),
-	}); err != nil {
-		// A fence whose record failed to persist would be indistinguishable from a
-		// writer's file forever: remove it and let the caller retain instead.
-		_ = os.Remove(path)
-		return false, fmt.Errorf("record fix clone fence %s: %w", path, err)
-	}
-	return true, nil
-}
-
-// reclaimAgedTerminalFixClone removes a terminal fix worktree's independent
-// clone only after proving that its object database holds nothing unpublished.
-// A fix worktree is a standalone clone, so removal takes its objects with it:
-// HEAD ancestry is not a sufficient proof, because side branches, tags, stashes
-// and reflog-only commits all survive a clean `git status` and all die with the
-// directory.
+// reclaimAgedTerminalFixClone proves whether a terminal fix worktree's clone is
+// disposable and, when it is, hands it to an operator instead of deleting it.
+//
+// AUTOMATIC REMOVAL IS DISABLED, deliberately. A fix worktree is a standalone
+// clone, so an unlink takes its object database with it, and a removal has to
+// delete exactly the bytes it proved. Linux cannot express that: unlink is by
+// NAME, there is no inode-conditional unlinkat, and against a same-user writer no
+// amount of descriptor discipline turns stat-then-unlink into an atomic
+// conditional delete. Successive review rounds each found another instance of that
+// one gap, which is the signature of a property the platform does not provide
+// rather than a bug awaiting a patch.
+//
+// So this pass keeps everything decidable — the proofs — and drops the step that
+// is not. A clone that passes every proof is recorded as reclaimable and left on
+// disk with its cleanup obligation open, where `gitmoot doctor` reports it for an
+// operator. A clone that fails any proof is retained with the reason it failed.
+//
+// What this costs: the fix-clone arm no longer frees disk by itself. What it buys:
+// the pass cannot destroy bytes it did not prove. The other reclaim arms are
+// unaffected — they manage LINKED worktrees, where removal does not take an object
+// database with it.
 func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, payload JobPayload, path string) (bool, error) {
 	expected, err := FixWorktreePath(e.Home, payload.Repo, jobID)
 	if err != nil || filepath.Clean(path) != filepath.Clean(expected) {
 		return false, fmt.Errorf("refusing TTL reclaim for unmanaged fix worktree %s", path)
 	}
-	// Absence is observed FIRST, then the quarantines. That order is what makes the
-	// inference sound against a concurrent pass: a rename requires the path to
-	// exist, so a path already seen absent cannot acquire a quarantine afterwards,
-	// while the reverse order lets a rename slip between the scan and the stat and
-	// makes this pass record a completed removal for a clone that is still alive.
 	present, err := pathPresent(path)
 	if err != nil {
 		return false, fmt.Errorf("inspect aged terminal fix worktree %s: %w", path, err)
 	}
-	preOwned, err := e.fixCloneFenceOwnership(ctx, jobID)
-	if err != nil {
-		return false, err
-	}
-	quarantines, err := FixCloneQuarantines(path, preOwned)
-	if err != nil {
-		return false, fmt.Errorf("inspect fix clone quarantines beside %s: %w", path, err)
-	}
-	switch {
-	case len(quarantines) > 1:
-		return false, fmt.Errorf("refusing TTL reclaim: %d quarantined fix clones survive beside %s: %s", len(quarantines), path, strings.Join(quarantines, ", "))
-	case len(quarantines) == 1 && present:
-		return false, fmt.Errorf("refusing TTL reclaim: quarantined fix clone %s from an interrupted removal still exists beside %s", quarantines[0], path)
-	case len(quarantines) == 1:
-		// A survivor is only restorable when it is a DIRECTORY this code could have
-		// renamed aside. A symlink or a file at that name was created by something
-		// else: restoring it would install a foreign object as the clone and then
-		// re-prove it as one, so the pass refuses and leaves it for an operator.
-		info, statErr := os.Lstat(quarantines[0])
-		if statErr != nil {
-			return false, fmt.Errorf("inspect quarantined fix clone %s: %w", quarantines[0], statErr)
-		}
-		if !info.IsDir() {
-			return false, fmt.Errorf("refusing TTL reclaim: quarantine name %s beside %s is a %s created by another writer, not an interrupted removal", quarantines[0], path, info.Mode().Type())
-		}
-		// Interrupted removal: restore the clone and let a later pass re-prove it
-		// from scratch. The earlier proofs died with the interrupted pass.
-		if renameErr := os.Rename(quarantines[0], path); renameErr != nil {
-			return false, fmt.Errorf("restore interrupted quarantined fix clone %s to %s: %w", quarantines[0], path, renameErr)
-		}
-		return false, e.Store.AddJobEvent(context.WithoutCancel(ctx), db.JobEvent{
-			JobID: jobID, Kind: "delegation_worktree_quarantine_restored",
-			Message: fmt.Sprintf("restored fix clone %s after an interrupted TTL removal; safety will be re-proven", path),
-		})
-	case !present:
+	if !present {
+		// Someone else removed it. The bookkeeping still has to close, and closing
+		// it deletes nothing.
 		return e.completeAgedTerminalFixWorktreeReclaim(ctx, jobID, path)
 	}
-	// A live process wins before any manager capability or probe matters: the
-	// cheapest gate is also the one that must never be skipped. An INCONCLUSIVE
-	// probe retains the clone too, but it is recorded: an unreadable process table
-	// makes the whole feature inert, and a silent keep is indistinguishable from a
-	// worker that is genuinely still running.
+	if quarantines, err := FixCloneQuarantines(path); err != nil {
+		return false, fmt.Errorf("inspect fix clone quarantines beside %s: %w", path, err)
+	} else if len(quarantines) > 0 {
+		return false, fmt.Errorf("refusing TTL reclaim: %d unowned sibling(s) survive beside %s: %s",
+			len(quarantines), path, strings.Join(quarantines, ", "))
+	}
+	// A live process wins before any probe matters. An INCONCLUSIVE probe retains
+	// too, and is recorded: an unreadable process table makes the pass inert, and a
+	// silent keep is indistinguishable from a worker that is genuinely running.
 	if live, known := e.worktreeLiveness(path); !known {
 		return false, e.recordFixCloneLivenessUnknown(ctx, jobID, path)
 	} else if live {
@@ -2668,23 +2256,12 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 	if !ok || manager == nil {
 		return false, errors.New("delegation worktree manager cannot prove fix worktree lineage")
 	}
-	// Cleanliness here means NO UNSAVED WORK — tracked modifications and untracked
-	// files. Ignored build output is allowed only after the separate scan below
-	// proves that it contains no nested Git repository or object database. The
-	// root object-database proof cannot see commits stored in those databases.
 	clean, err := manager.WorktreeCleanAt(ctx, path)
 	if err != nil {
 		return false, fmt.Errorf("prove aged terminal fix worktree clean: %w", err)
 	}
 	if !clean {
 		return false, e.recordFixCloneRetainedDirty(ctx, jobID, path)
-	}
-	nested, err := nestedGitObjectDatabase(ctx, path, manager.VerifyPackIndex)
-	if err != nil {
-		return false, fmt.Errorf("inspect aged terminal fix worktree for nested Git object databases: %w", err)
-	}
-	if nested != "" {
-		return false, e.retainFixCloneWithNestedRepository(ctx, jobID, path, nested)
 	}
 	// The clone's own `origin` is writable by whatever ran inside it, so it is not
 	// evidence: the registered repository checkout supplies the trusted URL.
@@ -2705,179 +2282,14 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 	if unpublished != "" {
 		return false, e.retainFixCloneWithUnpublishedCommits(ctx, jobID, path, unpublished)
 	}
-	if live, known := e.worktreeLiveness(path); !known {
-		return false, e.recordFixCloneLivenessUnknown(ctx, jobID, path)
-	} else if live {
-		return false, e.recordFixCloneRetainedLive(ctx, jobID, path)
-	}
-	// Serialise only the MUTATION window — rename, re-proof, delete — against a
-	// second reclaimer on this host (the documented `gitmoot daemon restart`
-	// double-daemon overlap). The read-only proofs and the remote fetch above stay
-	// outside the lock: holding a shared checkout lock across a two-minute network
-	// timeout would delay every other pass that takes the same key.
-	//
-	// An empty checkout path makes that lock a silent no-op, so the removal refuses
-	// rather than proceeding unserialised: an unenforceable claim is worse than a
-	// retained directory.
-	if strings.TrimSpace(e.DelegationCheckout) == "" {
-		return false, errors.New("refusing TTL fix clone removal: no registered checkout to serialise reclaimers on")
-	}
-	lockCtx := context.WithoutCancel(ctx)
-	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(lockCtx, e.Store, e.DelegationCheckout, "worktree-ttl-reclaim:"+jobID, time.Now().UTC())
+	nested, err := nestedGitObjectDatabase(ctx, path, manager.VerifyPackIndex)
 	if err != nil {
-		return false, fmt.Errorf("lock checkout for TTL fix clone reclaim: %w", err)
-	}
-	defer func() {
-		if releaseCheckoutLock != nil {
-			_ = releaseCheckoutLock(context.Background())
-		}
-	}()
-	quarantine, err := newFixCloneQuarantinePath(path)
-	if err != nil {
-		return false, err
-	}
-	if err := os.Rename(path, quarantine); err != nil {
-		return false, fmt.Errorf("quarantine aged terminal fix worktree %s: %w", path, err)
-	}
-	restore := func(reason error) (bool, error) {
-		if renameErr := os.Rename(quarantine, path); renameErr != nil {
-			if reason != nil {
-				return false, fmt.Errorf("restore quarantined fix clone %s to %s: %w (while retaining after %v)", quarantine, path, renameErr, reason)
-			}
-			return false, fmt.Errorf("restore quarantined fix clone %s to %s: %w", quarantine, path, renameErr)
-		}
-		return false, reason
-	}
-	if live, known := e.worktreeLiveness(quarantine); !known {
-		if _, restoreErr := restore(nil); restoreErr != nil {
-			return false, restoreErr
-		}
-		return false, e.recordFixCloneLivenessUnknown(ctx, jobID, path)
-	} else if live {
-		if _, restoreErr := restore(nil); restoreErr != nil {
-			return false, restoreErr
-		}
-		return false, e.recordFixCloneRetainedLive(ctx, jobID, path)
-	}
-	clean, err = manager.WorktreeCleanAt(ctx, quarantine)
-	if err != nil {
-		return restore(fmt.Errorf("recheck quarantined fix clone clean: %w", err))
-	}
-	if !clean {
-		if _, restoreErr := restore(nil); restoreErr != nil {
-			return false, restoreErr
-		}
-		return false, e.recordFixCloneRetainedDirty(ctx, jobID, path)
-	}
-	unpublished, err = manager.CloneOnlyCommit(ctx, quarantine)
-	if err != nil {
-		return restore(fmt.Errorf("recheck quarantined fix clone for unpublished commits: %w", err))
-	}
-	if unpublished != "" {
-		if _, restoreErr := restore(nil); restoreErr != nil {
-			return false, restoreErr
-		}
-		return false, e.retainFixCloneWithUnpublishedCommits(ctx, jobID, path, unpublished)
-	}
-	// Seal the proof path before the final content scan. CloneOnlyCommit is the
-	// last operation that legitimately knows the first random quarantine name, so
-	// after this rename a path-based writer can only act on names we then FENCE.
-	sealed, err := newFixCloneQuarantinePath(path)
-	if err != nil {
-		return restore(err)
-	}
-	if err := os.Rename(quarantine, sealed); err != nil {
-		return restore(fmt.Errorf("seal proved fix clone %s as %s: %w", quarantine, sealed, err))
-	}
-	freed := quarantine
-	quarantine = sealed
-	// The rename freed the first name, and a writer that learned it can recreate
-	// it at any later instant — including after the final survivor scan, where no
-	// later pass would ever look again. Fencing it with a zero-byte file makes that
-	// impossible rather than merely unobserved.
-	if fenced, err := e.fenceFixCloneQuarantineNameForJob(ctx, jobID, freed); err != nil {
-		return restore(err)
-	} else if !fenced {
-		if _, restoreErr := restore(nil); restoreErr != nil {
-			return false, restoreErr
-		}
-		return false, e.retainFixCloneWithRacingQuarantineWriter(ctx, jobID, path, freed)
-	}
-	// ONE walk answers both remaining questions: is there a nested object database,
-	// and exactly which entries is the removal authorised to unlink.
-	nested, inventory, err := scanFixCloneTree(ctx, quarantine, manager.VerifyPackIndex)
-	if err != nil {
-		return restore(fmt.Errorf("recheck sealed fix clone for nested Git object databases: %w", err))
+		return false, fmt.Errorf("inspect aged terminal fix worktree for nested Git object databases: %w", err)
 	}
 	if nested != "" {
-		if _, restoreErr := restore(nil); restoreErr != nil {
-			return false, restoreErr
-		}
 		return false, e.retainFixCloneWithNestedRepository(ctx, jobID, path, nested)
 	}
-	// An existing cwd or open file descriptor follows the second rename. Refuse
-	// removal unless /proc conclusively shows that no such writer survives. This is
-	// a cheap early exit, NOT the guarantee: the guarantee is the inventoried
-	// unlink below, which the kernel enforces at the moment of removal.
-	if live, known := e.worktreeWriterLiveness(quarantine); !known {
-		if _, restoreErr := restore(nil); restoreErr != nil {
-			return false, restoreErr
-		}
-		return false, e.recordFixCloneLivenessUnknown(ctx, jobID, path)
-	} else if live {
-		if _, restoreErr := restore(nil); restoreErr != nil {
-			return false, restoreErr
-		}
-		return false, e.recordFixCloneRetainedLive(ctx, jobID, path)
-	}
-	// Remove EXACTLY what the scan above proved. Content a writer created between
-	// that scan and this unlink is not in the inventory, so it is never removed and
-	// its parent's rmdir fails instead — the removal aborts and the clone is put
-	// back with the new content intact.
-	if err := removeInventoriedTree(quarantine, inventory); err != nil {
-		if errors.Is(err, errFixCloneTreeChanged) {
-			if _, restoreErr := restoreChangedFixClone(quarantine, path); restoreErr != nil {
-				return false, restoreErr
-			}
-			return false, e.retainFixCloneWithConcurrentWrite(ctx, jobID, path, err)
-		}
-		return false, fmt.Errorf("remove quarantined fix clone %s: %w", quarantine, err)
-	}
-	// Fence the sealed name too: between RemoveAll and this call it is the only
-	// other name a writer could have observed. Losing the name means something
-	// else now owns it — a directory, or a SYMLINK aimed at a directory it keeps
-	// writing into — so the reclaim records why it did not complete instead of
-	// returning silently, which previously let the next pass see no survivor and
-	// retire the job.
-	if fenced, err := e.fenceFixCloneQuarantineNameForJob(ctx, jobID, quarantine); err != nil {
-		return false, err
-	} else if !fenced {
-		return false, e.retainFixCloneWithRacingQuarantineWriter(ctx, jobID, path, quarantine)
-	}
-	owned, err := e.fixCloneFenceOwnership(ctx, jobID)
-	if err != nil {
-		return false, err
-	}
-	if survivors, err := FixCloneQuarantines(path, owned); err != nil {
-		return false, fmt.Errorf("recheck fix clone quarantine siblings after removal: %w", err)
-	} else if len(survivors) != 0 {
-		return false, e.retainFixCloneWithRacingQuarantineWriter(ctx, jobID, path, strings.Join(survivors, ", "))
-	}
-	// Spent fences are bounded here rather than kept forever: this pass has just
-	// proved no process holds a working directory or descriptor inside the clone,
-	// so a fence from an earlier pass can no longer be protecting anything.
-	if _, err := PruneFixCloneFences(path, time.Now().UTC().Add(-fixCloneFenceRetention), owned); err != nil {
-		return false, err
-	}
-	// A concurrent actor may have restored this clone to its original path while we
-	// held the quarantine name. Completing the reclaim then would record a removal
-	// for a clone that is alive again.
-	if present, err := pathPresent(path); err != nil {
-		return false, fmt.Errorf("recheck aged terminal fix worktree %s after removal: %w", path, err)
-	} else if present {
-		return false, nil
-	}
-	return e.completeAgedTerminalFixWorktreeReclaim(ctx, jobID, path)
+	return false, e.recordFixCloneReclaimableByOperator(ctx, jobID, path)
 }
 
 func (e Engine) retainFixCloneWithUnpublishedCommits(ctx context.Context, jobID, path, sha string) error {
@@ -2891,31 +2303,6 @@ func (e Engine) retainFixCloneWithUnpublishedCommits(ctx context.Context, jobID,
 func (e Engine) retainFixCloneWithNestedRepository(ctx context.Context, jobID, path, nested string) error {
 	if err := e.recordFixCloneRetention(ctx, jobID, "delegation_worktree_retained_unpublished",
 		fmt.Sprintf("fix clone %s retained after TTL: nested Git object database %s has unproved recoverability", path, nested)); err != nil {
-		return err
-	}
-	return e.deferDelegationCleanupObligation(context.WithoutCancel(ctx), jobID, path, db.CleanupReasonUnpublishedCommits)
-}
-
-// retainFixCloneWithRacingQuarantineWriter records the one outcome the fence can
-// observe: something else created a directory at a quarantine name of this clone
-// while the proofs ran. Its content is unproven, so the clone is restored and the
-// obligation stays open rather than the racing directory being deleted.
-func (e Engine) retainFixCloneWithRacingQuarantineWriter(ctx context.Context, jobID, path, quarantine string) error {
-	if err := e.recordFixCloneRetention(ctx, jobID, "delegation_worktree_retained_unpublished",
-		fmt.Sprintf("fix clone %s retained after TTL: another writer created quarantine %s during the removal proof", path, quarantine)); err != nil {
-		return err
-	}
-	return e.deferDelegationCleanupObligation(context.WithoutCancel(ctx), jobID, path, db.CleanupReasonUnpublishedCommits)
-}
-
-// retainFixCloneWithConcurrentWrite records the retention an aborted removal
-// takes: the tree gained or changed content between the proof and the unlink, so
-// the removal stopped with that content on disk. It is the observable half of the
-// inventory guard — without it, a clone that keeps losing this race would look
-// like a pass that simply never runs.
-func (e Engine) retainFixCloneWithConcurrentWrite(ctx context.Context, jobID, path string, cause error) error {
-	if err := e.recordFixCloneRetention(ctx, jobID, "delegation_worktree_retained_unpublished",
-		fmt.Sprintf("fix clone %s retained after TTL: %v, so the proved removal was abandoned with its content intact", path, cause)); err != nil {
 		return err
 	}
 	return e.deferDelegationCleanupObligation(context.WithoutCancel(ctx), jobID, path, db.CleanupReasonUnpublishedCommits)
@@ -3384,19 +2771,19 @@ func blockTaskForDirtyWorktree(ctx context.Context, store *db.Store, task db.Tas
 	if task.Title == "" {
 		task.Title = request.TaskTitle
 	}
-	if err := store.UpsertTask(ctx, task); err != nil {
-		return err
-	}
-	if err := store.AddTaskEvent(ctx, db.TaskEvent{
-		TaskID:    task.ID,
+	blockErr := BlockedError{Reason: reason}
+	blocked, err := store.BlockTaskWithEvent(ctx, task, db.TaskEvent{
 		Kind:      "stale_worktree_dirty_blocked",
 		FromState: fromState,
-		ToState:   string(TaskBlocked),
 		Reason:    reason,
-	}); err != nil {
-		return err
+	})
+	if err != nil {
+		if !blocked {
+			return err
+		}
+		return errors.Join(blockErr, fmt.Errorf("record dirty-worktree block for task %s: %w", task.ID, err))
 	}
-	return BlockedError{Reason: reason}
+	return blockErr
 }
 
 func TaskWorktreePath(home string, repo string, taskID string) (string, error) {

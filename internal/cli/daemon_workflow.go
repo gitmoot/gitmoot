@@ -744,8 +744,11 @@ type daemonMergeGate struct {
 	// Home is the resolved <home>/.gitmoot root (or raw --home) used to load the
 	// [merge_gate] policy (#596). Empty uses the default mandatory review-and-CI
 	// merge gate.
-	Home   string
-	Runner subprocess.Runner
+	Home      string
+	Runner    subprocess.Runner
+	Git       workflow.MergeGateGit
+	Worktrees workflow.WorktreeCleaner
+	NextTasks workflow.NextTaskEnqueuer
 }
 
 func newDaemonMergeGate(store *db.Store, gh github.Client, checkout, home string, runner subprocess.Runner) daemonMergeGate {
@@ -759,21 +762,26 @@ func newHostDaemonMergeGate(store *db.Store, gh github.Client, checkout, home st
 }
 
 func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeRequest) (workflow.MergeDecision, error) {
-	if workflow.NativeMergeGateDisabled() {
+	recoveryOnly := request.PullRequestMerged
+	request.TerminalRecoveryOnly = recoveryOnly
+	if workflow.NativeMergeGateDisabled() && !recoveryOnly {
 		return workflow.MergeDecision{
-			Ready:  false,
-			Reason: workflow.PlainReason("native Gitmoot merge gate disabled by GITMOOT_DISABLE_NATIVE_MERGE_GATE; use external gate"),
+			Ready:      false,
+			Deferred:   true,
+			BlockClass: workflow.MergeBlockTransient,
+			Reason:     workflow.PlainReason("native Gitmoot merge gate disabled by GITMOOT_DISABLE_NATIVE_MERGE_GATE; use external gate"),
 		}, nil
 	}
-	// Never make a merge-or-human decision while a job still owns this branch.
-	// This is a local store query, so preserving the #1017 hold does not weaken
-	// the default path's zero GitHub side effects. An explicit @gitmoot merge
-	// request bypasses only the auto_merge policy, not this branch-safety hold.
+	// Never make an open merge-or-human decision while a job still owns this
+	// branch. An authoritative merged observation bypasses only this local hold;
+	// PolicyMergeGate still re-reads GitHub and owns all terminal recovery.
+	// This is a local store query, so the ordinary hold retains zero GitHub
+	// side effects. An explicit @gitmoot merge request does not bypass it.
 	active, found, err := findActiveJobForBranch(ctx, g.Store, request.Repo, request.Branch)
 	if err != nil {
 		return workflow.MergeDecision{}, fmt.Errorf("inspect active jobs on merge branch: %w", err)
 	}
-	if found {
+	if found && !request.PullRequestMerged {
 		return workflow.MergeDecision{
 			Ready:      false,
 			Merged:     false,
@@ -789,12 +797,25 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 	// again by the fully built gate below still parks before any merge operation.
 	policy, ok := resolvedMergeGatePolicy(g.Home, request.Repo)
 	if !ok {
-		if strings.TrimSpace(g.Home) != "" {
+		if strings.TrimSpace(g.Home) != "" && !recoveryOnly {
 			return (workflow.PolicyMergeGate{}).Evaluate(ctx, request)
 		}
 		policy = config.DefaultMergeGatePolicy()
 	}
-	if !policy.AutoMerge && !request.HumanMergeRequested {
+	if !policy.AutoMerge && !request.HumanMergeRequested && !recoveryOnly {
+		if g.Store != nil && strings.TrimSpace(request.TaskID) != "" {
+			claimed, claimErr := g.Store.HasTaskStateClaim(ctx, request.TaskID)
+			if claimErr != nil {
+				return workflow.MergeDecision{}, fmt.Errorf("inspect retained merge claim for task %s: %w", request.TaskID, claimErr)
+			}
+			if claimed {
+				return workflow.MergeDecision{
+					Deferred:   true,
+					BlockClass: workflow.MergeBlockTransient,
+					Reason:     workflow.PlainReason("auto_merge disabled while retained external merge claim awaits authoritative terminal state"),
+				}, nil
+			}
+		}
 		return (workflow.PolicyMergeGate{}).Evaluate(ctx, request)
 	}
 	checkout, err := mergeGateCheckout(ctx, g.Store, request.Repo, g.FallbackCheckout)
@@ -803,6 +824,13 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 	}
 	gate := newDaemonPolicyMergeGateForRunner(g.Store, g.githubClient(checkout), checkout, g.Runner)
 	applyResolvedMergeGatePolicy(&gate, policy)
+	if g.Git != nil {
+		gate.Git = g.Git
+	}
+	if g.Worktrees != nil {
+		gate.Worktrees = g.Worktrees
+	}
+	gate.NextTasks = g.NextTasks
 	// The check above minimizes but does not eliminate the enqueue-to-merge race:
 	// gate.Evaluate still performs review/CI reads before the squash merge, so a job
 	// enqueued in that window can escape the check. A branch-activity lease/barrier

@@ -123,22 +123,10 @@ func TestInspectDelegationWorktreeUsageAccountsFixCloneFencesAndSurvivors(t *tes
 	if err := os.WriteFile(filepath.Join(survivor, "payload.bin"), make([]byte, 23), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// A writer's plant: no marker, so it is unproven rather than an owned fence.
+	// Anything else at a quarantine name is unowned content, whatever its shape:
+	// with automatic removal disabled nothing here is ever deleted, so doctor's job
+	// is to make it visible rather than to classify it as disposable.
 	if err := os.WriteFile(clone+".ttl-reclaiming-bbbbbbbb", nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// A real spent fence, written by the production helper.
-	fencePath := clone + ".ttl-reclaiming-cccccccc"
-	fenced, nonce, err := workflow.FenceFixCloneQuarantineNameForTest(fencePath)
-	if err != nil || !fenced {
-		t.Fatalf("fence = (%v, %v)", fenced, err)
-	}
-	// Doctor proves ownership from the job's durable record, exactly as the daemon
-	// does; without this event the fence is an unproven file.
-	if err := store.AddJobEvent(context.Background(), db.JobEvent{
-		JobID: "fix-job", Kind: workflow.JobEventFixCloneFenced,
-		Message: fencePath + " " + nonce,
-	}); err != nil {
 		t.Fatal(err)
 	}
 	// Age the owner past the TTL so its surviving quarantine is stale reclaimable
@@ -153,20 +141,13 @@ func TestInspectDelegationWorktreeUsageAccountsFixCloneFencesAndSurvivors(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if usage.Fences != 1 {
-		t.Fatalf("fences = %d, want 1: %+v", usage.Fences, usage)
-	}
 	// The surviving directory is stale reclaimable state; the planted file is
-	// unproven. Neither may be reported as a fence.
+	// unproven. Both stay visible to the operator.
 	if usage.Unproven != 1 {
 		t.Fatalf("unproven = %d, want the writer plant counted once: %+v", usage.Unproven, usage)
 	}
 	if usage.SizeBytes != 23 {
 		t.Fatalf("size = %d, want the surviving quarantine's 23 B", usage.SizeBytes)
-	}
-	check := buildDelegationWorktreeDoctorCheck(usage)
-	if !strings.Contains(check.Detail, "1 spent removal fence") {
-		t.Fatalf("doctor detail omits fences: %q", check.Detail)
 	}
 }
 

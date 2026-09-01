@@ -2281,6 +2281,97 @@ CREATE TABLE merge_gate_status_observations (
 	PRIMARY KEY (repo_full_name, pull_request)
 );
 	`,
+	// #1562 durable merge-gate block classification. The gate already separates a
+	// transient/infra block from an authoritative quality rejection, but that
+	// classification lived only in the returned decision, so no exit path could
+	// read it and a transient block became permanent. Existing rows default to 0
+	// (MergeBlockNone), which is never selected for automatic re-evaluation.
+	//
+	// The CREATE is not redundant. A database can legitimately reach this version
+	// without merge_gates: seeding schema_migrations forward past the migration
+	// that created it leaves the table absent, and a bare ALTER then fails the
+	// whole Migrate call, which is a refusal to start rather than a test artifact.
+	// Both paths converge on the same shape, and this migration is APPENDED, never
+	// reordered, so an already-migrated database still applies exactly this step.
+	`
+CREATE TABLE IF NOT EXISTS merge_gates (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	repo_full_name TEXT NOT NULL,
+	pull_request INTEGER NOT NULL,
+	state TEXT NOT NULL,
+	reason TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	UNIQUE(repo_full_name, pull_request)
+);
+ALTER TABLE merge_gates ADD COLUMN block_class INTEGER NOT NULL DEFAULT 0;
+	`,
+	// Durable cross-process task-state claim for the irreversible native merge
+	// boundary. SQLite triggers make every state writer participate, including
+	// independent processes. An unresolved external outcome remains fenced
+	// without expiry until an authoritative remote observation resolves it.
+	`
+CREATE TABLE task_state_claims (
+	task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+	kind TEXT NOT NULL,
+	token TEXT NOT NULL UNIQUE,
+	expected_state TEXT NOT NULL,
+	acquired_at INTEGER NOT NULL,
+	expires_at INTEGER NOT NULL
+);
+CREATE INDEX idx_task_state_claims_expires_at ON task_state_claims(expires_at);
+CREATE TRIGGER guard_claimed_task_state_update
+BEFORE UPDATE OF state ON tasks
+WHEN OLD.state <> NEW.state
+	AND EXISTS (
+		SELECT 1 FROM task_state_claims
+		WHERE task_id = OLD.id
+			AND (kind = 'external_merge_uncertain'
+				OR expires_at > CAST(strftime('%s', 'now') AS INTEGER))
+	)
+BEGIN
+	SELECT RAISE(ABORT, 'task state is claimed for an external merge');
+END;
+CREATE TRIGGER guard_claimed_task_delete
+BEFORE DELETE ON tasks
+WHEN EXISTS (
+	SELECT 1 FROM task_state_claims
+	WHERE task_id = OLD.id
+		AND (kind = 'external_merge_uncertain'
+			OR expires_at > CAST(strftime('%s', 'now') AS INTEGER))
+)
+BEGIN
+	SELECT RAISE(ABORT, 'task state is claimed for an external merge');
+END;
+	`,
+	// Canonical terminal-effects ownership and secondary task-settlement debt
+	// survive a daemon exit between the two phases. The exact head is part of
+	// every key so a later push cannot inherit an earlier terminal decision.
+	`
+CREATE TABLE pull_request_terminal_reconciliations (
+	repo_full_name TEXT NOT NULL COLLATE NOCASE,
+	pull_request INTEGER NOT NULL CHECK(pull_request > 0),
+	head_sha TEXT NOT NULL CHECK(length(trim(head_sha)) > 0),
+	owner_task_id TEXT NOT NULL CHECK(length(trim(owner_task_id)) > 0),
+	effects_completed INTEGER NOT NULL DEFAULT 0 CHECK(effects_completed IN (0, 1)),
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY(repo_full_name, pull_request, head_sha)
+);
+CREATE TABLE pull_request_terminal_settlements (
+	repo_full_name TEXT NOT NULL COLLATE NOCASE,
+	pull_request INTEGER NOT NULL CHECK(pull_request > 0),
+	head_sha TEXT NOT NULL CHECK(length(trim(head_sha)) > 0),
+	task_id TEXT NOT NULL CHECK(length(trim(task_id)) > 0),
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY(repo_full_name, pull_request, head_sha, task_id),
+	FOREIGN KEY(repo_full_name, pull_request, head_sha)
+		REFERENCES pull_request_terminal_reconciliations(repo_full_name, pull_request, head_sha)
+		ON DELETE CASCADE
+);
+CREATE INDEX idx_pull_request_terminal_settlements_task
+	ON pull_request_terminal_settlements(task_id);
+	`,
 	// #1684 disposable clones retained because their object database still holds
 	// unpublished commits. SQLite cannot extend a CHECK in place, so the table is
 	// rebuilt; every existing row keeps its state, reason and retry accounting.

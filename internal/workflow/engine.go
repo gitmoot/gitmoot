@@ -409,15 +409,66 @@ type Engine struct {
 }
 
 func (e Engine) block(ctx context.Context, ref taskRef, reason string) error {
-	if err := e.setTaskState(ctx, ref, TaskBlocked); err != nil {
+	return e.blockTask(ctx, ref, "workflow_blocked", reason, "workflow")
+}
+
+// blockTask is the single task-blocking choke point. Every durable block
+// atomically writes the state and the event that owns it. A stale state
+// observation or failed attribution write commits neither half.
+func (e Engine) blockTask(ctx context.Context, ref taskRef, kind string, reason string, label string) error {
+	task, err := e.resolveTaskState(ctx, ref, TaskBlocked)
+	if err != nil {
 		return err
 	}
-	return BlockedError{Reason: reason}
+	blockErr := BlockedError{Reason: reason}
+	if strings.TrimSpace(task.ID) == "" {
+		return blockErr
+	}
+	fromState := ""
+	current, err := e.Store.GetTask(ctx, task.ID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err == nil {
+		fromState = current.State
+	}
+	blocked, err := e.Store.BlockTaskWithEvent(ctx, task, db.TaskEvent{
+		Kind:      kind,
+		FromState: fromState,
+		Reason:    reason,
+	})
+	if err != nil {
+		return fmt.Errorf("record %s block for task %s: %w", label, task.ID, err)
+	}
+	if !blocked {
+		return fmt.Errorf("record %s block for task %s: state transition did not commit", label, task.ID)
+	}
+	return blockErr
 }
 
 func (e Engine) setTaskState(ctx context.Context, ref taskRef, state TaskState) error {
+	_, err := e.setTaskStateResolved(ctx, ref, state)
+	return err
+}
+
+// setTaskStateResolved returns the task row actually advanced. A branch ref can
+// resolve to an existing canonical task.
+func (e Engine) setTaskStateResolved(ctx context.Context, ref taskRef, state TaskState) (string, error) {
+	task, err := e.resolveTaskState(ctx, ref, state)
+	if err != nil || strings.TrimSpace(task.ID) == "" {
+		return "", err
+	}
+	if err := e.Store.UpsertTask(ctx, task); err != nil {
+		return "", err
+	}
+	return task.ID, nil
+}
+
+// resolveTaskState preserves the branch-canonical identity rule without writing,
+// allowing all blocked transitions to use Store.BlockTaskWithEvent.
+func (e Engine) resolveTaskState(ctx context.Context, ref taskRef, state TaskState) (db.Task, error) {
 	if strings.TrimSpace(ref.ID) == "" {
-		return nil
+		return db.Task{}, nil
 	}
 	task := db.Task{
 		ID:           ref.ID,
@@ -429,11 +480,11 @@ func (e Engine) setTaskState(ctx context.Context, ref taskRef, state TaskState) 
 	}
 	existing, err := e.Store.GetTask(ctx, ref.ID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
+		return db.Task{}, err
 	}
 	if err == nil {
 		if IsDisposedTaskState(existing.State) && existing.State != string(state) {
-			return fmt.Errorf("task %s is %s; workflow advancement cannot move it to %s", existing.ID, existing.State, state)
+			return db.Task{}, fmt.Errorf("task %s is %s; workflow advancement cannot move it to %s", existing.ID, existing.State, state)
 		}
 		if task.GoalID == "" {
 			task.GoalID = existing.GoalID
@@ -450,25 +501,22 @@ func (e Engine) setTaskState(ctx context.Context, ref taskRef, state TaskState) 
 	}
 	// One task per (repo, branch) is enforced by the tasks(repo_full_name, branch)
 	// partial-unique index. If this ref carries a non-empty branch already owned by a
-	// DIFFERENT task -- e.g. workflow advancement re-running a phase on the same branch
-	// under a fresh task id -- upserting `task` would fail with
-	// "UNIQUE constraint failed: tasks.repo_full_name, tasks.branch" and wedge the
-	// advancement. Advance the branch's canonical task in place instead of inserting a
-	// duplicate (the same branch-reuse invariant used by task creation).
+	// different task, advance the branch's canonical row instead of inserting a
+	// duplicate.
 	if task.Branch != "" {
 		byBranch, berr := e.Store.GetTaskByRepoBranch(ctx, task.RepoFullName, task.Branch)
 		if berr != nil && !errors.Is(berr, sql.ErrNoRows) {
-			return berr
+			return db.Task{}, berr
 		}
 		if berr == nil && byBranch.ID != task.ID {
 			if IsDisposedTaskState(byBranch.State) && byBranch.State != string(state) {
-				return fmt.Errorf("task %s is %s; workflow advancement cannot move it to %s", byBranch.ID, byBranch.State, state)
+				return db.Task{}, fmt.Errorf("task %s is %s; workflow advancement cannot move it to %s", byBranch.ID, byBranch.State, state)
 			}
 			byBranch.State = string(state)
-			return e.Store.UpsertTask(ctx, byBranch)
+			return byBranch, nil
 		}
 	}
-	return e.Store.UpsertTask(ctx, task)
+	return task, nil
 }
 
 func (e Engine) jobID(request JobRequest) string {
