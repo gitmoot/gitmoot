@@ -710,48 +710,58 @@ func classifyRefusedTaskStateWrite(ctx context.Context, store *db.Store, task db
 	return nil
 }
 
-// openHumanRound is the ONE durable operation that opens a human round: the task
-// reaches awaiting_human and the round-open event lands, together or not at all,
-// and under an anchored advance both are bound to live ownership (#1673).
+// openHumanRound is the ONE durable operation that opens a human round: the round
+// event and the awaiting_human transition commit together, exactly once per open
+// round, and under an anchored advance both are bound to live ownership (#1673).
 //
-// Every announcement — notifier, event sink, chat link — MUST follow a successful
-// return, never precede it: that ordering is what stops a superseded generation from
-// calling a human about a lifecycle that has moved.
-func (e Engine) openHumanRound(ctx context.Context, ref taskRef, jobID string, event db.JobEvent) error {
+// It returns announce=true ONLY for the caller that both WON the round and actually
+// PAUSED the task. Every announcement — notifier, event sink, chat link — MUST be
+// gated on that value:
+//
+//	a LOSER under concurrency would otherwise double-notify a human for one round;
+//	a REFUSED transition (merged or disposed row) would otherwise announce a pause
+//	that never happened, and leave requested > resolved forever.
+func (e Engine) openHumanRound(ctx context.Context, ref taskRef, jobID string, event db.JobEvent) (announce bool, err error) {
 	task, err := e.resolveTaskState(ctx, ref, TaskAwaitingHuman)
 	if err != nil {
-		return err
+		return false, err
 	}
 	event.JobID = jobID
-	if strings.TrimSpace(task.ID) == "" {
-		// No task to move (a taskless root): the round record is still owed, and it is
-		// still ownership-bound.
-		if own := e.advanceOwnershipBinding(); own != nil {
-			if _, err := e.Store.AddJobEventIfAdvanceOwned(ctx, event, *own, time.Now().UTC()); err != nil {
-				return e.classifyAdvanceOwnershipLoss(err, "human-round-commit")
-			}
-			return nil
+	_, mergedGuarded := taskStateWriteExclusions(TaskAwaitingHuman)
+	round := db.HumanRoundOpen{
+		Event:         event,
+		RequestedKind: escalationRequestedEvent,
+		ResolvedKind:  escalationResolvedEvent,
+	}
+	taskless := strings.TrimSpace(task.ID) == ""
+	if !taskless {
+		task.State = string(TaskAwaitingHuman)
+		round.Task = task
+		round.ForbiddenStates, _ = taskStateWriteExclusions(TaskAwaitingHuman)
+		if taskStatePreWriteHook != nil {
+			taskStatePreWriteHook(ctx, task.ID)
 		}
-		return e.Store.AddJobEvent(ctx, event)
 	}
-	task.State = string(TaskAwaitingHuman)
-	forbidden, mergedGuarded := taskStateWriteExclusions(TaskAwaitingHuman)
-	if taskStatePreWriteHook != nil {
-		taskStatePreWriteHook(ctx, task.ID)
-	}
-	var written bool
+	var won, paused bool
 	if own := e.advanceOwnershipBinding(); own != nil {
-		written, err = e.Store.UpsertTaskWithJobEventUnlessStatesIfAdvanceOwned(ctx, task, forbidden, event, *own, time.Now().UTC())
+		won, paused, err = e.Store.OpenHumanRoundIfAdvanceOwned(ctx, round, *own, time.Now().UTC())
 	} else {
-		written, err = e.Store.UpsertTaskWithJobEventUnlessStates(ctx, task, forbidden, event)
+		won, paused, err = e.Store.OpenHumanRound(ctx, round)
 	}
 	if err != nil {
-		return e.classifyAdvanceOwnershipLoss(err, "human-round-commit")
+		return false, e.classifyAdvanceOwnershipLoss(err, "human-round-commit")
 	}
-	if written {
-		return nil
+	if won {
+		// A taskless coordinator has nothing to pause, so winning IS opening.
+		return taskless || paused, nil
 	}
-	return classifyRefusedTaskStateWrite(ctx, e.Store, task, TaskAwaitingHuman, mergedGuarded)
+	if taskless {
+		// Lost the round: another opener owns it. Idempotent, and silent.
+		return false, nil
+	}
+	// Either the round was already open, or the pause was refused and rolled back
+	// with it. Only the second owes a classification, and it is read from the row.
+	return false, classifyRefusedTaskStateWrite(ctx, e.Store, task, TaskAwaitingHuman, mergedGuarded)
 }
 
 // classifyAdvanceOwnershipLoss turns a refused ownership-bound write into the

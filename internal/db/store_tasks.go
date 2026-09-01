@@ -254,55 +254,101 @@ func (s *Store) UpsertTaskUnlessStatesIfAdvanceOwned(ctx context.Context, task T
 	return written, tx.Commit()
 }
 
-// UpsertTaskWithJobEventUnlessStates moves a task and appends a job event in ONE
-// transaction. Opening a human round is exactly this pair — the task reaches
-// awaiting_human and the round-open event records it — and splitting them leaves two
-// bad outcomes: a crash between the writes strands a task in awaiting_human with no
-// open round, and under a supersession recovery the second write can land after
-// ownership was lost (#1673).
-func (s *Store) UpsertTaskWithJobEventUnlessStates(ctx context.Context, task Task, forbiddenStates []string, event JobEvent) (bool, error) {
-	return s.upsertTaskWithJobEventUnlessStates(ctx, task, forbiddenStates, event, nil, time.Time{})
+// HumanRoundOpen names one attempt to open a human round: the pause target, the
+// round-open event, and the event kinds whose counts decide whether a round is
+// ALREADY open on that job.
+type HumanRoundOpen struct {
+	Task            Task
+	ForbiddenStates []string
+	Event           JobEvent
+	RequestedKind   string
+	ResolvedKind    string
 }
 
-// UpsertTaskWithJobEventUnlessStatesIfAdvanceOwned is the same single transaction
-// with live advance ownership asserted inside it, so the whole round-open either
-// commits while this pass still owns the advance or does not happen at all — which
-// is also what makes the announcements that follow it safe.
-func (s *Store) UpsertTaskWithJobEventUnlessStatesIfAdvanceOwned(ctx context.Context, task Task, forbiddenStates []string, event JobEvent, own AdvanceOwnership, now time.Time) (bool, error) {
-	return s.upsertTaskWithJobEventUnlessStates(ctx, task, forbiddenStates, event, &own, now)
+// OpenHumanRound opens a human round as ONE transaction that settles three facts
+// together (#1673):
+//
+//	WON     the requested<=resolved guard rides in the round-open INSERT's own WHERE
+//	        clause, so two workers advancing settled sibling children cannot both
+//	        open a round. A pre-check cannot do this: both callers read "closed" and
+//	        both commit, leaving requested=2 resolved=1 and a falsely open
+//	        coordinator. A caller that loses writes nothing and announces nothing.
+//	PAUSED  the guarded task transition commits WITH the event. If the transition is
+//	        REFUSED — a merged row forbids awaiting_human, or the row became disposed
+//	        after the caller's pre-read — the whole transaction rolls back: a round
+//	        event without its pause is a lie, and announcing an unopened round calls
+//	        a human about a transition that never happened.
+//	QUIET   the caller learns both facts BEFORE any announcement, so notifier, event
+//	        sink and chat link fire only for the winner that actually paused.
+//
+// The conditional INSERT is the FIRST statement so it takes the write lock before
+// anything is read — the same write-first ordering the resource-lock guard uses, and
+// for the same reason: under WAL a read-then-write pair loses to a concurrent commit.
+func (s *Store) OpenHumanRound(ctx context.Context, round HumanRoundOpen) (won bool, paused bool, err error) {
+	return s.openHumanRound(ctx, round, nil, time.Time{})
 }
 
-func (s *Store) upsertTaskWithJobEventUnlessStates(ctx context.Context, task Task, forbiddenStates []string, event JobEvent, own *AdvanceOwnership, now time.Time) (bool, error) {
-	if strings.TrimSpace(event.JobID) == "" {
-		return false, errors.New("job event job id is required")
+// OpenHumanRoundIfAdvanceOwned is OpenHumanRound with live advance ownership
+// asserted in the same transaction, so a superseded pass can neither open a round
+// nor announce one.
+func (s *Store) OpenHumanRoundIfAdvanceOwned(ctx context.Context, round HumanRoundOpen, own AdvanceOwnership, now time.Time) (won bool, paused bool, err error) {
+	return s.openHumanRound(ctx, round, &own, now)
+}
+
+func (s *Store) openHumanRound(ctx context.Context, round HumanRoundOpen, own *AdvanceOwnership, now time.Time) (bool, bool, error) {
+	if strings.TrimSpace(round.Event.JobID) == "" {
+		return false, false, errors.New("job event job id is required")
+	}
+	if strings.TrimSpace(round.RequestedKind) == "" || strings.TrimSpace(round.ResolvedKind) == "" {
+		return false, false, errors.New("round-open requires both event kinds")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message)
+		SELECT ?, ?, ?
+		WHERE (SELECT COUNT(*) FROM job_events WHERE job_id = ? AND kind = ?)
+		   <= (SELECT COUNT(*) FROM job_events WHERE job_id = ? AND kind = ?)`,
+		round.Event.JobID, round.Event.Kind, round.Event.Message,
+		round.Event.JobID, round.RequestedKind, round.Event.JobID, round.ResolvedKind)
+	if err != nil {
+		return false, false, err
+	}
+	opened, err := result.RowsAffected()
+	if err != nil {
+		return false, false, err
+	}
+	if opened != 1 {
+		// A round is already open on this job: idempotent, and nothing to announce.
+		return false, false, tx.Commit()
+	}
 	if own != nil {
 		live, ownErr := advanceOwnershipLiveTx(ctx, tx, *own, now)
 		if ownErr != nil {
-			return false, ownErr
+			return false, false, ownErr
 		}
 		if !live {
-			return false, fmt.Errorf("%w: task %s round-open for job %s at generation %d",
-				ErrAdvanceOwnershipLost, task.ID, own.OwnerJobID, own.AtGeneration)
+			return false, false, fmt.Errorf("%w: task %s round-open for job %s at generation %d",
+				ErrAdvanceOwnershipLost, round.Task.ID, own.OwnerJobID, own.AtGeneration)
 		}
 	}
-	written, err := s.upsertTaskUnlessStates(ctx, tx, task, forbiddenStates)
+	if strings.TrimSpace(round.Task.ID) == "" {
+		// A taskless coordinator owes the round record and has nothing to pause.
+		return true, false, tx.Commit()
+	}
+	written, err := s.upsertTaskUnlessStates(ctx, tx, round.Task, round.ForbiddenStates)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
-	// The event is written even when the task write was REFUSED: a refusal means the
-	// row is merged or disposed and the caller still owes its coordinator the round
-	// record. What must never happen is one of the two landing alone.
-	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`,
-		event.JobID, event.Kind, event.Message); err != nil {
-		return false, err
+	if !written {
+		// The pause was REFUSED: roll the round-open event back with it. The caller
+		// classifies the refusal and must not announce.
+		return false, false, nil
 	}
-	return written, tx.Commit()
+	return true, true, tx.Commit()
 }
 
 func (s *Store) upsertTaskUnlessStates(ctx context.Context, execer sqlExecer, task Task, forbiddenStates []string) (bool, error) {

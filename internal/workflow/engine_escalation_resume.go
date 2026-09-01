@@ -98,16 +98,22 @@ func (e Engine) pauseAwaitingHuman(ctx context.Context, parentJob db.Job, parent
 	if marshalErr == nil {
 		message = string(encoded)
 	}
-	// ONE durable operation: the pause and the round-open event commit together, and
-	// under a supersession advance both are bound to live ownership. Splitting them
-	// left two defects — a crash stranded awaiting_human with no open round, and a
-	// pass whose lease had lapsed could still record and announce a round for a
-	// lifecycle a retry had already moved (#1673).
-	if err := e.openHumanRound(ctx, ref, parentJob.ID, db.JobEvent{
+	// ONE durable operation, EXACTLY ONCE: the pause and the round-open event commit
+	// together and only for the caller that wins the requested<=resolved guard in the
+	// write itself. Under a supersession advance both are bound to live ownership
+	// (#1673).
+	announce, err := e.openHumanRound(ctx, ref, parentJob.ID, db.JobEvent{
 		Kind:    escalationRequestedEvent,
 		Message: message,
-	}); err != nil {
+	})
+	if err != nil {
 		return err
+	}
+	if !announce {
+		// Either a sibling opened this round or the pause was refused and rolled back.
+		// The coordinator is still parked from this leg's point of view, but nothing
+		// here may call a human about a round this caller did not open.
+		return awaitErr
 	}
 
 	// Notify the human best-effort: a nil notifier (ask-path/tests) or a notifier
@@ -247,11 +253,18 @@ func (e Engine) pauseAwaitingHumanAnswer(ctx context.Context, job db.Job, payloa
 	if marshalErr == nil {
 		message = string(encoded)
 	}
-	if err := e.openHumanRound(ctx, targetRef, targetID, db.JobEvent{
+	announce, err := e.openHumanRound(ctx, targetRef, targetID, db.JobEvent{
 		Kind:    escalationRequestedEvent,
 		Message: message,
-	}); err != nil {
+	})
+	if err != nil {
 		return false, err
+	}
+	if !announce {
+		// A sibling ask opened this round, or the pause was refused and rolled back
+		// with its event. The gate still reports "paused" so the caller does not
+		// redispatch, but this caller announces nothing.
+		return true, nil
 	}
 
 	// Notify the human best-effort (nil notifier / notifier error never fails the

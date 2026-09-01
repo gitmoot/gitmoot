@@ -524,7 +524,7 @@ func TestTasklessRoundOpenIsRefusedWhenOwnershipIsLost(t *testing.T) {
 		Token:      "token-gone",
 	}
 	// No taskRef at all: the round-open has only the event to write.
-	err := anchored.openHumanRound(ctx, taskRef{}, child, db.JobEvent{
+	_, err := anchored.openHumanRound(ctx, taskRef{}, child, db.JobEvent{
 		Kind:    escalationRequestedEvent,
 		Message: "obsolete round",
 	})
@@ -538,10 +538,10 @@ func TestTasklessRoundOpenIsRefusedWhenOwnershipIsLost(t *testing.T) {
 
 	// SUCCESS CONTROL: with the lease held the same taskless round-open commits.
 	ownAdvance(t, store, child, "token-gone", time.Now().UTC().Add(SupersedeAdvanceLeaseTTL))
-	if err := anchored.openHumanRound(ctx, taskRef{}, child, db.JobEvent{
+	if announce, err := anchored.openHumanRound(ctx, taskRef{}, child, db.JobEvent{
 		Kind:    escalationRequestedEvent,
 		Message: "owned round",
-	}); err != nil {
+	}); err != nil || !announce {
 		t.Fatalf("taskless round-open under a held lease: %v", err)
 	}
 	if got := countWorkflowJobEvents(t, store, child, escalationRequestedEvent); got != 1 {
