@@ -586,20 +586,16 @@ dropped stash leaves one, and it dies with the directory). The traversal ignores
 replace objects and refuses outright when the clone carries a grafts file. The
 clone's own `origin` is never trusted; it is writable by whatever ran in the clone.
 
-A proven-disposable clone is renamed to `<path>.ttl-reclaiming-<random>` and
-re-proven there, then renamed again before the final scan. That scan records an
-INVENTORY — the exact entries, sizes and modification times it proved — and the
-removal unlinks only those, so content written between the proof and the unlink is
-never deleted: it is not in the inventory, and its parent's `rmdir` fails with
-`ENOTEMPTY`, aborting the removal with the clone restored. Both names a writer
-could have observed are fenced with a marker-carrying single-link file; anything
-else at a quarantine name (directory, symlink, hard link, planted file) is a
-survivor that is never deleted and blocks completion. Retired fences are swept
-after 24h by the daemon's worktree tick and counted by `gitmoot doctor` and
-`/api/health`. Nested object databases are recognised by bytes: a loose candidate
-must hash to its storage name with a bounded header read, and a pack must have a
-verifying trailing checksum, a verifying `.idx`, and an index that records that
-pack's digest. Every retention records its reason once per job:
+No gitmoot path deletes a fix clone. A fix worktree is a standalone clone, so an
+unlink takes its object database with it, and Linux cannot express a delete that is
+conditional on the bytes a proof examined: unlink is by name, there is no
+inode-conditional `unlinkat`, and stat-then-unlink is not atomic against a same-user
+writer. The aged pass and the terminal cleanup therefore PROVE and then record
+`delegation_worktree_reclaimable_manual`, leaving the clone and its obligation open
+for an operator; allocation, pre-enqueue recovery and enqueue-failure paths MOVE the
+clone aside to a `.ttl-reclaiming-orphaned-*` sibling so a retry can proceed. Every
+`.ttl-reclaiming-*` entry is a survivor: reported by `gitmoot doctor` and
+`/api/health`, never deleted, never followed. Every retention records its reason once per job:
 `delegation_worktree_retained_unpublished` (with obligation reason
 `unpublished_commits`; squash-merged branches land here by design, because a
 squash publishes the content and not the commits; ignored nested repositories

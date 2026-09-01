@@ -537,18 +537,13 @@ two-minute probe deadline) and removes the clone only when no commit reachable
 from any local ref or reflog is missing from those refs AND the clone holds no
 unreachable commit object. The clone's own `origin` is never trusted, replace
 objects are ignored, and a grafts file makes the clone unprovable.
-The proven clone is renamed to `<path>.ttl-reclaiming-<random>`, re-proven, and
-renamed again before the final scan. That scan takes an INVENTORY, and the removal
-unlinks only what it inventoried: a writer's post-proof content is never in it, so
-the parent's `rmdir` fails and the removal aborts with the clone restored — the
-deletion window is closed by the kernel, not by another liveness sample. Both
-observable names are fenced with a marker-carrying single-link file; a directory,
-symlink, hard link or planted file at a quarantine name is a survivor that is never
-deleted, never followed, and blocks completion. Retired fences are swept after 24h
-by the daemon tick and counted by `gitmoot doctor` and `/api/health`. Nested object
-databases are proved from bytes: a loose candidate must hash (SHA-1 or SHA-256) to
-its storage name with a bounded header read, and a pack must carry a verifying
-trailing checksum plus a verifying `.idx` that records that pack's digest.
+NOTHING deletes a fix clone automatically. It is a standalone clone, so an unlink
+takes its object database with it, and Linux offers no inode-conditional unlink to
+make the delete match the proof. The aged pass and the terminal cleanup PROVE and
+then record `delegation_worktree_reclaimable_manual`, leaving the clone and its
+cleanup obligation open; allocation and failure paths MOVE it aside to a
+`.ttl-reclaiming-orphaned-*` sibling. Every `.ttl-reclaiming-*` entry is a survivor:
+reported, never deleted, never followed, and it blocks completion.
 `delegation_worktree_retained_unpublished` with obligation reason
 `unpublished_commits` (the normal outcome for a squash-merged branch, whose
 content is published while its commits are not, and for an ignored nested

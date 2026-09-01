@@ -10,7 +10,15 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 )
 
-func TestCleanupFixWorktreeRemovesCloneWithoutDeletingTaskBranchLock(t *testing.T) {
+// TestCleanupFixWorktreePreservesCloneAndTaskBranchLock pins the deletion
+// boundary at the TERMINAL cleanup path, which is the one a site-local fix of the
+// aged pass left deleting. A fix clone is a standalone object database and no
+// unlink here can be conditional on the bytes a proof examined, so this path hands
+// the clone to an operator instead of removing it.
+//
+// MUTATION PROOF: restore os.RemoveAll(path) here and this fails on the surviving
+// directory and the missing handoff event.
+func TestCleanupFixWorktreePreservesCloneAndTaskBranchLock(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	home := t.TempDir()
@@ -32,14 +40,25 @@ func TestCleanupFixWorktreeRemovesCloneWithoutDeletingTaskBranchLock(t *testing.
 	engine.cleanupFixWorktree(ctx, "fix-job", "implement", JobPayload{
 		Repo: "owner/repo", Branch: "feature/fix", WorktreePath: path, FixWorktree: true,
 	})
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("fix worktree still exists after cleanup: %v", err)
+	if _, err := os.Stat(filepath.Join(path, "owned.txt")); err != nil {
+		t.Fatalf("terminal cleanup deleted the standalone clone: %v", err)
 	}
 	if _, err := store.GetBranchLock(ctx, "owner/repo", "feature/fix"); err != nil {
 		t.Fatalf("task branch lock was removed with independent clone: %v", err)
 	}
-	if got := countJobEvents(t, store, "fix-job", "delegation_worktree_removed"); got != 1 {
-		t.Fatalf("delegation_worktree_removed events = %d, want 1", got)
+	if got := countJobEvents(t, store, "fix-job", "delegation_worktree_removed"); got != 0 {
+		t.Fatalf("delegation_worktree_removed events = %d, want 0: nothing was removed", got)
+	}
+	if got := countJobEvents(t, store, "fix-job", "delegation_worktree_reclaimable_manual"); got != 1 {
+		t.Fatalf("operator handoff events = %d, want 1", got)
+	}
+	// The obligation stays OPEN: a clone still on disk must not read as retired.
+	obligation, err := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID("fix-job", path))
+	if err != nil {
+		t.Fatalf("GetCleanupObligation: %v", err)
+	}
+	if obligation.State == string(db.CleanupObligationRemoved) {
+		t.Fatalf("obligation marked removed while the clone is still on disk: %+v", obligation)
 	}
 }
 

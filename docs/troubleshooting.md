@@ -763,36 +763,35 @@ because both rewrite ancestry locally. The trusted URL comes from the registered
 checkout, never from the clone's own `origin`, which whatever ran in the clone
 could have rewritten.
 
-**A proved fix clone is NOT deleted automatically.** The pass runs every proof —
-liveness, cleanliness, published-object reachability, nested object databases —
-and then records `delegation_worktree_reclaimable_manual`, leaves the clone on
-disk, and keeps its cleanup obligation open. `gitmoot doctor` reports it and an
-operator removes it.
+**No gitmoot path deletes a fix clone.** A fix worktree is a standalone clone, so
+an unlink takes its object database with it, and a safe removal would have to
+delete exactly the bytes a proof examined. Linux cannot express that: unlink is by
+NAME, there is no inode-conditional `unlinkat`, and against a same-user writer no
+descriptor discipline makes stat-then-unlink an atomic conditional delete.
 
-The reason is a platform limit, not an unfinished patch. A fix worktree is a
-standalone clone, so an unlink takes its object database with it, and a safe
-removal must delete exactly the bytes it proved. Linux cannot express that: unlink
-is by NAME, there is no inode-conditional `unlinkat`, and against a same-user
-writer no descriptor discipline turns stat-then-unlink into an atomic conditional
-delete. Successive reviews each found another instance of that single gap, so the
-pass keeps what is decidable and drops what is not. The cost is that this arm no
-longer frees disk on its own; the benefit is that it cannot destroy bytes it did
-not prove. The other reclaim arms are unaffected — they manage LINKED worktrees,
-where removal does not take an object database with it.
+Every path therefore either PROVES and hands off, or MOVES ASIDE:
 
-Any entry beside a managed clone with the `.ttl-reclaiming-*` prefix is a
-SURVIVOR: unowned content that blocks completion and is reported, never deleted
-and never followed.
+- the aged TTL pass runs its proofs (liveness, cleanliness, published-object
+  reachability, nested object databases) and records
+  `delegation_worktree_reclaimable_manual`, leaving the clone and its cleanup
+  obligation open;
+- the terminal cleanup after a successful advance does the same;
+- allocation, pre-enqueue recovery and enqueue-failure paths rename the clone to a
+  `.ttl-reclaiming-orphaned-*` sibling so a retry can allocate, destroying nothing.
 
-The proofs still matter, because they decide RETENTION reasons. A nested object
-database is recognised by its BYTES: a loose candidate must decompress and hash
-(SHA-1 or SHA-256) to the name it is stored under, with the header read bounded so
-a malformed cache entry cannot size the daemon's allocation while valid large
-objects still stream; a pack must pass its own trailing checksum, have an `.idx`
-that verifies and records that pack's digest, and be accepted by `git verify-pack`
-— invoked with `--object-format=sha256` for SHA-256 databases. If Git cannot be
-asked at all, the candidate is treated as an object database and the clone is
-retained, never classified as ordinary content.
+Everything with that prefix is a SURVIVOR: reported by `gitmoot doctor` and
+`/api/health`, never deleted and never followed. An operator removes them knowing
+no writer is racing them. The cost is that this arm no longer frees disk on its
+own; the benefit is that it cannot destroy bytes it did not prove. The other
+reclaim arms are unaffected — they manage LINKED worktrees, where removal does not
+take an object database with it.
+
+The proofs still run, because they decide the RETENTION REASON an operator reads.
+A nested object database is recognised by its bytes: a loose candidate must
+decompress and hash (SHA-1 or SHA-256) to its storage name, with a bounded header
+read; a pack must pass its trailing checksum, have an `.idx` recording that pack's
+digest, and be accepted by `git verify-pack`. If Git cannot be asked, the candidate
+is treated as an object database and the clone is retained.
 
 Every retention records **why**, once per reason per job, so an inert deployment
 is visible instead of silent: `delegation_worktree_retained_unpublished` (also

@@ -1239,15 +1239,14 @@ func (e Engine) cleanupFixWorktree(ctx context.Context, jobID string, jobType st
 		e.recordCleanupSkippedOnce(opCtx, jobID, payload, fmt.Sprintf("inspect failed: %v", statErr))
 		return fmt.Errorf("inspect fix worktree %s: %w", path, statErr)
 	}
-	if err := os.RemoveAll(path); err != nil {
-		if persistErr := e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", err); persistErr != nil {
-			return errors.Join(err, persistErr)
-		}
-		e.recordCleanupSkippedOnce(opCtx, jobID, payload, fmt.Sprintf("remove failed: %v", err))
-		return fmt.Errorf("remove fix worktree %s: %w", path, err)
-	}
-	_ = e.Store.AddJobEvent(opCtx, db.JobEvent{JobID: jobID, Kind: "delegation_worktree_removed", Message: fmt.Sprintf("fix worktree %s removed", path)})
-	return e.markDelegationCleanupRemoved(opCtx, jobID, path)
+	// The SAME boundary the aged pass reached: this clone is a standalone object
+	// database, and no unlink here can be made conditional on the bytes that were
+	// proved. Disabling the aged path alone left this one deleting on every
+	// successful advance, which is the whole hazard by another route.
+	//
+	// The obligation deliberately stays OPEN. Marking it removed would retire a
+	// clone that is still on disk, and the operator handoff is what closes it.
+	return e.recordFixCloneReclaimableByOperator(opCtx, jobID, path)
 }
 
 // cleanupReadOnlyDelegationWorktree disposes the detached worktree allocated for
@@ -2202,6 +2201,41 @@ func (e Engine) recordFixCloneReclaimableByOperator(ctx context.Context, jobID, 
 	}
 	return e.deferDelegationCleanupObligation(context.WithoutCancel(ctx), jobID, path, db.CleanupReasonUnpublishedCommits)
 }
+
+// SetAsideFixClone renames a fix clone out of the way instead of deleting it, and
+// returns the name it now has.
+//
+// It is the ONE disposal primitive every fix-clone path is allowed to use. A fix
+// clone is a standalone object database, and no unlink can be made conditional on
+// the bytes a proof examined, so nothing automatic may delete one. A rename
+// destroys nothing, is a single atomic filesystem operation, and frees the managed
+// path so allocation and retry keep working.
+//
+// The result is reported by `gitmoot doctor` as unowned content for an operator to
+// remove by hand.
+func SetAsideFixClone(path string) (string, error) {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if path == "" || path == "." {
+		return "", errors.New("fix clone path is required")
+	}
+	suffix := make([]byte, 8)
+	if _, err := rand.Read(suffix); err != nil {
+		return "", fmt.Errorf("generate fix clone set-aside suffix: %w", err)
+	}
+	aside := path + fixCloneSetAsidePrefix + hex.EncodeToString(suffix)
+	if err := os.Rename(path, aside); err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("set aside fix clone %s: %w", path, err)
+	}
+	return aside, nil
+}
+
+// fixCloneSetAsidePrefix names a clone moved out of the way. It shares the
+// quarantine prefix family so every existing survivor scan — the daemon's, the
+// reclaim's and doctor's — already reports it without a second mechanism.
+const fixCloneSetAsidePrefix = ".ttl-reclaiming-orphaned-"
 
 // reclaimAgedTerminalFixClone proves whether a terminal fix worktree's clone is
 // disposable and, when it is, hands it to an operator instead of deleting it.
