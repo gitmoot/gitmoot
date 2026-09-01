@@ -25,7 +25,22 @@ import (
 const (
 	escalationRequestedEvent = "delegation_escalation_requested"
 	escalationResolvedEvent  = "delegation_escalation_resolved"
+	// escalationEffectsCompletedEvent closes the resolution's second half.
+	//
+	// The resolved event is the exclusive CLAIM (its conditional append is what makes
+	// resolution exactly-once), and it is committed BEFORE the verb's irreversible
+	// effects so a loser cannot run them. That ordering has a debt: a crash between
+	// the claim and the effects would otherwise strand the tree forever, because a
+	// closed round is no longer a candidate for any sweep. This marker is the receipt
+	// — a claim without it is an UNFINISHED resolution that
+	// RecoverUnfinishedEscalationResolutions re-drives on the next poll (#1673).
+	escalationEffectsCompletedEvent = "delegation_escalation_effects_completed"
 )
+
+// escalationTTLPreClaimHook fires between the TTL sweep's candidate selection and
+// its resolution claim — the exact window in which a human resume lands, and the
+// only place a test can make that race deterministic. Nil in production.
+var escalationTTLPreClaimHook func(ctx context.Context, jobID string)
 
 // EscalationRecord is the structured payload stored in a
 // delegation_escalation_requested event message, so the resume path can resolve
@@ -545,7 +560,59 @@ func (e Engine) ResolveEscalation(ctx context.Context, coordinatorJobID string, 
 	// answers is populated only on the ask-gate `answer` verb; it is recorded on the
 	// resolution event (parsed + any unmatched ids) and threaded into the continuation.
 	var answers map[string]string
+	if verb == ResumeAnswer {
+		answers = parseHumanAnswers(rec.Questions, instructions)
+	}
 
+	// CLAIM THE RESOLUTION FIRST, in the append's own statement, THEN act (#1673).
+	// The pre-checks above are a fast path only: a human resume racing TTL
+	// auto-finalization, or two concurrent resume callers, both read
+	// requested=1/resolved=0. Whoever loses the conditional append must not run the
+	// irreversible retry/continuation effects below, and the counters must never
+	// reach requested==resolved+2, which would leave the NEXT round unresolvable.
+	//
+	// The verb's effects are idempotent by construction (deterministic resume ids,
+	// once-guarded continuations), so claiming before acting cannot strand the tree:
+	// a crash after the claim is re-driven by the same deterministic enqueue.
+	resolution := EscalationRecord{
+		DelegationID: rec.DelegationID,
+		ChildJobID:   rec.ChildJobID,
+		Reason:       string(verb),
+		Question:     strings.TrimSpace(instructions),
+		PausedAt:     e.now().UTC().Format(time.RFC3339), // reused as resolved_at
+		Kind:         rec.Kind,
+		Answers:      answers,
+	}
+	message := string(verb)
+	if encoded, marshalErr := json.Marshal(resolution); marshalErr == nil {
+		message = string(encoded)
+	}
+	claimed, err := e.Store.CloseHumanRound(ctx, db.JobEvent{
+		JobID:   coordinatorJobID,
+		Kind:    escalationResolvedEvent,
+		Message: message,
+	}, escalationRequestedEvent, escalationResolvedEvent)
+	if err != nil {
+		return err
+	}
+	if !claimed {
+		// Another resolver owns this round: idempotent no-op, exactly as a duplicate
+		// resume comment was always meant to be.
+		return nil
+	}
+
+	return e.applyResolutionEffects(ctx, parentJob, parentPayload, ref, rec, verb, instructions, answers)
+}
+
+// applyResolutionEffects runs the verb's irreversible half AFTER its resolution has
+// been exclusively claimed, then writes the receipt that marks the resolution
+// finished. Both the claim path and the recovery sweep call it, so a crash between
+// claim and effects is repaired by re-running exactly this code.
+//
+// Every verb's effect is idempotent — deterministic resume ids, once-guarded
+// continuations, and a task-state write that is a no-op when already planned — which
+// is what makes re-driving safe.
+func (e Engine) applyResolutionEffects(ctx context.Context, parentJob db.Job, parentPayload JobPayload, ref taskRef, rec EscalationRecord, verb ResumeDecision, instructions string, answers map[string]string) error {
 	switch verb {
 	case ResumeRetry:
 		if err := e.resumeRetryLeg(ctx, parentJob, parentPayload, rec, instructions); err != nil {
@@ -568,7 +635,6 @@ func (e Engine) ResolveEscalation(ctx context.Context, coordinatorJobID string, 
 			return err
 		}
 	case ResumeAnswer:
-		answers = parseHumanAnswers(rec.Questions, instructions)
 		if err := e.resumeAnswerLeg(ctx, parentJob, parentPayload, ref, rec, answers); err != nil {
 			return err
 		}
@@ -582,25 +648,92 @@ func (e Engine) ResolveEscalation(ctx context.Context, coordinatorJobID string, 
 	if err := e.setTaskState(ctx, ref, TaskPlanned); err != nil {
 		return err
 	}
-
-	resolution := EscalationRecord{
-		DelegationID: rec.DelegationID,
-		ChildJobID:   rec.ChildJobID,
-		Reason:       string(verb),
-		Question:     strings.TrimSpace(instructions),
-		PausedAt:     e.now().UTC().Format(time.RFC3339), // reused as resolved_at
-		Kind:         rec.Kind,
-		Answers:      answers,
+	if resolutionEffectsHook != nil {
+		if err := resolutionEffectsHook(ctx, parentJob.ID); err != nil {
+			return err
+		}
 	}
-	message := string(verb)
-	if encoded, marshalErr := json.Marshal(resolution); marshalErr == nil {
-		message = string(encoded)
-	}
+	// The receipt goes LAST: until it exists this resolution is unfinished and the
+	// recovery sweep owns it.
 	return e.Store.AddJobEvent(ctx, db.JobEvent{
-		JobID:   coordinatorJobID,
-		Kind:    escalationResolvedEvent,
-		Message: message,
+		JobID:   parentJob.ID,
+		Kind:    escalationEffectsCompletedEvent,
+		Message: string(verb),
 	})
+}
+
+// resolutionEffectsHook fires after a resolution's effects and before its receipt —
+// the only window in which a test can crash a claimed resolution and prove the
+// recovery sweep re-drives it. Nil in production.
+var resolutionEffectsHook func(ctx context.Context, jobID string) error
+
+// RecoverUnfinishedEscalationResolutions re-drives resolutions that were CLAIMED but
+// whose effects never finished (a crash, or a failed enqueue). Without it the
+// claim-before-act ordering that makes resolution exactly-once would let one crash
+// strand a tree permanently: a closed round is no candidate for any other sweep.
+func (e Engine) RecoverUnfinishedEscalationResolutions(ctx context.Context) (int, error) {
+	if err := e.validate(); err != nil {
+		return 0, err
+	}
+	jobIDs, err := e.Store.JobIDsWithUnfinishedEscalationResolution(ctx)
+	if err != nil {
+		return 0, err
+	}
+	recovered := 0
+	for _, jobID := range jobIDs {
+		rec, exists, err := e.loadEscalation(ctx, jobID)
+		if err != nil {
+			return recovered, err
+		}
+		resolution, resolved, err := e.loadResolution(ctx, jobID)
+		if err != nil {
+			return recovered, err
+		}
+		if !exists || !resolved {
+			continue
+		}
+		verb, ok := validResumeDecision(resolution.Reason)
+		if !ok {
+			continue
+		}
+		job, payload, err := e.jobPayload(ctx, jobID)
+		if err != nil {
+			return recovered, err
+		}
+		if payload.Result == nil {
+			continue
+		}
+		if err := e.applyResolutionEffects(ctx, job, payload, taskRefFromPayload(payload), rec, verb, resolution.Question, resolution.Answers); err != nil {
+			return recovered, err
+		}
+		recovered++
+	}
+	return recovered, nil
+}
+
+// loadResolution reads the LATEST resolution record for a job, which carries the verb
+// (Reason), the instructions (Question) and any parsed answers — everything the
+// recovery needs to re-drive the effects the claim promised.
+func (e Engine) loadResolution(ctx context.Context, jobID string) (EscalationRecord, bool, error) {
+	events, err := e.Store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		return EscalationRecord{}, false, err
+	}
+	var latest EscalationRecord
+	found := false
+	for _, event := range events {
+		if event.Kind != escalationResolvedEvent {
+			continue
+		}
+		var record EscalationRecord
+		if err := json.Unmarshal([]byte(event.Message), &record); err != nil {
+			// A legacy plain-verb message: the verb is the whole message.
+			record = EscalationRecord{Reason: strings.TrimSpace(event.Message)}
+		}
+		latest = record
+		found = true
+	}
+	return latest, found, nil
 }
 
 // resumeRetryLeg re-enqueues the failing delegation leg of a paused tree with the
@@ -784,6 +917,13 @@ func (e Engine) AutoFinalizeExpiredEscalations(ctx context.Context, ttl time.Dur
 	if err := e.validate(); err != nil {
 		return 0, err
 	}
+	// A resolution CLAIMED but never finished is repaired first, on every poll, and
+	// independently of ttl: it is not a paused tree, it is a debt (#1673). Doing it
+	// here rather than in a new sweep keeps it on the one path the daemon already
+	// calls for escalation upkeep.
+	if _, err := e.RecoverUnfinishedEscalationResolutions(ctx); err != nil {
+		return 0, err
+	}
 	if ttl <= 0 {
 		return 0, nil
 	}
@@ -857,13 +997,10 @@ func (e Engine) AutoFinalizeExpiredEscalations(ctx context.Context, ttl time.Dur
 				"job_id", jobID)
 			continue
 		}
-		reason := fmt.Sprintf("escalation TTL of %s elapsed with no human response", ttl)
-		if err := e.enqueueFinalizeContinuation(ctx, job, payload, reason); err != nil {
-			return finalized, err
-		}
-		if err := e.setTaskState(ctx, ref, TaskPlanned); err != nil {
-			return finalized, err
-		}
+		// CLAIM FIRST, exactly as a human resume does, and through the SAME mechanism:
+		// a TTL sweep racing a human resume must not also finalize (#1673). The
+		// JobIDsWithOpenEscalation candidate query above is a fast path; this append is
+		// the decision.
 		resolution := EscalationRecord{
 			DelegationID: rec.DelegationID,
 			ChildJobID:   rec.ChildJobID,
@@ -874,10 +1011,39 @@ func (e Engine) AutoFinalizeExpiredEscalations(ctx context.Context, ttl time.Dur
 		if encoded, marshalErr := json.Marshal(resolution); marshalErr == nil {
 			message = string(encoded)
 		}
-		if err := e.Store.AddJobEvent(ctx, db.JobEvent{
+		if escalationTTLPreClaimHook != nil {
+			escalationTTLPreClaimHook(ctx, jobID)
+		}
+		claimed, err := e.Store.CloseHumanRound(ctx, db.JobEvent{
 			JobID:   jobID,
 			Kind:    escalationResolvedEvent,
 			Message: message,
+		}, escalationRequestedEvent, escalationResolvedEvent)
+		if err != nil {
+			return finalized, err
+		}
+		if !claimed {
+			// A human resolved it between the candidate query and now.
+			continue
+		}
+		reason := fmt.Sprintf("escalation TTL of %s elapsed with no human response", ttl)
+		if err := e.enqueueFinalizeContinuation(ctx, job, payload, reason); err != nil {
+			return finalized, err
+		}
+		if err := e.setTaskState(ctx, ref, TaskPlanned); err != nil {
+			return finalized, err
+		}
+		if resolutionEffectsHook != nil {
+			if err := resolutionEffectsHook(ctx, jobID); err != nil {
+				return finalized, err
+			}
+		}
+		// The receipt, same contract as a human resume: until it exists this claimed
+		// resolution is unfinished and the recovery sweep owns it.
+		if err := e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   jobID,
+			Kind:    escalationEffectsCompletedEvent,
+			Message: "ttl",
 		}); err != nil {
 			return finalized, err
 		}

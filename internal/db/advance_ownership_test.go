@@ -256,7 +256,7 @@ func TestUpsertTaskWithJobEventUnlessStatesRollsBackTheTaskWhenTheEventFails(t *
 		t.Fatalf("hide job_events: %v", err)
 	}
 
-	won, paused, err := store.OpenHumanRound(ctx, HumanRoundOpen{
+	outcome, err := store.OpenHumanRound(ctx, HumanRoundOpen{
 		Task:            Task{ID: "task-round", RepoFullName: "o/r", Branch: "b", State: "awaiting_human"},
 		ForbiddenStates: []string{"dismissed", "superseded", "stranded", "merged"},
 		Event:           JobEvent{JobID: "coord", Kind: "delegation_escalation_requested", Message: "round"},
@@ -266,8 +266,8 @@ func TestUpsertTaskWithJobEventUnlessStatesRollsBackTheTaskWhenTheEventFails(t *
 	if err == nil {
 		t.Fatal("the round-open reported success while its event insert was impossible")
 	}
-	if won || paused {
-		t.Fatalf("the round-open reported won=%v paused=%v for an impossible write", won, paused)
+	if outcome == HumanRoundOpened {
+		t.Fatalf("the round-open reported %v for an impossible write", outcome)
 	}
 
 	if _, err := raw.ExecContext(ctx, `ALTER TABLE job_events_hidden RENAME TO job_events`); err != nil {

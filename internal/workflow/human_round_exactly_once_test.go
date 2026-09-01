@@ -102,6 +102,18 @@ func TestConcurrentSiblingEscalationsOpenExactlyOneRound(t *testing.T) {
 	} else if task.State != string(TaskAwaitingHuman) {
 		t.Fatalf("parent task state = %q, want awaiting_human: the winning opener did not pause", task.State)
 	}
+	// THE ASSERTION THIS SUITE WAS MISSING: task events. A loser classified as a
+	// refusal writes a FALSE landed-work row here, and job-event/notification counts
+	// cannot see it.
+	taskEvents, err := store.ListTaskEvents(ctx, "task-5")
+	if err != nil {
+		t.Fatalf("ListTaskEvents: %v", err)
+	}
+	for _, event := range taskEvents {
+		if event.Kind == TaskEventMergedRegressionRefused {
+			t.Fatalf("a concurrent opener loser wrote a false landed-work refusal: %+v", event)
+		}
+	}
 }
 
 // TestConcurrentSiblingAskGatesOpenExactlyOneRound is the same property for the ask

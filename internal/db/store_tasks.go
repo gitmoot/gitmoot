@@ -284,27 +284,43 @@ type HumanRoundOpen struct {
 // The conditional INSERT is the FIRST statement so it takes the write lock before
 // anything is read — the same write-first ordering the resource-lock guard uses, and
 // for the same reason: under WAL a read-then-write pair loses to a concurrent commit.
-func (s *Store) OpenHumanRound(ctx context.Context, round HumanRoundOpen) (won bool, paused bool, err error) {
+// HumanRoundOutcome names the three ways a round-open ends. A caller that cannot
+// tell them apart either announces for a loser, or writes a landed-work audit event
+// about a task it never touched — intent that a (bool, bool) pair cannot carry.
+type HumanRoundOutcome int
+
+const (
+	// HumanRoundAlreadyOpen: another opener holds this round. Idempotent and silent.
+	HumanRoundAlreadyOpen HumanRoundOutcome = iota
+	// HumanRoundOpened: this caller won the guard and, unless taskless, paused.
+	HumanRoundOpened
+	// HumanRoundRefused: this caller won the guard but its guarded task transition was
+	// refused, so the whole round-open rolled back. Only this outcome owes a
+	// classification of the winning row.
+	HumanRoundRefused
+)
+
+func (s *Store) OpenHumanRound(ctx context.Context, round HumanRoundOpen) (HumanRoundOutcome, error) {
 	return s.openHumanRound(ctx, round, nil, time.Time{})
 }
 
 // OpenHumanRoundIfAdvanceOwned is OpenHumanRound with live advance ownership
 // asserted in the same transaction, so a superseded pass can neither open a round
 // nor announce one.
-func (s *Store) OpenHumanRoundIfAdvanceOwned(ctx context.Context, round HumanRoundOpen, own AdvanceOwnership, now time.Time) (won bool, paused bool, err error) {
+func (s *Store) OpenHumanRoundIfAdvanceOwned(ctx context.Context, round HumanRoundOpen, own AdvanceOwnership, now time.Time) (HumanRoundOutcome, error) {
 	return s.openHumanRound(ctx, round, &own, now)
 }
 
-func (s *Store) openHumanRound(ctx context.Context, round HumanRoundOpen, own *AdvanceOwnership, now time.Time) (bool, bool, error) {
+func (s *Store) openHumanRound(ctx context.Context, round HumanRoundOpen, own *AdvanceOwnership, now time.Time) (HumanRoundOutcome, error) {
 	if strings.TrimSpace(round.Event.JobID) == "" {
-		return false, false, errors.New("job event job id is required")
+		return HumanRoundAlreadyOpen, errors.New("job event job id is required")
 	}
 	if strings.TrimSpace(round.RequestedKind) == "" || strings.TrimSpace(round.ResolvedKind) == "" {
-		return false, false, errors.New("round-open requires both event kinds")
+		return HumanRoundAlreadyOpen, errors.New("round-open requires both event kinds")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return false, false, err
+		return HumanRoundAlreadyOpen, err
 	}
 	defer tx.Rollback()
 
@@ -315,40 +331,74 @@ func (s *Store) openHumanRound(ctx context.Context, round HumanRoundOpen, own *A
 		round.Event.JobID, round.Event.Kind, round.Event.Message,
 		round.Event.JobID, round.RequestedKind, round.Event.JobID, round.ResolvedKind)
 	if err != nil {
-		return false, false, err
+		return HumanRoundAlreadyOpen, err
 	}
 	opened, err := result.RowsAffected()
 	if err != nil {
-		return false, false, err
+		return HumanRoundAlreadyOpen, err
 	}
 	if opened != 1 {
 		// A round is already open on this job: idempotent, and nothing to announce.
-		return false, false, tx.Commit()
+		return HumanRoundAlreadyOpen, tx.Commit()
 	}
 	if own != nil {
 		live, ownErr := advanceOwnershipLiveTx(ctx, tx, *own, now)
 		if ownErr != nil {
-			return false, false, ownErr
+			return HumanRoundAlreadyOpen, ownErr
 		}
 		if !live {
-			return false, false, fmt.Errorf("%w: task %s round-open for job %s at generation %d",
+			return HumanRoundAlreadyOpen, fmt.Errorf("%w: task %s round-open for job %s at generation %d",
 				ErrAdvanceOwnershipLost, round.Task.ID, own.OwnerJobID, own.AtGeneration)
 		}
 	}
 	if strings.TrimSpace(round.Task.ID) == "" {
 		// A taskless coordinator owes the round record and has nothing to pause.
-		return true, false, tx.Commit()
+		return HumanRoundOpened, tx.Commit()
 	}
 	written, err := s.upsertTaskUnlessStates(ctx, tx, round.Task, round.ForbiddenStates)
 	if err != nil {
-		return false, false, err
+		return HumanRoundAlreadyOpen, err
 	}
 	if !written {
-		// The pause was REFUSED: roll the round-open event back with it. The caller
-		// classifies the refusal and must not announce.
-		return false, false, nil
+		// The pause was REFUSED: roll the round-open event back with it, and say so
+		// explicitly. A loser and a refusal are different facts.
+		return HumanRoundRefused, nil
 	}
-	return true, true, tx.Commit()
+	return HumanRoundOpened, tx.Commit()
+}
+
+// CloseHumanRound is the resolver half, and it is the SAME mechanism as the opener:
+// the requested>resolved invariant is asserted inside the append's own statement, so
+// a human resume racing TTL auto-finalization — or two concurrent resume callers —
+// cannot both close one round (#1673).
+//
+// Without it both observe requested=1/resolved=0, both act, and both append: the
+// counters reach 2/2, escalationOpen reports closed, and the NEXT legitimate round
+// opens to requested=2/resolved=2, which no resolver can ever close again.
+//
+// closed=false means another caller owns this resolution. Its irreversible
+// retry/continuation effects MUST NOT run: callers claim first, then act.
+func (s *Store) CloseHumanRound(ctx context.Context, event JobEvent, requestedKind string, resolvedKind string) (closed bool, err error) {
+	if strings.TrimSpace(event.JobID) == "" {
+		return false, errors.New("job event job id is required")
+	}
+	if strings.TrimSpace(requestedKind) == "" || strings.TrimSpace(resolvedKind) == "" {
+		return false, errors.New("round-close requires both event kinds")
+	}
+	result, err := s.db.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message)
+		SELECT ?, ?, ?
+		WHERE (SELECT COUNT(*) FROM job_events WHERE job_id = ? AND kind = ?)
+		    > (SELECT COUNT(*) FROM job_events WHERE job_id = ? AND kind = ?)`,
+		event.JobID, event.Kind, event.Message,
+		event.JobID, requestedKind, event.JobID, resolvedKind)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
 }
 
 func (s *Store) upsertTaskUnlessStates(ctx context.Context, execer sqlExecer, task Task, forbiddenStates []string) (bool, error) {

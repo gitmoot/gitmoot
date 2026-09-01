@@ -742,26 +742,28 @@ func (e Engine) openHumanRound(ctx context.Context, ref taskRef, jobID string, e
 			taskStatePreWriteHook(ctx, task.ID)
 		}
 	}
-	var won, paused bool
+	var outcome db.HumanRoundOutcome
 	if own := e.advanceOwnershipBinding(); own != nil {
-		won, paused, err = e.Store.OpenHumanRoundIfAdvanceOwned(ctx, round, *own, time.Now().UTC())
+		outcome, err = e.Store.OpenHumanRoundIfAdvanceOwned(ctx, round, *own, time.Now().UTC())
 	} else {
-		won, paused, err = e.Store.OpenHumanRound(ctx, round)
+		outcome, err = e.Store.OpenHumanRound(ctx, round)
 	}
 	if err != nil {
 		return false, e.classifyAdvanceOwnershipLoss(err, "human-round-commit")
 	}
-	if won {
-		// A taskless coordinator has nothing to pause, so winning IS opening.
-		return taskless || paused, nil
-	}
-	if taskless {
-		// Lost the round: another opener owns it. Idempotent, and silent.
+	switch outcome {
+	case db.HumanRoundOpened:
+		return true, nil
+	case db.HumanRoundRefused:
+		// THIS caller's guarded pause was refused, so it owes a classification of the
+		// winning row. A concurrent LOSER must never reach here: its task is genuinely
+		// awaiting_human, and classifying it would write a false landed-work refusal
+		// into the durable audit.
+		return false, classifyRefusedTaskStateWrite(ctx, e.Store, task, TaskAwaitingHuman, mergedGuarded)
+	default:
+		// Another opener holds the round: idempotent, silent, and nothing to classify.
 		return false, nil
 	}
-	// Either the round was already open, or the pause was refused and rolled back
-	// with it. Only the second owes a classification, and it is read from the row.
-	return false, classifyRefusedTaskStateWrite(ctx, e.Store, task, TaskAwaitingHuman, mergedGuarded)
 }
 
 // classifyAdvanceOwnershipLoss turns a refused ownership-bound write into the

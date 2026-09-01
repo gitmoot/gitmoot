@@ -2243,6 +2243,23 @@ func (s *Store) JobIDsWithOpenEscalation(ctx context.Context) ([]string, error) 
 		ORDER BY job_id`)
 }
 
+// JobIDsWithUnfinishedEscalationResolution returns coordinator jobs whose escalation
+// resolution was CLAIMED but whose effects never finished: strictly more
+// delegation_escalation_resolved than delegation_escalation_effects_completed events.
+//
+// The claim is committed before the verb's irreversible effects so that only one
+// resolver runs them (#1673). This query is what stops that ordering from turning a
+// crash into a permanent stall: a closed round is no candidate for any other sweep,
+// so the receipt gap is the only remaining evidence that work is owed.
+func (s *Store) JobIDsWithUnfinishedEscalationResolution(ctx context.Context) ([]string, error) {
+	return s.jobIDsByQuery(ctx, `SELECT job_id FROM job_events
+		WHERE kind IN ('delegation_escalation_resolved', 'delegation_escalation_effects_completed')
+		GROUP BY job_id
+		HAVING SUM(CASE WHEN kind = 'delegation_escalation_resolved' THEN 1 ELSE 0 END)
+		     > SUM(CASE WHEN kind = 'delegation_escalation_effects_completed' THEN 1 ELSE 0 END)
+		ORDER BY job_id`)
+}
+
 // RecordJobGates persists one resumable gate per non-blank need for a blocked job
 // (#682). It is an UPSERT keyed on (job_id, need): a fresh need inserts an OPEN
 // gate; a re-blocked job that repeats a need REOPENS the existing row (resets
