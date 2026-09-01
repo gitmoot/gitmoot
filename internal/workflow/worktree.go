@@ -1794,22 +1794,32 @@ func blockTaskForDirtyWorktree(ctx context.Context, store *db.Store, task db.Tas
 	if task.Title == "" {
 		task.Title = request.TaskTitle
 	}
-	written, err := PersistTaskState(ctx, store, task, TaskBlocked)
+	blockErr := BlockedError{Reason: reason}
+	blocked, err := store.BlockTaskWithEvent(ctx, task, db.TaskEvent{
+		Kind:      "stale_worktree_dirty_blocked",
+		FromState: fromState,
+		Reason:    reason,
+	})
 	if err != nil {
-		return err
-	}
-	if written {
-		if err := store.AddTaskEvent(ctx, db.TaskEvent{
-			TaskID:    task.ID,
-			Kind:      "stale_worktree_dirty_blocked",
-			FromState: fromState,
-			ToState:   string(TaskBlocked),
-			Reason:    reason,
-		}); err != nil {
+		// #1673, same rule as Engine.blockTask: a task whose pull request already
+		// MERGED keeps that record, and the caller still gets a BlockedError so the
+		// dirty checkout is preserved and the allocation fails closed. Only the
+		// LANDED-WORK refusal is folded this way; every other conflict is a real error.
+		if errors.Is(err, db.ErrTaskStateConflict) && fromState == string(TaskMerged) {
+			_ = store.AddTaskEvent(ctx, db.TaskEvent{
+				TaskID: task.ID,
+				Kind:   TaskEventMergedRegressionRefused,
+				Reason: fmt.Sprintf("refused %s -> %s: the pull request already merged, so the landed-work record is kept; the dirty worktree at %s is preserved",
+					TaskMerged, TaskBlocked, path),
+			})
+			return blockErr
+		}
+		if !blocked {
 			return err
 		}
+		return errors.Join(blockErr, fmt.Errorf("record dirty-worktree block for task %s: %w", task.ID, err))
 	}
-	return BlockedError{Reason: reason}
+	return blockErr
 }
 
 func TaskWorktreePath(home string, repo string, taskID string) (string, error) {

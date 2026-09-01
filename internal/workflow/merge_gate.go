@@ -27,7 +27,14 @@ const (
 	MergeLeaveOpenAutoMergeKillSwitchReason = "native auto-merge is disabled by the repository kill-switch; leave the pull request open for a human merge"
 	commitStatusDescriptionMaxRunes         = 140
 	mergeQueueLockTTL                       = 30 * time.Minute
+	// The initial lease outlives the maximum eight-hour worker context by one
+	// hour. Hourly renewal also protects daemon-owned calls without a deadline.
+	mergeTaskStateClaimTTL             = 9 * time.Hour
+	mergeTaskStateClaimRenewalInterval = time.Hour
+	mergeOutcomeConfirmationTimeout    = 30 * time.Second
 )
+
+var ErrMergeTaskStateChanged = errors.New("merge task state changed before external merge")
 
 // NativeMergeGateDisabled reports whether the operator handed the merge decision
 // to an external gate via GITMOOT_DISABLE_NATIVE_MERGE_GATE (#545). It is the
@@ -98,7 +105,12 @@ type PolicyMergeGate struct {
 	// of wedging forever. Zero means use the built-in default (defaultMaxCIWait).
 	MaxCIWait time.Duration
 	// Clock is injectable for deterministic tests. Nil means time.Now.
-	Clock func() time.Time
+	Clock                      func() time.Time
+	taskClaimTTL               time.Duration
+	taskClaimRenewalInterval   time.Duration
+	taskClaimRenewalTicks      func(context.Context, time.Duration) <-chan time.Time
+	afterTaskClaimRenewal      func()
+	outcomeConfirmationTimeout time.Duration
 }
 
 // defaultMinCIWait is the built-in grace window used when MinCIWait is unset. It
@@ -135,6 +147,94 @@ func (g PolicyMergeGate) maxCIWait() time.Duration {
 	return defaultMaxCIWait
 }
 
+func (g PolicyMergeGate) taskStateClaimTTL() time.Duration {
+	if g.taskClaimTTL > 0 {
+		return g.taskClaimTTL
+	}
+	return mergeTaskStateClaimTTL
+}
+
+func (g PolicyMergeGate) taskStateClaimRenewalInterval() time.Duration {
+	if g.taskClaimRenewalInterval > 0 {
+		return g.taskClaimRenewalInterval
+	}
+	return mergeTaskStateClaimRenewalInterval
+}
+
+func (g PolicyMergeGate) taskStateClaimRenewalTickSource(ctx context.Context, interval time.Duration) <-chan time.Time {
+	if g.taskClaimRenewalTicks != nil {
+		return g.taskClaimRenewalTicks(ctx, interval)
+	}
+	out := make(chan time.Time)
+	go func() {
+		defer close(out)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case tick := <-ticker.C:
+				select {
+				case out <- tick:
+				case <-ctx.Done():
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
+}
+
+func (g PolicyMergeGate) startTaskStateClaimRenewal(taskID, token string) func() error {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		ticks := g.taskStateClaimRenewalTickSource(ctx, g.taskStateClaimRenewalInterval())
+		var lastErr error
+		for {
+			select {
+			case _, ok := <-ticks:
+				if !ok {
+					if ctx.Err() != nil {
+						done <- lastErr
+					} else {
+						done <- errors.Join(lastErr, errors.New("task claim renewal clock stopped"))
+					}
+					return
+				}
+				renewed, err := g.Store.RenewTaskStateClaim(context.Background(), taskID, token, g.taskStateClaimTTL())
+				if err != nil {
+					lastErr = fmt.Errorf("renew task state claim: %w", err)
+					continue
+				}
+				if !renewed {
+					done <- fmt.Errorf("%w: durable task claim for %s expired or changed owners", ErrMergeTaskStateChanged, taskID)
+					return
+				}
+				lastErr = nil
+				if g.afterTaskClaimRenewal != nil {
+					g.afterTaskClaimRenewal()
+				}
+			case <-ctx.Done():
+				done <- lastErr
+				return
+			}
+		}
+	}()
+	return func() error {
+		cancel()
+		return <-done
+	}
+}
+
+func (g PolicyMergeGate) mergeOutcomeConfirmationTimeout() time.Duration {
+	if g.outcomeConfirmationTimeout > 0 {
+		return g.outcomeConfirmationTimeout
+	}
+	return mergeOutcomeConfirmationTimeout
+}
+
 // workflowAwareGitHub is an OPTIONAL capability the merge gate probes for on its
 // GitHub client (#596, layer 2). The real *github.GhClient implements it; a
 // client that does not is treated as "workflows unknown", which fails safe
@@ -144,16 +244,16 @@ type workflowAwareGitHub interface {
 }
 
 func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (MergeDecision, error) {
-	// An explicit operator kill-switch must remain before validation and every
-	// GitHub/local-store operation. An authenticated human merge request may
-	// override this policy, but not the independently verified evidence below.
-	if !g.AutoMerge && !request.HumanMergeRequested {
+	// An explicit operator kill-switch remains before validation and every
+	// GitHub/local-store operation except terminal recovery. Recovery re-reads
+	// the forge and may only finish an already-merged pull request.
+	if !g.AutoMerge && !request.HumanMergeRequested && !request.TerminalRecoveryOnly {
 		return MergeDecision{LeaveOpen: true, Reason: PlainReason(MergeLeaveOpenAutoMergeKillSwitchReason)}, nil
 	}
-	if request.PullRequestDraftUnknown {
+	if request.PullRequestDraftUnknown && !request.TerminalRecoveryOnly {
 		return MergeDecision{LeaveOpen: true, Reason: PlainReason("pull request draft state is unknown")}, nil
 	}
-	if request.PullRequestDraft {
+	if request.PullRequestDraft && !request.TerminalRecoveryOnly {
 		return MergeDecision{LeaveOpen: true, Reason: PlainReason("pull request is draft")}, nil
 	}
 	if err := g.validate(); err != nil {
@@ -169,6 +269,25 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	pr, err := g.GitHub.GetPullRequest(ctx, repo, int64(request.PullRequest))
 	if err != nil {
 		return MergeDecision{}, err
+	}
+	if !pullRequestMerged(pr) && strings.TrimSpace(pr.State) == "closed" &&
+		strings.TrimSpace(request.TaskID) != "" && strings.TrimSpace(request.ExpectedTaskState) != "" {
+		released, _, releaseErr := g.Store.ReleaseRetainedTaskStateClaim(ctx,
+			request.TaskID, request.ExpectedTaskState, db.TaskStateClaimKindExternalMergeUncertain)
+		if releaseErr != nil {
+			return MergeDecision{}, fmt.Errorf("resolve retained task claim after authoritative non-merged observation: %w", releaseErr)
+		}
+		if released {
+			log.Printf("merge gate released retained external merge claim for task %s after pull request #%d reached a terminal non-merge state",
+				request.TaskID, request.PullRequest)
+		}
+	}
+	if request.TerminalRecoveryOnly && !pullRequestMerged(pr) {
+		return MergeDecision{
+			Deferred:   true,
+			BlockClass: MergeBlockTransient,
+			Reason:     PlainReason("authoritative pull request re-read has not confirmed a merge"),
+		}, nil
 	}
 	headSHA := strings.TrimSpace(pr.HeadSHA)
 	if headSHA == "" {
@@ -208,6 +327,12 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 		}()
 	}
 	if pullRequestMerged(pr) {
+		if strings.TrimSpace(request.TaskID) != "" && strings.TrimSpace(request.ExpectedTaskState) != "" {
+			if _, _, err := g.Store.RecoverClaimedTaskState(ctx, request.TaskID, string(TaskMerged),
+				"pull_request_merged", fmt.Sprintf("recovered merged pull request #%d from durable task claim", request.PullRequest)); err != nil {
+				return MergeDecision{}, err
+			}
+		}
 		return g.finishMerged(ctx, request, pr, strings.TrimSpace(pr.MergeSHA))
 	}
 	if strings.TrimSpace(pr.State) == "closed" {
@@ -241,7 +366,7 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	if pr.Mergeable != nil && !*pr.Mergeable {
 		return g.block(ctx, request, headSHA, "pull request is not mergeable; rebase or update the branch", MergeBlockTransient)
 	}
-	result, err := executePullRequestMerge(ctx, g.GitHub, github.MergePullRequestInput{
+	result, err := g.executePullRequestMergeFenced(ctx, request, github.MergePullRequestInput{
 		Repo:            repo,
 		Number:          int64(request.PullRequest),
 		Method:          mergeMethod(g.MergeMethod),
@@ -317,6 +442,92 @@ func (g PolicyMergeGate) reviewAndCIGateMiss(ctx context.Context, repo github.Re
 		}
 	}
 	return MergeDecision{}, false, miss, nil
+}
+
+// executePullRequestMergeFenced durably claims the task's expected state before
+// the irreversible GitHub merge. The active lease renews while the external
+// call is in flight. Accepted queued merges and outcomes that cannot be
+// confirmed remain fenced without expiry until a later authoritative merged or
+// terminal non-merge observation resolves them.
+func (g PolicyMergeGate) executePullRequestMergeFenced(ctx context.Context, request MergeRequest, input github.MergePullRequestInput) (github.MergeResult, error) {
+	expectedState := strings.TrimSpace(request.ExpectedTaskState)
+	taskID := strings.TrimSpace(request.TaskID)
+	if expectedState == "" || taskID == "" {
+		return executePullRequestMerge(ctx, g.GitHub, input)
+	}
+	token, claimed, currentState, err := g.Store.ClaimTaskState(
+		ctx, taskID, expectedState, db.TaskStateClaimKindExternalMerge, g.taskStateClaimTTL())
+	if err != nil {
+		return github.MergeResult{}, err
+	}
+	if !claimed {
+		return github.MergeResult{}, fmt.Errorf("%w: task %s expected %q, current %q",
+			ErrMergeTaskStateChanged, taskID, expectedState, currentState)
+	}
+	stopRenewal := g.startTaskStateClaimRenewal(taskID, token)
+	result, mergeErr := executePullRequestMerge(ctx, g.GitHub, input)
+	renewalErr := stopRenewal()
+
+	if mergeErr != nil {
+		confirmedPR, confirmationErr := g.confirmExternalMergeOutcome(ctx, input)
+		switch {
+		case confirmationErr == nil && pullRequestMerged(confirmedPR):
+			result = github.MergeResult{Merged: true, SHA: strings.TrimSpace(confirmedPR.MergeSHA)}
+			mergeErr = nil
+		case confirmationErr == nil && strings.TrimSpace(confirmedPR.State) == "closed":
+			releaseErr := g.Store.ReleaseTaskStateClaim(ctx, taskID, token)
+			return result, errors.Join(mergeErr, renewalErr, releaseErr)
+		default:
+			retained, retainErr := g.Store.RetainTaskStateClaim(ctx, taskID, token,
+				expectedState, db.TaskStateClaimKindExternalMergeUncertain)
+			outcomeErr := errors.Join(mergeErr, renewalErr, retainErr)
+			if confirmationErr != nil {
+				outcomeErr = errors.Join(outcomeErr, fmt.Errorf("confirm external merge outcome: %w", confirmationErr))
+			}
+			if !retained {
+				return result, fmt.Errorf("external merge outcome is unresolved and durable task ownership could not be retained: %w",
+					errors.Join(outcomeErr, ErrMergeTaskStateChanged))
+			}
+			if confirmationErr == nil {
+				return result, fmt.Errorf("external merge returned an error while the pull request remains open; durable task ownership retained for reconciliation: %w",
+					outcomeErr)
+			}
+			return result, fmt.Errorf("external merge outcome is ambiguous; durable task ownership retained for reconciliation: %w",
+				outcomeErr)
+		}
+	}
+	if !result.Merged {
+		retained, retainErr := g.Store.RetainTaskStateClaim(ctx, taskID, token,
+			expectedState, db.TaskStateClaimKindExternalMergeUncertain)
+		if !retained {
+			return result, fmt.Errorf("external merge is pending and durable task ownership could not be retained: %w",
+				errors.Join(renewalErr, retainErr, ErrMergeTaskStateChanged))
+		}
+		if renewalErr != nil {
+			log.Printf("merge gate retained pending task %s after claim renewal warning: %v", taskID, renewalErr)
+		}
+		return result, nil
+	}
+	changed, currentState, err := g.Store.CompleteTaskStateClaim(ctx, taskID, token,
+		string(TaskMerged), "pull_request_merged",
+		fmt.Sprintf("merged pull request #%d while holding durable task-state claim", request.PullRequest))
+	if err != nil {
+		return result, fmt.Errorf("external merge succeeded but task %s claim completion failed: %w", taskID, err)
+	}
+	if !changed {
+		return result, fmt.Errorf("external merge succeeded but %w: task %s expected %q, current %q",
+			ErrMergeTaskStateChanged, taskID, expectedState, currentState)
+	}
+	if renewalErr != nil {
+		log.Printf("merge gate completed task %s after claim renewal warning: %v", taskID, renewalErr)
+	}
+	return result, nil
+}
+
+func (g PolicyMergeGate) confirmExternalMergeOutcome(ctx context.Context, input github.MergePullRequestInput) (github.PullRequest, error) {
+	confirmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), g.mergeOutcomeConfirmationTimeout())
+	defer cancel()
+	return g.GitHub.GetPullRequest(confirmCtx, input.Repo, input.Number)
 }
 
 // executePullRequestMerge is the single low-level GitHub merge path shared by
@@ -475,19 +686,20 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	missingImplementerReason := implementerAttribution.failureReason()
 	delegationChildrenByParent := make(map[string][]db.Job)
 	for _, job := range jobs {
-		parentID := strings.TrimSpace(job.ParentJobID)
-		if parentID == "" || strings.TrimSpace(job.DelegationID) == "" {
+		if !isDelegationChild(job) {
 			continue
 		}
+		parentID := strings.TrimSpace(job.ParentJobID)
 		delegationChildrenByParent[parentID] = append(delegationChildrenByParent[parentID], job)
 	}
 	// A round can order remediation, but it must not hide a blocking verdict or
 	// an unfinished reviewer slot captured at the head currently being evaluated.
-	type reviewAtHead struct {
+	type taskReview struct {
 		job     db.Job
 		payload JobPayload
 	}
-	var reviewsAtHead []reviewAtHead
+	var taskReviews []taskReview
+	taskReviewIDs := make(map[string]struct{})
 	for _, job := range jobs {
 		if job.Type != "review" {
 			continue
@@ -499,40 +711,24 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if !sameTask(current, payload) {
 			continue
 		}
-		reviewHead := strings.TrimSpace(payload.HeadSHA)
+		taskReviews = append(taskReviews, taskReview{job: job, payload: payload})
+		taskReviewIDs[job.ID] = struct{}{}
+	}
+	var reviewsAtHead []taskReview
+	for _, review := range taskReviews {
+		reviewHead := strings.TrimSpace(review.payload.HeadSHA)
 		if reviewHead == "" || reviewHead != headSHA {
 			continue
 		}
-		reviewsAtHead = append(reviewsAtHead, reviewAtHead{job: job, payload: payload})
+		reviewsAtHead = append(reviewsAtHead, review)
 	}
-	latestReviewByReviewer := map[string]reviewAtHead{}
-	var reviewerOrder []string
-	for _, review := range reviewsAtHead {
-		reviewer := strings.TrimSpace(review.job.Agent)
-		latest, exists := latestReviewByReviewer[reviewer]
-		if !exists {
-			reviewerOrder = append(reviewerOrder, reviewer)
-			latestReviewByReviewer[reviewer] = review
-			continue
-		}
-		if reviewJobRecordedAfter(review.job, latest.job) {
-			latestReviewByReviewer[reviewer] = review
-		}
-	}
-	for _, reviewer := range reviewerOrder {
-		review := latestReviewByReviewer[reviewer]
-		switch JobState(review.job.State) {
-		case JobQueued, JobRunning:
-			return mergePending{reason: fmt.Sprintf("waiting for reviewer %s at evaluated head (job %s is %s)", reviewer, review.job.ID, review.job.State)}
-		case JobFailed, JobCancelled:
-			return fmt.Errorf("crashed reviewer %s at evaluated head (job %s is %s); requeue or reassign the review", reviewer, review.job.ID, review.job.State)
-		}
-	}
+	// Supersession is resolved BEFORE any state or verdict scan, and it covers a
+	// row in any state: a strictly later terminal verdict from the same reviewer
+	// is what clears a crashed or requeued slot. Rows whose order cannot be
+	// established -- one explicit review-N against one empty round -- supersede
+	// in neither direction, so no row is ever hidden by ListJobs' id order.
 	supersededReviewIDs := map[string]struct{}{}
 	for _, review := range reviewsAtHead {
-		if review.payload.Result == nil {
-			continue
-		}
 		reviewer := strings.TrimSpace(review.job.Agent)
 		if reviewer == "" {
 			continue
@@ -541,17 +737,32 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			if candidate.payload.Result != nil &&
 				strings.TrimSpace(candidate.job.Agent) == reviewer &&
 				isReviewReplacementDecision(candidate.payload.Result.Decision) &&
-				reviewJobRecordedAfter(candidate.job, review.job) {
+				reviewJobSupersedes(candidate.job, candidate.payload, review.job, review.payload) {
 				supersededReviewIDs[review.job.ID] = struct{}{}
 				break
 			}
 		}
 	}
+	var activeAtHead []taskReview
 	for _, review := range reviewsAtHead {
-		if review.payload.Result == nil {
+		if _, superseded := supersededReviewIDs[review.job.ID]; superseded {
 			continue
 		}
-		if _, superseded := supersededReviewIDs[review.job.ID]; superseded {
+		activeAtHead = append(activeAtHead, review)
+	}
+	// EVERY unsuperseded slot at the evaluated head is inspected, not one row per
+	// reviewer: an unfinished or crashed reviewer must not be hidden by a sibling
+	// row of the same reviewer whose recency cannot be decided.
+	for _, review := range activeAtHead {
+		switch JobState(review.job.State) {
+		case JobQueued, JobRunning:
+			return mergePending{reason: fmt.Sprintf("waiting for reviewer %s at evaluated head (job %s is %s)", strings.TrimSpace(review.job.Agent), review.job.ID, review.job.State)}
+		case JobFailed, JobCancelled:
+			return fmt.Errorf("crashed reviewer %s at evaluated head (job %s is %s); retry or settle that same job, or push a new head. Reassigning the review to a different agent cannot clear this reviewer's slot", strings.TrimSpace(review.job.Agent), review.job.ID, review.job.State)
+		}
+	}
+	for _, review := range activeAtHead {
+		if review.payload.Result == nil {
 			continue
 		}
 		switch effectiveReviewDecisionForPayload(review.payload, request.ReviewBlockingSeverity) {
@@ -559,17 +770,17 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			return mergeBlocked{reason: fmt.Sprintf("review at evaluated head has blocking result from %s", review.job.Agent)}
 		}
 	}
-	if len(latestReviewByReviewer) > 0 {
+	if len(activeAtHead) > 0 {
 		var selfApprovalReason string
 		var unknownImplementerReason string
 		var unattributedReviewerReason string
-		for _, reviewer := range reviewerOrder {
-			review := latestReviewByReviewer[reviewer]
+		for _, review := range activeAtHead {
+			reviewer := strings.TrimSpace(review.job.Agent)
 			if JobState(review.job.State) != JobSucceeded {
 				return fmt.Errorf("reviewer %s at evaluated head has unusable job state %s (job %s)", reviewer, review.job.State, review.job.ID)
 			}
 			if review.payload.Result == nil {
-				return fmt.Errorf("abstaining reviewer %s at evaluated head has no recognized decision (job %s); requeue or reassign the review", reviewer, review.job.ID)
+				return fmt.Errorf("abstaining reviewer %s at evaluated head has no recognized decision (job %s); dispatch a fresh review for that same agent at this head, or push a new head. Reassigning to a different agent cannot clear this reviewer's slot", reviewer, review.job.ID)
 			}
 			switch effectiveReviewDecisionForPayload(review.payload, request.ReviewBlockingSeverity) {
 			case "approved":
@@ -593,7 +804,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			case "changes_requested", "blocked", "failed":
 				return mergeBlocked{reason: fmt.Sprintf("review at evaluated head has blocking result from %s", reviewer)}
 			default:
-				return fmt.Errorf("abstaining reviewer %s at evaluated head returned unrecognized decision %q (job %s); requeue or reassign the review", reviewer, review.payload.Result.Decision, review.job.ID)
+				return fmt.Errorf("abstaining reviewer %s at evaluated head returned unrecognized decision %q (job %s); dispatch a fresh review for that same agent at this head, or push a new head. Reassigning to a different agent cannot clear this reviewer's slot", reviewer, review.payload.Result.Decision, review.job.ID)
 			}
 		}
 		if reason := reviewAuthorshipFailureReason(selfApprovalReason, unknownImplementerReason, unattributedReviewerReason); reason != "" {
@@ -601,30 +812,22 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		}
 		return nil
 	}
-	latest := ""
-	for _, job := range jobs {
-		if job.Type != "review" {
+	var latest reviewRoundKey
+	haveLatest := false
+	for _, review := range taskReviews {
+		if isRoundHistoryDuplicate(review.job, taskReviewIDs) {
 			continue
 		}
-		payload, err := unmarshalPayload(job.Payload)
-		if err != nil {
-			return err
-		}
-		if !sameTask(current, payload) {
+		if _, superseded := supersededReviewIDs[review.job.ID]; superseded {
 			continue
 		}
-		if _, superseded := supersededReviewIDs[job.ID]; superseded {
-			continue
-		}
-		round := strings.TrimSpace(payload.ReviewRound)
-		if round == "" {
-			round = job.ID
-		}
-		if latest == "" || reviewRoundAfter(round, latest) {
-			latest = round
+		candidate := reviewRoundKeyForJob(review.job, review.payload)
+		if !haveLatest || reviewRoundKeyAfter(candidate, latest) {
+			latest = candidate
+			haveLatest = true
 		}
 	}
-	if latest == "" {
+	if !haveLatest {
 		return errors.New("final agent review is not captured")
 	}
 	approved := false
@@ -636,19 +839,14 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		payload JobPayload
 	}
 	var eligible []eligibleReview
-	for _, job := range jobs {
-		if job.Type != "review" {
+	for _, review := range taskReviews {
+		job := review.job
+		payload := review.payload
+		if isRoundHistoryDuplicate(job, taskReviewIDs) {
 			continue
 		}
-		payload, err := unmarshalPayload(job.Payload)
-		if err != nil {
-			return err
-		}
-		round := strings.TrimSpace(payload.ReviewRound)
-		if round == "" {
-			round = job.ID
-		}
-		if !sameTask(current, payload) || round != latest || payload.Result == nil {
+		candidate := reviewRoundKeyForJob(job, payload)
+		if !sameReviewRoundKey(candidate, latest) || payload.Result == nil {
 			continue
 		}
 		if _, superseded := supersededReviewIDs[job.ID]; superseded {
@@ -915,6 +1113,136 @@ func reviewJobRecordedAfter(left db.Job, right db.Job) bool {
 		return after
 	}
 	return false
+}
+
+func reviewJobSupersedes(leftJob db.Job, leftPayload JobPayload, rightJob db.Job, rightPayload JobPayload) bool {
+	leftRound := reviewRoundKeyForJob(leftJob, leftPayload)
+	rightRound := reviewRoundKeyForJob(rightJob, rightPayload)
+	if (leftRound.name != "") != (rightRound.name != "") {
+		// The two rows come from different dispatch paths and their rounds cannot be
+		// ordered against each other: the engine always stamps review-N, while
+		// `gitmoot agent review <reviewer> --repo <o/r> --pr <N> --head-sha <H>`
+		// creates a row with the head set and NO round. Ranking them would let one
+		// path hide the other's live or blocking evidence, so a real verdict may
+		// resolve only a row that has already settled WITHOUT one -- no result at
+		// all, or a decision that is not a verdict (for example "skipped").
+		//
+		// That single exception is load-bearing: such a row is a settled non-answer,
+		// so nothing is hidden by resolving it, and it is otherwise inescapable.
+		// `gitmoot job retry` and `gitmoot job cancel` both refuse a succeeded job,
+		// and re-polling the same head dispatches nothing because the round already
+		// has a job, so the CLI re-review this gate's own error message asks for is
+		// the only exit. Queued, running, failed and cancelled rows keep blocking:
+		// their exits are settlement and `gitmoot job retry`, which mutate the row
+		// itself rather than adding a second one.
+		return isSettledNonVerdictReview(rightJob, rightPayload) && reviewJobRecordedAfter(leftJob, rightJob)
+	}
+	if reviewRoundKeyAfter(leftRound, rightRound) {
+		return true
+	}
+	if reviewRoundKeyAfter(rightRound, leftRound) || !sameReviewRoundKey(leftRound, rightRound) {
+		return false
+	}
+	return reviewJobRecordedAfter(leftJob, rightJob)
+}
+
+// isSettledNonVerdictReview reports whether a review row has reached a terminal
+// state carrying no verdict: succeeded with no result, or with a decision the
+// gate does not recognize as one. Such a row can never become a verdict on its
+// own, and its state alone proves no reviewer work is still in flight.
+func isSettledNonVerdictReview(job db.Job, payload JobPayload) bool {
+	if JobState(job.State) != JobSucceeded {
+		return false
+	}
+	if payload.Result == nil {
+		return true
+	}
+	return !isReviewReplacementDecision(payload.Result.Decision)
+}
+
+// isRoundHistoryDuplicate reports whether a delegated review row is a SUB-REVIEW
+// of another review job for the same task. Those rows are round-history
+// duplicates of their parent (#1737: a lens child's id is its parent's id plus a
+// suffix, and its verdict is already validated as the parent's evidence by
+// ensureDelegatedReviewEvidence), so they must not compete for the latest round.
+//
+// A delegated review whose parent is NOT a review job for this task is the
+// gate's own required review, not a duplicate of one. A #332 integration-worktree
+// review is exactly that shape -- the engine clears its HeadSHA, so it can never
+// appear in reviewsAtHead -- and excluding it from round selection deadlocks the
+// merge (#388).
+func isRoundHistoryDuplicate(job db.Job, taskReviewIDs map[string]struct{}) bool {
+	if !isDelegationChild(job) {
+		return false
+	}
+	_, parentIsTaskReview := taskReviewIDs[strings.TrimSpace(job.ParentJobID)]
+	return parentIsTaskReview
+}
+
+// reviewRoundKey is the ONE ordering key for the review rows of a task, shared by
+// every decision that ranks them: supersession, latest-round selection and
+// eligibility. An engine round orders by its number. A row dispatched by
+// `gitmoot agent review <reviewer> --repo <o/r> --pr <N> --head-sha <H>` carries
+// no round and orders by when its verdict was RECORDED -- UpdatedAt, falling back
+// to CreatedAt -- never by dispatch time alone.
+//
+// Dispatch time cannot express verdict recency: `gitmoot job retry` re-runs a row
+// IN PLACE, keeping created_at and bumping updated_at, so the EARLIEST-created row
+// can hold the NEWEST verdict. Ranking by created_at let a later-created but
+// earlier-recorded approval discard a retried row's changes_requested and merge.
+type reviewRoundKey struct {
+	name       string
+	recordedAt string
+	createdAt  string
+}
+
+func reviewRoundKeyForJob(job db.Job, payload JobPayload) reviewRoundKey {
+	round := strings.TrimSpace(payload.ReviewRound)
+	if round != "" {
+		return reviewRoundKey{name: round}
+	}
+	return reviewRoundKey{recordedAt: job.UpdatedAt, createdAt: job.CreatedAt}
+}
+
+// reviewRoundKeyRecency is the single recency comparison behind both key
+// operations below. Its precedence is the same as reviewJobRecordedAfter's, so a
+// round key and a job row can never disagree about which of two rows is newer.
+func reviewRoundKeyRecency(left reviewRoundKey, right reviewRoundKey) (after bool, decided bool) {
+	if after, decided := recordedTimestampAfter(left.recordedAt, right.recordedAt); decided {
+		return after, true
+	}
+	return recordedTimestampAfter(left.createdAt, right.createdAt)
+}
+
+func reviewRoundKeyAfter(left reviewRoundKey, right reviewRoundKey) bool {
+	leftExplicit := left.name != ""
+	rightExplicit := right.name != ""
+	if leftExplicit != rightExplicit {
+		return leftExplicit
+	}
+	if leftExplicit {
+		return reviewRoundAfter(left.name, right.name)
+	}
+	after, decided := reviewRoundKeyRecency(left, right)
+	return decided && after
+}
+
+func sameReviewRoundKey(left reviewRoundKey, right reviewRoundKey) bool {
+	leftExplicit := left.name != ""
+	rightExplicit := right.name != ""
+	if leftExplicit || rightExplicit {
+		return leftExplicit && rightExplicit && left.name == right.name
+	}
+	// Two roundless rows are the same round exactly when no persisted timestamp
+	// separates them: recordedTimestampAfter decides only when both values parse
+	// and differ, so an unparseable or equal pair stays one conservative round
+	// rather than being ordered by job id.
+	_, decided := reviewRoundKeyRecency(left, right)
+	return !decided
+}
+
+func isDelegationChild(job db.Job) bool {
+	return strings.TrimSpace(job.ParentJobID) != "" && strings.TrimSpace(job.DelegationID) != ""
 }
 
 func isReviewReplacementDecision(decision string) bool {
@@ -1270,12 +1598,15 @@ func reviewRoundAfter(left string, right string) bool {
 }
 
 // block records a not-ready block at the given quality classification (#465). The
-// class is advisory metadata for the Mode-A trace-harvester only; it never changes
-// the block transition itself. Call sites pass MergeBlockQuality for authoritative
-// template-quality rejections (external CI failed, blocking review captured, closed
-// without merge) and MergeBlockTransient for branch-staleness/infra conditions.
+// class drives the Mode-A trace-harvester AND is persisted on the merge-gate row
+// (#1562): a transient/infra block is self-clearing, so an exit path outside this
+// call stack must be able to tell it apart from an authoritative rejection. It
+// still never changes the block transition itself. Call sites pass
+// MergeBlockQuality for authoritative template-quality rejections (external CI
+// failed, blocking review captured, closed without merge) and MergeBlockTransient
+// for branch-staleness/infra conditions.
 func (g PolicyMergeGate) block(ctx context.Context, request MergeRequest, sha string, reason string, class MergeBlockClass) (MergeDecision, error) {
-	if err := g.Store.UpsertMergeGate(ctx, db.MergeGate{RepoFullName: request.Repo, PullRequest: int64(request.PullRequest), State: "blocked", Reason: reason}); err != nil {
+	if err := g.Store.UpsertMergeGate(ctx, db.MergeGate{RepoFullName: request.Repo, PullRequest: int64(request.PullRequest), State: "blocked", Reason: reason, BlockClass: int(class)}); err != nil {
 		return MergeDecision{}, err
 	}
 	if sha != "" {

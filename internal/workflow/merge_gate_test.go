@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/reviewseverity"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
 
 func insertIndependentMergeGateReview(t *testing.T, store *db.Store, reviewJob db.Job, reviewPayload JobPayload) {
@@ -38,7 +41,16 @@ type mergeGateReviewFixture struct {
 	headSHA   string
 	decision  string
 	hasResult bool
+	// recorded sets created_at AND updated_at to one value. createdAt/updatedAt
+	// set them INDEPENDENTLY, which is the only way to express a row retried in
+	// place: `gitmoot job retry` keeps created_at and bumps updated_at, so the
+	// earliest-created row can hold the newest verdict.
 	recorded  string
+	createdAt string
+	updatedAt string
+	// emptyRound reproduces a CLI-dispatched review: `gitmoot agent review` sets
+	// HeadSHA and never sets ReviewRound.
+	emptyRound bool
 }
 
 func newMergeGateQuorumScenario(t *testing.T) (*db.Store, *fakeMergeGateGitHub, PolicyMergeGate, MergeRequest) {
@@ -82,6 +94,9 @@ func insertMergeGateReviewFixture(t *testing.T, store *db.Store, fixture mergeGa
 		TaskID:      "task-9",
 		ReviewRound: "review-1",
 	}
+	if fixture.emptyRound {
+		payload.ReviewRound = ""
+	}
 	if fixture.hasResult {
 		payload.Result = &AgentResult{Decision: fixture.decision, Summary: "fixture verdict"}
 	}
@@ -98,7 +113,13 @@ func insertMergeGateReviewFixture(t *testing.T, store *db.Store, fixture mergeGa
 	}, db.JobEvent{Kind: string(state), Message: "fixture state"}); err != nil {
 		t.Fatalf("CreateJobWithEvent returned error: %v", err)
 	}
-	if fixture.recorded != "" {
+	switch {
+	case fixture.createdAt != "" || fixture.updatedAt != "":
+		if fixture.recorded != "" {
+			t.Fatalf("fixture %s sets recorded together with createdAt/updatedAt", fixture.id)
+		}
+		setMergeGateJobRecordedTimes(t, store, fixture.id, fixture.createdAt, fixture.updatedAt)
+	case fixture.recorded != "":
 		setMergeGateJobTimestamps(t, store, fixture.id, fixture.recorded)
 	}
 }
@@ -130,9 +151,13 @@ func insertMergeGateDelegationChild(t *testing.T, store *db.Store, parentID, del
 func insertMergeGateHeadlessIntegrationParent(t *testing.T, store *db.Store, parentID string) {
 	t.Helper()
 	insertCompletedJob(t, store, db.Job{
-		ID:           parentID,
-		Agent:        "reviewer-a",
-		Type:         "review",
+		ID:    parentID,
+		Agent: "reviewer-a",
+		Type:  "review",
+		// Production shape: mailbox.Enqueue writes ParentJobID AND DelegationID for
+		// every delegated review, so isDelegationChild is true for this row. The
+		// quorum scenario's implement job is the delegator.
+		ParentJobID:  "implement-job",
 		DelegationID: "verify-parent",
 	}, JobPayload{
 		Repo:         "gitmoot/gitmoot",
@@ -272,6 +297,483 @@ func TestPolicyMergeGateMergesPassingPullRequest(t *testing.T) {
 	}
 }
 
+func TestPolicyMergeGateFencesReadyStateThroughExternalMerge(t *testing.T) {
+	ctx := context.Background()
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-job", agent: "audit", decision: "approved", hasResult: true,
+	})
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request.Reviewer = "audit"
+	request.ExpectedTaskState = string(TaskReadyToMerge)
+	writer, err := db.OpenAlreadyMigrated(store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	var blocked bool
+	var blockErr error
+	gh.beforeMerge = func() {
+		blocked, blockErr = writer.BlockTaskWithEvent(ctx, db.Task{
+			ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+			State: string(TaskBlocked),
+		}, db.TaskEvent{
+			Kind: "workflow_blocked", FromState: string(TaskReadyToMerge),
+			Reason: "concurrent production block",
+		})
+	}
+	decision, err := gate.Evaluate(ctx, request)
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.Merged || len(gh.merges) != 1 {
+		t.Fatalf("decision=%+v merges=%d, want one completed external merge", decision, len(gh.merges))
+	}
+	if blocked || !errors.Is(blockErr, db.ErrTaskStateClaimed) {
+		t.Fatalf("concurrent block = blocked %v err %v, want durable claim conflict", blocked, blockErr)
+	}
+	task, taskErr := store.GetTask(ctx, "task-9")
+	events, eventsErr := store.ListTaskEvents(ctx, "task-9")
+	if taskErr != nil || eventsErr != nil || task.State != string(TaskMerged) {
+		t.Fatalf("task=%+v events=%+v taskErr=%v eventsErr=%v", task, events, taskErr, eventsErr)
+	}
+	for _, event := range events {
+		if event.Kind == "workflow_blocked" {
+			t.Fatalf("events=%+v, concurrent block must not commit after merge claim", events)
+		}
+	}
+}
+
+func TestPolicyMergeGateRetainsClaimAcrossAmbiguousPostMergeConfirmation(t *testing.T) {
+	const helperPathEnv = "GITMOOT_AMBIGUOUS_MERGE_CLAIM_HELPER_PATH"
+	ctx := context.Background()
+	if path := os.Getenv(helperPathEnv); path != "" {
+		writer, err := db.OpenAlreadyMigrated(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer writer.Close()
+		changed, _, err := writer.DisposeTask(ctx, "task-9", []string{string(TaskReadyToMerge)},
+			string(TaskDismissed), "stale", "cross-process ambiguous-outcome disposal", "", "task_disposed", time.Now())
+		if err == nil || changed || !strings.Contains(err.Error(), "claimed for an external merge") {
+			t.Fatalf("cross-process disposal = changed %v err %v, want retained-claim rejection", changed, err)
+		}
+		return
+	}
+
+	store, base, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-job", agent: "audit", decision: "approved", hasResult: true,
+	})
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request.Reviewer = "audit"
+	request.ExpectedTaskState = string(TaskReadyToMerge)
+	base.getPullRequest = func(call int) (github.PullRequest, error) {
+		if call == 2 {
+			return github.PullRequest{}, errors.New("secondary confirmation unavailable")
+		}
+		return base.pr, nil
+	}
+	runner := &mergeConfirmationFailureRunner{onMerge: func() {
+		base.pr.State = "closed"
+		base.pr.Merged = true
+		base.pr.MergeSHA = "merge-ambiguous"
+	}}
+	composed := &productionMergeGateGitHub{
+		fakeMergeGateGitHub: base,
+		mergeClient:         github.GhClient{Runner: runner},
+	}
+	gate.GitHub = composed
+
+	decision, err := gate.Evaluate(ctx, request)
+	if err == nil || !strings.Contains(err.Error(), "durable task ownership retained") {
+		t.Fatalf("first Evaluate decision=%+v err=%v, want retained ambiguous outcome", decision, err)
+	}
+	if runner.calls != 2 || len(composed.merges) != 1 {
+		t.Fatalf("production adapter calls=%d merge attempts=%d, want one command plus failed confirmation", runner.calls, len(composed.merges))
+	}
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestPolicyMergeGateRetainsClaimAcrossAmbiguousPostMergeConfirmation$")
+	cmd.Env = append(os.Environ(), helperPathEnv+"="+store.DatabasePath())
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("cross-process ambiguous-outcome writer: %v\n%s", err, output)
+	}
+
+	decision, err = gate.Evaluate(ctx, request)
+	if err != nil || !decision.Merged || decision.MergeCommitSHA != "merge-ambiguous" {
+		t.Fatalf("reconciliation decision=%+v err=%v, want recovered remote merge", decision, err)
+	}
+	task, taskErr := store.GetTask(ctx, "task-9")
+	if taskErr != nil || task.State != string(TaskMerged) {
+		t.Fatalf("task=%+v err=%v, want merged after reconciliation", task, taskErr)
+	}
+	if len(composed.merges) != 1 {
+		t.Fatalf("merge attempts=%d, reconciliation must not issue a second merge", len(composed.merges))
+	}
+}
+
+func TestPolicyMergeGateRetainsClaimForAcceptedQueuedMerge(t *testing.T) {
+	ctx := context.Background()
+	store, base, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-job", agent: "audit", decision: "approved", hasResult: true,
+	})
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := db.OpenAlreadyMigrated(store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	request.Reviewer = "audit"
+	request.ExpectedTaskState = string(TaskReadyToMerge)
+	runner := &queuedMergeRunner{}
+	composed := &productionMergeGateGitHub{
+		fakeMergeGateGitHub: base,
+		mergeClient:         github.GhClient{Runner: runner},
+	}
+	gate.GitHub = composed
+
+	decision, err := gate.Evaluate(ctx, request)
+	if err != nil || !decision.Ready || decision.Merged || !strings.Contains(decision.Reason.Render(), "pending") {
+		t.Fatalf("queued Evaluate decision=%+v err=%v, want accepted pending merge", decision, err)
+	}
+	if runner.calls != 2 || len(composed.merges) != 1 {
+		t.Fatalf("production adapter calls=%d merge attempts=%d, want one accepted command and open-state confirmation",
+			runner.calls, len(composed.merges))
+	}
+	changed, _, writeErr := writer.DisposeTask(ctx, "task-9", []string{string(TaskReadyToMerge)},
+		string(TaskDismissed), "stale", "queued merge disposal", "", "task_disposed", time.Now())
+	if writeErr == nil || changed || !strings.Contains(writeErr.Error(), "claimed for an external merge") {
+		t.Fatalf("conflicting queued-merge disposal = changed %v err %v, want durable claim rejection", changed, writeErr)
+	}
+
+	base.pr.State = "closed"
+	base.pr.Merged = true
+	base.pr.MergeSHA = "merge-completed-from-queue"
+	decision, err = gate.Evaluate(ctx, request)
+	if err != nil || !decision.Merged || decision.MergeCommitSHA != "merge-completed-from-queue" {
+		t.Fatalf("queued reconciliation decision=%+v err=%v, want recovered merge", decision, err)
+	}
+	task, taskErr := store.GetTask(ctx, "task-9")
+	if taskErr != nil || task.State != string(TaskMerged) {
+		t.Fatalf("task=%+v err=%v, want merged after queued reconciliation", task, taskErr)
+	}
+	if len(composed.merges) != 1 {
+		t.Fatalf("merge attempts=%d, reconciliation must not issue a second merge", len(composed.merges))
+	}
+}
+
+func TestPolicyMergeGateRetainsFailedMergeWhileRemoteOpenUntilClosure(t *testing.T) {
+	ctx := context.Background()
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-job", agent: "audit", decision: "approved", hasResult: true,
+	})
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := db.OpenAlreadyMigrated(store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	request.Reviewer = "audit"
+	request.ExpectedTaskState = string(TaskReadyToMerge)
+	gh.mergeErr = errors.New("merge command failed after submission")
+
+	decision, err := gate.Evaluate(ctx, request)
+	if err == nil || !strings.Contains(err.Error(), "pull request remains open") ||
+		!strings.Contains(err.Error(), "durable task ownership retained") {
+		t.Fatalf("open confirmation decision=%+v err=%v, want retained unresolved merge", decision, err)
+	}
+	changed, _, writeErr := writer.DisposeTask(ctx, "task-9", []string{string(TaskReadyToMerge)},
+		string(TaskDismissed), "stale", "open merge disposal", "", "task_disposed", time.Now())
+	if writeErr == nil || changed || !strings.Contains(writeErr.Error(), "claimed for an external merge") {
+		t.Fatalf("conflicting open-merge disposal = changed %v err %v, want durable claim rejection", changed, writeErr)
+	}
+
+	gh.pr.State = "closed"
+	decision, err = gate.Evaluate(ctx, request)
+	if err != nil || !strings.Contains(decision.Reason.Render(), "closed without being merged") {
+		t.Fatalf("closed reconciliation decision=%+v err=%v, want terminal non-merge block", decision, err)
+	}
+	changed, current, writeErr := writer.DisposeTask(ctx, "task-9", []string{string(TaskReadyToMerge)},
+		string(TaskDismissed), "stale", "terminal non-merge disposal", "", "task_disposed", time.Now())
+	if writeErr != nil || !changed || current != string(TaskDismissed) {
+		t.Fatalf("terminal non-merge disposal = changed %v current %q err %v, want released claim", changed, current, writeErr)
+	}
+}
+
+func TestPolicyMergeGateCompletesClaimWhenPostErrorConfirmationShowsMerged(t *testing.T) {
+	ctx := context.Background()
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-job", agent: "audit", decision: "approved", hasResult: true,
+	})
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request.Reviewer = "audit"
+	request.ExpectedTaskState = string(TaskReadyToMerge)
+	gh.mergeErr = errors.New("fetch merged pull request: HTTP 502")
+	gh.beforeMerge = func() {
+		gh.pr.State = "closed"
+		gh.pr.Merged = true
+		gh.pr.MergeSHA = "merge-confirmed-after-error"
+	}
+
+	decision, err := gate.Evaluate(ctx, request)
+	if err != nil || !decision.Merged || decision.MergeCommitSHA != "merge-confirmed-after-error" {
+		t.Fatalf("Evaluate decision=%+v err=%v, want authoritative post-error merge completion", decision, err)
+	}
+	task, taskErr := store.GetTask(ctx, "task-9")
+	if taskErr != nil || task.State != string(TaskMerged) {
+		t.Fatalf("task=%+v err=%v, want merged claim completion", task, taskErr)
+	}
+}
+
+func TestPolicyMergeGateRenewsClaimBeyondLeaseAcrossProcess(t *testing.T) {
+	const helperPathEnv = "GITMOOT_RENEWED_MERGE_CLAIM_HELPER_PATH"
+	ctx := context.Background()
+	if path := os.Getenv(helperPathEnv); path != "" {
+		writer, err := db.OpenAlreadyMigrated(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer writer.Close()
+		changed, _, err := writer.DisposeTask(ctx, "task-9", []string{string(TaskReadyToMerge)},
+			string(TaskDismissed), "stale", "cross-process lease-expiry disposal", "", "task_disposed", time.Now())
+		if err == nil || changed || !strings.Contains(err.Error(), "claimed for an external merge") {
+			t.Fatalf("cross-process disposal = changed %v err %v, want renewed-claim rejection", changed, err)
+		}
+		return
+	}
+
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-job", agent: "audit", decision: "approved", hasResult: true,
+	})
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request.Reviewer = "audit"
+	request.ExpectedTaskState = string(TaskReadyToMerge)
+	mergeStarted := make(chan struct{})
+	allowMerge := make(chan struct{})
+	gh.beforeMerge = func() {
+		close(mergeStarted)
+		<-allowMerge
+	}
+	ticks := make(chan time.Time)
+	renewed := make(chan struct{}, 1)
+	gate.taskClaimTTL = 4 * time.Second
+	gate.taskClaimRenewalInterval = 2 * time.Second
+	gate.taskClaimRenewalTicks = func(context.Context, time.Duration) <-chan time.Time {
+		return ticks
+	}
+	gate.afterTaskClaimRenewal = func() {
+		renewed <- struct{}{}
+	}
+	type evaluateResult struct {
+		decision MergeDecision
+		err      error
+	}
+	evaluated := make(chan evaluateResult, 1)
+	go func() {
+		decision, err := gate.Evaluate(ctx, request)
+		evaluated <- evaluateResult{decision: decision, err: err}
+	}()
+	select {
+	case <-mergeStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("merge did not reach the production external-call boundary")
+	}
+	time.Sleep(2100 * time.Millisecond)
+	ticks <- time.Now()
+	select {
+	case <-renewed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("durable claim renewal did not complete")
+	}
+	time.Sleep(2100 * time.Millisecond)
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestPolicyMergeGateRenewsClaimBeyondLeaseAcrossProcess$")
+	cmd.Env = append(os.Environ(), helperPathEnv+"="+store.DatabasePath())
+	if output, err := cmd.CombinedOutput(); err != nil {
+		close(allowMerge)
+		t.Fatalf("cross-process lease-expiry writer: %v\n%s", err, output)
+	}
+	close(allowMerge)
+	result := <-evaluated
+	if result.err != nil || !result.decision.Merged {
+		t.Fatalf("Evaluate decision=%+v err=%v, want successful merge after lease renewal", result.decision, result.err)
+	}
+	task, taskErr := store.GetTask(ctx, "task-9")
+	if taskErr != nil || task.State != string(TaskMerged) {
+		t.Fatalf("task=%+v err=%v, want merged after renewed in-flight claim", task, taskErr)
+	}
+}
+
+func TestHandlePullRequestOpenedFencesNoReviewerMergeFromPROpenState(t *testing.T) {
+	ctx := context.Background()
+	store, gh, gate, _ := newMergeGateQuorumScenario(t)
+	seedAgent(t, store, "implementer", []string{"implement"}, "gitmoot/gitmoot")
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-job", agent: "audit", decision: "approved", hasResult: true,
+	})
+	writer, err := db.OpenAlreadyMigrated(store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	var blocked bool
+	var blockErr error
+	gate.Git.(*fakeMergeGateGit).onClean = func() {
+		blocked, blockErr = writer.BlockTaskWithEvent(ctx, db.Task{
+			ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+			State: string(TaskBlocked),
+		}, db.TaskEvent{
+			Kind: "workflow_blocked", FromState: string(TaskPullRequestOpen),
+			Reason: "concurrent PR-open block",
+		})
+	}
+	engine := testEngine(store)
+	engine.MergeGate = gate
+
+	err = engine.HandlePullRequestOpened(ctx, PullRequestEvent{
+		Repo: "gitmoot/gitmoot", Branch: "task-9", PullRequest: 9,
+		HeadSHA: "head123", TaskID: "task-9", LeadAgent: "implementer",
+	})
+	if !errors.Is(err, ErrMergeTaskStateChanged) {
+		t.Fatalf("HandlePullRequestOpened error = %v, want PR-open state fence conflict", err)
+	}
+	if !blocked || blockErr != nil {
+		t.Fatalf("concurrent block = blocked %v err %v, want committed PR-open block", blocked, blockErr)
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("external merges = %d, want none after PR-open state changed", len(gh.merges))
+	}
+	task, taskErr := store.GetTask(ctx, "task-9")
+	if taskErr != nil || task.State != string(TaskBlocked) {
+		t.Fatalf("task=%+v err=%v, want blocked", task, taskErr)
+	}
+}
+
+func TestAdvanceApprovedReviewFencesMergeFromReviewingState(t *testing.T) {
+	ctx := context.Background()
+	store, gh, gate, _ := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-job", agent: "audit", decision: "approved", hasResult: true,
+	})
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReviewing),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := db.OpenAlreadyMigrated(store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	var blocked bool
+	var blockErr error
+	gate.Git.(*fakeMergeGateGit).onClean = func() {
+		blocked, blockErr = writer.BlockTaskWithEvent(ctx, db.Task{
+			ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+			State: string(TaskBlocked),
+		}, db.TaskEvent{
+			Kind: "workflow_blocked", FromState: string(TaskReviewing),
+			Reason: "concurrent review completion block",
+		})
+	}
+	engine := testEngine(store)
+	engine.MergeGate = gate
+
+	err = engine.AdvanceJob(ctx, "review-job")
+	if !errors.Is(err, ErrMergeTaskStateChanged) {
+		t.Fatalf("AdvanceJob error = %v, want reviewing-state fence conflict", err)
+	}
+	if !blocked || blockErr != nil {
+		t.Fatalf("concurrent block = blocked %v err %v, want committed reviewing block", blocked, blockErr)
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("external merges = %d, want none after reviewing state changed", len(gh.merges))
+	}
+	task, taskErr := store.GetTask(ctx, "task-9")
+	if taskErr != nil || task.State != string(TaskBlocked) {
+		t.Fatalf("task=%+v err=%v, want blocked", task, taskErr)
+	}
+}
+
+func TestPolicyMergeGateRejectsBlockAfterInitialReadyValidation(t *testing.T) {
+	ctx := context.Background()
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-job", agent: "audit", decision: "approved", hasResult: true,
+	})
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	matched, current, err := store.RevalidateTaskState(ctx, "task-9", string(TaskReadyToMerge))
+	if err != nil || !matched || current != string(TaskReadyToMerge) {
+		t.Fatalf("initial ready validation = matched %v current %q err %v", matched, current, err)
+	}
+	request.Reviewer = "audit"
+	request.ExpectedTaskState = string(TaskReadyToMerge)
+	var blocked bool
+	var blockErr error
+	gate.Git.(*fakeMergeGateGit).onClean = func() {
+		blocked, blockErr = store.BlockTaskWithEvent(ctx, db.Task{
+			ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+			State: string(TaskBlocked),
+		}, db.TaskEvent{
+			Kind: "workflow_blocked", FromState: string(TaskReadyToMerge),
+			Reason: "production block after initial validation",
+		})
+	}
+
+	decision, err := gate.Evaluate(ctx, request)
+	if !errors.Is(err, ErrMergeTaskStateChanged) {
+		t.Fatalf("Evaluate error = %v, want ready-state fence conflict", err)
+	}
+	if !blocked || blockErr != nil {
+		t.Fatalf("production block = blocked %v err %v, want committed block", blocked, blockErr)
+	}
+	if decision.Merged || len(gh.merges) != 0 {
+		t.Fatalf("decision=%+v merges=%d, external merge must not run after block", decision, len(gh.merges))
+	}
+	task, taskErr := store.GetTask(ctx, "task-9")
+	if taskErr != nil || task.State != string(TaskBlocked) {
+		t.Fatalf("task=%+v err=%v, want blocked", task, taskErr)
+	}
+}
+
 func TestPolicyMergeGateMergeFailureDoesNotPostSuccess(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -284,6 +786,12 @@ func TestPolicyMergeGateMergeFailureDoesNotPostSuccess(t *testing.T) {
 		ReviewRound: "review-1",
 		Result:      &AgentResult{Decision: "approved", Summary: "ready"},
 	})
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
 	mergeable := true
 	mergeErr := errors.New("draft pull request cannot be merged")
 	gh := &fakeMergeGateGitHub{
@@ -304,13 +812,26 @@ func TestPolicyMergeGateMergeFailureDoesNotPostSuccess(t *testing.T) {
 	}
 	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
 
-	_, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+	_, err := gate.Evaluate(ctx, MergeRequest{
+		Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+		ExpectedTaskState: string(TaskReadyToMerge),
+	})
 
 	if !errors.Is(err, mergeErr) {
 		t.Fatalf("Evaluate error = %v, want %v", err, mergeErr)
 	}
 	if hasStatus(gh.statuses, GitmootMergeGateContext, "success") {
 		t.Fatalf("statuses after failed merge = %+v, must not contain merge-gate success", gh.statuses)
+	}
+	blocked, blockErr := store.BlockTaskWithEvent(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskBlocked),
+	}, db.TaskEvent{
+		Kind: "workflow_blocked", FromState: string(TaskReadyToMerge),
+		Reason: "merge failure remained unresolved",
+	})
+	if blockErr == nil || blocked || !strings.Contains(blockErr.Error(), "claimed for an external merge") {
+		t.Fatalf("post-failure block = blocked %v err %v, want retained unresolved merge claim", blocked, blockErr)
 	}
 }
 
@@ -326,6 +847,12 @@ func TestPolicyMergeGateStatusFailureAfterMergeIsBestEffort(t *testing.T) {
 		ReviewRound: "review-1",
 		Result:      &AgentResult{Decision: "approved", Summary: "ready"},
 	})
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
 	mergeable := true
 	gh := &fakeMergeGateGitHub{
 		pr: github.PullRequest{
@@ -346,7 +873,10 @@ func TestPolicyMergeGateStatusFailureAfterMergeIsBestEffort(t *testing.T) {
 	}
 	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
 
-	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+	decision, err := gate.Evaluate(ctx, MergeRequest{
+		Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+		ExpectedTaskState: string(TaskReadyToMerge),
+	})
 
 	if err != nil {
 		t.Fatalf("Evaluate returned error after completed merge: %v", err)
@@ -356,6 +886,10 @@ func TestPolicyMergeGateStatusFailureAfterMergeIsBestEffort(t *testing.T) {
 	}
 	if got := strings.Join(gh.operations, ","); got != "merge,status:gitmoot/merge-gate:success" {
 		t.Fatalf("GitHub write order = %q, want merge before best-effort success status", got)
+	}
+	task, taskErr := store.GetTask(ctx, "task-9")
+	if taskErr != nil || task.State != string(TaskMerged) {
+		t.Fatalf("task=%+v err=%v, want durable claim completion", task, taskErr)
 	}
 }
 
@@ -1069,6 +1603,350 @@ func TestImplementerAttributionAnomalyDeclinesRemainByteStable(t *testing.T) {
 	}
 }
 
+func TestPolicyMergeGateEmptyReviewRoundUsesRecordedRecency(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	basePayload := JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		Branch:      "task-9",
+		PullRequest: 9,
+		TaskID:      "task-9",
+	}
+	implementPayload := basePayload
+	implementPayload.Result = &AgentResult{Decision: "implemented", Summary: "implemented"}
+	insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: "implementer", Type: "implement"}, implementPayload)
+
+	olderReview := basePayload
+	olderReview.HeadSHA = "older-head"
+	olderReview.Result = &AgentResult{Decision: "approved", Summary: "older approval"}
+	const olderJobID = "local-review-zulu-older"
+	insertCompletedJob(t, store, db.Job{ID: olderJobID, Agent: "zulu-reviewer", Type: "review"}, olderReview)
+	setMergeGateJobTimestamps(t, store, olderJobID, "2026-08-31 10:00:00")
+
+	newerReview := basePayload
+	newerReview.HeadSHA = "newer-head"
+	newerReview.Result = &AgentResult{Decision: "approved", Summary: "newer approval"}
+	const newerJobID = "local-review-alpha-newer"
+	insertCompletedJob(t, store, db.Job{ID: newerJobID, Agent: "alpha-reviewer", Type: "review"}, newerReview)
+	setMergeGateJobTimestamps(t, store, newerJobID, "2026-08-31 11:00:00")
+
+	insertMergeGateDelegationChild(t, store, olderJobID, "lens-latest", JobFailed, nil)
+	setMergeGateJobTimestamps(t, store, olderJobID+"/delegation/lens-latest", "2026-08-31 12:00:00")
+
+	mergeable := true
+	gh := &fakeMergeGateGitHub{
+		pr: github.PullRequest{
+			Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+			HeadSHA: "current-head", Mergeable: &mergeable,
+		},
+		status: github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+		checks: []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+	}
+	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Ready || decision.Merged {
+		t.Fatalf("decision = %+v, want escalating LeaveOpen", decision)
+	}
+	if !strings.Contains(decision.Reason.Render(), "latest review from alpha-reviewer is for a different head SHA") {
+		t.Fatalf("decision reason = %q, want newer root review selected by recorded time", decision.Reason)
+	}
+}
+
+func TestPolicyMergeGateExplicitRoundPrecedesNewerSameReviewerVerdict(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		newerRound string
+	}{
+		{name: "empty round", newerRound: ""},
+		{name: "lower explicit round", newerRound: "review-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			basePayload := JobPayload{
+				Repo:        "gitmoot/gitmoot",
+				Branch:      "task-9",
+				PullRequest: 9,
+				TaskID:      "task-9",
+			}
+			implementPayload := basePayload
+			implementPayload.Result = &AgentResult{Decision: "implemented", Summary: "implemented"}
+			insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: "implementer", Type: "implement"}, implementPayload)
+
+			blockingReview := basePayload
+			blockingReview.HeadSHA = "head123"
+			blockingReview.ReviewRound = "review-2"
+			blockingReview.Result = &AgentResult{Decision: "changes_requested", Summary: "blocking"}
+			insertCompletedJob(t, store, db.Job{ID: "review-blocking", Agent: "audit", Type: "review"}, blockingReview)
+			setMergeGateJobTimestamps(t, store, "review-blocking", "2026-08-31 10:00:00")
+
+			newerApproval := basePayload
+			newerApproval.HeadSHA = "head123"
+			newerApproval.ReviewRound = tc.newerRound
+			newerApproval.Result = &AgentResult{Decision: "approved", Summary: "lower round approval"}
+			insertCompletedJob(t, store, db.Job{ID: "review-newer", Agent: "audit", Type: "review"}, newerApproval)
+			setMergeGateJobTimestamps(t, store, "review-newer", "2026-08-31 11:00:00")
+
+			mergeable := true
+			gh := &fakeMergeGateGitHub{
+				pr: github.PullRequest{
+					Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+					HeadSHA: "head123", Mergeable: &mergeable,
+				},
+				status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+				checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+				mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+			}
+			gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+			decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if !decision.LeaveOpen || decision.Merged {
+				t.Fatalf("decision = %+v, want blocking review to keep PR open", decision)
+			}
+			if !strings.Contains(decision.Reason.Render(), "blocking result from audit") {
+				t.Fatalf("decision reason = %q, want higher explicit round's blocking verdict", decision.Reason)
+			}
+		})
+	}
+}
+
+func TestPolicyMergeGateNewerManualBlockingReviewSurvivesExplicitApproval(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	basePayload := JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		Branch:      "task-9",
+		PullRequest: 9,
+		TaskID:      "task-9",
+	}
+	implementPayload := basePayload
+	implementPayload.Result = &AgentResult{Decision: "implemented", Summary: "implemented"}
+	insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: "implementer", Type: "implement"}, implementPayload)
+
+	explicitApproval := basePayload
+	explicitApproval.HeadSHA = "head123"
+	explicitApproval.ReviewRound = "review-2"
+	explicitApproval.Result = &AgentResult{Decision: "approved", Summary: "older approval"}
+	insertCompletedJob(t, store, db.Job{ID: "review-explicit", Agent: "audit", Type: "review"}, explicitApproval)
+	setMergeGateJobTimestamps(t, store, "review-explicit", "2026-08-31 10:00:00")
+
+	manualBlock := basePayload
+	manualBlock.HeadSHA = "head123"
+	manualBlock.Result = &AgentResult{Decision: "changes_requested", Summary: "newer manual block"}
+	insertCompletedJob(t, store, db.Job{ID: "review-manual", Agent: "audit", Type: "review"}, manualBlock)
+	setMergeGateJobTimestamps(t, store, "review-manual", "2026-08-31 11:00:00")
+
+	mergeable := true
+	gh := &fakeMergeGateGitHub{
+		pr: github.PullRequest{
+			Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+			HeadSHA: "head123", Mergeable: &mergeable,
+		},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+		checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+	}
+	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.LeaveOpen || decision.Merged {
+		t.Fatalf("decision = %+v, want newer manual block to keep PR open", decision)
+	}
+	if !strings.Contains(decision.Reason.Render(), "blocking result from audit") {
+		t.Fatalf("decision reason = %q, want manual blocking verdict", decision.Reason)
+	}
+}
+
+func TestPolicyMergeGateBlockingDelegationChildUnderNonReviewParent(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	basePayload := JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		Branch:      "task-9",
+		PullRequest: 9,
+		TaskID:      "task-9",
+		HeadSHA:     "head123",
+	}
+	implementPayload := basePayload
+	implementPayload.HeadSHA = ""
+	implementPayload.Result = &AgentResult{Decision: "implemented", Summary: "implemented"}
+	insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: "implementer", Type: "implement"}, implementPayload)
+
+	approvalPayload := basePayload
+	approvalPayload.ReviewRound = "review-1"
+	approvalPayload.Result = &AgentResult{Decision: "approved", Summary: "root approval"}
+	insertCompletedJob(t, store, db.Job{ID: "review-approval", Agent: "audit", Type: "review"}, approvalPayload)
+
+	parentPayload := basePayload
+	parentPayload.Result = &AgentResult{Decision: "approved", Summary: "orchestration complete"}
+	insertCompletedJob(t, store, db.Job{ID: "orchestrate-parent", Agent: "coordinator", Type: "ask"}, parentPayload)
+
+	childPayload := basePayload
+	childPayload.Result = &AgentResult{Decision: "changes_requested", Summary: "delegated blocker"}
+	insertCompletedJob(t, store, db.Job{
+		ID:           "orchestrate-parent/delegation/security",
+		Agent:        "security",
+		Type:         "review",
+		ParentJobID:  "orchestrate-parent",
+		DelegationID: "security",
+	}, childPayload)
+
+	mergeable := true
+	gh := &fakeMergeGateGitHub{
+		pr: github.PullRequest{
+			Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+			HeadSHA: "head123", Mergeable: &mergeable,
+		},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+		checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+	}
+	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.LeaveOpen || decision.Merged {
+		t.Fatalf("decision = %+v, want delegated blocker to keep PR open", decision)
+	}
+	if !strings.Contains(decision.Reason.Render(), "blocking result from security") {
+		t.Fatalf("decision reason = %q, want delegated blocking verdict", decision.Reason)
+	}
+}
+
+// TestPolicyMergeGateUndecidedRoundOrderNeverHidesUnfinishedReviewer pins the
+// property that replaced per-reviewer "latest row wins" selection: when two rows
+// from one reviewer at the evaluated head cannot be ordered (one explicit
+// review-N, one CLI-dispatched empty round), an unfinished or crashed slot must
+// still block. It is asserted in BOTH job-id orders, so an implementation that
+// resolves the tie through ListJobs' ORDER BY id fails one direction, and the
+// approval is recorded LATER than the unfinished row, so a "latest timestamp
+// wins" implementation fails both.
+func TestPolicyMergeGateUndecidedRoundOrderNeverHidesUnfinishedReviewer(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		state       JobState
+		wantReason  string
+		wantPending bool
+	}{
+		{name: "queued", state: JobQueued, wantReason: "waiting for reviewer audit", wantPending: true},
+		{name: "running", state: JobRunning, wantReason: "waiting for reviewer audit", wantPending: true},
+		{name: "failed", state: JobFailed, wantReason: "crashed reviewer audit"},
+		{name: "cancelled", state: JobCancelled, wantReason: "crashed reviewer audit"},
+	} {
+		for _, order := range []struct {
+			name       string
+			manualID   string
+			numberedID string
+		}{
+			{name: "manual id sorts first", manualID: "aaa-manual-review", numberedID: "zzz-dispatched-review"},
+			{name: "numbered id sorts first", manualID: "zzz-manual-review", numberedID: "aaa-dispatched-review"},
+		} {
+			t.Run(tc.name+"/"+order.name, func(t *testing.T) {
+				store, gh, gate, request := newMergeGateQuorumScenario(t)
+				insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+					id: order.numberedID, agent: "audit", state: tc.state,
+					recorded: "2026-07-31 12:00:00",
+				})
+				insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+					id: order.manualID, agent: "audit", hasResult: true, decision: "approved",
+					recorded: "2026-07-31 12:01:00", emptyRound: true,
+				})
+
+				decision, err := gate.Evaluate(context.Background(), request)
+				if err != nil {
+					t.Fatalf("Evaluate returned error: %v", err)
+				}
+				if decision.Merged {
+					t.Fatalf("decision = %+v, want unfinished reviewer slot to hold the merge", decision)
+				}
+				if tc.wantPending && decision.Reason.IsGateMiss() {
+					t.Fatalf("decision = %+v, want unfinished slot to wait without escalating", decision)
+				}
+				if !tc.wantPending && (!decision.LeaveOpen || !decision.Reason.IsGateMiss()) {
+					t.Fatalf("decision = %+v, want crashed slot parked as a gate miss", decision)
+				}
+				if !strings.Contains(decision.Reason.Render(), tc.wantReason) ||
+					!strings.Contains(decision.Reason.Render(), order.numberedID) {
+					t.Fatalf("decision reason = %q, want %q naming %s", decision.Reason, tc.wantReason, order.numberedID)
+				}
+				if len(gh.merges) != 0 {
+					t.Fatalf("merge calls = %+v, want none", gh.merges)
+				}
+			})
+		}
+	}
+}
+
+// TestPolicyMergeGateAdvancesIntegrationWorktreeReviewAsDelegationChild is the
+// #388 regression in its PRODUCTION row shape: mailbox.Enqueue writes both
+// ParentJobID and DelegationID, so the gate-required #332 integration review IS a
+// delegation child. Its HeadSHA is cleared by the engine, so it can never appear
+// in the exact-head scan; excluding it from round selection as a round-history
+// duplicate deadlocks the merge. Its parent is an orchestrating job, not a review,
+// so it is nobody's sub-review.
+func TestPolicyMergeGateAdvancesIntegrationWorktreeReviewAsDelegationChild(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: "gitmoot/gitmoot",
+		Number:       9,
+		HeadBranch:   "task-9",
+		BaseBranch:   "main",
+		HeadSHA:      "head123",
+		State:        "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+	insertCompletedJob(t, store, db.Job{ID: "coordinator-job", Agent: "coordinator", Type: "ask"}, JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		PullRequest: 9,
+		TaskID:      "task-9",
+		Result:      &AgentResult{Decision: "approved", Summary: "verify gate fanned out"},
+	})
+	insertIndependentMergeGateReview(t, store, db.Job{
+		ID:           "coordinator-job/delegation/verify-gate",
+		Agent:        "audit",
+		Type:         "review",
+		ParentJobID:  "coordinator-job",
+		DelegationID: "verify-gate",
+	}, JobPayload{
+		Repo:         "gitmoot/gitmoot",
+		PullRequest:  9,
+		TaskID:       "task-9",
+		ReviewRound:  "review-1",
+		DelegationID: "verify-gate",
+		WorktreePath: "/tmp/gitmoot/integration-verify-gate",
+		Result:       &AgentResult{Decision: "approved", Summary: "integration verified"},
+	})
+	mergeable := true
+	gh := &fakeMergeGateGitHub{
+		pr:          github.PullRequest{Number: 9, HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123", Mergeable: &mergeable},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+	}
+	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.Merged {
+		t.Fatalf("production-shape integration review did not advance to merge: decision = %+v", decision)
+	}
+}
+
 func TestPolicyMergeGatePreservesSelfApprovalReasonWhenHeadMismatchSortsFirst(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -1216,7 +2094,7 @@ func TestRunMergeGateExplicitKillSwitchParksReviewedAndUnreviewedTasks(t *testin
 				})
 			}
 			for attempt := 0; attempt < 2; attempt++ {
-				decision, err := engine.runMergeGate(ctx, "", payload, taskRef{ID: tc.taskID, Repo: "owner/repo", Title: tc.name, Branch: tc.taskID})
+				decision, err := engine.runMergeGate(ctx, "", payload, taskRef{ID: tc.taskID, Repo: "owner/repo", Title: tc.name, Branch: tc.taskID}, TaskReadyToMerge)
 				if err != nil {
 					t.Fatalf("runMergeGate attempt %d: %v", attempt+1, err)
 				}
@@ -1257,7 +2135,7 @@ func TestRunMergeGateDraftPullRequestDoesNotParkTaskAwaitingHumanMerge(t *testin
 
 	decision, err := engine.runMergeGate(ctx, "", payload, taskRef{
 		ID: taskID, Repo: "owner/repo", Title: "Draft task", Branch: "task-draft",
-	})
+	}, TaskReadyToMerge)
 	if err != nil {
 		t.Fatalf("runMergeGate: %v", err)
 	}
@@ -2143,6 +3021,16 @@ func TestPolicyMergeGateRecordsAlreadyMergedPullRequest(t *testing.T) {
 	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-9", Owner: "lead"}); err != nil || !acquired {
 		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
 	}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, _, err := store.ClaimTaskState(ctx, "task-9", string(TaskReadyToMerge),
+		"external_merge", time.Minute); err != nil || !claimed {
+		t.Fatalf("seed crashed merge claim = claimed %v err %v", claimed, err)
+	}
 	gh := &fakeMergeGateGitHub{
 		pr: github.PullRequest{
 			Number:   9,
@@ -2157,7 +3045,10 @@ func TestPolicyMergeGateRecordsAlreadyMergedPullRequest(t *testing.T) {
 	}
 	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: false}}
 
-	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+	decision, err := gate.Evaluate(ctx, MergeRequest{
+		Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+		ExpectedTaskState: string(TaskReadyToMerge),
+	})
 
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
@@ -2170,6 +3061,10 @@ func TestPolicyMergeGateRecordsAlreadyMergedPullRequest(t *testing.T) {
 	}
 	if _, err := store.GetBranchLock(ctx, "gitmoot/gitmoot", "task-9"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("branch lock after merge error = %v, want sql.ErrNoRows", err)
+	}
+	task, taskErr := store.GetTask(ctx, "task-9")
+	if taskErr != nil || task.State != string(TaskMerged) {
+		t.Fatalf("task=%+v err=%v, want recovered merged state", task, taskErr)
 	}
 }
 
@@ -2512,16 +3407,18 @@ func TestPolicyMergeGateWaitsForRunningReviewAtEvaluatedHead(t *testing.T) {
 	}
 }
 
+// TestPolicyMergeGateLatestQueuedReviewWaitsOverEarlierObjection uses the
+// PRODUCTION requeue shape: `gitmoot job retry` re-runs the SAME row, nilling its
+// result and returning it to queued, so an objection followed by a requeue is one
+// row whose state changed -- not two rows sharing round review-1, which no
+// dispatch path can create.
 func TestPolicyMergeGateLatestQueuedReviewWaitsOverEarlierObjection(t *testing.T) {
 	store, gh, gate, request := newMergeGateQuorumScenario(t)
 	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
-		id: "review-objected", agent: "reviewer-a", hasResult: true, decision: "changes_requested",
+		id: "review-requeued", agent: "reviewer-a", hasResult: true, decision: "changes_requested",
 		recorded: "2026-07-31 12:00:00",
 	})
-	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
-		id: "review-requeued", agent: "reviewer-a", state: JobQueued,
-		recorded: "2026-07-31 12:01:00",
-	})
+	settleMergeGateReviewInPlace(t, store, "review-requeued", JobQueued, nil, "2026-07-31 12:01:00")
 	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
 		id: "review-other-approved", agent: "reviewer-b", hasResult: true, decision: "approved",
 		recorded: "2026-07-31 12:02:00",
@@ -2652,14 +3549,18 @@ func TestPolicyMergeGateUsesLatestReviewJobPerReviewer(t *testing.T) {
 		id: "workflow-1hulo51pzm01f", agent: "joltra-sol-review",
 		hasResult: true, decision: "approved", recorded: "2026-07-31 18:01:24",
 	})
+	// The two local-review-* rows are CLI dispatches: `gitmoot agent review` sets
+	// the head and never a round, so in production they carry EMPTY rounds. Only
+	// the workflow-* row is an engine round.
 	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
 		id:    "local-review-joltra-sol-review-18c723c7768aa61d",
-		agent: "joltra-sol-review", state: JobFailed, recorded: "2026-07-31 18:11:56",
+		agent: "joltra-sol-review", state: JobFailed, emptyRound: true,
+		recorded: "2026-07-31 18:11:56",
 	})
 	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
 		id:    "local-review-joltra-sol-review-18c7245ac25c6980",
 		agent: "joltra-sol-review", hasResult: true, decision: "changes_requested",
-		recorded: "2026-07-31 18:22:29",
+		emptyRound: true, recorded: "2026-07-31 18:22:29",
 	})
 
 	decision, err := gate.Evaluate(context.Background(), request)
@@ -2681,16 +3582,18 @@ func TestPolicyMergeGateUsesLatestReviewJobPerReviewer(t *testing.T) {
 	}
 }
 
+// TestPolicyMergeGateLatestCrashOverridesStaleApproval uses the PRODUCTION crash
+// shape: one row that carried an approval and was then retried in place and
+// crashed. `gitmoot job retry` keeps the id, head, round and created_at, nils the
+// result and advances updated_at, so the reviewer's slot is a single row -- never
+// an approval row plus a separate failed row sharing round review-1.
 func TestPolicyMergeGateLatestCrashOverridesStaleApproval(t *testing.T) {
 	store, gh, gate, request := newMergeGateQuorumScenario(t)
 	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
-		id: "review-z-stale-approved", agent: "reviewer-a",
+		id: "review-retried-crashed", agent: "reviewer-a",
 		hasResult: true, decision: "approved", recorded: "2026-07-31 12:00:00",
 	})
-	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
-		id: "review-a-latest-failed", agent: "reviewer-a",
-		state: JobFailed, recorded: "2026-07-31 12:01:00",
-	})
+	settleMergeGateReviewInPlace(t, store, "review-retried-crashed", JobFailed, nil, "2026-07-31 12:01:00")
 
 	decision, err := gate.Evaluate(context.Background(), request)
 
@@ -2698,20 +3601,95 @@ func TestPolicyMergeGateLatestCrashOverridesStaleApproval(t *testing.T) {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
 	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
-		t.Fatalf("decision = %+v, want latest crashed reviewer parked", decision)
+		t.Fatalf("decision = %+v, want crashed reviewer parked despite the row's earlier approval", decision)
 	}
 	if !strings.Contains(decision.Reason.Render(), "crashed reviewer reviewer-a") ||
-		!strings.Contains(decision.Reason.Render(), "review-a-latest-failed") {
-		t.Fatalf("decision reason = %q, want latest crashed reviewer and job", decision.Reason)
-	}
-	if strings.Contains(decision.Reason.Render(), "review-z-stale-approved") {
-		t.Fatalf("decision reason = %q, stale approval must not govern reviewer slot", decision.Reason)
+		!strings.Contains(decision.Reason.Render(), "review-retried-crashed") {
+		t.Fatalf("decision reason = %q, want crashed reviewer and job", decision.Reason)
 	}
 	if len(gh.merges) != 0 {
 		t.Fatalf("merge calls = %+v, want none", gh.merges)
 	}
 }
 
+// TestPolicyMergeGateEmptyRoundSupersessionUsesVerdictRecency pins the ordering
+// invariant for two CLI-dispatched rows of one reviewer at the evaluated head:
+// recency is when the VERDICT was recorded (updated_at, then created_at), never
+// dispatch time. `gitmoot job retry` re-runs a row in place, keeping created_at
+// and bumping updated_at, so the EARLIEST-created row can hold the NEWEST verdict;
+// ordering by created_at let a later-created but earlier-recorded approval discard
+// a retried row's changes_requested and merge the PR.
+//
+// The second case is the control: with the approval genuinely recorded last,
+// supersession must still work and the PR must merge, so the first case cannot
+// pass by refusing every supersession.
+func TestPolicyMergeGateEmptyRoundSupersessionUsesVerdictRecency(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		retriedUpdated string
+		freshUpdated   string
+		wantMerged     bool
+	}{
+		{
+			name:           "retried row records the newer objection",
+			retriedUpdated: "2026-07-31 10:40:00",
+			freshUpdated:   "2026-07-31 10:20:00",
+		},
+		{
+			name:           "fresh row records the newer approval",
+			retriedUpdated: "2026-07-31 10:20:00",
+			freshUpdated:   "2026-07-31 10:40:00",
+			wantMerged:     true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, gh, gate, request := newMergeGateQuorumScenario(t)
+			// Dispatched FIRST (oldest created_at) and later retried in place, so its
+			// verdict is carried by updated_at.
+			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+				id: "local-review-audit-retried", agent: "audit", emptyRound: true,
+				hasResult: true, decision: "changes_requested",
+				createdAt: "2026-07-31 10:00:00", updatedAt: tc.retriedUpdated,
+			})
+			// Dispatched SECOND (newer created_at) and ran once.
+			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+				id: "local-review-audit-fresh", agent: "audit", emptyRound: true,
+				hasResult: true, decision: "approved",
+				createdAt: "2026-07-31 10:10:00", updatedAt: tc.freshUpdated,
+			})
+
+			decision, err := gate.Evaluate(context.Background(), request)
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if tc.wantMerged {
+				if !decision.Merged {
+					t.Fatalf("decision = %+v, want the later-recorded approval to supersede", decision)
+				}
+				if len(gh.merges) != 1 {
+					t.Fatalf("merge calls = %+v, want one", gh.merges)
+				}
+				return
+			}
+			if decision.Merged || !decision.LeaveOpen || !decision.Reason.IsGateMiss() {
+				t.Fatalf("decision = %+v, want the later-recorded objection to hold the merge", decision)
+			}
+			if !strings.Contains(decision.Reason.Render(), "blocking result from audit") {
+				t.Fatalf("decision reason = %q, want the retried row's objection", decision.Reason)
+			}
+			if len(gh.merges) != 0 {
+				t.Fatalf("merge calls = %+v, want none", gh.merges)
+			}
+		})
+	}
+}
+
+// TestPolicyMergeGateRequeueClearsCrashedReviewerPark pins the PRODUCTION requeue
+// shape. `gitmoot job retry` transitions the SAME row in place and preserves its
+// id, head and round, so a requeue is one row whose state changes -- never a
+// second row sharing the first's explicit round, which no dispatch path can
+// create. Pinning the two-row shape hid a regression that refused every
+// cross-round supersession.
 func TestPolicyMergeGateRequeueClearsCrashedReviewerPark(t *testing.T) {
 	store, gh, gate, request := newMergeGateQuorumScenario(t)
 	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
@@ -2735,10 +3713,9 @@ func TestPolicyMergeGateRequeueClearsCrashedReviewerPark(t *testing.T) {
 		t.Fatalf("first decision reason = %q, want crashed reviewer and job", parked.Reason)
 	}
 
-	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
-		id: "review-requeued-approved", agent: "reviewer-b", hasResult: true, decision: "approved",
-		recorded: "2026-07-31 12:02:00",
-	})
+	settleMergeGateReviewInPlace(t, store, "review-crashed", JobSucceeded,
+		&AgentResult{Decision: "approved", Summary: "requeued verdict"}, "2026-07-31 12:02:00")
+
 	merged, err := gate.Evaluate(context.Background(), request)
 	if err != nil {
 		t.Fatalf("second Evaluate returned error: %v", err)
@@ -2748,6 +3725,118 @@ func TestPolicyMergeGateRequeueClearsCrashedReviewerPark(t *testing.T) {
 	}
 	if len(gh.merges) != 1 {
 		t.Fatalf("merge calls = %+v, want one after requeue approval", gh.merges)
+	}
+}
+
+// TestPolicyMergeGateCLIReviewResolvesOnlySettledNonVerdictEngineRound pins the
+// exception that makes the mixed-round refusal survivable. The engine always
+// stamps review-N; `gitmoot agent review <reviewer> --repo gitmoot/gitmoot
+// --pr <N> --head-sha <H>` creates a second row with the head set and NO round.
+// A later CLI verdict may resolve an engine round that SETTLED WITHOUT a verdict
+// -- no result, or a decision like "skipped" -- because that row is inescapable
+// otherwise: `gitmoot job retry` and `gitmoot job cancel` both refuse a succeeded
+// job and a re-poll of the same head dispatches nothing. It must NOT resolve a
+// live, crashed or blocking row: those exits mutate the row itself.
+func TestPolicyMergeGateCLIReviewResolvesOnlySettledNonVerdictEngineRound(t *testing.T) {
+	const engineJobID = "review-audit-task-9-review-1"
+	const cliJobID = "local-review-audit-18d0f3d229cc7aa3"
+	for _, tc := range []struct {
+		name        string
+		state       JobState
+		hasResult   bool
+		decision    string
+		cliRecorded string
+		wantMerged  bool
+		wantPending bool
+		wantReason  string
+	}{
+		{
+			name: "unrecognized decision is resolved", hasResult: true, decision: "skipped",
+			cliRecorded: "2026-07-31 12:02:00", wantMerged: true,
+		},
+		{
+			name:        "missing result is resolved",
+			cliRecorded: "2026-07-31 12:02:00", wantMerged: true,
+		},
+		{
+			name: "unrecognized decision parks without a cli review", hasResult: true, decision: "skipped",
+			wantReason: `unrecognized decision "skipped"`,
+		},
+		{
+			name:       "missing result parks without a cli review",
+			wantReason: "abstaining reviewer audit",
+		},
+		{
+			name: "earlier cli review does not resolve", hasResult: true, decision: "skipped",
+			cliRecorded: "2026-07-31 12:00:00", wantReason: `unrecognized decision "skipped"`,
+		},
+		{
+			name: "crashed row keeps blocking", state: JobFailed,
+			cliRecorded: "2026-07-31 12:02:00", wantReason: "crashed reviewer audit",
+		},
+		{
+			name: "cancelled row keeps blocking", state: JobCancelled,
+			cliRecorded: "2026-07-31 12:02:00", wantReason: "crashed reviewer audit",
+		},
+		{
+			name: "queued row keeps waiting", state: JobQueued,
+			cliRecorded: "2026-07-31 12:02:00", wantPending: true, wantReason: "waiting for reviewer audit",
+		},
+		{
+			name: "running row keeps waiting", state: JobRunning,
+			cliRecorded: "2026-07-31 12:02:00", wantPending: true, wantReason: "waiting for reviewer audit",
+		},
+		{
+			name: "blocking verdict is not a non-verdict", hasResult: true, decision: "changes_requested",
+			cliRecorded: "2026-07-31 12:02:00", wantReason: "blocking result from audit",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, gh, gate, request := newMergeGateQuorumScenario(t)
+			state := tc.state
+			if state == "" {
+				state = JobSucceeded
+			}
+			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+				id: engineJobID, agent: "audit", state: state,
+				hasResult: tc.hasResult, decision: tc.decision,
+				recorded: "2026-07-31 12:01:00",
+			})
+			if tc.cliRecorded != "" {
+				insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+					id: cliJobID, agent: "audit", hasResult: true, decision: "approved",
+					recorded: tc.cliRecorded, emptyRound: true,
+				})
+			}
+
+			decision, err := gate.Evaluate(context.Background(), request)
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			switch {
+			case tc.wantMerged:
+				if !decision.Merged {
+					t.Fatalf("decision = %+v, want cli verdict to resolve the settled non-verdict round", decision)
+				}
+				if len(gh.merges) != 1 {
+					t.Fatalf("merge calls = %+v, want one", gh.merges)
+				}
+			case tc.wantPending:
+				if decision.Merged || decision.Reason.IsGateMiss() {
+					t.Fatalf("decision = %+v, want live reviewer slot to wait without escalating", decision)
+				}
+			default:
+				if decision.Merged || !decision.LeaveOpen || !decision.Reason.IsGateMiss() {
+					t.Fatalf("decision = %+v, want the engine round to keep holding the merge", decision)
+				}
+			}
+			if !strings.Contains(decision.Reason.Render(), tc.wantReason) {
+				t.Fatalf("decision reason = %q, want %q", decision.Reason, tc.wantReason)
+			}
+			if !tc.wantMerged && len(gh.merges) != 0 {
+				t.Fatalf("merge calls = %+v, want none", gh.merges)
+			}
+		})
 	}
 }
 
@@ -2817,9 +3906,11 @@ func TestPolicyMergeGateAcceptsHeadlessIntegrationParentWhenDelegationChildrenSu
 	store, gh, gate, request := newMergeGateQuorumScenario(t)
 	const parentID = "review-parent-healthy"
 	insertCompletedJob(t, store, db.Job{
-		ID:           parentID,
-		Agent:        "reviewer-a",
-		Type:         "review",
+		ID:    parentID,
+		Agent: "reviewer-a",
+		Type:  "review",
+		// Production shape: a delegated review row carries both ids.
+		ParentJobID:  "implement-job",
 		DelegationID: "verify-parent",
 	}, JobPayload{
 		Repo:         "gitmoot/gitmoot",
@@ -3638,7 +4729,13 @@ func TestPolicyMergeGateAdvancesIntegrationWorktreeReviewWithoutHeadSHA(t *testi
 	}
 	// An integration-worktree review: a delegation child (DelegationID +
 	// WorktreePath set) whose HeadSHA the engine intentionally cleared.
-	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review", DelegationID: "verify-gate"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{
+		ID:           "review-job",
+		Agent:        "audit",
+		Type:         "review",
+		ParentJobID:  "review-job-implement-author",
+		DelegationID: "verify-gate",
+	}, JobPayload{
 		Repo:         "gitmoot/gitmoot",
 		PullRequest:  9,
 		TaskID:       "task-9",
@@ -3673,7 +4770,13 @@ func TestPolicyMergeGateAdvancesIntegrationWorktreeReviewWithoutHeadSHA(t *testi
 func TestPolicyMergeGateBlocksDelegationReviewForMismatchedHead(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review", DelegationID: "verify-gate"}, JobPayload{
+	insertIndependentMergeGateReview(t, store, db.Job{
+		ID:           "review-job",
+		Agent:        "audit",
+		Type:         "review",
+		ParentJobID:  "review-job-implement-author",
+		DelegationID: "verify-gate",
+	}, JobPayload{
 		Repo:         "gitmoot/gitmoot",
 		PullRequest:  9,
 		HeadSHA:      "stale999",
@@ -3720,31 +4823,91 @@ func TestPolicyMergeGateBlocksMissingFinalReview(t *testing.T) {
 	}
 }
 
+type mergeConfirmationFailureRunner struct {
+	onMerge func()
+	calls   int
+}
+
+func (r *mergeConfirmationFailureRunner) Run(_ context.Context, _ string, _ string, _ ...string) (subprocess.Result, error) {
+	r.calls++
+	switch r.calls {
+	case 1:
+		if r.onMerge != nil {
+			r.onMerge()
+		}
+		return subprocess.Result{Stdout: "merged"}, nil
+	case 2:
+		return subprocess.Result{Stderr: "HTTP 502"}, errors.New("exit status 1")
+	default:
+		return subprocess.Result{}, fmt.Errorf("unexpected merge adapter call %d", r.calls)
+	}
+}
+
+func (*mergeConfirmationFailureRunner) LookPath(file string) (string, error) {
+	return file, nil
+}
+
+type queuedMergeRunner struct {
+	calls int
+}
+
+func (r *queuedMergeRunner) Run(_ context.Context, _ string, _ string, _ ...string) (subprocess.Result, error) {
+	r.calls++
+	switch r.calls {
+	case 1:
+		return subprocess.Result{Stdout: "queued"}, nil
+	case 2:
+		return subprocess.Result{Stdout: `{"number":9,"title":"Task","state":"open","html_url":"https://github.com/gitmoot/gitmoot/pull/9","head":{"ref":"task-9","sha":"head123"},"base":{"ref":"main"}}`}, nil
+	default:
+		return subprocess.Result{}, fmt.Errorf("unexpected queued merge adapter call %d", r.calls)
+	}
+}
+
+func (*queuedMergeRunner) LookPath(file string) (string, error) {
+	return file, nil
+}
+
+type productionMergeGateGitHub struct {
+	*fakeMergeGateGitHub
+	mergeClient github.GhClient
+}
+
+func (g *productionMergeGateGitHub) MergePullRequest(ctx context.Context, input github.MergePullRequestInput) (github.MergeResult, error) {
+	g.merges = append(g.merges, input)
+	g.operations = append(g.operations, "merge")
+	return g.mergeClient.MergePullRequest(ctx, input)
+}
+
 type fakeMergeGateGitHub struct {
-	pr           github.PullRequest
-	status       github.CombinedStatus
-	compare      github.CompareResult
-	checks       []github.PullRequestCheck
-	mergeResult  github.MergeResult
-	mergeErr     error
-	statusErr    error
-	updateErr    error
-	statuses     []github.CommitStatusInput
-	merges       []github.MergePullRequestInput
-	updates      []github.UpdatePullRequestBranchInput
-	comments     []string
-	operations   []string
-	getCalls     int
-	statusCalls  int
-	compareCalls int
-	checkCalls   int
-	prCheckCalls int
-	checkRefs    []string
-	noChecks     bool
+	pr             github.PullRequest
+	status         github.CombinedStatus
+	compare        github.CompareResult
+	checks         []github.PullRequestCheck
+	mergeResult    github.MergeResult
+	getPullRequest func(int) (github.PullRequest, error)
+	mergeErr       error
+	statusErr      error
+	beforeMerge    func()
+	updateErr      error
+	statuses       []github.CommitStatusInput
+	merges         []github.MergePullRequestInput
+	updates        []github.UpdatePullRequestBranchInput
+	comments       []string
+	operations     []string
+	getCalls       int
+	statusCalls    int
+	compareCalls   int
+	checkCalls     int
+	prCheckCalls   int
+	checkRefs      []string
+	noChecks       bool
 }
 
 func (f *fakeMergeGateGitHub) GetPullRequest(context.Context, github.Repository, int64) (github.PullRequest, error) {
 	f.getCalls++
+	if f.getPullRequest != nil {
+		return f.getPullRequest(f.getCalls)
+	}
 	return f.pr, nil
 }
 
@@ -3792,6 +4955,9 @@ func (f *fakeMergeGateGitHub) UpdatePullRequestBranch(_ context.Context, input g
 }
 
 func (f *fakeMergeGateGitHub) MergePullRequest(_ context.Context, input github.MergePullRequestInput) (github.MergeResult, error) {
+	if f.beforeMerge != nil {
+		f.beforeMerge()
+	}
 	f.merges = append(f.merges, input)
 	f.operations = append(f.operations, "merge")
 	return f.mergeResult, f.mergeErr
@@ -3799,11 +4965,15 @@ func (f *fakeMergeGateGitHub) MergePullRequest(_ context.Context, input github.M
 
 type fakeMergeGateGit struct {
 	clean    bool
+	onClean  func()
 	onUpdate func()
 	updated  []string
 }
 
 func (f *fakeMergeGateGit) WorktreeClean(context.Context) (bool, error) {
+	if f.onClean != nil {
+		f.onClean()
+	}
 	return f.clean, nil
 }
 
@@ -3834,21 +5004,74 @@ func hasStatus(statuses []github.CommitStatusInput, context string, state string
 	return false
 }
 
+// setMergeGateJobTimestamps stamps created_at and updated_at to the SAME value,
+// which is what a row that ran once looks like.
 func setMergeGateJobTimestamps(t *testing.T, store *db.Store, jobID string, timestamp string) {
 	t.Helper()
+	setMergeGateJobRecordedTimes(t, store, jobID, timestamp, timestamp)
+}
+
+// setMergeGateJobRecordedTimes stamps created_at and updated_at INDEPENDENTLY; an
+// empty value leaves that column untouched. This is the only way a fixture can
+// express a row retried in place, where created_at is old and updated_at is new,
+// and it is exactly the shape no merge-gate fixture could express before.
+func setMergeGateJobRecordedTimes(t *testing.T, store *db.Store, jobID string, createdAt string, updatedAt string) {
+	t.Helper()
+	if createdAt == "" && updatedAt == "" {
+		t.Fatalf("set job %s recorded times: both values empty", jobID)
+	}
 	raw, err := sql.Open("sqlite", store.DatabasePath())
 	if err != nil {
 		t.Fatalf("open store for timestamp update: %v", err)
 	}
 	defer raw.Close()
+	assignments := make([]string, 0, 2)
+	args := make([]any, 0, 3)
+	if createdAt != "" {
+		assignments = append(assignments, "created_at = ?")
+		args = append(args, createdAt)
+	}
+	if updatedAt != "" {
+		assignments = append(assignments, "updated_at = ?")
+		args = append(args, updatedAt)
+	}
+	args = append(args, jobID)
 	result, err := raw.ExecContext(context.Background(),
-		`UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?`,
-		timestamp, timestamp, jobID)
+		`UPDATE jobs SET `+strings.Join(assignments, ", ")+` WHERE id = ?`, args...)
 	if err != nil {
-		t.Fatalf("set job %s timestamps: %v", jobID, err)
+		t.Fatalf("set job %s recorded times: %v", jobID, err)
 	}
 	affected, err := result.RowsAffected()
 	if err != nil || affected != 1 {
-		t.Fatalf("set job %s timestamps affected=%d, err=%v; want 1", jobID, affected, err)
+		t.Fatalf("set job %s recorded times affected=%d, err=%v; want 1", jobID, affected, err)
 	}
+}
+
+// settleMergeGateReviewInPlace mirrors `gitmoot job retry` settling a review row:
+// the SAME row transitions to a state carrying (or losing) a result, keeping its
+// id, head, round and CREATED_AT while only updated_at advances. No production
+// path adds a second row for the same round.
+func settleMergeGateReviewInPlace(t *testing.T, store *db.Store, jobID string, state JobState, result *AgentResult, recorded string) {
+	t.Helper()
+	ctx := context.Background()
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob(%s) returned error: %v", jobID, err)
+	}
+	payload, err := unmarshalPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(%s) returned error: %v", jobID, err)
+	}
+	payload.Result = result
+	encoded, err := marshalPayload(payload)
+	if err != nil {
+		t.Fatalf("marshalPayload(%s) returned error: %v", jobID, err)
+	}
+	if err := store.UpdateJobPayload(ctx, jobID, encoded); err != nil {
+		t.Fatalf("UpdateJobPayload(%s) returned error: %v", jobID, err)
+	}
+	if err := store.UpdateJobState(ctx, jobID, string(state)); err != nil {
+		t.Fatalf("UpdateJobState(%s) returned error: %v", jobID, err)
+	}
+	setMergeGateJobRecordedTimes(t, store, jobID, "", recorded)
 }

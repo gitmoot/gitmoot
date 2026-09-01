@@ -827,22 +827,23 @@ func (s *Store) ListBranchLockEvents(ctx context.Context, repoFullName string, b
 }
 
 func (s *Store) UpsertMergeGate(ctx context.Context, gate MergeGate) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO merge_gates(repo_full_name, pull_request, state, reason, updated_at)
-		VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO merge_gates(repo_full_name, pull_request, state, reason, block_class, updated_at)
+		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(repo_full_name, pull_request) DO UPDATE SET
 			state = excluded.state,
 			reason = excluded.reason,
+			block_class = excluded.block_class,
 			updated_at = CURRENT_TIMESTAMP`,
-		gate.RepoFullName, gate.PullRequest, gate.State, gate.Reason)
+		gate.RepoFullName, gate.PullRequest, gate.State, gate.Reason, gate.BlockClass)
 	return err
 }
 
 func (s *Store) GetMergeGate(ctx context.Context, repoFullName string, pullRequest int64) (MergeGate, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT repo_full_name, pull_request, state, reason
+	row := s.db.QueryRowContext(ctx, `SELECT repo_full_name, pull_request, state, reason, block_class
 		FROM merge_gates WHERE repo_full_name = ? AND pull_request = ?`,
 		repoFullName, pullRequest)
 	var gate MergeGate
-	if err := row.Scan(&gate.RepoFullName, &gate.PullRequest, &gate.State, &gate.Reason); err != nil {
+	if err := row.Scan(&gate.RepoFullName, &gate.PullRequest, &gate.State, &gate.Reason, &gate.BlockClass); err != nil {
 		return MergeGate{}, err
 	}
 	return gate, nil

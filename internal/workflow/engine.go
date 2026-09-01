@@ -411,15 +411,87 @@ type Engine struct {
 }
 
 func (e Engine) block(ctx context.Context, ref taskRef, reason string) error {
-	if err := e.setTaskState(ctx, ref, TaskBlocked); err != nil {
+	return e.blockTask(ctx, ref, "workflow_blocked", reason, "workflow")
+}
+
+// blockTask is the single task-blocking choke point. Every durable block
+// atomically writes the state and the event that owns it. A stale state
+// observation or failed attribution write commits neither half.
+func (e Engine) blockTask(ctx context.Context, ref taskRef, kind string, reason string, label string) error {
+	task, err := e.resolveTaskState(ctx, ref, TaskBlocked)
+	if err != nil {
 		return err
 	}
-	return BlockedError{Reason: reason}
+	blockErr := BlockedError{Reason: reason}
+	if strings.TrimSpace(task.ID) == "" {
+		return blockErr
+	}
+	fromState := ""
+	current, err := e.Store.GetTask(ctx, task.ID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err == nil {
+		fromState = current.State
+	}
+	blocked, err := e.Store.BlockTaskWithEvent(ctx, task, db.TaskEvent{
+		Kind:      kind,
+		FromState: fromState,
+		Reason:    reason,
+	})
+	if err != nil {
+		// #1673: a task whose pull request already MERGED must keep that record, and a
+		// dead leg's block_parent must still RELEASE its coordinator. The store's
+		// atomic guard refuses the write — which is right — but turning that refusal
+		// into a hard error would fail the whole poll and strand the coordinator the
+		// sweep exists to free. Record the durable trace and return the DAG's own
+		// BlockedError instead: what the caller then observes is exactly "child
+		// failed and finalized, parent advanced, task still merged".
+		if errors.Is(err, db.ErrTaskStateConflict) && fromState == string(TaskMerged) {
+			_ = e.Store.AddTaskEvent(ctx, db.TaskEvent{
+				TaskID: task.ID,
+				Kind:   TaskEventMergedRegressionRefused,
+				Reason: fmt.Sprintf("refused %s -> %s: the pull request already merged, so the landed-work record is kept; the %s advance that requested it continues",
+					TaskMerged, TaskBlocked, label),
+			})
+			return blockErr
+		}
+		return fmt.Errorf("record %s block for task %s: %w", label, task.ID, err)
+	}
+	if !blocked {
+		return fmt.Errorf("record %s block for task %s: state transition did not commit", label, task.ID)
+	}
+	return blockErr
 }
 
 func (e Engine) setTaskState(ctx context.Context, ref taskRef, state TaskState) error {
+	_, err := e.setTaskStateResolved(ctx, ref, state)
+	return err
+}
+
+// setTaskStateResolved returns the task row actually advanced. A branch ref can
+// resolve to an existing canonical task.
+func (e Engine) setTaskStateResolved(ctx context.Context, ref taskRef, state TaskState) (string, error) {
+	task, err := e.resolveTaskState(ctx, ref, state)
+	if err != nil || strings.TrimSpace(task.ID) == "" {
+		return "", err
+	}
+	// PersistTaskState, not a plain upsert: `planned` and `awaiting_human` are
+	// merged-regression targets too (blocked now goes through the store's atomic
+	// BlockTaskWithEvent), and every target must refuse to overwrite a disposed row.
+	// Both exclusions live on the write, so a second daemon cannot win the race a
+	// pre-read would lose.
+	if _, err := PersistTaskState(ctx, e.Store, task, state); err != nil {
+		return "", err
+	}
+	return task.ID, nil
+}
+
+// resolveTaskState preserves the branch-canonical identity rule without writing,
+// allowing all blocked transitions to use Store.BlockTaskWithEvent.
+func (e Engine) resolveTaskState(ctx context.Context, ref taskRef, state TaskState) (db.Task, error) {
 	if strings.TrimSpace(ref.ID) == "" {
-		return nil
+		return db.Task{}, nil
 	}
 	task := db.Task{
 		ID:           ref.ID,
@@ -431,11 +503,11 @@ func (e Engine) setTaskState(ctx context.Context, ref taskRef, state TaskState) 
 	}
 	existing, err := e.Store.GetTask(ctx, ref.ID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
+		return db.Task{}, err
 	}
 	if err == nil {
 		if IsDisposedTaskState(existing.State) && existing.State != string(state) {
-			return fmt.Errorf("task %s is %s; workflow advancement cannot move it to %s", existing.ID, existing.State, state)
+			return db.Task{}, fmt.Errorf("task %s is %s; workflow advancement cannot move it to %s", existing.ID, existing.State, state)
 		}
 		// The merged-regression refusal is NOT here: an advisory check on this read
 		// loses the race a second daemon can win between the read and the write, so
@@ -455,51 +527,46 @@ func (e Engine) setTaskState(ctx context.Context, ref taskRef, state TaskState) 
 	}
 	// One task per (repo, branch) is enforced by the tasks(repo_full_name, branch)
 	// partial-unique index. If this ref carries a non-empty branch already owned by a
-	// DIFFERENT task -- e.g. workflow advancement re-running a phase on the same branch
-	// under a fresh task id -- upserting `task` would fail with
-	// "UNIQUE constraint failed: tasks.repo_full_name, tasks.branch" and wedge the
-	// advancement. Advance the branch's canonical task in place instead of inserting a
-	// duplicate (the same branch-reuse invariant used by task creation).
+	// different task, advance the branch's canonical row instead of inserting a
+	// duplicate.
 	if task.Branch != "" {
 		byBranch, berr := e.Store.GetTaskByRepoBranch(ctx, task.RepoFullName, task.Branch)
 		if berr != nil && !errors.Is(berr, sql.ErrNoRows) {
-			return berr
+			return db.Task{}, berr
 		}
 		if berr == nil && byBranch.ID != task.ID {
 			if IsDisposedTaskState(byBranch.State) && byBranch.State != string(state) {
-				return fmt.Errorf("task %s is %s; workflow advancement cannot move it to %s", byBranch.ID, byBranch.State, state)
+				return db.Task{}, fmt.Errorf("task %s is %s; workflow advancement cannot move it to %s", byBranch.ID, byBranch.State, state)
 			}
 			byBranch.State = string(state)
-			return e.writeTaskState(ctx, byBranch, state)
+			return byBranch, nil
 		}
 	}
-	return e.writeTaskState(ctx, task, state)
+	return task, nil
 }
 
-// writeTaskState is setTaskState's single write point.
-func (e Engine) writeTaskState(ctx context.Context, task db.Task, state TaskState) error {
-	_, err := PersistTaskState(ctx, e.Store, task, state)
-	return err
-}
-
-// PersistTaskState is the single task-state write point for automated
-// advancement. Every exclusion it enforces lives on the conflict UPDATE, so a
-// caller's advisory pre-read cannot be invalidated between the read and the
-// write by another daemon — or by the same daemon earlier in the same poll.
+// PersistTaskState is the guarded write point for automated task-state
+// advancement (#1673). Every exclusion it enforces lives on the conflict UPDATE,
+// so the advisory pre-reads in resolveTaskState cannot be invalidated between the
+// read and the write by another daemon — or by the same daemon earlier in the same
+// poll.
 //
-// Two exclusion families, and they are refused differently because they mean
-// different things:
+// Two exclusion families, refused differently because they mean different things:
 //
 //	DISPOSED (dismissed/superseded/stranded) is an explicit operator or audit
 //	disposition. Automation never moves a task out of one, so a refusal is an
-//	ERROR naming the state — the same answer the pre-reads in setTaskState and
-//	blockTaskForPermissionBlockedJob give, now unwinnable by a race. Writing the
-//	SAME disposed state is permitted, so a disposal is idempotent.
+//	ERROR naming the state — the same answer resolveTaskState's pre-read gives,
+//	now unwinnable by a race. Writing the SAME disposed state is permitted, so a
+//	disposal stays idempotent.
 //
 //	MERGED, for a target that would claim the work is not done
 //	(IsMergedWorkRegressionTarget), is refused SILENTLY with a durable
 //	TaskEventMergedRegressionRefused trace: the failure policy that requested it
 //	still has to release its coordinator, so this must not become an error.
+//
+// `blocked` reaches the store through BlockTaskWithEvent, which carries its own
+// terminal-state conflict check; this covers the remaining regression targets
+// (`planned`, `awaiting_human`) and every ordinary advancement.
 func PersistTaskState(ctx context.Context, store *db.Store, task db.Task, state TaskState) (bool, error) {
 	task.State = string(state)
 	forbidden := make([]string, 0, 4)
@@ -519,8 +586,8 @@ func PersistTaskState(ctx context.Context, store *db.Store, task db.Task, state 
 	if written {
 		return true, nil
 	}
-	// The write lost. Classify against the state that actually won, because the
-	// two families answer differently and only the row can say which one refused.
+	// The write lost. Classify against the state that actually won, because the two
+	// families answer differently and only the row can say which one refused.
 	existing, getErr := store.GetTask(ctx, task.ID)
 	if getErr != nil {
 		return false, getErr

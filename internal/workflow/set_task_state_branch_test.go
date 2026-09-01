@@ -264,7 +264,6 @@ func TestWriteTaskStateRefusesMergedWrittenAfterTheRead(t *testing.T) {
 			if err := store.UpsertTask(ctx, seed); err != nil {
 				t.Fatal(err)
 			}
-			engine := Engine{Store: store}
 
 			// 1. The read setTaskState takes. It observes `reviewing`: no advisory check
 			//    on this value can ever refuse.
@@ -283,10 +282,13 @@ func TestWriteTaskStateRefusesMergedWrittenAfterTheRead(t *testing.T) {
 				t.Fatalf("UpsertTask(merged) returned error: %v", err)
 			}
 
-			// 3. The guarded write runs, still holding the stale snapshot.
+			// 3. The guarded write runs, still holding the stale snapshot. `blocked` now
+			//    reaches the store through BlockTaskWithEvent, but `planned` and
+			//    `awaiting_human` still come through PersistTaskState, which is the write
+			//    point this window is about.
 			stale.State = string(refused)
-			if err := engine.writeTaskState(ctx, stale, refused); err != nil {
-				t.Fatalf("writeTaskState(%s) returned error: %v", refused, err)
+			if _, err := PersistTaskState(ctx, store, stale, refused); err != nil {
+				t.Fatalf("PersistTaskState(%s) returned error: %v", refused, err)
 			}
 
 			task, err := store.GetTask(ctx, "canonical")

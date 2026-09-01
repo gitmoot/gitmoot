@@ -87,6 +87,10 @@ type Daemon struct {
 	// repository. When it turns on, only tasks parked by the auto-merge-disabled
 	// leave-open reason are re-armed. Nil preserves direct daemon users' behavior.
 	AutoMergeEnabled func(repo string) bool
+	// AfterCanonicalTerminalEffects is an optional interruption/observability
+	// hook invoked only after durable completion is recorded and before
+	// secondary identities settle.
+	AfterCanonicalTerminalEffects func(context.Context, db.PullRequestTerminalReconciliation) error
 	// parseCommentCommand is an injectable test seam for proving that the
 	// system-verified author gate runs before untrusted comment text reaches the
 	// command parser. Nil uses ParseCommand.
@@ -225,12 +229,12 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 			// HandlePullRequestOpened runs the gate itself when no reviewers are
 			// configured; avoid evaluating it twice in that one composition.
 			if !mergeReadinessHandled {
-				retry, err := d.pullRequestReadyToMerge(ctx, pull)
-				if err != nil {
+				task, err := d.lookupReadyPullRequestTask(ctx, pull, reviewMemo)
+				if err != nil && !errors.Is(err, sql.ErrNoRows) {
 					return err
 				}
-				if retry {
-					if err := d.handleReadyToMergeWorkflow(ctx, pull); err != nil && firstErr == nil {
+				if err == nil {
+					if err := d.handleReadyToMergeWorkflow(ctx, pull, task); err != nil && firstErr == nil {
 						firstErr = err
 					}
 				}
@@ -286,6 +290,9 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 	// retried on the next one, and BEFORE the remaining reconcilers so a
 	// coordinator released here is visible to them.
 	if err := d.completePendingSupersedeFinalizations(ctx); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := d.reconcileTransientlyBlockedMergeGates(ctx, openPullNumbers); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if err := d.retryClosedReadyToMerge(ctx, openBranches); err != nil && firstErr == nil {
@@ -538,6 +545,197 @@ func (d Daemon) reconcilePROpenTasks(ctx context.Context, pulls []github.PullReq
 	return firstErr
 }
 
+// reconcileTransientlyBlockedMergeGates gives a TRANSIENTLY blocked task an exit
+// (#1562). The merge gate already separates an operational/branch-staleness/infra
+// condition from an authoritative quality rejection, but that classification used
+// to live only on the returned decision, so nothing outside the blocking call
+// stack could act on it: daemon.pullRequestReadyToMerge admits ready_to_merge
+// only, engine_pr_lifecycle's non-merged close branch omits blocked, and
+// `task resume-work` refuses blocked. Measured on review-pr-1699-3f3a1026, whose
+// dirty-worktree block outlived the dirt by 95 minutes and cleared only when a
+// human merged the PR by hand.
+//
+// Release requires BOTH halves. The persisted class is the SELECTION filter — the
+// gate's own statement that this condition is self-clearing — and returning the
+// row to ready_to_merge is what restores it to the population that is
+// re-evaluated, which is the same remedy the engine already applies to a deferred
+// decision for the identical wedge ("a state that poll does not re-evaluate",
+// engine_routing_merge.go). The gate is NOT re-run here: it runs on the
+// ready_to_merge path, so a condition that has not actually cleared blocks again
+// and the row simply returns here next tick. A quality-classed row is never
+// selected, so an authoritative rejection stays blocked by construction rather
+// than by a re-evaluation happening to agree.
+//
+// PR-number resolution mirrors reconcileExternallyMergedTasks exactly, because
+// the wedged population is precisely the branchless local review task: a
+// pull.HeadRef lookup cannot find it, which is why the branch-keyed poll predicate
+// is the wrong seam for this exit.
+const transientMergeGateRetryInterval = time.Minute
+
+func (d Daemon) reconcileTransientlyBlockedMergeGates(ctx context.Context, openPullNumbers map[int64]struct{}) error {
+	tasks, err := d.Store.ListTasksByRepo(ctx, d.Repo.FullName())
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, task := range tasks {
+		if task.State != string(workflow.TaskBlocked) {
+			continue
+		}
+		branch := strings.TrimSpace(task.Branch)
+		var number int64
+		if branch == "" {
+			var ok bool
+			number, ok = reviewTaskPullRequestNumber(task.ID)
+			if !ok {
+				continue
+			}
+		} else {
+			stored, storedErr := d.Store.GetPullRequestByRepoBranch(ctx, d.Repo.FullName(), branch)
+			if storedErr != nil {
+				if errors.Is(storedErr, sql.ErrNoRows) {
+					continue
+				}
+				return storedErr
+			}
+			number = stored.Number
+		}
+		if number <= 0 {
+			continue
+		}
+		// Only a still-open PR can clear a transient condition. A closed or merged
+		// PR belongs to the external-merge and closed-reviewing reconcilers.
+		if _, open := openPullNumbers[number]; !open {
+			continue
+		}
+		gate, gateErr := d.Store.GetMergeGate(ctx, d.Repo.FullName(), number)
+		if gateErr != nil {
+			if errors.Is(gateErr, sql.ErrNoRows) {
+				continue
+			}
+			return gateErr
+		}
+		if gate.State != "blocked" || gate.BlockClass != int(workflow.MergeBlockTransient) {
+			continue
+		}
+		// The latest blocking event owns the current state. Retry its unchanged
+		// transient condition indefinitely, but no more than once per interval.
+		// The release transition preserves tasks.updated_at, so retries cannot
+		// disguise the original blocked age.
+		attributed, unattributed, lastRetryAt, attrErr := d.mergeGateOwnsCurrentBlock(ctx, task.ID, gate.Reason)
+		if attrErr != nil {
+			if firstErr == nil {
+				firstErr = attrErr
+			}
+			continue
+		}
+		if !attributed && !unattributed {
+			continue
+		}
+		now := d.now()
+		if !lastRetryAt.IsZero() && now.Before(lastRetryAt.Add(transientMergeGateRetryInterval)) {
+			continue
+		}
+		changed, _, transitionErr := d.Store.TransitionTaskStateWithEventPreserveAgeAt(ctx, task.ID,
+			[]string{string(workflow.TaskBlocked)},
+			string(workflow.TaskReadyToMerge), "merge_gate_transient_retry",
+			fmt.Sprintf("re-evaluating transient merge-gate block on open PR #%d: %s", number, gate.Reason), now)
+		if transitionErr != nil {
+			if firstErr == nil {
+				firstErr = transitionErr
+			}
+			continue
+		}
+		if changed {
+			d.logf("task %s released blocked -> ready_to_merge: transient merge-gate block on open PR #%d (%s)", task.ID, number, gate.Reason)
+		}
+	}
+	return firstErr
+}
+
+// mergeGateOwnsCurrentBlock reports whether the merge gate owns the task's
+// current block, whether the task predates block attribution, and the most
+// recent retry in the unchanged condition episode. Another blocker supersedes
+// the merge gate; a changed reason permits an immediate retry.
+func (d Daemon) mergeGateOwnsCurrentBlock(ctx context.Context, taskID string, currentGateReason string) (attributed bool, unattributed bool, lastRetryAt time.Time, err error) {
+	events, err := d.Store.ListTaskEvents(ctx, taskID)
+	if err != nil {
+		return false, false, time.Time{}, err
+	}
+	currentOwner := -1
+	for i := len(events) - 1; i >= 0; i-- {
+		if taskEventIsBlocking(events[i]) {
+			currentOwner = i
+			break
+		}
+	}
+	if currentOwner < 0 {
+		for _, event := range events {
+			if event.Kind != "merge_gate_transient_retry" {
+				continue
+			}
+			parsed, parseErr := parseTaskStoreTime(event.CreatedAt)
+			if parseErr != nil {
+				return false, false, time.Time{}, fmt.Errorf("parse transient retry time for task %s: %w", taskID, parseErr)
+			}
+			if parsed.After(lastRetryAt) {
+				lastRetryAt = parsed
+			}
+		}
+		return false, true, lastRetryAt, nil
+	}
+	if events[currentOwner].Kind != "merge_gate_blocked" {
+		return false, false, time.Time{}, nil
+	}
+	if strings.TrimSpace(events[currentOwner].Reason) != strings.TrimSpace(currentGateReason) {
+		return true, false, time.Time{}, nil
+	}
+
+	episodeActive := false
+	episodeReason := ""
+	for _, event := range events {
+		if taskEventIsBlocking(event) {
+			if event.Kind != "merge_gate_blocked" {
+				episodeActive = false
+				episodeReason = ""
+				lastRetryAt = time.Time{}
+				continue
+			}
+			if !episodeActive || event.Reason != episodeReason {
+				episodeActive = true
+				episodeReason = event.Reason
+				lastRetryAt = time.Time{}
+			}
+			continue
+		}
+		if event.Kind != "merge_gate_transient_retry" || !episodeActive {
+			continue
+		}
+		parsed, parseErr := parseTaskStoreTime(event.CreatedAt)
+		if parseErr != nil {
+			return false, false, time.Time{}, fmt.Errorf("parse transient retry time for task %s: %w", taskID, parseErr)
+		}
+		if parsed.After(lastRetryAt) {
+			lastRetryAt = parsed
+		}
+	}
+	return true, false, lastRetryAt, nil
+}
+
+func taskEventIsBlocking(event db.TaskEvent) bool {
+	if event.ToState == string(workflow.TaskBlocked) {
+		return true
+	}
+	switch event.Kind {
+	case "merge_gate_blocked", "review_auto_fix_blocked", "pr_closed_unmerged",
+		"delegation_vote_unmet", "delegation_quorum_unmet", "delegation_child_failed",
+		"block_parent", "quorum_unmet":
+		return true
+	default:
+		return false
+	}
+}
+
 // reconcileExternallyMergedTasks advances PR lifecycle tasks, plus blocked
 // tasks, whose PR was merged outside Gitmoot. It uses targeted single-PR reads
 // rather than a closed list, so old wedged tasks are not hidden by GitHub
@@ -615,15 +813,11 @@ func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumb
 			continue
 		}
 		if !pullRequestListedAsMerged(pull) {
-			// The PR left the open set without merging. If it is closed
-			// (abandoned), record a closed status breadcrumb for any linked
-			// workflow so a pr_open/changes_requested task does not leave its
-			// workflow status frozen at "open". This pass remains observability-
-			// only: reconcileClosedReviewingTasks is the single authoritative home
-			// for the closed-unmerged -> blocked transition, avoiding two passes
-			// racing the same task. The #953 conservatism against advancing or
-			// un-blocking on any ambiguous PR state is preserved. Idempotent and
-			// non-fatal.
+			// The PR left the open set without merging. Closed branch-bearing
+			// lifecycle tasks remain owned by their dedicated reconciliation
+			// passes. A branchless ready task has no path through those branch
+			// indexes, so resolve its retained merge claim here before applying
+			// the terminal non-merge transition.
 			if strings.EqualFold(strings.TrimSpace(pull.State), "closed") {
 				if _, err := workflow.RecordPullRequestWorkflowTransition(ctx, d.Store, workflow.PullRequestEvent{
 					Repo:        d.Repo.FullName(),
@@ -632,59 +826,271 @@ func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumb
 				}, workflow.PullRequestJournalClosed); err != nil {
 					d.logf("workflow journal PR-closed breadcrumb failed for %s#%d: %v", d.Repo.FullName(), group.number, err)
 				}
+				for _, task := range group.tasks {
+					if task.State != string(workflow.TaskReadyToMerge) || strings.TrimSpace(task.Branch) != "" {
+						continue
+					}
+					event, eventErr := d.reconciledPullRequestEvent(ctx, pull, task, group.number)
+					if eventErr != nil {
+						if firstErr == nil {
+							firstErr = eventErr
+						}
+						continue
+					}
+					if _, _, recoverErr := d.Store.RecoverClaimedTaskState(ctx, task.ID,
+						string(workflow.TaskBlocked), "pr_closed_unmerged",
+						fmt.Sprintf("pull request #%d closed without merging while holding a retained merge claim", group.number)); recoverErr != nil {
+						if firstErr == nil {
+							firstErr = recoverErr
+						}
+						continue
+					}
+					if closeErr := d.Workflow.HandleReviewPullRequestClosed(ctx, event, false); closeErr != nil && firstErr == nil {
+						firstErr = closeErr
+					}
+				}
 			}
 			continue
 		}
+		canonicalTask, selectErr := d.selectCanonicalMergedTask(ctx, group.tasks)
+		if selectErr != nil {
+			if firstErr == nil {
+				firstErr = selectErr
+			}
+			continue
+		}
+		taskIDs := make([]string, 0, len(group.tasks))
 		for _, task := range group.tasks {
-			branch := strings.TrimSpace(pull.HeadRef)
-			if branch == "" {
-				branch = strings.TrimSpace(task.Branch)
+			taskIDs = append(taskIDs, task.ID)
+		}
+		reconciliation, reconcileErr := d.Store.BeginPullRequestTerminalReconciliation(ctx, db.PullRequestTerminalReconciliation{
+			RepoFullName: d.Repo.FullName(),
+			PullRequest:  group.number,
+			HeadSHA:      strings.TrimSpace(pull.HeadSHA),
+			OwnerTaskID:  canonicalTask.ID,
+		}, taskIDs)
+		if reconcileErr != nil {
+			if firstErr == nil {
+				firstErr = reconcileErr
 			}
-			if branch == "" {
-				if firstErr == nil {
-					firstErr = fmt.Errorf("reconcile externally merged PR #%d: head branch is empty", pull.Number)
-				}
-				continue
-			}
-			leadAgent := "github"
-			if lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), branch); err == nil {
-				if owner := strings.TrimSpace(lock.Owner); owner != "" {
-					leadAgent = owner
-				}
-			} else if !errors.Is(err, sql.ErrNoRows) {
-				if firstErr == nil {
-					firstErr = err
-				}
-				continue
-			}
-			event := workflow.PullRequestEvent{
-				Repo:        d.Repo.FullName(),
-				Branch:      branch,
-				PullRequest: int(group.number),
-				HeadSHA:     pull.HeadSHA,
-				GoalID:      task.GoalID,
-				TaskID:      task.ID,
-				TaskTitle:   task.Title,
-				LeadAgent:   leadAgent,
-				Sender:      "github",
-			}
-			// Preserve the existing ready-to-merge path's merge-gate cleanup and
-			// outcome side effects. The closure handler below remains the durable
-			// backstop and also updates the local PR mirror for custom test gates.
-			if task.State == string(workflow.TaskReadyToMerge) && strings.TrimSpace(task.Branch) != "" && d.Workflow.MergeGate != nil {
-				if err := d.handleReadyToMergeWorkflow(ctx, pull); err != nil {
+			continue
+		}
+		if reconciliation.OwnerTaskID != canonicalTask.ID {
+			if reconciliation.EffectsCompleted {
+				canonicalTask = db.Task{ID: reconciliation.OwnerTaskID}
+			} else {
+				canonicalTask, reconcileErr = d.Store.GetTask(ctx, reconciliation.OwnerTaskID)
+				if reconcileErr != nil {
 					if firstErr == nil {
-						firstErr = err
+						firstErr = fmt.Errorf("load canonical terminal-effects owner %s: %w", reconciliation.OwnerTaskID, reconcileErr)
 					}
 					continue
 				}
 			}
-			if err := d.Workflow.HandleReviewPullRequestClosed(ctx, event, true); err != nil && firstErr == nil {
-				firstErr = err
+		}
+		if !reconciliation.EffectsCompleted {
+			event, eventErr := d.reconciledPullRequestEvent(ctx, pull, canonicalTask, group.number)
+			if eventErr != nil {
+				if firstErr == nil {
+					firstErr = eventErr
+				}
+				continue
+			}
+			if canonicalTask.State == string(workflow.TaskReadyToMerge) && d.Workflow.MergeGate != nil {
+				// Exactly one ready identity owns the per-PR boundary: atomic claim
+				// recovery, merge-gate finalization, branch/worktree cleanup,
+				// harvesting and detached signals, and continuation.
+				if readyErr := d.handleReadyToMergeWorkflow(ctx, pull, canonicalTask); readyErr != nil {
+					if firstErr == nil {
+						firstErr = readyErr
+					}
+					continue
+				}
+				canonicalTask, reconcileErr = d.Store.GetTask(ctx, canonicalTask.ID)
+				if reconcileErr != nil {
+					if firstErr == nil {
+						firstErr = reconcileErr
+					}
+					continue
+				}
+				if canonicalTask.State != string(workflow.TaskMerged) {
+					// The wrapper's authoritative re-read did not confirm the
+					// daemon's merged hint. Retain owner/debt and retry; never
+					// apply terminal effects or settle another identity.
+					continue
+				}
+			} else if canonicalTask.State == string(workflow.TaskReadyToMerge) && strings.TrimSpace(canonicalTask.Branch) == "" {
+				// Defensive fallback for a gate removed between polls. There is no
+				// configured canonical continuation to run, but the retained claim
+				// must still resolve into the authoritative merged state.
+				if _, _, recoverErr := d.Store.RecoverClaimedTaskState(ctx, canonicalTask.ID,
+					string(workflow.TaskMerged), "pull_request_merged",
+					fmt.Sprintf("recovered merged pull request #%d from retained branchless task claim", group.number)); recoverErr != nil {
+					if firstErr == nil {
+						firstErr = recoverErr
+					}
+					continue
+				}
+			}
+			if closeErr := d.Workflow.HandleReviewPullRequestClosed(ctx, event, true); closeErr != nil {
+				if firstErr == nil {
+					firstErr = closeErr
+				}
+				continue
+			}
+			if completeErr := d.Store.CompletePullRequestTerminalEffects(ctx, reconciliation); completeErr != nil {
+				if firstErr == nil {
+					firstErr = completeErr
+				}
+				continue
+			}
+			reconciliation.EffectsCompleted = true
+			if d.AfterCanonicalTerminalEffects != nil {
+				if interruptErr := d.AfterCanonicalTerminalEffects(ctx, reconciliation); interruptErr != nil {
+					if firstErr == nil {
+						firstErr = interruptErr
+					}
+					continue
+				}
+			}
+		}
+		settlements, settlementErr := d.Store.ListPullRequestTerminalSettlements(ctx, reconciliation)
+		if settlementErr != nil {
+			if firstErr == nil {
+				firstErr = settlementErr
+			}
+			continue
+		}
+		for _, taskID := range settlements {
+			task, taskErr := d.Store.GetTask(ctx, taskID)
+			if errors.Is(taskErr, sql.ErrNoRows) {
+				taskErr = d.Store.ResolvePullRequestTerminalSettlement(ctx, reconciliation, taskID)
+			}
+			if taskErr != nil {
+				if firstErr == nil {
+					firstErr = taskErr
+				}
+				continue
+			}
+			if task.ID == "" {
+				continue
+			}
+			if taskErr := d.reconcileAdditionalMergedTask(ctx, task, reconciliation.OwnerTaskID, group.number); taskErr != nil {
+				if firstErr == nil {
+					firstErr = taskErr
+				}
+				continue
+			}
+			if resolveErr := d.Store.ResolvePullRequestTerminalSettlement(ctx, reconciliation, task.ID); resolveErr != nil && firstErr == nil {
+				firstErr = resolveErr
 			}
 		}
 	}
 	return firstErr
+}
+
+// selectCanonicalMergedTask chooses one identity to own per-PR terminal effects.
+// A ready task with a durable merge claim wins, followed by a branch-owning
+// ready task, then another ready task. Groups without a ready identity preserve
+// the branch-owning lifecycle task as the canonical cleanup owner.
+func (d Daemon) selectCanonicalMergedTask(ctx context.Context, tasks []db.Task) (db.Task, error) {
+	claimedReady := -1
+	branchReady := -1
+	anyReady := -1
+	branchFallback := -1
+	anyFallback := -1
+	for index := range tasks {
+		task := tasks[index]
+		if anyFallback < 0 || task.ID < tasks[anyFallback].ID {
+			anyFallback = index
+		}
+		if strings.TrimSpace(task.Branch) != "" &&
+			(branchFallback < 0 || task.ID < tasks[branchFallback].ID) {
+			branchFallback = index
+		}
+		if task.State != string(workflow.TaskReadyToMerge) {
+			continue
+		}
+		if anyReady < 0 || task.ID < tasks[anyReady].ID {
+			anyReady = index
+		}
+		if strings.TrimSpace(task.Branch) != "" &&
+			(branchReady < 0 || task.ID < tasks[branchReady].ID) {
+			branchReady = index
+		}
+		claimed, err := d.Store.HasTaskStateClaim(ctx, task.ID)
+		if err != nil {
+			return db.Task{}, fmt.Errorf("inspect merge claim for task %s: %w", task.ID, err)
+		}
+		if claimed && (claimedReady < 0 || task.ID < tasks[claimedReady].ID) {
+			claimedReady = index
+		}
+	}
+	for _, index := range []int{claimedReady, branchReady, anyReady, branchFallback, anyFallback} {
+		if index >= 0 {
+			return tasks[index], nil
+		}
+	}
+	return db.Task{}, errors.New("select canonical merged task from empty PR group")
+}
+
+// reconcileAdditionalMergedTask advances an additional local identity without
+// replaying per-PR cleanup, harvesting, detached legs, or continuation.
+func (d Daemon) reconcileAdditionalMergedTask(ctx context.Context, task db.Task, canonicalTaskID string, number int64) error {
+	reason := fmt.Sprintf("reconciled merged pull request #%d; canonical terminal effects owned by task %s", number, canonicalTaskID)
+	changed, current, err := d.Store.RecoverClaimedTaskState(ctx, task.ID,
+		string(workflow.TaskMerged), "pull_request_merged", reason)
+	if err != nil {
+		return err
+	}
+	if changed || current == string(workflow.TaskMerged) {
+		return nil
+	}
+	changed, current, err = d.Store.TransitionTaskStateWithEvent(ctx, task.ID, []string{
+		string(workflow.TaskPullRequestOpen),
+		string(workflow.TaskReviewing),
+		string(workflow.TaskChangesRequested),
+		string(workflow.TaskReadyToMerge),
+		string(workflow.TaskAwaitingHumanMerge),
+		string(workflow.TaskBlocked),
+	}, string(workflow.TaskMerged), "pull_request_merged", reason)
+	if err != nil {
+		return err
+	}
+	if !changed && current != string(workflow.TaskMerged) {
+		return fmt.Errorf("%w: additional task %s reached %q while reconciling merged PR #%d",
+			db.ErrTaskStateConflict, task.ID, current, number)
+	}
+	return nil
+}
+
+func (d Daemon) reconciledPullRequestEvent(ctx context.Context, pull github.PullRequest, task db.Task, number int64) (workflow.PullRequestEvent, error) {
+	branch := strings.TrimSpace(pull.HeadRef)
+	if branch == "" {
+		branch = strings.TrimSpace(task.Branch)
+	}
+	if branch == "" {
+		return workflow.PullRequestEvent{}, fmt.Errorf("reconcile terminal PR #%d: head branch is empty", number)
+	}
+	leadAgent := "github"
+	if lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), branch); err == nil {
+		if owner := strings.TrimSpace(lock.Owner); owner != "" {
+			leadAgent = owner
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return workflow.PullRequestEvent{}, err
+	}
+	return workflow.PullRequestEvent{
+		Repo:        d.Repo.FullName(),
+		Branch:      branch,
+		PullRequest: int(number),
+		HeadSHA:     pull.HeadSHA,
+		GoalID:      task.GoalID,
+		TaskID:      task.ID,
+		TaskTitle:   task.Title,
+		LeadAgent:   leadAgent,
+		Sender:      "github",
+	}, nil
 }
 
 func externalMergeCandidateState(state string) bool {
@@ -1598,27 +2004,112 @@ func workflowReviewJobMatchesPull(repoFullName string, pull github.PullRequest, 
 		len(payload.Reviewers) > 0
 }
 
+// lookupReadyPullRequestTask resolves exactly one ready task for the current PR
+// head. A ready branch owner is canonical only when the stored PR mirror binds
+// that branch to this PR number and head SHA. A branchless local-review task is
+// eligible only when a succeeded review job supplies the same exact binding.
+// Multiple eligible branchless rows fail closed.
+func (d Daemon) lookupReadyPullRequestTask(ctx context.Context, pull github.PullRequest, memo *reviewJobsMemo) (db.Task, error) {
+	if !d.pullRequestHeadIsLocal(pull) {
+		return db.Task{}, sql.ErrNoRows
+	}
+	branchTask, branchErr := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
+	if branchErr != nil && !errors.Is(branchErr, sql.ErrNoRows) {
+		return db.Task{}, branchErr
+	}
+	if branchErr == nil && branchTask.State == string(workflow.TaskReadyToMerge) {
+		stored, err := d.Store.GetPullRequestByRepoBranch(ctx, d.Repo.FullName(), pull.HeadRef)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return db.Task{}, err
+		}
+		if err == nil && stored.Number == pull.Number &&
+			strings.TrimSpace(stored.HeadSHA) == strings.TrimSpace(pull.HeadSHA) {
+			return branchTask, nil
+		}
+	}
+
+	tasks, err := d.Store.ListTasksByRepo(ctx, d.Repo.FullName())
+	if err != nil {
+		return db.Task{}, err
+	}
+	jobs, err := d.reviewJobs(ctx, memo)
+	if err != nil {
+		return db.Task{}, err
+	}
+	candidates := make([]db.Task, 0, 1)
+	for _, candidate := range tasks {
+		if strings.TrimSpace(candidate.Branch) != "" ||
+			candidate.State != string(workflow.TaskReadyToMerge) {
+			continue
+		}
+		number, ok := reviewTaskPullRequestNumber(candidate.ID)
+		if !ok || number != pull.Number {
+			continue
+		}
+		bound, err := reviewTaskBoundToPullHead(candidate, d.Repo.FullName(), pull, jobs)
+		if err != nil {
+			return db.Task{}, err
+		}
+		if bound {
+			candidates = append(candidates, candidate)
+		}
+	}
+	switch len(candidates) {
+	case 0:
+		return db.Task{}, sql.ErrNoRows
+	case 1:
+		return candidates[0], nil
+	default:
+		ids := make([]string, 0, len(candidates))
+		for _, candidate := range candidates {
+			ids = append(ids, candidate.ID)
+		}
+		return db.Task{}, fmt.Errorf("ambiguous ready tasks for %s#%d at head %s: %s",
+			d.Repo.FullName(), pull.Number, pull.HeadSHA, strings.Join(ids, ", "))
+	}
+}
+
+func reviewTaskBoundToPullHead(task db.Task, repoFullName string, pull github.PullRequest, jobs []db.Job) (bool, error) {
+	for _, job := range jobs {
+		if job.State != string(workflow.JobSucceeded) {
+			continue
+		}
+		var payload workflow.JobPayload
+		if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
+			return false, fmt.Errorf("parse job payload %q: %w", job.ID, err)
+		}
+		if payload.TaskID == task.ID &&
+			payload.Repo == repoFullName &&
+			payload.PullRequest == int(pull.Number) &&
+			payload.Branch == pull.HeadRef &&
+			strings.TrimSpace(payload.HeadSHA) == strings.TrimSpace(pull.HeadSHA) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (d Daemon) pullRequestReadyToMerge(ctx context.Context, pull github.PullRequest) (bool, error) {
-	task, err := d.lookupPolledPullRequestTask(ctx, pull)
+	_, err := d.lookupReadyPullRequestTask(ctx, pull, nil)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
 		}
 		return false, err
 	}
-	// TaskReadyToMerge is the retry authority. SkipNativeReviewFanout controls
-	// PR-open review routing only; a direct review can leave this task pending
-	// on CI, and suppressing its poll here strands gitmoot/merge-gate (#1708).
-	return task.State == string(workflow.TaskReadyToMerge), nil
+	return true, nil
 }
 
-func (d Daemon) handleReadyToMergeWorkflow(ctx context.Context, pull github.PullRequest) error {
+func (d Daemon) handleReadyToMergeWorkflow(ctx context.Context, pull github.PullRequest, task db.Task) error {
 	if d.Workflow == nil {
 		return nil
 	}
-	task, err := d.lookupPolledPullRequestTask(ctx, pull)
+	ready, _, err := d.Store.RevalidateTaskState(ctx, task.ID, string(workflow.TaskReadyToMerge))
 	if err != nil {
 		return err
+	}
+	if !ready {
+		return nil
 	}
 	lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), pull.HeadRef)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -1632,12 +2123,13 @@ func (d Daemon) handleReadyToMergeWorkflow(ctx context.Context, pull github.Pull
 	if branch == "" {
 		branch = pull.HeadRef
 	}
-	return d.Workflow.HandlePullRequestReadyToMerge(ctx, workflow.PullRequestEvent{
+	err = d.Workflow.HandlePullRequestReadyToMerge(ctx, workflow.PullRequestEvent{
 		Repo:                    d.Repo.FullName(),
 		Branch:                  branch,
 		PullRequest:             int(pull.Number),
 		PullRequestDraft:        pull.Draft,
 		PullRequestDraftUnknown: pull.DraftUnknown,
+		PullRequestMerged:       pullRequestListedAsMerged(pull),
 		HeadSHA:                 pull.HeadSHA,
 		GoalID:                  task.GoalID,
 		TaskID:                  task.ID,
@@ -1645,6 +2137,10 @@ func (d Daemon) handleReadyToMergeWorkflow(ctx context.Context, pull github.Pull
 		LeadAgent:               leadAgent,
 		Sender:                  "github",
 	})
+	if errors.Is(err, workflow.ErrMergeTaskStateChanged) {
+		return nil
+	}
+	return err
 }
 
 func (d Daemon) reconcileReviewingPullRequest(ctx context.Context, pull github.PullRequest, memo *reviewJobsMemo) error {
@@ -1740,6 +2236,7 @@ func (d Daemon) retryClosedReadyToMerge(ctx context.Context, openBranches map[st
 	type readyPullRequest struct {
 		number  int64
 		headSHA string
+		task    db.Task
 	}
 	readyBranches := map[string]readyPullRequest{}
 	for _, task := range tasks {
@@ -1761,7 +2258,7 @@ func (d Daemon) retryClosedReadyToMerge(ctx context.Context, openBranches map[st
 			}
 			return err
 		}
-		readyBranches[task.Branch] = readyPullRequest{number: stored.Number, headSHA: stored.HeadSHA}
+		readyBranches[task.Branch] = readyPullRequest{number: stored.Number, headSHA: stored.HeadSHA, task: task}
 	}
 	if len(readyBranches) == 0 {
 		return nil
@@ -1781,7 +2278,7 @@ func (d Daemon) retryClosedReadyToMerge(ctx context.Context, openBranches map[st
 		if ready.headSHA != "" && pull.HeadSHA != ready.headSHA {
 			continue
 		}
-		if err := d.handleReadyToMergeWorkflow(ctx, pull); err != nil {
+		if err := d.handleReadyToMergeWorkflow(ctx, pull, ready.task); err != nil {
 			return err
 		}
 		delete(readyBranches, pull.HeadRef)

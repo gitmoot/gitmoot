@@ -81,7 +81,7 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		if e.isPipelineOrchestrateRoot(ctx, parentJob, parentPayload) {
 			return e.enqueueFinalizeContinuation(ctx, parentJob, parentPayload, reason)
 		}
-		return e.block(ctx, ref, reason)
+		return e.blockSynthesisGate(ctx, ref, "delegation_vote_unmet", reason)
 	}
 
 	// synthesis_rule "quorum": block the parent unless at least K children
@@ -100,7 +100,7 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 			if e.isPipelineOrchestrateRoot(ctx, parentJob, parentPayload) {
 				return e.enqueueFinalizeContinuation(ctx, parentJob, parentPayload, reason)
 			}
-			return e.block(ctx, ref, reason)
+			return e.blockSynthesisGate(ctx, ref, "delegation_quorum_unmet", reason)
 		}
 	}
 

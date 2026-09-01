@@ -547,35 +547,81 @@ func TestPermissionBlockedJobCannotResurrectDismissedTask(t *testing.T) {
 	}
 }
 
-func TestPermissionBlockedJobCannotOverwriteMergedTask(t *testing.T) {
+func TestPermissionBlockedJobWritesCurrentTaskOwnership(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
 	if err := store.UpsertTask(ctx, db.Task{
-		ID: "task-1", RepoFullName: "owner/repo", State: string(workflow.TaskMerged), Branch: "feature/one",
+		ID: "task-2", RepoFullName: "owner/repo",
+		State: string(workflow.TaskImplementing), Branch: "feature/two",
 	}); err != nil {
 		t.Fatal(err)
 	}
 	payload, err := json.Marshal(workflow.JobPayload{
-		TaskID: "task-1", Repo: "owner/repo", Branch: "feature/one",
+		TaskID: "task-2", Repo: "owner/repo", Branch: "feature/two",
+		Result: &workflow.AgentResult{Decision: "blocked", Summary: "permission denied"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := blockTaskForPermissionBlockedJob(ctx, store, db.Job{ID: "job-1", Payload: string(payload)}); err != nil {
-		t.Fatalf("blockTaskForPermissionBlockedJob returned error: %v", err)
+	if err := blockTaskForPermissionBlockedJob(ctx, store, db.Job{ID: "job-2", Payload: string(payload)}); err != nil {
+		t.Fatal(err)
 	}
-	task, err := store.GetTask(ctx, "task-1")
+	task, err := store.GetTask(ctx, "task-2")
+	if err != nil || task.State != string(workflow.TaskBlocked) {
+		t.Fatalf("task = %+v err %v, want blocked", task, err)
+	}
+	events, err := store.ListTaskEvents(ctx, "task-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Kind != "permission_job_blocked" ||
+		events[0].FromState != string(workflow.TaskImplementing) ||
+		events[0].ToState != string(workflow.TaskBlocked) {
+		t.Fatalf("task events = %+v, want permission block ownership", events)
+	}
+}
+
+// TestPermissionBlockedJobCannotOverwriteMergedTask keeps the #1673 guarantee on
+// the permission-block path after it moved to the store's atomic
+// BlockTaskWithEvent: a task whose pull request already MERGED must not be
+// rewritten as blocked by a leg that never ran.
+//
+// The refusal shape belongs to the store now — a terminal-state conflict error
+// instead of the engine's silent refusal event — so this asserts the invariant
+// (the landed-work record survives, and no block is attributed to it) rather than
+// the old mechanism.
+func TestPermissionBlockedJobCannotOverwriteMergedTask(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-3", RepoFullName: "owner/repo", State: string(workflow.TaskMerged), Branch: "feature/three",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(workflow.JobPayload{
+		TaskID: "task-3", Repo: "owner/repo", Branch: "feature/three",
+		Result: &workflow.AgentResult{Decision: "blocked", Summary: "permission denied"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := blockTaskForPermissionBlockedJob(ctx, store, db.Job{ID: "job-3", Payload: string(payload)}); err == nil {
+		t.Fatal("a permission-blocked leg overwrote a merged task without complaint")
+	}
+	task, err := store.GetTask(ctx, "task-3")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if task.State != string(workflow.TaskMerged) {
-		t.Fatalf("task state = %q, want merged", task.State)
+		t.Fatalf("task state = %q, want the landed-work record preserved", task.State)
 	}
-	events, err := store.ListTaskEvents(ctx, "task-1")
+	events, err := store.ListTaskEvents(ctx, "task-3")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 1 || events[0].Kind != workflow.TaskEventMergedRegressionRefused {
-		t.Fatalf("task events = %+v, want one merged-regression refusal", events)
+	for _, event := range events {
+		if event.Kind == "permission_job_blocked" {
+			t.Fatalf("a block was attributed to a merged task: %+v", event)
+		}
 	}
 }
