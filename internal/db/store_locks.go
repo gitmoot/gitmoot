@@ -264,15 +264,96 @@ func (s *Store) ReleaseResourceLock(ctx context.Context, resourceKey string, own
 	return affected == 1, nil
 }
 
+// AdvanceOwnership names the exact lease an advance holds: key, token, the job it
+// advances, and the lifecycle generation it was granted for. Every renewal and
+// every irreversible effect is bound to ALL FOUR, in one predicate.
+type AdvanceOwnership struct {
+	LockKey      string
+	OwnerToken   string
+	OwnerJobID   string
+	AtGeneration int64
+}
+
+// advanceOwnershipLiveSQL is the predicate: this exact token still holds this exact
+// key, its lease has NOT expired, and the job is still on the generation the lease
+// was granted for.
+//
+// Expiry is part of it because a lapsed lease is how an abandoned pass is
+// recovered: once RetryJob commits generation N+1 against an expired lock, the old
+// token must be permanently dead. A renewal that only matched key+token would
+// RESURRECT it and let a dead pass emit effects against a lifecycle that has moved.
+// The generation clause closes the same door from the other side.
+const advanceOwnershipLiveSQL = `SELECT 1 FROM resource_locks
+		WHERE resource_key = ? AND owner_token = ? AND expires_at > ?
+		  AND EXISTS (SELECT 1 FROM jobs WHERE jobs.id = ? AND jobs.lifecycle_generation = ?)`
+
+// RenewAdvanceOwnershipLease extends a lease that is STILL live and still on its
+// granted lifecycle. Zero rows means ownership is gone for good, never "try again".
+//
+// It is deliberately separate from HeartbeatResourceLock: a runtime-session
+// heartbeat has different recovery semantics, and widening that method would change
+// behaviour for every session on the box.
+func (s *Store) RenewAdvanceOwnershipLease(ctx context.Context, own AdvanceOwnership, expiresAt time.Time, now time.Time) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE resource_locks
+		SET expires_at = ?, updated_at = ?
+		WHERE resource_key = ? AND owner_token = ? AND expires_at > ?
+		  AND EXISTS (SELECT 1 FROM jobs WHERE jobs.id = ? AND jobs.lifecycle_generation = ?)`,
+		formatResourceLockTime(expiresAt), formatResourceLockTime(now),
+		strings.TrimSpace(own.LockKey), strings.TrimSpace(own.OwnerToken), formatResourceLockTime(now),
+		strings.TrimSpace(own.OwnerJobID), own.AtGeneration)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
+}
+
+// advanceOwnershipLiveTx answers the same predicate INSIDE a caller's transaction,
+// so an irreversible write can be bound to live ownership at COMMIT rather than by
+// a preceding read. A pre-write heartbeat is not sufficient: the gap between it and
+// the write is exactly where a lease loss lands.
+func advanceOwnershipLiveTx(ctx context.Context, tx *sql.Tx, own AdvanceOwnership, now time.Time) (bool, error) {
+	if strings.TrimSpace(own.LockKey) == "" || strings.TrimSpace(own.OwnerToken) == "" {
+		return false, nil
+	}
+	var live int
+	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM (`+advanceOwnershipLiveSQL+`)`,
+		strings.TrimSpace(own.LockKey), strings.TrimSpace(own.OwnerToken), formatResourceLockTime(now),
+		strings.TrimSpace(own.OwnerJobID), own.AtGeneration).Scan(&live)
+	if err != nil {
+		return false, err
+	}
+	return live > 0, nil
+}
+
+// excludeLiveAdvanceLockSQL keeps a supersession parent-advance lease OUT of every
+// broad, owner-scoped resource-lock delete (#1673).
+//
+// The lease is not a resource the OWNER JOB holds; it is a coordination lock held
+// by whichever recovery PASS is advancing that job right now, and its owner_job_id
+// is only how it is addressed. A cleanup keyed on owner_job_id therefore deletes a
+// lock belonging to a different, live pass — after which a retry's exclusion
+// predicate sees nothing and rolls the lifecycle over mid-advance. Ownership of
+// this class is managed only by its owner's explicit release and by lease expiry.
+//
+// Liveness is part of the exclusion so an ABANDONED lease is still swept by the
+// same cleanup: only an unexpired one is protected.
+const excludeLiveAdvanceLockSQL = ` AND NOT (resource_key LIKE '` + SupersedeAdvanceLockKeyPrefix + `%' AND expires_at > ?)`
+
 // DeleteResourceLocksByOwner releases every resource lock held by ownerJobID,
 // regardless of token/expiry — used when a job is cancelled and can no longer
-// renew its locks. Returns the number released.
-func (s *Store) DeleteResourceLocksByOwner(ctx context.Context, ownerJobID string) (int64, error) {
+// renew its locks. A LIVE supersede-advance lease is excluded: it belongs to a
+// recovery pass, not to this job. Returns the number released.
+func (s *Store) DeleteResourceLocksByOwner(ctx context.Context, ownerJobID string, now time.Time) (int64, error) {
 	ownerJobID = strings.TrimSpace(ownerJobID)
 	if ownerJobID == "" {
 		return 0, nil
 	}
-	result, err := s.db.ExecContext(ctx, `DELETE FROM resource_locks WHERE owner_job_id = ?`, ownerJobID)
+	result, err := s.db.ExecContext(ctx, `DELETE FROM resource_locks WHERE owner_job_id = ?`+excludeLiveAdvanceLockSQL,
+		ownerJobID, formatResourceLockTime(now))
 	if err != nil {
 		return 0, err
 	}
@@ -286,7 +367,11 @@ func (s *Store) DeleteResourceLocksByOwner(ctx context.Context, ownerJobID strin
 // the delegation-kill cleanup path (#479): a child that raced queued->running
 // after a stale snapshot was read keeps its live runtime-session / checkout
 // lock instead of having it deleted out from under its in-flight process.
-func (s *Store) DeleteResourceLocksByOwnerIfNotRunning(ctx context.Context, ownerJobID string) (int64, error) {
+//
+// A live supersede-advance lease is excluded for the same reason as above: the
+// owner job is terminal by construction here, so this guard alone would not save
+// another pass's lease (#1673).
+func (s *Store) DeleteResourceLocksByOwnerIfNotRunning(ctx context.Context, ownerJobID string, now time.Time) (int64, error) {
 	ownerJobID = strings.TrimSpace(ownerJobID)
 	if ownerJobID == "" {
 		return 0, nil
@@ -297,7 +382,7 @@ func (s *Store) DeleteResourceLocksByOwnerIfNotRunning(ctx context.Context, owne
 				SELECT 1 FROM jobs
 				WHERE jobs.id = resource_locks.owner_job_id
 					AND jobs.state = 'running'
-			)`, ownerJobID)
+			)`+excludeLiveAdvanceLockSQL, ownerJobID, formatResourceLockTime(now))
 	if err != nil {
 		return 0, err
 	}
@@ -327,7 +412,13 @@ func (s *Store) DeleteResourceLocksByOwnerIfNotRunning(ctx context.Context, owne
 //
 // Every error is returned. A caller that cannot prove the cleanup ran must leave
 // its debt outstanding rather than record it paid.
-func (s *Store) ReleaseSupersededJobResourceLocksAtGeneration(ctx context.Context, ownerJobID string, atGeneration int64) (released int64, guarded bool, err error) {
+// A LIVE supersede-advance lease is excluded (#1673). This cleanup is keyed on
+// owner_job_id, and a competing recovery pass's advance lease carries the same
+// owner_job_id, so without the exclusion a second finalizer deletes the FIRST
+// pass's unexpired lock — and a retry then rolls the lifecycle over mid-advance,
+// which is the precise failure the lease exists to prevent. An expired lease is
+// still swept here, so a crashed pass is recovered as before.
+func (s *Store) ReleaseSupersededJobResourceLocksAtGeneration(ctx context.Context, ownerJobID string, atGeneration int64, now time.Time) (released int64, guarded bool, err error) {
 	ownerJobID = strings.TrimSpace(ownerJobID)
 	if ownerJobID == "" {
 		return 0, false, nil
@@ -344,7 +435,7 @@ func (s *Store) ReleaseSupersededJobResourceLocksAtGeneration(ctx context.Contex
 			WHERE jobs.id = ?
 			  AND jobs.lifecycle_generation = ?
 			  AND jobs.state IN ('cancelled', 'failed')
-		  )`, ownerJobID, ownerJobID, atGeneration)
+		  )`+excludeLiveAdvanceLockSQL, ownerJobID, ownerJobID, atGeneration, formatResourceLockTime(now))
 	if err != nil {
 		return 0, false, err
 	}

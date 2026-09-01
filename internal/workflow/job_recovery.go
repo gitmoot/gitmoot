@@ -428,7 +428,7 @@ func releaseAbortedJobResources(ctx context.Context, store *db.Store, job db.Job
 	// makes the existing TTL-based reaper release happen sooner: the same brief
 	// same-session window already exists when a long-running job's lock TTL lapses
 	// while its runtime is still in flight, and abandoning the job signals intent.
-	_, _ = store.DeleteResourceLocksByOwner(ctx, job.ID)
+	_, _ = store.DeleteResourceLocksByOwner(ctx, job.ID, time.Now().UTC())
 	releaseAbortedJobSideResources(ctx, store, job, cause)
 }
 
@@ -446,7 +446,7 @@ func releaseAbortedJobResources(ctx context.Context, store *db.Store, job db.Job
 // guarded false means the row moved: the branch, task-lane and worktree cleanups
 // all belong to the abort of THAT run, and another run owns the row now.
 func releaseSupersededJobResourcesAtGeneration(ctx context.Context, store *db.Store, job db.Job, cause abortCause, atGeneration int64) (bool, error) {
-	_, guarded, err := store.ReleaseSupersededJobResourceLocksAtGeneration(ctx, job.ID, atGeneration)
+	_, guarded, err := store.ReleaseSupersededJobResourceLocksAtGeneration(ctx, job.ID, atGeneration, time.Now().UTC())
 	if err != nil || !guarded {
 		return false, err
 	}
@@ -982,15 +982,22 @@ type supersedeAdvanceAnchor struct {
 	Token   string
 }
 
-// renewSupersedeAdvanceLease extends this pass's ownership lease and reports loss
-// of ownership as a rolled-back advance — the same class the generation barrier
-// raises, because the consequence is identical: no effect may follow.
 func (e Engine) renewSupersedeAdvanceLease(ctx context.Context) error {
 	anchor := e.supersedeAdvance
 	if anchor == nil || strings.TrimSpace(anchor.LockKey) == "" || strings.TrimSpace(anchor.Token) == "" {
 		return nil
 	}
-	renewed, err := e.Store.HeartbeatResourceLock(ctx, anchor.LockKey, anchor.Token, time.Now().UTC().Add(SupersedeAdvanceLeaseTTL))
+	now := time.Now().UTC()
+	// The renewal predicate requires the lease to be STILL UNEXPIRED and the job to
+	// be STILL on the granted generation. Once an expired lease let a retry commit
+	// N+1, this token is permanently dead: it must renew zero rows, and every later
+	// barrier and effect fails closed rather than resurrecting it.
+	renewed, err := e.Store.RenewAdvanceOwnershipLease(ctx, db.AdvanceOwnership{
+		LockKey:      anchor.LockKey,
+		OwnerToken:   anchor.Token,
+		OwnerJobID:   anchor.JobID,
+		AtGeneration: anchor.Generation,
+	}, now.Add(SupersedeAdvanceLeaseTTL), now)
 	if err != nil {
 		return err
 	}

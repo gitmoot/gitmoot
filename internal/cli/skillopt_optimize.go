@@ -1197,7 +1197,7 @@ func recoverSkillOptTrainGenerationLock(ctx context.Context, paths config.Paths,
 		// crashed holder) and emit an audit event — there is no
 		// ForceReleaseLockWithEvent for resource locks, so the event is emitted
 		// manually.
-		released, err := store.DeleteResourceLocksByOwner(ctx, strings.TrimSpace(lock.OwnerJobID))
+		released, err := store.DeleteResourceLocksByOwner(ctx, strings.TrimSpace(lock.OwnerJobID), time.Now().UTC())
 		if err != nil {
 			return result, err
 		}

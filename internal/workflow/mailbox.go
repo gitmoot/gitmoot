@@ -38,6 +38,12 @@ type Mailbox struct {
 	// returns an explicit typed exclusion. It is private so production callers
 	// cannot recreate the old optional-field failure with a keyed struct literal.
 	resolveDeliveryWorktree DeliveryWorktreeResolver
+	// advanceOwnership, when set, binds every job this mailbox inserts to a live
+	// supersession advance lease: the insert carries the ownership predicate in its
+	// OWN transaction, so a lease lost between the decision and the write refuses
+	// the enqueue instead of minting a job for a lifecycle that has moved (#1673).
+	// Nil on every ordinary path, which is byte-identical to before.
+	advanceOwnership *db.AdvanceOwnership
 	// CollectChangeSet is the P2a host-import seam. A non-local backend wires a
 	// collector here once it owns an instance lifecycle (P2b); nil preserves the
 	// local backend byte-for-byte. It is consulted once after the delivery sequence
@@ -602,6 +608,11 @@ type JobPayload struct {
 	ResumedSelfDirtyWorktree bool `json:"resumed_self_dirty_worktree,omitempty"`
 }
 
+// enqueuePreWriteHook fires between an anchored enqueue's ownership renewal and its
+// insert — the only window a pre-write check cannot cover, and the reason the
+// binding is asserted inside the insert's transaction (#1673). Nil in production.
+var enqueuePreWriteHook func(ctx context.Context, jobID string)
+
 type DeliveryAdapter interface {
 	Deliver(ctx context.Context, agent runtime.Agent, job runtime.Job) (runtime.Result, error)
 }
@@ -767,7 +778,20 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 	if err != nil {
 		return db.Job{}, err
 	}
-	if err := m.store.CreateJobWithEvent(ctx, job, db.JobEvent{JobID: job.ID, Kind: string(JobQueued), Message: "job queued"}, request.RequiredEvents...); err != nil {
+	queuedEvent := db.JobEvent{JobID: job.ID, Kind: string(JobQueued), Message: "job queued"}
+	if m.advanceOwnership != nil {
+		// enqueuePreWriteHook occupies the ONE window a pre-write ownership check
+		// cannot cover: between that check and this insert. Nil in production.
+		if enqueuePreWriteHook != nil {
+			enqueuePreWriteHook(ctx, job.ID)
+		}
+		// The ownership predicate and the INSERT commit together, which is why the
+		// hook above cannot smuggle an effect through: a lease lost in that window
+		// makes the insert's own transaction refuse.
+		if err := m.store.CreateJobWithEventIfAdvanceOwned(ctx, job, *m.advanceOwnership, time.Now().UTC(), queuedEvent, request.RequiredEvents...); err != nil {
+			return db.Job{}, err
+		}
+	} else if err := m.store.CreateJobWithEvent(ctx, job, queuedEvent, request.RequiredEvents...); err != nil {
 		return db.Job{}, err
 	}
 	if autolabeled {

@@ -73,7 +73,7 @@ func TestReleaseSupersededJobResourceLocksAtGenerationSurvivesACrossStoreRetry(t
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			released, guarded, releaseErr = recovery.ReleaseSupersededJobResourceLocksAtGeneration(ctx, jobID, claimed.LifecycleGeneration)
+			released, guarded, releaseErr = recovery.ReleaseSupersededJobResourceLocksAtGeneration(ctx, jobID, claimed.LifecycleGeneration, time.Now().UTC())
 		}()
 		go func() {
 			defer wg.Done()
@@ -160,7 +160,7 @@ func TestReleaseSupersededJobResourceLocksAtGenerationRefusesAnAlreadyRequeuedRo
 		t.Fatalf("AcquireResourceLock acquired=%v err=%v", locked, err)
 	}
 
-	released, guarded, err := store.ReleaseSupersededJobResourceLocksAtGeneration(ctx, jobID, claimed.LifecycleGeneration)
+	released, guarded, err := store.ReleaseSupersededJobResourceLocksAtGeneration(ctx, jobID, claimed.LifecycleGeneration, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("ReleaseSupersededJobResourceLocksAtGeneration: %v", err)
 	}

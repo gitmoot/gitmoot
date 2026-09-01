@@ -144,75 +144,73 @@ func TestAbandonedAdvanceOwnershipStopsBlockingRetries(t *testing.T) {
 
 // TestAdvanceLeaseIsRenewedThroughASlowAdvance is the LEASE-EXPIRY half of the
 // class, driven through the production entry point. The lease is short on purpose,
-// so a slow advance must survive by RENEWING rather than by being given a bigger
-// budget: the hook expires the lease from underneath a running advance at the first
-// barrier, exactly as a slow allocation outliving one window would, and the advance
-// must still own the job at the next barrier.
+// so a long advance must survive by RENEWING rather than by being given a bigger
+// budget — and renewal must push ownership BEYOND the window the acquisition
+// granted, which is what makes the short lease safe for slow work.
+//
+// The lease is never expired by hand here: a lapsed lease means a DEAD pass under
+// the corrected semantics, and reviving one is the failure the renewal predicate
+// exists to prevent. What is asserted instead is the observable renewal itself, at
+// every barrier, with a real retry interleaved.
 //
 // MUTATION PROOF: delete the renewSupersedeAdvanceLease call from
-// assertSupersedeAdvanceAnchor and the interleaved retry wins.
+// assertSupersedeAdvanceAnchor and the expiry stops moving.
 func TestAdvanceLeaseIsRenewedThroughASlowAdvance(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	engine := testEngine(store)
-	seedAgent(t, store, "coord", []string{"ask"}, "gitmoot/gitmoot")
-	seedAgent(t, store, "api", []string{"review"}, "gitmoot/gitmoot")
-	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coord", Type: "ask"}, JobPayload{
-		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "coord",
-		Result: &AgentResult{
-			Decision: "approved",
-			Summary:  "fan out",
-			Delegations: []Delegation{
-				{ID: "api", Agent: "api", Action: "review", Prompt: "review api", FailurePolicy: "continue"},
-			},
-		},
-	})
-	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
-		t.Fatalf("AdvanceJob(parent-job): %v", err)
-	}
-	const child = "parent-job/delegation/api"
-	observed := mustJob(t, store, child)
-	if _, err := store.TransitionJobStateWithEventAtGeneration(ctx, child, observed.State, observed.LifecycleGeneration, string(JobFailed),
-		db.JobEvent{JobID: child, Kind: JobEventSupersededPullRequestClosed, Message: "pr closed"}); err != nil {
-		t.Fatalf("supersede: %v", err)
-	}
-	stampSyntheticResult(t, store, child, "superseded")
+	child, observed := seedSupersededDelegationChild(t, store, engine)
 
 	var (
+		expiries     []string
 		retryErr     error
 		retryAttempt bool
-		expired      bool
 	)
 	supersedeAdvanceBarrierHook = func(hookCtx context.Context, at string) {
-		if !expired {
-			// The slow phase: this pass's lease lapses while it is still working.
-			expired = true
-			if _, err := store.HeartbeatResourceLock(hookCtx, db.SupersedeAdvanceLockKeyPrefix+child, advanceOwnerToken(t, store, child), time.Now().UTC().Add(-time.Hour)); err != nil {
-				t.Errorf("expire the live owner's lease: %v", err)
-			}
+		lock, err := store.GetResourceLock(hookCtx, db.SupersedeAdvanceLockKeyPrefix+child)
+		if err != nil {
+			t.Errorf("GetResourceLock at %s: %v", at, err)
 			return
 		}
+		// Recorded BEFORE this barrier's renewal, so consecutive entries show whether
+		// the previous barrier actually extended the lease.
+		expiries = append(expiries, lock.ExpiresAt)
 		if retryAttempt {
 			return
 		}
-		// A retry racing the renewed lease must still lose.
+		// A retry racing a renewed lease must still lose.
 		retryAttempt = true
 		_, retryErr = RetryJob(hookCtx, store, child)
 	}
 	t.Cleanup(func() { supersedeAdvanceBarrierHook = nil })
 
+	granted := time.Now().UTC().Add(SupersedeAdvanceLeaseTTL)
 	advanced, err := engine.advanceSupersededChildAtGeneration(ctx, child, observed.LifecycleGeneration)
 	if err != nil {
 		t.Fatalf("advanceSupersededChildAtGeneration: %v", err)
 	}
 	if !advanced {
-		t.Fatal("a live-but-slow advance was treated as abandoned; the lease was not renewed")
+		t.Fatal("a live advance lost its own lease")
 	}
 	if !retryAttempt {
 		t.Fatal("no retry was interleaved; the test proves nothing")
 	}
 	if retryErr == nil {
-		t.Fatal("a retry won against a renewed lease: an expired-but-live owner lost its advance")
+		t.Fatal("a retry won against a live lease")
+	}
+	if len(expiries) < 2 {
+		t.Fatalf("barriers observed = %d, want at least 2 so renewal is observable", len(expiries))
+	}
+	first, ferr := time.Parse(time.RFC3339Nano, expiries[0])
+	last, lerr := time.Parse(time.RFC3339Nano, expiries[len(expiries)-1])
+	if ferr != nil || lerr != nil {
+		t.Fatalf("parse expiries %q/%q: %v %v", expiries[0], expiries[len(expiries)-1], ferr, lerr)
+	}
+	if !last.After(first) {
+		t.Fatalf("lease expiry did not move across barriers (%s -> %s): a long advance would be reaped mid-flight", expiries[0], expiries[len(expiries)-1])
+	}
+	if !last.After(granted) {
+		t.Fatalf("lease expiry %s never passed the window the acquisition granted (%s): renewal is not extending ownership", last, granted)
 	}
 	if got := countWorkflowJobEvents(t, store, child, JobEventSupersedeAdvanceConfirmed); got != 1 {
 		t.Fatalf("%s events = %d, want 1: the anchored advance did not complete", JobEventSupersedeAdvanceConfirmed, got)

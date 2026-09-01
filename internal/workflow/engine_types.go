@@ -134,6 +134,18 @@ func (e Engine) mailbox() Mailbox {
 	mb.RuntimeDefaultEffort = e.RuntimeDefaultEffort
 	mb.routerContextEnabled = e.RouterContextEnabled
 	mb.resultCheckMode = normalizeResultCheckMode(e.ResultCheckMode)
+	// A supersession recovery's advance runs on a COPY of the engine carrying its
+	// ownership lease. Every mailbox this engine builds inherits it, so the insert
+	// that mints a dependent or a continuation is bound to live ownership at commit
+	// (#1673). Nil on every ordinary path.
+	if e.supersedeAdvance != nil {
+		mb.advanceOwnership = &db.AdvanceOwnership{
+			LockKey:      e.supersedeAdvance.LockKey,
+			OwnerToken:   e.supersedeAdvance.Token,
+			OwnerJobID:   e.supersedeAdvance.JobID,
+			AtGeneration: e.supersedeAdvance.Generation,
+		}
+	}
 	// Session review jobs close through the Mailbox and never run AdvanceJob, so
 	// they need the same repository policy the advancement path uses in order to
 	// record the folded outcome (#1685-adjacent): without it the merge gate folds

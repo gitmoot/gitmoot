@@ -1731,11 +1731,11 @@ func TestDeleteResourceLocksByOwner(t *testing.T) {
 	}
 
 	// Empty owner id is a no-op.
-	if released, err := store.DeleteResourceLocksByOwner(ctx, "  "); err != nil || released != 0 {
+	if released, err := store.DeleteResourceLocksByOwner(ctx, "  ", time.Now().UTC()); err != nil || released != 0 {
 		t.Fatalf("DeleteResourceLocksByOwner(empty) released=%d err=%v, want 0/nil", released, err)
 	}
 
-	released, err := store.DeleteResourceLocksByOwner(ctx, "job-a")
+	released, err := store.DeleteResourceLocksByOwner(ctx, "job-a", time.Now().UTC())
 	if err != nil {
 		t.Fatalf("DeleteResourceLocksByOwner(job-a) returned error: %v", err)
 	}
@@ -1782,14 +1782,14 @@ func TestDeleteResourceLocksByOwnerIfNotRunning(t *testing.T) {
 	}
 
 	// Empty owner id is a no-op.
-	if released, err := store.DeleteResourceLocksByOwnerIfNotRunning(ctx, "  "); err != nil || released != 0 {
+	if released, err := store.DeleteResourceLocksByOwnerIfNotRunning(ctx, "  ", time.Now().UTC()); err != nil || released != 0 {
 		t.Fatalf("DeleteResourceLocksByOwnerIfNotRunning(empty) released=%d err=%v, want 0/nil", released, err)
 	}
 
 	// A RUNNING owner's lock is NOT released: this is the #479 TOCTOU guard. A
 	// child that raced queued->running after a stale snapshot was read keeps its
 	// live runtime-session / checkout lock.
-	if released, err := store.DeleteResourceLocksByOwnerIfNotRunning(ctx, "job-running"); err != nil || released != 0 {
+	if released, err := store.DeleteResourceLocksByOwnerIfNotRunning(ctx, "job-running", time.Now().UTC()); err != nil || released != 0 {
 		t.Fatalf("DeleteResourceLocksByOwnerIfNotRunning(job-running) released=%d err=%v, want 0/nil", released, err)
 	}
 	if _, err := store.GetResourceLock(ctx, "runtime:codex:session-r"); err != nil {
@@ -1797,7 +1797,7 @@ func TestDeleteResourceLocksByOwnerIfNotRunning(t *testing.T) {
 	}
 
 	// A non-running owner's lock IS released.
-	if released, err := store.DeleteResourceLocksByOwnerIfNotRunning(ctx, "job-queued"); err != nil || released != 1 {
+	if released, err := store.DeleteResourceLocksByOwnerIfNotRunning(ctx, "job-queued", time.Now().UTC()); err != nil || released != 1 {
 		t.Fatalf("DeleteResourceLocksByOwnerIfNotRunning(job-queued) released=%d err=%v, want 1/nil", released, err)
 	}
 	if _, err := store.GetResourceLock(ctx, "runtime:codex:session-q"); !errors.Is(err, sql.ErrNoRows) {

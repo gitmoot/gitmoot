@@ -81,8 +81,18 @@ func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent,
 	}
 	defer tx.Rollback()
 
-	// See CreateJob: same COALESCE(NULLIF(?,''), ?) bound to (payload.RootJobID,
-	// job.ID) denormalizes the rootJobID() rule onto the indexed root_id column.
+	if err := createJobWithEventTx(ctx, tx, s, job, event, additionalEvents...); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// createJobWithEventTx is the shared insert body, so the ownership-bound variant
+// below cannot drift from the plain one.
+//
+// See CreateJob: the same COALESCE(NULLIF(?,”), ?) bound to (payload.RootJobID,
+// job.ID) denormalizes the rootJobID() rule onto the indexed root_id column.
+func createJobWithEventTx(ctx context.Context, tx *sql.Tx, s *Store, job Job, event JobEvent, additionalEvents ...JobEvent) error {
 	projection := jobProjectionFromPayload(job.Payload)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, model, result_hash, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
@@ -105,7 +115,36 @@ func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent,
 			return err
 		}
 	}
-	if err := resolveAwaitedReviewFactTx(ctx, tx, job.ID, job.Agent, job.Type, job.State, job.Payload, s.blockingSeverityFor, time.Now().UTC()); err != nil {
+	return resolveAwaitedReviewFactTx(ctx, tx, job.ID, job.Agent, job.Type, job.State, job.Payload, s.blockingSeverityFor, time.Now().UTC())
+}
+
+// ErrAdvanceOwnershipLost is returned when an irreversible write is refused because
+// the supersession advance that requested it no longer owns the job.
+var ErrAdvanceOwnershipLost = errors.New("supersede advance no longer owns this job")
+
+// CreateJobWithEventIfAdvanceOwned is CreateJobWithEvent with live advance ownership
+// asserted INSIDE the insert's own transaction (#1673).
+//
+// Enqueueing a job is irreversible, so the binding cannot be a preceding read or a
+// pre-write heartbeat: the gap between such a check and the insert is exactly where
+// a lease loss or a lifecycle rollover lands. Checking in the transaction that
+// carries the insert means either both the ownership predicate held and the job
+// exists, or neither.
+func (s *Store) CreateJobWithEventIfAdvanceOwned(ctx context.Context, job Job, own AdvanceOwnership, now time.Time, event JobEvent, additionalEvents ...JobEvent) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	live, err := advanceOwnershipLiveTx(ctx, tx, own, now)
+	if err != nil {
+		return err
+	}
+	if !live {
+		return fmt.Errorf("%w: job %s at generation %d", ErrAdvanceOwnershipLost, own.OwnerJobID, own.AtGeneration)
+	}
+	if err := createJobWithEventTx(ctx, tx, s, job, event, additionalEvents...); err != nil {
 		return err
 	}
 	return tx.Commit()
