@@ -145,6 +145,78 @@ func (s *Store) ListResourceLocks(ctx context.Context) ([]ResourceLock, error) {
 	return locks, rows.Err()
 }
 
+// SupersedeAdvanceLockKeyPrefix namespaces the resource lock a supersession
+// recovery holds while it drives a child's parent advance (#1673).
+//
+// The ownership primitive is deliberately the EXISTING resource_locks table
+// rather than a bespoke marker: it already carries an owner token, a renewable
+// lease (HeartbeatResourceLock), an explicit release, and PID/boot identity, so a
+// crashed owner is recovered by the same machinery that recovers a dead runtime
+// session instead of by a fixed timeout nobody can renew.
+const SupersedeAdvanceLockKeyPrefix = "supersede-advance:"
+
+// noLiveSupersedeAdvanceLockSQL excludes a job whose parent advance is OWNED right
+// now. It is a predicate, not a pre-check, so it lands in the same statement as the
+// transition it guards; a pre-check loses to a recovery pass that acquires
+// ownership between the caller's read and its write.
+//
+// Ownership is honoured only while the lease is unexpired, which is what makes an
+// abandoned owner recoverable — and the owner renews that lease for as long as its
+// advance is genuinely running, so a slow-but-live advance never lapses.
+const noLiveSupersedeAdvanceLockSQL = ` AND NOT EXISTS (
+			SELECT 1 FROM resource_locks advance
+			WHERE advance.resource_key = '` + SupersedeAdvanceLockKeyPrefix + `' || jobs.id
+			  AND advance.expires_at > ?
+		)`
+
+// AdvanceOwnershipHeld reports whether resourceKey is held by ownerToken with an
+// unexpired lease. Effect commits use it INSIDE their own transaction, so an
+// irreversible parent effect can only land while its advance still owns the job.
+func advanceOwnershipHeldTx(ctx context.Context, tx *sql.Tx, resourceKey string, ownerToken string, now time.Time) (bool, error) {
+	resourceKey = strings.TrimSpace(resourceKey)
+	ownerToken = strings.TrimSpace(ownerToken)
+	if resourceKey == "" || ownerToken == "" {
+		return false, nil
+	}
+	var held int
+	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM resource_locks
+		WHERE resource_key = ? AND owner_token = ? AND expires_at > ?`,
+		resourceKey, ownerToken, formatResourceLockTime(now)).Scan(&held)
+	if err != nil {
+		return false, err
+	}
+	return held > 0, nil
+}
+
+// AdvanceOwnershipHeld is the non-transactional read used by renewal checks and by
+// tests. The authoritative check for a WRITE is advanceOwnershipHeldTx inside that
+// write's own transaction.
+func (s *Store) AdvanceOwnershipHeld(ctx context.Context, resourceKey string, ownerToken string, now time.Time) (bool, error) {
+	var held int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM resource_locks
+		WHERE resource_key = ? AND owner_token = ? AND expires_at > ?`,
+		strings.TrimSpace(resourceKey), strings.TrimSpace(ownerToken), formatResourceLockTime(now)).Scan(&held)
+	if err != nil {
+		return false, err
+	}
+	return held > 0, nil
+}
+
+// advanceOwnershipHeldAnyTokenTx answers "is this job's advance owned by ANYONE
+// right now", which is how a losing retry distinguishes "ownership refused me"
+// from "my state CAS simply did not match". It runs in the caller's transaction so
+// the answer belongs to the same snapshot as the failed write.
+func advanceOwnershipHeldAnyTokenTx(ctx context.Context, tx *sql.Tx, resourceKey string, now time.Time) (bool, error) {
+	var held int
+	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM resource_locks
+		WHERE resource_key = ? AND expires_at > ?`,
+		strings.TrimSpace(resourceKey), formatResourceLockTime(now)).Scan(&held)
+	if err != nil {
+		return false, err
+	}
+	return held > 0, nil
+}
+
 func (s *Store) ListExpiredRuntimeSessionLocks(ctx context.Context, now time.Time) ([]ResourceLock, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT resource_key, owner_job_id, owner_token, owner_pid, owner_hostname, command_hash, acquired_at, updated_at, expires_at
 		FROM resource_locks

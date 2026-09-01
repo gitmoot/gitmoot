@@ -3,10 +3,10 @@ package workflow
 import "strconv"
 
 const (
-	OrgDirectivePrefix       = "[org:directive "
-	OrgDirectiveAckPrefix    = "[org:directive-ack "
-	OrgDirectiveCancelPrefix = "[org:directive-cancel "
-	OrgDirectiveDonePrefix   = "[org:directive-done "
+	OrgDirectivePrefix          = "[org:directive "
+	OrgDirectiveAckPrefix       = "[org:directive-ack "
+	OrgDirectiveCancelPrefix    = "[org:directive-cancel "
+	OrgDirectiveDonePrefix      = "[org:directive-done "
 	OrgDirectiveExhaustedPrefix = "[org:directive-exhausted "
 )
 

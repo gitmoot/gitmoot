@@ -56,7 +56,13 @@ var jobStateWriteAllowlist = map[string]int{
 	// since that decision wins instead of being finalized by the stale verdict. It
 	// carries bumpLifecycleGenerationSQL too, so a claim that is also a re-queue
 	// advances the counter exactly like every other writer.
-	"internal/db/store_jobs.go": 11,
+	//
+	// The twelfth (TransitionJobStatePayloadWithEventUnlessAdvanceOwned, #1673) is the
+	// retry arm carrying the advance-ownership exclusion in its own statement: claim
+	// absence and the terminal-to-queued transition commit together, because a
+	// pre-check loses to a recovery pass that takes ownership in between. It bumps the
+	// generation exactly like every other writer.
+	"internal/db/store_jobs.go": 12,
 }
 
 // TestEveryJobStateWriteBumpsTheLifecycleGeneration enforces the seam #1407's design rests on.

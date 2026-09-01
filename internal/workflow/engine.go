@@ -414,6 +414,11 @@ func (e Engine) block(ctx context.Context, ref taskRef, reason string) error {
 	return e.blockTask(ctx, ref, "workflow_blocked", reason, "workflow")
 }
 
+// blockTaskPreWriteHook fires between blockTask's state pre-read and its guarded
+// write, and between the dirty-worktree block's read and write. It is the seam a
+// concurrent merge occupies in production; nil outside tests.
+var blockTaskPreWriteHook func(ctx context.Context, taskID string)
+
 // blockTask is the single task-blocking choke point. Every durable block
 // atomically writes the state and the event that owns it. A stale state
 // observation or failed attribution write commits neither half.
@@ -434,6 +439,11 @@ func (e Engine) blockTask(ctx context.Context, ref taskRef, kind string, reason 
 	if err == nil {
 		fromState = current.State
 	}
+	// blockTaskPreWriteHook is the only place a test can land a merge in the exact
+	// post-read/pre-write seam this classification exists for. Nil in production.
+	if blockTaskPreWriteHook != nil {
+		blockTaskPreWriteHook(ctx, task.ID)
+	}
 	blocked, err := e.Store.BlockTaskWithEvent(ctx, task, db.TaskEvent{
 		Kind:      kind,
 		FromState: fromState,
@@ -444,17 +454,29 @@ func (e Engine) blockTask(ctx context.Context, ref taskRef, kind string, reason 
 		// dead leg's block_parent must still RELEASE its coordinator. The store's
 		// atomic guard refuses the write — which is right — but turning that refusal
 		// into a hard error would fail the whole poll and strand the coordinator the
-		// sweep exists to free. Record the durable trace and return the DAG's own
-		// BlockedError instead: what the caller then observes is exactly "child
-		// failed and finalized, parent advanced, task still merged".
-		if errors.Is(err, db.ErrTaskStateConflict) && fromState == string(TaskMerged) {
-			_ = e.Store.AddTaskEvent(ctx, db.TaskEvent{
-				TaskID: task.ID,
-				Kind:   TaskEventMergedRegressionRefused,
-				Reason: fmt.Sprintf("refused %s -> %s: the pull request already merged, so the landed-work record is kept; the %s advance that requested it continues",
-					TaskMerged, TaskBlocked, label),
-			})
-			return blockErr
+		// sweep exists to free.
+		//
+		// The classification reads the WINNING state, not the pre-read: the pre-read is
+		// exactly the value the guard proved stale, so a merge that lands in the
+		// post-read/pre-write seam would be classified from a state that no longer
+		// exists and hard-fail the poll. Genuinely incompatible non-merged winners
+		// still hard-error.
+		if errors.Is(err, db.ErrTaskStateConflict) {
+			winner := fromState
+			if latest, getErr := e.Store.GetTask(ctx, task.ID); getErr == nil {
+				winner = latest.State
+			} else if !errors.Is(getErr, sql.ErrNoRows) {
+				return fmt.Errorf("record %s block for task %s: %w", label, task.ID, err)
+			}
+			if winner == string(TaskMerged) {
+				_ = e.Store.AddTaskEvent(ctx, db.TaskEvent{
+					TaskID: task.ID,
+					Kind:   TaskEventMergedRegressionRefused,
+					Reason: fmt.Sprintf("refused %s -> %s: the pull request already merged, so the landed-work record is kept; the %s advance that requested it continues",
+						TaskMerged, TaskBlocked, label),
+				})
+				return blockErr
+			}
 		}
 		return fmt.Errorf("record %s block for task %s: %w", label, task.ID, err)
 	}

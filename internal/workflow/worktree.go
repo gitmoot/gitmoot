@@ -1795,24 +1795,33 @@ func blockTaskForDirtyWorktree(ctx context.Context, store *db.Store, task db.Tas
 		task.Title = request.TaskTitle
 	}
 	blockErr := BlockedError{Reason: reason}
+	if blockTaskPreWriteHook != nil {
+		blockTaskPreWriteHook(ctx, task.ID)
+	}
 	blocked, err := store.BlockTaskWithEvent(ctx, task, db.TaskEvent{
 		Kind:      "stale_worktree_dirty_blocked",
 		FromState: fromState,
 		Reason:    reason,
 	})
 	if err != nil {
-		// #1673, same rule as Engine.blockTask: a task whose pull request already
-		// MERGED keeps that record, and the caller still gets a BlockedError so the
-		// dirty checkout is preserved and the allocation fails closed. Only the
-		// LANDED-WORK refusal is folded this way; every other conflict is a real error.
-		if errors.Is(err, db.ErrTaskStateConflict) && fromState == string(TaskMerged) {
-			_ = store.AddTaskEvent(ctx, db.TaskEvent{
-				TaskID: task.ID,
-				Kind:   TaskEventMergedRegressionRefused,
-				Reason: fmt.Sprintf("refused %s -> %s: the pull request already merged, so the landed-work record is kept; the dirty worktree at %s is preserved",
-					TaskMerged, TaskBlocked, path),
-			})
-			return blockErr
+		// #1673, same rule as Engine.blockTask, and classified the same way: from the
+		// WINNING state, never the pre-read the guard just proved stale. A merge that
+		// lands in the post-read/pre-write seam is still the landed-work refusal; every
+		// other conflict remains a real error.
+		if errors.Is(err, db.ErrTaskStateConflict) {
+			winner := fromState
+			if latest, getErr := store.GetTask(ctx, task.ID); getErr == nil {
+				winner = latest.State
+			}
+			if winner == string(TaskMerged) {
+				_ = store.AddTaskEvent(ctx, db.TaskEvent{
+					TaskID: task.ID,
+					Kind:   TaskEventMergedRegressionRefused,
+					Reason: fmt.Sprintf("refused %s -> %s: the pull request already merged, so the landed-work record is kept; the dirty worktree at %s is preserved",
+						TaskMerged, TaskBlocked, path),
+				})
+				return blockErr
+			}
 		}
 		if !blocked {
 			return err

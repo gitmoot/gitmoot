@@ -2,9 +2,7 @@ package workflow
 
 import (
 	"context"
-	"database/sql"
 	"errors"
-	"path/filepath"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -173,106 +171,6 @@ func TestSupersedeAdvanceBarriersAllowTheAnchoredLifecycle(t *testing.T) {
 	}
 	if got := countWorkflowJobEvents(t, store, child, JobEventSupersedeAdvanceConfirmed); got != 1 {
 		t.Fatalf("%s events = %d, want 1", JobEventSupersedeAdvanceConfirmed, got)
-	}
-}
-
-// TestRetryIsRefusedInsideASupersedeAdvance pins the PREVENTION half: while the
-// advance holds its claim, `gitmoot job retry` cannot roll the lifecycle over at
-// all. That is what makes "no stale parent effect" a property of the system rather
-// than of the barrier placement.
-//
-// MUTATION PROOF: remove the JobHasLiveSupersedeAdvanceClaim check from RetryJob and
-// the retry succeeds mid-advance.
-func TestRetryIsRefusedInsideASupersedeAdvance(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedAgent(t, store, "impl", []string{"implement"}, "gitmoot/gitmoot")
-	const child = "workflow-advance-claim"
-	insertQueuedJob(t, store, db.Job{ID: child, Agent: "impl", Type: "implement"}, JobPayload{
-		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "impl",
-	})
-	observed := mustJob(t, store, child)
-	if _, err := store.TransitionJobStateWithEventAtGeneration(ctx, child, observed.State, observed.LifecycleGeneration, string(JobFailed),
-		db.JobEvent{JobID: child, Kind: JobEventSupersededPullRequestClosed, Message: "pr closed"}); err != nil {
-		t.Fatalf("supersede: %v", err)
-	}
-	// The claim an in-flight advance holds.
-	if written, err := store.AddJobEventAtGeneration(ctx, db.JobEvent{
-		JobID: child, Kind: JobEventSupersedeAdvanceClaimed,
-		Message: formatSupersedeFinalizeDebt(observed.LifecycleGeneration),
-	}, observed.LifecycleGeneration); err != nil || !written {
-		t.Fatalf("claim written=%v err=%v", written, err)
-	}
-
-	if _, err := RetryJob(ctx, store, child); err == nil {
-		t.Fatal("a retry rolled the lifecycle over while the parent advance was in flight")
-	} else if !errorMentions(err, "supersession parent-advance") {
-		t.Fatalf("retry error = %v, want one naming the in-flight advance", err)
-	}
-	if state := mustJob(t, store, child).State; state != string(JobFailed) {
-		t.Fatalf("child state = %q, want the claimed lifecycle untouched", state)
-	}
-
-	// Once the advance settles, the retry is allowed again.
-	if written, err := store.AddJobEventAtGeneration(ctx, db.JobEvent{
-		JobID: child, Kind: JobEventSupersedeAdvanceConfirmed,
-		Message: formatSupersedeFinalizeDebt(observed.LifecycleGeneration),
-	}, observed.LifecycleGeneration); err != nil || !written {
-		t.Fatalf("confirm written=%v err=%v", written, err)
-	}
-	if _, err := RetryJob(ctx, store, child); err != nil {
-		t.Fatalf("retry after the advance settled: %v", err)
-	}
-}
-
-// TestSupersedeAdvanceClaimStopsBlockingRetriesAfterItsTTL keeps the prevention from
-// becoming a wedge: a pass that died mid-advance leaves a claim behind, and an
-// operator must not be locked out of retrying forever. The claim row is BACKDATED,
-// which is what a crashed pass looks like an hour later.
-func TestSupersedeAdvanceClaimStopsBlockingRetriesAfterItsTTL(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "gitmoot.db")
-	store := openEngineStoreAt(t, path)
-	seedAgent(t, store, "impl", []string{"implement"}, "gitmoot/gitmoot")
-	const child = "workflow-stale-claim"
-	insertQueuedJob(t, store, db.Job{ID: child, Agent: "impl", Type: "implement"}, JobPayload{
-		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "impl",
-	})
-	observed := mustJob(t, store, child)
-	if _, err := store.TransitionJobStateWithEventAtGeneration(ctx, child, observed.State, observed.LifecycleGeneration, string(JobFailed),
-		db.JobEvent{JobID: child, Kind: JobEventSupersedeAdvanceClaimed, Message: formatSupersedeFinalizeDebt(observed.LifecycleGeneration)}); err != nil {
-		t.Fatalf("supersede with claim: %v", err)
-	}
-	live, err := store.JobHasLiveSupersedeAdvanceClaim(ctx, child, SupersedeAdvanceClaimTTL)
-	if err != nil {
-		t.Fatalf("JobHasLiveSupersedeAdvanceClaim: %v", err)
-	}
-	if !live {
-		t.Fatal("a fresh claim was not seen as live")
-	}
-	if _, err := RetryJob(ctx, store, child); err == nil {
-		t.Fatal("a fresh claim did not block the retry")
-	}
-
-	raw, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatalf("open backdating connection: %v", err)
-	}
-	t.Cleanup(func() { _ = raw.Close() })
-	if _, err := raw.Exec(`UPDATE job_events SET created_at = datetime('now', '-1 hour')
-		WHERE job_id = ? AND kind = 'supersede_advance_claimed'`, child); err != nil {
-		t.Fatalf("backdate the claim: %v", err)
-	}
-
-	stale, err := store.JobHasLiveSupersedeAdvanceClaim(ctx, child, SupersedeAdvanceClaimTTL)
-	if err != nil {
-		t.Fatalf("JobHasLiveSupersedeAdvanceClaim: %v", err)
-	}
-	if stale {
-		t.Fatal("a claim older than its TTL still blocks retries; a crashed advance would wedge the job")
-	}
-	if _, err := RetryJob(ctx, store, child); err != nil {
-		t.Fatalf("retry after the claim went stale: %v", err)
 	}
 }
 

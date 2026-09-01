@@ -369,6 +369,13 @@ func (e Engine) enqueue(ctx context.Context, request JobRequest) error {
 	if request.ID == "" {
 		request.ID = e.jobID(request)
 	}
+	// An enqueue is irreversible, so it is bound to advance ownership immediately
+	// before it happens rather than at the barrier that decided it (#1673). A pass
+	// that has lost ownership aborts here instead of minting a job for a lifecycle
+	// that no longer exists; ordinary callers carry no anchor and are unaffected.
+	if err := e.renewSupersedeAdvanceLease(ctx); err != nil {
+		return err
+	}
 	_, err := e.mailbox().Enqueue(ctx, request)
 	if err == nil {
 		return nil

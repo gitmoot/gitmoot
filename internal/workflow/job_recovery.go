@@ -54,12 +54,12 @@ const JobEventSupersededStaleHead = "superseded_stale_head"
 // row is camouflage that inflates every queue-depth check forever.
 const JobEventSupersededPullRequestClosed = "superseded_pr_closed"
 
-// SupersedeAdvanceClaimTTL bounds how long a supersession parent-advance claim
-// blocks a retry. It exists so a crashed or killed recovery pass cannot wedge
-// `gitmoot job retry` forever: past the TTL the claim is ignored, and the next poll
-// re-claims before advancing again. Sized well above a normal advance (which is a
-// handful of local statements) and well below a poll interval's operator patience.
-const SupersedeAdvanceClaimTTL = 2 * time.Minute
+// SupersedeAdvanceLeaseTTL is how far ahead the advance's OWNERSHIP LEASE is set,
+// and renewed. It is not a budget for the whole advance: the owner renews at every
+// barrier and before every slow phase, so a legitimately slow allocation, fetch or
+// enqueue never lapses mid-flight. Its only job is to bound how long an ABANDONED
+// owner — a pass that was killed — can block a retry, which is why it is short.
+const SupersedeAdvanceLeaseTTL = 2 * time.Minute
 
 func RetryJob(ctx context.Context, store *db.Store, jobID string) (db.Job, error) {
 	if store == nil {
@@ -95,15 +95,11 @@ func RetryJob(ctx context.Context, store *db.Store, jobID string) (db.Job, error
 	// A supersession recovery's parent-advance CRITICAL SECTION is the one window in
 	// which a re-queue is destructive rather than merely racy: AdvanceJob emits
 	// irreversible parent effects (a failure policy applied, a dependent enqueued, a
-	// continuation minted), and none of them can be taken back once the lifecycle
-	// they were computed from is gone. So the rollover is PREVENTED here rather than
-	// detected downstream. The claim is bounded in age, so a crashed advance releases
-	// retries by itself instead of wedging them.
-	if live, err := store.JobHasLiveSupersedeAdvanceClaim(ctx, job.ID, SupersedeAdvanceClaimTTL); err != nil {
-		return db.Job{}, err
-	} else if live {
-		return db.Job{}, fmt.Errorf("job %s is inside a supersession parent-advance; retry once it settles", job.ID)
-	}
+	// continuation minted), and none can be taken back once the lifecycle they were
+	// computed from is gone. The exclusion therefore rides in the SAME statement as
+	// the terminal-to-queued transition below — BOTH arms — rather than being read
+	// here, because a recovery pass can take ownership between a pre-check and the
+	// write.
 	payload, err := unmarshalPayload(job.Payload)
 	if err != nil {
 		return db.Job{}, err
@@ -133,19 +129,26 @@ func RetryJob(ctx context.Context, store *db.Store, jobID string) (db.Job, error
 		Message: fmt.Sprintf("retry requested from %s", job.State),
 	}
 	transitioned := false
-	if task, ok, err := dismissedTaskForJob(ctx, store, payload); err != nil {
-		return db.Job{}, err
-	} else if ok {
+	// NOT `if task, ok, err := ...`: that form SHADOWS err, so an error from either
+	// transition below was assigned to the inner variable and never returned — the
+	// caller saw the generic "retry requires failed, blocked, or cancelled" message
+	// instead of the real refusal. The advance-ownership refusal has to reach the
+	// operator verbatim, so the lookup gets its own statement.
+	task, hasDismissedTask, lookupErr := dismissedTaskForJob(ctx, store, payload)
+	if lookupErr != nil {
+		return db.Job{}, lookupErr
+	}
+	if hasDismissedTask {
 		taskState := string(TaskPlanned)
 		if job.Type == "implement" && strings.TrimSpace(payload.Branch) != "" && strings.TrimSpace(payload.WorktreePath) != "" {
 			taskState = string(TaskImplementing)
 		}
 		transitioned, err = store.TransitionJobStatePayloadWithEventAndTaskTransition(ctx,
-			job.ID, job.State, string(JobQueued), encoded, retryEvent,
+			job.ID, job.State, string(JobQueued), encoded, time.Now().UTC(), retryEvent,
 			task.ID, string(TaskDismissed), taskState, "task_recovered_job_retry",
 			fmt.Sprintf("restored dismissed task before retrying job %s", job.ID))
 	} else {
-		transitioned, err = store.TransitionJobStatePayloadWithEvent(ctx, job.ID, job.State, string(JobQueued), encoded, retryEvent)
+		transitioned, err = store.TransitionJobStatePayloadWithEventUnlessAdvanceOwned(ctx, job.ID, job.State, string(JobQueued), encoded, time.Now().UTC(), retryEvent)
 	}
 	if err != nil {
 		return db.Job{}, err
@@ -946,6 +949,14 @@ func (e Engine) assertSupersedeAdvanceAnchor(ctx context.Context, barrier string
 	if supersedeAdvanceBarrierHook != nil {
 		supersedeAdvanceBarrierHook(ctx, barrier)
 	}
+	// RENEW BEFORE CHECKING, at every barrier. The lease is short so an abandoned
+	// owner unblocks retries quickly; renewing here is what keeps a slow BUT LIVE
+	// advance from being treated as abandoned while it is still working. A renewal
+	// that fails means this pass no longer owns the advance, so the barrier aborts
+	// before the effect it guards rather than acting without ownership.
+	if err := e.renewSupersedeAdvanceLease(ctx); err != nil {
+		return err
+	}
 	current, err := e.Store.GetJob(ctx, e.supersedeAdvance.JobID)
 	if err != nil {
 		return err
@@ -964,6 +975,29 @@ func (e Engine) assertSupersedeAdvanceAnchor(ctx context.Context, barrier string
 type supersedeAdvanceAnchor struct {
 	JobID      string
 	Generation int64
+	// LockKey and Token identify the ownership lease this pass holds. Every
+	// irreversible parent effect renews and re-verifies them, so an effect can only
+	// land while this pass still owns the advance.
+	LockKey string
+	Token   string
+}
+
+// renewSupersedeAdvanceLease extends this pass's ownership lease and reports loss
+// of ownership as a rolled-back advance — the same class the generation barrier
+// raises, because the consequence is identical: no effect may follow.
+func (e Engine) renewSupersedeAdvanceLease(ctx context.Context) error {
+	anchor := e.supersedeAdvance
+	if anchor == nil || strings.TrimSpace(anchor.LockKey) == "" || strings.TrimSpace(anchor.Token) == "" {
+		return nil
+	}
+	renewed, err := e.Store.HeartbeatResourceLock(ctx, anchor.LockKey, anchor.Token, time.Now().UTC().Add(SupersedeAdvanceLeaseTTL))
+	if err != nil {
+		return err
+	}
+	if !renewed {
+		return supersedeAdvanceRolledBackError{JobID: anchor.JobID, Generation: anchor.Generation, Barrier: "ownership-lease"}
+	}
+	return nil
 }
 
 // supersedeAdvanceBarrierHook is a test seam that fires AT each barrier, which is
@@ -1143,6 +1177,32 @@ func (e Engine) advanceSupersededChildAtGeneration(ctx context.Context, jobID st
 	if supersedeDebtInterleaveHook != nil {
 		supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeAdvanceClaim)
 	}
+	// OWNERSHIP FIRST, and it is a renewable lease rather than an age-bounded
+	// marker: RetryJob's exclusion predicate reads this lock, so taking it here is
+	// what makes the retry refusal atomic with the transition rather than advisory.
+	// An owner that is genuinely working renews it; only a dead owner lets it lapse.
+	lockKey := db.SupersedeAdvanceLockKeyPrefix + jobID
+	token := fmt.Sprintf("supersede-advance-%s-%d-%d", jobID, generation, time.Now().UTC().UnixNano())
+	now := time.Now().UTC()
+	owned, err := e.Store.AcquireResourceLock(ctx, db.ResourceLock{
+		ResourceKey: lockKey,
+		OwnerJobID:  jobID,
+		OwnerToken:  token,
+		ExpiresAt:   now.Add(SupersedeAdvanceLeaseTTL).Format(time.RFC3339Nano),
+	}, now)
+	if err != nil {
+		return false, err
+	}
+	if !owned {
+		// Another pass owns this advance right now. Not an error: the debt stays
+		// outstanding and the owner either finishes it or its lease lapses.
+		return false, nil
+	}
+	defer func() {
+		// Release explicitly on EVERY exit, so a finished advance stops blocking
+		// retries immediately instead of waiting out a lease.
+		_, _ = e.Store.ReleaseResourceLock(ctx, lockKey, jobID, token)
+	}()
 	claimed, err := e.Store.AddJobEventAtGeneration(ctx, db.JobEvent{
 		JobID:   jobID,
 		Kind:    JobEventSupersedeAdvanceClaimed,
@@ -1155,11 +1215,11 @@ func (e Engine) advanceSupersededChildAtGeneration(ctx context.Context, jobID st
 		supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeAdvance)
 	}
 	// The advance runs on a COPY of the engine carrying the anchor, so every
-	// parent-effect class inside advanceDelegations re-asserts the child's lifecycle
-	// immediately before it acts. Prevention, not detection: an aborted barrier
-	// returns before the effect it guards.
+	// parent-effect class inside advanceDelegations renews ownership and re-asserts
+	// the child's lifecycle immediately before it acts. Prevention, not detection: an
+	// aborted barrier returns before the effect it guards.
 	anchored := e
-	anchored.supersedeAdvance = &supersedeAdvanceAnchor{JobID: jobID, Generation: generation}
+	anchored.supersedeAdvance = &supersedeAdvanceAnchor{JobID: jobID, Generation: generation, LockKey: lockKey, Token: token}
 	advanceErr := anchored.AdvanceJob(ctx, jobID)
 	var rolledBack supersedeAdvanceRolledBackError
 	if errors.As(advanceErr, &rolledBack) {

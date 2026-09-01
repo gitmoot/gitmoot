@@ -944,6 +944,65 @@ func (s *Store) ListRunningJobIDsFromForeignBoot(ctx context.Context, currentBoo
 	return ids, rows.Err()
 }
 
+// ErrSupersedeAdvanceOwned is returned when a retry loses the ownership predicate:
+// a supersession recovery owns this job's parent advance right now, and re-queueing
+// it would roll the lifecycle over mid-advance.
+var ErrSupersedeAdvanceOwned = errors.New("supersession parent-advance owns this job")
+
+// TransitionJobStatePayloadWithEventUnlessAdvanceOwned is
+// TransitionJobStatePayloadWithEvent with the advance-ownership exclusion in the
+// SAME statement. RetryJob uses it so claim absence and the terminal-to-queued
+// transition commit together; a separate pre-check loses to a recovery pass that
+// acquires ownership in between.
+func (s *Store) TransitionJobStatePayloadWithEventUnlessAdvanceOwned(ctx context.Context, id string, from string, to string, payload string, now time.Time, event JobEvent, extraEvents ...JobEvent) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	projection := jobProjectionFromPayload(payload)
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ? AND state = ? AND workflow_id = ?`+noLiveSupersedeAdvanceLockSQL,
+		to, to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+		projection.BlockerSuggestedAction, id, from, projection.WorkflowID, formatResourceLockTime(now))
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		if err := rejectWorkflowIDMismatch(ctx, tx, id, projection.WorkflowID); err != nil {
+			return false, err
+		}
+		owned, ownErr := advanceOwnershipHeldAnyTokenTx(ctx, tx, SupersedeAdvanceLockKeyPrefix+id, now)
+		if ownErr != nil {
+			return false, ownErr
+		}
+		if owned {
+			return false, fmt.Errorf("%w: job %s", ErrSupersedeAdvanceOwned, id)
+		}
+		return false, tx.Commit()
+	}
+	if event.JobID == "" {
+		event.JobID = id
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+		return false, err
+	}
+	for _, extra := range extraEvents {
+		if extra.JobID == "" {
+			extra.JobID = id
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, extra.JobID, extra.Kind, extra.Message); err != nil {
+			return false, err
+		}
+	}
+	return true, tx.Commit()
+}
+
 func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id string, from string, to string, payload string, event JobEvent, extraEvents ...JobEvent) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1054,7 +1113,11 @@ func (s *Store) TransitionJobStatePayloadUsageWithEvent(ctx context.Context, id 
 // TransitionJobStatePayloadWithEventAndTaskTransition is the retry path's
 // cross-row transaction: a dismissed task is explicitly recovered before its
 // job is re-queued, and either both lifecycle events commit or neither does.
-func (s *Store) TransitionJobStatePayloadWithEventAndTaskTransition(ctx context.Context, id string, from string, to string, payload string, event JobEvent, taskID string, taskFrom string, taskTo string, taskKind string, taskReason string) (bool, error) {
+// now is required because the job transition carries the advance-ownership
+// exclusion in its own statement: this arm re-queues exactly like the plain one,
+// so it must refuse for the same reason (#1673) rather than being the hole the
+// other arm's guard leaves open.
+func (s *Store) TransitionJobStatePayloadWithEventAndTaskTransition(ctx context.Context, id string, from string, to string, payload string, now time.Time, event JobEvent, taskID string, taskFrom string, taskTo string, taskKind string, taskReason string) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -1083,9 +1146,10 @@ func (s *Store) TransitionJobStatePayloadWithEventAndTaskTransition(ctx context.
 	}
 
 	projection := jobProjectionFromPayload(payload)
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND workflow_id = ?`,
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ? AND state = ? AND workflow_id = ?`+noLiveSupersedeAdvanceLockSQL,
 		to, to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
-		projection.BlockerSuggestedAction, id, from, projection.WorkflowID)
+		projection.BlockerSuggestedAction, id, from, projection.WorkflowID, formatResourceLockTime(now))
 	if err != nil {
 		return false, err
 	}
@@ -1096,6 +1160,13 @@ func (s *Store) TransitionJobStatePayloadWithEventAndTaskTransition(ctx context.
 	if affected == 0 {
 		if err := rejectWorkflowIDMismatch(ctx, tx, id, projection.WorkflowID); err != nil {
 			return false, err
+		}
+		owned, ownErr := advanceOwnershipHeldAnyTokenTx(ctx, tx, SupersedeAdvanceLockKeyPrefix+id, now)
+		if ownErr != nil {
+			return false, ownErr
+		}
+		if owned {
+			return false, fmt.Errorf("%w: job %s", ErrSupersedeAdvanceOwned, id)
 		}
 		return false, nil
 	}
@@ -2081,40 +2152,6 @@ func (s *Store) AddJobEventAtGeneration(ctx context.Context, event JobEvent, atG
 		return false, err
 	}
 	return affected == 1, nil
-}
-
-// JobHasLiveSupersedeAdvanceClaim reports whether a job is inside a supersession
-// recovery's parent-advance critical section: its latest advance-bracket event is a
-// CLAIM, with no confirmation or superseded trace after it, and that claim is
-// younger than within.
-//
-// RetryJob consults it so a re-queue cannot roll the lifecycle over WHILE
-// AdvanceJob is emitting irreversible parent effects (#1673). Prevention beats
-// detection here: a failure policy applied, a dependent enqueued or a continuation
-// minted from a superseded run cannot be undone.
-//
-// The staleness bound is what keeps a crashed advance from wedging retries forever:
-// a claim older than within is ignored, and the pass that owns it re-claims on its
-// next poll.
-func (s *Store) JobHasLiveSupersedeAdvanceClaim(ctx context.Context, jobID string, within time.Duration) (bool, error) {
-	jobID = strings.TrimSpace(jobID)
-	if jobID == "" || within <= 0 {
-		return false, nil
-	}
-	var live int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM job_events claim
-		WHERE claim.job_id = ?
-		  AND claim.kind = 'supersede_advance_claimed'
-		  AND claim.id = (
-			SELECT MAX(id) FROM job_events latest
-			WHERE latest.job_id = ?
-			  AND latest.kind IN ('supersede_advance_claimed', 'supersede_advance_confirmed', 'supersede_advance_superseded')
-		  )
-		  AND unixepoch(claim.created_at) >= unixepoch('now') - ?`, jobID, jobID, int64(within.Seconds())).Scan(&live)
-	if err != nil {
-		return false, err
-	}
-	return live > 0, nil
 }
 
 // JobIDsWithOpenEscalation returns the IDs of coordinator jobs with an OPEN
