@@ -289,7 +289,17 @@ func sanitizePipelineProofJobs(jobs []db.Job, results map[string]*workflow.Agent
 		result := results[job.ID]
 		var safe *workflow.AgentResult
 		if result != nil {
-			safe = &workflow.AgentResult{Decision: result.Decision, Findings: make([]json.RawMessage, len(result.Findings))}
+			// FanOut is a CLASSIFICATION, not a payload: it names what the row is
+			// without exposing a single executable delegation instruction, so it is
+			// safe to publish and unsafe to drop. In the production pipeline shape
+			// Mailbox.Run has already removed Delegations and only this flag
+			// survives — omitting it here made the public manifest project and
+			// render a coordinator announcement as an approved review (#1685).
+			safe = &workflow.AgentResult{
+				Decision: result.Decision,
+				FanOut:   result.FanOut,
+				Findings: make([]json.RawMessage, len(result.Findings)),
+			}
 			for _, delegation := range result.Delegations {
 				safe.Delegations = append(safe.Delegations, workflow.Delegation{
 					ID: delegation.ID, Deps: append([]string(nil), delegation.Deps...),
