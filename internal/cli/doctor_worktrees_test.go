@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -213,6 +215,62 @@ func TestInspectDelegationWorktreeUsageBoundsLogicalSizeScan(t *testing.T) {
 	}
 	if check := buildDelegationWorktreeDoctorCheck(usage); check.OK {
 		t.Fatalf("doctor check = %+v, want a truncated scan to warn", check)
+	}
+}
+
+type recordingWorktreeDirectoryReader struct {
+	entry        fs.DirEntry
+	remaining    int
+	maxRequested int
+}
+
+func (r *recordingWorktreeDirectoryReader) ReadDir(n int) ([]fs.DirEntry, error) {
+	if n <= 0 {
+		return nil, fmt.Errorf("unbounded ReadDir request: %d", n)
+	}
+	r.maxRequested = max(r.maxRequested, n)
+	count := min(n, r.remaining)
+	if count == 0 {
+		return nil, io.EOF
+	}
+	entries := make([]fs.DirEntry, count)
+	for i := range entries {
+		entries[i] = r.entry
+	}
+	r.remaining -= count
+	return entries, nil
+}
+
+func TestReadWorktreeDirectoryBatchesNeverEagerlyReadsWholeDirectory(t *testing.T) {
+	fixture := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fixture, "entry"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := &recordingWorktreeDirectoryReader{
+		entry:     entries[0],
+		remaining: delegationWorktreeSizeEntryLimit + 1,
+	}
+	remaining := delegationWorktreeSizeEntryLimit
+	visited := 0
+	truncated, stopped, err := readWorktreeDirectoryBatches(context.Background(), reader, &remaining, func(fs.DirEntry) bool {
+		visited++
+		return true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !truncated || stopped {
+		t.Fatalf("truncated = %v, stopped = %v, want hard-budget truncation", truncated, stopped)
+	}
+	if visited != delegationWorktreeSizeEntryLimit {
+		t.Fatalf("visited = %d, want exactly %d budgeted entries", visited, delegationWorktreeSizeEntryLimit)
+	}
+	if reader.maxRequested > delegationWorktreeReadBatchSize {
+		t.Fatalf("largest ReadDir request = %d, want at most %d", reader.maxRequested, delegationWorktreeReadBatchSize)
 	}
 }
 

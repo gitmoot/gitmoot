@@ -2,7 +2,9 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -22,6 +24,7 @@ const (
 	delegationWorktreeTrackedPathLimit    = 4096
 	delegationWorktreeDiscoveryEntryLimit = 4096
 	delegationWorktreeSizeEntryLimit      = 4096
+	delegationWorktreeReadBatchSize       = 128
 )
 
 type delegationWorktreeUsage struct {
@@ -128,47 +131,37 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 	// The FIXES arm is structural rather than job-driven: interrupted pre-enqueue
 	// allocation has no job row by definition. A single global entry budget bounds
 	// doctor and /api/health even when the host tree is attacker-controlled.
-	discovered := 0
-	walkErr := filepath.WalkDir(root, func(path string, entry fs.DirEntry, entryErr error) error {
-		if ctx.Err() != nil {
-			return fs.SkipAll
-		}
-		if entryErr != nil {
-			usage.Truncated = true
-			return nil
-		}
-		if path == root {
-			return nil
-		}
-		discovered++
-		if discovered > delegationWorktreeDiscoveryEntryLimit {
-			usage.Truncated = true
-			return fs.SkipAll
-		}
+	discoveryEntriesRemaining := delegationWorktreeDiscoveryEntryLimit
+	scanTruncated, scanErr := walkWorktreeDirectoriesBatched(ctx, root, &discoveryEntriesRemaining, func(path string, entry fs.DirEntry) (descend, stop bool) {
 		rel, err := filepath.Rel(root, path)
 		if err != nil {
 			usage.Truncated = true
-			return nil
+			return false, false
 		}
 		parts := strings.Split(rel, string(filepath.Separator))
-		isDelegationRoot := len(parts) == 4 && parts[1] == "delegations"
-		isFixRoot := len(parts) == 3 && parts[1] == "fixes"
-		if !isDelegationRoot && !isFixRoot {
-			return nil
-		}
-		if entry.IsDir() {
-			if len(pathsOnDisk) >= delegationWorktreeTrackedPathLimit {
-				usage.Truncated = true
-				return fs.SkipAll
+		switch {
+		case len(parts) == 1:
+			return entry.IsDir(), false
+		case len(parts) == 2 && (parts[1] == "delegations" || parts[1] == "fixes"):
+			return entry.IsDir(), false
+		case len(parts) == 3 && parts[1] == "delegations":
+			return entry.IsDir(), false
+		case len(parts) == 4 && parts[1] == "delegations", len(parts) == 3 && parts[1] == "fixes":
+			if entry.IsDir() {
+				if len(pathsOnDisk) >= delegationWorktreeTrackedPathLimit {
+					usage.Truncated = true
+					return false, true
+				}
+				pathsOnDisk[path] = struct{}{}
+			} else {
+				unprovenEntries[path] = struct{}{}
 			}
-			pathsOnDisk[path] = struct{}{}
-			return filepath.SkipDir
 		}
-		unprovenEntries[path] = struct{}{}
-		return nil
+		return false, false
 	})
-	if walkErr != nil && !os.IsNotExist(walkErr) {
-		usage.Truncated = true
+	usage.Truncated = usage.Truncated || scanTruncated
+	if scanErr != nil {
+		return usage, scanErr
 	}
 	if ctx.Err() != nil {
 		return usage, ctx.Err()
@@ -243,37 +236,106 @@ func worktreePathUnderRoot(root, candidate string) (string, bool) {
 	return filepath.Clean(path), true
 }
 
-func directoryLogicalSize(ctx context.Context, root string, remaining *int) (int64, bool) {
-	var total int64
-	truncated := false
-	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if ctx.Err() != nil {
-			truncated = true
-			return fs.SkipAll
-		}
-		if walkErr != nil {
-			truncated = true
-			return nil
+type worktreeDirectoryBatchReader interface {
+	ReadDir(n int) ([]fs.DirEntry, error)
+}
+
+func readWorktreeDirectoryBatches(ctx context.Context, reader worktreeDirectoryBatchReader, remaining *int, visit func(fs.DirEntry) bool) (truncated, stopped bool, err error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return false, true, err
 		}
 		if *remaining <= 0 {
-			truncated = true
-			return fs.SkipAll
+			entries, readErr := reader.ReadDir(1)
+			switch {
+			case len(entries) > 0:
+				return true, false, nil
+			case readErr == nil:
+				continue
+			case errors.Is(readErr, io.EOF):
+				return false, false, nil
+			default:
+				return true, false, nil
+			}
 		}
-		*remaining--
+		batchSize := min(delegationWorktreeReadBatchSize, *remaining)
+		entries, readErr := reader.ReadDir(batchSize)
+		for _, entry := range entries {
+			*remaining = *remaining - 1
+			if !visit(entry) {
+				return false, true, nil
+			}
+		}
+		switch {
+		case readErr == nil:
+		case errors.Is(readErr, io.EOF):
+			return false, false, nil
+		default:
+			return true, false, nil
+		}
+	}
+}
+
+func walkWorktreeDirectoriesBatched(ctx context.Context, root string, remaining *int, visit func(path string, entry fs.DirEntry) (descend, stop bool)) (bool, error) {
+	directories := []string{root}
+	truncated := false
+	for len(directories) > 0 {
+		if err := ctx.Err(); err != nil {
+			return true, err
+		}
+		last := len(directories) - 1
+		directory := directories[last]
+		directories = directories[:last]
+		handle, err := os.Open(directory)
+		if err != nil {
+			if directory != root || !os.IsNotExist(err) {
+				truncated = true
+			}
+			continue
+		}
+		var children []string
+		batchTruncated, stopped, readErr := readWorktreeDirectoryBatches(ctx, handle, remaining, func(entry fs.DirEntry) bool {
+			path := filepath.Join(directory, entry.Name())
+			descend, stop := visit(path, entry)
+			if descend && entry.IsDir() {
+				children = append(children, path)
+			}
+			return !stop
+		})
+		if closeErr := handle.Close(); closeErr != nil {
+			truncated = true
+		}
+		truncated = truncated || batchTruncated
+		if readErr != nil {
+			return true, readErr
+		}
+		if stopped {
+			return truncated, nil
+		}
+		directories = append(directories, children...)
+	}
+	return truncated, nil
+}
+
+func directoryLogicalSize(ctx context.Context, root string, remaining *int) (int64, bool) {
+	if *remaining <= 0 {
+		return 0, true
+	}
+	*remaining--
+	var total int64
+	metadataTruncated := false
+	truncated, err := walkWorktreeDirectoriesBatched(ctx, root, remaining, func(_ string, entry fs.DirEntry) (bool, bool) {
 		if entry.IsDir() {
-			return nil
+			return true, false
 		}
 		if info, infoErr := entry.Info(); infoErr == nil {
 			total += info.Size()
 		} else {
-			truncated = true
+			metadataTruncated = true
 		}
-		return nil
+		return false, false
 	})
-	if err != nil {
-		truncated = true
-	}
-	return total, truncated
+	return total, metadataTruncated || truncated || err != nil
 }
 
 func formatWorktreeBytes(size int64) string {
