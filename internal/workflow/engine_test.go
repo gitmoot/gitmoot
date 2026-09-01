@@ -2233,12 +2233,137 @@ func TestEngineAdvanceReviewChangesRequestedFailsClosedWithoutOwnership(t *testi
 	}
 	found := false
 	for _, event := range events {
-		if event.Kind == "review_auto_fix_blocked" && strings.Contains(event.Reason, "ownership unresolved") {
+		if event.Kind == "review_auto_fix_blocked" &&
+			event.ToState == string(TaskBlocked) &&
+			strings.Contains(event.Reason, "ownership unresolved") {
 			found = true
 		}
 	}
 	if !found {
 		t.Fatalf("task events = %+v, want review_auto_fix_blocked ownership event", events)
+	}
+}
+
+func TestEngineFailedResultWritesCurrentBlockOwnership(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	insertCompletedJob(t, store, db.Job{ID: "failed-result", Agent: "worker", Type: "ask"}, JobPayload{
+		Repo:      "gitmoot/gitmoot",
+		Branch:    "task-8",
+		TaskID:    "task-8",
+		TaskTitle: "Failed result",
+		Result:    &AgentResult{Decision: "failed", Summary: "production failure"},
+	})
+
+	err := engine.AdvanceJob(ctx, "failed-result")
+	var blocked BlockedError
+	if !errors.As(err, &blocked) {
+		t.Fatalf("AdvanceJob error = %v, want BlockedError", err)
+	}
+	assertTaskState(t, store, "task-8", TaskBlocked)
+	events, err := store.ListTaskEvents(ctx, "task-8")
+	if err != nil {
+		t.Fatalf("ListTaskEvents: %v", err)
+	}
+	if len(events) != 1 || events[0].Kind != "workflow_blocked" ||
+		events[0].ToState != string(TaskBlocked) ||
+		events[0].Reason != "production failure" {
+		t.Fatalf("task events = %+v, want current workflow_blocked ownership", events)
+	}
+}
+
+func TestHandlePullRequestReadyToMergeWritesMergeGateBlockOwnership(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	engine := testEngine(store)
+	expectedState := ""
+	engine.MergeGate = &fakeMergeGate{
+		decision: MergeDecision{
+			Ready: false, Reason: PlainReason("dirty worktree"), BlockClass: MergeBlockTransient,
+		},
+		onEvaluate: func(request MergeRequest) {
+			expectedState = request.ExpectedTaskState
+		},
+	}
+
+	err := engine.HandlePullRequestReadyToMerge(ctx, PullRequestEvent{
+		Repo: "gitmoot/gitmoot", Branch: "task-9", PullRequest: 9,
+		HeadSHA: "head-9", TaskID: "task-9", LeadAgent: "lead",
+	})
+	var blocked BlockedError
+	if !errors.As(err, &blocked) {
+		t.Fatalf("HandlePullRequestReadyToMerge error = %v, want BlockedError", err)
+	}
+	if expectedState != string(TaskReadyToMerge) {
+		t.Fatalf("merge request expected state = %q, want ready_to_merge", expectedState)
+	}
+	assertTaskState(t, store, "task-9", TaskBlocked)
+	events, err := store.ListTaskEvents(ctx, "task-9")
+	if err != nil {
+		t.Fatalf("ListTaskEvents: %v", err)
+	}
+	if len(events) != 1 || events[0].Kind != "merge_gate_blocked" ||
+		events[0].ToState != string(TaskBlocked) {
+		t.Fatalf("task events = %+v, want merge_gate_blocked ownership", events)
+	}
+}
+
+// The block state and its owner are one transaction. If ownership persistence
+// fails, neither half commits and callers receive the store error rather than a
+// false durable BlockedError.
+func TestMergeGateAttributionFailureRollsBackBlockedState(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-10", RepoFullName: "gitmoot/gitmoot", Branch: "task-10",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.ExecContext(ctx, `
+CREATE TRIGGER fail_merge_gate_block_attribution
+BEFORE INSERT ON task_events
+WHEN NEW.kind = 'merge_gate_blocked'
+BEGIN
+	SELECT RAISE(ABORT, 'forced merge gate attribution failure');
+END`); err != nil {
+		t.Fatal(err)
+	}
+	engine := testEngine(store)
+	engine.MergeGate = &fakeMergeGate{decision: MergeDecision{
+		Ready: false, Reason: PlainReason("dirty worktree"), BlockClass: MergeBlockTransient,
+	}}
+
+	err = engine.HandlePullRequestReadyToMerge(ctx, PullRequestEvent{
+		Repo: "gitmoot/gitmoot", Branch: "task-10", PullRequest: 10,
+		HeadSHA: "head-10", TaskID: "task-10", LeadAgent: "lead",
+	})
+	var blocked BlockedError
+	if errors.As(err, &blocked) {
+		t.Fatalf("error = %v, must not claim a durable block", err)
+	}
+	if !strings.Contains(err.Error(), "forced merge gate attribution failure") {
+		t.Fatalf("error = %v, want attribution store failure", err)
+	}
+	assertTaskState(t, store, "task-10", TaskReadyToMerge)
+	events, listErr := store.ListTaskEvents(ctx, "task-10")
+	if listErr != nil {
+		t.Fatalf("ListTaskEvents: %v", listErr)
+	}
+	if len(events) != 0 {
+		t.Fatalf("task events = %+v, want atomic rollback", events)
 	}
 }
 
@@ -5493,6 +5618,19 @@ func TestEngineDelegationSynthesisRuleVoteBlocksOnFailure(t *testing.T) {
 		t.Fatal("vote failure must not enqueue the continuation")
 	}
 	assertTaskState(t, store, "task-5", TaskBlocked)
+	events, err := store.ListTaskEvents(ctx, "task-5")
+	if err != nil {
+		t.Fatalf("ListTaskEvents: %v", err)
+	}
+	found := false
+	for _, event := range events {
+		if event.Kind == "delegation_vote_unmet" && event.ToState == string(TaskBlocked) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("task events = %+v, want delegation_vote_unmet blocked ownership event", events)
+	}
 }
 
 func TestEngineDelegationSynthesisRuleVotePassesWhenAllApproved(t *testing.T) {

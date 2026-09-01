@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/reviewseverity"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
 
 func insertIndependentMergeGateReview(t *testing.T, store *db.Store, reviewJob db.Job, reviewPayload JobPayload) {
@@ -341,6 +344,483 @@ func TestPolicyMergeGateMergesPassingPullRequest(t *testing.T) {
 	}
 }
 
+func TestPolicyMergeGateFencesReadyStateThroughExternalMerge(t *testing.T) {
+	ctx := context.Background()
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-job", agent: "audit", decision: "approved", hasResult: true,
+	})
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request.Reviewer = "audit"
+	request.ExpectedTaskState = string(TaskReadyToMerge)
+	writer, err := db.OpenAlreadyMigrated(store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	var blocked bool
+	var blockErr error
+	gh.beforeMerge = func() {
+		blocked, blockErr = writer.BlockTaskWithEvent(ctx, db.Task{
+			ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+			State: string(TaskBlocked),
+		}, db.TaskEvent{
+			Kind: "workflow_blocked", FromState: string(TaskReadyToMerge),
+			Reason: "concurrent production block",
+		})
+	}
+	decision, err := gate.Evaluate(ctx, request)
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.Merged || len(gh.merges) != 1 {
+		t.Fatalf("decision=%+v merges=%d, want one completed external merge", decision, len(gh.merges))
+	}
+	if blocked || !errors.Is(blockErr, db.ErrTaskStateClaimed) {
+		t.Fatalf("concurrent block = blocked %v err %v, want durable claim conflict", blocked, blockErr)
+	}
+	task, taskErr := store.GetTask(ctx, "task-9")
+	events, eventsErr := store.ListTaskEvents(ctx, "task-9")
+	if taskErr != nil || eventsErr != nil || task.State != string(TaskMerged) {
+		t.Fatalf("task=%+v events=%+v taskErr=%v eventsErr=%v", task, events, taskErr, eventsErr)
+	}
+	for _, event := range events {
+		if event.Kind == "workflow_blocked" {
+			t.Fatalf("events=%+v, concurrent block must not commit after merge claim", events)
+		}
+	}
+}
+
+func TestPolicyMergeGateRetainsClaimAcrossAmbiguousPostMergeConfirmation(t *testing.T) {
+	const helperPathEnv = "GITMOOT_AMBIGUOUS_MERGE_CLAIM_HELPER_PATH"
+	ctx := context.Background()
+	if path := os.Getenv(helperPathEnv); path != "" {
+		writer, err := db.OpenAlreadyMigrated(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer writer.Close()
+		changed, _, err := writer.DisposeTask(ctx, "task-9", []string{string(TaskReadyToMerge)},
+			string(TaskDismissed), "stale", "cross-process ambiguous-outcome disposal", "", "task_disposed", time.Now())
+		if err == nil || changed || !strings.Contains(err.Error(), "claimed for an external merge") {
+			t.Fatalf("cross-process disposal = changed %v err %v, want retained-claim rejection", changed, err)
+		}
+		return
+	}
+
+	store, base, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-job", agent: "audit", decision: "approved", hasResult: true,
+	})
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request.Reviewer = "audit"
+	request.ExpectedTaskState = string(TaskReadyToMerge)
+	base.getPullRequest = func(call int) (github.PullRequest, error) {
+		if call == 2 {
+			return github.PullRequest{}, errors.New("secondary confirmation unavailable")
+		}
+		return base.pr, nil
+	}
+	runner := &mergeConfirmationFailureRunner{onMerge: func() {
+		base.pr.State = "closed"
+		base.pr.Merged = true
+		base.pr.MergeSHA = "merge-ambiguous"
+	}}
+	composed := &productionMergeGateGitHub{
+		fakeMergeGateGitHub: base,
+		mergeClient:         github.GhClient{Runner: runner},
+	}
+	gate.GitHub = composed
+
+	decision, err := gate.Evaluate(ctx, request)
+	if err == nil || !strings.Contains(err.Error(), "durable task ownership retained") {
+		t.Fatalf("first Evaluate decision=%+v err=%v, want retained ambiguous outcome", decision, err)
+	}
+	if runner.calls != 2 || len(composed.merges) != 1 {
+		t.Fatalf("production adapter calls=%d merge attempts=%d, want one command plus failed confirmation", runner.calls, len(composed.merges))
+	}
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestPolicyMergeGateRetainsClaimAcrossAmbiguousPostMergeConfirmation$")
+	cmd.Env = append(os.Environ(), helperPathEnv+"="+store.DatabasePath())
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("cross-process ambiguous-outcome writer: %v\n%s", err, output)
+	}
+
+	decision, err = gate.Evaluate(ctx, request)
+	if err != nil || !decision.Merged || decision.MergeCommitSHA != "merge-ambiguous" {
+		t.Fatalf("reconciliation decision=%+v err=%v, want recovered remote merge", decision, err)
+	}
+	task, taskErr := store.GetTask(ctx, "task-9")
+	if taskErr != nil || task.State != string(TaskMerged) {
+		t.Fatalf("task=%+v err=%v, want merged after reconciliation", task, taskErr)
+	}
+	if len(composed.merges) != 1 {
+		t.Fatalf("merge attempts=%d, reconciliation must not issue a second merge", len(composed.merges))
+	}
+}
+
+func TestPolicyMergeGateRetainsClaimForAcceptedQueuedMerge(t *testing.T) {
+	ctx := context.Background()
+	store, base, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-job", agent: "audit", decision: "approved", hasResult: true,
+	})
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := db.OpenAlreadyMigrated(store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	request.Reviewer = "audit"
+	request.ExpectedTaskState = string(TaskReadyToMerge)
+	runner := &queuedMergeRunner{}
+	composed := &productionMergeGateGitHub{
+		fakeMergeGateGitHub: base,
+		mergeClient:         github.GhClient{Runner: runner},
+	}
+	gate.GitHub = composed
+
+	decision, err := gate.Evaluate(ctx, request)
+	if err != nil || !decision.Ready || decision.Merged || !strings.Contains(decision.Reason.Render(), "pending") {
+		t.Fatalf("queued Evaluate decision=%+v err=%v, want accepted pending merge", decision, err)
+	}
+	if runner.calls != 2 || len(composed.merges) != 1 {
+		t.Fatalf("production adapter calls=%d merge attempts=%d, want one accepted command and open-state confirmation",
+			runner.calls, len(composed.merges))
+	}
+	changed, _, writeErr := writer.DisposeTask(ctx, "task-9", []string{string(TaskReadyToMerge)},
+		string(TaskDismissed), "stale", "queued merge disposal", "", "task_disposed", time.Now())
+	if writeErr == nil || changed || !strings.Contains(writeErr.Error(), "claimed for an external merge") {
+		t.Fatalf("conflicting queued-merge disposal = changed %v err %v, want durable claim rejection", changed, writeErr)
+	}
+
+	base.pr.State = "closed"
+	base.pr.Merged = true
+	base.pr.MergeSHA = "merge-completed-from-queue"
+	decision, err = gate.Evaluate(ctx, request)
+	if err != nil || !decision.Merged || decision.MergeCommitSHA != "merge-completed-from-queue" {
+		t.Fatalf("queued reconciliation decision=%+v err=%v, want recovered merge", decision, err)
+	}
+	task, taskErr := store.GetTask(ctx, "task-9")
+	if taskErr != nil || task.State != string(TaskMerged) {
+		t.Fatalf("task=%+v err=%v, want merged after queued reconciliation", task, taskErr)
+	}
+	if len(composed.merges) != 1 {
+		t.Fatalf("merge attempts=%d, reconciliation must not issue a second merge", len(composed.merges))
+	}
+}
+
+func TestPolicyMergeGateRetainsFailedMergeWhileRemoteOpenUntilClosure(t *testing.T) {
+	ctx := context.Background()
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-job", agent: "audit", decision: "approved", hasResult: true,
+	})
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := db.OpenAlreadyMigrated(store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	request.Reviewer = "audit"
+	request.ExpectedTaskState = string(TaskReadyToMerge)
+	gh.mergeErr = errors.New("merge command failed after submission")
+
+	decision, err := gate.Evaluate(ctx, request)
+	if err == nil || !strings.Contains(err.Error(), "pull request remains open") ||
+		!strings.Contains(err.Error(), "durable task ownership retained") {
+		t.Fatalf("open confirmation decision=%+v err=%v, want retained unresolved merge", decision, err)
+	}
+	changed, _, writeErr := writer.DisposeTask(ctx, "task-9", []string{string(TaskReadyToMerge)},
+		string(TaskDismissed), "stale", "open merge disposal", "", "task_disposed", time.Now())
+	if writeErr == nil || changed || !strings.Contains(writeErr.Error(), "claimed for an external merge") {
+		t.Fatalf("conflicting open-merge disposal = changed %v err %v, want durable claim rejection", changed, writeErr)
+	}
+
+	gh.pr.State = "closed"
+	decision, err = gate.Evaluate(ctx, request)
+	if err != nil || !strings.Contains(decision.Reason.Render(), "closed without being merged") {
+		t.Fatalf("closed reconciliation decision=%+v err=%v, want terminal non-merge block", decision, err)
+	}
+	changed, current, writeErr := writer.DisposeTask(ctx, "task-9", []string{string(TaskReadyToMerge)},
+		string(TaskDismissed), "stale", "terminal non-merge disposal", "", "task_disposed", time.Now())
+	if writeErr != nil || !changed || current != string(TaskDismissed) {
+		t.Fatalf("terminal non-merge disposal = changed %v current %q err %v, want released claim", changed, current, writeErr)
+	}
+}
+
+func TestPolicyMergeGateCompletesClaimWhenPostErrorConfirmationShowsMerged(t *testing.T) {
+	ctx := context.Background()
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-job", agent: "audit", decision: "approved", hasResult: true,
+	})
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request.Reviewer = "audit"
+	request.ExpectedTaskState = string(TaskReadyToMerge)
+	gh.mergeErr = errors.New("fetch merged pull request: HTTP 502")
+	gh.beforeMerge = func() {
+		gh.pr.State = "closed"
+		gh.pr.Merged = true
+		gh.pr.MergeSHA = "merge-confirmed-after-error"
+	}
+
+	decision, err := gate.Evaluate(ctx, request)
+	if err != nil || !decision.Merged || decision.MergeCommitSHA != "merge-confirmed-after-error" {
+		t.Fatalf("Evaluate decision=%+v err=%v, want authoritative post-error merge completion", decision, err)
+	}
+	task, taskErr := store.GetTask(ctx, "task-9")
+	if taskErr != nil || task.State != string(TaskMerged) {
+		t.Fatalf("task=%+v err=%v, want merged claim completion", task, taskErr)
+	}
+}
+
+func TestPolicyMergeGateRenewsClaimBeyondLeaseAcrossProcess(t *testing.T) {
+	const helperPathEnv = "GITMOOT_RENEWED_MERGE_CLAIM_HELPER_PATH"
+	ctx := context.Background()
+	if path := os.Getenv(helperPathEnv); path != "" {
+		writer, err := db.OpenAlreadyMigrated(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer writer.Close()
+		changed, _, err := writer.DisposeTask(ctx, "task-9", []string{string(TaskReadyToMerge)},
+			string(TaskDismissed), "stale", "cross-process lease-expiry disposal", "", "task_disposed", time.Now())
+		if err == nil || changed || !strings.Contains(err.Error(), "claimed for an external merge") {
+			t.Fatalf("cross-process disposal = changed %v err %v, want renewed-claim rejection", changed, err)
+		}
+		return
+	}
+
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-job", agent: "audit", decision: "approved", hasResult: true,
+	})
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request.Reviewer = "audit"
+	request.ExpectedTaskState = string(TaskReadyToMerge)
+	mergeStarted := make(chan struct{})
+	allowMerge := make(chan struct{})
+	gh.beforeMerge = func() {
+		close(mergeStarted)
+		<-allowMerge
+	}
+	ticks := make(chan time.Time)
+	renewed := make(chan struct{}, 1)
+	gate.taskClaimTTL = 4 * time.Second
+	gate.taskClaimRenewalInterval = 2 * time.Second
+	gate.taskClaimRenewalTicks = func(context.Context, time.Duration) <-chan time.Time {
+		return ticks
+	}
+	gate.afterTaskClaimRenewal = func() {
+		renewed <- struct{}{}
+	}
+	type evaluateResult struct {
+		decision MergeDecision
+		err      error
+	}
+	evaluated := make(chan evaluateResult, 1)
+	go func() {
+		decision, err := gate.Evaluate(ctx, request)
+		evaluated <- evaluateResult{decision: decision, err: err}
+	}()
+	select {
+	case <-mergeStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("merge did not reach the production external-call boundary")
+	}
+	time.Sleep(2100 * time.Millisecond)
+	ticks <- time.Now()
+	select {
+	case <-renewed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("durable claim renewal did not complete")
+	}
+	time.Sleep(2100 * time.Millisecond)
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestPolicyMergeGateRenewsClaimBeyondLeaseAcrossProcess$")
+	cmd.Env = append(os.Environ(), helperPathEnv+"="+store.DatabasePath())
+	if output, err := cmd.CombinedOutput(); err != nil {
+		close(allowMerge)
+		t.Fatalf("cross-process lease-expiry writer: %v\n%s", err, output)
+	}
+	close(allowMerge)
+	result := <-evaluated
+	if result.err != nil || !result.decision.Merged {
+		t.Fatalf("Evaluate decision=%+v err=%v, want successful merge after lease renewal", result.decision, result.err)
+	}
+	task, taskErr := store.GetTask(ctx, "task-9")
+	if taskErr != nil || task.State != string(TaskMerged) {
+		t.Fatalf("task=%+v err=%v, want merged after renewed in-flight claim", task, taskErr)
+	}
+}
+
+func TestHandlePullRequestOpenedFencesNoReviewerMergeFromPROpenState(t *testing.T) {
+	ctx := context.Background()
+	store, gh, gate, _ := newMergeGateQuorumScenario(t)
+	seedAgent(t, store, "implementer", []string{"implement"}, "gitmoot/gitmoot")
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-job", agent: "audit", decision: "approved", hasResult: true,
+	})
+	writer, err := db.OpenAlreadyMigrated(store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	var blocked bool
+	var blockErr error
+	gate.Git.(*fakeMergeGateGit).onClean = func() {
+		blocked, blockErr = writer.BlockTaskWithEvent(ctx, db.Task{
+			ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+			State: string(TaskBlocked),
+		}, db.TaskEvent{
+			Kind: "workflow_blocked", FromState: string(TaskPullRequestOpen),
+			Reason: "concurrent PR-open block",
+		})
+	}
+	engine := testEngine(store)
+	engine.MergeGate = gate
+
+	err = engine.HandlePullRequestOpened(ctx, PullRequestEvent{
+		Repo: "gitmoot/gitmoot", Branch: "task-9", PullRequest: 9,
+		HeadSHA: "head123", TaskID: "task-9", LeadAgent: "implementer",
+	})
+	if !errors.Is(err, ErrMergeTaskStateChanged) {
+		t.Fatalf("HandlePullRequestOpened error = %v, want PR-open state fence conflict", err)
+	}
+	if !blocked || blockErr != nil {
+		t.Fatalf("concurrent block = blocked %v err %v, want committed PR-open block", blocked, blockErr)
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("external merges = %d, want none after PR-open state changed", len(gh.merges))
+	}
+	task, taskErr := store.GetTask(ctx, "task-9")
+	if taskErr != nil || task.State != string(TaskBlocked) {
+		t.Fatalf("task=%+v err=%v, want blocked", task, taskErr)
+	}
+}
+
+func TestAdvanceApprovedReviewFencesMergeFromReviewingState(t *testing.T) {
+	ctx := context.Background()
+	store, gh, gate, _ := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-job", agent: "audit", decision: "approved", hasResult: true,
+	})
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReviewing),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := db.OpenAlreadyMigrated(store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	var blocked bool
+	var blockErr error
+	gate.Git.(*fakeMergeGateGit).onClean = func() {
+		blocked, blockErr = writer.BlockTaskWithEvent(ctx, db.Task{
+			ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+			State: string(TaskBlocked),
+		}, db.TaskEvent{
+			Kind: "workflow_blocked", FromState: string(TaskReviewing),
+			Reason: "concurrent review completion block",
+		})
+	}
+	engine := testEngine(store)
+	engine.MergeGate = gate
+
+	err = engine.AdvanceJob(ctx, "review-job")
+	if !errors.Is(err, ErrMergeTaskStateChanged) {
+		t.Fatalf("AdvanceJob error = %v, want reviewing-state fence conflict", err)
+	}
+	if !blocked || blockErr != nil {
+		t.Fatalf("concurrent block = blocked %v err %v, want committed reviewing block", blocked, blockErr)
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("external merges = %d, want none after reviewing state changed", len(gh.merges))
+	}
+	task, taskErr := store.GetTask(ctx, "task-9")
+	if taskErr != nil || task.State != string(TaskBlocked) {
+		t.Fatalf("task=%+v err=%v, want blocked", task, taskErr)
+	}
+}
+
+func TestPolicyMergeGateRejectsBlockAfterInitialReadyValidation(t *testing.T) {
+	ctx := context.Background()
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-job", agent: "audit", decision: "approved", hasResult: true,
+	})
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	matched, current, err := store.RevalidateTaskState(ctx, "task-9", string(TaskReadyToMerge))
+	if err != nil || !matched || current != string(TaskReadyToMerge) {
+		t.Fatalf("initial ready validation = matched %v current %q err %v", matched, current, err)
+	}
+	request.Reviewer = "audit"
+	request.ExpectedTaskState = string(TaskReadyToMerge)
+	var blocked bool
+	var blockErr error
+	gate.Git.(*fakeMergeGateGit).onClean = func() {
+		blocked, blockErr = store.BlockTaskWithEvent(ctx, db.Task{
+			ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+			State: string(TaskBlocked),
+		}, db.TaskEvent{
+			Kind: "workflow_blocked", FromState: string(TaskReadyToMerge),
+			Reason: "production block after initial validation",
+		})
+	}
+
+	decision, err := gate.Evaluate(ctx, request)
+	if !errors.Is(err, ErrMergeTaskStateChanged) {
+		t.Fatalf("Evaluate error = %v, want ready-state fence conflict", err)
+	}
+	if !blocked || blockErr != nil {
+		t.Fatalf("production block = blocked %v err %v, want committed block", blocked, blockErr)
+	}
+	if decision.Merged || len(gh.merges) != 0 {
+		t.Fatalf("decision=%+v merges=%d, external merge must not run after block", decision, len(gh.merges))
+	}
+	task, taskErr := store.GetTask(ctx, "task-9")
+	if taskErr != nil || task.State != string(TaskBlocked) {
+		t.Fatalf("task=%+v err=%v, want blocked", task, taskErr)
+	}
+}
+
 func TestPolicyMergeGateMergeFailureDoesNotPostSuccess(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -353,6 +833,12 @@ func TestPolicyMergeGateMergeFailureDoesNotPostSuccess(t *testing.T) {
 		ReviewRound: "review-1",
 		Result:      &AgentResult{Decision: "approved", Summary: "ready"},
 	})
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
 	mergeable := true
 	mergeErr := errors.New("draft pull request cannot be merged")
 	gh := &fakeMergeGateGitHub{
@@ -373,13 +859,26 @@ func TestPolicyMergeGateMergeFailureDoesNotPostSuccess(t *testing.T) {
 	}
 	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
 
-	_, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+	_, err := gate.Evaluate(ctx, MergeRequest{
+		Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+		ExpectedTaskState: string(TaskReadyToMerge),
+	})
 
 	if !errors.Is(err, mergeErr) {
 		t.Fatalf("Evaluate error = %v, want %v", err, mergeErr)
 	}
 	if hasStatus(gh.statuses, GitmootMergeGateContext, "success") {
 		t.Fatalf("statuses after failed merge = %+v, must not contain merge-gate success", gh.statuses)
+	}
+	blocked, blockErr := store.BlockTaskWithEvent(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskBlocked),
+	}, db.TaskEvent{
+		Kind: "workflow_blocked", FromState: string(TaskReadyToMerge),
+		Reason: "merge failure remained unresolved",
+	})
+	if blockErr == nil || blocked || !strings.Contains(blockErr.Error(), "claimed for an external merge") {
+		t.Fatalf("post-failure block = blocked %v err %v, want retained unresolved merge claim", blocked, blockErr)
 	}
 }
 
@@ -395,6 +894,12 @@ func TestPolicyMergeGateStatusFailureAfterMergeIsBestEffort(t *testing.T) {
 		ReviewRound: "review-1",
 		Result:      &AgentResult{Decision: "approved", Summary: "ready"},
 	})
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
 	mergeable := true
 	gh := &fakeMergeGateGitHub{
 		pr: github.PullRequest{
@@ -415,7 +920,10 @@ func TestPolicyMergeGateStatusFailureAfterMergeIsBestEffort(t *testing.T) {
 	}
 	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
 
-	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+	decision, err := gate.Evaluate(ctx, MergeRequest{
+		Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+		ExpectedTaskState: string(TaskReadyToMerge),
+	})
 
 	if err != nil {
 		t.Fatalf("Evaluate returned error after completed merge: %v", err)
@@ -425,6 +933,10 @@ func TestPolicyMergeGateStatusFailureAfterMergeIsBestEffort(t *testing.T) {
 	}
 	if got := strings.Join(gh.operations, ","); got != "merge,status:gitmoot/merge-gate:success" {
 		t.Fatalf("GitHub write order = %q, want merge before best-effort success status", got)
+	}
+	task, taskErr := store.GetTask(ctx, "task-9")
+	if taskErr != nil || task.State != string(TaskMerged) {
+		t.Fatalf("task=%+v err=%v, want durable claim completion", task, taskErr)
 	}
 }
 
@@ -1835,7 +2347,7 @@ func TestRunMergeGateExplicitKillSwitchParksReviewedAndUnreviewedTasks(t *testin
 				})
 			}
 			for attempt := 0; attempt < 2; attempt++ {
-				decision, err := engine.runMergeGate(ctx, "", payload, taskRef{ID: tc.taskID, Repo: "owner/repo", Title: tc.name, Branch: tc.taskID})
+				decision, err := engine.runMergeGate(ctx, "", payload, taskRef{ID: tc.taskID, Repo: "owner/repo", Title: tc.name, Branch: tc.taskID}, TaskReadyToMerge)
 				if err != nil {
 					t.Fatalf("runMergeGate attempt %d: %v", attempt+1, err)
 				}
@@ -1876,7 +2388,7 @@ func TestRunMergeGateDraftPullRequestDoesNotParkTaskAwaitingHumanMerge(t *testin
 
 	decision, err := engine.runMergeGate(ctx, "", payload, taskRef{
 		ID: taskID, Repo: "owner/repo", Title: "Draft task", Branch: "task-draft",
-	})
+	}, TaskReadyToMerge)
 	if err != nil {
 		t.Fatalf("runMergeGate: %v", err)
 	}
@@ -2762,6 +3274,16 @@ func TestPolicyMergeGateRecordsAlreadyMergedPullRequest(t *testing.T) {
 	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-9", Owner: "lead"}); err != nil || !acquired {
 		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
 	}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, _, err := store.ClaimTaskState(ctx, "task-9", string(TaskReadyToMerge),
+		"external_merge", time.Minute); err != nil || !claimed {
+		t.Fatalf("seed crashed merge claim = claimed %v err %v", claimed, err)
+	}
 	gh := &fakeMergeGateGitHub{
 		pr: github.PullRequest{
 			Number:   9,
@@ -2776,7 +3298,10 @@ func TestPolicyMergeGateRecordsAlreadyMergedPullRequest(t *testing.T) {
 	}
 	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: false}}
 
-	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+	decision, err := gate.Evaluate(ctx, MergeRequest{
+		Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+		ExpectedTaskState: string(TaskReadyToMerge),
+	})
 
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
@@ -2789,6 +3314,10 @@ func TestPolicyMergeGateRecordsAlreadyMergedPullRequest(t *testing.T) {
 	}
 	if _, err := store.GetBranchLock(ctx, "gitmoot/gitmoot", "task-9"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("branch lock after merge error = %v, want sql.ErrNoRows", err)
+	}
+	task, taskErr := store.GetTask(ctx, "task-9")
+	if taskErr != nil || task.State != string(TaskMerged) {
+		t.Fatalf("task=%+v err=%v, want recovered merged state", task, taskErr)
 	}
 }
 
@@ -4547,31 +5076,91 @@ func TestPolicyMergeGateBlocksMissingFinalReview(t *testing.T) {
 	}
 }
 
+type mergeConfirmationFailureRunner struct {
+	onMerge func()
+	calls   int
+}
+
+func (r *mergeConfirmationFailureRunner) Run(_ context.Context, _ string, _ string, _ ...string) (subprocess.Result, error) {
+	r.calls++
+	switch r.calls {
+	case 1:
+		if r.onMerge != nil {
+			r.onMerge()
+		}
+		return subprocess.Result{Stdout: "merged"}, nil
+	case 2:
+		return subprocess.Result{Stderr: "HTTP 502"}, errors.New("exit status 1")
+	default:
+		return subprocess.Result{}, fmt.Errorf("unexpected merge adapter call %d", r.calls)
+	}
+}
+
+func (*mergeConfirmationFailureRunner) LookPath(file string) (string, error) {
+	return file, nil
+}
+
+type queuedMergeRunner struct {
+	calls int
+}
+
+func (r *queuedMergeRunner) Run(_ context.Context, _ string, _ string, _ ...string) (subprocess.Result, error) {
+	r.calls++
+	switch r.calls {
+	case 1:
+		return subprocess.Result{Stdout: "queued"}, nil
+	case 2:
+		return subprocess.Result{Stdout: `{"number":9,"title":"Task","state":"open","html_url":"https://github.com/gitmoot/gitmoot/pull/9","head":{"ref":"task-9","sha":"head123"},"base":{"ref":"main"}}`}, nil
+	default:
+		return subprocess.Result{}, fmt.Errorf("unexpected queued merge adapter call %d", r.calls)
+	}
+}
+
+func (*queuedMergeRunner) LookPath(file string) (string, error) {
+	return file, nil
+}
+
+type productionMergeGateGitHub struct {
+	*fakeMergeGateGitHub
+	mergeClient github.GhClient
+}
+
+func (g *productionMergeGateGitHub) MergePullRequest(ctx context.Context, input github.MergePullRequestInput) (github.MergeResult, error) {
+	g.merges = append(g.merges, input)
+	g.operations = append(g.operations, "merge")
+	return g.mergeClient.MergePullRequest(ctx, input)
+}
+
 type fakeMergeGateGitHub struct {
-	pr           github.PullRequest
-	status       github.CombinedStatus
-	compare      github.CompareResult
-	checks       []github.PullRequestCheck
-	mergeResult  github.MergeResult
-	mergeErr     error
-	statusErr    error
-	updateErr    error
-	statuses     []github.CommitStatusInput
-	merges       []github.MergePullRequestInput
-	updates      []github.UpdatePullRequestBranchInput
-	comments     []string
-	operations   []string
-	getCalls     int
-	statusCalls  int
-	compareCalls int
-	checkCalls   int
-	prCheckCalls int
-	checkRefs    []string
-	noChecks     bool
+	pr             github.PullRequest
+	status         github.CombinedStatus
+	compare        github.CompareResult
+	checks         []github.PullRequestCheck
+	mergeResult    github.MergeResult
+	getPullRequest func(int) (github.PullRequest, error)
+	mergeErr       error
+	statusErr      error
+	beforeMerge    func()
+	updateErr      error
+	statuses       []github.CommitStatusInput
+	merges         []github.MergePullRequestInput
+	updates        []github.UpdatePullRequestBranchInput
+	comments       []string
+	operations     []string
+	getCalls       int
+	statusCalls    int
+	compareCalls   int
+	checkCalls     int
+	prCheckCalls   int
+	checkRefs      []string
+	noChecks       bool
 }
 
 func (f *fakeMergeGateGitHub) GetPullRequest(context.Context, github.Repository, int64) (github.PullRequest, error) {
 	f.getCalls++
+	if f.getPullRequest != nil {
+		return f.getPullRequest(f.getCalls)
+	}
 	return f.pr, nil
 }
 
@@ -4619,6 +5208,9 @@ func (f *fakeMergeGateGitHub) UpdatePullRequestBranch(_ context.Context, input g
 }
 
 func (f *fakeMergeGateGitHub) MergePullRequest(_ context.Context, input github.MergePullRequestInput) (github.MergeResult, error) {
+	if f.beforeMerge != nil {
+		f.beforeMerge()
+	}
 	f.merges = append(f.merges, input)
 	f.operations = append(f.operations, "merge")
 	return f.mergeResult, f.mergeErr
@@ -4626,11 +5218,15 @@ func (f *fakeMergeGateGitHub) MergePullRequest(_ context.Context, input github.M
 
 type fakeMergeGateGit struct {
 	clean    bool
+	onClean  func()
 	onUpdate func()
 	updated  []string
 }
 
 func (f *fakeMergeGateGit) WorktreeClean(context.Context) (bool, error) {
+	if f.onClean != nil {
+		f.onClean()
+	}
 	return f.clean, nil
 }
 

@@ -12,20 +12,27 @@ import (
 )
 
 // TestMergeGateStoreAccessSurface is the interface-level firewall between the
-// merge authority and display-only review evidence. The eleven calls below are
+// merge authority and display-only review evidence. The eighteen calls below are
 // the complete *db.Store surface used by PolicyMergeGate, plus the native review
 // aggregation read in allRequiredReviewersApproved. Adding any store call makes
 // this test fail until its authority implications are reviewed explicitly.
 func TestMergeGateStoreAccessSurface(t *testing.T) {
 	want := []string{
 		"AcquireResourceLock",
+		"ClaimTaskState",
 		"ClearTaskWorktreePath",
+		"CompleteTaskStateClaim",
 		"GetBranchLock",
 		"GetNoCIObservation",
 		"GetTask",
 		"ListJobs",
+		"RecoverClaimedTaskState",
+		"ReleaseRetainedTaskStateClaim",
 		"ReleaseLockWithEvent",
 		"ReleaseResourceLock",
+		"ReleaseTaskStateClaim",
+		"RenewTaskStateClaim",
+		"RetainTaskStateClaim",
 		"UpsertMergeGate",
 		"UpsertNoCIObservation",
 		"UpsertPullRequest",

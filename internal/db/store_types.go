@@ -583,6 +583,21 @@ type MergeGate struct {
 	PullRequest  int64
 	State        string
 	Reason       string
+	// BlockClass persists the merge gate's own transient-vs-quality classification
+	// of a blocked row (#1562). Only the block path sets it; a pending or merged
+	// row is not a block and correctly stores the zero value. It is durable
+	// precisely so an exit path outside the blocking call stack can read it.
+	BlockClass int
+}
+
+// PullRequestTerminalReconciliation pins one canonical terminal-effects owner
+// to an exact pull request head across daemon restarts.
+type PullRequestTerminalReconciliation struct {
+	RepoFullName     string
+	PullRequest      int64
+	HeadSHA          string
+	OwnerTaskID      string
+	EffectsCompleted bool
 }
 
 // MergeGateStatusObservation records the exact PR head most recently reconciled

@@ -3383,6 +3383,7 @@ func blockTaskForPermissionBlockedJob(ctx context.Context, store *db.Store, job 
 		State:        string(workflow.TaskBlocked),
 		Branch:       payload.Branch,
 	}
+	fromState := ""
 	existing, err := store.GetTask(ctx, payload.TaskID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
@@ -3391,6 +3392,7 @@ func blockTaskForPermissionBlockedJob(ctx context.Context, store *db.Store, job 
 		if existing.State == string(workflow.TaskDismissed) {
 			return fmt.Errorf("task %s is dismissed; permission-blocked job cannot resurrect it", existing.ID)
 		}
+		fromState = existing.State
 		if task.RepoFullName == "" {
 			task.RepoFullName = existing.RepoFullName
 		}
@@ -3404,7 +3406,23 @@ func blockTaskForPermissionBlockedJob(ctx context.Context, store *db.Store, job 
 			task.Branch = existing.Branch
 		}
 	}
-	return store.UpsertTask(ctx, task)
+	reason := fmt.Sprintf("permission-blocked job %s", job.ID)
+	if payload.Result != nil && strings.TrimSpace(payload.Result.Summary) != "" {
+		reason = strings.TrimSpace(payload.Result.Summary)
+	}
+	blocked, err := store.BlockTaskWithEvent(ctx, task, db.TaskEvent{
+		Kind:      "permission_job_blocked",
+		FromState: fromState,
+		Reason:    reason,
+	})
+	if err != nil {
+		if !blocked {
+			return err
+		}
+		return errors.Join(workflow.BlockedError{Reason: reason},
+			fmt.Errorf("record permission block for task %s: %w", task.ID, err))
+	}
+	return nil
 }
 
 func (w jobWorker) jobNeedsAdvanceRetry(ctx context.Context, jobID string) (bool, error) {
