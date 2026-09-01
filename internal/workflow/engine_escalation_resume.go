@@ -660,7 +660,21 @@ func (e Engine) ResolveEscalation(ctx context.Context, coordinatorJobID string, 
 		return nil
 	}
 
-	return e.applyResolutionEffects(ctx, parentJob, parentPayload, ref, rec, verb, instructions, answers, round.RoundID)
+	// EXCLUSIVE OWNERSHIP THROUGH EFFECT COMMIT: take the fence, run the effects under
+	// it, and commit them with the receipt in one transaction (#1673).
+	owner := newEscalationRoundID()
+	now := time.Now().UTC()
+	held, err := e.Store.AcquireEscalationRecoveryLease(ctx, coordinatorJobID, round.RoundID, owner,
+		now.Add(escalationRecoveryLeaseTTL), now)
+	if err != nil {
+		return err
+	}
+	if !held {
+		// Another pass owns this replay; its effects are the same idempotent set.
+		return nil
+	}
+	defer func() { _ = e.Store.ReleaseEscalationRecoveryLease(ctx, coordinatorJobID, round.RoundID, owner) }()
+	return e.applyResolutionEffectsFenced(ctx, parentJob, parentPayload, ref, rec, verb, instructions, answers, round.RoundID, owner)
 }
 
 // adoptOrLoadUnsettledRound returns the coordinator's unsettled round, ADOPTING a
@@ -687,10 +701,87 @@ func (e Engine) adoptOrLoadUnsettledRound(ctx context.Context, coordinatorJobID 
 	return e.Store.UnsettledEscalationRound(ctx, coordinatorJobID)
 }
 
+// escalationRecoveryLeaseTTL bounds how long a recovery fence is held before another
+// pass may reclaim it. Expiry transfers OWNERSHIP ONLY: it never settles, never
+// discards, and never touches the preserved claim, so it cannot become the
+// abandonment path rejected in v3.
+const escalationRecoveryLeaseTTL = 2 * time.Minute
+
+// applyResolutionEffectsFenced is the authorized shape (#1673, design note v6 +
+// A-NARROW): acquire the fence, run the pre-effects UNDER it, then commit every
+// durable database write AND the receipt in ONE transaction that re-validates the
+// fence, and only then announce.
+//
+// The order is load-bearing. The fence comes first so two recoverers can never both
+// allocate a worktree or both take a branch lock - an idempotent worktree key does not
+// protect a lock that has an owner. The receipt is inside the transaction so there is
+// no "effect committed, receipt missing" state for a crash to land in, which is what a
+// per-effect boundary could not provide.
+func (e Engine) applyResolutionEffectsFenced(ctx context.Context, parentJob db.Job, parentPayload JobPayload, ref taskRef, rec EscalationRecord, verb ResumeDecision, instructions string, answers map[string]string, roundID string, owner string) error {
+	sink := &resolutionEffectSink{}
+	capturing := e
+	capturing.resolutionSink = sink
+
+	// PRE-EFFECTS AND PREPARATION run here, under the held fence. Everything durable
+	// they would write is captured instead; the git/lock work is real and is recorded
+	// on the round so a later supersede or release can hand it back.
+	verbErr := capturing.applyResolutionEffects(ctx, parentJob, parentPayload, ref, rec, verb, instructions, answers, roundID)
+	if verbErr != nil && sink.blocked == nil {
+		return verbErr
+	}
+	if sink.preEffectWorktree != "" || sink.preEffectBranch != "" {
+		if _, err := e.Store.RecordEscalationRoundPreEffects(ctx, parentJob.ID, roundID, owner,
+			sink.preEffectRepo, sink.preEffectBranch, sink.preEffectWorktree, sink.preEffectLockOwner,
+			time.Now().UTC()); err != nil {
+			return err
+		}
+	}
+
+	commit := db.ResolutionCommit{
+		JobID:   parentJob.ID,
+		RoundID: roundID,
+		Owner:   owner,
+		Jobs:    sink.jobs,
+		Events:  sink.events,
+	}
+	if sink.taskSet {
+		commit.Task = sink.task
+		commit.TaskForbidden = sink.taskForbidden
+	}
+	if sink.blocked != nil {
+		// ALTERNATIVE OUTCOME: the decision could not be applied. The block lands under
+		// the fence and NO receipt is written, so the claim stays preserved and the next
+		// pass re-drives (or parks) rather than double-blocking.
+		commit.Task = sink.task
+		commit.Task.State = string(TaskBlocked)
+		commit.TaskForbidden, _ = taskStateWriteExclusions(TaskBlocked)
+		commit.TaskEvent = db.TaskEvent{Kind: "escalation_resolution_blocked", Reason: sink.blocked.Reason}
+		commit.TaskEventValid = strings.TrimSpace(commit.Task.ID) != ""
+	} else {
+		commit.Receipt = db.JobEvent{
+			JobID:   parentJob.ID,
+			Kind:    escalationEffectsCompletedEvent,
+			Message: roundID + " " + string(verb),
+		}
+		commit.ReceiptValid = true
+	}
+	committed, err := e.Store.CommitResolutionEffects(ctx, commit, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	if !committed {
+		// The fence was lost - superseded, parked, or lapsed. Nothing landed.
+		return nil
+	}
+	if sink.blocked != nil {
+		return *sink.blocked
+	}
+	return nil
+}
+
 // applyResolutionEffects runs the verb's irreversible half AFTER its resolution has
-// been exclusively claimed, then writes the receipt that marks the resolution
-// finished. Both the claim path and the recovery sweep call it, so a crash between
-// claim and effects is repaired by re-running exactly this code.
+// been exclusively claimed. Under a capturing engine it WRITES NOTHING: its effects
+// are collected for applyResolutionEffectsFenced to commit in one transaction.
 //
 // Every verb's effect is idempotent — deterministic resume ids, once-guarded
 // continuations, and a task-state write that is a no-op when already planned — which
@@ -744,6 +835,12 @@ func (e Engine) applyResolutionEffects(ctx context.Context, parentJob db.Job, pa
 			return err
 		}
 	}
+	if e.capturing() {
+		// The receipt is committed by applyResolutionEffectsFenced, in the SAME
+		// transaction as these effects. Writing it here would recreate the window v6
+		// deletes.
+		return nil
+	}
 	// The RECEIPT goes last and releases the coordinator's slot. Until it exists this
 	// resolution is unfinished and the recovery sweep owns it; the affected-row
 	// predicate makes it exactly-once, so concurrent recoverers cannot over-settle.
@@ -796,6 +893,22 @@ func (e Engine) RecoverUnfinishedEscalationResolutions(ctx context.Context) (int
 }
 
 func (e Engine) recoverEscalationRound(ctx context.Context, round db.EscalationRound) (bool, error) {
+	// THE FENCE FIRST. Recovery must own the round through EFFECT COMMIT, and the
+	// order is load-bearing: taking it before the pre-effects is what stops two
+	// recoverers from both allocating a worktree or both taking a branch lock (#1673).
+	owner := newEscalationRoundID()
+	fenceNow := time.Now().UTC()
+	held, err := e.Store.AcquireEscalationRecoveryLease(ctx, round.JobID, round.RoundID, owner,
+		fenceNow.Add(escalationRecoveryLeaseTTL), fenceNow)
+	if err != nil {
+		return false, err
+	}
+	if !held {
+		// Another pass owns it, or it was parked or settled since the candidate query.
+		return false, nil
+	}
+	defer func() { _ = e.Store.ReleaseEscalationRecoveryLease(ctx, round.JobID, round.RoundID, owner) }()
+
 	// CLASS I - STRUCTURALLY IMPOSSIBLE, and the only one: the coordinator row is
 	// gone. With no coordinator there is no DAG to pause, no task to move and no
 	// continuation to enqueue, so this claim can never be replayed by anyone, and
@@ -817,37 +930,37 @@ func (e Engine) recoverEscalationRound(ctx context.Context, round db.EscalationR
 	}
 	var resolution EscalationRecord
 	if err := json.Unmarshal([]byte(round.ClaimPayload), &resolution); err != nil {
-		return false, e.parkEscalationRound(ctx, round, "claim_payload_unreadable")
+		return false, e.parkEscalationRound(ctx, round, owner, "claim_payload_unreadable")
 	}
 	verb, ok := validReplayableResumeDecision(round.ClaimVerb)
 	if !ok {
-		return false, e.parkEscalationRound(ctx, round, "claim_verb_unreplayable")
+		return false, e.parkEscalationRound(ctx, round, owner, "claim_verb_unreplayable")
 	}
 	job, payload, err := e.jobPayload(ctx, round.JobID)
 	if err != nil {
 		return false, err
 	}
 	if payload.Result == nil {
-		return false, e.parkEscalationRound(ctx, round, "coordinator_result_absent")
+		return false, e.parkEscalationRound(ctx, round, owner, "coordinator_result_absent")
 	}
 	if round.ClaimGeneration != job.LifecycleGeneration {
 		// The human decided about a run that has since been re-queued. Applying it
 		// would be a stale effect; dropping it would lose intent. An operator decides.
-		return false, e.parkEscalationRound(ctx, round, "lifecycle_generation_moved")
+		return false, e.parkEscalationRound(ctx, round, owner, "lifecycle_generation_moved")
 	}
 	rec, exists, err := e.loadEscalationForRound(ctx, round.JobID, round.RoundID)
 	if err != nil {
 		return false, err
 	}
 	if !exists {
-		return false, e.parkEscalationRound(ctx, round, "request_record_absent")
+		return false, e.parkEscalationRound(ctx, round, owner, "request_record_absent")
 	}
-	if err := e.applyResolutionEffects(ctx, job, payload, taskRefFromPayload(payload), rec, verb,
-		resolution.Question, resolution.Answers, round.RoundID); err != nil {
+	if err := e.applyResolutionEffectsFenced(ctx, job, payload, taskRefFromPayload(payload), rec, verb,
+		resolution.Question, resolution.Answers, round.RoundID, owner); err != nil {
 		if attempts >= escalationRecoveryAttemptBound {
 			// The bound's ONLY role is to stop hammering and ask a human. It can never
 			// discard the claim: this parks the round with the decision intact.
-			return false, e.parkEscalationRound(ctx, round, "retry_exhausted")
+			return false, e.parkEscalationRound(ctx, round, owner, "retry_exhausted")
 		}
 		return false, err
 	}
@@ -856,8 +969,11 @@ func (e Engine) recoverEscalationRound(ctx context.Context, round db.EscalationR
 
 // parkEscalationRound enters the terminal integrity state and emits the ONE repair
 // signal, both under the affected-row predicate that makes the signal exactly-once.
-func (e Engine) parkEscalationRound(ctx context.Context, round db.EscalationRound, cause string) error {
-	parked, err := e.Store.MarkEscalationRoundNeedsRepair(ctx, round.JobID, round.RoundID, cause, db.JobEvent{
+func (e Engine) parkEscalationRound(ctx context.Context, round db.EscalationRound, owner string, cause string) error {
+	// Parking requires the FENCE. That is what makes parking and an in-flight replay
+	// mutually exclusive, and therefore what makes an operator supersede - which
+	// requires a parked round - unable to race a replay.
+	parked, err := e.Store.MarkEscalationRoundNeedsRepairAsOwner(ctx, round.JobID, round.RoundID, owner, cause, db.JobEvent{
 		JobID:   round.JobID,
 		Kind:    escalationNeedsRepairEvent,
 		Message: fmt.Sprintf("round %s verb %s needs operator repair: %s", round.RoundID, round.ClaimVerb, cause),
@@ -1024,7 +1140,7 @@ func (e Engine) resumeRetryLeg(ctx context.Context, parentJob db.Job, parentPayl
 	if err := e.allocateAndEnqueueDelegation(ctx, parentJob, parentPayload, d, request, taskRefFromPayload(parentPayload)); err != nil {
 		return err
 	}
-	return e.Store.AddJobEvent(ctx, db.JobEvent{
+	return e.recordEffectEvent(ctx, db.JobEvent{
 		JobID:   parentJob.ID,
 		Kind:    "delegation_escalation_retry",
 		Message: fmt.Sprintf("human resume retry re-enqueued delegation %q as job %s", d.ID, request.ID),
@@ -1301,11 +1417,23 @@ func (e Engine) AutoFinalizeExpiredEscalations(ctx context.Context, ttl time.Dur
 			// A human claimed it between the candidate query and now.
 			continue
 		}
-		// The verb's effects and its receipt run through the ONE shared switch, so a
-		// crash here is recovered by replaying ResumeTTL rather than being unreachable.
-		if err := e.applyResolutionEffects(ctx, job, payload, ref, rec, ResumeTTL, "", nil, round.RoundID); err != nil {
+		// The verb's effects and its receipt commit in ONE fenced transaction, so a
+		// crash here leaves either nothing or everything, and is replayed as ResumeTTL.
+		ttlOwner := newEscalationRoundID()
+		ttlNow := time.Now().UTC()
+		ttlHeld, ttlErr := e.Store.AcquireEscalationRecoveryLease(ctx, jobID, round.RoundID, ttlOwner,
+			ttlNow.Add(escalationRecoveryLeaseTTL), ttlNow)
+		if ttlErr != nil {
+			return finalized, ttlErr
+		}
+		if !ttlHeld {
+			continue
+		}
+		if err := e.applyResolutionEffectsFenced(ctx, job, payload, ref, rec, ResumeTTL, "", nil, round.RoundID, ttlOwner); err != nil {
+			_ = e.Store.ReleaseEscalationRecoveryLease(ctx, jobID, round.RoundID, ttlOwner)
 			return finalized, err
 		}
+		_ = e.Store.ReleaseEscalationRecoveryLease(ctx, jobID, round.RoundID, ttlOwner)
 		finalized++
 	}
 	return finalized, nil

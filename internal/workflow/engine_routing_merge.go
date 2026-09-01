@@ -383,6 +383,17 @@ func (e Engine) enqueue(ctx context.Context, request JobRequest) error {
 	if err := e.renewSupersedeAdvanceLease(ctx); err != nil {
 		return err
 	}
+	// CAPTURING: a resolution's enqueue is PREPARED, not written, so it can commit in
+	// the same transaction as the task write and the receipt. PrepareEnqueue performs
+	// no durable write and no git/network work.
+	if e.capturing() {
+		prepared, perr := e.mailbox().PrepareEnqueue(ctx, request)
+		if perr != nil {
+			return perr
+		}
+		e.resolutionSink.jobs = append(e.resolutionSink.jobs, db.PreparedJob{Job: prepared.Job, Events: prepared.Events})
+		return nil
+	}
 	_, err := e.mailbox().Enqueue(ctx, request)
 	if err == nil {
 		return nil

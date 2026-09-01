@@ -242,6 +242,16 @@ type Engine struct {
 	// anchor before running, so a retry that re-queued the child cannot fail,
 	// enqueue or continue the parent from a run that no longer exists.
 	supersedeAdvance *supersedeAdvanceAnchor
+	// resolutionSink, when set, makes this engine copy CAPTURE its durable database
+	// effects instead of writing them: job inserts, job events and the task-state
+	// transition are appended here so a resolution can commit ALL of them - plus its
+	// receipt - in ONE lease-guarded transaction (#1673).
+	//
+	// It is nil on every ordinary path, so those paths are byte-identical. It does NOT
+	// capture pre-effects: allocating a delegation worktree and taking a branch lock are
+	// git/lock operations that cannot live in a transaction, so they run under the held
+	// fence and are recorded on the round for later release.
+	resolutionSink *resolutionEffectSink
 	// MaxDelegationTokenBudget is the cumulative per-root token budget (input +
 	// output, summed across a coordination tree) that bounds a delegation tree by
 	// cost in addition to depth/width/total-jobs/wall-clock (#338 Part B). When a
@@ -554,6 +564,16 @@ func (e Engine) setTaskStateResolved(ctx context.Context, ref taskRef, state Tas
 	// lease lapsed and a retry re-queued the child (#1673).
 	if taskStatePreWriteHook != nil {
 		taskStatePreWriteHook(ctx, task.ID)
+	}
+	// CAPTURING: the task-state transition and its event belong in the resolution's one
+	// transaction, alongside the receipt, so a crash cannot leave the write without it.
+	if e.capturing() {
+		task.State = string(state)
+		forbidden, _ := taskStateWriteExclusions(state)
+		e.resolutionSink.task = task
+		e.resolutionSink.taskForbidden = forbidden
+		e.resolutionSink.taskSet = true
+		return task.ID, nil
 	}
 	if _, err := persistTaskStateOwned(ctx, e.Store, task, state, e.advanceOwnershipBinding()); err != nil {
 		if errors.Is(err, db.ErrAdvanceOwnershipLost) {

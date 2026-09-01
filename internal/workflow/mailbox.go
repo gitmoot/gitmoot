@@ -617,25 +617,45 @@ type DeliveryAdapter interface {
 	Deliver(ctx context.Context, agent runtime.Agent, job runtime.Job) (runtime.Result, error)
 }
 
-func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error) {
+// PreparedEnqueue is an enqueue with every NON-WRITE step already done: payload built,
+// template snapshot taken, model resolved, ids derived, policy applied. It holds no
+// open transaction and performs no git, network or LLM work, so a caller can commit it
+// inside a transaction it already owns (#1673).
+type PreparedEnqueue struct {
+	Job    db.Job
+	Events []db.JobEvent
+}
+
+// PrepareEnqueue runs Enqueue's read-and-compute half and returns the row to insert.
+// It writes NOTHING durable: that is the whole point, and it is what lets a resolution
+// commit its job insert in the same transaction as its task write and its receipt.
+func (m Mailbox) PrepareEnqueue(ctx context.Context, request JobRequest) (PreparedEnqueue, error) {
+	job, events, err := m.prepareEnqueue(ctx, request)
+	if err != nil {
+		return PreparedEnqueue{}, err
+	}
+	return PreparedEnqueue{Job: job, Events: events}, nil
+}
+
+func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job, []db.JobEvent, error) {
 	if m.store == nil {
-		return db.Job{}, errors.New("mailbox store is required")
+		return db.Job{}, nil, errors.New("mailbox store is required")
 	}
 	if err := validateJobRequest(request); err != nil {
-		return db.Job{}, err
+		return db.Job{}, nil, err
 	}
 	orgWarning, err := m.resolveEnqueueOrgScope(&request)
 	if err != nil {
-		return db.Job{}, err
+		return db.Job{}, nil, err
 	}
 	autolabeled, err := m.resolveEnqueueWorkflowID(&request)
 	if err != nil {
-		return db.Job{}, err
+		return db.Job{}, nil, err
 	}
 
 	snapshot, err := m.templateSnapshot(ctx, request.Agent)
 	if err != nil {
-		return db.Job{}, err
+		return db.Job{}, nil, err
 	}
 	// A --recipe override swaps in the recipe template's content while leaving the
 	// agent's identity untouched; the snapshot fields below then carry it.
@@ -760,7 +780,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		CheckRetries:           request.CheckRetries,
 	})
 	if err != nil {
-		return db.Job{}, err
+		return db.Job{}, nil, err
 	}
 
 	job := db.Job{
@@ -775,6 +795,22 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		DelegatedBy:     request.DelegatedBy,
 	}
 	job.Model, err = m.resolveEnqueueModel(ctx, request)
+	if err != nil {
+		return db.Job{}, nil, err
+	}
+	var advisory []db.JobEvent
+	if autolabeled {
+		advisory = append(advisory, db.JobEvent{JobID: job.ID, Kind: "workflow_autolabeled",
+			Message: fmt.Sprintf("auto-filed under %s (require_workflow=auto for %s; pass --workflow to name your initiative)", strings.TrimSpace(request.WorkflowID), strings.TrimSpace(request.Repo))})
+	}
+	if orgWarning != "" {
+		advisory = append(advisory, db.JobEvent{JobID: job.ID, Kind: "org_scope_violation", Message: orgWarning})
+	}
+	return job, advisory, nil
+}
+
+func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error) {
+	job, advisory, err := m.prepareEnqueue(ctx, request)
 	if err != nil {
 		return db.Job{}, err
 	}
@@ -794,17 +830,11 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 	} else if err := m.store.CreateJobWithEvent(ctx, job, queuedEvent, request.RequiredEvents...); err != nil {
 		return db.Job{}, err
 	}
-	if autolabeled {
-		if err := m.store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "workflow_autolabeled", Message: fmt.Sprintf("auto-filed under %s (require_workflow=auto for %s; pass --workflow to name your initiative)", strings.TrimSpace(request.WorkflowID), strings.TrimSpace(request.Repo))}); err != nil {
+	for _, event := range advisory {
+		if err := m.store.AddJobEvent(ctx, event); err != nil {
 			// The queued job is durable. Never turn a successful enqueue into a
 			// rejection because an advisory follow-up event could not be written.
-			fmt.Fprintf(os.Stderr, "gitmoot: add workflow_autolabeled event for %s: %v\n", job.ID, err)
-		}
-	}
-	if orgWarning != "" {
-		if err := m.store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "org_scope_violation", Message: orgWarning}); err != nil {
-			// The queued job is durable. An advisory warning event must never undo it.
-			fmt.Fprintf(os.Stderr, "gitmoot: add org_scope_violation event for %s: %v\n", job.ID, err)
+			fmt.Fprintf(os.Stderr, "gitmoot: add %s event for %s: %v\n", event.Kind, job.ID, err)
 		}
 	}
 	return job, nil

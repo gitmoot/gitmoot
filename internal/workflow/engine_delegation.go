@@ -20,7 +20,7 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 	// completes, so a continuation enqueued to their (now-deleted) synthetic agent
 	// would strand. Do not dispatch delegations returned by an ephemeral worker.
 	if payload.Ephemeral != nil {
-		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		_ = e.recordEffectEvent(ctx, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    "delegation_ignored_ephemeral",
 			Message: fmt.Sprintf("ephemeral workers cannot delegate; ignoring %d delegation(s)", len(payload.Result.Delegations)),
@@ -34,7 +34,7 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 	// precede the budget checks so an over-budget finalize continuation is not
 	// itself re-tripped.
 	if payload.DelegationFinalize {
-		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		_ = e.recordEffectEvent(ctx, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    "delegation_finalized",
 			Message: fmt.Sprintf("finalize continuation is terminal; ignoring %d delegation(s)", len(payload.Result.Delegations)),
@@ -50,7 +50,7 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 	// route through the same #305 graceful finalize continuation (synthesize what
 	// completed → stop). Fails open: a lookup error never blocks dispatch.
 	if killed, _ := e.Store.IsRootJobKilled(ctx, rootID); killed {
-		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		_ = e.recordEffectEvent(ctx, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    "delegation_killed",
 			Message: fmt.Sprintf("root delegation tree %s killed by operator; not dispatching %d delegation(s)", rootID, len(payload.Result.Delegations)),
@@ -60,7 +60,7 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 
 	maxDepth := effectiveMaxDelegationDepth()
 	if payload.DelegationDepth >= maxDepth {
-		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		_ = e.recordEffectEvent(ctx, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    "delegation_depth_exceeded",
 			Message: fmt.Sprintf("delegation depth %d reached the limit of %d; not dispatching %d delegation(s)", payload.DelegationDepth, maxDepth, len(payload.Result.Delegations)),
@@ -90,7 +90,7 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 	}
 	maxJobs := effectiveMaxDelegationTotalJobs()
 	if total+projected > maxJobs {
-		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		_ = e.recordEffectEvent(ctx, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    "delegation_budget_exceeded",
 			Message: fmt.Sprintf("delegation batch of %d new job(s) would exceed the per-root job budget of %d (tree at %d); not dispatching %d delegation(s)", projected, maxJobs, total, len(payload.Result.Delegations)),
@@ -99,7 +99,7 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 	}
 
 	if exceeded, elapsed := e.rootWallClockExceeded(ctx, rootID); exceeded {
-		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		_ = e.recordEffectEvent(ctx, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    "delegation_walltime_exceeded",
 			Message: fmt.Sprintf("delegation tree for root %s ran %s, exceeding the wall-clock limit of %s; not dispatching %d delegation(s)", rootID, elapsed.Round(time.Second), MaxDelegationWallClock, len(payload.Result.Delegations)),
@@ -118,7 +118,7 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 	// reports no usage contributes 0, so the budget under-counts that runtime).
 	if e.MaxDelegationTokenBudget > 0 {
 		if used, _ := e.sumRootDelegationTokens(ctx, rootID); used >= e.MaxDelegationTokenBudget {
-			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			_ = e.recordEffectEvent(ctx, db.JobEvent{
 				JobID:   job.ID,
 				Kind:    "delegation_cost_exceeded",
 				Message: fmt.Sprintf("delegation tree %s reached token budget %d (used %d); not dispatching %d delegation(s)", rootID, e.MaxDelegationTokenBudget, used, len(payload.Result.Delegations)),
@@ -139,7 +139,7 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 	// usage contributes $0, so the budget under-counts that runtime.
 	if e.MaxDelegationCostUSD > 0 {
 		if spent, _ := e.sumRootDelegationCost(ctx, rootID); spent >= e.MaxDelegationCostUSD {
-			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			_ = e.recordEffectEvent(ctx, db.JobEvent{
 				JobID:   job.ID,
 				Kind:    "delegation_cost_usd_exceeded",
 				Message: fmt.Sprintf("delegation tree %s reached cost budget $%.4f (spent $%.4f); not dispatching %d delegation(s)", rootID, e.MaxDelegationCostUSD, spent, len(payload.Result.Delegations)),
@@ -149,7 +149,7 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 	}
 
 	if width := len(payload.Result.Delegations); width > MaxDelegationWidth {
-		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		_ = e.recordEffectEvent(ctx, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    "delegation_width_exceeded",
 			Message: fmt.Sprintf("delegation set width %d exceeds the per-coordinator limit of %d; not dispatching", width, MaxDelegationWidth),
@@ -205,7 +205,7 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 		return e.finalizeOrBlockDispatch(ctx, job, payload, e.block(ctx, ref, fmt.Sprintf("write delegation artifacts: %v", err)))
 	}
 	if artifactDir != "" {
-		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		_ = e.recordEffectEvent(ctx, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    "delegation_artifacts_written",
 			Message: fmt.Sprintf("delegation artifacts written to %s", artifactDir),
@@ -269,7 +269,7 @@ func (e Engine) handleDelegationLoop(ctx context.Context, job db.Job, payload Jo
 	}
 
 	if payload.DelegationRepeatCount >= 1 {
-		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		_ = e.recordEffectEvent(ctx, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    "delegation_loop_detected",
 			Message: fmt.Sprintf("delegation set %s repeated after a corrective nudge (repeat count %d); not dispatching %d delegation(s)", currentHash, payload.DelegationRepeatCount, len(payload.Result.Delegations)),
@@ -282,7 +282,7 @@ func (e Engine) handleDelegationLoop(ctx context.Context, job db.Job, payload Jo
 		return true, nil
 	}
 
-	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+	_ = e.recordEffectEvent(ctx, db.JobEvent{
 		JobID:   job.ID,
 		Kind:    "delegation_loop_warning",
 		Message: fmt.Sprintf("delegation set %s repeats a recent round; sending a corrective continuation instead of dispatching %d delegation(s)", currentHash, len(payload.Result.Delegations)),
@@ -365,7 +365,7 @@ func (e Engine) handleDelegationPreflightFailure(ctx context.Context, job db.Job
 		}
 	}
 
-	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+	_ = e.recordEffectEvent(ctx, db.JobEvent{
 		JobID:   job.ID,
 		Kind:    "delegation_preflight_failed",
 		Message: reason,
@@ -429,7 +429,7 @@ func (e Engine) handleDelegationPreflightFailure(ctx context.Context, job db.Job
 	// The corrective continuation IS the coordinator's single continuation, so it
 	// occupies the continuation slot: emit delegation_continuation_enqueued so a
 	// re-advance hits the continuationEnqueued top-guard.
-	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+	_ = e.recordEffectEvent(ctx, db.JobEvent{
 		JobID:   job.ID,
 		Kind:    "delegation_continuation_enqueued",
 		Message: fmt.Sprintf("preflight corrective continuation occupies the continuation slot for job %s", request.ID),
@@ -504,12 +504,12 @@ func (e Engine) enqueueFinalizeContinuation(ctx context.Context, job db.Job, pay
 	// never enqueue a *normal* continuation that would collide with the finalize
 	// job's deterministic id. The finalize-specific event below drives the
 	// once-guard above and keeps the backstop observable.
-	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+	_ = e.recordEffectEvent(ctx, db.JobEvent{
 		JobID:   job.ID,
 		Kind:    "delegation_continuation_enqueued",
 		Message: fmt.Sprintf("finalize continuation occupies the continuation slot for job %s", request.ID),
 	})
-	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+	_ = e.recordEffectEvent(ctx, db.JobEvent{
 		JobID:   job.ID,
 		Kind:    "delegation_finalize_enqueued",
 		Message: fmt.Sprintf("termination backstop tripped (%s); enqueued a best-effort finalize continuation as job %s", reason, request.ID),
@@ -545,7 +545,7 @@ func (e Engine) enqueueDelegation(ctx context.Context, job db.Job, payload JobPa
 			return err
 		}
 		if seen {
-			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			_ = e.recordEffectEvent(ctx, db.JobEvent{
 				JobID:   job.ID,
 				Kind:    "delegation_deduped",
 				Message: fmt.Sprintf("delegation %q skipped: fingerprint %q already enqueued (key %s)", d.ID, fingerprint, delegationFingerprintKey(job.ID, fingerprint)),
@@ -644,7 +644,7 @@ func (e Engine) commitDelegationLeg(ctx context.Context, job db.Job, payload Job
 		return err
 	}
 	if committed {
-		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		_ = e.recordEffectEvent(ctx, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    "delegation_committed",
 			Message: fmt.Sprintf("delegation %q committed its implementation to branch %s", payload.DelegationID, payload.Branch),
@@ -675,7 +675,7 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 			// Home/DelegationWorktrees manager), so the child falls back to a
 			// shared-checkout branch lock. Emit a parent event so the loss of
 			// isolation is observable rather than silent.
-			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			_ = e.recordEffectEvent(ctx, db.JobEvent{
 				JobID:   job.ID,
 				Kind:    "delegation_worktree_skipped",
 				Message: fmt.Sprintf("delegation %q implement runs in the shared checkout on branch %s: per-delegation worktree isolation unavailable", request.DelegationID, request.Branch),
@@ -704,6 +704,9 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 			}
 			request.Branch = result.Branch
 			request.WorktreePath = result.Path
+			// Recorded so a later supersede or Class I release can hand this worktree
+			// back instead of orphaning it (#1673).
+			e.recordEffectPreAllocation(request.Repo, result.Branch, result.Path, request.Agent)
 			// The freshly-allocated worktree is created off the parent's base
 			// branch, whose tip may have advanced past the HeadSHA the child
 			// inherited from the parent payload. validateTargetCheckout (daemon)
@@ -722,7 +725,7 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 		// WITHOUT the implemented change. A zero-branch resolution is allowed only when
 		// every implement dep is already on the parent base branch.
 		unresolved := strings.Join(integration.unresolvedDeps, ", ")
-		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		_ = e.recordEffectEvent(ctx, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    "delegation_integration_unresolved",
 			Message: fmt.Sprintf("delegation %q depends on unresolved implement leg(s) %s; refusing to review the base checkout", request.DelegationID, unresolved),
@@ -734,7 +737,7 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 		// into one detached worktree so the dependent sees the combined work instead
 		// of the base checkout (#332).
 		if manager, ok := e.DelegationWorktrees.(IntegrationWorktreeManager); !ok || strings.TrimSpace(e.Home) == "" {
-			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			_ = e.recordEffectEvent(ctx, db.JobEvent{
 				JobID:   job.ID,
 				Kind:    "delegation_worktree_skipped",
 				Message: fmt.Sprintf("delegation %q runs against the base checkout: integration worktree unavailable", request.DelegationID),
@@ -760,7 +763,7 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 			// Validate against the integration worktree's own HEAD, not the inherited
 			// parent HeadSHA (see isDelegationWorktreeChild).
 			request.HeadSHA = ""
-			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			_ = e.recordEffectEvent(ctx, db.JobEvent{
 				JobID:   job.ID,
 				Kind:    "delegation_integrated",
 				Message: fmt.Sprintf("delegation %q runs in an integration worktree merging %d implement leg(s)", request.DelegationID, len(integration.branches)),
@@ -791,7 +794,7 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 				kind = "delegation_worktree_deferred"
 				message = fmt.Sprintf("delegation %q exact-head worktree allocation deferred to the job worker; shared-checkout delivery remains forbidden", request.DelegationID)
 			}
-			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			_ = e.recordEffectEvent(ctx, db.JobEvent{
 				JobID:   job.ID,
 				Kind:    kind,
 				Message: message,
@@ -835,7 +838,7 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 				if fetchErr := fetcher.FetchPullRequest(ctx, "origin", payload.PullRequest); fetchErr != nil {
 					return fmt.Errorf("allocate read-only fan-out worktree for delegation %q: %w; fetch PR ref: %v", request.DelegationID, err, fetchErr)
 				}
-				_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+				_ = e.recordEffectEvent(ctx, db.JobEvent{
 					JobID:   job.ID,
 					Kind:    "delegation_worktree_pr_ref_fetched",
 					Message: fmt.Sprintf("delegation %q exact-head worktree retried after fetching pull/%d/head into the cold checkout", request.DelegationID, payload.PullRequest),
@@ -877,7 +880,7 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 	if err := e.enqueue(ctx, request); err != nil {
 		return fmt.Errorf("dispatch delegation %q: %w", request.DelegationID, err)
 	}
-	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+	_ = e.recordEffectEvent(ctx, db.JobEvent{
 		JobID:   job.ID,
 		Kind:    "delegation_enqueued",
 		Message: fmt.Sprintf("delegation %q enqueued as job %s", request.DelegationID, request.ID),
@@ -955,7 +958,7 @@ func (e Engine) requeueDelegation(ctx context.Context, parentJob db.Job, parentP
 	if err := e.allocateAndEnqueueDelegation(ctx, parentJob, parentPayload, d, request, ref); err != nil {
 		return false, err
 	}
-	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+	_ = e.recordEffectEvent(ctx, db.JobEvent{
 		JobID:   parentJob.ID,
 		Kind:    "delegation_retry",
 		Message: fmt.Sprintf("delegation %q retry %d/%d enqueued as job %s after %s failed", d.ID, next, d.Retry, request.ID, failedChild.ID),
@@ -1021,13 +1024,13 @@ func (e Engine) advanceDelegations(ctx context.Context, parentJob db.Job, parent
 	// not block draining ready dependents.
 	if e.InjectUpstreamDepContext {
 		if augmentedDir, augErr := augmentDelegationManifest(e.ArtifactRoot, parentJob.ID, parentResult, children, dedupWinners, e); augErr != nil {
-			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			_ = e.recordEffectEvent(ctx, db.JobEvent{
 				JobID:   parentJob.ID,
 				Kind:    "delegation_manifest_augment_failed",
 				Message: fmt.Sprintf("augment delegation manifest: %v", augErr),
 			})
 		} else if augmentedDir != "" {
-			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			_ = e.recordEffectEvent(ctx, db.JobEvent{
 				JobID:   parentJob.ID,
 				Kind:    "delegation_manifest_augmented",
 				Message: fmt.Sprintf("delegation manifest augmented at %s", augmentedDir),

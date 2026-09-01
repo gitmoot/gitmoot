@@ -54,6 +54,15 @@ type EscalationRound struct {
 	IntegrityState     string
 	IntegrityCause     string
 	RecoveryAttempts   int64
+	RecoveryOwner      string
+	RecoveryLeaseUntil string
+	// PreEffect* record the resources this round's replay allocated OUTSIDE the effect
+	// transaction (a delegation worktree, a branch lock). They exist so a supersede or
+	// a Class I release can hand them back rather than orphaning them.
+	PreEffectRepo         string
+	PreEffectBranch       string
+	PreEffectWorktreePath string
+	PreEffectLockOwner    string
 }
 
 // Claimed reports whether this round's resolution has been claimed.
@@ -66,14 +75,18 @@ func (r EscalationRound) NeedsRepair() bool {
 
 const escalationRoundColumns = `job_id, round_id, kind, opened_at, COALESCE(resolved_at, ''), claim_verb,
 	COALESCE(claim_generation, 0), claim_payload, COALESCE(effects_completed_at, ''), settled_reason,
-	settled_by, integrity_state, integrity_cause, recovery_attempts`
+	settled_by, integrity_state, integrity_cause, recovery_attempts, recovery_owner,
+	COALESCE(recovery_lease_until, ''), preeffect_repo, preeffect_branch, preeffect_worktree_path,
+	preeffect_lock_owner`
 
 func scanEscalationRound(scan func(...any) error) (EscalationRound, error) {
 	var round EscalationRound
 	err := scan(&round.JobID, &round.RoundID, &round.Kind, &round.OpenedAt, &round.ResolvedAt,
 		&round.ClaimVerb, &round.ClaimGeneration, &round.ClaimPayload, &round.EffectsCompletedAt,
 		&round.SettledReason, &round.SettledBy, &round.IntegrityState, &round.IntegrityCause,
-		&round.RecoveryAttempts)
+		&round.RecoveryAttempts, &round.RecoveryOwner, &round.RecoveryLeaseUntil,
+		&round.PreEffectRepo, &round.PreEffectBranch, &round.PreEffectWorktreePath,
+		&round.PreEffectLockOwner)
 	return round, err
 }
 
@@ -373,4 +386,237 @@ func (s *Store) AdoptLegacyEscalationRound(ctx context.Context, jobID string, ro
 func (s *Store) ExecForTest(ctx context.Context, statement string, args ...any) error {
 	_, err := s.db.ExecContext(ctx, statement, args...)
 	return err
+}
+
+// AcquireEscalationRecoveryLease is THE FENCE. Recovery is exclusively owned through
+// effect commit: only the holder may run pre-effects, apply effects, park the round or
+// settle it (#1673).
+//
+// ORDER MATTERS AND IS PART OF THE DESIGN: the fence is taken BEFORE the pre-effects,
+// so two recoverers can never both allocate a worktree or both try to take a branch
+// lock - an idempotent worktree key does not protect a lock that has an owner.
+//
+// A lease is taken only on an UNPARKED, UNSETTLED round, and an expired lease is
+// reclaimable so a crashed owner cannot wedge the round. Expiry transfers ownership
+// ONLY: it never settles, never discards, and never touches the preserved claim.
+func (s *Store) AcquireEscalationRecoveryLease(ctx context.Context, jobID string, roundID string, owner string, until time.Time, now time.Time) (bool, error) {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return false, errors.New("recovery lease owner is required")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE escalation_rounds
+		SET recovery_owner = ?, recovery_lease_until = ?
+		WHERE job_id = ? AND round_id = ?
+		  AND effects_completed_at IS NULL
+		  AND integrity_state = ''
+		  AND (recovery_owner = '' OR recovery_lease_until IS NULL OR recovery_lease_until <= ?)`,
+		owner, formatResourceLockTime(until), strings.TrimSpace(jobID), strings.TrimSpace(roundID),
+		formatResourceLockTime(now))
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
+}
+
+// ReleaseEscalationRecoveryLease drops a lease this owner still holds so a finished
+// pass does not make the round wait out its lease.
+func (s *Store) ReleaseEscalationRecoveryLease(ctx context.Context, jobID string, roundID string, owner string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE escalation_rounds
+		SET recovery_owner = '', recovery_lease_until = NULL
+		WHERE job_id = ? AND round_id = ? AND recovery_owner = ? AND effects_completed_at IS NULL`,
+		strings.TrimSpace(jobID), strings.TrimSpace(roundID), strings.TrimSpace(owner))
+	return err
+}
+
+// RecordEscalationRoundPreEffects durably records the resources a replay allocated
+// outside the effect transaction, under the held fence. It is what lets a later
+// supersede or Class I release hand those resources back instead of orphaning them.
+func (s *Store) RecordEscalationRoundPreEffects(ctx context.Context, jobID string, roundID string, owner string, repo string, branch string, worktreePath string, lockOwner string, now time.Time) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE escalation_rounds
+		SET preeffect_repo = ?, preeffect_branch = ?, preeffect_worktree_path = ?, preeffect_lock_owner = ?
+		WHERE job_id = ? AND round_id = ? AND effects_completed_at IS NULL
+		  AND recovery_owner = ? AND recovery_lease_until > ?`,
+		strings.TrimSpace(repo), strings.TrimSpace(branch), strings.TrimSpace(worktreePath),
+		strings.TrimSpace(lockOwner), strings.TrimSpace(jobID), strings.TrimSpace(roundID),
+		strings.TrimSpace(owner), formatResourceLockTime(now))
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
+}
+
+// ResolutionCommit is EVERY durable write one resolution performs. It exists so they
+// commit in ONE lease-guarded transaction: there is then no "after effect N, before
+// receipt" state for a crash to land in, which is what a per-effect boundary could not
+// give (#1673).
+type ResolutionCommit struct {
+	JobID   string
+	RoundID string
+	Owner   string
+	// Jobs are prepared rows: PREPARE did every non-write step, so nothing here needs
+	// computation, network, git or policy resolution inside the transaction.
+	Jobs []PreparedJob
+	// Task, when TaskID is set, is the task-state transition plus its event.
+	Task           Task
+	TaskForbidden  []string
+	TaskEvent      TaskEvent
+	TaskEventValid bool
+	// Events are the verb's own job events, including the isolation-skipped note, which
+	// is a job_events row and therefore belongs INSIDE the transaction.
+	Events []JobEvent
+	// Receipt settles the round and releases its slot. Omitted (ReceiptValid false)
+	// when the transaction's outcome is the ALTERNATIVE one - a blocked allocation -
+	// where the claim must stay preserved so a crash-replay cannot double-block.
+	Receipt      JobEvent
+	ReceiptValid bool
+}
+
+// PreparedJob is one job row plus the events that must land with it.
+type PreparedJob struct {
+	Job    Job
+	Events []JobEvent
+}
+
+// CommitResolutionEffects commits a resolution in ONE transaction, with the fence
+// validated inside it. Zero affected rows on the fence check ABORTS EVERYTHING: no
+// job, no task write, no event, no receipt, and the claim preserved.
+//
+// Every write goes through tx-scoped statements taking this transaction handle; no
+// effect opens its own transaction or connection.
+func (s *Store) CommitResolutionEffects(ctx context.Context, commit ResolutionCommit, now time.Time) (bool, error) {
+	jobID := strings.TrimSpace(commit.JobID)
+	roundID := strings.TrimSpace(commit.RoundID)
+	owner := strings.TrimSpace(commit.Owner)
+	if jobID == "" || roundID == "" || owner == "" {
+		return false, errors.New("resolution commit requires job id, round id and fence owner")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	// THE FENCE, validated inside the transaction that commits the effects.
+	fence, err := tx.ExecContext(ctx, `UPDATE escalation_rounds
+		SET recovery_lease_until = ?
+		WHERE job_id = ? AND round_id = ? AND effects_completed_at IS NULL
+		  AND recovery_owner = ? AND recovery_lease_until > ?`,
+		formatResourceLockTime(now.Add(2*time.Minute)), jobID, roundID, owner, formatResourceLockTime(now))
+	if err != nil {
+		return false, err
+	}
+	held, err := fence.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if held != 1 {
+		// Lost the fence: an operator superseded the round, it was parked, or the lease
+		// lapsed. Nothing may land.
+		return false, nil
+	}
+
+	for _, prepared := range commit.Jobs {
+		if err := createJobWithEventTx(ctx, tx, s, prepared.Job, JobEvent{
+			JobID: prepared.Job.ID, Kind: prepared.Job.State, Message: "job queued",
+		}); err != nil {
+			return false, err
+		}
+		for _, event := range prepared.Events {
+			if strings.TrimSpace(event.JobID) == "" {
+				event.JobID = prepared.Job.ID
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`,
+				event.JobID, event.Kind, event.Message); err != nil {
+				return false, err
+			}
+		}
+	}
+
+	if strings.TrimSpace(commit.Task.ID) != "" {
+		if _, err := s.upsertTaskUnlessStates(ctx, tx, commit.Task, commit.TaskForbidden); err != nil {
+			return false, err
+		}
+		if commit.TaskEventValid {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO task_events(task_id, kind, from_state, to_state, reason)
+				VALUES (?, ?, ?, ?, ?)`, commit.Task.ID, commit.TaskEvent.Kind, commit.TaskEvent.FromState,
+				commit.TaskEvent.ToState, commit.TaskEvent.Reason); err != nil {
+				return false, err
+			}
+		}
+	}
+
+	for _, event := range commit.Events {
+		if strings.TrimSpace(event.JobID) == "" {
+			event.JobID = jobID
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`,
+			event.JobID, event.Kind, event.Message); err != nil {
+			return false, err
+		}
+	}
+
+	if commit.ReceiptValid {
+		if _, err := tx.ExecContext(ctx, `UPDATE escalation_rounds
+			SET effects_completed_at = ?, recovery_owner = '', recovery_lease_until = NULL
+			WHERE job_id = ? AND round_id = ? AND effects_completed_at IS NULL`,
+			formatResourceLockTime(now), jobID, roundID); err != nil {
+			return false, err
+		}
+		event := commit.Receipt
+		if strings.TrimSpace(event.JobID) == "" {
+			event.JobID = jobID
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`,
+			event.JobID, event.Kind, event.Message); err != nil {
+			return false, err
+		}
+	}
+	return true, tx.Commit()
+}
+
+// MarkEscalationRoundNeedsRepairAsOwner parks a round only for its FENCE HOLDER. That
+// restriction is what pairs with supersede's needs_repair precondition to make an
+// operator discard and an in-flight replay mutually exclusive rather than racing
+// (#1673). It clears the fence as it parks, so the parked round is by construction
+// unfenced and therefore supersedable.
+func (s *Store) MarkEscalationRoundNeedsRepairAsOwner(ctx context.Context, jobID string, roundID string, owner string, cause string, event JobEvent, now time.Time) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE escalation_rounds
+		SET integrity_state = ?, integrity_cause = ?, integrity_at = ?,
+		    recovery_owner = '', recovery_lease_until = NULL
+		WHERE job_id = ? AND round_id = ? AND integrity_state = '' AND effects_completed_at IS NULL
+		  AND recovery_owner = ? AND recovery_lease_until > ?`,
+		EscalationRoundIntegrityNeedsRepair, strings.TrimSpace(cause), formatResourceLockTime(now),
+		strings.TrimSpace(jobID), strings.TrimSpace(roundID), strings.TrimSpace(owner),
+		formatResourceLockTime(now))
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected != 1 {
+		return false, tx.Commit()
+	}
+	if strings.TrimSpace(event.JobID) == "" {
+		event.JobID = strings.TrimSpace(jobID)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`,
+		event.JobID, event.Kind, event.Message); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
 }

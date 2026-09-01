@@ -3172,7 +3172,10 @@ func TestMigrateAppendsTaskWorktreePath(t *testing.T) {
 		t.Fatalf("sql.Open returned error: %v", err)
 	}
 	store := &Store{db: raw}
-	for version, migration := range migrationsBefore(t, "worktree_path") {
+	// The marker must name the TASKS column specifically: #1673 added an
+	// escalation_rounds.preeffect_worktree_path, so a bare "worktree_path" now matches
+	// two migrations and cannot identify this one.
+	for version, migration := range migrationsBefore(t, "ALTER TABLE tasks ADD COLUMN worktree_path") {
 		if err := store.applyMigration(ctx, version+1, migration); err != nil {
 			t.Fatalf("applyMigration(%d) returned error: %v", version+1, err)
 		}

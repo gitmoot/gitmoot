@@ -2442,6 +2442,23 @@ CREATE TABLE escalation_rounds (
 	integrity_cause TEXT NOT NULL DEFAULT '',
 	integrity_at TEXT,
 	recovery_attempts INTEGER NOT NULL DEFAULT 0,
+	-- THE FENCE. Recovery is EXCLUSIVELY OWNED through effect commit: only the holder
+	-- may run pre-effects, apply effects, park the round or settle it, and the fence is
+	-- validated INSIDE the transaction that commits the effects. Because parking
+	-- requires the fence and an operator supersede requires a parked round, a supersede
+	-- and an in-flight replay are mutually exclusive rather than racing.
+	recovery_owner TEXT NOT NULL DEFAULT '',
+	recovery_lease_until TEXT,
+	-- THE PRE-EFFECT RESOURCE RECORD. Allocating a delegation worktree and taking a
+	-- branch lock are git/lock operations that cannot live inside a database
+	-- transaction, so they run under the held fence BEFORE it and are recorded here.
+	-- This row is what makes orphan release possible: when a round is superseded by an
+	-- operator, or released because its coordinator is gone, these are the resources
+	-- that must be handed back.
+	preeffect_repo TEXT NOT NULL DEFAULT '',
+	preeffect_branch TEXT NOT NULL DEFAULT '',
+	preeffect_worktree_path TEXT NOT NULL DEFAULT '',
+	preeffect_lock_owner TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY(job_id, round_id)
 );
 -- THE EXCLUSION INVARIANT, as a schema constraint rather than a predicate a caller
