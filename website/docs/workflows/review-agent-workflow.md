@@ -40,10 +40,40 @@ job targets the lead while the reviewer stays read-only. Omitting `--lead`
 checks the reviewer as the fallback implementer and therefore refuses a strict
 review-only agent before spending a review session.
 
-## Risk-Tiered Adaptive Review
+## Review Policy
 
-Gitmoot can scale review depth to a change's blast radius through the
-off-by-default `[review]` config section (not in the generated default config):
+Review severity controls whether a reported finding restarts the fix loop. The
+default preserves the existing block-all behavior:
+
+```toml
+[review]
+blocking_severity = "P3"
+
+[repos."themartianapp/keephair".review]
+blocking_severity = "P1"
+```
+
+The threshold is inclusive. `P1` blocks `P0` and `P1`; `P2` and `P3` findings
+are still posted and the raw `changes_requested` result remains stored, but the
+round resolves as approved-with-notes and Gitmoot does not dispatch a fix. The
+global default is `P3`. Configured values must be `P0`, `P1`, `P2`, or `P3`.
+An invalid `blocking_severity` value falls back to `P3` while other valid review
+fields remain active. Any other review-policy parse or read error rejects the
+entire applied review policy, restoring `P3` with native fanout and risk tiers
+off.
+
+The threshold applies to native review rounds only. A pipeline review stage is
+report-only — the pipeline advancer owns folding its verdict — so its raw
+`changes_requested` keeps blocking the merge gate at every threshold and never
+counts toward required-reviewer approval. The resolved outcome is recorded on
+the review job as a `review_approved_with_notes` event, which is what
+`gitmoot proof` reads for its approval claim and what the `review_verdict`
+awaited fact reports when it wakes a waiting role.
+
+### Risk-Tiered Adaptive Review
+
+Set `risk_tiers_enabled = true` in `[review]` to scale review depth to a
+change's blast radius:
 
 ```toml
 [review]
@@ -54,24 +84,23 @@ risk_label_high = "risk:high"        # a PR label that forces the high tier
 risk_label_routine = "risk:routine"  # a PR label that forces the routine tier
 ```
 
-When enabled, every opened PR is classified — **explicit PR label > changed-path
-glob match > default routine**. A `risk:high` / `risk:routine` label wins over the
-path heuristics, and a high label wins a label tie (safety-biased).
+When enabled, every opened PR is classified: **explicit PR label > changed-path
+glob match > default routine**. A `risk:high` / `risk:routine` label wins over
+the path heuristics, and a high label wins a label tie.
 
-- **routine** PRs keep the existing single-reviewer fan-out, unchanged.
+- **routine** PRs keep the existing single-reviewer fan-out.
 - **high** PRs fan out a delegation batch of **refutation-framed lens reviewers**
-  (correctness, security, and — with three or more configured reviewers —
+  (correctness, security, and, with three or more configured reviewers,
   regression). Each lens is prompted to actively *disprove* the change along one
   axis and return structured findings `{lens, refuted, severity, confidence,
   evidence}` in `gitmoot_result.findings`.
 
 The lens outcomes are synthesized by the existing delegation `synthesis_rule =
-quorum` engine (not a bespoke synthesizer): **any critical-severity refutation —
-reported as a `blocked` lens decision — fails the quorum and blocks the merge**;
-unanimous approval satisfies it. The resolved tier is recorded as a
-`risk_tier_resolved` job event so an escalation is explainable in the report and
-dashboard.
+quorum` engine: **any blocking refutation fails the quorum and blocks the merge**;
+the configured quorum of effective approvals satisfies it. The resolved tier is
+recorded as a `risk_tier_resolved` job event so an escalation is explainable in
+the report and dashboard.
 
-With the `[review]` section absent or `risk_tiers_enabled` off, PR review is
-byte-for-byte the single-reviewer path. The competition tier (two independent
-implementations plus a judge) is a planned follow-up.
+With `risk_tiers_enabled` off, PR review uses the single-reviewer path. The
+competition tier (two independent implementations plus a judge) is a planned
+follow-up.

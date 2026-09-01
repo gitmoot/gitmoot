@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 )
 
 func highRiskEvent() PullRequestEvent {
@@ -426,6 +427,99 @@ func TestHighRiskChangesRequestedLensFailsQuorum(t *testing.T) {
 	assertTaskState(t, store, "task-7", TaskBlocked)
 	if jobExists(t, store, delegationContinuationID(coordID)) {
 		t.Fatal("an unmet quorum must NOT enqueue a coordinator continuation")
+	}
+}
+
+func TestHighRiskSubthresholdLensSatisfiesQuorum(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement", "ask"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "sec", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	engine.RiskTiersEnabled = true
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+
+	if err := engine.HandlePullRequestOpened(ctx, highRiskEvent()); err != nil {
+		t.Fatalf("HandlePullRequestOpened returned error: %v", err)
+	}
+	coordID := "review-coordinator/task-7/review-1"
+	correctnessID := coordID + "/delegation/" + LensCorrectness
+	securityID := coordID + "/delegation/" + LensSecurity
+	completeDelegationChild(t, store, correctnessID, JobSucceeded, AgentResult{Decision: "approved", Summary: "clean"})
+	if err := engine.AdvanceJob(ctx, correctnessID); err != nil {
+		t.Fatalf("AdvanceJob(correctness) returned error: %v", err)
+	}
+	completeDelegationChild(t, store, securityID, JobSucceeded, AgentResult{
+		Decision: "changes_requested",
+		Severity: reviewseverity.P2,
+		Summary:  "non-blocking polish",
+	})
+	securityJob := mustJob(t, store, securityID)
+	securityPayload, err := unmarshalPayload(securityJob.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(security) returned error: %v", err)
+	}
+	quorumMet, err := engine.highRiskLensQuorumMet(ctx, securityPayload)
+	if err != nil {
+		t.Fatalf("highRiskLensQuorumMet returned error: %v", err)
+	}
+	if !quorumMet {
+		t.Fatal("high-risk merge quorum must count the sub-threshold security lens")
+	}
+	if err := engine.AdvanceJob(ctx, securityID); err != nil {
+		t.Fatalf("AdvanceJob(security) returned error: %v", err)
+	}
+
+	if !jobExists(t, store, delegationContinuationID(coordID)) {
+		t.Fatal("sub-threshold lens must satisfy quorum and enqueue the coordinator continuation")
+	}
+	if task, _ := store.GetTask(ctx, "task-7"); task.State == string(TaskBlocked) {
+		t.Fatal("sub-threshold lens must not block the task")
+	}
+}
+
+func TestReviewDelegationQuorumThresholdOnlyAppliesToReviewChildren(t *testing.T) {
+	for _, action := range []string{"ask", "implement"} {
+		t.Run(action, func(t *testing.T) {
+			delegations := []Delegation{
+				{ID: "review", Action: "review"},
+				{ID: "other", Action: action},
+			}
+			children := map[string]db.Job{
+				"review": {ID: "review", Type: "review", State: string(JobSucceeded)},
+				"other":  {ID: "other", Type: action, State: string(JobSucceeded)},
+			}
+			payloads := map[string]JobPayload{
+				"review": {Result: &AgentResult{Decision: "changes_requested", Severity: reviewseverity.P2}},
+				"other":  {Result: &AgentResult{Decision: "changes_requested", Severity: reviewseverity.P2}},
+			}
+
+			if reviewDelegationQuorumSatisfied(delegations, children, payloads, 2, reviewseverity.P1) {
+				t.Fatalf("sub-threshold %s child counted as a review approval", action)
+			}
+			payloads["other"] = JobPayload{Result: &AgentResult{Decision: "approved"}}
+			if !reviewDelegationQuorumSatisfied(delegations, children, payloads, 2, reviewseverity.P1) {
+				t.Fatalf("approved %s child plus sub-threshold review did not satisfy quorum", action)
+			}
+		})
+	}
+}
+
+func TestDelegationVotePreservesSucceededStateContract(t *testing.T) {
+	delegations := []Delegation{{
+		ID: "verdict", Action: "ask", SynthesisRule: "vote",
+	}}
+	children := map[string]db.Job{
+		"verdict": {ID: "verdict", Type: "ask", State: string(JobSucceeded)},
+	}
+	for _, decision := range []string{"skipped", "changes_requested"} {
+		payloads := map[string]JobPayload{
+			"verdict": {Result: &AgentResult{Decision: decision, Severity: reviewseverity.P2}},
+		}
+		if !delegationVoteSatisfied(delegations, children, payloads) {
+			t.Fatalf("succeeded child with decision %q must satisfy the documented vote contract", decision)
+		}
 	}
 }
 

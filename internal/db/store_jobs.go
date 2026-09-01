@@ -105,7 +105,7 @@ func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent,
 			return err
 		}
 	}
-	if err := resolveAwaitedReviewFactTx(ctx, tx, job.ID, job.Agent, job.Type, job.State, job.Payload, time.Now().UTC()); err != nil {
+	if err := resolveAwaitedReviewFactTx(ctx, tx, job.ID, job.Agent, job.Type, job.State, job.Payload, s.blockingSeverityFor, time.Now().UTC()); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -787,7 +787,7 @@ func (s *Store) TransitionJobStatePayloadWithEventAtGeneration(ctx context.Conte
 	if err := tx.QueryRowContext(ctx, `SELECT agent, type FROM jobs WHERE id = ?`, id).Scan(&agent, &jobType); err != nil {
 		return false, err
 	}
-	if err := resolveAwaitedReviewFactTx(ctx, tx, id, agent, jobType, to, payload, time.Now().UTC()); err != nil {
+	if err := resolveAwaitedReviewFactTx(ctx, tx, id, agent, jobType, to, payload, s.blockingSeverityFor, time.Now().UTC()); err != nil {
 		return false, err
 	}
 	return true, tx.Commit()
@@ -897,7 +897,7 @@ func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id strin
 	if err := tx.QueryRowContext(ctx, `SELECT agent, type FROM jobs WHERE id = ?`, id).Scan(&agent, &jobType); err != nil {
 		return false, err
 	}
-	if err := resolveAwaitedReviewFactTx(ctx, tx, id, agent, jobType, to, payload, time.Now().UTC()); err != nil {
+	if err := resolveAwaitedReviewFactTx(ctx, tx, id, agent, jobType, to, payload, s.blockingSeverityFor, time.Now().UTC()); err != nil {
 		return false, err
 	}
 	return true, tx.Commit()
@@ -956,7 +956,7 @@ func (s *Store) TransitionJobStatePayloadUsageWithEvent(ctx context.Context, id 
 	if err := tx.QueryRowContext(ctx, `SELECT agent, type FROM jobs WHERE id = ?`, id).Scan(&agent, &jobType); err != nil {
 		return false, err
 	}
-	if err := resolveAwaitedReviewFactTx(ctx, tx, id, agent, jobType, to, payload, time.Now().UTC()); err != nil {
+	if err := resolveAwaitedReviewFactTx(ctx, tx, id, agent, jobType, to, payload, s.blockingSeverityFor, time.Now().UTC()); err != nil {
 		return false, err
 	}
 	return true, tx.Commit()
@@ -1163,7 +1163,7 @@ func (s *Store) UpdateJobPayloadAndStateWithEvent(ctx context.Context, id string
 	if err := tx.QueryRowContext(ctx, `SELECT agent, type FROM jobs WHERE id = ?`, id).Scan(&agent, &jobType); err != nil {
 		return err
 	}
-	if err := resolveAwaitedReviewFactTx(ctx, tx, id, agent, jobType, state, payload, time.Now().UTC()); err != nil {
+	if err := resolveAwaitedReviewFactTx(ctx, tx, id, agent, jobType, state, payload, s.blockingSeverityFor, time.Now().UTC()); err != nil {
 		return err
 	}
 	return tx.Commit()

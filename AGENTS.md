@@ -317,6 +317,85 @@ live-probe before close. The **OWNER holds merge authority**. Under ultracode,
 orchestrate via the Workflow tool with opus sub-agents (protect the scarcer fable
 quota).
 
+## Workload mode
+
+**Current mode: DRAIN.**
+
+A mode switch is a merged PR that changes the line above. It takes effect at
+that PR's `mergedAt` time. At the next check-in, the coordinator must:
+
+1. fetch `origin/main`, read the marker from `origin/main:AGENTS.md` rather than
+   the seat's worktree, and steer every active seat to the merged mode;
+2. comment on the merged mode-switch PR with this exact transition record:
+   `[workload-mode-transition]`, `mode: <THROUGHPUT|DRAIN>`,
+   `effective_commit: <40-character SHA>`, `observed_at: <RFC3339>`, zero or more
+   `implementer: <seat> issue=<number> pr=<number|none> accepted_at=<RFC3339>`
+   lines, zero or more `review: <job-id> pr=<number> created_at=<RFC3339>`
+   lines, then
+   `[/workload-mode-transition]`.
+
+For DRAIN, the listed transition wave is derived from durable timestamps:
+implementation assignments accepted before `mergedAt` that have not reached a
+terminal handoff, plus review jobs created before `mergedAt` that were queued or
+running then. `accepted_at` is the timestamp of the Herdr pane's first
+`working` status event after the issue-backed assignment prompt; `created_at` is
+the job-store timestamp. The merged PR always exists, so this record does not
+depend on a pre-existing workflow. The mode changes how much work may start; it
+never relaxes correctness, exact-head review, CI, or owner merge authority.
+
+Across both modes, use exactly one independent reviewer per corrected head.
+Parallel review lanes mean different PRs, not multiple reviewers on one head.
+Review panels and fanout require explicit, durable owner authorization for that
+specific incident; an incident does not override this rule by itself.
+
+### Throughput mode
+
+- Start independent, issue-backed work when ownership and integration order are
+  clear.
+- Parallelize genuinely independent implementation lanes and reviews of
+  different PRs under the repository's normal safety rules.
+- Stop opening new lanes when work queues behind shared files, unresolved
+  integration order, or repeated review findings.
+
+### Drain mode
+
+- Finish and merge the active queue; do not expand it. Do not start new issues,
+  PRs, experiments, or speculative cleanup unless a security, data-loss, or
+  live-service incident requires containment.
+- Grandfathered transition-wave items may temporarily exceed the normal cap,
+  but they count toward occupancy. No unlisted work may start while occupancy
+  exceeds the cap. Each listed item loses its exemption at its first subsequent
+  terminal handoff: review verdict, blocked or parked seat, merged PR, or
+  explicit cancellation. Once occupancy reaches the cap, it must not rise above
+  it again; never replace a completed transition-wave item with new work.
+- After activation, cap the `gitmoot/*` scope at **two active implementers and
+  one running reviewer**. An active implementer is a persistent seat currently
+  changing code or a running engine implementation job.
+- A DRAIN mode-switch PR is not merge-ready until the coordinator configures
+  the shared daemon with `[daemon] workers = 1`; every active
+  `[repos."gitmoot/*"].max_parallel` override must be absent, zero, or one.
+  Apply the warm reload and verify both the effective global worker count and
+  every effective per-repository limit. This is the atomic runtime gate shared
+  by native PR fanout, heartbeats, and manual background reviews.
+- Before that PR merges, every foreground or persistent-seat review already in
+  progress must reach a terminal handoff; those reviews cannot be grandfathered.
+  All DRAIN reviews then run as background engine jobs. Never bypass the shared
+  gate with a foreground or persistent-seat reviewer.
+- Before that PR merges, disable every `action=review` heartbeat and allow
+  exactly one review-capable agent on each active `gitmoot/*` repository. For a
+  PR with a branch lock, the native PR watcher is the sole producer; do not also
+  dispatch a manual review. For a PR without a branch lock, native fanout cannot
+  run, so only the coordinator may enqueue its single manual review.
+- Prioritize merge-ready work and merge-gate integrity, then serial dependency
+  chains, then resource-safety work. Rebase conflicted branches only after
+  upstream merges settle. Keep drafts and backlog work parked.
+- If another correction receives a new substantive P1, stop the patch loop and
+  re-plan the defect class before writing more code.
+- Run routine coordinator check-ins hourly. Owner messages, directives, and
+  review verdicts remain immediate.
+- Zero-model-token operational pipelines, including the hourly PR report, may
+  continue.
+
 ## Escalation: ping your org parent, and ping again
 
 When you need something from your **org parent** — a dispatch you cannot make, a

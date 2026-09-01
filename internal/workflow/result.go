@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
@@ -38,7 +39,7 @@ var ResultDecisions = []string{"approved", "changes_requested", "blocked", "impl
 // ReviewSeverities are ordered from most to least severe. A review returning
 // changes_requested must report the highest-severity finding through this
 // engine-readable field rather than only in prose.
-var ReviewSeverities = []string{"P0", "P1", "P2", "P3"}
+var ReviewSeverities = reviewseverity.Values
 
 // DelegationActions is the canonical set of delegation/session job actions.
 var DelegationActions = []string{"ask", "review", "implement"}
@@ -373,7 +374,7 @@ func validateAgentResult(result AgentResult) error {
 
 func validateAgentResultSeverity(result AgentResult) error {
 	severity := strings.TrimSpace(result.Severity)
-	if severity != "" && (result.Severity != severity || !slices.Contains(ReviewSeverities, severity)) {
+	if severity != "" && (result.Severity != severity || !reviewseverity.Valid(severity)) {
 		return fmt.Errorf("unsupported gitmoot_result severity %q (want one of %s)", result.Severity, strings.Join(ReviewSeverities, ", "))
 	}
 	return nil

@@ -156,6 +156,34 @@ func (e Engine) recordImplementNoPRAdvance(ctx context.Context, jobID, decision 
 	})
 }
 
+// recordFoldedReviewOutcome persists the durable approved-with-notes outcome for a
+// sub-threshold changes-requested review. proof/project.go keys its review.approved
+// claim on this event, and the merge gate, required-reviewer evaluation, delegation
+// quorum and verify synthesis all fold the same verdict to approved regardless — so
+// a fold that is not recorded leaves those surfaces contradicting `gitmoot proof`.
+//
+// It is called once at the TOP of AdvanceJob rather than at any point inside it.
+// Pipeline-sender reviews are excluded for free: effectiveReviewDecisionForPayload
+// keeps their verdict raw, so they never reach "approved" here. blocked/failed are
+// excluded by the changes_requested test. AddJobEventIfAbsent makes every replay,
+// re-advance and stale round idempotent.
+func (e Engine) recordFoldedReviewOutcome(ctx context.Context, job db.Job, payload JobPayload) error {
+	if job.Type != "review" || payload.Result == nil ||
+		payload.Result.Decision != "changes_requested" {
+		return nil
+	}
+	blockingSeverity := e.reviewBlockingSeverity(payload.Repo)
+	if effectiveReviewDecisionForPayload(payload, blockingSeverity) != "approved" {
+		return nil
+	}
+	return e.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
+		JobID: job.ID,
+		Kind:  ReviewApprovedWithNotesEventKind,
+		Message: fmt.Sprintf("review severity %s is below repository blocking severity %s; findings remain recorded and no fix is dispatched",
+			payload.Result.Severity, blockingSeverity),
+	})
+}
+
 func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	if err := e.validate(); err != nil {
 		return err
@@ -237,6 +265,17 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	defer func() {
 		retErr = errors.Join(retErr, e.cleanupConsumedImplementLegWorktrees(ctx, payload))
 	}()
+
+	// Recorded BEFORE any early return in this function, and deliberately not
+	// positioned relative to them. Five consecutive review rounds each found a
+	// DIFFERENT early return that skipped a positionally-placed write — the
+	// approval replay guard, the PR-less arm, the top-level ask-gate, and the
+	// delegated-child ask-gate. Position is not a property that survives edits;
+	// being first is. Every consumer folds this verdict the same way whether or not
+	// advancement proceeds, so the record is owed unconditionally.
+	if err := e.recordFoldedReviewOutcome(ctx, job, payload); err != nil {
+		return err
+	}
 
 	// Commit a succeeded implement leg's work to its own branch BEFORE advancing
 	// the parent's delegation DAG. The parent advance below may enqueue a dependent
@@ -354,6 +393,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			Message: "pipeline review recorded as report-only; pipeline advancement owns the verdict and human merge remains required",
 		})
 	}
+	effectiveDecision := payload.Result.Decision
 	if job.Type == "review" {
 		latest, err := e.latestReviewRound(ctx, payload)
 		if err != nil {
@@ -362,6 +402,11 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		if latest != "" && strings.TrimSpace(payload.ReviewRound) != latest {
 			return nil
 		}
+		// Pipeline-sender reviews already returned above as report-only, so this is
+		// reached only by native reviews. Folding through the payload authority
+		// anyway keeps the invariant LOCAL rather than dependent on that distant
+		// early return surviving future edits.
+		effectiveDecision = effectiveReviewDecisionForPayload(payload, e.reviewBlockingSeverity(payload.Repo))
 	}
 	if payload.Result.Decision == "blocked" || payload.Result.Decision == "failed" {
 		return e.block(ctx, ref, payload.Result.Summary)
@@ -394,7 +439,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		// delegations[] must NOT also dispatch and no second continuation enqueues.
 		return nil
 	}
-	if job.Type == "review" && payload.Result.Decision == "approved" {
+	if job.Type == "review" && effectiveDecision == "approved" {
 		done, err := e.reviewApprovalAlreadyAdvanced(ctx, ref)
 		if err != nil {
 			return err
@@ -520,7 +565,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			return e.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_skipped_no_pr", Message: "no pull request is attached; skipping review advancement"})
 		}
 		reviewer := reviewDecisionAgent(job, payload)
-		switch payload.Result.Decision {
+		switch effectiveDecision {
 		case "changes_requested":
 			if err := e.setTaskState(ctx, ref, TaskChangesRequested); err != nil {
 				return err

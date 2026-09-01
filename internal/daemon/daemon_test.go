@@ -2249,8 +2249,19 @@ func TestPollOnceDoesNotTreatManualReviewJobAsWorkflowRoute(t *testing.T) {
 	if err := daemon.PollOnce(ctx); err != nil {
 		t.Fatalf("PollOnce returned error: %v", err)
 	}
-	if _, err := store.GetJob(ctx, "review-audit-task-7-review-2"); err != nil {
+	workflowJob, err := store.GetJob(ctx, "review-audit-task-7-review-1")
+	if err != nil {
 		t.Fatalf("GetJob workflow review round returned error: %v", err)
+	}
+	var workflowPayload workflow.JobPayload
+	if err := json.Unmarshal([]byte(workflowJob.Payload), &workflowPayload); err != nil {
+		t.Fatalf("Unmarshal workflow review payload returned error: %v", err)
+	}
+	if workflowPayload.ReviewRound != "review-1" {
+		t.Fatalf("workflow review round = %q, want review-1", workflowPayload.ReviewRound)
+	}
+	if _, err := store.GetJob(ctx, "review-audit-task-7-review-2"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("manual empty round counted as numbered workflow history: %v", err)
 	}
 	if pr, err := store.GetPullRequest(ctx, repo.FullName(), 7); err != nil || pr.HeadSHA != "abc123" {
 		t.Fatalf("stored pull request = %+v err=%v", pr, err)

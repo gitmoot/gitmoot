@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
+	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
@@ -1336,6 +1338,7 @@ func TestEngineAdvanceReviewChangesRequestedDispatchesActingRoleAcrossTaskOwnerL
 	seedAgent(t, store, "payload-default", []string{"implement"}, "gitmoot/gitmoot")
 	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
 	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
 	engine.RequireWorkflowPolicy = func(string) RequireWorkflowPolicy { return RequireWorkflowPolicy{Enabled: true, Mode: "strict"} }
 	insertCompletedJob(t, store, db.Job{
 		ID: "original-implement", Agent: "task-owner", Type: "implement",
@@ -1363,7 +1366,12 @@ func TestEngineAdvanceReviewChangesRequestedDispatchesActingRoleAcrossTaskOwnerL
 		TaskTitle:     "Workflow Engine",
 		LeadAgent:     "payload-default",
 		ActingOrgRole: "owner-role",
-		Result:        &AgentResult{Decision: "changes_requested", Summary: "fix edge case"},
+		Result: &AgentResult{
+			Decision: "changes_requested",
+			Severity: reviewseverity.P1,
+			Summary:  "fix edge case",
+			Findings: []json.RawMessage{json.RawMessage(`{"severity":"P1","summary":"edge case"}`)},
+		},
 	})
 
 	err := engine.AdvanceJob(ctx, "review-job")
@@ -1392,6 +1400,519 @@ func TestEngineAdvanceReviewChangesRequestedDispatchesActingRoleAcrossTaskOwnerL
 	}
 	if lock.Owner != "task-owner" || lock.ActingOrgRole != "owner-role" {
 		t.Fatalf("branch lock = %+v, want task-owner serialization with owner-role attribution", lock)
+	}
+}
+
+func TestEngineAdvanceReviewSubthresholdApprovesWithNotes(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(repo string) string {
+		if repo != "mobile/app" {
+			t.Fatalf("blocking severity repo = %q, want mobile/app", repo)
+		}
+		return reviewseverity.P1
+	}
+	gate := &fakeMergeGate{decision: MergeDecision{Ready: true}}
+	engine.MergeGate = gate
+	finding := json.RawMessage(`{"severity":"P2","summary":"medium polish"}`)
+	insertCompletedJob(t, store, db.Job{
+		ID:    "review-notes",
+		Agent: "audit",
+		Type:  "review",
+	}, JobPayload{
+		Repo:        "mobile/app",
+		Branch:      "task-8",
+		PullRequest: 8,
+		TaskID:      "task-8",
+		TaskTitle:   "Mobile App",
+		LeadAgent:   "lead",
+		Result: &AgentResult{
+			Decision: "changes_requested",
+			Severity: reviewseverity.P2,
+			Summary:  "non-blocking polish",
+			Findings: []json.RawMessage{finding},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "review-notes"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+
+	assertTaskState(t, store, "task-8", TaskReadyToMerge)
+	if _, err := store.GetJob(ctx, "implement-lead-task-8"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("sub-threshold review fix job error = %v, want sql.ErrNoRows", err)
+	}
+	if len(gate.requests) != 1 || gate.requests[0].ReviewBlockingSeverity != reviewseverity.P1 {
+		t.Fatalf("merge gate requests = %+v, want threshold P1", gate.requests)
+	}
+	if err := engine.AdvanceJob(ctx, "review-notes"); err != nil {
+		t.Fatalf("replayed AdvanceJob returned error: %v", err)
+	}
+	if len(gate.requests) != 1 {
+		t.Fatalf("replayed approved-with-notes review evaluated merge gate %d times, want 1", len(gate.requests))
+	}
+	stored := mustJob(t, store, "review-notes")
+	payload, err := ParseJobPayload(stored.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload returned error: %v", err)
+	}
+	if payload.Result == nil || payload.Result.Decision != "changes_requested" || payload.Result.Severity != reviewseverity.P2 ||
+		len(payload.Result.Findings) != 1 || string(payload.Result.Findings[0]) != string(finding) {
+		t.Fatalf("stored result was rewritten or findings lost: %+v", payload.Result)
+	}
+	if got := countJobEvents(t, store, "review-notes", ReviewApprovedWithNotesEventKind); got != 1 {
+		t.Fatalf("%s events = %d, want 1", ReviewApprovedWithNotesEventKind, got)
+	}
+}
+
+func TestAllRequiredReviewersApprovedCountsSubthresholdReview(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+	insertCompletedJob(t, store, db.Job{ID: "review-audit", Agent: "audit", Type: "review"}, JobPayload{
+		Repo:        "mobile/app",
+		PullRequest: 8,
+		TaskID:      "task-8",
+		ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "changes_requested",
+			Severity: reviewseverity.P2,
+			Summary:  "non-blocking audit note",
+		},
+	})
+	payload := JobPayload{
+		Repo:        "mobile/app",
+		PullRequest: 8,
+		TaskID:      "task-8",
+		ReviewRound: "review-1",
+		Reviewers:   []string{"audit", "security"},
+	}
+
+	approved, err := engine.allRequiredReviewersApproved(ctx, "security", payload)
+	if err != nil {
+		t.Fatalf("allRequiredReviewersApproved returned error: %v", err)
+	}
+	if !approved {
+		t.Fatal("sub-threshold audit review must count toward required-reviewer approval")
+	}
+}
+
+// A pipeline review stage binds its job to the task/PR/head under Sender=pipeline
+// (internal/pipeline/run.go) and records no ReviewRound, so once the PR head moves
+// on, that stale stage verdict still shares the round of the current native review
+// (sameReviewRound treats two empty rounds as one round). Required-reviewer
+// counting reads stored payloads, so folding a sub-threshold pipeline
+// changes_requested here would let a stage veto satisfy a reviewer slot and clear
+// the merge prerequisites — the pipeline advancer owns that verdict, not this
+// counter. Sender is the only difference between the two cases below.
+func TestAllRequiredReviewersApprovedRejectsFoldedPipelineVeto(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		sender string
+		want   bool
+	}{
+		{name: "native", sender: "", want: true},
+		{name: "pipeline", sender: PipelineJobSender, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			engine := testEngine(store)
+			engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+			insertCompletedJob(t, store, db.Job{ID: "review-stale", Agent: "audit", Type: "review"}, JobPayload{
+				Repo:        "mobile/app",
+				PullRequest: 8,
+				TaskID:      "task-8",
+				HeadSHA:     "oldhead",
+				Sender:      tc.sender,
+				Result: &AgentResult{
+					Decision: "changes_requested",
+					Severity: reviewseverity.P2,
+					Summary:  "stage refused",
+				},
+			})
+			payload := JobPayload{
+				Repo:        "mobile/app",
+				PullRequest: 8,
+				TaskID:      "task-8",
+				HeadSHA:     "head123",
+				Reviewers:   []string{"audit", "security"},
+			}
+
+			approved, err := engine.allRequiredReviewersApproved(ctx, "security", payload)
+			if err != nil {
+				t.Fatalf("allRequiredReviewersApproved returned error: %v", err)
+			}
+			if approved != tc.want {
+				t.Fatalf("allRequiredReviewersApproved = %v, want %v", approved, tc.want)
+			}
+		})
+	}
+}
+
+func TestEngineAdvanceReviewSubthresholdEventIsIdempotentAfterMergeError(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+	gate := &fakeMergeGate{err: errors.New("temporary merge gate failure")}
+	engine.MergeGate = gate
+	insertCompletedJob(t, store, db.Job{ID: "review-notes-retry", Agent: "audit", Type: "review"}, JobPayload{
+		Repo:        "mobile/app",
+		Branch:      "task-9",
+		PullRequest: 9,
+		TaskID:      "task-9",
+		Result: &AgentResult{
+			Decision: "changes_requested",
+			Severity: reviewseverity.P2,
+			Summary:  "non-blocking retry note",
+		},
+	})
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		if err := engine.AdvanceJob(ctx, "review-notes-retry"); err == nil || !strings.Contains(err.Error(), "temporary merge gate failure") {
+			t.Fatalf("AdvanceJob attempt %d error = %v, want temporary merge gate failure", attempt, err)
+		}
+	}
+	if len(gate.requests) != 2 {
+		t.Fatalf("merge gate requests = %d, want 2 retry attempts", len(gate.requests))
+	}
+	if got := countJobEvents(t, store, "review-notes-retry", ReviewApprovedWithNotesEventKind); got != 1 {
+		t.Fatalf("%s events = %d, want 1 across retries", ReviewApprovedWithNotesEventKind, got)
+	}
+}
+
+// proof/project.go keys the review approval claim on the durable
+// review_approved_with_notes event, so a sub-threshold review that advances once
+// the task has ALREADY reached ready_to_merge must still record it. Writing it on
+// the far side of the approval replay guard drops it silently and leaves
+// `gitmoot proof` contradicting the PR comment for the same job.
+func TestEngineAdvanceReviewSubthresholdRecordsOutcomeAfterTaskReadyToMerge(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+	engine.MergeGate = &fakeMergeGate{decision: MergeDecision{Ready: true}}
+	base := JobPayload{
+		Repo: "mobile/app", Branch: "task-8", PullRequest: 8,
+		TaskID: "task-8", TaskTitle: "Mobile App", LeadAgent: "lead",
+	}
+	first := base
+	first.Result = &AgentResult{Decision: "approved", Summary: "ship it"}
+	insertCompletedJob(t, store, db.Job{ID: "review-first", Agent: "audit", Type: "review"}, first)
+	if err := engine.AdvanceJob(ctx, "review-first"); err != nil {
+		t.Fatalf("AdvanceJob(review-first) returned error: %v", err)
+	}
+	assertTaskState(t, store, "task-8", TaskReadyToMerge)
+
+	second := base
+	second.Result = &AgentResult{
+		Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "non-blocking polish",
+	}
+	insertCompletedJob(t, store, db.Job{ID: "review-second", Agent: "sec", Type: "review"}, second)
+	if err := engine.AdvanceJob(ctx, "review-second"); err != nil {
+		t.Fatalf("AdvanceJob(review-second) returned error: %v", err)
+	}
+	if got := countJobEvents(t, store, "review-second", ReviewApprovedWithNotesEventKind); got != 1 {
+		t.Fatalf("%s events = %d, want 1 despite the task already being ready_to_merge",
+			ReviewApprovedWithNotesEventKind, got)
+	}
+	// The replay guard must still hold: advancing again records no second event.
+	if err := engine.AdvanceJob(ctx, "review-second"); err != nil {
+		t.Fatalf("replayed AdvanceJob(review-second) returned error: %v", err)
+	}
+	if got := countJobEvents(t, store, "review-second", ReviewApprovedWithNotesEventKind); got != 1 {
+		t.Fatalf("%s events = %d after replay, want 1", ReviewApprovedWithNotesEventKind, got)
+	}
+}
+
+// P1 from the g7-review verdict on #1693. allRequiredReviewersApproved scans
+// STORED review payloads, so it can see a pipeline job — and folding it through
+// the bare-result helper discarded Sender. A stale pipeline P2 veto then counted
+// as a required reviewer's approval under a P1 threshold, helping satisfy merge
+// prerequisites the pipeline had explicitly refused. Pipeline and local review
+// jobs both carry an empty ReviewRound, so sameReviewRound does not separate them.
+func TestAllRequiredReviewersApprovedKeepsPipelineVetoRaw(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+
+	pipelineVeto := JobPayload{
+		Repo: "mobile/app", PullRequest: 8, TaskID: "task-8",
+		Sender: PipelineJobSender,
+		Result: &AgentResult{
+			Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "stage refused",
+		},
+	}
+	insertCompletedJob(t, store, db.Job{ID: "review-pipeline", Agent: "stagebot", Type: "review"}, pipelineVeto)
+
+	payload := JobPayload{
+		Repo: "mobile/app", PullRequest: 8, TaskID: "task-8",
+		Reviewers: []string{"stagebot", "audit"},
+	}
+	approved, err := engine.allRequiredReviewersApproved(ctx, "audit", payload)
+	if err != nil {
+		t.Fatalf("allRequiredReviewersApproved returned error: %v", err)
+	}
+	if approved {
+		t.Fatal("a pipeline changes_requested veto must never count as a required reviewer's approval")
+	}
+
+	// ACCEPTANCE: the same sub-threshold verdict from a NATIVE reviewer still
+	// counts, so the fix is the pipeline exemption and not a blanket refusal.
+	// A fresh store, because the two rows would otherwise both be scanned.
+	nativeStore := openEngineStore(t)
+	nativeEngine := testEngine(nativeStore)
+	nativeEngine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+	nativeSubThreshold := pipelineVeto
+	nativeSubThreshold.Sender = "stagebot"
+	insertCompletedJob(t, nativeStore, db.Job{ID: "review-native", Agent: "stagebot", Type: "review"}, nativeSubThreshold)
+	approved, err = nativeEngine.allRequiredReviewersApproved(ctx, "audit", payload)
+	if err != nil {
+		t.Fatalf("allRequiredReviewersApproved returned error: %v", err)
+	}
+	if !approved {
+		t.Fatal("a native sub-threshold review must still count toward required-reviewer approval")
+	}
+}
+
+// A PR-less review child is still FOLDED: advanceDelegations counts a
+// sub-threshold child toward delegation quorum and verify synthesis before the
+// PR-only advancement arm is ever reached. Gating the outcome write on
+// PullRequest > 0 therefore suppressed the only event proof/project.go
+// recognizes for exactly the children whose folded verdict is load-bearing.
+func TestEngineAdvanceReviewSubthresholdRecordsOutcomeWithoutPullRequest(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+	insertCompletedJob(t, store, db.Job{ID: "review-noprr", Agent: "audit", Type: "review"}, JobPayload{
+		Repo: "mobile/app", TaskID: "task-8", TaskTitle: "Mobile App", LeadAgent: "lead",
+		Result: &AgentResult{
+			Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "non-blocking polish",
+		},
+	})
+	if err := engine.AdvanceJob(ctx, "review-noprr"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+	if got := countJobEvents(t, store, "review-noprr", ReviewApprovedWithNotesEventKind); got != 1 {
+		t.Fatalf("%s events = %d, want 1 for a PR-less folded review", ReviewApprovedWithNotesEventKind, got)
+	}
+	// The PR-less arm still terminates without review advancement.
+	if got := countJobEvents(t, store, "review-noprr", "advance_skipped_no_pr"); got != 1 {
+		t.Fatalf("advance_skipped_no_pr events = %d, want 1", got)
+	}
+}
+
+// The ask-gate returns before the rest of review advancement, so a review that
+// carries human_questions[] used to be folded to approved by every consumer and
+// recorded by none. The outcome write is hoisted above every early return for
+// exactly this reason — chasing them one at a time is what produced four rounds
+// of the same finding.
+func TestEngineAdvanceReviewSubthresholdRecordsOutcomeBeforeAskGate(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+	engine.MergeGate = &fakeMergeGate{decision: MergeDecision{Ready: true}}
+	insertCompletedJob(t, store, db.Job{ID: "review-asking", Agent: "audit", Type: "review"}, JobPayload{
+		Repo: "mobile/app", Branch: "task-8", PullRequest: 8,
+		TaskID: "task-8", TaskTitle: "Mobile App", LeadAgent: "lead",
+		Result: &AgentResult{
+			Decision: "changes_requested", Severity: reviewseverity.P2,
+			Summary:        "non-blocking polish, but one question",
+			HumanQuestions: []HumanQuestion{{ID: "q1", Prompt: "should the threshold apply to docs-only PRs?"}},
+		},
+	})
+	// The ask-gate pauses the tree; that is expected and not the thing under test.
+	err := engine.AdvanceJob(ctx, "review-asking")
+	var awaiting AwaitingHumanError
+	if err != nil && !errors.As(err, &awaiting) {
+		t.Fatalf("AdvanceJob returned unexpected error: %v", err)
+	}
+	if got := countJobEvents(t, store, "review-asking", ReviewApprovedWithNotesEventKind); got != 1 {
+		t.Fatalf("%s events = %d, want 1 despite the ask-gate pausing the round",
+			ReviewApprovedWithNotesEventKind, got)
+	}
+}
+
+// The DELEGATED-CHILD ask-gate (engine_run_budgets.go, inside the ParentJobID
+// block) returns before the top-level review path is reached at all — it is a
+// second, earlier ask-gate. It was the fifth distinct early return found to skip
+// a positionally-placed outcome write, which is why the write now runs at the top
+// of AdvanceJob instead of at a position relative to any of them.
+func TestEngineAdvanceDelegatedReviewChildAskGateRecordsFoldedOutcome(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+
+	parent := JobPayload{
+		Repo: "mobile/app", Branch: "task-8", PullRequest: 8, TaskID: "task-8",
+		TaskTitle: "Mobile App", LeadAgent: "lead",
+		Result: &AgentResult{Decision: "approved", Summary: "coordinated"},
+	}
+	insertCompletedJob(t, store, db.Job{ID: "coord", Agent: "lead", Type: "ask"}, parent)
+
+	child := parent
+	child.ParentJobID = "coord"
+	child.DelegationID = "lens-a"
+	child.Sender = "lead"
+	child.Result = &AgentResult{
+		Decision: "changes_requested", Severity: reviewseverity.P2,
+		Summary:        "non-blocking, one question",
+		HumanQuestions: []HumanQuestion{{ID: "q1", Prompt: "docs-only too?"}},
+	}
+	insertCompletedJob(t, store, db.Job{ID: "coord/delegation/lens-a", Agent: "audit", Type: "review"}, child)
+
+	err := engine.AdvanceJob(ctx, "coord/delegation/lens-a")
+	var awaiting AwaitingHumanError
+	if err != nil && !errors.As(err, &awaiting) {
+		t.Fatalf("AdvanceJob returned unexpected error: %v", err)
+	}
+	if got := countJobEvents(t, store, "coord/delegation/lens-a", ReviewApprovedWithNotesEventKind); got != 1 {
+		t.Fatalf("%s events = %d, want 1 despite the delegated-child ask-gate returning early",
+			ReviewApprovedWithNotesEventKind, got)
+	}
+}
+
+// Negative controls for the hoisted write. Moving it to the top of AdvanceJob put
+// it AHEAD of the guards that used to sit between the function entry and the old
+// write site — the pipeline report-only return and the stale-review-round return.
+// Each exclusion therefore has to be a property of recordFoldedReviewOutcome
+// itself, not of where it is called. These pin that.
+func TestRecordFoldedReviewOutcomeExclusionsSurviveTheHoist(t *testing.T) {
+	base := func() JobPayload {
+		return JobPayload{
+			Repo: "mobile/app", Branch: "task-8", PullRequest: 8, TaskID: "task-8",
+			TaskTitle: "Mobile App", LeadAgent: "lead",
+		}
+	}
+	cases := []struct {
+		name    string
+		jobType string
+		mutate  func(*JobPayload)
+		want    int
+	}{
+		{
+			name: "pipeline-sender verdict is never folded", jobType: "review",
+			mutate: func(p *JobPayload) {
+				p.Sender = PipelineJobSender
+				p.Result = &AgentResult{Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "stage refused"}
+			},
+			want: 0,
+		},
+		{
+			name: "blocked review records nothing", jobType: "review",
+			mutate: func(p *JobPayload) {
+				p.Result = &AgentResult{Decision: "blocked", Severity: reviewseverity.P2, Summary: "stuck", Needs: []string{"a checkout"}}
+			},
+			want: 0,
+		},
+		{
+			name: "failed review records nothing", jobType: "review",
+			mutate: func(p *JobPayload) {
+				p.Result = &AgentResult{Decision: "failed", Severity: reviewseverity.P2, Summary: "crashed"}
+			},
+			want: 0,
+		},
+		{
+			name: "at-threshold review records nothing", jobType: "review",
+			mutate: func(p *JobPayload) {
+				p.Result = &AgentResult{Decision: "changes_requested", Severity: reviewseverity.P1, Summary: "blocking"}
+			},
+			want: 0,
+		},
+		{
+			name: "an ask job is never folded", jobType: "ask",
+			mutate: func(p *JobPayload) {
+				p.Result = &AgentResult{Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "not a review"}
+			},
+			want: 0,
+		},
+		{
+			name: "an implement job is never folded", jobType: "implement",
+			mutate: func(p *JobPayload) {
+				p.Result = &AgentResult{Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "not a review"}
+			},
+			want: 0,
+		},
+		{
+			name: "the shape that SHOULD be recorded still is", jobType: "review",
+			mutate: func(p *JobPayload) {
+				p.Result = &AgentResult{Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "non-blocking"}
+			},
+			want: 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			engine := testEngine(store)
+			engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+			payload := base()
+			tc.mutate(&payload)
+			job := db.Job{ID: "j-" + tc.jobType, Agent: "audit", Type: tc.jobType}
+			if err := engine.recordFoldedReviewOutcome(ctx, job, payload); err != nil {
+				t.Fatalf("recordFoldedReviewOutcome returned error: %v", err)
+			}
+			if got := countJobEvents(t, store, job.ID, ReviewApprovedWithNotesEventKind); got != tc.want {
+				t.Fatalf("%s events = %d, want %d", ReviewApprovedWithNotesEventKind, got, tc.want)
+			}
+		})
+	}
+}
+
+// The one BEHAVIOUR CHANGE the hoist introduces: the write now runs ahead of the
+// stale-review-round return, so a stale round records its own folded outcome
+// where previously it recorded nothing. That is defensible — the event is a fact
+// about THAT job's verdict, not about whether its round is current — but it is
+// only safe if it cannot buy merge eligibility. This enters through AdvanceJob
+// to pin both the hoisted write and the gate's rejection of the superseded round.
+func TestStaleRoundOutcomeEventDoesNotGrantMergeEligibility(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+
+	stale := JobPayload{
+		Repo: "mobile/app", Branch: "task-9", PullRequest: 9, HeadSHA: "head123",
+		TaskID: "task-9", ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "old round",
+		},
+	}
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-stale", Agent: "audit", Type: "review"}, stale)
+
+	// A LATER round from the same reviewer makes review-1 stale before AdvanceJob
+	// sees it and supersedes it with a real blocking verdict.
+	current := stale
+	current.ReviewRound = "review-2"
+	current.Result = &AgentResult{
+		Decision: "changes_requested", Severity: reviewseverity.P0, Summary: "blocking now",
+	}
+	insertCompletedJob(t, store, db.Job{ID: "review-current", Agent: "audit", Type: "review"}, current)
+
+	// AdvanceJob must still record the stale round's folded outcome before taking
+	// its stale-round return.
+	if err := engine.AdvanceJob(ctx, "review-stale"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+	if got := countJobEvents(t, store, "review-stale", ReviewApprovedWithNotesEventKind); got != 1 {
+		t.Fatalf("%s events = %d, want 1", ReviewApprovedWithNotesEventKind, got)
+	}
+
+	err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
+		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "audit",
+		ReviewBlockingSeverity: reviewseverity.P1,
+	}, "head123")
+	var blocked mergeBlocked
+	if !errors.As(err, &blocked) {
+		t.Fatalf("ensureFinalReviewCaptured = %v, want the current blocking round to block", err)
 	}
 }
 
@@ -2128,6 +2649,68 @@ func TestEngineReviewLoopAllowsNewHead(t *testing.T) {
 	}
 	if got := reviewJobCount(t, store); got != 2 {
 		t.Fatalf("review job count = %d, want prior plus new-head review", got)
+	}
+}
+
+func TestEngineReviewLoopSparseHistoryDispatchesNextNumericRound(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
+	for _, prior := range []struct {
+		id    string
+		round string
+	}{
+		{id: "prior-review-10-a", round: "review-10"},
+		{id: "prior-review-10-b", round: "review-10"},
+		{id: "prior-review-malformed", round: "manual-round"},
+		{id: "prior-review-empty", round: ""},
+	} {
+		insertCompletedJob(t, store, db.Job{ID: prior.id, Agent: "audit", Type: "review"}, JobPayload{
+			Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, HeadSHA: "head-a",
+			TaskID: "task-7", ReviewRound: prior.round,
+			Result: &AgentResult{Decision: "changes_requested", Summary: "fix it"},
+		})
+	}
+	engine := testEngine(store)
+	gate := &fakeMergeGate{decision: MergeDecision{Ready: true}}
+	engine.MergeGate = gate
+	engine.ReviewChangedFiles = func(context.Context, string, int, string, string) ([]string, error) {
+		return []string{"internal/workflow/engine.go"}, nil
+	}
+	if err := engine.HandlePullRequestOpened(ctx, PullRequestEvent{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, HeadSHA: "head-b",
+		TaskID: "task-7", LeadAgent: "lead", RequiredReviewers: []string{"audit"},
+	}); err != nil {
+		t.Fatalf("new-head dispatch: %v", err)
+	}
+
+	const jobID = "review-audit-task-7-review-11"
+	job := mustJob(t, store, jobID)
+	payload, err := unmarshalPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload: %v", err)
+	}
+	if payload.ReviewRound != "review-11" {
+		t.Fatalf("review round = %q, want review-11", payload.ReviewRound)
+	}
+	payload.Result = &AgentResult{Decision: "approved", Summary: "ready"}
+	encoded, err := marshalPayload(payload)
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.UpdateJobPayload(ctx, jobID, encoded); err != nil {
+		t.Fatalf("UpdateJobPayload: %v", err)
+	}
+	if err := store.UpdateJobState(ctx, jobID, string(JobSucceeded)); err != nil {
+		t.Fatalf("UpdateJobState: %v", err)
+	}
+	if err := engine.AdvanceJob(ctx, jobID); err != nil {
+		t.Fatalf("AdvanceJob: %v", err)
+	}
+	assertTaskState(t, store, "task-7", TaskReadyToMerge)
+	if len(gate.requests) != 1 {
+		t.Fatalf("merge gate requests = %d, want 1", len(gate.requests))
 	}
 }
 
@@ -5010,6 +5593,54 @@ func TestEngineDelegationSynthesisRuleQuorumPassesWhenMet(t *testing.T) {
 	}
 }
 
+func TestEngineRoutineReviewQuorumUsesBlockingSeverity(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "api", []string{"review"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "ui", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+
+	insertCompletedJob(t, store, db.Job{ID: "routine-parent", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:      "gitmoot/gitmoot",
+		Branch:    "task-006",
+		TaskID:    "task-6",
+		TaskTitle: "Routine parent",
+		Sender:    "coord",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "done",
+			Delegations: []Delegation{
+				{ID: "api", Agent: "api", Action: "review", Prompt: "review api", FailurePolicy: "continue", SynthesisRule: "quorum", Quorum: 2},
+				{ID: "ui", Agent: "ui", Action: "review", Prompt: "review ui", FailurePolicy: "continue", SynthesisRule: "quorum", Quorum: 2},
+			},
+		},
+	})
+	if err := engine.AdvanceJob(ctx, "routine-parent"); err != nil {
+		t.Fatalf("AdvanceJob(parent) returned error: %v", err)
+	}
+	completeDelegationChild(t, store, "routine-parent/delegation/api", JobSucceeded, AgentResult{
+		Decision: "approved", Summary: "api clean",
+	})
+	if err := engine.AdvanceJob(ctx, "routine-parent/delegation/api"); err != nil {
+		t.Fatalf("AdvanceJob(api) returned error: %v", err)
+	}
+	completeDelegationChild(t, store, "routine-parent/delegation/ui", JobSucceeded, AgentResult{
+		Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "non-blocking polish",
+	})
+	if err := engine.AdvanceJob(ctx, "routine-parent/delegation/ui"); err != nil {
+		t.Fatalf("AdvanceJob(ui) returned error: %v", err)
+	}
+
+	if !jobExists(t, store, delegationContinuationID("routine-parent")) {
+		t.Fatal("routine sub-threshold review must satisfy quorum and enqueue the continuation")
+	}
+	if state, _ := store.GetTask(ctx, "task-6"); state.State == string(TaskBlocked) {
+		t.Fatal("routine sub-threshold review must not block the parent")
+	}
+}
+
 // TestQuorumThresholdExceedingDelegationCountRejected pins that a quorum K larger
 // than the number of delegations (always unsatisfiable → would block forever) is
 // rejected at extraction, while K == len (vote-equivalent) is accepted.
@@ -5047,6 +5678,7 @@ func (f fakeImplementationFinalizer) FinalizeImplementation(context.Context, db.
 type fakeMergeGate struct {
 	decision   MergeDecision
 	onEvaluate func(MergeRequest)
+	err        error
 	requests   []MergeRequest
 }
 
@@ -5055,7 +5687,7 @@ func (f *fakeMergeGate) Evaluate(_ context.Context, request MergeRequest) (Merge
 	if f.onEvaluate != nil {
 		f.onEvaluate(request)
 	}
-	return f.decision, nil
+	return f.decision, f.err
 }
 
 // TestCanonicalDelegationSetHashStableUnderReorder pins the order-independence and
