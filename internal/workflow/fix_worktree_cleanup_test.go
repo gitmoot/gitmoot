@@ -49,8 +49,13 @@ func TestCleanupFixWorktreePreservesCloneAndTaskBranchLock(t *testing.T) {
 	if got := countJobEvents(t, store, "fix-job", "delegation_worktree_removed"); got != 0 {
 		t.Fatalf("delegation_worktree_removed events = %d, want 0: nothing was removed", got)
 	}
-	if got := countJobEvents(t, store, "fix-job", "delegation_worktree_reclaimable_manual"); got != 1 {
-		t.Fatalf("operator handoff events = %d, want 1", got)
+	// This path runs NO proofs, so it must record the unproved retention rather
+	// than borrow the aged pass's "proved disposable" wording.
+	if got := countJobEvents(t, store, "fix-job", "delegation_worktree_retained_unproved"); got != 1 {
+		t.Fatalf("unproved retention events = %d, want 1", got)
+	}
+	if got := countJobEvents(t, store, "fix-job", "delegation_worktree_reclaimable_manual"); got != 0 {
+		t.Fatalf("terminal cleanup claimed a proof it never ran: %d handoff events", got)
 	}
 	// The obligation stays OPEN: a clone still on disk must not read as retired.
 	obligation, err := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID("fix-job", path))
@@ -89,5 +94,75 @@ func TestAdvanceFixPreservesCloneWhenFinalizerFails(t *testing.T) {
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("fix clone was removed after resumable finalizer failure: %v", err)
+	}
+}
+
+// This enters through AdvanceJob, not cleanupFixWorktree directly. Replacing the
+// successful-advance cleanup with os.RemoveAll(path) must lose owned.txt and fail.
+func TestAdvanceFixSuccessPreservesCloneForOperator(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	path, err := FixWorktreePath(home, "owner/repo", "fix-success")
+	if err != nil {
+		t.Fatalf("FixWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "owned.txt"), []byte("committed fix\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{ID: "review-pr-8", RepoFullName: "owner/repo", Branch: "feature/fix", State: string(TaskImplementing)}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	payload := JobPayload{
+		Repo: "owner/repo", Branch: "feature/fix", TaskID: "review-pr-8",
+		WorktreePath: path, FixWorktree: true,
+		Result: &AgentResult{Decision: "implemented", Summary: "fixed"},
+	}
+	insertCompletedJob(t, store, db.Job{ID: "fix-success", Agent: "lead", Type: "implement"}, payload)
+	engine := testEngine(store)
+	engine.Home = home
+	engine.ImplementationFinalizer = fakeImplementationFinalizer{payload: payload}
+
+	if err := engine.AdvanceJob(ctx, "fix-success"); err != nil {
+		t.Fatalf("AdvanceJob: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(path, "owned.txt")); err != nil || string(got) != "committed fix\n" {
+		t.Fatalf("successful AdvanceJob did not preserve clone bytes: %q, %v", got, err)
+	}
+	if got := countJobEvents(t, store, "fix-success", "delegation_worktree_removed"); got != 0 {
+		t.Fatalf("removed events = %d, want 0", got)
+	}
+	if got := countJobEvents(t, store, "fix-success", "delegation_worktree_retained_unproved"); got != 1 {
+		t.Fatalf("unproved retention events = %d, want 1", got)
+	}
+}
+
+func TestCleanupFixWorktreeDoesNotTreatDanglingSymlinkAsRemoved(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	path, err := FixWorktreePath(home, "owner/repo", "fix-symlink")
+	if err != nil {
+		t.Fatalf("FixWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(home, "missing-target"), path); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	engine := testEngine(store)
+	engine.Home = home
+	_ = engine.cleanupFixWorktree(ctx, "fix-symlink", "implement", JobPayload{
+		Repo: "owner/repo", Branch: "feature/fix", WorktreePath: path, FixWorktree: true,
+	})
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("dangling symlink was removed: %v", err)
+	}
+	if got := countJobEvents(t, store, "fix-symlink", "delegation_worktree_removed"); got != 0 {
+		t.Fatalf("dangling symlink produced %d removed events", got)
 	}
 }

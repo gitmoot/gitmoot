@@ -445,8 +445,8 @@ type JobPayload struct {
 	// may own throwaway writable worktrees without being read-only runtime seats.
 	ReadOnlySeat bool `json:"read_only_seat,omitempty"`
 	// FixWorktree marks a per-job writable clone allocated for a review fix round.
-	// The clone owns its git directory, is attached to Branch, and is reclaimed by
-	// the delegation-worktree TTL machinery without deleting that real branch.
+	// The clone owns its git directory, is attached to Branch, and remains visible
+	// to cleanup obligations and doctor until an operator removes it.
 	FixWorktree bool `json:"fix_worktree,omitempty"`
 	// ReadOnlyWorktreeDiff durably preserves the bounded `git status --short` +
 	// `git diff HEAD` snapshot collected immediately before a terminal ask/review

@@ -749,76 +749,43 @@ Gitmoot never force-removes those.
 delegation owner cannot resume, while the grace period preserves short-term
 debugging access. Set it to `"0"` to disable the TTL pass. Aged read-only and
 delegation worktrees are force-removed even when dirty. An independent fix
-clone is different: removing it deletes its object database, so a clean working
-tree and a published HEAD are not sufficient evidence. Gitmoot mirrors every
-branch and tag of the **registered repository checkout's** remote URL into the
-clone's own proof namespace (`refs/remotes/gitmoot-reclaim-proof/heads/*` and
-`.../tags/*`, pruned each pass) within a two-minute probe deadline, then requires
-that no commit reachable from any local ref or reflog is missing from those refs,
-**and** that the clone holds no unreachable commit object — `git commit-tree`, an
-interrupted rebase or a dropped stash all write commits that no ref and no reflog
-reaches, and they die with the directory like everything else. The traversal
-ignores replace objects and refuses outright when the clone carries a grafts file,
-because both rewrite ancestry locally. The trusted URL comes from the registered
-checkout, never from the clone's own `origin`, which whatever ran in the clone
-could have rewritten.
+clone is different: removing it deletes its standalone object database.
 
-**No gitmoot path deletes a fix clone.** A fix worktree is a standalone clone, so
-an unlink takes its object database with it, and a safe removal would have to
-delete exactly the bytes a proof examined. Linux cannot express that: unlink is by
-NAME, there is no inode-conditional `unlinkat`, and against a same-user writer no
-descriptor discipline makes stat-then-unlink an atomic conditional delete.
+### Fix clones are never deleted automatically
 
-Every path therefore either PROVES and hands off, or MOVES ASIDE:
+Linux has no inode-conditional unlink that can guarantee a delete removes
+exactly the bytes a preceding proof examined. Gitmoot therefore never deletes a
+fix clone and never labels one proved disposable. Commit reachability and
+nested-repository checks can explain obvious retention cases, but they do not
+close over every loose blob, tree, annotated tag, pack, or concurrent write.
 
-- the aged TTL pass runs its proofs (liveness, cleanliness, published-object
-  reachability, nested object databases) and records
-  `delegation_worktree_reclaimable_manual`, leaving the clone and its cleanup
-  obligation open;
-- the terminal cleanup after a successful advance does the same;
-- allocation, pre-enqueue recovery and enqueue-failure paths rename the clone to a
-  `.ttl-reclaiming-orphaned-*` sibling so a retry can allocate, destroying nothing.
+| path | behaviour |
+| --- | --- |
+| terminal cleanup after a job ends | records `delegation_worktree_retained_unproved` and leaves the clone |
+| aged TTL pass | records a specific dirty/live/unpublished/nested reason when established; otherwise records `delegation_worktree_retained_unproved` because complete object closure was not proved |
+| allocation, interrupted pre-enqueue recovery, enqueue failure | renames the clone to a `.ttl-reclaiming-orphaned-*` sibling so a retry can allocate without destroying data |
 
-Everything with that prefix is a SURVIVOR: reported by `gitmoot doctor` and
-`/api/health`, never deleted and never followed. An operator removes them knowing
-no writer is racing them. The cost is that this arm no longer frees disk on its
-own; the benefit is that it cannot destroy bytes it did not prove. The other
-reclaim arms are unaffected — they manage LINKED worktrees, where removal does not
-take an object database with it.
+Cleanup obligations stay OPEN in every case. Absence of the managed pathname is
+not removal evidence: the clone may have been moved aside, and even an empty
+sibling scan is not durable operator confirmation. Dangling symlinks remain
+visible through `lstat` rather than being mistaken for absent targets.
 
-The proofs still run, because they decide the RETENTION REASON an operator reads.
-A nested object database is recognised by its bytes: a loose candidate must
-decompress and hash (SHA-1 or SHA-256) to its storage name, with a bounded header
-read; a pack must pass its trailing checksum, have an `.idx` recording that pack's
-digest, and be accepted by `git verify-pack`. If Git cannot be asked, the candidate
-is treated as an object database and the clone is retained.
+`gitmoot doctor` and `/api/health` count both the managed fix clone and every
+surviving `.ttl-reclaiming-*` sibling. Manual cleanup requires inspecting the
+reported directory and deciding independently whether its object database and
+working tree can be discarded.
 
 Every retention records **why**, once per reason per job, so an inert deployment
-is visible instead of silent: `delegation_worktree_retained_unpublished` (also
-sets cleanup-obligation reason `unpublished_commits`; a squash merge publishes the
-content under a new commit while the branch commits stay clone-only, so a
-squash-merged clone is retained by design; an ignored nested repository or
-submodule object database lands here too because the outer clone cannot prove
-its commits), `delegation_worktree_retained_dirty` (tracked or untracked
-content — unsaved work; ordinary ignored build output remains reclaimable),
-`delegation_worktree_retained_live` (a live process holds a working directory
-inside it) and `delegation_worktree_liveness_unknown` (the process table could not
-be read, which is what makes the whole pass inert).
+is visible instead of silent: `delegation_worktree_retained_unpublished`,
+`delegation_worktree_retained_dirty`, `delegation_worktree_retained_live`,
+`delegation_worktree_liveness_unknown`, nested-repository retention, or
+`delegation_worktree_retained_unproved`.
 
-Both reclaim passes are bounded at eight proofs per tick with a rotating window,
-and the shared checkout lock is held only across the rename, re-proof and delete —
-never across the remote fetch — so maintenance cannot delay dispatch.
-
-`gitmoot doctor` and `/api/health` also count `.ttl-reclaiming-*` siblings of fix
-clones, so an interrupted removal is visible on the host rather than only in the
-job log.
-
-An already-absent managed fix path completes the same bookkeeping instead of
-consuming retries or entering quarantine. `delegation_worktree_reclaimed_ttl`
-is recorded after removal or this already-absent reconciliation. The dashboard
-`/api/health` response exposes the same count, bytes, path, breakdown, and
-summary in its top-level `worktrees` field, including the number of cleanup
-obligations in terminal quarantine.
+The daemon's pending and aged delegation-reclaim queries return at most 256 due
+owners host-wide. Processing writes the next-attempt time to the cleanup
+obligation, so later candidates advance across daemon restarts rather than
+depending on an in-memory cursor. The aged pass additionally attempts at most
+eight candidates per repository per tick.
 
 Terminal-task reclaim failures use the same three-message path limit before
 suppressing identical repeats. The pass proves at most eight candidates per

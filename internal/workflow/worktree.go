@@ -1173,10 +1173,9 @@ func (e Engine) markDelegationCleanupRemoved(ctx context.Context, jobID, path st
 	return err
 }
 
-// cleanupFixWorktree removes an engine-dispatched review fix's independent
-// writable clone. It deliberately does not use RemoveWorktreeForce, delete the
-// payload branch, or release its task branch lock: the clone has its own .git and
-// payload.Branch is the real lane branch that the finalizer just pushed.
+// cleanupFixWorktree records an engine-dispatched review fix's independent
+// writable clone for operator cleanup. It deliberately does not delete the
+// standalone object database, the payload branch, or the task branch lock.
 func (e Engine) cleanupFixWorktree(ctx context.Context, jobID string, jobType string, payload JobPayload) error {
 	if !isFixWorktree(jobType, payload) {
 		return nil
@@ -1209,29 +1208,20 @@ func (e Engine) cleanupFixWorktree(ctx context.Context, jobID string, jobType st
 		e.recordCleanupSkippedOnce(opCtx, jobID, payload, "path is not the job's managed fix-worktree path")
 		return cleanupErr
 	}
-	// An absent path is evidence of a completed removal only when no
-	// interrupted-removal quarantine of this clone survives. The TTL pass renames
-	// the clone aside before deleting it, so "path absent, clone alive" is a real
-	// state and marking the obligation removed here would retire the candidate
-	// before the TTL pass can restore it. Absence is stat'd BEFORE the quarantine
-	// scan: a rename needs the path to exist, so a path already seen absent cannot
-	// acquire a quarantine afterwards.
-	if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
+	// Path absence is not proof of removal. SetAsideFixClone deliberately makes
+	// the managed name absent while preserving the clone at a sibling, and even
+	// without such a sibling there is no durable operator acknowledgement that
+	// the standalone object database was intentionally removed. Lstat keeps a
+	// dangling symlink visible rather than following it to an absent target.
+	if _, statErr := os.Lstat(path); os.IsNotExist(statErr) {
 		quarantines, quarantineErr := FixCloneQuarantines(path)
 		if quarantineErr != nil {
 			if persistErr := e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", quarantineErr); persistErr != nil {
 				return errors.Join(quarantineErr, persistErr)
 			}
-			return fmt.Errorf("inspect fix clone quarantines beside %s: %w", path, quarantineErr)
+			return fmt.Errorf("inspect fix clone survivors beside %s: %w", path, quarantineErr)
 		}
-		if len(quarantines) > 0 {
-			if err := e.deferDelegationCleanupObligation(opCtx, jobID, path, db.CleanupReasonTerminalDeferred); err != nil {
-				return err
-			}
-			e.recordCleanupSkippedOnce(opCtx, jobID, payload, fmt.Sprintf("interrupted TTL removal left %s; awaiting restore", quarantines[0]))
-			return nil
-		}
-		return e.markDelegationCleanupRemoved(opCtx, jobID, path)
+		return e.recordFixClonePresenceUnconfirmed(opCtx, jobID, path, quarantines)
 	} else if statErr != nil {
 		if persistErr := e.deferDelegationCleanupFailure(opCtx, jobID, path, "reclaim", statErr); persistErr != nil {
 			return errors.Join(statErr, persistErr)
@@ -1246,7 +1236,7 @@ func (e Engine) cleanupFixWorktree(ctx context.Context, jobID string, jobType st
 	//
 	// The obligation deliberately stays OPEN. Marking it removed would retire a
 	// clone that is still on disk, and the operator handoff is what closes it.
-	return e.recordFixCloneReclaimableByOperator(opCtx, jobID, path)
+	return e.recordFixCloneRetainedForOperator(opCtx, jobID, path)
 }
 
 // cleanupReadOnlyDelegationWorktree disposes the detached worktree allocated for
@@ -1674,73 +1664,18 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktree(ctx context.Context, jobID
 	return err
 }
 
-func (e Engine) completeAgedTerminalFixWorktreeReclaim(ctx context.Context, jobID, path string) (bool, error) {
-	opCtx := context.WithoutCancel(ctx)
-	err := e.Store.AddJobEvent(opCtx, db.JobEvent{
-		JobID: jobID, Kind: "delegation_worktree_reclaimed_ttl",
-		Message: fmt.Sprintf("aged terminal fix worktree %s reconciled after TTL", path),
-	})
-	if err == nil {
-		err = e.markDelegationCleanupRemoved(opCtx, jobID, path)
-	}
-	return err == nil, err
-}
-
-// fixCloneQuarantinePrefix names the sibling path a proven-disposable fix clone
-// is renamed to before deletion. The rename is the atomicity boundary the proof
-// needs: it is a single filesystem operation in the same directory, and once it
-// returns no `git -C <original path>` can create a commit inside the clone that
-// is about to be deleted. Anything that followed the directory instead is caught
-// by repeating every proof on the quarantined copy.
-//
-// The suffix carries RANDOM bytes because the quarantine path is documented: a
-// predictable name is a name a process can open between the final proof and the
-// removal. Callers therefore discover quarantines by this prefix rather than
-// reconstructing one name.
+// FixCloneQuarantines lists every surviving sibling previously created by the
+// old quarantine mechanism or the current SetAsideFixClone path. Automatic
+// deletion is disabled; every matching name is operator-owned content.
 const fixCloneQuarantinePrefix = ".ttl-reclaiming-"
 
-// fixCloneFenceRetention bounds how long a spent fence file is kept. It only has
-// to outlive any process that could still name the quarantine it replaced; a day
-// covers a daemon restart overlap and keeps the directory-entry cost per reclaimed
-// job at zero in steady state.
-const fixCloneFenceRetention = 24 * time.Hour
-
-// FixCloneQuarantines lists the interrupted-removal siblings of a fix clone. The
-// daemon and doctor need this too: an absent clone path is only evidence of a
-// completed removal when no quarantine of it survives.
-//
-// The parent directory is READ rather than globbed, because a managed path may
-// legitimately contain glob metacharacters (a repo or home directory named with
-// brackets), and a pattern that silently matches nothing would be read as "no
-// quarantine" by callers that then delete.
+// FixCloneQuarantines lists everything left beside a managed fix clone under the
+// reclaim prefix: legacy interrupted-removal leftovers and clones moved aside by
+// SetAsideFixClone. Nothing deletes them, so this is the operator's work list.
 func FixCloneQuarantines(path string) ([]string, error) {
 	return classifyFixCloneQuarantineNames(path)
 }
 
-// fixCloneFencePrefix opens the content of a spent-quarantine fence. What follows
-// it is a random NONCE recorded durably in the job's event log at creation.
-//
-// The prefix alone is not provenance: it is public, so a same-user writer can type
-// it. The nonce is what ties the file to a fence THIS daemon created — a writer
-// that has not read the event log cannot produce one, and a fence whose nonce is
-// not registered is treated as a survivor rather than as ours. Fences written
-// before this record existed carry no nonce and are likewise treated as survivors:
-// unproven, never pruned, visible to the operator.
-const fixCloneFencePrefix = "gitmoot: spent fix-clone quarantine name; do not recreate\nnonce="
-
-// JobEventFixCloneFenced is the durable record of a fence this code wrote. Its
-// message is `<absolute fence path> <nonce>`, which is the evidence
-// FixCloneFenceOwnership matches a file against.
-const JobEventFixCloneFenced = "delegation_worktree_fence_written"
-
-// classifyFixCloneQuarantineNames splits the quarantine-named siblings of a clone
-// into SURVIVORS and FENCES.
-//
-// Only a zero-byte REGULAR file is a fence. Anything else — a directory, a
-// symlink (which a writer can point at a directory it still writes into), a
-// device node, a non-empty file — is a survivor, because it can hold or reach
-// content and something other than this code created it. Classifying by "not a
-// directory" let a symlink win a fence name and then vanish from every scan.
 func classifyFixCloneQuarantineNames(path string) (survivors []string, err error) {
 	path = filepath.Clean(strings.TrimSpace(path))
 	if path == "" || path == "." {
@@ -1760,34 +1695,15 @@ func classifyFixCloneQuarantineNames(path string) (survivors []string, err error
 			continue
 		}
 		candidate := filepath.Join(parent, entry.Name())
-		// Type() reports the LSTAT type, so a symlink is never mistaken for its
-		// target. An info error is reported rather than swallowed: a name that
-		// cannot be classified must not be read as absent by a caller that
-		// completes a removal on that basis.
-		info, infoErr := entry.Info()
-		if infoErr != nil {
+		if _, infoErr := entry.Info(); infoErr != nil {
 			if os.IsNotExist(infoErr) {
 				continue
 			}
-			return nil, fmt.Errorf("classify fix clone quarantine %s: %w", candidate, infoErr)
+			return nil, fmt.Errorf("classify fix clone survivor %s: %w", candidate, infoErr)
 		}
-		// A fence is a file this code wrote: it carries the exact marker, is
-		// exactly that long, and has ONE link. A zero-byte file, a hard link to
-		// someone else's inode, a symlink, a directory or any other content is a
-		// SURVIVOR — a writer can plant those, and treating them as owned made an
-		// unproven name look like a completed removal.
-		_ = info
 		survivors = append(survivors, candidate)
 	}
 	return survivors, nil
-}
-
-func newFixCloneQuarantinePath(path string) (string, error) {
-	suffix := make([]byte, 8)
-	if _, err := rand.Read(suffix); err != nil {
-		return "", fmt.Errorf("generate fix clone quarantine suffix: %w", err)
-	}
-	return filepath.Clean(path) + fixCloneQuarantinePrefix + hex.EncodeToString(suffix), nil
 }
 
 // pathPresent distinguishes "absent" from "cannot tell", so a stat failure is
@@ -2190,18 +2106,6 @@ func nestedGitObjectDatabase(ctx context.Context, path string, verify packIndexV
 	return nested, nil
 }
 
-// recordFixCloneReclaimableByOperator is the outcome a fully proved clone now
-// reaches. It is a RETENTION with a different reason: nothing is wrong with the
-// clone, the pass simply will not delete what it cannot delete atomically. The
-// obligation stays open so doctor keeps reporting it until an operator acts.
-func (e Engine) recordFixCloneReclaimableByOperator(ctx context.Context, jobID, path string) error {
-	if err := e.recordFixCloneRetention(ctx, jobID, "delegation_worktree_reclaimable_manual",
-		fmt.Sprintf("fix clone %s proved disposable but was NOT removed: an atomic conditional unlink is unavailable, so removal is left to an operator", path)); err != nil {
-		return err
-	}
-	return e.deferDelegationCleanupObligation(context.WithoutCancel(ctx), jobID, path, db.CleanupReasonUnpublishedCommits)
-}
-
 // SetAsideFixClone renames a fix clone out of the way instead of deleting it, and
 // returns the name it now has.
 //
@@ -2237,27 +2141,16 @@ func SetAsideFixClone(path string) (string, error) {
 // reclaim's and doctor's — already reports it without a second mechanism.
 const fixCloneSetAsidePrefix = ".ttl-reclaiming-orphaned-"
 
-// reclaimAgedTerminalFixClone proves whether a terminal fix worktree's clone is
-// disposable and, when it is, hands it to an operator instead of deleting it.
+// reclaimAgedTerminalFixClone diagnoses an aged terminal fix clone and retains
+// it for an operator.
 //
-// AUTOMATIC REMOVAL IS DISABLED, deliberately. A fix worktree is a standalone
-// clone, so an unlink takes its object database with it, and a removal has to
-// delete exactly the bytes it proved. Linux cannot express that: unlink is by
-// NAME, there is no inode-conditional unlinkat, and against a same-user writer no
-// amount of descriptor discipline turns stat-then-unlink into an atomic
-// conditional delete. Successive review rounds each found another instance of that
-// one gap, which is the signature of a property the platform does not provide
-// rather than a bug awaiting a patch.
-//
-// So this pass keeps everything decidable — the proofs — and drops the step that
-// is not. A clone that passes every proof is recorded as reclaimable and left on
-// disk with its cleanup obligation open, where `gitmoot doctor` reports it for an
-// operator. A clone that fails any proof is retained with the reason it failed.
-//
-// What this costs: the fix-clone arm no longer frees disk by itself. What it buys:
-// the pass cannot destroy bytes it did not prove. The other reclaim arms are
-// unaffected — they manage LINKED worktrees, where removal does not take an object
-// database with it.
+// AUTOMATIC REMOVAL IS DISABLED. A fix worktree is a standalone clone, so an
+// unlink takes its object database with it, and Linux has no inode-conditional
+// unlink that can guarantee it deletes exactly the bytes a preceding proof saw.
+// Commit reachability and nested-repository checks provide useful retention
+// reasons, but they do not prove the absence of every loose blob, tree, tag, or
+// concurrently changed pack. Passing them therefore never becomes a
+// "proved-disposable" handoff.
 func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, payload JobPayload, path string) (bool, error) {
 	expected, err := FixWorktreePath(e.Home, payload.Repo, jobID)
 	if err != nil || filepath.Clean(path) != filepath.Clean(expected) {
@@ -2268,9 +2161,11 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 		return false, fmt.Errorf("inspect aged terminal fix worktree %s: %w", path, err)
 	}
 	if !present {
-		// Someone else removed it. The bookkeeping still has to close, and closing
-		// it deletes nothing.
-		return e.completeAgedTerminalFixWorktreeReclaim(ctx, jobID, path)
+		survivors, survivorErr := FixCloneQuarantines(path)
+		if survivorErr != nil {
+			return false, fmt.Errorf("inspect fix clone survivors beside %s: %w", path, survivorErr)
+		}
+		return false, e.recordFixClonePresenceUnconfirmed(ctx, jobID, path, survivors)
 	}
 	if quarantines, err := FixCloneQuarantines(path); err != nil {
 		return false, fmt.Errorf("inspect fix clone quarantines beside %s: %w", path, err)
@@ -2323,7 +2218,7 @@ func (e Engine) reclaimAgedTerminalFixClone(ctx context.Context, jobID string, p
 	if nested != "" {
 		return false, e.retainFixCloneWithNestedRepository(ctx, jobID, path, nested)
 	}
-	return false, e.recordFixCloneReclaimableByOperator(ctx, jobID, path)
+	return false, e.recordFixCloneProofIncomplete(ctx, jobID, path)
 }
 
 func (e Engine) retainFixCloneWithUnpublishedCommits(ctx context.Context, jobID, path, sha string) error {
@@ -2340,6 +2235,38 @@ func (e Engine) retainFixCloneWithNestedRepository(ctx context.Context, jobID, p
 		return err
 	}
 	return e.deferDelegationCleanupObligation(context.WithoutCancel(ctx), jobID, path, db.CleanupReasonUnpublishedCommits)
+}
+
+// recordFixCloneRetainedForOperator is the terminal-cleanup outcome. This path
+// runs no liveness, cleanliness, reachability, or object proof. The aged pass
+// may add a more specific retention reason, but it also never declares the clone
+// disposable because complete object closure is unavailable.
+func (e Engine) recordFixCloneRetainedForOperator(ctx context.Context, jobID, path string) error {
+	if err := e.recordFixCloneRetention(ctx, jobID, "delegation_worktree_retained_unproved",
+		fmt.Sprintf("fix clone %s left in place after its job ended: nothing automatic may delete a standalone clone, and this path proves nothing about its contents", path)); err != nil {
+		return err
+	}
+	return e.deferDelegationCleanupObligation(context.WithoutCancel(ctx), jobID, path, db.CleanupReasonTerminalDeferred)
+}
+
+func (e Engine) recordFixClonePresenceUnconfirmed(ctx context.Context, jobID, path string, survivors []string) error {
+	detail := "no set-aside sibling was found"
+	if len(survivors) > 0 {
+		detail = fmt.Sprintf("surviving sibling %s remains", survivors[0])
+	}
+	if err := e.recordFixCloneRetention(ctx, jobID, "delegation_worktree_retained_unproved",
+		fmt.Sprintf("fix clone %s is absent but removal is not durably confirmed; %s", path, detail)); err != nil {
+		return err
+	}
+	return e.deferDelegationCleanupObligation(context.WithoutCancel(ctx), jobID, path, db.CleanupReasonTerminalDeferred)
+}
+
+func (e Engine) recordFixCloneProofIncomplete(ctx context.Context, jobID, path string) error {
+	if err := e.recordFixCloneRetention(ctx, jobID, "delegation_worktree_retained_unproved",
+		fmt.Sprintf("fix clone %s retained after TTL: commit and nested-repository checks passed, but complete blob/tree/tag/pack closure was not proved", path)); err != nil {
+		return err
+	}
+	return e.deferDelegationCleanupObligation(context.WithoutCancel(ctx), jobID, path, db.CleanupReasonTerminalDeferred)
 }
 
 // recordFixCloneLivenessUnknown makes an inert deployment visible. A process

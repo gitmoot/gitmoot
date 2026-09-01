@@ -94,11 +94,10 @@ func TestBuildDelegationWorktreeDoctorCheckThresholds(t *testing.T) {
 	}
 }
 
-// A fix clone's quarantine siblings are the only worktree state no other surface
-// reports: a surviving directory is unowned garbage, an unproven file is a writer's
-// plant, and a spent fence is ours. Doctor has to separate the three, because the
-// first two block a reclaim and the last is inert bookkeeping.
-func TestInspectDelegationWorktreeUsageAccountsFixCloneFencesAndSurvivors(t *testing.T) {
+// Doctor must report both a managed fix clone and every clone moved aside after
+// an interrupted allocation/dispatch. These are durable operator work items:
+// neither has another automatic deletion path.
+func TestInspectDelegationWorktreeUsageAccountsManagedAndSetAsideFixClones(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
 	store := openCLIJobStore(t, home)
@@ -114,6 +113,33 @@ func TestInspectDelegationWorktreeUsageAccountsFixCloneFencesAndSurvivors(t *tes
 		ID: "fix-job", Agent: "fixer", Type: "implement", State: string(workflow.JobSucceeded),
 		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", WorktreePath: clone, FixWorktree: true}),
 	}, string(workflow.JobSucceeded))
+	if err := os.MkdirAll(clone, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(clone, "managed.bin"), make([]byte, 7), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setAsideClone, err := workflow.FixWorktreePath(paths.Home, "owner/repo", "fix-set-aside")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(setAsideClone, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(setAsideClone, "set-aside.bin"), make([]byte, 11), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setAside, err := workflow.SetAsideFixClone(setAsideClone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedCLIJob(t, store, db.Job{
+		ID: "fix-set-aside", Agent: "fixer", Type: "implement", State: string(workflow.JobSucceeded),
+		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", WorktreePath: setAsideClone, FixWorktree: true}),
+	}, string(workflow.JobSucceeded))
+	if setAside == "" {
+		t.Fatal("SetAsideFixClone returned no survivor")
+	}
 
 	// An interrupted removal's surviving clone, sized so it lands in the byte total.
 	survivor := clone + ".ttl-reclaiming-aaaaaaaa"
@@ -134,6 +160,7 @@ func TestInspectDelegationWorktreeUsageAccountsFixCloneFencesAndSurvivors(t *tes
 	store.Close()
 	aged := now.Add(-96 * time.Hour).Format("2006-01-02 15:04:05")
 	setJobTimes(t, home, "fix-job", aged, aged)
+	setJobTimes(t, home, "fix-set-aside", aged, aged)
 	store = openCLIJobStore(t, home)
 	defer store.Close()
 
@@ -141,13 +168,17 @@ func TestInspectDelegationWorktreeUsageAccountsFixCloneFencesAndSurvivors(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The surviving directory is stale reclaimable state; the planted file is
-	// unproven. Both stay visible to the operator.
+	// Managed clone (7 B), set-aside clone (11 B), and legacy survivor (23 B)
+	// are reclaimable operator work. The planted file is the fourth stale entry
+	// and is separately classified unproven.
+	if usage.Stale != 4 {
+		t.Fatalf("stale = %d, want three clones plus the unproven plant: %+v", usage.Stale, usage)
+	}
 	if usage.Unproven != 1 {
 		t.Fatalf("unproven = %d, want the writer plant counted once: %+v", usage.Unproven, usage)
 	}
-	if usage.SizeBytes != 23 {
-		t.Fatalf("size = %d, want the surviving quarantine's 23 B", usage.SizeBytes)
+	if usage.SizeBytes != 41 {
+		t.Fatalf("size = %d, want all three fix-clone directories (41 B)", usage.SizeBytes)
 	}
 }
 
@@ -167,12 +198,31 @@ func TestHealthEndpointSurfacesDelegationWorktreeUsage(t *testing.T) {
 		ParentJobID: "parent", DelegationID: "pinned",
 		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", DelegationID: "pinned", WorktreePath: path}),
 	}, string(workflow.JobBlocked))
+	fixClone, err := workflow.FixWorktreePath(paths.Home, "owner/repo", "fix-api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(fixClone, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fixClone, "api.bin"), []byte("set-aside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := workflow.SetAsideFixClone(fixClone); err != nil {
+		t.Fatal(err)
+	}
+	seedCLIJob(t, store, db.Job{
+		ID: "fix-api", Agent: "fixer", Type: "implement", State: string(workflow.JobSucceeded),
+		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", WorktreePath: fixClone, FixWorktree: true}),
+	}, string(workflow.JobSucceeded))
 	for attempt := 0; attempt < delegationCleanupRetryBudget; attempt++ {
 		if _, err := store.RecordCleanupObligationFailure(context.Background(), "quarantined", filepath.Join(paths.Home, "worktrees", "owner--repo", "delegations", "parent", "quarantined"), db.CleanupReasonUnknown, errors.New("stuck"), time.Now().UTC(), time.Now().UTC().Add(time.Minute), delegationCleanupRetryBudget); err != nil {
 			t.Fatal(err)
 		}
 	}
 	store.Close()
+	aged := time.Now().UTC().Add(-96 * time.Hour).Format("2006-01-02 15:04:05")
+	setJobTimes(t, home, "fix-api", aged, aged)
 
 	stubOnDiskBuild(t, "", "")
 	stubUpdateCheck(t, "")
@@ -187,10 +237,11 @@ func TestHealthEndpointSurfacesDelegationWorktreeUsage(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload.Worktrees.Stale != 1 || payload.Worktrees.Pinned != 1 || payload.Worktrees.Quarantined != 1 || payload.Worktrees.SizeBytes != int64(len("dashboard")) {
+	if payload.Worktrees.Stale != 2 || payload.Worktrees.Pinned != 1 || payload.Worktrees.Quarantined != 1 ||
+		payload.Worktrees.SizeBytes != int64(len("dashboard")+len("set-aside")) {
 		t.Fatalf("worktrees = %+v", payload.Worktrees)
 	}
-	if !strings.Contains(payload.Worktrees.Summary, "1 stale worktree") {
+	if !strings.Contains(payload.Worktrees.Summary, "2 stale worktrees") {
 		t.Fatalf("summary = %q", payload.Worktrees.Summary)
 	}
 }

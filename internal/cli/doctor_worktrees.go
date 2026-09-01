@@ -91,9 +91,10 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 				class = worktreeRecentTerminal
 			}
 		}
-		// A fix clone's own directory stays out of this metric — it is the engine's
-		// managed clone, not a delegation worktree — but its interrupted-removal
-		// quarantine siblings are counted below, because nothing else reports them.
+		// A fix clone's own directory is now IN this metric. Nothing deletes a
+		// standalone clone automatically any more, so the clone itself — not just a
+		// leftover sibling — is what an operator has to see and remove. Excluding it
+		// made the documented "doctor reports it" handoff a claim with no surface.
 		target := owned
 		if fixClone && strings.TrimSpace(payload.DelegationID) == "" && !payload.ReadOnlyWorktree {
 			target = fixClones
@@ -108,18 +109,17 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 	pathsOnDisk := map[string]struct{}{}
 	quarantineClasses := map[string]delegationWorktreeClass{}
 	scanQuarantines := func(path string, class delegationWorktreeClass) {
-		// A fix clone mid-removal lives at a quarantine sibling, not at the recorded
-		// path. Counting only recorded paths hides exactly the directory an
-		// interrupted removal leaves behind. A scan or stat failure is reported as
-		// unproven rather than dropped: silently reporting zero would present an
-		// unreadable directory as a healthy one.
-		quarantines, err := workflow.FixCloneQuarantines(path)
+		// A set-aside fix clone lives at a sibling, not at the recorded path.
+		// Counting only recorded paths hides exactly the directory an interrupted
+		// allocation or dispatch preserves. A scan or stat failure is reported as
+		// unproven rather than dropped.
+		survivors, err := workflow.FixCloneQuarantines(path)
 		if err != nil {
 			usage.Unproven++
 			usage.Stale++
 			return
 		}
-		for _, quarantine := range quarantines {
+		for _, quarantine := range survivors {
 			info, err := os.Lstat(quarantine)
 			switch {
 			case err == nil && info.IsDir():
@@ -144,6 +144,13 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 		scanQuarantines(path, class)
 	}
 	for path, class := range fixClones {
+		// The clone itself, then anything left beside it.
+		if info, err := os.Lstat(path); err == nil && info.IsDir() {
+			pathsOnDisk[path] = struct{}{}
+			if _, classified := owned[path]; !classified {
+				owned[path] = class
+			}
+		}
 		scanQuarantines(path, class)
 	}
 	for quarantine, class := range quarantineClasses {

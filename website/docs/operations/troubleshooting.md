@@ -575,46 +575,33 @@ quarantined cleanup count in its top-level `worktrees` field.
 
 `[workflow].delegation_worktree_ttl = "72h"` is default-on. After that grace
 period the daemon force-removes dirty terminal-owned read-only and delegation
-worktrees. An independent fix clone is different: removing it deletes its object
-database, so Gitmoot mirrors every branch and tag of the **registered repository
-checkout's** remote URL into the clone's proof namespace
-(`refs/remotes/gitmoot-reclaim-proof/heads/*` and `.../tags/*`, pruned each pass)
-within a two-minute probe deadline, then requires that no commit reachable from
-any local ref or reflog is absent from those refs and that the clone holds no
-unreachable commit object (a `commit-tree` write, an interrupted rebase or a
-dropped stash leaves one, and it dies with the directory). The traversal ignores
-replace objects and refuses outright when the clone carries a grafts file. The
-clone's own `origin` is never trusted; it is writable by whatever ran in the clone.
+worktrees. Set the TTL to `"0"` to disable this pass. Blocked, queued, and
+running owners remain pinned.
 
-No gitmoot path deletes a fix clone. A fix worktree is a standalone clone, so an
-unlink takes its object database with it, and Linux cannot express a delete that is
-conditional on the bytes a proof examined: unlink is by name, there is no
-inode-conditional `unlinkat`, and stat-then-unlink is not atomic against a same-user
-writer. The aged pass and the terminal cleanup therefore PROVE and then record
-`delegation_worktree_reclaimable_manual`, leaving the clone and its obligation open
-for an operator; allocation, pre-enqueue recovery and enqueue-failure paths MOVE the
-clone aside to a `.ttl-reclaiming-orphaned-*` sibling so a retry can proceed. Every
-`.ttl-reclaiming-*` entry is a survivor: reported by `gitmoot doctor` and
-`/api/health`, never deleted, never followed. Every retention records its reason once per job:
-`delegation_worktree_retained_unpublished` (with obligation reason
-`unpublished_commits`; squash-merged branches land here by design, because a
-squash publishes the content and not the commits; ignored nested repositories
-and submodule object databases land here because the outer clone cannot prove
-their commits), `delegation_worktree_retained_dirty` (tracked or untracked
-content; ordinary ignored build output remains reclaimable),
-`delegation_worktree_retained_live` (a live process holds a working directory inside it), and
-`delegation_worktree_liveness_unknown` (the process table could not be read,
-which is what makes the pass inert). Both passes are bounded at eight proofs per
-tick with a rotating window, and the shared checkout lock covers only the rename,
-re-proof and delete — never the remote fetch.
-An already-absent managed fix path completes cleanup
-bookkeeping instead of consuming retries or entering quarantine. A successful
-removal or already-absent reconciliation records
-`delegation_worktree_reclaimed_ttl`. Set the TTL to `"0"` to disable this pass.
-Blocked, queued, and running owners remain pinned and are never force-removed.
+No gitmoot path deletes an independent fix clone. It is a standalone object
+database, and Linux has no inode-conditional unlink that can make deletion match
+a preceding proof. Commit and nested-repository checks can diagnose obvious
+retention reasons, but they do not close over every blob, tree, annotated tag,
+pack, or concurrent write. Passing them therefore records
+`delegation_worktree_retained_unproved`, never a proved-disposable handoff.
+
+Terminal cleanup leaves the managed clone in place. Allocation recovery and
+enqueue failures rename it to a `.ttl-reclaiming-orphaned-*` sibling so retries
+can allocate without destroying bytes. Cleanup obligations remain open.
+Managed-path absence is not treated as removal, even when no sibling is found,
+and dangling symlinks remain visible through `lstat`.
+
+`gitmoot doctor` and `/api/health` count both managed fix clones and every
+surviving `.ttl-reclaiming-*` sibling. Removal is a manual operator decision
+after inspecting the working tree and object database.
+
+The daemon queries at most 256 due pending or aged delegation owners host-wide.
+Processed candidates persist their next-attempt time in the cleanup obligation,
+so fairness survives restarts rather than depending on an in-memory cursor.
+The aged pass also attempts at most eight candidates per repository per tick.
 Candidate-local failures skip only that worktree, and later candidates continue.
 The five-minute pass cadence advances after every attempt so a failed cleanup
-cannot hot-loop. Cleanup obligations still retry once per minute and stop in
+cannot hot-loop. Cleanup obligations retry once per minute and stop in
 `quarantined` after the third failure. Inspect them with `gitmoot job cleanup
 list --state quarantined` and reopen a repaired target with
 `gitmoot job cleanup reopen <resource-id>`.

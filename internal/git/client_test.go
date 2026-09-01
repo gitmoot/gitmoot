@@ -1454,6 +1454,17 @@ func TestParseNameStatusZRejectsTruncatedRecord(t *testing.T) {
 	}
 }
 
+func TestVerifyPackIndexPassesObjectFormatToVerifyPackSubcommand(t *testing.T) {
+	runner := &fakeRunner{}
+	client := NewClient(t.TempDir(), runner)
+	valid, err := client.VerifyPackIndex(context.Background(), "/tmp/pack-test.idx", "sha256")
+	if err != nil || !valid {
+		t.Fatalf("VerifyPackIndex = %v, %v", valid, err)
+	}
+	runner.wantArgs(t, 0,
+		"git", "verify-pack", "--object-format=sha256", "--stat-only", "--", "/tmp/pack-test.idx")
+}
+
 func writeGitFixture(t *testing.T, dir string, name string, body string) {
 	t.Helper()
 	path := filepath.Join(dir, name)

@@ -1559,7 +1559,7 @@ func TestEngineReclaimAgedFixWorktreeKeepsLiveProcess(t *testing.T) {
 	}
 }
 
-func TestEngineReclaimAgedFixWorktreeCompletesAlreadyAbsentPath(t *testing.T) {
+func TestEngineReclaimAgedFixWorktreeKeepsAlreadyAbsentPathUnconfirmed(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	home := t.TempDir()
@@ -1587,8 +1587,8 @@ func TestEngineReclaimAgedFixWorktreeCompletesAlreadyAbsentPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
 	}
-	if !reclaimed {
-		t.Fatal("already-absent fix worktree did not complete reclaim")
+	if reclaimed {
+		t.Fatal("already-absent fix worktree was marked reclaimed without durable operator confirmation")
 	}
 	events, err := store.ListJobEvents(ctx, jobID)
 	if err != nil {
@@ -1596,13 +1596,20 @@ func TestEngineReclaimAgedFixWorktreeCompletesAlreadyAbsentPath(t *testing.T) {
 	}
 	found := false
 	for _, event := range events {
-		if event.Kind == "delegation_worktree_reclaimed_ttl" {
+		if event.Kind == "delegation_worktree_retained_unproved" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Fatalf("missing reclaim event: %+v", events)
+		t.Fatalf("missing unproved-retention event: %+v", events)
+	}
+	obligation, err := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID(jobID, path))
+	if err != nil {
+		t.Fatalf("GetCleanupObligation: %v", err)
+	}
+	if obligation.State == db.CleanupObligationRemoved {
+		t.Fatalf("obligation = %+v, want open without explicit removal outcome", obligation)
 	}
 }
 
@@ -1619,7 +1626,7 @@ func TestEngineReclaimAgedFixCloneRequiresPublishedObjectDatabase(t *testing.T) 
 		want            bool
 		wantErr         string
 		wantRetained    bool
-		wantProved      bool
+		wantIncomplete  bool
 	}{
 		{name: "dirty", clean: false},
 		{name: "unpublished side branch", clean: true, unpublished: "deadbeef", wantRetained: true},
@@ -1627,9 +1634,9 @@ func TestEngineReclaimAgedFixCloneRequiresPublishedObjectDatabase(t *testing.T) 
 		{name: "trusted remote url error", clean: true, remoteURLErr: errors.New("no origin"), wantErr: "resolve trusted remote url"},
 		{name: "proof refresh error", clean: true, refreshErr: errors.New("fetch failed"), wantErr: "refresh trusted remote refs"},
 		{name: "clone-only probe error", clean: true, cloneOnlyErr: errors.New("rev-list failed"), wantErr: "holds no unpublished commits"},
-		// A fully proved clone is no longer deleted: it is handed to an operator, so
-		// the pass reports "not reclaimed" and leaves the directory in place.
-		{name: "fully published clone", clean: true, requireDeadline: true, wantProved: true},
+		// Passing commit and nested-repository checks is still incomplete: loose
+		// blobs, trees, tags and concurrently changed packs are not closed over.
+		{name: "fully published clone", clean: true, requireDeadline: true, wantIncomplete: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -1692,27 +1699,30 @@ func TestEngineReclaimAgedFixCloneRequiresPublishedObjectDatabase(t *testing.T) 
 			if _, statErr := os.Stat(path); statErr != nil {
 				t.Fatalf("fix clone was removed; automatic removal is disabled: %v", statErr)
 			}
-			if tc.wantProved {
+			if tc.wantIncomplete {
 				events, eventsErr := store.ListJobEvents(ctx, jobID)
 				if eventsErr != nil {
 					t.Fatalf("ListJobEvents: %v", eventsErr)
 				}
-				proved := false
+				incomplete := false
 				for _, event := range events {
+					if event.Kind == "delegation_worktree_retained_unproved" {
+						incomplete = true
+					}
 					if event.Kind == "delegation_worktree_reclaimable_manual" {
-						proved = true
+						t.Fatalf("incomplete object proof emitted unsafe manual handoff: %+v", events)
 					}
 				}
-				if !proved {
-					t.Fatalf("a fully proved clone did not reach the operator handoff: %+v", events)
+				if !incomplete {
+					t.Fatalf("incomplete object proof was not recorded: %+v", events)
 				}
 			}
 			leftovers, quarantineErr := FixCloneQuarantines(path)
 			if quarantineErr != nil || len(leftovers) != 0 {
 				t.Fatalf("quarantines survived the pass: %v (err %v)", leftovers, quarantineErr)
 			}
-			if tc.wantProved && len(manager.refreshedURLs) == 0 {
-				t.Fatal("removal proof never refreshed the trusted remote refs")
+			if tc.wantIncomplete && len(manager.refreshedURLs) == 0 {
+				t.Fatal("commit reachability diagnosis never refreshed the trusted remote refs")
 			}
 			for _, url := range manager.refreshedURLs {
 				if url != "https://example.invalid/owner/repo.git" {
@@ -2198,7 +2208,7 @@ func TestLooseObjectHeaderReadIsBounded(t *testing.T) {
 // NAMING as a Git object database. Classifying it as Git data retains every
 // clone with a content-addressed cache, which makes the whole pass inert, so
 // recognition reads the candidate's bytes instead of trusting its name.
-func TestEngineReclaimAgedFixCloneReclaimsIgnoredHexFanoutOutput(t *testing.T) {
+func TestEngineReclaimAgedFixCloneRetainsIgnoredHexFanoutOutput(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
 	}
@@ -2296,36 +2306,38 @@ func TestEngineReclaimAgedFixCloneReclaimsIgnoredHexFanoutOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
 	}
-	// Automatic removal is disabled, so "not inert" now means the pass reaches the
-	// PROVED-DISPOSABLE outcome instead of retaining for a content reason: the
-	// clone is handed to an operator, and nothing is deleted.
+	// Ordinary ignored build output is not misclassified as nested Git data, but
+	// the remaining object proof is still incomplete, so the clone stays retained.
 	if reclaimed {
 		t.Fatal("the pass deleted a fix clone; automatic removal is disabled")
 	}
 	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("proved clone was removed: %v", err)
+		t.Fatalf("retained clone was removed: %v", err)
 	}
 	events, err := store.ListJobEvents(ctx, jobID)
 	if err != nil {
 		t.Fatalf("ListJobEvents: %v", err)
 	}
-	proved := false
+	incomplete := false
 	for _, event := range events {
+		if event.Kind == "delegation_worktree_retained_unproved" {
+			incomplete = true
+		}
 		if event.Kind == "delegation_worktree_reclaimable_manual" {
-			proved = true
+			t.Fatalf("incomplete object proof emitted unsafe manual handoff: %+v", events)
 		}
 		if event.Kind == "delegation_worktree_retained_unpublished" {
 			t.Fatalf("ordinary build output was classified as unpublished Git data: %s", event.Message)
 		}
 	}
-	if !proved {
-		t.Fatalf("clone holding only ignored build output never reached the proved-disposable outcome: %+v", events)
+	if !incomplete {
+		t.Fatalf("incomplete object proof was not recorded: %+v", events)
 	}
 }
 
 // A managed path may contain glob metacharacters (a home or repo directory named
-// with brackets). Discovery must not silently return "no quarantine" there: every
-// caller reads that as a completed removal.
+// with brackets). Survivor discovery must not silently return an empty operator
+// work list there.
 func TestFixCloneQuarantinesFindsPathsWithGlobMetacharacters(t *testing.T) {
 	root := t.TempDir()
 	parent := filepath.Join(root, "home[a]", "worktrees", "owner--repo", "fixes")

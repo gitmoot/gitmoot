@@ -978,11 +978,11 @@ func (c Client) VerifyPackIndex(ctx context.Context, indexPath string, objectFor
 	if indexPath == "" {
 		return false, errors.New("pack index path is required")
 	}
-	args := []string{}
+	args := []string{"verify-pack"}
 	if format := strings.TrimSpace(objectFormat); format != "" {
 		args = append(args, "--object-format="+format)
 	}
-	args = append(args, "verify-pack", "--stat-only", "--", indexPath)
+	args = append(args, "--stat-only", "--", indexPath)
 	if _, err := c.run(ctx, args...); err != nil {
 		// The command RAN and rejected the pair: that is an ANSWER (the pair holds
 		// nothing readable). A process that could not run at all proves nothing, and

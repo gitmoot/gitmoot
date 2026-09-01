@@ -695,10 +695,10 @@ func TestTerminalTaskWorktreeReclaimResumeIsPerRepo(t *testing.T) {
 	}
 }
 
-// The engine renames a fix clone aside before deleting it. If the scheduler reads
-// an absent path as a completed removal while that quarantine still exists, the
-// obligation is marked removed and the clone can never be restored.
-func TestFinishDelegationCleanupAttemptKeepsQuarantinedCloneUnfinished(t *testing.T) {
+// The scheduler must only close an obligation when the engine explicitly
+// reports a completed removal. Path absence is ambiguous: a fix clone may have
+// been set aside, and no sibling scan can prove an operator intended deletion.
+func TestFinishDelegationCleanupAttemptDoesNotInferRemovalFromAbsence(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()
 	store := openCLIJobStore(t, home)
@@ -729,7 +729,7 @@ func TestFinishDelegationCleanupAttemptKeepsQuarantinedCloneUnfinished(t *testin
 		t.Fatalf("obligation = %+v, want it still open while a quarantine survives", obligation)
 	}
 
-	// With the quarantine gone, an absent path is genuine evidence of removal.
+	// Even with the sibling gone, absence alone is not durable removal evidence.
 	if err := os.RemoveAll(quarantine); err != nil {
 		t.Fatalf("RemoveAll quarantine: %v", err)
 	}
@@ -740,8 +740,74 @@ func TestFinishDelegationCleanupAttemptKeepsQuarantinedCloneUnfinished(t *testin
 	if err != nil {
 		t.Fatalf("GetCleanupObligation: %v", err)
 	}
-	if obligation.State != db.CleanupObligationRemoved {
-		t.Fatalf("obligation = %+v, want removed once no quarantine survives", obligation)
+	if obligation.State == db.CleanupObligationRemoved {
+		t.Fatalf("obligation = %+v, want it open without an explicit reclaimed outcome", obligation)
+	}
+}
+
+// This enters through the daemon's skipped-cleanup pass. Re-enabling deletion in
+// cleanupFixWorktree loses owned.txt and fails this production-path regression.
+func TestReclaimSkippedFixClonePreservesStandaloneObjectDatabase(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	})
+	worker := defaultJobWorker(store, io.Discard, home)
+	jobID := "fix-skipped"
+	path, err := workflow.FixWorktreePath(worker.workflowHome(), "owner/repo", jobID)
+	if err != nil {
+		t.Fatalf("FixWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "owned.txt"), []byte("only copy\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	payload, err := json.Marshal(workflow.JobPayload{
+		Repo: "owner/repo", Branch: "feature/fix", WorktreePath: path, FixWorktree: true,
+	})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	seedCLIJob(t, store, db.Job{
+		ID: jobID, Agent: "fixer", Type: "implement", State: string(workflow.JobSucceeded),
+		Repo: "owner/repo", Payload: string(payload),
+	}, "seed terminal fix")
+	if err := store.AddJobEvent(ctx, db.JobEvent{
+		JobID: jobID, Kind: "delegation_worktree_cleanup_skipped", Message: "preserved",
+	}); err != nil {
+		t.Fatalf("AddJobEvent: %v", err)
+	}
+	worker.WorkflowFactory = func(string) workflow.Engine {
+		return workflow.Engine{Store: store, Home: worker.workflowHome()}
+	}
+
+	if err := reclaimSkippedDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(store), time.Now().UTC()); err != nil {
+		t.Fatalf("reclaimSkippedDelegationWorktrees: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(path, "owned.txt")); err != nil || string(got) != "only copy\n" {
+		t.Fatalf("daemon cleanup did not preserve clone bytes: %q, %v", got, err)
+	}
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	for _, event := range events {
+		if event.Kind == "delegation_worktree_removed" {
+			t.Fatalf("daemon emitted removal for retained fix clone: %+v", events)
+		}
+	}
+	obligation, err := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID(jobID, path))
+	if err != nil {
+		t.Fatalf("GetCleanupObligation: %v", err)
+	}
+	if obligation.State == db.CleanupObligationRemoved {
+		t.Fatalf("obligation = %+v, want retained clone visible", obligation)
 	}
 }
 
