@@ -162,6 +162,18 @@ type AgentResult struct {
 	// and consumes zero compute until the human answers via the `answer` resume
 	// verb. The same escalation TTL backstop auto-finalizes an unanswered ask.
 	HumanQuestions []HumanQuestion `json:"human_questions,omitempty"`
+	// FanOut records that this result WAS a coordinator fan-out. It exists because
+	// the executable delegations[] do not always survive to the consumers: a
+	// pipeline leaf stage has its delegations STRIPPED at the mailbox seam so a
+	// stage can never spawn phantom children, and an approved announcement then
+	// reached auto-merge indistinguishable from a real leaf approval (#1685).
+	// Stripping the INSTRUCTIONS must not erase the CLASSIFICATION.
+	//
+	// Normalization owns this field; agents are never asked for it. An agent that
+	// sets it anyway can only REMOVE its own verdict's authority, never add any:
+	// ResultIsFanOut ORs it with the delegations it can see, so `fan_out: false`
+	// beside a declared panel is still a fan-out.
+	FanOut bool `json:"fan_out,omitempty"`
 }
 
 var agentResultAllowedFields = jsonTagSet(reflect.TypeOf(AgentResult{}))

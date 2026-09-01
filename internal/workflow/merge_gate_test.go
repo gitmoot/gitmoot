@@ -4732,3 +4732,78 @@ func settleMergeGateReviewInPlace(t *testing.T, store *db.Store, jobID string, s
 	}
 	setMergeGateJobRecordedTimes(t, store, jobID, "", recorded)
 }
+
+// #1685 P2. The gate groups delegation children by parent and judges every row.
+// A panel child that FAILED and was then retried to approval left the obsolete
+// failed row in that set forever: a terminal row can never change, so the panel
+// stayed poisoned and only a new head could clear it. Continuation synthesis
+// already selects the highest RetryCount per delegation; the gate must agree.
+func TestPolicyMergeGateUsesLatestDelegationAttempt(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		latestState JobState
+		latest      *AgentResult
+		wantErr     bool
+	}{
+		{
+			name: "approved retry supersedes the failed original", latestState: JobSucceeded,
+			latest: &AgentResult{Decision: "approved", Summary: "retry verified the head"},
+		},
+		{
+			name: "a failed latest attempt still blocks", latestState: JobFailed, wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			insertMergeGateFanOutRow(t, store, "approved")
+			// lens-b answers cleanly throughout; only lens-a is retried, so a mixed
+			// panel proves the selection is per-delegation and not per-parent.
+			insertMergeGatePanelChild(t, store, "review-panel", "lens-b", JobSucceeded, &AgentResult{
+				Decision: "approved", Summary: "lens-b verified the head",
+			})
+			insertMergeGatePanelChild(t, store, "review-panel", "lens-c", JobSucceeded, &AgentResult{
+				Decision: "approved", Summary: "lens-c verified the head",
+			})
+			insertMergeGatePanelChild(t, store, "review-panel", "lens-a", JobFailed, nil)
+			insertMergeGatePanelRetry(t, store, "review-panel", "lens-a", 1, tc.latestState, tc.latest)
+
+			err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
+				Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "g6-review-sol",
+			}, "head123")
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("an unsuccessful latest attempt must still block the panel")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("an approved retry must clear its failed original, got %v", err)
+			}
+		})
+	}
+}
+
+// insertMergeGatePanelRetry adds a later ATTEMPT of an existing delegation, the
+// shape the engine writes on retry: same DelegationID, RetryCount incremented,
+// a distinct job id.
+func insertMergeGatePanelRetry(t *testing.T, store *db.Store, parentID, delegationID string, attempt int, state JobState, result *AgentResult) {
+	t.Helper()
+	encoded, err := marshalPayload(JobPayload{
+		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", RetryCount: attempt, Result: result,
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload returned error: %v", err)
+	}
+	if err := store.CreateJobWithEvent(context.Background(), db.Job{
+		ID:           fmt.Sprintf("%s/delegation/%s/retry/%d", parentID, delegationID, attempt),
+		Agent:        delegationID,
+		Type:         "review",
+		State:        string(state),
+		Payload:      encoded,
+		ParentJobID:  parentID,
+		DelegationID: delegationID,
+	}, db.JobEvent{Kind: string(state), Message: "delegation retry fixture"}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+}

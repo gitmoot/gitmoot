@@ -562,3 +562,34 @@ func cloneNodes(nodes map[string]Node) map[string]Node {
 	}
 	return out
 }
+
+// #1685 P2. Suppressing the approval CLAIM was not enough: the renderer counts a
+// raw "approved" whenever no effective decision is carried, so the proof summary
+// still reported one approved review for a coordinator announcement. Absence is
+// not a classification. Asserted end to end, projector THROUGH renderer, because
+// the projector-only test passed while the rendered output was wrong.
+func TestReviewFanOutRendersAsNoVerdictAndIsNotCounted(t *testing.T) {
+	root, jobs, results, receipts, events := proofFixture(t, false)
+	for _, result := range results {
+		if result.Decision != "approved" {
+			continue
+		}
+		result.Delegations = []workflow.Delegation{
+			{ID: "lens-a", Agent: "r1", Action: "review"},
+			{ID: "lens-b", Agent: "r2", Action: "review"},
+		}
+	}
+	manifest := Project(root, jobs, results, receipts, events)
+
+	var rendered strings.Builder
+	if err := RenderTree(&rendered, manifest); err != nil {
+		t.Fatalf("RenderTree: %v", err)
+	}
+	out := rendered.String()
+	if !strings.Contains(out, "no verdict") || !strings.Contains(out, "fan-out") {
+		t.Fatalf("rendered proof hides the fan-out classification:\n%s", out)
+	}
+	if strings.Contains(out, "1 approved") {
+		t.Fatalf("a fan-out was counted as an approved review:\n%s", out)
+	}
+}

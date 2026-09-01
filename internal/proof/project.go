@@ -284,6 +284,11 @@ func (p *projector) factNodes(job db.Job, projection payloadProjection, result *
 			if workflow.ResultIsFanOut(result) {
 				attrs["fan_out_delegations"] = strconv.Itoa(len(result.Delegations))
 				attrs["review_outcome"] = "fan-out (no verdict)"
+				// The EFFECTIVE decision has to be explicit, not merely absent: the
+				// renderer's fallback counts a raw "approved" whenever no effective
+				// decision is carried, so suppressing the claim alone still produced a
+				// proof summary reporting one approved review (#1685).
+				attrs["effective_decision"] = NoVerdictDecision
 			} else if effectiveDecision == "approved" {
 				claimType := "review.approved"
 				if independent {

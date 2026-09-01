@@ -93,15 +93,25 @@ func RenderTree(w io.Writer, manifest Manifest) error {
 				// claim. Count the EFFECTIVE decision and show both: the reader sees the
 				// verdict the reviewer wrote and the outcome gitmoot acted on.
 				decision := dash(review.Attrs["decision"])
-				if effective := strings.TrimSpace(review.Attrs["effective_decision"]); effective != "" {
-					if outcome := strings.TrimSpace(review.Attrs["review_outcome"]); outcome != "" {
+				effective := strings.TrimSpace(review.Attrs["effective_decision"])
+				outcome := strings.TrimSpace(review.Attrs["review_outcome"])
+				switch {
+				case effective == NoVerdictDecision:
+					// A coordinator fan-out announced a panel. It is not a verdict, so it
+					// is neither counted nor allowed to READ as one at a glance — the
+					// classification leads and the announced decision trails it.
+					decision = fmt.Sprintf("no verdict · %s · announced %s", dash(outcome), dash(review.Attrs["decision"]))
+				case effective != "":
+					if outcome != "" {
 						decision = fmt.Sprintf("%s (%s)", decision, outcome)
 					}
 					if effective == "approved" {
 						approvedReviews++
 					}
-				} else if review.Attrs["decision"] == "approved" {
-					approvedReviews++
+				default:
+					if review.Attrs["decision"] == "approved" {
+						approvedReviews++
+					}
 				}
 				fmt.Fprintf(w, "      %s · %s · findings %s · %s [%s]\n",
 					dash(review.Attrs["agent"]), decision,

@@ -811,13 +811,23 @@ Every surface that reads a review decision applies the same rule:
   the same head still decides the PR;
 - if the panel **reported**, the gate decides that slot on the delegates — at
   least one approving child, no blocking, crashed, abstaining or still-running
-  child, and every declared delegation accounted for;
+  child, and every declared delegation accounted for. Only the LATEST attempt of
+  each delegation counts, so an approved retry supersedes a failed original
+  instead of being poisoned by it;
 - if the panel was announced and **never dispatched**, the gate reports
   `no review verdict at evaluated head: <agent> (job <id>, N declared) declared
   delegations that never reported` rather than merging or parking;
-- **pipeline auto-merge**, **required-reviewer counting**, the **proof
-  projector** (no `review.approved` claim) and the **review-verdict wake** all
-  skip fan-out rows the same way;
+- **pipeline auto-merge** refuses a fan-out. A pipeline stage has its executable
+  `delegations` stripped at the mailbox seam so a leaf can never spawn children,
+  and the classification is preserved across that strip — stripping the
+  instructions must not erase what the row IS;
+- **required-reviewer counting**, the **review-verdict wake**, the **canonical
+  same-head verdict history** (`SucceededReviewVerdicts`) and **awaited
+  review-verdict facts** all skip fan-outs, so an announcement neither satisfies
+  a reviewer slot nor wakes a waiter nor suppresses the retry that would produce
+  a real verdict;
+- the **proof projector** mints no approval claim for a fan-out, and the
+  rendered proof shows `no verdict` rather than counting it as approved;
 - `blocked` and `failed` reviews are never fan-outs. They already refuse on their
   own terms and keep reporting their own cause.
 

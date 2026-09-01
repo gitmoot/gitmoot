@@ -225,8 +225,19 @@ func TestPipelineAutoMergeGateRefusesFanOutReview(t *testing.T) {
 	}
 }
 
-// declareBoundReviewDelegations rewrites a settled review job's result so it
-// declares a panel, which is the production shape of a coordinator fan-out.
+// declareBoundReviewDelegations rewrites a settled review job's result into the
+// shape a production pipeline fan-out actually has WHEN THIS GATE READS IT.
+//
+// That shape has NO delegations. Mailbox.Run strips them for every
+// non-orchestrate pipeline stage, and a review stage cannot set
+// orchestrate:true, so a stored pipeline review payload carrying delegations is
+// a shape production never writes. The earlier version of this helper wrote
+// exactly that, which is why the gate's guard looked covered while a real
+// coordinator announcement still auto-merged. What survives the strip is the
+// FanOut classification, and that is what the gate must consume.
+//
+// The strip itself is pinned separately, at its own seam, by
+// TestMailboxRunPreservesFanOutClassificationAcrossPipelineStrip.
 func declareBoundReviewDelegations(t *testing.T, store *db.Store, jobID string) {
 	t.Helper()
 	ctx := context.Background()
@@ -238,10 +249,8 @@ func declareBoundReviewDelegations(t *testing.T, store *db.Store, jobID string) 
 	if err != nil {
 		t.Fatalf("ParseJobPayload(review): %v", err)
 	}
-	payload.Result.Delegations = []workflow.Delegation{
-		{ID: "lens-a", Agent: "r1", Action: "review"},
-		{ID: "lens-b", Agent: "r2", Action: "review"},
-	}
+	payload.Result.Delegations = nil
+	payload.Result.FanOut = true
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatalf("marshal review payload: %v", err)

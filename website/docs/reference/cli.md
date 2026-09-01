@@ -2483,14 +2483,21 @@ or missing evidence. Each check is a yes/no question with an explanation:
   declares `delegations` — is exempt, because it announces a panel that has not
   reported yet and legitimately has nothing to record.
 
-  A fan-out is never counted as a verdict. The merge gate excludes such a row
-  from the verdict population (so an independent verdict at the same head still
-  decides the PR), decides the slot on the delegates when the panel reported, and
-  reports `declared delegations that never reported` when it was announced and
-  never dispatched. Pipeline auto-merge, required-reviewer counting, the proof
-  projector and the review-verdict wake apply the same rule; `blocked` and
-  `failed` reviews keep reporting their own cause. A coordinator is therefore
-  dispatchable into a review slot, by CLI and by heartbeat.
+  A fan-out is never counted as a verdict, at any surface that reads a review
+  decision. The merge gate excludes such a row from the verdict population, so an
+  independent verdict at the same head still decides the PR; when the panel
+  reported, the gate decides the slot on the delegates, counting only the LATEST
+  attempt of each delegation so an approved retry supersedes a failed original;
+  when it was announced and never dispatched, the gate reports `declared
+  delegations that never reported`. Pipeline auto-merge refuses a fan-out — a
+  pipeline stage has its executable `delegations` stripped at the mailbox seam so
+  a leaf can never spawn children, and the classification is preserved across
+  that strip. Required-reviewer counting, the review-verdict wake, the canonical
+  same-head verdict history and awaited review-verdict facts all skip fan-outs.
+  The proof projector mints no approval claim and the rendered proof shows
+  `no verdict` instead of counting one. `blocked` and `failed` reviews keep
+  reporting their own cause. A coordinator is therefore dispatchable into a
+  review slot, by CLI and by heartbeat.
 - **ask** — the answer (`summary`/`artifact_body`) must be non-empty and
   actionable.
 - **blocked** (any action) — a `blocked` result must list actionable `needs`.

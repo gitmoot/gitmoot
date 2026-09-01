@@ -473,13 +473,39 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	implementerAttribution := collectImplementerAttribution(jobs, current)
 	implementingAgents := implementerAttribution.agents
 	missingImplementerReason := implementerAttribution.failureReason()
-	delegationChildrenByParent := make(map[string][]db.Job)
+	// One row per (parent, delegation): the LATEST attempt, exactly as continuation
+	// synthesis selects it (childDelegationJobs). Evaluating every attempt let an
+	// obsolete FAILED original outlive an approved retry and block its panel
+	// forever — the retry can never clear a row that is already terminal, so only
+	// a new head could. Ties break on job id so ListJobs ordering never decides.
+	latestAttempt := make(map[string]db.Job)
+	latestAttemptCount := make(map[string]int)
 	for _, job := range jobs {
 		if !isDelegationChild(job) {
 			continue
 		}
+		key := strings.TrimSpace(job.ParentJobID) + "\x00" + strings.TrimSpace(job.DelegationID)
+		attempt := delegationJobRetryCount(job)
+		if held, ok := latestAttempt[key]; ok {
+			if attempt < latestAttemptCount[key] {
+				continue
+			}
+			if attempt == latestAttemptCount[key] && job.ID <= held.ID {
+				continue
+			}
+		}
+		latestAttempt[key] = job
+		latestAttemptCount[key] = attempt
+	}
+	delegationChildrenByParent := make(map[string][]db.Job)
+	for _, job := range latestAttempt {
 		parentID := strings.TrimSpace(job.ParentJobID)
 		delegationChildrenByParent[parentID] = append(delegationChildrenByParent[parentID], job)
+	}
+	for parentID := range delegationChildrenByParent {
+		sort.Slice(delegationChildrenByParent[parentID], func(i, j int) bool {
+			return delegationChildrenByParent[parentID][i].ID < delegationChildrenByParent[parentID][j].ID
+		})
 	}
 	// A round can order remediation, but it must not hide a blocking verdict or
 	// an unfinished reviewer slot captured at the head currently being evaluated.
@@ -784,7 +810,14 @@ func reviewRowIsFanOut(result *AgentResult) bool {
 // treats "approved" as an answer has to agree on what an answer IS, or the
 // defect simply moves to whichever surface was not updated (#1685).
 func ResultIsFanOut(result *AgentResult) bool {
-	return result != nil && len(result.Delegations) > 0 && isTerminalReviewVerdict(result.Decision)
+	if result == nil || !isTerminalReviewVerdict(result.Decision) {
+		return false
+	}
+	// Either the declared panel is still visible, or normalization recorded that
+	// it was there before the executable instructions were stripped. Reading only
+	// delegations[] made every consumer blind to a pipeline review fan-out, whose
+	// delegations the mailbox seam removes by design.
+	return len(result.Delegations) > 0 || result.FanOut
 }
 
 // ensureDelegatedReviewEvidence decides a delegating review on its CHILDREN,
