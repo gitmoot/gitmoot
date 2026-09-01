@@ -419,6 +419,30 @@ func (e Engine) block(ctx context.Context, ref taskRef, reason string) error {
 // concurrent merge occupies in production; nil outside tests.
 var blockTaskPreWriteHook func(ctx context.Context, taskID string)
 
+// taskStatePreWriteHook fires between setTaskStateResolved's resolution and its
+// write, which is the ONLY window in which a test can prove the write itself is
+// ownership-bound: an interleaving placed at the barrier is refused by the barrier's
+// renewal and never reaches this write at all. Nil in production.
+var taskStatePreWriteHook func(ctx context.Context, taskID string)
+
+// advanceOwnershipBinding returns the live-ownership predicate this engine's writes
+// must satisfy, or nil for every ordinary caller (#1673). A supersession recovery's
+// advance runs on a COPY of the engine carrying its lease, so any irreversible
+// parent effect reached from that copy can bind to it at COMMIT rather than trusting
+// the barrier that decided it: the pass can stall in between, its lease can lapse,
+// and a retry can legally re-queue the child at the next generation.
+func (e Engine) advanceOwnershipBinding() *db.AdvanceOwnership {
+	if e.supersedeAdvance == nil || strings.TrimSpace(e.supersedeAdvance.LockKey) == "" {
+		return nil
+	}
+	return &db.AdvanceOwnership{
+		LockKey:      e.supersedeAdvance.LockKey,
+		OwnerToken:   e.supersedeAdvance.Token,
+		OwnerJobID:   e.supersedeAdvance.JobID,
+		AtGeneration: e.supersedeAdvance.Generation,
+	}
+}
+
 // blockTask is the single task-blocking choke point. Every durable block
 // atomically writes the state and the event that owns it. A stale state
 // observation or failed attribution write commits neither half.
@@ -444,11 +468,28 @@ func (e Engine) blockTask(ctx context.Context, ref taskRef, kind string, reason 
 	if blockTaskPreWriteHook != nil {
 		blockTaskPreWriteHook(ctx, task.ID)
 	}
-	blocked, err := e.Store.BlockTaskWithEvent(ctx, task, db.TaskEvent{
+	blockEvent := db.TaskEvent{
 		Kind:      kind,
 		FromState: fromState,
 		Reason:    reason,
-	})
+	}
+	var blocked bool
+	if own := e.advanceOwnershipBinding(); own != nil {
+		blocked, err = e.Store.BlockTaskWithEventIfAdvanceOwned(ctx, task, blockEvent, *own, time.Now().UTC())
+	} else {
+		blocked, err = e.Store.BlockTaskWithEvent(ctx, task, blockEvent)
+	}
+	if errors.Is(err, db.ErrAdvanceOwnershipLost) {
+		// Not a fault and not a merged-work refusal: this pass no longer owns the
+		// advance, so the effect was correctly refused. Report it as the rolled-back
+		// class the recovery already understands — the debt stays outstanding and the
+		// next poll re-drives it against whatever run owns the row then.
+		return supersedeAdvanceRolledBackError{
+			JobID:      e.supersedeAdvance.JobID,
+			Generation: e.supersedeAdvance.Generation,
+			Barrier:    "block-commit",
+		}
+	}
 	if err != nil {
 		// #1673: a task whose pull request already MERGED must keep that record, and a
 		// dead leg's block_parent must still RELEASE its coordinator. The store's
@@ -503,7 +544,21 @@ func (e Engine) setTaskStateResolved(ctx context.Context, ref taskRef, state Tas
 	// BlockTaskWithEvent), and every target must refuse to overwrite a disposed row.
 	// Both exclusions live on the write, so a second daemon cannot win the race a
 	// pre-read would lose.
-	if _, err := PersistTaskState(ctx, e.Store, task, state); err != nil {
+	// An anchored advance binds this write to its live lease as well, so an
+	// escalate_human pause (or any other state move it reaches) cannot land after the
+	// lease lapsed and a retry re-queued the child (#1673).
+	if taskStatePreWriteHook != nil {
+		taskStatePreWriteHook(ctx, task.ID)
+	}
+	if _, err := persistTaskStateOwned(ctx, e.Store, task, state, e.advanceOwnershipBinding()); err != nil {
+		if errors.Is(err, db.ErrAdvanceOwnershipLost) {
+			// Same classification as the block path: a refused effect, not a fault.
+			return "", supersedeAdvanceRolledBackError{
+				JobID:      e.supersedeAdvance.JobID,
+				Generation: e.supersedeAdvance.Generation,
+				Barrier:    "task-state-commit",
+			}
+		}
 		return "", err
 	}
 	return task.ID, nil
@@ -590,6 +645,13 @@ func (e Engine) resolveTaskState(ctx context.Context, ref taskRef, state TaskSta
 // terminal-state conflict check; this covers the remaining regression targets
 // (`planned`, `awaiting_human`) and every ordinary advancement.
 func PersistTaskState(ctx context.Context, store *db.Store, task db.Task, state TaskState) (bool, error) {
+	return persistTaskStateOwned(ctx, store, task, state, nil)
+}
+
+// persistTaskStateOwned is PersistTaskState with an optional live-ownership
+// predicate carried INTO the write's transaction. own is nil for every ordinary
+// caller, which keeps that path byte-identical.
+func persistTaskStateOwned(ctx context.Context, store *db.Store, task db.Task, state TaskState, own *db.AdvanceOwnership) (bool, error) {
 	task.State = string(state)
 	forbidden := make([]string, 0, 4)
 	for _, disposed := range []TaskState{TaskDismissed, TaskSuperseded, TaskStranded} {
@@ -601,7 +663,15 @@ func PersistTaskState(ctx context.Context, store *db.Store, task db.Task, state 
 	if mergedGuarded {
 		forbidden = append(forbidden, string(TaskMerged))
 	}
-	written, err := store.UpsertTaskUnlessStates(ctx, task, forbidden)
+	var (
+		written bool
+		err     error
+	)
+	if own != nil {
+		written, err = store.UpsertTaskUnlessStatesIfAdvanceOwned(ctx, task, forbidden, *own, time.Now().UTC())
+	} else {
+		written, err = store.UpsertTaskUnlessStates(ctx, task, forbidden)
+	}
 	if err != nil {
 		return false, err
 	}

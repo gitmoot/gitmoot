@@ -223,6 +223,38 @@ func (s *Store) UpsertTask(ctx context.Context, task Task) error {
 // callers that must not resurrect a terminal task remain safe if its state
 // changes after their initial read.
 func (s *Store) UpsertTaskUnlessStates(ctx context.Context, task Task, forbiddenStates []string) (bool, error) {
+	return s.upsertTaskUnlessStates(ctx, s.db, task, forbiddenStates)
+}
+
+// UpsertTaskUnlessStatesIfAdvanceOwned is UpsertTaskUnlessStates with live advance
+// ownership asserted in the SAME transaction as the task write (#1673).
+//
+// An escalate_human pause moves the parent task to awaiting_human, which is an
+// irreversible parent effect: it stops the tree and calls a human. The barrier that
+// decided the policy cannot protect it, because the pass can stall between that
+// check and this write while its lease lapses and a retry re-queues the child.
+func (s *Store) UpsertTaskUnlessStatesIfAdvanceOwned(ctx context.Context, task Task, forbiddenStates []string, own AdvanceOwnership, now time.Time) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	live, err := advanceOwnershipLiveTx(ctx, tx, own, now)
+	if err != nil {
+		return false, err
+	}
+	if !live {
+		return false, fmt.Errorf("%w: task %s write for job %s at generation %d",
+			ErrAdvanceOwnershipLost, task.ID, own.OwnerJobID, own.AtGeneration)
+	}
+	written, err := s.upsertTaskUnlessStates(ctx, tx, task, forbiddenStates)
+	if err != nil {
+		return false, err
+	}
+	return written, tx.Commit()
+}
+
+func (s *Store) upsertTaskUnlessStates(ctx context.Context, execer sqlExecer, task Task, forbiddenStates []string) (bool, error) {
 	if len(forbiddenStates) == 0 {
 		return false, errors.New("at least one forbidden task state is required")
 	}
@@ -232,7 +264,7 @@ func (s *Store) UpsertTaskUnlessStates(ctx context.Context, task Task, forbidden
 		placeholders = append(placeholders, "?")
 		args = append(args, strings.TrimSpace(state))
 	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch, worktree_path, updated_at)
+	result, err := execer.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch, worktree_path, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO UPDATE SET
 			repo_full_name = excluded.repo_full_name,
@@ -441,6 +473,23 @@ const (
 // the blocked task row, and appends the event that owns that block. blocked is
 // true only after both writes commit.
 func (s *Store) BlockTaskWithEvent(ctx context.Context, task Task, event TaskEvent) (blocked bool, err error) {
+	return s.blockTaskWithEvent(ctx, task, event, nil, time.Time{})
+}
+
+// BlockTaskWithEventIfAdvanceOwned is BlockTaskWithEvent with live advance ownership
+// asserted in the SAME transaction as the block (#1673).
+//
+// A block_parent failure policy is an irreversible parent effect: it moves the
+// parent task and writes its attribution event. Checking ownership at the barrier
+// that decided the policy is not enough — the pass can stall between that check and
+// this write, its lease can lapse, and a retry can legally re-queue the child at
+// generation N+1. Binding here means the block either commits while this pass still
+// owns the advance, or does not happen at all.
+func (s *Store) BlockTaskWithEventIfAdvanceOwned(ctx context.Context, task Task, event TaskEvent, own AdvanceOwnership, now time.Time) (blocked bool, err error) {
+	return s.blockTaskWithEvent(ctx, task, event, &own, now)
+}
+
+func (s *Store) blockTaskWithEvent(ctx context.Context, task Task, event TaskEvent, own *AdvanceOwnership, now time.Time) (blocked bool, err error) {
 	task.ID = strings.TrimSpace(task.ID)
 	if task.ID == "" {
 		return false, errors.New("blocked task id is required")
@@ -456,6 +505,17 @@ func (s *Store) BlockTaskWithEvent(ctx context.Context, task Task, event TaskEve
 		return false, err
 	}
 	defer tx.Rollback()
+
+	if own != nil {
+		live, ownErr := advanceOwnershipLiveTx(ctx, tx, *own, now)
+		if ownErr != nil {
+			return false, ownErr
+		}
+		if !live {
+			return false, fmt.Errorf("%w: task %s block for job %s at generation %d",
+				ErrAdvanceOwnershipLost, task.ID, own.OwnerJobID, own.AtGeneration)
+		}
+	}
 
 	var activeClaim string
 	claimErr := tx.QueryRowContext(ctx, `SELECT token FROM task_state_claims
