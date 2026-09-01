@@ -2372,4 +2372,43 @@ CREATE TABLE pull_request_terminal_settlements (
 CREATE INDEX idx_pull_request_terminal_settlements_task
 	ON pull_request_terminal_settlements(task_id);
 	`,
+	`
+-- #1673: a human escalation round gets a DURABLE IDENTITY and a JOB-LEVEL
+-- exclusive slot, so claim, effects and receipt are settled by identity rather
+-- than by comparing aggregate event counts.
+CREATE TABLE escalation_rounds (
+	job_id TEXT NOT NULL CHECK(length(trim(job_id)) > 0),
+	round_id TEXT NOT NULL CHECK(length(trim(round_id)) > 0),
+	kind TEXT NOT NULL DEFAULT '',
+	opened_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	-- resolved_at NULL => the round is LIVE (nobody has claimed its resolution).
+	resolved_at TEXT,
+	claim_verb TEXT NOT NULL DEFAULT '',
+	claim_generation INTEGER,
+	claim_payload TEXT NOT NULL DEFAULT '',
+	-- effects_completed_at NULL => UNSETTLED. It is the slot predicate below, so a
+	-- claimed-but-unfinished round keeps holding the coordinator's only slot: a
+	-- stale replay must never be able to clear a NEWER round's live pause.
+	effects_completed_at TEXT,
+	-- settled_reason names WHY a settlement happened without applying effects: a
+	-- Class I no-op release (the coordinator row is gone) or an operator supersede.
+	settled_reason TEXT NOT NULL DEFAULT '',
+	settled_by TEXT NOT NULL DEFAULT '',
+	-- needs_repair is the terminal integrity state. It PRESERVES the claim and,
+	-- because effects_completed_at stays NULL, keeps the slot held: no new round and
+	-- no ordinary advance until an operator repairs or supersedes it.
+	integrity_state TEXT NOT NULL DEFAULT '' CHECK(integrity_state IN ('', 'needs_repair')),
+	integrity_cause TEXT NOT NULL DEFAULT '',
+	integrity_at TEXT,
+	recovery_attempts INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY(job_id, round_id)
+);
+-- THE EXCLUSION INVARIANT, as a schema constraint rather than a predicate a caller
+-- can weaken: at most ONE unsettled round per coordinator job.
+CREATE UNIQUE INDEX escalation_rounds_one_unsettled
+	ON escalation_rounds(job_id) WHERE effects_completed_at IS NULL;
+CREATE INDEX idx_escalation_rounds_unfinished
+	ON escalation_rounds(job_id, integrity_state)
+	WHERE resolved_at IS NOT NULL AND effects_completed_at IS NULL;
+	`,
 }

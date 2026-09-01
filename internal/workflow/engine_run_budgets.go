@@ -249,6 +249,18 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	}
 	ref := taskRefFromPayload(payload)
 
+	// A round parked in needs_repair means a human's decision was CLAIMED and never
+	// applied. Advancing past it would proceed as if it had been applied - the exact
+	// harm the claim protocol exists to prevent - so the coordinator is blocked with
+	// the cause until an operator repairs or supersedes it (#1673). The block is
+	// keyed on the coordinator this advance would settle, so ordinary work is
+	// untouched: a job with no parked round pays one indexed lookup.
+	if blockedErr, blocked, err := e.escalationRepairBlock(ctx, job, ref); err != nil {
+		return err
+	} else if blocked {
+		return blockedErr
+	}
+
 	// High-risk lens normalization (#650). A refutation lens may report a CRITICAL
 	// finding in AgentResult.Findings yet leave its OWN decision at
 	// approved/changes_requested — the documented convention (SynthesizeLensDecision)

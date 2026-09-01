@@ -254,143 +254,128 @@ func (s *Store) UpsertTaskUnlessStatesIfAdvanceOwned(ctx context.Context, task T
 	return written, tx.Commit()
 }
 
-// HumanRoundOpen names one attempt to open a human round: the pause target, the
-// round-open event, and the event kinds whose counts decide whether a round is
-// ALREADY open on that job.
+// HumanRoundOpen names one attempt to open a human round: the round's durable
+// identity, the pause target, and the round-open event that records it.
 type HumanRoundOpen struct {
+	JobID           string
+	RoundID         string
+	Kind            string
 	Task            Task
 	ForbiddenStates []string
 	Event           JobEvent
-	RequestedKind   string
-	ResolvedKind    string
 }
 
 // OpenHumanRound opens a human round as ONE transaction that settles three facts
 // together (#1673):
 //
-//	WON     the requested<=resolved guard rides in the round-open INSERT's own WHERE
-//	        clause, so two workers advancing settled sibling children cannot both
-//	        open a round. A pre-check cannot do this: both callers read "closed" and
-//	        both commit, leaving requested=2 resolved=1 and a falsely open
-//	        coordinator. A caller that loses writes nothing and announces nothing.
-//	PAUSED  the guarded task transition commits WITH the event. If the transition is
-//	        REFUSED — a merged row forbids awaiting_human, or the row became disposed
-//	        after the caller's pre-read — the whole transaction rolls back: a round
-//	        event without its pause is a lie, and announcing an unopened round calls
-//	        a human about a transition that never happened.
-//	QUIET   the caller learns both facts BEFORE any announcement, so notifier, event
+//	SLOT    the FIRST statement takes the coordinator's only unsettled-round slot in
+//	        escalation_rounds. Exclusion is the partial unique index
+//	        escalation_rounds_one_unsettled, not a predicate over the caller's own
+//	        identity: two concurrent openers mint DIFFERENT round ids, so an
+//	        identity-scoped predicate would let both through. The slot is held until
+//	        SETTLEMENT, so a claimed round whose effects have not landed still blocks
+//	        a new round — a stale replay must never clear a newer round's live pause.
+//	PAUSED  the guarded task transition commits WITH the requested event. If the
+//	        transition is REFUSED (a merged row forbids awaiting_human, or the row
+//	        became disposed after the caller's pre-read) the whole transaction rolls
+//	        back, releasing the slot: a round event without its pause is a lie, and
+//	        announcing an unopened round calls a human about nothing.
+//	QUIET   the caller learns the outcome BEFORE any announcement, so notifier, event
 //	        sink and chat link fire only for the winner that actually paused.
 //
-// The conditional INSERT is the FIRST statement so it takes the write lock before
-// anything is read — the same write-first ordering the resource-lock guard uses, and
-// for the same reason: under WAL a read-then-write pair loses to a concurrent commit.
-// HumanRoundOutcome names the three ways a round-open ends. A caller that cannot
-// tell them apart either announces for a loser, or writes a landed-work audit event
-// about a task it never touched — intent that a (bool, bool) pair cannot carry.
-type HumanRoundOutcome int
-
-const (
-	// HumanRoundAlreadyOpen: another opener holds this round. Idempotent and silent.
-	HumanRoundAlreadyOpen HumanRoundOutcome = iota
-	// HumanRoundOpened: this caller won the guard and, unless taskless, paused.
-	HumanRoundOpened
-	// HumanRoundRefused: this caller won the guard but its guarded task transition was
-	// refused, so the whole round-open rolled back. Only this outcome owes a
-	// classification of the winning row.
-	HumanRoundRefused
-)
-
-func (s *Store) OpenHumanRound(ctx context.Context, round HumanRoundOpen) (HumanRoundOutcome, error) {
-	return s.openHumanRound(ctx, round, nil, time.Time{})
+// A LOSER writes nothing at all — no round row, no event, no task write, and
+// therefore no classification and no audit row. That is why a concurrent loser can
+// never produce a false landed-work refusal.
+func (s *Store) OpenHumanRound(ctx context.Context, round HumanRoundOpen, now time.Time) (EscalationRoundOutcome, error) {
+	return s.openHumanRound(ctx, round, nil, now)
 }
 
 // OpenHumanRoundIfAdvanceOwned is OpenHumanRound with live advance ownership
 // asserted in the same transaction, so a superseded pass can neither open a round
 // nor announce one.
-func (s *Store) OpenHumanRoundIfAdvanceOwned(ctx context.Context, round HumanRoundOpen, own AdvanceOwnership, now time.Time) (HumanRoundOutcome, error) {
+func (s *Store) OpenHumanRoundIfAdvanceOwned(ctx context.Context, round HumanRoundOpen, own AdvanceOwnership, now time.Time) (EscalationRoundOutcome, error) {
 	return s.openHumanRound(ctx, round, &own, now)
 }
 
-func (s *Store) openHumanRound(ctx context.Context, round HumanRoundOpen, own *AdvanceOwnership, now time.Time) (HumanRoundOutcome, error) {
-	if strings.TrimSpace(round.Event.JobID) == "" {
-		return HumanRoundAlreadyOpen, errors.New("job event job id is required")
+func (s *Store) openHumanRound(ctx context.Context, round HumanRoundOpen, own *AdvanceOwnership, now time.Time) (EscalationRoundOutcome, error) {
+	jobID := strings.TrimSpace(round.JobID)
+	if jobID == "" {
+		return EscalationRoundBlocked, errors.New("escalation round job id is required")
 	}
-	if strings.TrimSpace(round.RequestedKind) == "" || strings.TrimSpace(round.ResolvedKind) == "" {
-		return HumanRoundAlreadyOpen, errors.New("round-open requires both event kinds")
+	if strings.TrimSpace(round.RoundID) == "" {
+		return EscalationRoundBlocked, errors.New("escalation round id is required")
+	}
+	if strings.TrimSpace(round.Event.Kind) == "" {
+		return EscalationRoundBlocked, errors.New("round-open event kind is required")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return HumanRoundAlreadyOpen, err
+		return EscalationRoundBlocked, err
 	}
 	defer tx.Rollback()
 
-	result, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message)
-		SELECT ?, ?, ?
-		WHERE (SELECT COUNT(*) FROM job_events WHERE job_id = ? AND kind = ?)
-		   <= (SELECT COUNT(*) FROM job_events WHERE job_id = ? AND kind = ?)`,
-		round.Event.JobID, round.Event.Kind, round.Event.Message,
-		round.Event.JobID, round.RequestedKind, round.Event.JobID, round.ResolvedKind)
+	took, err := insertEscalationRoundTx(ctx, tx, jobID, round.RoundID, round.Kind, now)
 	if err != nil {
-		return HumanRoundAlreadyOpen, err
+		return EscalationRoundBlocked, err
 	}
-	opened, err := result.RowsAffected()
-	if err != nil {
-		return HumanRoundAlreadyOpen, err
-	}
-	if opened != 1 {
-		// A round is already open on this job: idempotent, and nothing to announce.
-		return HumanRoundAlreadyOpen, tx.Commit()
+	if !took {
+		// The coordinator already has an unsettled round: idempotent, and silent.
+		return EscalationRoundBlocked, tx.Commit()
 	}
 	if own != nil {
 		live, ownErr := advanceOwnershipLiveTx(ctx, tx, *own, now)
 		if ownErr != nil {
-			return HumanRoundAlreadyOpen, ownErr
+			return EscalationRoundBlocked, ownErr
 		}
 		if !live {
-			return HumanRoundAlreadyOpen, fmt.Errorf("%w: task %s round-open for job %s at generation %d",
-				ErrAdvanceOwnershipLost, round.Task.ID, own.OwnerJobID, own.AtGeneration)
+			return EscalationRoundBlocked, fmt.Errorf("%w: round-open for job %s at generation %d",
+				ErrAdvanceOwnershipLost, own.OwnerJobID, own.AtGeneration)
 		}
 	}
-	if strings.TrimSpace(round.Task.ID) == "" {
-		// A taskless coordinator owes the round record and has nothing to pause.
-		return HumanRoundOpened, tx.Commit()
+	if strings.TrimSpace(round.Task.ID) != "" {
+		written, werr := s.upsertTaskUnlessStates(ctx, tx, round.Task, round.ForbiddenStates)
+		if werr != nil {
+			return EscalationRoundBlocked, werr
+		}
+		if !written {
+			// REFUSED: roll back the slot and the event with the pause. The caller
+			// classifies the winning row; a loser never reaches this statement.
+			return EscalationRoundRefused, nil
+		}
 	}
-	written, err := s.upsertTaskUnlessStates(ctx, tx, round.Task, round.ForbiddenStates)
-	if err != nil {
-		return HumanRoundAlreadyOpen, err
+	event := round.Event
+	if strings.TrimSpace(event.JobID) == "" {
+		event.JobID = jobID
 	}
-	if !written {
-		// The pause was REFUSED: roll the round-open event back with it, and say so
-		// explicitly. A loser and a refusal are different facts.
-		return HumanRoundRefused, nil
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`,
+		event.JobID, event.Kind, event.Message); err != nil {
+		return EscalationRoundBlocked, err
 	}
-	return HumanRoundOpened, tx.Commit()
+	return EscalationRoundOpened, tx.Commit()
 }
 
-// CloseHumanRound is the resolver half, and it is the SAME mechanism as the opener:
-// the requested>resolved invariant is asserted inside the append's own statement, so
-// a human resume racing TTL auto-finalization — or two concurrent resume callers —
-// cannot both close one round (#1673).
+// CloseHumanRound claims a round's resolution and appends its resolved event in ONE
+// transaction, keyed by round identity (#1673). rows=1 on the claim UPDATE is the
+// winner and the only caller allowed to run the verb's irreversible effects; a human
+// resume and the TTL sweep contend on that single statement rather than on two
+// independent pre-checks.
 //
-// Without it both observe requested=1/resolved=0, both act, and both append: the
-// counters reach 2/2, escalationOpen reports closed, and the NEXT legitimate round
-// opens to requested=2/resolved=2, which no resolver can ever close again.
-//
-// closed=false means another caller owns this resolution. Its irreversible
-// retry/continuation effects MUST NOT run: callers claim first, then act.
-func (s *Store) CloseHumanRound(ctx context.Context, event JobEvent, requestedKind string, resolvedKind string) (closed bool, err error) {
-	if strings.TrimSpace(event.JobID) == "" {
-		return false, errors.New("job event job id is required")
+// It does NOT release the slot: settlement does, after the effects land.
+func (s *Store) CloseHumanRound(ctx context.Context, jobID string, roundID string, verb string, generation int64, payload string, event JobEvent, now time.Time) (bool, error) {
+	jobID = strings.TrimSpace(jobID)
+	roundID = strings.TrimSpace(roundID)
+	if jobID == "" || roundID == "" {
+		return false, errors.New("round-close requires a job id and a round id")
 	}
-	if strings.TrimSpace(requestedKind) == "" || strings.TrimSpace(resolvedKind) == "" {
-		return false, errors.New("round-close requires both event kinds")
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
 	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message)
-		SELECT ?, ?, ?
-		WHERE (SELECT COUNT(*) FROM job_events WHERE job_id = ? AND kind = ?)
-		    > (SELECT COUNT(*) FROM job_events WHERE job_id = ? AND kind = ?)`,
-		event.JobID, event.Kind, event.Message,
-		event.JobID, requestedKind, event.JobID, resolvedKind)
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE escalation_rounds
+		SET resolved_at = ?, claim_verb = ?, claim_generation = ?, claim_payload = ?
+		WHERE job_id = ? AND round_id = ? AND resolved_at IS NULL AND effects_completed_at IS NULL`,
+		formatResourceLockTime(now), strings.TrimSpace(verb), generation, payload, jobID, roundID)
 	if err != nil {
 		return false, err
 	}
@@ -398,7 +383,17 @@ func (s *Store) CloseHumanRound(ctx context.Context, event JobEvent, requestedKi
 	if err != nil {
 		return false, err
 	}
-	return affected == 1, nil
+	if affected != 1 {
+		return false, tx.Commit()
+	}
+	if strings.TrimSpace(event.JobID) == "" {
+		event.JobID = jobID
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`,
+		event.JobID, event.Kind, event.Message); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
 }
 
 func (s *Store) upsertTaskUnlessStates(ctx context.Context, execer sqlExecer, task Task, forbiddenStates []string) (bool, error) {

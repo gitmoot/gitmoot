@@ -2,7 +2,9 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -88,9 +90,16 @@ func TestConcurrentResumeAndTTLResolveExactlyOnce(t *testing.T) {
 	// effect exists while the loser's does NOT. (The deterministic
 	// resume-inside-the-TTL-window test below pins the human-wins ordering and the
 	// re-escalation consequence.)
-	resolution, found, err := engine.loadResolution(ctx, "parent-job")
+	round, found, err := store.UnsettledEscalationRound(ctx, "parent-job")
+	if err != nil {
+		t.Fatalf("UnsettledEscalationRound: %v", err)
+	}
+	if found {
+		t.Fatalf("a settled round still holds the slot: %+v", round)
+	}
+	resolution, found, err := latestResolutionRecord(t, store, "parent-job")
 	if err != nil || !found {
-		t.Fatalf("loadResolution found=%v err=%v", found, err)
+		t.Fatalf("latestResolutionRecord found=%v err=%v", found, err)
 	}
 	resumeJobID := "parent-job/delegation/api/resume"
 	continuationID := delegationContinuationID("parent-job")
@@ -429,4 +438,29 @@ func TestTTLClaimRefusesAfterAHumanResolvesInTheWindow(t *testing.T) {
 	} else if !open {
 		t.Fatal("the re-escalated round reports CLOSED: it can never be resolved")
 	}
+}
+
+// latestResolutionRecord reads the last resolution record from the audit trail. Tests
+// read it to learn WHICH side won a genuine race; production settles by round
+// identity and never by scanning events.
+func latestResolutionRecord(t *testing.T, store *db.Store, jobID string) (EscalationRecord, bool, error) {
+	t.Helper()
+	events, err := store.ListJobEvents(context.Background(), jobID)
+	if err != nil {
+		return EscalationRecord{}, false, err
+	}
+	var latest EscalationRecord
+	found := false
+	for _, event := range events {
+		if event.Kind != escalationResolvedEvent {
+			continue
+		}
+		var record EscalationRecord
+		if err := json.Unmarshal([]byte(event.Message), &record); err != nil {
+			record = EscalationRecord{Reason: strings.TrimSpace(event.Message)}
+		}
+		latest = record
+		found = true
+	}
+	return latest, found, nil
 }

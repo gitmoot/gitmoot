@@ -2,12 +2,15 @@ package workflow
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,17 +28,50 @@ import (
 const (
 	escalationRequestedEvent = "delegation_escalation_requested"
 	escalationResolvedEvent  = "delegation_escalation_resolved"
-	// escalationEffectsCompletedEvent closes the resolution's second half.
+	// escalationEffectsCompletedEvent is the RECEIPT: the claim's second half landed.
 	//
-	// The resolved event is the exclusive CLAIM (its conditional append is what makes
-	// resolution exactly-once), and it is committed BEFORE the verb's irreversible
-	// effects so a loser cannot run them. That ordering has a debt: a crash between
-	// the claim and the effects would otherwise strand the tree forever, because a
-	// closed round is no longer a candidate for any sweep. This marker is the receipt
-	// — a claim without it is an UNFINISHED resolution that
-	// RecoverUnfinishedEscalationResolutions re-drives on the next poll (#1673).
+	// The claim is committed BEFORE the verb's irreversible effects so only one
+	// resolver runs them. A crash in between would otherwise strand the tree, so a
+	// claim without a receipt is an UNFINISHED resolution that the recovery sweep
+	// re-drives from the round's stored claim (#1673).
 	escalationEffectsCompletedEvent = "delegation_escalation_effects_completed"
+	// escalationNeedsRepairEvent is the ONE signal a parked round emits. Its
+	// exactly-once-ness comes from the affected-row predicate on the state transition,
+	// not from counting events.
+	escalationNeedsRepairEvent = "delegation_escalation_needs_repair"
+	// escalationRepairedEvent and escalationSupersededEvent are the two operator repair
+	// arms' durable traces. Supersede is the ONLY path that discards a claimed human
+	// decision, and it carries the operator and their reason.
+	escalationRepairedEvent   = "delegation_escalation_repair_retried"
+	escalationSupersededEvent = "delegation_escalation_repair_superseded"
+	// escalationReleasedEvent records a Class I no-op release: the coordinator row is
+	// gone, so the round can never be replayed by anyone.
+	escalationReleasedEvent = "delegation_escalation_released"
 )
+
+// escalationRecoveryAttemptBound is how many replay attempts a claimed round gets
+// before the sweep STOPS RETRYING AND ASKS A HUMAN. It is deliberately larger than
+// one poll's worth of transient failure (a lock, a dependency outage) and it can
+// never discard a claim: exhaustion routes to needs_repair, which PRESERVES the
+// decision and holds the slot, so every value of this constant is safe.
+const escalationRecoveryAttemptBound = 5
+
+// escalationReleaseReasonCoordinatorGone is the named reason for the only settlement
+// the engine may perform without applying effects.
+const escalationReleaseReasonCoordinatorGone = "coordinator_row_absent"
+
+// newEscalationRoundID mints a round's durable identity. It must be unique per
+// coordinator over time; it is never parsed, only compared. Identity is for PAIRING
+// a round's request, claim and receipt — exclusion is the job-level slot, never this.
+func newEscalationRoundID() string {
+	var tail [8]byte
+	if _, err := rand.Read(tail[:]); err != nil {
+		// A failed read must never fail a pause: the timestamp alone still separates
+		// rounds on one coordinator, which is the only uniqueness required here.
+		return strconv.FormatInt(time.Now().UTC().UnixNano(), 36)
+	}
+	return strconv.FormatInt(time.Now().UTC().UnixNano(), 36) + "-" + hex.EncodeToString(tail[:])
+}
 
 // escalationTTLPreClaimHook fires between the TTL sweep's candidate selection and
 // its resolution claim — the exact window in which a human resume lands, and the
@@ -67,6 +103,15 @@ type EscalationRecord struct {
 	// Answers carries the human's parsed id->answer map on the resolved event of an
 	// ask round. Empty for a failure escalation or an unanswered (TTL) resolution.
 	Answers map[string]string `json:"answers,omitempty"`
+	// RoundID is the round's DURABLE IDENTITY, minted by the opener and echoed by its
+	// claim and receipt (#1673). It PAIRS a round's three phases so recovery can never
+	// join one round's request to another round's resolution. It is NOT exclusion:
+	// exclusion is the coordinator's unsettled-round slot, because two concurrent
+	// openers mint different ids and an identity-scoped predicate would pass both.
+	//
+	// Absent on every event written before this protocol, which is why a legacy round
+	// has no escalation_rounds row and can never enter recovery.
+	RoundID string `json:"round_id,omitempty"`
 }
 
 // escalationKindAsk is the EscalationRecord.Kind discriminator for an ask-gate
@@ -85,14 +130,11 @@ func (e Engine) pauseAwaitingHuman(ctx context.Context, parentJob db.Job, parent
 	reason := childFailureReason(child)
 	awaitErr := AwaitingHumanError{Reason: fmt.Sprintf("delegation %q failed (failure_policy escalate_human): %s", d.ID, reason)}
 
-	// While an escalation round is OPEN (requested > resolved), this is an
-	// idempotent re-advance (a concurrent child completion, or the same child's
-	// AdvanceJob re-running): keep the task in awaiting_human and return the same
-	// pause error, but re-record nothing and re-notify nobody. When the round is
-	// CLOSED (requested == resolved: a prior escalation was resolved, e.g. a retry
-	// that has now failed AGAIN) we fall through to open a FRESH round below — a
-	// new requested event, a re-pause, and a re-notify — so the tree never strands
-	// permanently in planned with nothing in flight (#340).
+	// The pre-check is a FAST PATH ONLY: the authoritative exclusion is the
+	// coordinator's unsettled-round slot, taken inside the round-open transaction. A
+	// slot is held from OPEN through SETTLEMENT, so it also covers a claimed round
+	// whose effects have not landed - a stale replay must never be able to clear a
+	// newer round's live pause (#1673).
 	open, err := e.escalationOpen(ctx, parentJob.ID)
 	if err != nil {
 		return err
@@ -108,24 +150,17 @@ func (e Engine) pauseAwaitingHuman(ctx context.Context, parentJob db.Job, parent
 		Question:     strings.TrimSpace(d.Prompt),
 		PausedAt:     e.now().UTC().Format(time.RFC3339),
 	}
-	encoded, marshalErr := json.Marshal(record)
-	message := awaitErr.Reason
-	if marshalErr == nil {
-		message = string(encoded)
-	}
-	// ONE durable operation, EXACTLY ONCE: the pause and the round-open event commit
-	// together and only for the caller that wins the requested<=resolved guard in the
-	// write itself. Under a supersession advance both are bound to live ownership
-	// (#1673).
-	announce, err := e.openHumanRound(ctx, ref, parentJob.ID, db.JobEvent{
-		Kind:    escalationRequestedEvent,
-		Message: message,
+	_, announce, err := e.openHumanRound(ctx, ref, parentJob.ID, "", record, func(rec EscalationRecord) string {
+		if encoded, marshalErr := json.Marshal(rec); marshalErr == nil {
+			return string(encoded)
+		}
+		return awaitErr.Reason
 	})
 	if err != nil {
 		return err
 	}
 	if !announce {
-		// Either a sibling opened this round or the pause was refused and rolled back.
+		// A sibling holds the slot, or the pause was refused and rolled back with it.
 		// The coordinator is still parked from this leg's point of view, but nothing
 		// here may call a human about a round this caller did not open.
 		return awaitErr
@@ -263,14 +298,11 @@ func (e Engine) pauseAwaitingHumanAnswer(ctx context.Context, job db.Job, payloa
 		Kind:      escalationKindAsk,
 		Questions: questions,
 	}
-	encoded, marshalErr := json.Marshal(record)
-	message := record.Reason
-	if marshalErr == nil {
-		message = string(encoded)
-	}
-	announce, err := e.openHumanRound(ctx, targetRef, targetID, db.JobEvent{
-		Kind:    escalationRequestedEvent,
-		Message: message,
+	_, announce, err := e.openHumanRound(ctx, targetRef, targetID, escalationKindAsk, record, func(rec EscalationRecord) string {
+		if encoded, marshalErr := json.Marshal(rec); marshalErr == nil {
+			return string(encoded)
+		}
+		return rec.Reason
 	})
 	if err != nil {
 		return false, err
@@ -477,6 +509,12 @@ const (
 	// only on an ask round (Kind="ask"); the retry/continue/abort verbs are valid
 	// only on a failure-escalation round.
 	ResumeAnswer ResumeDecision = "answer"
+	// ResumeTTL is the auto-finalize verb the TTL sweep claims a round with. It is
+	// REPLAY-ONLY: validResumeDecision rejects it, so an operator cannot type it,
+	// while the recovery sweep replays it through the SAME applyResolutionEffects
+	// switch as the human verbs. Before this, a crashed TTL claim was unrecoverable
+	// because "ttl" was not a decision anything could replay (#1673).
+	ResumeTTL ResumeDecision = "ttl"
 )
 
 // validResumeDecision normalizes and validates a resume verb.
@@ -493,6 +531,16 @@ func validResumeDecision(decision string) (ResumeDecision, bool) {
 	default:
 		return "", false
 	}
+}
+
+// validReplayableResumeDecision accepts every verb the recovery sweep may replay,
+// which is the operator set PLUS ResumeTTL. Operator input goes through
+// validResumeDecision, so "ttl" stays unusable as a resume verb.
+func validReplayableResumeDecision(decision string) (ResumeDecision, bool) {
+	if ResumeDecision(strings.ToLower(strings.TrimSpace(decision))) == ResumeTTL {
+		return ResumeTTL, true
+	}
+	return validResumeDecision(decision)
 }
 
 // ParseResumeDecision is the exported normalizer the daemon uses to validate the
@@ -564,16 +612,27 @@ func (e Engine) ResolveEscalation(ctx context.Context, coordinatorJobID string, 
 		answers = parseHumanAnswers(rec.Questions, instructions)
 	}
 
-	// CLAIM THE RESOLUTION FIRST, in the append's own statement, THEN act (#1673).
-	// The pre-checks above are a fast path only: a human resume racing TTL
-	// auto-finalization, or two concurrent resume callers, both read
-	// requested=1/resolved=0. Whoever loses the conditional append must not run the
-	// irreversible retry/continuation effects below, and the counters must never
-	// reach requested==resolved+2, which would leave the NEXT round unresolvable.
+	// CLAIM THE RESOLUTION FIRST, by ROUND IDENTITY, THEN act (#1673). The pre-checks
+	// above are a fast path only: a human resume racing TTL auto-finalization, or two
+	// concurrent resume callers, both read the round as open. Whoever loses the claim
+	// UPDATE must not run the irreversible effects below.
 	//
-	// The verb's effects are idempotent by construction (deterministic resume ids,
-	// once-guarded continuations), so claiming before acting cannot strand the tree:
-	// a crash after the claim is re-driven by the same deterministic enqueue.
+	// The claim does NOT release the coordinator's slot - the receipt does, after the
+	// effects land - so a crash in between cannot let a newer round open and be
+	// clobbered by this round's replay.
+	round, hasRound, err := e.adoptOrLoadUnsettledRound(ctx, coordinatorJobID, rec)
+	if err != nil {
+		return err
+	}
+	if !hasRound || round.Claimed() {
+		// Nothing open to claim (or already claimed): idempotent no-op, exactly as a
+		// duplicate resume comment was always meant to be.
+		return nil
+	}
+	if round.NeedsRepair() {
+		return fmt.Errorf("job %s escalation round %s needs operator repair (%s); resolve it with `gitmoot escalation repair`",
+			coordinatorJobID, round.RoundID, round.IntegrityCause)
+	}
 	resolution := EscalationRecord{
 		DelegationID: rec.DelegationID,
 		ChildJobID:   rec.ChildJobID,
@@ -582,26 +641,50 @@ func (e Engine) ResolveEscalation(ctx context.Context, coordinatorJobID string, 
 		PausedAt:     e.now().UTC().Format(time.RFC3339), // reused as resolved_at
 		Kind:         rec.Kind,
 		Answers:      answers,
+		RoundID:      round.RoundID,
 	}
 	message := string(verb)
 	if encoded, marshalErr := json.Marshal(resolution); marshalErr == nil {
 		message = string(encoded)
 	}
-	claimed, err := e.Store.CloseHumanRound(ctx, db.JobEvent{
-		JobID:   coordinatorJobID,
-		Kind:    escalationResolvedEvent,
-		Message: message,
-	}, escalationRequestedEvent, escalationResolvedEvent)
+	claimed, err := e.Store.CloseHumanRound(ctx, coordinatorJobID, round.RoundID, string(verb),
+		parentJob.LifecycleGeneration, message, db.JobEvent{
+			JobID:   coordinatorJobID,
+			Kind:    escalationResolvedEvent,
+			Message: message,
+		}, time.Now().UTC())
 	if err != nil {
 		return err
 	}
 	if !claimed {
-		// Another resolver owns this round: idempotent no-op, exactly as a duplicate
-		// resume comment was always meant to be.
 		return nil
 	}
 
-	return e.applyResolutionEffects(ctx, parentJob, parentPayload, ref, rec, verb, instructions, answers)
+	return e.applyResolutionEffects(ctx, parentJob, parentPayload, ref, rec, verb, instructions, answers, round.RoundID)
+}
+
+// adoptOrLoadUnsettledRound returns the coordinator's unsettled round, ADOPTING a
+// legacy open round on first touch: escalations that predate escalation_rounds have
+// no row, and adoption is what lets them be resolved by the one mechanism instead of
+// a second legacy code path. The partial unique index makes adoption idempotent.
+func (e Engine) adoptOrLoadUnsettledRound(ctx context.Context, coordinatorJobID string, rec EscalationRecord) (db.EscalationRound, bool, error) {
+	round, ok, err := e.Store.UnsettledEscalationRound(ctx, coordinatorJobID)
+	if err != nil || ok {
+		return round, ok, err
+	}
+	// No row. That is the NORMAL state for a coordinator with nothing open, so
+	// adoption must not fire on it: minting a round here would let a second resolver
+	// claim a round nobody opened, which is how the full suite caught a duplicate
+	// resolution. Adopt ONLY on positive evidence of a PRE-UPGRADE open round: its
+	// request record carries no RoundID, because every post-upgrade request does.
+	legacy, hasLegacy, err := e.legacyOpenEscalation(ctx, coordinatorJobID)
+	if err != nil || !hasLegacy {
+		return db.EscalationRound{}, false, err
+	}
+	if _, err := e.Store.AdoptLegacyEscalationRound(ctx, coordinatorJobID, newEscalationRoundID(), legacy.Kind, time.Now().UTC()); err != nil {
+		return db.EscalationRound{}, false, err
+	}
+	return e.Store.UnsettledEscalationRound(ctx, coordinatorJobID)
 }
 
 // applyResolutionEffects runs the verb's irreversible half AFTER its resolution has
@@ -612,7 +695,7 @@ func (e Engine) ResolveEscalation(ctx context.Context, coordinatorJobID string, 
 // Every verb's effect is idempotent — deterministic resume ids, once-guarded
 // continuations, and a task-state write that is a no-op when already planned — which
 // is what makes re-driving safe.
-func (e Engine) applyResolutionEffects(ctx context.Context, parentJob db.Job, parentPayload JobPayload, ref taskRef, rec EscalationRecord, verb ResumeDecision, instructions string, answers map[string]string) error {
+func (e Engine) applyResolutionEffects(ctx context.Context, parentJob db.Job, parentPayload JobPayload, ref taskRef, rec EscalationRecord, verb ResumeDecision, instructions string, answers map[string]string, roundID string) error {
 	switch verb {
 	case ResumeRetry:
 		if err := e.resumeRetryLeg(ctx, parentJob, parentPayload, rec, instructions); err != nil {
@@ -638,6 +721,14 @@ func (e Engine) applyResolutionEffects(ctx context.Context, parentJob db.Job, pa
 		if err := e.resumeAnswerLeg(ctx, parentJob, parentPayload, ref, rec, answers); err != nil {
 			return err
 		}
+	case ResumeTTL:
+		// The TTL verb's effect lives in the SAME switch as the human verbs rather than
+		// inline in the sweep - that duplication is what made a crashed TTL claim
+		// unrecoverable (#1673).
+		if err := e.enqueueFinalizeContinuation(ctx, parentJob, parentPayload,
+			"escalation TTL elapsed with no human response"); err != nil {
+			return err
+		}
 	}
 
 	// Clear the pause: move the task out of awaiting_human. retry/continue re-arm
@@ -653,12 +744,21 @@ func (e Engine) applyResolutionEffects(ctx context.Context, parentJob db.Job, pa
 			return err
 		}
 	}
-	// The receipt goes LAST: until it exists this resolution is unfinished and the
-	// recovery sweep owns it.
+	// The RECEIPT goes last and releases the coordinator's slot. Until it exists this
+	// resolution is unfinished and the recovery sweep owns it; the affected-row
+	// predicate makes it exactly-once, so concurrent recoverers cannot over-settle.
+	settled, err := e.Store.SettleEscalationRound(ctx, parentJob.ID, roundID, "", "", time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	if !settled {
+		// Another recoverer settled it first: its effects were the same idempotent set.
+		return nil
+	}
 	return e.Store.AddJobEvent(ctx, db.JobEvent{
 		JobID:   parentJob.ID,
 		Kind:    escalationEffectsCompletedEvent,
-		Message: string(verb),
+		Message: roundID + " " + string(verb),
 	})
 }
 
@@ -668,72 +768,238 @@ func (e Engine) applyResolutionEffects(ctx context.Context, parentJob db.Job, pa
 var resolutionEffectsHook func(ctx context.Context, jobID string) error
 
 // RecoverUnfinishedEscalationResolutions re-drives resolutions that were CLAIMED but
-// whose effects never finished (a crash, or a failed enqueue). Without it the
-// claim-before-act ordering that makes resolution exactly-once would let one crash
-// strand a tree permanently: a closed round is no candidate for any other sweep.
+// whose effects never finished. It is the counterpart of claim-before-act: without it
+// one crash would strand a coordinator, because the slot stays held until settlement.
+//
+// Everything it reads is keyed by ROUND IDENTITY, so it can never pair one round's
+// request with another round's resolution, and a round parked in needs_repair is
+// skipped entirely — that state is terminal until an operator acts.
 func (e Engine) RecoverUnfinishedEscalationResolutions(ctx context.Context) (int, error) {
 	if err := e.validate(); err != nil {
 		return 0, err
 	}
-	jobIDs, err := e.Store.JobIDsWithUnfinishedEscalationResolution(ctx)
+	rounds, err := e.Store.UnfinishedEscalationRounds(ctx)
 	if err != nil {
 		return 0, err
 	}
 	recovered := 0
-	for _, jobID := range jobIDs {
-		rec, exists, err := e.loadEscalation(ctx, jobID)
+	for _, round := range rounds {
+		done, err := e.recoverEscalationRound(ctx, round)
 		if err != nil {
 			return recovered, err
 		}
-		resolution, resolved, err := e.loadResolution(ctx, jobID)
-		if err != nil {
-			return recovered, err
+		if done {
+			recovered++
 		}
-		if !exists || !resolved {
-			continue
-		}
-		verb, ok := validResumeDecision(resolution.Reason)
-		if !ok {
-			continue
-		}
-		job, payload, err := e.jobPayload(ctx, jobID)
-		if err != nil {
-			return recovered, err
-		}
-		if payload.Result == nil {
-			continue
-		}
-		if err := e.applyResolutionEffects(ctx, job, payload, taskRefFromPayload(payload), rec, verb, resolution.Question, resolution.Answers); err != nil {
-			return recovered, err
-		}
-		recovered++
 	}
 	return recovered, nil
 }
 
-// loadResolution reads the LATEST resolution record for a job, which carries the verb
-// (Reason), the instructions (Question) and any parsed answers — everything the
-// recovery needs to re-drive the effects the claim promised.
-func (e Engine) loadResolution(ctx context.Context, jobID string) (EscalationRecord, bool, error) {
+func (e Engine) recoverEscalationRound(ctx context.Context, round db.EscalationRound) (bool, error) {
+	// CLASS I - STRUCTURALLY IMPOSSIBLE, and the only one: the coordinator row is
+	// gone. With no coordinator there is no DAG to pause, no task to move and no
+	// continuation to enqueue, so this claim can never be replayed by anyone, and
+	// holding the slot would reserve exclusivity against rounds nothing can open.
+	exists, err := e.Store.JobExists(ctx, round.JobID)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		return e.releaseAbsentCoordinatorRound(ctx, round)
+	}
+
+	// CLASS II - everything else PRESERVES the claim: effects_completed_at stays NULL,
+	// so the slot stays held and no new round or ordinary advance may proceed until an
+	// operator repairs or supersedes it.
+	attempts, err := e.Store.RecordEscalationRoundAttempt(ctx, round.JobID, round.RoundID)
+	if err != nil {
+		return false, err
+	}
+	var resolution EscalationRecord
+	if err := json.Unmarshal([]byte(round.ClaimPayload), &resolution); err != nil {
+		return false, e.parkEscalationRound(ctx, round, "claim_payload_unreadable")
+	}
+	verb, ok := validReplayableResumeDecision(round.ClaimVerb)
+	if !ok {
+		return false, e.parkEscalationRound(ctx, round, "claim_verb_unreplayable")
+	}
+	job, payload, err := e.jobPayload(ctx, round.JobID)
+	if err != nil {
+		return false, err
+	}
+	if payload.Result == nil {
+		return false, e.parkEscalationRound(ctx, round, "coordinator_result_absent")
+	}
+	if round.ClaimGeneration != job.LifecycleGeneration {
+		// The human decided about a run that has since been re-queued. Applying it
+		// would be a stale effect; dropping it would lose intent. An operator decides.
+		return false, e.parkEscalationRound(ctx, round, "lifecycle_generation_moved")
+	}
+	rec, exists, err := e.loadEscalationForRound(ctx, round.JobID, round.RoundID)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		return false, e.parkEscalationRound(ctx, round, "request_record_absent")
+	}
+	if err := e.applyResolutionEffects(ctx, job, payload, taskRefFromPayload(payload), rec, verb,
+		resolution.Question, resolution.Answers, round.RoundID); err != nil {
+		if attempts >= escalationRecoveryAttemptBound {
+			// The bound's ONLY role is to stop hammering and ask a human. It can never
+			// discard the claim: this parks the round with the decision intact.
+			return false, e.parkEscalationRound(ctx, round, "retry_exhausted")
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// parkEscalationRound enters the terminal integrity state and emits the ONE repair
+// signal, both under the affected-row predicate that makes the signal exactly-once.
+func (e Engine) parkEscalationRound(ctx context.Context, round db.EscalationRound, cause string) error {
+	parked, err := e.Store.MarkEscalationRoundNeedsRepair(ctx, round.JobID, round.RoundID, cause, db.JobEvent{
+		JobID:   round.JobID,
+		Kind:    escalationNeedsRepairEvent,
+		Message: fmt.Sprintf("round %s verb %s needs operator repair: %s", round.RoundID, round.ClaimVerb, cause),
+	}, time.Now().UTC())
+	if err != nil || !parked {
+		return err
+	}
+	// A blocked coordinator must never be silent: the attention surface carries the
+	// same fact the report does.
+	e.emitEscalationRepairAttention(ctx, round, cause)
+	return nil
+}
+
+// releaseAbsentCoordinatorRound is the Class I no-op release. It records the NAMED
+// reason and a durable event, applies no effects, and frees the slot.
+func (e Engine) releaseAbsentCoordinatorRound(ctx context.Context, round db.EscalationRound) (bool, error) {
+	settled, err := e.Store.SettleEscalationRound(ctx, round.JobID, round.RoundID,
+		escalationReleaseReasonCoordinatorGone, "engine", time.Now().UTC())
+	if err != nil || !settled {
+		return false, err
+	}
+	// The coordinator row is gone, so a job event keyed to it is the only trace
+	// available; it is written best-effort for the audit and never gates the release.
+	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   round.JobID,
+		Kind:    escalationReleasedEvent,
+		Message: fmt.Sprintf("round %s released without effects: %s", round.RoundID, escalationReleaseReasonCoordinatorGone),
+	})
+
+	return false, nil
+}
+
+// emitEscalationRepairAttention makes a parked round OPERATOR-VISIBLE. A blocked
+// coordinator must never be silent: this rides the same needs-attention seam the
+// escalate/ask pauses use, so the dashboard's Attention section and any event
+// consumer see the block and its cause without polling the table.
+func (e Engine) emitEscalationRepairAttention(ctx context.Context, round db.EscalationRound, cause string) {
+	job, payload, err := e.jobPayload(ctx, round.JobID)
+	if err != nil {
+		return
+	}
+	rootID := strings.TrimSpace(payload.RootJobID)
+	if rootID == "" {
+		rootID = job.ID
+	}
+	ev := events.NewEvent(
+		events.EventJobNeedsAttention,
+		job.ID,
+		rootID,
+		payload.Repo,
+		EscalationRoundNeedsRepairState,
+		fmt.Sprintf("escalation round %s (%s) needs operator repair: %s", round.RoundID, round.ClaimVerb, cause),
+		e.now(),
+		RedactCommentText,
+	)
+	ev.Cause = "escalation_needs_repair"
+	events.EmitEvent(ctx, e.EventSink, ev)
+}
+
+// EscalationRoundNeedsRepairState is the state string the attention event carries for
+// a parked round. It is deliberately NOT a task state: the task keeps whatever the
+// round left it in, and this names the round's integrity state instead.
+const EscalationRoundNeedsRepairState = "escalation_needs_repair"
+
+// EscalationRepairReport is one row of the operator-facing blocked report.
+type EscalationRepairReport struct {
+	JobID   string
+	RoundID string
+	Verb    string
+	Cause   string
+}
+
+// EscalationRoundsNeedingRepair is the blocked-with-cause report. It is what the
+// operator surface prints, so a parked coordinator is discoverable without knowing
+// the schema.
+func (e Engine) EscalationRoundsNeedingRepair(ctx context.Context) ([]EscalationRepairReport, error) {
+	if err := e.validate(); err != nil {
+		return nil, err
+	}
+	rounds, err := e.Store.EscalationRoundsNeedingRepair(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]EscalationRepairReport, 0, len(rounds))
+	for _, round := range rounds {
+		out = append(out, EscalationRepairReport{
+			JobID:   round.JobID,
+			RoundID: round.RoundID,
+			Verb:    round.ClaimVerb,
+			Cause:   round.IntegrityCause,
+		})
+	}
+	return out, nil
+}
+
+// RepairEscalationRound is the operator entry point's engine half. arm selects which
+// repair the operator asked for; supersede is the ONLY path that discards a claimed
+// decision, and it requires a reason.
+func (e Engine) RepairEscalationRound(ctx context.Context, jobID string, roundID string, supersede bool, operator string, reason string) error {
+	if err := e.validate(); err != nil {
+		return err
+	}
+	if supersede {
+		if strings.TrimSpace(reason) == "" {
+			return errors.New("superseding a claimed escalation requires a reason: it discards a human decision")
+		}
+
+		_, err := e.Store.RepairSupersedeEscalationRound(ctx, jobID, roundID, reason, operator, time.Now().UTC(), db.JobEvent{
+			JobID:   jobID,
+			Kind:    escalationSupersededEvent,
+			Message: fmt.Sprintf("round %s superseded by %s without applying effects: %s", roundID, operator, reason),
+		})
+		return err
+	}
+	_, err := e.Store.RepairRetryEscalationRound(ctx, jobID, roundID, db.JobEvent{
+		JobID:   jobID,
+		Kind:    escalationRepairedEvent,
+		Message: fmt.Sprintf("round %s re-armed by %s; the stored claim is preserved and replays on the next sweep", roundID, operator),
+	})
+	return err
+}
+
+// loadEscalationForRound reads the REQUEST record for one round id. Recovery uses it
+// instead of "the latest requested event", which could belong to a different round.
+func (e Engine) loadEscalationForRound(ctx context.Context, jobID string, roundID string) (EscalationRecord, bool, error) {
 	events, err := e.Store.ListJobEvents(ctx, jobID)
 	if err != nil {
 		return EscalationRecord{}, false, err
 	}
-	var latest EscalationRecord
-	found := false
 	for _, event := range events {
-		if event.Kind != escalationResolvedEvent {
+		if event.Kind != escalationRequestedEvent {
 			continue
 		}
 		var record EscalationRecord
 		if err := json.Unmarshal([]byte(event.Message), &record); err != nil {
-			// A legacy plain-verb message: the verb is the whole message.
-			record = EscalationRecord{Reason: strings.TrimSpace(event.Message)}
+			continue
 		}
-		latest = record
-		found = true
+		if record.RoundID == roundID {
+			return record, true, nil
+		}
 	}
-	return latest, found, nil
+	return EscalationRecord{}, false, nil
 }
 
 // resumeRetryLeg re-enqueues the failing delegation leg of a paused tree with the
@@ -997,54 +1263,47 @@ func (e Engine) AutoFinalizeExpiredEscalations(ctx context.Context, ttl time.Dur
 				"job_id", jobID)
 			continue
 		}
-		// CLAIM FIRST, exactly as a human resume does, and through the SAME mechanism:
-		// a TTL sweep racing a human resume must not also finalize (#1673). The
-		// JobIDsWithOpenEscalation candidate query above is a fast path; this append is
-		// the decision.
+		// CLAIM FIRST, by ROUND IDENTITY, through the SAME mechanism a human resume
+		// uses: a TTL sweep racing a resume must not also finalize (#1673). The
+		// candidate query above is a fast path; this claim UPDATE is the decision, and
+		// it does not release the slot - the receipt does, after the effects land.
+		round, hasRound, err := e.adoptOrLoadUnsettledRound(ctx, jobID, rec)
+		if err != nil {
+			return finalized, err
+		}
+		if !hasRound || round.Claimed() || round.NeedsRepair() {
+			continue
+		}
 		resolution := EscalationRecord{
 			DelegationID: rec.DelegationID,
 			ChildJobID:   rec.ChildJobID,
-			Reason:       "ttl",
+			Reason:       string(ResumeTTL),
 			PausedAt:     now.Format(time.RFC3339), // reused as resolved_at
+			RoundID:      round.RoundID,
 		}
-		message := "ttl"
+		message := string(ResumeTTL)
 		if encoded, marshalErr := json.Marshal(resolution); marshalErr == nil {
 			message = string(encoded)
 		}
 		if escalationTTLPreClaimHook != nil {
 			escalationTTLPreClaimHook(ctx, jobID)
 		}
-		claimed, err := e.Store.CloseHumanRound(ctx, db.JobEvent{
-			JobID:   jobID,
-			Kind:    escalationResolvedEvent,
-			Message: message,
-		}, escalationRequestedEvent, escalationResolvedEvent)
+		claimed, err := e.Store.CloseHumanRound(ctx, jobID, round.RoundID, string(ResumeTTL),
+			job.LifecycleGeneration, message, db.JobEvent{
+				JobID:   jobID,
+				Kind:    escalationResolvedEvent,
+				Message: message,
+			}, time.Now().UTC())
 		if err != nil {
 			return finalized, err
 		}
 		if !claimed {
-			// A human resolved it between the candidate query and now.
+			// A human claimed it between the candidate query and now.
 			continue
 		}
-		reason := fmt.Sprintf("escalation TTL of %s elapsed with no human response", ttl)
-		if err := e.enqueueFinalizeContinuation(ctx, job, payload, reason); err != nil {
-			return finalized, err
-		}
-		if err := e.setTaskState(ctx, ref, TaskPlanned); err != nil {
-			return finalized, err
-		}
-		if resolutionEffectsHook != nil {
-			if err := resolutionEffectsHook(ctx, jobID); err != nil {
-				return finalized, err
-			}
-		}
-		// The receipt, same contract as a human resume: until it exists this claimed
-		// resolution is unfinished and the recovery sweep owns it.
-		if err := e.Store.AddJobEvent(ctx, db.JobEvent{
-			JobID:   jobID,
-			Kind:    escalationEffectsCompletedEvent,
-			Message: "ttl",
-		}); err != nil {
+		// The verb's effects and its receipt run through the ONE shared switch, so a
+		// crash here is recovered by replaying ResumeTTL rather than being unreachable.
+		if err := e.applyResolutionEffects(ctx, job, payload, ref, rec, ResumeTTL, "", nil, round.RoundID); err != nil {
 			return finalized, err
 		}
 		finalized++
@@ -1078,4 +1337,71 @@ func (e Engine) dismissedTaskForAdvancement(ctx context.Context, ref taskRef) (s
 		return "", false, err
 	}
 	return task.ID, task.State == string(TaskDismissed), nil
+}
+
+// escalationRepairBlock reports whether this advance must be refused because the
+// coordinator it would settle carries a round parked in needs_repair.
+//
+// The parked round is on the COORDINATOR, so an advance of a delegation child checks
+// its parent: that is the job whose continuation/task the stale claim would touch.
+func (e Engine) escalationRepairBlock(ctx context.Context, job db.Job, ref taskRef) (error, bool, error) {
+	coordinatorID := strings.TrimSpace(job.ParentJobID)
+	if coordinatorID == "" {
+		coordinatorID = job.ID
+	}
+	round, ok, err := e.Store.UnsettledEscalationRound(ctx, coordinatorID)
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok || !round.NeedsRepair() {
+		return nil, false, nil
+	}
+	reason := fmt.Sprintf("escalation round %s (%s) needs operator repair: %s; run `gitmoot escalation repair %s --round %s --retry` or `--supersede --reason ...`",
+		round.RoundID, round.ClaimVerb, round.IntegrityCause, coordinatorID, round.RoundID)
+	if strings.TrimSpace(ref.ID) == "" {
+		return BlockedError{Reason: reason}, true, nil
+	}
+	// Route it through the ordinary block choke point so the task carries the cause
+	// and the dashboard shows it: a blocked coordinator must never be silent.
+	return e.blockTask(ctx, ref, "escalation_needs_repair", reason, "escalation repair"), true, nil
+}
+
+// legacyOpenEscalation reports whether this coordinator has a PRE-UPGRADE open round:
+// its latest requested event carries no RoundID, and the legacy requested/resolved
+// counters say it is still open.
+//
+// Counting is acceptable here and ONLY here: it decides whether to ADOPT a historical
+// round, never whether a claim, an effect or a receipt may proceed. Those are settled
+// by round identity, which is what the counters could not express (#1673).
+func (e Engine) legacyOpenEscalation(ctx context.Context, coordinatorJobID string) (EscalationRecord, bool, error) {
+	events, err := e.Store.ListJobEvents(ctx, coordinatorJobID)
+	if err != nil {
+		return EscalationRecord{}, false, err
+	}
+	var latest EscalationRecord
+	requested, resolved, found := 0, 0, false
+	for _, event := range events {
+		switch event.Kind {
+		case escalationRequestedEvent:
+			requested++
+			var record EscalationRecord
+			if err := json.Unmarshal([]byte(event.Message), &record); err == nil {
+				latest = record
+			} else {
+				latest = EscalationRecord{}
+			}
+			found = true
+		case escalationResolvedEvent:
+			resolved++
+		}
+	}
+	if !found || requested <= resolved {
+		return EscalationRecord{}, false, nil
+	}
+	if strings.TrimSpace(latest.RoundID) != "" {
+		// Post-upgrade round: it has a row, or it has none because it is already
+		// settled. Either way there is nothing to adopt.
+		return EscalationRecord{}, false, nil
+	}
+	return latest, true, nil
 }

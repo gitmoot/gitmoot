@@ -710,31 +710,36 @@ func classifyRefusedTaskStateWrite(ctx context.Context, store *db.Store, task db
 	return nil
 }
 
-// openHumanRound is the ONE durable operation that opens a human round: the round
-// event and the awaiting_human transition commit together, exactly once per open
-// round, and under an anchored advance both are bound to live ownership (#1673).
+// openHumanRound is the ONE durable operation that opens a human round: the
+// coordinator's exclusive unsettled-round SLOT, the awaiting_human transition and the
+// requested event commit together, and under an anchored advance all of it is bound
+// to live ownership (#1673).
 //
-// It returns announce=true ONLY for the caller that both WON the round and actually
-// PAUSED the task. Every announcement — notifier, event sink, chat link — MUST be
-// gated on that value:
+// It returns the round's durable identity plus announce=true ONLY for the caller that
+// took the slot and actually paused the task. Every announcement — notifier, event
+// sink, chat link — MUST be gated on that value:
 //
-//	a LOSER under concurrency would otherwise double-notify a human for one round;
-//	a REFUSED transition (merged or disposed row) would otherwise announce a pause
-//	that never happened, and leave requested > resolved forever.
-func (e Engine) openHumanRound(ctx context.Context, ref taskRef, jobID string, event db.JobEvent) (announce bool, err error) {
+//	a LOSER would otherwise double-notify a human about one round;
+//	a REFUSED transition would otherwise announce a pause that never happened.
+func (e Engine) openHumanRound(ctx context.Context, ref taskRef, jobID string, kind string, record EscalationRecord, message func(EscalationRecord) string) (roundID string, announce bool, err error) {
 	task, err := e.resolveTaskState(ctx, ref, TaskAwaitingHuman)
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
-	event.JobID = jobID
 	_, mergedGuarded := taskStateWriteExclusions(TaskAwaitingHuman)
+	roundID = newEscalationRoundID()
+	record.RoundID = roundID
 	round := db.HumanRoundOpen{
-		Event:         event,
-		RequestedKind: escalationRequestedEvent,
-		ResolvedKind:  escalationResolvedEvent,
+		JobID:   jobID,
+		RoundID: roundID,
+		Kind:    kind,
+		Event: db.JobEvent{
+			JobID:   jobID,
+			Kind:    escalationRequestedEvent,
+			Message: message(record),
+		},
 	}
-	taskless := strings.TrimSpace(task.ID) == ""
-	if !taskless {
+	if strings.TrimSpace(task.ID) != "" {
 		task.State = string(TaskAwaitingHuman)
 		round.Task = task
 		round.ForbiddenStates, _ = taskStateWriteExclusions(TaskAwaitingHuman)
@@ -742,27 +747,26 @@ func (e Engine) openHumanRound(ctx context.Context, ref taskRef, jobID string, e
 			taskStatePreWriteHook(ctx, task.ID)
 		}
 	}
-	var outcome db.HumanRoundOutcome
+	var outcome db.EscalationRoundOutcome
 	if own := e.advanceOwnershipBinding(); own != nil {
 		outcome, err = e.Store.OpenHumanRoundIfAdvanceOwned(ctx, round, *own, time.Now().UTC())
 	} else {
-		outcome, err = e.Store.OpenHumanRound(ctx, round)
+		outcome, err = e.Store.OpenHumanRound(ctx, round, time.Now().UTC())
 	}
 	if err != nil {
-		return false, e.classifyAdvanceOwnershipLoss(err, "human-round-commit")
+		return "", false, e.classifyAdvanceOwnershipLoss(err, "human-round-commit")
 	}
 	switch outcome {
-	case db.HumanRoundOpened:
-		return true, nil
-	case db.HumanRoundRefused:
-		// THIS caller's guarded pause was refused, so it owes a classification of the
-		// winning row. A concurrent LOSER must never reach here: its task is genuinely
-		// awaiting_human, and classifying it would write a false landed-work refusal
-		// into the durable audit.
-		return false, classifyRefusedTaskStateWrite(ctx, e.Store, task, TaskAwaitingHuman, mergedGuarded)
+	case db.EscalationRoundOpened:
+		return roundID, true, nil
+	case db.EscalationRoundRefused:
+		// THIS caller took the slot and its guarded pause was refused, so it owes a
+		// classification of the winning row. A LOSER never reaches here: it wrote
+		// nothing, so classifying it would invent a false landed-work refusal.
+		return "", false, classifyRefusedTaskStateWrite(ctx, e.Store, task, TaskAwaitingHuman, mergedGuarded)
 	default:
-		// Another opener holds the round: idempotent, silent, and nothing to classify.
-		return false, nil
+		// The coordinator already has an unsettled round: idempotent and silent.
+		return "", false, nil
 	}
 }
 

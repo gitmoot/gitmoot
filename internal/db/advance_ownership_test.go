@@ -257,16 +257,16 @@ func TestUpsertTaskWithJobEventUnlessStatesRollsBackTheTaskWhenTheEventFails(t *
 	}
 
 	outcome, err := store.OpenHumanRound(ctx, HumanRoundOpen{
+		JobID:           "coord",
+		RoundID:         "round-1",
 		Task:            Task{ID: "task-round", RepoFullName: "o/r", Branch: "b", State: "awaiting_human"},
 		ForbiddenStates: []string{"dismissed", "superseded", "stranded", "merged"},
 		Event:           JobEvent{JobID: "coord", Kind: "delegation_escalation_requested", Message: "round"},
-		RequestedKind:   "delegation_escalation_requested",
-		ResolvedKind:    "delegation_escalation_resolved",
-	})
+	}, time.Now().UTC())
 	if err == nil {
 		t.Fatal("the round-open reported success while its event insert was impossible")
 	}
-	if outcome == HumanRoundOpened {
+	if outcome == EscalationRoundOpened {
 		t.Fatalf("the round-open reported %v for an impossible write", outcome)
 	}
 
@@ -279,5 +279,58 @@ func TestUpsertTaskWithJobEventUnlessStatesRollsBackTheTaskWhenTheEventFails(t *
 	}
 	if task.State != "implementing" {
 		t.Fatalf("task state = %q, want implementing: the task moved although its round record never landed", task.State)
+	}
+}
+
+// TestMarkEscalationRoundNeedsRepairEmitsOneSignal pins the affected-row predicate on
+// the integrity transition: it is what makes the repair signal exactly-once. An
+// unguarded version would emit a duplicate every time anything asked again, and the
+// operator surface would show one block as many.
+func TestMarkEscalationRoundNeedsRepairEmitsOneSignal(t *testing.T) {
+	ctx := context.Background()
+	store := openWorkflowTestStore(t)
+	if err := store.CreateJob(ctx, Job{ID: "coord", Agent: "coord", Type: "ask", State: "succeeded", Payload: `{"repo":"o/r"}`}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if _, err := store.AdoptLegacyEscalationRound(ctx, "coord", "round-1", "", time.Now().UTC()); err != nil {
+		t.Fatalf("seed round: %v", err)
+	}
+	if _, err := store.ClaimEscalationRound(ctx, "coord", "round-1", "continue", 0, `{"reason":"continue"}`, time.Now().UTC()); err != nil {
+		t.Fatalf("ClaimEscalationRound: %v", err)
+	}
+
+	event := JobEvent{JobID: "coord", Kind: "delegation_escalation_needs_repair", Message: "parked"}
+	first, err := store.MarkEscalationRoundNeedsRepair(ctx, "coord", "round-1", "retry_exhausted", event, time.Now().UTC())
+	if err != nil || !first {
+		t.Fatalf("first park marked=%v err=%v, want true", first, err)
+	}
+	for i := 0; i < 3; i++ {
+		again, aErr := store.MarkEscalationRoundNeedsRepair(ctx, "coord", "round-1", "retry_exhausted", event, time.Now().UTC())
+		if aErr != nil {
+			t.Fatalf("re-park %d: %v", i, aErr)
+		}
+		if again {
+			t.Fatalf("re-park %d reported a fresh transition: the guard is not affected-row based", i)
+		}
+	}
+	events, err := store.ListJobEvents(ctx, "coord")
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	signals := 0
+	for _, ev := range events {
+		if ev.Kind == "delegation_escalation_needs_repair" {
+			signals++
+		}
+	}
+	if signals != 1 {
+		t.Fatalf("repair signals = %d, want exactly 1 across repeated parks", signals)
+	}
+	round, ok, err := store.UnsettledEscalationRound(ctx, "coord")
+	if err != nil || !ok {
+		t.Fatalf("UnsettledEscalationRound ok=%v err=%v, want the parked round still holding the slot", ok, err)
+	}
+	if round.ClaimVerb != "continue" || round.EffectsCompletedAt != "" {
+		t.Fatalf("round = %+v, want the claim preserved and unsettled", round)
 	}
 }

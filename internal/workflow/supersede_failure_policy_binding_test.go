@@ -524,10 +524,8 @@ func TestTasklessRoundOpenIsRefusedWhenOwnershipIsLost(t *testing.T) {
 		Token:      "token-gone",
 	}
 	// No taskRef at all: the round-open has only the event to write.
-	_, err := anchored.openHumanRound(ctx, taskRef{}, child, db.JobEvent{
-		Kind:    escalationRequestedEvent,
-		Message: "obsolete round",
-	})
+	_, _, err := anchored.openHumanRound(ctx, taskRef{}, child, "", EscalationRecord{Reason: "obsolete round"},
+		func(rec EscalationRecord) string { return rec.Reason })
 	var rolled supersedeAdvanceRolledBackError
 	if !errors.As(err, &rolled) {
 		t.Fatalf("openHumanRound error = %v, want a rolled-back advance", err)
@@ -538,10 +536,8 @@ func TestTasklessRoundOpenIsRefusedWhenOwnershipIsLost(t *testing.T) {
 
 	// SUCCESS CONTROL: with the lease held the same taskless round-open commits.
 	ownAdvance(t, store, child, "token-gone", time.Now().UTC().Add(SupersedeAdvanceLeaseTTL))
-	if announce, err := anchored.openHumanRound(ctx, taskRef{}, child, db.JobEvent{
-		Kind:    escalationRequestedEvent,
-		Message: "owned round",
-	}); err != nil || !announce {
+	if _, announce, err := anchored.openHumanRound(ctx, taskRef{}, child, "", EscalationRecord{Reason: "owned round"},
+		func(rec EscalationRecord) string { return rec.Reason }); err != nil || !announce {
 		t.Fatalf("taskless round-open under a held lease: %v", err)
 	}
 	if got := countWorkflowJobEvents(t, store, child, escalationRequestedEvent); got != 1 {
