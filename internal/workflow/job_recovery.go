@@ -54,6 +54,13 @@ const JobEventSupersededStaleHead = "superseded_stale_head"
 // row is camouflage that inflates every queue-depth check forever.
 const JobEventSupersededPullRequestClosed = "superseded_pr_closed"
 
+// SupersedeAdvanceClaimTTL bounds how long a supersession parent-advance claim
+// blocks a retry. It exists so a crashed or killed recovery pass cannot wedge
+// `gitmoot job retry` forever: past the TTL the claim is ignored, and the next poll
+// re-claims before advancing again. Sized well above a normal advance (which is a
+// handful of local statements) and well below a poll interval's operator patience.
+const SupersedeAdvanceClaimTTL = 2 * time.Minute
+
 func RetryJob(ctx context.Context, store *db.Store, jobID string) (db.Job, error) {
 	if store == nil {
 		return db.Job{}, fmt.Errorf("store is required")
@@ -84,6 +91,18 @@ func RetryJob(ctx context.Context, store *db.Store, jobID string) (db.Job, error
 		if fromRunning {
 			return db.Job{}, fmt.Errorf("job %s was cancelled while running; wait for the active worker to settle before retrying", job.ID)
 		}
+	}
+	// A supersession recovery's parent-advance CRITICAL SECTION is the one window in
+	// which a re-queue is destructive rather than merely racy: AdvanceJob emits
+	// irreversible parent effects (a failure policy applied, a dependent enqueued, a
+	// continuation minted), and none of them can be taken back once the lifecycle
+	// they were computed from is gone. So the rollover is PREVENTED here rather than
+	// detected downstream. The claim is bounded in age, so a crashed advance releases
+	// retries by itself instead of wedging them.
+	if live, err := store.JobHasLiveSupersedeAdvanceClaim(ctx, job.ID, SupersedeAdvanceClaimTTL); err != nil {
+		return db.Job{}, err
+	} else if live {
+		return db.Job{}, fmt.Errorf("job %s is inside a supersession parent-advance; retry once it settles", job.ID)
 	}
 	payload, err := unmarshalPayload(job.Payload)
 	if err != nil {
@@ -465,24 +484,44 @@ func releaseSupersededJobResourcesAtGeneration(ctx context.Context, store *db.St
 	if supersedeDebtInterleaveHook != nil {
 		supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeTaskLane)
 	}
-	// The task lane's release is already fail-closed: ReleaseBranchLockIfInactive-
-	// WithEvent refuses while any non-terminal job holds the branch, and a retry is
-	// non-terminal by definition. Left exactly as it was.
+	// The task lane's inactivity vetoes are NOT sufficient for this caller. The
+	// tasks veto deliberately excludes the exact implementing task being cleaned up,
+	// so a retry of that same task cannot re-assert the lane through it, and the jobs
+	// veto only fires while the retry is non-terminal — a retry that re-queued, ran
+	// and settled terminal passes both and loses its lane. The generation therefore
+	// rides in the DELETE's own predicate, its errors propagate, and a lost guard
+	// stops the remaining cleanup.
 	if job.Type == "implement" && strings.TrimSpace(payload.TaskID) != "" && strings.TrimSpace(payload.DelegationID) == "" {
 		repo := strings.TrimSpace(payload.Repo)
 		branch := strings.TrimSpace(payload.Branch)
 		if repo != "" && branch != "" {
-			if lock, lerr := store.GetBranchLock(ctx, repo, branch); lerr == nil {
-				if released, rerr := store.ReleaseBranchLockIfInactiveWithEvent(ctx, lock, strings.TrimSpace(payload.TaskID), time.Time{}, db.BranchLockEvent{
+			lock, lerr := store.GetBranchLock(ctx, repo, branch)
+			switch {
+			case lerr == nil:
+				released, rerr := store.ReleaseTaskLaneBranchLockAtJobGeneration(ctx, lock, strings.TrimSpace(payload.TaskID), job.ID, atGeneration, db.BranchLockEvent{
 					Kind: "released", Message: fmt.Sprintf("released after task implement %s left no non-terminal branch work (#1565)", cause.noun),
-				}); rerr == nil && released {
-					if _, eerr := store.AddJobEventAtGeneration(ctx, db.JobEvent{
+				})
+				if rerr != nil {
+					return true, rerr
+				}
+				if released {
+					written, eerr := store.AddJobEventAtGeneration(ctx, db.JobEvent{
 						JobID: job.ID, Kind: "task_lane_lock_released",
 						Message: fmt.Sprintf("released task lane lock %s on %s (#1565)", branch, cause.verb),
-					}, atGeneration); eerr != nil {
+					}, atGeneration)
+					if eerr != nil {
 						return true, eerr
 					}
+					if !written {
+						// The row moved between the guarded delete and its audit row. Stop:
+						// the remaining cleanup belongs to a lifecycle that no longer owns
+						// this job, and the debt stays outstanding for a re-drive.
+						return false, nil
+					}
 				}
+			case errors.Is(lerr, sql.ErrNoRows):
+			default:
+				return true, lerr
 			}
 		}
 	}
@@ -866,6 +905,72 @@ const (
 	JobEventSupersedeAdvanceSuperseded = "supersede_advance_superseded"
 )
 
+// The parent-effect barrier points inside advanceDelegations. Each names one
+// EFFECT CLASS the directive requires to be unreachable from a superseded
+// lifecycle: the child snapshot the pass reasons from, the failure policy, the
+// dependent enqueue, and the coordinator continuation.
+const (
+	supersedeAdvanceBarrierChildSnapshot    = "child-snapshot"
+	supersedeAdvanceBarrierFailurePolicy    = "failure-policy"
+	supersedeAdvanceBarrierDependentEnqueue = "dependent-enqueue"
+	supersedeAdvanceBarrierContinuation     = "continuation"
+)
+
+// supersedeAdvanceRolledBackError is returned when a barrier finds the anchored
+// child lifecycle gone. It aborts the advance BEFORE the effect it guards, so no
+// parent mutation is ever attributable to a superseded run. The recovery treats it
+// as "not advanced": the debt stays outstanding and the next poll re-drives it
+// against whatever lifecycle owns the row then.
+type supersedeAdvanceRolledBackError struct {
+	JobID      string
+	Generation int64
+	Barrier    string
+}
+
+func (e supersedeAdvanceRolledBackError) Error() string {
+	return fmt.Sprintf("supersede advance aborted at the %s barrier: job %s left lifecycle %d", e.Barrier, e.JobID, e.Generation)
+}
+
+// assertSupersedeAdvanceAnchor is the barrier itself. It is a no-op for every
+// ordinary AdvanceJob caller (supersedeAdvance is nil), so the delegation path is
+// byte-identical outside supersession recovery.
+//
+// The check is a read, and it is deliberately NOT the only protection: RetryJob
+// refuses to re-queue a job whose supersession advance is in flight, so the
+// rollover this barrier looks for cannot normally happen at all. The barrier is
+// what makes that guarantee verifiable per effect class rather than assumed.
+func (e Engine) assertSupersedeAdvanceAnchor(ctx context.Context, barrier string) error {
+	if e.supersedeAdvance == nil {
+		return nil
+	}
+	if supersedeAdvanceBarrierHook != nil {
+		supersedeAdvanceBarrierHook(ctx, barrier)
+	}
+	current, err := e.Store.GetJob(ctx, e.supersedeAdvance.JobID)
+	if err != nil {
+		return err
+	}
+	if current.LifecycleGeneration != e.supersedeAdvance.Generation || !isSupersededTerminalState(current.State) {
+		return supersedeAdvanceRolledBackError{
+			JobID:      e.supersedeAdvance.JobID,
+			Generation: e.supersedeAdvance.Generation,
+			Barrier:    barrier,
+		}
+	}
+	return nil
+}
+
+// supersedeAdvanceAnchor pins an AdvanceJob pass to one child lifecycle.
+type supersedeAdvanceAnchor struct {
+	JobID      string
+	Generation int64
+}
+
+// supersedeAdvanceBarrierHook is a test seam that fires AT each barrier, which is
+// the only place a test can interleave a retry inside AdvanceJob's parent-effect
+// section. Nil in production.
+var supersedeAdvanceBarrierHook func(ctx context.Context, barrier string)
+
 var supersedeDebtInterleaveHook func(ctx context.Context, stage string)
 
 // supersedeFinalizeDebt is the state of a job's supersession debt: whether one is
@@ -1049,13 +1154,24 @@ func (e Engine) advanceSupersededChildAtGeneration(ctx context.Context, jobID st
 	if supersedeDebtInterleaveHook != nil {
 		supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeAdvance)
 	}
-	advanceErr := e.AdvanceJob(ctx, jobID)
+	// The advance runs on a COPY of the engine carrying the anchor, so every
+	// parent-effect class inside advanceDelegations re-asserts the child's lifecycle
+	// immediately before it acts. Prevention, not detection: an aborted barrier
+	// returns before the effect it guards.
+	anchored := e
+	anchored.supersedeAdvance = &supersedeAdvanceAnchor{JobID: jobID, Generation: generation}
+	advanceErr := anchored.AdvanceJob(ctx, jobID)
+	var rolledBack supersedeAdvanceRolledBackError
+	if errors.As(advanceErr, &rolledBack) {
+		e.recordSupersedeAdvanceRaced(ctx, jobID, generation, advanceErr)
+		return false, nil
+	}
 	if advanceErr != nil && !isDelegationPolicyOutcome(advanceErr) {
-		// A retry that lands mid-advance CAUSES failures rather than wrong results:
-		// production's RetryJob clears the child's result, so AdvanceJob's own read
-		// finds none and refuses. Distinguish that from a real fault by re-testing the
-		// anchor — if the lifecycle moved, the error is this race and the debt simply
-		// stays outstanding, with no poll-level error and no stale mutation.
+		// A retry that lands in a window no barrier covers CAUSES failures rather than
+		// wrong results: production's RetryJob clears the child's result, so
+		// AdvanceJob's own read finds none and refuses. Distinguish that from a real
+		// fault by re-testing the anchor — if the lifecycle moved, the error is this
+		// race, the debt simply stays outstanding, and no poll-level error is raised.
 		superseded, probeErr := e.supersedeAdvanceLifecycleMoved(ctx, jobID, generation)
 		if probeErr != nil {
 			return false, probeErr

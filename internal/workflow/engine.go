@@ -230,6 +230,13 @@ type Engine struct {
 	// off no telemetry query runs and prompt assembly is byte-identical. Routing
 	// stays advisory in v1 — the block never forces a route.
 	RouterContextEnabled bool
+	// supersedeAdvance pins an AdvanceJob pass to ONE child lifecycle (#1673). It is
+	// set only by the closed-PR supersession recovery, on a COPY of the engine, so
+	// every other caller keeps the nil default and the delegation path is unchanged.
+	// While it is set, each parent-effect class in advanceDelegations re-asserts the
+	// anchor before running, so a retry that re-queued the child cannot fail,
+	// enqueue or continue the parent from a run that no longer exists.
+	supersedeAdvance *supersedeAdvanceAnchor
 	// MaxDelegationTokenBudget is the cumulative per-root token budget (input +
 	// output, summed across a coordination tree) that bounds a delegation tree by
 	// cost in addition to depth/width/total-jobs/wall-clock (#338 Part B). When a

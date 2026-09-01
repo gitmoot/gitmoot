@@ -120,6 +120,120 @@ func TestSupersedeDebtMarkerClassificationIsCanonicalOnly(t *testing.T) {
 	}
 }
 
+// TestSupersedeCleanupKeepsATaskLaneOwnedByATerminalRetry is the task-lane gap.
+//
+// Its inactivity vetoes look sufficient and are not. The tasks veto EXCLUDES the
+// exact implementing task being cleaned up, so a retry of that same task cannot
+// re-assert the lane through it; and the jobs veto only fires while some job on the
+// branch is non-terminal. A retry that re-queues, runs and SETTLES TERMINAL
+// therefore passes both — and the previous run's cleanup deleted the lane the retry
+// had re-acquired. The generation now rides in the DELETE's own predicate.
+//
+// MUTATION PROOF: swap ReleaseTaskLaneBranchLockAtJobGeneration for the unanchored
+// ReleaseBranchLockIfInactiveWithEvent and the newer lane disappears.
+func TestSupersedeCleanupKeepsATaskLaneOwnedByATerminalRetry(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "impl", []string{"implement"}, "gitmoot/gitmoot")
+	const (
+		child  = "workflow-task-lane"
+		repo   = "gitmoot/gitmoot"
+		branch = "task-7"
+	)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-7", RepoFullName: repo, State: string(TaskImplementing), Branch: branch,
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	insertQueuedJob(t, store, db.Job{ID: child, Agent: "impl", Type: "implement"}, JobPayload{
+		Repo: repo, Branch: branch, PullRequest: 7, TaskID: "task-7", LeadAgent: "impl",
+	})
+	observed := mustJob(t, store, child)
+	superseded, err := store.TransitionJobStateWithEventAtGeneration(ctx, child, observed.State, observed.LifecycleGeneration, string(JobCancelled),
+		db.JobEvent{JobID: child, Kind: JobEventSupersededPullRequestClosed, Message: "pr closed"},
+		db.JobEvent{JobID: child, Kind: JobEventSupersedeFinalizePending, Message: formatSupersedeFinalizeDebt(observed.LifecycleGeneration)})
+	if err != nil || !superseded {
+		t.Fatalf("supersede: transitioned=%v err=%v", superseded, err)
+	}
+
+	interleaved := 0
+	supersedeDebtInterleaveHook = func(hookCtx context.Context, at string) {
+		if at != supersedeDebtStageBeforeTaskLane {
+			return
+		}
+		interleaved++
+		// The retry advances the generation AND settles terminal, so neither
+		// inactivity veto fires; only the lifecycle anchor can refuse.
+		for _, state := range []JobState{JobQueued, JobRunning, JobFailed} {
+			if err := store.UpdateJobState(hookCtx, child, string(state)); err != nil {
+				t.Fatalf("UpdateJobState(%s): %v", state, err)
+			}
+		}
+		if acquired, err := store.AcquireLock(hookCtx, db.BranchLock{RepoFullName: repo, Branch: branch, Owner: "impl"}); err != nil || !acquired {
+			t.Fatalf("retry re-acquire task lane: acquired=%v err=%v", acquired, err)
+		}
+	}
+	t.Cleanup(func() { supersedeDebtInterleaveHook = nil })
+
+	guarded, err := releaseSupersededJobResourcesAtGeneration(ctx, store, mustJob(t, store, child), abortCauseSupersede, observed.LifecycleGeneration)
+	if err != nil {
+		t.Fatalf("releaseSupersededJobResourcesAtGeneration: %v", err)
+	}
+	if interleaved != 1 {
+		t.Fatalf("interleave hook ran %d times, want 1", interleaved)
+	}
+	if lock, lerr := store.GetBranchLock(ctx, repo, branch); lerr != nil || lock.Owner != "impl" {
+		t.Fatalf("task lane = %+v err=%v, want still held by the terminal retry", lock, lerr)
+	}
+	if got := countWorkflowJobEvents(t, store, child, "task_lane_lock_released"); got != 0 {
+		t.Fatalf("task_lane_lock_released events = %d, want 0", got)
+	}
+	// No LATER cleanup effect may run once the guard is lost.
+	if got := countWorkflowJobEvents(t, store, child, "delegation_worktree_cleanup_skipped"); got != 0 {
+		t.Fatalf("delegation_worktree_cleanup_skipped events = %d, want 0: cleanup continued past a lost guard", got)
+	}
+	_ = guarded
+}
+
+// TestSupersedeCleanupReleasesTheTaskLaneItOwns is the matching success control: the
+// anchored release must still free the lane on an ordinary supersession.
+func TestSupersedeCleanupReleasesTheTaskLaneItOwns(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "impl", []string{"implement"}, "gitmoot/gitmoot")
+	const (
+		child  = "workflow-task-lane-ok"
+		repo   = "gitmoot/gitmoot"
+		branch = "task-8"
+	)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-8", RepoFullName: repo, State: string(TaskImplementing), Branch: branch,
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	insertQueuedJob(t, store, db.Job{ID: child, Agent: "impl", Type: "implement"}, JobPayload{
+		Repo: repo, Branch: branch, PullRequest: 8, TaskID: "task-8", LeadAgent: "impl",
+	})
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo, Branch: branch, Owner: "impl"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock acquired=%v err=%v", acquired, err)
+	}
+	observed := mustJob(t, store, child)
+	if _, err := store.TransitionJobStateWithEventAtGeneration(ctx, child, observed.State, observed.LifecycleGeneration, string(JobCancelled),
+		db.JobEvent{JobID: child, Kind: JobEventSupersededPullRequestClosed, Message: "pr closed"}); err != nil {
+		t.Fatalf("supersede: %v", err)
+	}
+
+	if guarded, err := releaseSupersededJobResourcesAtGeneration(ctx, store, mustJob(t, store, child), abortCauseSupersede, observed.LifecycleGeneration); err != nil || !guarded {
+		t.Fatalf("releaseSupersededJobResourcesAtGeneration guarded=%v err=%v", guarded, err)
+	}
+	if _, err := store.GetBranchLock(ctx, repo, branch); err == nil {
+		t.Fatal("the superseded run's task lane was not released")
+	}
+	if got := countWorkflowJobEvents(t, store, child, "task_lane_lock_released"); got != 1 {
+		t.Fatalf("task_lane_lock_released events = %d, want 1", got)
+	}
+}
+
 // TestSupersedeCleanupReleasesTheDelegationLaneItOwns is the positive half. A guard
 // that refuses everything would satisfy the race test above while leaking the lane
 // on every ordinary supersession, so the happy path is pinned too.

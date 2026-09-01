@@ -643,6 +643,89 @@ func (s *Store) ReleaseBranchLockIfInactiveWithEvent(ctx context.Context, lock B
 	return true, tx.Commit()
 }
 
+// ReleaseTaskLaneBranchLockAtJobGeneration is ReleaseBranchLockIfInactiveWithEvent
+// with the owning job's LIFECYCLE pinned.
+//
+// The inactivity vetoes alone are not enough for a caller that decided a poll ago.
+// The tasks veto deliberately EXCLUDES the exact implementing task it was asked
+// about, so a retry of that same task cannot re-assert the lane through it; and
+// the jobs veto only fires while the retry is non-terminal, so a retry that has
+// already re-queued, run and settled terminal passes both. The generation lives in
+// the DELETE's own predicate here, which is the only formulation that cannot be
+// outrun.
+func (s *Store) ReleaseTaskLaneBranchLockAtJobGeneration(ctx context.Context, lock BranchLock, ignoredImplementingTaskID string, ownerJobID string, atGeneration int64, event BranchLockEvent) (bool, error) {
+	ownerJobID = strings.TrimSpace(ownerJobID)
+	if ownerJobID == "" {
+		return false, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	// Write first: no read precedes it, so there is no snapshot to stale-upgrade
+	// when another process commits a re-queue (the WAL hazard #1673 hit on the
+	// resource-lock release).
+	result, err := tx.ExecContext(ctx, `DELETE FROM branch_locks
+		WHERE repo_full_name = ? AND branch = ? AND owner = ?
+		AND EXISTS (
+			SELECT 1 FROM jobs
+			WHERE jobs.id = ?
+			  AND jobs.lifecycle_generation = ?
+			  AND jobs.state IN ('cancelled', 'failed')
+		)
+		AND NOT EXISTS (
+			SELECT 1 FROM tasks
+			WHERE tasks.repo_full_name = branch_locks.repo_full_name
+				AND TRIM(tasks.branch) = TRIM(branch_locks.branch)
+				AND NOT (tasks.id = ? AND tasks.state = 'implementing')
+				AND (
+					tasks.state IN (
+						'planned', 'implementing', 'pr_open', 'reviewing', 'changes_requested', 'ready_to_merge',
+						'blocked', 'awaiting_human_merge', 'awaiting_human'
+					)
+					OR tasks.state NOT IN (
+						'planned', 'implementing', 'pr_open', 'reviewing', 'changes_requested', 'ready_to_merge',
+						'merged', 'superseded', 'stranded', 'blocked', 'awaiting_human_merge', 'dismissed', 'awaiting_human'
+					)
+				)
+		)
+		AND NOT EXISTS (
+			SELECT 1 FROM jobs
+			WHERE jobs.state NOT IN ('succeeded', 'failed', 'cancelled')
+				AND json_valid(jobs.payload)
+				AND TRIM(COALESCE(json_extract(jobs.payload, '$.branch'), '')) = TRIM(branch_locks.branch)
+				AND (
+					TRIM(jobs.repo) = TRIM(branch_locks.repo_full_name)
+					OR TRIM(COALESCE(json_extract(jobs.payload, '$.repo'), '')) = TRIM(branch_locks.repo_full_name)
+				)
+		)`,
+		strings.TrimSpace(lock.RepoFullName), strings.TrimSpace(lock.Branch), strings.TrimSpace(lock.Owner),
+		ownerJobID, atGeneration, strings.TrimSpace(ignoredImplementingTaskID))
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, tx.Commit()
+	}
+	event.RepoFullName = strings.TrimSpace(lock.RepoFullName)
+	event.Branch = strings.TrimSpace(lock.Branch)
+	event.Owner = strings.TrimSpace(lock.Owner)
+	if strings.TrimSpace(event.Kind) == "" {
+		event.Kind = "released"
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO lock_events(repo_full_name, branch, owner, kind, message)
+		VALUES (?, ?, ?, ?, ?)`, event.RepoFullName, event.Branch, event.Owner, event.Kind, event.Message); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
 func (s *Store) ForceReleaseLockWithEvent(ctx context.Context, repoFullName string, branch string, event BranchLockEvent) (BranchLock, bool, error) {
 	lock, err := s.GetBranchLock(ctx, repoFullName, branch)
 	if errors.Is(err, sql.ErrNoRows) {

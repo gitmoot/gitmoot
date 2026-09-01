@@ -272,8 +272,12 @@ func countWorkflowJobEvents(t *testing.T, store *db.Store, jobID string, kind st
 //	                       would otherwise hand a LIVE run's checkout to the reclaim
 //	                       pass because the path is derived from the job id
 //	before-finalize        the anchored payload write inside the finalizer
-//	before-advance         the parent-advance bracket, whose confirm append refuses
-//	                       when the lifecycle moved while AdvanceJob was running
+//	before-advance-claim   the parent-advance bracket's claim, which refuses to start
+//	                       an advance for a lifecycle that has already moved
+//
+// The window INSIDE the advance is covered separately: a retry cannot even reach it
+// (RetryJob refuses while the claim is live, see TestRetryIsRefusedInsideASupersede-
+// Advance), and each parent-effect class has its own barrier test.
 //
 // before-cleanup is the window F-1 named: the re-read has already VALIDATED
 // generation N, and the resource-lock delete happens statements later. The three
@@ -290,7 +294,7 @@ func TestCompletePendingSupersedeFinalizationRefusesARetryClaimedMidPayment(t *t
 		supersedeDebtStageBeforeTaskLane,
 		supersedeDebtStageBeforeReclaim,
 		supersedeDebtStageBeforeFinalize,
-		supersedeDebtStageBeforeAdvance,
+		supersedeDebtStageBeforeAdvanceClaim,
 	} {
 		t.Run(stage, func(t *testing.T) {
 			runSupersedeDebtInterleaveCase(t, stage)
@@ -349,7 +353,10 @@ func runSupersedeDebtInterleaveCase(t *testing.T, stage string) {
 	const lockKey = "runtime:codex:session-retry"
 	interleaved := 0
 	supersedeDebtInterleaveHook = func(hookCtx context.Context, at string) {
-		if at != stage {
+		if at != stage || interleaved > 0 {
+			// Once only: a stage can be reached twice (the finalizer arm and the
+			// already-stamped arm both bracket the advance), and re-running the retry
+			// would model something no operator does.
 			return
 		}
 		interleaved++
@@ -394,11 +401,16 @@ func runSupersedeDebtInterleaveCase(t *testing.T, stage string) {
 	if err != nil {
 		t.Fatalf("unmarshalPayload: %v", err)
 	}
-	if stage != supersedeDebtStageBeforeAdvance && payload.Result != nil {
+	if payload.Result != nil {
 		t.Fatalf("the superseded run's failure was stamped onto the claimed run: %+v", payload.Result)
 	}
-	if got := countWorkflowJobEvents(t, store, child, "delegation_timeout_finalized"); got != finalizedBefore {
-		t.Fatalf("delegation_timeout_finalized events = %d, want %d: the claimed run was finalized", got, finalizedBefore)
+	// The finalizer runs BEFORE the advance bracket, so at before-advance-claim it has
+	// legitimately finalized the still-claimed lifecycle by the time the retry lands.
+	// Every earlier stage must show no new finalization at all.
+	if stage != supersedeDebtStageBeforeAdvanceClaim {
+		if got := countWorkflowJobEvents(t, store, child, "delegation_timeout_finalized"); got != finalizedBefore {
+			t.Fatalf("delegation_timeout_finalized events = %d, want %d: the claimed run was finalized", got, finalizedBefore)
+		}
 	}
 	// The parent advance is only ever CONFIRMED for a lifecycle that never moved, so
 	// a stale payment must add no confirmation at any stage.
@@ -408,22 +420,6 @@ func runSupersedeDebtInterleaveCase(t *testing.T, stage string) {
 	held, err := store.GetResourceLock(ctx, lockKey)
 	if err != nil || held.OwnerJobID != child {
 		t.Fatalf("resource lock = %+v err=%v, want still held by the claimed run", held, err)
-	}
-	if stage == supersedeDebtStageBeforeAdvance {
-		// This stage's guard is the CONFIRM append, which fires after AdvanceJob has
-		// run. The contract is therefore detect-and-re-drive, not prevention: the
-		// debt must stay OUTSTANDING with a durable trace, so the next poll advances
-		// the parent against whatever run owns the row then.
-		debt, derr := latestSupersedeFinalizeDebt(ctx, store, child)
-		if derr != nil {
-			t.Fatalf("latestSupersedeFinalizeDebt: %v", derr)
-		}
-		if !debt.pending {
-			t.Fatal("the debt was closed after an advance whose lifecycle moved; the parent can never be re-driven")
-		}
-		if got := countWorkflowJobEvents(t, store, child, JobEventSupersedeAdvanceSuperseded); got != 1 {
-			t.Fatalf("%s events = %d, want exactly 1 durable trace", JobEventSupersedeAdvanceSuperseded, got)
-		}
 	}
 }
 

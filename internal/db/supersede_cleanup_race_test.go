@@ -96,12 +96,13 @@ func TestReleaseSupersededJobResourceLocksAtGenerationSurvivesACrossStoreRetry(t
 			t.Fatalf("round %d: retry connection failed: %v", round, retryErr)
 		}
 		if releaseErr != nil {
-			// Permitted, and the caller's contract is to leave the debt outstanding.
-			// What is NOT permitted is claiming the cleanup happened.
-			if guarded {
-				t.Fatalf("round %d: release reported guarded alongside error %v", round, releaseErr)
-			}
-			continue
+			// The write-first formulation takes the write lock as its FIRST statement, so
+			// it has no read snapshot to stale-upgrade: a cross-process re-queue either
+			// loses the EXISTS predicate or serialises after the commit. Any error here
+			// therefore means the implementation is NOT write-first — which is exactly the
+			// SELECT-before-DELETE mutant, whose failure mode is SQLITE_BUSY_SNAPSHOT.
+			// Accepting it was what let that mutant survive this test.
+			t.Fatalf("round %d: guarded release returned %v; a write-first guard cannot stale-upgrade (guarded=%v)", round, releaseErr, guarded)
 		}
 		current, err := recovery.GetJob(ctx, jobID)
 		if err != nil {

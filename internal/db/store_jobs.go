@@ -2083,6 +2083,40 @@ func (s *Store) AddJobEventAtGeneration(ctx context.Context, event JobEvent, atG
 	return affected == 1, nil
 }
 
+// JobHasLiveSupersedeAdvanceClaim reports whether a job is inside a supersession
+// recovery's parent-advance critical section: its latest advance-bracket event is a
+// CLAIM, with no confirmation or superseded trace after it, and that claim is
+// younger than within.
+//
+// RetryJob consults it so a re-queue cannot roll the lifecycle over WHILE
+// AdvanceJob is emitting irreversible parent effects (#1673). Prevention beats
+// detection here: a failure policy applied, a dependent enqueued or a continuation
+// minted from a superseded run cannot be undone.
+//
+// The staleness bound is what keeps a crashed advance from wedging retries forever:
+// a claim older than within is ignored, and the pass that owns it re-claims on its
+// next poll.
+func (s *Store) JobHasLiveSupersedeAdvanceClaim(ctx context.Context, jobID string, within time.Duration) (bool, error) {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" || within <= 0 {
+		return false, nil
+	}
+	var live int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM job_events claim
+		WHERE claim.job_id = ?
+		  AND claim.kind = 'supersede_advance_claimed'
+		  AND claim.id = (
+			SELECT MAX(id) FROM job_events latest
+			WHERE latest.job_id = ?
+			  AND latest.kind IN ('supersede_advance_claimed', 'supersede_advance_confirmed', 'supersede_advance_superseded')
+		  )
+		  AND unixepoch(claim.created_at) >= unixepoch('now') - ?`, jobID, jobID, int64(within.Seconds())).Scan(&live)
+	if err != nil {
+		return false, err
+	}
+	return live > 0, nil
+}
+
 // JobIDsWithOpenEscalation returns the IDs of coordinator jobs with an OPEN
 // escalation round — strictly more delegation_escalation_requested than
 // delegation_escalation_resolved events — the same requested>resolved rule

@@ -980,6 +980,15 @@ func (e Engine) advanceDelegations(ctx context.Context, parentJob db.Job, parent
 		return err
 	}
 
+	// #1673 supersession recovery: when this advance is anchored to ONE child
+	// lifecycle, the snapshot below is that lifecycle's. Every parent-side effect
+	// class re-asserts the anchor immediately before it runs, so a retry that
+	// re-queued the child after the snapshot cannot make this pass fail, enqueue or
+	// continue the parent from a run that no longer exists. A post-effect check
+	// cannot do that: the effects are irreversible.
+	if err := e.assertSupersedeAdvanceAnchor(ctx, supersedeAdvanceBarrierChildSnapshot); err != nil {
+		return err
+	}
 	// Parent job events drive two decisions below: which delegations dispatch
 	// skipped via fingerprint dedup (so they resolve against their winning
 	// sibling rather than stalling the continuation forever), and whether a
@@ -1082,6 +1091,9 @@ func (e Engine) advanceDelegations(ctx context.Context, parentJob db.Job, parent
 	// it by skipping the block here.
 	continuationAlreadyEnqueued := continuationEnqueued(parentEvents)
 	escalate := false
+	if err := e.assertSupersedeAdvanceAnchor(ctx, supersedeAdvanceBarrierFailurePolicy); err != nil {
+		return err
+	}
 	for _, d := range parentResult.Delegations {
 		child, ok := children[d.ID]
 		if !ok || !IsSettledJobState(child.State) || child.State == string(JobSucceeded) {
@@ -1128,6 +1140,9 @@ func (e Engine) advanceDelegations(ctx context.Context, parentJob db.Job, parent
 	// unless every dep is succeeded). Already-enqueued children are skipped via
 	// the children map and e.enqueue's idempotency.
 	if !escalate {
+		if err := e.assertSupersedeAdvanceAnchor(ctx, supersedeAdvanceBarrierDependentEnqueue); err != nil {
+			return err
+		}
 		for _, d := range parentResult.Delegations {
 			if len(compactStrings(d.Deps)) == 0 {
 				continue
@@ -1184,6 +1199,9 @@ func (e Engine) advanceDelegations(ctx context.Context, parentJob db.Job, parent
 	// is resolved (terminal child, or permanently gated by a failed dependency
 	// under a continue policy), or immediately when a failure escalates.
 	if escalate || allDelegationsResolved(parentResult.Delegations, children, dedupWinners) {
+		if err := e.assertSupersedeAdvanceAnchor(ctx, supersedeAdvanceBarrierContinuation); err != nil {
+			return err
+		}
 		if err := e.maybeEnqueueContinuation(ctx, parentJob, parentPayload, parentResult, children, ref); err != nil {
 			return err
 		}
