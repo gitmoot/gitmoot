@@ -623,16 +623,15 @@ func TestHeartbeatScanReviewRejectsMissingCapability(t *testing.T) {
 	}
 }
 
-// #1685: the heartbeat enqueue path deliberately bypasses ensureLocalAgentAccess,
-// so the dispatch-time role gate does not cover it. A coordinator on a review
-// heartbeat would otherwise produce a vacuous "approved" ON A TIMER — strictly
-// worse than the one-off CLI dispatches that were caught live, because nobody is
-// watching a cron. Skips WITHOUT wedging: next_due advances exactly as the
-// capability skip does.
-func TestHeartbeatScanReviewRejectsCoordinatorRole(t *testing.T) {
+// #1685. A review heartbeat for a coordinator ENQUEUES, and must: the panel
+// recipe is a legitimate way to answer a review cron, and its fan-out is judged
+// on the delegates by the merge gate rather than counted as a verdict. An
+// earlier version of this test pinned the opposite — a "role_not_reviewer" skip
+// — which took a documented flow off the cron to compensate for a consumer
+// defect that is now fixed in the consumers.
+func TestHeartbeatScanReviewEnqueuesForCoordinatorRole(t *testing.T) {
 	paths, store := heartbeatScanFixture(t, reviewHeartbeatBody)
 	ctx := context.Background()
-	// Registered exactly as g6-review-sol is: review-capable, but role=coordinator.
 	if err := store.UpsertAgent(ctx, db.Agent{
 		Name: "reviewer", Role: "coordinator", Runtime: "codex", RepoScope: "gitmoot/gitmoot",
 		Capabilities: []string{"ask", "review"}, RuntimeRef: "last",
@@ -644,18 +643,8 @@ func TestHeartbeatScanReviewRejectsCoordinatorRole(t *testing.T) {
 	if err := runHeartbeatScanOnce(ctx, paths, store, enq, now); err != nil {
 		t.Fatalf("runHeartbeatScanOnce: %v", err)
 	}
-	if len(*seen) != 0 {
-		t.Fatalf("coordinator review heartbeat enqueued %d jobs", len(*seen))
-	}
-	state, found, err := store.GetHeartbeatState(ctx, "reviewer", "stale-prs")
-	if err != nil || !found {
-		t.Fatalf("expected state row, found=%v err=%v", found, err)
-	}
-	if state.LastStatus != "role_not_reviewer" {
-		t.Fatalf("last_status = %q, want role_not_reviewer", state.LastStatus)
-	}
-	if !state.NextDueAt.Equal(now.Add(12 * time.Hour)) {
-		t.Fatalf("role skip must advance next_due (no wedge): %+v", state)
+	if len(*seen) != 1 {
+		t.Fatalf("coordinator review heartbeat enqueued %d jobs, want 1", len(*seen))
 	}
 }
 

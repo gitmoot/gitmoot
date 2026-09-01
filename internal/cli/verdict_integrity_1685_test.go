@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -24,36 +25,32 @@ func seedVerdictIntegrityAgent(t *testing.T, store *db.Store, name, role string,
 	return agent
 }
 
-// #1685 layer 4. g6-review-sol is registered role=coordinator with
-// caps=ask,review. Every dispatcher that picked it by name got a fan-out where
-// it expected a verdict, because the dispatch path gates on CAPABILITY and
-// nothing reads ROLE. The name reading "*-review-*" is what made it survive:
-// the convention held for 30 agents and failed silently on the 31st.
-func TestEnsureLocalAgentAccessRefusesCoordinatorInReviewSlot(t *testing.T) {
+// #1685. A coordinator in a review slot is the SHIPPED review-panel flow, so
+// dispatch must allow it. An earlier version of this file pinned the opposite —
+// it refused role=coordinator outright — which made the product refuse its own
+// documented recipe (skills/gitmoot/agent-templates/review-panel.md declares
+// capabilities [ask, review] and outputs [delegations]).
+//
+// The defect was never that a coordinator PRODUCES a fan-out; it was that
+// consumers COUNTED one as a verdict. That is fixed where the counting happens:
+// TestPolicyMergeGateRefusesUndispatchedFanOutRow and its siblings in
+// internal/workflow, the pipeline auto-merge gate, allRequiredReviewersApproved,
+// the proof projector, and the verdict wake.
+func TestEnsureLocalAgentAccessAllowsCoordinatorInReviewSlot(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
-	coordinator := seedVerdictIntegrityAgent(t, store, "g6-review-sol", "coordinator", []string{"ask", "review"})
-
-	err := ensureLocalAgentAccess(ctx, store, coordinator, "owner/repo", "review")
-	if err == nil {
-		t.Fatal("a coordinator-role agent must be refused in a review slot")
-	}
-	for _, want := range []string{"g6-review-sol", "coordinator", "not a verdict"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("refusal %q must name %q", err, want)
+	for i, role := range []string{
+		"coordinator", "Coordinator", "review-coordinator", "coordinator-sol", "panel-coordinator",
+	} {
+		agent := seedVerdictIntegrityAgent(t, store, fmt.Sprintf("coord-%d", i), role, []string{"ask", "review"})
+		agent.Role = role
+		if err := ensureLocalAgentAccess(ctx, store, agent, "owner/repo", "review"); err != nil {
+			t.Fatalf("role %q must be dispatchable as a reviewer, got %v", role, err)
 		}
-	}
-
-	// DISTINCTNESS: the refusal is on ROLE, not capability. The same agent is
-	// perfectly valid in the slot it was built for, so this guard must not
-	// degenerate into "coordinators cannot be dispatched".
-	if err := ensureLocalAgentAccess(ctx, store, coordinator, "owner/repo", "ask"); err != nil {
-		t.Fatalf("a coordinator must still be dispatchable as an ask, got %v", err)
 	}
 }
 
-// ACCEPTANCE: the actual reviewer for this repo must be unaffected. A guard that
-// also refuses g7-review has replaced a rare vacuous verdict with a total outage.
+// ACCEPTANCE: the actual reviewer for this repo must be unaffected.
 func TestEnsureLocalAgentAccessAllowsReviewerRoleInReviewSlot(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
@@ -61,21 +58,6 @@ func TestEnsureLocalAgentAccessAllowsReviewerRoleInReviewSlot(t *testing.T) {
 		reviewer := seedVerdictIntegrityAgent(t, store, "reviewer-"+role+"x", role, []string{"review"})
 		if err := ensureLocalAgentAccess(ctx, store, reviewer, "owner/repo", "review"); err != nil {
 			t.Fatalf("role %q must be allowed to review, got %v", role, err)
-		}
-	}
-}
-
-// The role comparison is case-insensitive because the registry column is a
-// free-form string: "Coordinator" must not walk through the gate that
-// "coordinator" is refused by.
-func TestEnsureLocalAgentAccessCoordinatorRoleIsCaseInsensitive(t *testing.T) {
-	ctx := context.Background()
-	store := daemonWorkerStore(t)
-	for _, role := range []string{"Coordinator", "COORDINATOR", "  coordinator  "} {
-		agent := seedVerdictIntegrityAgent(t, store, "coord-"+strings.TrimSpace(strings.ToLower(role))+"-x", role, []string{"review"})
-		agent.Role = role
-		if err := ensureLocalAgentAccess(ctx, store, agent, "owner/repo", "review"); err == nil {
-			t.Fatalf("role %q must be refused in a review slot", role)
 		}
 	}
 }

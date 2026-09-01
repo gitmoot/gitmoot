@@ -301,6 +301,45 @@ func TestReviewIndependenceRequiresNormalizedNonEmptyAgents(t *testing.T) {
 	}
 }
 
+// #1685. The projector's job is to certify what happened, so a coordinator
+// fan-out must not produce an OBSERVED approval claim: that turns an
+// announcement nobody answered into a positive audit artifact. The panelists'
+// own review jobs are projected separately and carry the real claims.
+func TestReviewFanOutProducesNoApprovalClaim(t *testing.T) {
+	root, jobs, results, receipts, events := proofFixture(t, false)
+	for _, result := range results {
+		if result.Decision != "approved" {
+			continue
+		}
+		result.Delegations = []workflow.Delegation{
+			{ID: "lens-a", Agent: "r1", Action: "review"},
+			{ID: "lens-b", Agent: "r2", Action: "review"},
+		}
+	}
+	manifest := Project(root, jobs, results, receipts, events)
+	reviewNodes := 0
+	for _, node := range manifest.Nodes {
+		if node.Kind != KindReview {
+			continue
+		}
+		reviewNodes++
+		for _, claim := range node.Claims {
+			if strings.HasPrefix(claim.Type, "review.") && strings.Contains(claim.Type, "approved") {
+				t.Fatalf("fan-out review produced approval claim %q", claim.Type)
+			}
+		}
+		if node.Attrs["review_outcome"] != "fan-out (no verdict)" {
+			t.Fatalf("review_outcome = %q, want the fan-out label", node.Attrs["review_outcome"])
+		}
+		if node.Attrs["fan_out_delegations"] != "2" {
+			t.Fatalf("fan_out_delegations = %q, want 2", node.Attrs["fan_out_delegations"])
+		}
+	}
+	if reviewNodes == 0 {
+		t.Fatal("fixture produced no review node, so this test proves nothing")
+	}
+}
+
 func TestApprovedWithNotesProofUsesDurableOutcomeEvent(t *testing.T) {
 	root, jobs, results, receipts, events := proofFixture(t, false)
 	results["review-job"] = &workflow.AgentResult{

@@ -1893,6 +1893,16 @@ func autoMergeGateStageSettleOutcome(ctx context.Context, deps pipelineStageSett
 		if rerr != nil || reviewPayload.Result == nil {
 			return block(fmt.Sprintf("source-bound review stage %q produced no valid result", reviewStage.ID))
 		}
+		// A fan-out is not an approval. This gate reaches PipelineAutoMerger.Evaluate,
+		// which never runs the native merge gate's review checks, so it is the only
+		// place on this path that can refuse a coordinator continuation (#1685). An
+		// `orchestrate: true` review stage keeps its delegations and lands here with
+		// them intact.
+		if workflow.ResultIsFanOut(reviewPayload.Result) {
+			return block(fmt.Sprintf(
+				"source-bound review stage %q declared %d delegation(s); a fan-out is a coordinator continuation, not a verdict",
+				reviewStage.ID, len(reviewPayload.Result.Delegations)))
+		}
 		decision := strings.TrimSpace(reviewPayload.Result.Decision)
 		if decision != "approved" {
 			return block(fmt.Sprintf("source-bound review stage %q returned decision %q, not approved", reviewStage.ID, decision))

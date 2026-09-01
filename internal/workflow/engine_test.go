@@ -1499,6 +1499,44 @@ func TestAllRequiredReviewersApprovedCountsSubthresholdReview(t *testing.T) {
 	}
 }
 
+// #1685. A fan-out announces a panel; it does not approve. Counting it here
+// would let a coordinator satisfy a required-reviewer slot with no delegate
+// having reported.
+func TestAllRequiredReviewersApprovedRejectsFanOutRow(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+	insertCompletedJob(t, store, db.Job{ID: "review-audit", Agent: "audit", Type: "review"}, JobPayload{
+		Repo:        "mobile/app",
+		PullRequest: 8,
+		TaskID:      "task-8",
+		ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "Convening a panel",
+			Delegations: []Delegation{
+				{ID: "lens-a", Agent: "r1", Action: "review"},
+			},
+		},
+	})
+	payload := JobPayload{
+		Repo:        "mobile/app",
+		PullRequest: 8,
+		TaskID:      "task-8",
+		ReviewRound: "review-1",
+		Reviewers:   []string{"audit", "security"},
+	}
+
+	approved, err := engine.allRequiredReviewersApproved(ctx, "security", payload)
+	if err != nil {
+		t.Fatalf("allRequiredReviewersApproved returned error: %v", err)
+	}
+	if approved {
+		t.Fatal("a fan-out must not satisfy a required-reviewer slot")
+	}
+}
+
 // A pipeline review stage binds its job to the task/PR/head under Sender=pipeline
 // (internal/pipeline/run.go) and records no ReviewRound, so once the PR head moves
 // on, that stale stage verdict still shares the round of the current native review

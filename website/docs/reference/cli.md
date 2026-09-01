@@ -2470,7 +2470,27 @@ or missing evidence. Each check is a yes/no question with an explanation:
   mentions. A worktree-less delegation child instead persists the typed source
   `excluded_worktree_less_delegation_child`; exclusion is observable and is not
   graded as diff evidence.
-- **review** — a `changes_requested` review must carry `findings` (evidence).
+- **review** — a `changes_requested` review must carry `findings` (evidence). A
+  terminal review verdict (`approved` / `changes_requested`) must additionally
+  ACCOUNT FOR ITSELF (`review-verdict-has-evidence`): cite `findings`, name a
+  substantive `tests_run` / `changes_made` entry, or give a summary long enough
+  to state why there was nothing to run. An entry counts as substantive when it
+  is a phrase (a command with its outcome) or a single token long enough to name
+  a real path or target — so `tests_run: ["."]` is not evidence, while an honest
+  docs-only approval that explains what it read passes on its rationale. The
+  check measures ACCOUNTING, not truth: it cannot detect fabricated evidence, and
+  no deterministic check can. A **coordinator fan-out** — a review result that
+  declares `delegations` — is exempt, because it announces a panel that has not
+  reported yet and legitimately has nothing to record.
+
+  A fan-out is never counted as a verdict. The merge gate excludes such a row
+  from the verdict population (so an independent verdict at the same head still
+  decides the PR), decides the slot on the delegates when the panel reported, and
+  reports `declared delegations that never reported` when it was announced and
+  never dispatched. Pipeline auto-merge, required-reviewer counting, the proof
+  projector and the review-verdict wake apply the same rule; `blocked` and
+  `failed` reviews keep reporting their own cause. A coordinator is therefore
+  dispatchable into a review slot, by CLI and by heartbeat.
 - **ask** — the answer (`summary`/`artifact_body`) must be non-empty and
   actionable.
 - **blocked** (any action) — a `blocked` result must list actionable `needs`.

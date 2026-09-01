@@ -103,6 +103,12 @@ func insertMergeGateReviewFixture(t *testing.T, store *db.Store, fixture mergeGa
 	}
 }
 
+// insertMergeGateDelegationChild creates a delegation child AND records that
+// delegation on the parent's stored result. Production always writes both: the
+// engine dispatches children FROM the parent result's delegations[], so a parent
+// with children and an empty delegations[] is a shape the product never
+// produces. Fixtures that built it hid #1685 — the fan-out row is exactly the
+// row whose delegations[] is populated.
 func insertMergeGateDelegationChild(t *testing.T, store *db.Store, parentID, delegationID string, state JobState, result *AgentResult) {
 	t.Helper()
 	payload, err := marshalPayload(JobPayload{
@@ -124,6 +130,39 @@ func insertMergeGateDelegationChild(t *testing.T, store *db.Store, parentID, del
 		DelegationID: delegationID,
 	}, db.JobEvent{Kind: string(state), Message: "delegation fixture state"}); err != nil {
 		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	if strings.TrimSpace(delegationID) == "" {
+		// An ordinary child with no delegation id was never declared by the parent.
+		return
+	}
+	declareMergeGateParentDelegation(t, store, parentID, delegationID)
+}
+
+// declareMergeGateParentDelegation appends one delegation to the parent review's
+// stored result, mirroring what the agent wrote before the engine fanned out.
+func declareMergeGateParentDelegation(t *testing.T, store *db.Store, parentID, delegationID string) {
+	t.Helper()
+	ctx := context.Background()
+	parent, err := store.GetJob(ctx, parentID)
+	if err != nil {
+		t.Fatalf("GetJob(%s) returned error: %v", parentID, err)
+	}
+	payload, err := ParseJobPayload(parent.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload(%s) returned error: %v", parentID, err)
+	}
+	if payload.Result == nil {
+		return
+	}
+	payload.Result.Delegations = append(payload.Result.Delegations, Delegation{
+		ID: delegationID, Agent: delegationID, Action: "review",
+	})
+	encoded, err := marshalPayload(payload)
+	if err != nil {
+		t.Fatalf("marshalPayload returned error: %v", err)
+	}
+	if err := store.UpdateJobPayload(ctx, parentID, string(encoded)); err != nil {
+		t.Fatalf("UpdateJobPayload(%s) returned error: %v", parentID, err)
 	}
 }
 
@@ -434,20 +473,37 @@ func TestPolicyMergeGateRejectsUnverifiableReviewAuthorship(t *testing.T) {
 	}
 }
 
-// #1685 layer 3. The result contract stops such a row being WRITTEN, but it
-// defaults to OFF (normalizeResultCheckMode maps the zero value to
-// ResultChecksOff), and rows persisted before it shipped are already in the
-// store. The gate is the surface with merge authority and must refuse them on
-// its own — this is what makes layer 3 distinct from layers 1 and 2 rather than
-// a second copy of them.
-func TestPolicyMergeGateRefusesReviewVerdictWithUnreportedDelegations(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
+// insertMergeGatePanelChild adds one delegation child under a head-bound parent
+// review. The parent declares its delegations itself in these tests, so this
+// deliberately does not touch the parent payload.
+func insertMergeGatePanelChild(t *testing.T, store *db.Store, parentID, delegationID string, state JobState, result *AgentResult) {
+	t.Helper()
+	encoded, err := marshalPayload(JobPayload{
+		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Result: result,
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload returned error: %v", err)
+	}
+	if err := store.CreateJobWithEvent(context.Background(), db.Job{
+		ID:           parentID + "/delegation/" + delegationID,
+		Agent:        delegationID,
+		Type:         "review",
+		State:        string(state),
+		Payload:      encoded,
+		ParentJobID:  parentID,
+		DelegationID: delegationID,
+	}, db.JobEvent{Kind: string(state), Message: "panel child"}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+}
+
+func insertMergeGateFanOutRow(t *testing.T, store *db.Store, decision string) {
+	t.Helper()
 	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-panel", Agent: "g6-review-sol", Type: "review"}, JobPayload{
 		Repo: "mobile/app", Branch: "task-9", PullRequest: 9, HeadSHA: "head123",
 		TaskID: "task-9", ReviewRound: "review-1",
 		Result: &AgentResult{
-			Decision: "approved",
+			Decision: decision,
 			Summary:  "Convening a three-reviewer panel at exact head head123",
 			Delegations: []Delegation{
 				{ID: "lens-a", Agent: "r1", Action: "review"},
@@ -456,21 +512,150 @@ func TestPolicyMergeGateRefusesReviewVerdictWithUnreportedDelegations(t *testing
 			},
 		},
 	})
+}
+
+// #1685. A fan-out row is an announcement, so the delegates it named — not its
+// own decision — decide the slot. This is the flow the shipped review-panel
+// template produces, and the first version of this guard refused it outright.
+func TestPolicyMergeGateMergesDelegatedReviewWhenPanelReported(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	insertMergeGateFanOutRow(t, store, "approved")
+	for _, lens := range []string{"lens-a", "lens-b", "lens-c"} {
+		insertMergeGatePanelChild(t, store, "review-panel", lens, JobSucceeded, &AgentResult{
+			Decision: "approved", Summary: "lens verified the head", TestsRun: []string{"go test ./... -> ok"},
+		})
+	}
+
+	if err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
+		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "g6-review-sol",
+	}, "head123"); err != nil {
+		t.Fatalf("a reported panel must clear the gate, got %v", err)
+	}
+}
+
+// A panel that was announced and never dispatched carries no evidence. It must
+// not satisfy the gate — that is the #1685 defect — and it must not be reported
+// as a generic "review is not captured" either.
+func TestPolicyMergeGateRefusesUndispatchedFanOutRow(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	insertMergeGateFanOutRow(t, store, "approved")
+
+	err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
+		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "g6-review-sol",
+	}, "head123")
+	if err == nil {
+		t.Fatal("an undispatched fan-out must not satisfy the gate")
+	}
+	// Not mergeBlocked: a fan-out is a missing verdict, not a quality rejection,
+	// and classifying it as one both misreports the cause and parks the task.
+	var blocked mergeBlocked
+	if errors.As(err, &blocked) {
+		t.Fatalf("undispatched fan-out returned mergeBlocked %q, want a missing-verdict error", blocked.reason)
+	}
+	for _, want := range []string{"g6-review-sol", "review-panel", "not a verdict"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q must name %q", err, want)
+		}
+	}
+}
+
+// The wedge finding: blocking on the fan-out row made the head unrecoverable,
+// because supersession is same-agent-only and a coordinator's continuation is
+// dispatched as an "ask". A skipped row lets a real verdict at the SAME head
+// decide, with no new commit required.
+func TestPolicyMergeGateLetsIndependentVerdictClearFanOutRow(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	insertMergeGateFanOutRow(t, store, "approved")
+	insertCompletedJob(t, store, db.Job{ID: "review-independent", Agent: "reviewer-y", Type: "review"}, JobPayload{
+		Repo: "mobile/app", Branch: "task-9", PullRequest: 9, HeadSHA: "head123",
+		TaskID: "task-9", ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "approved", Summary: "read the diff at head123",
+			TestsRun: []string{"go test ./... -> ok"},
+		},
+	})
+
+	if err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
+		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "reviewer-y",
+	}, "head123"); err != nil {
+		t.Fatalf("an independent verdict at the same head must clear a fan-out row, got %v", err)
+	}
+}
+
+// Partial dispatch: children exist, so the panel did run, but one declared
+// delegate produced no row. Its evidence is outstanding, not absent, so the gate
+// waits instead of merging on the two that answered.
+func TestPolicyMergeGateWaitsForDeclaredDelegationWithoutChild(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	insertMergeGateFanOutRow(t, store, "approved")
+	for _, lens := range []string{"lens-a", "lens-b"} {
+		insertMergeGatePanelChild(t, store, "review-panel", lens, JobSucceeded, &AgentResult{
+			Decision: "approved", Summary: "lens verified the head",
+		})
+	}
+
+	err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
+		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "g6-review-sol",
+	}, "head123")
+	var pending mergePending
+	if !errors.As(err, &pending) {
+		t.Fatalf("ensureFinalReviewCaptured = %v, want mergePending for an unreported delegate", err)
+	}
+	if !strings.Contains(pending.reason, "lens-c") {
+		t.Fatalf("pending reason %q must name the delegate that never reported", pending.reason)
+	}
+}
+
+// blocked/failed rows are not announcements: they already refuse on their own
+// terms, and reclassifying them as fan-outs reported the wrong cause for a row
+// nobody could mistake for an approval.
+func TestPolicyMergeGateReportsBlockingCauseForDelegatingBlockedRow(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	insertMergeGateFanOutRow(t, store, "blocked")
 
 	err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
 		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "g6-review-sol",
 	}, "head123")
 	var blocked mergeBlocked
 	if !errors.As(err, &blocked) {
-		t.Fatalf("ensureFinalReviewCaptured = %v, want mergeBlocked for a fan-out row", err)
+		t.Fatalf("ensureFinalReviewCaptured = %v, want mergeBlocked for a blocked row", err)
 	}
-	// The reason must name the offending row. A generic "final agent review is not
-	// captured" would leave an operator unable to tell WHICH row was wrong, which
-	// is why this blocks rather than skipping the row.
-	for _, want := range []string{"g6-review-sol", "review-panel", "continuation, not a verdict"} {
-		if !strings.Contains(blocked.reason, want) {
-			t.Fatalf("block reason %q must name %q", blocked.reason, want)
-		}
+	if !strings.Contains(blocked.reason, "blocking result from g6-review-sol") {
+		t.Fatalf("reason %q must report the blocking verdict, not a fan-out diagnosis", blocked.reason)
+	}
+}
+
+// A fan-out that announced changes_requested is still only an ANNOUNCEMENT, so
+// it must not veto the head either. This is the direction that separates
+// "excluded from the verdict population" from "cannot satisfy the gate": an
+// approved fan-out is already non-blocking because approved is not a blocking
+// decision, so only a changes_requested one can prove the exclusion is real.
+//
+// The distinction from TestPolicyMergeGateReportsBlockingCauseForDelegatingBlockedRow
+// is deliberate: blocked/failed are leaf refusals that keep their own cause,
+// while approved/changes_requested from a delegating row are continuations.
+func TestPolicyMergeGateDoesNotBlockOnAChangesRequestedFanOut(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	insertMergeGateFanOutRow(t, store, "changes_requested")
+	insertCompletedJob(t, store, db.Job{ID: "review-independent", Agent: "reviewer-y", Type: "review"}, JobPayload{
+		Repo: "mobile/app", Branch: "task-9", PullRequest: 9, HeadSHA: "head123",
+		TaskID: "task-9", ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "approved", Summary: "read the diff at head123",
+			TestsRun: []string{"go test ./... -> ok"},
+		},
+	})
+
+	if err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
+		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "reviewer-y",
+	}, "head123"); err != nil {
+		t.Fatalf("a changes_requested fan-out must not veto an independent verdict, got %v", err)
 	}
 }
 
@@ -804,16 +989,16 @@ func TestDelegatedReviewEvidenceUsesBlockingSeverity(t *testing.T) {
 		ID: "child-review", Type: "review", State: string(JobSucceeded), Payload: string(encoded),
 	}}
 
-	if err := ensureDelegatedReviewEvidence(db.Job{ID: "parent-review"}, children, reviewseverity.P1); err != nil {
+	if err := ensureDelegatedReviewEvidence(db.Job{ID: "parent-review"}, children, nil, reviewseverity.P1); err != nil {
 		t.Fatalf("sub-threshold delegated review returned error: %v", err)
 	}
-	if err := ensureDelegatedReviewEvidence(db.Job{ID: "parent-review"}, children, reviewseverity.P2); err == nil || !strings.Contains(err.Error(), "blocking") {
+	if err := ensureDelegatedReviewEvidence(db.Job{ID: "parent-review"}, children, nil, reviewseverity.P2); err == nil || !strings.Contains(err.Error(), "blocking") {
 		t.Fatalf("at-threshold delegated review error = %v, want blocking evidence", err)
 	}
 	askChildren := []db.Job{{
 		ID: "child-ask", Type: "ask", State: string(JobSucceeded), Payload: string(encoded),
 	}}
-	if err := ensureDelegatedReviewEvidence(db.Job{ID: "parent-review"}, askChildren, reviewseverity.P1); err == nil || !strings.Contains(err.Error(), "blocking") {
+	if err := ensureDelegatedReviewEvidence(db.Job{ID: "parent-review"}, askChildren, nil, reviewseverity.P1); err == nil || !strings.Contains(err.Error(), "blocking") {
 		t.Fatalf("sub-threshold non-review child error = %v, want raw blocking decision", err)
 	}
 }

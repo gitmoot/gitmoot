@@ -1791,10 +1791,19 @@ func localAgentTargetRepo(ctx context.Context, repoFlag string) (github.Reposito
 	return github.Repository{Owner: parsed.Owner, Name: parsed.Name}, nil
 }
 
-// coordinatorAgentRole is the registry role that means "fans work out to others"
-// rather than "answers the question itself" (#1685). It is compared
-// case-insensitively because the role column is a free-form registry string.
-const coordinatorAgentRole = "coordinator"
+// #1685 removed a role gate that lived here. It refused any agent whose registry
+// role was "coordinator" from a review slot, on the theory that a coordinator in
+// that slot can only produce a fan-out. The theory was right and the conclusion
+// was wrong: a fan-out in a review slot is the SHIPPED recipe
+// (skills/gitmoot/agent-templates/review-panel.md, capabilities [ask, review]),
+// and the merge gate now decides such a row on its delegates instead of counting
+// it as a verdict. Refusing the dispatch removed a documented capability to
+// compensate for a consumer defect that no longer exists — and it did so by
+// exact-matching one literal against a free-form registry column, which let
+// "review-coordinator" and "coordinator-sol" through anyway.
+//
+// Do not reintroduce a role gate here without first answering what it catches
+// that the consumers do not.
 
 func ensureLocalAgentAccess(ctx context.Context, store *db.Store, agent db.Agent, repo string, action string) error {
 	allowed, err := store.AgentCanAccessRepo(ctx, agent.Name, repo)
@@ -1806,20 +1815,6 @@ func ensureLocalAgentAccess(ctx context.Context, store *db.Store, agent db.Agent
 	}
 	if !agentHasCapability(agent.Capabilities, action) {
 		return fmt.Errorf("agent %q lacks %s capability", agent.Name, action)
-	}
-	// #1685 layer 4: capability says an agent CAN review; role says what it IS. A
-	// coordinator dispatched into a review slot does exactly what coordinators do
-	// — it fans out and reports that its dispatch succeeded — and "approved" lands
-	// in the one field every consumer reads as a verdict. Nothing downstream reads
-	// role, so this is the only place the mismatch is visible before a near-merge.
-	// Refused rather than warned: the two live instances (#1682, #1691) were both
-	// dispatched in good faith by seats selecting on capability, which is exactly
-	// what a warning would not have stopped.
-	if strings.EqualFold(strings.TrimSpace(action), "review") &&
-		strings.EqualFold(strings.TrimSpace(agent.Role), coordinatorAgentRole) {
-		return fmt.Errorf(
-			"agent %q has role %q and cannot be dispatched as a reviewer: a coordinator fans out delegations and reports dispatch success, which is not a verdict; name an agent whose role is a reviewer",
-			agent.Name, agent.Role)
 	}
 	return nil
 }

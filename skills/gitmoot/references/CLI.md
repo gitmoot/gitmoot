@@ -795,6 +795,35 @@ report-only — the pipeline advancer owns folding its verdict — so its raw
 `changes_requested` keeps blocking the merge gate at every threshold and never
 counts toward required-reviewer approval.
 
+### Fan-outs are not verdicts
+
+A review result that declares `delegations` is a coordinator **fan-out**: it
+announces a panel. Gitmoot dispatches a result's delegations *after* the result
+is stored, so such a row was written before any delegate could report, and it is
+not an answer about the code (#1685). This is the shape the shipped
+`review-panel` agent template produces, and it is legitimate — what is not
+legitimate is counting it as a verdict.
+
+Every surface that reads a review decision applies the same rule:
+
+- the **merge gate** excludes a fan-out row from the verdict population. It
+  neither satisfies nor blocks the reviewer slot, so an independent verdict at
+  the same head still decides the PR;
+- if the panel **reported**, the gate decides that slot on the delegates — at
+  least one approving child, no blocking, crashed, abstaining or still-running
+  child, and every declared delegation accounted for;
+- if the panel was announced and **never dispatched**, the gate reports
+  `no review verdict at evaluated head: <agent> (job <id>, N declared) declared
+  delegations that never reported` rather than merging or parking;
+- **pipeline auto-merge**, **required-reviewer counting**, the **proof
+  projector** (no `review.approved` claim) and the **review-verdict wake** all
+  skip fan-out rows the same way;
+- `blocked` and `failed` reviews are never fan-outs. They already refuse on their
+  own terms and keep reporting their own cause.
+
+A coordinator is therefore dispatchable into a review slot, by CLI and by
+heartbeat. Gitmoot judges the panel it convenes, not the announcement.
+
 ### Risk-Tiered Adaptive Review
 
 Set `risk_tiers_enabled = true` in `[review]` to scale review depth to a
@@ -2785,7 +2814,20 @@ or missing evidence. Each check is a yes/no question with an explanation, e.g.:
   mentions. A worktree-less delegation child instead persists the typed source
   `excluded_worktree_less_delegation_child`; exclusion is observable and is not
   graded as diff evidence.
-- **review** — a `changes_requested` review must carry `findings` (evidence).
+- **review** — a `changes_requested` review must carry `findings` (evidence). A
+  terminal review verdict (`approved` / `changes_requested`) must additionally
+  ACCOUNT FOR ITSELF (`review-verdict-has-evidence`): cite `findings`, name a
+  substantive `tests_run` / `changes_made` entry, or give a summary long enough
+  to state why there was nothing to run. An entry counts as substantive when it
+  is a phrase (a command with its outcome) or a single token long enough to name
+  a real path or target — so `tests_run: ["."]` is not evidence, while an honest
+  docs-only approval that explains what it read passes on its rationale.
+
+  The check measures ACCOUNTING, not truth: it cannot detect fabricated evidence,
+  and no deterministic check can. A **coordinator fan-out** — a review result
+  that declares `delegations` — is exempt, because it announces a panel that has
+  not reported yet and legitimately has nothing to record. See
+  [Fan-outs are not verdicts](#fan-outs-are-not-verdicts).
 - **ask** — the answer (`summary`/`artifact_body`) must be non-empty and
   actionable.
 - **blocked** (any action) — a `blocked` result must list actionable `needs`.

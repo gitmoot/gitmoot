@@ -198,6 +198,59 @@ func TestPipelineAutoMergeGateExecutesAfterApprovedReviewAndGreenChecks(t *testi
 	}
 }
 
+// #1685. An `orchestrate: true` review stage keeps its delegations, so a
+// coordinator fan-out can reach this gate with them intact. The gate reads
+// `decision` and then merges FOR REAL through PipelineAutoMerger, and it never
+// runs the native merge gate's review checks — so it is the only place on this
+// path that can refuse an announcement posing as an approval.
+func TestPipelineAutoMergeGateRefusesFanOutReview(t *testing.T) {
+	store, enqueue, rec, spec, run, _, now := prepareAutoMergeGate(t)
+	review := stageRow(t, store, run.ID, "review")
+	settleBoundReviewJob(t, store, review.JobID, "approved", "0123456789abcdef")
+	declareBoundReviewDelegations(t, store, review.JobID)
+	executor := &stubPipelineAutoMerger{
+		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-sha"},
+	}
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), executor)
+	if len(executor.mergeReqs) != 0 {
+		t.Fatalf("merge calls = %d, want none for a fan-out review", len(executor.mergeReqs))
+	}
+	gate := stageRow(t, store, run.ID, "merge")
+	if gate.State != StageBlocked {
+		t.Fatalf("gate state = %q, want blocked", gate.State)
+	}
+	if !strings.Contains(gate.Summary, "not a verdict") {
+		t.Fatalf("gate summary = %q, want the fan-out reason", gate.Summary)
+	}
+}
+
+// declareBoundReviewDelegations rewrites a settled review job's result so it
+// declares a panel, which is the production shape of a coordinator fan-out.
+func declareBoundReviewDelegations(t *testing.T, store *db.Store, jobID string) {
+	t.Helper()
+	ctx := context.Background()
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob(review): %v", err)
+	}
+	payload, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload(review): %v", err)
+	}
+	payload.Result.Delegations = []workflow.Delegation{
+		{ID: "lens-a", Agent: "r1", Action: "review"},
+		{ID: "lens-b", Agent: "r2", Action: "review"},
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal review payload: %v", err)
+	}
+	if err := store.UpdateJobPayload(ctx, jobID, string(encoded)); err != nil {
+		t.Fatalf("UpdateJobPayload(review): %v", err)
+	}
+}
+
 func TestPipelineAutoMergeGateRequiresEverySourceBoundReview(t *testing.T) {
 	const secondReview = `  - id: review-two
     agent: reviewer
