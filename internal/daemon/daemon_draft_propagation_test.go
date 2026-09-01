@@ -29,7 +29,11 @@ func TestDaemonReadyToMergeDraftDoesNotParkTask(t *testing.T) {
 	engine := workflow.Engine{Store: store, MergeGate: gate}
 	daemon := Daemon{Repo: repo, Store: store, Workflow: &engine}
 
-	if err := daemon.handleReadyToMergeWorkflow(ctx, pull); err != nil {
+	task, err := store.GetTask(ctx, "task-draft")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := daemon.handleReadyToMergeWorkflow(ctx, pull, task); err != nil {
 		t.Fatalf("handleReadyToMergeWorkflow returned error: %v", err)
 	}
 	assertDaemonDraftReachedGateAndTaskState(t, store, gate, workflow.TaskReadyToMerge)

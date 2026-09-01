@@ -187,16 +187,29 @@ func (e Engine) fixBranchLockOwner(ctx context.Context, payload JobPayload, exec
 }
 
 func (e Engine) blockAutoFix(ctx context.Context, ref taskRef, reason string) error {
-	if strings.TrimSpace(ref.ID) != "" {
-		if err := e.Store.AddTaskEvent(ctx, db.TaskEvent{
-			TaskID: ref.ID,
-			Kind:   "review_auto_fix_blocked",
-			Reason: reason,
-		}); err != nil {
-			return fmt.Errorf("record auto-fix block: %w", err)
-		}
-	}
-	return e.block(ctx, ref, reason)
+	return e.blockAttributed(ctx, ref, "review_auto_fix_blocked", reason, "auto-fix")
+}
+
+// blockMergeGate attributes a merge-gate block on the task itself (#1562).
+// All block writers converge on blockTask, so the event naming the owner is
+// written only after the durable blocked transition.
+func (e Engine) blockMergeGate(ctx context.Context, ref taskRef, reason string) error {
+	return e.blockAttributed(ctx, ref, "merge_gate_blocked", reason, "merge-gate")
+}
+
+// blockSynthesisGate attributes a coordinator synthesis-gate block (vote or
+// quorum unmet) on the task, mirroring blockMergeGate and blockAutoFix (#1562).
+// Generic workflow blocks use workflow_blocked at the same choke point, making
+// the latest blocking event a complete ownership record rather than a selective
+// list of callers.
+func (e Engine) blockSynthesisGate(ctx context.Context, ref taskRef, kind string, reason string) error {
+	return e.blockAttributed(ctx, ref, kind, reason, "synthesis-gate")
+}
+
+// blockAttributed routes named blockers through the shared block-first,
+// attribute-second choke point.
+func (e Engine) blockAttributed(ctx context.Context, ref taskRef, kind string, reason string, label string) error {
+	return e.blockTask(ctx, ref, kind, reason, label)
 }
 
 func (e Engine) allRequiredReviewersApproved(ctx context.Context, currentReviewer string, payload JobPayload) (bool, error) {
@@ -574,11 +587,14 @@ func (e Engine) ensureBranchLock(ctx context.Context, repo string, branch string
 	return nil
 }
 
-func (e Engine) runMergeGate(ctx context.Context, reviewer string, payload JobPayload, ref taskRef) (MergeDecision, error) {
-	return e.runMergeGateWithHumanMerge(ctx, reviewer, payload, ref, false)
+func (e Engine) runMergeGate(ctx context.Context, reviewer string, payload JobPayload, ref taskRef, expectedTaskState TaskState) (MergeDecision, error) {
+	return e.runMergeGateWithHumanMerge(ctx, reviewer, payload, ref, false, string(expectedTaskState))
 }
 
-func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string, payload JobPayload, ref taskRef, humanMergeRequested bool) (MergeDecision, error) {
+func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string, payload JobPayload, ref taskRef, humanMergeRequested bool, expectedTaskState string) (MergeDecision, error) {
+	if strings.TrimSpace(ref.ID) != "" && strings.TrimSpace(expectedTaskState) == "" {
+		return MergeDecision{}, errors.New("task-owned merge gate requires an expected task state")
+	}
 	if e.MergeGate == nil {
 		return MergeDecision{Ready: true}, e.setTaskState(ctx, ref, TaskReadyToMerge)
 	}
@@ -592,12 +608,14 @@ func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string,
 		PullRequest:             payload.PullRequest,
 		PullRequestDraft:        payload.PullRequestDraft,
 		PullRequestDraftUnknown: payload.PullRequestDraftUnknown,
+		PullRequestMerged:       payload.PullRequestMerged,
 		HeadSHA:                 payload.HeadSHA,
 		TaskID:                  payload.TaskID,
 		WorkflowID:              payload.WorkflowID,
 		Reviewer:                reviewer,
 		ReviewOptional:          !reviewRequired,
 		ReviewBlockingSeverity:  e.reviewBlockingSeverity(payload.Repo),
+		ExpectedTaskState:       expectedTaskState,
 		HumanMergeRequested:     humanMergeRequested,
 	})
 	if err != nil {
@@ -621,12 +639,11 @@ func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string,
 		if decision.Deferred {
 			// Park the task in ready_to_merge (NOT whatever state it arrived in) so
 			// the daemon's pullRequestReadyToMerge poll re-drives it every tick until
-			// the in-flight branch job settles. This matters for the no-reviewers
-			// auto-merge path: HandlePullRequestOpened reaches here with the task in
-			// pull_request_open, a state that poll does not re-evaluate — without this
-			// the deferred PR would wedge unmerged. Mirrors PolicyMergeGate.pending
-			// (which parks via a Ready:true tail); a deferred decision is never
-			// blocked, failed, or harvested.
+			// the hold settles. A task-owned retry already expected in ready_to_merge
+			// needs no write; this also preserves a retained external-merge claim.
+			if expectedTaskState == string(TaskReadyToMerge) {
+				return decision, nil
+			}
 			return decision, e.setTaskState(ctx, ref, TaskReadyToMerge)
 		}
 		reason := decision.Reason.Render()
@@ -645,7 +662,7 @@ func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string,
 		// INFRA-NOISE-FILTERED). A real store error skips the harvest and returns up.
 		// Best-effort and nil-safe: a harvest error can never affect the (already-
 		// durable) block.
-		err := e.block(ctx, ref, reason)
+		err := e.blockMergeGate(ctx, ref, reason)
 		var blocked BlockedError
 		if errors.As(err, &blocked) && decision.BlockClass == MergeBlockQuality {
 			// Only an AUTHORITATIVE template-quality block (external CI failed, a

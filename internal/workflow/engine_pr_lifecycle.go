@@ -117,7 +117,7 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 			TaskID:                  event.TaskID,
 			TaskTitle:               event.TaskTitle,
 			LeadAgent:               event.LeadAgent,
-		}, ref)
+		}, ref, TaskPullRequestOpen)
 		if err != nil {
 			return err
 		}
@@ -531,19 +531,27 @@ func (e Engine) HandlePullRequestReadyToMerge(ctx context.Context, event PullReq
 	// primary merge-gate path. Repeated polls are deduped durably by the store.
 	_, _ = RecordPullRequestWorkflowTransition(ctx, e.Store, event, PullRequestJournalReady)
 	ref := taskRefFromPullRequest(event)
+	// A local review task deliberately owns no branch so it cannot collide with the
+	// implement task that owns (repo, head branch). Carrying the PR's branch into
+	// its ref would let setTaskState's branch-reuse fallback advance that OTHER
+	// task instead of this one. Mirrors the same guard on the PR-closed path.
+	if stored, storedErr := e.Store.GetTask(ctx, event.TaskID); storedErr == nil && strings.TrimSpace(stored.Branch) == "" {
+		ref.Branch = ""
+	}
 	_, err := e.runMergeGateWithHumanMerge(ctx, "", JobPayload{
 		Repo:                    event.Repo,
 		Branch:                  event.Branch,
 		PullRequest:             event.PullRequest,
 		PullRequestDraft:        event.PullRequestDraft,
 		PullRequestDraftUnknown: event.PullRequestDraftUnknown,
+		PullRequestMerged:       event.PullRequestMerged,
 		HeadSHA:                 event.HeadSHA,
 		GoalID:                  event.GoalID,
 		TaskID:                  event.TaskID,
 		TaskTitle:               event.TaskTitle,
 		LeadAgent:               event.LeadAgent,
 		Reviewers:               compactStrings(append([]string{}, event.RequiredReviewers...)),
-	}, ref, event.HumanMergeRequested)
+	}, ref, event.HumanMergeRequested, string(TaskReadyToMerge))
 	return err
 }
 
@@ -553,12 +561,12 @@ func (e Engine) HandlePullRequestReadyToMerge(ctx context.Context, event PullReq
 // while its task and local PR mirror remain stale.
 //
 // Merged PRs resolve any of
-// pr_open/reviewing/changes_requested/ready_to_merge/awaiting_human_merge/blocked; an already-merged
-// task is accepted only to repair its stale PR mirror. A clean closed-unmerged
-// detection resolves pr_open/reviewing/changes_requested/awaiting_human_merge to
-// blocked. The daemon's
-// closed-PR reconcile pass is the sole caller for that transition; the external-
-// merge pass only records its workflow breadcrumb, avoiding double handling.
+// pr_open/reviewing/changes_requested/ready_to_merge/awaiting_human_merge/blocked;
+// an already-merged task is accepted only to repair its stale PR mirror. A
+// clean closed-unmerged detection resolves pr_open/reviewing/changes_requested/
+// awaiting_human_merge, plus branchless ready_to_merge tasks, to blocked. An
+// already-blocked branchless task is accepted to repair its stale PR mirror.
+// The daemon's closed-PR reconcile pass owns that transition.
 // Existing PR row fields (url/base/merge SHA) are preserved.
 func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullRequestEvent, merged bool) error {
 	if err := e.validate(); err != nil {
@@ -577,6 +585,7 @@ func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullReq
 	}
 	taskState := TaskState(task.State)
 	alreadyMerged := false
+	alreadyBlocked := false
 	if merged {
 		switch taskState {
 		case TaskPullRequestOpen, TaskReviewing, TaskChangesRequested, TaskReadyToMerge, TaskAwaitingHumanMerge, TaskBlocked:
@@ -590,6 +599,15 @@ func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullReq
 	} else {
 		switch taskState {
 		case TaskPullRequestOpen, TaskReviewing, TaskChangesRequested, TaskAwaitingHumanMerge:
+		case TaskReadyToMerge:
+			if strings.TrimSpace(task.Branch) != "" {
+				return nil
+			}
+		case TaskBlocked:
+			if strings.TrimSpace(task.Branch) != "" {
+				return nil
+			}
+			alreadyBlocked = true
 		default:
 			return nil
 		}
@@ -600,7 +618,7 @@ func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullReq
 		prState = "merged"
 		nextTaskState = TaskMerged
 	}
-	if !alreadyMerged {
+	if !alreadyMerged && !alreadyBlocked {
 		stateRef := ref
 		if strings.TrimSpace(task.Branch) == "" {
 			// Legacy/local review-pr tasks intentionally have no branch because the
@@ -615,7 +633,7 @@ func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullReq
 			}
 		} else {
 			changed, observedState, _, err := e.Store.TransitionTaskStateWithEventObserved(ctx, task.ID,
-				[]string{string(TaskPullRequestOpen), string(TaskReviewing), string(TaskChangesRequested), string(TaskAwaitingHumanMerge)},
+				[]string{string(TaskPullRequestOpen), string(TaskReviewing), string(TaskChangesRequested), string(TaskReadyToMerge), string(TaskAwaitingHumanMerge)},
 				string(TaskBlocked), "pr_closed_unmerged", "pull request closed without merging")
 			if err != nil {
 				return err
