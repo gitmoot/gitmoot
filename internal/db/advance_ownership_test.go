@@ -2,7 +2,9 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -194,7 +196,6 @@ func TestOwnerScopedDeletesSpareALiveAdvanceLease(t *testing.T) {
 			}, time.Now().UTC()); err != nil || !owned {
 				t.Fatalf("seed ordinary lock owned=%v err=%v", owned, err)
 			}
-
 			tc.delete(t, store, "j-swept")
 
 			if _, err := store.GetResourceLock(ctx, SupersedeAdvanceLockKeyPrefix+"j-swept"); err != nil {
@@ -221,5 +222,59 @@ func TestOwnerScopedDeletesStillSweepAnAbandonedLease(t *testing.T) {
 	}
 	if _, err := store.GetResourceLock(ctx, SupersedeAdvanceLockKeyPrefix+"j-dead"); err == nil {
 		t.Fatal("an abandoned lease survived owner cleanup; a crashed pass would wedge retries")
+	}
+}
+
+// TestUpsertTaskWithJobEventUnlessStatesRollsBackTheTaskWhenTheEventFails proves the
+// round-open pair really is ONE transaction, which no interleaving test can show: an
+// interleaving that fails the first write proves nothing about the second.
+//
+// The event insert is broken from a SECOND connection by renaming job_events away, so
+// the task upsert has already executed inside the transaction when the append fails.
+// If the two writes were sequential, the task would be left in awaiting_human with no
+// round record — the exact stranding the atomicity exists to prevent.
+func TestUpsertTaskWithJobEventUnlessStatesRollsBackTheTaskWhenTheEventFails(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "gitmoot.db")
+	store, err := openRealTestStore(t, path)
+	if err != nil {
+		t.Fatalf("openRealTestStore: %v", err)
+	}
+	if err := store.UpsertTask(ctx, Task{ID: "task-round", RepoFullName: "o/r", Branch: "b", State: "implementing"}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	if err := store.CreateJob(ctx, Job{ID: "coord", Agent: "coord", Type: "ask", State: "succeeded", Payload: `{"repo":"o/r"}`}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open second connection: %v", err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	if _, err := raw.ExecContext(ctx, `ALTER TABLE job_events RENAME TO job_events_hidden`); err != nil {
+		t.Fatalf("hide job_events: %v", err)
+	}
+
+	written, err := store.UpsertTaskWithJobEventUnlessStates(ctx,
+		Task{ID: "task-round", RepoFullName: "o/r", Branch: "b", State: "awaiting_human"},
+		[]string{"dismissed", "superseded", "stranded", "merged"},
+		JobEvent{JobID: "coord", Kind: "delegation_escalation_requested", Message: "round"})
+	if err == nil {
+		t.Fatal("the round-open reported success while its event insert was impossible")
+	}
+	if written {
+		t.Fatal("the round-open reported a committed task write")
+	}
+
+	if _, err := raw.ExecContext(ctx, `ALTER TABLE job_events_hidden RENAME TO job_events`); err != nil {
+		t.Fatalf("restore job_events: %v", err)
+	}
+	task, err := store.GetTask(ctx, "task-round")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if task.State != "implementing" {
+		t.Fatalf("task state = %q, want implementing: the task moved although its round record never landed", task.State)
 	}
 }

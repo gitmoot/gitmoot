@@ -150,6 +150,31 @@ func (s *Store) CreateJobWithEventIfAdvanceOwned(ctx context.Context, job Job, o
 	return tx.Commit()
 }
 
+// AddJobEventIfAdvanceOwned appends a job event only while the advance that asked
+// for it still owns the job, asserted in the append's own transaction (#1673). It is
+// the taskless counterpart of the round-open write: a coordinator with no task still
+// owes a durable round record, and a superseded pass still must not write one.
+func (s *Store) AddJobEventIfAdvanceOwned(ctx context.Context, event JobEvent, own AdvanceOwnership, now time.Time) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	live, err := advanceOwnershipLiveTx(ctx, tx, own, now)
+	if err != nil {
+		return false, err
+	}
+	if !live {
+		return false, fmt.Errorf("%w: event %q for job %s at generation %d",
+			ErrAdvanceOwnershipLost, event.Kind, own.OwnerJobID, own.AtGeneration)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`,
+		event.JobID, event.Kind, event.Message); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
 // CreateExternallyDrivenJobWithEvent creates a session job (#657) whose execution
 // happens OUTSIDE the engine: it sets externally_driven = 1 so the daemon's
 // queued selector never claims it and the engine lease reaper skips it. It

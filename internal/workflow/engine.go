@@ -653,16 +653,7 @@ func PersistTaskState(ctx context.Context, store *db.Store, task db.Task, state 
 // caller, which keeps that path byte-identical.
 func persistTaskStateOwned(ctx context.Context, store *db.Store, task db.Task, state TaskState, own *db.AdvanceOwnership) (bool, error) {
 	task.State = string(state)
-	forbidden := make([]string, 0, 4)
-	for _, disposed := range []TaskState{TaskDismissed, TaskSuperseded, TaskStranded} {
-		if disposed != state {
-			forbidden = append(forbidden, string(disposed))
-		}
-	}
-	mergedGuarded := IsMergedWorkRegressionTarget(string(state))
-	if mergedGuarded {
-		forbidden = append(forbidden, string(TaskMerged))
-	}
+	forbidden, mergedGuarded := taskStateWriteExclusions(state)
 	var (
 		written bool
 		err     error
@@ -678,14 +669,35 @@ func persistTaskStateOwned(ctx context.Context, store *db.Store, task db.Task, s
 	if written {
 		return true, nil
 	}
-	// The write lost. Classify against the state that actually won, because the two
-	// families answer differently and only the row can say which one refused.
+	return false, classifyRefusedTaskStateWrite(ctx, store, task, state, mergedGuarded)
+}
+
+// taskStateWriteExclusions is the shared exclusion set every automated task-state
+// write carries: never overwrite a disposed row, and never regress landed work.
+func taskStateWriteExclusions(state TaskState) (forbidden []string, mergedGuarded bool) {
+	forbidden = make([]string, 0, 4)
+	for _, disposed := range []TaskState{TaskDismissed, TaskSuperseded, TaskStranded} {
+		if disposed != state {
+			forbidden = append(forbidden, string(disposed))
+		}
+	}
+	mergedGuarded = IsMergedWorkRegressionTarget(string(state))
+	if mergedGuarded {
+		forbidden = append(forbidden, string(TaskMerged))
+	}
+	return forbidden, mergedGuarded
+}
+
+// classifyRefusedTaskStateWrite reads the state that actually WON and answers the
+// two families differently: a disposed row is a hard error, landed work is a silent
+// refusal with a durable trace. Only the row can say which one refused.
+func classifyRefusedTaskStateWrite(ctx context.Context, store *db.Store, task db.Task, state TaskState, mergedGuarded bool) error {
 	existing, getErr := store.GetTask(ctx, task.ID)
 	if getErr != nil {
-		return false, getErr
+		return getErr
 	}
 	if IsDisposedTaskState(existing.State) && existing.State != string(state) {
-		return false, fmt.Errorf("task %s is %s; automated advancement cannot move it to %s", task.ID, existing.State, state)
+		return fmt.Errorf("task %s is %s; automated advancement cannot move it to %s", task.ID, existing.State, state)
 	}
 	if mergedGuarded {
 		_ = store.AddTaskEvent(ctx, db.TaskEvent{
@@ -695,7 +707,65 @@ func persistTaskStateOwned(ctx context.Context, store *db.Store, task db.Task, s
 				TaskMerged, state),
 		})
 	}
-	return false, nil
+	return nil
+}
+
+// openHumanRound is the ONE durable operation that opens a human round: the task
+// reaches awaiting_human and the round-open event lands, together or not at all,
+// and under an anchored advance both are bound to live ownership (#1673).
+//
+// Every announcement — notifier, event sink, chat link — MUST follow a successful
+// return, never precede it: that ordering is what stops a superseded generation from
+// calling a human about a lifecycle that has moved.
+func (e Engine) openHumanRound(ctx context.Context, ref taskRef, jobID string, event db.JobEvent) error {
+	task, err := e.resolveTaskState(ctx, ref, TaskAwaitingHuman)
+	if err != nil {
+		return err
+	}
+	event.JobID = jobID
+	if strings.TrimSpace(task.ID) == "" {
+		// No task to move (a taskless root): the round record is still owed, and it is
+		// still ownership-bound.
+		if own := e.advanceOwnershipBinding(); own != nil {
+			if _, err := e.Store.AddJobEventIfAdvanceOwned(ctx, event, *own, time.Now().UTC()); err != nil {
+				return e.classifyAdvanceOwnershipLoss(err, "human-round-commit")
+			}
+			return nil
+		}
+		return e.Store.AddJobEvent(ctx, event)
+	}
+	task.State = string(TaskAwaitingHuman)
+	forbidden, mergedGuarded := taskStateWriteExclusions(TaskAwaitingHuman)
+	if taskStatePreWriteHook != nil {
+		taskStatePreWriteHook(ctx, task.ID)
+	}
+	var written bool
+	if own := e.advanceOwnershipBinding(); own != nil {
+		written, err = e.Store.UpsertTaskWithJobEventUnlessStatesIfAdvanceOwned(ctx, task, forbidden, event, *own, time.Now().UTC())
+	} else {
+		written, err = e.Store.UpsertTaskWithJobEventUnlessStates(ctx, task, forbidden, event)
+	}
+	if err != nil {
+		return e.classifyAdvanceOwnershipLoss(err, "human-round-commit")
+	}
+	if written {
+		return nil
+	}
+	return classifyRefusedTaskStateWrite(ctx, e.Store, task, TaskAwaitingHuman, mergedGuarded)
+}
+
+// classifyAdvanceOwnershipLoss turns a refused ownership-bound write into the
+// rolled-back class the recovery already understands: the debt stays outstanding and
+// the next poll re-drives it. Any other error passes through untouched.
+func (e Engine) classifyAdvanceOwnershipLoss(err error, barrier string) error {
+	if err == nil || !errors.Is(err, db.ErrAdvanceOwnershipLost) || e.supersedeAdvance == nil {
+		return err
+	}
+	return supersedeAdvanceRolledBackError{
+		JobID:      e.supersedeAdvance.JobID,
+		Generation: e.supersedeAdvance.Generation,
+		Barrier:    barrier,
+	}
 }
 
 func (e Engine) jobID(request JobRequest) string {

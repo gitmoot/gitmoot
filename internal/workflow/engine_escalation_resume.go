@@ -86,10 +86,6 @@ func (e Engine) pauseAwaitingHuman(ctx context.Context, parentJob db.Job, parent
 		return awaitErr
 	}
 
-	if err := e.setTaskState(ctx, ref, TaskAwaitingHuman); err != nil {
-		return err
-	}
-
 	record := EscalationRecord{
 		DelegationID: d.ID,
 		ChildJobID:   child.ID,
@@ -102,8 +98,12 @@ func (e Engine) pauseAwaitingHuman(ctx context.Context, parentJob db.Job, parent
 	if marshalErr == nil {
 		message = string(encoded)
 	}
-	if err := e.Store.AddJobEvent(ctx, db.JobEvent{
-		JobID:   parentJob.ID,
+	// ONE durable operation: the pause and the round-open event commit together, and
+	// under a supersession advance both are bound to live ownership. Splitting them
+	// left two defects — a crash stranded awaiting_human with no open round, and a
+	// pass whose lease had lapsed could still record and announce a round for a
+	// lifecycle a retry had already moved (#1673).
+	if err := e.openHumanRound(ctx, ref, parentJob.ID, db.JobEvent{
 		Kind:    escalationRequestedEvent,
 		Message: message,
 	}); err != nil {
@@ -227,14 +227,13 @@ func (e Engine) pauseAwaitingHumanAnswer(ctx context.Context, job db.Job, payloa
 		return false, nil
 	}
 
-	// Open a FRESH ask round: pause the (coordinator's) task, record the requested
-	// event with the questions on the target, notify best-effort, and emit
-	// job.needs_attention once. All keyed on targetID/targetRef so a child's ask
+	// Open a FRESH ask round: pause the (coordinator's) task and record the requested
+	// event with the questions AS ONE DURABLE OPERATION, then notify best-effort and
+	// emit job.needs_attention once. All keyed on targetID/targetRef so a child's ask
 	// routes to its coordinator.
-	if err := e.setTaskState(ctx, targetRef, TaskAwaitingHuman); err != nil {
-		return false, err
-	}
-
+	//
+	// Same shape and same fix as pauseAwaitingHuman above (#1673): the two writes are
+	// atomic, and announcements strictly follow their commit.
 	questions := payload.Result.HumanQuestions
 	record := EscalationRecord{
 		Reason:    fmt.Sprintf("%d human question(s) awaiting an answer", len(questions)),
@@ -248,8 +247,7 @@ func (e Engine) pauseAwaitingHumanAnswer(ctx context.Context, job db.Job, payloa
 	if marshalErr == nil {
 		message = string(encoded)
 	}
-	if err := e.Store.AddJobEvent(ctx, db.JobEvent{
-		JobID:   targetID,
+	if err := e.openHumanRound(ctx, targetRef, targetID, db.JobEvent{
 		Kind:    escalationRequestedEvent,
 		Message: message,
 	}); err != nil {

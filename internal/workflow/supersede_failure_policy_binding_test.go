@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -231,5 +232,319 @@ func TestFailurePolicyEffectsStillCommitUnderALiveLease(t *testing.T) {
 				t.Fatal("the completed advance kept its lease")
 			}
 		})
+	}
+}
+
+// TestEscalateHumanRoundOpensAtomically covers the CRASH-AFTER-TRANSITION ordering:
+// the two writes that open a human round must be one durable operation, or a crash
+// between them strands a task in awaiting_human that no open round explains — and
+// nothing re-opens it, because the round guard reads the event, not the task.
+//
+// The crash is simulated the only way a test can: the seam fires between the
+// resolution and the write, and the ROUND-OPEN EVENT COUNT is compared against the
+// TASK STATE. Either both moved or neither did.
+//
+// MUTATION PROOF: write the task and the event in two statements (route through
+// UpsertTaskUnlessStatesIfAdvanceOwned + AddJobEvent) and inject a failure between
+// them; the task strands in awaiting_human with zero round events.
+func TestEscalateHumanRoundOpensAtomically(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	notifier := &countingEscalationNotifier{}
+	engine.EscalationNotifier = notifier
+	child, observed := seedFailurePolicyTree(t, store, engine, "escalate_human")
+
+	// Force the round-open write to be REFUSED at the store, which is what a crashed
+	// or superseded write looks like from the caller's side: the transaction does not
+	// commit. Ownership is dropped in the seam, so the bound write refuses.
+	fired := false
+	taskStatePreWriteHook = func(hookCtx context.Context, taskID string) {
+		if fired {
+			return
+		}
+		fired = true
+		lock, err := store.GetResourceLock(hookCtx, db.SupersedeAdvanceLockKeyPrefix+child)
+		if err != nil {
+			t.Errorf("GetResourceLock: %v", err)
+			return
+		}
+		if released, err := store.ReleaseResourceLock(hookCtx, lock.ResourceKey, child, lock.OwnerToken); err != nil || !released {
+			t.Errorf("drop ownership released=%v err=%v", released, err)
+		}
+	}
+	t.Cleanup(func() { taskStatePreWriteHook = nil })
+
+	if _, err := engine.advanceSupersededChildAtGeneration(ctx, child, observed.LifecycleGeneration); err != nil && !isDelegationPolicyOutcome(err) {
+		t.Fatalf("advanceSupersededChildAtGeneration: %v", err)
+	}
+	if !fired {
+		t.Fatal("the round-open seam never fired; the ordering under test did not happen")
+	}
+
+	task, err := store.GetTask(ctx, "task-7")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	rounds := countWorkflowJobEvents(t, store, "parent-job", escalationRequestedEvent)
+	paused := task.State == string(TaskAwaitingHuman)
+	if paused != (rounds > 0) {
+		t.Fatalf("task awaiting_human=%v but round events=%d: the two halves of a round-open are not atomic", paused, rounds)
+	}
+	if paused {
+		t.Fatal("a write refused for lost ownership still paused the parent")
+	}
+	// ZERO announcements: every announcement follows the commit, so a refused
+	// round-open announces nothing.
+	if notifier.calls != 0 {
+		t.Fatalf("escalation notifications = %d, want 0: an unopened round called a human", notifier.calls)
+	}
+}
+
+// TestEscalateHumanRoundOpenIsAtomicOnTheOrdinaryPath is the same invariant with NO
+// supersession anchor: the atomicity is a property of the round-open itself, not of
+// the ownership binding, so an ordinary pause must also never strand one half.
+func TestEscalateHumanRoundOpenIsAtomicOnTheOrdinaryPath(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	notifier := &countingEscalationNotifier{}
+	engine.EscalationNotifier = notifier
+	child, _ := seedFailurePolicyTree(t, store, engine, "escalate_human")
+
+	// The ordinary production entry with no anchor at all: advancing the settled
+	// child is what fires the coordinator's failure policy.
+	if err := engine.AdvanceJob(ctx, child); err != nil && !isDelegationPolicyOutcome(err) {
+		t.Fatalf("AdvanceJob: %v", err)
+	}
+
+	task, err := store.GetTask(ctx, "task-7")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	rounds := countWorkflowJobEvents(t, store, "parent-job", escalationRequestedEvent)
+	if task.State != string(TaskAwaitingHuman) {
+		t.Fatalf("parent task state = %q, want awaiting_human: a legitimate ordinary pause was refused", task.State)
+	}
+	if rounds != 1 {
+		t.Fatalf("%s events = %d, want exactly 1", escalationRequestedEvent, rounds)
+	}
+	if notifier.calls != 1 {
+		t.Fatalf("escalation notifications = %d, want 1", notifier.calls)
+	}
+}
+
+// TestEscalateHumanDoesNotAnnounceAfterResumingSuperseded covers the
+// RESUME-AFTER-SUPERSEDE ordering: the pass stalls past its lease, a retry commits
+// generation N+1, and only THEN does the old pass reach the round-open. Nothing it
+// writes or announces may survive, and the retried lifecycle must be left intact.
+//
+// MUTATION PROOF: drop the ownership assertion from the round-open write and the
+// obsolete generation records a round and calls a human.
+func TestEscalateHumanDoesNotAnnounceAfterResumingSuperseded(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	notifier := &countingEscalationNotifier{}
+	engine.EscalationNotifier = notifier
+	child, observed := seedFailurePolicyTree(t, store, engine, "escalate_human")
+
+	retryWon := false
+	taskStatePreWriteHook = expireLeaseAndWinRetry(t, store, child, &retryWon)
+	t.Cleanup(func() { taskStatePreWriteHook = nil })
+
+	if _, err := engine.advanceSupersededChildAtGeneration(ctx, child, observed.LifecycleGeneration); err != nil && !isDelegationPolicyOutcome(err) {
+		t.Fatalf("advanceSupersededChildAtGeneration: %v", err)
+	}
+	if !retryWon {
+		t.Fatal("the retry never committed; the ordering under test did not happen")
+	}
+	task, err := store.GetTask(ctx, "task-7")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if task.State == string(TaskAwaitingHuman) {
+		t.Fatal("a superseded generation paused the parent for a human")
+	}
+	if got := countWorkflowJobEvents(t, store, "parent-job", escalationRequestedEvent); got != 0 {
+		t.Fatalf("%s events = %d, want 0: an obsolete generation opened a human round", escalationRequestedEvent, got)
+	}
+	if notifier.calls != 0 {
+		t.Fatalf("escalation notifications = %d, want 0: an obsolete generation announced", notifier.calls)
+	}
+	// The retry's lifecycle is untouched by the loser.
+	if state := mustJob(t, store, child).State; state != string(JobQueued) {
+		t.Fatalf("child state = %q, want queued: the retry's re-queue was disturbed", state)
+	}
+}
+
+// TestAskGateRoundOpensAtomically covers the SIBLING round-open the class audit
+// found: the ask gate opens a human round with the same two writes and the same
+// announcements, so it gets the same atomic, ownership-bound operation. Without this
+// the fix would close one site and leave its twin reachable.
+func TestAskGateRoundOpensAtomically(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	notifier := &countingEscalationNotifier{}
+	engine.EscalationNotifier = notifier
+	seedAgent(t, store, "coord", []string{"ask"}, "gitmoot/gitmoot")
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-ask", RepoFullName: "gitmoot/gitmoot", Branch: "task-ask", GoalID: "g1",
+		Title: "ask", State: string(TaskImplementing),
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	insertCompletedJob(t, store, db.Job{ID: "ask-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-ask", TaskID: "task-ask", LeadAgent: "coord",
+		Result: &AgentResult{
+			Decision:       "blocked",
+			Summary:        "needs a human",
+			HumanQuestions: []HumanQuestion{{ID: "q1", Prompt: "which branch?"}},
+		},
+	})
+
+	paused, err := engine.pauseAwaitingHumanAnswer(ctx, mustJob(t, store, "ask-job"), mustPayload(t, store, "ask-job"), taskRef{ID: "task-ask", Repo: "gitmoot/gitmoot", Branch: "task-ask"})
+	if err != nil {
+		t.Fatalf("pauseAwaitingHumanAnswer: %v", err)
+	}
+	if !paused {
+		t.Fatal("the ask gate did not pause; the success path regressed")
+	}
+	task, err := store.GetTask(ctx, "task-ask")
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	rounds := countWorkflowJobEvents(t, store, "ask-job", escalationRequestedEvent)
+	if task.State != string(TaskAwaitingHuman) || rounds != 1 {
+		t.Fatalf("ask round: task=%q rounds=%d, want awaiting_human and exactly 1", task.State, rounds)
+	}
+	if notifier.calls != 1 {
+		t.Fatalf("escalation notifications = %d, want 1", notifier.calls)
+	}
+}
+
+func mustPayload(t *testing.T, store *db.Store, jobID string) JobPayload {
+	t.Helper()
+	payload, err := unmarshalPayload(mustJob(t, store, jobID).Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(%s): %v", jobID, err)
+	}
+	return payload
+}
+
+// TestAnchoredTaskStateWriteIsRefusedWhenOwnershipIsLost pins the SHARED CHOKEPOINT
+// every other anchored task-state move funnels through. Enumerated call sites
+// reachable from an anchored AdvanceJob: the merge gate's ready_to_merge and merged
+// writes and the awaiting_human_merge park (engine_routing_merge.go), the reviewing
+// and pull_request_open writes (engine_pr_lifecycle.go), the changes_requested write
+// (engine_run_budgets.go), and the escalation-resolution planned writes
+// (engine_escalation_resume.go). All of them reach the store through
+// setTaskState → persistTaskStateOwned, so the binding is proven once, here, rather
+// than by building a fixture per site.
+//
+// MUTATION PROOF: route persistTaskStateOwned through the unbound
+// UpsertTaskUnlessStates and this write lands for a lifecycle that has moved.
+func TestAnchoredTaskStateWriteIsRefusedWhenOwnershipIsLost(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	const child = "workflow-anchored-taskwrite"
+	observed := supersedeAdvanceOwnershipChild(t, store, child)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-7", RepoFullName: "gitmoot/gitmoot", Branch: "task-7", GoalID: "g1",
+		Title: "impl", State: string(TaskImplementing),
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	ownAdvance(t, store, child, "token-live", time.Now().UTC().Add(SupersedeAdvanceLeaseTTL))
+
+	anchored := engine
+	anchored.supersedeAdvance = &supersedeAdvanceAnchor{
+		JobID:      child,
+		Generation: observed.LifecycleGeneration,
+		LockKey:    db.SupersedeAdvanceLockKeyPrefix + child,
+		Token:      "token-live",
+	}
+	ref := taskRef{ID: "task-7", Repo: "gitmoot/gitmoot", Branch: "task-7"}
+
+	// SUCCESS CONTROL FIRST: a held lease must not block a legitimate move.
+	if err := anchored.setTaskState(ctx, ref, TaskReviewing); err != nil {
+		t.Fatalf("anchored task-state write under a held lease: %v", err)
+	}
+	if task, err := store.GetTask(ctx, "task-7"); err != nil {
+		t.Fatalf("GetTask: %v", err)
+	} else if task.State != string(TaskReviewing) {
+		t.Fatalf("task state = %q, want reviewing: the binding rejected valid work", task.State)
+	}
+
+	// Ownership is lost in the write's own pre-write window.
+	fired := false
+	taskStatePreWriteHook = func(hookCtx context.Context, taskID string) {
+		if fired {
+			return
+		}
+		fired = true
+		if released, err := store.ReleaseResourceLock(hookCtx, db.SupersedeAdvanceLockKeyPrefix+child, child, "token-live"); err != nil || !released {
+			t.Errorf("drop ownership released=%v err=%v", released, err)
+		}
+	}
+	t.Cleanup(func() { taskStatePreWriteHook = nil })
+
+	err := anchored.setTaskState(ctx, ref, TaskReadyToMerge)
+	var rolled supersedeAdvanceRolledBackError
+	if !errors.As(err, &rolled) {
+		t.Fatalf("setTaskState error = %v, want a rolled-back advance", err)
+	}
+	if task, err := store.GetTask(ctx, "task-7"); err != nil {
+		t.Fatalf("GetTask: %v", err)
+	} else if task.State != string(TaskReviewing) {
+		t.Fatalf("task state = %q, want reviewing: a pass that lost ownership still moved the task", task.State)
+	}
+}
+
+// TestTasklessRoundOpenIsRefusedWhenOwnershipIsLost covers the coordinator with NO
+// task: it still owes a durable round record, so that append is ownership-bound too.
+// Without this the taskless branch of openHumanRound is an unguarded hole.
+//
+// MUTATION PROOF: route the taskless branch through the plain AddJobEvent and the
+// obsolete generation records a round.
+func TestTasklessRoundOpenIsRefusedWhenOwnershipIsLost(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	const child = "workflow-taskless-round"
+	observed := supersedeAdvanceOwnershipChild(t, store, child)
+
+	anchored := engine
+	anchored.supersedeAdvance = &supersedeAdvanceAnchor{
+		JobID:      child,
+		Generation: observed.LifecycleGeneration,
+		LockKey:    db.SupersedeAdvanceLockKeyPrefix + child,
+		Token:      "token-gone",
+	}
+	// No taskRef at all: the round-open has only the event to write.
+	err := anchored.openHumanRound(ctx, taskRef{}, child, db.JobEvent{
+		Kind:    escalationRequestedEvent,
+		Message: "obsolete round",
+	})
+	var rolled supersedeAdvanceRolledBackError
+	if !errors.As(err, &rolled) {
+		t.Fatalf("openHumanRound error = %v, want a rolled-back advance", err)
+	}
+	if got := countWorkflowJobEvents(t, store, child, escalationRequestedEvent); got != 0 {
+		t.Fatalf("%s events = %d, want 0: a taskless round-open landed without ownership", escalationRequestedEvent, got)
+	}
+
+	// SUCCESS CONTROL: with the lease held the same taskless round-open commits.
+	ownAdvance(t, store, child, "token-gone", time.Now().UTC().Add(SupersedeAdvanceLeaseTTL))
+	if err := anchored.openHumanRound(ctx, taskRef{}, child, db.JobEvent{
+		Kind:    escalationRequestedEvent,
+		Message: "owned round",
+	}); err != nil {
+		t.Fatalf("taskless round-open under a held lease: %v", err)
+	}
+	if got := countWorkflowJobEvents(t, store, child, escalationRequestedEvent); got != 1 {
+		t.Fatalf("%s events = %d, want 1", escalationRequestedEvent, got)
 	}
 }

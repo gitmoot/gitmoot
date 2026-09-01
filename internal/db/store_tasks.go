@@ -254,6 +254,57 @@ func (s *Store) UpsertTaskUnlessStatesIfAdvanceOwned(ctx context.Context, task T
 	return written, tx.Commit()
 }
 
+// UpsertTaskWithJobEventUnlessStates moves a task and appends a job event in ONE
+// transaction. Opening a human round is exactly this pair — the task reaches
+// awaiting_human and the round-open event records it — and splitting them leaves two
+// bad outcomes: a crash between the writes strands a task in awaiting_human with no
+// open round, and under a supersession recovery the second write can land after
+// ownership was lost (#1673).
+func (s *Store) UpsertTaskWithJobEventUnlessStates(ctx context.Context, task Task, forbiddenStates []string, event JobEvent) (bool, error) {
+	return s.upsertTaskWithJobEventUnlessStates(ctx, task, forbiddenStates, event, nil, time.Time{})
+}
+
+// UpsertTaskWithJobEventUnlessStatesIfAdvanceOwned is the same single transaction
+// with live advance ownership asserted inside it, so the whole round-open either
+// commits while this pass still owns the advance or does not happen at all — which
+// is also what makes the announcements that follow it safe.
+func (s *Store) UpsertTaskWithJobEventUnlessStatesIfAdvanceOwned(ctx context.Context, task Task, forbiddenStates []string, event JobEvent, own AdvanceOwnership, now time.Time) (bool, error) {
+	return s.upsertTaskWithJobEventUnlessStates(ctx, task, forbiddenStates, event, &own, now)
+}
+
+func (s *Store) upsertTaskWithJobEventUnlessStates(ctx context.Context, task Task, forbiddenStates []string, event JobEvent, own *AdvanceOwnership, now time.Time) (bool, error) {
+	if strings.TrimSpace(event.JobID) == "" {
+		return false, errors.New("job event job id is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if own != nil {
+		live, ownErr := advanceOwnershipLiveTx(ctx, tx, *own, now)
+		if ownErr != nil {
+			return false, ownErr
+		}
+		if !live {
+			return false, fmt.Errorf("%w: task %s round-open for job %s at generation %d",
+				ErrAdvanceOwnershipLost, task.ID, own.OwnerJobID, own.AtGeneration)
+		}
+	}
+	written, err := s.upsertTaskUnlessStates(ctx, tx, task, forbiddenStates)
+	if err != nil {
+		return false, err
+	}
+	// The event is written even when the task write was REFUSED: a refusal means the
+	// row is merged or disposed and the caller still owes its coordinator the round
+	// record. What must never happen is one of the two landing alone.
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`,
+		event.JobID, event.Kind, event.Message); err != nil {
+		return false, err
+	}
+	return written, tx.Commit()
+}
+
 func (s *Store) upsertTaskUnlessStates(ctx context.Context, execer sqlExecer, task Task, forbiddenStates []string) (bool, error) {
 	if len(forbiddenStates) == 0 {
 		return false, errors.New("at least one forbidden task state is required")

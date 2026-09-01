@@ -87,6 +87,10 @@ func TestStoreOpenPolicy(t *testing.T) {
 		"TestWorkflowMetaTextMigrations":                                         true,
 	}
 	realPathTests["TestMigrateExecBackendAttemptsLifecycleGenerationNotNullPreservesRows"] = true
+	// #1673: proves the round-open pair is ONE transaction by breaking the event
+	// insert from a SECOND connection to the same file, which a cached shared-memory
+	// store cannot express.
+	realPathTests["TestUpsertTaskWithJobEventUnlessStatesRollsBackTheTaskWhenTheEventFails"] = true
 	directOpenFunctions := map[string]bool{
 		"ensureCachedMigratedTestTemplateOnce": true,
 		"openRealTestStore":                    true,
