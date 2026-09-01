@@ -144,18 +144,24 @@ func (e Engine) finalizeTimedOutJob(ctx context.Context, jobID string, reason st
 	if strings.TrimSpace(payload.ParentJobID) == "" {
 		return true, nil
 	}
-	// The parent advance settles the coordinator ON THIS CHILD'S RESULT, so it is
-	// re-checked rather than assumed: a retry queued between the payload write and
-	// here owns the row now, and advancing its parent on the superseded run's
-	// verdict is the same defect one step later.
+	// The parent advance settles the coordinator ON THIS CHILD'S RESULT. Under an
+	// anchor it goes through the bracketed contract, because a re-read here would
+	// only narrow the window: AdvanceJob is multi-statement, so a retry can claim
+	// the row after the check or after AdvanceJob's own first read and have its
+	// coordinator mutated from a superseded verdict. A refused bracket returns
+	// false so the caller leaves the debt outstanding for a re-drive.
 	if atGeneration != nil {
-		current, err := e.Store.GetJob(ctx, jobID)
+		advanced, err := e.advanceSupersededChildAtGeneration(ctx, jobID, *atGeneration)
 		if err != nil {
-			return false, err
+			return advanced, err
 		}
-		if current.LifecycleGeneration != *atGeneration || current.State != job.State {
+		if !advanced {
 			return false, nil
 		}
+		if err := e.Store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_completed", Message: "workflow advancement completed"}); err != nil {
+			return true, err
+		}
+		return true, nil
 	}
 	if err := e.AdvanceJob(ctx, jobID); err != nil {
 		return true, err

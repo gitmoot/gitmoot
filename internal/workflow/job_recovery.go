@@ -411,34 +411,102 @@ func releaseAbortedJobResources(ctx context.Context, store *db.Store, job db.Job
 }
 
 // releaseSupersededJobResourcesAtGeneration is releaseAbortedJobResources for a
-// caller that decided one POLL AGO. The lock release is conditional on the job
-// still being the settled lifecycle named by atGeneration, evaluated inside the
-// store's write transaction, so generation N's cleanup can never delete the locks
+// caller that decided one POLL AGO. EVERY step is conditional on the job still
+// being the settled lifecycle named by atGeneration, evaluated inside the write
+// statement that performs it, so generation N's cleanup can never touch what
 // generation N+1 acquired while this pass was mid-flight.
 //
-// A lost guard skips the rest too: the branch, task-lane and worktree cleanups all
-// belong to the abort of THAT run, and the row now belongs to another one.
-func releaseSupersededJobResourcesAtGeneration(ctx context.Context, store *db.Store, job db.Job, cause abortCause, atGeneration int64) {
+// It RETURNS its error. The previous version swallowed one, and a swallowed error
+// let the caller record the debt paid while the cleanup had not run — the debt was
+// then unrecoverable. A caller that cannot prove the cleanup ran must leave the
+// marker outstanding.
+//
+// guarded false means the row moved: the branch, task-lane and worktree cleanups
+// all belong to the abort of THAT run, and another run owns the row now.
+func releaseSupersededJobResourcesAtGeneration(ctx context.Context, store *db.Store, job db.Job, cause abortCause, atGeneration int64) (bool, error) {
 	_, guarded, err := store.ReleaseSupersededJobResourceLocksAtGeneration(ctx, job.ID, atGeneration)
 	if err != nil || !guarded {
-		return
+		return false, err
 	}
-	releaseAbortedJobSideResources(ctx, store, job, cause)
+	if supersedeDebtInterleaveHook != nil {
+		supersedeDebtInterleaveHook(ctx, supersedeDebtStageAfterResourceCommit)
+	}
+	payload, perr := unmarshalPayload(job.Payload)
+	if perr != nil {
+		return true, nil
+	}
+	// An implement delegation leg that dies here never runs the engine's terminal
+	// cleanupImplementDelegationWorktree, so its per-delegation branch lock would
+	// leak (#617). The unguarded force-release deletes by (repo, branch) alone, so a
+	// retry that re-queued and re-acquired the SAME delegation lane lost it to this
+	// pass; the generation rides in the DELETE's own predicate instead.
+	if isImplementDelegationWorktree(job.Type, payload) {
+		repo := strings.TrimSpace(payload.Repo)
+		branch := strings.TrimSpace(payload.Branch)
+		if repo != "" && branch != "" {
+			released, rerr := store.ForceReleaseDelegationBranchLockAtJobGeneration(ctx, repo, branch, job.ID, atGeneration, db.BranchLockEvent{
+				Kind:    "released",
+				Message: "released after delegation leg reached a terminal state (#617)",
+			})
+			if rerr != nil {
+				return true, rerr
+			}
+			if released {
+				if _, eerr := store.AddJobEventAtGeneration(ctx, db.JobEvent{
+					JobID:   job.ID,
+					Kind:    "delegation_branch_lock_released",
+					Message: fmt.Sprintf("released delegation branch lock %s on %s (#617)", branch, cause.verb),
+				}, atGeneration); eerr != nil {
+					return true, eerr
+				}
+			}
+		}
+	}
+	if supersedeDebtInterleaveHook != nil {
+		supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeTaskLane)
+	}
+	// The task lane's release is already fail-closed: ReleaseBranchLockIfInactive-
+	// WithEvent refuses while any non-terminal job holds the branch, and a retry is
+	// non-terminal by definition. Left exactly as it was.
+	if job.Type == "implement" && strings.TrimSpace(payload.TaskID) != "" && strings.TrimSpace(payload.DelegationID) == "" {
+		repo := strings.TrimSpace(payload.Repo)
+		branch := strings.TrimSpace(payload.Branch)
+		if repo != "" && branch != "" {
+			if lock, lerr := store.GetBranchLock(ctx, repo, branch); lerr == nil {
+				if released, rerr := store.ReleaseBranchLockIfInactiveWithEvent(ctx, lock, strings.TrimSpace(payload.TaskID), time.Time{}, db.BranchLockEvent{
+					Kind: "released", Message: fmt.Sprintf("released after task implement %s left no non-terminal branch work (#1565)", cause.noun),
+				}); rerr == nil && released {
+					if _, eerr := store.AddJobEventAtGeneration(ctx, db.JobEvent{
+						JobID: job.ID, Kind: "task_lane_lock_released",
+						Message: fmt.Sprintf("released task lane lock %s on %s (#1565)", branch, cause.verb),
+					}, atGeneration); eerr != nil {
+						return true, eerr
+					}
+				}
+			}
+		}
+	}
+	if supersedeDebtInterleaveHook != nil {
+		supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeReclaim)
+	}
+	// The reclaim marker is the dangerous one to append blind: the worktree path is
+	// derived from the job id, so it is the SAME path a retry is using, and an
+	// unguarded marker hands a live run's checkout to the reclaim pass.
+	if err := recordSupersededReadOnlyWorktreeReclaimAtGeneration(ctx, store, job, payload, atGeneration); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 // releaseAbortedJobSideResources is the non-resource-lock half of an abort's
-// cleanup, shared by both entry points above. Each step carries its own atomic
-// predicate (an inactive-branch check, an existence check), so it is safe to run
-// once the caller's lifecycle claim holds.
+// cleanup for a caller acting on a lifecycle it observed JUST NOW (cancel, kill).
+// Each step carries its own atomic predicate, and no generation anchor is needed
+// because there is no poll-long gap between the decision and these writes.
 func releaseAbortedJobSideResources(ctx context.Context, store *db.Store, job db.Job, cause abortCause) {
 	payload, perr := unmarshalPayload(job.Payload)
 	if perr != nil {
 		return
 	}
-	// An implement delegation leg that dies here never runs the engine's terminal
-	// cleanupImplementDelegationWorktree (that fires from AdvanceJob), so its
-	// per-delegation branch lock would leak exactly like the success path did before
-	// #617. Gated to worktree-isolated implement legs.
 	if released, rerr := releaseDelegationBranchLock(ctx, store, job.Type, payload); rerr == nil && released {
 		_ = store.AddJobEvent(ctx, db.JobEvent{
 			JobID:   job.ID,
@@ -446,11 +514,6 @@ func releaseAbortedJobSideResources(ctx context.Context, store *db.Store, job db
 			Message: fmt.Sprintf("released delegation branch lock %s on %s (#617)", strings.TrimSpace(payload.Branch), cause.verb),
 		})
 	}
-	// A top-level task implement owns the task lane rather than an ephemeral
-	// delegation lane. Task dismissal stays with the stale-task reconciler, which
-	// owns remote cleanup and the audit event; this excludes only this exact
-	// implementing task from the atomic release check, and every other task, every
-	// unknown/review state and every non-terminal job still vetoes.
 	if job.Type == "implement" && strings.TrimSpace(payload.TaskID) != "" && strings.TrimSpace(payload.DelegationID) == "" {
 		repo := strings.TrimSpace(payload.Repo)
 		branch := strings.TrimSpace(payload.Branch)
@@ -467,9 +530,30 @@ func releaseAbortedJobSideResources(ctx context.Context, store *db.Store, job db
 			}
 		}
 	}
-	// Dispose a #739 dispatch-time read-only worktree that dying before running
-	// would otherwise leak.
 	recordReadOnlyWorktreeReclaimOnAbort(ctx, store, job, payload)
+}
+
+// recordSupersededReadOnlyWorktreeReclaimAtGeneration is the reclaim marker with a
+// lifecycle anchor. The path comes from the payload the superseded run carried;
+// because it is derived from the job id, a retry uses the SAME path, so an
+// unguarded marker would hand a live checkout to the daemon's reclaim pass.
+func recordSupersededReadOnlyWorktreeReclaimAtGeneration(ctx context.Context, store *db.Store, job db.Job, payload JobPayload, atGeneration int64) error {
+	if !isReadOnlyDelegationWorktree(job.Type, payload) && !isFixWorktree(job.Type, payload) {
+		return nil
+	}
+	path := strings.TrimSpace(payload.WorktreePath)
+	if path == "" {
+		return nil
+	}
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	_, err := store.AddJobEventAtGeneration(ctx, db.JobEvent{
+		JobID:   job.ID,
+		Kind:    "delegation_worktree_cleanup_skipped",
+		Message: fmt.Sprintf("dispatch worktree %s preserved for daemon reclaim: job aborted (%s) before its terminal cleanup ran", path, job.State),
+	}, atGeneration)
+	return err
 }
 
 func SupersedeStaleHeadJob(ctx context.Context, store *db.Store, jobID string, reason string) (db.Job, bool, error) {
@@ -529,41 +613,46 @@ func SupersedeStaleHeadJob(ctx context.Context, store *db.Store, jobID string, r
 // debt is durable from the instant the job stops being queued;
 // CompletePendingSupersedeFinalization pays it and records completion.
 //
-// The pending marker's message CARRIES THE LIFECYCLE GENERATION it was written
-// for, because the debt is about one run and `gitmoot job retry` can start
-// another. Paying an old PR-closed debt against a newer lifecycle would stamp
-// that run with the old synthetic failure and advance the parent on it, and a
-// newer run that SUCCEEDS would leave the marker outstanding forever. A debt
-// whose generation no longer matches is therefore VOIDED, never paid.
+// The pending marker's message IS THE LIFECYCLE GENERATION it was written for,
+// as a canonical decimal and nothing else, because the debt is about one run and
+// `gitmoot job retry` can start another. Paying an old PR-closed debt against a
+// newer lifecycle would stamp that run with the old synthetic failure and advance
+// the parent on it, and a newer run that SUCCEEDS would leave the marker
+// outstanding forever. A debt whose generation no longer matches is therefore
+// VOIDED, never paid.
+//
+// The message carries the generation ALONE, with the human reason recovered from
+// the superseded_pr_closed event written in the same transaction, because the
+// classification must mean the same thing here and in SQL. The earlier
+// `generation=<n>: <reason>` prefix could not: `generation=abc: …` parsed as
+// unanchored while SQL read it as anchored-shaped, and `generation=01: …` parsed
+// as 1 while SQL's anchored comparison missed it. Both produced a debt no path
+// could close. A canonical decimal is expressible in both languages exactly —
+// see supersedeFinalizationAnchoredPendingSQL.
 const (
 	JobEventSupersedeFinalizePending   = "supersede_finalize_pending"
 	JobEventSupersedeFinalizeCompleted = "supersede_finalize_completed"
-
-	supersedeFinalizeGenerationPrefix = "generation="
 )
 
-// formatSupersedeFinalizeDebt and parseSupersedeFinalizeDebt are the marker's
-// wire format. db.JobEvent carries no numeric column, so the generation rides in
-// the message behind a fixed prefix; the reason follows it verbatim so the
-// retry's synthetic result reads exactly as the original attempt's would have.
-func formatSupersedeFinalizeDebt(generation int64, reason string) string {
-	return fmt.Sprintf("%s%d: %s", supersedeFinalizeGenerationPrefix, generation, reason)
+// formatSupersedeFinalizeDebt renders the marker message: the generation, canonical
+// decimal, nothing else.
+func formatSupersedeFinalizeDebt(generation int64) string {
+	return strconv.FormatInt(generation, 10)
 }
 
-func parseSupersedeFinalizeDebt(message string) (int64, string, bool) {
-	if !strings.HasPrefix(message, supersedeFinalizeGenerationPrefix) {
-		return 0, message, false
-	}
-	rest := message[len(supersedeFinalizeGenerationPrefix):]
-	separator := strings.Index(rest, ": ")
-	if separator < 0 {
-		return 0, message, false
-	}
-	generation, err := strconv.ParseInt(rest[:separator], 10, 64)
+// parseSupersedeFinalizeDebt is the exact Go twin of the SQL classification. It
+// accepts ONLY a canonical decimal — the FormatInt round-trip rejects `01`, `+1`
+// and whitespace — so a message either names a generation in both languages or
+// names none in both.
+func parseSupersedeFinalizeDebt(message string) (int64, bool) {
+	generation, err := strconv.ParseInt(message, 10, 64)
 	if err != nil {
-		return 0, message, false
+		return 0, false
 	}
-	return generation, rest[separator+2:], true
+	if strconv.FormatInt(generation, 10) != message {
+		return 0, false
+	}
+	return generation, true
 }
 
 // SupersedeClosedPullRequestJob terminates a QUEUED job whose pull request is no
@@ -607,7 +696,7 @@ func SupersedeClosedPullRequestJob(ctx context.Context, store *db.Store, observe
 	}, db.JobEvent{
 		JobID:   observed.ID,
 		Kind:    JobEventSupersedeFinalizePending,
-		Message: formatSupersedeFinalizeDebt(observed.LifecycleGeneration, reason),
+		Message: formatSupersedeFinalizeDebt(observed.LifecycleGeneration),
 	})
 	if err != nil {
 		return db.Job{}, false, err
@@ -666,7 +755,7 @@ func (e Engine) FinalizeClosedPullRequestDelegationChild(ctx context.Context, ob
 	}, db.JobEvent{
 		JobID:   observed.ID,
 		Kind:    JobEventSupersedeFinalizePending,
-		Message: formatSupersedeFinalizeDebt(observed.LifecycleGeneration, reason),
+		Message: formatSupersedeFinalizeDebt(observed.LifecycleGeneration),
 	})
 	if err != nil {
 		return false, err
@@ -755,11 +844,26 @@ func (e Engine) CompletePendingSupersedeFinalization(ctx context.Context, jobID 
 // inside the finalizer, and the window between reading the latest debt marker and
 // closing it.
 const (
-	supersedeDebtStageAfterRead      = "after-read"
-	supersedeDebtStageAfterClaim     = "after-claim"
-	supersedeDebtStageBeforeCleanup  = "before-cleanup"
-	supersedeDebtStageBeforeFinalize = "before-finalize"
-	supersedeDebtStageBeforeClosure  = "before-closure"
+	supersedeDebtStageAfterRead           = "after-read"
+	supersedeDebtStageAfterClaim          = "after-claim"
+	supersedeDebtStageBeforeCleanup       = "before-cleanup"
+	supersedeDebtStageAfterResourceCommit = "after-resource-commit"
+	supersedeDebtStageBeforeTaskLane      = "before-task-lane"
+	supersedeDebtStageBeforeReclaim       = "before-reclaim"
+	supersedeDebtStageBeforeFinalize      = "before-finalize"
+	supersedeDebtStageBeforeAdvance       = "before-advance"
+	supersedeDebtStageBeforeAdvanceClaim  = "before-advance-claim"
+	supersedeDebtStageBeforeClosure       = "before-closure"
+)
+
+// The parent-advance bracket's durable trace. Claimed and confirmed are both
+// ANCHORED appends, so between them the lifecycle is provably unchanged; the
+// superseded kind records the one case where it changed mid-advance and the debt
+// was deliberately left outstanding.
+const (
+	JobEventSupersedeAdvanceClaimed    = "supersede_advance_claimed"
+	JobEventSupersedeAdvanceConfirmed  = "supersede_advance_confirmed"
+	JobEventSupersedeAdvanceSuperseded = "supersede_advance_superseded"
 )
 
 var supersedeDebtInterleaveHook func(ctx context.Context, stage string)
@@ -776,24 +880,38 @@ type supersedeFinalizeDebt struct {
 // latestSupersedeFinalizeDebt applies the same last-one-wins rule as the store's
 // candidate query: the highest-id event among exactly the two marker kinds
 // decides. Reading it in Go as well keeps a direct caller honest, and lets the
-// reason and generation come from the marker the sweep actually wrote.
+// generation come from the marker the sweep actually wrote.
+//
+// The reason is recovered from the superseded_pr_closed event written in the SAME
+// transaction as the marker, because the marker's message is now the generation
+// alone. That keeps one classification rule shared with SQL and still lets a
+// retried payment produce the same synthetic result text the first attempt would
+// have.
 func latestSupersedeFinalizeDebt(ctx context.Context, store *db.Store, jobID string) (supersedeFinalizeDebt, error) {
 	events, err := store.ListJobEvents(ctx, jobID)
 	if err != nil {
 		return supersedeFinalizeDebt{}, err
 	}
 	debt := supersedeFinalizeDebt{}
+	reason := ""
 	for _, event := range events {
 		switch event.Kind {
+		case JobEventSupersededPullRequestClosed:
+			if trimmed := strings.TrimSpace(event.Message); trimmed != "" {
+				reason = trimmed
+			}
 		case JobEventSupersedeFinalizePending:
-			generation, reason, anchored := parseSupersedeFinalizeDebt(event.Message)
-			debt = supersedeFinalizeDebt{pending: true, anchored: anchored, generation: generation, reason: reason}
+			generation, anchored := parseSupersedeFinalizeDebt(event.Message)
+			debt = supersedeFinalizeDebt{pending: true, anchored: anchored, generation: generation}
 		case JobEventSupersedeFinalizeCompleted:
 			debt = supersedeFinalizeDebt{}
 		}
 	}
-	if debt.pending && strings.TrimSpace(debt.reason) == "" {
-		debt.reason = "queued job superseded: its pull request is no longer open"
+	if debt.pending {
+		debt.reason = reason
+		if debt.reason == "" {
+			debt.reason = "queued job superseded: its pull request is no longer open"
+		}
 	}
 	return debt, nil
 }
@@ -852,15 +970,17 @@ func completeSupersedeFinalization(ctx context.Context, engine *Engine, store *d
 	}
 	// A queued job dying here owes the SAME cleanups a cancel does — resource locks,
 	// a per-delegation branch lock, the task lane lock, a dispatch-time read-only
-	// worktree. Copying only the worktree half (the shape SupersedeStaleHeadJob
-	// carries, where the targeted review legs hold none of the others) would leak
-	// locks that block the next same-repo work.
-	// Conditional on the claimed lifecycle: the claim above and this cleanup are
-	// separate statements, so a retry can queue generation N+1 and a worker can
-	// claim it in between. An unguarded by-owner lock delete would then destroy the
-	// RUNNING run's locks. A lost guard also skips the remaining cleanups, which
-	// belong to the same abort.
-	releaseSupersededJobResourcesAtGeneration(ctx, store, current, abortCauseSupersede, generation)
+	// worktree. Every one is anchored on the claimed lifecycle inside the statement
+	// that performs it, and the error is PROPAGATED: a cleanup that could not be
+	// proven to have run must leave the debt outstanding rather than be recorded
+	// paid, which is how a swallowed SQLITE_BUSY_SNAPSHOT lost cleanup debt before.
+	guarded, cleanupErr := releaseSupersededJobResourcesAtGeneration(ctx, store, current, abortCauseSupersede, generation)
+	if cleanupErr != nil {
+		return cleanupErr
+	}
+	if !guarded {
+		return recordSupersedeFinalizationCompleted(ctx, store, job.ID, reason, generation, nil)
+	}
 	if engine == nil {
 		return recordSupersedeFinalizationCompleted(ctx, store, job.ID, reason, generation, nil)
 	}
@@ -878,27 +998,115 @@ func completeSupersedeFinalization(ctx context.Context, engine *Engine, store *d
 	if !finalized && finalizeErr == nil {
 		// The finalizer returns this both when the result is ALREADY stamped (a
 		// previous attempt got that far and then failed) and when it refused because
-		// the row moved to another lifecycle. Only the first owes a parent advance,
-		// and advancing the coordinator on a run that is no longer this one is the
-		// same defect the anchor exists to stop — so re-read and require the anchored
-		// lifecycle before touching the parent.
-		latest, err := store.GetJob(ctx, job.ID)
+		// the row moved to another lifecycle. Only the first owes a parent advance.
+		advanced, err := engine.advanceSupersededChildAtGeneration(ctx, job.ID, generation)
 		if err != nil {
-			return err
-		}
-		if latest.LifecycleGeneration != generation || !isSupersededTerminalState(latest.State) {
-			return recordSupersedeFinalizationCompleted(ctx, store, job.ID, reason, generation, nil)
-		}
-		// AdvanceJob is re-entrant (the post-delivery retry pass re-calls it on the
-		// same job), so driving it again on an already-advanced parent is a no-op.
-		if err := engine.AdvanceJob(ctx, job.ID); err != nil {
 			if !isDelegationPolicyOutcome(err) {
 				return err
 			}
 			finalizeErr = err
+		} else if !advanced {
+			// The lifecycle moved before or during the advance. The debt stays
+			// outstanding so the next poll re-drives it against whatever run owns the
+			// row then; closing it here would bury a parent that is still waiting.
+			return nil
 		}
 	}
 	return recordSupersedeFinalizationCompleted(ctx, store, job.ID, reason, generation, finalizeErr)
+}
+
+// advanceSupersededChildAtGeneration is the parent-advance half of the recovery,
+// bracketed so a retry cannot have its coordinator settled on a superseded run's
+// verdict.
+//
+// AdvanceJob is multi-statement and has no lifecycle anchor of its own, so a
+// re-read before calling it only narrows the window; it cannot close it. The
+// bracket does two things a read cannot:
+//
+//	BEFORE  an anchored event append CLAIMS the advance. It is a conditional
+//	        INSERT, so a row that has moved refuses it and no advance runs at all.
+//	AFTER   a second anchored append CONFIRMS the lifecycle never moved while
+//	        AdvanceJob was running. If it refuses, the advance may have mutated the
+//	        parent from a stale verdict, so the durable trace says so and the debt
+//	        is left outstanding: the next poll re-drives the advance against the run
+//	        that owns the row then, and AdvanceJob is re-entrant, so the repair is
+//	        the same call.
+//
+// advanced false means no parent mutation can be attributed to this lifecycle and
+// the caller must NOT close the debt.
+func (e Engine) advanceSupersededChildAtGeneration(ctx context.Context, jobID string, generation int64) (bool, error) {
+	if supersedeDebtInterleaveHook != nil {
+		supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeAdvanceClaim)
+	}
+	claimed, err := e.Store.AddJobEventAtGeneration(ctx, db.JobEvent{
+		JobID:   jobID,
+		Kind:    JobEventSupersedeAdvanceClaimed,
+		Message: formatSupersedeFinalizeDebt(generation),
+	}, generation)
+	if err != nil || !claimed {
+		return false, err
+	}
+	if supersedeDebtInterleaveHook != nil {
+		supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeAdvance)
+	}
+	advanceErr := e.AdvanceJob(ctx, jobID)
+	if advanceErr != nil && !isDelegationPolicyOutcome(advanceErr) {
+		// A retry that lands mid-advance CAUSES failures rather than wrong results:
+		// production's RetryJob clears the child's result, so AdvanceJob's own read
+		// finds none and refuses. Distinguish that from a real fault by re-testing the
+		// anchor — if the lifecycle moved, the error is this race and the debt simply
+		// stays outstanding, with no poll-level error and no stale mutation.
+		superseded, probeErr := e.supersedeAdvanceLifecycleMoved(ctx, jobID, generation)
+		if probeErr != nil {
+			return false, probeErr
+		}
+		if superseded {
+			e.recordSupersedeAdvanceRaced(ctx, jobID, generation, advanceErr)
+			return false, nil
+		}
+		return false, advanceErr
+	}
+	confirmed, err := e.Store.AddJobEventAtGeneration(ctx, db.JobEvent{
+		JobID:   jobID,
+		Kind:    JobEventSupersedeAdvanceConfirmed,
+		Message: formatSupersedeFinalizeDebt(generation),
+	}, generation)
+	if err != nil {
+		return false, err
+	}
+	if !confirmed {
+		e.recordSupersedeAdvanceRaced(ctx, jobID, generation, nil)
+		return false, nil
+	}
+	return true, advanceErr
+}
+
+// supersedeAdvanceLifecycleMoved reports whether the row has left the lifecycle the
+// advance was claimed for. It reads the row rather than probing with a write,
+// because by this point the question is only how to CLASSIFY an outcome that has
+// already happened; the anchored appends above are what decide whether anything is
+// attributed to this lifecycle.
+func (e Engine) supersedeAdvanceLifecycleMoved(ctx context.Context, jobID string, generation int64) (bool, error) {
+	current, err := e.Store.GetJob(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	return current.LifecycleGeneration != generation || !isSupersededTerminalState(current.State), nil
+}
+
+// recordSupersedeAdvanceRaced leaves the durable trace for an advance whose
+// lifecycle moved. Best-effort: the debt is already staying outstanding, and an
+// unwritable audit row must not turn a benign race into a poll error.
+func (e Engine) recordSupersedeAdvanceRaced(ctx context.Context, jobID string, generation int64, cause error) {
+	message := fmt.Sprintf("lifecycle %d was superseded while its parent advance ran; the debt stays outstanding for re-drive", generation)
+	if cause != nil {
+		message += ": " + cause.Error()
+	}
+	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   jobID,
+		Kind:    JobEventSupersedeAdvanceSuperseded,
+		Message: message,
+	})
 }
 
 // isSupersededTerminalState reports whether a job row is in one of the two states

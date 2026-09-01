@@ -237,24 +237,24 @@ func (s *Store) DeleteResourceLocksByOwnerIfNotRunning(ctx context.Context, owne
 // claimed: same lifecycle_generation, and still in one of the two terminal states
 // a supersession writes.
 //
-// The guard and the delete share ONE write transaction, which is what makes this
-// different from reading the row and then calling DeleteResourceLocksByOwner. A
-// `gitmoot job retry` between those two statements queues a new lifecycle and a
-// worker claims it; the by-owner delete carries no state or generation predicate,
-// so it then destroys the RUNNING run's locks. Serialised here, the retry's
-// generation bump either lands before the guard (which fails, and nothing is
-// deleted) or after the commit (so the locks it goes on to acquire are its own and
-// were never in scope).
+// The guard and the delete are ONE WRITE STATEMENT, and it is the FIRST statement
+// of the transaction. That ordering is the fix, not decoration: with a deferred
+// BeginTx a SELECT-then-DELETE takes a READ snapshot first, and under WAL another
+// PROCESS committing `gitmoot job retry` in between makes the upgrade fail
+// SQLITE_BUSY_SNAPSHOT — safe in isolation, but the caller then has to distinguish
+// "guard lost" from "write refused", and swallowing it closed the debt. Writing
+// first takes the write lock immediately, so a concurrent re-queue either lands
+// BEFORE this statement (the EXISTS predicate fails and nothing is deleted) or
+// serialises AFTER the commit (the locks it goes on to acquire were never in
+// scope). There is no third interleaving.
 //
-// guarded reports whether the claimed lifecycle was still current, so a caller can
-// skip the remaining cleanups that belong to the same abort. It is distinct from
-// released, which is 0 both for a lost guard and for a job that simply held no
-// locks.
+// guarded is read AFTER the write, inside the same transaction, so it reports the
+// state that decided the delete rather than a pre-read another process could have
+// invalidated. It is distinct from released, which is 0 both for a lost guard and
+// for a job that simply held no locks.
 //
-// The generation equality is the load-bearing half: generations bump on every
-// state write, so a row still at atGeneration IS the row the caller claimed. The
-// terminal-state clause is therefore redundant and kept only as an explicit
-// statement of the precondition — no test can distinguish it, and none pretends to.
+// Every error is returned. A caller that cannot prove the cleanup ran must leave
+// its debt outstanding rather than record it paid.
 func (s *Store) ReleaseSupersededJobResourceLocksAtGeneration(ctx context.Context, ownerJobID string, atGeneration int64) (released int64, guarded bool, err error) {
 	ownerJobID = strings.TrimSpace(ownerJobID)
 	if ownerJobID == "" {
@@ -265,6 +265,21 @@ func (s *Store) ReleaseSupersededJobResourceLocksAtGeneration(ctx context.Contex
 		return 0, false, err
 	}
 	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `DELETE FROM resource_locks
+		WHERE owner_job_id = ?
+		  AND EXISTS (
+			SELECT 1 FROM jobs
+			WHERE jobs.id = ?
+			  AND jobs.lifecycle_generation = ?
+			  AND jobs.state IN ('cancelled', 'failed')
+		  )`, ownerJobID, ownerJobID, atGeneration)
+	if err != nil {
+		return 0, false, err
+	}
+	released, err = result.RowsAffected()
+	if err != nil {
+		return 0, false, err
+	}
 	var state string
 	var generation int64
 	err = tx.QueryRowContext(ctx, `SELECT state, lifecycle_generation FROM jobs WHERE id = ?`, ownerJobID).Scan(&state, &generation)
@@ -277,15 +292,62 @@ func (s *Store) ReleaseSupersededJobResourceLocksAtGeneration(ctx context.Contex
 	if generation != atGeneration || (state != "cancelled" && state != "failed") {
 		return 0, false, tx.Commit()
 	}
-	result, err := tx.ExecContext(ctx, `DELETE FROM resource_locks WHERE owner_job_id = ?`, ownerJobID)
-	if err != nil {
-		return 0, false, err
-	}
-	released, err = result.RowsAffected()
-	if err != nil {
-		return 0, false, err
-	}
 	return released, true, tx.Commit()
+}
+
+// ForceReleaseDelegationBranchLockAtJobGeneration force-releases a branch lock only
+// while the owning job is still the settled lifecycle the caller claimed.
+//
+// The unguarded ForceReleaseLockWithEvent deletes by (repo, branch) alone, so a
+// retry that re-queued and re-acquired the same delegation branch lock lost it to
+// the previous run's cleanup. The generation lives in the DELETE's own predicate,
+// and the audit event is written in the same transaction, so a lost guard leaves
+// both the lock and the history untouched.
+func (s *Store) ForceReleaseDelegationBranchLockAtJobGeneration(ctx context.Context, repoFullName string, branch string, ownerJobID string, atGeneration int64, event BranchLockEvent) (bool, error) {
+	repoFullName = strings.TrimSpace(repoFullName)
+	branch = strings.TrimSpace(branch)
+	ownerJobID = strings.TrimSpace(ownerJobID)
+	if repoFullName == "" || branch == "" || ownerJobID == "" {
+		return false, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	// The guarded DELETE is the FIRST statement, for the same reason as the resource
+	// release above: a read taken first would hold a WAL snapshot another process's
+	// re-queue could invalidate, turning this into a stale upgrade. RETURNING hands
+	// back the owner the audit event needs, so nothing has to be read beforehand.
+	var owner string
+	err = tx.QueryRowContext(ctx, `DELETE FROM branch_locks
+		WHERE repo_full_name = ? AND branch = ?
+		  AND EXISTS (
+			SELECT 1 FROM jobs
+			WHERE jobs.id = ?
+			  AND jobs.lifecycle_generation = ?
+			  AND jobs.state IN ('cancelled', 'failed')
+		  )
+		RETURNING owner`, repoFullName, branch, ownerJobID, atGeneration).Scan(&owner)
+	if errors.Is(err, sql.ErrNoRows) {
+		// No lock row, or the guard refused: either way nothing was released and no
+		// history is written.
+		return false, tx.Commit()
+	}
+	if err != nil {
+		return false, err
+	}
+	event.RepoFullName = repoFullName
+	event.Branch = branch
+	event.Owner = owner
+	if strings.TrimSpace(event.Kind) == "" {
+		event.Kind = "released"
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO lock_events(repo_full_name, branch, owner, kind, message) VALUES (?, ?, ?, ?, ?)`,
+		event.RepoFullName, event.Branch, event.Owner, event.Kind, event.Message); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
 }
 
 // DeleteExpiredResourceLocks reaps lock rows whose lease has elapsed.

@@ -1822,9 +1822,19 @@ const (
 	// paid. Predicate and insert are one statement, so no retry can land between
 	// them.
 	//
-	// %s is the pending marker's identity test: an ANCHORED payment matches the
-	// generation it claimed, an unanchored one matches only a marker that carries
-	// no generation at all.
+	// %s is the pending marker's identity test. The marker's MESSAGE IS THE
+	// GENERATION, written as a canonical decimal and nothing else, because the
+	// classification has to mean the same thing in SQL and in Go. The previous
+	// `generation=<n>: <reason>` prefix could not: a malformed prefix
+	// (`generation=abc: …`) parsed as unanchored in Go while SQL's
+	// `NOT LIKE 'generation=%'` rejected it as anchored-shaped, and a non-canonical
+	// spelling (`generation=01: …`) parsed as 1 in Go while the anchored LIKE missed
+	// it — both left a debt that no path could ever close.
+	//
+	// CAST(CAST(message AS INTEGER) AS TEXT) = message is exactly "canonical decimal
+	// integer", which is the same predicate strconv.ParseInt plus a FormatInt
+	// round-trip applies in Go. So anchored is an equality on that canonical form and
+	// unanchored is its complement, and every shape lands in exactly one of them.
 	supersedeFinalizationClosureSQL = `INSERT INTO job_events(job_id, kind, message)
 		SELECT ?, 'supersede_finalize_completed', ?
 		WHERE EXISTS (
@@ -1839,8 +1849,9 @@ const (
 			  )
 		)`
 
-	supersedeFinalizationAnchoredPendingSQL   = `pending.message LIKE 'generation=' || CAST(? AS TEXT) || ': %'`
-	supersedeFinalizationUnanchoredPendingSQL = `pending.message NOT LIKE 'generation=%'`
+	supersedeFinalizationAnchoredPendingSQL = `pending.message = CAST(? AS TEXT)
+			  AND CAST(CAST(pending.message AS INTEGER) AS TEXT) = pending.message`
+	supersedeFinalizationUnanchoredPendingSQL = `CAST(CAST(pending.message AS INTEGER) AS TEXT) <> pending.message`
 )
 
 // JobIDsWithPendingDelegationWorktreeReclaim returns the IDs of jobs whose most
@@ -2026,6 +2037,42 @@ func (s *Store) CloseSupersedeFinalizationDebtAtGeneration(ctx context.Context, 
 		args = []any{jobID, message, jobID, jobID}
 	}
 	result, err := s.db.ExecContext(ctx, statement, args...)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
+}
+
+// AddJobEventAtGeneration appends an event only while the job is still the settled
+// lifecycle the caller claimed: same lifecycle_generation, still in one of the two
+// terminal states a supersession writes.
+//
+// Predicate and insert are ONE statement, so it is the write-side equivalent of a
+// compare-and-swap for the event log. Recovery uses it wherever an unconditional
+// append would attribute a superseded run's work to a retry that now owns the row:
+// the read-only worktree reclaim marker (which would hand a LIVE run's worktree to
+// the reclaim pass, since the path is derived from the job id and is therefore the
+// same one the retry is using), and the parent-advance bracket.
+//
+// written reports whether the row landed. False means the lifecycle moved; the
+// caller must not treat the step as done.
+func (s *Store) AddJobEventAtGeneration(ctx context.Context, event JobEvent, atGeneration int64) (bool, error) {
+	jobID := strings.TrimSpace(event.JobID)
+	if jobID == "" {
+		return false, errors.New("job event requires a job id")
+	}
+	result, err := s.db.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message)
+		SELECT ?, ?, ?
+		WHERE EXISTS (
+			SELECT 1 FROM jobs
+			WHERE jobs.id = ?
+			  AND jobs.lifecycle_generation = ?
+			  AND jobs.state IN ('cancelled', 'failed')
+		)`, jobID, event.Kind, event.Message, jobID, atGeneration)
 	if err != nil {
 		return false, err
 	}
