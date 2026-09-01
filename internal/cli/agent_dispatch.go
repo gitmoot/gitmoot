@@ -1791,6 +1791,20 @@ func localAgentTargetRepo(ctx context.Context, repoFlag string) (github.Reposito
 	return github.Repository{Owner: parsed.Owner, Name: parsed.Name}, nil
 }
 
+// #1685 removed a role gate that lived here. It refused any agent whose registry
+// role was "coordinator" from a review slot, on the theory that a coordinator in
+// that slot can only produce a fan-out. The theory was right and the conclusion
+// was wrong: a fan-out in a review slot is the SHIPPED recipe
+// (skills/gitmoot/agent-templates/review-panel.md, capabilities [ask, review]),
+// and the merge gate now decides such a row on its delegates instead of counting
+// it as a verdict. Refusing the dispatch removed a documented capability to
+// compensate for a consumer defect that no longer exists — and it did so by
+// exact-matching one literal against a free-form registry column, which let
+// "review-coordinator" and "coordinator-sol" through anyway.
+//
+// Do not reintroduce a role gate here without first answering what it catches
+// that the consumers do not.
+
 func ensureLocalAgentAccess(ctx context.Context, store *db.Store, agent db.Agent, repo string, action string) error {
 	allowed, err := store.AgentCanAccessRepo(ctx, agent.Name, repo)
 	if err != nil {

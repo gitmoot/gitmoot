@@ -197,6 +197,41 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 				Explanation: explain(pass, "the review requests changes but findings[] is empty, so there is no evidence to act on"),
 			})
 		}
+		// #1685: a review result that declares delegations is a coordinator FAN-OUT.
+		// It is NOT refused here, and an earlier version of this file that refused it
+		// was wrong twice over: the shipped review-panel template prescribes exactly
+		// that result, so the check failed the product's own documented recipe, and
+		// under result_checks=block it failed the job before AdvanceJob ever reached
+		// dispatchDelegations — the announced panel could never run. Emitting a
+		// fan-out is legitimate; COUNTING one as a verdict is the defect, and that is
+		// fixed in the consumers that read decision (merge gate, pipeline auto-merge,
+		// required-reviewer counting, the proof projector, the verdict wake).
+		//
+		// The evidence nudge below is skipped for the same reason: a coordinator that
+		// has just announced a panel legitimately has no findings or tests_run yet,
+		// and recording a contract violation on every panel run would train readers
+		// to ignore the check.
+		if isTerminalReviewVerdict(r.Decision) && len(r.Delegations) == 0 {
+			// The obligation is that a verdict ACCOUNTS FOR ITSELF: it cites what it
+			// found, names something it actually ran, or states why there was nothing
+			// to run. Field non-emptiness is not that obligation, and testing it
+			// failed in both directions — a one-token `tests_run: ["."]` passed while
+			// an honest docs-only approval that explained itself in prose failed.
+			//
+			// This cannot detect FABRICATED evidence, and no deterministic check can.
+			// It detects a verdict that accounts for nothing, which is the shape that
+			// reached a near-merge twice.
+			pass := reviewVerdictAccountsForItself(r)
+			checks = append(checks, ResultCheck{
+				ID:       "review-verdict-has-evidence",
+				Action:   "review",
+				Question: "Does the review verdict cite findings, name evidence it produced, or explain why there was none?",
+				Pass:     pass,
+				Explanation: explain(pass, fmt.Sprintf(
+					"the review returned terminal decision %q with no findings, no substantive tests_run or changes_made entry, and a summary too short to be a rationale, so it accounts for nothing the reviewer did",
+					strings.TrimSpace(r.Decision))),
+			})
+		}
 	case "ask":
 		// The coordinator finalize continuation is dispatched as an "ask" carrying
 		// DelegationFinalize (#305): it is a reconciliation, not a plain answer, so
@@ -289,6 +324,71 @@ func hasActionableEntries(values []string) bool {
 		}
 	}
 	return false
+}
+
+// minReviewRationaleChars is the floor at which a review summary can carry the
+// reviewer's account of why a verdict cites no other evidence. It is longer than
+// the ask-answer floor on purpose: "lgtm" is a verdict with no account, while a
+// real one has to say what was examined and why nothing needed running.
+const minReviewRationaleChars = 40
+
+// minEvidenceTokenChars is the floor at which a SINGLE-token evidence entry can
+// still name something real — a path or a target. It exists so `tests_run: ["."]`
+// is not mistaken for evidence while `internal/workflow/result_checks.go` is.
+const minEvidenceTokenChars = 8
+
+// reviewVerdictAccountsForItself reports whether a terminal review verdict
+// accounts for what the reviewer did, by any of the three routes a real one
+// takes: it cites findings, it names something substantive it ran or changed, or
+// its summary states the rationale.
+//
+// This deliberately does NOT ask whether the evidence fields are non-empty. That
+// question has a false answer in both directions: one arbitrary token satisfies
+// it, and an honest approval of a change with nothing to run fails it.
+func reviewVerdictAccountsForItself(r AgentResult) bool {
+	if len(r.Findings) > 0 {
+		return true
+	}
+	for _, entry := range r.TestsRun {
+		if isSubstantiveEvidenceEntry(entry) {
+			return true
+		}
+	}
+	for _, entry := range r.ChangesMade {
+		if isSubstantiveEvidenceEntry(entry) {
+			return true
+		}
+	}
+	return len(strings.TrimSpace(r.Summary)) >= minReviewRationaleChars
+}
+
+// isSubstantiveEvidenceEntry reports whether one evidence entry names something a
+// reader could go and check. A phrase qualifies — a command with its outcome is
+// the common shape — and so does a single token long enough to be a real path or
+// target. A bare "." or "ok" does not.
+func isSubstantiveEvidenceEntry(entry string) bool {
+	trimmed := strings.TrimSpace(entry)
+	if trimmed == "" {
+		return false
+	}
+	if len(strings.Fields(trimmed)) > 1 {
+		return true
+	}
+	return len(trimmed) >= minEvidenceTokenChars && strings.ContainsAny(trimmed, "/.")
+}
+
+// isTerminalReviewVerdict reports whether a review decision is one the merge
+// gate and the review lifecycle treat as a settled answer about the code.
+// "blocked" and "failed" are excluded on purpose: they are self-describing
+// non-answers that no consumer mistakes for an approval, and they legitimately
+// carry no findings or tests.
+func isTerminalReviewVerdict(decision string) bool {
+	switch strings.ToLower(strings.TrimSpace(decision)) {
+	case "approved", "changes_requested":
+		return true
+	default:
+		return false
+	}
 }
 
 // explain returns the failure explanation for a failed check and "" for a passed

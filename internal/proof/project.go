@@ -276,7 +276,20 @@ func (p *projector) factNodes(job db.Job, projection payloadProjection, result *
 				attrs["review_outcome"] = "approved-with-notes"
 				approvalSource = "job_event." + workflow.ReviewApprovedWithNotesEventKind
 			}
-			if effectiveDecision == "approved" {
+			// A fan-out is an announcement, so it cannot support an OBSERVED approval
+			// claim: the projector's whole job is to certify what happened, and
+			// emitting review.approved because a coordinator declared a panel turns a
+			// non-verdict into a positive audit artifact (#1685). The delegates'
+			// own review jobs are projected separately and carry the real claims.
+			if workflow.ResultIsFanOut(result) {
+				attrs["fan_out_delegations"] = strconv.Itoa(len(result.Delegations))
+				attrs["review_outcome"] = "fan-out (no verdict)"
+				// The EFFECTIVE decision has to be explicit, not merely absent: the
+				// renderer's fallback counts a raw "approved" whenever no effective
+				// decision is carried, so suppressing the claim alone still produced a
+				// proof summary reporting one approved review (#1685).
+				attrs["effective_decision"] = NoVerdictDecision
+			} else if effectiveDecision == "approved" {
 				claimType := "review.approved"
 				if independent {
 					claimType = "review.independent_approved"

@@ -239,6 +239,13 @@ func (e Engine) allRequiredReviewersApproved(ctx context.Context, currentReviewe
 		if !sameTask(payload, jobPayload) || !sameReviewRound(payload, jobPayload) || jobPayload.Result == nil {
 			continue
 		}
+		// A fan-out announces a panel; it does not approve. Counting it here would
+		// let a coordinator satisfy a required-reviewer slot without any delegate
+		// having reported (#1685). The panel's children carry their own rows and
+		// are counted on their own agents.
+		if ResultIsFanOut(jobPayload.Result) {
+			continue
+		}
 		if effectiveReviewDecisionForPayload(jobPayload, blockingSeverity) == "approved" {
 			approved[reviewDecisionAgent(job, jobPayload)] = true
 		}
