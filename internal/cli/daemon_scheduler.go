@@ -2163,6 +2163,10 @@ func (w jobWorker) allocatePoolIsolationWorktree(ctx context.Context, job db.Job
 		return poolIsolatedDispatch{}, false, nil
 	}
 	payload.WorktreePath = path
+	switch strings.TrimSpace(job.Type) {
+	case "ask", "review":
+		payload.ReadOnlySeat = true
+	}
 	// The detached worktree is the COMMITTED TIP of the base ref, so it omits
 	// gitignored paths (e.g. vendored repos/**) and uncommitted working-tree
 	// changes. Point the isolated read-only job at the canonical repo checkout so an
@@ -2420,6 +2424,21 @@ func queuedChildOfKilledRoot(ctx context.Context, store *db.Store, job db.Job) b
 func queuedJobCheckoutKey(ctx context.Context, store *db.Store, job db.Job) string {
 	payload, err := daemonJobPayload(job)
 	if err != nil || strings.TrimSpace(payload.Repo) == "" {
+		return "job:" + job.ID
+	}
+	// A PR review's TaskID names the owning implementation task. Its task-table
+	// worktree may therefore be the registered implementation checkout, never the
+	// exact review head. Normal native and local review dispatches are born with an
+	// owned payload WorktreePath; a legacy or misconfigured pathless review gets a
+	// job-local scheduler key until the worker allocates that exact-head worktree.
+	// It must not inherit either the task checkout key or repo:<repo>.
+	if job.Type == "review" && payload.PullRequest > 0 && strings.TrimSpace(payload.HeadSHA) != "" {
+		if path := strings.TrimSpace(payload.WorktreePath); path != "" {
+			normalized, normalizeErr := normalizeTaskWorktreePath(path)
+			if normalizeErr == nil && normalized != "" {
+				return "worktree:" + normalized
+			}
+		}
 		return "job:" + job.ID
 	}
 	if path, ok := queuedJobTaskWorktreePath(ctx, store, payload); ok {

@@ -183,6 +183,7 @@ func (w jobWorker) prepareNativeReviewWorktreeForRunner(ctx context.Context, job
 	}
 	payload.WorktreePath = path
 	payload.ReadOnlyWorktree = true
+	payload.ReadOnlySeat = true
 	if note := workflow.ReadOnlyWorktreeContextNote(checkout); note != "" {
 		payload.Instructions += note
 	}

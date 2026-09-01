@@ -1038,8 +1038,7 @@ func TestExecutionBackendJobWorkerReportsAndRetriesRemoteStartupReapFailure(t *t
 // local work. A local ask reaches the shell runtime and succeeds.
 func TestLocalExecutionBackendAllowsNonImplement(t *testing.T) {
 	ctx := context.Background()
-	marker := filepath.Join(t.TempDir(), "local-ask-ran")
-	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
+	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(""))
 	jobID := execBackendDispatchAsk(t, home)
 	job, err := store.GetJob(ctx, jobID)
 	if err != nil {
@@ -1049,7 +1048,7 @@ func TestLocalExecutionBackendAllowsNonImplement(t *testing.T) {
 	if err := worker.run(ctx, job); err != nil {
 		t.Fatalf("worker.run: %v", err)
 	}
-	assertExecBackendLocalSucceeded(t, store, jobID, marker)
+	assertExecBackendLocalSucceeded(t, store, jobID)
 }
 
 // GITMOOT-IMPL: non-implement work must fail before construction; otherwise a

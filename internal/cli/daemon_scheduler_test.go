@@ -564,6 +564,96 @@ func TestRunQueuedJobsPostsAttributedResultComment(t *testing.T) {
 	}
 }
 
+func TestRunQueuedReviewCommentExplainsApprovedWithNotes(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"review"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "review-comment-notes", Agent: "audit", Action: "review",
+		Repo: "owner/repo", Branch: "main", PullRequest: 7,
+	})
+
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[review]\nblocking_severity = \"P1\"\n"), 0o600); err != nil {
+		t.Fatalf("write review config: %v", err)
+	}
+
+	comments := &cliPollFakeGitHub{}
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return &cliWorkerFakeAdapter{
+			output: `{"gitmoot_result":{"decision":"changes_requested","severity":"P2","summary":"non-blocking polish","findings":[{"severity":"P2","summary":"rename helper"}],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		}, nil
+	}
+	worker.CommenterFactory = func(string) github.Client { return comments }
+
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+	if len(comments.posted) != 1 {
+		t.Fatalf("posted comments = %+v, want one", comments.posted)
+	}
+	body := comments.posted[0].body
+	for _, want := range []string{
+		"**Decision:** `changes_requested`",
+		"**Severity:** `P2`",
+		"**Review Outcome:** `approved-with-notes` (`P2` is below repository blocking severity `P1`; findings remain posted)",
+		"**rename helper** (P2)",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("review comment missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestPipelineReviewCommentDoesNotClaimApprovedWithNotes(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[review]\nblocking_severity = \"P1\"\n"), 0o600); err != nil {
+		t.Fatalf("write review config: %v", err)
+	}
+	worker := defaultJobWorker(nil, io.Discard, home)
+	payload := workflow.JobPayload{
+		Repo:   "owner/repo",
+		Sender: workflow.PipelineJobSender,
+	}
+	job := db.Job{ID: "pipeline-review", Type: "review", State: string(workflow.JobSucceeded)}
+	threshold := worker.reviewBlockingSeverityForComment(job, payload)
+	if threshold != "" {
+		t.Fatalf("pipeline review comment threshold = %q, want raw report-only handling", threshold)
+	}
+	body := workflow.RenderJobResultComment(workflow.JobResultComment{
+		JobID:                  job.ID,
+		JobType:                job.Type,
+		JobState:               job.State,
+		Payload:                payload,
+		ReviewBlockingSeverity: threshold,
+		Result: &workflow.AgentResult{
+			Decision: "changes_requested",
+			Severity: "P2",
+			Summary:  "pipeline stage failed",
+		},
+	})
+	if !strings.Contains(body, "**Decision:** `changes_requested`") {
+		t.Fatalf("pipeline review comment lost raw decision:\n%s", body)
+	}
+	if strings.Contains(body, "**Review Outcome:**") {
+		t.Fatalf("pipeline review comment claimed an engine-level outcome:\n%s", body)
+	}
+}
+
 func TestRunQueuedJobsPostsMalformedOutputDiagnosticComment(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
@@ -2627,12 +2717,18 @@ func TestRunQueuedJobsPoolIsolatesContendedReadJob(t *testing.T) {
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	store := daemonWorkerStore(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, `printf '%s\n' '{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`, []string{"ask"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-1", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-2", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 2})
-	adapter := &cliWorkerFakeAdapter{output: poolSchedulerAskResult}
-	worker := poolSchedulerWorker(t, store, adapter, true)
+	worker := poolSchedulerWorker(t, store, nil, true)
 	worker.ConfigHome = home // enable isolation
+	worker.CheckoutValidator = func(_ context.Context, _ db.Job, payload workflow.JobPayload, _ runtime.Agent) (string, error) {
+		if isolated := strings.TrimSpace(payload.WorktreePath); payload.ReadOnlySeat && isolated != "" {
+			return isolated, nil
+		}
+		return checkout, nil
+	}
+	worker.AdapterFactory = worker.defaultAdapter
 
 	if err := runQueuedJobsForRepo(ctx, worker, 2, "", ""); err != nil {
 		t.Fatalf("pool run: %v", err)
@@ -2676,14 +2772,21 @@ func TestPoolIsolationAppendsCommittedTipNote(t *testing.T) {
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	store := daemonWorkerStore(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime,
+		fmt.Sprintf("printf '%%s' '%s'", poolSchedulerAskResult), []string{"ask"}, "owner/repo")
 	const goal = "audit the config loader"
 	for i, id := range []string{"job-1", "job-2", "job-3"} {
 		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: id, Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: i + 1, Instructions: goal})
 	}
-	adapter := &cliWorkerFakeAdapter{output: poolSchedulerAskResult}
-	worker := poolSchedulerWorker(t, store, adapter, true)
-	worker.ConfigHome = home // enable isolation
+	var workerOutput bytes.Buffer
+	worker := defaultJobWorker(store, &workerOutput, home)
+	worker.UsePool = true
+	worker.CheckoutValidator = func(_ context.Context, _ db.Job, payload workflow.JobPayload, _ runtime.Agent) (string, error) {
+		if strings.TrimSpace(payload.WorktreePath) != "" {
+			return payload.WorktreePath, nil
+		}
+		return checkout, nil
+	}
 
 	if err := runQueuedJobsForRepo(ctx, worker, 3, "", ""); err != nil {
 		t.Fatalf("pool run: %v", err)
@@ -2695,15 +2798,18 @@ func TestPoolIsolationAppendsCommittedTipNote(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetJob %s: %v", id, err)
 		}
-		if job.State != string(workflow.JobSucceeded) {
-			t.Fatalf("%s state = %q, want succeeded (all three read jobs must run concurrently, not stay queued)", id, job.State)
-		}
 		payload, err := daemonJobPayload(job)
 		if err != nil {
 			t.Fatalf("payload %s: %v", id, err)
 		}
+		if job.State != string(workflow.JobSucceeded) {
+			t.Fatalf("%s state = %q, want succeeded (all three read jobs must run concurrently, not stay queued); payload=%s worker=%s", id, job.State, job.Payload, workerOutput.String())
+		}
 		if payload.WorktreePath != "" {
 			isolated++
+			if !payload.ReadOnlySeat {
+				t.Fatalf("%s isolated without hard read-only seat marker", id)
+			}
 			if _, statErr := os.Stat(payload.WorktreePath); !os.IsNotExist(statErr) {
 				t.Fatalf("%s isolation worktree %s was not cleaned up", id, payload.WorktreePath)
 			}
@@ -2717,6 +2823,9 @@ func TestPoolIsolationAppendsCommittedTipNote(t *testing.T) {
 			}
 		} else {
 			shared++
+			if payload.ReadOnlySeat {
+				t.Fatalf("%s shared-checkout job unexpectedly marked as a read-only seat", id)
+			}
 			// The un-isolated job stays in the shared base checkout: its prompt must
 			// be byte-identical (no committed-tip note appended).
 			if payload.Instructions != goal {

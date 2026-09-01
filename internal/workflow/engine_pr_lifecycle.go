@@ -359,6 +359,7 @@ func (e Engine) prepareNativeReviewWorktree(ctx context.Context, request JobRequ
 	}
 	request.WorktreePath = path
 	request.ReadOnlyWorktree = true
+	request.ReadOnlySeat = true
 	if note := readOnlyWorktreeContextNote(e.DelegationCheckout); note != "" {
 		request.Instructions += note
 	}

@@ -149,14 +149,17 @@ type Event struct {
 	// EventType. It is assigned by trusted emit sites and deliberately bypasses
 	// free-text redaction and path scrubbing.
 	Cause string `json:"cause,omitempty"`
-	// WakeKind, WakeTargetRole, WakeOutboxIDs, PullRequest, and ReviewDecision
-	// are internal delivery metadata. They never alter the public event JSON
-	// contract.
-	WakeKind       string  `json:"-"`
-	WakeTargetRole string  `json:"-"`
-	WakeOutboxIDs  []int64 `json:"-"`
-	PullRequest    int     `json:"-"`
-	ReviewDecision string  `json:"-"`
+	// WakeKind, WakeTargetRole, WakeTargetRoles, WakeOutboxIDs, PullRequest, and
+	// ReviewDecision are internal delivery metadata. WakeTargetRole remains the
+	// primary target for single-address producers; WakeTargetRoles carries the
+	// complete target set for multi-address events. Neither alters the public
+	// event JSON contract.
+	WakeKind        string   `json:"-"`
+	WakeTargetRole  string   `json:"-"`
+	WakeTargetRoles []string `json:"-"`
+	WakeOutboxIDs   []int64  `json:"-"`
+	PullRequest     int      `json:"-"`
+	ReviewDecision  string   `json:"-"`
 }
 
 // Sink is the injected outbound seam the engine and daemon call from the

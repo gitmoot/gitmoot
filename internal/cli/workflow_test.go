@@ -1385,6 +1385,15 @@ func runGit(t *testing.T, dir string, args ...string) {
 	}
 }
 
+func seedGitHead(t *testing.T, dir string) {
+	t.Helper()
+	runGit(t, dir,
+		"-c", "user.name=Gitmoot Test",
+		"-c", "user.email=gitmoot@example.invalid",
+		"commit", "--allow-empty", "-m", "initial",
+	)
+}
+
 func withWorkingDirectory(t *testing.T, dir string) {
 	t.Helper()
 	previous, err := os.Getwd()

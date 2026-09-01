@@ -1672,9 +1672,12 @@ gitmoot org events rule rm --home /alternate/home <rule-id>
 `review-verdict`, `blocked`, `recycle-overdue`, `pane_input_pending`, `reply`,
 `directive`, or `fact`. A successful review terminal whose decision is
 `approved` or `changes_requested` matches both `job-terminal` and
-`review-verdict` and addresses the resolved pull request owner. If no owner can
-be resolved, addressed rules fail closed while observer rules remain eligible.
-`pane_input_pending` matches the
+`review-verdict` and addresses both the requesting org role and the resolved
+implementing role. When a successful ownership lookup finds no implement job
+or branch lock attribution, the review's persisted lead identifies a
+persistent implementing seat; lookup errors remain fail-closed. If neither
+role can be resolved, addressed rules fail closed while observer rules remain
+eligible. `pane_input_pending` matches the
 `org.input_pending` event emitted when Herdr continuously reports
 `input_pending: true` for a role's pane longer than
 `[orchestrate].blocked_role_wake_after`; it re-nudges at most once per that
@@ -2411,8 +2414,13 @@ auto-finalizes a whole paused delegation *tree* and is on by default (24h);
 
 Native task auto-merge is enabled by default only behind an exact-head approved
 review and green SHA-scoped commit statuses/check-runs. A miss parks the task as
-`awaiting_human_merge`, records an org escalation, and wakes `jarvis`. Set
-`[repos."owner/repo".merge_gate] auto_merge = false` as an explicit kill-switch;
+`awaiting_human_merge` and records an org escalation. It selects the
+most-specific live role whose scope matches the repo and addresses that role's
+nearest live chart ancestor. With no live scope match it addresses a live
+`owner`; a root match addresses itself. With no live upward recipient, the gate
+fails closed without journaling an addressed note. Archive filtering does not
+predict delivery; `org validate` reports missing wake routes and pane bindings.
+Set `[repos."owner/repo".merge_gate] auto_merge = false` as an explicit kill-switch;
 that deliberate hold does not escalate. Pipeline `allow_auto_merge` is independent.
 
 When review independence cannot be verified, the merge gate names the evidence

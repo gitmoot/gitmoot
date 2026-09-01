@@ -74,6 +74,15 @@ type Agent struct {
 	// also injects a working relay env, so a seat is never elevated without a relay;
 	// never persisted.
 	ChatSeat bool
+	// ReadOnlySeat marks a delivery running in a detached read-only worktree.
+	// The CLI wraps these jobs in a hard filesystem sandbox before adapters
+	// receive the widened command and network permissions below.
+	// In-memory only; never persisted on the agents table.
+	ReadOnlySeat bool
+	// RuntimeConfigDir is the source profile selected by the dispatching process.
+	// Read-only seats copy only the provider authentication needed by that
+	// runtime into per-job state; the source directory is never sandbox-visible.
+	RuntimeConfigDir string
 	// ExecBackend is the execution backend resolved for THIS job at dispatch
 	// (#1536 P1) from [remote_exec].backend plus the payload's exec_backend
 	// override. Dispatch stamps it in-memory before adapter construction so the
@@ -952,6 +961,16 @@ func effectiveEffort(agent Agent, job Job) string {
 }
 
 func codexSandboxArgs(agent Agent, workdir string) ([]string, PermissionPolicyApplication) {
+	if agent.ReadOnlySeat {
+		args := []string{"--sandbox", "workspace-write"}
+		for _, path := range agent.WritablePaths {
+			if path = strings.TrimSpace(path); path != "" {
+				args = append(args, "--add-dir", path)
+			}
+		}
+		args = append(args, "-c", "sandbox_workspace_write.network_access=true")
+		return args, PermissionPolicyWidened
+	}
 	// #732: a moot/chat seat must reach the daemon chat-relay unix socket, but a
 	// codex read-only sandbox blocks the connect() syscall itself (empirically
 	// probed on codex-cli 0.142.4 bubblewrap+seccomp). Dispatch the seat with
@@ -1914,19 +1933,24 @@ var claudeRuntimeContract = RuntimeContract{
 func claudePermissionArgs(agent Agent) ([]string, PermissionPolicyApplication) {
 	var args []string
 	property := PermissionPolicyNotApplied
-	switch NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {
-	case AutonomyPolicyReadOnly:
-		args = []string{"--permission-mode", "plan"}
-		property = PermissionPolicyApplied
-	case AutonomyPolicyWorkspaceWrite:
-		args = []string{"--permission-mode", "acceptEdits"}
-		property = PermissionPolicyApplied
-	case AutonomyPolicyDangerFullAccess:
-		// Upstream refusal, Claude 2.1.223: "--dangerously-skip-permissions cannot
-		// be used with root/sudo privileges". The runtime contract above keeps
-		// this environmental precondition beside the argv that triggers it.
-		args = []string{"--permission-mode", "bypassPermissions"}
-		property = PermissionPolicyApplied
+	if agent.ReadOnlySeat {
+		args = []string{"--restricted", "--tools", "Bash,WebFetch,WebSearch", "--permission-mode", "dontAsk", "--allowedTools", "Bash,WebFetch,WebSearch"}
+		property = PermissionPolicyWidened
+	} else {
+		switch NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {
+		case AutonomyPolicyReadOnly:
+			args = []string{"--permission-mode", "plan"}
+			property = PermissionPolicyApplied
+		case AutonomyPolicyWorkspaceWrite:
+			args = []string{"--permission-mode", "acceptEdits"}
+			property = PermissionPolicyApplied
+		case AutonomyPolicyDangerFullAccess:
+			// Upstream refusal, Claude 2.1.223: "--dangerously-skip-permissions cannot
+			// be used with root/sudo privileges". The runtime contract above keeps
+			// this environmental precondition beside the argv that triggers it.
+			args = []string{"--permission-mode", "bypassPermissions"}
+			property = PermissionPolicyApplied
+		}
 	}
 	for _, path := range agent.WritablePaths {
 		if path = strings.TrimSpace(path); path != "" {

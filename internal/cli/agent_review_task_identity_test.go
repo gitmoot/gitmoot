@@ -157,7 +157,7 @@ func evaluateC1GateScenario(t *testing.T, implementTaskID string, reviewTaskID s
 			ReviewRound: "review-2", Result: &workflow.AgentResult{Decision: "approved", Summary: "round two approved"},
 		})
 	}
-	decision, err := (newHostDaemonMergeGate(store, gh, checkout, "")).Evaluate(context.Background(), request)
+	decision, err := (newHostDaemonMergeGate(store, gh, checkout, daemonMergeGateLiveOrgHome(t))).Evaluate(context.Background(), request)
 	if err != nil {
 		t.Fatalf("Evaluate: %v", err)
 	}

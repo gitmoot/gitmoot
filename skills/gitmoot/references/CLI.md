@@ -767,11 +767,38 @@ transition **instead of** `job.failed` (no preceding `job.failed`); the rule
 still holds and is forward-compatible with the older `job.failed`→`job.deferred`
 flap. See `docs/events.md` for the full contract.
 
-## Risk-Tiered Adaptive Review
+## Review Policy
 
-Scale review depth to a change's blast radius via the off-by-default `[review]`
-config section — it is **not** in the generated default config, so this is its
-discovery surface:
+Review severity controls whether a reported finding restarts the fix loop. The
+default preserves the existing block-all behavior:
+
+```toml
+[review]
+blocking_severity = "P3"
+
+[repos."themartianapp/keephair".review]
+blocking_severity = "P1"
+```
+
+The threshold is inclusive. `P1` blocks `P0` and `P1`; `P2` and `P3` still post
+their findings and record the raw `changes_requested` result, but Gitmoot treats
+the round as approved-with-notes and does not dispatch a fix. The global default
+is `P3`, so every valid finding blocks unless a repository overrides it.
+Configured values must be `P0`, `P1`, `P2`, or `P3`.
+An invalid `blocking_severity` value falls back to `P3` while other valid review
+fields remain active. Any other review-policy parse or read error rejects the
+entire applied review policy, restoring `P3` with native fanout and risk tiers
+off.
+
+The threshold applies to native review rounds only. A pipeline review stage is
+report-only — the pipeline advancer owns folding its verdict — so its raw
+`changes_requested` keeps blocking the merge gate at every threshold and never
+counts toward required-reviewer approval.
+
+### Risk-Tiered Adaptive Review
+
+Set `risk_tiers_enabled = true` in `[review]` to scale review depth to a
+change's blast radius:
 
 ```toml
 [review]
@@ -782,20 +809,21 @@ risk_label_high = "risk:high"                 # PR label that forces the high ti
 risk_label_routine = "risk:routine"           # PR label that forces the routine tier
 ```
 
-With `risk_tiers_enabled = true`, each opened PR is classified — **explicit PR
+With `risk_tiers_enabled = true`, each opened PR is classified: **explicit PR
 label > changed-path glob match > default routine** (a `risk:high`/`risk:routine`
 label wins over paths; a high label wins a label tie). A `routine` PR keeps the
 unchanged single-reviewer fan-out. A `high` PR instead fans out a delegation
-batch of **refutation-framed lens reviewers** (correctness, security, and — with
-≥3 configured reviewers — regression), each prompted to *disprove* the change and
-return structured findings `{lens, refuted, severity, confidence, evidence}` in
-`gitmoot_result.findings`. The lenses are synthesized by the existing delegation
-`synthesis_rule = quorum` engine: **any critical-severity refutation (a `blocked`
-lens decision) fails the quorum and blocks the merge**; unanimous approval
-satisfies it. The resolved tier is recorded as a `risk_tier_resolved` job event so
-an escalation is explainable in the report/dashboard. With the section absent or
-`risk_tiers_enabled` off, PR review is byte-identical to the single-reviewer path.
-The competition tier (two implementations + a judge) is a planned follow-up.
+batch of **refutation-framed lens reviewers** (correctness, security, and, with
+three or more configured reviewers, regression), each prompted to *disprove*
+the change and return structured findings `{lens, refuted, severity, confidence,
+evidence}` in `gitmoot_result.findings`. The lenses are synthesized by the
+existing delegation `synthesis_rule = quorum` engine: **any blocking refutation
+fails the quorum and blocks the merge**; the configured quorum of effective
+approvals satisfies it. The resolved tier is recorded as a
+`risk_tier_resolved` job event so an escalation is explainable in the
+report/dashboard. With `risk_tiers_enabled`
+off, PR review uses the single-reviewer path. The competition tier (two
+implementations + a judge) is a planned follow-up.
 
 ## Bug Reports
 
@@ -1877,9 +1905,12 @@ gitmoot org events rule rm --home /alternate/home <rule-id>
 `review-verdict`, `blocked`, `recycle-overdue`, `pane_input_pending`, `reply`,
 `directive`, or `fact`. A successful review terminal whose decision is
 `approved` or `changes_requested` matches both `job-terminal` and
-`review-verdict` and addresses the resolved pull request owner. If no owner can
-be resolved, addressed rules fail closed while observer rules remain eligible.
-`pane_input_pending` matches the
+`review-verdict` and addresses both the requesting org role and the resolved
+implementing role. When a successful ownership lookup finds no implement job
+or branch lock attribution, the review's persisted lead identifies a
+persistent implementing seat; lookup errors remain fail-closed. If neither
+role can be resolved, addressed rules fail closed while observer rules remain
+eligible. `pane_input_pending` matches the
 `org.input_pending` event emitted when Herdr continuously reports
 `input_pending: true` for a role's pane longer than
 `[orchestrate].blocked_role_wake_after`; it re-nudges at most once per that
@@ -2724,7 +2755,12 @@ disables it (a negative value is rejected). Unlike `[orchestrate].escalation_ttl
 
 Native task auto-merge is enabled by default only behind an exact-head approved
 review and green SHA-scoped commit statuses/check-runs. A gate miss parks the
-task as `awaiting_human_merge`, records an org escalation, and wakes `jarvis`.
+task as `awaiting_human_merge` and records an org escalation. It selects the
+most-specific live role whose scope matches the repo and addresses that role's
+nearest live chart ancestor. With no live scope match it addresses a live
+`owner`; a root match addresses itself. With no live upward recipient, the gate
+fails closed without journaling an addressed note. Archive filtering does not
+predict delivery; `org validate` reports missing wake routes and pane bindings.
 Set `[repos."owner/repo".merge_gate] auto_merge = false` as an explicit
 kill-switch; that deliberate hold does not escalate. Pipeline `allow_auto_merge`
 is independent, and an authorized `@gitmoot merge` remains an explicit override.

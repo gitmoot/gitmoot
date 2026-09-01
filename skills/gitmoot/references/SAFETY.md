@@ -46,8 +46,13 @@ merges gatelessly; the external gate makes the call.
 Gitmoot enables native task auto-merge by default, but only when an affirmative
 review verdict matches the exact current head SHA and all SHA-scoped commit
 statuses and check-runs are green. Missing or failing evidence parks the task in
-`awaiting_human_merge`, journals the reason, and actively wakes `jarvis`.
-Set `auto_merge = false` globally or per repo as an explicit kill-switch:
+`awaiting_human_merge` and journals an org escalation from the most-specific live
+role whose scope matches the repo to its nearest live chart ancestor. With no
+live scope match it addresses a live `owner`; a root match addresses itself.
+With no live upward recipient, the gate fails closed without journaling an
+addressed note. Archive filtering does not predict delivery; `org validate`
+reports missing wake routes and pane bindings. Set `auto_merge = false` globally
+or per repo as an explicit kill-switch:
 
 ```toml
 [repos."owner/repo".merge_gate]
@@ -78,9 +83,10 @@ Gitmoot does **not** immediately treat the repo as CI-less and stamp the
 synthetic `gitmoot/ci` success. GitHub Actions creates a check-run a few seconds
 *after* a head is pushed, so a single zero observation cannot distinguish "no CI
 configured" from "CI not created yet". Instead the gate returns **pending**
-(a non-escalating, automatically-retried hold — not a policy miss, so it does
-not park the task or wake `jarvis`) and only concludes "no CI" after a **second
-consecutive zero-external observation at the same head**, at least `min_ci_wait`
+(a non-escalating, automatically retried hold, not a policy miss, so it does
+not park the task or enqueue an org escalation) and only concludes "no CI" after
+a **second consecutive zero-external observation at the same head**, at least
+`min_ci_wait`
 (default `60s`) later. The gate is re-evaluated every daemon poll, so a
 genuinely CI-less repo merges exactly one grace window later, provided the
 exact-head review is also clean. Two extra guards layer on top:

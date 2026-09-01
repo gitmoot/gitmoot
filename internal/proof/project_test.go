@@ -301,6 +301,85 @@ func TestReviewIndependenceRequiresNormalizedNonEmptyAgents(t *testing.T) {
 	}
 }
 
+func TestApprovedWithNotesProofUsesDurableOutcomeEvent(t *testing.T) {
+	root, jobs, results, receipts, events := proofFixture(t, false)
+	results["review-job"] = &workflow.AgentResult{
+		Decision: "changes_requested",
+		Severity: "P2",
+		Summary:  "non-blocking polish",
+	}
+
+	withoutEvent := Project(root, jobs, results, receipts, events)
+	for _, node := range withoutEvent.Nodes {
+		if node.Kind != KindReview {
+			continue
+		}
+		if node.Attrs["decision"] != "changes_requested" {
+			t.Fatalf("raw review decision = %q, want changes_requested", node.Attrs["decision"])
+		}
+		if node.Attrs["effective_decision"] != "" {
+			t.Fatalf("review without durable outcome event gained effective decision %q", node.Attrs["effective_decision"])
+		}
+		for _, claim := range node.Claims {
+			if claim.Type == "review.independent_approved" {
+				t.Fatal("review without durable outcome event gained an approval claim")
+			}
+		}
+	}
+
+	events["review-job"] = []db.JobEvent{{
+		JobID: "review-job", Kind: workflow.ReviewApprovedWithNotesEventKind,
+		Message:   "review severity P2 is below repository blocking severity P1",
+		CreatedAt: "2026-07-17 01:09:30",
+	}}
+	withEvent := Project(root, jobs, results, receipts, events)
+	assertClaim(t, withEvent, KindReview, "review.independent_approved", GradeObserved)
+	for _, node := range withEvent.Nodes {
+		if node.Kind != KindReview {
+			continue
+		}
+		if node.Attrs["decision"] != "changes_requested" {
+			t.Fatalf("approved-with-notes raw decision = %q, want changes_requested", node.Attrs["decision"])
+		}
+		if node.Attrs["effective_decision"] != "approved" ||
+			node.Attrs["review_outcome"] != "approved-with-notes" {
+			t.Fatalf("approved-with-notes attrs = %+v", node.Attrs)
+		}
+		for _, claim := range node.Claims {
+			if claim.Type == "review.independent_approved" &&
+				claim.Source != "job_event."+workflow.ReviewApprovedWithNotesEventKind {
+				t.Fatalf("approved-with-notes claim source = %q", claim.Source)
+			}
+		}
+	}
+
+	// The rendered tree is the surface a human reads before merging, so it must
+	// not contradict the claim graph it was built from: an approval claim with a
+	// "0 approved" summary is a false negative in exactly that direction.
+	var rendered bytes.Buffer
+	if err := RenderTree(&rendered, withEvent); err != nil {
+		t.Fatalf("RenderTree returned error: %v", err)
+	}
+	out := rendered.String()
+	if !strings.Contains(out, "1 reviews / 1 approved") {
+		t.Fatalf("approved-with-notes render did not count the approval:\n%s", out)
+	}
+	if !strings.Contains(out, "changes_requested (approved-with-notes)") {
+		t.Fatalf("approved-with-notes render lost the raw verdict or the outcome:\n%s", out)
+	}
+
+	// Without the durable event the same review must still render as raw
+	// changes_requested and count zero approvals.
+	rendered.Reset()
+	if err := RenderTree(&rendered, withoutEvent); err != nil {
+		t.Fatalf("RenderTree returned error: %v", err)
+	}
+	if raw := rendered.String(); !strings.Contains(raw, "1 reviews / 0 approved") ||
+		strings.Contains(raw, "approved-with-notes") {
+		t.Fatalf("blocking review render = \n%s", raw)
+	}
+}
+
 func TestProjectHonestGapsRenderDash(t *testing.T) {
 	result := &workflow.AgentResult{Decision: "implemented", Summary: "done"}
 	root := db.Job{

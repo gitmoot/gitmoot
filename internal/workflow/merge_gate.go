@@ -554,7 +554,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if _, superseded := supersededReviewIDs[review.job.ID]; superseded {
 			continue
 		}
-		switch review.payload.Result.Decision {
+		switch effectiveReviewDecisionForPayload(review.payload, request.ReviewBlockingSeverity) {
 		case "changes_requested", "blocked", "failed":
 			return mergeBlocked{reason: fmt.Sprintf("review at evaluated head has blocking result from %s", review.job.Agent)}
 		}
@@ -571,9 +571,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			if review.payload.Result == nil {
 				return fmt.Errorf("abstaining reviewer %s at evaluated head has no recognized decision (job %s); requeue or reassign the review", reviewer, review.job.ID)
 			}
-			switch review.payload.Result.Decision {
+			switch effectiveReviewDecisionForPayload(review.payload, request.ReviewBlockingSeverity) {
 			case "approved":
-				if err := ensureDelegatedReviewEvidence(review.job, delegationChildrenByParent[review.job.ID]); err != nil {
+				if err := ensureDelegatedReviewEvidence(review.job, delegationChildrenByParent[review.job.ID], request.ReviewBlockingSeverity); err != nil {
 					return err
 				}
 				switch {
@@ -654,7 +654,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if _, superseded := supersededReviewIDs[job.ID]; superseded {
 			continue
 		}
-		if payload.Result.Decision == "approved" {
+		if effectiveReviewDecisionForPayload(payload, request.ReviewBlockingSeverity) == "approved" {
 			reviewerAgent := strings.TrimSpace(job.Agent)
 			switch {
 			case reviewerAgent == "":
@@ -687,9 +687,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			}
 			return err
 		}
-		switch payload.Result.Decision {
+		switch effectiveReviewDecisionForPayload(payload, request.ReviewBlockingSeverity) {
 		case "approved":
-			if err := ensureDelegatedReviewEvidence(job, delegationChildrenByParent[job.ID]); err != nil {
+			if err := ensureDelegatedReviewEvidence(job, delegationChildrenByParent[job.ID], request.ReviewBlockingSeverity); err != nil {
 				return err
 			}
 			approved = true
@@ -710,7 +710,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	return nil
 }
 
-func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job) error {
+func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job, blockingSeverity string) error {
 	if len(children) == 0 {
 		return nil
 	}
@@ -736,7 +736,7 @@ func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job) error {
 				unrecognized = append(unrecognized, fmt.Sprintf("%s (nil result)", childID))
 				continue
 			}
-			decision := strings.TrimSpace(payload.Result.Decision)
+			decision := effectiveDelegationDecision(payload.Result, child.Type, "", blockingSeverity)
 			switch decision {
 			case "approved":
 				hasApproval = true

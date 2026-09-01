@@ -1233,8 +1233,16 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    Agents review, request fixes, and rerun work through comments and job output.
    Native task auto-merge is enabled by default, but only with an approved review
    verdict for the exact current head SHA and green SHA-scoped commit statuses
-   and check-runs. A miss leaves the PR open, records an org escalation, and wakes
-   `jarvis`. Set `[merge_gate] auto_merge = false` globally or per repository as
+   and check-runs. A miss leaves the PR open, records an org escalation, and
+   enqueues an addressed workflow-note wake. The sender is the most-specific live
+   org role whose scope matches the repo, and the recipient is its nearest live
+   chart ancestor. With no live scope match, the recipient is the live `owner`
+   root; when the match is already the root, the note addresses that root itself.
+   If no live upward recipient exists, the gate fails closed without journaling
+   an addressed note. Archive filtering does not predict delivery; `org validate`
+   reports missing wake routes and pane bindings. Set
+   `[merge_gate] auto_merge = false` globally or per
+   repository as
    an explicit kill-switch. The merge gate also checks local worktree cleanliness,
    branch freshness, and mergeability. Final merge work
    is serialized per repository base branch. Before the policy gate can issue
@@ -2736,6 +2744,8 @@ Symptoms:
 - The PR remains `ready_to_merge`.
 - `gitmoot/merge-gate` is pending or failing.
 - The daemon retries a queued merge.
+- `gitmoot/merge-gate` is pending with `Gitmoot merge gate has not cleared
+  this head` before the policy gate has produced a more specific verdict.
 
 Checks:
 
@@ -2747,6 +2757,21 @@ git status --short
 
 Fixes:
 
+- The generic `has not cleared this head` status makes an active managed head
+  visibly unjudged, so an unevaluated head stops reading as an approved one. A
+  later gate evaluation replaces it with the specific pending, failure, or
+  success verdict for that same head.
+- Gitmoot publishes it only while it owns the merge decision. With
+  `[merge_gate] auto_merge = false`, with `GITMOOT_DISABLE_NATIVE_MERGE_GATE=1`,
+  or once a task reaches `awaiting_human_merge`, `dismissed`, `superseded`,
+  `stranded` or `merged`, Gitmoot replaces only its own generic marker with
+  `Gitmoot merge gate is not applied to this head` and preserves a real gate
+  failure or a specific pending verdict.
+- A `blocked` or `awaiting_human` task KEEPS the generic marker, because that
+  head genuinely has not been cleared and Gitmoot can still resolve it when the
+  task resumes.
+- A draft pull request keeps the generic marker until it is undrafted, because
+  the gate deliberately withholds a verdict on a draft head.
 - Clean the local worktree before the daemon attempts the merge.
 - If the reason says an active job is in flight on the PR branch, let that queued
   or running job settle (or cancel it deliberately). This is a transient safety
@@ -2764,8 +2789,9 @@ Fixes:
   manually or run an explicit implement/fix job, then rerun review/merge.
 - Fix failing external CI or Gitmoot statuses.
 - If the task is `awaiting_human_merge`, inspect its reason. Either the mandatory
-  exact-head review/CI gate missed (also escalated to `jarvis`) or the repository
-  has the explicit `[merge_gate] auto_merge = false` kill-switch. Merge it in
+  exact-head review/CI gate missed (and the daemon journaled its chart-derived org
+  escalation) or the repository has the explicit
+  `[merge_gate] auto_merge = false` kill-switch. Merge it in
   GitHub or use an authorized `@gitmoot merge` comment. If more implementation
   is required instead, a coordinator can explicitly run `gitmoot task
   resume-work <id> --reason "..." --override-pending-human-decision`; this
@@ -3064,9 +3090,13 @@ case-insensitive and exact. Job IDs always use case-insensitive substring
 matching, including slash-bearing delegation IDs. Without a slash, repositories
 also use substring matching; empty matches all. Pass only one of `--match` and
 `--repo`. A successful review terminal whose decision is `approved` or
-`changes_requested` matches both `job-terminal` and `review-verdict` and
-addresses the pull request owner's role. If no role can be resolved, addressed
-rules fail closed while observer rules can still receive the verdict. A plain
+`changes_requested` matches both `job-terminal` and `review-verdict`. Addressed
+rules may deliver that verdict to both the requesting org role and the pull
+request's implementing role. When a successful ownership lookup finds no
+implement job or branch lock attribution, the review's persisted lead
+identifies a persistent implementing seat; lookup errors remain fail-closed. If
+neither role can be resolved, addressed rules fail closed while observer rules
+can still receive the verdict. A plain
 `job.blocked` event matches both `job-terminal` and `blocked`, while
 guard-caused blocks match `guard` first. A synthesized `blocked_since` event
 matches only `blocked`. Task episodes due in
@@ -9918,8 +9948,8 @@ can discover Gitmoot through an installed runtime plugin. Use
 adds the resolved `.gitmoot` home to the sandbox on Linux, macOS, and Windows.
 Use `gitmoot goal template` when
 writing a standard task-by-task goal file. Use `gitmoot workflow list`, `gitmoot
-workflow show`, `gitmoot workflow describe`, `gitmoot workflow note`, and
-`gitmoot workflow close` to
+workflow show`, `gitmoot workflow show-note`, `gitmoot workflow describe`,
+`gitmoot workflow note`, and `gitmoot workflow close` to
 inspect external-coordinator workflow groups, set their stable description, add
 verbatim journal entries, set a manual status escape hatch, optionally stage
 a note in persistent memory, and end a finished group. Workflow hygiene:
@@ -9927,6 +9957,9 @@ a note in persistent memory, and end a finished group. Workflow hygiene:
 work merges or completes — never-closed workflows accumulate and bury live
 work in the dashboard's active buckets and every workflow-picking surface. Linked PR lifecycle transitions also add deduped
 `daemon` journal notes and advance live status.
+In org mode, `gitmoot org message send --to <role> --workflow <label>
+"<message>"` gives distinct same-parent siblings a durable sender-attributed
+heads-up. It creates no acknowledgment, completion, TTL, or nag obligation.
 In org mode, obligations and questions have a full lifecycle and closing it is
 part of the work: `gitmoot org directive send --to <role> --workflow <label>`
 mints a tracked, TTL-nudged obligation; `org directive ack <id>` records
@@ -11030,11 +11063,38 @@ transition **instead of** `job.failed` (no preceding `job.failed`); the rule
 still holds and is forward-compatible with the older `job.failed`→`job.deferred`
 flap. See `docs/events.md` for the full contract.
 
-## Risk-Tiered Adaptive Review
+## Review Policy
 
-Scale review depth to a change's blast radius via the off-by-default `[review]`
-config section — it is **not** in the generated default config, so this is its
-discovery surface:
+Review severity controls whether a reported finding restarts the fix loop. The
+default preserves the existing block-all behavior:
+
+```toml
+[review]
+blocking_severity = "P3"
+
+[repos."themartianapp/keephair".review]
+blocking_severity = "P1"
+```
+
+The threshold is inclusive. `P1` blocks `P0` and `P1`; `P2` and `P3` still post
+their findings and record the raw `changes_requested` result, but Gitmoot treats
+the round as approved-with-notes and does not dispatch a fix. The global default
+is `P3`, so every valid finding blocks unless a repository overrides it.
+Configured values must be `P0`, `P1`, `P2`, or `P3`.
+An invalid `blocking_severity` value falls back to `P3` while other valid review
+fields remain active. Any other review-policy parse or read error rejects the
+entire applied review policy, restoring `P3` with native fanout and risk tiers
+off.
+
+The threshold applies to native review rounds only. A pipeline review stage is
+report-only — the pipeline advancer owns folding its verdict — so its raw
+`changes_requested` keeps blocking the merge gate at every threshold and never
+counts toward required-reviewer approval.
+
+### Risk-Tiered Adaptive Review
+
+Set `risk_tiers_enabled = true` in `[review]` to scale review depth to a
+change's blast radius:
 
 ```toml
 [review]
@@ -11045,20 +11105,21 @@ risk_label_high = "risk:high"                 # PR label that forces the high ti
 risk_label_routine = "risk:routine"           # PR label that forces the routine tier
 ```
 
-With `risk_tiers_enabled = true`, each opened PR is classified — **explicit PR
+With `risk_tiers_enabled = true`, each opened PR is classified: **explicit PR
 label > changed-path glob match > default routine** (a `risk:high`/`risk:routine`
 label wins over paths; a high label wins a label tie). A `routine` PR keeps the
 unchanged single-reviewer fan-out. A `high` PR instead fans out a delegation
-batch of **refutation-framed lens reviewers** (correctness, security, and — with
-≥3 configured reviewers — regression), each prompted to *disprove* the change and
-return structured findings `{lens, refuted, severity, confidence, evidence}` in
-`gitmoot_result.findings`. The lenses are synthesized by the existing delegation
-`synthesis_rule = quorum` engine: **any critical-severity refutation (a `blocked`
-lens decision) fails the quorum and blocks the merge**; unanimous approval
-satisfies it. The resolved tier is recorded as a `risk_tier_resolved` job event so
-an escalation is explainable in the report/dashboard. With the section absent or
-`risk_tiers_enabled` off, PR review is byte-identical to the single-reviewer path.
-The competition tier (two implementations + a judge) is a planned follow-up.
+batch of **refutation-framed lens reviewers** (correctness, security, and, with
+three or more configured reviewers, regression), each prompted to *disprove*
+the change and return structured findings `{lens, refuted, severity, confidence,
+evidence}` in `gitmoot_result.findings`. The lenses are synthesized by the
+existing delegation `synthesis_rule = quorum` engine: **any blocking refutation
+fails the quorum and blocks the merge**; the configured quorum of effective
+approvals satisfies it. The resolved tier is recorded as a
+`risk_tier_resolved` job event so an escalation is explainable in the
+report/dashboard. With `risk_tiers_enabled`
+off, PR review uses the single-reviewer path. The competition tier (two
+implementations + a judge) is a planned follow-up.
 
 ## Bug Reports
 
@@ -11885,8 +11946,8 @@ whichever current pane uniquely carries that cosmetic value. `org seat add`
 canonicalizes new bindings to ids. Roles without a binding report unknown live
 presence, and event wakes for them are skipped with an observable log and
 increment the role's missed-wake counter rather than being inferred from a pane
-label. There is exactly one root named `owner`; accepted scopes are `*`,
-`owner/*`, and
+label. There is
+exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
 `owner/repo`, and each child scope must be covered by its parent. Malformed
 org configuration fails closed and loudly. `brief` records passive last-seen
 presence for its role and can render static context with provider state
@@ -12140,9 +12201,12 @@ gitmoot org events rule rm --home /alternate/home <rule-id>
 `review-verdict`, `blocked`, `recycle-overdue`, `pane_input_pending`, `reply`,
 `directive`, or `fact`. A successful review terminal whose decision is
 `approved` or `changes_requested` matches both `job-terminal` and
-`review-verdict` and addresses the resolved pull request owner. If no owner can
-be resolved, addressed rules fail closed while observer rules remain eligible.
-`pane_input_pending` matches the
+`review-verdict` and addresses both the requesting org role and the resolved
+implementing role. When a successful ownership lookup finds no implement job
+or branch lock attribution, the review's persisted lead identifies a
+persistent implementing seat; lookup errors remain fail-closed. If neither
+role can be resolved, addressed rules fail closed while observer rules remain
+eligible. `pane_input_pending` matches the
 `org.input_pending` event emitted when Herdr continuously reports
 `input_pending: true` for a role's pane longer than
 `[orchestrate].blocked_role_wake_after`; it re-nudges at most once per that
@@ -12987,7 +13051,12 @@ disables it (a negative value is rejected). Unlike `[orchestrate].escalation_ttl
 
 Native task auto-merge is enabled by default only behind an exact-head approved
 review and green SHA-scoped commit statuses/check-runs. A gate miss parks the
-task as `awaiting_human_merge`, records an org escalation, and wakes `jarvis`.
+task as `awaiting_human_merge` and records an org escalation. It selects the
+most-specific live role whose scope matches the repo and addresses that role's
+nearest live chart ancestor. With no live scope match it addresses a live
+`owner`; a root match addresses itself. With no live upward recipient, the gate
+fails closed without journaling an addressed note. Archive filtering does not
+predict delivery; `org validate` reports missing wake routes and pane bindings.
 Set `[repos."owner/repo".merge_gate] auto_merge = false` as an explicit
 kill-switch; that deliberate hold does not escalate. Pipeline `allow_auto_merge`
 is independent, and an authorized `@gitmoot merge` remains an explicit override.
@@ -16678,8 +16747,13 @@ merges gatelessly; the external gate makes the call.
 Gitmoot enables native task auto-merge by default, but only when an affirmative
 review verdict matches the exact current head SHA and all SHA-scoped commit
 statuses and check-runs are green. Missing or failing evidence parks the task in
-`awaiting_human_merge`, journals the reason, and actively wakes `jarvis`.
-Set `auto_merge = false` globally or per repo as an explicit kill-switch:
+`awaiting_human_merge` and journals an org escalation from the most-specific live
+role whose scope matches the repo to its nearest live chart ancestor. With no
+live scope match it addresses a live `owner`; a root match addresses itself.
+With no live upward recipient, the gate fails closed without journaling an
+addressed note. Archive filtering does not predict delivery; `org validate`
+reports missing wake routes and pane bindings. Set `auto_merge = false` globally
+or per repo as an explicit kill-switch:
 
 ```toml
 [repos."owner/repo".merge_gate]
@@ -16710,9 +16784,10 @@ Gitmoot does **not** immediately treat the repo as CI-less and stamp the
 synthetic `gitmoot/ci` success. GitHub Actions creates a check-run a few seconds
 *after* a head is pushed, so a single zero observation cannot distinguish "no CI
 configured" from "CI not created yet". Instead the gate returns **pending**
-(a non-escalating, automatically-retried hold — not a policy miss, so it does
-not park the task or wake `jarvis`) and only concludes "no CI" after a **second
-consecutive zero-external observation at the same head**, at least `min_ci_wait`
+(a non-escalating, automatically retried hold, not a policy miss, so it does
+not park the task or enqueue an org escalation) and only concludes "no CI" after
+a **second consecutive zero-external observation at the same head**, at least
+`min_ci_wait`
 (default `60s`) later. The gate is re-evaluated every daemon poll, so a
 genuinely CI-less repo merges exactly one grace window later, provided the
 exact-head review is also clean. Two extra guards layer on top:
@@ -17240,6 +17315,12 @@ findings and non-review jobs omit it.
 This field is the engine-readable round severity. A `severity` key nested inside
 an individual `findings[]` object remains useful for display, but does not
 replace the top-level field.
+
+Repository policy may set an inclusive blocking threshold. With
+`blocking_severity = "P1"`, `P0` and `P1` restart the fix loop; `P2` and `P3`
+resolve as approved-with-notes. Gitmoot still stores and posts the original
+`changes_requested` result and its findings. The default threshold is `P3`, so
+all valid severities block unless configured otherwise.
 
 Session review jobs use the same rule. Pass `--severity P0|P1|P2|P3` to
 `job close` or `job record` when the decision is `changes_requested`.

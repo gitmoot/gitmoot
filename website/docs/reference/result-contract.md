@@ -57,6 +57,12 @@ This field is the engine-readable round severity. A `severity` key nested inside
 an individual `findings[]` object remains useful for display, but does not
 replace the top-level field.
 
+Repository policy may set an inclusive blocking threshold. With
+`blocking_severity = "P1"`, `P0` and `P1` restart the fix loop; `P2` and `P3`
+resolve as approved-with-notes. Gitmoot still stores and posts the original
+`changes_requested` result and its findings. The default threshold is `P3`, so
+all valid severities block unless configured otherwise.
+
 The narrative and evidence fields are reporting-only. Do not claim tests were run
 in `tests_run` unless they were actually run, and do not list files in
 `changes_made` unless they were actually changed. Name repo-relative file paths

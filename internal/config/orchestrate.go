@@ -1,11 +1,14 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 )
 
 const (
@@ -496,6 +499,9 @@ type ReviewPolicy struct {
 	// NativeFanoutEnabled permits HandlePullRequestOpened to schedule the
 	// configured native reviewer roster. Default false = OFF.
 	NativeFanoutEnabled bool
+	// BlockingSeverity is the least severe changes-requested review that restarts
+	// the fix loop. Default P3 preserves the historical block-all behavior.
+	BlockingSeverity string
 	// RiskTiersEnabled opts the engine into risk-tiered review. Default false = OFF.
 	RiskTiersEnabled bool
 	// HighRiskPaths is the changed-path glob list that resolves the `high` tier.
@@ -509,22 +515,80 @@ type ReviewPolicy struct {
 }
 
 func DefaultReviewPolicy() ReviewPolicy {
-	return ReviewPolicy{NativeFanoutEnabled: false, RiskTiersEnabled: false}
+	return ReviewPolicy{
+		NativeFanoutEnabled: false,
+		BlockingSeverity:    reviewseverity.DefaultBlocking,
+		RiskTiersEnabled:    false,
+	}
 }
 
-// ReviewConfig is the parsed global [review] policy plus the
-// [repos."owner/repo".review].native_fanout_enabled override.
+// ReviewConfig is the parsed global [review] policy plus repository-scoped
+// native_fanout_enabled and blocking_severity overrides.
 type ReviewConfig struct {
 	Global ReviewPolicy
 	repos  map[string]reviewPolicyOverride
 }
 
+type reviewConfigFieldError struct {
+	section string
+	field   string
+	err     error
+}
+
+func (e *reviewConfigFieldError) Error() string {
+	return fmt.Sprintf("parse %s.%s: %v", e.section, e.field, e.err)
+}
+
+func (e *reviewConfigFieldError) Unwrap() error {
+	return e.err
+}
+
+// ReviewConfigErrorsOnlyBlockingSeverity reports whether every parse failure is
+// a blocking_severity field. Those failures are safe to retain because the
+// parser replaces that field with the fail-closed P3 default. Any other parse
+// failure makes the applied review policy ambiguous and must reject the file.
+func ReviewConfigErrorsOnlyBlockingSeverity(err error) bool {
+	if err == nil {
+		return false
+	}
+	seen := false
+	onlyBlockingSeverity := true
+	var visit func(error)
+	visit = func(current error) {
+		if current == nil {
+			return
+		}
+		if fieldErr, ok := current.(*reviewConfigFieldError); ok {
+			seen = true
+			if fieldErr.field != "blocking_severity" {
+				onlyBlockingSeverity = false
+			}
+			return
+		}
+		if joined, ok := current.(interface{ Unwrap() []error }); ok {
+			for _, child := range joined.Unwrap() {
+				visit(child)
+			}
+			return
+		}
+		if wrapped, ok := current.(interface{ Unwrap() error }); ok {
+			visit(wrapped.Unwrap())
+			return
+		}
+		seen = true
+		onlyBlockingSeverity = false
+	}
+	visit(err)
+	return seen && onlyBlockingSeverity
+}
+
 type reviewPolicyOverride struct {
 	nativeFanoutEnabled *bool
+	blockingSeverity    *string
 }
 
 // For resolves the effective policy for repo. Risk-tier settings remain global;
-// only native fanout has a repository override.
+// native fanout and blocking severity support repository overrides.
 func (c ReviewConfig) For(repo string) ReviewPolicy {
 	policy := c.Global
 	policy.HighRiskPaths = append([]string(nil), policy.HighRiskPaths...)
@@ -532,12 +596,17 @@ func (c ReviewConfig) For(repo string) ReviewPolicy {
 	if ok && override.nativeFanoutEnabled != nil {
 		policy.NativeFanoutEnabled = *override.nativeFanoutEnabled
 	}
+	if ok && override.blockingSeverity != nil {
+		policy.BlockingSeverity = *override.blockingSeverity
+	}
 	return policy
 }
 
 // LoadReviewConfig parses [review] and [repos."owner/repo".review]. A missing
-// config file or section yields the default with native fanout and risk tiers
-// both disabled.
+// config file or section yields blocking severity P3, with native fanout and
+// risk tiers disabled. Invalid fields retain their safe defaults while valid
+// fields continue to load; the joined parse error still lets strict callers
+// reject the file.
 func LoadReviewConfig(paths Paths) (ReviewConfig, error) {
 	content, err := os.ReadFile(paths.ConfigFile)
 	if err != nil {
@@ -549,6 +618,7 @@ func LoadReviewConfig(paths Paths) (ReviewConfig, error) {
 	cfg := ReviewConfig{Global: DefaultReviewPolicy(), repos: map[string]reviewPolicyOverride{}}
 	var repo string
 	inSection := false
+	var parseErrors []error
 	for _, raw := range strings.Split(string(content), "\n") {
 		line := strings.TrimSpace(stripConfigComment(raw))
 		if line == "" {
@@ -575,17 +645,21 @@ func LoadReviewConfig(paths Paths) (ReviewConfig, error) {
 		value = strings.TrimSpace(value)
 		if repo == "" {
 			if err := applyReviewPolicyField(&cfg.Global, key, value); err != nil {
-				return ReviewConfig{}, fmt.Errorf("parse [review].%s: %w", key, err)
+				parseErrors = append(parseErrors, &reviewConfigFieldError{
+					section: "[review]", field: key, err: err,
+				})
 			}
 			continue
 		}
 		override := cfg.repos[repo]
 		if err := applyReviewPolicyOverrideField(&override, key, value); err != nil {
-			return ReviewConfig{}, fmt.Errorf("parse [repos.%q.review].%s: %w", repo, key, err)
+			parseErrors = append(parseErrors, &reviewConfigFieldError{
+				section: fmt.Sprintf("[repos.%q.review]", repo), field: key, err: err,
+			})
 		}
 		cfg.repos[repo] = override
 	}
-	return cfg, nil
+	return cfg, errors.Join(parseErrors...)
 }
 
 func parseReviewSection(section string) (string, bool) {
@@ -618,6 +692,14 @@ func applyReviewPolicyField(policy *ReviewPolicy, key string, value string) erro
 			return err
 		}
 		policy.NativeFanoutEnabled = parsed
+		return nil
+	case "blocking_severity":
+		parsed, err := parseReviewBlockingSeverity(value)
+		if err != nil {
+			policy.BlockingSeverity = reviewseverity.DefaultBlocking
+			return err
+		}
+		policy.BlockingSeverity = parsed
 		return nil
 	case "risk_tiers_enabled":
 		parsed, err := parseConfigBool(value)
@@ -653,15 +735,38 @@ func applyReviewPolicyField(policy *ReviewPolicy, key string, value string) erro
 }
 
 func applyReviewPolicyOverrideField(override *reviewPolicyOverride, key string, value string) error {
-	if key != "native_fanout_enabled" {
+	switch key {
+	case "native_fanout_enabled":
+		parsed, err := parseConfigBool(value)
+		if err != nil {
+			return err
+		}
+		override.nativeFanoutEnabled = &parsed
+		return nil
+	case "blocking_severity":
+		parsed, err := parseReviewBlockingSeverity(value)
+		if err != nil {
+			safe := reviewseverity.DefaultBlocking
+			override.blockingSeverity = &safe
+			return err
+		}
+		override.blockingSeverity = &parsed
+		return nil
+	default:
 		return nil
 	}
-	parsed, err := parseConfigBool(value)
+}
+
+func parseReviewBlockingSeverity(value string) (string, error) {
+	parsed, err := parseConfigString(value)
 	if err != nil {
-		return err
+		return "", err
 	}
-	override.nativeFanoutEnabled = &parsed
-	return nil
+	severity := strings.ToUpper(strings.TrimSpace(parsed))
+	if !reviewseverity.Valid(severity) {
+		return "", fmt.Errorf("blocking severity %q must be one of %s", parsed, strings.Join(reviewseverity.Values, ", "))
+	}
+	return severity, nil
 }
 
 // SkillOptPolicy is the host-level template-learning policy read from the

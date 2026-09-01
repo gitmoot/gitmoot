@@ -56,13 +56,17 @@ func TestNativeReviewWorkerRunsInOwnedExactHeadWorktree(t *testing.T) {
 		t.Fatalf("scheduled job is not a native workflow review: %+v", job)
 	}
 
-	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"exact head reviewed","findings":[],"changes_made":[],"tests_run":["exact-head smoke"],"needs":[],"delegations":[]}}`}
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	runner := &sandboxAdapterCaptureRunner{stdout: `{"result":"{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"exact head reviewed\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"exact-head smoke\"],\"needs\":[],\"delegations\":[]}}"}`}
 	worker := defaultJobWorker(store, io.Discard, home)
 	var deliveredCheckout, deliveredHead string
-	worker.AdapterFactory = func(_ runtime.Agent, checkout string) (workflow.DeliveryAdapter, error) {
+	worker.AdapterFactory = func(agent runtime.Agent, checkout string) (workflow.DeliveryAdapter, error) {
+		if !agent.ReadOnlySeat {
+			t.Fatal("native review reached adapter construction without hard read-only seat marker")
+		}
 		deliveredCheckout = checkout
 		deliveredHead = readonlyWorktreeHead(t, checkout)
-		return adapter, nil
+		return runtime.ClaudeAdapter{Runner: runner}, nil
 	}
 	gate := &cliWorkerFakeMergeGate{decision: workflow.MergeDecision{Ready: true}}
 	worker.WorkflowFactory = func(checkout string) workflow.Engine {
@@ -78,15 +82,15 @@ func TestNativeReviewWorkerRunsInOwnedExactHeadWorktree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetJob after run: %v", err)
 	}
-	if reloaded.State != string(workflow.JobSucceeded) || adapter.calls != 1 {
-		t.Fatalf("native review state=%q deliveries=%d, want succeeded with one delivery", reloaded.State, adapter.calls)
+	if reloaded.State != string(workflow.JobSucceeded) || len(runner.args) == 0 {
+		t.Fatalf("native review state=%q runner args=%v payload=%s, want succeeded delivery", reloaded.State, runner.args, reloaded.Payload)
 	}
 	payload, err := daemonJobPayload(reloaded)
 	if err != nil {
 		t.Fatalf("daemonJobPayload: %v", err)
 	}
-	if !payload.ReadOnlyWorktree || payload.WorktreePath == "" {
-		t.Fatalf("native review payload has no owned read-only worktree: %+v", payload)
+	if !payload.ReadOnlyWorktree || !payload.ReadOnlySeat || payload.WorktreePath == "" {
+		t.Fatalf("native review payload has no owned hard read-only seat: %+v", payload)
 	}
 	if deliveredCheckout == sharedCheckout {
 		t.Fatalf("native review delivered from shared checkout %q", deliveredCheckout)
@@ -237,8 +241,8 @@ func TestNativeReviewWorktreePreparationCoversHighRiskLensChild(t *testing.T) {
 			_ = gitutil.NewHostClient(sharedCheckout).RemoveWorktreeForce(context.Background(), persisted.WorktreePath)
 		}
 	})
-	if !persisted.ReadOnlyWorktree || persisted.WorktreePath != deliveredCheckout {
-		t.Fatalf("high-risk lens payload = %+v, want owned read-only worktree %q", persisted, deliveredCheckout)
+	if !persisted.ReadOnlyWorktree || !persisted.ReadOnlySeat || persisted.WorktreePath != deliveredCheckout {
+		t.Fatalf("high-risk lens payload = %+v, want owned hard read-only seat %q", persisted, deliveredCheckout)
 	}
 	events, err := store.ListJobEvents(ctx, jobID)
 	if err != nil {
@@ -285,13 +289,14 @@ func cleanupNativeReviewWorktrees(t *testing.T, checkout string, paths ...string
 
 // TestRoutineNativeReviewLegsGetDistinctSchedulerCheckoutKeys is F2. Two reviewer
 // legs for ONE pull request used to be admitted on the same repo:<repo> checkout
-// key, because queuedJobCheckoutKey reads payload.WorktreePath and the routine leg
-// carried none until the worker allocated one AFTER admission. Scheduler
-// exclusivity is strict (`if s.checkouts[checkoutKey] { return false }`), so only
-// one leg ran per tick and it held that key for a full LLM review.
+// key, because queuedJobCheckoutKey saw no payload WorktreePath until the worker
+// allocated one AFTER admission. Scheduler exclusivity is strict
+// (`if s.checkouts[checkoutKey] { return false }`), so only one leg ran per tick
+// and it held that key for a full LLM review.
 //
-// MUTATION PROOF: make prepareNativeReviewWorktree return its request untouched
-// and both keys collapse to "repo:owner/repo".
+// MUTATION PROOF: make prepareNativeReviewWorktree return its request untouched.
+// The payload assertions fail even though the scheduler's defensive job-local key
+// prevents TaskID from redirecting the leg to the implementation checkout.
 func TestRoutineNativeReviewLegsGetDistinctSchedulerCheckoutKeys(t *testing.T) {
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
@@ -300,6 +305,12 @@ func TestRoutineNativeReviewLegsGetDistinctSchedulerCheckoutKeys(t *testing.T) {
 	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer-a", runtime.ClaudeRuntime, runtime.LastRef, []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer-b", runtime.ClaudeRuntime, runtime.LastRef, []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	seedDaemonWorkerAgentWithPolicy(t, store, "implementer", runtime.ShellRuntime, "true", []string{"implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-1698", RepoFullName: "owner/repo", State: string(workflow.TaskImplementing),
+		Branch: "feature/review", WorktreePath: sharedCheckout,
+	}); err != nil {
+		t.Fatalf("seed owning implementation task: %v", err)
+	}
 
 	fanout := routineNativeReviewFanoutEngine(store, sharedCheckout, home)
 	if err := fanout.HandlePullRequestOpened(ctx, workflow.PullRequestEvent{
@@ -344,8 +355,9 @@ func TestRoutineNativeReviewLegsGetDistinctSchedulerCheckoutKeys(t *testing.T) {
 			t.Fatalf("leg %s worktree head = %q, want the review head %q", job.ID, head, reviewHead)
 		}
 		key := queuedJobCheckoutKey(ctx, store, job)
-		if !strings.HasPrefix(key, "worktree:") {
-			t.Fatalf("leg %s checkout key = %q, want worktree:<path> (it would serialize on the shared repo key)", job.ID, key)
+		wantKey := "worktree:" + payload.WorktreePath
+		if key != wantKey {
+			t.Fatalf("leg %s checkout key = %q, want exact review worktree key %q, not owning task checkout %q", job.ID, key, wantKey, sharedCheckout)
 		}
 		keys[job.ID] = key
 		// The SAME configuration must not also allocate in the worker: the helper's
