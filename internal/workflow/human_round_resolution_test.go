@@ -83,28 +83,47 @@ func TestConcurrentResumeAndTTLResolveExactlyOnce(t *testing.T) {
 		t.Fatalf("%s events = %d, want exactly 1: the winner's effects were not receipted once", escalationEffectsCompletedEvent, got)
 	}
 
-	// THE CONSEQUENCE THAT MATTERS: a later legitimate round must still be
-	// resolvable, i.e. requested=2 with resolved=1. The retry verb re-enqueues the
-	// leg (no continuation in flight), so a second failure genuinely re-pauses.
+	// EXACTLY ONE WINNER'S EFFECTS, and the test must not assume WHICH side won: this
+	// is a genuine race, so it reads the resolution record and asserts the winner's
+	// effect exists while the loser's does NOT. (The deterministic
+	// resume-inside-the-TTL-window test below pins the human-wins ordering and the
+	// re-escalation consequence.)
+	resolution, found, err := engine.loadResolution(ctx, "parent-job")
+	if err != nil || !found {
+		t.Fatalf("loadResolution found=%v err=%v", found, err)
+	}
 	resumeJobID := "parent-job/delegation/api/resume"
-	if _, err := store.GetJob(ctx, resumeJobID); err != nil {
-		t.Fatalf("the winning resolver did not enqueue the retry leg: %v", err)
+	continuationID := delegationContinuationID("parent-job")
+	_, retryLeg := store.GetJob(ctx, resumeJobID)
+	_, continuation := store.GetJob(ctx, continuationID)
+	switch resolution.Reason {
+	case string(ResumeRetry):
+		if retryLeg != nil {
+			t.Fatalf("the human won with retry but its leg is missing: %v", retryLeg)
+		}
+		if continuation == nil {
+			t.Fatal("the losing TTL sweep enqueued its finalize continuation anyway")
+		}
+	case "ttl":
+		if continuation != nil {
+			t.Fatalf("the TTL sweep won but its finalize continuation is missing: %v", continuation)
+		}
+		if retryLeg == nil {
+			t.Fatal("the losing human resume enqueued its retry leg anyway")
+		}
+	default:
+		t.Fatalf("unexpected resolution verb %q", resolution.Reason)
 	}
-	completeDelegationChild(t, store, resumeJobID, JobFailed, AgentResult{Decision: "failed", Summary: "failed again"})
-	if err := engine.AdvanceJob(ctx, resumeJobID); err == nil {
-		t.Fatal("expected the re-escalation to pause again")
+
+	// The round is CLOSED exactly once, so the counters are balanced and a later
+	// round can still be opened and resolved.
+	if requested := countWorkflowJobEvents(t, store, "parent-job", escalationRequestedEvent); requested != 1 {
+		t.Fatalf("%s events = %d, want 1", escalationRequestedEvent, requested)
 	}
-	requested := countWorkflowJobEvents(t, store, "parent-job", escalationRequestedEvent)
-	resolved = countWorkflowJobEvents(t, store, "parent-job", escalationResolvedEvent)
-	if requested != 2 || resolved != 1 {
-		t.Fatalf("counters after re-escalation = requested %d / resolved %d, want 2/1: the new round is unresolvable", requested, resolved)
-	}
-	open, err := engine.escalationOpen(ctx, "parent-job")
-	if err != nil {
+	if open, err := engine.escalationOpen(ctx, "parent-job"); err != nil {
 		t.Fatalf("escalationOpen: %v", err)
-	}
-	if !open {
-		t.Fatal("the re-escalated round reports CLOSED: it can never be resolved")
+	} else if open {
+		t.Fatal("the resolved round still reports OPEN")
 	}
 }
 
@@ -389,5 +408,25 @@ func TestTTLClaimRefusesAfterAHumanResolvesInTheWindow(t *testing.T) {
 	}
 	if _, err := store.GetJob(ctx, delegationContinuationID("parent-job")); err == nil {
 		t.Fatal("the TTL sweep enqueued its finalize continuation for a round it did not own")
+	}
+
+	// THE CONSEQUENCE THAT MATTERS, pinned where the winner is deterministic: a later
+	// legitimate round must still be resolvable, i.e. requested=2 with resolved=1. A
+	// double resolution would have left 2/2, which escalationOpen reports as CLOSED
+	// and no resolver can ever close again.
+	resumeJobID := "parent-job/delegation/api/resume"
+	completeDelegationChild(t, store, resumeJobID, JobFailed, AgentResult{Decision: "failed", Summary: "failed again"})
+	if err := engine.AdvanceJob(ctx, resumeJobID); err == nil {
+		t.Fatal("expected the re-escalation to pause again")
+	}
+	requested := countWorkflowJobEvents(t, store, "parent-job", escalationRequestedEvent)
+	resolved := countWorkflowJobEvents(t, store, "parent-job", escalationResolvedEvent)
+	if requested != 2 || resolved != 1 {
+		t.Fatalf("counters after re-escalation = requested %d / resolved %d, want 2/1: the new round is unresolvable", requested, resolved)
+	}
+	if open, err := engine.escalationOpen(ctx, "parent-job"); err != nil {
+		t.Fatalf("escalationOpen: %v", err)
+	} else if !open {
+		t.Fatal("the re-escalated round reports CLOSED: it can never be resolved")
 	}
 }
