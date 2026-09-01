@@ -2344,4 +2344,32 @@ BEGIN
 	SELECT RAISE(ABORT, 'task state is claimed for an external merge');
 END;
 	`,
+	// Canonical terminal-effects ownership and secondary task-settlement debt
+	// survive a daemon exit between the two phases. The exact head is part of
+	// every key so a later push cannot inherit an earlier terminal decision.
+	`
+CREATE TABLE pull_request_terminal_reconciliations (
+	repo_full_name TEXT NOT NULL COLLATE NOCASE,
+	pull_request INTEGER NOT NULL CHECK(pull_request > 0),
+	head_sha TEXT NOT NULL CHECK(length(trim(head_sha)) > 0),
+	owner_task_id TEXT NOT NULL CHECK(length(trim(owner_task_id)) > 0),
+	effects_completed INTEGER NOT NULL DEFAULT 0 CHECK(effects_completed IN (0, 1)),
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY(repo_full_name, pull_request, head_sha)
+);
+CREATE TABLE pull_request_terminal_settlements (
+	repo_full_name TEXT NOT NULL COLLATE NOCASE,
+	pull_request INTEGER NOT NULL CHECK(pull_request > 0),
+	head_sha TEXT NOT NULL CHECK(length(trim(head_sha)) > 0),
+	task_id TEXT NOT NULL CHECK(length(trim(task_id)) > 0),
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	PRIMARY KEY(repo_full_name, pull_request, head_sha, task_id),
+	FOREIGN KEY(repo_full_name, pull_request, head_sha)
+		REFERENCES pull_request_terminal_reconciliations(repo_full_name, pull_request, head_sha)
+		ON DELETE CASCADE
+);
+CREATE INDEX idx_pull_request_terminal_settlements_task
+	ON pull_request_terminal_settlements(task_id);
+	`,
 }

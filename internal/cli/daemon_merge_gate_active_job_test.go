@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -587,6 +588,28 @@ scope = ["owner/repo"]
 	return paths.Home
 }
 
+func disableTerminalPollMergeGate(t *testing.T, home, mode string) {
+	t.Helper()
+	switch mode {
+	case "":
+		return
+	case "native":
+		t.Setenv("GITMOOT_DISABLE_NATIVE_MERGE_GATE", "1")
+	case "policy":
+		configFile := filepath.Join(home, "config.toml")
+		raw, err := os.ReadFile(configFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		updated := string(raw) + "\n[merge_gate]\nauto_merge = false\n"
+		if err := os.WriteFile(configFile, []byte(updated), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatalf("unknown merge-gate disable mode %q", mode)
+	}
+}
+
 func daemonMergeGateActiveJobFixture(t *testing.T, seedReview ...bool) (*db.Store, string, *activeJobMergeGateGitHub, workflow.MergeRequest) {
 	t.Helper()
 	t.Setenv("GITMOOT_DISABLE_NATIVE_MERGE_GATE", "")
@@ -645,21 +668,56 @@ func seedDaemonMergeGateJob(t *testing.T, store *db.Store, job db.Job, payload w
 }
 
 func TestPollOnceDaemonMergeGateRecoversMergedClaimDespiteActiveBranchJob(t *testing.T) {
-	runDaemonMergeGateTerminalPolls(t, true, false)
+	runDaemonMergeGateTerminalPolls(t, terminalPollOptions{withActiveJob: true, secondPollMerged: true})
 }
 
 func TestPollOnceDaemonMergeGateRunsTerminalEffectsOnceForTwoReadyIdentities(t *testing.T) {
-	runDaemonMergeGateTerminalPolls(t, false, true)
+	runDaemonMergeGateTerminalPolls(t, terminalPollOptions{withAdditionalReadyTask: true, secondPollMerged: true})
 }
 
-func runDaemonMergeGateTerminalPolls(t *testing.T, withActiveJob, withAdditionalReadyTask bool) {
+func TestPollOnceDaemonMergeGateRecoversMergedClaimAfterPolicySwitchOff(t *testing.T) {
+	for _, mode := range []string{"policy", "native"} {
+		t.Run(mode, func(t *testing.T) {
+			runDaemonMergeGateTerminalPolls(t, terminalPollOptions{secondPollMerged: true, disableBeforeSecondPoll: mode})
+		})
+	}
+}
+
+func TestPollOnceDaemonMergeGateDoesNotMergeOpenPullAfterPolicySwitchOff(t *testing.T) {
+	for _, mode := range []string{"policy", "native"} {
+		t.Run(mode, func(t *testing.T) {
+			runDaemonMergeGateTerminalPolls(t, terminalPollOptions{
+				secondPollMerged: true, authoritativeRecoveryOpen: true, disableBeforeSecondPoll: mode,
+			})
+		})
+	}
+}
+
+func TestPollOnceDaemonMergeGateRestartSettlesSecondaryWithoutReplayingEffects(t *testing.T) {
+	runDaemonMergeGateTerminalPolls(t, terminalPollOptions{
+		withAdditionalReadyTask: true,
+		secondPollMerged:        true,
+		interruptAfterCanonical: true,
+	})
+}
+
+type terminalPollOptions struct {
+	withActiveJob             bool
+	withAdditionalReadyTask   bool
+	secondPollMerged          bool
+	authoritativeRecoveryOpen bool
+	disableBeforeSecondPoll   string
+	interruptAfterCanonical   bool
+}
+
+func runDaemonMergeGateTerminalPolls(t *testing.T, options terminalPollOptions) {
 	t.Helper()
 	t.Setenv("GITMOOT_DISABLE_NATIVE_MERGE_GATE", "")
 	ctx := context.Background()
 	const (
 		repoName     = "owner/repo"
 		taskID       = "review-pr-1732-retained"
-		additionalID = "task-1732"
+		additionalID = "review-pr-1732-secondary"
 		workflowID   = "gitmoot4/daemon-wrapper-1732"
 		headBranch   = "fix/1732"
 		headSHA      = "head-1732"
@@ -716,9 +774,10 @@ func runDaemonMergeGateTerminalPolls(t *testing.T, withActiveJob, withAdditional
 	worktrees := &terminalPollWorktreeCleaner{}
 	nextTasks := &terminalPollNextTasks{}
 	effects := newTerminalPollEffects()
+	home := daemonMergeGateLiveOrgHome(t)
 	gate := daemonMergeGate{
 		Store: store, GitHub: mergeClient, FallbackCheckout: checkout, Runner: mergeRunner,
-		Home: daemonMergeGateLiveOrgHome(t), Git: postMergeGit,
+		Home: home, Git: postMergeGit,
 		Worktrees: worktrees, NextTasks: nextTasks,
 	}
 	engine := workflow.Engine{
@@ -751,15 +810,15 @@ func runDaemonMergeGateTerminalPolls(t *testing.T, withActiveJob, withAdditional
 			worktrees.paths, postMergeGit.updates, nextTasks.taskIDs)
 	}
 
-	if withAdditionalReadyTask {
+	if options.withAdditionalReadyTask {
 		if err := store.UpsertTask(ctx, db.Task{
 			ID: additionalID, RepoFullName: repoName, GoalID: workflowID,
-			Title: "Implement PR 1732", State: string(workflow.TaskReadyToMerge), Branch: headBranch,
+			Title: "Review PR 1732 secondary", State: string(workflow.TaskReadyToMerge),
 		}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if withActiveJob {
+	if options.withActiveJob {
 		seedDaemonMergeGateJob(t, store, db.Job{
 			ID: "active-branch-job", Agent: "worker", Type: "ask", State: string(workflow.JobQueued),
 		}, workflow.JobPayload{Repo: repoName, Branch: headBranch, TaskID: "active-task"})
@@ -768,15 +827,85 @@ func runDaemonMergeGateTerminalPolls(t *testing.T, withActiveJob, withAdditional
 			t.Fatalf("active branch job = %+v found=%v err=%v", active, found, err)
 		}
 	}
-	gh.pr.State = "closed"
-	gh.pr.Merged = true
-	gh.pr.MergeSHA = mergeCommit
+	disableTerminalPollMergeGate(t, home, options.disableBeforeSecondPoll)
+	if options.secondPollMerged {
+		gh.pr.State = "closed"
+		gh.pr.Merged = true
+		gh.pr.MergeSHA = mergeCommit
+	}
+	if options.authoritativeRecoveryOpen {
+		openRecovery := gh.pr
+		openRecovery.State = "open"
+		openRecovery.Merged = false
+		openRecovery.MergeSHA = ""
+		mergeRunner.recoveryPR = &openRecovery
+	}
+	interruption := errors.New("simulated process interruption after canonical terminal effects")
+	if options.interruptAfterCanonical {
+		poller.AfterCanonicalTerminalEffects = func(context.Context, db.PullRequestTerminalReconciliation) error {
+			return interruption
+		}
+	}
 
-	if err := poller.PollOnce(ctx); err != nil {
-		t.Fatalf("merged PollOnce: %v", err)
+	secondPollErr := poller.PollOnce(ctx)
+	if options.authoritativeRecoveryOpen {
+		if secondPollErr != nil {
+			t.Fatalf("disabled recovery-only open PollOnce: %v", secondPollErr)
+		}
+		openTask, taskErr := store.GetTask(ctx, taskID)
+		if taskErr != nil || openTask.State != string(workflow.TaskReadyToMerge) {
+			t.Fatalf("disabled open task = %+v err=%v, want retained ready_to_merge", openTask, taskErr)
+		}
+		claimRetained, claimErr := store.HasTaskStateClaim(ctx, taskID)
+		if claimErr != nil || !claimRetained {
+			t.Fatalf("disabled open claim = %v err=%v, want retained", claimRetained, claimErr)
+		}
+		reconciliation, reconciliationErr := store.GetPullRequestTerminalReconciliation(ctx, repoName, pullRequest, headSHA)
+		if reconciliationErr != nil || reconciliation.EffectsCompleted || reconciliation.OwnerTaskID != taskID {
+			t.Fatalf("disabled open reconciliation = %+v err=%v, want incomplete owner %s", reconciliation, reconciliationErr, taskID)
+		}
+		if mergeRunner.mergeCommands != 1 || len(worktrees.paths) != 0 ||
+			len(postMergeGit.updates) != 0 || len(nextTasks.taskIDs) != 0 ||
+			len(effects.snapshot().harvestKinds) != 0 {
+			t.Fatalf("disabled open effects merges=%d removals=%v updates=%v continuations=%v engine=%+v, want no second merge or terminal effects",
+				mergeRunner.mergeCommands, worktrees.paths, postMergeGit.updates, nextTasks.taskIDs, effects.snapshot())
+		}
+		return
+	}
+	if options.interruptAfterCanonical {
+		if !errors.Is(secondPollErr, interruption) {
+			t.Fatalf("interrupted merged PollOnce error = %v, want %v", secondPollErr, interruption)
+		}
+		reconciliation, err := store.GetPullRequestTerminalReconciliation(ctx, repoName, pullRequest, headSHA)
+		if err != nil || !reconciliation.EffectsCompleted || reconciliation.OwnerTaskID != taskID {
+			t.Fatalf("terminal reconciliation = %+v err=%v, want completed owner %s", reconciliation, err, taskID)
+		}
+		assertTerminalPollTask(t, store, taskID)
+		additional, err := store.GetTask(ctx, additionalID)
+		if err != nil || additional.State != string(workflow.TaskReadyToMerge) {
+			t.Fatalf("interrupted secondary task = %+v err=%v, want ready_to_merge", additional, err)
+		}
+		databasePath := store.DatabasePath()
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		store, err = db.OpenAlreadyMigrated(databasePath)
+		if err != nil {
+			t.Fatalf("reopen store: %v", err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		gate.Store = store
+		engine.Store = store
+		engine.MergeGate = gate
+		poller = daemon.Daemon{Repo: repo, Store: store, GitHub: gh, Workflow: &engine}
+		if err := poller.PollOnce(ctx); err != nil {
+			t.Fatalf("restart PollOnce: %v", err)
+		}
+	} else if secondPollErr != nil {
+		t.Fatalf("merged PollOnce: %v", secondPollErr)
 	}
 	assertTerminalPollTask(t, store, taskID)
-	if withAdditionalReadyTask {
+	if options.withAdditionalReadyTask {
 		assertTerminalPollTask(t, store, additionalID)
 	}
 	claimed, err = store.HasTaskStateClaim(ctx, taskID)
@@ -820,7 +949,7 @@ func runDaemonMergeGateTerminalPolls(t *testing.T, withActiveJob, withAdditional
 	}
 	taskEvents := terminalPollTaskEvents(t, store, taskID)
 	additionalEvents := []db.TaskEvent(nil)
-	if withAdditionalReadyTask {
+	if options.withAdditionalReadyTask {
 		additionalEvents = terminalPollTaskEvents(t, store, additionalID)
 	}
 	notes, err := store.ListWorkflowNotes(ctx, workflowID, 0)
@@ -832,7 +961,7 @@ func runDaemonMergeGateTerminalPolls(t *testing.T, withActiveJob, withAdditional
 		t.Fatalf("stable PollOnce: %v", err)
 	}
 	assertTerminalPollTask(t, store, taskID)
-	if withAdditionalReadyTask {
+	if options.withAdditionalReadyTask {
 		assertTerminalPollTask(t, store, additionalID)
 	}
 	claimed, err = store.HasTaskStateClaim(ctx, taskID)
@@ -853,7 +982,7 @@ func runDaemonMergeGateTerminalPolls(t *testing.T, withActiveJob, withAdditional
 	if got := terminalPollTaskEvents(t, store, taskID); !reflect.DeepEqual(got, taskEvents) {
 		t.Fatalf("stable canonical task events = %+v, want %+v", got, taskEvents)
 	}
-	if withAdditionalReadyTask {
+	if options.withAdditionalReadyTask {
 		if got := terminalPollTaskEvents(t, store, additionalID); !reflect.DeepEqual(got, additionalEvents) {
 			t.Fatalf("stable additional task events = %+v, want %+v", got, additionalEvents)
 		}
@@ -942,6 +1071,7 @@ func (g *terminalPollMergeGateGitHub) CreateCommitStatus(_ context.Context, inpu
 
 type terminalPollGitHubRunner struct {
 	poll          *terminalPollMergeGateGitHub
+	recoveryPR    *github.PullRequest
 	mergeCommands int
 }
 
@@ -954,6 +1084,9 @@ func (r *terminalPollGitHubRunner) Run(_ context.Context, _ string, _ string, ar
 	switch {
 	case strings.Contains(joined, "/pulls/1732"):
 		pr := r.poll.pr
+		if r.recoveryPR != nil {
+			pr = *r.recoveryPR
+		}
 		body := fmt.Sprintf(
 			`{"number":%d,"title":%q,"state":%q,"merged":%t,"html_url":%q,"merge_commit_sha":%q,"mergeable":true,"head":{"ref":%q,"sha":%q},"base":{"ref":%q,"sha":%q}}`,
 			pr.Number, pr.Title, pr.State, pr.Merged, pr.URL, pr.MergeSHA,

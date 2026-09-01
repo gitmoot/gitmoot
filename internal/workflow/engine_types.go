@@ -318,8 +318,12 @@ type MergeRequest struct {
 	// PullRequestMerged carries an authoritative forge observation through the
 	// production wrapper. It never decides the merge outcome by itself.
 	PullRequestMerged bool
-	HeadSHA           string
-	TaskID            string
+	// TerminalRecoveryOnly permits an authoritative merged hint to re-read the
+	// forge and finish terminal recovery while merge initiation is disabled.
+	// An open or closed-unmerged pull request must still leave without merging.
+	TerminalRecoveryOnly bool
+	HeadSHA              string
+	TaskID               string
 	// ExpectedTaskState asks PolicyMergeGate to revalidate and hold this task
 	// state through the irreversible MergePullRequest call. Empty preserves
 	// callers that do not own a task-state precondition.

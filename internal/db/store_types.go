@@ -590,6 +590,16 @@ type MergeGate struct {
 	BlockClass int
 }
 
+// PullRequestTerminalReconciliation pins one canonical terminal-effects owner
+// to an exact pull request head across daemon restarts.
+type PullRequestTerminalReconciliation struct {
+	RepoFullName     string
+	PullRequest      int64
+	HeadSHA          string
+	OwnerTaskID      string
+	EffectsCompleted bool
+}
+
 // MergeGateStatusObservation records the exact PR head most recently reconciled
 // with the visible gitmoot/merge-gate context. Kind distinguishes a generic
 // marker, an observed policy verdict, and an inactive head that needs no marker.

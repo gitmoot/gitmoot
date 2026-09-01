@@ -762,10 +762,14 @@ func newHostDaemonMergeGate(store *db.Store, gh github.Client, checkout, home st
 }
 
 func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeRequest) (workflow.MergeDecision, error) {
-	if workflow.NativeMergeGateDisabled() {
+	recoveryOnly := request.PullRequestMerged
+	request.TerminalRecoveryOnly = recoveryOnly
+	if workflow.NativeMergeGateDisabled() && !recoveryOnly {
 		return workflow.MergeDecision{
-			Ready:  false,
-			Reason: workflow.PlainReason("native Gitmoot merge gate disabled by GITMOOT_DISABLE_NATIVE_MERGE_GATE; use external gate"),
+			Ready:      false,
+			Deferred:   true,
+			BlockClass: workflow.MergeBlockTransient,
+			Reason:     workflow.PlainReason("native Gitmoot merge gate disabled by GITMOOT_DISABLE_NATIVE_MERGE_GATE; use external gate"),
 		}, nil
 	}
 	// Never make an open merge-or-human decision while a job still owns this
@@ -793,12 +797,25 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 	// again by the fully built gate below still parks before any merge operation.
 	policy, ok := resolvedMergeGatePolicy(g.Home, request.Repo)
 	if !ok {
-		if strings.TrimSpace(g.Home) != "" {
+		if strings.TrimSpace(g.Home) != "" && !recoveryOnly {
 			return (workflow.PolicyMergeGate{}).Evaluate(ctx, request)
 		}
 		policy = config.DefaultMergeGatePolicy()
 	}
-	if !policy.AutoMerge && !request.HumanMergeRequested {
+	if !policy.AutoMerge && !request.HumanMergeRequested && !recoveryOnly {
+		if g.Store != nil && strings.TrimSpace(request.TaskID) != "" {
+			claimed, claimErr := g.Store.HasTaskStateClaim(ctx, request.TaskID)
+			if claimErr != nil {
+				return workflow.MergeDecision{}, fmt.Errorf("inspect retained merge claim for task %s: %w", request.TaskID, claimErr)
+			}
+			if claimed {
+				return workflow.MergeDecision{
+					Deferred:   true,
+					BlockClass: workflow.MergeBlockTransient,
+					Reason:     workflow.PlainReason("auto_merge disabled while retained external merge claim awaits authoritative terminal state"),
+				}, nil
+			}
+		}
 		return (workflow.PolicyMergeGate{}).Evaluate(ctx, request)
 	}
 	checkout, err := mergeGateCheckout(ctx, g.Store, request.Repo, g.FallbackCheckout)

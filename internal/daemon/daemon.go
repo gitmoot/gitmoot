@@ -87,6 +87,10 @@ type Daemon struct {
 	// repository. When it turns on, only tasks parked by the auto-merge-disabled
 	// leave-open reason are re-armed. Nil preserves direct daemon users' behavior.
 	AutoMergeEnabled func(repo string) bool
+	// AfterCanonicalTerminalEffects is an optional interruption/observability
+	// hook invoked only after durable completion is recorded and before
+	// secondary identities settle.
+	AfterCanonicalTerminalEffects func(context.Context, db.PullRequestTerminalReconciliation) error
 	// parseCommentCommand is an injectable test seam for proving that the
 	// system-verified author gate runs before untrusted comment text reaches the
 	// command parser. Nil uses ParseCommand.
@@ -841,48 +845,130 @@ func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumb
 			}
 			continue
 		}
-		event, eventErr := d.reconciledPullRequestEvent(ctx, pull, canonicalTask, group.number)
-		if eventErr != nil {
-			if firstErr == nil {
-				firstErr = eventErr
-			}
-			continue
-		}
-		if canonicalTask.State == string(workflow.TaskReadyToMerge) && d.Workflow.MergeGate != nil {
-			// Exactly one ready identity owns the per-PR boundary: atomic claim
-			// recovery, merge-gate finalization, branch/worktree cleanup,
-			// harvesting and detached signals, and continuation.
-			if readyErr := d.handleReadyToMergeWorkflow(ctx, pull, canonicalTask); readyErr != nil {
-				if firstErr == nil {
-					firstErr = readyErr
-				}
-				continue
-			}
-		} else if canonicalTask.State == string(workflow.TaskReadyToMerge) && strings.TrimSpace(canonicalTask.Branch) == "" {
-			// Defensive fallback for a gate removed between polls. There is no
-			// configured canonical continuation to run, but the retained claim
-			// must still resolve into the authoritative merged state.
-			if _, _, recoverErr := d.Store.RecoverClaimedTaskState(ctx, canonicalTask.ID,
-				string(workflow.TaskMerged), "pull_request_merged",
-				fmt.Sprintf("recovered merged pull request #%d from retained branchless task claim", group.number)); recoverErr != nil {
-				if firstErr == nil {
-					firstErr = recoverErr
-				}
-				continue
-			}
-		}
-		if closeErr := d.Workflow.HandleReviewPullRequestClosed(ctx, event, true); closeErr != nil {
-			if firstErr == nil {
-				firstErr = closeErr
-			}
-			continue
-		}
+		taskIDs := make([]string, 0, len(group.tasks))
 		for _, task := range group.tasks {
-			if task.ID == canonicalTask.ID {
+			taskIDs = append(taskIDs, task.ID)
+		}
+		reconciliation, reconcileErr := d.Store.BeginPullRequestTerminalReconciliation(ctx, db.PullRequestTerminalReconciliation{
+			RepoFullName: d.Repo.FullName(),
+			PullRequest:  group.number,
+			HeadSHA:      strings.TrimSpace(pull.HeadSHA),
+			OwnerTaskID:  canonicalTask.ID,
+		}, taskIDs)
+		if reconcileErr != nil {
+			if firstErr == nil {
+				firstErr = reconcileErr
+			}
+			continue
+		}
+		if reconciliation.OwnerTaskID != canonicalTask.ID {
+			if reconciliation.EffectsCompleted {
+				canonicalTask = db.Task{ID: reconciliation.OwnerTaskID}
+			} else {
+				canonicalTask, reconcileErr = d.Store.GetTask(ctx, reconciliation.OwnerTaskID)
+				if reconcileErr != nil {
+					if firstErr == nil {
+						firstErr = fmt.Errorf("load canonical terminal-effects owner %s: %w", reconciliation.OwnerTaskID, reconcileErr)
+					}
+					continue
+				}
+			}
+		}
+		if !reconciliation.EffectsCompleted {
+			event, eventErr := d.reconciledPullRequestEvent(ctx, pull, canonicalTask, group.number)
+			if eventErr != nil {
+				if firstErr == nil {
+					firstErr = eventErr
+				}
 				continue
 			}
-			if reconcileErr := d.reconcileAdditionalMergedTask(ctx, task, canonicalTask.ID, group.number); reconcileErr != nil && firstErr == nil {
-				firstErr = reconcileErr
+			if canonicalTask.State == string(workflow.TaskReadyToMerge) && d.Workflow.MergeGate != nil {
+				// Exactly one ready identity owns the per-PR boundary: atomic claim
+				// recovery, merge-gate finalization, branch/worktree cleanup,
+				// harvesting and detached signals, and continuation.
+				if readyErr := d.handleReadyToMergeWorkflow(ctx, pull, canonicalTask); readyErr != nil {
+					if firstErr == nil {
+						firstErr = readyErr
+					}
+					continue
+				}
+				canonicalTask, reconcileErr = d.Store.GetTask(ctx, canonicalTask.ID)
+				if reconcileErr != nil {
+					if firstErr == nil {
+						firstErr = reconcileErr
+					}
+					continue
+				}
+				if canonicalTask.State != string(workflow.TaskMerged) {
+					// The wrapper's authoritative re-read did not confirm the
+					// daemon's merged hint. Retain owner/debt and retry; never
+					// apply terminal effects or settle another identity.
+					continue
+				}
+			} else if canonicalTask.State == string(workflow.TaskReadyToMerge) && strings.TrimSpace(canonicalTask.Branch) == "" {
+				// Defensive fallback for a gate removed between polls. There is no
+				// configured canonical continuation to run, but the retained claim
+				// must still resolve into the authoritative merged state.
+				if _, _, recoverErr := d.Store.RecoverClaimedTaskState(ctx, canonicalTask.ID,
+					string(workflow.TaskMerged), "pull_request_merged",
+					fmt.Sprintf("recovered merged pull request #%d from retained branchless task claim", group.number)); recoverErr != nil {
+					if firstErr == nil {
+						firstErr = recoverErr
+					}
+					continue
+				}
+			}
+			if closeErr := d.Workflow.HandleReviewPullRequestClosed(ctx, event, true); closeErr != nil {
+				if firstErr == nil {
+					firstErr = closeErr
+				}
+				continue
+			}
+			if completeErr := d.Store.CompletePullRequestTerminalEffects(ctx, reconciliation); completeErr != nil {
+				if firstErr == nil {
+					firstErr = completeErr
+				}
+				continue
+			}
+			reconciliation.EffectsCompleted = true
+			if d.AfterCanonicalTerminalEffects != nil {
+				if interruptErr := d.AfterCanonicalTerminalEffects(ctx, reconciliation); interruptErr != nil {
+					if firstErr == nil {
+						firstErr = interruptErr
+					}
+					continue
+				}
+			}
+		}
+		settlements, settlementErr := d.Store.ListPullRequestTerminalSettlements(ctx, reconciliation)
+		if settlementErr != nil {
+			if firstErr == nil {
+				firstErr = settlementErr
+			}
+			continue
+		}
+		for _, taskID := range settlements {
+			task, taskErr := d.Store.GetTask(ctx, taskID)
+			if errors.Is(taskErr, sql.ErrNoRows) {
+				taskErr = d.Store.ResolvePullRequestTerminalSettlement(ctx, reconciliation, taskID)
+			}
+			if taskErr != nil {
+				if firstErr == nil {
+					firstErr = taskErr
+				}
+				continue
+			}
+			if task.ID == "" {
+				continue
+			}
+			if taskErr := d.reconcileAdditionalMergedTask(ctx, task, reconciliation.OwnerTaskID, group.number); taskErr != nil {
+				if firstErr == nil {
+					firstErr = taskErr
+				}
+				continue
+			}
+			if resolveErr := d.Store.ResolvePullRequestTerminalSettlement(ctx, reconciliation, task.ID); resolveErr != nil && firstErr == nil {
+				firstErr = resolveErr
 			}
 		}
 	}

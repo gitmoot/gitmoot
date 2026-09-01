@@ -244,16 +244,16 @@ type workflowAwareGitHub interface {
 }
 
 func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (MergeDecision, error) {
-	// An explicit operator kill-switch must remain before validation and every
-	// GitHub/local-store operation. An authenticated human merge request may
-	// override this policy, but not the independently verified evidence below.
-	if !g.AutoMerge && !request.HumanMergeRequested {
+	// An explicit operator kill-switch remains before validation and every
+	// GitHub/local-store operation except terminal recovery. Recovery re-reads
+	// the forge and may only finish an already-merged pull request.
+	if !g.AutoMerge && !request.HumanMergeRequested && !request.TerminalRecoveryOnly {
 		return MergeDecision{LeaveOpen: true, Reason: PlainReason(MergeLeaveOpenAutoMergeKillSwitchReason)}, nil
 	}
-	if request.PullRequestDraftUnknown {
+	if request.PullRequestDraftUnknown && !request.TerminalRecoveryOnly {
 		return MergeDecision{LeaveOpen: true, Reason: PlainReason("pull request draft state is unknown")}, nil
 	}
-	if request.PullRequestDraft {
+	if request.PullRequestDraft && !request.TerminalRecoveryOnly {
 		return MergeDecision{LeaveOpen: true, Reason: PlainReason("pull request is draft")}, nil
 	}
 	if err := g.validate(); err != nil {
@@ -281,6 +281,13 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 			log.Printf("merge gate released retained external merge claim for task %s after pull request #%d reached a terminal non-merge state",
 				request.TaskID, request.PullRequest)
 		}
+	}
+	if request.TerminalRecoveryOnly && !pullRequestMerged(pr) {
+		return MergeDecision{
+			Deferred:   true,
+			BlockClass: MergeBlockTransient,
+			Reason:     PlainReason("authoritative pull request re-read has not confirmed a merge"),
+		}, nil
 	}
 	headSHA := strings.TrimSpace(pr.HeadSHA)
 	if headSHA == "" {

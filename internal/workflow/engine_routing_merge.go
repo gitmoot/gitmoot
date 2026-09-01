@@ -639,12 +639,11 @@ func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string,
 		if decision.Deferred {
 			// Park the task in ready_to_merge (NOT whatever state it arrived in) so
 			// the daemon's pullRequestReadyToMerge poll re-drives it every tick until
-			// the in-flight branch job settles. This matters for the no-reviewers
-			// auto-merge path: HandlePullRequestOpened reaches here with the task in
-			// pull_request_open, a state that poll does not re-evaluate — without this
-			// the deferred PR would wedge unmerged. Mirrors PolicyMergeGate.pending
-			// (which parks via a Ready:true tail); a deferred decision is never
-			// blocked, failed, or harvested.
+			// the hold settles. A task-owned retry already expected in ready_to_merge
+			// needs no write; this also preserves a retained external-merge claim.
+			if expectedTaskState == string(TaskReadyToMerge) {
+				return decision, nil
+			}
 			return decision, e.setTaskState(ctx, ref, TaskReadyToMerge)
 		}
 		reason := decision.Reason.Render()
