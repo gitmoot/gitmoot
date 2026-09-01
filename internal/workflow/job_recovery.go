@@ -407,6 +407,30 @@ func releaseAbortedJobResources(ctx context.Context, store *db.Store, job db.Job
 	// same-session window already exists when a long-running job's lock TTL lapses
 	// while its runtime is still in flight, and abandoning the job signals intent.
 	_, _ = store.DeleteResourceLocksByOwner(ctx, job.ID)
+	releaseAbortedJobSideResources(ctx, store, job, cause)
+}
+
+// releaseSupersededJobResourcesAtGeneration is releaseAbortedJobResources for a
+// caller that decided one POLL AGO. The lock release is conditional on the job
+// still being the settled lifecycle named by atGeneration, evaluated inside the
+// store's write transaction, so generation N's cleanup can never delete the locks
+// generation N+1 acquired while this pass was mid-flight.
+//
+// A lost guard skips the rest too: the branch, task-lane and worktree cleanups all
+// belong to the abort of THAT run, and the row now belongs to another one.
+func releaseSupersededJobResourcesAtGeneration(ctx context.Context, store *db.Store, job db.Job, cause abortCause, atGeneration int64) {
+	_, guarded, err := store.ReleaseSupersededJobResourceLocksAtGeneration(ctx, job.ID, atGeneration)
+	if err != nil || !guarded {
+		return
+	}
+	releaseAbortedJobSideResources(ctx, store, job, cause)
+}
+
+// releaseAbortedJobSideResources is the non-resource-lock half of an abort's
+// cleanup, shared by both entry points above. Each step carries its own atomic
+// predicate (an inactive-branch check, an existence check), so it is safe to run
+// once the caller's lifecycle claim holds.
+func releaseAbortedJobSideResources(ctx context.Context, store *db.Store, job db.Job, cause abortCause) {
 	payload, perr := unmarshalPayload(job.Payload)
 	if perr != nil {
 		return
@@ -726,12 +750,16 @@ func (e Engine) CompletePendingSupersedeFinalization(ctx context.Context, jobID 
 // at one named stage and prove the guard owning that stage refuses.
 //
 // One stage per guard, so a test kills exactly one: the claim CAS, the payment's
-// own re-read (which gates the UNANCHORED cleanups), and the anchored payload
-// write inside the finalizer.
+// own re-read (which gates the UNANCHORED cleanups), the window between that
+// re-read and the resource cleanup it authorises, the anchored payload write
+// inside the finalizer, and the window between reading the latest debt marker and
+// closing it.
 const (
 	supersedeDebtStageAfterRead      = "after-read"
 	supersedeDebtStageAfterClaim     = "after-claim"
+	supersedeDebtStageBeforeCleanup  = "before-cleanup"
 	supersedeDebtStageBeforeFinalize = "before-finalize"
+	supersedeDebtStageBeforeClosure  = "before-closure"
 )
 
 var supersedeDebtInterleaveHook func(ctx context.Context, stage string)
@@ -779,12 +807,17 @@ func recordSupersedeFinalizationVoided(ctx context.Context, store *db.Store, job
 	if !debt.anchored {
 		detail = "an unanchored marker"
 	}
-	return store.AddJobEvent(ctx, db.JobEvent{
-		JobID: job.ID,
-		Kind:  JobEventSupersedeFinalizeCompleted,
-		Message: fmt.Sprintf("voided without action: the debt was incurred by %s, and the job is now %s at generation %d",
+	if supersedeDebtInterleaveHook != nil {
+		supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeClosure)
+	}
+	// Conditional for the same reason completion is: a void races the same retry.
+	// If a newer pending marker has landed, writing this one would close a debt
+	// that belongs to a lifecycle nobody has looked at yet.
+	_, err := store.CloseSupersedeFinalizationDebtAtGeneration(ctx, job.ID,
+		fmt.Sprintf("voided without action: the debt was incurred by %s, and the job is now %s at generation %d",
 			detail, job.State, job.LifecycleGeneration),
-	})
+		debt.generation, debt.anchored)
+	return err
 }
 
 // completeSupersedeFinalization pays the recorded debt and, only once every step
@@ -813,12 +846,21 @@ func completeSupersedeFinalization(ctx context.Context, engine *Engine, store *d
 	if current.LifecycleGeneration != generation || !isSupersededTerminalState(current.State) {
 		return recordSupersedeFinalizationCompleted(ctx, store, job.ID, reason, generation, nil)
 	}
+	// The window F-1 named: validated above, cleanup below, two statements apart.
+	if supersedeDebtInterleaveHook != nil {
+		supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeCleanup)
+	}
 	// A queued job dying here owes the SAME cleanups a cancel does — resource locks,
 	// a per-delegation branch lock, the task lane lock, a dispatch-time read-only
 	// worktree. Copying only the worktree half (the shape SupersedeStaleHeadJob
 	// carries, where the targeted review legs hold none of the others) would leak
 	// locks that block the next same-repo work.
-	releaseAbortedJobResources(ctx, store, current, abortCauseSupersede)
+	// Conditional on the claimed lifecycle: the claim above and this cleanup are
+	// separate statements, so a retry can queue generation N+1 and a worker can
+	// claim it in between. An unguarded by-owner lock delete would then destroy the
+	// RUNNING run's locks. A lost guard also skips the remaining cleanups, which
+	// belong to the same abort.
+	releaseSupersededJobResourcesAtGeneration(ctx, store, current, abortCauseSupersede, generation)
 	if engine == nil {
 		return recordSupersedeFinalizationCompleted(ctx, store, job.ID, reason, generation, nil)
 	}
@@ -896,11 +938,13 @@ func recordSupersedeFinalizationCompleted(ctx context.Context, store *db.Store, 
 	if !debt.pending || !debt.anchored || debt.generation != generation {
 		return outcome
 	}
-	if err := store.AddJobEvent(ctx, db.JobEvent{
-		JobID:   jobID,
-		Kind:    JobEventSupersedeFinalizeCompleted,
-		Message: reason,
-	}); err != nil {
+	if supersedeDebtInterleaveHook != nil {
+		supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeClosure)
+	}
+	// The read above only decides WHETHER to attempt the close; the store re-asserts
+	// the same predicate inside the INSERT, so a pending marker for a newer
+	// lifecycle appended in between cannot be overwritten by this one.
+	if _, err := store.CloseSupersedeFinalizationDebtAtGeneration(ctx, jobID, reason, generation, true); err != nil {
 		return err
 	}
 	return outcome

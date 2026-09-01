@@ -264,13 +264,20 @@ func countWorkflowJobEvents(t *testing.T, store *db.Store, jobID string, kind st
 //
 //	after-read       the atomic claim CAS on (state, generation)
 //	after-claim      the payment's own re-read, which gates the UNANCHORED cleanups
+//	before-cleanup   the transactional generation guard inside the lock release
 //	before-finalize  the anchored payload write inside the finalizer
+//
+// before-cleanup is the window F-1 named: the re-read has already VALIDATED
+// generation N, and the by-owner resource-lock delete happens statements later, so
+// a retry claimed in between had its own locks destroyed by a cleanup that was
+// authorised for a lifecycle that no longer exists.
 //
 // The expected outcome is identical at every stage — that is the point.
 func TestCompletePendingSupersedeFinalizationRefusesARetryClaimedMidPayment(t *testing.T) {
 	for _, stage := range []string{
 		supersedeDebtStageAfterRead,
 		supersedeDebtStageAfterClaim,
+		supersedeDebtStageBeforeCleanup,
 		supersedeDebtStageBeforeFinalize,
 	} {
 		t.Run(stage, func(t *testing.T) {
@@ -432,6 +439,191 @@ func TestSupersedeDebtCompletionDoesNotClearANewerDebt(t *testing.T) {
 	}
 	if debt, err := latestSupersedeFinalizeDebt(ctx, store, "workflow-debt"); err != nil || debt.pending {
 		t.Fatalf("debt = %+v err=%v, want closed by its own payment", debt, err)
+	}
+}
+
+// TestSupersedeDebtClosureRefusesADebtAppendedMidClosure is the F-2 window: the
+// payment READS the latest marker, accepts generation N, and appends its closure
+// statements later. A retry plus a fresh supersession in that gap appends pending
+// generation N+1; an unconditional append then becomes the latest marker and
+// erases N+1 from the candidate query — a debt that is now invisible and unpaid.
+//
+// Driven through the production recovery entry point
+// Engine.CompletePendingSupersedeFinalization, at the stage between the read and
+// the append, for BOTH terminal markers: the payment's completion and the
+// failed-claim void.
+//
+// MUTATION PROOF: make CloseSupersedeFinalizationDebtAtGeneration append
+// unconditionally and the job leaves JobIDsWithPendingSupersedeFinalization.
+func TestSupersedeDebtClosureRefusesADebtAppendedMidClosure(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		breakClaim bool
+	}{
+		{name: "completion"},
+		{name: "void-after-failed-claim", breakClaim: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			seedAgent(t, store, "impl", []string{"implement"}, "gitmoot/gitmoot")
+			engine := testEngine(store)
+			const job = "workflow-debt-midclosure"
+			insertQueuedJob(t, store, db.Job{ID: job, Agent: "impl", Type: "implement"}, JobPayload{
+				Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "impl",
+			})
+			// Settle the run the way production does: one transaction carrying the
+			// terminal state and the debt anchored to the generation it superseded.
+			observed := mustJob(t, store, job)
+			superseded, err := store.TransitionJobStateWithEventAtGeneration(ctx, job, observed.State, observed.LifecycleGeneration, string(JobCancelled),
+				db.JobEvent{JobID: job, Kind: JobEventSupersededPullRequestClosed, Message: "pr closed"},
+				db.JobEvent{JobID: job, Kind: JobEventSupersedeFinalizePending, Message: formatSupersedeFinalizeDebt(observed.LifecycleGeneration, "pr closed")})
+			if err != nil || !superseded {
+				t.Fatalf("supersede the observed run: transitioned=%v err=%v", superseded, err)
+			}
+
+			fired := 0
+			supersedeDebtInterleaveHook = func(hookCtx context.Context, at string) {
+				// Breaking the claim routes the pass down the void path instead of the
+				// payment path; both end in a terminal marker append.
+				if tc.breakClaim && at == supersedeDebtStageAfterRead {
+					if _, err := RetryJob(hookCtx, store, job); err != nil {
+						t.Fatalf("RetryJob to break the claim: %v", err)
+					}
+					return
+				}
+				if at != supersedeDebtStageBeforeClosure || fired > 0 {
+					return
+				}
+				fired++
+				// A retry queues a new lifecycle and a fresh supersession records ITS
+				// debt. Only the marker write is done here, not the payment: the race is
+				// against a supersession whose own payment has not run yet. On the void
+				// path the retry already happened (that is what broke the claim), so the
+				// row is queued and only the supersession is left to do.
+				queued := mustJob(t, store, job)
+				if queued.State != string(JobQueued) {
+					retried, err := RetryJob(hookCtx, store, job)
+					if err != nil {
+						t.Fatalf("RetryJob in the closure window: %v", err)
+					}
+					queued = retried
+				}
+				appended, err := store.TransitionJobStateWithEventAtGeneration(hookCtx, job, queued.State, queued.LifecycleGeneration, string(JobCancelled),
+					db.JobEvent{JobID: job, Kind: JobEventSupersededPullRequestClosed, Message: "pr closed again"},
+					db.JobEvent{JobID: job, Kind: JobEventSupersedeFinalizePending, Message: formatSupersedeFinalizeDebt(queued.LifecycleGeneration, "pr closed again")})
+				if err != nil || !appended {
+					t.Fatalf("append the newer debt: transitioned=%v err=%v", appended, err)
+				}
+			}
+			t.Cleanup(func() { supersedeDebtInterleaveHook = nil })
+
+			if _, err := engine.CompletePendingSupersedeFinalization(ctx, job); err != nil && !isDelegationPolicyOutcome(err) {
+				t.Fatalf("CompletePendingSupersedeFinalization: %v", err)
+			}
+			if fired != 1 {
+				t.Fatalf("closure-window interleavings = %d, want exactly 1", fired)
+			}
+
+			debt, err := latestSupersedeFinalizeDebt(ctx, store, job)
+			if err != nil {
+				t.Fatalf("latestSupersedeFinalizeDebt: %v", err)
+			}
+			if !debt.pending {
+				t.Fatal("the newer debt was closed by the older payment; no poll will ever pay it")
+			}
+			pending, err := store.JobIDsWithPendingSupersedeFinalization(ctx)
+			if err != nil {
+				t.Fatalf("JobIDsWithPendingSupersedeFinalization: %v", err)
+			}
+			found := false
+			for _, id := range pending {
+				if id == job {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("job left the candidate set with debt %+v outstanding", debt)
+			}
+
+			// And the newer debt is still payable: its own generation closes it.
+			if err := recordSupersedeFinalizationCompleted(ctx, store, job, debt.reason, debt.generation, nil); err != nil {
+				t.Fatalf("pay the newer debt: %v", err)
+			}
+			if after, err := latestSupersedeFinalizeDebt(ctx, store, job); err != nil || after.pending {
+				t.Fatalf("debt = %+v err=%v, want closed by its own payment", after, err)
+			}
+		})
+	}
+}
+
+// TestSupersedeCleanupRefusesATerminalRetryAtANewerGeneration separates the two
+// halves of the cleanup guard. The interleaved retry here ends TERMINAL again, so
+// the state half of the predicate passes and only the GENERATION half can refuse:
+// a state-only guard deletes the newer lifecycle's locks while looking correct.
+//
+// MUTATION PROOF: drop `generation != atGeneration` from
+// ReleaseSupersededJobResourceLocksAtGeneration and this fails while the
+// running-retry cases still pass.
+func TestSupersedeCleanupRefusesATerminalRetryAtANewerGeneration(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "impl", []string{"implement"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	const job = "workflow-debt-terminal-retry"
+	insertQueuedJob(t, store, db.Job{ID: job, Agent: "impl", Type: "implement"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "impl",
+	})
+	observed := mustJob(t, store, job)
+	superseded, err := store.TransitionJobStateWithEventAtGeneration(ctx, job, observed.State, observed.LifecycleGeneration, string(JobCancelled),
+		db.JobEvent{JobID: job, Kind: JobEventSupersededPullRequestClosed, Message: "pr closed"},
+		db.JobEvent{JobID: job, Kind: JobEventSupersedeFinalizePending, Message: formatSupersedeFinalizeDebt(observed.LifecycleGeneration, "pr closed")})
+	if err != nil || !superseded {
+		t.Fatalf("supersede the observed run: transitioned=%v err=%v", superseded, err)
+	}
+
+	now := time.Date(2026, 9, 1, 9, 0, 0, 0, time.UTC)
+	const lockKey = "runtime:codex:session-terminal-retry"
+	interleaved := 0
+	supersedeDebtInterleaveHook = func(hookCtx context.Context, at string) {
+		if at != supersedeDebtStageBeforeCleanup || interleaved > 0 {
+			return
+		}
+		interleaved++
+		if _, err := RetryJob(hookCtx, store, job); err != nil {
+			t.Fatalf("RetryJob in the cleanup window: %v", err)
+		}
+		// The new lifecycle runs and fails: TERMINAL, like the row this pass
+		// claimed, but at a different generation and holding its own lock.
+		if err := store.UpdateJobState(hookCtx, job, string(JobRunning)); err != nil {
+			t.Fatalf("UpdateJobState(running): %v", err)
+		}
+		if err := store.UpdateJobState(hookCtx, job, string(JobFailed)); err != nil {
+			t.Fatalf("UpdateJobState(failed): %v", err)
+		}
+		locked, err := store.AcquireResourceLock(hookCtx, db.ResourceLock{
+			ResourceKey: lockKey, OwnerJobID: job, OwnerToken: "token-terminal-retry",
+			ExpiresAt: now.Add(30 * time.Minute).Format(time.RFC3339Nano),
+		}, now)
+		if err != nil || !locked {
+			t.Fatalf("AcquireResourceLock acquired=%v err=%v", locked, err)
+		}
+	}
+	t.Cleanup(func() { supersedeDebtInterleaveHook = nil })
+
+	if _, err := engine.CompletePendingSupersedeFinalization(ctx, job); err != nil && !isDelegationPolicyOutcome(err) {
+		t.Fatalf("CompletePendingSupersedeFinalization: %v", err)
+	}
+	if interleaved != 1 {
+		t.Fatalf("cleanup-window interleavings = %d, want exactly 1", interleaved)
+	}
+	held, err := store.GetResourceLock(ctx, lockKey)
+	if err != nil || held.OwnerJobID != job {
+		t.Fatalf("resource lock = %+v err=%v, want still held by the newer lifecycle", held, err)
+	}
+	live := mustJob(t, store, job)
+	if live.LifecycleGeneration == observed.LifecycleGeneration {
+		t.Fatalf("interleave did not move the generation off %d", observed.LifecycleGeneration)
 	}
 }
 

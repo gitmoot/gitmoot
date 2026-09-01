@@ -232,6 +232,62 @@ func (s *Store) DeleteResourceLocksByOwnerIfNotRunning(ctx context.Context, owne
 	return result.RowsAffected()
 }
 
+// ReleaseSupersededJobResourceLocksAtGeneration releases an owner's resource
+// locks only while that owner job is STILL the settled lifecycle the caller
+// claimed: same lifecycle_generation, and still in one of the two terminal states
+// a supersession writes.
+//
+// The guard and the delete share ONE write transaction, which is what makes this
+// different from reading the row and then calling DeleteResourceLocksByOwner. A
+// `gitmoot job retry` between those two statements queues a new lifecycle and a
+// worker claims it; the by-owner delete carries no state or generation predicate,
+// so it then destroys the RUNNING run's locks. Serialised here, the retry's
+// generation bump either lands before the guard (which fails, and nothing is
+// deleted) or after the commit (so the locks it goes on to acquire are its own and
+// were never in scope).
+//
+// guarded reports whether the claimed lifecycle was still current, so a caller can
+// skip the remaining cleanups that belong to the same abort. It is distinct from
+// released, which is 0 both for a lost guard and for a job that simply held no
+// locks.
+//
+// The generation equality is the load-bearing half: generations bump on every
+// state write, so a row still at atGeneration IS the row the caller claimed. The
+// terminal-state clause is therefore redundant and kept only as an explicit
+// statement of the precondition — no test can distinguish it, and none pretends to.
+func (s *Store) ReleaseSupersededJobResourceLocksAtGeneration(ctx context.Context, ownerJobID string, atGeneration int64) (released int64, guarded bool, err error) {
+	ownerJobID = strings.TrimSpace(ownerJobID)
+	if ownerJobID == "" {
+		return 0, false, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, false, err
+	}
+	defer tx.Rollback()
+	var state string
+	var generation int64
+	err = tx.QueryRowContext(ctx, `SELECT state, lifecycle_generation FROM jobs WHERE id = ?`, ownerJobID).Scan(&state, &generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, tx.Commit()
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	if generation != atGeneration || (state != "cancelled" && state != "failed") {
+		return 0, false, tx.Commit()
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM resource_locks WHERE owner_job_id = ?`, ownerJobID)
+	if err != nil {
+		return 0, false, err
+	}
+	released, err = result.RowsAffected()
+	if err != nil {
+		return 0, false, err
+	}
+	return released, true, tx.Commit()
+}
+
 // DeleteExpiredResourceLocks reaps lock rows whose lease has elapsed.
 //
 // The owner_pid<=0 clause keeps the historical conservatism for NON-runtime locks

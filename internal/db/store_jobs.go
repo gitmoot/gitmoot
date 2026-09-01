@@ -1814,6 +1814,33 @@ const (
 			GROUP BY job_id
 		)
 		ORDER BY job_id`
+
+	// supersedeFinalizationClosureSQL appends the completion marker only while the
+	// pending marker it claims is STILL the latest of the two marker kinds. The
+	// candidate query above is last-one-wins by event id, so an unconditional
+	// append written after a newer pending marker silently clears a debt nobody
+	// paid. Predicate and insert are one statement, so no retry can land between
+	// them.
+	//
+	// %s is the pending marker's identity test: an ANCHORED payment matches the
+	// generation it claimed, an unanchored one matches only a marker that carries
+	// no generation at all.
+	supersedeFinalizationClosureSQL = `INSERT INTO job_events(job_id, kind, message)
+		SELECT ?, 'supersede_finalize_completed', ?
+		WHERE EXISTS (
+			SELECT 1 FROM job_events pending
+			WHERE pending.job_id = ?
+			  AND pending.kind = 'supersede_finalize_pending'
+			  AND %s
+			  AND pending.id = (
+				SELECT MAX(id) FROM job_events latest
+				WHERE latest.job_id = ?
+				  AND latest.kind IN ('supersede_finalize_pending', 'supersede_finalize_completed')
+			  )
+		)`
+
+	supersedeFinalizationAnchoredPendingSQL   = `pending.message LIKE 'generation=' || CAST(? AS TEXT) || ': %'`
+	supersedeFinalizationUnanchoredPendingSQL = `pending.message NOT LIKE 'generation=%'`
 )
 
 // JobIDsWithPendingDelegationWorktreeReclaim returns the IDs of jobs whose most
@@ -1967,6 +1994,46 @@ func (s *Store) JobIDsWithPendingCommentRetry(ctx context.Context) ([]string, er
 // re-queued and superseded again is a candidate again.
 func (s *Store) JobIDsWithPendingSupersedeFinalization(ctx context.Context) ([]string, error) {
 	return s.jobIDsByQuery(ctx, jobIDsWithPendingSupersedeFinalizationSQL)
+}
+
+// CloseSupersedeFinalizationDebtAtGeneration appends the completion marker for
+// ONE lifecycle's debt, conditionally and atomically: the pending marker the
+// payment claimed must still be the latest of the two marker kinds.
+//
+// Reading the latest marker and then appending are two statements, and between
+// them a retry plus a fresh supersession can append pending generation N+1. The
+// old completion then becomes the latest marker and erases N+1 from
+// JobIDsWithPendingSupersedeFinalization — a debt that is now invisible and was
+// never paid. Evaluating the predicate inside the INSERT removes that window.
+//
+// closed reports whether the marker was written. False means a newer debt is
+// outstanding (or the debt was already closed); the caller leaves it for the next
+// poll rather than treating it as paid.
+func (s *Store) CloseSupersedeFinalizationDebtAtGeneration(ctx context.Context, jobID string, message string, atGeneration int64, anchored bool) (bool, error) {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return false, nil
+	}
+	var (
+		statement string
+		args      []any
+	)
+	if anchored {
+		statement = fmt.Sprintf(supersedeFinalizationClosureSQL, supersedeFinalizationAnchoredPendingSQL)
+		args = []any{jobID, message, jobID, atGeneration, jobID}
+	} else {
+		statement = fmt.Sprintf(supersedeFinalizationClosureSQL, supersedeFinalizationUnanchoredPendingSQL)
+		args = []any{jobID, message, jobID, jobID}
+	}
+	result, err := s.db.ExecContext(ctx, statement, args...)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
 }
 
 // JobIDsWithOpenEscalation returns the IDs of coordinator jobs with an OPEN
