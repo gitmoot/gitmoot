@@ -547,7 +547,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		case JobQueued, JobRunning:
 			return mergePending{reason: fmt.Sprintf("waiting for reviewer %s at evaluated head (job %s is %s)", strings.TrimSpace(review.job.Agent), review.job.ID, review.job.State)}
 		case JobFailed, JobCancelled:
-			return fmt.Errorf("crashed reviewer %s at evaluated head (job %s is %s); requeue or reassign the review", strings.TrimSpace(review.job.Agent), review.job.ID, review.job.State)
+			return fmt.Errorf("crashed reviewer %s at evaluated head (job %s is %s); retry or settle that same job, or push a new head. Reassigning the review to a different agent cannot clear this reviewer's slot", strings.TrimSpace(review.job.Agent), review.job.ID, review.job.State)
 		}
 	}
 	for _, review := range activeAtHead {
@@ -569,7 +569,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 				return fmt.Errorf("reviewer %s at evaluated head has unusable job state %s (job %s)", reviewer, review.job.State, review.job.ID)
 			}
 			if review.payload.Result == nil {
-				return fmt.Errorf("abstaining reviewer %s at evaluated head has no recognized decision (job %s); requeue or reassign the review", reviewer, review.job.ID)
+				return fmt.Errorf("abstaining reviewer %s at evaluated head has no recognized decision (job %s); dispatch a fresh review for that same agent at this head, or push a new head. Reassigning to a different agent cannot clear this reviewer's slot", reviewer, review.job.ID)
 			}
 			switch review.payload.Result.Decision {
 			case "approved":
@@ -593,7 +593,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			case "changes_requested", "blocked", "failed":
 				return mergeBlocked{reason: fmt.Sprintf("review at evaluated head has blocking result from %s", reviewer)}
 			default:
-				return fmt.Errorf("abstaining reviewer %s at evaluated head returned unrecognized decision %q (job %s); requeue or reassign the review", reviewer, review.payload.Result.Decision, review.job.ID)
+				return fmt.Errorf("abstaining reviewer %s at evaluated head returned unrecognized decision %q (job %s); dispatch a fresh review for that same agent at this head, or push a new head. Reassigning to a different agent cannot clear this reviewer's slot", reviewer, review.payload.Result.Decision, review.job.ID)
 			}
 		}
 		if reason := reviewAuthorshipFailureReason(selfApprovalReason, unknownImplementerReason, unattributedReviewerReason); reason != "" {
@@ -968,9 +968,21 @@ func isRoundHistoryDuplicate(job db.Job, taskReviewIDs map[string]struct{}) bool
 	return parentIsTaskReview
 }
 
+// reviewRoundKey is the ONE ordering key for the review rows of a task, shared by
+// every decision that ranks them: supersession, latest-round selection and
+// eligibility. An engine round orders by its number. A row dispatched by
+// `gitmoot agent review <reviewer> --repo <o/r> --pr <N> --head-sha <H>` carries
+// no round and orders by when its verdict was RECORDED -- UpdatedAt, falling back
+// to CreatedAt -- never by dispatch time alone.
+//
+// Dispatch time cannot express verdict recency: `gitmoot job retry` re-runs a row
+// IN PLACE, keeping created_at and bumping updated_at, so the EARLIEST-created row
+// can hold the NEWEST verdict. Ranking by created_at let a later-created but
+// earlier-recorded approval discard a retried row's changes_requested and merge.
 type reviewRoundKey struct {
-	name      string
-	createdAt string
+	name       string
+	recordedAt string
+	createdAt  string
 }
 
 func reviewRoundKeyForJob(job db.Job, payload JobPayload) reviewRoundKey {
@@ -978,7 +990,17 @@ func reviewRoundKeyForJob(job db.Job, payload JobPayload) reviewRoundKey {
 	if round != "" {
 		return reviewRoundKey{name: round}
 	}
-	return reviewRoundKey{createdAt: job.CreatedAt}
+	return reviewRoundKey{recordedAt: job.UpdatedAt, createdAt: job.CreatedAt}
+}
+
+// reviewRoundKeyRecency is the single recency comparison behind both key
+// operations below. Its precedence is the same as reviewJobRecordedAfter's, so a
+// round key and a job row can never disagree about which of two rows is newer.
+func reviewRoundKeyRecency(left reviewRoundKey, right reviewRoundKey) (after bool, decided bool) {
+	if after, decided := recordedTimestampAfter(left.recordedAt, right.recordedAt); decided {
+		return after, true
+	}
+	return recordedTimestampAfter(left.createdAt, right.createdAt)
 }
 
 func reviewRoundKeyAfter(left reviewRoundKey, right reviewRoundKey) bool {
@@ -990,7 +1012,7 @@ func reviewRoundKeyAfter(left reviewRoundKey, right reviewRoundKey) bool {
 	if leftExplicit {
 		return reviewRoundAfter(left.name, right.name)
 	}
-	after, decided := recordedTimestampAfter(left.createdAt, right.createdAt)
+	after, decided := reviewRoundKeyRecency(left, right)
 	return decided && after
 }
 
@@ -1000,14 +1022,12 @@ func sameReviewRoundKey(left reviewRoundKey, right reviewRoundKey) bool {
 	if leftExplicit || rightExplicit {
 		return leftExplicit && rightExplicit && left.name == right.name
 	}
-	leftTime, leftOK := parseStoredJobTime(left.createdAt)
-	rightTime, rightOK := parseStoredJobTime(right.createdAt)
-	if !leftOK || !rightOK {
-		// An unparseable persisted timestamp cannot establish recency. Treat the
-		// fallback reviews as one conservative round instead of ordering by ID.
-		return true
-	}
-	return leftTime.Equal(rightTime)
+	// Two roundless rows are the same round exactly when no persisted timestamp
+	// separates them: recordedTimestampAfter decides only when both values parse
+	// and differ, so an unparseable or equal pair stays one conservative round
+	// rather than being ordered by job id.
+	_, decided := reviewRoundKeyRecency(left, right)
+	return !decided
 }
 
 func isDelegationChild(job db.Job) bool {
