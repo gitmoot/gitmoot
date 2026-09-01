@@ -683,6 +683,10 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 			if err := e.ensureBranchLock(ctx, request.Repo, request.Branch, request.Agent, request.ActingOrgRole, ref); err != nil {
 				return err
 			}
+			// THE FALLBACK LOCK IS A PRE-EFFECT TOO. Recording only the isolated-worktree
+			// branch left a crash or supersede after fallback lock acquisition with no
+			// round metadata able to release it (#1673).
+			e.recordEffectPreAllocation(request.Repo, request.Branch, "", request.Agent)
 		} else {
 			result, err := e.AllocateDelegationWorktree(ctx, DelegationWorktreeRequest{
 				Home:         e.Home,
@@ -698,7 +702,7 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 			if err != nil {
 				var blocked BlockedError
 				if errors.As(err, &blocked) {
-					return e.block(ctx, ref, blocked.Reason)
+					return e.blockRefusedAllocation(ctx, ref, blocked.Reason)
 				}
 				return err
 			}
@@ -755,7 +759,7 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 			if err != nil {
 				var blocked BlockedError
 				if errors.As(err, &blocked) {
-					return e.block(ctx, ref, blocked.Reason)
+					return e.blockRefusedAllocation(ctx, ref, blocked.Reason)
 				}
 				return err
 			}
@@ -816,7 +820,7 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 			if err != nil {
 				var blocked BlockedError
 				if errors.As(err, &blocked) {
-					return e.block(ctx, ref, blocked.Reason)
+					return e.blockRefusedAllocation(ctx, ref, blocked.Reason)
 				}
 				// A cold checkout may not carry the PR commit object even though the
 				// forge supplied its SHA, and nothing in the daemon poll/dispatch path
@@ -846,7 +850,7 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 				path, err = allocate()
 				if err != nil {
 					if errors.As(err, &blocked) {
-						return e.block(ctx, ref, blocked.Reason)
+						return e.blockRefusedAllocation(ctx, ref, blocked.Reason)
 					}
 					return fmt.Errorf("allocate read-only fan-out worktree for delegation %q after fetch: %w", request.DelegationID, err)
 				}

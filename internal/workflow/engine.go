@@ -429,6 +429,29 @@ func (e Engine) block(ctx context.Context, ref taskRef, reason string) error {
 	return e.blockTask(ctx, ref, "workflow_blocked", reason, "workflow")
 }
 
+// blockRefusedAllocation is the block that means THE DECISION CANNOT BE APPLIED AT
+// ALL: a delegation worktree or branch lock was refused, so there is no way to run the
+// verb. Under a capturing resolution it marks the transaction's ALTERNATIVE OUTCOME -
+// the block and its event commit under the fence, the prepared work is dropped and the
+// receipt is withheld, so the claim survives and a replay cannot double-block (#1673).
+//
+// It is deliberately distinct from a plain block: continuation synthesis legitimately
+// blocks a parent task while still enqueuing work, and folding the two together
+// silently discarded that work.
+func (e Engine) blockRefusedAllocation(ctx context.Context, ref taskRef, reason string) error {
+	err := e.block(ctx, ref, reason)
+	if !e.capturing() {
+		return err
+	}
+	refused := BlockedError{Reason: reason}
+	var carried BlockedError
+	if errors.As(err, &carried) {
+		refused = carried
+	}
+	e.resolutionSink.blocked = &refused
+	return err
+}
+
 // blockTaskPreWriteHook fires between blockTask's state pre-read and its guarded
 // write, and between the dirty-worktree block's read and write. It is the seam a
 // concurrent merge occupies in production; nil outside tests.
@@ -482,6 +505,25 @@ func (e Engine) blockTask(ctx context.Context, ref taskRef, kind string, reason 
 	// post-read/pre-write seam this classification exists for. Nil in production.
 	if blockTaskPreWriteHook != nil {
 		blockTaskPreWriteHook(ctx, task.ID)
+	}
+	// CAPTURING: a resolution's block is the ALTERNATIVE OUTCOME of its one
+	// transaction, not a separate write. Landing it here would put a durable task
+	// mutation outside the fence - so a pass that lost or outlived its lease could
+	// still block the task, and every recovery would repeat the block. Capture it and
+	// let CommitResolutionEffects apply it under the fence, with no receipt (#1673).
+	if e.capturing() {
+		task.State = string(TaskBlocked)
+		forbidden, _ := taskStateWriteExclusions(TaskBlocked)
+		e.resolutionSink.task = task
+		e.resolutionSink.taskForbidden = forbidden
+		e.resolutionSink.taskSet = true
+		// The block's task_event travels WITH the transition rather than as a second
+		// write. It does NOT by itself mean the decision was refused: continuation
+		// synthesis legitimately blocks a parent task while still enqueuing work, so
+		// only the allocation-refusal site sets resolutionSink.blocked.
+		e.resolutionSink.taskEvent = db.TaskEvent{Kind: kind, FromState: fromState, Reason: reason}
+		e.resolutionSink.taskEventValid = true
+		return blockErr
 	}
 	blockEvent := db.TaskEvent{
 		Kind:      kind,

@@ -725,15 +725,36 @@ func (e Engine) applyResolutionEffectsFenced(ctx context.Context, parentJob db.J
 	// PRE-EFFECTS AND PREPARATION run here, under the held fence. Everything durable
 	// they would write is captured instead; the git/lock work is real and is recorded
 	// on the round so a later supersede or release can hand it back.
+	//
+	// The lease is RENEWED first: git work has no bound, and a fixed lease that expires
+	// mid-allocation would let a second recoverer take ownership while this pass is
+	// still creating resources (#1673).
+	if renewed, err := e.Store.RenewEscalationRecoveryLease(ctx, parentJob.ID, roundID, owner,
+		time.Now().UTC().Add(escalationRecoveryLeaseTTL), time.Now().UTC()); err != nil {
+		return err
+	} else if !renewed {
+		// Lost between the fence and here: apply nothing.
+		return nil
+	}
 	verbErr := capturing.applyResolutionEffects(ctx, parentJob, parentPayload, ref, rec, verb, instructions, answers, roundID)
 	if verbErr != nil && sink.blocked == nil {
 		return verbErr
 	}
 	if sink.preEffectWorktree != "" || sink.preEffectBranch != "" {
-		if _, err := e.Store.RecordEscalationRoundPreEffects(ctx, parentJob.ID, roundID, owner,
+		recorded, err := e.Store.RecordEscalationRoundPreEffects(ctx, parentJob.ID, roundID, owner,
 			sink.preEffectRepo, sink.preEffectBranch, sink.preEffectWorktree, sink.preEffectLockOwner,
-			time.Now().UTC()); err != nil {
+			time.Now().UTC())
+		if err != nil {
 			return err
+		}
+		if !recorded {
+			// OWNERSHIP LOST while the external work ran. The resources exist and this
+			// pass can no longer claim them, so it hands them back rather than
+			// committing effects it no longer owns: the new owner re-derives the same
+			// idempotent worktree key, and the branch lock is released here because its
+			// owner token belongs to this pass.
+			e.releaseUnownedPreEffects(ctx, sink)
+			return nil
 		}
 	}
 
@@ -747,16 +768,17 @@ func (e Engine) applyResolutionEffectsFenced(ctx context.Context, parentJob db.J
 	if sink.taskSet {
 		commit.Task = sink.task
 		commit.TaskForbidden = sink.taskForbidden
+		// The task_event travels with the transition it belongs to, captured by
+		// blockTask, so the two can never land separately.
+		commit.TaskEvent = sink.taskEvent
+		commit.TaskEventValid = sink.taskEventValid && strings.TrimSpace(sink.task.ID) != ""
 	}
 	if sink.blocked != nil {
-		// ALTERNATIVE OUTCOME: the decision could not be applied. The block lands under
-		// the fence and NO receipt is written, so the claim stays preserved and the next
-		// pass re-drives (or parks) rather than double-blocking.
-		commit.Task = sink.task
-		commit.Task.State = string(TaskBlocked)
-		commit.TaskForbidden, _ = taskStateWriteExclusions(TaskBlocked)
-		commit.TaskEvent = db.TaskEvent{Kind: "escalation_resolution_blocked", Reason: sink.blocked.Reason}
-		commit.TaskEventValid = strings.TrimSpace(commit.Task.ID) != ""
+		// ALTERNATIVE OUTCOME: the decision could not be applied at all. The block and
+		// its event land under the fence, the prepared work is DROPPED - a refused
+		// decision must not dispatch anything - and NO receipt is written, so the claim
+		// stays preserved and the next pass re-drives or parks rather than double-blocking.
+		commit.Jobs = nil
 	} else {
 		commit.Receipt = db.JobEvent{
 			JobID:   parentJob.ID,
@@ -777,6 +799,21 @@ func (e Engine) applyResolutionEffectsFenced(ctx context.Context, parentJob db.J
 		return *sink.blocked
 	}
 	return nil
+}
+
+// releaseUnownedPreEffects hands back resources a pass created and then lost the
+// right to use. It is best-effort by design: the worktree key is idempotent so the new
+// owner re-uses it, and the branch lock is the only resource whose retention would
+// block another pass outright.
+func (e Engine) releaseUnownedPreEffects(ctx context.Context, sink *resolutionEffectSink) {
+	if strings.TrimSpace(sink.preEffectBranch) == "" {
+		return
+	}
+	_, _ = e.Store.ReleaseLock(ctx, db.BranchLock{
+		RepoFullName: sink.preEffectRepo,
+		Branch:       sink.preEffectBranch,
+		Owner:        sink.preEffectLockOwner,
+	})
 }
 
 // applyResolutionEffects runs the verb's irreversible half AFTER its resolution has

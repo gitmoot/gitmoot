@@ -523,6 +523,31 @@ func (s *Store) CommitResolutionEffects(ctx context.Context, commit ResolutionCo
 		return false, nil
 	}
 
+	if strings.TrimSpace(commit.Task.ID) != "" {
+		// THE GUARD DECIDES THE WHOLE TRANSACTION. A refused task write means another
+		// worker moved the task to a terminal state (merged, dismissed, superseded)
+		// between capture and commit. Committing anyway would dispatch stale work
+		// against a finished lifecycle AND record the human decision as applied, so a
+		// zero-row guard aborts everything - jobs, events and receipt included (#1673).
+		written, err := s.upsertTaskUnlessStates(ctx, tx, commit.Task, commit.TaskForbidden)
+		if err != nil {
+			return false, err
+		}
+		if !written {
+			// Rolled back by the deferred Rollback: nothing landed. Reported as a lost
+			// fence rather than an error, because the claim is intact and the next pass
+			// re-classifies against the winning state.
+			return false, nil
+		}
+		if commit.TaskEventValid {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO task_events(task_id, kind, from_state, to_state, reason)
+				VALUES (?, ?, ?, ?, ?)`, commit.Task.ID, commit.TaskEvent.Kind, commit.TaskEvent.FromState,
+				commit.TaskEvent.ToState, commit.TaskEvent.Reason); err != nil {
+				return false, err
+			}
+		}
+	}
+
 	for _, prepared := range commit.Jobs {
 		if err := createJobWithEventTx(ctx, tx, s, prepared.Job, JobEvent{
 			JobID: prepared.Job.ID, Kind: prepared.Job.State, Message: "job queued",
@@ -535,19 +560,6 @@ func (s *Store) CommitResolutionEffects(ctx context.Context, commit ResolutionCo
 			}
 			if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`,
 				event.JobID, event.Kind, event.Message); err != nil {
-				return false, err
-			}
-		}
-	}
-
-	if strings.TrimSpace(commit.Task.ID) != "" {
-		if _, err := s.upsertTaskUnlessStates(ctx, tx, commit.Task, commit.TaskForbidden); err != nil {
-			return false, err
-		}
-		if commit.TaskEventValid {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO task_events(task_id, kind, from_state, to_state, reason)
-				VALUES (?, ?, ?, ?, ?)`, commit.Task.ID, commit.TaskEvent.Kind, commit.TaskEvent.FromState,
-				commit.TaskEvent.ToState, commit.TaskEvent.Reason); err != nil {
 				return false, err
 			}
 		}
@@ -619,4 +631,36 @@ func (s *Store) MarkEscalationRoundNeedsRepairAsOwner(ctx context.Context, jobID
 		return false, err
 	}
 	return true, tx.Commit()
+}
+
+// RenewEscalationRecoveryLease extends a fence its CURRENT holder still owns. It is a
+// separate primitive from AcquireEscalationRecoveryLease on purpose: acquire requires
+// the lease to be free or lapsed, so a holder calling it gets false and would wrongly
+// conclude it had lost ownership (#1673).
+//
+// It returns false ONLY on genuine ownership loss - superseded, parked, settled, or
+// lapsed and taken by someone else - which is exactly the signal a long external
+// pre-effect needs.
+func (s *Store) RenewEscalationRecoveryLease(ctx context.Context, jobID string, roundID string, owner string, until time.Time, now time.Time) (bool, error) {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return false, errors.New("recovery lease owner is required")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE escalation_rounds
+		SET recovery_lease_until = ?
+		WHERE job_id = ? AND round_id = ?
+		  AND effects_completed_at IS NULL
+		  AND integrity_state = ''
+		  AND recovery_owner = ?
+		  AND recovery_lease_until > ?`,
+		formatResourceLockTime(until), strings.TrimSpace(jobID), strings.TrimSpace(roundID),
+		owner, formatResourceLockTime(now))
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
 }

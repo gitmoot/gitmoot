@@ -21,6 +21,10 @@ type resolutionEffectSink struct {
 	// outcome: the block commits under the fence and the receipt is withheld, so the
 	// claim stays preserved and a crash-replay cannot double-block.
 	blocked *BlockedError
+	// blockKind and blockFromState carry the task_event the block owns, so the event
+	// and the state transition commit together rather than as two writes.
+	taskEvent      db.TaskEvent
+	taskEventValid bool
 	// preEffect records resources allocated OUTSIDE the transaction, under the fence.
 	preEffectRepo      string
 	preEffectBranch    string
