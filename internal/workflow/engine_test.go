@@ -2690,6 +2690,68 @@ func TestEngineReviewLoopAllowsNewHead(t *testing.T) {
 	}
 }
 
+func TestEngineReviewLoopSparseHistoryDispatchesNextNumericRound(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
+	for _, prior := range []struct {
+		id    string
+		round string
+	}{
+		{id: "prior-review-10-a", round: "review-10"},
+		{id: "prior-review-10-b", round: "review-10"},
+		{id: "prior-review-malformed", round: "manual-round"},
+		{id: "prior-review-empty", round: ""},
+	} {
+		insertCompletedJob(t, store, db.Job{ID: prior.id, Agent: "audit", Type: "review"}, JobPayload{
+			Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, HeadSHA: "head-a",
+			TaskID: "task-7", ReviewRound: prior.round,
+			Result: &AgentResult{Decision: "changes_requested", Summary: "fix it"},
+		})
+	}
+	engine := testEngine(store)
+	gate := &fakeMergeGate{decision: MergeDecision{Ready: true}}
+	engine.MergeGate = gate
+	engine.ReviewChangedFiles = func(context.Context, string, int, string, string) ([]string, error) {
+		return []string{"internal/workflow/engine.go"}, nil
+	}
+	if err := engine.HandlePullRequestOpened(ctx, PullRequestEvent{
+		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, HeadSHA: "head-b",
+		TaskID: "task-7", LeadAgent: "lead", RequiredReviewers: []string{"audit"},
+	}); err != nil {
+		t.Fatalf("new-head dispatch: %v", err)
+	}
+
+	const jobID = "review-audit-task-7-review-11"
+	job := mustJob(t, store, jobID)
+	payload, err := unmarshalPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload: %v", err)
+	}
+	if payload.ReviewRound != "review-11" {
+		t.Fatalf("review round = %q, want review-11", payload.ReviewRound)
+	}
+	payload.Result = &AgentResult{Decision: "approved", Summary: "ready"}
+	encoded, err := marshalPayload(payload)
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.UpdateJobPayload(ctx, jobID, encoded); err != nil {
+		t.Fatalf("UpdateJobPayload: %v", err)
+	}
+	if err := store.UpdateJobState(ctx, jobID, string(JobSucceeded)); err != nil {
+		t.Fatalf("UpdateJobState: %v", err)
+	}
+	if err := engine.AdvanceJob(ctx, jobID); err != nil {
+		t.Fatalf("AdvanceJob: %v", err)
+	}
+	assertTaskState(t, store, "task-7", TaskReadyToMerge)
+	if len(gate.requests) != 1 {
+		t.Fatalf("merge gate requests = %d, want 1", len(gate.requests))
+	}
+}
+
 // TestEngineReviewLoopAllowsMixedDecisionsAtSameHead kills a decision-blind
 // mutant. A verdict flip is unstable evidence and must not freeze progress.
 func TestEngineReviewLoopAllowsMixedDecisionsAtSameHead(t *testing.T) {
