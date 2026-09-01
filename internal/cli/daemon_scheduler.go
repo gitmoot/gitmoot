@@ -1259,6 +1259,12 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 // ahead of dispatch.
 const terminalTaskWorktreeReclaimPassBudget = 8
 
+// fixCloneFenceRetentionWindow is how long a retired fix-clone fence is kept by
+// the scheduled sweep. It only has to outlive any process that could still name
+// the quarantine the fence replaced, and the reclaim that wrote it already proved
+// no process held the clone.
+const fixCloneFenceRetentionWindow = 24 * time.Hour
+
 // terminalTaskWorktreeReclaimResume rotates the bounded window so a candidate
 // that can never be reclaimed cannot starve the ones behind it: the pass resumes
 // at the first id at or after the last pass's unreached candidate.
@@ -1525,6 +1531,15 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 		}
 		if err := reclaimTerminalTaskWorktrees(ctx, worker, repoFilter, rootFilter, tracker.checkoutHeld, cand, stdout); err != nil {
 			writeLine(stdout, "terminal task worktree reclaim failed: %v", err)
+		}
+		// Retired fences are bounded HERE rather than in the reclaim itself: that
+		// pass creates the current fences and never revisits a completed clone, so
+		// nothing it can do would ever remove them. This sweep is filesystem-driven
+		// and runs beside the passes that create them.
+		if pruned, err := workflow.PruneExpiredFixCloneFences(worker.workflowHome(), now.Add(-fixCloneFenceRetentionWindow)); err != nil {
+			writeLine(stdout, "fix clone fence prune failed: %v", err)
+		} else if pruned > 0 {
+			writeLine(stdout, "pruned %d retired fix clone fence%s", pruned, pluralSuffix(pruned))
 		}
 	}
 	// Comment retries only post PR comments through the commenter — they never

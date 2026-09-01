@@ -587,25 +587,19 @@ replace objects and refuses outright when the clone carries a grafts file. The
 clone's own `origin` is never trusted; it is writable by whatever ran in the clone.
 
 A proven-disposable clone is renamed to `<path>.ttl-reclaiming-<random>` and
-re-proven there. After the final Git proof, Gitmoot renames it to a second random
-sibling before the last nested-object-database scan, then fences both names a
-writer could have observed with a zero-byte file: `mkdir` on such a name fails and
-any path below it fails with `ENOTDIR`, so a writer recreating a quarantine name
-after the final scan cannot orphan content. A name another writer wins first — a
-directory, a symlink, a non-empty file — is never deleted or followed; the clone is
-restored, the obligation stays open, and the pass refuses to complete. Only a
-zero-byte regular file counts as a spent fence; spent fences are pruned after 24h
-and counted by `gitmoot doctor` and `/api/health`. Nested object databases are
-recognised by their bytes: a loose candidate must hash (SHA-1 or SHA-256) to its
-storage name, and a pack needs the `PACK` magic, a supported version, a non-zero
-object count and its sibling `.idx`, so ordinary ignored content-addressed build
-output stays reclaimable. The final liveness gate scans both process working
-directories and open file descriptors and retains on an inconclusive `/proc` scan.
-A failed proof renames the current quarantine back. An interrupted removal leaves a
-quarantine DIRECTORY, restored by the next pass
-(`delegation_worktree_quarantine_restored`) and re-proven; the scheduler does not
-complete removal while one survives, and `gitmoot doctor` counts those
-directories. Every retention records its reason once per job:
+re-proven there, then renamed again before the final scan. That scan records an
+INVENTORY — the exact entries, sizes and modification times it proved — and the
+removal unlinks only those, so content written between the proof and the unlink is
+never deleted: it is not in the inventory, and its parent's `rmdir` fails with
+`ENOTEMPTY`, aborting the removal with the clone restored. Both names a writer
+could have observed are fenced with a marker-carrying single-link file; anything
+else at a quarantine name (directory, symlink, hard link, planted file) is a
+survivor that is never deleted and blocks completion. Retired fences are swept
+after 24h by the daemon's worktree tick and counted by `gitmoot doctor` and
+`/api/health`. Nested object databases are recognised by bytes: a loose candidate
+must hash to its storage name with a bounded header read, and a pack must have a
+verifying trailing checksum, a verifying `.idx`, and an index that records that
+pack's digest. Every retention records its reason once per job:
 `delegation_worktree_retained_unpublished` (with obligation reason
 `unpublished_commits`; squash-merged branches land here by design, because a
 squash publishes the content and not the commits; ignored nested repositories

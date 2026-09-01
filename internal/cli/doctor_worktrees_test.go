@@ -94,6 +94,72 @@ func TestBuildDelegationWorktreeDoctorCheckThresholds(t *testing.T) {
 	}
 }
 
+// A fix clone's quarantine siblings are the only worktree state no other surface
+// reports: a surviving directory is unowned garbage, an unproven file is a writer's
+// plant, and a spent fence is ours. Doctor has to separate the three, because the
+// first two block a reclaim and the last is inert bookkeeping.
+func TestInspectDelegationWorktreeUsageAccountsFixCloneFencesAndSurvivors(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	store := openCLIJobStore(t, home)
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	clone, err := workflow.FixWorktreePath(paths.Home, "owner/repo", "fix-job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(clone), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seedCLIJob(t, store, db.Job{
+		ID: "fix-job", Agent: "fixer", Type: "implement", State: string(workflow.JobSucceeded),
+		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", WorktreePath: clone, FixWorktree: true}),
+	}, string(workflow.JobSucceeded))
+
+	// An interrupted removal's surviving clone, sized so it lands in the byte total.
+	survivor := clone + ".ttl-reclaiming-aaaaaaaa"
+	if err := os.MkdirAll(survivor, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(survivor, "payload.bin"), make([]byte, 23), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A writer's plant: no marker, so it is unproven rather than an owned fence.
+	if err := os.WriteFile(clone+".ttl-reclaiming-bbbbbbbb", nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A real spent fence, written by the production helper.
+	if fenced, err := workflow.FenceFixCloneQuarantineNameForTest(clone + ".ttl-reclaiming-cccccccc"); err != nil || !fenced {
+		t.Fatalf("fence = (%v, %v)", fenced, err)
+	}
+	// Age the owner past the TTL so its surviving quarantine is stale reclaimable
+	// state rather than a recent terminal the size total excludes by design.
+	store.Close()
+	aged := now.Add(-96 * time.Hour).Format("2006-01-02 15:04:05")
+	setJobTimes(t, home, "fix-job", aged, aged)
+	store = openCLIJobStore(t, home)
+	defer store.Close()
+
+	usage, err := inspectDelegationWorktreeUsage(context.Background(), paths, store, now, 72*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.Fences != 1 {
+		t.Fatalf("fences = %d, want 1: %+v", usage.Fences, usage)
+	}
+	// The surviving directory is stale reclaimable state; the planted file is
+	// unproven. Neither may be reported as a fence.
+	if usage.Unproven != 1 {
+		t.Fatalf("unproven = %d, want the writer plant counted once: %+v", usage.Unproven, usage)
+	}
+	if usage.SizeBytes != 23 {
+		t.Fatalf("size = %d, want the surviving quarantine's 23 B", usage.SizeBytes)
+	}
+	check := buildDelegationWorktreeDoctorCheck(usage)
+	if !strings.Contains(check.Detail, "1 spent removal fence") {
+		t.Fatalf("doctor detail omits fences: %q", check.Detail)
+	}
+}
+
 func TestHealthEndpointSurfacesDelegationWorktreeUsage(t *testing.T) {
 	home := dashboardTestHome(t)
 	paths := config.PathsForHome(home)

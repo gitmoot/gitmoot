@@ -531,22 +531,18 @@ two-minute probe deadline) and removes the clone only when no commit reachable
 from any local ref or reflog is missing from those refs AND the clone holds no
 unreachable commit object. The clone's own `origin` is never trusted, replace
 objects are ignored, and a grafts file makes the clone unprovable.
-The proven clone is renamed to `<path>.ttl-reclaiming-<random>` and re-proven
-there. After the final Git proof it is renamed to a second random sibling, then
-scanned for nested object databases, and both names a writer could have observed
-are fenced with a zero-byte file so no directory can ever exist at them again. A
-name another writer wins first — directory, symlink or non-empty file — is
-retained, never deleted and never followed, and the pass refuses to complete while
-it survives. Only a zero-byte regular file is a spent fence; fences are pruned
-after 24h and counted by `gitmoot doctor` and `/api/health`. Nested object
-databases are proved from BYTES: a loose candidate must hash (SHA-1 or SHA-256) to
-its storage name, and a pack needs the `PACK` magic, a supported version, a
-non-zero object count and its sibling `.idx`, so ignored content-addressed build
-output stays reclaimable. The final liveness gate covers both process working
-directories and open file descriptors and retains on an inconclusive `/proc` scan.
-An interrupted removal leaves a quarantine DIRECTORY, restored by the next pass
-(`delegation_worktree_quarantine_restored`); no pass completes removal while one
-survives, and `gitmoot doctor` counts them.
+The proven clone is renamed to `<path>.ttl-reclaiming-<random>`, re-proven, and
+renamed again before the final scan. That scan takes an INVENTORY, and the removal
+unlinks only what it inventoried: a writer's post-proof content is never in it, so
+the parent's `rmdir` fails and the removal aborts with the clone restored — the
+deletion window is closed by the kernel, not by another liveness sample. Both
+observable names are fenced with a marker-carrying single-link file; a directory,
+symlink, hard link or planted file at a quarantine name is a survivor that is never
+deleted, never followed, and blocks completion. Retired fences are swept after 24h
+by the daemon tick and counted by `gitmoot doctor` and `/api/health`. Nested object
+databases are proved from bytes: a loose candidate must hash (SHA-1 or SHA-256) to
+its storage name with a bounded header read, and a pack must carry a verifying
+trailing checksum plus a verifying `.idx` that records that pack's digest.
 `delegation_worktree_retained_unpublished` with obligation reason
 `unpublished_commits` (the normal outcome for a squash-merged branch, whose
 content is published while its commits are not, and for an ignored nested
