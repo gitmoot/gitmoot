@@ -542,14 +542,17 @@ Cleanup obligations for fix clones stay OPEN. Managed-path absence is not
 removal evidence, even when no sibling is found; a clone may have been set
 aside, and only a durable operator action can close that work item. Dangling
 symlinks are inspected with `lstat` and never treated as absent targets.
-`gitmoot doctor` and `/api/health` count the managed clone and every surviving
-`.ttl-reclaiming-*` sibling.
+`gitmoot doctor` and `/api/health` discover the canonical `fixes/` directory
+structurally, including set-asides created before any job row exists. Discovery
+and logical-size accounting each stop after 4096 entries; `truncated=true` and
+the summary identify lower-bound results, and doctor warns.
 
 The daemon's pending and aged delegation-reclaim queries return at most 256 due
-owners host-wide. Each processed obligation persists its next-attempt time, so
-fairness survives daemon restarts instead of depending on an in-memory cursor.
-The aged and terminal-task passes additionally attempt at most eight candidates
-per repository per tick.
+owners host-wide. Attempted candidates and selected rows skipped by repository,
+session, lifecycle, or checkout-liveness filters persist a later next-attempt
+time, so fairness survives daemon restarts instead of depending on an in-memory
+cursor. The aged and terminal-task passes additionally attempt at most eight
+candidates per repository per tick.
 The task pass is driven by terminal task lifecycle state rather than age.
 Candidate-local lookup, runner, and removal failures skip only that worktree so
 later candidates continue; candidate-query and store-wide lookup failures still

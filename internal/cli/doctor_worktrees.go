@@ -17,8 +17,11 @@ import (
 )
 
 const (
-	delegationWorktreeWarnCount = 10
-	delegationWorktreeWarnBytes = int64(1_000_000_000)
+	delegationWorktreeWarnCount           = 10
+	delegationWorktreeWarnBytes           = int64(1_000_000_000)
+	delegationWorktreeTrackedPathLimit    = 4096
+	delegationWorktreeDiscoveryEntryLimit = 4096
+	delegationWorktreeSizeEntryLimit      = 4096
 )
 
 type delegationWorktreeUsage struct {
@@ -30,6 +33,7 @@ type delegationWorktreeUsage struct {
 	Unproven       int    `json:"unproven"`
 	RecentTerminal int    `json:"recentTerminal"`
 	Quarantined    int    `json:"quarantined"`
+	Truncated      bool   `json:"truncated"`
 	Root           string `json:"root"`
 	Summary        string `json:"summary"`
 }
@@ -62,7 +66,6 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 	}
 
 	owned := map[string]delegationWorktreeClass{}
-	fixClones := map[string]delegationWorktreeClass{}
 	for _, job := range jobs {
 		payload, err := workflow.ParseJobPayload(job.Payload)
 		if err != nil || strings.TrimSpace(payload.WorktreePath) == "" {
@@ -91,96 +94,94 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 				class = worktreeRecentTerminal
 			}
 		}
-		// A fix clone's own directory is now IN this metric. Nothing deletes a
-		// standalone clone automatically any more, so the clone itself — not just a
-		// leftover sibling — is what an operator has to see and remove. Excluding it
-		// made the documented "doctor reports it" handoff a claim with no surface.
-		target := owned
-		if fixClone && strings.TrimSpace(payload.DelegationID) == "" && !payload.ReadOnlyWorktree {
-			target = fixClones
-		}
 		// A path referenced by multiple rows is pinned if ANY owner is resumable;
 		// safety wins over an older terminal record for the same deterministic path.
-		if prior, exists := target[path]; !exists || worktreeClassPriority(class) > worktreeClassPriority(prior) {
-			target[path] = class
+		if prior, exists := owned[path]; exists {
+			if worktreeClassPriority(class) > worktreeClassPriority(prior) {
+				owned[path] = class
+			}
+			continue
 		}
+		if len(owned) >= delegationWorktreeTrackedPathLimit {
+			usage.Truncated = true
+			continue
+		}
+		owned[path] = class
 	}
 
 	pathsOnDisk := map[string]struct{}{}
-	quarantineClasses := map[string]delegationWorktreeClass{}
-	scanQuarantines := func(path string, class delegationWorktreeClass) {
-		// A set-aside fix clone lives at a sibling, not at the recorded path.
-		// Counting only recorded paths hides exactly the directory an interrupted
-		// allocation or dispatch preserves. A scan or stat failure is reported as
-		// unproven rather than dropped.
-		survivors, err := workflow.FixCloneQuarantines(path)
-		if err != nil {
-			usage.Unproven++
-			usage.Stale++
-			return
-		}
-		for _, quarantine := range survivors {
-			info, err := os.Lstat(quarantine)
-			switch {
-			case err == nil && info.IsDir():
-				pathsOnDisk[quarantine] = struct{}{}
-				quarantineClasses[quarantine] = class
-			case err == nil:
-				// A surviving non-directory (a symlink a writer aimed elsewhere, a
-				// non-empty file) is not a clone and has no size to attribute, but
-				// it is unowned garbage at a managed name.
-				usage.Unproven++
-				usage.Stale++
-			case !os.IsNotExist(err):
-				usage.Unproven++
-				usage.Stale++
+	unprovenEntries := map[string]struct{}{}
+	for path := range owned {
+		if info, err := os.Lstat(path); err == nil {
+			if info.IsDir() {
+				pathsOnDisk[path] = struct{}{}
+			} else {
+				unprovenEntries[path] = struct{}{}
 			}
 		}
 	}
-	for path, class := range owned {
-		if info, err := os.Stat(path); err == nil && info.IsDir() {
-			pathsOnDisk[path] = struct{}{}
+
+	// Canonical directory roots:
+	//   <root>/<owner--repo>/delegations/<parent>/<leg>
+	//   <root>/<owner--repo>/fixes/<managed-or-set-aside-clone>
+	//
+	// The FIXES arm is structural rather than job-driven: interrupted pre-enqueue
+	// allocation has no job row by definition. A single global entry budget bounds
+	// doctor and /api/health even when the host tree is attacker-controlled.
+	discovered := 0
+	walkErr := filepath.WalkDir(root, func(path string, entry fs.DirEntry, entryErr error) error {
+		if ctx.Err() != nil {
+			return fs.SkipAll
 		}
-		scanQuarantines(path, class)
-	}
-	for path, class := range fixClones {
-		// The clone itself, then anything left beside it.
-		if info, err := os.Lstat(path); err == nil && info.IsDir() {
-			pathsOnDisk[path] = struct{}{}
-			if _, classified := owned[path]; !classified {
-				owned[path] = class
-			}
-		}
-		scanQuarantines(path, class)
-	}
-	for quarantine, class := range quarantineClasses {
-		if _, classified := owned[quarantine]; !classified {
-			owned[quarantine] = class
-		}
-	}
-	// Canonical layout: <root>/<owner--repo>/delegations/<parent>/<leg>.
-	// Stop at each leg root; size accounting below walks it exactly once.
-	_ = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil || path == root || !entry.IsDir() {
+		if entryErr != nil {
+			usage.Truncated = true
 			return nil
+		}
+		if path == root {
+			return nil
+		}
+		discovered++
+		if discovered > delegationWorktreeDiscoveryEntryLimit {
+			usage.Truncated = true
+			return fs.SkipAll
 		}
 		rel, err := filepath.Rel(root, path)
 		if err != nil {
+			usage.Truncated = true
 			return nil
 		}
 		parts := strings.Split(rel, string(filepath.Separator))
-		if len(parts) == 4 && parts[1] == "delegations" {
+		isDelegationRoot := len(parts) == 4 && parts[1] == "delegations"
+		isFixRoot := len(parts) == 3 && parts[1] == "fixes"
+		if !isDelegationRoot && !isFixRoot {
+			return nil
+		}
+		if entry.IsDir() {
+			if len(pathsOnDisk) >= delegationWorktreeTrackedPathLimit {
+				usage.Truncated = true
+				return fs.SkipAll
+			}
 			pathsOnDisk[path] = struct{}{}
 			return filepath.SkipDir
 		}
+		unprovenEntries[path] = struct{}{}
 		return nil
 	})
+	if walkErr != nil && !os.IsNotExist(walkErr) {
+		usage.Truncated = true
+	}
+	if ctx.Err() != nil {
+		return usage, ctx.Err()
+	}
+	usage.Stale += len(unprovenEntries)
+	usage.Unproven += len(unprovenEntries)
 
 	ordered := make([]string, 0, len(pathsOnDisk))
 	for path := range pathsOnDisk {
 		ordered = append(ordered, path)
 	}
 	sort.Strings(ordered)
+	sizeEntriesRemaining := delegationWorktreeSizeEntryLimit
 	for _, path := range ordered {
 		class, ok := owned[path]
 		if !ok {
@@ -199,10 +200,15 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 		case worktreeUnproven:
 			usage.Unproven++
 		}
-		usage.SizeBytes += directoryLogicalSize(path)
+		size, truncated := directoryLogicalSize(ctx, path, &sizeEntriesRemaining)
+		usage.SizeBytes += size
+		usage.Truncated = usage.Truncated || truncated
 	}
 	usage.Size = formatWorktreeBytes(usage.SizeBytes)
 	usage.Summary = fmt.Sprintf("%d stale worktree%s / %s under %s", usage.Stale, pluralSuffix(usage.Stale), usage.Size, usage.Root)
+	if usage.Truncated {
+		usage.Summary += " (bounded scan truncated; counts and bytes are lower bounds)"
+	}
 	return usage, nil
 }
 
@@ -237,18 +243,37 @@ func worktreePathUnderRoot(root, candidate string) (string, bool) {
 	return filepath.Clean(path), true
 }
 
-func directoryLogicalSize(root string) int64 {
+func directoryLogicalSize(ctx context.Context, root string, remaining *int) (int64, bool) {
 	var total int64
-	_ = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil || entry.IsDir() {
+	truncated := false
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if ctx.Err() != nil {
+			truncated = true
+			return fs.SkipAll
+		}
+		if walkErr != nil {
+			truncated = true
 			return nil
 		}
-		if info, err := entry.Info(); err == nil {
+		if *remaining <= 0 {
+			truncated = true
+			return fs.SkipAll
+		}
+		*remaining--
+		if entry.IsDir() {
+			return nil
+		}
+		if info, infoErr := entry.Info(); infoErr == nil {
 			total += info.Size()
+		} else {
+			truncated = true
 		}
 		return nil
 	})
-	return total
+	if err != nil {
+		truncated = true
+	}
+	return total, truncated
 }
 
 func formatWorktreeBytes(size int64) string {
@@ -298,6 +323,6 @@ func delegationWorktreeDoctorCheck(paths config.Paths) (doctor.Check, bool) {
 
 func buildDelegationWorktreeDoctorCheck(usage delegationWorktreeUsage) doctor.Check {
 	detail := fmt.Sprintf("%s (%d reclaimable, %d pinned by non-terminal owners, %d unproven; %d recent terminal within TTL; %d cleanup quarantined)", usage.Summary, usage.Reclaimable, usage.Pinned, usage.Unproven, usage.RecentTerminal, usage.Quarantined)
-	warn := usage.Stale >= delegationWorktreeWarnCount || usage.SizeBytes >= delegationWorktreeWarnBytes || usage.Quarantined > 0
+	warn := usage.Truncated || usage.Stale >= delegationWorktreeWarnCount || usage.SizeBytes >= delegationWorktreeWarnBytes || usage.Quarantined > 0
 	return doctor.Check{Name: "worktrees", OK: !warn, Required: false, Detail: detail}
 }

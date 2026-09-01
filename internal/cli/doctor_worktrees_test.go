@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -169,16 +170,49 @@ func TestInspectDelegationWorktreeUsageAccountsManagedAndSetAsideFixClones(t *te
 		t.Fatal(err)
 	}
 	// Managed clone (7 B), set-aside clone (11 B), and legacy survivor (23 B)
-	// are reclaimable operator work. The planted file is the fourth stale entry
-	// and is separately classified unproven.
+	// are operator work. The two unowned survivors and planted file are unproven.
 	if usage.Stale != 4 {
 		t.Fatalf("stale = %d, want three clones plus the unproven plant: %+v", usage.Stale, usage)
 	}
-	if usage.Unproven != 1 {
-		t.Fatalf("unproven = %d, want the writer plant counted once: %+v", usage.Unproven, usage)
+	if usage.Unproven != 3 {
+		t.Fatalf("unproven = %d, want two unowned survivors plus the writer plant: %+v", usage.Unproven, usage)
 	}
 	if usage.SizeBytes != 41 {
 		t.Fatalf("size = %d, want all three fix-clone directories (41 B)", usage.SizeBytes)
+	}
+}
+
+func TestInspectDelegationWorktreeUsageBoundsLogicalSizeScan(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	clone, err := workflow.FixWorktreePath(paths.Home, "owner/repo", "fix-large")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(clone, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < delegationWorktreeSizeEntryLimit; i++ {
+		if err := os.WriteFile(filepath.Join(clone, fmt.Sprintf("entry-%04d", i)), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedCLIJob(t, store, db.Job{
+		ID: "fix-large", Agent: "fixer", Type: "implement", State: string(workflow.JobBlocked),
+		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", WorktreePath: clone, FixWorktree: true}),
+	}, string(workflow.JobBlocked))
+
+	usage, err := inspectDelegationWorktreeUsage(context.Background(), paths, store, time.Now().UTC(), 72*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !usage.Truncated || !strings.Contains(usage.Summary, "lower bounds") {
+		t.Fatalf("usage = %+v, want explicit bounded-scan truncation", usage)
+	}
+	if check := buildDelegationWorktreeDoctorCheck(usage); check.OK {
+		t.Fatalf("doctor check = %+v, want a truncated scan to warn", check)
 	}
 }
 
@@ -211,18 +245,14 @@ func TestHealthEndpointSurfacesDelegationWorktreeUsage(t *testing.T) {
 	if _, err := workflow.SetAsideFixClone(fixClone); err != nil {
 		t.Fatal(err)
 	}
-	seedCLIJob(t, store, db.Job{
-		ID: "fix-api", Agent: "fixer", Type: "implement", State: string(workflow.JobSucceeded),
-		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", WorktreePath: fixClone, FixWorktree: true}),
-	}, string(workflow.JobSucceeded))
+	// Deliberately do not create a job row. Interrupted pre-enqueue recovery has
+	// exactly this shape, so visibility must come from the fixes directory itself.
 	for attempt := 0; attempt < delegationCleanupRetryBudget; attempt++ {
 		if _, err := store.RecordCleanupObligationFailure(context.Background(), "quarantined", filepath.Join(paths.Home, "worktrees", "owner--repo", "delegations", "parent", "quarantined"), db.CleanupReasonUnknown, errors.New("stuck"), time.Now().UTC(), time.Now().UTC().Add(time.Minute), delegationCleanupRetryBudget); err != nil {
 			t.Fatal(err)
 		}
 	}
 	store.Close()
-	aged := time.Now().UTC().Add(-96 * time.Hour).Format("2006-01-02 15:04:05")
-	setJobTimes(t, home, "fix-api", aged, aged)
 
 	stubOnDiskBuild(t, "", "")
 	stubUpdateCheck(t, "")
@@ -237,8 +267,8 @@ func TestHealthEndpointSurfacesDelegationWorktreeUsage(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload.Worktrees.Stale != 2 || payload.Worktrees.Pinned != 1 || payload.Worktrees.Quarantined != 1 ||
-		payload.Worktrees.SizeBytes != int64(len("dashboard")+len("set-aside")) {
+	if payload.Worktrees.Stale != 2 || payload.Worktrees.Pinned != 1 || payload.Worktrees.Unproven != 1 ||
+		payload.Worktrees.Quarantined != 1 || payload.Worktrees.SizeBytes != int64(len("dashboard")+len("set-aside")) {
 		t.Fatalf("worktrees = %+v", payload.Worktrees)
 	}
 	if !strings.Contains(payload.Worktrees.Summary, "2 stale worktrees") {

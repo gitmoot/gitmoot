@@ -250,6 +250,17 @@ func deferDelegationCleanupContention(ctx context.Context, worker jobWorker, mod
 	return nil
 }
 
+// deferDelegationCleanupSkip moves a selected-but-unattempted row behind the
+// bounded host window. The durable next_attempt_at is the fairness cursor: repo
+// filters, session filters, non-final state, and held checkouts must not leave the
+// same 256 rows monopolizing every tick after a daemon restart.
+func deferDelegationCleanupSkip(ctx context.Context, worker jobWorker, jobID, path string, reason db.CleanupObligationReason, now time.Time) error {
+	_, err := worker.Store.DeferCleanupObligation(
+		context.WithoutCancel(ctx), jobID, path, reason, now, now.Add(delegationCleanupRetryDelay),
+	)
+	return err
+}
+
 func delegationCleanupContended(err error) bool {
 	var blocked workflow.BlockedError
 	return errors.As(err, &blocked)
@@ -1096,18 +1107,23 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 		}
 		path := delegationReclaimPath(job.ID, job.Payload)
 		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+			if err := deferDelegationCleanupSkip(ctx, worker, job.ID, path, db.CleanupReasonTerminalDeferred, now); err != nil {
+				return stopDelegationCleanupPass(err)
+			}
 			continue
 		}
 		if !jobStateEligibleForWorktreeReclaim(job.State) {
+			if err := deferDelegationCleanupSkip(ctx, worker, job.ID, path, db.CleanupReasonTerminalDeferred, now); err != nil {
+				return stopDelegationCleanupPass(err)
+			}
 			continue
 		}
-		if checkoutHeld != nil {
-			if checkoutHeld(queuedJobCheckoutKey(ctx, worker.Store, job)) {
-				continue
+		if checkoutHeld != nil && (checkoutHeld(queuedJobCheckoutKey(ctx, worker.Store, job)) ||
+			(repoFilter != "" && checkoutHeld("repo:"+repoFilter))) {
+			if err := deferDelegationCleanupSkip(ctx, worker, job.ID, path, db.CleanupReasonCheckoutLock, now); err != nil {
+				return stopDelegationCleanupPass(err)
 			}
-			if repoFilter != "" && checkoutHeld("repo:"+repoFilter) {
-				continue
-			}
+			continue
 		}
 		_, ok, err := prepareDelegationCleanup(ctx, worker, "skipped", job, path, now)
 		if err != nil {
@@ -1151,16 +1167,13 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 	if err != nil {
 		return err
 	}
-	rotated := rotateTerminalTaskWorktreeCandidates("aged:"+repoFilter, jobIDs)
 	attempts := 0
-	resume := ""
-	for i, jobID := range rotated {
+	for _, jobID := range jobIDs {
 		// Each attempt can run a remote fetch under a two-minute deadline and a
-		// full-clone removal, so the pass is bounded per tick and rotates, exactly
-		// like the task pass. An unbounded list would delay dispatch behind
-		// maintenance whenever aged candidates accumulate.
+		// full-clone removal, so the pass is bounded per tick. Every attempted or
+		// skipped row persists a later next_attempt_at; the ordered SQL window
+		// therefore advances without an in-memory rotation cursor.
 		if attempts >= terminalTaskWorktreeReclaimPassBudget {
-			resume = rotated[i]
 			break
 		}
 		job, err := delegationReclaimCandidateJob(ctx, worker, jobID)
@@ -1183,18 +1196,23 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 		}
 		path := delegationReclaimPath(job.ID, job.Payload)
 		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+			if err := deferDelegationCleanupSkip(ctx, worker, job.ID, path, db.CleanupReasonTerminalDeferred, now); err != nil {
+				return stopDelegationCleanupPass(err)
+			}
 			continue
 		}
 		if !workflow.IsFinalJobState(job.State) {
+			if err := deferDelegationCleanupSkip(ctx, worker, job.ID, path, db.CleanupReasonTerminalDeferred, now); err != nil {
+				return stopDelegationCleanupPass(err)
+			}
 			continue
 		}
-		if checkoutHeld != nil {
-			if checkoutHeld(queuedJobCheckoutKey(ctx, worker.Store, job)) {
-				continue
+		if checkoutHeld != nil && (checkoutHeld(queuedJobCheckoutKey(ctx, worker.Store, job)) ||
+			(repoFilter != "" && checkoutHeld("repo:"+repoFilter))) {
+			if err := deferDelegationCleanupSkip(ctx, worker, job.ID, path, db.CleanupReasonCheckoutLock, now); err != nil {
+				return stopDelegationCleanupPass(err)
 			}
-			if repoFilter != "" && checkoutHeld("repo:"+repoFilter) {
-				continue
-			}
+			continue
 		}
 		_, ok, err := prepareDelegationCleanup(ctx, worker, "aged", job, path, now)
 		if err != nil {
@@ -1229,7 +1247,6 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 			return stopDelegationCleanupPass(err)
 		}
 	}
-	setTerminalTaskWorktreeReclaimResume("aged:"+repoFilter, resume)
 	return nil
 }
 

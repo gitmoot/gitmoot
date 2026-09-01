@@ -2365,6 +2365,22 @@ func TestFixCloneQuarantinesFindsPathsWithGlobMetacharacters(t *testing.T) {
 	}
 }
 
+func TestFixCloneQuarantinesBoundsParentEnumeration(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "fixes")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i <= fixCloneSurvivorScanMaxEntry; i++ {
+		if err := os.WriteFile(filepath.Join(parent, fmt.Sprintf("unrelated-%04d", i)), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := FixCloneQuarantines(filepath.Join(parent, "job"))
+	if !errors.Is(err, ErrFixCloneSurvivorScanLimit) {
+		t.Fatalf("FixCloneQuarantines error = %v, want bounded-scan marker", err)
+	}
+}
+
 // The pristine check includes ignored files, so a clone holding build output is
 // the retention most hosts will actually hit. It must record why, like the other
 // retention branches: a silent keep is indistinguishable from a live worker.

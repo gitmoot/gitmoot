@@ -811,6 +811,81 @@ func TestReclaimSkippedFixClonePreservesStandaloneObjectDatabase(t *testing.T) {
 	}
 }
 
+func TestSkippedReclaimPersistsFairnessPastFilteredHostWindow(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	worker := defaultJobWorker(store, io.Discard, home)
+	now := time.Now().UTC()
+
+	for i := 0; i < 256; i++ {
+		id := fmt.Sprintf("a-disabled-%03d", i)
+		path, err := workflow.DelegationWorktreePath(worker.workflowHome(), "owner/disabled", "parent", id, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, err := json.Marshal(workflow.JobPayload{
+			Repo: "owner/disabled", DelegationID: id, WorktreePath: path, ReadOnlyWorktree: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		seedCLIJob(t, store, db.Job{
+			ID: id, Agent: "reader", Type: "ask", State: string(workflow.JobFailed),
+			Repo: "owner/disabled", ParentJobID: "parent", DelegationID: id, Payload: string(payload),
+		}, "seed filtered reclaim candidate")
+		if err := store.AddJobEvent(ctx, db.JobEvent{
+			JobID: id, Kind: "delegation_worktree_cleanup_skipped", Message: "preserved",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	targetID := "z-target"
+	targetPath, err := workflow.DelegationWorktreePath(worker.workflowHome(), "owner/target", "parent", targetID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(targetPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	targetPayload, err := json.Marshal(workflow.JobPayload{
+		Repo: "owner/target", DelegationID: targetID, WorktreePath: targetPath, ReadOnlyWorktree: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedCLIJob(t, store, db.Job{
+		ID: targetID, Agent: "reader", Type: "ask", State: string(workflow.JobFailed),
+		Repo: "owner/target", ParentJobID: "parent", DelegationID: targetID, Payload: string(targetPayload),
+	}, "seed target reclaim candidate")
+	if err := store.AddJobEvent(ctx, db.JobEvent{
+		JobID: targetID, Kind: "delegation_worktree_cleanup_skipped", Message: "preserved",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manager := &fakeReclaimWorktreeManager{branches: map[string]bool{}}
+	worker.WorkflowFactory = func(string) workflow.Engine {
+		return workflow.Engine{
+			Store: store, Home: worker.workflowHome(), DelegationCheckout: t.TempDir(), DelegationWorktrees: manager,
+		}
+	}
+
+	if err := reclaimSkippedDelegationWorktrees(ctx, worker, "owner/target", "", nil, newTickCandidates(store), now); err != nil {
+		t.Fatalf("first reclaim pass: %v", err)
+	}
+	if len(manager.removed) != 0 {
+		t.Fatalf("first pass removed %v, want target beyond the bounded window", manager.removed)
+	}
+	next, err := store.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
+	if err != nil {
+		t.Fatalf("query next persistent window: %v", err)
+	}
+	if len(next) != 1 || next[0] != targetID {
+		t.Fatalf("next persistent window = %v, want [%s]", next, targetID)
+	}
+}
+
 // Lock contention is not failure. Counting it spends the three-attempt retry
 // budget and quarantines an obligation that would have succeeded once the lock
 // cleared, so a contended pass must DEFER instead of recording a failure.

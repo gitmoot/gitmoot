@@ -591,14 +591,18 @@ can allocate without destroying bytes. Cleanup obligations remain open.
 Managed-path absence is not treated as removal, even when no sibling is found,
 and dangling symlinks remain visible through `lstat`.
 
-`gitmoot doctor` and `/api/health` count both managed fix clones and every
-surviving `.ttl-reclaiming-*` sibling. Removal is a manual operator decision
-after inspecting the working tree and object database.
+`gitmoot doctor` and `/api/health` discover the canonical `fixes/` directory
+structurally, including set-asides created before a job row exists. Directory
+discovery and logical-size accounting each stop after 4096 entries; the API sets
+`truncated=true`, the summary marks counts and bytes as lower bounds, and doctor
+warns. Removal remains a manual operator decision after inspecting the working
+tree and object database.
 
 The daemon queries at most 256 due pending or aged delegation owners host-wide.
-Processed candidates persist their next-attempt time in the cleanup obligation,
-so fairness survives restarts rather than depending on an in-memory cursor.
-The aged pass also attempts at most eight candidates per repository per tick.
+Attempted candidates and selected rows skipped by repository, session,
+lifecycle, or checkout-liveness filters persist a later next-attempt time, so
+fairness survives restarts rather than depending on an in-memory cursor. The
+aged pass also attempts at most eight candidates per repository per tick.
 Candidate-local failures skip only that worktree, and later candidates continue.
 The five-minute pass cadence advances after every attempt so a failed cleanup
 cannot hot-loop. Cleanup obligations retry once per minute and stop in

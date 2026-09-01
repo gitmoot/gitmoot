@@ -770,10 +770,14 @@ not removal evidence: the clone may have been moved aside, and even an empty
 sibling scan is not durable operator confirmation. Dangling symlinks remain
 visible through `lstat` rather than being mistaken for absent targets.
 
-`gitmoot doctor` and `/api/health` count both the managed fix clone and every
-surviving `.ttl-reclaiming-*` sibling. Manual cleanup requires inspecting the
-reported directory and deciding independently whether its object database and
-working tree can be discarded.
+`gitmoot doctor` and `/api/health` discover the canonical `fixes/` layout
+structurally, so a `.ttl-reclaiming-*` clone remains visible even when the crash
+happened before any job row was written. Managed clones are counted too. Both
+directory discovery and logical-size accounting stop after 4096 filesystem
+entries; the JSON `truncated` field and summary then state that counts and bytes
+are lower bounds, and doctor warns. Manual cleanup requires inspecting the
+directory and deciding independently whether its object database and working
+tree can be discarded.
 
 Every retention records **why**, once per reason per job, so an inert deployment
 is visible instead of silent: `delegation_worktree_retained_unpublished`,
@@ -782,8 +786,9 @@ is visible instead of silent: `delegation_worktree_retained_unpublished`,
 `delegation_worktree_retained_unproved`.
 
 The daemon's pending and aged delegation-reclaim queries return at most 256 due
-owners host-wide. Processing writes the next-attempt time to the cleanup
-obligation, so later candidates advance across daemon restarts rather than
+owners host-wide. Attempted candidates and selected rows skipped by repository,
+session, lifecycle, or checkout-liveness filters all persist a later
+`next_attempt_at`, so later candidates advance across daemon restarts instead of
 depending on an in-memory cursor. The aged pass additionally attempts at most
 eight candidates per repository per tick.
 

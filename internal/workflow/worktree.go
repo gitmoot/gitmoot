@@ -1667,7 +1667,12 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktree(ctx context.Context, jobID
 // FixCloneQuarantines lists every surviving sibling previously created by the
 // old quarantine mechanism or the current SetAsideFixClone path. Automatic
 // deletion is disabled; every matching name is operator-owned content.
-const fixCloneQuarantinePrefix = ".ttl-reclaiming-"
+const (
+	fixCloneQuarantinePrefix     = ".ttl-reclaiming-"
+	fixCloneSurvivorScanMaxEntry = 4096
+)
+
+var ErrFixCloneSurvivorScanLimit = errors.New("fix clone survivor scan entry limit reached")
 
 // FixCloneQuarantines lists everything left beside a managed fix clone under the
 // reclaim prefix: legacy interrupted-removal leftovers and clones moved aside by
@@ -1682,28 +1687,48 @@ func classifyFixCloneQuarantineNames(path string) (survivors []string, err error
 		return nil, nil
 	}
 	parent, base := filepath.Dir(path), filepath.Base(path)
-	entries, err := os.ReadDir(parent)
+	dir, err := os.Open(parent)
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	defer dir.Close()
+
 	prefix := base + fixCloneQuarantinePrefix
-	for _, entry := range entries {
-		if !strings.HasPrefix(entry.Name(), prefix) {
-			continue
-		}
-		candidate := filepath.Join(parent, entry.Name())
-		if _, infoErr := entry.Info(); infoErr != nil {
-			if os.IsNotExist(infoErr) {
+	scanned := 0
+	for scanned < fixCloneSurvivorScanMaxEntry {
+		entries, readErr := dir.ReadDir(min(128, fixCloneSurvivorScanMaxEntry-scanned))
+		scanned += len(entries)
+		for _, entry := range entries {
+			if !strings.HasPrefix(entry.Name(), prefix) {
 				continue
 			}
-			return nil, fmt.Errorf("classify fix clone survivor %s: %w", candidate, infoErr)
+			candidate := filepath.Join(parent, entry.Name())
+			if _, infoErr := entry.Info(); infoErr != nil {
+				if os.IsNotExist(infoErr) {
+					continue
+				}
+				return survivors, fmt.Errorf("classify fix clone survivor %s: %w", candidate, infoErr)
+			}
+			survivors = append(survivors, candidate)
 		}
-		survivors = append(survivors, candidate)
+		if errors.Is(readErr, io.EOF) {
+			return survivors, nil
+		}
+		if readErr != nil {
+			return survivors, readErr
+		}
 	}
-	return survivors, nil
+	extra, readErr := dir.ReadDir(1)
+	if len(extra) > 0 {
+		return survivors, ErrFixCloneSurvivorScanLimit
+	}
+	if errors.Is(readErr, io.EOF) {
+		return survivors, nil
+	}
+	return survivors, readErr
 }
 
 // pathPresent distinguishes "absent" from "cannot tell", so a stat failure is
