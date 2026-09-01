@@ -70,6 +70,17 @@ Return one gitmoot_result whose delegations array is the panel. All panelists ar
 dep-free, so they run in parallel; Gitmoot enqueues one continuation once they
 all finish.
 
+This first result is an ANNOUNCEMENT, not a verdict, and Gitmoot treats it as
+one: a review result that declares `delegations` is excluded from the merge
+gate's verdict population, and the PR is decided on the panelists' own reviews
+(#1685). So `decision` here does not approve anything — the empty `findings`,
+`changes_made` and `tests_run` below are correct and are not a contract
+violation. Your verdict is the SYNTHESIS you return from the continuation, once
+the panel has reported.
+
+A panel that is announced and never dispatched therefore merges nothing: the
+gate reports that the declared delegations never reported.
+
 ```json
 {
   "gitmoot_result": {

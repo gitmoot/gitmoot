@@ -623,6 +623,52 @@ func TestHeartbeatScanReviewRejectsMissingCapability(t *testing.T) {
 	}
 }
 
+// #1685. A review heartbeat for a coordinator ENQUEUES, and must: the panel
+// recipe is a legitimate way to answer a review cron, and its fan-out is judged
+// on the delegates by the merge gate rather than counted as a verdict. An
+// earlier version of this test pinned the opposite — a "role_not_reviewer" skip
+// — which took a documented flow off the cron to compensate for a consumer
+// defect that is now fixed in the consumers.
+func TestHeartbeatScanReviewEnqueuesForCoordinatorRole(t *testing.T) {
+	paths, store := heartbeatScanFixture(t, reviewHeartbeatBody)
+	ctx := context.Background()
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name: "reviewer", Role: "coordinator", Runtime: "codex", RepoScope: "gitmoot/gitmoot",
+		Capabilities: []string{"ask", "review"}, RuntimeRef: "last",
+	}); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+	enq, seen := recordingEnqueuer()
+	now := time.Date(2026, 6, 30, 9, 0, 0, 0, time.UTC)
+	if err := runHeartbeatScanOnce(ctx, paths, store, enq, now); err != nil {
+		t.Fatalf("runHeartbeatScanOnce: %v", err)
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("coordinator review heartbeat enqueued %d jobs, want 1", len(*seen))
+	}
+}
+
+// ACCEPTANCE: a reviewer-role heartbeat still enqueues. The role gate must not
+// take the ordinary review cron down with it.
+func TestHeartbeatScanReviewAllowsReviewerRole(t *testing.T) {
+	paths, store := heartbeatScanFixture(t, reviewHeartbeatBody)
+	ctx := context.Background()
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name: "reviewer", Role: "reviewer", Runtime: "codex", RepoScope: "gitmoot/gitmoot",
+		Capabilities: []string{"ask", "review"}, RuntimeRef: "last",
+	}); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+	enq, seen := recordingEnqueuer()
+	now := time.Date(2026, 6, 30, 9, 0, 0, 0, time.UTC)
+	if err := runHeartbeatScanOnce(ctx, paths, store, enq, now); err != nil {
+		t.Fatalf("runHeartbeatScanOnce: %v", err)
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("reviewer-role review heartbeat enqueued %d jobs, want 1", len(*seen))
+	}
+}
+
 // TestHeartbeatScanCoalescesMissedTicks proves a long outage replays only ONCE:
 // next_due is anchored to now (not the stale due time), so one scan after many
 // missed intervals enqueues a single job and schedules the next from now.

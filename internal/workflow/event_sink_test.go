@@ -294,6 +294,58 @@ func TestEngineEmitsSubthresholdReviewVerdictAsApproved(t *testing.T) {
 	}
 }
 
+// #1685. EventCauseReviewVerdict tells the PR owner that a verdict landed. A
+// coordinator fan-out is an announcement, so waking them with
+// ReviewDecision=approved reports an answer nobody gave. The delegates' own
+// terminal events carry the real verdicts.
+func TestEngineDoesNotEmitReviewVerdictForFanOut(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName:  "gitmoot/gitmoot",
+		Branch:        "task-47",
+		Owner:         "audit",
+		ActingOrgRole: "author",
+	}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "review-47", Agent: "audit", Type: "review", State: string(JobSucceeded), Payload: "{}",
+	}); err != nil {
+		t.Fatalf("CreateJob returned error: %v", err)
+	}
+	sink := &recordingSink{}
+	engine := testEngine(store)
+	engine.EventSink = sink
+	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
+
+	engine.mailbox().emitTerminal(ctx, "review-47", JobSucceeded, JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		Branch:      "task-47",
+		PullRequest: 47,
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "Convening a three-reviewer panel",
+			Delegations: []Delegation{
+				{ID: "lens-a", Agent: "r1", Action: "review"},
+			},
+		},
+	})
+
+	finished := sink.byType(events.EventJobFinished)
+	if len(finished) != 1 {
+		t.Fatalf("job.finished emissions = %d, want 1; all=%+v", len(finished), sink.snapshot())
+	}
+	// The terminal event still fires — the job did finish. What must not appear is
+	// the verdict CLAIM riding on it.
+	if got := finished[0].ReviewDecision; got != "" {
+		t.Fatalf("fan-out emitted review decision %q, want none", got)
+	}
+	if got := finished[0].Cause; got == events.EventCauseReviewVerdict {
+		t.Fatalf("fan-out emitted cause %q, want no verdict cause", got)
+	}
+}
+
 func TestEngineEmitsPipelineReviewVerdictWithRawDecision(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

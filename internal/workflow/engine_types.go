@@ -179,7 +179,11 @@ func (e Engine) mailbox() Mailbox {
 		wakeTargetRole := requesterRole
 		if state == JobSucceeded && payload.PullRequest > 0 && payload.Result != nil && e.Store != nil {
 			job, jobErr := e.Store.GetJob(ctx, jobID)
-			if jobErr == nil && strings.EqualFold(strings.TrimSpace(job.Type), "review") {
+			// A fan-out is excluded: EventCauseReviewVerdict tells the PR owner a
+			// verdict landed, and waking them with ReviewDecision=approved because a
+			// coordinator announced a panel reports an answer nobody gave (#1685).
+			// The delegates' own terminal events carry the real verdicts.
+			if jobErr == nil && strings.EqualFold(strings.TrimSpace(job.Type), "review") && !ResultIsFanOut(payload.Result) {
 				decision := effectiveReviewDecisionForPayload(payload, e.reviewBlockingSeverity(payload.Repo))
 				if decision == "approved" || decision == "changes_requested" {
 					owner := ""

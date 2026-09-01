@@ -45,6 +45,14 @@ const (
 	GradeVerified = evidence.GradeVerified
 )
 
+// NoVerdictDecision is the effective_decision a review node carries when its
+// result is a coordinator FAN-OUT: an announcement of a panel, not a verdict
+// about the code (#1685). It exists because absence is not a classification —
+// the renderer's fallback counts a raw "approved" whenever no effective decision
+// is present, so a suppressed claim alone still produced a proof summary
+// reporting an approved review that nobody gave.
+const NoVerdictDecision = "no_verdict"
+
 // Claim is one evidence-graded assertion attached to a node.
 type Claim struct {
 	Type        string `json:"type"`

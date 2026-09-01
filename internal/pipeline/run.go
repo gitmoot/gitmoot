@@ -1893,6 +1893,16 @@ func autoMergeGateStageSettleOutcome(ctx context.Context, deps pipelineStageSett
 		if rerr != nil || reviewPayload.Result == nil {
 			return block(fmt.Sprintf("source-bound review stage %q produced no valid result", reviewStage.ID))
 		}
+		// A fan-out is not an approval. This gate reaches PipelineAutoMerger.Evaluate,
+		// which never runs the native merge gate's review checks, so it is the only
+		// place on this path that can refuse a coordinator continuation (#1685). An
+		// `orchestrate: true` review stage keeps its delegations and lands here with
+		// them intact.
+		if workflow.ResultIsFanOut(reviewPayload.Result) {
+			return block(fmt.Sprintf(
+				"source-bound review stage %q declared %d delegation(s); a fan-out is a coordinator continuation, not a verdict",
+				reviewStage.ID, len(reviewPayload.Result.Delegations)))
+		}
 		decision := strings.TrimSpace(reviewPayload.Result.Decision)
 		if decision != "approved" {
 			return block(fmt.Sprintf("source-bound review stage %q returned decision %q, not approved", reviewStage.ID, decision))
@@ -2069,6 +2079,25 @@ func foldPipelineStageOutcome(successDecisions []string, job db.Job) (state, sum
 		return StageFailed, "stage job produced no gitmoot_result", nil
 	}
 	decision := strings.TrimSpace(payload.Result.Decision)
+	// A coordinator FAN-OUT is not a verdict, so it cannot be a stage SUCCESS
+	// either (#1685). This is the authority that matters most on this path: a
+	// succeeded stage satisfies pipelineStageDepsSucceeded, which authorizes every
+	// dependent stage. The auto-merge gate refuses a fan-out on its own, but it is
+	// one specialized dependent among many — folding the announcement as success
+	// here let ALL THE OTHERS run on a review that never happened.
+	//
+	// A FINALIZE continuation is exempt, and that exemption is the whole point of
+	// the rule rather than a hole in it: the finalize tail IS the synthesis the
+	// panel produced, so it is the verdict. The engine ignores the delegations a
+	// finalize result returns (#758), which is exactly why they must not be read
+	// here as an unreported announcement.
+	//
+	// Failed rather than blocked: blocked means "a human must act on this run",
+	// while an announced panel whose synthesis never arrived is a stage that did
+	// not produce its result.
+	if !payload.DelegationFinalize && workflow.ResultIsFanOut(payload.Result) {
+		return StageFailed, "stage review declared delegations; a fan-out is a coordinator continuation, not a verdict", nil
+	}
 	// The skipped marker is reserved for Gitmoot-authored fold metadata. Strip every
 	// leading agent-authored occurrence before deciding the outcome; only a genuine
 	// successful skipped decision may reapply exactly one marker below. This keeps

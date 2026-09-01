@@ -1465,6 +1465,14 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		// pipeline-sender job (shell + #757 agent leaf) keeps the delegations strip
 		// byte-identically and can never spawn phantom children.
 		if !payload.OrchestrateStage {
+			// Stripping the INSTRUCTIONS must not erase the CLASSIFICATION. Without
+			// this stamp a pipeline review coordinator's announcement arrives at the
+			// auto-merge gate as an ordinary approved leaf, and merges (#1685). A
+			// review stage cannot set orchestrate:true, so this is the ONLY path a
+			// production pipeline fan-out takes.
+			if len(result.Delegations) > 0 {
+				result.FanOut = true
+			}
 			result.Delegations = nil
 		}
 		// Same leaf enforcement for human_questions[] (#757): a healthy agent-stage
