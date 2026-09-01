@@ -2,7 +2,9 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -17,8 +19,12 @@ import (
 )
 
 const (
-	delegationWorktreeWarnCount = 10
-	delegationWorktreeWarnBytes = int64(1_000_000_000)
+	delegationWorktreeWarnCount           = 10
+	delegationWorktreeWarnBytes           = int64(1_000_000_000)
+	delegationWorktreeTrackedPathLimit    = 4096
+	delegationWorktreeDiscoveryEntryLimit = 4096
+	delegationWorktreeSizeEntryLimit      = 4096
+	delegationWorktreeReadBatchSize       = 128
 )
 
 type delegationWorktreeUsage struct {
@@ -30,6 +36,7 @@ type delegationWorktreeUsage struct {
 	Unproven       int    `json:"unproven"`
 	RecentTerminal int    `json:"recentTerminal"`
 	Quarantined    int    `json:"quarantined"`
+	Truncated      bool   `json:"truncated"`
 	Root           string `json:"root"`
 	Summary        string `json:"summary"`
 }
@@ -43,10 +50,12 @@ const (
 	worktreeUnproven
 )
 
-// inspectDelegationWorktreeUsage accounts only for per-delegation/read-only
-// worktrees under <home>/worktrees. Ordinary task worktrees are excluded. It
-// combines recorded job ownership with an exact-depth directory scan so a
-// crash-before-enqueue orphan is still visible as unproven, never reclaimed.
+// inspectDelegationWorktreeUsage accounts for per-delegation/read-only worktrees
+// under <home>/worktrees, plus the interrupted-removal quarantine siblings of fix
+// clones — a quarantine is unowned garbage on disk that no other surface reports.
+// Ordinary task worktrees are excluded. It combines recorded job ownership with an
+// exact-depth directory scan so a crash-before-enqueue orphan is still visible as
+// unproven, never reclaimed.
 func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, store *db.Store, now time.Time, ttl time.Duration) (delegationWorktreeUsage, error) {
 	root := filepath.Join(paths.Home, "worktrees")
 	usage := delegationWorktreeUsage{Root: root}
@@ -65,7 +74,8 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 		if err != nil || strings.TrimSpace(payload.WorktreePath) == "" {
 			continue
 		}
-		if strings.TrimSpace(payload.DelegationID) == "" && !payload.ReadOnlyWorktree {
+		fixClone := payload.FixWorktree
+		if strings.TrimSpace(payload.DelegationID) == "" && !payload.ReadOnlyWorktree && !fixClone {
 			continue // ordinary task/shared-checkout payload
 		}
 		path, ok := worktreePathUnderRoot(root, payload.WorktreePath)
@@ -89,40 +99,82 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 		}
 		// A path referenced by multiple rows is pinned if ANY owner is resumable;
 		// safety wins over an older terminal record for the same deterministic path.
-		if prior, exists := owned[path]; !exists || worktreeClassPriority(class) > worktreeClassPriority(prior) {
-			owned[path] = class
+		if prior, exists := owned[path]; exists {
+			if worktreeClassPriority(class) > worktreeClassPriority(prior) {
+				owned[path] = class
+			}
+			continue
 		}
+		if len(owned) >= delegationWorktreeTrackedPathLimit {
+			usage.Truncated = true
+			continue
+		}
+		owned[path] = class
 	}
 
 	pathsOnDisk := map[string]struct{}{}
+	unprovenEntries := map[string]struct{}{}
 	for path := range owned {
-		if info, err := os.Stat(path); err == nil && info.IsDir() {
-			pathsOnDisk[path] = struct{}{}
+		if info, err := os.Lstat(path); err == nil {
+			if info.IsDir() {
+				pathsOnDisk[path] = struct{}{}
+			} else {
+				unprovenEntries[path] = struct{}{}
+			}
 		}
 	}
-	// Canonical layout: <root>/<owner--repo>/delegations/<parent>/<leg>.
-	// Stop at each leg root; size accounting below walks it exactly once.
-	_ = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil || path == root || !entry.IsDir() {
-			return nil
-		}
+
+	// Canonical directory roots:
+	//   <root>/<owner--repo>/delegations/<parent>/<leg>
+	//   <root>/<owner--repo>/fixes/<managed-or-set-aside-clone>
+	//
+	// The FIXES arm is structural rather than job-driven: interrupted pre-enqueue
+	// allocation has no job row by definition. A single global entry budget bounds
+	// doctor and /api/health even when the host tree is attacker-controlled.
+	discoveryEntriesRemaining := delegationWorktreeDiscoveryEntryLimit
+	scanTruncated, scanErr := walkWorktreeDirectoriesBatched(ctx, root, &discoveryEntriesRemaining, func(path string, entry fs.DirEntry) (descend, stop bool) {
 		rel, err := filepath.Rel(root, path)
 		if err != nil {
-			return nil
+			usage.Truncated = true
+			return false, false
 		}
 		parts := strings.Split(rel, string(filepath.Separator))
-		if len(parts) == 4 && parts[1] == "delegations" {
-			pathsOnDisk[path] = struct{}{}
-			return filepath.SkipDir
+		switch {
+		case len(parts) == 1:
+			return entry.IsDir(), false
+		case len(parts) == 2 && (parts[1] == "delegations" || parts[1] == "fixes"):
+			return entry.IsDir(), false
+		case len(parts) == 3 && parts[1] == "delegations":
+			return entry.IsDir(), false
+		case len(parts) == 4 && parts[1] == "delegations", len(parts) == 3 && parts[1] == "fixes":
+			if entry.IsDir() {
+				if len(pathsOnDisk) >= delegationWorktreeTrackedPathLimit {
+					usage.Truncated = true
+					return false, true
+				}
+				pathsOnDisk[path] = struct{}{}
+			} else {
+				unprovenEntries[path] = struct{}{}
+			}
 		}
-		return nil
+		return false, false
 	})
+	usage.Truncated = usage.Truncated || scanTruncated
+	if scanErr != nil {
+		return usage, scanErr
+	}
+	if ctx.Err() != nil {
+		return usage, ctx.Err()
+	}
+	usage.Stale += len(unprovenEntries)
+	usage.Unproven += len(unprovenEntries)
 
 	ordered := make([]string, 0, len(pathsOnDisk))
 	for path := range pathsOnDisk {
 		ordered = append(ordered, path)
 	}
 	sort.Strings(ordered)
+	sizeEntriesRemaining := delegationWorktreeSizeEntryLimit
 	for _, path := range ordered {
 		class, ok := owned[path]
 		if !ok {
@@ -141,10 +193,15 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 		case worktreeUnproven:
 			usage.Unproven++
 		}
-		usage.SizeBytes += directoryLogicalSize(path)
+		size, truncated := directoryLogicalSize(ctx, path, &sizeEntriesRemaining)
+		usage.SizeBytes += size
+		usage.Truncated = usage.Truncated || truncated
 	}
 	usage.Size = formatWorktreeBytes(usage.SizeBytes)
 	usage.Summary = fmt.Sprintf("%d stale worktree%s / %s under %s", usage.Stale, pluralSuffix(usage.Stale), usage.Size, usage.Root)
+	if usage.Truncated {
+		usage.Summary += " (bounded scan truncated; counts and bytes are lower bounds)"
+	}
 	return usage, nil
 }
 
@@ -179,18 +236,106 @@ func worktreePathUnderRoot(root, candidate string) (string, bool) {
 	return filepath.Clean(path), true
 }
 
-func directoryLogicalSize(root string) int64 {
+type worktreeDirectoryBatchReader interface {
+	ReadDir(n int) ([]fs.DirEntry, error)
+}
+
+func readWorktreeDirectoryBatches(ctx context.Context, reader worktreeDirectoryBatchReader, remaining *int, visit func(fs.DirEntry) bool) (truncated, stopped bool, err error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return false, true, err
+		}
+		if *remaining <= 0 {
+			entries, readErr := reader.ReadDir(1)
+			switch {
+			case len(entries) > 0:
+				return true, false, nil
+			case readErr == nil:
+				continue
+			case errors.Is(readErr, io.EOF):
+				return false, false, nil
+			default:
+				return true, false, nil
+			}
+		}
+		batchSize := min(delegationWorktreeReadBatchSize, *remaining)
+		entries, readErr := reader.ReadDir(batchSize)
+		for _, entry := range entries {
+			*remaining = *remaining - 1
+			if !visit(entry) {
+				return false, true, nil
+			}
+		}
+		switch {
+		case readErr == nil:
+		case errors.Is(readErr, io.EOF):
+			return false, false, nil
+		default:
+			return true, false, nil
+		}
+	}
+}
+
+func walkWorktreeDirectoriesBatched(ctx context.Context, root string, remaining *int, visit func(path string, entry fs.DirEntry) (descend, stop bool)) (bool, error) {
+	directories := []string{root}
+	truncated := false
+	for len(directories) > 0 {
+		if err := ctx.Err(); err != nil {
+			return true, err
+		}
+		last := len(directories) - 1
+		directory := directories[last]
+		directories = directories[:last]
+		handle, err := os.Open(directory)
+		if err != nil {
+			if directory != root || !os.IsNotExist(err) {
+				truncated = true
+			}
+			continue
+		}
+		var children []string
+		batchTruncated, stopped, readErr := readWorktreeDirectoryBatches(ctx, handle, remaining, func(entry fs.DirEntry) bool {
+			path := filepath.Join(directory, entry.Name())
+			descend, stop := visit(path, entry)
+			if descend && entry.IsDir() {
+				children = append(children, path)
+			}
+			return !stop
+		})
+		if closeErr := handle.Close(); closeErr != nil {
+			truncated = true
+		}
+		truncated = truncated || batchTruncated
+		if readErr != nil {
+			return true, readErr
+		}
+		if stopped {
+			return truncated, nil
+		}
+		directories = append(directories, children...)
+	}
+	return truncated, nil
+}
+
+func directoryLogicalSize(ctx context.Context, root string, remaining *int) (int64, bool) {
+	if *remaining <= 0 {
+		return 0, true
+	}
+	*remaining--
 	var total int64
-	_ = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil || entry.IsDir() {
-			return nil
+	metadataTruncated := false
+	truncated, err := walkWorktreeDirectoriesBatched(ctx, root, remaining, func(_ string, entry fs.DirEntry) (bool, bool) {
+		if entry.IsDir() {
+			return true, false
 		}
-		if info, err := entry.Info(); err == nil {
+		if info, infoErr := entry.Info(); infoErr == nil {
 			total += info.Size()
+		} else {
+			metadataTruncated = true
 		}
-		return nil
+		return false, false
 	})
-	return total
+	return total, metadataTruncated || truncated || err != nil
 }
 
 func formatWorktreeBytes(size int64) string {
@@ -240,6 +385,6 @@ func delegationWorktreeDoctorCheck(paths config.Paths) (doctor.Check, bool) {
 
 func buildDelegationWorktreeDoctorCheck(usage delegationWorktreeUsage) doctor.Check {
 	detail := fmt.Sprintf("%s (%d reclaimable, %d pinned by non-terminal owners, %d unproven; %d recent terminal within TTL; %d cleanup quarantined)", usage.Summary, usage.Reclaimable, usage.Pinned, usage.Unproven, usage.RecentTerminal, usage.Quarantined)
-	warn := usage.Stale >= delegationWorktreeWarnCount || usage.SizeBytes >= delegationWorktreeWarnBytes || usage.Quarantined > 0
+	warn := usage.Truncated || usage.Stale >= delegationWorktreeWarnCount || usage.SizeBytes >= delegationWorktreeWarnBytes || usage.Quarantined > 0
 	return doctor.Check{Name: "worktrees", OK: !warn, Required: false, Detail: detail}
 }

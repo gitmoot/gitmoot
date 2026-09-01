@@ -406,3 +406,170 @@ func TestGuardedTaskTransitionRefusesMatchingActiveJob(t *testing.T) {
 		})
 	}
 }
+
+func TestTaskIDsWithTerminalWorktreeUsesLifecycleStateAndClassification(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	for _, task := range []Task{
+		{ID: "merged", State: "merged", WorktreePath: "/worktrees/merged"},
+		{ID: "dismissed", State: "dismissed", WorktreePath: "/worktrees/dismissed"},
+		{ID: "superseded", State: "superseded", WorktreePath: "/worktrees/superseded"},
+		{ID: "stranded", State: "stranded", WorktreePath: " /worktrees/stranded "},
+		{ID: "blocked", State: "blocked", WorktreePath: "/worktrees/blocked"},
+		{ID: "implementing", State: "implementing", WorktreePath: "/worktrees/implementing"},
+		{ID: "empty-path", State: "merged"},
+	} {
+		if err := store.UpsertTask(ctx, task); err != nil {
+			t.Fatalf("UpsertTask %s: %v", task.ID, err)
+		}
+	}
+	classified, err := store.ClassifyTerminalTaskWorktreeUnremovable(ctx, "stranded", "/worktrees/stranded")
+	if err != nil || !classified {
+		t.Fatalf("ClassifyTerminalTaskWorktreeUnremovable classified=%v err=%v", classified, err)
+	}
+	events, err := store.ListTaskEvents(ctx, "stranded")
+	if err != nil {
+		t.Fatalf("ListTaskEvents after classification: %v", err)
+	}
+	if len(events) != 1 || events[0].FromState != "" || events[0].ToState != "" || events[0].Reason != "/worktrees/stranded" {
+		t.Fatalf("classification event = %+v, want normalized informational event", events)
+	}
+
+	ids, err := store.TaskIDsWithTerminalWorktree(ctx)
+	if err != nil {
+		t.Fatalf("TaskIDsWithTerminalWorktree: %v", err)
+	}
+	want := []string{"dismissed", "merged", "superseded"}
+	if len(ids) != len(want) {
+		t.Fatalf("terminal worktree ids = %v, want %v", ids, want)
+	}
+	for i := range want {
+		if ids[i] != want[i] {
+			t.Fatalf("terminal worktree ids = %v, want %v", ids, want)
+		}
+	}
+	if err := store.AddTaskEvent(ctx, TaskEvent{TaskID: "stranded", Kind: "task_rechecked", Reason: "new lifecycle evidence"}); err != nil {
+		t.Fatalf("AddTaskEvent after classification: %v", err)
+	}
+	ids, err = store.TaskIDsWithTerminalWorktree(ctx)
+	if err != nil {
+		t.Fatalf("TaskIDsWithTerminalWorktree after later event: %v", err)
+	}
+	want = []string{"dismissed", "merged", "stranded", "superseded"}
+	if len(ids) != len(want) {
+		t.Fatalf("terminal worktree ids after later event = %v, want %v", ids, want)
+	}
+	for i := range want {
+		if ids[i] != want[i] {
+			t.Fatalf("terminal worktree ids after later event = %v, want %v", ids, want)
+		}
+	}
+}
+
+func TestTaskHasActiveWorktreeOwnerMatchesTaskOrPath(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	for _, job := range []Job{
+		{ID: "by-task", Agent: "agent", Type: "implement", State: "queued", Payload: `{"task_id":"task-1"}`},
+		{ID: "by-path", Agent: "agent", Type: "review", State: "running", Payload: `{"worktree_path":"/worktrees/task-2"}`},
+		{ID: "blocked-owner", Agent: "agent", Type: "implement", State: "blocked", Payload: `{"task_id":"task-4","worktree_path":"/worktrees/task-4"}`},
+		{ID: "finished", Agent: "agent", Type: "implement", State: "succeeded", Payload: `{"task_id":"task-3","worktree_path":"/worktrees/task-3"}`},
+		{ID: "malformed-finished", Agent: "agent", Type: "implement", State: "failed", Payload: `not json at all`},
+	} {
+		if err := store.CreateJobWithEvent(ctx, job, JobEvent{Kind: job.State, Message: "seed"}); err != nil {
+			t.Fatalf("CreateJobWithEvent %s: %v", job.ID, err)
+		}
+	}
+	for _, tc := range []struct {
+		taskID string
+		path   string
+		want   bool
+	}{
+		{taskID: "task-1", path: "/other", want: true},
+		{taskID: "other", path: "/worktrees/task-2", want: true},
+		{taskID: "task-3", path: "/worktrees/task-3", want: false},
+		{taskID: "task-4", path: "/worktrees/task-4", want: true},
+		{taskID: "unowned", path: "/worktrees/unowned", want: false},
+	} {
+		got, err := store.TaskHasActiveWorktreeOwner(ctx, tc.taskID, tc.path)
+		if err != nil {
+			t.Fatalf("TaskHasActiveWorktreeOwner(%q, %q): %v", tc.taskID, tc.path, err)
+		}
+		if got != tc.want {
+			t.Fatalf("TaskHasActiveWorktreeOwner(%q, %q) = %v, want %v", tc.taskID, tc.path, got, tc.want)
+		}
+	}
+	malformedJobID, err := store.FirstMalformedNonFinalJob(ctx)
+	if err != nil {
+		t.Fatalf("FirstMalformedNonFinalJob without active malformed payload: %v", err)
+	}
+	if malformedJobID != "" {
+		t.Fatalf("FirstMalformedNonFinalJob = %q before active malformed payload, want empty", malformedJobID)
+	}
+	if err := store.CreateJobWithEvent(ctx, Job{
+		ID: "malformed-active", Agent: "agent", Type: "implement", State: "queued", Payload: `not json at all`,
+	}, JobEvent{Kind: "queued", Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent malformed-active: %v", err)
+	}
+	got, err := store.TaskHasActiveWorktreeOwner(ctx, "unowned", "/worktrees/unowned")
+	if err != nil {
+		t.Fatalf("TaskHasActiveWorktreeOwner with malformed active payload: %v", err)
+	}
+	if !got {
+		t.Fatal("malformed non-final payload did not fail closed as an active owner")
+	}
+	malformedJobID, err = store.FirstMalformedNonFinalJob(ctx)
+	if err != nil {
+		t.Fatalf("FirstMalformedNonFinalJob: %v", err)
+	}
+	if malformedJobID != "malformed-active" {
+		t.Fatalf("FirstMalformedNonFinalJob = %q, want malformed-active", malformedJobID)
+	}
+}
+
+func TestCompleteTerminalTaskWorktreeReclaimClearsRemovedPathAfterStateTransition(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	const taskID = "task-reclaim-race"
+	const removedPath = "/worktrees/task-reclaim-race"
+	if err := store.UpsertTask(ctx, Task{
+		ID: taskID, State: "reviewing", WorktreePath: removedPath,
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+
+	changed, err := store.CompleteTerminalTaskWorktreeReclaim(ctx, taskID, removedPath)
+	if err != nil {
+		t.Fatalf("CompleteTerminalTaskWorktreeReclaim: %v", err)
+	}
+	if !changed {
+		t.Fatal("removed path was not cleared after lifecycle transition")
+	}
+	task, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("GetTask after completion: %v", err)
+	}
+	if task.WorktreePath != "" || task.State != "reviewing" {
+		t.Fatalf("task after completion = %+v, want reviewing with empty path", task)
+	}
+
+	const replacementPath = "/worktrees/task-reclaim-race-new"
+	task.WorktreePath = replacementPath
+	if err := store.UpsertTask(ctx, task); err != nil {
+		t.Fatalf("UpsertTask replacement: %v", err)
+	}
+	changed, err = store.CompleteTerminalTaskWorktreeReclaim(ctx, taskID, removedPath)
+	if err != nil {
+		t.Fatalf("CompleteTerminalTaskWorktreeReclaim replacement: %v", err)
+	}
+	if changed {
+		t.Fatal("completion cleared a concurrent path replacement")
+	}
+	task, err = store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("GetTask after replacement: %v", err)
+	}
+	if task.WorktreePath != replacementPath {
+		t.Fatalf("replacement path = %q, want %q", task.WorktreePath, replacementPath)
+	}
+}

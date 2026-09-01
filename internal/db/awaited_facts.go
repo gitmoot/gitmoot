@@ -213,13 +213,32 @@ type reviewVerdictPayload struct {
 	Result *struct {
 		Decision string `json:"decision"`
 		Severity string `json:"severity,omitempty"`
+		// Delegations and FanOut are the canonical fan-out classification, decoded
+		// here for the same reason every other consumer reads it: a coordinator
+		// announcement carries decision "approved" and is not a verdict (#1685).
+		// Both are needed — the executable delegations do not survive the pipeline
+		// mailbox seam, where normalization records FanOut instead.
+		Delegations []json.RawMessage `json:"delegations"`
+		FanOut      bool              `json:"fan_out,omitempty"`
 	} `json:"result"`
 }
 
-// SucceededReviewVerdict is the minimal immutable evidence needed to decide
-// whether a review dispatch would repeat a stable verdict at an unchanged head.
-// It deliberately carries no result body: callers may use the prior verdict to
-// refuse and escalate, but never to serve a cached review result.
+// isFanOut reports whether a decoded review result is a coordinator announcement
+// rather than a verdict. It mirrors workflow.ResultIsFanOut, which cannot be
+// imported here because workflow depends on db and never the reverse — the same
+// reason pipelineReviewSender is duplicated above.
+func (p reviewVerdictPayload) isFanOut() bool {
+	if p.Result == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(p.Result.Decision)) {
+	case "approved", "changes_requested":
+	default:
+		return false
+	}
+	return len(p.Result.Delegations) > 0 || p.Result.FanOut
+}
+
 type SucceededReviewVerdict struct {
 	JobID    string
 	Agent    string
@@ -266,6 +285,12 @@ ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 		if err := json.Unmarshal([]byte(payload), &decoded); err != nil || decoded.Result == nil {
 			continue
 		}
+		if decoded.isFanOut() {
+			// A coordinator announcement is not a verdict, so it must not enter
+			// same-head verdict history: doing so let a fan-out suppress the
+			// legitimate retry that would have produced a real one (#1685).
+			continue
+		}
 		decision := strings.ToLower(strings.TrimSpace(decoded.Result.Decision))
 		if decision != "approved" && decision != "changes_requested" {
 			continue
@@ -305,6 +330,12 @@ func reviewVerdictFact(jobID, agent, state, payload string, blockingSeverity fun
 	}
 	var decoded reviewVerdictPayload
 	if err := json.Unmarshal([]byte(payload), &decoded); err != nil || decoded.Result == nil {
+		return reviewVerdictObservation{}, false
+	}
+	if decoded.isFanOut() {
+		// Waking a waiter with "review verdict approved" because a coordinator
+		// announced a panel reports an answer nobody gave (#1685). The panel's own
+		// synthesized leaf verdict satisfies the fact when it lands.
 		return reviewVerdictObservation{}, false
 	}
 	decoded.Repo = strings.ToLower(strings.TrimSpace(decoded.Repo))

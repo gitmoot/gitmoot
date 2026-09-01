@@ -198,6 +198,108 @@ func TestPipelineAutoMergeGateExecutesAfterApprovedReviewAndGreenChecks(t *testi
 	}
 }
 
+// #1685. A review fan-out is refused at STAGE SETTLEMENT, before anything
+// depends on it. That is the load-bearing layer: a succeeded stage satisfies
+// pipelineStageDepsSucceeded and authorizes every dependent stage, so folding an
+// announcement as success let all of them run on a review that never happened.
+// The auto-merge gate is only one such dependent.
+func TestPipelineFanOutReviewNeverSettlesAsStageSuccess(t *testing.T) {
+	store, enqueue, rec, spec, run, _, now := prepareAutoMergeGate(t)
+	review := stageRow(t, store, run.ID, "review")
+	settleBoundReviewJob(t, store, review.JobID, "approved", "0123456789abcdef")
+	declareBoundReviewDelegations(t, store, review.JobID)
+	executor := &stubPipelineAutoMerger{
+		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-sha"},
+	}
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), executor)
+
+	settledReview := stageRow(t, store, run.ID, "review")
+	if settledReview.State != StageFailed {
+		t.Fatalf("review stage = %q, want failed: a fan-out settled as success and can authorize dependents", settledReview.State)
+	}
+	if !strings.Contains(settledReview.Summary, "not a verdict") {
+		t.Fatalf("review stage summary = %q, want the fan-out reason", settledReview.Summary)
+	}
+	if len(executor.mergeReqs) != 0 {
+		t.Fatalf("merge calls = %d, want none for a fan-out review", len(executor.mergeReqs))
+	}
+	if gate := stageRow(t, store, run.ID, "merge"); gate.State == StageSucceeded {
+		t.Fatalf("merge gate = %q, want anything but succeeded", gate.State)
+	}
+}
+
+// DEFENCE IN DEPTH, pinned separately so removing either layer is caught: the
+// auto-merge gate refuses a fan-out on its own, evaluated against a review stage
+// row that is already SUCCEEDED. That is the shape a row settled before this fix
+// still has on disk, and the shape any future settlement path that forgets the
+// classification would produce.
+func TestPipelineAutoMergeGateRefusesFanOutReview(t *testing.T) {
+	store, enqueue, rec, spec, run, _, now := prepareAutoMergeGate(t)
+	review := stageRow(t, store, run.ID, "review")
+	settleBoundReviewJob(t, store, review.JobID, "approved", "0123456789abcdef")
+	// Settle the STAGE ROW as succeeded first, then make its job a fan-out, so the
+	// gate is reached with a dependency that already reads as satisfied.
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second), &stubPipelineAutoMerger{
+		readiness: workflow.PipelineAutoMergeReadiness{Ready: false, Reason: "checks pending", CurrentHeadSHA: "0123456789abcdef"},
+	})
+	if got := stageRow(t, store, run.ID, "review"); got.State != StageSucceeded {
+		t.Fatalf("review stage = %q, want succeeded before arming the gate probe", got.State)
+	}
+	declareBoundReviewDelegations(t, store, review.JobID)
+
+	executor := &stubPipelineAutoMerger{
+		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-sha"},
+	}
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), executor)
+	if len(executor.mergeReqs) != 0 {
+		t.Fatalf("merge calls = %d, want none for a fan-out review", len(executor.mergeReqs))
+	}
+	gate := stageRow(t, store, run.ID, "merge")
+	if gate.State != StageBlocked {
+		t.Fatalf("gate state = %q, want blocked", gate.State)
+	}
+	if !strings.Contains(gate.Summary, "not a verdict") {
+		t.Fatalf("gate summary = %q, want the fan-out reason", gate.Summary)
+	}
+}
+
+// declareBoundReviewDelegations rewrites a settled review job's result into the
+// shape a production pipeline fan-out actually has WHEN THIS GATE READS IT.
+//
+// That shape has NO delegations. Mailbox.Run strips them for every
+// non-orchestrate pipeline stage, and a review stage cannot set
+// orchestrate:true, so a stored pipeline review payload carrying delegations is
+// a shape production never writes. The earlier version of this helper wrote
+// exactly that, which is why the gate's guard looked covered while a real
+// coordinator announcement still auto-merged. What survives the strip is the
+// FanOut classification, and that is what the gate must consume.
+//
+// The strip itself is pinned separately, at its own seam, by
+// TestMailboxRunPreservesFanOutClassificationAcrossPipelineStrip.
+func declareBoundReviewDelegations(t *testing.T, store *db.Store, jobID string) {
+	t.Helper()
+	ctx := context.Background()
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob(review): %v", err)
+	}
+	payload, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload(review): %v", err)
+	}
+	payload.Result.Delegations = nil
+	payload.Result.FanOut = true
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal review payload: %v", err)
+	}
+	if err := store.UpdateJobPayload(ctx, jobID, string(encoded)); err != nil {
+		t.Fatalf("UpdateJobPayload(review): %v", err)
+	}
+}
+
 func TestPipelineAutoMergeGateRequiresEverySourceBoundReview(t *testing.T) {
 	const secondReview = `  - id: review-two
     agent: reviewer

@@ -56,8 +56,12 @@ func allocateFixWorktreeForRunner(ctx context.Context, store *db.Store, home str
 		} else if !errors.Is(jobErr, sql.ErrNoRows) {
 			return allocation, jobErr
 		}
-		if err := os.RemoveAll(path); err != nil {
-			return allocation, fmt.Errorf("remove incomplete fix worktree %s: %w", path, err)
+		// An interrupted pre-enqueue allocation is still a standalone object
+		// database, and nothing automatic may delete one. Moving it aside frees the
+		// managed path for a fresh fetch without destroying whatever is in it; the
+		// survivor scans already report the result for an operator.
+		if _, err := workflow.SetAsideFixClone(path); err != nil {
+			return allocation, fmt.Errorf("set aside incomplete fix worktree %s: %w", path, err)
 		}
 	} else if !os.IsNotExist(err) {
 		return allocation, fmt.Errorf("inspect fix worktree %s: %w", path, err)
@@ -92,8 +96,10 @@ func allocateFixWorktreeForRunner(ctx context.Context, store *db.Store, home str
 	}
 	allocation.Created = true
 	defer func() {
+		// Same boundary on the error path: the clone this call created is moved
+		// aside, never deleted, so a retry allocates cleanly and no bytes are lost.
 		if retErr != nil && allocation.Created {
-			_ = os.RemoveAll(path)
+			_, _ = workflow.SetAsideFixClone(path)
 		}
 	}()
 	clone := jobGitClient(path, runner)

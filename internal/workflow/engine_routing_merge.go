@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -131,7 +130,8 @@ func (e Engine) dispatchFix(ctx context.Context, reviewer string, payload JobPay
 	request.FixWorktree = true
 	if err := e.enqueue(ctx, request); err != nil {
 		if allocation.Created {
-			_ = os.RemoveAll(request.WorktreePath)
+			// Never delete a standalone fix clone: move it aside for the operator.
+			_, _ = SetAsideFixClone(request.WorktreePath)
 		}
 		return err
 	}
@@ -237,6 +237,13 @@ func (e Engine) allRequiredReviewersApproved(ctx context.Context, currentReviewe
 			return false, err
 		}
 		if !sameTask(payload, jobPayload) || !sameReviewRound(payload, jobPayload) || jobPayload.Result == nil {
+			continue
+		}
+		// A fan-out announces a panel; it does not approve. Counting it here would
+		// let a coordinator satisfy a required-reviewer slot without any delegate
+		// having reported (#1685). The panel's children carry their own rows and
+		// are counted on their own agents.
+		if ResultIsFanOut(jobPayload.Result) {
 			continue
 		}
 		if effectiveReviewDecisionForPayload(jobPayload, blockingSeverity) == "approved" {

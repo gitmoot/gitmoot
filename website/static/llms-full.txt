@@ -2822,32 +2822,107 @@ Fixes:
   then abstains from its native merge gate — fail-closed, it never merges
   gatelessly; the external gate makes the call.
 
-## Delegation worktrees consume too much disk
+## Worktrees consume too much disk
+
+The daemon checks task-owned worktrees every five minutes. A task is eligible
+only in `merged`, `dismissed`, `superseded`, or `stranded`. Age is not an
+eligibility signal. Before removal, Gitmoot re-reads the task under the checkout
+mutation lock and requires all of these checks to pass:
+
+- no non-final job names the task or path
+- no branch lock owns the task branch
+- the `/proc/<pid>/cwd` scan was conclusive and no process has a cwd in the worktree
+- the recorded path is the deterministic task path
+- `git status --porcelain --ignored` reports no tracked, untracked, or ignored content
+- the worktree HEAD is reachable from the recorded task branch, so removing a
+  clean detached worktree cannot orphan a local commit
+
+A malformed payload on any non-final job also counts as an active owner because
+Gitmoot cannot prove that it refers to another worktree. The bounded retention
+log names one malformed job responsible for this global safety pin.
+
+Removal uses `git worktree remove` without `--force` and preserves the branch.
+Gitmoot then clears the task's stored path and records
+`terminal_worktree_reclaimed`. A live process, unreadable process table, dirty
+tree, unreachable HEAD, active owner, or failed proof retains the path.
+Retention decisions are logged three times per path and classification before
+identical messages are suppressed.
+
+If the worktree belongs to an older checkout root, Gitmoot retries removal
+through the owner named by the worktree's `.git` pointer. An owner mismatch that
+cannot be inspected or removed is recorded as `terminal_worktree_unremovable`
+and excluded from later passes. A later task update makes it eligible again.
 
 `gitmoot doctor` reports delegation-worktree usage as
-`N stale worktrees / X GB under <home>/worktrees`. The detail separates aged
-final owners that are **reclaimable**, resumable/non-final owners that are
-**pinned**, and directories whose owner is **unproven**. Pinned includes
-`blocked`, `queued`, and `running`; Gitmoot never force-removes those.
+`N stale worktrees / X GB under <home>/worktrees`. It does not include ordinary
+task worktrees; use the bounded `terminal task worktree retained` daemon lines
+for those paths. Doctor detail separates aged final delegation owners that are
+**reclaimable**, resumable/non-final owners that are **pinned**, and directories
+whose owner is **unproven**. Pinned includes `blocked`, `queued`, and `running`;
+Gitmoot never force-removes those.
 
 `[workflow].delegation_worktree_ttl = "72h"` is default-on because a final
 delegation owner cannot resume, while the grace period preserves short-term
-debugging access. Set it to `"0"` to disable the TTL pass. Aged final owners are
-force-removed even when dirty, Git worktree metadata is pruned, and
-`delegation_worktree_reclaimed_ttl` is recorded. The dashboard `/api/health`
-response exposes the same count, bytes, path, breakdown, and summary in its
-top-level `worktrees` field, including the number of cleanup obligations in
-terminal quarantine.
+debugging access. Set it to `"0"` to disable the TTL pass. Aged read-only and
+delegation worktrees are force-removed even when dirty. An independent fix
+clone is different: removing it deletes its standalone object database.
 
-One unreclaimable candidate does not stop the pass: candidate-local lookup,
-runner, and removal failures are skipped while later paths continue. The daemon
-logs the first three failures for a path and suppresses repeats.
+### Fix clones are never deleted automatically
+
+Linux has no inode-conditional unlink that can guarantee a delete removes
+exactly the bytes a preceding proof examined. Gitmoot therefore never deletes a
+fix clone and never labels one proved disposable. Commit reachability and
+nested-repository checks can explain obvious retention cases, but they do not
+close over every loose blob, tree, annotated tag, pack, or concurrent write.
+
+| path | behaviour |
+| --- | --- |
+| terminal cleanup after a job ends | records `delegation_worktree_retained_unproved` and leaves the clone |
+| aged TTL pass | records a specific dirty/live/unpublished/nested reason when established; otherwise records `delegation_worktree_retained_unproved` because complete object closure was not proved |
+| allocation, interrupted pre-enqueue recovery, enqueue failure | renames the clone to a `.ttl-reclaiming-orphaned-*` sibling so a retry can allocate without destroying data |
+
+Cleanup obligations stay OPEN in every case. Absence of the managed pathname is
+not removal evidence: the clone may have been moved aside, and even an empty
+sibling scan is not durable operator confirmation. Dangling symlinks remain
+visible through `lstat` rather than being mistaken for absent targets.
+
+`gitmoot doctor` and `/api/health` discover the canonical `fixes/` layout
+structurally, so a `.ttl-reclaiming-*` clone remains visible even when the crash
+happened before any job row was written. Managed clones are counted too. Both
+directory discovery and logical-size accounting stop after 4096 filesystem
+entries; the JSON `truncated` field and summary then state that counts and bytes
+are lower bounds, and doctor warns. Manual cleanup requires inspecting the
+directory and deciding independently whether its object database and working
+tree can be discarded.
+
+Every retention records **why**, once per reason per job, so an inert deployment
+is visible instead of silent: `delegation_worktree_retained_unpublished`,
+`delegation_worktree_retained_dirty`, `delegation_worktree_retained_live`,
+`delegation_worktree_liveness_unknown`, nested-repository retention, or
+`delegation_worktree_retained_unproved`.
+
+The daemon's pending and aged delegation-reclaim queries return at most 256 due
+owners host-wide. Attempted candidates and selected rows skipped by repository,
+session, lifecycle, or checkout-liveness filters all persist a later
+`next_attempt_at`, so later candidates advance across daemon restarts instead of
+depending on an in-memory cursor. The aged pass additionally attempts at most
+eight candidates per repository per tick.
+
+Terminal-task reclaim failures use the same three-message path limit before
+suppressing identical repeats. The pass proves at most eight candidates per
+tick — each proof takes the checkout mutation lock and walks the ignored tree
+twice — and rotates its window through the candidate list so a permanently
+retained worktree cannot starve the ones behind it.
+
+One unreclaimable delegation candidate does not stop the pass. Candidate-local
+lookup, runner, and removal failures are skipped while later paths continue.
+The daemon logs the first three failures for a path and suppresses repeats.
 Each failure advances a durable, restart-safe cleanup obligation. Retries wait
 one minute and stop after the third failure in `quarantined`; quarantined paths
 are not selected again until an operator inspects `gitmoot job cleanup list
 --state quarantined` and runs `gitmoot job cleanup reopen <resource-id>`.
-Candidate-query and store-wide lookup failures still abort the pass and surface
-normally.
+The five-minute worktree cadence advances after every attempted pass, including
+passes with candidate failures, so a failed cleanup cannot hot-loop.
 
 For immediate manual relief, list paths and then prove the owner is final. Do
 not infer safety from directory age alone:
@@ -11091,6 +11166,45 @@ report-only — the pipeline advancer owns folding its verdict — so its raw
 `changes_requested` keeps blocking the merge gate at every threshold and never
 counts toward required-reviewer approval.
 
+### Fan-outs are not verdicts
+
+A review result that declares `delegations` is a coordinator **fan-out**: it
+announces a panel. Gitmoot dispatches a result's delegations *after* the result
+is stored, so such a row was written before any delegate could report, and it is
+not an answer about the code (#1685). This is the shape the shipped
+`review-panel` agent template produces, and it is legitimate — what is not
+legitimate is counting it as a verdict.
+
+Every surface that reads a review decision applies the same rule:
+
+- the **merge gate** excludes a fan-out row from the verdict population. It
+  neither satisfies nor blocks the reviewer slot, so an independent verdict at
+  the same head still decides the PR;
+- if the panel **reported**, the gate decides that slot on the delegates — at
+  least one approving child, no blocking, crashed, abstaining or still-running
+  child, and every declared delegation accounted for. Only the LATEST attempt of
+  each delegation counts, so an approved retry supersedes a failed original
+  instead of being poisoned by it;
+- if the panel was announced and **never dispatched**, the gate reports
+  `no review verdict at evaluated head: <agent> (job <id>, N declared) declared
+  delegations that never reported` rather than merging or parking;
+- **pipeline auto-merge** refuses a fan-out. A pipeline stage has its executable
+  `delegations` stripped at the mailbox seam so a leaf can never spawn children,
+  and the classification is preserved across that strip — stripping the
+  instructions must not erase what the row IS;
+- **required-reviewer counting**, the **review-verdict wake**, the **canonical
+  same-head verdict history** (`SucceededReviewVerdicts`) and **awaited
+  review-verdict facts** all skip fan-outs, so an announcement neither satisfies
+  a reviewer slot nor wakes a waiter nor suppresses the retry that would produce
+  a real verdict;
+- the **proof projector** mints no approval claim for a fan-out, and the
+  rendered proof shows `no verdict` rather than counting it as approved;
+- `blocked` and `failed` reviews are never fan-outs. They already refuse on their
+  own terms and keep reporting their own cause.
+
+A coordinator is therefore dispatchable into a review slot, by CLI and by
+heartbeat. Gitmoot judges the panel it convenes, not the announcement.
+
 ### Risk-Tiered Adaptive Review
 
 Set `risk_tiers_enabled = true` in `[review]` to scale review depth to a
@@ -13081,7 +13195,20 @@ or missing evidence. Each check is a yes/no question with an explanation, e.g.:
   mentions. A worktree-less delegation child instead persists the typed source
   `excluded_worktree_less_delegation_child`; exclusion is observable and is not
   graded as diff evidence.
-- **review** — a `changes_requested` review must carry `findings` (evidence).
+- **review** — a `changes_requested` review must carry `findings` (evidence). A
+  terminal review verdict (`approved` / `changes_requested`) must additionally
+  ACCOUNT FOR ITSELF (`review-verdict-has-evidence`): cite `findings`, name a
+  substantive `tests_run` / `changes_made` entry, or give a summary long enough
+  to state why there was nothing to run. An entry counts as substantive when it
+  is a phrase (a command with its outcome) or a single token long enough to name
+  a real path or target — so `tests_run: ["."]` is not evidence, while an honest
+  docs-only approval that explains what it read passes on its rationale.
+
+  The check measures ACCOUNTING, not truth: it cannot detect fabricated evidence,
+  and no deterministic check can. A **coordinator fan-out** — a review result
+  that declares `delegations` — is exempt, because it announces a panel that has
+  not reported yet and legitimately has nothing to record. See
+  [Fan-outs are not verdicts](#fan-outs-are-not-verdicts).
 - **ask** — the answer (`summary`/`artifact_body`) must be non-empty and
   actionable.
 - **blocked** (any action) — a `blocked` result must list actionable `needs`.
@@ -17218,17 +17345,43 @@ their separate fail-open committed-tip isolation policy.
 An engine-dispatched `changes_requested` fix uses a different owned shape: an
 independent writable clone attached to the real task branch at its fetched
 remote head. Dispatch fails closed if that clone cannot be allocated; it never
-falls back to the registered checkout. Terminal cleanup removes the independent
-clone without deleting the task branch or releasing its task branch lock, and
-the same TTL candidate pass reclaims crash-window leftovers.
+falls back to the registered checkout. No automatic path deletes the clone.
+Terminal cleanup records it for an operator without deleting the task branch or
+releasing its branch lock. Allocation recovery and enqueue failures atomically
+rename it to a `.ttl-reclaiming-orphaned-*` sibling so retries can proceed
+without destroying data.
 
 The daemon force-reclaims a recorded delegation/read-only worktree only when its
 owning job is final (`succeeded`, `failed`, or `cancelled`) and its terminal
 `updated_at` is older than `[workflow].delegation_worktree_ttl` (default `72h`;
-`"0"` disables). This default is safe because final owners cannot resume; the
-delay preserves a short debugging window. `blocked` is resumable and is never a
-TTL reclaim candidate. A successful force-remove and metadata prune records
+`"0"` disables). `blocked` is resumable and is never a TTL candidate. A
+successful linked-worktree force-remove and metadata prune records
 `delegation_worktree_reclaimed_ttl`.
+
+An aged fix clone is retained. Deleting a standalone clone deletes its object
+database, and Linux has no inode-conditional unlink that can make a deletion
+match a preceding proof. Commit reachability and nested-repository checks can
+diagnose obvious unpublished content, but they do not prove the absence of
+every loose blob, tree, annotated tag, pack, or concurrent write. Passing those
+checks therefore records `delegation_worktree_retained_unproved`, never a
+proved-disposable handoff.
+
+Cleanup obligations for fix clones stay OPEN. Managed-path absence is not
+removal evidence, even when no sibling is found; a clone may have been set
+aside, and only a durable operator action can close that work item. Dangling
+symlinks are inspected with `lstat` and never treated as absent targets.
+`gitmoot doctor` and `/api/health` discover the canonical `fixes/` directory
+structurally, including set-asides created before any job row exists. Discovery
+and logical-size accounting each stop after 4096 entries; `truncated=true` and
+the summary identify lower-bound results, and doctor warns.
+
+The daemon's pending and aged delegation-reclaim queries return at most 256 due
+owners host-wide. Attempted candidates and selected rows skipped by repository,
+session, lifecycle, or checkout-liveness filters persist a later next-attempt
+time, so fairness survives daemon restarts instead of depending on an in-memory
+cursor. The aged and terminal-task passes additionally attempt at most eight
+candidates per repository per tick.
+The task pass is driven by terminal task lifecycle state rather than age.
 Candidate-local lookup, runner, and removal failures skip only that worktree so
 later candidates continue; candidate-query and store-wide lookup failures still
 abort. Repeated failures log three times per path before suppression. Cleanup

@@ -301,10 +301,10 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		retErr = errors.Join(retErr, e.cleanupReadOnlyDelegationWorktree(ctx, jobID, job.Type, payload))
 	}()
 	// A review fix owns an independent writable clone, not a linked delegation
-	// worktree. Remove only that clone after SUCCESSFUL advancement; a finalizer or
-	// store error can leave the clone holding the only committed fix, and the daemon
-	// may convert that result into a resumable blocked job. The real task branch is
-	// never deleted or unlocked by this cleanup.
+	// worktree. Record it for operator cleanup only after SUCCESSFUL advancement;
+	// a finalizer or store error can leave the clone holding the only committed fix,
+	// and the daemon may convert that result into a resumable blocked job. The real
+	// task branch is never deleted or unlocked by this cleanup.
 	defer func() {
 		if retErr == nil {
 			retErr = e.cleanupFixWorktree(ctx, jobID, job.Type, payload)

@@ -301,6 +301,45 @@ func TestReviewIndependenceRequiresNormalizedNonEmptyAgents(t *testing.T) {
 	}
 }
 
+// #1685. The projector's job is to certify what happened, so a coordinator
+// fan-out must not produce an OBSERVED approval claim: that turns an
+// announcement nobody answered into a positive audit artifact. The panelists'
+// own review jobs are projected separately and carry the real claims.
+func TestReviewFanOutProducesNoApprovalClaim(t *testing.T) {
+	root, jobs, results, receipts, events := proofFixture(t, false)
+	for _, result := range results {
+		if result.Decision != "approved" {
+			continue
+		}
+		result.Delegations = []workflow.Delegation{
+			{ID: "lens-a", Agent: "r1", Action: "review"},
+			{ID: "lens-b", Agent: "r2", Action: "review"},
+		}
+	}
+	manifest := Project(root, jobs, results, receipts, events)
+	reviewNodes := 0
+	for _, node := range manifest.Nodes {
+		if node.Kind != KindReview {
+			continue
+		}
+		reviewNodes++
+		for _, claim := range node.Claims {
+			if strings.HasPrefix(claim.Type, "review.") && strings.Contains(claim.Type, "approved") {
+				t.Fatalf("fan-out review produced approval claim %q", claim.Type)
+			}
+		}
+		if node.Attrs["review_outcome"] != "fan-out (no verdict)" {
+			t.Fatalf("review_outcome = %q, want the fan-out label", node.Attrs["review_outcome"])
+		}
+		if node.Attrs["fan_out_delegations"] != "2" {
+			t.Fatalf("fan_out_delegations = %q, want 2", node.Attrs["fan_out_delegations"])
+		}
+	}
+	if reviewNodes == 0 {
+		t.Fatal("fixture produced no review node, so this test proves nothing")
+	}
+}
+
 func TestApprovedWithNotesProofUsesDurableOutcomeEvent(t *testing.T) {
 	root, jobs, results, receipts, events := proofFixture(t, false)
 	results["review-job"] = &workflow.AgentResult{
@@ -522,4 +561,35 @@ func cloneNodes(nodes map[string]Node) map[string]Node {
 		out[id] = node
 	}
 	return out
+}
+
+// #1685 P2. Suppressing the approval CLAIM was not enough: the renderer counts a
+// raw "approved" whenever no effective decision is carried, so the proof summary
+// still reported one approved review for a coordinator announcement. Absence is
+// not a classification. Asserted end to end, projector THROUGH renderer, because
+// the projector-only test passed while the rendered output was wrong.
+func TestReviewFanOutRendersAsNoVerdictAndIsNotCounted(t *testing.T) {
+	root, jobs, results, receipts, events := proofFixture(t, false)
+	for _, result := range results {
+		if result.Decision != "approved" {
+			continue
+		}
+		result.Delegations = []workflow.Delegation{
+			{ID: "lens-a", Agent: "r1", Action: "review"},
+			{ID: "lens-b", Agent: "r2", Action: "review"},
+		}
+	}
+	manifest := Project(root, jobs, results, receipts, events)
+
+	var rendered strings.Builder
+	if err := RenderTree(&rendered, manifest); err != nil {
+		t.Fatalf("RenderTree: %v", err)
+	}
+	out := rendered.String()
+	if !strings.Contains(out, "no verdict") || !strings.Contains(out, "fan-out") {
+		t.Fatalf("rendered proof hides the fan-out classification:\n%s", out)
+	}
+	if strings.Contains(out, "1 approved") {
+		t.Fatalf("a fan-out was counted as an approved review:\n%s", out)
+	}
 }

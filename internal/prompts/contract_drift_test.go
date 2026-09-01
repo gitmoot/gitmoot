@@ -50,14 +50,46 @@ func renderedJob() string {
 	})
 }
 
+// normalizationOwnedResultFields are AgentResult JSON fields the PRODUCT sets and
+// never asks an agent for. They are deliberately absent from the prompt: naming
+// a field there is an invitation to return it, and these carry no meaning coming
+// from an agent.
+//
+// The exclusion is by exact name, so a rename still fails the drift guard — the
+// field simply reappears as uncovered under its new name, which is the outcome
+// this test exists to force.
+var normalizationOwnedResultFields = map[string]string{
+	// Set by Mailbox.Run when it strips a pipeline leaf's executable delegations,
+	// so consumers can still tell the row was a coordinator fan-out (#1685).
+	"fan_out": "set by mailbox normalization, never requested from an agent",
+}
+
 func contractFieldNames() []string {
 	var fields []string
-	fields = append(fields, jsonFieldNames(workflow.AgentResult{})...)
+	for _, field := range jsonFieldNames(workflow.AgentResult{}) {
+		if _, owned := normalizationOwnedResultFields[field]; owned {
+			continue
+		}
+		fields = append(fields, field)
+	}
 	fields = append(fields, jsonFieldNames(workflow.Delegation{})...)
 	fields = append(fields, jsonFieldNames(workflow.EphemeralSpec{})...)
 	fields = append(fields, jsonFieldNames(workflow.HumanQuestion{})...)
 	fields = append(fields, jsonFieldNames(workflow.Learning{})...)
 	return fields
+}
+
+// TestNormalizationOwnedFieldsStayOutOfThePrompt is the other half of the
+// exclusion above: a field the product owns must not appear in the prompt, or
+// agents will start returning it. Without this, the exclusion list would be a
+// silent hole rather than a stated contract.
+func TestNormalizationOwnedFieldsStayOutOfThePrompt(t *testing.T) {
+	prompt := renderedJob()
+	for field, why := range normalizationOwnedResultFields {
+		if strings.Contains(prompt, field) {
+			t.Fatalf("prompt names %q, which is %s; agents must not be asked for it", field, why)
+		}
+	}
 }
 
 // TestContractFieldsCoveredInJobPrompt is the load-bearing drift guard: every

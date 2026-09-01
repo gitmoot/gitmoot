@@ -5055,6 +5055,7 @@ func TestTickCandidatesComputedOncePerTick(t *testing.T) {
 		atomic.StoreInt32(&counter.comment, 0)
 		atomic.StoreInt32(&counter.reclaim, 0)
 		atomic.StoreInt32(&counter.agedReclaim, 0)
+		atomic.StoreInt32(&counter.taskReclaim, 0)
 	}
 	now := time.Now().UTC()
 
@@ -5074,6 +5075,9 @@ func TestTickCandidatesComputedOncePerTick(t *testing.T) {
 	if got := atomic.LoadInt32(&counter.agedReclaim); got != 1 {
 		t.Fatalf("aged delegation-reclaim query ran %d times across %d repos, want 1", got, repoCount)
 	}
+	if got := atomic.LoadInt32(&counter.taskReclaim); got != 1 {
+		t.Fatalf("terminal task-reclaim query ran %d times across %d repos, want 1", got, repoCount)
+	}
 
 	// Single-repo tick with a nil carrier self-computes each query at most once.
 	reset()
@@ -5092,13 +5096,16 @@ func TestTickCandidatesComputedOncePerTick(t *testing.T) {
 	if got := atomic.LoadInt32(&counter.agedReclaim); got != 1 {
 		t.Fatalf("single-repo aged delegation-reclaim query ran %d times, want 1", got)
 	}
+	if got := atomic.LoadInt32(&counter.taskReclaim); got != 1 {
+		t.Fatalf("single-repo terminal task-reclaim query ran %d times, want 1", got)
+	}
 
 	// A dry-run tick returns before computing any candidate set.
 	reset()
 	if err := runDaemonWorkerTickTracked(ctx, store, worker, 1, true, "owner/repo0", "", io.Discard, now, nil, nil); err != nil {
 		t.Fatalf("dry-run runDaemonWorkerTickTracked returned error: %v", err)
 	}
-	if got := atomic.LoadInt32(&counter.advance) + atomic.LoadInt32(&counter.comment) + atomic.LoadInt32(&counter.reclaim) + atomic.LoadInt32(&counter.agedReclaim); got != 0 {
+	if got := atomic.LoadInt32(&counter.advance) + atomic.LoadInt32(&counter.comment) + atomic.LoadInt32(&counter.reclaim) + atomic.LoadInt32(&counter.agedReclaim) + atomic.LoadInt32(&counter.taskReclaim); got != 0 {
 		t.Fatalf("dry-run ran %d candidate queries, want 0", got)
 	}
 }
@@ -5216,14 +5223,14 @@ func TestAgedDelegationReclaimThrottledAcrossMultiRepoTicks(t *testing.T) {
 		t.Fatalf("first aged-reclaim query count = %d, want 1 (fresh daemon runs eagerly)", got)
 	}
 
-	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now.Add(agedDelegationWorktreeReclaimInterval-time.Nanosecond), nil, tracker); err != nil {
+	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now.Add(worktreeReclaimInterval-time.Nanosecond), nil, tracker); err != nil {
 		t.Fatalf("throttled runEnabledRepoWorkerTicksTracked returned error: %v", err)
 	}
 	if got := atomic.LoadInt32(&counter.agedReclaim); got != 1 {
 		t.Fatalf("aged-reclaim query count inside throttle window = %d, want 1", got)
 	}
 
-	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now.Add(agedDelegationWorktreeReclaimInterval), nil, tracker); err != nil {
+	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now.Add(worktreeReclaimInterval), nil, tracker); err != nil {
 		t.Fatalf("due runEnabledRepoWorkerTicksTracked returned error: %v", err)
 	}
 	if got := atomic.LoadInt32(&counter.agedReclaim); got != 2 {
@@ -5239,17 +5246,53 @@ func TestAgedDelegationReclaimThrottledAcrossMultiRepoTicks(t *testing.T) {
 	if err := runDaemonWorkerTickTracked(ctx, store, worker, 1, false, "owner/repo0", "", io.Discard, now, singleTracker, nil); err != nil {
 		t.Fatalf("first single-repo tick returned error: %v", err)
 	}
-	if err := runDaemonWorkerTickTracked(ctx, store, worker, 1, false, "owner/repo0", "", io.Discard, now.Add(agedDelegationWorktreeReclaimInterval-time.Nanosecond), singleTracker, nil); err != nil {
+	if err := runDaemonWorkerTickTracked(ctx, store, worker, 1, false, "owner/repo0", "", io.Discard, now.Add(worktreeReclaimInterval-time.Nanosecond), singleTracker, nil); err != nil {
 		t.Fatalf("throttled single-repo tick returned error: %v", err)
 	}
 	if got := atomic.LoadInt32(&counter.agedReclaim); got != 1 {
 		t.Fatalf("single-repo aged-reclaim count inside throttle window = %d, want 1", got)
 	}
-	if err := runDaemonWorkerTickTracked(ctx, store, worker, 1, false, "owner/repo0", "", io.Discard, now.Add(agedDelegationWorktreeReclaimInterval), singleTracker, nil); err != nil {
+	if err := runDaemonWorkerTickTracked(ctx, store, worker, 1, false, "owner/repo0", "", io.Discard, now.Add(worktreeReclaimInterval), singleTracker, nil); err != nil {
 		t.Fatalf("due single-repo tick returned error: %v", err)
 	}
 	if got := atomic.LoadInt32(&counter.agedReclaim); got != 2 {
 		t.Fatalf("single-repo aged-reclaim count after throttle window = %d, want 2", got)
+	}
+}
+
+func TestWorktreeReclaimCadenceDoesNotAdvanceWhenPoolSkipsPass(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	const repo = "owner/repo"
+	seedDaemonWorkerRepo(t, store, repo, t.TempDir())
+	worker := defaultJobWorker(store, io.Discard)
+	tracker := newInflightJobTracker(ctx)
+	defer tracker.drain(io.Discard, time.Second)
+	if !tracker.tryBeginPool(repo) {
+		t.Fatal("tryBeginPool returned false")
+	}
+
+	counter := &countingCandidateStore{inner: store}
+	realNewTickCandidates := newTickCandidates
+	newTickCandidates = func(tickCandidateStore) *tickCandidates {
+		return realNewTickCandidates(counter)
+	}
+	defer func() { newTickCandidates = realNewTickCandidates }()
+
+	now := time.Now().UTC()
+	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now, nil, tracker); err != nil {
+		t.Fatalf("pool-blocked runEnabledRepoWorkerTicksTracked returned error: %v", err)
+	}
+	if got := atomic.LoadInt32(&counter.agedReclaim); got != 0 {
+		t.Fatalf("pool-blocked aged-reclaim query count = %d, want 0", got)
+	}
+	tracker.endPool(repo)
+
+	if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now.Add(time.Second), nil, tracker); err != nil {
+		t.Fatalf("post-pool runEnabledRepoWorkerTicksTracked returned error: %v", err)
+	}
+	if got := atomic.LoadInt32(&counter.agedReclaim); got != 1 {
+		t.Fatalf("post-pool aged-reclaim query count = %d, want 1", got)
 	}
 }
 
@@ -5287,7 +5330,7 @@ func TestTickCandidatesRetriesOnError(t *testing.T) {
 		t.Fatalf("advance query ran %d times after a cached success, want still 2", got)
 	}
 
-	// The same retry-on-error / memoize-on-success contract holds for the other two.
+	// The same retry-on-error / memoize-on-success contract holds for the other queries.
 	if _, err := cand.commentRetryCandidates(ctx); !errors.Is(err, errCandidateTransient) {
 		t.Fatalf("first commentRetryCandidates err = %v, want transient", err)
 	}
@@ -5314,5 +5357,28 @@ func TestTickCandidatesRetriesOnError(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&store.agedReclaimCalls); got != 2 {
 		t.Fatalf("aged reclaim query ran %d times, want 2", got)
+	}
+	if _, err := cand.terminalTaskWorktreeCandidates(ctx); !errors.Is(err, errCandidateTransient) {
+		t.Fatalf("first terminalTaskWorktreeCandidates err = %v, want transient", err)
+	}
+	if ids, err := cand.terminalTaskWorktreeCandidates(ctx); err != nil || len(ids) != 1 || ids[0] != "task-reclaim" {
+		t.Fatalf("second terminalTaskWorktreeCandidates ids=%v err=%v, want [task-reclaim] nil", ids, err)
+	}
+	if got := atomic.LoadInt32(&store.taskReclaimCalls); got != 2 {
+		t.Fatalf("terminal task reclaim query ran %d times, want 2", got)
+	}
+	if _, err := cand.firstMalformedNonFinalJob(ctx); !errors.Is(err, errCandidateTransient) {
+		t.Fatalf("first firstMalformedNonFinalJob err = %v, want transient", err)
+	}
+	id, err := cand.firstMalformedNonFinalJob(ctx)
+	if err != nil || id != "malformed-job" {
+		t.Fatalf("second firstMalformedNonFinalJob id=%q err=%v, want malformed-job nil", id, err)
+	}
+	id, err = cand.firstMalformedNonFinalJob(ctx)
+	if err != nil || id != "malformed-job" {
+		t.Fatalf("third firstMalformedNonFinalJob id=%q err=%v, want cached malformed-job nil", id, err)
+	}
+	if got := atomic.LoadInt32(&store.malformedOwnerCalls); got != 2 {
+		t.Fatalf("malformed owner query ran %d times, want 2", got)
 	}
 }

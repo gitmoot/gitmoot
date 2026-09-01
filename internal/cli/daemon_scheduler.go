@@ -60,10 +60,9 @@ const daemonWorkerLoopInterval = 1 * time.Second
 // on every supervisor iteration.
 const foreignBootRecoveryInterval = 15 * time.Second
 
-// agedDelegationWorktreeReclaimInterval is tiny beside the default 72-hour
-// eligibility TTL, but removes the 0.151s global candidate query from the
-// daemon's one-second hot path.
-const agedDelegationWorktreeReclaimInterval = 5 * time.Minute
+// worktreeReclaimInterval keeps terminal-task and aged-job candidate queries
+// out of the daemon's one-second hot path.
+const worktreeReclaimInterval = 5 * time.Minute
 
 // Task lane locks are cheap to inspect but are not part of the one-second hot
 // path. The age floor is the safety boundary: event-driven cancellation may
@@ -182,6 +181,37 @@ func logDelegationReclaimFailure(stdout io.Writer, mode string, phase string, jo
 		writeLine(stdout, "job %s delegation worktree reclaim path=%s reached %d failures; further identical-path failures are suppressed", jobID, path, count)
 	}
 }
+func logTaskWorktreeReclaimFailure(stdout io.Writer, taskID string, path string, err error) {
+	path = filepath.Clean(path)
+	count, shouldLog := recordDelegationReclaimFailure(path, time.Now().UTC())
+	if !shouldLog {
+		return
+	}
+	writeLine(stdout, "terminal task worktree reclaim failed task=%s path=%s attempt=%d: %v", taskID, path, count, err)
+	if count == delegationReclaimFailureLogLimit {
+		writeLine(stdout, "terminal task worktree reclaim task=%s path=%s reached %d failures; further identical-path failures are suppressed", taskID, path, count)
+	}
+}
+
+func logTaskWorktreeRetention(stdout io.Writer, taskID string, path string, classification workflow.TaskWorktreeReclaimClassification, malformedJobID string) {
+	if classification == "" {
+		return
+	}
+	path = filepath.Clean(path)
+	key := path + "|retained|" + string(classification)
+	count, shouldLog := recordDelegationReclaimFailure(key, time.Now().UTC())
+	if !shouldLog {
+		return
+	}
+	detail := ""
+	if classification == workflow.TaskWorktreeReclaimActiveOwner && strings.TrimSpace(malformedJobID) != "" {
+		detail = " malformed_non_final_job=" + strings.TrimSpace(malformedJobID)
+	}
+	writeLine(stdout, "terminal task worktree retained task=%s path=%s classification=%s observation=%d%s", taskID, path, classification, count, detail)
+	if count == delegationReclaimFailureLogLimit {
+		writeLine(stdout, "terminal task worktree retention task=%s path=%s classification=%s reached %d observations; further identical retention messages are suppressed", taskID, path, classification, count)
+	}
+}
 
 func recordDelegationCleanupFailure(ctx context.Context, worker jobWorker, mode, phase, jobID, path string, err error, now time.Time) (db.CleanupObligation, error) {
 	reason := db.ClassifyCleanupObligationFailure(phase, err)
@@ -203,6 +233,37 @@ func recordDelegationCleanupFailure(ctx context.Context, worker jobWorker, mode,
 		})
 	}
 	return obligation, nil
+}
+
+// deferDelegationCleanupContention reschedules a candidate whose only problem was
+// a busy checkout lock. Contention is not failure: counting it spends the
+// three-attempt retry budget and quarantines an obligation that would have
+// succeeded as soon as the lock cleared.
+func deferDelegationCleanupContention(ctx context.Context, worker jobWorker, mode, jobID, path string, err error, now time.Time) error {
+	if _, deferErr := worker.Store.DeferCleanupObligation(
+		context.WithoutCancel(ctx), jobID, path, db.CleanupReasonCheckoutLock, now, now.Add(delegationCleanupRetryDelay),
+	); deferErr != nil {
+		logDelegationReclaimFailure(worker.Stdout, mode, "lock", jobID, path, fmt.Errorf("%w (persist cleanup obligation: %v)", err, deferErr))
+		return fmt.Errorf("defer contended cleanup obligation for %s: %w", jobID, deferErr)
+	}
+	logDelegationReclaimFailure(worker.Stdout, mode, "lock", jobID, path, err)
+	return nil
+}
+
+// deferDelegationCleanupSkip moves a selected-but-unattempted row behind the
+// bounded host window. The durable next_attempt_at is the fairness cursor: repo
+// filters, session filters, non-final state, and held checkouts must not leave the
+// same 256 rows monopolizing every tick after a daemon restart.
+func deferDelegationCleanupSkip(ctx context.Context, worker jobWorker, jobID, path string, reason db.CleanupObligationReason, now time.Time) error {
+	_, err := worker.Store.DeferCleanupObligation(
+		context.WithoutCancel(ctx), jobID, path, reason, now, now.Add(delegationCleanupRetryDelay),
+	)
+	return err
+}
+
+func delegationCleanupContended(err error) bool {
+	var blocked workflow.BlockedError
+	return errors.As(err, &blocked)
 }
 
 func delegationCleanupTargetContained(worker jobWorker, job db.Job, obligation db.CleanupObligation) error {
@@ -242,11 +303,6 @@ func prepareDelegationCleanup(ctx context.Context, worker jobWorker, mode string
 }
 
 func finishDelegationCleanupAttempt(ctx context.Context, worker jobWorker, jobID, path string, reclaimed bool, now time.Time) error {
-	if !reclaimed {
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			reclaimed = true
-		}
-	}
 	if reclaimed {
 		if _, err := worker.Store.MarkCleanupObligationRemoved(context.WithoutCancel(ctx), jobID, path, now); err != nil {
 			logDelegationReclaimFailure(worker.Stdout, "state", "removed", jobID, path, err)
@@ -809,17 +865,13 @@ func recoveredJobLogTail(store *db.Store, jobID string) string {
 	return cut
 }
 
-// tickCandidates memoizes the four per-tick job-candidate GROUP BY queries
-// (advance-retry / comment-retry / delegation-worktree-reclaim) so they run ONCE
-// per supervisor tick instead of once per enabled repo (#619). Each query takes
-// NO repo argument — they scan the whole job_events table and return the global
-// candidate set — yet the retry passes ran them inside runDaemonWorkerTickTracked,
-// which the multi-repo supervisor invokes once per enabled repo (18×/tick on the
-// affected VPS). The most expensive of the three (JobIDsWithPendingAdvanceRetry)
-// materialized ~23.67 MiB of row fetches per call, so re-running it per repo was
-// the single largest source of the daemon's idle read volume. Hoisting it here
-// keeps per-repo filtering exactly where it was (in Go, in the retry passes) while
-// collapsing the shared query to one execution.
+// tickCandidates memoizes the five per-tick global candidate queries
+// (advance retry, comment retry, delegation cleanup, aged job cleanup, and
+// terminal task cleanup) so they run once per supervisor tick instead of once
+// per enabled repo (#619). Each query takes no repo argument and returns a
+// global candidate set that the per-repo pass filters in Go. Before the hoist,
+// the multi-repo supervisor invoked each query once per enabled repo. The most
+// expensive query materialized about 23.67 MiB of row fetches per call.
 //
 // Two memoization properties, both implemented once in candidateMemo.get:
 //
@@ -850,6 +902,8 @@ type tickCandidateStore interface {
 	JobIDsWithPendingCommentRetry(ctx context.Context) ([]string, error)
 	JobIDsWithPendingDelegationWorktreeReclaim(ctx context.Context) ([]string, error)
 	JobIDsWithAgedTerminalDelegationWorktree(ctx context.Context, cutoff time.Time) ([]string, error)
+	TaskIDsWithTerminalWorktree(ctx context.Context) ([]string, error)
+	FirstMalformedNonFinalJob(ctx context.Context) (string, error)
 }
 
 // candidateMemo lazily runs one per-tick candidate query and shares its RESULT
@@ -859,11 +913,13 @@ type tickCandidateStore interface {
 // (retry-on-error — see tickCandidates for why per-repo fault isolation matters). It
 // is consumed only on the synchronous tick goroutine, so it needs no synchronization.
 type candidateMemo struct {
-	done bool
-	ids  []string
+	attempted bool
+	done      bool
+	ids       []string
 }
 
 func (m *candidateMemo) get(fetch func() ([]string, error)) ([]string, error) {
+	m.attempted = true
 	if m.done {
 		return m.ids, nil
 	}
@@ -877,15 +933,15 @@ func (m *candidateMemo) get(fetch func() ([]string, error)) ([]string, error) {
 }
 
 type tickCandidates struct {
-	store           tickCandidateStore
-	advance         candidateMemo
-	comment         candidateMemo
-	reclaim         candidateMemo
-	agedReclaim     candidateMemo
-	skipAgedReclaim bool
-	// A best-effort reclaim failure stays outside tick health but must not advance
-	// the success cadence; the fresh per-tick carrier keeps that signal bounded.
-	agedReclaimFailed bool
+	store              tickCandidateStore
+	advance            candidateMemo
+	comment            candidateMemo
+	reclaim            candidateMemo
+	agedReclaim        candidateMemo
+	taskReclaim        candidateMemo
+	malformedOwnerDone bool
+	malformedOwnerID   string
+	skipAgedReclaim    bool
 }
 
 // newTickCandidates is a package var (not a plain func) only so the once-per-tick
@@ -920,6 +976,28 @@ func (c *tickCandidates) agedDelegationReclaimCandidates(ctx context.Context, cu
 	return c.agedReclaim.get(func() ([]string, error) {
 		return c.store.JobIDsWithAgedTerminalDelegationWorktree(ctx, cutoff)
 	})
+}
+
+func (c *tickCandidates) terminalTaskWorktreeCandidates(ctx context.Context) ([]string, error) {
+	if c.skipAgedReclaim {
+		return nil, nil
+	}
+	return c.taskReclaim.get(func() ([]string, error) {
+		return c.store.TaskIDsWithTerminalWorktree(ctx)
+	})
+}
+
+func (c *tickCandidates) firstMalformedNonFinalJob(ctx context.Context) (string, error) {
+	if c.malformedOwnerDone {
+		return c.malformedOwnerID, nil
+	}
+	id, err := c.store.FirstMalformedNonFinalJob(ctx)
+	if err != nil {
+		return "", err
+	}
+	c.malformedOwnerID = id
+	c.malformedOwnerDone = true
+	return id, nil
 }
 
 // retryPendingJobAdvancements re-fires the post-delivery advancement for any
@@ -1029,18 +1107,23 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 		}
 		path := delegationReclaimPath(job.ID, job.Payload)
 		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+			if err := deferDelegationCleanupSkip(ctx, worker, job.ID, path, db.CleanupReasonTerminalDeferred, now); err != nil {
+				return stopDelegationCleanupPass(err)
+			}
 			continue
 		}
 		if !jobStateEligibleForWorktreeReclaim(job.State) {
+			if err := deferDelegationCleanupSkip(ctx, worker, job.ID, path, db.CleanupReasonTerminalDeferred, now); err != nil {
+				return stopDelegationCleanupPass(err)
+			}
 			continue
 		}
-		if checkoutHeld != nil {
-			if checkoutHeld(queuedJobCheckoutKey(ctx, worker.Store, job)) {
-				continue
+		if checkoutHeld != nil && (checkoutHeld(queuedJobCheckoutKey(ctx, worker.Store, job)) ||
+			(repoFilter != "" && checkoutHeld("repo:"+repoFilter))) {
+			if err := deferDelegationCleanupSkip(ctx, worker, job.ID, path, db.CleanupReasonCheckoutLock, now); err != nil {
+				return stopDelegationCleanupPass(err)
 			}
-			if repoFilter != "" && checkoutHeld("repo:"+repoFilter) {
-				continue
-			}
+			continue
 		}
 		_, ok, err := prepareDelegationCleanup(ctx, worker, "skipped", job, path, now)
 		if err != nil {
@@ -1084,7 +1167,15 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 	if err != nil {
 		return err
 	}
+	attempts := 0
 	for _, jobID := range jobIDs {
+		// Each attempt can run a remote fetch under a two-minute deadline and a
+		// full-clone removal, so the pass is bounded per tick. Every attempted or
+		// skipped row persists a later next_attempt_at; the ordered SQL window
+		// therefore advances without an in-memory rotation cursor.
+		if attempts >= terminalTaskWorktreeReclaimPassBudget {
+			break
+		}
 		job, err := delegationReclaimCandidateJob(ctx, worker, jobID)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
@@ -1101,30 +1192,33 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 			if _, persistErr := recordDelegationCleanupFailure(ctx, worker, "aged", "get_job", jobID, path, err, now); persistErr != nil {
 				return stopDelegationCleanupPass(persistErr)
 			}
-			cand.agedReclaimFailed = true
 			continue
 		}
 		path := delegationReclaimPath(job.ID, job.Payload)
 		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+			if err := deferDelegationCleanupSkip(ctx, worker, job.ID, path, db.CleanupReasonTerminalDeferred, now); err != nil {
+				return stopDelegationCleanupPass(err)
+			}
 			continue
 		}
 		if !workflow.IsFinalJobState(job.State) {
+			if err := deferDelegationCleanupSkip(ctx, worker, job.ID, path, db.CleanupReasonTerminalDeferred, now); err != nil {
+				return stopDelegationCleanupPass(err)
+			}
 			continue
 		}
-		if checkoutHeld != nil {
-			if checkoutHeld(queuedJobCheckoutKey(ctx, worker.Store, job)) {
-				continue
+		if checkoutHeld != nil && (checkoutHeld(queuedJobCheckoutKey(ctx, worker.Store, job)) ||
+			(repoFilter != "" && checkoutHeld("repo:"+repoFilter))) {
+			if err := deferDelegationCleanupSkip(ctx, worker, job.ID, path, db.CleanupReasonCheckoutLock, now); err != nil {
+				return stopDelegationCleanupPass(err)
 			}
-			if repoFilter != "" && checkoutHeld("repo:"+repoFilter) {
-				continue
-			}
+			continue
 		}
 		_, ok, err := prepareDelegationCleanup(ctx, worker, "aged", job, path, now)
 		if err != nil {
 			return stopDelegationCleanupPass(err)
 		}
 		if !ok {
-			cand.agedReclaimFailed = true
 			continue
 		}
 		runner, err := worker.subprocessRunnerForJob(job)
@@ -1132,22 +1226,158 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 			if _, persistErr := recordDelegationCleanupFailure(ctx, worker, "aged", "runner", job.ID, path, err, now); persistErr != nil {
 				return stopDelegationCleanupPass(persistErr)
 			}
-			cand.agedReclaimFailed = true
 			continue
 		}
 		engine := worker.workflowForJob(worker.delegationParentCheckout(ctx, job), runner)
+		attempts++
 		reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, now.Add(-ttl))
 		if err != nil {
+			if delegationCleanupContended(err) {
+				if deferErr := deferDelegationCleanupContention(ctx, worker, "aged", job.ID, path, err, now); deferErr != nil {
+					return stopDelegationCleanupPass(deferErr)
+				}
+				continue
+			}
 			if _, persistErr := recordDelegationCleanupFailure(ctx, worker, "aged", "reclaim", job.ID, path, err, now); persistErr != nil {
 				return stopDelegationCleanupPass(persistErr)
 			}
-			cand.agedReclaimFailed = true
 			continue
 		}
 		if err := finishDelegationCleanupAttempt(ctx, worker, job.ID, path, reclaimed, now); err != nil {
 			return stopDelegationCleanupPass(err)
 		}
 	}
+	return nil
+}
+
+// terminalTaskWorktreeReclaimPassBudget caps how many candidates enter the
+// engine's safety proof per tick. Each one takes the checkout mutation lock with
+// the package's two-minute wait budget and runs two `git status --ignored`
+// scans, and the candidate list has no age filter, so a host that accumulates
+// permanently retained worktrees would otherwise spend the whole tick here
+// ahead of dispatch.
+const terminalTaskWorktreeReclaimPassBudget = 8
+
+// terminalTaskWorktreeReclaimResume rotates the bounded window so a candidate
+// that can never be reclaimed cannot starve the ones behind it: the pass resumes
+// at the first id at or after the last pass's unreached candidate.
+// The marker is keyed by repo filter. The candidate list is host-wide and every
+// repo's pass walks all of it, skipping other repos' candidates for free, so one
+// shared marker let a small repo's completed pass reset a large repo's window to
+// the start on every tick and starve its tail forever.
+var terminalTaskWorktreeReclaimResume = struct {
+	sync.Mutex
+	taskIDByRepo map[string]string
+}{taskIDByRepo: map[string]string{}}
+
+func rotateTerminalTaskWorktreeCandidates(repoFilter string, ids []string) []string {
+	terminalTaskWorktreeReclaimResume.Lock()
+	resume := terminalTaskWorktreeReclaimResume.taskIDByRepo[repoFilter]
+	terminalTaskWorktreeReclaimResume.Unlock()
+	if resume == "" || len(ids) == 0 {
+		return ids
+	}
+	for i, id := range ids {
+		if id >= resume {
+			if i == 0 {
+				return ids
+			}
+			rotated := make([]string, 0, len(ids))
+			return append(append(rotated, ids[i:]...), ids[:i]...)
+		}
+	}
+	return ids
+}
+
+func setTerminalTaskWorktreeReclaimResume(repoFilter string, taskID string) {
+	terminalTaskWorktreeReclaimResume.Lock()
+	defer terminalTaskWorktreeReclaimResume.Unlock()
+	if taskID == "" {
+		delete(terminalTaskWorktreeReclaimResume.taskIDByRepo, repoFilter)
+		return
+	}
+	terminalTaskWorktreeReclaimResume.taskIDByRepo[repoFilter] = taskID
+}
+
+// reclaimTerminalTaskWorktrees removes task-owned worktrees based on terminal
+// lifecycle state, never age. Each candidate is independently safety-checked by
+// the workflow engine; item failures are logged and left for the next bounded
+// pass so maintenance cannot suppress dispatch.
+func reclaimTerminalTaskWorktrees(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string, checkoutHeld func(string) bool, cand *tickCandidates, stdout io.Writer) error {
+	if strings.TrimSpace(rootFilter) != "" {
+		return nil
+	}
+	taskIDs, err := cand.terminalTaskWorktreeCandidates(ctx)
+	if err != nil {
+		return err
+	}
+	if len(taskIDs) == 0 {
+		return nil
+	}
+	home := worker.workflowHome()
+	if strings.TrimSpace(home) == "" {
+		return errors.New("resolve Gitmoot home for terminal task worktree reclaim")
+	}
+	malformedJobID, malformedErr := cand.firstMalformedNonFinalJob(ctx)
+	if malformedErr != nil {
+		writeLine(stdout, "terminal task worktree reclaim could not identify malformed non-final owner: %v", malformedErr)
+	}
+	rotated := rotateTerminalTaskWorktreeCandidates(repoFilter, taskIDs)
+	attempts := 0
+	resume := ""
+	for i, taskID := range rotated {
+		if attempts >= terminalTaskWorktreeReclaimPassBudget {
+			resume = rotated[i]
+			break
+		}
+		task, err := worker.Store.GetTask(ctx, taskID)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			writeLine(stdout, "terminal task worktree reclaim candidate %s skipped: %v", taskID, err)
+			continue
+		}
+		if repoFilter != "" && task.RepoFullName != repoFilter {
+			continue
+		}
+		path := strings.TrimSpace(task.WorktreePath)
+		if checkoutHeld != nil && (checkoutHeld("worktree:"+filepath.Clean(path)) || checkoutHeld("repo:"+task.RepoFullName)) {
+			continue
+		}
+		repo, err := worker.Store.GetRepo(ctx, task.RepoFullName)
+		if err != nil {
+			writeLine(stdout, "terminal task worktree reclaim candidate %s has no registered repo checkout: %v", task.ID, err)
+			continue
+		}
+		checkout := strings.TrimSpace(repo.CheckoutPath)
+		if checkout == "" {
+			writeLine(stdout, "terminal task worktree reclaim candidate %s has an empty registered repo checkout", task.ID)
+			continue
+		}
+		engine := worker.workflowForHost(checkout)
+		manager, ok := engine.DelegationWorktrees.(workflow.WritableWorktreeLineageManager)
+		if !ok || manager == nil {
+			writeLine(stdout, "terminal task worktree reclaim candidate %s has no writable worktree manager", task.ID)
+			continue
+		}
+		attempts++
+		outcome, err := engine.ReclaimTerminalTaskWorktreeOutcome(ctx, home, checkout, task.ID, manager)
+		if err != nil {
+			logTaskWorktreeReclaimFailure(stdout, task.ID, path, err)
+			continue
+		}
+		clearDelegationReclaimFailure(filepath.Clean(path))
+		switch {
+		case outcome.Reclaimed:
+			writeLine(stdout, "terminal task worktree reclaimed: task=%s path=%s classification=%s", task.ID, outcome.Path, outcome.Classification)
+		case outcome.Classification == workflow.TaskWorktreeReclaimUnremovable || outcome.Classification == workflow.TaskWorktreeReclaimPathMismatch:
+			writeLine(stdout, "terminal task worktree classified: task=%s path=%s classification=%s", task.ID, outcome.Path, outcome.Classification)
+		default:
+			logTaskWorktreeRetention(stdout, task.ID, outcome.Path, outcome.Classification, malformedJobID)
+		}
+	}
+	setTerminalTaskWorktreeReclaimResume(repoFilter, resume)
 	return nil
 }
 
@@ -1202,13 +1432,20 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	}
 	ownsCandidates := cand == nil
 	// A nil carrier means this is a standalone tick (single-repo supervisor or
-	// direct caller): compute the shared candidate sets once for THIS
-	// tick. The multi-repo supervisor passes a carrier it created once per tick, so
-	// the four GROUP BY queries run once per tick rather than once per enabled repo
-	// (#619).
+	// direct caller): compute the shared candidate sets once for this tick. The
+	// multi-repo supervisor passes a carrier it created once per tick, so the
+	// five global candidate queries run once rather than once per enabled repo.
 	if cand == nil {
 		cand = newTickCandidates(worker.Store)
-		cand.skipAgedReclaim = !tracker.agedDelegationWorktreeReclaimDue(now)
+		runWorktreeReclaim := tracker.worktreeReclaimDue(now)
+		cand.skipAgedReclaim = !runWorktreeReclaim
+		if runWorktreeReclaim {
+			defer func() {
+				if cand.taskReclaim.attempted || cand.agedReclaim.attempted {
+					tracker.markWorktreeReclaimAttempted(now)
+				}
+			}()
+		}
 	}
 	if ownsCandidates && tracker.staleTaskLaneLockReclaimDue(now) {
 		if err := reclaimStaleTaskLaneLocks(ctx, store, repoFilter, stdout, now); err != nil {
@@ -1279,12 +1516,14 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 		}
 		// The store path is already the resolved Gitmoot root. Using it keeps this
 		// hot-read on the daemon's actual home and prevents the raw/resolved
-		// double-resolution bug class; isolated tests likewise stay in /tmp.
+		// double-resolution bug class.
 		if ttl, err := resolveDelegationWorktreeTTL(filepath.Dir(store.DatabasePath())); err != nil {
 			writeLine(stdout, "delegation_worktree_ttl reclaim skipped: %v", err)
 		} else if err := reclaimAgedTerminalDelegationWorktrees(ctx, worker, repoFilter, rootFilter, tracker.checkoutHeld, cand, now, ttl); err != nil {
-			cand.agedReclaimFailed = true
 			writeLine(stdout, "delegation_worktree_ttl reclaim failed: %v", err)
+		}
+		if err := reclaimTerminalTaskWorktrees(ctx, worker, repoFilter, rootFilter, tracker.checkoutHeld, cand, stdout); err != nil {
+			writeLine(stdout, "terminal task worktree reclaim failed: %v", err)
 		}
 	}
 	// Comment retries only post PR comments through the commenter — they never
@@ -1314,9 +1553,6 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	if err != nil {
 		return err
 	}
-	if ownsCandidates && cand.agedReclaim.done && !cand.agedReclaimFailed {
-		tracker.markAgedDelegationWorktreeReclaimSuccessful(now)
-	}
 	return nil
 }
 
@@ -1341,14 +1577,13 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 	if err != nil {
 		return err
 	}
-	// Compute the shared per-tick job-candidate sets ONCE for this whole sweep and
-	// pass the carrier into every enabled repo's tick (#619). The four GROUP BY
-	// candidate queries take no repo argument — they return the global candidate set
-	// that each repo's retry pass then filters in Go — so running them once here
-	// instead of once inside each runDaemonWorkerTickTracked collapses 18×/tick down
-	// to 1×/tick on a multi-repo daemon. Fresh each sweep; never retained.
+	// Compute the shared per-tick candidate sets once for this whole sweep and
+	// pass the carrier into every enabled repo's tick (#619). The five global
+	// queries take no repo argument. Each repo's retry pass filters in Go, so
+	// hoisting them here collapses 18 calls per query to one on the affected
+	// multi-repo daemon. Fresh each sweep; never retained.
 	cand := newTickCandidates(worker.Store)
-	runAgedReclaim := tracker.agedDelegationWorktreeReclaimDue(now)
+	runAgedReclaim := tracker.worktreeReclaimDue(now)
 	cand.skipAgedReclaim = !runAgedReclaim
 	// Scope tick faults per repo (#555 follow-up): the recovering supervisor
 	// treats a returned error as one fleet-wide failure unit and, after a bounded
@@ -1387,8 +1622,8 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 			writeLine(stdout, "%s: worker tick error: %v", repo.FullName(), tickErr)
 		}
 	}
-	if failed == 0 && runAgedReclaim && cand.agedReclaim.done && !cand.agedReclaimFailed {
-		tracker.markAgedDelegationWorktreeReclaimSuccessful(now)
+	if runAgedReclaim && (cand.taskReclaim.attempted || cand.agedReclaim.attempted) {
+		tracker.markWorktreeReclaimAttempted(now)
 	}
 	// Every enabled repo failing is the global-fault signal: return it so the
 	// recovering supervisor's streak can trip and escalate. A single-repo daemon

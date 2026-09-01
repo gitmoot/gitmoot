@@ -546,25 +546,75 @@ npm run build
 rsync -a --delete build/ /var/www/gitmoot-docs/
 ```
 
-## Delegation worktrees consume too much disk
+## Worktrees consume too much disk
 
-`gitmoot doctor` reports `N stale worktrees / X GB under <home>/worktrees` and
-separates reclaimable final owners, pinned non-final owners, and unproven
-directories. `/api/health` exposes the same metric and the quarantined cleanup
-count in its top-level `worktrees` field.
+Every five minutes, the daemon checks task-owned worktrees whose task is
+`merged`, `dismissed`, `superseded`, or `stranded`. Age alone never qualifies a
+task worktree. Gitmoot retains it unless the recorded path is deterministic,
+there is no non-final job or branch lock, the `/proc/<pid>/cwd` scan is
+conclusive with no live process inside it, the worktree HEAD is reachable from
+the recorded task branch, and `git status --porcelain --ignored` reports no
+tracked, untracked, or ignored content. Removal is non-force and preserves the
+branch.
 
-`[workflow].delegation_worktree_ttl = "72h"` is default-on: after that grace
-period the daemon force-removes dirty terminal-owned delegation worktrees,
-prunes Git worktree metadata, and records
-`delegation_worktree_reclaimed_ttl`. Set it to `"0"` to disable this pass.
-Blocked, queued, and running owners remain pinned and are never force-removed.
-Candidate-local lookup, runner, and removal failures skip only that worktree;
-later candidates continue. The daemon logs three failures per path before
-suppressing repeats. Each failure advances a restart-safe cleanup obligation;
-retries wait one minute and stop in terminal `quarantined` state after the third
-failure. Inspect quarantines with `gitmoot job cleanup list --state quarantined`
-and explicitly reopen a repaired target with `gitmoot job cleanup reopen
-<resource-id>`. Candidate-query and store-wide lookup failures remain fatal.
+A malformed payload on any non-final job also pins task worktrees because
+Gitmoot cannot prove that the job owns some other path. The bounded retention
+log names one malformed job responsible for this global safety pin.
+
+A worktree registered to an older checkout root is removed through the owner in
+its `.git` pointer. If that owner cannot inspect or remove it, Gitmoot records
+`terminal_worktree_unremovable` once instead of retrying every daemon tick.
+Retention decisions log three times per path and classification before
+identical messages are suppressed.
+
+`gitmoot doctor` reports delegation worktrees only; ordinary task worktrees
+appear in the bounded `terminal task worktree retained` daemon lines instead.
+Doctor separates reclaimable final delegation owners, pinned non-final owners,
+and unproven directories. `/api/health` exposes the same delegation metric and
+quarantined cleanup count in its top-level `worktrees` field.
+
+`[workflow].delegation_worktree_ttl = "72h"` is default-on. After that grace
+period the daemon force-removes dirty terminal-owned read-only and delegation
+worktrees. Set the TTL to `"0"` to disable this pass. Blocked, queued, and
+running owners remain pinned.
+
+No gitmoot path deletes an independent fix clone. It is a standalone object
+database, and Linux has no inode-conditional unlink that can make deletion match
+a preceding proof. Commit and nested-repository checks can diagnose obvious
+retention reasons, but they do not close over every blob, tree, annotated tag,
+pack, or concurrent write. Passing them therefore records
+`delegation_worktree_retained_unproved`, never a proved-disposable handoff.
+
+Terminal cleanup leaves the managed clone in place. Allocation recovery and
+enqueue failures rename it to a `.ttl-reclaiming-orphaned-*` sibling so retries
+can allocate without destroying bytes. Cleanup obligations remain open.
+Managed-path absence is not treated as removal, even when no sibling is found,
+and dangling symlinks remain visible through `lstat`.
+
+`gitmoot doctor` and `/api/health` discover the canonical `fixes/` directory
+structurally, including set-asides created before a job row exists. Directory
+discovery and logical-size accounting each stop after 4096 entries; the API sets
+`truncated=true`, the summary marks counts and bytes as lower bounds, and doctor
+warns. Removal remains a manual operator decision after inspecting the working
+tree and object database.
+
+The daemon queries at most 256 due pending or aged delegation owners host-wide.
+Attempted candidates and selected rows skipped by repository, session,
+lifecycle, or checkout-liveness filters persist a later next-attempt time, so
+fairness survives restarts rather than depending on an in-memory cursor. The
+aged pass also attempts at most eight candidates per repository per tick.
+Candidate-local failures skip only that worktree, and later candidates continue.
+The five-minute pass cadence advances after every attempt so a failed cleanup
+cannot hot-loop. Cleanup obligations retry once per minute and stop in
+`quarantined` after the third failure. Inspect them with `gitmoot job cleanup
+list --state quarantined` and reopen a repaired target with
+`gitmoot job cleanup reopen <resource-id>`.
+
+Repeated terminal-task failures log three times per path before identical
+messages are suppressed. The terminal-task pass proves at most eight candidates
+per tick, because each proof takes the checkout mutation lock and walks the
+ignored tree twice; the window rotates through the candidate list so a
+permanently retained worktree cannot starve the ones behind it.
 
 For immediate relief, list candidate directories and prove ownership before
 removing anything:

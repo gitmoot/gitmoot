@@ -451,8 +451,8 @@ type JobPayload struct {
 	// may own throwaway writable worktrees without being read-only runtime seats.
 	ReadOnlySeat bool `json:"read_only_seat,omitempty"`
 	// FixWorktree marks a per-job writable clone allocated for a review fix round.
-	// The clone owns its git directory, is attached to Branch, and is reclaimed by
-	// the delegation-worktree TTL machinery without deleting that real branch.
+	// The clone owns its git directory, is attached to Branch, and remains visible
+	// to cleanup obligations and doctor until an operator removes it.
 	FixWorktree bool `json:"fix_worktree,omitempty"`
 	// ReadOnlyWorktreeDiff durably preserves the bounded `git status --short` +
 	// `git diff HEAD` snapshot collected immediately before a terminal ask/review
@@ -1489,6 +1489,14 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		// pipeline-sender job (shell + #757 agent leaf) keeps the delegations strip
 		// byte-identically and can never spawn phantom children.
 		if !payload.OrchestrateStage {
+			// Stripping the INSTRUCTIONS must not erase the CLASSIFICATION. Without
+			// this stamp a pipeline review coordinator's announcement arrives at the
+			// auto-merge gate as an ordinary approved leaf, and merges (#1685). A
+			// review stage cannot set orchestrate:true, so this is the ONLY path a
+			// production pipeline fan-out takes.
+			if len(result.Delegations) > 0 {
+				result.FanOut = true
+			}
 			result.Delegations = nil
 		}
 		// Same leaf enforcement for human_questions[] (#757): a healthy agent-stage
