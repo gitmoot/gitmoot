@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
+	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 )
@@ -57,6 +58,41 @@ func backendHasCall(backend *fakeGitHubBackend, fragment string) bool {
 	return false
 }
 
+func TestPipelinePullReadsPreRemovalBundleV1Manifest(t *testing.T) {
+	const catalogRepo = "jerry/pipeline-catalog"
+	fixtureDir := filepath.Join("testdata", "pipeline_bundle_v1_pre_removal")
+	manifestRaw := readPipelineBundleTestFile(t, filepath.Join(fixtureDir, "bundle.yaml"))
+	if !bytes.Contains(manifestRaw, []byte("  connections: []")) {
+		t.Fatal("legacy pull fixture does not contain the pre-removal connections field")
+	}
+
+	backend := newFakeGitHubBackend()
+	backend.repos[catalogRepo] = true
+	backend.files[catalogRepo] = map[string][]byte{
+		"pipelines/legacy-bundle/bundle.yaml": manifestRaw,
+		"pipelines/legacy-bundle/spec.yaml":   readPipelineBundleTestFile(t, filepath.Join(fixtureDir, "spec.yaml")),
+	}
+	usePipelineFakeGitHubBackend(t, backend)
+
+	home, _, store := heartbeatLoopE2EHome(t)
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"pipeline", "remote", "set", catalogRepo, "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("remote set exit=%d stderr=%s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"pipeline", "pull", "legacy-bundle", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("legacy bundle pull exit=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	stored, found, err := store.GetPipeline(context.Background(), "legacy-bundle")
+	if err != nil || !found {
+		t.Fatalf("pulled legacy pipeline found=%v err=%v", found, err)
+	}
+	if stored.Repo != "owner/repo" {
+		t.Fatalf("pulled legacy pipeline repo=%q, want owner/repo", stored.Repo)
+	}
+}
+
 // TestPipelinePublishPullRoundTripThroughSharedBackend is the GitHub transport
 // counterpart to TestPipelineBundleRoundTripE2E. One in-memory gh backend is
 // shared by home A's publish and home B's list/pull, while the imported pipeline
@@ -81,7 +117,7 @@ func TestPipelinePublishPullRoundTripThroughSharedBackend(t *testing.T) {
 
 	cmd := "test -d /tmp && " + pipelineStageResultCmd("approved", "command collected", nil)
 	specYAML := "# shared pipeline comment\nname: share-flow # preserve-name-comment\ndescription: Portable review flow.\nrepo: source/project # preserve-repo-comment\n" +
-		"trigger:\n  kind: email\n  connection: shared-imap\n" +
+		"trigger:\n  kind: pipeline\n  pipeline: upstream\n" +
 		"stages:\n  # preserve-stage-comment\n" +
 		pipelineE2EStage("collect", cmd, "") +
 		"  - id: review\n    agent: exported-reviewer\n    prompt: Review collected output.\n    needs: [collect]\n"
@@ -89,10 +125,6 @@ func TestPipelinePublishPullRoundTripThroughSharedBackend(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if code := Run([]string{"pipeline", "add", specFile, "--home", homeA}, &stdout, &stderr); code != 0 {
 		t.Fatalf("pipeline add exit=%d stderr=%s", code, stderr.String())
-	}
-	const secretMarker = "DO-NOT-PUBLISH-BINDING-CREDENTIAL"
-	if err := storeA.SetPipelineTriggerBinding(ctx, "share-flow", `{"flow_id":"`+secretMarker+`","binding_id":"local-only"}`); err != nil {
-		t.Fatal(err)
 	}
 
 	stdout.Reset()
@@ -124,9 +156,9 @@ func TestPipelinePublishPullRoundTripThroughSharedBackend(t *testing.T) {
 	gotRemotePaths := make([]string, 0, len(backend.files[catalogRepo]))
 	for path, content := range backend.files[catalogRepo] {
 		gotRemotePaths = append(gotRemotePaths, path)
-		if bytes.Contains(content, []byte(secretMarker)) || bytes.Contains(content, []byte("trigger_binding")) {
+		if bytes.Contains(content, []byte("trigger_binding")) {
 			backend.mu.Unlock()
-			t.Fatalf("remote file %s contains trigger binding or credential material", path)
+			t.Fatalf("remote file %s contains removed trigger binding state", path)
 		}
 	}
 	backend.mu.Unlock()
@@ -150,7 +182,7 @@ func TestPipelinePublishPullRoundTripThroughSharedBackend(t *testing.T) {
 	if code := Run([]string{"pipeline", "pull", "--list", "--home", homeB}, &stdout, &stderr); code != 0 {
 		t.Fatalf("pull --list exit=%d stderr=%s", code, stderr.String())
 	}
-	for _, want := range []string{"share-flow", "Portable review flow.", "requirements: runtimes=shell", "connections=email/shared-imap"} {
+	for _, want := range []string{"share-flow", "Portable review flow.", "requirements: runtimes=shell", "upstreams=upstream"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("pull --list missing %q:\n%s", want, stdout.String())
 		}
@@ -161,7 +193,7 @@ func TestPipelinePublishPullRoundTripThroughSharedBackend(t *testing.T) {
 	if code := Run([]string{"pipeline", "pull", "share-flow", "--home", homeB, "--repo", "target/project", "--agent-map", "exported-reviewer=local-reviewer"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("pipeline pull exit=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
-	for _, want := range []string{"Requirements report:", "runtime shell: present", "connection email/shared-imap: unchecked", "imported pipeline share-flow (disabled"} {
+	for _, want := range []string{"Requirements report:", "runtime shell: present", "upstream pipeline upstream: missing", "imported pipeline share-flow (disabled"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("pull stdout missing %q:\n%s", want, stdout.String())
 		}
@@ -212,25 +244,19 @@ func TestPipelinePublishPullRoundTripThroughSharedBackend(t *testing.T) {
 	runID := strings.TrimSpace(stdout.String())
 	enqueue := newPipelineStageEnqueuer(storeB, homeB)
 	worker := defaultJobWorker(storeB, io.Discard, homeB)
-	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
-	for i := 0; i < 8; i++ {
-		if err := runEnabledRepoWorkerTicksTracked(ctx, storeB, worker, 1, "", io.Discard, now, nil, nil); err != nil {
+	run := waitForPipelineRunToSettle(t, func(i int) {
+		tickNow := time.Now().UTC()
+		if err := runEnabledRepoWorkerTicksTracked(ctx, storeB, worker, 1, "", io.Discard, tickNow, nil, nil); err != nil {
 			t.Fatalf("worker tick %d: %v", i, err)
 		}
-		if err := runPipelineScanOnce(ctx, storeB, enqueue, now); err != nil {
+		if err := runPipelineScanOnce(ctx, storeB, enqueue, tickNow); err != nil {
 			t.Fatalf("pipeline scan %d: %v", i, err)
 		}
-		run, _, err := storeB.GetPipelineRun(ctx, runID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if run.State != pipeline.RunRunning {
-			break
-		}
-	}
-	run, found, err := storeB.GetPipelineRun(ctx, runID)
-	if err != nil || !found || run.State != pipeline.RunSucceeded {
-		t.Fatalf("pulled pipeline run=%+v found=%v err=%v", run, found, err)
+	}, func() (db.PipelineRun, bool, error) {
+		return storeB.GetPipelineRun(ctx, runID)
+	})
+	if run.State != pipeline.RunSucceeded {
+		t.Fatalf("pulled pipeline run=%+v", run)
 	}
 
 	initialWrites := pipelineRemoteWritePaths(backend)

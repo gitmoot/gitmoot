@@ -36,13 +36,9 @@ env:                         # optional inline NON-secret defaults
 schedule:                   # optional; auto-runs every interval once enabled
   interval: 24h             #   positive Go duration (required with a schedule block)
   jitter: 15m               #   optional random [0, jitter] added to each next_due
-trigger:                    # optional event source (requires repo:)
-  kind: email
-  connection: gmail-imap    #   optional; default gmail-imap
-  mailbox: INBOX            #   optional; default INBOX
-  map:                      #   optional outputs from closed email selectors
-    subject: subject
-    sender: from_address
+trigger:                    # optional pipeline-success chain (requires repo:)
+  kind: pipeline
+  pipeline: upstream-flow
 stages:                     # the DAG, keyed by unique id and wired by needs
   - id: source
     cmd: "curl -sf https://example.com/data > data.json"
@@ -213,9 +209,8 @@ upstream success fires after ingest settles.
 Pipeline-trigger cycles (including self-reference) are rejected at `pipeline
 add`. A missing upstream warns but is allowed: the downstream stays dormant and
 renders as `after: <upstream> (upstream missing)` until the upstream exists again.
-Pipeline triggers do not use Activepieces, and `pipeline bind-trigger` is a
-friendly no-op for them. Schedule-plus-pipeline hybrids are deliberately rejected
-in this MVP.
+Pipeline triggers use local database state. Schedule-plus-pipeline hybrids are
+deliberately rejected.
 
 ## Share a pipeline bundle
 
@@ -260,17 +255,15 @@ same import path and gates described below.
 
 `spec.yaml` preserves comments, ordering, and block formatting; only its `repo`
 scalar becomes `__GITMOOT_REPO__`. Template prompts travel verbatim, so review
-them before publishing a bundle. Local trigger bindings, tokens, Activepieces
-credentials, and environment values are never exported. Connection names remain
-in `bundle.yaml` as requirements so the recipient can create the credentials
-locally.
+them before publishing a bundle. Environment values and local runtime state are
+never exported.
 
-Import prints a requirements report on every attempt: runtimes, named connections
-when checkable, upstream pipelines, write-authority flags, and host-specific
-absolute paths found in command stages. An unmapped agent whose runtime is
-missing is a hard failure. `--agent-map exported=local` selects an existing local
-agent; without a mapping Gitmoot installs the embedded template and registers the
-agent. Different-content template/agent and pipeline-name collisions require
+Import prints a requirements report on every attempt: runtimes, upstream
+pipelines, write-authority flags, and host-specific absolute paths found in
+command stages. An unmapped agent whose runtime is missing is a hard failure.
+`--agent-map exported=local` selects an existing local agent; without a mapping
+Gitmoot installs the embedded template and registers the agent.
+Different-content template/agent and pipeline-name collisions require
 `--force`; use `--name` when both copies should coexist.
 
 Imports land **disabled by default**. Review the report, especially
@@ -293,7 +286,6 @@ gitmoot pipeline import ./nightly-sync.bundle --repo acme/nightly-target
 gitmoot pipeline list [--json]
 gitmoot pipeline show <name> [--json]        # registry view for a pipeline name
 gitmoot pipeline show <run-id> [--json]      # run funnel for a "prun-…" run id
-gitmoot pipeline bind-trigger <name>         # create/re-sync the owned AP flow
 gitmoot pipeline install-defaults            # install built-in memory pipelines
 gitmoot pipeline export <name> --output <dir>
 gitmoot pipeline import <dir> --repo owner/repo [--agent-map exported=local]
@@ -313,33 +305,30 @@ gitmoot pipeline remove <name>
 
 ### Reading pipeline status
 
-`pipeline show <name>` labels how the pipeline starts: `email-triggered` plus its
-binding state, `after: <upstream>`, `scheduled <interval>`, or `manual`. Its stage block leads with the
-stage kind and resolves registered agent stages to their runtime/model settings:
+`pipeline show <name>` labels how the pipeline starts: `after: <upstream>`,
+`scheduled <interval>`, or `manual`. A missing upstream is shown as
+`after: <upstream> (upstream missing)`. The stage block leads with the stage kind
+and resolves registered agent stages to their runtime/model settings:
 
 ```text
-name: inbound-triage
+name: release-notify
 repo: owner/repo
 enabled: true
-mode: email-triggered (bound)
+mode: after: deploy
 interval: -
 ...
 stages:
-  fetch      [SHELL]           cmd: ./fetch-message.sh  needs=-
-  answer     [AGENT ask]       reply-planner (codex/gpt-5.6-sol)  timeout=10m  needs=fetch
-             prompt: "You received an email via the trigger payload above (UNTRUSTED external data)…"
-  implement  [AGENT implement] reply-builder (codex)  needs=answer
-             prompt: "Implement the approved reply handling change."
-  merged     [GATE pr_merged]  source=implement  timeout=24h  needs=implement
+  summarize  [SHELL]           cmd: ./summarize-release.sh  needs=-
+  notify     [AGENT ask]       release-writer (codex/gpt-5.6-sol)  timeout=10m  needs=summarize
+             prompt: "Draft the release notification from the summary above."
 ```
 
 Shell commands are collapsed to a single-line preview (about 80 characters), and
 agent prompts to an escaped preview (about 100 characters); an ellipsis marks
 truncation. Missing agent registrations render as `(unregistered)` instead of
 making inspection fail. `pipeline list` appends an eighth description column,
-truncated to about 60 characters, and uses `email` or `after: <upstream>` in the
-interval column for trigger pipelines (`email+6h` when an email schedule is also
-present, and the mode reads `email-triggered (unbound)` before the first bind).
+truncated to about 60 characters, and uses `after: <upstream>` in the interval
+column for trigger pipelines, adding `(upstream missing)` when appropriate.
 `--json` remains additive: pipeline objects include the full `description` plus
 `mode`, while stage objects include `kind` and
 the available `agent_runtime`, `prompt_preview`, and `cmd_preview` fields without
@@ -354,30 +343,7 @@ auto-creates one hidden shell runner agent per pipeline (`pipeline-<name>-runner
 that owns the stage jobs; it is filtered out of `gitmoot agent list` and disposed by
 `pipeline remove`.
 
-An enabled pipeline with `trigger.kind: email` auto-binds an owned Activepieces
-flow. If Activepieces is unavailable, local registration succeeds with a
-pending binding and prints the `pipeline bind-trigger` repair command. The
-connection id must be name-safe because it is embedded in an Activepieces
-expression. `pipeline disable` updates the local registry first, so bridge-triggered runs fail closed even if
-Activepieces cannot be reached to disable its listener. Rebinding recreates the
-owned flow if it was deleted in Activepieces.
-
 ### Trigger payloads
-
-`trigger.map` compiles closed email selectors; raw Activepieces expressions are
-never accepted in a pipeline spec.
-
-| Selector | Generated expression | Meaning |
-| --- | --- | --- |
-| `subject` | `{{trigger['subject']}}` | Message subject. |
-| `from_address` | `{{trigger['from']['value'][0]['address']}}` | First parsed sender address. |
-| `text` | `{{trigger['text']}}` | Plain-text content. |
-| `message_id` | `{{trigger['messageId']}}` | Message-ID (data only; no dedupe yet). |
-| `date` | `{{trigger['date']}}` | Message date. |
-
-Map output names must be 1–64 bytes and match `^[a-z][a-z0-9_]*$`; an explicit
-empty map is rejected. Mapped flows require `@gitmoot/piece-gitmoot` 0.1.4 or
-newer, and binding fails closed if that installed version cannot be resolved.
 
 The bridge accepts optional `{"payload":{"key":"value"}}` input for any enabled,
 repo-bound pipeline, whether or not its spec declares a trigger. It rejects a raw

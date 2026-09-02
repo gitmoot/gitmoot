@@ -17,8 +17,6 @@ const sources = [
   'docs/events.md',
   'docs/heartbeats.md',
   'docs/pipelines.md',
-  'docs/activepieces.md',
-  'docs/gmail.md',
   'docs/parallel-jobs.md',
   'docs/cockpit-orchestrate.md',
   'website/docs/dashboard/overview.md',

@@ -123,36 +123,26 @@ func TestLoadDescriptionValidation(t *testing.T) {
 	}
 }
 
-func TestLoadEmailTriggerDefaultsAndValidation(t *testing.T) {
-	loaded, err := Load([]byte("name: mail\nrepo: gitmoot/gitmoot\ntrigger:\n  kind: email\nstages:\n  - {id: run, cmd: echo}\n"))
-	if err != nil {
-		t.Fatalf("Load email trigger: %v", err)
-	}
-	if loaded.Trigger == nil || loaded.Trigger.Connection != "gmail-imap" || loaded.Trigger.Mailbox != "INBOX" {
-		t.Fatalf("trigger defaults = %+v", loaded.Trigger)
-	}
-	mapped, err := Load([]byte("name: mail\nrepo: gitmoot/gitmoot\ntrigger:\n  kind: email\n  map:\n    sender: from_address\n    subject: subject\n    received_at: date\nstages:\n  - {id: run, cmd: echo}\n"))
-	if err != nil {
-		t.Fatalf("Load mapped email trigger: %v", err)
-	}
-	if !reflect.DeepEqual(mapped.Trigger.Map, map[string]string{"received_at": "date", "sender": "from_address", "subject": "subject"}) {
-		t.Fatalf("trigger map = %+v", mapped.Trigger.Map)
-	}
-
-	cases := []struct{ name, trigger, want string }{
-		{"missing kind", "{}", "supported kinds: email"},
-		{"unknown kind", "{kind: webhook}", "supported kinds: email"},
-		{"unsafe connection", "{kind: email, connection: \"x']}}\"}", "must match"},
-		{"leading dash connection", "{kind: email, connection: -gmail}", "must match"},
-		{"leading underscore connection", "{kind: email, connection: _gmail}", "must match"},
-		{"mailbox expression", "{kind: email, mailbox: \"{{danger}}\"}", "must not contain"},
-		{"empty mapping", "{kind: email, map: {}}", "explicitly empty"},
-		{"invalid output", "{kind: email, map: {Bad-Key: subject}}", "must be 1-64 bytes"},
-		{"invalid selector", "{kind: email, map: {subject: '{{trigger.subject}}'}}", "use one of: subject, from_address, text, message_id, date"},
+func TestLoadRejectsRemovedEmailTrigger(t *testing.T) {
+	cases := []struct {
+		name string
+		spec string
+		want string
+	}{
+		{
+			name: "email kind",
+			spec: "name: mail\nrepo: gitmoot/gitmoot\ntrigger: {kind: email}\nstages:\n  - {id: run, cmd: echo}\n",
+			want: "supported kind: pipeline",
+		},
+		{
+			name: "email fields",
+			spec: "name: mail\nrepo: gitmoot/gitmoot\ntrigger: {kind: pipeline, pipeline: upstream, connection: gmail-imap}\nstages:\n  - {id: run, cmd: echo}\n",
+			want: "field connection not found",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := Load([]byte("name: mail\nrepo: gitmoot/gitmoot\ntrigger: " + tc.trigger + "\nstages:\n  - {id: run, cmd: echo}\n"))
+			_, err := Load([]byte(tc.spec))
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("Load error = %v, want %q", err, tc.want)
 			}
@@ -168,18 +158,15 @@ func TestLoadPipelineTriggerValidation(t *testing.T) {
 	if loaded.Trigger == nil || loaded.Trigger.Pipeline != "upstream" {
 		t.Fatalf("pipeline trigger = %+v", loaded.Trigger)
 	}
-	if loaded.Trigger.Connection != "" || loaded.Trigger.Mailbox != "" {
-		t.Fatalf("pipeline trigger received email defaults: %+v", loaded.Trigger)
-	}
 
 	cases := []struct {
 		name, spec, want string
 	}{
 		{"missing upstream", "name: downstream\nrepo: owner/repo\ntrigger: {kind: pipeline}\nstages: [{id: run, cmd: echo}]\n", "requires an upstream pipeline name"},
 		{"self reference", "name: downstream\nrepo: owner/repo\ntrigger: {kind: pipeline, pipeline: downstream}\nstages: [{id: run, cmd: echo}]\n", "cannot reference itself"},
-		{"connection field", "name: downstream\nrepo: owner/repo\ntrigger: {kind: pipeline, pipeline: upstream, connection: gmail-imap}\nstages: [{id: run, cmd: echo}]\n", "email-only fields"},
-		{"mailbox field", "name: downstream\nrepo: owner/repo\ntrigger: {kind: pipeline, pipeline: upstream, mailbox: INBOX}\nstages: [{id: run, cmd: echo}]\n", "email-only fields"},
-		{"map field", "name: downstream\nrepo: owner/repo\ntrigger: {kind: pipeline, pipeline: upstream, map: {subject: subject}}\nstages: [{id: run, cmd: echo}]\n", "email-only fields"},
+		{"connection field", "name: downstream\nrepo: owner/repo\ntrigger: {kind: pipeline, pipeline: upstream, connection: gmail-imap}\nstages: [{id: run, cmd: echo}]\n", "field connection not found"},
+		{"mailbox field", "name: downstream\nrepo: owner/repo\ntrigger: {kind: pipeline, pipeline: upstream, mailbox: INBOX}\nstages: [{id: run, cmd: echo}]\n", "field mailbox not found"},
+		{"map field", "name: downstream\nrepo: owner/repo\ntrigger: {kind: pipeline, pipeline: upstream, map: {subject: subject}}\nstages: [{id: run, cmd: echo}]\n", "field map not found"},
 		{"schedule hybrid", "name: downstream\nrepo: owner/repo\nschedule: {interval: 1h}\ntrigger: {kind: pipeline, pipeline: upstream}\nstages: [{id: run, cmd: echo}]\n", "schedule+pipeline hybrid semantics are not supported"},
 	}
 	for _, tc := range cases {
@@ -268,11 +255,11 @@ stages:
 }
 
 func TestLoadValidTriggeredImplementSpec(t *testing.T) {
-	const spec = `name: mail-fix
+	const spec = `name: chained-fix
 repo: owner/repo
 trigger:
-  kind: email
-  map: {subject: subject}
+  kind: pipeline
+  pipeline: upstream
 allow_triggered_writes: true
 stages:
   - id: fix
@@ -479,7 +466,7 @@ func TestLoadValidationErrors(t *testing.T) {
 		},
 		{
 			name:    "triggered implement without allow rejected",
-			spec:    "name: p\nrepo: owner/repo\ntrigger: {kind: email}\nstages:\n  - {id: a, agent: rev, prompt: hi, action: implement, write: true}\n",
+			spec:    "name: p\nrepo: owner/repo\ntrigger: {kind: pipeline, pipeline: upstream}\nstages:\n  - {id: a, agent: rev, prompt: hi, action: implement, write: true}\n",
 			wantSub: "set allow_triggered_writes: true",
 		},
 		{
@@ -735,7 +722,7 @@ stages:
 		{"check retries elsewhere", "name: p\nstages:\n- {id: a, agent: w, prompt: x, check_retries: 0}\n", "sets check_retries"},
 		{"negative check retries", "name: p\nstages:\n- {id: a, agent: w, action: produce, prompt: x, write: true, writes: [/data], check: true, check_retries: -1}\n", "check_retries must be >= 0"},
 		{"scheduled gate", "name: p\nschedule: {interval: 1h}\nstages:\n- {id: a, agent: w, action: produce, prompt: x, write: true, writes: [/data]}\n", "allow_scheduled_writes: true"},
-		{"triggered gate", "name: p\nrepo: owner/repo\ntrigger: {kind: email}\nstages:\n- {id: a, agent: w, action: produce, prompt: x, write: true, writes: [/data]}\n", "allow_triggered_writes: true"},
+		{"triggered gate", "name: p\nrepo: owner/repo\ntrigger: {kind: pipeline, pipeline: upstream}\nstages:\n- {id: a, agent: w, action: produce, prompt: x, write: true, writes: [/data]}\n", "allow_triggered_writes: true"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -886,10 +873,10 @@ func TestEffectiveSuccessDecisions(t *testing.T) {
 	}
 }
 
-// A trigger-bound pipeline without a repo would make the bridge 400 on every
-// email; validation refuses it at add time instead.
-func TestLoadEmailTriggerRequiresRepo(t *testing.T) {
-	_, err := Load([]byte("name: mail\ntrigger:\n  kind: email\nstages:\n  - {id: run, cmd: echo}\n"))
+// A pipeline-chain trigger without a repo would make the bridge reject every
+// downstream run, so validation refuses it at add time.
+func TestLoadPipelineTriggerRequiresRepo(t *testing.T) {
+	_, err := Load([]byte("name: downstream\ntrigger:\n  kind: pipeline\n  pipeline: upstream\nstages:\n  - {id: run, cmd: echo}\n"))
 	if err == nil || !strings.Contains(err.Error(), "declares a trigger but no repo") {
 		t.Fatalf("Load error = %v, want repo-required error", err)
 	}

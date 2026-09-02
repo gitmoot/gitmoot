@@ -74,7 +74,6 @@ normal job data; treat external content as stored Gitmoot data.
 
 ## Reaching the bridge from a container
 
-Use `http://host.docker.internal:8791` (Docker Desktop) or the docker bridge
-IP such as `http://172.17.0.1:8791` on Linux, passing the token from
-`bridge.token`. This is the seam the gitmoot Activepieces piece uses - see
-[Connect Gmail To A Pipeline](../workflows/gmail-pipeline-workflow.md).
+Use `http://host.docker.internal:8791` (Docker Desktop) or the Docker bridge
+IP, such as `http://172.17.0.1:8791` on Linux, passing the token from
+`bridge.token`.

@@ -2485,4 +2485,9 @@ DROP TABLE IF EXISTS eval_review_items;
 DROP TABLE IF EXISTS eval_runs;
 DROP TABLE IF EXISTS eval_artifacts;
 	`,
+	// #1755 removes the retired Activepieces flow ownership state. Pipeline-chain
+	// triggers remain in pipeline_trigger_states and are intentionally unaffected.
+	`
+ALTER TABLE pipelines DROP COLUMN trigger_binding;
+	`,
 }

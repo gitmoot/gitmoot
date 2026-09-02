@@ -13,10 +13,9 @@ import (
 // migration never silently re-points these tests at somebody else's entry.
 const skillOptRemovalMarker = "ALTER TABLE agent_template_versions DROP COLUMN canary_sample"
 
-// releasedMigrationsBeforeSkillOptRemoval returns the migration prefix as it
-// shipped BEFORE #1752 — every migration except the removal itself. It removes
-// that one entry rather than slicing off the tail so a reordered slice cannot
-// produce a synthetic "released" schema that already contains the removal.
+// releasedMigrationsBeforeSkillOptRemoval returns the strict migration prefix
+// that shipped before #1752. Later reductions may append new migrations, but a
+// previous-release fixture must not apply them under shifted version numbers.
 func releasedMigrationsBeforeSkillOptRemoval(t *testing.T) []string {
 	t.Helper()
 	index := -1
@@ -31,10 +30,7 @@ func releasedMigrationsBeforeSkillOptRemoval(t *testing.T) []string {
 	if index < 0 {
 		t.Fatalf("marker %q matches no migration", skillOptRemovalMarker)
 	}
-	released := make([]string, 0, len(migrations)-1)
-	released = append(released, migrations[:index]...)
-	released = append(released, migrations[index+1:]...)
-	return released
+	return append([]string(nil), migrations[:index]...)
 }
 
 // TestSkillOptRemovalMigrationReconcilesCandidateAndCanaryRows is the data test

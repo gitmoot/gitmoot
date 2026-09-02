@@ -6,11 +6,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
+	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	yaml "gopkg.in/yaml.v3"
@@ -18,8 +20,7 @@ import (
 
 // TestPipelineBundleRoundTripE2E drives the complete offline sharing chain over
 // two independent Gitmoot homes and repositories. Both pipeline stages execute
-// through the real shell worker; no LLM, GitHub, Activepieces, or other network
-// service participates.
+// through the real shell worker; no LLM, GitHub, or network service participates.
 func TestPipelineBundleRoundTripE2E(t *testing.T) {
 	ctx := context.Background()
 	homeA, _, storeA := heartbeatLoopE2EHome(t)
@@ -34,7 +35,7 @@ func TestPipelineBundleRoundTripE2E(t *testing.T) {
 
 	cmd := "test -d /tmp && " + pipelineStageResultCmd("approved", "command collected", nil)
 	specYAML := "# shared pipeline comment\nname: share-flow # preserve-name-comment\nrepo: source/project # preserve-repo-comment\n" +
-		"trigger:\n  kind: email\n  connection: shared-imap\n" +
+		"trigger:\n  kind: pipeline\n  pipeline: upstream\n" +
 		"stages:\n  # preserve-stage-comment\n" +
 		pipelineE2EStage("collect", cmd, "") +
 		"  - id: review\n    agent: exported-reviewer\n    prompt: Review collected output.\n    needs: [collect]\n"
@@ -42,10 +43,6 @@ func TestPipelineBundleRoundTripE2E(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if code := Run([]string{"pipeline", "add", specFile, "--home", homeA}, &stdout, &stderr); code != 0 {
 		t.Fatalf("pipeline add exit=%d stderr=%s", code, stderr.String())
-	}
-	const secretMarker = "DO-NOT-EXPORT-BINDING-CREDENTIAL"
-	if err := storeA.SetPipelineTriggerBinding(ctx, "share-flow", `{"flow_id":"`+secretMarker+`","binding_id":"local-only"}`); err != nil {
-		t.Fatal(err)
 	}
 
 	bundleDir := filepath.Join(t.TempDir(), "share-flow.bundle")
@@ -79,8 +76,8 @@ func TestPipelineBundleRoundTripE2E(t *testing.T) {
 	if manifest.Repo != pipelineBundleRepoParameter || manifest.SpecSHA256 != pipeline.Hash(bundledSpec) {
 		t.Fatalf("manifest repo/hash = %q/%q", manifest.Repo, manifest.SpecSHA256)
 	}
-	if len(manifest.Requirements.Connections) != 1 || manifest.Requirements.Connections[0].Name != "shared-imap" {
-		t.Fatalf("connection requirements = %+v", manifest.Requirements.Connections)
+	if !reflect.DeepEqual(manifest.Requirements.UpstreamPipelines, []string{"upstream"}) {
+		t.Fatalf("upstream requirements = %+v", manifest.Requirements.UpstreamPipelines)
 	}
 	if len(manifest.Warnings) != 1 || !strings.Contains(manifest.Warnings[0], "/tmp") {
 		t.Fatalf("absolute path warnings = %v", manifest.Warnings)
@@ -100,8 +97,8 @@ func TestPipelineBundleRoundTripE2E(t *testing.T) {
 		t.Fatalf("template snapshot differs from agenttemplate.Export\nwant:\n%q\ngot:\n%q", wantTemplate, got)
 	}
 	for _, path := range []string{filepath.Join(bundleDir, "bundle.yaml"), filepath.Join(bundleDir, "spec.yaml"), filepath.Join(bundleDir, "templates", templateID+".md")} {
-		if raw := readPipelineBundleTestFile(t, path); bytes.Contains(raw, []byte(secretMarker)) || bytes.Contains(raw, []byte("trigger_binding")) {
-			t.Fatalf("bundle file %s contains binding/credential material", path)
+		if raw := readPipelineBundleTestFile(t, path); bytes.Contains(raw, []byte("trigger_binding")) {
+			t.Fatalf("bundle file %s contains removed trigger binding state", path)
 		}
 	}
 
@@ -118,7 +115,7 @@ func TestPipelineBundleRoundTripE2E(t *testing.T) {
 	if code := Run([]string{"pipeline", "import", bundleDir, "--home", homeB, "--repo", "target/project", "--agent-map", "exported-reviewer=local-reviewer"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("pipeline import exit=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
-	for _, want := range []string{"Requirements report:", "runtime shell: present", "connection email/shared-imap: unchecked", "warning:", "imported pipeline share-flow (disabled"} {
+	for _, want := range []string{"Requirements report:", "runtime shell: present", "upstream pipeline upstream: missing", "warning:", "imported pipeline share-flow (disabled"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("import stdout missing %q:\n%s", want, stdout.String())
 		}
@@ -144,10 +141,8 @@ func TestPipelineBundleRoundTripE2E(t *testing.T) {
 		t.Fatalf("stored spec lost comments:\n%s", stored.SpecYAML)
 	}
 
-	// Enable the registry row directly: the E2E is deliberately zero-network,
-	// while the user-facing enable command also materializes the email flow in
-	// Activepieces. Trigger binding itself is covered by pipeline_trigger_test;
-	// this test owns bundle portability and execution.
+	// Enable the imported registry row directly. This E2E owns bundle
+	// portability and execution; trigger firing is covered separately.
 	if err := storeB.SetPipelineEnabled(ctx, "share-flow", true); err != nil {
 		t.Fatalf("enable imported pipeline: %v", err)
 	}
@@ -159,28 +154,25 @@ func TestPipelineBundleRoundTripE2E(t *testing.T) {
 	runID := strings.TrimSpace(stdout.String())
 	enqueue := newPipelineStageEnqueuer(storeB, homeB)
 	worker := defaultJobWorker(storeB, io.Discard, homeB)
-	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
-	for i := 0; i < 8; i++ {
-		if err := runEnabledRepoWorkerTicksTracked(ctx, storeB, worker, 1, "", io.Discard, now, nil, nil); err != nil {
+	run := waitForPipelineRunToSettle(t, func(i int) {
+		tickNow := time.Now().UTC()
+		if err := runEnabledRepoWorkerTicksTracked(ctx, storeB, worker, 1, "", io.Discard, tickNow, nil, nil); err != nil {
 			t.Fatalf("worker tick %d: %v", i, err)
 		}
-		if err := runPipelineScanOnce(ctx, storeB, enqueue, now); err != nil {
+		if err := runPipelineScanOnce(ctx, storeB, enqueue, tickNow); err != nil {
 			t.Fatalf("pipeline scan %d: %v", i, err)
 		}
-		run, _, err := storeB.GetPipelineRun(ctx, runID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if run.State != pipeline.RunRunning {
-			break
-		}
-	}
-	run, found, err := storeB.GetPipelineRun(ctx, runID)
-	if err != nil || !found || run.State != pipeline.RunSucceeded {
+	}, func() (db.PipelineRun, bool, error) {
+		return storeB.GetPipelineRun(ctx, runID)
+	})
+	if run.State != pipeline.RunSucceeded {
+		collect := stageRow(t, storeB, runID, "collect")
+		collectJob, collectJobErr := storeB.GetJob(ctx, collect.JobID)
+		collectEvents, collectEventsErr := storeB.ListJobEvents(ctx, collect.JobID)
 		review := stageRow(t, storeB, runID, "review")
 		agent, agentErr := storeB.GetAgent(ctx, "local-reviewer")
 		events, eventsErr := storeB.ListJobEvents(ctx, review.JobID)
-		t.Fatalf("imported run = %+v, found=%v err=%v; review=%+v; agent=%+v agentErr=%v; events=%+v eventsErr=%v", run, found, err, review, agent, agentErr, events, eventsErr)
+		t.Fatalf("imported run = %+v; collect=%+v job=%+v jobErr=%v events=%+v eventsErr=%v; review=%+v; agent=%+v agentErr=%v; events=%+v eventsErr=%v", run, collect, collectJob, collectJobErr, collectEvents, collectEventsErr, review, agent, agentErr, events, eventsErr)
 	}
 
 	t.Run("name collision", func(t *testing.T) {
@@ -217,6 +209,25 @@ func TestPipelineBundleRoundTripE2E(t *testing.T) {
 			t.Fatalf("code=%d stdout=%s stderr=%s", code, out.String(), errBuf.String())
 		}
 	})
+}
+
+func waitForPipelineRunToSettle(t *testing.T, tick func(int), load func() (db.PipelineRun, bool, error)) db.PipelineRun {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for i := 0; ; i++ {
+		tick(i)
+		run, found, err := load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !found {
+			t.Fatal("pipeline run disappeared while waiting for worker completion")
+		}
+		if run.State != pipeline.RunRunning || !time.Now().Before(deadline) {
+			return run
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func pipelineBundleCheckout(t *testing.T, remote string) string {
