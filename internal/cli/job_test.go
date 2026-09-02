@@ -306,7 +306,7 @@ func TestRunJobWatchTranscriptRendersExplicitShellLog(t *testing.T) {
 		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo"}),
 	}, "succeeded")
 	store.Close()
-	logPath := filepath.Join(home, "cockpit shell.log")
+	logPath := filepath.Join(home, "runtime shell.log")
 	if err := os.WriteFile(logPath, []byte("working\ndone without newline"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -394,7 +394,7 @@ func TestRunJobTranscriptRequiresMarkdownAndRetainedLog(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	code := Run([]string{"job", "transcript", "job-no-log", "--home", home, "--export", "md", "--runtime", runtime.ShellRuntime}, &stdout, &stderr)
-	if code != 1 || !strings.Contains(stderr.String(), "cockpit logs may already have been delivered and removed") {
+	if code != 1 || !strings.Contains(stderr.String(), "transcript log unavailable") {
 		t.Fatalf("missing-log code=%d stderr=%q", code, stderr.String())
 	}
 }

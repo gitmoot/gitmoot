@@ -2329,7 +2329,7 @@ func summarizeRuns(jobs []db.Job) []dashboard.RunSummary {
 		}
 		// A run's "done" count uses FINAL (resumability) semantics: a blocked job is
 		// not counted as done because it can still resume via RetryJob (#632),
-		// keeping the run active — mirroring runStateActive and the cockpit.
+		// keeping the run active and matching runStateActive.
 		if workflow.IsFinalJobState(strings.TrimSpace(j.State)) {
 			a.done++
 		}
@@ -2406,7 +2406,7 @@ const maxRunSummaries = 60
 func runStateActive(state dashboard.NodeState) bool {
 	// Active is the negation of FINAL (resumability) semantics: a blocked run is
 	// still "active" because it can resume via RetryJob (#632). Uses IsFinalJobState
-	// (not IsSettledJobState) so blocked surfaces as live, matching the cockpit.
+	// rather than IsSettledJobState so blocked work remains live.
 	return !workflow.IsFinalJobState(string(state))
 }
 

@@ -148,8 +148,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 
 	// The one-shot `gitmoot doctor` opts into the live claude probe (LiveProbe)
 	// so a cached-creds box is reported accurately rather than false-warned. The
-	// dashboard (dashboard_tui.go) leaves LiveProbe false so its refresh loop
-	// never spawns claude.
+	// dashboard leaves LiveProbe false so refreshes never spawn claude.
 	// Resolve paths best-effort so the daemon-aware claude auth check (#427) can
 	// locate the running daemon. A failure here (no initialized home) just leaves
 	// Paths zero, which skips the daemon check and keeps the shell-local one —

@@ -86,9 +86,8 @@ type Checker struct {
 	// LiveProbe opts the claude auth check into a live `claude -p` probe when the
 	// auth env is not Ready, instead of false-reporting OK:false on a cached-creds
 	// box. It is opt-in because GlobalChecks is re-run on every dashboard refresh
-	// (dashboard_tui.go) and an unconditional probe would spawn claude each time.
-	// The one-shot `gitmoot doctor` (root.go) sets this true; the dashboard leaves
-	// it false so a refresh never spawns claude.
+	// and an unconditional probe would spawn claude each time. The one-shot
+	// `gitmoot doctor` sets this true; dashboards leave it false.
 	LiveProbe bool
 	// Paths locates the running daemon for the daemon-aware claude auth check
 	// (issue #427). When unset, the daemon check is skipped and only the

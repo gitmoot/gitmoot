@@ -15,6 +15,7 @@ func reorderFlagArgs(args []string, stringFlags map[string]struct{}, boolFlags m
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
 		if arg == "--" {
+			flags = append(flags, arg)
 			positionals = append(positionals, args[index+1:]...)
 			break
 		}

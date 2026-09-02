@@ -1,14 +1,7 @@
-// Package cockpit is the daemon's herdr client: a timeout-bounded, CLI-only
-// (no Go import of herdr) seam used by the organization wake and directive
-// system to ask whether herdr is reachable, to deliver a prompt to a named
-// pane, and to resolve a pane binding to a live pane id. The org provider in
-// herdr_org.go shares the same runner.
-//
-// It used to also own the `gitmoot orchestrate --cockpit` pane wrapper, which
-// opened one live herdr pane per delegation subagent. That wrapper was deleted
-// with #1753: it had never opened a pane in production (cockpit_panes carried
-// zero rows for its whole lifetime). Every call here is still best-effort and
-// timeout-bounded, so a herdr failure degrades a wake rather than failing work.
+// Package cockpit provides the timeout-bounded Herdr client and organization
+// provider used by wake and directive delivery. It invokes the Herdr CLI rather
+// than importing Herdr and treats reachability failures as unavailable service,
+// so delivery failures do not fail the underlying work.
 package cockpit
 
 import (

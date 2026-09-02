@@ -46,10 +46,10 @@ type jobWorker struct {
 	ConfigHomeExplicit bool
 	AgentLookup        func(context.Context, string) (db.Agent, error)
 	AdapterFactory     func(runtime.Agent, string) (workflow.DeliveryAdapter, error)
-	// OutputAdapterFactory rebuilds a production runtime adapter around the one
-	// shared live-output writer used by pipeline progress and cockpit. Tests that
-	// inject an opaque fake AdapterFactory may leave this nil and still exercise
-	// elapsed-only progress without replacing their fake.
+	// OutputAdapterFactory rebuilds a production runtime adapter around the
+	// shared live-output writer used by progress and retained transcript capture.
+	// Tests that inject an opaque fake AdapterFactory may leave this nil and still
+	// exercise elapsed-only progress without replacing their fake.
 	OutputAdapterFactory func(runtime.Agent, string, io.Writer) (workflow.DeliveryAdapter, error)
 	StartAdapterFactory  func(execbackend.Backend, string, string) (runtime.Adapter, error)
 	// ExecutionBackendFactory is nil on hand-built/test workers that intentionally
@@ -61,8 +61,8 @@ type jobWorker struct {
 	// GITMOOT-IMPL: RemoteEnvdEndpointResolver is an offline-test seam. Production leaves it
 	// nil and resolves envd from [remote_exec].e2b_domain or the provider response.
 	RemoteEnvdEndpointResolver func(sandboxID string, port int) string
-	// executionRunner is run-scoped state on jobWorker's value receiver. Cockpit
-	// adapter rebuilds reuse it so enabling live logs cannot escape the backend.
+	// executionRunner is run-scoped state on jobWorker's value receiver. Runtime
+	// adapter rebuilds reuse it so live logs cannot escape the backend.
 	executionRunner subprocess.Runner
 	// CheckoutValidator and WorkflowFactory are test overrides. Production leaves
 	// them nil so checkoutForJob/workflowForJob must consume the resolved runner.
@@ -2702,10 +2702,10 @@ func (w jobWorker) admissionEstimate(ctx context.Context, job db.Job) admissionE
 	return perJobAdmissionEstimate(ctx, w.Store, job, policy)
 }
 
-// orchestratePolicy loads the host-level [orchestrate] cockpit policy, mirroring
-// parallelSessionPolicy: an implicit/empty config home uses the defaults, and an
-// explicit home loads from the config file. It is best-effort at the call site —
-// a load error degrades to no cockpit (the job runs unwrapped).
+// orchestratePolicy loads the host-level [orchestrate] policy, mirroring
+// parallelSessionPolicy: an implicit or empty config home uses the defaults, and
+// an explicit home loads from the config file. A load error is best-effort at
+// the call site and leaves the workflow engine on its defaults.
 func (w jobWorker) orchestratePolicy() (config.OrchestratePolicy, error) {
 	if !w.ConfigHomeExplicit && strings.TrimSpace(w.ConfigHome) == "" {
 		return config.DefaultOrchestratePolicy(), nil

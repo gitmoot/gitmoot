@@ -74,11 +74,8 @@ func TestEmitPipelineProgressThresholdCadenceAndCancel(t *testing.T) {
 }
 
 // The retained transcript log and the pipeline progress tracker must share ONE
-// runtime output writer: the log, the follower and the tracker all see the same
-// line. This used to be pinned through the cockpit tee (deleted with #1753); the
-// property belongs to the universal path — openRetainedTranscriptLog plus
-// appendDeliveryAdapterOutput — which is what every job goes through, cockpit or
-// not.
+// The retained transcript, follower, and tracker share the universal runtime
+// output writer, so all three observe the same line.
 func TestRetainedTranscriptAndProgressShareRuntimeOutput(t *testing.T) {
 	home := t.TempDir()
 	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard, home)
