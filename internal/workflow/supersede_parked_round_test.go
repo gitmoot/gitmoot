@@ -147,13 +147,11 @@ func TestSupersedeRecoveryRefusesAParkedRepairRound(t *testing.T) {
 	sibling := seedRoundWithSupersededSibling(t, store, engine, true)
 
 	before := countJobs(t, store, "")
-	observed := mustJob(t, store, sibling)
 	// Enter through the DEBT SWEEP, the production caller, so the assertion below covers
 	// the bookkeeping too: a refusal that still records the debt paid loses the work for
 	// good, because after the repair nothing re-drives it.
 	advanced, err := engine.CompletePendingSupersedeFinalization(ctx, sibling)
 	after := countJobs(t, store, "")
-	_ = observed
 
 	if after != before {
 		t.Fatalf("job count %d -> %d: the supersede recovery advanced the coordinator's DAG past a needs_repair round (advanced=%v err=%v)",
@@ -340,4 +338,40 @@ func TestSupersedeRecoveryAdvancesAfterTheRoundIsRepaired(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSupersedeRecoveryRefusesBeforeClaimingOwnership distinguishes the PRE-CLAIM
+// refusal from the downstream typed guard, which the other arms cannot.
+//
+// Review measured the gap and it was mine: discarding coordinatorRoundNeedsRepair's bool
+// leaves the ENTIRE workflow package green, because the advance then takes the lease,
+// writes the claim bracket, reaches escalationRepairBlock and returns the typed refusal
+// that maps to the same (false, nil). Every quantity the other tests assert - job count,
+// retry child, advance_confirmed, finalize_completed - is identical either way. That is
+// the fifth vacuous instrument found in this campaign and the first one in code I added
+// in response to a review.
+//
+// The observable that DOES separate them is the claim bracket: a pass that refuses before
+// claiming writes no JobEventSupersedeAdvanceClaimed at all. That also states the point
+// of the pre-flight in the assertion itself - do not take a lease or stamp a claim for
+// work this pass cannot perform.
+func TestSupersedeRecoveryRefusesBeforeClaimingOwnership(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.EscalationNotifier = &recordingNotifier{}
+	sibling := seedRoundWithSupersededSibling(t, store, engine, true)
+
+	if _, err := engine.CompletePendingSupersedeFinalization(ctx, sibling); err != nil && !isDelegationPolicyOutcome(err) {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	if got := countWorkflowJobEvents(t, store, sibling, JobEventSupersedeAdvanceClaimed); got != 0 {
+		t.Fatalf("%s events = %d, want 0: the pass claimed the advance bracket for work a parked round makes impossible, "+
+			"so the refusal happened after the lease and the claim rather than before them", JobEventSupersedeAdvanceClaimed, got)
+	}
+	// THE LEASE IS DELIBERATELY NOT ASSERTED. advanceSupersededChildAtGeneration releases
+	// it on every exit via defer, so it is absent after the pass either way and cannot
+	// discriminate - asserting it would be a sixth vacuous line inside the test written to
+	// fix the fifth. The claim bracket is the one durable trace that differs.
 }

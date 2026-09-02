@@ -327,7 +327,15 @@ mergeable with CI green; `merge_rule = "owner"` means the owner merges. The
 field is **advisory** — `merge_gate.go` never reads it (`internal/config/org.go`
 calls it "deliberately advisory in phase 1a"), so nothing mechanically stops a
 merge you are not entitled to make; the gate enforces exact-head review, CI and
-attribution, never role authority. The `[org.roles."<role>"]` block in the
+attribution, never role authority. Advisory cuts the other way too: **an armed
+engine merge gate may merge on its own approval-plus-green conditions, with no
+`merge_rule` holder acting at all**, so a holder MUST NOT rely on parking a local
+commit to protect a merge window. #1731 merged itself at 2026-09-02T11:23:26Z as
+squash `250b3fad` ("Gitmoot merge review-pr-1731-3f3a1026", committer GitHub);
+`merge_gates` row 963 flipped to `state=merged` four seconds later and six
+seconds *before* the approving verdict comment posted, and four fixes held back
+to protect the holder's window were excluded by that merge. Land work or record
+it durably; a window you do not control is not a queue. The
 gitmoot config is the authority of record and this file only describes it, so
 settle any future disagreement with a config read — `gitmoot org chart` prints
 `merge=<rule>` per role, `gitmoot org brief --role <role>` prints

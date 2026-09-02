@@ -36,6 +36,13 @@ func TestPollOnceClassifiesForgeFailuresByAnswerNotByTransience(t *testing.T) {
 		{name: "cancellation is not an answer", err: context.Canceled, wantPollErr: true, wantRecord: 0},
 		{name: "parse failure is not an answer", err: errors.New("parse gh output: invalid character 'x'"), wantPollErr: true, wantRecord: 0},
 		{name: "transient stays transient", err: errors.New("dial tcp: connection refused"), wantPollErr: true, wantRecord: 0},
+		// THESE TWO REACH THE COMPETING-STATUS FILTER, which every row above returns
+		// before: they carry the words "not found" AND a competing status. Review measured
+		// that deleting the filter entirely left this package green, because no existing
+		// row got past the earlier `not found` guard - a live production loop with zero
+		// coverage, and it is the exact heuristic I flagged as my risky over-correction.
+		{name: "429 body mentioning not found is not an answer", err: errors.New("gh: API rate limit exceeded, pull request not found (HTTP 429)"), wantPollErr: true, wantRecord: 0},
+		{name: "403 body mentioning not found is not an answer", err: errors.New("gh: Resource not accessible, not found (HTTP 403)"), wantPollErr: true, wantRecord: 0},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()

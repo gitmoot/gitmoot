@@ -1226,13 +1226,20 @@ func (e Engine) advanceSupersededChildAtGeneration(ctx context.Context, jobID st
 	}
 	// REFUSE BEFORE CLAIMING ANYTHING. A coordinator whose escalation round is parked in
 	// needs_repair cannot be advanced, so this pass must not take the ownership lease or
-	// write the claim bracket for work it cannot do (#1673). Read-only on purpose: the
-	// parked round already emitted its one repair signal and whichever advance path hits
-	// the full guard blocks the task, so refusing here writes nothing and simply leaves
-	// the debt outstanding for the poll after the repair.
+	// write the claim bracket for work it cannot do (#1673).
 	//
-	// The typed check after the advance stays as defence in depth: this one is an
-	// optimisation and a hygiene fix, that one is the correctness barrier.
+	// WRITES NOTHING, INCLUDING NO TASK BLOCK, and that is a real behavioural difference
+	// rather than a detail: because this pre-flight always short-circuits when the round
+	// is parked, escalationRepairBlock's blockTask is now UNREACHABLE from this route, so
+	// the coordinator's task keeps whatever state the escalation left it in
+	// (awaiting_human) instead of moving to blocked. That matches the round's own design
+	// - engine_escalation_resume.go states a parked round deliberately does not set a task
+	// state - and the operator signal is the round's needs-repair event plus the repair
+	// command, not this path. An earlier version of this comment claimed the guard still
+	// blocked the task; review measured that false once the pre-flight was in front of it.
+	//
+	// The typed check after the advance stays as defence in depth: this one is a hygiene
+	// fix, that one is the correctness barrier.
 	if parked, err := e.coordinatorRoundNeedsRepair(ctx, jobID); err != nil {
 		return false, err
 	} else if parked {
