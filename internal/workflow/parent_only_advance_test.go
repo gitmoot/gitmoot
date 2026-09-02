@@ -3,6 +3,8 @@ package workflow
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -37,6 +39,13 @@ func TestParentOnlyAdvanceCannotRunTheChildsOwnAdvancement(t *testing.T) {
 	engine.Home = t.TempDir()
 	engine.DelegationCheckout = t.TempDir()
 	engine.DelegationWorktrees = manager
+	// AN EXISTING, VALIDATED, MANAGED PATH: derived from engine.Home in the layout
+	// allocation uses, and actually created on disk, so the cleanup has something real to
+	// remove and RemoveWorktreeForce is reached even on an early return.
+	childWorktree := filepath.Join(engine.Home, "worktrees", "gitmoot--gitmoot", "delegations", "parent-job", "api")
+	if err := os.MkdirAll(childWorktree, 0o755); err != nil {
+		t.Fatalf("create managed worktree: %v", err)
+	}
 
 	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coord", Type: "ask"}, JobPayload{
 		Repo:      "gitmoot/gitmoot",
@@ -67,12 +76,21 @@ func TestParentOnlyAdvanceCannotRunTheChildsOwnAdvancement(t *testing.T) {
 	insertFailedDelegationChild(t, store, db.Job{
 		ID: child, Agent: "api", Type: "review", ParentJobID: "parent-job", DelegationID: "api",
 	}, JobPayload{
-		Repo:         "gitmoot/gitmoot",
-		Branch:       "task-7",
-		TaskID:       "task-7",
-		ParentJobID:  "parent-job",
-		Sender:       "coord",
-		WorktreePath: "/tmp/gm-parent-only-child-worktree",
+		Repo:        "gitmoot/gitmoot",
+		Branch:      "task-7",
+		TaskID:      "task-7",
+		ParentJobID: "parent-job",
+		Sender:      "coord",
+		// A PRODUCTION-ROUTABLE READ-ONLY MARKER, ON THE PAYLOAD. isReadOnlyDelegationWorktree
+		// reads the PAYLOAD, not the job struct: an empty WorktreePath is false, then
+		// payload.ReadOnlyWorktree, then payload.DelegationID with a read-only action. The
+		// earlier fixture put DelegationID only on db.Job and used a /tmp path it never
+		// created, so the predicate was false and the deferred cleanup was a no-op on BOTH
+		// paths - which is why the full-AdvanceJob mutant survived. That was an artefact of
+		// the fixture, not a property of the code (#1673).
+		DelegationID:     "api",
+		ReadOnlyWorktree: true,
+		WorktreePath:     childWorktree,
 		Result: &AgentResult{
 			Decision:                    "failed",
 			Summary:                     "pull request #7 is no longer open",
