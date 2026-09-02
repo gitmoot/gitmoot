@@ -753,11 +753,23 @@ func (e Engine) applyResolutionEffectsFenced(ctx context.Context, parentJob db.J
 	if escalationPreRenewHook != nil {
 		escalationPreRenewHook(ctx, parentJob.ID, roundID)
 	}
+	// THE PERSISTED EXPIRY IS THE ONE THAT COUNTS. This value is what the store WRITES,
+	// so authority is bound to it rather than to a second clock reading taken after the
+	// call returns - a slow database call or a scheduler pause would otherwise leave the
+	// local deadline LATER than the row's, and another recoverer could legitimately
+	// acquire at the row's expiry while this pass believed it still held the fence
+	// (#1673).
+	preEffectUntil := time.Now().UTC().Add(escalationRecoveryLeaseTTL)
 	if renewed, err := e.Store.RenewEscalationRecoveryLease(ctx, parentJob.ID, roundID, owner,
-		time.Now().UTC().Add(escalationRecoveryLeaseTTL), time.Now().UTC()); err != nil {
+		preEffectUntil, time.Now().UTC()); err != nil {
 		return err
 	} else if !renewed {
 		// Lost between the fence and here: apply nothing.
+		return nil
+	} else if !time.Now().UTC().Before(preEffectUntil) {
+		// The write landed, but so late that the expiry it persisted has already
+		// elapsed. Accepting it as confirmed would claim authority the row no longer
+		// grants.
 		return nil
 	}
 	// A HEARTBEAT, NOT A ONE-SHOT RENEWAL. Git work has no bound, and a single fixed
@@ -778,7 +790,7 @@ func (e Engine) applyResolutionEffectsFenced(ctx context.Context, parentJob db.J
 	// So authority is bounded by what this pass can PROVE it holds: the expiry it last
 	// confirmed. A retry loop that ignores that boundary is not a retry policy, it is an
 	// unbounded extension of authority the store never granted (#1673).
-	confirmedUntil := time.Now().UTC().Add(escalationRecoveryLeaseTTL)
+	confirmedUntil := preEffectUntil
 	effectCtx, stopHeartbeat := context.WithCancel(ctx)
 	// ownershipLost is set ONLY by the heartbeat observing a genuine loss. It is a
 	// separate signal from effectCtx.Err() on purpose: this function cancels effectCtx
@@ -820,6 +832,15 @@ func (e Engine) applyResolutionEffectsFenced(ctx context.Context, parentJob db.J
 					continue
 				}
 				if !held {
+					ownershipLost.Store(true)
+					stopHeartbeat()
+					return
+				}
+				if !time.Now().UTC().Before(renewUntil) {
+					// A successful UPDATE that returned after the expiry it wrote grants
+					// nothing: the row is already reclaimable. Treating it as confirmed
+					// would extend authority past the persisted deadline, which is the
+					// same defect as retrying past it.
 					ownershipLost.Store(true)
 					stopHeartbeat()
 					return

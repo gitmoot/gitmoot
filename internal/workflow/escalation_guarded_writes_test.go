@@ -640,3 +640,74 @@ func TestRenewalErrorsAfterSuccessesStillCompleteTheRun(t *testing.T) {
 		t.Fatalf("receipts = %d, want exactly 1", got)
 	}
 }
+
+// TestLateRenewalDoesNotExtendAuthorityPastThePersistedExpiry is the P1 of the 6ea2f6b9
+// review. The bound must be the expiry the STORE HOLDS, not a clock reading taken after
+// the call returns: a slow renewal write persists an expiry that may already have
+// elapsed by the time it comes back, and accepting that as "confirmed" claims authority
+// the row no longer grants.
+//
+// The test forces exactly that: the renewal is delayed past the TTL it writes, so a
+// competitor can legitimately acquire at the persisted deadline - and the original pass
+// must already have cancelled its in-flight pre-effect.
+//
+// SEMANTIC REVERSION THIS KILLS: accept a late-returning successful renewal as confirmed
+// (drop the post-write expiry check), and the original keeps working while a competitor
+// owns the round.
+func TestLateRenewalDoesNotExtendAuthorityPastThePersistedExpiry(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.EscalationNotifier = &recordingNotifier{}
+	manager := pausedImplementEscalation(t, store, &engine)
+
+	originalTTL := escalationRecoveryLeaseTTL
+	escalationRecoveryLeaseTTL = 300 * time.Millisecond
+	t.Cleanup(func() { escalationRecoveryLeaseTTL = originalTTL })
+
+	round, ok := unsettledRound(t, store, "parent-job")
+	if !ok {
+		t.Fatal("no unsettled round")
+	}
+
+	// Every heartbeat renewal is DELAYED past the expiry it writes, so no renewal can
+	// ever confirm authority beyond the persisted deadline.
+	escalationRenewFaultHook = func(attempt int) error {
+		time.Sleep(2 * escalationRecoveryLeaseTTL)
+		return nil
+	}
+	t.Cleanup(func() { escalationRenewFaultHook = nil })
+
+	var cancelled atomic.Bool
+	var competitorAcquired atomic.Bool
+	manager.onAddCtx = func(effectCtx context.Context) {
+		select {
+		case <-effectCtx.Done():
+			cancelled.Store(true)
+		case <-time.After(3 * time.Second):
+		}
+		// At the persisted deadline the fence is reclaimable, and the original pass must
+		// already have stopped - which the assertion above establishes.
+		now := time.Now().UTC()
+		if taken, err := store.AcquireEscalationRecoveryLease(context.Background(), "parent-job",
+			round.RoundID, "competitor", now.Add(time.Minute), now); err == nil && taken {
+			competitorAcquired.Store(true)
+		}
+	}
+
+	if err := engine.ResolveEscalation(ctx, "parent-job", ResumeRetry, ""); err != nil {
+		t.Fatalf("ResolveEscalation: %v", err)
+	}
+	if !cancelled.Load() {
+		t.Fatal("the in-flight pre-effect kept running past the persisted expiry: authority was extended by a late renewal")
+	}
+	if !competitorAcquired.Load() {
+		t.Fatal("the fence never became reclaimable: this test cannot observe the hazard it is named for")
+	}
+	if got := countJobs(t, store, "/resume"); got != 0 {
+		t.Fatalf("resume jobs = %d, want 0 from a pass whose authority lapsed", got)
+	}
+	if got := countWorkflowJobEvents(t, store, "parent-job", escalationEffectsCompletedEvent); got != 0 {
+		t.Fatalf("receipts = %d, want 0", got)
+	}
+}
