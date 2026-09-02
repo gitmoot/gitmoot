@@ -1568,9 +1568,10 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 			bridgePrecondition: true,
 			want: []string{
 				"no implement job is recorded for this task",
-				"coordinator bridge",
-				"gitmoot job show <job-id>",
-				"gitmoot workflow note",
+				"NOT disqualified",
+				"attribution gap, not a failed independence check",
+				"gitmoot job record --agent <implementing-agent>",
+				"--type implement",
 			},
 			doNotWant: []string{"implemented in a pane"},
 		},
@@ -1579,9 +1580,10 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 			bridgePrecondition: true,
 			want: []string{
 				"no implement job is recorded for this task",
-				"coordinator bridge",
-				"gitmoot job show <job-id>",
-				"gitmoot workflow note",
+				"NOT disqualified",
+				"attribution gap, not a failed independence check",
+				"gitmoot job record --agent <implementing-agent>",
+				"--type implement",
 			},
 			doNotWant: []string{"implemented in a pane"},
 		},
@@ -1672,8 +1674,8 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 						}
 					}
 					if cause.bridgePrecondition {
-						assertCoordinatorBridgeRefusalPrecondition(t, decision.Reason.Render())
-						assertRenderedCoordinatorBridgeDecline(t, decision.Reason.Render(), "head123")
+						assertAttributionGapRemedy(t, decision.Reason.Render())
+						assertRenderedAttributionGapDecline(t, decision.Reason.Render(), "head123")
 					}
 				})
 			}
@@ -1681,22 +1683,33 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 	}
 }
 
-// boundCoordinatorBridgeRefusal is the clause the remedy must carry verbatim: the
-// precondition and the refusal bound to that precondition FAILING, as one span.
+// boundAttributionGapRemedy is the clause the attribution-gap decline must carry verbatim:
+// the runnable remedy, bound to the row that actually satisfies collectImplementerAttribution.
 //
-// It is pinned as a contiguous clause rather than as separate tokens on purpose. The remedy
-// is operator-facing instruction text -- whoever reads it treats it as the system telling
-// them what to do -- so the guard has to bind the prohibition to the condition, not merely
-// observe that both words occur somewhere in the sentence.
-const boundCoordinatorBridgeRefusal = "confirm an independent approval exists at this exact head; if it does not, do not bridge"
+// This replaced a clause pinning a COORDINATOR BRIDGE procedure (#1765). The bridge text was
+// the defect: it told an operator to merge on human judgment when the engine's own remedy --
+// recording a durable implement row -- was already available and unnamed. A guard that pins
+// the wrong remedy verbatim keeps it shipped, which is why this constant moved rather than
+// being deleted.
+const boundAttributionGapRemedy = "gitmoot job record --agent <implementing-agent> --repo <owner/repo> --type implement --decision implemented --task <task-id> --pr <number> --head-sha <sha>"
 
-// renderedCoordinatorBridgeDecline is the COMPLETE operator-facing text of the
-// no-implement-job decline, wrapper included.
+// forbiddenAttributionGapPermissions are phrasings that turn the decline into permission to
+// merge without independence. The gate still REFUSES on an attribution gap; only the remedy
+// changed. Any of these appearing in the reason means the refusal has been inverted.
+var forbiddenAttributionGapPermissions = []string{
+	"may bridge",
+	"bridge anyway",
+	"merge the lane",
+	"advisory",
+	"after manual judgment",
+}
+
+// renderedAttributionGapDecline is the COMPLETE operator-facing text of the attribution-gap
+// decline, wrapper included.
 //
 // Pinning the constant is not sufficient. The reason an operator actually reads is assembled
 // AROUND the constant in reviewAndCIGateMiss -- "review gate: " + err + " for head " + sha --
-// so text added at the renderer ("this restriction is advisory, so a coordinator may bridge
-// anyway after manual judgment") leaves noImplementJobAttributionReason byte-identical and
+// so text added at the renderer leaves noImplementJobAttributionReason byte-identical and
 // every constant-level guard green while changing what the reader is told to do.
 //
 // This pins what is READ, not what is stored.
@@ -1709,103 +1722,105 @@ const boundCoordinatorBridgeRefusal = "confirm an independent approval exists at
 //
 //	append at the RENDERER  -> this guard FAILS (both cause paths); the byte pin passes
 //	append inside the CONSTANT -> the byte pin FAILS; this guard passes (both sides move together)
-//
-// A hardcoded literal here would catch constant mutations too and collapse the two guards into
-// one aggregate wearing two names, which is the thing this file keeps having to relearn.
-func renderedCoordinatorBridgeDecline(headSHA string) string {
+func renderedAttributionGapDecline(headSHA string) string {
 	return "review gate: " + noImplementJobAttributionReason + " for head " + headSHA
 }
 
-func assertRenderedCoordinatorBridgeDecline(t *testing.T, reason, headSHA string) {
+func assertRenderedAttributionGapDecline(t *testing.T, reason, headSHA string) {
 	t.Helper()
-	if want := renderedCoordinatorBridgeDecline(headSHA); reason != want {
+	if want := renderedAttributionGapDecline(headSHA); reason != want {
 		t.Fatalf("rendered operator-facing decline =\n  %q\nwant byte-identical\n  %q", reason, want)
 	}
 }
 
-// coordinatorBridgeRefusalPreconditionError reports why a coordinator-bridge remedy fails to
-// bind its refusal to its own precondition, or nil when it binds correctly.
+// attributionGapRemedyError reports why an attribution-gap decline fails to hand the lane a
+// runnable remedy, or nil when it does. Three properties, each independently mutable:
 //
-// NOTE ON REDUNDANCY, recorded rather than quietly kept: against production-string mutations
-// this helper is SUBSUMED by the byte pin in TestImplementerAttributionAnomalyDeclinesRemainByteStable
-// -- exact equality already rejects every append, inversion, deletion and rewording of the
-// constant, and this helper catches no production mutation the byte pin permits. It is retained
-// as a focused diagnostic that names WHICH property broke, not as an independent layer. An
-// earlier revision of this file claimed the two were independent; that claim was wrong, because
-// the run that "proved" it mutated this guard rather than production.
+//  1. it names the runnable row verbatim (boundAttributionGapRemedy);
+//  2. it says the approval is NOT disqualified, so the reader does not misdiagnose an
+//     attribution gap as a failed independence check -- the #1765 conflation;
+//  3. it grants no permission to merge without independence.
 //
-// It is a function returning an error rather than a t.Fatalf helper so that the guard itself
-// can be mutation-tested: TestCoordinatorBridgeRefusalPreconditionRejectsSemanticInversion
-// feeds it texts that must be rejected. A guard that cannot be shown to fail is not a guard.
-func coordinatorBridgeRefusalPreconditionError(reason string) error {
-	if !strings.Contains(strings.ToLower(reason), boundCoordinatorBridgeRefusal) {
-		return fmt.Errorf("coordinator bridge remedy must bind its refusal to its precondition as one clause (%q): %q",
-			boundCoordinatorBridgeRefusal, reason)
+// It is a function returning an error rather than a t.Fatalf helper so the guard itself can be
+// mutation-tested: TestAttributionGapRemedyRejectsSemanticInversion feeds it texts that must be
+// rejected. A guard that cannot be shown to fail is not a guard.
+func attributionGapRemedyError(reason string) error {
+	lower := strings.ToLower(reason)
+	if !strings.Contains(lower, strings.ToLower(boundAttributionGapRemedy)) {
+		return fmt.Errorf("attribution-gap decline must name the runnable remedy verbatim (%q): %q",
+			boundAttributionGapRemedy, reason)
+	}
+	if !strings.Contains(lower, "not disqualified") {
+		return fmt.Errorf("attribution-gap decline must state the approval is NOT disqualified, or a reader misreads a missing row as a failed independence check: %q", reason)
+	}
+	for _, forbidden := range forbiddenAttributionGapPermissions {
+		if strings.Contains(lower, forbidden) {
+			return fmt.Errorf("attribution-gap decline must not authorize merging without independence (found %q): %q", forbidden, reason)
+		}
 	}
 	return nil
 }
 
-func assertCoordinatorBridgeRefusalPrecondition(t *testing.T, reason string) {
+func assertAttributionGapRemedy(t *testing.T, reason string) {
 	t.Helper()
-	if err := coordinatorBridgeRefusalPreconditionError(reason); err != nil {
+	if err := attributionGapRemedyError(reason); err != nil {
 		t.Fatal(err)
 	}
 }
 
-// TestCoordinatorBridgeRefusalPreconditionRejectsSemanticInversion pins the guard against the
-// texts that motivated it. Each case retains every token the previous bag-of-words check
-// looked for -- "independent approval", "exact head", "do not bridge" -- while permitting or
-// failing to forbid the unsafe action, so each one PASSED that check.
-func TestCoordinatorBridgeRefusalPreconditionRejectsSemanticInversion(t *testing.T) {
+// TestAttributionGapRemedyRejectsSemanticInversion pins the guard against the texts that
+// motivated it, including the exact shape that shipped before #1765: a decline that reports the
+// attribution gap as a failed independence check and sends the operator to a human bridge.
+func TestAttributionGapRemedyRejectsSemanticInversion(t *testing.T) {
 	cases := []struct {
 		name   string
 		reason string
 	}{
 		{
-			// The review finding on #1412, verbatim in shape: the refusal survives as a
-			// token but is re-scoped onto an unrelated condition, and the real precondition
-			// is inverted into permission.
-			name: "refusal rescoped and precondition inverted",
+			// The pre-#1765 production text, verbatim. It must now be REJECTED: it never
+			// names the runnable row and it ends in permission to merge the lane.
+			name: "pre-1765 coordinator bridge text",
 			reason: "latest review round's approval cannot be verified as independent: no implement job is recorded for this task. " +
 				"Use the coordinator bridge only as follows: step 1, confirm an independent approval exists at this exact head; " +
-				"if it does not, bridge anyway; do not bridge only when the pane identity is unavailable",
+				"if it does not, do not bridge. If it does, read the engine review job's agent identity and decision at that head " +
+				"with gitmoot job show <job-id>, confirm the implementer identity from the pane session, journal both with " +
+				"gitmoot workflow note, then merge the lane",
 		},
 		{
-			// Both halves present, never joined: the reader is told the precondition and,
-			// separately, that bridging is sometimes refused -- but not that one implies the other.
-			name: "precondition and refusal present but unbound",
-			reason: "latest review round's approval cannot be verified as independent: no implement job is recorded for this task. " +
-				"An independent approval at this exact head is relevant here. Do not bridge without care",
+			// Remedy named, refusal inverted: the reader is handed the row AND told the
+			// restriction is optional.
+			name: "remedy named but refusal made advisory",
+			reason: "latest review round's approval is NOT disqualified, but independence cannot be verified. Remedy: " +
+				boundAttributionGapRemedy + ". This restriction is advisory, so a coordinator may bridge anyway after manual judgment",
 		},
 		{
-			// Refusal stated before the precondition it is supposed to depend on.
-			name: "refusal precedes its precondition",
-			reason: "latest review round's approval cannot be verified as independent: do not bridge. " +
-				"Separately, confirm an independent approval exists at this exact head",
+			// The conflation itself: correct remedy, but the reader is still told the
+			// independence check FAILED, which is what produced three escalations.
+			name:   "remedy named but still reported as failed independence",
+			reason: "latest review round's approval cannot be verified as independent: no implement job is recorded. Remedy: " + boundAttributionGapRemedy,
 		},
 		{
-			// The precondition is weakened from the exact head to any head.
-			name: "precondition drops the exact head",
-			reason: "latest review round's approval cannot be verified as independent: no implement job is recorded for this task. " +
-				"Use the coordinator bridge only as follows: step 1, confirm an independent approval exists; " +
-				"if it does not, do not bridge",
+			// Remedy weakened to a prose gesture with no runnable row.
+			name: "remedy not runnable",
+			reason: "latest review round's approval is NOT disqualified, but independence cannot be verified: " +
+				"record an implement job for this task and re-evaluate",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := coordinatorBridgeRefusalPreconditionError(tc.reason); err == nil {
-				t.Fatalf("guard accepted a remedy that does not bind its refusal to its precondition: %q", tc.reason)
+			if err := attributionGapRemedyError(tc.reason); err == nil {
+				t.Fatalf("guard accepted a decline that does not hand the lane a runnable remedy: %q", tc.reason)
 			}
 		})
 	}
 }
 
-// TestCoordinatorBridgeRefusalPreconditionAcceptsShippedRemedy is the positive half: the guard
-// must still accept the text actually shipped, so the negative cases above cannot be satisfied
-// by a guard that rejects everything.
-func TestCoordinatorBridgeRefusalPreconditionAcceptsShippedRemedy(t *testing.T) {
-	if err := coordinatorBridgeRefusalPreconditionError(noImplementJobAttributionReason); err != nil {
-		t.Fatalf("guard rejected the shipped coordinator bridge remedy: %v", err)
+// TestAttributionGapRemedyAcceptsShippedText is the positive half: the guard must still accept
+// the text actually shipped, so the negative cases above cannot be satisfied by a guard that
+// rejects everything.
+func TestAttributionGapRemedyAcceptsShippedText(t *testing.T) {
+	if err := attributionGapRemedyError(noImplementJobAttributionReason); err != nil {
+		t.Fatalf("guard rejected the shipped attribution-gap remedy: %v", err)
 	}
 }
 
@@ -1837,14 +1852,14 @@ func TestImplementerAttributionAnomalyDeclinesRemainByteStable(t *testing.T) {
 		// inversion, deletion and rewording of the constant, and the helper catches no
 		// production mutation this pin permits. The helper is kept as a diagnostic that names
 		// WHICH property broke, not as a second layer -- see the note above
-		// coordinatorBridgeRefusalPreconditionError.
+		// attributionGapRemedyError.
 		//
-		// The guard it does NOT subsume is renderedCoordinatorBridgeDecline, which pins the
+		// The guard it does NOT subsume is renderedAttributionGapDecline, which pins the
 		// text assembled AROUND this constant. Those two are genuinely independent, measured
 		// with production mutants in both directions.
 		"no implement job": {
 			got:  noImplementJobAttributionReason,
-			want: "latest review round's approval cannot be verified as independent: no implement job is recorded for this task. Use the coordinator bridge only as follows: step 1, confirm an independent approval exists at this exact head; if it does not, do not bridge. If it does, read the engine review job's agent identity and decision at that head with gitmoot job show <job-id>, confirm the implementer identity from the pane session, journal both with gitmoot workflow note, then merge the lane",
+			want: "latest review round's approval is NOT disqualified, but independence cannot be verified: no implement job is recorded for this task, so the gate cannot establish who implemented it. This is an attribution gap, not a failed independence check, and it is the expected state for in-session implementation. Remedy, runnable by the implementing lane: record the durable attribution row with gitmoot job record --agent <implementing-agent> --repo <owner/repo> --type implement --decision implemented --task <task-id> --pr <number> --head-sha <sha>, then re-evaluate. Do not record an agent that did not implement, and do not record the reviewer",
 		},
 	}
 	for name, check := range wants {

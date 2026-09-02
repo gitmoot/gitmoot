@@ -1178,7 +1178,18 @@ func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job, declared []
 }
 
 const (
-	noImplementJobAttributionReason            = "latest review round's approval cannot be verified as independent: no implement job is recorded for this task. Use the coordinator bridge only as follows: step 1, confirm an independent approval exists at this exact head; if it does not, do not bridge. If it does, read the engine review job's agent identity and decision at that head with gitmoot job show <job-id>, confirm the implementer identity from the pane session, journal both with gitmoot workflow note, then merge the lane"
+	// The attribution gap and an independence FAILURE are different facts with
+	// different remedies, and #1765 was filed because this constant reported the
+	// first as the second. No implement row means the gate cannot say WHO
+	// implemented, so it cannot prove the reviewer differs; it emphatically does
+	// not mean the reviewer implemented this. In-session implementation (a seat
+	// editing at its pane, no engine implement job) reaches this branch on every
+	// PR, so the message must name the durable remedy rather than prescribe a
+	// human bridge: session-recorded jobs (#657) create rows with
+	// Type == "implement", which is exactly what collectImplementerAttribution
+	// reads. The gate still refuses — attribution genuinely is unknown — but the
+	// lane can now clear it without a coordinator round.
+	noImplementJobAttributionReason            = "latest review round's approval is NOT disqualified, but independence cannot be verified: no implement job is recorded for this task, so the gate cannot establish who implemented it. This is an attribution gap, not a failed independence check, and it is the expected state for in-session implementation. Remedy, runnable by the implementing lane: record the durable attribution row with gitmoot job record --agent <implementing-agent> --repo <owner/repo> --type implement --decision implemented --task <task-id> --pr <number> --head-sha <sha>, then re-evaluate. Do not record an agent that did not implement, and do not record the reviewer"
 	mismatchedImplementTaskAttributionReason   = "latest review round's approval cannot be verified as independent: implement jobs are recorded, but none match this task identity; this is an attribution anomaly and may indicate a stable-task-identity regression"
 	emptyImplementAgentAttributionReason       = "latest review round's approval cannot be verified as independent: an implement job matches this task but has no recorded agent; this is an attribution data anomaly"
 	malformedImplementPayloadAttributionReason = "latest review round's approval cannot be verified as independent: an implement job has a malformed payload, so attribution for this task cannot be verified; this is a corrupt-record anomaly"
@@ -1235,6 +1246,13 @@ func (e implementerAttributionEvidence) failureReason() string {
 	case !e.sawImplementJob:
 		return noImplementJobAttributionReason
 	default:
+		// Reached when implement rows exist but none belong to this task and the
+		// repo/PR did not match either (an unrelated lane's row). For the
+		// operator that is the SAME fact as having no row at all -- there is no
+		// attribution for THIS task -- and the same remedy applies, so it
+		// deliberately shares the reason. TestPolicyMergeGateNamesImplementer
+		// AttributionDeclineCause pins both arms to this text; #1765 briefly
+		// split them and that test caught it.
 		return noImplementJobAttributionReason
 	}
 }
