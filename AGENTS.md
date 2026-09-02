@@ -319,10 +319,18 @@ changed (e.g. `curl -s http://172.17.0.1:8790/api/workflows`).
 ## Work strategy (lead-engineer)
 
 Issue-first → isolated worktrees off `main` → implement → adversarial-review →
-fix → verify on the integrated tree → owner-gated PR → deploy affected-only →
-live-probe before close. The **OWNER holds merge authority**. Under ultracode,
-orchestrate via the Workflow tool with opus sub-agents (protect the scarcer fable
-quota).
+fix → verify on the integrated tree → reviewed PR → deploy affected-only →
+live-probe before close. **Merge authority is whatever the org config records
+for your role**: `merge_rule = "self"` means the coordinator merges its own
+lane's PRs once one independent review is clean at the exact head and the PR is
+mergeable with CI green; `merge_rule = "owner"` means the owner merges. The
+`[org.roles."<role>"]` block in the gitmoot config is the authority of record
+and this file only describes it, so settle any future disagreement with a
+config read (`gitmoot org status`, `[org.roles]` in `config.toml`), not another
+doc edit. **Public releases are unchanged and still need explicit OWNER
+sign-off** — merge authority moved on 2026-08-31, release authority did not.
+Under ultracode, orchestrate via the Workflow tool with opus sub-agents
+(protect the scarcer fable quota).
 
 ## Workload mode
 
@@ -348,7 +356,8 @@ running then. `accepted_at` is the timestamp of the Herdr pane's first
 `working` status event after the issue-backed assignment prompt; `created_at` is
 the job-store timestamp. The merged PR always exists, so this record does not
 depend on a pre-existing workflow. The mode changes how much work may start; it
-never relaxes correctness, exact-head review, CI, or owner merge authority.
+never relaxes correctness, exact-head review, CI, or the merge authority
+recorded in the org config.
 
 Across both modes, use exactly one independent reviewer per corrected head.
 Parallel review lanes mean different PRs, not multiple reviewers on one head.
@@ -432,8 +441,11 @@ pinging X is the action.
   `perf:`, optional scope (e.g. `feat(workflow): …`). Reference issues with
   `(#NNN)`.
 - **Branches / PRs**: do **not** push directly to `main`. Branch, open a PR, let
-  CI (`build / vet / test`) pass, then the owner **squash-merges**. One PR per
-  issue, with deploy notes in the body.
+  CI (`build / vet / test`) pass, get one clean independent review at the exact
+  head, then whoever holds merge authority for that role in the org config
+  **squash-merges** — the coordinator itself under `merge_rule = "self"`, the
+  owner under `merge_rule = "owner"`. One PR per issue, with deploy notes in the
+  body. Cutting a public release stays an OWNER decision either way.
 - **Scope**: preserve existing behavior unless the change requires otherwise.
 - For machine-local agent notes, use a gitignored `CLAUDE.local.md` rather than
   editing this shared file. Gitignored (local-only, not in the repo): `/GOALS/`,
