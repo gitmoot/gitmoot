@@ -498,7 +498,7 @@ func TestWrapDeliverArgsCarryVerifiedFields(t *testing.T) {
 	assertContains("pane report-agent w1:p2 --source custom:gitmoot --agent gm-abcdef01 --state working")
 	assertContains("--state idle")
 	// pane run carries the job-watch command.
-	assertContains("pane run w1:p2 gitmoot job watch 'abcdef0123456789'")
+	assertContains("pane run w1:p2 gitmoot job watch abcdef0123456789")
 	// teardown releases then closes.
 	assertContains("pane release-agent w1:p2 --source custom:gitmoot --agent gm-abcdef01")
 	assertContains("pane close w1:p2")
@@ -534,7 +534,7 @@ func TestWatchCommandRendersLogWithExternalTailFallback(t *testing.T) {
 		meta:    JobMeta{JobID: "abcdef0123456789", Runtime: runtime.CodexRuntime, LogPath: "/home/g/logs/jobs/abcdef0123456789.log"},
 	}
 	got := a.watchCommand()
-	want := "gitmoot job watch 'abcdef0123456789' --transcript --log-path '/home/g/logs/jobs/abcdef0123456789.log' --runtime 'codex' --home '/home/g' || exec tail -n +1 -F '/home/g/logs/jobs/abcdef0123456789.log'"
+	want := "gitmoot job watch abcdef0123456789 --transcript --log-path /home/g/logs/jobs/abcdef0123456789.log --runtime codex --home /home/g || exec tail -n +1 -F /home/g/logs/jobs/abcdef0123456789.log"
 	if got != want {
 		t.Fatalf("watchCommand = %q, want %q", got, want)
 	}
@@ -548,7 +548,7 @@ func TestWatchCommandFallsBackToJobWatchWhenNoLogPath(t *testing.T) {
 		meta:    JobMeta{JobID: "abcdef0123456789"},
 	}
 	got := a.watchCommand()
-	want := "gitmoot job watch 'abcdef0123456789' --home '/home/g'"
+	want := "gitmoot job watch abcdef0123456789 --home /home/g"
 	if got != want {
 		t.Fatalf("watchCommand = %q, want %q", got, want)
 	}
@@ -561,20 +561,26 @@ func TestWatchCommandShellQuotesLogPathWithSpaces(t *testing.T) {
 		cockpit: &Cockpit{gitmootBin: "gitmoot"},
 		meta:    JobMeta{JobID: "x", Runtime: runtime.ShellRuntime, LogPath: "/home/my logs/jobs/x.log"},
 	}
-	if got, want := a.watchCommand(), "gitmoot job watch 'x' --transcript --log-path '/home/my logs/jobs/x.log' --runtime 'shell' || exec tail -n +1 -F '/home/my logs/jobs/x.log'"; got != want {
+	if got, want := a.watchCommand(), "gitmoot job watch x --transcript --log-path '/home/my logs/jobs/x.log' --runtime shell || exec tail -n +1 -F '/home/my logs/jobs/x.log'"; got != want {
 		t.Fatalf("watchCommand = %q, want %q", got, want)
 	}
 }
 
+// TestWatchCommandShellQuotesJobRuntimeAndHome is the security half and its
+// expectations are UNCHANGED by #1759: every dangerous value here still arrives
+// single-quoted. Only fully-safe words lost their cosmetic quotes when the four
+// shellQuote implementations were consolidated onto one allowlist, so this test
+// still fails if quoting is ever lost for input that needs it.
 func TestWatchCommandShellQuotesJobRuntimeAndHome(t *testing.T) {
 	a := &paneAdapter{
 		cockpit: &Cockpit{gitmootBin: "gitmoot", home: "/home/git moot"},
 		meta:    JobMeta{JobID: "job; echo nope", Runtime: "shell; echo nope", LogPath: "/tmp/job.log"},
 	}
-	want := "gitmoot job watch 'job; echo nope' --transcript --log-path '/tmp/job.log' --runtime 'shell; echo nope' --home '/home/git moot' || exec tail -n +1 -F '/tmp/job.log'"
+	want := "gitmoot job watch 'job; echo nope' --transcript --log-path /tmp/job.log --runtime 'shell; echo nope' --home '/home/git moot' || exec tail -n +1 -F /tmp/job.log"
 	if got := a.watchCommand(); got != want {
 		t.Fatalf("watchCommand = %q, want %q", got, want)
 	}
+
 	// Every dangerous value above contains a SPACE, so a naive "quote only when
 	// there is whitespace" policy would still quote them and this test would pass
 	// against it — measured with a compiling mutant during #1759. A space-free
@@ -601,7 +607,7 @@ func TestWrapDeliverPaneRunTailsLogPath(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	joined := strings.Join(fr.calls, "\n")
-	if want := "pane run w1:p2 gitmoot job watch 'abcdef0123456789' --transcript --log-path '/tmp/logs/jobs/abcdef0123456789.log' --runtime 'codex' || exec tail -n +1 -F '/tmp/logs/jobs/abcdef0123456789.log'"; !strings.Contains(joined, want) {
+	if want := "pane run w1:p2 gitmoot job watch abcdef0123456789 --transcript --log-path /tmp/logs/jobs/abcdef0123456789.log --runtime codex || exec tail -n +1 -F /tmp/logs/jobs/abcdef0123456789.log"; !strings.Contains(joined, want) {
 		t.Fatalf("expected pane run to render the log; want %q; calls:\n%s", want, joined)
 	}
 	if !strings.Contains(joined, "|| exec tail") {

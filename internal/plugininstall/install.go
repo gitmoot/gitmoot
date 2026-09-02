@@ -11,6 +11,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/buildinfo"
 	"github.com/gitmoot/gitmoot/internal/pluginpack"
+	"github.com/gitmoot/gitmoot/internal/shellquote"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
 
@@ -293,13 +294,13 @@ func manualCommands(provider pluginpack.Provider, marketplaceRoot string, packag
 	switch provider {
 	case pluginpack.ProviderCodex:
 		return []string{
-			"codex plugin marketplace add " + shellQuote(marketplaceRoot),
+			"codex plugin marketplace add " + shellquote.Posix(marketplaceRoot),
 			"codex plugin add " + pluginpack.PluginName + "@" + pluginpack.MarketplaceName,
 		}
 	case pluginpack.ProviderClaude:
 		return []string{
-			"claude plugin validate " + shellQuote(packagePath),
-			"claude plugin marketplace add " + shellQuote(marketplaceRoot) + " --scope " + scope,
+			"claude plugin validate " + shellquote.Posix(packagePath),
+			"claude plugin marketplace add " + shellquote.Posix(marketplaceRoot) + " --scope " + scope,
 			"claude plugin uninstall " + pluginpack.PluginName + "@" + pluginpack.MarketplaceName + " --scope " + scope + " --keep-data 2>/dev/null || true",
 			"claude plugin install " + pluginpack.PluginName + "@" + pluginpack.MarketplaceName + " --scope " + scope,
 		}
@@ -317,36 +318,6 @@ func joinArgs(args []string) string {
 		out += arg
 	}
 	return out
-}
-
-func shellQuote(value string) string {
-	if value == "" {
-		return "''"
-	}
-	for _, r := range value {
-		if !isShellSafe(r) {
-			return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
-		}
-	}
-	return value
-}
-
-func isShellSafe(r rune) bool {
-	if r >= 'a' && r <= 'z' {
-		return true
-	}
-	if r >= 'A' && r <= 'Z' {
-		return true
-	}
-	if r >= '0' && r <= '9' {
-		return true
-	}
-	switch r {
-	case '/', '.', '_', '-', '+', '=', ':', ',', '@', '%':
-		return true
-	default:
-		return false
-	}
 }
 
 func pathExists(path string) (bool, error) {
