@@ -623,7 +623,6 @@ func (s *bridgeServer) handleAgentAsk(w http.ResponseWriter, r *http.Request, na
 		SelectedAction:       "ask",
 		SelectedActionReason: "bridge agent ask",
 		ExecutionPath:        "bridge_agent_ask",
-		JSONOutput:           true,
 	})
 	if err != nil {
 		writeBridgeMappedError(w, err)

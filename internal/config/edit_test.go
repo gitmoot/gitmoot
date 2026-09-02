@@ -19,8 +19,8 @@ template = "gitmoot-plan-and-goal"
 max_background = 4
 idle_timeout = "10m"
 
-[feedback]
-repo = "owner/feedback"
+[template_remote]
+repo = "owner/templates"
 `
 
 func editTestPaths(t *testing.T, contents string) Paths {
@@ -55,7 +55,7 @@ func TestSetConfigScalarPreservesCommentsAndOtherKeys(t *testing.T) {
 		"# the planner runs ask jobs",
 		`template = "gitmoot-plan-and-goal"`,
 		`idle_timeout = "10m"`,
-		`repo = "owner/feedback"`,
+		`repo = "owner/templates"`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("lost %q after edit:\n%s", want, got)
@@ -73,12 +73,12 @@ func TestSetConfigScalarPreservesCommentsAndOtherKeys(t *testing.T) {
 
 func TestSetConfigScalarStringValue(t *testing.T) {
 	paths := editTestPaths(t, editFixture)
-	if err := SetConfigScalar(paths, []string{"feedback", "repo"}, StringScalar("owner/other")); err != nil {
+	if err := SetConfigScalar(paths, []string{"template_remote", "repo"}, StringScalar("owner/other")); err != nil {
 		t.Fatalf("SetConfigScalar: %v", err)
 	}
-	repo, err := LoadDefaultFeedbackRepo(paths)
-	if err != nil || repo != "owner/other" {
-		t.Fatalf("feedback repo = %q (err %v)", repo, err)
+	remote, err := LoadTemplateRemote(paths)
+	if err != nil || remote.Repo != "owner/other" {
+		t.Fatalf("template remote repo = %q (err %v)", remote.Repo, err)
 	}
 }
 

@@ -126,12 +126,6 @@ type localAgentDispatchRequest struct {
 	// real seat is elevated + relay-injected by the daemon. Additive: false leaves
 	// the enqueued payload byte-identical.
 	MootSeat bool
-	// JSONOutput is true when the caller will emit machine-readable JSON (e.g.
-	// `agent ask --json`). The live-A/B interceptor (#482) MUST stay byte-clean for
-	// these consumers: it never presents the A/B block (which would prepend
-	// "[live A/B] ..." to the JSON object and break parsing) and never runs the
-	// second challenger Deliver, falling through to the plain single ask.
-	JSONOutput bool
 	// DispatchWarning surfaces advisory pre-delivery checks to the operator. It
 	// is deliberately not persisted in the job payload.
 	DispatchWarning func(string)

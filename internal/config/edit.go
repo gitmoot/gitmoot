@@ -112,9 +112,6 @@ func validateConfigFile(paths Paths) error {
 	if _, err := LoadParallelSessionPolicy(paths); err != nil {
 		return err
 	}
-	if _, err := LoadDefaultFeedbackRepo(paths); err != nil {
-		return err
-	}
 	if _, err := LoadHeartbeats(paths); err != nil {
 		return err
 	}

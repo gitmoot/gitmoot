@@ -230,25 +230,3 @@ autonomy_policy = "read_only"
 		t.Fatalf("LoadAgentTypes error = %v, want unsupported autonomy policy", err)
 	}
 }
-
-func TestLoadDefaultFeedbackRepo(t *testing.T) {
-	paths := PathsForHome(t.TempDir())
-	if err := Initialize(paths); err != nil {
-		t.Fatalf("Initialize returned error: %v", err)
-	}
-	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
-[feedback]
-repo = "owner/reviews"
-`), 0o600); err != nil {
-		t.Fatalf("write config returned error: %v", err)
-	}
-
-	repo, err := LoadDefaultFeedbackRepo(paths)
-
-	if err != nil {
-		t.Fatalf("LoadDefaultFeedbackRepo returned error: %v", err)
-	}
-	if repo != "owner/reviews" {
-		t.Fatalf("repo = %q, want owner/reviews", repo)
-	}
-}

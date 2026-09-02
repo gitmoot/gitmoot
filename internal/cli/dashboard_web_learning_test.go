@@ -193,6 +193,55 @@ func TestWebDataSourceSkills(t *testing.T) {
 	}
 }
 
+// TestSkillTemplateFromVersionsSortsAscending feeds the mapper DESCENDING version
+// rows so the ascending-order contract depends on the defensive sort rather than on
+// the store's ORDER BY. Going through the store path cannot test this:
+// ListAgentTemplateVersions always returns ascending, so the sort is unobservable
+// there and deleting it would leave an end-to-end test green.
+//
+// Deleting the sort.SliceStable in skillTemplateFromVersions fails this test.
+func TestSkillTemplateFromVersionsSortsAscending(t *testing.T) {
+	tmpl := db.AgentTemplate{ID: "planner", Name: "Planner", VersionNumber: 2, VersionState: "current"}
+	descending := []db.AgentTemplateVersion{
+		{VersionNumber: 3, State: "superseded"},
+		{VersionNumber: 2, State: "current"},
+		{VersionNumber: 1, State: "superseded"},
+	}
+
+	st := skillTemplateFromVersions(tmpl, []string{"planner-agent"}, descending)
+
+	if len(st.Versions) != 3 {
+		t.Fatalf("versions = %d, want 3: %+v", len(st.Versions), st.Versions)
+	}
+	for i, v := range st.Versions {
+		if v.Number != i+1 {
+			t.Fatalf("versions[%d].Number = %d, want %d; descending input must be sorted ascending", i, v.Number, i+1)
+		}
+	}
+	// The states must travel with their own version, not be re-paired by the sort.
+	if st.Versions[1].State != "current" {
+		t.Fatalf("versions[1].State = %q, want current (state must follow its version through the sort)", st.Versions[1].State)
+	}
+	// Shuffled (not merely reversed) input sorts too.
+	shuffled := []db.AgentTemplateVersion{
+		{VersionNumber: 2, State: "current"},
+		{VersionNumber: 3, State: "superseded"},
+		{VersionNumber: 1, State: "superseded"},
+	}
+	st = skillTemplateFromVersions(tmpl, nil, shuffled)
+	for i, v := range st.Versions {
+		if v.Number != i+1 {
+			t.Fatalf("shuffled versions[%d].Number = %d, want %d", i, v.Number, i+1)
+		}
+	}
+	// A nil version list still yields the initialized empty slices the dashboard
+	// contract requires (the fail-open path buildSkillTemplate uses on a read error).
+	st = skillTemplateFromVersions(tmpl, nil, nil)
+	if st.Versions == nil || len(st.Versions) != 0 || st.Pending == nil {
+		t.Fatalf("nil versions must still initialize Versions and Pending: %+v", st)
+	}
+}
+
 func seedKnowledge(t *testing.T, home string) (oldID, newID int64) {
 	t.Helper()
 	paths := config.PathsForHome(home)

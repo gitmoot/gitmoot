@@ -98,17 +98,6 @@ func buildDashboardConfigView(paths config.Paths, daemon dashboardDaemonDetail) 
 		view.Sections = append(view.Sections, section)
 	}
 
-	// Feedback: default feedback repo.
-	if repo, err := config.LoadDefaultFeedbackRepo(paths); err == nil && strings.TrimSpace(repo) != "" {
-		view.Sections = append(view.Sections, tui.ConfigSection{
-			Title: "feedback",
-			Rows:  [][]string{{"repo", dashConfig(repo)}},
-			Editable: []tui.ConfigField{
-				{Label: "feedback · repo", KeyPath: []string{"feedback", "repo"}, Kind: tui.ConfigText, Value: repo},
-			},
-		})
-	}
-
 	// Daemon: persisted daemon launch state.
 	daemonRows := [][]string{}
 	if len(daemon.Flags) > 0 {
@@ -221,9 +210,6 @@ func validateDashboardConfig(paths config.Paths) []string {
 	}
 	if _, err := config.LoadParallelSessionPolicy(paths); err != nil {
 		problems = append(problems, "[parallel_sessions] "+err.Error())
-	}
-	if _, err := config.LoadDefaultFeedbackRepo(paths); err != nil {
-		problems = append(problems, "[feedback] "+err.Error())
 	}
 	return problems
 }

@@ -73,7 +73,28 @@ func (d *webDataSource) Skills(ctx context.Context) (dashboard.Skills, error) {
 // LEFT JOIN on current_version_id (tmpl.VersionNumber/VersionState) — the SAME
 // resolution Agent()'s Current marker uses, so the two views agree on which version
 // a template "runs".
+//
+// The mapping itself lives in skillTemplateFromVersions so the version ordering is
+// testable: this function's input always arrives pre-sorted from the store, which
+// would otherwise mask the defensive sort entirely.
 func buildSkillTemplate(ctx context.Context, store *db.Store, tmpl db.AgentTemplate, agents []string) dashboard.SkillTemplate {
+	versions, err := store.ListAgentTemplateVersions(ctx, tmpl.ID)
+	if err != nil {
+		// Fail-open: a version-list error leaves this one template with no history
+		// (its current version/state still resolved below) rather than failing the
+		// whole endpoint.
+		return skillTemplateFromVersions(tmpl, agents, nil)
+	}
+	return skillTemplateFromVersions(tmpl, agents, versions)
+}
+
+// skillTemplateFromVersions is the pure mapping from a template plus its version
+// rows to the dashboard shape. It is separated from the store read so a test can
+// hand it DESCENDING or shuffled versions: ListAgentTemplateVersions is
+// ORDER BY version, so the defensive sort below is unobservable through the store
+// path and a test that only went through it could not tell the sort from its
+// absence.
+func skillTemplateFromVersions(tmpl db.AgentTemplate, agents []string, versions []db.AgentTemplateVersion) dashboard.SkillTemplate {
 	st := dashboard.SkillTemplate{
 		TemplateID:     tmpl.ID,
 		Name:           strings.TrimSpace(tmpl.Name),
@@ -86,14 +107,6 @@ func buildSkillTemplate(ctx context.Context, store *db.Store, tmpl db.AgentTempl
 		// module's response shape, and a nil slice marshals as JSON null, which
 		// breaks a client that iterates it.
 		Pending: []dashboard.SkillCandidate{},
-	}
-
-	versions, err := store.ListAgentTemplateVersions(ctx, tmpl.ID)
-	if err != nil {
-		// Fail-open: a version-list error leaves this one template with no history
-		// (its current version/state still resolved above) rather than failing the
-		// whole endpoint.
-		return st
 	}
 
 	for _, v := range versions {
@@ -111,9 +124,10 @@ func buildSkillTemplate(ctx context.Context, store *db.Store, tmpl db.AgentTempl
 		}
 	}
 
-	// Versions ascending by Number (the sparkline order); ListAgentTemplateVersions
-	// already orders by version, but sort defensively so the contract holds even if
-	// the store's order ever changes.
+	// Versions ascending by Number (the sparkline order). The store already orders
+	// by version, so this is defensive — it keeps the dashboard contract true if
+	// either layer's ordering ever changes. TestSkillTemplateFromVersionsSortsAscending
+	// feeds it descending input, so deleting this sort fails that test.
 	sort.SliceStable(st.Versions, func(i, j int) bool {
 		return st.Versions[i].Number < st.Versions[j].Number
 	})
