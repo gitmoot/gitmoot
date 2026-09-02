@@ -39,6 +39,10 @@ func TestParentOnlyAdvanceCannotRunTheChildsOwnAdvancement(t *testing.T) {
 	engine.Home = t.TempDir()
 	engine.DelegationCheckout = t.TempDir()
 	engine.DelegationWorktrees = manager
+	// PRODUCTION CLEANUP VALIDATION. testEngine installs a permissive validator; with it
+	// in place this fixture could reach RemoveWorktreeForce on a path production would
+	// have rejected, which is what let the full-advance mutant survive.
+	engine.cleanupTargetValidator = nil
 	// AN EXISTING, VALIDATED, MANAGED PATH: derived from engine.Home in the layout
 	// allocation uses, and actually created on disk, so the cleanup has something real to
 	// remove and RemoveWorktreeForce is reached even on an early return.
@@ -88,9 +92,14 @@ func TestParentOnlyAdvanceCannotRunTheChildsOwnAdvancement(t *testing.T) {
 		// created, so the predicate was false and the deferred cleanup was a no-op on BOTH
 		// paths - which is why the full-AdvanceJob mutant survived. That was an artefact of
 		// the fixture, not a property of the code (#1673).
-		DelegationID:     "api",
-		ReadOnlyWorktree: true,
-		WorktreePath:     childWorktree,
+		// THE PRODUCTION DELEGATION SHAPE. Allocation sets the delegation WorktreePath
+		// and ReadOnlySeat - NOT ReadOnlyWorktree, which denotes a TOP-LEVEL allocation
+		// and makes ValidateDelegationCleanupTarget expect readonly-seat/pipeline/pool
+		// paths. Carrying that impossible marker was how the earlier fixture reached
+		// RemoveWorktreeForce only via the permissive test validator (#1673).
+		DelegationID: "api",
+		ReadOnlySeat: true,
+		WorktreePath: childWorktree,
 		Result: &AgentResult{
 			Decision:                    "failed",
 			Summary:                     "pull request #7 is no longer open",
