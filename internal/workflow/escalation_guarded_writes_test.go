@@ -162,6 +162,11 @@ func TestPreEffectOwnershipLossHandsBackResources(t *testing.T) {
 	engine := testEngine(store)
 	engine.EscalationNotifier = &recordingNotifier{}
 	pausedImplementEscalation(t, store, &engine)
+	// FORCE THE SHARED-CHECKOUT FALLBACK: with no worktree manager the leg takes a real
+	// BRANCH LOCK instead of an isolated worktree, which is the resource that strands.
+	// With the isolated path the lock never exists and any assertion about releasing it
+	// is vacuous - the first version of this test measured nothing.
+	engine.DelegationWorktrees = nil
 	round, ok := unsettledRound(t, store, "parent-job")
 	if !ok {
 		t.Fatal("no unsettled round")
@@ -195,15 +200,22 @@ func TestPreEffectOwnershipLossHandsBackResources(t *testing.T) {
 		t.Fatalf("receipts = %d, want 0 after ownership loss", got)
 	}
 	// THE LOCK WAS HANDED BACK: the new owner must be able to take the same branch.
+	stored, ok := unsettledRound(t, store, "parent-job")
+	if !ok {
+		t.Fatal("the round vanished: the claim must survive an ownership loss")
+	}
+	if strings.TrimSpace(stored.PreEffectBranch) != "" {
+		t.Fatalf("a pass that lost ownership recorded pre-effects on the round: %+v", stored)
+	}
 	acquired, err := store.AcquireLock(ctx, db.BranchLock{
 		RepoFullName: "gitmoot/gitmoot",
-		Branch:       round.PreEffectBranch,
+		Branch:       "task-005",
 		Owner:        "other-recoverer",
 	})
 	if err != nil {
 		t.Fatalf("AcquireLock: %v", err)
 	}
-	if !acquired && strings.TrimSpace(round.PreEffectBranch) != "" {
+	if !acquired {
 		t.Fatal("the lost pass stranded its branch lock: the new owner cannot proceed")
 	}
 }
@@ -258,5 +270,59 @@ func TestReleasingAFenceYouDoNotOwnReportsFalse(t *testing.T) {
 	}
 	if !released {
 		t.Fatal("the owner's release reported false")
+	}
+}
+
+// TestOwnershipLostBeforeRenewalAppliesNothing covers the RENEWAL's own false case,
+// which is a different window from RecordEscalationRoundPreEffects: ownership can be
+// gone before the pre-effects even start. The renewal exists because git work has no
+// bound and a fixed lease can lapse under it.
+//
+// SEMANTIC REVERSION THIS KILLS: ignore the renewal result and this pass runs its
+// pre-effects and commits while a second recoverer owns the round.
+func TestOwnershipLostBeforeRenewalAppliesNothing(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.EscalationNotifier = &recordingNotifier{}
+	manager := pausedImplementEscalation(t, store, &engine)
+	round, ok := unsettledRound(t, store, "parent-job")
+	if !ok {
+		t.Fatal("no unsettled round")
+	}
+	// INVOCATIONS, not distinct paths. The property here is "a pass without ownership
+	// must not even ATTEMPT git work"; allocation is idempotent by key, so counting
+	// distinct worktrees cannot see a second attempt at all.
+	attemptsBefore := len(manager.calls)
+
+	escalationPreRenewHook = func(hookCtx context.Context, jobID string, roundID string) {
+		now := time.Now().UTC()
+		taken, err := store.AcquireEscalationRecoveryLease(hookCtx, jobID, roundID, "other-recoverer",
+			now.Add(time.Minute), now.Add(2*escalationRecoveryLeaseTTL))
+		if err != nil {
+			t.Fatalf("hook acquire: %v", err)
+		}
+		if !taken {
+			t.Fatal("the hook could not take ownership: the test cannot observe the renewal")
+		}
+	}
+	t.Cleanup(func() { escalationPreRenewHook = nil })
+
+	if err := engine.ResolveEscalation(ctx, "parent-job", ResumeRetry, ""); err != nil {
+		t.Fatalf("ResolveEscalation: %v", err)
+	}
+
+	// NOTHING RAN: not the pre-effects, not the effects, not the receipt.
+	if got := len(manager.calls); got != attemptsBefore {
+		t.Fatalf("worktree attempts %d -> %d: a pass without ownership ran git work", attemptsBefore, got)
+	}
+	if got := countJobs(t, store, "/resume"); got != 0 {
+		t.Fatalf("resume jobs = %d, want 0", got)
+	}
+	if got := countWorkflowJobEvents(t, store, "parent-job", escalationEffectsCompletedEvent); got != 0 {
+		t.Fatalf("receipts = %d, want 0", got)
+	}
+	if _, stillOpen := unsettledRound(t, store, "parent-job"); !stillOpen {
+		t.Fatalf("the round was settled by a pass that had lost ownership (round %s)", round.RoundID)
 	}
 }

@@ -710,6 +710,11 @@ func (e Engine) adoptOrLoadUnsettledRound(ctx context.Context, coordinatorJobID 
 // abandonment path rejected in v3.
 const escalationRecoveryLeaseTTL = 2 * time.Minute
 
+// escalationPreRenewHook fires between the fence acquisition and the renewal that
+// covers the pre-effects, which is the one window a test cannot otherwise reach
+// deterministically. Nil in production (#1673).
+var escalationPreRenewHook func(ctx context.Context, jobID string, roundID string)
+
 // applyResolutionEffectsFenced is the authorized shape (#1673, design note v6 +
 // A-NARROW): acquire the fence, run the pre-effects UNDER it, then commit every
 // durable database write AND the receipt in ONE transaction that re-validates the
@@ -732,6 +737,12 @@ func (e Engine) applyResolutionEffectsFenced(ctx context.Context, parentJob db.J
 	// The lease is RENEWED first: git work has no bound, and a fixed lease that expires
 	// mid-allocation would let a second recoverer take ownership while this pass is
 	// still creating resources (#1673).
+	// escalationPreRenewHook is the only place a test can land an ownership change in the
+	// exact window between taking the fence and renewing it for the pre-effects. Nil in
+	// production.
+	if escalationPreRenewHook != nil {
+		escalationPreRenewHook(ctx, parentJob.ID, roundID)
+	}
 	if renewed, err := e.Store.RenewEscalationRecoveryLease(ctx, parentJob.ID, roundID, owner,
 		time.Now().UTC().Add(escalationRecoveryLeaseTTL), time.Now().UTC()); err != nil {
 		return err
