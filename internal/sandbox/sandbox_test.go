@@ -263,3 +263,36 @@ func TestSandboxProbeForcedUnsupported(t *testing.T) {
 		t.Fatalf("SandboxProbe forced result = %+v", result)
 	}
 }
+
+// TestSandboxExecStrictReadModeReachesProcfsE2E is the REAL-SUBPROCESS half of
+// the procfs grant. TestReadableRootsGrantsProcfs only asserts list membership,
+// which would stay green if the rule stopped being applied; this runs a genuine
+// Landlock-confined child in STRICT read mode (reads declared, the read-only
+// seat's shape) and reads the exact file whose denial broke every reviewer:
+// codex's bwrap died on /proc/sys/kernel/overflowuid and the Bun-based Claude
+// binary aborted with no message at all.
+func TestSandboxExecStrictReadModeReachesProcfsE2E(t *testing.T) {
+	requireLandlockABI(t)
+	gitmoot := buildGitmootBinary(t)
+	base := t.TempDir()
+	workdir := filepath.Join(base, "work")
+	cacheDir := filepath.Join(base, "cache")
+	for _, dir := range []string{workdir, cacheDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Strict read mode is selected by declaring reads; that is the mode the
+	// grant regressed in. The legacy no-reads mode never lost procfs.
+	command := exec.Command(gitmoot, "sandbox-exec", "--read-only-workdir",
+		"--read", workdir, "--write", cacheDir, "--",
+		"/bin/sh", "-c", `cat /proc/sys/kernel/overflowuid && cat /proc/self/status >/dev/null`)
+	command.Dir = workdir
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("strict-read-mode sandbox could not read procfs: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "65534") {
+		t.Fatalf("overflowuid read returned %q, want the kernel value; procfs is not genuinely readable", output)
+	}
+}

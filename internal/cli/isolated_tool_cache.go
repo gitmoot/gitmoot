@@ -125,6 +125,17 @@ func injectDeliveryAdapterEnv(adapter workflow.DeliveryAdapter, env []string) (w
 		}
 		a.Adapter = runtimeAdapter
 		return a, nil
+	case readOnlyRuntimeAdapter:
+		inner, err := injectDeliveryAdapterEnv(a.Adapter, env)
+		if err != nil {
+			return nil, err
+		}
+		runtimeAdapter, ok := inner.(runtime.Adapter)
+		if !ok {
+			return nil, fmt.Errorf("tool cache env inject returned incompatible %T read-only adapter", inner)
+		}
+		a.Adapter = runtimeAdapter
+		return a, nil
 	case runtime.CodexAdapter:
 		a.Runner = subprocess.EnvInjectingRunner{Inner: a.Runner, Env: env}
 		return a, nil

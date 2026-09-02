@@ -571,6 +571,11 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		if err != nil {
 			return localAgentJobOutput{}, fmt.Errorf("resolve read-only tool cache paths: %w", err)
 		}
+		// The grant widens effectiveAgent.WritablePaths, which is what
+		// wrapReadOnlySandboxAdapter reads to build the sandbox; the returned env
+		// is deliberately discarded because readOnlyRuntimeSandboxGrants derives
+		// it again and injects it at the Landlock boundary. A second rewrap here
+		// is unreachable-by-test dead weight.
 		if _, err := applyIsolatedToolCacheGrants(cachePaths, workflow.JobPayload{WorktreePath: readOnlyWorktreePath}, &effectiveAgent); err != nil {
 			return localAgentJobOutput{}, fmt.Errorf("prepare read-only tool cache: %w", err)
 		}

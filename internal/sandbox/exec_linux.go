@@ -35,6 +35,7 @@ var runtimeHostReadFiles = []string{
 	"/etc/passwd",
 	"/etc/group",
 	"/etc/localtime",
+	"/etc/ssl/openssl.cnf",
 }
 
 // Exec applies Gitmoot's strict filesystem ruleset to the current process and
@@ -186,6 +187,22 @@ func readableRoots(paths []string, executable string) ([]string, error) {
 		"/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64", "/usr/libexec", "/usr/share",
 		"/usr/local/bin", "/usr/local/sbin", "/usr/local/lib", "/usr/local/lib64", "/usr/local/share",
 		"/etc/ssl/certs", "/etc/pki",
+		// procfs read is a runtime BOOTSTRAP requirement, not a convenience: the
+		// Bun-based Claude/Kimi binaries abort with an opaque crash without it,
+		// and codex's managed bwrap fails reading /proc/sys/kernel/overflowuid.
+		// The legacy no-reads mode always had it via RODirs("/"), so strict read
+		// mode was the regression rather than this grant being a widening.
+		//
+		// EXPOSURE, stated as narrowly as it was measured. One subcase is proven:
+		// /proc/<other-pid>/environ stays denied to a sandboxed process because
+		// Landlock's ptrace domain check gates it (measured — own environ
+		// readable, the live daemon's denied, while an unsandboxed root read of
+		// that same path succeeds). That is NOT a general claim: /proc/<pid>/cmdline,
+		// /proc/net/* and /proc/sys/* are gated by ordinary DAC and hidepid, which
+		// this rule neither tightens nor loosens. Narrowing the grant to /proc/self
+		// plus specific files is a live follow-up, untested here because Landlock
+		// resolves paths at rule-add time while nested runtimes fork new pids.
+		"/proc",
 	} {
 		if err := add(candidate, false); err != nil {
 			return nil, err
