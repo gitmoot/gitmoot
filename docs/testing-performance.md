@@ -80,7 +80,7 @@ The current real-path carve-out files are:
 - `internal/db/pipeline_test.go`
 - `internal/db/session_job_reaper_test.go`
 - `internal/db/session_job_test.go`
-- `internal/db/store_canary_test.go`
+- `internal/db/skillopt_removal_migration_test.go`
 - `internal/db/store_root_id_test.go`
 - `internal/db/store_root_killed_test.go`
 - `internal/db/store_test.go`

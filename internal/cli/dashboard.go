@@ -733,15 +733,6 @@ func dashboardJobStateColor(st style.Style, state string) string {
 	}
 }
 
-func dashboardDeadTrainPhase(phase string) bool {
-	switch phase {
-	case "run_abandoned", "candidate_rejected", "candidate_promoted":
-		return true
-	default:
-		return false
-	}
-}
-
 // dashboardSessionStateText renders a session's state, appending "(stale)" for a
 // phantom running session (#505 gap 2) so a dead runtime session is never
 // silently shown as live.

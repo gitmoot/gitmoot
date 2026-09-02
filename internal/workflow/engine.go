@@ -229,47 +229,6 @@ type Engine struct {
 	// existing set is byte-identical. It is sourced from the host
 	// [orchestrate].max_verify_replan_attempts config at daemon startup.
 	MaxVerifyReplanAttempts int
-	// ReviewLegTimeout bounds the DETACHED cross-family review leg (#469): the
-	// review runs a live LLM adapter.Deliver that can take minutes, so it must
-	// never run unbounded. The detached goroutine's context is wrapped in this
-	// timeout so a wedged reviewer process is reaped rather than leaking forever.
-	// <= 0 means defaultReviewLegTimeout. It only matters when a ReviewLegDispatcher
-	// is wired (off by default).
-	ReviewLegTimeout time.Duration
-	// ReviewSpawner runs the detached cross-family review leg OFF the AdvanceJob /
-	// daemon-poll path so a live, possibly-wedged reviewer adapter.Deliver can never
-	// block AdvanceJob, the worker tick, or the daemon's checkoutLock. The default
-	// (nil) spawns a goroutine; tests inject a synchronous runner so the review is
-	// deterministic. It mirrors the EventSink fire-and-forget seam: the engine hands
-	// off a self-contained closure that owns its own bounded, cancellation-detached
-	// context.
-	ReviewSpawner func(func())
-	// CheckerLegTimeout bounds the DETACHED deterministic-checker leg (#485): the
-	// leg shells out to external tools (dupl/jscpd/golangci-lint/gocyclo) that can
-	// be slow, so it must never run unbounded. The detached goroutine's context is
-	// wrapped in this timeout so a wedged tool is reaped rather than leaking
-	// forever. <= 0 means defaultCheckerLegTimeout. It only matters when a
-	// DeterministicCheckerDispatcher is wired (off by default).
-	CheckerLegTimeout time.Duration
-	// CheckerSpawner runs the detached deterministic-checker leg OFF the AdvanceJob
-	// / daemon-poll path so a slow, possibly-wedged external tool can never block
-	// AdvanceJob, the worker tick, or the daemon's checkoutLock. The default (nil)
-	// spawns a goroutine; tests inject a synchronous runner so the checker leg is
-	// deterministic. It mirrors ReviewSpawner.
-	CheckerSpawner func(func())
-	// HardVerifierLegTimeout bounds the DETACHED hard-verifier leg (#474): the leg
-	// provisions a fresh sandbox and runs the operator's build/test/lint commands,
-	// which can be slow, so it must never run unbounded. The detached goroutine's
-	// context is wrapped in this timeout so a wedged verifier is reaped rather than
-	// leaking forever. <= 0 means defaultHardVerifierLegTimeout. It only matters when
-	// a HardVerifierDispatcher is wired (off by default).
-	HardVerifierLegTimeout time.Duration
-	// HardVerifierSpawner runs the detached hard-verifier leg OFF the AdvanceJob /
-	// daemon-poll path so a slow, possibly-wedged test suite can never block
-	// AdvanceJob, the worker tick, or the daemon's checkoutLock. The default (nil)
-	// spawns a goroutine; tests inject a synchronous runner so the verifier leg is
-	// deterministic. It mirrors CheckerSpawner.
-	HardVerifierSpawner func(func())
 	// Memory is the injected, off-by-default agent persistent-memory controller
 	// (#626). When set (only when at least one agent is enrolled and the global
 	// kill switch is off), the engine's Mailbox injects a "Prior learnings" block

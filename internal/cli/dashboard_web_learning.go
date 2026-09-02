@@ -81,6 +81,11 @@ func buildSkillTemplate(ctx context.Context, store *db.Store, tmpl db.AgentTempl
 		Versions:       []dashboard.SkillVersion{},
 		CurrentVersion: tmpl.VersionNumber,
 		CurrentState:   strings.TrimSpace(tmpl.VersionState),
+		// Pending stays an initialized EMPTY slice even though #1752 removed the
+		// candidate layer that filled it: it is still part of the pinned dashboard
+		// module's response shape, and a nil slice marshals as JSON null, which
+		// breaks a client that iterates it.
+		Pending: []dashboard.SkillCandidate{},
 	}
 
 	versions, err := store.ListAgentTemplateVersions(ctx, tmpl.ID)

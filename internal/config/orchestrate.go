@@ -768,17 +768,3 @@ func parseReviewBlockingSeverity(value string) (string, error) {
 	}
 	return severity, nil
 }
-
-// parseConfigStringList parses a plain comma list (e.g. "a, b ,c") into a
-// trimmed, non-empty slice; an empty value (or only blanks) yields nil. It is the
-// shared parser for comma-list config knobs (deterministic_checkers,
-// mode_b_jury_veto_dimensions) and never errors.
-func parseConfigStringList(value string) []string {
-	var out []string
-	for _, part := range strings.Split(value, ",") {
-		if name := strings.TrimSpace(part); name != "" {
-			out = append(out, name)
-		}
-	}
-	return out
-}
