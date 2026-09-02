@@ -312,7 +312,7 @@ func validateOptionalDuration(name string, value string) error {
 
 // EventsPolicy is the host-level outbound-event-stream policy read from the
 // [events] section of the gitmoot config (#446). It is a distinct concern from
-// [orchestrate] (cockpit/delegation budgets): when WebhookURL is empty (the
+// [orchestrate] delegation policies and budgets: when WebhookURL is empty (the
 // default) NO sink is constructed and behavior is byte-identical (off by
 // default). The daemon uses it to build the best-effort webhook Sink wired into
 // the workflow engine's terminal-transition path.
