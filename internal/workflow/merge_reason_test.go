@@ -58,7 +58,6 @@ func TestGateMissKindIsTheEscalationSignal(t *testing.T) {
 	}
 }
 
-
 // TestRenderPinsEveryGateAndTheCombinedPath closes P2: the previous rendered pin covered ONLY
 // the coordinator-bridge review reason, so a conditional append on the CI-gate branch changed
 // the durable operator instruction while the byte pin, the cause-naming test and the CI test

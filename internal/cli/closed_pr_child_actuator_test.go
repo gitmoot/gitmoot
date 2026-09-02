@@ -181,6 +181,12 @@ func TestClosedPullRequestChildConvergesThroughTheRetryActuator(t *testing.T) {
 	if resolutions == 0 {
 		t.Fatalf("the actuator never resolved the advancement: it is looping. events = %+v", events)
 	}
+	// THE STRUCTURAL GUARANTEE: a parent-DAG-only advancement cannot dispatch the
+	// child's OWN delegations. If this job appears, the actuator ran the full advance
+	// under an unvalidated checkout.
+	if _, err := store.GetJob(ctx, child+"/delegation/grandchild"); err == nil {
+		t.Fatal("the child's own delegation was dispatched: parent-only advancement ran the full advance")
+	}
 	if remaining, err := store.JobIDsWithPendingAdvanceRetry(ctx); err != nil {
 		t.Fatalf("JobIDsWithPendingAdvanceRetry after: %v", err)
 	} else {
@@ -248,5 +254,103 @@ func TestClosedPullRequestChildWithoutResultDoesNotLoopForever(t *testing.T) {
 	}
 	if retries > 2 {
 		t.Fatalf("advance_retry events = %d after three actuator passes: the marker grows per tick", retries)
+	}
+}
+
+// seedTerminalChild writes a settled delegation child with the given state, decision and
+// event kind, so a test can state exactly which shape it is presenting to the actuator.
+func seedTerminalChild(t *testing.T, store *db.Store, id string, state workflow.JobState, decision string, eventKind string) {
+	t.Helper()
+	payload, err := json.Marshal(workflow.JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		Branch:      "task-7",
+		PullRequest: 7,
+		TaskID:      "task-7",
+		ParentJobID: "parent-job",
+		HeadSHA:     "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+		Sender:      "coord",
+		Result:      &workflow.AgentResult{Decision: decision, Summary: "terminal"},
+	})
+	if err != nil {
+		t.Fatalf("marshal child payload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(context.Background(), db.Job{
+		ID: id, Agent: "api", Type: "review", State: string(state),
+		Payload: string(payload), ParentJobID: "parent-job", DelegationID: "api",
+	}, db.JobEvent{Kind: eventKind, Message: "terminal"}); err != nil {
+		t.Fatalf("create child %s: %v", id, err)
+	}
+	if err := store.AddJobEvent(context.Background(), db.JobEvent{
+		JobID: id, Kind: "advance_retry", Message: "parent advancement owed",
+	}); err != nil {
+		t.Fatalf("add advance_retry to %s: %v", id, err)
+	}
+}
+
+// TestCheckoutBypassIsLimitedToTheClosedPullRequestShape is the round-4 P1 control. The
+// bypass exists for ONE shape - a child terminalized by the closed-PR sweep - and
+// Engine.AdvanceJob does much more than parent advancement for other shapes: it
+// dispatches their own delegations and continues into the review merge gate. So a
+// SUCCEEDED review child and an IMPLEMENTED child must keep the full preflight even
+// though both are settled and both carry a result.
+//
+// SEMANTIC REVERSION THIS KILLS: widen the predicate back to "any settled child with any
+// result" and these two shapes advance under an unvalidated checkout.
+func TestCheckoutBypassIsLimitedToTheClosedPullRequestShape(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+
+	// No repo row at all, so checkoutForJob CANNOT succeed for any of these jobs. That
+	// makes the preflight the only thing standing between them and AdvanceJob.
+	seedTerminalChild(t, store, "child-superseded", workflow.JobFailed, "failed", "superseded_pr_closed")
+	seedTerminalChild(t, store, "child-succeeded", workflow.JobSucceeded, "approved", "succeeded")
+	seedTerminalChild(t, store, "child-implemented", workflow.JobFailed, "implemented", "failed")
+	// AN ORDINARY FAILED REVIEW CHILD: same state and same decision as the superseded
+	// shape, differing ONLY in that no closed-PR supersession event was written. It
+	// isolates the event discriminator - without it, this shape is indistinguishable from
+	// the sweep's own output and would advance under an unvalidated checkout.
+	seedTerminalChild(t, store, "child-plain-failure", workflow.JobFailed, "failed", "failed")
+
+	for _, agent := range []db.Agent{{
+		Name: "api", Role: "reviewer", Runtime: "codex", RuntimeRef: "last",
+		RepoScope: "gitmoot/gitmoot", Capabilities: []string{"review"},
+		AutonomyPolicy: "auto", HealthStatus: "ok",
+	}} {
+		if err := store.UpsertAgent(ctx, agent); err != nil {
+			t.Fatalf("UpsertAgent: %v", err)
+		}
+	}
+
+	worker := defaultJobWorker(store, io.Discard)
+	if err := retryPendingJobAdvancements(ctx, worker, "", "", nil, newTickCandidates(store)); err != nil {
+		t.Fatalf("retryPendingJobAdvancements: %v", err)
+	}
+
+	for _, tc := range []struct {
+		id         string
+		wantBypass bool
+		why        string
+	}{
+		{"child-superseded", true, "the closed-PR shape must advance without a checkout"},
+		{"child-succeeded", false, "a succeeded review child must keep the preflight: AdvanceJob would reach the merge gate"},
+		{"child-implemented", false, "an implemented child must keep the preflight: AdvanceJob continues implementation advancement"},
+		{"child-plain-failure", false, "an ordinary failed child must keep the preflight: only the closed-PR sweep's own output is exempt"},
+	} {
+		events, err := store.ListJobEvents(ctx, tc.id)
+		if err != nil {
+			t.Fatalf("ListJobEvents(%s): %v", tc.id, err)
+		}
+		preflightRefused := false
+		for _, event := range events {
+			if event.Kind == "advance_retry" && strings.Contains(event.Message, "preflight failed") {
+				preflightRefused = true
+			}
+		}
+		if tc.wantBypass && preflightRefused {
+			t.Fatalf("%s: preflight refused it, but %s", tc.id, tc.why)
+		}
+		if !tc.wantBypass && !preflightRefused {
+			t.Fatalf("%s: the checkout bypass swallowed it, but %s", tc.id, tc.why)
+		}
 	}
 }

@@ -3478,15 +3478,42 @@ func (w jobWorker) recordAdvanceRetryOnce(ctx context.Context, jobID, message st
 	return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_retry", Message: message})
 }
 
-// terminalParentAdvancementOnly reports whether the ONLY work this job still owes is
-// advancing its parent: it is settled, it already carries the result the parent's
-// advanceDelegations consumes, and it has a parent to advance. Such a job needs no
-// checkout, so a checkout failure must not strand it (#1673).
-func terminalParentAdvancementOnly(job db.Job, payload workflow.JobPayload) bool {
+// closedPullRequestSupersededChild reports whether this job is EXACTLY the shape the
+// closed-PR sweep produces: a delegation child that was terminalized because its pull
+// request is no longer open, carrying the synthetic failed result the parent's
+// advanceDelegations consumes (#1673).
+//
+// IT IS DELIBERATELY NARROW, and an earlier version was not. "Any settled child with any
+// result" also matches a SUCCEEDED review child and an IMPLEMENTED child, and
+// Engine.AdvanceJob does far more than parent advancement for those: it dispatches their
+// own delegations and continues into the review merge gate. Letting them through with no
+// checkout would convert a safety-preflight failure into database and remote actions
+// under an unvalidated checkout - strictly worse than the strand it was meant to fix.
+//
+// The discriminator is the supersession EVENT this sweep writes, not a state/result
+// shape that other paths can reproduce.
+func closedPullRequestSupersededChild(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload) bool {
 	if strings.TrimSpace(payload.ParentJobID) == "" || payload.Result == nil {
 		return false
 	}
-	return workflow.IsSettledJobState(job.State)
+	if job.State != string(workflow.JobFailed) {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(payload.Result.Decision), "failed") {
+		return false
+	}
+	events, err := store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		// Cannot prove the shape: keep the preflight. Failing closed here costs a poll,
+		// while guessing costs an unvalidated write.
+		return false
+	}
+	for _, event := range events {
+		if event.Kind == workflow.JobEventSupersededPullRequestClosed {
+			return true
+		}
+	}
+	return false
 }
 
 func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
@@ -3515,20 +3542,32 @@ func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 	}
 	checkout, err := w.checkoutForJob(ctx, job, payload, agent, jobRunner)
 	if err != nil {
-		// TERMINAL ADVANCEMENT DOES NOT NEED A DELIVERY CHECKOUT (#1673). This preflight
-		// exists for jobs that still have RUNTIME work to deliver. A job that is already
-		// terminal WITH a result owes exactly one thing - handing that result to its
-		// parent - and that touches the parent's DAG, not this job's worktree.
+		// THE STRUCTURAL ROUTE (#1673). A child terminalized by the closed-PR sweep can
+		// never satisfy this preflight - the shared checkout is never on a dead PR's head
+		// - and gating its parent advancement on that stranded the parent forever. But
+		// letting it through the FULL advance with an empty checkout was too broad:
+		// AdvanceJob also normalizes high-risk lens verdicts, dispatches the child's own
+		// delegations, continues into the review merge gate and registers worktree
+		// teardown, so a preflight failure would become database and remote action under
+		// an unvalidated checkout.
 		//
-		// Gating it on the checkout made the obligation unrecoverable in the case it was
-		// created for: a superseded review child's recorded head can never equal the
-		// shared checkout's HEAD (the PR is closed), so the preflight failed, the marker
-		// was re-stamped, and the parent stayed stranded forever. Reclaimed worktrees and
-		// moved task checkouts produce the same shape.
-		if !terminalParentAdvancementOnly(job, payload) {
-			return w.recordAdvanceRetryOnce(ctx, job.ID, "post-delivery workflow retry preflight failed: "+err.Error())
+		// So this shape is routed to an operation that CANNOT reach any of that, rather
+		// than to the full advance with a narrower predicate in front of it. A predicate
+		// is a list the next edit widens; an operation that cannot execute the child's own
+		// advancement cannot be widened by accident.
+		if closedPullRequestSupersededChild(ctx, w.Store, job, payload) {
+			parentOnly := w.workflowForJob("", jobRunner)
+			if advErr := parentOnly.AdvanceParentDAGForTerminalChild(ctx, job.ID); advErr != nil {
+				var blocked workflow.BlockedError
+				if errors.As(advErr, &blocked) {
+					return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_blocked", Message: advErr.Error()})
+				}
+				return w.recordAdvanceRetryOnce(ctx, job.ID, "parent-only advancement failed: "+advErr.Error())
+			}
+			return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_completed",
+				Message: "parent advancement completed without a delivery checkout (closed pull request)"})
 		}
-		checkout = ""
+		return w.recordAdvanceRetryOnce(ctx, job.ID, "post-delivery workflow retry preflight failed: "+err.Error())
 	}
 	engine := w.workflowForJob(checkout, jobRunner)
 	if err := engine.AdvanceJob(ctx, job.ID); err != nil {
