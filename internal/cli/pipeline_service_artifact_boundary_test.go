@@ -1,12 +1,13 @@
 package cli
 
 import (
-	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/proof"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/proof"
 )
 
 func TestVerifyPipelineServiceArtifactProofRejectsDigestMismatch(t *testing.T) {

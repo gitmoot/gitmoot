@@ -17,6 +17,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/events"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/githubtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -1055,7 +1056,7 @@ func TestDaemonImplementationFinalizerKeepsMissingBranchBackstop(t *testing.T) {
 		Repo: "owner/repo", PullRequest: 12, TaskID: "task-backstop",
 		FixWorktree: true, WorktreePath: t.TempDir(), Result: &workflow.AgentResult{Decision: "implemented"},
 	}
-	_, err := (newHostDaemonImplementationFinalizer(store, github.NoopClient{})).FinalizeImplementation(ctx, db.Job{ID: "late-backstop", Agent: "lead", Type: "implement"}, payload)
+	_, err := (newHostDaemonImplementationFinalizer(store, githubtest.NoopClient{})).FinalizeImplementation(ctx, db.Job{ID: "late-backstop", Agent: "lead", Type: "implement"}, payload)
 	var blocked workflow.BlockedError
 	if !errors.As(err, &blocked) || !blocked.ResultDeliveryFailed || !strings.Contains(err.Error(), "carries no payload branch") {
 		t.Fatalf("FinalizeImplementation error = %v, want delivery-blocked missing-branch backstop", err)

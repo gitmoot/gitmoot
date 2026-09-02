@@ -15,6 +15,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/githubtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -130,7 +131,7 @@ func TestReviewFixRunsInPerJobBranchWorktree(t *testing.T) {
 		executionBranch, _ = (gitutil.NewHostClient(checkout)).CurrentBranch(ctx)
 		return adapter, nil
 	}
-	worker.CommenterFactory = func(string) github.Client { return github.NoopClient{} }
+	worker.CommenterFactory = func(string) github.Client { return githubtest.NoopClient{} }
 	job, err := fixture.store.GetJob(ctx, "fix-job")
 	if err != nil {
 		t.Fatal(err)

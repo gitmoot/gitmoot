@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/githubtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -76,7 +76,7 @@ func TestFixWorktreeFinalizerDeliversPayloadBranchWhenTaskHasNone(t *testing.T) 
 		Repo: "owner/repo", Branch: branch, PullRequest: 1523, TaskID: "review-pr-1523-deadbeef",
 		FixWorktree: true, WorktreePath: fixWorktree, Result: &workflow.AgentResult{Decision: "implemented"},
 	}
-	delivered, err := (newHostDaemonImplementationFinalizer(store, github.NoopClient{})).FinalizeImplementation(
+	delivered, err := (newHostDaemonImplementationFinalizer(store, githubtest.NoopClient{})).FinalizeImplementation(
 		ctx, db.Job{ID: "fix-delivers", Agent: "lead", Type: "implement"}, payload)
 	if err != nil {
 		t.Fatalf("FinalizeImplementation returned error: %v", err)

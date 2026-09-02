@@ -1,11 +1,12 @@
 package pipeline
 
 import (
-	"github.com/gitmoot/gitmoot/internal/config"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/gitmoot/gitmoot/internal/config"
 )
 
 func TestCopyPipelineServiceStageOutRejectsSymlinkEscape(t *testing.T) {

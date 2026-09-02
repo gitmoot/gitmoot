@@ -16,6 +16,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/githubtest"
 	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -167,7 +168,7 @@ func TestApplyReviewPolicyEmptyHomeIsOff(t *testing.T) {
 }
 
 type reviewCompareClient struct {
-	github.NoopClient
+	githubtest.NoopClient
 	base   string
 	head   string
 	calls  int

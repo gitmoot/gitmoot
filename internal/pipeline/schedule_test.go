@@ -3,10 +3,11 @@ package pipeline
 import (
 	"context"
 	"fmt"
-	"github.com/gitmoot/gitmoot/internal/db"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gitmoot/gitmoot/internal/db"
 )
 
 // newScheduledPipeline stores an enabled/disabled pipeline carrying an interval

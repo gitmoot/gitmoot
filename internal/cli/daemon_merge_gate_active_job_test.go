@@ -16,12 +16,13 @@ import (
 	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/githubtest"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 type activeJobMergeGateGitHub struct {
-	github.NoopClient
+	githubtest.NoopClient
 	pr          github.PullRequest
 	mergeInputs []github.MergePullRequestInput
 	statuses    []github.CommitStatusInput
@@ -1020,7 +1021,7 @@ func terminalPollTaskEvents(t *testing.T, store *db.Store, taskID string) []db.T
 }
 
 type terminalPollMergeGateGitHub struct {
-	github.NoopClient
+	githubtest.NoopClient
 	pr       github.PullRequest
 	statuses []github.CommitStatusInput
 }

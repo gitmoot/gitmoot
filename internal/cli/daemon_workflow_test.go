@@ -14,6 +14,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/githubtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -74,7 +75,7 @@ func TestRefreshDaemonJobPayloadPreservesTaskWorktreeHeadForFinalizer(t *testing
 	if refreshed.HeadSHA != oldHead {
 		t.Fatalf("refreshed head = %q, want original %q", refreshed.HeadSHA, oldHead)
 	}
-	finalized, err := (newHostDaemonImplementationFinalizer(store, github.NoopClient{})).FinalizeImplementation(ctx, db.Job{ID: "job-implement-worktree", Agent: "lead", Type: "implement"}, refreshed)
+	finalized, err := (newHostDaemonImplementationFinalizer(store, githubtest.NoopClient{})).FinalizeImplementation(ctx, db.Job{ID: "job-implement-worktree", Agent: "lead", Type: "implement"}, refreshed)
 	if err != nil {
 		t.Fatalf("FinalizeImplementation returned error: %v", err)
 	}
@@ -119,7 +120,7 @@ func TestDaemonImplementationFinalizerCommitsBeforeReusingExistingPullRequest(t 
 	if err := store.UpsertPullRequest(ctx, db.PullRequest{RepoFullName: "owner/repo", Number: 12, URL: "https://github.com/owner/repo/pull/12", HeadBranch: "task-1", BaseBranch: "main", HeadSHA: "old", State: "open"}); err != nil {
 		t.Fatalf("UpsertPullRequest returned error: %v", err)
 	}
-	finalizer := newHostDaemonImplementationFinalizer(store, github.NoopClient{})
+	finalizer := newHostDaemonImplementationFinalizer(store, githubtest.NoopClient{})
 	payload := workflow.JobPayload{
 		Repo:      "owner/repo",
 		Branch:    "task-1",
@@ -354,7 +355,7 @@ func TestDaemonImplementationFinalizerPersistsSkipFanoutOnNoChangeReFinalize(t *
 	}
 	// Clean worktree + PR already attached + head unchanged ⇒ the no-changes early
 	// return. NoopClient: no PR-open call is expected on this path.
-	finalizer := newHostDaemonImplementationFinalizer(store, github.NoopClient{})
+	finalizer := newHostDaemonImplementationFinalizer(store, githubtest.NoopClient{})
 	payload := workflow.JobPayload{
 		Repo:                   "owner/repo",
 		Branch:                 "task-1",
@@ -422,7 +423,7 @@ func TestDaemonImplementationFinalizerPushesAlreadyCommittedWork(t *testing.T) {
 	if err := store.UpsertPullRequest(ctx, db.PullRequest{RepoFullName: "owner/repo", Number: 12, URL: "https://github.com/owner/repo/pull/12", HeadBranch: "task-1", BaseBranch: "main", HeadSHA: oldHead, State: "open"}); err != nil {
 		t.Fatalf("UpsertPullRequest returned error: %v", err)
 	}
-	finalizer := newHostDaemonImplementationFinalizer(store, github.NoopClient{})
+	finalizer := newHostDaemonImplementationFinalizer(store, githubtest.NoopClient{})
 	payload := workflow.JobPayload{
 		Repo:      "owner/repo",
 		Branch:    "task-1",
@@ -480,7 +481,7 @@ func TestDaemonImplementationFinalizerBlocksWrongBranch(t *testing.T) {
 	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Task 1", State: string(workflow.TaskImplementing), Branch: "task-1", WorktreePath: repoDir}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
-	finalizer := newHostDaemonImplementationFinalizer(store, github.NoopClient{})
+	finalizer := newHostDaemonImplementationFinalizer(store, githubtest.NoopClient{})
 	payload := workflow.JobPayload{
 		Repo:      "owner/repo",
 		Branch:    "task-1",
@@ -531,7 +532,7 @@ func TestDaemonImplementationFinalizerAllowsAlreadyFinalizedPullRequest(t *testi
 	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Task 1", State: string(workflow.TaskImplementing), Branch: "task-1", WorktreePath: repoDir}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
-	finalizer := newHostDaemonImplementationFinalizer(store, github.NoopClient{})
+	finalizer := newHostDaemonImplementationFinalizer(store, githubtest.NoopClient{})
 	payload := workflow.JobPayload{
 		Repo:        "owner/repo",
 		Branch:      "task-1",
@@ -554,7 +555,7 @@ func TestDaemonImplementationFinalizerAllowsAlreadyFinalizedPullRequest(t *testi
 }
 
 func TestNewDaemonPolicyMergeGateIncludesWorktreeCleaner(t *testing.T) {
-	gate := newDaemonPolicyMergeGate(nil, github.NoopClient{}, "/tmp/gitmoot-checkout")
+	gate := newDaemonPolicyMergeGate(nil, githubtest.NoopClient{}, "/tmp/gitmoot-checkout")
 
 	if gate.Worktrees == nil {
 		t.Fatal("daemon merge gate missing worktree cleaner")
@@ -588,7 +589,7 @@ func TestDaemonMergeGateCanBeDisabledByEnvironment(t *testing.T) {
 }
 
 func TestDaemonMergeGatePreservesInjectedGitHubClient(t *testing.T) {
-	fake := github.NoopClient{}
+	fake := githubtest.NoopClient{}
 	gate := daemonMergeGate{GitHub: fake}
 
 	if got := gate.githubClient("/tmp/checkout"); got != fake {

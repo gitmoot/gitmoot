@@ -3,14 +3,15 @@ package pipeline
 import (
 	"context"
 	"fmt"
-	"github.com/gitmoot/gitmoot/internal/config"
-	"github.com/gitmoot/gitmoot/internal/daemon"
-	"github.com/gitmoot/gitmoot/internal/db"
-	yaml "gopkg.in/yaml.v3"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/daemon"
+	"github.com/gitmoot/gitmoot/internal/db"
+	yaml "gopkg.in/yaml.v3"
 )
 
 const (

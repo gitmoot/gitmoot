@@ -12,6 +12,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/githubtest"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -358,7 +359,7 @@ func TestFixWorktreeStrandReviewBindsImplementTaskE2E(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(fixWorktree, "fix.txt"), []byte("fix\n"), 0o644); err != nil {
 		t.Fatalf("write fix change: %v", err)
 	}
-	if _, err := (newHostDaemonImplementationFinalizer(store, github.NoopClient{})).FinalizeImplementation(
+	if _, err := (newHostDaemonImplementationFinalizer(store, githubtest.NoopClient{})).FinalizeImplementation(
 		ctx, db.Job{ID: "fix-leg", Agent: "implementer", Type: "implement"}, workflow.JobPayload{
 			Repo: "owner/repo", Branch: branch, PullRequest: 1530, TaskID: "adhoc-impl",
 			FixWorktree: true, WorktreePath: fixWorktree,

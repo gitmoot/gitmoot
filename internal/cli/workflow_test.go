@@ -17,6 +17,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/githubtest"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -837,7 +838,7 @@ func TestRunTaskRunDirtyTaskWorktreeSuggestsRecover(t *testing.T) {
 }
 
 type stubTaskRecoverGitHub struct {
-	github.NoopClient
+	githubtest.NoopClient
 	input github.CreatePullRequestInput
 }
 

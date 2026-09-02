@@ -12,6 +12,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/githubtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -139,7 +140,7 @@ func TestAgentRunForegroundReviewForcedMissingTypeNamesType(t *testing.T) {
 }
 
 type fixPassPullRequestClient struct {
-	github.NoopClient
+	githubtest.NoopClient
 	pr  github.PullRequest
 	err error
 }
@@ -456,7 +457,7 @@ func TestTaskRecoverPredicateStillRejectsPullRequestOpen(t *testing.T) {
 		t.Fatal("shared implement branch-reuse predicate was widened to dismissed")
 	}
 	fixture := newFixPassFixture(t, workflow.TaskPullRequestOpen)
-	_, err := recoverTaskImplementation(context.Background(), fixture.store, fixture.task.ID, fixture.repo.FullName(), fixture.owner, false, github.NoopClient{})
+	_, err := recoverTaskImplementation(context.Background(), fixture.store, fixture.task.ID, fixture.repo.FullName(), fixture.owner, false, githubtest.NoopClient{})
 	if err == nil || !strings.Contains(err.Error(), "task recover only supports active implementation states") {
 		t.Fatalf("task recover error = %v, want unchanged pr_open refusal", err)
 	}
@@ -488,7 +489,7 @@ func TestTaskRecoverableStateIncludesDismissedWithoutWideningImplementReuse(t *t
 }
 
 type finalizerFixPassGitHub struct {
-	github.NoopClient
+	githubtest.NoopClient
 	prs         map[int64]github.PullRequest
 	getCalls    []int64
 	ensureCalls int

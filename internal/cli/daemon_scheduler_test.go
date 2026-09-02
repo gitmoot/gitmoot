@@ -24,6 +24,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/githubtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/transcript"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -1005,7 +1006,7 @@ func TestRunQueuedJobsRefreshesImplementedHeadBeforeReviewDispatch(t *testing.T)
 		return adapter, nil
 	}
 	worker.WorkflowFactory = func(checkout string) workflow.Engine {
-		engine := daemonWorkflowEngine(store, github.NoopClient{}, checkout, "")
+		engine := daemonWorkflowEngine(store, githubtest.NoopClient{}, checkout, "")
 		engine.NativeReviewFanoutEnabled = func(string) bool { return true }
 		return engine
 	}
@@ -3506,7 +3507,7 @@ func TestRetryPendingJobAdvancementsRefreshesImplementedHeadBeforePreflight(t *t
 	}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.WorkflowFactory = func(checkout string) workflow.Engine {
-		engine := daemonWorkflowEngine(store, github.NoopClient{}, checkout, "")
+		engine := daemonWorkflowEngine(store, githubtest.NoopClient{}, checkout, "")
 		engine.NativeReviewFanoutEnabled = func(string) bool { return true }
 		return engine
 	}
@@ -4483,7 +4484,7 @@ func TestRunQueuedJobsFansOutDelegationsAndEnqueuesContinuation(t *testing.T) {
 		return adapter, nil
 	}
 	worker.WorkflowFactory = func(checkout string) workflow.Engine {
-		return daemonWorkflowEngine(store, github.NoopClient{}, checkout, "")
+		return daemonWorkflowEngine(store, githubtest.NoopClient{}, checkout, "")
 	}
 
 	// Drain the DAG: coordinator -> two reviewer children -> continuation.

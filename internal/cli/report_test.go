@@ -13,6 +13,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/githubtest"
 	"github.com/gitmoot/gitmoot/internal/report"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -253,7 +254,7 @@ func replaceReportGitHubClient(client reportGitHubClient) func() {
 }
 
 type reportFakeGitHub struct {
-	github.NoopClient
+	githubtest.NoopClient
 
 	preflightRepos []github.Repository
 	searches       []string
