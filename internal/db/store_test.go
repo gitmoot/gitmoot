@@ -87,6 +87,29 @@ func TestOpenMigratesSchema(t *testing.T) {
 		}
 	}
 
+	// #1756 dropped the #33 preset delivery modes. Same reasoning as the block
+	// above: a no-op forward migration must fail HERE, in the canonical schema
+	// test, and not only in the dedicated migration test — this list is where the
+	// next reader looks to learn what the schema no longer has.
+	for _, table := range []string{"preset_session_state"} {
+		ok, err := store.HasTable(ctx, table)
+		if err != nil {
+			t.Fatalf("HasTable(%s) returned error: %v", table, err)
+		}
+		if ok {
+			t.Fatalf("table %s still exists; the #1756 forward DROP migration did not run", table)
+		}
+	}
+	for _, column := range []string{"preset_delivery"} {
+		var count int
+		if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('agents') WHERE name = ?`, column).Scan(&count); err != nil {
+			t.Fatalf("pragma_table_info(agents) returned error: %v", err)
+		}
+		if count != 0 {
+			t.Fatalf("agents.%s still exists; the #1756 DROP COLUMN did not run", column)
+		}
+	}
+
 	// The candidate/canary columns and their partial index go with the states that
 	// used them. Reading pragma_table_info directly means a rebuild that forgot a
 	// column, or a DROP COLUMN that silently failed, fails here.

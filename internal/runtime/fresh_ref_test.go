@@ -83,7 +83,7 @@ func TestValidateAgentAcceptsFreshRefs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFreshRef returned error: %v", err)
 	}
-	for _, runtimeName := range []string{CodexRuntime, ClaudeRuntime, KimiRuntime, KimiCLIRuntime} {
+	for _, runtimeName := range []string{CodexRuntime, ClaudeRuntime, KimiRuntime} {
 		agent := Agent{Name: "audit", Role: "reviewer", Runtime: runtimeName, RuntimeRef: ref, RepoScope: "gitmoot/gitmoot"}
 		if err := ValidateAgent(agent); err != nil {
 			t.Fatalf("ValidateAgent rejected fresh ref for %s: %v", runtimeName, err)

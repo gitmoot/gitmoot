@@ -26,7 +26,7 @@ import (
 // Gitmoot never REJECTS a --model based on it, so populating it cannot change how a
 // job is delivered.
 type RuntimeMetadata struct {
-	// Name is the runtime id (codex, claude, kimi, kimi-cli, omp, shell).
+	// Name is the runtime id (codex, claude, kimi, omp, shell).
 	Name string
 	// Dispatchable is true for a runtime backed by a compiled Go adapter (every
 	// built-in). Config can TWEAK a built-in runtime's metadata but cannot add a
@@ -151,14 +151,6 @@ func newBuiltinRegistry() Registry {
 			UsageSource:  "kimi `--output-format stream-json` usage event (kimi-code 0.19.2 emits none -> 0)",
 			Description:  "Kimi Code CLI (prompt mode, stream-json, per-job fresh session)",
 			Contract:     kimiRuntimeContract,
-		},
-		{
-			Name:         KimiCLIRuntime,
-			Dispatchable: true,
-			Capabilities: []string{"review", "implement", "ask"},
-			UsageSource:  "kimi `--print` `--output-format stream-json` usage event (legacy kimi-cli)",
-			Description:  "Legacy kimi-cli runtime (--print prompt mode; same model family as kimi)",
-			Contract:     kimiCLIRuntimeContract,
 		},
 		{
 			Name:         OmpRuntime,

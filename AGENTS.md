@@ -15,8 +15,7 @@ single static Go binary plus a background daemon; workflow state lives in local
 SQLite (the **modernc pure-Go** driver — no cgo). The single static binary with
 **zero runtime dependencies** is a core invariant.
 
-It drives five runtimes (`codex`, `claude`, `kimi`, `omp`, `shell`; plus the
-legacy `kimi-cli`). `agent start` supports codex/claude/kimi/omp; `shell` is a
+It drives five runtimes (`codex`, `claude`, `kimi`, `omp`, `shell`). `agent start` supports codex/claude/kimi/omp; `shell` is a
 subscribe-only command runtime used mainly to drive engine-feature E2Es with no
 LLM.
 
@@ -245,7 +244,7 @@ portable code behavior.
 ## Agent jobs & the result contract
 
 gitmoot runs agents through registered runtimes — **Codex, Claude Code, Kimi
-Code, and omp** (`gitmoot agent start --runtime codex|claude|kimi|kimi-cli|omp`).
+Code, and omp** (`gitmoot agent start --runtime codex|claude|kimi|omp`).
 Jobs return a `gitmoot_result` JSON object, and agents can fan work out via a
 validated `delegations[]` DAG with a coordinator continuation job (the
 **Orchestra** pattern), bounded by depth, a per-root job budget, and loop

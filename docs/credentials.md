@@ -1,7 +1,7 @@
 # Runtime Ambient Credential Hygiene
 
 Gitmoot can curate the environment of runtime-agent subprocesses. The feature is
-off by default and applies to Codex, Claude Code, Kimi Code, legacy `kimi-cli`,
+off by default and applies to Codex, Claude Code, Kimi Code, omp,
 and shell runtime adapters in foreground and daemon-worker delivery paths.
 
 ```toml
@@ -169,7 +169,7 @@ Runtime-specific additions are:
   strictly fail-closed), and `--profile` selects omp's auth/state store without
   isolating process environment, so a passed-through key is visible to every omp
   profile this daemon runs.
-- Kimi Code, legacy `kimi-cli`, and shell: no additions. Shell stage variables,
+- Kimi Code and shell: no additions. Shell stage variables,
   pipeline metadata, and the upstream-context file variable are job-owned
   injections and are appended after the curated base.
 

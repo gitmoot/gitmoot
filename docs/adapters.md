@@ -52,8 +52,7 @@ type Agent struct {
 
 `RuntimeRef` is runtime-specific. Codex accepts a session UUID, thread name, or
 `last`. Claude accepts a UUID or `last`. Kimi accepts a Kimi session id of the
-form `session_<uuid>` or empty. Kimi CLI (legacy, `kimi-cli`) accepts a session
-UUID or empty. omp accepts a session UUID or `fresh:<suffix>` — never `last`,
+form `session_<uuid>` or empty. omp accepts a session UUID or `fresh:<suffix>` — never `last`,
 because it never resumes — and its adapter also accepts an empty reference,
 since delivery ignores the value entirely. Shell uses the configured command.
 `TemplateID` is Gitmoot-owned metadata. Adapters do not fetch or interpret template
@@ -106,18 +105,6 @@ kimi -S <session-id> -p '<job-prompt>' --output-format stream-json
 
 Kimi runs against a logged-in Kimi CLI. Run `kimi login`, then restart the
 Gitmoot daemon so it inherits the session.
-
-The opt-in `kimi-cli` runtime (#546) targets the **legacy** Kimi CLI, which
-requires the older `--print` command shape the current Kimi Code CLI does not
-support:
-
-```sh
-kimi --print -p '<prompt>' --output-format stream-json
-```
-
-It is intentionally a separate runtime name so the default `kimi` (Kimi Code)
-path is never probed or changed; choose `kimi` unless you specifically run the
-legacy CLI. The two count as the same runtime family for cross-family review.
 
 omp (oh-my-pi) startup and every later job run the SAME argument vector — one
 builder, so no flag can appear on one path and go missing on the other:

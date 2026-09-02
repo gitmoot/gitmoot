@@ -92,12 +92,6 @@ func appendDeliveryAdapterOutput(adapter workflow.DeliveryAdapter, out io.Writer
 	case *runtime.KimiAdapter:
 		a.Runner = appendRuntimeOutputRunner(a.Runner, out)
 		return a, nil
-	case runtime.KimiCLIAdapter:
-		a.Runner = appendRuntimeOutputRunner(a.Runner, out)
-		return a, nil
-	case *runtime.KimiCLIAdapter:
-		a.Runner = appendRuntimeOutputRunner(a.Runner, out)
-		return a, nil
 	case runtime.OmpAdapter:
 		a.Runner = appendRuntimeOutputRunner(a.Runner, out)
 		return a, nil

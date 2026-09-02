@@ -33,8 +33,8 @@ gitmoot plugin doctor
 gitmoot agent template list
 gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
 gitmoot agent template update thermo-nuclear-code-quality-review
-gitmoot agent start <name> --runtime codex|claude|kimi|kimi-cli|omp --repo owner/repo --path . --template thermo-nuclear-code-quality-review --start-daemon
-gitmoot agent subscribe <name> --runtime codex|claude|kimi|kimi-cli|omp|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
+gitmoot agent start <name> --runtime codex|claude|kimi|omp --repo owner/repo --path . --template thermo-nuclear-code-quality-review --start-daemon
+gitmoot agent subscribe <name> --runtime codex|claude|kimi|omp|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
 gitmoot agent run <name> "message" --repo owner/repo [--task task-id] [--pr number] [--background]
 gitmoot agent review <name> "message" --repo owner/repo --pr number [--background] # exact-head loop guard applies
 gitmoot agent run <name> "message" --repo owner/repo [--task task-id] [--pr number] [--lead implementer] [--background]

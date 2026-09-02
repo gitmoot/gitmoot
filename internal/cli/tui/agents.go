@@ -100,7 +100,7 @@ func (m *Model) openAgentDelete(agent Agent) {
 }
 
 // agentRuntimeOptions are the runtimes an agent can be switched between.
-var agentRuntimeOptions = []string{"codex", "claude", "kimi", "kimi-cli"}
+var agentRuntimeOptions = []string{"codex", "claude", "kimi"}
 
 // openAgentRuntimePick enters the switch-runtime overlay, preselecting the
 // agent's current runtime.
@@ -559,13 +559,12 @@ func NewAgentCreateForm(store PromptStore, templates []Choice) TrainInitModel {
 				{Value: "codex", Label: "codex"},
 				{Value: "claude", Label: "claude"},
 				{Value: "kimi", Label: "kimi"},
-				{Value: "kimi-cli", Label: "kimi-cli"},
 			},
 			Default: "codex",
 			Prompt: db.InteractivePrompt{
 				ID:            "agent-create-runtime",
 				Question:      "Runtime for the new agent?",
-				Choices:       []string{"codex", "claude", "kimi", "kimi-cli"},
+				Choices:       []string{"codex", "claude", "kimi"},
 				Default:       "codex",
 				Required:      true,
 				AnswerFormat:  "choice",

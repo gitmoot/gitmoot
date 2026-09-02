@@ -272,6 +272,11 @@ func invokesModelCLI(command string) bool {
 		field = strings.Trim(field, "'\"`;|&(){}[]")
 		base := filepath.Base(field)
 		switch base {
+		// Binary base names as they appear ON DISK, deliberately not the
+		// gitmoot runtime set: a shell agent can invoke any model CLI the box
+		// has installed. `kimi-cli` stays after #1756 removed the runtime of
+		// that name — the binary still exists and dropping it would narrow the
+		// heuristic for commands gitmoot never dispatched.
 		case "claude", "codex", "kimi", "kimi-cli", "omp":
 			return true
 		}

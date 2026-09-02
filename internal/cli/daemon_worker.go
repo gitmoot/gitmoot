@@ -1509,12 +1509,6 @@ func wrapReadOnlyAdapterRunner(runtimeName string, adapter workflow.DeliveryAdap
 	case *runtime.KimiAdapter:
 		a.Runner = wrap(a.Runner)
 		return a, nil
-	case runtime.KimiCLIAdapter:
-		a.Runner = wrap(a.Runner)
-		return a, nil
-	case *runtime.KimiCLIAdapter:
-		a.Runner = wrap(a.Runner)
-		return a, nil
 	case runtime.OmpAdapter, *runtime.OmpAdapter:
 		return nil, errors.New("read-only seats cannot use omp without an isolated credential broker")
 	case runtime.ShellAdapter:
@@ -1633,7 +1627,7 @@ func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string, gatewayM
 		}
 		relativeState = ".codex"
 		credentialFile = "auth.json"
-	case runtime.KimiRuntime, runtime.KimiCLIRuntime:
+	case runtime.KimiRuntime:
 		if sourceDir == "" {
 			sourceDir = filepath.Join(userHome, ".kimi-code")
 		}
@@ -2106,7 +2100,7 @@ func perJobAdmissionEstimate(ctx context.Context, store *db.Store, job db.Job, p
 		return admissionEstimate{session: true, memGB: policy.CodexMemoryGB}
 	case runtime.ClaudeRuntime:
 		return admissionEstimate{session: true, memGB: policy.ClaudeMemoryGB}
-	case runtime.KimiRuntime, runtime.KimiCLIRuntime:
+	case runtime.KimiRuntime:
 		return admissionEstimate{session: true, memGB: policy.KimiMemoryGB}
 	default:
 		return admissionEstimate{session: true, memGB: policy.DefaultMemoryGB}
@@ -2480,7 +2474,7 @@ func tempWorkerEligible(ctx context.Context, store *db.Store, job db.Job, payloa
 		return tempWorkerEligibility{Reason: "parallel_sessions.same_session is queue"}
 	}
 	switch agent.Runtime {
-	case runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime, runtime.KimiCLIRuntime:
+	case runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime:
 	default:
 		return tempWorkerEligibility{Reason: fmt.Sprintf("runtime %s does not support temp workers", agent.Runtime)}
 	}
@@ -3717,8 +3711,6 @@ func buildLocalRuntimeAdapter(home string, agent runtime.Agent, checkout string,
 		adapter = runtime.ClaudeAdapter{Dir: checkout, Runner: runner}
 	case runtime.KimiRuntime:
 		adapter = runtime.KimiAdapter{Dir: checkout, Runner: runner}
-	case runtime.KimiCLIRuntime:
-		adapter = runtime.KimiCLIAdapter{Dir: checkout, Runner: runner}
 	case runtime.OmpRuntime:
 		adapter = runtime.OmpAdapter{Dir: checkout, Runner: runner}
 	case runtime.ShellRuntime:

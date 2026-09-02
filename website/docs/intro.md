@@ -51,8 +51,8 @@ flowchart TD
   Daemon --> GitHub[GitHub issues and PRs]
 ```
 
-Codex, Claude Code, Kimi Code, omp, and the legacy `kimi-cli` are the runtimes
-Gitmoot can start or subscribe; shell is subscribe-only.
+Codex, Claude Code, Kimi Code, and omp are the runtimes Gitmoot can start or
+subscribe; shell is subscribe-only.
 
 Use the docs here for the human workflow; agents have the index callout above.
 

@@ -920,7 +920,7 @@ func TestSupportsPlanMode(t *testing.T) {
 	if !SupportsPlanMode(OmpRuntime) || !SupportsPlanMode("  "+OmpRuntime+"  ") {
 		t.Fatal("omp must support plan mode")
 	}
-	for _, name := range []string{CodexRuntime, ClaudeRuntime, KimiRuntime, KimiCLIRuntime, ShellRuntime, "", "bogus"} {
+	for _, name := range []string{CodexRuntime, ClaudeRuntime, KimiRuntime, ShellRuntime, "", "bogus"} {
 		if SupportsPlanMode(name) {
 			t.Fatalf("runtime %q must not claim plan mode", name)
 		}

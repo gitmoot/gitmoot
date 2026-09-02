@@ -13,7 +13,7 @@ import (
 func TestBuiltinRegistryMatchesSupportedRuntimes(t *testing.T) {
 	reg := BuiltinRuntimeRegistry()
 	got := reg.dispatchableNames()
-	want := []string{CodexRuntime, ClaudeRuntime, KimiRuntime, KimiCLIRuntime, OmpRuntime, ShellRuntime}
+	want := []string{CodexRuntime, ClaudeRuntime, KimiRuntime, OmpRuntime, ShellRuntime}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("dispatchableNames() = %v, want %v", got, want)
 	}

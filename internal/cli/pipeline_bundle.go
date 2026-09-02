@@ -724,7 +724,7 @@ func pipelineBundleRuntimeAvailable(name string) bool {
 		return true
 	}
 	binary := name
-	if name == runtime.KimiRuntime || name == runtime.KimiCLIRuntime {
+	if name == runtime.KimiRuntime {
 		binary = "kimi"
 	}
 	supported := false

@@ -32,12 +32,6 @@ type Agent struct {
 	Capabilities   []string
 	AutonomyPolicy string
 	HealthStatus   string
-	// PresetDelivery is the per-agent prompt preset delivery mode (#33): one of
-	// full (the default and pre-#33 behavior — always inline the whole preset),
-	// referenced, or auto. Backed by the additive agents.preset_delivery column
-	// (DEFAULT 'full'), so every existing row and every agent that never sets it
-	// reads 'full' and behaves byte-identically.
-	PresetDelivery string
 }
 
 type AgentTemplate struct {

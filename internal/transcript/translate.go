@@ -36,7 +36,7 @@ func newTranslator(runtimeName string, now func() time.Time) (Translator, error)
 		return &codexTranslator{now: now, tools: make(map[string]pendingTool)}, nil
 	case gitmootruntime.ClaudeRuntime:
 		return &claudeTranslator{}, nil
-	case gitmootruntime.KimiRuntime, gitmootruntime.KimiCLIRuntime:
+	case gitmootruntime.KimiRuntime:
 		return &kimiTranslator{now: now, tools: make(map[string]pendingTool)}, nil
 	case gitmootruntime.OmpRuntime:
 		return ompTranslator{}, nil

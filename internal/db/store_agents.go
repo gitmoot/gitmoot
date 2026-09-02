@@ -20,8 +20,8 @@ func (s *Store) UpsertAgent(ctx context.Context, agent Agent) error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO agents(name, role, runtime, runtime_ref, repo_scope, template_id, model, effort, capabilities_json, autonomy_policy, health_status, preset_delivery, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO agents(name, role, runtime, runtime_ref, repo_scope, template_id, model, effort, capabilities_json, autonomy_policy, health_status, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 			ON CONFLICT(name) DO UPDATE SET
 				role = excluded.role,
 				runtime = excluded.runtime,
@@ -33,9 +33,8 @@ func (s *Store) UpsertAgent(ctx context.Context, agent Agent) error {
 				capabilities_json = excluded.capabilities_json,
 				autonomy_policy = excluded.autonomy_policy,
 				health_status = excluded.health_status,
-				preset_delivery = excluded.preset_delivery,
 				updated_at = CURRENT_TIMESTAMP`,
-		agent.Name, agent.Role, agent.Runtime, agent.RuntimeRef, agent.RepoScope, agent.TemplateID, agent.Model, agent.Effort, string(capabilities), agent.AutonomyPolicy, agent.HealthStatus, normalizePresetDeliveryStored(agent.PresetDelivery)); err != nil {
+		agent.Name, agent.Role, agent.Runtime, agent.RuntimeRef, agent.RepoScope, agent.TemplateID, agent.Model, agent.Effort, string(capabilities), agent.AutonomyPolicy, agent.HealthStatus); err != nil {
 		return err
 	}
 	if strings.TrimSpace(agent.RepoScope) != "" {
@@ -48,9 +47,9 @@ func (s *Store) UpsertAgent(ctx context.Context, agent Agent) error {
 }
 
 // UpdateAgentRuntime switches a registered agent's runtime (codex, claude, kimi,
-// or omp — the allow-list below; kimi-cli is missing from it and is flagged, not
-// fixed, in #1428), preserving its role, capabilities, repo scope, template, and
-// policy. The warm
+// or omp — the allow-list below, which now matches the adapter registry exactly:
+// the legacy kimi-cli runtime it used to omit (#1428) is gone (#1756)),
+// preserving its role, capabilities, repo scope, template, and policy. The warm
 // runtime_ref is cleared because it is bound to the old runtime — the next job
 // starts a fresh session for the new runtime. The old agent_instance, if any,
 // idle-expires on its own.
@@ -59,7 +58,7 @@ func (s *Store) UpdateAgentRuntime(ctx context.Context, name, runtime string) er
 	if runtime != "codex" && runtime != "claude" && runtime != "kimi" && runtime != "omp" {
 		return fmt.Errorf("unknown runtime %q (want codex, claude, kimi, or omp)", runtime)
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, template_id, model, effort, capabilities_json, autonomy_policy, health_status, preset_delivery
+	row := s.db.QueryRowContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, template_id, model, effort, capabilities_json, autonomy_policy, health_status
 		FROM agents WHERE name = ?`, name)
 	agent, err := scanAgent(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -96,7 +95,7 @@ func (s *Store) UpdateAgentRuntimeRef(ctx context.Context, name, ref string) err
 }
 
 func (s *Store) GetAgent(ctx context.Context, name string) (Agent, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, template_id, model, effort, capabilities_json, autonomy_policy, health_status, preset_delivery
+	row := s.db.QueryRowContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, template_id, model, effort, capabilities_json, autonomy_policy, health_status
 		FROM agents WHERE name = ?`, name)
 	agent, err := scanAgent(row)
 	if err == nil {
@@ -125,14 +124,11 @@ func (s *Store) GetAgent(ctx context.Context, name string) (Agent, error) {
 		Capabilities:   instance.Capabilities,
 		AutonomyPolicy: policy,
 		HealthStatus:   instance.State,
-		// Ephemeral/temp-worker instances have no preset_delivery column; they
-		// always deliver the full preset (#33), matching the 'full' default.
-		PresetDelivery: PresetDeliveryFull,
 	}, nil
 }
 
 func (s *Store) ListAgents(ctx context.Context) ([]Agent, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, template_id, model, effort, capabilities_json, autonomy_policy, health_status, preset_delivery
+	rows, err := s.db.QueryContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, template_id, model, effort, capabilities_json, autonomy_policy, health_status
 		FROM agents ORDER BY name`)
 	if err != nil {
 		return nil, err
@@ -646,7 +642,7 @@ func parseHeartbeatTime(value string) time.Time {
 func scanAgent(scanner agentScanner) (Agent, error) {
 	var agent Agent
 	var capabilities string
-	if err := scanner.Scan(&agent.Name, &agent.Role, &agent.Runtime, &agent.RuntimeRef, &agent.RepoScope, &agent.TemplateID, &agent.Model, &agent.Effort, &capabilities, &agent.AutonomyPolicy, &agent.HealthStatus, &agent.PresetDelivery); err != nil {
+	if err := scanner.Scan(&agent.Name, &agent.Role, &agent.Runtime, &agent.RuntimeRef, &agent.RepoScope, &agent.TemplateID, &agent.Model, &agent.Effort, &capabilities, &agent.AutonomyPolicy, &agent.HealthStatus); err != nil {
 		return Agent{}, err
 	}
 	if err := json.Unmarshal([]byte(capabilities), &agent.Capabilities); err != nil {
