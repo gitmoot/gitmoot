@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/gitmoot/gitmoot/internal/github"
 	"io"
 	"os"
 	"os/signal"
@@ -17,7 +18,6 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
 	"github.com/gitmoot/gitmoot/internal/config"
-	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
@@ -1501,7 +1501,7 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	if memoryExplicit {
 		memoryEnrolled = *memoryFlag
 	}
-	repo, err := daemon.ParseRepository(*repoFlag)
+	repo, err := github.ParseRepository(*repoFlag)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid repo: %v\n", err)
 		return 2
@@ -1850,7 +1850,7 @@ func registerAgentOnly(ctx context.Context, store *db.Store, name, runtimeName, 
 	}
 	repos := []string{}
 	if agent.RepoScope != "" {
-		repo, err := daemon.ParseRepository(agent.RepoScope)
+		repo, err := github.ParseRepository(agent.RepoScope)
 		if err != nil {
 			return err
 		}
@@ -2605,7 +2605,7 @@ func normalizeRepoFlags(values []string) ([]string, error) {
 }
 
 func normalizeRepoFlag(value string) (string, error) {
-	repo, err := daemon.ParseRepository(value)
+	repo, err := github.ParseRepository(value)
 	if err != nil {
 		return "", err
 	}

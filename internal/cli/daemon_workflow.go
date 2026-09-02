@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/config"
-	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
@@ -175,7 +174,7 @@ func (n *daemonEscalationNotifier) NotifyEscalation(ctx context.Context, request
 		// still stands. Nothing to notify.
 		return nil
 	}
-	repo, err := daemon.ParseRepository(repoFull)
+	repo, err := github.ParseRepository(repoFull)
 	if err != nil {
 		return err
 	}
@@ -484,7 +483,7 @@ func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Contex
 	if hasValidatedPR {
 		return f.adoptValidatedImplementationPullRequest(ctx, payload, task, validatedPR, head)
 	}
-	repo, err := daemon.ParseRepository(payload.Repo)
+	repo, err := github.ParseRepository(payload.Repo)
 	if err != nil {
 		return payload, err
 	}
@@ -565,7 +564,7 @@ func (f daemonImplementationFinalizer) revalidateImplementationPullRequest(ctx c
 	if payload.PullRequest <= 0 {
 		return github.PullRequest{}, false, blockedResultDelivery("validated implementation payload has no pull request number")
 	}
-	repo, err := daemon.ParseRepository(payload.Repo)
+	repo, err := github.ParseRepository(payload.Repo)
 	if err != nil {
 		return github.PullRequest{}, false, err
 	}

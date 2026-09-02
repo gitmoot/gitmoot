@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/config"
-	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/github"
 )
 
@@ -51,7 +50,7 @@ func resolveGitHubRemote(paths config.Paths, repoFlag, refFlag, pathFlag, defaul
 	if repo == "" {
 		return "", "", "", errors.New(missingMessage)
 	}
-	if _, parseErr := daemon.ParseRepository(repo); parseErr != nil {
+	if _, parseErr := github.ParseRepository(repo); parseErr != nil {
 		return "", "", "", parseErr
 	}
 	ref = strings.TrimSpace(refFlag)
@@ -112,7 +111,7 @@ func runGitHubRemoteSet(args []string, stdout, stderr io.Writer, opts githubRemo
 		fmt.Fprintf(stderr, "%s set requires exactly one <owner/repo>\n", opts.Command)
 		return 2
 	}
-	repository, err := daemon.ParseRepository(repoArg)
+	repository, err := github.ParseRepository(repoArg)
 	if err != nil {
 		fmt.Fprintf(stderr, "set %s remote: %v\n", opts.Noun, err)
 		return 2

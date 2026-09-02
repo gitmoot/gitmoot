@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
-	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/github"
@@ -586,7 +585,7 @@ func runDaemonWorkerGit(t *testing.T, dir string, args ...string) {
 
 func seedDaemonWorkerRepo(t *testing.T, store *db.Store, fullName string, checkout string) {
 	t.Helper()
-	repo, err := daemon.ParseRepository(fullName)
+	repo, err := github.ParseRepository(fullName)
 	if err != nil {
 		t.Fatalf("ParseRepository returned error: %v", err)
 	}

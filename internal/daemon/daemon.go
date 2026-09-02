@@ -3309,11 +3309,3 @@ func issueJobID(repo github.Repository, issueNumber, commentID int64, sequence i
 	_, _ = hash.Write([]byte(action))
 	return "issue-comment-" + strconv.FormatUint(hash.Sum64(), 36)
 }
-
-func ParseRepository(value string) (github.Repository, error) {
-	parts := strings.Split(strings.TrimSpace(value), "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return github.Repository{}, fmt.Errorf("repo must be owner/repo")
-	}
-	return github.Repository{Owner: parts[0], Name: parts[1]}, nil
-}

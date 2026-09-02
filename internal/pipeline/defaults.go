@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"github.com/gitmoot/gitmoot/internal/config"
-	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/github"
 	yaml "gopkg.in/yaml.v3"
 	"io"
 	"os"
@@ -99,7 +99,7 @@ func InstallDefaultMemoryPipelinesForDaemon(ctx context.Context, store *db.Store
 
 func defaultMemoryPipelineRepo(ctx context.Context, store *db.Store, settings config.MemoryPipelineSettings) (string, error) {
 	if repo := strings.TrimSpace(settings.Repo); repo != "" {
-		parsed, err := daemon.ParseRepository(repo)
+		parsed, err := github.ParseRepository(repo)
 		if err != nil {
 			return "", fmt.Errorf("memory.pipelines.repo: %w", err)
 		}
@@ -107,7 +107,7 @@ func defaultMemoryPipelineRepo(ctx context.Context, store *db.Store, settings co
 	}
 	for _, source := range settings.IngestSources {
 		if repo := strings.TrimSpace(source.Repo); repo != "" {
-			parsed, err := daemon.ParseRepository(repo)
+			parsed, err := github.ParseRepository(repo)
 			if err != nil {
 				return "", fmt.Errorf("memory.ingest repo %q: %w", repo, err)
 			}

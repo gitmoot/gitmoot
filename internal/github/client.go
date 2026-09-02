@@ -1877,3 +1877,19 @@ func firstNonEmpty(values ...string) string {
 	}
 	return ""
 }
+
+// ParseRepository parses an "owner/repo" argument into a Repository.
+//
+// It lives here rather than in internal/daemon because it CONSTRUCTS the Repository
+// type this package owns, and because internal/pipeline imported internal/daemon for
+// this one symbol and nothing else - the single edge that blocked moving the daemon
+// worker into internal/daemon (#1760). internal/git was the other candidate and was
+// rejected: it does not import internal/github, so putting a Repository constructor
+// there would ADD an import edge to delete none.
+func ParseRepository(value string) (Repository, error) {
+	parts := strings.Split(strings.TrimSpace(value), "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return Repository{}, fmt.Errorf("repo must be owner/repo")
+	}
+	return Repository{Owner: parts[0], Name: parts[1]}, nil
+}

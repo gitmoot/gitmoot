@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
-	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -418,7 +417,7 @@ func validateSessionParentJob(ctx context.Context, store *db.Store, parentJobID 
 // explicitly provided repo. Requiring the repo be tracked keeps the recorded
 // session job consistent with the registered-agent path and rejects typos.
 func validateSessionRepo(ctx context.Context, store *db.Store, repoFlag string) (string, error) {
-	repo, err := daemon.ParseRepository(repoFlag)
+	repo, err := github.ParseRepository(repoFlag)
 	if err != nil {
 		return "", err
 	}

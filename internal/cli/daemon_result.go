@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/gitmoot/gitmoot/internal/github"
 	"strings"
 	"time"
 
-	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -620,7 +620,7 @@ func (w jobWorker) postJobResultComment(ctx context.Context, jobID string, agent
 	if posted {
 		return nil
 	}
-	repo, err := daemon.ParseRepository(payload.Repo)
+	repo, err := github.ParseRepository(payload.Repo)
 	if err != nil {
 		return err
 	}

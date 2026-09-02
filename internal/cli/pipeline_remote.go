@@ -14,7 +14,6 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
 	"github.com/gitmoot/gitmoot/internal/config"
-	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
 	yaml "gopkg.in/yaml.v3"
@@ -123,7 +122,7 @@ func runPipelinePublish(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return err
 		}
-		repository, err := daemon.ParseRepository(repoName)
+		repository, err := github.ParseRepository(repoName)
 		if err != nil {
 			return err
 		}
@@ -324,7 +323,7 @@ func runPipelinePull(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "pipeline pull requires a name-safe pipeline name or --list")
 		return 2
 	}
-	if _, err := daemon.ParseRepository(*repoFlag); err != nil {
+	if _, err := github.ParseRepository(*repoFlag); err != nil {
 		fmt.Fprintf(stderr, "pipeline pull: --repo is required and must be owner/name: %v\n", err)
 		return 2
 	}
