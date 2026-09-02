@@ -324,11 +324,18 @@ live-probe before close. **Merge authority is whatever the org config records
 for your role**: `merge_rule = "self"` means the coordinator merges its own
 lane's PRs once one independent review is clean at the exact head and the PR is
 mergeable with CI green; `merge_rule = "owner"` means the owner merges. The
-`[org.roles."<role>"]` block in the gitmoot config is the authority of record
-and this file only describes it, so settle any future disagreement with a
-config read (`gitmoot org status`, `[org.roles]` in `config.toml`), not another
-doc edit. **Public releases are unchanged and still need explicit OWNER
-sign-off** — merge authority moved on 2026-08-31, release authority did not.
+field is **advisory** — `merge_gate.go` never reads it (`internal/config/org.go`
+calls it "deliberately advisory in phase 1a"), so nothing mechanically stops a
+merge you are not entitled to make; the gate enforces exact-head review, CI and
+attribution, never role authority. The `[org.roles."<role>"]` block in the
+gitmoot config is the authority of record and this file only describes it, so
+settle any future disagreement with a config read — `gitmoot org chart` prints
+`merge=<rule>` per role, `gitmoot org brief --role <role>` prints
+`merge_rule: <rule>`, `gitmoot org status --json` carries the field, and
+`[org.roles]` in `config.toml` is the source. Plain `gitmoot org status` has no
+merge column, so it cannot answer this. **Public releases are unchanged and
+still need explicit OWNER sign-off** — merge authority moved on 2026-08-31,
+release authority did not.
 Under ultracode, orchestrate via the Workflow tool with opus sub-agents
 (protect the scarcer fable quota).
 
