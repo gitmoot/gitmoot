@@ -133,10 +133,7 @@ gitmoot report bug --job <job-id> --create --yes
 ```
 
 The command prints either `created issue: ...` or `existing issue: ...`; use that
-URL when sharing status. In the interactive dashboard, select a failed, blocked,
-or cancelled job and press `B report bug` to open the same preview, then `g` to
-create or reuse the issue. If creation fails, the preview stays open and shows
-the error inline.
+URL when sharing status.
 
 ## Plugin Doctor Fails
 
@@ -474,25 +471,6 @@ this head` and leaves any real gate verdict untouched. A `blocked` or
 `awaiting_human` task keeps the marker, because that head genuinely has not been
 cleared and Gitmoot can still resolve it when the task resumes. A draft pull
 request keeps the marker until it is undrafted.
-
-## Dashboard Blank Or Noninteractive
-
-Symptom: `gitmoot dashboard` does not open the TUI, prints plain output, or
-looks blank under a script/agent.
-
-Likely cause: stdin/stdout is not a TTY, `TERM=dumb`, or TUI was disabled.
-
-Check:
-
-```sh
-gitmoot dashboard --plain
-gitmoot dashboard --json
-gitmoot dashboard --watch
-echo "$TERM"
-```
-
-Fix: run from a real terminal for the interactive TUI, or use `--plain` /
-`--json` in agents, CI, pipes, and redirected output.
 
 ## Live Docs Or LLM Context Stale
 

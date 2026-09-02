@@ -331,12 +331,6 @@ func finishDelegationCleanupAttempt(ctx context.Context, worker jobWorker, jobID
 // lock leak) is the correct recovery.
 const daemonPollTimeout = 2 * time.Minute
 
-// cockpitReconcileInterval is the low-frequency cadence of the cockpit reconcile
-// GC sweep (Task 7): it drops cockpit_pane rows whose herdr pane is gone and whose
-// owning root is terminal. It runs rarely because it is a backstop for the
-// per-Deliver / root-finalize teardown plus report-metadata --ttl-ms self-expiry.
-const cockpitReconcileInterval = 5 * time.Minute
-
 var errRuntimeSessionBusy = errors.New("runtime session is busy")
 
 // runtimeLockWaitEpisodes dedups the runtime_lock_wait job_event: a job that

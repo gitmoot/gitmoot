@@ -138,12 +138,13 @@ func TestMigrationsUpgradeFromPreviousReleasedVersion(t *testing.T) {
 	// The marker names THIS BRANCH's migration, and it has moved five times as main
 	// advanced: the cleanup_obligations rebuild, #1766's SkillOpt/evals teardown,
 	// #1770's Activepieces trigger removal, #1731's escalation_rounds table and
-	// #1754's chat/moot teardown each joined the released prefix, leaving #1756's
-	// preset-delivery removal appended last. Two branches cannot both be "last", and
-	// the ordering that matters is the one a deployed database sees — which is why
-	// this marker MUST be repointed on every branch that appends a migration, and
-	// why the failure reads as "not appended last" rather than as a merge conflict.
-	const branchMigrationMarker = "ALTER TABLE agents DROP COLUMN preset_delivery"
+	// #1754's chat/moot teardown and #1756's preset-delivery removal each joined the
+	// released prefix, leaving #1753's cockpit/interactive table drop appended last.
+	// Two branches cannot both be "last", and the ordering that matters is the one a
+	// deployed database sees — which is why this marker MUST be repointed on every
+	// branch that appends a migration, and why the failure reads as "not appended
+	// last" rather than as a merge conflict.
+	const branchMigrationMarker = "DROP TABLE IF EXISTS cockpit_panes"
 	branchIndex := -1
 	for index, migration := range migrations {
 		if strings.Contains(migration, branchMigrationMarker) {

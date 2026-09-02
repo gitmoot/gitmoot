@@ -1090,9 +1090,6 @@ func (e Engine) delegationRequest(job db.Job, payload JobPayload, d Delegation) 
 		SkipNativeReviewFanout: payload.SkipNativeReviewFanout,
 		// Cockpit settings are inherited from the coordinator so every delegation
 		// subagent in one tree renders a pane under the same workspace/session.
-		Cockpit:        payload.Cockpit,
-		CockpitSession: payload.CockpitSession,
-		CockpitPaneKey: payload.CockpitPaneKey,
 	}
 }
 

@@ -13,7 +13,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
-	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/transcript"
 )
 
@@ -74,22 +73,36 @@ func TestEmitPipelineProgressThresholdCadenceAndCancel(t *testing.T) {
 	}
 }
 
-func TestCockpitAndProgressShareRuntimeOutput(t *testing.T) {
+// The retained transcript log and the pipeline progress tracker must share ONE
+// runtime output writer: the log, the follower and the tracker all see the same
+// line. This used to be pinned through the cockpit tee (deleted with #1753); the
+// property belongs to the universal path — openRetainedTranscriptLog plus
+// appendDeliveryAdapterOutput — which is what every job goes through, cockpit or
+// not.
+func TestRetainedTranscriptAndProgressShareRuntimeOutput(t *testing.T) {
 	home := t.TempDir()
 	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard, home)
 	agent := runtime.Agent{Name: "lead", Role: "builder", Runtime: runtime.ShellRuntime, RuntimeRef: "echo shared-line"}
 	tracker := &pipelineProgressLineTracker{}
-	// Progress output is attached when the adapter is built, so the cockpit tee
-	// must ADD its writer to that adapter rather than rebuild it.
-	progressAdapter, err := appendDeliveryAdapterOutput(runtime.ShellAdapter{Runner: subprocess.GroupRunner{}}, tracker)
+
+	logPath, logFile, err := openRetainedTranscriptLog(home, "job-shared")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("openRetainedTranscriptLog: %v", err)
 	}
-	adapter, logPath, logFile := worker.cockpitTeeAdapter(progressAdapter, "job-shared")
 	if logFile == nil {
-		t.Fatal("expected cockpit log")
+		t.Fatal("expected a retained transcript log")
 	}
 	defer logFile.Close()
+
+	base, err := worker.OutputAdapterFactory(agent, t.TempDir(), tracker)
+	if err != nil {
+		t.Fatalf("OutputAdapterFactory: %v", err)
+	}
+	adapter, err := appendDeliveryAdapterOutput(base, logFile)
+	if err != nil {
+		t.Fatalf("appendDeliveryAdapterOutput: %v", err)
+	}
+
 	var settled atomic.Bool
 	lines := make(chan string, 4)
 	followDone := make(chan error, 1)
@@ -116,7 +129,7 @@ func TestCockpitAndProgressShareRuntimeOutput(t *testing.T) {
 	}
 	logged, err := os.ReadFile(logPath)
 	if err != nil || !strings.Contains(string(logged), "shared-line") || tracker.LastLine() != "shared-line" || strings.Join(followed, "\n") != "shared-line" {
-		t.Fatalf("cockpit=%q tracker=%q follower=%q err=%v", logged, tracker.LastLine(), followed, err)
+		t.Fatalf("log=%q tracker=%q follower=%q err=%v", logged, tracker.LastLine(), followed, err)
 	}
 }
 

@@ -456,7 +456,7 @@ func TestPreflightDelegationChildBlockedAdvancesParent(t *testing.T) {
 		return h.checkout, nil
 	}
 	h.worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
-		return cockpitStubAdapter{}, nil
+		return noopDeliveryAdapter{}, nil
 	}
 	// Strip the api agent's "review" capability so ensureJobExecutorAllowed returns
 	// e.block(...) -> BlockedError; handleRunJobError then routes the still-queued

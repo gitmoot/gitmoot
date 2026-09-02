@@ -104,7 +104,6 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 			// sequential classifier lane for the daemon process and is deliberately
 			// outside daemonWorkflowEngine, which is rebuilt per repo/tick.
 			startMemoryHarvestLoop(ctx, paths, home, store, stdout)
-			startCockpitReconcileLoop(ctx, store, paths.Home, stdout)
 			startBlockedRoleWakeLoop(ctx, store, paths.Home, stdout)
 			startTranscriptRetentionLoop(ctx, paths, store, stdout)
 		}
@@ -214,7 +213,6 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	// preserves same-repo serialization, concurrency caps, and poller exclusion.
 	// The deferred drain cancels + waits (bounded) for in-flight jobs on exit.
 	workerErr := startSingleRepoWorkerLoop(ctx, daemonWorkerLoopInterval, store, worker, live, &checkoutLock, tracker, d.Repo.FullName(), rootFilter, stdout)
-	startCockpitReconcileLoop(ctx, store, home, stdout)
 	startBlockedRoleWakeLoop(ctx, store, home, stdout)
 	// Heartbeat schedules (#533) must also fire in the single-repo daemon, or a
 	// single-repo daemon would silently never run them. Off-by-default: with no
@@ -854,49 +852,6 @@ func receiveSupervisorWorkerError(errCh <-chan error) error {
 	default:
 		return nil
 	}
-}
-
-// startCockpitReconcileLoop runs the low-frequency cockpit reconcile GC in the
-// background until ctx is cancelled (Task 7). Each tick drops cockpit_pane rows
-// whose herdr pane is gone AND whose owning root is terminal, complementing the
-// per-Deliver / root-finalize teardown and report-metadata --ttl-ms self-expiry.
-// It is entirely best-effort: it is gated on herdr availability (so a host without
-// herdr never sweeps), uses the auto-policy cockpit, and swallows every error. It
-// never blocks the supervisor's poll/worker loops. A policy load failure or a
-// disabled cockpit simply skips the sweep.
-func startCockpitReconcileLoop(ctx context.Context, store *db.Store, home string, stdout io.Writer) {
-	worker := defaultJobWorker(store, stdout, home)
-	go func() {
-		ticker := time.NewTicker(cockpitReconcileInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				reconcileCockpitPanesOnce(ctx, worker)
-			}
-		}
-	}()
-}
-
-// reconcileCockpitPanesOnce performs one best-effort cockpit reconcile sweep. It
-// builds the cockpit from the host orchestrate policy, skips when the cockpit is
-// disabled or herdr is unreachable, and otherwise asks cockpit.Reconcile to drop
-// orphaned rows (pane gone + root terminal). All errors are swallowed.
-func reconcileCockpitPanesOnce(ctx context.Context, worker jobWorker) {
-	policy, err := worker.orchestratePolicy()
-	if err != nil || policy.CockpitMode == config.CockpitModeOff {
-		return
-	}
-	cp := worker.newCockpit(policy)
-	if cp == nil || !cp.Available(ctx) {
-		return
-	}
-	cp.Reconcile(ctx, func(rootJobID string) bool {
-		terminal, terr := worker.rootTreeTerminal(ctx, rootJobID)
-		return terr == nil && terminal
-	})
 }
 
 type repoCheckoutLocks struct {

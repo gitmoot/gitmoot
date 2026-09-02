@@ -187,9 +187,6 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 			// above the threshold and the next generation escalates.
 			NonProgressStreak:  nonProgressStreak,
 			LastProgressDigest: digest,
-			Cockpit:            parentPayload.Cockpit,
-			CockpitSession:     parentPayload.CockpitSession,
-			CockpitPaneKey:     parentPayload.CockpitPaneKey,
 		}
 		if err := e.enqueue(ctx, correctiveRequest); err != nil {
 			return fmt.Errorf("enqueue corrective continuation for %q: %w", parentJob.ID, err)
@@ -295,9 +292,6 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 			DelegationRepeatCount:  0,
 			NonProgressStreak:      nonProgressStreak,
 			LastProgressDigest:     digest,
-			Cockpit:                parentPayload.Cockpit,
-			CockpitSession:         parentPayload.CockpitSession,
-			CockpitPaneKey:         parentPayload.CockpitPaneKey,
 		}
 		if err := e.enqueue(ctx, replanRequest); err != nil {
 			return fmt.Errorf("enqueue verify replan continuation for %q: %w", parentJob.ID, err)
@@ -382,9 +376,6 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		LastProgressDigest: digest,
 		// Inherit the coordinator's cockpit settings so the continuation renders
 		// its pane under the same workspace/session as the rest of the tree.
-		Cockpit:        parentPayload.Cockpit,
-		CockpitSession: parentPayload.CockpitSession,
-		CockpitPaneKey: parentPayload.CockpitPaneKey,
 	}
 	if err := e.enqueue(ctx, request); err != nil {
 		return fmt.Errorf("enqueue continuation for %q: %w", parentJob.ID, err)

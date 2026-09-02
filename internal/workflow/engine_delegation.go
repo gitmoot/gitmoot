@@ -324,9 +324,6 @@ func (e Engine) handleDelegationLoop(ctx context.Context, job db.Job, payload Jo
 		DelegationRepeatCount:  payload.DelegationRepeatCount + 1,
 		// Inherit the coordinator's cockpit settings so the continuation renders
 		// its pane under the same workspace/session as the rest of the tree.
-		Cockpit:        payload.Cockpit,
-		CockpitSession: payload.CockpitSession,
-		CockpitPaneKey: payload.CockpitPaneKey,
 	}
 	if err := e.enqueue(ctx, request); err != nil {
 		return true, fmt.Errorf("enqueue corrective continuation for %q: %w", job.ID, err)
@@ -419,9 +416,6 @@ func (e Engine) handleDelegationPreflightFailure(ctx context.Context, job db.Job
 		LastProgressDigest:     payload.LastProgressDigest,
 		// Inherit the coordinator's cockpit settings so the continuation renders its
 		// pane under the same workspace/session as the rest of the tree.
-		Cockpit:        payload.Cockpit,
-		CockpitSession: payload.CockpitSession,
-		CockpitPaneKey: payload.CockpitPaneKey,
 	}
 	if err := e.enqueue(ctx, request); err != nil {
 		return fmt.Errorf("enqueue preflight corrective continuation for %q: %w", job.ID, err)
@@ -488,9 +482,6 @@ func (e Engine) enqueueFinalizeContinuation(ctx context.Context, job db.Job, pay
 		DelegationFinalize: true,
 		// Inherit the coordinator's cockpit settings so the finalize continuation
 		// renders its pane under the same workspace/session as the rest of the tree.
-		Cockpit:        payload.Cockpit,
-		CockpitSession: payload.CockpitSession,
-		CockpitPaneKey: payload.CockpitPaneKey,
 	}
 	if err := e.enqueue(ctx, request); err != nil {
 		return fmt.Errorf("enqueue finalize continuation for %q: %w", job.ID, err)

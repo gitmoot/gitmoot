@@ -122,7 +122,6 @@ Inspect state:
 ```sh
 gitmoot status --repo owner/repo
 gitmoot dashboard
-gitmoot dashboard --plain
 gitmoot job list --repo owner/repo
 gitmoot events --repo owner/repo
 ```
@@ -135,12 +134,11 @@ minting another task or PR, use `gitmoot agent implement <agent> --repo
 owner/repo --pr <number> "..."` (or `agent run --action implement --pr`): the PR
 must be open, same-repository, and bound to the existing task branch.
 
-On a real terminal, `gitmoot dashboard` launches an interactive TUI cockpit with
-pages for Attention, Activity (live orchestras), Trains, Agents, Workers, Jobs,
-Locks, Health, and Config (pending prompts live under Attention). Use
-`gitmoot dashboard --plain` for a one-shot snapshot, `gitmoot dashboard --json`
-for scripts and noninteractive agent checks, and `gitmoot dashboard --web` for
-a read-only browser view of a running orchestration.
+`gitmoot dashboard` prints a styled snapshot of local state — daemon health,
+repos, agents, jobs by state, worktrees, and branch locks. Use
+`gitmoot dashboard --json` for scripts and noninteractive agent checks,
+`--watch` to redraw it on an interval, and `gitmoot dashboard --web` for a
+read-only browser view of a running orchestration.
 
 To kick off an orchestra of agents — a conductor (coordinator) that returns a
 `delegations[]` score, players (child agents) that run in parallel or in

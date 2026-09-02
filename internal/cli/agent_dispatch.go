@@ -111,8 +111,6 @@ type localAgentDispatchRequest struct {
 	TaskTitle              string
 	LeadAgent              string
 	Reviewers              []string
-	Cockpit                bool
-	CockpitSession         string
 	SkipNativeReviewFanout bool
 	Recipe                 string
 	SelectedAction         string
@@ -461,8 +459,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		RuntimeConfigDir:       effectiveAgent.RuntimeConfigDir,
 		EffectiveRuntime:       effectiveRuntimeAtEnqueue,
 		RequiredEvents:         requiredEvents,
-		Cockpit:                request.Cockpit,
-		CockpitSession:         request.CockpitSession,
 		SkipNativeReviewFanout: request.SkipNativeReviewFanout,
 		ValidatedPullRequest:   request.ImplementPRValidated,
 		TemplateOverride:       recipeTemplate,

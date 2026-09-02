@@ -238,9 +238,8 @@ the same `delegations` field, `coordinator`, and `continuation` mechanics.
     failure the parent task enters the resumable `awaiting_human` state, **no
     continuation is enqueued, and the tree consumes zero tokens/compute** until a
     human resumes it. The daemon @-tags the human in a GitHub comment (default
-    handle: the repo owner, or `[orchestrate].escalation_handle`) and the
-    dashboard lists the tree under **Attention**. A human resumes with
-    `/gitmoot resume <coordinatorJobID> retry|continue|abort [instructions]`:
+    handle: the repo owner, or `[orchestrate].escalation_handle`). A human resumes
+    with `/gitmoot resume <coordinatorJobID> retry|continue|abort [instructions]`:
     `retry` re-runs the failing leg with the instructions folded in, `continue`
     proceeds the coordinator continuation (now human-approved), and `abort`
     routes to the graceful finalize continuation. A never-answered escalation is
@@ -248,8 +247,7 @@ the same `delegations` field, `coordinator`, and `continuation` mechanics.
     time is excluded from the per-root wall-clock budget, and a paused tree is
     never counted as a budget failure. The daemon routes `/gitmoot resume`
     comments on the tree's **open** PR or issue (it watches open PRs/issues); the
-    dashboard **Attention** section and the `escalation_ttl` backstop cover a tree
-    whose PR/issue is no longer open.
+    `escalation_ttl` backstop covers a tree whose PR/issue is no longer open.
 - `synthesis_rule` (optional): one of `summary`, `vote`, `quorum`, or `verify`.
   It tells the coordinator how to combine the children's results.
 - `quorum` (optional): an integer `K` (`> 0`), required when `synthesis_rule` is
@@ -318,8 +316,7 @@ the same `delegations` field, `coordinator`, and `continuation` mechanics.
   `default_review_timeout` / `default_gate_timeout` / `default_repair_timeout`,
   keyed by the delegation's `phase`, falling back to its `action`) >
   `default_delegation_timeout` > unbounded** (the historical behavior; all keys
-  are empty by default). See the
-  [`[orchestrate]` configuration](../workflows/cockpit-orchestrate-workflow.md#configuration-the-orchestrate-section).
+  are empty by default).
 - `retry` (optional): an integer that must be `>= 0`.
 - `worktree` (optional): the worktree path for the child job.
 - `artifacts` (optional): named artifact handles passed to the child. When any
@@ -508,9 +505,9 @@ the termination bounds below are measured against.
   fenced block after each child's decision/summary/PR line, size-capped (per body
   and per continuation) and rune-safe truncated, with a marker pointing at the
   full on-disk brief at `<ArtifactRoot>/delegations/<parent>/brief.md`. Inlining
-  is **off by default**; see `inline_artifact_bodies` in the
-  [cockpit/orchestrate config](../workflows/cockpit-orchestrate-workflow.md#configuration-the-orchestrate-section).
-  With it off, the continuation prompt is byte-identical to before.
+  is **off by default**; enable it with `[orchestrate] inline_artifact_bodies =
+  true`, bounded by `inline_artifact_max_bytes`. With it off, the continuation
+  prompt is byte-identical to before.
 
 - `human_questions` (optional): an **ask-gate** — the non-failure sibling of
   `escalate_human`. A **healthy** result (any decision) may carry
@@ -526,10 +523,9 @@ the termination bounds below are measured against.
   and the tree consumes zero tokens/compute** until a human answers — exactly like
   `escalate_human`, but **no leg fails** (it is a healthy result that simply needs
   a decision). The daemon @-tags the human (default handle: the repo owner, or
-  `[orchestrate].escalation_handle`) with the question(s) rendered, and the
-  dashboard lists the tree under **Attention**. A human answers with
-  `/gitmoot resume <coordinatorJobID> answer "<id>: ..."` — one `<id>: text` line
-  per question (a single-question pause also accepts a bare answer body). The
+  `[orchestrate].escalation_handle`) with the question(s) rendered. A human answers
+  with `/gitmoot resume <coordinatorJobID> answer "<id>: ..."` — one `<id>: text`
+  line per question (a single-question pause also accepts a bare answer body). The
   answer is delivered to the coordinator continuation as a clearly-labelled
   **"Human answers to your questions"** block injected at the top of its prompt; the
   coordinator then proceeds with the human's decision. An unmatched id (a typo) is
@@ -626,9 +622,8 @@ trips, the offending delegations are dropped rather than dispatched.
   are corrected, without recreating the root job. Because the coordinator now ends
   `succeeded` (not blocked), the failure is surfaced from the
   `delegation_preflight_failed` event — not the job state — in `gitmoot job list`
-  (a trailing `PREFLIGHT_FAILED:` column), the `gitmoot dashboard` **Attention**
-  page (the coordinator is flagged with its reason regardless of state), and the
-  `delegation preflight failures` count in `gitmoot daemon status`.
+  (a trailing `PREFLIGHT_FAILED:` column) and the `delegation preflight
+  failures` count in `gitmoot daemon status`.
 - **Operator kill switch**: `gitmoot job kill <root-job-id>` lets an operator
   terminate a runaway tree by its root id from outside. It is the **first**
   backstop, so operator action wins over every budget cap. The kill is graceful —

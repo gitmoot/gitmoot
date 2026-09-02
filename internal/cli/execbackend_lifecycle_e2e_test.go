@@ -888,7 +888,6 @@ printf '%s' '{"gitmoot_result":{"decision":"implemented","summary":"remote backe
 		Repo: "owner/repo", Branch: branch, GoalID: "goal-remote-backend", TaskID: "task-remote-backend",
 		TaskTitle: "Remote backend", WorktreePath: checkout, HeadSHA: baseHEAD,
 		ParentJobID: parent.ID, DelegationID: "remote-roundtrip", DelegationDepth: 1, DelegatedBy: "remote-coder", RootJobID: parent.ID,
-		Cockpit: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -979,14 +978,13 @@ printf '%s' '{"gitmoot_result":{"decision":"implemented","summary":"remote backe
 	if err != nil {
 		t.Fatal(err)
 	}
-	cockpitUnavailable := 0
+	// #1753 deleted the cockpit pane wrapper, so the remote backend no longer
+	// emits cockpit_unavailable. Pin its absence rather than dropping the check:
+	// a resurrected emitter on the remote path would otherwise go unnoticed.
 	for _, event := range events {
-		if event.Kind == "cockpit_unavailable" && strings.Contains(event.Message, "remote execution backend has no host worktree pane") {
-			cockpitUnavailable++
+		if event.Kind == "cockpit_unavailable" {
+			t.Fatalf("cockpit_unavailable survived the pane-wrapper deletion: %+v", event)
 		}
-	}
-	if cockpitUnavailable != 1 {
-		t.Fatalf("remote cockpit_unavailable events = %d, want 1; events=%+v", cockpitUnavailable, events)
 	}
 }
 

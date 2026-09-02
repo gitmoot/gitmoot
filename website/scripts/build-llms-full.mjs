@@ -18,7 +18,6 @@ const sources = [
   'docs/heartbeats.md',
   'docs/pipelines.md',
   'docs/parallel-jobs.md',
-  'docs/cockpit-orchestrate.md',
   'website/docs/dashboard/overview.md',
   'website/docs/dashboard/views.md',
   'docs/beta-smoke-tests.md',

@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gitmoot/gitmoot/internal/cockpit"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
@@ -512,7 +511,7 @@ func TestJobWatchTranscriptShellNoLLME2E(t *testing.T) {
 		State:   string(workflow.JobRunning),
 		Payload: mustJobPayload(t, payload),
 	}, "running")
-	logPath := filepath.Join(config.PathsForHome(home).Logs, "jobs", cockpit.SafeLogName("job-shell-e2e")+".log")
+	logPath := filepath.Join(config.PathsForHome(home).Logs, "jobs", transcript.LegacyLogName("job-shell-e2e")+".log")
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
 		t.Fatal(err)
 	}

@@ -16,11 +16,9 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/cli/style"
-	"github.com/gitmoot/gitmoot/internal/cli/tui"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
-	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // dashboardListCap is how many entries each list shows in styled mode before
@@ -43,25 +41,14 @@ type dashboardSnapshot struct {
 	Worktrees       []dashboardWorktree     `json:"worktrees"`
 	BranchLocks     []dashboardBranchLock   `json:"branch_locks"`
 	ResourceLocks   []dashboardResourceLock `json:"resource_locks"`
-	PendingPrompts  []dashboardPrompt       `json:"pending_prompts"`
 
-	// promptDetails carries the full pending interactive-prompt records for the
-	// TUI's inline answer flow. Unexported so it never appears in --json output
-	// or the plain renderer, keeping those contracts byte-stable.
-	promptDetails []db.InteractivePrompt
 	// jobRows carries per-job rows (and, for blocked/failed jobs, the latest
-	// event message) for the TUI's Jobs page. Unexported for the same reason.
+	// event message). Unexported so --json and the plain renderer stay
+	// byte-stable.
 	jobRows []dashboardJobRow
-	// awaitingHuman carries the tasks paused at awaiting_human (#340) for the
-	// TUI's Attention page. Unexported so --json/--plain stay byte-stable.
-	awaitingHuman []dashboardAwaitingHuman
 	// daemonDetail carries the persisted daemon flags/workdir and a tail of
-	// recent log errors for the TUI's Health page. Unexported so --json and
-	// the plain renderer stay byte-stable.
+	// recent log errors. Unexported for the same reason.
 	daemonDetail dashboardDaemonDetail
-	// configView carries the parsed config sections for the TUI's Config page.
-	// Unexported for the same byte-stability reason.
-	configView tui.ConfigView
 }
 
 // dashboardDaemonDetail is the extra daemon info the Health page shows beyond
@@ -73,24 +60,17 @@ type dashboardDaemonDetail struct {
 	LogErrors []string
 }
 
-// dashboardJobRow is one job with the context the TUI needs to act on it.
+// dashboardJobRow is one job with the context the web dashboard's run summary
+// and the attention grouping need.
 type dashboardJobRow struct {
 	db.Job
 	LatestEvent string
 	Repo        string // parsed from the payload for reportable jobs (attention grouping)
 	// PreflightFailed marks a coordinator whose delegation fan-out could not be
 	// routed (#451). It no longer terminal-blocks (it takes a corrective
-	// continuation and ends succeeded), so this surfaces it on the Attention page
-	// regardless of state, mirroring the `job list` PREFLIGHT_FAILED column.
+	// continuation and ends succeeded), so this surfaces it regardless of state,
+	// mirroring the `job list` PREFLIGHT_FAILED column.
 	PreflightFailed bool
-}
-
-// dashboardAwaitingHuman is one task paused at awaiting_human (#340), shown in the
-// TUI's Attention page with the resume hint.
-type dashboardAwaitingHuman struct {
-	TaskID string
-	Repo   string
-	Title  string
 }
 
 type dashboardResourceLock struct {
@@ -171,22 +151,12 @@ type dashboardBranchLock struct {
 	Owner  string `json:"owner,omitempty"`
 }
 
-type dashboardPrompt struct {
-	ID       string `json:"id"`
-	Question string `json:"question"`
-}
-
 func runDashboard(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("dashboard", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	jsonOutput := fs.Bool("json", false, "write the snapshot as JSON")
 	all := fs.Bool("all", false, "show full lists without truncation or grouping")
-	answerID := fs.String("answer", "", "pending prompt id to answer before showing the snapshot")
-	answerValue := fs.String("value", "", "answer value to use with --answer")
-	answerSource := fs.String("source", "dashboard", "answer source recorded with --answer")
-	dismissID := fs.String("dismiss", "", "prompt id to delete before showing the snapshot")
-	plain := fs.Bool("plain", false, "print a one-shot snapshot instead of launching the interactive TUI")
 	watch := fs.Bool("watch", false, "refresh the snapshot on an interval until interrupted (terminal only)")
 	interval := fs.Duration("interval", 5*time.Second, "refresh interval for --watch")
 	web := fs.Bool("web", false, "serve the read-only web dashboard (live orchestration graph) until interrupted")
@@ -202,8 +172,8 @@ func runDashboard(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if *watch {
-		if *jsonOutput || strings.TrimSpace(*answerID) != "" || strings.TrimSpace(*dismissID) != "" {
-			fmt.Fprintln(stderr, "dashboard --watch cannot be combined with --json, --answer, or --dismiss")
+		if *jsonOutput {
+			fmt.Fprintln(stderr, "dashboard --watch cannot be combined with --json")
 			return 2
 		}
 		if !style.IsTerminal(stdout) {
@@ -217,52 +187,17 @@ func runDashboard(args []string, stdout, stderr io.Writer) int {
 		return runDashboardWatch(stdout, *home, *all, *interval)
 	}
 	// The web dashboard is a separate read-only HTTP server (never the daemon
-	// path); branch out before the TUI/one-shot decision, mirroring --watch.
+	// path); branch out before the one-shot snapshot, mirroring --watch.
 	if *web {
 		return runDashboardWeb(*home, *webAddr, stdout, stderr)
 	}
 
-	// On a real terminal with no machine-output or mutation flags, launch the
-	// interactive TUI. Every other case (pipes, --json/--all/--plain/--answer/
-	// --dismiss, non-terminal stdin) falls through to the one-shot snapshot, so
-	// scripts, tests, and CI are unaffected.
-	flags := dashboardFlags{
-		plain:      *plain,
-		jsonOutput: *jsonOutput,
-		all:        *all,
-		watch:      *watch,
-		answerID:   *answerID,
-		dismissID:  *dismissID,
-	}
-	if shouldLaunchTUI(flags, style.IsTerminal(stdout), stdinIsCharDevice()) {
-		return runDashboardTUI(*home, *interval, stdout, stderr)
-	}
-
+	// Everything else prints the styled one-shot snapshot. The interactive TUI
+	// that used to run here on a terminal was deleted with #1753.
 	paths, err := initializedPaths(*home)
 	if err != nil {
 		fmt.Fprintf(stderr, "dashboard: %v\n", err)
 		return 1
-	}
-
-	// The only state the dashboard may mutate is a pending prompt: answering it
-	// (same store API as `gitmoot interactive answer`) or dismissing it (same as
-	// `gitmoot interactive clear`).
-	if strings.TrimSpace(*answerID) != "" {
-		if err := withStore(*home, func(store *db.Store) error {
-			_, err := store.AnswerInteractivePrompt(context.Background(), *answerID, *answerValue, *answerSource)
-			return err
-		}); err != nil {
-			fmt.Fprintf(stderr, "dashboard: answer prompt: %v\n", err)
-			return 1
-		}
-	}
-	if strings.TrimSpace(*dismissID) != "" {
-		if err := withStore(*home, func(store *db.Store) error {
-			return store.DeleteInteractivePrompt(context.Background(), *dismissID)
-		}); err != nil {
-			fmt.Fprintf(stderr, "dashboard: dismiss prompt: %v\n", err)
-			return 1
-		}
 	}
 
 	snapshot, err := buildDashboardSnapshot(*home, paths)
@@ -398,7 +333,6 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 		Worktrees:       []dashboardWorktree{},
 		BranchLocks:     []dashboardBranchLock{},
 		ResourceLocks:   []dashboardResourceLock{},
-		PendingPrompts:  []dashboardPrompt{},
 	}
 	now := time.Now().UTC()
 	if info, err := os.Stat(paths.Database); err == nil && !info.IsDir() {
@@ -412,7 +346,6 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 		snapshot.Daemon = dashboardDaemon{Running: false, LogFile: state.LogFile}
 	}
 	snapshot.daemonDetail = buildDashboardDaemonDetail(state)
-	snapshot.configView = buildDashboardConfigView(paths, snapshot.daemonDetail)
 
 	err := withStore(home, func(store *db.Store) error {
 		ctx := context.Background()
@@ -522,9 +455,6 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 			if strings.TrimSpace(task.WorktreePath) != "" {
 				snapshot.Worktrees = append(snapshot.Worktrees, dashboardWorktree{Task: task.ID, Repo: task.RepoFullName, Path: task.WorktreePath})
 			}
-			if task.State == string(workflow.TaskAwaitingHuman) {
-				snapshot.awaitingHuman = append(snapshot.awaitingHuman, dashboardAwaitingHuman{TaskID: task.ID, Repo: task.RepoFullName, Title: task.Title})
-			}
 		}
 		locks, err := store.ListBranchLocks(ctx, "")
 		if err != nil {
@@ -544,14 +474,6 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 				Stale: dashboardLockStale(lock.ExpiresAt, now),
 			})
 		}
-		prompts, err := store.ListInteractivePrompts(ctx, db.InteractivePromptStatePending)
-		if err != nil {
-			return err
-		}
-		for _, prompt := range prompts {
-			snapshot.PendingPrompts = append(snapshot.PendingPrompts, dashboardPrompt{ID: prompt.ID, Question: prompt.Question})
-		}
-		snapshot.promptDetails = prompts
 		return nil
 	})
 	if err != nil {
@@ -649,11 +571,6 @@ func printDashboardSnapshot(stdout io.Writer, st style.Style, snapshot dashboard
 	for _, lock := range snapshot.BranchLocks {
 		writeLine(stdout, "  %s@%s %s", lock.Repo, lock.Branch, emptyText(lock.Owner))
 	}
-
-	dashboardSectionHeader(stdout, st, "pending_prompts", len(snapshot.PendingPrompts))
-	for _, prompt := range snapshot.PendingPrompts {
-		writeLine(stdout, "  %s\t%s", prompt.ID, prompt.Question)
-	}
 }
 
 // printDashboardAttention prints, before the regular sections, the things a
@@ -661,10 +578,6 @@ func printDashboardSnapshot(stdout io.Writer, st style.Style, snapshot dashboard
 // plain modes; it prints nothing when there is nothing to flag.
 func printDashboardAttention(stdout io.Writer, st style.Style, snapshot dashboardSnapshot, home string) {
 	lines := []string{}
-	for _, prompt := range snapshot.PendingPrompts {
-		lines = append(lines, st.Yellow("prompt")+" "+prompt.ID)
-		lines = append(lines, "  "+st.Dim(dashboardAnswerCommand(home, prompt.ID)))
-	}
 	if blocked := snapshot.Jobs.ByState["blocked"]; blocked > 0 {
 		lines = append(lines, st.Red(fmt.Sprintf("%d blocked job(s)", blocked)))
 	}
@@ -692,13 +605,6 @@ func printDashboardAttention(stdout io.Writer, st style.Style, snapshot dashboar
 		writeLine(stdout, "  %s", line)
 	}
 	writeLine(stdout, "")
-}
-
-func dashboardAnswerCommand(home, id string) string {
-	if strings.TrimSpace(home) != "" {
-		return fmt.Sprintf("gitmoot interactive answer --home %s %s <value>", home, id)
-	}
-	return fmt.Sprintf("gitmoot interactive answer %s <value>", id)
 }
 
 func dashboardSectionHeader(stdout io.Writer, st style.Style, name string, count int) {

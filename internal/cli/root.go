@@ -51,7 +51,6 @@ var rootCommands = []command{
 	{name: "workflow", summary: "inspect external-coordinator workflow groups and notes", run: runWorkflowJournal},
 	{name: "report", summary: "build and file bug reports", run: runReport},
 	{name: "lock", summary: "inspect and release branch locks", run: runLock},
-	{name: "interactive", summary: "inspect and answer interactive prompts", run: runInteractive},
 	{name: "escalation", summary: "inspect and repair blocked human-escalation rounds", run: runEscalation},
 	{name: "dashboard", summary: "show a snapshot of local Gitmoot state", run: runDashboard},
 	{name: "memory", summary: "inspect and measure agent persistent memory", run: runMemory},

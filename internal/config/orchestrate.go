@@ -11,30 +11,13 @@ import (
 	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 )
 
-const (
-	// CockpitMode values for [orchestrate].cockpit_mode. "auto" lets the daemon
-	// decide per job (gated on herdr reachability), "on" forces panes when herdr
-	// is reachable, and "off" disables cockpit panes entirely regardless of the
-	// per-job --cockpit flag.
-	CockpitModeAuto = "auto"
-	CockpitModeOn   = "on"
-	CockpitModeOff  = "off"
-
-	// CockpitPaneKey values for [orchestrate].cockpit_pane_key. "job" gives each
-	// job its own pane (P0); "seat" reuses one pane per opaque seat key (P2).
-	CockpitPaneKeyJob  = "job"
-	CockpitPaneKeySeat = "seat"
-)
+const ()
 
 // OrchestratePolicy is the host-level cockpit policy read from the
 // [orchestrate] section of the gitmoot config. The daemon combines it with the
 // per-job JobPayload.Cockpit flag to decide whether to wrap a job's delivery in
 // a herdr pane (see issue #357). It never affects engine/DAG behavior.
 type OrchestratePolicy struct {
-	CockpitMode     string
-	CockpitSession  string
-	CockpitMaxPanes int
-	CockpitPaneKey  string
 	// InlineArtifactBodies opts the coordinator continuation prompt into inlining
 	// each finished child's artifact_body as a fenced block (see issue #368). It is
 	// off by default because inlined briefs can be large.
@@ -120,10 +103,6 @@ const DefaultEscalationTTL = "24h"
 
 func DefaultOrchestratePolicy() OrchestratePolicy {
 	return OrchestratePolicy{
-		CockpitMode:                    CockpitModeAuto,
-		CockpitSession:                 "",
-		CockpitMaxPanes:                4,
-		CockpitPaneKey:                 CockpitPaneKeyJob,
 		InlineArtifactBodies:           false,
 		InlineArtifactMaxBytes:         0,
 		InjectUpstreamDepContext:       false,
@@ -180,22 +159,6 @@ func LoadOrchestratePolicy(paths Paths) (OrchestratePolicy, error) {
 
 func applyOrchestratePolicyField(policy *OrchestratePolicy, key string, value string) error {
 	switch key {
-	case "cockpit_mode":
-		parsed, err := parseConfigString(value)
-		policy.CockpitMode = strings.TrimSpace(parsed)
-		return err
-	case "cockpit_session":
-		parsed, err := parseConfigString(value)
-		policy.CockpitSession = strings.TrimSpace(parsed)
-		return err
-	case "cockpit_max_panes":
-		parsed, err := strconv.Atoi(value)
-		policy.CockpitMaxPanes = parsed
-		return err
-	case "cockpit_pane_key":
-		parsed, err := parseConfigString(value)
-		policy.CockpitPaneKey = strings.TrimSpace(parsed)
-		return err
 	case "inline_artifact_bodies":
 		parsed, err := strconv.ParseBool(value)
 		policy.InlineArtifactBodies = parsed
@@ -282,19 +245,6 @@ func applyOrchestratePolicyField(policy *OrchestratePolicy, key string, value st
 }
 
 func validateOrchestratePolicy(policy OrchestratePolicy) error {
-	switch policy.CockpitMode {
-	case CockpitModeAuto, CockpitModeOn, CockpitModeOff:
-	default:
-		return fmt.Errorf("unsupported orchestrate.cockpit_mode %q; use on, off, or auto", policy.CockpitMode)
-	}
-	if policy.CockpitMaxPanes < 1 {
-		return fmt.Errorf("orchestrate.cockpit_max_panes must be positive")
-	}
-	switch policy.CockpitPaneKey {
-	case CockpitPaneKeyJob, CockpitPaneKeySeat:
-	default:
-		return fmt.Errorf("unsupported orchestrate.cockpit_pane_key %q; use job or seat", policy.CockpitPaneKey)
-	}
 	if policy.MaxDelegationTokenBudget < 0 {
 		return fmt.Errorf("orchestrate.max_delegation_token_budget must be 0 (unlimited) or positive")
 	}

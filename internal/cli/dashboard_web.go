@@ -2411,6 +2411,13 @@ func runStateActive(state dashboard.NodeState) bool {
 	return !workflow.IsFinalJobState(string(state))
 }
 
+// activityJobActive is the web dashboard's liveness predicate for a job row. It
+// moved here with #1753: it used to live beside the deleted TUI's Activity page,
+// which was its other caller.
+func activityJobActive(state string) bool {
+	return state == "queued" || state == "running"
+}
+
 // mostRecentRunRoot returns the run root to show when no run is requested: the
 // most-recently-updated run that has live (queued/running) work, else the
 // most-recently-updated run overall. Deterministic on ties (root id).

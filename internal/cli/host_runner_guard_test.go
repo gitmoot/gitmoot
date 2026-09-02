@@ -63,14 +63,6 @@ var hostRunnerAllowlist = map[string]hostRunnerAllowance{
 		execRunners: 1,
 		reason:      "same host-mode engine wrapper as daemonWorkflowEngine, taking the poll pass's config memo (#1758); backend jobs call daemonWorkflowEngineForRunner",
 	},
-	"internal/cli/dashboard_config.go:editAgentPromptCmd": {
-		rawCommands: 1,
-		reason:      "interactive dashboard launches the operator's configured editor",
-	},
-	"internal/cli/dashboard_config.go:editConfigCmd": {
-		rawCommands: 1,
-		reason:      "interactive dashboard launches the operator's configured editor",
-	},
 	"internal/cli/dashboard_web.go:execBinaryBuild": {
 		rawCommands: 2,
 		reason:      "dashboard probes the deployed gitmoot binary version on the host",
