@@ -1702,6 +1702,13 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 			}
 			continue
 		}
+		if unresolved := evidence[number].unresolved; unresolved != nil {
+			// Recorded on the JOB, once, keyed on the event kind so repeated polls do not
+			// append: an issue-bound job is a permanent condition, so this must be a fact a
+			// reader can find rather than an error the dashboard shows forever.
+			d.recordPullRequestUnresolvedOnce(ctx, job.ID, number, unresolved)
+			continue
+		}
 		if !closed {
 			continue
 		}
@@ -1838,15 +1845,31 @@ func (d Daemon) pullRequestIsClosedOnTheForge(ctx context.Context, number int, m
 	}
 	answer := forgeClosureAnswer{}
 	pull, err := d.GitHub.GetPullRequest(ctx, d.Repo, int64(number))
-	if err != nil {
-		// NO EVIDENCE, and SAID OUT LOUD. Leaving the job queued is the safe half and it
-		// was never in question; the half that was is observability. A swallowed forge
-		// error makes a sweep that does nothing on every poll, forever, look exactly like
-		// a sweep with nothing to do (#1673). The caller records it and continues, so one
-		// unreachable number never blocks the rest of the poll.
-		answer.err = fmt.Errorf("revalidate pull request #%d before superseding queued work: %w", number, err)
-	} else {
+	switch {
+	case err == nil:
 		answer.closed = pull.Number == int64(number) && !strings.EqualFold(strings.TrimSpace(pull.State), "open")
+	case github.AsTransient(err) || github.IsTransientMessage(err.Error()):
+		// NO EVIDENCE, AND SAID OUT LOUD. Leaving the job queued was never the question;
+		// observability was. A swallowed forge error makes a sweep that does nothing on
+		// every poll look exactly like a sweep with nothing to do (#1673). The caller
+		// records it and continues, so one unreachable number never blocks the rest of
+		// the poll, and it CLEARS once the outage does.
+		answer.err = fmt.Errorf("revalidate pull request #%d before superseding queued work: %w", number, err)
+	default:
+		// DEFINITIVE, SO NOT AN ERROR TO REPORT FOREVER. A 404 is the normal answer for a
+		// number that is not a pull request in this repo, and payload.PullRequest carries
+		// issue numbers - delegationRequest copies them onto children. Reporting it would
+		// stamp repos.last_error on EVERY poll for the life of the job and, because
+		// firstErr is first-wins and this sweep runs before the finalization sweep and the
+		// reconcilers, mask a genuine error from every later stage. That is the same
+		// argument this file already makes about BlockedError a few lines up, applied to
+		// the forge read instead of to the DAG's decisions.
+		//
+		// It is NOT silence: the fact is recorded once per job, keyed on the event so
+		// repeated polls do not append. And it is still fail-closed - a number that cannot
+		// be proven to name a non-open pull request never terminates anything.
+		answer.closed = false
+		answer.unresolved = err
 	}
 	if memo != nil {
 		// The ERROR is memoized alongside the answer, which is what keeps the cost bound
@@ -1857,12 +1880,49 @@ func (d Daemon) pullRequestIsClosedOnTheForge(ctx context.Context, number int, m
 	return answer.closed, answer.err
 }
 
+// pullRequestUnresolvedEvent records that the forge answered definitively that a job's
+// pull_request number does not name a pull request in this repo - an issue number, a
+// deleted PR, a transferred repo. It is the observability half of NOT reporting that as
+// a poll error.
+const pullRequestUnresolvedEvent = "pull_request_unresolved"
+
+// recordPullRequestUnresolvedOnce appends pullRequestUnresolvedEvent unless this job
+// already carries one.
+//
+// ONCE is the requirement, not a nicety: the condition is permanent, so an append per
+// poll would grow job_events without bound at the daemon's tick rate - the same failure
+// the advance_retry collapse migration had to repair. Best-effort by design: this is a
+// note for a reader, and failing the poll over it would reintroduce exactly the
+// permanent red this path exists to avoid.
+func (d Daemon) recordPullRequestUnresolvedOnce(ctx context.Context, jobID string, number int, cause error) {
+	events, err := d.Store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		return
+	}
+	for _, event := range events {
+		if event.Kind == pullRequestUnresolvedEvent {
+			return
+		}
+	}
+	_ = d.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   jobID,
+		Kind:    pullRequestUnresolvedEvent,
+		Message: fmt.Sprintf("#%d does not name a pull request in %s, so this job can never be superseded by a closed pull request: %v", number, d.Repo.FullName(), cause),
+	})
+}
+
 // forgeClosureAnswer is one number's memoized revalidation outcome for a single poll.
-// closed is only meaningful when err is nil; an err entry means "asked, got no
-// evidence", which is a distinct state from "asked, and it is open".
+// closed is only meaningful when both errors are nil.
+//
+// The two error fields are DIFFERENT FACTS and the distinction is the whole point: err
+// means "could not read the forge" and is reported so a broken poll cannot look like a
+// quiet one, while unresolved means "the forge answered, and this number is not a pull
+// request here" - a permanent, expected condition that is recorded once rather than
+// reported on every tick forever.
 type forgeClosureAnswer struct {
-	closed bool
-	err    error
+	closed     bool
+	err        error
+	unresolved error
 }
 
 // workflowForJob resolves the engine to advance THIS job with. Every other daemon

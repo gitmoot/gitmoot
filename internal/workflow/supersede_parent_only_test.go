@@ -7,33 +7,27 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 )
 
-// TestSupersedeAdvanceDoesNotDispatchTheDeadChildsOwnDelegations pins the guarantee the
-// merge of #1731 with #1763 dropped.
+// TestSupersedeRecoveryNeverDispatchesTheDeadChildsOwnDelegations pins that a
+// closed-PR-superseded child never fans out its own delegations during recovery, using
+// the ONLY result shape this path can mint: decision "failed" with
+// SupersededPullRequestClosed set. The sweep selects QUEUED jobs, which carry no result;
+// the finalizer stamps the synthetic one; RetryJob clears it.
 //
-// The two safety mechanisms on this path protect DIFFERENT things and neither implies
-// the other:
+// WHAT THIS TEST DOES NOT DO, stated because the first version of it claimed otherwise
+// and the claim was wrong. It does NOT discriminate the routing change from the full
+// AdvanceJob. Review measured that on this shape the full advance also produces no
+// grandchild, because it returns at the failed/blocked branch (engine_run_budgets.go)
+// BEFORE reaching dispatchDelegations. My earlier version reached the dispatch only by
+// stamping decision "approved", which the supersession cannot produce, so it pinned a
+// hypothetical and I have removed it along with its helper.
 //
-//   - the supersede ownership anchor refuses parent effects from a lifecycle that has
-//     been superseded;
-//   - parent-DAG-only advancement refuses to dispatch the terminal child's OWN
-//     delegations.
-//
-// The anchor cannot cover the second. When the recovery runs for the lifecycle it
-// actually claimed, dispatching that child's delegations is legitimate by the anchor's
-// own test, so every barrier passes and the grandchildren spawn anyway - from a recovery
-// pass with no validated checkout, which is what #1763 closed.
-//
-// #1731 was written before the parent-only operation existed and called the full
-// AdvanceJob here, so this is a merge-time regression rather than a defect in either
-// change alone.
-//
-// THE FIXTURE HAS TO ROUTE, and the first version of this test did not: seeding the
-// child as `succeeded` made advanceSupersededChildAtGeneration return (false, nil)
-// before it ever claimed ownership, so both the fixed and the full-advance versions
-// "passed" while advancing nothing. The shape below is the production one - a child
-// terminalized by a supersession, carrying a result - and its result FANS OUT, which is
-// the adversarial part: a full advance reads those delegations and dispatches them.
-func TestSupersedeAdvanceDoesNotDispatchTheDeadChildsOwnDelegations(t *testing.T) {
+// The routing to AdvanceParentDAGForTerminalChild is still the right change, for a
+// reason this test cannot express: it makes the exclusion STRUCTURAL instead of
+// depending on an early return inside a long function continuing to sit ahead of
+// dispatchDelegations. This test is the behavioural floor for that - it fails if any
+// future edit lets the failed-decision path fall through to a fan-out - and it is
+// honest about being a change-detector rather than a mutant-killer for the routing.
+func TestSupersedeRecoveryNeverDispatchesTheDeadChildsOwnDelegations(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedAgent(t, store, "coord", []string{"ask"}, "gitmoot/gitmoot")
@@ -65,32 +59,27 @@ func TestSupersedeAdvanceDoesNotDispatchTheDeadChildsOwnDelegations(t *testing.T
 	if err != nil || !superseded {
 		t.Fatalf("supersede: transitioned=%v err=%v", superseded, err)
 	}
-	stampFanningOutResult(t, store, child, "pr closed")
+	// The production result shape, carrying a delegation: if anything on this path ever
+	// reaches dispatchDelegations, THIS is what it would fan out.
+	stampSupersededResultWithFanout(t, store, child, "pr closed")
 
 	advanced, err := engine.advanceSupersededChildAtGeneration(ctx, child, observed.LifecycleGeneration)
 	if err != nil && !isDelegationPolicyOutcome(err) {
 		t.Fatalf("advanceSupersededChildAtGeneration: %v", err)
 	}
-	// The advance must actually RUN, otherwise the observable below is vacuous - this is
-	// the assertion whose absence let the first version of this test pass against the
-	// defect.
 	if !advanced {
-		t.Fatal("the advance was refused, so this test never reached the dispatch decision it exists to constrain")
+		t.Fatal("the advance was refused, so the dispatch decision this test constrains was never reached")
 	}
-
-	// THE OBSERVABLE. A full advance reads the child's result and dispatches this row;
-	// the parent-only operation cannot reach the code that creates it.
 	if grandchild, err := store.GetJob(ctx, child+"/delegation/grandchild"); err == nil {
-		t.Fatalf("the dead child's own delegation was dispatched (%s, state %q): the recovery ran a FULL advance, "+
-			"so a pass with no validated checkout spawned work #1763 forbids",
+		t.Fatalf("the dead child's own delegation was dispatched (%s, state %q) during recovery",
 			grandchild.ID, grandchild.State)
 	}
 }
 
-// stampFanningOutResult is stampSyntheticResult's adversarial sibling: the result it
-// writes carries a delegation, so a caller that runs the FULL advance dispatches a
-// grandchild and a caller that advances only the parent DAG cannot.
-func stampFanningOutResult(t *testing.T, store *db.Store, jobID string, summary string) {
+// stampSupersededResultWithFanout writes the production supersession result shape
+// (failed + SupersededPullRequestClosed) but with a delegation attached, so a path that
+// wrongly reached dispatchDelegations would have something to dispatch.
+func stampSupersededResultWithFanout(t *testing.T, store *db.Store, jobID string, summary string) {
 	t.Helper()
 	job := mustJob(t, store, jobID)
 	payload, err := unmarshalPayload(job.Payload)
@@ -98,8 +87,9 @@ func stampFanningOutResult(t *testing.T, store *db.Store, jobID string, summary 
 		t.Fatalf("unmarshalPayload: %v", err)
 	}
 	payload.Result = &AgentResult{
-		Decision: "approved",
-		Summary:  summary,
+		Decision:                    "failed",
+		Summary:                     summary,
+		SupersededPullRequestClosed: true,
 		Delegations: []Delegation{
 			{ID: "grandchild", Agent: "api", Action: "review", Prompt: "review more", FailurePolicy: "continue"},
 		},

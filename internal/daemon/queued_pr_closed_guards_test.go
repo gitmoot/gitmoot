@@ -132,15 +132,15 @@ func TestPollOnceAsksTheForgeOncePerNumberPerPoll(t *testing.T) {
 	engine := workflow.Engine{Store: store}
 	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
 
-	// This fixture's forge cannot separate "number 12 is an issue" from "the forge is
-	// unreachable" — both surface as a generic error — so PollOnce reports one, exactly
-	// as TestPollOnceLeavesWorkQueuedWhenRevalidationFails requires. The error is not
-	// what this test pins: the COST is. What matters here is that reporting it does not
-	// cost an extra ask, and that the jobs stay queued (asserted below).
+	// The fixture's #12 is an ISSUE, and the forge answers definitively (a generic
+	// not-found, not a transport failure), so this is the PERMANENT arm: the condition
+	// never changes, and reporting it would stamp repos.last_error on every tick forever
+	// AND first-wins-mask a genuine error from every later stage of the poll. So PollOnce
+	// must stay CLEAN here while the jobs stay queued.
 	const polls = 4
 	for poll := range polls {
-		if err := daemon.PollOnce(ctx); err == nil {
-			t.Fatalf("PollOnce %d returned nil: this fixture's #12 lookup fails, and a swallowed revalidation failure is the defect", poll+1)
+		if err := daemon.PollOnce(ctx); err != nil {
+			t.Fatalf("PollOnce %d returned %v: a permanently unresolvable number must not red the poll on every tick", poll+1, err)
 		}
 	}
 	asked := 0
@@ -151,6 +151,13 @@ func TestPollOnceAsksTheForgeOncePerNumberPerPoll(t *testing.T) {
 	}
 	if asked != polls {
 		t.Fatalf("forge asked about #12 %d times across %d polls with 3 jobs, want exactly one per poll", asked, polls)
+	}
+	// RECORDED, not swallowed, and recorded ONCE despite four polls: the fact must be
+	// findable by a reader without growing job_events at the tick rate.
+	for _, id := range []string{"issue-child-a", "issue-child-b", "issue-child-c"} {
+		if got := countJobEventKind(t, store, id, pullRequestUnresolvedEvent); got != 1 {
+			t.Fatalf("%s events on %s = %d across %d polls, want exactly 1", pullRequestUnresolvedEvent, id, got, polls)
+		}
 	}
 	for _, id := range []string{"issue-child-a", "issue-child-b", "issue-child-c"} {
 		if job, err := store.GetJob(ctx, id); err != nil || job.State != string(workflow.JobQueued) {

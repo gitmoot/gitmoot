@@ -269,6 +269,16 @@ func (e Engine) AdvanceParentDAGForTerminalChild(ctx context.Context, jobID stri
 		return fmt.Errorf("job %q is not settled, so parent-only advancement does not apply", jobID)
 	}
 	ref := taskRefFromPayload(payload)
+	// The parked-round refusal is INHERITED from advanceParentForTerminalChild rather
+	// than repeated here: that is the shared choke point both advance entry points pass
+	// through, and this operation not consulting the round is precisely the gap the merge
+	// opened. Measured before the fix, on a fixture with a parked round and a
+	// closed-PR-superseded sibling carrying a retry budget: AdvanceJob refused and
+	// enqueued nothing (3 jobs -> 3), while this operation enqueued
+	// parent-job/delegation/ui/retry/1 (3 -> 4). The retry pass inside advanceDelegations
+	// runs BEFORE any failure policy, so the enqueue landed before the escalate_human
+	// short-circuit and the AwaitingHumanError that ended the call arrived after the new
+	// job existed rather than instead of it.
 	stop, err := e.advanceParentForTerminalChild(ctx, job, payload, ref)
 	if err != nil {
 		return err
@@ -298,6 +308,23 @@ func (e Engine) AdvanceParentDAGForTerminalChild(ctx context.Context, jobID stri
 // reports whether the caller must STOP - the block's own short-circuits mean "this
 // child's outcome is fully handled", not "continue with the rest of the advance".
 func (e Engine) advanceParentForTerminalChild(ctx context.Context, job db.Job, payload JobPayload, ref taskRef) (bool, error) {
+	// THE PARKED-ROUND GUARD LIVES HERE, at the shared choke point, so it is inherited
+	// rather than remembered. A round parked in needs_repair means a human's decision was
+	// CLAIMED and never applied, and advancing past it is the exact harm the claim
+	// protocol exists to prevent.
+	//
+	// It was previously only at AdvanceJob's top, and the merge added a SECOND entry
+	// point into this block (AdvanceParentDAGForTerminalChild) that did not consult the
+	// round: escalationRepairBlock existed only on this branch's parent, the parent-only
+	// operation only on main's. Guarding each caller instead would leave the next caller
+	// to remember, which is what failed once already. AdvanceJob keeps its own earlier
+	// check so it still refuses before doing any other work; the redundant second lookup
+	// on that path is one indexed read against the coordinator.
+	if blockedErr, blocked, err := e.escalationRepairBlock(ctx, job, ref); err != nil {
+		return false, err
+	} else if blocked {
+		return false, blockedErr
+	}
 	parentJob, parentPayload, err := e.jobPayload(ctx, payload.ParentJobID)
 	if err != nil {
 		return false, err
