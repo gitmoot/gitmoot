@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func openCockpitStore(t *testing.T) *Store {
+func openStoreOperationsTestStore(t *testing.T) *Store {
 	t.Helper()
 	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
 	if err != nil {
@@ -19,7 +19,7 @@ func openCockpitStore(t *testing.T) *Store {
 }
 
 func TestRevertAgentTemplateVersion(t *testing.T) {
-	store := openCockpitStore(t)
+	store := openStoreOperationsTestStore(t)
 	ctx := context.Background()
 	base := AgentTemplate{ID: "planner", Name: "Planner", SourceRepo: "o/r", SourceRef: "main", SourcePath: "p.md", ResolvedCommit: "abc", Content: "v1 content"}
 	if err := store.UpsertAgentTemplate(ctx, base); err != nil {
@@ -79,7 +79,7 @@ func TestRevertAgentTemplateVersion(t *testing.T) {
 }
 
 func TestDeleteAgentChecked(t *testing.T) {
-	store := openCockpitStore(t)
+	store := openStoreOperationsTestStore(t)
 	ctx := context.Background()
 	if err := store.UpsertAgent(ctx, Agent{Name: "worker", Runtime: "codex"}); err != nil {
 		t.Fatalf("upsert agent: %v", err)
@@ -104,7 +104,7 @@ func TestDeleteAgentChecked(t *testing.T) {
 }
 
 func TestUpdateAgentRuntime(t *testing.T) {
-	store := openCockpitStore(t)
+	store := openStoreOperationsTestStore(t)
 	ctx := context.Background()
 	original := Agent{
 		Name:           "worker",
@@ -171,7 +171,7 @@ func TestUpdateAgentRuntime(t *testing.T) {
 }
 
 func TestLatestJobEvents(t *testing.T) {
-	store := openCockpitStore(t)
+	store := openStoreOperationsTestStore(t)
 	ctx := context.Background()
 	if err := store.CreateJob(ctx, Job{ID: "job-a", Agent: "planner", Type: "ask", State: "failed"}); err != nil {
 		t.Fatalf("CreateJob: %v", err)
