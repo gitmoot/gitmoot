@@ -675,13 +675,54 @@ func (s *Store) TransitionJobState(ctx context.Context, id string, from string, 
 }
 
 func (s *Store) TransitionJobStateWithEvent(ctx context.Context, id string, from string, to string, event JobEvent) (bool, error) {
+	return s.TransitionJobStateWithEvents(ctx, id, from, to, event)
+}
+
+// TransitionJobStateWithEvents is TransitionJobStateWithEvent for a caller that must
+// land the transition AND a durable OBLIGATION in the same commit (#1673).
+//
+// The single-event form leaves a window: a caller that transitions a job and then
+// writes its re-drive marker separately can crash in between, and a settled job with
+// no marker is invisible to every sweep that would have re-driven it. Passing both
+// events here closes that window by construction rather than by ordering luck.
+func (s *Store) TransitionJobStateWithEvents(ctx context.Context, id string, from string, to string, events ...JobEvent) (bool, error) {
+	return s.TransitionJobStateWithPayloadAndEvents(ctx, id, from, to, nil, events...)
+}
+
+// TransitionJobStateWithPayloadAndEvents additionally rewrites the job's PAYLOAD in
+// the same commit (#1673).
+//
+// THE CLASS, not the site: a caller that terminalizes a job and then writes the
+// payload its recovery path needs has merely MOVED the non-atomicity one step down the
+// sequence. The state it leaves - a settled job carrying a re-drive marker but no
+// result - is unrepairable: the actuator rejects the nil result, re-stamps the marker
+// and repeats forever, and no sweep selects it because the sweeps list QUEUED jobs.
+// Two durable facts that must agree are written by one statement here.
+//
+// A nil payload leaves the stored payload untouched, so the events-only wrapper above
+// is byte-equivalent to the original single-event primitive.
+func (s *Store) TransitionJobStateWithPayloadAndEvents(ctx context.Context, id string, from string, to string, payload []byte, events ...JobEvent) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
 
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, to, id, from)
+	var result sql.Result
+	if payload == nil {
+		result, err = tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, to, id, from)
+	} else {
+		// DERIVED FIELDS TRAVEL WITH THE PAYLOAD. jobs.result_hash and the payload
+		// projections are not decoration: the hash is the terminal result's
+		// proof-integrity receipt and its memory-harvest key, and writing a payload that
+		// installs a result while leaving the old (or empty) hash behind breaks that
+		// invariant silently. Every other payload writer recomputes them in the same
+		// UPDATE; so does this one (#1673).
+		projection := jobProjectionFromPayload(string(payload))
+		result, err = tx.ExecContext(ctx, `UPDATE jobs SET state = ?, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`,
+			to, payload, jobResultHashFromPayload(string(payload)), projection.Repo, projection.PullRequest,
+			projection.BlockerRetryAt, projection.BlockerSuggestedAction, to, id, from)
+	}
 	if err != nil {
 		return false, err
 	}
@@ -692,11 +733,13 @@ func (s *Store) TransitionJobStateWithEvent(ctx context.Context, id string, from
 	if affected == 0 {
 		return false, tx.Commit()
 	}
-	if event.JobID == "" {
-		event.JobID = id
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
-		return false, err
+	for _, event := range events {
+		if event.JobID == "" {
+			event.JobID = id
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+			return false, err
+		}
 	}
 	return true, tx.Commit()
 }

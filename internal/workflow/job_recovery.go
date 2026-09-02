@@ -45,6 +45,14 @@ func recordReadOnlyWorktreeReclaimOnAbort(ctx context.Context, store *db.Store, 
 
 const JobEventSupersededStaleHead = "superseded_stale_head"
 
+// JobEventSupersededPullRequestClosed marks a QUEUED job terminated because the
+// pull request it was dispatched for is no longer open (#1673). A merged or closed
+// PR cannot be implemented or reviewed, so the leg is not waiting for capacity, it
+// is waiting for a condition that has become impossible. The event kind is the
+// legible half: a terminal state with a reason can be read, an indefinite `queued`
+// row is camouflage that inflates every queue-depth check forever.
+const JobEventSupersededPullRequestClosed = "superseded_pr_closed"
+
 func RetryJob(ctx context.Context, store *db.Store, jobID string) (db.Job, error) {
 	if store == nil {
 		return db.Job{}, fmt.Errorf("store is required")
@@ -466,4 +474,169 @@ func SupersedeStaleHeadJob(ctx context.Context, store *db.Store, jobID string, r
 	}
 	updated, err := store.GetJob(ctx, job.ID)
 	return updated, true, err
+}
+
+// SupersedeClosedPullRequestJob terminates a QUEUED job whose pull request is no
+// longer open (#1673). It is deliberately narrower than SupersedeStaleHeadJob in
+// two ways.
+//
+// QUEUED ONLY. A running job is doing work whose output may still be worth
+// harvesting, and killing it mid-flight is a different decision with different
+// evidence; the stranded population this addresses has never started.
+//
+// NO PARENT PROPAGATION. Like CancelJob, this writes one job's terminal state and
+// nothing else. A delegation child must NOT come through here: `cancelled` is
+// rejected by finalizeTimedOutJob's state gate (engine_run_budgets.go), so a
+// cancelled child would never advance its coordinator and the strand would move
+// from the child to the parent. The daemon routes children through
+// FinalizeClosedPullRequestDelegationChild instead.
+func SupersedeClosedPullRequestJob(ctx context.Context, store *db.Store, jobID string, reason string) (db.Job, bool, error) {
+	if store == nil {
+		return db.Job{}, false, fmt.Errorf("store is required")
+	}
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		return db.Job{}, false, err
+	}
+	if job.State != string(JobQueued) {
+		return job, false, nil
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "queued job superseded: its pull request is no longer open"
+	}
+	transitioned, err := store.TransitionJobStateWithEvent(ctx, job.ID, job.State, string(JobCancelled), db.JobEvent{
+		JobID:   job.ID,
+		Kind:    JobEventSupersededPullRequestClosed,
+		Message: reason,
+	})
+	if err != nil {
+		return db.Job{}, false, err
+	}
+	if !transitioned {
+		latest, getErr := store.GetJob(ctx, job.ID)
+		if getErr != nil {
+			return db.Job{}, false, getErr
+		}
+		return latest, false, nil
+	}
+	// Same symmetry as CancelJob and SupersedeStaleHeadJob: a job that carried a
+	// dispatch-time read-only worktree must not leak it when it dies before running.
+	if payload, perr := unmarshalPayload(job.Payload); perr == nil {
+		recordReadOnlyWorktreeReclaimOnAbort(ctx, store, job, payload)
+	}
+	updated, err := store.GetJob(ctx, job.ID)
+	return updated, true, err
+}
+
+// closedPRChildPreAdvanceHook fires between the atomic terminal commit and the parent
+// advancement, which is the window the round-2 #1763 P1 occupies. Nil in production
+// (#1673).
+var closedPRChildPreAdvanceHook func(ctx context.Context, jobID string) error
+
+// FinalizeClosedPullRequestDelegationChild terminates a QUEUED delegation child
+// whose pull request is no longer open, and — unlike the top-level path — makes the
+// coordinator move. It transitions the child to `failed` with the same legible
+// event kind and then hands it to the finalizer the worker already uses for a
+// child that ended without a result, which stamps the synthetic result the parent's
+// advanceDelegations requires.
+//
+// The state differs from the top-level path on purpose: finalizeTimedOutJob accepts
+// running/failed/blocked and REJECTS cancelled, so `failed` is the only terminal
+// state from which a child can still advance its parent. The event kind, not the
+// state, is what makes the reason legible.
+func (e Engine) FinalizeClosedPullRequestDelegationChild(ctx context.Context, jobID string, reason string) (bool, error) {
+	if err := e.validate(); err != nil {
+		return false, err
+	}
+	job, payload, err := e.jobPayload(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	if strings.TrimSpace(payload.ParentJobID) == "" || job.State != string(JobQueued) {
+		return false, nil
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "queued delegation child superseded: its pull request is no longer open"
+	}
+	// ONE COMMIT FOR EVERY DURABLE FACT THIS DECISION PRODUCES (#1673): the terminal
+	// state, the synthetic result the parent's advanceDelegations requires, the legible
+	// supersession event, and the re-drive obligation.
+	//
+	// Round 1 of this review made the MARKER atomic with the transition and left the
+	// RESULT as a second write, which moved the non-atomicity one step down rather than
+	// removing it: a failed child with a marker and no result is a permanent retry loop,
+	// because the actuator rejects the nil result and no sweep selects a failed row.
+	// If two durable facts must agree, one statement writes them.
+	payload.Result = &AgentResult{
+		Decision: "failed",
+		Summary:  reason,
+		// The retry actuator reads this to know a delivery checkout can never validate
+		// for this child; it is cleared automatically by any RetryJob (#1673).
+		SupersededPullRequestClosed: true,
+	}
+	encoded, err := marshalPayload(payload)
+	if err != nil {
+		return false, err
+	}
+	transitioned, err := e.Store.TransitionJobStateWithPayloadAndEvents(ctx, job.ID, job.State, string(JobFailed), []byte(encoded),
+		db.JobEvent{
+			JobID:   job.ID,
+			Kind:    JobEventSupersededPullRequestClosed,
+			Message: reason,
+		},
+		db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "delegation_timeout_finalized",
+			Message: reason,
+		},
+		db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "advance_retry",
+			Message: "parent advancement owed after closed-pull-request supersession: " + reason,
+		})
+	if err != nil {
+		return false, err
+	}
+	if !transitioned {
+		return false, nil
+	}
+	recordReadOnlyWorktreeReclaimOnAbort(ctx, e.Store, job, payload)
+
+	// closedPRChildPreAdvanceHook is the only place a test can stop this sequence in the
+	// window the round-2 P1 lives in: after the atomic commit, before the parent is
+	// advanced. Nil in production.
+	if closedPRChildPreAdvanceHook != nil {
+		if hookErr := closedPRChildPreAdvanceHook(ctx, job.ID); hookErr != nil {
+			return true, hookErr
+		}
+	}
+	// ADVANCE EXPLICITLY. FinalizeTimedOutDelegationChild returns early once a result
+	// exists, which is now always, so routing through it would silently never advance
+	// the parent. An interruption here is covered: the result is already durable, so the
+	// pending-advancement actuator re-drives this exact call and converges.
+	if err := e.AdvanceJob(ctx, job.ID); err != nil {
+		var blocked BlockedError
+		if !errors.As(err, &blocked) {
+			return true, err
+		}
+		// A BlockedError is the parent's failure_policy making a decision and recording
+		// it - an advancement that HAPPENED, not one still owed.
+	}
+	if addErr := e.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   job.ID,
+		Kind:    "advance_completed",
+		Message: "parent advancement discharged after closed-pull-request supersession",
+	}); addErr != nil {
+		return true, addErr
+	}
+	return true, nil
+}
+
+// SetClosedPRChildPreAdvanceHookForTest installs the pre-advance interruption seam from
+// another package's test. The actuator that recovers this window lives in internal/cli,
+// so the boundary can only be exercised end-to-end from there (#1673).
+func SetClosedPRChildPreAdvanceHookForTest(hook func(ctx context.Context, jobID string) error) {
+	closedPRChildPreAdvanceHook = hook
 }

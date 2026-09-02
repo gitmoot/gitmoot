@@ -261,6 +261,13 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 	if err := d.reconcileTransientlyBlockedMergeGates(ctx, openPullNumbers); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	// Queued legs whose PR closed or merged underneath them (#1673). Placed AFTER
+	// the open-PR listing on purpose: that listing is fail-closed (a forge error
+	// returns before this point), so the open set is complete-or-absent and never a
+	// silently truncated page this sweep could read as "everything closed".
+	if err := d.supersedeQueuedJobsForClosedPullRequests(ctx, openPullNumbers); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	if err := d.retryClosedReadyToMerge(ctx, openBranches); err != nil && firstErr == nil {
 		firstErr = err
 	}
@@ -1598,6 +1605,164 @@ func (d Daemon) supersedeStaleReviewJobs(ctx context.Context, pull github.PullRe
 		}
 	}
 	return nil
+}
+
+// supersedeQueuedJobsForClosedPullRequests terminates queued jobs bound to a pull
+// request that is no longer open (#1673). A merged or closed PR cannot be
+// implemented or reviewed, so those legs are not waiting for capacity — they wait
+// for a condition that has become impossible, and they wait forever: nothing else
+// in the poll selects them (supersedeStaleReviewJobs only fires per OPEN pull, and
+// the task reconcilers write task state, never job state). The cost is quiet: the
+// queued count gains a floor it never drops below, so a real backlog hides behind a
+// constant and any "is the queue empty" readiness check can never pass again.
+//
+// The selection is deliberately narrow, because the failure mode of a sweep that is
+// too wide is silently discarding work somebody asked for:
+//   - the job's payload repo must be THIS daemon's repo. PR numbers are not
+//     repo-qualified, so PR #42 exists in every repo and payload.Repo is the only
+//     binding.
+//   - payload.PullRequest must be > 0. jobs.pull_request was never backfilled, so
+//     pre-#843 rows read 0; 0 means "no PR recorded", never "PR zero".
+//   - four PR-bound classes are exempt and enumerated in queuedJobSurvivesClosedPullRequest.
+func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, openPullNumbers map[int64]struct{}) error {
+	// ListQueuedJobs filters state in SQL against the partial index on
+	// state='queued' and already excludes externally-driven rows.
+	jobs, err := d.Store.ListQueuedJobs(ctx)
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, job := range jobs {
+		payload, err := workflowPayload(job)
+		if err != nil {
+			// A payload this poll cannot parse is not evidence that the work is
+			// pointless. Leave it queued and surface the error.
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if payload.Repo != d.Repo.FullName() || payload.PullRequest <= 0 {
+			continue
+		}
+		if _, open := openPullNumbers[int64(payload.PullRequest)]; open {
+			continue
+		}
+		survives, err := d.queuedJobSurvivesClosedPullRequest(ctx, job, payload)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if survives {
+			continue
+		}
+		// REVALIDATE IMMEDIATELY BEFORE THE IRREVERSIBLE TRANSITION (#1673). The open
+		// set is complete-or-error, but completeness is not CURRENCY: it was read at the
+		// top of the poll, and a PR reopened since then - or a PR plus its queued job
+		// created since then - is genuinely open while absent from that older map. The
+		// snapshot alone would silently terminalize valid work, and terminalizing is not
+		// reversible, so the sweep pays one targeted read per candidate instead.
+		//
+		// FAIL CLOSED: a read error leaves the job queued and surfaces the error. A
+		// sweep that cannot prove the PR is closed must not act as if it were.
+		stillClosed, err := d.pullRequestStillClosed(ctx, int64(payload.PullRequest))
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if !stillClosed {
+			continue
+		}
+		reason := fmt.Sprintf("queued %s job superseded: %s pull request #%d is no longer open",
+			job.Type, payload.Repo, payload.PullRequest)
+		if strings.TrimSpace(payload.ParentJobID) != "" {
+			// A delegation child must also release its coordinator; see
+			// FinalizeClosedPullRequestDelegationChild for why its terminal state
+			// differs from the top-level path.
+			if d.Workflow == nil {
+				continue
+			}
+			if _, err := d.Workflow.FinalizeClosedPullRequestDelegationChild(ctx, job.ID, reason); err != nil {
+				// The parent's failure_policy decides what a dead child means, and
+				// block_parent (the default) surfaces as a BlockedError. That is the DAG
+				// making a decision and recording it, not this sweep failing — the same
+				// treatment reconcileReviewingPullRequest gives an AdvanceJob block.
+				var blocked workflow.BlockedError
+				if !errors.As(err, &blocked) && firstErr == nil {
+					firstErr = err
+				}
+			}
+			continue
+		}
+		if _, _, err := workflow.SupersedeClosedPullRequestJob(ctx, d.Store, job.ID, reason); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// pullRequestStillClosed re-reads ONE pull request's current state, immediately before
+// the sweep terminalizes work bound to it (#1673).
+//
+// It exists because a complete listing is not a current one: ListPullRequests is
+// fail-closed and never returns a truncated page, but it is read once at the top of
+// the poll, and the sweep runs much later. A PR reopened in that window - or created
+// with its queued job in that window - is genuinely open and absent from the map.
+//
+// An error is returned rather than swallowed, so the caller leaves the job queued: the
+// only safe default for an irreversible transition is "I could not prove it".
+func (d Daemon) pullRequestStillClosed(ctx context.Context, number int64) (bool, error) {
+	if d.GitHub == nil {
+		// No client to revalidate with: refuse to terminalize rather than trusting a
+		// snapshot whose age this function exists to distrust.
+		return false, nil
+	}
+	pull, err := d.GitHub.GetPullRequest(ctx, d.Repo, number)
+	if err != nil {
+		return false, fmt.Errorf("revalidate pull request #%d before superseding queued work: %w", number, err)
+	}
+	return !strings.EqualFold(strings.TrimSpace(pull.State), "open"), nil
+}
+
+// queuedJobSurvivesClosedPullRequest reports whether a queued PR-bound job must be
+// left alone even though its pull request is closed. Each class is here because
+// killing it would discard work whose purpose outlives the PR:
+//
+//   - a job routed from a PR COMMENT is an explicit human request. An `ask` posted
+//     minutes before a merge is still worth answering, and the operator who asked
+//     has no way to see it was silently dropped. The `routed` event the comment path
+//     writes is the durable marker.
+//   - a COORDINATOR CONTINUATION synthesizes work that already happened; the
+//     killed-root skip exempts it for the same reason (daemon_scheduler.go).
+//   - a PIPELINE stage job owns run rows, and a pipeline PR review is legitimately
+//     report-only on an already-merged PR.
+//   - a TEMP-WORKER MERGE-BACK summary describes work that already ran. Today it
+//     carries PullRequest 0 so the caller's `> 0` gate already skips it; it is named
+//     here so a future field addition cannot make it collateral.
+func (d Daemon) queuedJobSurvivesClosedPullRequest(ctx context.Context, job db.Job, payload workflow.JobPayload) (bool, error) {
+	if payload.Sender == workflow.PipelineJobSender {
+		return true, nil
+	}
+	if payload.DelegationReason == "temp_worker_merge_back" {
+		return true, nil
+	}
+	if job.ID == workflow.DelegationContinuationID(strings.TrimSpace(payload.ParentJobID)) {
+		return true, nil
+	}
+	events, err := d.Store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		return false, err
+	}
+	for _, event := range events {
+		if event.Kind == "routed" {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // reviewJobTargetsPull is deliberately broader than

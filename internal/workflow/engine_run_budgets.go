@@ -184,6 +184,115 @@ func (e Engine) recordFoldedReviewOutcome(ctx context.Context, job db.Job, paylo
 	})
 }
 
+// AdvanceParentDAGForTerminalChild advances ONLY the parent DAG for a child that is
+// already terminal, and it is STRUCTURALLY unable to do anything else (#1673).
+//
+// It exists because the delivery preflight in the retry actuator cannot succeed for a
+// child whose pull request has closed - the shared checkout can never be on a dead PR's
+// head - so gating parent advancement on that preflight stranded the parent forever. The
+// first remedy let such a child through AdvanceJob with an empty checkout, which was too
+// broad: AdvanceJob normalizes high-risk lens verdicts (rewriting the result and updating
+// the job payload and state), dispatches the child's OWN delegations, continues into the
+// review merge gate, and registers deferred worktree teardown - all of which would then
+// run unvalidated.
+//
+// This operation reaches none of that. It runs the parent-side block of AdvanceJob and
+// nothing else, so it cannot be widened by accident: there is no path from here to lens
+// normalization, to the child's delegations, or to worktree cleanup.
+func (e Engine) AdvanceParentDAGForTerminalChild(ctx context.Context, jobID string) error {
+	if err := e.validate(); err != nil {
+		return err
+	}
+	job, payload, err := e.jobPayload(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if payload.Result == nil {
+		return fmt.Errorf("job %q has no agent result", jobID)
+	}
+	if strings.TrimSpace(payload.ParentJobID) == "" {
+		return nil
+	}
+	if !IsSettledJobState(job.State) {
+		return fmt.Errorf("job %q is not settled, so parent-only advancement does not apply", jobID)
+	}
+	_, err = e.advanceParentForTerminalChild(ctx, job, payload, taskRefFromPayload(payload))
+	return err
+}
+
+// advanceParentForTerminalChild is the parent-side half of AdvanceJob, shared by
+// AdvanceJob and AdvanceParentDAGForTerminalChild so the two cannot drift. The bool
+// reports whether the caller must STOP - the block's own short-circuits mean "this
+// child's outcome is fully handled", not "continue with the rest of the advance".
+func (e Engine) advanceParentForTerminalChild(ctx context.Context, job db.Job, payload JobPayload, ref taskRef) (bool, error) {
+	parentJob, parentPayload, err := e.jobPayload(ctx, payload.ParentJobID)
+	if err != nil {
+		return false, err
+	}
+	// Ask-gate for a delegation CHILD (#445): a HEALTHY child that returned
+	// human_questions[] pauses the SHARED parent task on the COORDINATOR's round
+	// BEFORE advancing the parent DAG. Running it here — ahead of
+	// advanceDelegations — is load-bearing: if the asking child is the last/only
+	// sibling to finish, advanceDelegations would otherwise enqueue the coordinator
+	// continuation (the tree would PROCEED past the question, consuming compute and
+	// contradicting the open pause). Routing the pause to the coordinator
+	// (pauseAwaitingHumanAnswer keys on payload.ParentJobID) also makes the human's
+	// resume target the coordinator — whose answer-driven continuation is the one
+	// the tree advances on — and lets sibling asks share the single round. A
+	// blocked/failed child never asks (it takes the failure path below).
+	if len(payload.Result.HumanQuestions) > 0 &&
+		payload.Result.Decision != "blocked" && payload.Result.Decision != "failed" {
+		open, perr := e.pauseAwaitingHumanAnswer(ctx, job, payload, ref)
+		if perr != nil {
+			return false, perr
+		}
+		if open {
+			return false, AwaitingHumanError{Reason: fmt.Sprintf("job %q is awaiting a human answer to %d question(s)", payload.ParentJobID, len(payload.Result.HumanQuestions))}
+		}
+		// CLOSED: the human already answered (the coordinator continuation that
+		// carries the answer is in flight) or the ask was TTL-finalized. The
+		// answer-driven coordinator continuation is the asking child's sole
+		// continuation, so short-circuit — neither the parent DAG advance nor this
+		// child's own delegations[] re-dispatch.
+		return true, nil
+	}
+	if parentPayload.Result != nil {
+		if err := e.advanceDelegations(ctx, parentJob, parentPayload, parentPayload.Result, taskRefFromPayload(parentPayload)); err != nil {
+			return false, err
+		}
+		// A child that failed under a continue/escalate failure_policy, one that
+		// was re-enqueued by the retry pass, or one whose parent already has a
+		// continuation in flight, is handled by the delegation graph (siblings
+		// keep running, the retry runs, or the coordinator continuation absorbs
+		// the failure); do not also block the shared parent task via the
+		// failed-decision path below.
+		if payload.Result.Decision == "blocked" || payload.Result.Decision == "failed" {
+			if delegationFailureHandledByPolicy(parentPayload.Result, payload.DelegationID) {
+				return true, nil
+			}
+			retrying, err := e.delegationRetryPending(ctx, parentJob.ID, payload.DelegationID)
+			if err != nil {
+				return false, err
+			}
+			if retrying {
+				return true, nil
+			}
+			// Once a continuation has been enqueued (e.g. an earlier escalate
+			// fired it), a later block_parent sibling failure must not block the
+			// shared parent task: that would contradict the in-flight
+			// continuation, which already carries every child outcome.
+			parentEvents, err := e.Store.ListJobEvents(ctx, parentJob.ID)
+			if err != nil {
+				return false, err
+			}
+			if continuationEnqueued(parentEvents) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	if err := e.validate(); err != nil {
 		return err
@@ -304,70 +413,12 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	// terminal. This runs here (the child's AdvanceJob) because RunJob calls
 	// AdvanceJob per finishing child. A child with no parent is unaffected.
 	if strings.TrimSpace(payload.ParentJobID) != "" {
-		parentJob, parentPayload, err := e.jobPayload(ctx, payload.ParentJobID)
+		stop, err := e.advanceParentForTerminalChild(ctx, job, payload, ref)
 		if err != nil {
 			return err
 		}
-		// Ask-gate for a delegation CHILD (#445): a HEALTHY child that returned
-		// human_questions[] pauses the SHARED parent task on the COORDINATOR's round
-		// BEFORE advancing the parent DAG. Running it here — ahead of
-		// advanceDelegations — is load-bearing: if the asking child is the last/only
-		// sibling to finish, advanceDelegations would otherwise enqueue the coordinator
-		// continuation (the tree would PROCEED past the question, consuming compute and
-		// contradicting the open pause). Routing the pause to the coordinator
-		// (pauseAwaitingHumanAnswer keys on payload.ParentJobID) also makes the human's
-		// resume target the coordinator — whose answer-driven continuation is the one
-		// the tree advances on — and lets sibling asks share the single round. A
-		// blocked/failed child never asks (it takes the failure path below).
-		if len(payload.Result.HumanQuestions) > 0 &&
-			payload.Result.Decision != "blocked" && payload.Result.Decision != "failed" {
-			open, perr := e.pauseAwaitingHumanAnswer(ctx, job, payload, ref)
-			if perr != nil {
-				return perr
-			}
-			if open {
-				return AwaitingHumanError{Reason: fmt.Sprintf("job %q is awaiting a human answer to %d question(s)", payload.ParentJobID, len(payload.Result.HumanQuestions))}
-			}
-			// CLOSED: the human already answered (the coordinator continuation that
-			// carries the answer is in flight) or the ask was TTL-finalized. The
-			// answer-driven coordinator continuation is the asking child's sole
-			// continuation, so short-circuit — neither the parent DAG advance nor this
-			// child's own delegations[] re-dispatch.
+		if stop {
 			return nil
-		}
-		if parentPayload.Result != nil {
-			if err := e.advanceDelegations(ctx, parentJob, parentPayload, parentPayload.Result, taskRefFromPayload(parentPayload)); err != nil {
-				return err
-			}
-			// A child that failed under a continue/escalate failure_policy, one that
-			// was re-enqueued by the retry pass, or one whose parent already has a
-			// continuation in flight, is handled by the delegation graph (siblings
-			// keep running, the retry runs, or the coordinator continuation absorbs
-			// the failure); do not also block the shared parent task via the
-			// failed-decision path below.
-			if payload.Result.Decision == "blocked" || payload.Result.Decision == "failed" {
-				if delegationFailureHandledByPolicy(parentPayload.Result, payload.DelegationID) {
-					return nil
-				}
-				retrying, err := e.delegationRetryPending(ctx, parentJob.ID, payload.DelegationID)
-				if err != nil {
-					return err
-				}
-				if retrying {
-					return nil
-				}
-				// Once a continuation has been enqueued (e.g. an earlier escalate
-				// fired it), a later block_parent sibling failure must not block the
-				// shared parent task: that would contradict the in-flight
-				// continuation, which already carries every child outcome.
-				parentEvents, err := e.Store.ListJobEvents(ctx, parentJob.ID)
-				if err != nil {
-					return err
-				}
-				if continuationEnqueued(parentEvents) {
-					return nil
-				}
-			}
 		}
 	}
 

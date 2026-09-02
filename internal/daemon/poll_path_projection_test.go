@@ -125,7 +125,15 @@ func TestPollOnceFetchesReviewJobsOncePerPoll(t *testing.T) {
 	newReviewJobsMemo = func(reviewJobLister) *reviewJobsMemo { return realNewReviewJobsMemo(counter) }
 	defer func() { newReviewJobsMemo = realNewReviewJobsMemo }()
 
-	client := &fakeGitHub{pulls: pulls}
+	// seedReviewJob binds its job to PR 7, which is not among the three open PRs above.
+	// The closed-PR sweep revalidates such a candidate against the forge before acting
+	// (#1673), so this world must state #7's current state rather than leave it
+	// undeclared - an undeclared PR is indistinguishable from a forge failure, and the
+	// sweep correctly refuses to terminalize work it cannot prove is dead.
+	client := &fakeGitHub{
+		pulls:         pulls,
+		pullsByNumber: map[int64]github.PullRequest{7: {Number: 7, State: "closed", HeadRef: "other-head", BaseRef: "main"}},
+	}
 	if err := (Daemon{Repo: repo, Store: store, GitHub: client}).PollOnce(ctx); err != nil {
 		t.Fatalf("PollOnce returned error: %v", err)
 	}

@@ -137,6 +137,17 @@ var LearningScopes = []string{"repo", "general"}
 
 type AgentResult struct {
 	Decision string `json:"decision"`
+	// SupersededPullRequestClosed marks a SYNTHETIC result minted by the closed-PR
+	// sweep for a delegation child whose pull request is no longer open (#1673).
+	//
+	// It rides in the RESULT rather than in the event log on purpose. The retry actuator
+	// needs to know that this child can never satisfy a delivery-checkout preflight, and
+	// the event log cannot answer that question safely: job_events carries no lifecycle
+	// generation, and RetryJob preserves prior events while starting a new run, so a
+	// historical supersession would keep authorizing a bypass for a job that has since
+	// been retried and failed normally. RetryJob clears Result, so this fact is cleared
+	// with it - the staleness is IMPOSSIBLE rather than filtered.
+	SupersededPullRequestClosed bool `json:"superseded_pull_request_closed,omitempty"`
 	// Severity is the highest-severity review finding. It is optional for
 	// non-review results and approved reviews, but required for a review that
 	// requests changes.
@@ -176,7 +187,33 @@ type AgentResult struct {
 	FanOut bool `json:"fan_out,omitempty"`
 }
 
-var agentResultAllowedFields = jsonTagSet(reflect.TypeOf(AgentResult{}))
+// authorityGrantingResultFields are AgentResult fields an agent may NEVER supply,
+// because setting them GRANTS the job authority it would not otherwise have (#1673).
+//
+// The distinction is not "product-owned". FanOut is product-owned too and is safe to
+// accept, because an agent that sets it can only REMOVE its own authority - it marks a
+// row as a fan-out. SupersededPullRequestClosed is the opposite: it tells the retry
+// actuator that this child's pull request is gone, which authorizes a route that SKIPS
+// the delivery-checkout preflight. An agent that could set it could bypass a safety
+// boundary by asserting a lifecycle fact about itself.
+//
+// Excluding a field from the PROMPT does not stop this. A prompt omission stops a
+// cooperative agent; the parser is what stops an incorrect or adversarial one.
+var authorityGrantingResultFields = map[string]struct{}{
+	"superseded_pull_request_closed": {},
+}
+
+// agentResultAllowedFields is the accepted-input roster: every AgentResult JSON tag
+// MINUS the fields that would grant authority.
+var agentResultAllowedFields = agentAcceptedResultFields()
+
+func agentAcceptedResultFields() map[string]struct{} {
+	fields := jsonTagSet(reflect.TypeOf(AgentResult{}))
+	for field := range authorityGrantingResultFields {
+		delete(fields, field)
+	}
+	return fields
+}
 
 // AllowedAgentResultFields returns a copy of the JSON fields accepted in a
 // gitmoot_result object. It is derived from AgentResult so contract consumers
@@ -693,6 +730,12 @@ func shortHash(value string) string {
 }
 
 func normalizeAgentResult(result *AgentResult) {
+	// DEFENSE IN DEPTH. The field roster above already refuses this field as unknown
+	// input, so reaching here with it set would mean a second parse path exists. Clearing
+	// it costs nothing and removes the possibility that a future caller bypasses the
+	// roster and silently grants itself the checkout-bypass route (#1673).
+	result.SupersededPullRequestClosed = false
+
 	if result.Findings == nil {
 		result.Findings = []json.RawMessage{}
 	}
