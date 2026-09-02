@@ -424,12 +424,24 @@ func (s *Store) AcquireEscalationRecoveryLease(ctx context.Context, jobID string
 
 // ReleaseEscalationRecoveryLease drops a lease this owner still holds so a finished
 // pass does not make the round wait out its lease.
-func (s *Store) ReleaseEscalationRecoveryLease(ctx context.Context, jobID string, roundID string, owner string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE escalation_rounds
+func (s *Store) ReleaseEscalationRecoveryLease(ctx context.Context, jobID string, roundID string, owner string) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE escalation_rounds
 		SET recovery_owner = '', recovery_lease_until = NULL
 		WHERE job_id = ? AND round_id = ? AND recovery_owner = ? AND effects_completed_at IS NULL`,
 		strings.TrimSpace(jobID), strings.TrimSpace(roundID), strings.TrimSpace(owner))
-	return err
+	if err != nil {
+		return false, err
+	}
+	// BOUND, NOT DISCARDED (#1673). Zero rows is LEGITIMATE here and is the one case in
+	// this model where a guarded write's false is not a fault: the round settled, was
+	// parked, or ownership already moved on, and in every one of those the lease is
+	// already gone. It is returned rather than swallowed so a caller that does care -
+	// and a test - can tell "I released it" from "it was not mine to release".
+	released, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return released == 1, nil
 }
 
 // RecordEscalationRoundPreEffects durably records the resources a replay allocated

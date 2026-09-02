@@ -673,7 +673,10 @@ func (e Engine) ResolveEscalation(ctx context.Context, coordinatorJobID string, 
 		// Another pass owns this replay; its effects are the same idempotent set.
 		return nil
 	}
-	defer func() { _ = e.Store.ReleaseEscalationRecoveryLease(ctx, coordinatorJobID, round.RoundID, owner) }()
+	defer func() { // Explicitly rejected: see ReleaseEscalationRecoveryLease - zero rows means the
+		// lease is already gone.
+		_, _ = e.Store.ReleaseEscalationRecoveryLease(ctx, coordinatorJobID, round.RoundID, owner)
+	}()
 	return e.applyResolutionEffectsFenced(ctx, parentJob, parentPayload, ref, rec, verb, instructions, answers, round.RoundID, owner)
 }
 
@@ -944,7 +947,10 @@ func (e Engine) recoverEscalationRound(ctx context.Context, round db.EscalationR
 		// Another pass owns it, or it was parked or settled since the candidate query.
 		return false, nil
 	}
-	defer func() { _ = e.Store.ReleaseEscalationRecoveryLease(ctx, round.JobID, round.RoundID, owner) }()
+	defer func() { // Explicitly rejected: a false here means the round already settled or moved on,
+		// in which case the lease is gone anyway.
+		_, _ = e.Store.ReleaseEscalationRecoveryLease(ctx, round.JobID, round.RoundID, owner)
+	}()
 
 	// CLASS I - STRUCTURALLY IMPOSSIBLE, and the only one: the coordinator row is
 	// gone. With no coordinator there is no DAG to pause, no task to move and no
@@ -1467,10 +1473,10 @@ func (e Engine) AutoFinalizeExpiredEscalations(ctx context.Context, ttl time.Dur
 			continue
 		}
 		if err := e.applyResolutionEffectsFenced(ctx, job, payload, ref, rec, ResumeTTL, "", nil, round.RoundID, ttlOwner); err != nil {
-			_ = e.Store.ReleaseEscalationRecoveryLease(ctx, jobID, round.RoundID, ttlOwner)
+			_, _ = e.Store.ReleaseEscalationRecoveryLease(ctx, jobID, round.RoundID, ttlOwner)
 			return finalized, err
 		}
-		_ = e.Store.ReleaseEscalationRecoveryLease(ctx, jobID, round.RoundID, ttlOwner)
+		_, _ = e.Store.ReleaseEscalationRecoveryLease(ctx, jobID, round.RoundID, ttlOwner)
 		finalized++
 	}
 	return finalized, nil

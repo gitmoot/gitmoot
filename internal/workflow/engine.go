@@ -522,7 +522,13 @@ func (e Engine) blockTask(ctx context.Context, ref taskRef, kind string, reason 
 		// synthesis legitimately blocks a parent task while still enqueuing work, so
 		// only the allocation-refusal site sets resolutionSink.blocked.
 		e.resolutionSink.taskEvent = db.TaskEvent{Kind: kind, FromState: fromState, Reason: reason}
-		e.resolutionSink.taskEventValid = true
+		// IDEMPOTENT BY STATE. A refused resolution keeps its claim and withholds its
+		// receipt, so the recovery sweep re-drives it until the attempt bound parks it -
+		// and an event appended on every pass would turn one refusal into an unbounded
+		// audit trail. The event records a TRANSITION, so it is written only when the
+		// task is not already blocked; a genuine re-block after the task left the
+		// blocked state still records, because fromState differs then (#1673).
+		e.resolutionSink.taskEventValid = fromState != string(TaskBlocked)
 		return blockErr
 	}
 	blockEvent := db.TaskEvent{
