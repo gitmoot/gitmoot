@@ -2394,13 +2394,17 @@ that deliberate hold does not escalate. Pipeline `allow_auto_merge` is independe
 When review independence cannot be verified, the merge gate names the evidence
 it observed: no implement job for the task, implement jobs that do not match the
 task identity, a matching implement job with no agent, or a malformed implement
-payload. All four remain fail-closed. For the no-job case, first confirm that an
-independent approval exists at the PR's exact current head. If it does not, do
-not use the **coordinator bridge**. If it does, inspect that engine review job
-with `gitmoot job show <job-id>`, confirm its agent and decision, confirm the
-implementer from the pane session, then journal both facts with `gitmoot
-workflow note`. That journal is an operator record only; it is not an
-attestation or merge-gate input.
+payload. All four remain fail-closed. The no-job case is an **attribution gap,
+not a failed independence check**: the gate cannot establish *who* implemented,
+which is a different fact from "the reviewer implemented this", and it is the
+expected state for in-session (pane-driven) implementation, where no engine
+implement job exists. The approval is not disqualified. The remedy is runnable
+by the implementing lane and needs no coordinator: record the durable
+attribution row with `gitmoot job record --agent <implementing-agent> --repo
+<owner/repo> --type implement --decision implemented --task <task-id> --pr
+<number> --head-sha <sha>`, then re-evaluate. Session-recorded jobs (#657)
+create rows with `Type == "implement"`, which is exactly what the gate reads.
+Never record an agent that did not implement, and never record the reviewer.
 
 Merge-gate retries are automatic while the daemon is running. Retryable states,
 such as a busy base-branch merge queue or a GitHub branch update in progress,
