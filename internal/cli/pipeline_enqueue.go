@@ -6,9 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/gitmoot/gitmoot/internal/github"
 	"strings"
 
-	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -419,7 +419,7 @@ func allocatePipelineStageWritableWorktreeForRunner(ctx context.Context, store *
 	if err != nil {
 		return request, fmt.Errorf("resolve repo %q for implement stage: %w", request.Repo, err)
 	}
-	repo, err := daemon.ParseRepository(request.Repo)
+	repo, err := github.ParseRepository(request.Repo)
 	if err != nil {
 		return request, err
 	}

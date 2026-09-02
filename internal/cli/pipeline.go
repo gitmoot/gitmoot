@@ -7,8 +7,8 @@ import (
 	"flag"
 	"fmt"
 	"github.com/gitmoot/gitmoot/internal/config"
-	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -198,7 +198,7 @@ func runPipelineAdd(args []string, stdout, stderr io.Writer) int {
 	}
 	repo := ""
 	if strings.TrimSpace(spec.Repo) != "" {
-		parsed, err := daemon.ParseRepository(spec.Repo)
+		parsed, err := github.ParseRepository(spec.Repo)
 		if err != nil {
 			fmt.Fprintf(stderr, "pipeline add: invalid repo %q: %v\n", spec.Repo, err)
 			return 2

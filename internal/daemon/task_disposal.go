@@ -147,7 +147,7 @@ func (d Daemon) disposeTaskCandidate(ctx context.Context, candidate db.StaleTask
 		}
 		getter, ok := d.GitHub.(issueGetter)
 		if ok {
-			subjectRepo, parseErr := ParseRepository(itemEvidence.subjectRepo)
+			subjectRepo, parseErr := github.ParseRepository(itemEvidence.subjectRepo)
 			if parseErr != nil {
 				return d.strandTask(ctx, candidate, taskDisposalReasonUnavailable, orgConfig)
 			}

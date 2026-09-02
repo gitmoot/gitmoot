@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
@@ -117,7 +116,7 @@ func runRepoAdd(args []string, stdout, stderr io.Writer) int {
 			pollExplicit = true
 		}
 	})
-	repo, err := daemon.ParseRepository(repoArg)
+	repo, err := github.ParseRepository(repoArg)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid repo: %v\n", err)
 		return 2
@@ -284,7 +283,7 @@ func runRepoSetInterval(args []string, stdout, stderr io.Writer) int {
 			// Accept the fully-spelled form from the command synopsis; --all makes
 			// the validated owner/repo selector informational.
 			repoArg, value = fs.Arg(0), fs.Arg(1)
-			if _, err := daemon.ParseRepository(repoArg); err != nil {
+			if _, err := github.ParseRepository(repoArg); err != nil {
 				fmt.Fprintf(stderr, "invalid repo: %v\n", err)
 				return 2
 			}
@@ -298,7 +297,7 @@ func runRepoSetInterval(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 		repoArg, value = fs.Arg(0), fs.Arg(1)
-		repo, err := daemon.ParseRepository(repoArg)
+		repo, err := github.ParseRepository(repoArg)
 		if err != nil {
 			fmt.Fprintf(stderr, "invalid repo: %v\n", err)
 			return 2
@@ -383,7 +382,7 @@ func runRepoAutoFix(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "repo auto-fix requires --reason")
 		return 2
 	}
-	repo, err := daemon.ParseRepository(repoArg)
+	repo, err := github.ParseRepository(repoArg)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid repo: %v\n", err)
 		return 2
@@ -432,7 +431,7 @@ func runRepoRemove(args []string, stdout, stderr io.Writer) int {
 	if code >= 0 {
 		return code
 	}
-	repo, err := daemon.ParseRepository(repoArg)
+	repo, err := github.ParseRepository(repoArg)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid repo: %v\n", err)
 		return 2
@@ -470,7 +469,7 @@ func runRepoDoctor(args []string, stdout, stderr io.Writer) int {
 	if code >= 0 {
 		return code
 	}
-	repo, err := daemon.ParseRepository(repoArg)
+	repo, err := github.ParseRepository(repoArg)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid repo: %v\n", err)
 		return 2
@@ -519,7 +518,7 @@ func runRepoDoctor(args []string, stdout, stderr io.Writer) int {
 }
 
 func inspectRegisteredRepoCheckout(ctx context.Context, store *db.Store, record db.Repo) (db.Repo, bool, bool, error) {
-	repo, err := daemon.ParseRepository(record.FullName())
+	repo, err := github.ParseRepository(record.FullName())
 	if err != nil {
 		return db.Repo{}, false, false, err
 	}

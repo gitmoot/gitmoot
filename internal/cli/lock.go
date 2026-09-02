@@ -6,11 +6,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/gitmoot/gitmoot/internal/github"
 	"io"
 	"strings"
 	"time"
 
-	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 )
 
@@ -236,7 +236,7 @@ func normalizeOptionalRepoFlag(value string, stderr io.Writer) (string, bool) {
 }
 
 func normalizeRepoArg(value string, stderr io.Writer) (string, bool) {
-	repo, err := daemon.ParseRepository(value)
+	repo, err := github.ParseRepository(value)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid repo: %v\n", err)
 		return "", false

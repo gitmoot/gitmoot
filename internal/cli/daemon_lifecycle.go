@@ -323,7 +323,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	repo, err := daemon.ParseRepository(*repoFlag)
+	repo, err := github.ParseRepository(*repoFlag)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid repo: %v\n", err)
 		return 2
@@ -997,7 +997,7 @@ func parseDaemonStartConfig(command string, args []string, stderr io.Writer) (da
 	// --scheduler barrier still forces the old per-tick behavior.
 	cfg.Scheduler = autoSelectScheduler(cfg.Scheduler, cfg.Workers, cfg.ExplicitScheduler)
 	if cfg.RepoFlag != "" {
-		repo, err := daemon.ParseRepository(cfg.RepoFlag)
+		repo, err := github.ParseRepository(cfg.RepoFlag)
 		if err != nil {
 			fmt.Fprintf(stderr, "invalid repo: %v\n", err)
 			return daemonStartConfig{}, 2

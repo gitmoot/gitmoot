@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/github"
 )
 
@@ -55,7 +54,7 @@ func runRepoCollisions(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "repo collisions: --limit must be between 1 and %d\n", repoCollisionMaxLimit)
 		return 2
 	}
-	repo, err := daemon.ParseRepository(repoArg)
+	repo, err := github.ParseRepository(repoArg)
 	if err != nil {
 		fmt.Fprintf(stderr, "repo collisions: invalid repo: %v\n", err)
 		return 2

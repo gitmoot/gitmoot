@@ -21,7 +21,6 @@ import (
 	"unicode"
 
 	"github.com/gitmoot/gitmoot/internal/config"
-	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
@@ -218,7 +217,7 @@ func runGoalImport(args []string, stdout, stderr io.Writer) int {
 	}
 	repoScope := strings.TrimSpace(*repo)
 	if repoScope != "" {
-		parsedRepo, err := daemon.ParseRepository(repoScope)
+		parsedRepo, err := github.ParseRepository(repoScope)
 		if err != nil {
 			fmt.Fprintf(stderr, "invalid repo: %v\n", err)
 			return 2
@@ -428,7 +427,7 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 		if strings.TrimSpace(requestRepo) == "" {
 			return errors.New("task run requires --repo when task has no repo")
 		}
-		repo, err := daemon.ParseRepository(requestRepo)
+		repo, err := github.ParseRepository(requestRepo)
 		if err != nil {
 			return fmt.Errorf("invalid repo: %w", err)
 		}
@@ -996,7 +995,7 @@ func recoverTaskImplementationForRunner(ctx context.Context, store *db.Store, ta
 	if strings.TrimSpace(requestRepo) == "" {
 		return workflow.JobPayload{}, errors.New("task recover requires --repo when task has no repo")
 	}
-	if _, err := daemon.ParseRepository(requestRepo); err != nil {
+	if _, err := github.ParseRepository(requestRepo); err != nil {
 		return workflow.JobPayload{}, fmt.Errorf("invalid repo: %w", err)
 	}
 	if _, err := store.GetRepo(ctx, requestRepo); err != nil {

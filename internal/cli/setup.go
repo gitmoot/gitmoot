@@ -6,11 +6,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/gitmoot/gitmoot/internal/github"
 	"io"
 	"os"
 	"strings"
 
-	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
@@ -43,7 +43,7 @@ func runSetup(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "setup requires --repo, --agent, --runtime, and --session")
 		return 2
 	}
-	repo, err := daemon.ParseRepository(*repoFlag)
+	repo, err := github.ParseRepository(*repoFlag)
 	if err != nil {
 		fmt.Fprintf(stderr, "invalid repo: %v\n", err)
 		return 2

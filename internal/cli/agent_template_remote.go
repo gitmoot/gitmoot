@@ -10,7 +10,6 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
 	"github.com/gitmoot/gitmoot/internal/config"
-	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
 )
@@ -102,7 +101,7 @@ func runAgentTemplatePublish(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "no custom templates to publish")
 			return nil
 		}
-		repository, err := daemon.ParseRepository(repoName)
+		repository, err := github.ParseRepository(repoName)
 		if err != nil {
 			return err
 		}

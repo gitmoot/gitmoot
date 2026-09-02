@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/gitmoot/gitmoot/internal/github"
 	"io"
 	"os"
 	"os/exec"
@@ -18,7 +19,6 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
 	"github.com/gitmoot/gitmoot/internal/buildinfo"
-	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -326,7 +326,7 @@ func runPipelineImport(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "pipeline import accepts exactly one bundle directory")
 		return 2
 	}
-	repo, err := daemon.ParseRepository(*repoFlag)
+	repo, err := github.ParseRepository(*repoFlag)
 	if err != nil {
 		fmt.Fprintf(stderr, "pipeline import: --repo is required and must be owner/name: %v\n", err)
 		return 2
@@ -620,7 +620,7 @@ func importPipelineBundle(ctx context.Context, store *db.Store, home, bundleDir,
 	if err != nil {
 		return fmt.Errorf("validate imported spec: %w", err)
 	}
-	parsedRepo, err := daemon.ParseRepository(spec.Repo)
+	parsedRepo, err := github.ParseRepository(spec.Repo)
 	if err != nil {
 		return fmt.Errorf("invalid imported repo %q: %w", spec.Repo, err)
 	}

@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
-	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
@@ -1728,7 +1727,7 @@ func resolveLocalAgentRepo(ctx context.Context, store *db.Store, repoFlag string
 
 func localAgentTargetRepo(ctx context.Context, repoFlag string) (github.Repository, error) {
 	if strings.TrimSpace(repoFlag) != "" {
-		return daemon.ParseRepository(repoFlag)
+		return github.ParseRepository(repoFlag)
 	}
 	remote, err := (gitutil.NewHostClient(".")).OriginRemote(ctx)
 	if err != nil {

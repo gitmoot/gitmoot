@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
@@ -214,7 +213,7 @@ func (w jobWorker) resolveJobCheckoutForRunner(ctx context.Context, job db.Job, 
 		if checkout == "" {
 			return "", errors.New("review fix job has no allocated worktree path")
 		}
-		repo, err := daemon.ParseRepository(payload.Repo)
+		repo, err := github.ParseRepository(payload.Repo)
 		if err != nil {
 			return "", err
 		}
@@ -227,7 +226,7 @@ func (w jobWorker) resolveJobCheckoutForRunner(ctx context.Context, job db.Job, 
 	if err != nil {
 		return "", err
 	}
-	repo, err := daemon.ParseRepository(payload.Repo)
+	repo, err := github.ParseRepository(payload.Repo)
 	if err != nil {
 		return "", err
 	}

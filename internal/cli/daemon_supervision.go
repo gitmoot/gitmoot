@@ -670,7 +670,7 @@ type heartbeatImplementFields struct {
 // base) rather than re-deriving the base from the possibly-off-branch shared
 // checkout (#611).
 func allocateHeartbeatImplement(ctx context.Context, store *db.Store, home string, heartbeat config.Heartbeat) (heartbeatImplementFields, error) {
-	repo, err := daemon.ParseRepository(heartbeat.Repo)
+	repo, err := github.ParseRepository(heartbeat.Repo)
 	if err != nil {
 		return heartbeatImplementFields{}, err
 	}
@@ -1294,7 +1294,7 @@ type conditionalRequestStatsProvider interface {
 
 func (p registeredRepoPoller) pollRepo(ctx context.Context, repoRecord db.Repo, now time.Time) (registeredRepoPollResult, error) {
 	store := p.Store
-	repo, err := daemon.ParseRepository(repoRecord.FullName())
+	repo, err := github.ParseRepository(repoRecord.FullName())
 	if err != nil {
 		lastError := err.Error()
 		writeLine(p.Stdout, "%s: %s", repoRecord.FullName(), lastError)

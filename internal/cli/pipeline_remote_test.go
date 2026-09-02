@@ -12,7 +12,6 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
-	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/github"
 	yaml "gopkg.in/yaml.v3"
 )
@@ -141,7 +140,7 @@ func TestPipelineRemotePathLayout(t *testing.T) {
 }
 
 func TestSyncPipelineRemoteFilesNoopAndDeletesVanishedFiles(t *testing.T) {
-	repo, err := daemon.ParseRepository("jerry/catalog")
+	repo, err := github.ParseRepository("jerry/catalog")
 	if err != nil {
 		t.Fatal(err)
 	}

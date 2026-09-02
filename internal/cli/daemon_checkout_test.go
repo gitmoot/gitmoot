@@ -3,13 +3,13 @@ package cli
 import (
 	"bytes"
 	"context"
+	"github.com/gitmoot/gitmoot/internal/github"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
@@ -315,7 +315,7 @@ func TestResolveDaemonStartRepoUsesRegisteredCheckout(t *testing.T) {
 	runGit(t, otherDir, "commit", "-m", "init")
 	runGit(t, otherDir, "remote", "add", "origin", "https://github.com/owner/other.git")
 
-	repo, err := daemon.ParseRepository("owner/repo")
+	repo, err := github.ParseRepository("owner/repo")
 	if err != nil {
 		t.Fatalf("ParseRepository returned error: %v", err)
 	}
@@ -350,7 +350,7 @@ func TestResolveDaemonStartRepoBootstrapsUnregistered(t *testing.T) {
 	runGit(t, checkout, "commit", "-m", "initial")
 	runGit(t, checkout, "remote", "add", "origin", "https://github.com/owner/repo.git")
 
-	repo, err := daemon.ParseRepository("owner/repo")
+	repo, err := github.ParseRepository("owner/repo")
 	if err != nil {
 		t.Fatalf("ParseRepository returned error: %v", err)
 	}
@@ -363,7 +363,7 @@ func TestResolveDaemonStartRepoBootstrapsUnregistered(t *testing.T) {
 		t.Fatalf("bootstrapped repo = %s/%s, want owner/repo", record.Owner, record.Name)
 	}
 	// Origin protection: a non-matching cwd for an unregistered repo still fails.
-	other, err := daemon.ParseRepository("owner/elsewhere")
+	other, err := github.ParseRepository("owner/elsewhere")
 	if err != nil {
 		t.Fatalf("ParseRepository returned error: %v", err)
 	}
