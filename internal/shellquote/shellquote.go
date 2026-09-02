@@ -43,11 +43,16 @@ import "strings"
 // command line rather than be passed as an empty argument.
 //
 // The allowlist is deliberately narrower than "characters sh happens to treat
-// literally today": it is the set that is safe in every position of every
-// POSIX-compatible shell, so a caller never has to reason about whether its
-// value lands in a command position, an argument, or inside a `[ ... ]` test.
-// Anything else is single-quoted, with embedded single quotes closed, escaped
-// and reopened via the '"'"' idiom.
+// literally today": it is the set that is safe in every ARGUMENT position of
+// every POSIX-compatible shell - after a command name, after a flag, inside a
+// `[ ... ]` test - so a caller passing arguments never has to reason about
+// where its value lands. Anything else is single-quoted, with embedded single
+// quotes closed, escaped and reopened via the '"'"' idiom.
+//
+// COMMAND POSITION IS OUT OF SCOPE, and no allowlist can bring it in: `if` and
+// `FOO=bar` are all-safe-rune yet the shell reads them as a reserved word and an
+// assignment before quoting is consulted. See the package comment; callers own
+// that boundary and gitmoot never builds a command word from this result.
 func Posix(value string) string {
 	if value == "" {
 		return "''"
