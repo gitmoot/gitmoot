@@ -675,6 +675,17 @@ func (s *Store) TransitionJobState(ctx context.Context, id string, from string, 
 }
 
 func (s *Store) TransitionJobStateWithEvent(ctx context.Context, id string, from string, to string, event JobEvent) (bool, error) {
+	return s.TransitionJobStateWithEvents(ctx, id, from, to, event)
+}
+
+// TransitionJobStateWithEvents is TransitionJobStateWithEvent for a caller that must
+// land the transition AND a durable OBLIGATION in the same commit (#1673).
+//
+// The single-event form leaves a window: a caller that transitions a job and then
+// writes its re-drive marker separately can crash in between, and a settled job with
+// no marker is invisible to every sweep that would have re-driven it. Passing both
+// events here closes that window by construction rather than by ordering luck.
+func (s *Store) TransitionJobStateWithEvents(ctx context.Context, id string, from string, to string, events ...JobEvent) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -692,11 +703,13 @@ func (s *Store) TransitionJobStateWithEvent(ctx context.Context, id string, from
 	if affected == 0 {
 		return false, tx.Commit()
 	}
-	if event.JobID == "" {
-		event.JobID = id
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
-		return false, err
+	for _, event := range events {
+		if event.JobID == "" {
+			event.JobID = id
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+			return false, err
+		}
 	}
 	return true, tx.Commit()
 }

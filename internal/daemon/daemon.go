@@ -1678,6 +1678,25 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 		if survives {
 			continue
 		}
+		// REVALIDATE IMMEDIATELY BEFORE THE IRREVERSIBLE TRANSITION (#1673). The open
+		// set is complete-or-error, but completeness is not CURRENCY: it was read at the
+		// top of the poll, and a PR reopened since then - or a PR plus its queued job
+		// created since then - is genuinely open while absent from that older map. The
+		// snapshot alone would silently terminalize valid work, and terminalizing is not
+		// reversible, so the sweep pays one targeted read per candidate instead.
+		//
+		// FAIL CLOSED: a read error leaves the job queued and surfaces the error. A
+		// sweep that cannot prove the PR is closed must not act as if it were.
+		stillClosed, err := d.pullRequestStillClosed(ctx, int64(payload.PullRequest))
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if !stillClosed {
+			continue
+		}
 		reason := fmt.Sprintf("queued %s job superseded: %s pull request #%d is no longer open",
 			job.Type, payload.Repo, payload.PullRequest)
 		if strings.TrimSpace(payload.ParentJobID) != "" {
@@ -1704,6 +1723,29 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 		}
 	}
 	return firstErr
+}
+
+// pullRequestStillClosed re-reads ONE pull request's current state, immediately before
+// the sweep terminalizes work bound to it (#1673).
+//
+// It exists because a complete listing is not a current one: ListPullRequests is
+// fail-closed and never returns a truncated page, but it is read once at the top of
+// the poll, and the sweep runs much later. A PR reopened in that window - or created
+// with its queued job in that window - is genuinely open and absent from the map.
+//
+// An error is returned rather than swallowed, so the caller leaves the job queued: the
+// only safe default for an irreversible transition is "I could not prove it".
+func (d Daemon) pullRequestStillClosed(ctx context.Context, number int64) (bool, error) {
+	if d.GitHub == nil {
+		// No client to revalidate with: refuse to terminalize rather than trusting a
+		// snapshot whose age this function exists to distrust.
+		return false, nil
+	}
+	pull, err := d.GitHub.GetPullRequest(ctx, d.Repo, number)
+	if err != nil {
+		return false, fmt.Errorf("revalidate pull request #%d before superseding queued work: %w", number, err)
+	}
+	return !strings.EqualFold(strings.TrimSpace(pull.State), "open"), nil
 }
 
 // queuedJobSurvivesClosedPullRequest reports whether a queued PR-bound job must be

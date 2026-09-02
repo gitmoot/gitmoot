@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -35,6 +36,14 @@ func TestPollOnceSupersedesQueuedLegsWhosePullRequestClosed(t *testing.T) {
 			HeadRef: "task-9", BaseRef: "main", HeadSHA: "head-nine",
 		}},
 		comments: map[int64][]github.IssueComment{9: {}},
+		// The sweep revalidates each candidate immediately before terminalizing it
+		// (#1673), so the fixture must state PR 7's CURRENT state rather than only
+		// leaving it out of the open listing. That is the test's own premise made
+		// explicit: #7 is merged.
+		pullsByNumber: map[int64]github.PullRequest{
+			7: {Number: 7, State: "closed", HeadRef: "task-7", BaseRef: "main", Merged: true},
+			9: {Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main", HeadSHA: "head-nine"},
+		},
 	}
 
 	seedQueuedJob(t, store, "stranded-review", "audit", "review", workflow.JobPayload{
@@ -181,4 +190,107 @@ func containsAll(text string, parts ...string) bool {
 		}
 	}
 	return true
+}
+
+// TestPollOnceLeavesWorkAloneWhenThePullRequestReopenedAfterTheListing is Finding A of
+// the #1763 exact-head review. The open-PR snapshot is taken at the top of PollOnce and
+// the cancellation sweep runs arbitrarily later in the same tick, so a PR REOPENED in
+// that window - or created with its queued job in that window - is genuinely open at
+// mutation time while absent from the older map.
+//
+// Complete-or-error pagination does not cover this: completeness is not CURRENCY. The
+// sweep therefore revalidates each candidate immediately before the irreversible
+// transition.
+//
+// SEMANTIC REVERSION THIS KILLS: trust the snapshot (drop the revalidation, or let a
+// revalidation error fall through to cancellation) and this valid queued work is
+// silently terminalized.
+func TestPollOnceLeavesWorkAloneWhenThePullRequestReopenedAfterTheListing(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name: "audit", Role: "reviewer", Runtime: "codex", RuntimeRef: "last",
+		RepoScope: repo.FullName(), Capabilities: []string{"review"},
+		AutonomyPolicy: "auto", HealthStatus: "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+
+	// THE RACE, expressed exactly: PR 11 is ABSENT from the open listing the poll reads
+	// at the top, and OPEN when the sweep revalidates it a moment later.
+	client := &fakeGitHub{
+		pulls:         []github.PullRequest{},
+		comments:      map[int64][]github.IssueComment{},
+		pullsByNumber: map[int64]github.PullRequest{11: {Number: 11, State: "open", HeadRef: "task-11", BaseRef: "main"}},
+	}
+
+	seedQueuedJob(t, store, "reopened-review", "audit", "review", workflow.JobPayload{
+		Repo:        repo.FullName(),
+		Branch:      "task-11",
+		PullRequest: 11,
+		TaskID:      "task-11",
+		Sender:      "audit",
+	})
+
+	engine := workflow.Engine{Store: store}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce: %v", err)
+	}
+
+	job, err := store.GetJob(ctx, "reopened-review")
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if job.State != string(workflow.JobQueued) {
+		t.Fatalf("job state = %q, want queued: the sweep terminalized work for a PR that is OPEN at mutation time", job.State)
+	}
+	// The revalidation actually happened - a passing assertion above with zero targeted
+	// reads would mean the candidate never reached the guard.
+	if len(client.getPullRequestCalls) == 0 {
+		t.Fatal("no targeted revalidation read: this test cannot observe the guard")
+	}
+}
+
+// TestPollOnceLeavesWorkQueuedWhenRevalidationFails is the FAIL-CLOSED half, and it is
+// what stops the new forge call from becoming a new way to lose work: if the
+// revalidation itself errors, the sweep must leave the job queued and surface the
+// error, never fall through to cancellation.
+func TestPollOnceLeavesWorkQueuedWhenRevalidationFails(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name: "audit", Role: "reviewer", Runtime: "codex", RuntimeRef: "last",
+		RepoScope: repo.FullName(), Capabilities: []string{"review"},
+		AutonomyPolicy: "auto", HealthStatus: "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+	client := &fakeGitHub{
+		pulls:             []github.PullRequest{},
+		comments:          map[int64][]github.IssueComment{},
+		getPullRequestErr: errors.New("forge unavailable"),
+	}
+	seedQueuedJob(t, store, "unproven-review", "audit", "review", workflow.JobPayload{
+		Repo:        repo.FullName(),
+		Branch:      "task-12",
+		PullRequest: 12,
+		TaskID:      "task-12",
+		Sender:      "audit",
+	})
+
+	engine := workflow.Engine{Store: store}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+	if err := daemon.PollOnce(ctx); err == nil {
+		t.Fatal("PollOnce returned nil: a revalidation failure must be surfaced, not swallowed")
+	}
+	job, err := store.GetJob(ctx, "unproven-review")
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if job.State != string(workflow.JobQueued) {
+		t.Fatalf("job state = %q, want queued: unproven closure must never terminalize work", job.State)
+	}
 }

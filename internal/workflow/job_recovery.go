@@ -555,11 +555,26 @@ func (e Engine) FinalizeClosedPullRequestDelegationChild(ctx context.Context, jo
 	if reason == "" {
 		reason = "queued delegation child superseded: its pull request is no longer open"
 	}
-	transitioned, err := e.Store.TransitionJobStateWithEvent(ctx, job.ID, job.State, string(JobFailed), db.JobEvent{
-		JobID:   job.ID,
-		Kind:    JobEventSupersededPullRequestClosed,
-		Message: reason,
-	})
+	// THE TRANSITION AND THE RE-DRIVE OBLIGATION COMMIT TOGETHER (#1673). Stamping the
+	// synthetic result and advancing the parent is a SECOND step, and any error or
+	// crash after the state commit would otherwise leave a failed child with no result
+	// that ListQueuedJobs can never select again - the coordinator waits forever.
+	//
+	// `advance_retry` is the marker the liveness table already understands (see
+	// advancementPending): a settled job carrying it still keeps its task live, so a
+	// sweep re-drives it. It is self-clearing, because the finalizer's own
+	// advance_completed/advance_blocked is a later event and the scan is last-writer-wins.
+	transitioned, err := e.Store.TransitionJobStateWithEvents(ctx, job.ID, job.State, string(JobFailed),
+		db.JobEvent{
+			JobID:   job.ID,
+			Kind:    JobEventSupersededPullRequestClosed,
+			Message: reason,
+		},
+		db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "advance_retry",
+			Message: "parent advancement owed after closed-pull-request supersession: " + reason,
+		})
 	if err != nil {
 		return false, err
 	}
@@ -567,5 +582,21 @@ func (e Engine) FinalizeClosedPullRequestDelegationChild(ctx context.Context, jo
 		return false, nil
 	}
 	recordReadOnlyWorktreeReclaimOnAbort(ctx, e.Store, job, payload)
-	return e.FinalizeTimedOutDelegationChild(ctx, job.ID, reason)
+	finalized, finalizeErr := e.FinalizeTimedOutDelegationChild(ctx, job.ID, reason)
+	var blocked BlockedError
+	if finalizeErr == nil || errors.As(finalizeErr, &blocked) {
+		// THE OBLIGATION IS DISCHARGED. The advancement events the finalizer writes land
+		// on the PARENT, so nothing on this child would ever clear its marker and the
+		// child would stay "advancement pending" forever - a permanently live task, which
+		// is the mirror-image leak of the stranding this marker exists to prevent.
+		//
+		// A BlockedError counts as discharged: that is the parent's failure_policy making
+		// a decision and recording it, not an advancement still owed.
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "advance_completed",
+			Message: "parent advancement discharged after closed-pull-request supersession",
+		})
+	}
+	return finalized, finalizeErr
 }
