@@ -199,136 +199,12 @@ func (a KimiAdapter) newRuntimeRef() (string, error) {
 	return newUUID()
 }
 
-// KimiCLIAdapter delivers jobs to the opt-in legacy Kimi CLI runtime. This
-// runtime is intentionally separate from `kimi`: it uses the older `--print`
-// command shape without probing or changing the default Kimi Code path.
-type KimiCLIAdapter struct {
-	Runner        subprocess.Runner
-	Dir           string
-	NewRuntimeRef func() (string, error)
-}
-
-func (a KimiCLIAdapter) Name() string { return KimiCLIRuntime }
-
-func (a KimiCLIAdapter) PermissionPolicyApplication(Agent) PermissionPolicyApplication {
-	return PermissionPolicyNotApplied
-}
-
-func (a KimiCLIAdapter) Start(ctx context.Context, request StartRequest) (StartResult, error) {
-	if err := validateStartRequest(request.Agent, a.Name(), request.Prompt); err != nil {
-		return StartResult{}, err
-	}
-	runtimeRef, err := a.newRuntimeRef()
-	if err != nil {
-		return StartResult{}, err
-	}
-	promptArg, extraArgs, cleanup, err := kimiPromptDelivery(request.Prompt)
-	if err != nil {
-		return StartResult{}, err
-	}
-	defer cleanup()
-	args := kimiCLIPromptArgs(request.Agent, request.Agent.Model, promptArg, extraArgs)
-	result, err := a.runner().Run(ctx, a.Dir, "kimi", args...)
-	if err != nil {
-		return StartResult{Raw: result.Stdout + result.Stderr}, kimiCommandError(result, err)
-	}
-	content, sessionID, _, parseErr := parseKimiStreamJSON(result.Stdout)
-	if parseErr != nil {
-		return StartResult{Raw: result.Stdout}, fmt.Errorf("parse kimi stream-json output: %w", parseErr)
-	}
-	if sessionID == "" {
-		sessionID = runtimeRef
-	}
-	return StartResult{RuntimeRef: sessionID, Raw: content}, nil
-}
-
-func (a KimiCLIAdapter) Validate(_ context.Context, agent Agent) error {
-	if err := validateRuntime(agent, a.Name()); err != nil {
-		return err
-	}
-	if agent.RuntimeRef != "" && !isKimiSessionID(agent.RuntimeRef) && !IsFreshRef(agent.RuntimeRef) {
-		return fmt.Errorf("kimi runtime reference %q must be a Kimi session id, fresh:<suffix>, or empty", agent.RuntimeRef)
-	}
-	return nil
-}
-
-func (a KimiCLIAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, error) {
-	if err := a.Validate(ctx, agent); err != nil {
-		return Result{}, err
-	}
-	_ = agent.RuntimeRef
-	promptArg, extraArgs, cleanup, err := kimiPromptDelivery(job.Prompt)
-	if err != nil {
-		return Result{}, err
-	}
-	defer cleanup()
-	result, err := runAgentCommand(ctx, a.runner(), a.Dir, job.AgentEnv, job.OnPID, "kimi", kimiCLIPromptArgs(agent, EffectiveModel(agent, job), promptArg, extraArgs)...)
-	if err != nil {
-		return Result{Raw: result.Stdout + result.Stderr, SessionDiag: newSessionDiag(result, err, "")}, kimiCommandError(result, err)
-	}
-	content, _, usage, parseErr := parseKimiStreamJSON(result.Stdout)
-	if parseErr != nil {
-		return Result{Raw: result.Stdout, SessionDiag: newSessionDiag(result, nil, "")}, fmt.Errorf("parse kimi stream-json output: %w", parseErr)
-	}
-	return Result{Raw: content, Summary: strings.TrimSpace(content), InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens, SessionDiag: newSessionDiag(result, nil, "")}, nil
-}
-
-func (a KimiCLIAdapter) Health(ctx context.Context, agent Agent) error {
-	if err := a.Validate(ctx, agent); err != nil {
-		return err
-	}
-	_, err := a.Deliver(ctx, agent, Job{Prompt: KimiLiveCheckPrompt})
-	return err
-}
-
-func (a KimiCLIAdapter) Capabilities(context.Context) ([]string, error) {
-	return []string{"review", "implement", "ask"}, nil
-}
-
-func (a KimiCLIAdapter) runner() subprocess.Runner {
-	if a.Runner != nil {
-		return a.Runner
-	}
-	return subprocess.GroupRunner{}
-}
-
-func (a KimiCLIAdapter) newRuntimeRef() (string, error) {
-	if a.NewRuntimeRef != nil {
-		return a.NewRuntimeRef()
-	}
-	return newUUID()
-}
-
 var kimiRuntimeContract = RuntimeContract{
 	Binary: "kimi",
 	Requirements: []RuntimeRequirement{
 		{Kind: RuntimeRequirementFlag, Name: "flag -p", Flag: "-p", Source: "internal/runtime/kimi.go::KimiAdapter.Deliver", Remedy: "install a Kimi CLI that lists -p, or run the job on a runtime whose installed CLI satisfies its declared contract"},
 		{Kind: RuntimeRequirementFlag, Name: "flag --output-format", Flag: "--output-format", Source: "internal/runtime/kimi.go::KimiAdapter.Deliver", Remedy: "install a Kimi CLI that lists --output-format, or run the job on a runtime whose installed CLI satisfies its declared contract"},
 	},
-}
-
-var kimiCLIRuntimeContract = RuntimeContract{
-	Binary: "kimi",
-	Requirements: []RuntimeRequirement{
-		{Kind: RuntimeRequirementFlag, Name: "flag --print", Flag: "--print", Source: "internal/runtime/kimi.go::kimiCLIPromptArgs", Remedy: "install a Kimi CLI that lists --print, or run the job on a runtime whose installed CLI satisfies its declared contract"},
-		{Kind: RuntimeRequirementFlag, Name: "flag -p", Flag: "-p", Source: "internal/runtime/kimi.go::kimiCLIPromptArgs", Remedy: "install a Kimi CLI that lists -p, or run the job on a runtime whose installed CLI satisfies its declared contract"},
-		{Kind: RuntimeRequirementFlag, Name: "flag --output-format", Flag: "--output-format", Source: "internal/runtime/kimi.go::kimiCLIPromptArgs", Remedy: "install a Kimi CLI that lists --output-format, or run the job on a runtime whose installed CLI satisfies its declared contract"},
-	},
-}
-
-// kimiCLIPromptArgs builds the legacy kimi-cli `--print -p` argument vector.
-// promptArg and extraArgs are the values already produced by kimiPromptDelivery
-// (the verbatim prompt with no extra args for normal sizes, or the argv-safe
-// temp-file wrapper plus the `--add-dir <dir>` workspace grant for oversize
-// prompts), so this runtime shares the #723 MAX_ARG_STRLEN protection AND the
-// workspace grant that makes the staged prompt file readable.
-func kimiCLIPromptArgs(agent Agent, model string, promptArg string, extraArgs []string) []string {
-	args := kimiPermissionArgs(agent)
-	if model != "" {
-		args = append(args, "--model", model)
-	}
-	args = append(args, extraArgs...)
-	return append(args, "--print", "-p", promptArg, "--output-format", "stream-json")
 }
 
 func kimiPermissionArgs(agent Agent) []string {
@@ -410,12 +286,7 @@ func isKimiSessionID(ref string) bool {
 }
 
 func isKimiRuntime(runtimeName string) bool {
-	switch runtimeName {
-	case KimiRuntime, KimiCLIRuntime:
-		return true
-	default:
-		return false
-	}
+	return runtimeName == KimiRuntime
 }
 
 func kimiCommandError(result subprocess.Result, err error) error {

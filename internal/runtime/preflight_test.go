@@ -79,7 +79,7 @@ func newContractCheckerForTest(t *testing.T, content string) (*RuntimeContractCh
 
 func TestRuntimePreflightUnknownNeverBlocks(t *testing.T) {
 	checker, _, _ := newContractCheckerForTest(t, "unparseable")
-	agent := Agent{Name: "legacy", Runtime: KimiCLIRuntime, AutonomyPolicy: AutonomyPolicyAuto}
+	agent := Agent{Name: "seat", Runtime: KimiRuntime, AutonomyPolicy: AutonomyPolicyAuto}
 	result := checker.Check(context.Background(), agent)
 	if result.State != RuntimeContractUnknown {
 		t.Fatalf("state = %q, want unknown", result.State)
@@ -91,7 +91,7 @@ func TestRuntimePreflightUnknownNeverBlocks(t *testing.T) {
 
 func TestRuntimePreflightUnsupportedErrorNamesRequiredFlag(t *testing.T) {
 	checker, _, _ := newContractCheckerForTest(t, "unsupported")
-	agent := Agent{Name: "legacy", Runtime: KimiCLIRuntime, AutonomyPolicy: AutonomyPolicyAuto}
+	agent := Agent{Name: "seat", Runtime: KimiRuntime, AutonomyPolicy: AutonomyPolicyAuto}
 	result := checker.Check(context.Background(), agent)
 	if result.State != RuntimeContractUnsupported {
 		t.Fatalf("state = %q, want unsupported", result.State)
@@ -100,7 +100,7 @@ func TestRuntimePreflightUnsupportedErrorNamesRequiredFlag(t *testing.T) {
 	if err == nil {
 		t.Fatal("unsupported preflight did not block")
 	}
-	for _, want := range []string{"kimi-cli", "--print", "stub 1.2.3", "remedy", "kimiCLIPromptArgs"} {
+	for _, want := range []string{"kimi", "flag -p", "stub 1.2.3", "remedy", "KimiAdapter.Deliver"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error %q does not contain %q", err, want)
 		}
@@ -133,7 +133,7 @@ func TestRuntimePreflightScopesOmpPlanFlagsToPlanJobs(t *testing.T) {
 
 func TestRuntimePreflightReprobesChangedBinaryIdentity(t *testing.T) {
 	checker, runner, path := newContractCheckerForTest(t, "supported")
-	agent := Agent{Name: "legacy", Runtime: KimiCLIRuntime}
+	agent := Agent{Name: "seat", Runtime: KimiRuntime}
 	if got := checker.Check(context.Background(), agent).State; got != RuntimeContractSupported {
 		t.Fatalf("initial state = %q, want supported", got)
 	}
@@ -156,7 +156,7 @@ func TestRuntimePreflightCachesUnchangedBinaryIdentity(t *testing.T) {
 	checker, runner, _ := newContractCheckerForTest(t, "supported")
 	now := time.Unix(1_700_000_000, 0)
 	checker.now = func() time.Time { return now }
-	agent := Agent{Name: "legacy", Runtime: KimiCLIRuntime}
+	agent := Agent{Name: "seat", Runtime: KimiRuntime}
 	result := checker.Check(context.Background(), agent)
 	if result.State != RuntimeContractSupported || result.Instrument != "binary-help" {
 		t.Fatalf("first result = %#v, want supported from binary-help", result)
@@ -177,7 +177,7 @@ func TestRuntimePreflightCachesUnknownProbeUntilTTL(t *testing.T) {
 	checker.Timeout = time.Millisecond
 	now := time.Unix(1_700_000_000, 0)
 	checker.now = func() time.Time { return now }
-	agent := Agent{Name: "legacy", Runtime: KimiCLIRuntime}
+	agent := Agent{Name: "seat", Runtime: KimiRuntime}
 	if got := checker.Check(context.Background(), agent).State; got != RuntimeContractUnknown {
 		t.Fatalf("first state = %q, want unknown", got)
 	}

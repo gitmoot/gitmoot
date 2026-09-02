@@ -125,7 +125,7 @@ snippet with `--config-snippet`.
 ## Runtime Metadata Registry
 
 Gitmoot drives five built-in runtimes (`codex`, `claude`, `kimi`, `omp`, plus the
-subscribe-only `shell`; the legacy `kimi-cli` is also compiled in). Each carries
+subscribe-only `shell`). Each carries
 declarative metadata — advertised capabilities, default model and effort values,
 an advisory list of known-valid models, and a descriptor of where token usage is read from. Inspect
 the resolved registry:
@@ -690,32 +690,9 @@ subscribe`, and at implement-job dispatch with an actionable message. Set
 `go`/`git`/`gh`), or `--policy workspace-write` for edits-only (Bash stays
 blocked). `read-only`/`ask`/`review` agents are unaffected.
 
-`agent subscribe` accepts `--preset-delivery full|referenced|auto` (default
-`full`), and `agent update <name> --preset-delivery <mode>` flips it in place on
-an already-registered agent. The mode is a sticky per-agent preference:
-re-running `agent subscribe` on an existing agent WITHOUT `--preset-delivery`
-(e.g. to refresh its session/repo) preserves the stored mode; only brand-new
-agents default to `full`. It controls how the agent's installed preset
-(template) prompt is delivered on each job:
-
-| mode | behavior |
-|---|---|
-| `full` (default) | always inline the full preset prompt every job — the pre-existing behavior, byte-identical |
-| `referenced` | send a short "use your installed `<preset>` preset (commit `<c>`)" reference instead of the whole body, but only when Gitmoot has recorded that the exact resumed session already loaded the same preset at the same commit; any doubt (a new / `last` / fresh session, an unknown session, or a changed commit) falls back to full |
-| `auto` | like `referenced`, and additionally only when the runtime persists sessions (`codex`/`claude`); `shell`/`kimi`/`omp`/custom always send full |
-
-The optimization is correctness-first and additive: the job payload **always**
-snapshots the exact preset id, resolved commit, and content regardless of mode,
-so auditability and retry determinism are unchanged, and a preset commit change
-invalidates the recorded loaded-state so the next job re-sends the full preset.
-Leave it at `full` unless you repeatedly resume a stable persisted session and
-want to save preset tokens.
-
-`--runtime` accepts `codex`, `claude`, `kimi`, `kimi-cli`, or `omp`. Kimi Code is
+`--runtime` accepts `codex`, `claude`, `kimi`, or `omp`. Kimi Code is
 a first-class runtime adapter alongside Codex and Claude Code; `kimi` targets the
-current Kimi Code CLI (stream-json output) while `kimi-cli` is the opt-in
-legacy Kimi CLI adapter (#546) — choose `kimi` unless you specifically run the
-legacy CLI. The two count as the same runtime *family* for cross-family review.
+current Kimi Code CLI (stream-json output).
 Before starting a Kimi-backed agent, authenticate the Kimi CLI with
 `kimi login`, then restart the Gitmoot daemon so it inherits the logged-in
 session:
@@ -979,7 +956,7 @@ with the same job-over-agent-over-registry precedence. Gitmoot does not validate
 an allow-list; Codex validates the forwarded value.
 
 The same commands accept an optional per-job `--runtime
-codex|claude|kimi|kimi-cli|omp|shell` override: that ONE job runs through the
+codex|claude|kimi|omp|shell` override: that ONE job runs through the
 named runtime while the agent's registered default runtime stays untouched
 (`agent show` is unchanged afterwards). An overridden job never resumes — and
 never writes back to — the agent's default-runtime session: it runs on a fresh
@@ -2010,8 +1987,8 @@ later command is ignored without a reply.
 gitmoot job list --repo owner/repo   # add --json for machine-readable rows
 gitmoot job show <job-id>            # add --json for the full job + operational detail
 gitmoot job watch <job-id>
-gitmoot job watch <job-id> --transcript [--log-path <path>] [--runtime codex|claude|kimi|kimi-cli|omp|shell]
-gitmoot job transcript <job-id> --export md|jsonl [--output <path>] [--log-path <path>] [--runtime codex|claude|kimi|kimi-cli|omp|shell]
+gitmoot job watch <job-id> --transcript [--log-path <path>] [--runtime codex|claude|kimi|omp|shell]
+gitmoot job transcript <job-id> --export md|jsonl [--output <path>] [--log-path <path>] [--runtime codex|claude|kimi|omp|shell]
 gitmoot job transcript --all [--state succeeded,failed] [--since 720h] --export jsonl [--output <path>]
 gitmoot job events <job-id>
 gitmoot job run <job-id>

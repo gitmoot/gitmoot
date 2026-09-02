@@ -45,9 +45,8 @@ var curatedRuntimeEnvNames = map[string][]string{
 	// Claude's ambient auth names remain available only for the explicit-empty
 	// authoritative-file fallback. A populated runtime-auth.env overlay is
 	// appended later and wins, including explicit blanks for absent names.
-	runtime.ClaudeRuntime:  {"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CONFIG_DIR"},
-	runtime.KimiRuntime:    {},
-	runtime.KimiCLIRuntime: {},
+	runtime.ClaudeRuntime: {"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CONFIG_DIR"},
+	runtime.KimiRuntime:   {},
 	// omp is a multi-provider ROUTING harness, so its curated set is ROUTING
 	// PLUMBING ONLY — which profile to run under, where the coding-agent state
 	// lives, which model each routing tier resolves to, and the optional auth

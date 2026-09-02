@@ -64,8 +64,6 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 		return runAgentGC(args[1:], stdout, stderr)
 	case "subscribe":
 		return runAgentSubscribe(args[1:], stdout, stderr)
-	case "update":
-		return runAgentUpdate(args[1:], stdout, stderr)
 	case "show":
 		return runAgentShow(args[1:], stdout, stderr)
 	case "list":
@@ -91,7 +89,7 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 
 func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime codex|claude|kimi|kimi-cli|omp --repo owner/repo [--path .] [--template <template-id>] [--model model] [--effort effort] [--start-daemon]")
+	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime codex|claude|kimi|omp --repo owner/repo [--path .] [--template <template-id>] [--model model] [--effort effort] [--start-daemon]")
 	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--lead implementer] [--head-sha sha] [--base ref] [--branch branch] [--background] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--lead implementer] [--head-sha sha] [--branch branch] [--background] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
@@ -102,9 +100,8 @@ func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot agent template list|show|add|draft|validate|update|diff ...")
 	fmt.Fprintln(w, "  gitmoot agent prompt <agent-or-template> [--json] [--record [--repo owner/repo] [--type ask|review|implement]]")
 	fmt.Fprintln(w, "  gitmoot agent gc")
-	fmt.Fprintln(w, "  gitmoot agent subscribe <name> --runtime codex|claude|kimi|kimi-cli|omp|shell --session <id|name|last|command> --role <role> [--repo owner/repo...] [--model model] [--effort effort] [--preset-delivery full|referenced|auto] --capability <capability>")
+	fmt.Fprintln(w, "  gitmoot agent subscribe <name> --runtime codex|claude|kimi|omp|shell --session <id|name|last|command> --role <role> [--repo owner/repo...] [--model model] [--effort effort] --capability <capability>")
 	fmt.Fprintln(w, "    Codex sessions may use a UUID, thread name, or last. Claude sessions may use a UUID or last. Kimi sessions may use a Kimi session id. Omp sessions may use a UUID or fresh:<suffix> — never last, because omp never resumes. Shell sessions are commands.")
-	fmt.Fprintln(w, "  gitmoot agent update <name> --preset-delivery full|referenced|auto")
 	fmt.Fprintln(w, "  gitmoot agent allow <name> --repo owner/repo")
 	fmt.Fprintln(w, "  gitmoot agent deny <name> --repo owner/repo")
 	fmt.Fprintln(w, "  gitmoot agent repos <name>")
@@ -1148,7 +1145,7 @@ func printAgentTypeUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot agent type list")
 	fmt.Fprintln(w, "  gitmoot agent type show <type>")
-	fmt.Fprintln(w, "  gitmoot agent type set <type> --runtime codex|claude|kimi|kimi-cli|omp --template <template-id> --model <model> --effort <effort> --policy workspace-write --max-background 2 --idle-timeout 20m")
+	fmt.Fprintln(w, "  gitmoot agent type set <type> --runtime codex|claude|kimi|omp --template <template-id> --model <model> --effort <effort> --policy workspace-write --max-background 2 --idle-timeout 20m")
 }
 
 func runAgentTypeList(args []string, stdout, stderr io.Writer) int {
@@ -1223,7 +1220,7 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("agent type set", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, kimi, kimi-cli, or omp")
+	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, kimi, or omp")
 	templateID := fs.String("template", "", "agent template")
 	model := fs.String("model", "", "default runtime model for this agent type")
 	effort := fs.String("effort", "", "default reasoning effort for this agent type")
@@ -1276,7 +1273,7 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if entry.Runtime == runtime.ShellRuntime {
-		fmt.Fprintln(stderr, "invalid runtime: managed agent types support codex, claude, kimi, kimi-cli, or omp")
+		fmt.Fprintln(stderr, "invalid runtime: managed agent types support codex, claude, kimi, or omp")
 		return 2
 	}
 	if strings.TrimSpace(*templateID) != "" {
@@ -1436,7 +1433,7 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("agent start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, kimi, kimi-cli, or omp")
+	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, kimi, or omp")
 	repoFlag := fs.String("repo", "", "allowed repo as owner/repo")
 	path := fs.String("path", ".", "local checkout path")
 	role := fs.String("role", "", "agent role")
@@ -1656,14 +1653,13 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("agent subscribe", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, kimi, kimi-cli, omp, or shell")
+	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, kimi, omp, or shell")
 	session := fs.String("session", "", "runtime session reference, last, or shell command")
 	role := fs.String("role", "", "agent role")
 	templateID := fs.String("template", "", "agent template")
 	model := fs.String("model", "", "default runtime model for this agent")
 	effort := fs.String("effort", "", "default reasoning effort for this agent")
 	policy := fs.String("policy", "auto", "autonomy policy")
-	presetDelivery := fs.String("preset-delivery", "", "preset prompt delivery mode: full (default), referenced, or auto")
 	var repos repeatedFlag
 	var capabilities repeatedFlag
 	fs.Var(&repos, "repo", "allowed repo as owner/repo, repeatable")
@@ -1687,17 +1683,6 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "agent subscribe requires exactly one name")
 		return 2
 	}
-
-	// preset-delivery is a sticky per-agent preference. When re-subscribing an
-	// existing agent (e.g. to refresh its session/repo) without passing the flag,
-	// we must preserve the stored mode rather than write empty — which normalizes
-	// to full and would silently disable a previously-chosen auto/referenced mode.
-	presetDeliveryExplicit := false
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "preset-delivery" {
-			presetDeliveryExplicit = true
-		}
-	})
 
 	normalizedRepos, err := normalizeRepoFlags(repos)
 	if err != nil {
@@ -1729,11 +1714,6 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "invalid template: %v\n", err)
 		return 2
 	}
-	deliveryMode := strings.TrimSpace(*presetDelivery)
-	if deliveryMode != "" && !db.ValidPresetDeliveryMode(deliveryMode) {
-		fmt.Fprintf(stderr, "invalid --preset-delivery %q: want full, referenced, or auto\n", deliveryMode)
-		return 2
-	}
 	agent := runtime.Agent{
 		Name:           name,
 		Role:           resolvedRole,
@@ -1746,7 +1726,6 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 		Capabilities:   resolvedCapabilities,
 		AutonomyPolicy: strings.TrimSpace(*policy),
 		HealthStatus:   "unknown",
-		PresetDelivery: strings.ToLower(deliveryMode),
 	}
 	if err := runtime.ValidateAgent(agent); err != nil {
 		fmt.Fprintf(stderr, "invalid agent: %v\n", err)
@@ -1760,11 +1739,6 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 		if agent.TemplateID != "" {
 			if _, err := loadInstalledTemplate(context.Background(), store, agent.TemplateID); err != nil {
 				return err
-			}
-		}
-		if !presetDeliveryExplicit {
-			if existing, err := store.GetAgent(context.Background(), agent.Name); err == nil {
-				agent.PresetDelivery = existing.PresetDelivery
 			}
 		}
 		return persistAgentSubscription(context.Background(), store, agent, normalizedRepos)
@@ -1781,55 +1755,6 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 	} else {
 		fmt.Fprintf(stdout, "subscribed %s (%s) for %s\n", agent.Name, agent.Runtime, strings.Join(normalizedRepos, ","))
 	}
-	return 0
-}
-
-// runAgentUpdate mutates one flag-updatable field of an already-registered agent
-// in place (#33). Today it exposes --preset-delivery; it mirrors the in-place
-// update path (UpdateAgentRuntimeRef) rather than re-running the full subscribe
-// upsert, so an operator can flip the preset delivery mode without re-declaring
-// runtime/session/role.
-func runAgentUpdate(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent update", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	presetDelivery := fs.String("preset-delivery", "", "preset prompt delivery mode: full, referenced, or auto")
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
-		fs.Usage()
-		fmt.Fprintln(stderr, "Usage: gitmoot agent update <name> --preset-delivery full|referenced|auto")
-		if len(args) == 0 {
-			fmt.Fprintln(stderr, "agent update requires exactly one name")
-			return 2
-		}
-		return 0
-	}
-	name := strings.TrimSpace(args[0])
-	if err := fs.Parse(args[1:]); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0
-		}
-		return 2
-	}
-	if fs.NArg() != 0 || name == "" {
-		fmt.Fprintln(stderr, "agent update requires exactly one name")
-		return 2
-	}
-	mode := strings.TrimSpace(*presetDelivery)
-	if mode == "" {
-		fmt.Fprintln(stderr, "agent update requires at least one field to change (e.g. --preset-delivery)")
-		return 2
-	}
-	if !db.ValidPresetDeliveryMode(mode) {
-		fmt.Fprintf(stderr, "invalid --preset-delivery %q: want full, referenced, or auto\n", mode)
-		return 2
-	}
-	if err := withStore(*home, func(store *db.Store) error {
-		return store.UpdateAgentPresetDelivery(context.Background(), name, mode)
-	}); err != nil {
-		fmt.Fprintf(stderr, "update agent: %v\n", err)
-		return 1
-	}
-	fmt.Fprintf(stdout, "updated %s preset-delivery to %s\n", name, strings.ToLower(mode))
 	return 0
 }
 
@@ -1965,8 +1890,6 @@ func runtimeStartAdapter(factory runtime.Factory, runtimeName string, checkout s
 		return runtime.ClaudeAdapter{Runner: factory.Runner, Dir: checkout}, nil
 	case runtime.KimiRuntime:
 		return runtime.KimiAdapter{Runner: factory.Runner, Dir: checkout}, nil
-	case runtime.KimiCLIRuntime:
-		return runtime.KimiCLIAdapter{Runner: factory.Runner, Dir: checkout}, nil
 	case runtime.OmpRuntime:
 		return runtime.OmpAdapter{Runner: factory.Runner, Dir: checkout}, nil
 	case runtime.ShellRuntime:
@@ -2182,7 +2105,7 @@ func runAgentShow(args []string, stdout, stderr io.Writer) int {
 
 func isPinnedRuntimeRef(runtimeName, ref string) bool {
 	switch strings.TrimSpace(runtimeName) {
-	case runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime, runtime.KimiCLIRuntime:
+	case runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime:
 	default:
 		return false
 	}
@@ -2645,7 +2568,6 @@ func dbAgent(agent runtime.Agent) db.Agent {
 		Capabilities:   agent.Capabilities,
 		AutonomyPolicy: policy,
 		HealthStatus:   agent.HealthStatus,
-		PresetDelivery: agent.PresetDelivery,
 	}
 }
 
@@ -2663,7 +2585,6 @@ func runtimeAgent(agent db.Agent) runtime.Agent {
 		Capabilities:   agent.Capabilities,
 		AutonomyPolicy: policy,
 		HealthStatus:   agent.HealthStatus,
-		PresetDelivery: agent.PresetDelivery,
 	}
 }
 

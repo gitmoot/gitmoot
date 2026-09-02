@@ -67,7 +67,7 @@ issue comment appears to have been ignored, the daemon log will not explain it.
 The daemon polls GitHub, applies that author gate, queues jobs, invokes the
 selected agent runtime, and posts attributed results back to the PR. The
 selected agent's runtime can be `codex`, `claude`, `kimi` (Kimi Code CLI), or
-`kimi-cli` (the opt-in legacy Kimi CLI adapter).
+`omp`.
 
 Expected result comments include the agent identity, runtime, the template when
 one is attached, and the job id:

@@ -769,8 +769,8 @@ func TestCodexSandboxArgsProduceGrants(t *testing.T) {
 			t.Fatalf("%s produce dispatch error = %v", runtimeName, err)
 		}
 	}
-	if err := ProduceDispatchError("produce", Agent{Name: "p", Runtime: KimiCLIRuntime, AutonomyPolicy: AutonomyPolicyWorkspaceWrite}); err == nil || !strings.Contains(err.Error(), `runtime "kimi-cli"`) {
-		t.Fatalf("legacy kimi produce error = %v", err)
+	if err := ProduceDispatchError("produce", Agent{Name: "p", Runtime: OmpRuntime, AutonomyPolicy: AutonomyPolicyWorkspaceWrite}); err == nil || !strings.Contains(err.Error(), `runtime "omp"`) {
+		t.Fatalf("non-produce runtime error = %v", err)
 	}
 	if err := ProduceDispatchError("produce", Agent{Name: "p", Runtime: CodexRuntime, AutonomyPolicy: AutonomyPolicyReadOnly}); err == nil || !strings.Contains(err.Error(), "writable autonomy policy") {
 		t.Fatalf("read-only produce error = %v", err)
@@ -1910,11 +1910,6 @@ func TestManagedRuntimeDeliveriesThreadAgentEnv(t *testing.T) {
 			build: func(r subprocess.Runner) Adapter { return KimiAdapter{Runner: r} },
 		},
 		{
-			name: "kimi-cli", output: kimiStreamOK,
-			agent: Agent{Name: "seat", Role: "reviewer", Runtime: KimiCLIRuntime, RuntimeRef: "session_" + session, RepoScope: "gitmoot/gitmoot"},
-			build: func(r subprocess.Runner) Adapter { return KimiCLIAdapter{Runner: r} },
-		},
-		{
 			name: "omp", output: ompStreamOK,
 			agent: Agent{Name: "seat", Role: "reviewer", Runtime: OmpRuntime, RuntimeRef: session, RepoScope: "gitmoot/gitmoot"},
 			build: func(r subprocess.Runner) Adapter { return OmpAdapter{Runner: r} },
@@ -2053,11 +2048,6 @@ func TestDeliverReportsPIDWhenRunnerSupportsCapability(t *testing.T) {
 			name:    "kimi",
 			adapter: KimiAdapter{Runner: &pidFakeRunner{fakeRunner: &fakeRunner{results: []subprocess.Result{{Stdout: `{"role":"assistant","content":"done"}` + "\n"}}}, pid: wantPID}},
 			agent:   Agent{Name: "kimi", Role: "implementer", Runtime: KimiRuntime, RuntimeRef: FreshRefForJob("pid-kimi"), RepoScope: "gitmoot/gitmoot"},
-		},
-		{
-			name:    "kimi-cli",
-			adapter: KimiCLIAdapter{Runner: &pidFakeRunner{fakeRunner: &fakeRunner{results: []subprocess.Result{{Stdout: `{"role":"assistant","content":"done"}` + "\n"}}}, pid: wantPID}},
-			agent:   Agent{Name: "kimi-cli", Role: "implementer", Runtime: KimiCLIRuntime, RuntimeRef: FreshRefForJob("pid-kimi-cli"), RepoScope: "gitmoot/gitmoot"},
 		},
 		{
 			name:    "omp",
@@ -2224,21 +2214,17 @@ func TestClaudeCommandError(t *testing.T) {
 	}
 }
 
-func TestValidateAgentAcceptsKimiRuntimes(t *testing.T) {
-	for _, runtimeName := range []string{KimiRuntime, KimiCLIRuntime} {
-		agent := Agent{Name: "audit", Role: "reviewer", Runtime: runtimeName, RuntimeRef: "session_550e8400-e29b-41d4-a716-446655440000", RepoScope: "gitmoot/gitmoot"}
-		if err := ValidateAgent(agent); err != nil {
-			t.Fatalf("ValidateAgent rejected valid %s agent: %v", runtimeName, err)
-		}
+func TestValidateAgentAcceptsKimiRuntime(t *testing.T) {
+	agent := Agent{Name: "audit", Role: "reviewer", Runtime: KimiRuntime, RuntimeRef: "session_550e8400-e29b-41d4-a716-446655440000", RepoScope: "gitmoot/gitmoot"}
+	if err := ValidateAgent(agent); err != nil {
+		t.Fatalf("ValidateAgent rejected valid kimi agent: %v", err)
 	}
 }
 
 func TestValidateAgentRejectsInvalidKimiRef(t *testing.T) {
-	for _, runtimeName := range []string{KimiRuntime, KimiCLIRuntime} {
-		agent := Agent{Name: "audit", Role: "reviewer", Runtime: runtimeName, RuntimeRef: "not-a-session", RepoScope: "gitmoot/gitmoot"}
-		if err := ValidateAgent(agent); err == nil {
-			t.Fatalf("ValidateAgent accepted invalid %s runtime ref", runtimeName)
-		}
+	agent := Agent{Name: "audit", Role: "reviewer", Runtime: KimiRuntime, RuntimeRef: "not-a-session", RepoScope: "gitmoot/gitmoot"}
+	if err := ValidateAgent(agent); err == nil {
+		t.Fatal("ValidateAgent accepted invalid kimi runtime ref")
 	}
 }
 
@@ -2246,9 +2232,6 @@ func TestKimiAdapterValidateRejectsRuntimeMismatch(t *testing.T) {
 	agent := Agent{Name: "audit", Role: "reviewer", Runtime: ClaudeRuntime, RuntimeRef: "session_550e8400-e29b-41d4-a716-446655440000", RepoScope: "gitmoot/gitmoot"}
 	if err := (KimiAdapter{}).Validate(context.Background(), agent); err == nil {
 		t.Fatal("KimiAdapter accepted a Claude agent")
-	}
-	if err := (KimiCLIAdapter{}).Validate(context.Background(), agent); err == nil {
-		t.Fatal("KimiCLIAdapter accepted a Claude agent")
 	}
 }
 
@@ -2458,37 +2441,4 @@ func TestKimiHealthRejectsBrokenSession(t *testing.T) {
 		t.Fatal("Health accepted broken Kimi session")
 	}
 	runner.want(t, 0, "kimi", "-p", KimiLiveCheckPrompt, "--output-format", "stream-json")
-}
-
-func TestKimiCLIStartCommandUsesPrintRuntime(t *testing.T) {
-	stdout := `{"role":"assistant","content":"ready"}` + "\n" +
-		`{"role":"meta","type":"session.resume_hint","session_id":"session_550e8400-e29b-41d4-a716-446655440003"}` + "\n"
-	runner := &fakeRunner{results: []subprocess.Result{{Stdout: stdout}}}
-	adapter := KimiCLIAdapter{Runner: runner, Dir: "/repo"}
-	agent := Agent{Name: "lead", Role: "implementer", Runtime: KimiCLIRuntime, RepoScope: "gitmoot/gitmoot", AutonomyPolicy: AutonomyPolicyReadOnly}
-
-	result, err := adapter.Start(context.Background(), StartRequest{Agent: agent, Prompt: "initialize"})
-	if err != nil {
-		t.Fatalf("Start returned error: %v", err)
-	}
-	if result.RuntimeRef != "session_550e8400-e29b-41d4-a716-446655440003" {
-		t.Fatalf("runtime ref = %q", result.RuntimeRef)
-	}
-	runner.want(t, 0, "kimi", "--print", "-p", "initialize", "--output-format", "stream-json")
-}
-
-func TestKimiCLIDeliverCommandUsesPrintRuntime(t *testing.T) {
-	stdout := `{"role":"assistant","content":"done"}` + "\n"
-	runner := &fakeRunner{results: []subprocess.Result{{Stdout: stdout}}}
-	adapter := KimiCLIAdapter{Runner: runner}
-	agent := Agent{Name: "reviewer", Role: "reviewer", Runtime: KimiCLIRuntime, RuntimeRef: "session_550e8400-e29b-41d4-a716-446655440001", RepoScope: "gitmoot/gitmoot", AutonomyPolicy: AutonomyPolicyReadOnly, Model: "agent-default"}
-
-	result, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review", Model: "opus"})
-	if err != nil {
-		t.Fatalf("Deliver returned error: %v", err)
-	}
-	if result.Summary != "done" {
-		t.Fatalf("summary = %q", result.Summary)
-	}
-	runner.want(t, 0, "kimi", "--model", "opus", "--print", "-p", "review", "--output-format", "stream-json")
 }

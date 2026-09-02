@@ -1116,15 +1116,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	runStart := time.Now()
 
 	registeredFreshRef := runtime.IsFreshRef(agent.RuntimeRef)
-	// #33 preset delivery mode: decide whether the resumed session already holds
-	// this exact preset and may receive the short reference instead of the full
-	// body. For a `full` agent (the default) this returns false without touching
-	// the store, so the assembled prompt is byte-identical. The snapshot in the
-	// payload (id/commit/content) is unchanged regardless — auditability/retry are
-	// preserved.
-	referenceUsed := m.usePresetReference(ctx, agent, payload)
 	jobPrompt := payload.prompt(job.Type)
-	jobPrompt.TemplateReferenceOnly = referenceUsed
 	prompt := prompts.RenderJob(jobPrompt)
 	// Append the off-by-default "Prior learnings" memory block (#626 READ path).
 	// When the memory hook is unset (every non-enrolled path) or returns "" (no
@@ -1205,13 +1197,6 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	if firstRefreshedRef != "" {
 		agent.RuntimeRef = firstRefreshedRef
 	}
-	// #33: after a successful FULL preset delivery, record that the resumed session
-	// now holds this preset so a later referenced/auto delivery can send the short
-	// reference. agent.RuntimeRef here is the effective session the next job will
-	// resume (the refreshed ref was adopted above). No-op for a `full` agent, when
-	// a reference was already used, or for a non-concrete session — so the default
-	// path writes nothing.
-	m.recordPresetSessionState(ctx, agent, payload, agent.RuntimeRef, referenceUsed)
 	payload.RawOutputs = append(payload.RawOutputs, firstRaw)
 
 	result, parseErr := extractAgentResultForAction(firstRaw, job.Type)

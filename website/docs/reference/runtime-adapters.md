@@ -26,12 +26,6 @@ agent template and rendered job prompt before handing work to an adapter.
   the limit. Normal-size prompts are passed verbatim as before, unchanged. (The
   Claude and Codex adapters pass the prompt as an argv argument too, but their
   CLIs can also read it from stdin, so they have a native escape hatch.)
-- **Kimi CLI (legacy)** is the opt-in `--runtime kimi-cli` adapter (#546) for
-  the **older** Kimi CLI, which requires the `--print` command shape the
-  current Kimi Code CLI does not support. It is intentionally separate from
-  `kimi` so the default Kimi Code path is never probed or changed. Choose
-  `kimi` unless you specifically run the legacy CLI; the two count as the same
-  runtime *family* for cross-family review.
 - **omp** is the oh-my-pi CLI (v17.2.4), a multi-provider *routing harness*
   rather than one vendor's CLI. Select it with `gitmoot agent start <name>
   --runtime omp`. It advertises `review`, `implement`, and `ask` — **not**

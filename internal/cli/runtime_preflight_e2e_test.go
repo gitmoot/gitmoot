@@ -43,7 +43,7 @@ func TestRuntimePreflightStubBinaryE2E(t *testing.T) {
 		if job.State != string(workflow.JobBlocked) {
 			t.Fatalf("job state = %q, want blocked", job.State)
 		}
-		assertRuntimePreflightEventText(t, events, "--print", "kimi-code stub-0.29.2", "remedy")
+		assertRuntimePreflightEventText(t, events, "flag -p", "kimi-code stub-0.29.2", "remedy")
 	})
 
 	t.Run("arm2_unsupported_blocks", func(t *testing.T) {
@@ -58,7 +58,7 @@ func TestRuntimePreflightStubBinaryE2E(t *testing.T) {
 		if job.State != string(workflow.JobBlocked) {
 			t.Fatalf("job state = %q, want blocked", job.State)
 		}
-		assertRuntimePreflightEventText(t, events, "--print", "kimi-code stub-0.29.2", "remedy")
+		assertRuntimePreflightEventText(t, events, "flag -p", "kimi-code stub-0.29.2", "remedy")
 	})
 
 	t.Run("arm3_unparseable_dispatches_and_records", func(t *testing.T) {
@@ -210,7 +210,7 @@ func runRuntimePreflightStubJob(t *testing.T, rawHome string, checker *runtime.R
 		t.Fatal(err)
 	}
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "legacy", runtime.KimiCLIRuntime, "fresh:e2e", []string{"ask"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "legacy", runtime.KimiRuntime, "fresh:e2e", []string{"ask"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: jobID, Agent: "legacy", Action: "ask", Repo: "owner/repo", Branch: "main"})
 	worker := defaultJobWorker(store, io.Discard, rawHome)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {

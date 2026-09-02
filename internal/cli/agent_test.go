@@ -2059,7 +2059,7 @@ func TestRunAgentTypeSetRejectsNonStartableRuntime(t *testing.T) {
 	if code != 2 {
 		t.Fatalf("agent type set shell exit code = %d, want 2", code)
 	}
-	if !strings.Contains(stderr.String(), "managed agent types support codex, claude, kimi, kimi-cli, or omp") {
+	if !strings.Contains(stderr.String(), "managed agent types support codex, claude, kimi, or omp") {
 		t.Fatalf("stderr = %q", stderr.String())
 	}
 }

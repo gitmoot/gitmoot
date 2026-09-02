@@ -143,12 +143,6 @@ func injectDeliveryAdapterEnv(adapter workflow.DeliveryAdapter, env []string) (w
 	case *runtime.KimiAdapter:
 		a.Runner = subprocess.EnvInjectingRunner{Inner: a.Runner, Env: env}
 		return a, nil
-	case runtime.KimiCLIAdapter:
-		a.Runner = subprocess.EnvInjectingRunner{Inner: a.Runner, Env: env}
-		return a, nil
-	case *runtime.KimiCLIAdapter:
-		a.Runner = subprocess.EnvInjectingRunner{Inner: a.Runner, Env: env}
-		return a, nil
 	case runtime.OmpAdapter:
 		a.Runner = subprocess.EnvInjectingRunner{Inner: a.Runner, Env: env}
 		return a, nil

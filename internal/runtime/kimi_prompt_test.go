@@ -239,29 +239,3 @@ func TestKimiStartLongPromptUsesTempFile(t *testing.T) {
 		t.Fatalf("Start left temp file %s behind", runner.stagedPath)
 	}
 }
-
-// TestKimiCLILongPromptUsesTempFile confirms the legacy kimi-cli runtime shares
-// the protection and still emits its --print flag.
-func TestKimiCLILongPromptUsesTempFile(t *testing.T) {
-	runner := &captureKimiRunner{result: subprocess.Result{Stdout: kimiStreamOK}}
-	adapter := KimiCLIAdapter{Runner: runner}
-	agent := kimiTestAgent()
-	agent.Runtime = KimiCLIRuntime
-	prompt := strings.Repeat("W", kimiMaxArgvPromptBytes+1)
-	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: prompt}); err != nil {
-		t.Fatalf("Deliver: %v", err)
-	}
-	if !runner.stagedRead || runner.stagedBody != prompt {
-		t.Fatalf("legacy kimi-cli did not stage the oversize prompt intact (read=%v)", runner.stagedRead)
-	}
-	joined := strings.Join(runner.lastArgs, "\x00")
-	if !strings.Contains(joined, "--print") {
-		t.Fatalf("legacy kimi-cli dropped --print: %v", runner.lastArgs)
-	}
-	if grant := kimiAddDirValue(runner.lastArgs); grant == "" || filepath.Dir(runner.stagedPath) != grant {
-		t.Fatalf("legacy kimi-cli did not grant --add-dir for staged prompt %q; argv=%v", runner.stagedPath, runner.lastArgs)
-	}
-	if strings.Contains(strings.Join(runner.lastArgs, ""), prompt) {
-		t.Fatal("raw oversize prompt leaked into legacy kimi-cli argv")
-	}
-}

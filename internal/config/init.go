@@ -348,7 +348,7 @@ path = ""
 
 # [runtimes.<name>] is the OPTIONAL config-driven runtime metadata registry
 # (issue #652). Gitmoot ships built-in metadata for each compiled runtime (codex,
-# claude, kimi, kimi-cli, omp, shell) — capabilities, default model/effort, known models, and where
+# claude, kimi, omp, shell) — capabilities, default model/effort, known models, and where
 # token usage is read from — that reproduces today's behavior. A [runtimes.<name>]
 # section OVERRIDES that recorded metadata for a BUILT-IN runtime WITHOUT a
 # recompile: retarget the default model, record which models a runtime accepts, or

@@ -71,8 +71,7 @@ The daemon default is `--workers 1`; raise it only for independent runtime
 sessions or managed agent types with `max_background` greater than one.
 
 For runtime selection, `gitmoot agent start <name> --runtime <runtime>` accepts
-`codex`, `claude`, `kimi`, `kimi-cli` (the opt-in legacy Kimi CLI adapter), or
-`omp`. Kimi Code is a first-class runtime adapter alongside Codex and Claude
+`codex`, `claude`, `kimi`, or `omp`. Kimi Code is a first-class runtime adapter alongside Codex and Claude
 Code. To use it, run `kimi login`, then restart the Gitmoot daemon so it inherits
 the session. `omp` is the oh-my-pi CLI, a multi-provider routing harness:
 authenticate it once (interactively, via a provider key in the daemon

@@ -20,12 +20,11 @@ import (
 )
 
 const (
-	CodexRuntime   = "codex"
-	ClaudeRuntime  = "claude"
-	KimiRuntime    = "kimi"
-	KimiCLIRuntime = "kimi-cli"
-	ShellRuntime   = "shell"
-	LastRef        = "last"
+	CodexRuntime  = "codex"
+	ClaudeRuntime = "claude"
+	KimiRuntime   = "kimi"
+	ShellRuntime  = "shell"
+	LastRef       = "last"
 
 	healthPrompt = "Gitmoot health check. Reply OK only."
 
@@ -47,12 +46,6 @@ type Agent struct {
 	HealthStatus   string
 	Model          string
 	Effort         string
-	// PresetDelivery is the agent's prompt preset delivery mode (#33): full
-	// (default), referenced, or auto. Carried in-memory from the stored agents row
-	// so the delivery seam can decide whether to inline the whole preset or send a
-	// short reference. Empty (the default and every construction site that does not
-	// set it) is treated as full, so delivery is byte-identical.
-	PresetDelivery string
 	// SingleUseSession marks an agent whose runtime session exists solely for
 	// the current job (ephemeral delegation workers and per-job temp workers:
 	// the session is started for the job and disposed after it). Adapters whose
@@ -377,8 +370,6 @@ func (f Factory) Adapter(name string) (Adapter, error) {
 		return ClaudeAdapter{Runner: f.Runner}, nil
 	case KimiRuntime:
 		return KimiAdapter{Runner: f.Runner}, nil
-	case KimiCLIRuntime:
-		return KimiCLIAdapter{Runner: f.Runner}, nil
 	case OmpRuntime:
 		return OmpAdapter{Runner: f.Runner}, nil
 	case ShellRuntime:

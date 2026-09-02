@@ -64,7 +64,6 @@ func TestCuratedRuntimeBaseEnvPinnedPolicy(t *testing.T) {
 		{runtime: runtime.CodexRuntime, want: []string{"CODEX_HOME", "GH_CONFIG_DIR", "GH_PROMPT_DISABLED", "GOCACHE", "HOME", "LC_ALL", "NPM_TOKEN", "PATH"}},
 		{runtime: runtime.ClaudeRuntime, want: []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR", "GH_CONFIG_DIR", "GH_PROMPT_DISABLED", "GOCACHE", "HOME", "LC_ALL", "NPM_TOKEN", "PATH"}},
 		{runtime: runtime.KimiRuntime, want: []string{"GH_CONFIG_DIR", "GH_PROMPT_DISABLED", "GOCACHE", "HOME", "LC_ALL", "NPM_TOKEN", "PATH"}},
-		{runtime: runtime.KimiCLIRuntime, want: []string{"GH_CONFIG_DIR", "GH_PROMPT_DISABLED", "GOCACHE", "HOME", "LC_ALL", "NPM_TOKEN", "PATH"}},
 		// omp gets ROUTING PLUMBING ONLY plus the OMP_AUTH_BROKER_* pair (broker-mode
 		// auth, inherited by design). OPENAI_API_KEY and ANTHROPIC_OAUTH_TOKEN sit in
 		// environ and are absent here: that absence is the no-raw-provider-key pin, and
@@ -90,7 +89,7 @@ func TestCuratedRuntimeBaseEnvPinnedPolicy(t *testing.T) {
 func TestCuratedRuntimeBaseEnvGitHubInherit(t *testing.T) {
 	cfg := config.CredentialsConfig{EnvCuration: true, GitHub: config.CredentialsGitHubInherit}
 	want := []string{"PATH=/bin", "GH_TOKEN=one", "GITHUB_TOKEN=two", "GH_HOST=three"}
-	for _, runtimeName := range []string{runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime, runtime.KimiCLIRuntime, runtime.OmpRuntime, runtime.ShellRuntime} {
+	for _, runtimeName := range []string{runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime, runtime.OmpRuntime, runtime.ShellRuntime} {
 		t.Run(runtimeName, func(t *testing.T) {
 			got := curatedRuntimeBaseEnv(cfg, runtimeName, []string{"PATH=/bin", "GH_TOKEN=one", "GITHUB_TOKEN=two", "GH_HOST=three"}, "")
 			if !reflect.DeepEqual(got, want) {

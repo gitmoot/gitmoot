@@ -118,9 +118,8 @@ func HeartbeatActionSupported(action string) bool {
 
 // HeartbeatRuntimes lists the runtimes a per-heartbeat runtime override may name
 // (#611): the runtimes the adapter Factory supports EXCEPT shell (a heartbeat mints
-// a fresh session, and shell sessions are whole commands, not resumable sessions)
-// and kimi-cli (the legacy Kimi CLI; gitmoot targets kimi-code via the `kimi`
-// runtime). The result — codex|claude|kimi|omp today — is the SINGLE source of
+// a fresh session, and shell sessions are whole commands, not resumable sessions).
+// The result — codex|claude|kimi|omp today — is the SINGLE source of
 // truth that the CLI usage/flag help and the docs advertise, so accepted ==
 // documented (the rest is derived from runtime.SupportedRuntimes so the set stays
 // in lockstep with the adapter registry). That derivation is why registering a
@@ -132,7 +131,7 @@ func HeartbeatRuntimes() []string {
 	names := runtime.SupportedRuntimes()
 	allowed := make([]string, 0, len(names))
 	for _, name := range names {
-		if name == runtime.ShellRuntime || name == runtime.KimiCLIRuntime {
+		if name == runtime.ShellRuntime {
 			continue
 		}
 		allowed = append(allowed, name)

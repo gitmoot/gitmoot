@@ -2566,4 +2566,30 @@ DROP TABLE IF EXISTS chat_messages;
 DROP TABLE IF EXISTS chat_threads;
 DROP TABLE IF EXISTS chat_meta;
 	`,
+
+	// #1756 removes the #33 preset delivery MODES. Measured before writing this:
+	// preset_session_state held 0 rows and all 186 registered agents read
+	// preset_delivery='full' on the live deployment, so `referenced`/`auto` were
+	// never exercised and the only surviving behaviour is the pre-#33 one — always
+	// inline the whole preset. That makes this a pure drop, not a data transition:
+	// there is no non-'full' value to migrate and nothing reads the table.
+	//
+	// Order matters and is the reverse of the additive migration that created them:
+	// the table goes first, then the column, so a failure between the two statements
+	// leaves a column whose only legal value is already its DEFAULT rather than a
+	// column referencing a table that no longer exists.
+	//
+	// The column drop is what makes this irreversible, and it is deliberate: a
+	// column with one legal value is a configurable-but-behaviourless surface, which
+	// is the defect this reduction exists to remove. ALTER TABLE ... DROP COLUMN is
+	// the same mechanism #1752 used for the canary columns on agent_template_versions,
+	// but precedent is not a measurement: both arms are proven for THIS migration by
+	// TestPresetDeliveryRemovalMigration below (a fresh schema, and a pre-change
+	// database seeded with real agent rows and a preset_session_state row, upgraded
+	// through the real Open path).
+	`
+DROP TABLE IF EXISTS preset_session_state;
+
+ALTER TABLE agents DROP COLUMN preset_delivery;
+	`,
 }

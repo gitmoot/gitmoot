@@ -46,9 +46,8 @@ gitmoot agent start project-planner \
   --start-daemon
 ```
 
-The `--runtime` flag accepts `codex`, `claude`, `kimi`, or `kimi-cli` (the
-opt-in legacy Kimi CLI adapter; choose `kimi` unless you specifically run the
-legacy CLI — see [Runtime Adapters](../reference/runtime-adapters.md)). To use
+The `--runtime` flag accepts `codex`, `claude`, `kimi`, or `omp` (see
+[Runtime Adapters](../reference/runtime-adapters.md)). To use
 the Kimi Code runtime, run `kimi login` first, then restart the Gitmoot daemon
 so it inherits the session.
 
