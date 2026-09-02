@@ -433,24 +433,37 @@ exactly what makes a stale green look current. (Whether a manual "Re-run all
 jobs" re-resolves the merge ref against the new base or replays the original
 merge SHA is **unmeasured** — do not rely on either.)
 
-The two axes, and both can be true at once:
+The two axes — the head axis has two shapes — and both axes can be true at once:
 
 - **The head moved — new commits were pushed.** The verdict is void: it
   described a tree that no longer exists. Re-review at the new head, scoped to
   the delta since the approved head, not the whole PR again. Verify the branch
   carries only what you intended: `git diff origin/<baseRefName>..HEAD` and a
   tree read confirming no file you never touched reappears or vanishes.
-- **The head moved BACK — a force-push restored an earlier approved SHA.** An
-  exact-head gate keyed to `head_sha` cannot see this: the tree exists and the
-  SHA matches a prior approval. But that approval was made against a different
-  base and against intermediate history the force-push discarded. Treat it as
-  unreviewed.
+  - **Sub-case of the head axis: the head moved BACK** — a force-push restored
+    an earlier approved SHA. An exact-head gate keyed to `head_sha` cannot see
+    this: the tree exists and the SHA matches a prior approval. But that
+    approval was made against a different base and against intermediate history
+    the force-push discarded. Treat it as unreviewed.
 - **The base moved.** The verdict still names a commit that still exists and git
   still reports CLEAN, yet nobody reviewed `base` + branch, which is what lands.
   **The sound instrument is to build and test the merge result** — re-trigger CI
-  at the current base and read that run. File/package overlap between the base
-  delta and the PR is useful only to scope how much of the diff a human
-  re-reads; it is **not** a merge predicate. It has no direction and no
+  at the current base and read that run. To re-trigger it, **push to the
+  branch** (rebase onto the base, or merge the base in): that fires
+  `pull_request: synchronize`, which produces a fresh merge ref AND a fresh run.
+  Do not rely on the GitHub UI's "Re-run all jobs" — whether it re-resolves the
+  merge ref against the new base or replays the original merge SHA is unmeasured
+  here, so it may report green for the tree you were trying to leave behind.
+
+  **A green merge build is necessary, not sufficient.** It proves the merged tree
+  compiles and its tests pass; it cannot notice an assertion that stopped
+  existing. Where the base delta and the PR touch the same region, a clean
+  textual merge silently produces wrong code: two migrations appended to the same
+  slice merge without conflict and can still renumber, and two edits to one test
+  function merge with one assertion dropped — after which the merged tree builds
+  and every remaining test passes, so CI is green and reports nothing. That is
+  what file/package overlap is for: it is useful only to scope how much of the
+  diff a human re-reads, and it is **not** a merge predicate. It has no direction and no
   transitivity, while "depends on" has both: a PR changing a signature in
   `internal/workflow` and a base commit adding a call site in `internal/daemon`
   share zero files and zero packages, pass any overlap test, and produce a tree
@@ -492,8 +505,12 @@ the note path's precedent is STEADY, set by owner instruction in note 107313 on
 2026-09-02 and since superseded. A merged PR takes effect at that PR's
 `mergedAt` time. At the next check-in, the coordinator must:
 
-1. fetch `origin/main`, read the marker from `origin/main:AGENTS.md` rather than
-   the seat's worktree, and steer every active seat to the merged mode;
+1. resolve the mode from BOTH sources and steer to the LATER one: fetch
+   `origin/main` and read the marker from `origin/main:AGENTS.md` rather than the
+   seat's worktree, AND read the newest `[operating-mode ...]` workflow note.
+   Between a note and the PR that corrects the file, `AGENTS.md` is stale BY
+   CONSTRUCTION, so a coordinator reading only the file in that window steers
+   every seat to the superseded mode. Name which source you read;
 2. comment on the merged mode-switch PR with this exact transition record:
    `[workload-mode-transition]`, `mode: <THROUGHPUT|STEADY|DRAIN>`,
    `effective_commit: <40-character SHA>`, `observed_at: <RFC3339>`, zero or more
@@ -507,12 +524,14 @@ implementation assignments accepted before `mergedAt` that have not reached a
 terminal handoff, plus review jobs created before `mergedAt` that were queued or
 running then. `accepted_at` is the timestamp of the Herdr pane's first
 `working` status event after the issue-backed assignment prompt; `created_at` is
-the job-store timestamp. The merged PR always exists, so this record does not
-depend on a pre-existing workflow. The mode changes how much work may start; it
+the job-store timestamp. A merged PR always exists for a PR-sourced switch, so that record does not
+depend on a pre-existing workflow. For a NOTE-sourced switch the note id IS the
+record and the transition record is posted as a workflow note, because the
+correcting PR may not exist yet. The mode changes how much work may start; it
 never relaxes correctness, exact-head review, CI, or the merge authority
 recorded in the org config.
 
-Across both modes, use exactly one independent reviewer per corrected head.
+Across ALL THREE modes, use exactly one independent reviewer per corrected head.
 Parallel review lanes mean different PRs, not multiple reviewers on one head.
 Review panels and fanout require explicit, durable owner authorization for that
 specific incident; an incident does not override this rule by itself.
@@ -540,7 +559,17 @@ escalations, and an armed merge gate then merged the PR without them.
 - **No admission gate.** A seat that finishes takes the next item itself: no
   escalation for permission, no waiting for an authorization row.
 - Work comes off an **ordered list**, not a free choice — for a reduction epic,
-  that epic's own dependency-sorted sub-issue order.
+  that epic's own dependency-sorted sub-issue order. **Nothing outside the
+  scoped list is in scope**: with no admission gate, exclusivity is the only
+  clause that bounds what a finishing seat may pick up (owner instruction, note
+  107313: "Nothing outside #1762 is in scope").
+- **Claim before editing.** A seat posts a one-line claim note naming issue,
+  seat and branch BEFORE its first edit. No permission, no wait, no reply — it
+  is a record other seats can read. Removing the admission gate removed the
+  permission step, not the coordination signal: on 2026-09-02 two seats built
+  incompatible answers to one issue (#1757, PRs #1786 and #1789 sharing 18 files
+  and treating `NoopClient` two ways) because the second seat checked for a
+  claim, correctly found none, and started.
 - **One in, one out**: no second PR from a seat while its first is unmerged.
   This is what keeps the queue from growing, without anyone deciding.
 - Escalate only for a **P2-or-worse finding**, a **scope boundary wider than the
