@@ -62,6 +62,12 @@ var normalizationOwnedResultFields = map[string]string{
 	// Set by Mailbox.Run when it strips a pipeline leaf's executable delegations,
 	// so consumers can still tell the row was a coordinator fan-out (#1685).
 	"fan_out": "set by mailbox normalization, never requested from an agent",
+	// Set by the closed-PR sweep on the SYNTHETIC result it mints for a delegation
+	// child whose pull request is no longer open (#1673). The retry actuator reads it
+	// to know a delivery-checkout preflight can never validate for that child, and it
+	// lives in the result so RetryJob clears it along with the result. An agent
+	// claiming it would be asserting a lifecycle fact the product owns.
+	"superseded_pull_request_closed": "set by the closed-pull-request sweep, never requested from an agent",
 }
 
 func contractFieldNames() []string {
