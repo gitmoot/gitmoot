@@ -719,6 +719,12 @@ var escalationRecoveryLeaseTTL = 2 * time.Minute
 // deterministically. Nil in production (#1673).
 var escalationPreRenewHook func(ctx context.Context, jobID string, roundID string)
 
+// escalationRenewFaultHook injects a renewal STORE FAILURE into the heartbeat, which is
+// the only way to reach the expiry-bound cancellation through the production loop rather
+// than by calling a helper. It returns the error the renewal should report; a nil return
+// lets the real renewal run. Nil in production (#1673).
+var escalationRenewFaultHook func(attempt int) error
+
 // applyResolutionEffectsFenced is the authorized shape (#1673, design note v6 +
 // A-NARROW): acquire the fence, run the pre-effects UNDER it, then commit every
 // durable database write AND the receipt in ONE transaction that re-validates the
@@ -763,6 +769,16 @@ func (e Engine) applyResolutionEffectsFenced(ctx context.Context, parentJob db.J
 	// The heartbeat renews while the work runs and CANCELS the work's context the moment
 	// ownership is genuinely lost, so a losing pass stops mid-flight instead of
 	// completing effects it no longer owns.
+	// THE LAST CONFIRMED EXPIRY. A renewal ERROR is not proof of loss, so the heartbeat
+	// retries it - but retrying forever is a bet that the store recovers before the lease
+	// lapses, and if it does not, another recoverer legitimately takes the fence while
+	// this pass is still creating worktrees and locks. Commit-time validation would stop
+	// the database write; it cannot undo an overlapping external effect.
+	//
+	// So authority is bounded by what this pass can PROVE it holds: the expiry it last
+	// confirmed. A retry loop that ignores that boundary is not a retry policy, it is an
+	// unbounded extension of authority the store never granted (#1673).
+	confirmedUntil := time.Now().UTC().Add(escalationRecoveryLeaseTTL)
 	effectCtx, stopHeartbeat := context.WithCancel(ctx)
 	// ownershipLost is set ONLY by the heartbeat observing a genuine loss. It is a
 	// separate signal from effectCtx.Err() on purpose: this function cancels effectCtx
@@ -774,16 +790,33 @@ func (e Engine) applyResolutionEffectsFenced(ctx context.Context, parentJob db.J
 		defer close(heartbeatDone)
 		ticker := time.NewTicker(escalationRecoveryLeaseTTL / 3)
 		defer ticker.Stop()
+		attempt := 0
 		for {
 			select {
 			case <-effectCtx.Done():
 				return
 			case <-ticker.C:
-				held, err := e.Store.RenewEscalationRecoveryLease(ctx, parentJob.ID, roundID, owner,
-					time.Now().UTC().Add(escalationRecoveryLeaseTTL), time.Now().UTC())
+				attempt++
+				renewUntil := time.Now().UTC().Add(escalationRecoveryLeaseTTL)
+				var held bool
+				var err error
+				if escalationRenewFaultHook != nil {
+					err = escalationRenewFaultHook(attempt)
+				}
+				if err == nil {
+					held, err = e.Store.RenewEscalationRecoveryLease(ctx, parentJob.ID, roundID, owner,
+						renewUntil, time.Now().UTC())
+				}
 				if err != nil {
-					// A transient store error is not proof of loss; the next tick retries
-					// and the lease still has two thirds of its life left.
+					// Retry ONLY while the lease this pass last confirmed is still in
+					// force. One transient failure is survivable; failure persisting to the
+					// known expiry is proof this pass no longer has authority to run
+					// external pre-effects, because the fence is reclaimable by anyone.
+					if !time.Now().UTC().Before(confirmedUntil) {
+						ownershipLost.Store(true)
+						stopHeartbeat()
+						return
+					}
 					continue
 				}
 				if !held {
@@ -791,6 +824,7 @@ func (e Engine) applyResolutionEffectsFenced(ctx context.Context, parentJob db.J
 					stopHeartbeat()
 					return
 				}
+				confirmedUntil = renewUntil
 			}
 		}
 	}()

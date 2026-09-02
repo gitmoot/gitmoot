@@ -514,3 +514,129 @@ func TestBranchLockCollisionDoesNotSettleTheRetry(t *testing.T) {
 		t.Fatal("the claim was discarded by a refused allocation")
 	}
 }
+
+// TestRenewalErrorsCancelAtTheConfirmedExpiry is the P1 of the 2754115c review, and it
+// is what round 2's heartbeat made possible: moving from a one-shot renewal to a retry
+// loop turned the RETRY policy into an AUTHORITY policy, and a loop that retries past
+// the lease it last confirmed extends authority the store never granted.
+//
+// THE TIMELINE, driven through the production heartbeat rather than a helper: the TTL is
+// shrunk, every renewal write fails, and a pre-effect blocks. At the last confirmed
+// expiry the fence becomes reclaimable by anyone, so the pass must cancel its own
+// in-flight work at or before that instant - even though no renewal ever returned an
+// authoritative "not held".
+//
+// SEMANTIC REVERSION THIS KILLS: turn the expiry bound back into an unconditional
+// `continue` and the original pass keeps allocating while a competitor takes the fence.
+func TestRenewalErrorsCancelAtTheConfirmedExpiry(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.EscalationNotifier = &recordingNotifier{}
+	manager := pausedImplementEscalation(t, store, &engine)
+
+	originalTTL := escalationRecoveryLeaseTTL
+	escalationRecoveryLeaseTTL = 300 * time.Millisecond
+	t.Cleanup(func() { escalationRecoveryLeaseTTL = originalTTL })
+
+	round, ok := unsettledRound(t, store, "parent-job")
+	if !ok {
+		t.Fatal("no unsettled round")
+	}
+
+	// EVERY renewal write fails, for the whole run.
+	var renewAttempts atomic.Int64
+	escalationRenewFaultHook = func(attempt int) error {
+		renewAttempts.Store(int64(attempt))
+		return errors.New("store unavailable")
+	}
+	t.Cleanup(func() { escalationRenewFaultHook = nil })
+
+	var cancelledBeforeExpiry atomic.Bool
+	var competitorOverlapped atomic.Bool
+	manager.onAddCtx = func(effectCtx context.Context) {
+		deadline := time.Now().UTC().Add(escalationRecoveryLeaseTTL)
+		select {
+		case <-effectCtx.Done():
+			// (a) cancelled, and cancelled no later than the confirmed expiry.
+			if !time.Now().UTC().After(deadline.Add(150 * time.Millisecond)) {
+				cancelledBeforeExpiry.Store(true)
+			}
+		case <-time.After(3 * time.Second):
+		}
+		// (b) once this pass is cancelled, a competitor may take the fence - and the
+		// original must no longer be running external work alongside it.
+		now := time.Now().UTC()
+		if taken, err := store.AcquireEscalationRecoveryLease(context.Background(), "parent-job",
+			round.RoundID, "competitor", now.Add(time.Minute), now); err == nil && taken {
+			competitorOverlapped.Store(true)
+		}
+	}
+
+	if err := engine.ResolveEscalation(ctx, "parent-job", ResumeRetry, ""); err != nil {
+		t.Fatalf("ResolveEscalation: %v", err)
+	}
+
+	if renewAttempts.Load() < 2 {
+		t.Fatalf("renewal attempts = %d, want at least 2: the heartbeat never retried through the error", renewAttempts.Load())
+	}
+	if !cancelledBeforeExpiry.Load() {
+		t.Fatal("the in-flight pre-effect was not cancelled by the confirmed expiry: authority outlived the lease")
+	}
+	if !competitorOverlapped.Load() {
+		t.Fatal("the fence never became reclaimable: this test cannot observe the hazard it is named for")
+	}
+	// (c) NO COMMIT from the cancelled pass.
+	if got := countJobs(t, store, "/resume"); got != 0 {
+		t.Fatalf("resume jobs = %d, want 0 from a pass whose authority lapsed", got)
+	}
+	if got := countWorkflowJobEvents(t, store, "parent-job", escalationEffectsCompletedEvent); got != 0 {
+		t.Fatalf("receipts = %d, want 0", got)
+	}
+	if _, stillOpen := unsettledRound(t, store, "parent-job"); !stillOpen {
+		t.Fatal("a pass whose authority lapsed settled the round")
+	}
+}
+
+// TestRenewalErrorsAfterSuccessesStillCompleteTheRun is the control that keeps the
+// expiry bound from becoming a bound that rejects VALID work: renewals that succeed for
+// a while and only then start failing must not cancel the pass, because each success
+// moved the confirmed expiry forward. A bound anchored on the ORIGINAL expiry would kill
+// a run that legitimately held its lease the whole time.
+func TestRenewalErrorsAfterSuccessesStillCompleteTheRun(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.EscalationNotifier = &recordingNotifier{}
+	manager := pausedImplementEscalation(t, store, &engine)
+
+	originalTTL := escalationRecoveryLeaseTTL
+	escalationRecoveryLeaseTTL = 300 * time.Millisecond
+	t.Cleanup(func() { escalationRecoveryLeaseTTL = originalTTL })
+
+	// The first two renewals succeed - each advancing the confirmed expiry - and only
+	// then does the store start failing.
+	escalationRenewFaultHook = func(attempt int) error {
+		if attempt <= 2 {
+			return nil
+		}
+		return errors.New("store unavailable after two good renewals")
+	}
+	t.Cleanup(func() { escalationRenewFaultHook = nil })
+
+	// Work that spans several ticks, so the late errors are genuinely reached.
+	manager.onAdd = func() { time.Sleep(450 * time.Millisecond) }
+
+	if err := engine.ResolveEscalation(ctx, "parent-job", ResumeRetry, ""); err != nil {
+		t.Fatalf("ResolveEscalation: %v", err)
+	}
+
+	// THE RUN THAT SHOULD SUCCEED DID: the retry landed exactly once and the round is
+	// settled, because the confirmed expiry moved with each successful renewal.
+	if got := countJobs(t, store, "/resume"); got != 1 {
+		t.Fatalf("resume jobs = %d, want exactly 1: late renewal errors cancelled a run that held its lease", got)
+	}
+	if got := countWorkflowJobEvents(t, store, "parent-job", escalationEffectsCompletedEvent); got != 1 {
+		t.Fatalf("receipts = %d, want exactly 1", got)
+	}
+}
