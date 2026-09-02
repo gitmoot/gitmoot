@@ -173,7 +173,6 @@ func TestParsePipelineRemoteListingAndRequirementsLine(t *testing.T) {
 		Description:   "Nightly deployment sync.",
 		Requirements: pipelineBundleRequirements{
 			Runtimes:          []string{"shell", "codex"},
-			Connections:       []pipelineBundleConnection{{Kind: "email", Name: "deploy-mail"}},
 			UpstreamPipelines: []string{"ingest"},
 		},
 	}
@@ -189,7 +188,7 @@ func TestParsePipelineRemoteListingAndRequirementsLine(t *testing.T) {
 		t.Fatalf("listing = %+v", listing)
 	}
 	line := pipelineRemoteRequirementsLine(listing.Requirements)
-	for _, want := range []string{"runtimes=codex,shell", "connections=email/deploy-mail", "upstreams=ingest"} {
+	for _, want := range []string{"runtimes=codex,shell", "upstreams=ingest"} {
 		if !strings.Contains(line, want) {
 			t.Fatalf("requirements line %q missing %q", line, want)
 		}

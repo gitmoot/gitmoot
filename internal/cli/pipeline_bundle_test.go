@@ -38,6 +38,47 @@ func TestReadPipelineBundleManifestKnownFields(t *testing.T) {
 	}
 }
 
+func TestPipelineImportReadsPreRemovalBundleV1Manifest(t *testing.T) {
+	fixtureDir := filepath.Join("testdata", "pipeline_bundle_v1_pre_removal")
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"pipeline", "import", fixtureDir, "--home", t.TempDir(), "--repo", "owner/repo"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("legacy bundle import exit=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+
+	currentRaw, err := yaml.Marshal(validPipelineBundleManifestForTest(t, []byte(bundleSpecForTest)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(currentRaw, []byte("connections:")) {
+		t.Fatalf("new bundle manifest still emits decode-only connections field:\n%s", currentRaw)
+	}
+
+	manifestRaw, err := os.ReadFile(filepath.Join(fixtureDir, "bundle.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyEmailRaw := bytes.Replace(manifestRaw, []byte("  connections: []"), []byte("  connections:\n    - kind: gmail-imap\n      name: inbox"), 1)
+	if bytes.Equal(legacyEmailRaw, manifestRaw) {
+		t.Fatal("legacy fixture does not contain the pre-removal connections field")
+	}
+	legacyEmailDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(legacyEmailDir, "bundle.yaml"), legacyEmailRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	specRaw, err := os.ReadFile(filepath.Join(fixtureDir, "spec.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyEmailDir, "spec.yaml"), specRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"pipeline", "import", legacyEmailDir, "--home", t.TempDir(), "--repo", "owner/repo"}, &stdout, &stderr); code == 0 || !strings.Contains(stderr.String(), "bundle manifest requires removed email connections") {
+		t.Fatalf("legacy email bundle exit=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+}
+
 func TestPipelineBundleVersionGate(t *testing.T) {
 	for _, test := range []struct {
 		name, minimum, current string
@@ -105,8 +146,8 @@ func TestDerivePipelineBundleRequirements(t *testing.T) {
 	raw := []byte(`name: share-me
 repo: owner/repo
 trigger:
-  kind: email
-  connection: inbox-imap
+  kind: pipeline
+  pipeline: upstream
 stages:
   - id: collect
     cmd: echo ok
@@ -122,21 +163,10 @@ stages:
 	if !reflect.DeepEqual(got.Runtimes, []string{runtime.CodexRuntime, runtime.ShellRuntime}) {
 		t.Fatalf("runtimes = %v", got.Runtimes)
 	}
-	if !reflect.DeepEqual(got.Connections, []pipelineBundleConnection{{Kind: "email", Name: "inbox-imap"}}) {
-		t.Fatalf("connections = %+v", got.Connections)
-	}
-	if len(got.UpstreamPipelines) != 0 {
+	if !reflect.DeepEqual(got.UpstreamPipelines, []string{"upstream"}) {
 		t.Fatalf("upstreams = %v", got.UpstreamPipelines)
 	}
 
-	upstreamSpec, err := pipeline.Load([]byte("name: downstream\nrepo: owner/repo\ntrigger:\n  kind: pipeline\n  pipeline: upstream\nstages:\n  - id: check\n    cmd: echo ok\n"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	upstreamRequirements := derivePipelineBundleRequirements(upstreamSpec, nil)
-	if !reflect.DeepEqual(upstreamRequirements.UpstreamPipelines, []string{"upstream"}) {
-		t.Fatalf("upstreams = %v", upstreamRequirements.UpstreamPipelines)
-	}
 }
 
 func TestParsePipelineAgentMappings(t *testing.T) {
@@ -272,7 +302,7 @@ func TestPipelineBundleMissingRuntimeNamesAgent(t *testing.T) {
 	manifest := validPipelineBundleManifestForTest(t, []byte(bundleSpecForTest))
 	manifest.Agents = []pipelineBundleAgent{{Name: "reviewer", Runtime: runtime.CodexRuntime}}
 	manifest.Requirements.Runtimes = []string{runtime.CodexRuntime}
-	report := inspectPipelineBundleRequirements(context.Background(), store, paths, home, manifest, nil)
+	report := inspectPipelineBundleRequirements(context.Background(), store, manifest, nil)
 	if len(report.AgentErrors) != 1 || !strings.Contains(report.AgentErrors[0].Error(), `agent "reviewer" requires missing runtime "codex"`) {
 		t.Fatalf("agent errors = %v", report.AgentErrors)
 	}
@@ -292,7 +322,7 @@ func validPipelineBundleManifestForTest(t *testing.T, raw []byte) pipelineBundle
 		GitmootVersionMin: "0.1.0",
 		Pipeline:          "bundle-test",
 		Repo:              pipelineBundleRepoParameter,
-		Requirements:      pipelineBundleRequirements{Runtimes: []string{runtime.ShellRuntime}, Connections: []pipelineBundleConnection{}, UpstreamPipelines: []string{}},
+		Requirements:      pipelineBundleRequirements{Runtimes: []string{runtime.ShellRuntime}, UpstreamPipelines: []string{}},
 		Warnings:          []string{},
 		WriteAuthority:    []string{},
 		Agents:            []pipelineBundleAgent{},

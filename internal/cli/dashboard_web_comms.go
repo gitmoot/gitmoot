@@ -411,7 +411,6 @@ button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{heig
     <span class="crumb-divider"></span>
     <span class="crumb"><span>dashboard</span><span>›</span><b>Comms</b></span><span class="spacer"></span>
     <div class="gm-header-actions">
-      <span class="gm-aplink"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 13l7-9-1 6h4l-7 9 1-6z"/></svg><span>Activepieces</span><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 17L17 7M9 7h8v8"/></svg></span>
       <span class="daemon-label" id="daemon-label">daemon</span>
       <span class="daemon-state" id="daemon-state"><span class="daemon-dot"></span><span class="daemon-status" id="daemon-status">LIVE</span></span>
     </div>

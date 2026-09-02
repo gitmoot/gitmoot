@@ -968,9 +968,8 @@ existing import flow unchanged. `spec.yaml` is the stored pipeline text with onl
 `__GITMOOT_REPO__` parameter; comments, ordering, block scalars, and other bytes
 survive. Referenced custom templates are canonical snapshots produced by the same
 export path as `agent template export`. Template prompts are verbatim, so inspect
-them before publishing. Trigger bindings, tokens, Activepieces
-credentials, and local environment values are never copied; only connection
-`kind`/`name` requirements are listed.
+them before publishing. Local environment values and runtime state are never
+copied.
 
 Import always prints its requirements report. Use `--agent-map exported=local`
 for a machine-local agent/session, or omit it to install the embedded template and
@@ -1024,8 +1023,7 @@ latest groom run, so no historical or disabled-period runs backfill. If ingest
 is already active, its cursor does not move and it fires after settlement.
 Pipeline-trigger cycles are rejected at add time. A missing or later-removed
 upstream is allowed but leaves the downstream dormant and visibly marked
-`(upstream missing)`. Pipeline triggers are local database state and never use
-Activepieces; `pipeline bind-trigger` is an informational no-op for them.
+`(upstream missing)`. Pipeline triggers use local database state.
 
 A stage prints a `gitmoot_result` blob to stdout to signal its decision; the
 advancer folds by that **decision**, never the job's exit state:
@@ -1264,47 +1262,3 @@ pipeline stage job, so a pipeline can never fan out into a delegation tree. Reac
 for an orchestra (a coordinator returning `delegations[]`) when you want dynamic,
 model-driven decomposition; reach for a pipeline when the steps and their wiring are
 known up front. See `../../../docs/pipelines.md` for the full reference.
-
-## Gmail -> Pipeline (Activepieces)
-
-Activepieces holds all Gmail credentials and forwards mail into the published
-gitmoot piece. The piece calls `gitmoot bridge serve`, which is a local,
-bearer-token HTTP seam. Activepieces must run on the same box as the bridge;
-Activepieces Cloud cannot reach it. From Docker use
-`http://host.docker.internal:8791` or a Linux bridge address such as
-`http://172.17.0.1:8791`. Linux Compose needs
-`extra_hosts: ["host.docker.internal:host-gateway"]`.
-
-| Path | Needs | Browser consent | Best for |
-|---|---|---|---|
-| App password (default) | 2-Step Verification and app passwords allowed | No OAuth consent | Simple self-hosted or headless setup |
-| Own OAuth app | Google Cloud project, Gmail API, OAuth client | Once; Testing tokens expire after 7 days | OAuth-required accounts |
-| Workspace service account | Workspace admin and domain-wide delegation | No | Fully headless managed mailboxes |
-
-For the default path, enable 2-Step Verification, generate the 16-character app
-password at `https://myaccount.google.com/apppasswords`, and create these
-Activepieces connections using the full email address as the username and the
-app password as the password:
-
-- IMAP trigger: `imap.gmail.com:993`, SSL
-- SMTP action: `smtp.gmail.com:465`, SSL (`587` with STARTTLS also works)
-
-This needs no Google Cloud project and no OAuth consent. For your own OAuth app,
-enable the Gmail API, create an External consent screen and Web-application
-client, then authorize `https://<your-ap>/redirect`. The value derives from
-`AP_FRONTEND_URL`; copy the exact redirect shown by Activepieces. For Workspace
-service accounts, enable domain-wide delegation and have a super administrator
-grant `https://www.googleapis.com/auth/gmail.send`,
-`https://www.googleapis.com/auth/gmail.readonly`, and
-`https://www.googleapis.com/auth/gmail.compose`. In Activepieces choose
-**Service Account (Advanced)**, paste the JSON key, and set **User Email** to
-the Workspace mailbox to impersonate.
-
-Wire the Gmail or IMAP new-email trigger to `run_pipeline` with
-`pipeline_name`, or use `ask_agent` with `agent`, `message`, and the required
-`repo`. The target pipeline must be enabled; the bridge rejects `run_pipeline`
-for disabled pipelines. Configure the piece's CustomAuth with `bridge_url` and `bridge_token`.
-If the flow prepares a reply, default to **Create Draft** and never auto-send
-without explicit operator opt-in.
-
-See `../../../docs/gmail.md` for the full setup and troubleshooting guide.

@@ -70,7 +70,7 @@ func TestStoreOpenPolicy(t *testing.T) {
 		"TestMemoryMigrationCreatesTables":                                       true,
 		"TestMigrateAddsExecBackendAttempts":                                     true,
 		"TestMigrateAddsPipelinesToUpgradedDB":                                   true,
-		"TestMigrateAddsTriggerBindingToExistingPipeline":                        true,
+		"TestMigrateDropsTriggerBindingFromExistingPipeline":                     true,
 		"TestMigrateAppendsAgentInstanceAutonomyPolicy":                          true,
 		"TestMigrateAppendsRootKilled":                                           true,
 		"TestMigrateAppendsTaskWorktreePath":                                     true,

@@ -455,14 +455,9 @@ func parsePipelineRemoteListing(directoryName string, manifestRaw []byte) (pipel
 func pipelineRemoteRequirementsLine(requirements pipelineBundleRequirements) string {
 	runtimes := append([]string(nil), requirements.Runtimes...)
 	sort.Strings(runtimes)
-	connections := make([]string, 0, len(requirements.Connections))
-	for _, connection := range requirements.Connections {
-		connections = append(connections, connection.Kind+"/"+connection.Name)
-	}
-	sort.Strings(connections)
 	upstreams := append([]string(nil), requirements.UpstreamPipelines...)
 	sort.Strings(upstreams)
-	return fmt.Sprintf("requirements: runtimes=%s; connections=%s; upstreams=%s", listOrNone(runtimes), listOrNone(connections), listOrNone(upstreams))
+	return fmt.Sprintf("requirements: runtimes=%s; upstreams=%s", listOrNone(runtimes), listOrNone(upstreams))
 }
 
 func listOrNone(values []string) string {

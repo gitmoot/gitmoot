@@ -135,7 +135,7 @@ func TestCleanupObligationsRebuildPreservesLegacyRows(t *testing.T) {
 // test would pass on precisely the mutant it exists to kill.
 func TestMigrationsUpgradeFromPreviousReleasedVersion(t *testing.T) {
 	ctx := context.Background()
-	const branchMigrationMarker = "ALTER TABLE agent_template_versions DROP COLUMN canary_sample"
+	const branchMigrationMarker = "DROP COLUMN trigger_binding"
 	branchIndex := -1
 	for index, migration := range migrations {
 		if strings.Contains(migration, branchMigrationMarker) {
@@ -190,6 +190,13 @@ func TestMigrationsUpgradeFromPreviousReleasedVersion(t *testing.T) {
 	}
 	if final != len(migrations) {
 		t.Fatalf("upgraded version = %d, want %d", final, len(migrations))
+	}
+	var retiredColumnCount int
+	if err := upgraded.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('pipelines') WHERE name = 'trigger_binding'`).Scan(&retiredColumnCount); err != nil {
+		t.Fatalf("inspect upgraded pipelines columns: %v", err)
+	}
+	if retiredColumnCount != 0 {
+		t.Fatalf("trigger_binding column count = %d, want 0", retiredColumnCount)
 	}
 	now := time.Now().UTC()
 	if _, err := upgraded.DeferCleanupObligation(ctx, "job-upgraded", "/tmp/managed/upgraded", CleanupReasonUnpublishedCommits, now, now.Add(time.Minute)); err != nil {

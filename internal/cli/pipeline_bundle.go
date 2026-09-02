@@ -18,7 +18,6 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
 	"github.com/gitmoot/gitmoot/internal/buildinfo"
-	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
@@ -54,10 +53,12 @@ type pipelineBundleManifest struct {
 
 type pipelineBundleRequirements struct {
 	Runtimes          []string                   `yaml:"runtimes"`
-	Connections       []pipelineBundleConnection `yaml:"connections"`
+	Connections       []pipelineBundleConnection `yaml:"connections,omitempty"`
 	UpstreamPipelines []string                   `yaml:"upstream_pipelines"`
 }
 
+// pipelineBundleConnection is decode-only compatibility for bundle version 1.
+// New bundles omit this removed email integration requirement.
 type pipelineBundleConnection struct {
 	Kind string `yaml:"kind"`
 	Name string `yaml:"name"`
@@ -255,14 +256,9 @@ func derivePipelineBundleRequirements(spec pipeline.Spec, agents []pipelineBundl
 		runtimes = append(runtimes, name)
 	}
 	sort.Strings(runtimes)
-	requirements := pipelineBundleRequirements{Runtimes: runtimes, Connections: []pipelineBundleConnection{}, UpstreamPipelines: []string{}}
+	requirements := pipelineBundleRequirements{Runtimes: runtimes, UpstreamPipelines: []string{}}
 	if spec.Trigger != nil {
-		switch spec.Trigger.Kind {
-		case "email":
-			requirements.Connections = append(requirements.Connections, pipelineBundleConnection{Kind: "email", Name: spec.Trigger.Connection})
-		case "pipeline":
-			requirements.UpstreamPipelines = append(requirements.UpstreamPipelines, spec.Trigger.Pipeline)
-		}
+		requirements.UpstreamPipelines = append(requirements.UpstreamPipelines, spec.Trigger.Pipeline)
 	}
 	return requirements
 }
@@ -345,10 +341,10 @@ func runPipelineImport(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "pipeline import: %v\n", err)
 		return 1
 	}
-	if err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
+	if err := withStore(*home, func(store *db.Store) error {
 		ctx := context.Background()
 		reportManifest := pipelineBundleReportManifest(manifest, raw)
-		report := inspectPipelineBundleRequirements(ctx, store, paths, *home, reportManifest, agentMap)
+		report := inspectPipelineBundleRequirements(ctx, store, reportManifest, agentMap)
 		printPipelineBundleRequirements(stdout, report, reportManifest)
 		if err := validatePipelineBundle(manifest, raw, buildinfo.Current().Version); err != nil {
 			return err
@@ -395,6 +391,9 @@ func validatePipelineBundle(manifest pipelineBundleManifest, raw []byte, current
 	}
 	if err := requirePipelineBundleVersion(manifest.GitmootVersionMin, currentVersion); err != nil {
 		return err
+	}
+	if len(manifest.Requirements.Connections) != 0 {
+		return errors.New("bundle manifest requires removed email connections")
 	}
 	if manifest.Pipeline == "" || !pipelineBundleToken.MatchString(manifest.Pipeline) {
 		return fmt.Errorf("bundle manifest pipeline %q is not a name-safe token", manifest.Pipeline)
@@ -484,15 +483,8 @@ func countPipelineBundleAgents(spec pipeline.Spec) int {
 }
 
 func equalPipelineBundleRequirements(left, right pipelineBundleRequirements) bool {
-	if !stringSlicesEqual(left.Runtimes, right.Runtimes) || !stringSlicesEqual(left.UpstreamPipelines, right.UpstreamPipelines) || len(left.Connections) != len(right.Connections) {
-		return false
-	}
-	for i := range left.Connections {
-		if left.Connections[i] != right.Connections[i] {
-			return false
-		}
-	}
-	return true
+	return stringSlicesEqual(left.Runtimes, right.Runtimes) &&
+		stringSlicesEqual(left.UpstreamPipelines, right.UpstreamPipelines)
 }
 
 func stringSlicesEqual(left, right []string) bool {
@@ -509,14 +501,13 @@ func stringSlicesEqual(left, right []string) bool {
 
 type pipelineBundleRequirementReport struct {
 	Runtimes    map[string]string
-	Connections map[string]string
 	Upstreams   map[string]string
 	AgentErrors []error
 	MapErrors   []error
 }
 
-func inspectPipelineBundleRequirements(ctx context.Context, store *db.Store, paths config.Paths, home string, manifest pipelineBundleManifest, agentMap map[string]string) pipelineBundleRequirementReport {
-	report := pipelineBundleRequirementReport{Runtimes: map[string]string{}, Connections: map[string]string{}, Upstreams: map[string]string{}}
+func inspectPipelineBundleRequirements(ctx context.Context, store *db.Store, manifest pipelineBundleManifest, agentMap map[string]string) pipelineBundleRequirementReport {
+	report := pipelineBundleRequirementReport{Runtimes: map[string]string{}, Upstreams: map[string]string{}}
 	for _, name := range manifest.Requirements.Runtimes {
 		if pipelineBundleRuntimeAvailable(name) {
 			report.Runtimes[name] = "present"
@@ -533,10 +524,6 @@ func inspectPipelineBundleRequirements(ctx context.Context, store *db.Store, pat
 		} else {
 			report.Upstreams[requirement] = "missing (pipeline will remain dormant)"
 		}
-	}
-	for _, requirement := range manifest.Requirements.Connections {
-		key := requirement.Kind + "/" + requirement.Name
-		report.Connections[key] = inspectPipelineBundleConnection(ctx, paths, home, requirement)
 	}
 	agentByName := make(map[string]pipelineBundleAgent, len(manifest.Agents))
 	for _, agent := range manifest.Agents {
@@ -559,34 +546,9 @@ func inspectPipelineBundleRequirements(ctx context.Context, store *db.Store, pat
 	return report
 }
 
-func inspectPipelineBundleConnection(ctx context.Context, paths config.Paths, home string, requirement pipelineBundleConnection) string {
-	if requirement.Name == "" {
-		return "missing (empty name)"
-	}
-	if _, err := os.Stat(activepiecesCredentialsPath(paths.Home)); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return "unchecked (Activepieces is not configured)"
-		}
-		return "unchecked (cannot inspect Activepieces credentials file)"
-	}
-	session, err := openActivepiecesSession(ctx, activepiecesAuthOptions{Home: home})
-	if err != nil {
-		return "unchecked (" + err.Error() + ")"
-	}
-	present, err := session.Client.HasConnection(ctx, session.Token, session.ProjectID, requirement.Name)
-	if err != nil {
-		return "unchecked (" + err.Error() + ")"
-	}
-	if present {
-		return "present"
-	}
-	return "missing"
-}
-
 func printPipelineBundleRequirements(w io.Writer, report pipelineBundleRequirementReport, manifest pipelineBundleManifest) {
 	fmt.Fprintln(w, "Requirements report:")
 	printRequirementMap(w, "runtime", report.Runtimes)
-	printRequirementMap(w, "connection", report.Connections)
 	printRequirementMap(w, "upstream pipeline", report.Upstreams)
 	if len(manifest.WriteAuthority) == 0 {
 		fmt.Fprintln(w, "  write authority: none")

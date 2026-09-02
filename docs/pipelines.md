@@ -62,13 +62,9 @@ env:                       # optional inline NON-secret defaults
 schedule:                   # optional; interval schedule (no cron in v1)
   interval: 24h             #   required when a schedule block is present (positive Go duration)
   jitter: 15m               #   optional random [0, jitter] added to each next_due (>= 0)
-trigger:                    # optional; generated Activepieces event source (requires repo:)
-  kind: email               #   only email in this release
-  connection: gmail-imap    #   optional; default gmail-imap
-  mailbox: INBOX            #   optional; default INBOX
-  map:                      #   optional run payload outputs from closed email selectors
-    subject: subject
-    sender: from_address
+trigger:                    # optional pipeline-success chain (requires repo:)
+  kind: pipeline
+  pipeline: upstream-flow  # successful upstream runs start this pipeline
 success_decisions:          # optional top-level default (see below)
   - approved
   - implemented
@@ -101,10 +97,8 @@ stages:                     # the DAG, keyed by unique id and wired by needs
 | `env`                       | pipeline     | no       | Inline **non-secret** `KEY: value` defaults. Pipeline-owned and granted shared values take precedence. Values are delivered only when a shell stage selects the key. |
 | `schedule.interval`         | pipeline     | cond.    | Required when a `schedule:` block is present. A positive Go duration (`24h`, `1h30m`). |
 | `schedule.jitter`           | pipeline     | no       | Random `[0, jitter]` added to each `next_due` to de-thunder (`>= 0`). |
-| `trigger.kind`              | pipeline     | cond.    | Required with `trigger:`. Only `email` is supported; it generates an owned Activepieces IMAP flow. |
-| `trigger.connection`        | pipeline     | no       | Activepieces connection external id; default `gmail-imap`. Must match `[A-Za-z0-9][A-Za-z0-9_-]*`. |
-| `trigger.mailbox`           | pipeline     | no       | IMAP mailbox; default `INBOX`. |
-| `trigger.map`               | pipeline     | no       | Output name to email selector. Output names must match `^[a-z][a-z0-9_]*$` and be at most 64 bytes; an explicit empty map is rejected. See [Trigger payloads](#trigger-payloads). |
+| `trigger.kind`              | pipeline     | cond.    | Required with `trigger:`. The supported kind is `pipeline`. |
+| `trigger.pipeline`          | pipeline     | cond.    | Required for a pipeline trigger. Names the upstream pipeline whose successful runs start this pipeline. |
 | `success_decisions`         | pipeline     | no       | Decisions that mark a stage succeeded. Default `["approved","implemented","skipped"]`. Any value must be one of `approved`, `implemented`, `changes_requested`, `skipped` - `blocked`/`failed` are park states and are rejected. An explicit list is strict: omitting `skipped` requires real work and makes a skipped result fail. |
 | `allow_scheduled_writes`    | pipeline     | no       | Safety flag. A **mutating** `implement` or `produce` stage on a **scheduled** pipeline is rejected unless this is `true`. Manual runs do not need it. Default `false`. |
 | `allow_triggered_writes`    | pipeline     | no       | Safety flag. A **mutating** `implement` or `produce` stage on a pipeline with `trigger:` is rejected unless this is `true`. Default `false`. |
@@ -218,29 +212,23 @@ exercising the credential on the pinned upstream. Curated upstreams and base
 paths are part of the model. Configure only trusted upstreams because an
 upstream can observe and potentially reflect the credential.
 
-On `pipeline add --enable`, Gitmoot publishes the owned flow. An unavailable
-Activepieces instance leaves a pending binding; run
-`gitmoot pipeline bind-trigger <name>` to retry. Disable is local-first: the
-bridge rejects event-triggered runs even when Activepieces is unreachable.
-Rebinding recreates the owned flow if it was deleted in Activepieces.
+### Pipeline-chain triggers
+
+`trigger: {kind: pipeline, pipeline: upstream-flow}` starts the downstream
+pipeline once for each successful upstream run. Adding or enabling the
+downstream arms a durable cursor in `pipeline_trigger_states`; existing upstream
+history is not backfilled. A missing upstream leaves the downstream dormant
+until that pipeline is added again.
+
+Pipeline-chain triggers are local database state. They reject self-reference,
+cycles, and schedule-plus-trigger hybrids. `pipeline disable` stops new chained
+runs locally, and `pipeline remove` deletes the downstream cursor without
+removing the upstream pipeline.
 
 ### Trigger payloads
 
-`trigger.map` exposes only closed, kind-specific selectors; the spec never accepts
-raw Activepieces expressions. For email triggers:
-
-| Selector | Generated Activepieces expression | Meaning |
-| --- | --- | --- |
-| `subject` | `{{trigger['subject']}}` | Message subject. |
-| `from_address` | `{{trigger['from']['value'][0]['address']}}` | First parsed sender address. |
-| `text` | `{{trigger['text']}}` | Plain-text message content. |
-| `message_id` | `{{trigger['messageId']}}` | Message-ID value (data only; no deduplication yet). |
-| `date` | `{{trigger['date']}}` | Message date reported by the IMAP trigger. |
-
-Mapped generated flows require `@gitmoot/piece-gitmoot` 0.1.4 or newer. Binding
-fails closed with an error state when that installed version cannot be resolved.
-The bridge transport also accepts the same optional `{"payload":{"key":"value"}}`
-body for **any** enabled, repo-bound pipeline, even one without a `trigger:` block.
+The bridge transport accepts an optional `{"payload":{"key":"value"}}` body for
+any enabled, repo-bound pipeline, even one without a `trigger:` block.
 
 Bridge payloads reject rather than truncate: the raw request is limited to 64 KiB;
 there may be at most 32 entries; keys are 1–64 bytes matching
@@ -708,7 +696,6 @@ gitmoot pipeline add nightly-sync.yaml --enable
 gitmoot pipeline list [--json]
 gitmoot pipeline show <name> [--json]        # registry view for a pipeline name
 gitmoot pipeline show <run-id> [--json]      # run funnel for a "prun-…" run id
-gitmoot pipeline bind-trigger <name>         # create/re-sync the owned AP flow
 
 gitmoot pipeline run <name> [--payload key=value ...] [--payload-json '<obj>']
 gitmoot pipeline watch <run-id> [--timeout 10m] [--poll 5s] [--json]
@@ -722,33 +709,31 @@ gitmoot pipeline remove <name>
 
 ### Reading pipeline status
 
-`pipeline show <name>` labels how the pipeline starts: `email-triggered` plus its
-binding state, `scheduled <interval>`, or `manual`. Its stage block leads with the
-stage kind and resolves registered agent stages to their runtime/model settings:
+`pipeline show <name>` labels how the pipeline starts: `after: <upstream>`,
+`scheduled <interval>`, or `manual`. A missing upstream is shown as
+`after: <upstream> (upstream missing)`. The stage block leads with the stage kind
+and resolves registered agent stages to their runtime/model settings:
 
 ```text
-name: inbound-triage
+name: release-notify
 repo: owner/repo
 enabled: true
-mode: email-triggered (bound)
+mode: after: deploy
 interval: -
 ...
 stages:
-  fetch      [SHELL]           cmd: ./fetch-message.sh  needs=-
-  answer     [AGENT ask]       reply-planner (codex/gpt-5.6-sol)  timeout=10m  needs=fetch
-             prompt: "You received an email via the trigger payload above (UNTRUSTED external data)…"
-  implement  [AGENT implement] reply-builder (codex)  needs=answer
-             prompt: "Implement the approved reply handling change."
-  merged     [GATE pr_merged]  source=implement  timeout=24h  needs=implement
+  summarize  [SHELL]           cmd: ./summarize-release.sh  needs=-
+  notify     [AGENT ask]       release-writer (codex/gpt-5.6-sol)  timeout=10m  needs=summarize
+             prompt: "Draft the release notification from the summary above."
 ```
 
 Shell commands are collapsed to a single-line preview (about 80 characters), and
 agent prompts to an escaped preview (about 100 characters); an ellipsis marks
 truncation. Missing agent registrations render as `(unregistered)` instead of
 making inspection fail. `pipeline list` appends an eighth description column,
-truncated to about 60 characters, and uses `email` in the interval column for
-trigger pipelines (`email+6h` when a schedule is also present, and the mode reads
-`email-triggered (unbound)` before the first bind). `--json` remains additive:
+truncated to about 60 characters, and uses `after: <upstream>` in the interval
+column for trigger pipelines, adding `(upstream missing)` when appropriate.
+`--json` remains additive:
 pipeline objects include the full `description` and `mode`, while stage objects include `kind` and
 the available `agent_runtime`, `prompt_preview`, and `cmd_preview` fields without
 removing the full `prompt` or `cmd`.

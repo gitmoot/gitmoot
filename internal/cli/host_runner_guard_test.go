@@ -27,10 +27,6 @@ type hostRunnerSite struct {
 }
 
 var hostRunnerAllowlist = map[string]hostRunnerAllowance{
-	"internal/cli/activepieces.go:ensureActivepiecesBridge": {
-		rawCommands: 1,
-		reason:      "operator command starts the detached local Activepieces bridge process",
-	},
 	"internal/cli/agent.go:<package>": {
 		execRunners: 1,
 		reason:      "operator-side agent doctor uses a replaceable local-runtime probe seam",

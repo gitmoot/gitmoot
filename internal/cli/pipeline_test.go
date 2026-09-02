@@ -15,33 +15,30 @@ import (
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 )
 
-func TestPipelineAddEnabledTriggerPersistsPendingBinding(t *testing.T) {
+func TestStoredEmailTriggerRejectedByPipelineEntryPoints(t *testing.T) {
 	t.Parallel()
 	home := t.TempDir()
-	specFile := writeSpec(t, "name: mail-flow\nrepo: owner/repo\ntrigger:\n  kind: email\nstages:\n  - {id: run, cmd: echo ok}\n")
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{"pipeline", "add", specFile, "--enable", "--home", home}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("pipeline add exit=%d stderr=%s", code, stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "pipeline bind-trigger mail-flow") {
-		t.Fatalf("missing actionable pending warning: %s", stderr.String())
-	}
+	const specYAML = "name: mail-flow\nrepo: owner/repo\ntrigger:\n  kind: email\nstages:\n  - {id: run, cmd: echo ok}\n"
 	if err := withStore(home, func(store *db.Store) error {
-		rec, ok, err := store.GetPipeline(context.Background(), "mail-flow")
-		if err != nil || !ok {
-			return fmt.Errorf("GetPipeline: ok=%v err=%v", ok, err)
-		}
-		binding, err := decodeTriggerBinding(rec.TriggerBinding)
-		if err != nil {
-			return err
-		}
-		if !rec.Enabled || binding.State != triggerBindingPending || binding.BindingID == "" {
-			return fmt.Errorf("record=%+v binding=%+v", rec, binding)
-		}
-		return nil
+		return store.CreateOrUpdatePipeline(context.Background(), db.Pipeline{
+			Name:     "mail-flow",
+			Repo:     "owner/repo",
+			SpecYAML: specYAML,
+			SpecHash: pipeline.Hash([]byte(specYAML)),
+			Enabled:  true,
+		})
 	}); err != nil {
 		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"pipeline", "run", "mail-flow", "--home", home},
+		{"pipeline", "enable", "mail-flow", "--home", home},
+	} {
+		var stdout, stderr bytes.Buffer
+		code := Run(args, &stdout, &stderr)
+		if code == 0 || !strings.Contains(stderr.String(), "supported kind: pipeline") {
+			t.Fatalf("%v exit=%d stdout=%s stderr=%s", args, code, stdout.String(), stderr.String())
+		}
 	}
 }
 
@@ -95,7 +92,7 @@ func TestPipelineAddListShowEnableDisableRemove(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("list exit=%d stderr=%s", code, errOut)
 	}
-	columns := strings.Split(strings.TrimSpace(out), "\t")
+	columns := strings.Split(strings.TrimSuffix(out, "\n"), "\t")
 	if len(columns) != 7 || columns[0] != "deploy-flow" || columns[1] != "enabled" || columns[2] != "24h" || columns[3] != "gitmoot/gitmoot" || columns[4] != "gitmoot/gitmoot" {
 		t.Fatalf("list stdout=%q", out)
 	}
@@ -148,7 +145,6 @@ func TestPipelineAddListShowEnableDisableRemove(t *testing.T) {
 
 func TestPipelineDisplayMode(t *testing.T) {
 	t.Parallel()
-	triggerSpec := "name: mail\nrepo: owner/repo\ntrigger: {kind: email}\nstages:\n  - {id: run, cmd: echo}\n"
 	pipelineTriggerSpec := "name: downstream\nrepo: owner/downstream\ntrigger: {kind: pipeline, pipeline: upstream}\nstages:\n  - {id: run, cmd: echo}\n"
 	scheduledSpec := "name: nightly\nschedule: {interval: 24h}\nstages:\n  - {id: run, cmd: echo}\n"
 	manualSpec := "name: manual\nstages:\n  - {id: run, cmd: echo}\n"
@@ -157,10 +153,6 @@ func TestPipelineDisplayMode(t *testing.T) {
 		record db.Pipeline
 		want   string
 	}{
-		{name: "trigger bound", record: db.Pipeline{SpecYAML: triggerSpec, TriggerBinding: `{"state":"bound"}`}, want: "email-triggered (bound)"},
-		{name: "trigger pending", record: db.Pipeline{SpecYAML: triggerSpec, TriggerBinding: `{"state":"pending"}`}, want: "email-triggered (pending)"},
-		{name: "trigger never bound", record: db.Pipeline{SpecYAML: triggerSpec}, want: "email-triggered (unbound)"},
-		{name: "trigger plus schedule hybrid", record: db.Pipeline{SpecYAML: "name: both\nrepo: owner/repo\ntrigger: {kind: email}\nschedule: {interval: 6h}\nstages:\n  - {id: run, cmd: echo}\n", TriggerBinding: `{"state":"bound"}`, Interval: "6h"}, want: "email-triggered (bound), scheduled 6h"},
 		{name: "pipeline trigger", record: db.Pipeline{SpecYAML: pipelineTriggerSpec}, want: "after: upstream"},
 		{name: "schedule", record: db.Pipeline{SpecYAML: scheduledSpec, Interval: "24h"}, want: "scheduled 24h"},
 		{name: "neither", record: db.Pipeline{SpecYAML: manualSpec}, want: "manual"},
@@ -309,7 +301,7 @@ stages:
 		t.Fatalf("unexpected gate JSON: %+v", got)
 	}
 
-	triggerSpec := writeSpec(t, "name: mail-flow\nrepo: owner/repo\ntrigger: {kind: email}\nstages:\n  - {id: run, cmd: echo}\n")
+	triggerSpec := writeSpec(t, "name: chained-flow\nrepo: owner/repo\ntrigger: {kind: pipeline, pipeline: upstream}\nstages:\n  - {id: run, cmd: echo}\n")
 	if code := Run([]string{"pipeline", "add", triggerSpec, "--home", home}, &bytes.Buffer{}, &bytes.Buffer{}); code != 0 {
 		t.Fatalf("add trigger pipeline exit=%d", code)
 	}
@@ -322,19 +314,19 @@ stages:
 	foundDisplay := false
 	for _, row := range rows {
 		columns := strings.Split(row, "\t")
-		if len(columns) != 8 {
+		if len(columns) != 7 {
 			t.Fatalf("pipeline list changed column count: row=%q", row)
 		}
-		if columns[0] == "mail-flow" {
+		if columns[0] == "chained-flow" {
 			foundTrigger = true
-			if columns[2] != "email" {
-				t.Fatalf("trigger pipeline interval column = %q, want email", columns[2])
+			if columns[2] != "after: upstream (upstream missing)" {
+				t.Fatalf("trigger pipeline interval column = %q, want missing-upstream state", columns[2])
 			}
 			if columns[4] != "owner/repo" {
 				t.Fatalf("trigger pipeline group column = %q, want repo fallback", columns[4])
 			}
-			if columns[7] != "" {
-				t.Fatalf("trigger pipeline description column = %q, want empty", columns[7])
+			if columns[6] != "" {
+				t.Fatalf("trigger pipeline description column = %q, want empty", columns[6])
 			}
 		}
 		if columns[0] == "display-flow" {
@@ -345,8 +337,8 @@ stages:
 			if columns[4] != "Product Operations" {
 				t.Fatalf("explicit pipeline group column = %q, want Product Operations", columns[4])
 			}
-			if columns[7] != "Coordinates product operations. Preserves the declared stage…" {
-				t.Fatalf("pipeline description column = %q, want truncated description", columns[7])
+			if columns[6] != "Coordinates product operations. Preserves the declared stage…" {
+				t.Fatalf("pipeline description column = %q, want truncated description", columns[6])
 			}
 		}
 	}
@@ -544,18 +536,9 @@ func TestPipelineRunnerNameCollisionRefused(t *testing.T) {
 	}
 }
 
-// Reviewer-required pins: hybrid list value, multibyte-safe previews, and the
-// orchestrate/produce badges (previously untested).
-func TestPipelineListIntervalHybridKeepsInterval(t *testing.T) {
+// Pipeline-chain trigger display includes its upstream and missing state.
+func TestPipelineListIntervalPipelineTrigger(t *testing.T) {
 	t.Parallel()
-	hybrid := db.Pipeline{SpecYAML: "name: both\nrepo: owner/repo\ntrigger: {kind: email}\nschedule: {interval: 6h}\nstages:\n  - {id: run, cmd: echo}\n", Interval: "6h"}
-	if got := pipelineListInterval(hybrid); got != "email+6h" {
-		t.Fatalf("hybrid list interval = %q, want %q", got, "email+6h")
-	}
-	triggerOnly := db.Pipeline{SpecYAML: "name: mail\nrepo: owner/repo\ntrigger: {kind: email}\nstages:\n  - {id: run, cmd: echo}\n"}
-	if got := pipelineListInterval(triggerOnly); got != "email" {
-		t.Fatalf("trigger-only list interval = %q, want %q", got, "email")
-	}
 	pipelineTrigger := db.Pipeline{SpecYAML: "name: downstream\nrepo: owner/downstream\ntrigger: {kind: pipeline, pipeline: upstream}\nstages:\n  - {id: run, cmd: echo}\n"}
 	if got := pipelineListInterval(pipelineTrigger); got != "after: upstream" {
 		t.Fatalf("pipeline-trigger list interval = %q", got)
