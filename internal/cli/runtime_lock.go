@@ -17,6 +17,36 @@ import (
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
+// parseLockStatusTime parses a stored resource-lock timestamp, accepting the three
+// layouts the store writes across its history (RFC3339 with and without fractional
+// seconds, and SQLite's CURRENT_TIMESTAMP form). ok=false for an empty or
+// unparseable value, so a malformed row reads as "no deadline" rather than as an
+// expired one. It moved here from the SkillOpt train command deleted in #1752.
+func parseLockStatusTime(value string) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05"} {
+		parsed, err := time.Parse(layout, value)
+		if err == nil {
+			return parsed, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// lockOwnerPIDLive reports whether a lock's recorded owner PID is a live process on
+// THIS host. A non-positive pid or any probe error reads as not-live. It moved here
+// from the SkillOpt lock commands deleted in #1752.
+func lockOwnerPIDLive(pid int64) bool {
+	if pid <= 0 {
+		return false
+	}
+	running, err := processRunning(int(pid))
+	return err == nil && running
+}
+
 // acquireRuntimeSessionLock acquires the per-job runtime-session lock and returns
 // a release closure, whether it was acquired, the resource key, the owner token
 // recorded on the lock, and any error. The owner token is surfaced so the caller
@@ -177,7 +207,7 @@ func runtimeSessionHeldByLiveOwner(ctx context.Context, store *db.Store, agent r
 		return false, "", err
 	}
 	now := time.Now().UTC()
-	if expiresAt, parsed := parseSkillOptStatusTime(lock.ExpiresAt); parsed && !expiresAt.After(now) {
+	if expiresAt, parsed := parseLockStatusTime(lock.ExpiresAt); parsed && !expiresAt.After(now) {
 		// Lease expired: stale and self-clearing on the next acquire — proceed.
 		return false, "", nil
 	}
@@ -189,7 +219,7 @@ func runtimeSessionHeldByLiveOwner(ctx context.Context, store *db.Store, agent r
 		hostText = "this host"
 	}
 	switch {
-	case sameHost && lock.OwnerPID > 0 && skillOptOwnerPIDLive(lock.OwnerPID):
+	case sameHost && lock.OwnerPID > 0 && lockOwnerPIDLive(lock.OwnerPID):
 		// Live same-host owner: refuse — restarting would clobber a live session.
 		return true, fmt.Sprintf("held by pid %d on %s", lock.OwnerPID, hostText), nil
 	case sameHost:
@@ -219,7 +249,7 @@ func runtimeOwnerLeaseHeld(ctx context.Context, store *db.Store, jobID string, n
 	thisHost, _ := os.Hostname()
 	// excludeOwnerToken is "" — recovery runs from a daemon tick/startup that holds
 	// no runtime-session lock of its own, so there is nothing to exclude.
-	liveness, err := store.JobRuntimeLockLiveness(ctx, jobID, now, thisHost, skillOptOwnerPIDLive, "")
+	liveness, err := store.JobRuntimeLockLiveness(ctx, jobID, now, thisHost, lockOwnerPIDLive, "")
 	if err != nil {
 		return false, err
 	}

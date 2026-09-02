@@ -36,7 +36,6 @@ const sidebars: SidebarsConfig = {
         'workflows/activepieces-setup-workflow',
         'workflows/gmail-pipeline-workflow',
         'workflows/chat-workflow',
-        'workflows/skillopt-train-workflow',
       ],
     },
     {
@@ -65,7 +64,6 @@ const sidebars: SidebarsConfig = {
         'reference/remote-exec',
         'reference/result-contract',
         'reference/event-stream',
-        'reference/skillopt-exchange-contract',
       ],
     },
     {

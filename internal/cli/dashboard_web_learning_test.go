@@ -18,23 +18,25 @@ import (
 	"github.com/gitmoot/gitmoot/internal/memory"
 )
 
-// reviewScoreSeed pins a candidate-review score (the nullable REAL column, carried
-// as *float64) on a template version so Skills() can surface it.
-func reviewScoreSeed(t *testing.T, store *db.Store, templateID, versionID string, score float64) {
-	t.Helper()
-	s := score
-	if err := store.UpsertAgentTemplateCandidateReview(context.Background(), db.AgentTemplateCandidateReview{
-		VersionID: versionID, TemplateID: templateID, Score: &s,
-	}); err != nil {
-		t.Fatalf("UpsertAgentTemplateCandidateReview %s: %v", versionID, err)
-	}
-}
+// This file covers the two Learning-page DataSource methods the pinned
+// gitmoot-dashboard module requires: Skills (agent-template version history) and
+// Knowledge (the memory brain graph).
+//
+// The Knowledge tests below are unchanged by #1752 — the memory graph never had
+// anything to do with the SkillOpt loop. The Skills test WAS rewritten: the loop
+// owned per-version scores, in-flight canaries and pending candidates, so those
+// fields are now always zero and the seed builds its version history through the
+// surviving write paths (UpsertAgentTemplate mints a new current version;
+// RevertAgentTemplateVersion is the only way the newest version is not the
+// current one).
 
-// seedSkillTemplates builds two templates exercising the Skills view: "planner"
-// evolves v1(superseded)->v2(current)->v3(pending)->v4(canary) with scored reviews;
-// "helper" is a single current version with no pending. Two agents point at planner
-// (one via an @latest ref, to prove the reference split) and one at helper.
-func seedSkillTemplates(t *testing.T, home string) (v3ID string) {
+// seedSkillTemplates installs two templates: "planner" with a three-version
+// history whose CURRENT version is v2 (v3 exists but was reverted away from), and
+// single-version "helper". It also registers agents against both, including one
+// pinned with an @latest ref and one template-less agent, so the
+// agents-per-template grouping is exercised. It returns planner's newest
+// (non-current) version id.
+func seedSkillTemplates(t *testing.T, home string) (newestID string) {
 	t.Helper()
 	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
@@ -45,42 +47,31 @@ func seedSkillTemplates(t *testing.T, home string) (v3ID string) {
 
 	base := db.AgentTemplate{ID: "planner", Name: "Planner", Content: "v1"}
 	if err := store.UpsertAgentTemplate(ctx, base); err != nil {
-		t.Fatalf("UpsertAgentTemplate planner: %v", err)
+		t.Fatalf("UpsertAgentTemplate planner v1: %v", err)
 	}
-	tmpl, err := store.GetAgentTemplate(ctx, "planner")
-	if err != nil {
-		t.Fatalf("GetAgentTemplate planner: %v", err)
-	}
-	reviewScoreSeed(t, store, "planner", tmpl.VersionID, 0.60) // v1
-
 	v2 := base
 	v2.Content = "v2"
-	v2v, err := store.AddPendingAgentTemplateVersion(ctx, v2)
+	if err := store.UpsertAgentTemplate(ctx, v2); err != nil {
+		t.Fatalf("UpsertAgentTemplate planner v2: %v", err)
+	}
+	v2Version, err := store.GetLatestAgentTemplateVersion(ctx, "planner")
 	if err != nil {
-		t.Fatalf("AddPending v2: %v", err)
+		t.Fatalf("resolve planner v2: %v", err)
 	}
-	reviewScoreSeed(t, store, "planner", v2v.ID, 0.70)
-	if _, err := store.PromoteAgentTemplateVersion(ctx, v2v.ID); err != nil {
-		t.Fatalf("Promote v2: %v", err)
-	}
-
 	v3 := base
 	v3.Content = "v3"
-	v3v, err := store.AddPendingAgentTemplateVersion(ctx, v3)
-	if err != nil {
-		t.Fatalf("AddPending v3: %v", err)
+	if err := store.UpsertAgentTemplate(ctx, v3); err != nil {
+		t.Fatalf("UpsertAgentTemplate planner v3: %v", err)
 	}
-	reviewScoreSeed(t, store, "planner", v3v.ID, 0.81)
-	v3ID = v3v.ID
-
-	v4 := base
-	v4.Content = "v4"
-	v4v, err := store.AddPendingAgentTemplateVersion(ctx, v4)
+	newest, err := store.GetLatestAgentTemplateVersion(ctx, "planner")
 	if err != nil {
-		t.Fatalf("AddPending v4: %v", err)
+		t.Fatalf("resolve planner v3: %v", err)
 	}
-	if _, err := store.CanaryPromoteAgentTemplateVersion(ctx, v4v.ID, 0.15); err != nil {
-		t.Fatalf("Canary v4: %v", err)
+	newestID = newest.VersionID
+	// Revert to v2 so the template's CURRENT version is not its newest row — the
+	// case that proves CurrentVersion follows current_version_id, not recency.
+	if _, err := store.RevertAgentTemplateVersion(ctx, "planner", v2Version.VersionID); err != nil {
+		t.Fatalf("RevertAgentTemplateVersion planner -> v2: %v", err)
 	}
 
 	if err := store.UpsertAgentTemplate(ctx, db.AgentTemplate{ID: "helper", Name: "Helper", Content: "h1"}); err != nil {
@@ -97,23 +88,19 @@ func seedSkillTemplates(t *testing.T, home string) (v3ID string) {
 			t.Fatalf("UpsertAgent %s: %v", a.Name, err)
 		}
 	}
-	return v3ID
+	return newestID
 }
 
-func approxEq(a, b float64) bool {
-	d := a - b
-	if d < 0 {
-		d = -d
-	}
-	return d < 1e-9
-}
-
-// TestWebDataSourceSkills asserts Skills() maps the version history + scores,
-// resolves the current/canary state, extracts pending candidates, groups the
-// agents-per-template, and sorts pending-first.
+// TestWebDataSourceSkills asserts Skills() still maps every template's real
+// version history, resolves the current version through current_version_id (not
+// recency), groups agents per template, and keeps its ordering contract
+// (LastPromotedAt desc, TemplateID asc on a tie). It also pins the post-#1752 contract that the candidate/canary
+// fields are zero and Pending is empty but NON-NIL: those fields remain in the
+// pinned dashboard module's response shape, and a nil slice would marshal as JSON
+// null and break a client that iterates it.
 func TestWebDataSourceSkills(t *testing.T) {
 	home := dashboardTestHome(t)
-	v3ID := seedSkillTemplates(t, home)
+	newestID := seedSkillTemplates(t, home)
 
 	ds := &webDataSource{home: home}
 	skills, err := ds.Skills(context.Background())
@@ -124,29 +111,45 @@ func TestWebDataSourceSkills(t *testing.T) {
 	if len(skills.Templates) != 2 {
 		t.Fatalf("templates = %d, want 2: %+v", len(skills.Templates), skills.Templates)
 	}
-	// Pending-first: planner (has a pending candidate) before helper.
-	planner := skills.Templates[0]
-	helper := skills.Templates[1]
-	if planner.TemplateID != "planner" || helper.TemplateID != "helper" {
-		t.Fatalf("template order = %s,%s, want planner,helper (pending-first)", planner.TemplateID, helper.TemplateID)
+	byID := map[string]dashboard.SkillTemplate{}
+	for _, tmpl := range skills.Templates {
+		byID[tmpl.TemplateID] = tmpl
+	}
+	planner, ok := byID["planner"]
+	if !ok {
+		t.Fatalf("planner missing: %+v", skills.Templates)
+	}
+	helper, ok := byID["helper"]
+	if !ok {
+		t.Fatalf("helper missing: %+v", skills.Templates)
+	}
+	// Documented order: LastPromotedAt descending, TemplateID ascending on a tie.
+	// Asserted as the invariant rather than a fixed sequence, because both seeds
+	// promote inside the same CURRENT_TIMESTAMP second and would otherwise make
+	// this test depend on clock granularity.
+	for i := 1; i < len(skills.Templates); i++ {
+		prev, cur := skills.Templates[i-1], skills.Templates[i]
+		if prev.LastPromotedAt < cur.LastPromotedAt {
+			t.Fatalf("templates not sorted by LastPromotedAt desc: %s(%d) before %s(%d)", prev.TemplateID, prev.LastPromotedAt, cur.TemplateID, cur.LastPromotedAt)
+		}
+		if prev.LastPromotedAt == cur.LastPromotedAt && prev.TemplateID > cur.TemplateID {
+			t.Fatalf("tied templates not sorted by TemplateID asc: %s before %s", prev.TemplateID, cur.TemplateID)
+		}
 	}
 
-	// Current resolution (current_version_id) + canary fields.
+	// Current resolution follows current_version_id, NOT the newest row.
 	if planner.CurrentVersion != 2 || planner.CurrentState != "current" {
 		t.Fatalf("planner current = v%d/%q, want v2/current", planner.CurrentVersion, planner.CurrentState)
 	}
-	if !approxEq(planner.CanarySample, 0.15) || planner.CanaryStartedAt <= 0 {
-		t.Fatalf("planner canary = sample %v started %d, want 0.15 / >0", planner.CanarySample, planner.CanaryStartedAt)
-	}
 	if planner.LastPromotedAt <= 0 {
-		t.Fatalf("planner LastPromotedAt = %d, want > 0 (v2 promotion)", planner.LastPromotedAt)
+		t.Fatalf("planner LastPromotedAt = %d, want > 0", planner.LastPromotedAt)
 	}
 
-	// Version history ascending by number, with the store's real states + scores.
-	if len(planner.Versions) != 4 {
-		t.Fatalf("planner versions = %d, want 4: %+v", len(planner.Versions), planner.Versions)
+	// Full history, ascending, carrying each row's real state.
+	if len(planner.Versions) != 3 {
+		t.Fatalf("planner versions = %d, want 3: %+v", len(planner.Versions), planner.Versions)
 	}
-	wantState := []string{"superseded", "current", "pending", "canary"}
+	wantState := []string{"superseded", "current", "superseded"}
 	for i, v := range planner.Versions {
 		if v.Number != i+1 {
 			t.Fatalf("versions[%d].Number = %d, want %d (ascending)", i, v.Number, i+1)
@@ -155,47 +158,90 @@ func TestWebDataSourceSkills(t *testing.T) {
 			t.Fatalf("versions[%d].State = %q, want %q", i, v.State, wantState[i])
 		}
 	}
-	for i, want := range []float64{0.60, 0.70, 0.81} {
-		if !planner.Versions[i].HasScore || !approxEq(planner.Versions[i].Score, want) {
-			t.Fatalf("versions[%d] score = %v (has %v), want %v", i, planner.Versions[i].Score, planner.Versions[i].HasScore, want)
-		}
-	}
-	if planner.Versions[3].HasScore {
-		t.Fatalf("canary v4 must be unscored (mid-canary, no review), got %v", planner.Versions[3].Score)
+	if newestID == "" {
+		t.Fatal("seed returned no newest version id")
 	}
 
-	// Pending candidate carries the review's raw score string.
-	if len(planner.Pending) != 1 {
-		t.Fatalf("planner pending = %d, want 1: %+v", len(planner.Pending), planner.Pending)
-	}
-	cand := planner.Pending[0]
-	if cand.VersionID != v3ID || cand.Number != 3 || cand.Score != "0.81" {
-		t.Fatalf("pending candidate = %+v, want {%s, 3, 0.81}", cand, v3ID)
-	}
-
-	// Agents-per-template, sorted, with the @latest ref normalized to the base id.
-	if len(planner.Agents) != 2 || planner.Agents[0] != "planner-agent" || planner.Agents[1] != "planner-two" {
-		t.Fatalf("planner agents = %v, want [planner-agent planner-two]", planner.Agents)
+	// Agents grouped per template; the template-less agent belongs to neither.
+	if len(planner.Agents) != 2 || !containsString(planner.Agents, "planner-agent") || !containsString(planner.Agents, "planner-two") {
+		t.Fatalf("planner agents = %v, want planner-agent and planner-two (an @latest ref splits to the base id)", planner.Agents)
 	}
 	if len(helper.Agents) != 1 || helper.Agents[0] != "helper-agent" {
 		t.Fatalf("helper agents = %v, want [helper-agent]", helper.Agents)
 	}
-
-	// helper: single current version, no pending, no canary.
-	if helper.CurrentVersion != 1 || len(helper.Pending) != 0 || helper.CanarySample != 0 {
-		t.Fatalf("helper = v%d pending%d canary%v, want v1/0/0", helper.CurrentVersion, len(helper.Pending), helper.CanarySample)
+	if helper.CurrentVersion != 1 {
+		t.Fatalf("helper current = v%d, want v1", helper.CurrentVersion)
 	}
 
-	// Rollups.
-	if skills.ActiveCanaries != 1 || skills.PendingTotal != 1 {
-		t.Fatalf("rollups = canaries%d pending%d, want 1/1", skills.ActiveCanaries, skills.PendingTotal)
+	// #1752: the candidate/canary layer is gone, so these are always zero — and
+	// Pending must be an empty slice, never nil.
+	for _, tmpl := range skills.Templates {
+		if tmpl.Pending == nil {
+			t.Fatalf("%s Pending is nil; it must serialize as an empty JSON array", tmpl.TemplateID)
+		}
+		if len(tmpl.Pending) != 0 || tmpl.CanarySample != 0 || tmpl.CanaryStartedAt != 0 {
+			t.Fatalf("%s still reports candidate/canary state: %+v", tmpl.TemplateID, tmpl)
+		}
+		for i, v := range tmpl.Versions {
+			if v.HasScore || v.Score != 0 {
+				t.Fatalf("%s versions[%d] carries a score %v; the review layer that produced scores is gone", tmpl.TemplateID, i, v.Score)
+			}
+		}
+	}
+	if skills.ActiveCanaries != 0 || skills.PendingTotal != 0 {
+		t.Fatalf("rollups = canaries%d pending%d, want 0/0", skills.ActiveCanaries, skills.PendingTotal)
 	}
 }
 
-// seedKnowledge seeds confirmed facts across enrolled + unenrolled owners, an
-// observation pool (for witness counts), and one superseded chain (set directly,
-// since no production write path populates superseded_by). It returns the row ids
-// of the older and newer facts of that chain.
+// TestSkillTemplateFromVersionsSortsAscending feeds the mapper DESCENDING version
+// rows so the ascending-order contract depends on the defensive sort rather than on
+// the store's ORDER BY. Going through the store path cannot test this:
+// ListAgentTemplateVersions always returns ascending, so the sort is unobservable
+// there and deleting it would leave an end-to-end test green.
+//
+// Deleting the sort.SliceStable in skillTemplateFromVersions fails this test.
+func TestSkillTemplateFromVersionsSortsAscending(t *testing.T) {
+	tmpl := db.AgentTemplate{ID: "planner", Name: "Planner", VersionNumber: 2, VersionState: "current"}
+	descending := []db.AgentTemplateVersion{
+		{VersionNumber: 3, State: "superseded"},
+		{VersionNumber: 2, State: "current"},
+		{VersionNumber: 1, State: "superseded"},
+	}
+
+	st := skillTemplateFromVersions(tmpl, []string{"planner-agent"}, descending)
+
+	if len(st.Versions) != 3 {
+		t.Fatalf("versions = %d, want 3: %+v", len(st.Versions), st.Versions)
+	}
+	for i, v := range st.Versions {
+		if v.Number != i+1 {
+			t.Fatalf("versions[%d].Number = %d, want %d; descending input must be sorted ascending", i, v.Number, i+1)
+		}
+	}
+	// The states must travel with their own version, not be re-paired by the sort.
+	if st.Versions[1].State != "current" {
+		t.Fatalf("versions[1].State = %q, want current (state must follow its version through the sort)", st.Versions[1].State)
+	}
+	// Shuffled (not merely reversed) input sorts too.
+	shuffled := []db.AgentTemplateVersion{
+		{VersionNumber: 2, State: "current"},
+		{VersionNumber: 3, State: "superseded"},
+		{VersionNumber: 1, State: "superseded"},
+	}
+	st = skillTemplateFromVersions(tmpl, nil, shuffled)
+	for i, v := range st.Versions {
+		if v.Number != i+1 {
+			t.Fatalf("shuffled versions[%d].Number = %d, want %d", i, v.Number, i+1)
+		}
+	}
+	// A nil version list still yields the initialized empty slices the dashboard
+	// contract requires (the fail-open path buildSkillTemplate uses on a read error).
+	st = skillTemplateFromVersions(tmpl, nil, nil)
+	if st.Versions == nil || len(st.Versions) != 0 || st.Pending == nil {
+		t.Fatalf("nil versions must still initialize Versions and Pending: %+v", st)
+	}
+}
+
 func seedKnowledge(t *testing.T, home string) (oldID, newID int64) {
 	t.Helper()
 	paths := config.PathsForHome(home)

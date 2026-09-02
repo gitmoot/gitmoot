@@ -2822,7 +2822,6 @@ func (w jobWorker) queueTempWorkerMergeBack(ctx context.Context, completedJobID 
 		},
 	}
 	mailbox := workflow.NewMailbox(w.Store, workflow.UnavailableDeliveryWorktreeResolver("temporary worker merge-back enqueue"))
-	mailbox.CanaryEnabled = canaryRoutingEnabled(w.workflowHome())
 	mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(w.workflowHome())
 	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(w.workflowHome())
 	mailbox.OrgPolicy = orgPolicyResolver(w.workflowHome())

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -1031,28 +1030,6 @@ func replaceAgentTemplateFetcher(fetcher agenttemplate.Fetcher) func() {
 	}
 	return func() {
 		newAgentTemplateFetcher = previous
-	}
-}
-
-func replaceSkillOptTrainInitInteractive(interactive bool) func() {
-	previous := skillOptTrainInitInteractive
-	active := true
-	skillOptTrainInitInteractive = func() bool {
-		return active && interactive
-	}
-	return func() {
-		active = false
-		skillOptTrainInitInteractive = previous
-	}
-}
-
-func replaceSkillOptTrainInitStdin(input string) func() {
-	previous := skillOptTrainInitStdin
-	skillOptTrainInitStdin = func() io.Reader {
-		return strings.NewReader(input)
-	}
-	return func() {
-		skillOptTrainInitStdin = previous
 	}
 }
 

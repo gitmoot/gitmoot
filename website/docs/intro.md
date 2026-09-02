@@ -31,11 +31,9 @@ context in one file.
   `gitmoot agent prompt <agent-or-template>`.
 - Track jobs, branch locks, goals, tasks, reviews, and merges locally.
 - Open `gitmoot dashboard`, an interactive TUI cockpit with pages for Attention,
-  Activity (live orchestras), Trains, Agents, Workers, Jobs, Locks, Health, and
+  Activity (live orchestras), Agents, Workers, Jobs, Locks, Health, and
   Config (pending prompts live under Attention) — or `gitmoot dashboard --web`
   for a read-only browser view of a running orchestration.
-- Run SkillOpt training loops that collect human feedback, call the external
-  optimizer, and keep promotion decisions explicit.
 
 ## How It Works
 
@@ -51,8 +49,6 @@ flowchart TD
   Runtime --> Kimi[Kimi Code]
   Runtime --> Shell[Shell]
   Daemon --> GitHub[GitHub issues and PRs]
-  CLI --> SkillOpt[SkillOpt train workflow]
-  SkillOpt --> Optimizer[gitmoot-skillopt]
 ```
 
 Codex, Claude Code, Kimi Code, omp, and the legacy `kimi-cli` are the runtimes
@@ -68,6 +64,5 @@ flowchart LR
   Workflows --> Reference[Reference]
   Reference --> Operations[Operations]
   Start --> Plugins[Codex and Claude plugins]
-  Workflows --> SkillOpt[SkillOpt train]
   Reference --> CLI[CLI and dashboard]
 ```

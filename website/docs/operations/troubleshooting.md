@@ -454,74 +454,6 @@ echo "$TERM"
 Fix: run from a real terminal for the interactive TUI, or use `--plain` /
 `--json` in agents, CI, pipes, and redirected output.
 
-## SkillOpt Optimizer Missing
-
-Symptom: `gitmoot skillopt train continue` reaches optimizer handoff and
-reports `blocked_config` or missing `gitmoot-skillopt`.
-
-Likely cause: the separate Python optimizer is not installed or is not on
-`PATH`.
-
-Check:
-
-```sh
-gitmoot-skillopt --version
-gitmoot-skillopt optimize --help
-gitmoot skillopt train status --session <session-id> --verbose
-```
-
-Fix:
-
-```sh
-python3 -m pip install --user pipx
-python3 -m pipx ensurepath
-pipx install https://github.com/jerryfane/gitmoot-skillopt/releases/download/v0.4.2/gitmoot_skillopt-0.4.2-py3-none-any.whl
-gitmoot-skillopt --version
-gitmoot-skillopt optimize --help
-```
-
-For a virtualenv install, pass `--skillopt-bin /path/to/gitmoot-skillopt`.
-
-## SkillOpt Dependency Or Credential Failure
-
-Symptom: optimizer preflight starts but fails before producing a candidate.
-
-Likely cause: missing Python dependency, backend/model credentials, evaluator
-configuration, or writable output directory.
-
-Check:
-
-```sh
-gitmoot skillopt train status --session <session-id> --verbose
-gitmoot-skillopt optimize --help
-```
-
-Fix: install the missing dependency, configure the required backend credential
-through user-owned environment/config, and restart any daemon or runtime that
-must inherit the environment. Do not commit secrets.
-
-## Train Session Recoverable
-
-Symptom: verbose status reports `status_phase: recovery_available`.
-
-Likely cause: optimizer wrote completed artifacts but the wrapper failed before
-Gitmoot imported the result.
-
-Check:
-
-```sh
-gitmoot skillopt train status --session <session-id> --verbose
-```
-
-Fix:
-
-```sh
-gitmoot skillopt train recover --session <session-id> --out-root <optimizer-output-root>
-```
-
-Recovery validates artifacts and imports either a completed candidate or a
-completed no-candidate result through the normal gate.
-
 ## Live Docs Or LLM Context Stale
 
 Symptom: `gitmoot.io/docs` or `/llms.txt` does not show current source docs.
@@ -535,7 +467,7 @@ Check:
 cd website
 npm run build
 curl -fsS https://gitmoot.io/docs/reference/cli | rg 'gitmoot dashboard'
-curl -fsS https://gitmoot.io/llms.txt | rg 'SkillOpt|Dashboard|Release Notes'
+curl -fsS https://gitmoot.io/llms.txt | rg 'Dashboard|Release Notes'
 ```
 
 Fix: deploy the current static build with delete semantics:

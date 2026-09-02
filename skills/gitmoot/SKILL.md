@@ -318,44 +318,6 @@ events, labels, and a fingerprint marker for duplicate detection. After
 creation, tell the user the printed issue URL; if Gitmoot reused an existing
 issue, report that URL as existing instead of new.
 
-For SkillOpt template learning, prefer the high-level
-`gitmoot skillopt train start/status/continue/stop` workflow when the user wants
-Gitmoot to enforce the full feedback, optimizer, candidate-review, and
-promotion loop. Use low-level `gitmoot skillopt review`, `feedback`, `export`,
-`import`, and `candidate` commands for advanced/debug work or when recovering a
-specific step. In train mode, collect enough ranked feedback and trait notes
-before optimizer handoff, check `gitmoot-skillopt --version` and
-`gitmoot-skillopt optimize --help` when optimizer-backed continue is needed,
-keep promotion decisions explicit, and start follow-up iterations only through
-`train continue --start-next`. Generation is durable: each review item's
-artifacts and options commit in one transaction the moment that item finishes,
-so an interrupted phase resumes idempotently when you re-run `train continue` —
-already-complete items are skipped and never duplicated, while an item with some
-but not all options persisted returns a hard error to inspect or clear before
-continuing. For optimizer-phase recovery, use
-`gitmoot skillopt train recover --session <id> [--out-root path] [--json]`,
-which re-imports or repairs the optimizer candidate package and classifies the
-iteration; it does not release the generation lock or rebuild generation
-options. To improve the *judge's rubric* (not the model) from accumulated human
-feedback, run `gitmoot skillopt rubric induce --template <id>` — an offline,
-deterministic tool that induces a criterion-separated rubric from captured
-trait feedback, meta-evaluates it for coverage/redundancy, and writes a frozen
-JSON for human review; it never auto-injects. To generate Autodata-style
-synthetic review items, use the explicit, off-by-default `gitmoot skillopt synth
---template <id> --repo owner/repo --strong <agent> [--weak <agent>] [--judge
-<agent>]`: `--weak` is optional and defaults to the template's current champion
-version (#741), so accepted items are by construction champion weaknesses. It
-keeps only items a strong agent beats the weak agent on and a judge
-deems well-formed, stores them `pending_human_approval`, and requires
-`gitmoot skillopt synth approve <item-id>` before an item may be used — nothing
-runs it automatically. Opt-in `--diversity-quota N` may salvage up to N
-human-gated, non-discriminating `too_easy` diversity items, but only when a slot
-exhausts every refinement round without producing a discriminating item. It
-keeps the most recent well-formed `too_easy` candidate and never displaces a
-discriminating item. Opt-in `--novelty-injection` may weave one shared, confirmed,
-repo-visible fact from outside the guidance anchor's memory cluster into each
-Challenger prompt; it safely no-ops when no eligible clustered fact exists.
-
 For complete command examples, read [CLI.md](references/CLI.md).
 For end-to-end workflows, read [WORKFLOWS.md](references/WORKFLOWS.md).
 For current-chat template capture, read

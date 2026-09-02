@@ -42,5 +42,4 @@ Pay special attention to changes that touch:
 - GitHub CLI token usage and PR/issue writes
 - daemon job routing, branch locks, and merge gates
 - runtime adapter command execution
-- SkillOpt package import/export and artifact path validation
 - local config, SQLite state, logs, and generated files

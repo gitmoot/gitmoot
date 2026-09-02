@@ -57,17 +57,6 @@ func TestDashboardConfigProjectionAllowlist(t *testing.T) {
 		"memory.pipelines.ingest_sweep",
 		"memory.pipelines.ingest_sweep_jitter",
 		"orchestrate.blocked_ttl",
-		"skillopt.auto_promote",
-		"skillopt.auto_promote_canary",
-		"skillopt.auto_promote_require_external_ci",
-		"skillopt.auto_promote_require_measured_judge",
-		"skillopt.auto_trace_enabled",
-		"skillopt.cross_family_review_enabled",
-		"skillopt.deterministic_checkers_enabled",
-		"skillopt.gate_enabled",
-		"skillopt.hard_verifiers_enabled",
-		"skillopt.mode_b_judge_enabled",
-		"skillopt.pace_enabled",
 		"workflow.implement_base",
 	}
 
@@ -95,7 +84,6 @@ func TestDashboardConfigProjectionAllowlist(t *testing.T) {
 	defaults := dashboardConfigSettings{
 		memory: config.DefaultMemorySettings(), chat: config.DefaultChatSettings(),
 		orchestrate: config.DefaultOrchestratePolicy(), github: config.DefaultGitHubLimiterPolicy(),
-		skillopt: config.DefaultSkillOptPolicy(),
 	}
 	if first, second := projectDashboardConfig(defaults, defaults), projectDashboardConfig(defaults, defaults); !reflect.DeepEqual(first, second) {
 		t.Fatal("unchanged config projection is not deterministic")

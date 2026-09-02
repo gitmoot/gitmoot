@@ -95,7 +95,7 @@ func runDaemonStartWithWorkDirRestart(args []string, workDir string, _ bool, _ b
 		fmt.Fprintf(stderr, "daemon start: warning: could not bootstrap runtime auth: %v\n", err)
 	}
 
-	started, err := startDaemonChildFn(cfg.Home, cfg.Poll.String(), cfg.Workers, cfg.WatchSkillOptReviews, cfg.WatchIssues, cfg.Scheduler, cfg.RepoFlag, cfg.Session, state, resolvedWorkDir)
+	started, err := startDaemonChildFn(cfg.Home, cfg.Poll.String(), cfg.Workers, cfg.WatchIssues, cfg.Scheduler, cfg.RepoFlag, cfg.Session, state, resolvedWorkDir)
 	if err != nil {
 		fmt.Fprintf(stderr, "daemon start: %v\n", err)
 		return 1
@@ -154,7 +154,6 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	poll := fs.Duration("poll", 30*time.Second, "poll interval")
 	workers := fs.Int("workers", 1, "worker count")
 	dryRun := fs.Bool("dry-run", false, "run without mutating external systems")
-	watchSkillOptReviews := fs.Bool("watch-skillopt-reviews", false, "poll watched SkillOpt review issue comments and import valid feedback")
 	watchIssues := fs.Bool("watch-issues", false, "poll open issues and route @<agent> ask comments to jobs (#389)")
 	scheduler := fs.String("scheduler", "barrier", "queued-job scheduler: barrier (default) or pool (#394 opt-in continuous worker pool)")
 	parallel := fs.Int("parallel", 0, "run jobs in parallel: sets --workers N and --scheduler pool together (#444)")
@@ -340,7 +339,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	}
 
 	if *repoFlag == "" {
-		err := runRegisteredRepoSupervisor(ctx, *home, live, *dryRun, *watchSkillOptReviews, *watchIssues, session, stdout)
+		err := runRegisteredRepoSupervisor(ctx, *home, live, *dryRun, *watchIssues, session, stdout)
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return 0
 		}
@@ -436,7 +435,6 @@ func newSingleRepoSupervisorDaemon(
 		},
 		WatchIssues:             watchIssues,
 		EscalationTTL:           resolveEscalationTTL(rawHome),
-		RevertDetectionEnabled:  resolveRevertDetectionEnabled(rawHome),
 		ObservePermissionPolicy: resolvePermissionPolicyObservationEnabled(rawHome),
 		AutoMergeEnabled:        autoMergeEnabledResolver(rawHome),
 	}
@@ -926,24 +924,22 @@ type daemonMeta struct {
 }
 
 type daemonStartConfig struct {
-	Home                         string
-	RepoFlag                     string
-	Repo                         github.Repository
-	RepoSet                      bool
-	Session                      string
-	ExplicitSession              bool
-	Poll                         time.Duration
-	Workers                      int
-	ExplicitStartConfig          bool
-	ExplicitRepo                 bool
-	ExplicitPoll                 bool
-	ExplicitWorkers              bool
-	WatchSkillOptReviews         bool
-	ExplicitWatchSkillOptReviews bool
-	WatchIssues                  bool
-	ExplicitWatchIssues          bool
-	Scheduler                    string
-	ExplicitScheduler            bool
+	Home                string
+	RepoFlag            string
+	Repo                github.Repository
+	RepoSet             bool
+	Session             string
+	ExplicitSession     bool
+	Poll                time.Duration
+	Workers             int
+	ExplicitStartConfig bool
+	ExplicitRepo        bool
+	ExplicitPoll        bool
+	ExplicitWorkers     bool
+	WatchIssues         bool
+	ExplicitWatchIssues bool
+	Scheduler           string
+	ExplicitScheduler   bool
 }
 
 const daemonHelp = -1
@@ -958,7 +954,6 @@ func parseDaemonStartConfig(command string, args []string, stderr io.Writer) (da
 	fs.StringVar(&session, "root", "", "alias for --session")
 	poll := fs.Duration("poll", 30*time.Second, "poll interval")
 	workers := fs.Int("workers", 1, "worker count")
-	watchSkillOptReviews := fs.Bool("watch-skillopt-reviews", false, "poll watched SkillOpt review issue comments and import valid feedback")
 	watchIssues := fs.Bool("watch-issues", false, "poll open issues and route @<agent> ask comments to jobs (#389)")
 	scheduler := fs.String("scheduler", "barrier", "queued-job scheduler: barrier (default) or pool (#394 opt-in continuous worker pool)")
 	parallel := fs.Int("parallel", 0, "run jobs in parallel: sets --workers N and --scheduler pool together (#444)")
@@ -973,14 +968,13 @@ func parseDaemonStartConfig(command string, args []string, stderr io.Writer) (da
 		return daemonStartConfig{}, 2
 	}
 	cfg := daemonStartConfig{
-		Home:                 *home,
-		RepoFlag:             *repoFlag,
-		Session:              session,
-		Poll:                 *poll,
-		Workers:              *workers,
-		WatchSkillOptReviews: *watchSkillOptReviews,
-		WatchIssues:          *watchIssues,
-		Scheduler:            *scheduler,
+		Home:        *home,
+		RepoFlag:    *repoFlag,
+		Session:     session,
+		Poll:        *poll,
+		Workers:     *workers,
+		WatchIssues: *watchIssues,
+		Scheduler:   *scheduler,
 	}
 	explicitParallel := false
 	fs.Visit(func(f *flag.Flag) {
@@ -996,9 +990,6 @@ func parseDaemonStartConfig(command string, args []string, stderr io.Writer) (da
 			cfg.ExplicitStartConfig = true
 		case "workers":
 			cfg.ExplicitWorkers = true
-			cfg.ExplicitStartConfig = true
-		case "watch-skillopt-reviews":
-			cfg.ExplicitWatchSkillOptReviews = true
 			cfg.ExplicitStartConfig = true
 		case "watch-issues":
 			cfg.ExplicitWatchIssues = true
@@ -1161,9 +1152,6 @@ func overlayDaemonStartArgs(args []string, cfg daemonStartConfig) []string {
 	}
 	if cfg.ExplicitWorkers {
 		args = withDaemonFlagArg(args, "workers", strconv.Itoa(cfg.Workers))
-	}
-	if cfg.ExplicitWatchSkillOptReviews {
-		args = withDaemonBoolFlagArg(args, "watch-skillopt-reviews", cfg.WatchSkillOptReviews)
 	}
 	if cfg.ExplicitWatchIssues {
 		args = withDaemonBoolFlagArg(args, "watch-issues", cfg.WatchIssues)
@@ -1579,7 +1567,7 @@ func currentDaemonPIDWithProbe(state daemonState, probe func(int, string) (strin
 	return pid, false, nil
 }
 
-func startDaemonChild(home string, poll string, workers int, watchSkillOptReviews bool, watchIssues bool, scheduler string, repo string, session string, state daemonState, workDir string) (daemonMeta, error) {
+func startDaemonChild(home string, poll string, workers int, watchIssues bool, scheduler string, repo string, session string, state daemonState, workDir string) (daemonMeta, error) {
 	executable, err := os.Executable()
 	if err != nil {
 		return daemonMeta{}, err
@@ -1589,7 +1577,7 @@ func startDaemonChild(home string, poll string, workers int, watchSkillOptReview
 		return daemonMeta{}, err
 	}
 	defer logFile.Close()
-	args := daemonChildArgs(home, poll, workers, watchSkillOptReviews, watchIssues, scheduler, repo, session)
+	args := daemonChildArgs(home, poll, workers, watchIssues, scheduler, repo, session)
 	cmd := exec.Command(executable, args...)
 	cmd.Dir = workDir
 	cmd.Stdout = logFile
@@ -1621,7 +1609,7 @@ func startDaemonChild(home string, poll string, workers int, watchSkillOptReview
 	}, nil
 }
 
-func daemonChildArgs(home string, poll string, workers int, watchSkillOptReviews bool, watchIssues bool, scheduler string, repo string, session string) []string {
+func daemonChildArgs(home string, poll string, workers int, watchIssues bool, scheduler string, repo string, session string) []string {
 	args := []string{"daemon", "run", "--poll", poll, "--workers", strconv.Itoa(workers)}
 	if home != "" {
 		args = append(args, "--home", home)
@@ -1631,9 +1619,6 @@ func daemonChildArgs(home string, poll string, workers int, watchSkillOptReviews
 	}
 	if session != "" {
 		args = append(args, "--session", session)
-	}
-	if watchSkillOptReviews {
-		args = append(args, "--watch-skillopt-reviews")
 	}
 	if watchIssues {
 		args = append(args, "--watch-issues")

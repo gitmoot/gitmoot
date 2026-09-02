@@ -69,10 +69,6 @@ jobs can override it with the same flag. Gitmoot forwards the free-form value as
 `-c model_reasoning_effort=<value>`; omp receives it as `--thinking <level>` when
 it names one of omp's accepted levels; Claude and Kimi ignore it.
 
-### Agents that evolve themselves with SkillOpt
-
-The [SkillOpt](https://github.com/gitmoot/gitmoot-skillopt) loop turns real usage into better agents: job traces feed an optimizer, candidate prompt versions run behind a canary with automatic rollback, and promotion stays a human decision. Blind A/B review, ranked exploration, and GitHub-based feedback collection are built in, so your review agent from last month keeps getting sharper without hand-tuning prompts.
-
 ### Built for unattended runs
 
 Checkout, branch, and runtime-session locks; per-root token and dollar budgets; boot-id crash recovery that reclaims jobs and locks the moment a reboot proves their owner dead; `task recover` for salvaging a dead implementer's half-finished work; `job kill` for whole delegation trees; paused trees that @-mention you on the PR with the exact resume command. Overnight is the normal case, not the demo case.
@@ -156,7 +152,7 @@ Built-in coordinator recipes turn the Orchestra pattern into one command:
 - **Producer vs. checker**: one implementation leg, one independent read-only verification on a different runtime.
   `gitmoot orchestrate lead "Implement the rate limiter and prove it works." --repo owner/repo --recipe verifier`
 
-More workflows: **[coordinator recipes](https://gitmoot.io/docs/workflows/coordinator-recipes-workflow)** · [template capture](https://gitmoot.io/docs/workflows/template-capture-workflow) · [heartbeat schedules](https://gitmoot.io/docs/workflows/heartbeat-schedules-workflow) · [SkillOpt training](https://gitmoot.io/docs/workflows/skillopt-train-workflow) · [events webhook](https://gitmoot.io/docs/reference/event-stream).
+More workflows: **[coordinator recipes](https://gitmoot.io/docs/workflows/coordinator-recipes-workflow)** · [template capture](https://gitmoot.io/docs/workflows/template-capture-workflow) · [heartbeat schedules](https://gitmoot.io/docs/workflows/heartbeat-schedules-workflow) · [events webhook](https://gitmoot.io/docs/reference/event-stream).
 
 ## What's Next
 

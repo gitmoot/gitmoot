@@ -35,7 +35,6 @@ func pipelineStageCheckoutPath(ctx context.Context, store *db.Store, repo string
 // carries no template, so canary never actually samples).
 func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueuer {
 	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("pipeline stage enqueue"))
-	mailbox.CanaryEnabled = canaryRoutingEnabled(home)
 	mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(home)
 	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(home)
 	mailbox.OrgPolicy = orgPolicyResolver(home)

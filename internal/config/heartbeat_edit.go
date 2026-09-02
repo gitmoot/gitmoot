@@ -33,7 +33,7 @@ func SaveHeartbeat(paths Paths, entry Heartbeat) error {
 		return err
 	}
 	editedSection := strings.Join([]string{"agents", entry.Agent, "heartbeats", entry.Name}, ".")
-	editable, err := parseEditableConfig(original, editedSection, true)
+	editable, err := parseEditableConfig(original, editedSection)
 	if err != nil {
 		return err
 	}
@@ -143,7 +143,7 @@ func RemoveHeartbeat(paths Paths, agent, name string) (bool, error) {
 		return false, err
 	}
 	editedSection := strings.Join([]string{"agents", agent, "heartbeats", name}, ".")
-	editable, err := parseEditableConfig(original, editedSection, true)
+	editable, err := parseEditableConfig(original, editedSection)
 	if err != nil {
 		return false, err
 	}

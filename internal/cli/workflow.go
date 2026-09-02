@@ -1378,7 +1378,6 @@ func enqueueTaskRunImplementJob(ctx context.Context, store *db.Store, task db.Ta
 		return db.Job{}, err
 	}
 	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("task run enqueue"))
-	mailbox.CanaryEnabled = canaryRoutingEnabled(home)
 	mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(home)
 	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(home)
 	mailbox.OrgPolicy = fixedOrgPolicy(orgPolicy)

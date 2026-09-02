@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand"
 	"os"
 	"regexp"
 	"strings"
@@ -66,15 +65,6 @@ type Mailbox struct {
 	// constructed or emitted and behavior is byte-identical. The hook is
 	// fire-and-forget — it must never block or fail the finish.
 	emitTerminal func(ctx context.Context, jobID string, state JobState, payload JobPayload)
-	// CanaryRand, when set, is the per-resolution random draw in [0,1) the canary
-	// routing seam uses (#484) so tests can force a deterministic route (0.0 always
-	// hits the canary, a value >= sample always resolves the champion). When nil
-	// (the default, every production construction site) it falls back to the
-	// concurrency-safe global rand.Float64, so concurrent Enqueues each draw
-	// independently and safely. It is ONLY consulted when an active canary row
-	// exists for the resolved template, so when the feature is off the rng is never
-	// drawn and resolution is byte-identical.
-	CanaryRand func() float64
 	// deferBlocker, when set, is the injected PRE-TERMINAL operational-blocker
 	// deferrer (#532 slice E). On a DELIVERY-seam failure (adapter.Deliver errored)
 	// Run consults it BEFORE m.fail: if it re-queues the job (running->queued +
@@ -85,19 +75,6 @@ type Mailbox struct {
 	// byte-identical. The cause it receives is always a DeliveryError so the
 	// classifier's #602 contract gate still refuses agent-authored text.
 	deferBlocker func(ctx context.Context, jobID string, cause error) (bool, error)
-	// CanaryEnabled gates the #484 canary ROUTING seam on the SAME policy the
-	// daemon's regression comparator uses (config.SkillOptPolicy.CanaryEnabled()),
-	// so the two seams turn on and off together. When false (the default, every
-	// construction site that does not opt in) routeCanary returns immediately —
-	// BEFORE the GetActiveCanaryVersion query — so no traffic is sampled, no rng is
-	// drawn, and the hot Enqueue path is byte-identical to before the feature
-	// existed. This is what stops a canary row from outliving the manager: turning
-	// auto_promote_canary off (or unsetting the sample) and restarting the daemon
-	// disables BOTH the comparator (no graduate/rollback) AND routing (no sampled
-	// traffic), so a stranded canary can never keep serving traffic with no
-	// auto-rollback. It is wired true only where the daemon-resolved policy reports
-	// CanaryEnabled().
-	CanaryEnabled bool
 	// injectMemory, when set, returns the "Prior learnings" block (#626) to append
 	// to the rendered job prompt. Nil (default, every path with no enrolled agent)
 	// => byte-identical: no query runs and nothing is appended. It is wired from
@@ -994,72 +971,7 @@ func (m Mailbox) templateSnapshot(ctx context.Context, agentName string) (db.Age
 		}
 		return db.AgentTemplate{}, err
 	}
-	// Canary routing (#484): a sampled fraction of resolutions that WOULD resolve the
-	// champion (the default/current reference, NOT a pinned version) route to the
-	// active canary version instead. The champion `template` resolved above is the
-	// always-valid fallback: any miss, error, or no-canary case returns it unchanged,
-	// so a mid-canary/half-promoted/missing canary or concurrent resolve can NEVER
-	// return no-template or a broken version. Off-by-default: with no canary row the
-	// lookup is one indexed miss, no rng is drawn, and the result is byte-identical.
-	if canary, ok := m.routeCanary(ctx, agent.TemplateID, template); ok {
-		return canary, nil
-	}
 	return template, nil
-}
-
-// routeCanary decides, for one resolution, whether to swap the resolved champion
-// snapshot for the template's active canary version (#484). It returns ok=false
-// (resolve the champion) in EVERY uncertain case — a pinned version reference, no
-// active canary, an out-of-range sample, a draw at/above the sample, or any store
-// error — so the champion (already resolved by the caller) is the guaranteed valid
-// fallback and resolution is never broken. The random draw is taken ONLY when an
-// active canary actually exists, keeping the no-canary path byte-identical.
-func (m Mailbox) routeCanary(ctx context.Context, agentTemplateRef string, champion db.AgentTemplate) (db.AgentTemplate, bool) {
-	// Config gate (#484): routing is gated on the SAME policy the daemon's
-	// regression comparator uses, so the two seams are consistent. When the knob is
-	// off this returns before the GetActiveCanaryVersion query, so no rng is drawn,
-	// no traffic is sampled, and the path is byte-identical — and a canary row left
-	// behind by a since-disabled run can never keep serving traffic with no
-	// auto-rollback.
-	if !m.CanaryEnabled {
-		return db.AgentTemplate{}, false
-	}
-	templateID, versionRef := db.SplitAgentTemplateReference(agentTemplateRef)
-	// Only the default/current resolution participates in the canary; an explicit
-	// version pin (latest / @vN) is honored verbatim.
-	if versionRef != "" && versionRef != "current" {
-		return db.AgentTemplate{}, false
-	}
-	canary, found, err := m.store.GetActiveCanaryVersion(ctx, templateID)
-	if err != nil || !found {
-		return db.AgentTemplate{}, false
-	}
-	sample := canary.CanarySample
-	if sample <= 0 || sample > 1 {
-		return db.AgentTemplate{}, false
-	}
-	if m.canaryDraw() >= sample {
-		return db.AgentTemplate{}, false
-	}
-	// Resolve the canary version's snapshot through the EXISTING reference path
-	// (canary.ID is "templateID@vN"), so its distinct ResolvedCommit/Content flow
-	// into the payload unchanged and the #465 harvester attributes the outcome to
-	// the canary version. A resolve error falls back to the champion (never break).
-	snap, err := m.store.GetAgentTemplateReference(ctx, canary.ID)
-	if err != nil || strings.TrimSpace(snap.VersionID) == "" {
-		return db.AgentTemplate{}, false
-	}
-	return snap, true
-}
-
-// canaryDraw returns a per-resolution random draw in [0,1) for canary routing,
-// using the injected CanaryRand when set (deterministic tests) and the
-// concurrency-safe global rand.Float64 otherwise.
-func (m Mailbox) canaryDraw() float64 {
-	if m.CanaryRand != nil {
-		return m.CanaryRand()
-	}
-	return rand.Float64()
 }
 
 // DeliveryError marks an error that provably originated from the runtime
@@ -1518,7 +1430,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 			if err := m.addEvent(ctx, job.ID, ResultChecksFailedEventKind, summary); err != nil && mode != ResultChecksBlock {
 				return AgentResult{}, err
 			}
-			// Feed-forward stub for SkillOpt (#526): persist the failures so the
+			// Feed-forward stub (#526): persist the failures so the
 			// optimizer can later consume them as structured feedback. Best-effort —
 			// it must never fail the job, and it does nothing tonight beyond storing.
 			rootID := strings.TrimSpace(payload.RootJobID)

@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -21,7 +20,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
-	"github.com/gitmoot/gitmoot/internal/skillopt"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -44,7 +42,6 @@ type dashboardSnapshot struct {
 	Jobs            dashboardJobs           `json:"jobs"`
 	Worktrees       []dashboardWorktree     `json:"worktrees"`
 	BranchLocks     []dashboardBranchLock   `json:"branch_locks"`
-	TrainSessions   []dashboardTrainSession `json:"train_sessions"`
 	ResourceLocks   []dashboardResourceLock `json:"resource_locks"`
 	PendingPrompts  []dashboardPrompt       `json:"pending_prompts"`
 
@@ -58,10 +55,6 @@ type dashboardSnapshot struct {
 	// awaitingHuman carries the tasks paused at awaiting_human (#340) for the
 	// TUI's Attention page. Unexported so --json/--plain stay byte-stable.
 	awaitingHuman []dashboardAwaitingHuman
-	// pendingCandidates carries the SkillOpt template candidates awaiting a
-	// promote/reject decision (#471) for the TUI's Attention page. Unexported so
-	// --json/--plain stay byte-stable.
-	pendingCandidates []dashboardPendingCandidate
 	// daemonDetail carries the persisted daemon flags/workdir and a tail of
 	// recent log errors for the TUI's Health page. Unexported so --json and
 	// the plain renderer stay byte-stable.
@@ -98,14 +91,6 @@ type dashboardAwaitingHuman struct {
 	TaskID string
 	Repo   string
 	Title  string
-}
-
-// dashboardPendingCandidate is one SkillOpt template candidate awaiting a
-// promote/reject decision (#471), shown in the TUI's Attention page.
-type dashboardPendingCandidate struct {
-	VersionID  string
-	TemplateID string
-	Score      string
 }
 
 type dashboardResourceLock struct {
@@ -184,13 +169,6 @@ type dashboardBranchLock struct {
 	Repo   string `json:"repo"`
 	Branch string `json:"branch"`
 	Owner  string `json:"owner,omitempty"`
-}
-
-type dashboardTrainSession struct {
-	ID        string `json:"id"`
-	Phase     string `json:"phase"`
-	Candidate string `json:"candidate_version,omitempty"`
-	Repo      string `json:"repo,omitempty"`
 }
 
 type dashboardPrompt struct {
@@ -419,7 +397,6 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 		ActiveJobs:      []dashboardActiveJob{},
 		Worktrees:       []dashboardWorktree{},
 		BranchLocks:     []dashboardBranchLock{},
-		TrainSessions:   []dashboardTrainSession{},
 		ResourceLocks:   []dashboardResourceLock{},
 		PendingPrompts:  []dashboardPrompt{},
 	}
@@ -556,48 +533,6 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 		for _, lock := range locks {
 			snapshot.BranchLocks = append(snapshot.BranchLocks, dashboardBranchLock{Repo: lock.RepoFullName, Branch: lock.Branch, Owner: lock.Owner})
 		}
-		// Pending SkillOpt candidates awaiting a promote/reject decision (#471), for
-		// the TUI Attention page. Read-only: the existing ListPendingAgentTemplateVersions
-		// + the review row's score, no new query infrastructure.
-		pendingCandidates, err := store.ListPendingAgentTemplateVersions(ctx, "")
-		if err != nil {
-			return err
-		}
-		for _, version := range pendingCandidates {
-			entry := dashboardPendingCandidate{VersionID: version.ID, TemplateID: version.TemplateID}
-			if review, err := store.GetAgentTemplateCandidateReview(ctx, version.ID); err == nil && review.Score != nil {
-				entry.Score = fmt.Sprintf("%.4g", *review.Score)
-			}
-			snapshot.pendingCandidates = append(snapshot.pendingCandidates, entry)
-		}
-		trainSessions, err := store.ListSkillOptTrainSessions(ctx)
-		if err != nil {
-			return err
-		}
-		for _, session := range trainSessions {
-			entry := dashboardTrainSession{ID: session.ID, Phase: session.State, Repo: session.TargetRepo}
-			iteration, err := store.GetLatestSkillOptTrainIteration(ctx, session.ID)
-			switch {
-			case err == nil:
-				summary := skillopt.BuildTrainStatusSummary(session, &iteration, skillopt.TrainStatusCounts{})
-				entry.Phase = summary.CurrentPhase
-				entry.Candidate = summary.CandidateVersion
-				// Override with the live lock-derived phase (e.g. generating_options,
-				// optimizer_running) using the same helper as `train status`.
-				locks, lockErr := skillOptTrainActiveLocks(ctx, store, session.ID, iteration.ID)
-				if lockErr != nil {
-					return lockErr
-				}
-				if phase, ok := skillOptTrainLockPhase(locks); ok {
-					entry.Phase = phase
-				}
-			case errors.Is(err, sql.ErrNoRows):
-				// No iteration yet — keep the session-state fallback.
-			default:
-				return err
-			}
-			snapshot.TrainSessions = append(snapshot.TrainSessions, entry)
-		}
 		resourceLocks, err := store.ListResourceLocks(ctx)
 		if err != nil {
 			return err
@@ -715,17 +650,6 @@ func printDashboardSnapshot(stdout io.Writer, st style.Style, snapshot dashboard
 		writeLine(stdout, "  %s@%s %s", lock.Repo, lock.Branch, emptyText(lock.Owner))
 	}
 
-	dashboardSectionHeader(stdout, st, "train_sessions", len(snapshot.TrainSessions))
-	trains, hidden := dashboardTruncate(st, all, snapshot.TrainSessions)
-	for _, train := range trains {
-		line := fmt.Sprintf("%s phase=%s candidate=%s", train.ID, train.Phase, emptyText(train.Candidate))
-		if dashboardDeadTrainPhase(train.Phase) {
-			line = st.Dim(line)
-		}
-		writeLine(stdout, "  %s", line)
-	}
-	dashboardMore(stdout, st, hidden)
-
 	dashboardSectionHeader(stdout, st, "pending_prompts", len(snapshot.PendingPrompts))
 	for _, prompt := range snapshot.PendingPrompts {
 		writeLine(stdout, "  %s\t%s", prompt.ID, prompt.Question)
@@ -806,15 +730,6 @@ func dashboardJobStateColor(st style.Style, state string) string {
 		return st.Cyan(state)
 	default:
 		return state
-	}
-}
-
-func dashboardDeadTrainPhase(phase string) bool {
-	switch phase {
-	case "run_abandoned", "candidate_rejected", "candidate_promoted":
-		return true
-	default:
-		return false
 	}
 }
 

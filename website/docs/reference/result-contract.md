@@ -373,7 +373,7 @@ the same `delegations` field, `coordinator`, and `continuation` mechanics.
 
   **`agent` vs `ephemeral` — which to use:** delegate to a registered `agent`
   when the work needs a specific, durable, addressable worker (a tuned or
-  SkillOpt-trained template, a resumable session, accountable job history) or
+  versioned template, a resumable session, accountable job history) or
   when the worker must itself delegate — ephemeral workers are leaf-only and
   cannot return their own delegations. Use `ephemeral` for one-off, disposable,
   dynamically-sized fan-out where you just need "a runtime + model + prompt"

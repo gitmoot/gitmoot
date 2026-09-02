@@ -173,7 +173,7 @@ func TestWebhookSinkFlushDeliversQueuedEvent(t *testing.T) {
 	defer srv.Close()
 
 	sink := NewWebhookSink(srv.URL, time.Second)
-	sink.Emit(context.Background(), NewEvent(EventCandidateAwaitingPromotion, "ver-1", "tmpl-1", "", "awaiting_promotion", "candidate awaiting", time.Now(), nil))
+	sink.Emit(context.Background(), NewEvent(EventJobFinished, "job-1", "root-1", "owner/repo", "succeeded", "queued event", time.Now(), nil))
 
 	sink.Flush(context.Background())
 	if got := delivered.Load(); got != 1 {
@@ -199,7 +199,7 @@ func TestWebhookSinkFlushIsIdempotentAndDropsLateEmit(t *testing.T) {
 	sink.Flush(context.Background()) // second call must not panic (double-close guard)
 
 	// A post-Flush Emit must drop, not panic on a closed channel.
-	sink.Emit(context.Background(), NewEvent(EventCandidateAutoPromoted, "ver-2", "tmpl-2", "", "auto_promoted", "", time.Now(), nil))
+	sink.Emit(context.Background(), NewEvent(EventJobFinished, "job-2", "root-2", "owner/repo", "succeeded", "", time.Now(), nil))
 	select {
 	case reason := <-dropped:
 		if reason != "sink flushed" {

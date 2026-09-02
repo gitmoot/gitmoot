@@ -34,8 +34,8 @@ merge_back = "summary"
 max_temp_sessions_per_agent = 4
 eligible_actions = ["ask", "review", "implement"]
 
-[feedback]
-repo = "owner/feedback"
+[template_remote]
+repo = "owner/templates"
 `
 
 func writeConfig(t *testing.T, contents string) config.Paths {
@@ -115,10 +115,6 @@ func TestBuildDashboardConfigView(t *testing.T) {
 	if eligible.Value != `["ask", "review", "implement"]` {
 		t.Fatalf("eligible_actions value = %q", eligible.Value)
 	}
-	feedback, ok := sectionByTitle(view, "feedback")
-	if !ok || feedback.Rows[0][1] != "owner/feedback" {
-		t.Fatalf("feedback section wrong: %+v", feedback)
-	}
 	daemon, ok := sectionByTitle(view, "daemon (persisted)")
 	if !ok || daemon.Rows[0][1] != "--workers 4" {
 		t.Fatalf("daemon section wrong: %+v", daemon)
@@ -168,7 +164,7 @@ func TestConfigScalarForKind(t *testing.T) {
 	// Finding-10 guard: a ConfigText value that happens to look bracketed must
 	// still be written as a string, not silently promoted to an array.
 	bracketedText := configScalarForKind(tui.ConfigText, `["x"]`)
-	if err := config.SetConfigScalar(writeConfig(t, sampleConfigTOML), []string{"feedback", "repo"}, bracketedText); err != nil {
+	if err := config.SetConfigScalar(writeConfig(t, sampleConfigTOML), []string{"agents", "planner", "template"}, bracketedText); err != nil {
 		t.Fatalf("bracketed ConfigText should write as a string, got: %v", err)
 	}
 	// Apply each to a fixture and confirm the stored TOML type round-trips.
@@ -179,7 +175,7 @@ func TestConfigScalarForKind(t *testing.T) {
 	if err := config.SetConfigScalar(paths, []string{"agents", "planner", "idle_timeout"}, strVal); err != nil {
 		t.Fatalf("duration write: %v", err)
 	}
-	if err := config.SetConfigScalar(paths, []string{"feedback", "repo"}, repoVal); err != nil {
+	if err := config.SetConfigScalar(paths, []string{"template_remote", "repo"}, repoVal); err != nil {
 		t.Fatalf("repo write: %v", err)
 	}
 	if err := config.SetConfigScalar(paths, []string{"parallel_sessions", "eligible_actions"}, listVal); err != nil {

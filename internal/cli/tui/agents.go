@@ -37,9 +37,11 @@ func (m Model) orderedAgents() []Agent {
 	return out
 }
 
-// isManagedTrainingAgent reports whether an agent name is internal skillopt
-// training plumbing — the per-option target agents and the generator workers —
-// that the user never acts on, so the Agents page hides them.
+// isManagedTrainingAgent reports whether an agent name is training plumbing left
+// behind by the SkillOpt loop removed in #1752 — the per-option target agents and
+// the generator workers. Nothing mints these any more, but a home that ran training
+// before the removal still has the registered rows, and the user never acts on them,
+// so the Agents page keeps hiding them (`a` still reveals them for cleanup).
 func isManagedTrainingAgent(name string) bool {
 	name = strings.TrimSpace(name)
 	return strings.HasPrefix(name, "skillopt-target-") || strings.HasPrefix(name, "skillopt-generator")
@@ -513,42 +515,6 @@ func openAgentFormCmd(deps Deps) tea.Cmd {
 	}
 }
 
-// openAgentOptimizeCmd builds the pre-filled optimize form off the UI thread
-// and pushes it.
-func openAgentOptimizeCmd(deps Deps, agent Agent) tea.Cmd {
-	return func() tea.Msg {
-		form, err := deps.OpenAgentOptimize(agent)
-		if err != nil {
-			return agentActionMsg{verb: "form", err: err}
-		}
-		return PushModelMsg{Model: form}
-	}
-}
-
-// startOptimizeCmd scaffolds and starts the train session from the form's
-// answers.
-func startOptimizeCmd(deps Deps, templateID string, values map[string]string) tea.Cmd {
-	return func() tea.Msg {
-		if deps.StartOptimize == nil {
-			return optimizeStartedMsg{}
-		}
-		sessionID, err := deps.StartOptimize(templateID, values)
-		return optimizeStartedMsg{sessionID: sessionID, err: err}
-	}
-}
-
-// NewAgentOptimizeForm wraps the train-init form for the optimize flow: on
-// completion it pops itself and delivers the answers (bound to the template it
-// was opened for) to the dashboard, which starts the session and opens its
-// phase view.
-func NewAgentOptimizeForm(store PromptStore, templateID string, fields []Field, summary func(map[string]string) [][]string, interpret Interpret) TrainInitModel {
-	form := NewTrainInit(store, fields, summary, interpret, 0)
-	form.Done = func(res Result) tea.Cmd {
-		return PopWith(agentOptimizeFormResultMsg{templateID: templateID, result: res})
-	}
-	return form
-}
-
 func agentCreateCmd(deps Deps, values map[string]string) tea.Cmd {
 	return func() tea.Msg {
 		if deps.CreateAgent == nil {
@@ -676,7 +642,7 @@ func choiceValues(choices []Choice) []string {
 func (m Model) agentsContentInteractive() string {
 	visible := m.visibleAgents()
 	// hidden counts only the managed training agents the hidden line describes
-	// ("… training agents hidden (skillopt-*)"). Ephemeral agents (#325) are
+	// ("… training agents hidden"). Ephemeral agents (#325) are
 	// filtered from the registry too, but they are not training plumbing, so they
 	// are dropped silently rather than mislabeled here.
 	hidden := 0
@@ -709,7 +675,7 @@ func (m Model) agentsContentInteractive() string {
 			return
 		}
 		if hidden > 0 {
-			line := strconv.Itoa(hidden) + " training agents hidden (skillopt-*)"
+			line := strconv.Itoa(hidden) + " training agents hidden"
 			if hiddenLive > 0 {
 				line += " · " + strconv.Itoa(hiddenLive) + " live"
 				if hiddenRunning > 0 {
@@ -795,10 +761,7 @@ func (m Model) agentsContentInteractive() string {
 		b.WriteString("\n" + mutedStyle.Render(m.agentNotice) + "\n")
 	}
 	hiddenLine(&b)
-	if m.optimizeBusy {
-		b.WriteString("\n" + mutedStyle.Render("starting optimization…") + "\n")
-	}
-	b.WriteString(mutedStyle.Render("enter detail  n new  o optimize  D delete  X delete group  a show all/hide"))
+	b.WriteString(mutedStyle.Render("enter detail  n new  D delete  X delete group  a show all/hide"))
 	b.WriteByte('\n')
 	return b.String()
 }

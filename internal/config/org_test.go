@@ -298,7 +298,7 @@ func TestLoadOrgToleratesUnrelatedMalformedAndTOMLForms(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(paths.ConfigFile, []byte("[skillopt\nanything = nope\n"), 0o600); err != nil {
+	if err := os.WriteFile(paths.ConfigFile, []byte("[orchestrate\nanything = nope\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if cfg, err := LoadOrg(paths); err != nil || cfg.Enabled() {
@@ -338,7 +338,7 @@ func TestLoadOrgToleratesUnrelatedMalformedAndTOMLForms(t *testing.T) {
 			t.Fatalf("org-prefixed unrelated malformed header should be tolerated: %q cfg=%+v err=%v", content, cfg, err)
 		}
 	}
-	if err := os.WriteFile(paths.ConfigFile, []byte("[ skillopt\nanything = nope\n"), 0o600); err != nil {
+	if err := os.WriteFile(paths.ConfigFile, []byte("[ orchestrate\nanything = nope\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if cfg, err := LoadOrg(paths); err != nil || cfg.Enabled() {
