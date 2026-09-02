@@ -21,9 +21,9 @@ func buildDashboardConfigView(paths config.Paths, daemon dashboardDaemonDetail) 
 
 	// Sections are appended in domain order so the page reads top-to-bottom as
 	// System (paths) → Agents (agent types) → Sessions (parallel sessions) →
-	// Feedback → Daemon. The first-row keys "paths"/"agent types"/"feedback"
-	// stay verbatim because the TUI render tests pin them; the parallel-sessions
-	// title is enriched to name its domain.
+	// Daemon. The first-row keys "paths"/"agent types" stay verbatim because the
+	// TUI render tests pin them; the parallel-sessions title is enriched to name
+	// its domain.
 
 	// System: filesystem paths.
 	view.Sections = append(view.Sections, tui.ConfigSection{
@@ -66,7 +66,7 @@ func buildDashboardConfigView(paths config.Paths, daemon dashboardDaemonDetail) 
 	}
 
 	// Sessions: parallel-session policy. The scalar fields are inline-editable,
-	// mirroring feedback.repo / the agent timeouts; same_session and merge_back
+	// mirroring the agent timeouts; same_session and merge_back
 	// are short enums and max_temp_sessions_per_agent is an int. eligible_actions
 	// is a string list (ConfigStringList): its editable Value is the bracketed
 	// TOML literal so configScalarForKind round-trips it back as a list.
@@ -96,17 +96,6 @@ func buildDashboardConfigView(paths config.Paths, daemon dashboardDaemonDetail) 
 			}
 		}
 		view.Sections = append(view.Sections, section)
-	}
-
-	// Feedback: default feedback repo.
-	if repo, err := config.LoadDefaultFeedbackRepo(paths); err == nil && strings.TrimSpace(repo) != "" {
-		view.Sections = append(view.Sections, tui.ConfigSection{
-			Title: "feedback",
-			Rows:  [][]string{{"repo", dashConfig(repo)}},
-			Editable: []tui.ConfigField{
-				{Label: "feedback · repo", KeyPath: []string{"feedback", "repo"}, Kind: tui.ConfigText, Value: repo},
-			},
-		})
 	}
 
 	// Daemon: persisted daemon launch state.
@@ -221,9 +210,6 @@ func validateDashboardConfig(paths config.Paths) []string {
 	}
 	if _, err := config.LoadParallelSessionPolicy(paths); err != nil {
 		problems = append(problems, "[parallel_sessions] "+err.Error())
-	}
-	if _, err := config.LoadDefaultFeedbackRepo(paths); err != nil {
-		problems = append(problems, "[feedback] "+err.Error())
 	}
 	return problems
 }

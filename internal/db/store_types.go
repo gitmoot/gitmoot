@@ -75,67 +75,6 @@ type AgentTemplateVersion struct {
 	CreatedAt      string
 	UpdatedAt      string
 	PromotedAt     string
-	// CanarySample is the active canary's sampled-traffic fraction in (0,1] (#484),
-	// recorded only on a `canary`-state version; 0 (the column DEFAULT) for every
-	// other state so existing rows read identically. The routing seam draws a
-	// per-resolution random < CanarySample to route to the canary.
-	CanarySample float64
-	// CanaryStartedAt is the RFC3339 window-start of the active canary (#484), set
-	// when a version transitions to `canary`; "" (the DEFAULT) otherwise. It bounds
-	// the daemon's regression-window comparator.
-	CanaryStartedAt string
-}
-
-type AgentTemplateCandidateReview struct {
-	VersionID           string
-	TemplateID          string
-	BaseVersionID       string
-	DiffArtifactID      string
-	Score               *float64
-	PreferenceSummary   string
-	EvalReportJSON      string
-	SummaryMetadataJSON string
-	State               string
-	DecisionReason      string
-	CreatedAt           string
-	UpdatedAt           string
-	DecidedAt           string
-}
-
-// BanditArm is one persisted Beta-Bernoulli arm of the #473 Mode B
-// champion-challenger bandit, keyed by (TemplateID, TemplateVersionID). Alpha
-// and Beta are the Beta(1+wins, 1+losses) posterior under the uniform Beta(1,1)
-// prior (so a missing row is exactly NewArm()); Pulls is the total win+loss
-// count that drives the "over K samples" string and the low-traffic tiering
-// floor. The arm key is the version id (which already encodes the agent and
-// template), so champion and challenger are two distinct rows and promoting or
-// rejecting a version naturally retires its arm.
-type BanditArm struct {
-	TemplateID        string
-	TemplateVersionID string
-	Alpha             float64
-	Beta              float64
-	Pulls             int
-	UpdatedAt         string
-}
-
-// SkillOptJudgeOutcome records a single human promote/reject decision on a
-// SkillOpt candidate alongside the LLM judge's signal for the same candidate,
-// so judge calibration (agreement, Cohen's kappa, per-dimension drift) can be
-// computed offline. The raw judge eval report is stored in JudgeScoreJSON so
-// the derived Direction can always be recomputed from source.
-type SkillOptJudgeOutcome struct {
-	ID                 string
-	CandidateVersionID string
-	TemplateID         string
-	JudgeScoreJSON     string
-	JudgePromptVersion string
-	JudgeEvaluatorID   string
-	JudgePromptHash    string
-	HumanDecision      string
-	Direction          string
-	Reason             string
-	CreatedAt          string
 }
 
 type AgentRepo struct {
@@ -346,81 +285,6 @@ type JobGate struct {
 	SatisfiedAt string
 }
 
-type EvalArtifact struct {
-	ID        string
-	Hash      string
-	MediaType string
-	SizeBytes int64
-	Driver    string
-	CreatedAt string
-}
-
-type EvalRun struct {
-	ID                string
-	TemplateID        string
-	TemplateVersionID string
-	TargetRepo        string
-	State             string
-	Mode              string
-	ExplorationLevel  string
-	OptionsCount      int
-	MetadataJSON      string
-	CreatedAt         string
-	UpdatedAt         string
-}
-
-type SkillOptTrainSession struct {
-	ID                string
-	TemplateID        string
-	TemplateVersionID string
-	TargetRepo        string
-	WorkspaceRepo     string
-	PreviewRepo       string
-	RequestSummary    string
-	TaskKind          string
-	State             string
-	MetadataJSON      string
-	CreatedAt         string
-	UpdatedAt         string
-}
-
-type SkillOptTrainIteration struct {
-	ID                    string
-	SessionID             string
-	EvalRunID             string
-	BaseTemplateVersionID string
-	CandidateVersionID    string
-	Mode                  string
-	ExplorationLevel      string
-	State                 string
-	IssueRepo             string
-	IssueNumber           int64
-	IssueURL              string
-	PullRequestRepo       string
-	PullRequestNumber     int64
-	PullRequestURL        string
-	DecisionReason        string
-	MetadataJSON          string
-	CreatedAt             string
-	UpdatedAt             string
-}
-
-type SkillOptReviewWatch struct {
-	Repo                  string
-	IssueNumber           int64
-	RunID                 string
-	ExpectedItemIDsJSON   string
-	Status                string
-	LastSeenCommentID     int64
-	LastImportErrorHash   string
-	StaleAfter            string
-	StaleThresholdSeconds int64
-	StaleNotified         bool
-	MetadataJSON          string
-	CreatedAt             string
-	UpdatedAt             string
-}
-
 type InteractivePrompt struct {
 	ID            string   `json:"id"`
 	Question      string   `json:"question"`
@@ -438,102 +302,9 @@ type InteractivePrompt struct {
 }
 
 const (
-	EvalRunModeExplore  = "explore"
-	EvalRunModeRefine   = "refine"
-	EvalRunModeDistill  = "distill"
-	EvalRunModeValidate = "validate"
-
-	ExplorationLevelHigh   = "high"
-	ExplorationLevelMedium = "medium"
-	ExplorationLevelLow    = "low"
-
-	SkillOptReviewWatchStatusWatching      = "watching"
-	SkillOptReviewWatchStatusImported      = "imported"
-	SkillOptReviewWatchStatusClosed        = "closed"
-	SkillOptReviewWatchStatusStaleNotified = "stale_notified"
-	SkillOptReviewWatchStatusFailed        = "failed"
-
 	InteractivePromptStatePending  = "pending"
 	InteractivePromptStateResolved = "resolved"
 )
-
-type EvalReviewItem struct {
-	ID                  string
-	RunID               string
-	ItemID              string
-	Title               string
-	SourceArtifactID    string
-	BaselineArtifactID  string
-	CandidateArtifactID string
-	PreviewArtifactID   string
-	DiffArtifactID      string
-	MetadataJSON        string
-	CreatedAt           string
-	UpdatedAt           string
-}
-
-type EvalReviewOption struct {
-	ID           string
-	RunID        string
-	ItemID       string
-	Label        string
-	ArtifactID   string
-	Role         string
-	MetadataJSON string
-	CreatedAt    string
-	UpdatedAt    string
-}
-
-type EvalReviewGenerationWrite struct {
-	ItemID     string
-	ReviewItem *EvalReviewItem
-	Artifacts  []EvalArtifact
-	Options    []EvalReviewOption
-}
-
-type FeedbackEvent struct {
-	ID        string
-	RunID     string
-	ItemID    string
-	Choice    string
-	Reasoning string
-	Reviewer  string
-	Source    string
-	SourceURL string
-	CreatedAt string
-}
-
-type RankedFeedbackEvent struct {
-	ID                       string
-	RunID                    string
-	ItemID                   string
-	RankingJSON              string
-	TieGroupsJSON            string
-	Winner                   string
-	UsefulTraitsJSON         string
-	RejectedTraitsJSON       string
-	RequiredImprovementsJSON string
-	Quality                  string
-	ContinueMode             string
-	Promote                  string
-	Reasoning                string
-	Reviewer                 string
-	Source                   string
-	SourceURL                string
-	CreatedAt                string
-}
-
-type PairwisePreference struct {
-	RunID         string
-	ItemID        string
-	Preferred     string
-	Rejected      string
-	RankedEventID string
-	Reviewer      string
-	Source        string
-	SourceURL     string
-	CreatedAt     string
-}
 
 type BranchLock struct {
 	RepoFullName           string
@@ -625,49 +396,6 @@ type NoCIObservation struct {
 	FirstZeroAt string
 }
 
-// CreatedRepo records a GitHub repository gitmoot itself created, so cleanup
-// flows can offer deletion of exactly those repos and never others.
-type CreatedRepo struct {
-	Repo      string `json:"repo"`
-	Purpose   string `json:"purpose,omitempty"`
-	SessionID string `json:"session_id,omitempty"`
-	CreatedAt string `json:"created_at,omitempty"`
-}
-
-// BinaryVerdict is one persisted BINEVAL binary-evaluation verdict (#525): a
-// yes/no answer + explanation for a single question of an eval run.
-type BinaryVerdict struct {
-	RunID           string
-	QuestionID      string
-	Dimension       string
-	Verdict         string
-	Explanation     string
-	QuestionWeight  float64
-	DimensionWeight float64
-	CreatedAt       string
-}
-
-// BinaryVerdictWithRun is one persisted binary verdict joined with the template
-// id and version id of the eval run it belongs to. It is the read shape the
-// #527 binary-disagreement lesson derivation consumes: to compare verdicts
-// across candidate-vs-champion runs (different versions) and repeated runs of
-// the same version, the derivation needs every verdict for a template together
-// with which run/version produced it.
-type BinaryVerdictWithRun struct {
-	BinaryVerdict
-	TemplateID        string
-	TemplateVersionID string
-}
-
-// RankedFeedbackEventWithTemplate pairs a ranked feedback event with the
-// template id of the eval run it belongs to, so cross-run measurement joins
-// (`skillopt judge agreement`, #344) can scope by template without a second
-// per-run lookup loop.
-type RankedFeedbackEventWithTemplate struct {
-	RankedFeedbackEvent
-	TemplateID string
-}
-
 // HeartbeatState is the persisted state of one named agent heartbeat schedule
 // (#533): when it last ran, when it is next due, and the id/status of its most
 // recent job. The next_due + last_status are what make a heartbeat restart-safe
@@ -691,28 +419,4 @@ type BranchLockInfo struct {
 	BranchLock
 	CreatedAt time.Time
 	UpdatedAt time.Time
-}
-
-// SkillOptGateRun is one persisted deterministic replay-gate run for a candidate
-// (#627). It is an additive audit record: the champion the candidate was compared
-// against, the fixed corpus (path + version + item count), the two aggregate corpus
-// means, the accept/reject verdict, the attempt count (1, or 2 after the single
-// retry), the reason, and the per-item deltas serialized as JSON. It NEVER drives
-// promotion by itself — the promotion guard reads Accepted, but a human/operator
-// still promotes.
-type SkillOptGateRun struct {
-	ID                 string
-	TemplateID         string
-	CandidateVersionID string
-	ChampionVersionID  string
-	CorpusPath         string
-	CorpusVersion      int
-	CorpusItems        int
-	Attempts           int
-	Accepted           bool
-	ChampionMean       float64
-	CandidateMean      float64
-	Reason             string
-	DeltasJSON         string
-	CreatedAt          string
 }

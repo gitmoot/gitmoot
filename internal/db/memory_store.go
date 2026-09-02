@@ -2734,7 +2734,7 @@ LIMIT ?`
 }
 
 // ListSharedActiveConfirmedMemories returns the complete shared-memory pool that
-// is visible to repo for SkillOpt synth novelty selection. It is deliberately a
+// is visible to repo for novelty selection. It is deliberately a
 // local plain-read seam rather than a refactor of QueryConfirmedMemories: normal
 // recall keeps its FTS ranking and owner-floor behavior unchanged.
 func (s *Store) ListSharedActiveConfirmedMemories(ctx context.Context, repo string) ([]ConfirmedMemory, error) {

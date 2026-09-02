@@ -63,7 +63,6 @@ func TestDashboardSnapshotRendersSections(t *testing.T) {
 		"runtime_sessions: 0",
 		"jobs: 0",
 		"branch_locks: 0",
-		"train_sessions: 0",
 		"pending_prompts: 1",
 		"dash.prompt.one\tPick a value",
 	} {

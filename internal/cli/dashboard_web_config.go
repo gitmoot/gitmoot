@@ -21,7 +21,6 @@ type dashboardConfigSettings struct {
 	chat           config.ChatSettings
 	orchestrate    config.OrchestratePolicy
 	github         config.GitHubLimiterPolicy
-	skillopt       config.SkillOptPolicy
 	memoryPipeline config.MemoryPipelineSettings
 	implementBase  string
 }
@@ -50,7 +49,7 @@ var dashboardConfigProjection = []dashboardConfigProjectionRow{
 	{section: "memory", key: "distill_all_jobs", kind: "flag", doc: "Distill outcomes from agents that are not enrolled in memory.", value: func(s dashboardConfigSettings) any { return s.memory.DistillAllJobs }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.DistillAllJobs }},
 	{section: "memory", key: "distill_at_terminal", kind: "flag", doc: "Stage deterministic memory observations when jobs terminate.", value: func(s dashboardConfigSettings) any { return s.memory.DistillAtTerminal }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.DistillAtTerminal }},
 	{section: "memory", key: "distill_max_per_job", kind: "int", doc: "Maximum observations staged by distillation for one job.", value: func(s dashboardConfigSettings) any { return s.memory.DistillMaxPerJob }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.DistillMaxPerJob }},
-	{section: "memory", key: "distill_successes", kind: "flag", doc: "Stage observations from successful promotions and recoveries.", value: func(s dashboardConfigSettings) any { return s.memory.DistillSuccesses }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.DistillSuccesses }},
+	{section: "memory", key: "distill_successes", kind: "flag", doc: "Stage observations from recovered failures.", value: func(s dashboardConfigSettings) any { return s.memory.DistillSuccesses }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.DistillSuccesses }},
 	{section: "memory", key: "groom_llm_total_max_per_run", kind: "int", doc: "Shared maximum LLM calls across quality, stale, and split grooming passes.", value: func(s dashboardConfigSettings) any { return s.memory.GroomLLMTotalMaxPerRun }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.GroomLLMTotalMaxPerRun }},
 	{section: "memory", key: "groom_quality", kind: "flag", doc: "Permit corroborated useless quality verdicts to retire facts; false is shadow mode.", value: func(s dashboardConfigSettings) any { return s.memory.GroomQuality }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.GroomQuality }},
 	{section: "memory", key: "groom_quality_max_per_run", kind: "int", doc: "Maximum uncached quality verdicts requested in one grooming run.", value: func(s dashboardConfigSettings) any { return s.memory.GroomQualityMaxPerRun }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.GroomQualityMaxPerRun }},
@@ -75,17 +74,6 @@ var dashboardConfigProjection = []dashboardConfigProjectionRow{
 	{section: "memory.pipelines", key: "ingest_sweep", kind: "duration", doc: "Schedule for automatic memory ingest sweeps.", value: func(s dashboardConfigSettings) any { return s.memoryPipeline.IngestSweepInterval }, defaultValue: func(s dashboardConfigSettings) any { return s.memoryPipeline.IngestSweepInterval }},
 	{section: "memory.pipelines", key: "ingest_sweep_jitter", kind: "duration", doc: "Scheduling jitter applied to memory ingest sweeps.", value: func(s dashboardConfigSettings) any { return s.memoryPipeline.IngestSweepJitter }, defaultValue: func(s dashboardConfigSettings) any { return s.memoryPipeline.IngestSweepJitter }},
 	{section: "orchestrate", key: "blocked_ttl", kind: "duration", doc: "Maximum time a blocked job remains awaiting a human; empty disables expiry.", value: func(s dashboardConfigSettings) any { return s.orchestrate.BlockedTTL }, defaultValue: func(s dashboardConfigSettings) any { return s.orchestrate.BlockedTTL }},
-	{section: "skillopt", key: "auto_promote", kind: "flag", doc: "Promote qualifying template candidates automatically.", value: func(s dashboardConfigSettings) any { return s.skillopt.AutoPromote }, defaultValue: func(s dashboardConfigSettings) any { return s.skillopt.AutoPromote }},
-	{section: "skillopt", key: "auto_promote_canary", kind: "flag", doc: "Route automatic promotions through a sampled canary.", value: func(s dashboardConfigSettings) any { return s.skillopt.AutoPromoteCanary }, defaultValue: func(s dashboardConfigSettings) any { return s.skillopt.AutoPromoteCanary }},
-	{section: "skillopt", key: "auto_promote_require_external_ci", kind: "flag", doc: "Require positive external CI evidence before automatic promotion.", value: func(s dashboardConfigSettings) any { return s.skillopt.AutoPromoteRequireExternalCI }, defaultValue: func(s dashboardConfigSettings) any { return s.skillopt.AutoPromoteRequireExternalCI }},
-	{section: "skillopt", key: "auto_promote_require_measured_judge", kind: "flag", doc: "Require calibrated judge evidence before automatic promotion.", value: func(s dashboardConfigSettings) any { return s.skillopt.AutoPromoteRequireMeasuredJudge }, defaultValue: func(s dashboardConfigSettings) any { return s.skillopt.AutoPromoteRequireMeasuredJudge }},
-	{section: "skillopt", key: "auto_trace_enabled", kind: "flag", doc: "Harvest terminal workflow outcomes into SkillOpt evaluations.", value: func(s dashboardConfigSettings) any { return s.skillopt.AutoTraceEnabled }, defaultValue: func(s dashboardConfigSettings) any { return s.skillopt.AutoTraceEnabled }},
-	{section: "skillopt", key: "cross_family_review_enabled", kind: "flag", doc: "Add cross-family review evidence to automatic traces.", value: func(s dashboardConfigSettings) any { return s.skillopt.CrossFamilyReviewEnabled }, defaultValue: func(s dashboardConfigSettings) any { return s.skillopt.CrossFamilyReviewEnabled }},
-	{section: "skillopt", key: "deterministic_checkers_enabled", kind: "flag", doc: "Add deterministic checker evidence to automatic traces.", value: func(s dashboardConfigSettings) any { return s.skillopt.DeterministicCheckers }, defaultValue: func(s dashboardConfigSettings) any { return s.skillopt.DeterministicCheckers }},
-	{section: "skillopt", key: "gate_enabled", kind: "flag", doc: "Require a passing fixed-corpus replay gate before promotion.", value: func(s dashboardConfigSettings) any { return s.skillopt.Gate }, defaultValue: func(s dashboardConfigSettings) any { return s.skillopt.Gate }},
-	{section: "skillopt", key: "hard_verifiers_enabled", kind: "flag", doc: "Run configured deterministic verifier commands for automatic traces.", value: func(s dashboardConfigSettings) any { return s.skillopt.HardVerifiers }, defaultValue: func(s dashboardConfigSettings) any { return s.skillopt.HardVerifiers }},
-	{section: "skillopt", key: "mode_b_judge_enabled", kind: "flag", doc: "Enable cross-family judging for SkillOpt A/B comparisons.", value: func(s dashboardConfigSettings) any { return s.skillopt.ModeBJudgeEnabled }, defaultValue: func(s dashboardConfigSettings) any { return s.skillopt.ModeBJudgeEnabled }},
-	{section: "skillopt", key: "pace_enabled", kind: "flag", doc: "Require the anytime-valid PACE gate before automatic promotion.", value: func(s dashboardConfigSettings) any { return s.skillopt.PaceEnabled }, defaultValue: func(s dashboardConfigSettings) any { return s.skillopt.PaceEnabled }},
 	{section: "workflow", key: "implement_base", kind: "string", doc: "Base ref used when dispatching implementation jobs.", value: func(s dashboardConfigSettings) any { return s.implementBase }, defaultValue: func(s dashboardConfigSettings) any { return s.implementBase }},
 }
 
@@ -199,7 +187,6 @@ func loadDashboardConfigSettings(paths config.Paths) (dashboardConfigSettings, d
 		chat:        config.DefaultChatSettings(),
 		orchestrate: config.DefaultOrchestratePolicy(),
 		github:      config.DefaultGitHubLimiterPolicy(),
-		skillopt:    config.DefaultSkillOptPolicy(),
 	}
 	var err error
 	if values.memory, err = config.LoadMemorySettings(paths); err != nil {
@@ -213,9 +200,6 @@ func loadDashboardConfigSettings(paths config.Paths) (dashboardConfigSettings, d
 	}
 	if values.github, err = config.LoadGitHubLimiterPolicy(paths); err != nil {
 		return values, defaults, fmt.Errorf("load github config: %w", err)
-	}
-	if values.skillopt, err = config.LoadSkillOptPolicy(paths); err != nil {
-		return values, defaults, fmt.Errorf("load skillopt config: %w", err)
 	}
 	if values.memoryPipeline, err = config.LoadMemoryPipelineSettings(paths); err != nil {
 		return values, defaults, fmt.Errorf("load memory pipeline config: %w", err)

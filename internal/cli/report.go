@@ -46,14 +46,12 @@ func printReportUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot report bug --job <job-id> --create --yes")
 	fmt.Fprintln(w, "  gitmoot report bug --source daemon --preview")
 	fmt.Fprintln(w, "  gitmoot report bug --source dashboard --preview")
-	fmt.Fprintln(w, "  gitmoot report bug --train <session-id> --create --yes")
 }
 
 type reportBugOptions struct {
 	home    string
 	jobID   string
 	source  string
-	trainID string
 	preview bool
 	create  bool
 	yes     bool
@@ -66,7 +64,6 @@ func runReportBug(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&options.home, "home", "", "home directory to use instead of the current user's home")
 	fs.StringVar(&options.jobID, "job", "", "job id to build a report from")
 	fs.StringVar(&options.source, "source", "", "future report source: daemon or dashboard")
-	fs.StringVar(&options.trainID, "train", "", "future SkillOpt train session id to build a report from")
 	fs.BoolVar(&options.preview, "preview", false, "print the report without creating a GitHub issue")
 	fs.BoolVar(&options.create, "create", false, "create a GitHub issue")
 	fs.BoolVar(&options.yes, "yes", false, "confirm non-interactive issue creation")
@@ -114,11 +111,8 @@ func validateReportBugOptions(options reportBugOptions) error {
 	if strings.TrimSpace(options.source) != "" {
 		sourceCount++
 	}
-	if strings.TrimSpace(options.trainID) != "" {
-		sourceCount++
-	}
 	if sourceCount == 0 {
-		return errors.New("a source is required (--job, --source daemon, --source dashboard, or --train)")
+		return errors.New("a source is required (--job, --source daemon, or --source dashboard)")
 	}
 	if sourceCount > 1 {
 		return errors.New("only one source may be specified")
@@ -143,9 +137,6 @@ func buildBugReport(ctx context.Context, options reportBugOptions) (report.Repor
 		default:
 			return report.Report{}, fmt.Errorf("source %s is not supported", source)
 		}
-	}
-	if trainID := strings.TrimSpace(options.trainID); trainID != "" {
-		return report.Report{}, fmt.Errorf("source train is not supported yet for session %s", trainID)
 	}
 	return report.Report{}, errors.New("source is required")
 }

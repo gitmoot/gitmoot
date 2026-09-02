@@ -74,9 +74,10 @@ type MemorySettings struct {
 	// `memory confirm` gate stays the only promotion path).
 	DistillAtTerminal bool
 	// DistillSuccesses enables deterministic success-side memory producers (#781).
-	// Default false: no SkillOpt promotion observations and no recovered-failure
-	// observations are staged. When true, those producers still write only pending
-	// low-trust observations; they never confirm memory directly.
+	// Default false: no recovered-failure observations are staged. When true, the
+	// producer still writes only pending low-trust observations; it never confirms
+	// memory directly. (The SkillOpt-promotion producer went with the loop in #1752;
+	// recovered-failure observations are what remains.)
 	DistillSuccesses bool
 	// DistillMaxPerJob is the hard per-job cap on distill writes (default 3). Only
 	// consulted when DistillAtTerminal or DistillSuccesses is true; a value <= 0

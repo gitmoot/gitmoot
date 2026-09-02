@@ -32,8 +32,8 @@ func runDaemon(args []string, stdout, stderr io.Writer) int {
 
 func printDaemonUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot daemon start [--repo owner/repo] [--poll 30s] [--workers 1 | --parallel N] [--scheduler barrier|pool] [--watch-skillopt-reviews] [--watch-issues]")
-	fmt.Fprintln(w, "  gitmoot daemon run [--repo owner/repo] [--poll 30s] [--workers 1 | --parallel N] [--scheduler barrier|pool] [--watch-skillopt-reviews] [--watch-issues]")
+	fmt.Fprintln(w, "  gitmoot daemon start [--repo owner/repo] [--poll 30s] [--workers 1 | --parallel N] [--scheduler barrier|pool] [--watch-issues]")
+	fmt.Fprintln(w, "  gitmoot daemon run [--repo owner/repo] [--poll 30s] [--workers 1 | --parallel N] [--scheduler barrier|pool] [--watch-issues]")
 	fmt.Fprintln(w, "  gitmoot daemon stop")
 	fmt.Fprintln(w, "  gitmoot daemon restart")
 	fmt.Fprintln(w, "  gitmoot daemon status")

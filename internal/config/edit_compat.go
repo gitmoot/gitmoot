@@ -8,83 +8,25 @@ import (
 	"github.com/creachadair/tomledit"
 )
 
-type legacyConfigLine struct {
-	occurrence int
-	original   string
-}
-
 type editableConfig struct {
-	doc         *tomledit.Document
-	legacyLines []legacyConfigLine
+	doc *tomledit.Document
 }
 
-// parseEditableConfig keeps tomledit's strict TOML parser while admitting the
-// one legacy scalar grammar Gitmoot previously documented for
-// deterministic_checkers. The compatibility rewrite exists only in memory; the
-// formatter restores the operator's exact legacy line unless that field itself
-// is the edit target.
-func parseEditableConfig(original []byte, editedSection string, preserveLegacy bool) (editableConfig, error) {
-	normalized, legacyLines, err := normalizeLegacyDeterministicCheckerLines(string(original))
-	if err != nil {
-		return editableConfig{}, err
-	}
-	doc, err := tomledit.Parse(strings.NewReader(normalized))
+// parseEditableConfig parses the config with tomledit's strict TOML parser,
+// mapping a parse failure onto the section being edited so the error names the
+// offending block.
+//
+// It used to carry a compatibility rewrite for the one legacy scalar grammar
+// Gitmoot documented — the bare comma list accepted for
+// [skillopt].deterministic_checkers — restoring the operator's exact line on
+// format. That section went with the SkillOpt loop (#1752), so the only grammar
+// left is strict TOML.
+func parseEditableConfig(original []byte, editedSection string) (editableConfig, error) {
+	doc, err := tomledit.Parse(strings.NewReader(string(original)))
 	if err != nil {
 		return editableConfig{}, configMutationParseError(string(original), editedSection, err)
 	}
-	if !preserveLegacy {
-		legacyLines = nil
-	}
-	return editableConfig{doc: doc, legacyLines: legacyLines}, nil
-}
-
-func normalizeLegacyDeterministicCheckerLines(contents string) (string, []legacyConfigLine, error) {
-	lines := strings.Split(contents, "\n")
-	section := ""
-	occurrence := 0
-	var legacyLines []legacyConfigLine
-	for i := 0; i < len(lines); i++ {
-		raw := lines[i]
-		line := strings.TrimSpace(stripConfigComment(raw))
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section = strings.TrimSpace(line[1 : len(line)-1])
-			continue
-		}
-		if section != "skillopt" {
-			continue
-		}
-		key, value, ok := strings.Cut(line, "=")
-		if !ok || strings.TrimSpace(key) != "deterministic_checkers" {
-			continue
-		}
-		value, end := joinDeterministicCheckerArrayValue(lines, i, strings.TrimSpace(value))
-		names, err := parseDeterministicCheckerList(value)
-		if err != nil {
-			return "", nil, fmt.Errorf("parse [skillopt].deterministic_checkers: %w", err)
-		}
-		trimmed := strings.TrimSpace(value)
-		if strings.HasPrefix(trimmed, "[") {
-			occurrence++
-			i = end
-			continue
-		}
-		equals := strings.IndexByte(raw, '=')
-		if equals < 0 {
-			continue
-		}
-		comment := ""
-		if hash := strings.IndexByte(raw[equals+1:], '#'); hash >= 0 {
-			comment = strings.TrimSpace(raw[equals+1+hash:])
-		}
-		normalized := raw[:equals+1] + " " + StringListScalar(names).toml()
-		if comment != "" {
-			normalized += " " + comment
-		}
-		legacyLines = append(legacyLines, legacyConfigLine{occurrence: occurrence, original: raw})
-		lines[i] = normalized
-		occurrence++
-	}
-	return strings.Join(lines, "\n"), legacyLines, nil
+	return editableConfig{doc: doc}, nil
 }
 
 func (c editableConfig) format() ([]byte, error) {
@@ -92,36 +34,7 @@ func (c editableConfig) format() ([]byte, error) {
 	if err := tomledit.Format(&formatted, c.doc); err != nil {
 		return nil, fmt.Errorf("format config: %w", err)
 	}
-	if len(c.legacyLines) == 0 {
-		return []byte(formatted.String()), nil
-	}
-
-	restore := make(map[int]string, len(c.legacyLines))
-	for _, line := range c.legacyLines {
-		restore[line.occurrence] = line.original
-	}
-	lines := strings.Split(formatted.String(), "\n")
-	section := ""
-	occurrence := 0
-	for i, raw := range lines {
-		line := strings.TrimSpace(stripConfigComment(raw))
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section = strings.TrimSpace(line[1 : len(line)-1])
-			continue
-		}
-		if section != "skillopt" {
-			continue
-		}
-		key, _, ok := strings.Cut(line, "=")
-		if !ok || strings.TrimSpace(key) != "deterministic_checkers" {
-			continue
-		}
-		if original, ok := restore[occurrence]; ok {
-			lines[i] = original
-		}
-		occurrence++
-	}
-	return []byte(strings.Join(lines, "\n")), nil
+	return []byte(formatted.String()), nil
 }
 
 func configMutationParseError(contents, editedSection string, parseErr error) error {

@@ -23,13 +23,6 @@ gitmoot version
 gitmoot plugin doctor
 ```
 
-For SkillOpt optimizer work, also verify the separate Python package:
-
-```sh
-gitmoot-skillopt --version
-gitmoot-skillopt optimize --help
-```
-
 ## Development Checks
 
 Run focused checks for the area you changed. Common checks are:
@@ -67,12 +60,6 @@ npm run build
 
 The docs build regenerates the ignored `website/static/llms-full.txt` through
 `npm run build:llms`.
-
-For SkillOpt train-mode changes:
-
-```sh
-scripts/skillopt-train-smoke.sh
-```
 
 ## Continuous Integration
 

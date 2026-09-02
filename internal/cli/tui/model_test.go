@@ -40,7 +40,6 @@ func sampleSnapshot() Snapshot {
 			{ID: "job-1", Agent: "planner", Type: "ask", State: "failed", LatestEvent: "agent returned an error"},
 			{ID: "job-2", Agent: "planner", Type: "review", State: "succeeded"},
 		},
-		Trains:      []TrainSession{{ID: "train-s1", Phase: "items_ready", Candidate: "smithyx@v3", Repo: "owner/repo"}},
 		BranchLocks: []BranchLock{{Repo: "owner/repo", Branch: "main", Owner: "agent"}},
 		ResourceLocks: []ResourceLock{
 			{Key: "generation:s1", Owner: "pid:1", Stale: false},
@@ -77,8 +76,8 @@ func tabToPage(t *testing.T, m Model, p page) Model {
 func TestPagesRenderExpectedContent(t *testing.T) {
 	t.Parallel()
 	m := loadedModel(t)
-	// Page order: Attention, Activity, Trains, Agents, Workers, Jobs, Locks, Health, Config.
-	wants := []string{"Prompts (1)", "No active jobs", "train-s1", "planner", "skillopt-generator", "failed", "branch locks", "environment", "edit in $EDITOR"}
+	// Page order: Attention, Activity, Agents, Workers, Jobs, Locks, Health, Config.
+	wants := []string{"Prompts (1)", "No active jobs", "planner", "skillopt-generator", "failed", "branch locks", "environment", "edit in $EDITOR"}
 	for i, want := range wants {
 		if i > 0 {
 			next, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})

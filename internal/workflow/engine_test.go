@@ -3347,15 +3347,6 @@ func testEngine(store *db.Store) Engine {
 		FixWorktreeAllocator: func(_ context.Context, request FixWorktreeRequest) (FixWorktreeAllocation, error) {
 			return FixWorktreeAllocation{Path: filepath.Join(os.TempDir(), "gitmoot-test-fixes", request.JobID)}, nil
 		},
-		// Run the detached cross-family review leg SYNCHRONOUSLY in tests so its
-		// dispatch + harvest are deterministic; production defaults to a goroutine.
-		ReviewSpawner: func(fn func()) { fn() },
-		// Likewise run the detached deterministic-checker leg (#485) synchronously so
-		// its dispatch + harvest are deterministic in tests.
-		CheckerSpawner: func(fn func()) { fn() },
-		// Likewise run the detached hard-verifier leg (#474) synchronously so its
-		// dispatch + harvest are deterministic in tests.
-		HardVerifierSpawner: func(fn func()) { fn() },
 		// Default the #536 physical worktree-process probe to "no live process" so
 		// cleanup tests are not influenced by whatever real processes happen to live
 		// on the host running the suite. Tests exercising the lease-expiry-boundary

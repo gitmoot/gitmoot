@@ -1216,10 +1216,14 @@ func TestWebDataSourceHealthDaemonRunning(t *testing.T) {
 	}
 }
 
-// seedTemplatedAgent registers an agent bound to a template that has a current
-// v1 plus a newer pending v2 (so version ordering and the Current marker are both
-// exercised), and gives the agent two jobs. It returns the current v1 version id
-// and the pending v2 version id.
+// seedTemplatedAgent registers an agent bound to a template whose CURRENT version is
+// v1 while a NEWER v2 also exists (so version ordering and the Current marker are
+// both exercised — Current must follow current_version_id, not recency), and gives
+// the agent two jobs. It returns the current v1 version id and the newer v2 id.
+//
+// The newer-but-not-current version is produced by upserting v2 and then REVERTING to
+// v1: since #1752 removed the candidate layer, revert is the only way a template's
+// newest version is not its current one.
 func seedTemplatedAgent(t *testing.T, home string) (v1ID, v2ID string) {
 	t.Helper()
 	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
@@ -1248,11 +1252,21 @@ func seedTemplatedAgent(t *testing.T, home string) (v1ID, v2ID string) {
 	v2.Content = "v2 content"
 	v2.ResolvedCommit = "bbbbbbbbbbbb"
 	v2.SourceRef = "candidate"
-	pending, err := store.AddPendingAgentTemplateVersion(ctx, v2)
-	if err != nil {
-		t.Fatalf("AddPendingAgentTemplateVersion: %v", err)
+	if err := store.UpsertAgentTemplate(ctx, v2); err != nil {
+		t.Fatalf("UpsertAgentTemplate v2: %v", err)
 	}
-	v2ID = pending.ID
+	newer, err := store.GetLatestAgentTemplateVersion(ctx, "planner")
+	if err != nil {
+		t.Fatalf("GetLatestAgentTemplateVersion: %v", err)
+	}
+	v2ID = newer.VersionID
+	if v2ID == v1ID {
+		t.Fatalf("v2 upsert did not mint a new version: %q", v2ID)
+	}
+	// Revert to v1 so the template resolves to v1 while v2 remains the newest row.
+	if _, err := store.RevertAgentTemplateVersion(ctx, "planner", v1ID); err != nil {
+		t.Fatalf("RevertAgentTemplateVersion to v1: %v", err)
+	}
 
 	if err := store.UpsertAgent(ctx, db.Agent{Name: "planner-agent", Runtime: "codex", TemplateID: "planner"}); err != nil {
 		t.Fatalf("UpsertAgent planner-agent: %v", err)
@@ -1309,7 +1323,8 @@ func TestWebDataSourceAgentDetail(t *testing.T) {
 		t.Fatalf("template content = %q, want %q (the current v1 body)", detail.Template.Content, "v1 content")
 	}
 
-	// Versions newest-first: v2 (pending) before v1 (current). Current marks v1.
+	// Versions newest-first: v2 (superseded by the revert) before v1 (current).
+	// Current marks v1, the version the template resolves to — not the newest row.
 	if len(detail.Versions) != 2 {
 		t.Fatalf("versions = %d, want 2: %+v", len(detail.Versions), detail.Versions)
 	}
@@ -1317,11 +1332,11 @@ func TestWebDataSourceAgentDetail(t *testing.T) {
 	if newest.ID != v2ID || newest.Number != 2 {
 		t.Fatalf("versions[0] = %+v, want v2 (number 2, id %s)", newest, v2ID)
 	}
-	if newest.State != "pending" {
-		t.Fatalf("versions[0].State = %q, want pending", newest.State)
+	if newest.State != "superseded" {
+		t.Fatalf("versions[0].State = %q, want superseded", newest.State)
 	}
 	if newest.Current {
-		t.Fatalf("newest pending v2 must not be marked Current")
+		t.Fatalf("newest v2 must not be marked Current; v1 is the current version")
 	}
 	// Each version carries its own body, mapped verbatim from the store row's Content.
 	if newest.Content != "v2 content" {

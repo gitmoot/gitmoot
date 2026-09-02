@@ -17,24 +17,22 @@ import (
 // dashboardSnapshot. Prompts carries the full interactive-prompt records (not
 // just id/question) so the Attention page can answer them inline.
 type Snapshot struct {
-	Home              string
-	DatabaseExists    bool
-	Daemon            Daemon
-	Repos             []Repo
-	Agents            []Agent
-	Sessions          []Session
-	Jobs              Jobs
-	Worktrees         []Worktree
-	BranchLocks       []BranchLock
-	Trains            []TrainSession
-	ResourceLocks     []ResourceLock
-	Prompts           []db.InteractivePrompt
-	JobRows           []JobRow
-	AwaitingHuman     []AwaitingHumanTask
-	PendingCandidates []PendingCandidate
-	ActiveJobs        []ActiveJob
-	Activity          []ActivityRoot
-	Config            ConfigView
+	Home           string
+	DatabaseExists bool
+	Daemon         Daemon
+	Repos          []Repo
+	Agents         []Agent
+	Sessions       []Session
+	Jobs           Jobs
+	Worktrees      []Worktree
+	BranchLocks    []BranchLock
+	ResourceLocks  []ResourceLock
+	Prompts        []db.InteractivePrompt
+	JobRows        []JobRow
+	AwaitingHuman  []AwaitingHumanTask
+	ActiveJobs     []ActiveJob
+	Activity       []ActivityRoot
+	Config         ConfigView
 }
 
 // ActiveJob mirrors cli.dashboardActiveJob: one in-flight (queued/running) job
@@ -55,16 +53,6 @@ type AwaitingHumanTask struct {
 	TaskID string
 	Repo   string
 	Title  string
-}
-
-// PendingCandidate is one SkillOpt template candidate awaiting a promote/reject
-// decision (#471), shown on the Attention page next to AwaitingHumanTask so a
-// candidate is locally visible even when [events] is off. VersionID is the pending
-// agent_template_version id; Score is the review row's score (empty when absent).
-type PendingCandidate struct {
-	VersionID  string
-	TemplateID string
-	Score      string
 }
 
 // ActivityRoot is one live delegation tree on the Activity page: a root
@@ -294,14 +282,6 @@ type BranchLock struct {
 	Owner  string
 }
 
-// TrainSession mirrors cli.dashboardTrainSession.
-type TrainSession struct {
-	ID        string
-	Phase     string
-	Candidate string
-	Repo      string
-}
-
 // ResourceLock mirrors cli.dashboardResourceLock.
 type ResourceLock struct {
 	Key   string
@@ -316,15 +296,10 @@ type Deps struct {
 	Dismiss  func(id string) error
 	Interval time.Duration
 
-	// CollapseGroupsByDefault folds collapsible repo groups (Attention / Trains)
+	// CollapseGroupsByDefault folds collapsible repo groups (Attention)
 	// on first show, so the live dashboard opens uncluttered; the user expands
 	// what they want with space. Tests leave it false (groups start expanded).
 	CollapseGroupsByDefault bool
-
-	// OpenTrain, when set, builds the embedded train-run model for a session;
-	// the Trains page pushes it onto the Root stack instead of the inline
-	// detail view.
-	OpenTrain func(sessionID string) tea.Model
 
 	// Job actions: event history + parsed payload (detail view), retry a
 	// failed/blocked job, cancel a queued/running one (cooperative — the
@@ -341,14 +316,6 @@ type Deps struct {
 	// StartDaemon starts the background daemon when the attention list shows it
 	// stopped.
 	StartDaemon func() error
-
-	// Train session actions. StopTrain abandons a live session's current run
-	// with a reason. DeleteTrain removes a terminal session and its history,
-	// returning the GitHub repos gitmoot recorded as created for it (still
-	// pending cleanup). DeleteTrainRepo deletes one such repo and its record.
-	StopTrain       func(id, reason string) error
-	DeleteTrain     func(id string) ([]string, error)
-	DeleteTrainRepo func(repo string) error
 
 	// Agent actions. TemplateVersions lazily loads a template's version history
 	// for the agent detail view. OpenAgentCreate builds the create-agent form
@@ -382,13 +349,6 @@ type Deps struct {
 	// template from that content and registers the agent against it.
 	EditAgentPrompt       func(seedTemplateID string) tea.Cmd
 	CreateAgentWithPrompt func(name, runtime, content string) error
-
-	// Optimize an agent: OpenAgentOptimize builds the pre-filled training form
-	// for the agent's template; StartOptimize scaffolds and starts the train
-	// session from the collected answers and returns its id, which the
-	// dashboard opens via OpenTrain.
-	OpenAgentOptimize func(agent Agent) (tea.Model, error)
-	StartOptimize     func(templateID string, values map[string]string) (string, error)
 
 	// HealthChecks runs the environment/runtime diagnostics for the Health
 	// page. It shells out (gh/codex/claude version calls), so it is dispatched
@@ -497,26 +457,6 @@ type daemonStartMsg struct {
 	err error
 }
 
-// trainStopMsg carries the outcome of a Deps.StopTrain call.
-type trainStopMsg struct {
-	err error
-}
-
-// trainDeleteMsg carries the outcome of a Deps.DeleteTrain call; repos are the
-// recorded gitmoot-created repos now eligible for cleanup.
-type trainDeleteMsg struct {
-	repos []string
-	err   error
-}
-
-// trainRepoCleanupMsg carries the outcome of a cleanup pass: the repos that
-// failed (so a retry only replays those) and their errors. Both empty on full
-// success.
-type trainRepoCleanupMsg struct {
-	failed []string
-	errs   []string
-}
-
 // agentVersionsMsg carries a template's version history for the agent detail.
 type agentVersionsMsg struct {
 	templateID string
@@ -550,22 +490,8 @@ type agentFormResultMsg struct {
 	result Result
 }
 
-// agentOptimizeFormResultMsg is delivered when the pushed optimize form pops.
-// It carries the template the form was opened for, so a cursor move between
-// opening and completing the form cannot retarget the session.
-type agentOptimizeFormResultMsg struct {
-	templateID string
-	result     Result
-}
-
 // healthChecksMsg carries the result of a Deps.HealthChecks dispatch.
 type healthChecksMsg struct {
 	checks []HealthCheck
 	err    error
-}
-
-// optimizeStartedMsg carries the outcome of Deps.StartOptimize.
-type optimizeStartedMsg struct {
-	sessionID string
-	err       error
 }

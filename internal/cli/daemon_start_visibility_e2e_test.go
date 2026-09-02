@@ -63,7 +63,7 @@ func TestDaemonStartRefusesWhenDaemonRunLockHeld(t *testing.T) {
 
 	spawned := false
 	prev := startDaemonChildFn
-	startDaemonChildFn = func(h, poll string, workers int, wsor, wi bool, scheduler, repo, session string, state daemonState, workDir string) (daemonMeta, error) {
+	startDaemonChildFn = func(h, poll string, workers int, wi bool, scheduler, repo, session string, state daemonState, workDir string) (daemonMeta, error) {
 		spawned = true
 		return daemonMeta{PID: 424242, LogFile: filepath.Join(h, "daemon.log")}, nil
 	}
@@ -113,7 +113,7 @@ func TestStartDaemonChildSurfacesInstantFlockLoser(t *testing.T) {
 	state := daemonProcessState(paths)
 	holdDaemonRunLock(t, home)
 
-	meta, err := startDaemonChild(home, "30s", 1, false, false, "", "", "", state, t.TempDir())
+	meta, err := startDaemonChild(home, "30s", 1, false, "", "", "", state, t.TempDir())
 	if err == nil {
 		_ = syscall.Kill(meta.PID, syscall.SIGKILL)
 		reapChildProcess(t, meta.PID)
@@ -143,7 +143,7 @@ func TestStartDaemonChildConfirmsHealthySurvivor(t *testing.T) {
 	}
 	state := daemonProcessState(paths)
 
-	meta, err := startDaemonChild(home, "30s", 1, false, false, "", "", "", state, t.TempDir())
+	meta, err := startDaemonChild(home, "30s", 1, false, "", "", "", state, t.TempDir())
 	if err != nil {
 		t.Fatalf("startDaemonChild: %v", err)
 	}

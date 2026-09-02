@@ -159,26 +159,6 @@ var hostRunnerAllowlist = map[string]hostRunnerAllowance{
 		execRunners: 1,
 		reason:      "operator repo registration inspects and repairs the selected host checkout",
 	},
-	"internal/cli/skillopt_gate.go:<package>": {
-		execRunners: 1,
-		reason:      "operator skillopt gate replays a local candidate command through a replaceable seam",
-	},
-	"internal/cli/skillopt_optimize.go:<package>": {
-		execRunners: 1,
-		reason:      "operator skillopt optimization invokes the configured local optimizer through a replaceable seam",
-	},
-	"internal/cli/skillopt_publish.go:<package>": {
-		execRunners: 1,
-		reason:      "operator skillopt publish preview invokes local tooling through a replaceable seam",
-	},
-	"internal/cli/skillopt_trainrun_tui.go:<package>": {
-		rawCommands: 1,
-		reason:      "interactive skillopt TUI starts a detached local train process",
-	},
-	"internal/cli/trace_harvest_daemon.go:daemonDeterministicCheckerDispatcher": {
-		execRunners: 1,
-		reason:      "post-delivery deterministic checks run against the collected managed checkout on the host",
-	},
 	"internal/cli/update.go:runDaemonRestartFromExecutable": {
 		rawCommands: 1,
 		reason:      "operator update lifecycle restarts the local daemon executable",

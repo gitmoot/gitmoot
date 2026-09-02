@@ -25,10 +25,6 @@ The pilot emits a tight allowlist of event types over the webhook transport:
 | `job.deferred`                  | the daemon re-queued a run whose delivery failed on a retryable operational blocker (runtime auth, rate limit/quota, network/GitHub outage, checkout contention) — it will be re-dispatched automatically. Since #532 slice E this is a **first-class** transition emitted INSTEAD of `job.failed` (no preceding `job.failed` for that run) |
 | `org.input_pending`             | a Herdr pane bound to an organization role continuously reports an interactive input dialog past the configured threshold |
 | `org.reply`                     | the daemon drains a durable, coalesced batch of notes addressed to one organization role |
-| `candidate.awaiting_promotion`  | a SkillOpt template candidate becomes `pending` after import (always, off the auto-promote policy) |
-| `candidate.auto_promoted`       | the off-by-default `[skillopt].auto_promote` policy auto-promoted a candidate to `current` (also the canary GRADUATE event) |
-| `candidate.canary_started`      | the off-by-default `[skillopt].auto_promote_canary` policy promoted a candidate to the `canary` state behind the live champion |
-| `candidate.rolled_back`         | the canary regression window auto-rolled-back a canary on a material regression (champion stays current, canary rejected) |
 
 Each terminal transition emits **exactly once**. `org.input_pending` is an
 episode alert instead: it repeats at most once per configured interval while
@@ -56,33 +52,6 @@ flap is gone. A `job.failed` with no following `job.deferred` was already the on
 "final" signal, so the safe consumer rule is unchanged and forward-compatible:
 **treat `job.failed` as final only when it is not immediately followed by a
 `job.deferred` for the same `job_id`.**
-
-The two `candidate.*` events come from the `skillopt import` / `train continue`
-CLI path, NOT the daemon (#471). When a candidate becomes `pending`,
-`candidate.awaiting_promotion` is emitted **once** carrying the version id
-(`job_id`), the template id (`root_id`), and a redacted score/samples/CI reason —
-independent of the auto-promote policy, so a human is notified even in the manual
-default. If `[skillopt].auto_promote` is on **and** every configured guardrail
-holds, the candidate is promoted via the existing promote path and
-`candidate.auto_promoted` fires so the change can be reviewed or rolled back. The
-adjacent dashboard **Attention** page also lists every pending candidate
-(read-only), so candidates are visible locally even with `[events]` off.
-
-When `[skillopt].auto_promote_canary` is on **and** `auto_promote_canary_sample`
-is a fraction in `(0,1]`, a guardrails-pass candidate is promoted to a **canary**
-instead of straight to `current`: it routes that sampled fraction of new job
-resolutions while the prior champion stays the live current version, and
-`candidate.canary_started` fires (carrying the canary version id, template id, and
-the sample fraction). The daemon then watches a bounded regression window over the
-canary's harvested verifiable outcomes (reusing the #465 Mode A signal, no new
-evaluator) and compares it to the prior champion: on parity-or-better it
-**graduates** the canary to `current` and emits `candidate.auto_promoted`; on a
-**material regression** it auto-rolls-back — the champion stays current, the canary
-is rejected, and `candidate.rolled_back` fires. It is **fail-safe**: too few canary
-outcomes, no champion baseline, or feedback it could not read all **hold** (keep
-sampling), never rolling back on unread evidence and never graduating without
-confirming non-regression. With the knob off (the default) promotion is the
-unchanged direct path and no canary event is ever emitted.
 
 The following `event_type` values are **reserved** for the graduate step. They
 are enumerated in the contract so a consumer can `switch` over them

@@ -84,7 +84,7 @@ agent type's `max_background` — you never create one directly.
 - You will reuse it (a repo's `reviewer`, a `planner` you invoke repeatedly).
 - It needs a stable name — PR-comment subscriptions, `gitmoot agent ask <name>`,
   the dashboard, job history and accountability.
-- It carries managed state: a versioned, SkillOpt-trained template, a resumable
+- It carries managed state: a versioned template, a resumable
   runtime session, repo scope / capabilities / autonomy you tune.
 - You want a pool that auto-scales under load — a managed *agent type* with
   `max_background` (the daemon forks temp workers from it).

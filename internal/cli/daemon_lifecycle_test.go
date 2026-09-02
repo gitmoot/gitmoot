@@ -202,7 +202,7 @@ func TestDaemonRestartOverlayPreservesSavedArgs(t *testing.T) {
 func TestDaemonStartForwardsRepoAndSessionThroughRestart(t *testing.T) {
 	// The detached child argv carries both filters (this is exactly what
 	// daemonMeta.Args records).
-	childArgs := daemonChildArgs("/tmp/gitmoot-home", "30s", 1, false, false, "barrier", "owner/project", "root-coordinator")
+	childArgs := daemonChildArgs("/tmp/gitmoot-home", "30s", 1, false, "barrier", "owner/project", "root-coordinator")
 	if !daemonArgsContainFlag(childArgs, "repo", "owner/project") {
 		t.Fatalf("child argv missing --repo: %v", childArgs)
 	}
@@ -262,7 +262,7 @@ func TestDaemonStartConfigSessionRootAlias(t *testing.T) {
 }
 
 func TestDaemonChildArgsRunAllRepoSupervisor(t *testing.T) {
-	args := daemonChildArgs("/tmp/gitmoot-home", "30s", 2, true, false, "barrier", "", "")
+	args := daemonChildArgs("/tmp/gitmoot-home", "30s", 2, false, "barrier", "", "")
 
 	for i, arg := range args {
 		if arg == "--repo" || strings.HasPrefix(arg, "--repo=") {
@@ -282,13 +282,13 @@ func TestDaemonChildArgsRunAllRepoSupervisor(t *testing.T) {
 	if parsed.Session != "" {
 		t.Fatalf("daemon child args carried a session filter: %v", args)
 	}
-	if parsed.Workers != 2 || parsed.Poll != 30*time.Second || !parsed.WatchSkillOptReviews {
+	if parsed.Workers != 2 || parsed.Poll != 30*time.Second {
 		t.Fatalf("parsed child args = %+v", parsed)
 	}
 }
 
 func TestDaemonChildArgsForwardsRepo(t *testing.T) {
-	args := daemonChildArgs("/tmp/gitmoot-home", "30s", 1, false, false, "barrier", "owner/project", "")
+	args := daemonChildArgs("/tmp/gitmoot-home", "30s", 1, false, "barrier", "owner/project", "")
 
 	if !daemonArgsContainFlag(args, "repo", "owner/project") {
 		t.Fatalf("daemon child args missing --repo owner/project: %v", args)
@@ -306,7 +306,7 @@ func TestDaemonChildArgsForwardsRepo(t *testing.T) {
 }
 
 func TestDaemonChildArgsForwardsSession(t *testing.T) {
-	args := daemonChildArgs("/tmp/gitmoot-home", "30s", 1, false, false, "barrier", "owner/project", "root-coordinator")
+	args := daemonChildArgs("/tmp/gitmoot-home", "30s", 1, false, "barrier", "owner/project", "root-coordinator")
 
 	if !daemonArgsContainFlag(args, "repo", "owner/project") {
 		t.Fatalf("daemon child args missing --repo owner/project: %v", args)
@@ -426,7 +426,7 @@ func TestParseSchedulerMode(t *testing.T) {
 }
 
 func TestDaemonChildArgsForwardsPoolScheduler(t *testing.T) {
-	pool := daemonChildArgs("/tmp/home", "30s", 1, false, false, "pool", "", "")
+	pool := daemonChildArgs("/tmp/home", "30s", 1, false, "pool", "", "")
 	if !daemonArgsContainFlag(pool, "scheduler", "pool") {
 		t.Fatalf("pool child args missing --scheduler pool: %v", pool)
 	}
@@ -439,7 +439,7 @@ func TestDaemonChildArgsForwardsPoolScheduler(t *testing.T) {
 	}
 	// barrier (the default) appends no --scheduler flag, keeping the child argv
 	// byte-identical to before this change.
-	barrier := daemonChildArgs("/tmp/home", "30s", 1, false, false, "barrier", "", "")
+	barrier := daemonChildArgs("/tmp/home", "30s", 1, false, "barrier", "", "")
 	for _, a := range barrier {
 		if a == "--scheduler" {
 			t.Fatalf("barrier child args should not carry --scheduler: %v", barrier)
@@ -501,7 +501,7 @@ func TestParseDaemonStartConfigAutoPoolsWithWorkers(t *testing.T) {
 		t.Fatalf("ExplicitScheduler = true, want false (auto-selection is not explicit)")
 	}
 	// The resolved child args must carry --scheduler pool so the daemon child runs it.
-	childArgs := daemonChildArgs("", "30s", parsed.Workers, false, false, parsed.Scheduler, "", "")
+	childArgs := daemonChildArgs("", "30s", parsed.Workers, false, parsed.Scheduler, "", "")
 	if !daemonArgsContainFlag(childArgs, "scheduler", "pool") {
 		t.Fatalf("child argv missing --scheduler pool: %v", childArgs)
 	}
@@ -591,7 +591,7 @@ func TestDaemonAutoPoolSurvivesChildArgsAndRestart(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("parseDaemonStartConfig code = %d", code)
 	}
-	childArgs := daemonChildArgs(cfg.Home, cfg.Poll.String(), cfg.Workers, cfg.WatchSkillOptReviews, cfg.WatchIssues, cfg.Scheduler, cfg.RepoFlag, cfg.Session)
+	childArgs := daemonChildArgs(cfg.Home, cfg.Poll.String(), cfg.Workers, cfg.WatchIssues, cfg.Scheduler, cfg.RepoFlag, cfg.Session)
 	if !daemonArgsContainFlag(childArgs, "scheduler", "pool") {
 		t.Fatalf("persisted child argv lost auto-selected pool: %v", childArgs)
 	}

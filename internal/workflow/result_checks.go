@@ -82,7 +82,7 @@ func normalizeResultCheckMode(mode ResultCheckMode) ResultCheckMode {
 // passes every applicable check is byte-identical on the wire.
 type ResultCheck struct {
 	// ID is a stable, machine-readable handle for the check (e.g.
-	// "implement-tests-listed"), suitable for later SkillOpt aggregation.
+	// "implement-tests-listed"), suitable for later aggregation.
 	ID string `json:"id"`
 	// Action is the job action the check applies to ("implement", "review",
 	// "ask", "coordinator"), or "any" for a decision-scoped check that applies

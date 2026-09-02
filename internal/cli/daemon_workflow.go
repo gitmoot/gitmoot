@@ -61,57 +61,6 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 		// byte-identical. The sink is a process-global shared singleton (one drain
 		// goroutine), so re-building the engine per tick never leaks goroutines.
 		EventSink: daemonEventSink(store, home),
-		// Off-by-default Mode-A trace-harvester (#465): on a verifiable implement-job
-		// outcome (merge merged/blocked, review changes_requested, revert) the engine
-		// harvests a synthetic {score, feedback} FeedbackEvent for the job's template
-		// version through this best-effort, nil-safe seam. daemonOutcomeHarvester
-		// returns nil unless [skillopt].auto_trace_enabled is set, so with no config
-		// NO harvester is constructed and behavior — and every human-run
-		// TrainingPackage — is byte-identical. The harvester writes ONLY
-		// eval/feedback rows; promotion stays 100% manual (the #484 canary wrapper
-		// below is the only path that may graduate/roll back, and only when canary
-		// mode is configured AND a live canary exists).
-		//
-		// Off-by-default #484 canary regression window: when [skillopt].auto_promote_canary
-		// is configured with a valid sample, the base harvester is wrapped so that AFTER
-		// a verifiable outcome it loads the active canary + prior champion auto-trace runs
-		// and graduates (-> current) or auto-rolls-back (reusing RevertAgentTemplateVersion
-		// to keep the champion live + rejecting the canary) on a material regression.
-		// daemonOutcomeHarvesterWithCanary returns the bare base harvester when canary is
-		// off and nil when auto_trace is off, so both default paths stay byte-identical.
-		OutcomeHarvester: daemonOutcomeHarvesterWithCanary(store, gh, home),
-		// Off-by-default cross-family review-agent soft signal (#469): on a MERGE the
-		// engine additionally runs a read-only CROSS-FAMILY review leg (off the
-		// blocking merge path, best-effort) whose subjective-quality + scope-fidelity
-		// rubric is projected into a SECOND, judge-tagged, down-weighted FeedbackEvent
-		// in the SAME auto-trace run. daemonReviewLegDispatcher returns nil unless BOTH
-		// [skillopt].cross_family_review_enabled AND auto_trace_enabled are set, so with
-		// no config NO review leg runs and NO review row is written — byte-identical.
-		// A review-leg failure never blocks or fails a job; promotion stays manual.
-		ReviewLegDispatcher: daemonReviewLegDispatcher(store, gh, checkout, home),
-		// Off-by-default OBJECTIVE deterministic-checker signal (#485): on a MERGE the
-		// engine additionally runs a best-effort, DETACHED leg of plain external tools
-		// (duplication/lint/complexity) + a pure-Go diff-size metric whose tool-derived
-		// [0,1] dimensions are projected into a THIRD, objective-tagged FeedbackEvent in
-		// the SAME auto-trace run, distinct from the verifiable floor and the subjective
-		// review. daemonDeterministicCheckerDispatcher returns nil unless BOTH
-		// [skillopt].deterministic_checkers_enabled AND auto_trace_enabled are set, so
-		// with no config NO checker leg runs and NO checker row is written —
-		// byte-identical. A missing tool/checkout/timeout SKIPS that dimension and never
-		// blocks or fails the merge; promotion stays manual.
-		DeterministicCheckerDispatcher: daemonDeterministicCheckerDispatcher(store, gh, checkout, home),
-		// Off-by-default deterministic HARD-verifier tier (#474): on a MERGE the engine
-		// additionally runs the operator's configured build/test/lint commands in a
-		// FRESH sandbox checkout at the merged head (exit 0 == pass), best-effort and
-		// DETACHED, and projects the binary pass/fail as the authoritative
-		// EvaluatorScore.Hard into the SAME auto-trace run — an un-gameable gate distinct
-		// from the verifiable floor, the subjective review, and the objective checker.
-		// daemonHardVerifierDispatcher returns nil unless [skillopt].hard_verifiers_enabled
-		// AND auto_trace_enabled are set AND at least one command is configured, so with
-		// no config NO verifier leg runs and NO hard row is written — byte-identical. A
-		// slow suite / unprovisionable sandbox never blocks or fails the merge; promotion
-		// stays manual.
-		HardVerifierDispatcher: daemonHardVerifierDispatcherForRunner(store, checkout, home, runner),
 		// Off-by-default agent persistent memory (#626, Phase 1 observation mode):
 		// when at least one agent is enrolled ([agents.<name>].memory = true) and the
 		// global kill switch is off, the engine's Mailbox injects a "Prior learnings"
@@ -139,12 +88,6 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 		PayloadRefresher: func(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
 			return refreshDaemonJobPayloadForRunner(ctx, store, checkout, job, payload, runner)
 		},
-		// Gate the #484 canary ROUTING seam on the SAME policy.CanaryEnabled() the
-		// OutcomeHarvester's regression comparator above is gated on, so both seams
-		// are consistent: with canary off NO traffic is sampled (Mailbox.routeCanary
-		// returns before its query, byte-identical) AND no comparator runs, so a
-		// stranded canary row can never keep serving traffic with no auto-rollback.
-		CanaryEnabled: canaryRoutingEnabled(home),
 		// Off-by-default #530 coordinator routing-context injection: when [router]
 		// context_enabled is set, the engine's Mailbox appends a bounded advisory
 		// observed-performance table to a top-level coordinator job's prompt.
