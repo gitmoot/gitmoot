@@ -84,11 +84,11 @@ func (s *Store) GetRepo(ctx context.Context, fullName string) (Repo, error) {
 func (s *Store) ListRepos(ctx context.Context) ([]Repo, error) {
 	out, err := queryList(ctx, s.db, `SELECT owner, name, default_branch, remote_url, checkout_path, primary_checkout_path, enabled, poll_interval, last_poll_at, last_error
 		FROM repos ORDER BY full_name`, nil, scanRepo)
-	if err != nil {
-		return nil, err
-	}
-	// Promised a non-nil empty slice before #1759 and still does.
-	return emptyIfNil(out), nil
+	// Pre-#1759 these loaders returned `accumulator, rows.Err()`, so a LATE
+	// iteration error arrived WITH the rows already read. Returning nil here
+	// would silently convert an iteration failure into an empty result, which
+	// is the one shape a caller checking only the slice cannot notice.
+	return emptyIfNil(out), err
 }
 
 // HealRepoCheckout atomically replaces a repo checkout only when it still has
@@ -196,11 +196,11 @@ func (s *Store) ListGoals(ctx context.Context) ([]Goal, error) {
 			err := row.Scan(&goal.ID, &goal.Title, &goal.Source, &goal.Status)
 			return goal, err
 		})
-	if err != nil {
-		return nil, err
-	}
-	// Promised a non-nil empty slice before #1759 and still does.
-	return emptyIfNil(out), nil
+	// Pre-#1759 these loaders returned `accumulator, rows.Err()`, so a LATE
+	// iteration error arrived WITH the rows already read. Returning nil here
+	// would silently convert an iteration failure into an empty result, which
+	// is the one shape a caller checking only the slice cannot notice.
+	return emptyIfNil(out), err
 }
 
 func (s *Store) UpsertTask(ctx context.Context, task Task) error {

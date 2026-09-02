@@ -57,9 +57,9 @@ func (s *Store) ListRecycleOverdueEpisodes(ctx context.Context) ([]RecycleOverdu
 			err := row.Scan(&episode.Subject, &episode.OverdueSince, &episode.EmittedAt, &episode.UpdatedAt)
 			return episode, err
 		})
-	if err != nil {
-		return nil, err
-	}
-	// This method promised a non-nil empty slice before #1759 and still does.
-	return emptyIfNil(result), nil
+	// Pre-#1759 these loaders returned `accumulator, rows.Err()`, so a LATE
+	// iteration error arrived WITH the rows already read. Returning nil here
+	// would silently convert an iteration failure into an empty result, which
+	// is the one shape a caller checking only the slice cannot notice.
+	return emptyIfNil(result), err
 }

@@ -1181,3 +1181,38 @@ func TestSafeLogName(t *testing.T) {
 		}
 	}
 }
+
+// TestWatchCommandKeepsReservedTokensInArgumentPosition is the CLI-path half of
+// the #1795 review's shellquote finding. internal/shellquote's contract is
+// scoped to ARGUMENT position, so this asserts the property that scope depends
+// on: values that would be reinterpreted in command position - the reserved
+// word `if`, the assignment form `FOO=bar` - land after a flag or after the
+// command word, never as the command word itself.
+//
+// The command word here is gitmootBin, which is deliberately NOT routed through
+// shellquote.Posix. If a future change ever built the command word from a quoted
+// value, this test is where that shows up.
+func TestWatchCommandKeepsReservedTokensInArgumentPosition(t *testing.T) {
+	a := &paneAdapter{
+		cockpit: &Cockpit{gitmootBin: "gitmoot", home: "FOO=bar"},
+		meta:    JobMeta{JobID: "if", Runtime: "while", LogPath: "/tmp/if.log"},
+	}
+	got := a.watchCommand()
+
+	// The command word is the literal binary, not a quoted value.
+	if !strings.HasPrefix(got, "gitmoot job watch ") {
+		t.Fatalf("command word is not the literal binary: %q", got)
+	}
+	// Each reserved/assignment token appears only after a preceding word.
+	for _, want := range []string{"job watch if", "--runtime while", "--home FOO=bar"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("want %q in argument position; got %q", want, got)
+		}
+	}
+	// And none of them starts the command.
+	for _, token := range []string{"if ", "while ", "FOO=bar "} {
+		if strings.HasPrefix(got, token) {
+			t.Fatalf("token %q reached COMMAND position: %q", token, got)
+		}
+	}
+}

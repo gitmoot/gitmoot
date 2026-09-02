@@ -101,11 +101,11 @@ func (s *Store) ListAgentTemplates(ctx context.Context) ([]AgentTemplate, error)
 		// interface, which is never identical to queryList's unnamed one, so this
 		// one call site needs an explicit adapter rather than the bare function.
 		func(row rowScanner) (AgentTemplate, error) { return scanAgentTemplateWithVersion(row) })
-	if err != nil {
-		return nil, err
-	}
-	// Promised a non-nil empty slice before #1759 and still does.
-	return emptyIfNil(out), nil
+	// Pre-#1759 these loaders returned `accumulator, rows.Err()`, so a LATE
+	// iteration error arrived WITH the rows already read. Returning nil here
+	// would silently convert an iteration failure into an empty result, which
+	// is the one shape a caller checking only the slice cannot notice.
+	return emptyIfNil(out), err
 }
 
 func (s *Store) GetAgentTemplateReference(ctx context.Context, ref string) (AgentTemplate, error) {

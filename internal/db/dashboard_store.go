@@ -207,12 +207,11 @@ func (s *Store) ListDashboardBlockedJobs(ctx context.Context) ([]DashboardJobRow
 				&item.Payload, &item.CreatedAt, &item.UpdatedAt, &item.Reason)
 			return item, err
 		})
-	if err != nil {
-		return nil, err
-	}
-	// Promised a non-nil empty slice before #1759 and still does: this one is
-	// served directly to the dashboard's HTTP client.
-	return emptyIfNil(out), nil
+	// Pre-#1759 these loaders returned `accumulator, rows.Err()`, so a LATE
+	// iteration error arrived WITH the rows already read. Returning nil here
+	// would silently convert an iteration failure into an empty result, which
+	// is the one shape a caller checking only the slice cannot notice.
+	return emptyIfNil(out), err
 }
 
 func (s *Store) ListDashboardTerminalBuckets(ctx context.Context, since, now string) ([]DashboardTerminalBucket, error) {

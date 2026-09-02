@@ -442,11 +442,11 @@ func (s *Store) FindActiveAgentInstance(ctx context.Context, typ string, repo st
 func (s *Store) ListAgentInstances(ctx context.Context) ([]AgentInstance, error) {
 	out, err := queryList(ctx, s.db, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, template_id, model, effort, capabilities_json, autonomy_policy, state, created_at, last_used_at, expires_at
 		FROM agent_instances ORDER BY type, repo_full_name, name`, nil, scanAgentInstance)
-	if err != nil {
-		return nil, err
-	}
-	// Promised a non-nil empty slice before #1759 and still does.
-	return emptyIfNil(out), nil
+	// Pre-#1759 these loaders returned `accumulator, rows.Err()`, so a LATE
+	// iteration error arrived WITH the rows already read. Returning nil here
+	// would silently convert an iteration failure into an empty result, which
+	// is the one shape a caller checking only the slice cannot notice.
+	return emptyIfNil(out), err
 }
 
 func (s *Store) TouchAgentInstance(ctx context.Context, name string, now time.Time, idleTimeout time.Duration) error {

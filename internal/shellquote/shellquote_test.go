@@ -105,3 +105,76 @@ func TestPosixNeverEmitsAnUnquotedMetacharacter(t *testing.T) {
 		}
 	}
 }
+
+// TestPosixArgumentPositionHoldsForReservedAndAssignmentTokens pins the NARROWED
+// contract from the #1795 review: `if` and `FOO=bar` come back unquoted, and
+// that is correct BECAUSE the guarantee is argument position only.
+//
+// Both are then round-tripped through a real /bin/sh in argument position, which
+// is the assertion that matters: the value the shell hands the command must be
+// the original string, reserved word or not.
+func TestPosixArgumentPositionHoldsForReservedAndAssignmentTokens(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skipf("no sh on PATH: %v", err)
+	}
+	// Reserved WORDS and assignment-form tokens are all-safe-rune, so they come
+	// back bare. '!' is deliberately NOT in this list: it is a metacharacter
+	// (negation, and history expansion in an interactive shell) and IS quoted -
+	// asserting otherwise was this test's own first mistake.
+	for _, in := range []string{"if", "while", "then", "FOO=bar", "PATH=/tmp"} {
+		quoted := Posix(in)
+		if quoted != in {
+			t.Fatalf("Posix(%q) = %q; these tokens are argument-safe and should stay bare", in, quoted)
+		}
+		// Argument position: printf's first operand. This is how every gitmoot
+		// call site uses the result.
+		out, err := exec.Command(sh, "-c", "printf %s "+quoted).Output()
+		if err != nil {
+			t.Fatalf("sh rejected %q in argument position: %v", quoted, err)
+		}
+		if string(out) != in {
+			t.Fatalf("argument position: sh saw %q, want %q", string(out), in)
+		}
+	}
+
+	// Whether a token is quoted or not, argument position must round-trip. '!'
+	// belongs here rather than above: it is quoted, and still arrives intact.
+	for _, in := range []string{"!", "if", "FOO=bar"} {
+		out, err := exec.Command(sh, "-c", "printf %s "+Posix(in)).Output()
+		if err != nil {
+			t.Fatalf("sh rejected Posix(%q) = %s: %v", in, Posix(in), err)
+		}
+		if string(out) != in {
+			t.Fatalf("argument position: Posix(%q) -> sh saw %q", in, string(out))
+		}
+	}
+}
+
+// TestPosixDoesNotClaimCommandPosition is the negative half, and it exists so the
+// limitation is DEMONSTRATED rather than only documented. `FOO=bar` in command
+// position is an assignment: the shell runs no command and produces no output,
+// which is exactly the reinterpretation the package doc now disclaims.
+//
+// If a future change made Posix quote assignment-form tokens, this test fails and
+// tells the author to widen the documented contract deliberately rather than by
+// accident.
+func TestPosixDoesNotClaimCommandPosition(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skipf("no sh on PATH: %v", err)
+	}
+	assignment := Posix("FOO=bar")
+	if assignment != "FOO=bar" {
+		t.Fatalf("Posix(\"FOO=bar\") = %q; if this is now quoted, the package doc's argument-position scope must be widened on purpose", assignment)
+	}
+	// Command position: the shell treats it as an assignment, so `printf` never
+	// runs and nothing is written.
+	out, err := exec.Command(sh, "-c", assignment).Output()
+	if err != nil {
+		t.Fatalf("sh -c %q errored unexpectedly: %v", assignment, err)
+	}
+	if len(out) != 0 {
+		t.Fatalf("command position produced %q; the assignment reinterpretation this test documents did not occur", string(out))
+	}
+}

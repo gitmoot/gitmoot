@@ -12,6 +12,27 @@
 // every rune is provably safe. Over-quoting is always correctness-preserving —
 // a quoted string means exactly itself to sh — whereas under-quoting is how a
 // path with a '#' or a '~' becomes a comment or a home-directory expansion.
+//
+// SCOPE: ARGUMENT POSITION ONLY. The guarantee is that sh passes the value
+// through as one literal word where a WORD is expected — after a command name,
+// after a flag, inside a `[ ... ]` test. It is NOT a guarantee about COMMAND
+// position, and it cannot be: a bare `if`, `while` or `!` is a reserved word
+// there, and a bare `FOO=bar` is a variable assignment, so the shell reinterprets
+// them before any quoting question arises. Both are returned unquoted by Posix
+// because both are safe as arguments, which is the only position gitmoot uses.
+//
+// Callers own that boundary. Every current call site builds `<literal command>
+// <quoted arguments>` — `gh release view <repo>`, `codex plugin marketplace add
+// <root>`, `<gitmootBin> job watch <id>` — so no Posix result ever lands in
+// command position, and gitmootBin is deliberately NOT routed through here. A
+// future caller that needs a computed COMMAND WORD must not use this function
+// and must not assume it protects that position.
+//
+// Deliberately NOT solved by quoting reserved words and assignment-form tokens:
+// that would mean enumerating every shell's reserved list correctly, forever,
+// which is precisely the denylist defect this package replaced. Narrowing a
+// documented contract to what the code actually guarantees is the cheaper and
+// more honest fix (#1759, review of PR #1795).
 package shellquote
 
 import "strings"
