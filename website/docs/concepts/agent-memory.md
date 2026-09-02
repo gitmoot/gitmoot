@@ -198,7 +198,7 @@ All of the following are read-only:
 gitmoot memory list [--pending|--confirmed] [--agent NAME] [--repo owner/repo]
 gitmoot memory recall "<query>" [--repo owner/repo] [--agent NAME|--shared] [--limit N] [--expand]
 gitmoot memory replay [--agent NAME] [--repo owner/repo] [--limit N]
-gitmoot memory eval --fixtures evals/memory-retrieval-fixtures.json [--k N] [--json]
+gitmoot memory eval --fixtures internal/cli/testdata/memory-retrieval-fixtures.json [--k N] [--json]
 ```
 
 `memory list` shows confirmed memories and pending observations. `memory recall`
@@ -218,8 +218,9 @@ persisted links.
 learnings block and reports the injection delta (added tokens, entries injected)
 — it measures injection *mechanics*, not outcome quality. `memory eval` scores
 the production `PreviewEntries` retrieval path against the versioned 44-case
-`evals/memory-retrieval-fixtures.json` exam. It includes verbatim real-job
-instructions, known incidents, six deliberately disjoint-vocabulary paraphrases,
+`internal/cli/testdata/memory-retrieval-fixtures.json` exam. It includes
+verbatim real-job instructions, known incidents, six deliberately
+disjoint-vocabulary paraphrases,
 and self-retrieval sanity checks. The original fixture fields remain valid;
 optional `id`, `source`, `category`, `note`, and `expected_alternates` fields add
 provenance and key-stability labels without breaking old fixture files.

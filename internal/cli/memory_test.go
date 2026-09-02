@@ -685,7 +685,7 @@ func TestMemoryEvalOldFixtureContractStillParses(t *testing.T) {
 }
 
 func TestMemoryEvalCheckedInFixtureSchema(t *testing.T) {
-	fixtures, err := loadMemoryEvalFixtures(filepath.Join("..", "..", "evals", "memory-retrieval-fixtures.json"))
+	fixtures, err := loadMemoryEvalFixtures(filepath.Join("testdata", "memory-retrieval-fixtures.json"))
 	if err != nil {
 		t.Fatalf("load checked-in fixtures: %v", err)
 	}
