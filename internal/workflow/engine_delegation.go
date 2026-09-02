@@ -668,7 +668,35 @@ type PullRequestFetcher interface {
 // delegation_enqueued event. It is shared by enqueueDelegation (initial/deferred
 // dispatch) and requeueDelegation (retry) so both go through identical worktree
 // allocation and idempotent enqueue.
+// allocateAndEnqueueDelegation is the ONE CHOKE POINT every delegation precondition
+// flows through: worktree allocation, the shared-checkout branch lock, dependency
+// resolution and the enqueue itself. Under a capturing resolution its refusal is
+// therefore classifiable STRUCTURALLY rather than per-site (#1673).
+//
+// WHY THE CLASSIFICATION LIVES HERE AND NOT AT THE ERROR TYPE. A refused allocation and
+// a recorded synthesis decision are the SAME Go type - both surface as BlockedError -
+// so a type check cannot separate them, and the version that tried settled a retry that
+// had dispatched nothing and lost a human's decision. The property that actually decides
+// is WHERE the block came from: a block raised while establishing this leg's
+// preconditions means the decision could not be attempted, while a block raised by the
+// DAG's synthesis rules means the decision WAS applied and the parent is blocked as its
+// outcome. Only the first passes through this function's error return, so marking it
+// here cannot alias the second.
 func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, payload JobPayload, d Delegation, request JobRequest, ref taskRef) error {
+	err := e.allocateAndEnqueueDelegationInner(ctx, job, payload, d, request, ref)
+	if err == nil || !e.capturing() {
+		return err
+	}
+	var blocked BlockedError
+	if errors.As(err, &blocked) {
+		// The block itself was already captured by blockTask on the way out; this only
+		// records the OUTCOME, so it must not write the block a second time.
+		e.resolutionSink.blocked = &blocked
+	}
+	return err
+}
+
+func (e Engine) allocateAndEnqueueDelegationInner(ctx context.Context, job db.Job, payload JobPayload, d Delegation, request JobRequest, ref taskRef) error {
 	if request.Action == "implement" {
 		if e.DelegationWorktrees == nil || strings.TrimSpace(e.Home) == "" {
 			// No per-delegation worktree isolation is available (the engine lacks a
@@ -702,7 +730,7 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 			if err != nil {
 				var blocked BlockedError
 				if errors.As(err, &blocked) {
-					return e.blockRefusedAllocation(ctx, ref, blocked.Reason)
+					return e.block(ctx, ref, blocked.Reason)
 				}
 				return err
 			}
@@ -759,7 +787,7 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 			if err != nil {
 				var blocked BlockedError
 				if errors.As(err, &blocked) {
-					return e.blockRefusedAllocation(ctx, ref, blocked.Reason)
+					return e.block(ctx, ref, blocked.Reason)
 				}
 				return err
 			}
@@ -820,7 +848,7 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 			if err != nil {
 				var blocked BlockedError
 				if errors.As(err, &blocked) {
-					return e.blockRefusedAllocation(ctx, ref, blocked.Reason)
+					return e.block(ctx, ref, blocked.Reason)
 				}
 				// A cold checkout may not carry the PR commit object even though the
 				// forge supplied its SHA, and nothing in the daemon poll/dispatch path
@@ -850,7 +878,7 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 				path, err = allocate()
 				if err != nil {
 					if errors.As(err, &blocked) {
-						return e.blockRefusedAllocation(ctx, ref, blocked.Reason)
+						return e.block(ctx, ref, blocked.Reason)
 					}
 					return fmt.Errorf("allocate read-only fan-out worktree for delegation %q after fetch: %w", request.DelegationID, err)
 				}

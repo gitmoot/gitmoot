@@ -719,7 +719,10 @@ func (e Engine) AllocateDelegationWorktree(ctx context.Context, request Delegati
 	}
 	if lineage.DirtyBlocked {
 		reason := lineage.dirtyBlockedMessage(path)
-		if err := e.Store.AddJobEvent(ctx, db.JobEvent{
+		// Captured under a resolution so a later ownership loss, crash or refused task
+		// commit cannot leave audit rows from a decision that was never applied - and
+		// cannot duplicate them on recovery (#1673).
+		if err := e.recordEffectEvent(ctx, db.JobEvent{
 			JobID:   request.ParentJobID,
 			Kind:    "stale_worktree_dirty_blocked",
 			Message: reason,
@@ -735,7 +738,7 @@ func (e Engine) AllocateDelegationWorktree(ctx context.Context, request Delegati
 		return DelegationWorktreeResult{}, BlockedError{Reason: reason}
 	}
 	if lineage.Recut {
-		if err := e.Store.AddJobEvent(ctx, db.JobEvent{
+		if err := e.recordEffectEvent(ctx, db.JobEvent{
 			JobID:   request.ParentJobID,
 			Kind:    "stale_worktree_recut",
 			Message: lineage.message("stale delegation worktree detected and re-cut"),

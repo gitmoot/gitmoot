@@ -1348,7 +1348,10 @@ func (e Engine) resumeAnswerLeg(ctx context.Context, parentJob db.Job, parentPay
 	if err := e.maybeEnqueueContinuation(ctx, parentJob, parentPayload, &resumeResult, children, ref, withHumanAnswer(answerBlock)); err != nil {
 		return err
 	}
-	return e.Store.AddJobEvent(ctx, db.JobEvent{
+	// Captured, not written: this event must land with the receipt, or a refused commit
+	// leaves it behind while the continuation, task transition and settlement roll back -
+	// and recovery appends it again on every attempt (#1673).
+	return e.recordEffectEvent(ctx, db.JobEvent{
 		JobID:   parentJob.ID,
 		Kind:    "delegation_ask_answered",
 		Message: fmt.Sprintf("human answered %d ask-gate question(s) for job %s", len(rec.Questions), parentJob.ID),

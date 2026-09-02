@@ -2765,6 +2765,7 @@ func runWorktreeGitEnvOutput(t *testing.T, dir string, env []string, stdin strin
 type fakeWorktreeManager struct {
 	err               error
 	onAdd             func()
+	onAddCtx          func(context.Context)
 	existingBranches  map[string]bool
 	fetchedRemotes    []string
 	pathHeads         map[string]string
@@ -2816,7 +2817,12 @@ type worktreeCall struct {
 	base   string
 }
 
-func (f *fakeWorktreeManager) AddWorktree(_ context.Context, branch string, path string, base string) error {
+func (f *fakeWorktreeManager) AddWorktree(ctx context.Context, branch string, path string, base string) error {
+	// onAddCtx receives the allocation's OWN context, which is what a test needs to
+	// observe the heartbeat cancelling an in-flight pre-effect (#1673).
+	if f.onAddCtx != nil {
+		f.onAddCtx(ctx)
+	}
 	if f.onAdd != nil {
 		f.onAdd()
 	}

@@ -429,29 +429,6 @@ func (e Engine) block(ctx context.Context, ref taskRef, reason string) error {
 	return e.blockTask(ctx, ref, "workflow_blocked", reason, "workflow")
 }
 
-// blockRefusedAllocation is the block that means THE DECISION CANNOT BE APPLIED AT
-// ALL: a delegation worktree or branch lock was refused, so there is no way to run the
-// verb. Under a capturing resolution it marks the transaction's ALTERNATIVE OUTCOME -
-// the block and its event commit under the fence, the prepared work is dropped and the
-// receipt is withheld, so the claim survives and a replay cannot double-block (#1673).
-//
-// It is deliberately distinct from a plain block: continuation synthesis legitimately
-// blocks a parent task while still enqueuing work, and folding the two together
-// silently discarded that work.
-func (e Engine) blockRefusedAllocation(ctx context.Context, ref taskRef, reason string) error {
-	err := e.block(ctx, ref, reason)
-	if !e.capturing() {
-		return err
-	}
-	refused := BlockedError{Reason: reason}
-	var carried BlockedError
-	if errors.As(err, &carried) {
-		refused = carried
-	}
-	e.resolutionSink.blocked = &refused
-	return err
-}
-
 // blockTaskPreWriteHook fires between blockTask's state pre-read and its guarded
 // write, and between the dirty-worktree block's read and write. It is the seam a
 // concurrent merge occupies in production; nil outside tests.

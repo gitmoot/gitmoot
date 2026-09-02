@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -338,5 +339,178 @@ func TestOwnershipLostBeforeRenewalAppliesNothing(t *testing.T) {
 	}
 	if _, stillOpen := unsettledRound(t, store, "parent-job"); !stillOpen {
 		t.Fatalf("the round was settled by a pass that had lost ownership (round %s)", round.RoundID)
+	}
+}
+
+// TestHeartbeatKeepsOwnershipAcrossASlowPreEffect is the test the round-3 verdict said
+// did not exist: nothing shrank escalationRecoveryLeaseTTL, so the ticker (TTL/3 = 40s)
+// never fired in any checked-in test, and deleting the heartbeat loop left them all
+// green.
+//
+// Here the TTL is shrunk and the worktree allocation is made SLOWER than the whole
+// lease, so the pass survives only if renewal actually happens. A competing recoverer
+// tries to take the fence at a moment when the original lease would already have lapsed.
+//
+// SEMANTIC REVERSION THIS KILLS: delete the renewal inside the heartbeat loop (or make
+// its tick a no-op) and the competitor takes the fence, so this pass applies nothing.
+func TestHeartbeatKeepsOwnershipAcrossASlowPreEffect(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.EscalationNotifier = &recordingNotifier{}
+	manager := pausedImplementEscalation(t, store, &engine)
+
+	originalTTL := escalationRecoveryLeaseTTL
+	escalationRecoveryLeaseTTL = 300 * time.Millisecond
+	t.Cleanup(func() { escalationRecoveryLeaseTTL = originalTTL })
+
+	round, ok := unsettledRound(t, store, "parent-job")
+	if !ok {
+		t.Fatal("no unsettled round")
+	}
+
+	// The pre-effect outlives the ORIGINAL lease by a wide margin, so only renewal can
+	// keep this pass's ownership alive.
+	var competitorTook atomic.Bool
+	manager.onAdd = func() {
+		time.Sleep(900 * time.Millisecond)
+		now := time.Now().UTC()
+		taken, err := store.AcquireEscalationRecoveryLease(context.Background(), "parent-job", round.RoundID,
+			"competitor", now.Add(time.Minute), now)
+		if err == nil && taken {
+			competitorTook.Store(true)
+		}
+	}
+
+	if err := engine.ResolveEscalation(ctx, "parent-job", ResumeRetry, ""); err != nil {
+		t.Fatalf("ResolveEscalation: %v", err)
+	}
+	if competitorTook.Load() {
+		t.Fatal("a competitor took the fence during a slow pre-effect: the lease was not renewed")
+	}
+	// AND THE RUN THAT SHOULD SUCCEED DID: the retry landed exactly once.
+	if got := countJobs(t, store, "/resume"); got != 1 {
+		t.Fatalf("resume jobs = %d, want exactly 1: a renewed pass must still apply its effects", got)
+	}
+	if got := countWorkflowJobEvents(t, store, "parent-job", escalationEffectsCompletedEvent); got != 1 {
+		t.Fatalf("receipts = %d, want exactly 1", got)
+	}
+}
+
+// TestHeartbeatCancelsThePassOnAuthoritativeLoss is the other half: when ownership is
+// genuinely taken, the heartbeat must CANCEL the in-flight pre-effects so the losing
+// pass stops mid-flight rather than finishing work it no longer owns.
+//
+// SEMANTIC REVERSION THIS KILLS: drop the cancellation (or treat loss as a transient
+// error and keep going) and the losing pass runs to completion.
+func TestHeartbeatCancelsThePassOnAuthoritativeLoss(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.EscalationNotifier = &recordingNotifier{}
+	manager := pausedImplementEscalation(t, store, &engine)
+
+	originalTTL := escalationRecoveryLeaseTTL
+	escalationRecoveryLeaseTTL = 300 * time.Millisecond
+	t.Cleanup(func() { escalationRecoveryLeaseTTL = originalTTL })
+
+	round, ok := unsettledRound(t, store, "parent-job")
+	if !ok {
+		t.Fatal("no unsettled round")
+	}
+
+	// Ownership is taken from under the pass WHILE its pre-effect runs, using a clock
+	// far enough ahead that the steal is authoritative rather than a race.
+	var cancelObserved atomic.Bool
+	manager.onAddCtx = func(effectCtx context.Context) {
+		now := time.Now().UTC()
+		if _, err := store.AcquireEscalationRecoveryLease(context.Background(), "parent-job", round.RoundID,
+			"thief", now.Add(time.Minute), now.Add(10*escalationRecoveryLeaseTTL)); err != nil {
+			t.Errorf("steal the fence: %v", err)
+			return
+		}
+		// THE ASSERTION THAT MAKES THIS A TEST OF CANCELLATION rather than of the commit
+		// guard: the in-flight pre-effect must have its OWN context cancelled, so it stops
+		// mid-flight instead of finishing work this pass no longer owns. Without this the
+		// test passes even with the cancellation removed, because the fenced commit
+		// refuses the losing pass anyway - a mutant proved exactly that.
+		select {
+		case <-effectCtx.Done():
+			cancelObserved.Store(true)
+		case <-time.After(2 * time.Second):
+		}
+	}
+
+	if err := engine.ResolveEscalation(ctx, "parent-job", ResumeRetry, ""); err != nil {
+		t.Fatalf("ResolveEscalation: %v", err)
+	}
+	if !cancelObserved.Load() {
+		t.Fatal("the in-flight pre-effect was never cancelled: a pass that lost ownership kept working")
+	}
+	// A PASS THAT LOST OWNERSHIP APPLIES NOTHING.
+	if got := countJobs(t, store, "/resume"); got != 0 {
+		t.Fatalf("resume jobs = %d, want 0 after an authoritative ownership loss", got)
+	}
+	if got := countWorkflowJobEvents(t, store, "parent-job", escalationEffectsCompletedEvent); got != 0 {
+		t.Fatalf("receipts = %d, want 0 after an authoritative ownership loss", got)
+	}
+	if _, stillOpen := unsettledRound(t, store, "parent-job"); !stillOpen {
+		t.Fatal("a pass that lost ownership settled the round")
+	}
+}
+
+// TestBranchLockCollisionDoesNotSettleTheRetry is the P1 of the fea59486 review, and it
+// is the case a type check cannot separate: a shared-checkout branch lock held by
+// another agent refuses the retry with a BlockedError - the SAME Go type a recorded
+// synthesis decision uses.
+//
+// Classified as a decision it commits a receipt and SETTLES the round, so a retry that
+// dispatched nothing looks applied and the human's decision is lost for good. Classified
+// structurally - the block came out of the allocation choke point, so the decision could
+// not be ATTEMPTED - the receipt is withheld and the claim survives to be re-driven once
+// the lock frees.
+//
+// SEMANTIC REVERSION THIS KILLS: stop marking the choke point's refusal (or key the
+// guard on the error type again) and this round settles with no child dispatched.
+func TestBranchLockCollisionDoesNotSettleTheRetry(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.EscalationNotifier = &recordingNotifier{}
+	pausedImplementEscalation(t, store, &engine)
+	// Force the shared-checkout fallback, which is the arm that takes a branch lock.
+	engine.DelegationWorktrees = nil
+
+	// ANOTHER AGENT ALREADY HOLDS THE BRANCH. This is the production trigger.
+	taken, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName: "gitmoot/gitmoot", Branch: "task-005", Owner: "someone-else",
+	})
+	if err != nil {
+		t.Fatalf("AcquireLock: %v", err)
+	}
+	if !taken {
+		t.Fatal("the competing agent could not take the branch lock: the test cannot observe the collision")
+	}
+
+	resolveErr := engine.ResolveEscalation(ctx, "parent-job", ResumeRetry, "")
+	var blocked BlockedError
+	if !errors.As(resolveErr, &blocked) {
+		t.Fatalf("ResolveEscalation error = %v, want a BlockedError from the lock collision", resolveErr)
+	}
+
+	// NOTHING WAS DISPATCHED, so nothing may be recorded as applied.
+	if got := countJobs(t, store, "/resume"); got != 0 {
+		t.Fatalf("resume jobs = %d, want 0: the lock collision prevented any dispatch", got)
+	}
+	if got := countWorkflowJobEvents(t, store, "parent-job", escalationEffectsCompletedEvent); got != 0 {
+		t.Fatalf("receipts = %d, want 0: a refused allocation must not look applied", got)
+	}
+	// AND THE HUMAN'S DECISION SURVIVES for a later pass.
+	round, ok := unsettledRound(t, store, "parent-job")
+	if !ok {
+		t.Fatal("the round settled: the human retry decision is unrecoverable")
+	}
+	if !round.Claimed() {
+		t.Fatal("the claim was discarded by a refused allocation")
 	}
 }
