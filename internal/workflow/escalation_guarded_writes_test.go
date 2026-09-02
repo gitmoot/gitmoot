@@ -711,3 +711,140 @@ func TestLateRenewalDoesNotExtendAuthorityPastThePersistedExpiry(t *testing.T) {
 		t.Fatalf("receipts = %d, want 0", got)
 	}
 }
+
+// TestStalledRenewalStopsPreEffectsAtThePersistedExpiry is the P1 of the afb07b98
+// review, and it is the case my previous bound could not see: the check ran only AFTER
+// a renewal returned, so a HUNG store call left the effect context live past the
+// persisted expiry while another pass could acquire the reclaimable fence.
+//
+// The competing acquisition here is attempted AT the persisted expiry, while the
+// stalled renewal is still in flight - deliberately NOT waiting for effectCtx.Done,
+// which is what made the earlier test blind to this interval.
+//
+// SEMANTIC REVERSION THIS KILLS: move the deadline check back to the renewal's return
+// path (drop the expiry timer) and the pre-effect keeps running while a competitor owns
+// the round.
+func TestStalledRenewalStopsPreEffectsAtThePersistedExpiry(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.EscalationNotifier = &recordingNotifier{}
+	manager := pausedImplementEscalation(t, store, &engine)
+
+	originalTTL := escalationRecoveryLeaseTTL
+	escalationRecoveryLeaseTTL = 300 * time.Millisecond
+	t.Cleanup(func() { escalationRecoveryLeaseTTL = originalTTL })
+
+	round, ok := unsettledRound(t, store, "parent-job")
+	if !ok {
+		t.Fatal("no unsettled round")
+	}
+
+	// Every renewal STALLS for twice the whole TTL. It neither errors nor returns in
+	// time, so nothing on the renewal's return path can enforce the bound.
+	escalationRenewFaultHook = func(attempt int) error {
+		time.Sleep(2 * escalationRecoveryLeaseTTL)
+		return nil
+	}
+	t.Cleanup(func() { escalationRenewFaultHook = nil })
+
+	var cancelledByExpiry atomic.Bool
+	var competitorAcquiredWhileStalled atomic.Bool
+	manager.onAddCtx = func(effectCtx context.Context) {
+		// Wait until the persisted expiry has passed, WITHOUT waiting for cancellation -
+		// that ordering is the whole point.
+		time.Sleep(escalationRecoveryLeaseTTL + 80*time.Millisecond)
+		now := time.Now().UTC()
+		if taken, err := store.AcquireEscalationRecoveryLease(context.Background(), "parent-job",
+			round.RoundID, "competitor", now.Add(time.Minute), now); err == nil && taken {
+			competitorAcquiredWhileStalled.Store(true)
+		}
+		// By this instant the original pass must already have been cancelled by its own
+		// expiry timer, even though its renewal has still not come back.
+		if effectCtx.Err() != nil {
+			cancelledByExpiry.Store(true)
+		}
+	}
+
+	if err := engine.ResolveEscalation(ctx, "parent-job", ResumeRetry, ""); err != nil {
+		t.Fatalf("ResolveEscalation: %v", err)
+	}
+	if !competitorAcquiredWhileStalled.Load() {
+		t.Fatal("the fence never became reclaimable at the persisted expiry: this test cannot observe the hazard")
+	}
+	if !cancelledByExpiry.Load() {
+		t.Fatal("the in-flight pre-effect was still live at the persisted expiry while a competitor owned the round")
+	}
+	if got := countJobs(t, store, "/resume"); got != 0 {
+		t.Fatalf("resume jobs = %d, want 0 from a pass whose authority lapsed", got)
+	}
+	if got := countWorkflowJobEvents(t, store, "parent-job", escalationEffectsCompletedEvent); got != 0 {
+		t.Fatalf("receipts = %d, want 0", got)
+	}
+}
+
+// TestExpiryIsReArmedAfterEachConfirmedRenewal is the control that pins the OTHER half
+// of the clock-based bound: the deadline must MOVE when a renewal confirms a later
+// expiry, and must still fire from that later value if renewals then stall.
+//
+// Without re-arming, the timer either fires at the original expiry (cancelling a run
+// that legitimately held its lease) or is stopped and never fires again (leaving a
+// stalled pass unbounded). This drives the composite shape - two healthy renewals, then
+// a permanent stall - which is the only one that can tell those apart.
+//
+// SEMANTIC REVERSION THIS KILLS: drop the expiry.Reset after a confirmed renewal.
+func TestExpiryIsReArmedAfterEachConfirmedRenewal(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.EscalationNotifier = &recordingNotifier{}
+	manager := pausedImplementEscalation(t, store, &engine)
+
+	originalTTL := escalationRecoveryLeaseTTL
+	escalationRecoveryLeaseTTL = 300 * time.Millisecond
+	t.Cleanup(func() { escalationRecoveryLeaseTTL = originalTTL })
+
+	round, ok := unsettledRound(t, store, "parent-job")
+	if !ok {
+		t.Fatal("no unsettled round")
+	}
+
+	// Two renewals succeed - each must push the deadline out - and every later one
+	// STALLS, so only a re-armed timer can still enforce the bound.
+	escalationRenewFaultHook = func(attempt int) error {
+		if attempt > 2 {
+			time.Sleep(4 * escalationRecoveryLeaseTTL)
+		}
+		return nil
+	}
+	t.Cleanup(func() { escalationRenewFaultHook = nil })
+
+	var survivedFirstExpiry atomic.Bool
+	var cancelledEventually atomic.Bool
+	manager.onAddCtx = func(effectCtx context.Context) {
+		// Past the ORIGINAL expiry, the pass must still be alive: renewals were healthy.
+		time.Sleep(escalationRecoveryLeaseTTL + 60*time.Millisecond)
+		if effectCtx.Err() == nil {
+			survivedFirstExpiry.Store(true)
+		}
+		// Then the stall begins, and the re-armed deadline must still cancel it.
+		select {
+		case <-effectCtx.Done():
+			cancelledEventually.Store(true)
+		case <-time.After(4 * time.Second):
+		}
+		now := time.Now().UTC()
+		_, _ = store.AcquireEscalationRecoveryLease(context.Background(), "parent-job",
+			round.RoundID, "competitor", now.Add(time.Minute), now)
+	}
+
+	if err := engine.ResolveEscalation(ctx, "parent-job", ResumeRetry, ""); err != nil {
+		t.Fatalf("ResolveEscalation: %v", err)
+	}
+	if !survivedFirstExpiry.Load() {
+		t.Fatal("the pass was cancelled at its ORIGINAL expiry despite healthy renewals: the deadline was never re-armed forward")
+	}
+	if !cancelledEventually.Load() {
+		t.Fatal("the pass was never cancelled once renewals stalled: the deadline was stopped and never re-armed")
+	}
+}

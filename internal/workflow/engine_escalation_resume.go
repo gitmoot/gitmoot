@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -719,6 +720,18 @@ var escalationRecoveryLeaseTTL = 2 * time.Minute
 // deterministically. Nil in production (#1673).
 var escalationPreRenewHook func(ctx context.Context, jobID string, roundID string)
 
+// deadlineFor returns the instant a renewal call may not outlive: the expiry it is
+// trying to establish. A renewal that returns after that instant confirms nothing, so
+// there is no reason to keep the call alive past it (#1673).
+func deadlineFor(confirmedUntil time.Time) time.Time {
+	if confirmedUntil.Before(time.Now().UTC().Add(50 * time.Millisecond)) {
+		// Always leave a little room, so a deadline that has effectively arrived does not
+		// cancel the call before it can even be issued.
+		return time.Now().UTC().Add(50 * time.Millisecond)
+	}
+	return confirmedUntil
+}
+
 // escalationRenewFaultHook injects a renewal STORE FAILURE into the heartbeat, which is
 // the only way to reach the expiry-bound cancellation through the production loop rather
 // than by calling a helper. It returns the error the renewal should report; a nil return
@@ -797,61 +810,114 @@ func (e Engine) applyResolutionEffectsFenced(ctx context.Context, parentJob db.J
 	// itself once the effects return, so reading the context's error as "lost" would
 	// classify every successful run as a loss and silently discard its commit.
 	var ownershipLost atomic.Bool
+	// renewalsInFlight tracks the renewal goroutines. They MUST be awaited before this
+	// function returns: a renewal that outlives the call would touch the store - and, in
+	// tests, package state - after its caller finished, which the race detector correctly
+	// reports. Each call carries a deadline at its own target expiry, so the wait is
+	// bounded by construction (#1673).
+	var renewalsInFlight sync.WaitGroup
 	heartbeatDone := make(chan struct{})
 	go func() {
 		defer close(heartbeatDone)
 		ticker := time.NewTicker(escalationRecoveryLeaseTTL / 3)
 		defer ticker.Stop()
+		// AUTHORITY EXPIRES BY THE CLOCK, NOT BY OBSERVATION. Checking the bound only
+		// after a renewal RETURNS leaves the stalled case open: a hung store call keeps
+		// the effect context live past the persisted expiry, another pass acquires the
+		// reclaimable fence, and both run external pre-effects. The commit would reject
+		// the stale pass's database write but cannot undo an overlapping worktree or
+		// branch lock.
+		//
+		// So the deadline is armed as a TIMER and the renewal runs on its own goroutine.
+		// Whatever the store does - return, error, or never come back - the pass stops at
+		// the last expiry it could prove (#1673).
+		expiry := time.NewTimer(time.Until(confirmedUntil))
+		defer expiry.Stop()
+		type renewOutcome struct {
+			until time.Time
+			held  bool
+			err   error
+		}
+		renewals := make(chan renewOutcome, 1)
 		attempt := 0
+		inFlight := false
 		for {
 			select {
 			case <-effectCtx.Done():
 				return
+			case <-expiry.C:
+				// The lease this pass last confirmed has lapsed and nothing has renewed
+				// it. Whether a renewal is still in flight is irrelevant: the row is
+				// reclaimable now.
+				ownershipLost.Store(true)
+				stopHeartbeat()
+				return
 			case <-ticker.C:
-				attempt++
-				renewUntil := time.Now().UTC().Add(escalationRecoveryLeaseTTL)
-				var held bool
-				var err error
-				if escalationRenewFaultHook != nil {
-					err = escalationRenewFaultHook(attempt)
-				}
-				if err == nil {
-					held, err = e.Store.RenewEscalationRecoveryLease(ctx, parentJob.ID, roundID, owner,
-						renewUntil, time.Now().UTC())
-				}
-				if err != nil {
-					// Retry ONLY while the lease this pass last confirmed is still in
-					// force. One transient failure is survivable; failure persisting to the
-					// known expiry is proof this pass no longer has authority to run
-					// external pre-effects, because the fence is reclaimable by anyone.
-					if !time.Now().UTC().Before(confirmedUntil) {
-						ownershipLost.Store(true)
-						stopHeartbeat()
-						return
-					}
+				if inFlight {
+					// A renewal is stalled. Do not pile on; the expiry timer owns the
+					// deadline.
 					continue
 				}
-				if !held {
+				inFlight = true
+				attempt++
+				// THE CALL IS BOUNDED TOO. The timer above already enforces the deadline,
+				// so a hung renewal cannot extend authority - but an unbounded call would
+				// leave a goroutine parked in the store for the life of the process. Its
+				// deadline is the expiry it is trying to establish: past that instant the
+				// call could not confirm anything useful anyway.
+				renewCtx, cancelRenew := context.WithDeadline(context.WithoutCancel(ctx), deadlineFor(confirmedUntil))
+				renewalsInFlight.Add(1)
+				go func(attempt int, renewCtx context.Context, cancelRenew context.CancelFunc) {
+					defer renewalsInFlight.Done()
+					defer cancelRenew()
+					until := time.Now().UTC().Add(escalationRecoveryLeaseTTL)
+					var held bool
+					var err error
+					if escalationRenewFaultHook != nil {
+						err = escalationRenewFaultHook(attempt)
+					}
+					if err == nil {
+						held, err = e.Store.RenewEscalationRecoveryLease(renewCtx, parentJob.ID, roundID, owner,
+							until, time.Now().UTC())
+					}
+					renewals <- renewOutcome{until: until, held: held, err: err}
+				}(attempt, renewCtx, cancelRenew)
+			case outcome := <-renewals:
+				inFlight = false
+				if outcome.err != nil {
+					// A transient failure is survivable; the expiry timer enforces the
+					// bound if failures persist.
+					continue
+				}
+				if !outcome.held {
 					ownershipLost.Store(true)
 					stopHeartbeat()
 					return
 				}
-				if !time.Now().UTC().Before(renewUntil) {
+				if !time.Now().UTC().Before(outcome.until) {
 					// A successful UPDATE that returned after the expiry it wrote grants
-					// nothing: the row is already reclaimable. Treating it as confirmed
-					// would extend authority past the persisted deadline, which is the
-					// same defect as retrying past it.
+					// nothing: the row is already reclaimable.
 					ownershipLost.Store(true)
 					stopHeartbeat()
 					return
 				}
-				confirmedUntil = renewUntil
+				confirmedUntil = outcome.until
+				if !expiry.Stop() {
+					select {
+					case <-expiry.C:
+					default:
+					}
+				}
+				expiry.Reset(time.Until(confirmedUntil))
 			}
 		}
 	}()
 	verbErr := capturing.applyResolutionEffects(effectCtx, parentJob, parentPayload, ref, rec, verb, instructions, answers, roundID)
 	stopHeartbeat()
 	<-heartbeatDone
+	// Await any renewal still in flight. Its deadline bounds this wait, and letting it
+	// escape would leave a goroutine writing to the store after the resolution finished.
+	renewalsInFlight.Wait()
 	// Ownership lost while the pre-effects ran: the heartbeat cancelled them, so apply
 	// nothing rather than committing a partially-run decision.
 	if ownershipLost.Load() {
