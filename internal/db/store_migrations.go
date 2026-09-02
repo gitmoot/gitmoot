@@ -2547,4 +2547,23 @@ CREATE INDEX idx_escalation_rounds_unfinished
 	ON escalation_rounds(job_id, integrity_state)
 	WHERE resolved_at IS NOT NULL AND effects_completed_at IS NULL;
 	`,
+
+	// #1754 removes native chat/moot. Every reader of these tables is deleted in
+	// the same change, so the rows have no surviving consumer; the escalation
+	// answer path is retained through `gitmoot job answer`. Dropped children
+	// first so no index or foreign-key-shaped reference outlives its parent.
+	`
+DROP INDEX IF EXISTS idx_chat_mentions_agent_unread;
+DROP INDEX IF EXISTS idx_chat_messages_content_hash;
+DROP INDEX IF EXISTS idx_chat_messages_promoted_job;
+DROP INDEX IF EXISTS idx_chat_messages_thread_seq;
+
+DELETE FROM wake_outbox WHERE source_kind = 'chat_message';
+
+DROP TABLE IF EXISTS chat_thread_meta;
+DROP TABLE IF EXISTS chat_mentions;
+DROP TABLE IF EXISTS chat_messages;
+DROP TABLE IF EXISTS chat_threads;
+DROP TABLE IF EXISTS chat_meta;
+	`,
 }

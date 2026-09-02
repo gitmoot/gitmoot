@@ -238,7 +238,7 @@ path = ""
 # promotion path). distill_successes (default false) enables the #781 deterministic
 # success producer: recovered-failure observations. It also stages only
 # trust_mark=low pending observations. ingest_auto_confirm (default
-# false) lets memory ingest and chat remember immediately confirm into the authoring
+# false) lets memory ingest immediately confirm into the authoring
 # agent's private pool only; the shared pool is always explicit through confirm
 # --to-shared or promote --to-shared. distill_max_per_job (default 3, >= 0) caps
 # distilled rows per job; distill_all_jobs (default false) widens distill past
@@ -373,45 +373,6 @@ path = ""
 # default_effort = "high"
 # models = ["gpt-5.5-codex", "gpt-5.4-codex"]
 # capabilities = ["review", "implement", "ask"]
-
-# [chat] is the OFF-BY-DEFAULT native-chat auto-respond policy (#534 V1.5). With no
-# [chat] section — or with no agent enrolled — behavior is byte-identical: the daemon
-# tick never touches the chat tables and no agent is ever auto-summoned. auto_respond
-# is the global kill switch (default false = OFF): only when true does the sweep run.
-# Enrollment is PER AGENT — add chat_autorespond = true to an [agents.<name>] block
-# (see [agents.builder] below) to opt that agent in; BOTH the global switch and the
-# per-agent flag must be true. When enrolled, each daemon tick looks for OPEN chat
-# threads with an unread @mention of the agent on a kind='chat' message (job_result /
-# system / promotion_request messages NEVER trigger) and enqueues ONE bounded
-# read-only ask through the normal dispatch gate; its reply is posted back as a
-# non-promotable job_result, so it can never itself re-trigger (structural
-# anti-ping-pong). auto_respond_cap (default 4) is the HARD cap on auto-responses per
-# (thread, agent): on the cap the thread HARD-STOPS — no auto-extension — and a
-# VISIBLE "needs a human" system message is posted into the thread. auto_respond_cooldown
-# (default "2m", a Go duration) is the minimum spacing between an agent's auto-responses
-# in a thread; a trigger seen inside the window is deferred, never dropped. cap must be
-# >= 0 and cooldown >= 0.
-#
-# The [chat] section also carries the 'gitmoot moot' knobs (#534 V1.5). A moot
-# convenes N registered agents as SEATS (one background read-only ask job each)
-# that converse in one chat thread via 'gitmoot chat send'/'gitmoot chat wait'.
-# moot_max_seats (default 6) bounds how many agents one moot may convene (more is
-# rejected). moot_message_cap (default 30, overridable per-moot via --max-messages)
-# is the HARD per-thread cap on agent-authored turns: on the cap the moot HARD-STOPS
-# (no auto-extension), further 'chat send --as' is refused, and a VISIBLE overrun
-# system message is posted; each seat then posts its partial conclusions (know /
-# unsure / would-ask-next) via its gitmoot_result. Both must be >= 1. These are
-# resolved even when auto_respond is off (a moot is convened by an explicit command).
-# [chat]
-# auto_respond = false
-# auto_respond_cap = 4
-# auto_respond_cooldown = "2m"
-# moot_max_seats = 6
-# moot_message_cap = 30
-#
-# Enroll a specific agent (per-agent opt-in; omit for byte-identical default):
-# [agents.builder]
-# chat_autorespond = true
 
 # [review] controls native PR review scheduling. Native fanout is disabled by
 # default; request deliberate reviews with 'gitmoot agent review <agent>'.

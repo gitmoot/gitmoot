@@ -44,8 +44,8 @@ func TestDispatchReadOnlyWorktreeEligible(t *testing.T) {
 }
 
 // TestDispatchBackgroundAskAllocatesReadOnlyWorktree drives the REAL dispatch path
-// for a background ask (a moot seat / chat-task / autorespond / `agent ask
-// --background` shape) and proves the #739 fix: the enqueued job is born with a
+// for a background ask (`agent ask --background` shape) and proves the #739 fix:
+// the enqueued job is born with a
 // detached committed-tip worktree, so queuedJobCheckoutKey keys it off
 // worktree:<path> and it runs beside same-repo seats instead of serializing on the
 // shared repo:<repo> key.

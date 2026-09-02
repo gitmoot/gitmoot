@@ -602,6 +602,5 @@ redirect applies to them.
 
 A codex job gets neither the grant nor the env when its sandbox mode cannot
 reach the shared directory: a read-only/`auto`/unrecognized autonomy policy
-(codex never emits `--add-dir` there), or a chat seat (codex grants it
-workspace-write, but without ever populating `--add-dir` either). Those jobs
-keep the pre-#1113 behavior — no redirect, no in-worktree cache reuse.
+(codex never emits `--add-dir` there). Those jobs keep the pre-#1113 behavior —
+no redirect, no in-worktree cache reuse.

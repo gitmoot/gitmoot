@@ -331,12 +331,20 @@ func ingestedMemoryEventDetail(provenance string) map[string]string {
 	return map[string]string{"source": source}
 }
 
-// autoConfirmEligibleProvenance is deliberately fail-closed. Only the three
-// existing human/operator-authored ingestion families may cross the optional
-// auto-confirm boundary; harvest, distill, and every future producer remain
-// pending until this allowlist is explicitly extended.
+// autoConfirmEligibleProvenance is deliberately fail-closed. Only
+// human/operator-authored ingestion families may cross the optional auto-confirm
+// boundary; harvest, distill, and every future producer remain pending until this
+// allowlist is explicitly extended.
+//
+// Exactly two producers can reach this predicate: `memory ingest` (ingest:) and
+// `workflow note --remember` (workflow:). Both construct their observation in the
+// same invocation, so an already-pending row's provenance is never passed here —
+// which is why #1754 dropped the `chat:` entry outright rather than keeping it as
+// dead vocabulary. Confirming or retiring historical chat: rows still works
+// through the explicit human gates (`memory confirm|retire --provenance-prefix
+// chat:`), which do not consult this list.
 func autoConfirmEligibleProvenance(provenance string) bool {
-	for _, prefix := range []string{"ingest:", "chat:", "workflow:"} {
+	for _, prefix := range []string{"ingest:", "workflow:"} {
 		if strings.HasPrefix(strings.TrimSpace(provenance), prefix) {
 			return true
 		}

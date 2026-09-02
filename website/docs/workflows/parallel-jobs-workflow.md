@@ -217,10 +217,10 @@ idle_max_multiplier = 4  # 1 disables idle decay
 Any response-body miss, poll error, queued repo job, or in-flight repo job resets
 the streak and promotes the repo immediately. A repo with an open PR remains at
 base cadence because its per-PR comment reads are deliberately non-conditional.
-The decayed `NextPoll` gates GitHub calls only: heartbeat, pipeline, and chat
-maintenance still wake at the resolved base interval. The local call count is
-approximate and covers only this daemon process; foreground commands and
-agent-owned `gh` processes are outside it.
+The decayed `NextPoll` gates GitHub calls only: heartbeat and pipeline still
+wake at the resolved base interval. The local call count is approximate and
+covers only this daemon process; foreground commands and agent-owned `gh`
+processes are outside it.
 
 ## Not yet automatic (follow-ups)
 

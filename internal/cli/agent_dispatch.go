@@ -116,16 +116,6 @@ type localAgentDispatchRequest struct {
 	SelectedAction         string
 	SelectedActionReason   string
 	ExecutionPath          string
-	// ThreadID / ChatMessageID link a chat-promoted job (#534) back to the thread
-	// and the promotion_request message it came from. Set only by `chat task`;
-	// empty for every other dispatch, so the enqueued payload is byte-identical.
-	ThreadID      string
-	ChatMessageID string
-	// MootSeat marks a `gitmoot moot` conversing seat (#732). Set ONLY by the moot
-	// dispatch — never by `chat task` or any other chat-linked dispatch — so only a
-	// real seat is elevated + relay-injected by the daemon. Additive: false leaves
-	// the enqueued payload byte-identical.
-	MootSeat bool
 	// DispatchWarning surfaces advisory pre-delivery checks to the operator. It
 	// is deliberately not persisted in the job payload.
 	DispatchWarning func(string)
@@ -407,12 +397,8 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		checkoutPath = readOnlyWorktreePath
 		promptHeadWarnings = dispatchPromptHeadContradictionWarnings(ctx, jobGitClient(checkoutPath, localDispatchJobRunner(request)), request.Instructions, request.HeadSHA)
 	}
-	// Moot seats have a separate relay-backed chat sandbox. Its socket and
-	// current-binary grants are owned by that path, not this review/ask policy.
-	if readOnlyWorktreePath != "" && !request.MootSeat {
-		applyReadOnlySeat(true, selectedRuntimeConfigDir(effectiveAgent.Runtime), &effectiveAgent)
-	}
 	if readOnlyWorktreePath != "" {
+		applyReadOnlySeat(true, selectedRuntimeConfigDir(effectiveAgent.Runtime), &effectiveAgent)
 		if request.Action != "review" {
 			// An ask worktree is the committed tip of checkout HEAD, which may have
 			// advanced past its inherited HeadSHA. Review is different: its worktree
@@ -472,12 +458,9 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		SkipNativeReviewFanout: request.SkipNativeReviewFanout,
 		ValidatedPullRequest:   request.ImplementPRValidated,
 		TemplateOverride:       recipeTemplate,
-		ThreadID:               request.ThreadID,
-		ChatMessageID:          request.ChatMessageID,
-		MootSeat:               request.MootSeat,
 		WorktreePath:           readOnlyWorktreePath,
 		ReadOnlyWorktree:       readOnlyWorktreePath != "",
-		ReadOnlySeat:           readOnlyWorktreePath != "" && !request.MootSeat,
+		ReadOnlySeat:           readOnlyWorktreePath != "",
 	})
 	if err != nil {
 		// #739: the read-only worktree is created on disk BEFORE Enqueue. If Enqueue

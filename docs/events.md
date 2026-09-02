@@ -204,13 +204,12 @@ within that grace never resets it, and a later re-block starts a fresh episode.
 Each synthesized event's `detail` carries the stable since-time, so a re-nudge
 (same `job_id` + same since) is distinguishable from a fresh episode.
 `reply`, `blocked`, and `escalation` consume durable wake-outbox obligations.
-Reply obligations come from addressed workflow notes and `kind=chat` messages
-and only wake the role named by both the message and the rule. Non-triggering
-chat back-links such as `job_result` do not enter the outbox. Blocked and
-escalation obligations retain the redacted source event. Reply rows commit in
-the source note/chat transaction. Resolving a typed org escalation addresses
-the resolution marker to its parsed asker, so the same transaction records a
-pending reply obligation that wakes the asker. A legacy typed escalation with
+Reply obligations come from addressed workflow notes and only wake the role
+named by both the note and the rule. Blocked and escalation obligations
+retain the redacted source event. Reply rows commit in the source note
+transaction. Resolving a typed org escalation addresses the resolution marker
+to its parsed asker, so the same transaction records a pending reply
+obligation that wakes the asker. A legacy typed escalation with
 no identifiable asker still resolves, prints a warning, and records no invented
 target. Blocked and escalation rows are synchronously
 persisted after the source transition; insert failure is logged but cannot roll

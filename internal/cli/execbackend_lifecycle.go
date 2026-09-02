@@ -216,22 +216,13 @@ func (w jobWorker) destroyExecutionBackend(jobID string, lifecycle execbackend.E
 	}
 }
 
-func (w *jobWorker) executionDeliveryAdapter(agent runtime.Agent, checkout string, relayToken string, outputs ...io.Writer) (workflow.DeliveryAdapter, error) {
+func (w *jobWorker) executionDeliveryAdapter(agent runtime.Agent, checkout string, outputs ...io.Writer) (workflow.DeliveryAdapter, error) {
 	runner := w.executionRunner
 	if runner == nil {
 		return nil, errors.New("execution-backend runtime runner is required")
 	}
-	if relayToken != "" {
-		if w.RelayServer == nil {
-			return nil, errors.New("execution-backend relay token has no relay server")
-		}
-		runner = subprocess.EnvInjectingRunner{Inner: runner, Env: []string{
-			chatRelayEnvSocket + "=" + w.RelayServer.SocketPath(),
-			chatRelayEnvToken + "=" + relayToken,
-		}}
-	}
-	// Keep the relay wrapper as part of the run-scoped base so a later cockpit
-	// tee rebuild preserves both backend execution and seat authentication.
+	// Keep the run-scoped base runner so a later cockpit tee rebuild preserves
+	// backend execution.
 	w.executionRunner = runner
 	if len(outputs) > 0 && outputs[0] != nil {
 		stream, ok := runner.(subprocess.StreamRunner)

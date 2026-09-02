@@ -53,9 +53,6 @@ func applyIsolatedToolCacheGrants(paths config.Paths, payload workflow.JobPayloa
 		return nil, nil
 	}
 	if agent.Runtime == runtime.CodexRuntime {
-		if agent.ChatSeat {
-			return nil, nil
-		}
 		if !agent.ReadOnlySeat {
 			switch runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {
 			case runtime.AutonomyPolicyWorkspaceWrite, runtime.AutonomyPolicyDangerFullAccess:

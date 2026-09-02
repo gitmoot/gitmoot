@@ -92,7 +92,7 @@ distill_at_terminal = false # stage deterministic failure signal at terminal (P4
 distill_successes = false   # stage deterministic success observations
 distill_max_per_job = 3     # hard cap on distilled observations per job
 distill_all_jobs = false    # true → distill every job, not only enrolled agents
-ingest_auto_confirm = false # true → ingest/chat remember confirm to private only
+ingest_auto_confirm = false # true → ingest confirms to private only
 harvest_enabled = false     # sweep new terminal results for durable insights
 harvest_runtime = "codex"   # fresh read-only one-shot classifier runtime
 harvest_model = ""          # empty uses the runtime default
@@ -291,10 +291,10 @@ The vault export is the bridge's *outlet*; `memory ingest` is its *mouth*. It
 reads arbitrary Markdown (session notes, runbooks, incident writeups) and stages
 it as observations behind the existing confirmation gate. By default those
 observations stay pending. If `[memory].ingest_auto_confirm = true`, `memory
-ingest`, `memory ingest sweep`, and `chat remember` immediately confirm the
-staged observation into the authoring agent's **private** pool only. They never
-auto-confirm into the shared pool. Shared memory stays explicit through `memory
-confirm --to-shared` or `memory promote --to-shared`.
+ingest` and `memory ingest sweep` immediately confirm the staged observation
+into the authoring agent's **private** pool only. They never auto-confirm into
+the shared pool. Shared memory stays explicit through
+`memory confirm --to-shared` or `memory promote --to-shared`.
 
 `workflow note --remember` has an additional shipping-status gate. A leading
 `MERGED`, `SHIPPED`, `DEPLOYED`, or `CLOSED` phrase with a PR/CI reference stays
@@ -345,9 +345,8 @@ suffix (`-2`, `-3`) in document order. Because the key survives edits, a
 re-swept edited note lands on the same key as its earlier edition, and with
 `ingest_auto_confirm` enabled the existing confirmed fact is updated **in
 place** instead of accumulating a new hash-suffixed sibling on every edit.
-`chat remember` keys (`chat-<thread>-<seq>`) follow the same scheme.
 
-Auto-confirmed in-place updates (ingest auto-confirm and `chat remember`) are
+Auto-confirmed in-place updates (ingest auto-confirm) are
 **supersede-preserving**: before the live row is overwritten, the prior edition
 is copied to an archived row whose `superseded_by` points at the live row. The
 archive never injects, never exports, and carries no links; `memory_links` stay

@@ -329,7 +329,6 @@ type wakeOutboxSourceKind struct {
 
 var wakeOutboxSourceKinds = []wakeOutboxSourceKind{
 	{sourceKind: db.WakeOutboxSourceWorkflowNote, wakeKind: db.WakeOutboxKindReply},
-	{sourceKind: db.WakeOutboxSourceChatMessage, wakeKind: db.WakeOutboxKindReply},
 	{sourceKind: db.WakeOutboxSourceBlocked, wakeKind: db.WakeOutboxKindBlocked},
 	{sourceKind: db.WakeOutboxSourceEscalation, wakeKind: db.WakeOutboxKindEscalation},
 	{sourceKind: db.WakeOutboxSourceAwaitedFact, wakeKind: db.WakeOutboxKindFact},
@@ -382,7 +381,7 @@ func wakeOutboxEvent(batch []db.WakeOutboxObligation, now time.Time) (events.Eve
 	}
 	var event events.Event
 	switch oldest.SourceKind {
-	case db.WakeOutboxSourceWorkflowNote, db.WakeOutboxSourceChatMessage:
+	case db.WakeOutboxSourceWorkflowNote:
 		if wakeKind == db.WakeOutboxKindDirective {
 			detail := fmt.Sprintf("directive id %s for %s", oldest.SourceID, role)
 			event = events.NewEvent(

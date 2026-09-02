@@ -305,12 +305,12 @@ func TestRuntimeJobRunnerClaudeAuthRemainsBelowWrapperEnvironment(t *testing.T) 
 	}
 	runner, err := runtimeJobRunner(home, runtime.ClaudeRuntime, subprocess.EnvInjectingRunner{Env: []string{
 		runtime.ClaudeConfigDirEnv + "=/wrapper-config",
-		"GITMOOT_CHAT_RELAY=/relay.sock",
+		"GITMOOT_TEST_INJECTED_ENV=/relay.sock",
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := runner.Run(context.Background(), "", "sh", "-c", `printf '%s|%s|%s|%s' "$CLAUDE_CODE_OAUTH_TOKEN" "$ANTHROPIC_API_KEY" "$CLAUDE_CONFIG_DIR" "$GITMOOT_CHAT_RELAY"`)
+	result, err := runner.Run(context.Background(), "", "sh", "-c", `printf '%s|%s|%s|%s' "$CLAUDE_CODE_OAUTH_TOKEN" "$ANTHROPIC_API_KEY" "$CLAUDE_CONFIG_DIR" "$GITMOOT_TEST_INJECTED_ENV"`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,7 +366,7 @@ func TestCuratedRunnerCompositionPreservesInjectedEnvironment(t *testing.T) {
 		t.Fatalf("curated+tee result=%+v stream=%q err=%v", result, streamed.String(), err)
 	}
 
-	runner, err = runtimeJobRunner(home, runtime.ShellRuntime, subprocess.EnvInjectingRunner{Env: []string{"GITMOOT_CHAT_RELAY=/relay", "GITMOOT_CHAT_RELAY_AUTH=token"}})
+	runner, err = runtimeJobRunner(home, runtime.ShellRuntime, subprocess.EnvInjectingRunner{Env: []string{"GITMOOT_TEST_INJECTED_ENV=/relay", "GITMOOT_TEST_INJECTED_AUTH=token"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +380,7 @@ func TestCuratedRunnerCompositionPreservesInjectedEnvironment(t *testing.T) {
 		},
 		ShellUpstreamContext: `{"schema_version":1,"complete":true}`,
 	}
-	agent := runtime.Agent{Name: "shell", Role: "runner", Runtime: runtime.ShellRuntime, RepoScope: "owner/repo", RuntimeRef: `printf '%s|%s|%s|%s|%s' "$GITMOOT_CHAT_RELAY" "$GITMOOT_CHAT_RELAY_AUTH" "$GITMOOT_PIPELINE_NAME" "$GITMOOT_PIPELINE_STAGE_ID" "$(test -r "$GITMOOT_PIPELINE_UPSTREAM_CONTEXT_FILE" && echo context)"`}
+	agent := runtime.Agent{Name: "shell", Role: "runner", Runtime: runtime.ShellRuntime, RepoScope: "owner/repo", RuntimeRef: `printf '%s|%s|%s|%s|%s' "$GITMOOT_TEST_INJECTED_ENV" "$GITMOOT_TEST_INJECTED_AUTH" "$GITMOOT_PIPELINE_NAME" "$GITMOOT_PIPELINE_STAGE_ID" "$(test -r "$GITMOOT_PIPELINE_UPSTREAM_CONTEXT_FILE" && echo context)"`}
 	got, err := adapter.Deliver(context.Background(), agent, job)
 	if err != nil {
 		t.Fatal(err)

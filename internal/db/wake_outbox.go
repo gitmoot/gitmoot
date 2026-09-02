@@ -34,7 +34,6 @@ const (
 	WakeOutboxKindFact       = "fact"
 
 	WakeOutboxSourceWorkflowNote = "workflow_note"
-	WakeOutboxSourceChatMessage  = "chat_message"
 	WakeOutboxSourceBlocked      = WakeOutboxKindBlocked
 	WakeOutboxSourceEscalation   = WakeOutboxKindEscalation
 	WakeOutboxSourceAwaitedFact  = "awaited_fact"
@@ -149,26 +148,6 @@ WHERE source_kind = ? AND source_id = ?
 	return nil
 }
 
-func insertChatMessageWakeOutboxTx(ctx context.Context, tx *sql.Tx, messageID string, targetRoles []string) error {
-	seen := make(map[string]struct{}, len(targetRoles))
-	for _, targetRole := range targetRoles {
-		role := strings.ToLower(strings.TrimSpace(targetRole))
-		if role == "" {
-			continue
-		}
-		if _, exists := seen[role]; exists {
-			continue
-		}
-		seen[role] = struct{}{}
-		if err := insertWakeOutboxTx(
-			ctx, tx, WakeOutboxSourceChatMessage, messageID, WakeOutboxKindReply, role,
-		); err != nil {
-			return fmt.Errorf("insert chat message wake outbox: %w", err)
-		}
-	}
-	return nil
-}
-
 // InsertWakeOutbox persists one event as a durable obligation for each target
 // role. All rows share the event-kind coalescing namespace.
 func (s *Store) InsertWakeOutbox(
@@ -208,7 +187,7 @@ func (s *Store) InsertWakeOutbox(
 // The table's implicit assumption is that source_id is event-unique. AT
 // event_rule_sink.go — and only there — the non-directive kinds get that free
 // from serialized payloads; this is NOT a property of the table, since the
-// workflow-note and chat-message writers pass their own source ids. Directives
+// workflow-note writer passes its own source id. Directives
 // alone carry a LITERAL directive id, because the decoder (wakeOutboxEvent)
 // renders source_id straight into the command an operator reads back:
 // `gitmoot org directive ack <id>`. Storing a payload there instead produced
@@ -236,13 +215,13 @@ func insertWakeOutboxTx(ctx context.Context, tx *sql.Tx, sourceKind, sourceID, w
 	if err != nil {
 		return err
 	}
-	// #1352: REVIVE SEMANTICS BIND TO THE DIRECTIVE BRANCH ONLY. The other two
-	// writers on this generic seam — workflow-note insertion and chat-message
-	// insertion — keep HARD-INSERT semantics, untouched.
+	// #1352: REVIVE SEMANTICS BIND TO THE DIRECTIVE BRANCH ONLY. The other writer
+	// on this generic seam — workflow-note insertion — keeps HARD-INSERT
+	// semantics, untouched.
 	//
 	// The reasoning is obligation-specific: directive rows key a PER-OBLIGATION
 	// STATE MACHINE, while every other kind keys an EVENT. Extending revive to
-	// chat messages and workflow notes would apply an obligation semantic to
+	// workflow notes would apply an obligation semantic to
 	// things that are not obligations.
 	//
 	// SCOPE OF THE SAFETY ARGUMENT, stated precisely because a looser version was

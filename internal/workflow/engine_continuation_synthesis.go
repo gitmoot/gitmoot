@@ -178,8 +178,6 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 			RootJobID:       e.rootJobID(parentJob, parentPayload),
 			WorkflowID:      parentPayload.WorkflowID,
 			ActingOrgRole:   parentPayload.ActingOrgRole,
-			ThreadID:        parentPayload.ThreadID,
-			ChatMessageID:   parentPayload.ChatMessageID,
 			// Carry the window forward and mark that a corrective nudge has fired so a
 			// further non-progress generation escalates to delegation_loop_detected.
 			RecentDelegationHashes: appendDelegationHashWindow(parentPayload.RecentDelegationHashes, canonicalDelegationSetHash(parentResult.Delegations)),
@@ -359,12 +357,6 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		// it at the top of the prompt. Empty (the default) for every non-answer path,
 		// so omitempty keeps the stored payload byte-identical.
 		HumanAnswer: cfg.humanAnswer,
-		// Chat back-link (#534): a continuation of a chat-promoted (or ask-gate
-		// auto-linked) coordinator inherits the thread linkage so its terminal
-		// result posts back into the originating thread. Empty for every non-chat
-		// coordinator, so omitempty keeps the stored payload byte-identical.
-		ThreadID:      parentPayload.ThreadID,
-		ChatMessageID: parentPayload.ChatMessageID,
 		// Increment depth per continuation generation so a coordinator whose
 		// continuation re-delegates is bounded by MaxDelegationDepth instead of
 		// looping forever (the continuation reused the parent's depth before).

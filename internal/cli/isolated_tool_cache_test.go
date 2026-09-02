@@ -20,17 +20,11 @@ import (
 // finding: codex only honors WritablePaths under workspace-write, so a
 // read-only (or unrecognized) codex job must get neither the grant nor the env
 // -- pointing its tools at an unwritable shared dir would be worse than doing
-// nothing. workspace-write and danger-full-access proceed. A ChatSeat is ALSO
-// always a no-op regardless of policy: codexSandboxArgs returns workspace-write
-// for a ChatSeat WITHOUT ever reaching the --add-dir loop, so granting it here
-// would inject env pointing at a directory its sandbox still cannot write —
-// the second-pass finder caught an earlier, backwards version of this gate that
-// bypassed ChatSeat into proceeding, which reproduced the original defect.
+// nothing. workspace-write and danger-full-access proceed.
 func TestApplyIsolatedToolCacheGrantsCodexAutonomyGate(t *testing.T) {
 	tests := []struct {
 		name     string
 		policy   string
-		chatSeat bool
 		wantNoop bool
 	}{
 		{name: "read-only skipped", policy: runtime.AutonomyPolicyReadOnly, wantNoop: true},
@@ -38,13 +32,11 @@ func TestApplyIsolatedToolCacheGrantsCodexAutonomyGate(t *testing.T) {
 		{name: "empty policy skipped", policy: "", wantNoop: true},
 		{name: "workspace-write proceeds", policy: runtime.AutonomyPolicyWorkspaceWrite, wantNoop: false},
 		{name: "danger-full-access proceeds", policy: runtime.AutonomyPolicyDangerFullAccess, wantNoop: false},
-		{name: "chat seat skipped despite read-only policy", policy: runtime.AutonomyPolicyReadOnly, chatSeat: true, wantNoop: true},
-		{name: "chat seat skipped even with workspace-write policy", policy: runtime.AutonomyPolicyWorkspaceWrite, chatSeat: true, wantNoop: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			paths := config.PathsForHome(t.TempDir())
-			agent := runtime.Agent{Runtime: runtime.CodexRuntime, AutonomyPolicy: test.policy, ChatSeat: test.chatSeat}
+			agent := runtime.Agent{Runtime: runtime.CodexRuntime, AutonomyPolicy: test.policy}
 			payload := workflow.JobPayload{WorktreePath: filepath.Join(paths.Home, "worktrees", "w1")}
 			env, err := applyIsolatedToolCacheGrants(paths, payload, &agent)
 			if err != nil {
@@ -52,12 +44,12 @@ func TestApplyIsolatedToolCacheGrantsCodexAutonomyGate(t *testing.T) {
 			}
 			if test.wantNoop {
 				if len(env) != 0 || len(agent.WritablePaths) != 0 {
-					t.Fatalf("policy %q chatSeat=%v must be a no-op: env=%v writable=%v", test.policy, test.chatSeat, env, agent.WritablePaths)
+					t.Fatalf("policy %q must be a no-op: env=%v writable=%v", test.policy, env, agent.WritablePaths)
 				}
 				return
 			}
 			if len(env) != len(toolCacheEnvSubdirs) || len(agent.WritablePaths) != 1 {
-				t.Fatalf("policy %q chatSeat=%v must grant: env=%v writable=%v", test.policy, test.chatSeat, env, agent.WritablePaths)
+				t.Fatalf("policy %q must grant: env=%v writable=%v", test.policy, env, agent.WritablePaths)
 			}
 		})
 	}
@@ -283,9 +275,9 @@ func TestFreshIsolatedProduceRunnerStreamsInjectedEnvAndPID(t *testing.T) {
 
 	// This is the fresh pipeline-stage construction order in jobWorker.run:
 	// progress tee, produce sandbox, then isolated tool-cache env injection.
-	adapter, _, err := worker.buildSeatAwareAdapter(&agent, checkout, payload, &progress)
+	adapter, err := worker.buildJobAdapter(agent, checkout, &progress)
 	if err != nil {
-		t.Fatalf("buildSeatAwareAdapter: %v", err)
+		t.Fatalf("buildJobAdapter: %v", err)
 	}
 	toolCacheEnv, err := applyIsolatedToolCacheGrants(paths, payload, &agent)
 	if err != nil {

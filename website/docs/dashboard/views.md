@@ -408,11 +408,11 @@ The read-only effective-configuration viewer. Every known knob is listed by
 config section with its current value, its default, and a `default` /
 `overridden` badge (overridden values stand out); boolean feature flags render
 as ON/OFF chips, and the off-by-default feature flags (memory distillation,
-`groom_split_llm`, chat auto-respond, …) are gathered
+`groom_split_llm`, …) are gathered
 into a highlighted section at the top so you can see at a glance what is
 enabled on this install. Below the knobs, a per-agent table shows each
 registered or configured agent's runtime, model, capabilities, autonomy
-policy, memory enrollment, chat auto-respond flag, and background-job cap. A
+policy, memory enrollment, and background-job cap. A
 filter box narrows by key, section, or value, and every knob carries a
 click-to-copy `key = value` snippet for pasting into `config.toml`, whose path
 and last-modified time are shown in the footer.

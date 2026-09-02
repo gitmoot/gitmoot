@@ -39,7 +39,6 @@ type RuntimeRequirement struct {
 	Source   string
 	Remedy   string
 	Policies []string
-	ChatSeat bool
 	// PlanMode scopes a requirement to deliveries whose request enables plan
 	// mode. It is request-scoped rather than inferred from the agent: older CLIs
 	// that lack an optional plan flag must still run ordinary jobs.
@@ -363,11 +362,8 @@ func requirementApplies(req RuntimeRequirement, agent Agent, request RuntimeCont
 	if req.PlanMode && !request.Plan {
 		return false
 	}
-	if req.ChatSeat && agent.ChatSeat {
-		return true
-	}
 	if len(req.Policies) == 0 {
-		return !req.ChatSeat
+		return true
 	}
 	policy := NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy)
 	for _, candidate := range req.Policies {

@@ -311,33 +311,6 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	// the leaf helpers (a revert of this wiring would otherwise stay green).
 	defer daemonRunStartupReconcile(ctx, *home, os.Args, stdout)()
 
-	// #732 chat relay: start a daemon-owned unix-socket relay so a sandboxed moot
-	// seat (whose read-only home blocks a direct `gitmoot chat send`) can route
-	// send/wait to THIS daemon, which owns the store unsandboxed. It uses a
-	// dedicated store bound to the daemon ctx (the per-repo supervisors open their
-	// own stores per pass) and is torn down on ctx.Done. Best-effort: a relay start
-	// failure never blocks the daemon — a moot simply degrades to the pre-#732
-	// parallel-conclusions behavior.
-	if relayPaths, perr := initializedPaths(*home); perr != nil {
-		writeLine(stdout, "daemon: chat relay disabled (paths unavailable): %v", perr)
-	} else if relayStore, serr := db.Open(relayPaths.Database); serr != nil {
-		writeLine(stdout, "daemon: chat relay disabled (store unavailable): %v", serr)
-	} else {
-		relay := newChatRelayServer(relayStore, chatRelaySocketDir(relayPaths.Home), stdout)
-		if rerr := relay.Start(ctx); rerr != nil {
-			writeLine(stdout, "daemon: chat relay disabled: %v", rerr)
-			_ = relayStore.Close()
-		} else {
-			setActiveChatRelayServer(relay)
-			writeLine(stdout, "daemon: chat relay listening at %s", relay.SocketPath())
-			go func() {
-				<-ctx.Done()
-				setActiveChatRelayServer(nil)
-				_ = relayStore.Close()
-			}()
-		}
-	}
-
 	if *repoFlag == "" {
 		err := runRegisteredRepoSupervisor(ctx, *home, live, *dryRun, *watchIssues, session, stdout)
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

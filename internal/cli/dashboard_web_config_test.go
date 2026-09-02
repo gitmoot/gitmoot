@@ -21,7 +21,6 @@ import (
 
 func TestDashboardConfigProjectionAllowlist(t *testing.T) {
 	want := []string{
-		"chat.auto_respond",
 		"github.max_concurrent",
 		"github.min_interval",
 		"memory.cluster_depth_cap",
@@ -82,7 +81,7 @@ func TestDashboardConfigProjectionAllowlist(t *testing.T) {
 	}
 
 	defaults := dashboardConfigSettings{
-		memory: config.DefaultMemorySettings(), chat: config.DefaultChatSettings(),
+		memory:      config.DefaultMemorySettings(),
 		orchestrate: config.DefaultOrchestratePolicy(), github: config.DefaultGitHubLimiterPolicy(),
 	}
 	if first, second := projectDashboardConfig(defaults, defaults), projectDashboardConfig(defaults, defaults); !reflect.DeepEqual(first, second) {
@@ -107,7 +106,6 @@ groom_split_llm = true
 runtime = "codex"
 model = "gpt-test"
 memory = true
-chat_autorespond = true
 capabilities = ["ask", "implement"]
 autonomy_policy = "workspace-write"
 max_background = 9
@@ -160,7 +158,7 @@ private_token = "` + secret + `"
 		t.Fatalf("agents = %+v, want one worker", snapshot.Agents)
 	}
 	agent := snapshot.Agents[0]
-	if agent.Name != "worker" || agent.Runtime != "codex" || agent.Model != "gpt-test" || !agent.Memory || !agent.ChatAutorespond || agent.MaxBackground != 9 {
+	if agent.Name != "worker" || agent.Runtime != "codex" || agent.Model != "gpt-test" || !agent.Memory || agent.MaxBackground != 9 {
 		t.Fatalf("worker config = %+v", agent)
 	}
 	if !reflect.DeepEqual(agent.Capabilities, []string{"ask", "implement"}) || agent.AutonomyPolicy != "workspace-write" {

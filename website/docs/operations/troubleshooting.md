@@ -587,10 +587,10 @@ across jobs instead of duplicated per worktree. This is on by default; set
 `[cache] enabled = false` in `config.toml` to opt out, or `[cache] dir =
 "/absolute/path"` to relocate the shared directory (must be absolute).
 
-A read-only/`auto` codex job and a codex chat seat do not get the redirect —
-codex never grants writable-path access to either, so pointing their tools at
-the shared directory would break rather than help. Those jobs keep their
-pre-existing (in-worktree) cache behavior.
+A read-only/`auto` codex job does not get the redirect — codex never grants it
+writable-path access, so pointing its tools at the shared directory would break
+rather than help. Those jobs keep their pre-existing (in-worktree) cache
+behavior.
 
 If an existing worktree already carries a large in-worktree cache from before
 this took effect, it is cleaned up the same way as any other worktree content:
