@@ -361,16 +361,6 @@ func sameReviewRound(left JobPayload, right JobPayload) bool {
 	return leftRound == rightRound
 }
 
-func (e Engine) dispatch(ctx context.Context, request JobRequest, ref taskRef) error {
-	if request.ID == "" {
-		request.ID = e.jobID(request)
-	}
-	if err := e.ensureAgentAllowed(ctx, request, ref); err != nil {
-		return err
-	}
-	return e.enqueue(ctx, request)
-}
-
 func (e Engine) enqueue(ctx context.Context, request JobRequest) error {
 	if request.ID == "" {
 		request.ID = e.jobID(request)
@@ -662,7 +652,7 @@ func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string,
 	if !decision.Ready {
 		if decision.Deferred {
 			// Park the task in ready_to_merge (NOT whatever state it arrived in) so
-			// the daemon's pullRequestReadyToMerge poll re-drives it every tick until
+			// the daemon's lookupReadyPullRequestTask poll re-drives it every tick until
 			// the hold settles. A task-owned retry already expected in ready_to_merge
 			// needs no write; this also preserves a retained external-merge claim.
 			if expectedTaskState == string(TaskReadyToMerge) {

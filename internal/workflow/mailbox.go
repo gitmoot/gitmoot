@@ -169,15 +169,6 @@ var PayloadDeliveryWorktreeResolver DeliveryWorktreeResolver = func(_ context.Co
 	return DeliveryWorktreeResolution{Path: path}, nil
 }
 
-// ExcludedDeliveryWorktreeResolver is an explicit sentinel for a context that
-// intentionally does not observe implement worktrees. Production exclusions
-// should normally be selected by a shape-specific CLI predicate instead.
-func ExcludedDeliveryWorktreeResolver(source string) DeliveryWorktreeResolver {
-	return func(context.Context, db.Job, JobPayload) (DeliveryWorktreeResolution, error) {
-		return DeliveryWorktreeResolution{ExcludedSource: strings.TrimSpace(source)}, nil
-	}
-}
-
 // PipelineKeyAccess is the persisted, names-only authorization for one pipeline
 // stage environment name. Source is pinned at enqueue so delivery never changes
 // audit meaning by falling through to another source.

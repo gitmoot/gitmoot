@@ -100,7 +100,7 @@ func TestAskReviewDiffPrecleanupHookEmptyAndTruncated(t *testing.T) {
 		State:   string(workflow.JobSucceeded),
 		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", WorktreePath: checkout, ReadOnlyWorktree: true}),
 	}, "succeeded")
-	if err := askReviewDiffPrecleanupHook(store)(ctx, "clean-ask", "ask", workflow.JobPayload{
+	if err := askReviewDiffPrecleanupHookForRunner(store, subprocess.ExecRunner{})(ctx, "clean-ask", "ask", workflow.JobPayload{
 		Repo: "owner/repo", WorktreePath: checkout, ReadOnlyWorktree: true,
 	}); err != nil {
 		t.Fatalf("clean precleanup hook: %v", err)
@@ -128,7 +128,7 @@ func TestAskReviewDiffPrecleanupHookEmptyAndTruncated(t *testing.T) {
 		State:   string(workflow.JobSucceeded),
 		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", WorktreePath: checkout, ReadOnlyWorktree: true}),
 	}, "succeeded")
-	if err := askReviewDiffPrecleanupHook(store)(ctx, "large-review", "review", workflow.JobPayload{
+	if err := askReviewDiffPrecleanupHookForRunner(store, subprocess.ExecRunner{})(ctx, "large-review", "review", workflow.JobPayload{
 		Repo: "owner/repo", WorktreePath: checkout, ReadOnlyWorktree: true,
 	}); err != nil {
 		t.Fatalf("large precleanup hook: %v", err)
@@ -168,7 +168,7 @@ func TestAskReviewDiffPrecleanupHookPersistsFailureMarker(t *testing.T) {
 		Payload: mustJobPayload(t, payload),
 	}, "succeeded")
 
-	if err := askReviewDiffPrecleanupHook(store)(ctx, "broken-ask", "ask", payload); err == nil {
+	if err := askReviewDiffPrecleanupHookForRunner(store, subprocess.ExecRunner{})(ctx, "broken-ask", "ask", payload); err == nil {
 		t.Fatal("capture in a non-repository returned nil error")
 	}
 	job, err := store.GetJob(ctx, "broken-ask")
@@ -235,7 +235,7 @@ func TestCaptureReadOnlyWorktreeDiffDoesNotRunConfiguredGitHelpers(t *testing.T)
 	_ = os.Remove(textconvSentinel)
 	_ = os.Remove(cleanSentinel)
 
-	snapshot, truncated, err := captureReadOnlyWorktreeDiff(ctx, checkout)
+	snapshot, truncated, err := captureReadOnlyWorktreeDiffForRunner(ctx, checkout, subprocess.ExecRunner{})
 	if err != nil {
 		t.Fatalf("isolated capture: %v", err)
 	}
@@ -274,7 +274,7 @@ func TestCaptureReadOnlyWorktreeDiffSupportsSplitIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	snapshot, truncated, err := captureReadOnlyWorktreeDiff(ctx, worktree)
+	snapshot, truncated, err := captureReadOnlyWorktreeDiffForRunner(ctx, worktree, subprocess.ExecRunner{})
 	if err != nil {
 		t.Fatalf("capture split-index worktree: %v", err)
 	}
@@ -335,7 +335,7 @@ func TestCaptureReadOnlyWorktreeDiffIncludesStagedGitlinkWithoutRunningSubmodule
 		t.Fatal(err)
 	}
 
-	snapshot, truncated, err := captureReadOnlyWorktreeDiff(ctx, parent)
+	snapshot, truncated, err := captureReadOnlyWorktreeDiffForRunner(ctx, parent, subprocess.ExecRunner{})
 	if err != nil {
 		t.Fatalf("capture staged gitlink: %v", err)
 	}

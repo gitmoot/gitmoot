@@ -963,10 +963,6 @@ func runTaskRecover(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func recoverTaskImplementation(ctx context.Context, store *db.Store, taskID string, repoFlag string, owner string, skipFanout bool, gh github.Client) (workflow.JobPayload, error) {
-	return recoverTaskImplementationForRunner(ctx, store, taskID, repoFlag, owner, skipFanout, gh, subprocess.ExecRunner{})
-}
-
 func recoverTaskImplementationForRunner(ctx context.Context, store *db.Store, taskID string, repoFlag string, owner string, skipFanout bool, gh github.Client, runner subprocess.Runner) (workflow.JobPayload, error) {
 	task, err := store.GetTask(ctx, strings.TrimSpace(taskID))
 	if err != nil {
@@ -1132,10 +1128,6 @@ func recoverTaskImplementationForRunner(ctx context.Context, store *db.Store, ta
 	return finalized, nil
 }
 
-func taskWorktreeDirty(ctx context.Context, task db.Task) (bool, error) {
-	return taskWorktreeDirtyWithRunner(ctx, task, subprocess.ExecRunner{})
-}
-
 func taskWorktreeDirtyWithRunner(ctx context.Context, task db.Task, runner subprocess.Runner) (bool, error) {
 	if strings.TrimSpace(task.WorktreePath) == "" {
 		return false, nil
@@ -1252,10 +1244,6 @@ func previousTaskImplementHeadSHA(ctx context.Context, store *db.Store, taskID s
 		head = payload.HeadSHA
 	}
 	return head
-}
-
-func taskRecoverBaseHead(ctx context.Context, store *db.Store, task db.Task, repo string) (string, error) {
-	return taskRecoverBaseHeadForRunner(ctx, store, task, repo, subprocess.ExecRunner{})
 }
 
 func taskRecoverBaseHeadForRunner(ctx context.Context, store *db.Store, task db.Task, repo string, runner subprocess.Runner) (string, error) {

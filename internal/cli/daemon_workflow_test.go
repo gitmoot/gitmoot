@@ -14,7 +14,9 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/github/githubtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -67,14 +69,14 @@ func TestRefreshDaemonJobPayloadPreservesTaskWorktreeHeadForFinalizer(t *testing
 		t.Fatal("worker did not create a new commit")
 	}
 	payload := workflow.JobPayload{Repo: "owner/repo", Branch: "task-1", PullRequest: 12, HeadSHA: oldHead, GoalID: "goal-1", TaskID: "task-1", TaskTitle: "Task 1", Result: &workflow.AgentResult{Decision: "implemented", Summary: "done"}}
-	refreshed, err := refreshDaemonJobPayload(ctx, store, worktree, db.Job{ID: "job-implement-worktree", Agent: "lead", Type: "implement"}, payload)
+	refreshed, err := refreshDaemonJobPayloadForRunner(ctx, store, worktree, db.Job{ID: "job-implement-worktree", Agent: "lead", Type: "implement"}, payload, subprocess.ExecRunner{})
 	if err != nil {
-		t.Fatalf("refreshDaemonJobPayload returned error: %v", err)
+		t.Fatalf("refreshDaemonJobPayloadForRunner returned error: %v", err)
 	}
 	if refreshed.HeadSHA != oldHead {
 		t.Fatalf("refreshed head = %q, want original %q", refreshed.HeadSHA, oldHead)
 	}
-	finalized, err := (newHostDaemonImplementationFinalizer(store, github.NoopClient{})).FinalizeImplementation(ctx, db.Job{ID: "job-implement-worktree", Agent: "lead", Type: "implement"}, refreshed)
+	finalized, err := (daemonImplementationFinalizer{Store: store, GitHub: githubtest.NoopClient{}, Runner: subprocess.ExecRunner{}}).FinalizeImplementation(ctx, db.Job{ID: "job-implement-worktree", Agent: "lead", Type: "implement"}, refreshed)
 	if err != nil {
 		t.Fatalf("FinalizeImplementation returned error: %v", err)
 	}
@@ -119,7 +121,7 @@ func TestDaemonImplementationFinalizerCommitsBeforeReusingExistingPullRequest(t 
 	if err := store.UpsertPullRequest(ctx, db.PullRequest{RepoFullName: "owner/repo", Number: 12, URL: "https://github.com/owner/repo/pull/12", HeadBranch: "task-1", BaseBranch: "main", HeadSHA: "old", State: "open"}); err != nil {
 		t.Fatalf("UpsertPullRequest returned error: %v", err)
 	}
-	finalizer := newHostDaemonImplementationFinalizer(store, github.NoopClient{})
+	finalizer := daemonImplementationFinalizer{Store: store, GitHub: githubtest.NoopClient{}, Runner: subprocess.ExecRunner{}}
 	payload := workflow.JobPayload{
 		Repo:      "owner/repo",
 		Branch:    "task-1",
@@ -198,7 +200,7 @@ func TestDaemonImplementationFinalizerAdoptsExistingPullRequestViaEnsure(t *test
 		HeadRef: "task-1",
 		BaseRef: "main",
 	}}
-	finalizer := newHostDaemonImplementationFinalizer(store, gh)
+	finalizer := daemonImplementationFinalizer{Store: store, GitHub: gh, Runner: subprocess.ExecRunner{}}
 	payload := workflow.JobPayload{
 		Repo:      "owner/repo",
 		Branch:    "task-1",
@@ -279,7 +281,7 @@ func TestDaemonImplementationFinalizerPersistsSkipFanoutBeforeOpeningPR(t *testi
 		HeadRef: "task-1",
 		BaseRef: "main",
 	}}
-	finalizer := newHostDaemonImplementationFinalizer(store, gh)
+	finalizer := daemonImplementationFinalizer{Store: store, GitHub: gh, Runner: subprocess.ExecRunner{}}
 	payload := workflow.JobPayload{
 		Repo:                   "owner/repo",
 		Branch:                 "task-1",
@@ -354,7 +356,7 @@ func TestDaemonImplementationFinalizerPersistsSkipFanoutOnNoChangeReFinalize(t *
 	}
 	// Clean worktree + PR already attached + head unchanged ⇒ the no-changes early
 	// return. NoopClient: no PR-open call is expected on this path.
-	finalizer := newHostDaemonImplementationFinalizer(store, github.NoopClient{})
+	finalizer := daemonImplementationFinalizer{Store: store, GitHub: githubtest.NoopClient{}, Runner: subprocess.ExecRunner{}}
 	payload := workflow.JobPayload{
 		Repo:                   "owner/repo",
 		Branch:                 "task-1",
@@ -422,7 +424,7 @@ func TestDaemonImplementationFinalizerPushesAlreadyCommittedWork(t *testing.T) {
 	if err := store.UpsertPullRequest(ctx, db.PullRequest{RepoFullName: "owner/repo", Number: 12, URL: "https://github.com/owner/repo/pull/12", HeadBranch: "task-1", BaseBranch: "main", HeadSHA: oldHead, State: "open"}); err != nil {
 		t.Fatalf("UpsertPullRequest returned error: %v", err)
 	}
-	finalizer := newHostDaemonImplementationFinalizer(store, github.NoopClient{})
+	finalizer := daemonImplementationFinalizer{Store: store, GitHub: githubtest.NoopClient{}, Runner: subprocess.ExecRunner{}}
 	payload := workflow.JobPayload{
 		Repo:      "owner/repo",
 		Branch:    "task-1",
@@ -480,7 +482,7 @@ func TestDaemonImplementationFinalizerBlocksWrongBranch(t *testing.T) {
 	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Task 1", State: string(workflow.TaskImplementing), Branch: "task-1", WorktreePath: repoDir}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
-	finalizer := newHostDaemonImplementationFinalizer(store, github.NoopClient{})
+	finalizer := daemonImplementationFinalizer{Store: store, GitHub: githubtest.NoopClient{}, Runner: subprocess.ExecRunner{}}
 	payload := workflow.JobPayload{
 		Repo:      "owner/repo",
 		Branch:    "task-1",
@@ -531,7 +533,7 @@ func TestDaemonImplementationFinalizerAllowsAlreadyFinalizedPullRequest(t *testi
 	if err := store.UpsertTask(ctx, db.Task{ID: "task-1", RepoFullName: "owner/repo", GoalID: "goal-1", Title: "Task 1", State: string(workflow.TaskImplementing), Branch: "task-1", WorktreePath: repoDir}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
-	finalizer := newHostDaemonImplementationFinalizer(store, github.NoopClient{})
+	finalizer := daemonImplementationFinalizer{Store: store, GitHub: githubtest.NoopClient{}, Runner: subprocess.ExecRunner{}}
 	payload := workflow.JobPayload{
 		Repo:        "owner/repo",
 		Branch:      "task-1",
@@ -554,7 +556,7 @@ func TestDaemonImplementationFinalizerAllowsAlreadyFinalizedPullRequest(t *testi
 }
 
 func TestNewDaemonPolicyMergeGateIncludesWorktreeCleaner(t *testing.T) {
-	gate := newDaemonPolicyMergeGate(nil, github.NoopClient{}, "/tmp/gitmoot-checkout")
+	gate := newDaemonPolicyMergeGateForRunner(nil, githubtest.NoopClient{}, "/tmp/gitmoot-checkout", subprocess.ExecRunner{})
 
 	if gate.Worktrees == nil {
 		t.Fatal("daemon merge gate missing worktree cleaner")
@@ -588,7 +590,7 @@ func TestDaemonMergeGateCanBeDisabledByEnvironment(t *testing.T) {
 }
 
 func TestDaemonMergeGatePreservesInjectedGitHubClient(t *testing.T) {
-	fake := github.NoopClient{}
+	fake := githubtest.NoopClient{}
 	gate := daemonMergeGate{GitHub: fake}
 
 	if got := gate.githubClient("/tmp/checkout"); got != fake {
@@ -663,10 +665,13 @@ func TestBuildEscalationCommentIsNotParsedAsCommand(t *testing.T) {
 		}
 	}
 
-	// And end-to-end: the daemon's own parser yields no command at all for the
-	// notification body, so the daemon never acks it as an (un)routable command.
-	if cmds := daemon.ParseCommandsWithoutAuthorization(body); len(cmds) != 0 {
-		t.Fatalf("escalation comment parsed into %d command(s); want 0: %+v\nbody:\n%s", len(cmds), cmds, body)
+	// And end-to-end: the daemon's own parser yields no command for any line of
+	// the notification body, so the daemon never acks it as an (un)routable
+	// command.
+	for _, line := range strings.Split(body, "\n") {
+		if cmd, ok := daemon.ParseCommand(line); ok {
+			t.Fatalf("escalation comment line parsed into command %+v; want none: %q\nbody:\n%s", cmd, line, body)
+		}
 	}
 }
 
@@ -700,8 +705,10 @@ func TestBuildAskGateComment(t *testing.T) {
 		t.Fatalf("ask-gate comment must NOT offer the failure verbs; body:\n%s", body)
 	}
 	// Same command-injection guard as the failure comment.
-	if cmds := daemon.ParseCommandsWithoutAuthorization(body); len(cmds) != 0 {
-		t.Fatalf("ask-gate comment parsed into %d command(s); want 0: %+v\nbody:\n%s", len(cmds), cmds, body)
+	for _, line := range strings.Split(body, "\n") {
+		if cmd, ok := daemon.ParseCommand(line); ok {
+			t.Fatalf("ask-gate comment line parsed into command %+v; want none: %q\nbody:\n%s", cmd, line, body)
+		}
 	}
 }
 
@@ -762,7 +769,7 @@ func TestDaemonImplementationFinalizerPersistsSkipFanoutWhenExecutorIsDelegatedW
 		HeadRef: "task-busy",
 		BaseRef: "main",
 	}}
-	finalizer := newHostDaemonImplementationFinalizer(store, gh)
+	finalizer := daemonImplementationFinalizer{Store: store, GitHub: gh, Runner: subprocess.ExecRunner{}}
 	payload := workflow.JobPayload{
 		Repo:                   "owner/repo",
 		Branch:                 "task-busy",
@@ -862,7 +869,7 @@ func TestDaemonImplementationFinalizerPreservesPrearmedSkipFanoutWhenPayloadIsFa
 		HeadRef: "task-fixround",
 		BaseRef: "main",
 	}}
-	finalizer := newHostDaemonImplementationFinalizer(store, gh)
+	finalizer := daemonImplementationFinalizer{Store: store, GitHub: gh, Runner: subprocess.ExecRunner{}}
 	payload := workflow.JobPayload{
 		Repo:                   "owner/repo",
 		Branch:                 "task-fixround",

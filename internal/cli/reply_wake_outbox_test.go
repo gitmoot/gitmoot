@@ -614,7 +614,7 @@ func TestReplyWakeOutboxStartsNewBatchAfterWindow(t *testing.T) {
 	setWakeOutboxCreatedAt(t, store.DatabasePath(), fmt.Sprint(first.ID), base)
 	setWakeOutboxCreatedAt(t, store.DatabasePath(), fmt.Sprint(second.ID), base.Add(replyWakeCoalescingWindow))
 
-	if err := drainReplyWakeOutbox(ctx, store, base.Add(2*replyWakeCoalescingWindow+time.Second), replyWakeTestDeliveryResolver(sink)); err != nil {
+	if _, err := drainReplyWakeOutboxWithHealth(ctx, store, base.Add(2*replyWakeCoalescingWindow+time.Second), replyWakeTestDeliveryResolver(sink)); err != nil {
 		t.Fatal(err)
 	}
 	if wake.promptCalls != 2 {
@@ -646,7 +646,7 @@ func TestReplyWakeOutboxFleetDrainRunsWithZeroEnabledRepos(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = drainReplyWakeOutbox(ctx, store, oldestAt.Add(replyWakeCoalescingWindow-time.Millisecond), replyWakeTestDeliveryResolver(sink))
+	_, err = drainReplyWakeOutboxWithHealth(ctx, store, oldestAt.Add(replyWakeCoalescingWindow-time.Millisecond), replyWakeTestDeliveryResolver(sink))
 	if err == nil || !strings.Contains(err.Error(), "outstanding obligations: pending=4") {
 		t.Fatalf("pre-window drain health = %v, want four pending obligations", err)
 	}
@@ -1238,7 +1238,8 @@ func drainReplyWakeAfterAllRowsAreDueResult(t *testing.T, store *db.Store, sink 
 			latest = createdAt
 		}
 	}
-	return drainReplyWakeOutbox(context.Background(), store, latest.Add(replyWakeCoalescingWindow+time.Second), replyWakeTestDeliveryResolver(sink))
+	_, drainErr := drainReplyWakeOutboxWithHealth(context.Background(), store, latest.Add(replyWakeCoalescingWindow+time.Second), replyWakeTestDeliveryResolver(sink))
+	return drainErr
 }
 
 func replyWakeTestDeliveryResolver(sink synchronousEventRuleTestSink) replyWakeDeliveryResolver {
@@ -1343,7 +1344,7 @@ func TestReplyWakeOutboxDrainProjectsOnceWhenNothingIsClaimed(t *testing.T) {
 
 	// This row is deliverable, so the drain claims it and must re-read.
 	claiming := &countingWakeOutboxStore{inner: store}
-	if err := drainReplyWakeOutbox(ctx, claiming, due, replyWakeTestDeliveryResolver(sink)); err != nil {
+	if _, err := drainReplyWakeOutboxWithHealth(ctx, claiming, due, replyWakeTestDeliveryResolver(sink)); err != nil {
 		t.Fatalf("claiming drain: %v", err)
 	}
 	if claiming.claims == 0 {
@@ -1355,7 +1356,7 @@ func TestReplyWakeOutboxDrainProjectsOnceWhenNothingIsClaimed(t *testing.T) {
 
 	// Nothing left to claim: one projection for the whole drain.
 	idle := &countingWakeOutboxStore{inner: store}
-	if err := drainReplyWakeOutbox(ctx, idle, due, replyWakeTestDeliveryResolver(sink)); err != nil {
+	if _, err := drainReplyWakeOutboxWithHealth(ctx, idle, due, replyWakeTestDeliveryResolver(sink)); err != nil {
 		t.Fatalf("idle drain: %v", err)
 	}
 	if idle.claims != 0 {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -96,12 +97,12 @@ func TestDefaultCheckoutResyncsReviewHeadWhenPRIsOpen(t *testing.T) {
 		t.Fatalf("daemonJobPayload returned error: %v", err)
 	}
 
-	got, err := worker.defaultCheckout(ctx, job, payload, runtime.Agent{Name: "reviewer"})
+	got, err := worker.defaultCheckoutForRunner(ctx, job, payload, runtime.Agent{Name: "reviewer"}, subprocess.ExecRunner{})
 	if err != nil {
-		t.Fatalf("defaultCheckout failed the stale-head review instead of re-syncing: %v", err)
+		t.Fatalf("defaultCheckoutForRunner failed the stale-head review instead of re-syncing: %v", err)
 	}
 	if got != checkout {
-		t.Fatalf("defaultCheckout = %q, want shared checkout %q", got, checkout)
+		t.Fatalf("defaultCheckoutForRunner = %q, want shared checkout %q", got, checkout)
 	}
 
 	// The job payload is re-targeted to the checkout's CURRENT head so RunJob (which
@@ -175,9 +176,9 @@ func TestDefaultCheckoutFailsReviewHeadMismatchWhenPRClosed(t *testing.T) {
 		t.Fatalf("daemonJobPayload returned error: %v", err)
 	}
 
-	_, err = worker.defaultCheckout(ctx, job, payload, runtime.Agent{Name: "reviewer"})
+	_, err = worker.defaultCheckoutForRunner(ctx, job, payload, runtime.Agent{Name: "reviewer"}, subprocess.ExecRunner{})
 	if err == nil {
-		t.Fatal("defaultCheckout re-synced a review whose PR is closed; want a clean head-mismatch failure")
+		t.Fatal("defaultCheckoutForRunner re-synced a review whose PR is closed; want a clean head-mismatch failure")
 	}
 	if !strings.Contains(err.Error(), "not review job head") {
 		t.Fatalf("expected the review head-mismatch error, got: %v", err)
@@ -266,9 +267,9 @@ func TestDefaultCheckoutDeclinesResyncWhenCheckoutOnWrongBranch(t *testing.T) {
 		t.Fatalf("daemonJobPayload returned error: %v", err)
 	}
 
-	_, err = worker.defaultCheckout(ctx, job, payload, runtime.Agent{Name: "reviewer"})
+	_, err = worker.defaultCheckoutForRunner(ctx, job, payload, runtime.Agent{Name: "reviewer"}, subprocess.ExecRunner{})
 	if err == nil {
-		t.Fatal("defaultCheckout re-synced a review to a checkout on the wrong branch; want a clean head-mismatch failure")
+		t.Fatal("defaultCheckoutForRunner re-synced a review to a checkout on the wrong branch; want a clean head-mismatch failure")
 	}
 	if !strings.Contains(err.Error(), "not review job head") {
 		t.Fatalf("expected the review head-mismatch error, got: %v", err)

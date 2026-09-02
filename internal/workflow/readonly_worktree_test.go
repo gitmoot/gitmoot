@@ -479,7 +479,7 @@ func TestDispatchDelegationsTwoReadOnlySiblingsGetSeparateDetachedWorktrees(t *t
 	if payloadOne.Branch != "task-005" || payloadTwo.Branch != "task-005" {
 		t.Fatalf("read-only children must keep the parent branch: d1=%q d2=%q", payloadOne.Branch, payloadTwo.Branch)
 	}
-	// HeadSHA cleared so validateTargetCheckout validates the fresh worktree HEAD.
+	// HeadSHA cleared so validateTargetCheckoutForRunner validates the fresh worktree HEAD.
 	if payloadOne.HeadSHA != "" || payloadTwo.HeadSHA != "" {
 		t.Fatalf("read-only worktree children must not inherit parent HeadSHA: d1=%q d2=%q", payloadOne.HeadSHA, payloadTwo.HeadSHA)
 	}

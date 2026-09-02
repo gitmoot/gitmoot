@@ -12,6 +12,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -327,12 +328,12 @@ func TestHeartbeatScanEnqueuesImplementJob(t *testing.T) {
 }
 
 // TestHeartbeatImplementJobPassesWorkerCheckout is the WORKER-LEVEL guard for #611:
-// it drives the REAL daemon worker checkout pre-flight (defaultCheckout →
-// taskWorktreeCheckout + validateTargetCheckout + validateImplementationLock) for
+// it drives the REAL daemon worker checkout pre-flight (defaultCheckoutForRunner →
+// taskWorktreeCheckout + validateTargetCheckoutForRunner + validateImplementationLock) for
 // the job a policy-passing implement heartbeat enqueues, and asserts it RESOLVES the
 // isolated on-branch worktree instead of failing "checkout branch is main, not job
 // branch " on the shared checkout. Against pre-fix code (a bare enqueue with
-// Branch/TaskID empty) defaultCheckout returns that error and the job goes straight
+// Branch/TaskID empty) defaultCheckoutForRunner returns that error and the job goes straight
 // to JobFailed — the exact false-green the scan+enqueue tests could never catch
 // because they stop at a fake enqueuer and never reach the worker.
 func TestHeartbeatImplementJobPassesWorkerCheckout(t *testing.T) {
@@ -344,7 +345,7 @@ func TestHeartbeatImplementJobPassesWorkerCheckout(t *testing.T) {
 	}
 	// A real git checkout whose origin is owner/repo, so the worker's
 	// preflightDaemonRepoCheckout (origin must equal the registered repo) and
-	// validateTargetCheckout both pass against the resolved worktree.
+	// validateTargetCheckoutForRunner both pass against the resolved worktree.
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+`
 [agents.builder]
@@ -406,12 +407,12 @@ max_concurrent = 1
 	// Drive the REAL worker checkout pre-flight. Pre-fix this returned "checkout
 	// branch is main, not job branch "; post-fix it resolves the on-branch worktree.
 	worker := defaultJobWorker(store, io.Discard, home)
-	got, err := worker.defaultCheckout(ctx, job, payload, runtime.Agent{Name: "builder"})
+	got, err := worker.defaultCheckoutForRunner(ctx, job, payload, runtime.Agent{Name: "builder"}, subprocess.ExecRunner{})
 	if err != nil {
-		t.Fatalf("defaultCheckout rejected the implement heartbeat job (the #611 false-green): %v", err)
+		t.Fatalf("defaultCheckoutForRunner rejected the implement heartbeat job (the #611 false-green): %v", err)
 	}
 	if got == checkout {
-		t.Fatalf("defaultCheckout resolved the SHARED checkout %q, not the isolated task worktree", checkout)
+		t.Fatalf("defaultCheckoutForRunner resolved the SHARED checkout %q, not the isolated task worktree", checkout)
 	}
 	task, err := store.GetTask(ctx, payload.TaskID)
 	if err != nil {
@@ -422,7 +423,7 @@ max_concurrent = 1
 		t.Fatalf("normalizeTaskWorktreePath: %v", err)
 	}
 	if got != wantWorktree {
-		t.Fatalf("defaultCheckout = %q, want isolated task worktree %q", got, wantWorktree)
+		t.Fatalf("defaultCheckoutForRunner = %q, want isolated task worktree %q", got, wantWorktree)
 	}
 }
 

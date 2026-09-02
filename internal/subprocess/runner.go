@@ -208,38 +208,19 @@ func (r EnvInjectingRunner) inner() Runner {
 	return GroupRunner{}
 }
 
+// Run, RunStream and RunWithPID are the non-env spellings of their RunEnv*
+// counterparts: EnvInjectingRunner already injects r.Env on every call, so each
+// delegates with no additional environment.
 func (r EnvInjectingRunner) Run(ctx context.Context, dir string, command string, args ...string) (Result, error) {
-	if inner, ok := r.inner().(EnvRunner); ok {
-		return inner.RunEnv(ctx, dir, r.Env, command, args...)
-	}
-	if len(r.Env) == 0 {
-		return r.inner().Run(ctx, dir, command, args...)
-	}
-	return Result{}, errors.New("environment-injecting runner inner does not support environment injection")
+	return r.RunEnv(ctx, dir, nil, command, args...)
 }
 
 func (r EnvInjectingRunner) RunStream(ctx context.Context, dir string, out io.Writer, command string, args ...string) (Result, error) {
-	if inner, ok := r.inner().(EnvStreamRunner); ok {
-		return inner.RunEnvStream(ctx, dir, r.Env, out, command, args...)
-	}
-	if len(r.Env) == 0 {
-		if inner, ok := r.inner().(StreamRunner); ok {
-			return inner.RunStream(ctx, dir, out, command, args...)
-		}
-	}
-	return Result{}, errors.New("environment-injecting runner inner does not support environment streaming")
+	return r.RunEnvStream(ctx, dir, nil, out, command, args...)
 }
 
 func (r EnvInjectingRunner) RunWithPID(ctx context.Context, dir string, onPID PIDCallback, command string, args ...string) (Result, error) {
-	if inner, ok := r.inner().(EnvPIDRunner); ok {
-		return inner.RunEnvWithPID(ctx, dir, r.Env, onPID, command, args...)
-	}
-	if len(r.Env) == 0 {
-		if inner, ok := r.inner().(PIDRunner); ok {
-			return inner.RunWithPID(ctx, dir, onPID, command, args...)
-		}
-	}
-	return Result{}, errors.New("environment-injecting runner inner does not support PID capture")
+	return r.RunEnvWithPID(ctx, dir, nil, onPID, command, args...)
 }
 
 func (r EnvInjectingRunner) RunEnv(ctx context.Context, dir string, env []string, command string, args ...string) (Result, error) {
@@ -275,6 +256,13 @@ func (r EnvInjectingRunner) RunEnvWithPID(ctx context.Context, dir string, env [
 		if inner, ok := r.inner().(PIDRunner); ok {
 			return inner.RunWithPID(ctx, dir, onPID, command, args...)
 		}
+	}
+	// The non-env spelling RunWithPID delegates here with a nil env, so an inner
+	// that cannot capture a PID must still report the plain wording it reported
+	// before the fold: an operator log-matching rule keyed on it would otherwise
+	// stop matching on a path where no environment was involved at all.
+	if len(merged) == 0 {
+		return Result{}, errors.New("environment-injecting runner inner does not support PID capture")
 	}
 	return Result{}, errors.New("environment-injecting runner inner does not support environment PID capture")
 }
@@ -375,11 +363,11 @@ func RunStreamWithPID(ctx context.Context, dir string, out io.Writer, onPID PIDC
 
 // runStreamingCmd wires line-teeing tee writers (sharing one SyncWriter so the
 // two pipes interleave safely) plus the buffered captures onto cmd, runs it, and
-// returns the same buffered Result Run/RunGroup produce. The cmd's run strategy
-// (plain context-cancel vs process-group) is the caller's choice: RunStream
-// passes a plain cmd; RunGroupStream wires the group cancel/sweep first. The
-// returned Result is byte-identical to the non-streaming runners' Result, so the
-// tee never changes result capture.
+// returns the same buffered Result Run/GroupRunner.Run produce. The cmd's run
+// strategy (plain context-cancel vs process-group) is the caller's choice:
+// RunStream passes a plain cmd; GroupRunner.RunStream wires the group
+// cancel/sweep first. The returned Result is byte-identical to the
+// non-streaming runners' Result, so the tee never changes result capture.
 func runStreamingCmd(cmd *exec.Cmd, out io.Writer, command string, args []string) (Result, error) {
 	return runStreamingCmdWithPID(cmd, out, nil, command, args)
 }

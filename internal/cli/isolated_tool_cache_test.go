@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -275,9 +276,9 @@ func TestFreshIsolatedProduceRunnerStreamsInjectedEnvAndPID(t *testing.T) {
 
 	// This is the fresh pipeline-stage construction order in jobWorker.run:
 	// progress tee, produce sandbox, then isolated tool-cache env injection.
-	adapter, err := worker.buildJobAdapter(agent, checkout, &progress)
+	adapter, err := worker.buildJobAdapterForBackend(execbackend.Local, agent, checkout, &progress)
 	if err != nil {
-		t.Fatalf("buildJobAdapter: %v", err)
+		t.Fatalf("buildJobAdapterForBackend: %v", err)
 	}
 	toolCacheEnv, err := applyIsolatedToolCacheGrants(paths, payload, &agent)
 	if err != nil {

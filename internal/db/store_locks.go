@@ -169,27 +169,8 @@ const noLiveSupersedeAdvanceLockSQL = ` AND NOT EXISTS (
 			  AND advance.expires_at > ?
 		)`
 
-// AdvanceOwnershipHeld reports whether resourceKey is held by ownerToken with an
-// unexpired lease. Effect commits use it INSIDE their own transaction, so an
-// irreversible parent effect can only land while its advance still owns the job.
-func advanceOwnershipHeldTx(ctx context.Context, tx *sql.Tx, resourceKey string, ownerToken string, now time.Time) (bool, error) {
-	resourceKey = strings.TrimSpace(resourceKey)
-	ownerToken = strings.TrimSpace(ownerToken)
-	if resourceKey == "" || ownerToken == "" {
-		return false, nil
-	}
-	var held int
-	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM resource_locks
-		WHERE resource_key = ? AND owner_token = ? AND expires_at > ?`,
-		resourceKey, ownerToken, formatResourceLockTime(now)).Scan(&held)
-	if err != nil {
-		return false, err
-	}
-	return held > 0, nil
-}
-
 // AdvanceOwnershipHeld is the non-transactional read used by renewal checks and by
-// tests. The authoritative check for a WRITE is advanceOwnershipHeldTx inside that
+// tests. The authoritative check for a WRITE is advanceOwnershipLiveTx inside that
 // write's own transaction.
 func (s *Store) AdvanceOwnershipHeld(ctx context.Context, resourceKey string, ownerToken string, now time.Time) (bool, error) {
 	var held int

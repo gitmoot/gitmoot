@@ -12,7 +12,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
-	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/github/githubtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -70,7 +70,7 @@ func TestNativeReviewWorkerRunsInOwnedExactHeadWorktree(t *testing.T) {
 	}
 	gate := &cliWorkerFakeMergeGate{decision: workflow.MergeDecision{Ready: true}}
 	worker.WorkflowFactory = func(checkout string) workflow.Engine {
-		engine := daemonWorkflowEngine(store, github.NoopClient{}, checkout, worker.workflowHome())
+		engine := daemonWorkflowEngine(store, githubtest.NoopClient{}, checkout, worker.workflowHome())
 		engine.MergeGate = gate
 		return engine
 	}
@@ -130,7 +130,7 @@ func TestNativeReviewWorkerCleansOwnedWorktreeWhenAdapterPreflightFails(t *testi
 		return nil, errors.New("adapter preflight failed")
 	}
 	worker.WorkflowFactory = func(checkout string) workflow.Engine {
-		return daemonWorkflowEngine(store, github.NoopClient{}, checkout, worker.workflowHome())
+		return daemonWorkflowEngine(store, githubtest.NoopClient{}, checkout, worker.workflowHome())
 	}
 	if err := worker.run(ctx, job); err != nil {
 		t.Fatalf("worker.run: %v", err)
@@ -207,7 +207,7 @@ func TestNativeReviewWorktreePreparationCoversHighRiskLensChild(t *testing.T) {
 	}
 	gate := &cliWorkerFakeMergeGate{decision: workflow.MergeDecision{Ready: true}}
 	worker.WorkflowFactory = func(checkout string) workflow.Engine {
-		engine := daemonWorkflowEngine(store, github.NoopClient{}, checkout, worker.workflowHome())
+		engine := daemonWorkflowEngine(store, githubtest.NoopClient{}, checkout, worker.workflowHome())
 		engine.MergeGate = gate
 		return engine
 	}
@@ -268,7 +268,7 @@ func TestNativeReviewWorktreePreparationCoversHighRiskLensChild(t *testing.T) {
 // jobWorker.workflowHome() returns, so the engine's pre-enqueue allocation and the
 // worker's cleanup validator agree on one managed worktree root.
 func routineNativeReviewFanoutEngine(store *db.Store, checkout string, home string) workflow.Engine {
-	fanout := daemonWorkflowEngine(store, github.NoopClient{}, checkout, config.PathsForHome(home).Home)
+	fanout := daemonWorkflowEngine(store, githubtest.NoopClient{}, checkout, config.PathsForHome(home).Home)
 	fanout.RequireWorkflowPolicy = func(string) workflow.RequireWorkflowPolicy {
 		return workflow.RequireWorkflowPolicy{Enabled: true, Mode: "strict"}
 	}
@@ -476,7 +476,7 @@ func TestNativeReviewWorktreeContentionDefersInsteadOfBurningTheLeg(t *testing.T
 	}
 	gate := &cliWorkerFakeMergeGate{decision: workflow.MergeDecision{Ready: true}}
 	worker.WorkflowFactory = func(checkout string) workflow.Engine {
-		engine := daemonWorkflowEngine(store, github.NoopClient{}, checkout, worker.workflowHome())
+		engine := daemonWorkflowEngine(store, githubtest.NoopClient{}, checkout, worker.workflowHome())
 		engine.MergeGate = gate
 		return engine
 	}
@@ -577,7 +577,7 @@ func TestNativeReviewWorktreeHardFailureStaysTerminal(t *testing.T) {
 		return nil, errors.New("adapter must never be built for an unallocatable head")
 	}
 	worker.WorkflowFactory = func(checkout string) workflow.Engine {
-		return daemonWorkflowEngine(store, github.NoopClient{}, checkout, worker.workflowHome())
+		return daemonWorkflowEngine(store, githubtest.NoopClient{}, checkout, worker.workflowHome())
 	}
 	if err := worker.run(ctx, job); err != nil {
 		t.Fatalf("worker.run: %v", err)
@@ -632,7 +632,7 @@ func TestNativeReviewWorktreeContentionDefersLensChild(t *testing.T) {
 	}
 	gate := &cliWorkerFakeMergeGate{decision: workflow.MergeDecision{Ready: true}}
 	worker.WorkflowFactory = func(checkout string) workflow.Engine {
-		engine := daemonWorkflowEngine(store, github.NoopClient{}, checkout, worker.workflowHome())
+		engine := daemonWorkflowEngine(store, githubtest.NoopClient{}, checkout, worker.workflowHome())
 		engine.MergeGate = gate
 		return engine
 	}
@@ -721,7 +721,7 @@ func TestNativeReviewWorktreeHardFailureStaysTerminalForLensChild(t *testing.T) 
 		return nil, errors.New("adapter must never be built for an unallocatable head")
 	}
 	worker.WorkflowFactory = func(checkout string) workflow.Engine {
-		return daemonWorkflowEngine(store, github.NoopClient{}, checkout, worker.workflowHome())
+		return daemonWorkflowEngine(store, githubtest.NoopClient{}, checkout, worker.workflowHome())
 	}
 	// The parent coordinator row is deliberately absent, so AdvanceJob's parent
 	// lookup is the LAST step of the terminal routing and its error is the witness
@@ -782,7 +782,7 @@ func TestNativeReviewWorktreeContentionOnLensChildIsBudgetBounded(t *testing.T) 
 		return nil, errors.New("adapter must never be built while the lock is wedged")
 	}
 	worker.WorkflowFactory = func(checkout string) workflow.Engine {
-		return daemonWorkflowEngine(store, github.NoopClient{}, checkout, worker.workflowHome())
+		return daemonWorkflowEngine(store, githubtest.NoopClient{}, checkout, worker.workflowHome())
 	}
 	// The lock is never released: the worst case the narrowing has to survive.
 	if _, err := workflow.AcquireCheckoutMutationLock(ctx, store, sharedCheckout, "wedged-worker", time.Now().UTC()); err != nil {

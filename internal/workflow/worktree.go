@@ -1656,17 +1656,6 @@ func (e Engine) ReclaimTerminalDelegationWorktreeOutcome(ctx context.Context, jo
 	return outcome == "delegation_worktree_removed", nil
 }
 
-// ReclaimAgedTerminalDelegationWorktree force-removes a delegation/read-only/fix
-// worktree only when the owning job is FINAL and its terminal updated_at is at
-// or before cutoff. This is the crash-window backstop: unlike the ordinary
-// cleanup path it intentionally bypasses dirty/unprovable-content and stale
-// runtime-owner preservation after the 72h default grace period. Blocked jobs
-// are resumable (not final), so they can never pass this gate.
-func (e Engine) ReclaimAgedTerminalDelegationWorktree(ctx context.Context, jobID string, cutoff time.Time) error {
-	_, err := e.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, jobID, cutoff)
-	return err
-}
-
 // FixCloneQuarantines lists every surviving sibling previously created by the
 // old quarantine mechanism or the current SetAsideFixClone path. Automatic
 // deletion is disabled; every matching name is operator-owned content.
@@ -2340,9 +2329,15 @@ func (e Engine) recordFixCloneRetention(ctx context.Context, jobID, kind, messag
 	})
 }
 
-// ReclaimAgedTerminalDelegationWorktreeOutcome is the reporting form used by
-// the daemon reclaim pass. reclaimed is false for every revalidation no-op and
-// true only after the path cleanup and reclaim event complete.
+// ReclaimAgedTerminalDelegationWorktreeOutcome force-removes a
+// delegation/read-only/fix worktree only when the owning job is FINAL and its
+// terminal updated_at is at or before cutoff. This is the crash-window
+// backstop: unlike the ordinary cleanup path it intentionally bypasses
+// dirty/unprovable-content and stale runtime-owner preservation after the 72h
+// default grace period. Blocked jobs are resumable (not final), so they can
+// never pass this gate. It is the reporting form used by the daemon reclaim
+// pass: reclaimed is false for every revalidation no-op and true only after the
+// path cleanup and reclaim event complete.
 func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context, jobID string, cutoff time.Time) (reclaimed bool, err error) {
 	if err := e.validate(); err != nil {
 		return false, err

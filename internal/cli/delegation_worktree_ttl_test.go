@@ -83,7 +83,7 @@ func TestReclaimAgedTerminalDelegationWorktreesTTLAndStateGate(t *testing.T) {
 	}
 
 	engine := worker.WorkflowFactory("")
-	if err := engine.ReclaimAgedTerminalDelegationWorktree(ctx, "blocked-old", now.Add(-72*time.Hour)); err == nil || !strings.Contains(err.Error(), "non-final") {
+	if _, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, "blocked-old", now.Add(-72*time.Hour)); err == nil || !strings.Contains(err.Error(), "non-final") {
 		t.Fatalf("blocked force reclaim error = %v, want non-final refusal", err)
 	}
 }

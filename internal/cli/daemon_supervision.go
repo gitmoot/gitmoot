@@ -591,7 +591,7 @@ func runOneHeartbeat(ctx context.Context, store *db.Store, enqueue heartbeatEnqu
 	// a false-green that never runs the agent, creates a branch, or opens a PR. Do the
 	// allocation here (AFTER the overlap/capacity guards so a skipped tick allocates
 	// nothing) so taskWorktreeCheckout resolves the on-branch worktree and
-	// validateTargetCheckout passes, exactly like a foreground implement. Read-only
+	// validateTargetCheckoutForRunner passes, exactly like a foreground implement. Read-only
 	// actions (ask/review) carry no branch identity and keep their bare-enqueue path.
 	var implementFields heartbeatImplementFields
 	if heartbeat.Action == "implement" {
@@ -649,7 +649,7 @@ func runOneHeartbeat(ctx context.Context, store *db.Store, enqueue heartbeatEnqu
 
 // heartbeatImplementFields is the task/branch/worktree identity an implement
 // heartbeat job must carry so the daemon worker's checkout pre-flight
-// (taskWorktreeCheckout + validateTargetCheckout) resolves the freshly allocated
+// (taskWorktreeCheckout + validateTargetCheckoutForRunner) resolves the freshly allocated
 // on-branch worktree and passes — the exact set the direct `agent implement` path
 // stamps onto its JobRequest (#611).
 type heartbeatImplementFields struct {

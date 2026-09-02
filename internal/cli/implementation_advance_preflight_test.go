@@ -17,7 +17,9 @@ import (
 	"github.com/gitmoot/gitmoot/internal/events"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/github/githubtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -54,7 +56,7 @@ func TestImplementationFinalizationTargetRejectsEveryMissingField(t *testing.T) 
 					t.Fatalf("UpsertTask returned error: %v", err)
 				}
 			}
-			_, err := implementationFinalizationTargetFor(ctx, store, db.Job{ID: "advance-fix", Agent: "lead", Type: "implement"}, test.payload, implementationFinalizationBeforeRun)
+			_, err := implementationFinalizationTargetForRunner(ctx, store, db.Job{ID: "advance-fix", Agent: "lead", Type: "implement"}, test.payload, implementationFinalizationBeforeRun, subprocess.ExecRunner{})
 			var blocked workflow.BlockedError
 			if !errors.As(err, &blocked) || !blocked.ResultDeliveryFailed {
 				t.Fatalf("error = %v, want result-delivery BlockedError", err)
@@ -777,7 +779,7 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 		if err != nil {
 			t.Fatalf("daemonJobPayload after remedy: %v", err)
 		}
-		if _, err := implementationFinalizationTargetFor(ctx, store, after, payload, implementationFinalizationBeforeRun); err != nil {
+		if _, err := implementationFinalizationTargetForRunner(ctx, store, after, payload, implementationFinalizationBeforeRun, subprocess.ExecRunner{}); err != nil {
 			t.Fatalf("documented reset remedy did not clear preflight: %v", err)
 		}
 		remedyCleared = true
@@ -788,7 +790,7 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 		if err != nil {
 			t.Fatalf("daemonJobPayload after fresh dispatch checkout: %v", err)
 		}
-		if _, err := implementationFinalizationTargetFor(ctx, store, after, payload, implementationFinalizationBeforeRun); err != nil {
+		if _, err := implementationFinalizationTargetForRunner(ctx, store, after, payload, implementationFinalizationBeforeRun, subprocess.ExecRunner{}); err != nil {
 			t.Fatalf("new dispatch with current object did not clear preflight: %v", err)
 		}
 		remedyCleared = true
@@ -798,7 +800,7 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 			t.Fatalf("daemonJobPayload after missing-head refusal: %v", err)
 		}
 		payload.HeadSHA = currentHead
-		if _, err := implementationFinalizationTargetFor(ctx, store, after, payload, implementationFinalizationBeforeRun); err != nil {
+		if _, err := implementationFinalizationTargetForRunner(ctx, store, after, payload, implementationFinalizationBeforeRun, subprocess.ExecRunner{}); err != nil {
 			t.Fatalf("fresh dispatch head did not clear missing-head preflight: %v", err)
 		}
 		remedyCleared = true
@@ -812,7 +814,7 @@ func runAdvanceImplementationPreflightFixture(t *testing.T, mode string) advance
 		if err != nil {
 			t.Fatalf("daemonJobPayload after retry: %v", err)
 		}
-		if _, err := implementationFinalizationTargetFor(ctx, store, retried, retriedPayload, implementationFinalizationBeforeRun); err != nil {
+		if _, err := implementationFinalizationTargetForRunner(ctx, store, retried, retriedPayload, implementationFinalizationBeforeRun, subprocess.ExecRunner{}); err != nil {
 			t.Fatalf("repair plus job retry did not clear preflight: %v", err)
 		}
 		remedyCleared = true
@@ -1055,7 +1057,7 @@ func TestDaemonImplementationFinalizerKeepsMissingBranchBackstop(t *testing.T) {
 		Repo: "owner/repo", PullRequest: 12, TaskID: "task-backstop",
 		FixWorktree: true, WorktreePath: t.TempDir(), Result: &workflow.AgentResult{Decision: "implemented"},
 	}
-	_, err := (newHostDaemonImplementationFinalizer(store, github.NoopClient{})).FinalizeImplementation(ctx, db.Job{ID: "late-backstop", Agent: "lead", Type: "implement"}, payload)
+	_, err := (daemonImplementationFinalizer{Store: store, GitHub: githubtest.NoopClient{}, Runner: subprocess.ExecRunner{}}).FinalizeImplementation(ctx, db.Job{ID: "late-backstop", Agent: "lead", Type: "implement"}, payload)
 	var blocked workflow.BlockedError
 	if !errors.As(err, &blocked) || !blocked.ResultDeliveryFailed || !strings.Contains(err.Error(), "carries no payload branch") {
 		t.Fatalf("FinalizeImplementation error = %v, want delivery-blocked missing-branch backstop", err)
@@ -1070,11 +1072,11 @@ func TestImplementationFinalizationTargetAcceptsCompleteTarget(t *testing.T) {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
 	head := strings.TrimSpace(runGitOutput(t, worktree, "rev-parse", "HEAD"))
-	target, err := implementationFinalizationTargetFor(ctx, store, db.Job{ID: "advance-ok", Agent: "lead", Type: "implement"}, workflow.JobPayload{
+	target, err := implementationFinalizationTargetForRunner(ctx, store, db.Job{ID: "advance-ok", Agent: "lead", Type: "implement"}, workflow.JobPayload{
 		Repo: "owner/repo", Branch: "feature/ok", HeadSHA: head, TaskID: "task-ok", FixWorktree: true, WorktreePath: worktree,
-	}, implementationFinalizationBeforeRun)
+	}, implementationFinalizationBeforeRun, subprocess.ExecRunner{})
 	if err != nil {
-		t.Fatalf("implementationFinalizationTargetFor returned error: %v", err)
+		t.Fatalf("implementationFinalizationTargetForRunner returned error: %v", err)
 	}
 	if target.Task.ID != "task-ok" || target.WorktreePath != worktree {
 		t.Fatalf("target = %+v, want task-ok and fix worktree", target)
@@ -1103,9 +1105,9 @@ func TestImplementationFinalizationTargetClassifiesBranchLookupByPhase(t *testin
 		{name: "after run retries", phase: implementationFinalizationAfterRun, wantBlocked: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := implementationFinalizationTargetFor(ctx, store, job, payload, test.phase)
+			_, err := implementationFinalizationTargetForRunner(ctx, store, job, payload, test.phase, subprocess.ExecRunner{})
 			if err == nil {
-				t.Fatal("implementationFinalizationTargetFor returned nil error")
+				t.Fatal("implementationFinalizationTargetForRunner returned nil error")
 			}
 			var blocked workflow.BlockedError
 			if got := errors.As(err, &blocked); got != test.wantBlocked {
@@ -1121,8 +1123,8 @@ func TestImplementationFinalizationTargetClassifiesBranchLookupByPhase(t *testin
 func TestImplementationFinalizationTargetRejectsUnsetPhase(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
-	_, err := implementationFinalizationTargetFor(ctx, store, db.Job{ID: "advance-unset"}, workflow.JobPayload{}, implementationFinalizationPhaseUnset)
+	_, err := implementationFinalizationTargetForRunner(ctx, store, db.Job{ID: "advance-unset"}, workflow.JobPayload{}, implementationFinalizationPhaseUnset, subprocess.ExecRunner{})
 	if err == nil || !strings.Contains(err.Error(), "finalization phase 0 is invalid") {
-		t.Fatalf("implementationFinalizationTargetFor error = %v, want invalid zero phase", err)
+		t.Fatalf("implementationFinalizationTargetForRunner error = %v, want invalid zero phase", err)
 	}
 }

@@ -15,7 +15,9 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/github/githubtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -73,17 +75,17 @@ func newFixWorktreeFixture(t *testing.T) fixWorktreeFixture {
 
 func (f fixWorktreeFixture) allocate(t *testing.T, jobID string) workflow.FixWorktreeAllocation {
 	t.Helper()
-	allocation, err := allocateFixWorktree(context.Background(), f.store, f.home, f.registered, workflow.FixWorktreeRequest{
+	allocation, err := allocateFixWorktreeForRunner(context.Background(), f.store, f.home, f.registered, workflow.FixWorktreeRequest{
 		JobID: jobID, Repo: "owner/repo", Branch: f.branch,
-	})
+	}, subprocess.ExecRunner{})
 	if err != nil {
-		t.Fatalf("allocateFixWorktree: %v", err)
+		t.Fatalf("allocateFixWorktreeForRunner: %v", err)
 	}
 	return allocation
 }
 
 // #1523 (review follow-up): the finalizer's branch resolution in
-// implementationFinalizationTargetFor unconditionally overrides the delivery
+// implementationFinalizationTargetForRunner unconditionally overrides the delivery
 // branch with payload.Branch for a FixWorktree job. That override is only safe
 // because this producer-side guard hard-errors on a blank branch BEFORE
 // dispatchFix ever sets FixWorktree=true — otherwise an empty payload.Branch
@@ -94,11 +96,11 @@ func (f fixWorktreeFixture) allocate(t *testing.T, jobID string) workflow.FixWor
 func TestAllocateFixWorktreeRejectsBlankBranch(t *testing.T) {
 	store := daemonWorkerStore(t)
 	for _, branch := range []string{"", "   "} {
-		_, err := allocateFixWorktree(context.Background(), store, t.TempDir(), t.TempDir(), workflow.FixWorktreeRequest{
+		_, err := allocateFixWorktreeForRunner(context.Background(), store, t.TempDir(), t.TempDir(), workflow.FixWorktreeRequest{
 			JobID: "fix-blank-branch", Repo: "owner/repo", Branch: branch,
-		})
+		}, subprocess.ExecRunner{})
 		if err == nil || !strings.Contains(err.Error(), "fix worktree branch is required") {
-			t.Fatalf("allocateFixWorktree with branch %q: err = %v, want \"fix worktree branch is required\"", branch, err)
+			t.Fatalf("allocateFixWorktreeForRunner with branch %q: err = %v, want \"fix worktree branch is required\"", branch, err)
 		}
 	}
 }
@@ -130,7 +132,7 @@ func TestReviewFixRunsInPerJobBranchWorktree(t *testing.T) {
 		executionBranch, _ = (gitutil.NewHostClient(checkout)).CurrentBranch(ctx)
 		return adapter, nil
 	}
-	worker.CommenterFactory = func(string) github.Client { return github.NoopClient{} }
+	worker.CommenterFactory = func(string) github.Client { return githubtest.NoopClient{} }
 	job, err := fixture.store.GetJob(ctx, "fix-job")
 	if err != nil {
 		t.Fatal(err)

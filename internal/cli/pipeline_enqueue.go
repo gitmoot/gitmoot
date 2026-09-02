@@ -185,10 +185,6 @@ func pipelineServiceShellStage(ctx context.Context, store *db.Store, request wor
 	return ok && strings.TrimSpace(run.Trigger) == "service", nil
 }
 
-func allocatePipelineServiceShellWorktree(ctx context.Context, store *db.Store, home string, request workflow.JobRequest) (workflow.JobRequest, string, error) {
-	return allocatePipelineServiceShellWorktreeForRunner(ctx, store, home, request, subprocess.ExecRunner{})
-}
-
 func allocatePipelineServiceShellWorktreeForRunner(ctx context.Context, store *db.Store, home string, request workflow.JobRequest, runner subprocess.Runner) (workflow.JobRequest, string, error) {
 	checkout := pipelineStageCheckoutPath(ctx, store, request.Repo)
 	if checkout == "" {
@@ -300,15 +296,12 @@ func pipelineShellStageReadOnlyWorktreeEligible(request workflow.JobRequest) boo
 		strings.TrimSpace(request.WorktreePath) == ""
 }
 
-// allocatePipelineShellStageReadOnlyWorktree gives an opted-in non-service shell
-// stage its own detached committed-tip worktree. Allocation is FAIL-OPEN: callers
-// enqueue the unchanged request on any error and emit readonly_worktree_skipped.
-// Unlike agent isolation, shell commands receive the live managed checkout through
-// GITMOOT_CHECKOUT and do not get prose appended to their fixed instructions.
-func allocatePipelineShellStageReadOnlyWorktree(ctx context.Context, store *db.Store, home string, request workflow.JobRequest) (workflow.JobRequest, string, error) {
-	return allocatePipelineShellStageReadOnlyWorktreeForRunner(ctx, store, home, request, subprocess.ExecRunner{})
-}
-
+// allocatePipelineShellStageReadOnlyWorktreeForRunner gives an opted-in
+// non-service shell stage its own detached committed-tip worktree. Allocation is
+// FAIL-OPEN: callers enqueue the unchanged request on any error and emit
+// readonly_worktree_skipped. Unlike agent isolation, shell commands receive the
+// live managed checkout through GITMOOT_CHECKOUT and do not get prose appended to
+// their fixed instructions.
 func allocatePipelineShellStageReadOnlyWorktreeForRunner(ctx context.Context, store *db.Store, home string, request workflow.JobRequest, runner subprocess.Runner) (workflow.JobRequest, string, error) {
 	checkout := pipelineStageCheckoutPath(ctx, store, request.Repo)
 	if checkout == "" {
@@ -331,20 +324,16 @@ func allocatePipelineShellStageReadOnlyWorktreeForRunner(ctx context.Context, st
 	return request, path, nil
 }
 
-// allocatePipelineStageReadOnlyWorktree allocates a detached committed-tip worktree
-// for an eligible repo-bound agent stage and returns the request with WorktreePath +
-// the ReadOnlyWorktree disposal marker set (so the existing terminal cleanup and
-// daemon reclaim dispose it) plus the #654 context note appended to Instructions. It
-// resolves the ref to the checkout HEAD (always resolvable) via the shared
-// workflow.AllocateReadOnlyWorktree primitive under the short
+// allocatePipelineStageReadOnlyWorktreeForRunner allocates a detached committed-tip
+// worktree for an eligible repo-bound agent stage and returns the request with
+// WorktreePath + the ReadOnlyWorktree disposal marker set (so the existing terminal
+// cleanup and daemon reclaim dispose it) plus the #654 context note appended to
+// Instructions. It resolves the ref to the checkout HEAD (always resolvable) via the
+// shared workflow.AllocateReadOnlyWorktree primitive under the short
 // ReadOnlyWorktreeDispatchLockWaitBudget. It is FAIL-OPEN: an ineligible stage or an
 // unknown checkout returns the request UNCHANGED with a nil error and empty path; a
 // genuine allocation failure returns the request unchanged with the error so the
 // caller enqueues on the shared checkout and emits a loud skip event.
-func allocatePipelineStageReadOnlyWorktree(ctx context.Context, store *db.Store, home string, request workflow.JobRequest) (workflow.JobRequest, string, error) {
-	return allocatePipelineStageReadOnlyWorktreeForRunner(ctx, store, home, request, subprocess.ExecRunner{})
-}
-
 func allocatePipelineStageReadOnlyWorktreeForRunner(ctx context.Context, store *db.Store, home string, request workflow.JobRequest, runner subprocess.Runner) (workflow.JobRequest, string, error) {
 	if !pipelineStageReadOnlyWorktreeEligible(request) {
 		return request, "", nil
@@ -408,24 +397,20 @@ func pipelineStageImplementWorktreeEligible(request workflow.JobRequest) bool {
 	return strings.TrimSpace(request.WorktreePath) == ""
 }
 
-// allocatePipelineStageWritableWorktree gives a MUTATING implement stage (#768) a real
-// WRITABLE task-worktree on its DETERMINISTIC branch by REUSING the existing implement
-// dispatch preparation (prepareLocalImplementDispatchRequest): its GetTaskByRepoBranch
-// reuse lands a retry in the SAME branch/worktree (never a duplicate PR), and its
-// fail-closed guards (an active implement job, a live process still inside the
-// worktree, or uncommitted changes) reject a retry that would clobber or duplicate
-// work. Unlike the read-only allocator it is FAIL-CLOSED: any error propagates so the
-// stage is NOT enqueued. An ineligible request (every non-implement stage) returns
-// unchanged with a nil error. On success the request carries the task worktree path +
-// the resolved deterministic branch/task/head, so the enqueued job keys worktree:<path>
-// (mutating same-repo stages parallelize; the only serialization is the brief
-// checkout-mutation lock during allocation). ReadOnlyWorktree is deliberately left
-// false — the task worktree is durable (disposed by the task lifecycle, not the #739
-// read-only cleanup).
-func allocatePipelineStageWritableWorktree(ctx context.Context, store *db.Store, home string, request workflow.JobRequest) (workflow.JobRequest, error) {
-	return allocatePipelineStageWritableWorktreeForRunner(ctx, store, home, request, subprocess.ExecRunner{})
-}
-
+// allocatePipelineStageWritableWorktreeForRunner gives a MUTATING implement stage
+// (#768) a real WRITABLE task-worktree on its DETERMINISTIC branch by REUSING the
+// existing implement dispatch preparation (prepareLocalImplementDispatchRequest): its
+// GetTaskByRepoBranch reuse lands a retry in the SAME branch/worktree (never a
+// duplicate PR), and its fail-closed guards (an active implement job, a live process
+// still inside the worktree, or uncommitted changes) reject a retry that would clobber
+// or duplicate work. Unlike the read-only allocator it is FAIL-CLOSED: any error
+// propagates so the stage is NOT enqueued. An ineligible request (every non-implement
+// stage) returns unchanged with a nil error. On success the request carries the task
+// worktree path + the resolved deterministic branch/task/head, so the enqueued job keys
+// worktree:<path> (mutating same-repo stages parallelize; the only serialization is the
+// brief checkout-mutation lock during allocation). ReadOnlyWorktree is deliberately
+// left false — the task worktree is durable (disposed by the task lifecycle, not the
+// #739 read-only cleanup).
 func allocatePipelineStageWritableWorktreeForRunner(ctx context.Context, store *db.Store, home string, request workflow.JobRequest, runner subprocess.Runner) (workflow.JobRequest, error) {
 	if !pipelineStageImplementWorktreeEligible(request) {
 		return request, nil

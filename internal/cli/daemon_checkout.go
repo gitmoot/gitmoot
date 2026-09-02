@@ -33,10 +33,6 @@ func mergeGateCheckout(ctx context.Context, store *db.Store, repo string, fallba
 	return checkout, nil
 }
 
-func (w jobWorker) defaultCheckout(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent) (string, error) {
-	return w.defaultCheckoutForRunner(ctx, job, payload, agent, subprocess.ExecRunner{})
-}
-
 func (w jobWorker) defaultCheckoutForRunner(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent, runner subprocess.Runner) (string, error) {
 	checkout, err := w.resolveJobCheckoutForRunner(ctx, job, payload, runner)
 	if err != nil {
@@ -209,10 +205,6 @@ func (w jobWorker) prepareNativeReviewWorktreeForRunner(ctx context.Context, job
 	return payload, nil
 }
 
-func (w jobWorker) resolveJobCheckout(ctx context.Context, job db.Job, payload workflow.JobPayload) (string, error) {
-	return w.resolveJobCheckoutForRunner(ctx, job, payload, subprocess.ExecRunner{})
-}
-
 func (w jobWorker) resolveJobCheckoutForRunner(ctx context.Context, job db.Job, payload workflow.JobPayload, runner subprocess.Runner) (string, error) {
 	if payload.FixWorktree {
 		checkout, err := normalizeTaskWorktreePath(payload.WorktreePath)
@@ -332,10 +324,6 @@ func normalizeTaskWorktreePath(path string) (string, error) {
 		return "", fmt.Errorf("normalize task worktree path: %w", err)
 	}
 	return filepath.Clean(absolute), nil
-}
-
-func (w jobWorker) validateTargetCheckout(ctx context.Context, payload workflow.JobPayload, checkout string) error {
-	return w.validateTargetCheckoutForRunner(ctx, payload, checkout, subprocess.ExecRunner{})
 }
 
 func (w jobWorker) validateTargetCheckoutForRunner(ctx context.Context, payload workflow.JobPayload, checkout string, runner subprocess.Runner) error {
@@ -545,7 +533,7 @@ func (w jobWorker) reviewPullRequestOpen(ctx context.Context, repo string, numbe
 // On a re-sync it persists the current head onto the job payload (RunJob re-reads
 // the payload from the store, so the delivered review prompt and the posted PR
 // comment carry the new head) and records a review_head_resynced event, then
-// returns true so defaultCheckout proceeds with the review. Every declined case
+// returns true so defaultCheckoutForRunner proceeds with the review. Every declined case
 // returns false so the caller's existing error path runs byte-identically.
 func (w jobWorker) resyncReviewHeadForRunner(ctx context.Context, job db.Job, payload workflow.JobPayload, checkout string, runner subprocess.Runner, cause error) (bool, error) {
 	if !isReviewHeadMismatch(cause) {

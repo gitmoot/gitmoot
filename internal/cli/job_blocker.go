@@ -374,14 +374,6 @@ func quotaResetHintMentioned(text string) bool {
 	return strings.Contains(text, "reset") || strings.Contains(text, "try again") || strings.Contains(text, "retry")
 }
 
-// parseQuotaResetDelay is the duration compatibility wrapper used by the
-// existing blocker tests and retry path.
-func parseQuotaResetDelay(text string) time.Duration {
-	now := time.Now().UTC()
-	resetAt, _ := parseQuotaResetAt(text, now)
-	return resetAt.Sub(now)
-}
-
 // startsWithLetter reports whether rest — the text immediately after a matched
 // bare number — begins (after spaces/tabs) with a letter, i.e. the number
 // carried a unit word quotaResetInRe does not recognize, so the bare-integer-

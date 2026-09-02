@@ -590,9 +590,8 @@ func TestP2GapSingleRepoSupervisorAdvanceResolvesJobSubprocessRunner(t *testing.
 }
 
 // TestJobCheckoutRouteConsumesResolvedSubprocessRunner pins the production
-// checkoutForJob call site. Replacing defaultCheckoutForRunner with the
-// host-only defaultCheckout wrapper compiles, but ignores this resolved runner
-// and makes the test fail by executing git locally.
+// checkoutForJob call site. Passing subprocess.ExecRunner{} instead of this
+// resolved runner compiles, but makes the test fail by executing git locally.
 func TestJobCheckoutRouteConsumesResolvedSubprocessRunner(t *testing.T) {
 	ctx := context.Background()
 	_, _, store := heartbeatLoopE2EHome(t)
@@ -665,9 +664,10 @@ func TestDaemonWorkflowGitHubRoutesConsumeResolvedSubprocessRunner(t *testing.T)
 }
 
 // TestJobSubprocessProductionRoutesDoNotCallHostWrappers binds the package
-// contract to every production call site. The wrappers remain for focused
-// legacy tests only; using one from non-test code would silently substitute an
-// ExecRunner and bypass the resolved backend.
+// contract to every production call site. The host-only wrappers these names
+// once belonged to are gone (#1757); the names stay forbidden so reintroducing
+// one would be caught here rather than silently substituting an ExecRunner and
+// bypassing the resolved backend.
 func TestJobSubprocessProductionRoutesDoNotCallHostWrappers(t *testing.T) {
 	forbidden := map[string]struct{}{
 		"defaultCheckout":             {},

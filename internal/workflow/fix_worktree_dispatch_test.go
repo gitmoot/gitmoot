@@ -102,7 +102,10 @@ func TestReviewFixEnqueueFailureSetsCloneAside(t *testing.T) {
 	}
 }
 
-func TestOrdinaryImplementDispatchDoesNotAllocateFixWorktree(t *testing.T) {
+// enqueue is the shared bottom of every ordinary dispatch: only dispatchFix
+// allocates a fix worktree, so an ordinary implement reaching the queue must
+// leave the allocator untouched and the payload free of fix isolation.
+func TestOrdinaryImplementEnqueueDoesNotAllocateFixWorktree(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
@@ -112,15 +115,15 @@ func TestOrdinaryImplementDispatchDoesNotAllocateFixWorktree(t *testing.T) {
 		allocations++
 		return FixWorktreeAllocation{Path: "/wrong"}, nil
 	}
-	err := engine.dispatch(ctx, JobRequest{
+	err := engine.enqueue(ctx, JobRequest{
 		ID: "ordinary-implement", Agent: "lead", Action: "implement", Repo: "gitmoot/gitmoot",
 		Branch: "task-ordinary", TaskID: "task-ordinary", LeadAgent: "lead",
-	}, taskRef{ID: "task-ordinary"})
+	})
 	if err != nil {
-		t.Fatalf("dispatch ordinary implement: %v", err)
+		t.Fatalf("enqueue ordinary implement: %v", err)
 	}
 	if allocations != 0 {
-		t.Fatalf("fix allocator calls = %d, want 0 for ordinary implement dispatch", allocations)
+		t.Fatalf("fix allocator calls = %d, want 0 for an ordinary implement enqueue", allocations)
 	}
 	job := mustJob(t, store, "ordinary-implement")
 	payload, err := ParseJobPayload(job.Payload)

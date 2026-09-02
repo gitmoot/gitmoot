@@ -5,19 +5,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// applyMergeGatePolicy loads the [merge_gate] policy for `home` and applies the
-// per-repo resolved knobs (auto_merge, require_external_ci, min_ci_wait,
-// max_ci_wait) onto a constructed merge gate (#596). It is fail-safe: an empty
-// home, a missing config, or a parse error leaves the caller-provided gate
-// unchanged rather than erroring the daemon.
-func applyMergeGatePolicy(gate *workflow.PolicyMergeGate, home string, repo string) {
-	policy, ok := resolvedMergeGatePolicy(home, repo)
-	if !ok {
-		return
-	}
-	applyResolvedMergeGatePolicy(gate, policy)
-}
-
 func applyResolvedMergeGatePolicy(gate *workflow.PolicyMergeGate, policy config.MergeGatePolicy) {
 	gate.AutoMerge = policy.AutoMerge
 	gate.RequireExternalCI = policy.RequireExternalCI

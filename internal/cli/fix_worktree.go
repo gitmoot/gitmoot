@@ -15,15 +15,11 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// allocateFixWorktree creates an independent writable clone for one review fix
-// job. A linked worktree cannot check out payload.Branch while the lane owner's
-// registered checkout already has that branch checked out; an independent clone
-// has its own refs and HEAD, so the fix can commit and push without touching the
-// owner's index, files, or current branch.
-func allocateFixWorktree(ctx context.Context, store *db.Store, home string, checkout string, request workflow.FixWorktreeRequest) (workflow.FixWorktreeAllocation, error) {
-	return allocateFixWorktreeForRunner(ctx, store, home, checkout, request, subprocess.ExecRunner{})
-}
-
+// allocateFixWorktreeForRunner creates an independent writable clone for one
+// review fix job. A linked worktree cannot check out payload.Branch while the
+// lane owner's registered checkout already has that branch checked out; an
+// independent clone has its own refs and HEAD, so the fix can commit and push
+// without touching the owner's index, files, or current branch.
 func allocateFixWorktreeForRunner(ctx context.Context, store *db.Store, home string, checkout string, request workflow.FixWorktreeRequest, runner subprocess.Runner) (allocation workflow.FixWorktreeAllocation, retErr error) {
 	if store == nil {
 		return allocation, errors.New("fix worktree store is required")

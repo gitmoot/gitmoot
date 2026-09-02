@@ -16,12 +16,13 @@ import (
 	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/github/githubtest"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 type activeJobMergeGateGitHub struct {
-	github.NoopClient
+	githubtest.NoopClient
 	pr          github.PullRequest
 	mergeInputs []github.MergePullRequestInput
 	statuses    []github.CommitStatusInput
@@ -63,7 +64,7 @@ func TestDaemonMergeGateHoldsWhileImplementJobActiveOnBranch(t *testing.T) {
 		ID: "fix-round-running", Agent: "implementer", Type: "implement", State: string(workflow.JobRunning),
 	}, workflow.JobPayload{Repo: request.Repo, Branch: request.Branch, TaskID: request.TaskID})
 
-	decision, err := (newHostDaemonMergeGate(store, gh, checkout, daemonMergeGateLiveOrgHome(t))).Evaluate(context.Background(), request)
+	decision, err := (newDaemonMergeGate(store, gh, checkout, daemonMergeGateLiveOrgHome(t), subprocess.ExecRunner{})).Evaluate(context.Background(), request)
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
@@ -87,7 +88,7 @@ func TestDaemonMergeGateHoldsHumanMergeRequestWhileJobActiveOnBranch(t *testing.
 		ID: "fix-round-running", Agent: "implementer", Type: "implement", State: string(workflow.JobRunning),
 	}, workflow.JobPayload{Repo: request.Repo, Branch: request.Branch, TaskID: request.TaskID})
 
-	decision, err := (newHostDaemonMergeGate(store, gh, checkout, daemonMergeGateLiveOrgHome(t))).Evaluate(context.Background(), request)
+	decision, err := (newDaemonMergeGate(store, gh, checkout, daemonMergeGateLiveOrgHome(t), subprocess.ExecRunner{})).Evaluate(context.Background(), request)
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
@@ -107,7 +108,7 @@ func TestDaemonMergeGateDefaultPreservesMergePathWhenMandatoryGatePasses(t *test
 		t.Fatalf("Initialize config: %v", err)
 	}
 
-	decision, err := (newHostDaemonMergeGate(store, gh, checkout, paths.Home)).Evaluate(context.Background(), request)
+	decision, err := (newDaemonMergeGate(store, gh, checkout, paths.Home, subprocess.ExecRunner{})).Evaluate(context.Background(), request)
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
@@ -143,7 +144,7 @@ func TestDaemonMergeGateEscalatesOncePerAccountableRecipient(t *testing.T) {
 	}
 	evaluate := func() string {
 		t.Helper()
-		decision, err := newHostDaemonMergeGate(store, gh, checkout, paths.Home).Evaluate(context.Background(), request)
+		decision, err := newDaemonMergeGate(store, gh, checkout, paths.Home, subprocess.ExecRunner{}).Evaluate(context.Background(), request)
 		if err != nil {
 			t.Fatalf("Evaluate: %v", err)
 		}
@@ -286,7 +287,7 @@ scope = ["owner/repo"]
 	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	decision, err := newHostDaemonMergeGate(store, gh, checkout, paths.Home).Evaluate(context.Background(), request)
+	decision, err := newDaemonMergeGate(store, gh, checkout, paths.Home, subprocess.ExecRunner{}).Evaluate(context.Background(), request)
 	if err != nil {
 		t.Fatalf("Evaluate: %v", err)
 	}
@@ -508,7 +509,7 @@ func TestDaemonMergeGateKillSwitchDoesNotEscalate(t *testing.T) {
 	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+"\n[merge_gate]\nauto_merge = false\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	decision, err := (newHostDaemonMergeGate(store, gh, checkout, paths.Home)).Evaluate(context.Background(), request)
+	decision, err := (newDaemonMergeGate(store, gh, checkout, paths.Home, subprocess.ExecRunner{})).Evaluate(context.Background(), request)
 	if err != nil || !decision.LeaveOpen || decision.Reason.IsGateMiss() {
 		t.Fatalf("decision = %+v, err=%v", decision, err)
 	}
@@ -1020,7 +1021,7 @@ func terminalPollTaskEvents(t *testing.T, store *db.Store, taskID string) []db.T
 }
 
 type terminalPollMergeGateGitHub struct {
-	github.NoopClient
+	githubtest.NoopClient
 	pr       github.PullRequest
 	statuses []github.CommitStatusInput
 }

@@ -61,7 +61,7 @@ func (r GroupRunner) RunEnvWithPID(ctx context.Context, dir string, env []string
 // semantics PLUS a live line-tee of the child's stdout/stderr to out. It is what
 // TeeRunner{} defaults to, so teeing a runtime adapter's output into a per-job
 // log keeps the same whole-group cancellation the adapters rely on. A nil out
-// degrades to RunGroup.
+// degrades to Run.
 func (r GroupRunner) RunStream(ctx context.Context, dir string, out io.Writer, command string, args ...string) (Result, error) {
 	return r.RunEnvStream(ctx, dir, nil, out, command, args...)
 }
@@ -80,21 +80,6 @@ func (r GroupRunner) RunEnvStreamWithPID(ctx context.Context, dir string, env []
 
 func (GroupRunner) LookPath(file string) (string, error) {
 	return exec.LookPath(file)
-}
-
-// RunGroup is Run with process-group semantics: the child gets its own pgid
-// (Setpgid) so the daemon never signals itself, cancellation SIGTERMs the
-// group, Go's WaitDelay reaps a stuck main child after the grace period, and a
-// final best-effort SIGKILL sweeps any group members that ignored SIGTERM.
-func RunGroup(ctx context.Context, dir string, command string, args ...string) (Result, error) {
-	return RunGroupEnv(ctx, dir, nil, command, args...)
-}
-
-// RunGroupEnv is RunGroup with extra KEY=VALUE env vars appended to the inherited
-// environment. A nil extraEnv leaves cmd.Env unset (the child inherits os.Environ
-// exactly as RunGroup did), so the env path is byte-identical when unused.
-func RunGroupEnv(ctx context.Context, dir string, extraEnv []string, command string, args ...string) (Result, error) {
-	return runGroupEnv(ctx, dir, extraEnv, nil, nil, command, args...)
 }
 
 func runGroupEnv(ctx context.Context, dir string, extraEnv []string, credential *syscall.Credential, onPID PIDCallback, command string, args ...string) (Result, error) {
@@ -122,13 +107,9 @@ func runGroupEnv(ctx context.Context, dir string, extraEnv []string, credential 
 	}, err
 }
 
-// RunGroupEnvBounded is RunGroupEnv with bounded tail capture for stdout and
+// runGroupEnvBounded is runGroupEnv with bounded tail capture for stdout and
 // stderr. It preserves the same process-group cancellation, WaitDelay, and final
 // SIGKILL sweep while preventing a noisy child from growing memory without bound.
-func RunGroupEnvBounded(ctx context.Context, dir string, extraEnv []string, maxOutputBytes int, command string, args ...string) (Result, error) {
-	return runGroupEnvBounded(ctx, dir, extraEnv, maxOutputBytes, nil, nil, command, args...)
-}
-
 func runGroupEnvBounded(ctx context.Context, dir string, extraEnv []string, maxOutputBytes int, credential *syscall.Credential, onPID PIDCallback, command string, args ...string) (Result, error) {
 	cmd, sweep := newGroupCmd(ctx, dir, command, args, credential)
 	if len(extraEnv) > 0 {
@@ -166,24 +147,6 @@ func (b *tailBuffer) Write(p []byte) (int, error) {
 }
 
 func (b *tailBuffer) String() string { return string(b.data) }
-
-// RunGroupStream is RunGroup that additionally streams the child's stdout and
-// stderr to out, line by line, as they are produced — the buffered Result is
-// byte-identical to RunGroup's, so the tee is purely additive. A nil out
-// degrades to RunGroup. The whole-group cancellation/sweep is identical.
-func RunGroupStream(ctx context.Context, dir string, out io.Writer, command string, args ...string) (Result, error) {
-	return RunGroupEnvStream(ctx, dir, nil, out, command, args...)
-}
-
-// RunGroupEnvStream combines RunGroupEnv's environment injection with
-// RunGroupStream's live tee and the same whole-process-group cancellation.
-func RunGroupEnvStream(ctx context.Context, dir string, extraEnv []string, out io.Writer, command string, args ...string) (Result, error) {
-	return runGroupEnvStream(ctx, dir, extraEnv, out, nil, nil, command, args...)
-}
-
-func RunGroupEnvStreamWithPID(ctx context.Context, dir string, extraEnv []string, out io.Writer, onPID PIDCallback, command string, args ...string) (Result, error) {
-	return runGroupEnvStream(ctx, dir, extraEnv, out, nil, onPID, command, args...)
-}
 
 func runGroupEnvStream(ctx context.Context, dir string, extraEnv []string, out io.Writer, credential *syscall.Credential, onPID PIDCallback, command string, args ...string) (Result, error) {
 	if out == nil {

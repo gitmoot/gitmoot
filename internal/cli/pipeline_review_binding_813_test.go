@@ -16,6 +16,7 @@ import (
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -296,12 +297,12 @@ func TestPipelineSourceReviewWorktreePinnedToBoundHead(t *testing.T) {
 		t.Fatalf("review checkout HEAD = %s, want bound PR head %s (main=%s)", gotHead, head, mainHead)
 	}
 	worker := jobWorker{Store: store}
-	gotCheckout, err := worker.defaultCheckout(ctx, reviewJob, payload, runtime.Agent{Name: "reviewer"})
+	gotCheckout, err := worker.defaultCheckoutForRunner(ctx, reviewJob, payload, runtime.Agent{Name: "reviewer"}, subprocess.ExecRunner{})
 	if err != nil {
-		t.Fatalf("defaultCheckout rejected pinned review worktree: %v", err)
+		t.Fatalf("defaultCheckoutForRunner rejected pinned review worktree: %v", err)
 	}
 	if gotCheckout != payload.WorktreePath {
-		t.Fatalf("defaultCheckout = %q, want %q", gotCheckout, payload.WorktreePath)
+		t.Fatalf("defaultCheckoutForRunner = %q, want %q", gotCheckout, payload.WorktreePath)
 	}
 }
 

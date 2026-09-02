@@ -2,6 +2,22 @@ package daemon
 
 import "testing"
 
+// parseCommandsWithoutAuthorization sanitizes and parses addressed command lines
+// without checking repository permission, exactly as the production comment
+// handlers do before authorizing the author. It lives here because only tests
+// need the whole-body form: daemon.go drives prepareCommentCommandInput and
+// parseCommentCommands directly so it can authorize per line.
+func parseCommandsWithoutAuthorization(body string) []Command {
+	input := prepareCommentCommandInput(body)
+	var commands []Command
+	for _, parsed := range parseCommentCommands(input, ParseCommand) {
+		if parsed.err == nil {
+			commands = append(commands, parsed.command)
+		}
+	}
+	return commands
+}
+
 func TestParseCommandAgentFirstActions(t *testing.T) {
 	command, ok := ParseCommand("/gitmoot audit review check the branch")
 	if !ok {
@@ -71,7 +87,7 @@ func TestParseCommandMentionForm(t *testing.T) {
 }
 
 func TestParseCommandsOnlyReturnsGitmootLines(t *testing.T) {
-	commands := ParseCommandsWithoutAuthorization("hello\n/gitmoot status\n/gitmoot merge when ready\nthanks")
+	commands := parseCommandsWithoutAuthorization("hello\n/gitmoot status\n/gitmoot merge when ready\nthanks")
 	if len(commands) != 2 {
 		t.Fatalf("commands length = %d, want 2", len(commands))
 	}
@@ -92,7 +108,7 @@ func TestParseCommandsIgnoreIndentedCodeBlocks(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			commands := ParseCommandsWithoutAuthorization(test.body)
+			commands := parseCommandsWithoutAuthorization(test.body)
 			if test.wantAction == "" {
 				if len(commands) != 0 {
 					t.Fatalf("commands = %+v, want none", commands)

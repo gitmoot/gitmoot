@@ -65,7 +65,7 @@ func TestCaptureQuotaRoleUnavailableEscalatesOnceAndSuccessClears(t *testing.T) 
 	cause := workflow.DeliveryError{Err: errors.New("API error: You've hit your weekly limit - resets Jul 28, 1am (Europe/Berlin)")}
 	agent := runtime.Agent{Name: "claude-agent", Runtime: runtime.ClaudeRuntime}
 
-	if err := worker.captureQuotaRoleUnavailable(context.Background(), job, payload, agent, cause, now); err != nil {
+	if err := worker.quotaRoleUnavailableHooks().captureFailure(context.Background(), job, payload, agent, cause, now); err != nil {
 		t.Fatal(err)
 	}
 	if wake.promptCalls != 1 || wake.pane != "w1:p1" {
@@ -79,14 +79,14 @@ func TestCaptureQuotaRoleUnavailableEscalatesOnceAndSuccessClears(t *testing.T) 
 		t.Fatalf("incident = %+v found=%v err=%v", incident, found, err)
 	}
 
-	if err := worker.captureQuotaRoleUnavailable(context.Background(), job, payload, agent, cause, now.Add(time.Minute)); err != nil {
+	if err := worker.quotaRoleUnavailableHooks().captureFailure(context.Background(), job, payload, agent, cause, now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if wake.promptCalls != 1 {
 		t.Fatalf("repeat quota failure woke %d times, want exactly once", wake.promptCalls)
 	}
 
-	if err := worker.clearQuotaRoleUnavailableOnSuccess(context.Background(), "review", runtime.ClaudeRuntime); err != nil {
+	if err := worker.quotaRoleUnavailableHooks().clearOnSuccess(context.Background(), "review", runtime.ClaudeRuntime); err != nil {
 		t.Fatal(err)
 	}
 	if _, found, err := store.GetActiveOrgRoleUnavailable(context.Background(), "review", now); err != nil || found {
@@ -148,7 +148,7 @@ func TestCaptureQuotaRoleUnavailableClaudeOnly(t *testing.T) {
 	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
 	cause := workflow.DeliveryError{Err: errors.New("You've hit your weekly limit - resets Jul 28, 1am (Europe/Berlin)")}
 	payload := workflow.JobPayload{ActingOrgRole: "review"}
-	if err := worker.captureQuotaRoleUnavailable(context.Background(), db.Job{ID: "codex-job"}, payload, runtime.Agent{Runtime: runtime.CodexRuntime}, cause, now); err != nil {
+	if err := worker.quotaRoleUnavailableHooks().captureFailure(context.Background(), db.Job{ID: "codex-job"}, payload, runtime.Agent{Runtime: runtime.CodexRuntime}, cause, now); err != nil {
 		t.Fatal(err)
 	}
 	if rows, err := store.ListActiveOrgRolesUnavailable(context.Background(), now); err != nil || len(rows) != 0 {

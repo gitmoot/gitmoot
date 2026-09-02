@@ -64,14 +64,9 @@ type wakeOutboxStore interface {
 	ListDeletedEventRulesForRoutes(ctx context.Context, routes []db.EventRuleRoute) ([]db.DeletedEventRule, error)
 }
 
-// drainReplyWakeOutbox is a store-global daemon operation. It deliberately
-// reads durable work before resolving delivery: unreadable outbox state and an
-// empty outbox therefore cannot collapse into the same result.
-func drainReplyWakeOutbox(ctx context.Context, store wakeOutboxStore, now time.Time, resolve replyWakeDeliveryResolver) error {
-	_, err := drainReplyWakeOutboxWithHealth(ctx, store, now, resolve)
-	return err
-}
-
+// drainReplyWakeOutboxWithHealth is a store-global daemon operation. It
+// deliberately reads durable work before resolving delivery: unreadable outbox
+// state and an empty outbox therefore cannot collapse into the same result.
 func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, now time.Time, resolve replyWakeDeliveryResolver) (replyWakeOutboxHealth, error) {
 	if store == nil {
 		return replyWakeOutboxHealth{}, errors.New("wake outbox store is required")
@@ -84,7 +79,7 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 	// Tracks whether this drain changed any outbox row. Only a successful claim
 	// does: ExpireAgedWakeOutbox returns above whenever it expired anything, and
 	// every other branch is a read. When nothing was claimed the projection read
-	// at line 68 still describes the store exactly, so the closing health pass
+	// above still describes the store exactly, so the closing health pass
 	// can reuse it instead of issuing the same query a second time (#1758).
 	mutated := false
 
@@ -191,7 +186,7 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 		return wakeOutboxObligationHealth(ctx, store, attemptedBefore, resolve)
 	}
 	// The #1200/#1201 contract is untouched by the reuse: an unreadable outbox
-	// already returned its error at line 68, so only a SUCCESSFUL read can reach
+	// already returned its error above, so only a SUCCESSFUL read can reach
 	// here, and an empty one returned early. Reuse therefore never turns "could
 	// not read" into "nothing to do".
 	return classifyWakeOutboxObligations(ctx, store, obligations, attemptedBefore, resolve)

@@ -14,7 +14,7 @@ import (
 // Issue #532 slice C: classify the daemon-owned pre-flight CHECKOUT strings —
 // which today TERMINALLY fail a job through finishQueuedJob — and defer the job
 // for automatic re-dispatch instead. Two sub-classes of the checkout_contention
-// class, both keyed off strings the daemon itself emits (validateTargetCheckout /
+// class, both keyed off strings the daemon itself emits (validateTargetCheckoutForRunner /
 // validateReviewCheckout / validateImplementationLock):
 //
 //   - branch-LOCK contention ("branch %s is locked by %s"): another worker holds

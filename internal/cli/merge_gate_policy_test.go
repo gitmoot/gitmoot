@@ -12,6 +12,19 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
+// applyMergeGatePolicyForTest composes the two live production steps exactly as
+// daemonMergeGate.Evaluate does (daemon_workflow.go): resolve the [merge_gate]
+// policy for `home`/`repo`, and apply it only when resolution succeeded. An
+// empty home, a missing config, or a parse error therefore leaves the gate
+// untouched, which is the fail-safe property the tests below pin.
+func applyMergeGatePolicyForTest(gate *workflow.PolicyMergeGate, home string, repo string) {
+	policy, ok := resolvedMergeGatePolicy(home, repo)
+	if !ok {
+		return
+	}
+	applyResolvedMergeGatePolicy(gate, policy)
+}
+
 func TestApplyMergeGatePolicyEnabledByDefault(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
@@ -20,7 +33,7 @@ func TestApplyMergeGatePolicyEnabledByDefault(t *testing.T) {
 	}
 
 	gate := workflow.PolicyMergeGate{}
-	applyMergeGatePolicy(&gate, paths.Home, "jerryfane/noted")
+	applyMergeGatePolicyForTest(&gate, paths.Home, "jerryfane/noted")
 	if gate.RequireExternalCI {
 		t.Fatalf("RequireExternalCI = true, want off by default")
 	}
@@ -87,7 +100,7 @@ require_external_ci = true
 	}
 
 	noted := workflow.PolicyMergeGate{}
-	applyMergeGatePolicy(&noted, paths.Home, "jerryfane/noted")
+	applyMergeGatePolicyForTest(&noted, paths.Home, "jerryfane/noted")
 	if !noted.RequireExternalCI {
 		t.Fatalf("noted RequireExternalCI = false, want true from per-repo override")
 	}
@@ -102,7 +115,7 @@ require_external_ci = true
 	}
 
 	other := workflow.PolicyMergeGate{}
-	applyMergeGatePolicy(&other, paths.Home, "gitmoot/gitmoot")
+	applyMergeGatePolicyForTest(&other, paths.Home, "gitmoot/gitmoot")
 	if other.RequireExternalCI {
 		t.Fatalf("non-override repo RequireExternalCI = true, want false")
 	}
@@ -124,7 +137,7 @@ func TestApplyMergeGatePolicyEmptyHomeIsNoop(t *testing.T) {
 	}
 
 	gate := workflow.PolicyMergeGate{}
-	applyMergeGatePolicy(&gate, "", "jerryfane/noted")
+	applyMergeGatePolicyForTest(&gate, "", "jerryfane/noted")
 	if gate.AutoMerge || gate.RequireExternalCI || gate.MinCIWait != 0 || gate.MaxCIWait != 0 {
 		t.Fatalf("empty home must leave the gate untouched, got %+v", gate)
 	}

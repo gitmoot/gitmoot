@@ -752,7 +752,7 @@ func TestPersistTaskStateRefusesADisposalWrittenAfterTheRead(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				written, err := PersistTaskState(ctx, store, snapshot, target)
+				written, err := persistTaskStateOwned(ctx, store, snapshot, target, nil)
 				if written {
 					t.Fatalf("wrote %s over a %s task", target, disposed)
 				}
@@ -796,18 +796,18 @@ func TestPersistTaskStateStillWritesEveryNonDisposedState(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			written, err := PersistTaskState(ctx, store, task, target)
+			written, err := persistTaskStateOwned(ctx, store, task, target, nil)
 			if err != nil || !written {
-				t.Fatalf("PersistTaskState(%s) written=%v err=%v", target, written, err)
+				t.Fatalf("persistTaskStateOwned(%s) written=%v err=%v", target, written, err)
 			}
 			if got := mustTaskState(t, store, "task-1"); got != string(target) {
 				t.Fatalf("task state = %q, want %s", got, target)
 			}
 			// Idempotent: writing the same state again is permitted, including for a
 			// disposed target, so a repeated disposal is not an error.
-			written, err = PersistTaskState(ctx, store, task, target)
+			written, err = persistTaskStateOwned(ctx, store, task, target, nil)
 			if err != nil || !written {
-				t.Fatalf("repeated PersistTaskState(%s) written=%v err=%v", target, written, err)
+				t.Fatalf("repeated persistTaskStateOwned(%s) written=%v err=%v", target, written, err)
 			}
 		})
 	}

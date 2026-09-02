@@ -14,6 +14,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
 
 type implementBaseFixture struct {
@@ -446,9 +447,9 @@ func TestResolveLocalAgentRepoSelfHealsDanglingCheckoutForImplementBase(t *testi
 		t.Fatalf("resolved record = %+v, want repaired primary %s", record, primary)
 	}
 	wantSHA := strings.TrimSpace(runGitOutput(t, primary, "rev-parse", "HEAD"))
-	gotSHA, err := resolveLocalImplementBase(ctx, config.PathsForHome(home), record, "HEAD")
+	gotSHA, err := resolveLocalImplementBaseForRunner(ctx, config.PathsForHome(home), record, "HEAD", subprocess.ExecRunner{})
 	if err != nil || gotSHA != wantSHA {
-		t.Fatalf("resolveLocalImplementBase = %q, err=%v, want %q", gotSHA, err, wantSHA)
+		t.Fatalf("resolveLocalImplementBaseForRunner = %q, err=%v, want %q", gotSHA, err, wantSHA)
 	}
 	stored, err := store.GetRepo(ctx, "owner/repo")
 	if err != nil || stored.CheckoutPath != primary || stored.PrimaryCheckoutPath != primary {

@@ -12,10 +12,10 @@ import (
 	"time"
 )
 
-// TestRunGroupKillsGrandchildrenOnCancel proves that cancelling the context
+// TestGroupRunnerKillsGrandchildrenOnCancel proves that cancelling the context
 // terminates not just the shell but the background grandchild it spawned —
 // the failure mode plain exec.CommandContext leaves behind.
-func TestRunGroupKillsGrandchildrenOnCancel(t *testing.T) {
+func TestGroupRunnerKillsGrandchildrenOnCancel(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "grandchild.pid")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -23,7 +23,7 @@ func TestRunGroupKillsGrandchildrenOnCancel(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		// The shell spawns a long-lived grandchild, records its pid, then waits.
-		_, err := RunGroup(ctx, "", "sh", "-c", "sleep 300 & echo $! > "+pidFile+"; wait")
+		_, err := GroupRunner{}.Run(ctx, "", "sh", "-c", "sleep 300 & echo $! > "+pidFile+"; wait")
 		done <- err
 	}()
 
@@ -48,7 +48,7 @@ func TestRunGroupKillsGrandchildrenOnCancel(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(15 * time.Second):
-		t.Fatal("RunGroup did not return after cancellation")
+		t.Fatal("GroupRunner.Run did not return after cancellation")
 	}
 
 	// The grandchild must be gone (signal 0 probes existence). Allow a short
@@ -63,25 +63,26 @@ func TestRunGroupKillsGrandchildrenOnCancel(t *testing.T) {
 	t.Fatalf("grandchild %d survived group cancellation", grandchild)
 }
 
-// TestRunGroupNormalCompletionUnaffected: group semantics must not change
+// TestGroupRunnerNormalCompletionUnaffected: group semantics must not change
 // successful runs.
-func TestRunGroupNormalCompletionUnaffected(t *testing.T) {
-	result, err := RunGroup(context.Background(), "", "sh", "-c", "echo hello")
+func TestGroupRunnerNormalCompletionUnaffected(t *testing.T) {
+	result, err := GroupRunner{}.Run(context.Background(), "", "sh", "-c", "echo hello")
 	if err != nil {
-		t.Fatalf("RunGroup: %v", err)
+		t.Fatalf("GroupRunner.Run: %v", err)
 	}
 	if strings.TrimSpace(result.Stdout) != "hello" {
 		t.Fatalf("stdout = %q", result.Stdout)
 	}
 }
 
-// TestRunGroupStreamTeesAndBuffers: the streaming group runner tees live to out
-// while returning the same buffered Result as RunGroup — the tee is additive.
-func TestRunGroupStreamTeesAndBuffers(t *testing.T) {
+// TestGroupRunnerRunStreamTeesAndBuffers: the streaming group runner tees live
+// to out while returning the same buffered Result as GroupRunner.Run — the tee
+// is additive.
+func TestGroupRunnerRunStreamTeesAndBuffers(t *testing.T) {
 	var tee bytes.Buffer
-	result, err := RunGroupStream(context.Background(), "", &tee, "sh", "-c", "echo out; echo err >&2")
+	result, err := GroupRunner{}.RunStream(context.Background(), "", &tee, "sh", "-c", "echo out; echo err >&2")
 	if err != nil {
-		t.Fatalf("RunGroupStream: %v", err)
+		t.Fatalf("GroupRunner.RunStream: %v", err)
 	}
 	if result.Stdout != "out\n" || result.Stderr != "err\n" {
 		t.Fatalf("buffered result = %+v", result)
@@ -91,11 +92,12 @@ func TestRunGroupStreamTeesAndBuffers(t *testing.T) {
 	}
 }
 
-// TestRunGroupStreamKillsGrandchildrenOnCancel: streaming must NOT weaken the
-// whole-group kill — cancelling still terminates the background grandchild, the
-// failure mode plain exec.CommandContext (and the non-group RunStream) leaves
-// behind. This is the load-bearing guarantee for teeing runtime adapter output.
-func TestRunGroupStreamKillsGrandchildrenOnCancel(t *testing.T) {
+// TestGroupRunnerRunStreamKillsGrandchildrenOnCancel: streaming must NOT weaken
+// the whole-group kill — cancelling still terminates the background grandchild,
+// the failure mode plain exec.CommandContext (and the non-group RunStream)
+// leaves behind. This is the load-bearing guarantee for teeing runtime adapter
+// output.
+func TestGroupRunnerRunStreamKillsGrandchildrenOnCancel(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "grandchild.pid")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -103,7 +105,7 @@ func TestRunGroupStreamKillsGrandchildrenOnCancel(t *testing.T) {
 	var tee bytes.Buffer
 	done := make(chan error, 1)
 	go func() {
-		_, err := RunGroupStream(ctx, "", &tee, "sh", "-c", "sleep 300 & echo $! > "+pidFile+"; wait")
+		_, err := GroupRunner{}.RunStream(ctx, "", &tee, "sh", "-c", "sleep 300 & echo $! > "+pidFile+"; wait")
 		done <- err
 	}()
 
@@ -127,7 +129,7 @@ func TestRunGroupStreamKillsGrandchildrenOnCancel(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(15 * time.Second):
-		t.Fatal("RunGroupStream did not return after cancellation")
+		t.Fatal("GroupRunner.RunStream did not return after cancellation")
 	}
 
 	deadline = time.Now().Add(5 * time.Second)

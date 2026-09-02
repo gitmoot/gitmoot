@@ -284,11 +284,11 @@ func TestWriteTaskStateRefusesMergedWrittenAfterTheRead(t *testing.T) {
 
 			// 3. The guarded write runs, still holding the stale snapshot. `blocked` now
 			//    reaches the store through BlockTaskWithEvent, but `planned` and
-			//    `awaiting_human` still come through PersistTaskState, which is the write
-			//    point this window is about.
+			//    `awaiting_human` still come through persistTaskStateOwned, which is the
+			//    write point this window is about.
 			stale.State = string(refused)
-			if _, err := PersistTaskState(ctx, store, stale, refused); err != nil {
-				t.Fatalf("PersistTaskState(%s) returned error: %v", refused, err)
+			if _, err := persistTaskStateOwned(ctx, store, stale, refused, nil); err != nil {
+				t.Fatalf("persistTaskStateOwned(%s) returned error: %v", refused, err)
 			}
 
 			task, err := store.GetTask(ctx, "canonical")

@@ -1,4 +1,4 @@
-package skill
+package skills
 
 import (
 	"os"
@@ -55,7 +55,7 @@ func TestCanonicalSkillReferencesExist(t *testing.T) {
 		if !strings.Contains(text, ref) {
 			t.Fatalf("canonical SKILL.md missing reference %q", ref)
 		}
-		path := filepath.Join(append([]string{"..", "..", "skills", "gitmoot"}, strings.Split(ref, "/")...)...)
+		path := filepath.Join(append([]string{"..", "skills", "gitmoot"}, strings.Split(ref, "/")...)...)
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("referenced file %s missing: %v", ref, err)
 		}
@@ -274,7 +274,7 @@ func TestRootSkillCompatibilityEntrypoint(t *testing.T) {
 
 func readRepoFile(t *testing.T, parts ...string) string {
 	t.Helper()
-	path := filepath.Join(append([]string{"..", ".."}, parts...)...)
+	path := filepath.Join(append([]string{".."}, parts...)...)
 	contents, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", filepath.Join(parts...), err)

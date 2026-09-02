@@ -13,6 +13,16 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
+// quotaResetDelayForTest measures the hold parseQuotaResetAt schedules, relative
+// to the same `now` production hands it (classifyOperationalBlocker). The two
+// tests below assert delays rather than instants, so they need the difference,
+// not a second parser.
+func quotaResetDelayForTest(text string) time.Duration {
+	now := time.Now().UTC()
+	resetAt, _ := parseQuotaResetAt(text, now)
+	return resetAt.Sub(now)
+}
+
 func TestClassifyOperationalBlocker(t *testing.T) {
 	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
 	tests := []struct {
@@ -273,8 +283,8 @@ func TestParseQuotaResetDelay(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := parseQuotaResetDelay(tc.text); got != tc.want {
-				t.Fatalf("parseQuotaResetDelay(%q) = %s, want %s", tc.text, got, tc.want)
+			if got := quotaResetDelayForTest(tc.text); got != tc.want {
+				t.Fatalf("quotaResetDelayForTest(%q) = %s, want %s", tc.text, got, tc.want)
 			}
 		})
 	}
@@ -285,12 +295,12 @@ func TestParseQuotaResetDelayClaudeEpoch(t *testing.T) {
 	// "Claude AI usage limit reached|<epoch>". Use a future epoch and accept the
 	// small elapsed-time skew of time.Until.
 	epoch := time.Now().Add(90 * time.Second).Unix()
-	got := parseQuotaResetDelay(fmt.Sprintf("Claude AI usage limit reached|%d", epoch))
+	got := quotaResetDelayForTest(fmt.Sprintf("Claude AI usage limit reached|%d", epoch))
 	if got < 80*time.Second || got > 90*time.Second {
-		t.Fatalf("parseQuotaResetDelay epoch = %s, want ~90s", got)
+		t.Fatalf("quotaResetDelayForTest epoch = %s, want ~90s", got)
 	}
 	// A past epoch must never yield a non-positive hold.
-	if got := parseQuotaResetDelay("Claude AI usage limit reached|1000000000"); got != quotaBlockerFallbackDelay {
+	if got := quotaResetDelayForTest("Claude AI usage limit reached|1000000000"); got != quotaBlockerFallbackDelay {
 		t.Fatalf("past epoch = %s, want fallback %s", got, quotaBlockerFallbackDelay)
 	}
 }

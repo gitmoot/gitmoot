@@ -468,13 +468,6 @@ func (w jobWorker) reportDeliveryDiagnosticsLoss(jobID string, cause error, faul
 		workflow.RedactCommentText(fmt.Sprintf("%v (delivery error: %v)", fault, cause)))
 }
 
-// matches reports whether the row read back is still the run this lifecycle identified.
-// Both components must agree: an equal state at a LATER generation is the ABA case, and an
-// equal generation is what makes the state comparison meaningful at all.
-func (l jobLifecycle) matches(job db.Job) bool {
-	return job.State == l.state && job.LifecycleGeneration == l.generation
-}
-
 func (w jobWorker) recordBlockedAdvancement(ctx context.Context, jobID string, observed jobLifecycle, cause error, blocked workflow.BlockedError) error {
 	if blocked.ResultDeliveryFailed {
 		return w.settleBlockedAdvancement(ctx, jobID, observed, cause)

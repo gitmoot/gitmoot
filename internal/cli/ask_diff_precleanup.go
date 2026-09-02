@@ -42,14 +42,10 @@ func composeBeforeReadOnlyWorktreeCleanupHooks(hooks ...beforeReadOnlyWorktreeCl
 	}
 }
 
-// askReviewDiffPrecleanupHook captures edits from a terminal isolated ask/review
-// while its detached worktree still exists. The snapshot rides the existing
-// payload JSON so it remains available after synchronous worktree disposal
-// without creating a second file-retention lifecycle.
-func askReviewDiffPrecleanupHook(store *db.Store) beforeReadOnlyWorktreeCleanupHook {
-	return askReviewDiffPrecleanupHookForRunner(store, subprocess.ExecRunner{})
-}
-
+// askReviewDiffPrecleanupHookForRunner captures edits from a terminal isolated
+// ask/review while its detached worktree still exists. The snapshot rides the
+// existing payload JSON so it remains available after synchronous worktree
+// disposal without creating a second file-retention lifecycle.
 func askReviewDiffPrecleanupHookForRunner(store *db.Store, runner subprocess.Runner) beforeReadOnlyWorktreeCleanupHook {
 	return func(ctx context.Context, jobID, jobType string, payload workflow.JobPayload) error {
 		if store == nil ||
@@ -86,10 +82,6 @@ func askReviewDiffPrecleanupHookForRunner(store *db.Store, runner subprocess.Run
 		}
 		return errors.Join(captureErr, persistErr)
 	}
-}
-
-func captureReadOnlyWorktreeDiff(ctx context.Context, worktree string) (string, bool, error) {
-	return captureReadOnlyWorktreeDiffForRunner(ctx, worktree, subprocess.ExecRunner{})
 }
 
 func captureReadOnlyWorktreeDiffForRunner(ctx context.Context, worktree string, runner subprocess.Runner) (string, bool, error) {

@@ -33,20 +33,6 @@ type commentCommandInput struct {
 	addressed bool
 }
 
-// ParseCommandsWithoutAuthorization sanitizes and parses addressed command
-// lines without checking repository permission. Production comment handlers
-// must authorize the author before calling the underlying parser.
-func ParseCommandsWithoutAuthorization(body string) []Command {
-	input := prepareCommentCommandInput(body)
-	var commands []Command
-	for _, parsed := range parseCommentCommands(input, ParseCommand) {
-		if parsed.err == nil {
-			commands = append(commands, parsed.command)
-		}
-	}
-	return commands
-}
-
 // prepareCommentCommandInput removes Markdown code before any command parser is
 // called. It also records whether an outside-code line was actually addressed
 // to Gitmoot, preserving the original first-token position so removing a leading

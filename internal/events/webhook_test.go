@@ -210,21 +210,6 @@ func TestWebhookSinkFlushIsIdempotentAndDropsLateEmit(t *testing.T) {
 	}
 }
 
-// TestFlushSinkNilAndNonFlusherAreNoOps proves the FlushSink helper is safe to
-// defer unconditionally: a nil sink and a synchronous (non-Flusher) sink are both
-// no-ops, so the CLI can `defer events.FlushSink(ctx, sink)` over a sink that may
-// be nil when [events] is OFF.
-func TestFlushSinkNilAndNonFlusherAreNoOps(t *testing.T) {
-	FlushSink(context.Background(), nil)             // must not panic
-	FlushSink(context.Background(), &syncTestSink{}) // non-Flusher: no-op, must not panic
-}
-
-// syncTestSink is a minimal synchronous Sink that does NOT implement Flusher, to
-// prove FlushSink degrades to a no-op for such sinks.
-type syncTestSink struct{}
-
-func (s *syncTestSink) Emit(context.Context, Event) {}
-
 func TestWebhookSinkConcurrentEmitIsRaceClean(t *testing.T) {
 	var count int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

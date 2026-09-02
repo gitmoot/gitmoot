@@ -324,7 +324,7 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 // sessionWorkflowEngine builds the workflow engine used by the session-job
 // commands. It needs no checkout or GitHub work (a session job never dispatches a
 // runtime), so it passes an empty checkout; the only engine seam it exercises is
-// the wired EventSink, which lets CloseExternalJob emit the outbound
+// the wired EventSink, which lets CloseExternalJobWithUsage emit the outbound
 // job.finished/failed/blocked event exactly as an engine-run job does.
 func sessionWorkflowEngine(store *db.Store, home string) workflow.Engine {
 	return daemonWorkflowEngine(store, github.NewClient(""), "", home)
