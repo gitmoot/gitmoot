@@ -3479,41 +3479,31 @@ func (w jobWorker) recordAdvanceRetryOnce(ctx context.Context, jobID, message st
 }
 
 // closedPullRequestSupersededChild reports whether this job is EXACTLY the shape the
-// closed-PR sweep produces: a delegation child that was terminalized because its pull
-// request is no longer open, carrying the synthetic failed result the parent's
-// advanceDelegations consumes (#1673).
+// closed-PR sweep produces: a delegation child terminalized because its pull request is
+// no longer open, carrying the synthetic result the parent's advanceDelegations consumes
+// (#1673).
 //
-// IT IS DELIBERATELY NARROW, and an earlier version was not. "Any settled child with any
-// result" also matches a SUCCEEDED review child and an IMPLEMENTED child, and
-// Engine.AdvanceJob does far more than parent advancement for those: it dispatches their
-// own delegations and continues into the review merge gate. Letting them through with no
-// checkout would convert a safety-preflight failure into database and remote actions
-// under an unvalidated checkout - strictly worse than the strand it was meant to fix.
+// IT READS THE RESULT, NOT THE EVENT LOG. An event scan cannot be made safe here:
+// job_events has no lifecycle_generation column, and RetryJob starts a new run while
+// PRESERVING prior events, so a historical supersession would keep authorizing the
+// bypass for a job that has since been retried and failed normally - and that run still
+// owes the full advance, deferred teardown and implement bookkeeping included. Carrying
+// the fact in the result means RetryJob clears it along with Result, so the stale case
+// cannot arise rather than being detected.
 //
-// The discriminator is the supersession EVENT this sweep writes, not a state/result
-// shape that other paths can reproduce.
-func closedPullRequestSupersededChild(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload) bool {
+// Rejected alternatives: stamping the generation on the supersession event at write time
+// (follows the exec-backend-attempts precedent, but adds a write-side schema change and
+// still leaves a scan whose correctness depends on the filter being right everywhere it
+// is read); and comparing against a recorded generation boundary (same objection, plus a
+// second durable fact to keep in agreement - the defect class this campaign kept hitting).
+func closedPullRequestSupersededChild(job db.Job, payload workflow.JobPayload) bool {
 	if strings.TrimSpace(payload.ParentJobID) == "" || payload.Result == nil {
 		return false
 	}
 	if job.State != string(workflow.JobFailed) {
 		return false
 	}
-	if !strings.EqualFold(strings.TrimSpace(payload.Result.Decision), "failed") {
-		return false
-	}
-	events, err := store.ListJobEvents(ctx, job.ID)
-	if err != nil {
-		// Cannot prove the shape: keep the preflight. Failing closed here costs a poll,
-		// while guessing costs an unvalidated write.
-		return false
-	}
-	for _, event := range events {
-		if event.Kind == workflow.JobEventSupersededPullRequestClosed {
-			return true
-		}
-	}
-	return false
+	return payload.Result.SupersededPullRequestClosed
 }
 
 func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
@@ -3555,7 +3545,7 @@ func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 		// than to the full advance with a narrower predicate in front of it. A predicate
 		// is a list the next edit widens; an operation that cannot execute the child's own
 		// advancement cannot be widened by accident.
-		if closedPullRequestSupersededChild(ctx, w.Store, job, payload) {
+		if closedPullRequestSupersededChild(job, payload) {
 			parentOnly := w.workflowForJob("", jobRunner)
 			if advErr := parentOnly.AdvanceParentDAGForTerminalChild(ctx, job.ID); advErr != nil {
 				var blocked workflow.BlockedError

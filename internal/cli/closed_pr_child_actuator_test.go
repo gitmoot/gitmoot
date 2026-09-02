@@ -260,6 +260,10 @@ func TestClosedPullRequestChildWithoutResultDoesNotLoopForever(t *testing.T) {
 // seedTerminalChild writes a settled delegation child with the given state, decision and
 // event kind, so a test can state exactly which shape it is presenting to the actuator.
 func seedTerminalChild(t *testing.T, store *db.Store, id string, state workflow.JobState, decision string, eventKind string) {
+	seedTerminalChildWithSupersession(t, store, id, state, decision, eventKind, eventKind == "superseded_pr_closed")
+}
+
+func seedTerminalChildWithSupersession(t *testing.T, store *db.Store, id string, state workflow.JobState, decision string, eventKind string, superseded bool) {
 	t.Helper()
 	payload, err := json.Marshal(workflow.JobPayload{
 		Repo:        "gitmoot/gitmoot",
@@ -269,7 +273,10 @@ func seedTerminalChild(t *testing.T, store *db.Store, id string, state workflow.
 		ParentJobID: "parent-job",
 		HeadSHA:     "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
 		Sender:      "coord",
-		Result:      &workflow.AgentResult{Decision: decision, Summary: "terminal"},
+		Result: &workflow.AgentResult{
+			Decision: decision, Summary: "terminal",
+			SupersededPullRequestClosed: superseded,
+		},
 	})
 	if err != nil {
 		t.Fatalf("marshal child payload: %v", err)
@@ -310,6 +317,19 @@ func TestCheckoutBypassIsLimitedToTheClosedPullRequestShape(t *testing.T) {
 	// isolates the event discriminator - without it, this shape is indistinguishable from
 	// the sweep's own output and would advance under an unvalidated checkout.
 	seedTerminalChild(t, store, "child-plain-failure", workflow.JobFailed, "failed", "failed")
+	// A RETRIED CHILD: it WAS superseded once, then an operator retried it and the new
+	// lifecycle failed normally. The historical supersession must not authorize the
+	// bypass, because this run still owes the full advance - deferred teardown and
+	// implement bookkeeping included.
+	// The supersession EVENT is still in its history, but RetryJob cleared the result -
+	// so the new lifecycle's result carries no supersession fact. That is exactly the
+	// aliasing an event scan could not see.
+	seedTerminalChildWithSupersession(t, store, "child-retried", workflow.JobFailed, "failed", "superseded_pr_closed", false)
+	if err := store.AddJobEvent(ctx, db.JobEvent{
+		JobID: "child-retried", Kind: string(workflow.JobQueued), Message: "job queued",
+	}); err != nil {
+		t.Fatalf("re-queue child-retried: %v", err)
+	}
 
 	for _, agent := range []db.Agent{{
 		Name: "api", Role: "reviewer", Runtime: "codex", RuntimeRef: "last",
@@ -335,6 +355,7 @@ func TestCheckoutBypassIsLimitedToTheClosedPullRequestShape(t *testing.T) {
 		{"child-succeeded", false, "a succeeded review child must keep the preflight: AdvanceJob would reach the merge gate"},
 		{"child-implemented", false, "an implemented child must keep the preflight: AdvanceJob continues implementation advancement"},
 		{"child-plain-failure", false, "an ordinary failed child must keep the preflight: only the closed-PR sweep's own output is exempt"},
+		{"child-retried", false, "a historical supersession must not authorize the bypass after a retry started a new lifecycle"},
 	} {
 		events, err := store.ListJobEvents(ctx, tc.id)
 		if err != nil {

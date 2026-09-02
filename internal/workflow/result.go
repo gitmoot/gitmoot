@@ -137,6 +137,17 @@ var LearningScopes = []string{"repo", "general"}
 
 type AgentResult struct {
 	Decision string `json:"decision"`
+	// SupersededPullRequestClosed marks a SYNTHETIC result minted by the closed-PR
+	// sweep for a delegation child whose pull request is no longer open (#1673).
+	//
+	// It rides in the RESULT rather than in the event log on purpose. The retry actuator
+	// needs to know that this child can never satisfy a delivery-checkout preflight, and
+	// the event log cannot answer that question safely: job_events carries no lifecycle
+	// generation, and RetryJob preserves prior events while starting a new run, so a
+	// historical supersession would keep authorizing a bypass for a job that has since
+	// been retried and failed normally. RetryJob clears Result, so this fact is cleared
+	// with it - the staleness is IMPOSSIBLE rather than filtered.
+	SupersededPullRequestClosed bool `json:"superseded_pull_request_closed,omitempty"`
 	// Severity is the highest-severity review finding. It is optional for
 	// non-review results and approved reviews, but required for a review that
 	// requests changes.

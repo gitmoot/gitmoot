@@ -569,7 +569,13 @@ func (e Engine) FinalizeClosedPullRequestDelegationChild(ctx context.Context, jo
 	// removing it: a failed child with a marker and no result is a permanent retry loop,
 	// because the actuator rejects the nil result and no sweep selects a failed row.
 	// If two durable facts must agree, one statement writes them.
-	payload.Result = &AgentResult{Decision: "failed", Summary: reason}
+	payload.Result = &AgentResult{
+		Decision: "failed",
+		Summary:  reason,
+		// The retry actuator reads this to know a delivery checkout can never validate
+		// for this child; it is cleared automatically by any RetryJob (#1673).
+		SupersededPullRequestClosed: true,
+	}
 	encoded, err := marshalPayload(payload)
 	if err != nil {
 		return false, err
