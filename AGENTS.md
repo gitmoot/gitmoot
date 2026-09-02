@@ -260,13 +260,17 @@ detection.
 
 ## Deploy recipe (this host)
 
-1. On `main` after merge, build with the pinned toolchain (above). Stamp the
-   version the way `release.yml` does, or `gitmoot version` reports
-   `commit: unknown`:
+1. On `main` after merge, build with the pinned toolchain (above), from a clean
+   detached worktree at the exact tip rather than the shared `/root/gitmoot`
+   checkout, which usually carries uncommitted work. Stamp the version the way
+   `release.yml` does, or `gitmoot version` reports `commit: unknown`.
+   `-buildvcs=false` is required for the same reason as the test gate above: in
+   a linked worktree `.git` is a file, so Go's VCS stamp fails with
+   `error obtaining VCS status: exit status 128`.
 
    ```sh
    PKG=github.com/gitmoot/gitmoot/internal/buildinfo
-   CGO_ENABLED=0 go build -trimpath -ldflags \
+   CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags \
      "-s -w -X $PKG.Version=dev-$(git rev-parse --short HEAD) \
       -X $PKG.Commit=$(git rev-parse HEAD) -X $PKG.Date=$(date -Iseconds)" \
      -o /root/.local/bin/gitmoot.new ./cmd/gitmoot
