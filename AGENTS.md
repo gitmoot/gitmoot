@@ -320,9 +320,9 @@ changed (e.g. `curl -s http://172.17.0.1:8790/api/workflows`).
 Issue-first → isolated worktrees off `main` → implement → adversarial-review →
 fix → verify on the integrated tree → reviewed PR → deploy affected-only →
 live-probe before close. **Merge authority is whatever the org config records
-for your role**: `merge_rule = "self"` means the coordinator merges its own
-lane's PRs once one independent review is clean at the exact head and the PR is
-mergeable with CI green; `merge_rule = "owner"` means the owner merges. The
+for your role**: `merge_rule = "self"` lets the coordinator merge its own
+lane's PRs only under the standing delegation and safeguards below;
+`merge_rule = "owner"` leaves the merge with the owner. The
 field is **advisory** — `merge_gate.go` never reads it (`internal/config/org.go`
 calls it "deliberately advisory in phase 1a"), so nothing mechanically stops a
 merge you are not entitled to make; the gate enforces exact-head review, CI and
@@ -343,6 +343,27 @@ settle any future disagreement with a config read — `gitmoot org chart` prints
 merge column, so it cannot answer this. **Public releases are unchanged and
 still need explicit OWNER sign-off** — merge authority moved on 2026-08-31,
 release authority did not.
+
+For the `gitmoot` role, owner standing-delegation row **107983** makes every
+self-merge conditional on all six checks below:
+
+1. The PR is OPEN, MERGEABLE, and CLEAN. Every check has succeeded; none is
+   pending or failing.
+2. A review job has succeeded with `decision=approved` at the current PR head.
+3. The verdict has non-empty `tests_run`; an evidence-free approval does not
+   qualify.
+4. The reviewer is neither the implementer nor the lead. One independent
+   review is enough; same-family review is valid when reported as such.
+5. Immediately before merging, re-read the head and every check. Abort if the
+   head moved or any check is not successful.
+6. In-session work with no implement job is an **attribution gap**. Name it in
+   the merge note; do not report it as an independence failure or skip it
+   silently.
+
+The delegation does **not** authorize releases, `gh release create`, deploys,
+service restarts, force-pushes to `main`, or merging work outside the PR's
+issue. Those actions remain owner-gated.
+
 Under ultracode, orchestrate via the Workflow tool with opus sub-agents
 (protect the scarcer fable quota).
 
@@ -457,9 +478,10 @@ pinging X is the action.
 - **Branches / PRs**: do **not** push directly to `main`. Branch, open a PR, let
   CI (`build / vet / test`) pass, get one clean independent review at the exact
   head, then whoever holds merge authority for that role in the org config
-  **squash-merges** — the coordinator itself under `merge_rule = "self"`, the
-  owner under `merge_rule = "owner"`. One PR per issue, with deploy notes in the
-  body. Cutting a public release stays an OWNER decision either way.
+  **squash-merges** — the coordinator under `merge_rule = "self"` only after
+  satisfying the row-107983 safeguards above, or the owner under
+  `merge_rule = "owner"`. One PR per issue, with deploy notes in the body.
+  Cutting a public release stays an OWNER decision either way.
 - **Scope**: preserve existing behavior unless the change requires otherwise.
 - For machine-local agent notes, use a gitignored `CLAUDE.local.md` rather than
   editing this shared file. Gitignored (local-only, not in the repo): `/GOALS/`,
