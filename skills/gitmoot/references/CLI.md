@@ -3393,7 +3393,7 @@ Inspect, curate, and measure the store:
 gitmoot memory list [--pending|--confirmed] [--agent NAME] [--repo owner/repo] [--json]
 gitmoot memory recall "<query>" [--repo owner/repo] [--agent NAME|--shared] [--limit N] [--expand] [--json]
 gitmoot memory replay [--agent NAME] [--repo owner/repo] [--limit N] [--json]
-gitmoot memory eval --fixtures evals/memory-retrieval-fixtures.json [--k N] [--json]
+gitmoot memory eval --fixtures internal/cli/testdata/memory-retrieval-fixtures.json [--k N] [--json]
 gitmoot memory vault export [--out DIR] [--agent NAME] [--force] [--json]
 gitmoot memory vault import <DIR> [--dry-run|--yes] [--json]
 gitmoot memory links backfill [--dry-run] [--json]
@@ -3428,8 +3428,9 @@ entries injected) — it measures injection *mechanics*, not outcome quality
 (running real agents twice is a later-phase gate). `memory eval` computes
 recall/precision through the production `PreviewEntries` path over a labeled
 fixtures file. The versioned 44-case exam is
-`evals/memory-retrieval-fixtures.json`; it mixes verbatim real-job payloads,
-incident probes, six deliberately disjoint-vocabulary paraphrases, and
+`internal/cli/testdata/memory-retrieval-fixtures.json`; it mixes verbatim
+real-job payloads, incident probes, six deliberately disjoint-vocabulary
+paraphrases, and
 self-retrieval sanity checks. Cases keep the original
 `{agent, repo, instructions, expected_keys}` fields and add optional `id`,
 `source`, `category`, `note`, and `expected_alternates`. An alternate ending in
@@ -3455,7 +3456,7 @@ The interpretation bands are recall@15 >= 0.8: keyword retrieval is adequate;
 is justified. The command is measurement-only and opens the store read-only:
 
 ```sh
-gitmoot memory eval --fixtures evals/memory-retrieval-fixtures.json --k 15 --json
+gitmoot memory eval --fixtures internal/cli/testdata/memory-retrieval-fixtures.json --k 15 --json
 ```
 
 Confirmed-memory injection reads the running agent's private pool unioned with
