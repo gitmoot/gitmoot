@@ -720,9 +720,12 @@ var escalationRecoveryLeaseTTL = 2 * time.Minute
 // deterministically. Nil in production (#1673).
 var escalationPreRenewHook func(ctx context.Context, jobID string, roundID string)
 
-// deadlineFor returns the instant a renewal call may not outlive: the expiry it is
-// trying to establish. A renewal that returns after that instant confirms nothing, so
-// there is no reason to keep the call alive past it (#1673).
+// deadlineFor returns the instant after which a renewal call has nothing useful left to
+// confirm: the expiry it is trying to establish. It is passed as a context deadline on a
+// BEST-EFFORT basis - a driver that honours cancellation will release the goroutine
+// there - but it is NOT a bound, because the SQLite driver does not interrupt an UPDATE
+// waiting on another connection's write lock. Authority is bounded by the heartbeat's
+// expiry timer and shutdown by its own timer; neither depends on this (#1673).
 func deadlineFor(confirmedUntil time.Time) time.Time {
 	if confirmedUntil.Before(time.Now().UTC().Add(50 * time.Millisecond)) {
 		// Always leave a little room, so a deadline that has effectively arrived does not
@@ -810,11 +813,13 @@ func (e Engine) applyResolutionEffectsFenced(ctx context.Context, parentJob db.J
 	// itself once the effects return, so reading the context's error as "lost" would
 	// classify every successful run as a loss and silently discard its commit.
 	var ownershipLost atomic.Bool
-	// renewalsInFlight tracks the renewal goroutines. They MUST be awaited before this
-	// function returns: a renewal that outlives the call would touch the store - and, in
-	// tests, package state - after its caller finished, which the race detector correctly
-	// reports. Each call carries a deadline at its own target expiry, so the wait is
-	// bounded by construction (#1673).
+	// renewalsInFlight tracks the renewal goroutines so shutdown can TRY to await them.
+	// It is a courtesy, not a guarantee, and the distinction is measured: the SQLite
+	// driver does NOT interrupt an UPDATE waiting on another connection's write lock at
+	// its context deadline - a renewal with a 120ms deadline was observed returning after
+	// ~11.7s, bounded by the 15s busy timeout instead. So the wait below is bounded by
+	// OUR timer and may ABANDON a renewal still in flight, which is safe only because
+	// every value such a goroutine touches is captured below (#1673).
 	var renewalsInFlight sync.WaitGroup
 	// EVERY PACKAGE-LEVEL VALUE THE HEARTBEAT NEEDS IS CAPTURED HERE, on the caller's
 	// goroutine, before anything starts. The heartbeat and its renewals then read no
@@ -866,11 +871,12 @@ func (e Engine) applyResolutionEffectsFenced(ctx context.Context, parentJob db.J
 				}
 				inFlight = true
 				attempt++
-				// THE CALL IS BOUNDED TOO. The timer above already enforces the deadline,
-				// so a hung renewal cannot extend authority - but an unbounded call would
-				// leave a goroutine parked in the store for the life of the process. Its
-				// deadline is the expiry it is trying to establish: past that instant the
-				// call could not confirm anything useful anyway.
+				// The call carries a deadline as a BEST EFFORT, not as a bound. Authority is
+				// enforced entirely by the expiry timer above, which is why a hung renewal
+				// cannot extend it. The deadline's only job is to let a driver that DOES
+				// honour cancellation release the goroutine early; measured on this
+				// repository, an UPDATE blocked on another connection's write lock ignores
+				// it, so nothing here may assume the call returns by that instant.
 				renewCtx, cancelRenew := context.WithDeadline(context.WithoutCancel(ctx), deadlineFor(confirmedUntil))
 				renewalsInFlight.Add(1)
 				go func(attempt int, renewCtx context.Context, cancelRenew context.CancelFunc) {
