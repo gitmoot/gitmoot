@@ -96,9 +96,8 @@ func LoadDaemonRuntimeConfig(paths Paths) (DaemonRuntimeConfig, error) {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section := strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
-			current = strings.TrimSpace(section) == "daemon"
+		if section, ok := sectionHeader(line); ok {
+			current = section == "daemon"
 			continue
 		}
 		if !current {

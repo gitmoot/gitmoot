@@ -53,9 +53,8 @@ func LoadRepoConcurrency(paths Paths) ([]RepoConcurrency, error) {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+		if section, ok := sectionHeader(line); ok {
 			current = nil
-			section := strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
 			repo, ok := parseRepoConcurrencySection(section)
 			if !ok {
 				continue

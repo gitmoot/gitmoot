@@ -30,8 +30,8 @@ func LoadPlannedTaskTTL(paths Paths) (time.Duration, error) {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			current = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "["), "]"))
+		if section, ok := sectionHeader(line); ok {
+			current = section
 			continue
 		}
 		if current != "workflow" {
@@ -75,8 +75,8 @@ func LoadStaleTaskTTL(paths Paths) (time.Duration, error) {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			current = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "["), "]"))
+		if section, ok := sectionHeader(line); ok {
+			current = section
 			continue
 		}
 		if current != "workflow" {
@@ -135,8 +135,8 @@ func LoadDelegationWorktreeTTL(paths Paths) (time.Duration, error) {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			current = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "["), "]"))
+		if section, ok := sectionHeader(line); ok {
+			current = section
 			continue
 		}
 		if current != "workflow" {

@@ -58,9 +58,8 @@ func LoadRuntimeOverrides(paths Paths) ([]RuntimeOverride, error) {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+		if section, ok := sectionHeader(line); ok {
 			current = nil
-			section := strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
 			name, ok := parseRuntimeRegistrySection(section)
 			if !ok {
 				continue

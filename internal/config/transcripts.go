@@ -47,8 +47,7 @@ func LoadTranscriptsConfig(paths Paths) TranscriptsConfig {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "["), "]"))
+		if section, ok := sectionHeader(line); ok {
 			current = section == "transcripts"
 			found = found || current
 			continue

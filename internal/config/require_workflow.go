@@ -68,8 +68,8 @@ func LoadRequireWorkflow(paths Paths) (RequireWorkflowConfig, error) {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			repo, inSection = parseRequireWorkflowSection(strings.TrimSuffix(strings.TrimPrefix(line, "["), "]"))
+		if section, ok := sectionHeader(line); ok {
+			repo, inSection = parseRequireWorkflowSection(section)
 			if inSection && repo != "" {
 				if _, ok := cfg.repos[repo]; !ok {
 					cfg.repos[repo] = requireWorkflowOverride{}

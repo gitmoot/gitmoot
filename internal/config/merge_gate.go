@@ -109,8 +109,7 @@ func LoadMergeGatePolicy(paths Paths) (MergeGateConfig, error) {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section := strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
+		if section, ok := sectionHeader(line); ok {
 			repo, inSection = parseMergeGateSection(section)
 			if inSection && repo != "" {
 				if _, ok := cfg.repos[repo]; !ok {

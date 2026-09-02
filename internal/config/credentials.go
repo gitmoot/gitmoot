@@ -49,9 +49,8 @@ func LoadCredentialsConfig(paths Paths) (CredentialsConfig, error) {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section := strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
-			current = strings.TrimSpace(section) == "credentials"
+		if section, ok := sectionHeader(line); ok {
+			current = section == "credentials"
 			continue
 		}
 		if !current {
