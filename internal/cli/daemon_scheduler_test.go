@@ -2761,6 +2761,46 @@ func TestRunQueuedJobsPoolIsolatesContendedReadJob(t *testing.T) {
 	}
 }
 
+// concurrentOutputProbe makes overlapping writes observable instead of relying
+// on scheduler luck. The first armed write waits for a peer; a worker that owns
+// serialization keeps the peer outside Write, while an unguarded pool admits it.
+type concurrentOutputProbe struct {
+	armed       atomic.Bool
+	active      atomic.Int32
+	overlap     atomic.Bool
+	firstWrite  sync.Once
+	peerEntered sync.Once
+	peer        chan struct{}
+	buf         bytes.Buffer
+}
+
+func newConcurrentOutputProbe() *concurrentOutputProbe {
+	return &concurrentOutputProbe{peer: make(chan struct{})}
+}
+
+func (b *concurrentOutputProbe) Write(p []byte) (int, error) {
+	if !b.armed.Load() {
+		return b.buf.Write(p)
+	}
+	active := b.active.Add(1)
+	defer b.active.Add(-1)
+	if active > 1 {
+		b.overlap.Store(true)
+		b.peerEntered.Do(func() { close(b.peer) })
+	}
+	b.firstWrite.Do(func() {
+		select {
+		case <-b.peer:
+		case <-time.After(250 * time.Millisecond):
+		}
+	})
+	return b.buf.Write(p)
+}
+
+func (b *concurrentOutputProbe) String() string {
+	return b.buf.String()
+}
+
 func TestPoolIsolationAppendsCommittedTipNote(t *testing.T) {
 	// #696: three same-repo top-level read-only (ask) jobs submitted together under
 	// the pool run concurrently — one in the shared checkout, the other two
@@ -2780,8 +2820,8 @@ func TestPoolIsolationAppendsCommittedTipNote(t *testing.T) {
 	for i, id := range []string{"job-1", "job-2", "job-3"} {
 		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: id, Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: i + 1, Instructions: goal})
 	}
-	var workerOutput bytes.Buffer
-	worker := defaultJobWorker(store, &workerOutput, home)
+	workerOutput := newConcurrentOutputProbe()
+	worker := defaultJobWorker(store, workerOutput, home)
 	worker.UsePool = true
 	worker.CheckoutValidator = func(_ context.Context, _ db.Job, payload workflow.JobPayload, _ runtime.Agent) (string, error) {
 		if strings.TrimSpace(payload.WorktreePath) != "" {
@@ -2789,9 +2829,13 @@ func TestPoolIsolationAppendsCommittedTipNote(t *testing.T) {
 		}
 		return checkout, nil
 	}
+	workerOutput.armed.Store(true)
 
 	if err := runQueuedJobsForRepo(ctx, worker, 3, "", ""); err != nil {
 		t.Fatalf("pool run: %v", err)
+	}
+	if workerOutput.overlap.Load() {
+		t.Fatal("pool workers wrote to the shared output concurrently")
 	}
 
 	isolated, shared := 0, 0
