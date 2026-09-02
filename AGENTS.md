@@ -499,11 +499,19 @@ Under ultracode, orchestrate via the Workflow tool with opus sub-agents
 
 A mode switch is either a merged PR that changes the line above, or a durable
 `[operating-mode ...]` workflow note from the owner (or a coordinator acting on a
-recorded owner instruction) — whichever is later. A note takes effect at its own
-timestamp and this line is then corrected in the next PR that touches this file;
-the note path's precedent is STEADY, set by owner instruction in note 107313 on
-2026-09-02 and since superseded. A merged PR takes effect at that PR's
-`mergedAt` time. At the next check-in, the coordinator must:
+recorded owner instruction). A note takes effect at its own timestamp and this
+line is then corrected in the next PR that touches this file; the note path's
+precedent is STEADY, set by owner instruction in note 107313 on 2026-09-02 and
+since superseded by a merged PR. A merged PR takes effect at that PR's
+`mergedAt` time only after the pre-merge reconciliation below. The later valid
+source wins.
+
+Immediately before merging a mode-switch PR, re-read the newest
+`[operating-mode ...]` note and record its id (or `none`) on the PR. The PR's
+reviewed head must implement that note's mode, unless a later durable owner
+instruction explicitly chooses another mode. Otherwise update the PR and
+re-review it, or do not merge it. An unreconciled stale PR is not a valid switch,
+and its later `mergedAt` timestamp cannot override a newer owner instruction.
 
 1. resolve the mode from BOTH sources and steer to the LATER one: fetch
    `origin/main` and read the marker from `origin/main:AGENTS.md` rather than the
@@ -520,14 +528,16 @@ the note path's precedent is STEADY, set by owner instruction in note 107313 on
    `[/workload-mode-transition]`.
 
 For DRAIN, the listed transition wave is derived from durable timestamps:
-implementation assignments accepted before `mergedAt` that have not reached a
-terminal handoff, plus review jobs created before `mergedAt` that were queued or
-running then. `accepted_at` is the timestamp of the Herdr pane's first
-`working` status event after the issue-backed assignment prompt; `created_at` is
-the job-store timestamp. A merged PR always exists for a PR-sourced switch, so that record does not
-depend on a pre-existing workflow. For a NOTE-sourced switch the note id IS the
-record and the transition record is posted as a workflow note, because the
-correcting PR may not exist yet. The mode changes how much work may start; it
+implementation assignments accepted before the switch's effective time that
+have not reached a terminal handoff, plus review jobs created before that time
+that were queued or running then. The effective time is `mergedAt` for a
+PR-sourced switch and the note's `created_at` for a note-sourced switch.
+`accepted_at` is the timestamp of the Herdr pane's first `working` status event
+after the issue-backed assignment prompt; `created_at` is the job-store
+timestamp. A merged PR always exists for a PR-sourced switch, so that record
+does not depend on a pre-existing workflow. For a NOTE-sourced switch the note
+id IS the record and the transition record is posted as a workflow note, because
+the correcting PR may not exist yet. The mode changes how much work may start;
 never relaxes correctness, exact-head review, CI, or the merge authority
 recorded in the org config.
 
@@ -575,10 +585,10 @@ escalations, and an armed merge gate then merged the PR without them.
 - Escalate only for a **P2-or-worse finding**, a **scope boundary wider than the
   assigned item**, or **live-service impact**. Everything else is the seat's call.
 - Steady mode names its own **exit condition and its destination**: when the
-  scoped list is merged, `gitmoot/*` returns to **DRAIN**, and the coordinator
-  posts that drain marker itself rather than waiting to be told (owner
-  instruction, note 107313: "we need to stop and go back to DRAIN mode once
-  those are merged").
+  scoped list is merged, `gitmoot/*` returns to **DRAIN**. The coordinator first
+  completes every DRAIN activation precondition below and only then posts the
+  drain marker itself rather than waiting to be told (owner instruction, note
+  107313: "we need to stop and go back to DRAIN mode once those are merged").
 
 ### Drain mode
 
@@ -594,17 +604,19 @@ escalations, and an armed merge gate then merged the PR without them.
 - After activation, cap the `gitmoot/*` scope at **two active implementers and
   one running reviewer**. An active implementer is a persistent seat currently
   changing code or a running engine implementation job.
-- A DRAIN mode-switch PR is not merge-ready until the coordinator configures
-  the shared daemon with `[daemon] workers = 1`; every active
+- A DRAIN switch is not effective until the coordinator configures the shared
+  daemon with `[daemon] workers = 1`; every active
   `[repos."gitmoot/*"].max_parallel` override must be absent, zero, or one.
   Apply the warm reload and verify both the effective global worker count and
   every effective per-repository limit. This is the atomic runtime gate shared
-  by native PR fanout, heartbeats, and manual background reviews.
-- Before that PR merges, every foreground or persistent-seat review already in
+  by native PR fanout, heartbeats, and manual background reviews. For a
+  PR-sourced switch, complete this before merge; for a note-sourced switch,
+  complete it before posting the marker.
+- Before DRAIN activates, every foreground or persistent-seat review already in
   progress must reach a terminal handoff; those reviews cannot be grandfathered.
   All DRAIN reviews then run as background engine jobs. Never bypass the shared
   gate with a foreground or persistent-seat reviewer.
-- Before that PR merges, disable every `action=review` heartbeat and allow
+- Before DRAIN activates, disable every `action=review` heartbeat and allow
   exactly one review-capable agent on each active `gitmoot/*` repository. For a
   PR with a branch lock, the native PR watcher is the sole producer; do not also
   dispatch a manual review. For a PR without a branch lock, native fanout cannot
