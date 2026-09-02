@@ -529,6 +529,11 @@ func SupersedeClosedPullRequestJob(ctx context.Context, store *db.Store, jobID s
 	return updated, true, err
 }
 
+// closedPRChildPreAdvanceHook fires between the atomic terminal commit and the parent
+// advancement, which is the window the round-2 #1763 P1 occupies. Nil in production
+// (#1673).
+var closedPRChildPreAdvanceHook func(ctx context.Context, jobID string) error
+
 // FinalizeClosedPullRequestDelegationChild terminates a QUEUED delegation child
 // whose pull request is no longer open, and — unlike the top-level path — makes the
 // coordinator move. It transitions the child to `failed` with the same legible
@@ -555,19 +560,29 @@ func (e Engine) FinalizeClosedPullRequestDelegationChild(ctx context.Context, jo
 	if reason == "" {
 		reason = "queued delegation child superseded: its pull request is no longer open"
 	}
-	// THE TRANSITION AND THE RE-DRIVE OBLIGATION COMMIT TOGETHER (#1673). Stamping the
-	// synthetic result and advancing the parent is a SECOND step, and any error or
-	// crash after the state commit would otherwise leave a failed child with no result
-	// that ListQueuedJobs can never select again - the coordinator waits forever.
+	// ONE COMMIT FOR EVERY DURABLE FACT THIS DECISION PRODUCES (#1673): the terminal
+	// state, the synthetic result the parent's advanceDelegations requires, the legible
+	// supersession event, and the re-drive obligation.
 	//
-	// `advance_retry` is the marker the liveness table already understands (see
-	// advancementPending): a settled job carrying it still keeps its task live, so a
-	// sweep re-drives it. It is self-clearing, because the finalizer's own
-	// advance_completed/advance_blocked is a later event and the scan is last-writer-wins.
-	transitioned, err := e.Store.TransitionJobStateWithEvents(ctx, job.ID, job.State, string(JobFailed),
+	// Round 1 of this review made the MARKER atomic with the transition and left the
+	// RESULT as a second write, which moved the non-atomicity one step down rather than
+	// removing it: a failed child with a marker and no result is a permanent retry loop,
+	// because the actuator rejects the nil result and no sweep selects a failed row.
+	// If two durable facts must agree, one statement writes them.
+	payload.Result = &AgentResult{Decision: "failed", Summary: reason}
+	encoded, err := marshalPayload(payload)
+	if err != nil {
+		return false, err
+	}
+	transitioned, err := e.Store.TransitionJobStateWithPayloadAndEvents(ctx, job.ID, job.State, string(JobFailed), []byte(encoded),
 		db.JobEvent{
 			JobID:   job.ID,
 			Kind:    JobEventSupersededPullRequestClosed,
+			Message: reason,
+		},
+		db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "delegation_timeout_finalized",
 			Message: reason,
 		},
 		db.JobEvent{
@@ -582,21 +597,40 @@ func (e Engine) FinalizeClosedPullRequestDelegationChild(ctx context.Context, jo
 		return false, nil
 	}
 	recordReadOnlyWorktreeReclaimOnAbort(ctx, e.Store, job, payload)
-	finalized, finalizeErr := e.FinalizeTimedOutDelegationChild(ctx, job.ID, reason)
-	var blocked BlockedError
-	if finalizeErr == nil || errors.As(finalizeErr, &blocked) {
-		// THE OBLIGATION IS DISCHARGED. The advancement events the finalizer writes land
-		// on the PARENT, so nothing on this child would ever clear its marker and the
-		// child would stay "advancement pending" forever - a permanently live task, which
-		// is the mirror-image leak of the stranding this marker exists to prevent.
-		//
-		// A BlockedError counts as discharged: that is the parent's failure_policy making
-		// a decision and recording it, not an advancement still owed.
-		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
-			JobID:   job.ID,
-			Kind:    "advance_completed",
-			Message: "parent advancement discharged after closed-pull-request supersession",
-		})
+
+	// closedPRChildPreAdvanceHook is the only place a test can stop this sequence in the
+	// window the round-2 P1 lives in: after the atomic commit, before the parent is
+	// advanced. Nil in production.
+	if closedPRChildPreAdvanceHook != nil {
+		if hookErr := closedPRChildPreAdvanceHook(ctx, job.ID); hookErr != nil {
+			return true, hookErr
+		}
 	}
-	return finalized, finalizeErr
+	// ADVANCE EXPLICITLY. FinalizeTimedOutDelegationChild returns early once a result
+	// exists, which is now always, so routing through it would silently never advance
+	// the parent. An interruption here is covered: the result is already durable, so the
+	// pending-advancement actuator re-drives this exact call and converges.
+	if err := e.AdvanceJob(ctx, job.ID); err != nil {
+		var blocked BlockedError
+		if !errors.As(err, &blocked) {
+			return true, err
+		}
+		// A BlockedError is the parent's failure_policy making a decision and recording
+		// it - an advancement that HAPPENED, not one still owed.
+	}
+	if addErr := e.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   job.ID,
+		Kind:    "advance_completed",
+		Message: "parent advancement discharged after closed-pull-request supersession",
+	}); addErr != nil {
+		return true, addErr
+	}
+	return true, nil
+}
+
+// SetClosedPRChildPreAdvanceHookForTest installs the pre-advance interruption seam from
+// another package's test. The actuator that recovers this window lives in internal/cli,
+// so the boundary can only be exercised end-to-end from there (#1673).
+func SetClosedPRChildPreAdvanceHookForTest(hook func(ctx context.Context, jobID string) error) {
+	closedPRChildPreAdvanceHook = hook
 }

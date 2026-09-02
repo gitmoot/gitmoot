@@ -49,7 +49,15 @@ var jobStateWriteAllowlist = map[string]int{
 	// replacing its result payload. It is anchored to the observed state and
 	// lifecycle generation and carries bumpLifecycleGenerationSQL like every
 	// other state assignment, so a stale run cannot rewrite a newer result.
-	"internal/db/store_jobs.go": 10,
+	//
+	// The ELEVENTH is TransitionJobStateWithPayloadAndEvents' payload-carrying arm
+	// (#1673). It exists because terminalizing a job and then writing the payload its
+	// recovery path needs are two statements, and the state in between - a settled job
+	// with a re-drive marker and no result - is unrepairable: the retry actuator rejects
+	// the nil result, re-stamps the marker, and no sweep selects it because the sweeps
+	// list QUEUED jobs. The arm is state-anchored and carries
+	// bumpLifecycleGenerationSQL, exactly like the payload-free arm beside it.
+	"internal/db/store_jobs.go": 11,
 }
 
 // TestEveryJobStateWriteBumpsTheLifecycleGeneration enforces the seam #1407's design rests on.

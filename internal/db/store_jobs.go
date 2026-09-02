@@ -686,13 +686,34 @@ func (s *Store) TransitionJobStateWithEvent(ctx context.Context, id string, from
 // no marker is invisible to every sweep that would have re-driven it. Passing both
 // events here closes that window by construction rather than by ordering luck.
 func (s *Store) TransitionJobStateWithEvents(ctx context.Context, id string, from string, to string, events ...JobEvent) (bool, error) {
+	return s.TransitionJobStateWithPayloadAndEvents(ctx, id, from, to, nil, events...)
+}
+
+// TransitionJobStateWithPayloadAndEvents additionally rewrites the job's PAYLOAD in
+// the same commit (#1673).
+//
+// THE CLASS, not the site: a caller that terminalizes a job and then writes the
+// payload its recovery path needs has merely MOVED the non-atomicity one step down the
+// sequence. The state it leaves - a settled job carrying a re-drive marker but no
+// result - is unrepairable: the actuator rejects the nil result, re-stamps the marker
+// and repeats forever, and no sweep selects it because the sweeps list QUEUED jobs.
+// Two durable facts that must agree are written by one statement here.
+//
+// A nil payload leaves the stored payload untouched, so the events-only wrapper above
+// is byte-equivalent to the original single-event primitive.
+func (s *Store) TransitionJobStateWithPayloadAndEvents(ctx context.Context, id string, from string, to string, payload []byte, events ...JobEvent) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
 
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, to, id, from)
+	var result sql.Result
+	if payload == nil {
+		result, err = tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, to, id, from)
+	} else {
+		result, err = tx.ExecContext(ctx, `UPDATE jobs SET state = ?, payload = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, payload, to, id, from)
+	}
 	if err != nil {
 		return false, err
 	}
