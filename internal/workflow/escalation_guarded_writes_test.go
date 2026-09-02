@@ -412,6 +412,10 @@ func TestHeartbeatCancelsThePassOnAuthoritativeLoss(t *testing.T) {
 
 	originalTTL := escalationRecoveryLeaseTTL
 	escalationRecoveryLeaseTTL = 300 * time.Millisecond
+	// ttl is captured for use inside the hooks below. They run on the heartbeat's own
+	// goroutine, which can outlive this test body now that shutdown is bounded, so a
+	// closure reading the package var would race this cleanup.
+	ttl := escalationRecoveryLeaseTTL
 	t.Cleanup(func() { escalationRecoveryLeaseTTL = originalTTL })
 
 	round, ok := unsettledRound(t, store, "parent-job")
@@ -425,7 +429,7 @@ func TestHeartbeatCancelsThePassOnAuthoritativeLoss(t *testing.T) {
 	manager.onAddCtx = func(effectCtx context.Context) {
 		now := time.Now().UTC()
 		if _, err := store.AcquireEscalationRecoveryLease(context.Background(), "parent-job", round.RoundID,
-			"thief", now.Add(time.Minute), now.Add(10*escalationRecoveryLeaseTTL)); err != nil {
+			"thief", now.Add(time.Minute), now.Add(10*ttl)); err != nil {
 			t.Errorf("steal the fence: %v", err)
 			return
 		}
@@ -537,6 +541,10 @@ func TestRenewalErrorsCancelAtTheConfirmedExpiry(t *testing.T) {
 
 	originalTTL := escalationRecoveryLeaseTTL
 	escalationRecoveryLeaseTTL = 300 * time.Millisecond
+	// ttl is captured for use inside the hooks below. They run on the heartbeat's own
+	// goroutine, which can outlive this test body now that shutdown is bounded, so a
+	// closure reading the package var would race this cleanup.
+	ttl := escalationRecoveryLeaseTTL
 	t.Cleanup(func() { escalationRecoveryLeaseTTL = originalTTL })
 
 	round, ok := unsettledRound(t, store, "parent-job")
@@ -555,7 +563,7 @@ func TestRenewalErrorsCancelAtTheConfirmedExpiry(t *testing.T) {
 	var cancelledBeforeExpiry atomic.Bool
 	var competitorOverlapped atomic.Bool
 	manager.onAddCtx = func(effectCtx context.Context) {
-		deadline := time.Now().UTC().Add(escalationRecoveryLeaseTTL)
+		deadline := time.Now().UTC().Add(ttl)
 		select {
 		case <-effectCtx.Done():
 			// (a) cancelled, and cancelled no later than the confirmed expiry.
@@ -663,6 +671,10 @@ func TestLateRenewalDoesNotExtendAuthorityPastThePersistedExpiry(t *testing.T) {
 
 	originalTTL := escalationRecoveryLeaseTTL
 	escalationRecoveryLeaseTTL = 300 * time.Millisecond
+	// ttl is captured for use inside the hooks below. They run on the heartbeat's own
+	// goroutine, which can outlive this test body now that shutdown is bounded, so a
+	// closure reading the package var would race this cleanup.
+	ttl := escalationRecoveryLeaseTTL
 	t.Cleanup(func() { escalationRecoveryLeaseTTL = originalTTL })
 
 	round, ok := unsettledRound(t, store, "parent-job")
@@ -673,7 +685,7 @@ func TestLateRenewalDoesNotExtendAuthorityPastThePersistedExpiry(t *testing.T) {
 	// Every heartbeat renewal is DELAYED past the expiry it writes, so no renewal can
 	// ever confirm authority beyond the persisted deadline.
 	escalationRenewFaultHook = func(attempt int) error {
-		time.Sleep(2 * escalationRecoveryLeaseTTL)
+		time.Sleep(2 * ttl)
 		return nil
 	}
 	t.Cleanup(func() { escalationRenewFaultHook = nil })
@@ -733,6 +745,10 @@ func TestStalledRenewalStopsPreEffectsAtThePersistedExpiry(t *testing.T) {
 
 	originalTTL := escalationRecoveryLeaseTTL
 	escalationRecoveryLeaseTTL = 300 * time.Millisecond
+	// ttl is captured for use inside the hooks below. They run on the heartbeat's own
+	// goroutine, which can outlive this test body now that shutdown is bounded, so a
+	// closure reading the package var would race this cleanup.
+	ttl := escalationRecoveryLeaseTTL
 	t.Cleanup(func() { escalationRecoveryLeaseTTL = originalTTL })
 
 	round, ok := unsettledRound(t, store, "parent-job")
@@ -743,7 +759,7 @@ func TestStalledRenewalStopsPreEffectsAtThePersistedExpiry(t *testing.T) {
 	// Every renewal STALLS for twice the whole TTL. It neither errors nor returns in
 	// time, so nothing on the renewal's return path can enforce the bound.
 	escalationRenewFaultHook = func(attempt int) error {
-		time.Sleep(2 * escalationRecoveryLeaseTTL)
+		time.Sleep(2 * ttl)
 		return nil
 	}
 	t.Cleanup(func() { escalationRenewFaultHook = nil })
@@ -753,7 +769,7 @@ func TestStalledRenewalStopsPreEffectsAtThePersistedExpiry(t *testing.T) {
 	manager.onAddCtx = func(effectCtx context.Context) {
 		// Wait until the persisted expiry has passed, WITHOUT waiting for cancellation -
 		// that ordering is the whole point.
-		time.Sleep(escalationRecoveryLeaseTTL + 80*time.Millisecond)
+		time.Sleep(ttl + 80*time.Millisecond)
 		now := time.Now().UTC()
 		if taken, err := store.AcquireEscalationRecoveryLease(context.Background(), "parent-job",
 			round.RoundID, "competitor", now.Add(time.Minute), now); err == nil && taken {
@@ -802,6 +818,10 @@ func TestExpiryIsReArmedAfterEachConfirmedRenewal(t *testing.T) {
 
 	originalTTL := escalationRecoveryLeaseTTL
 	escalationRecoveryLeaseTTL = 300 * time.Millisecond
+	// ttl is captured for use inside the hooks below. They run on the heartbeat's own
+	// goroutine, which can outlive this test body now that shutdown is bounded, so a
+	// closure reading the package var would race this cleanup.
+	ttl := escalationRecoveryLeaseTTL
 	t.Cleanup(func() { escalationRecoveryLeaseTTL = originalTTL })
 
 	round, ok := unsettledRound(t, store, "parent-job")
@@ -813,7 +833,7 @@ func TestExpiryIsReArmedAfterEachConfirmedRenewal(t *testing.T) {
 	// STALLS, so only a re-armed timer can still enforce the bound.
 	escalationRenewFaultHook = func(attempt int) error {
 		if attempt > 2 {
-			time.Sleep(4 * escalationRecoveryLeaseTTL)
+			time.Sleep(4 * ttl)
 		}
 		return nil
 	}
@@ -823,7 +843,7 @@ func TestExpiryIsReArmedAfterEachConfirmedRenewal(t *testing.T) {
 	var cancelledEventually atomic.Bool
 	manager.onAddCtx = func(effectCtx context.Context) {
 		// Past the ORIGINAL expiry, the pass must still be alive: renewals were healthy.
-		time.Sleep(escalationRecoveryLeaseTTL + 60*time.Millisecond)
+		time.Sleep(ttl + 60*time.Millisecond)
 		if effectCtx.Err() == nil {
 			survivedFirstExpiry.Store(true)
 		}
@@ -846,5 +866,59 @@ func TestExpiryIsReArmedAfterEachConfirmedRenewal(t *testing.T) {
 	}
 	if !cancelledEventually.Load() {
 		t.Fatal("the pass was never cancelled once renewals stalled: the deadline was stopped and never re-armed")
+	}
+}
+
+// TestStalledRenewalDoesNotStallTheResolution is the P2 of the 7189ecdc review, and it
+// pins the bound that WAS present but unproven: shutdown must not wait for a renewal
+// that cannot be interrupted.
+//
+// THE MEASUREMENT BEHIND IT, which the reviewer took at the previous head: a renewal
+// UPDATE blocked behind another connection's write lock returned ~11.7s after a 120ms
+// context deadline, because the SQLite driver does not interrupt a statement waiting on
+// the write lock. So a context deadline is NOT a bound here, and the comment claiming it
+// was has been corrected. The bound is enforced on OUR side, by giving up on the wait.
+//
+// SEMANTIC REVERSION THIS KILLS: wait unconditionally for the renewal goroutine, and
+// ResolveEscalation blocks for the whole stall - stalling the daemon poll behind it.
+func TestStalledRenewalDoesNotStallTheResolution(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	engine.EscalationNotifier = &recordingNotifier{}
+	manager := pausedImplementEscalation(t, store, &engine)
+
+	originalTTL := escalationRecoveryLeaseTTL
+	escalationRecoveryLeaseTTL = 200 * time.Millisecond
+	ttl := escalationRecoveryLeaseTTL
+	t.Cleanup(func() { escalationRecoveryLeaseTTL = originalTTL })
+
+	// A renewal that cannot be interrupted, far longer than anything the resolution may
+	// wait for. This stands in for the write-lock case measured above.
+	stall := 12 * time.Second
+	escalationRenewFaultHook = func(attempt int) error {
+		time.Sleep(stall)
+		return nil
+	}
+	t.Cleanup(func() { escalationRenewFaultHook = nil })
+
+	// The pre-effect lasts long enough for the heartbeat to issue a renewal and for the
+	// expiry to lapse while that renewal is stuck.
+	manager.onAdd = func() { time.Sleep(3 * ttl) }
+
+	started := time.Now()
+	if err := engine.ResolveEscalation(ctx, "parent-job", ResumeRetry, ""); err != nil {
+		t.Fatalf("ResolveEscalation: %v", err)
+	}
+	elapsed := time.Since(started)
+
+	// THE BOUND: shutdown gives up on the uninterruptible renewal, so the resolution
+	// returns in a time governed by the lease, not by the stall.
+	if elapsed >= stall/2 {
+		t.Fatalf("ResolveEscalation took %s with a %s stalled renewal: shutdown waited for a call it cannot interrupt", elapsed, stall)
+	}
+	// And ownership safety is unchanged: the lapsed pass applied nothing.
+	if got := countJobs(t, store, "/resume"); got != 0 {
+		t.Fatalf("resume jobs = %d, want 0 from a pass whose authority lapsed", got)
 	}
 }

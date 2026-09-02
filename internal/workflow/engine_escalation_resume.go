@@ -816,10 +816,16 @@ func (e Engine) applyResolutionEffectsFenced(ctx context.Context, parentJob db.J
 	// reports. Each call carries a deadline at its own target expiry, so the wait is
 	// bounded by construction (#1673).
 	var renewalsInFlight sync.WaitGroup
+	// EVERY PACKAGE-LEVEL VALUE THE HEARTBEAT NEEDS IS CAPTURED HERE, on the caller's
+	// goroutine, before anything starts. The heartbeat and its renewals then read no
+	// package state at all - which is required because the shutdown wait below is bounded
+	// and may give up on a goroutine that outlives this call (#1673).
+	leaseTTL := escalationRecoveryLeaseTTL
+	faultHook := escalationRenewFaultHook
 	heartbeatDone := make(chan struct{})
 	go func() {
 		defer close(heartbeatDone)
-		ticker := time.NewTicker(escalationRecoveryLeaseTTL / 3)
+		ticker := time.NewTicker(leaseTTL / 3)
 		defer ticker.Stop()
 		// AUTHORITY EXPIRES BY THE CLOCK, NOT BY OBSERVATION. Checking the bound only
 		// after a renewal RETURNS leaves the stalled case open: a hung store call keeps
@@ -870,11 +876,11 @@ func (e Engine) applyResolutionEffectsFenced(ctx context.Context, parentJob db.J
 				go func(attempt int, renewCtx context.Context, cancelRenew context.CancelFunc) {
 					defer renewalsInFlight.Done()
 					defer cancelRenew()
-					until := time.Now().UTC().Add(escalationRecoveryLeaseTTL)
+					until := time.Now().UTC().Add(leaseTTL)
 					var held bool
 					var err error
-					if escalationRenewFaultHook != nil {
-						err = escalationRenewFaultHook(attempt)
+					if faultHook != nil {
+						err = faultHook(attempt)
 					}
 					if err == nil {
 						held, err = e.Store.RenewEscalationRecoveryLease(renewCtx, parentJob.ID, roundID, owner,
@@ -915,9 +921,26 @@ func (e Engine) applyResolutionEffectsFenced(ctx context.Context, parentJob db.J
 	verbErr := capturing.applyResolutionEffects(effectCtx, parentJob, parentPayload, ref, rec, verb, instructions, answers, roundID)
 	stopHeartbeat()
 	<-heartbeatDone
-	// Await any renewal still in flight. Its deadline bounds this wait, and letting it
-	// escape would leave a goroutine writing to the store after the resolution finished.
-	renewalsInFlight.Wait()
+	// AWAIT THE RENEWAL, BUT BOUNDED - and by OUR clock, not by the store's goodwill.
+	// A context deadline is not a real bound here: measured on this repository, an UPDATE
+	// blocked behind another connection's write lock returned ~11.7s after a 120ms
+	// deadline, because the SQLite driver does not interrupt a statement waiting on the
+	// write lock (the busy timeout is 15s). Trusting the deadline would stall
+	// ResolveEscalation and the daemon poll for that whole window.
+	//
+	// Ownership safety does not depend on this wait: the expiry timer has already
+	// cancelled the pre-effects and marked ownership lost. The wait exists only to avoid
+	// leaking a goroutine, so giving up on it is safe - the goroutine captured everything
+	// it needs and writes only to a buffered channel nobody reads (#1673).
+	renewalsSettled := make(chan struct{})
+	go func() {
+		renewalsInFlight.Wait()
+		close(renewalsSettled)
+	}()
+	select {
+	case <-renewalsSettled:
+	case <-time.After(leaseTTL):
+	}
 	// Ownership lost while the pre-effects ran: the heartbeat cancelled them, so apply
 	// nothing rather than committing a partially-run decision.
 	if ownershipLost.Load() {
