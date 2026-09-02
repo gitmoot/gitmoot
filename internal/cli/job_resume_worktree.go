@@ -13,15 +13,12 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// resumeSelfDirtyWorktree recognizes one narrowly-owned checkout-contention
-// case: a queued, top-level implement job being retried into its own dirty task
-// worktree after the prior runtime owner died. It bypasses only the dirty
-// pre-flight guard; every predicate miss or probe/persistence error returns false
-// so jobWorker.run takes the existing checkout-contention path unchanged.
-func (w jobWorker) resumeSelfDirtyWorktree(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent, cause error) (string, workflow.JobPayload, bool) {
-	return w.resumeSelfDirtyWorktreeForRunner(ctx, job, payload, agent, cause, subprocess.ExecRunner{})
-}
-
+// resumeSelfDirtyWorktreeForRunner recognizes one narrowly-owned
+// checkout-contention case: a queued, top-level implement job being retried into
+// its own dirty task worktree after the prior runtime owner died. It bypasses
+// only the dirty pre-flight guard; every predicate miss or probe/persistence
+// error returns false so jobWorker.run takes the existing checkout-contention
+// path unchanged.
 func (w jobWorker) resumeSelfDirtyWorktreeForRunner(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent, cause error, runner subprocess.Runner) (string, workflow.JobPayload, bool) {
 	kind, _ := classifyCheckoutContention(cause)
 	if kind != checkoutContentionDirty || cause == nil || !strings.Contains(cause.Error(), "has uncommitted changes") {
@@ -54,7 +51,7 @@ func (w jobWorker) resumeSelfDirtyWorktreeForRunner(ctx context.Context, job db.
 	}
 
 	// The normal checkout validator reports dirtiness before checking HEAD, then
-	// defaultCheckout checks the unconditional implementation branch lock. Since
+	// defaultCheckoutForRunner checks the unconditional implementation branch lock. Since
 	// this recovery path bypasses only that dirty result, positively re-establish
 	// both later invariants before allowing delivery.
 	expectedHead := strings.TrimSpace(payload.HeadSHA)

@@ -326,7 +326,7 @@ func TestDirectiveWakeOutboxIsConfigInert(t *testing.T) {
 
 	// MUTANT F3: treating an unmatched directive as an unhealthy obligation
 	// makes this zero-directive-rule drain return a permanent error.
-	if err := drainReplyWakeOutbox(context.Background(), store, createdAt.Add(replyWakeCoalescingWindow+time.Second), replyWakeTestDeliveryResolver(deliverySink)); err != nil {
+	if _, err := drainReplyWakeOutboxWithHealth(context.Background(), store, createdAt.Add(replyWakeCoalescingWindow+time.Second), replyWakeTestDeliveryResolver(deliverySink)); err != nil {
 		t.Fatalf("config-inert drain for directive %d: %v", directive.ID, err)
 	}
 	health, err := wakeOutboxObligationHealth(
@@ -387,7 +387,7 @@ func TestDirectiveWakeOutboxUsesSeparateCoalesceNamespace(t *testing.T) {
 	}
 
 	latest, _ := time.Parse(time.RFC3339Nano, pending[len(pending)-1].CreatedAt)
-	if err := drainReplyWakeOutbox(ctx, store, latest.Add(replyWakeCoalescingWindow+time.Second), replyWakeTestDeliveryResolver(deliverySink)); err != nil {
+	if _, err := drainReplyWakeOutboxWithHealth(ctx, store, latest.Add(replyWakeCoalescingWindow+time.Second), replyWakeTestDeliveryResolver(deliverySink)); err != nil {
 		t.Fatalf("coalesced drain: %v", err)
 	}
 	directivePrompt := ""

@@ -11,7 +11,6 @@ import (
 	"os"
 	"runtime"
 	"strings"
-	"unicode/utf8"
 )
 
 const (
@@ -116,35 +115,6 @@ func isCharDevice(w io.Writer) bool {
 	}
 	info, err := stater.Stat()
 	return err == nil && info.Mode()&os.ModeCharDevice != 0
-}
-
-// Columns aligns a table of cells into left-justified, space-padded lines, two
-// spaces between columns. Widths are measured in runes; ragged rows (differing
-// cell counts) are aligned per column and trailing padding is trimmed. Styling
-// escape codes in cells are not measured, so apply color after Columns, not
-// before.
-func Columns(rows [][]string) []string {
-	widths := map[int]int{}
-	for _, row := range rows {
-		for col, cell := range row {
-			if w := utf8.RuneCountInString(cell); w > widths[col] {
-				widths[col] = w
-			}
-		}
-	}
-	lines := make([]string, 0, len(rows))
-	for _, row := range rows {
-		var builder strings.Builder
-		for col, cell := range row {
-			if col > 0 {
-				builder.WriteString("  ")
-			}
-			builder.WriteString(cell)
-			builder.WriteString(strings.Repeat(" ", widths[col]-utf8.RuneCountInString(cell)))
-		}
-		lines = append(lines, strings.TrimRight(builder.String(), " "))
-	}
-	return lines
 }
 
 // TopN returns the first n items and the count of items omitted. n <= 0 keeps

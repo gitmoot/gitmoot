@@ -3129,63 +3129,6 @@ func TestPollOnceRetriesUnseenCommentAfterAckFailure(t *testing.T) {
 	}
 }
 
-func TestRunReturnsOnCancellation(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	store := testStore(t)
-	client := &fakeGitHub{}
-	daemon := Daemon{
-		Repo:         github.Repository{Owner: "gitmoot", Name: "gitmoot"},
-		Store:        store,
-		GitHub:       client,
-		PollInterval: time.Hour,
-		Sleep: func(ctx context.Context, _ time.Duration) error {
-			cancel()
-			<-ctx.Done()
-			return ctx.Err()
-		},
-	}
-
-	err := daemon.Run(ctx)
-
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run error = %v, want context.Canceled", err)
-	}
-	if client.listPullRequestsCalls != 1 {
-		t.Fatalf("ListPullRequests calls = %d, want 1", client.listPullRequestsCalls)
-	}
-}
-
-func TestRunContinuesAfterPollError(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	store := testStore(t)
-	client := &fakeGitHub{listPullRequestsErrs: []error{errors.New("rate limited"), nil}}
-	var sleeps int
-	daemon := Daemon{
-		Repo:         github.Repository{Owner: "gitmoot", Name: "gitmoot"},
-		Store:        store,
-		GitHub:       client,
-		PollInterval: time.Second,
-		Sleep: func(ctx context.Context, _ time.Duration) error {
-			sleeps++
-			if sleeps == 1 {
-				return nil
-			}
-			cancel()
-			<-ctx.Done()
-			return ctx.Err()
-		},
-	}
-
-	err := daemon.Run(ctx)
-
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run error = %v, want context.Canceled", err)
-	}
-	if client.listPullRequestsCalls != 2 {
-		t.Fatalf("ListPullRequests calls = %d, want 2", client.listPullRequestsCalls)
-	}
-}
-
 func TestPollOnceWithoutWatchIssuesIgnoresIssues(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
@@ -3550,7 +3493,6 @@ type fakeGitHub struct {
 	posted                 []postedComment
 	permissions            map[string]string
 	postErrs               []error
-	listPullRequestsCalls  int
 	listPullRequestsErrs   []error
 	listIssuesCalls        int
 	recentClosedCalls      int
@@ -3592,7 +3534,6 @@ func (f *fakeGitHub) DeleteRepository(context.Context, github.Repository) error 
 }
 
 func (f *fakeGitHub) ListPullRequests(_ context.Context, _ github.Repository, state string) ([]github.PullRequest, error) {
-	f.listPullRequestsCalls++
 	if len(f.listPullRequestsErrs) > 0 {
 		err := f.listPullRequestsErrs[0]
 		f.listPullRequestsErrs = f.listPullRequestsErrs[1:]

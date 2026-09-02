@@ -21,7 +21,6 @@ import (
 )
 
 const (
-	defaultPollInterval = 30 * time.Second
 	// externalMergeReconcileLookupLimit bounds targeted GitHub reads per repo poll.
 	// A stale backlog drains over successive ticks without walking paginated closed
 	// PR history or allowing old task rows to dominate the daemon's API budget.
@@ -52,7 +51,6 @@ type Daemon struct {
 	// completed job. Supervisors use it to bind job-associated subprocess seams
 	// to the backend stored on that job; nil preserves the static Workflow.
 	WorkflowForJob func(context.Context, db.Job) (*workflow.Engine, error)
-	Sleep          func(context.Context, time.Duration) error
 	// Now is an injectable clock (test seam). It defaults to time.Now and is used
 	// to seed/advance the #566 issue-comment `since` cursor deterministically.
 	Now func() time.Time
@@ -97,41 +95,6 @@ type gitRemoteBranchChecker struct{}
 
 func (gitRemoteBranchChecker) RemoteBranches(ctx context.Context, checkout string, branches []string) (map[string]struct{}, error) {
 	return (gitutil.NewHostClient(checkout)).RemoteBranches(ctx, branches)
-}
-
-func (d Daemon) Run(ctx context.Context) error {
-	interval := d.PollInterval
-	if interval == 0 {
-		interval = defaultPollInterval
-	}
-	if interval < 0 {
-		return fmt.Errorf("poll interval must be positive")
-	}
-	if err := d.validate(); err != nil {
-		return err
-	}
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		// Continuing past a poll error is deliberate and pinned by
-		// TestRunContinuesAfterPollError: one bad tick must not stop the watcher.
-		// REPORTING it is equally deliberate. A discarded error made this loop
-		// indistinguishable from a healthy one, which is tolerable while every error is
-		// transient and self-describing elsewhere -- and stops being tolerable the moment
-		// a CALLER DEFECT can reach here. #1381 made the merge gate REFUSE a malformed
-		// gate miss instead of panicking, exactly so an unattended daemon survives it; a
-		// refusal nobody can observe converts that panic into silence, which is the worse
-		// of the two. The task stays retryable and fails identically every interval with
-		// nothing emitted anywhere. Log it and keep polling.
-		if err := d.PollOnce(ctx); err != nil {
-			d.logf("poll error: %v", err)
-		}
-		if err := d.sleep(ctx, interval); err != nil {
-			return err
-		}
-	}
 }
 
 func (d Daemon) PollOnce(ctx context.Context) error {
@@ -529,7 +492,7 @@ func (d Daemon) reconcilePROpenTasks(ctx context.Context, pulls []github.PullReq
 // (#1562). The merge gate already separates an operational/branch-staleness/infra
 // condition from an authoritative quality rejection, but that classification used
 // to live only on the returned decision, so nothing outside the blocking call
-// stack could act on it: daemon.pullRequestReadyToMerge admits ready_to_merge
+// stack could act on it: daemon.lookupReadyPullRequestTask admits ready_to_merge
 // only, engine_pr_lifecycle's non-merged close branch omits blocked, and
 // `task resume-work` refuses blocked. Measured on review-pr-1699-3f3a1026, whose
 // dirty-worktree block outlived the dirt by 95 minutes and cleared only when a
@@ -2198,17 +2161,6 @@ func reviewTaskBoundToPullHead(task db.Task, repoFullName string, pull github.Pu
 	return false, nil
 }
 
-func (d Daemon) pullRequestReadyToMerge(ctx context.Context, pull github.PullRequest) (bool, error) {
-	_, err := d.lookupReadyPullRequestTask(ctx, pull, nil)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
-}
-
 func (d Daemon) handleReadyToMergeWorkflow(ctx context.Context, pull github.PullRequest, task db.Task) error {
 	if d.Workflow == nil {
 		return nil
@@ -3304,20 +3256,6 @@ func (d Daemon) markIssueCommentSeen(ctx context.Context, issue github.Issue, co
 func (d Daemon) ack(ctx context.Context, issueNumber int64, body string) error {
 	_, err := d.GitHub.PostIssueComment(ctx, d.Repo, issueNumber, body)
 	return err
-}
-
-func (d Daemon) sleep(ctx context.Context, duration time.Duration) error {
-	if d.Sleep != nil {
-		return d.Sleep(ctx, duration)
-	}
-	timer := time.NewTimer(duration)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }
 
 type workflowTaskRef struct {

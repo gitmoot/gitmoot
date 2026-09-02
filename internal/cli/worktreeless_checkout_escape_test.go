@@ -8,27 +8,28 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // The #413 escape: a worktree-less delegation child (a delegation leg with an
 // empty WorktreePath) inherits its coordinator's branch but can only resolve the
 // repo's registered shared checkout, which sits on `main`. Before #413, the
-// implement/review arms of defaultCheckout validated that shared checkout against
+// implement/review arms of defaultCheckoutForRunner validated that shared checkout against
 // payload.Branch and failed it with "checkout branch is main, not job branch
 // <X>" — even though the engine's delegation_worktree_skipped fallback runs the
 // child against the shared checkout (holding its branch lock) on purpose. #413
 // extends #389's ask-arm escape to the implement/review arms for that child only.
 //
 // These tests reuse the daemon checkout seams (a temp git checkout on `main`, the
-// real defaultCheckout) so they exercise the production code path end-to-end.
+// real defaultCheckoutForRunner) so they exercise the production code path end-to-end.
 
 // T1 (implement) + LOAD-BEARING: the escape fires for a worktree-less delegation
 // implement child (DelegationID set, WorktreePath "", Branch "feature-x") — it is
 // NOT rejected against the `main` checkout — AND validateImplementationLock still
 // runs (the unconditional branch-lock guard). This test FAILS against pre-fix
-// code, where defaultCheckout returns the "checkout branch is main, not job
-// branch feature-x" error from validateTargetCheckout before the lock is ever
+// code, where defaultCheckoutForRunner returns the "checkout branch is main, not job
+// branch feature-x" error from validateTargetCheckoutForRunner before the lock is ever
 // consulted.
 func TestDefaultCheckoutEscapesWorktreelessDelegationImplementChild(t *testing.T) {
 	ctx := context.Background()
@@ -55,10 +56,10 @@ func TestDefaultCheckoutEscapesWorktreelessDelegationImplementChild(t *testing.T
 	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "owner/repo", Branch: "feature-x", Owner: "someone-else"}); err != nil || !acquired {
 		t.Fatalf("AcquireLock returned (%v, %v)", acquired, err)
 	}
-	if _, err := worker.defaultCheckout(ctx, job, child, agent); err == nil {
-		t.Fatal("defaultCheckout accepted a worktree-less implement child whose branch lock is held by another owner")
+	if _, err := worker.defaultCheckoutForRunner(ctx, job, child, agent, subprocess.ExecRunner{}); err == nil {
+		t.Fatal("defaultCheckoutForRunner accepted a worktree-less implement child whose branch lock is held by another owner")
 	} else if strings.Contains(err.Error(), "not job branch") {
-		t.Fatalf("escape did not fire: defaultCheckout still validated the shared checkout against the job branch: %v", err)
+		t.Fatalf("escape did not fire: defaultCheckoutForRunner still validated the shared checkout against the job branch: %v", err)
 	} else if !strings.Contains(err.Error(), "locked by") {
 		t.Fatalf("expected an implementation-lock error, got: %v", err)
 	}
@@ -69,17 +70,17 @@ func TestDefaultCheckoutEscapesWorktreelessDelegationImplementChild(t *testing.T
 	}
 
 	// Now hold the branch lock for the child's agent: the escape skips the branch
-	// guard AND validateImplementationLock passes, so defaultCheckout returns the
+	// guard AND validateImplementationLock passes, so defaultCheckoutForRunner returns the
 	// shared checkout with NO error.
 	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "owner/repo", Branch: "feature-x", Owner: agent.Name}); err != nil || !acquired {
 		t.Fatalf("AcquireLock returned (%v, %v)", acquired, err)
 	}
-	got, err := worker.defaultCheckout(ctx, job, child, agent)
+	got, err := worker.defaultCheckoutForRunner(ctx, job, child, agent, subprocess.ExecRunner{})
 	if err != nil {
-		t.Fatalf("defaultCheckout rejected a worktree-less implement child holding its branch lock: %v", err)
+		t.Fatalf("defaultCheckoutForRunner rejected a worktree-less implement child holding its branch lock: %v", err)
 	}
 	if got != checkout {
-		t.Fatalf("defaultCheckout = %q, want shared checkout %q", got, checkout)
+		t.Fatalf("defaultCheckoutForRunner = %q, want shared checkout %q", got, checkout)
 	}
 }
 
@@ -100,9 +101,9 @@ func TestDefaultCheckoutKeepsBranchGuardForNormalImplementJob(t *testing.T) {
 		// No DelegationID and no WorktreePath: an ordinary implement job.
 	}
 	job := db.Job{ID: "normal-impl", Type: "implement"}
-	_, err := worker.defaultCheckout(ctx, job, normal, runtime.Agent{Name: "impl-agent"})
+	_, err := worker.defaultCheckoutForRunner(ctx, job, normal, runtime.Agent{Name: "impl-agent"}, subprocess.ExecRunner{})
 	if err == nil {
-		t.Fatal("defaultCheckout accepted a normal implement job whose branch does not match the checkout")
+		t.Fatal("defaultCheckoutForRunner accepted a normal implement job whose branch does not match the checkout")
 	}
 	if !strings.Contains(err.Error(), "checkout branch is main, not job branch feature-x") {
 		t.Fatalf("expected the branch-identity guard to fire, got: %v", err)
@@ -111,7 +112,7 @@ func TestDefaultCheckoutKeepsBranchGuardForNormalImplementJob(t *testing.T) {
 
 // T3 worktree delegation child unaffected: a delegation child WITH a worktree
 // (DelegationID + WorktreePath set) still routes through the existing
-// isDelegationWorktreeChild validation in validateTargetCheckout — a wrong-branch
+// isDelegationWorktreeChild validation in validateTargetCheckoutForRunner — a wrong-branch
 // worktree fails, a right-branch worktree passes. The new escape (gated on an
 // EMPTY WorktreePath) must not touch this path.
 func TestDefaultCheckoutLeavesWorktreeDelegationChildValidated(t *testing.T) {
@@ -133,8 +134,8 @@ func TestDefaultCheckoutLeavesWorktreeDelegationChildValidated(t *testing.T) {
 		ParentJobID:  "coordinator-job",
 		WorktreePath: rightCheckout, // worktree present and on the job branch
 	}
-	if _, err := worker.defaultCheckout(ctx, db.Job{ID: "wt-right", Type: "implement"}, rightChild, agent); err != nil {
-		t.Fatalf("defaultCheckout rejected a worktree delegation child on its job branch: %v", err)
+	if _, err := worker.defaultCheckoutForRunner(ctx, db.Job{ID: "wt-right", Type: "implement"}, rightChild, agent, subprocess.ExecRunner{}); err != nil {
+		t.Fatalf("defaultCheckoutForRunner rejected a worktree delegation child on its job branch: %v", err)
 	}
 
 	// Wrong-branch worktree: the child's worktree is on `main`, not its job branch
@@ -154,9 +155,9 @@ func TestDefaultCheckoutLeavesWorktreeDelegationChildValidated(t *testing.T) {
 		ParentJobID:  "coordinator-job",
 		WorktreePath: wrongCheckout, // worktree present but on the wrong branch
 	}
-	_, err := wrongWorker.defaultCheckout(ctx, db.Job{ID: "wt-wrong", Type: "implement"}, wrongChild, agent)
+	_, err := wrongWorker.defaultCheckoutForRunner(ctx, db.Job{ID: "wt-wrong", Type: "implement"}, wrongChild, agent, subprocess.ExecRunner{})
 	if err == nil {
-		t.Fatal("defaultCheckout accepted a worktree delegation child on the wrong branch")
+		t.Fatal("defaultCheckoutForRunner accepted a worktree delegation child on the wrong branch")
 	}
 	if !strings.Contains(err.Error(), "not job branch feature-x") {
 		t.Fatalf("expected the worktree branch check to fire, got: %v", err)
@@ -164,7 +165,7 @@ func TestDefaultCheckoutLeavesWorktreeDelegationChildValidated(t *testing.T) {
 }
 
 // T4 read-only review escape: a worktree-less delegation review child (no
-// TaskID/PR pairing, so it takes the validateTargetCheckout branch) runs against
+// TaskID/PR pairing, so it takes the validateTargetCheckoutForRunner branch) runs against
 // the shared `main` checkout with NO error. Review is read-only, so the escape is
 // trivially safe and there is no branch lock involved.
 func TestDefaultCheckoutEscapesWorktreelessDelegationReviewChild(t *testing.T) {
@@ -179,15 +180,15 @@ func TestDefaultCheckoutEscapesWorktreelessDelegationReviewChild(t *testing.T) {
 		Branch:       "feature-x",
 		DelegationID: "d-review",
 		ParentJobID:  "coordinator-job",
-		// No WorktreePath, no TaskID, no PullRequest: the else-arm validateTargetCheckout path.
+		// No WorktreePath, no TaskID, no PullRequest: the else-arm validateTargetCheckoutForRunner path.
 	}
 	job := db.Job{ID: "review-child", Type: "review"}
-	got, err := worker.defaultCheckout(ctx, job, child, runtime.Agent{Name: "review-agent"})
+	got, err := worker.defaultCheckoutForRunner(ctx, job, child, runtime.Agent{Name: "review-agent"}, subprocess.ExecRunner{})
 	if err != nil {
-		t.Fatalf("defaultCheckout rejected a worktree-less review child: %v", err)
+		t.Fatalf("defaultCheckoutForRunner rejected a worktree-less review child: %v", err)
 	}
 	if got != checkout {
-		t.Fatalf("defaultCheckout = %q, want shared checkout %q", got, checkout)
+		t.Fatalf("defaultCheckoutForRunner = %q, want shared checkout %q", got, checkout)
 	}
 }
 
@@ -204,12 +205,12 @@ func TestDefaultCheckoutKeepsBranchGuardForNormalReviewJob(t *testing.T) {
 	normal := workflow.JobPayload{
 		Repo:   "owner/repo",
 		Branch: "feature-x",
-		// No DelegationID, no WorktreePath, no TaskID/PR -> validateTargetCheckout.
+		// No DelegationID, no WorktreePath, no TaskID/PR -> validateTargetCheckoutForRunner.
 	}
 	job := db.Job{ID: "normal-review", Type: "review"}
-	_, err := worker.defaultCheckout(ctx, job, normal, runtime.Agent{Name: "review-agent"})
+	_, err := worker.defaultCheckoutForRunner(ctx, job, normal, runtime.Agent{Name: "review-agent"}, subprocess.ExecRunner{})
 	if err == nil {
-		t.Fatal("defaultCheckout accepted a normal review job whose branch does not match the checkout")
+		t.Fatal("defaultCheckoutForRunner accepted a normal review job whose branch does not match the checkout")
 	}
 	if !strings.Contains(err.Error(), "checkout branch is main, not job branch feature-x") {
 		t.Fatalf("expected the branch-identity guard to fire, got: %v", err)

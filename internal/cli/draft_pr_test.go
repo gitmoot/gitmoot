@@ -8,11 +8,13 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/github/githubtest"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 type draftRecordingGitHub struct {
-	github.NoopClient
+	githubtest.NoopClient
 	input github.CreatePullRequestInput
 	pr    github.PullRequest
 }
@@ -82,7 +84,7 @@ func TestImplementationFinalizerOpensForgePullRequestInRequestedMode(t *testing.
 				TaskTitle: fixture.task.Title, LeadAgent: "lead", PullRequestReady: request.PullRequestReady,
 				Result: &workflow.AgentResult{Decision: "implemented", Summary: "done"},
 			}
-			finalized, err := (newHostDaemonImplementationFinalizer(fixture.store, gh)).FinalizeImplementation(
+			finalized, err := (daemonImplementationFinalizer{Store: fixture.store, GitHub: gh, Runner: subprocess.ExecRunner{}}).FinalizeImplementation(
 				context.Background(), db.Job{ID: "implement", Agent: "lead", Type: "implement"}, payload,
 			)
 			if err != nil {

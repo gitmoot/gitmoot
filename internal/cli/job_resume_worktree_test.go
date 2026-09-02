@@ -15,6 +15,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -409,9 +410,9 @@ func TestResumeSelfDirtyPredicate(t *testing.T) {
 				defer func() { taskWorktreeLiveness = previous }()
 			}
 
-			checkout, gotPayload, ok := fixture.worker.resumeSelfDirtyWorktree(ctx, job, payload, runtime.Agent{Name: "lead"}, cause)
+			checkout, gotPayload, ok := fixture.worker.resumeSelfDirtyWorktreeForRunner(ctx, job, payload, runtime.Agent{Name: "lead"}, cause, subprocess.ExecRunner{})
 			if ok || checkout != "" {
-				t.Fatalf("resumeSelfDirtyWorktree = (%q, ok=%v), want predicate miss", checkout, ok)
+				t.Fatalf("resumeSelfDirtyWorktreeForRunner = (%q, ok=%v), want predicate miss", checkout, ok)
 			}
 			if !reflect.DeepEqual(gotPayload, payload) {
 				t.Fatalf("predicate miss mutated payload: got=%+v want=%+v", gotPayload, payload)
@@ -518,7 +519,7 @@ func TestResumeSelfDirtyPredicateRequiresExactDirtyText(t *testing.T) {
 	job := db.Job{ID: "job", Type: "implement", State: string(workflow.JobQueued)}
 	payload := workflow.JobPayload{Repo: "owner/repo", Branch: "task", TaskID: "task"}
 	for _, cause := range []error{nil, errors.New("checkout is dirty"), errors.New("checkout head is abc, not job head def")} {
-		if checkout, got, ok := worker.resumeSelfDirtyWorktree(context.Background(), job, payload, runtime.Agent{Name: "lead"}, cause); ok || checkout != "" || !reflect.DeepEqual(got, payload) {
+		if checkout, got, ok := worker.resumeSelfDirtyWorktreeForRunner(context.Background(), job, payload, runtime.Agent{Name: "lead"}, cause, subprocess.ExecRunner{}); ok || checkout != "" || !reflect.DeepEqual(got, payload) {
 			t.Fatalf("cause %v unexpectedly resumed: checkout=%q payload=%+v ok=%v", cause, checkout, got, ok)
 		}
 	}

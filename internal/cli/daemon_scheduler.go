@@ -1260,7 +1260,7 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 // reclaimAgedTerminalDelegationWorktrees closes the cleanup crash window that
 // has no _cleanup_skipped marker. The bounded store query selects only FINAL
 // owners older than the configured TTL. Re-verification happens both here and
-// in Engine.ReclaimAgedTerminalDelegationWorktree; blocked/queued/running jobs
+// in Engine.ReclaimAgedTerminalDelegationWorktreeOutcome; blocked/queued/running jobs
 // are never force-removed.
 func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string, checkoutHeld func(string) bool, cand *tickCandidates, now time.Time, ttl time.Duration) error {
 	if ttl <= 0 {

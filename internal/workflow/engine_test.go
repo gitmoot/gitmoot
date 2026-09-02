@@ -253,7 +253,7 @@ func TestDispatchDelegationsTwoImplementSiblingsGetSeparateWorktrees(t *testing.
 	if len(manager.calls) != 2 {
 		t.Fatalf("AddWorktree calls = %+v, want two", manager.calls)
 	}
-	// Each child's HeadSHA is cleared so validateTargetCheckout validates the
+	// Each child's HeadSHA is cleared so validateTargetCheckoutForRunner validates the
 	// fresh worktree HEAD instead of the stale parent SHA.
 	if payloadOne.HeadSHA != "" || payloadTwo.HeadSHA != "" {
 		t.Fatalf("delegated implement children must not inherit parent HeadSHA: d1=%q d2=%q", payloadOne.HeadSHA, payloadTwo.HeadSHA)

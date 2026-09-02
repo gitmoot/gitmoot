@@ -23,6 +23,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/github/githubtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -60,7 +61,7 @@ func mustListJobEvents(t *testing.T, store *db.Store, jobID string) []db.JobEven
 // whether CreatePullRequest was called so the test can prove the finalizer took
 // the idempotent adopt path instead of erroring on a 422 race.
 type stubEnsureGitHub struct {
-	github.NoopClient
+	githubtest.NoopClient
 	existing    github.PullRequest
 	ensureCalls int
 	createCalls int
@@ -85,7 +86,7 @@ func (s *stubEnsureGitHub) CreatePullRequest(context.Context, github.CreatePullR
 // flag must be durable BEFORE the daemon-watched PR becomes observable, or the
 // PR-watcher can fan out native reviews in the gap.
 type stubSkipFlagAtOpenGitHub struct {
-	github.NoopClient
+	githubtest.NoopClient
 	store      *db.Store
 	repo       string
 	branch     string
@@ -367,7 +368,7 @@ func (f *daemonGitRunner) wantArgs(t *testing.T, index int, want ...string) {
 }
 
 type cliPollFakeGitHub struct {
-	github.NoopClient
+	githubtest.NoopClient
 	pulls                 []github.PullRequest
 	comments              map[int64][]github.IssueComment
 	listErr               error
@@ -744,7 +745,7 @@ func seedDelegationCoordinator(t *testing.T, store *db.Store, parentID string, d
 
 	worker := defaultJobWorker(store, io.Discard)
 	worker.WorkflowFactory = func(checkout string) workflow.Engine {
-		return daemonWorkflowEngine(store, github.NoopClient{}, checkout, "")
+		return daemonWorkflowEngine(store, githubtest.NoopClient{}, checkout, "")
 	}
 	engine := worker.WorkflowFactory("")
 	if err := engine.AdvanceJob(ctx, parentID); err != nil {

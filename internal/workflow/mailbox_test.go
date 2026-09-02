@@ -17,6 +17,16 @@ import (
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
+// ExcludedDeliveryWorktreeResolver is an explicit sentinel for a test context
+// that intentionally does not observe implement worktrees. Production exclusions
+// are selected by a shape-specific CLI predicate, so this lives with the tests
+// that are its only callers.
+func ExcludedDeliveryWorktreeResolver(source string) DeliveryWorktreeResolver {
+	return func(context.Context, db.Job, JobPayload) (DeliveryWorktreeResolution, error) {
+		return DeliveryWorktreeResolution{ExcludedSource: strings.TrimSpace(source)}, nil
+	}
+}
+
 func TestTerminalWriteContextSurvivesRunCancellationAndHasGraceDeadline(t *testing.T) {
 	runCtx, stopRun := context.WithCancel(context.Background())
 	stopRun()

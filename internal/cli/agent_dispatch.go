@@ -1265,13 +1265,10 @@ func validateFixPassTaskWorktreeHead(ctx context.Context, task db.Task, pr githu
 	return nil
 }
 
-// resolveLocalImplementBase returns the exact commit an implement worktree must
-// start from. A CLI value wins over [workflow].implement_base. With neither set,
-// HEAD preserves checkout-following behavior after the stale-feature guard.
-func resolveLocalImplementBase(ctx context.Context, paths config.Paths, record db.Repo, requested string) (string, error) {
-	return resolveLocalImplementBaseForRunner(ctx, paths, record, requested, subprocess.ExecRunner{})
-}
-
+// resolveLocalImplementBaseForRunner returns the exact commit an implement
+// worktree must start from. A CLI value wins over [workflow].implement_base.
+// With neither set, HEAD preserves checkout-following behavior after the
+// stale-feature guard.
 func resolveLocalImplementBaseForRunner(ctx context.Context, paths config.Paths, record db.Repo, requested string, runner subprocess.Runner) (string, error) {
 	base := strings.TrimSpace(requested)
 	if base == "" {

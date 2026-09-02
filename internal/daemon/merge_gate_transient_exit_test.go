@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,21 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
+// pullRequestReadyToMerge reports whether this PR resolves to exactly one ready
+// task, which is the admission question the PR poll asks. It is test-only: the
+// poll itself needs the task row, so daemon.go calls lookupReadyPullRequestTask
+// directly and only these tests want the bare yes/no.
+func (d Daemon) pullRequestReadyToMerge(ctx context.Context, pull github.PullRequest) (bool, error) {
+	_, err := d.lookupReadyPullRequestTask(ctx, pull, nil)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // seedBlockedReviewTask stages the exact live shape from #1562: the local review
 // task review-pr-1699-3f3a1026, blocked by the merge gate while its pull request
 // is still open.
@@ -21,7 +37,7 @@ import (
 // The empty Branch is load-bearing, not incidental. A local review task
 // deliberately carries no branch so it cannot collide with the implement task that
 // owns (repo, head branch), and that is precisely why the wedge survived: every
-// branch-keyed path — daemon.pullRequestReadyToMerge, handleReadyToMergeWorkflow,
+// branch-keyed path — daemon.lookupReadyPullRequestTask, handleReadyToMergeWorkflow,
 // reconcilePROpenTasks — resolves tasks from pull.HeadRef and cannot see this row.
 // A fixture with a branch would be released by reconcilePROpenTasks instead and
 // would therefore pass against a fix that never runs.

@@ -212,11 +212,11 @@ func TestParseCommandsMarkdownCodeEdges(t *testing.T) {
 		"```text",
 		"/gitmoot ask helper unclosed fence",
 	}, "\n")
-	if commands := ParseCommandsWithoutAuthorization(body); len(commands) != 0 {
+	if commands := parseCommandsWithoutAuthorization(body); len(commands) != 0 {
 		t.Fatalf("fenced edge cases parsed commands = %+v, want none", commands)
 	}
 
-	commands := ParseCommandsWithoutAuthorization("Use `/gitmoot ask helper inline` as documentation.\n/gitmoot status")
+	commands := parseCommandsWithoutAuthorization("Use `/gitmoot ask helper inline` as documentation.\n/gitmoot status")
 	if len(commands) != 1 || commands[0].Action != "status" {
 		t.Fatalf("inline stripping commands = %+v, want only status", commands)
 	}

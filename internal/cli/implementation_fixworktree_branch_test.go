@@ -10,8 +10,9 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/github/githubtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -76,7 +77,7 @@ func TestFixWorktreeFinalizerDeliversPayloadBranchWhenTaskHasNone(t *testing.T) 
 		Repo: "owner/repo", Branch: branch, PullRequest: 1523, TaskID: "review-pr-1523-deadbeef",
 		FixWorktree: true, WorktreePath: fixWorktree, Result: &workflow.AgentResult{Decision: "implemented"},
 	}
-	delivered, err := (newHostDaemonImplementationFinalizer(store, github.NoopClient{})).FinalizeImplementation(
+	delivered, err := (daemonImplementationFinalizer{Store: store, GitHub: githubtest.NoopClient{}, Runner: subprocess.ExecRunner{}}).FinalizeImplementation(
 		ctx, db.Job{ID: "fix-delivers", Agent: "lead", Type: "implement"}, payload)
 	if err != nil {
 		t.Fatalf("FinalizeImplementation returned error: %v", err)
@@ -174,9 +175,9 @@ func TestImplementationFinalizationTargetOrdinaryJobTaskBranchWins(t *testing.T)
 	if err := store.UpsertTask(ctx, task); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
-	target, err := implementationFinalizationTargetFor(ctx, store, db.Job{ID: "ordinary", Agent: "lead", Type: "implement"}, payload, implementationFinalizationAfterRun)
+	target, err := implementationFinalizationTargetForRunner(ctx, store, db.Job{ID: "ordinary", Agent: "lead", Type: "implement"}, payload, implementationFinalizationAfterRun, subprocess.ExecRunner{})
 	if err != nil {
-		t.Fatalf("implementationFinalizationTargetFor returned error: %v", err)
+		t.Fatalf("implementationFinalizationTargetForRunner returned error: %v", err)
 	}
 	if target.Task.Branch != "feature/task-branch" {
 		t.Fatalf("resolved branch = %q, want the task branch for an ordinary job", target.Task.Branch)
@@ -232,7 +233,7 @@ func TestImplementationFinalizationTargetRefusesCheckoutOffResolvedBranch(t *tes
 			if err := store.UpsertTask(ctx, test.task); err != nil {
 				t.Fatalf("UpsertTask returned error: %v", err)
 			}
-			_, err := implementationFinalizationTargetFor(ctx, store, db.Job{ID: "guard", Agent: "lead", Type: "implement"}, test.payload, implementationFinalizationAfterRun)
+			_, err := implementationFinalizationTargetForRunner(ctx, store, db.Job{ID: "guard", Agent: "lead", Type: "implement"}, test.payload, implementationFinalizationAfterRun, subprocess.ExecRunner{})
 			var blocked workflow.BlockedError
 			if !errors.As(err, &blocked) || !blocked.ResultDeliveryFailed {
 				t.Fatalf("error = %v, want result-delivery BlockedError", err)
@@ -273,9 +274,9 @@ func TestImplementationFinalizationTargetFixWorktreeOverridesAreSymmetric(t *tes
 	}
 	job := db.Job{ID: "symmetry", Agent: "lead", Type: "implement"}
 
-	target, err := implementationFinalizationTargetFor(ctx, store, job, payload, implementationFinalizationAfterRun)
+	target, err := implementationFinalizationTargetForRunner(ctx, store, job, payload, implementationFinalizationAfterRun, subprocess.ExecRunner{})
 	if err != nil {
-		t.Fatalf("implementationFinalizationTargetFor returned error: %v", err)
+		t.Fatalf("implementationFinalizationTargetForRunner returned error: %v", err)
 	}
 	t.Run("worktree path override", func(t *testing.T) {
 		if target.WorktreePath != realWorktree {
@@ -301,9 +302,9 @@ func TestImplementationFinalizationMissingBranchMessageIsAccurate(t *testing.T) 
 		if err := store.UpsertTask(ctx, db.Task{ID: "task-msg-fix", RepoFullName: "owner/repo", WorktreePath: t.TempDir()}); err != nil {
 			t.Fatalf("UpsertTask returned error: %v", err)
 		}
-		_, err := implementationFinalizationTargetFor(ctx, store, job, workflow.JobPayload{
+		_, err := implementationFinalizationTargetForRunner(ctx, store, job, workflow.JobPayload{
 			Repo: "owner/repo", TaskID: "task-msg-fix", FixWorktree: true, WorktreePath: t.TempDir(),
-		}, implementationFinalizationBeforeRun)
+		}, implementationFinalizationBeforeRun, subprocess.ExecRunner{})
 		var blocked workflow.BlockedError
 		if !errors.As(err, &blocked) || !blocked.ResultDeliveryFailed {
 			t.Fatalf("error = %v, want result-delivery BlockedError", err)
@@ -320,9 +321,9 @@ func TestImplementationFinalizationMissingBranchMessageIsAccurate(t *testing.T) 
 		if err := store.UpsertTask(ctx, db.Task{ID: "task-msg-ordinary", RepoFullName: "owner/repo", WorktreePath: t.TempDir()}); err != nil {
 			t.Fatalf("UpsertTask returned error: %v", err)
 		}
-		_, err := implementationFinalizationTargetFor(ctx, store, job, workflow.JobPayload{
+		_, err := implementationFinalizationTargetForRunner(ctx, store, job, workflow.JobPayload{
 			Repo: "owner/repo", Branch: "feature/hint", TaskID: "task-msg-ordinary",
-		}, implementationFinalizationBeforeRun)
+		}, implementationFinalizationBeforeRun, subprocess.ExecRunner{})
 		var blocked workflow.BlockedError
 		if !errors.As(err, &blocked) || !blocked.ResultDeliveryFailed {
 			t.Fatalf("error = %v, want result-delivery BlockedError", err)
@@ -345,10 +346,10 @@ func TestImplementationFinalizationMissingBranchMessageIsAccurate(t *testing.T) 
 			t.Fatalf("UpsertTask returned error: %v", err)
 		}
 		head := strings.TrimSpace(runGitOutput(t, worktree, "rev-parse", "HEAD"))
-		_, err := implementationFinalizationTargetFor(ctx, store, job, workflow.JobPayload{
+		_, err := implementationFinalizationTargetForRunner(ctx, store, job, workflow.JobPayload{
 			Repo: "owner/repo", Branch: "feature/has-branch", HeadSHA: head, TaskID: "task-msg-ok",
 			FixWorktree: true, WorktreePath: worktree,
-		}, implementationFinalizationBeforeRun)
+		}, implementationFinalizationBeforeRun, subprocess.ExecRunner{})
 		if err != nil {
 			t.Fatalf("the case the old message lied about must now resolve, got: %v", err)
 		}

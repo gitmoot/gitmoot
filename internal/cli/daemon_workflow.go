@@ -266,10 +266,6 @@ type daemonImplementationFinalizer struct {
 	Runner           subprocess.Runner
 }
 
-func newHostDaemonImplementationFinalizer(store *db.Store, gh github.Client) daemonImplementationFinalizer {
-	return daemonImplementationFinalizer{Store: store, GitHub: gh, Runner: subprocess.ExecRunner{}}
-}
-
 type implementationFinalizationTarget struct {
 	Task         db.Task
 	WorktreePath string
@@ -283,9 +279,10 @@ const (
 	implementationFinalizationBeforeRun
 )
 
-// implementationFinalizationTargetFor resolves the durable task fields required
-// to deliver an implementation. The advance preflight and the finalizer both
-// call this predicate so an early refusal cannot drift from the late backstop.
+// implementationFinalizationTargetForRunner resolves the durable task fields
+// required to deliver an implementation. The advance preflight and the finalizer
+// both call this predicate so an early refusal cannot drift from the late
+// backstop.
 //
 // The delivery branch is resolved once, with the same FixWorktree override the
 // worktree path uses: for a fix job the PAYLOAD owns the branch — advance-created
@@ -293,10 +290,6 @@ const (
 // legitimately carry no branch (#1523) — while for any other job the TASK owns it.
 // The returned task copy carries the resolved branch so the finalizer pushes and
 // opens the pull request for exactly the branch this predicate validated.
-func implementationFinalizationTargetFor(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload, phase implementationFinalizationPhase) (implementationFinalizationTarget, error) {
-	return implementationFinalizationTargetForRunner(ctx, store, job, payload, phase, subprocess.ExecRunner{})
-}
-
 func implementationFinalizationTargetForRunner(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload, phase implementationFinalizationPhase, runner subprocess.Runner) (implementationFinalizationTarget, error) {
 	switch phase {
 	case implementationFinalizationBeforeRun, implementationFinalizationAfterRun:
@@ -329,7 +322,7 @@ func implementationFinalizationTargetForRunner(ctx context.Context, store *db.St
 	// delivering to the wrong branch.
 	//
 	// The unconditional FixWorktree override depends on the producer side:
-	// allocateFixWorktree (fix_worktree.go) hard-errors "fix worktree branch
+	// allocateFixWorktreeForRunner (fix_worktree.go) hard-errors "fix worktree branch
 	// is required" on a blank branch before dispatchFix ever sets
 	// FixWorktree=true, so a fix job cannot reach this predicate with an empty
 	// payload.Branch that would clobber a valid task.Branch.
@@ -708,10 +701,6 @@ func newDaemonMergeGate(store *db.Store, gh github.Client, checkout, home string
 	}
 }
 
-func newHostDaemonMergeGate(store *db.Store, gh github.Client, checkout, home string) daemonMergeGate {
-	return newDaemonMergeGate(store, gh, checkout, home, subprocess.ExecRunner{})
-}
-
 func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeRequest) (workflow.MergeDecision, error) {
 	recoveryOnly := request.PullRequestMerged
 	request.TerminalRecoveryOnly = recoveryOnly
@@ -975,10 +964,6 @@ func (g daemonMergeGate) githubClient(checkout string) github.Client {
 	return jobGitHubClient(checkout, g.GitHub, g.Runner)
 }
 
-func newDaemonPolicyMergeGate(store *db.Store, gh github.Client, checkout string) workflow.PolicyMergeGate {
-	return newDaemonPolicyMergeGateForRunner(store, gh, checkout, subprocess.ExecRunner{})
-}
-
 func newDaemonPolicyMergeGateForRunner(store *db.Store, gh github.Client, checkout string, runner subprocess.Runner) workflow.PolicyMergeGate {
 	return workflow.PolicyMergeGate{
 		Store:        store,
@@ -988,10 +973,6 @@ func newDaemonPolicyMergeGateForRunner(store *db.Store, gh github.Client, checko
 		CheckoutPath: checkout,
 		DeleteBranch: true,
 	}
-}
-
-func refreshDaemonJobPayload(ctx context.Context, store *db.Store, checkout string, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
-	return refreshDaemonJobPayloadForRunner(ctx, store, checkout, job, payload, subprocess.ExecRunner{})
 }
 
 func refreshDaemonJobPayloadForRunner(ctx context.Context, store *db.Store, checkout string, job db.Job, payload workflow.JobPayload, runner subprocess.Runner) (workflow.JobPayload, error) {

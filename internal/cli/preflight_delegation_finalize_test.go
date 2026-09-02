@@ -67,7 +67,7 @@ func newPreflightHarnessForAction(t *testing.T, failPolicy string, failingAction
 
 	worker := defaultJobWorker(store, io.Discard)
 	// The shared checkout sits on main; a worktree-less child inherits a non-main
-	// branch, so validateTargetCheckout rejects it. Stage that exact failure with
+	// branch, so validateTargetCheckoutForRunner rejects it. Stage that exact failure with
 	// no git setup.
 	worker.CheckoutValidator = func(_ context.Context, _ db.Job, payload workflow.JobPayload, _ runtime.Agent) (string, error) {
 		return "", checkoutMismatch(payload.Branch)

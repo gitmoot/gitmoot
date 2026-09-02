@@ -14,6 +14,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/github/githubtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -217,7 +218,7 @@ func TestRecoverAdvanceErrorOutput(t *testing.T) {
 }
 
 type reviewLoopPullRequestClient struct {
-	github.NoopClient
+	githubtest.NoopClient
 	pr github.PullRequest
 }
 
@@ -698,7 +699,7 @@ func TestReviewDispatchRoutesChangesRequestedFixToTaskImplementer(t *testing.T) 
 			}
 			adapter := installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"changes_requested","severity":"P1","summary":"fix the edge case","findings":[{"severity":"P1","description":"edge case"}],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`)
 			previousGitHubFactory := newAgentDispatchGitHubClient
-			newAgentDispatchGitHubClient = func(string) github.Client { return github.NoopClient{} }
+			newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
 			t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
 
 			args := []string{

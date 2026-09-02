@@ -153,11 +153,6 @@ var defaultRuntimeContractChecker = NewRuntimeContractChecker(subprocess.GroupRu
 
 func DefaultRuntimeContractChecker() *RuntimeContractChecker { return defaultRuntimeContractChecker }
 
-// Check evaluates requirements used by an ordinary, non-plan delivery.
-func (c *RuntimeContractChecker) Check(ctx context.Context, agent Agent) RuntimeContractResult {
-	return c.CheckRequest(ctx, agent, RuntimeContractRequest{})
-}
-
 // CheckRequest evaluates only requirements used by this agent and request's
 // concrete argv. Request-scoped features must not be inferred from static agent
 // metadata.

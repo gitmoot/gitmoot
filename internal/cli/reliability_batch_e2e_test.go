@@ -237,7 +237,7 @@ func TestResumableGatesDoNotBypassAwaitingHumanE2E(t *testing.T) {
 // -----------------------------------------------------------------------------
 // CHAIN B — #684 review re-sync when the PR branch advances.
 //
-// The existing unit tests (review_head_resync_test.go) call defaultCheckout
+// The existing unit tests (review_head_resync_test.go) call defaultCheckoutForRunner
 // directly and cover open-resync / closed-fail / wrong-branch-decline. This chain
 // extends coverage to the FULL worker tick: a real local git repo whose branch
 // advanced past the pinned head, driven through the REAL worker checkout path and
@@ -289,7 +289,7 @@ func TestReviewResyncFullChainDeliversOnOpenPRE2E(t *testing.T) {
 		TaskID:      "review-task-e2e-1", // no task row -> resolves the shared checkout
 	})
 
-	// Build a worker that runs the REAL defaultCheckout (so the re-sync actually
+	// Build a worker that runs the REAL defaultCheckoutForRunner (so the re-sync actually
 	// happens) but captures delivery with a fake adapter and drops the merge gate so
 	// the approved review terminates locally with no GitHub call.
 	worker := defaultJobWorker(store, io.Discard)
@@ -380,9 +380,9 @@ func TestDefaultCheckoutDeclinesResyncWhenNoLocalPRRecordE2E(t *testing.T) {
 		t.Fatalf("daemonJobPayload returned error: %v", err)
 	}
 
-	_, err = worker.defaultCheckout(ctx, job, payload, runtime.Agent{Name: "reviewer"})
+	_, err = worker.defaultCheckoutForRunner(ctx, job, payload, runtime.Agent{Name: "reviewer"}, subprocess.ExecRunner{})
 	if err == nil {
-		t.Fatal("defaultCheckout re-synced a review with no local PR record; want a clean head-mismatch failure")
+		t.Fatal("defaultCheckoutForRunner re-synced a review with no local PR record; want a clean head-mismatch failure")
 	}
 	if !strings.Contains(err.Error(), "not review job head") {
 		t.Fatalf("expected the review head-mismatch error, got: %v", err)

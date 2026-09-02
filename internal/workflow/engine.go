@@ -474,7 +474,7 @@ func (e Engine) setTaskStateResolved(ctx context.Context, ref taskRef, state Tas
 	if err != nil || strings.TrimSpace(task.ID) == "" {
 		return "", err
 	}
-	// PersistTaskState, not a plain upsert: `planned` and `awaiting_human` are
+	// persistTaskStateOwned, not a plain upsert: `planned` and `awaiting_human` are
 	// merged-regression targets too (blocked now goes through the store's atomic
 	// BlockTaskWithEvent), and every target must refuse to overwrite a disposed row.
 	// Both exclusions live on the write, so a second daemon cannot win the race a
@@ -567,7 +567,7 @@ func (e Engine) resolveTaskState(ctx context.Context, ref taskRef, state TaskSta
 	return task, nil
 }
 
-// PersistTaskState is the guarded write point for automated task-state
+// persistTaskStateOwned is the guarded write point for automated task-state
 // advancement (#1673). Every exclusion it enforces lives on the conflict UPDATE,
 // so the advisory pre-reads in resolveTaskState cannot be invalidated between the
 // read and the write by another daemon — or by the same daemon earlier in the same
@@ -589,13 +589,9 @@ func (e Engine) resolveTaskState(ctx context.Context, ref taskRef, state TaskSta
 // `blocked` reaches the store through BlockTaskWithEvent, which carries its own
 // terminal-state conflict check; this covers the remaining regression targets
 // (`planned`, `awaiting_human`) and every ordinary advancement.
-func PersistTaskState(ctx context.Context, store *db.Store, task db.Task, state TaskState) (bool, error) {
-	return persistTaskStateOwned(ctx, store, task, state, nil)
-}
-
-// persistTaskStateOwned is PersistTaskState with an optional live-ownership
-// predicate carried INTO the write's transaction. own is nil for every ordinary
-// caller, which keeps that path byte-identical.
+//
+// own carries an optional live-ownership predicate INTO the write's transaction.
+// It is nil for every ordinary caller, which keeps that path byte-identical.
 func persistTaskStateOwned(ctx context.Context, store *db.Store, task db.Task, state TaskState, own *db.AdvanceOwnership) (bool, error) {
 	task.State = string(state)
 	forbidden, mergedGuarded := taskStateWriteExclusions(state)

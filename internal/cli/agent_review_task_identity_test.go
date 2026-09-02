@@ -12,6 +12,8 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/github/githubtest"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -157,7 +159,7 @@ func evaluateC1GateScenario(t *testing.T, implementTaskID string, reviewTaskID s
 			ReviewRound: "review-2", Result: &workflow.AgentResult{Decision: "approved", Summary: "round two approved"},
 		})
 	}
-	decision, err := (newHostDaemonMergeGate(store, gh, checkout, daemonMergeGateLiveOrgHome(t))).Evaluate(context.Background(), request)
+	decision, err := (newDaemonMergeGate(store, gh, checkout, daemonMergeGateLiveOrgHome(t), subprocess.ExecRunner{})).Evaluate(context.Background(), request)
 	if err != nil {
 		t.Fatalf("Evaluate: %v", err)
 	}
@@ -358,7 +360,7 @@ func TestFixWorktreeStrandReviewBindsImplementTaskE2E(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(fixWorktree, "fix.txt"), []byte("fix\n"), 0o644); err != nil {
 		t.Fatalf("write fix change: %v", err)
 	}
-	if _, err := (newHostDaemonImplementationFinalizer(store, github.NoopClient{})).FinalizeImplementation(
+	if _, err := (daemonImplementationFinalizer{Store: store, GitHub: githubtest.NoopClient{}, Runner: subprocess.ExecRunner{}}).FinalizeImplementation(
 		ctx, db.Job{ID: "fix-leg", Agent: "implementer", Type: "implement"}, workflow.JobPayload{
 			Repo: "owner/repo", Branch: branch, PullRequest: 1530, TaskID: "adhoc-impl",
 			FixWorktree: true, WorktreePath: fixWorktree,

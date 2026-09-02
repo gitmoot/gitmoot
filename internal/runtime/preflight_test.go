@@ -80,7 +80,7 @@ func newContractCheckerForTest(t *testing.T, content string) (*RuntimeContractCh
 func TestRuntimePreflightUnknownNeverBlocks(t *testing.T) {
 	checker, _, _ := newContractCheckerForTest(t, "unparseable")
 	agent := Agent{Name: "seat", Runtime: KimiRuntime, AutonomyPolicy: AutonomyPolicyAuto}
-	result := checker.Check(context.Background(), agent)
+	result := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{})
 	if result.State != RuntimeContractUnknown {
 		t.Fatalf("state = %q, want unknown", result.State)
 	}
@@ -92,7 +92,7 @@ func TestRuntimePreflightUnknownNeverBlocks(t *testing.T) {
 func TestRuntimePreflightUnsupportedErrorNamesRequiredFlag(t *testing.T) {
 	checker, _, _ := newContractCheckerForTest(t, "unsupported")
 	agent := Agent{Name: "seat", Runtime: KimiRuntime, AutonomyPolicy: AutonomyPolicyAuto}
-	result := checker.Check(context.Background(), agent)
+	result := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{})
 	if result.State != RuntimeContractUnsupported {
 		t.Fatalf("state = %q, want unsupported", result.State)
 	}
@@ -134,7 +134,7 @@ func TestRuntimePreflightScopesOmpPlanFlagsToPlanJobs(t *testing.T) {
 func TestRuntimePreflightReprobesChangedBinaryIdentity(t *testing.T) {
 	checker, runner, path := newContractCheckerForTest(t, "supported")
 	agent := Agent{Name: "seat", Runtime: KimiRuntime}
-	if got := checker.Check(context.Background(), agent).State; got != RuntimeContractSupported {
+	if got := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{}).State; got != RuntimeContractSupported {
 		t.Fatalf("initial state = %q, want supported", got)
 	}
 	if err := os.WriteFile(path, []byte("unsupported-and-longer"), 0o755); err != nil {
@@ -144,7 +144,7 @@ func TestRuntimePreflightReprobesChangedBinaryIdentity(t *testing.T) {
 	if err := os.Chtimes(path, stamp, stamp); err != nil {
 		t.Fatal(err)
 	}
-	if got := checker.Check(context.Background(), agent).State; got != RuntimeContractUnsupported {
+	if got := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{}).State; got != RuntimeContractUnsupported {
 		t.Fatalf("updated state = %q, want unsupported", got)
 	}
 	if got := runner.calls(); got != 2 {
@@ -157,12 +157,12 @@ func TestRuntimePreflightCachesUnchangedBinaryIdentity(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	checker.now = func() time.Time { return now }
 	agent := Agent{Name: "seat", Runtime: KimiRuntime}
-	result := checker.Check(context.Background(), agent)
+	result := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{})
 	if result.State != RuntimeContractSupported || result.Instrument != "binary-help" {
 		t.Fatalf("first result = %#v, want supported from binary-help", result)
 	}
 	now = now.Add(2 * unknownBinaryProbeTTL)
-	result = checker.Check(context.Background(), agent)
+	result = checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{})
 	if result.State != RuntimeContractSupported || result.Instrument != "binary-help" {
 		t.Fatalf("second result = %#v, want supported from binary-help", result)
 	}
@@ -178,18 +178,18 @@ func TestRuntimePreflightCachesUnknownProbeUntilTTL(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	checker.now = func() time.Time { return now }
 	agent := Agent{Name: "seat", Runtime: KimiRuntime}
-	if got := checker.Check(context.Background(), agent).State; got != RuntimeContractUnknown {
+	if got := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{}).State; got != RuntimeContractUnknown {
 		t.Fatalf("first state = %q, want unknown", got)
 	}
 	now = now.Add(unknownBinaryProbeTTL - time.Second)
-	if got := checker.Check(context.Background(), agent).State; got != RuntimeContractUnknown {
+	if got := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{}).State; got != RuntimeContractUnknown {
 		t.Fatalf("within-TTL state = %q, want cached unknown", got)
 	}
 	if got := runner.calls(); got != 1 {
 		t.Fatalf("within-TTL help probes = %d, want 1", got)
 	}
 	now = now.Add(time.Second)
-	if got := checker.Check(context.Background(), agent).State; got != RuntimeContractSupported {
+	if got := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{}).State; got != RuntimeContractSupported {
 		t.Fatalf("second state = %q, want supported after retry", got)
 	}
 	if got := runner.calls(); got != 2 {
@@ -211,7 +211,7 @@ func TestRuntimePreflightHonorsDeclaredPrecondition(t *testing.T) {
 		}},
 	})
 	agent := Agent{Name: "root-claude", Runtime: ClaudeRuntime, AutonomyPolicy: AutonomyPolicyDangerFullAccess}
-	result := checker.Check(context.Background(), agent)
+	result := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{})
 	if result.State != RuntimeContractUnsupported || result.Instrument != "effective-uid" {
 		t.Fatalf("precondition result = %#v, want unsupported from effective-uid", result)
 	}
@@ -229,7 +229,7 @@ func TestRuntimePreflightHonorsDeclaredPrecondition(t *testing.T) {
 		t.Fatalf("configured execution identity result = %#v, want supported effective uid 996", result)
 	}
 	checker.EffectiveUID = func() (int, bool) { return 0, false }
-	result = checker.Check(context.Background(), agent)
+	result = checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{})
 	if result.State != RuntimeContractUnknown || result.Instrument != "effective-uid" {
 		t.Fatalf("undecidable precondition result = %#v, want unknown from effective-uid", result)
 	}
@@ -241,37 +241,6 @@ func TestRuntimePreflightHonorsDeclaredPrecondition(t *testing.T) {
 func registryWithContractForTest(name string, contract RuntimeContract) Registry {
 	meta := RuntimeMetadata{Name: name, Dispatchable: true, Contract: contract}
 	return Registry{order: []string{name}, entries: map[string]RuntimeMetadata{name: meta}}
-}
-
-// TestCheckShimIsPlanFalse pins the legacy 2-arg Check shim to its one meaning: a
-// NON-plan delivery. It is a shim over CheckRequest, and an untested shim is how a
-// caller silently acquires the wrong contract — the foreground dispatch preflight
-// relies on it, so if Check ever stopped implying Plan:false a plan request would
-// dispatch with its flags unverified: a guard failing silently instead of loudly.
-//
-// The omp contract is used because it is the only one carrying PlanMode-scoped
-// requirements, and a stub help that omits the plan flags is what makes the two
-// answers differ at all.
-func TestCheckShimIsPlanFalse(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "omp")
-	if err := os.WriteFile(path, []byte("omp-without-plan"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	checker := NewRuntimeContractChecker(&contractProbeRunner{path: path}, BuiltinRuntimeRegistry())
-	agent := Agent{Name: "seat", Runtime: OmpRuntime, AutonomyPolicy: AutonomyPolicyWorkspaceWrite}
-
-	shim := checker.Check(context.Background(), agent)
-	explicit := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{Plan: false})
-	if shim.State != explicit.State {
-		t.Fatalf("Check state = %q but CheckRequest{Plan:false} = %q: the shim must mean exactly a non-plan delivery", shim.State, explicit.State)
-	}
-	if len(shim.Requirements) != len(explicit.Requirements) {
-		t.Fatalf("Check evaluated %d requirements, CheckRequest{Plan:false} evaluated %d", len(shim.Requirements), len(explicit.Requirements))
-	}
-	planned := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{Plan: true})
-	if len(planned.Requirements) <= len(shim.Requirements) {
-		t.Fatalf("a plan request evaluated %d requirements, no more than the non-plan %d: the plan scoping is inert, so this test could not detect a regression", len(planned.Requirements), len(shim.Requirements))
-	}
 }
 
 // TestInspectSkipsPlanScopedRequirements pins doctor's question. Inspect answers

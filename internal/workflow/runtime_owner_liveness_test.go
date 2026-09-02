@@ -129,24 +129,6 @@ func TestWorktreeLiveness(t *testing.T) {
 	})
 }
 
-func TestWorktreeOpenFileLivenessDetectsWriterHandle(t *testing.T) {
-	worktree := t.TempDir()
-	procRoot := t.TempDir()
-	processDir := filepath.Join(procRoot, "999999995")
-	fdDir := filepath.Join(processDir, "fd")
-	if err := os.MkdirAll(fdDir, 0o755); err != nil {
-		t.Fatalf("MkdirAll fd directory: %v", err)
-	}
-	target := filepath.Join(worktree, "open-output")
-	if err := os.Symlink(target, filepath.Join(fdDir, "3")); err != nil {
-		t.Fatalf("Symlink writer fd: %v", err)
-	}
-	live, known := worktreeOpenFileLiveness(worktree, procRoot)
-	if !live || !known {
-		t.Fatalf("open writer fd liveness = (%v, %v), want (true, true)", live, known)
-	}
-}
-
 // The boolean seam is an injection point: its answer must be taken verbatim, in
 // both directions, so a wired test or recovery caller does not silently depend on
 // the host process table. The strict scan is what production gets.

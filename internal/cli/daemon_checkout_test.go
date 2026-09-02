@@ -12,13 +12,14 @@ import (
 	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 func TestValidateTargetCheckoutSkipsHeadShaForDelegationWorktreeChild(t *testing.T) {
 	// A delegated implement child runs in its own freshly-allocated worktree whose
 	// HEAD is the base-branch tip at allocation time; the dispatcher clears the
-	// inherited parent HeadSHA. validateTargetCheckout must not reject such a child
+	// inherited parent HeadSHA. validateTargetCheckoutForRunner must not reject such a child
 	// even when its payload HeadSHA is empty or stale, as long as the worktree is
 	// on the job branch and clean. A non-delegation job with a mismatched HeadSHA
 	// must still be rejected.
@@ -34,16 +35,16 @@ func TestValidateTargetCheckoutSkipsHeadShaForDelegationWorktreeChild(t *testing
 		ParentJobID:  "parent-job",
 		WorktreePath: checkout,
 	}
-	if err := worker.validateTargetCheckout(ctx, delegationPayload, checkout); err != nil {
-		t.Fatalf("validateTargetCheckout rejected delegation worktree child: %v", err)
+	if err := worker.validateTargetCheckoutForRunner(ctx, delegationPayload, checkout, subprocess.ExecRunner{}); err != nil {
+		t.Fatalf("validateTargetCheckoutForRunner rejected delegation worktree child: %v", err)
 	}
 
 	// Delegation child with a stale (non-matching) HeadSHA -> still accepted,
 	// because the equality check is skipped for delegation worktree children.
 	stalePayload := delegationPayload
 	stalePayload.HeadSHA = "0000000000000000000000000000000000000000"
-	if err := worker.validateTargetCheckout(ctx, stalePayload, checkout); err != nil {
-		t.Fatalf("validateTargetCheckout rejected delegation child with stale HeadSHA: %v", err)
+	if err := worker.validateTargetCheckoutForRunner(ctx, stalePayload, checkout, subprocess.ExecRunner{}); err != nil {
+		t.Fatalf("validateTargetCheckoutForRunner rejected delegation child with stale HeadSHA: %v", err)
 	}
 
 	// A non-delegation job with a mismatched HeadSHA must still be rejected so the
@@ -53,14 +54,14 @@ func TestValidateTargetCheckoutSkipsHeadShaForDelegationWorktreeChild(t *testing
 		Branch:  "task-005",
 		HeadSHA: "0000000000000000000000000000000000000000",
 	}
-	if err := worker.validateTargetCheckout(ctx, ordinaryPayload, checkout); err == nil {
-		t.Fatal("validateTargetCheckout accepted ordinary job with mismatched HeadSHA")
+	if err := worker.validateTargetCheckoutForRunner(ctx, ordinaryPayload, checkout, subprocess.ExecRunner{}); err == nil {
+		t.Fatal("validateTargetCheckoutForRunner accepted ordinary job with mismatched HeadSHA")
 	}
 }
 
 func TestValidateTargetCheckoutAcceptsDetachedReadOnlyWorktreeChild(t *testing.T) {
 	// A read-only delegation child runs in a *detached* worktree (no branch).
-	// CurrentBranch errors on a detached HEAD, so validateTargetCheckout must
+	// CurrentBranch errors on a detached HEAD, so validateTargetCheckoutForRunner must
 	// recognize the delegation worktree child and accept it on the clean-worktree
 	// check alone rather than rejecting it on the branch check.
 	ctx := context.Background()
@@ -77,8 +78,8 @@ func TestValidateTargetCheckoutAcceptsDetachedReadOnlyWorktreeChild(t *testing.T
 		ParentJobID:  "parent-job",
 		WorktreePath: detached,
 	}
-	if err := worker.validateTargetCheckout(ctx, payload, detached); err != nil {
-		t.Fatalf("validateTargetCheckout rejected detached read-only worktree child: %v", err)
+	if err := worker.validateTargetCheckoutForRunner(ctx, payload, detached, subprocess.ExecRunner{}); err != nil {
+		t.Fatalf("validateTargetCheckoutForRunner rejected detached read-only worktree child: %v", err)
 	}
 }
 
@@ -98,23 +99,23 @@ func TestValidateTargetCheckoutAllowsSharedCheckoutDelegationChildWithoutHeadSHA
 		ParentJobID:  "parent-job",
 		// no WorktreePath (shared checkout), no HeadSHA (PR-less local orchestrate)
 	}
-	if err := worker.validateTargetCheckout(ctx, delegationChild, checkout); err != nil {
-		t.Fatalf("validateTargetCheckout rejected shared-checkout delegation child without HeadSHA: %v", err)
+	if err := worker.validateTargetCheckoutForRunner(ctx, delegationChild, checkout, subprocess.ExecRunner{}); err != nil {
+		t.Fatalf("validateTargetCheckoutForRunner rejected shared-checkout delegation child without HeadSHA: %v", err)
 	}
 
 	nonDelegation := workflow.JobPayload{Repo: "owner/repo", Branch: "task-005"}
-	if err := worker.validateTargetCheckout(ctx, nonDelegation, checkout); err == nil {
-		t.Fatal("validateTargetCheckout accepted a non-delegation job with no HeadSHA")
+	if err := worker.validateTargetCheckoutForRunner(ctx, nonDelegation, checkout, subprocess.ExecRunner{}); err == nil {
+		t.Fatal("validateTargetCheckoutForRunner accepted a non-delegation job with no HeadSHA")
 	}
 }
 
 // TestDefaultCheckoutAllowsBranchlessIssueAsk is the regression guard for the
 // #389 live bug: an issue `@<agent> ask` job carries the *issue number* in
 // PullRequest (>0) but no Branch (the question stands alone). The `ask` case in
-// defaultCheckout previously gated its branch validation on PullRequest>0, so an
+// defaultCheckoutForRunner previously gated its branch validation on PullRequest>0, so an
 // issue ask was rejected with "checkout branch is main, not job branch " — the
 // job failed instead of answering, and no real reply was ever posted. This test
-// drives the real defaultCheckout against a real git checkout that is on `main`
+// drives the real defaultCheckoutForRunner against a real git checkout that is on `main`
 // (not the empty job branch) and asserts the branchless issue ask is accepted.
 // It also asserts that a branch-carrying ask (the PR ask) is still validated, so
 // the PR ask's checkout guard is not weakened.
@@ -131,12 +132,12 @@ func TestDefaultCheckoutAllowsBranchlessIssueAsk(t *testing.T) {
 		// Branch and HeadSHA intentionally empty (issue ask, no PR context).
 	}
 	job := db.Job{ID: "issue-comment-regression", Type: "ask"}
-	got, err := worker.defaultCheckout(ctx, job, issueAsk, runtime.Agent{})
+	got, err := worker.defaultCheckoutForRunner(ctx, job, issueAsk, runtime.Agent{}, subprocess.ExecRunner{})
 	if err != nil {
-		t.Fatalf("defaultCheckout rejected branchless issue ask: %v", err)
+		t.Fatalf("defaultCheckoutForRunner rejected branchless issue ask: %v", err)
 	}
 	if got != checkout {
-		t.Fatalf("defaultCheckout = %q, want %q", got, checkout)
+		t.Fatalf("defaultCheckoutForRunner = %q, want %q", got, checkout)
 	}
 
 	// A PR ask carries the PR head branch; when that branch does not match the
@@ -147,8 +148,8 @@ func TestDefaultCheckoutAllowsBranchlessIssueAsk(t *testing.T) {
 		PullRequest: 12,
 		Branch:      "feature-branch",
 	}
-	if _, err := worker.defaultCheckout(ctx, job, prAsk, runtime.Agent{}); err == nil {
-		t.Fatal("defaultCheckout accepted a PR ask whose branch does not match the checkout")
+	if _, err := worker.defaultCheckoutForRunner(ctx, job, prAsk, runtime.Agent{}, subprocess.ExecRunner{}); err == nil {
+		t.Fatal("defaultCheckoutForRunner accepted a PR ask whose branch does not match the checkout")
 	}
 }
 
@@ -253,9 +254,9 @@ func TestResolveJobCheckoutSelfHealsDanglingLinkedWorktree(t *testing.T) {
 	runGit(t, primary, "worktree", "remove", "--force", linked)
 	var output bytes.Buffer
 	worker := jobWorker{Store: store, Stdout: &output}
-	checkout, err := worker.resolveJobCheckout(ctx, job, workflow.JobPayload{Repo: "owner/repo"})
+	checkout, err := worker.resolveJobCheckoutForRunner(ctx, job, workflow.JobPayload{Repo: "owner/repo"}, subprocess.ExecRunner{})
 	if err != nil {
-		t.Fatalf("resolveJobCheckout returned error: %v", err)
+		t.Fatalf("resolveJobCheckoutForRunner returned error: %v", err)
 	}
 	if checkout != primary {
 		t.Fatalf("checkout = %q, want healed primary %q", checkout, primary)

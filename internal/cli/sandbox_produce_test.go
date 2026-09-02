@@ -14,6 +14,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/github/githubtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/sandbox"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
@@ -672,7 +673,7 @@ func TestForegroundReviewRuntimeStateSurvivesRepairAndCleansAtBoundary(t *testin
 	}
 	t.Cleanup(func() { localAgentDispatchRuntimeAdapterFor = previousAdapterFactory })
 	previousGitHubFactory := newAgentDispatchGitHubClient
-	newAgentDispatchGitHubClient = func(string) github.Client { return github.NoopClient{} }
+	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
 	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
 
 	output, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{

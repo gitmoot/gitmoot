@@ -66,8 +66,8 @@ func ParseSessionJobDisplayEvent(event db.JobEvent) (SessionJobDisplayEvent, boo
 // no runtime subprocess, no runtime-session/checkout lock) and the engine lease
 // reaper skips it. It emits the same running-state ("job started") event a normal
 // job emits on claim, so the job list, events, and dashboard reflect it. The
-// calling session does the real work and later calls CloseExternalJob to apply the
-// result and move the job to its terminal state; lifecycle maintenance separately
+// calling session does the real work and later calls CloseExternalJobWithUsage to
+// apply the result and move the job to its terminal state; lifecycle maintenance
 // cancels a genuinely orphaned session row.
 func (m Mailbox) OpenExternalJob(ctx context.Context, request JobRequest) (db.Job, error) {
 	if m.store == nil {
@@ -124,8 +124,8 @@ func (m Mailbox) OpenExternalJob(ctx context.Context, request JobRequest) (db.Jo
 	return job, nil
 }
 
-// CloseExternalJob records the "clock out" of a session job (#657): it applies the
-// session's result through the SAME result path an engine-run job uses —
+// CloseExternalJobWithUsage records the "clock out" of a session job (#657): it
+// applies the session's result through the SAME result path an engine-run job uses —
 // result.Decision maps to a terminal JobState via stateForDecision, the result is
 // stored on the payload, and the terminal-state event + best-effort outbound event
 // (job.finished/failed/blocked via the wired EventSink) fire exactly as they do for
@@ -137,14 +137,10 @@ func (m Mailbox) OpenExternalJob(ctx context.Context, request JobRequest) (db.Jo
 // A job can be closed exactly once: it must currently be running AND
 // externally_driven, else a clear error is returned (double-close, closing an
 // engine job, or an unknown id all fail cleanly).
-func (m Mailbox) CloseExternalJob(ctx context.Context, jobID string, result AgentResult, prOverride int, headSHAOverride, branchOverride string) (db.Job, error) {
-	return m.CloseExternalJobWithUsage(ctx, jobID, result, prOverride, headSHAOverride, branchOverride, ExternalJobUsage{})
-}
-
-// CloseExternalJobWithUsage closes an external job and records only the model
-// and token evidence explicitly supplied by its caller. The evidence and terminal
-// transition share one transaction, so a terminal session row cannot lose usage
-// that was part of the accepted close operation.
+//
+// It records only the model and token evidence explicitly supplied by its caller.
+// The evidence and terminal transition share one transaction, so a terminal session
+// row cannot lose usage that was part of the accepted close operation.
 func (m Mailbox) CloseExternalJobWithUsage(ctx context.Context, jobID string, result AgentResult, prOverride int, headSHAOverride, branchOverride string, usage ExternalJobUsage) (db.Job, error) {
 	if m.store == nil {
 		return db.Job{}, errors.New("mailbox store is required")
@@ -247,16 +243,9 @@ func (m Mailbox) CloseExternalJobWithUsage(ctx context.Context, jobID string, re
 
 // OpenExternalJob records a session job's clock-in through the engine's Mailbox so
 // the terminal-event emit seam (e.mailbox()) is wired for the matching
-// CloseExternalJob. See Mailbox.OpenExternalJob.
+// CloseExternalJobWithUsage. See Mailbox.OpenExternalJob.
 func (e Engine) OpenExternalJob(ctx context.Context, request JobRequest) (db.Job, error) {
 	return e.mailbox().OpenExternalJob(ctx, request)
-}
-
-// CloseExternalJob applies a session job's result and moves it to its terminal
-// state, emitting the outbound terminal event through the engine's wired EventSink.
-// See Mailbox.CloseExternalJob.
-func (e Engine) CloseExternalJob(ctx context.Context, jobID string, result AgentResult, prOverride int, headSHAOverride, branchOverride string) (db.Job, error) {
-	return e.mailbox().CloseExternalJob(ctx, jobID, result, prOverride, headSHAOverride, branchOverride)
 }
 
 // CloseExternalJobWithUsage closes a session job with explicit caller-reported

@@ -106,12 +106,12 @@ func TestCloseExternalJobAppliesDecision(t *testing.T) {
 				t.Fatalf("OpenExternalJob returned error: %v", err)
 			}
 
-			closed, err := engine.CloseExternalJob(ctx, "session-job", AgentResult{
+			closed, err := engine.CloseExternalJobWithUsage(ctx, "session-job", AgentResult{
 				Decision: tc.decision,
 				Summary:  "session done",
-			}, 0, "", "")
+			}, 0, "", "", ExternalJobUsage{})
 			if err != nil {
-				t.Fatalf("CloseExternalJob returned error: %v", err)
+				t.Fatalf("CloseExternalJobWithUsage returned error: %v", err)
 			}
 			if closed.State != string(tc.wantState) {
 				t.Fatalf("closed state = %q, want %q", closed.State, tc.wantState)
@@ -169,23 +169,23 @@ func TestCloseExternalJobRequiresSeverityForChangesRequestedReview(t *testing.T)
 		t.Fatalf("OpenExternalJob returned error: %v", err)
 	}
 
-	if _, err := engine.CloseExternalJob(ctx, "session-review", AgentResult{
+	if _, err := engine.CloseExternalJobWithUsage(ctx, "session-review", AgentResult{
 		Decision: "changes_requested",
 		Summary:  "fix the finding",
-	}, 0, "", ""); err == nil || !strings.Contains(err.Error(), "severity is required") {
-		t.Fatalf("CloseExternalJob without severity error = %v, want severity requirement", err)
+	}, 0, "", "", ExternalJobUsage{}); err == nil || !strings.Contains(err.Error(), "severity is required") {
+		t.Fatalf("CloseExternalJobWithUsage without severity error = %v, want severity requirement", err)
 	}
 	if stored := mustJob(t, store, "session-review"); stored.State != string(JobRunning) {
 		t.Fatalf("job state after rejected close = %q, want running", stored.State)
 	}
 
-	closed, err := engine.CloseExternalJob(ctx, "session-review", AgentResult{
+	closed, err := engine.CloseExternalJobWithUsage(ctx, "session-review", AgentResult{
 		Decision: "changes_requested",
 		Severity: "P1",
 		Summary:  "fix the finding",
-	}, 0, "", "")
+	}, 0, "", "", ExternalJobUsage{})
 	if err != nil {
-		t.Fatalf("CloseExternalJob with severity returned error: %v", err)
+		t.Fatalf("CloseExternalJobWithUsage with severity returned error: %v", err)
 	}
 	payload, err := unmarshalPayload(closed.Payload)
 	if err != nil {
@@ -215,10 +215,10 @@ func TestCloseExternalJobRecordsApprovedWithNotesForSubthresholdReview(t *testin
 	}); err != nil {
 		t.Fatalf("OpenExternalJob returned error: %v", err)
 	}
-	if _, err := engine.CloseExternalJob(ctx, "session-review-notes", AgentResult{
+	if _, err := engine.CloseExternalJobWithUsage(ctx, "session-review-notes", AgentResult{
 		Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "non-blocking polish",
-	}, 0, "", ""); err != nil {
-		t.Fatalf("CloseExternalJob returned error: %v", err)
+	}, 0, "", "", ExternalJobUsage{}); err != nil {
+		t.Fatalf("CloseExternalJobWithUsage returned error: %v", err)
 	}
 	if got := countJobEvents(t, store, "session-review-notes", ReviewApprovedWithNotesEventKind); got != 1 {
 		t.Fatalf("%s events = %d, want 1", ReviewApprovedWithNotesEventKind, got)
@@ -250,10 +250,10 @@ func TestCloseExternalJobRecordsNoOutcomeForBlockingSessionReview(t *testing.T) 
 	}); err != nil {
 		t.Fatalf("OpenExternalJob returned error: %v", err)
 	}
-	if _, err := engine.CloseExternalJob(ctx, "session-review-blocking", AgentResult{
+	if _, err := engine.CloseExternalJobWithUsage(ctx, "session-review-blocking", AgentResult{
 		Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "blocking",
-	}, 0, "", ""); err != nil {
-		t.Fatalf("CloseExternalJob returned error: %v", err)
+	}, 0, "", "", ExternalJobUsage{}); err != nil {
+		t.Fatalf("CloseExternalJobWithUsage returned error: %v", err)
 	}
 	if got := countJobEvents(t, store, "session-review-blocking", ReviewApprovedWithNotesEventKind); got != 0 {
 		t.Fatalf("%s events = %d, want 0 for an at-threshold blocking review", ReviewApprovedWithNotesEventKind, got)
@@ -275,12 +275,12 @@ func TestCloseExternalJobRecordsPRAndBranch(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("OpenExternalJob returned error: %v", err)
 	}
-	closed, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).CloseExternalJob(ctx, "session-review", AgentResult{
+	closed, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).CloseExternalJobWithUsage(ctx, "session-review", AgentResult{
 		Decision: "approved",
 		Summary:  "reviewed",
-	}, 42, "reviewed-head", "feat/x")
+	}, 42, "reviewed-head", "feat/x", ExternalJobUsage{})
 	if err != nil {
-		t.Fatalf("CloseExternalJob returned error: %v", err)
+		t.Fatalf("CloseExternalJobWithUsage returned error: %v", err)
 	}
 	payload, err := unmarshalPayload(closed.Payload)
 	if err != nil {
@@ -313,11 +313,11 @@ func TestCloseExternalReviewPersistsReportedGrade(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("OpenExternalJob returned error: %v", err)
 	}
-	if _, err := mb.CloseExternalJob(ctx, "session-review-grade", AgentResult{
+	if _, err := mb.CloseExternalJobWithUsage(ctx, "session-review-grade", AgentResult{
 		Decision: "approved",
 		Summary:  "reviewed",
-	}, 0, "", ""); err != nil {
-		t.Fatalf("CloseExternalJob returned error: %v", err)
+	}, 0, "", "", ExternalJobUsage{}); err != nil {
+		t.Fatalf("CloseExternalJobWithUsage returned error: %v", err)
 	}
 
 	stored := mustJob(t, store, "session-review-grade")
@@ -339,13 +339,13 @@ func TestCloseExternalJobErrors(t *testing.T) {
 	mb := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
 
 	// Unknown id.
-	if _, err := mb.CloseExternalJob(ctx, "nope", AgentResult{Decision: "approved"}, 0, "", ""); err == nil {
-		t.Fatalf("CloseExternalJob(unknown) returned nil error")
+	if _, err := mb.CloseExternalJobWithUsage(ctx, "nope", AgentResult{Decision: "approved"}, 0, "", "", ExternalJobUsage{}); err == nil {
+		t.Fatalf("CloseExternalJobWithUsage(unknown) returned nil error")
 	}
 
 	// Invalid decision.
-	if _, err := mb.CloseExternalJob(ctx, "nope", AgentResult{Decision: "bogus"}, 0, "", ""); err == nil || !strings.Contains(err.Error(), "unsupported decision") {
-		t.Fatalf("CloseExternalJob(bad decision) err = %v, want unsupported decision", err)
+	if _, err := mb.CloseExternalJobWithUsage(ctx, "nope", AgentResult{Decision: "bogus"}, 0, "", "", ExternalJobUsage{}); err == nil || !strings.Contains(err.Error(), "unsupported decision") {
+		t.Fatalf("CloseExternalJobWithUsage(bad decision) err = %v, want unsupported decision", err)
 	}
 
 	// Engine (non-session) job cannot be closed.
@@ -353,7 +353,7 @@ func TestCloseExternalJobErrors(t *testing.T) {
 		t.Fatalf("CreateJobWithEvent returned error: %v", err)
 	}
 	if _, err := mb.CloseExternalJobWithUsage(ctx, "engine-job", AgentResult{Decision: "approved"}, 0, "", "", ExternalJobUsage{Model: "must-not-land", InputTokens: 7, OutputTokens: 9}); err == nil || !strings.Contains(err.Error(), "not a session job") {
-		t.Fatalf("CloseExternalJob(engine job) err = %v, want not-a-session-job", err)
+		t.Fatalf("CloseExternalJobWithUsage(engine job) err = %v, want not-a-session-job", err)
 	}
 	engineJob := mustJob(t, store, "engine-job")
 	if engineJob.Model != "" || engineJob.InputTokens != 0 || engineJob.OutputTokens != 0 || engineJob.State != string(JobRunning) {
@@ -364,11 +364,11 @@ func TestCloseExternalJobErrors(t *testing.T) {
 	if _, err := mb.OpenExternalJob(ctx, JobRequest{ID: "sess", Agent: "lead", Action: "ask", Repo: "gitmoot/gitmoot"}); err != nil {
 		t.Fatalf("OpenExternalJob returned error: %v", err)
 	}
-	if _, err := mb.CloseExternalJob(ctx, "sess", AgentResult{Decision: "approved"}, 0, "", ""); err != nil {
-		t.Fatalf("first CloseExternalJob returned error: %v", err)
+	if _, err := mb.CloseExternalJobWithUsage(ctx, "sess", AgentResult{Decision: "approved"}, 0, "", "", ExternalJobUsage{}); err != nil {
+		t.Fatalf("first CloseExternalJobWithUsage returned error: %v", err)
 	}
-	if _, err := mb.CloseExternalJob(ctx, "sess", AgentResult{Decision: "approved"}, 0, "", ""); err == nil || !strings.Contains(err.Error(), "already been closed") {
-		t.Fatalf("double CloseExternalJob err = %v, want already-been-closed", err)
+	if _, err := mb.CloseExternalJobWithUsage(ctx, "sess", AgentResult{Decision: "approved"}, 0, "", "", ExternalJobUsage{}); err == nil || !strings.Contains(err.Error(), "already been closed") {
+		t.Fatalf("double CloseExternalJobWithUsage err = %v, want already-been-closed", err)
 	}
 }
 
@@ -398,9 +398,9 @@ func TestCloseExternalJobAfterGhostReaperReturnsCleanAlreadyClosedError(t *testi
 	if len(reaped) != 1 || reaped[0] != "session-race" {
 		t.Fatalf("reaped = %v", reaped)
 	}
-	if _, err := mb.CloseExternalJob(ctx, "session-race", AgentResult{Decision: "approved"}, 0, "", ""); err == nil ||
+	if _, err := mb.CloseExternalJobWithUsage(ctx, "session-race", AgentResult{Decision: "approved"}, 0, "", "", ExternalJobUsage{}); err == nil ||
 		!strings.Contains(err.Error(), "already been closed") {
-		t.Fatalf("CloseExternalJob after reaper err = %v, want already-been-closed", err)
+		t.Fatalf("CloseExternalJobWithUsage after reaper err = %v, want already-been-closed", err)
 	}
 	job, err := store.GetJob(ctx, "session-race")
 	if err != nil || job.State != string(JobCancelled) {
@@ -428,8 +428,8 @@ func TestRetryJobRefusesSessionJob(t *testing.T) {
 		t.Fatalf("OpenExternalJob returned error: %v", err)
 	}
 	// Close it into a retry-eligible terminal state (failed).
-	if _, err := mb.CloseExternalJob(ctx, "sess-retry", AgentResult{Decision: "failed"}, 0, "", ""); err != nil {
-		t.Fatalf("CloseExternalJob returned error: %v", err)
+	if _, err := mb.CloseExternalJobWithUsage(ctx, "sess-retry", AgentResult{Decision: "failed"}, 0, "", "", ExternalJobUsage{}); err != nil {
+		t.Fatalf("CloseExternalJobWithUsage returned error: %v", err)
 	}
 
 	_, err := RetryJob(ctx, store, "sess-retry")

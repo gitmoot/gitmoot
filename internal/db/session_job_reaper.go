@@ -14,7 +14,7 @@ import (
 
 const (
 	// A terminal workflow is a strong orphan signal, but status writes and a live
-	// session's CloseExternalJob are separate transactions. Keep one short sweep
+	// session's CloseExternalJobWithUsage are separate transactions. Keep one short sweep
 	// grace so a normal close racing an operator's terminal status can win first.
 	ghostSessionTerminalWorkflowGrace = 5 * time.Minute
 

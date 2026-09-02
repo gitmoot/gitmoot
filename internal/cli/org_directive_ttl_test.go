@@ -766,7 +766,7 @@ func TestDirectiveNagInsertToDrainDelivers(t *testing.T) {
 	}
 
 	// And the drain must still accept it.
-	if err := drainReplyWakeOutbox(ctx, store, time.Now().UTC(), func(context.Context) (replyWakeDelivery, error) {
+	if _, err := drainReplyWakeOutboxWithHealth(ctx, store, time.Now().UTC(), func(context.Context) (replyWakeDelivery, error) {
 		return replyWakeDelivery{sink: &recordingSink{}, rules: rules}, nil
 	}); err != nil && strings.Contains(err.Error(), "unsupported source kind") {
 		t.Fatalf("drain REFUSED the nag it was just handed: %v", err)

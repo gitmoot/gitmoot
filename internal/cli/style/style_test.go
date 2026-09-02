@@ -73,34 +73,6 @@ func TestStyleWrapsOnlyWhenEnabled(t *testing.T) {
 	}
 }
 
-func TestColumns(t *testing.T) {
-	lines := Columns([][]string{
-		{"a", "longvalue", "x"},
-		{"bbb", "v", "y"},
-	})
-	want := []string{
-		"a    longvalue  x",
-		"bbb  v          y",
-	}
-	for i := range want {
-		if lines[i] != want[i] {
-			t.Fatalf("Columns line %d = %q, want %q", i, lines[i], want[i])
-		}
-	}
-
-	// Ragged rows: a short row's interior cell is still padded to its column,
-	// and trailing padding is trimmed.
-	ragged := Columns([][]string{{"a", "bb", "ccc"}, {"x", "y"}})
-	if ragged[1] != "x  y" {
-		t.Fatalf("ragged row = %q, want %q", ragged[1], "x  y")
-	}
-	// Rune width: a 5-rune multibyte cell pads to 5 columns, not its byte length.
-	runed := Columns([][]string{{"héllo", "z"}, {"ab", "z"}})
-	if runed[1] != "ab     z" {
-		t.Fatalf("multibyte row = %q, want %q", runed[1], "ab     z")
-	}
-}
-
 func TestTopN(t *testing.T) {
 	items := []int{1, 2, 3, 4, 5}
 	shown, hidden := TopN(items, 3)

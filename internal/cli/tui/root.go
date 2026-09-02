@@ -15,16 +15,6 @@ type PopModelMsg struct {
 	Deliver tea.Msg
 }
 
-// Push returns a command that pushes model onto the Root's stack.
-func Push(model tea.Model) tea.Cmd {
-	return func() tea.Msg { return PushModelMsg{Model: model} }
-}
-
-// Pop returns a command that pops the Root's top model.
-func Pop() tea.Cmd {
-	return func() tea.Msg { return PopModelMsg{} }
-}
-
 // PopWith returns a command that pops the Root's top model and delivers msg
 // to the model below.
 func PopWith(msg tea.Msg) tea.Cmd {

@@ -35,30 +35,6 @@ var hostRunnerAllowlist = map[string]hostRunnerAllowance{
 		execRunners: 1,
 		reason:      "operator and test helper fallback; admitted jobs install the resolved backend runner before dispatch",
 	},
-	"internal/cli/agent_dispatch.go:resolveLocalImplementBase": {
-		execRunners: 1,
-		reason:      "operator-side base resolution inspects the managed host checkout before backend provisioning",
-	},
-	"internal/cli/ask_diff_precleanup.go:askReviewDiffPrecleanupHook": {
-		execRunners: 1,
-		reason:      "host-side post-delivery hook captures an already-collected read-only worktree before cleanup",
-	},
-	"internal/cli/ask_diff_precleanup.go:captureReadOnlyWorktreeDiff": {
-		execRunners: 1,
-		reason:      "host-side post-delivery diff capture delegates to the injectable runner implementation",
-	},
-	"internal/cli/daemon_checkout.go:defaultCheckout": {
-		execRunners: 1,
-		reason:      "legacy host-mode checkout wrapper; backend jobs call defaultCheckoutForRunner with the instance runner",
-	},
-	"internal/cli/daemon_checkout.go:resolveJobCheckout": {
-		execRunners: 1,
-		reason:      "legacy host-mode checkout resolver; backend jobs use resolveJobCheckoutForRunner",
-	},
-	"internal/cli/daemon_checkout.go:validateTargetCheckout": {
-		execRunners: 1,
-		reason:      "legacy host-mode checkout validator; backend jobs use validateTargetCheckoutForRunner",
-	},
 	"internal/cli/daemon_lifecycle.go:preflightDaemonRepoCheckout": {
 		execRunners: 1,
 		reason:      "daemon preflight inspects the registered host checkout before any job backend is provisioned",
@@ -87,26 +63,6 @@ var hostRunnerAllowlist = map[string]hostRunnerAllowance{
 		execRunners: 1,
 		reason:      "same host-mode engine wrapper as daemonWorkflowEngine, taking the poll pass's config memo (#1758); backend jobs call daemonWorkflowEngineForRunner",
 	},
-	"internal/cli/daemon_workflow.go:implementationFinalizationTargetFor": {
-		execRunners: 1,
-		reason:      "host-mode finalization wrapper delegates checkout inspection to implementationFinalizationTargetForRunner",
-	},
-	"internal/cli/daemon_workflow.go:newDaemonPolicyMergeGate": {
-		execRunners: 1,
-		reason:      "host-mode policy gate wrapper delegates to newDaemonPolicyMergeGateForRunner",
-	},
-	"internal/cli/daemon_workflow.go:newHostDaemonImplementationFinalizer": {
-		execRunners: 1,
-		reason:      "explicit host finalizer is used only after backend output has been collected into the managed checkout",
-	},
-	"internal/cli/daemon_workflow.go:newHostDaemonMergeGate": {
-		execRunners: 1,
-		reason:      "explicit host merge gate evaluates and merges the managed checkout after job execution",
-	},
-	"internal/cli/daemon_workflow.go:refreshDaemonJobPayload": {
-		execRunners: 1,
-		reason:      "host-mode payload refresh wrapper delegates to refreshDaemonJobPayloadForRunner",
-	},
 	"internal/cli/dashboard_config.go:editAgentPromptCmd": {
 		rawCommands: 1,
 		reason:      "interactive dashboard launches the operator's configured editor",
@@ -119,14 +75,6 @@ var hostRunnerAllowlist = map[string]hostRunnerAllowance{
 		rawCommands: 2,
 		reason:      "dashboard probes the deployed gitmoot binary version on the host",
 	},
-	"internal/cli/fix_worktree.go:allocateFixWorktree": {
-		execRunners: 1,
-		reason:      "host-side allocator creates the managed fix worktree before execution",
-	},
-	"internal/cli/job_resume_worktree.go:resumeSelfDirtyWorktree": {
-		execRunners: 1,
-		reason:      "host-side recovery inspects the managed checkout before a backend instance can resume",
-	},
 	"internal/cli/org.go:<package>": {
 		execRunners: 2,
 		reason:      "operator org doctor and seat-management commands use replaceable host runner seams",
@@ -134,22 +82,6 @@ var hostRunnerAllowlist = map[string]hostRunnerAllowance{
 	"internal/cli/org_archive_ingest.go:defaultHerdrAgentList": {
 		rawCommands: 1,
 		reason:      "daemon org lane reads host-local herdr archive state (#1635); never job work — an injectable dependency tests override, wired to the real binary only in production deps",
-	},
-	"internal/cli/pipeline_enqueue.go:allocatePipelineServiceShellWorktree": {
-		execRunners: 1,
-		reason:      "host-side allocator prepares a managed service-shell worktree before execution",
-	},
-	"internal/cli/pipeline_enqueue.go:allocatePipelineShellStageReadOnlyWorktree": {
-		execRunners: 1,
-		reason:      "host-side allocator prepares a managed read-only shell-stage worktree before execution",
-	},
-	"internal/cli/pipeline_enqueue.go:allocatePipelineStageReadOnlyWorktree": {
-		execRunners: 1,
-		reason:      "host-side allocator prepares a managed read-only stage worktree before execution",
-	},
-	"internal/cli/pipeline_enqueue.go:allocatePipelineStageWritableWorktree": {
-		execRunners: 1,
-		reason:      "host-side allocator prepares a managed writable stage worktree before execution",
 	},
 	"internal/cli/plugin.go:<package>": {
 		execRunners: 2,
@@ -162,18 +94,6 @@ var hostRunnerAllowlist = map[string]hostRunnerAllowance{
 	"internal/cli/update.go:runDaemonRestartFromExecutable": {
 		rawCommands: 1,
 		reason:      "operator update lifecycle restarts the local daemon executable",
-	},
-	"internal/cli/workflow.go:recoverTaskImplementation": {
-		execRunners: 1,
-		reason:      "operator recovery command inspects the managed host task worktree",
-	},
-	"internal/cli/workflow.go:taskRecoverBaseHead": {
-		execRunners: 1,
-		reason:      "operator recovery command resolves the managed checkout base before redispatch",
-	},
-	"internal/cli/workflow.go:taskWorktreeDirty": {
-		execRunners: 1,
-		reason:      "operator recovery command checks whether the managed host task worktree is dirty",
 	},
 	"internal/workflow/result_observation.go:changedWorktreeFiles": {
 		execRunners: 1,

@@ -118,14 +118,6 @@ func (h quotaRoleUnavailableHooks) clearOnSuccess(ctx context.Context, role, run
 	return h.store.ClearOrgRoleUnavailableForRuntime(ctx, role, runtimeName)
 }
 
-func (w jobWorker) captureQuotaRoleUnavailable(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent, cause error, now time.Time) error {
-	return w.quotaRoleUnavailableHooks().captureFailure(ctx, job, payload, agent, cause, now)
-}
-
-func (w jobWorker) clearQuotaRoleUnavailableOnSuccess(ctx context.Context, role, runtimeName string) error {
-	return w.quotaRoleUnavailableHooks().clearOnSuccess(ctx, role, runtimeName)
-}
-
 // wakeQuotaRoleUnavailable directly wakes the unavailable role's configured
 // parent. The durable escalation claim is marked before this best-effort call,
 // matching the codebase's mark-before-emit discipline and preventing storms.

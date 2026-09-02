@@ -39,7 +39,7 @@ func IsDisposedTaskState(state string) bool {
 	}
 }
 
-// TaskEventMergedRegressionRefused is the durable trace PersistTaskState leaves
+// TaskEventMergedRegressionRefused is the durable trace persistTaskStateOwned leaves
 // when it refuses to overwrite a `merged` task with a state that asserts the
 // work is not done. It is an informational event: the task does not move, so
 // FromState/ToState stay empty per the db.TaskEvent contract, and the refused
@@ -58,7 +58,7 @@ const TaskEventMergedRegressionRefused = "task_merged_regression_refused"
 // rewrite the landed-work record or to strand the coordinator, and both are wrong.
 //
 // The rule is a TARGET-state test, not a from/to pair, because the from side is
-// enforced by PersistTaskState's conditional UPDATE. The "is it still merged?"
+// enforced by persistTaskStateOwned's conditional UPDATE. The "is it still merged?"
 // question is answered by the statement that writes rather than by a pre-read
 // another daemon can invalidate.
 //

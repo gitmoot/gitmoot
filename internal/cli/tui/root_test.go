@@ -27,7 +27,7 @@ func (s stubChild) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return s, nil
 	case tea.KeyMsg:
 		if m.String() == "q" {
-			return s, Pop()
+			return s, PopWith(nil)
 		}
 	}
 	return s, nil

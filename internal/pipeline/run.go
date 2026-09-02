@@ -238,7 +238,7 @@ func PipelineStageJobRequest(rec db.Pipeline, stage Stage, run db.PipelineRun, a
 	// but — unlike a read-only agent stage — carry a DETERMINISTIC, attempt-INDEPENDENT
 	// Branch/TaskID so a retry lands in the SAME branch/worktree (never a duplicate PR).
 	// The writable task-worktree itself is allocated at the enqueue seam
-	// (allocatePipelineStageWritableWorktree), which reuses the existing implement
+	// (allocatePipelineStageWritableWorktreeForRunner), which reuses the existing implement
 	// dispatch's GetTaskByRepoBranch reuse + fail-closed guards. Still a LEAF
 	// (Sender=pipeline strips delegations/human_questions), and this implement job never
 	// merges its PR; only a separately authorized gate may. This is an APPEND above the

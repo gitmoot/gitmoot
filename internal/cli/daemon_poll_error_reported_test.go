@@ -14,6 +14,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/github/githubtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -152,7 +153,7 @@ waitForPolls:
 // countingPollFakeGitHub fails every poll and counts them under a mutex, so the test goroutine
 // can read the count while the supervisor goroutine writes it.
 type countingPollFakeGitHub struct {
-	github.NoopClient
+	githubtest.NoopClient
 	mu  sync.Mutex
 	n   int
 	err error
@@ -226,7 +227,7 @@ func TestPollErrorReportersAreIndependentPerMode(t *testing.T) {
 // PollRecoveryCommandsOnce does not, so ListIssues being reached proves which runner the idle
 // branch executed.
 type pollDiscriminatingFakeGitHub struct {
-	github.NoopClient
+	githubtest.NoopClient
 	mu     sync.Mutex
 	issues int
 	pulls  int

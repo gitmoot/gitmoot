@@ -12,7 +12,9 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/github/githubtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -139,7 +141,7 @@ func TestAgentRunForegroundReviewForcedMissingTypeNamesType(t *testing.T) {
 }
 
 type fixPassPullRequestClient struct {
-	github.NoopClient
+	githubtest.NoopClient
 	pr  github.PullRequest
 	err error
 }
@@ -456,7 +458,7 @@ func TestTaskRecoverPredicateStillRejectsPullRequestOpen(t *testing.T) {
 		t.Fatal("shared implement branch-reuse predicate was widened to dismissed")
 	}
 	fixture := newFixPassFixture(t, workflow.TaskPullRequestOpen)
-	_, err := recoverTaskImplementation(context.Background(), fixture.store, fixture.task.ID, fixture.repo.FullName(), fixture.owner, false, github.NoopClient{})
+	_, err := recoverTaskImplementationForRunner(context.Background(), fixture.store, fixture.task.ID, fixture.repo.FullName(), fixture.owner, false, githubtest.NoopClient{}, subprocess.ExecRunner{})
 	if err == nil || !strings.Contains(err.Error(), "task recover only supports active implementation states") {
 		t.Fatalf("task recover error = %v, want unchanged pr_open refusal", err)
 	}
@@ -488,7 +490,7 @@ func TestTaskRecoverableStateIncludesDismissedWithoutWideningImplementReuse(t *t
 }
 
 type finalizerFixPassGitHub struct {
-	github.NoopClient
+	githubtest.NoopClient
 	prs         map[int64]github.PullRequest
 	getCalls    []int64
 	ensureCalls int
@@ -576,7 +578,7 @@ func TestDaemonImplementationFinalizerPrefersValidatedPullRequest(t *testing.T) 
 		ValidatedPullRequest: true, HeadSHA: fixture.headSHA, TaskID: fixture.task.ID,
 		Result: &workflow.AgentResult{Decision: "implemented", Summary: "fix pass complete"},
 	}
-	finalized, err := (newHostDaemonImplementationFinalizer(fixture.store, gh)).FinalizeImplementation(ctx, db.Job{ID: "fix-pass", Agent: "lead", Type: "implement"}, payload)
+	finalized, err := (daemonImplementationFinalizer{Store: fixture.store, GitHub: gh, Runner: subprocess.ExecRunner{}}).FinalizeImplementation(ctx, db.Job{ID: "fix-pass", Agent: "lead", Type: "implement"}, payload)
 	if err != nil {
 		t.Fatalf("FinalizeImplementation: %v", err)
 	}
@@ -610,7 +612,7 @@ func TestDaemonImplementationFinalizerPayloadlessUsesBranchFallback(t *testing.T
 		Repo: "owner/repo", Branch: fixture.task.Branch, TaskID: fixture.task.ID,
 		Result: &workflow.AgentResult{Decision: "implemented", Summary: "ordinary implementation"},
 	}
-	finalized, err := (newHostDaemonImplementationFinalizer(fixture.store, gh)).FinalizeImplementation(ctx, db.Job{ID: "ordinary", Agent: "lead", Type: "implement"}, payload)
+	finalized, err := (daemonImplementationFinalizer{Store: fixture.store, GitHub: gh, Runner: subprocess.ExecRunner{}}).FinalizeImplementation(ctx, db.Job{ID: "ordinary", Agent: "lead", Type: "implement"}, payload)
 	if err != nil {
 		t.Fatalf("FinalizeImplementation: %v", err)
 	}
@@ -647,7 +649,7 @@ func TestDaemonImplementationFinalizerRevalidatesBoundPullRequest(t *testing.T) 
 				ValidatedPullRequest: true, HeadSHA: fixture.headSHA, TaskID: fixture.task.ID,
 				Result: &workflow.AgentResult{Decision: "implemented", Summary: "fix pass complete"},
 			}
-			_, err := (newHostDaemonImplementationFinalizer(fixture.store, gh)).FinalizeImplementation(context.Background(), db.Job{ID: "fix-pass", Agent: "lead", Type: "implement"}, payload)
+			_, err := (daemonImplementationFinalizer{Store: fixture.store, GitHub: gh, Runner: subprocess.ExecRunner{}}).FinalizeImplementation(context.Background(), db.Job{ID: "fix-pass", Agent: "lead", Type: "implement"}, payload)
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("FinalizeImplementation error = %v, want %q", err, tt.want)
 			}

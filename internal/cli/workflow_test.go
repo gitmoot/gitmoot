@@ -17,6 +17,8 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/github/githubtest"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -837,7 +839,7 @@ func TestRunTaskRunDirtyTaskWorktreeSuggestsRecover(t *testing.T) {
 }
 
 type stubTaskRecoverGitHub struct {
-	github.NoopClient
+	githubtest.NoopClient
 	input github.CreatePullRequestInput
 }
 
@@ -929,9 +931,9 @@ func TestRecoverTaskImplementationFinalizesDirtyWorktree(t *testing.T) {
 	}
 
 	gh := &stubTaskRecoverGitHub{}
-	payload, err := recoverTaskImplementation(ctx, store, "task-001", "owner/repo", "lead", true, gh)
+	payload, err := recoverTaskImplementationForRunner(ctx, store, "task-001", "owner/repo", "lead", true, gh, subprocess.ExecRunner{})
 	if err != nil {
-		t.Fatalf("recoverTaskImplementation returned error: %v", err)
+		t.Fatalf("recoverTaskImplementationForRunner returned error: %v", err)
 	}
 	if payload.PullRequest != 4 || payload.Branch != "task-001-bootstrap" || payload.HeadSHA == "" {
 		t.Fatalf("payload = %+v", payload)
@@ -1022,8 +1024,8 @@ func TestRecoverDismissedTaskWithArtifactsTransitionsThroughImplementingToPROpen
 		t.Fatal(err)
 	}
 	gh := &observingTaskRecoverGitHub{store: store, taskID: "task-dismissed"}
-	if _, err := recoverTaskImplementation(ctx, store, "task-dismissed", "owner/repo", "lead", false, gh); err != nil {
-		t.Fatalf("recoverTaskImplementation: %v", err)
+	if _, err := recoverTaskImplementationForRunner(ctx, store, "task-dismissed", "owner/repo", "lead", false, gh, subprocess.ExecRunner{}); err != nil {
+		t.Fatalf("recoverTaskImplementationForRunner: %v", err)
 	}
 	if gh.sawState != string(workflow.TaskImplementing) {
 		t.Fatalf("state during finalization = %q, want implementing", gh.sawState)
@@ -1112,9 +1114,9 @@ func TestRecoverTaskImplementationFinalizesCleanCommittedWorktree(t *testing.T) 
 	}
 
 	gh := &stubTaskRecoverGitHub{}
-	payload, err := recoverTaskImplementation(ctx, store, "task-001", "owner/repo", "lead", false, gh)
+	payload, err := recoverTaskImplementationForRunner(ctx, store, "task-001", "owner/repo", "lead", false, gh, subprocess.ExecRunner{})
 	if err != nil {
-		t.Fatalf("recoverTaskImplementation returned error: %v", err)
+		t.Fatalf("recoverTaskImplementationForRunner returned error: %v", err)
 	}
 	if payload.PullRequest != 4 || payload.HeadSHA == "" {
 		t.Fatalf("payload = %+v", payload)
@@ -1140,7 +1142,7 @@ func TestRecoverTaskImplementationRejectsMergedTask(t *testing.T) {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
 
-	if _, err := recoverTaskImplementation(ctx, store, "task-001", "owner/repo", "lead", false, &stubTaskRecoverGitHub{}); err == nil || !strings.Contains(err.Error(), "state merged") {
+	if _, err := recoverTaskImplementationForRunner(ctx, store, "task-001", "owner/repo", "lead", false, &stubTaskRecoverGitHub{}, subprocess.ExecRunner{}); err == nil || !strings.Contains(err.Error(), "state merged") {
 		t.Fatalf("recover merged task err = %v, want state merged", err)
 	}
 	if _, err := store.GetBranchLock(ctx, "owner/repo", "task-001-bootstrap"); !errors.Is(err, sql.ErrNoRows) {
@@ -1178,7 +1180,7 @@ func TestRecoverTaskImplementationReleasesCreatedLockOnBlockedRecovery(t *testin
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
 
-	if _, err := recoverTaskImplementation(ctx, store, "task-001", "owner/repo", "lead", false, &stubTaskRecoverGitHub{}); err == nil || !strings.Contains(err.Error(), "no recoverable commit") {
+	if _, err := recoverTaskImplementationForRunner(ctx, store, "task-001", "owner/repo", "lead", false, &stubTaskRecoverGitHub{}, subprocess.ExecRunner{}); err == nil || !strings.Contains(err.Error(), "no recoverable commit") {
 		t.Fatalf("recover clean base task err = %v, want no recoverable commit", err)
 	}
 	if _, err := store.GetBranchLock(ctx, "owner/repo", "task-001-bootstrap"); !errors.Is(err, sql.ErrNoRows) {
@@ -1205,7 +1207,7 @@ func TestRecoverTaskImplementationBlocksLiveWorktreeProcess(t *testing.T) {
 	taskWorktreeHasLiveProcess = func(path string) bool { return path == worktree }
 	defer func() { taskWorktreeHasLiveProcess = prev }()
 
-	if _, err := recoverTaskImplementation(ctx, store, "task-001", "owner/repo", "lead", false, &stubTaskRecoverGitHub{}); err == nil || !strings.Contains(err.Error(), "live process") {
+	if _, err := recoverTaskImplementationForRunner(ctx, store, "task-001", "owner/repo", "lead", false, &stubTaskRecoverGitHub{}, subprocess.ExecRunner{}); err == nil || !strings.Contains(err.Error(), "live process") {
 		t.Fatalf("recover live worktree err = %v, want live process", err)
 	}
 	if _, err := store.GetBranchLock(ctx, "owner/repo", "task-001-bootstrap"); !errors.Is(err, sql.ErrNoRows) {
@@ -1250,7 +1252,7 @@ func TestRecoverTaskImplementationBlocksActiveJobAndWrongLockOwner(t *testing.T)
 	if err := store.CreateJob(ctx, db.Job{ID: "active-implement", Agent: "lead", Type: "implement", State: string(workflow.JobRunning), Payload: string(activePayload)}); err != nil {
 		t.Fatalf("CreateJob returned error: %v", err)
 	}
-	if _, err := recoverTaskImplementation(ctx, store, "task-001", "owner/repo", "lead", false, &stubTaskRecoverGitHub{}); err == nil || !strings.Contains(err.Error(), "live job active-implement") {
+	if _, err := recoverTaskImplementationForRunner(ctx, store, "task-001", "owner/repo", "lead", false, &stubTaskRecoverGitHub{}, subprocess.ExecRunner{}); err == nil || !strings.Contains(err.Error(), "live job active-implement") {
 		t.Fatalf("recover with active job err = %v, want live job", err)
 	}
 	if err := store.UpdateJobState(ctx, "active-implement", string(workflow.JobSucceeded)); err != nil {
@@ -1259,7 +1261,7 @@ func TestRecoverTaskImplementationBlocksActiveJobAndWrongLockOwner(t *testing.T)
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: "active-implement", Kind: "advance_started"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := recoverTaskImplementation(ctx, store, "task-001", "owner/repo", "lead", false, &stubTaskRecoverGitHub{}); err == nil || !strings.Contains(err.Error(), "live job active-implement") {
+	if _, err := recoverTaskImplementationForRunner(ctx, store, "task-001", "owner/repo", "lead", false, &stubTaskRecoverGitHub{}, subprocess.ExecRunner{}); err == nil || !strings.Contains(err.Error(), "live job active-implement") {
 		t.Fatalf("recover during pending advancement err = %v, want live job", err)
 	}
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: "active-implement", Kind: "advance_completed"}); err != nil {
@@ -1271,7 +1273,7 @@ func TestRecoverTaskImplementationBlocksActiveJobAndWrongLockOwner(t *testing.T)
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: "active-implement", Kind: string(workflow.JobCancelled), Message: "cancel requested from running"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := recoverTaskImplementation(ctx, store, "task-001", "owner/repo", "lead", false, &stubTaskRecoverGitHub{}); err == nil || !strings.Contains(err.Error(), "live job active-implement") {
+	if _, err := recoverTaskImplementationForRunner(ctx, store, "task-001", "owner/repo", "lead", false, &stubTaskRecoverGitHub{}, subprocess.ExecRunner{}); err == nil || !strings.Contains(err.Error(), "live job active-implement") {
 		t.Fatalf("recover during unsettled cancellation err = %v, want live job", err)
 	}
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: "active-implement", Kind: "cancel_settled"}); err != nil {
@@ -1280,7 +1282,7 @@ func TestRecoverTaskImplementationBlocksActiveJobAndWrongLockOwner(t *testing.T)
 	if _, err := store.CreateLock(ctx, db.BranchLock{RepoFullName: "owner/repo", Branch: "task-001-bootstrap", Owner: "other"}); err != nil {
 		t.Fatalf("CreateLock returned error: %v", err)
 	}
-	if _, err := recoverTaskImplementation(ctx, store, "task-001", "owner/repo", "lead", false, &stubTaskRecoverGitHub{}); err == nil || !strings.Contains(err.Error(), "locked by other") {
+	if _, err := recoverTaskImplementationForRunner(ctx, store, "task-001", "owner/repo", "lead", false, &stubTaskRecoverGitHub{}, subprocess.ExecRunner{}); err == nil || !strings.Contains(err.Error(), "locked by other") {
 		t.Fatalf("recover after cancellation settled err = %v, want locked by other (liveness cleared)", err)
 	}
 }

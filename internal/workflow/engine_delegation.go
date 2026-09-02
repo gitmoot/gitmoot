@@ -739,7 +739,7 @@ func (e Engine) allocateAndEnqueueDelegationInner(ctx context.Context, job db.Jo
 			e.recordEffectPreAllocation(request.Repo, result.Branch, result.Path, request.Agent)
 			// The freshly-allocated worktree is created off the parent's base
 			// branch, whose tip may have advanced past the HeadSHA the child
-			// inherited from the parent payload. validateTargetCheckout (daemon)
+			// inherited from the parent payload. validateTargetCheckoutForRunner (daemon)
 			// compares the worktree HEAD against payload.HeadSHA and would
 			// spuriously reject the child on a moving parent branch. Clear the
 			// inherited HeadSHA so the child validates against its own fresh

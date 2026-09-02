@@ -12,14 +12,6 @@ type hostJobSubprocessRunner struct {
 	subprocess.ExecRunner
 }
 
-func (hostJobSubprocessRunner) grouped() subprocess.Runner {
-	return subprocess.GroupRunner{}
-}
-
-type groupedJobSubprocessRunner interface {
-	grouped() subprocess.Runner
-}
-
 func (w jobWorker) subprocessRunnerForJob(job db.Job) (subprocess.Runner, error) {
 	payload, err := daemonJobPayload(job)
 	if err != nil {
@@ -42,13 +34,6 @@ func jobSubprocessRunnerForBackend(backend execbackend.Backend) (subprocess.Runn
 	}, func() (subprocess.Runner, error) {
 		return hostJobSubprocessRunner{}, nil
 	})
-}
-
-func jobGroupedSubprocessRunner(runner subprocess.Runner) subprocess.Runner {
-	if grouped, ok := runner.(groupedJobSubprocessRunner); ok {
-		return grouped.grouped()
-	}
-	return runner
 }
 
 var _ subprocess.Runner = hostJobSubprocessRunner{}

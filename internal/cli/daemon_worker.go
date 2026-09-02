@@ -3578,20 +3578,6 @@ func (w jobWorker) outputAdapter(agent runtime.Agent, checkout string, out io.Wr
 	return buildRuntimeAdapter(w.ConfigHome, agent, checkout, subprocess.TeeRunner{Inner: subprocess.GroupRunner{}, Out: runtimeOutputWriter(out)})
 }
 
-// buildJobAdapter builds the job's runtime adapter for the agent's configured
-// execution backend, teeing runtime output when the caller supplies a writer.
-func (w jobWorker) buildJobAdapter(agent runtime.Agent, checkout string, output ...io.Writer) (workflow.DeliveryAdapter, error) {
-	backend := execbackend.Local
-	if strings.TrimSpace(agent.ExecBackend) != "" {
-		resolved, err := execbackend.ParseImplemented(agent.ExecBackend)
-		if err != nil {
-			return nil, err
-		}
-		backend = resolved
-	}
-	return w.buildJobAdapterForBackend(backend, agent, checkout, output...)
-}
-
 // buildJobAdapterForBackend consumes the already-resolved backend at the
 // daemon's adapter boundary. Adding a name to the selector's implemented set is
 // insufficient: a new backend must extend execbackend.Consume and supply its
