@@ -65,7 +65,7 @@ npm install
 npm run build
 ```
 
-The docs build also regenerates `website/static/llms-full.txt` through
+The docs build regenerates the ignored `website/static/llms-full.txt` through
 `npm run build:llms`.
 
 For SkillOpt train-mode changes:

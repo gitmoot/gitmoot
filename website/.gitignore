@@ -1,4 +1,5 @@
 build
 .docusaurus
 node_modules
+static/llms-full.txt
 

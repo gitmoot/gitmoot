@@ -18,6 +18,8 @@ import (
 // a done/cancel-style marker note, because it records LADDER state rather than
 // obligation completion.
 
+const malformedOrgDirectiveParkReason = "malformed directive marker"
+
 // ParkOpenOrgDirectivesForRole parks every OPEN directive obligation addressed
 // to targetRole that is not already parked. Done and cancelled directives are
 // untouched (they carry no ladder to suspend). Returns how many rows parked.
@@ -58,6 +60,33 @@ WHERE substr(body, 1, length('[org:directive to=' || ? || ' ')) = '[org:directiv
 	return result.RowsAffected()
 }
 
+// ParkMalformedOrgDirective removes a syntactically invalid directive from the
+// live TTL sweep without claiming that its obligation completed.
+func (s *Store) ParkMalformedOrgDirective(ctx context.Context, id int64, at time.Time) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `
+UPDATE workflow_notes
+SET directive_parked_at = ?, directive_parked_reason = ?
+WHERE id = ?
+	AND TRIM(directive_parked_at) = ''
+	AND substr(body, 1, length('[org:directive ')) = '[org:directive '
+	AND NOT EXISTS (
+		SELECT 1 FROM workflow_notes r
+		WHERE r.workflow_id = workflow_notes.workflow_id AND (
+			substr(r.body, 1, length('[org:directive-cancel id=' || workflow_notes.id || ' ')) = '[org:directive-cancel id=' || workflow_notes.id || ' '
+			OR substr(r.body, 1, length('[org:directive-done id=' || workflow_notes.id || ' ')) = '[org:directive-done id=' || workflow_notes.id || ' '
+		)
+	)`,
+		at.UTC().Format(time.RFC3339Nano), malformedOrgDirectiveParkReason, id)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
+}
+
 // UnparkOrgDirectivesForRole returns targetRole's parked directives to the live
 // sweep. The nudge anchor (directive_last_nudged_at) is reset to the unpark
 // time: a directive whose TTL elapsed while its seat was archived must get a
@@ -72,8 +101,9 @@ func (s *Store) UnparkOrgDirectivesForRole(ctx context.Context, targetRole strin
 UPDATE workflow_notes
 SET directive_parked_at = '', directive_parked_reason = '', directive_last_nudged_at = ?
 WHERE substr(body, 1, length('[org:directive to=' || ? || ' ')) = '[org:directive to=' || ? || ' '
-	AND TRIM(directive_parked_at) <> ''`,
-		stamp, targetRole, targetRole)
+	AND TRIM(directive_parked_at) <> ''
+	AND directive_parked_reason <> ?`,
+		stamp, targetRole, targetRole, malformedOrgDirectiveParkReason)
 	if err != nil {
 		return 0, err
 	}
@@ -110,8 +140,9 @@ func (s *Store) UnarchiveOrgSeatTransition(ctx context.Context, targetRole strin
 UPDATE workflow_notes
 SET directive_parked_at = '', directive_parked_reason = '', directive_last_nudged_at = ?
 WHERE substr(body, 1, length('[org:directive to=' || ? || ' ')) = '[org:directive to=' || ? || ' '
-	AND TRIM(directive_parked_at) <> ''`,
-		stamp, targetRole, targetRole)
+	AND TRIM(directive_parked_at) <> ''
+	AND directive_parked_reason <> ?`,
+		stamp, targetRole, targetRole, malformedOrgDirectiveParkReason)
 	if err != nil {
 		return 0, err
 	}
