@@ -106,6 +106,13 @@ func (m PipelineAutoMerger) Evaluate(ctx context.Context, request PipelineAutoMe
 		readiness.Reason = "pull request is not mergeable; rebase or update the branch"
 		return readiness, nil
 	}
+	if required, reconciled, reason, err := ensureWorkloadModeReconciled(ctx, m.Store, m.GitHub, repo, int64(request.PullRequest), head); err != nil {
+		return PipelineAutoMergeReadiness{}, err
+	} else if required && !reconciled {
+		readiness.Waiting = true
+		readiness.Reason = reason
+		return readiness, nil
+	}
 	gate := PolicyMergeGate{
 		Store:             m.Store,
 		GitHub:            m.GitHub,
@@ -146,6 +153,22 @@ func (m PipelineAutoMerger) Merge(ctx context.Context, request PipelineAutoMerge
 	repo, err := parseRepoFullName(request.Repo)
 	if err != nil {
 		return PipelineAutoMergeResult{}, err
+	}
+	if m.Store == nil || m.GitHub == nil {
+		return PipelineAutoMergeResult{}, fmt.Errorf("pipeline auto-merge executor is not configured")
+	}
+	pr, err := m.GitHub.GetPullRequest(ctx, repo, int64(request.PullRequest))
+	if err != nil {
+		return PipelineAutoMergeResult{}, err
+	}
+	head := strings.TrimSpace(pr.HeadSHA)
+	if head != strings.TrimSpace(request.HeadSHA) {
+		return PipelineAutoMergeResult{Reason: fmt.Sprintf("pull request head drifted after review: reviewed %s, current %s", shortSHA(request.HeadSHA), shortSHA(head))}, nil
+	}
+	if required, reconciled, reason, err := ensureWorkloadModeReconciled(ctx, m.Store, m.GitHub, repo, int64(request.PullRequest), head); err != nil {
+		return PipelineAutoMergeResult{}, err
+	} else if required && !reconciled {
+		return PipelineAutoMergeResult{Reason: reason}, nil
 	}
 	result, err := executePullRequestMerge(ctx, m.GitHub, github.MergePullRequestInput{
 		Repo:            repo,

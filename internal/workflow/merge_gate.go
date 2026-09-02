@@ -54,6 +54,7 @@ type MergeGateGitHub interface {
 	GetPullRequest(ctx context.Context, repo github.Repository, number int64) (github.PullRequest, error)
 	GetCombinedStatus(ctx context.Context, repo github.Repository, ref string) (github.CombinedStatus, error)
 	ListCheckRunsForRef(ctx context.Context, repo github.Repository, ref string) ([]github.PullRequestCheck, error)
+	ListPullRequestFiles(ctx context.Context, repo github.Repository, number int64) ([]github.PullRequestFile, error)
 	CompareCommits(ctx context.Context, repo github.Repository, base string, head string) (github.CompareResult, error)
 	ListPullRequestChecks(ctx context.Context, repo github.Repository, number int64) ([]github.PullRequestCheck, error)
 	CreateCommitStatus(ctx context.Context, input github.CommitStatusInput) (github.CommitStatus, error)
@@ -384,6 +385,11 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	}
 	if pr.Mergeable != nil && !*pr.Mergeable {
 		return g.block(ctx, request, headSHA, "pull request is not mergeable; rebase or update the branch", MergeBlockTransient)
+	}
+	if required, reconciled, reason, err := ensureWorkloadModeReconciled(ctx, g.Store, g.GitHub, repo, int64(request.PullRequest), headSHA); err != nil {
+		return MergeDecision{}, err
+	} else if required && !reconciled {
+		return g.pending(ctx, request, headSHA, reason)
 	}
 	result, err := g.executePullRequestMergeFenced(ctx, request, github.MergePullRequestInput{
 		Repo:            repo,

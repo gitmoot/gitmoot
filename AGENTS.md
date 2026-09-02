@@ -441,10 +441,12 @@ The two axes — the head axis has two shapes — and both axes can be true at o
   carries only what you intended: `git diff origin/<baseRefName>..HEAD` and a
   tree read confirming no file you never touched reappears or vanishes.
   - **Sub-case of the head axis: the head moved BACK** — a force-push restored
-    an earlier approved SHA. An exact-head gate keyed to `head_sha` cannot see
-    this: the tree exists and the SHA matches a prior approval. But that
-    approval was made against a different base and against intermediate history
-    the force-push discarded. Treat it as unreviewed.
+    an earlier approved SHA. `ensureFinalReviewCaptured` binds approval to
+    `head_sha`; it does not persist the reviewed base SHA. If the base stayed
+    unchanged, the restored head and merge tree are identical and discarded
+    intermediate commits are irrelevant. The current gate cannot prove that
+    invariant, so treat the restored head as unreviewed as a conservative
+    fail-closed policy, not because the base necessarily changed.
 - **The base moved.** The verdict still names a commit that still exists and git
   still reports CLEAN, yet nobody reviewed `base` + branch, which is what lands.
   **The sound instrument is to build and test the merge result** — re-trigger CI
@@ -497,49 +499,65 @@ Under ultracode, orchestrate via the Workflow tool with opus sub-agents
 
 **Current mode: THROUGHPUT.**
 
-A mode switch is either a merged PR that changes the line above, or a durable
-`[operating-mode ...]` workflow note from the owner (or a coordinator acting on a
-recorded owner instruction). A note takes effect at its own timestamp and this
-line is then corrected in the next PR that touches this file; the note path's
-precedent is STEADY, set by owner instruction in note 107313 on 2026-09-02 and
-since superseded by a merged PR. A merged PR takes effect at that PR's
-`mergedAt` time only after the pre-merge reconciliation below. The later valid
-source wins.
+A mode decision is an append-only
+`[operating-mode repo=<owner/repo> mode=<THROUGHPUT|STEADY|DRAIN>]` workflow
+note from the owner (or a coordinator acting on a recorded owner instruction).
+A PR that changes the marker above is a second materialization path, but it
+cannot invent a later decision merely by merging later. A merged marker PR takes
+effect at its `mergedAt` only after the pre-merge reconciliation below, and the
+later valid source wins. The note path's precedent is STEADY, decided by owner
+instruction in note 107313 on 2026-09-02 and since superseded; the marker above
+is whatever `origin/main:AGENTS.md` currently says, which is the only line a
+seat should trust.
 
-Immediately before merging a mode-switch PR, re-read the newest
-`[operating-mode ...]` note and record its id (or `none`) on the PR. The PR's
-reviewed head must implement that note's mode, unless a later durable owner
-instruction explicitly chooses another mode. Otherwise update the PR and
-re-review it, or do not merge it. An unreconciled stale PR is not a valid switch,
-and its later `mergedAt` timestamp cannot override a newer owner instruction.
+Before a mode-marker PR is marked ready, post
+`[workload-mode-reconciliation repo=<owner/repo> pr=<number> head=<40-character-reviewed-head> mode=<mode> decision_note=<id|none>]`.
+For a PR-sourced decision, use `decision_note=none`; the reconciliation row's
+`created_at` is then `decided_at`. Otherwise `decision_note` names the newest
+operating-mode note the exact head implements, and that note's `created_at` is
+`decided_at`. A later operating-mode note supersedes the reconciliation and
+requires a new exact-head row.
 
-1. resolve the mode from BOTH sources and steer to the LATER one: fetch
-   `origin/main` and read the marker from `origin/main:AGENTS.md` rather than the
-   seat's worktree, AND read the newest `[operating-mode ...]` workflow note.
-   Between a note and the PR that corrects the file, `AGENTS.md` is stale BY
-   CONSTRUCTION, so a coordinator reading only the file in that window steers
-   every seat to the superseded mode. Name which source you read;
-2. comment on the merged mode-switch PR with this exact transition record:
-   `[workload-mode-transition]`, `mode: <THROUGHPUT|STEADY|DRAIN>`,
-   `effective_commit: <40-character SHA>`, `observed_at: <RFC3339>`, zero or more
-   `implementer: <seat> issue=<number> pr=<number|none> accepted_at=<RFC3339>`
-   lines, zero or more `review: <job-id> pr=<number> created_at=<RFC3339>`
-   lines, then
-   `[/workload-mode-transition]`.
+This is mechanically enforced, not a pre-merge memory check. Both the native
+`PolicyMergeGate` and the separate `PipelineAutoMerger` read the paginated PR
+file list. A changed `+`/`-` line containing the exact `**Current mode:` marker
+requires a matching reconciliation row. An `AGENTS.md` entry whose patch is
+missing or ambiguous fails closed. `PipelineAutoMerger.Merge` re-reads the PR
+and both note streams at the final merge boundary; an older reconciled PR that
+merges after a newer owner decision cannot override the newer decision.
 
-For DRAIN, the listed transition wave is derived from durable timestamps:
-implementation assignments accepted before the switch's effective time that
-have not reached a terminal handoff, plus review jobs created before that time
-that were queued or running then. The effective time is `mergedAt` for a
-PR-sourced switch and the note's `created_at` for a note-sourced switch.
-`accepted_at` is the timestamp of the Herdr pane's first `working` status event
-after the issue-backed assignment prompt; `created_at` is the job-store
-timestamp. A merged PR always exists for a PR-sourced switch, so that record
-does not depend on a pre-existing workflow. For a NOTE-sourced switch the note
-id IS the record and the transition record is posted as a workflow note, because
-the correcting PR may not exist yet. The mode changes how much work may start;
-never relaxes correctness, exact-head review, CI, or the merge authority
-recorded in the org config.
+Resolve the active decision from both durable sources: read the marker from
+`origin/main:AGENTS.md`, never a seat worktree, and read the newest typed
+operating-mode/reconciliation note. Decisions are ordered by `decided_at`
+(the decision row's `created_at`), not by when their materialization later
+activates. Name both sources in the handoff.
+
+Record every activation with:
+`[workload-mode-transition]`,
+`mode: <THROUGHPUT|STEADY|DRAIN>`,
+`decision_ref: workflow-note:<id>`,
+`change_ref: none|pr:<owner/repo>#<number>@<reviewed-head>`,
+`activation_ref: workflow-note:<id>|commit:<merge-sha>`,
+`decided_at: <RFC3339>`,
+`effective_at: <RFC3339>`,
+`observed_at: <RFC3339>`, zero or more
+`implementer: <seat> issue=<number> pr=<number|none> accepted_at=<RFC3339>`
+lines, zero or more `review: <job-id> pr=<number> created_at=<RFC3339>` lines,
+then `[/workload-mode-transition]`. A direct STEADY/THROUGHPUT note may be both
+the decision and activation reference. A PR activates at its merge commit. A
+note-sourced DRAIN uses a later activation-marker note, so no field claims a
+commit that does not exist.
+
+A DRAIN decision freezes new admissions at `decided_at`; the previously active
+mode remains active while DRAIN prerequisites are installed. The transition
+wave is the non-terminal implementation assignments accepted before
+`decided_at` plus review jobs created before it that were queued or running
+then. DRAIN becomes active only at `effective_at`: `mergedAt` for a reconciled
+PR after its prerequisites, or the activation-marker note's `created_at` for a
+note source. A later owner decision cancels an unactivated DRAIN.
+`accepted_at` is the Herdr pane's first `working` event after the issue-backed
+assignment prompt; review `created_at` is the job-store timestamp. Mode changes
+never relax correctness, exact-head review, CI, or org merge authority.
 
 Across ALL THREE modes, use exactly one independent reviewer per corrected head.
 Parallel review lanes mean different PRs, not multiple reviewers on one head.
@@ -604,14 +622,14 @@ escalations, and an armed merge gate then merged the PR without them.
 - After activation, cap the `gitmoot/*` scope at **two active implementers and
   one running reviewer**. An active implementer is a persistent seat currently
   changing code or a running engine implementation job.
-- A DRAIN switch is not effective until the coordinator configures the shared
-  daemon with `[daemon] workers = 1`; every active
-  `[repos."gitmoot/*"].max_parallel` override must be absent, zero, or one.
-  Apply the warm reload and verify both the effective global worker count and
-  every effective per-repository limit. This is the atomic runtime gate shared
-  by native PR fanout, heartbeats, and manual background reviews. For a
-  PR-sourced switch, complete this before merge; for a note-sourced switch,
-  complete it before posting the marker.
+- A DRAIN decision freezes admission immediately, but DRAIN is not active until
+  the coordinator configures the shared daemon with `[daemon] workers = 1`;
+  every active `[repos."gitmoot/*"].max_parallel` override must be absent, zero,
+  or one. Apply the warm reload and verify the live worker setting plus every
+  effective per-repository limit; plain `gitmoot daemon status` renders process
+  arguments and is not proof of a warm-reloaded value. For a PR source, finish
+  these prerequisites before marking the reconciled PR ready and merging it.
+  For a note source, finish them before posting the separate activation marker.
 - Before DRAIN activates, every foreground or persistent-seat review already in
   progress must reach a terminal handoff; those reviews cannot be grandfathered.
   All DRAIN reviews then run as background engine jobs. Never bypass the shared
