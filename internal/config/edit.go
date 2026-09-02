@@ -13,8 +13,8 @@ import (
 // SetConfigScalar replaces the value of an existing scalar key in the config
 // file, preserving comments, key order, and formatting (tomledit edits the
 // lossless AST). keyPath is the full dotted path, e.g.
-// {"agents", "planner", "max_background"} or {"feedback", "repo"}. The key must
-// already exist — adding/removing keys or whole sections stays an $EDITOR job.
+// {"agents", "planner", "max_background"}. The key must already exist —
+// adding/removing keys or whole sections stays an $EDITOR job.
 //
 // The write is atomic (temp file + rename) and validated: if the resulting
 // file fails to re-parse through the Load* parsers, the original is restored
