@@ -92,24 +92,20 @@ func (s *Store) GetAgentTemplate(ctx context.Context, id string) (AgentTemplate,
 }
 
 func (s *Store) ListAgentTemplates(ctx context.Context) ([]AgentTemplate, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT t.id, t.name, t.description, t.source_repo, t.source_ref, t.source_path, t.resolved_commit, t.content, t.metadata_json,
+	out, err := queryList(ctx, s.db, `SELECT t.id, t.name, t.description, t.source_repo, t.source_ref, t.source_path, t.resolved_commit, t.content, t.metadata_json,
 			COALESCE(v.id, ''), COALESCE(v.version, 0), COALESCE(v.state, ''), COALESCE(NULLIF(v.content_hash, ''), ''), t.created_at, t.updated_at
 		FROM agent_templates t
 		LEFT JOIN agent_template_versions v ON v.id = t.current_version_id
-		ORDER BY t.id`)
+		ORDER BY t.id`, nil,
+		// scanAgentTemplateWithVersion takes the DEFINED agentTemplateScanner
+		// interface, which is never identical to queryList's unnamed one, so this
+		// one call site needs an explicit adapter rather than the bare function.
+		func(row rowScanner) (AgentTemplate, error) { return scanAgentTemplateWithVersion(row) })
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	templates := []AgentTemplate{}
-	for rows.Next() {
-		template, err := scanAgentTemplateWithVersion(rows)
-		if err != nil {
-			return nil, err
-		}
-		templates = append(templates, template)
-	}
-	return templates, rows.Err()
+	// Promised a non-nil empty slice before #1759 and still does.
+	return emptyIfNil(out), nil
 }
 
 func (s *Store) GetAgentTemplateReference(ctx context.Context, ref string) (AgentTemplate, error) {

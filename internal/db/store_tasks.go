@@ -82,21 +82,13 @@ func (s *Store) GetRepo(ctx context.Context, fullName string) (Repo, error) {
 }
 
 func (s *Store) ListRepos(ctx context.Context) ([]Repo, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT owner, name, default_branch, remote_url, checkout_path, primary_checkout_path, enabled, poll_interval, last_poll_at, last_error
-		FROM repos ORDER BY full_name`)
+	out, err := queryList(ctx, s.db, `SELECT owner, name, default_branch, remote_url, checkout_path, primary_checkout_path, enabled, poll_interval, last_poll_at, last_error
+		FROM repos ORDER BY full_name`, nil, scanRepo)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	repos := []Repo{}
-	for rows.Next() {
-		repo, err := scanRepo(rows)
-		if err != nil {
-			return nil, err
-		}
-		repos = append(repos, repo)
-	}
-	return repos, rows.Err()
+	// Promised a non-nil empty slice before #1759 and still does.
+	return emptyIfNil(out), nil
 }
 
 // HealRepoCheckout atomically replaces a repo checkout only when it still has
@@ -198,20 +190,17 @@ func upsertGoal(ctx context.Context, execer sqlExecer, goal Goal) error {
 }
 
 func (s *Store) ListGoals(ctx context.Context) ([]Goal, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, title, source, status FROM goals ORDER BY id`)
+	out, err := queryList(ctx, s.db, `SELECT id, title, source, status FROM goals ORDER BY id`, nil,
+		func(row rowScanner) (Goal, error) {
+			var goal Goal
+			err := row.Scan(&goal.ID, &goal.Title, &goal.Source, &goal.Status)
+			return goal, err
+		})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	goals := []Goal{}
-	for rows.Next() {
-		var goal Goal
-		if err := rows.Scan(&goal.ID, &goal.Title, &goal.Source, &goal.Status); err != nil {
-			return nil, err
-		}
-		goals = append(goals, goal)
-	}
-	return goals, rows.Err()
+	// Promised a non-nil empty slice before #1759 and still does.
+	return emptyIfNil(out), nil
 }
 
 func (s *Store) UpsertTask(ctx context.Context, task Task) error {

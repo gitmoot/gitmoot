@@ -196,25 +196,23 @@ func (s *Store) ListDashboardUnlabeledJobs(ctx context.Context, since string) ([
 }
 
 func (s *Store) ListDashboardBlockedJobs(ctx context.Context) ([]DashboardJobRow, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT j.id, j.agent, j.state, j.workflow_id, j.repo,
+	out, err := queryList(ctx, s.db, `SELECT j.id, j.agent, j.state, j.workflow_id, j.repo,
 		j.payload, j.created_at, j.updated_at,
 		COALESCE(NULLIF(j.blocker_suggested_action, ''),
 			(SELECT e.message FROM job_events e WHERE e.job_id = j.id ORDER BY e.id DESC LIMIT 1), '')
-	FROM jobs j WHERE j.state = 'blocked' ORDER BY j.updated_at DESC, j.id`)
+	FROM jobs j WHERE j.state = 'blocked' ORDER BY j.updated_at DESC, j.id`, nil,
+		func(row rowScanner) (DashboardJobRow, error) {
+			var item DashboardJobRow
+			err := row.Scan(&item.ID, &item.Agent, &item.State, &item.WorkflowID, &item.Repo,
+				&item.Payload, &item.CreatedAt, &item.UpdatedAt, &item.Reason)
+			return item, err
+		})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	out := []DashboardJobRow{}
-	for rows.Next() {
-		var item DashboardJobRow
-		if err := rows.Scan(&item.ID, &item.Agent, &item.State, &item.WorkflowID, &item.Repo,
-			&item.Payload, &item.CreatedAt, &item.UpdatedAt, &item.Reason); err != nil {
-			return nil, err
-		}
-		out = append(out, item)
-	}
-	return out, rows.Err()
+	// Promised a non-nil empty slice before #1759 and still does: this one is
+	// served directly to the dashboard's HTTP client.
+	return emptyIfNil(out), nil
 }
 
 func (s *Store) ListDashboardTerminalBuckets(ctx context.Context, since, now string) ([]DashboardTerminalBucket, error) {

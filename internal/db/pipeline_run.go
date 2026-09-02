@@ -154,21 +154,9 @@ func (s *Store) ActivePipelineRun(ctx context.Context, pipeline string) (Pipelin
 // advanced, so a parked (blocked/failed) or terminal run consumes zero compute
 // until it is resumed.
 func (s *Store) ListActivePipelineRuns(ctx context.Context) ([]PipelineRun, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, pipeline, trigger, payload_json, spec_hash, state, halt_stage, halt_reason, needs_json, started_at, finished_at
-		FROM pipeline_runs WHERE state = 'running' ORDER BY started_at, id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var runs []PipelineRun
-	for rows.Next() {
-		run, err := scanPipelineRun(rows)
-		if err != nil {
-			return nil, err
-		}
-		runs = append(runs, run)
-	}
-	return runs, rows.Err()
+	// Returns NIL for zero rows, as before #1759 (see queryList).
+	return queryList(ctx, s.db, `SELECT id, pipeline, trigger, payload_json, spec_hash, state, halt_stage, halt_reason, needs_json, started_at, finished_at
+		FROM pipeline_runs WHERE state = 'running' ORDER BY started_at, id`, nil, scanPipelineRun)
 }
 
 // UpdatePipelineRun writes a run's mutable advancement fields (state, halt

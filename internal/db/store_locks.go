@@ -129,20 +129,14 @@ func (s *Store) GetResourceLock(ctx context.Context, resourceKey string) (Resour
 
 // ListResourceLocks returns all held resource locks, ordered by resource key.
 func (s *Store) ListResourceLocks(ctx context.Context) ([]ResourceLock, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT resource_key, owner_job_id, owner_token, owner_pid, owner_hostname, command_hash, acquired_at, updated_at, expires_at FROM resource_locks ORDER BY resource_key`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var locks []ResourceLock
-	for rows.Next() {
-		var lock ResourceLock
-		if err := rows.Scan(&lock.ResourceKey, &lock.OwnerJobID, &lock.OwnerToken, &lock.OwnerPID, &lock.OwnerHostname, &lock.CommandHash, &lock.AcquiredAt, &lock.UpdatedAt, &lock.ExpiresAt); err != nil {
-			return nil, err
-		}
-		locks = append(locks, lock)
-	}
-	return locks, rows.Err()
+	// Returns NIL for no locks, as it did before #1759. Not normalised on
+	// purpose: see queryList's note on the nil/empty contract.
+	return queryList(ctx, s.db, `SELECT resource_key, owner_job_id, owner_token, owner_pid, owner_hostname, command_hash, acquired_at, updated_at, expires_at FROM resource_locks ORDER BY resource_key`, nil,
+		func(row rowScanner) (ResourceLock, error) {
+			var lock ResourceLock
+			err := row.Scan(&lock.ResourceKey, &lock.OwnerJobID, &lock.OwnerToken, &lock.OwnerPID, &lock.OwnerHostname, &lock.CommandHash, &lock.AcquiredAt, &lock.UpdatedAt, &lock.ExpiresAt)
+			return lock, err
+		})
 }
 
 // SupersedeAdvanceLockKeyPrefix namespaces the resource lock a supersession
