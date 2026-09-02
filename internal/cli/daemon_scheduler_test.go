@@ -5382,3 +5382,176 @@ func TestTickCandidatesRetriesOnError(t *testing.T) {
 		t.Fatalf("malformed owner query ran %d times, want 2", got)
 	}
 }
+
+// scriptedCursorStore drives the job_events cursor cache (#1758) directly: it
+// reports a cursor the test controls and can mutate its own candidate set from
+// INSIDE the guarded query, which is how the hazard the cache must survive is
+// reproduced deterministically — an event landing after the cursor was read but
+// after the query already took its snapshot.
+type scriptedCursorStore struct {
+	cursor      int64
+	ids         []string
+	queries     int
+	cursorReads int
+	cursorErr   error
+	duringQuery func(*scriptedCursorStore)
+}
+
+func (s *scriptedCursorStore) MaxJobEventID(context.Context) (int64, error) {
+	s.cursorReads++
+	if s.cursorErr != nil {
+		return 0, s.cursorErr
+	}
+	return s.cursor, nil
+}
+
+func (s *scriptedCursorStore) JobIDsWithPendingAdvanceRetry(context.Context) ([]string, error) {
+	s.queries++
+	snapshot := append([]string(nil), s.ids...)
+	if s.duringQuery != nil {
+		s.duringQuery(s)
+	}
+	return snapshot, nil
+}
+
+func (s *scriptedCursorStore) JobIDsWithPendingCommentRetry(context.Context) ([]string, error) {
+	return nil, nil
+}
+
+func (s *scriptedCursorStore) JobIDsWithPendingDelegationWorktreeReclaim(context.Context) ([]string, error) {
+	return nil, nil
+}
+
+func (s *scriptedCursorStore) JobIDsWithAgedTerminalDelegationWorktree(context.Context, time.Time) ([]string, error) {
+	return nil, nil
+}
+
+func (s *scriptedCursorStore) TaskIDsWithTerminalWorktree(context.Context) ([]string, error) {
+	return nil, nil
+}
+
+func (s *scriptedCursorStore) FirstMalformedNonFinalJob(context.Context) (string, error) {
+	return "", nil
+}
+
+// The cursor cache may DEFER an advancement by at most one tick; it must never
+// DROP one. The mutant this kills is recording the cursor AFTER the query instead
+// of before: an event written while the query is in flight would then be covered
+// by a cursor the query never saw, and the candidate would be skipped forever.
+func TestJobEventCursorCacheDefersButNeverDropsAnAdvancement(t *testing.T) {
+	ctx := context.Background()
+	cache := &jobEventCandidateCache{}
+	store := &scriptedCursorStore{cursor: 10, ids: []string{"job-a"}}
+	tick := func() []string {
+		cand := newTickCandidates(store)
+		cand.events = cache
+		ids, err := cand.advanceRetryCandidates(ctx)
+		if err != nil {
+			t.Fatalf("advanceRetryCandidates: %v", err)
+		}
+		return ids
+	}
+
+	if got := tick(); !reflect.DeepEqual(got, []string{"job-a"}) {
+		t.Fatalf("cold tick candidates = %v, want [job-a]", got)
+	}
+	if store.queries != 1 {
+		t.Fatalf("cold tick ran %d queries, want 1", store.queries)
+	}
+
+	// Unmoved cursor: the candidate query is SKIPPED and the memo is served.
+	if got := tick(); !reflect.DeepEqual(got, []string{"job-a"}) {
+		t.Fatalf("cached tick candidates = %v, want [job-a]", got)
+	}
+	if store.queries != 1 {
+		t.Fatalf("candidate query re-ran with an unmoved cursor (%d runs)", store.queries)
+	}
+	// Deliberately NO assertion on cursor-read counts here: this test must fail on
+	// the DROP, not on an incidental extra query. The read cadence is pinned
+	// separately by TestJobEventCursorCacheReadsCursorOncePerTick.
+
+	// An unrelated event moves the cursor, forcing a query — and a SECOND event
+	// making job-b a candidate lands while that query is in flight.
+	store.cursor = 11
+	store.duringQuery = func(s *scriptedCursorStore) {
+		s.cursor = 12
+		s.ids = []string{"job-a", "job-b"}
+	}
+	if got := tick(); !reflect.DeepEqual(got, []string{"job-a"}) {
+		t.Fatalf("in-flight tick candidates = %v, want the pre-insert snapshot [job-a]", got)
+	}
+	store.duringQuery = nil
+
+	// The cursor now sits past the one that tick recorded, so the next tick must
+	// re-run and surface job-b: deferred by exactly one tick, not dropped.
+	if got := tick(); !reflect.DeepEqual(got, []string{"job-a", "job-b"}) {
+		t.Fatalf("job-b was DROPPED by the cursor cache: candidates = %v", got)
+	}
+	if store.queries != 3 {
+		t.Fatalf("queries = %d, want 3 (cold, cursor-moved, deferred pickup)", store.queries)
+	}
+}
+
+// A cursor read that fails must fall through to the query. The cache may only
+// ever remove redundant work, so a broken cursor degrades to the un-gated
+// behavior rather than to a skip.
+func TestJobEventCursorCacheFallsBackWhenCursorUnavailable(t *testing.T) {
+	ctx := context.Background()
+	cache := &jobEventCandidateCache{}
+	store := &scriptedCursorStore{cursor: 7, ids: []string{"job-a"}}
+	tick := func() []string {
+		cand := newTickCandidates(store)
+		cand.events = cache
+		ids, err := cand.advanceRetryCandidates(ctx)
+		if err != nil {
+			t.Fatalf("advanceRetryCandidates: %v", err)
+		}
+		return ids
+	}
+
+	tick()
+	store.cursorErr = errors.New("cursor unavailable")
+	if got := tick(); !reflect.DeepEqual(got, []string{"job-a"}) {
+		t.Fatalf("candidates with a broken cursor = %v, want [job-a]", got)
+	}
+	if store.queries != 2 {
+		t.Fatalf("queries = %d, want 2: a failed cursor read must never skip the query", store.queries)
+	}
+}
+
+// With no cache attached — every non-supervisor caller — the gating is inert and
+// the cursor is never even read.
+func TestJobEventCursorCacheAbsentRunsEveryQuery(t *testing.T) {
+	ctx := context.Background()
+	store := &scriptedCursorStore{cursor: 3, ids: []string{"job-a"}}
+	for range 3 {
+		cand := newTickCandidates(store)
+		if _, err := cand.advanceRetryCandidates(ctx); err != nil {
+			t.Fatalf("advanceRetryCandidates: %v", err)
+		}
+	}
+	if store.queries != 3 || store.cursorReads != 0 {
+		t.Fatalf("queries=%d cursorReads=%d, want 3 and 0 with no cache attached", store.queries, store.cursorReads)
+	}
+}
+
+// One cheap cursor read replaces the heavy GROUP BY on an idle tick; two reads
+// would mean the gate costs more than it saves on the common path.
+func TestJobEventCursorCacheReadsCursorOncePerTick(t *testing.T) {
+	ctx := context.Background()
+	cache := &jobEventCandidateCache{}
+	store := &scriptedCursorStore{cursor: 5, ids: []string{"job-a"}}
+	for range 4 {
+		cand := newTickCandidates(store)
+		cand.events = cache
+		if _, err := cand.advanceRetryCandidates(ctx); err != nil {
+			t.Fatalf("advanceRetryCandidates: %v", err)
+		}
+	}
+	if store.cursorReads != 4 {
+		t.Fatalf("cursor reads = %d over 4 ticks, want exactly 4", store.cursorReads)
+	}
+	if store.queries != 1 {
+		t.Fatalf("candidate queries = %d over 4 idle ticks, want 1", store.queries)
+	}
+}

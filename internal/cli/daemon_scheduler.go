@@ -904,6 +904,7 @@ type tickCandidateStore interface {
 	JobIDsWithAgedTerminalDelegationWorktree(ctx context.Context, cutoff time.Time) ([]string, error)
 	TaskIDsWithTerminalWorktree(ctx context.Context) ([]string, error)
 	FirstMalformedNonFinalJob(ctx context.Context) (string, error)
+	MaxJobEventID(ctx context.Context) (int64, error)
 }
 
 // candidateMemo lazily runs one per-tick candidate query and shares its RESULT
@@ -933,7 +934,12 @@ func (m *candidateMemo) get(fetch func() ([]string, error)) ([]string, error) {
 }
 
 type tickCandidates struct {
-	store              tickCandidateStore
+	store tickCandidateStore
+	// config carries the tick's config.toml memo (#1758). It rides the candidate
+	// carrier for the same reason the candidate sets do: the carrier is created
+	// once per tick and consumed by every repo in the sweep, so a value resolved
+	// here is resolved exactly once per tick instead of once per repo.
+	config             tickConfigCache
 	advance            candidateMemo
 	comment            candidateMemo
 	reclaim            candidateMemo
@@ -942,6 +948,11 @@ type tickCandidates struct {
 	malformedOwnerDone bool
 	malformedOwnerID   string
 	skipAgedReclaim    bool
+	// events is the supervisor's CROSS-tick job_events cursor cache (#1758). It
+	// outlives the carrier (it hangs off the tracker), which is exactly why it is
+	// a pointer while config is a value: the config memo must die with the tick,
+	// the cursor must survive it. nil disables cursor gating entirely.
+	events *jobEventCandidateCache
 }
 
 // newTickCandidates is a package var (not a plain func) only so the once-per-tick
@@ -951,15 +962,107 @@ var newTickCandidates = func(store tickCandidateStore) *tickCandidates {
 	return &tickCandidates{store: store}
 }
 
+// jobEventCandidateKind indexes the candidate sets whose value is a pure function
+// of job_events and can therefore be gated on that table's change cursor.
+type jobEventCandidateKind int
+
+const (
+	jobEventCandidateAdvance jobEventCandidateKind = iota
+	jobEventCandidateComment
+	jobEventCandidateKindCount
+)
+
+// jobEventCandidateCache carries the advance- and comment-retry candidate sets
+// ACROSS ticks, keyed by db.MaxJobEventID. Both queries GROUP BY job_id over the
+// whole of job_events (92K rows on the affected host and growing without bound)
+// and ran every ~2.5s whether or not a single event had been written (#1758).
+//
+// The cursor is only ever a permission to SKIP a query whose answer provably
+// cannot have changed — never a substitute for one. Two properties make that
+// safe, and the second is the one worth guarding:
+//
+//  1. Soundness of the key: see db.MaxJobEventID. Both gated queries read only
+//     (id, kind, job_id), which no production write mutates in place, and rows are
+//     otherwise append-only — so an unmoved maximum means an unchanged result.
+//  2. Ordering: the cursor is read BEFORE the query it guards. An event written
+//     between the two is then either seen by the query (fine) or not — but either
+//     way the RECORDED cursor pre-dates it, so the next tick sees a moved cursor
+//     and re-runs. Recording the cursor after the query would let exactly that
+//     event be skipped forever. The worst case is therefore a candidate deferred
+//     by one tick, never dropped.
+//
+// It is guarded by a mutex rather than relying on the tick goroutine: the carrier
+// is per-tick and single-threaded, but this cache is shared by every carrier the
+// supervisor makes, and the single-repo and fleet loops both reach it.
+type jobEventCandidateCache struct {
+	mu      sync.Mutex
+	entries [jobEventCandidateKindCount]jobEventCandidateEntry
+}
+
+type jobEventCandidateEntry struct {
+	cursor int64
+	valid  bool
+	ids    []string
+}
+
+func (c *jobEventCandidateCache) lookup(kind jobEventCandidateKind, cursor int64) ([]string, bool) {
+	if c == nil {
+		return nil, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry := c.entries[kind]
+	if !entry.valid || entry.cursor != cursor {
+		return nil, false
+	}
+	return entry.ids, true
+}
+
+func (c *jobEventCandidateCache) remember(kind jobEventCandidateKind, cursor int64, ids []string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[kind] = jobEventCandidateEntry{cursor: cursor, valid: true, ids: ids}
+}
+
+// jobEventCandidates runs one job_events-derived candidate query, skipping it when
+// the change cursor has not moved since the last tick that ran it. Any cursor read
+// failure falls through to the query: the cache may only ever remove redundant
+// work, so a broken cursor must degrade to today's behavior, not to a skip.
+func (c *tickCandidates) jobEventCandidates(ctx context.Context, kind jobEventCandidateKind, fetch func() ([]string, error)) ([]string, error) {
+	if c.events == nil {
+		return fetch()
+	}
+	cursor, err := c.store.MaxJobEventID(ctx)
+	if err != nil {
+		return fetch()
+	}
+	if ids, ok := c.events.lookup(kind, cursor); ok {
+		return ids, nil
+	}
+	ids, err := fetch()
+	if err != nil {
+		return nil, err
+	}
+	c.events.remember(kind, cursor, ids)
+	return ids, nil
+}
+
 func (c *tickCandidates) advanceRetryCandidates(ctx context.Context) ([]string, error) {
 	return c.advance.get(func() ([]string, error) {
-		return c.store.JobIDsWithPendingAdvanceRetry(ctx)
+		return c.jobEventCandidates(ctx, jobEventCandidateAdvance, func() ([]string, error) {
+			return c.store.JobIDsWithPendingAdvanceRetry(ctx)
+		})
 	})
 }
 
 func (c *tickCandidates) commentRetryCandidates(ctx context.Context) ([]string, error) {
 	return c.comment.get(func() ([]string, error) {
-		return c.store.JobIDsWithPendingCommentRetry(ctx)
+		return c.jobEventCandidates(ctx, jobEventCandidateComment, func() ([]string, error) {
+			return c.store.JobIDsWithPendingCommentRetry(ctx)
+		})
 	})
 }
 
@@ -1437,6 +1540,7 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	// five global candidate queries run once rather than once per enabled repo.
 	if cand == nil {
 		cand = newTickCandidates(worker.Store)
+		cand.events = tracker.jobEventCandidateCache()
 		runWorktreeReclaim := tracker.worktreeReclaimDue(now)
 		cand.skipAgedReclaim = !runWorktreeReclaim
 		if runWorktreeReclaim {
@@ -1478,14 +1582,15 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	// tick's dispatch or escalate the daemon the way the store-fault recovery scans
 	// above (deliberately) do. Resolved per tick, so the TTL is live-tunable like the
 	// per-repo scheduler override below.
-	if err := sweepExpiredBlockedJobs(ctx, store, resolveBlockedTTL(worker.workflowHome()), stdout, now); err != nil {
+	workflowHome := worker.workflowHome()
+	if err := sweepExpiredBlockedJobs(ctx, store, cand.config.blockedJobTTL(workflowHome), stdout, now); err != nil {
 		writeLine(stdout, "blocked_ttl sweep failed: %v", err)
 	}
 	// Opt-in blocked-since source (#1060): stale BLOCKED tasks synthesize one
 	// blocked event per continuous episode for the existing event-rule engine.
 	// Like blocked_ttl, every failure is logged and swallowed so this optional
 	// evaluator can never fail the repo tick.
-	if err := sweepBlockedTaskWakeEvents(ctx, store, worker.workflowHome(), repoFilter, stdout, now); err != nil {
+	if err := sweepBlockedTaskWakeEvents(ctx, store, workflowHome, repoFilter, cand.config.blockedRoleWakeAfter(workflowHome), stdout, now); err != nil {
 		writeLine(stdout, "blocked_since task sweep failed: %v", err)
 	}
 	// Checkout-mutating maintenance (advancement/merge retries, delegation
@@ -1517,7 +1622,7 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 		// The store path is already the resolved Gitmoot root. Using it keeps this
 		// hot-read on the daemon's actual home and prevents the raw/resolved
 		// double-resolution bug class.
-		if ttl, err := resolveDelegationWorktreeTTL(filepath.Dir(store.DatabasePath())); err != nil {
+		if ttl, err := cand.config.delegationWorktreeTTL(filepath.Dir(store.DatabasePath())); err != nil {
 			writeLine(stdout, "delegation_worktree_ttl reclaim skipped: %v", err)
 		} else if err := reclaimAgedTerminalDelegationWorktrees(ctx, worker, repoFilter, rootFilter, tracker.checkoutHeld, cand, now, ttl); err != nil {
 			writeLine(stdout, "delegation_worktree_ttl reclaim failed: %v", err)
@@ -1561,10 +1666,18 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 	// any repository. Drain before listing repos so zero enabled repos cannot
 	// suppress delivery or hide an unreadable outbox behind a healthy fleet tick.
 	health, err := drainFleetReplyWakeOutbox(ctx, store, worker, now)
-	if err != nil {
+	switch {
+	case err != nil:
 		writeLine(stdout, "reply wake outbox drain unhealthy: %v", err)
-	} else if health.inert > 0 {
-		writeLine(stdout, "reply wake outbox drain health: %s", health)
+		tracker.forgetReplyWakeOutboxHealth()
+	case health.inert > 0:
+		// Log on CHANGE only (#1758): inert obligations persist until an
+		// operator adds a matching rule, so the unchanged line is pure noise.
+		if tracker.replyWakeOutboxHealthChanged(health) {
+			writeLine(stdout, "reply wake outbox drain health: %s", health)
+		}
+	default:
+		tracker.forgetReplyWakeOutboxHealth()
 	}
 	if tracker.staleTaskLaneLockReclaimDue(now) {
 		if err := reclaimStaleTaskLaneLocks(ctx, store, "", stdout, now); err != nil {
@@ -1583,6 +1696,9 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 	// hoisting them here collapses 18 calls per query to one on the affected
 	// multi-repo daemon. Fresh each sweep; never retained.
 	cand := newTickCandidates(worker.Store)
+	// The cursor cache is the one piece of candidate state that DOES span ticks:
+	// it hangs off the tracker, and the fresh carrier borrows it for this sweep.
+	cand.events = tracker.jobEventCandidateCache()
 	runAgedReclaim := tracker.worktreeReclaimDue(now)
 	cand.skipAgedReclaim = !runAgedReclaim
 	// Scope tick faults per repo (#555 follow-up): the recovering supervisor

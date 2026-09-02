@@ -1845,6 +1845,34 @@ func (s *Store) JobIDsWithPendingAdvanceRetry(ctx context.Context) ([]string, er
 	return s.jobIDsByQuery(ctx, jobIDsWithPendingAdvanceRetrySQL)
 }
 
+// maxJobEventIDSQL is the change cursor for the candidate queries whose result is
+// a pure function of job_events. It is the same monotonic maximum the dashboard
+// already polls (dashboardChangeCursorSQL) and SQLite answers it with a single
+// descent of the integer primary key, so it costs the same whether the table
+// holds a hundred rows or a hundred thousand.
+const maxJobEventIDSQL = `SELECT COALESCE(MAX(id), 0) FROM job_events`
+
+// MaxJobEventID returns the highest job_events row id, or 0 when the table is
+// empty.
+//
+// It is a sound change cursor for JobIDsWithPendingAdvanceRetry and
+// JobIDsWithPendingCommentRetry specifically, because those two queries read only
+// the (id, kind, job_id) columns of job_events and NOTHING else — no other table,
+// no clock. Production only ever APPENDS to job_events (the sole DELETE is a
+// one-time migration that runs before any tick) and its in-place updates —
+// RefreshLatestAdvanceRetry, the running-job progress refresh, and the claimed
+// permission-policy warning — all SET message/created_at only, never id, kind or
+// job_id. So an unmoved maximum id proves those two result sets are unchanged.
+//
+// It is NOT a sound cursor for the delegation/aged/task reclaim candidates: those
+// join jobs and cleanup_obligations and compare against unixepoch('now'), so their
+// results change with the clock alone.
+func (s *Store) MaxJobEventID(ctx context.Context) (int64, error) {
+	var id int64
+	err := s.db.QueryRowContext(ctx, maxJobEventIDSQL).Scan(&id)
+	return id, err
+}
+
 // JobIDsWithPendingCommentRetry returns the IDs of jobs whose LATEST comment event
 // (by id) is comment_post_failed with no subsequent comment_posted or retry_queued
 // — exactly jobWorker.jobNeedsCommentRetry's last-one-wins rule (daemon.go),

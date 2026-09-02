@@ -3782,7 +3782,7 @@ func (w jobWorker) workflowForHost(checkout string) workflow.Engine {
 }
 
 func (w jobWorker) defaultWorkflowForRunner(checkout string, runner subprocess.Runner) workflow.Engine {
-	engine := daemonWorkflowEngineForRunner(w.Store, github.NewClient(checkout), checkout, w.workflowHome(), runner)
+	engine := daemonWorkflowEngineForRunner(w.Store, github.NewClient(checkout), checkout, w.workflowHome(), runner, nil)
 	w.applyOrchestratePolicy(&engine)
 	return engine
 }
