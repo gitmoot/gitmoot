@@ -1695,21 +1695,21 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 		// poll and it cannot separate a closed PR from an ISSUE number. Ask the forge
 		// for the authoritative answer — is this a pull request, and is it not open
 		// right now — before terminating anything.
-		closed, closedErr := d.pullRequestIsClosedOnTheForge(ctx, number, evidence)
-		if closedErr != nil {
+		answer := d.pullRequestIsClosedOnTheForge(ctx, number, evidence)
+		if answer.err != nil {
 			if firstErr == nil {
-				firstErr = closedErr
+				firstErr = answer.err
 			}
 			continue
 		}
-		if unresolved := evidence[number].unresolved; unresolved != nil {
+		if unresolved := answer.unresolved; unresolved != nil {
 			// Recorded on the JOB, once, keyed on the event kind so repeated polls do not
 			// append: an issue-bound job is a permanent condition, so this must be a fact a
 			// reader can find rather than an error the dashboard shows forever.
 			d.recordPullRequestUnresolvedOnce(ctx, job.ID, number, unresolved)
 			continue
 		}
-		if !closed {
+		if !answer.closed {
 			continue
 		}
 		reason := fmt.Sprintf("queued %s job superseded: %s pull request #%d is no longer open",
@@ -1837,10 +1837,10 @@ func (d Daemon) completePendingSupersedeFinalizations(ctx context.Context) error
 // never read as licence to terminate somebody's work. The memo caches negatives too:
 // an issue-bound job can never be terminated, so without that every job sharing the
 // number re-asks on every poll, forever.
-func (d Daemon) pullRequestIsClosedOnTheForge(ctx context.Context, number int, memo map[int]forgeClosureAnswer) (bool, error) {
+func (d Daemon) pullRequestIsClosedOnTheForge(ctx context.Context, number int, memo map[int]forgeClosureAnswer) forgeClosureAnswer {
 	if memo != nil {
 		if answer, seen := memo[number]; seen {
-			return answer.closed, answer.err
+			return answer
 		}
 	}
 	answer := forgeClosureAnswer{}
@@ -1848,17 +1848,24 @@ func (d Daemon) pullRequestIsClosedOnTheForge(ctx context.Context, number int, m
 	switch {
 	case err == nil:
 		answer.closed = pull.Number == int64(number) && !strings.EqualFold(strings.TrimSpace(pull.State), "open")
-	case github.AsTransient(err) || github.IsTransientMessage(err.Error()):
-		// NO EVIDENCE, AND SAID OUT LOUD. Leaving the job queued was never the question;
-		// observability was. A swallowed forge error makes a sweep that does nothing on
-		// every poll look exactly like a sweep with nothing to do (#1673). The caller
-		// records it and continues, so one unreachable number never blocks the rest of
-		// the poll, and it CLEARS once the outage does.
+	case !isPullRequestNotFound(err):
+		// NO EVIDENCE, AND SAID OUT LOUD - and this is now the DEFAULT arm, which is the
+		// direction that fails safe. A swallowed forge error makes a sweep that does
+		// nothing on every poll look exactly like a sweep with nothing to do (#1673).
+		//
+		// The first version keyed the quiet arm on "not transient", which review measured
+		// as swallowing 403 permission loss, 401 bad credentials, 429 rate limit,
+		// context.Canceled and gh output parse failures - every one of them recording a
+		// permanent "this number is not a pull request" claim about a real PR and
+		// returning a clean poll. transientSignatures is deliberately narrow (transport,
+		// DNS, TLS, gateway 5xx, and by its own comment NOT rate limits), so anything
+		// unrecognised must surface rather than be classified as an answer.
 		answer.err = fmt.Errorf("revalidate pull request #%d before superseding queued work: %w", number, err)
 	default:
-		// DEFINITIVE, SO NOT AN ERROR TO REPORT FOREVER. A 404 is the normal answer for a
-		// number that is not a pull request in this repo, and payload.PullRequest carries
-		// issue numbers - delegationRequest copies them onto children. Reporting it would
+		// DEFINITIVE NOT-FOUND, SO NOT AN ERROR TO REPORT FOREVER. A 404 is the normal
+		// answer for a number that is not a pull request in this repo, and
+		// payload.PullRequest carries issue numbers - delegationRequest copies them onto
+		// children. Nothing else reaches this arm. Reporting it would
 		// stamp repos.last_error on EVERY poll for the life of the job and, because
 		// firstErr is first-wins and this sweep runs before the finalization sweep and the
 		// reconcilers, mask a genuine error from every later stage. That is the same
@@ -1877,7 +1884,11 @@ func (d Daemon) pullRequestIsClosedOnTheForge(ctx context.Context, number int, m
 		// time it is asked, so re-asking per job would repeat it once per job forever.
 		memo[number] = answer
 	}
-	return answer.closed, answer.err
+	// Return the ANSWER, not two of its three fields: the first version returned
+	// (closed, err) and left the caller to fish `unresolved` back out of the memo, so a
+	// nil memo would have dropped the fact silently and fallen through to the
+	// "not closed -> continue" path with no record at all.
+	return answer
 }
 
 // pullRequestUnresolvedEvent records that the forge answered definitively that a job's
@@ -1886,29 +1897,61 @@ func (d Daemon) pullRequestIsClosedOnTheForge(ctx context.Context, number int, m
 // a poll error.
 const pullRequestUnresolvedEvent = "pull_request_unresolved"
 
-// recordPullRequestUnresolvedOnce appends pullRequestUnresolvedEvent unless this job
-// already carries one.
+// recordPullRequestUnresolvedOnce records, once, that the forge answered definitively
+// that this job's pull_request number does not name a pull request in this repo.
 //
-// ONCE is the requirement, not a nicety: the condition is permanent, so an append per
-// poll would grow job_events without bound at the daemon's tick rate - the same failure
-// the advance_retry collapse migration had to repair. Best-effort by design: this is a
-// note for a reader, and failing the poll over it would reintroduce exactly the
-// permanent red this path exists to avoid.
+// ONE ATOMIC STATEMENT, because "once" is the requirement and a read-then-write cannot
+// enforce it. The first version listed the job's events, scanned for the kind and then
+// appended - which two daemons polling the same home (the restart footgun AGENTS.md
+// warns about) both pass, both finding nothing and both appending. It also paid an
+// O(events) read per unresolved job per poll, forever, which is the exact cost class the
+// per-poll forge memo above exists to avoid. AddJobEventIfAbsent dedupes on
+// (job_id, kind) inside a single INSERT ... WHERE NOT EXISTS.
+//
+// Best-effort by design: this is a note for a reader, and failing the poll over it would
+// reintroduce the permanent red this whole path exists to avoid.
 func (d Daemon) recordPullRequestUnresolvedOnce(ctx context.Context, jobID string, number int, cause error) {
-	events, err := d.Store.ListJobEvents(ctx, jobID)
-	if err != nil {
-		return
-	}
-	for _, event := range events {
-		if event.Kind == pullRequestUnresolvedEvent {
-			return
-		}
-	}
-	_ = d.Store.AddJobEvent(ctx, db.JobEvent{
+	_ = d.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
 		JobID:   jobID,
 		Kind:    pullRequestUnresolvedEvent,
 		Message: fmt.Sprintf("#%d does not name a pull request in %s, so this job can never be superseded by a closed pull request: %v", number, d.Repo.FullName(), cause),
 	})
+}
+
+// isPullRequestNotFound reports whether a forge read answered DEFINITIVELY that the
+// number does not name a pull request in this repository.
+//
+// It matches the 404 signature only. Every other failure - 401, 403, 429, a
+// cancellation, a parse error - is NOT an answer and must surface, because classifying
+// it as "not a pull request" writes a permanent false claim about a real PR and returns
+// a clean poll. The safe direction here is fail-loud: an unrecognised failure is treated
+// as no evidence, which costs a red poll until it clears, while the opposite mistake
+// costs a silently stranded job forever (#1673).
+//
+// The whole-repo case is covered earlier and independently: ListPullRequests runs at the
+// top of the poll and hard-returns, so a repo-wide permission loss never reaches this
+// function at all. What this predicate has to get right is the MID-POLL failure - a rate
+// limit exhausted after that listing succeeded, or a shutdown cancellation.
+func isPullRequestNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	if strings.Contains(text, "http 404") || strings.Contains(text, "(404)") {
+		return true
+	}
+	// gh reports a missing pull request as "not found" without always carrying the
+	// status; require the phrase AND the absence of a competing status so a 403 body
+	// mentioning "not found" is not misread.
+	if !strings.Contains(text, "not found") {
+		return false
+	}
+	for _, competing := range []string{"401", "403", "429", "rate limit"} {
+		if strings.Contains(text, competing) {
+			return false
+		}
+	}
+	return true
 }
 
 // forgeClosureAnswer is one number's memoized revalidation outcome for a single poll.

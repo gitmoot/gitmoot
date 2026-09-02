@@ -1196,11 +1196,47 @@ func completeSupersedeFinalization(ctx context.Context, engine *Engine, store *d
 //
 // advanced false means no parent mutation can be attributed to this lifecycle and
 // the caller must NOT close the debt.
+// coordinatorRoundNeedsRepair reports whether the coordinator this job would advance is
+// holding an escalation round parked in needs_repair.
+//
+// Read-only, and deliberately not escalationRepairBlock: that one blocks the task as a
+// side effect, which is right for an advance that is being refused mid-flight and wrong
+// for a pre-flight check that runs on every recovery pass.
+func (e Engine) coordinatorRoundNeedsRepair(ctx context.Context, jobID string) (bool, error) {
+	job, err := e.Store.GetJob(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	coordinatorID := strings.TrimSpace(job.ParentJobID)
+	if coordinatorID == "" {
+		return false, nil
+	}
+	round, ok, err := e.Store.UnsettledEscalationRound(ctx, coordinatorID)
+	if err != nil {
+		return false, err
+	}
+	return ok && round.NeedsRepair(), nil
+}
+
 func (e Engine) advanceSupersededChildAtGeneration(ctx context.Context, jobID string, generation int64) (bool, error) {
 	if supersedeDebtInterleaveHook != nil {
 		if err := supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeAdvanceClaim); err != nil {
 			return false, err
 		}
+	}
+	// REFUSE BEFORE CLAIMING ANYTHING. A coordinator whose escalation round is parked in
+	// needs_repair cannot be advanced, so this pass must not take the ownership lease or
+	// write the claim bracket for work it cannot do (#1673). Read-only on purpose: the
+	// parked round already emitted its one repair signal and whichever advance path hits
+	// the full guard blocks the task, so refusing here writes nothing and simply leaves
+	// the debt outstanding for the poll after the repair.
+	//
+	// The typed check after the advance stays as defence in depth: this one is an
+	// optimisation and a hygiene fix, that one is the correctness barrier.
+	if parked, err := e.coordinatorRoundNeedsRepair(ctx, jobID); err != nil {
+		return false, err
+	} else if parked {
+		return false, nil
 	}
 	// OWNERSHIP FIRST, and it is a renewable lease rather than an age-bounded
 	// marker: RetryJob's exclusion predicate reads this lock, so taking it here is
@@ -1247,18 +1283,42 @@ func (e Engine) advanceSupersededChildAtGeneration(ctx context.Context, jobID st
 	// aborted barrier returns before the effect it guards.
 	anchored := e
 	anchored.supersedeAdvance = &supersedeAdvanceAnchor{JobID: jobID, Generation: generation, LockKey: lockKey, Token: token}
-	// PARENT DAG ONLY, and the two guards are not interchangeable (#1673/#1731). The
-	// anchor stops a SUPERSEDED lifecycle from applying parent effects; this stops a
-	// DEAD CHILD from dispatching its OWN delegations, which no ownership check can
-	// refuse because that dispatch belongs to the anchored lifecycle and is therefore
-	// legitimate by the anchor's own test. This path was written before the parent-only
-	// operation existed and called the full AdvanceJob; on the merged tree that
-	// re-opens the hole #1763 closed - a recovery running without a validated checkout
-	// spawning the child's grandchildren.
+	// PARENT DAG ONLY, and the reason is STRUCTURE rather than a specific escape. A full
+	// AdvanceJob on this path would run lens normalization (rewriting the result and the
+	// job's payload and state), continue into the review merge gate, and register
+	// deferred worktree teardown - all under a recovery pass with no validated checkout.
+	// This operation cannot reach any of it.
+	//
+	// WHAT IT DOES NOT CLAIM, corrected after review measured it: a full advance would
+	// NOT dispatch this child's own delegations on the shape this path can mint. A
+	// superseded child's result carries decision "failed", and the parent-side block
+	// short-circuits on it (delegationFailureHandledByPolicy) long before
+	// dispatchDelegations. The earlier version of this comment asserted that fan-out as
+	// fact and cited a mutant that only reached the dispatch through decision "approved",
+	// which the supersession cannot produce. The value here is that the exclusion is
+	// structural instead of resting on an early return continuing to sit ahead of a
+	// dispatch call in a long function.
 	advanceErr := anchored.AdvanceParentDAGForTerminalChild(ctx, jobID)
 	var rolledBack supersedeAdvanceRolledBackError
 	if errors.As(advanceErr, &rolledBack) {
 		e.recordSupersedeAdvanceRaced(ctx, jobID, generation, advanceErr)
+		return false, nil
+	}
+	if AsEscalationRepairRequired(advanceErr) {
+		// THE ADVANCE DID NOT HAPPEN, so it must not be confirmed and the debt must not be
+		// settled. A round parked in needs_repair is CLEARABLE - the work becomes possible
+		// again the moment `gitmoot escalation repair` runs - which makes it categorically
+		// unlike the failure policies below, where the graph has DECIDED.
+		//
+		// Measured before this branch existed: isDelegationPolicyOutcome matches any
+		// BlockedError, so the refusal fell through to the confirmation write, the caller
+		// recorded the finalization debt PAID, and after the operator repaired the round
+		// nothing re-drove the parent advance. The coordinator waited forever, which is
+		// worse than the unguarded advance the guard replaced.
+		//
+		// false with a nil error is exactly the "lifecycle moved" contract the caller
+		// already implements: leave the debt outstanding, raise no poll error, re-drive on
+		// the next poll.
 		return false, nil
 	}
 	if advanceErr != nil && !isDelegationPolicyOutcome(advanceErr) {

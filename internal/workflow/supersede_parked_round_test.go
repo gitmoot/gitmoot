@@ -148,8 +148,12 @@ func TestSupersedeRecoveryRefusesAParkedRepairRound(t *testing.T) {
 
 	before := countJobs(t, store, "")
 	observed := mustJob(t, store, sibling)
-	advanced, err := engine.advanceSupersededChildAtGeneration(ctx, sibling, observed.LifecycleGeneration)
+	// Enter through the DEBT SWEEP, the production caller, so the assertion below covers
+	// the bookkeeping too: a refusal that still records the debt paid loses the work for
+	// good, because after the repair nothing re-drives it.
+	advanced, err := engine.CompletePendingSupersedeFinalization(ctx, sibling)
 	after := countJobs(t, store, "")
+	_ = observed
 
 	if after != before {
 		t.Fatalf("job count %d -> %d: the supersede recovery advanced the coordinator's DAG past a needs_repair round (advanced=%v err=%v)",
@@ -158,7 +162,20 @@ func TestSupersedeRecoveryRefusesAParkedRepairRound(t *testing.T) {
 	if _, gerr := store.GetJob(ctx, sibling+"/retry/1"); gerr == nil {
 		t.Fatal("the retry child was enqueued through the recovery path")
 	}
-	// The debt must NOT be settled: a refused advance owes the same work next poll.
+	// ASSERT THE EVENT THIS PATH ACTUALLY WRITES. The earlier version of this assertion
+	// counted JobEventSupersedeFinalizeCompleted, which only recordSupersedeFinalizationCompleted
+	// writes - unreachable from the function under test when it was entered directly - so
+	// it was structurally 0 in every arm and no input could have made it fire. Review
+	// proved that by removing the guard entirely and replacing the real assertions with
+	// t.Logf: the test still passed while logging 3->4 and advance_confirmed=1. That was
+	// the FOURTH vacuous instrument in this campaign and I asked for it to be hunted.
+	//
+	// JobEventSupersedeAdvanceConfirmed is the discriminator: 0 on a refusal, 1 when the
+	// advance really ran. The debt assertion below is kept as well, and it is meaningful
+	// HERE because this test now enters through the sweep, which is the only writer.
+	if got := countWorkflowJobEvents(t, store, sibling, JobEventSupersedeAdvanceConfirmed); got != 0 {
+		t.Fatalf("%s events = %d, want 0: a refused advance confirmed the bracket, so the caller will record the debt paid for work that never happened", JobEventSupersedeAdvanceConfirmed, got)
+	}
 	if got := countWorkflowJobEvents(t, store, sibling, JobEventSupersedeFinalizeCompleted); got != 0 {
 		t.Fatalf("%s events = %d, want 0: the debt was recorded paid although the advance was refused", JobEventSupersedeFinalizeCompleted, got)
 	}
@@ -263,4 +280,64 @@ func seedRoundWithSupersededSibling(t *testing.T, store *db.Store, engine Engine
 	}
 	stampSupersededResult(t, store, sibling, "pr closed")
 	return sibling
+}
+
+// TestSupersedeRecoveryAdvancesAfterTheRoundIsRepaired answers the question the other
+// arms cannot: the refusal must be RECOVERABLE, not permanent.
+//
+// Moving the guard to the shared choke point means callers that previously ADVANCED now
+// REFUSE. The success control proves the guard stays out of the way when nothing is
+// parked, but a tree that was never parked is not the risky case - parked-THEN-REPAIRED
+// is, and if nothing clears needs_repair then every coordinator that ever parks is stuck
+// forever and this change is worse than what it replaced.
+//
+// BOTH operator arms are driven, because `gitmoot escalation repair` offers two and a fix
+// that only re-drives after one of them is half a fix.
+func TestSupersedeRecoveryAdvancesAfterTheRoundIsRepaired(t *testing.T) {
+	for _, arm := range []struct {
+		name      string
+		supersede bool
+	}{
+		{name: "supersede", supersede: true},
+		{name: "retry", supersede: false},
+	} {
+		t.Run(arm.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			engine := testEngine(store)
+			engine.EscalationNotifier = &recordingNotifier{}
+			sibling := seedRoundWithSupersededSibling(t, store, engine, true)
+
+			if _, err := engine.CompletePendingSupersedeFinalization(ctx, sibling); err != nil && !isDelegationPolicyOutcome(err) {
+				t.Fatalf("pre-repair sweep: %v", err)
+			}
+			// PRECONDITION, and it is the whole hazard: the refused pass must have settled
+			// NOTHING. A closed debt here leaves the repair with nothing to re-drive.
+			if got := countWorkflowJobEvents(t, store, sibling, JobEventSupersedeFinalizeCompleted); got != 0 {
+				t.Fatalf("%s events = %d before repair, want 0: the refusal recorded the debt paid", JobEventSupersedeFinalizeCompleted, got)
+			}
+			if got := countWorkflowJobEvents(t, store, sibling, JobEventSupersedeAdvanceConfirmed); got != 0 {
+				t.Fatalf("%s events = %d before repair, want 0: the refusal confirmed an advance that never ran", JobEventSupersedeAdvanceConfirmed, got)
+			}
+
+			round, ok := unsettledRound(t, store, "parent-job")
+			if !ok {
+				t.Fatal("fixture drift: no unsettled round to repair")
+			}
+			if err := engine.RepairEscalationRound(ctx, "parent-job", round.RoundID, arm.supersede, "operator", "repaired for test"); err != nil {
+				t.Fatalf("RepairEscalationRound(supersede=%v): %v", arm.supersede, err)
+			}
+
+			if _, err := engine.CompletePendingSupersedeFinalization(ctx, sibling); err != nil && !isDelegationPolicyOutcome(err) {
+				t.Fatalf("sweep after repair: %v", err)
+			}
+			// THE RE-DRIVE HAPPENED: the advance ran exactly once and the debt settled once.
+			if got := countWorkflowJobEvents(t, store, sibling, JobEventSupersedeAdvanceConfirmed); got != 1 {
+				t.Fatalf("%s events = %d, want exactly 1: the refused pass must not confirm and the repaired pass must", JobEventSupersedeAdvanceConfirmed, got)
+			}
+			if got := countWorkflowJobEvents(t, store, sibling, JobEventSupersedeFinalizeCompleted); got != 1 {
+				t.Fatalf("%s events = %d, want exactly 1 after repair", JobEventSupersedeFinalizeCompleted, got)
+			}
+		})
+	}
 }

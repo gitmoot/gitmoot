@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -129,11 +130,17 @@ func TestPollOnceAsksTheForgeOncePerNumberPerPoll(t *testing.T) {
 			LeadAgent: "lead", Sender: "github", ParentJobID: "issue-coordinator", DelegationID: id,
 		})
 	}
+	// The forge answers with a real 404, which is what GitHub returns for a number that
+	// is not a pull request. The fake's own fallthrough is a bare "not implemented", and
+	// that is NOT a definitive answer under isPullRequestNotFound - deliberately, since
+	// an unrecognised failure must surface rather than be classified as an answer. Using
+	// the real shape here is what makes this test exercise the permanent arm instead of
+	// the ambiguous one.
+	client.getPullRequestErr = errors.New("gh: Not Found (HTTP 404)")
 	engine := workflow.Engine{Store: store}
 	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
 
-	// The fixture's #12 is an ISSUE, and the forge answers definitively (a generic
-	// not-found, not a transport failure), so this is the PERMANENT arm: the condition
+	// #12 is an ISSUE and the forge said so definitively, so this is the PERMANENT arm: the condition
 	// never changes, and reporting it would stamp repos.last_error on every tick forever
 	// AND first-wins-mask a genuine error from every later stage of the poll. So PollOnce
 	// must stay CLEAN here while the jobs stay queued.

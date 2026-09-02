@@ -244,13 +244,17 @@ func (e Engine) recordFoldedReviewOutcome(ctx context.Context, job db.Job, paylo
 // head - so gating parent advancement on that preflight stranded the parent forever. The
 // first remedy let such a child through AdvanceJob with an empty checkout, which was too
 // broad: AdvanceJob normalizes high-risk lens verdicts (rewriting the result and updating
-// the job payload and state), dispatches the child's OWN delegations, continues into the
-// review merge gate, and registers deferred worktree teardown - all of which would then
-// run unvalidated.
+// the job payload and state), continues into the review merge gate, and registers
+// deferred worktree teardown - all of which would then run unvalidated. It can also
+// dispatch a child's OWN delegations, though not for a child whose decision is "failed":
+// the parent-side block short-circuits on that first, which review measured. The list is
+// what the operation EXCLUDES, not a list of escapes each independently demonstrated on
+// the closed-PR shape.
 //
 // This operation reaches none of that. It runs the parent-side block of AdvanceJob and
 // nothing else, so it cannot be widened by accident: there is no path from here to lens
-// normalization, to the child's delegations, or to worktree cleanup.
+// normalization, to the child's delegations, or to worktree cleanup. That STRUCTURAL
+// exclusion is the guarantee - not a claim that every excluded step was reachable.
 func (e Engine) AdvanceParentDAGForTerminalChild(ctx context.Context, jobID string) error {
 	if err := e.validate(); err != nil {
 		return err

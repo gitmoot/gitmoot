@@ -3535,10 +3535,12 @@ func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 		// never satisfy this preflight - the shared checkout is never on a dead PR's head
 		// - and gating its parent advancement on that stranded the parent forever. But
 		// letting it through the FULL advance with an empty checkout was too broad:
-		// AdvanceJob also normalizes high-risk lens verdicts, dispatches the child's own
-		// delegations, continues into the review merge gate and registers worktree
-		// teardown, so a preflight failure would become database and remote action under
-		// an unvalidated checkout.
+		// AdvanceJob also normalizes high-risk lens verdicts, continues into the review
+		// merge gate and registers worktree teardown, so a preflight failure would become
+		// database and remote action under an unvalidated checkout. (It can dispatch a
+		// child's own delegations too, but not for one whose decision is "failed" - the
+		// parent-side block short-circuits first, which review measured. The point is what
+		// the narrow operation EXCLUDES, not that each excluded step was reachable here.)
 		//
 		// So this shape is routed to an operation that CANNOT reach any of that, rather
 		// than to the full advance with a narrower predicate in front of it. A predicate

@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
@@ -421,6 +422,41 @@ type EscalationRequest struct {
 // comment that @-tags the human with the resume instructions.
 type EscalationNotifier interface {
 	NotifyEscalation(ctx context.Context, request EscalationRequest) error
+}
+
+// EscalationRepairRequiredError is a BlockedError that an OPERATOR must clear, as
+// opposed to one the delegation graph decided.
+//
+// The distinction is load-bearing for any caller that owes follow-up work. A
+// block_parent failure policy blocking a task is a DECISION: it is final for this run,
+// so a caller may settle whatever bookkeeping it holds. A round parked in needs_repair
+// is the opposite - the work is still owed and will become possible again the moment
+// `gitmoot escalation repair` runs - so a caller must leave its debt OUTSTANDING rather
+// than record it settled.
+//
+// Measured on the closed-PR supersession recovery (#1673/#1731): without this type the
+// parked-round refusal reached isDelegationPolicyOutcome, which classifies any
+// BlockedError as a policy outcome, so the recovery reported advanced=true, wrote
+// supersede_advance_confirmed and closed the finalization debt. The repair then had
+// nothing left to re-drive and the coordinator waited forever - a worse outcome than the
+// unguarded advance it replaced.
+//
+// It UNWRAPS to BlockedError on purpose: every existing consumer - the task block, the
+// dashboard, the daemon's classifier - keeps matching it, and only callers that ask
+// specifically about repair see the difference.
+type EscalationRepairRequiredError struct {
+	Blocked BlockedError
+}
+
+func (e EscalationRepairRequiredError) Error() string { return e.Blocked.Error() }
+
+func (e EscalationRepairRequiredError) Unwrap() error { return e.Blocked }
+
+// AsEscalationRepairRequired reports whether err (anywhere in its chain) is a refusal an
+// operator must clear.
+func AsEscalationRepairRequired(err error) bool {
+	var repair EscalationRepairRequiredError
+	return errors.As(err, &repair)
 }
 
 type BlockedError struct {

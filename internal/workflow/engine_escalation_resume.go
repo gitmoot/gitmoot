@@ -1756,12 +1756,21 @@ func (e Engine) escalationRepairBlock(ctx context.Context, job db.Job, ref taskR
 	}
 	reason := fmt.Sprintf("escalation round %s (%s) needs operator repair: %s; run `gitmoot escalation repair %s --round %s --retry` or `--supersede --reason ...`",
 		round.RoundID, round.ClaimVerb, round.IntegrityCause, coordinatorID, round.RoundID)
+	// EscalationRepairRequiredError, not a bare BlockedError: this refusal is CLEARABLE
+	// by the operator, and a caller holding follow-up work must leave it outstanding
+	// rather than settle it. It unwraps to BlockedError so the task block, the dashboard
+	// and the daemon's classifier all keep matching (#1673).
 	if strings.TrimSpace(ref.ID) == "" {
-		return BlockedError{Reason: reason}, true, nil
+		return EscalationRepairRequiredError{Blocked: BlockedError{Reason: reason}}, true, nil
 	}
 	// Route it through the ordinary block choke point so the task carries the cause
 	// and the dashboard shows it: a blocked coordinator must never be silent.
-	return e.blockTask(ctx, ref, "escalation_needs_repair", reason, "escalation repair"), true, nil
+	blockErr := e.blockTask(ctx, ref, "escalation_needs_repair", reason, "escalation repair")
+	var blocked BlockedError
+	if errors.As(blockErr, &blocked) {
+		return EscalationRepairRequiredError{Blocked: blocked}, true, nil
+	}
+	return blockErr, true, nil
 }
 
 // legacyOpenEscalation reports whether this coordinator has a PRE-UPGRADE open round:
