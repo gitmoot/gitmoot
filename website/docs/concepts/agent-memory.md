@@ -7,7 +7,7 @@ block. It is a native SQLite + FTS5 feature in the existing store (no vector DB,
 no new dependencies) and is **off by default**.
 
 Memory is distinct from templates. Templates hold *skills* (how an agent works;
-SkillOpt improves them); memory holds *knowledge* (what is true about a repo).
+templates carry them); memory holds *knowledge* (what is true about a repo).
 
 ## Trust model
 
@@ -165,15 +165,10 @@ read path and confirmed producers stay enrolled-only.
 
 ### Success Distill
 
-`distill_successes` (off by default) enables two deterministic success producers.
-Both write only pending observations at trust `low`; neither writes confirmed
+`distill_successes` (off by default) enables one deterministic success producer.
+It writes only pending observations at trust `low`; it never writes confirmed
 memory directly.
 
-- **SkillOpt promotions** stage one observation when a candidate is promoted.
-  The key is bounded by template version and content hash, for example
-  `skillopt:<template>@vN-promoted:<hash>`. The content records which version was
-  promoted over which base, plus local evidence such as review score,
-  replay-gate mean scores, and recorded weaknesses when present.
 - **Recovered failures** run when a later job succeeds. Gitmoot looks for active
   confirmed failure facts with `distill:` provenance whose `source_job` belongs
   to the same task lineage as the successful job, using matching `task_id` when
@@ -181,9 +176,8 @@ memory directly.
   pending observation on the same key that names the successful job, date, and
   branch. It does not mutate, retire, or auto-upgrade the confirmed failure fact.
 
-Recovered-failure writes share `distill_max_per_job`; SkillOpt promotion writes
-are one observation per promotion event. Both paths use the same PreFilter and
-observation dedup rules as other pending memory.
+Recovered-failure writes share `distill_max_per_job` and use the same PreFilter
+and observation dedup rules as other pending memory.
 
 An agent records a durable fact via the optional top-level `learnings` field in
 `gitmoot_result` — each entry is `{key, scope, content}` where `scope` is

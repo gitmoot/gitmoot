@@ -135,7 +135,7 @@ func TestCleanupObligationsRebuildPreservesLegacyRows(t *testing.T) {
 // test would pass on precisely the mutant it exists to kill.
 func TestMigrationsUpgradeFromPreviousReleasedVersion(t *testing.T) {
 	ctx := context.Background()
-	const branchMigrationMarker = "'identity_or_containment', 'unpublished_commits', 'unknown'"
+	const branchMigrationMarker = "ALTER TABLE agent_template_versions DROP COLUMN canary_sample"
 	branchIndex := -1
 	for index, migration := range migrations {
 		if strings.Contains(migration, branchMigrationMarker) {

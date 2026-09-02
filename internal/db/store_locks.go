@@ -48,7 +48,7 @@ func (s *Store) ReleaseRuntimeSessionLocksFromForeignBoot(ctx context.Context, c
 // ResourceLockOwnerBootID returns the recorded owner_boot_id for a held lock, or
 // "" when the lock is absent or its boot id was never stamped (#651). It is a
 // targeted single-column read kept deliberately OUT of the shared 9-column lock
-// SELECTs so their scan arity is unchanged; the skillopt generation-lock recovery
+// SELECTs so their scan arity is unchanged; the generation-lock recovery
 // path uses it to prove a same-host owner from a different boot is dead without a
 // kill(2) syscall (and PID-reuse-immune).
 func (s *Store) ResourceLockOwnerBootID(ctx context.Context, resourceKey string) (string, error) {
@@ -235,7 +235,7 @@ func (s *Store) DeleteResourceLocksByOwnerIfNotRunning(ctx context.Context, owne
 // DeleteExpiredResourceLocks reaps lock rows whose lease has elapsed.
 //
 // The owner_pid<=0 clause keeps the historical conservatism for NON-runtime locks
-// (e.g. skillopt-train-generation): a lock that records a live-process owner PID is
+// a lock that records a live-process owner PID is
 // reclaimed by a PID-liveness check elsewhere, not by blind expiry. Runtime-session
 // locks (resource_key LIKE 'runtime:%') are the explicit exception: their recorded
 // PID is the gitmoot DAEMON's, not the spawned worker's, so it is meaningless after

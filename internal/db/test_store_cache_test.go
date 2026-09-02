@@ -52,7 +52,6 @@ func TestStoreOpenPolicy(t *testing.T) {
 		"TestAdvanceRetryCollapseMigration":                                      true,
 		"TestBackfillGhostSessionJobsHonorsDisabledAgePolicy":                    true,
 		"TestBackfillGhostSessionJobsReusesReaperAndIsIdempotent":                true,
-		"TestCanaryMigrationOnPreExistingDB":                                     true,
 		"TestCleanupObligationsMigrationFreshAndUpgrade":                         true,
 		"TestCleanupObligationsRebuildPreservesLegacyRows":                       true,
 		"TestMigrationsUpgradeFromPreviousReleasedVersion":                       true,

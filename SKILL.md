@@ -102,7 +102,7 @@ asks for that action.
    state or pointing the user to live monitoring.
 6. Use `gitmoot --help` and subcommand help for version-sensitive features such
    as `pipeline`, `chat`, `moot`, `memory`, `router`, `runtime`, dashboard web,
-   session jobs, heartbeats, and SkillOpt exchange commands.
+   session jobs, and heartbeats.
 
 ## Install And Update
 
@@ -119,21 +119,6 @@ gitmoot version
 gitmoot update --check
 gh auth status
 ```
-
-Install the separate Python optimizer before optimizer-backed SkillOpt train
-continues:
-
-```sh
-python3 -m pip install --user pipx
-python3 -m pipx ensurepath
-pipx install https://github.com/jerryfane/gitmoot-skillopt/releases/download/v0.3.1/gitmoot_skillopt-0.3.1-py3-none-any.whl
-gitmoot-skillopt --version
-gitmoot-skillopt optimize --help
-```
-
-If `pipx` is unavailable, install `gitmoot-skillopt` in a venv and pass
-`--skillopt-bin /path/to/venv/bin/gitmoot-skillopt` to `gitmoot skillopt train
-continue`.
 
 Install runtime plugin guidance when the user wants Codex or Claude Code to
 discover Gitmoot from its plugin system:
@@ -198,20 +183,6 @@ gitmoot chat task <thread> "@agent message" [--action ask|review|implement] [--r
 gitmoot chat wait <thread> [--since-seq N] [--timeout 90s] [--repo owner/repo] [--json]
 gitmoot moot <name> "topic" --agents a,b,c --repo owner/repo [--max-messages N] [--json]
 gitmoot router summary [--repo owner/repo] [--action ask|review|implement] [--since 30d] [--json]
-gitmoot skillopt export --run <run-id> [--output training.json]
-gitmoot skillopt import --file candidate.json [--artifact-dir artifacts]
-gitmoot skillopt ab <agent> "<prompt>" [--challenger <versionId>] [--pick a|b] [--judge]
-gitmoot skillopt pairwise import <packet-dir> [--json]
-gitmoot skillopt rubric induce --template <id> [--json]
-gitmoot skillopt judge agreement [--template <id>] [--json]
-gitmoot skillopt candidate list [--template id]
-gitmoot skillopt candidate show <version-id>
-gitmoot skillopt candidate promote <version-id>
-gitmoot skillopt candidate reject <version-id> [--reason text]
-gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals/<run-id>
-gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id>
-gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]
-gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)
 ```
 
 Use `gitmoot daemon start` for the background daemon. Use `gitmoot daemon run`
@@ -266,24 +237,6 @@ cancelled Gitmoot job needs a user-shareable bug report. Preview first by
 default. Create with `--create --yes` only when the user explicitly asks or the
 active workflow policy permits filing reports, then report the created or
 existing GitHub issue URL back to the user.
-
-SkillOpt train generation is durable and idempotent on resume. Each review
-item's artifacts, item row, and options commit in one transaction the moment
-that item finishes, so an interrupted generate phase loses only the item that
-was in flight. Re-running `gitmoot skillopt train continue` regenerates ONLY the
-items that are not yet complete; fully-generated items are skipped, so no
-duplicate options are produced and completed work is never rewritten. If a single
-item has some but not all of its options/artifacts persisted, resume returns a
-hard error (`item <id> has partial generated options; inspect or clear review
-options before continuing`) rather than guessing.
-
-Use `gitmoot skillopt train recover --session <id> [--out-root path] [--json]`
-to recover the OPTIMIZER phase only. It re-imports or repairs the optimizer
-candidate package and classifies the iteration (for example
-`already_completed_candidate`, `already_completed_no_candidate`,
-`optimizer_active`, or `corrupted_unrecoverable`). It does NOT release the
-generation-phase lock or rebuild generation options; use `train continue` for
-generation resume.
 
 ## PR Comment Commands
 

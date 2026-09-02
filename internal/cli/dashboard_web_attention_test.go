@@ -14,11 +14,11 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// seedAttentionHome seeds a home exercising all three #528 buckets: a blocked job
+// seedAttentionHome seeds a home exercising the surviving #528 bucket: a blocked job
 // with an OPEN gate (plus a second job whose gate is satisfied, to prove the
-// open-only filter) and recorded result-check failures; a pending synth item (plus a
-// rejected one, to prove the status filter); a pending template candidate; and a
-// SkillOpt run with binary verdicts.
+// open-only filter) and recorded result-check failures. The synth-review and
+// pending-candidate buckets went with the SkillOpt loop in #1752, so there is
+// nothing left to seed for them.
 func seedAttentionHome(t *testing.T, home string) {
 	t.Helper()
 	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
@@ -70,43 +70,6 @@ func seedAttentionHome(t *testing.T, home string) {
 		t.Fatalf("RecordResultCheckFailures: %v", err)
 	}
 
-	// One pending synth item + one rejected (must be filtered out).
-	if err := store.CreateSynthReviewItem(ctx, db.SynthReviewItem{
-		ID: "synth-1", TemplateID: "tmpl-reviewer", Repo: "gitmoot/gitmoot", Status: db.SynthItemStatusPending,
-		Question: "flag an unearned pass?", Gap: 0.29, WeakAgent: "r@v2", StrongAgent: "r@v3", JudgeAgent: "judge",
-	}); err != nil {
-		t.Fatalf("CreateSynthReviewItem pending: %v", err)
-	}
-	if err := store.CreateSynthReviewItem(ctx, db.SynthReviewItem{
-		ID: "synth-2", TemplateID: "tmpl-reviewer", Repo: "gitmoot/gitmoot", Status: db.SynthItemStatusRejected,
-		Question: "already decided", Gap: 0.10,
-	}); err != nil {
-		t.Fatalf("CreateSynthReviewItem rejected: %v", err)
-	}
-
-	// One pending template candidate (a version awaiting promotion) with a score.
-	if err := store.UpsertAgentTemplate(ctx, db.AgentTemplate{ID: "reviewer", Name: "Reviewer", Content: "v1"}); err != nil {
-		t.Fatalf("UpsertAgentTemplate: %v", err)
-	}
-	v2, err := store.AddPendingAgentTemplateVersion(ctx, db.AgentTemplate{ID: "reviewer", Name: "Reviewer", Content: "v2"})
-	if err != nil {
-		t.Fatalf("AddPendingAgentTemplateVersion: %v", err)
-	}
-	score := 0.81
-	if err := store.UpsertAgentTemplateCandidateReview(ctx, db.AgentTemplateCandidateReview{VersionID: v2.ID, TemplateID: "reviewer", Score: &score}); err != nil {
-		t.Fatalf("UpsertAgentTemplateCandidateReview: %v", err)
-	}
-
-	// SkillOpt binary verdicts for a run (mixed yes/no across two dimensions).
-	for _, v := range []db.BinaryVerdict{
-		{RunID: "eval-1", QuestionID: "q-cites", Dimension: "correctness", Verdict: "yes", Explanation: "cites sources"},
-		{RunID: "eval-1", QuestionID: "q-false-pass", Dimension: "correctness", Verdict: "no", Explanation: "unearned pass"},
-		{RunID: "eval-1", QuestionID: "q-scoped", Dimension: "usefulness", Verdict: "no", Explanation: "out of scope"},
-	} {
-		if err := store.UpsertBinaryVerdict(ctx, v); err != nil {
-			t.Fatalf("UpsertBinaryVerdict %s: %v", v.QuestionID, err)
-		}
-	}
 }
 
 func TestWebDataSourceAttention(t *testing.T) {
@@ -138,25 +101,19 @@ func TestWebDataSourceAttention(t *testing.T) {
 		t.Fatalf("gate title should be resolved from the job payload: %+v", g)
 	}
 
-	// Synth: only the pending one.
-	if len(att.SynthItems) != 1 || att.SynthItems[0].ID != "synth-1" {
-		t.Fatalf("synth items = %+v, want only synth-1", att.SynthItems)
+	// The synth-review and pending-candidate buckets lost their backing tables with
+	// the SkillOpt loop (#1752). Their DataSource fields remain part of the pinned
+	// dashboard module's contract, so they must serialize as EMPTY BUT NON-NIL and
+	// contribute nothing to Total — a nil here would marshal as JSON null and break
+	// a client that iterates them.
+	if att.SynthItems == nil || len(att.SynthItems) != 0 {
+		t.Fatalf("synth items = %+v, want empty non-nil", att.SynthItems)
 	}
-	if att.SynthItems[0].Gap != 0.29 || att.SynthItems[0].StrongAgent != "r@v3" {
-		t.Fatalf("synth item fields wrong: %+v", att.SynthItems[0])
+	if att.Candidates == nil || len(att.Candidates) != 0 {
+		t.Fatalf("candidates = %+v, want empty non-nil", att.Candidates)
 	}
-
-	// Candidates: the one pending version, with its score passed through.
-	if len(att.Candidates) != 1 {
-		t.Fatalf("candidates = %d, want 1: %+v", len(att.Candidates), att.Candidates)
-	}
-	c := att.Candidates[0]
-	if c.TemplateID != "reviewer" || c.Number != 2 || c.Score != "0.81" {
-		t.Fatalf("candidate wrong: %+v", c)
-	}
-
-	if att.Total != 3 {
-		t.Fatalf("Total = %d, want 3", att.Total)
+	if att.Total != 1 {
+		t.Fatalf("Total = %d, want 1 (the single open gate)", att.Total)
 	}
 
 	// Non-nil, deterministic across calls.
@@ -252,44 +209,26 @@ func TestWebDataSourceJobChecksBlockMode(t *testing.T) {
 	}
 }
 
+// TestWebDataSourceBinaryVerdicts pins the post-#1752 contract: the
+// skillopt_binary_verdicts table is gone, so every run — seeded or not — resolves to
+// zero counts and an empty, never-nil list, and the method never errors. It stays
+// wired because the pinned dashboard module's DataSource interface requires it.
 func TestWebDataSourceBinaryVerdicts(t *testing.T) {
 	home := dashboardTestHome(t)
 	seedAttentionHome(t, home)
 	ds := &webDataSource{home: home}
 	ctx := context.Background()
 
-	v, err := ds.BinaryVerdicts(ctx, "eval-1")
-	if err != nil {
-		t.Fatalf("BinaryVerdicts: %v", err)
-	}
-	if v.RunID != "eval-1" {
-		t.Fatalf("RunID = %q", v.RunID)
-	}
-	if len(v.Verdicts) != 3 {
-		t.Fatalf("verdicts = %d, want 3", len(v.Verdicts))
-	}
-	if v.Passed != 1 || v.Failed != 2 {
-		t.Fatalf("passed=%d failed=%d, want 1/2", v.Passed, v.Failed)
-	}
-	// Ordered by (dimension, questionId): correctness rows before usefulness.
-	if v.Verdicts[0].Dimension != "correctness" || v.Verdicts[2].Dimension != "usefulness" {
-		t.Fatalf("verdict order wrong: %+v", v.Verdicts)
-	}
-	for _, q := range v.Verdicts {
-		if q.Pass != (q.Verdict == "yes") {
-			t.Fatalf("Pass/Verdict mismatch: %+v", q)
+	for _, runID := range []string{"eval-1", "nope", ""} {
+		v, err := ds.BinaryVerdicts(ctx, runID)
+		if err != nil {
+			t.Fatalf("BinaryVerdicts(%q): %v", runID, err)
 		}
-		if q.Weight <= 0 {
-			t.Fatalf("weight should default > 0: %+v", q)
+		if v.RunID != runID {
+			t.Fatalf("BinaryVerdicts(%q) RunID = %q, want the requested run echoed back", runID, v.RunID)
 		}
-	}
-
-	// Unknown run: zero counts, empty non-nil list, no error.
-	empty, err := ds.BinaryVerdicts(ctx, "nope")
-	if err != nil {
-		t.Fatalf("BinaryVerdicts unknown: %v", err)
-	}
-	if empty.Verdicts == nil || len(empty.Verdicts) != 0 || empty.Passed != 0 || empty.Failed != 0 {
-		t.Fatalf("unknown run should be empty: %+v", empty)
+		if v.Verdicts == nil || len(v.Verdicts) != 0 || v.Passed != 0 || v.Failed != 0 {
+			t.Fatalf("BinaryVerdicts(%q) = %+v, want empty non-nil with zero counts", runID, v)
+		}
 	}
 }

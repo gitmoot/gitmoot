@@ -18,7 +18,6 @@ type page int
 const (
 	pageAttention page = iota
 	pageActivity
-	pageTrains
 	pageAgents
 	pageSessions
 	pageJobs
@@ -36,7 +35,6 @@ var pages = []struct {
 }{
 	{pageAttention, "Attention", "Attention"},
 	{pageActivity, "Activity", "Activity — live orchestras"},
-	{pageTrains, "Trains", "Trains"},
 	{pageAgents, "Agents", "Agents"},
 	{pageSessions, "Workers", "Runtime workers (agent sessions)"},
 	{pageJobs, "Jobs", "Jobs"},
@@ -54,16 +52,12 @@ const (
 	modeAnswerChoice
 	modeAnswerText
 	modeConfirmDismiss
-	modeTrainDetail
 	modeJobDetail
 	modeSessionDetail
 	modeConfirmSessionStop
 	modeConfirmJobRetry
 	modeConfirmJobCancel
 	modeBugReportPreview
-	modeTrainStopReason
-	modeConfirmTrainDelete
-	modeConfirmTrainRepoCleanup
 	modeAgentDetail
 	modeAgentRevertPick
 	modeConfirmAgentRevert
@@ -91,22 +85,20 @@ type Model struct {
 	inFlight bool
 
 	// expanded records explicit user open(true)/close(false) decisions for
-	// collapsible group headers (Attention / Trains), keyed by a page-qualified
+	// collapsible group headers (Attention / Jobs), keyed by a page-qualified
 	// group key; it overrides collapseByDefault and persists across refresh ticks
-	// while the key is stable (a Trains group's key includes its status section,
+	// while the key is stable (a Jobs group's key includes its status section,
 	// so a session changing section moves to that section's group). collapseByDefault
 	// is the state for groups the user has not touched — the live dashboard sets it
 	// true so groups start folded.
 	expanded          map[string]bool
 	collapseByDefault bool
 
-	// Attention / Activity / Trains page interaction state.
+	// Attention / Activity page interaction state.
 	mode           mode
 	promptCursor   int                  // selected row in snap.Prompts on the Attention page
 	activityCursor int                  // selected active root on the Activity page
-	trainCursor    int                  // selected row in snap.Trains on the Trains page
 	active         db.InteractivePrompt // prompt being answered/dismissed in an overlay
-	activeTrain    TrainSession         // train shown in modeTrainDetail
 	choiceIdx      int                  // selected choice in modeAnswerChoice
 	input          textinput.Model      // free-text answer in modeAnswerText
 	actionErr      string               // inline error from the last Answer/Dismiss attempt
@@ -154,12 +146,9 @@ type Model struct {
 	configField     ConfigField // field being edited inline
 	configActionErr string      // inline write error in the edit overlay
 
-	// Trains page action state.
-	pendingRepos []string // gitmoot-created repos offered for cleanup after a delete
-
 	// Agents page interaction state.
 	agentCursor         int               // selected row in snap.Agents
-	showAllAgents       bool              // Agents page: include hidden skillopt-* training agents
+	showAllAgents       bool              // Agents page: include hidden internal agents
 	groupDeleteLabel    string            // template-group label being bulk-deleted (confirm)
 	groupDeleteNames    []string          // agent names in the group being bulk-deleted
 	activeAgent         Agent             // agent shown in detail / being confirmed
@@ -179,7 +168,6 @@ type Model struct {
 	versionViewLoaded   bool              //
 	agentErr            string            // inline error on the Agents page (e.g. create failed)
 	agentNotice         string            // non-blocking note on the Agents page (e.g. prompt missing contract)
-	optimizeBusy        bool              // a train session is being scaffolded/started
 	formPending         bool              // a form push is in flight; suppress re-dispatch
 
 	// Pending custom-prompt agent creation: the create form collected these,
@@ -251,12 +239,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 			model, cmd := m.updateJobOverlay(msg)
-			return scrollResetOnModeChange(m.mode, model, cmd)
-		case modeTrainStopReason, modeConfirmTrainDelete, modeConfirmTrainRepoCleanup:
-			if msg.String() == "ctrl+c" {
-				return m, tea.Quit
-			}
-			model, cmd := m.updateTrainOverlay(msg)
 			return scrollResetOnModeChange(m.mode, model, cmd)
 		case modeAgentDetail, modeAgentRevertPick, modeConfirmAgentRevert, modeConfirmAgentDelete, modeConfirmAgentGroupDelete, modeAgentVersionView, modeAgentRuntimePick:
 			if msg.String() == "ctrl+c" {
@@ -337,7 +319,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(cmds...)
 			}
 		case " ":
-			// Toggle a collapsible group header (Attention / Trains).
+			// Toggle a collapsible group header (Attention).
 			if m.toggleCurrentGroup() {
 				m.viewport.SetContent(m.content())
 				return m, tea.Batch(cmds...)
@@ -351,7 +333,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(cmds...)
 			}
 			if pages[m.selected].page == pageAgents {
-				// Toggle the hidden skillopt-* training agents in/out of the list.
+				// Toggle the hidden internal agents in/out of the list.
 				m.showAllAgents = !m.showAllAgents
 				m.agentCursor = clampCursor(m.agentCursor, len(m.visibleAgents()))
 				m.viewport.GotoTop()
@@ -361,11 +343,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "d":
 			if pages[m.selected].page == pageAttention {
 				m.openDismiss()
-				m.viewport.SetContent(m.content())
-				return m, tea.Batch(cmds...)
-			}
-			if t, ok := m.trainUnderCursor(); ok && deadTrainPhase(t.Phase) {
-				m.openTrainDelete(t)
 				m.viewport.SetContent(m.content())
 				return m, tea.Batch(cmds...)
 			}
@@ -384,22 +361,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.viewport.SetContent(m.content())
 					return m, cmd
 				}
-				return m, tea.Batch(cmds...)
-			}
-			if pages[m.selected].page == pageTrains {
-				// With a Root router, open the full train-run view; otherwise the
-				// inline detail (keeps the model usable standalone and old tests
-				// green). Pushing is suppressed while an optimize start is in
-				// flight: its result message routes to the top of the stack, so a
-				// covering view would swallow it. Resolve the session through the
-				// cursor (display order), not raw snapshot order.
-				if t, ok := m.trainUnderCursor(); ok {
-					if m.deps.OpenTrain != nil && !m.optimizeBusy {
-						return m, Push(m.deps.OpenTrain(t.ID))
-					}
-					m.openTrainDetail()
-				}
-				m.viewport.SetContent(m.content())
 				return m, tea.Batch(cmds...)
 			}
 			if pages[m.selected].page == pageSessions {
@@ -454,11 +415,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewport.SetContent(m.content())
 				return m, tea.Batch(cmds...)
 			}
-			if t, ok := m.trainUnderCursor(); ok && !deadTrainPhase(t.Phase) {
-				cmd := m.openTrainStop(t)
-				m.viewport.SetContent(m.content())
-				return m, cmd
-			}
 			if pages[m.selected].page == pageSessions && m.deps.StopSession != nil {
 				rows := m.sessionRows()
 				if m.sessionCursor < len(rows) {
@@ -471,7 +427,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Form construction touches the database, so it runs as a command
 			// (a synchronous call here would freeze the UI on a busy store).
 			if pages[m.selected].page == pageAgents && m.deps.OpenAgentCreate != nil &&
-				!m.formPending && !m.optimizeBusy {
+				!m.formPending {
 				m.formPending = true
 				m.agentErr = ""
 				return m, openAgentFormCmd(m.deps)
@@ -499,14 +455,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, tea.Batch(cmds...)
 					}
 				}
-			}
-		case "o":
-			if agent, ok := m.agentUnderCursor(); ok && agent.TemplateID != "" &&
-				m.deps.OpenAgentOptimize != nil && !m.formPending && !m.optimizeBusy {
-				m.formPending = true
-				m.activeAgent = agent
-				m.agentErr = ""
-				return m, openAgentOptimizeCmd(m.deps, agent)
 			}
 		case "e":
 			if agent, ok := m.agentUnderCursor(); ok && m.deps.SetAgentRuntime != nil {
@@ -666,61 +614,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, cmd)
 			}
 		}
-	case trainStopMsg:
-		if m.mode == modeTrainStopReason {
-			m.actionBusy = false
-			if msg.err != nil {
-				m.actionErr = msg.err.Error()
-			} else {
-				m.mode = modeNormal
-				m.actionErr = ""
-			}
-		}
-		if msg.err == nil {
-			if cmd := m.queueLoad(); cmd != nil {
-				cmds = append(cmds, cmd)
-			}
-		}
-	case trainDeleteMsg:
-		if m.mode == modeConfirmTrainDelete {
-			m.actionBusy = false
-			if msg.err != nil {
-				// e.g. the lock-refusal from DeleteSkillOptTrainSession; stays
-				// in the confirm so the user reads it.
-				m.actionErr = msg.err.Error()
-			} else {
-				m.actionErr = ""
-				if len(msg.repos) > 0 {
-					m.pendingRepos = msg.repos
-					m.mode = modeConfirmTrainRepoCleanup
-				} else {
-					m.mode = modeNormal
-				}
-			}
-		}
-		if msg.err == nil {
-			if cmd := m.queueLoad(); cmd != nil {
-				cmds = append(cmds, cmd)
-			}
-		}
-	case trainRepoCleanupMsg:
-		if m.mode == modeConfirmTrainRepoCleanup {
-			m.actionBusy = false
-			if len(msg.errs) > 0 {
-				// Scope errors carry their remedy verbatim; keep the confirm
-				// open with only the still-failing repos on offer, so a retry
-				// does not replay repos that were already deleted.
-				m.actionErr = strings.Join(msg.errs, "\n")
-				m.pendingRepos = msg.failed
-			} else {
-				m.mode = modeNormal
-				m.actionErr = ""
-				m.pendingRepos = nil
-			}
-		}
-		if cmd := m.queueLoad(); cmd != nil {
-			cmds = append(cmds, cmd)
-		}
 	case agentVersionsMsg:
 		if m.activeAgent.TemplateID == msg.templateID {
 			m.agentVersionsLoaded = true
@@ -761,27 +654,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, m.deps.EditAgentPrompt(msg.result.Values["seed"]))
 			} else {
 				cmds = append(cmds, agentCreateCmd(m.deps, msg.result.Values))
-			}
-		}
-	case agentOptimizeFormResultMsg:
-		m.formPending = false
-		if !msg.result.Aborted {
-			m.agentErr = ""
-			m.optimizeBusy = true
-			cmds = append(cmds, startOptimizeCmd(m.deps, msg.templateID, msg.result.Values))
-		}
-	case optimizeStartedMsg:
-		m.optimizeBusy = false
-		if msg.err != nil {
-			m.agentErr = msg.err.Error()
-		} else {
-			m.agentErr = ""
-			if cmd := m.queueLoad(); cmd != nil {
-				cmds = append(cmds, cmd)
-			}
-			// Straight into the new session's live phase view.
-			if m.deps.OpenTrain != nil && msg.sessionID != "" {
-				cmds = append(cmds, Push(m.deps.OpenTrain(msg.sessionID)))
 			}
 		}
 	case agentActionMsg:
@@ -916,7 +788,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.loadedAt = msg.at
 			m.jobGroups = computeJobsByStatusGroup(m.snap.JobRows)
 			m.clampPromptCursor()
-			m.clampTrainCursor()
 			m.clampJobCursor()
 			m.activityCursor = clampCursor(m.activityCursor, m.activitySelectableLen())
 			m.agentCursor = clampCursor(m.agentCursor, len(m.visibleAgents()))
@@ -1047,8 +918,6 @@ func (m *Model) pageCursor() (*int, int) {
 		return &m.promptCursor, selectableCount(m.attentionVisibleRows())
 	case pageActivity:
 		return &m.activityCursor, m.activitySelectableLen()
-	case pageTrains:
-		return &m.trainCursor, selectableCount(m.trainVisibleRows())
 	case pageAgents:
 		return &m.agentCursor, len(m.visibleAgents())
 	case pageSessions:
@@ -1078,19 +947,12 @@ func (m *Model) clampPromptCursor() {
 	m.promptCursor = clampCursor(m.promptCursor, selectableCount(m.attentionVisibleRows()))
 }
 
-// clampTrainCursor keeps the Trains cursor within the current selectable rows.
-func (m *Model) clampTrainCursor() {
-	m.trainCursor = clampCursor(m.trainCursor, selectableCount(m.trainVisibleRows()))
-}
-
 // currentListRows returns the visible collapsible rows for the current page, if
-// it is a collapsible-list page (Attention or Trains).
+// it is a collapsible-list page (Attention or Jobs).
 func (m Model) currentListRows() ([]listRow, bool) {
 	switch pages[m.selected].page {
 	case pageAttention:
 		return m.attentionVisibleRows(), true
-	case pageTrains:
-		return m.trainVisibleRows(), true
 	case pageJobs:
 		return m.jobsVisibleRows(), true
 	}
@@ -1155,7 +1017,6 @@ func (m *Model) toggleCurrentGroup() bool {
 		return false
 	}
 	m.clampPromptCursor()
-	m.clampTrainCursor()
 	m.clampJobCursor()
 	return true
 }

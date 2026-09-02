@@ -242,12 +242,13 @@ INSERT INTO jobs(id, agent, type, state, payload) VALUES ('old', 'w', 'ask', 'su
 	// leave that ALTER (and everything after it) unapplied so they all run on Open.
 	// The seeded jobs table is missing the token columns AND root_id, so the
 	// token-column ALTER and the #420 root_id ALTER both succeed; any later
-	// migrations (e.g. #473's skillopt_bandit_arms) are independent and also run.
+	// migrations are independent and also run.
 	// We locate the token migration by CONTENT rather than position so appending
 	// new migrations never breaks this pin.
 	tokenMigrationVersion := -1
 	confirmedMemoryBaseVersion := -1
 	blockedEpisodesBaseVersion := -1
+	skillOptRemovalVersion := -1
 	for i, m := range migrations {
 		if tokenMigrationVersion < 0 && strings.Contains(m, "input_tokens") {
 			tokenMigrationVersion = i + 1 // migration versions are 1-indexed
@@ -258,6 +259,9 @@ INSERT INTO jobs(id, agent, type, state, payload) VALUES ('old', 'w', 'ask', 'su
 		if strings.Contains(m, "CREATE TABLE org_blocked_episodes") {
 			blockedEpisodesBaseVersion = i + 1
 		}
+		if strings.Contains(m, "ALTER TABLE agent_template_versions DROP COLUMN canary_sample") {
+			skillOptRemovalVersion = i + 1
+		}
 	}
 	if tokenMigrationVersion < 1 {
 		t.Fatalf("could not locate the input_tokens migration")
@@ -267,6 +271,9 @@ INSERT INTO jobs(id, agent, type, state, payload) VALUES ('old', 'w', 'ask', 'su
 	}
 	if blockedEpisodesBaseVersion < 1 {
 		t.Fatalf("could not locate the org-blocked-episodes base migration")
+	}
+	if skillOptRemovalVersion < 1 {
+		t.Fatalf("could not locate the #1752 SkillOpt-removal migration")
 	}
 	for v := 1; v < tokenMigrationVersion; v++ {
 		if _, err := raw.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, 'seed')`, v); err != nil {
@@ -281,6 +288,16 @@ INSERT INTO jobs(id, agent, type, state, payload) VALUES ('old', 'w', 'ask', 'su
 	if blockedEpisodesBaseVersion >= tokenMigrationVersion {
 		if _, err := raw.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, 'seed')`, blockedEpisodesBaseVersion); err != nil {
 			t.Fatalf("seed org-blocked-episodes base migration v%d returned error: %v", blockedEpisodesBaseVersion, err)
+		}
+	}
+	// The #1752 SkillOpt-removal migration reconciles agent_templates rows, and this
+	// fixture's minimal schema never creates that table (the migration that would
+	// have is marked applied above). Mark it applied for the same reason
+	// confirmed_memories and org_blocked_episodes are: the pin here is the
+	// token-column ALTER, not later table-dependent migrations.
+	if skillOptRemovalVersion >= tokenMigrationVersion {
+		if _, err := raw.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, 'seed')`, skillOptRemovalVersion); err != nil {
+			t.Fatalf("seed skillopt-removal migration v%d returned error: %v", skillOptRemovalVersion, err)
 		}
 	}
 	if err := raw.Close(); err != nil {

@@ -444,7 +444,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		requiredEvents = append(requiredEvents, db.JobEvent{Kind: "review_task_head_divergence", Message: divergence})
 	}
 	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("local agent enqueue"))
-	mailbox.CanaryEnabled = canaryRoutingEnabled(request.Home)
 	mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(request.Home)
 	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(request.Home)
 	mailbox.OrgPolicy = orgPolicy
@@ -657,39 +656,17 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		_ = quotaHooks.recordRuntimeOutcome(ctx, job, payload, effectiveAgent, runErr, time.Now().UTC())
 	}
 	if request.Action == "ask" {
-		// Live-traffic A/B interception (#482). Off by default: when
-		// [skillopt].live_ab_sample_rate is 0 (every existing home + DefaultConfig),
-		// the agent is unmanaged, the bandit floor is not met, or the sampling die
-		// misses, maybeRunLiveAB returns handled=false and the EXACT single
-		// Mailbox.Run below runs unchanged (byte-identical, no extra Deliver). It
-		// reuses the runtime-session lock already held from acquireRuntimeSessionLock
-		// above — no second lock acquisition — so the two serialized Deliver calls
-		// can never self-deadlock on "session is busy".
-		// A runtime-overridden ask skips the live-A/B interceptor: the A/B
-		// compares template variants on the agent's OWN runtime session, which an
-		// override job deliberately does not run on.
-		handled := false
-		if overrideRuntime == "" {
-			var abErr error
-			handled, abErr = maybeRunLiveAB(runCtx, store, request, agent, job, adapter, managed.OK, execBackend)
-			if abErr != nil {
-				recordRuntimeOutcome(abErr)
-				return localAgentJobOutput{}, foregroundAskTimeoutError(runCtx, jobTimeout, abErr)
-			}
+		// Wire the home-aware registry defaults so a foreground ask with no
+		// agent/job model or effort pin honors the runtime's defaults too.
+		// Fail-open/empty by default; an agent/job pin wins.
+		mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("foreground ask delivery"))
+		mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(request.Home)
+		mailbox.RuntimeDefaultEffort = runtimeDefaultEffortResolver(request.Home)
+		if _, err := mailbox.Run(runCtx, job.ID, effectiveAgent, adapter); err != nil {
+			recordRuntimeOutcome(err)
+			return localAgentJobOutput{}, foregroundAskTimeoutError(runCtx, jobTimeout, err)
 		}
-		if !handled {
-			// Wire the home-aware registry defaults so a foreground ask with no
-			// agent/job model or effort pin honors the runtime's defaults too.
-			// Fail-open/empty by default; an agent/job pin wins.
-			mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("foreground ask delivery"))
-			mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(request.Home)
-			mailbox.RuntimeDefaultEffort = runtimeDefaultEffortResolver(request.Home)
-			if _, err := mailbox.Run(runCtx, job.ID, effectiveAgent, adapter); err != nil {
-				recordRuntimeOutcome(err)
-				return localAgentJobOutput{}, foregroundAskTimeoutError(runCtx, jobTimeout, err)
-			}
-			recordRuntimeOutcome(nil)
-		}
+		recordRuntimeOutcome(nil)
 		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_completed", Message: "workflow advancement completed"}); err != nil {
 			return localAgentJobOutput{}, err
 		}
@@ -833,7 +810,6 @@ func buildLocalAgentJobOutput(latest db.Job, request localAgentDispatchRequest) 
 
 func enqueuePermissionBlockedLocalAgentJob(ctx context.Context, store *db.Store, request localAgentDispatchRequest, repo string, defaultBranch string, agentName string, overrideRuntime string, overrideRef string, orgPolicy func(string) workflow.OrgEnforcement) (localAgentJobOutput, error) {
 	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("permission-blocked local agent enqueue"))
-	mailbox.CanaryEnabled = canaryRoutingEnabled(request.Home)
 	mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(request.Home)
 	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(request.Home)
 	mailbox.OrgPolicy = orgPolicy
@@ -1413,7 +1389,7 @@ func resolveLocalDispatchAgent(ctx context.Context, store *db.Store, request loc
 		}
 	}
 	// A background dispatch (or a caller that explicitly opted in via
-	// AllowManagedSync, e.g. the skillopt path) always reaches the managed path.
+	// AllowManagedSync) always reaches the managed path.
 	// For a plain foreground dispatch, fall through to the managed path only for
 	// the `ask` action AND only when the resolved name maps to a configured
 	// managed agent type; otherwise preserve the historical "agent not found"

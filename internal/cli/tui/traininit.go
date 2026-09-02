@@ -25,7 +25,7 @@ const (
 // prompt was answered externally (mirrors the line wizard's 200ms ticker).
 const defaultTrainInitPoll = 200 * time.Millisecond
 
-// TrainInitModel is the bubbletea form for `skillopt train init`. It walks the
+// TrainInitModel is the bubbletea form the agent-create wizard walks. It walks the
 // fields one at a time, publishing a prompt record per field so an agent can
 // answer it with `gitmoot interactive answer` while a human uses the keyboard.
 type TrainInitModel struct {

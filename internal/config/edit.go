@@ -28,8 +28,7 @@ func SetConfigScalar(paths Paths, keyPath []string, value ConfigScalar) error {
 		return err
 	}
 	editedSection := strings.Join(keyPath[:len(keyPath)-1], ".")
-	preserveLegacy := editedSection != "skillopt" || keyPath[len(keyPath)-1] != "deterministic_checkers"
-	editable, err := parseEditableConfig(original, editedSection, preserveLegacy)
+	editable, err := parseEditableConfig(original, editedSection)
 	if err != nil {
 		return err
 	}
@@ -114,9 +113,6 @@ func validateConfigFile(paths Paths) error {
 		return err
 	}
 	if _, err := LoadDefaultFeedbackRepo(paths); err != nil {
-		return err
-	}
-	if _, err := LoadSkillOptABPolicy(paths); err != nil {
 		return err
 	}
 	if _, err := LoadHeartbeats(paths); err != nil {

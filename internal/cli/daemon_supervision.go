@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gitmoot/gitmoot/internal/artifact"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -47,7 +46,7 @@ func startForeignBootRecoveryLoop(ctx context.Context, store *db.Store, stdout i
 	}()
 }
 
-func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonReloadableConfig, dryRun bool, watchSkillOptReviews bool, watchIssues bool, rootFilter string, stdout io.Writer) error {
+func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonReloadableConfig, dryRun bool, watchIssues bool, rootFilter string, stdout io.Writer) error {
 	return withStoreAndPaths(home, func(paths config.Paths, store *db.Store) error {
 		schedule := registeredRepoSchedule{
 			NextPoll:    map[string]time.Time{},
@@ -59,8 +58,6 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 		// paths.Home (the resolved <home>/.gitmoot root) feeds the engine wiring (#459).
 		poller := defaultRegisteredRepoPoller(store, initialWorkers, dryRun, stdout, home, paths.Home)
 		poller.WatchIssues = watchIssues
-		blobStore := artifact.NewStore(paths.ArtifactBlobs)
-		reviewGitHub := newSkillOptGitHubClient()
 		worker := executionBackendJobWorker(store, stdout, home)
 		worker.CommenterFactory = worker.defaultCommenter
 		worker.Admission = worker.loadAdmissionBudget()
@@ -175,11 +172,6 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 					writeLine(stdout, "pipeline in-flight check error: %s", err)
 				} else {
 					wait = pipeline.PipelineAdvanceWait(wait, live.pollInterval(), inFlight)
-				}
-			}
-			if watchSkillOptReviews {
-				if _, err := pollSkillOptReviewWatches(ctx, paths, store, blobStore, reviewGitHub, stdout, dryRun, home); err != nil {
-					writeLine(stdout, "skillopt review watch poll error: %s", err)
 				}
 			}
 			timer := time.NewTimer(wait)
@@ -363,7 +355,6 @@ type heartbeatEnqueuer func(ctx context.Context, request workflow.JobRequest) (d
 // job once enqueued.
 func newHeartbeatEnqueuer(store *db.Store, home string) heartbeatEnqueuer {
 	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("heartbeat enqueue"))
-	mailbox.CanaryEnabled = canaryRoutingEnabled(home)
 	mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(home)
 	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(home)
 	mailbox.OrgPolicy = orgPolicyResolver(home)
@@ -951,7 +942,6 @@ type registeredRepoPoller struct {
 	RecoveryOnly            bool
 	WatchIssues             bool
 	EscalationTTL           time.Duration
-	RevertDetectionEnabled  bool
 	ObservePermissionPolicy bool
 	AutoMergeEnabled        func(repo string) bool
 	CheckoutLocks           *repoCheckoutLocks
@@ -1004,7 +994,6 @@ func defaultRegisteredRepoPoller(store *db.Store, workers int, dryRun bool, stdo
 		DryRun:                  dryRun,
 		Stdout:                  stdout,
 		EscalationTTL:           resolveEscalationTTL(rawHome),
-		RevertDetectionEnabled:  resolveRevertDetectionEnabled(rawHome),
 		ObservePermissionPolicy: resolvePermissionPolicyObservationEnabled(rawHome),
 		AutoMergeEnabled:        autoMergeEnabledResolver(rawHome),
 		IdleGraceTicks:          config.DefaultDaemonIdleGraceTicks,
@@ -1250,7 +1239,6 @@ func (p registeredRepoPoller) pollRepo(ctx context.Context, repoRecord db.Repo, 
 		},
 		WatchIssues:             p.WatchIssues,
 		EscalationTTL:           p.EscalationTTL,
-		RevertDetectionEnabled:  p.RevertDetectionEnabled,
 		ObservePermissionPolicy: p.ObservePermissionPolicy,
 		AutoMergeEnabled:        p.AutoMergeEnabled,
 	}

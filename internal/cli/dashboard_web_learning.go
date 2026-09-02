@@ -18,20 +18,25 @@ import (
 )
 
 // This file implements the two Learning-page DataSource methods — Skills (the
-// SkillOpt evolution overview) and Knowledge (the memory brain graph) — over the
-// same read-only store paths the rest of dashboard_web.go uses (withStore /
+// agent-template version overview) and Knowledge (the memory brain graph) — over
+// the same read-only store paths the rest of dashboard_web.go uses (withStore /
 // withStoreAndPaths, parseJobTimeMillis, loadAgentTypesFailOpen). Both are
 // deterministic: the Learning UI polls them with a change-signature skip, so the
 // sort orders below must be stable across calls.
 
-// Skills returns the SkillOpt evolution overview behind the Learning page's Skills
+// Skills returns the agent-template overview behind the Learning page's Skills
 // view: one SkillTemplate per registered agent template, each carrying its full
-// version history (the sparkline), the version it currently resolves to, any
-// in-flight canary, and its pending candidates. It is a single read-only pass over
-// ListAgentTemplates plus, per template, ListAgentTemplateVersions; each version's
-// score is read best-effort from its candidate review. It is fail-open per
-// template: a broken review or a version-list error degrades that one template
-// (empty scores / history) rather than failing the endpoint.
+// version history (the sparkline) and the version it currently resolves to. It is
+// a single read-only pass over ListAgentTemplates plus, per template,
+// ListAgentTemplateVersions. It is fail-open per template: a version-list error
+// degrades that one template (empty history) rather than failing the endpoint.
+//
+// #1752 removed the SkillOpt optimization loop, and with it the candidate/canary
+// layer that used to populate per-version scores, in-flight canaries and pending
+// candidates. Those DataSource fields are still part of the pinned dashboard
+// module's contract, so they are serialized as their zero values: Pending is empty,
+// ActiveCanaries and PendingTotal are 0. The version history itself is unaffected —
+// it comes from the agent_templates/agent_template_versions store, which stays.
 func (d *webDataSource) Skills(ctx context.Context) (dashboard.Skills, error) {
 	out := dashboard.Skills{Templates: []dashboard.SkillTemplate{}}
 	err := withStore(d.home, func(store *db.Store) error {
@@ -46,25 +51,15 @@ func (d *webDataSource) Skills(ctx context.Context) (dashboard.Skills, error) {
 			out.Templates = append(out.Templates, buildSkillTemplate(ctx, store, tmpl, agentsByTemplate[tmpl.ID]))
 		}
 
-		// Deterministic order: pending-first, then most-recently-promoted
-		// (LastPromotedAt desc), TemplateID tie-break — mirrors the fake feed's sort.
+		// Deterministic order: most-recently-promoted first (LastPromotedAt desc),
+		// TemplateID tie-break. The pending-first tier is gone with the candidate
+		// layer (#1752): Pending is always empty, so it can no longer discriminate.
 		sort.SliceStable(out.Templates, func(i, j int) bool {
-			pi, pj := len(out.Templates[i].Pending) > 0, len(out.Templates[j].Pending) > 0
-			if pi != pj {
-				return pi
-			}
 			if out.Templates[i].LastPromotedAt != out.Templates[j].LastPromotedAt {
 				return out.Templates[i].LastPromotedAt > out.Templates[j].LastPromotedAt
 			}
 			return out.Templates[i].TemplateID < out.Templates[j].TemplateID
 		})
-
-		for i := range out.Templates {
-			if out.Templates[i].CanarySample > 0 {
-				out.ActiveCanaries++
-			}
-			out.PendingTotal += len(out.Templates[i].Pending)
-		}
 		return nil
 	})
 	if err != nil {
@@ -77,8 +72,7 @@ func (d *webDataSource) Skills(ctx context.Context) (dashboard.Skills, error) {
 // dashboard SkillTemplate. The current version/state come from ListAgentTemplates'
 // LEFT JOIN on current_version_id (tmpl.VersionNumber/VersionState) — the SAME
 // resolution Agent()'s Current marker uses, so the two views agree on which version
-// a template "runs". Version scores are read best-effort from each version's
-// candidate review; a broken/absent review simply leaves that version unscored.
+// a template "runs".
 func buildSkillTemplate(ctx context.Context, store *db.Store, tmpl db.AgentTemplate, agents []string) dashboard.SkillTemplate {
 	st := dashboard.SkillTemplate{
 		TemplateID:     tmpl.ID,
@@ -87,7 +81,6 @@ func buildSkillTemplate(ctx context.Context, store *db.Store, tmpl db.AgentTempl
 		Versions:       []dashboard.SkillVersion{},
 		CurrentVersion: tmpl.VersionNumber,
 		CurrentState:   strings.TrimSpace(tmpl.VersionState),
-		Pending:        []dashboard.SkillCandidate{},
 	}
 
 	versions, err := store.ListAgentTemplateVersions(ctx, tmpl.ID)
@@ -99,14 +92,9 @@ func buildSkillTemplate(ctx context.Context, store *db.Store, tmpl db.AgentTempl
 	}
 
 	for _, v := range versions {
-		score, hasScore, rawScore := reviewScore(ctx, store, v.ID)
-		state := strings.TrimSpace(v.State)
-
 		st.Versions = append(st.Versions, dashboard.SkillVersion{
 			Number:     v.VersionNumber,
-			State:      state,
-			Score:      score,
-			HasScore:   hasScore,
+			State:      strings.TrimSpace(v.State),
 			CreatedAt:  parseJobTimeMillis(v.CreatedAt),
 			PromotedAt: parseJobTimeMillis(v.PromotedAt),
 		})
@@ -116,25 +104,6 @@ func buildSkillTemplate(ctx context.Context, store *db.Store, tmpl db.AgentTempl
 		if pa := parseJobTimeMillis(v.PromotedAt); pa > st.LastPromotedAt {
 			st.LastPromotedAt = pa
 		}
-
-		// Canary fields come from the single canary-state version (#484), when one is
-		// in flight. At most one canary exists per template, so the last-writer here
-		// is deterministic (there is only one).
-		if state == "canary" && v.CanarySample > 0 {
-			st.CanarySample = v.CanarySample
-			st.CanaryStartedAt = parseJobTimeMillis(v.CanaryStartedAt)
-		}
-
-		// Pending candidates carry the review's raw score string passed through
-		// verbatim (a decimal here, since the store's score column is REAL).
-		if state == "pending" {
-			st.Pending = append(st.Pending, dashboard.SkillCandidate{
-				VersionID: v.ID,
-				Number:    v.VersionNumber,
-				Score:     rawScore,
-				CreatedAt: parseJobTimeMillis(v.CreatedAt),
-			})
-		}
 	}
 
 	// Versions ascending by Number (the sparkline order); ListAgentTemplateVersions
@@ -143,24 +112,7 @@ func buildSkillTemplate(ctx context.Context, store *db.Store, tmpl db.AgentTempl
 	sort.SliceStable(st.Versions, func(i, j int) bool {
 		return st.Versions[i].Number < st.Versions[j].Number
 	})
-	sort.SliceStable(st.Pending, func(i, j int) bool {
-		return st.Pending[i].Number < st.Pending[j].Number
-	})
 	return st
-}
-
-// reviewScore reads a template version's candidate-review score best-effort. The
-// store column (agent_template_candidate_reviews.score) is a nullable REAL, so the
-// review struct carries it as a *float64: a present score is parsed into the float
-// (for SkillVersion.Score/HasScore) and its compact decimal string is passed
-// through on SkillCandidate.Score. A missing review (sql.ErrNoRows) or ANY lookup
-// error is swallowed — a broken review never errors the Skills endpoint (fail-open).
-func reviewScore(ctx context.Context, store *db.Store, versionID string) (score float64, hasScore bool, raw string) {
-	review, err := store.GetAgentTemplateCandidateReview(ctx, versionID)
-	if err != nil || review.Score == nil {
-		return 0, false, ""
-	}
-	return *review.Score, true, strconv.FormatFloat(*review.Score, 'f', -1, 64)
 }
 
 // agentsByTemplateID maps each base template id to the sorted names of the

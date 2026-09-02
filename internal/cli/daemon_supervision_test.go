@@ -59,7 +59,7 @@ func TestForeignBootRecoveryLoopIndependentOfSlowPollInterval(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- runRegisteredRepoSupervisor(ctx, home, newDaemonReloadableConfig(slowPollInterval, 1, false), false, false, false, "", io.Discard)
+		done <- runRegisteredRepoSupervisor(ctx, home, newDaemonReloadableConfig(slowPollInterval, 1, false), false, false, "", io.Discard)
 	}()
 
 	select {

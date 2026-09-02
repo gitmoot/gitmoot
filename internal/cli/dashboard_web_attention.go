@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"sort"
 	"strings"
 
 	dashboard "github.com/gitmoot/gitmoot-dashboard"
@@ -12,22 +11,24 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// This file implements the three #528 DataSource methods that surface binary-check
-// output and human gates where a human manages work — Attention (the fleet-wide
-// "Needs a human" roll-up), JobChecks (a job's failed deterministic result checks
-// plus the policy mode, #711), and BinaryVerdicts (a SkillOpt eval run's per-question
-// binary verdicts, #714) — over the same read-only store paths the rest of
+// This file implements the three #528 DataSource methods that surface human gates
+// where a human manages work — Attention (the fleet-wide "Needs a human" roll-up),
+// JobChecks (a job's failed deterministic result checks plus the policy mode, #711),
+// and BinaryVerdicts (#714) — over the same read-only store paths the rest of
 // dashboard_web.go uses (withStore / withStoreAndPaths). All three are deterministic:
 // the UI polls them with a change-signature skip, so ordering must be stable across
-// calls (the store queries already sort; the candidate list is sorted here).
+// calls (the store queries already sort).
+//
+// #1752 removed the SkillOpt optimization loop, so two of Attention's three lists and
+// all of BinaryVerdicts lost their backing tables (skillopt_synth_items,
+// agent_template_candidate_reviews and the `pending` version state,
+// skillopt_binary_verdicts). The methods and their response fields remain — they are
+// the pinned dashboard module's DataSource contract — and serialize as empty,
+// never-nil lists.
 
 // Attention returns the "Needs a human" view: every item across the fleet parked on
-// an explicit human decision — blocked job gates (#693), pending synth-review
-// approvals (skillopt_synth_items status pending_human_approval), and agent-template
-// candidates awaiting promotion (versions in the "pending" state, the same set the
-// Skills view surfaces as SkillCandidate). It is a single read-only pass; each list is
-// deterministically ordered (gates oldest-first by insertion id, synth items
-// newest-first, candidates by templateId then version number) and always non-nil.
+// an explicit human decision. Since #1752 that is blocked job gates (#693) only,
+// ordered oldest-first by insertion id; SynthItems and Candidates are always empty.
 func (d *webDataSource) Attention(ctx context.Context) (dashboard.Attention, error) {
 	out := dashboard.Attention{
 		Gates:      []dashboard.AttentionGate{},
@@ -78,75 +79,17 @@ func (d *webDataSource) Attention(ctx context.Context) (dashboard.Attention, err
 			})
 		}
 
-		// --- pending synth approvals ---
-		items, err := store.ListSynthReviewItems(ctx, db.SynthItemStatusPending)
-		if err != nil {
-			return err
-		}
-		for _, it := range items {
-			out.SynthItems = append(out.SynthItems, dashboard.AttentionSynthItem{
-				ID:          it.ID,
-				TemplateID:  strings.TrimSpace(it.TemplateID),
-				Repo:        strings.TrimSpace(it.Repo),
-				Question:    it.Question,
-				Gap:         it.Gap,
-				WeakAgent:   strings.TrimSpace(it.WeakAgent),
-				StrongAgent: strings.TrimSpace(it.StrongAgent),
-				JudgeAgent:  strings.TrimSpace(it.JudgeAgent),
-				CreatedAt:   pipelineTimeMillis(it.CreatedAt),
-			})
-		}
-
-		// --- candidates awaiting promotion (pending template versions) ---
-		out.Candidates = pendingTemplateCandidates(ctx, store)
+		// The synth-review queue and the pending-candidate queue were both owned by
+		// the SkillOpt loop (#1752) and no longer exist. Nothing else parks work on a
+		// human decision, so Gates is the whole view.
 
 		return nil
 	})
 	if err != nil {
 		return dashboard.Attention{}, err
 	}
-	out.Total = len(out.Gates) + len(out.SynthItems) + len(out.Candidates)
+	out.Total = len(out.Gates)
 	return out, nil
-}
-
-// pendingTemplateCandidates lists every agent-template version in the "pending" state
-// (a candidate awaiting human promotion) across all templates, sorted by templateId
-// then version number. Its Score passes through the candidate review's stored form,
-// exactly as the Skills view's SkillCandidate does (reuses reviewScore). Fail-open per
-// template: a version-list error skips that one template rather than failing the view.
-func pendingTemplateCandidates(ctx context.Context, store *db.Store) []dashboard.AttentionCandidate {
-	out := []dashboard.AttentionCandidate{}
-	templates, err := store.ListAgentTemplates(ctx)
-	if err != nil {
-		return out
-	}
-	for _, tmpl := range templates {
-		versions, verr := store.ListAgentTemplateVersions(ctx, tmpl.ID)
-		if verr != nil {
-			continue
-		}
-		for _, v := range versions {
-			if strings.TrimSpace(v.State) != "pending" {
-				continue
-			}
-			_, _, rawScore := reviewScore(ctx, store, v.ID)
-			out = append(out, dashboard.AttentionCandidate{
-				TemplateID: tmpl.ID,
-				Name:       strings.TrimSpace(tmpl.Name),
-				VersionID:  v.ID,
-				Number:     v.VersionNumber,
-				Score:      rawScore,
-				CreatedAt:  parseJobTimeMillis(v.CreatedAt),
-			})
-		}
-	}
-	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].TemplateID != out[j].TemplateID {
-			return out[i].TemplateID < out[j].TemplateID
-		}
-		return out[i].Number < out[j].Number
-	})
-	return out
 }
 
 // JobChecks returns the job-detail failed-check section (#711): the deterministic
@@ -183,38 +126,10 @@ func (d *webDataSource) JobChecks(ctx context.Context, jobID string) (dashboard.
 	return out, nil
 }
 
-// BinaryVerdicts returns the per-run SkillOpt binary-check breakdown (#714) for a
-// skillopt eval run id: the verdicts ordered by (dimension, questionId) — the same
-// order ListBinaryVerdicts reads — plus pass/fail headline counts. Pass mirrors
-// Verdict == "yes". An unknown run is not an error: it returns zero counts and an
-// empty (never nil) list.
+// BinaryVerdicts returns the per-run binary-check breakdown (#714). The
+// skillopt_binary_verdicts table it read was dropped with the SkillOpt loop (#1752),
+// so every run now resolves to zero counts and an empty (never nil) list. The method
+// stays because it is part of the pinned dashboard module's DataSource interface.
 func (d *webDataSource) BinaryVerdicts(ctx context.Context, runID string) (dashboard.BinaryVerdicts, error) {
-	out := dashboard.BinaryVerdicts{RunID: runID, Verdicts: []dashboard.BinaryVerdict{}}
-	err := withStore(d.home, func(store *db.Store) error {
-		rows, err := store.ListBinaryVerdicts(ctx, runID)
-		if err != nil {
-			return err
-		}
-		for _, v := range rows {
-			pass := strings.EqualFold(strings.TrimSpace(v.Verdict), "yes")
-			out.Verdicts = append(out.Verdicts, dashboard.BinaryVerdict{
-				QuestionID:  v.QuestionID,
-				Dimension:   v.Dimension,
-				Verdict:     v.Verdict,
-				Pass:        pass,
-				Explanation: v.Explanation,
-				Weight:      v.QuestionWeight,
-			})
-			if pass {
-				out.Passed++
-			} else {
-				out.Failed++
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return dashboard.BinaryVerdicts{}, err
-	}
-	return out, nil
+	return dashboard.BinaryVerdicts{RunID: runID, Verdicts: []dashboard.BinaryVerdict{}}, nil
 }

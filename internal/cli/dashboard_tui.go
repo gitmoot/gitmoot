@@ -13,12 +13,12 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/gitmoot/gitmoot/internal/agenttemplate"
 	"github.com/gitmoot/gitmoot/internal/cli/tui"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/doctor"
 	"github.com/gitmoot/gitmoot/internal/report"
-	"github.com/gitmoot/gitmoot/internal/skillopt"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -58,15 +58,10 @@ func stdinIsCharDevice() bool {
 }
 
 // runDashboardTUI launches the bubbletea dashboard inside the Root router so
-// pages can push full-screen child views (e.g. a train session's phase view).
-// It returns a process exit code like the other dashboard paths.
+// pages can push full-screen child views. It returns a process exit code like the
+// other dashboard paths.
 func runDashboardTUI(home string, interval time.Duration, stdout, stderr io.Writer) int {
 	deps := dashboardTUIDeps(home, interval)
-	deps.OpenTrain = func(sessionID string) tea.Model {
-		trainDeps := skillOptTrainRunDeps(home, func() string { return sessionID })
-		trainDeps.Embedded = true
-		return tui.NewTrainRun(trainDeps)
-	}
 	program := tea.NewProgram(
 		tui.NewRoot(tui.New(deps)),
 		tea.WithAltScreen(),
@@ -77,7 +72,7 @@ func runDashboardTUI(home string, interval time.Duration, stdout, stderr io.Writ
 	// pending; sweep them so they do not haunt the attention list (mirrors
 	// the standalone wizard's deferred cleanup).
 	_ = withStore(home, func(store *db.Store) error {
-		ids := append(tui.AgentCreatePromptIDs(), agentOptimizePromptIDs()...)
+		ids := tui.AgentCreatePromptIDs()
 		for _, id := range ids {
 			_ = store.DeleteInteractivePrompt(context.Background(), id)
 		}
@@ -213,26 +208,6 @@ func dashboardTUIDeps(home string, interval time.Duration) tui.Deps {
 			}
 			return tui.BugReportCreateResult{URL: result.URL, Existing: result.Existing}, nil
 		},
-		StopTrain: func(id, reason string) error {
-			return withStore(home, func(store *db.Store) error {
-				_, err := stopSkillOptTrainSession(context.Background(), store, id, reason)
-				return err
-			})
-		},
-		DeleteTrain: func(id string) ([]string, error) {
-			var repos []string
-			err := withStore(home, func(store *db.Store) error {
-				var err error
-				repos, err = deleteSkillOptTrainSession(context.Background(), store, id)
-				return err
-			})
-			return repos, err
-		},
-		DeleteTrainRepo: func(repo string) error {
-			return withStore(home, func(store *db.Store) error {
-				return cleanupCreatedTrainRepo(context.Background(), store, repo)
-			})
-		},
 		TemplateVersions: func(templateID string) ([]tui.TemplateVersion, error) {
 			var views []tui.TemplateVersion
 			err := withStore(home, func(store *db.Store) error {
@@ -278,19 +253,10 @@ func dashboardTUIDeps(home string, interval time.Duration) tui.Deps {
 			if err != nil {
 				return nil, err
 			}
-			templates, err := skillopt.ListTrainInitTemplateChoices(context.Background(), store)
+			choices, err := installedAgentTemplateChoices(context.Background(), store)
 			if err != nil {
 				store.Close()
 				return nil, err
-			}
-			var choices []tui.Choice
-			for _, t := range templates {
-				// Only installed templates: registerAgentOnly persists the id
-				// verbatim, and an uninstalled one yields an agent whose jobs
-				// fail at delivery (the CLI register path gates the same way).
-				if t.Installed {
-					choices = append(choices, tui.Choice{Value: t.ID, Label: skillOptTrainInitTemplateChoiceLabel(t)})
-				}
 			}
 			if len(choices) == 0 {
 				store.Close()
@@ -389,31 +355,6 @@ func dashboardTUIDeps(home string, interval time.Duration) tui.Deps {
 				}
 				return registerAgentOnly(context.Background(), store, name, runtimeName, templateID, "")
 			})
-		},
-		OpenAgentOptimize: func(agent tui.Agent) (tea.Model, error) {
-			// Same lifetime pattern as the create form: one store for the
-			// form's 200ms poll, closed from the Done hook.
-			paths, err := initializedPaths(home)
-			if err != nil {
-				return nil, err
-			}
-			store, err := db.Open(paths.Database)
-			if err != nil {
-				return nil, err
-			}
-			repoChoices := skillOptRepoPickerChoices(skillOptKnownRepoNames(context.Background(), store))
-			form := tui.NewAgentOptimizeForm(formPromptStore{home: home, store: store},
-				agent.TemplateID, buildAgentOptimizeFields(home, repoChoices),
-				agentOptimizeSummaryRows(agent.TemplateID), agentOptimizeInterpret)
-			done := form.Done
-			form.Done = func(res tui.Result) tea.Cmd {
-				store.Close()
-				return done(res)
-			}
-			return form, nil
-		},
-		StartOptimize: func(templateID string, values map[string]string) (string, error) {
-			return startAgentOptimizeSession(home, templateID, values)
 		},
 		StartDaemon: func() error {
 			// Restart rather than start: it tolerates a stopped daemon and
@@ -521,6 +462,43 @@ func (s formPromptStore) DeleteInteractivePrompt(ctx context.Context, id string)
 	})
 }
 
+// installedAgentTemplateChoices lists the INSTALLED agent templates the create
+// wizard may instantiate, as picker choices ordered by template id.
+//
+// It replaces skillopt.ListTrainInitTemplateChoices (removed with the SkillOpt loop
+// in #1752), which enumerated three tiers — builtin definitions, installed rows and
+// ids merely referenced by a registered agent — only for the wizard to discard every
+// tier but the installed one. Reading agent_templates directly is the same set with
+// none of that machinery.
+//
+// The label is unchanged: "<id> @v<n> (<source>)", where the version suffix is the
+// current version id with its redundant "<id>@" prefix stripped, and source is
+// "builtin" when the id is a shipped definition and "installed" otherwise. Retired
+// templates are skipped, so the wizard cannot mint an agent on one.
+func installedAgentTemplateChoices(ctx context.Context, store *db.Store) ([]tui.Choice, error) {
+	templates, err := store.ListAgentTemplates(ctx)
+	if err != nil {
+		return nil, err
+	}
+	choices := make([]tui.Choice, 0, len(templates))
+	for _, template := range templates {
+		if agenttemplate.IsRetired(template.ID) {
+			continue
+		}
+		label := template.ID
+		if template.VersionID != "" {
+			label += " @" + strings.TrimPrefix(template.VersionID, template.ID+"@")
+		}
+		source := "installed"
+		if _, ok := agenttemplate.Lookup(template.ID); ok {
+			source = "builtin"
+		}
+		choices = append(choices, tui.Choice{Value: template.ID, Label: label + " (" + source + ")"})
+	}
+	sort.SliceStable(choices, func(i, j int) bool { return choices[i].Value < choices[j].Value })
+	return choices, nil
+}
+
 // toTUISnapshot copies the cli dashboardSnapshot into the tui-facing Snapshot.
 func toTUISnapshot(s dashboardSnapshot) tui.Snapshot {
 	out := tui.Snapshot{
@@ -564,9 +542,6 @@ func toTUISnapshot(s dashboardSnapshot) tui.Snapshot {
 	for _, l := range s.BranchLocks {
 		out.BranchLocks = append(out.BranchLocks, tui.BranchLock{Repo: l.Repo, Branch: l.Branch, Owner: l.Owner})
 	}
-	for _, t := range s.TrainSessions {
-		out.Trains = append(out.Trains, tui.TrainSession{ID: t.ID, Phase: t.Phase, Candidate: t.Candidate, Repo: t.Repo})
-	}
 	for _, l := range s.ResourceLocks {
 		out.ResourceLocks = append(out.ResourceLocks, tui.ResourceLock{Key: l.Key, Owner: l.Owner, Stale: l.Stale})
 	}
@@ -596,9 +571,6 @@ func toTUISnapshot(s dashboardSnapshot) tui.Snapshot {
 	}
 	for _, t := range s.awaitingHuman {
 		out.AwaitingHuman = append(out.AwaitingHuman, tui.AwaitingHumanTask{TaskID: t.TaskID, Repo: t.Repo, Title: t.Title})
-	}
-	for _, c := range s.pendingCandidates {
-		out.PendingCandidates = append(out.PendingCandidates, tui.PendingCandidate{VersionID: c.VersionID, TemplateID: c.TemplateID, Score: c.Score})
 	}
 	out.Activity = buildDashboardActivity(jobs)
 	return out

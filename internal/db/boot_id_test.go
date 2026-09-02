@@ -205,7 +205,7 @@ func TestReleaseRuntimeSessionLocksFromForeignBoot(t *testing.T) {
 		{ResourceKey: "runtime:codex:s-legacy", OwnerJobID: "job-leg", OwnerToken: "t3", OwnerBootID: "", ExpiresAt: future},
 		// Foreign-boot but NOT a runtime lock: must be kept (only runtime:% locks
 		// are reclaimed cross-boot by the daemon).
-		{ResourceKey: "skillopt-train-generation:s:i", OwnerJobID: "job-gen", OwnerToken: "t4", OwnerBootID: "old-boot", ExpiresAt: future},
+		{ResourceKey: "generation:s:i", OwnerJobID: "job-gen", OwnerToken: "t4", OwnerBootID: "old-boot", ExpiresAt: future},
 		// Running session jobs execute outside the daemon and remain protected.
 		{ResourceKey: "runtime:codex:session-live", OwnerJobID: "session-live", OwnerToken: "t5", OwnerBootID: "old-boot", ExpiresAt: future},
 		// Once the session row is terminal, its old-boot lock is stale and must go.
@@ -237,7 +237,7 @@ func TestReleaseRuntimeSessionLocksFromForeignBoot(t *testing.T) {
 	if present("runtime:codex:session-terminal") {
 		t.Fatal("terminal session's foreign-boot runtime lock was not reclaimed")
 	}
-	for _, key := range []string{"runtime:codex:s-cur", "runtime:codex:s-legacy", "skillopt-train-generation:s:i", "runtime:codex:session-live"} {
+	for _, key := range []string{"runtime:codex:s-cur", "runtime:codex:s-legacy", "generation:s:i", "runtime:codex:session-live"} {
 		if !present(key) {
 			t.Fatalf("lock %s was wrongly reclaimed", key)
 		}

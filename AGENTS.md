@@ -139,7 +139,7 @@ boundary — component tests miss the home double-resolution bug class (#446/#45
 ## Repository layout
 
 - `cmd/gitmoot/` — CLI entrypoint.
-- `internal/cli/` — the command surface (agent, template, skillopt, memory,
+- `internal/cli/` — the command surface (agent, template, memory,
   dashboard) **and the `daemon` command wiring / worker loop**.
 - `internal/daemon/` — the PR-watcher daemon package (poll/resume/revert logic).
 - `internal/pipeline/`: the pipeline engine. Start with:
@@ -154,7 +154,6 @@ boundary — component tests miss the home double-resolution bug class (#446/#45
 - `internal/workflow/` — the job/delegation engine, mailbox, memory controller,
   and the `gitmoot_result` contract.
 - `internal/runtime/` — the Codex/Claude/Kimi/omp/shell adapters.
-- `internal/skillopt/` — the template auto-optimization loop.
 - `internal/config/` — config loaders (`init.go` holds the `DefaultConfig`
   template + per-section loaders).
 - `internal/db/` — the SQLite store + the migrations slice.
@@ -226,16 +225,15 @@ portable code behavior.
 - In E2E/orchestrate set `HERDR_SOCKET_PATH=/tmp/throwaway` and unset `HERDR_ENV`
   or panes leak to the prod Telegram group.
 - Global flags like `--home` use Go flag parsing, so they must precede positional
-  args (e.g. `skillopt candidate --home /tmp/h show <id>`, not after the id).
+  args (e.g. `agent template --home /tmp/h show <id>`, not after the id).
 - `agent template add` needs a file with YAML frontmatter — use
   `agent template draft` to scaffold one. `template publish --create` makes a
   **private** repo; prompt bodies + metadata are stored/published **verbatim**,
   so point the remote at a private repo unless the prompts are meant to be public.
 - An invalid `CLAUDE_CODE_OAUTH_TOKEN` 401s fresh claude sessions but `--resume`
   masks it; `gitmoot doctor` "auth ok" is set-not-valid (a false green).
-- Killing a foreground `agent ask` / `skillopt train` strands a resource lock
-  (runtime-session / generation); recover via `skillopt train recover` or clear
-  the lock.
+- Killing a foreground `agent ask` strands a runtime-session resource lock;
+  clear the lock to recover.
 - codex ephemeral workers need `~/.codex/config.toml`
   `[sandbox_workspace_write] network_access=true` to push / open PRs.
 - Agent permission policies gate Bash: `--policy workspace-write` auto-accepts
@@ -301,7 +299,7 @@ detection.
 
    Both empty (`[]`), then:
    `systemctl --user restart gitmoot-daemon gitmoot-dashboard-web`.
-5. Config-only changes (e.g. `[memory]`/`[skillopt]`) usually need no restart
+5. Config-only changes (e.g. `[memory]`) usually need no restart
    (re-read per tick / warm-reloaded on SIGHUP).
 6. **Public releases need explicit OWNER sign-off** —
    `gh release create vX.Y.Z --latest` triggers `release.yml`. "Deploy locally"

@@ -38,7 +38,7 @@ type RepoConcurrency struct {
 // repo keeps today's global behavior.
 //
 // It reuses the same naive line-scanner shape as LoadHeartbeats. Unrelated
-// sections (agents.*, admission, skillopt, …) are ignored; a repo name contains
+// sections (agents.*, admission, …) are ignored; a repo name contains
 // a '/', so the section key is the TOML quoted-key form repos."owner/repo".
 func LoadRepoConcurrency(paths Paths) ([]RepoConcurrency, error) {
 	content, err := os.ReadFile(paths.ConfigFile)

@@ -55,7 +55,7 @@ type PromptStore interface {
 }
 
 // Interpret validates a free-text answer for a field, returning the cleaned
-// value and a status of "ok" or "reask". The cli wraps skillopt's interpret
+// value and a status of "ok" or "reask". The cli wraps its own interpret
 // core so the TUI and line wizard share identical validation.
 type Interpret func(field, text string) (value, status string)
 

@@ -365,9 +365,7 @@ watches open **issues** for `@<agent> ask …` mentions and routes them to jobs,
 mirroring the PR-comment watcher; `--scheduler pool` selects the continuous
 worker-pool scheduler that re-queries the queue as workers free and auto-isolates
 a contended same-repo read job into an ephemeral worktree (fixing a same-repo
-dependent-job deadlock), versus the default `--scheduler barrier`;
-`--watch-skillopt-reviews` polls watched SkillOpt review issue comments and
-imports valid feedback automatically.
+dependent-job deadlock), versus the default `--scheduler barrier`.
 
 To run a repo's queued jobs N-wide, use `--parallel N` (sugar for `--workers N
 --scheduler pool`; it cannot be combined with `--workers` or `--scheduler`).
@@ -497,12 +495,12 @@ conditional. Decay gates repository GitHub calls only; heartbeat, pipeline, and
 chat maintenance still wakes at the base interval.
 
 `gitmoot dashboard` shows local state — daemon health, repos, agents and runtime
-sessions, jobs by state, worktrees, branch locks, SkillOpt train phase/candidate,
-and pending interactive prompts.
+sessions, jobs by state, worktrees, branch locks, and pending interactive
+prompts.
 
 On a real terminal (stdin and stdout both a TTY) and with no other output/mutation
 flag, `gitmoot dashboard` launches an **interactive TUI**: a sidebar of pages
-(Attention, Activity, Trains, Agents, Workers, Jobs, Locks, Health, Config)
+(Attention, Activity, Agents, Workers, Jobs, Locks, Health, Config)
 that auto-refreshes.
 Navigate with `tab`/`shift+tab` or `←/→`; `↑/↓` selects a row; `?` opens a
 per-page key reference; `r` refreshes, `q` quits. The TUI is the cockpit — every
@@ -517,13 +515,6 @@ equivalent:
   its children, so "what are my agents working on right now" is answered at a
   glance; `enter` opens the request/result detail of a root or a specific
   delegate.
-- **Trains** lists every train session: `enter` opens ANY session's live phase
-  view (not just the newest), `s` stops a live session (a reason is required;
-  same path as `skillopt train stop`), `d` deletes a finished session and its
-  history — and, if gitmoot created GitHub repos for that session, a second
-  confirm offers to delete those too (never offered for repos gitmoot did not
-  create; a missing `delete_repo` token scope shows its `gh auth refresh`
-  remedy and can be retried in place).
 - **Agents** lists registered agents: `enter` opens a detail with the template,
   recent jobs, and the template's version history — in the detail `↑/↓` selects a
   recent job (then a version) and `enter` opens it: a recent job opens that job's
@@ -2522,257 +2513,8 @@ result_checks = "warn"   # off | warn | block (default: warn)
   independent of whether a gate refuses it.
 
 A result that passes every applicable check records nothing, so the audit is
-quiet on healthy jobs. Failed checks are also stored durably for later SkillOpt
-consumption as structured feedback; there is no SkillOpt behavior change today.
-
-## SkillOpt Exchange
-
-```sh
-gitmoot skillopt review create --template <id> --repo owner/repo --run <run-id>
-gitmoot skillopt review item add --run <run-id> --item <item-id> --baseline baseline.md --candidate candidate.md [--title text]
-gitmoot skillopt review create --template <id> --repo owner/repo --run <run-id> --mode explore --exploration-level high --options 4
-gitmoot skillopt review item add --run <run-id> --item <item-id> --option a=option-a.md --option b=option-b.md [...]
-gitmoot skillopt review status --run <run-id>
-gitmoot skillopt export --run <run-id> [--output training.json]
-gitmoot skillopt import --file candidate.json [--artifact-dir artifacts]
-gitmoot skillopt candidate list [--template id]
-gitmoot skillopt candidate show <version-id>
-gitmoot skillopt candidate promote <version-id>
-gitmoot skillopt candidate reject <version-id> [--reason text]
-gitmoot skillopt ab <agent> "<prompt>" [--challenger <versionId>] [--pick a|b] [--seed N] [--judge] [--judge-only] [--home path]
-gitmoot skillopt pairwise import <packet-dir> [--packet path] [--secret-map path] [--picks path] [--reviewer name] [--json]
-gitmoot skillopt rubric induce --template <id> [--out <dir>] [--holdout 0.2] [--min-events N] [--home path] [--json]
-gitmoot skillopt feedback markdown export --run <run-id> --output .gitmoot/evals/<run-id>
-gitmoot skillopt feedback markdown import --packet .gitmoot/evals/<run-id> [--reviewer name]
-gitmoot skillopt feedback github publish --run <run-id> [--repo owner/repo] [--pr <number>]
-gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)
-gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file items.yml [--workspace-repo owner/workspace] [--preview-repo owner/previews] [--preview-mode none|optional|required] [--preview-renderer none|vue-vite] [--preview-publisher none|github-pages] [--preview-route-template template] [--create-repos] [--yes]
-gitmoot skillopt train status --session <id>
-gitmoot skillopt train run [--config path | --session <id>] [--plain]
-gitmoot skillopt train continue --session <id> [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--dry-run] [--promote version|--reject version --reason text] [--start-next]
-gitmoot skillopt train recover --session <id> [--out-root path] [--generation [--abort | --advance-state]] [--json]
-gitmoot skillopt train stop --session <id> --reason <text>
-gitmoot skillopt judge-report [--template <id>] [--home <path>]
-gitmoot skillopt judge agreement [--template <id>] [--home <path>] [--json]
-gitmoot skillopt judge promote --template <id> --task-kind <kind> --file <pkg.json> [--home <path>] [--yes] [--json]
-```
-
-On a real terminal, `skillopt train run` opens an interactive view of one session
-(resolved from `--session` or the newest session of a `--config`): a phase bar
-plus a single keypress per step — `enter` advances the current phase (the long
-generate/optimizer steps run in a detached background process so `q` leaves the
-run going), `p`/`x` promote or reject a candidate, `n` starts the next iteration.
-Review-blocked phases show the GitHub issue link to continue from the browser.
-`--plain`, a piped stdin, or `GITMOOT_NO_TUI`/`TERM=dumb` print a one-shot status
-snapshot instead. `train status`/`continue` print a `continue_from_github:` line
-at review-blocked phases. `train start --create-repos` (or the prompt in the
-`train init` form) creates a missing target/workspace/review repo on GitHub.
-
-Use `skillopt train` for the product workflow. It pins the template version,
-tracks sessions and iterations, validates item diversity, generates temporary
-agent options, publishes review packets, syncs feedback, hands off to the
-external optimizer, imports pending candidates, publishes candidate review
-context, and starts follow-up iterations only after a promoted/rejected/abandoned
-decision. Use `skillopt review`, `feedback`, `export`, `import`, and
-`candidate` directly only for advanced debugging, custom research runs, or
-recovering one step of a train session.
-
-Option generation in `skillopt train continue` is durable and idempotent on
-resume. Each review item's artifacts, item row, and options commit in a single
-transaction the moment that item finishes, so an interrupted generation phase
-keeps every item that already completed instead of losing the whole batch.
-Re-running `skillopt train continue` regenerates only the incomplete items:
-completed items are skipped, no duplicate options are written, and finished work
-is never rewritten. If an item has some but not all of its options persisted,
-resume hard-errors with `item <id> has partial generated options; inspect or
-clear review options before continuing` so you can inspect or clear that item
-before retrying.
-
-`skillopt train recover` repairs the optimizer phase of a session by default — it
-re-imports or repairs the optimizer candidate package and classifies the
-iteration as `already_completed_candidate`, `already_completed_no_candidate`,
-`optimizer_active`, or `corrupted_unrecoverable`:
-
-```sh
-gitmoot skillopt train recover --session <id>
-gitmoot skillopt train recover --session <id> --out-root .gitmoot/skillopt/<run-id>
-gitmoot skillopt train recover --session <id> --json
-```
-
-`--out-root` overrides the optimizer output directory (it defaults to the
-session's persisted optimizer path), and `--json` prints the recovery result as
-JSON.
-
-Pass `--generation` to recover the generation phase instead:
-
-```sh
-gitmoot skillopt train recover --session <id> --generation
-gitmoot skillopt train recover --session <id> --generation --advance-state
-gitmoot skillopt train recover --session <id> --generation --abort
-```
-
-This reclaims a generation lock stranded by a crashed/killed `train continue`
-(whose deferred lock release never ran) and salvages the persisted per-item
-options. Reclamation is liveness-gated: the lock is released only when its owner
-PID is provably dead AND it was held on this same host. A live owner is refused
-(`skillopt train generation is already running`) so you stop the running process
-first; a cross-host owner requires the lock TTL to expire. The recover process
-re-acquires the lock for itself so the salvage is crash-safe. Salvage is
-import-only — it reports `expected_items`, `recovered_items`, and `missing_items`
-and classifies the run as `generation_complete`, `generation_incomplete`, or
-`generation_active`. The iteration advances to `options_generated` only with
-`--advance-state` and only when every expected item is recovered (regenerating
-missing items remains `train continue`'s job). `--abort` reclaims the lock and
-leaves the phase at `items_ready`, keeping persisted items. A stale generation
-lock also surfaces in `train status` as a `stale` active lock, separate from the
-true current phase.
-
-`skillopt review create` starts a review run for a template and target repo.
-Use the default A/B shape for validation, or pass `--mode explore|refine|distill`
-with `--options N` for ranked exploration. `skillopt review item add` stores
-saved baseline/candidate outputs as artifact-backed A/B review items, or
-repeated `--option label=path` artifacts for ranked N-way items. `skillopt
-review status` reports whether the run has items, complete artifacts, imported
-feedback for every item, ranking stability, pairwise preference count, and a
-recommended next mode. Recommendations are advisory; Gitmoot never changes mode,
-imports a candidate, or promotes a template automatically.
-
-`skillopt export` writes a JSON training package with the template snapshot,
-eval run, review items, artifact manifests, feedback events when present, and
-evaluator config. Use `gitmoot-skillopt optimize --training-package
-training.json --artifact-root ~/.gitmoot/evals/blobs --out-root
-.gitmoot/skillopt/<run-id> --candidate-output candidate.json --dry-run` first
-to validate the contract without model calls.
-Before real model-backed optimization, check `gitmoot-skillopt --version` and
-`gitmoot-skillopt optimize --help`, or install it with
-`pipx install https://github.com/jerryfane/gitmoot-skillopt/releases/download/v0.4.2/gitmoot_skillopt-0.4.2-py3-none-any.whl`.
-Verify required model/backend environment variables for the installed optimizer
-version. `skillopt import` validates a candidate package and stores the
-candidate template as a pending version; it never promotes the candidate
-automatically. If the candidate package includes new artifact manifest entries,
-pass `--artifact-dir` so Gitmoot can verify relative paths and SHA256 hashes
-before storing blobs. `skillopt candidate show` displays candidate metadata, eval
-report JSON, preference summary, and a content diff against the base/current
-version. `skillopt candidate promote` makes a pending candidate current, while
-`skillopt candidate reject` records an auditable rejection and prevents that
-version from being selected by `@latest`.
-
-`skillopt pairwise import <packet-dir>` ingests a **blinded paired-review
-packet** produced by the gitmoot-skillopt fork (the `pairwise-review.json`
-packet plus its secret map and the reviewer's picks), de-blinds it, and stores
-the pairwise-preference feedback events — the import path for Mode B's
-paired-review evidence. The daemon can also import review-issue feedback
-automatically when started with `--watch-skillopt-reviews`.
-
-At the manual promote/reject gate, Gitmoot records every judge↔human outcome
-into a local store — all four directions: `agree_accept`, `agree_reject`,
-`judge_accept_human_reject` (judge accepts, human rejects — a false positive),
-and `judge_reject_human_accept` (judge rejects, human accepts — a false
-negative). Each outcome is tagged with the judge prompt version, evaluator id,
-and prompt hash that produced the score, so later analysis can compare judges by
-prompt revision. This capture is measurement only: it never changes the judge,
-overrides a decision, or bumps the result contract.
-
-`skillopt judge-report` reads those captured outcomes and reports how well the
-LLM judge is calibrated against human verdicts. It prints a confusion matrix
-(the four `direction` buckets), the agreement rate and Cohen's κ, calibration
-buckets (judge soft-score versus the human decision), and per-dimension
-disagreement. Pass `--template <id>` to scope the report to one template, and
-`--home <path>` to read from a non-default Gitmoot home. It is read-only.
-
-`skillopt judge agreement` is the judge↔human agreement measurement harness
-(#344). It joins the stored A/B judge verdicts (`skillopt ab --judge` /
-jury rows) against the human ranked/pairwise feedback on the same
-**comparison**: each `skillopt ab` invocation stamps a shared per-comparison
-token on all of its rows, so repeated A/Bs of one challenger stay separate
-observations (older tokenless rows are excluded and counted as unmeasurable,
-never pooled; internal ties within one comparison are skipped and counted).
-It reports Cohen's κ as the **headline** metric (raw agreement overstates
-judge quality because it does not correct for chance), the raw agreement
-rate, per-human-source and per-juror-family breakdowns, an
-assignment-corrected position-bias audit over judge rows that carry the
-recorded raw a/b pick (`P(pick=a)` stratified by the champion's presented
-position and reported alongside `P(option A = champion)`; undefined when a
-fixed `--seed` pinned the champion to one position), and a summary of the
-candidate-level judge outcomes above. Small samples get a loud warning —
-sample size is the limiter. `--json` emits the machine-readable report. It is
-read-only.
-
-`skillopt rubric induce` is the **offline, deterministic rubric-induction**
-tool (#344/#347, AutoLibra-style — 2505.02820). It reads the human feedback
-already captured for a template (the `useful_traits` / `rejected_traits` /
-`required_improvements` on ranked feedback events, across all of that
-template's runs) and **induces a criterion-separated rubric** from it, then
-freezes it as reviewed static JSON. The pipeline is fully offline — no LLM
-calls, so it is reproducible and testable: (1) **ground** each trait string
-into an aspect `{text, sign +/-, source_event_id}`; (2) **cluster** aspects by
-normalized token-overlap (Jaccard, greedy single-linkage, stable ordering)
-into up to six metrics, each `{name, definition, positive_examples,
-negative_examples, source_event_ids}`; (3) **meta-evaluate** on a held-out
-split — `coverage` (fraction of held-out aspects a metric matches) and
-`redundancy` (max inter-metric similarity, lower is better); (4) **write**
-`rubric.json` (the frozen rubric, `{version, template, metrics[...]}`),
-`report.json`, and a human-readable `report.txt` under `--out` (default
-`<home>/skillopt/rubrics/<template>`). Flags: `--template <id>` (required),
-`--holdout 0.2` (fraction reserved for coverage; `0` keeps in-sample),
-`--min-events N` (minimum usable feedback events, hard floor 3),
-`--home <path>`, and `--json` (emits the report plus the artifact paths). It
-errors with an actionable message and a non-zero exit when there are fewer than
-three usable feedback events or fewer than two separable metric clusters. The
-token-overlap clusterer is the deterministic v1; swapping in AutoLibra's LLM
-thematic clustering is a clearly-marked extension point that changes only the
-clustering step, leaving grounding, the held-out meta-eval, and the emitted
-contract identical.
-
-The tool is **read-only over the store and human-gated**: it only writes files
-and never injects anywhere. To adopt an induced rubric, a human reviews
-`rubric.json` and maps its metrics onto gitmoot-skillopt's
-`evaluator_config['rubric']` — one dimension per metric, using the metric
-`name` as the dimension key and its `definition` (plus the positive/negative
-examples) as the description, with a weight the reviewer chooses. Because the
-judge's `_compose_evaluator_rubric` already merges arbitrary
-`evaluator_config['rubric']` dimensions and `_normalize_dimension_list`
-accepts arbitrary names, adopting an induced rubric needs **zero judge-code
-change and no result-contract bump**.
-
-`skillopt judge promote` closes the judge-prompt optimization loop: it applies an
-**accepted** judge-prompt variant (from the judge-prompt optimizer's
-`gitmoot-skillopt-judge-candidate` package) into a template, so the next
-skill-opt run judges with the improved prompt. Select the variant with
-`--task-kind <kind>` (use `_global` for the all-items pass). It **previews by
-default** — printing the template id, task kind, the `baseline→best` agreement
-delta, and a truncated prompt preview, and writing nothing — and requires
-`--yes` to apply. It refuses (hard error) any variant whose `accepted` is not
-true or whose `best_prompt` is empty, and any task kind missing from the package.
-On apply it writes the prompt into the template's `evaluation` metadata
-(`judge_prompt_templates` keyed by task kind, **merging** so other task kinds are
-preserved, plus a bumped `judge_prompt_version`) and records a
-`skillopt_judge_outcomes` audit row (`human_decision=promoted`, the old→new
-version, and the agreement delta in `reason`). `--json` emits the machine-readable
-preview/apply summary.
-
-The Markdown feedback collector writes blind A/B review packets with `index.md`,
-per-item Markdown files, editable `feedback.yml`, and hidden assignment metadata
-that Gitmoot uses to validate the full response and import de-blinded canonical
-feedback events. Open `index.md`, review every file in `items/*.md`, set
-`reviewer`, edit `feedback.yml` with exactly one of `a`, `b`, `tie`, `neither`,
-or `skip` for every item, and leave `.assignments.json` untouched.
-Ranked packets use the same files, but `feedback.yml` contains ordered rankings
-plus optional `useful_traits`, `rejected_traits`, and reasoning. After feedback
-exists, packet summaries hide outcome-bearing phase details so later blind
-reviewers do not see the current winner before responding.
-
-The GitHub feedback collector publishes the same blind A/B review packet to a
-new issue by default, or to an existing PR when `--pr <number>` is provided.
-Repository resolution uses `--repo`, then the eval run target repo, then the
-template source repo, then optional `[feedback].repo = "owner/reviews"` in
-Gitmoot config. Reviewers can reply with full YAML or run-scoped short-form
-lines such as `run_id: run-1` followed by `item-001: b - More concrete.`.
-`github sync` imports valid comments into canonical feedback events and ignores
-unrelated comments safely.
-Ranked GitHub comments can use `item-001 ranking: C > A > D > B` plus trait
-notes. Use the ranked workflow for exploration/refinement and return to A/B
-validation for final promotion decisions on fresh items.
+quiet on healthy jobs. Failed checks are also stored durably for later
+consumption as structured feedback; nothing consumes them today.
 
 ## Agent Memory
 
