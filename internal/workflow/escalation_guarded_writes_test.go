@@ -151,29 +151,33 @@ func TestTerminalTaskWinnerRefusesTheWholeResolution(t *testing.T) {
 	}
 }
 
-// TestPreEffectOwnershipLossHandsBackResources covers P1-3
-// (engine_escalation_resume.go:733). Long external pre-effects must hold ownership:
-// a lease that lapses while git work runs means RecordEscalationRoundPreEffects
-// refuses, and that boolean must be treated as OWNERSHIP LOSS - no effects, and the
-// branch lock handed back rather than stranded.
-func TestPreEffectOwnershipLossHandsBackResources(t *testing.T) {
+// TestPreEffectOwnershipLossLeavesTheReplacementsLockAlone covers P1-3 in its
+// PRODUCTION SHAPE. The earlier version of this test used "other-recoverer" as the
+// replacement branch-lock owner and asserted the stale pass HANDED THE LOCK BACK. Both
+// halves were wrong.
+//
+// The shared-checkout lock is owned by request.Agent (engine_delegation.go), an identity
+// that is STABLE ACROSS RECOVERY PASSES rather than unique to the lease holder. So a
+// replacement pass acquires the very same repo/branch/agent lock legitimately - and a
+// stale pass "releasing its own lock" by that tuple DELETES THE LIVE LOCK the new pass
+// believes it holds, turning a bounded leak into a silent mutual-exclusion failure.
+//
+// SEMANTIC REVERSION THIS KILLS: re-introduce the handback and the replacement's lock
+// disappears.
+func TestPreEffectOwnershipLossLeavesTheReplacementsLockAlone(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	engine := testEngine(store)
 	engine.EscalationNotifier = &recordingNotifier{}
 	pausedImplementEscalation(t, store, &engine)
 	// FORCE THE SHARED-CHECKOUT FALLBACK: with no worktree manager the leg takes a real
-	// BRANCH LOCK instead of an isolated worktree, which is the resource that strands.
-	// With the isolated path the lock never exists and any assertion about releasing it
-	// is vacuous - the first version of this test measured nothing.
+	// BRANCH LOCK, which is the resource this finding is about.
 	engine.DelegationWorktrees = nil
 	round, ok := unsettledRound(t, store, "parent-job")
 	if !ok {
 		t.Fatal("no unsettled round")
 	}
 
-	// Ownership is taken away DURING the pre-effects, exactly as a lapsed lease
-	// followed by another recoverer would do.
 	resolutionEffectsHook = func(hookCtx context.Context, jobID string) error {
 		now := time.Now().UTC()
 		taken, err := store.AcquireEscalationRecoveryLease(hookCtx, "parent-job", round.RoundID, "other-recoverer",
@@ -199,24 +203,34 @@ func TestPreEffectOwnershipLossHandsBackResources(t *testing.T) {
 	if got := countWorkflowJobEvents(t, store, "parent-job", escalationEffectsCompletedEvent); got != 0 {
 		t.Fatalf("receipts = %d, want 0 after ownership loss", got)
 	}
-	// THE LOCK WAS HANDED BACK: the new owner must be able to take the same branch.
+	// NOTHING RECORDED on the round either: the pre-effect record is owner-scoped.
 	stored, ok := unsettledRound(t, store, "parent-job")
 	if !ok {
 		t.Fatal("the round vanished: the claim must survive an ownership loss")
 	}
 	if strings.TrimSpace(stored.PreEffectBranch) != "" {
-		t.Fatalf("a pass that lost ownership recorded pre-effects on the round: %+v", stored)
+		t.Fatalf("a pass that lost ownership recorded pre-effects: %+v", stored)
 	}
-	acquired, err := store.AcquireLock(ctx, db.BranchLock{
-		RepoFullName: "gitmoot/gitmoot",
-		Branch:       "task-005",
-		Owner:        "other-recoverer",
-	})
+
+	// THE REPLACEMENT'S LOCK SURVIVES. The replacement holds it under the REAL
+	// production identity - the same agent - which is exactly why a handback keyed on
+	// that tuple would delete it.
+	lock := db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-005", Owner: "builder"}
+	if _, err := store.AcquireLock(ctx, lock); err != nil {
+		t.Fatalf("replacement AcquireLock: %v", err)
+	}
+	held, err := store.ListBranchLocks(ctx, "gitmoot/gitmoot")
 	if err != nil {
-		t.Fatalf("AcquireLock: %v", err)
+		t.Fatalf("ListLocks: %v", err)
 	}
-	if !acquired {
-		t.Fatal("the lost pass stranded its branch lock: the new owner cannot proceed")
+	found := false
+	for _, existing := range held {
+		if existing.Branch == "task-005" && existing.Owner == "builder" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the replacement pass's branch lock was deleted by the stale pass; locks = %+v", held)
 	}
 }
 

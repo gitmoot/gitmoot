@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -708,7 +709,10 @@ func (e Engine) adoptOrLoadUnsettledRound(ctx context.Context, coordinatorJobID 
 // pass may reclaim it. Expiry transfers OWNERSHIP ONLY: it never settles, never
 // discards, and never touches the preserved claim, so it cannot become the
 // abandonment path rejected in v3.
-const escalationRecoveryLeaseTTL = 2 * time.Minute
+// escalationRecoveryLeaseTTL bounds how long a recovery fence is held before another
+// pass may reclaim it. A var, not a const, so a test can shrink it and drive the
+// heartbeat that keeps unbounded git work fenced (#1673).
+var escalationRecoveryLeaseTTL = 2 * time.Minute
 
 // escalationPreRenewHook fires between the fence acquisition and the renewal that
 // covers the pre-effects, which is the one window a test cannot otherwise reach
@@ -750,8 +754,70 @@ func (e Engine) applyResolutionEffectsFenced(ctx context.Context, parentJob db.J
 		// Lost between the fence and here: apply nothing.
 		return nil
 	}
-	verbErr := capturing.applyResolutionEffects(ctx, parentJob, parentPayload, ref, rec, verb, instructions, answers, roundID)
-	if verbErr != nil && sink.blocked == nil {
+	// A HEARTBEAT, NOT A ONE-SHOT RENEWAL. Git work has no bound, and a single fixed
+	// extension is a bet on how long it takes: if allocation outlives the lease, another
+	// recoverer takes ownership and runs the SAME pre-effects concurrently, and
+	// RecordEscalationRoundPreEffects only notices after the external work finished -
+	// too late to have preserved single-owner pre-effects at all (#1673).
+	//
+	// The heartbeat renews while the work runs and CANCELS the work's context the moment
+	// ownership is genuinely lost, so a losing pass stops mid-flight instead of
+	// completing effects it no longer owns.
+	effectCtx, stopHeartbeat := context.WithCancel(ctx)
+	// ownershipLost is set ONLY by the heartbeat observing a genuine loss. It is a
+	// separate signal from effectCtx.Err() on purpose: this function cancels effectCtx
+	// itself once the effects return, so reading the context's error as "lost" would
+	// classify every successful run as a loss and silently discard its commit.
+	var ownershipLost atomic.Bool
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		ticker := time.NewTicker(escalationRecoveryLeaseTTL / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-effectCtx.Done():
+				return
+			case <-ticker.C:
+				held, err := e.Store.RenewEscalationRecoveryLease(ctx, parentJob.ID, roundID, owner,
+					time.Now().UTC().Add(escalationRecoveryLeaseTTL), time.Now().UTC())
+				if err != nil {
+					// A transient store error is not proof of loss; the next tick retries
+					// and the lease still has two thirds of its life left.
+					continue
+				}
+				if !held {
+					ownershipLost.Store(true)
+					stopHeartbeat()
+					return
+				}
+			}
+		}
+	}()
+	verbErr := capturing.applyResolutionEffects(effectCtx, parentJob, parentPayload, ref, rec, verb, instructions, answers, roundID)
+	stopHeartbeat()
+	<-heartbeatDone
+	// Ownership lost while the pre-effects ran: the heartbeat cancelled them, so apply
+	// nothing rather than committing a partially-run decision.
+	if ownershipLost.Load() {
+		return nil
+	}
+	// A RECORDED DECISION MUST REACH ITS TRANSACTION, even though it surfaces as an error.
+	// Returning here on any non-nil error discarded a legitimate synthesis block: a
+	// failed delegation under a vote/quorum rule blocks the parent task, blockTask
+	// captured that transition and its event, and this branch then threw both away - the
+	// task stayed awaiting_human, no block and no receipt landed, and recovery re-drove
+	// the round until it parked. sink.blocked is deliberately nil for such a block,
+	// because it is a decision the DAG recorded, not a refused allocation (#1673).
+	//
+	// So the early return is now for errors that produced NOTHING to commit. Anything
+	// captured proceeds to the fenced commit, and the verb's error is returned after it.
+	var blockedDecision BlockedError
+	if verbErr != nil && sink.blocked == nil && !errors.As(verbErr, &blockedDecision) {
+		// A GENUINE FAILURE - a crash, a transient store error - commits NOTHING. That
+		// all-or-nothing property is the point of the fenced transaction, and an earlier
+		// version of this guard committed captured writes on any error, which let an
+		// injected crash land a job.
 		return verbErr
 	}
 	if sink.preEffectWorktree != "" || sink.preEffectBranch != "" {
@@ -762,12 +828,21 @@ func (e Engine) applyResolutionEffectsFenced(ctx context.Context, parentJob db.J
 			return err
 		}
 		if !recorded {
-			// OWNERSHIP LOST while the external work ran. The resources exist and this
-			// pass can no longer claim them, so it hands them back rather than
-			// committing effects it no longer owns: the new owner re-derives the same
-			// idempotent worktree key, and the branch lock is released here because its
-			// owner token belongs to this pass.
-			e.releaseUnownedPreEffects(ctx, sink)
+			// OWNERSHIP LOST while the external work ran: apply nothing.
+			//
+			// AND RELEASE NOTHING. An earlier version handed the branch lock back here,
+			// which was WORSE THAN LEAKING IT: the shared-checkout lock is owned by
+			// request.Agent (engine_delegation.go), an identity that is STABLE ACROSS
+			// PASSES rather than unique to the lease holder. So a replacement pass
+			// acquires the same repo/branch/agent lock legitimately, and a stale pass
+			// releasing "its" lock by that tuple deletes the lock the new pass believes
+			// it holds - turning a bounded leak into a silent mutual-exclusion failure.
+			//
+			// Nothing is stranded by declining: the same-agent identity means the next
+			// pass's AcquireLock succeeds, and the worktree key is idempotent so it is
+			// re-used rather than duplicated. Handback would only be safe with a
+			// pass-specific lock identity, which is a change to the lock's own contract
+			// and not this PR's scope (#1673).
 			return nil
 		}
 	}
@@ -812,22 +887,10 @@ func (e Engine) applyResolutionEffectsFenced(ctx context.Context, parentJob db.J
 	if sink.blocked != nil {
 		return *sink.blocked
 	}
-	return nil
-}
-
-// releaseUnownedPreEffects hands back resources a pass created and then lost the
-// right to use. It is best-effort by design: the worktree key is idempotent so the new
-// owner re-uses it, and the branch lock is the only resource whose retention would
-// block another pass outright.
-func (e Engine) releaseUnownedPreEffects(ctx context.Context, sink *resolutionEffectSink) {
-	if strings.TrimSpace(sink.preEffectBranch) == "" {
-		return
-	}
-	_, _ = e.Store.ReleaseLock(ctx, db.BranchLock{
-		RepoFullName: sink.preEffectRepo,
-		Branch:       sink.preEffectBranch,
-		Owner:        sink.preEffectLockOwner,
-	})
+	// The verb's own error is returned only AFTER its captured writes committed. A
+	// legitimate block (a synthesis rule refusing the parent) arrives here: the block and
+	// its event are durable, and the caller still learns the DAG's decision.
+	return verbErr
 }
 
 // applyResolutionEffects runs the verb's irreversible half AFTER its resolution has
