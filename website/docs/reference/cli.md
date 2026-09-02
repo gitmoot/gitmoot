@@ -491,8 +491,8 @@ After `[daemon].idle_grace_ticks` all-304 polls (default `3`), a quiet repo move
 to 2x and then up to `[daemon].idle_max_multiplier` (default `4`; `1` disables
 decay). A miss, poll error, queued job, or in-flight job resets it immediately.
 Open-PR repos remain at base cadence because their per-PR comment reads are not
-conditional. Decay gates repository GitHub calls only; heartbeat, pipeline, and
-chat maintenance still wakes at the base interval.
+conditional. Decay gates repository GitHub calls only; heartbeat and pipeline
+maintenance still wakes at the base interval.
 
 `gitmoot dashboard` shows local state — daemon health, repos, agents and runtime
 sessions, jobs by state, worktrees, branch locks, and pending interactive
@@ -1675,9 +1675,8 @@ eligible. `pane_input_pending` matches the
 interval while the dialog remains pending. The pending signal takes precedence
 over the pane's last `idle` or `working` activity status.
 `reply`, `blocked`, `escalation`, and `fact` wakes use the durable wake outbox.
-`reply` matches workflow notes and `kind=chat` messages addressed to the same
-role as `--wake`; non-triggering chat back-links such as `job_result` are
-excluded. Reply rows commit atomically with their source note or chat message.
+`reply` matches workflow notes addressed to the same role as `--wake`. Reply
+rows commit atomically with their source note.
 Blocked and escalation rows are persisted synchronously by the event sink after
 the source transition; an insert failure is logged but cannot roll back the
 emitting job. The daemon coalesces a rolling five-second window per event kind
@@ -2024,6 +2023,7 @@ gitmoot job gates clear <job-id> --need "<text>"|--all             # satisfy gat
 gitmoot job cancel <job-id>                                        # one queued|running|blocked job
 gitmoot job cancel --state blocked [--older-than 7d] [--repo owner/repo] [--agent name] [--yes]
 gitmoot job kill <root-job-id>
+gitmoot job answer <job-id> "<question-id>: answer text" [--json]  # resume a job paused at awaiting_human
 gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 ```
@@ -2641,8 +2641,8 @@ hash participates only in dedup, never in the key, so an edited note re-sweeps
 onto the same key and updates its confirmed fact in place instead of spawning a
 hash-suffixed sibling.
 By default observations stay pending. If `[memory].ingest_auto_confirm = true`,
-`memory ingest`, `memory ingest sweep`, and `chat remember` immediately confirm
-the staged observation into the authoring agent's private pool only. They never
+`memory ingest` and `memory ingest sweep` immediately confirm the staged
+observation into the authoring agent's private pool only. They never
 auto-confirm into shared; shared stays explicit through `confirm --to-shared` or
 `promote --to-shared`. Auto-confirmed key-matched updates are
 **supersede-preserving**: the prior edition is archived as a `superseded_by` row
@@ -2985,65 +2985,6 @@ change once. It exits `0` for succeeded, `1` for failed/blocked/cancelled, and `
 with `still running` when the timeout expires. `--json` emits the final
 `pipeline show --json` summary without transition lines.
 
-## Native Chat (agent threads)
-
-`gitmoot chat` (#534, V1 local-only) is a durable, repo-aware **conversation
-ledger** where registered agents and the human talk in threads, `@`-tag each
-other, and (explicitly) promote a message into a real job. It lives in local
-SQLite — **zero network, zero entmoot dependency**. The core rule: **a message is
-a row (free); a job is compute (explicit)**. A plain `chat send` never starts
-work — only `chat task` (promotion) and `chat answer` (ask-gate resume) touch the
-dispatch path.
-
-```sh
-gitmoot chat create <name> --repo owner/repo [--topic "title"] [--json]
-gitmoot chat list [--repo owner/repo] [--all] [--json]      # open threads; --all includes archived
-gitmoot chat show <thread> [--repo owner/repo] [--limit N] [--json]
-gitmoot chat send <thread> "message" [--as agent] [--repo owner/repo] [--ref kind:value ...] [--json]
-gitmoot chat remember <thread> <message-seq> [--repo owner/repo] [--tier repo|general] [--agent NAME] [--json]
-gitmoot chat inbox <agent> [--unread] [--json]
-gitmoot chat task <thread> "@agent message" [--action ask|review|implement] [--repo owner/repo] [--json]
-gitmoot chat answer <thread> "<question-id>: answer text" [--repo owner/repo] [--json]
-gitmoot chat close|reopen <thread> [--repo owner/repo] [--json]
-gitmoot chat rename <thread> "new name" [--repo owner/repo] [--json]
-```
-
-- **`create`** — `<name>` is slugified to a topic-path-safe handle (`[a-z0-9-]`,
-  no `+`/`#`/`/`; unique per repo). `--repo` is required; `--topic` sets the human
-  display title. The slug is the stable handle — a later `rename` changes only the
-  title.
-- **`send`** — appends a `chat` message. `@agent` mentions land in a **registered**
-  agent's unread **inbox**; an unknown mention is recorded for audit with a stderr
-  warning and **never fails the send**. `--as <agent>` authors as a registered
-  agent (default: the human); `--ref kind:value` attaches structured refs.
-- **`remember`**: captures exactly one existing message by sequence as a memory
-  observation with deterministic provenance `chat:<thread-id>#<seq>`. It stores
-  the message body verbatim, applies the memory PreFilter, and dedups by content
-  hash in the target scope/repo. It does not scan for natural-language prefixes
-  or bulk-mine a thread. `--agent` defaults to `lead`; if
-  `[memory].ingest_auto_confirm = true`, the observation is confirmed into that
-  agent's private pool only.
-- **`inbox`** — an agent's mentions, newest first; `--unread` restricts to unread.
-- **`task`** — the one promotion verb. The body must name **exactly one**
-  registered `@agent`; it records a `promotion_request` message, then dispatches a
-  background job through the **same** validate → repo-scope → capability →
-  autonomy-policy gate the daemon uses (`--action` defaults to `ask`). The message
-  is back-linked (`promoted_job_id`), and the terminal result is appended into the
-  thread as a **`job_result`** message (non-promotable, `reply_to` the promotion).
-  An identical `(thread, body)` promotion within 60 s is refused (anti-ping-pong).
-- **`answer`** — the local answer channel for the **ask-gate** (#445). When a job
-  pauses at `awaiting_human`, the engine auto-links a `job-<hash>` thread and posts
-  the questions as a **`system`** message with a `{kind:job}` ref; `chat answer`
-  routes the answer onto the existing resume path and enqueues the coordinator
-  continuation that carries it.
-- **`close`/`reopen`** — archive (audit-preserving) / restore a thread.
-
-**Message kinds** are a fixed vocabulary: `chat`, `promotion_request`,
-`job_result` (never promotable), and `system`. Every row carries an `origin`
-stamped with a generated stable per-DB `home_id` (never the literal `self`) and a
-versioned canonical envelope — schema discipline that keeps a future cross-machine
-bridge additive without changing any V1 behavior. See
-[Chat](../workflows/chat-workflow.md) for the full workflow.
 ## Routing Telemetry (Advisory)
 
 Gitmoot records lightweight **execution-grounded routing telemetry**: one additive
@@ -3080,59 +3021,3 @@ context_enabled = true   # inject the advisory table into top-level coordinator 
 
 The injected block carries the same "not a benchmark" disclaimer, is added only to
 top-level (coordinator) jobs, and never forces a route — routing stays advisory.
-
-### V1.5 — auto-respond, `chat wait`, and `moot`
-
-V1.5 (#534) adds the **agent-to-agent** layer. Both additions are **off by
-default** and keep anti-ping-pong **structural**: only a `kind=chat` message with a
-resolved mention triggers work, and every back-linked reply is a non-triggering
-`kind=job_result`.
-
-**Auto-respond sweep** — an opt-in daemon-tick sweep that lets an enrolled agent
-answer an `@mention` without a human running `chat task`, enqueueing **one** bounded
-read-only `ask` per unread mention through the same dispatch gate as `chat task`. It
-is a no-op (zero chat-table queries per tick) unless **both** the global switch and a
-per-agent opt-in are set: `[chat] auto_respond = true` and
-`[agents.<name>] chat_autorespond = true`.
-
-| `[chat]` knob | Default | Meaning |
-|---|---|---|
-| `auto_respond` | `false` | Global kill switch; `false` overrides every per-agent opt-in. |
-| `auto_respond_cap` | `4` | HARD cap on auto-responses per (thread, agent). At the cap the sweep **hard-stops** (no auto-extension), parks the trigger, and posts **one** visible `needs a human` system message. |
-| `auto_respond_cooldown` | `2m` | Minimum spacing per (thread, agent); a trigger inside the window is deferred (left unread to re-fire), never dropped. |
-
-**`chat wait`** — a blocking read verb for moot turn-taking: it polls until the
-thread has a message with `seq > --since-seq`, then prints the new messages plus a
-`last-seq: N` line (feed `N` back as the next `--since-seq`). On a capped moot thread
-it returns immediately with the wrap-up line instead of spinning to the timeout.
-
-```sh
-gitmoot chat wait <thread> [--since-seq N] [--timeout 90s] [--repo owner/repo] [--json]
-```
-
-**`gitmoot moot`** — convene N registered agents as **seats** in one bounded
-brainstorm. Each seat is **one** background read-only `ask` job through the same
-validate → repo-scope → capability → policy gate as `chat task`; seats converse via
-`chat send` / `chat wait`, so the cost is exactly one job per seat regardless of
-message count. Messages are rows (free).
-
-```sh
-gitmoot moot <name> "topic" --agents a,b,c --repo owner/repo [--max-messages N] [--home ...] [--json]
-```
-
-Every seat must be **registered**, **repo-scoped**, and carry the **`ask`**
-capability, or the moot is rejected before any thread or seat is created. The moot
-**HARD-STOPS** at its agent-message cap (no auto-extension): at the cap
-`chat send --as` is refused, **one** visible `MOOT CAP REACHED` overrun system
-message is posted, and each seat wraps up by returning its **partial conclusions**
-(what it knows / is unsure of / would ask next) as its `gitmoot_result`, which arrive
-via the `job_result` back-link path (the cap never blocks those). Human sends and
-seat conclusions are never gated by the cap.
-
-| `[chat]` knob | Default | Meaning |
-|---|---|---|
-| `moot_max_seats` | `6` | Max agents one moot may convene; a larger roster is rejected. |
-| `moot_message_cap` | `30` | Default HARD cap on agent-authored turns (overridable per-moot with `--max-messages`). |
-
-`[chat]` is optional: with no `[chat]` section every knob resolves to its default,
-`auto_respond` stays off, and the daemon tick is byte-identical.

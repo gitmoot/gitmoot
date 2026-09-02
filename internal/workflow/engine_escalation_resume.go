@@ -209,12 +209,6 @@ func (e Engine) pauseAwaitingHuman(ctx context.Context, parentJob db.Job, parent
 	)
 	ev.Cause = "escalation"
 	events.EmitEvent(ctx, e.EventSink, ev)
-
-	// Auto-link a local chat thread as the answer channel (#534): best-effort and
-	// swallow-all, so a chat failure never affects the pause. Participant is the
-	// coordinator agent (whose resume the human drives).
-	e.linkAskGateChatThread(ctx, parentJob.ID, firstNonEmptyString(ref.Repo, parentPayload.Repo), parentJob.Agent, awaitErr.Reason)
-
 	return awaitErr
 }
 
@@ -355,12 +349,6 @@ func (e Engine) pauseAwaitingHumanAnswer(ctx context.Context, job db.Job, payloa
 	)
 	ev.Cause = "ask_gate"
 	events.EmitEvent(ctx, e.EventSink, ev)
-
-	// Auto-link a local chat thread carrying the questions as the answer channel
-	// (#534 keystone): best-effort and swallow-all. Keyed on the resume target
-	// (coordinator for a child ask); participant is the asking job's agent.
-	e.linkAskGateChatThread(ctx, targetID, firstNonEmptyString(targetRef.Repo, payload.Repo), job.Agent, renderHumanQuestions(questions))
-
 	return true, nil
 }
 
@@ -472,9 +460,9 @@ func (e Engine) escalationResolved(ctx context.Context, coordinatorJobID string)
 // escalation round right now: a round was requested and not yet
 // answered/aborted/TTL-finalized. It is the read-side companion to
 // ResolveEscalation, whose already-resolved branch is a silent idempotent no-op.
-// A caller like `chat answer` checks this first so it does not report a false
-// success (and record a duplicate answer message) when the round was already
-// resolved. Returns false when the job never had an escalation at all.
+// A caller like `job answer` checks this first so it does not report a false
+// success when the round was already resolved. Returns false when the job never
+// had an escalation at all.
 func (e Engine) EscalationPending(ctx context.Context, coordinatorJobID string) (bool, error) {
 	if err := e.validate(); err != nil {
 		return false, err

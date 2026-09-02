@@ -56,6 +56,8 @@ func runJob(args []string, stdout, stderr io.Writer) int {
 		return runJobClose(args[1:], stdout, stderr)
 	case "record":
 		return runJobRecord(args[1:], stdout, stderr)
+	case "answer":
+		return runJobAnswer(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown job command %q\n\n", args[0])
 		printJobUsage(stderr)
@@ -83,6 +85,106 @@ func printJobUsage(w io.Writer) {
 	fmt.Fprintf(w, "  gitmoot job open --agent name --repo owner/repo --type %s [--title ...] [--task id] [--parent-job-id id] [--pr n] [--head-sha sha] [--workflow label] [--json]\n", strings.Join(workflow.DelegationActions, "|"))
 	fmt.Fprintf(w, "  gitmoot job close <id> --decision %s [--summary ...] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]\n", strings.Join(workflow.ResultDecisions, "|"))
 	fmt.Fprintf(w, "  gitmoot job record --agent name --repo owner/repo --type %s --decision ... [--title ...] [--summary ...] [--task id] [--parent-job-id id] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]\n", strings.Join(workflow.DelegationActions, "|"))
+	fmt.Fprintln(w, "  gitmoot job answer <id> \"<question-id>: answer text\" [--json]")
+}
+
+// runJobAnswer is the local (non-PR) way to answer a job paused at
+// awaiting_human. It resumes through the SAME workflow.Engine.ResolveEscalation
+// (ResumeAnswer) the daemon's PR-comment `answer` verb uses, so the answer text
+// is parsed and the coordinator continuation enqueued by one shared path.
+func runJobAnswer(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("job answer", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	jsonOut := fs.Bool("json", false, "print the answered job as JSON")
+	if len(args) >= 1 && (args[0] == "-h" || args[0] == "--help") {
+		printJobUsage(stdout)
+		return 0
+	}
+	// The two positionals are read BEFORE flag parsing (flag stops at the first
+	// non-flag), so a DEFINED FLAG sitting in the answer slot must be rejected
+	// rather than stored as the human's answer: `job answer <id> --json` recorded
+	// the literal "--json" and resolved the escalation, after which the real answer
+	// could no longer be submitted.
+	//
+	// The check names the command's own flags instead of refusing every leading
+	// dash, because parseHumanAnswers accepts a prefix-less free-form body for a
+	// single-question round — so "-1" is a legitimate answer and must reach it.
+	if len(args) < 2 {
+		fmt.Fprintln(stderr, "job answer requires a <job-id> and a \"<question-id>: answer text\"")
+		return 2
+	}
+	if _, isFlag := definedFlagName(fs, args[1]); isFlag {
+		fmt.Fprintf(stderr, "job answer is missing its answer: %s is a flag, so pass the answer first (job answer <job-id> \"<question-id>: answer text\" %s ...)\n", args[1], args[1])
+		return 2
+	}
+	jobID := strings.TrimSpace(args[0])
+	body := args[1]
+	if jobID == "" || strings.HasPrefix(jobID, "-") {
+		fmt.Fprintln(stderr, "job answer requires a <job-id> as the first argument")
+		return 2
+	}
+	if err := fs.Parse(args[2:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "job answer accepts exactly one <job-id> and one \"<id>: answer\"")
+		return 2
+	}
+	if strings.TrimSpace(body) == "" {
+		fmt.Fprintln(stderr, "job answer requires a non-empty answer")
+		return 2
+	}
+	if err := withStore(*home, func(store *db.Store) error {
+		ctx := context.Background()
+		engine := workflow.Engine{Store: store}
+		pending, err := engine.EscalationPending(ctx, jobID)
+		if err != nil {
+			return err
+		}
+		if !pending {
+			// No OPEN round: ResolveEscalation would be a silent idempotent no-op, so
+			// report it did not route rather than claim success.
+			return fmt.Errorf("job %s has no pending question to answer (it was already answered or finalized)", jobID)
+		}
+		return engine.ResolveEscalation(ctx, jobID, workflow.ResumeAnswer, body)
+	}); err != nil {
+		fmt.Fprintf(stderr, "job answer: %v\n", err)
+		return 1
+	}
+	if *jsonOut {
+		_ = writeJSON(stdout, struct {
+			JobID string `json:"job_id"`
+		}{JobID: jobID})
+		return 0
+	}
+	writeLine(stdout, "answered job: %s", jobID)
+	return 0
+}
+
+// definedFlagName reports whether token names a flag THIS command defines. It is
+// deliberately narrow: an unknown leading-dash token is ordinary positional text
+// (a free-form answer may legitimately start with "-"), while a defined flag in a
+// positional slot means the operator omitted that positional.
+//
+// A token containing whitespace is prose, never a flag. Without that guard the
+// "="-split below reduced "-home=us-east is the region" to the defined flag name
+// "home" and refused a legitimate answer.
+func definedFlagName(fs *flag.FlagSet, token string) (string, bool) {
+	if !strings.HasPrefix(token, "-") || strings.ContainsAny(token, " \t\r\n") {
+		return "", false
+	}
+	name := strings.TrimLeft(token, "-")
+	if head, _, found := strings.Cut(name, "="); found {
+		name = head
+	}
+	if name == "h" || name == "help" {
+		return name, true
+	}
+	return name, fs.Lookup(name) != nil
 }
 
 func runJobList(args []string, stdout, stderr io.Writer) int {

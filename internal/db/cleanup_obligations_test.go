@@ -135,12 +135,13 @@ func TestCleanupObligationsRebuildPreservesLegacyRows(t *testing.T) {
 // test would pass on precisely the mutant it exists to kill.
 func TestMigrationsUpgradeFromPreviousReleasedVersion(t *testing.T) {
 	ctx := context.Background()
-	// The marker names THIS BRANCH's migration, and it has moved three times as main
-	// advanced: the cleanup_obligations rebuild, #1766's SkillOpt/evals teardown, and
-	// #1770's Activepieces trigger removal each joined the released prefix, leaving
-	// escalation_rounds appended last. Two branches cannot both be "last", and the
-	// ordering that matters is the one a deployed database sees.
-	const branchMigrationMarker = "CREATE UNIQUE INDEX escalation_rounds_one_unsettled"
+	// The marker names THIS BRANCH's migration, and it has moved four times as main
+	// advanced: the cleanup_obligations rebuild, #1766's SkillOpt/evals teardown,
+	// #1770's Activepieces trigger removal, and #1731's escalation_rounds table each
+	// joined the released prefix, leaving #1754's chat/moot teardown appended last.
+	// Two branches cannot both be "last", and the ordering that matters is the one a
+	// deployed database sees.
+	const branchMigrationMarker = "DROP TABLE IF EXISTS chat_threads"
 	branchIndex := -1
 	for index, migration := range migrations {
 		if strings.Contains(migration, branchMigrationMarker) {
@@ -196,12 +197,14 @@ func TestMigrationsUpgradeFromPreviousReleasedVersion(t *testing.T) {
 	if final != len(migrations) {
 		t.Fatalf("upgraded version = %d, want %d", final, len(migrations))
 	}
-	var retiredColumnCount int
-	if err := upgraded.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('pipelines') WHERE name = 'trigger_binding'`).Scan(&retiredColumnCount); err != nil {
-		t.Fatalf("inspect upgraded pipelines columns: %v", err)
+	var retiredTableCount int
+	if err := upgraded.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('chat_meta','chat_threads','chat_messages','chat_mentions','chat_thread_meta')`,
+	).Scan(&retiredTableCount); err != nil {
+		t.Fatalf("inspect upgraded chat tables: %v", err)
 	}
-	if retiredColumnCount != 0 {
-		t.Fatalf("trigger_binding column count = %d, want 0", retiredColumnCount)
+	if retiredTableCount != 0 {
+		t.Fatalf("retired chat table count = %d, want 0", retiredTableCount)
 	}
 	now := time.Now().UTC()
 	if _, err := upgraded.DeferCleanupObligation(ctx, "job-upgraded", "/tmp/managed/upgraded", CleanupReasonUnpublishedCommits, now, now.Add(time.Minute)); err != nil {

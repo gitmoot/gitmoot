@@ -18,7 +18,6 @@ import (
 
 type dashboardConfigSettings struct {
 	memory         config.MemorySettings
-	chat           config.ChatSettings
 	orchestrate    config.OrchestratePolicy
 	github         config.GitHubLimiterPolicy
 	memoryPipeline config.MemoryPipelineSettings
@@ -38,7 +37,6 @@ type dashboardConfigProjectionRow struct {
 // Keep it in section/key order: the dashboard polls this payload and expects a
 // byte-stable projection when neither the config nor the agents have changed.
 var dashboardConfigProjection = []dashboardConfigProjectionRow{
-	{section: "chat", key: "auto_respond", kind: "flag", doc: "Enable automatic replies for enrolled chat agents.", value: func(s dashboardConfigSettings) any { return s.chat.AutoRespond }, defaultValue: func(s dashboardConfigSettings) any { return s.chat.AutoRespond }},
 	{section: "github", key: "max_concurrent", kind: "int", doc: "Maximum number of concurrent GitHub calls; zero is unlimited.", value: func(s dashboardConfigSettings) any { return s.github.MaxConcurrent }, defaultValue: func(s dashboardConfigSettings) any { return s.github.MaxConcurrent }},
 	{section: "github", key: "min_interval", kind: "duration", doc: "Minimum spacing between GitHub call starts.", value: func(s dashboardConfigSettings) any { return s.github.MinInterval.String() }, defaultValue: func(s dashboardConfigSettings) any { return s.github.MinInterval.String() }},
 	{section: "memory", key: "cluster_depth_cap", kind: "int", doc: "Maximum recursive memory-cluster depth.", value: func(s dashboardConfigSettings) any { return s.memory.ClusterDepthCap }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.ClusterDepthCap }},
@@ -66,7 +64,7 @@ var dashboardConfigProjection = []dashboardConfigProjectionRow{
 	{section: "memory", key: "harvest_max_per_job", kind: "int", doc: "Maximum pending observations staged from one job result.", value: func(s dashboardConfigSettings) any { return s.memory.HarvestMaxPerJob }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.HarvestMaxPerJob }},
 	{section: "memory", key: "harvest_model", kind: "string", doc: "Optional model override for the insight-harvest classifier.", value: func(s dashboardConfigSettings) any { return s.memory.HarvestModel }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.HarvestModel }},
 	{section: "memory", key: "harvest_runtime", kind: "string", doc: "Runtime used for the isolated insight-harvest classifier.", value: func(s dashboardConfigSettings) any { return s.memory.HarvestRuntime }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.HarvestRuntime }},
-	{section: "memory", key: "ingest_auto_confirm", kind: "flag", doc: "Confirm allowlisted ingest, chat, and workflow observations into the private author pool.", value: func(s dashboardConfigSettings) any { return s.memory.IngestAutoConfirm }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.IngestAutoConfirm }},
+	{section: "memory", key: "ingest_auto_confirm", kind: "flag", doc: "Confirm allowlisted ingest and workflow observations into the private author pool.", value: func(s dashboardConfigSettings) any { return s.memory.IngestAutoConfirm }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.IngestAutoConfirm }},
 	{section: "memory", key: "max_entries", kind: "int", doc: "Maximum confirmed memories considered for context injection.", value: func(s dashboardConfigSettings) any { return s.memory.MaxEntries }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.MaxEntries }},
 	{section: "memory", key: "token_budget", kind: "int", doc: "Token budget for injected memory context.", value: func(s dashboardConfigSettings) any { return s.memory.TokenBudget }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.TokenBudget }},
 	{section: "memory.pipelines", key: "groom_propose", kind: "duration", doc: "Schedule for automatic memory groom proposal runs.", value: func(s dashboardConfigSettings) any { return s.memoryPipeline.GroomProposeInterval }, defaultValue: func(s dashboardConfigSettings) any { return s.memoryPipeline.GroomProposeInterval }},
@@ -184,16 +182,12 @@ func loadDashboardConfigSettings(paths config.Paths) (dashboardConfigSettings, d
 	values := dashboardConfigSettings{}
 	defaults := dashboardConfigSettings{
 		memory:      config.DefaultMemorySettings(),
-		chat:        config.DefaultChatSettings(),
 		orchestrate: config.DefaultOrchestratePolicy(),
 		github:      config.DefaultGitHubLimiterPolicy(),
 	}
 	var err error
 	if values.memory, err = config.LoadMemorySettings(paths); err != nil {
 		return values, defaults, fmt.Errorf("load memory config: %w", err)
-	}
-	if values.chat, err = config.LoadChatSettings(paths); err != nil {
-		return values, defaults, fmt.Errorf("load chat config: %w", err)
 	}
 	if values.orchestrate, err = config.LoadOrchestratePolicy(paths); err != nil {
 		return values, defaults, fmt.Errorf("load orchestrate config: %w", err)
@@ -242,7 +236,6 @@ func projectDashboardConfigAgents(registered []db.Agent, configured map[string]c
 			row.Model = model
 		}
 		row.Memory = agentType.Memory
-		row.ChatAutorespond = agentType.ChatAutoRespond
 		row.Capabilities = append([]string(nil), agentType.Capabilities...)
 		row.AutonomyPolicy = strings.TrimSpace(agentType.AutonomyPolicy)
 		row.MaxBackground = agentType.MaxBackground
@@ -283,7 +276,7 @@ func dashboardUnknownConfigKeys(path string) ([]string, error) {
 		known[row.section+"."+row.key] = struct{}{}
 	}
 	agentKeys := map[string]struct{}{
-		"runtime": {}, "model": {}, "memory": {}, "chat_autorespond": {}, "capabilities": {}, "autonomy_policy": {}, "max_background": {},
+		"runtime": {}, "model": {}, "memory": {}, "capabilities": {}, "autonomy_policy": {}, "max_background": {},
 	}
 	unknown := map[string]struct{}{}
 	doc.Scan(func(key parser.Key, entry *tomledit.Entry) bool {

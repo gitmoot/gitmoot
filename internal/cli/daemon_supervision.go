@@ -134,7 +134,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 				return err
 			}
 			// Per-repo idle decay gates GitHub calls only. Heartbeats, pipelines,
-			// chat scans, and other supervisor maintenance still wake at base cadence.
+			// and other supervisor maintenance still wake at base cadence.
 			if wait > baseInterval {
 				wait = baseInterval
 			}
@@ -153,12 +153,6 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 				}
 				if err := pipeline.RunPipelineScanOnce(ctx, store, pipelineEnqueue, time.Now().UTC()); err != nil {
 					writeLine(stdout, "pipeline scan error: %s", err)
-				}
-				// Chat auto-respond sweep (#534 V1.5). Off-by-default: with
-				// [chat].auto_respond unset (or no agent enrolled) it returns before any
-				// chat-table query, so the tick hot path is byte-identical.
-				if err := runChatAutoRespondScanOnce(ctx, paths, home, store, dispatchLocalAgentJob, time.Now().UTC()); err != nil {
-					writeLine(stdout, "chat auto-respond scan error: %s", err)
 				}
 				// Decouple the pipeline-advance cadence from the repo-poll backoff
 				// (#697): `wait` is the poller's cadence, which grows to minutes when
@@ -309,12 +303,6 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 			}
 			if err := runHeartbeatScanOnce(ctx, heartbeatPaths, store, heartbeatEnqueue, time.Now().UTC()); err != nil {
 				writeLine(stdout, "heartbeat scan error: %s", err)
-			}
-			// Chat auto-respond sweep (#534 V1.5) needs the same resolved config paths
-			// as the heartbeat scan, so gate it on the same paths resolution.
-			// Off-by-default: returns before any chat-table query unless enabled.
-			if err := runChatAutoRespondScanOnce(ctx, heartbeatPaths, home, store, dispatchLocalAgentJob, time.Now().UTC()); err != nil {
-				writeLine(stdout, "chat auto-respond scan error: %s", err)
 			}
 		}
 		if err := runSQLiteIncrementalVacuumOnce(ctx, store, time.Now().UTC(), sqliteMaintenance); err != nil {

@@ -1,6 +1,6 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, daemon jobs, stuck jobs, branch locks, agent templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, pipelines, native chat and moots, memory curation, routing telemetry, event webhooks, the web dashboard, runtime metadata, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, daemon jobs, stuck jobs, branch locks, agent templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, pipelines, memory curation, routing telemetry, event webhooks, the web dashboard, runtime metadata, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
 version: 0.1.0
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, Kimi Code, or omp.
@@ -31,7 +31,7 @@ user wants PR-comment agent workflows, repo-scoped agent subscriptions,
 background daemon checks, Codex, Claude Code, Kimi Code, or omp agent startup,
 structured implementation plans, standard goal files, agent template workflows,
 template capture, custom prompt agents, job status, branch lock inspection,
-declarative pipelines, native agent chat threads, bounded moots, agent memory,
+declarative pipelines, agent memory,
 routing telemetry, or runtime metadata.
 
 Gitmoot's CLI evolves quickly. If the user names a Gitmoot feature or command
@@ -101,7 +101,7 @@ asks for that action.
 5. Prefer read-only status commands and answer directly before mutating Gitmoot
    state or pointing the user to live monitoring.
 6. Use `gitmoot --help` and subcommand help for version-sensitive features such
-   as `pipeline`, `chat`, `moot`, `memory`, `router`, `runtime`, dashboard web,
+   as `pipeline`, `memory`, `router`, `runtime`, dashboard web,
    session jobs, and heartbeats.
 
 ## Install And Update
@@ -177,11 +177,7 @@ gitmoot pipeline resume <run-id> [--from <stage>]
 gitmoot pipeline cancel <run-id>
 gitmoot pipeline enable|disable <name>
 gitmoot pipeline remove <name>
-gitmoot chat create <name> --repo owner/repo [--topic "title"] [--json]
-gitmoot chat send <thread> "message" [--as agent] [--repo owner/repo] [--json]
-gitmoot chat task <thread> "@agent message" [--action ask|review|implement] [--repo owner/repo] [--json]
-gitmoot chat wait <thread> [--since-seq N] [--timeout 90s] [--repo owner/repo] [--json]
-gitmoot moot <name> "topic" --agents a,b,c --repo owner/repo [--max-messages N] [--json]
+gitmoot job answer <job-id> "<question-id>: answer text" [--json]
 gitmoot router summary [--repo owner/repo] [--action ask|review|implement] [--since 30d] [--json]
 ```
 
@@ -213,10 +209,9 @@ YAML rather than a model-driven decomposition. `pipeline add` validates and
 stores the spec, stage commands must emit `gitmoot_result`, `blocked` parks the
 run, and `pipeline resume` reruns the halted stage plus dependents.
 
-Use `gitmoot chat` for durable local repo-aware threads. A plain `chat send`
-records a message and never starts work; only `chat task` promotes a message
-into a real job. Use `gitmoot chat wait` and `gitmoot moot` for bounded
-agent-to-agent brainstorms.
+Use `gitmoot job answer <job-id> "<question-id>: text"` to resume a job paused at
+`awaiting_human`; it routes through the same escalation-resume path the daemon's
+PR-comment `answer` verb uses.
 
 Use `gitmoot memory` to inspect or curate persistent agent memory. `memory
 ingest` stages Markdown as pending observations, `memory confirm` is the human

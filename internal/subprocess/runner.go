@@ -193,11 +193,9 @@ func (t TeeRunner) LookPath(file string) (string, error) {
 }
 
 // EnvInjectingRunner wraps a runner to always append Env (KEY=VALUE entries)
-// to the runtime subprocess environment while preserving process-group kill. The
-// #732 daemon dispatches a moot seat's runtime adapter with one of these so the
-// seat's GITMOOT_CHAT_RELAY[_AUTH] reaches its `gitmoot chat send/wait` subprocess
-// - ONLY for moot seats. Inner defaults to GroupRunner, preserving the historical
-// behavior when credential curation is off. Env is applied on every Run/RunEnv call.
+// to the runtime subprocess environment while preserving process-group kill.
+// Inner defaults to GroupRunner, preserving the historical behavior when
+// credential curation is off. Env is applied on every Run/RunEnv call.
 type EnvInjectingRunner struct {
 	Inner Runner
 	Env   []string

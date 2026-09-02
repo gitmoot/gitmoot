@@ -156,8 +156,8 @@ Runtime-specific additions are:
   isolating process environment, so a passed-through key is visible to every omp
   profile this daemon runs.
 - Kimi Code, legacy `kimi-cli`, and shell: no additions. Shell stage variables,
-  chat-relay variables, pipeline metadata, and the upstream-context file variable
-  are job-owned injections and are appended after the curated base.
+  pipeline metadata, and the upstream-context file variable are job-owned
+  injections and are appended after the curated base.
 
 `SSH_AUTH_SOCK`, `GH_*`, `GITHUB_*`, proxy variables, and toolchain cache
 variables such as `GOCACHE` are not in the base list. Add non-secret operational

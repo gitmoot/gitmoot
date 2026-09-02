@@ -190,6 +190,19 @@ func withDashboardCommsNav(next http.Handler) http.Handler {
 	})
 }
 
+// ChatThreads and ChatThread satisfy dashboard.DataSource, whose interface lives
+// in the external dashboard module. Native chat was removed from Gitmoot
+// (#1754), so there is no thread store left to read: the list is empty and every
+// id is unknown. These are the truthful answers, not placeholders — the module's
+// Chat view renders as empty rather than reporting a server error.
+func (d *webDataSource) ChatThreads(context.Context) ([]dashboard.ChatThreadSummary, error) {
+	return []dashboard.ChatThreadSummary{}, nil
+}
+
+func (d *webDataSource) ChatThread(context.Context, string) (*dashboard.ChatThreadDetail, error) {
+	return nil, dashboard.ErrChatThreadNotFound
+}
+
 type dashboardWorkflowAPIView struct {
 	dashboard.WorkflowView
 	Description string `json:"description"`

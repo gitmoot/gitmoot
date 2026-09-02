@@ -92,13 +92,6 @@ type jobWorker struct {
 	// a config file / webhook. When nil (production), eventSink() resolves the
 	// shared process-global webhook sink from [events] config instead.
 	EventSinkOverride events.Sink
-	// RelayServer is the daemon's #732 chat relay. When non-nil AND a job payload is
-	// a `gitmoot moot` seat (payload.MootSeat), run() mints a per-seat token on it and
-	// injects GITMOOT_CHAT_RELAY[_AUTH] into the seat's runtime subprocess so the
-	// sandboxed seat's `gitmoot chat send/wait` routes through the (unsandboxed)
-	// daemon. nil (foreground CLI, and every non-daemon construction) means no relay
-	// injection — the job's adapter is byte-identical to pre-#732.
-	RelayServer *chatRelayServer
 	// AuthProbe is the injected doctor-style live credential probe (#532 slice B).
 	// It gates re-dispatch of a runtime_auth deferral: once the coarse hold elapses
 	// the scheduler only releases the job when the probe reports the credential is
@@ -180,7 +173,6 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 		configHomeExplicit = true
 	}
 	worker := jobWorker{Store: store, Stdout: stdout, ConfigHome: configHome, ConfigHomeExplicit: configHomeExplicit}
-	worker.RelayServer = activeChatRelayServer()
 	worker.AdapterFactory = worker.defaultAdapter
 	worker.OutputAdapterFactory = worker.outputAdapter
 	worker.StartAdapterFactory = worker.defaultStartAdapter
@@ -350,7 +342,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// Stamp the already-resolved decision on the in-memory job agent so every
 	// secondary adapter rebuild consumes the same backend selection.
 	agent.ExecBackend = string(execBackend)
-	readOnlySeat := payload.ReadOnlySeat && !payload.MootSeat
+	readOnlySeat := payload.ReadOnlySeat
 	runtimeConfigDir := strings.TrimSpace(payload.RuntimeConfigDir)
 	if readOnlySeat && runtimeConfigDir == "" {
 		runtimeConfigDir = selectedRuntimeConfigDir(agent.Runtime)
@@ -487,32 +479,15 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 	}
 	deliveryCheckout := checkout
-	// #732 moot-seat relay injection: a `gitmoot moot` SEAT (payload.MootSeat) must
-	// converse via `gitmoot chat send/wait` mid-run, but its runtime sandbox makes
-	// the home read-only. buildSeatAwareAdapter mints a per-seat token bound to
-	// (agent, thread), builds the adapter with an env-injecting runner so the seat's
-	// runtime subprocess inherits GITMOOT_CHAT_RELAY[_AUTH] and routes those writes
-	// to this daemon, AND — only when it actually injects that relay env — elevates
-	// the agent to ChatSeat (a codex seat then gets workspace-write+network to reach
-	// the socket; the home stays read-only, so the relay does the write). Coupling
-	// the elevation to real injection is deliberate: a seat is NEVER left with the
-	// extra codex privilege but no working relay (the pre-#732-review bug). Gating on
-	// MootSeat — not ThreadID — keeps chat-task promotions and ThreadID-carrying
-	// continuations/children byte-identical (unelevated, no relay env). The token is
-	// released on every exit path so it cannot be replayed after the seat ends.
 	var progressTracker *pipelineProgressLineTracker
 	if payload.Sender == workflow.PipelineJobSender {
 		progressTracker = &pipelineProgressLineTracker{}
 	}
 	var adapter workflow.DeliveryAdapter
-	var relayToken string
 	if progressTracker != nil {
-		adapter, relayToken, err = w.buildSeatAwareAdapterForBackend(execBackend, &agent, checkout, payload, progressTracker)
+		adapter, err = w.buildJobAdapterForBackend(execBackend, agent, checkout, progressTracker)
 	} else {
-		adapter, relayToken, err = w.buildSeatAwareAdapterForBackend(execBackend, &agent, checkout, payload)
-	}
-	if relayToken != "" {
-		defer w.RelayServer.ReleaseSeat(relayToken)
+		adapter, err = w.buildJobAdapterForBackend(execBackend, agent, checkout)
 	}
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
@@ -683,9 +658,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			w.executionRunner = subprocess.EnvInjectingRunner{Inner: w.executionRunner, Env: credentialEnv}
 		}
 		if progressTracker != nil {
-			adapter, err = w.executionDeliveryAdapter(agent, deliveryCheckout, relayToken, progressTracker)
+			adapter, err = w.executionDeliveryAdapter(agent, deliveryCheckout, progressTracker)
 		} else {
-			adapter, err = w.executionDeliveryAdapter(agent, deliveryCheckout, relayToken)
+			adapter, err = w.executionDeliveryAdapter(agent, deliveryCheckout)
 		}
 		if err != nil {
 			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
@@ -3609,56 +3584,33 @@ func (w jobWorker) outputAdapter(agent runtime.Agent, checkout string, out io.Wr
 	return buildRuntimeAdapter(w.ConfigHome, agent, checkout, subprocess.TeeRunner{Inner: subprocess.GroupRunner{}, Out: runtimeOutputWriter(out)})
 }
 
-// buildSeatAwareAdapter builds the job's runtime adapter, injecting the #732 chat
-// relay env for a `gitmoot moot` SEAT (payload.MootSeat) when a relay is running.
-// For a seat that gets a working relay it mints a per-seat token bound to (agent,
-// thread), returns an adapter whose runner appends GITMOOT_CHAT_RELAY[_AUTH] to the
-// runtime subprocess env, and — only then — sets agent.ChatSeat so a codex seat is
-// elevated to workspace-write+network to reach the socket. It takes *agent so this
-// elevation propagates to the agent that RunJob delivers. Elevation is coupled to
-// injection on PURPOSE: a seat is never granted the extra codex privilege without a
-// working relay to use it (a no-relay / mint-failure seat stays unelevated and
-// degrades to a job_result conclusion, exactly like a non-seat). For every non-seat
-// job (or when no relay is running) it returns the byte-identical AdapterFactory
-// adapter, no elevation, and an empty token.
-//
-// NOTE: moot seats are dispatched WITHOUT cockpit (runMoot sets no Cockpit flag),
-// so the cockpit adapter-rebuild path in run() — which would replace this adapter
-// and drop the env runner — never fires for a seat. If that ever changes, thread
-// the relay env into the cockpit rebuild too.
-func (w jobWorker) buildSeatAwareAdapter(agent *runtime.Agent, checkout string, payload workflow.JobPayload, output ...io.Writer) (workflow.DeliveryAdapter, string, error) {
+// buildJobAdapter builds the job's runtime adapter for the agent's configured
+// execution backend, teeing runtime output when the caller supplies a writer.
+func (w jobWorker) buildJobAdapter(agent runtime.Agent, checkout string, output ...io.Writer) (workflow.DeliveryAdapter, error) {
 	backend := execbackend.Local
 	if strings.TrimSpace(agent.ExecBackend) != "" {
 		resolved, err := execbackend.ParseImplemented(agent.ExecBackend)
 		if err != nil {
-			return nil, "", err
+			return nil, err
 		}
 		backend = resolved
 	}
-	return w.buildSeatAwareAdapterForBackend(backend, agent, checkout, payload, output...)
+	return w.buildJobAdapterForBackend(backend, agent, checkout, output...)
 }
 
-// buildSeatAwareAdapterForBackend consumes the already-resolved backend at the
+// buildJobAdapterForBackend consumes the already-resolved backend at the
 // daemon's adapter boundary. Adding a name to the selector's implemented set is
 // insufficient: a new backend must extend execbackend.Consume and supply its
 // builder at every compiler-identified call site before it can execute.
-func (w jobWorker) buildSeatAwareAdapterForBackend(backend execbackend.Backend, agent *runtime.Agent, checkout string, payload workflow.JobPayload, output ...io.Writer) (workflow.DeliveryAdapter, string, error) {
-	type result struct {
-		adapter workflow.DeliveryAdapter
-		token   string
-	}
-	consumed, err := execbackend.Consume(backend, func() (result, error) {
-		adapter, token, err := w.buildLocalSeatAwareAdapter(agent, checkout, payload, output...)
-		return result{adapter: adapter, token: token}, err
-	}, func() (result, error) {
-		if payload.MootSeat {
-			// The chat relay is a host Unix socket and cannot be injected into a
-			// provider-backed instance.
-			return result{}, errors.New("moot-seat relay is not supported on the remote execution backend")
+func (w jobWorker) buildJobAdapterForBackend(backend execbackend.Backend, agent runtime.Agent, checkout string, output ...io.Writer) (workflow.DeliveryAdapter, error) {
+	return execbackend.Consume(backend, func() (workflow.DeliveryAdapter, error) {
+		if len(output) > 0 && output[0] != nil && w.OutputAdapterFactory != nil {
+			return w.OutputAdapterFactory(agent, checkout, output[0])
 		}
-		return result{adapter: unprovisionedRemoteDeliveryAdapter{}}, nil
+		return w.AdapterFactory(agent, checkout)
+	}, func() (workflow.DeliveryAdapter, error) {
+		return unprovisionedRemoteDeliveryAdapter{}, nil
 	})
-	return consumed.adapter, consumed.token, err
 }
 
 // unprovisionedRemoteDeliveryAdapter prevents a configured remote job from
@@ -3676,42 +3628,6 @@ func (w jobWorker) deliveryAdapterForBackend(backend execbackend.Backend, agent 
 		// The temporary-worker loop never provisions an execution instance.
 		return nil, errors.New("temporary workers do not support the remote execution backend")
 	})
-}
-
-func (w jobWorker) buildLocalSeatAwareAdapter(agent *runtime.Agent, checkout string, payload workflow.JobPayload, output ...io.Writer) (workflow.DeliveryAdapter, string, error) {
-	if w.RelayServer == nil || !payload.MootSeat || strings.TrimSpace(payload.ThreadID) == "" {
-		if len(output) > 0 && output[0] != nil && w.OutputAdapterFactory != nil {
-			adapter, err := w.OutputAdapterFactory(*agent, checkout, output[0])
-			return adapter, "", err
-		}
-		adapter, err := w.AdapterFactory(*agent, checkout)
-		return adapter, "", err
-	}
-	token, err := w.RelayServer.RegisterSeat(agent.Name, payload.ThreadID)
-	if err != nil {
-		// Fail-open: without a token the seat cannot relay, but a normal adapter
-		// still lets the seat run (and degrade to a job_result conclusion). Leave the
-		// agent UNELEVATED — elevation without a relay buys nothing and would leave a
-		// codex seat with write+network it cannot use. Do not fail the job over a mint
-		// error.
-		writeLine(w.Stdout, "job seat %s relay token mint failed: %v", agent.Name, err)
-		adapter, aerr := w.AdapterFactory(*agent, checkout)
-		return adapter, "", aerr
-	}
-	relayEnv := []string{
-		chatRelayEnvSocket + "=" + w.RelayServer.SocketPath(),
-		chatRelayEnvToken + "=" + token,
-	}
-	// Elevate ONLY now that the seat will get a working relay env (see the coupling
-	// rationale above). Mutates the caller's agent so RunJob delivers with ChatSeat.
-	agent.ChatSeat = true
-	adapter, err := buildRuntimeAdapter(w.ConfigHome, *agent, checkout, subprocess.EnvInjectingRunner{Env: relayEnv})
-	if err != nil {
-		agent.ChatSeat = false
-		w.RelayServer.ReleaseSeat(token)
-		return nil, "", err
-	}
-	return adapter, token, nil
 }
 
 // buildRuntimeAdapter constructs the concrete runtime adapter for a job. With

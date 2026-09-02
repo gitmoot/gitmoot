@@ -90,7 +90,7 @@ type MemorySettings struct {
 	// — useful to harvest failure signal box-wide — while the READ/injection and
 	// the confirmed mechanical producers stay enrolled-only.
 	DistillAllJobs bool
-	// IngestAutoConfirm immediately promotes memory ingest and chat remember
+	// IngestAutoConfirm immediately promotes memory ingest
 	// observations into the authoring agent's private pool. Default false keeps the
 	// pending human gate. Shared memory remains explicit through confirm/promote
 	// commands even when this is enabled.

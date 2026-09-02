@@ -40,10 +40,8 @@ func (r GroupRunner) RunWithPID(ctx context.Context, dir string, onPID PIDCallba
 }
 
 // RunEnv gives GroupRunner the EnvRunner contract: process-group kill semantics
-// PLUS extra KEY=VALUE env vars appended to the inherited environment. It is what
-// the #732 chat relay uses to inject a moot seat's GITMOOT_CHAT_RELAY[_AUTH] into
-// the runtime subprocess without losing whole-tree cancellation. A nil/empty env
-// is byte-identical to Run.
+// PLUS extra KEY=VALUE env vars appended to the inherited environment, without
+// losing whole-tree cancellation. A nil/empty env is byte-identical to Run.
 
 func (r GroupRunner) RunEnv(ctx context.Context, dir string, env []string, command string, args ...string) (Result, error) {
 	if r.MaxOutputBytes > 0 {

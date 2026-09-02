@@ -14,7 +14,6 @@ func TestContractDocsEnumsMatchWorkflow(t *testing.T) {
 	skill := filepath.Join("..", "..", "skills", "gitmoot", "SKILL.md")
 	assertDocEnumNear(t, skill, "gitmoot job close", workflow.ResultDecisions)
 	assertDocEnumNear(t, skill, "locks, commits, pushes", workflow.DelegationActions)
-	assertDocEnumNear(t, skill, "gitmoot chat task", workflow.DelegationActions)
 
 	contract := filepath.Join("..", "..", "skills", "gitmoot", "references", "RESULT_CONTRACT.md")
 	assertDocEnumNear(t, contract, `"decision"`, workflow.ResultDecisions)
@@ -46,7 +45,7 @@ func assertDocEnumNear(t *testing.T, path, marker string, values []string) {
 }
 
 func TestContainsDocEnumTokenRejectsSubstring(t *testing.T) {
-	if containsDocEnumToken("gitmoot chat task", "ask") {
+	if containsDocEnumToken("a queued task", "ask") {
 		t.Fatal("ask must not match within task")
 	}
 	if !containsDocEnumToken("--action ask|review|implement", "ask") {

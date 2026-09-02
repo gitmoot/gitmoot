@@ -155,7 +155,7 @@ func AllowResurrectConfirmedMemory() UpsertConfirmedMemoryOption {
 // PreserveSupersededEdition makes a key-matched in-place UPDATE archive the prior
 // edition first (#804): the old content is copied to a new row whose
 // superseded_by points at the live row, then the live row is overwritten.
-// AUTO-CONFIRMED writers (ingest auto-confirm, chat remember) pass this so a bad
+// AUTO-CONFIRMED writers (ingest auto-confirm) pass this so a bad
 // or poisoned edit can never silently destroy the last human-reviewed edition —
 // the archived row stays inspectable by groom, the vault ghosts, and the brain
 // graph. Manual human-controlled paths (vault import CAS edits, `memory confirm

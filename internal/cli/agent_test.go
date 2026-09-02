@@ -2838,7 +2838,6 @@ max_background = 4
 idle_timeout = "41m"
 job_timeout = "17m"
 memory = true
-chat_autorespond = true
 `
 	if err := os.WriteFile(paths.ConfigFile, []byte(configured), 0o600); err != nil {
 		t.Fatal(err)
@@ -2877,7 +2876,7 @@ chat_autorespond = true
 	entry := entries["memory-agent"]
 	if !entry.Memory || entry.Runtime != "claude" || entry.Template != "preserved-template" || entry.Model != "preserved-model" ||
 		entry.Effort != "high" || entry.Role != "preserved-role" || !reflect.DeepEqual(entry.Capabilities, []string{"review"}) ||
-		entry.AutonomyPolicy != "read-only" || entry.MaxBackground != 4 || entry.IdleTimeout != "41m" || entry.JobTimeout != "17m" || !entry.ChatAutoRespond {
+		entry.AutonomyPolicy != "read-only" || entry.MaxBackground != 4 || entry.IdleTimeout != "41m" || entry.JobTimeout != "17m" {
 		t.Fatalf("pre-existing type was clobbered: %+v", entry)
 	}
 	if !strings.Contains(stdout.String(), "memory: on") {

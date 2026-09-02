@@ -744,7 +744,7 @@ func TestP2GapEveryJobAdapterConstructionRouteRefusesLocalFallback(t *testing.T)
 		}
 	})
 	t.Run("daemon primary delivery", func(t *testing.T) {
-		if _, _, err := worker.buildSeatAwareAdapterForBackend(backend, &agent, t.TempDir(), workflow.JobPayload{}); err == nil {
+		if _, err := worker.buildJobAdapterForBackend(backend, agent, t.TempDir()); err == nil {
 			t.Fatal("daemon primary delivery accepted p2-probe without an implementation")
 		}
 	})
@@ -819,20 +819,12 @@ func TestRemoteBackendRefusesEveryHostOnlyRoute(t *testing.T) {
 		}
 	})
 	t.Run("daemon primary delivery is an unprovisioned placeholder", func(t *testing.T) {
-		adapter, token, err := worker.buildSeatAwareAdapterForBackend(execbackend.Remote, &agent, t.TempDir(), workflow.JobPayload{})
+		adapter, err := worker.buildJobAdapterForBackend(execbackend.Remote, agent, t.TempDir())
 		if err != nil {
 			t.Fatalf("build remote placeholder: %v", err)
 		}
-		if token != "" {
-			t.Fatalf("remote placeholder relay token = %q, want empty", token)
-		}
 		if _, err := adapter.Deliver(context.Background(), agent, runtime.Job{}); err == nil || !strings.Contains(err.Error(), "not provisioned") {
 			t.Fatalf("remote placeholder Deliver error = %v, want unprovisioned refusal", err)
-		}
-	})
-	t.Run("moot seat relay", func(t *testing.T) {
-		if _, _, err := worker.buildSeatAwareAdapterForBackend(execbackend.Remote, &agent, t.TempDir(), workflow.JobPayload{MootSeat: true}); err == nil {
-			t.Fatal("remote moot seat accepted a host relay")
 		}
 	})
 	t.Run("temporary worker delivery", func(t *testing.T) {

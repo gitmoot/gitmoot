@@ -512,8 +512,8 @@ mirroring the PR-comment watcher; `--scheduler pool` selects the continuous
 worker-pool scheduler that re-queries the queue as workers free and reactively
 isolates a contended same-repo read job into an ephemeral worktree (fixing a
 same-repo dependent-job deadlock), versus the default `--scheduler barrier`.
-(Independently of the scheduler, background **read-only ask** jobs — moot seats,
-chat-task promotions, autorespond, `agent ask --background` — are each given their
+(Independently of the scheduler, background **read-only ask** jobs — `agent ask
+--background` and heartbeat asks — are each given their
 own detached committed-tip worktree **at dispatch** (#739), so they parallelize
 across same-repo seats under either scheduler with ≥2 workers.)
 To run a repo's queued jobs N-wide, use `--parallel N` (sugar for `--workers N
@@ -635,7 +635,8 @@ read is a 304, a repo's GitHub poll cadence decays to 2x and then up to
 poll error, queued repo job, or in-flight repo job resets/promotes it immediately.
 Repos with open PRs stay at base cadence because their per-PR comment reads are
 deliberately non-conditional. Idle decay gates only GitHub calls; heartbeat,
-pipeline, and chat maintenance still wake at the resolved base interval.
+pipeline, and other supervisor maintenance still wake at the resolved base
+interval.
 
 `gitmoot dashboard` shows local state — daemon health, repos, agents and runtime
 sessions, jobs by state, worktrees, branch locks, and pending interactive
@@ -1944,9 +1945,8 @@ eligible. `pane_input_pending` matches the
 interval while the dialog remains pending. The pending signal takes precedence
 over the pane's last `idle` or `working` activity status.
 `reply`, `blocked`, `escalation`, and `fact` wakes use the durable wake outbox.
-`reply` matches workflow notes and `kind=chat` messages addressed to the same
-role as `--wake`; non-triggering chat back-links such as `job_result` are
-excluded. Reply rows commit atomically with their source note or chat message.
+`reply` matches workflow notes addressed to the same role as `--wake`. Reply
+rows commit atomically with their source note.
 Blocked and escalation rows are persisted synchronously by the event sink after
 the source transition; an insert failure is logged but cannot roll back the
 emitting job. The daemon coalesces a rolling five-second window per event kind
@@ -2342,6 +2342,7 @@ gitmoot job gates clear <job-id> --need "<text>"|--all             # satisfy gat
 gitmoot job cancel <job-id>                                        # one queued|running|blocked job
 gitmoot job cancel --state blocked [--older-than 7d] [--repo owner/repo] [--agent name] [--yes]
 gitmoot job kill <root-job-id>
+gitmoot job answer <job-id> "<question-id>: answer text" [--json]  # resume a job paused at awaiting_human
 gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 ```
@@ -2936,7 +2937,7 @@ distill_at_terminal = false # stage deterministic failure signal at job terminal
 distill_successes = false   # stage deterministic success observations (#781)
 distill_max_per_job = 3     # hard cap on distilled observations per job
 distill_all_jobs = false    # when true, distill runs for every job, not only enrolled agents
-ingest_auto_confirm = false # when true, ingest/chat remember confirm to the authoring agent private pool only
+ingest_auto_confirm = false # when true, ingest confirms to the authoring agent private pool only
 harvest_enabled = false     # sweep new terminal results for durable insights
 harvest_runtime = "codex"   # read-only one-shot classifier runtime
 harvest_model = ""          # empty uses the runtime default
@@ -3121,10 +3122,10 @@ memories (import rebuilds the fresh export with the manifest's recorded scope). 
 `memory ingest` is the **mouth** of the bridge: it reads arbitrary Markdown
 (session notes, runbooks, incident writeups) and stages it as observations behind
 the existing confirmation gate. By default those observations stay pending. If
-`[memory].ingest_auto_confirm = true`, `memory ingest`, `memory ingest sweep`,
-and `chat remember` immediately confirm the staged observation into the
-authoring agent's **private** pool only. They never auto-confirm into the shared
-pool. Shared memory stays explicit through `memory confirm --to-shared` or
+`[memory].ingest_auto_confirm = true`, `memory ingest` and `memory ingest sweep`
+immediately confirm the staged observation into the authoring agent's
+**private** pool only. They never auto-confirm into the shared pool. Shared
+memory stays explicit through `memory confirm --to-shared` or
 `memory promote --to-shared`.
 
 ```sh
@@ -3165,9 +3166,9 @@ Chunk keys are **stable**: `slug(file)-slug(heading)`, with an ordinal suffix
 hash participates only in dedup, never in the key, so a re-swept **edited** note
 lands on the same key as its earlier edition and, under auto-confirm, updates
 the existing confirmed fact **in place**. Auto-confirmed key-matched updates
-(ingest auto-confirm and `chat remember`) are **supersede-preserving**: the
-prior edition is archived first as a `superseded_by` row (out of FTS, out of the
-vault; `memory_links` stay on the unchanged live row id) so a bad edit never
+from ingest auto-confirm are **supersede-preserving**: the prior edition is
+archived first as a `superseded_by` row (out of FTS, out of the vault;
+`memory_links` stay on the unchanged live row id) so a bad edit never
 destroys the last reviewed edition. Manual paths (vault import CAS edits,
 `memory confirm --yes`) keep plain overwrite semantics. Keys minted before this
 scheme end in an 8-hex content-hash suffix; the groom **rekey** detector
@@ -3979,73 +3980,6 @@ stage job. Use an orchestra for dynamic fan-out, a pipeline for a fixed shell DA
 See `docs/pipelines.md` for the full reference and `WORKFLOWS.md → Pipelines` for the
 end-to-end story.
 
-## Native Chat (agent threads)
-
-`gitmoot chat` (#534, V1 local-only) is a durable, repo-aware **conversation
-ledger** where registered agents and the human talk in threads, `@`-tag each
-other, and (explicitly) promote a message into a real job. It is stored in local
-SQLite alongside the rest of gitmoot state — **zero network, zero entmoot
-dependency**. The core rule: **a message is a row (free); a job is compute
-(explicit)**. A plain `chat send` never starts work — only `chat task` (promotion)
-and `chat answer` (ask-gate resume) touch the dispatch path.
-
-```sh
-gitmoot chat create <name> --repo owner/repo [--topic "title"] [--json]
-gitmoot chat list [--repo owner/repo] [--all] [--json]      # open threads; --all includes archived
-gitmoot chat show <thread> [--repo owner/repo] [--limit N] [--json]
-gitmoot chat send <thread> "message" [--as agent] [--repo owner/repo] [--ref kind:value ...] [--json]
-gitmoot chat remember <thread> <message-seq> [--repo owner/repo] [--tier repo|general] [--agent NAME] [--json]
-gitmoot chat inbox <agent> [--unread] [--json]
-gitmoot chat task <thread> "@agent message" [--action ask|review|implement] [--repo owner/repo] [--json]
-gitmoot chat answer <thread> "<question-id>: answer text" [--repo owner/repo] [--json]
-gitmoot chat close|reopen <thread> [--repo owner/repo] [--json]
-gitmoot chat rename <thread> "new name" [--repo owner/repo] [--json]
-```
-
-- **`create`** — `<name>` is slugified to a topic-path-safe handle (`[a-z0-9-]`, no
-  `+`/`#`/`/`; unique per repo); a name that slugifies to nothing is rejected.
-  `--repo` is required. `--topic` sets the human display title (defaults to the
-  slug). The slug is the stable handle; a later `rename` changes only the title.
-- **`send`** — appends a `chat` message. `@agent` mentions are parsed and, for
-  **registered** agents, delivered as an unread **inbox** row; an unknown mention
-  is recorded for audit with a stderr warning and **never fails the send**.
-  `--as <agent>` authors the message as a registered agent (default: the human);
-  `--ref kind:value` attaches structured refs (e.g. `--ref pr:42`). Sending to an
-  archived thread is refused until you `reopen` it.
-- **`remember`**: captures exactly one existing message by sequence as a memory
-  observation. It stores the message body verbatim with deterministic provenance
-  `chat:<thread-id>#<seq>`, applies the memory PreFilter, and dedups by content
-  hash within the target scope/repo. It does not scan for natural-language
-  prefixes, does not bulk-mine a thread, and does not self-trigger from agent
-  messages. `--agent` is the capturing agent identity (default `lead`); `--tier`
-  defaults to `repo`. If `[memory].ingest_auto_confirm = true`, the observation is
-  immediately confirmed into that agent's private pool only. Shared memory remains
-  explicit through `memory confirm --to-shared` or `memory promote --to-shared`.
-- **`inbox`** — an agent's mentions, newest first; `--unread` restricts to unread.
-- **`task`** — the one promotion verb. The body must name **exactly one**
-  registered `@agent`; it records a `promotion_request` message, then dispatches a
-  background job through the **same** validate → repo-scope → capability →
-  autonomy-policy gate the daemon uses (`--action` defaults to `ask`). The message
-  is back-linked to the job (`promoted_job_id`), and when the job reaches a terminal
-  state the daemon appends its result into the thread as a **`job_result`** message
-  (non-promotable, `reply_to` the promotion, with a `{kind:job}` ref). An identical
-  `(thread, body)` promotion inside a 60 s window is refused (anti-ping-pong).
-- **`answer`** — the local answer channel for the **#445 ask-gate**. When a job
-  pauses at `awaiting_human` (its `human_questions[]`), the engine auto-creates (or
-  reuses) a thread named `job-<hash>` and posts the questions as a **`system`**
-  message carrying a `{kind:job}` ref. `chat answer <thread> "<id>: text"` routes
-  that answer onto the existing resume path (`ResolveEscalation(answer)`), enqueuing
-  the coordinator continuation that carries the answer and inherits the thread link.
-- **`close`/`reopen`** — archive (audit-preserving) / restore a thread.
-
-**Message kinds** are a fixed vocabulary: `chat` (a normal message),
-`promotion_request` (a `task`), `job_result` (a back-linked terminal result —
-never promotable, never mention-scanned), and `system` (engine-authored, e.g. the
-ask-gate questions). Every thread/message/mention carries an **`origin`** stamped
-with a generated stable per-DB `home_id` (never the literal `self`), and each
-message stores a versioned canonical **envelope** — schema discipline that keeps a
-future cross-machine bridge purely additive without changing any V1 runtime
-behavior. See `WORKFLOWS.md → Chat` for the human↔agent thread story.
 ## Routing Telemetry (Advisory)
 
 Gitmoot records lightweight **execution-grounded routing telemetry** (#530): one
@@ -4088,103 +4022,6 @@ context_enabled = true   # inject the advisory table into top-level coordinator 
 The injected block carries the same "not a benchmark" disclaimer and is only added
 to top-level (coordinator) jobs — a delegation child inherits its coordinator's
 routing decision. Routing stays advisory: the block never forces a route.
-
-### V1.5 — auto-respond, `chat wait`, and `moot`
-
-V1.5 (#534) adds the **agent-to-agent** layer on top of the V1 ledger. Both
-additions are **off by default** and keep anti-ping-pong **structural**: only a
-`kind=chat` message with a resolved mention ever triggers work, and every
-back-linked reply is a non-triggering `kind=job_result`.
-
-**Auto-respond sweep** — an opt-in daemon-tick sweep that lets an enrolled agent
-answer an `@mention` without a human running `chat task`. It enqueues **one**
-bounded read-only `ask` job per unread mention, through the same dispatch gate as
-`chat task`. It is gated three ways and is a no-op (zero chat-table queries on the
-tick) unless **both** the global switch and a per-agent opt-in are set:
-
-- Global: `[chat] auto_respond = true` (default `false`).
-- Per agent: `[agents.<name>] chat_autorespond = true` (default `false`).
-
-Bounds (all in `[chat]`, warm-reloadable per tick / on SIGHUP):
-
-| Knob | Default | Meaning |
-|---|---|---|
-| `auto_respond` | `false` | Global kill switch; `false` overrides every per-agent opt-in. |
-| `auto_respond_cap` | `4` | HARD cap on auto-responses per (thread, agent). At the cap the sweep **hard-stops** — no auto-extension — parks the trigger, and posts **one** visible `needs a human` system message. |
-| `auto_respond_cooldown` | `2m` | Minimum spacing between auto-responses for the same (thread, agent). A trigger inside the window is deferred (left unread to re-fire), never dropped. |
-
-A dispatched reply back-links as a `job_result` and marks the trigger mention read,
-so the same mention can never double-fire; a failed enqueue leaves it unread to
-retry next tick. The cap is a **real-time** bound: the sweep also counts the agent's
-in-flight (queued/running) auto-respond asks, so a burst of mentions arriving before
-the first reply lands can never stack past the cap. **Moot threads are excluded** from
-the sweep entirely — a seat's `@mention` of a peer never double-drives that peer with
-an extra ask on top of its seat job (auto-respond and `moot` compose, never stack).
-
-**`chat wait`** — a blocking read verb (the moot turn-taking primitive): it polls
-until the thread has a message with `seq > --since-seq`, then prints the new
-messages plus a `last-seq: N` line (feed `N` as the next `--since-seq`). On a capped
-moot thread it returns immediately with the wrap-up line instead of spinning to the
-timeout.
-
-```sh
-gitmoot chat wait <thread> [--since-seq N] [--timeout 90s] [--repo owner/repo] [--json]
-```
-
-**`gitmoot moot`** — convene N registered agents as **seats** in one bounded
-brainstorm. Each seat is **one** background read-only `ask` job dispatched through
-the same validate → repo-scope → capability → policy gate as `chat task`; seats
-converse in the thread by running `chat send` / `chat wait` as subprocesses, so the
-compute cost is exactly **one job per seat** regardless of how many messages they
-exchange. Messages are rows (free).
-
-```sh
-gitmoot moot <name> "topic" --agents a,b,c --repo owner/repo [--max-messages N] [--home ...] [--json]
-```
-
-- Roster validation is up front: every seat must be **registered**, **repo-scoped**,
-  and carry the **`ask`** capability, or the whole moot is rejected before any
-  thread is created or seat dispatched.
-- The moot creates (or reuses an **open**) thread named `<name>`, stamps its hard
-  cap, and posts a visible `MOOT convened` system message naming the seats + cap.
-- The moot **HARD-STOPS** at its agent-message cap (owner design decision): there is
-  **no** auto-extension. Once the thread hits the cap, `chat send --as` is refused
-  with a distinctive error and **one** visible `MOOT CAP REACHED` overrun system
-  message is posted; each seat then wraps up by returning its **partial conclusions**
-  (what it knows / is unsure of / would ask next) as its `gitmoot_result`, which
-  arrives via the `job_result` back-link path (the cap never blocks those). Human
-  sends and seat conclusions are never gated by the cap.
-- **Daemon relay**: seats converse **transparently** even under the runtime sandbox.
-  The daemon serves a local **unix-socket chat relay**, and each moot seat's `chat send`
-  / `chat wait` route through it to the (unsandboxed) daemon, which does the actual store
-  write/read (the daemon injects a scoped, per-seat token bound to that seat's agent +
-  thread). The gitmoot home stays **read-only** for the seat — only the daemon writes —
-  so the read-only-home invariant holds. A human/CLI takes the byte-identical
-  direct-store path.
-- **Concurrency requirement**: seats are top-level read-only same-repo jobs. Each
-  seat gets its own detached committed-tip **worktree at dispatch** (#739), so it is
-  keyed off `worktree:<path>` instead of the shared `repo:<repo>` checkout key and
-  same-repo seats converse concurrently under **either scheduler** as long as the
-  daemon has **≥2 workers** (`--parallel N`, `[daemon] parallel = N`, or a per-repo
-  `[repos."owner/repo"]` `max_parallel` override). Scheduler mode no longer matters
-  (barrier batches the distinct-keyed seats per tick; pool runs them continuously).
-  The only remaining serializer is a genuinely **single-worker** daemon
-  (`parallel = 1`), where each seat's `chat wait` may time out and the moot degrades
-  to sequential monologues. When it detects a single-worker daemon, `gitmoot moot`
-  prints a **non-blocking** stderr warning (it still dispatches every seat) — give
-  the daemon ≥2 workers so seats converse. Because a seat runs in a committed-tip
-  worktree it sees the last committed state, not uncommitted edits (its prompt notes
-  the canonical checkout), the same isolation read-only delegation children use.
-
-Moot bounds (in `[chat]`, warm-reloadable):
-
-| Knob | Default | Meaning |
-|---|---|---|
-| `moot_max_seats` | `6` | Max agents one moot may convene; a larger roster is rejected. |
-| `moot_message_cap` | `30` | Default HARD cap on agent-authored turns (overridable per-moot with `--max-messages`). |
-
-`[chat]` is entirely optional: with no `[chat]` section every knob resolves to its
-default, `auto_respond` stays off, and the daemon tick is byte-identical.
 
 ## Bridge (localhost HTTP for external automation)
 

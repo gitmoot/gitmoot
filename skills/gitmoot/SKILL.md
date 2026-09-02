@@ -15,12 +15,9 @@ goals, reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
 background daemon checks, Codex, Claude Code, Kimi Code, or omp agent startup, structured
 implementation plans, standard goal files, agent template workflows, custom
-prompt agents, template capture, native agent chat threads, job status, or branch
-lock inspection. When the user wants agents and humans to converse in a durable
-repo thread, tag an agent, answer a paused job's question, or turn a chat message
-into a real job, use `gitmoot chat`; to convene several agents in one bounded,
-hard-capped brainstorm, use `gitmoot moot` (see CLI.md § Native Chat and
-WORKFLOWS.md § Chat).
+prompt agents, template capture, job status, or branch lock inspection. When a job
+pauses at `awaiting_human`, answer it locally with `gitmoot job answer <job-id>
+"<question-id>: text"` (see CLI.md § Jobs).
 
 For current-chat prompt import, "use <agent> here" or "use Gitmoot agent
 <agent> here" means import the agent's prompt into this current chat and apply
@@ -292,21 +289,9 @@ run (resume with `pipeline resume <run-id>`), and a stage is a leaf (its
 `delegations[]` never spawn children). Pipelines are off by default. See CLI.md
 § Pipelines, WORKFLOWS.md § Pipelines, and `docs/pipelines.md`.
 
-For lightweight, durable agent communication that is **not** immediately work, use
-**native chat** (#534): `gitmoot chat create <name> --repo owner/repo`, then
-`gitmoot chat send <thread> "@agent …"` to leave a durable, `@`-tagged message in
-the agent's inbox. A message is a row (free); a job is compute (explicit) — a plain
-`send` never starts work. Promote a message into a real job only with
-`gitmoot chat task <thread> "@agent …" [--action ask|review|implement]` (the job's
-result is posted back into the thread), and answer a job paused at `awaiting_human`
-with `gitmoot chat answer <thread> "<question-id>: …"`. Chat is local-only (no
-network). For the agent-to-agent V1.5 layer, an enrolled agent can auto-answer an
-`@mention` via the off-by-default `[chat] auto_respond` sweep (one bounded read-only
-`ask` per mention, hard-capped). Use `gitmoot chat wait <thread>` for turn-taking
-in agent conversations, and `gitmoot moot <name> "topic" --agents a,b,c --repo
-owner/repo` to convene agents as seats in one brainstorm — one job per seat,
-hard-stopping at a message cap (`moot_max_seats` default 6, `moot_message_cap`
-default 30). See CLI.md § Native Chat (V1.5) and WORKFLOWS.md § Chat.
+When a job pauses at `awaiting_human`, the local (non-PR) answer path is
+`gitmoot job answer <job-id> "<question-id>: text"`. It resumes through the same
+escalation-resume engine the daemon's PR-comment `answer` verb uses.
 
 The plugin is only the runtime discovery surface for this skill. Local agent
 invocation still goes through the `gitmoot` CLI and the same registered agent,

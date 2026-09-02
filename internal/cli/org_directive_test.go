@@ -358,14 +358,11 @@ func TestDirectiveWakeOutboxUsesSeparateCoalesceNamespace(t *testing.T) {
 	if err := store.AddEventRule(ctx, db.EventRule{ID: "directive-owner", OnKind: "directive", WakeRole: "owner", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	thread, err := store.CreateChatThread(ctx, db.ChatThread{Slug: "directive-coalesce", Repo: "owner/repo"})
-	if err != nil {
-		t.Fatal(err)
-	}
 	for index := 0; index < 2; index++ {
-		if _, err := store.AddChatMessage(ctx, db.ChatMessage{
-			ThreadID: thread.ID, AuthorName: "worker", Kind: db.ChatKindChat,
-			Body: fmt.Sprintf("@owner reply %d", index), Mentions: []string{"owner"},
+		if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID: "release/coalesce", Author: "worker",
+			Body:            fmt.Sprintf("@owner reply %d", index),
+			AddressedTarget: "owner",
 		}); err != nil {
 			t.Fatal(err)
 		}

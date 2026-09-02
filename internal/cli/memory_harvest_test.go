@@ -222,12 +222,12 @@ func TestHarvestSlugDegenerateContent(t *testing.T) {
 }
 
 func TestAutoConfirmEligibleProvenanceFailClosed(t *testing.T) {
-	for _, provenance := range []string{"ingest:notes.md", "chat:thread#1", "workflow:release#2"} {
+	for _, provenance := range []string{"ingest:notes.md", "workflow:release#2"} {
 		if !autoConfirmEligibleProvenance(provenance) {
 			t.Fatalf("allowlisted provenance rejected: %q", provenance)
 		}
 	}
-	for _, provenance := range []string{"", "harvest:abc", "distill:job", "future:source", "x-ingest:notes"} {
+	for _, provenance := range []string{"", "chat:thread#1", "harvest:abc", "distill:job", "future:source", "x-ingest:notes"} {
 		if autoConfirmEligibleProvenance(provenance) {
 			t.Fatalf("unlisted provenance accepted: %q", provenance)
 		}

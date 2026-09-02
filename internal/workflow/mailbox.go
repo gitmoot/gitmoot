@@ -345,20 +345,6 @@ type JobRequest struct {
 	// and the dashboard can explain an escalation. Empty (the default) for every
 	// job outside the opt-in risk-tiered path.
 	RiskTier string
-	// ThreadID / ChatMessageID link a job back to the chat message it was
-	// promoted from (#534). Populated only by `chat task` promotion; empty for
-	// every non-chat job, so the stored payload is byte-identical by default. The
-	// daemon terminal back-link posts the result into ThreadID when it is set.
-	ThreadID      string
-	ChatMessageID string
-	// MootSeat marks the job as a `gitmoot moot` conversing SEAT (#732) — the ONLY
-	// job class whose whole purpose is to run `gitmoot chat send/wait` mid-run and
-	// therefore needs the daemon relay (and, for codex, the sandbox elevation that
-	// reaches it). It is distinct from ThreadID, which every chat-linked job carries
-	// (chat-task promotions, ask-gate coordinator continuations, delegation children
-	// inheriting it for back-linking) but which must NOT trigger seat elevation. Set
-	// only by the moot dispatch; never inherited by continuations/children.
-	MootSeat bool
 	// OrchestrateStage marks a #758 pipeline orchestrate stage job: the stage's agent
 	// runs as a bounded sub-tree COORDINATOR, so its delegations[] are NOT stripped by
 	// the pipeline-sender leaf strip (they fan out as children owned by this stage
@@ -502,16 +488,6 @@ type JobPayload struct {
 	ValidatedPullRequest   bool                `json:"validated_pull_request,omitempty"`
 	Ephemeral              *EphemeralSpec      `json:"ephemeral,omitempty"`
 	HumanAnswer            string              `json:"human_answer,omitempty"`
-	// ThreadID / ChatMessageID back-link a chat-promoted job (#534) to its origin
-	// message. Additive/omitempty: a non-chat job serializes byte-identically.
-	ThreadID      string `json:"thread_id,omitempty"`
-	ChatMessageID string `json:"chat_message_id,omitempty"`
-	// MootSeat marks a `gitmoot moot` conversing seat (#732): the daemon elevates
-	// ONLY these jobs (codex workspace-write+network to reach the relay socket) and
-	// injects the relay env into them. Additive/omitempty so every non-seat job —
-	// including chat-task promotions and continuations that carry ThreadID — is
-	// byte-identical. Never inherited by delegation children or continuations.
-	MootSeat bool `json:"moot_seat,omitempty"`
 	// OrchestrateStage marks a #758 pipeline orchestrate stage job whose delegations[]
 	// survive the pipeline-sender leaf strip (they fan out as children owned by this
 	// stage job, whose own id is the sub-tree RootJobID). Set only from the validated
@@ -746,9 +722,6 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		Ephemeral:              request.Ephemeral,
 		HumanAnswer:            request.HumanAnswer,
 		RiskTier:               strings.TrimSpace(request.RiskTier),
-		ThreadID:               strings.TrimSpace(request.ThreadID),
-		ChatMessageID:          strings.TrimSpace(request.ChatMessageID),
-		MootSeat:               request.MootSeat,
 		OrchestrateStage:       request.OrchestrateStage,
 		WritablePaths:          compactStrings(request.WritablePaths),
 		ReadablePaths:          compactStrings(request.ReadablePaths),
@@ -884,7 +857,7 @@ func OrgScopeDecision(policy OrgEnforcement, actingRole, repo string) (string, e
 // resolveEnqueueOrgScope is deliberately independent of require_workflow: a
 // repo that opted out of workflow labels remains protected by its org registry.
 // Only explicit human CLI dispatches carry OperatorOrigin; shared local helpers
-// also serve comment, chat, pipeline, heartbeat, and other automated producers.
+// also serve comment, pipeline, heartbeat, and other automated producers.
 func (m Mailbox) resolveEnqueueOrgScope(request *JobRequest) (string, error) {
 	if request.PolicyExempt == "exempt" || strings.TrimSpace(request.ParentJobID) != "" || strings.TrimSpace(request.DelegationReason) == "temp_worker_merge_back" || !request.OperatorOrigin {
 		return "", nil

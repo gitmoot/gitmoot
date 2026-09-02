@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	mrand "math/rand/v2"
 	"regexp"
 	"slices"
 	"strconv"
@@ -333,6 +334,23 @@ func (s *Store) InsertOrgDirectiveReceipt(
 		"record directive receipt after %d attempts: %w",
 		maxDirectiveReceiptRetries, lastConflict,
 	)
+}
+
+// seqConflictBackoff sleeps a short JITTERED interval between retry attempts.
+// Without it, a cross-process read->write upgrade deadlock (SQLITE_BUSY /
+// SQLITE_BUSY_SNAPSHOT — which busy_timeout returns immediately rather than
+// waiting out) livelocks: two symmetric processes both re-run their read and
+// collide again on the very next tick. The randomized backoff breaks that
+// symmetry so contending writers drain instead of exhausting the retry budget in
+// lockstep. Growth is capped so the worst case stays bounded.
+func seqConflictBackoff(attempt int) {
+	const capMs = 40
+	ms := 1 << attempt // 1,2,4,8,16,32,...
+	if ms > capMs {
+		ms = capMs
+	}
+	// Full jitter in [0, ms] milliseconds.
+	time.Sleep(time.Duration(mrand.IntN(ms+1)) * time.Millisecond)
 }
 
 // isRetryableSQLiteSnapshot accepts only the immediate stale-WAL conflict.

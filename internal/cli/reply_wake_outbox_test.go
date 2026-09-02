@@ -153,19 +153,8 @@ func TestWakeOutboxCoalescedPromptNamesEveryWorkflowNote(t *testing.T) {
 		[]replyWakeTestRole{{name: "owner", pane: "w1:p1"}},
 	)
 	ctx := context.Background()
-	thread, err := store.CreateChatThread(ctx, db.ChatThread{Slug: "mixed-note-wake", Repo: "owner/repo"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	chat, err := store.AddChatMessage(ctx, db.ChatMessage{
-		ThreadID: thread.ID, AuthorName: "human", Kind: db.ChatKindChat,
-		Body: "@owner first", Mentions: []string{"owner"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	notes := make([]db.WorkflowNote, 0, 2)
-	for _, body := range []string{"first message", "second message"} {
+	notes := make([]db.WorkflowNote, 0, 3)
+	for _, body := range []string{"first message", "second message", "third message"} {
 		note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
 			WorkflowID:      "release/distinct-note-wakes",
 			Author:          "worker",
@@ -182,7 +171,7 @@ func TestWakeOutboxCoalescedPromptNamesEveryWorkflowNote(t *testing.T) {
 	if wake.promptCalls != 1 {
 		t.Fatalf("wake calls=%d, want one coalesced wake: %q", wake.promptCalls, wake.prompts)
 	}
-	if want := "3 new items, oldest id " + chat.ID; !strings.Contains(wake.prompt, want) {
+	if want := fmt.Sprintf("3 new items, oldest id %d", notes[0].ID); !strings.Contains(wake.prompt, want) {
 		t.Fatalf("coalesced prompt=%q, want %q", wake.prompt, want)
 	}
 	for _, note := range notes {
@@ -569,32 +558,6 @@ func TestReplyWakeOutboxSplitsOversizedAddressedNoteBatch(t *testing.T) {
 		if matches := strings.Count(normalizedPrompts, command+";"); matches != 1 {
 			t.Fatalf("retrieval command %q appeared %d times, want exactly one: %q", command, matches, wake.prompts)
 		}
-	}
-}
-
-func TestReplyWakeOutboxDeliversAddressedChatMessage(t *testing.T) {
-	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
-	ctx := context.Background()
-	thread, err := store.CreateChatThread(ctx, db.ChatThread{Slug: "wake-chat", Repo: "owner/repo"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	message, err := store.AddChatMessage(ctx, db.ChatMessage{
-		ThreadID: thread.ID, AuthorName: "human", Kind: db.ChatKindChat,
-		Body: "@owner please inspect", Mentions: []string{"owner"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	drainReplyWakeAfterAllRowsAreDue(t, store, sink)
-
-	if wake.promptCalls != 1 || !strings.Contains(wake.prompt, "1 new items, oldest id "+message.ID) {
-		t.Fatalf("chat wake = calls=%d prompt=%q", wake.promptCalls, wake.prompt)
-	}
-	delivered, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateDelivered)
-	if err != nil || len(delivered) != 1 || delivered[0].SourceKind != db.WakeOutboxSourceChatMessage {
-		t.Fatalf("delivered chat rows = %+v, err=%v", delivered, err)
 	}
 }
 

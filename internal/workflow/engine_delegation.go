@@ -486,8 +486,6 @@ func (e Engine) enqueueFinalizeContinuation(ctx context.Context, job db.Job, pay
 		WorkflowID:         payload.WorkflowID,
 		ActingOrgRole:      payload.ActingOrgRole,
 		DelegationFinalize: true,
-		ThreadID:           payload.ThreadID,
-		ChatMessageID:      payload.ChatMessageID,
 		// Inherit the coordinator's cockpit settings so the finalize continuation
 		// renders its pane under the same workspace/session as the rest of the tree.
 		Cockpit:        payload.Cockpit,
