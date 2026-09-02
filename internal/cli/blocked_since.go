@@ -471,7 +471,7 @@ func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.
 	for _, item := range items {
 		from, to, _, _, ok := workflow.ParseOrgDirectiveNote(item.Body)
 		if !ok {
-			parked, parkErr := store.ParkMalformedOrgDirective(ctx, item.ID, now, "malformed directive marker")
+			parked, parkErr := store.ParkMalformedOrgDirective(ctx, item.ID, now)
 			if parkErr != nil {
 				writeLine(stdout, "org directive %d malformed marker park failed: %v", item.ID, parkErr)
 			} else if parked {
