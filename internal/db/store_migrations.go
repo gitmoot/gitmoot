@@ -2596,10 +2596,8 @@ ALTER TABLE agents DROP COLUMN preset_delivery;
 	// #1753 deleted the `gitmoot orchestrate --cockpit` pane wrapper and the
 	// `gitmoot interactive` prompt command. Their tables have no remaining reader
 	// or writer, so drop them rather than leaving three orphaned schemas behind.
-	// cockpit_panes never carried a row in production; interactive_prompts carried
-	// two, both from June 2026 and both unreachable once the TUI and the
-	// interactive command were removed. Dropping a table drops its indexes with
-	// it, so idx_cockpit_panes_job / idx_cockpit_panes_root /
+	// Dropping a table drops its indexes with it, so
+	// idx_cockpit_panes_job / idx_cockpit_panes_root /
 	// idx_interactive_prompts_state need no separate statement.
 	`
 DROP TABLE IF EXISTS cockpit_panes;

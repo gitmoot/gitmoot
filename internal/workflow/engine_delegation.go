@@ -322,8 +322,6 @@ func (e Engine) handleDelegationLoop(ctx context.Context, job db.Job, payload Jo
 		// detector escalates to delegation_loop_detected.
 		RecentDelegationHashes: appendDelegationHashWindow(payload.RecentDelegationHashes, currentHash),
 		DelegationRepeatCount:  payload.DelegationRepeatCount + 1,
-		// Inherit the coordinator's cockpit settings so the continuation renders
-		// its pane under the same workspace/session as the rest of the tree.
 	}
 	if err := e.enqueue(ctx, request); err != nil {
 		return true, fmt.Errorf("enqueue corrective continuation for %q: %w", job.ID, err)
@@ -414,8 +412,6 @@ func (e Engine) handleDelegationPreflightFailure(ctx context.Context, job db.Job
 		DelegationRepeatCount:  payload.DelegationRepeatCount + 1,
 		NonProgressStreak:      nonProgressStreak,
 		LastProgressDigest:     payload.LastProgressDigest,
-		// Inherit the coordinator's cockpit settings so the continuation renders its
-		// pane under the same workspace/session as the rest of the tree.
 	}
 	if err := e.enqueue(ctx, request); err != nil {
 		return fmt.Errorf("enqueue preflight corrective continuation for %q: %w", job.ID, err)
@@ -480,8 +476,6 @@ func (e Engine) enqueueFinalizeContinuation(ctx context.Context, job db.Job, pay
 		WorkflowID:         payload.WorkflowID,
 		ActingOrgRole:      payload.ActingOrgRole,
 		DelegationFinalize: true,
-		// Inherit the coordinator's cockpit settings so the finalize continuation
-		// renders its pane under the same workspace/session as the rest of the tree.
 	}
 	if err := e.enqueue(ctx, request); err != nil {
 		return fmt.Errorf("enqueue finalize continuation for %q: %w", job.ID, err)

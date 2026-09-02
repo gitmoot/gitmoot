@@ -1962,7 +1962,7 @@ func runAgentList(args []string, stdout, stderr io.Writer) int {
 // isEphemeralAgentName reports whether an agent name is a transient ephemeral
 // worker materialized from a delegation spec (#325). Such workers are persisted
 // only for the duration of their job and auto-disposed; they are excluded from
-// the registry listings (mirroring the dashboard TUI's isEphemeralAgent filter).
+// registry listings.
 func isEphemeralAgentName(name string) bool {
 	return strings.Contains(name, "-ephemeral-")
 }

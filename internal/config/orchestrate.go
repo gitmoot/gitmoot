@@ -11,12 +11,8 @@ import (
 	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 )
 
-const ()
-
-// OrchestratePolicy is the host-level cockpit policy read from the
-// [orchestrate] section of the gitmoot config. The daemon combines it with the
-// per-job JobPayload.Cockpit flag to decide whether to wrap a job's delivery in
-// a herdr pane (see issue #357). It never affects engine/DAG behavior.
+// OrchestratePolicy contains host-level orchestration settings read from the
+// [orchestrate] section of the gitmoot config.
 type OrchestratePolicy struct {
 	// InlineArtifactBodies opts the coordinator continuation prompt into inlining
 	// each finished child's artifact_body as a fenced block (see issue #368). It is

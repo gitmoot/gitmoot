@@ -579,7 +579,7 @@ func TestEphemeralAgentNameContainsInfix(t *testing.T) {
 		t.Fatalf("ephemeral agent name %q does not contain the %q infix", name, "-ephemeral-")
 	}
 	// The name is stable for the same (delegation, parent) pair and distinct for
-	// different parents, so the TUI filter and idempotent enqueue agree.
+	// different parents, so registry filtering and idempotent enqueue agree.
 	if again := ephemeralAgentName("worker-1", "parent-job"); again != name {
 		t.Fatalf("ephemeralAgentName not stable: %q vs %q", name, again)
 	}

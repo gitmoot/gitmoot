@@ -269,10 +269,9 @@ func (d *webDataSource) writeDashboardAPIJSON(w http.ResponseWriter, value any, 
 }
 
 // webDataSource implements dashboard.DataSource over a local Gitmoot home. It
-// reuses the existing read paths only — buildDashboardSnapshot for the run list
-// and the same store APIs the dashboard TUI reads (ListJobs / ListJobEvents /
-// GetJob / workflow.ParseJobPayload) — so it never duplicates a store query or
-// touches workflow state.
+// reuses existing read paths, including buildDashboardSnapshot for the run list
+// and store APIs for job and workflow details, so it does not duplicate store
+// queries or mutate workflow state.
 type webDataSource struct {
 	home string
 
@@ -402,7 +401,7 @@ var _ dashboard.ChangeCursorDataSource = (*webDataSource)(nil)
 
 // Runs lists every orchestration run (delegation tree) rooted at an originating
 // job, newest activity first. It reuses buildDashboardSnapshot so the run list
-// is assembled from the same read path the plain/TUI dashboard uses.
+// shares the one-shot dashboard's read path.
 func (d *webDataSource) Runs(ctx context.Context) ([]dashboard.RunSummary, error) {
 	paths, err := initializedPaths(d.home)
 	if err != nil {
@@ -2262,8 +2261,8 @@ func resolveDelegationEdges(job db.Job, payloadByID map[string]workflow.JobPaylo
 	return deps, meta.action
 }
 
-// delegMeta is a delegation's declared action and deps, read off the parent's
-// settled result (the same source buildDelegationTree uses).
+// delegMeta is a delegation's declared action and deps, read from its parent's
+// settled result.
 type delegMeta struct {
 	action string
 	deps   []string
@@ -2411,9 +2410,7 @@ func runStateActive(state dashboard.NodeState) bool {
 	return !workflow.IsFinalJobState(string(state))
 }
 
-// activityJobActive is the web dashboard's liveness predicate for a job row. It
-// moved here with #1753: it used to live beside the deleted TUI's Activity page,
-// which was its other caller.
+// activityJobActive is the web dashboard's liveness predicate for a job row.
 func activityJobActive(state string) bool {
 	return state == "queued" || state == "running"
 }

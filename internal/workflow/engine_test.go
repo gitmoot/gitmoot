@@ -4383,8 +4383,8 @@ func TestEngineDelegationRequestThreadsEphemeralSpec(t *testing.T) {
 	if request.Ephemeral != spec {
 		t.Fatalf("request.Ephemeral = %+v, want the delegation spec", request.Ephemeral)
 	}
-	// The synthetic agent name replaces the (empty) delegation agent and carries
-	// the TUI filter infix.
+	// The synthetic agent name replaces the empty delegation agent and carries
+	// the registry-filtering infix.
 	if !strings.Contains(request.Agent, "-ephemeral-") {
 		t.Fatalf("request.Agent = %q, want it to contain %q", request.Agent, "-ephemeral-")
 	}

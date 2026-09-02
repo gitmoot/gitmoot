@@ -374,8 +374,6 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		// always resets the streak even when the self-reported summary repeats.
 		NonProgressStreak:  nonProgressStreak,
 		LastProgressDigest: digest,
-		// Inherit the coordinator's cockpit settings so the continuation renders
-		// its pane under the same workspace/session as the rest of the tree.
 	}
 	if err := e.enqueue(ctx, request); err != nil {
 		return fmt.Errorf("enqueue continuation for %q: %w", parentJob.ID, err)

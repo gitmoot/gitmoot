@@ -872,9 +872,9 @@ func validateEphemeralSpec(delegationID string, action string, spec *EphemeralSp
 
 // ephemeralAgentName derives the synthetic agent name for an ephemeral delegation
 // child from the delegation id and parent job id. The name always contains the
-// literal infix "-ephemeral-" so the TUI can filter ephemeral workers off that
-// marker, and the trailing short hash of (parentJobID+delegationID) keeps the name
-// stable and unique per (parent, delegation) pair.
+// literal infix "-ephemeral-" so registry listings can exclude transient workers,
+// and the trailing short hash of (parentJobID+delegationID) keeps the name stable
+// and unique per (parent, delegation) pair.
 func ephemeralAgentName(delegationID, parentJobID string) string {
 	return slugForName(delegationID) + "-ephemeral-" + shortHash(parentJobID+delegationID)
 }

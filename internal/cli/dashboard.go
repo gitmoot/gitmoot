@@ -95,7 +95,7 @@ type dashboardAgent struct {
 	Runtime string `json:"runtime"`
 	Role    string `json:"role,omitempty"`
 	Health  string `json:"health,omitempty"`
-	// templateID feeds the TUI's agent detail; unexported so the --json output
+	// templateID feeds the web agent detail; unexported so the --json output
 	// stays byte-identical.
 	templateID string
 }
@@ -110,9 +110,8 @@ type dashboardSession struct {
 	// keeps the --json shape byte-identical for healthy sessions (no new key).
 	Stale bool `json:"stale,omitempty"`
 
-	// Detail fields shown only in the interactive session detail view. They are
-	// unexported so the --json/--plain output stays byte-stable (mirrors how
-	// dashboardAgent.templateID is carried).
+	// Detail fields shown only in the web session detail. They are unexported so
+	// the --json output stays byte-stable (mirrors dashboardAgent.templateID).
 	sessionType string
 	role        string
 	templateID  string
@@ -192,8 +191,7 @@ func runDashboard(args []string, stdout, stderr io.Writer) int {
 		return runDashboardWeb(*home, *webAddr, stdout, stderr)
 	}
 
-	// Everything else prints the styled one-shot snapshot. The interactive TUI
-	// that used to run here on a terminal was deleted with #1753.
+	// Everything else prints the styled one-shot snapshot.
 	paths, err := initializedPaths(*home)
 	if err != nil {
 		fmt.Fprintf(stderr, "dashboard: %v\n", err)
@@ -437,9 +435,9 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 			}
 			snapshot.jobRows = append(snapshot.jobRows, row)
 		}
-		// Newest-first for the interactive Jobs list (ISO timestamps sort
-		// lexically; id breaks ties deterministically). jobRows is unexported and
-		// feeds only the TUI, so the --json/--plain aggregate stays byte-stable.
+		// Newest-first for dashboard run listings (ISO timestamps sort lexically;
+		// id breaks ties deterministically). jobRows is unexported, so the --json
+		// aggregate stays byte-stable.
 		sort.SliceStable(snapshot.jobRows, func(i, j int) bool {
 			a, b := snapshot.jobRows[i], snapshot.jobRows[j]
 			if a.UpdatedAt != b.UpdatedAt {
