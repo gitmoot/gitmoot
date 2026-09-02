@@ -102,6 +102,67 @@ func readDirectiveTTLObligation(t *testing.T, store *db.Store, id int64) db.OrgD
 	return db.OrgDirectiveObligation{}
 }
 
+func TestEvaluateOrgDirectiveTTLsParksMalformedDirectiveOnce(t *testing.T) {
+	home := t.TempDir()
+	cfg := writeDirectiveTTLConfig(t, home, "supervisor", 10*time.Minute, 0, 3)
+	store := openDirectiveTTLStore(t, home)
+	defer store.Close()
+	malformed, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+		WorkflowID: "release/ttl",
+		Author:     "sender",
+		Body:       "[org:directive to=worker from=sender] missing-wf",
+		Repo:       "gitmoot/gitmoot",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := seedDirectiveTTLNote(t, store, "positive control", 0, false)
+	now := time.Now().UTC().Add(20 * time.Minute)
+	var output bytes.Buffer
+
+	for range 2 {
+		if err := evaluateOrgDirectiveTTLs(context.Background(), store, &recordingSink{}, cfg, &output, now, directiveTTLDependencies{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := strings.Count(output.String(), "parked: malformed directive marker"); got != 1 {
+		t.Fatalf("park log count = %d, want 1; output=%q", got, output.String())
+	}
+	open, err := store.ListOpenOrgDirectiveObligations(context.Background(), 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 1 || open[0].ID != valid.ID {
+		t.Fatalf("open directives = %+v, want only positive-control directive %d", open, valid.ID)
+	}
+	parked, err := store.ListParkedOrgDirectives(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parked) != 1 || parked[0].ID != malformed.ID || parked[0].ParkedAt == "" || parked[0].ParkedReason != "malformed directive marker" {
+		t.Fatalf("parked directives = %+v, want malformed directive %d with durable reason", parked, malformed.ID)
+	}
+	unparked, err := store.UnparkOrgDirectivesForRole(context.Background(), "worker", now.Add(time.Minute))
+	if err != nil || unparked != 0 {
+		t.Fatalf("direct role unpark = %d, %v; want malformed park retained", unparked, err)
+	}
+	if err := store.UpsertOrgRoleArchived(context.Background(), db.OrgRoleArchived{
+		Role: "worker", ArchivedAt: now.Format(time.RFC3339Nano), ArchivedBy: "test", ObservedAt: now.Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	unparked, err = store.UnarchiveOrgSeatTransition(context.Background(), "worker", now.Add(2*time.Minute))
+	if err != nil || unparked != 0 {
+		t.Fatalf("atomic role unarchive = %d, %v; want malformed park retained", unparked, err)
+	}
+	if err := evaluateOrgDirectiveTTLs(context.Background(), store, &recordingSink{}, cfg, &output, now.Add(3*time.Minute), directiveTTLDependencies{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(output.String(), "parked: malformed directive marker"); got != 1 {
+		t.Fatalf("park log count after role unarchive = %d, want 1; output=%q", got, output.String())
+	}
+}
+
 func TestDirectiveTTLNudgesOncePerInterval(t *testing.T) {
 	home := t.TempDir()
 	cfg := writeDirectiveTTLConfig(t, home, "supervisor", 10*time.Minute, 0, 3)
