@@ -69,7 +69,7 @@ func TestEnsureTemplateRemoteSectionAppendsThenSetRoundTrips(t *testing.T) {
 	// default config (the other sections stay intact so SetConfigScalar's
 	// post-edit validation of every parser still passes).
 	full := DefaultConfig(paths)
-	stripped := full[:strings.Index(full, "[template_remote]")] + full[strings.Index(full, "[skillopt] is"):]
+	stripped := full[:strings.Index(full, "[template_remote]")] + full[strings.Index(full, "[pipeline_remote] is"):]
 	if strings.Contains(stripped, "[template_remote]") {
 		t.Fatalf("failed to strip [template_remote] from default config")
 	}

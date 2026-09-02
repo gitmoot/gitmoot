@@ -29,10 +29,9 @@ Smoke checks:
 ```sh
 curl -fsS https://gitmoot.io/docs/intro >/dev/null
 curl -fsS https://gitmoot.io/docs/reference/cli | rg 'gitmoot dashboard|agent run|interactive'
-curl -fsS https://gitmoot.io/docs/workflows/skillopt-train-workflow | rg 'train init|train recover|gitmoot-skillopt'
 curl -fsS https://gitmoot.io/docs/release-notes/v0.3.0-beta.1 | rg 'v0.3.0-beta.1|dashboard'
-curl -fsS https://gitmoot.io/llms.txt | rg 'SkillOpt|Dashboard|Release Notes'
-curl -fsS https://gitmoot.io/llms-full.txt | rg 'skillopt-train-workflow|CLI.md|release-notes'
+curl -fsS https://gitmoot.io/llms.txt | rg 'Dashboard|Release Notes'
+curl -fsS https://gitmoot.io/llms-full.txt | rg 'CLI.md|release-notes'
 ```
 
 ## Daemon Restart Call Spike

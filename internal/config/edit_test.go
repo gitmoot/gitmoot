@@ -19,8 +19,8 @@ template = "gitmoot-plan-and-goal"
 max_background = 4
 idle_timeout = "10m"
 
-[feedback]
-repo = "owner/feedback"
+[template_remote]
+repo = "owner/templates"
 `
 
 func editTestPaths(t *testing.T, contents string) Paths {
@@ -55,7 +55,7 @@ func TestSetConfigScalarPreservesCommentsAndOtherKeys(t *testing.T) {
 		"# the planner runs ask jobs",
 		`template = "gitmoot-plan-and-goal"`,
 		`idle_timeout = "10m"`,
-		`repo = "owner/feedback"`,
+		`repo = "owner/templates"`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("lost %q after edit:\n%s", want, got)
@@ -73,12 +73,12 @@ func TestSetConfigScalarPreservesCommentsAndOtherKeys(t *testing.T) {
 
 func TestSetConfigScalarStringValue(t *testing.T) {
 	paths := editTestPaths(t, editFixture)
-	if err := SetConfigScalar(paths, []string{"feedback", "repo"}, StringScalar("owner/other")); err != nil {
+	if err := SetConfigScalar(paths, []string{"template_remote", "repo"}, StringScalar("owner/other")); err != nil {
 		t.Fatalf("SetConfigScalar: %v", err)
 	}
-	repo, err := LoadDefaultFeedbackRepo(paths)
-	if err != nil || repo != "owner/other" {
-		t.Fatalf("feedback repo = %q (err %v)", repo, err)
+	remote, err := LoadTemplateRemote(paths)
+	if err != nil || remote.Repo != "owner/other" {
+		t.Fatalf("template remote repo = %q (err %v)", remote.Repo, err)
 	}
 }
 
@@ -105,21 +105,6 @@ func TestSetConfigScalarRevertsOnInvalidResult(t *testing.T) {
 	after, _ := os.ReadFile(paths.ConfigFile)
 	if string(after) != string(original) {
 		t.Fatalf("file not reverted after invalid edit:\n%s", string(after))
-	}
-}
-
-// TestValidateConfigFilePinsIndirectSkillOptPolicyCoverage pins the intentional
-// transitive dependency validateConfigFile -> LoadSkillOptABPolicy ->
-// LoadSkillOptPolicy. If the AB loader is later split or inlined, this guard must
-// fail rather than silently orphan validation for the rest of [skillopt].
-func TestValidateConfigFilePinsIndirectSkillOptPolicyCoverage(t *testing.T) {
-	paths := editTestPaths(t, editFixture+`
-[skillopt]
-deterministic_checkers = ["diff_size", "orphaned_checker"]
-`)
-	err := validateConfigFile(paths)
-	if err == nil || !strings.Contains(err.Error(), `unknown deterministic checker "orphaned_checker"`) {
-		t.Fatalf("validateConfigFile error = %v, want transitive checker validation", err)
 	}
 }
 

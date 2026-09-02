@@ -198,7 +198,7 @@ func TestDaemonStartBootstrapsRuntimeAuth(t *testing.T) {
 		return "", false
 	}
 	oldStart := startDaemonChildFn
-	startDaemonChildFn = func(home, poll string, workers int, watchSkillOptReviews, watchIssues bool, scheduler, repo, session string, state daemonState, workDir string) (daemonMeta, error) {
+	startDaemonChildFn = func(home, poll string, workers int, watchIssues bool, scheduler, repo, session string, state daemonState, workDir string) (daemonMeta, error) {
 		return daemonMeta{PID: 987654, LogFile: state.LogFile}, nil
 	}
 	t.Cleanup(func() {

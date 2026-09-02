@@ -2413,6 +2413,78 @@ CREATE INDEX idx_cleanup_obligations_due
 	ON cleanup_obligations(state, next_attempt_at, owner_job_id)
 	WHERE state IN ('pending', 'retryable');
 	`,
+	// #1752 removes the SkillOpt/evals/feedback optimization loop. This entry is
+	// FORWARD-ONLY, like every one above it: the slice is APPEND-ONLY, so the
+	// historical CREATE TABLEs stay exactly as written and this entry drops what they
+	// built. Every table below was written only by the loop — the audit measured the
+	// eval_*/skillopt_train_* tables last written 2026-07-08, feedback_events
+	// 2026-06-01, and zero rows ever in skillopt_bandit_arms, skillopt_binary_verdicts,
+	// skillopt_gate_runs and skillopt_judge_outcomes — and no surviving code reads or
+	// writes any of them.
+	//
+	// ORDER MATTERS. The two candidate/canary columns on agent_template_versions can
+	// only be dropped once no row still depends on the states that used them, so the
+	// reconciliation runs FIRST:
+	//
+	//  1. Any agent_templates.latest_version_id pointing at a `pending`/`canary` row is
+	//     repointed at that template's live `current` version. Without this the
+	//     surviving read path (GetLatestAgentTemplateVersion, `@latest`) would keep
+	//     resolving a version that is about to become terminal.
+	//  2. Every remaining `pending`/`canary` version becomes `rejected`, NOT
+	//     `superseded`: `superseded` is the one state RevertAgentTemplateVersion
+	//     accepts, so reusing it here would let a never-reviewed candidate be reverted
+	//     into `current` after the review layer that gated it is gone. `rejected` is
+	//     terminal for every surviving path.
+	//  3. current_version_id needs no reconciliation: a canary never held it (the
+	//     champion stays current for the whole canary window) and a pending candidate
+	//     never held it either.
+	//
+	// The partial index goes because the `canary` state it indexed no longer exists.
+	// created_repos is deliberately NOT dropped: its rows name real GitHub repositories
+	// gitmoot created for training runs, some of which may still exist un-cleaned, so
+	// discarding that record is a separate decision from deleting the loop's code.
+	`
+UPDATE agent_templates
+SET latest_version_id = COALESCE((
+		SELECT v.id
+		FROM agent_template_versions v
+		WHERE v.template_id = agent_templates.id AND v.state = 'current'
+		ORDER BY v.version DESC
+		LIMIT 1
+	), ''),
+	updated_at = CURRENT_TIMESTAMP
+WHERE latest_version_id IN (
+	SELECT id FROM agent_template_versions WHERE state IN ('pending', 'canary')
+);
+
+UPDATE agent_template_versions
+SET state = 'rejected',
+	canary_sample = 0,
+	canary_started_at = '',
+	updated_at = CURRENT_TIMESTAMP
+WHERE state IN ('pending', 'canary');
+
+DROP INDEX IF EXISTS idx_atv_canary;
+
+ALTER TABLE agent_template_versions DROP COLUMN canary_sample;
+ALTER TABLE agent_template_versions DROP COLUMN canary_started_at;
+
+DROP TABLE IF EXISTS agent_template_candidate_reviews;
+DROP TABLE IF EXISTS skillopt_train_iterations;
+DROP TABLE IF EXISTS skillopt_train_sessions;
+DROP TABLE IF EXISTS skillopt_review_watches;
+DROP TABLE IF EXISTS skillopt_judge_outcomes;
+DROP TABLE IF EXISTS skillopt_bandit_arms;
+DROP TABLE IF EXISTS skillopt_gate_runs;
+DROP TABLE IF EXISTS skillopt_binary_verdicts;
+DROP TABLE IF EXISTS skillopt_synth_items;
+DROP TABLE IF EXISTS ranked_feedback_events;
+DROP TABLE IF EXISTS feedback_events;
+DROP TABLE IF EXISTS eval_review_options;
+DROP TABLE IF EXISTS eval_review_items;
+DROP TABLE IF EXISTS eval_runs;
+DROP TABLE IF EXISTS eval_artifacts;
+	`,
 	`
 -- #1673: a human escalation round gets a DURABLE IDENTITY and a JOB-LEVEL
 -- exclusive slot, so claim, effects and receipt are settled by identity rather

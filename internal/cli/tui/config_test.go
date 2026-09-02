@@ -20,7 +20,7 @@ func configSnapshot() Snapshot {
 					{"NAME", "RUNTIME", "TEMPLATE"},
 					{"planner", "codex", "gitmoot-plan-and-goal"},
 				}},
-				{Title: "feedback", Rows: [][]string{{"repo", "owner/feedback"}}},
+				{Title: "template_remote", Rows: [][]string{{"repo", "owner/templates"}}},
 			},
 		},
 	}
@@ -53,7 +53,7 @@ func TestConfigPageRendersSections(t *testing.T) {
 		"file: /home/.gitmoot/config.toml",
 		"paths", "/home/.gitmoot/gitmoot.db",
 		"agent types", "planner", "gitmoot-plan-and-goal",
-		"feedback", "owner/feedback",
+		"template_remote", "owner/templates",
 		"e edit in $EDITOR",
 	} {
 		if !strings.Contains(view, want) {
@@ -230,8 +230,8 @@ func configEditSnapshot() Snapshot {
 					{Label: "planner · max_background", KeyPath: []string{"agents", "planner", "max_background"}, Kind: ConfigInt, Value: "4"},
 					{Label: "planner · idle_timeout", KeyPath: []string{"agents", "planner", "idle_timeout"}, Kind: ConfigDuration, Value: "10m"},
 				}},
-				{Title: "feedback", Rows: [][]string{{"repo", "owner/feedback"}}, Editable: []ConfigField{
-					{Label: "feedback · repo", KeyPath: []string{"feedback", "repo"}, Kind: ConfigText, Value: "owner/feedback"},
+				{Title: "template_remote", Rows: [][]string{{"repo", "owner/templates"}}, Editable: []ConfigField{
+					{Label: "template_remote · repo", KeyPath: []string{"template_remote", "repo"}, Kind: ConfigText, Value: "owner/templates"},
 				}},
 			},
 		},

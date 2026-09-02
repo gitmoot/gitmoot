@@ -9,7 +9,6 @@ import (
 	"hash/fnv"
 	"log"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -71,15 +70,6 @@ type Daemon struct {
 	// PollOnce auto-finalizes it gracefully (#340). 0 disables the scan, keeping
 	// behavior unchanged for trees that never use escalate_human.
 	EscalationTTL time.Duration
-	// RevertDetectionEnabled opts PollOnce into corrective revert detection (#467):
-	// when true, a polled PR whose body is `Reverts owner/repo#NN` and which is
-	// merged maps back to the ORIGINAL PR's auto-trace row and fires
-	// Workflow.HandlePullRequestReverted (best-effort) to overwrite the prior
-	// positive with a negative in place. Resolved once at construction from
-	// [skillopt].RevertDetectionEnabled() (AutoTraceEnabled AND the opt-out knob).
-	// Default false is a CHEAP SHORT-CIRCUIT: PollOnce parses NO PR body and fires
-	// nothing, so the off path is byte-identical (no new GitHub reads, no new work).
-	RevertDetectionEnabled bool
 	// ObservePermissionPolicy opts this daemon into the live-store
 	// #1484 ratchet. False is a cheap short-circuit with no inventory query.
 	ObservePermissionPolicy bool
@@ -253,16 +243,6 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 			if err := d.reconcileReviewingPullRequest(ctx, pull, reviewMemo); err != nil && firstErr == nil {
 				firstErr = err
 			}
-		}
-	}
-	// Corrective revert detection (#467): OFF-BY-DEFAULT cheap short-circuit. When
-	// disabled, the scan never runs — no extra GitHub read, no PR body parsed, no
-	// fire — so the off path is byte-identical. When enabled it lists closed PRs
-	// (a merged GitHub Revert-button PR is closed, not in the "open" set above) and
-	// fires the corrective harvest best-effort; an error never aborts the poll.
-	if d.RevertDetectionEnabled {
-		if err := d.harvestRevertsOnce(ctx); err != nil && firstErr == nil {
-			firstErr = err
 		}
 	}
 	// Permission-policy visibility is warn-only and best-effort. An observation
@@ -2487,126 +2467,6 @@ func (d Daemon) lookupPullRequestTask(ctx context.Context, repoFullName string, 
 	return task, nil
 }
 
-// revertBodyPattern matches the GitHub Revert-button PR body anchor (#467):
-// `Reverts owner/repo#NN` or `Reverts #NN`. The owner/repo segment is captured so
-// harvestRevertIfAny can reject a CROSS-REPO reference (the harvester's item_id is
-// repo-scoped and the daemon polls one repo). Case-insensitive on "Reverts" so a
-// hand-edited "reverts #N" still matches.
-var revertBodyPattern = regexp.MustCompile(`(?i)\breverts\s+(?:([\w.-]+/[\w.-]+))?#(\d+)\b`)
-
-// revertedOriginalPR parses a polled PR's body for the GitHub Revert-button anchor
-// and returns the ORIGINAL (reverted) PR number when the body references a
-// SAME-REPO PR (#467). It returns ok=false for a body with no `Reverts #NN`
-// anchor, a malformed/unparseable number, or a CROSS-REPO reference (an
-// owner/repo prefix that is not d.Repo) — so a foreign Reverts never maps onto
-// this repo's item_id. It is a pure string parse with no side effects, kept
-// isolated for unit testing.
-func (d Daemon) revertedOriginalPR(pull github.PullRequest) (int, bool) {
-	body := strings.TrimSpace(pull.Body)
-	if body == "" {
-		return 0, false
-	}
-	match := revertBodyPattern.FindStringSubmatch(body)
-	if match == nil {
-		return 0, false
-	}
-	if repoRef := strings.TrimSpace(match[1]); repoRef != "" {
-		// An explicit owner/repo prefix must match the polled repo exactly; a
-		// cross-repo Reverts reference does not map onto this repo's item_id.
-		if !strings.EqualFold(repoRef, d.Repo.FullName()) {
-			return 0, false
-		}
-	}
-	number, err := strconv.Atoi(match[2])
-	if err != nil || number <= 0 {
-		return 0, false
-	}
-	return number, true
-}
-
-// harvestRevertsOnce scans recently-closed PRs for merged GitHub Revert-button
-// PRs and fires the corrective OutcomeReverted harvest for each (#467). It is
-// called from PollOnce ONLY when RevertDetectionEnabled, so the off path issues no
-// extra GitHub read and parses no bodies (byte-identical). A merged revert PR is
-// closed (the "open" loop above never sees it), so the merged-revert anchor lives
-// here in the closed set.
-//
-// BOUNDED COST: it uses ListRecentClosedPullRequests (one page of the
-// most-recently-updated closed PRs, no --paginate) rather than walking the repo's
-// entire closed-PR history every tick. A freshly-merged revert is recently
-// updated, so it lands at the top of that window; steady-state polling is a single
-// fixed GitHub request, not O(all-closed-PRs). Best-effort: a list error returns
-// up for firstErr collection but per-PR harvest errors are collected and never
-// abort the scan.
-func (d Daemon) harvestRevertsOnce(ctx context.Context) error {
-	if d.Workflow == nil {
-		return nil
-	}
-	closed, err := d.GitHub.ListRecentClosedPullRequests(ctx, d.Repo)
-	if err != nil {
-		return err
-	}
-	var firstErr error
-	for _, pull := range closed {
-		if err := d.harvestRevertIfAny(ctx, pull); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
-}
-
-// harvestRevertIfAny fires the corrective OutcomeReverted harvest for the ORIGINAL
-// PR a (now-merged) revert PR undid (#467). It is called per closed PR from
-// harvestRevertsOnce ONLY when RevertDetectionEnabled, so the off path parses no
-// bodies. It
-// is best-effort and FAIL-SAFE: it fires ONLY when the revert PR itself is MERGED
-// (so a not-yet-landed revert never corrects), the engine carries a harvester
-// (nil-safe HandlePullRequestReverted), and the body parses to a same-repo
-// original PR number. Errors from the engine are returned for collection into the
-// poll's firstErr but never abort the loop (PollOnce calls it best-effort), and
-// HandlePullRequestReverted itself swallows the actual harvest error.
-func (d Daemon) harvestRevertIfAny(ctx context.Context, pull github.PullRequest) error {
-	if d.Workflow == nil {
-		return nil
-	}
-	// Fire on a LANDED revert only: a merged revert PR (or a closed-as-merged one).
-	if !revertPullMerged(pull) {
-		return nil
-	}
-	original, ok := d.revertedOriginalPR(pull)
-	if !ok {
-		return nil
-	}
-	// Best-effort attribution hints: resolve the original PR's branch/task so
-	// implementJobForTask's sameTask has the strongest possible match. A lookup
-	// failure degrades to the Repo+PR-only match (still correct via sameTask).
-	event := workflow.RevertEvent{
-		Repo:                d.Repo.FullName(),
-		OriginalPullRequest: original,
-	}
-	if stored, err := d.Store.GetPullRequest(ctx, d.Repo.FullName(), int64(original)); err == nil {
-		event.OriginalBranch = stored.HeadBranch
-		if task, terr := d.lookupPullRequestTask(ctx, d.Repo.FullName(), stored.HeadBranch); terr == nil {
-			event.OriginalTaskID = task.ID
-		}
-	}
-	return d.Workflow.HandlePullRequestReverted(ctx, event)
-}
-
-// revertPullMerged reports whether a polled revert PR has LANDED, so the corrective
-// overwrite only fires on a merged revert (#467).
-//
-// CRITICAL: these PRs come from the GitHub LIST endpoint
-// (ListPullRequests state="closed"), which reports merged PRs as state="closed"
-// and OMITS the top-level `merged` boolean — `merged` is computed only on the
-// single-PR GET endpoint. The list's ONLY merged signal is `merged_at`, so the
-// non-empty MergedAt check is the load-bearing one against real GitHub data; the
-// Merged flag and "merged" state string are kept only as belt-and-suspenders for
-// the single-PR shape and never fire on a list item.
-func revertPullMerged(pull github.PullRequest) bool {
-	return pullRequestListedAsMerged(pull)
-}
-
 func (d Daemon) workflowReviewers(ctx context.Context) ([]string, error) {
 	if d.Workflow != nil && len(d.Workflow.RequiredReviewers) > 0 {
 		return append([]string{}, d.Workflow.RequiredReviewers...), nil
@@ -3274,10 +3134,6 @@ func (d Daemon) enqueueJob(ctx context.Context, request workflow.JobRequest) (db
 	if !errors.Is(err, sql.ErrNoRows) {
 		return db.Job{}, false, err
 	}
-	// Gate the #484 canary routing seam on the SAME policy the daemon's engine
-	// (and its regression comparator) is gated on, so a stranded canary is never
-	// sampled once the knob is off. The engine carries the resolved flag.
-	canaryEnabled := d.Workflow != nil && d.Workflow.CanaryEnabled
 	var runtimeDefaultModel func(string) string
 	if d.Workflow != nil {
 		runtimeDefaultModel = d.Workflow.RuntimeDefaultModel
@@ -3289,7 +3145,6 @@ func (d Daemon) enqueueJob(ctx context.Context, request workflow.JobRequest) (db
 		orgPolicy = d.Workflow.OrgPolicy
 	}
 	mailbox := workflow.NewMailbox(d.Store, workflow.UnavailableDeliveryWorktreeResolver("daemon comment enqueue"))
-	mailbox.CanaryEnabled = canaryEnabled
 	mailbox.RuntimeDefaultModel = runtimeDefaultModel
 	mailbox.RequireWorkflowPolicy = requireWorkflowPolicy
 	mailbox.OrgPolicy = orgPolicy

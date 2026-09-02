@@ -2,7 +2,6 @@ package config
 
 import (
 	"os"
-	"slices"
 	"strings"
 	"testing"
 )
@@ -51,40 +50,15 @@ func TestSaveHeartbeatCreateRoundTrip(t *testing.T) {
 	}
 }
 
-func TestSaveHeartbeatPreservesLegacyDeterministicCheckerSyntax(t *testing.T) {
-	const legacy = "deterministic_checkers = diff_size,duplication,lint,complexity"
-	paths := newHeartbeatEditPaths(t, "\n[skillopt]\n"+legacy+"\n")
-	if err := SaveHeartbeat(paths, Heartbeat{
-		Agent: "probe", Name: "compat", Repo: "gitmoot/gitmoot", Interval: "1h", Action: "ask", Prompt: "check",
-	}); err != nil {
-		t.Fatalf("SaveHeartbeat: %v", err)
-	}
-	contents, err := os.ReadFile(paths.ConfigFile)
-	if err != nil {
-		t.Fatalf("read config: %v", err)
-	}
-	if count := strings.Count(string(contents), legacy); count != 1 {
-		t.Fatalf("legacy checker syntax count = %d, want 1; config:\n%s", count, contents)
-	}
-	policy, err := LoadSkillOptPolicy(paths)
-	if err != nil {
-		t.Fatalf("LoadSkillOptPolicy: %v", err)
-	}
-	want := []string{"diff_size", "duplication", "lint", "complexity"}
-	if got := policy.ResolvedDeterministicCheckers(); !slices.Equal(got, want) {
-		t.Fatalf("resolved checkers = %v, want %v", got, want)
-	}
-}
-
 func TestSaveHeartbeatParseErrorNamesUnrelatedSection(t *testing.T) {
-	paths := newHeartbeatEditPaths(t, "\n[skillopt]\npace_alpha = invalid\n")
+	paths := newHeartbeatEditPaths(t, "\n[admission]\nmax_memory_gb = invalid\n")
 	err := SaveHeartbeat(paths, Heartbeat{
 		Agent: "probe", Name: "diagnostic", Repo: "gitmoot/gitmoot", Interval: "1h", Action: "ask", Prompt: "check",
 	})
 	if err == nil {
 		t.Fatal("expected strict TOML parse error")
 	}
-	for _, want := range []string{"[skillopt]", "not the [agents.probe.heartbeats.diagnostic] section being edited", "remedy"} {
+	for _, want := range []string{"[admission]", "not the [agents.probe.heartbeats.diagnostic] section being edited", "remedy"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("SaveHeartbeat error = %q, want %q", err, want)
 		}

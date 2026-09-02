@@ -119,20 +119,3 @@ gitmoot update --restart-daemon
 Restart the Gitmoot daemon after `kimi login` so it inherits the logged-in
 session. The Kimi runtime is a first-class adapter alongside Codex and Claude
 Code; it does not use the `gitmoot plugin install` discovery surface.
-
-## SkillOpt Optimizer
-
-Gitmoot's SkillOpt train workflow invokes a separate Python optimizer only at
-optimizer handoff. Install and preflight it before running optimizer-backed
-training:
-
-```sh
-python3 -m pip install --user pipx
-python3 -m pipx ensurepath
-pipx install https://github.com/jerryfane/gitmoot-skillopt/releases/download/v0.4.2/gitmoot_skillopt-0.4.2-py3-none-any.whl
-gitmoot-skillopt --version
-gitmoot-skillopt optimize --help
-```
-
-If you install it in a virtualenv, pass the executable with
-`gitmoot skillopt train continue --skillopt-bin /path/to/gitmoot-skillopt`.

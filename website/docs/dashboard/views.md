@@ -189,10 +189,9 @@ recent success rate and average duration.
 Route: `/learning` (opens `/learning/skills`; second tab `/learning/knowledge`)
 
 Learning is one nav item with two tabs telling one story: what the agents are
-learning. **Skills** is the SkillOpt evolution overview — one row per agent
-template with its version history as an inline score-trend sparkline, the
-current version, any active canary, and pending candidates (each expandable to
-a copy-paste `gitmoot skillopt candidate promote` command). Clicking a row
+learning. **Skills** is the agent-template overview — one row per agent
+template with its version history and the version it currently resolves to.
+Clicking a row
 jumps to that agent's detail panel. The memory fact galaxy that used to live
 here as a second tab is now the top-level **Brain** view (below) —
 one lane per repo scope, each lane holding its facts as a wiki-link
@@ -375,21 +374,15 @@ required. Three buckets:
   **failed result checks** — the deterministic checks its result failed, each with
   the question asked and the evaluator's explanation, plus the home-wide
   `[workflow] result_checks` policy in force (`warn` or `block`).
-- **Pending synth approvals** — synthesized SkillOpt review items awaiting the
-  human approval gate (the challenger/weak-vs-strong items, each with its question,
-  the weak→strong agents, the judge, and the score gap).
-- **Candidates awaiting promotion** — agent-template candidate versions in the
-  `pending` state, waiting to be promoted (version number and its review score).
-
 Human approval stays **explicit** for these ambiguous or high-stakes evaluator
 outcomes: the view surfaces them and links to the action, but nothing is auto-approved.
 
-The same failed-check and binary-verdict payloads back the planned Slack/media
-bridge ([#519](https://github.com/gitmoot/gitmoot/issues/519)), which needs
-compact human-action status to post into a thread. Two read-only endpoints expose
-them for bridge consumers: `GET /api/job/{id}/checks` (a job's failed result checks
-+ policy mode) and `GET /api/run/{id}/verdicts` (a SkillOpt run's per-question
-binary verdicts with pass/fail counts).
+The failed-check payload backs the planned Slack/media bridge
+([#519](https://github.com/gitmoot/gitmoot/issues/519)), which needs compact
+human-action status to post into a thread. A read-only endpoint exposes it for
+bridge consumers: `GET /api/job/{id}/checks` (a job's failed result checks +
+policy mode). `GET /api/run/{id}/verdicts` still answers for interface
+compatibility but always returns zero verdicts since #1752.
 
 ## Comms
 
@@ -415,7 +408,7 @@ The read-only effective-configuration viewer. Every known knob is listed by
 config section with its current value, its default, and a `default` /
 `overridden` badge (overridden values stand out); boolean feature flags render
 as ON/OFF chips, and the off-by-default feature flags (memory distillation,
-`groom_split_llm`, SkillOpt auto-promote, chat auto-respond, …) are gathered
+`groom_split_llm`, chat auto-respond, …) are gathered
 into a highlighted section at the top so you can see at a glance what is
 enabled on this install. Below the knobs, a per-agent table shows each
 registered or configured agent's runtime, model, capabilities, autonomy

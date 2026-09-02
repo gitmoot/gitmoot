@@ -10,9 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/daemon"
@@ -773,7 +771,6 @@ func runDaemonMergeGateTerminalPolls(t *testing.T, options terminalPollOptions) 
 	postMergeGit := &terminalPollMergeGateGit{}
 	worktrees := &terminalPollWorktreeCleaner{}
 	nextTasks := &terminalPollNextTasks{}
-	effects := newTerminalPollEffects()
 	home := daemonMergeGateLiveOrgHome(t)
 	gate := daemonMergeGate{
 		Store: store, GitHub: mergeClient, FallbackCheckout: checkout, Runner: mergeRunner,
@@ -782,8 +779,6 @@ func runDaemonMergeGateTerminalPolls(t *testing.T, options terminalPollOptions) 
 	}
 	engine := workflow.Engine{
 		Store: store, MergeGate: gate, RequiredReviewers: []string{"reviewer"},
-		OutcomeHarvester: effects, ReviewLegDispatcher: effects,
-		DeterministicCheckerDispatcher: effects, HardVerifierDispatcher: effects,
 	}
 	poller := daemon.Daemon{Repo: repo, Store: store, GitHub: gh, Workflow: &engine}
 
@@ -865,10 +860,9 @@ func runDaemonMergeGateTerminalPolls(t *testing.T, options terminalPollOptions) 
 			t.Fatalf("disabled open reconciliation = %+v err=%v, want incomplete owner %s", reconciliation, reconciliationErr, taskID)
 		}
 		if mergeRunner.mergeCommands != 1 || len(worktrees.paths) != 0 ||
-			len(postMergeGit.updates) != 0 || len(nextTasks.taskIDs) != 0 ||
-			len(effects.snapshot().harvestKinds) != 0 {
-			t.Fatalf("disabled open effects merges=%d removals=%v updates=%v continuations=%v engine=%+v, want no second merge or terminal effects",
-				mergeRunner.mergeCommands, worktrees.paths, postMergeGit.updates, nextTasks.taskIDs, effects.snapshot())
+			len(postMergeGit.updates) != 0 || len(nextTasks.taskIDs) != 0 {
+			t.Fatalf("disabled open effects merges=%d removals=%v updates=%v continuations=%v, want no second merge or terminal effects",
+				mergeRunner.mergeCommands, worktrees.paths, postMergeGit.updates, nextTasks.taskIDs)
 		}
 		return
 	}
@@ -941,12 +935,6 @@ func runDaemonMergeGateTerminalPolls(t *testing.T, options terminalPollOptions) 
 	if mergeRunner.mergeCommands != 1 {
 		t.Fatalf("terminal merge commands = %d, want 1 total", mergeRunner.mergeCommands)
 	}
-	effects.waitForDetached(t)
-	effectSnapshot := effects.snapshot()
-	if !reflect.DeepEqual(effectSnapshot.harvestKinds, []workflow.OutcomeKind{workflow.OutcomeMerged}) ||
-		effectSnapshot.reviewCalls != 1 || effectSnapshot.checkerCalls != 1 || effectSnapshot.verifierCalls != 1 {
-		t.Fatalf("terminal engine effects = %+v, want one merge harvest and one of each detached leg", effectSnapshot)
-	}
 	taskEvents := terminalPollTaskEvents(t, store, taskID)
 	additionalEvents := []db.TaskEvent(nil)
 	if options.withAdditionalReadyTask {
@@ -998,10 +986,9 @@ func runDaemonMergeGateTerminalPolls(t *testing.T, options terminalPollOptions) 
 	if mergeRunner.mergeCommands != 1 ||
 		!reflect.DeepEqual(worktrees.paths, []string{worktreePath}) ||
 		!reflect.DeepEqual(postMergeGit.updates, []string{"origin/main"}) ||
-		!reflect.DeepEqual(nextTasks.taskIDs, []string{taskID}) ||
-		!reflect.DeepEqual(effects.snapshot(), effectSnapshot) {
-		t.Fatalf("stable effects merges=%d removals=%v updates=%v continuations=%v engine=%+v",
-			mergeRunner.mergeCommands, worktrees.paths, postMergeGit.updates, nextTasks.taskIDs, effects.snapshot())
+		!reflect.DeepEqual(nextTasks.taskIDs, []string{taskID}) {
+		t.Fatalf("stable effects merges=%d removals=%v updates=%v continuations=%v",
+			mergeRunner.mergeCommands, worktrees.paths, postMergeGit.updates, nextTasks.taskIDs)
 	}
 }
 
@@ -1141,81 +1128,4 @@ type terminalPollNextTasks struct {
 func (n *terminalPollNextTasks) EnqueueNextTask(_ context.Context, taskID string) error {
 	n.taskIDs = append(n.taskIDs, taskID)
 	return nil
-}
-
-type terminalPollEffectSnapshot struct {
-	harvestKinds  []workflow.OutcomeKind
-	reviewCalls   int
-	checkerCalls  int
-	verifierCalls int
-}
-
-type terminalPollEffects struct {
-	mu            sync.Mutex
-	harvestKinds  []workflow.OutcomeKind
-	reviewCalls   int
-	checkerCalls  int
-	verifierCalls int
-	reviewDone    chan struct{}
-	checkerDone   chan struct{}
-	verifierDone  chan struct{}
-}
-
-func newTerminalPollEffects() *terminalPollEffects {
-	return &terminalPollEffects{
-		reviewDone: make(chan struct{}, 1), checkerDone: make(chan struct{}, 1), verifierDone: make(chan struct{}, 1),
-	}
-}
-
-func (e *terminalPollEffects) Harvest(_ context.Context, _ db.Job, _ workflow.JobPayload, outcome workflow.Outcome) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.harvestKinds = append(e.harvestKinds, outcome.Kind)
-	return nil
-}
-
-func (e *terminalPollEffects) Review(context.Context, db.Job, workflow.JobPayload, string) (workflow.Outcome, bool, error) {
-	e.mu.Lock()
-	e.reviewCalls++
-	e.mu.Unlock()
-	e.reviewDone <- struct{}{}
-	return workflow.Outcome{}, false, nil
-}
-
-func (e *terminalPollEffects) Check(context.Context, db.Job, workflow.JobPayload, string) (workflow.Outcome, bool, error) {
-	e.mu.Lock()
-	e.checkerCalls++
-	e.mu.Unlock()
-	e.checkerDone <- struct{}{}
-	return workflow.Outcome{}, false, nil
-}
-
-func (e *terminalPollEffects) Verify(context.Context, db.Job, workflow.JobPayload, string) (workflow.Outcome, bool, error) {
-	e.mu.Lock()
-	e.verifierCalls++
-	e.mu.Unlock()
-	e.verifierDone <- struct{}{}
-	return workflow.Outcome{}, false, nil
-}
-
-func (e *terminalPollEffects) waitForDetached(t *testing.T) {
-	t.Helper()
-	for name, done := range map[string]<-chan struct{}{
-		"review": e.reviewDone, "checker": e.checkerDone, "verifier": e.verifierDone,
-	} {
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatalf("timed out waiting for detached %s effect", name)
-		}
-	}
-}
-
-func (e *terminalPollEffects) snapshot() terminalPollEffectSnapshot {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return terminalPollEffectSnapshot{
-		harvestKinds: append([]workflow.OutcomeKind(nil), e.harvestKinds...),
-		reviewCalls:  e.reviewCalls, checkerCalls: e.checkerCalls, verifierCalls: e.verifierCalls,
-	}
 }

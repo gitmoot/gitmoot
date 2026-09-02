@@ -81,60 +81,6 @@ type Engine struct {
 	// the #602 matcher and writes the payload hold fields), keeping the engine free of
 	// the classification coupling; it is wired only on the daemon run path.
 	BlockerDeferrer func(ctx context.Context, jobID string, cause error) (bool, error)
-	// OutcomeHarvester is the injected, best-effort, nil-by-default seam (#465,
-	// Mode A) the engine calls after a verifiable implement-job outcome transition
-	// (merge merged/blocked, review changes_requested, revert) to harvest a
-	// synthetic {score, feedback} FeedbackEvent for the job's template version. It
-	// mirrors EventSink/EscalationNotifier: optional and nil-safe (when nil — the
-	// default, no [skillopt].auto_trace_enabled — NO Outcome is constructed and
-	// Harvest is never called, so behavior is byte-identical), and best-effort (a
-	// Harvest error is swallowed and recorded as an auto_trace_harvest_failed job
-	// event, never returned up). It writes ONLY eval/feedback rows and never
-	// promotes. The concrete impl lives in internal/skillopt and is wired only in
-	// cli (daemonWorkflowEngine), keeping the engine free of skillopt coupling.
-	OutcomeHarvester OutcomeHarvester
-	// ReviewLegDispatcher is the injected, best-effort, nil-by-default seam (#469)
-	// the engine calls AFTER a merge harvest to run a CROSS-FAMILY review leg whose
-	// rubric is projected into the SAME auto-trace run as a SOFT, down-weighted,
-	// judge-tagged secondary signal. It mirrors OutcomeHarvester: optional and
-	// nil-safe (when nil — the default, no [skillopt].cross_family_review_enabled —
-	// NO review leg runs and NO review row is written, so behavior is
-	// byte-identical), and best-effort (a dispatch error is swallowed and recorded
-	// as a cross_family_review_failed job event, never returned up, so it can never
-	// block or fail a job). It runs OFF the blocking merge path. The concrete impl
-	// is wired only in cli (gated by cross_family_review_enabled AND
-	// auto_trace_enabled), keeping the engine free of runtime/skillopt coupling.
-	ReviewLegDispatcher ReviewLegDispatcher
-	// DeterministicCheckerDispatcher is the injected, best-effort, nil-by-default
-	// seam (#485) the engine calls AFTER a merge harvest to run an OBJECTIVE,
-	// non-LLM deterministic-checker leg (code duplication / lint / cyclomatic
-	// complexity tools + a pure-Go diff-size metric) whose tool-derived dimensions
-	// are projected into the SAME auto-trace run as a THIRD coexisting signal,
-	// distinct from the verifiable floor and the subjective cross-family review. It
-	// mirrors ReviewLegDispatcher EXACTLY: optional and nil-safe (when nil — the
-	// default, no [skillopt].deterministic_checkers_enabled — NO checker leg runs
-	// and NO checker row is written, byte-identical), DETACHED off the blocking
-	// merge path (a wedged tool can never stall AdvanceJob), and best-effort (a
-	// dispatch error is swallowed and recorded as a deterministic_checkers_failed
-	// job event, never returned up). The concrete impl is wired only in cli (gated
-	// by deterministic_checkers_enabled AND auto_trace_enabled), keeping the engine
-	// free of subprocess/skillopt coupling.
-	DeterministicCheckerDispatcher DeterministicCheckerDispatcher
-	// HardVerifierDispatcher is the injected, best-effort, nil-by-default seam (#474)
-	// the engine calls AFTER a merge harvest to run the deterministic HARD-verifier
-	// tier: the operator's configured build/test/lint COMMANDS run in a FRESH clean
-	// sandbox checkout at the merged head (exit 0 == pass), producing a BINARY
-	// pass/fail verdict the harvester maps onto the authoritative EvaluatorScore.Hard.
-	// It mirrors DeterministicCheckerDispatcher EXACTLY: optional and nil-safe (when
-	// nil — the default, no [skillopt].hard_verifiers_enabled — NO verifier leg runs
-	// and NO hard row is written, byte-identical), DETACHED off the blocking merge
-	// path (a slow test suite can never stall AdvanceJob or the daemon checkoutLock),
-	// and best-effort (a dispatch error is swallowed and recorded as a
-	// hard_verifiers_failed job event, never returned up). The concrete impl is wired
-	// only in cli (gated by hard_verifiers_enabled AND auto_trace_enabled AND a
-	// non-empty command list), keeping the engine free of subprocess/skillopt/git
-	// coupling.
-	HardVerifierDispatcher HardVerifierDispatcher
 	// Home is the resolved GITMOOT_HOME root used to place per-delegation
 	// worktrees. DelegationWorktrees is the checkout-bound git client that
 	// performs the worktree-add. Both are optional: when either is unset, the
@@ -178,16 +124,6 @@ type Engine struct {
 	// cwd link cannot prove that unlinking is safe. WorktreeHasLiveProcess remains
 	// the compatibility seam for existing cleanup tests and callers.
 	WorktreeLiveness func(path string) (live bool, known bool)
-	// CanaryEnabled gates the #484 canary ROUTING seam (Mailbox.routeCanary) on the
-	// SAME [skillopt] policy.CanaryEnabled() the daemon's regression comparator
-	// (daemonOutcomeHarvesterWithCanary) is gated on, so both seams turn on/off
-	// together. It is resolved ONCE at daemon-engine construction
-	// (daemonWorkflowEngine) and propagated into every Mailbox the engine builds via
-	// mailbox(). Default false (the engine's zero value and every test/ask-path
-	// Engine) means routing is off and resolution is byte-identical — a canary row
-	// left behind by a since-disabled run is never sampled, so it can never serve
-	// traffic without the comparator that would graduate or roll it back.
-	CanaryEnabled bool
 	// DelegationTimeoutDefaults carries optional [orchestrate] default child-job
 	// timeouts. Empty fields mean unbounded. Explicit per-delegation timeout values
 	// still win, so an engine with the zero value is byte-identical to historical
@@ -310,47 +246,6 @@ type Engine struct {
 	// existing set is byte-identical. It is sourced from the host
 	// [orchestrate].max_verify_replan_attempts config at daemon startup.
 	MaxVerifyReplanAttempts int
-	// ReviewLegTimeout bounds the DETACHED cross-family review leg (#469): the
-	// review runs a live LLM adapter.Deliver that can take minutes, so it must
-	// never run unbounded. The detached goroutine's context is wrapped in this
-	// timeout so a wedged reviewer process is reaped rather than leaking forever.
-	// <= 0 means defaultReviewLegTimeout. It only matters when a ReviewLegDispatcher
-	// is wired (off by default).
-	ReviewLegTimeout time.Duration
-	// ReviewSpawner runs the detached cross-family review leg OFF the AdvanceJob /
-	// daemon-poll path so a live, possibly-wedged reviewer adapter.Deliver can never
-	// block AdvanceJob, the worker tick, or the daemon's checkoutLock. The default
-	// (nil) spawns a goroutine; tests inject a synchronous runner so the review is
-	// deterministic. It mirrors the EventSink fire-and-forget seam: the engine hands
-	// off a self-contained closure that owns its own bounded, cancellation-detached
-	// context.
-	ReviewSpawner func(func())
-	// CheckerLegTimeout bounds the DETACHED deterministic-checker leg (#485): the
-	// leg shells out to external tools (dupl/jscpd/golangci-lint/gocyclo) that can
-	// be slow, so it must never run unbounded. The detached goroutine's context is
-	// wrapped in this timeout so a wedged tool is reaped rather than leaking
-	// forever. <= 0 means defaultCheckerLegTimeout. It only matters when a
-	// DeterministicCheckerDispatcher is wired (off by default).
-	CheckerLegTimeout time.Duration
-	// CheckerSpawner runs the detached deterministic-checker leg OFF the AdvanceJob
-	// / daemon-poll path so a slow, possibly-wedged external tool can never block
-	// AdvanceJob, the worker tick, or the daemon's checkoutLock. The default (nil)
-	// spawns a goroutine; tests inject a synchronous runner so the checker leg is
-	// deterministic. It mirrors ReviewSpawner.
-	CheckerSpawner func(func())
-	// HardVerifierLegTimeout bounds the DETACHED hard-verifier leg (#474): the leg
-	// provisions a fresh sandbox and runs the operator's build/test/lint commands,
-	// which can be slow, so it must never run unbounded. The detached goroutine's
-	// context is wrapped in this timeout so a wedged verifier is reaped rather than
-	// leaking forever. <= 0 means defaultHardVerifierLegTimeout. It only matters when
-	// a HardVerifierDispatcher is wired (off by default).
-	HardVerifierLegTimeout time.Duration
-	// HardVerifierSpawner runs the detached hard-verifier leg OFF the AdvanceJob /
-	// daemon-poll path so a slow, possibly-wedged test suite can never block
-	// AdvanceJob, the worker tick, or the daemon's checkoutLock. The default (nil)
-	// spawns a goroutine; tests inject a synchronous runner so the verifier leg is
-	// deterministic. It mirrors CheckerSpawner.
-	HardVerifierSpawner func(func())
 	// Memory is the injected, off-by-default agent persistent-memory controller
 	// (#626). When set (only when at least one agent is enrolled and the global
 	// kill switch is off), the engine's Mailbox injects a "Prior learnings" block

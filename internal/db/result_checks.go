@@ -13,7 +13,7 @@ type ResultCheckFailure struct {
 
 // ResultCheckFailureRow is a persisted result-check failure as read back
 // (RecordResultCheckFailures writes one row per failed check). It is the
-// feed-forward record SkillOpt may later consume as structured feedback; nothing
+// feed-forward record a later consumer may read as structured feedback; nothing
 // consumes it tonight beyond tests and the job-detail cross-check.
 type ResultCheckFailureRow struct {
 	ID          int64
@@ -27,7 +27,7 @@ type ResultCheckFailureRow struct {
 }
 
 // RecordResultCheckFailures persists the given failed checks for a job as one row
-// per check (#526, the SkillOpt feed-forward stub). It is a pure additive write:
+// per check (#526, the feed-forward stub). It is a pure additive write:
 // the result_check_failures table is empty until [workflow] result_checks is
 // warn/block AND a result fails a check, so every existing DB and every off-mode
 // job is byte-identical. An empty slice is a no-op. Best-effort by convention at
@@ -54,7 +54,7 @@ func (s *Store) RecordResultCheckFailures(ctx context.Context, jobID, rootID, ac
 }
 
 // ListResultCheckFailures returns the persisted result-check failures for a job
-// in insertion order. It is used by tests and is the read seam a future SkillOpt
+// in insertion order. It is used by tests and is the read seam a future
 // consumer would build on.
 func (s *Store) ListResultCheckFailures(ctx context.Context, jobID string) ([]ResultCheckFailureRow, error) {
 	rows, err := s.db.QueryContext(ctx,

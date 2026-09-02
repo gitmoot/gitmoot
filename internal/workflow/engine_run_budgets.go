@@ -646,19 +646,6 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 					return err
 				}
 			}
-			// Verifiable graded negative (#465): a review asked for changes, so the
-			// implement job's diff did not pass review. Harvested AFTER requester
-			// routing and optional dispatch so a harvest error can affect neither.
-			// The fix-round count (the review round number, round 1 = first) grades severity:
-			// more rounds => a worse score.
-			e.harvestOutcomeForMergeGate(ctx, payload, Outcome{
-				Kind:        OutcomeChangesRequested,
-				Repo:        payload.Repo,
-				PullRequest: payload.PullRequest,
-				HeadSHA:     payload.HeadSHA,
-				Reason:      strings.TrimSpace(payload.Result.Summary),
-				FixRounds:   reviewRoundCount(payload.ReviewRound),
-			})
 			return nil
 		case "approved":
 			// High-risk review (#650): the native required-reviewer gate approves a PR

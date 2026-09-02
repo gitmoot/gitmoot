@@ -135,12 +135,12 @@ func TestCleanupObligationsRebuildPreservesLegacyRows(t *testing.T) {
 // test would pass on precisely the mutant it exists to kill.
 func TestMigrationsUpgradeFromPreviousReleasedVersion(t *testing.T) {
 	ctx := context.Background()
-	// The marker names THIS BRANCH's migration. It moved when #1673 merged main: the
-	// cleanup_obligations rebuild this test was written for is now part of the
-	// released prefix, and the escalation_rounds migration is the one appended last.
-	// Two branches cannot both be "last", and the ordering that matters is the one a
-	// deployed database sees - main's migration is already applied there, so this
-	// branch's must follow it.
+	// The marker names THIS BRANCH's migration, and it has moved twice as main
+	// advanced: the cleanup_obligations rebuild and then #1766's SkillOpt/evals
+	// teardown each became part of the released prefix, leaving escalation_rounds as
+	// the migration appended last. Two branches cannot both be "last", and the
+	// ordering that matters is the one a deployed database sees - main's migrations
+	// are already applied there, so this branch's must follow them.
 	const branchMigrationMarker = "CREATE UNIQUE INDEX escalation_rounds_one_unsettled"
 	branchIndex := -1
 	for index, migration := range migrations {

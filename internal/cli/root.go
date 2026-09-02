@@ -54,7 +54,6 @@ var rootCommands = []command{
 	{name: "interactive", summary: "inspect and answer interactive prompts", run: runInteractive},
 	{name: "escalation", summary: "inspect and repair blocked human-escalation rounds", run: runEscalation},
 	{name: "dashboard", summary: "show a snapshot of local Gitmoot state", run: runDashboard},
-	{name: "skillopt", summary: "export and import SkillOpt packages", run: runSkillOpt},
 	{name: "memory", summary: "inspect and measure agent persistent memory", run: runMemory},
 	{name: "pipeline", summary: "define, run, and manage declarative pipelines", run: runPipeline},
 	{name: "bridge", summary: "serve the authenticated localhost HTTP bridge", run: runBridge},

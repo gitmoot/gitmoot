@@ -72,8 +72,7 @@ func (m Model) content() string {
 		b.WriteString("\n\n")
 	}
 	// Job overlays can be entered from more than one page (Jobs, Attention), so
-	// they are dispatched once here rather than inside each page renderer; the
-	// train action overlays follow the same pattern.
+	// they are dispatched once here rather than inside each page renderer.
 	switch m.mode {
 	case modeJobDetail:
 		b.WriteString(m.jobDetailView())
@@ -85,12 +84,6 @@ func (m Model) content() string {
 		b.WriteString(m.jobConfirmView())
 	case modeBugReportPreview:
 		b.WriteString(m.bugReportPreviewView())
-	case modeTrainStopReason:
-		b.WriteString(m.trainStopView())
-	case modeConfirmTrainDelete:
-		b.WriteString(m.trainDeleteConfirmView())
-	case modeConfirmTrainRepoCleanup:
-		b.WriteString(m.trainRepoCleanupView())
 	case modeAgentDetail:
 		b.WriteString(m.agentDetailView())
 	case modeAgentRevertPick:
@@ -113,8 +106,6 @@ func (m Model) content() string {
 			b.WriteString(m.attentionContent())
 		case pageActivity:
 			b.WriteString(m.activityContent())
-		case pageTrains:
-			b.WriteString(m.trainsContent())
 		case pageAgents:
 			b.WriteString(m.agentsContentInteractive())
 		case pageSessions:
@@ -154,18 +145,10 @@ func (m Model) helpContent() string {
 		b.WriteString("players (delegation children — which agent is doing what, and its state)\n")
 		b.WriteString("↑/↓  select an active root\n")
 		b.WriteString("enter open the root's full detail (request + delegation tree)\n")
-	case pageTrains:
-		b.WriteString("↑/↓  select a train session\n")
-		b.WriteString("enter open the session (live phase view; esc returns)\n")
-		b.WriteString("s    stop a live session (asks for a reason)\n")
-		b.WriteString("d    delete a finished session and its history;\n")
-		b.WriteString("     repos gitmoot created for it can be deleted too\n")
 	case pageAgents:
 		b.WriteString("↑/↓  select an agent\n")
 		b.WriteString("enter open the agent (template, recent jobs, versions)\n")
 		b.WriteString("n    register a new agent (name, runtime, template)\n")
-		b.WriteString("o    optimize: start a training session for the agent's template\n")
-		b.WriteString("     (asks repos, request, codex/claude/kimi/kimi-cli backend, optional model)\n")
 		b.WriteString("D    delete the selected agent (refused while jobs reference it)\n")
 		b.WriteString("v    in the detail: revert the template to a previous version\n")
 	case pageJobs:
@@ -207,8 +190,6 @@ func (m Model) footerHelp() string {
 		return "type answer  enter submit  esc cancel"
 	case modeConfirmDismiss:
 		return "y delete  n/esc cancel"
-	case modeTrainDetail:
-		return "enter/esc back"
 	case modeJobDetail:
 		if jobReportable(m.activeJob.State) {
 			return "R retry  B report bug  c cancel  esc back"
@@ -227,12 +208,6 @@ func (m Model) footerHelp() string {
 			return "g create issue  esc back"
 		}
 		return "esc back"
-	case modeTrainStopReason:
-		return "type reason  enter stop  esc cancel"
-	case modeConfirmTrainDelete:
-		return "y delete  n/esc cancel"
-	case modeConfirmTrainRepoCleanup:
-		return "y delete repos  n/esc keep them"
 	case modeAgentDetail:
 		help := "D delete  esc back"
 		if len(m.revertableVersions()) > 0 {
@@ -264,10 +239,8 @@ func (m Model) footerHelp() string {
 		return help + "  ? help  q quit"
 	case pageActivity:
 		return "orchestras · tab/←→ page  ↑/↓ select root or delegate  enter open detail  ? help  q quit"
-	case pageTrains:
-		return "tab/←→ page  ↑/↓ select  enter open  s stop  d delete  ? help  q quit"
 	case pageAgents:
-		return "tab/←→ page  ↑/↓ select  enter detail  n new  o optimize  e runtime  D delete  X delete group  a show all/hide  ? help  q quit"
+		return "tab/←→ page  ↑/↓ select  enter detail  n new  e runtime  D delete  X delete group  a show all/hide  ? help  q quit"
 	case pageSessions:
 		return "tab/←→ page  ↑/↓ select  enter detail  s stop  ? help  q quit"
 	case pageJobs:

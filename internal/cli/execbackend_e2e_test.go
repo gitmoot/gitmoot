@@ -461,17 +461,6 @@ func TestP2GapEveryJobSubprocessRouteRefusesLocalFallback(t *testing.T) {
 				return err
 			},
 		},
-		{
-			name: "hard verifier",
-			run: func() error {
-				runner, err := routeRunner()
-				if err != nil {
-					return err
-				}
-				_ = daemonHardVerifierDispatcherForRunner(nil, t.TempDir(), t.TempDir(), runner)
-				return errors.New("future backend reached hard verifier construction")
-			},
-		},
 	}
 	for _, route := range routes {
 		t.Run(route.name, func(t *testing.T) {
@@ -781,26 +770,6 @@ func TestP2GapEveryJobAdapterConstructionRouteRefusesLocalFallback(t *testing.T)
 		}, "must not run")
 		if err == nil {
 			t.Fatal("one-shot runtime session accepted p2-probe without an implementation")
-		}
-	})
-	t.Run("live A/B resumed runtime session", func(t *testing.T) {
-		runner := &agentStartRunner{results: []subprocess.Result{{Stdout: "silently-local"}}}
-		restore := replaceRuntimeFactory(runtime.Factory{Runner: runner})
-		t.Cleanup(restore)
-
-		_, err := realSkillOptABDeliver(context.Background(), runtime.Agent{
-			Name:        "live-ab-challenger",
-			Role:        "reviewer",
-			Runtime:     runtime.ShellRuntime,
-			RuntimeRef:  "printf silently-local",
-			RepoScope:   "owner/repo",
-			ExecBackend: string(backend),
-		}, "must not run")
-		if err == nil {
-			t.Fatal("live A/B resume accepted p2-probe without an implementation")
-		}
-		if len(runner.calls) != 0 {
-			t.Fatalf("live A/B resume invoked the local runtime %d times, want 0", len(runner.calls))
 		}
 	})
 	t.Run("runtime contract preflight", func(t *testing.T) {

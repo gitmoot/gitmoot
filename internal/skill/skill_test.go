@@ -154,7 +154,6 @@ func TestSkillDocumentsCurrentCLIFamilies(t *testing.T) {
 				"gitmoot job gates <id>",
 				"gitmoot workflow list",
 				"gitmoot dashboard --web",
-				"gitmoot skillopt rubric induce",
 			},
 		},
 		{
@@ -175,10 +174,6 @@ func TestSkillDocumentsCurrentCLIFamilies(t *testing.T) {
 				"gitmoot job gates",
 				"gitmoot workflow list",
 				"gitmoot dashboard --web",
-				"gitmoot skillopt ab",
-				"gitmoot skillopt pairwise",
-				"gitmoot skillopt rubric",
-				"gitmoot skillopt judge",
 			},
 		},
 		{

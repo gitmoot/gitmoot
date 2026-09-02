@@ -1092,7 +1092,6 @@ func agentTemplateVersions(ctx context.Context, store *db.Store, tmpl db.AgentTe
 			ResolvedCommit: strings.TrimSpace(v.ResolvedCommit),
 			CreatedAt:      parseJobTimeMillis(v.CreatedAt),
 			PromotedAt:     parseJobTimeMillis(v.PromotedAt),
-			CanarySample:   v.CanarySample,
 			Current:        currentID != "" && v.ID == currentID,
 			// Content is this version's full prompt body; passed verbatim (no trim).
 			Content: v.Content,
@@ -2595,10 +2594,8 @@ func firstInstructionLine(instructions string) string {
 // don't fit that shape (e.g. task-rooted runs) fall back to the root job's Type
 // and Agent columns.
 // knownRunKinds is the set of single-token run entrypoints the id parser trusts
-// as parts[1]. Multi-token internal actions (e.g. "skillopt-train-candidate-
-// review") are deliberately absent, so their ids fall through to the root job's
-// Type/Agent columns instead of being mis-split (kind="skillopt", agent absorbs
-// the rest).
+// as parts[1]. Multi-token internal actions are deliberately absent, so their ids
+// fall through to the root job's Type/Agent columns instead of being mis-split.
 var knownRunKinds = map[string]bool{"ask": true, "review": true, "implement": true, "produce": true, "orchestrate": true, "goal": true}
 
 func parseRunKindAgent(rootID string, root db.Job) (kind, agent string) {

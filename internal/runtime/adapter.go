@@ -96,7 +96,7 @@ type Agent struct {
 	// WorkingDir is the resolved filesystem checkout directory the runtime
 	// adapter should chdir into for a delivery. It is DISTINCT from RepoScope,
 	// which stays in "owner/repo" form (and is validated as such). Callers that
-	// need a real subprocess to run inside a repo checkout (e.g. the SkillOpt
+	// need a real subprocess to run inside a repo checkout (e.g. an
 	// synth loop) resolve the repo's registered db.Repo.CheckoutPath and set it
 	// here; the delivery seam prefers this over RepoScope when picking the
 	// adapter Dir. In-memory only; not persisted on the agents table and never
@@ -104,7 +104,7 @@ type Agent struct {
 	// legacy behavior for callers that never set it).
 	WorkingDir string
 	// ConfigHome is the raw --home value used only when constructing a runtime
-	// adapter for one-shot/SkillOpt deliveries. It is in-memory only.
+	// adapter for one-shot deliveries. It is in-memory only.
 	ConfigHome string
 	// WritablePaths are additive runtime workspace grants for an action: produce
 	// pipeline stage. Codex enforces them itself; Claude/Kimi receive matching
@@ -689,7 +689,7 @@ func (a CodexAdapter) Start(ctx context.Context, request StartRequest) (StartRes
 		return StartResult{Raw: result.Stdout}, err
 	}
 	// Unwrap the `codex exec --json` JSONL stream so forked-session consumers
-	// (skillopt synth/ab) that parse Raw as the assistant's answer see the
+	// that parse Raw as the assistant's answer see the
 	// agent_message text, not the whole transcript (banner, thread.started,
 	// turn events) — the codex flavor of #722. Reuses the same parser the
 	// Deliver path uses to build Summary. Fail-open: fall back to the raw stdout
@@ -1124,7 +1124,7 @@ func (a ClaudeAdapter) Start(ctx context.Context, request StartRequest) (StartRe
 		return StartResult{Raw: result.Stdout + result.Stderr}, claudeCommandError(result, err)
 	}
 	// Unwrap the --output-format json result envelope so forked-session
-	// consumers (skillopt synth/ab) that parse Raw as the assistant's answer see
+	// consumers that parse Raw as the assistant's answer see
 	// the answer text, not the CLI envelope (#721). Reuses the same helper the
 	// Deliver path uses to build Summary. Fail-open: fall back to the raw stdout
 	// when stdout is not the envelope or carries no "result" field (e.g. an older

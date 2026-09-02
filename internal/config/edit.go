@@ -13,8 +13,8 @@ import (
 // SetConfigScalar replaces the value of an existing scalar key in the config
 // file, preserving comments, key order, and formatting (tomledit edits the
 // lossless AST). keyPath is the full dotted path, e.g.
-// {"agents", "planner", "max_background"} or {"feedback", "repo"}. The key must
-// already exist — adding/removing keys or whole sections stays an $EDITOR job.
+// {"agents", "planner", "max_background"}. The key must already exist —
+// adding/removing keys or whole sections stays an $EDITOR job.
 //
 // The write is atomic (temp file + rename) and validated: if the resulting
 // file fails to re-parse through the Load* parsers, the original is restored
@@ -28,8 +28,7 @@ func SetConfigScalar(paths Paths, keyPath []string, value ConfigScalar) error {
 		return err
 	}
 	editedSection := strings.Join(keyPath[:len(keyPath)-1], ".")
-	preserveLegacy := editedSection != "skillopt" || keyPath[len(keyPath)-1] != "deterministic_checkers"
-	editable, err := parseEditableConfig(original, editedSection, preserveLegacy)
+	editable, err := parseEditableConfig(original, editedSection)
 	if err != nil {
 		return err
 	}
@@ -111,12 +110,6 @@ func validateConfigFile(paths Paths) error {
 		return err
 	}
 	if _, err := LoadParallelSessionPolicy(paths); err != nil {
-		return err
-	}
-	if _, err := LoadDefaultFeedbackRepo(paths); err != nil {
-		return err
-	}
-	if _, err := LoadSkillOptABPolicy(paths); err != nil {
 		return err
 	}
 	if _, err := LoadHeartbeats(paths); err != nil {

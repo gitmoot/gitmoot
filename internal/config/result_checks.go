@@ -15,7 +15,7 @@ import (
 //     recorded, no payload field is set, and no feed-forward row is written, so
 //     behavior and wire output are BYTE-IDENTICAL to before this feature existed.
 //   - warn  — checks run; any failures are recorded as a job event, surfaced in
-//     the job detail, and stored for later SkillOpt consumption, but the job
+//     the job detail, and stored for later consumption, but the job
 //     still succeeds/blocks/fails on its own decision. This is the DEFAULT.
 //   - block — checks run; a failure additionally maps the job onto the same
 //     terminal contract-violation path a malformed result takes (the job fails).

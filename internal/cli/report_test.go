@@ -120,7 +120,6 @@ func TestReportBugUnsupportedSourcesNameSource(t *testing.T) {
 	for _, args := range [][]string{
 		{"report", "bug", "--source", "daemon", "--preview"},
 		{"report", "bug", "--source", "dashboard", "--preview"},
-		{"report", "bug", "--train", "train-1", "--preview"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
@@ -131,7 +130,7 @@ func TestReportBugUnsupportedSourcesNameSource(t *testing.T) {
 				t.Fatalf("exit code = %d, stderr=%s", code, stderr.String())
 			}
 			output := stderr.String()
-			if !strings.Contains(output, "source daemon") && !strings.Contains(output, "source dashboard") && !strings.Contains(output, "source train") {
+			if !strings.Contains(output, "source daemon") && !strings.Contains(output, "source dashboard") {
 				t.Fatalf("stderr does not name source: %q", output)
 			}
 		})
