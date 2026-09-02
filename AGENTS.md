@@ -412,53 +412,70 @@ self-merge conditional on all six checks below:
 The delegation does **not** authorize releases, `gh release create`, deploys,
 service restarts, force-pushes to `main`, or merging work outside the PR's
 issue. Those actions remain owner-gated.
-**A clean, mergeable PR whose head is no longer the reviewed head is NOT ready.**
+
+**A green, mergeable PR is not necessarily a REVIEWED one — check two axes
+independently: did the head move, and did the base move?**
 `mergeable: MERGEABLE` / `mergeStateStatus: CLEAN` is a claim about *git* — that
 the branch applies with no textual conflict. It says nothing about whether
-anyone reviewed the tree that will land, and CI here is keyed to `head_sha`
-(`.github/workflows/ci.yml` runs on `pull_request`, and every check-run reports
-the branch head), so green CI tested the *branch*, not the branch merged into
-current `main`. Two cases, and they need different actions:
+anyone reviewed the tree that will land.
 
-- **Case A — new commits were pushed to the branch.** The verdict is void: it
+CI is a **stronger** instrument than a file-level argument, but it has a
+staleness hazard. `.github/workflows/ci.yml` runs on `pull_request` with no
+`ref:` override, so each `actions/checkout` resolves `github.ref` =
+`refs/pull/N/merge` and GitHub **does** build the branch merged into the base —
+measured on this file's own PR, whose run log reads
+`git checkout --force refs/remotes/pull/1783/merge` /
+`HEAD is now at 7057f594 Merge 4b245ac5… into c3785d6d…`. But GitHub recomputes
+that merge ref when the base moves and **does not re-run CI**, and the
+check-runs are reported against the *branch head*. So a green check is a claim
+about `merge(head, base AS OF THAT RUN)` displayed against the head — which is
+exactly what makes a stale green look current. (Whether a manual "Re-run all
+jobs" re-resolves the merge ref against the new base or replays the original
+merge SHA is **unmeasured** — do not rely on either.)
+
+The two axes, and both can be true at once:
+
+- **The head moved — new commits were pushed.** The verdict is void: it
   described a tree that no longer exists. Re-review at the new head, scoped to
-  the delta since the approved head — not the whole PR again.
-- **Case B — the branch head is unchanged and `main` moved underneath it.** The
-  verdict still names a commit that still exists and git still reports CLEAN,
-  yet nobody has reviewed `main` + branch, which is what actually lands. **Check
-  the BRANCH, not the base**: `git diff origin/main..HEAD` must contain only the
-  change you intended, and a tree read must confirm no file you never touched
-  reappears or vanishes. Only then compare the base delta: if `main`'s new
-  commits touch no file and no package the PR touches, the merge result is
-  semantically the reviewed tree — merge; if they overlap, re-review the delta.
-  A clean textual merge silently produces wrong code exactly where two changes
-  touch one region: two migrations appended to the same slice merge without
-  conflict and can still renumber; two edits to one test file merge and can drop
-  an assertion.
+  the delta since the approved head, not the whole PR again. Verify the branch
+  carries only what you intended: `git diff origin/<baseRefName>..HEAD` and a
+  tree read confirming no file you never touched reappears or vanishes.
+- **The head moved BACK — a force-push restored an earlier approved SHA.** An
+  exact-head gate keyed to `head_sha` cannot see this: the tree exists and the
+  SHA matches a prior approval. But that approval was made against a different
+  base and against intermediate history the force-push discarded. Treat it as
+  unreviewed.
+- **The base moved.** The verdict still names a commit that still exists and git
+  still reports CLEAN, yet nobody reviewed `base` + branch, which is what lands.
+  **The sound instrument is to build and test the merge result** — re-trigger CI
+  at the current base and read that run. File/package overlap between the base
+  delta and the PR is useful only to scope how much of the diff a human
+  re-reads; it is **not** a merge predicate. It has no direction and no
+  transitivity, while "depends on" has both: a PR changing a signature in
+  `internal/workflow` and a base commit adding a call site in `internal/daemon`
+  share zero files and zero packages, pass any overlap test, and produce a tree
+  that does not compile. Same shape when a PR deletes a symbol the base has just
+  begun to reference — live risk during a reduction epic.
 
-  The branch check comes first because the base check alone is **not
-  sufficient**, measured on the first push of this very PR. It was stacked on a
-  PR whose own base predated a large deletion; that parent was **squash**-merged,
-  which makes the reviewed branch commits non-ancestors of `main`, so the stack
-  silently kept the parent's stale base. The branch then reported
-  `mergeable: MERGEABLE`, no conflict and green CI while its diff against the
-  moved `main` re-added ~10,200 deleted lines — a mass revert of a merge from
-  half an hour earlier. The base-delta predicate PASSED that case: the base delta
-  touched the deleted files, the PR touched only this file, no overlap. Stacking
-  on a PR that will be squash-merged always requires a rebuild on `main`, never a
-  base-delta comparison.
+Measured on the first push of this very PR: it was stacked on a PR whose own
+base predated a large deletion; that parent was **squash**-merged, which makes
+the reviewed branch commits non-ancestors of the base, so the stack silently
+kept the parent's stale base. The branch reported MERGEABLE, no conflict, green
+CI — while its diff against the moved base re-added ~10,200 deleted lines, a
+mass revert of a merge from half an hour earlier. Stacking on a PR that will be
+squash-merged always requires a rebuild on the base once the parent lands.
 
-Prove Case B with **trees, not diff output**, and put a positive control on
-every instrument. #1731 was waived on "only `AGENTS.md` changed" by the role
-that benefited from the waiver; reversing that bought a content-addressed proof
-instead — `git ls-tree -r` over all 1173 tracked files, pairwise-equal subtree
-hashes, identical blob hashes for all 57 PR-changed files, each instrument
-shown to report differences on a known-different pair. That cost one review
-round and is the standard.
+Where a tree comparison is the right tool, use **trees, not diff output**, with a
+positive control on every instrument. #1731 was waived on "only `AGENTS.md`
+changed" by the role that benefited from the waiver; reversing that bought a
+content-addressed proof instead — `git ls-tree -r` over all 1173 tracked files,
+pairwise-equal subtree hashes, identical blob hashes for all 57 PR-changed
+files, each instrument shown to report differences on a known-different pair.
 
 And **`CLEAN` beside an empty check rollup is not green** — a head whose checks
-have not registered yet reports zero check-runs and still reads CLEAN. Read the
-count, not the label.
+have not registered yet reports zero check-runs and still reads CLEAN. An empty
+check list right after a push means "not started", never "not required". Read
+the count, not the label.
 
 Under ultracode, orchestrate via the Workflow tool with opus sub-agents
 (protect the scarcer fable quota).
@@ -500,25 +517,6 @@ Parallel review lanes mean different PRs, not multiple reviewers on one head.
 Review panels and fanout require explicit, durable owner authorization for that
 specific incident; an incident does not override this rule by itself.
 
-### Steady mode
-
-Between throughput and drain: the **cap stays, the admission gate goes**. Set by
-the owner on 2026-09-02, because drain's cost was never its concurrency limit but
-its permission step — a seat sat on four ready, gated fixes through two
-escalations, and an armed merge gate then merged the PR without them.
-
-- At most **four implementation seats and two independent reviewers** at once.
-- **No admission gate.** A seat that finishes takes the next item itself: no
-  escalation for permission, no waiting for an authorization row.
-- Work comes off an **ordered list**, not a free choice — for a reduction epic,
-  that epic's own dependency-sorted sub-issue order.
-- **One in, one out**: no second PR from a seat while its first is unmerged.
-  This is what keeps the queue from growing, without anyone deciding.
-- Escalate only for a **P2-or-worse finding**, a **scope boundary wider than the
-  assigned item**, or **live-service impact**. Everything else is the seat's call.
-- Steady mode names its own **exit condition**: when the scoped list is merged,
-  the coordinator posts the next mode marker itself rather than waiting to be told.
-
 ### Throughput mode
 
 - Start independent, issue-backed work when ownership and integration order are
@@ -527,6 +525,31 @@ escalations, and an armed merge gate then merged the PR without them.
   different PRs under the repository's normal safety rules.
 - Stop opening new lanes when work queues behind shared files, unresolved
   integration order, or repeated review findings.
+
+### Steady mode
+
+Between throughput and drain: the **cap stays, the admission gate goes**. Set by
+the owner on 2026-09-02, because drain's cost was never its concurrency limit but
+its permission step — a seat sat on four ready, gated fixes through two
+escalations, and an armed merge gate then merged the PR without them.
+
+- At most **four implementation seats and two independent reviewers** at once.
+  The owner gave those numbers illustratively ("4 implementations and 2 reviews
+  for example"); note 107313 hardened them, and a rules file needs a definite
+  cap rather than an example.
+- **No admission gate.** A seat that finishes takes the next item itself: no
+  escalation for permission, no waiting for an authorization row.
+- Work comes off an **ordered list**, not a free choice — for a reduction epic,
+  that epic's own dependency-sorted sub-issue order.
+- **One in, one out**: no second PR from a seat while its first is unmerged.
+  This is what keeps the queue from growing, without anyone deciding.
+- Escalate only for a **P2-or-worse finding**, a **scope boundary wider than the
+  assigned item**, or **live-service impact**. Everything else is the seat's call.
+- Steady mode names its own **exit condition and its destination**: when the
+  scoped list is merged, `gitmoot/*` returns to **DRAIN**, and the coordinator
+  posts that drain marker itself rather than waiting to be told (owner
+  instruction, note 107313: "we need to stop and go back to DRAIN mode once
+  those are merged").
 
 ### Drain mode
 
