@@ -712,7 +712,16 @@ func (s *Store) TransitionJobStateWithPayloadAndEvents(ctx context.Context, id s
 	if payload == nil {
 		result, err = tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, to, id, from)
 	} else {
-		result, err = tx.ExecContext(ctx, `UPDATE jobs SET state = ?, payload = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, payload, to, id, from)
+		// DERIVED FIELDS TRAVEL WITH THE PAYLOAD. jobs.result_hash and the payload
+		// projections are not decoration: the hash is the terminal result's
+		// proof-integrity receipt and its memory-harvest key, and writing a payload that
+		// installs a result while leaving the old (or empty) hash behind breaks that
+		// invariant silently. Every other payload writer recomputes them in the same
+		// UPDATE; so does this one (#1673).
+		projection := jobProjectionFromPayload(string(payload))
+		result, err = tx.ExecContext(ctx, `UPDATE jobs SET state = ?, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`,
+			to, payload, jobResultHashFromPayload(string(payload)), projection.Repo, projection.PullRequest,
+			projection.BlockerRetryAt, projection.BlockerSuggestedAction, to, id, from)
 	}
 	if err != nil {
 		return false, err

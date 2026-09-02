@@ -47,7 +47,6 @@ func TestClosedPullRequestChildConvergesThroughTheRetryActuator(t *testing.T) {
 	runGit(t, checkout, "branch", "-m", "main")
 	runGit(t, checkout, "push", "-u", "origin", "main")
 	runGit(t, checkout, "remote", "set-url", "origin", "https://github.com/gitmoot/gitmoot.git")
-	checkoutHead := strings.TrimSpace(runGitOutput(t, checkout, "rev-parse", "HEAD"))
 	if err := store.UpsertRepo(ctx, db.Repo{
 		Owner: "gitmoot", Name: "gitmoot", CheckoutPath: checkout,
 		DefaultBranch: "main", PollInterval: "30s",
@@ -60,14 +59,12 @@ func TestClosedPullRequestChildConvergesThroughTheRetryActuator(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertTask: %v", err)
 	}
-	// The actuator's preflight compares the registered checkout HEAD against the review
-	// job's head, so the fixture pins them equal. NOTE, and it is a real finding rather
-	// than a fixture convenience: for a child whose PR is CLOSED that equality cannot
-	// hold in production - the shared checkout is on a long-lived branch, never on a dead
-	// PR's head - so the retry path refuses with "checkout head is X, not review job head
-	// Y" before it ever advances the parent. That is gitmoot#1698 reaching this path; the
-	// atomic-result fix here is necessary but not sufficient while it stands, and it is
-	// out of scope for this minimal PR.
+	// THE HEAD DELIBERATELY DOES NOT MATCH THE CHECKOUT. That is the production shape
+	// for a closed PR - the shared checkout sits on a long-lived branch, never on a dead
+	// PR's head - and an earlier version of this test pinned them equal, which masked the
+	// defect: the actuator's delivery preflight failed, re-stamped the marker, and left
+	// the parent stranded forever. Terminal parent advancement no longer depends on that
+	// preflight, so convergence must hold with a mismatched head.
 
 	// The parent fanned out one child and is waiting on it.
 	parentPayload, err := json.Marshal(workflow.JobPayload{
@@ -76,7 +73,7 @@ func TestClosedPullRequestChildConvergesThroughTheRetryActuator(t *testing.T) {
 		PullRequest: 7,
 		TaskID:      "task-7",
 		Sender:      "coord",
-		HeadSHA:     checkoutHead,
+		HeadSHA:     "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
 		Result: &workflow.AgentResult{
 			Decision: "approved",
 			Summary:  "fan out",

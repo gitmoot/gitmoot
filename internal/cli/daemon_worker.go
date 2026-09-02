@@ -3478,6 +3478,17 @@ func (w jobWorker) recordAdvanceRetryOnce(ctx context.Context, jobID, message st
 	return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_retry", Message: message})
 }
 
+// terminalParentAdvancementOnly reports whether the ONLY work this job still owes is
+// advancing its parent: it is settled, it already carries the result the parent's
+// advanceDelegations consumes, and it has a parent to advance. Such a job needs no
+// checkout, so a checkout failure must not strand it (#1673).
+func terminalParentAdvancementOnly(job db.Job, payload workflow.JobPayload) bool {
+	if strings.TrimSpace(payload.ParentJobID) == "" || payload.Result == nil {
+		return false
+	}
+	return workflow.IsSettledJobState(job.State)
+}
+
 func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 	payload, err := daemonJobPayload(job)
 	if err != nil {
@@ -3504,7 +3515,20 @@ func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 	}
 	checkout, err := w.checkoutForJob(ctx, job, payload, agent, jobRunner)
 	if err != nil {
-		return w.recordAdvanceRetryOnce(ctx, job.ID, "post-delivery workflow retry preflight failed: "+err.Error())
+		// TERMINAL ADVANCEMENT DOES NOT NEED A DELIVERY CHECKOUT (#1673). This preflight
+		// exists for jobs that still have RUNTIME work to deliver. A job that is already
+		// terminal WITH a result owes exactly one thing - handing that result to its
+		// parent - and that touches the parent's DAG, not this job's worktree.
+		//
+		// Gating it on the checkout made the obligation unrecoverable in the case it was
+		// created for: a superseded review child's recorded head can never equal the
+		// shared checkout's HEAD (the PR is closed), so the preflight failed, the marker
+		// was re-stamped, and the parent stayed stranded forever. Reclaimed worktrees and
+		// moved task checkouts produce the same shape.
+		if !terminalParentAdvancementOnly(job, payload) {
+			return w.recordAdvanceRetryOnce(ctx, job.ID, "post-delivery workflow retry preflight failed: "+err.Error())
+		}
+		checkout = ""
 	}
 	engine := w.workflowForJob(checkout, jobRunner)
 	if err := engine.AdvanceJob(ctx, job.ID); err != nil {
