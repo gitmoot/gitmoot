@@ -135,12 +135,11 @@ func TestCleanupObligationsRebuildPreservesLegacyRows(t *testing.T) {
 // test would pass on precisely the mutant it exists to kill.
 func TestMigrationsUpgradeFromPreviousReleasedVersion(t *testing.T) {
 	ctx := context.Background()
-	// The marker names THIS BRANCH's migration, and it has moved twice as main
-	// advanced: the cleanup_obligations rebuild and then #1766's SkillOpt/evals
-	// teardown each became part of the released prefix, leaving escalation_rounds as
-	// the migration appended last. Two branches cannot both be "last", and the
-	// ordering that matters is the one a deployed database sees - main's migrations
-	// are already applied there, so this branch's must follow them.
+	// The marker names THIS BRANCH's migration, and it has moved three times as main
+	// advanced: the cleanup_obligations rebuild, #1766's SkillOpt/evals teardown, and
+	// #1770's Activepieces trigger removal each joined the released prefix, leaving
+	// escalation_rounds appended last. Two branches cannot both be "last", and the
+	// ordering that matters is the one a deployed database sees.
 	const branchMigrationMarker = "CREATE UNIQUE INDEX escalation_rounds_one_unsettled"
 	branchIndex := -1
 	for index, migration := range migrations {
@@ -196,6 +195,13 @@ func TestMigrationsUpgradeFromPreviousReleasedVersion(t *testing.T) {
 	}
 	if final != len(migrations) {
 		t.Fatalf("upgraded version = %d, want %d", final, len(migrations))
+	}
+	var retiredColumnCount int
+	if err := upgraded.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('pipelines') WHERE name = 'trigger_binding'`).Scan(&retiredColumnCount); err != nil {
+		t.Fatalf("inspect upgraded pipelines columns: %v", err)
+	}
+	if retiredColumnCount != 0 {
+		t.Fatalf("trigger_binding column count = %d, want 0", retiredColumnCount)
 	}
 	now := time.Now().UTC()
 	if _, err := upgraded.DeferCleanupObligation(ctx, "job-upgraded", "/tmp/managed/upgraded", CleanupReasonUnpublishedCommits, now, now.Add(time.Minute)); err != nil {

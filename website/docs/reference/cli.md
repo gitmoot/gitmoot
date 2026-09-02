@@ -2784,13 +2784,9 @@ env:                         # optional inline NON-secret defaults
 schedule:                   # optional interval schedule (no cron in v1)
   interval: 24h
   jitter: 15m
-trigger:                    # optional generated Activepieces event source
-  kind: email
-  connection: gmail-imap    # default
-  mailbox: INBOX            # default
-  map:
-    subject: subject
-    sender: from_address
+trigger:                    # optional pipeline-success chain
+  kind: pipeline
+  pipeline: upstream-name
 stages:                     # the DAG, keyed by unique id and wired by needs
   - id: source
     cmd: "curl -sf https://example.com/data > data.json"
@@ -2816,7 +2812,6 @@ gitmoot pipeline add nightly-sync.yaml --enable   # validate + store; omit --ena
 gitmoot pipeline install-defaults                 # install built-in memory pipelines, skipping existing names
 gitmoot pipeline list [--json]
 gitmoot pipeline show nightly-sync [--json]        # registry view for a name
-gitmoot pipeline bind-trigger nightly-sync         # create/re-sync owned AP flow
 gitmoot pipeline run nightly-sync [--payload key=value ...] [--payload-json '<obj>']
 gitmoot pipeline watch <run-id> [--timeout 10m] [--poll 5s] [--json]
 gitmoot pipeline show <run-id> [--json]            # run funnel for a "prun-…" id
@@ -2859,13 +2854,11 @@ bodies and referenced environment-variable names, so never inline a secret
 literal in `cmd`. Public capability receipt URLs remain public after token
 rotation.
 
-An enabled `trigger.kind: email` pipeline auto-binds. If Activepieces is down,
-registration succeeds with a pending binding; `bind-trigger` retries it and
-recreates an owned flow deleted in Activepieces. Map output names are lowercase
-identifier keys up to 64 bytes; selectors are `subject`, `from_address`, `text`,
-`message_id`, and `date`. Mapped flows require `@gitmoot/piece-gitmoot` 0.1.4+.
-Create the default IMAP connection with
-`gitmoot activepieces connect gmail`; `--with-smtp` is optional.
+An enabled `trigger.kind: pipeline` pipeline fires once for each successful
+upstream run. The durable cursor prevents duplicate fires across daemon restarts,
+and adding or enabling the downstream arms it without backfilling old history.
+Missing upstreams remain dormant. Self-reference, cycles, and schedule-plus-
+trigger hybrids are rejected.
 
 `pipeline add` validates the whole spec at add time and stores the raw YAML
 **verbatim** plus a content hash; each run snapshots the hash and executes its

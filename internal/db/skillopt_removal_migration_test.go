@@ -13,10 +13,9 @@ import (
 // migration never silently re-points these tests at somebody else's entry.
 const skillOptRemovalMarker = "ALTER TABLE agent_template_versions DROP COLUMN canary_sample"
 
-// releasedMigrationsBeforeSkillOptRemoval returns the migration prefix as it
-// shipped BEFORE #1752 — every migration except the removal itself. It removes
-// that one entry rather than slicing off the tail so a reordered slice cannot
-// produce a synthetic "released" schema that already contains the removal.
+// releasedMigrationsBeforeSkillOptRemoval returns the strict migration prefix
+// that shipped before #1752. Later reductions may append new migrations, but a
+// previous-release fixture must not apply them under shifted version numbers.
 func releasedMigrationsBeforeSkillOptRemoval(t *testing.T) []string {
 	t.Helper()
 	index := -1
@@ -31,18 +30,7 @@ func releasedMigrationsBeforeSkillOptRemoval(t *testing.T) []string {
 	if index < 0 {
 		t.Fatalf("marker %q matches no migration", skillOptRemovalMarker)
 	}
-	// THE PREFIX IS EVERYTHING STRICTLY BEFORE THIS MIGRATION, not "every migration
-	// except this one". The original form assumed this migration was LAST, so the
-	// remainder was a valid previous-release schema. #1673 appended a later migration
-	// (escalation_rounds), and keeping it in the seed made the seeded database already
-	// contain a table the full re-apply then tries to create again - "table
-	// escalation_rounds already exists".
-	//
-	// The reordering mutant the original form guarded against is still covered, by
-	// TestMigrationsUpgradeFromPreviousReleasedVersion: that test pins which migration
-	// is appended LAST, which is the property a slice-based prefix cannot check on its
-	// own (#1673).
-	return migrations[:index]
+	return append([]string(nil), migrations[:index]...)
 }
 
 // TestSkillOptRemovalMigrationReconcilesCandidateAndCanaryRows is the data test

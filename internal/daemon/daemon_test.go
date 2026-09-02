@@ -3555,6 +3555,7 @@ type fakeGitHub struct {
 	listIssuesCalls        int
 	recentClosedCalls      int
 	getPullRequestCalls    []int64
+	getPullRequestErr      error
 }
 
 type postedComment struct {
@@ -3713,6 +3714,9 @@ func (f *fakeGitHub) UpdatePullRequestBranch(context.Context, github.UpdatePullR
 
 func (f *fakeGitHub) GetPullRequest(_ context.Context, _ github.Repository, number int64) (github.PullRequest, error) {
 	f.getPullRequestCalls = append(f.getPullRequestCalls, number)
+	if f.getPullRequestErr != nil {
+		return github.PullRequest{}, f.getPullRequestErr
+	}
 	if f.pullsByNumber != nil {
 		if pull, ok := f.pullsByNumber[number]; ok {
 			return pull, nil

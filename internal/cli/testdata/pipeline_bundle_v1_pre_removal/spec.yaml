@@ -1,0 +1,5 @@
+name: legacy-bundle
+repo: __GITMOOT_REPO__
+stages:
+  - id: check
+    cmd: echo ok

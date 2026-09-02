@@ -855,6 +855,7 @@ type countingCandidateStore struct {
 	agedReclaim    int32
 	taskReclaim    int32
 	malformedOwner int32
+	jobEventCursor int32
 }
 
 func (c *countingCandidateStore) JobIDsWithPendingAdvanceRetry(ctx context.Context) ([]string, error) {
@@ -885,6 +886,11 @@ func (c *countingCandidateStore) TaskIDsWithTerminalWorktree(ctx context.Context
 func (c *countingCandidateStore) FirstMalformedNonFinalJob(ctx context.Context) (string, error) {
 	atomic.AddInt32(&c.malformedOwner, 1)
 	return c.inner.FirstMalformedNonFinalJob(ctx)
+}
+
+func (c *countingCandidateStore) MaxJobEventID(ctx context.Context) (int64, error) {
+	atomic.AddInt32(&c.jobEventCursor, 1)
+	return c.inner.MaxJobEventID(ctx)
 }
 
 // flakyCandidateStore returns an error on the first call to each candidate query and
@@ -943,4 +949,11 @@ func (s *flakyCandidateStore) FirstMalformedNonFinalJob(context.Context) (string
 		return "", errCandidateTransient
 	}
 	return "malformed-job", nil
+}
+
+// MaxJobEventID is deliberately non-flaky and unused by these carriers (they set
+// no cursor cache), so the retry-on-error proof keeps measuring only the
+// candidate queries themselves.
+func (s *flakyCandidateStore) MaxJobEventID(context.Context) (int64, error) {
+	return 0, nil
 }

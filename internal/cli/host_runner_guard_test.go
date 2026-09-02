@@ -27,10 +27,6 @@ type hostRunnerSite struct {
 }
 
 var hostRunnerAllowlist = map[string]hostRunnerAllowance{
-	"internal/cli/activepieces.go:ensureActivepiecesBridge": {
-		rawCommands: 1,
-		reason:      "operator command starts the detached local Activepieces bridge process",
-	},
 	"internal/cli/agent.go:<package>": {
 		execRunners: 1,
 		reason:      "operator-side agent doctor uses a replaceable local-runtime probe seam",
@@ -86,6 +82,10 @@ var hostRunnerAllowlist = map[string]hostRunnerAllowance{
 	"internal/cli/daemon_workflow.go:daemonWorkflowEngine": {
 		execRunners: 1,
 		reason:      "legacy host-mode engine wrapper; backend jobs call daemonWorkflowEngineForRunner",
+	},
+	"internal/cli/daemon_workflow.go:daemonWorkflowEngineCached": {
+		execRunners: 1,
+		reason:      "same host-mode engine wrapper as daemonWorkflowEngine, taking the poll pass's config memo (#1758); backend jobs call daemonWorkflowEngineForRunner",
 	},
 	"internal/cli/daemon_workflow.go:implementationFinalizationTargetFor": {
 		execRunners: 1,

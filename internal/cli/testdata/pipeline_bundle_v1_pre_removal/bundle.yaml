@@ -1,0 +1,13 @@
+bundle_version: 1
+gitmoot_version_min: 0.1.0
+pipeline: legacy-bundle
+repo: __GITMOOT_REPO__
+requirements:
+  runtimes:
+    - shell
+  connections: []
+  upstream_pipelines: []
+warnings: []
+write_authority: []
+agents: []
+spec_sha256: 5a711bf72f5547512fd2a8736b1a8f2a5974b700a09f2d43ab6bffe46b48f6a8

@@ -85,6 +85,9 @@ type inflightJobTracker struct {
 	foreignBootRecoveryAt      time.Time
 	worktreeReclaimAttemptedAt time.Time
 	staleTaskLaneLockReapAt    time.Time
+	wakeOutboxHealthLast       replyWakeOutboxHealth
+	wakeOutboxHealthLogged     bool
+	jobEvents                  jobEventCandidateCache
 	liveness                   *daemonLivenessSweep
 }
 
@@ -369,6 +372,54 @@ func (t *inflightJobTracker) markStaleTaskLaneLockReclaimSuccessful(now time.Tim
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.staleTaskLaneLockReapAt = now
+}
+
+// replyWakeOutboxHealthChanged reports whether health differs from the last
+// wake-outbox health line this supervisor logged, and remembers it when it
+// does. An `inert` obligation — a pending row with no matching wake rule — is a
+// PERMANENT state until an operator adds a rule, so re-logging the identical
+// line every tick produced ~12.8k identical lines/day carrying no new
+// information (#1758). A nil tracker (the untracked/legacy path) always reports
+// changed, so its logging stays exactly as it was.
+func (t *inflightJobTracker) replyWakeOutboxHealthChanged(health replyWakeOutboxHealth) bool {
+	if t == nil {
+		return true
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.wakeOutboxHealthLogged && t.wakeOutboxHealthLast == health {
+		return false
+	}
+	t.wakeOutboxHealthLast = health
+	t.wakeOutboxHealthLogged = true
+	return true
+}
+
+// forgetReplyWakeOutboxHealth drops the remembered line so the next health line
+// logs even when it repeats the last one. Every tick that does NOT print a
+// health line calls it — a drain error, or a clean drain with nothing inert — so
+// leaving the inert state and returning to it is always visible in the journal.
+func (t *inflightJobTracker) forgetReplyWakeOutboxHealth() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.wakeOutboxHealthLast = replyWakeOutboxHealth{}
+	t.wakeOutboxHealthLogged = false
+}
+
+// jobEventCandidateCache returns the supervisor's cross-tick job_events cursor
+// cache (#1758). Its lifetime is the supervisor's, not the tick's, which is the
+// whole point: the per-tick candidate carrier consults it to skip a candidate
+// query whose inputs have not changed since the previous tick. A nil tracker
+// returns nil, which disables the gating and runs every query, so untracked and
+// legacy paths keep today's behavior.
+func (t *inflightJobTracker) jobEventCandidateCache() *jobEventCandidateCache {
+	if t == nil {
+		return nil
+	}
+	return &t.jobEvents
 }
 
 // holderOf returns the job ID currently holding checkoutKey, if any.

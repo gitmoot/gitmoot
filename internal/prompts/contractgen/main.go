@@ -70,6 +70,16 @@ var resultFieldAnnotations = map[string]fieldAnnotation{
 	// generator's every-field-accounted-for check, so a future rename cannot
 	// silently drop it.
 	"fan_out": {},
+	// superseded_pull_request_closed is PRODUCT-OWNED for the same reason as fan_out,
+	// so it carries neither an example nor help: no agent is ever asked for it. The
+	// closed-PR sweep sets it on the SYNTHETIC result it mints for a delegation child
+	// whose pull request is no longer open, and the retry actuator reads it to know a
+	// delivery-checkout preflight can never validate for that child (#1673). It lives
+	// in the result rather than the event log precisely so RetryJob clears it with the
+	// result. Advertising it in the prompt would invite an agent to claim a lifecycle
+	// fact the product owns. The empty entry still satisfies the every-field-accounted
+	// -for check, so a future rename cannot silently drop it.
+	"superseded_pull_request_closed": {},
 }
 
 // delegationFieldAnnotations covers every JSON field of workflow.Delegation.

@@ -669,7 +669,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		if paths, err := pathsFromFlag(request.Home); err == nil {
 			workflowHome = paths.Home
 		}
-		engine := daemonWorkflowEngineForRunner(store, newAgentDispatchGitHubClient(checkoutPath), checkoutPath, workflowHome, localDispatchJobRunner(request))
+		engine := daemonWorkflowEngineForRunner(store, newAgentDispatchGitHubClient(checkoutPath), checkoutPath, workflowHome, localDispatchJobRunner(request), nil)
 		if _, err := engine.RunJob(runCtx, job.ID, effectiveAgent, adapter); err != nil {
 			if out, ok, _ := recoverAdvanceErrorOutput(ctx, store, job.ID, request, err); ok {
 				recordRuntimeOutcome(nil)

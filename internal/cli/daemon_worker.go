@@ -3477,6 +3477,34 @@ func (w jobWorker) recordAdvanceRetryOnce(ctx context.Context, jobID, message st
 	return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_retry", Message: message})
 }
 
+// closedPullRequestSupersededChild reports whether this job is EXACTLY the shape the
+// closed-PR sweep produces: a delegation child terminalized because its pull request is
+// no longer open, carrying the synthetic result the parent's advanceDelegations consumes
+// (#1673).
+//
+// IT READS THE RESULT, NOT THE EVENT LOG. An event scan cannot be made safe here:
+// job_events has no lifecycle_generation column, and RetryJob starts a new run while
+// PRESERVING prior events, so a historical supersession would keep authorizing the
+// bypass for a job that has since been retried and failed normally - and that run still
+// owes the full advance, deferred teardown and implement bookkeeping included. Carrying
+// the fact in the result means RetryJob clears it along with Result, so the stale case
+// cannot arise rather than being detected.
+//
+// Rejected alternatives: stamping the generation on the supersession event at write time
+// (follows the exec-backend-attempts precedent, but adds a write-side schema change and
+// still leaves a scan whose correctness depends on the filter being right everywhere it
+// is read); and comparing against a recorded generation boundary (same objection, plus a
+// second durable fact to keep in agreement - the defect class this campaign kept hitting).
+func closedPullRequestSupersededChild(job db.Job, payload workflow.JobPayload) bool {
+	if strings.TrimSpace(payload.ParentJobID) == "" || payload.Result == nil {
+		return false
+	}
+	if job.State != string(workflow.JobFailed) {
+		return false
+	}
+	return payload.Result.SupersededPullRequestClosed
+}
+
 func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 	payload, err := daemonJobPayload(job)
 	if err != nil {
@@ -3503,6 +3531,31 @@ func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 	}
 	checkout, err := w.checkoutForJob(ctx, job, payload, agent, jobRunner)
 	if err != nil {
+		// THE STRUCTURAL ROUTE (#1673). A child terminalized by the closed-PR sweep can
+		// never satisfy this preflight - the shared checkout is never on a dead PR's head
+		// - and gating its parent advancement on that stranded the parent forever. But
+		// letting it through the FULL advance with an empty checkout was too broad:
+		// AdvanceJob also normalizes high-risk lens verdicts, dispatches the child's own
+		// delegations, continues into the review merge gate and registers worktree
+		// teardown, so a preflight failure would become database and remote action under
+		// an unvalidated checkout.
+		//
+		// So this shape is routed to an operation that CANNOT reach any of that, rather
+		// than to the full advance with a narrower predicate in front of it. A predicate
+		// is a list the next edit widens; an operation that cannot execute the child's own
+		// advancement cannot be widened by accident.
+		if closedPullRequestSupersededChild(job, payload) {
+			parentOnly := w.workflowForJob("", jobRunner)
+			if advErr := parentOnly.AdvanceParentDAGForTerminalChild(ctx, job.ID); advErr != nil {
+				var blocked workflow.BlockedError
+				if errors.As(advErr, &blocked) {
+					return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_blocked", Message: advErr.Error()})
+				}
+				return w.recordAdvanceRetryOnce(ctx, job.ID, "parent-only advancement failed: "+advErr.Error())
+			}
+			return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_completed",
+				Message: "parent advancement completed without a delivery checkout (closed pull request)"})
+		}
 		return w.recordAdvanceRetryOnce(ctx, job.ID, "post-delivery workflow retry preflight failed: "+err.Error())
 	}
 	engine := w.workflowForJob(checkout, jobRunner)
@@ -3782,7 +3835,7 @@ func (w jobWorker) workflowForHost(checkout string) workflow.Engine {
 }
 
 func (w jobWorker) defaultWorkflowForRunner(checkout string, runner subprocess.Runner) workflow.Engine {
-	engine := daemonWorkflowEngineForRunner(w.Store, github.NewClient(checkout), checkout, w.workflowHome(), runner)
+	engine := daemonWorkflowEngineForRunner(w.Store, github.NewClient(checkout), checkout, w.workflowHome(), runner, nil)
 	w.applyOrchestratePolicy(&engine)
 	return engine
 }

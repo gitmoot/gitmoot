@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -127,9 +129,10 @@ func TestPollRegisteredReposHonorsPerRepoIntervals(t *testing.T) {
 	defer store.Close()
 
 	ctx := context.Background()
+	slowCheckout, fastCheckout := t.TempDir(), t.TempDir()
 	repos := []db.Repo{
-		{Owner: "owner", Name: "slow", CheckoutPath: "/tmp/slow", PollInterval: "1h"},
-		{Owner: "owner", Name: "fast", CheckoutPath: "/tmp/fast", PollInterval: "30s"},
+		{Owner: "owner", Name: "slow", CheckoutPath: slowCheckout, PollInterval: "1h"},
+		{Owner: "owner", Name: "fast", CheckoutPath: fastCheckout, PollInterval: "30s"},
 	}
 	for _, repo := range repos {
 		if err := store.UpsertRepo(ctx, repo); err != nil {
@@ -188,9 +191,10 @@ func TestPollRegisteredReposRoutesEachRepoWithOwnGitHubClient(t *testing.T) {
 	ctx := context.Background()
 	repoA := github.Repository{Owner: "owner", Name: "repo-a"}
 	repoB := github.Repository{Owner: "owner", Name: "repo-b"}
+	checkoutA, checkoutB := t.TempDir(), t.TempDir()
 	for _, repo := range []db.Repo{
-		{Owner: repoA.Owner, Name: repoA.Name, CheckoutPath: "/tmp/repo-a", PollInterval: "30s"},
-		{Owner: repoB.Owner, Name: repoB.Name, CheckoutPath: "/tmp/repo-b", PollInterval: "30s"},
+		{Owner: repoA.Owner, Name: repoA.Name, CheckoutPath: checkoutA, PollInterval: "30s"},
+		{Owner: repoB.Owner, Name: repoB.Name, CheckoutPath: checkoutB, PollInterval: "30s"},
 	} {
 		if err := store.UpsertRepo(ctx, repo); err != nil {
 			t.Fatalf("UpsertRepo(%s) returned error: %v", repo.FullName(), err)
@@ -213,13 +217,13 @@ func TestPollRegisteredReposRoutesEachRepoWithOwnGitHubClient(t *testing.T) {
 	}
 
 	clients := map[string]*cliPollFakeGitHub{
-		"/tmp/repo-a": {
+		checkoutA: {
 			pulls: []github.PullRequest{{Number: 1, Title: "A", State: "open", HeadRef: "task-a", BaseRef: "main", HeadSHA: "sha-a"}},
 			comments: map[int64][]github.IssueComment{
 				1: {{ID: 77, Body: "/gitmoot audit review check repo a", Author: "alice"}},
 			},
 		},
-		"/tmp/repo-b": {
+		checkoutB: {
 			pulls: []github.PullRequest{{Number: 1, Title: "B", State: "open", HeadRef: "task-b", BaseRef: "main", HeadSHA: "sha-b"}},
 			comments: map[int64][]github.IssueComment{
 				1: {{ID: 77, Body: "/gitmoot audit review check repo b", Author: "alice"}},
@@ -286,9 +290,10 @@ func TestPollRegisteredReposBacksOffFailedRepoWithoutStoppingOthers(t *testing.T
 	defer store.Close()
 
 	ctx := context.Background()
+	failingCheckout, healthyCheckout := t.TempDir(), t.TempDir()
 	for _, repo := range []db.Repo{
-		{Owner: "owner", Name: "failing", CheckoutPath: "/tmp/failing", PollInterval: "30s"},
-		{Owner: "owner", Name: "healthy", CheckoutPath: "/tmp/healthy", PollInterval: "30s"},
+		{Owner: "owner", Name: "failing", CheckoutPath: failingCheckout, PollInterval: "30s"},
+		{Owner: "owner", Name: "healthy", CheckoutPath: healthyCheckout, PollInterval: "30s"},
 	} {
 		if err := store.UpsertRepo(ctx, repo); err != nil {
 			t.Fatalf("UpsertRepo(%s) returned error: %v", repo.FullName(), err)
@@ -298,7 +303,7 @@ func TestPollRegisteredReposBacksOffFailedRepoWithoutStoppingOthers(t *testing.T
 	healthy := &cliPollFakeGitHub{}
 	poller := defaultRegisteredRepoPoller(store, 1, false, io.Discard, "", "")
 	poller.GitHubClient = func(checkout string) github.Client {
-		if checkout == "/tmp/failing" {
+		if checkout == failingCheckout {
 			return failing
 		}
 		return healthy
@@ -360,7 +365,7 @@ func TestPollRegisteredReposAdaptiveIdleCadence(t *testing.T) {
 	}
 	defer store.Close()
 	ctx := context.Background()
-	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "idle", CheckoutPath: "/tmp/idle", PollInterval: "1s"}); err != nil {
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "idle", CheckoutPath: t.TempDir(), PollInterval: "1s"}); err != nil {
 		t.Fatal(err)
 	}
 	stats := []github.ConditionalRequestStats{
@@ -420,7 +425,7 @@ func TestPollRegisteredReposIdleErrorBackoffTakesPrecedence(t *testing.T) {
 	}
 	defer store.Close()
 	ctx := context.Background()
-	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", CheckoutPath: "/tmp/repo", PollInterval: "1s"}); err != nil {
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", CheckoutPath: t.TempDir(), PollInterval: "1s"}); err != nil {
 		t.Fatal(err)
 	}
 	poller := defaultRegisteredRepoPoller(store, 1, false, io.Discard, "", "")
@@ -456,7 +461,7 @@ func TestPollRegisteredReposQueuedJobPromotesImmediately(t *testing.T) {
 	}
 	defer store.Close()
 	ctx := context.Background()
-	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", CheckoutPath: "/tmp/repo", PollInterval: "1s"}); err != nil {
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", CheckoutPath: t.TempDir(), PollInterval: "1s"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CreateJob(ctx, db.Job{ID: "queued", Agent: "agent", Type: "ask", State: string(workflow.JobQueued), Payload: `{"repo":"owner/repo"}`}); err != nil {
@@ -501,7 +506,7 @@ func TestPollRegisteredReposQueuedJobDoesNotOverrideErrorBackoff(t *testing.T) {
 	}
 	defer store.Close()
 	ctx := context.Background()
-	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", CheckoutPath: "/tmp/repo", PollInterval: "1s"}); err != nil {
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", CheckoutPath: t.TempDir(), PollInterval: "1s"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CreateJob(ctx, db.Job{ID: "queued", Agent: "agent", Type: "ask", State: string(workflow.JobQueued), Payload: `{"repo":"owner/repo"}`}); err != nil {
@@ -544,7 +549,7 @@ func TestPollRegisteredReposBusyRepoAtBaseCadenceKeepsInterval(t *testing.T) {
 	}
 	defer store.Close()
 	ctx := context.Background()
-	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", CheckoutPath: "/tmp/repo", PollInterval: "1s"}); err != nil {
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", CheckoutPath: t.TempDir(), PollInterval: "1s"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CreateJob(ctx, db.Job{ID: "queued", Agent: "agent", Type: "ask", State: string(workflow.JobQueued), Payload: `{"repo":"owner/repo"}`}); err != nil {
@@ -585,7 +590,7 @@ func TestPollRegisteredReposTreats304AsSuccess(t *testing.T) {
 	}
 	defer store.Close()
 	ctx := context.Background()
-	if err := store.UpsertRepo(ctx, db.Repo{Owner: "etag304", Name: "repo", CheckoutPath: "/tmp/etag304", PollInterval: "1s"}); err != nil {
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "etag304", Name: "repo", CheckoutPath: t.TempDir(), PollInterval: "1s"}); err != nil {
 		t.Fatal(err)
 	}
 	runner := &cliETagRunner{}
@@ -658,5 +663,234 @@ func TestStartSupervisorWorkerLoopRecoveringRetriesAfterRunError(t *testing.T) {
 	defer mu.Unlock()
 	if calls < 2 {
 		t.Fatalf("recovering worker loop calls = %d, want at least 2", calls)
+	}
+}
+
+// A registered repo whose checkout directory has vanished must be reported and
+// SKIPPED (#1758): before the guard it still paid for engine construction, DB
+// passes, a config parse and a `gh` exec that could only fail on chdir, on every
+// tick forever. The factory counter is the load-bearing assertion — a version
+// that logs the problem and then polls anyway would pass a log-only check.
+func TestPollRepoSkipsRepoWhoseCheckoutIsMissing(t *testing.T) {
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	missing := filepath.Join(t.TempDir(), "went-away")
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "gone", CheckoutPath: missing, PollInterval: "1s"}); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	engines, clients := 0, 0
+	poller := defaultRegisteredRepoPoller(store, 1, false, &stdout, "", "")
+	poller.GitHubClient = func(string) github.Client { clients++; return &cliPollFakeGitHub{} }
+	poller.WorkflowFactory = func(*db.Store, github.Client, string) *workflow.Engine {
+		engines++
+		return nil
+	}
+	schedule := registeredRepoSchedule{NextPoll: map[string]time.Time{}, ErrorStreak: map[string]int{}, IdleStreak: map[string]int{}}
+	if _, err := pollRegisteredReposWithPoller(ctx, poller, schedule, time.Now().UTC(), time.Second); err != nil {
+		t.Fatalf("poll pass: %v", err)
+	}
+	if engines != 0 || clients != 0 {
+		t.Fatalf("missing checkout still built %d engines and %d github clients, want 0 and 0", engines, clients)
+	}
+	if !strings.Contains(stdout.String(), "owner/gone: registered repo checkout path is unavailable") {
+		t.Fatalf("poll log = %q, want the unavailable-checkout report", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "polling owner/gone") {
+		t.Fatalf("missing checkout was polled anyway: %q", stdout.String())
+	}
+	repos, err := store.ListRepos(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != 1 || !strings.Contains(repos[0].LastError, "checkout path is unavailable") {
+		t.Fatalf("repos = %+v, want last_error naming the unavailable checkout", repos)
+	}
+}
+
+// The poll line echoed a fleet-wide --workers flag as if it were a per-repo pool
+// (#1758). No such pool exists, so the number is removed rather than corrected.
+func TestPollRepoLogDoesNotClaimAPerRepoWorkerPool(t *testing.T) {
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "live", CheckoutPath: t.TempDir(), PollInterval: "1s"}); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	poller := defaultRegisteredRepoPoller(store, 32, false, &stdout, "", "")
+	poller.GitHubClient = func(string) github.Client { return &cliPollFakeGitHub{} }
+	poller.WorkflowFactory = func(*db.Store, github.Client, string) *workflow.Engine { return nil }
+	schedule := registeredRepoSchedule{NextPoll: map[string]time.Time{}, ErrorStreak: map[string]int{}, IdleStreak: map[string]int{}}
+	if _, err := pollRegisteredReposWithPoller(ctx, poller, schedule, time.Now().UTC(), time.Second); err != nil {
+		t.Fatalf("poll pass: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "polling owner/live dry_run=false") {
+		t.Fatalf("poll log = %q, want the worker-free poll line", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "workers") {
+		t.Fatalf("poll log still advertises a per-repo worker pool: %q", stdout.String())
+	}
+}
+
+// The per-tick config memo must read config.toml ONCE per tick and re-read it on
+// the next one: rewriting the file between two calls on the same cache must be
+// invisible, and visible immediately after reset(). That is the same measurement
+// as counting opens, without depending on strace.
+func TestTickConfigCacheReadsConfigOncePerTick(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	write := func(ttl string) {
+		if err := os.WriteFile(paths.ConfigFile, []byte("[orchestrate]\nblocked_ttl = \""+ttl+"\"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	write("48h")
+	cache := &tickConfigCache{}
+	if got := cache.blockedJobTTL(paths.Home); got != 48*time.Hour {
+		t.Fatalf("blockedJobTTL = %s, want 48h", got)
+	}
+	write("1h")
+	if got := cache.blockedJobTTL(paths.Home); got != 48*time.Hour {
+		t.Fatalf("blockedJobTTL re-read config.toml mid-tick: got %s, want the memoized 48h", got)
+	}
+	// A different home must never be served another home's policy.
+	other := t.TempDir()
+	otherPaths := config.PathsForHome(other)
+	if err := config.Initialize(otherPaths); err != nil {
+		t.Fatal(err)
+	}
+	if got := cache.blockedJobTTL(otherPaths.Home); got != 0 {
+		t.Fatalf("a second home got %s, want its own (unset ⇒ 0) policy", got)
+	}
+	cache.reset()
+	if got := cache.blockedJobTTL(paths.Home); got != time.Hour {
+		t.Fatalf("blockedJobTTL after reset = %s, want the re-read 1h", got)
+	}
+
+	// A nil cache is the un-memoized path and must see every write immediately.
+	var uncached *tickConfigCache
+	write("2h")
+	if got := uncached.blockedJobTTL(paths.Home); got != 2*time.Hour {
+		t.Fatalf("nil cache blockedJobTTL = %s, want 2h", got)
+	}
+
+	// Every other memoized resolver must behave the same way, or the hoist only
+	// covers whichever one the test happened to exercise.
+	writePolicy := func(wake, retention string) {
+		body := "[orchestrate]\nblocked_role_wake_after = \"" + wake + "\"\n[workflow]\ndelegation_worktree_ttl = \"" + retention + "\"\n"
+		if err := os.WriteFile(paths.ConfigFile, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writePolicy("3h", "24h")
+	fresh := &tickConfigCache{}
+	if got := fresh.blockedRoleWakeAfter(paths.Home); got != 3*time.Hour {
+		t.Fatalf("blockedRoleWakeAfter = %s, want 3h", got)
+	}
+	retention, err := fresh.delegationWorktreeTTL(paths.Home)
+	if err != nil || retention != 24*time.Hour {
+		t.Fatalf("delegationWorktreeTTL = %s err=%v, want 24h", retention, err)
+	}
+	writePolicy("9h", "72h")
+	if got := fresh.blockedRoleWakeAfter(paths.Home); got != 3*time.Hour {
+		t.Fatalf("blockedRoleWakeAfter re-read config.toml mid-tick: got %s, want 3h", got)
+	}
+	if got, err := fresh.delegationWorktreeTTL(paths.Home); err != nil || got != 24*time.Hour {
+		t.Fatalf("delegationWorktreeTTL re-read config.toml mid-tick: got %s err=%v, want 24h", got, err)
+	}
+	fresh.reset()
+	if got := fresh.blockedRoleWakeAfter(paths.Home); got != 9*time.Hour {
+		t.Fatalf("blockedRoleWakeAfter after reset = %s, want 9h", got)
+	}
+	if got, err := fresh.delegationWorktreeTTL(paths.Home); err != nil || got != 72*time.Hour {
+		t.Fatalf("delegationWorktreeTTL after reset = %s err=%v, want 72h", got, err)
+	}
+}
+
+// The memory controller is the loader that cost the most for the least: two full
+// config loads per repo per tick to return nil. Memoize the RESULT, nil included,
+// and still re-resolve on the next tick.
+func TestTickConfigCacheMemoizesMemoryController(t *testing.T) {
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	write := func(body string) {
+		if err := os.WriteFile(paths.ConfigFile, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	write("[agents.solo]\nmemory = true\n")
+	cache := &tickConfigCache{}
+	if cache.memoryController(store, paths.Home) == nil {
+		t.Fatal("an enrolled agent must produce a controller")
+	}
+	write("[memory]\ndisabled = true\n")
+	if cache.memoryController(store, paths.Home) == nil {
+		t.Fatal("the controller was re-resolved mid-tick; the memo did not hold")
+	}
+	cache.reset()
+	if cache.memoryController(store, paths.Home) != nil {
+		t.Fatal("after reset the kill switch must take effect")
+	}
+	// The nil result is memoized too — reaching it costs the same two loads.
+	write("[agents.solo]\nmemory = true\n")
+	if cache.memoryController(store, paths.Home) != nil {
+		t.Fatal("the nil result was not memoized")
+	}
+}
+
+// Every poll pass must start from a cold config memo, otherwise the poller would
+// read config.toml once per PROCESS rather than once per tick and stop being
+// live-tunable.
+func TestPollPassResetsConfigCache(t *testing.T) {
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	poller := defaultRegisteredRepoPoller(store, 1, false, io.Discard, "", "")
+	if poller.ConfigCache == nil {
+		t.Fatal("the default poller must carry a config cache")
+	}
+	poller.ConfigCache.memoryDone = true
+	poller.ConfigCache.memoryHome = "stale"
+	// No enabled repos: the pass does nothing except its own setup, so a cleared
+	// cache can only have come from the reset.
+	if _, err := pollRegisteredReposWithPoller(context.Background(), poller, registeredRepoSchedule{}, time.Now().UTC(), time.Second); err != nil {
+		t.Fatalf("poll pass: %v", err)
+	}
+	if poller.ConfigCache.memoryDone || poller.ConfigCache.memoryHome != "" {
+		t.Fatalf("config cache survived a poll pass: %+v", poller.ConfigCache)
 	}
 }

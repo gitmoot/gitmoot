@@ -84,9 +84,8 @@ type Spec struct {
 	// Schedule, when present, drives interval-based auto-runs (heartbeat idiom: an
 	// interval plus optional jitter; no cron in v1).
 	Schedule *Schedule `yaml:"schedule,omitempty"`
-	// Trigger, when present, declares an event source materialized by Gitmoot.
-	// Email uses an owned Activepieces flow; pipeline waits for a successful run
-	// of another named pipeline.
+	// Trigger, when present, starts this pipeline after a successful run of
+	// another named pipeline.
 	Trigger *Trigger `yaml:"trigger,omitempty"`
 	// AllowScheduledWrites, when true, permits MUTATING (implement) stages on a
 	// SCHEDULED pipeline (one carrying a schedule: block) (#768 safety layer 2).
@@ -122,15 +121,10 @@ type Schedule struct {
 	Jitter string `yaml:"jitter,omitempty"`
 }
 
-// Trigger is an event source for a pipeline. Email triggers use the
-// Activepieces-specific connection/mailbox/map fields; pipeline triggers name an
-// upstream pipeline whose successful runs start this pipeline.
+// Trigger names an upstream pipeline whose successful runs start this pipeline.
 type Trigger struct {
-	Kind       string            `yaml:"kind"`
-	Pipeline   string            `yaml:"pipeline,omitempty"`
-	Connection string            `yaml:"connection,omitempty"`
-	Mailbox    string            `yaml:"mailbox,omitempty"`
-	Map        map[string]string `yaml:"map,omitempty"`
+	Kind     string `yaml:"kind"`
+	Pipeline string `yaml:"pipeline,omitempty"`
 }
 
 // Stage is one step in the pipeline DAG. A stage is EITHER a shell step (cmd) or

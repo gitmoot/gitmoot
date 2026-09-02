@@ -132,10 +132,15 @@ func TestPollOnceAsksTheForgeOncePerNumberPerPoll(t *testing.T) {
 	engine := workflow.Engine{Store: store}
 	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
 
+	// This fixture's forge cannot separate "number 12 is an issue" from "the forge is
+	// unreachable" — both surface as a generic error — so PollOnce reports one, exactly
+	// as TestPollOnceLeavesWorkQueuedWhenRevalidationFails requires. The error is not
+	// what this test pins: the COST is. What matters here is that reporting it does not
+	// cost an extra ask, and that the jobs stay queued (asserted below).
 	const polls = 4
 	for poll := range polls {
-		if err := daemon.PollOnce(ctx); err != nil {
-			t.Fatalf("PollOnce %d: %v", poll+1, err)
+		if err := daemon.PollOnce(ctx); err == nil {
+			t.Fatalf("PollOnce %d returned nil: this fixture's #12 lookup fails, and a swallowed revalidation failure is the defect", poll+1)
 		}
 	}
 	asked := 0

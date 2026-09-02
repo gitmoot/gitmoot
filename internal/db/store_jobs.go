@@ -2656,3 +2656,97 @@ func (s *Store) CountActiveJobsByFingerprint(ctx context.Context, fingerprint st
 	}
 	return count, rows.Err()
 }
+
+// TransitionJobStateWithEvents is TransitionJobStateWithEvent for a caller that must
+// land the transition AND a durable OBLIGATION in the same commit (#1673).
+//
+// The single-event form leaves a window: a caller that transitions a job and then
+// writes its re-drive marker separately can crash in between, and a settled job with
+// no marker is invisible to every sweep that would have re-driven it. Passing both
+// events here closes that window by construction rather than by ordering luck.
+func (s *Store) TransitionJobStateWithEvents(ctx context.Context, id string, from string, to string, events ...JobEvent) (bool, error) {
+	return s.TransitionJobStateWithPayloadAndEvents(ctx, id, from, to, nil, events...)
+}
+
+// TransitionJobStateWithPayloadAndEvents additionally rewrites the job's PAYLOAD in
+// the same commit (#1673).
+//
+// THE CLASS, not the site: a caller that terminalizes a job and then writes the
+// payload its recovery path needs has merely MOVED the non-atomicity one step down the
+// sequence. The state it leaves - a settled job carrying a re-drive marker but no
+// result - is unrepairable: the actuator rejects the nil result, re-stamps the marker
+// and repeats forever, and no sweep selects it because the sweeps list QUEUED jobs.
+// Two durable facts that must agree are written by one statement here.
+//
+// A nil payload leaves the stored payload untouched, so the events-only wrapper above
+// is byte-equivalent to the original single-event primitive.
+func (s *Store) TransitionJobStateWithPayloadAndEvents(ctx context.Context, id string, from string, to string, payload []byte, events ...JobEvent) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	var result sql.Result
+	if payload == nil {
+		result, err = tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, to, id, from)
+	} else {
+		// DERIVED FIELDS TRAVEL WITH THE PAYLOAD. jobs.result_hash and the payload
+		// projections are not decoration: the hash is the terminal result's
+		// proof-integrity receipt and its memory-harvest key, and writing a payload that
+		// installs a result while leaving the old (or empty) hash behind breaks that
+		// invariant silently. Every other payload writer recomputes them in the same
+		// UPDATE; so does this one (#1673).
+		projection := jobProjectionFromPayload(string(payload))
+		result, err = tx.ExecContext(ctx, `UPDATE jobs SET state = ?, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`,
+			to, payload, jobResultHashFromPayload(string(payload)), projection.Repo, projection.PullRequest,
+			projection.BlockerRetryAt, projection.BlockerSuggestedAction, to, id, from)
+	}
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, tx.Commit()
+	}
+	for _, event := range events {
+		if event.JobID == "" {
+			event.JobID = id
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+			return false, err
+		}
+	}
+	return true, tx.Commit()
+}
+
+// maxJobEventIDSQL is the change cursor for the candidate queries whose result is
+// a pure function of job_events. It is the same monotonic maximum the dashboard
+// already polls (dashboardChangeCursorSQL) and SQLite answers it with a single
+// descent of the integer primary key, so it costs the same whether the table
+// holds a hundred rows or a hundred thousand.
+const maxJobEventIDSQL = `SELECT COALESCE(MAX(id), 0) FROM job_events`
+
+// MaxJobEventID returns the highest job_events row id, or 0 when the table is
+// empty.
+//
+// It is a sound change cursor for JobIDsWithPendingAdvanceRetry and
+// JobIDsWithPendingCommentRetry specifically, because those two queries read only
+// the (id, kind, job_id) columns of job_events and NOTHING else — no other table,
+// no clock. Production only ever APPENDS to job_events (the sole DELETE is a
+// one-time migration that runs before any tick) and its in-place updates —
+// RefreshLatestAdvanceRetry, the running-job progress refresh, and the claimed
+// permission-policy warning — all SET message/created_at only, never id, kind or
+// job_id. So an unmoved maximum id proves those two result sets are unchanged.
+//
+// It is NOT a sound cursor for the delegation/aged/task reclaim candidates: those
+// join jobs and cleanup_obligations and compare against unixepoch('now'), so their
+// results change with the clock alone.
+func (s *Store) MaxJobEventID(ctx context.Context) (int64, error) {
+	var id int64
+	err := s.db.QueryRowContext(ctx, maxJobEventIDSQL).Scan(&id)
+	return id, err
+}

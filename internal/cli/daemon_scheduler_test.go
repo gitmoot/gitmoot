@@ -5382,3 +5382,309 @@ func TestTickCandidatesRetriesOnError(t *testing.T) {
 		t.Fatalf("malformed owner query ran %d times, want 2", got)
 	}
 }
+
+// scriptedCursorStore drives the job_events cursor cache (#1758) directly: it
+// reports a cursor the test controls and can mutate its own candidate set from
+// INSIDE the guarded query, which is how the hazard the cache must survive is
+// reproduced deterministically — an event landing after the cursor was read but
+// after the query already took its snapshot.
+type scriptedCursorStore struct {
+	cursor      int64
+	ids         []string
+	queries     int
+	cursorReads int
+	cursorErr   error
+	duringQuery func(*scriptedCursorStore)
+}
+
+func (s *scriptedCursorStore) MaxJobEventID(context.Context) (int64, error) {
+	s.cursorReads++
+	if s.cursorErr != nil {
+		return 0, s.cursorErr
+	}
+	return s.cursor, nil
+}
+
+func (s *scriptedCursorStore) JobIDsWithPendingAdvanceRetry(context.Context) ([]string, error) {
+	s.queries++
+	snapshot := append([]string(nil), s.ids...)
+	if s.duringQuery != nil {
+		s.duringQuery(s)
+	}
+	return snapshot, nil
+}
+
+func (s *scriptedCursorStore) JobIDsWithPendingCommentRetry(context.Context) ([]string, error) {
+	return nil, nil
+}
+
+func (s *scriptedCursorStore) JobIDsWithPendingDelegationWorktreeReclaim(context.Context) ([]string, error) {
+	return nil, nil
+}
+
+func (s *scriptedCursorStore) JobIDsWithAgedTerminalDelegationWorktree(context.Context, time.Time) ([]string, error) {
+	return nil, nil
+}
+
+func (s *scriptedCursorStore) TaskIDsWithTerminalWorktree(context.Context) ([]string, error) {
+	return nil, nil
+}
+
+func (s *scriptedCursorStore) FirstMalformedNonFinalJob(context.Context) (string, error) {
+	return "", nil
+}
+
+// The cursor cache may DEFER an advancement by at most one tick; it must never
+// DROP one. The mutant this kills is recording the cursor AFTER the query instead
+// of before: an event written while the query is in flight would then be covered
+// by a cursor the query never saw, and the candidate would be skipped forever.
+func TestJobEventCursorCacheDefersButNeverDropsAnAdvancement(t *testing.T) {
+	ctx := context.Background()
+	cache := &jobEventCandidateCache{}
+	store := &scriptedCursorStore{cursor: 10, ids: []string{"job-a"}}
+	tick := func() []string {
+		cand := newTickCandidates(store)
+		cand.events = cache
+		ids, err := cand.advanceRetryCandidates(ctx)
+		if err != nil {
+			t.Fatalf("advanceRetryCandidates: %v", err)
+		}
+		return ids
+	}
+
+	if got := tick(); !reflect.DeepEqual(got, []string{"job-a"}) {
+		t.Fatalf("cold tick candidates = %v, want [job-a]", got)
+	}
+	if store.queries != 1 {
+		t.Fatalf("cold tick ran %d queries, want 1", store.queries)
+	}
+
+	// Unmoved cursor: the candidate query is SKIPPED and the memo is served.
+	if got := tick(); !reflect.DeepEqual(got, []string{"job-a"}) {
+		t.Fatalf("cached tick candidates = %v, want [job-a]", got)
+	}
+	if store.queries != 1 {
+		t.Fatalf("candidate query re-ran with an unmoved cursor (%d runs)", store.queries)
+	}
+	// Deliberately NO assertion on cursor-read counts here: this test must fail on
+	// the DROP, not on an incidental extra query. The read cadence is pinned
+	// separately by TestJobEventCursorCacheReadsCursorOncePerTick.
+
+	// An unrelated event moves the cursor, forcing a query — and a SECOND event
+	// making job-b a candidate lands while that query is in flight.
+	store.cursor = 11
+	store.duringQuery = func(s *scriptedCursorStore) {
+		s.cursor = 12
+		s.ids = []string{"job-a", "job-b"}
+	}
+	if got := tick(); !reflect.DeepEqual(got, []string{"job-a"}) {
+		t.Fatalf("in-flight tick candidates = %v, want the pre-insert snapshot [job-a]", got)
+	}
+	store.duringQuery = nil
+
+	// The cursor now sits past the one that tick recorded, so the next tick must
+	// re-run and surface job-b: deferred by exactly one tick, not dropped.
+	if got := tick(); !reflect.DeepEqual(got, []string{"job-a", "job-b"}) {
+		t.Fatalf("job-b was DROPPED by the cursor cache: candidates = %v", got)
+	}
+	if store.queries != 3 {
+		t.Fatalf("queries = %d, want 3 (cold, cursor-moved, deferred pickup)", store.queries)
+	}
+}
+
+// A cursor read that fails must fall through to the query. The cache may only
+// ever remove redundant work, so a broken cursor degrades to the un-gated
+// behavior rather than to a skip.
+func TestJobEventCursorCacheFallsBackWhenCursorUnavailable(t *testing.T) {
+	ctx := context.Background()
+	cache := &jobEventCandidateCache{}
+	store := &scriptedCursorStore{cursor: 7, ids: []string{"job-a"}}
+	tick := func() []string {
+		cand := newTickCandidates(store)
+		cand.events = cache
+		ids, err := cand.advanceRetryCandidates(ctx)
+		if err != nil {
+			t.Fatalf("advanceRetryCandidates: %v", err)
+		}
+		return ids
+	}
+
+	tick()
+	store.cursorErr = errors.New("cursor unavailable")
+	if got := tick(); !reflect.DeepEqual(got, []string{"job-a"}) {
+		t.Fatalf("candidates with a broken cursor = %v, want [job-a]", got)
+	}
+	if store.queries != 2 {
+		t.Fatalf("queries = %d, want 2: a failed cursor read must never skip the query", store.queries)
+	}
+}
+
+// With no cache attached — every non-supervisor caller — the gating is inert and
+// the cursor is never even read.
+func TestJobEventCursorCacheAbsentRunsEveryQuery(t *testing.T) {
+	ctx := context.Background()
+	store := &scriptedCursorStore{cursor: 3, ids: []string{"job-a"}}
+	for range 3 {
+		cand := newTickCandidates(store)
+		if _, err := cand.advanceRetryCandidates(ctx); err != nil {
+			t.Fatalf("advanceRetryCandidates: %v", err)
+		}
+	}
+	if store.queries != 3 || store.cursorReads != 0 {
+		t.Fatalf("queries=%d cursorReads=%d, want 3 and 0 with no cache attached", store.queries, store.cursorReads)
+	}
+}
+
+// One cheap cursor read replaces the heavy GROUP BY on an idle tick; two reads
+// would mean the gate costs more than it saves on the common path.
+func TestJobEventCursorCacheReadsCursorOncePerTick(t *testing.T) {
+	ctx := context.Background()
+	cache := &jobEventCandidateCache{}
+	store := &scriptedCursorStore{cursor: 5, ids: []string{"job-a"}}
+	for range 4 {
+		cand := newTickCandidates(store)
+		cand.events = cache
+		if _, err := cand.advanceRetryCandidates(ctx); err != nil {
+			t.Fatalf("advanceRetryCandidates: %v", err)
+		}
+	}
+	if store.cursorReads != 4 {
+		t.Fatalf("cursor reads = %d over 4 ticks, want exactly 4", store.cursorReads)
+	}
+	if store.queries != 1 {
+		t.Fatalf("candidate queries = %d over 4 idle ticks, want 1", store.queries)
+	}
+}
+
+// The tests above hand-attach cand.events and drive only the advancement path,
+// which pins the helper rather than the path: production reaches the cache by a
+// route they never take, and it serves TWO kinds, not one. Three mutants survive
+// them — swapping commentRetryCandidates' kind to jobEventCandidateAdvance, and
+// deleting either of the two `cand.events = tracker.jobEventCandidateCache()`
+// attachments. The kind swap is a silent stall in production: an empty cached
+// ADVANCEMENT set at cursor N would be served to comment retries at the same
+// cursor, suppressing a real comment_post_failed candidate until some later event
+// moves MAX(id).
+//
+// The two attachments sit on DIFFERENT production entry paths and each needs its
+// own case:
+//   - daemon_scheduler.go:1701 in runEnabledRepoWorkerTicksTracked — the
+//     multi-repo sweep, which builds one carrier for the whole tick.
+//   - daemon_scheduler.go:1543 in runDaemonWorkerTickTracked, reached ONLY on the
+//     cand == nil branch — the single-repo supervisor and direct callers, which
+//     let the tick build its own carrier.
+//
+// Both are driven through their real entry point below. Hand-attaching
+// cand.events is what made the round-1 tests blind to the wiring, so neither case
+// touches the field.
+func TestJobEventCursorCacheProductionWiringCachesBothKinds(t *testing.T) {
+	t.Run("fleet sweep", func(t *testing.T) {
+		assertCursorCacheWiredForBothKinds(t, func(ctx context.Context, store *db.Store, worker jobWorker, tracker *inflightJobTracker, at time.Time) error {
+			return runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, at, nil, tracker)
+		})
+	})
+	t.Run("standalone tick with no carrier", func(t *testing.T) {
+		assertCursorCacheWiredForBothKinds(t, func(ctx context.Context, store *db.Store, worker jobWorker, tracker *inflightJobTracker, at time.Time) error {
+			// nil carrier: the single-repo supervisor's shape, where the tick
+			// itself builds the carrier and must attach the tracker's cache.
+			return runDaemonWorkerTickTracked(ctx, store, worker, 1, false, "owner/repo", "", io.Discard, at, tracker, nil)
+		})
+	})
+}
+
+// assertCursorCacheWiredForBothKinds runs `drive` for two ticks against a shared
+// tracker and proves the tracker-supplied cursor cache is in force for BOTH
+// candidate kinds, each holding its own set.
+//
+// Every seeded candidate is a pruned-orphan marker — a job_events row with no
+// surviving jobs row — so each pass drops it on the GetJob and the ticks write no
+// job_events. That is what leaves the cursor genuinely unmoved between the two
+// ticks; otherwise the second tick would re-query for an honest reason and the
+// skip assertion would prove nothing. The precondition is asserted, not assumed.
+func assertCursorCacheWiredForBothKinds(t *testing.T, drive func(context.Context, *db.Store, jobWorker, *inflightJobTracker, time.Time) error) {
+	t.Helper()
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
+
+	const advanceID = "adv-pruned-orphan"
+	const commentID = "cmt-pruned-orphan"
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: advanceID, Kind: "advance_started", Message: "orphan"}); err != nil {
+		t.Fatalf("AddJobEvent(advance_started) returned error: %v", err)
+	}
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: commentID, Kind: "comment_post_failed", Message: "orphan"}); err != nil {
+		t.Fatalf("AddJobEvent(comment_post_failed) returned error: %v", err)
+	}
+
+	// The two candidate sets must DIFFER, or a kind-swapped cache would serve the
+	// right answer by accident and this would pin nothing.
+	wantAdvance, err := store.JobIDsWithPendingAdvanceRetry(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantComment, err := store.JobIDsWithPendingCommentRetry(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reflect.DeepEqual(wantAdvance, wantComment) ||
+		!reflect.DeepEqual(wantAdvance, []string{advanceID}) ||
+		!reflect.DeepEqual(wantComment, []string{commentID}) {
+		t.Fatalf("fixture is not discriminating: advance=%v comment=%v", wantAdvance, wantComment)
+	}
+	cursorBefore, err := store.MaxJobEventID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	worker := defaultJobWorker(store, io.Discard)
+	tracker := newInflightJobTracker(ctx)
+	defer tracker.drain(io.Discard, time.Second)
+	counter := &countingCandidateStore{inner: store}
+	realNewTickCandidates := newTickCandidates
+	newTickCandidates = func(tickCandidateStore) *tickCandidates {
+		return realNewTickCandidates(counter)
+	}
+	defer func() { newTickCandidates = realNewTickCandidates }()
+
+	now := time.Now().UTC()
+	for i, at := range []time.Time{now, now.Add(time.Second)} {
+		if err := drive(ctx, store, worker, tracker, at); err != nil {
+			t.Fatalf("tick %d returned error: %v", i+1, err)
+		}
+	}
+
+	cursorAfter, err := store.MaxJobEventID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursorAfter != cursorBefore {
+		t.Fatalf("the ticks wrote job_events (cursor %d -> %d); the skip below would be untestable", cursorBefore, cursorAfter)
+	}
+
+	// The cache the PRODUCTION wiring attached, not one this test supplied.
+	cache := tracker.jobEventCandidateCache()
+	advanceIDs, advanceCached := cache.lookup(jobEventCandidateAdvance, cursorBefore)
+	commentIDs, commentCached := cache.lookup(jobEventCandidateComment, cursorBefore)
+	if !advanceCached || !commentCached {
+		t.Fatalf("production wiring did not populate the cache: advance cached=%v comment cached=%v", advanceCached, commentCached)
+	}
+	if !reflect.DeepEqual(advanceIDs, wantAdvance) {
+		t.Fatalf("cached advancement candidates = %v, want %v", advanceIDs, wantAdvance)
+	}
+	if !reflect.DeepEqual(commentIDs, wantComment) {
+		t.Fatalf("cached comment candidates = %v, want %v (a kind collision serves one pass the other's set)", commentIDs, wantComment)
+	}
+
+	// Two ticks, one query each: the second tick's cursor was unmoved, so both
+	// gated queries were skipped. Without the production attachment the carrier
+	// gates nothing and each count is 2.
+	if got := atomic.LoadInt32(&counter.advance); got != 1 {
+		t.Fatalf("advancement candidate query ran %d times over two unchanged ticks, want 1", got)
+	}
+	if got := atomic.LoadInt32(&counter.comment); got != 1 {
+		t.Fatalf("comment candidate query ran %d times over two unchanged ticks, want 1", got)
+	}
+	if got := atomic.LoadInt32(&counter.jobEventCursor); got < 2 {
+		t.Fatalf("cursor reads = %d, want at least one per gated query per tick", got)
+	}
+}

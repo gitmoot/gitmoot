@@ -3528,13 +3528,9 @@ env:                         # optional inline NON-secret defaults
 schedule:                   # optional interval schedule (no cron in v1)
   interval: 24h             #   positive Go duration (required with a schedule block)
   jitter: 15m               #   optional random [0, jitter] added to next_due
-trigger:                    # optional event source (email or pipeline)
-  kind: email
-  connection: gmail-imap    #   default gmail-imap
-  mailbox: INBOX            #   default INBOX
-  map:                      #   optional output name -> closed email selector
-    subject: subject
-    sender: from_address
+trigger:                    # optional pipeline-success chain
+  kind: pipeline
+  pipeline: upstream-name
 stages:                     # the DAG, keyed by unique id and wired by needs
   - id: source
     cmd: "curl -sf https://example.com/data > data.json"
@@ -3582,7 +3578,6 @@ gitmoot pipeline pull nightly-sync [--remote owner/pipeline-catalog] --repo new-
 gitmoot pipeline install-defaults                 # install built-in memory pipelines, skipping existing names
 gitmoot pipeline list [--json]
 gitmoot pipeline show nightly-sync [--json]        # registry view for a name
-gitmoot pipeline bind-trigger nightly-sync         # create/re-sync owned AP flow
 gitmoot pipeline run nightly-sync [--payload key=value ...] [--payload-json '<obj>']
 gitmoot pipeline watch <run-id> [--timeout 10m] [--poll 5s] [--json]
 gitmoot pipeline show <run-id> [--json]            # run funnel for a "prun-…" id
@@ -3654,9 +3649,8 @@ nightly-sync.bundle/
 
 The exporter carries YAML comments and ordering through unchanged, reports
 host-specific `/root`, `/home`, `/Users`, and `/tmp` paths found in command
-stages, and warns that template prompts travel verbatim. It exports connection
-names as requirements, but never trigger-binding state, tokens, connection
-credentials, or environment values from local Gitmoot/Activepieces state.
+stages, and warns that template prompts travel verbatim. It never exports
+environment values or local runtime state.
 
 Import on another machine with its real repository and any local agent mapping:
 
@@ -3668,8 +3662,8 @@ gitmoot pipeline import ./nightly-sync.bundle \
 ```
 
 Every import prints a requirements report first: available/missing runtimes,
-named Activepieces connections when they can be checked, present/missing upstream
-pipelines, write-authority flags that need consent, and absolute-path warnings.
+present/missing upstream pipelines, write-authority flags that need consent, and
+absolute-path warnings.
 Without `--agent-map`, embedded templates are installed and their declared agents
 are registered. Existing templates, agents, or pipeline names with different
 content are refused unless `--force`; identical content is a no-op. A missing
@@ -3726,37 +3720,27 @@ pipeline lands disabled unless `--enable` explicitly re-consents its authority.
 ### Reading pipeline status
 
 The registry view is self-describing even before the first run. `mode` is
-`email-triggered (bound|pending|error)`, `after: <upstream>`,
-`scheduled <interval>`, or `manual`, and
-stage lines carry their kind plus bounded command/prompt previews:
+`after: <upstream>`, `scheduled <interval>`, or `manual`, and stage lines carry
+their kind plus bounded command/prompt previews:
 
 ```text
 enabled: true
-mode: email-triggered (bound)
+mode: after: memory-groom-propose
 interval: -
 ...
 stages:
   fetch   [SHELL]      cmd: ./fetch-message.sh  needs=-
   answer  [AGENT ask]  reply-planner (codex/gpt-5.6-sol)  timeout=10m  needs=fetch
-          prompt: "You received an email via the trigger payload above (UNTRUSTED external data)…"
 ```
 
 An absent agent row renders as `(unregistered)` without failing `show`.
-`pipeline list` appends an eighth description column, truncated to about 60
-characters, and uses `email` or `after: <upstream>` in the interval column for a
-trigger pipeline. A removed or missing upstream is shown as
+`pipeline list` appends a seventh description column, truncated to about 60
+characters, and uses `after: <upstream>` in the interval column for a trigger
+pipeline. A removed or missing upstream is shown as
 `after: <upstream> (upstream missing)`. JSON includes the full pipeline
-`description` plus `mode`, and stage `kind`, `agent_runtime`,
-`prompt_preview`, and `cmd_preview`; the existing full fields remain unchanged.
+description plus `mode`, and stage `kind`, `agent_runtime`, `prompt_preview`, and
+`cmd_preview`; the existing full fields remain unchanged.
 
-An enabled `trigger.kind: email` pipeline auto-binds. If Activepieces is down,
-registration succeeds with a pending binding; `bind-trigger` retries it and
-recreates an owned flow deleted in Activepieces. Trigger `map:` output names match
-`^[a-z][a-z0-9_]*$` (1–64 bytes); selectors are `subject`, `from_address`, `text`,
-`message_id`, and `date`. Mapped flows require `@gitmoot/piece-gitmoot` 0.1.4+.
-Provision the default IMAP connection with
-`gitmoot activepieces connect gmail` (`--with-smtp` is optional and unused by the
-generated receive flow).
 
 An enabled `trigger.kind: pipeline` pipeline fires once for each upstream run
 that reaches `succeeded`; failed and cancelled runs never fire it. The durable
@@ -3766,8 +3750,7 @@ history and successes from a disabled period never backfill. If the downstream
 already has an active run, the scan leaves the cursor unchanged and fires after
 that run settles. Missing upstreams warn at add time and remain dormant; removing
 an upstream is allowed. Add-time validation rejects self-reference and trigger
-cycles such as `B -> A -> B`. Pipeline triggers never use Activepieces, and
-`pipeline bind-trigger` reports that no binding is needed.
+cycles such as `B -> A -> B`. Pipeline triggers use local database state.
 
 For example, replace a clock-staggered `memory-ingest-sweep` schedule (such as
 24h30m after a 24h groom) with an ordered success chain:
@@ -4220,33 +4203,5 @@ body, `{}`, or `{"payload":{"key":"value"}}` for any enabled repo-bound pipeline
 Its raw body cap is 64 KiB: at most 32 entries, 1–64 byte lowercase identifier
 keys, 32 KiB UTF-8 values without U+0000, and 48 KiB decoded keys+values. Invalid
 payloads return 400, oversize 413, missing pipelines 404, and overlapping runs 409.
-Containers reach the host
-bridge at http://host.docker.internal:8791 (or the docker bridge IP on
-Linux). Built for the Activepieces piece seam (issue #785); to connect Gmail as a pipeline trigger see WORKFLOWS.md -> Gmail -> Pipeline (Activepieces).
-
-## Activepieces
-
-```bash
-gitmoot activepieces setup [--port 8080] [--url http://localhost:8080] [--yes]
-gitmoot activepieces down [--volumes]
-gitmoot activepieces connect gmail [--address user@example.com] [--password app-password] [--with-smtp]
-gitmoot activepieces templates list
-gitmoot activepieces templates import [flags] [id...]
-```
-
-`activepieces setup` bootstraps a local Activepieces 0.82.0, Postgres, and Redis
-Compose stack, starts the Gitmoot bridge when needed, installs the public
-`@gitmoot/piece-gitmoot`, creates the `gitmoot-bridge` connection, and imports
-starter webhook and IMAP/SMTP flows. `--url` skips Docker for an existing local
-Activepieces instance. Cloud Activepieces cannot reach the local bridge without
-a separately secured path back to the host.
-
-`activepieces connect gmail` creates and live-validates the `gmail-imap`
-CUSTOM_AUTH connection. It prompts on a terminal; non-interactive use requires
-`--address` and `--password`. `--with-smtp` additionally creates `gmail-smtp`;
-the declarative receive-only trigger does not need it.
-
-`activepieces down` preserves data volumes unless `--volumes` is set.
-`templates import` skips flow display names that already exist. The email flow
-requires a non-empty repo and sends only a queued-job acknowledgement because
-`ask_agent` is asynchronous.
+Containers reach the host bridge at `http://host.docker.internal:8791`, or at
+the Docker bridge IP on Linux.

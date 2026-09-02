@@ -647,7 +647,7 @@ func TestDaemonWorkflowGitHubRoutesConsumeResolvedSubprocessRunner(t *testing.T)
 		Limiter:    github.NewRateLimiter(github.RateLimiterConfig{}),
 	}
 	checkout := t.TempDir()
-	engine := daemonWorkflowEngineForRunner(nil, source, checkout, "", runner)
+	engine := daemonWorkflowEngineForRunner(nil, source, checkout, "", runner, nil)
 	finalizer, ok := engine.ImplementationFinalizer.(daemonImplementationFinalizer)
 	if !ok {
 		t.Fatalf("implementation finalizer = %T, want daemonImplementationFinalizer", engine.ImplementationFinalizer)

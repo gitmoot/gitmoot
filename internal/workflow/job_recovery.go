@@ -451,7 +451,9 @@ func releaseSupersededJobResourcesAtGeneration(ctx context.Context, store *db.St
 		return false, err
 	}
 	if supersedeDebtInterleaveHook != nil {
-		supersedeDebtInterleaveHook(ctx, supersedeDebtStageAfterResourceCommit)
+		if err := supersedeDebtInterleaveHook(ctx, supersedeDebtStageAfterResourceCommit); err != nil {
+			return true, err
+		}
 	}
 	payload, perr := unmarshalPayload(job.Payload)
 	if perr != nil {
@@ -485,7 +487,9 @@ func releaseSupersededJobResourcesAtGeneration(ctx context.Context, store *db.St
 		}
 	}
 	if supersedeDebtInterleaveHook != nil {
-		supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeTaskLane)
+		if err := supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeTaskLane); err != nil {
+			return true, err
+		}
 	}
 	// The task lane's inactivity vetoes are NOT sufficient for this caller. The
 	// tasks veto deliberately excludes the exact implementing task being cleaned up,
@@ -529,7 +533,9 @@ func releaseSupersededJobResourcesAtGeneration(ctx context.Context, store *db.St
 		}
 	}
 	if supersedeDebtInterleaveHook != nil {
-		supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeReclaim)
+		if err := supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeReclaim); err != nil {
+			return true, err
+		}
 	}
 	// The reclaim marker is the dangerous one to append blind: the worktree path is
 	// derived from the job id, so it is the SAME path a retry is using, and an
@@ -850,7 +856,9 @@ func (e Engine) CompletePendingSupersedeFinalization(ctx context.Context, jobID 
 		return true, recordSupersedeFinalizationVoided(ctx, e.Store, job, debt)
 	}
 	if supersedeDebtInterleaveHook != nil {
-		supersedeDebtInterleaveHook(ctx, supersedeDebtStageAfterRead)
+		if err := supersedeDebtInterleaveHook(ctx, supersedeDebtStageAfterRead); err != nil {
+			return false, err
+		}
 	}
 	// CLAIM the run, rather than acting on the read above. The read and the writes
 	// live in different transactions, so between them `gitmoot job retry` can queue
@@ -1012,7 +1020,7 @@ func (e Engine) renewSupersedeAdvanceLease(ctx context.Context) error {
 // section. Nil in production.
 var supersedeAdvanceBarrierHook func(ctx context.Context, barrier string)
 
-var supersedeDebtInterleaveHook func(ctx context.Context, stage string)
+var supersedeDebtInterleaveHook func(ctx context.Context, stage string) error
 
 // supersedeFinalizeDebt is the state of a job's supersession debt: whether one is
 // outstanding, which lifecycle incurred it, and the reason to reuse when paying.
@@ -1072,7 +1080,9 @@ func recordSupersedeFinalizationVoided(ctx context.Context, store *db.Store, job
 		detail = "an unanchored marker"
 	}
 	if supersedeDebtInterleaveHook != nil {
-		supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeClosure)
+		if err := supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeClosure); err != nil {
+			return err
+		}
 	}
 	// Conditional for the same reason completion is: a void races the same retry.
 	// If a newer pending marker has landed, writing this one would close a debt
@@ -1101,7 +1111,9 @@ func completeSupersedeFinalization(ctx context.Context, engine *Engine, store *d
 	// closing the debt it was carrying: releasing another run's locks or worktree
 	// would be worse than leaving this debt for the next poll.
 	if supersedeDebtInterleaveHook != nil {
-		supersedeDebtInterleaveHook(ctx, supersedeDebtStageAfterClaim)
+		if err := supersedeDebtInterleaveHook(ctx, supersedeDebtStageAfterClaim); err != nil {
+			return err
+		}
 	}
 	current, err := store.GetJob(ctx, job.ID)
 	if err != nil {
@@ -1112,7 +1124,9 @@ func completeSupersedeFinalization(ctx context.Context, engine *Engine, store *d
 	}
 	// The window F-1 named: validated above, cleanup below, two statements apart.
 	if supersedeDebtInterleaveHook != nil {
-		supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeCleanup)
+		if err := supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeCleanup); err != nil {
+			return err
+		}
 	}
 	// A queued job dying here owes the SAME cleanups a cancel does — resource locks,
 	// a per-delegation branch lock, the task lane lock, a dispatch-time read-only
@@ -1135,7 +1149,9 @@ func completeSupersedeFinalization(ctx context.Context, engine *Engine, store *d
 		return recordSupersedeFinalizationCompleted(ctx, store, job.ID, reason, generation, nil)
 	}
 	if supersedeDebtInterleaveHook != nil {
-		supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeFinalize)
+		if err := supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeFinalize); err != nil {
+			return err
+		}
 	}
 	finalized, finalizeErr := engine.finalizeSupersededDelegationChildAtGeneration(ctx, job.ID, reason, generation)
 	if finalizeErr != nil && !isDelegationPolicyOutcome(finalizeErr) {
@@ -1182,7 +1198,9 @@ func completeSupersedeFinalization(ctx context.Context, engine *Engine, store *d
 // the caller must NOT close the debt.
 func (e Engine) advanceSupersededChildAtGeneration(ctx context.Context, jobID string, generation int64) (bool, error) {
 	if supersedeDebtInterleaveHook != nil {
-		supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeAdvanceClaim)
+		if err := supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeAdvanceClaim); err != nil {
+			return false, err
+		}
 	}
 	// OWNERSHIP FIRST, and it is a renewable lease rather than an age-bounded
 	// marker: RetryJob's exclusion predicate reads this lock, so taking it here is
@@ -1219,7 +1237,9 @@ func (e Engine) advanceSupersededChildAtGeneration(ctx context.Context, jobID st
 		return false, err
 	}
 	if supersedeDebtInterleaveHook != nil {
-		supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeAdvance)
+		if err := supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeAdvance); err != nil {
+			return false, err
+		}
 	}
 	// The advance runs on a COPY of the engine carrying the anchor, so every
 	// parent-effect class inside advanceDelegations renews ownership and re-asserts
@@ -1227,7 +1247,15 @@ func (e Engine) advanceSupersededChildAtGeneration(ctx context.Context, jobID st
 	// aborted barrier returns before the effect it guards.
 	anchored := e
 	anchored.supersedeAdvance = &supersedeAdvanceAnchor{JobID: jobID, Generation: generation, LockKey: lockKey, Token: token}
-	advanceErr := anchored.AdvanceJob(ctx, jobID)
+	// PARENT DAG ONLY, and the two guards are not interchangeable (#1673/#1731). The
+	// anchor stops a SUPERSEDED lifecycle from applying parent effects; this stops a
+	// DEAD CHILD from dispatching its OWN delegations, which no ownership check can
+	// refuse because that dispatch belongs to the anchored lifecycle and is therefore
+	// legitimate by the anchor's own test. This path was written before the parent-only
+	// operation existed and called the full AdvanceJob; on the merged tree that
+	// re-opens the hole #1763 closed - a recovery running without a validated checkout
+	// spawning the child's grandchildren.
+	advanceErr := anchored.AdvanceParentDAGForTerminalChild(ctx, jobID)
 	var rolledBack supersedeAdvanceRolledBackError
 	if errors.As(advanceErr, &rolledBack) {
 		e.recordSupersedeAdvanceRaced(ctx, jobID, generation, advanceErr)
@@ -1330,7 +1358,9 @@ func recordSupersedeFinalizationCompleted(ctx context.Context, store *db.Store, 
 		return outcome
 	}
 	if supersedeDebtInterleaveHook != nil {
-		supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeClosure)
+		if err := supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeClosure); err != nil {
+			return err
+		}
 	}
 	// The read above only decides WHETHER to attempt the close; the store re-asserts
 	// the same predicate inside the INSERT, so a pending marker for a newer
@@ -1339,4 +1369,28 @@ func recordSupersedeFinalizationCompleted(ctx context.Context, store *db.Store, 
 		return err
 	}
 	return outcome
+}
+
+// SetClosedPRChildPreAdvanceHookForTest installs an interruption at the window between
+// the atomic terminal commit and the parent advancement — the window the round-2 #1763
+// P1 occupied. The actuator that recovers it lives in internal/cli, so the boundary can
+// only be exercised end-to-end from there (#1673).
+//
+// It is an ADAPTER over supersedeDebtInterleaveHook rather than a second hook. Both
+// named the same boundary, and the merge of #1731 with #1763 left the standalone one
+// with no production call site at all: it still compiled, its test still passed against
+// main's code, and it constrained nothing here. Two seams at one boundary is how that
+// happens quietly, so there is one seam and this is a view onto its before-advance
+// stage.
+func SetClosedPRChildPreAdvanceHookForTest(hook func(ctx context.Context) error) {
+	if hook == nil {
+		supersedeDebtInterleaveHook = nil
+		return
+	}
+	supersedeDebtInterleaveHook = func(ctx context.Context, stage string) error {
+		if stage != supersedeDebtStageBeforeAdvance {
+			return nil
+		}
+		return hook(ctx)
+	}
 }

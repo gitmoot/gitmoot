@@ -352,12 +352,12 @@ func runSupersedeDebtInterleaveCase(t *testing.T, stage string) {
 	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
 	const lockKey = "runtime:codex:session-retry"
 	interleaved := 0
-	supersedeDebtInterleaveHook = func(hookCtx context.Context, at string) {
+	supersedeDebtInterleaveHook = func(hookCtx context.Context, at string) error {
 		if at != stage || interleaved > 0 {
 			// Once only: a stage can be reached twice (the finalizer arm and the
 			// already-stamped arm both bracket the advance), and re-running the retry
 			// would model something no operator does.
-			return
+			return nil
 		}
 		interleaved++
 		if _, err := RetryJob(hookCtx, store, child); err != nil {
@@ -378,6 +378,7 @@ func runSupersedeDebtInterleaveCase(t *testing.T, stage string) {
 		if err != nil || !locked {
 			t.Fatalf("AcquireResourceLock acquired=%v err=%v", locked, err)
 		}
+		return nil
 	}
 	t.Cleanup(func() { supersedeDebtInterleaveHook = nil })
 	finalizedBefore := countWorkflowJobEvents(t, store, child, "delegation_timeout_finalized")
@@ -522,17 +523,17 @@ func TestSupersedeDebtClosureRefusesADebtAppendedMidClosure(t *testing.T) {
 			}
 
 			fired := 0
-			supersedeDebtInterleaveHook = func(hookCtx context.Context, at string) {
+			supersedeDebtInterleaveHook = func(hookCtx context.Context, at string) error {
 				// Breaking the claim routes the pass down the void path instead of the
 				// payment path; both end in a terminal marker append.
 				if tc.breakClaim && at == supersedeDebtStageAfterRead {
 					if _, err := RetryJob(hookCtx, store, job); err != nil {
 						t.Fatalf("RetryJob to break the claim: %v", err)
 					}
-					return
+					return nil
 				}
 				if at != supersedeDebtStageBeforeClosure || fired > 0 {
-					return
+					return nil
 				}
 				fired++
 				// A retry queues a new lifecycle and a fresh supersession records ITS
@@ -554,6 +555,7 @@ func TestSupersedeDebtClosureRefusesADebtAppendedMidClosure(t *testing.T) {
 				if err != nil || !appended {
 					t.Fatalf("append the newer debt: transitioned=%v err=%v", appended, err)
 				}
+				return nil
 			}
 			t.Cleanup(func() { supersedeDebtInterleaveHook = nil })
 
@@ -624,9 +626,9 @@ func TestSupersedeCleanupRefusesATerminalRetryAtANewerGeneration(t *testing.T) {
 	now := time.Date(2026, 9, 1, 9, 0, 0, 0, time.UTC)
 	const lockKey = "runtime:codex:session-terminal-retry"
 	interleaved := 0
-	supersedeDebtInterleaveHook = func(hookCtx context.Context, at string) {
+	supersedeDebtInterleaveHook = func(hookCtx context.Context, at string) error {
 		if at != supersedeDebtStageBeforeCleanup || interleaved > 0 {
-			return
+			return nil
 		}
 		interleaved++
 		if _, err := RetryJob(hookCtx, store, job); err != nil {
@@ -647,6 +649,7 @@ func TestSupersedeCleanupRefusesATerminalRetryAtANewerGeneration(t *testing.T) {
 		if err != nil || !locked {
 			t.Fatalf("AcquireResourceLock acquired=%v err=%v", locked, err)
 		}
+		return nil
 	}
 	t.Cleanup(func() { supersedeDebtInterleaveHook = nil })
 

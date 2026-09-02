@@ -50,19 +50,22 @@ var jobStateWriteAllowlist = map[string]int{
 	// lifecycle generation and carries bumpLifecycleGenerationSQL like every
 	// other state assignment, so a stale run cannot rewrite a newer result.
 	//
-	// The eleventh (TransitionJobStateAtGeneration, #1673) is the eventless
-	// counterpart: a recovery pass CLAIMS the exact run it decided about by
-	// re-asserting (state, generation) as a self-transition, so a retry queued
-	// since that decision wins instead of being finalized by the stale verdict. It
-	// carries bumpLifecycleGenerationSQL too, so a claim that is also a re-queue
-	// advances the counter exactly like every other writer.
-	//
-	// The twelfth (TransitionJobStatePayloadWithEventUnlessAdvanceOwned, #1673) is the
-	// retry arm carrying the advance-ownership exclusion in its own statement: claim
-	// absence and the terminal-to-queued transition commit together, because a
-	// pre-check loses to a recovery pass that takes ownership in between. It bumps the
-	// generation exactly like every other writer.
-	"internal/db/store_jobs.go": 12,
+	// The ELEVENTH is TransitionJobStateWithPayloadAndEvents' payload-carrying arm
+	// (#1673). It exists because terminalizing a job and then writing the payload its
+	// recovery path needs are two statements, and the state in between - a settled job
+	// with a re-drive marker and no result - is unrepairable: the retry actuator rejects
+	// the nil result, re-stamps the marker, and no sweep selects it because the sweeps
+	// list QUEUED jobs. The arm is state-anchored and carries
+	// bumpLifecycleGenerationSQL, exactly like the payload-free arm beside it.
+	// The TWELFTH through FOURTEENTH arrive with #1731's advance-ownership work meeting
+	// #1763 on main, and each was audited individually rather than accepted as a delta:
+	// TransitionJobStateAtGeneration and
+	// TransitionJobStatePayloadWithEventUnlessAdvanceOwned are the generation-anchored
+	// and ownership-refusing arms this PR adds, and TransitionJobStateWithPayloadAndEvents
+	// contributes a SECOND write (its payload-free arm) that arrived from main. All three
+	// carry bumpLifecycleGenerationSQL; the count was verified by listing every writer with
+	// its bump count, not by adjusting the total until the test passed.
+	"internal/db/store_jobs.go": 14,
 }
 
 // TestEveryJobStateWriteBumpsTheLifecycleGeneration enforces the seam #1407's design rests on.

@@ -49,9 +49,9 @@ func TestSupersedeCleanupKeepsARetriedDelegationBranchLock(t *testing.T) {
 	// The retry re-queues the leg and re-acquires the SAME delegation lane, in the
 	// window after the guarded resource transaction commits.
 	interleaved := 0
-	supersedeDebtInterleaveHook = func(hookCtx context.Context, at string) {
+	supersedeDebtInterleaveHook = func(hookCtx context.Context, at string) error {
 		if at != supersedeDebtStageAfterResourceCommit {
-			return
+			return nil
 		}
 		interleaved++
 		if _, err := RetryJob(hookCtx, store, child); err != nil {
@@ -62,6 +62,7 @@ func TestSupersedeCleanupKeepsARetriedDelegationBranchLock(t *testing.T) {
 		}); err != nil || !acquired {
 			t.Fatalf("retry re-acquire delegation lane: acquired=%v err=%v", acquired, err)
 		}
+		return nil
 	}
 	t.Cleanup(func() { supersedeDebtInterleaveHook = nil })
 
@@ -157,9 +158,9 @@ func TestSupersedeCleanupKeepsATaskLaneOwnedByATerminalRetry(t *testing.T) {
 	}
 
 	interleaved := 0
-	supersedeDebtInterleaveHook = func(hookCtx context.Context, at string) {
+	supersedeDebtInterleaveHook = func(hookCtx context.Context, at string) error {
 		if at != supersedeDebtStageBeforeTaskLane {
-			return
+			return nil
 		}
 		interleaved++
 		// The retry advances the generation AND settles terminal, so neither
@@ -172,6 +173,7 @@ func TestSupersedeCleanupKeepsATaskLaneOwnedByATerminalRetry(t *testing.T) {
 		if acquired, err := store.AcquireLock(hookCtx, db.BranchLock{RepoFullName: repo, Branch: branch, Owner: "impl"}); err != nil || !acquired {
 			t.Fatalf("retry re-acquire task lane: acquired=%v err=%v", acquired, err)
 		}
+		return nil
 	}
 	t.Cleanup(func() { supersedeDebtInterleaveHook = nil })
 
@@ -334,9 +336,9 @@ func TestSupersedeAdvanceClaimPreventsAdvancingAMovedLifecycle(t *testing.T) {
 	}
 
 	interleaved := 0
-	supersedeDebtInterleaveHook = func(hookCtx context.Context, at string) {
+	supersedeDebtInterleaveHook = func(hookCtx context.Context, at string) error {
 		if at != supersedeDebtStageBeforeAdvanceClaim {
-			return
+			return nil
 		}
 		interleaved++
 		// A payload-preserving lifecycle bump: AdvanceJob would SUCCEED if it ran.
@@ -345,6 +347,7 @@ func TestSupersedeAdvanceClaimPreventsAdvancingAMovedLifecycle(t *testing.T) {
 				t.Fatalf("UpdateJobState(%s): %v", state, err)
 			}
 		}
+		return nil
 	}
 	t.Cleanup(func() { supersedeDebtInterleaveHook = nil })
 
@@ -500,9 +503,9 @@ func TestSupersedeAdvanceRefusesALifecycleMovedDuringASuccessfulAdvance(t *testi
 	}
 
 	interleaved := 0
-	supersedeDebtInterleaveHook = func(hookCtx context.Context, at string) {
+	supersedeDebtInterleaveHook = func(hookCtx context.Context, at string) error {
 		if at != supersedeDebtStageBeforeAdvance {
-			return
+			return nil
 		}
 		interleaved++
 		// A lifecycle bump that PRESERVES the payload, so AdvanceJob still has a
@@ -512,6 +515,7 @@ func TestSupersedeAdvanceRefusesALifecycleMovedDuringASuccessfulAdvance(t *testi
 				t.Fatalf("UpdateJobState(%s): %v", state, err)
 			}
 		}
+		return nil
 	}
 	t.Cleanup(func() { supersedeDebtInterleaveHook = nil })
 

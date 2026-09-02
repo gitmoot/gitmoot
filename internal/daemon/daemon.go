@@ -1646,7 +1646,7 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 	// same unrecorded number cost N identical GetPullRequest calls in a single poll,
 	// and an issue-bound job — which can never be terminated — repeats that cost on
 	// every poll forever.
-	evidence := map[int]bool{}
+	evidence := map[int]forgeClosureAnswer{}
 	var firstErr error
 	for _, job := range jobs {
 		payload, err := workflowPayload(job)
@@ -1695,7 +1695,14 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 		// poll and it cannot separate a closed PR from an ISSUE number. Ask the forge
 		// for the authoritative answer — is this a pull request, and is it not open
 		// right now — before terminating anything.
-		if !d.pullRequestIsClosedOnTheForge(ctx, number, evidence) {
+		closed, closedErr := d.pullRequestIsClosedOnTheForge(ctx, number, evidence)
+		if closedErr != nil {
+			if firstErr == nil {
+				firstErr = closedErr
+			}
+			continue
+		}
+		if !closed {
 			continue
 		}
 		reason := fmt.Sprintf("queued %s job superseded: %s pull request #%d is no longer open",
@@ -1823,20 +1830,39 @@ func (d Daemon) completePendingSupersedeFinalizations(ctx context.Context) error
 // never read as licence to terminate somebody's work. The memo caches negatives too:
 // an issue-bound job can never be terminated, so without that every job sharing the
 // number re-asks on every poll, forever.
-func (d Daemon) pullRequestIsClosedOnTheForge(ctx context.Context, number int, memo map[int]bool) bool {
+func (d Daemon) pullRequestIsClosedOnTheForge(ctx context.Context, number int, memo map[int]forgeClosureAnswer) (bool, error) {
 	if memo != nil {
 		if answer, seen := memo[number]; seen {
-			return answer
+			return answer.closed, answer.err
 		}
 	}
-	answer := false
-	if pull, err := d.GitHub.GetPullRequest(ctx, d.Repo, int64(number)); err == nil {
-		answer = pull.Number == int64(number) && !strings.EqualFold(strings.TrimSpace(pull.State), "open")
+	answer := forgeClosureAnswer{}
+	pull, err := d.GitHub.GetPullRequest(ctx, d.Repo, int64(number))
+	if err != nil {
+		// NO EVIDENCE, and SAID OUT LOUD. Leaving the job queued is the safe half and it
+		// was never in question; the half that was is observability. A swallowed forge
+		// error makes a sweep that does nothing on every poll, forever, look exactly like
+		// a sweep with nothing to do (#1673). The caller records it and continues, so one
+		// unreachable number never blocks the rest of the poll.
+		answer.err = fmt.Errorf("revalidate pull request #%d before superseding queued work: %w", number, err)
+	} else {
+		answer.closed = pull.Number == int64(number) && !strings.EqualFold(strings.TrimSpace(pull.State), "open")
 	}
 	if memo != nil {
+		// The ERROR is memoized alongside the answer, which is what keeps the cost bound
+		// at one ask per number per poll: an issue-bound job produces a failure every
+		// time it is asked, so re-asking per job would repeat it once per job forever.
 		memo[number] = answer
 	}
-	return answer
+	return answer.closed, answer.err
+}
+
+// forgeClosureAnswer is one number's memoized revalidation outcome for a single poll.
+// closed is only meaningful when err is nil; an err entry means "asked, got no
+// evidence", which is a distinct state from "asked, and it is open".
+type forgeClosureAnswer struct {
+	closed bool
+	err    error
 }
 
 // workflowForJob resolves the engine to advance THIS job with. Every other daemon
