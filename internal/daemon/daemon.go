@@ -258,14 +258,21 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 	if err := d.reconcileExternallyMergedTasks(ctx, openPullNumbers); err != nil && firstErr == nil {
 		firstErr = err
 	}
-	if err := d.reconcileTransientlyBlockedMergeGates(ctx, openPullNumbers); err != nil && firstErr == nil {
-		firstErr = err
-	}
 	// Queued legs whose PR closed or merged underneath them (#1673). Placed AFTER
 	// the open-PR listing on purpose: that listing is fail-closed (a forge error
 	// returns before this point), so the open set is complete-or-absent and never a
 	// silently truncated page this sweep could read as "everything closed".
 	if err := d.supersedeQueuedJobsForClosedPullRequests(ctx, openPullNumbers); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	// Supersessions whose follow-up work did not finish (#1673). It runs right
+	// after the sweep that creates that debt so a failure recorded this poll is
+	// retried on the next one, and BEFORE the remaining reconcilers so a
+	// coordinator released here is visible to them.
+	if err := d.completePendingSupersedeFinalizations(ctx); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := d.reconcileTransientlyBlockedMergeGates(ctx, openPullNumbers); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if err := d.retryClosedReadyToMerge(ctx, openBranches); err != nil && firstErr == nil {
@@ -1625,29 +1632,55 @@ func (d Daemon) supersedeStaleReviewJobs(ctx context.Context, pull github.PullRe
 //     pre-#843 rows read 0; 0 means "no PR recorded", never "PR zero".
 //   - four PR-bound classes are exempt and enumerated in queuedJobSurvivesClosedPullRequest.
 func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, openPullNumbers map[int64]struct{}) error {
-	// ListQueuedJobs filters state in SQL against the partial index on
-	// state='queued' and already excludes externally-driven rows.
-	jobs, err := d.Store.ListQueuedJobs(ctx)
+	// Repo-scoped in SQL. ListQueuedJobs is HOME-WIDE and projects neither repo nor
+	// pull_request, so selecting candidates from it meant decoding every payload in
+	// the home — and one undecodable row in ANY repo then failed EVERY watched repo's
+	// poll, permanently, because that condition never clears. This query never reads a
+	// foreign row, and keeps the literal 'queued' predicate so the partial index
+	// idx_jobs_queued_created still applies.
+	jobs, err := d.Store.ListQueuedJobsForRepo(ctx, d.Repo.FullName())
 	if err != nil {
 		return err
 	}
+	// One forge answer per number per poll. Without it, N queued jobs bound to the
+	// same unrecorded number cost N identical GetPullRequest calls in a single poll,
+	// and an issue-bound job — which can never be terminated — repeats that cost on
+	// every poll forever.
+	evidence := map[int]forgeClosureAnswer{}
 	var firstErr error
 	for _, job := range jobs {
 		payload, err := workflowPayload(job)
 		if err != nil {
-			// A payload this poll cannot parse is not evidence that the work is
-			// pointless. Leave it queued and surface the error.
-			if firstErr == nil {
-				firstErr = err
-			}
+			// This repo's own row, and it cannot be parsed. Skip it — an unparseable
+			// payload is not evidence the work is pointless — but do NOT fail the poll:
+			// the condition is permanent, so returning it here would wedge every later
+			// reconciler in the chain on every tick. The log line is the trace.
+			d.logf("queued-job sweep: skipping %s: %v", job.ID, err)
 			continue
 		}
-		if payload.Repo != d.Repo.FullName() || payload.PullRequest <= 0 {
+		// The PAYLOAD is authoritative for the number, not the projection.
+		// jobs.pull_request was never backfilled, so a pre-#843 row carries 0 there
+		// while its payload names a real PR — reading the projection alone left exactly
+		// those legacy rows invisible, which is the population this sweep exists for.
+		// The projection's job is done: it kept the SQL from ever reading another
+		// repo's row.
+		number := payload.PullRequest
+		if number <= 0 {
 			continue
 		}
-		if _, open := openPullNumbers[int64(payload.PullRequest)]; open {
+		// Case-insensitive, because forge repository identity is. A row projected
+		// `Gitmoot/Gitmoot` against a daemon registered as `gitmoot/gitmoot` would
+		// otherwise never be selected by any poll, forever.
+		if !strings.EqualFold(strings.TrimSpace(payload.Repo), d.Repo.FullName()) {
 			continue
 		}
+		if _, open := openPullNumbers[int64(number)]; open {
+			continue
+		}
+		// Cheapest-first, and the order is load-bearing rather than cosmetic: the
+		// exemption check reads job events from the local store, while the
+		// pull-request-evidence check can reach the forge. Testing evidence first
+		// would spend an API call on a job this sweep would never touch anyway.
 		survives, err := d.queuedJobSurvivesClosedPullRequest(ctx, job, payload)
 		if err != nil {
 			if firstErr == nil {
@@ -1658,74 +1691,347 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 		if survives {
 			continue
 		}
-		// REVALIDATE IMMEDIATELY BEFORE THE IRREVERSIBLE TRANSITION (#1673). The open
-		// set is complete-or-error, but completeness is not CURRENCY: it was read at the
-		// top of the poll, and a PR reopened since then - or a PR plus its queued job
-		// created since then - is genuinely open while absent from that older map. The
-		// snapshot alone would silently terminalize valid work, and terminalizing is not
-		// reversible, so the sweep pays one targeted read per candidate instead.
-		//
-		// FAIL CLOSED: a read error leaves the job queued and surfaces the error. A
-		// sweep that cannot prove the PR is closed must not act as if it were.
-		stillClosed, err := d.pullRequestStillClosed(ctx, int64(payload.PullRequest))
+		// The open-PR listing is only a prefilter: it is a snapshot from the top of the
+		// poll and it cannot separate a closed PR from an ISSUE number. Ask the forge
+		// for the authoritative answer — is this a pull request, and is it not open
+		// right now — before terminating anything.
+		answer := d.pullRequestIsClosedOnTheForge(ctx, number, evidence)
+		if answer.err != nil {
+			if firstErr == nil {
+				firstErr = answer.err
+			}
+			continue
+		}
+		if unresolved := answer.unresolved; unresolved != nil {
+			// Recorded on the JOB, once, keyed on the event kind so repeated polls do not
+			// append: an issue-bound job is a permanent condition, so this must be a fact a
+			// reader can find rather than an error the dashboard shows forever.
+			d.recordPullRequestUnresolvedOnce(ctx, job.ID, number, unresolved)
+			continue
+		}
+		if !answer.closed {
+			continue
+		}
+		reason := fmt.Sprintf("queued %s job superseded: %s pull request #%d is no longer open",
+			job.Type, payload.Repo, number)
+		releasesCoordinator, err := d.queuedChildCanReleaseCoordinator(ctx, payload)
 		if err != nil {
+			// A store error here is not evidence about the coordinator. Skipping keeps a
+			// transient failure from silently downgrading a child with a LIVE parent to
+			// the cancel path, which would strand that coordinator for good.
 			if firstErr == nil {
 				firstErr = err
 			}
 			continue
 		}
-		if !stillClosed {
-			continue
-		}
-		reason := fmt.Sprintf("queued %s job superseded: %s pull request #%d is no longer open",
-			job.Type, payload.Repo, payload.PullRequest)
-		if strings.TrimSpace(payload.ParentJobID) != "" {
-			// A delegation child must also release its coordinator; see
-			// FinalizeClosedPullRequestDelegationChild for why its terminal state
-			// differs from the top-level path.
-			if d.Workflow == nil {
+		if releasesCoordinator {
+			engine, err := d.workflowForJob(ctx, job)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
 				continue
 			}
-			if _, err := d.Workflow.FinalizeClosedPullRequestDelegationChild(ctx, job.ID, reason); err != nil {
-				// The parent's failure_policy decides what a dead child means, and
-				// block_parent (the default) surfaces as a BlockedError. That is the DAG
-				// making a decision and recording it, not this sweep failing — the same
-				// treatment reconcileReviewingPullRequest gives an AdvanceJob block.
+			// A delegation child must also release its coordinator; see
+			// FinalizeClosedPullRequestDelegationChild for why its terminal state
+			// differs from the top-level path. The OBSERVED row is passed, not its
+			// id: the verdict is about the run this poll listed, and the settlement
+			// is anchored on that row's lifecycle generation so a job that
+			// completed and re-queued in the meantime is left alone.
+			if _, err := engine.FinalizeClosedPullRequestDelegationChild(ctx, job, reason); err != nil {
+				// The parent's failure_policy decides what a dead child means, and it
+				// RECORDS that decision: block_parent surfaces as BlockedError,
+				// escalate_human as AwaitingHumanError. Both are the DAG acting, not this
+				// sweep failing, and treating either as a poll error would stamp the
+				// repo's last_error and (first-wins) mask a genuine error from a later
+				// reconciler. Same treatment reconcileReviewingPullRequest gives an
+				// AdvanceJob block.
 				var blocked workflow.BlockedError
-				if !errors.As(err, &blocked) && firstErr == nil {
+				var awaiting workflow.AwaitingHumanError
+				if !errors.As(err, &blocked) && !errors.As(err, &awaiting) && firstErr == nil {
 					firstErr = err
 				}
 			}
 			continue
 		}
-		if _, _, err := workflow.SupersedeClosedPullRequestJob(ctx, d.Store, job.ID, reason); err != nil && firstErr == nil {
+		if _, _, err := workflow.SupersedeClosedPullRequestJob(ctx, d.Store, job, reason); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 	return firstErr
 }
 
-// pullRequestStillClosed re-reads ONE pull request's current state, immediately before
-// the sweep terminalizes work bound to it (#1673).
+// completePendingSupersedeFinalizations pays supersession debt that a previous
+// poll recorded and did not finish (#1673).
 //
-// It exists because a complete listing is not a current one: ListPullRequests is
-// fail-closed and never returns a truncated page, but it is read once at the top of
-// the poll, and the sweep runs much later. A PR reopened in that window - or created
-// with its queued job in that window - is genuinely open and absent from the map.
+// The terminal state write moves a superseded job out of `queued`, and
+// supersedeQueuedJobsForClosedPullRequests selects only queued jobs — so before
+// this pass, a child whose cleanup, synthetic result or parent advance failed
+// after the transition was UNREACHABLE by any later sweep and its coordinator
+// waited forever. The pending marker written inside that transition is what makes
+// the window recoverable, and this is the pass that closes it.
 //
-// An error is returned rather than swallowed, so the caller leaves the job queued: the
-// only safe default for an irreversible transition is "I could not prove it".
-func (d Daemon) pullRequestStillClosed(ctx context.Context, number int64) (bool, error) {
-	if d.GitHub == nil {
-		// No client to revalidate with: refuse to terminalize rather than trusting a
-		// snapshot whose age this function exists to distrust.
+// Bounded by the store's marker query, so a poll with no outstanding debt costs
+// one indexed read. A BlockedError/AwaitingHumanError is the parent's
+// failure_policy acting — the same classification the creating sweep uses.
+func (d Daemon) completePendingSupersedeFinalizations(ctx context.Context) error {
+	ids, err := d.Store.JobIDsWithPendingSupersedeFinalization(ctx)
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, id := range ids {
+		job, err := d.Store.GetJob(ctx, id)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		// The PAYLOAD names the repo. GetJob does not project the denormalized
+		// jobs.repo column, so comparing job.Repo here would compare against an
+		// always-empty string: a filter that can never match, silently skipping
+		// every candidate and reporting a clean poll.
+		payload, perr := workflowPayload(job)
+		if perr != nil {
+			d.logf("supersede-finalization recovery: skipping %s: %v", id, perr)
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(payload.Repo), d.Repo.FullName()) {
+			// Another watched repo's row. Its own daemon owns it, and the marker
+			// query is home-wide.
+			continue
+		}
+		engine, err := d.workflowForJob(ctx, job)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if _, err := engine.CompletePendingSupersedeFinalization(ctx, id); err != nil {
+			var blocked workflow.BlockedError
+			var awaiting workflow.AwaitingHumanError
+			if !errors.As(err, &blocked) && !errors.As(err, &awaiting) && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
+// pullRequestIsClosedOnTheForge reports whether this number names a pull request in
+// this repo that is NOT open, memoized per number for the caller's poll.
+//
+// It answers the whole question in one place, because splitting it was wrong twice
+// over. Absence from the poll's open-PR listing is a cheap PREFILTER and nothing more:
+// it cannot tell a closed PR from an ISSUE number (payload.PullRequest carries those
+// too, and delegationRequest copies them onto children), and it is a SNAPSHOT taken at
+// the top of the poll, so a PR reopened before the sweep runs still looks absent. A
+// recorded pull_requests row proves the number is a PR but says nothing current about
+// its state.
+//
+// So the forge decides, and it must say BOTH things: this number is a pull request,
+// and it is not open right now. Any error — including the 404 an issue number produces
+// — is NO EVIDENCE and leaves the job queued, because a transient forge failure must
+// never read as licence to terminate somebody's work. The memo caches negatives too:
+// an issue-bound job can never be terminated, so without that every job sharing the
+// number re-asks on every poll, forever.
+func (d Daemon) pullRequestIsClosedOnTheForge(ctx context.Context, number int, memo map[int]forgeClosureAnswer) forgeClosureAnswer {
+	if memo != nil {
+		if answer, seen := memo[number]; seen {
+			return answer
+		}
+	}
+	answer := forgeClosureAnswer{}
+	pull, err := d.GitHub.GetPullRequest(ctx, d.Repo, int64(number))
+	switch {
+	case err == nil:
+		answer.closed = pull.Number == int64(number) && !strings.EqualFold(strings.TrimSpace(pull.State), "open")
+	case !isPullRequestNotFound(err):
+		// NO EVIDENCE, AND SAID OUT LOUD - and this is now the DEFAULT arm, which is the
+		// direction that fails safe. A swallowed forge error makes a sweep that does
+		// nothing on every poll look exactly like a sweep with nothing to do (#1673).
+		//
+		// The first version keyed the quiet arm on "not transient", which review measured
+		// as swallowing 403 permission loss, 401 bad credentials, 429 rate limit,
+		// context.Canceled and gh output parse failures - every one of them recording a
+		// permanent "this number is not a pull request" claim about a real PR and
+		// returning a clean poll. transientSignatures is deliberately narrow (transport,
+		// DNS, TLS, gateway 5xx, and by its own comment NOT rate limits), so anything
+		// unrecognised must surface rather than be classified as an answer.
+		answer.err = fmt.Errorf("revalidate pull request #%d before superseding queued work: %w", number, err)
+	default:
+		// DEFINITIVE NOT-FOUND, SO NOT AN ERROR TO REPORT FOREVER. A 404 is the normal
+		// answer for a number that is not a pull request in this repo, and
+		// payload.PullRequest carries issue numbers - delegationRequest copies them onto
+		// children. Nothing else reaches this arm. Reporting it would
+		// stamp repos.last_error on EVERY poll for the life of the job and, because
+		// firstErr is first-wins and this sweep runs before the finalization sweep and the
+		// reconcilers, mask a genuine error from every later stage. That is the same
+		// argument this file already makes about BlockedError a few lines up, applied to
+		// the forge read instead of to the DAG's decisions.
+		//
+		// It is NOT silence: the fact is recorded once per job, keyed on the event so
+		// repeated polls do not append. And it is still fail-closed - a number that cannot
+		// be proven to name a non-open pull request never terminates anything.
+		answer.closed = false
+		answer.unresolved = err
+	}
+	if memo != nil {
+		// The ERROR is memoized alongside the answer, which is what keeps the cost bound
+		// at one ask per number per poll: an issue-bound job produces a failure every
+		// time it is asked, so re-asking per job would repeat it once per job forever.
+		memo[number] = answer
+	}
+	// Return the ANSWER, not two of its three fields: the first version returned
+	// (closed, err) and left the caller to fish `unresolved` back out of the memo, so a
+	// nil memo would have dropped the fact silently and fallen through to the
+	// "not closed -> continue" path with no record at all.
+	return answer
+}
+
+// pullRequestUnresolvedEvent records that the forge answered definitively that a job's
+// pull_request number does not name a pull request in this repo - an issue number, a
+// deleted PR, a transferred repo. It is the observability half of NOT reporting that as
+// a poll error.
+const pullRequestUnresolvedEvent = "pull_request_unresolved"
+
+// recordPullRequestUnresolvedOnce records, once, that the forge answered definitively
+// that this job's pull_request number does not name a pull request in this repo.
+//
+// ONE ATOMIC STATEMENT, because "once" is the requirement and a read-then-write cannot
+// enforce it. The first version listed the job's events, scanned for the kind and then
+// appended - which two daemons polling the same home (the restart footgun AGENTS.md
+// warns about) both pass, both finding nothing and both appending. It also paid an
+// O(events) read per unresolved job per poll, forever, which is the exact cost class the
+// per-poll forge memo above exists to avoid. AddJobEventIfAbsent dedupes on
+// (job_id, kind) inside a single INSERT ... WHERE NOT EXISTS.
+//
+// Best-effort by design: this is a note for a reader, and failing the poll over it would
+// reintroduce the permanent red this whole path exists to avoid.
+func (d Daemon) recordPullRequestUnresolvedOnce(ctx context.Context, jobID string, number int, cause error) {
+	_ = d.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
+		JobID:   jobID,
+		Kind:    pullRequestUnresolvedEvent,
+		Message: fmt.Sprintf("#%d does not name a pull request in %s, so this job can never be superseded by a closed pull request: %v", number, d.Repo.FullName(), cause),
+	})
+}
+
+// isPullRequestNotFound reports whether a forge read answered DEFINITIVELY that the
+// number does not name a pull request in this repository.
+//
+// It matches the 404 signature only. Every other failure - 401, 403, 429, a
+// cancellation, a parse error - is NOT an answer and must surface, because classifying
+// it as "not a pull request" writes a permanent false claim about a real PR and returns
+// a clean poll. The safe direction here is fail-loud: an unrecognised failure is treated
+// as no evidence, which costs a red poll until it clears, while the opposite mistake
+// costs a silently stranded job forever (#1673).
+//
+// The whole-repo case is covered earlier and independently: ListPullRequests runs at the
+// top of the poll and hard-returns, so a repo-wide permission loss never reaches this
+// function at all. What this predicate has to get right is the MID-POLL failure - a rate
+// limit exhausted after that listing succeeded, or a shutdown cancellation.
+func isPullRequestNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	if strings.Contains(text, "http 404") || strings.Contains(text, "(404)") {
+		return true
+	}
+	// gh reports a missing pull request as "not found" without always carrying the
+	// status; require the phrase AND the absence of a competing status so a 403 body
+	// mentioning "not found" is not misread.
+	if !strings.Contains(text, "not found") {
+		return false
+	}
+	for _, competing := range []string{"401", "403", "429", "rate limit"} {
+		if strings.Contains(text, competing) {
+			return false
+		}
+	}
+	return true
+}
+
+// forgeClosureAnswer is one number's memoized revalidation outcome for a single poll.
+// closed is only meaningful when both errors are nil.
+//
+// The two error fields are DIFFERENT FACTS and the distinction is the whole point: err
+// means "could not read the forge" and is reported so a broken poll cannot look like a
+// quiet one, while unresolved means "the forge answered, and this number is not a pull
+// request here" - a permanent, expected condition that is recorded once rather than
+// reported on every tick forever.
+type forgeClosureAnswer struct {
+	closed     bool
+	err        error
+	unresolved error
+}
+
+// workflowForJob resolves the engine to advance THIS job with. Every other daemon
+// path that reaches AdvanceJob does this (reconcileReviewingPullRequest), because
+// WorkflowForJob binds the exec backend recorded on the job; using the repo-default
+// engine instead would advance a job on the wrong runner.
+func (d Daemon) workflowForJob(ctx context.Context, job db.Job) (*workflow.Engine, error) {
+	if d.WorkflowForJob == nil {
+		return d.Workflow, nil
+	}
+	engine, err := d.WorkflowForJob(ctx, job)
+	if err != nil {
+		return nil, fmt.Errorf("resolve workflow for job %q: %w", job.ID, err)
+	}
+	if engine == nil {
+		return nil, fmt.Errorf("resolve workflow for job %q: workflow is nil", job.ID)
+	}
+	return engine, nil
+}
+
+// queuedChildCanReleaseCoordinator reports whether terminating this queued job
+// should drive its coordinator, and distinguishes "no" from "cannot tell".
+//
+// It requires a delegation parent whose row still EXISTS. An orphaned child — parent
+// purged, or a synthetic id never persisted — takes the top-level path, because the
+// child finalizer walks to the parent and would fail with "job not found" on every
+// poll, and an error that recurs forever is the camouflage this sweep removes.
+//
+// It does NOT refuse on a merged task any more, and that reversal is the point. The
+// merged-task refusal traded one strand for another: in the PR's own headline case —
+// reconcileExternallyMergedTasks drives the task to `merged` EARLIER IN THE SAME POLL
+// — every child then took the cancel path and its coordinator was never released, so
+// the strand simply moved from the child to the parent. Protecting `merged` belongs in
+// the state machine, not here: setTaskState now refuses merged -> blocked, so the
+// advance can run and the record that the work landed still cannot be undone.
+//
+// A store error returns an error rather than false. Reading a transient failure as
+// "no coordinator" would downgrade a child with a LIVE parent to the cancel path and
+// strand that coordinator permanently, for the duration of one failed query.
+func (d Daemon) queuedChildCanReleaseCoordinator(ctx context.Context, payload workflow.JobPayload) (bool, error) {
+	parentID := strings.TrimSpace(payload.ParentJobID)
+	if parentID == "" || d.Workflow == nil {
 		return false, nil
 	}
-	pull, err := d.GitHub.GetPullRequest(ctx, d.Repo, number)
-	if err != nil {
-		return false, fmt.Errorf("revalidate pull request #%d before superseding queued work: %w", number, err)
+	if _, err := d.Store.GetJob(ctx, parentID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
 	}
-	return !strings.EqualFold(strings.TrimSpace(pull.State), "open"), nil
+	taskID := strings.TrimSpace(payload.TaskID)
+	if taskID == "" {
+		return true, nil
+	}
+	task, err := d.Store.GetTask(ctx, taskID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// No task at all: the child still has a coordinator to release, and there
+			// is no task state for the advance to write.
+			return true, nil
+		}
+		return false, err
+	}
+	// A DISPOSED task (dismissed, superseded, stranded) is deliberately outside the
+	// state machine's normal transitions, so leave those alone.
+	return !workflow.IsDisposedTaskState(task.State), nil
 }
 
 // queuedJobSurvivesClosedPullRequest reports whether a queued PR-bound job must be
@@ -1736,6 +2042,13 @@ func (d Daemon) pullRequestStillClosed(ctx context.Context, number int64) (bool,
 //     minutes before a merge is still worth answering, and the operator who asked
 //     has no way to see it was silently dropped. The `routed` event the comment path
 //     writes is the durable marker.
+//   - a CLI-DISPATCHED job is the same request arriving through a different door.
+//     `gitmoot agent review <r> --repo o/r --pr N --head-sha <sha> --background`
+//     enqueues with Sender "local" and writes no `routed` event, and a retrospective
+//     review of a just-merged PR is legitimate work somebody asked for by name. The
+//     stranded population this sweep exists for is ENGINE fan-out (Sender "github"),
+//     never an operator's own dispatch, so exempting Sender "local" costs the fix
+//     nothing and removes its only way to discard an explicit request.
 //   - a COORDINATOR CONTINUATION synthesizes work that already happened; the
 //     killed-root skip exempts it for the same reason (daemon_scheduler.go).
 //   - a PIPELINE stage job owns run rows, and a pipeline PR review is legitimately
@@ -1743,8 +2056,15 @@ func (d Daemon) pullRequestStillClosed(ctx context.Context, number int64) (bool,
 //   - a TEMP-WORKER MERGE-BACK summary describes work that already ran. Today it
 //     carries PullRequest 0 so the caller's `> 0` gate already skips it; it is named
 //     here so a future field addition cannot make it collateral.
+//   - a job an operator RETRIED after this sweep terminated it. `gitmoot job retry`
+//     accepts `cancelled` and writes the row back to `queued` with a `retry_queued`
+//     event, so without this the sweep re-cancelled it on the very next poll, forever:
+//     an operator's explicit instruction silently undone in a loop, which is the exact
+//     failure this sweep was built to remove rather than create. The test is ORDER, not
+//     mere presence: a retry NEWER than the newest supersede means "I know, do it
+//     anyway", while a retry older than the supersede is history.
 func (d Daemon) queuedJobSurvivesClosedPullRequest(ctx context.Context, job db.Job, payload workflow.JobPayload) (bool, error) {
-	if payload.Sender == workflow.PipelineJobSender {
+	if payload.Sender == workflow.PipelineJobSender || payload.Sender == "local" {
 		return true, nil
 	}
 	if payload.DelegationReason == "temp_worker_merge_back" {
@@ -1760,6 +2080,15 @@ func (d Daemon) queuedJobSurvivesClosedPullRequest(ctx context.Context, job db.J
 	for _, event := range events {
 		if event.Kind == "routed" {
 			return true, nil
+		}
+	}
+	// Newest-first: the last word between a supersede and a retry decides.
+	for i := len(events) - 1; i >= 0; i-- {
+		switch events[i].Kind {
+		case "retry_queued":
+			return true, nil
+		case workflow.JobEventSupersededPullRequestClosed:
+			return false, nil
 		}
 	}
 	return false, nil

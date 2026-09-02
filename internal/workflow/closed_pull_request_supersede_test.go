@@ -21,7 +21,7 @@ func TestSupersedeClosedPullRequestJobTerminatesQueuedLegLegibly(t *testing.T) {
 		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "impl",
 	})
 
-	job, superseded, err := SupersedeClosedPullRequestJob(ctx, store, "workflow-stranded",
+	job, superseded, err := SupersedeClosedPullRequestJob(ctx, store, mustJob(t, store, "workflow-stranded"),
 		"queued implement job superseded: gitmoot/gitmoot pull request #7 is no longer open")
 	if err != nil {
 		t.Fatalf("SupersedeClosedPullRequestJob returned error: %v", err)
@@ -52,7 +52,7 @@ func TestSupersedeClosedPullRequestJobTerminatesQueuedLegLegibly(t *testing.T) {
 	}
 
 	// Idempotent: a second poll observing the same closed PR changes nothing.
-	again, supersededAgain, err := SupersedeClosedPullRequestJob(ctx, store, "workflow-stranded", "second observation")
+	again, supersededAgain, err := SupersedeClosedPullRequestJob(ctx, store, mustJob(t, store, "workflow-stranded"), "second observation")
 	if err != nil {
 		t.Fatalf("second SupersedeClosedPullRequestJob returned error: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestSupersedeClosedPullRequestJobLeavesRunningWorkAlone(t *testing.T) {
 		t.Fatalf("UpdateJobState returned error: %v", err)
 	}
 
-	job, superseded, err := SupersedeClosedPullRequestJob(ctx, store, "workflow-running", "pr closed")
+	job, superseded, err := SupersedeClosedPullRequestJob(ctx, store, mustJob(t, store, "workflow-running"), "pr closed")
 	if err != nil {
 		t.Fatalf("SupersedeClosedPullRequestJob returned error: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestFinalizeClosedPullRequestDelegationChildReleasesCoordinator(t *testing.
 	// The parent's own failure_policy decides what a dead child means. With the
 	// default block_parent that surfaces as a BlockedError, which is the DAG making a
 	// decision, not the sweep failing — the daemon treats it as a normal outcome.
-	finalized, err := engine.FinalizeClosedPullRequestDelegationChild(ctx, child,
+	finalized, err := engine.FinalizeClosedPullRequestDelegationChild(ctx, mustJob(t, store, child),
 		"queued review job superseded: gitmoot/gitmoot pull request #7 is no longer open")
 	var blocked BlockedError
 	if err != nil && !errors.As(err, &blocked) {
@@ -179,7 +179,7 @@ func TestFinalizeClosedPullRequestDelegationChildIgnoresTopLevelAndRunningJobs(t
 		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "impl",
 	})
 
-	finalized, err := engine.FinalizeClosedPullRequestDelegationChild(ctx, "workflow-top-level", "pr closed")
+	finalized, err := engine.FinalizeClosedPullRequestDelegationChild(ctx, mustJob(t, store, "workflow-top-level"), "pr closed")
 	if err != nil {
 		t.Fatalf("FinalizeClosedPullRequestDelegationChild returned error: %v", err)
 	}

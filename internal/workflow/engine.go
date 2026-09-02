@@ -171,6 +171,23 @@ type Engine struct {
 	// off no telemetry query runs and prompt assembly is byte-identical. Routing
 	// stays advisory in v1 — the block never forces a route.
 	RouterContextEnabled bool
+	// supersedeAdvance pins an AdvanceJob pass to ONE child lifecycle (#1673). It is
+	// set only by the closed-PR supersession recovery, on a COPY of the engine, so
+	// every other caller keeps the nil default and the delegation path is unchanged.
+	// While it is set, each parent-effect class in advanceDelegations re-asserts the
+	// anchor before running, so a retry that re-queued the child cannot fail,
+	// enqueue or continue the parent from a run that no longer exists.
+	supersedeAdvance *supersedeAdvanceAnchor
+	// resolutionSink, when set, makes this engine copy CAPTURE its durable database
+	// effects instead of writing them: job inserts, job events and the task-state
+	// transition are appended here so a resolution can commit ALL of them - plus its
+	// receipt - in ONE lease-guarded transaction (#1673).
+	//
+	// It is nil on every ordinary path, so those paths are byte-identical. It does NOT
+	// capture pre-effects: allocating a delegation worktree and taking a branch lock are
+	// git/lock operations that cannot live in a transaction, so they run under the held
+	// fence and are recorded on the round for later release.
+	resolutionSink *resolutionEffectSink
 	// MaxDelegationTokenBudget is the cumulative per-root token budget (input +
 	// output, summed across a coordination tree) that bounds a delegation tree by
 	// cost in addition to depth/width/total-jobs/wall-clock (#338 Part B). When a
@@ -307,6 +324,35 @@ func (e Engine) block(ctx context.Context, ref taskRef, reason string) error {
 	return e.blockTask(ctx, ref, "workflow_blocked", reason, "workflow")
 }
 
+// blockTaskPreWriteHook fires between blockTask's state pre-read and its guarded
+// write, and between the dirty-worktree block's read and write. It is the seam a
+// concurrent merge occupies in production; nil outside tests.
+var blockTaskPreWriteHook func(ctx context.Context, taskID string)
+
+// taskStatePreWriteHook fires between setTaskStateResolved's resolution and its
+// write, which is the ONLY window in which a test can prove the write itself is
+// ownership-bound: an interleaving placed at the barrier is refused by the barrier's
+// renewal and never reaches this write at all. Nil in production.
+var taskStatePreWriteHook func(ctx context.Context, taskID string)
+
+// advanceOwnershipBinding returns the live-ownership predicate this engine's writes
+// must satisfy, or nil for every ordinary caller (#1673). A supersession recovery's
+// advance runs on a COPY of the engine carrying its lease, so any irreversible
+// parent effect reached from that copy can bind to it at COMMIT rather than trusting
+// the barrier that decided it: the pass can stall in between, its lease can lapse,
+// and a retry can legally re-queue the child at the next generation.
+func (e Engine) advanceOwnershipBinding() *db.AdvanceOwnership {
+	if e.supersedeAdvance == nil || strings.TrimSpace(e.supersedeAdvance.LockKey) == "" {
+		return nil
+	}
+	return &db.AdvanceOwnership{
+		LockKey:      e.supersedeAdvance.LockKey,
+		OwnerToken:   e.supersedeAdvance.Token,
+		OwnerJobID:   e.supersedeAdvance.JobID,
+		AtGeneration: e.supersedeAdvance.Generation,
+	}
+}
+
 // blockTask is the single task-blocking choke point. Every durable block
 // atomically writes the state and the event that owns it. A stale state
 // observation or failed attribution write commits neither half.
@@ -327,12 +373,87 @@ func (e Engine) blockTask(ctx context.Context, ref taskRef, kind string, reason 
 	if err == nil {
 		fromState = current.State
 	}
-	blocked, err := e.Store.BlockTaskWithEvent(ctx, task, db.TaskEvent{
+	// blockTaskPreWriteHook is the only place a test can land a merge in the exact
+	// post-read/pre-write seam this classification exists for. Nil in production.
+	if blockTaskPreWriteHook != nil {
+		blockTaskPreWriteHook(ctx, task.ID)
+	}
+	// CAPTURING: a resolution's block is the ALTERNATIVE OUTCOME of its one
+	// transaction, not a separate write. Landing it here would put a durable task
+	// mutation outside the fence - so a pass that lost or outlived its lease could
+	// still block the task, and every recovery would repeat the block. Capture it and
+	// let CommitResolutionEffects apply it under the fence, with no receipt (#1673).
+	if e.capturing() {
+		task.State = string(TaskBlocked)
+		forbidden, _ := taskStateWriteExclusions(TaskBlocked)
+		e.resolutionSink.task = task
+		e.resolutionSink.taskForbidden = forbidden
+		e.resolutionSink.taskSet = true
+		// The block's task_event travels WITH the transition rather than as a second
+		// write. It does NOT by itself mean the decision was refused: continuation
+		// synthesis legitimately blocks a parent task while still enqueuing work, so
+		// only the allocation-refusal site sets resolutionSink.blocked.
+		e.resolutionSink.taskEvent = db.TaskEvent{Kind: kind, FromState: fromState, Reason: reason}
+		// IDEMPOTENT BY STATE. A refused resolution keeps its claim and withholds its
+		// receipt, so the recovery sweep re-drives it until the attempt bound parks it -
+		// and an event appended on every pass would turn one refusal into an unbounded
+		// audit trail. The event records a TRANSITION, so it is written only when the
+		// task is not already blocked; a genuine re-block after the task left the
+		// blocked state still records, because fromState differs then (#1673).
+		e.resolutionSink.taskEventValid = fromState != string(TaskBlocked)
+		return blockErr
+	}
+	blockEvent := db.TaskEvent{
 		Kind:      kind,
 		FromState: fromState,
 		Reason:    reason,
-	})
+	}
+	var blocked bool
+	if own := e.advanceOwnershipBinding(); own != nil {
+		blocked, err = e.Store.BlockTaskWithEventIfAdvanceOwned(ctx, task, blockEvent, *own, time.Now().UTC())
+	} else {
+		blocked, err = e.Store.BlockTaskWithEvent(ctx, task, blockEvent)
+	}
+	if errors.Is(err, db.ErrAdvanceOwnershipLost) {
+		// Not a fault and not a merged-work refusal: this pass no longer owns the
+		// advance, so the effect was correctly refused. Report it as the rolled-back
+		// class the recovery already understands — the debt stays outstanding and the
+		// next poll re-drives it against whatever run owns the row then.
+		return supersedeAdvanceRolledBackError{
+			JobID:      e.supersedeAdvance.JobID,
+			Generation: e.supersedeAdvance.Generation,
+			Barrier:    "block-commit",
+		}
+	}
 	if err != nil {
+		// #1673: a task whose pull request already MERGED must keep that record, and a
+		// dead leg's block_parent must still RELEASE its coordinator. The store's
+		// atomic guard refuses the write — which is right — but turning that refusal
+		// into a hard error would fail the whole poll and strand the coordinator the
+		// sweep exists to free.
+		//
+		// The classification reads the WINNING state, not the pre-read: the pre-read is
+		// exactly the value the guard proved stale, so a merge that lands in the
+		// post-read/pre-write seam would be classified from a state that no longer
+		// exists and hard-fail the poll. Genuinely incompatible non-merged winners
+		// still hard-error.
+		if errors.Is(err, db.ErrTaskStateConflict) {
+			winner := fromState
+			if latest, getErr := e.Store.GetTask(ctx, task.ID); getErr == nil {
+				winner = latest.State
+			} else if !errors.Is(getErr, sql.ErrNoRows) {
+				return fmt.Errorf("record %s block for task %s: %w", label, task.ID, err)
+			}
+			if winner == string(TaskMerged) {
+				_ = e.Store.AddTaskEvent(ctx, db.TaskEvent{
+					TaskID: task.ID,
+					Kind:   TaskEventMergedRegressionRefused,
+					Reason: fmt.Sprintf("refused %s -> %s: the pull request already merged, so the landed-work record is kept; the %s advance that requested it continues",
+						TaskMerged, TaskBlocked, label),
+				})
+				return blockErr
+			}
+		}
 		return fmt.Errorf("record %s block for task %s: %w", label, task.ID, err)
 	}
 	if !blocked {
@@ -353,7 +474,36 @@ func (e Engine) setTaskStateResolved(ctx context.Context, ref taskRef, state Tas
 	if err != nil || strings.TrimSpace(task.ID) == "" {
 		return "", err
 	}
-	if err := e.Store.UpsertTask(ctx, task); err != nil {
+	// PersistTaskState, not a plain upsert: `planned` and `awaiting_human` are
+	// merged-regression targets too (blocked now goes through the store's atomic
+	// BlockTaskWithEvent), and every target must refuse to overwrite a disposed row.
+	// Both exclusions live on the write, so a second daemon cannot win the race a
+	// pre-read would lose.
+	// An anchored advance binds this write to its live lease as well, so an
+	// escalate_human pause (or any other state move it reaches) cannot land after the
+	// lease lapsed and a retry re-queued the child (#1673).
+	if taskStatePreWriteHook != nil {
+		taskStatePreWriteHook(ctx, task.ID)
+	}
+	// CAPTURING: the task-state transition and its event belong in the resolution's one
+	// transaction, alongside the receipt, so a crash cannot leave the write without it.
+	if e.capturing() {
+		task.State = string(state)
+		forbidden, _ := taskStateWriteExclusions(state)
+		e.resolutionSink.task = task
+		e.resolutionSink.taskForbidden = forbidden
+		e.resolutionSink.taskSet = true
+		return task.ID, nil
+	}
+	if _, err := persistTaskStateOwned(ctx, e.Store, task, state, e.advanceOwnershipBinding()); err != nil {
+		if errors.Is(err, db.ErrAdvanceOwnershipLost) {
+			// Same classification as the block path: a refused effect, not a fault.
+			return "", supersedeAdvanceRolledBackError{
+				JobID:      e.supersedeAdvance.JobID,
+				Generation: e.supersedeAdvance.Generation,
+				Barrier:    "task-state-commit",
+			}
+		}
 		return "", err
 	}
 	return task.ID, nil
@@ -381,6 +531,9 @@ func (e Engine) resolveTaskState(ctx context.Context, ref taskRef, state TaskSta
 		if IsDisposedTaskState(existing.State) && existing.State != string(state) {
 			return db.Task{}, fmt.Errorf("task %s is %s; workflow advancement cannot move it to %s", existing.ID, existing.State, state)
 		}
+		// The merged-regression refusal is NOT here: an advisory check on this read
+		// loses the race a second daemon can win between the read and the write, so
+		// it lives on the write itself (writeTaskState).
 		if task.GoalID == "" {
 			task.GoalID = existing.GoalID
 		}
@@ -412,6 +565,168 @@ func (e Engine) resolveTaskState(ctx context.Context, ref taskRef, state TaskSta
 		}
 	}
 	return task, nil
+}
+
+// PersistTaskState is the guarded write point for automated task-state
+// advancement (#1673). Every exclusion it enforces lives on the conflict UPDATE,
+// so the advisory pre-reads in resolveTaskState cannot be invalidated between the
+// read and the write by another daemon — or by the same daemon earlier in the same
+// poll.
+//
+// Two exclusion families, refused differently because they mean different things:
+//
+//	DISPOSED (dismissed/superseded/stranded) is an explicit operator or audit
+//	disposition. Automation never moves a task out of one, so a refusal is an
+//	ERROR naming the state — the same answer resolveTaskState's pre-read gives,
+//	now unwinnable by a race. Writing the SAME disposed state is permitted, so a
+//	disposal stays idempotent.
+//
+//	MERGED, for a target that would claim the work is not done
+//	(IsMergedWorkRegressionTarget), is refused SILENTLY with a durable
+//	TaskEventMergedRegressionRefused trace: the failure policy that requested it
+//	still has to release its coordinator, so this must not become an error.
+//
+// `blocked` reaches the store through BlockTaskWithEvent, which carries its own
+// terminal-state conflict check; this covers the remaining regression targets
+// (`planned`, `awaiting_human`) and every ordinary advancement.
+func PersistTaskState(ctx context.Context, store *db.Store, task db.Task, state TaskState) (bool, error) {
+	return persistTaskStateOwned(ctx, store, task, state, nil)
+}
+
+// persistTaskStateOwned is PersistTaskState with an optional live-ownership
+// predicate carried INTO the write's transaction. own is nil for every ordinary
+// caller, which keeps that path byte-identical.
+func persistTaskStateOwned(ctx context.Context, store *db.Store, task db.Task, state TaskState, own *db.AdvanceOwnership) (bool, error) {
+	task.State = string(state)
+	forbidden, mergedGuarded := taskStateWriteExclusions(state)
+	var (
+		written bool
+		err     error
+	)
+	if own != nil {
+		written, err = store.UpsertTaskUnlessStatesIfAdvanceOwned(ctx, task, forbidden, *own, time.Now().UTC())
+	} else {
+		written, err = store.UpsertTaskUnlessStates(ctx, task, forbidden)
+	}
+	if err != nil {
+		return false, err
+	}
+	if written {
+		return true, nil
+	}
+	return false, classifyRefusedTaskStateWrite(ctx, store, task, state, mergedGuarded)
+}
+
+// taskStateWriteExclusions is the shared exclusion set every automated task-state
+// write carries: never overwrite a disposed row, and never regress landed work.
+func taskStateWriteExclusions(state TaskState) (forbidden []string, mergedGuarded bool) {
+	forbidden = make([]string, 0, 4)
+	for _, disposed := range []TaskState{TaskDismissed, TaskSuperseded, TaskStranded} {
+		if disposed != state {
+			forbidden = append(forbidden, string(disposed))
+		}
+	}
+	mergedGuarded = IsMergedWorkRegressionTarget(string(state))
+	if mergedGuarded {
+		forbidden = append(forbidden, string(TaskMerged))
+	}
+	return forbidden, mergedGuarded
+}
+
+// classifyRefusedTaskStateWrite reads the state that actually WON and answers the
+// two families differently: a disposed row is a hard error, landed work is a silent
+// refusal with a durable trace. Only the row can say which one refused.
+func classifyRefusedTaskStateWrite(ctx context.Context, store *db.Store, task db.Task, state TaskState, mergedGuarded bool) error {
+	existing, getErr := store.GetTask(ctx, task.ID)
+	if getErr != nil {
+		return getErr
+	}
+	if IsDisposedTaskState(existing.State) && existing.State != string(state) {
+		return fmt.Errorf("task %s is %s; automated advancement cannot move it to %s", task.ID, existing.State, state)
+	}
+	if mergedGuarded {
+		_ = store.AddTaskEvent(ctx, db.TaskEvent{
+			TaskID: task.ID,
+			Kind:   TaskEventMergedRegressionRefused,
+			Reason: fmt.Sprintf("refused %s -> %s: the pull request already merged, so the landed-work record is kept; the operation that requested it continues",
+				TaskMerged, state),
+		})
+	}
+	return nil
+}
+
+// openHumanRound is the ONE durable operation that opens a human round: the
+// coordinator's exclusive unsettled-round SLOT, the awaiting_human transition and the
+// requested event commit together, and under an anchored advance all of it is bound
+// to live ownership (#1673).
+//
+// It returns the round's durable identity plus announce=true ONLY for the caller that
+// took the slot and actually paused the task. Every announcement — notifier, event
+// sink, chat link — MUST be gated on that value:
+//
+//	a LOSER would otherwise double-notify a human about one round;
+//	a REFUSED transition would otherwise announce a pause that never happened.
+func (e Engine) openHumanRound(ctx context.Context, ref taskRef, jobID string, kind string, record EscalationRecord, message func(EscalationRecord) string) (roundID string, announce bool, err error) {
+	task, err := e.resolveTaskState(ctx, ref, TaskAwaitingHuman)
+	if err != nil {
+		return "", false, err
+	}
+	_, mergedGuarded := taskStateWriteExclusions(TaskAwaitingHuman)
+	roundID = newEscalationRoundID()
+	record.RoundID = roundID
+	round := db.HumanRoundOpen{
+		JobID:   jobID,
+		RoundID: roundID,
+		Kind:    kind,
+		Event: db.JobEvent{
+			JobID:   jobID,
+			Kind:    escalationRequestedEvent,
+			Message: message(record),
+		},
+	}
+	if strings.TrimSpace(task.ID) != "" {
+		task.State = string(TaskAwaitingHuman)
+		round.Task = task
+		round.ForbiddenStates, _ = taskStateWriteExclusions(TaskAwaitingHuman)
+		if taskStatePreWriteHook != nil {
+			taskStatePreWriteHook(ctx, task.ID)
+		}
+	}
+	var outcome db.EscalationRoundOutcome
+	if own := e.advanceOwnershipBinding(); own != nil {
+		outcome, err = e.Store.OpenHumanRoundIfAdvanceOwned(ctx, round, *own, time.Now().UTC())
+	} else {
+		outcome, err = e.Store.OpenHumanRound(ctx, round, time.Now().UTC())
+	}
+	if err != nil {
+		return "", false, e.classifyAdvanceOwnershipLoss(err, "human-round-commit")
+	}
+	switch outcome {
+	case db.EscalationRoundOpened:
+		return roundID, true, nil
+	case db.EscalationRoundRefused:
+		// THIS caller took the slot and its guarded pause was refused, so it owes a
+		// classification of the winning row. A LOSER never reaches here: it wrote
+		// nothing, so classifying it would invent a false landed-work refusal.
+		return "", false, classifyRefusedTaskStateWrite(ctx, e.Store, task, TaskAwaitingHuman, mergedGuarded)
+	default:
+		// The coordinator already has an unsettled round: idempotent and silent.
+		return "", false, nil
+	}
+}
+
+// classifyAdvanceOwnershipLoss turns a refused ownership-bound write into the
+// rolled-back class the recovery already understands: the debt stays outstanding and
+// the next poll re-drives it. Any other error passes through untouched.
+func (e Engine) classifyAdvanceOwnershipLoss(err error, barrier string) error {
+	if err == nil || !errors.Is(err, db.ErrAdvanceOwnershipLost) || e.supersedeAdvance == nil {
+		return err
+	}
+	return supersedeAdvanceRolledBackError{
+		JobID:      e.supersedeAdvance.JobID,
+		Generation: e.supersedeAdvance.Generation,
+		Barrier:    barrier,
+	}
 }
 
 func (e Engine) jobID(request JobRequest) string {

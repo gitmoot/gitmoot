@@ -2485,9 +2485,66 @@ DROP TABLE IF EXISTS eval_review_items;
 DROP TABLE IF EXISTS eval_runs;
 DROP TABLE IF EXISTS eval_artifacts;
 	`,
+
 	// #1755 removes the retired Activepieces flow ownership state. Pipeline-chain
 	// triggers remain in pipeline_trigger_states and are intentionally unaffected.
 	`
 ALTER TABLE pipelines DROP COLUMN trigger_binding;
+	`,
+	`
+-- #1673: a human escalation round gets a DURABLE IDENTITY and a JOB-LEVEL
+-- exclusive slot, so claim, effects and receipt are settled by identity rather
+-- than by comparing aggregate event counts.
+CREATE TABLE escalation_rounds (
+	job_id TEXT NOT NULL CHECK(length(trim(job_id)) > 0),
+	round_id TEXT NOT NULL CHECK(length(trim(round_id)) > 0),
+	kind TEXT NOT NULL DEFAULT '',
+	opened_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	-- resolved_at NULL => the round is LIVE (nobody has claimed its resolution).
+	resolved_at TEXT,
+	claim_verb TEXT NOT NULL DEFAULT '',
+	claim_generation INTEGER,
+	claim_payload TEXT NOT NULL DEFAULT '',
+	-- effects_completed_at NULL => UNSETTLED. It is the slot predicate below, so a
+	-- claimed-but-unfinished round keeps holding the coordinator's only slot: a
+	-- stale replay must never be able to clear a NEWER round's live pause.
+	effects_completed_at TEXT,
+	-- settled_reason names WHY a settlement happened without applying effects: a
+	-- Class I no-op release (the coordinator row is gone) or an operator supersede.
+	settled_reason TEXT NOT NULL DEFAULT '',
+	settled_by TEXT NOT NULL DEFAULT '',
+	-- needs_repair is the terminal integrity state. It PRESERVES the claim and,
+	-- because effects_completed_at stays NULL, keeps the slot held: no new round and
+	-- no ordinary advance until an operator repairs or supersedes it.
+	integrity_state TEXT NOT NULL DEFAULT '' CHECK(integrity_state IN ('', 'needs_repair')),
+	integrity_cause TEXT NOT NULL DEFAULT '',
+	integrity_at TEXT,
+	recovery_attempts INTEGER NOT NULL DEFAULT 0,
+	-- THE FENCE. Recovery is EXCLUSIVELY OWNED through effect commit: only the holder
+	-- may run pre-effects, apply effects, park the round or settle it, and the fence is
+	-- validated INSIDE the transaction that commits the effects. Because parking
+	-- requires the fence and an operator supersede requires a parked round, a supersede
+	-- and an in-flight replay are mutually exclusive rather than racing.
+	recovery_owner TEXT NOT NULL DEFAULT '',
+	recovery_lease_until TEXT,
+	-- THE PRE-EFFECT RESOURCE RECORD. Allocating a delegation worktree and taking a
+	-- branch lock are git/lock operations that cannot live inside a database
+	-- transaction, so they run under the held fence BEFORE it and are recorded here.
+	-- This row is what makes orphan release possible: when a round is superseded by an
+	-- operator, or released because its coordinator is gone, these are the resources
+	-- that must be handed back.
+	preeffect_repo TEXT NOT NULL DEFAULT '',
+	preeffect_branch TEXT NOT NULL DEFAULT '',
+	preeffect_worktree_path TEXT NOT NULL DEFAULT '',
+	preeffect_lock_owner TEXT NOT NULL DEFAULT '',
+	PRIMARY KEY(job_id, round_id)
+);
+-- THE EXCLUSION INVARIANT, as a schema constraint rather than a predicate a caller
+-- can weaken: at most ONE unsettled round per coordinator job.
+CREATE UNIQUE INDEX escalation_rounds_one_unsettled
+	ON escalation_rounds(job_id) WHERE effects_completed_at IS NULL;
+CREATE INDEX idx_escalation_rounds_unfinished
+	ON escalation_rounds(job_id, integrity_state)
+	WHERE resolved_at IS NOT NULL AND effects_completed_at IS NULL;
 	`,
 }

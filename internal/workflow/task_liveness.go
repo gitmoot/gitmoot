@@ -142,15 +142,26 @@ func jobKeepsTaskLive(job db.Job, events []db.JobEvent) bool {
 	return job.State == string(JobCancelled) && cancellationFromRunningUnsettled(events)
 }
 
+// advancementPending answers "does this settled job still OWE its parent an
+// advance", which is what keeps the coordinator's task alive while the debt is
+// outstanding.
+//
+// Two independent mechanisms open that debt and both must be recognised here
+// (#1673/#1731). advance_retry is the retry actuator's marker, written after the
+// terminal state. supersede_finalize_pending is the closed-PR supersession's, and
+// it commits in the SAME transaction as the terminal write. Knowing only the first
+// makes a superseded child with outstanding debt look finally dead: the sweep would
+// still re-drive it, but the coordinator's task would already have been treated as
+// dead while the parent was still waiting.
 func advancementPending(events []db.JobEvent) bool {
 	pending := false
 	seen := false
 	for _, event := range events {
 		switch event.Kind {
-		case "advance_started", "advance_retry":
+		case "advance_started", "advance_retry", JobEventSupersedeFinalizePending:
 			pending = true
 			seen = true
-		case "advance_completed", "advance_retried", "advance_blocked", "advance_retry_skipped", "retry_queued", ReviewLoopDetectedEventKind:
+		case "advance_completed", "advance_retried", "advance_blocked", "advance_retry_skipped", "retry_queued", JobEventSupersedeFinalizeCompleted, ReviewLoopDetectedEventKind:
 			pending = false
 			seen = true
 		}

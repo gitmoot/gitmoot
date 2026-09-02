@@ -39,6 +39,74 @@ func IsDisposedTaskState(state string) bool {
 	}
 }
 
+// TaskEventMergedRegressionRefused is the durable trace PersistTaskState leaves
+// when it refuses to overwrite a `merged` task with a state that asserts the
+// work is not done. It is an informational event: the task does not move, so
+// FromState/ToState stay empty per the db.TaskEvent contract, and the refused
+// destination is named in Reason.
+const TaskEventMergedRegressionRefused = "task_merged_regression_refused"
+
+// IsMergedWorkRegressionTarget reports whether writing this task state over a
+// task that is already `merged` would undo the record that the work LANDED.
+//
+// It exists because a dead DELEGATION CHILD reaches the parent's failure_policy
+// long after the parent's pull request merged (#1673: the daemon sweep that
+// terminates queued legs whose pull request is no longer open now hands each one
+// to the child finalizer instead of cancelling it, so the parent's policy runs).
+// setTaskState's only other guard is IsDisposedTaskState, which does not list
+// `merged`. Without this predicate the choice is to let a leg that never ran
+// rewrite the landed-work record or to strand the coordinator, and both are wrong.
+//
+// The rule is a TARGET-state test, not a from/to pair, because the from side is
+// enforced by PersistTaskState's conditional UPDATE. The "is it still merged?"
+// question is answered by the statement that writes rather than by a pre-read
+// another daemon can invalidate.
+//
+// Every TaskState, with its verdict for a task that is already `merged`:
+//
+//	planned              REFUSED. The two setTaskState sites that write it
+//	                     (resumeEscalation, and the escalation TTL sweep) exist
+//	                     only to CLEAR an awaiting_human pause, so they sit
+//	                     directly downstream of the escalate_human refusal below —
+//	                     the escalation round is recorded even when the pause is
+//	                     refused, so resume/TTL still fires. Permitting `planned`
+//	                     would hand the same dead child the same regression one
+//	                     step later. Nothing legitimately moves landed work back
+//	                     to a pre-work state.
+//	implementing         PERMITTED. It is not a terminal failure-policy result.
+//	                     The CLI resume-work command separately rejects `merged`;
+//	                     this state-machine guard does not claim that CLI path.
+//	pr_open              PERMITTED. A real pull request exists on the branch —
+//	                     the fresh cycle resume-work started.
+//	reviewing            PERMITTED. A real review is running on that real PR.
+//	changes_requested    PERMITTED. A reviewer's verdict on a real PR is evidence,
+//	                     not a leg that never ran; refusing it would silently drop
+//	                     review feedback and strand the auto-fix cycle, and that
+//	                     cycle itself re-reaches merged.
+//	ready_to_merge       PERMITTED. Merge-gate verdict on an open PR.
+//	awaiting_human_merge PERMITTED. Parks an OPEN, otherwise-ready PR for a human
+//	                     merge; neither a quality failure nor a delegation pause.
+//	merged               PERMITTED. Idempotent.
+//	blocked              REFUSED. The default block_parent failure policy's
+//	                     terminal state, and the original #1673 regression.
+//	awaiting_human       REFUSED. The escalate_human failure policy's pause
+//	                     (pauseAwaitingHuman, and the ask-round pause). Reachable
+//	                     only BECAUSE the sweep now routes the queued child to the
+//	                     finalizer, so it is this change's own new edge.
+//	superseded           PERMITTED here, governed elsewhere: setTaskState has no
+//	stranded             call site that writes any of the three, and
+//	dismissed            IsDisposedTaskState guards moves OUT of them. They are
+//	                     explicit operator/audit dispositions, not a dead leg's
+//	                     opinion of whether the work landed.
+func IsMergedWorkRegressionTarget(to string) bool {
+	switch TaskState(to) {
+	case TaskPlanned, TaskBlocked, TaskAwaitingHuman:
+		return true
+	default:
+		return false
+	}
+}
+
 type JobState string
 
 const (

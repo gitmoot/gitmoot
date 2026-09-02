@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 )
@@ -133,7 +134,7 @@ func KillDelegationTree(ctx context.Context, store *db.Store, jobID string) (db.
 			// The call returns 0 on a re-kill, so the lock_released event is not
 			// duplicated. This mirrors CancelJob, which only frees locks for the job it
 			// is STOPPING.
-			if released, derr := store.DeleteResourceLocksByOwnerIfNotRunning(ctx, j.ID); derr == nil && released > 0 {
+			if released, derr := store.DeleteResourceLocksByOwnerIfNotRunning(ctx, j.ID, time.Now().UTC()); derr == nil && released > 0 {
 				_ = store.AddJobEvent(ctx, db.JobEvent{
 					JobID:   j.ID,
 					Kind:    "lock_released",

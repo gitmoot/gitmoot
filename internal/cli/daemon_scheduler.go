@@ -804,7 +804,7 @@ func failRecoveredRunningJob(ctx context.Context, store *db.Store, stdout io.Wri
 		return false, err
 	}
 	if transitioned {
-		_, _ = store.DeleteResourceLocksByOwnerIfNotRunning(ctx, job.ID)
+		_, _ = store.DeleteResourceLocksByOwnerIfNotRunning(ctx, job.ID, time.Now().UTC())
 		writeLine(stdout, "failed recovered running job %s: %s", job.ID, cause)
 	}
 	return transitioned, nil

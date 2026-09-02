@@ -719,7 +719,10 @@ func (e Engine) AllocateDelegationWorktree(ctx context.Context, request Delegati
 	}
 	if lineage.DirtyBlocked {
 		reason := lineage.dirtyBlockedMessage(path)
-		if err := e.Store.AddJobEvent(ctx, db.JobEvent{
+		// Captured under a resolution so a later ownership loss, crash or refused task
+		// commit cannot leave audit rows from a decision that was never applied - and
+		// cannot duplicate them on recovery (#1673).
+		if err := e.recordEffectEvent(ctx, db.JobEvent{
 			JobID:   request.ParentJobID,
 			Kind:    "stale_worktree_dirty_blocked",
 			Message: reason,
@@ -735,7 +738,7 @@ func (e Engine) AllocateDelegationWorktree(ctx context.Context, request Delegati
 		return DelegationWorktreeResult{}, BlockedError{Reason: reason}
 	}
 	if lineage.Recut {
-		if err := e.Store.AddJobEvent(ctx, db.JobEvent{
+		if err := e.recordEffectEvent(ctx, db.JobEvent{
 			JobID:   request.ParentJobID,
 			Kind:    "stale_worktree_recut",
 			Message: lineage.message("stale delegation worktree detected and re-cut"),
@@ -2758,12 +2761,34 @@ func blockTaskForDirtyWorktree(ctx context.Context, store *db.Store, task db.Tas
 		task.Title = request.TaskTitle
 	}
 	blockErr := BlockedError{Reason: reason}
+	if blockTaskPreWriteHook != nil {
+		blockTaskPreWriteHook(ctx, task.ID)
+	}
 	blocked, err := store.BlockTaskWithEvent(ctx, task, db.TaskEvent{
 		Kind:      "stale_worktree_dirty_blocked",
 		FromState: fromState,
 		Reason:    reason,
 	})
 	if err != nil {
+		// #1673, same rule as Engine.blockTask, and classified the same way: from the
+		// WINNING state, never the pre-read the guard just proved stale. A merge that
+		// lands in the post-read/pre-write seam is still the landed-work refusal; every
+		// other conflict remains a real error.
+		if errors.Is(err, db.ErrTaskStateConflict) {
+			winner := fromState
+			if latest, getErr := store.GetTask(ctx, task.ID); getErr == nil {
+				winner = latest.State
+			}
+			if winner == string(TaskMerged) {
+				_ = store.AddTaskEvent(ctx, db.TaskEvent{
+					TaskID: task.ID,
+					Kind:   TaskEventMergedRegressionRefused,
+					Reason: fmt.Sprintf("refused %s -> %s: the pull request already merged, so the landed-work record is kept; the dirty worktree at %s is preserved",
+						TaskMerged, TaskBlocked, path),
+				})
+				return blockErr
+			}
+		}
 		if !blocked {
 			return err
 		}

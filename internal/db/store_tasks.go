@@ -223,6 +223,180 @@ func (s *Store) UpsertTask(ctx context.Context, task Task) error {
 // callers that must not resurrect a terminal task remain safe if its state
 // changes after their initial read.
 func (s *Store) UpsertTaskUnlessStates(ctx context.Context, task Task, forbiddenStates []string) (bool, error) {
+	return s.upsertTaskUnlessStates(ctx, s.db, task, forbiddenStates)
+}
+
+// UpsertTaskUnlessStatesIfAdvanceOwned is UpsertTaskUnlessStates with live advance
+// ownership asserted in the SAME transaction as the task write (#1673).
+//
+// An escalate_human pause moves the parent task to awaiting_human, which is an
+// irreversible parent effect: it stops the tree and calls a human. The barrier that
+// decided the policy cannot protect it, because the pass can stall between that
+// check and this write while its lease lapses and a retry re-queues the child.
+func (s *Store) UpsertTaskUnlessStatesIfAdvanceOwned(ctx context.Context, task Task, forbiddenStates []string, own AdvanceOwnership, now time.Time) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	live, err := advanceOwnershipLiveTx(ctx, tx, own, now)
+	if err != nil {
+		return false, err
+	}
+	if !live {
+		return false, fmt.Errorf("%w: task %s write for job %s at generation %d",
+			ErrAdvanceOwnershipLost, task.ID, own.OwnerJobID, own.AtGeneration)
+	}
+	written, err := s.upsertTaskUnlessStates(ctx, tx, task, forbiddenStates)
+	if err != nil {
+		return false, err
+	}
+	return written, tx.Commit()
+}
+
+// HumanRoundOpen names one attempt to open a human round: the round's durable
+// identity, the pause target, and the round-open event that records it.
+type HumanRoundOpen struct {
+	JobID           string
+	RoundID         string
+	Kind            string
+	Task            Task
+	ForbiddenStates []string
+	Event           JobEvent
+}
+
+// OpenHumanRound opens a human round as ONE transaction that settles three facts
+// together (#1673):
+//
+//	SLOT    the FIRST statement takes the coordinator's only unsettled-round slot in
+//	        escalation_rounds. Exclusion is the partial unique index
+//	        escalation_rounds_one_unsettled, not a predicate over the caller's own
+//	        identity: two concurrent openers mint DIFFERENT round ids, so an
+//	        identity-scoped predicate would let both through. The slot is held until
+//	        SETTLEMENT, so a claimed round whose effects have not landed still blocks
+//	        a new round — a stale replay must never clear a newer round's live pause.
+//	PAUSED  the guarded task transition commits WITH the requested event. If the
+//	        transition is REFUSED (a merged row forbids awaiting_human, or the row
+//	        became disposed after the caller's pre-read) the whole transaction rolls
+//	        back, releasing the slot: a round event without its pause is a lie, and
+//	        announcing an unopened round calls a human about nothing.
+//	QUIET   the caller learns the outcome BEFORE any announcement, so notifier, event
+//	        sink and chat link fire only for the winner that actually paused.
+//
+// A LOSER writes nothing at all — no round row, no event, no task write, and
+// therefore no classification and no audit row. That is why a concurrent loser can
+// never produce a false landed-work refusal.
+func (s *Store) OpenHumanRound(ctx context.Context, round HumanRoundOpen, now time.Time) (EscalationRoundOutcome, error) {
+	return s.openHumanRound(ctx, round, nil, now)
+}
+
+// OpenHumanRoundIfAdvanceOwned is OpenHumanRound with live advance ownership
+// asserted in the same transaction, so a superseded pass can neither open a round
+// nor announce one.
+func (s *Store) OpenHumanRoundIfAdvanceOwned(ctx context.Context, round HumanRoundOpen, own AdvanceOwnership, now time.Time) (EscalationRoundOutcome, error) {
+	return s.openHumanRound(ctx, round, &own, now)
+}
+
+func (s *Store) openHumanRound(ctx context.Context, round HumanRoundOpen, own *AdvanceOwnership, now time.Time) (EscalationRoundOutcome, error) {
+	jobID := strings.TrimSpace(round.JobID)
+	if jobID == "" {
+		return EscalationRoundBlocked, errors.New("escalation round job id is required")
+	}
+	if strings.TrimSpace(round.RoundID) == "" {
+		return EscalationRoundBlocked, errors.New("escalation round id is required")
+	}
+	if strings.TrimSpace(round.Event.Kind) == "" {
+		return EscalationRoundBlocked, errors.New("round-open event kind is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return EscalationRoundBlocked, err
+	}
+	defer tx.Rollback()
+
+	took, err := insertEscalationRoundTx(ctx, tx, jobID, round.RoundID, round.Kind, now)
+	if err != nil {
+		return EscalationRoundBlocked, err
+	}
+	if !took {
+		// The coordinator already has an unsettled round: idempotent, and silent.
+		return EscalationRoundBlocked, tx.Commit()
+	}
+	if own != nil {
+		live, ownErr := advanceOwnershipLiveTx(ctx, tx, *own, now)
+		if ownErr != nil {
+			return EscalationRoundBlocked, ownErr
+		}
+		if !live {
+			return EscalationRoundBlocked, fmt.Errorf("%w: round-open for job %s at generation %d",
+				ErrAdvanceOwnershipLost, own.OwnerJobID, own.AtGeneration)
+		}
+	}
+	if strings.TrimSpace(round.Task.ID) != "" {
+		written, werr := s.upsertTaskUnlessStates(ctx, tx, round.Task, round.ForbiddenStates)
+		if werr != nil {
+			return EscalationRoundBlocked, werr
+		}
+		if !written {
+			// REFUSED: roll back the slot and the event with the pause. The caller
+			// classifies the winning row; a loser never reaches this statement.
+			return EscalationRoundRefused, nil
+		}
+	}
+	event := round.Event
+	if strings.TrimSpace(event.JobID) == "" {
+		event.JobID = jobID
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`,
+		event.JobID, event.Kind, event.Message); err != nil {
+		return EscalationRoundBlocked, err
+	}
+	return EscalationRoundOpened, tx.Commit()
+}
+
+// CloseHumanRound claims a round's resolution and appends its resolved event in ONE
+// transaction, keyed by round identity (#1673). rows=1 on the claim UPDATE is the
+// winner and the only caller allowed to run the verb's irreversible effects; a human
+// resume and the TTL sweep contend on that single statement rather than on two
+// independent pre-checks.
+//
+// It does NOT release the slot: settlement does, after the effects land.
+func (s *Store) CloseHumanRound(ctx context.Context, jobID string, roundID string, verb string, generation int64, payload string, event JobEvent, now time.Time) (bool, error) {
+	jobID = strings.TrimSpace(jobID)
+	roundID = strings.TrimSpace(roundID)
+	if jobID == "" || roundID == "" {
+		return false, errors.New("round-close requires a job id and a round id")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE escalation_rounds
+		SET resolved_at = ?, claim_verb = ?, claim_generation = ?, claim_payload = ?
+		WHERE job_id = ? AND round_id = ? AND resolved_at IS NULL AND effects_completed_at IS NULL`,
+		formatResourceLockTime(now), strings.TrimSpace(verb), generation, payload, jobID, roundID)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected != 1 {
+		return false, tx.Commit()
+	}
+	if strings.TrimSpace(event.JobID) == "" {
+		event.JobID = jobID
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`,
+		event.JobID, event.Kind, event.Message); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+func (s *Store) upsertTaskUnlessStates(ctx context.Context, execer sqlExecer, task Task, forbiddenStates []string) (bool, error) {
 	if len(forbiddenStates) == 0 {
 		return false, errors.New("at least one forbidden task state is required")
 	}
@@ -232,7 +406,7 @@ func (s *Store) UpsertTaskUnlessStates(ctx context.Context, task Task, forbidden
 		placeholders = append(placeholders, "?")
 		args = append(args, strings.TrimSpace(state))
 	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch, worktree_path, updated_at)
+	result, err := execer.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch, worktree_path, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(id) DO UPDATE SET
 			repo_full_name = excluded.repo_full_name,
@@ -610,6 +784,23 @@ const (
 // the blocked task row, and appends the event that owns that block. blocked is
 // true only after both writes commit.
 func (s *Store) BlockTaskWithEvent(ctx context.Context, task Task, event TaskEvent) (blocked bool, err error) {
+	return s.blockTaskWithEvent(ctx, task, event, nil, time.Time{})
+}
+
+// BlockTaskWithEventIfAdvanceOwned is BlockTaskWithEvent with live advance ownership
+// asserted in the SAME transaction as the block (#1673).
+//
+// A block_parent failure policy is an irreversible parent effect: it moves the
+// parent task and writes its attribution event. Checking ownership at the barrier
+// that decided the policy is not enough — the pass can stall between that check and
+// this write, its lease can lapse, and a retry can legally re-queue the child at
+// generation N+1. Binding here means the block either commits while this pass still
+// owns the advance, or does not happen at all.
+func (s *Store) BlockTaskWithEventIfAdvanceOwned(ctx context.Context, task Task, event TaskEvent, own AdvanceOwnership, now time.Time) (blocked bool, err error) {
+	return s.blockTaskWithEvent(ctx, task, event, &own, now)
+}
+
+func (s *Store) blockTaskWithEvent(ctx context.Context, task Task, event TaskEvent, own *AdvanceOwnership, now time.Time) (blocked bool, err error) {
 	task.ID = strings.TrimSpace(task.ID)
 	if task.ID == "" {
 		return false, errors.New("blocked task id is required")
@@ -625,6 +816,17 @@ func (s *Store) BlockTaskWithEvent(ctx context.Context, task Task, event TaskEve
 		return false, err
 	}
 	defer tx.Rollback()
+
+	if own != nil {
+		live, ownErr := advanceOwnershipLiveTx(ctx, tx, *own, now)
+		if ownErr != nil {
+			return false, ownErr
+		}
+		if !live {
+			return false, fmt.Errorf("%w: task %s block for job %s at generation %d",
+				ErrAdvanceOwnershipLost, task.ID, own.OwnerJobID, own.AtGeneration)
+		}
+	}
 
 	var activeClaim string
 	claimErr := tx.QueryRowContext(ctx, `SELECT token FROM task_state_claims

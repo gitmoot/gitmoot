@@ -269,9 +269,16 @@ func TestPollOnceLeavesWorkQueuedWhenRevalidationFails(t *testing.T) {
 		t.Fatalf("UpsertAgent: %v", err)
 	}
 	client := &fakeGitHub{
-		pulls:             []github.PullRequest{},
-		comments:          map[int64][]github.IssueComment{},
-		getPullRequestErr: errors.New("forge unavailable"),
+		pulls:    []github.PullRequest{},
+		comments: map[int64][]github.IssueComment{},
+		// A TRANSIENT signature, deliberately, because that is what this test names. The
+		// generic "forge unavailable" it used before is indistinguishable from the normal
+		// not-found a 404 produces for an issue number, and reporting THAT on every poll
+		// reds repos.last_error forever and first-wins-masks later reconcilers. The two
+		// arms are now separated: this one must surface, the permanent one is recorded
+		// once and stays out of the poll's error (see
+		// TestPollOnceAsksTheForgeOncePerNumberPerPoll).
+		getPullRequestErr: errors.New("dial tcp: connection refused"),
 	}
 	seedQueuedJob(t, store, "unproven-review", "audit", "review", workflow.JobPayload{
 		Repo:        repo.FullName(),

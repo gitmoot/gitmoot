@@ -59,10 +59,19 @@ func (e Engine) RunJob(ctx context.Context, jobID string, agent runtime.Agent, a
 // deadline, elapsed duration, and bounded stderr tail. The method is idempotent:
 // a result-bearing or non-failed terminal job is never rewritten.
 func (e Engine) FinalizeTimedOutJob(ctx context.Context, jobID string, reason string, timeoutDetail string) (bool, error) {
-	return e.finalizeTimedOutJob(ctx, jobID, reason, "job_timeout", timeoutDetail, false)
+	return e.finalizeTimedOutJob(ctx, jobID, reason, "job_timeout", timeoutDetail, false, nil)
 }
 
-func (e Engine) finalizeTimedOutJob(ctx context.Context, jobID string, reason string, eventKind string, eventDetail string, delegationOnly bool) (bool, error) {
+// atGeneration, when non-nil, pins every write to ONE observed lifecycle. A
+// caller recovering work it decided about earlier (the closed-PR supersession
+// debt) cannot otherwise tell "the run I judged" from "a retry that has since
+// been queued and claimed": finalizing by job id alone would stamp the old
+// synthetic failure onto the new run and advance its parent on it. With the
+// anchor set, the read, the payload write and the parent advance each refuse a
+// row whose generation has moved, so a mid-flight retry loses instead of being
+// finalized. Nil restores the historical behavior for the deadline callers, whose
+// verdict is formed and applied within one pass.
+func (e Engine) finalizeTimedOutJob(ctx context.Context, jobID string, reason string, eventKind string, eventDetail string, delegationOnly bool, atGeneration *int64) (bool, error) {
 	if err := e.validate(); err != nil {
 		return false, err
 	}
@@ -97,8 +106,26 @@ func (e Engine) finalizeTimedOutJob(ctx context.Context, jobID string, reason st
 	}
 	mailbox := e.mailbox()
 	if job.State == string(JobRunning) {
+		if atGeneration != nil {
+			// A running row under an anchored recovery means a worker has claimed this
+			// job. finishWithPayload is unanchored, so refuse rather than race it: the
+			// live run settles through its own terminal path.
+			return false, nil
+		}
 		if err := mailbox.finishWithPayload(ctx, jobID, JobFailed, reason, payload); err != nil {
 			return false, err
+		}
+	} else if atGeneration != nil {
+		encoded, err := marshalPayload(payload)
+		if err != nil {
+			return false, err
+		}
+		written, err := e.Store.UpdateJobPayloadAtGeneration(ctx, jobID, encoded, *atGeneration)
+		if err != nil {
+			return false, err
+		}
+		if !written {
+			return false, nil
 		}
 	} else {
 		// Already terminal-failed/blocked: only attach the synthetic result so
@@ -117,6 +144,25 @@ func (e Engine) finalizeTimedOutJob(ctx context.Context, jobID string, reason st
 	if strings.TrimSpace(payload.ParentJobID) == "" {
 		return true, nil
 	}
+	// The parent advance settles the coordinator ON THIS CHILD'S RESULT. Under an
+	// anchor it goes through the bracketed contract, because a re-read here would
+	// only narrow the window: AdvanceJob is multi-statement, so a retry can claim
+	// the row after the check or after AdvanceJob's own first read and have its
+	// coordinator mutated from a superseded verdict. A refused bracket returns
+	// false so the caller leaves the debt outstanding for a re-drive.
+	if atGeneration != nil {
+		advanced, err := e.advanceSupersededChildAtGeneration(ctx, jobID, *atGeneration)
+		if err != nil {
+			return advanced, err
+		}
+		if !advanced {
+			return false, nil
+		}
+		if err := e.Store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_completed", Message: "workflow advancement completed"}); err != nil {
+			return true, err
+		}
+		return true, nil
+	}
 	if err := e.AdvanceJob(ctx, jobID); err != nil {
 		return true, err
 	}
@@ -129,7 +175,13 @@ func (e Engine) finalizeTimedOutJob(ctx context.Context, jobID string, reason st
 // FinalizeTimedOutDelegationChild preserves the established engine API for
 // delegation callers while routing through the all-job terminalizer.
 func (e Engine) FinalizeTimedOutDelegationChild(ctx context.Context, jobID string, reason string) (bool, error) {
-	return e.finalizeTimedOutJob(ctx, jobID, reason, "delegation_timeout_finalized", reason, true)
+	return e.finalizeTimedOutJob(ctx, jobID, reason, "delegation_timeout_finalized", reason, true, nil)
+}
+
+// finalizeSupersededDelegationChildAtGeneration is the closed-PR recovery's
+// finalizer: the same terminalizer, pinned to the lifecycle the debt names.
+func (e Engine) finalizeSupersededDelegationChildAtGeneration(ctx context.Context, jobID string, reason string, generation int64) (bool, error) {
+	return e.finalizeTimedOutJob(ctx, jobID, reason, "delegation_timeout_finalized", reason, true, &generation)
 }
 
 func (e Engine) refreshJobPayload(ctx context.Context, jobID string) error {
@@ -192,13 +244,17 @@ func (e Engine) recordFoldedReviewOutcome(ctx context.Context, job db.Job, paylo
 // head - so gating parent advancement on that preflight stranded the parent forever. The
 // first remedy let such a child through AdvanceJob with an empty checkout, which was too
 // broad: AdvanceJob normalizes high-risk lens verdicts (rewriting the result and updating
-// the job payload and state), dispatches the child's OWN delegations, continues into the
-// review merge gate, and registers deferred worktree teardown - all of which would then
-// run unvalidated.
+// the job payload and state), continues into the review merge gate, and registers
+// deferred worktree teardown - all of which would then run unvalidated. It can also
+// dispatch a child's OWN delegations, though not for a child whose decision is "failed":
+// the parent-side block short-circuits on that first, which review measured. The list is
+// what the operation EXCLUDES, not a list of escapes each independently demonstrated on
+// the closed-PR shape.
 //
 // This operation reaches none of that. It runs the parent-side block of AdvanceJob and
 // nothing else, so it cannot be widened by accident: there is no path from here to lens
-// normalization, to the child's delegations, or to worktree cleanup.
+// normalization, to the child's delegations, or to worktree cleanup. That STRUCTURAL
+// exclusion is the guarantee - not a claim that every excluded step was reachable.
 func (e Engine) AdvanceParentDAGForTerminalChild(ctx context.Context, jobID string) error {
 	if err := e.validate(); err != nil {
 		return err
@@ -216,8 +272,39 @@ func (e Engine) AdvanceParentDAGForTerminalChild(ctx context.Context, jobID stri
 	if !IsSettledJobState(job.State) {
 		return fmt.Errorf("job %q is not settled, so parent-only advancement does not apply", jobID)
 	}
-	_, err = e.advanceParentForTerminalChild(ctx, job, payload, taskRefFromPayload(payload))
-	return err
+	ref := taskRefFromPayload(payload)
+	// The parked-round refusal is INHERITED from advanceParentForTerminalChild rather
+	// than repeated here: that is the shared choke point both advance entry points pass
+	// through, and this operation not consulting the round is precisely the gap the merge
+	// opened. Measured before the fix, on a fixture with a parked round and a
+	// closed-PR-superseded sibling carrying a retry budget: AdvanceJob refused and
+	// enqueued nothing (3 jobs -> 3), while this operation enqueued
+	// parent-job/delegation/ui/retry/1 (3 -> 4). The retry pass inside advanceDelegations
+	// runs BEFORE any failure policy, so the enqueue landed before the escalate_human
+	// short-circuit and the AwaitingHumanError that ended the call arrived after the new
+	// job existed rather than instead of it.
+	stop, err := e.advanceParentForTerminalChild(ctx, job, payload, ref)
+	if err != nil {
+		return err
+	}
+	if stop {
+		return nil
+	}
+	// HONOURING THE BOOL IS THE WHOLE POINT, and the previous version dropped it: it
+	// discarded `stop` and returned nil, so the one case the block reports as NOT fully
+	// handled - a failed or blocked child whose failure no policy absorbs - silently did
+	// nothing and reported success. The coordinator's task stayed `implementing` while
+	// the parent waited forever, and a supersede recovery then recorded its debt PAID on
+	// the strength of that success (#1673/#1731).
+	//
+	// This is AdvanceJob's own next step, truncated immediately after it. Everything the
+	// operation exists to exclude - the child's own delegations, lens normalization, the
+	// review merge gate, deferred worktree teardown - lives BEYOND this point and stays
+	// unreachable from here.
+	if payload.Result.Decision == "blocked" || payload.Result.Decision == "failed" {
+		return e.block(ctx, ref, payload.Result.Summary)
+	}
+	return nil
 }
 
 // advanceParentForTerminalChild is the parent-side half of AdvanceJob, shared by
@@ -225,6 +312,23 @@ func (e Engine) AdvanceParentDAGForTerminalChild(ctx context.Context, jobID stri
 // reports whether the caller must STOP - the block's own short-circuits mean "this
 // child's outcome is fully handled", not "continue with the rest of the advance".
 func (e Engine) advanceParentForTerminalChild(ctx context.Context, job db.Job, payload JobPayload, ref taskRef) (bool, error) {
+	// THE PARKED-ROUND GUARD LIVES HERE, at the shared choke point, so it is inherited
+	// rather than remembered. A round parked in needs_repair means a human's decision was
+	// CLAIMED and never applied, and advancing past it is the exact harm the claim
+	// protocol exists to prevent.
+	//
+	// It was previously only at AdvanceJob's top, and the merge added a SECOND entry
+	// point into this block (AdvanceParentDAGForTerminalChild) that did not consult the
+	// round: escalationRepairBlock existed only on this branch's parent, the parent-only
+	// operation only on main's. Guarding each caller instead would leave the next caller
+	// to remember, which is what failed once already. AdvanceJob keeps its own earlier
+	// check so it still refuses before doing any other work; the redundant second lookup
+	// on that path is one indexed read against the coordinator.
+	if blockedErr, blocked, err := e.escalationRepairBlock(ctx, job, ref); err != nil {
+		return false, err
+	} else if blocked {
+		return false, blockedErr
+	}
 	parentJob, parentPayload, err := e.jobPayload(ctx, payload.ParentJobID)
 	if err != nil {
 		return false, err
@@ -305,6 +409,18 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		return fmt.Errorf("job %q has no agent result", jobID)
 	}
 	ref := taskRefFromPayload(payload)
+
+	// A round parked in needs_repair means a human's decision was CLAIMED and never
+	// applied. Advancing past it would proceed as if it had been applied - the exact
+	// harm the claim protocol exists to prevent - so the coordinator is blocked with
+	// the cause until an operator repairs or supersedes it (#1673). The block is
+	// keyed on the coordinator this advance would settle, so ordinary work is
+	// untouched: a job with no parked round pays one indexed lookup.
+	if blockedErr, blocked, err := e.escalationRepairBlock(ctx, job, ref); err != nil {
+		return err
+	} else if blocked {
+		return blockedErr
+	}
 
 	// High-risk lens normalization (#650). A refutation lens may report a CRITICAL
 	// finding in AgentResult.Findings yet leave its OWN decision at

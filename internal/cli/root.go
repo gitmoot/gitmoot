@@ -52,6 +52,7 @@ var rootCommands = []command{
 	{name: "report", summary: "build and file bug reports", run: runReport},
 	{name: "lock", summary: "inspect and release branch locks", run: runLock},
 	{name: "interactive", summary: "inspect and answer interactive prompts", run: runInteractive},
+	{name: "escalation", summary: "inspect and repair blocked human-escalation rounds", run: runEscalation},
 	{name: "dashboard", summary: "show a snapshot of local Gitmoot state", run: runDashboard},
 	{name: "memory", summary: "inspect and measure agent persistent memory", run: runMemory},
 	{name: "pipeline", summary: "define, run, and manage declarative pipelines", run: runPipeline},

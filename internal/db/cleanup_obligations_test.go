@@ -135,7 +135,12 @@ func TestCleanupObligationsRebuildPreservesLegacyRows(t *testing.T) {
 // test would pass on precisely the mutant it exists to kill.
 func TestMigrationsUpgradeFromPreviousReleasedVersion(t *testing.T) {
 	ctx := context.Background()
-	const branchMigrationMarker = "DROP COLUMN trigger_binding"
+	// The marker names THIS BRANCH's migration, and it has moved three times as main
+	// advanced: the cleanup_obligations rebuild, #1766's SkillOpt/evals teardown, and
+	// #1770's Activepieces trigger removal each joined the released prefix, leaving
+	// escalation_rounds appended last. Two branches cannot both be "last", and the
+	// ordering that matters is the one a deployed database sees.
+	const branchMigrationMarker = "CREATE UNIQUE INDEX escalation_rounds_one_unsettled"
 	branchIndex := -1
 	for index, migration := range migrations {
 		if strings.Contains(migration, branchMigrationMarker) {

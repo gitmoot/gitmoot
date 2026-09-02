@@ -130,7 +130,7 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 	}
 	if nonProgressStreak >= e.nonProgressStreakThreshold() {
 		if parentPayload.DelegationRepeatCount >= 1 {
-			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			_ = e.recordEffectEvent(ctx, db.JobEvent{
 				JobID:   parentJob.ID,
 				Kind:    "delegation_loop_detected",
 				Message: fmt.Sprintf("delegation tree made no new durable side effect for %d consecutive generations after a corrective nudge (digest %s); finalizing instead of continuing", nonProgressStreak, digest),
@@ -140,7 +140,7 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 			return e.enqueueFinalizeContinuation(ctx, parentJob, parentPayload, "delegation tree made no progress after a corrective nudge")
 		}
 
-		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		_ = e.recordEffectEvent(ctx, db.JobEvent{
 			JobID:   parentJob.ID,
 			Kind:    "delegation_loop_warning",
 			Message: fmt.Sprintf("delegation tree made no new durable side effect for %d consecutive generations (digest %s); sending a corrective continuation instead of continuing", nonProgressStreak, digest),
@@ -200,7 +200,7 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		// occupies the continuation slot: emit delegation_continuation_enqueued so a
 		// re-advance hits the continuationEnqueued top-guard rather than re-running
 		// the streak logic.
-		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		_ = e.recordEffectEvent(ctx, db.JobEvent{
 			JobID:   parentJob.ID,
 			Kind:    "delegation_continuation_enqueued",
 			Message: fmt.Sprintf("corrective continuation occupies the continuation slot for job %s", correctiveRequest.ID),
@@ -237,7 +237,7 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		) {
 		attemptCap := e.verifyReplanAttemptCap()
 		if parentPayload.VerifyAttempt >= attemptCap {
-			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			_ = e.recordEffectEvent(ctx, db.JobEvent{
 				JobID:   parentJob.ID,
 				Kind:    "verify_replan_exhausted",
 				Message: fmt.Sprintf("verify→replan attempt cap of %d reached for job %s; finalizing instead of replanning", attemptCap, parentJob.ID),
@@ -248,7 +248,7 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		}
 
 		attempt := parentPayload.VerifyAttempt + 1
-		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		_ = e.recordEffectEvent(ctx, db.JobEvent{
 			JobID:   parentJob.ID,
 			Kind:    "verify_replan_warning",
 			Message: fmt.Sprintf("independent verification failed (attempt %d/%d); sending a corrective replan continuation for job %s", attempt, attemptCap, parentJob.ID),
@@ -308,7 +308,7 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		// occupies the continuation slot: emit delegation_continuation_enqueued so a
 		// re-advance hits the continuationEnqueued top-guard rather than re-running
 		// the verify gate (and never double-enqueues a normal continuation).
-		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		_ = e.recordEffectEvent(ctx, db.JobEvent{
 			JobID:   parentJob.ID,
 			Kind:    "delegation_continuation_enqueued",
 			Message: fmt.Sprintf("verify replan continuation occupies the continuation slot for job %s", replanRequest.ID),
@@ -397,7 +397,7 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 	if err := e.enqueue(ctx, request); err != nil {
 		return fmt.Errorf("enqueue continuation for %q: %w", parentJob.ID, err)
 	}
-	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+	_ = e.recordEffectEvent(ctx, db.JobEvent{
 		JobID:   parentJob.ID,
 		Kind:    "delegation_continuation_enqueued",
 		Message: fmt.Sprintf("delegation continuation enqueued as job %s", request.ID),

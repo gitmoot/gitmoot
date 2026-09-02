@@ -63,7 +63,7 @@ func TestClosedPullRequestChildKeepsItsAdvanceObligationWhenTheSecondStageFails(
 		Sender:      "coord",
 	})
 
-	finalized, err := engine.FinalizeClosedPullRequestDelegationChild(ctx, child,
+	finalized, err := engine.FinalizeClosedPullRequestDelegationChild(ctx, mustJob(t, store, child),
 		"queued review job superseded: gitmoot/gitmoot pull request #7 is no longer open")
 	var blocked BlockedError
 	if err == nil || errors.As(err, &blocked) {
@@ -77,18 +77,32 @@ func TestClosedPullRequestChildKeepsItsAdvanceObligationWhenTheSecondStageFails(
 	}
 
 	// AND THE OBLIGATION LANDED WITH IT. This is the assertion the old code fails.
+	//
+	// The marker is supersede_finalize_pending, not advance_retry: this path now commits
+	// the debt in the SAME transaction as the terminal write (#1731), so there is no
+	// window where the child is settled and the debt is not yet recorded. Asserting the
+	// QUEUE rather than the event kind is what makes this a test of the behaviour - a
+	// child that is not in the re-drive queue is stranded no matter which marker it
+	// carries.
 	events, err := store.ListJobEvents(ctx, child)
 	if err != nil {
 		t.Fatalf("ListJobEvents: %v", err)
 	}
 	obligations := 0
 	for _, event := range events {
-		if event.Kind == "advance_retry" {
+		if event.Kind == JobEventSupersedeFinalizePending {
 			obligations++
 		}
 	}
 	if obligations != 1 {
-		t.Fatalf("advance_retry events = %d, want exactly 1: a failed child with no marker is stranded", obligations)
+		t.Fatalf("%s events = %d, want exactly 1: a failed child with no marker is stranded", JobEventSupersedeFinalizePending, obligations)
+	}
+	pending, err := store.JobIDsWithPendingSupersedeFinalization(ctx)
+	if err != nil {
+		t.Fatalf("JobIDsWithPendingSupersedeFinalization: %v", err)
+	}
+	if len(pending) != 1 || pending[0] != child {
+		t.Fatalf("re-drive queue = %v, want exactly [%s]: the sweep will never reach this child", pending, child)
 	}
 	if !advancementPending(events) {
 		t.Fatal("advancementPending = false: the sweep will never re-drive this child")
@@ -130,7 +144,7 @@ func TestClosedPullRequestChildObligationClearsOnSuccess(t *testing.T) {
 	}
 	child := "parent-job/delegation/api"
 
-	finalized, err := engine.FinalizeClosedPullRequestDelegationChild(ctx, child,
+	finalized, err := engine.FinalizeClosedPullRequestDelegationChild(ctx, mustJob(t, store, child),
 		"queued review job superseded: gitmoot/gitmoot pull request #7 is no longer open")
 	var blocked BlockedError
 	if err != nil && !errors.As(err, &blocked) {

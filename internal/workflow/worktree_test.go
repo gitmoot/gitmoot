@@ -517,6 +517,38 @@ func TestEngineAllocateTaskWorktreeBlocksDirtyOffLineageWorktree(t *testing.T) {
 	}
 }
 
+func TestEngineAllocateTaskWorktreeCannotBlockMergedTaskForDirtyWorktree(t *testing.T) {
+	ctx, store, engine, manager, request, _, _, _ := setupOffLineageTaskWorktree(t, true)
+	task, err := store.GetTask(ctx, request.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task.State = string(TaskMerged)
+	if err := store.UpsertTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = engine.AllocateTaskWorktree(ctx, request, manager)
+	var blocked BlockedError
+	if !errors.As(err, &blocked) {
+		t.Fatalf("AllocateTaskWorktree error = %v, want BlockedError", err)
+	}
+	task, err = store.GetTask(ctx, request.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != string(TaskMerged) {
+		t.Fatalf("task state = %q, want merged", task.State)
+	}
+	events, err := store.ListTaskEvents(ctx, request.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Kind != TaskEventMergedRegressionRefused {
+		t.Fatalf("task events = %+v, want one merged-regression refusal", events)
+	}
+}
+
 func TestEngineAllocateTaskWorktreeUsesExistingBranchWhenBranchAlreadyExists(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -2733,6 +2765,7 @@ func runWorktreeGitEnvOutput(t *testing.T, dir string, env []string, stdin strin
 type fakeWorktreeManager struct {
 	err               error
 	onAdd             func()
+	onAddCtx          func(context.Context)
 	existingBranches  map[string]bool
 	fetchedRemotes    []string
 	pathHeads         map[string]string
@@ -2784,7 +2817,12 @@ type worktreeCall struct {
 	base   string
 }
 
-func (f *fakeWorktreeManager) AddWorktree(_ context.Context, branch string, path string, base string) error {
+func (f *fakeWorktreeManager) AddWorktree(ctx context.Context, branch string, path string, base string) error {
+	// onAddCtx receives the allocation's OWN context, which is what a test needs to
+	// observe the heartbeat cancelling an in-flight pre-effect (#1673).
+	if f.onAddCtx != nil {
+		f.onAddCtx(ctx)
+	}
 	if f.onAdd != nil {
 		f.onAdd()
 	}

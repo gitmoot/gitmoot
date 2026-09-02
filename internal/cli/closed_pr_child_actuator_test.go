@@ -124,10 +124,10 @@ func TestClosedPullRequestChildConvergesThroughTheRetryActuator(t *testing.T) {
 
 	// STOP THE SEQUENCE in the exact window the P1 occupies: after the atomic terminal
 	// commit, before the parent is advanced.
-	workflow.SetClosedPRChildPreAdvanceHookForTest(func(context.Context, string) error {
+	workflow.SetClosedPRChildPreAdvanceHookForTest(func(context.Context) error {
 		return errors.New("process stopped before advancing the parent")
 	})
-	_, finalizeErr := engine.FinalizeClosedPullRequestDelegationChild(ctx, child,
+	_, finalizeErr := engine.FinalizeClosedPullRequestDelegationChild(ctx, spawned,
 		"queued review job superseded: gitmoot/gitmoot pull request #7 is no longer open")
 	workflow.SetClosedPRChildPreAdvanceHookForTest(nil)
 	if finalizeErr == nil || !strings.Contains(finalizeErr.Error(), "process stopped before advancing the parent") {
@@ -141,10 +141,17 @@ func TestClosedPullRequestChildConvergesThroughTheRetryActuator(t *testing.T) {
 		t.Fatalf("child state = %q after interruption, want failed", interrupted.State)
 	}
 
-	// The child must be a candidate at all - otherwise this test proves nothing.
-	candidates, err := store.JobIDsWithPendingAdvanceRetry(ctx)
+	// THE OWNER OF THIS RECOVERY IS THE SUPERSEDE DEBT SWEEP, not the generic advance
+	// actuator, and that is a deliberate choice rather than an accident of the merge
+	// (#1673/#1731). The generic actuator selects on advance_retry and advances WITHOUT
+	// the supersede ownership anchor; driving an interrupted supersede through it would
+	// apply parent effects that a superseded lifecycle must not apply, which is exactly
+	// what the anchor exists to refuse. Teaching it this marker would have made the
+	// assertion below pass and reopened that hole, so the marker stays where its anchor
+	// is.
+	candidates, err := store.JobIDsWithPendingSupersedeFinalization(ctx)
 	if err != nil {
-		t.Fatalf("JobIDsWithPendingAdvanceRetry: %v", err)
+		t.Fatalf("JobIDsWithPendingSupersedeFinalization: %v", err)
 	}
 	found := false
 	for _, id := range candidates {
@@ -153,15 +160,22 @@ func TestClosedPullRequestChildConvergesThroughTheRetryActuator(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatalf("child %s is not a pending-advancement candidate; candidates = %v", child, candidates)
+		t.Fatalf("child %s is not a pending-supersede-finalization candidate; candidates = %v", child, candidates)
 	}
 
-	// DRIVE THE REAL ACTUATOR, twice: convergence means the second pass finds nothing
-	// owed, not that one pass happened to work.
-	worker := defaultJobWorker(store, io.Discard)
+	// DRIVE THE REAL SWEEP, twice: convergence means the second pass finds nothing owed,
+	// not that one pass happened to work. The hook is cleared above, so this pass runs
+	// the boundary the interruption stopped at.
 	for pass := range 2 {
-		if err := retryPendingJobAdvancements(ctx, worker, "", "", nil, newTickCandidates(store)); err != nil {
-			t.Fatalf("retryPendingJobAdvancements pass %d: %v", pass+1, err)
+		// A BlockedError here is the parent's failure_policy (block_parent, the default)
+		// DECIDING that a dead child blocks it - the DAG recording an outcome, not this
+		// path failing - so it is classified exactly as the daemon classifies it and the
+		// debt is still settled. Any other error is a real fault.
+		if _, err := engine.CompletePendingSupersedeFinalization(ctx, child); err != nil {
+			var blocked workflow.BlockedError
+			if !errors.As(err, &blocked) {
+				t.Fatalf("CompletePendingSupersedeFinalization pass %d: %v", pass+1, err)
+			}
 		}
 	}
 
@@ -169,31 +183,31 @@ func TestClosedPullRequestChildConvergesThroughTheRetryActuator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListJobEvents: %v", err)
 	}
-	retries, resolutions := 0, 0
+	pending, resolutions := 0, 0
 	for _, event := range events {
 		switch event.Kind {
-		case "advance_retry":
-			retries++
-		case "advance_completed", "advance_retried", "advance_blocked", "advance_retry_skipped":
+		case workflow.JobEventSupersedeFinalizePending:
+			pending++
+		case workflow.JobEventSupersedeFinalizeCompleted:
 			resolutions++
 		}
 	}
 	if resolutions == 0 {
-		t.Fatalf("the actuator never resolved the advancement: it is looping. events = %+v", events)
+		t.Fatalf("the sweep never resolved the finalization: it is looping. events = %+v", events)
 	}
 	// THE STRUCTURAL GUARANTEE: a parent-DAG-only advancement cannot dispatch the
-	// child's OWN delegations. If this job appears, the actuator ran the full advance
+	// child's OWN delegations. If this job appears, the recovery ran the full advance
 	// under an unvalidated checkout.
 	if _, err := store.GetJob(ctx, child+"/delegation/grandchild"); err == nil {
 		t.Fatal("the child's own delegation was dispatched: parent-only advancement ran the full advance")
 	}
-	if remaining, err := store.JobIDsWithPendingAdvanceRetry(ctx); err != nil {
-		t.Fatalf("JobIDsWithPendingAdvanceRetry after: %v", err)
+	if remaining, err := store.JobIDsWithPendingSupersedeFinalization(ctx); err != nil {
+		t.Fatalf("JobIDsWithPendingSupersedeFinalization after: %v", err)
 	} else {
 		for _, id := range remaining {
 			if id == child {
-				t.Fatalf("child %s is STILL owed an advancement after two actuator passes: retries=%d resolutions=%d",
-					child, retries, resolutions)
+				t.Fatalf("child %s is STILL owed a finalization after two sweep passes: pending=%d resolutions=%d",
+					child, pending, resolutions)
 			}
 		}
 	}

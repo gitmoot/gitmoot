@@ -74,3 +74,63 @@ func TestTaskDisposalStatesCannotBeOverwrittenByConditionalUpsert(t *testing.T) 
 		})
 	}
 }
+
+// TestUpsertTaskUnlessStatesDecidesAtWriteTimeAcrossConnections pins the property
+// the workflow engine's merged-regression guard leans on (#1673): the forbidden-state
+// predicate is evaluated by the UPDATE itself, so a state written by ANOTHER
+// connection after the caller's read still wins.
+//
+// Two Store handles on the same file stand in for two daemons. Handle A reads
+// `reviewing` — the read a pre-write advisory check would have approved — then
+// handle B lands `merged`, and only then does A issue its stale conditional write.
+// A `merged` row surviving that is the whole difference between an atomic guard and
+// an advisory one; against a plain UpsertTask the stale `blocked` lands.
+func TestUpsertTaskUnlessStatesDecidesAtWriteTimeAcrossConnections(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gitmoot.db")
+	engineSide, err := openCachedTestStore(t, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engineSide.Close()
+	otherDaemon, err := openCachedTestStore(t, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer otherDaemon.Close()
+
+	ctx := context.Background()
+	seed := Task{ID: "task-7", RepoFullName: "owner/repo", Title: "Parent", State: "reviewing", Branch: "task-7"}
+	if err := engineSide.UpsertTask(ctx, seed); err != nil {
+		t.Fatal(err)
+	}
+
+	stale, err := engineSide.GetTask(ctx, "task-7")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if stale.State != "reviewing" {
+		t.Fatalf("pre-read state = %q, want reviewing (the window must open on a permitted state)", stale.State)
+	}
+
+	merged := seed
+	merged.State = "merged"
+	if err := otherDaemon.UpsertTask(ctx, merged); err != nil {
+		t.Fatalf("other daemon's merged write returned error: %v", err)
+	}
+
+	stale.State = "blocked"
+	changed, err := engineSide.UpsertTaskUnlessStates(ctx, stale, []string{"merged"})
+	if err != nil {
+		t.Fatalf("conditional upsert returned error: %v", err)
+	}
+	if changed {
+		t.Fatal("conditional upsert reported changed=true; it wrote over a row that had merged since the read")
+	}
+	got, err := otherDaemon.GetTask(ctx, "task-7")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if got.State != "merged" {
+		t.Fatalf("task state = %q, want merged: the stale write raced the merge and won", got.State)
+	}
+}

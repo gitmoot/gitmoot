@@ -81,8 +81,18 @@ func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent,
 	}
 	defer tx.Rollback()
 
-	// See CreateJob: same COALESCE(NULLIF(?,''), ?) bound to (payload.RootJobID,
-	// job.ID) denormalizes the rootJobID() rule onto the indexed root_id column.
+	if err := createJobWithEventTx(ctx, tx, s, job, event, additionalEvents...); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// createJobWithEventTx is the shared insert body, so the ownership-bound variant
+// below cannot drift from the plain one.
+//
+// See CreateJob: the same COALESCE(NULLIF(?,”), ?) bound to (payload.RootJobID,
+// job.ID) denormalizes the rootJobID() rule onto the indexed root_id column.
+func createJobWithEventTx(ctx context.Context, tx *sql.Tx, s *Store, job Job, event JobEvent, additionalEvents ...JobEvent) error {
 	projection := jobProjectionFromPayload(job.Payload)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, model, result_hash, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
@@ -105,10 +115,64 @@ func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent,
 			return err
 		}
 	}
-	if err := resolveAwaitedReviewFactTx(ctx, tx, job.ID, job.Agent, job.Type, job.State, job.Payload, s.blockingSeverityFor, time.Now().UTC()); err != nil {
+	return resolveAwaitedReviewFactTx(ctx, tx, job.ID, job.Agent, job.Type, job.State, job.Payload, s.blockingSeverityFor, time.Now().UTC())
+}
+
+// ErrAdvanceOwnershipLost is returned when an irreversible write is refused because
+// the supersession advance that requested it no longer owns the job.
+var ErrAdvanceOwnershipLost = errors.New("supersede advance no longer owns this job")
+
+// CreateJobWithEventIfAdvanceOwned is CreateJobWithEvent with live advance ownership
+// asserted INSIDE the insert's own transaction (#1673).
+//
+// Enqueueing a job is irreversible, so the binding cannot be a preceding read or a
+// pre-write heartbeat: the gap between such a check and the insert is exactly where
+// a lease loss or a lifecycle rollover lands. Checking in the transaction that
+// carries the insert means either both the ownership predicate held and the job
+// exists, or neither.
+func (s *Store) CreateJobWithEventIfAdvanceOwned(ctx context.Context, job Job, own AdvanceOwnership, now time.Time, event JobEvent, additionalEvents ...JobEvent) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	live, err := advanceOwnershipLiveTx(ctx, tx, own, now)
+	if err != nil {
+		return err
+	}
+	if !live {
+		return fmt.Errorf("%w: job %s at generation %d", ErrAdvanceOwnershipLost, own.OwnerJobID, own.AtGeneration)
+	}
+	if err := createJobWithEventTx(ctx, tx, s, job, event, additionalEvents...); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+// AddJobEventIfAdvanceOwned appends a job event only while the advance that asked
+// for it still owns the job, asserted in the append's own transaction (#1673). It is
+// the taskless counterpart of the round-open write: a coordinator with no task still
+// owes a durable round record, and a superseded pass still must not write one.
+func (s *Store) AddJobEventIfAdvanceOwned(ctx context.Context, event JobEvent, own AdvanceOwnership, now time.Time) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	live, err := advanceOwnershipLiveTx(ctx, tx, own, now)
+	if err != nil {
+		return false, err
+	}
+	if !live {
+		return false, fmt.Errorf("%w: event %q for job %s at generation %d",
+			ErrAdvanceOwnershipLost, event.Kind, own.OwnerJobID, own.AtGeneration)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`,
+		event.JobID, event.Kind, event.Message); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
 }
 
 // CreateExternallyDrivenJobWithEvent creates a session job (#657) whose execution
@@ -513,6 +577,59 @@ func (s *Store) CountQueuedJobsForRepo(ctx context.Context, repo string) (int, e
 	return count, err
 }
 
+// listQueuedJobsForRepoSQL mirrors listQueuedJobsSQL with a repo residual and the
+// denormalized repo/pull_request columns projected, so a repo-scoped consumer can
+// select its own candidates WITHOUT decoding another repo's payload.
+//
+// INDEXED BY is not decoration. MEASURED with EXPLAIN QUERY PLAN: left to itself the
+// planner picks idx_jobs_repo (repo=?) and then builds a TEMP B-TREE for the ORDER BY,
+// which walks every job this repo has ever had and sorts them. The queued set is tiny
+// by construction — that is the premise of the whole sweep — so scanning the partial
+// index in created_at order with repo as the residual is strictly cheaper and needs no
+// sort. The literal 'queued' predicate is what makes the partial index usable at all;
+// the hint follows the existing precedent at countCurrentJobsByOrgRoleRunningSQL.
+// The repo residual is CASE-INSENSITIVE because forge repository identity is: a row
+// projected `Gitmoot/Gitmoot` against a daemon registered as `gitmoot/gitmoot` would
+// otherwise be invisible to every poll, forever. It costs nothing here — repo is a
+// residual over the queued rows, not the indexed term.
+const listQueuedJobsForRepoSQL = `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, repo, pull_request, lifecycle_generation
+		FROM jobs INDEXED BY idx_jobs_queued_created
+		WHERE state = 'queued' AND externally_driven = 0 AND lower(repo) = lower(?) ORDER BY created_at, rowid`
+
+// ListQueuedJobsForRepo returns this repo's queued engine-owned jobs in created_at
+// (then rowid) order, with the repo, pull_request and lifecycle_generation
+// projections populated.
+//
+// lifecycle_generation rides along because a sweep that decides a job is
+// terminable has formed that verdict about the run it OBSERVED. Settling on the
+// state string alone cannot tell "still that run" from "it completed, was
+// re-queued, and is queued again", so a slow sweep could cancel a newer
+// lifecycle. Every settlement from this list must be anchored on the generation
+// returned here.
+//
+// It exists because ListQueuedJobs is HOME-WIDE and projects neither column, so a
+// repo-scoped caller had to decode every payload in the home just to discover whose
+// row it was — which meant one undecodable payload in ANY repo could fail EVERY
+// watched repo's poll, permanently, since that condition is not transient. Filtering
+// in SQL means a foreign row is never read at all.
+func (s *Store) ListQueuedJobsForRepo(ctx context.Context, repo string) ([]Job, error) {
+	rows, err := s.db.QueryContext(ctx, listQueuedJobsForRepoSQL, strings.TrimSpace(repo))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []Job
+	for rows.Next() {
+		var job Job
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.Repo, &job.PullRequest, &job.LifecycleGeneration); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
 const countCurrentJobsByOrgRoleRunningSQL = `SELECT json_extract(payload, '$.acting_org_role') AS role, COUNT(*)
 	FROM jobs INDEXED BY idx_jobs_running_updated_at
 	WHERE state = 'running' AND json_valid(payload)
@@ -674,55 +791,36 @@ func (s *Store) TransitionJobState(ctx context.Context, id string, from string, 
 	return affected == 1, nil
 }
 
+// TransitionJobStateAtGeneration is TransitionJobState with the LIFECYCLE
+// GENERATION pinned and NO event written.
+//
+// It exists for a recovery pass that must convert a check-then-act into a
+// compare-and-swap without leaving an audit row per attempt. A caller re-asserts
+// (state, generation) as a self-transition to claim the exact run it decided
+// about; a retry queued since that decision moves the generation, so the claim
+// fails. Writing an event here instead would append one row per poll for as long
+// as a fault persists, which is the unbounded job_events growth the advance-retry
+// markers were reshaped to avoid (#598).
+func (s *Store) TransitionJobStateAtGeneration(ctx context.Context, id string, from string, fromGeneration int64, to string) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND lifecycle_generation = ?`, to, to, id, from, fromGeneration)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
+}
+
 func (s *Store) TransitionJobStateWithEvent(ctx context.Context, id string, from string, to string, event JobEvent) (bool, error) {
-	return s.TransitionJobStateWithEvents(ctx, id, from, to, event)
-}
-
-// TransitionJobStateWithEvents is TransitionJobStateWithEvent for a caller that must
-// land the transition AND a durable OBLIGATION in the same commit (#1673).
-//
-// The single-event form leaves a window: a caller that transitions a job and then
-// writes its re-drive marker separately can crash in between, and a settled job with
-// no marker is invisible to every sweep that would have re-driven it. Passing both
-// events here closes that window by construction rather than by ordering luck.
-func (s *Store) TransitionJobStateWithEvents(ctx context.Context, id string, from string, to string, events ...JobEvent) (bool, error) {
-	return s.TransitionJobStateWithPayloadAndEvents(ctx, id, from, to, nil, events...)
-}
-
-// TransitionJobStateWithPayloadAndEvents additionally rewrites the job's PAYLOAD in
-// the same commit (#1673).
-//
-// THE CLASS, not the site: a caller that terminalizes a job and then writes the
-// payload its recovery path needs has merely MOVED the non-atomicity one step down the
-// sequence. The state it leaves - a settled job carrying a re-drive marker but no
-// result - is unrepairable: the actuator rejects the nil result, re-stamps the marker
-// and repeats forever, and no sweep selects it because the sweeps list QUEUED jobs.
-// Two durable facts that must agree are written by one statement here.
-//
-// A nil payload leaves the stored payload untouched, so the events-only wrapper above
-// is byte-equivalent to the original single-event primitive.
-func (s *Store) TransitionJobStateWithPayloadAndEvents(ctx context.Context, id string, from string, to string, payload []byte, events ...JobEvent) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
 
-	var result sql.Result
-	if payload == nil {
-		result, err = tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, to, id, from)
-	} else {
-		// DERIVED FIELDS TRAVEL WITH THE PAYLOAD. jobs.result_hash and the payload
-		// projections are not decoration: the hash is the terminal result's
-		// proof-integrity receipt and its memory-harvest key, and writing a payload that
-		// installs a result while leaving the old (or empty) hash behind breaks that
-		// invariant silently. Every other payload writer recomputes them in the same
-		// UPDATE; so does this one (#1673).
-		projection := jobProjectionFromPayload(string(payload))
-		result, err = tx.ExecContext(ctx, `UPDATE jobs SET state = ?, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`,
-			to, payload, jobResultHashFromPayload(string(payload)), projection.Repo, projection.PullRequest,
-			projection.BlockerRetryAt, projection.BlockerSuggestedAction, to, id, from)
-	}
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, to, id, from)
 	if err != nil {
 		return false, err
 	}
@@ -733,13 +831,11 @@ func (s *Store) TransitionJobStateWithPayloadAndEvents(ctx context.Context, id s
 	if affected == 0 {
 		return false, tx.Commit()
 	}
-	for _, event := range events {
-		if event.JobID == "" {
-			event.JobID = id
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
-			return false, err
-		}
+	if event.JobID == "" {
+		event.JobID = id
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+		return false, err
 	}
 	return true, tx.Commit()
 }
@@ -756,7 +852,13 @@ func (s *Store) TransitionJobStateWithPayloadAndEvents(ctx context.Context, id s
 // It returns false, with no event written, when the row is not in `from` state OR
 // not at `fromGeneration` -- the caller cannot tell the two apart from the return
 // value alone and should re-read the row to classify what happened.
-func (s *Store) TransitionJobStateWithEventAtGeneration(ctx context.Context, id string, from string, fromGeneration int64, to string, event JobEvent) (bool, error) {
+//
+// additionalEvents land in the SAME transaction as the state write. A caller that
+// owes follow-up work after the transition (cleanup, a synthetic result, a parent
+// advance) uses one to record that debt durably, so a crash between the
+// transition and the follow-up leaves a marker a later sweep can rediscover
+// rather than a silently half-finished settlement.
+func (s *Store) TransitionJobStateWithEventAtGeneration(ctx context.Context, id string, from string, fromGeneration int64, to string, event JobEvent, additionalEvents ...JobEvent) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -779,6 +881,14 @@ func (s *Store) TransitionJobStateWithEventAtGeneration(ctx context.Context, id 
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
 		return false, err
+	}
+	for _, additional := range additionalEvents {
+		if additional.JobID == "" {
+			additional.JobID = id
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, additional.JobID, additional.Kind, additional.Message); err != nil {
+			return false, err
+		}
 	}
 	return true, tx.Commit()
 }
@@ -898,6 +1008,65 @@ func (s *Store) ListRunningJobIDsFromForeignBoot(ctx context.Context, currentBoo
 	return ids, rows.Err()
 }
 
+// ErrSupersedeAdvanceOwned is returned when a retry loses the ownership predicate:
+// a supersession recovery owns this job's parent advance right now, and re-queueing
+// it would roll the lifecycle over mid-advance.
+var ErrSupersedeAdvanceOwned = errors.New("supersession parent-advance owns this job")
+
+// TransitionJobStatePayloadWithEventUnlessAdvanceOwned is
+// TransitionJobStatePayloadWithEvent with the advance-ownership exclusion in the
+// SAME statement. RetryJob uses it so claim absence and the terminal-to-queued
+// transition commit together; a separate pre-check loses to a recovery pass that
+// acquires ownership in between.
+func (s *Store) TransitionJobStatePayloadWithEventUnlessAdvanceOwned(ctx context.Context, id string, from string, to string, payload string, now time.Time, event JobEvent, extraEvents ...JobEvent) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	projection := jobProjectionFromPayload(payload)
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ? AND state = ? AND workflow_id = ?`+noLiveSupersedeAdvanceLockSQL,
+		to, to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+		projection.BlockerSuggestedAction, id, from, projection.WorkflowID, formatResourceLockTime(now))
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		if err := rejectWorkflowIDMismatch(ctx, tx, id, projection.WorkflowID); err != nil {
+			return false, err
+		}
+		owned, ownErr := advanceOwnershipHeldAnyTokenTx(ctx, tx, SupersedeAdvanceLockKeyPrefix+id, now)
+		if ownErr != nil {
+			return false, ownErr
+		}
+		if owned {
+			return false, fmt.Errorf("%w: job %s", ErrSupersedeAdvanceOwned, id)
+		}
+		return false, tx.Commit()
+	}
+	if event.JobID == "" {
+		event.JobID = id
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+		return false, err
+	}
+	for _, extra := range extraEvents {
+		if extra.JobID == "" {
+			extra.JobID = id
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, extra.JobID, extra.Kind, extra.Message); err != nil {
+			return false, err
+		}
+	}
+	return true, tx.Commit()
+}
+
 func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id string, from string, to string, payload string, event JobEvent, extraEvents ...JobEvent) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1008,7 +1177,11 @@ func (s *Store) TransitionJobStatePayloadUsageWithEvent(ctx context.Context, id 
 // TransitionJobStatePayloadWithEventAndTaskTransition is the retry path's
 // cross-row transaction: a dismissed task is explicitly recovered before its
 // job is re-queued, and either both lifecycle events commit or neither does.
-func (s *Store) TransitionJobStatePayloadWithEventAndTaskTransition(ctx context.Context, id string, from string, to string, payload string, event JobEvent, taskID string, taskFrom string, taskTo string, taskKind string, taskReason string) (bool, error) {
+// now is required because the job transition carries the advance-ownership
+// exclusion in its own statement: this arm re-queues exactly like the plain one,
+// so it must refuse for the same reason (#1673) rather than being the hole the
+// other arm's guard leaves open.
+func (s *Store) TransitionJobStatePayloadWithEventAndTaskTransition(ctx context.Context, id string, from string, to string, payload string, now time.Time, event JobEvent, taskID string, taskFrom string, taskTo string, taskKind string, taskReason string) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -1037,9 +1210,10 @@ func (s *Store) TransitionJobStatePayloadWithEventAndTaskTransition(ctx context.
 	}
 
 	projection := jobProjectionFromPayload(payload)
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND workflow_id = ?`,
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ? AND state = ? AND workflow_id = ?`+noLiveSupersedeAdvanceLockSQL,
 		to, to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
-		projection.BlockerSuggestedAction, id, from, projection.WorkflowID)
+		projection.BlockerSuggestedAction, id, from, projection.WorkflowID, formatResourceLockTime(now))
 	if err != nil {
 		return false, err
 	}
@@ -1050,6 +1224,13 @@ func (s *Store) TransitionJobStatePayloadWithEventAndTaskTransition(ctx context.
 	if affected == 0 {
 		if err := rejectWorkflowIDMismatch(ctx, tx, id, projection.WorkflowID); err != nil {
 			return false, err
+		}
+		owned, ownErr := advanceOwnershipHeldAnyTokenTx(ctx, tx, SupersedeAdvanceLockKeyPrefix+id, now)
+		if ownErr != nil {
+			return false, ownErr
+		}
+		if owned {
+			return false, fmt.Errorf("%w: job %s", ErrSupersedeAdvanceOwned, id)
 		}
 		return false, nil
 	}
@@ -1762,6 +1943,53 @@ const (
 			GROUP BY job_id
 		)
 		ORDER BY job_id`
+
+	jobIDsWithPendingSupersedeFinalizationSQL = `SELECT job_id FROM job_events
+		WHERE kind = 'supersede_finalize_pending'
+		  AND id IN (
+			SELECT MAX(id) FROM job_events
+			WHERE kind IN ('supersede_finalize_pending', 'supersede_finalize_completed')
+			GROUP BY job_id
+		)
+		ORDER BY job_id`
+
+	// supersedeFinalizationClosureSQL appends the completion marker only while the
+	// pending marker it claims is STILL the latest of the two marker kinds. The
+	// candidate query above is last-one-wins by event id, so an unconditional
+	// append written after a newer pending marker silently clears a debt nobody
+	// paid. Predicate and insert are one statement, so no retry can land between
+	// them.
+	//
+	// %s is the pending marker's identity test. The marker's MESSAGE IS THE
+	// GENERATION, written as a canonical decimal and nothing else, because the
+	// classification has to mean the same thing in SQL and in Go. The previous
+	// `generation=<n>: <reason>` prefix could not: a malformed prefix
+	// (`generation=abc: …`) parsed as unanchored in Go while SQL's
+	// `NOT LIKE 'generation=%'` rejected it as anchored-shaped, and a non-canonical
+	// spelling (`generation=01: …`) parsed as 1 in Go while the anchored LIKE missed
+	// it — both left a debt that no path could ever close.
+	//
+	// CAST(CAST(message AS INTEGER) AS TEXT) = message is exactly "canonical decimal
+	// integer", which is the same predicate strconv.ParseInt plus a FormatInt
+	// round-trip applies in Go. So anchored is an equality on that canonical form and
+	// unanchored is its complement, and every shape lands in exactly one of them.
+	supersedeFinalizationClosureSQL = `INSERT INTO job_events(job_id, kind, message)
+		SELECT ?, 'supersede_finalize_completed', ?
+		WHERE EXISTS (
+			SELECT 1 FROM job_events pending
+			WHERE pending.job_id = ?
+			  AND pending.kind = 'supersede_finalize_pending'
+			  AND %s
+			  AND pending.id = (
+				SELECT MAX(id) FROM job_events latest
+				WHERE latest.job_id = ?
+				  AND latest.kind IN ('supersede_finalize_pending', 'supersede_finalize_completed')
+			  )
+		)`
+
+	supersedeFinalizationAnchoredPendingSQL = `pending.message = CAST(? AS TEXT)
+			  AND CAST(CAST(pending.message AS INTEGER) AS TEXT) = pending.message`
+	supersedeFinalizationUnanchoredPendingSQL = `CAST(CAST(pending.message AS INTEGER) AS TEXT) <> pending.message`
 )
 
 // JobIDsWithPendingDelegationWorktreeReclaim returns the IDs of jobs whose most
@@ -1888,34 +2116,6 @@ func (s *Store) JobIDsWithPendingAdvanceRetry(ctx context.Context) ([]string, er
 	return s.jobIDsByQuery(ctx, jobIDsWithPendingAdvanceRetrySQL)
 }
 
-// maxJobEventIDSQL is the change cursor for the candidate queries whose result is
-// a pure function of job_events. It is the same monotonic maximum the dashboard
-// already polls (dashboardChangeCursorSQL) and SQLite answers it with a single
-// descent of the integer primary key, so it costs the same whether the table
-// holds a hundred rows or a hundred thousand.
-const maxJobEventIDSQL = `SELECT COALESCE(MAX(id), 0) FROM job_events`
-
-// MaxJobEventID returns the highest job_events row id, or 0 when the table is
-// empty.
-//
-// It is a sound change cursor for JobIDsWithPendingAdvanceRetry and
-// JobIDsWithPendingCommentRetry specifically, because those two queries read only
-// the (id, kind, job_id) columns of job_events and NOTHING else — no other table,
-// no clock. Production only ever APPENDS to job_events (the sole DELETE is a
-// one-time migration that runs before any tick) and its in-place updates —
-// RefreshLatestAdvanceRetry, the running-job progress refresh, and the claimed
-// permission-policy warning — all SET message/created_at only, never id, kind or
-// job_id. So an unmoved maximum id proves those two result sets are unchanged.
-//
-// It is NOT a sound cursor for the delegation/aged/task reclaim candidates: those
-// join jobs and cleanup_obligations and compare against unixepoch('now'), so their
-// results change with the clock alone.
-func (s *Store) MaxJobEventID(ctx context.Context) (int64, error) {
-	var id int64
-	err := s.db.QueryRowContext(ctx, maxJobEventIDSQL).Scan(&id)
-	return id, err
-}
-
 // JobIDsWithPendingCommentRetry returns the IDs of jobs whose LATEST comment event
 // (by id) is comment_post_failed with no subsequent comment_posted or retry_queued
 // — exactly jobWorker.jobNeedsCommentRetry's last-one-wins rule (daemon.go),
@@ -1925,6 +2125,101 @@ func (s *Store) MaxJobEventID(ctx context.Context) (int64, error) {
 // only has to be a superset; it is in fact exact.
 func (s *Store) JobIDsWithPendingCommentRetry(ctx context.Context) ([]string, error) {
 	return s.jobIDsByQuery(ctx, jobIDsWithPendingCommentRetrySQL)
+}
+
+// JobIDsWithPendingSupersedeFinalization returns the IDs of jobs whose closed-PR
+// supersession recorded its follow-up debt (supersede_finalize_pending) in the
+// same transaction as the terminal state write and has not yet recorded that the
+// debt was paid (supersede_finalize_completed).
+//
+// It exists because the terminal write moves the job OUT of queued, and the
+// closed-PR sweep selects only queued jobs: a crash or error after the
+// transition but before the cleanups, the synthetic result and the parent
+// advance left a child that no sweep could ever rediscover, stranding its
+// coordinator forever. The marker makes that window recoverable — this is the
+// set a later poll re-drives.
+//
+// Same last-one-wins shape as the other bounded marker queries: the highest-id
+// event among exactly the two tracked kinds decides, so a job that was finalized,
+// re-queued and superseded again is a candidate again.
+func (s *Store) JobIDsWithPendingSupersedeFinalization(ctx context.Context) ([]string, error) {
+	return s.jobIDsByQuery(ctx, jobIDsWithPendingSupersedeFinalizationSQL)
+}
+
+// CloseSupersedeFinalizationDebtAtGeneration appends the completion marker for
+// ONE lifecycle's debt, conditionally and atomically: the pending marker the
+// payment claimed must still be the latest of the two marker kinds.
+//
+// Reading the latest marker and then appending are two statements, and between
+// them a retry plus a fresh supersession can append pending generation N+1. The
+// old completion then becomes the latest marker and erases N+1 from
+// JobIDsWithPendingSupersedeFinalization — a debt that is now invisible and was
+// never paid. Evaluating the predicate inside the INSERT removes that window.
+//
+// closed reports whether the marker was written. False means a newer debt is
+// outstanding (or the debt was already closed); the caller leaves it for the next
+// poll rather than treating it as paid.
+func (s *Store) CloseSupersedeFinalizationDebtAtGeneration(ctx context.Context, jobID string, message string, atGeneration int64, anchored bool) (bool, error) {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return false, nil
+	}
+	var (
+		statement string
+		args      []any
+	)
+	if anchored {
+		statement = fmt.Sprintf(supersedeFinalizationClosureSQL, supersedeFinalizationAnchoredPendingSQL)
+		args = []any{jobID, message, jobID, atGeneration, jobID}
+	} else {
+		statement = fmt.Sprintf(supersedeFinalizationClosureSQL, supersedeFinalizationUnanchoredPendingSQL)
+		args = []any{jobID, message, jobID, jobID}
+	}
+	result, err := s.db.ExecContext(ctx, statement, args...)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
+}
+
+// AddJobEventAtGeneration appends an event only while the job is still the settled
+// lifecycle the caller claimed: same lifecycle_generation, still in one of the two
+// terminal states a supersession writes.
+//
+// Predicate and insert are ONE statement, so it is the write-side equivalent of a
+// compare-and-swap for the event log. Recovery uses it wherever an unconditional
+// append would attribute a superseded run's work to a retry that now owns the row:
+// the read-only worktree reclaim marker (which would hand a LIVE run's worktree to
+// the reclaim pass, since the path is derived from the job id and is therefore the
+// same one the retry is using), and the parent-advance bracket.
+//
+// written reports whether the row landed. False means the lifecycle moved; the
+// caller must not treat the step as done.
+func (s *Store) AddJobEventAtGeneration(ctx context.Context, event JobEvent, atGeneration int64) (bool, error) {
+	jobID := strings.TrimSpace(event.JobID)
+	if jobID == "" {
+		return false, errors.New("job event requires a job id")
+	}
+	result, err := s.db.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message)
+		SELECT ?, ?, ?
+		WHERE EXISTS (
+			SELECT 1 FROM jobs
+			WHERE jobs.id = ?
+			  AND jobs.lifecycle_generation = ?
+			  AND jobs.state IN ('cancelled', 'failed')
+		)`, jobID, event.Kind, event.Message, jobID, atGeneration)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
 }
 
 // JobIDsWithOpenEscalation returns the IDs of coordinator jobs with an OPEN
@@ -1949,6 +2244,23 @@ func (s *Store) JobIDsWithOpenEscalation(ctx context.Context) ([]string, error) 
 		GROUP BY job_id
 		HAVING SUM(CASE WHEN kind = 'delegation_escalation_requested' THEN 1 ELSE 0 END)
 		     > SUM(CASE WHEN kind = 'delegation_escalation_resolved' THEN 1 ELSE 0 END)
+		ORDER BY job_id`)
+}
+
+// JobIDsWithUnfinishedEscalationResolution returns coordinator jobs whose escalation
+// resolution was CLAIMED but whose effects never finished: strictly more
+// delegation_escalation_resolved than delegation_escalation_effects_completed events.
+//
+// The claim is committed before the verb's irreversible effects so that only one
+// resolver runs them (#1673). This query is what stops that ordering from turning a
+// crash into a permanent stall: a closed round is no candidate for any other sweep,
+// so the receipt gap is the only remaining evidence that work is owed.
+func (s *Store) JobIDsWithUnfinishedEscalationResolution(ctx context.Context) ([]string, error) {
+	return s.jobIDsByQuery(ctx, `SELECT job_id FROM job_events
+		WHERE kind IN ('delegation_escalation_resolved', 'delegation_escalation_effects_completed')
+		GROUP BY job_id
+		HAVING SUM(CASE WHEN kind = 'delegation_escalation_resolved' THEN 1 ELSE 0 END)
+		     > SUM(CASE WHEN kind = 'delegation_escalation_effects_completed' THEN 1 ELSE 0 END)
 		ORDER BY job_id`)
 }
 
@@ -2343,4 +2655,98 @@ func (s *Store) CountActiveJobsByFingerprint(ctx context.Context, fingerprint st
 		}
 	}
 	return count, rows.Err()
+}
+
+// TransitionJobStateWithEvents is TransitionJobStateWithEvent for a caller that must
+// land the transition AND a durable OBLIGATION in the same commit (#1673).
+//
+// The single-event form leaves a window: a caller that transitions a job and then
+// writes its re-drive marker separately can crash in between, and a settled job with
+// no marker is invisible to every sweep that would have re-driven it. Passing both
+// events here closes that window by construction rather than by ordering luck.
+func (s *Store) TransitionJobStateWithEvents(ctx context.Context, id string, from string, to string, events ...JobEvent) (bool, error) {
+	return s.TransitionJobStateWithPayloadAndEvents(ctx, id, from, to, nil, events...)
+}
+
+// TransitionJobStateWithPayloadAndEvents additionally rewrites the job's PAYLOAD in
+// the same commit (#1673).
+//
+// THE CLASS, not the site: a caller that terminalizes a job and then writes the
+// payload its recovery path needs has merely MOVED the non-atomicity one step down the
+// sequence. The state it leaves - a settled job carrying a re-drive marker but no
+// result - is unrepairable: the actuator rejects the nil result, re-stamps the marker
+// and repeats forever, and no sweep selects it because the sweeps list QUEUED jobs.
+// Two durable facts that must agree are written by one statement here.
+//
+// A nil payload leaves the stored payload untouched, so the events-only wrapper above
+// is byte-equivalent to the original single-event primitive.
+func (s *Store) TransitionJobStateWithPayloadAndEvents(ctx context.Context, id string, from string, to string, payload []byte, events ...JobEvent) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	var result sql.Result
+	if payload == nil {
+		result, err = tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, to, id, from)
+	} else {
+		// DERIVED FIELDS TRAVEL WITH THE PAYLOAD. jobs.result_hash and the payload
+		// projections are not decoration: the hash is the terminal result's
+		// proof-integrity receipt and its memory-harvest key, and writing a payload that
+		// installs a result while leaving the old (or empty) hash behind breaks that
+		// invariant silently. Every other payload writer recomputes them in the same
+		// UPDATE; so does this one (#1673).
+		projection := jobProjectionFromPayload(string(payload))
+		result, err = tx.ExecContext(ctx, `UPDATE jobs SET state = ?, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`,
+			to, payload, jobResultHashFromPayload(string(payload)), projection.Repo, projection.PullRequest,
+			projection.BlockerRetryAt, projection.BlockerSuggestedAction, to, id, from)
+	}
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, tx.Commit()
+	}
+	for _, event := range events {
+		if event.JobID == "" {
+			event.JobID = id
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+			return false, err
+		}
+	}
+	return true, tx.Commit()
+}
+
+// maxJobEventIDSQL is the change cursor for the candidate queries whose result is
+// a pure function of job_events. It is the same monotonic maximum the dashboard
+// already polls (dashboardChangeCursorSQL) and SQLite answers it with a single
+// descent of the integer primary key, so it costs the same whether the table
+// holds a hundred rows or a hundred thousand.
+const maxJobEventIDSQL = `SELECT COALESCE(MAX(id), 0) FROM job_events`
+
+// MaxJobEventID returns the highest job_events row id, or 0 when the table is
+// empty.
+//
+// It is a sound change cursor for JobIDsWithPendingAdvanceRetry and
+// JobIDsWithPendingCommentRetry specifically, because those two queries read only
+// the (id, kind, job_id) columns of job_events and NOTHING else — no other table,
+// no clock. Production only ever APPENDS to job_events (the sole DELETE is a
+// one-time migration that runs before any tick) and its in-place updates —
+// RefreshLatestAdvanceRetry, the running-job progress refresh, and the claimed
+// permission-policy warning — all SET message/created_at only, never id, kind or
+// job_id. So an unmoved maximum id proves those two result sets are unchanged.
+//
+// It is NOT a sound cursor for the delegation/aged/task reclaim candidates: those
+// join jobs and cleanup_obligations and compare against unixepoch('now'), so their
+// results change with the clock alone.
+func (s *Store) MaxJobEventID(ctx context.Context) (int64, error) {
+	var id int64
+	err := s.db.QueryRowContext(ctx, maxJobEventIDSQL).Scan(&id)
+	return id, err
 }

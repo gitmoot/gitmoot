@@ -714,11 +714,11 @@ func TestDeleteResourceLocksByOwner(t *testing.T) {
 	}
 
 	// Empty owner id is a no-op.
-	if released, err := store.DeleteResourceLocksByOwner(ctx, "  "); err != nil || released != 0 {
+	if released, err := store.DeleteResourceLocksByOwner(ctx, "  ", time.Now().UTC()); err != nil || released != 0 {
 		t.Fatalf("DeleteResourceLocksByOwner(empty) released=%d err=%v, want 0/nil", released, err)
 	}
 
-	released, err := store.DeleteResourceLocksByOwner(ctx, "job-a")
+	released, err := store.DeleteResourceLocksByOwner(ctx, "job-a", time.Now().UTC())
 	if err != nil {
 		t.Fatalf("DeleteResourceLocksByOwner(job-a) returned error: %v", err)
 	}
@@ -765,14 +765,14 @@ func TestDeleteResourceLocksByOwnerIfNotRunning(t *testing.T) {
 	}
 
 	// Empty owner id is a no-op.
-	if released, err := store.DeleteResourceLocksByOwnerIfNotRunning(ctx, "  "); err != nil || released != 0 {
+	if released, err := store.DeleteResourceLocksByOwnerIfNotRunning(ctx, "  ", time.Now().UTC()); err != nil || released != 0 {
 		t.Fatalf("DeleteResourceLocksByOwnerIfNotRunning(empty) released=%d err=%v, want 0/nil", released, err)
 	}
 
 	// A RUNNING owner's lock is NOT released: this is the #479 TOCTOU guard. A
 	// child that raced queued->running after a stale snapshot was read keeps its
 	// live runtime-session / checkout lock.
-	if released, err := store.DeleteResourceLocksByOwnerIfNotRunning(ctx, "job-running"); err != nil || released != 0 {
+	if released, err := store.DeleteResourceLocksByOwnerIfNotRunning(ctx, "job-running", time.Now().UTC()); err != nil || released != 0 {
 		t.Fatalf("DeleteResourceLocksByOwnerIfNotRunning(job-running) released=%d err=%v, want 0/nil", released, err)
 	}
 	if _, err := store.GetResourceLock(ctx, "runtime:codex:session-r"); err != nil {
@@ -780,7 +780,7 @@ func TestDeleteResourceLocksByOwnerIfNotRunning(t *testing.T) {
 	}
 
 	// A non-running owner's lock IS released.
-	if released, err := store.DeleteResourceLocksByOwnerIfNotRunning(ctx, "job-queued"); err != nil || released != 1 {
+	if released, err := store.DeleteResourceLocksByOwnerIfNotRunning(ctx, "job-queued", time.Now().UTC()); err != nil || released != 1 {
 		t.Fatalf("DeleteResourceLocksByOwnerIfNotRunning(job-queued) released=%d err=%v, want 1/nil", released, err)
 	}
 	if _, err := store.GetResourceLock(ctx, "runtime:codex:session-q"); !errors.Is(err, sql.ErrNoRows) {
@@ -1909,7 +1909,10 @@ func TestMigrateAppendsTaskWorktreePath(t *testing.T) {
 		t.Fatalf("sql.Open returned error: %v", err)
 	}
 	store := &Store{db: raw}
-	for version, migration := range migrationsBefore(t, "worktree_path") {
+	// The marker must name the TASKS column specifically: #1673 added an
+	// escalation_rounds.preeffect_worktree_path, so a bare "worktree_path" now matches
+	// two migrations and cannot identify this one.
+	for version, migration := range migrationsBefore(t, "ALTER TABLE tasks ADD COLUMN worktree_path") {
 		if err := store.applyMigration(ctx, version+1, migration); err != nil {
 			t.Fatalf("applyMigration(%d) returned error: %v", version+1, err)
 		}
@@ -3892,6 +3895,118 @@ func TestListQueuedJobsUsesQueuedIndex(t *testing.T) {
 		if job.State != "queued" {
 			t.Fatalf("job[%d].State = %q, want queued only", i, job.State)
 		}
+	}
+}
+
+// TestListQueuedJobsForRepoScopesInSQL pins #1673's selection surface: the repo-scoped
+// queued lister returns ONLY this repo's queued rows with the denormalized repo and
+// pull_request projections populated, and is still served by the partial queued index.
+// The projection matters because a repo-scoped consumer that had to decode payloads to
+// discover ownership let one undecodable row in ANY repo fail EVERY repo's poll.
+func TestListQueuedJobsForRepoScopesInSQL(t *testing.T) {
+	ctx := context.Background()
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	seed := []struct {
+		id, state, payload string
+	}{
+		{"mine-2", "queued", `{"repo":"gitmoot/gitmoot","pull_request":8}`},
+		{"mine-1", "queued", `{"repo":"gitmoot/gitmoot","pull_request":7}`},
+		{"foreign", "queued", `{"repo":"gitmoot/other","pull_request":7}`},
+		{"mine-running", "running", `{"repo":"gitmoot/gitmoot","pull_request":9}`},
+	}
+	for _, s := range seed {
+		if err := store.CreateJob(ctx, Job{ID: s.id, Agent: "a", Type: "review", State: s.state, Payload: s.payload}); err != nil {
+			t.Fatalf("CreateJob(%s) returned error: %v", s.id, err)
+		}
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE jobs SET created_at = '2026-01-01 00:00:00' WHERE id = 'mine-1'`); err != nil {
+		t.Fatalf("set created_at(mine-1) returned error: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE jobs SET created_at = '2026-01-02 00:00:00' WHERE id = 'mine-2'`); err != nil {
+		t.Fatalf("set created_at(mine-2) returned error: %v", err)
+	}
+
+	plan := explainQueryPlan(t, store, listQueuedJobsForRepoSQL, "gitmoot/gitmoot")
+	if !strings.Contains(plan, "USING INDEX idx_jobs_queued_created") {
+		t.Fatalf("ListQueuedJobsForRepo plan does not use idx_jobs_queued_created:\n%s", plan)
+	}
+	if strings.Contains(plan, "TEMP B-TREE") {
+		t.Fatalf("ListQueuedJobsForRepo plan builds a temp b-tree:\n%s", plan)
+	}
+
+	got, err := store.ListQueuedJobsForRepo(ctx, "gitmoot/gitmoot")
+	if err != nil {
+		t.Fatalf("ListQueuedJobsForRepo returned error: %v", err)
+	}
+	wantIDs := []string{"mine-1", "mine-2"}
+	if len(got) != len(wantIDs) {
+		t.Fatalf("returned %d jobs, want %d (this repo's queued rows only): %+v", len(got), len(wantIDs), got)
+	}
+	for i, job := range got {
+		if job.ID != wantIDs[i] {
+			t.Fatalf("job[%d].ID = %q, want %q (created_at, rowid order)", i, job.ID, wantIDs[i])
+		}
+		if job.Repo != "gitmoot/gitmoot" {
+			t.Fatalf("job[%d].Repo = %q, want the projection populated", i, job.Repo)
+		}
+		if job.PullRequest <= 0 {
+			t.Fatalf("job[%d].PullRequest = %d, want the projection populated", i, job.PullRequest)
+		}
+	}
+
+	// A LEGACY row must stay visible. jobs.repo was retro-backfilled (#1066) but
+	// jobs.pull_request never was, so a pre-#843 row can carry the right repo and a
+	// zero pull_request while its PAYLOAD names a real PR. This query must not filter
+	// on the projected number, or precisely those rows — the ones most likely to be
+	// stranded, because they are the oldest — would be invisible to every consumer.
+	// Only the same package can build this state: every exported write recomputes the
+	// projection from the payload.
+	if _, err := store.db.ExecContext(ctx, `UPDATE jobs SET pull_request = 0 WHERE id = 'mine-1'`); err != nil {
+		t.Fatalf("clear pull_request(mine-1) returned error: %v", err)
+	}
+	legacy, err := store.ListQueuedJobsForRepo(ctx, "gitmoot/gitmoot")
+	if err != nil {
+		t.Fatalf("ListQueuedJobsForRepo after clearing the projection: %v", err)
+	}
+	found := false
+	for _, job := range legacy {
+		if job.ID == "mine-1" {
+			found = true
+			if job.PullRequest != 0 {
+				t.Fatalf("mine-1 PullRequest = %d, want the cleared projection reported as-is", job.PullRequest)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("a row with a zero pull_request projection vanished: legacy rows must reach the consumer that can read their payload")
+	}
+
+	// Case-variant projection must still be selected: forge repository identity is
+	// case-insensitive, so a row projected with different casing is the same repo's
+	// work. Left case-sensitive, those rows were unreachable by any poll.
+	if err := store.CreateJob(ctx, Job{
+		ID: "case-variant", Agent: "a", Type: "review", State: "queued",
+		Payload: `{"repo":"Gitmoot/Gitmoot","pull_request":7}`,
+	}); err != nil {
+		t.Fatalf("CreateJob(case-variant) returned error: %v", err)
+	}
+	variants, err := store.ListQueuedJobsForRepo(ctx, "gitmoot/gitmoot")
+	if err != nil {
+		t.Fatalf("ListQueuedJobsForRepo after case-variant row: %v", err)
+	}
+	sawVariant := false
+	for _, job := range variants {
+		if job.ID == "case-variant" {
+			sawVariant = true
+		}
+	}
+	if !sawVariant {
+		t.Fatal("a case-variant repo projection was not selected: forge repo identity is case-insensitive")
 	}
 }
 
