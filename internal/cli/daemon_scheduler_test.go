@@ -5558,30 +5558,55 @@ func TestJobEventCursorCacheReadsCursorOncePerTick(t *testing.T) {
 
 // The tests above hand-attach cand.events and drive only the advancement path,
 // which pins the helper rather than the path: production reaches the cache by a
-// route they never take (the two `cand.events = tracker.jobEventCandidateCache()`
-// attachments), and it serves TWO kinds, not one. Two mutants survive them —
-// swapping commentRetryCandidates' kind to jobEventCandidateAdvance, and deleting
-// both attachments — and the first is a silent stall in production: an empty
-// cached ADVANCEMENT set at cursor N would be served to comment retries at the
-// same cursor, suppressing a real comment_post_failed candidate until some later
-// event moves MAX(id).
+// route they never take, and it serves TWO kinds, not one. Three mutants survive
+// them — swapping commentRetryCandidates' kind to jobEventCandidateAdvance, and
+// deleting either of the two `cand.events = tracker.jobEventCandidateCache()`
+// attachments. The kind swap is a silent stall in production: an empty cached
+// ADVANCEMENT set at cursor N would be served to comment retries at the same
+// cursor, suppressing a real comment_post_failed candidate until some later event
+// moves MAX(id).
 //
-// So drive the REAL fleet tick over two ticks with a shared tracker and DISTINCT
-// advancement and comment candidate sets, and assert both kinds are cached
-// independently, under the cache the production wiring supplied.
+// The two attachments sit on DIFFERENT production entry paths and each needs its
+// own case:
+//   - daemon_scheduler.go:1701 in runEnabledRepoWorkerTicksTracked — the
+//     multi-repo sweep, which builds one carrier for the whole tick.
+//   - daemon_scheduler.go:1543 in runDaemonWorkerTickTracked, reached ONLY on the
+//     cand == nil branch — the single-repo supervisor and direct callers, which
+//     let the tick build its own carrier.
 //
-// Every seeded candidate is state-rejected by its pass's Go predicate (#602
-// deferred-to-queued), so the ticks write no job_events and the cursor is
-// genuinely unmoved between them — otherwise the second tick would re-query for
-// an honest reason and the skip assertion would prove nothing.
+// Both are driven through their real entry point below. Hand-attaching
+// cand.events is what made the round-1 tests blind to the wiring, so neither case
+// touches the field.
 func TestJobEventCursorCacheProductionWiringCachesBothKinds(t *testing.T) {
+	t.Run("fleet sweep", func(t *testing.T) {
+		assertCursorCacheWiredForBothKinds(t, func(ctx context.Context, store *db.Store, worker jobWorker, tracker *inflightJobTracker, at time.Time) error {
+			return runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, at, nil, tracker)
+		})
+	})
+	t.Run("standalone tick with no carrier", func(t *testing.T) {
+		assertCursorCacheWiredForBothKinds(t, func(ctx context.Context, store *db.Store, worker jobWorker, tracker *inflightJobTracker, at time.Time) error {
+			// nil carrier: the single-repo supervisor's shape, where the tick
+			// itself builds the carrier and must attach the tracker's cache.
+			return runDaemonWorkerTickTracked(ctx, store, worker, 1, false, "owner/repo", "", io.Discard, at, tracker, nil)
+		})
+	})
+}
+
+// assertCursorCacheWiredForBothKinds runs `drive` for two ticks against a shared
+// tracker and proves the tracker-supplied cursor cache is in force for BOTH
+// candidate kinds, each holding its own set.
+//
+// Every seeded candidate is a pruned-orphan marker — a job_events row with no
+// surviving jobs row — so each pass drops it on the GetJob and the ticks write no
+// job_events. That is what leaves the cursor genuinely unmoved between the two
+// ticks; otherwise the second tick would re-query for an honest reason and the
+// skip assertion would prove nothing. The precondition is asserted, not assumed.
+func assertCursorCacheWiredForBothKinds(t *testing.T, drive func(context.Context, *db.Store, jobWorker, *inflightJobTracker, time.Time) error) {
+	t.Helper()
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
 
-	// Pruned-orphan markers: candidate rows in job_events with no surviving jobs
-	// row. Each pass's Go re-verification drops them on the GetJob, so the ticks
-	// dispatch nothing and write nothing, which is what leaves the cursor still.
 	const advanceID = "adv-pruned-orphan"
 	const commentID = "cmt-pruned-orphan"
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: advanceID, Kind: "advance_started", Message: "orphan"}); err != nil {
@@ -5592,7 +5617,7 @@ func TestJobEventCursorCacheProductionWiringCachesBothKinds(t *testing.T) {
 	}
 
 	// The two candidate sets must DIFFER, or a kind-swapped cache would serve the
-	// right answer by accident and the test would pin nothing.
+	// right answer by accident and this would pin nothing.
 	wantAdvance, err := store.JobIDsWithPendingAdvanceRetry(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -5623,8 +5648,8 @@ func TestJobEventCursorCacheProductionWiringCachesBothKinds(t *testing.T) {
 
 	now := time.Now().UTC()
 	for i, at := range []time.Time{now, now.Add(time.Second)} {
-		if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, at, nil, tracker); err != nil {
-			t.Fatalf("fleet tick %d returned error: %v", i+1, err)
+		if err := drive(ctx, store, worker, tracker, at); err != nil {
+			t.Fatalf("tick %d returned error: %v", i+1, err)
 		}
 	}
 
