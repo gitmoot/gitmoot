@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -409,6 +410,14 @@ func TestReplyWakeOutboxDrainFailureDoesNotAbortRepoWork(t *testing.T) {
 	}
 }
 
+// A persistently inert wake outbox must (a) never escalate the supervisor and
+// (b) since #1758, print its health line exactly ONCE however long it persists —
+// inert is a permanent state, so the repeat carries no information and used to
+// cost ~12.8k journal lines/day.
+//
+// Ticks are counted through the newTickCandidates seam rather than through the
+// health line itself: with log-on-change the line no longer marks a tick, so
+// counting it would silently stop measuring what the test claims to measure.
 func TestReplyWakeOutboxInertHealthDoesNotEscalateSingleRepoLoop(t *testing.T) {
 	store := daemonWorkerStore(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
@@ -425,10 +434,22 @@ func TestReplyWakeOutboxInertHealthDoesNotEscalateSingleRepoLoop(t *testing.T) {
 	live := newDaemonReloadableConfig(30*time.Second, 1, false)
 	tracker := newInflightJobTracker(ctx)
 	var checkoutLock sync.Mutex
-	stdout := &cancelAfterWakeHealthWriter{
-		cancel:    cancel,
-		threshold: maxConsecutiveWorkerTickFailures + 1,
+	stdout := &syncBuffer{}
+
+	// Cancel only once the loop has run strictly more ticks than the escalation
+	// ladder tolerates, so surviving the ladder is what ends the test.
+	wantTicks := maxConsecutiveWorkerTickFailures + 2
+	var ticks atomic.Int32
+	var cancelOnce sync.Once
+	realNewTickCandidates := newTickCandidates
+	newTickCandidates = func(store tickCandidateStore) *tickCandidates {
+		if ticks.Add(1) >= int32(wantTicks) {
+			cancelOnce.Do(cancel)
+		}
+		return realNewTickCandidates(store)
 	}
+	defer func() { newTickCandidates = realNewTickCandidates }()
+
 	errCh := startSingleRepoWorkerLoop(
 		ctx, 100*time.Microsecond, store, worker, live, &checkoutLock, tracker,
 		"owner/repo", "", stdout,
@@ -440,10 +461,13 @@ func TestReplyWakeOutboxInertHealthDoesNotEscalateSingleRepoLoop(t *testing.T) {
 			t.Fatalf("single-repo loop escalated persistent inert wake health: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatalf("single-repo loop did not report inert health beyond %d ticks; log=%q", maxConsecutiveWorkerTickFailures, stdout.String())
+		t.Fatalf("single-repo loop ran %d ticks in 5s, want %d; log=%q", ticks.Load(), wantTicks, stdout.String())
 	}
-	if got := strings.Count(stdout.String(), "reply wake outbox drain health:"); got <= maxConsecutiveWorkerTickFailures {
-		t.Fatalf("inert health lines = %d, want more than escalation threshold %d; log=%q", got, maxConsecutiveWorkerTickFailures, stdout.String())
+	if got := ticks.Load(); got < int32(wantTicks) {
+		t.Fatalf("ticks = %d, want at least %d (the escalation ladder must be outlived)", got, wantTicks)
+	}
+	if got := strings.Count(stdout.String(), "reply wake outbox drain health:"); got != 1 {
+		t.Fatalf("inert health lines = %d over %d ticks, want exactly 1; log=%q", got, ticks.Load(), stdout.String())
 	}
 	if strings.Contains(stdout.String(), "consecutive failures, escalating") {
 		t.Fatalf("inert reply wake health reached escalation ladder: %q", stdout.String())
@@ -454,26 +478,32 @@ func TestReplyWakeOutboxInertHealthDoesNotEscalateSingleRepoLoop(t *testing.T) {
 	}
 }
 
-// cancelAfterWakeHealthWriter makes shutdown deterministic: cancellation is
-// triggered only after the threshold-crossing health line has been committed,
-// so it cannot land inside the drain that produced the observed line.
-type cancelAfterWakeHealthWriter struct {
-	output    syncBuffer
-	cancel    context.CancelFunc
-	threshold int
-	once      sync.Once
-}
+// Leaving the inert state and returning to it must re-log: log-on-change may
+// suppress a repeat, never a transition.
+func TestReplyWakeOutboxHealthRelogsAfterTransition(t *testing.T) {
+	tracker := newInflightJobTracker(context.Background())
+	inert := replyWakeOutboxHealth{inert: 1}
 
-func (w *cancelAfterWakeHealthWriter) Write(p []byte) (int, error) {
-	n, err := w.output.Write(p)
-	if err == nil && strings.Count(w.output.String(), "reply wake outbox drain health:") >= w.threshold {
-		w.once.Do(w.cancel)
+	if !tracker.replyWakeOutboxHealthChanged(inert) {
+		t.Fatal("first inert health must log")
 	}
-	return n, err
-}
-
-func (w *cancelAfterWakeHealthWriter) String() string {
-	return w.output.String()
+	if tracker.replyWakeOutboxHealthChanged(inert) {
+		t.Fatal("an identical repeat must be suppressed")
+	}
+	if !tracker.replyWakeOutboxHealthChanged(replyWakeOutboxHealth{inert: 2}) {
+		t.Fatal("a changed count must log")
+	}
+	// A clean tick (nothing inert) prints nothing but must clear the memory, so
+	// the same line reappearing afterwards is visible.
+	tracker.forgetReplyWakeOutboxHealth()
+	if !tracker.replyWakeOutboxHealthChanged(replyWakeOutboxHealth{inert: 2}) {
+		t.Fatal("returning to a previously-logged state must log again")
+	}
+	// A nil tracker is the untracked path and must keep logging every tick.
+	var untracked *inflightJobTracker
+	if !untracked.replyWakeOutboxHealthChanged(inert) || !untracked.replyWakeOutboxHealthChanged(inert) {
+		t.Fatal("a nil tracker must never suppress a health line")
+	}
 }
 
 func TestReplyWakeOutboxBurstCoalescesToExactlyOneWake(t *testing.T) {
@@ -1291,5 +1321,123 @@ func setWakeOutboxCreatedAt(t *testing.T, databasePath, sourceID string, at time
 	if _, err := raw.Exec(`UPDATE wake_outbox SET created_at = ?, updated_at = ? WHERE source_kind = ? AND source_id = ?`,
 		stamp, stamp, db.WakeOutboxSourceWorkflowNote, sourceID); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// countingWakeOutboxStore delegates every drain operation to a real store while
+// counting the obligation projections, which is the only way to observe #1758's
+// second half from outside: the drain used to run the identical
+// ListWakeOutboxObligations query TWICE on every tick.
+type countingWakeOutboxStore struct {
+	inner       *db.Store
+	projections int
+	claims      int
+}
+
+func (s *countingWakeOutboxStore) ListWakeOutboxObligations(ctx context.Context, attemptedBefore time.Time) (db.WakeOutboxObligationProjection, error) {
+	s.projections++
+	return s.inner.ListWakeOutboxObligations(ctx, attemptedBefore)
+}
+
+func (s *countingWakeOutboxStore) ExpireAgedWakeOutbox(ctx context.Context, attemptedBefore, now time.Time) ([]db.WakeOutboxEntry, error) {
+	return s.inner.ExpireAgedWakeOutbox(ctx, attemptedBefore, now)
+}
+
+func (s *countingWakeOutboxStore) ClaimWakeOutbox(ctx context.Context, ids []int64, now time.Time) (bool, error) {
+	claimed, err := s.inner.ClaimWakeOutbox(ctx, ids, now)
+	if claimed {
+		s.claims++
+	}
+	return claimed, err
+}
+
+func (s *countingWakeOutboxStore) ListDeletedEventRulesForRoutes(ctx context.Context, routes []db.EventRuleRoute) ([]db.DeletedEventRule, error) {
+	return s.inner.ListDeletedEventRulesForRoutes(ctx, routes)
+}
+
+// A tick that claims nothing changes no row, so its closing health pass reuses
+// the projection it already read instead of issuing the identical query again.
+// A tick that DOES claim must re-read: the rows it just moved are exactly what
+// the health grade is about.
+func TestReplyWakeOutboxDrainProjectsOnceWhenNothingIsClaimed(t *testing.T) {
+	store, sink, _, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
+	ctx := context.Background()
+	if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "release/projection-count", Author: "worker", Body: "deliverable",
+		AddressedTarget: "owner",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
+	if err != nil || len(pending) == 0 {
+		t.Fatalf("pending rows = %+v, err=%v", pending, err)
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, pending[0].CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	due := createdAt.Add(replyWakeCoalescingWindow + time.Second)
+
+	// This row is deliverable, so the drain claims it and must re-read.
+	claiming := &countingWakeOutboxStore{inner: store}
+	if err := drainReplyWakeOutbox(ctx, claiming, due, replyWakeTestDeliveryResolver(sink)); err != nil {
+		t.Fatalf("claiming drain: %v", err)
+	}
+	if claiming.claims == 0 {
+		t.Fatalf("the fixture claimed nothing; the counting test would be vacuous")
+	}
+	if claiming.projections != 2 {
+		t.Fatalf("claiming drain projected %d times, want 2 (post-claim state must be re-read)", claiming.projections)
+	}
+
+	// Nothing left to claim: one projection for the whole drain.
+	idle := &countingWakeOutboxStore{inner: store}
+	if err := drainReplyWakeOutbox(ctx, idle, due, replyWakeTestDeliveryResolver(sink)); err != nil {
+		t.Fatalf("idle drain: %v", err)
+	}
+	if idle.claims != 0 {
+		t.Fatalf("second drain claimed %d rows, want 0", idle.claims)
+	}
+	if idle.projections > 1 {
+		t.Fatalf("idle drain projected %d times, want at most 1", idle.projections)
+	}
+}
+
+// The reuse must not change the verdict: an inert row grades identically whether
+// the projection was re-read or reused.
+func TestReplyWakeOutboxReusedProjectionGradesIdentically(t *testing.T) {
+	store, sink, _, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
+	ctx := context.Background()
+	if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "release/reuse-grade", Author: "worker", Body: "unroutable",
+		AddressedTarget: "nobody",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
+	if err != nil || len(pending) == 0 {
+		t.Fatalf("pending rows = %+v, err=%v", pending, err)
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, pending[0].CreatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	due := createdAt.Add(replyWakeCoalescingWindow + time.Second)
+	attemptedBefore := due.UTC().Add(-replyWakeAttemptedUnknownAfter)
+
+	counted := &countingWakeOutboxStore{inner: store}
+	reused, reusedErr := drainReplyWakeOutboxWithHealth(ctx, counted, due, replyWakeTestDeliveryResolver(sink))
+	if counted.claims != 0 || counted.projections != 1 {
+		t.Fatalf("claims=%d projections=%d, want the reuse path (0 and 1)", counted.claims, counted.projections)
+	}
+	fresh, freshErr := wakeOutboxObligationHealth(ctx, store, attemptedBefore, replyWakeTestDeliveryResolver(sink))
+	if reused != fresh {
+		t.Fatalf("reused health %s != freshly read health %s", reused, fresh)
+	}
+	if (reusedErr == nil) != (freshErr == nil) {
+		t.Fatalf("reused err=%v, fresh err=%v", reusedErr, freshErr)
+	}
+	if reused.inert != 1 {
+		t.Fatalf("health = %s, want the unroutable row graded inert", reused)
 	}
 }

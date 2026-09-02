@@ -36,10 +36,18 @@ var (
 // of which re-resolve — so handing it the raw --home would misplace delegation
 // artifacts and the event-sink config probe.
 func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, home string) workflow.Engine {
-	return daemonWorkflowEngineForRunner(store, gh, checkout, home, subprocess.ExecRunner{})
+	return daemonWorkflowEngineForRunner(store, gh, checkout, home, subprocess.ExecRunner{}, nil)
 }
 
-func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout string, home string, runner subprocess.Runner) workflow.Engine {
+// daemonWorkflowEngineCached is daemonWorkflowEngine for a caller that already
+// holds a per-tick config memo (#1758) — today only the sequential registered-repo
+// poll pass, whose 45 per-repo engine rebuilds otherwise re-read and re-parsed
+// config.toml twice each just to resolve a memory controller that is nil.
+func daemonWorkflowEngineCached(store *db.Store, gh github.Client, checkout string, home string, cfg *tickConfigCache) workflow.Engine {
+	return daemonWorkflowEngineForRunner(store, gh, checkout, home, subprocess.ExecRunner{}, cfg)
+}
+
+func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout string, home string, runner subprocess.Runner, cfg *tickConfigCache) workflow.Engine {
 	gh = jobGitHubClient(checkout, gh, runner)
 	engine := workflow.Engine{
 		Store:                   store,
@@ -70,7 +78,7 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 		// error), so with no config NO memory hook is wired and prompt assembly +
 		// the terminal path are byte-identical. Non-enrolled agents are never touched
 		// even when the controller is present.
-		Memory: daemonMemoryController(store, home),
+		Memory: cfg.memoryController(store, home),
 		// Registry default model/effort fallbacks: when a delivered job pins no
 		// agent/job override, fall back to the HOME-AWARE resolved runtime registry
 		// (built-in defaults overlaid with [runtimes.<name>] config). Fail-open and

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -720,10 +721,17 @@ func startSingleRepoWorkerLoop(ctx context.Context, interval time.Duration, stor
 		// the supervisor boundary, outside the repository tick, matching the
 		// multi-repo fleet loop.
 		health, err := drainFleetReplyWakeOutbox(ctx, store, worker, now)
-		if err != nil {
+		switch {
+		case err != nil:
 			writeLine(stdout, "reply wake outbox drain unhealthy: %v", err)
-		} else if health.inert > 0 {
-			writeLine(stdout, "reply wake outbox drain health: %s", health)
+			tracker.forgetReplyWakeOutboxHealth()
+		case health.inert > 0:
+			// Log on CHANGE only (#1758); see the fleet loop for the rationale.
+			if tracker.replyWakeOutboxHealthChanged(health) {
+				writeLine(stdout, "reply wake outbox drain health: %s", health)
+			}
+		default:
+			tracker.forgetReplyWakeOutboxHealth()
 		}
 		// The checkout lock now guards the TICK (maintenance + claim/dispatch),
 		// not whole job runs: dispatched jobs execute on their own goroutines
@@ -956,6 +964,10 @@ type registeredRepoPoller struct {
 	GitHubClient       func(checkout string) github.Client
 	WorkflowFactory    func(store *db.Store, gh github.Client, checkout string) *workflow.Engine
 	JobWorkflowFactory func(context.Context, *db.Store, github.Client, string, db.Job) (*workflow.Engine, error)
+	// ConfigCache is the per-poll-pass config.toml memo (#1758). The
+	// WorkflowFactory closure below captures the same pointer; the pass resets it
+	// so the reads stay per-tick. nil (legacy/test callers) resolves directly.
+	ConfigCache *tickConfigCache
 }
 
 // defaultRegisteredRepoPoller wires the registered-repo supervisor's per-tick
@@ -988,7 +1000,9 @@ func defaultRegisteredRepoPoller(store *db.Store, workers int, dryRun bool, stdo
 		}
 		return &engine
 	}
+	configCache := &tickConfigCache{}
 	return registeredRepoPoller{
+		ConfigCache:             configCache,
 		Store:                   store,
 		Workers:                 workers,
 		DryRun:                  dryRun,
@@ -1000,14 +1014,14 @@ func defaultRegisteredRepoPoller(store *db.Store, workers int, dryRun bool, stdo
 		IdleMaxMultiplier:       config.DefaultDaemonIdleMaxMultiplier,
 		GitHubClient:            func(checkout string) github.Client { return github.NewClient(checkout) },
 		WorkflowFactory: func(store *db.Store, gh github.Client, checkout string) *workflow.Engine {
-			return configureWorkflow(daemonWorkflowEngine(store, gh, checkout, resolvedRoot), store)
+			return configureWorkflow(daemonWorkflowEngineCached(store, gh, checkout, resolvedRoot, configCache), store)
 		},
 		JobWorkflowFactory: func(_ context.Context, store *db.Store, gh github.Client, checkout string, job db.Job) (*workflow.Engine, error) {
 			runner, err := defaultJobWorker(store, stdout, rawHome).subprocessRunnerForJob(job)
 			if err != nil {
 				return nil, err
 			}
-			return configureWorkflow(daemonWorkflowEngineForRunner(store, gh, checkout, resolvedRoot, runner), store), nil
+			return configureWorkflow(daemonWorkflowEngineForRunner(store, gh, checkout, resolvedRoot, runner, nil), store), nil
 		},
 	}
 }
@@ -1095,8 +1109,109 @@ func resolveDelegationWorktreeTTL(home string) (time.Duration, error) {
 	return config.LoadDelegationWorktreeTTL(config.Paths{ConfigFile: resolveConfigFile(home)})
 }
 
+// tickConfigCache memoizes the daemon's hot config.toml reads for the span of
+// ONE tick (a worker sweep or a poll pass). resolveBlockedTTL,
+// resolveBlockedRoleWakeAfter, resolveDelegationWorktreeTTL and
+// daemonMemoryController are each a pure function of <home>/config.toml, and each
+// was re-read AND re-parsed once per ENABLED REPO per tick: at 45 repos that is
+// 135 opens/tick for the three durations plus ~90 more for a memory controller
+// that returns nil every time (#1758).
+//
+// It is created FRESH each tick and never retained, so config.toml keeps exactly
+// the live tunability it had — one re-read per tick — and only the per-REPO
+// repetition disappears. Entries are keyed by their home (and store, for the
+// memory controller) so a caller passing a different one always re-resolves
+// rather than silently reading another home's policy. Only SUCCESSES are
+// memoized, matching candidateMemo: a transient read failure is retried by the
+// next repo in the sweep instead of being replayed to all of them.
+//
+// Like candidateMemo it carries no mutex because it is consumed only on the
+// synchronous tick goroutine — the worker sweep's per-repo loop and the poll
+// pass's per-repo loop are both sequential, and neither dispatched jobs nor the
+// per-job engine factory touch it. A nil receiver resolves directly, so every
+// non-daemon caller and every existing test path stays byte-identical.
+type tickConfigCache struct {
+	blocked     durationMemo
+	delegation  durationMemo
+	wake        durationMemo
+	memoryHome  string
+	memoryStore *db.Store
+	memoryDone  bool
+	memory      *workflow.MemoryController
+}
+
+type durationMemo struct {
+	home  string
+	value time.Duration
+	done  bool
+}
+
+func (m *durationMemo) get(home string, resolve func(string) (time.Duration, error)) (time.Duration, error) {
+	if m.done && m.home == home {
+		return m.value, nil
+	}
+	value, err := resolve(home)
+	if err != nil {
+		return 0, err
+	}
+	m.home, m.value, m.done = home, value, true
+	return value, nil
+}
+
+// reset drops every memoized value so the next tick re-reads config.toml. The
+// poll pass reuses one cache across passes (the factory closure captures it), so
+// this is what keeps its reads per-TICK rather than per-process.
+func (c *tickConfigCache) reset() {
+	if c == nil {
+		return
+	}
+	*c = tickConfigCache{}
+}
+
+func (c *tickConfigCache) blockedJobTTL(home string) time.Duration {
+	if c == nil {
+		return resolveBlockedTTL(home)
+	}
+	ttl, _ := c.blocked.get(home, func(h string) (time.Duration, error) { return resolveBlockedTTL(h), nil })
+	return ttl
+}
+
+func (c *tickConfigCache) blockedRoleWakeAfter(home string) time.Duration {
+	if c == nil {
+		return resolveBlockedRoleWakeAfter(home)
+	}
+	wakeAfter, _ := c.wake.get(home, func(h string) (time.Duration, error) { return resolveBlockedRoleWakeAfter(h), nil })
+	return wakeAfter
+}
+
+func (c *tickConfigCache) delegationWorktreeTTL(home string) (time.Duration, error) {
+	if c == nil {
+		return resolveDelegationWorktreeTTL(home)
+	}
+	return c.delegation.get(home, resolveDelegationWorktreeTTL)
+}
+
+// memoryController memoizes the nil-or-controller resolution, including the nil
+// result — returning nil is the default outcome and it costs two full config
+// loads (LoadMemorySettings + LoadAgentTypes) to reach.
+func (c *tickConfigCache) memoryController(store *db.Store, home string) *workflow.MemoryController {
+	if c == nil {
+		return daemonMemoryController(store, home)
+	}
+	if c.memoryDone && c.memoryHome == home && c.memoryStore == store {
+		return c.memory
+	}
+	controller := daemonMemoryController(store, home)
+	c.memoryHome, c.memoryStore, c.memory, c.memoryDone = home, store, controller, true
+	return controller
+}
+
 func pollRegisteredReposWithPoller(ctx context.Context, poller registeredRepoPoller, schedule registeredRepoSchedule, now time.Time, fallbackPoll time.Duration) (time.Duration, error) {
 	schedule = schedule.ensure()
+	// Fresh config reads for THIS pass: the factory closure holds the same cache
+	// across passes, so resetting here is what keeps the poller's config.toml
+	// reads per-tick instead of per-process (#1758).
+	poller.ConfigCache.reset()
 	repos, err := poller.Store.ListRepos(ctx)
 	if err != nil {
 		return fallbackPoll, err
@@ -1203,7 +1318,20 @@ func (p registeredRepoPoller) pollRepo(ctx context.Context, repoRecord db.Repo, 
 		writeLine(p.Stdout, "%s: %s", repoRecord.FullName(), message)
 		return registeredRepoPollResult{LastError: message}, store.UpdateRepoPollResult(ctx, repoRecord.FullName(), lastPollAt, message)
 	}
-	writeLine(p.Stdout, "polling %s with %d workers dry_run=%t", repoRecord.FullName(), p.Workers, p.DryRun)
+	// A registered repo whose checkout directory is gone (moved, unmounted, or
+	// deleted out from under the daemon) cannot be polled, but without this
+	// guard it still paid for engine construction, two DB passes, a config
+	// parse and a `gh` exec that fails on chdir — every tick, forever (#1758).
+	// Same early return as the empty-path case above so the operator-visible
+	// signal (log line + repos.last_error) keeps its existing shape.
+	if info, err := os.Stat(repoRecord.CheckoutPath); err != nil || !info.IsDir() {
+		message := fmt.Sprintf("registered repo checkout path is unavailable: %s", repoRecord.CheckoutPath)
+		writeLine(p.Stdout, "%s: %s", repoRecord.FullName(), message)
+		return registeredRepoPollResult{LastError: message}, store.UpdateRepoPollResult(ctx, repoRecord.FullName(), lastPollAt, message)
+	}
+	// `Workers` is a fleet-wide flag echoed here, not a per-repo pool: no such
+	// pool exists, so printing it as one only misleads (#1758).
+	writeLine(p.Stdout, "polling %s dry_run=%t", repoRecord.FullName(), p.DryRun)
 	if p.DryRun {
 		return registeredRepoPollResult{}, store.UpdateRepoPollResult(ctx, repoRecord.FullName(), lastPollAt, "")
 	}

@@ -87,6 +87,10 @@ var hostRunnerAllowlist = map[string]hostRunnerAllowance{
 		execRunners: 1,
 		reason:      "legacy host-mode engine wrapper; backend jobs call daemonWorkflowEngineForRunner",
 	},
+	"internal/cli/daemon_workflow.go:daemonWorkflowEngineCached": {
+		execRunners: 1,
+		reason:      "same host-mode engine wrapper as daemonWorkflowEngine, taking the poll pass's config memo (#1758); backend jobs call daemonWorkflowEngineForRunner",
+	},
 	"internal/cli/daemon_workflow.go:implementationFinalizationTargetFor": {
 		execRunners: 1,
 		reason:      "host-mode finalization wrapper delegates checkout inspection to implementationFinalizationTargetForRunner",

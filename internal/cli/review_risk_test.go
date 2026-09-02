@@ -289,7 +289,7 @@ func TestDaemonWorkflowEngineScopesReviewFromTheDaemonCheckout(t *testing.T) {
 	}
 	client := &reviewCompareClient{result: github.CompareResult{Status: "ahead", Files: capped, Truncated: true}}
 
-	engine := daemonWorkflowEngineForRunner(daemonWorkerStore(t), client, checkout, home, subprocess.ExecRunner{})
+	engine := daemonWorkflowEngineForRunner(daemonWorkerStore(t), client, checkout, home, subprocess.ExecRunner{}, nil)
 	if engine.ReviewChangedFiles == nil {
 		t.Fatal("the daemon engine did not wire ReviewChangedFiles")
 	}

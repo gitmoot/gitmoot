@@ -52,15 +52,27 @@ func (h replyWakeOutboxHealth) String() string {
 	)
 }
 
+// wakeOutboxStore is the narrow store dependency the reply-wake drain uses. It
+// exists for the same reason tickCandidateStore does: production always threads
+// the real *db.Store, and a counting fake can then pin how many times the drain
+// projects the outbox — the property #1758 changed and would otherwise be
+// unmeasurable from outside.
+type wakeOutboxStore interface {
+	ListWakeOutboxObligations(ctx context.Context, attemptedBefore time.Time) (db.WakeOutboxObligationProjection, error)
+	ExpireAgedWakeOutbox(ctx context.Context, attemptedBefore time.Time, now time.Time) ([]db.WakeOutboxEntry, error)
+	ClaimWakeOutbox(ctx context.Context, ids []int64, now time.Time) (bool, error)
+	ListDeletedEventRulesForRoutes(ctx context.Context, routes []db.EventRuleRoute) ([]db.DeletedEventRule, error)
+}
+
 // drainReplyWakeOutbox is a store-global daemon operation. It deliberately
 // reads durable work before resolving delivery: unreadable outbox state and an
 // empty outbox therefore cannot collapse into the same result.
-func drainReplyWakeOutbox(ctx context.Context, store *db.Store, now time.Time, resolve replyWakeDeliveryResolver) error {
+func drainReplyWakeOutbox(ctx context.Context, store wakeOutboxStore, now time.Time, resolve replyWakeDeliveryResolver) error {
 	_, err := drainReplyWakeOutboxWithHealth(ctx, store, now, resolve)
 	return err
 }
 
-func drainReplyWakeOutboxWithHealth(ctx context.Context, store *db.Store, now time.Time, resolve replyWakeDeliveryResolver) (replyWakeOutboxHealth, error) {
+func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, now time.Time, resolve replyWakeDeliveryResolver) (replyWakeOutboxHealth, error) {
 	if store == nil {
 		return replyWakeOutboxHealth{}, errors.New("wake outbox store is required")
 	}
@@ -69,6 +81,12 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store *db.Store, now ti
 	if err != nil || obligations.Len() == 0 {
 		return replyWakeOutboxHealth{}, err
 	}
+	// Tracks whether this drain changed any outbox row. Only a successful claim
+	// does: ExpireAgedWakeOutbox returns above whenever it expired anything, and
+	// every other branch is a read. When nothing was claimed the projection read
+	// at line 68 still describes the store exactly, so the closing health pass
+	// can reuse it instead of issuing the same query a second time (#1758).
+	mutated := false
 
 	agedAttempted := len(obligations.AgedAttempted)
 	if agedAttempted > 0 {
@@ -160,6 +178,7 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store *db.Store, now ti
 				return replyWakeOutboxHealth{}, err
 			}
 			if claimed {
+				mutated = true
 				event.WakeOutboxIDs = ids
 				if err := emitReplyWakeOutboxEvent(ctx, delivery.sink, event, matchingRules); err != nil {
 					return replyWakeOutboxHealth{}, fmt.Errorf("emit claimed %s wake: %w", event.WakeKind, err)
@@ -168,12 +187,19 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store *db.Store, now ti
 			start = end
 		}
 	}
-	return wakeOutboxObligationHealth(ctx, store, attemptedBefore, resolve)
+	if mutated {
+		return wakeOutboxObligationHealth(ctx, store, attemptedBefore, resolve)
+	}
+	// The #1200/#1201 contract is untouched by the reuse: an unreadable outbox
+	// already returned its error at line 68, so only a SUCCESSFUL read can reach
+	// here, and an empty one returned early. Reuse therefore never turns "could
+	// not read" into "nothing to do".
+	return classifyWakeOutboxObligations(ctx, store, obligations, attemptedBefore, resolve)
 }
 
 func wakeOutboxObligationHealth(
 	ctx context.Context,
-	store *db.Store,
+	store wakeOutboxStore,
 	attemptedBefore time.Time,
 	resolve replyWakeDeliveryResolver,
 ) (replyWakeOutboxHealth, error) {
@@ -181,6 +207,20 @@ func wakeOutboxObligationHealth(
 	if err != nil {
 		return replyWakeOutboxHealth{}, fmt.Errorf("read wake outbox obligations: %w", err)
 	}
+	return classifyWakeOutboxObligations(ctx, store, obligations, attemptedBefore, resolve)
+}
+
+// classifyWakeOutboxObligations grades an ALREADY-READ obligation projection.
+// Splitting it out lets the drain reuse its own opening read when it claimed
+// nothing; the read itself stays in wakeOutboxObligationHealth for callers that
+// need a fresh projection.
+func classifyWakeOutboxObligations(
+	ctx context.Context,
+	store wakeOutboxStore,
+	obligations db.WakeOutboxObligationProjection,
+	attemptedBefore time.Time,
+	resolve replyWakeDeliveryResolver,
+) (replyWakeOutboxHealth, error) {
 	health := replyWakeOutboxHealth{agedAttempted: len(obligations.AgedAttempted)}
 	if len(obligations.Pending) == 0 {
 		if health.agedAttempted == 0 {
