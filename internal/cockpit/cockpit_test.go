@@ -575,6 +575,18 @@ func TestWatchCommandShellQuotesJobRuntimeAndHome(t *testing.T) {
 	if got := a.watchCommand(); got != want {
 		t.Fatalf("watchCommand = %q, want %q", got, want)
 	}
+	// Every dangerous value above contains a SPACE, so a naive "quote only when
+	// there is whitespace" policy would still quote them and this test would pass
+	// against it — measured with a compiling mutant during #1759. A space-free
+	// injection is the case that actually pins the allowlist.
+	spaceFree := &paneAdapter{
+		cockpit: &Cockpit{gitmootBin: "gitmoot"},
+		meta:    JobMeta{JobID: "job;id", Runtime: "shell$(id)", LogPath: "/tmp/a|b.log"},
+	}
+	wantSpaceFree := "gitmoot job watch 'job;id' --transcript --log-path '/tmp/a|b.log' --runtime 'shell$(id)' || exec tail -n +1 -F '/tmp/a|b.log'"
+	if got := spaceFree.watchCommand(); got != wantSpaceFree {
+		t.Fatalf("space-free injection watchCommand = %q, want %q", got, wantSpaceFree)
+	}
 }
 
 func TestWrapDeliverPaneRunTailsLogPath(t *testing.T) {
