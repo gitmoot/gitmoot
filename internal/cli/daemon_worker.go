@@ -172,7 +172,7 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 		configHome = home[0]
 		configHomeExplicit = true
 	}
-	worker := jobWorker{Store: store, Stdout: stdout, ConfigHome: configHome, ConfigHomeExplicit: configHomeExplicit}
+	worker := jobWorker{Store: store, Stdout: serializeWrites(stdout), ConfigHome: configHome, ConfigHomeExplicit: configHomeExplicit}
 	worker.AdapterFactory = worker.defaultAdapter
 	worker.OutputAdapterFactory = worker.outputAdapter
 	worker.StartAdapterFactory = worker.defaultStartAdapter
@@ -180,8 +180,8 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 	worker.RuntimePreflight = runtime.DefaultRuntimeContractChecker().CheckRequest
 	worker.QuotaWake = newQuotaRoleUnavailableWakeClient()
 	recoverKillPendingAtWorkerStartup.Do(func() {
-		if err := recoverKillPendingJobs(context.Background(), store, stdout); err != nil {
-			writeLine(stdout, "job kill-pending recovery failed: %v", err)
+		if err := recoverKillPendingJobs(context.Background(), store, worker.Stdout); err != nil {
+			writeLine(worker.Stdout, "job kill-pending recovery failed: %v", err)
 		}
 	})
 	return worker

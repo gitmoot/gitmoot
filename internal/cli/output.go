@@ -6,7 +6,30 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 )
+
+// serializedWriter protects the shared output sink used by concurrent pool jobs.
+type serializedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (w *serializedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.w.Write(p)
+}
+
+func serializeWrites(w io.Writer) io.Writer {
+	if w == nil {
+		return nil
+	}
+	if _, ok := w.(*serializedWriter); ok {
+		return w
+	}
+	return &serializedWriter{w: w}
+}
 
 func writeJSON(w io.Writer, value any) error {
 	encoder := json.NewEncoder(w)
