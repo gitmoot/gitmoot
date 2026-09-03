@@ -2139,11 +2139,19 @@ func runQueuedJobsForRepoPool(ctx context.Context, worker jobWorker, limit int, 
 //
 // Two seconds: a queued job's worst-case invisibility becomes a bound the
 // operator can state instead of "however long the longest running job takes"
-// (measured starvation before the bound: 22m42s and 27m40s). It costs at most
-// one listPendingQueuedJobs per 2s per repo that has work IN FLIGHT and nothing
-// dispatchable — the empty-queue path never reaches here, because `running == 0
-// && dispatched == 0` returns above. A var, not a const, so tests can shorten
-// it; production never reassigns it.
+// (measured starvation before the bound: 22m42s and 27m40s).
+//
+// Cost, stated precisely because the first version of this comment was wrong:
+// one listPendingQueuedJobs per interval per repo that has a job IN FLIGHT and
+// nothing dispatchable. An EMPTY QUEUE does reach this seam whenever something
+// is running — that is exactly what
+// TestPoolRequeryBoundIsPacedAndDispatchesNothingWhenIdle constructs. What
+// returns above is `running == 0 && dispatched == 0`, i.e. nothing running AND
+// nothing dispatchable, so a fully idle daemon never re-queries. That query is
+// a store scan whose cost grows with the queue, not an O(1) probe; the bound
+// caps its FREQUENCY, not its size.
+//
+// A var, not a const, so tests can shorten it; production never reassigns it.
 var poolRequeryInterval = 2 * time.Second
 
 // poolRequeryObserver is a test hook fired when the bound (rather than a job
@@ -2209,6 +2217,14 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 	// is retried on a later worker tick.
 	bouncedBusy := map[string]bool{}
 	bouncedBusyRuntimes := map[string]bool{}
+	// isolationSkipLogged bounds the pool_isolation_skipped event to once per job
+	// per invocation. The skip branch is reached on every re-query, and re-queries
+	// are now paced by poolRequeryInterval instead of by completions, so writing it
+	// unthrottled turned one row per completion into one row every two seconds for
+	// as long as a job stayed blocked. Dispatcher-goroutine-owned like the sets
+	// above, so no lock; reset each invocation, so a later pass reports the skip
+	// again for a job that is still serialized.
+	isolationSkipLogged := map[string]bool{}
 	// runtimeKeyMemo caches queuedJobRuntimeResourceKey per job id for the lifetime of
 	// this dispatcher invocation (#615 review). excludeBouncedBusy re-derives the key
 	// for every still-pending job on every dispatch pass, and each miss is a GetAgent
@@ -2409,7 +2425,12 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 						// skip event so a lost-parallelism serialize is observable. A nil
 						// allocErr means the job was simply not isolable (no home/checkout) —
 						// not a failure — so stay quiet there.
-						if allocErr != nil {
+						// Throttled to once per job per pass invocation: this branch is
+						// reached on EVERY re-query, and re-queries are now paced by
+						// poolRequeryInterval rather than by job completions, so an
+						// unthrottled write turned one event per completion into one every
+						// two seconds for as long as the job stayed blocked.
+						if allocErr != nil && !isolationSkipLogged[job.ID] {
 							_ = worker.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "pool_isolation_skipped", Message: fmt.Sprintf("pool read-only isolation skipped (#739); job stays serialized in the shared checkout: %v", allocErr)})
 						}
 						continue
