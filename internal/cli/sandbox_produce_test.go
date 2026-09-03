@@ -1159,3 +1159,56 @@ func TestWorkerProduceRunRemovesTheStateRootItGranted(t *testing.T) {
 		t.Fatalf("operator credential changed to %q, err=%v", data, err)
 	}
 }
+
+// Bound at the PRODUCE ENTRY POINT, not at the sandbox helper: the argv the
+// runtime is actually launched with decides whether implicit write roots apply.
+// Produce omits --read-only-workdir, so internal/cli/sandbox.go dispatches
+// sandbox.Exec, which calls writableRoots with includeImplicitRoots=true and
+// grants workdir, os.TempDir() and /tmp. That is why keeping the operator
+// profile out of tmp is a real precondition of this PR's guarantee and not an
+// abstract one: a profile under /tmp is writable by a produce job even though
+// produce grants never name it. The companion test in internal/sandbox pins the
+// helper side; this one pins that produce is on the implicit-root path at all.
+func TestProduceLaunchesOnTheImplicitWriteRootPathUnlikeAReadOnlySeat(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, "operator-profile"))
+	capture := &sandboxAdapterCaptureRunner{stdout: `{"result":"ok"}`}
+	agent := runtime.Agent{
+		Name: "p", Role: "producer", Runtime: runtime.ClaudeRuntime, RuntimeRef: "last",
+		AutonomyPolicy: runtime.AutonomyPolicyWorkspaceWrite,
+		WritablePaths:  []string{home},
+	}
+	wrapped, err := wrapProduceSandboxAdapter("produce", agent, runtime.ClaudeAdapter{Runner: capture, Dir: home}, filepath.Join(home, "job-runtime"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wrapped.Deliver(context.Background(), agent, runtime.Job{Prompt: "write"}); err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	if containsString(capture.args, "--read-only-workdir") {
+		t.Fatalf("produce now launches with a read-only workdir: %v", capture.args)
+	}
+
+	// The read-only seat is the contrast case and must stay on the explicit-only
+	// path; if this flag ever disappears there, seats gain implicit tmp writes.
+	seatCheckout := filepath.Join(t.TempDir(), "review-worktree")
+	if err := os.MkdirAll(filepath.Join(seatCheckout, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	seatCapture := &sandboxAdapterCaptureRunner{stdout: `{"result":"ok"}`}
+	seat := runtime.Agent{
+		Name: "r", Role: "reviewer", Runtime: runtime.ClaudeRuntime, RuntimeRef: "last",
+		AutonomyPolicy: runtime.AutonomyPolicyReadOnly, ReadOnlySeat: true,
+	}
+	seatWrapped, err := wrapReadOnlySandboxAdapter(t.TempDir(), seat, seatCheckout, runtime.ClaudeAdapter{Runner: seatCapture, Dir: seatCheckout})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seatWrapped.Deliver(context.Background(), seat, runtime.Job{Prompt: "review"}); err != nil {
+		t.Fatalf("seat Deliver: %v", err)
+	}
+	if !containsString(seatCapture.args, "--read-only-workdir") {
+		t.Fatalf("read-only seat lost its read-only workdir: %v", seatCapture.args)
+	}
+}
