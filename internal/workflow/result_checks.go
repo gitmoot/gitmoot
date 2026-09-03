@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -319,11 +320,47 @@ func isActionableAnswer(r AgentResult) bool {
 // non-blank entry, so an all-empty or single-blank list counts as no entries.
 func hasActionableEntries(values []string) bool {
 	for _, v := range values {
-		if strings.TrimSpace(v) != "" {
+		if entryCarriesContent(v) {
 			return true
 		}
 	}
 	return false
+}
+
+// entryCarriesContent reports whether one list entry says anything.
+//
+// Trimming whitespace is no longer sufficient (#1805): object elements now
+// decode into entries, so `needs: [{}]` arrives as the two-character string
+// "{}" - non-empty to TrimSpace, and therefore actionable to the old check.
+// That let a BLOCKED result whose ONLY blocker is an empty object pass the
+// evidence heuristic, which is a GATE behaviour change rather than a cosmetic
+// one. A content-free JSON container carries exactly as much information as ""
+// and is treated the same.
+//
+// An object WITH fields still counts: the test is emptiness, not shape.
+func entryCarriesContent(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return false
+	}
+	switch trimmed[0] {
+	case '{', '[':
+		var container []json.RawMessage
+		if trimmed[0] == '{' {
+			var object map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(trimmed), &object); err == nil {
+				return len(object) > 0
+			}
+			// Unparseable: it is still text a human can read, so keep it.
+			return true
+		}
+		if err := json.Unmarshal([]byte(trimmed), &container); err == nil {
+			return len(container) > 0
+		}
+		return true
+	default:
+		return true
+	}
 }
 
 // minReviewRationaleChars is the floor at which a review summary can carry the

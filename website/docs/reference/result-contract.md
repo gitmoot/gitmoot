@@ -96,11 +96,19 @@ them and refusing one used to fail the entire result: a review reporting
 was rejected with `cannot unmarshal object into Go struct field
 AgentResult.tests_run of type string` and spent a repair attempt, which made a
 job that did the work indistinguishable from one that returned nothing. An
-object element is stored as compact JSON with keys in canonical order: every
-field is kept, since the contract names none of them.
+object element is stored as compact JSON with keys in canonical order, and every
+field is carried through verbatim — including shell metacharacters, so a
+recorded `command` can be copy-pasted back.
+
+**Duplicate keys are rejected**, not merged: `[{"name":"a","name":"b"}]` fails
+with the duplicate named, rather than silently keeping one of them.
+
+A `null` element is accepted and becomes an **empty entry**, matching the
+behaviour before object elements were supported.
 
 Nothing else is accepted. A number, a boolean, a nested array, or a bare string
-where the array belongs still fails the result.
+where the array belongs still fails the result, and the error names the field so
+a repair attempt knows which list to fix.
 
 ## Display-only in-session review state
 

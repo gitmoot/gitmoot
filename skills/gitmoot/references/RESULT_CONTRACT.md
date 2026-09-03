@@ -84,12 +84,23 @@ was rejected with `cannot unmarshal object into Go struct field
 AgentResult.tests_run of type string` and spent a repair attempt, which made a
 job that did the work and reported it richly indistinguishable from one that
 returned nothing. An object element is now stored as compact JSON with its keys
-in canonical order: every field is kept, because the contract names none of them
-and picking one would be a guess.
+in canonical order, and every field is carried through verbatim — including
+shell metacharacters, so a recorded `command` can be copy-pasted back. The
+contract names none of the keys, so picking one would be a guess.
+
+**Duplicate keys are rejected**, not merged. `[{"name":"a","name":"b"}]` fails
+with the duplicate named, because the alternative is keeping one silently and
+losing the other, which would contradict the guarantee above.
+
+A `null` element is accepted and becomes an **empty entry**, which is what it
+did before object elements were supported. It is not an error: failing the whole
+result over one null would spend a repair attempt on an envelope that already
+parsed.
 
 Nothing else is accepted. A number, a boolean, a nested array, or a bare string
-where the array belongs still fails the result. Prefer a string and put the
-detail in it.
+where the array belongs still fails the result — and the error names the field,
+so a repair attempt knows which list to fix. Prefer a string and put the detail
+in it.
 
 ## Delegations
 

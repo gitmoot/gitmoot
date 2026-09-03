@@ -177,11 +177,26 @@ func (l *ResultStringList) UnmarshalJSON(data []byte) error {
 	}
 	list := make(ResultStringList, 0, len(elements))
 	for _, element := range elements {
-		element = bytes.TrimSpace(element)
-		if len(element) == 0 {
-			continue
-		}
+		// No TrimSpace and no empty-element guard: encoding/json hands each
+		// element as a complete JSON value with no surrounding whitespace and
+		// never zero-length, so both were unreachable and no mutant could kill
+		// them (#1809 review, P3-5). Measured rather than reasoned: decoding
+		// `[ "a" , "b" ]` and a multi-line array yields elements "a" and "b"
+		// with no padding. A guard nothing can reach is a claim about the input
+		// that the input does not make.
 		switch element[0] {
+		case 'n':
+			// A null element decoded to an EMPTY ENTRY before #1805 (verified
+			// differentially at parent 0965c458: ["a",null,"b"] produced
+			// ["a","","b"]). Rejecting it would narrow the contract in the same
+			// breath as widening it, and burn a repair attempt on an envelope
+			// that used to parse - the exact failure #1805 exists to remove.
+			// Only the literal null reaches here; anything else beginning with
+			// 'n' falls through to the default arm below.
+			if !bytes.Equal(element, []byte("null")) {
+				return fmt.Errorf("gitmoot_result list element must be a string or an object, got %s", string(element))
+			}
+			list = append(list, "")
 		case '"':
 			var value string
 			if err := json.Unmarshal(element, &value); err != nil {
@@ -192,21 +207,118 @@ func (l *ResultStringList) UnmarshalJSON(data []byte) error {
 			// Re-encode through a map so key order is canonical (encoding/json
 			// sorts map keys) and two agents reporting the same object produce
 			// the same entry.
-			var object map[string]json.RawMessage
-			if err := json.Unmarshal(element, &object); err != nil {
-				return err
-			}
-			encoded, err := json.Marshal(object)
+			//
+			// DUPLICATE KEYS ARE REJECTED, not collapsed. map[string]json.RawMessage
+			// silently keeps the LAST duplicate, so [{"name":"first","name":"second"}]
+			// used to decode without error to {"name":"second"} - losing a field while
+			// the doc claimed every field is kept. Duplicate keys are exactly the
+			// malformed-but-parseable JSON a runtime emits, and silently dropping
+			// data is the one option that is wrong; rejecting is visible and the
+			// repair prompt can act on it.
+			object, err := decodeObjectElementRejectingDuplicates(element)
 			if err != nil {
 				return err
 			}
-			list = append(list, string(encoded))
+			// SetEscapeHTML(false): json.Marshal escapes <, > and & to \u003c,
+			// \u003e and \u0026, so a recorded command like `go test ./... 2>&1`
+			// came back as `go test ./... 2\u003e\u00261` and could not be
+			// copy-pasted back. A tests_run entry that is not the command that ran
+			// is evidence damage.
+			encoded, err := marshalCanonicalNoHTMLEscape(object)
+			if err != nil {
+				return err
+			}
+			list = append(list, encoded)
 		default:
 			return fmt.Errorf("gitmoot_result list element must be a string or an object, got %s", string(element))
 		}
 	}
 	*l = list
 	return nil
+}
+
+// decodeObjectElementRejectingDuplicates decodes one object element and refuses
+// duplicate keys rather than letting map assignment keep the last one.
+//
+// It streams tokens instead of unmarshalling into a map because a map cannot
+// represent the duplicate at all - by the time you hold the map, the evidence is
+// already gone.
+func decodeObjectElementRejectingDuplicates(element []byte) (map[string]json.RawMessage, error) {
+	decoder := json.NewDecoder(bytes.NewReader(element))
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != '{' {
+		return nil, fmt.Errorf("gitmoot_result list element is not an object: %s", string(element))
+	}
+	object := map[string]json.RawMessage{}
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return nil, fmt.Errorf("gitmoot_result list element has a non-string key: %v", keyToken)
+		}
+		if _, exists := object[key]; exists {
+			return nil, fmt.Errorf("gitmoot_result list element has duplicate key %q: %s", key, string(element))
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, err
+		}
+		object[key] = value
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	}
+	return object, nil
+}
+
+// marshalCanonicalNoHTMLEscape marshals with map-key ordering (canonical, so two
+// agents reporting the same object produce the same entry) but WITHOUT HTML
+// escaping, so shell metacharacters in a recorded command survive verbatim.
+func marshalCanonicalNoHTMLEscape(object map[string]json.RawMessage) (string, error) {
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(object); err != nil {
+		return "", err
+	}
+	return string(bytes.TrimRight(buffer.Bytes(), "\n")), nil
+}
+
+// nameFailingListField restores the FIELD NAME in a list-element decode error.
+//
+// Pre-#1805, encoding/json produced "cannot unmarshal object into Go struct
+// field AgentResult.tests_run", and the repair prompt used that name to tell the
+// agent which list to fix. ResultStringList.UnmarshalJSON returns its own error,
+// which encoding/json passes through unwrapped, so the name was lost - and a
+// repair attempt that cannot see WHICH field failed is a wasted attempt, the
+// same cost #1805 exists to save (#1809 review, P3-4).
+//
+// It re-decodes each list field ALONE to find the offender rather than parsing
+// the error string, so it cannot drift when a message is reworded. If no single
+// field reproduces the failure the original error is returned unchanged: naming
+// the wrong field would be worse than naming none.
+func nameFailingListField(raw json.RawMessage, original error) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return original
+	}
+	for _, name := range []string{"changes_made", "tests_run", "needs"} {
+		value, present := fields[name]
+		if !present {
+			continue
+		}
+		var list ResultStringList
+		if err := json.Unmarshal(value, &list); err != nil {
+			return fmt.Errorf("gitmoot_result field %s: %w", name, err)
+		}
+	}
+	return original
 }
 
 type AgentResult struct {
@@ -339,7 +451,7 @@ func ExtractAgentResult(output string) (AgentResult, error) {
 		var result AgentResult
 		if err := json.Unmarshal(raw, &result); err != nil {
 			if validationErr == nil {
-				validationErr = err
+				validationErr = nameFailingListField(raw, err)
 			}
 			continue
 		}
