@@ -455,15 +455,25 @@ Fixes:
   when it is expired with no refresh token, since every read-only seat job on
   that runtime will fail until the account is re-logged in.
 - A Claude `produce` stage does NOT run against the operator profile. The daemon
-  stages the configured account (`CLAUDE_CONFIG_DIR`, else `~/.claude`) into a
-  job-private profile, points the runtime's `CLAUDE_CONFIG_DIR` and
-  `XDG_CACHE_HOME` at that job-private state root under
-  `<gitmoot home>/cache/produce-runtime/<hash>/run-*/` - one directory per
-  dispatch, so two concurrent runs of one job id cannot wipe each other - and
-  removes that directory when the job finishes. The operator profile is never granted writable and is never
-  exposed to the sandbox, so a token the runtime refreshes mid-job lands in the
-  discarded copy: re-login on the host, not in the job. A configured profile
-  that does not exist yet is valid and starts the job with an empty one.
+  copies `.credentials.json` and `settings.json` from the configured account
+  (`CLAUDE_CONFIG_DIR`, else `~/.claude`) into a job-private profile, points the
+  runtime's `CLAUDE_CONFIG_DIR` and `XDG_CACHE_HOME` at that job-private state
+  root under `<gitmoot home>/cache/produce-runtime/<hash>/run-*/` — one
+  directory per dispatch, so two runs of one job id cannot wipe each other — and
+  removes it when the job finishes. The operator profile is never granted
+  writable and is never named in any read grant, so a token the runtime
+  refreshes mid-job lands in the discarded copy: re-login on the host, not in
+  the job. It may still be READABLE: an agent that declares no readable paths
+  falls back to a read-only grant over `/`, which is a read, never a write.
+- Only those two files cross into a produce job. Everything else in the operator
+  profile — `agents/`, `commands/`, `plugins/`, `CLAUDE.md`,
+  `settings.local.json`, `~/.claude.json` — deliberately does not, so a produce
+  job sees runtime defaults rather than operator customisation. A profile that
+  does not exist yet is valid and starts the job with an empty one. A
+  `settings.json` that is symlinked is followed; one that is empty, holds a
+  non-object, or is not a file at all is SKIPPED rather than failing the job. An
+  unusable `.credentials.json` does fail the job, because it decides which
+  account the work runs as.
 - `sandbox-exec: sandbox read path "…": no such file or directory` means a path
   granted to the sandbox does not exist on disk. Explicit read grants are
   required, not skipped — check `readable_paths` in `gitmoot job show <job-id>

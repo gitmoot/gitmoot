@@ -529,3 +529,126 @@ func TestResolveRuntimeConfigDirMatchesTheStagingContract(t *testing.T) {
 		t.Fatalf("state path = %q, want the resolved staged file", path)
 	}
 }
+
+// Round 2 of the #1810 review measured four realistic operator profiles that
+// hard-failed EVERY Claude produce job once produce started parsing the profile:
+// a symlinked settings.json (chezmoi/stow/yadm), an empty one, one holding a
+// JSON array, and a symlinked .credentials.json. Base never opened these files,
+// so each was a regression introduced by the staging fix. settings.json is
+// configuration the runtime has defaults for, so an unusable one is skipped;
+// .credentials.json decides which account runs, so an unusable one still fails -
+// but a SYMLINK is resolved rather than rejected in both cases.
+func TestProduceStagingToleratesRealisticOperatorProfileShapes(t *testing.T) {
+	object := `{"claudeAiOauth":{"accessToken":"operator-account"}}`
+	for _, tc := range []struct {
+		name        string
+		build       func(t *testing.T, configured string)
+		wantErr     bool
+		wantStaged  []string
+		wantSkipped []string
+	}{
+		{name: "plain-objects", build: func(t *testing.T, configured string) {
+			writeProfileFile(t, configured, ".credentials.json", object)
+			writeProfileFile(t, configured, "settings.json", `{"model":"opus"}`)
+		}, wantStaged: []string{".credentials.json", "settings.json"}},
+		{name: "symlinked-settings", build: func(t *testing.T, configured string) {
+			writeProfileFile(t, configured, ".credentials.json", object)
+			target := filepath.Join(t.TempDir(), "settings.json")
+			if err := os.WriteFile(target, []byte(`{"model":"opus"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, filepath.Join(configured, "settings.json")); err != nil {
+				t.Fatal(err)
+			}
+		}, wantStaged: []string{".credentials.json", "settings.json"}},
+		{name: "symlinked-credential", build: func(t *testing.T, configured string) {
+			target := filepath.Join(t.TempDir(), ".credentials.json")
+			if err := os.WriteFile(target, []byte(object), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, filepath.Join(configured, ".credentials.json")); err != nil {
+				t.Fatal(err)
+			}
+		}, wantStaged: []string{".credentials.json"}},
+		{name: "empty-settings", build: func(t *testing.T, configured string) {
+			writeProfileFile(t, configured, ".credentials.json", object)
+			writeProfileFile(t, configured, "settings.json", "")
+		}, wantStaged: []string{".credentials.json"}, wantSkipped: []string{"settings.json"}},
+		{name: "array-settings", build: func(t *testing.T, configured string) {
+			writeProfileFile(t, configured, ".credentials.json", object)
+			writeProfileFile(t, configured, "settings.json", `["not","an","object"]`)
+		}, wantStaged: []string{".credentials.json"}, wantSkipped: []string{"settings.json"}},
+		{name: "directory-settings", build: func(t *testing.T, configured string) {
+			writeProfileFile(t, configured, ".credentials.json", object)
+			if err := os.MkdirAll(filepath.Join(configured, "settings.json"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}, wantStaged: []string{".credentials.json"}, wantSkipped: []string{"settings.json"}},
+		{name: "unparseable-credential-still-fails", build: func(t *testing.T, configured string) {
+			writeProfileFile(t, configured, ".credentials.json", `["not","an","object"]`)
+		}, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			configured := t.TempDir()
+			t.Setenv("CLAUDE_CONFIG_DIR", configured)
+			tc.build(t, configured)
+			stateRoot := t.TempDir()
+			_, _, _, env, err := produceRuntimeSandboxGrants(runtime.ClaudeRuntime, stateRoot, nil, nil, nil)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("an unusable .credentials.json must fail the dispatch loudly")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("a realistic operator profile must not fail produce: %v", err)
+			}
+			writeState := filepath.Join(stateRoot, ".claude")
+			if !containsEnv(env, "CLAUDE_CONFIG_DIR="+writeState) {
+				t.Fatalf("env = %v, want the job-private profile", env)
+			}
+			for _, name := range tc.wantStaged {
+				if _, err := os.Stat(filepath.Join(writeState, name)); err != nil {
+					t.Fatalf("%s was not staged: %v", name, err)
+				}
+			}
+			for _, name := range tc.wantSkipped {
+				if _, err := os.Stat(filepath.Join(writeState, name)); !os.IsNotExist(err) {
+					t.Fatalf("%s should have been skipped, not staged: %v", name, err)
+				}
+			}
+		})
+	}
+}
+
+// A file-type refusal must not blame the size, which sends the reader after the
+// wrong problem (#1810 review round 2).
+func TestProduceStagingErrorsNameTheActualCause(t *testing.T) {
+	configured := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(configured, ".credentials.json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err := stageProduceProfileFile(stagedProduceProfileFile{
+		source:      filepath.Join(configured, ".credentials.json"),
+		destination: filepath.Join(t.TempDir(), ".credentials.json"),
+		required:    true,
+	})
+	if err == nil {
+		t.Fatal("a directory in place of the credential must be refused")
+	}
+	if strings.Contains(err.Error(), "bytes") {
+		t.Fatalf("file-type refusal blames the size: %v", err)
+	}
+	if !strings.Contains(err.Error(), "regular file") {
+		t.Fatalf("error does not name the file type problem: %v", err)
+	}
+}
+
+func writeProfileFile(t *testing.T, dir, name, body string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}

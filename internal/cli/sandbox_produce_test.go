@@ -1041,42 +1041,80 @@ func findProduceSandboxShim(t *testing.T, runner subprocess.Runner) subprocess.W
 }
 
 // The local composition path keys produce state on checkout and runtime ref.
-// Collapsing that key makes every local produce run share one state root, so
-// two runs would reset and delete each other's runtime state.
+// Collapsing that key makes every local produce run share one hashed root.
+// Since round 2 each dispatch also carves its own run- directory inside that
+// root, so the identity to compare is the HASHED ROOT, not the run directory -
+// two dispatches with the same key must agree on the root and differ on the
+// run directory, which is exactly what stops one wiping the other's live state.
 func TestBuildLocalRuntimeAdapterKeysProduceStatePerCheckoutAndRuntimeRef(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
 	agent := runtime.Agent{Runtime: runtime.ClaudeRuntime, RuntimeRef: "session-a", WritablePaths: []string{"/data"}}
-	stateOf := func(checkout string, agent runtime.Agent) string {
+	dispatch := func(checkout string, agent runtime.Agent) (root string, runDir string) {
 		t.Helper()
 		adapter, err := buildLocalRuntimeAdapter(home, agent, checkout, subprocess.GroupRunner{})
 		if err != nil {
 			t.Fatalf("buildLocalRuntimeAdapter: %v", err)
 		}
-		claude, ok := adapter.(runtime.ClaudeAdapter)
-		if !ok {
-			t.Fatalf("adapter = %T, want ClaudeAdapter", adapter)
-		}
-		shim := findProduceSandboxShim(t, claude.Runner)
+		shim := findProduceSandboxShim(t, produceAdapterRunner(t, adapter))
 		state := envValue(shim.Env, "CLAUDE_CONFIG_DIR")
 		if state == "" {
 			t.Fatalf("shim env = %v, want a job-private config dir", shim.Env)
 		}
-		return state
+		runDir = filepath.Dir(state)
+		if base := filepath.Base(runDir); !strings.HasPrefix(base, "run-") {
+			t.Fatalf("local produce state %q is not inside a per-dispatch run- directory", state)
+		}
+		return filepath.Dir(runDir), runDir
 	}
-	firstCheckout := stateOf("/checkout-one", agent)
-	secondCheckout := stateOf("/checkout-two", agent)
-	if firstCheckout == secondCheckout {
-		t.Fatalf("two checkouts share produce state %q", firstCheckout)
+	firstRoot, firstRun := dispatch("/checkout-one", agent)
+	secondRoot, _ := dispatch("/checkout-two", agent)
+	if firstRoot == secondRoot {
+		t.Fatalf("two checkouts share produce state root %q", firstRoot)
 	}
 	otherRef := agent
 	otherRef.RuntimeRef = "session-b"
-	if second := stateOf("/checkout-one", otherRef); second == firstCheckout {
-		t.Fatalf("two runtime refs share produce state %q", firstCheckout)
+	if root, _ := dispatch("/checkout-one", otherRef); root == firstRoot {
+		t.Fatalf("two runtime refs share produce state root %q", firstRoot)
 	}
-	if repeated := stateOf("/checkout-one", agent); repeated != firstCheckout {
-		t.Fatalf("same checkout and ref resolved to %q then %q", firstCheckout, repeated)
+	repeatedRoot, repeatedRun := dispatch("/checkout-one", agent)
+	if repeatedRoot != firstRoot {
+		t.Fatalf("same checkout and ref resolved to root %q then %q", firstRoot, repeatedRoot)
+	}
+	// Same key, DIFFERENT dispatch directory: round 2 measured dispatch B
+	// wiping dispatch A's live state on this exact path.
+	if repeatedRun == firstRun {
+		t.Fatalf("two local dispatches share run directory %q", firstRun)
+	}
+	live := filepath.Join(firstRun, ".claude", "live-session.json")
+	if err := os.WriteFile(live, []byte(`{"live":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _ = dispatch("/checkout-one", agent); true {
+		if _, err := os.Stat(live); err != nil {
+			t.Fatalf("a later local dispatch destroyed a live sibling's state: %v", err)
+		}
+	}
+}
+
+// produceAdapterRunner unwraps the delivery adapter the local pipeline returns -
+// including the per-dispatch cleanup wrapper - down to the runtime adapter's
+// runner, so grant assertions bind to what actually executes.
+func produceAdapterRunner(t *testing.T, adapter workflow.DeliveryAdapter) subprocess.Runner {
+	t.Helper()
+	for {
+		switch typed := adapter.(type) {
+		case produceRunStateCleanupDeliveryAdapter:
+			adapter = typed.inner
+		case runtime.ClaudeAdapter:
+			return typed.Runner
+		case runtime.KimiAdapter:
+			return typed.Runner
+		default:
+			t.Fatalf("adapter = %T, want a Claude or Kimi adapter", adapter)
+			return nil
+		}
 	}
 }
 
@@ -1148,12 +1186,28 @@ func TestWorkerProduceRunRemovesTheStateRootItGranted(t *testing.T) {
 	if grantedConfigDir == operatorProfile {
 		t.Fatalf("produce job ran against the operator profile %q", operatorProfile)
 	}
-	stateRoot := filepath.Dir(grantedConfigDir)
-	if !containsPath(capture.args, stateRoot) && !containsPath(capture.args, grantedConfigDir) {
+	// The granted config dir must sit inside a PER-DISPATCH carve, not straight
+	// in the hashed job root: asserting only that "the parent is gone" holds
+	// either way, so deleting the carve from the worker survived (#1810 review
+	// round 2, M12). Name the run- component and the hashed root separately.
+	runDir := filepath.Dir(grantedConfigDir)
+	if base := filepath.Base(runDir); !strings.HasPrefix(base, "run-") {
+		t.Fatalf("granted config dir %q is not inside a per-dispatch run- directory (worker handed over the shared job root)", grantedConfigDir)
+	}
+	hashedRoot := filepath.Dir(runDir)
+	if filepath.Base(filepath.Dir(hashedRoot)) != "produce-runtime" {
+		t.Fatalf("run directory %q is not under a produce-runtime job root", runDir)
+	}
+	if !containsPath(capture.args, runDir) && !containsPath(capture.args, grantedConfigDir) {
 		t.Fatalf("granted state %q never reached the sandbox argv: %v", grantedConfigDir, capture.args)
 	}
-	if _, err := os.Stat(stateRoot); !os.IsNotExist(err) {
-		t.Fatalf("produce runtime state %q survived the job boundary: %v", stateRoot, err)
+	if _, err := os.Stat(runDir); !os.IsNotExist(err) {
+		t.Fatalf("produce runtime state %q survived the job boundary: %v", runDir, err)
+	}
+	// The hashed parent is reclaimed too once no sibling dispatch is live,
+	// otherwise one empty directory leaks per job id forever.
+	if _, err := os.Stat(hashedRoot); !os.IsNotExist(err) {
+		t.Fatalf("hashed produce root %q leaked after the job finished: %v", hashedRoot, err)
 	}
 	if data, err := os.ReadFile(filepath.Join(operatorProfile, ".credentials.json")); err != nil || string(data) != operatorCredential {
 		t.Fatalf("operator credential changed to %q, err=%v", data, err)
@@ -1190,6 +1244,20 @@ func TestProduceLaunchesOnTheImplicitWriteRootPathUnlikeAReadOnlySeat(t *testing
 		t.Fatalf("produce now launches with a read-only workdir: %v", capture.args)
 	}
 
+	// SECOND CONSTRUCTION SITE. buildLocalRuntimeAdapter decides the same thing
+	// independently, and a routing mutant there survived the whole package while
+	// this test was green (#1810 review round 2, MROUTE). Binding one site is
+	// not binding the behaviour.
+	localHome := t.TempDir()
+	localAdapter, err := buildLocalRuntimeAdapter(localHome, agent, filepath.Join(localHome, "checkout"), subprocess.GroupRunner{})
+	if err != nil {
+		t.Fatalf("buildLocalRuntimeAdapter: %v", err)
+	}
+	localShim := findProduceSandboxShim(t, produceAdapterRunner(t, localAdapter))
+	if localShim.ReadOnlyWorkdir {
+		t.Fatalf("local produce composition now launches with a read-only workdir: %+v", localShim)
+	}
+
 	// The read-only seat is the contrast case and must stay on the explicit-only
 	// path; if this flag ever disappears there, seats gain implicit tmp writes.
 	seatCheckout := filepath.Join(t.TempDir(), "review-worktree")
@@ -1210,5 +1278,43 @@ func TestProduceLaunchesOnTheImplicitWriteRootPathUnlikeAReadOnlySeat(t *testing
 	}
 	if !containsString(seatCapture.args, "--read-only-workdir") {
 		t.Fatalf("read-only seat lost its read-only workdir: %v", seatCapture.args)
+	}
+}
+
+// The local composition path has no worker to defer cleanup, so removal is bound
+// to the delivery returning. Round-2 mutant M19 (deleting that defer) SURVIVED
+// the whole scoped suite: the per-dispatch carve was pinned but nothing checked
+// that anything ever removes it, which is the leak the carve would otherwise
+// introduce on every local produce run.
+func TestBuildLocalRuntimeAdapterRemovesItsDispatchStateAfterDelivery(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	agent := runtime.Agent{
+		Name: "p", Role: "producer", Runtime: runtime.ClaudeRuntime, RuntimeRef: "last",
+		AutonomyPolicy: runtime.AutonomyPolicyWorkspaceWrite,
+		WritablePaths:  []string{home},
+	}
+	capture := &sandboxAdapterCaptureRunner{stdout: `{"result":"ok"}`}
+	adapter, err := buildLocalRuntimeAdapter(home, agent, filepath.Join(home, "checkout"), capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shim := findProduceSandboxShim(t, produceAdapterRunner(t, adapter))
+	runDir := filepath.Dir(envValue(shim.Env, "CLAUDE_CONFIG_DIR"))
+	if base := filepath.Base(runDir); !strings.HasPrefix(base, "run-") {
+		t.Fatalf("local dispatch state %q is not a per-dispatch run- directory", runDir)
+	}
+	if _, err := os.Stat(runDir); err != nil {
+		t.Fatalf("dispatch state missing before delivery: %v", err)
+	}
+	if _, err := adapter.Deliver(context.Background(), agent, runtime.Job{Prompt: "write"}); err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	if _, err := os.Stat(runDir); !os.IsNotExist(err) {
+		t.Fatalf("local dispatch state %q survived delivery: %v", runDir, err)
+	}
+	if _, err := os.Stat(filepath.Dir(runDir)); !os.IsNotExist(err) {
+		t.Fatalf("hashed local produce root leaked after delivery: %v", err)
 	}
 }

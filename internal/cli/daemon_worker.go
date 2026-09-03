@@ -714,7 +714,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 			return nil
 		}
-		defer os.RemoveAll(produceStateDir)
+		defer removeProduceRunStateDir(produceStateDir)
 	}
 	adapter, err = wrapProduceSandboxAdapter(job.Type, agent, adapter, produceStateDir)
 	if err != nil {
@@ -1876,6 +1876,58 @@ func pathsOverlap(left, right string) bool {
 type stagedProduceProfileFile struct {
 	source      string
 	destination string
+	// required marks a file whose presence-but-unusability is a dispatch
+	// failure rather than something to skip.
+	required bool
+}
+
+// stageProduceProfileFile copies one operator profile file into a job-private
+// profile. It differs from stageReadOnlyRuntimeCredential in two ways that the
+// produce path needs and the read-only seat path does not: it FOLLOWS SYMLINKS,
+// because dotfile managers symlink these files and rejecting a symlink would
+// deny produce to an ordinary host; and it distinguishes required from optional
+// files, so a malformed settings.json costs the operator their settings rather
+// than their job. Errors name the actual cause - file type and size are
+// separate messages, because reporting "too large" for a symlink sends the
+// reader after the wrong problem (#1810 review round 2).
+func stageProduceProfileFile(file stagedProduceProfileFile) error {
+	skip := func(err error) error {
+		if file.required {
+			return err
+		}
+		return nil
+	}
+	info, err := os.Stat(file.source)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return skip(fmt.Errorf("inspect runtime profile file %q: %w", file.source, err))
+	}
+	if !info.Mode().IsRegular() {
+		return skip(fmt.Errorf("runtime profile file %q must be a regular file or a symlink to one, found %s", file.source, info.Mode().Type()))
+	}
+	if info.Size() > maxReadOnlyRuntimeStateFileBytes {
+		return skip(fmt.Errorf("runtime profile file %q is %d bytes, over the %d byte limit", file.source, info.Size(), maxReadOnlyRuntimeStateFileBytes))
+	}
+	data, err := os.ReadFile(file.source)
+	if err != nil {
+		return skip(fmt.Errorf("read runtime profile file %q: %w", file.source, err))
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err != nil || object == nil {
+		if err == nil {
+			err = errors.New("content must be a JSON object")
+		}
+		return skip(fmt.Errorf("validate runtime profile file %q: %w", file.source, err))
+	}
+	if err := os.MkdirAll(filepath.Dir(file.destination), 0o700); err != nil {
+		return fmt.Errorf("create job-private profile directory: %w", err)
+	}
+	if err := os.WriteFile(file.destination, data, 0o600); err != nil {
+		return fmt.Errorf("stage runtime profile file %q: %w", file.destination, err)
+	}
+	return nil
 }
 
 func produceRuntimeSandboxGrants(runtimeName string, runtimeStateDir string, readable, readFiles, writable []string) ([]string, []string, []string, []string, error) {
@@ -1924,12 +1976,23 @@ func produceRuntimeSandboxGrants(runtimeName string, runtimeStateDir string, rea
 			"CLAUDE_CONFIG_DIR=" + writeStateDir,
 			"XDG_CACHE_HOME=" + cacheHome,
 		}
-		for _, name := range []string{".credentials.json", "settings.json"} {
-			staged = append(staged, stagedProduceProfileFile{
-				source:      filepath.Join(configDir, name),
-				destination: filepath.Join(writeStateDir, name),
-			})
-		}
+		// .credentials.json decides WHICH ACCOUNT the job runs as, so a present
+		// but unusable one is worth failing loudly. settings.json is ordinary
+		// configuration the runtime has defaults for, so an unusable one is
+		// skipped rather than failing the dispatch: an operator whose dotfiles
+		// leave it empty, symlinked, or holding a non-object must not lose
+		// produce entirely (#1810 review round 2).
+		staged = append(staged,
+			stagedProduceProfileFile{
+				source:      filepath.Join(configDir, ".credentials.json"),
+				destination: filepath.Join(writeStateDir, ".credentials.json"),
+				required:    true,
+			},
+			stagedProduceProfileFile{
+				source:      filepath.Join(configDir, "settings.json"),
+				destination: filepath.Join(writeStateDir, "settings.json"),
+			},
+		)
 	case runtime.KimiRuntime:
 		statePaths = []string{filepath.Join(home, ".kimi-code")}
 	default:
@@ -1942,9 +2005,11 @@ func produceRuntimeSandboxGrants(runtimeName string, runtimeStateDir string, rea
 	}
 	// Staging runs in the daemon, outside the sandbox, so the operator profile
 	// needs no grant. A missing profile stages nothing and is not an error: a
-	// fresh host with no profile is a valid configuration.
+	// fresh host with no profile is a valid configuration, and neither is a
+	// symlinked one - dotfile managers (chezmoi, stow, yadm) symlink these
+	// files, so staging resolves symlinks rather than rejecting them.
 	for _, file := range staged {
-		if err := stageReadOnlyRuntimeCredential(file.source, file.destination, ""); err != nil {
+		if err := stageProduceProfileFile(file); err != nil {
 			return nil, nil, nil, nil, err
 		}
 	}
@@ -2708,7 +2773,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		if err != nil {
 			return err
 		}
-		defer os.RemoveAll(produceStateDir)
+		defer removeProduceRunStateDir(produceStateDir)
 	}
 	adapter, err = wrapProduceSandboxAdapter(delegatedJob.Type, started.Agent, adapter, produceStateDir)
 	if err != nil {
@@ -3749,13 +3814,27 @@ func buildLocalRuntimeAdapter(home string, agent runtime.Agent, checkout string,
 		return nil, err
 	}
 	gatewayRunner, _ := runner.(*credgw.Runner)
+	var produceRunDir string
 	if (len(agent.WritablePaths) > 0 || len(agent.ReadablePaths) > 0 || len(agent.ReadableFiles) > 0) && (agent.Runtime == runtime.ClaudeRuntime || agent.Runtime == runtime.KimiRuntime) {
-		runtimeStateDir, err := jobProduceRuntimeStateDir(home, "local:"+checkout+":"+agent.RuntimeRef, agent.Runtime)
+		runtimeStateRoot, err := jobProduceRuntimeStateDir(home, "local:"+checkout+":"+agent.RuntimeRef, agent.Runtime)
 		if err != nil {
 			return nil, err
 		}
+		runtimeStateDir := runtimeStateRoot
+		if runtimeStateRoot != "" {
+			// Same reason as the worker paths: the key is stable, so two
+			// dispatches for one checkout and runtime ref would otherwise share
+			// a root that each resets, and the second would wipe the first's
+			// live state (#1810 review round 2 measured exactly that).
+			runtimeStateDir, err = newProduceRunStateDir(runtimeStateRoot)
+			if err != nil {
+				return nil, err
+			}
+			produceRunDir = runtimeStateDir
+		}
 		reads, readFiles, writes, env, err := produceRuntimeSandboxGrants(agent.Runtime, runtimeStateDir, agent.ReadablePaths, agent.ReadableFiles, agent.WritablePaths)
 		if err != nil {
+			removeProduceRunStateDir(produceRunDir)
 			return nil, err
 		}
 		runner = landlockProduceRunner(runner, reads, readFiles, writes, env)
@@ -3773,9 +3852,44 @@ func buildLocalRuntimeAdapter(home string, agent runtime.Agent, checkout string,
 	case runtime.ShellRuntime:
 		adapter = runtime.ShellAdapter{Dir: checkout, Runner: runner}
 	default:
+		removeProduceRunStateDir(produceRunDir)
 		return nil, fmt.Errorf("unsupported runtime: %s", agent.Runtime)
 	}
-	return wrapModelGatewayAdapter(adapter, gatewayRunner), nil
+	// The local pipeline has no worker to defer cleanup, so bind it to the one
+	// lifecycle event this path does have: the delivery returning.
+	return produceRunStateCleanupAdapter(wrapModelGatewayAdapter(adapter, gatewayRunner), produceRunDir), nil
+}
+
+// removeProduceRunStateDir removes one dispatch's run directory and then tries
+// to reclaim the hashed job root with a NON-recursive remove: it succeeds
+// exactly when no sibling dispatch is live, which is the correct condition, and
+// otherwise leaves the sibling untouched. Without it the hashed parent survives
+// every job forever (#1810 review round 2 measured 5 empty roots after 5 jobs).
+func removeProduceRunStateDir(runDir string) {
+	if strings.TrimSpace(runDir) == "" {
+		return
+	}
+	if err := os.RemoveAll(runDir); err != nil {
+		return
+	}
+	_ = os.Remove(filepath.Dir(runDir))
+}
+
+type produceRunStateCleanupDeliveryAdapter struct {
+	inner  workflow.DeliveryAdapter
+	runDir string
+}
+
+func (a produceRunStateCleanupDeliveryAdapter) Deliver(ctx context.Context, agent runtime.Agent, job runtime.Job) (runtime.Result, error) {
+	defer removeProduceRunStateDir(a.runDir)
+	return a.inner.Deliver(ctx, agent, job)
+}
+
+func produceRunStateCleanupAdapter(inner workflow.DeliveryAdapter, runDir string) workflow.DeliveryAdapter {
+	if strings.TrimSpace(runDir) == "" {
+		return inner
+	}
+	return produceRunStateCleanupDeliveryAdapter{inner: inner, runDir: runDir}
 }
 
 func startRuntimeAdapterForBackend(backend execbackend.Backend, home string, runtimeName string, checkout string) (runtime.Adapter, error) {
