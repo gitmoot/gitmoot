@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -696,7 +697,18 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 		writeLine(w.Stdout, "job %s tool cache grant failed: %v", job.ID, toolCacheErr)
 	}
-	adapter, err = wrapProduceSandboxAdapter(job.Type, agent, adapter)
+	produceStateDir, err := jobProduceRuntimeStateDir(w.ConfigHome, job.ID, agent.Runtime)
+	if err != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
+		return nil
+	}
+	if produceStateDir != "" {
+		defer os.RemoveAll(produceStateDir)
+	}
+	adapter, err = wrapProduceSandboxAdapter(job.Type, agent, adapter, produceStateDir)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
@@ -1352,20 +1364,20 @@ func (w jobWorker) recordProduceSandboxDiagnostic(ctx context.Context, jobID, ac
 // wrapProduceSandboxAdapter rewrites only Claude/Kimi produce adapters. Codex
 // keeps its existing native sandbox and every non-produce adapter is returned
 // byte-for-byte unchanged.
-func wrapProduceSandboxAdapter(action string, agent runtime.Agent, adapter workflow.DeliveryAdapter) (workflow.DeliveryAdapter, error) {
+func wrapProduceSandboxAdapter(action string, agent runtime.Agent, adapter workflow.DeliveryAdapter, runtimeStateDir string) (workflow.DeliveryAdapter, error) {
 	if strings.TrimSpace(action) != "produce" || agent.Runtime == runtime.CodexRuntime {
 		return adapter, nil
 	}
 	if agent.Runtime != runtime.ClaudeRuntime && agent.Runtime != runtime.KimiRuntime {
 		return adapter, nil
 	}
-	reads, readFiles, writes, env, err := produceRuntimeSandboxGrants(agent.Runtime, agent.ReadablePaths, agent.ReadableFiles, agent.WritablePaths)
+	reads, readFiles, writes, env, err := produceRuntimeSandboxGrants(agent.Runtime, runtimeStateDir, agent.ReadablePaths, agent.ReadableFiles, agent.WritablePaths)
 	if err != nil {
 		return nil, err
 	}
 	switch a := adapter.(type) {
 	case modelGatewayRuntimeAdapter:
-		wrapped, err := wrapProduceSandboxAdapter(action, agent, a.Adapter)
+		wrapped, err := wrapProduceSandboxAdapter(action, agent, a.Adapter, runtimeStateDir)
 		if err != nil {
 			return nil, err
 		}
@@ -1853,7 +1865,7 @@ func pathsOverlap(left, right string) bool {
 	return contains(left, right) || contains(right, left)
 }
 
-func produceRuntimeSandboxGrants(runtimeName string, readable, readFiles, writable []string) ([]string, []string, []string, []string, error) {
+func produceRuntimeSandboxGrants(runtimeName string, runtimeStateDir string, readable, readFiles, writable []string) ([]string, []string, []string, []string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("resolve runtime state home: %w", err)
@@ -1863,24 +1875,27 @@ func produceRuntimeSandboxGrants(runtimeName string, readable, readFiles, writab
 	var env []string
 	switch runtimeName {
 	case runtime.ClaudeRuntime:
-		// An operator-set CLAUDE_CONFIG_DIR selects the ACCOUNT the engine runs
-		// as. Hard-coding $HOME/.claude here silently replaced it, so a daemon
-		// configured onto a live account still pointed produce jobs at a dead
-		// one: on this host /root/.claude has carried expiresAt 0 with no refresh
-		// token since 2026-08-31, which yields exactly "OAuth session expired and
-		// could not be refreshed". Honor the configured dir and fall back only
-		// when none is set.
-		stateDir, err := resolveRuntimeConfigDir(runtime.ClaudeRuntime, os.Getenv("CLAUDE_CONFIG_DIR"))
+		// CLAUDE_CONFIG_DIR selects the account the daemon must authenticate as,
+		// but it may name a live operator profile outside the job's intended
+		// write scope. Expose that profile read-only and redirect all granted
+		// runtime writes into the caller's job-private state root.
+		configDir, err := resolveRuntimeConfigDir(runtime.ClaudeRuntime, os.Getenv("CLAUDE_CONFIG_DIR"))
 		if err != nil {
 			return nil, nil, nil, nil, err
 		}
-		cacheRoot, err := os.UserCacheDir()
-		if err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("resolve Claude cache root: %w", err)
+		if strings.TrimSpace(runtimeStateDir) == "" {
+			return nil, nil, nil, nil, errors.New("Claude produce requires a job-private runtime state root")
 		}
-		cacheDir := filepath.Join(cacheRoot, "claude-cli-nodejs")
-		statePaths = []string{stateDir, cacheDir}
-		env = []string{"CLAUDE_CONFIG_DIR=" + stateDir}
+		if err := os.RemoveAll(runtimeStateDir); err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("reset Claude produce runtime state %q: %w", runtimeStateDir, err)
+		}
+		writeStateDir := filepath.Join(runtimeStateDir, ".claude")
+		cacheDir := filepath.Join(runtimeStateDir, "claude-cli-nodejs")
+		statePaths = []string{writeStateDir, cacheDir}
+		env = []string{"CLAUDE_CONFIG_DIR=" + configDir}
+		if configDir != writeStateDir {
+			readable = append(readable, configDir)
+		}
 	case runtime.KimiRuntime:
 		statePaths = []string{filepath.Join(home, ".kimi-code")}
 	default:
@@ -1895,6 +1910,18 @@ func produceRuntimeSandboxGrants(runtimeName string, readable, readFiles, writab
 	files := compactCleanPaths(readFiles)
 	writes := compactCleanPaths(append(append([]string(nil), writable...), statePaths...))
 	return reads, files, writes, env, nil
+}
+
+func jobProduceRuntimeStateDir(home, jobID, runtimeName string) (string, error) {
+	if runtimeName != runtime.ClaudeRuntime {
+		return "", nil
+	}
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		return "", fmt.Errorf("resolve produce runtime state root: %w", err)
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(jobID)))
+	return filepath.Join(paths.Home, "cache", "produce-runtime", fmt.Sprintf("%x", sum[:8])), nil
 }
 
 func compactCleanPaths(paths []string) []string {
@@ -2614,7 +2641,14 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	} else {
 		tempToolCacheEnv = env
 	}
-	adapter, err = wrapProduceSandboxAdapter(delegatedJob.Type, started.Agent, adapter)
+	produceStateDir, err := jobProduceRuntimeStateDir(w.ConfigHome, delegatedJob.ID, started.Agent.Runtime)
+	if err != nil {
+		return err
+	}
+	if produceStateDir != "" {
+		defer os.RemoveAll(produceStateDir)
+	}
+	adapter, err = wrapProduceSandboxAdapter(delegatedJob.Type, started.Agent, adapter, produceStateDir)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
@@ -3654,7 +3688,11 @@ func buildLocalRuntimeAdapter(home string, agent runtime.Agent, checkout string,
 	}
 	gatewayRunner, _ := runner.(*credgw.Runner)
 	if (len(agent.WritablePaths) > 0 || len(agent.ReadablePaths) > 0 || len(agent.ReadableFiles) > 0) && (agent.Runtime == runtime.ClaudeRuntime || agent.Runtime == runtime.KimiRuntime) {
-		reads, readFiles, writes, env, err := produceRuntimeSandboxGrants(agent.Runtime, agent.ReadablePaths, agent.ReadableFiles, agent.WritablePaths)
+		runtimeStateDir, err := jobProduceRuntimeStateDir(home, "local:"+checkout+":"+agent.RuntimeRef, agent.Runtime)
+		if err != nil {
+			return nil, err
+		}
+		reads, readFiles, writes, env, err := produceRuntimeSandboxGrants(agent.Runtime, runtimeStateDir, agent.ReadablePaths, agent.ReadableFiles, agent.WritablePaths)
 		if err != nil {
 			return nil, err
 		}

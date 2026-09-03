@@ -91,7 +91,7 @@ func TestClaudeProduceHookAutoReadLandlockE2E(t *testing.T) {
 	// environment carries (#1810 review, P2).
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	gitmoot := sharedGitmootTestBinary(t)
-	reads, readFiles, writes, env, err := produceRuntimeSandboxGrants(agent.Runtime, agent.ReadablePaths, agent.ReadableFiles, agent.WritablePaths)
+	reads, readFiles, writes, env, err := produceRuntimeSandboxGrants(agent.Runtime, t.TempDir(), agent.ReadablePaths, agent.ReadableFiles, agent.WritablePaths)
 	if err != nil {
 		t.Fatal(err)
 	}

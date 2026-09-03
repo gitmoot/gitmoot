@@ -244,13 +244,20 @@ func TestWorkerClaudeKimiProduceDispatchWrappedArgv(t *testing.T) {
 				ref = "session_550e8400-e29b-41d4-a716-446655440000"
 			}
 			agent := runtime.Agent{Name: "p", Role: "producer", Runtime: tc.runtime, RuntimeRef: ref, RepoScope: "owner/repo", AutonomyPolicy: runtime.AutonomyPolicyWorkspaceWrite, ReadablePaths: []string{"/data/input"}, WritablePaths: []string{"/data/out"}}
+			var claudeConfigDir string
 			if tc.runtime == runtime.ClaudeRuntime {
 				agent.ReadableFiles = []string{home + "/.claude.json"}
 				if err := os.WriteFile(agent.ReadableFiles[0], []byte("{}"), 0o600); err != nil {
 					t.Fatal(err)
 				}
+				var resolveErr error
+				claudeConfigDir, resolveErr = resolveRuntimeConfigDir(runtime.ClaudeRuntime, os.Getenv("CLAUDE_CONFIG_DIR"))
+				if resolveErr != nil {
+					t.Fatal(resolveErr)
+				}
 			}
-			wrapped, err := wrapProduceSandboxAdapter("produce", agent, tc.adapter(capture))
+			runtimeStateDir := filepath.Join(home, "job-runtime")
+			wrapped, err := wrapProduceSandboxAdapter("produce", agent, tc.adapter(capture), runtimeStateDir)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -259,10 +266,13 @@ func TestWorkerClaudeKimiProduceDispatchWrappedArgv(t *testing.T) {
 			}
 			wantPrefix := []string{"sandbox-exec", "--read", "/data/input"}
 			if tc.runtime == runtime.ClaudeRuntime {
+				if claudeConfigDir != filepath.Join(runtimeStateDir, ".claude") {
+					wantPrefix = append(wantPrefix, "--read", claudeConfigDir)
+				}
 				wantPrefix = append(wantPrefix, "--read-file", home+"/.claude.json")
 				wantPrefix = append(wantPrefix, "--write", "/data/out")
-				wantPrefix = append(wantPrefix, "--write", home+"/.claude", "--write", home+"/.cache/claude-cli-nodejs")
-				if !reflect.DeepEqual(capture.env, []string{"CLAUDE_CONFIG_DIR=" + home + "/.claude"}) {
+				wantPrefix = append(wantPrefix, "--write", filepath.Join(runtimeStateDir, ".claude"), "--write", filepath.Join(runtimeStateDir, "claude-cli-nodejs"))
+				if !reflect.DeepEqual(capture.env, []string{"CLAUDE_CONFIG_DIR=" + claudeConfigDir}) {
 					t.Fatalf("Claude sandbox env = %v", capture.env)
 				}
 			} else {
@@ -297,9 +307,14 @@ func TestProduceRunnerComposesUnderTeeAndScopesByAction(t *testing.T) {
 	if err := os.WriteFile(stateFile, []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	configDir, err := resolveRuntimeConfigDir(runtime.ClaudeRuntime, os.Getenv("CLAUDE_CONFIG_DIR"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	agent := runtime.Agent{Runtime: runtime.ClaudeRuntime, ReadablePaths: []string{"/input"}, ReadableFiles: []string{stateFile}, WritablePaths: []string{"/data"}}
 	base := runtime.ClaudeAdapter{Runner: subprocess.TeeRunner{Inner: subprocess.GroupRunner{}}}
-	wrapped, err := wrapProduceSandboxAdapter("produce", agent, base)
+	runtimeStateDir := filepath.Join(home, "job-runtime")
+	wrapped, err := wrapProduceSandboxAdapter("produce", agent, base, runtimeStateDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,17 +330,21 @@ func TestProduceRunnerComposesUnderTeeAndScopesByAction(t *testing.T) {
 	if _, ok := shim.Inner.(subprocess.GroupRunner); !ok {
 		t.Fatalf("shim inner = %T, want GroupRunner", shim.Inner)
 	}
-	wantPaths := []string{"/data", home + "/.claude", home + "/.cache/claude-cli-nodejs"}
-	if !reflect.DeepEqual(shim.ReadablePaths, []string{"/input"}) || !reflect.DeepEqual(shim.ReadableFiles, []string{stateFile}) || !reflect.DeepEqual(shim.WritablePaths, wantPaths) || !reflect.DeepEqual(shim.Env, []string{"CLAUDE_CONFIG_DIR=" + home + "/.claude"}) {
-		t.Fatalf("Claude shim = reads %v writes %v env %v, want read /input, writes %v + config env", shim.ReadablePaths, shim.WritablePaths, shim.Env, wantPaths)
+	wantReads := []string{"/input"}
+	if configDir != filepath.Join(runtimeStateDir, ".claude") {
+		wantReads = append(wantReads, configDir)
+	}
+	wantPaths := []string{"/data", filepath.Join(runtimeStateDir, ".claude"), filepath.Join(runtimeStateDir, "claude-cli-nodejs")}
+	if !reflect.DeepEqual(shim.ReadablePaths, wantReads) || !reflect.DeepEqual(shim.ReadableFiles, []string{stateFile}) || !reflect.DeepEqual(shim.WritablePaths, wantPaths) || !reflect.DeepEqual(shim.Env, []string{"CLAUDE_CONFIG_DIR=" + configDir}) {
+		t.Fatalf("Claude shim = reads %v writes %v env %v, want reads %v, writes %v + config env", shim.ReadablePaths, shim.WritablePaths, shim.Env, wantReads, wantPaths)
 	}
 
-	nonProduce, err := wrapProduceSandboxAdapter("ask", agent, base)
+	nonProduce, err := wrapProduceSandboxAdapter("ask", agent, base, runtimeStateDir)
 	if err != nil || !reflect.DeepEqual(nonProduce, base) {
 		t.Fatalf("non-produce adapter changed: %T %+v, err=%v", nonProduce, nonProduce, err)
 	}
 	codexBase := runtime.CodexAdapter{Runner: subprocess.GroupRunner{}}
-	codex, err := wrapProduceSandboxAdapter("produce", runtime.Agent{Runtime: runtime.CodexRuntime, ReadablePaths: []string{"/input"}, WritablePaths: []string{"/data"}}, codexBase)
+	codex, err := wrapProduceSandboxAdapter("produce", runtime.Agent{Runtime: runtime.CodexRuntime, ReadablePaths: []string{"/input"}, WritablePaths: []string{"/data"}}, codexBase, runtimeStateDir)
 	if err != nil || !reflect.DeepEqual(codex, codexBase) {
 		t.Fatalf("Codex adapter changed: %T %+v, err=%v", codex, codex, err)
 	}

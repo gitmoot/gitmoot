@@ -248,71 +248,68 @@ func TestReadOnlySeatRuntimeAuthEnvDoesNotInventCredentialStoreOverlay(t *testin
 	}
 }
 
-// An operator-set CLAUDE_CONFIG_DIR names the ACCOUNT the engine runs as.
-// produceRuntimeSandboxGrants hard-coded $HOME/.claude and silently replaced
-// it, so a daemon configured onto a live account still pointed produce jobs at
-// /root/.claude, which on this host has carried expiresAt 0 with no refresh
-// token since 2026-08-31 and yields exactly "OAuth session expired and could
-// not be refreshed".
-func TestProduceRuntimeSandboxGrantsHonorsConfiguredClaudeDir(t *testing.T) {
-	configured := filepath.Join(t.TempDir(), "claude-13")
+// Produce jobs authenticate as the account selected by CLAUDE_CONFIG_DIR, but
+// their Landlock grant must never make that live operator profile writable.
+// Mutable runtime state stays under a job-private root.
+func TestProduceRuntimeSandboxGrantsReadButDoNotWriteConfiguredClaudeDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	configured := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", configured)
-
-	_, _, writes, env, err := produceRuntimeSandboxGrants(runtime.ClaudeRuntime, nil, nil, nil)
+	stateRoot := t.TempDir()
+	reads, _, writes, env, err := produceRuntimeSandboxGrants(runtime.ClaudeRuntime, stateRoot, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("produceRuntimeSandboxGrants: %v", err)
 	}
+	writeState := filepath.Join(stateRoot, ".claude")
 	if !containsEnv(env, "CLAUDE_CONFIG_DIR="+configured) {
-		t.Fatalf("produce env = %v, want the configured dir %q", env, configured)
+		t.Fatalf("produce env = %v, want configured account %q", env, configured)
 	}
-	if !containsPath(writes, configured) {
-		t.Fatalf("produce writes = %v, want the configured dir writable", writes)
+	if !containsPath(reads, configured) {
+		t.Fatalf("produce reads = %v, want configured account %q readable", reads, configured)
+	}
+	if !containsPath(writes, writeState) {
+		t.Fatalf("produce writes = %v, want mutable state under %q", writes, writeState)
+	}
+	if containsPath(writes, configured) {
+		t.Fatalf("produce writes = %v, must not grant live configured dir %q", writes, configured)
 	}
 
-	// With none set it still falls back to the host default.
-	t.Setenv("CLAUDE_CONFIG_DIR", "")
-	home, err := os.UserHomeDir()
+	for _, invalid := range []string{"relative-claude", "~someone/claude"} {
+		t.Setenv("CLAUDE_CONFIG_DIR", invalid)
+		if _, _, _, _, err := produceRuntimeSandboxGrants(runtime.ClaudeRuntime, stateRoot, nil, nil, nil); err == nil {
+			t.Fatalf("CLAUDE_CONFIG_DIR=%q must be refused by the produce path", invalid)
+		}
+	}
+}
+
+func TestJobProduceRuntimeStateDirIsPrivatePerJob(t *testing.T) {
+	home := t.TempDir()
+	first, err := jobProduceRuntimeStateDir(home, "job-a", runtime.ClaudeRuntime)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, fallbackEnv, err := produceRuntimeSandboxGrants(runtime.ClaudeRuntime, nil, nil, nil)
+	repeated, err := jobProduceRuntimeStateDir(home, "job-a", runtime.ClaudeRuntime)
 	if err != nil {
-		t.Fatalf("produceRuntimeSandboxGrants fallback: %v", err)
+		t.Fatal(err)
 	}
-	if !containsEnv(fallbackEnv, "CLAUDE_CONFIG_DIR="+filepath.Join(filepath.Clean(home), ".claude")) {
-		t.Fatalf("fallback env = %v, want $HOME/.claude", fallbackEnv)
-	}
-
-	// A ~ value is expanded to an absolute path under this user's home.
-	t.Setenv("CLAUDE_CONFIG_DIR", "~/tilde-claude")
-	_, _, tildeWrites, tildeEnv, err := produceRuntimeSandboxGrants(runtime.ClaudeRuntime, nil, nil, nil)
+	second, err := jobProduceRuntimeStateDir(home, "job-b", runtime.ClaudeRuntime)
 	if err != nil {
-		t.Fatalf("produceRuntimeSandboxGrants(~): %v", err)
+		t.Fatal(err)
 	}
-	wantTilde := filepath.Join(filepath.Clean(home), "tilde-claude")
-	if !containsEnv(tildeEnv, "CLAUDE_CONFIG_DIR="+wantTilde) || !containsPath(tildeWrites, wantTilde) {
-		t.Fatalf("~ env = %v writes = %v, want %q", tildeEnv, tildeWrites, wantTilde)
+	if first != repeated {
+		t.Fatalf("same job resolved to %q then %q", first, repeated)
 	}
-
-	// A relative or ~user value is REFUSED. Repairing either silently granted,
-	// staged and inspected an account the operator never named — a relative path
-	// against the daemon's arbitrary cwd (creating a stray profile there), ~user
-	// under the CURRENT user's home.
-	for _, configuredDir := range []string{"relative-claude", "~someone/claude"} {
-		t.Setenv("CLAUDE_CONFIG_DIR", configuredDir)
-		if _, _, _, _, err := produceRuntimeSandboxGrants(runtime.ClaudeRuntime, nil, nil, nil); err == nil {
-			t.Fatalf("CLAUDE_CONFIG_DIR=%q must be refused, not repaired", configuredDir)
-		}
-		if _, statErr := os.Stat(configuredDir); statErr == nil {
-			t.Fatalf("refusing %q still created it in the working directory", configuredDir)
-		}
+	if first == second {
+		t.Fatalf("distinct jobs share runtime state %q", first)
 	}
-
-	// A ~user path names ANOTHER account's home; mapping it under this user's
-	// home would grant and stage the wrong profile, so it is refused.
-	t.Setenv("CLAUDE_CONFIG_DIR", "~someone/claude")
-	if _, _, _, _, err := produceRuntimeSandboxGrants(runtime.ClaudeRuntime, nil, nil, nil); err == nil {
-		t.Fatal("a ~user CLAUDE_CONFIG_DIR must be refused, not remapped")
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRoot := filepath.Join(paths.Home, "cache", "produce-runtime")
+	if !strings.HasPrefix(first, wantRoot+string(filepath.Separator)) {
+		t.Fatalf("job state %q is outside private root %q", first, wantRoot)
 	}
 }
 
@@ -406,4 +403,3 @@ func TestResolveRuntimeConfigDirMatchesTheStagingContract(t *testing.T) {
 		t.Fatalf("state path = %q, want the resolved staged file", path)
 	}
 }
-
