@@ -265,16 +265,37 @@ detection.
    checkout, which usually carries uncommitted work. Stamp the version the way
    `release.yml` does, or `gitmoot version` reports `commit: unknown`.
    `-buildvcs=false` is required for the same reason as the test gate above: in
-   a linked worktree `.git` is a file, so Go's VCS stamp fails with
-   `error obtaining VCS status: exit status 128`.
+   a linked worktree `.git` is a **file**, which Go never accepts as a
+   repository root, so it walks up to the parent directories. Both outcomes of
+   that walk are wrong, and only one of them is loud:
+
+   - no repository above the worktree: the build **fails** with
+     `error obtaining VCS status: exit status 128`;
+   - an unrelated repository above it: the build **succeeds** and stamps that
+     repository's metadata. Measured on this host with a throwaway module: a
+     binary built from commit `03cf3963` embedded the ancestor's
+     `vcs.revision 866bf37b` and `vcs.modified true`.
+
+   The silent case is the one to design against. The `-ldflags` below override
+   `Commit`, so `gitmoot version` still prints the right value and the wrong
+   stamp stays hidden in the embedded build info. Drop the ldflags and
+   `buildinfo.Current` falls back to that VCS revision
+   (`internal/buildinfo/buildinfo.go`), so an unstamped binary reports the
+   ancestor's commit as its own and the daemon build-skew check compares a
+   false identity rather than an unknown one.
 
    ```sh
+   git worktree add --detach /root/gitmoot-deploy "$(git rev-parse HEAD)"
+   cd /root/gitmoot-deploy
    PKG=github.com/gitmoot/gitmoot/internal/buildinfo
    CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags \
      "-s -w -X $PKG.Version=dev-$(git rev-parse --short HEAD) \
       -X $PKG.Commit=$(git rev-parse HEAD) -X $PKG.Date=$(date -Iseconds)" \
      -o /root/.local/bin/gitmoot.new ./cmd/gitmoot
    ```
+
+   Remove the deploy worktree when the deploy is done:
+   `git worktree remove /root/gitmoot-deploy`.
 
 2. `mv`-rename the new binary into `/root/.local/bin/gitmoot` (same filesystem;
    the rename avoids `ETXTBSY`).
