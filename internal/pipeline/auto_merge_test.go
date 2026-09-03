@@ -297,9 +297,12 @@ func TestPipelineAutoMergeHoldTimeoutCarriesTheReason(t *testing.T) {
 }
 
 // With NO gate timeout the reviewer measured this parked silently at now+72h.
-// The hold now carries its own bound, measured from the first recorded hold, and
-// parks WITH the cause. A test that only exercises the happy reconcile is not a
-// test of this (#1783 round-3 review, F-A).
+// The hold carries its own bound and parks WITH the cause.
+//
+// The MAGNITUDE is pinned with LITERALS. The first version derived its clock
+// from autoMergeHoldMaxWait, so a mutant widening 6h to 720h - restoring exactly
+// the unbounded wait this exists to remove - survived: a self-referential test
+// cannot fail on the value it is meant to pin (#1783 round-4 review, F-5).
 func TestPipelineAutoMergeHoldIsBoundedWithoutAGateTimeout(t *testing.T) {
 	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
 	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
@@ -308,7 +311,6 @@ func TestPipelineAutoMergeHoldIsBoundedWithoutAGateTimeout(t *testing.T) {
 		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
 		mergeResult: workflow.PipelineAutoMergeResult{Waiting: true, Reason: holdReason},
 	}
-	// The spec's merge stage sets no timeout, so only the hold's own bound applies.
 	for _, stage := range spec.Stages {
 		if stage.ID == "merge" && strings.TrimSpace(stage.Timeout) != "" {
 			t.Fatalf("fixture must have no gate timeout, got %q", stage.Timeout)
@@ -319,29 +321,238 @@ func TestPipelineAutoMergeHoldIsBoundedWithoutAGateTimeout(t *testing.T) {
 	if gate := stageRow(t, store, run.ID, "merge"); gate.State == StageBlocked {
 		t.Fatalf("the first hold must wait, not park: %+v", gate)
 	}
-	// Retries keep happening inside the bound.
-	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Hour), executor)
+	held, err := latestAutoMergeHold(context.Background(), store, sourceJobID, "0123456789abcdef")
+	if err != nil || held.at.IsZero() {
+		t.Fatalf("hold episode = %+v err=%v, want a recorded hold", held, err)
+	}
+	if held.reason != holdReason {
+		t.Fatalf("episode reason = %q, want the hold's cause", held.reason)
+	}
+
+	// Just INSIDE six hours: still waiting, and still retrying.
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, held.at.Add(6*time.Hour-time.Minute), executor)
 	if len(executor.mergeReqs) != 2 {
 		t.Fatalf("merge attempts inside the bound = %d, want 2", len(executor.mergeReqs))
 	}
 	if gate := stageRow(t, store, run.ID, "merge"); gate.State == StageBlocked {
-		t.Fatalf("a hold inside its bound must not park: %+v", gate)
+		t.Fatalf("a hold 5h59m old must not park: %+v", gate)
 	}
 
-	// Past the bound it parks, carrying the cause.
-	held, err := firstAutoMergeHoldAt(context.Background(), store, sourceJobID)
-	if err != nil || held.IsZero() {
-		t.Fatalf("first hold time = %v err=%v, want a recorded hold", held, err)
-	}
-	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, held.Add(autoMergeHoldMaxWait+time.Minute), executor)
+	// AT six hours exactly the bound applies: the comparison is >=, so the
+	// boundary itself parks.
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, held.at.Add(6*time.Hour), executor)
 	gate := stageRow(t, store, run.ID, "merge")
 	if gate.State != StageBlocked {
-		t.Fatalf("gate = %q past the hold bound, want blocked", gate.State)
+		t.Fatalf("gate = %q at exactly six hours, want blocked", gate.State)
 	}
-	for _, want := range []string{holdReason, "no gate timeout is set", autoMergeHoldMaxWait.String()} {
+	for _, want := range []string{holdReason, "no gate timeout is set", "6h0m0s"} {
 		if !strings.Contains(gate.Summary, want) {
 			t.Fatalf("park summary must contain %q: %q", want, gate.Summary)
 		}
+	}
+}
+
+// The bound is per HOLD EPISODE, not per job. One row per job meant the anchor
+// never reset: a brand-new hold hours later parked instantly and the recorded
+// cause froze at the first reason (#1783 round-4 review, F-2).
+func TestPipelineAutoMergeHoldBudgetResetsForANewEpisode(t *testing.T) {
+	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	first := "workload-mode change requires reconciliation at head 0123456 against operating-mode note 41"
+	executor := &stubPipelineAutoMerger{
+		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		mergeResult: workflow.PipelineAutoMergeResult{Waiting: true, Reason: first},
+	}
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), executor)
+	episode, err := latestAutoMergeHold(context.Background(), store, sourceJobID, "0123456789abcdef")
+	if err != nil || episode.at.IsZero() {
+		t.Fatalf("first episode = %+v err=%v", episode, err)
+	}
+
+	// Seven hours later a DIFFERENT cause holds. That is a new episode and must
+	// get its own budget rather than parking instantly on the old anchor.
+	second := "workload-mode change requires reconciliation at head 0123456 against operating-mode note 77"
+	executor.mergeResult = workflow.PipelineAutoMergeResult{Waiting: true, Reason: second}
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, episode.at.Add(7*time.Hour), executor)
+	gate := stageRow(t, store, run.ID, "merge")
+	if gate.State == StageBlocked {
+		t.Fatalf("a new hold cause must start a new budget, not park instantly: %q", gate.Summary)
+	}
+	fresh, err := latestAutoMergeHold(context.Background(), store, sourceJobID, "0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.reason != second {
+		t.Fatalf("recorded cause = %q, want the CURRENT cause, not the frozen first one", fresh.reason)
+	}
+	if !fresh.at.After(episode.at) {
+		t.Fatalf("new episode anchor %v must be later than the first %v", fresh.at, episode.at)
+	}
+
+	// And the new episode's own bound still applies six hours after IT started.
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, fresh.at.Add(6*time.Hour), executor)
+	if gate := stageRow(t, store, run.ID, "merge"); gate.State != StageBlocked {
+		t.Fatalf("gate = %q six hours into the new episode, want blocked", gate.State)
+	} else if !strings.Contains(gate.Summary, second) {
+		t.Fatalf("park summary must carry the CURRENT cause: %q", gate.Summary)
+	}
+}
+
+// THE ORDINARY PATH. ensureWorkloadModeReconciled runs in Evaluate BEFORE Merge
+// with the same inputs, so a reconciliation hold normally surfaces as
+// readiness.Waiting and never reaches the Merge-side instrumentation at all. The
+// round-4 review measured that path recording no held event, carrying no reason
+// and consulting no bound - running at now+72h with zero merge attempts, the
+// round-3 defect verbatim on the common path (F-1).
+func TestPipelineAutoMergeEvaluateSideHoldIsRecordedAndBounded(t *testing.T) {
+	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	const holdReason = "workload-mode change requires reconciliation at head 0123456 against operating-mode note 41"
+	executor := &stubPipelineAutoMerger{
+		readiness: workflow.PipelineAutoMergeReadiness{
+			Waiting: true, ReconciliationHold: true,
+			CurrentHeadSHA: "0123456789abcdef", Reason: holdReason,
+		},
+	}
+
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), executor)
+	if len(executor.mergeReqs) != 0 {
+		t.Fatalf("a not-ready readiness must not attempt a merge: %d", len(executor.mergeReqs))
+	}
+	held, err := latestAutoMergeHold(context.Background(), store, sourceJobID, "0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held.at.IsZero() || held.reason != holdReason {
+		t.Fatalf("the Evaluate-side hold was not recorded: %+v", held)
+	}
+
+	// Bounded on the same path: at six hours it parks WITH the cause.
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, held.at.Add(6*time.Hour), executor)
+	gate := stageRow(t, store, run.ID, "merge")
+	if gate.State != StageBlocked {
+		t.Fatalf("gate = %q six hours into an Evaluate-side hold, want blocked", gate.State)
+	}
+	if !strings.Contains(gate.Summary, holdReason) {
+		t.Fatalf("park summary must carry the cause: %q", gate.Summary)
+	}
+
+	// A NON-reconciliation wait (CI pending) keeps the old cheap behaviour: no
+	// hold row, no bound, so this fix cannot park a run waiting on checks.
+	store2, enqueue2, rec2, spec2, run2, sourceJobID2, now2 := prepareAutoMergeGate(t)
+	settleBoundReviewJob(t, store2, stageRow(t, store2, run2.ID, "review").JobID, "approved", "0123456789abcdef")
+	ciWait := &stubPipelineAutoMerger{
+		readiness: workflow.PipelineAutoMergeReadiness{
+			Waiting: true, CurrentHeadSHA: "0123456789abcdef",
+			Reason: "GitHub has not determined pull request mergeability yet",
+		},
+	}
+	run2 = advanceWithAutoMerge(t, store2, enqueue2, rec2, spec2, run2, now2.Add(2*time.Second), ciWait)
+	run2 = advanceWithAutoMerge(t, store2, enqueue2, rec2, spec2, run2, now2.Add(72*time.Hour), ciWait)
+	if gate := stageRow(t, store2, run2.ID, "merge"); gate.State == StageBlocked {
+		t.Fatalf("a CI wait must not be parked by the reconciliation bound: %q", gate.Summary)
+	}
+	if held, err := latestAutoMergeHold(context.Background(), store2, sourceJobID2, "0123456789abcdef"); err != nil {
+		t.Fatal(err)
+	} else if !held.at.IsZero() {
+		t.Fatalf("a CI wait must not record a reconciliation hold: %+v", held)
+	}
+}
+
+// F-3: the release runs AFTER the hold is recorded, so a lost release cannot
+// strand the run. Seeded by consuming the claim and leaving it consumed: the
+// !claimed branch must find the recorded hold and keep its bound instead of
+// waiting silently forever.
+func TestPipelineAutoMergeClaimedBranchKeepsTheRecordedBound(t *testing.T) {
+	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	const holdReason = "workload-mode change requires reconciliation at head 0123456 against operating-mode note 41"
+	executor := &stubPipelineAutoMerger{
+		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		mergeResult: workflow.PipelineAutoMergeResult{Waiting: true, Reason: holdReason},
+	}
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), executor)
+	held, err := latestAutoMergeHold(context.Background(), store, sourceJobID, "0123456789abcdef")
+	if err != nil || held.at.IsZero() {
+		t.Fatalf("hold episode = %+v err=%v", held, err)
+	}
+
+	// Simulate the lost release: re-consume the claim by hand, exactly as a
+	// failed DELETE would leave it.
+	claim, marshalErr := json.Marshal(map[string]any{
+		"phase": "claim", "pipeline": rec.Name, "run_id": run.ID,
+		"stage_id": "merge", "pull_request": 813, "head_sha": "0123456789abcdef",
+	})
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	if claimed, err := store.ClaimJobEvent(context.Background(), db.JobEvent{
+		JobID: sourceJobID, Kind: "pipeline_auto_merge_claim", Message: string(claim),
+	}); err != nil || !claimed {
+		t.Fatalf("seeding the consumed claim: claimed=%v err=%v", claimed, err)
+	}
+
+	// The !claimed branch now owns the outcome, and it must still be bounded.
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, held.at.Add(6*time.Hour), executor)
+	gate := stageRow(t, store, run.ID, "merge")
+	if gate.State != StageBlocked {
+		t.Fatalf("gate = %q with a consumed claim past the bound, want blocked rather than a silent wait", gate.State)
+	}
+	if !strings.Contains(gate.Summary, holdReason) {
+		t.Fatalf("park summary must carry the cause: %q", gate.Summary)
+	}
+}
+
+// Two scans racing the same NEW episode each write a held row, which is
+// deliberate and harmless only because the anchor takes the EARLIEST held_at:
+// anchoring on the latest would restart the budget on every duplicate and the
+// bound would never be reached (#1783 round-4 review, F-5 listed this guard as
+// unkillable - it is killable once a duplicate exists, which is the state the
+// check-then-insert race actually produces).
+func TestPipelineAutoMergeHoldAnchorsOnTheEarliestDuplicate(t *testing.T) {
+	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	const holdReason = "workload-mode change requires reconciliation at head 0123456 against operating-mode note 41"
+	executor := &stubPipelineAutoMerger{
+		readiness: workflow.PipelineAutoMergeReadiness{
+			Waiting: true, ReconciliationHold: true,
+			CurrentHeadSHA: "0123456789abcdef", Reason: holdReason,
+		},
+	}
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), executor)
+	first, err := latestAutoMergeHold(context.Background(), store, sourceJobID, "0123456789abcdef")
+	if err != nil || first.at.IsZero() {
+		t.Fatalf("first episode = %+v err=%v", first, err)
+	}
+
+	// The racing scan's row: same head and cause, a LATER held_at.
+	duplicate, marshalErr := json.Marshal(map[string]any{
+		"phase": "held", "pipeline": rec.Name, "run_id": run.ID,
+		"stage_id": "merge", "pull_request": 813, "head_sha": "0123456789abcdef",
+		"reason": holdReason, "held_at": first.at.Add(5 * time.Hour).Format(time.RFC3339Nano),
+	})
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	if err := store.AddJobEvent(context.Background(), db.JobEvent{
+		JobID: sourceJobID, Kind: "pipeline_auto_merge_held", Message: string(duplicate),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	anchored, err := latestAutoMergeHold(context.Background(), store, sourceJobID, "0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !anchored.at.Equal(first.at) {
+		t.Fatalf("anchor = %v, want the EARLIEST duplicate %v", anchored.at, first.at)
+	}
+
+	// And the bound still fires six hours after the TRUE start, not after the
+	// duplicate: anchoring late would leave this waiting.
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, first.at.Add(6*time.Hour), executor)
+	if gate := stageRow(t, store, run.ID, "merge"); gate.State != StageBlocked {
+		t.Fatalf("gate = %q six hours after the episode began, want blocked", gate.State)
 	}
 }
 

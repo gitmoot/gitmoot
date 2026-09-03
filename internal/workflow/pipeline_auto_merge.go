@@ -26,22 +26,30 @@ type PipelineAutoMergeRequest struct {
 // mergeability and checks are green; Waiting is a transient not-yet-green state;
 // Blocked is terminal for this pipeline run. Merged is idempotent success.
 type PipelineAutoMergeReadiness struct {
-	Ready          bool
-	Waiting        bool
-	Blocked        bool
-	Merged         bool
-	CurrentHeadSHA string
-	MergeCommitSHA string
-	Reason         string
+	Ready   bool
+	Waiting bool
+	// ReconciliationHold marks the Waiting state as a workload-mode
+	// reconciliation hold specifically, rather than a not-yet-green CI or
+	// mergeability wait. The pipeline records and bounds this class; instrumenting
+	// only the Merge-side hold left the ORDINARY path - Evaluate, which runs the
+	// same check first - silent, unbounded and unrecorded (#1783 round-4 review,
+	// F-1, measured at now+72h).
+	ReconciliationHold bool
+	Blocked            bool
+	Merged             bool
+	CurrentHeadSHA     string
+	MergeCommitSHA     string
+	Reason             string
 }
 
 // PipelineAutoMergeResult is the result of the single audited merge attempt.
 //
-// Waiting separates a TRANSIENT refusal from a terminal one. The pipeline folds
-// any !Merged into a blocked stage with "retry stopped", so a reconciliation
-// hold that Evaluate reports as Waiting became a terminal block when it landed
-// in the Evaluate->Merge window - the same condition, two dispositions, and the
-// worse one needed a human (#1783 review, F4).
+// Waiting separates a TRANSIENT refusal from a terminal one, and carries a
+// SAFETY PRECONDITION the pipeline relies on: Waiting means NO GitHub mutation
+// was attempted. The pipeline releases its at-most-once merge claim on a Waiting
+// return, so mapping a merge-API timeout or any post-request failure to Waiting
+// would silently convert at-most-once into at-least-once (#1783 round-4 review,
+// F-9). A refusal that may have reached GitHub must NOT set Waiting.
 type PipelineAutoMergeResult struct {
 	Merged         bool
 	Waiting        bool
@@ -117,6 +125,7 @@ func (m PipelineAutoMerger) Evaluate(ctx context.Context, request PipelineAutoMe
 		return PipelineAutoMergeReadiness{}, err
 	} else if required && !reconciled {
 		readiness.Waiting = true
+		readiness.ReconciliationHold = true
 		readiness.Reason = reason
 		return readiness, nil
 	}

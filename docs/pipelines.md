@@ -615,6 +615,15 @@ stages:
 - The source job timeline atomically records `pipeline_auto_merge_claim` before
   the write and `pipeline_auto_merge_confirmed` afterward, carrying pipeline/run,
   stage, PR, and head SHA. Racing scans that lose the claim never call merge.
+- A workload-mode reconciliation hold is a THIRD event,
+  `pipeline_auto_merge_held`, carrying the cause plus the head and the time the
+  hold began. The hold is retryable, not terminal: the gate releases its
+  at-most-once claim (safe because that refusal is returned before any GitHub
+  mutation) and re-attempts on later scans, so the reconciliation row landing
+  merges. It is also bounded — with a gate `timeout` the stage parks at that
+  timeout carrying the cause; with no `timeout` the hold parks 6h after the
+  episode began. A hold whose cause or head changes starts a new episode with a
+  fresh 6h budget.
 
 ### Orchestrate stages
 

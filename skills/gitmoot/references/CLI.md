@@ -3843,7 +3843,10 @@ the existing `allow_scheduled_writes` key. Omitting `merge` preserves human merg
 Pending checks wait; skipped/neutral check-runs pass; failures block; and zero
 external statuses/checks always block regardless of `require_external_ci`. The
 source job atomically records `pipeline_auto_merge_claim` before the write and
-`pipeline_auto_merge_confirmed` after GitHub confirms it.
+`pipeline_auto_merge_confirmed` after GitHub confirms it. A workload-mode
+reconciliation hold records `pipeline_auto_merge_held` with its cause, releases
+the claim so the merge is re-attempted when the row lands, and parks with that
+cause at the gate `timeout` or 6h after the hold began when no timeout is set.
 
 `pipeline install-defaults` installs the built-in memory pipelines
 `memory-ingest-sweep` and `memory-groom-propose`. The daemon also runs this

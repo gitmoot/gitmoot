@@ -1043,7 +1043,10 @@ Without `merge: auto`, human merge remains unchanged.
 Pending checks wait; skipped/neutral check-runs pass; failures block; and zero
 external statuses/checks always block regardless of `require_external_ci`. The
 source job event timeline atomically records `pipeline_auto_merge_claim` before
-the write and `pipeline_auto_merge_confirmed` after GitHub confirms it.
+the write and `pipeline_auto_merge_confirmed` after GitHub confirms it, plus
+`pipeline_auto_merge_held` when a workload-mode reconciliation hold parks the
+gate: that hold releases the claim and retries, and is bounded by the gate
+`timeout` or by 6h from the start of the hold episode.
 
 `pipeline add` warns (does not block) when an agent stage names an agent that does
 not exist yet; create it before the stage runs. The

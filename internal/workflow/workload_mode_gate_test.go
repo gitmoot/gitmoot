@@ -744,3 +744,168 @@ func TestWorkloadModeGateBoundaryCatchesAMalformedNoteWithNoRepoColumn(t *testin
 		t.Fatalf("another repo's repo-less malformed note must not hold this one: %q", decision.Reason.Render())
 	}
 }
+
+// The remedy must be COMPLETE, and this test applies it in the two documented
+// steps SEPARATELY. The round-4 review measured that the note alone leaves
+// merged=false, and that the earlier test masked it by filing a row at the same
+// time (F-7). It also pins patchUnavailable in BOTH directions: a hold for a
+// patch GitHub DID return must not claim the API omitted it (F-5).
+func TestWorkloadModeGateStatesTheWholeRemedyAndOnlyBlamesTheAPIWhenItIsAtFault(t *testing.T) {
+	store, gh, gate, request := newWorkloadModeGateScenario(t)
+	gh.files = []github.PullRequestFile{{Filename: "AGENTS.md"}} // patch omitted
+	insertRawOperatingMode(t, store, "gitmoot/gitmoot", "[operating-mode repo=gitmoot/gitmoot mode=PAUSED]")
+
+	first, err := gate.Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if !strings.Contains(first.Reason.Render(), "AND file an exact-head reconciliation row") {
+		t.Fatalf("the hold must name BOTH steps: %q", first.Reason.Render())
+	}
+
+	// STEP ONE ONLY: a fresh readable note. This must NOT merge by itself - that
+	// is what the incomplete remedy text implied.
+	insertOperatingModeDecision(t, store, "STEADY")
+	step1, err := gate.Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Evaluate after step one: %v", err)
+	}
+	if step1.Merged || len(gh.merges) != 0 {
+		t.Fatalf("the note alone must not clear the hold: decision=%+v merges=%d", step1, len(gh.merges))
+	}
+
+	// STEP TWO: the exact-head row. Now it merges.
+	insertRawModeReconciliation(t, store, "STEADY", "head123", "none")
+	step2, err := gate.Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Evaluate after step two: %v", err)
+	}
+	if !step2.Merged || len(gh.merges) != 1 {
+		t.Fatalf("both steps together must clear the hold: decision=%+v merges=%d reason=%q",
+			step2, len(gh.merges), step2.Reason.Render())
+	}
+
+	// A hold for a patch GitHub DID return must not blame the API.
+	other, otherGH, otherGate, otherRequest := newWorkloadModeGateScenario(t)
+	insertRawOperatingMode(t, other, "gitmoot/gitmoot", "[operating-mode repo=gitmoot/gitmoot mode=PAUSED]")
+	otherGH.files = []github.PullRequestFile{{
+		Filename: "AGENTS.md",
+		Patch:    "@@ -1 +1 @@\n-**Current mode: DRAIN.**\n+**Current mode: SOMETHING.**",
+	}}
+	held, err := otherGate.Evaluate(context.Background(), otherRequest)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if strings.Contains(held.Reason.Render(), "GitHub omitted") {
+		t.Fatalf("a returned patch must not be reported as omitted by GitHub: %q", held.Reason.Render())
+	}
+}
+
+// The scan-window notice must fire only when the window is actually FULL: a
+// mutant relaxing the condition to '>= 0' printed it on every hold and survived
+// (#1783 round-4 review, F-5).
+func TestWorkloadModeGateDoesNotClaimAFullWindowWhenItIsNot(t *testing.T) {
+	store, gh, gate, request := newWorkloadModeGateScenario(t)
+	insertOperatingModeDecision(t, store, "STEADY")
+
+	decision, err := gate.Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if decision.Merged || len(gh.merges) != 0 {
+		t.Fatalf("no row exists, so this must hold: decision=%+v merges=%d", decision, len(gh.merges))
+	}
+	if strings.Contains(decision.Reason.Render(), "may have aged out") {
+		t.Fatalf("an empty window must not be reported as full: %q", decision.Reason.Render())
+	}
+}
+
+// The lenient repo scan must cover the shapes a HAND-WRITTEN note takes. The
+// first version matched a bare `repo=x` token only, so a trailing comma or
+// spaces around `=` still let a stale row merge (#1783 round-4 review, F-6).
+func TestWorkloadModeGateBoundaryToleratesHandWrittenRepoFields(t *testing.T) {
+	for name, body := range map[string]string{
+		"trailing comma": "[operating-mode repo=gitmoot/gitmoot, mode=DRAIN urgent]",
+		"spaced equals":  "[operating-mode repo = gitmoot/gitmoot mode=DRAIN urgent]",
+		"trailing brace": "[operating-mode repo=gitmoot/gitmoot] mode=DRAIN urgent",
+	} {
+		t.Run(name, func(t *testing.T) {
+			store, gh, gate, request := newWorkloadModeGateScenario(t)
+			stale := insertRawModeReconciliation(t, store, "STEADY", "head123", "none")
+			unreadable := insertRawOperatingMode(t, store, "", body)
+
+			decision, err := gate.Evaluate(context.Background(), request)
+			if err != nil {
+				t.Fatalf("Evaluate: %v", err)
+			}
+			if decision.Merged || len(gh.merges) != 0 {
+				t.Fatalf("a repo-less malformed note must supersede the stale row: decision=%+v merges=%d reason=%q",
+					decision, len(gh.merges), decision.Reason.Render())
+			}
+			rendered := decision.Reason.Render()
+			if !strings.Contains(rendered, strconv.FormatInt(stale.ID, 10)) || !strings.Contains(rendered, strconv.FormatInt(unreadable.ID, 10)) {
+				t.Fatalf("hold must name the stale row and the note that superseded it: %q", rendered)
+			}
+		})
+	}
+
+	// Still narrow: another repo's repo-less malformed note, in the same shapes,
+	// must not hold this repository.
+	for name, body := range map[string]string{
+		"trailing comma": "[operating-mode repo=other/repo, mode=DRAIN urgent]",
+		"spaced equals":  "[operating-mode repo = other/repo mode=DRAIN urgent]",
+	} {
+		t.Run("ignores "+name, func(t *testing.T) {
+			store, gh, gate, request := newWorkloadModeGateScenario(t)
+			mode := insertOperatingModeDecision(t, store, "STEADY")
+			insertModeReconciliation(t, store, mode, "STEADY", "head123")
+			insertRawOperatingMode(t, store, "", body)
+
+			decision, err := gate.Evaluate(context.Background(), request)
+			if err != nil {
+				t.Fatalf("Evaluate: %v", err)
+			}
+			if !decision.Merged || len(gh.merges) != 1 {
+				t.Fatalf("another repo's malformed note must not hold this one: decision=%+v reason=%q",
+					decision, decision.Reason.Render())
+			}
+		})
+	}
+}
+
+// The pipeline records and bounds the RECONCILIATION class specifically, so
+// Evaluate must mark it. Without this, the class flag was set in production and
+// asserted only through a pipeline stub, so deleting the production line changed
+// no test (#1783 round-4 review, F-1's second half).
+func TestPipelineAutoMergerEvaluateMarksTheReconciliationHold(t *testing.T) {
+	store, gh, _, _ := newWorkloadModeGateScenario(t)
+	insertOperatingModeDecision(t, store, "STEADY")
+	merger := PipelineAutoMerger{Store: store, GitHub: gh}
+	request := PipelineAutoMergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, HeadSHA: "head123", Pipeline: "release", RunID: "run-1", StageID: "merge"}
+
+	readiness, err := merger.Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if !readiness.Waiting || !readiness.ReconciliationHold {
+		t.Fatalf("readiness = %+v, want a marked reconciliation hold", readiness)
+	}
+	if !strings.Contains(readiness.Reason, "requires reconciliation") {
+		t.Fatalf("readiness reason = %q", readiness.Reason)
+	}
+
+	// A NON-reconciliation wait must NOT carry the class, or the pipeline would
+	// bound CI waits too.
+	pending, pendingGH, _, _ := newWorkloadModeGateScenario(t)
+	mode := insertOperatingModeDecision(t, pending, "STEADY")
+	insertModeReconciliation(t, pending, mode, "STEADY", "head123")
+	pendingGH.pr.Mergeable = nil
+	pendingMerger := PipelineAutoMerger{Store: pending, GitHub: pendingGH}
+	pendingReadiness, err := pendingMerger.Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Evaluate (mergeability unknown): %v", err)
+	}
+	if !pendingReadiness.Waiting || pendingReadiness.ReconciliationHold {
+		t.Fatalf("a mergeability wait must not be a reconciliation hold: %+v", pendingReadiness)
+	}
+}

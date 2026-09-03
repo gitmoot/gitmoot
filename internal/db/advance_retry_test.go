@@ -7,6 +7,77 @@ import (
 	"testing"
 )
 
+// ReleaseJobEventClaim must delete EXACTLY the claim it is handed. The pipeline
+// auto-merge gate releases a claim whose write provably did not happen, and a
+// predicate that ignored the message would release a DIFFERENT run's or head's
+// claim as collateral - which the #1783 round-4 review measured as unpinned by
+// the whole internal/db and internal/pipeline suites.
+func TestReleaseJobEventClaimDeletesOnlyThatClaim(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	if err := store.CreateJob(ctx, Job{ID: "src", Agent: "w", Type: "implement", State: "succeeded", Payload: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	mine := JobEvent{JobID: "src", Kind: "pipeline_auto_merge_claim", Message: `{"head_sha":"aaa"}`}
+	theirs := JobEvent{JobID: "src", Kind: "pipeline_auto_merge_claim", Message: `{"head_sha":"bbb"}`}
+	for _, event := range []JobEvent{mine, theirs} {
+		if claimed, err := store.ClaimJobEvent(ctx, event); err != nil || !claimed {
+			t.Fatalf("seed claim %q: claimed=%v err=%v", event.Message, claimed, err)
+		}
+	}
+
+	released, err := store.ReleaseJobEventClaim(ctx, mine)
+	if err != nil || !released {
+		t.Fatalf("release = %v, err=%v", released, err)
+	}
+
+	events, err := store.ListJobEvents(ctx, "src")
+	if err != nil {
+		t.Fatal(err)
+	}
+	surviving := []string{}
+	for _, event := range events {
+		if event.Kind == "pipeline_auto_merge_claim" {
+			surviving = append(surviving, event.Message)
+		}
+	}
+	if len(surviving) != 1 || surviving[0] != theirs.Message {
+		t.Fatalf("surviving claims = %v, want only the other head's claim", surviving)
+	}
+
+	// Releasing again is a no-op rather than an error, and re-claiming works.
+	if released, err := store.ReleaseJobEventClaim(ctx, mine); err != nil || released {
+		t.Fatalf("second release = %v, err=%v; want no row removed", released, err)
+	}
+	if claimed, err := store.ClaimJobEvent(ctx, mine); err != nil || !claimed {
+		t.Fatalf("re-claim after release: claimed=%v err=%v", claimed, err)
+	}
+
+	// The KIND is part of the identity too: a same-message event of a different
+	// kind must survive a release, or releasing a claim would delete the hold
+	// record that bounds it.
+	sameMessageOtherKind := JobEvent{JobID: "src", Kind: "pipeline_auto_merge_held", Message: mine.Message}
+	if err := store.AddJobEvent(ctx, sameMessageOtherKind); err != nil {
+		t.Fatal(err)
+	}
+	if released, err := store.ReleaseJobEventClaim(ctx, mine); err != nil || !released {
+		t.Fatalf("release of the re-claimed row = %v, err=%v", released, err)
+	}
+	after, err := store.ListJobEvents(ctx, "src")
+	if err != nil {
+		t.Fatal(err)
+	}
+	heldRows := 0
+	for _, event := range after {
+		if event.Kind == "pipeline_auto_merge_held" {
+			heldRows++
+		}
+	}
+	if heldRows != 1 {
+		t.Fatalf("held rows after releasing a claim = %d, want the hold record untouched", heldRows)
+	}
+}
+
 func TestLatestAdvancementMarker(t *testing.T) {
 	store := openWorkflowTestStore(t)
 	ctx := context.Background()

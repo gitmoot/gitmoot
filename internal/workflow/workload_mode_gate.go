@@ -26,9 +26,14 @@ type modeSensitivePullRequest struct {
 	patchUnavailable bool
 }
 
-// noteConcernsRepo decides whether an UNPARSEABLE note belongs to this repo:
-// its repo column when set, else a lenient `repo=<value>` scan of the body. A
-// note that names neither is another lane's and is skipped.
+// noteConcernsRepo decides whether an UNPARSEABLE note belongs to this repo: its
+// repo column when set, else a lenient scan of the body for a repo value.
+//
+// The scan tolerates the shapes a hand-written note actually takes. The first
+// version matched only a bare `repo=<value>` token, so `repo=owner/name,` and
+// `repo = owner/name` still slipped through and a stale row merged (#1783
+// round-4 review, F-6). A note that names neither this repo nor nothing is
+// another lane's and is skipped, which is the anti-wedge narrowing.
 func noteConcernsRepo(note db.WorkflowNote, repo string) bool {
 	repo = strings.TrimSpace(repo)
 	if repo == "" {
@@ -37,13 +42,41 @@ func noteConcernsRepo(note db.WorkflowNote, repo string) bool {
 	if column := strings.TrimSpace(note.Repo); column != "" {
 		return strings.EqualFold(column, repo)
 	}
-	for _, field := range strings.Fields(note.Body) {
-		field = strings.TrimRight(field, "]")
-		if value, ok := strings.CutPrefix(field, "repo="); ok {
-			return strings.EqualFold(strings.TrimSpace(value), repo)
-		}
+	if value, ok := leadingRepoValue(note.Body); ok {
+		return strings.EqualFold(value, repo)
 	}
 	return false
+}
+
+// leadingRepoValue extracts the first repo value from a note body, tolerating
+// `repo=x`, `repo = x`, and trailing punctuation such as `,`, `;` or `]`.
+func leadingRepoValue(body string) (string, bool) {
+	fields := strings.Fields(body)
+	for i, field := range fields {
+		key, value, split := strings.Cut(field, "=")
+		if !strings.EqualFold(strings.TrimSpace(key), "repo") {
+			continue
+		}
+		if !split || strings.TrimSpace(value) == "" {
+			// `repo = x` or `repo =x`: the value is in a later field.
+			for _, next := range fields[i+1:] {
+				next = strings.TrimPrefix(strings.TrimSpace(next), "=")
+				if trimmed := trimNoteFieldValue(next); trimmed != "" {
+					return trimmed, true
+				}
+			}
+			return "", false
+		}
+		if trimmed := trimNoteFieldValue(value); trimmed != "" {
+			return trimmed, true
+		}
+		return "", false
+	}
+	return "", false
+}
+
+func trimNoteFieldValue(value string) string {
+	return strings.Trim(strings.TrimSpace(value), "],;\"'")
 }
 
 // workloadModeEnforcedOwner is the repository OWNER whose mode-marker changes
@@ -182,7 +215,11 @@ func ensureWorkloadModeReconciled(ctx context.Context, store *db.Store, gh Merge
 	// unreadable note, or a PR whose own marker is unreadable too, where nothing
 	// remains to check the row against.
 	if decision.unreadableID > 0 && strings.TrimSpace(observed.mode) == "" {
-		remedy := "correct that note, or append a fresh readable operating-mode note"
+		// The remedy must be COMPLETE. Naming only the note left an exit that does
+		// not by itself clear the hold: a fresh readable note restores a decision,
+		// and the PR still needs an exact-head reconciliation row against it
+		// (#1783 round-4 review, F-7).
+		remedy := "append a fresh readable operating-mode note AND file an exact-head reconciliation row citing it, or correct the malformed note"
 		if observed.patchUnavailable {
 			remedy = "GitHub omitted this PR's AGENTS.md patch, so the marker cannot be read here and is not the author's to fix; " + remedy
 		}

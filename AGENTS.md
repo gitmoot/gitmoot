@@ -106,14 +106,15 @@ go test -timeout 25m -skip 'TestClaudeProduceHookAutoReadLandlockE2E' ./...
 `-buildvcs=false` is required, not optional, inside a gitmoot worktree (#1209):
 Go's VCS auto-stamp only recognizes a `.git` **directory** as a repo root
 (`cmd/go/internal/vcs.vcsGit.RootNames`), but a linked worktree's `.git` is a
-**file** (a `gitdir:` pointer), so the root-detection walk-up skips the
-worktree's real root and keeps going up. What happens next depends on what the
-walk finds, and it is stated once in the deploy recipe below rather than twice
-here: see "Deploy recipe (this host)", step 1. The short version is that the
-quiet outcome is the dangerous one, not the `exit status 128` failure. This is a
-Go toolchain behavior with linked worktrees, not something gitmoot's code or
-config can fix.
-
+**file** (a `gitdir:` pointer). Go's root-detection walk-up skips past the
+worktree's real root looking for any ancestor with a `.git`-shaped directory,
+and can land on an unrelated one — hard-failing with `error obtaining VCS
+status: exit status 128` even though `git status` itself works fine from the
+same directory. This is a genuine Go toolchain limitation with linked
+worktrees (confirmed by reading `cmd/go/internal/vcs/vcs.go`'s `FromDir` /
+`isVCSRoot`), not something gitmoot's code or config can fix, and even the
+non-failing cases can silently stamp the wrong VCS metadata (wrong commit,
+wrong dirty bit) from whatever directory the walk-up happened to land on.
 Disabling it here costs nothing real: release binaries get their version
 info from the explicit `-ldflags -X ...Commit=$(git rev-parse HEAD)` recipe
 in the deploy section below, never from Go's auto-stamp.
@@ -260,53 +261,17 @@ detection.
 
 ## Deploy recipe (this host)
 
-1. On `main` after merge, build with the pinned toolchain (above), from a clean
-   detached worktree at the exact tip rather than the shared `/root/gitmoot`
-   checkout, which usually carries uncommitted work. Stamp the version the way
-   `release.yml` does, or `gitmoot version` reports `commit: unknown`.
-   `-buildvcs=false` is required for the same reason as the test gate above: in
-   a linked worktree `.git` is a **file**, which the pinned toolchain does not
-   treat as a repository root, so it walks up to the parent directories. What
-   that walk finds decides the outcome. Measured with a throwaway module on
-   go1.26.4:
-
-   - **no repository anywhere above it**: the build succeeds and simply omits
-     the stamp. This case is tolerated, not an error;
-   - **a `.git` DIRECTORY above it that git rejects as a repository**: the build
-     **fails** with `error obtaining VCS status: exit status 128`. A `.git`
-     **file** never produces this: it is skipped, and the walk continues past
-     it. This is not hypothetical here: `/tmp/.git` exists on this host as a
-     directory (`ls -A` returns nothing, and `git -C /tmp status` fails), so a
-     deploy worktree anywhere under `/tmp` hits it, and it will not be the only
-     such directory on any given host;
-   - **a working unrelated repository above it**: the build **succeeds** and
-     stamps that repository's metadata. A binary built from commit `1f76f143`
-     embedded the ancestor's `vcs.revision 60f8282c` and `vcs.modified true`.
-
-   The third case is the one to design against, because it is silent. The
-   `-ldflags` below override `Commit`, so `gitmoot version` still prints the
-   right value and the wrong stamp stays hidden in the embedded build info.
-   Drop the ldflags and `buildinfo.Current` falls back to that VCS revision
-   (`internal/buildinfo/buildinfo.go`), so an unstamped binary reports an
-   ancestor's commit as its own and the daemon build-skew check compares a
-   false identity rather than an unknown one.
-
-   Treat the `.git`-file behavior as version-specific rather than permanent:
-   Go's handling of it is being changed upstream, and `-buildvcs=false` is what
-   makes all three outcomes moot.
+1. On `main` after merge, build with the pinned toolchain (above). Stamp the
+   version the way `release.yml` does, or `gitmoot version` reports
+   `commit: unknown`:
 
    ```sh
-   git worktree add --detach /root/gitmoot-deploy "$(git rev-parse HEAD)"
-   cd /root/gitmoot-deploy
    PKG=github.com/gitmoot/gitmoot/internal/buildinfo
-   CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags \
+   CGO_ENABLED=0 go build -trimpath -ldflags \
      "-s -w -X $PKG.Version=dev-$(git rev-parse --short HEAD) \
       -X $PKG.Commit=$(git rev-parse HEAD) -X $PKG.Date=$(date -Iseconds)" \
      -o /root/.local/bin/gitmoot.new ./cmd/gitmoot
    ```
-
-   Remove the deploy worktree when the deploy is done:
-   `git worktree remove /root/gitmoot-deploy`.
 
 2. `mv`-rename the new binary into `/root/.local/bin/gitmoot` (same filesystem;
    the rename avoids `ETXTBSY`).
@@ -497,18 +462,16 @@ Under ultracode, orchestrate via the Workflow tool with opus sub-agents
 
 ## Workload mode
 
-**Current mode: THROUGHPUT.**
+**Current mode: STEADY.**
 
 A mode decision is an append-only
 `[operating-mode repo=<owner/repo> mode=<THROUGHPUT|STEADY|DRAIN>]` workflow
 note from the owner (or a coordinator acting on a recorded owner instruction).
 A PR that changes the marker above is a second materialization path, but it
-cannot invent a later decision merely by merging later. A merged marker PR takes
-effect at its `mergedAt` only after the pre-merge reconciliation below, and the
-later valid source wins. The note path's precedent is STEADY, decided by owner
-instruction in note 107313 on 2026-09-02 and since superseded; the marker above
-is whatever `origin/main:AGENTS.md` currently says, which is the only line a
-seat should trust.
+cannot invent a later decision merely by merging later. STEADY was decided by
+owner instruction in note 107313 on 2026-09-02: that is the decision's dated
+provenance, not a claim about today. Derive the ACTIVE mode as described below,
+because an id repeated in prose freezes while the ledger moves.
 
 Before a mode-marker PR is marked ready, post
 `[workload-mode-reconciliation repo=<owner/repo> pr=<number> head=<40-character-reviewed-head> mode=<mode> decision_note=<id|none>]`.
@@ -538,18 +501,53 @@ file a new exact-head row. It is a recency boundary, not a veto, so a fresh row
 that agrees with the PR's own marker still merges, and correcting the note is
 optional rather than the only exit. The gate only refuses outright when nothing
 readable remains, meaning the note is unreadable AND the PR's marker patch is
-missing or ambiguous. A reconciliation hold at the merge boundary is retryable:
-the pipeline gate RELEASES its at-most-once merge claim, records the cause as a
+missing or ambiguous, and the hold then names both steps of the exit: append a
+fresh readable operating-mode note AND file an exact-head row citing it. A
+reconciliation hold at the merge boundary is retryable: the pipeline gate
+RELEASES its at-most-once merge claim, records the cause as a
 `pipeline_auto_merge_held` job event, and re-attempts on a later scan, so the
-row landing merges. If the gate stage sets a `timeout` the park summary carries
-that cause; a stage with no timeout waits indefinitely, which is documented
-pipeline policy and is only safe because the hold retries and is recorded.
+row landing merges. It is also BOUNDED, and the bound applies on both the
+ordinary Evaluate path and the merge boundary: with a gate `timeout` the stage
+parks at that timeout carrying the cause, and with no `timeout` it parks 6h
+after the hold episode began. A hold whose cause or head changes starts a new
+episode with a fresh budget, so a later hold is never charged for an earlier
+one.
 
 Resolve the active decision from both durable sources: read the marker from
 `origin/main:AGENTS.md`, never a seat worktree, and read the newest typed
 operating-mode/reconciliation note. Decisions are ordered by `decided_at`
 (the decision row's `created_at`), not by when their materialization later
 activates. Name both sources in the handoff.
+
+DERIVE, never trust a marker id quoted in a rules file — including any id quoted
+in THIS file. Two things are separate and were conflated on 2026-09-03, at the
+cost of two coordinators reporting the wrong mode:
+
+1. THE ACTIVE MODE IS THE MARKER LINE, `**Current mode: <MODE>.**`, in
+   `origin/main:AGENTS.md`. A switch is a MERGED PR that changes that line and
+   takes effect at its `mergedAt`. Fetch `origin/main` and read it there, never
+   from a seat worktree — a seat tree can be weeks stale, and a local grep miss
+   in one is an instrument failure, not evidence the marker moved.
+2. `[operating-mode ...]` workflow notes are DECISION rows: they record who
+   decided what and when, and the reconciliation gate above uses them to bind a
+   marker-changing PR to a decision. A decision note is not itself the marker,
+   and a note cannot switch the mode without the merged line.
+
+When you do need the newest decision note, anchor on the LITERAL PREFIX and read
+that note's own body for what it supersedes and at what scope:
+
+```sql
+select id, created_at, substr(body,1,80) from workflow_notes
+where body like '[operating-mode%' order by id desc limit 5;
+```
+
+The prefix is load-bearing: `body like '%operating-mode%'` also matches every
+note that merely DISCUSSES a marker — directives, reviews, this rule's own
+commit — so it returns a confident, current-looking row that is not a decision
+at all. A ledger whose notes debate markers cannot be counted by matching marker
+text, and a heading or phrase copied from the artifact you are trying to
+discredit makes the search self-confirming: list the headings and read the
+section instead.
 
 Record every activation with:
 `[workload-mode-transition]`,
