@@ -74,6 +74,17 @@ func appendDeliveryAdapterOutput(adapter workflow.DeliveryAdapter, out io.Writer
 		}
 		a.Adapter = runtimeAdapter
 		return a, nil
+	case readOnlyRuntimeAdapter:
+		inner, err := appendDeliveryAdapterOutput(a.Adapter, out)
+		if err != nil {
+			return nil, err
+		}
+		runtimeAdapter, ok := inner.(runtime.Adapter)
+		if !ok {
+			return nil, fmt.Errorf("transcript tee returned incompatible %T read-only adapter", inner)
+		}
+		a.Adapter = runtimeAdapter
+		return a, nil
 	case runtime.CodexAdapter:
 		a.Runner = appendRuntimeOutputRunner(a.Runner, out)
 		return a, nil

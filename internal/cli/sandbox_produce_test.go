@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
@@ -18,6 +20,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/sandbox"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
+	"github.com/gitmoot/gitmoot/internal/transcript"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -115,6 +118,7 @@ type repairStateRunner struct {
 	calls               int
 	stateDir            string
 	repairStateObserved bool
+	toolCacheObserved   bool
 }
 
 func (r *repairStateRunner) Run(context.Context, string, string, ...string) (subprocess.Result, error) {
@@ -130,6 +134,9 @@ func (r *repairStateRunner) RunEnv(_ context.Context, _ string, env []string, co
 	credential := filepath.Join(stateDir, ".credentials.json")
 	if _, err := os.ReadFile(credential); err != nil {
 		return subprocess.Result{}, err
+	}
+	if cache := envValue(env, "GOCACHE"); strings.Contains(cache, filepath.Join("cache", "tools", "read-only")) {
+		r.toolCacheObserved = true
 	}
 	marker := filepath.Join(stateDir, "repair.marker")
 	switch r.calls {
@@ -640,6 +647,115 @@ func TestWorkerReadOnlyCleanupRemovesRenamedRuntimeState(t *testing.T) {
 	}
 }
 
+// streamingReviewRunner is STREAM-capable on purpose: TeeRunner writes through
+// the StreamRunner seam, so a buffered-only fake makes the retained transcript
+// look empty even when the tee composed correctly — a fixture limitation that
+// reads exactly like a lost wrapper.
+type streamingReviewRunner struct {
+	stdout string
+	env    []string
+}
+
+func (r *streamingReviewRunner) Run(ctx context.Context, dir, command string, args ...string) (subprocess.Result, error) {
+	return r.RunStream(ctx, dir, nil, command, args...)
+}
+
+func (r *streamingReviewRunner) RunEnv(ctx context.Context, dir string, env []string, command string, args ...string) (subprocess.Result, error) {
+	return r.RunEnvStream(ctx, dir, env, nil, command, args...)
+}
+
+func (r *streamingReviewRunner) RunStream(_ context.Context, _ string, out io.Writer, command string, args ...string) (subprocess.Result, error) {
+	if out != nil {
+		if _, err := io.WriteString(out, r.stdout); err != nil {
+			return subprocess.Result{}, err
+		}
+	}
+	return subprocess.Result{Command: command, Args: args, Stdout: r.stdout}, nil
+}
+
+func (r *streamingReviewRunner) RunEnvStream(ctx context.Context, dir string, env []string, out io.Writer, command string, args ...string) (subprocess.Result, error) {
+	r.env = append([]string(nil), env...)
+	return r.RunStream(ctx, dir, out, command, args...)
+}
+
+// The read-only review adapter composes a PID-capturing, env-injecting tee, so
+// the fixture must serve that combined seam or delivery fails for a reason that
+// has nothing to do with the wrappers under test.
+func (r *streamingReviewRunner) RunStreamWithPID(ctx context.Context, dir string, out io.Writer, onPID subprocess.PIDCallback, command string, args ...string) (subprocess.Result, error) {
+	if onPID != nil {
+		onPID(os.Getpid())
+	}
+	return r.RunStream(ctx, dir, out, command, args...)
+}
+
+func (r *streamingReviewRunner) RunEnvStreamWithPID(ctx context.Context, dir string, env []string, out io.Writer, onPID subprocess.PIDCallback, command string, args ...string) (subprocess.Result, error) {
+	if onPID != nil {
+		onPID(os.Getpid())
+	}
+	return r.RunEnvStream(ctx, dir, env, out, command, args...)
+}
+func (r *streamingReviewRunner) LookPath(file string) (string, error) { return file, nil }
+
+// TestWorkerReadOnlyReviewRewrapsToolCacheAndTranscript enters through the
+// queued worker path: it must retain both post-sandbox wrappers around a
+// stateful read-only adapter. Calling either helper directly would not prove
+// the production composition order.
+func TestWorkerReadOnlyReviewRewrapsToolCacheAndTranscript(t *testing.T) {
+	ctx := context.Background()
+	store, home := blockerE2EHome(t)
+	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	sourceDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(sourceDir, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"host"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime,
+		"550e8400-e29b-41d4-a716-446655440002", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	const jobID = "read-only-rewrap-review"
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: jobID, Agent: "reviewer", Action: "review", Repo: "owner/repo",
+		WorktreePath: checkout, ReadOnlySeat: true, RuntimeConfigDir: sourceDir,
+	})
+	runner := &streamingReviewRunner{
+		stdout: `{"result":"{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"reviewer adapter rewrap probe\",\"findings\":[],\"changes_made\":[],\"tests_run\":[],\"needs\":[],\"delegations\":[]}}"}`,
+	}
+	var workerOutput bytes.Buffer
+	worker := defaultJobWorker(store, &workerOutput, home)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return runtime.ClaudeAdapter{Runner: runner}, nil
+	}
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.run(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != string(workflow.JobSucceeded) {
+		t.Fatalf("review job state=%q payload=%s", stored.State, stored.Payload)
+	}
+	if cache := envValue(runner.env, "GOCACHE"); !strings.Contains(cache, filepath.Join("cache", "tools", "read-only")) {
+		t.Fatalf("GOCACHE=%q, want isolated read-only tool cache", cache)
+	}
+	if output := workerOutput.String(); strings.Contains(output, "tool cache env inject failed") || strings.Contains(output, "transcript tee build failed") {
+		t.Fatalf("worker lost a post-sandbox wrapper: %s", output)
+	}
+	log, err := os.ReadFile(transcript.JobLogPath(config.PathsForHome(home).Logs, jobID))
+	if err != nil {
+		t.Fatalf("read retained transcript: %v", err)
+	}
+	if !strings.Contains(string(log), "reviewer adapter rewrap probe") {
+		t.Fatalf("retained transcript missing delivery output: %q", log)
+	}
+}
+
 func TestForegroundReviewRuntimeStateSurvivesRepairAndCleansAtBoundary(t *testing.T) {
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
@@ -687,8 +803,13 @@ func TestForegroundReviewRuntimeStateSurvivesRepairAndCleansAtBoundary(t *testin
 	if output.Result == nil || output.Result.Decision != "approved" {
 		t.Fatalf("foreground review result = %+v, want approved", output.Result)
 	}
-	if runner.calls != 2 || !runner.repairStateObserved {
-		t.Fatalf("foreground repair calls=%d stateObserved=%v", runner.calls, runner.repairStateObserved)
+	// SCOPE, stated because it is easy to misread: toolCacheObserved pins that the
+	// Landlock wrapper delivers the isolated cache env on the FOREGROUND path. It
+	// does NOT pin the two rewrap switches — reverting those leaves this green,
+	// verified by mutation. TestWorkerReadOnlyReviewRewrapsToolCacheAndTranscript
+	// is the test that guards them.
+	if runner.calls != 2 || !runner.repairStateObserved || !runner.toolCacheObserved {
+		t.Fatalf("foreground repair calls=%d stateObserved=%v toolCacheObserved=%v", runner.calls, runner.repairStateObserved, runner.toolCacheObserved)
 	}
 	if data, err := os.ReadFile(filepath.Join(sourceDir, ".credentials.json")); err != nil || string(data) != sourceCredential {
 		t.Fatalf("shared credential changed to %q, err=%v", data, err)
