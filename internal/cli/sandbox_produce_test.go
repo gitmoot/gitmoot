@@ -164,8 +164,8 @@ func (r *repairStateRunner) RunEnv(_ context.Context, _ string, env []string, co
 func (r *repairStateRunner) LookPath(file string) (string, error) { return file, nil }
 
 type kimiHomeStateRunner struct {
-	home               string
-	credentialObserved bool
+	home                string
+	credentialObserved  bool
 	modelConfigObserved bool
 }
 
@@ -893,7 +893,7 @@ func TestStageReadOnlyRuntimeCredentialCopiesOnlyProviderSection(t *testing.T) {
 	if err := os.WriteFile(source, []byte(sourceCredential), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := stageReadOnlyRuntimeCredential(source, staged, "claudeAiOauth"); err != nil {
+	if err := stageReadOnlyRuntimeCredential(source, staged, "claudeAiOauth", nil); err != nil {
 		t.Fatal(err)
 	}
 	stagedData, err := os.ReadFile(staged)

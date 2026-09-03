@@ -572,6 +572,64 @@ Verify that `job show` still reports `succeeded`, `failed`, or `cancelled` and
 the same `payload.worktree_path`. Never remove a worktree for a blocked, queued,
 or running job; settle it first.
 
+## Read-Only Reviewer Seat Refuses To Start
+
+A read-only seat runs the runtime against an ISOLATED home rather than yours, so
+anything the runtime reads at startup must be staged into that home first. When
+a startup input is missing, Gitmoot now fails BY NAME instead of letting the
+runtime report something unrelated.
+
+Symptoms:
+
+- `read-only seat requires runtime input "config.toml", and <path> does not
+  exist` - the host profile has no such file. This is a HARD PREREQUISITE for
+  kimi: `~/.kimi-code/config.toml` must exist on the host, or the seat cannot
+  start. Previously this surfaced as "No model configured" behind an auth
+  message that pointed at `kimi login`, which cannot fix it.
+- `runtime input "<path>" must be a regular file` - the path is a directory,
+  socket, device or fifo. A SYMLINK is fine and is followed, so a
+  stow/chezmoi-managed profile works; a symlink whose target is missing counts
+  as missing, and a symlink to a directory is refused.
+- `read-only seat credential <path> is unusable: claudeAiOauth expired at
+  <time> and carries no refreshToken` - the profile stages and parses but cannot
+  authenticate. Re-authenticate the host claude profile. An expired token WITH a
+  refresh token is accepted, because refreshing it is the runtime's job.
+- `narrow runtime input "<path>": codex config.toml has a section header that is
+  not readable` - the file has a section header that never closes, so Gitmoot
+  cannot locate the credentials it must strip. It refuses rather than stage a
+  file it cannot classify. Fix the TOML or remove it from the host state dir.
+
+What the seat stages, per runtime:
+
+| runtime | staged from | inputs |
+| --- | --- | --- |
+| claude | `~/.claude` | `.credentials.json`, narrowed to `claudeAiOauth` and checked for usability. Nothing is staged in gateway mode, where the gateway supplies the credential. |
+| codex | `~/.codex` | `auth.json`, plus `config.toml` when present - NARROWED, see below |
+| kimi | `~/.kimi-code` | `config.toml` (REQUIRED), `credentials/kimi-code.json` |
+
+### Why the staged codex config.toml is not a copy
+
+The seat's staged state lives inside the one writable path granted to the
+sandbox, so a reviewer can read anything placed there. A codex `config.toml`
+routinely carries credentials that have nothing to do with running the model, so
+Gitmoot narrows it before staging:
+
+- `[mcp_servers.*]` is dropped ENTIRELY. Its `env` table holds tokens, `args`
+  can hold them just as easily, and a read-only reviewer seat has no business
+  spawning third-party servers. MCP servers are optional to codex, so dropping
+  them cannot stop the seat starting.
+- `[model_providers.*]` KEEPS its structure and loses only `api_key` and
+  `http_headers`. Dropping the section would look stricter and would break a
+  custom `model`, because removing `base_url` and `wire_api` makes the provider
+  unresolvable. `env_key` and `env_http_headers` name environment variables
+  rather than hold values, so they stay.
+- Everything else is kept: those are the model and sandbox settings the file is
+  staged for.
+
+Dotted and quoted forms are classified the same way, so
+`mcp_servers.github.env.TOKEN = "..."` at the top level and
+`[mcp_servers."my server".env]` are both dropped.
+
 ## Isolated worktrees duplicate gigabytes of tool cache
 
 An isolated-worktree job re-materializing its own `uv`/`go`/`npm`/`pip` cache
