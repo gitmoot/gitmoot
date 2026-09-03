@@ -265,24 +265,32 @@ detection.
    checkout, which usually carries uncommitted work. Stamp the version the way
    `release.yml` does, or `gitmoot version` reports `commit: unknown`.
    `-buildvcs=false` is required for the same reason as the test gate above: in
-   a linked worktree `.git` is a **file**, which Go never accepts as a
-   repository root, so it walks up to the parent directories. Both outcomes of
-   that walk are wrong, and only one of them is loud:
+   a linked worktree `.git` is a **file**, which the pinned toolchain does not
+   treat as a repository root, so it walks up to the parent directories. What
+   that walk finds decides the outcome. Measured with a throwaway module on
+   go1.26.4:
 
-   - no repository above the worktree: the build **fails** with
-     `error obtaining VCS status: exit status 128`;
-   - an unrelated repository above it: the build **succeeds** and stamps that
-     repository's metadata. Measured on this host with a throwaway module: a
-     binary built from commit `03cf3963` embedded the ancestor's
-     `vcs.revision 866bf37b` and `vcs.modified true`.
+   - **no repository anywhere above it**: the build succeeds and simply omits
+     the stamp. This case is tolerated, not an error;
+   - **a `.git` that is not a valid repository**: the build **fails** with
+     `error obtaining VCS status: exit status 128`. This is not hypothetical
+     here: `/tmp/.git` exists on this host as an empty directory, so a deploy
+     worktree anywhere under `/tmp` hits it;
+   - **a working unrelated repository above it**: the build **succeeds** and
+     stamps that repository's metadata. A binary built from commit `1f76f143`
+     embedded the ancestor's `vcs.revision 60f8282c` and `vcs.modified true`.
 
-   The silent case is the one to design against. The `-ldflags` below override
-   `Commit`, so `gitmoot version` still prints the right value and the wrong
-   stamp stays hidden in the embedded build info. Drop the ldflags and
-   `buildinfo.Current` falls back to that VCS revision
-   (`internal/buildinfo/buildinfo.go`), so an unstamped binary reports the
+   The third case is the one to design against, because it is silent. The
+   `-ldflags` below override `Commit`, so `gitmoot version` still prints the
+   right value and the wrong stamp stays hidden in the embedded build info.
+   Drop the ldflags and `buildinfo.Current` falls back to that VCS revision
+   (`internal/buildinfo/buildinfo.go`), so an unstamped binary reports an
    ancestor's commit as its own and the daemon build-skew check compares a
    false identity rather than an unknown one.
+
+   Treat the `.git`-file behavior as version-specific rather than permanent:
+   Go's handling of it is being changed upstream, and `-buildvcs=false` is what
+   makes all three outcomes moot.
 
    ```sh
    git worktree add --detach /root/gitmoot-deploy "$(git rev-parse HEAD)"
