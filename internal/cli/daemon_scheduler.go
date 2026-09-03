@@ -2132,6 +2132,26 @@ func runQueuedJobsForRepoPool(ctx context.Context, worker jobWorker, limit int, 
 	return runQueuedJobsForRepoPoolTracked(ctx, worker, limit, limit, repoFilter, rootFilter, nil)
 }
 
+// poolRequeryInterval bounds how long a LIVE pool pass may wait on a job
+// completion before looking at the queue again. It exists because a pass that
+// only wakes on completions cannot see work enqueued after it parked, and the
+// single-flight guard forbids a replacement pass while it lives.
+//
+// Two seconds: a queued job's worst-case invisibility becomes a bound the
+// operator can state instead of "however long the longest running job takes"
+// (measured starvation before the bound: 22m42s and 27m40s). It costs at most
+// one listPendingQueuedJobs per 2s per repo that has work IN FLIGHT and nothing
+// dispatchable — the empty-queue path never reaches here, because `running == 0
+// && dispatched == 0` returns above. A var, not a const, so tests can shorten
+// it; production never reassigns it.
+var poolRequeryInterval = 2 * time.Second
+
+// poolRequeryObserver is a test hook fired when the bound (rather than a job
+// completion) wakes the pass. nil in production. It lets a test distinguish
+// "re-queries on the bound" from "re-queries in a tight loop", which a
+// wall-clock assertion cannot.
+var poolRequeryObserver func()
+
 // poolDispatchSlots is a pool pass's dispatch budget: the repo's free slots,
 // clamped by the host-global remainder (hostCap − tracked in-flight across ALL
 // repos) so concurrent per-repo passes never exceed the daemon-wide cap. With a
@@ -2433,9 +2453,30 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 			continue
 		}
 		if dispatched == 0 {
-			// No progress is possible until a running worker frees a resource; block
-			// for one, then re-query (which may now include newly-queued jobs).
-			reap(<-done)
+			// A job newly enqueued for this repo is progress that IS possible, and
+			// a pass parked on `done` cannot see it: the old blind receive only
+			// woke on a COMPLETION. That starved every later arrival for the
+			// running job's remaining lifetime (measured: 22m42s and 27m40s waits
+			// for a 3-second stage), and no replacement pass can cover for it
+			// because this one still holds poolRuns[repo] via tryBeginPool while
+			// the `running == 0` return above keeps it alive. Worse, it made the
+			// owner-configured per-agent max_background unreachable for a second
+			// same-repo job. So wake on a completion OR the re-query bound,
+			// whichever comes first, and let the top of the loop re-query.
+			//
+			// Single-flight is untouched: the same dispatcher goroutine simply
+			// looks again sooner, so no second selector exists and no two jobs
+			// can be dispatched onto one checkout key.
+			timer := time.NewTimer(poolRequeryInterval)
+			select {
+			case f := <-done:
+				timer.Stop()
+				reap(f)
+			case <-timer.C:
+				if poolRequeryObserver != nil {
+					poolRequeryObserver()
+				}
+			}
 		}
 	}
 }
