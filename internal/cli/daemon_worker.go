@@ -1897,6 +1897,14 @@ func produceRuntimeSandboxGrants(runtimeName string, runtimeStateDir string, rea
 		// lets a job mutate operator credentials. Stage the account into a
 		// job-private profile, point the runtime at that copy, and never expose
 		// the operator profile to the sandbox at all.
+		//
+		// PRECONDITION, because this is a property of the sandbox and not of
+		// these grants: produce runs with implicit write roots, so
+		// sandbox.writableRoots also grants the workdir, os.TempDir() and /tmp
+		// (exec_linux.go). A profile placed UNDER one of those roots stays
+		// writable no matter what this function grants - Landlock adds access,
+		// it cannot subtract it. Not naming the profile here is necessary and
+		// not sufficient; keeping operator profiles out of tmp is the other half.
 		configDir, err := resolveRuntimeConfigDir(runtime.ClaudeRuntime, os.Getenv("CLAUDE_CONFIG_DIR"))
 		if err != nil {
 			return nil, nil, nil, nil, err

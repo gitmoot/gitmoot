@@ -458,8 +458,9 @@ Fixes:
   stages the configured account (`CLAUDE_CONFIG_DIR`, else `~/.claude`) into a
   job-private profile, points the runtime's `CLAUDE_CONFIG_DIR` and
   `XDG_CACHE_HOME` at that job-private state root under
-  `<gitmoot home>/cache/produce-runtime/<hash>/`, and removes the root when the
-  job finishes. The operator profile is never granted writable and is never
+  `<gitmoot home>/cache/produce-runtime/<hash>/run-*/` - one directory per
+  dispatch, so two concurrent runs of one job id cannot wipe each other - and
+  removes that directory when the job finishes. The operator profile is never granted writable and is never
   exposed to the sandbox, so a token the runtime refreshes mid-job lands in the
   discarded copy: re-login on the host, not in the job. A configured profile
   that does not exist yet is valid and starts the job with an empty one.
