@@ -471,7 +471,20 @@ func runOrgSeatRemove(args []string, stdout, stderr io.Writer) int {
 				)
 				return 1
 			}
-			writeLine(stdout, "org seat rm: %s pane check skipped under --force: %s", role.Name, unresolvedDetail)
+			risk := "a stale binding may still name a LIVE pane whose work was not inspected"
+			if binding.Ambiguous {
+				var paneIDs []string
+				for _, candidate := range snapshot.Panes {
+					if candidate.PaneID != "" && candidate.Label == strings.TrimSpace(role.Pane) {
+						paneIDs = append(paneIDs, candidate.PaneID)
+					}
+				}
+				sort.Strings(paneIDs)
+				if len(paneIDs) != 0 {
+					risk = fmt.Sprintf("matching LIVE panes %s may still hold work that was not inspected", strings.Join(paneIDs, ", "))
+				}
+			}
+			writeLine(stdout, "org seat rm: %s pane check skipped under --force: %s; %s", role.Name, unresolvedDetail, risk)
 		} else if pane, ok = orgSeatPaneByID(snapshot.Panes, binding.PaneID); !ok {
 			fmt.Fprintf(stderr, "org seat rm: resolved pane %s is absent from the live snapshot\n", binding.PaneID)
 			return 1

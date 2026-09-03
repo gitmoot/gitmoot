@@ -1459,10 +1459,10 @@ matching label binding, or replaces a non-empty binding only when its former
 target no longer resolves. It does not rewrite existing policy or duplicate
 routes.
 
-`gitmoot org seat rm <name> [--home DIR]` resolves the role's live pane when it
-has a binding and checks every distinct Git checkout reported by that pane's
-`cwd` and `foreground_cwd`. It refuses a dirty checkout or a branch whose `HEAD`
-is not merged into the locally known `origin/HEAD` (falling back to
+`gitmoot org seat rm <name> [--force] [--home DIR]` resolves the role's live pane
+when it has a binding and checks every distinct Git checkout reported by that
+pane's `cwd` and `foreground_cwd`. It refuses a dirty checkout or a branch whose
+`HEAD` is not merged into the locally known `origin/HEAD` (falling back to
 `origin/main`); unreadable branch state also fails closed. A safe removal deletes
 the role and all of its wake routes, closes a resolved live pane, and validates
 that the role, routes, and closed pane are absent. A role with no configured
@@ -1471,6 +1471,20 @@ its routes. A configured binding that is stale, absent, or ambiguous fails
 closed before mutation and reports the `org seat add` rebind command. A provider
 error for a configured binding also fails closed. Roles that still parent
 another role cannot be removed.
+
+`--force` retires a seat whose configured pane will never resolve again, which
+is otherwise unreachable: rebinding is impossible when the pane is gone, so the
+role and its wake routes cannot be deleted at all. Per #1175 an unbound role is
+a defect with two remedies, bind it or remove it, and `--force` is the second
+one. It applies ONLY to an unresolved binding, and the removal prints
+`pane check skipped under --force` with the reason the binding did not resolve.
+A stale id may still name a LIVE pane holding work that the check cannot
+inspect, so forcing a stale binding asserts that pane is gone. An ambiguous
+label warning names every matching live pane ID; removal does not guess which
+one belongs to the role and therefore closes none of them. Inspect or close
+those panes separately before forcing the removal. `--force` does not weaken
+anything else: a pane that DOES resolve is still refused when its branch check
+fails, and a provider error still fails closed rather than being forced through.
 
 The five provisioned routes are enabled, addressed, and have an empty match
 filter. Remove one by its stable ID with `org events rule rm` to quiet that kind;
