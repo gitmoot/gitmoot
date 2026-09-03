@@ -106,15 +106,14 @@ go test -timeout 25m -skip 'TestClaudeProduceHookAutoReadLandlockE2E' ./...
 `-buildvcs=false` is required, not optional, inside a gitmoot worktree (#1209):
 Go's VCS auto-stamp only recognizes a `.git` **directory** as a repo root
 (`cmd/go/internal/vcs.vcsGit.RootNames`), but a linked worktree's `.git` is a
-**file** (a `gitdir:` pointer). Go's root-detection walk-up skips past the
-worktree's real root looking for any ancestor with a `.git`-shaped directory,
-and can land on an unrelated one — hard-failing with `error obtaining VCS
-status: exit status 128` even though `git status` itself works fine from the
-same directory. This is a genuine Go toolchain limitation with linked
-worktrees (confirmed by reading `cmd/go/internal/vcs/vcs.go`'s `FromDir` /
-`isVCSRoot`), not something gitmoot's code or config can fix, and even the
-non-failing cases can silently stamp the wrong VCS metadata (wrong commit,
-wrong dirty bit) from whatever directory the walk-up happened to land on.
+**file** (a `gitdir:` pointer), so the root-detection walk-up skips the
+worktree's real root and keeps going up. What happens next depends on what the
+walk finds, and it is stated once in the deploy recipe below rather than twice
+here: see "Deploy recipe (this host)", step 1. The short version is that the
+quiet outcome is the dangerous one, not the `exit status 128` failure. This is a
+Go toolchain behavior with linked worktrees, not something gitmoot's code or
+config can fix.
+
 Disabling it here costs nothing real: release binaries get their version
 info from the explicit `-ldflags -X ...Commit=$(git rev-parse HEAD)` recipe
 in the deploy section below, never from Go's auto-stamp.
@@ -272,10 +271,13 @@ detection.
 
    - **no repository anywhere above it**: the build succeeds and simply omits
      the stamp. This case is tolerated, not an error;
-   - **a `.git` that is not a valid repository**: the build **fails** with
-     `error obtaining VCS status: exit status 128`. This is not hypothetical
-     here: `/tmp/.git` exists on this host as an empty directory, so a deploy
-     worktree anywhere under `/tmp` hits it;
+   - **a `.git` DIRECTORY above it that git rejects as a repository**: the build
+     **fails** with `error obtaining VCS status: exit status 128`. A `.git`
+     **file** never produces this: it is skipped, and the walk continues past
+     it. This is not hypothetical here: `/tmp/.git` exists on this host as a
+     directory (`ls -A` returns nothing, and `git -C /tmp status` fails), so a
+     deploy worktree anywhere under `/tmp` hits it, and it will not be the only
+     such directory on any given host;
    - **a working unrelated repository above it**: the build **succeeds** and
      stamps that repository's metadata. A binary built from commit `1f76f143`
      embedded the ancestor's `vcs.revision 60f8282c` and `vcs.modified true`.
