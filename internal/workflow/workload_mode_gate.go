@@ -142,16 +142,32 @@ func ensureWorkloadModeReconciled(ctx context.Context, store *db.Store, gh Merge
 	// id==0, which dropped the supersession check AND made decision_note=none
 	// satisfiable by a row written before the owner decided — the same fail-open
 	// corner the repo-scoped SQL closed, reachable through a typo instead of a
-	// truncated window (#1783 review, F1). Hold and name the note to fix.
-	if decision.unreadableID > 0 {
+	// truncated window (#1783 review, F1).
+	//
+	// It must not WEDGE a PR either, which is what directive 110704 asked me to
+	// check. Holding unconditionally meant one malformed note froze every
+	// mode-marker PR in the repo until someone edited an append-only journal, and
+	// the coordinator's remedy — write a fresh exact-head row — did nothing. So an
+	// unreadable note is a RECENCY BOUNDARY, not a veto: a row filed AFTER it,
+	// which is a coordinator asserting the current head against a decision they
+	// can see, still reconciles. Only two states hold: no row newer than the
+	// unreadable note, or a PR whose own marker is unreadable too, where nothing
+	// remains to check the row against.
+	if decision.unreadableID > 0 && strings.TrimSpace(observed.mode) == "" {
 		return true, false, fmt.Sprintf(
-			"workload-mode change cannot be reconciled: operating-mode note %d %s, so the current decision is unknown; correct that note",
+			"workload-mode change cannot be reconciled: operating-mode note %d %s and this PR's own mode marker is missing or ambiguous, so no readable decision remains; correct that note or the marker",
 			decision.unreadableID, decision.unreadableWhy,
 		), nil
 	}
 	expectedMode := strings.ToUpper(strings.TrimSpace(observed.mode))
 	if expectedMode == "" && decision.id > 0 {
 		expectedMode = decision.mode
+	}
+	// supersededBy is the note a row must be newer than: the newest readable
+	// decision, or an unreadable one, whichever is later.
+	supersededBy := decision.id
+	if decision.unreadableID > supersededBy {
+		supersededBy = decision.unreadableID
 	}
 	decisionID := "none"
 	if decision.id > 0 {
@@ -202,17 +218,29 @@ func ensureWorkloadModeReconciled(ctx context.Context, store *db.Store, gh Merge
 			nearMiss = fmt.Sprintf("; row %d declares mode=%q, which is not a workload mode", note.ID, fields["mode"])
 			continue
 		}
+		// The row must reconcile the mode the PR ADDS. On the decision_note=none
+		// path this is the only binding constraint, so without it a PR-sourced row
+		// could ratify a marker change it disagreed with (#1783 review, F5a).
 		if expectedMode != "" && mode != expectedMode {
 			nearMiss = fmt.Sprintf("; row %d reconciles mode=%s but the PR changes the marker to %s", note.ID, mode, expectedMode)
 			continue
 		}
-		if decision.id > 0 && note.ID <= decision.id {
-			nearMiss = fmt.Sprintf("; row %d predates operating-mode note %d, so it reconciles a superseded decision", note.ID, decision.id)
+		if supersededBy > 0 && note.ID <= supersededBy {
+			if decision.unreadableID == supersededBy {
+				nearMiss = fmt.Sprintf("; row %d predates operating-mode note %d, which %s, so file a new exact-head row acknowledging it", note.ID, supersededBy, decision.unreadableWhy)
+			} else {
+				nearMiss = fmt.Sprintf("; row %d predates operating-mode note %d, so it reconciles a superseded decision", note.ID, supersededBy)
+			}
 			continue
 		}
 		cited := strings.TrimSpace(fields["decision_note"])
 		if cited == "none" {
 			// PR-sourced: this PR is the decision, so no earlier note must agree.
+			return true, true, "", nil
+		}
+		// A row may cite the unreadable note itself: it names what the coordinator
+		// saw, and the mode check above already bound it to the PR's marker.
+		if decision.unreadableID > 0 && cited == strconv.FormatInt(decision.unreadableID, 10) {
 			return true, true, "", nil
 		}
 		if cited != decisionID {

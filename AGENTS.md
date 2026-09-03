@@ -531,11 +531,16 @@ Enforcement is keyed on the repository OWNER, so every `gitmoot/*` repo is held
 until a row exists, human-requested merges included. Repository names are
 compared case-insensitively on every stream, so a note recorded as
 `Gitmoot/gitmoot` still counts. A newest operating-mode note that cannot be
-read — a malformed field list, or a `mode` that is not a workload mode — HOLDS
-the PR and names that note, because an unreadable decision is not the absence of
-one; correct the note rather than adding a row. And a reconciliation hold at the
-merge boundary is retryable, not terminal: the pipeline gate keeps waiting until
-the row lands or the gate times out.
+read — a malformed field list, or a `mode` that is not a workload mode —
+SUPERSEDES like any other decision instead of reading as no decision: a row
+filed before it no longer reconciles, and the hold names the note and says to
+file a new exact-head row. It is a recency boundary, not a veto, so a fresh row
+that agrees with the PR's own marker still merges, and correcting the note is
+optional rather than the only exit. The gate only refuses outright when nothing
+readable remains, meaning the note is unreadable AND the PR's marker patch is
+missing or ambiguous. And a reconciliation hold at the merge boundary is
+retryable, not terminal: the pipeline gate keeps waiting until the row lands or
+the gate times out.
 
 Resolve the active decision from both durable sources: read the marker from
 `origin/main:AGENTS.md`, never a seat worktree, and read the newest typed

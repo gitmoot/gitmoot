@@ -554,3 +554,87 @@ func TestWorkloadModeGateHoldNamesAMisfiledReconciliationRow(t *testing.T) {
 		t.Fatalf("hold must name the misfiled row and the repo it was recorded under: %q", rendered)
 	}
 }
+
+// Directive 110704 asked whether the fail-closed rule can WEDGE a legitimately
+// reconciled PR. Holding unconditionally did: one malformed note froze every
+// mode-marker PR in the repo until someone edited an append-only journal, and
+// the coordinator's own remedy - a fresh exact-head row - could not clear it.
+// An unreadable note is therefore a RECENCY BOUNDARY, not a veto.
+func TestWorkloadModeGateUnreadableDecisionIsABoundaryNotAWedge(t *testing.T) {
+	t.Run("a row filed after the unreadable note reconciles", func(t *testing.T) {
+		store, gh, gate, request := newWorkloadModeGateScenario(t)
+		insertRawOperatingMode(t, store, "gitmoot/gitmoot", "[operating-mode repo=gitmoot/gitmoot mode=DRAIN urgent]")
+		// The PR's marker adds STEADY, and the row agrees with the PR.
+		insertRawModeReconciliation(t, store, "STEADY", "head123", "none")
+
+		decision, err := gate.Evaluate(context.Background(), request)
+		if err != nil {
+			t.Fatalf("Evaluate: %v", err)
+		}
+		if !decision.Merged || len(gh.merges) != 1 {
+			t.Fatalf("a fresh row must clear an unreadable note: decision=%+v merges=%d reason=%q",
+				decision, len(gh.merges), decision.Reason.Render())
+		}
+	})
+
+	t.Run("a row citing the unreadable note reconciles", func(t *testing.T) {
+		store, gh, gate, request := newWorkloadModeGateScenario(t)
+		unreadable := insertRawOperatingMode(t, store, "gitmoot/gitmoot", "[operating-mode repo=gitmoot/gitmoot mode=PAUSED]")
+		insertRawModeReconciliation(t, store, "STEADY", "head123", strconv.FormatInt(unreadable.ID, 10))
+
+		decision, err := gate.Evaluate(context.Background(), request)
+		if err != nil {
+			t.Fatalf("Evaluate: %v", err)
+		}
+		if !decision.Merged || len(gh.merges) != 1 {
+			t.Fatalf("a row naming the unreadable note must reconcile: decision=%+v merges=%d reason=%q",
+				decision, len(gh.merges), decision.Reason.Render())
+		}
+	})
+
+	t.Run("a row that predates the unreadable note is held and told what to do", func(t *testing.T) {
+		store, gh, gate, request := newWorkloadModeGateScenario(t)
+		stale := insertRawModeReconciliation(t, store, "STEADY", "head123", "none")
+		unreadable := insertRawOperatingMode(t, store, "gitmoot/gitmoot", "[operating-mode repo=gitmoot/gitmoot mode=PAUSED]")
+
+		decision, err := gate.Evaluate(context.Background(), request)
+		if err != nil {
+			t.Fatalf("Evaluate: %v", err)
+		}
+		if decision.Merged || len(gh.merges) != 0 {
+			t.Fatalf("a row older than the unreadable note must not reconcile: decision=%+v merges=%d", decision, len(gh.merges))
+		}
+		rendered := decision.Reason.Render()
+		for _, want := range []string{
+			strconv.FormatInt(stale.ID, 10),
+			strconv.FormatInt(unreadable.ID, 10),
+			"file a new exact-head row",
+		} {
+			if !strings.Contains(rendered, want) {
+				t.Fatalf("hold must name both notes and the remedy %q: %q", want, rendered)
+			}
+		}
+	})
+
+	t.Run("an unreadable note plus an unreadable marker is genuinely unknowable", func(t *testing.T) {
+		store, gh, gate, request := newWorkloadModeGateScenario(t)
+		gh.files = []github.PullRequestFile{{
+			Filename: "AGENTS.md",
+			Patch:    "@@ -1 +1 @@\n-**Current mode: DRAIN.**\n+**Current mode: SOMETHING.**",
+		}}
+		unreadable := insertRawOperatingMode(t, store, "gitmoot/gitmoot", "[operating-mode repo=gitmoot/gitmoot mode=PAUSED]")
+		insertRawModeReconciliation(t, store, "STEADY", "head123", "none")
+
+		decision, err := gate.Evaluate(context.Background(), request)
+		if err != nil {
+			t.Fatalf("Evaluate: %v", err)
+		}
+		if decision.Merged || len(gh.merges) != 0 {
+			t.Fatalf("nothing readable remains, so the gate must hold: decision=%+v merges=%d", decision, len(gh.merges))
+		}
+		rendered := decision.Reason.Render()
+		if !strings.Contains(rendered, strconv.FormatInt(unreadable.ID, 10)) || !strings.Contains(rendered, "no readable decision remains") {
+			t.Fatalf("hold must say why nothing can be checked: %q", rendered)
+		}
+	})
+}
