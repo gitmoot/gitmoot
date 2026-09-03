@@ -525,39 +525,25 @@ const (
 	reviewHeadResyncRefusedEvent = "review_head_resync_refused"
 )
 
-// normalizeCommitSHA renders a recorded SHA in the form git reports one, so a
-// payload head and a `rev-parse HEAD` result are compared as commits rather than
-// as raw strings.
-func normalizeCommitSHA(sha string) string {
-	return strings.ToLower(strings.TrimSpace(sha))
-}
-
-// commitSHAAbbreviation reports whether short could be a hex abbreviation of long
-// (both already normalized). It is only a cheap pre-filter that avoids a pointless
-// subprocess: git's rev-parse is the authority on what an abbreviation actually
-// resolves to, and the caller requires that resolution to equal the SAME 40-char
-// head the checkout reports. Seven is git's conventional abbreviation length and
-// the floor accepted here; recorded review heads are 12 or 40 hex characters.
-func commitSHAAbbreviation(short, long string) bool {
-	if len(short) < 7 || len(short) >= len(long) {
-		return false
+// resolvedCommitID returns the 40-character object id git resolves rev to, or ""
+// when this repository cannot resolve it to a commit. The rev is handed to git
+// VERBATIM: this code must never interpret the spelling of a revision, so it is
+// not lowercased, length-tested, or hex-tested. Lowercasing here is what
+// previously broke "HEAD" (git rejects "head"), and every shape test that stood in
+// for identity produced a false movement claim for some other spelling of the same
+// commit (#1561).
+//
+// The "^{commit}" peel is what makes the resolution VERIFIED rather than merely
+// syntactic: plain `rev-parse <40 hex>` echoes a well-formed SHA back even when
+// the object is absent, so an unfetched or garbage-collected head would look
+// resolved and reach the ancestry comparison, which is the one place that must
+// only ever see object ids present here.
+func resolvedCommitID(ctx context.Context, git gitutil.Client, rev string) string {
+	resolved, err := git.RevParse(ctx, rev+"^{commit}")
+	if err != nil {
+		return ""
 	}
-	if !isHexSHA(short) || !isHexSHA(long) {
-		return false
-	}
-	return strings.HasPrefix(long, short)
-}
-
-func isHexSHA(sha string) bool {
-	if sha == "" {
-		return false
-	}
-	for _, c := range sha {
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return false
-		}
-	}
-	return true
+	return strings.TrimSpace(resolved)
 }
 
 // resyncReviewHead handles #684 head-SHA drift for a PR review job. A review is
@@ -633,54 +619,73 @@ func (w jobWorker) resyncReviewHeadForRunner(ctx context.Context, job db.Job, pa
 	if err != nil {
 		return false, err
 	}
-	head = normalizeCommitSHA(head)
-	dispatched := normalizeCommitSHA(payload.HeadSHA)
-	if head == "" || dispatched == "" {
+	head = strings.TrimSpace(head)
+	dispatchedRev := strings.TrimSpace(payload.HeadSHA)
+	if head == "" || dispatchedRev == "" {
 		// Nothing to re-target to, or nothing to re-target FROM; let the caller's
 		// existing path handle it.
 		return false, nil
 	}
-	if strings.TrimSpace(payload.HeadSHA) == head {
+	if dispatchedRev == head {
 		// Already recorded exactly; there is nothing to write.
 		return false, nil
 	}
-	// A dispatched head that names the SAME commit as the checkout head is not a
-	// re-target in any direction, however it was written down: a differently-cased
-	// 40-char SHA and a 12-char abbreviation are both the identical commit. Only the
-	// recorded FORM differs, so the payload is normalized and the review proceeds
-	// exactly as it does today, but it is never counted as a re-sync — miscounting
-	// these is what inflated, and then retracted, #1561's headline.
-	sameCommit := dispatched == head
-	if !sameCommit && commitSHAAbbreviation(dispatched, head) {
-		// rev-parse is the authority on what an abbreviation resolves to; a prefix
-		// that does not resolve here, or resolves to a different commit, is not
-		// provably the same commit and goes through the ancestry gate instead.
-		if resolved, resolveErr := git.RevParse(ctx, dispatched); resolveErr == nil && normalizeCommitSHA(resolved) == head {
-			sameCommit = true
-		}
+	// IDENTITY IS DECIDED BY RESOLUTION, NEVER BY SHAPE. The dispatched rev and the
+	// checkout head are compared as the 40-character object ids git resolves them
+	// to, so no spelling of one commit can be mistaken for a different commit:
+	// "8aaa1b", "<sha>^0", "feat/x", "HEAD", a 12-char abbreviation and a
+	// differently-cased 40-char SHA are all the same comparison. Three rounds of
+	// this fix enumerated spellings instead (a prefix test, then a case test) and
+	// each time another spelling reached the ancestry gate, where a commit is its
+	// own ancestor and a head that NEVER MOVED was recorded as a fast-forward
+	// re-sync. A rev that git cannot resolve is not identity; it goes to the
+	// ancestry gate below.
+	dispatched := head
+	if !strings.EqualFold(dispatchedRev, head) {
+		// Cheap path only: two 40-char spellings of one id need no subprocess. Every
+		// other rev is resolved by git, which this path can afford — it is reached
+		// only after a head mismatch already failed the pre-flight.
+		dispatched = resolvedCommitID(ctx, git, dispatchedRev)
 	}
-	if sameCommit {
+	if dispatched == head {
 		if err := w.persistReviewHead(ctx, job, payload, head); err != nil {
 			return false, err
 		}
 		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{
 			JobID: job.ID,
 			Kind:  reviewHeadNormalizedEvent,
-			Message: fmt.Sprintf("PR #%d dispatched head %s and checkout head %s are the SAME commit; recording the canonical SHA, not re-targeting the review",
-				payload.PullRequest, dispatched, head),
+			Message: fmt.Sprintf("PR #%d dispatched head %s resolves to checkout head %s — the SAME commit; recording the canonical SHA, not re-targeting the review",
+				payload.PullRequest, dispatchedRev, head),
 		}); eventErr != nil {
 			return false, eventErr
 		}
-		writeLine(w.Stdout, "job %s review head %s recorded canonically as %s (PR #%d same commit)", job.ID, dispatched, head, payload.PullRequest)
+		writeLine(w.Stdout, "job %s review head %s recorded canonically as %s (PR #%d same commit)", job.ID, dispatchedRev, head, payload.PullRequest)
 		return true, nil
+	}
+	if dispatched == "" {
+		// git cannot resolve the dispatched rev here (an unfetched object, or an
+		// orphaned force-push target that was garbage-collected), so the relationship
+		// is UNDECIDABLE. Record the diagnosis on the job and return false, letting
+		// the caller's ORIGINAL "checkout head is X, not review job head Y" error
+		// propagate untouched: that string is what classifyCheckoutContention
+		// (job_blocker_checkout.go:101) matches to defer and auto-retry the job, and
+		// an unfetched object is exactly the self-healing case #532 exists for. A
+		// distinctly-worded error here classified as nothing and terminally failed a
+		// job that used to recover.
+		_ = w.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID: job.ID,
+			Kind:  reviewHeadResyncRefusedEvent,
+			Message: fmt.Sprintf("PR #%d dispatched head %s does not resolve in this checkout, so its relationship to checkout head %s is undecidable; refusing to re-target the review",
+				payload.PullRequest, dispatchedRev, head),
+		})
+		writeLine(w.Stdout, "job %s review head re-sync refused: dispatched head %s does not resolve in the checkout (PR #%d)", job.ID, dispatchedRev, payload.PullRequest)
+		return false, nil
 	}
 	fastForward, err := git.IsAncestor(ctx, dispatched, head)
 	if err != nil {
-		// merge-base could not decide: "the dispatched object is not in this
-		// repository" (an orphaned force-push target or an unfetched commit) is a
-		// DIFFERENT fact from "not an ancestor" and must not be laundered into a
-		// silent refusal. Surface it, matching implementationFinalizationTargetForRunner
-		// (daemon_workflow.go:405-408), which wraps the same comparison's error.
+		// Both operands are resolved object ids present in this repository, so
+		// merge-base cannot fail for a missing object; a failure here is a real
+		// repository fault and is surfaced rather than read as a direction.
 		return false, fmt.Errorf("compare review checkout head %s with dispatched head %s: %w", head, dispatched, err)
 	}
 	if !fastForward {
@@ -691,7 +696,7 @@ func (w jobWorker) resyncReviewHeadForRunner(ctx context.Context, job db.Job, pa
 		_ = w.Store.AddJobEvent(ctx, db.JobEvent{
 			JobID: job.ID,
 			Kind:  reviewHeadResyncRefusedEvent,
-			Message: fmt.Sprintf("PR #%d checkout head %s does not have dispatched head %s as an ancestor (superseded, divergent, or unreachable commit); refusing to re-target the review",
+			Message: fmt.Sprintf("PR #%d checkout head %s does not have dispatched head %s as an ancestor (superseded or divergent commit); refusing to re-target the review",
 				payload.PullRequest, head, dispatched),
 		})
 		writeLine(w.Stdout, "job %s review head re-sync refused: %s is not a descendant of dispatched head %s (PR #%d)", job.ID, head, dispatched, payload.PullRequest)

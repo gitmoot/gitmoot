@@ -1299,7 +1299,8 @@ the older re-sync behavior only for legacy/fallback review jobs that lack an
 owned read-only worktree: when their shared checkout advances and the PR remains
 open on the same branch, it re-targets the payload and records
 `review_head_resynced`; closed/merged, dirty, or wrong-branch checkouts fail.
-A re-target requires the checkout head to have the dispatched head as an ancestor: a non-descendant head is refused and recorded as `review_head_resync_refused`, and an abbreviated payload head naming the same commit records `review_head_normalized` rather than a re-sync.
+A re-target requires the checkout head to have the dispatched head as an ancestor, so a review queued before an amend or a rebase force-push will **not** follow the branch: it refuses (recording `review_head_resync_refused`), defers and auto-retries on the original wrong-head error within the shared blocker budget, and fails terminally if that head never becomes reachable — the remedy is to dispatch a **new** review at the new head, which is what exact-head review does anyway.
+Any dispatched head that git resolves to the checkout's own commit — an abbreviation of any length, a case-differing 40-character SHA, a rev expression, a ref name — is recorded as `review_head_normalized` and is never a re-sync, while a dispatched head this checkout cannot resolve at all leaves the re-sync refused and keeps the original wrong-head failure so the job stays deferrable.
 Relatedly,
 when a foreground `agent review` finds the agent's serialized runtime session
 **busy**, the review is now **left queued** for the daemon to run when the session

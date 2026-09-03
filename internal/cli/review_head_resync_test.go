@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -320,6 +321,13 @@ func jobEventMessages(events []db.JobEvent, kind string) []string {
 	return messages
 }
 
+// daemonWorkerCurrentHead is the wantHead expectation for every case whose payload
+// must end up holding the checkout's canonical 40-char head.
+func daemonWorkerCurrentHead(t *testing.T, checkout, _ string) string {
+	t.Helper()
+	return daemonWorkerHeadSHA(t, checkout)
+}
+
 // #1561: the re-sync is DIRECTIONAL now. Its only gates were "the checkout is on
 // the payload branch" and "the head differs from the payload head", so a queued
 // review could be re-pointed at a commit that was not the branch tip in either
@@ -400,52 +408,89 @@ func TestDefaultCheckoutReviewHeadResyncMeasuresDirection(t *testing.T) {
 				return dispatched
 			},
 			wantEvent:   "review_head_resync_refused",
-			wantMessage: "superseded, divergent, or unreachable commit",
+			wantMessage: "superseded or divergent commit",
 		},
 		{
-			name: "undecidable_relationship_is_an_error_not_a_refusal",
+			name: "unresolvable_dispatch_head_preserves_the_deferrable_error",
 			setup: func(t *testing.T, checkout string) string {
 				commitDaemonWorkerFile(t, checkout, "feature.txt", "more work\n", "advance the branch")
 				return absentHead
 			},
-			// "the dispatched object is not in this repository" is a different fact
-			// from "not an ancestor" and must not be laundered into a silent refusal.
-			wantErr: "compare review checkout head",
+			// An unresolvable rev (an unfetched object) is UNDECIDABLE, not a measured
+			// direction — and it must stay as recoverable as a wrong-commit checkout.
+			// The caller's original error is what classifyCheckoutContention matches to
+			// defer and auto-retry (job_blocker_checkout.go:101); a distinctly-worded
+			// error classified as nothing and terminally failed the job. The diagnosis
+			// goes in the job record instead of the control flow.
+			wantErr: "not review job head",
 			wantHead: func(_ *testing.T, _, dispatched string) string {
 				return dispatched
 			},
+			wantEvent:   "review_head_resync_refused",
+			wantMessage: "does not resolve in this checkout",
 		},
 		{
-			name: "abbreviated_same_commit_is_an_expansion_not_a_re_sync",
+			// Every spelling below names the commit the checkout is ALREADY on, with
+			// the branch never moving. Identity is decided by resolving both revs to
+			// 40-char object ids, so none of these is a re-target, whatever its shape.
+			// Measured against the previous shape heuristics by the round-1 reviewer at
+			// 0c0a0b0e: the 6-hex, "^0" and branch-name spellings each produced a false
+			// review_head_resynced "fast-forward" claim for a head that never moved,
+			// and "HEAD" errored outright because the code lowercased it to "head".
+			name: "same_commit_abbreviated_12",
 			setup: func(t *testing.T, checkout string) string {
-				// The branch does NOT move; only the recorded form is short. Measured on
-				// this host, 260 of 1819 review_head_resynced rows (14.3%, including the
-				// three most recent) record a "previous" that is a PREFIX of the "new"
-				// head — the same commit with an abbreviation expanded — while the old
-				// message claimed "branch advanced". The driver below asserts
-				// review_head_resynced is NOT emitted for this case.
 				return daemonWorkerHeadSHA(t, checkout)[:12]
 			},
-			wantHead: func(t *testing.T, checkout, _ string) string {
-				return daemonWorkerHeadSHA(t, checkout)
-			},
+			wantHead:    daemonWorkerCurrentHead,
 			wantEvent:   "review_head_normalized",
-			wantMessage: "are the SAME commit",
+			wantMessage: "the SAME commit",
 		},
 		{
-			name: "case_only_same_commit_is_not_a_re_sync",
+			name: "same_commit_abbreviated_6",
 			setup: func(t *testing.T, checkout string) string {
-				// Same commit, same length, different case: the abbreviation pre-filter
-				// cannot see this one, and a commit is its own ancestor, so without an
-				// identity check first it would be recorded as a fast-forward re-sync of
-				// a head that never moved.
+				return daemonWorkerHeadSHA(t, checkout)[:6]
+			},
+			wantHead:    daemonWorkerCurrentHead,
+			wantEvent:   "review_head_normalized",
+			wantMessage: "the SAME commit",
+		},
+		{
+			name: "same_commit_uppercase_40",
+			setup: func(t *testing.T, checkout string) string {
 				return strings.ToUpper(daemonWorkerHeadSHA(t, checkout))
 			},
-			wantHead: func(t *testing.T, checkout, _ string) string {
-				return daemonWorkerHeadSHA(t, checkout)
-			},
+			wantHead:    daemonWorkerCurrentHead,
 			wantEvent:   "review_head_normalized",
-			wantMessage: "are the SAME commit",
+			wantMessage: "the SAME commit",
+		},
+		{
+			name: "same_commit_rev_expression",
+			setup: func(t *testing.T, checkout string) string {
+				return daemonWorkerHeadSHA(t, checkout) + "^0"
+			},
+			wantHead:    daemonWorkerCurrentHead,
+			wantEvent:   "review_head_normalized",
+			wantMessage: "the SAME commit",
+		},
+		{
+			name: "same_commit_branch_name",
+			setup: func(t *testing.T, _ string) string {
+				return "feat/x"
+			},
+			wantHead:    daemonWorkerCurrentHead,
+			wantEvent:   "review_head_normalized",
+			wantMessage: "the SAME commit",
+		},
+		{
+			name: "same_commit_symbolic_head",
+			setup: func(t *testing.T, _ string) string {
+				// Case-sensitive ref: the dispatched rev reaches git verbatim, so
+				// "HEAD" resolves instead of being lowercased into an invalid "head".
+				return "HEAD"
+			},
+			wantHead:    daemonWorkerCurrentHead,
+			wantEvent:   "review_head_normalized",
+			wantMessage: "the SAME commit",
 		},
 		{
 			name:   "wrong_branch_checkout_still_declines_before_any_measurement",
@@ -560,6 +605,32 @@ func TestDefaultCheckoutReviewHeadResyncMeasuresDirection(t *testing.T) {
 				t.Fatalf("%s message = %q, want it to contain %q", tc.wantEvent, messages[0], tc.wantMessage)
 			}
 		})
+	}
+}
+
+// The refusal path's whole value is that the CALLER's original error survives:
+// that string is what the #532 classifier matches to defer the job and auto-retry
+// it, so an undecidable comparison stays at least as recoverable as a
+// wrong-commit checkout. A refusal that invented its own error text classified as
+// nothing (checkoutContentionNone) and terminally failed a job that used to
+// self-heal, which is what a round-1 finding measured on this PR.
+func TestReviewHeadMismatchErrorStaysDeferrable(t *testing.T) {
+	cause := fmt.Errorf("checkout head is %s, not review job head %s", strings.Repeat("a", 40), strings.Repeat("b", 40))
+	if !isReviewHeadMismatch(cause) {
+		t.Fatalf("isReviewHeadMismatch(%v) = false, want true — the re-sync path would never see this error", cause)
+	}
+	kind, action := classifyCheckoutContention(cause)
+	if kind != checkoutContentionDirty {
+		t.Fatalf("classifyCheckoutContention kind = %v, want checkoutContentionDirty (%v) so the job defers and auto-retries", kind, checkoutContentionDirty)
+	}
+	if strings.TrimSpace(action) == "" {
+		t.Fatal("classifyCheckoutContention returned an empty suggested_action for the review head mismatch")
+	}
+	// The wording the refusal path must NOT introduce: a comparison-specific error
+	// is outside every classifier family, so it terminally fails instead.
+	invented := fmt.Errorf("compare review checkout head %s with dispatched head %s: exit status 128", strings.Repeat("a", 40), strings.Repeat("b", 40))
+	if kind, _ := classifyCheckoutContention(invented); kind != checkoutContentionNone {
+		t.Fatalf("classifyCheckoutContention(%q) kind = %v, want checkoutContentionNone — this test's premise is that such wording is unclassified", invented, kind)
 	}
 }
 
