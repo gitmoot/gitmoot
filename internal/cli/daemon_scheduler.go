@@ -2844,21 +2844,7 @@ func queuedJobRuntimeResourceKey(ctx context.Context, store *db.Store, job db.Jo
 	if err != nil {
 		return ""
 	}
-	effective := runtimeAgent(agent)
-	// A read-only seat runs on a job-scoped fresh ref (applyReadOnlySeat), never
-	// the agent's stored session, so gate on the SAME ref the worker acquires.
-	// Gating on the stored ref would serialize disposable review seats behind the
-	// agent's live default-runtime session AND disagree with acquisition. That is
-	// the #1034 shape, where a gate and a lock computed from different keys let a
-	// job pass the gate and then collide.
-	if payload, payloadErr := daemonJobPayload(job); payloadErr == nil && payload.ReadOnlySeat && resumableSessionRuntime(effective.Runtime) {
-		ref, refErr := readOnlySeatRuntimeRef(job.ID)
-		if refErr != nil {
-			return ""
-		}
-		effective.RuntimeRef = ref
-	}
-	key, ok := runtimeSessionResourceKey(effective)
+	key, ok := runtimeSessionResourceKey(runtimeAgent(agent))
 	if !ok {
 		return ""
 	}

@@ -396,6 +396,10 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		checkoutPath = readOnlyWorktreePath
 		promptHeadWarnings = dispatchPromptHeadContradictionWarnings(ctx, jobGitClient(checkoutPath, localDispatchJobRunner(request)), request.Instructions, request.HeadSHA)
 	}
+	// Locking stays on the agent's REGISTERED session (see the same split in
+	// jobWorker.run): a read-only seat isolates DELIVERY, not serialization, so
+	// #684's "busy reviewer session leaves the review queued" is unchanged.
+	sessionLockAgent := effectiveAgent
 	if readOnlyWorktreePath != "" {
 		if err := applyReadOnlySeat(true, selectedRuntimeConfigDir(effectiveAgent.Runtime), jobID, &effectiveAgent); err != nil {
 			return localAgentJobOutput{}, fmt.Errorf("isolate read-only seat session: %w", err)
@@ -528,10 +532,13 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if jobTimeout > 0 {
 		lockTTL = jobTimeout + runtimeLeaseTeardownGrace
 	}
-	// SESSION SAFETY (#531): the lock is taken on the EFFECTIVE agent, so an
-	// overridden job locks the OVERRIDE runtime's session key and can never
-	// collide with (or occupy) the agent's default-runtime session lock.
-	releaseLock, acquired, lockKey, ownerToken, err := acquireJobRuntimeSessionLock(ctx, store, job.ID, effectiveAgent, overrideRuntime != "", time.Now().UTC(), lockTTL)
+	// SESSION SAFETY (#531): the lock is taken on the agent an override already
+	// swapped in, so an overridden job locks the OVERRIDE runtime's session key
+	// and can never collide with (or occupy) the agent's default-runtime session
+	// lock. A read-only seat is the one case where this is NOT the delivery
+	// agent: sessionLockAgent still carries the registered session ref, because a
+	// seat isolates delivery without loosening #684 serialization.
+	releaseLock, acquired, lockKey, ownerToken, err := acquireJobRuntimeSessionLock(ctx, store, job.ID, sessionLockAgent, overrideRuntime != "", time.Now().UTC(), lockTTL)
 	if err != nil {
 		return localAgentJobOutput{}, err
 	}

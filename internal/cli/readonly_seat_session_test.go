@@ -3,6 +3,9 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -36,36 +39,31 @@ func TestApplyReadOnlySeatRunsOnFreshSessionNotTheAgentsOwn(t *testing.T) {
 	}
 }
 
-// A seat that kept the stored ref would also take the runtime-session lock on
-// the agent's LIVE default-runtime session key: the lock is acquired on this
-// effective agent (acquireJobRuntimeSessionLock), so a disposable report-only
-// review would occupy the session a real job needs.
-func TestApplyReadOnlySeatDoesNotOccupyTheAgentsSessionLockKey(t *testing.T) {
+// The seat isolates DELIVERY only. Locking must stay on the agent's registered
+// session so #684 serialization is unchanged (that invariant is exercised end
+// to end by TestRunAgentReviewRequeuesQueuedJobWhenRuntimeSessionBusy, which
+// drives `agent review` with the registered session held by another owner).
+// applyReadOnlySeat takes a pointer, so callers keep a pre-seat copy for the
+// lock; this test pins that a copy taken before the call is unaffected.
+func TestApplyReadOnlySeatLeavesTheSessionLockAgentIntact(t *testing.T) {
 	stored := runtime.Agent{Runtime: runtime.CodexRuntime, RuntimeRef: "019fa4c8-69c1-7bc2-8628-00ade8fa43c5"}
-	storedKey, ok := runtimeSessionResourceKey(stored)
-	if !ok {
-		t.Fatal("stored codex session must have a lock key")
-	}
-
-	seat := stored
-	if err := applyReadOnlySeat(true, "", "job-seat-1", &seat); err != nil {
+	sessionLockAgent := stored
+	delivery := stored
+	if err := applyReadOnlySeat(true, "", "job-seat-1", &delivery); err != nil {
 		t.Fatalf("applyReadOnlySeat: %v", err)
 	}
-	seatKey, ok := runtimeSessionResourceKey(seat)
-	if !ok {
-		t.Fatal("read-only seat must still take a lock key")
-	}
-	if seatKey == storedKey {
-		t.Fatalf("read-only seat locks the agent's own session key %q", seatKey)
-	}
 
-	other := stored
-	if err := applyReadOnlySeat(true, "", "job-seat-2", &other); err != nil {
-		t.Fatalf("applyReadOnlySeat: %v", err)
+	lockKey, ok := runtimeSessionResourceKey(sessionLockAgent)
+	if !ok {
+		t.Fatal("registered codex session must have a lock key")
 	}
-	otherKey, _ := runtimeSessionResourceKey(other)
-	if otherKey == seatKey {
-		t.Fatalf("two read-only seats of one agent must not share a lock key, both = %q", seatKey)
+	storedKey, _ := runtimeSessionResourceKey(stored)
+	if lockKey != storedKey {
+		t.Fatalf("session lock key = %q, want the registered %q", lockKey, storedKey)
+	}
+	deliveryKey, _ := runtimeSessionResourceKey(delivery)
+	if deliveryKey == lockKey {
+		t.Fatalf("delivery ref %q was not isolated from the locked session", delivery.RuntimeRef)
 	}
 }
 
@@ -117,9 +115,12 @@ func TestApplyReadOnlySeatKeepsShellCommandRef(t *testing.T) {
 	}
 }
 
-// The daemon SELECTOR must gate on exactly the key the worker ACQUIRES. A
-// mismatch is the #1034 shape: the gate serializes read-only seats behind the
-// agent's live session (or lets them through on a key nothing locks).
+// The daemon SELECTOR gates on exactly the key the worker ACQUIRES, and a
+// read-only seat must not change that: the worker locks the agent's registered
+// session (jobWorker.run keeps a pre-seat copy) and the selector reads the
+// stored agent, so both sides keep naming one key. A seat that moved its LOCK
+// to a job-scoped ref would have to move the gate too, or the two disagree,
+// which is the #1034 shape.
 func TestQueuedJobRuntimeResourceKeyReadOnlySeat(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
@@ -145,30 +146,108 @@ func TestQueuedJobRuntimeResourceKeyReadOnlySeat(t *testing.T) {
 		return db.Job{ID: id, Agent: stored.Name, Payload: string(encoded)}
 	}
 
-	seatJob := newJob("local-review-seat-a", true)
-	gate := queuedJobRuntimeResourceKey(ctx, store, seatJob)
+	storedKey, ok := runtimeSessionResourceKey(runtimeAgent(stored))
+	if !ok {
+		t.Fatal("registered codex session must have a lock key")
+	}
 
-	effective := runtimeAgent(stored)
-	if err := applyReadOnlySeat(true, "", seatJob.ID, &effective); err != nil {
+	seatJob := newJob("local-review-seat-a", true)
+	if gate := queuedJobRuntimeResourceKey(ctx, store, seatJob); gate != storedKey {
+		t.Fatalf("seat gate = %q, want the registered session key %q", gate, storedKey)
+	}
+	if gate := queuedJobRuntimeResourceKey(ctx, store, newJob("implement-a", false)); gate != storedKey {
+		t.Fatalf("ordinary gate = %q, want the registered session key %q", gate, storedKey)
+	}
+
+	// ...and the seat still delivers on an isolated fresh session, so the key it
+	// gates on is deliberately NOT the session it talks to.
+	delivery := runtimeAgent(stored)
+	if err := applyReadOnlySeat(true, "", seatJob.ID, &delivery); err != nil {
 		t.Fatalf("applyReadOnlySeat: %v", err)
 	}
-	lockKey, ok := runtimeSessionResourceKey(effective)
-	if !ok {
-		t.Fatal("read-only seat must have an acquisition key")
+	if !runtime.IsFreshRef(delivery.RuntimeRef) {
+		t.Fatalf("seat delivery ref = %q, want a fresh ref", delivery.RuntimeRef)
 	}
-	if gate != lockKey {
-		t.Fatalf("selector key %q must equal the acquisition key %q", gate, lockKey)
+}
+
+// Every registered runtime must declare a seat staging policy. The seat has
+// omitted a required startup input three times (openssl.cnf, codex sessions/,
+// kimi config.toml), and the third one shipped because nothing forced a runtime
+// to say what it reads at startup. A new runtime added to the registry without
+// a policy fails here rather than at dispatch.
+func TestReadOnlySeatStatePolicyCoversEveryRegisteredRuntime(t *testing.T) {
+	userHome := t.TempDir()
+	for _, name := range runtime.SupportedRuntimes() {
+		t.Run(name, func(t *testing.T) {
+			policy, needsState, err := readOnlySeatStatePolicyFor(name, userHome, false)
+			switch name {
+			case runtime.OmpRuntime:
+				if err == nil {
+					t.Fatal("omp must be refused: it has no isolated credential broker")
+				}
+				return
+			case runtime.ShellRuntime:
+				if err != nil || needsState {
+					t.Fatalf("shell needsState=%v err=%v, want no isolated state and no error", needsState, err)
+				}
+				return
+			}
+			if err != nil || !needsState {
+				t.Fatalf("%s needsState=%v err=%v, want a declared policy", name, needsState, err)
+			}
+			if strings.TrimSpace(policy.relativeState) == "" {
+				t.Fatalf("%s policy declares no staging location", name)
+			}
+			if strings.TrimSpace(policy.defaultSourceDir) == "" {
+				t.Fatalf("%s policy declares no host source dir", name)
+			}
+			if policy.credentialFile == "" && len(policy.requiredInputs) == 0 {
+				t.Fatalf("%s policy stages nothing: a seat with an empty state dir starts and then refuses", name)
+			}
+		})
+	}
+}
+
+// An unregistered runtime must be refused rather than silently given an empty
+// state dir.
+func TestReadOnlySeatStatePolicyRefusesUnknownRuntime(t *testing.T) {
+	if _, _, err := readOnlySeatStatePolicyFor("codxe", t.TempDir(), false); err == nil {
+		t.Fatal("unknown runtime must be refused")
+	}
+}
+
+// A required input the host does not have must fail with a message that NAMES
+// the file. The runtime's own diagnostic for this case ("No model configured",
+// behind an auth error telling the reader to run kimi login) is what cost a day.
+func TestPrepareReadOnlyRuntimeStateNamesAMissingRequiredInput(t *testing.T) {
+	sourceDir := t.TempDir()
+	credentialDir := filepath.Join(sourceDir, "credentials")
+	if err := os.MkdirAll(credentialDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(credentialDir, "kimi-code.json"), []byte(`{"access_token":"host"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	agent := runtime.Agent{Runtime: runtime.KimiRuntime, RuntimeConfigDir: sourceDir, ReadOnlySeat: true}
+
+	_, _, err := prepareReadOnlyRuntimeState(agent, t.TempDir(), false)
+	if err == nil {
+		t.Fatal("a kimi seat without config.toml must be refused, not launched")
+	}
+	if !strings.Contains(err.Error(), "config.toml") {
+		t.Fatalf("error must name the missing input, got: %v", err)
 	}
 
-	storedKey, _ := runtimeSessionResourceKey(runtimeAgent(stored))
-	if gate == storedKey {
-		t.Fatalf("read-only seat gated on the agent's own session key %q", gate)
+	// With the input present the same call stages it verbatim.
+	if err := os.WriteFile(filepath.Join(sourceDir, "config.toml"), []byte("default_model = \"kimi-code/k3\"\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-
-	// A non-seat job for the same agent still gates on that agent's session, so
-	// real work continues to serialize on the session it actually resumes.
-	ordinary := newJob("implement-a", false)
-	if got := queuedJobRuntimeResourceKey(ctx, store, ordinary); got != storedKey {
-		t.Fatalf("ordinary job gate = %q, want the agent session key %q", got, storedKey)
+	stateDir, _, err := prepareReadOnlyRuntimeState(agent, t.TempDir(), false)
+	if err != nil {
+		t.Fatalf("prepareReadOnlyRuntimeState: %v", err)
+	}
+	staged, err := os.ReadFile(filepath.Join(stateDir, "config.toml"))
+	if err != nil || !strings.Contains(string(staged), "default_model") {
+		t.Fatalf("staged config.toml = %q, err=%v", staged, err)
 	}
 }

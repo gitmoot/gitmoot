@@ -166,6 +166,7 @@ func (r *repairStateRunner) LookPath(file string) (string, error) { return file,
 type kimiHomeStateRunner struct {
 	home               string
 	credentialObserved bool
+	modelConfigObserved bool
 }
 
 func (r *kimiHomeStateRunner) Run(context.Context, string, string, ...string) (subprocess.Result, error) {
@@ -182,6 +183,18 @@ func (r *kimiHomeStateRunner) RunEnv(_ context.Context, _ string, env []string, 
 		return subprocess.Result{}, fmt.Errorf("read Kimi credential under HOME: %w", err)
 	}
 	r.credentialObserved = true
+	// Kimi reads default_model plus its provider and model blocks from
+	// config.toml. Staging only the credential produced a seat that
+	// authenticated and then refused with "No model configured" behind an auth
+	// message, so this runner reads what the real runtime reads at startup.
+	modelConfig, err := os.ReadFile(filepath.Join(r.home, ".kimi-code", "config.toml"))
+	if err != nil {
+		return subprocess.Result{}, fmt.Errorf("read Kimi config.toml under HOME: %w", err)
+	}
+	if !strings.Contains(string(modelConfig), "default_model") {
+		return subprocess.Result{}, errors.New("staged Kimi config.toml carries no default_model")
+	}
+	r.modelConfigObserved = true
 	return subprocess.Result{
 		Command: command,
 		Args:    args,
@@ -565,6 +578,10 @@ func TestWorkerKimiReadOnlySeatStagesProfileUnderEffectiveHome(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(credentialDir, "kimi-code.json"), []byte(sourceCredential), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	const sourceModelConfig = "default_model = \"kimi-code/k3\"\n\n[providers.\"managed:kimi-code\"]\ntype = \"kimi\"\n"
+	if err := os.WriteFile(filepath.Join(sourceDir, "config.toml"), []byte(sourceModelConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	seedDaemonWorkerAgentWithPolicy(t, store, "kimi-reviewer", runtime.KimiRuntime,
 		"session_550e8400-e29b-41d4-a716-446655440000", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
@@ -590,8 +607,8 @@ func TestWorkerKimiReadOnlySeatStagesProfileUnderEffectiveHome(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.State != string(workflow.JobSucceeded) || !runner.credentialObserved {
-		t.Fatalf("Kimi job state=%q credentialObserved=%v payload=%s", stored.State, runner.credentialObserved, stored.Payload)
+	if stored.State != string(workflow.JobSucceeded) || !runner.credentialObserved || !runner.modelConfigObserved {
+		t.Fatalf("Kimi job state=%q credentialObserved=%v modelConfigObserved=%v payload=%s", stored.State, runner.credentialObserved, runner.modelConfigObserved, stored.Payload)
 	}
 	if data, err := os.ReadFile(filepath.Join(credentialDir, "kimi-code.json")); err != nil || string(data) != sourceCredential {
 		t.Fatalf("shared Kimi credential changed to %q, err=%v", data, err)
