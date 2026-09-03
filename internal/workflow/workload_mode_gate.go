@@ -30,10 +30,22 @@ type modeSensitivePullRequest struct {
 // merged with no reconciliation at all (#1783 review, P3). The note grammar is
 // already repo-parameterized, so widening to the owner matches the policy the
 // gate implements without inventing a config knob.
+//
+// Two deliberate consequences, both raised by the round-2 review and both kept:
+// every gitmoot-owned repository is held until a reconciliation row exists, even
+// one where no coordinator writes notes today, and a human-requested merge is
+// held too. A mode marker is a fleet-wide instruction, so the hold is the point;
+// the escape hatch is the documented PR-sourced row (decision_note=none), not a
+// per-repo opt-out. If a sibling repo ever needs exemption that is a config
+// knob and an AGENTS.md change, not a silent scope narrowing here.
+//
+// The comparison is case-INSENSITIVE. GitHub treats owner/repo case
+// insensitively, so a repo recorded as "Gitmoot/gitmoot" disabled the entire
+// gate under a byte comparison — fail-open, and invisible.
 const workloadModeEnforcedOwner = "gitmoot"
 
 func inspectModeSensitivePullRequest(ctx context.Context, gh MergeGateGitHub, repo github.Repository, number int64) (modeSensitivePullRequest, error) {
-	if strings.TrimSpace(repo.Owner) != workloadModeEnforcedOwner {
+	if !strings.EqualFold(strings.TrimSpace(repo.Owner), workloadModeEnforcedOwner) {
 		return modeSensitivePullRequest{}, nil
 	}
 	files, err := gh.ListPullRequestFiles(ctx, repo, number)
@@ -99,9 +111,16 @@ func validWorkloadMode(mode string) bool {
 	}
 }
 
+// operatingModeDecision is the newest READABLE owner decision for a repo, or a
+// record of why the newest decision-shaped note could not be read.
 type operatingModeDecision struct {
 	id   int64
 	mode string
+	// unreadableID names a note that IS an operating-mode note for this repo but
+	// whose fields or mode cannot be read. It is not "no decision": the owner
+	// decided something the gate cannot determine, so the gate must hold.
+	unreadableID  int64
+	unreadableWhy string
 }
 
 func ensureWorkloadModeReconciled(ctx context.Context, store *db.Store, gh MergeGateGitHub, repo github.Repository, number int64, headSHA string) (required, reconciled bool, reason string, err error) {
@@ -118,6 +137,17 @@ func ensureWorkloadModeReconciled(ctx context.Context, store *db.Store, gh Merge
 	decision, err := latestOperatingModeDecision(ctx, store, repo.FullName())
 	if err != nil {
 		return true, false, "", err
+	}
+	// An UNREADABLE newest decision is not "no decision". Skipping it returned
+	// id==0, which dropped the supersession check AND made decision_note=none
+	// satisfiable by a row written before the owner decided — the same fail-open
+	// corner the repo-scoped SQL closed, reachable through a typo instead of a
+	// truncated window (#1783 review, F1). Hold and name the note to fix.
+	if decision.unreadableID > 0 {
+		return true, false, fmt.Sprintf(
+			"workload-mode change cannot be reconciled: operating-mode note %d %s, so the current decision is unknown; correct that note",
+			decision.unreadableID, decision.unreadableWhy,
+		), nil
 	}
 	expectedMode := strings.ToUpper(strings.TrimSpace(observed.mode))
 	if expectedMode == "" && decision.id > 0 {
@@ -155,7 +185,16 @@ func ensureWorkloadModeReconciled(ctx context.Context, store *db.Store, gh Merge
 		if !ok || !workflowNoteMatchesRepo(note, fields, repo.FullName()) {
 			continue
 		}
-		if fields["pr"] != strconv.FormatInt(number, 10) || fields["head"] != strings.TrimSpace(headSHA) {
+		// The two most likely coordinator mistakes used to `continue` silently, so
+		// the hold said only "requires reconciliation": a row written at the
+		// PREVIOUS head after a fix-up push, and a row naming another PR (#1783
+		// review, F2). Name the row and both values instead.
+		if rowPR := strings.TrimSpace(fields["pr"]); rowPR != strconv.FormatInt(number, 10) {
+			nearMiss = fmt.Sprintf("; row %d reconciles pr=%s, not this pull request", note.ID, rowPR)
+			continue
+		}
+		if rowHead := strings.TrimSpace(fields["head"]); rowHead != strings.TrimSpace(headSHA) {
+			nearMiss = fmt.Sprintf("; row %d reconciles head %s, but the current head is %s", note.ID, shortSHA(rowHead), shortSHA(headSHA))
 			continue
 		}
 		mode := strings.ToUpper(strings.TrimSpace(fields["mode"]))
@@ -190,8 +229,42 @@ func ensureWorkloadModeReconciled(ctx context.Context, store *db.Store, gh Merge
 	if observed.ambiguous {
 		detail += "; AGENTS.md mode-marker patch is missing or ambiguous"
 	}
+	if nearMiss == "" {
+		// The repo-scoped SQL drops a row whose repo COLUMN names another
+		// repository before this loop ever sees it, so a coordinator who filed the
+		// row against the wrong workflow saw only the generic hold (#1783 review,
+		// F2). One unscoped scan, only when nothing else explained the hold, finds
+		// it and names both repositories.
+		nearMiss = misfiledReconciliationRow(ctx, store, repo.FullName(), number, headSHA)
+	}
 	detail += nearMiss
 	return true, false, detail, nil
+}
+
+// misfiledReconciliationRow finds a row that names THIS repo in its body but was
+// recorded under a different repo column, which makes it invisible to the
+// repo-scoped lookup. It returns "" when there is nothing to report.
+func misfiledReconciliationRow(ctx context.Context, store *db.Store, repo string, number int64, headSHA string) string {
+	notes, err := store.ListWorkflowNotesByBodyPrefix(ctx, modeReconciliationNotePrefix, workloadModeReconciliationScan)
+	if err != nil {
+		return ""
+	}
+	for _, note := range notes {
+		fields, ok := parseModeNoteFields(note.Body, modeReconciliationNotePrefix)
+		if !ok || !strings.EqualFold(strings.TrimSpace(fields["repo"]), strings.TrimSpace(repo)) {
+			continue
+		}
+		noteRepo := strings.TrimSpace(note.Repo)
+		if noteRepo == "" || strings.EqualFold(noteRepo, strings.TrimSpace(repo)) {
+			continue
+		}
+		if strings.TrimSpace(fields["pr"]) != strconv.FormatInt(number, 10) ||
+			strings.TrimSpace(fields["head"]) != strings.TrimSpace(headSHA) {
+			continue
+		}
+		return fmt.Sprintf("; row %d names this repository in its body but was recorded under %s, so the repo-scoped lookup cannot see it", note.ID, noteRepo)
+	}
+	return ""
 }
 
 func latestOperatingModeDecision(ctx context.Context, store *db.Store, repo string) (operatingModeDecision, error) {
@@ -200,13 +273,27 @@ func latestOperatingModeDecision(ctx context.Context, store *db.Store, repo stri
 		return operatingModeDecision{}, fmt.Errorf("list operating-mode notes: %w", err)
 	}
 	for _, note := range notes {
-		fields, ok := parseModeNoteFields(note.Body, operatingModeNotePrefix)
-		if !ok || !workflowNoteMatchesRepo(note, fields, repo) {
-			continue
+		fields, parsed := parseModeNoteFields(note.Body, operatingModeNotePrefix)
+		if parsed && workflowNoteMatchesRepo(note, fields, repo) {
+			mode := strings.ToUpper(strings.TrimSpace(fields["mode"]))
+			if validWorkloadMode(mode) {
+				return operatingModeDecision{id: note.ID, mode: mode}, nil
+			}
+			return operatingModeDecision{
+				unreadableID:  note.ID,
+				unreadableWhy: fmt.Sprintf("declares mode=%q, which is not a workload mode", fields["mode"]),
+			}, nil
 		}
-		mode := strings.ToUpper(strings.TrimSpace(fields["mode"]))
-		if validWorkloadMode(mode) {
-			return operatingModeDecision{id: note.ID, mode: mode}, nil
+		// An unparseable body cannot answer "is this note for this repo?" through
+		// its repo FIELD, so fall back to the note's repo COLUMN. A note that is
+		// demonstrably this repo's and unreadable HOLDS; one that names neither
+		// this repo nor nothing is another lane's problem and is skipped, so a
+		// typo in an unrelated note cannot freeze every gitmoot repository.
+		if !parsed && strings.EqualFold(strings.TrimSpace(note.Repo), strings.TrimSpace(repo)) {
+			return operatingModeDecision{
+				unreadableID:  note.ID,
+				unreadableWhy: "has a malformed field list, so its mode cannot be read",
+			}, nil
 		}
 	}
 	return operatingModeDecision{}, nil
@@ -231,10 +318,14 @@ func parseModeNoteFields(body, prefix string) (map[string]string, bool) {
 	return fields, true
 }
 
+// workflowNoteMatchesRepo compares repositories CASE-INSENSITIVELY. GitHub
+// treats owner/repo case insensitively, so a byte comparison made a note
+// written as "Gitmoot/gitmoot" invisible on both note streams (#1783 review,
+// F3).
 func workflowNoteMatchesRepo(note db.WorkflowNote, fields map[string]string, repo string) bool {
 	repo = strings.TrimSpace(repo)
-	if noteRepo := strings.TrimSpace(note.Repo); noteRepo != "" && noteRepo != repo {
+	if noteRepo := strings.TrimSpace(note.Repo); noteRepo != "" && !strings.EqualFold(noteRepo, repo) {
 		return false
 	}
-	return strings.TrimSpace(fields["repo"]) == repo
+	return strings.EqualFold(strings.TrimSpace(fields["repo"]), repo)
 }

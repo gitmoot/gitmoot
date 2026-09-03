@@ -992,7 +992,10 @@ LIMIT ?`, prefix, prefix, limit)
 // "no decision exists", which both dropped the recency check and let a stale
 // PR-sourced reconciliation satisfy it (#1783 review, P3). A note whose repo
 // column is empty still matches, because the gate also accepts a repo named
-// inside the note body.
+// inside the note body. The repo comparison is COLLATE NOCASE: GitHub treats
+// owner/repo case insensitively, so a note recorded as "Gitmoot/gitmoot" was
+// invisible to a byte-equal filter and took the fail-open path with it (#1783
+// review, F3).
 func (s *Store) ListRepoWorkflowNotesByBodyPrefix(ctx context.Context, prefix string, repo string, limit int) ([]WorkflowNote, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 200
@@ -1000,7 +1003,7 @@ func (s *Store) ListRepoWorkflowNotesByBodyPrefix(ctx context.Context, prefix st
 	rows, err := s.db.QueryContext(ctx, `SELECT id, workflow_id, author, body, repo, memory_observation_id, created_at
 FROM workflow_notes
 WHERE substr(body, 1, length(?)) = ?
-  AND (repo = ? OR repo = '')
+  AND (repo = ? COLLATE NOCASE OR repo = '')
 ORDER BY created_at DESC, id DESC
 LIMIT ?`, prefix, prefix, repo, limit)
 	if err != nil {

@@ -36,8 +36,15 @@ type PipelineAutoMergeReadiness struct {
 }
 
 // PipelineAutoMergeResult is the result of the single audited merge attempt.
+//
+// Waiting separates a TRANSIENT refusal from a terminal one. The pipeline folds
+// any !Merged into a blocked stage with "retry stopped", so a reconciliation
+// hold that Evaluate reports as Waiting became a terminal block when it landed
+// in the Evaluate->Merge window - the same condition, two dispositions, and the
+// worse one needed a human (#1783 review, F4).
 type PipelineAutoMergeResult struct {
 	Merged         bool
+	Waiting        bool
 	MergeCommitSHA string
 	Reason         string
 }
@@ -168,7 +175,9 @@ func (m PipelineAutoMerger) Merge(ctx context.Context, request PipelineAutoMerge
 	if required, reconciled, reason, err := ensureWorkloadModeReconciled(ctx, m.Store, m.GitHub, repo, int64(request.PullRequest), head); err != nil {
 		return PipelineAutoMergeResult{}, err
 	} else if required && !reconciled {
-		return PipelineAutoMergeResult{Reason: reason}, nil
+		// Waiting, matching Evaluate: a reconciliation row or an owner note can
+		// land at any moment, so the run must re-observe rather than end.
+		return PipelineAutoMergeResult{Waiting: true, Reason: reason}, nil
 	}
 	result, err := executePullRequestMerge(ctx, m.GitHub, github.MergePullRequestInput{
 		Repo:            repo,

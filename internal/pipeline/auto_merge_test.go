@@ -198,6 +198,55 @@ func TestPipelineAutoMergeGateExecutesAfterApprovedReviewAndGreenChecks(t *testi
 	}
 }
 
+// A TRANSIENT merge-boundary refusal must keep the gate waiting. The fold turned
+// any !Merged into "retry stopped", so a workload-mode reconciliation hold that
+// Evaluate reports as Waiting terminally blocked the run once it appeared in the
+// Evaluate->Merge window, and the at-most-once claim was already consumed
+// (#1783 review, F4). The claim is why the retry is safe: the next scan cannot
+// call Merge again.
+func TestPipelineAutoMergeWaitingResultKeepsTheGateRetryable(t *testing.T) {
+	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	executor := &stubPipelineAutoMerger{
+		readiness: workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		mergeResult: workflow.PipelineAutoMergeResult{
+			Waiting: true,
+			Reason:  "workload-mode change requires reconciliation at head 0123456 against operating-mode note 41",
+		},
+	}
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), executor)
+
+	if len(executor.mergeReqs) != 1 {
+		t.Fatalf("merge calls = %d, want exactly one attempt", len(executor.mergeReqs))
+	}
+	gate := stageRow(t, store, run.ID, "merge")
+	if gate.State == StageBlocked || gate.State == StageFailed {
+		t.Fatalf("a transient hold ended the run: gate=%+v run=%+v", gate, run)
+	}
+	if run.State == RunBlocked || run.State == RunFailed {
+		t.Fatalf("run = %q, want it still open after a transient hold", run.State)
+	}
+
+	// The consumed claim keeps the retry at-most-once: a later scan must not
+	// call Merge again, and the gate must still not be terminal.
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(3*time.Second), executor)
+	if len(executor.mergeReqs) != 1 {
+		t.Fatalf("rescan merge calls = %d, want the claim to hold at one", len(executor.mergeReqs))
+	}
+	if gate := stageRow(t, store, run.ID, "merge"); gate.State == StageBlocked || gate.State == StageFailed {
+		t.Fatalf("rescan ended the run: gate=%+v", gate)
+	}
+	events, err := store.ListJobEvents(context.Background(), sourceJobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents(source): %v", err)
+	}
+	for _, event := range events {
+		if event.Kind == "pipeline_auto_merge_confirmed" {
+			t.Fatalf("a held merge recorded a confirmation: %+v", event)
+		}
+	}
+}
+
 // #1685. A review fan-out is refused at STAGE SETTLEMENT, before anything
 // depends on it. That is the load-bearing layer: a succeeded stage satisfies
 // pipelineStageDepsSucceeded and authorizes every dependent stage, so folding an

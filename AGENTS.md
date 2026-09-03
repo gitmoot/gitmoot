@@ -526,6 +526,17 @@ missing or ambiguous fails closed. `PipelineAutoMerger.Merge` re-reads the PR
 and both note streams at the final merge boundary; an older reconciled PR that
 merges after a newer owner decision cannot override the newer decision.
 
+Four properties of that enforcement are worth knowing before you write a row.
+Enforcement is keyed on the repository OWNER, so every `gitmoot/*` repo is held
+until a row exists, human-requested merges included. Repository names are
+compared case-insensitively on every stream, so a note recorded as
+`Gitmoot/gitmoot` still counts. A newest operating-mode note that cannot be
+read — a malformed field list, or a `mode` that is not a workload mode — HOLDS
+the PR and names that note, because an unreadable decision is not the absence of
+one; correct the note rather than adding a row. And a reconciliation hold at the
+merge boundary is retryable, not terminal: the pipeline gate keeps waiting until
+the row lands or the gate times out.
+
 Resolve the active decision from both durable sources: read the marker from
 `origin/main:AGENTS.md`, never a seat worktree, and read the newest typed
 operating-mode/reconciliation note. Decisions are ordered by `decided_at`

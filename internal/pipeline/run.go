@@ -1970,6 +1970,13 @@ func autoMergeGateStageSettleOutcome(ctx context.Context, deps pipelineStageSett
 		if reason == "" {
 			reason = "GitHub did not confirm the merge"
 		}
+		// A TRANSIENT refusal keeps the stage waiting, bounded by the gate's own
+		// timeout, instead of ending the run. The at-most-once claim is already
+		// consumed, so the next scan takes the !claimed path and waits there too
+		// until the PR merges or the gate times out (#1783 review, F4).
+		if result.Waiting {
+			return autoMergeGateWaiting(stage, stageRow, deps.now, payload.PullRequest)
+		}
 		return block(reason + "; retry stopped")
 	}
 	confirmation, marshalErr := json.Marshal(map[string]any{
