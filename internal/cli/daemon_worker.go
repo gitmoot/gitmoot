@@ -348,24 +348,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		runtimeConfigDir = selectedReadOnlyRuntimeConfigDir(agent.Runtime, payload.RuntimeConfigDir)
 	}
 	applyReadOnlySeat(readOnlySeat, runtimeConfigDir, &agent)
-	// A seat stages a credential SNAPSHOT. Record it when already expired so a
-	// later auth failure is attributable to staging, not read as a fresh OAuth
-	// problem. It never refuses: runtime auth failures use the deferrable
-	// blocker path. Resolve the gateway decision and overlay only for read-only
-	// seats; evaluating them for every job performed avoidable config reads and
-	// let the diagnosis use a different predicate from the eventual wrapper.
-	if agent.ReadOnlySeat {
-		gatewayMode := seatModelGatewayMode(w.ConfigHome)
-		seatAuthOverlay, seatAuthErr := readOnlySeatRuntimeAuthEnv(w.ConfigHome, agent.Runtime, gatewayMode)
-		if seatAuthErr != nil {
-			writeLine(w.Stdout, "job %s read-only seat auth overlay unresolved: %v", job.ID, seatAuthErr)
-		}
-		if diagnosis := readOnlySeatCredentialPreflight(agent, runtimeConfigDir, gatewayMode, len(seatAuthOverlay) > 0, time.Now().UTC()); diagnosis != "" {
-			if eventErr := w.recordReadOnlySeatCredentialDiagnosis(ctx, job.ID, diagnosis); eventErr != nil {
-				writeLine(w.Stdout, "job %s %s event failed: %v", job.ID, readOnlySeatCredentialExpiredEvent, eventErr)
-			}
-		}
-	}
 	preflightRequest := runtime.RuntimeContractRequest{Plan: payload.Plan}
 	if result, checked, preflightErr := w.runtimeContractPreflight(ctx, execBackend, execConfig, agent, preflightRequest); preflightErr != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, preflightErr); finishErr != nil {
@@ -721,6 +703,21 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
+	}
+	// Diagnose the exact adapter credential domain that the seat wrapper below
+	// will use. Reading gateway config separately here could disagree with the
+	// already-built adapter and report a staged credential that will not exist.
+	if agent.ReadOnlySeat {
+		_, gatewayMode := adapter.(modelGatewayRuntimeAdapter)
+		seatAuthOverlay, seatAuthErr := readOnlySeatRuntimeAuthEnv(w.ConfigHome, agent.Runtime, gatewayMode)
+		if seatAuthErr != nil {
+			writeLine(w.Stdout, "job %s read-only seat auth overlay unresolved: %v", job.ID, seatAuthErr)
+		}
+		if diagnosis := readOnlySeatCredentialPreflight(agent, runtimeConfigDir, gatewayMode, len(seatAuthOverlay) > 0, time.Now().UTC()); diagnosis != "" {
+			if eventErr := w.recordReadOnlySeatCredentialDiagnosis(ctx, job.ID, diagnosis); eventErr != nil {
+				writeLine(w.Stdout, "job %s %s event failed: %v", job.ID, readOnlySeatCredentialExpiredEvent, eventErr)
+			}
+		}
 	}
 	adapter, err = wrapReadOnlySandboxAdapter(w.ConfigHome, agent, deliveryCheckout, adapter)
 	if err != nil {
@@ -1873,9 +1870,9 @@ func produceRuntimeSandboxGrants(runtimeName string, readable, readFiles, writab
 		// token since 2026-08-31, which yields exactly "OAuth session expired and
 		// could not be refreshed". Honor the configured dir and fall back only
 		// when none is set.
-		stateDir := os.Getenv("CLAUDE_CONFIG_DIR")
-		if stateDir == "" {
-			stateDir = filepath.Join(home, ".claude")
+		stateDir, err := resolveRuntimeConfigDir(runtime.ClaudeRuntime, os.Getenv("CLAUDE_CONFIG_DIR"))
+		if err != nil {
+			return nil, nil, nil, nil, err
 		}
 		cacheRoot, err := os.UserCacheDir()
 		if err != nil {

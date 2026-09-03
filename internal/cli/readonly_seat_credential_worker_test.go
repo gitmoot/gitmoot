@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -229,12 +230,26 @@ func TestWorkerStaysSilentOnSeatCredentialsInGatewayMode(t *testing.T) {
 		WorktreePath: checkout, ReadOnlySeat: true, RuntimeConfigDir: sourceDir,
 	})
 
+	gateway, err := credgw.Start(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = gateway.Close(context.Background()) })
+	gatewayRunner := &credgw.Runner{
+		Inner:      &repairStateRunner{},
+		Gateway:    gateway,
+		Credential: credgw.Credential{Kind: credgw.CredentialBearer, Value: "test-token"},
+		Policy:     credgw.Policy{Upstream: credgw.DefaultAnthropicUpstream, AllowedHosts: []string{"api.anthropic.com"}},
+	}
 	worker := defaultJobWorker(store, io.Discard, home)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		return checkout, nil
 	}
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
-		return runtime.ClaudeAdapter{Runner: &repairStateRunner{}}, nil
+		return modelGatewayRuntimeAdapter{
+			Adapter: runtime.ClaudeAdapter{Runner: gatewayRunner},
+			runner:  gatewayRunner,
+		}, nil
 	}
 	job, err := store.GetJob(ctx, "cred-review-gateway")
 	if err != nil {

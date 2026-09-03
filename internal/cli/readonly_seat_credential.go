@@ -31,11 +31,9 @@ import (
 // problem. Two states are worth separating, and only one of them is certain:
 //
 //   - EXPIRED WITH NO REFRESH TOKEN is provably unusable. There is no valid
-//     access token and no way to obtain one, so launching can only fail. This
-//     refuses BEFORE the runtime starts, with an error naming the source dir and
-//     the expiry. `/root/.claude/.credentials.json` has been in exactly this
-//     state since 2026-08-31 (expiresAt 0, refreshToken absent), which is what
-//     forced the daemon onto a different account.
+//     access token and no way to obtain one. The worker records that fact before
+//     delivery; a later runtime-auth rejection follows the normal deferrable
+//     blocker path instead of becoming a terminal preflight failure.
 //   - EXPIRED WITH A REFRESH TOKEN may still work: refreshing is the runtime's
 //     job and normally succeeds. This does NOT refuse, because refusing would
 //     break every host whose credential refreshes fine. It records a diagnosis
