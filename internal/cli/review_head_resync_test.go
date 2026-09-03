@@ -354,6 +354,12 @@ func TestDefaultCheckoutReviewHeadResyncMeasuresDirection(t *testing.T) {
 		// wantErr is the substring the resolution must fail with; empty means the
 		// resolution must succeed and return the checkout.
 		wantErr string
+		// wantErrExact, when set, is the WHOLE error text the resolution must fail
+		// with, given the checkout head and the dispatched rev. It pins the promise
+		// that a refusal leaves the caller's original error byte-for-byte, which is
+		// what keeps the job on the #532 deferral surface — a substring match would
+		// still pass if the refusal wrapped or re-worded that error.
+		wantErrExact func(head, dispatched string) string
 		// wantHead is the payload head expected afterwards, given the dispatched head.
 		wantHead func(t *testing.T, checkout, dispatched string) string
 		// wantEvent is the single event kind the job must carry, with wantMessage a
@@ -404,6 +410,9 @@ func TestDefaultCheckoutReviewHeadResyncMeasuresDirection(t *testing.T) {
 				return dispatched
 			},
 			wantErr: "not review job head",
+			wantErrExact: func(head, dispatched string) string {
+				return fmt.Sprintf("checkout head is %s, not review job head %s", head, dispatched)
+			},
 			wantHead: func(_ *testing.T, _, dispatched string) string {
 				return dispatched
 			},
@@ -423,6 +432,9 @@ func TestDefaultCheckoutReviewHeadResyncMeasuresDirection(t *testing.T) {
 			// error classified as nothing and terminally failed the job. The diagnosis
 			// goes in the job record instead of the control flow.
 			wantErr: "not review job head",
+			wantErrExact: func(head, dispatched string) string {
+				return fmt.Sprintf("checkout head is %s, not review job head %s", head, dispatched)
+			},
 			wantHead: func(_ *testing.T, _, dispatched string) string {
 				return dispatched
 			},
@@ -567,6 +579,11 @@ func TestDefaultCheckoutReviewHeadResyncMeasuresDirection(t *testing.T) {
 				}
 				if !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("error = %v, want it to contain %q", err, tc.wantErr)
+				}
+				if tc.wantErrExact != nil {
+					if want := tc.wantErrExact(daemonWorkerHeadSHA(t, checkout), dispatched); err.Error() != want {
+						t.Fatalf("error = %q, want the caller's original error VERBATIM: %q", err.Error(), want)
+					}
 				}
 			}
 
