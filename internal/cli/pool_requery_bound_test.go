@@ -137,7 +137,7 @@ func TestPoolRequeryBoundIsPacedAndDispatchesNothingWhenIdle(t *testing.T) {
 
 	adapter := newWedgeBlockingAdapter("job-a")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "audit", Action: "ask", Repo: repo, Branch: "main", PullRequest: 1})
-	_, _ = startTrackedWedgeLoop(t, ctx, store, adapter, 2, true, io.Discard)
+	_, errCh := startTrackedWedgeLoop(t, ctx, store, adapter, 2, true, io.Discard)
 
 	if !waitForCondition(t, 5*time.Second, adapter.stillBlocked) {
 		t.Fatalf("job-a never started delivering; delivered=%v", adapter.deliveredJobs())
@@ -169,5 +169,75 @@ func TestPoolRequeryBoundIsPacedAndDispatchesNothingWhenIdle(t *testing.T) {
 	close(adapter.release)
 	if got := waitForJobState(t, store, "job-a", string(workflow.JobSucceeded), 10*time.Second); got != string(workflow.JobSucceeded) {
 		t.Fatalf("job-a state = %q after release, want succeeded (the empty-queue path must be unchanged)", got)
+	}
+
+	// Stop the loop HERE rather than relying on cleanup ordering. Restoring
+	// poolRequeryInterval while a pool pass is still parked on the shortened
+	// timer is safe today only because t.Cleanup runs LIFO — this test's restore
+	// was registered before startTrackedWedgeLoop's drain — and because
+	// tryBeginPool/endPool bracket the pass in the tracker's WaitGroup so drain
+	// genuinely waits for that goroutine. Both are true and neither is obvious,
+	// so the ordering is made explicit instead of inherited: cancel, wait for the
+	// loop to exit, and only then let the restore run.
+	cancel()
+	select {
+	case <-errCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker loop did not stop after context cancellation")
+	}
+}
+
+// TestPoolRequeryObserverIsSilentOnTheBarrierPath pins the DISCRIMINATOR the two
+// tests above rely on, rather than trusting it.
+//
+// poolRequeryObserver is a production hook whose only caller in production is
+// nil, so a reader is right to ask what it proves. It proves "the POOL pass's
+// bounded wait fired" only if it stays silent when dispatch is NOT on the pool
+// path — otherwise the assertions built on it in
+// TestPoolPassSeesJobEnqueuedWhileAnotherRuns would pass on a barrier build and
+// the pool-path claim would be unfounded again, which is exactly the round-1
+// finding. Same scenario, barrier scheduler: the observer must never fire.
+func TestPoolRequeryObserverIsSilentOnTheBarrierPath(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const repo = "owner/repo"
+	var wakes int64
+	restoreInterval, restoreObserver := poolRequeryInterval, poolRequeryObserver
+	poolRequeryInterval = 20 * time.Millisecond
+	poolRequeryObserver = func() { atomic.AddInt64(&wakes, 1) }
+	t.Cleanup(func() { poolRequeryInterval, poolRequeryObserver = restoreInterval, restoreObserver })
+
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, repo, t.TempDir())
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, repo)
+
+	adapter := newWedgeBlockingAdapter("job-a")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "audit", Action: "ask", Repo: repo, Branch: "main", PullRequest: 1})
+	// usePool=false: the BARRIER scheduler, which re-queries on its own tick and
+	// has no bounded wait to instrument.
+	tracker, errCh := startTrackedWedgeLoop(t, ctx, store, adapter, 2, false, io.Discard)
+
+	if !waitForCondition(t, 5*time.Second, adapter.stillBlocked) {
+		t.Fatalf("job-a never started delivering; delivered=%v", adapter.deliveredJobs())
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	if tracker.poolRunning(repo) {
+		t.Fatalf("a pool pass is live on the barrier scheduler; the control does not exercise the barrier path")
+	}
+	if got := atomic.LoadInt64(&wakes); got != 0 {
+		t.Fatalf("pool re-query observer fired %d times on the BARRIER path, want 0; the discriminator the pool-path tests rely on does not discriminate", got)
+	}
+
+	close(adapter.release)
+	if got := waitForJobState(t, store, "job-a", string(workflow.JobSucceeded), 10*time.Second); got != string(workflow.JobSucceeded) {
+		t.Fatalf("job-a state = %q after release, want succeeded", got)
+	}
+	cancel()
+	select {
+	case <-errCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker loop did not stop after context cancellation")
 	}
 }
