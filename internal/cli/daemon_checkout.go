@@ -644,25 +644,35 @@ func (w jobWorker) resyncReviewHeadForRunner(ctx context.Context, job db.Job, pa
 		// Already recorded exactly; there is nothing to write.
 		return false, nil
 	}
-	if commitSHAAbbreviation(dispatched, head) {
-		resolved, resolveErr := git.RevParse(ctx, dispatched)
-		if resolveErr == nil && normalizeCommitSHA(resolved) == head {
-			if err := w.persistReviewHead(ctx, job, payload, head); err != nil {
-				return false, err
-			}
-			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{
-				JobID: job.ID,
-				Kind:  reviewHeadNormalizedEvent,
-				Message: fmt.Sprintf("PR #%d dispatched head %s and checkout head %s are the SAME commit; recording the full SHA, not re-targeting the review",
-					payload.PullRequest, dispatched, head),
-			}); eventErr != nil {
-				return false, eventErr
-			}
-			writeLine(w.Stdout, "job %s review head %s recorded in full as %s (PR #%d same commit)", job.ID, dispatched, head, payload.PullRequest)
-			return true, nil
+	// A dispatched head that names the SAME commit as the checkout head is not a
+	// re-target in any direction, however it was written down: a differently-cased
+	// 40-char SHA and a 12-char abbreviation are both the identical commit. Only the
+	// recorded FORM differs, so the payload is normalized and the review proceeds
+	// exactly as it does today, but it is never counted as a re-sync — miscounting
+	// these is what inflated, and then retracted, #1561's headline.
+	sameCommit := dispatched == head
+	if !sameCommit && commitSHAAbbreviation(dispatched, head) {
+		// rev-parse is the authority on what an abbreviation resolves to; a prefix
+		// that does not resolve here, or resolves to a different commit, is not
+		// provably the same commit and goes through the ancestry gate instead.
+		if resolved, resolveErr := git.RevParse(ctx, dispatched); resolveErr == nil && normalizeCommitSHA(resolved) == head {
+			sameCommit = true
 		}
-		// The abbreviation does not resolve here, or resolves to a different commit;
-		// it is not provably the same commit, so it goes through the ancestry gate.
+	}
+	if sameCommit {
+		if err := w.persistReviewHead(ctx, job, payload, head); err != nil {
+			return false, err
+		}
+		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID: job.ID,
+			Kind:  reviewHeadNormalizedEvent,
+			Message: fmt.Sprintf("PR #%d dispatched head %s and checkout head %s are the SAME commit; recording the canonical SHA, not re-targeting the review",
+				payload.PullRequest, dispatched, head),
+		}); eventErr != nil {
+			return false, eventErr
+		}
+		writeLine(w.Stdout, "job %s review head %s recorded canonically as %s (PR #%d same commit)", job.ID, dispatched, head, payload.PullRequest)
+		return true, nil
 	}
 	fastForward, err := git.IsAncestor(ctx, dispatched, head)
 	if err != nil {

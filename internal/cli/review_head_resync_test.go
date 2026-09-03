@@ -433,6 +433,21 @@ func TestDefaultCheckoutReviewHeadResyncMeasuresDirection(t *testing.T) {
 			wantMessage: "are the SAME commit",
 		},
 		{
+			name: "case_only_same_commit_is_not_a_re_sync",
+			setup: func(t *testing.T, checkout string) string {
+				// Same commit, same length, different case: the abbreviation pre-filter
+				// cannot see this one, and a commit is its own ancestor, so without an
+				// identity check first it would be recorded as a fast-forward re-sync of
+				// a head that never moved.
+				return strings.ToUpper(daemonWorkerHeadSHA(t, checkout))
+			},
+			wantHead: func(t *testing.T, checkout, _ string) string {
+				return daemonWorkerHeadSHA(t, checkout)
+			},
+			wantEvent:   "review_head_normalized",
+			wantMessage: "are the SAME commit",
+		},
+		{
 			name:   "wrong_branch_checkout_still_declines_before_any_measurement",
 			branch: "feat/other",
 			setup: func(t *testing.T, checkout string) string {
