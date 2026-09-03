@@ -87,7 +87,11 @@ func TestKimiSelectedProviderWithholdsWhenItCannotProveWhichIsLive(t *testing.T)
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			if got := kimiSelectedProvider([]byte(tc.config)); got != tc.want {
+			lines, err := scanTOMLLines([]byte(tc.config))
+			if err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			if got := kimiSelectedProvider(lines); got != tc.want {
 				t.Fatalf("kimiSelectedProvider = %q, want %q", got, tc.want)
 			}
 		})

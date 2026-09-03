@@ -717,7 +717,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		return nil
 	}
 	adapter, narrowingDropped, err := wrapReadOnlySandboxAdapter(w.ConfigHome, agent, deliveryCheckout, adapter)
-	if err == nil && len(narrowingDropped) > 0 {
+	if len(narrowingDropped) > 0 {
 		// Narrowing is not silent: a reviewer whose MCP tool is missing, or a
 		// seat that cannot authenticate to a provider whose key was withheld,
 		// can find out why from the job's own event log.
@@ -1486,14 +1486,19 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 	}
 	wrapped, err := wrapReadOnlyAdapterRunner(agent.Runtime, adapter, grants.stateDir, wrap)
 	if err != nil {
-		return nil, nil, err
+		// Staging and narrowing are already done at this point, so the
+		// withheld list is reported even though the wrap failed.
+		return nil, grants.dropped, err
 	}
 	if grants.stateDir == "" {
 		return wrapped, grants.dropped, nil
 	}
 	runtimeAdapter, ok := wrapped.(runtime.Adapter)
 	if !ok {
-		return nil, nil, fmt.Errorf("read-only Landlock sandbox returned incompatible %T adapter", wrapped)
+		// The narrowing already happened, so report it even though delivery
+		// cannot be built: a withheld credential is news whether or not the
+		// wrap succeeds.
+		return nil, grants.dropped, fmt.Errorf("read-only Landlock sandbox returned incompatible %T adapter", wrapped)
 	}
 	return readOnlyRuntimeAdapter{
 		Adapter:     runtimeAdapter,
@@ -1812,6 +1817,15 @@ func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string, gatewayM
 		return "", nil, nil, fmt.Errorf("resolve read-only runtime state home: %w", err)
 	}
 	policy, needsState, err := readOnlySeatStatePolicyFor(agent.Runtime, userHome, gatewayMode)
+	if gatewayMode {
+		// The gateway supplies the credential, as the claude branch has always
+		// said. Only claude acted on it, so a gateway seat still staged
+		// codex's auth.json and kimi's token - neither of which it needs.
+		// Model settings (the narrowed config inputs) are still staged.
+		policy.credentialFile = ""
+		policy.credentialSection = ""
+		policy.credentialUsable = nil
+	}
 	if err != nil || !needsState {
 		return "", nil, nil, err
 	}
@@ -3006,7 +3020,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		// ReadOnlySeat is set), so this cannot affect the common path.
 		var forkDropped []string
 		adapter, forkDropped, err = wrapReadOnlySandboxAdapter(w.ConfigHome, started.Agent, checkout, adapter)
-		if err == nil && len(forkDropped) > 0 {
+		if len(forkDropped) > 0 {
 			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "read_only_seat_config_narrowed", Message: "withheld from the seat's staged config: " + strings.Join(forkDropped, ", ")}); eventErr != nil {
 				return eventErr
 			}

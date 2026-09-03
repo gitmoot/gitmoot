@@ -666,6 +666,35 @@ is missing - or a seat that cannot reach a provider - can find out why:
 gitmoot job events <job-id> | grep read_only_seat_config_narrowed
 ```
 
+### Two more refusals, and what gateway mode withholds
+
+Narrowing reads the file with ONE scanner shared by narrowing and provider
+selection, so escapes, comments, multi-line strings and unbalanced brackets are
+interpreted identically everywhere. Two shapes are refused rather than staged,
+because in both cases part of the file could not be classified, and staging an
+unclassified tail is the leak the narrowing exists to prevent:
+
+- `config has an array or inline table that never closes` - an unbalanced `[`
+  or `{` reached the end of the file.
+- `config has a multi-line string that never closes` - as before.
+
+A triple delimiter inside a COMMENT or inside a single-line string is not a
+multi-line string, and a backslash-escaped quote is valid TOML that stages
+unchanged.
+
+One provider shape is refused for a different reason:
+
+- `codex model_provider "<name>" authenticates only through env_key, and a
+  read-only seat's environment allowlist does not pass that variable through` -
+  set an inline `api_key` for that provider, or point `model_provider` at one
+  the seat can reach. Previously this staged cleanly and the seat failed later
+  with the runtime's own message.
+
+In GATEWAY mode the gateway supplies the credential, so a gateway seat stages
+NO credential file for any runtime - claude's `.credentials.json`, codex's
+`auth.json` and kimi's `credentials/kimi-code.json` are all withheld. Model
+settings are still staged, narrowed as above.
+
 ## Isolated worktrees duplicate gigabytes of tool cache
 
 An isolated-worktree job re-materializing its own `uv`/`go`/`npm`/`pip` cache
