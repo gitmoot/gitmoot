@@ -1256,3 +1256,114 @@ func listOrgSeatTestRules(t *testing.T, paths config.Paths) []db.EventRule {
 	}
 	return rules
 }
+
+// A seat whose configured pane will never resolve again had no retirement path:
+// removal fails closed on an unresolved binding (correctly, since a stale id or
+// ambiguous label may still name a LIVE pane), which left --force as the only
+// way to satisfy #1175's "bind it or remove it" for a seat whose pane is gone.
+// Measured on this host: gm-omp-e2b, gm-omp-nag and gm-omp-verdict were all
+// undeletable while gm-omp-e2b accrued 19 missed wakes.
+func TestOrgSeatRemoveForceRetiresAnUnresolvedSeat(t *testing.T) {
+	home, paths, panes := setupOrgSeatTestHome(t)
+	edit, _, err := config.UpsertOrgSeatRole(paths, config.OrgRole{
+		Name: "worker", Parent: "owner", Scope: []string{"*"}, Pane: "w1:p9",
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !edit.Changed() {
+		t.Fatal("stale worker config edit did not change config")
+	}
+	addOrgSeatWorkerRoutes(t, paths)
+	withOrgSeatFixtureProvider(t, &panes)
+	originalBranchCheck := orgSeatBranchCheck
+	orgSeatBranchCheck = func(context.Context, org.LivePane) error {
+		t.Fatal("forced removal of an unresolved seat must not attempt a branch check")
+		return nil
+	}
+	t.Cleanup(func() { orgSeatBranchCheck = originalBranchCheck })
+	originalClose := orgSeatClosePane
+	orgSeatClosePane = func(context.Context, string) error {
+		t.Fatal("forced removal of an unresolved seat must not close a pane")
+		return nil
+	}
+	t.Cleanup(func() { orgSeatClosePane = originalClose })
+
+	// Default still fails closed, and the refusal must name the escape hatch.
+	var stdout, stderr bytes.Buffer
+	if code := runOrg([]string{"seat", "rm", "worker", "--home", home}, &stdout, &stderr); code == 0 {
+		t.Fatalf("unforced rm of an unresolved seat must fail closed; out=%q err=%q", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "--force") {
+		t.Fatalf("refusal must name --force; err=%q", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := runOrg([]string{"seat", "rm", "worker", "--force", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("forced rm code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "pane check skipped under --force") {
+		t.Fatalf("forced removal must SAY the check was skipped; out=%q", stdout.String())
+	}
+	cfg, err := config.LoadOrg(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cfg.Role("worker"); ok {
+		t.Fatal("forced removal left the role in the registry")
+	}
+}
+
+// --force is scoped to an UNRESOLVED binding. It must never wave through a pane
+// that DOES resolve and whose branch check fails: that is live work about to be
+// destroyed. Without this test the scoping is vacuous, which a mutant proved by
+// making --force skip the branch check with every other test still green.
+func TestOrgSeatRemoveForceStillRefusesUnshippedBranchWork(t *testing.T) {
+	home, paths, panes := setupOrgSeatTestHome(t)
+	appendOrgSeatWorker(t, paths)
+	addOrgSeatWorkerRoutes(t, paths)
+
+	repo := t.TempDir()
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	runGit(t, repo, "init", "-b", "main")
+	runGit(t, repo, "config", "user.name", "Seat Test")
+	runGit(t, repo, "config", "user.email", "seat@example.test")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "README.md")
+	runGit(t, repo, "commit", "-m", "base")
+	runGit(t, t.TempDir(), "init", "--bare", remote)
+	runGit(t, remote, "symbolic-ref", "HEAD", "refs/heads/main")
+	runGit(t, repo, "remote", "add", "origin", remote)
+	runGit(t, repo, "push", "-u", "origin", "main")
+	runGit(t, repo, "checkout", "-b", "worker-unshipped")
+	if err := os.WriteFile(filepath.Join(repo, "work.txt"), []byte("not merged\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "work.txt")
+	runGit(t, repo, "commit", "-m", "unshipped")
+	panes[1].CWD = repo
+	panes[1].ForegroundCWD = repo
+	withOrgSeatFixtureProvider(t, &panes)
+	originalClose := orgSeatClosePane
+	orgSeatClosePane = func(context.Context, string) error {
+		t.Fatal("forced removal closed a pane holding unshipped work")
+		return nil
+	}
+	t.Cleanup(func() { orgSeatClosePane = originalClose })
+
+	var stdout, stderr bytes.Buffer
+	code := runOrg([]string{"seat", "rm", "worker", "--force", "--home", home}, &stdout, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "not merged into origin/main") {
+		t.Fatalf("forced rm over a resolved pane with unshipped work: code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	cfg, err := config.LoadOrg(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cfg.Role("worker"); !ok {
+		t.Fatal("forced removal deleted a role whose pane holds unshipped work")
+	}
+}

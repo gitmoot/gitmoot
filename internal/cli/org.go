@@ -143,7 +143,7 @@ func printOrgUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org status [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org recycle ROLE --kind KIND --handoff NOTE [--pane ID] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org seat add NAME [--pane ID_OR_LABEL] [--parent ROLE] [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--force] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org escalate --to ROLE --workflow LABEL [--org-role ROLE] [--repo OWNER/REPO] [--json] [--home DIR] \"QUESTION\"")
 	fmt.Fprintln(w, "  gitmoot org message send --to ROLE --workflow LABEL [--org-role ROLE] [--repo OWNER/REPO] [--json] [--home DIR] \"MESSAGE\"")
 	fmt.Fprintln(w, "  gitmoot org escalate resolve NOTE_ID [--by ROLE] [--note ANSWER_NOTE_ID] [--home DIR]")
@@ -182,7 +182,7 @@ func runOrgSeat(args []string, stdout, stderr io.Writer) int {
 func printOrgSeatUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot org seat add NAME [--pane ID_OR_LABEL] [--parent ROLE] [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--force] [--home DIR]")
 }
 
 func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
@@ -383,6 +383,18 @@ func runOrgSeatRemove(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("org seat rm", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	// A seat whose configured pane no longer resolves cannot be removed without
+	// this, and that is deliberate: a stale id or an ambiguous label may still
+	// name a LIVE pane holding work, which is why
+	// TestOrgSeatRemoveStalePaneIDFailsClosed and
+	// TestOrgSeatRemoveAmbiguousPaneLabelFailsClosed exist. But a seat whose pane
+	// is permanently gone then has no retirement path at all: measured on this
+	// host, gm-omp-e2b, gm-omp-nag and gm-omp-verdict were all undeletable while
+	// gm-omp-e2b accrued 19 missed wakes, and per #1175 an unbound role is a
+	// defect with exactly two remedies, bind or remove. --force is the operator
+	// stating that the pane is gone and accepting the unverified removal; it
+	// never skips the branch check on a pane that DOES resolve.
+	force := fs.Bool("force", false, "remove even when the configured pane cannot be resolved (stale id or ambiguous label)")
 	nameArg, flagArgs := leadingOrgSeatName(args)
 	if err := fs.Parse(flagArgs); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -443,24 +455,32 @@ func runOrgSeatRemove(args []string, stdout, stderr io.Writer) int {
 		}
 		binding := snapshot.PaneBindings[role.Name]
 		unresolvedDetail = firstNonEmpty(binding.Detail, "no live pane binding")
+		// An unresolved binding stays FAIL-CLOSED by default: a stale id or an
+		// ambiguous label may still name a live pane holding work, which is what
+		// TestOrgSeatRemoveStalePaneIDFailsClosed and
+		// TestOrgSeatRemoveAmbiguousPaneLabelFailsClosed defend. --force is the
+		// operator asserting the pane is gone, which is the only retirement path
+		// for a seat whose pane will never resolve again (#1175: an unbound role
+		// is a defect with two remedies, bind or remove).
 		if strings.TrimSpace(binding.PaneID) == "" {
-			fmt.Fprintf(
-				stderr,
-				"org seat rm: role %q pane is unresolved: %s; rebind with gitmoot org seat add %s --pane ID_OR_LABEL\n",
-				role.Name, unresolvedDetail, role.Name,
-			)
-			return 1
-		}
-		pane, ok = orgSeatPaneByID(snapshot.Panes, binding.PaneID)
-		if !ok {
+			if !*force {
+				fmt.Fprintf(
+					stderr,
+					"org seat rm: role %q pane is unresolved: %s; rebind with gitmoot org seat add %s --pane ID_OR_LABEL, or pass --force to retire a seat whose pane is gone\n",
+					role.Name, unresolvedDetail, role.Name,
+				)
+				return 1
+			}
+			writeLine(stdout, "org seat rm: %s pane check skipped under --force: %s", role.Name, unresolvedDetail)
+		} else if pane, ok = orgSeatPaneByID(snapshot.Panes, binding.PaneID); !ok {
 			fmt.Fprintf(stderr, "org seat rm: resolved pane %s is absent from the live snapshot\n", binding.PaneID)
 			return 1
-		}
-		if err := orgSeatBranchCheck(ctx, pane); err != nil {
+		} else if err := orgSeatBranchCheck(ctx, pane); err != nil {
 			fmt.Fprintf(stderr, "org seat rm: refusing to remove %q: %v\n", role.Name, err)
 			return 1
+		} else {
+			hasLivePane = true
 		}
-		hasLivePane = true
 	}
 	store, err := db.Open(paths.Database)
 	if err != nil {
