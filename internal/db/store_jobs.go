@@ -1527,6 +1527,27 @@ func (s *Store) ClaimJobEvent(ctx context.Context, event JobEvent) (bool, error)
 	return affected == 1, nil
 }
 
+// ReleaseJobEventClaim deletes an exact job/kind/message claim so a later
+// caller can win it again. It is for a claim whose external write PROVABLY did
+// not happen: the pipeline auto-merge gate claims before calling Merge, and a
+// reconciliation hold is returned before any GitHub mutation, which left the
+// claim consumed and the merge unrepeatable for the life of the run.
+//
+// It reports whether a row was removed, so a caller that loses the race with a
+// concurrent scan can tell it did not release someone else's claim.
+func (s *Store) ReleaseJobEventClaim(ctx context.Context, event JobEvent) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM job_events
+		WHERE job_id = ? AND kind = ? AND message = ?`, event.JobID, event.Kind, event.Message)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}
+
 // UpsertLatestJobEvent keeps one mutable latest-only row for a job/event kind.
 // The write is guarded by jobs.state='running' in the same transaction, so a
 // delayed best-effort progress tick that races terminalization becomes a no-op.

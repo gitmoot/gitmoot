@@ -1970,12 +1970,51 @@ func autoMergeGateStageSettleOutcome(ctx context.Context, deps pipelineStageSett
 		if reason == "" {
 			reason = "GitHub did not confirm the merge"
 		}
-		// A TRANSIENT refusal keeps the stage waiting, bounded by the gate's own
-		// timeout, instead of ending the run. The at-most-once claim is already
-		// consumed, so the next scan takes the !claimed path and waits there too
-		// until the PR merges or the gate times out (#1783 review, F4).
 		if result.Waiting {
-			return autoMergeGateWaiting(stage, stageRow, deps.now, payload.PullRequest)
+			// A TRANSIENT refusal keeps the stage waiting instead of ending the run.
+			// It must also RELEASE the claim: the claim is keyed on
+			// run/stage/PR/head, so leaving it consumed meant Merge was never
+			// re-attempted for the life of the run and the row landing merged
+			// nothing (#1783 round-3 review, F-A, measured). Releasing is safe
+			// because a Waiting return happens in PipelineAutoMerger.Merge BEFORE
+			// executePullRequestMerge, so no GitHub mutation occurred; the claim
+			// guards a write that provably did not happen.
+			if _, releaseErr := deps.store.ReleaseJobEventClaim(ctx, db.JobEvent{
+				JobID: sourceJobID, Kind: "pipeline_auto_merge_claim", Message: string(claim),
+			}); releaseErr != nil {
+				return false, "", "", nil, nil, releaseErr
+			}
+			// Record WHY the run is parked. The pre-change terminal block carried
+			// the reason; a silent wait reintroduced exactly the unexplained hold
+			// the native lane's F2 work removed.
+			held, marshalErr := json.Marshal(map[string]any{
+				"phase": "held", "pipeline": deps.rec.Name, "run_id": deps.run.ID,
+				"stage_id": stage.ID, "pull_request": payload.PullRequest,
+				"head_sha": reviewedHead, "reason": reason,
+			})
+			if marshalErr != nil {
+				return false, "", "", nil, nil, marshalErr
+			}
+			if eventErr := deps.store.AddJobEventIfAbsent(ctx, db.JobEvent{
+				JobID: sourceJobID, Kind: "pipeline_auto_merge_held", Message: string(held),
+			}); eventErr != nil {
+				return false, "", "", nil, nil, eventErr
+			}
+			// BOUND the wait. A gate stage's `timeout` is optional, so without one
+			// the reviewer measured this parked silently at now+72h. When the spec
+			// sets no timeout, the hold itself is bounded from the FIRST recorded
+			// hold event and parks with its cause; a spec timeout still wins.
+			if strings.TrimSpace(stage.Timeout) == "" {
+				heldSince, holdErr := firstAutoMergeHoldAt(ctx, deps.store, sourceJobID)
+				if holdErr != nil {
+					return false, "", "", nil, nil, holdErr
+				}
+				if !heldSince.IsZero() && deps.now.Sub(heldSince) >= autoMergeHoldMaxWait {
+					return block(fmt.Sprintf("auto-merge held %s without reconciliation (no gate timeout is set, so the hold's own bound of %s applied): %s",
+						deps.now.Sub(heldSince).Truncate(time.Second), autoMergeHoldMaxWait, reason))
+				}
+			}
+			return autoMergeGateWaitingWithReason(stage, stageRow, deps.now, payload.PullRequest, reason)
 		}
 		return block(reason + "; retry stopped")
 	}
@@ -1991,6 +2030,54 @@ func autoMergeGateStageSettleOutcome(ctx context.Context, deps pipelineStageSett
 		return false, "", "", nil, nil, eventErr
 	}
 	return true, StageSucceeded, fmt.Sprintf("gate %s auto-merged PR #%d at %s", stage.Gate, payload.PullRequest, shortPipelineSHA(reviewedHead)), nil, nil, nil
+}
+
+// autoMergeGateWaitingWithReason is autoMergeGateWaiting for a hold that HAS a
+// stated cause. On timeout the cause travels into the park summary and needs, so
+// the human who finds the parked run reads why it waited rather than only what
+// it waited for (#1783 round-3 review, F-A).
+func autoMergeGateWaitingWithReason(stage Stage, stageRow db.PipelineRunStage, now time.Time, pr int, reason string) (bool, string, string, []string, *db.PipelineRunStage, error) {
+	reason = strings.TrimSpace(reason)
+	if timedOut, waited := pipelineGateTimedOut(stage, stageRow, now); timedOut && reason != "" {
+		want := pipelineGateWaitDescription(stage.Gate, pr)
+		return true, StageBlocked,
+			fmt.Sprintf("gate %s timed out after %s waiting for auto-merge readiness for %s: %s", stage.Gate, waited, want, reason),
+			[]string{want, reason}, nil, nil
+	}
+	return autoMergeGateWaiting(stage, stageRow, now, pr)
+}
+
+// autoMergeHoldMaxWait bounds a merge-boundary reconciliation hold when the gate
+// stage sets no `timeout`. A gate with no timeout otherwise waits forever, which
+// the #1783 round-3 review measured as a silent park at now+72h. The hold is
+// retryable, so this bound only decides when to stop retrying and park WITH the
+// cause; a spec timeout takes precedence.
+const autoMergeHoldMaxWait = 6 * time.Hour
+
+// firstAutoMergeHoldAt returns when this source job's merge-boundary hold was
+// first recorded, or the zero time when no hold has been recorded yet. Parse
+// failures return zero rather than an error: an unbounded wait is better than a
+// park on an unreadable timestamp.
+func firstAutoMergeHoldAt(ctx context.Context, store *db.Store, sourceJobID string) (time.Time, error) {
+	events, err := store.ListJobEvents(ctx, sourceJobID)
+	if err != nil {
+		return time.Time{}, err
+	}
+	first := time.Time{}
+	for _, event := range events {
+		if event.Kind != "pipeline_auto_merge_held" {
+			continue
+		}
+		at, parseErr := time.Parse(time.DateTime, strings.TrimSpace(event.CreatedAt))
+		if parseErr != nil {
+			continue
+		}
+		at = at.UTC()
+		if first.IsZero() || at.Before(first) {
+			first = at
+		}
+	}
+	return first, nil
 }
 
 func autoMergeGateWaiting(stage Stage, stageRow db.PipelineRunStage, now time.Time, pr int) (bool, string, string, []string, *db.PipelineRunStage, error) {

@@ -638,3 +638,109 @@ func TestWorkloadModeGateUnreadableDecisionIsABoundaryNotAWedge(t *testing.T) {
 		}
 	})
 }
+
+// GitHub OMITS the patch for large files, and AGENTS.md is large, so the
+// refusal used to tell the author to fix a marker that was never the problem
+// and name no exit they could take (#1783 round-3 review, F-B).
+func TestWorkloadModeGateNamesAReachableRemedyWhenGitHubOmitsThePatch(t *testing.T) {
+	store, gh, gate, request := newWorkloadModeGateScenario(t)
+	gh.files = []github.PullRequestFile{{Filename: "AGENTS.md"}} // patch omitted by the API
+	unreadable := insertRawOperatingMode(t, store, "gitmoot/gitmoot", "[operating-mode repo=gitmoot/gitmoot mode=PAUSED]")
+
+	decision, err := gate.Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if decision.Merged || len(gh.merges) != 0 {
+		t.Fatalf("an unreadable note plus an unreadable marker must hold: decision=%+v merges=%d", decision, len(gh.merges))
+	}
+	rendered := decision.Reason.Render()
+	for _, want := range []string{
+		strconv.FormatInt(unreadable.ID, 10),
+		"GitHub omitted this PR's AGENTS.md patch",
+		"not the author's to fix",
+		"append a fresh readable operating-mode note",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("hold must contain %q: %q", want, rendered)
+		}
+	}
+
+	// And the owner-level exit actually works: a fresh readable note clears it.
+	insertOperatingModeDecision(t, store, "STEADY")
+	insertRawModeReconciliation(t, store, "STEADY", "head123", "none")
+	cleared, err := gate.Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Evaluate after the fresh note: %v", err)
+	}
+	if !cleared.Merged || len(gh.merges) != 1 {
+		t.Fatalf("the named remedy did not work: decision=%+v merges=%d reason=%q",
+			cleared, len(gh.merges), cleared.Reason.Render())
+	}
+}
+
+// A valid row aged out of the 200-row window used to leave the hold blaming an
+// unrelated near-miss row, which reads as a verdict on the operator's own work
+// (#1783 round-3 review, F-C). The window is recoverable by refiling, so this
+// is a message fix - the hold must SAY the window was full.
+func TestWorkloadModeGateHoldNamesTheScanWindowWhenItIsFull(t *testing.T) {
+	store, gh, gate, request := newWorkloadModeGateScenario(t)
+	mode := insertOperatingModeDecision(t, store, "STEADY")
+	insertModeReconciliation(t, store, mode, "STEADY", "head123")
+	for i := range workloadModeReconciliationScan + 5 {
+		if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+			WorkflowID: "gitmoot/worktree-lifecycle",
+			Author:     "coordinator",
+			Repo:       "gitmoot/gitmoot",
+			Body: fmt.Sprintf("[workload-mode-reconciliation repo=gitmoot/gitmoot pr=%d head=otherhead mode=STEADY decision_note=%d]",
+				1000+i, mode.ID),
+		}); err != nil {
+			t.Fatalf("InsertWorkflowNote filler %d: %v", i, err)
+		}
+	}
+
+	decision, err := gate.Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if decision.Merged || len(gh.merges) != 0 {
+		t.Fatalf("an aged-out row cannot reconcile: decision=%+v merges=%d", decision, len(gh.merges))
+	}
+	if rendered := decision.Reason.Render(); !strings.Contains(rendered, "may have aged out") {
+		t.Fatalf("hold must name the full scan window rather than only a near-miss row: %q", rendered)
+	}
+}
+
+// `workflow note` is written by hand, so an omitted --repo left a malformed
+// operating-mode note invisible to the boundary and a stale PR-sourced row
+// still reconciled (#1783 round-3 review, F-D).
+func TestWorkloadModeGateBoundaryCatchesAMalformedNoteWithNoRepoColumn(t *testing.T) {
+	store, gh, gate, request := newWorkloadModeGateScenario(t)
+	stale := insertRawModeReconciliation(t, store, "STEADY", "head123", "none")
+	unreadable := insertRawOperatingMode(t, store, "", "[operating-mode repo=gitmoot/gitmoot mode=DRAIN urgent]")
+
+	decision, err := gate.Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if decision.Merged || len(gh.merges) != 0 {
+		t.Fatalf("a repo-less malformed note must still supersede: decision=%+v merges=%d reason=%q",
+			decision, len(gh.merges), decision.Reason.Render())
+	}
+	rendered := decision.Reason.Render()
+	if !strings.Contains(rendered, strconv.FormatInt(stale.ID, 10)) || !strings.Contains(rendered, strconv.FormatInt(unreadable.ID, 10)) {
+		t.Fatalf("hold must name the stale row and the note that superseded it: %q", rendered)
+	}
+
+	// A malformed note that names ANOTHER repo, with no repo column, must still
+	// be ignored: the anti-wedge narrowing is the point.
+	other, _, otherGate, otherRequest := newWorkloadModeGateScenario(t)
+	otherMode := insertOperatingModeDecision(t, other, "STEADY")
+	insertModeReconciliation(t, other, otherMode, "STEADY", "head123")
+	insertRawOperatingMode(t, other, "", "[operating-mode repo=other/repo mode=DRAIN urgent]")
+	if decision, err := otherGate.Evaluate(context.Background(), otherRequest); err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	} else if !decision.Merged {
+		t.Fatalf("another repo's repo-less malformed note must not hold this one: %q", decision.Reason.Render())
+	}
+}

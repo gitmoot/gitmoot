@@ -21,6 +21,29 @@ type modeSensitivePullRequest struct {
 	required  bool
 	mode      string
 	ambiguous bool
+	// patchUnavailable records that GitHub omitted the AGENTS.md patch, which is
+	// an API limit on large files rather than an author mistake.
+	patchUnavailable bool
+}
+
+// noteConcernsRepo decides whether an UNPARSEABLE note belongs to this repo:
+// its repo column when set, else a lenient `repo=<value>` scan of the body. A
+// note that names neither is another lane's and is skipped.
+func noteConcernsRepo(note db.WorkflowNote, repo string) bool {
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return false
+	}
+	if column := strings.TrimSpace(note.Repo); column != "" {
+		return strings.EqualFold(column, repo)
+	}
+	for _, field := range strings.Fields(note.Body) {
+		field = strings.TrimRight(field, "]")
+		if value, ok := strings.CutPrefix(field, "repo="); ok {
+			return strings.EqualFold(strings.TrimSpace(value), repo)
+		}
+	}
+	return false
 }
 
 // workloadModeEnforcedOwner is the repository OWNER whose mode-marker changes
@@ -58,7 +81,12 @@ func inspectModeSensitivePullRequest(ctx context.Context, gh MergeGateGitHub, re
 		}
 		patch := strings.TrimSpace(file.Patch)
 		if patch == "" {
-			return modeSensitivePullRequest{required: true, ambiguous: true}, nil
+			// GitHub OMITS `patch` for large files, and AGENTS.md is large, so this
+			// is routinely an API limit rather than anything the author did. It
+			// still requires reconciliation - the marker may have moved and we
+			// cannot see it - but the hold must not tell the author to fix a
+			// marker that is not the problem (#1783 round-3 review, F-B).
+			return modeSensitivePullRequest{required: true, ambiguous: true, patchUnavailable: true}, nil
 		}
 		var addedMode string
 		changed := false
@@ -154,9 +182,13 @@ func ensureWorkloadModeReconciled(ctx context.Context, store *db.Store, gh Merge
 	// unreadable note, or a PR whose own marker is unreadable too, where nothing
 	// remains to check the row against.
 	if decision.unreadableID > 0 && strings.TrimSpace(observed.mode) == "" {
+		remedy := "correct that note, or append a fresh readable operating-mode note"
+		if observed.patchUnavailable {
+			remedy = "GitHub omitted this PR's AGENTS.md patch, so the marker cannot be read here and is not the author's to fix; " + remedy
+		}
 		return true, false, fmt.Sprintf(
-			"workload-mode change cannot be reconciled: operating-mode note %d %s and this PR's own mode marker is missing or ambiguous, so no readable decision remains; correct that note or the marker",
-			decision.unreadableID, decision.unreadableWhy,
+			"workload-mode change cannot be reconciled: operating-mode note %d %s and this PR's own mode marker is missing or ambiguous, so no readable decision remains; %s",
+			decision.unreadableID, decision.unreadableWhy, remedy,
 		), nil
 	}
 	expectedMode := strings.ToUpper(strings.TrimSpace(observed.mode))
@@ -255,7 +287,19 @@ func ensureWorkloadModeReconciled(ctx context.Context, store *db.Store, gh Merge
 	}
 	detail := fmt.Sprintf("workload-mode change requires reconciliation at head %s against operating-mode note %s", shortSHA(headSHA), decisionID)
 	if observed.ambiguous {
-		detail += "; AGENTS.md mode-marker patch is missing or ambiguous"
+		if observed.patchUnavailable {
+			detail += "; GitHub omitted this PR's AGENTS.md patch, so the mode marker could not be read"
+		} else {
+			detail += "; AGENTS.md mode-marker patch is missing or ambiguous"
+		}
+	}
+	if len(notes) >= workloadModeReconciliationScan {
+		// The window is FULL, so a valid row for this head may have been pushed
+		// out of it by newer rows from the same repo. Without this line the hold
+		// names whichever near-miss the loop happened to see and reads as a
+		// verdict on the operator's own row (#1783 round-3 review, F-C). Refiling
+		// the row recovers it, which is why this is a message fix.
+		detail += fmt.Sprintf("; the newest %d reconciliation rows for this repository were scanned and a valid row for this head may have aged out - refile it if you already wrote one", workloadModeReconciliationScan)
 	}
 	if nearMiss == "" {
 		// The repo-scoped SQL drops a row whose repo COLUMN names another
@@ -313,11 +357,17 @@ func latestOperatingModeDecision(ctx context.Context, store *db.Store, repo stri
 			}, nil
 		}
 		// An unparseable body cannot answer "is this note for this repo?" through
-		// its repo FIELD, so fall back to the note's repo COLUMN. A note that is
-		// demonstrably this repo's and unreadable HOLDS; one that names neither
+		// its repo FIELD, so fall back to the note's repo COLUMN, and when that is
+		// empty to a lenient scan of the body for `repo=<this repo>`. A note that
+		// is demonstrably this repo's and unreadable HOLDS; one that names neither
 		// this repo nor nothing is another lane's problem and is skipped, so a
 		// typo in an unrelated note cannot freeze every gitmoot repository.
-		if !parsed && strings.EqualFold(strings.TrimSpace(note.Repo), strings.TrimSpace(repo)) {
+		//
+		// The lenient body scan closes the residual fail-open the round-3 review
+		// measured (F-D): `workflow note` is written by hand, so an omitted --repo
+		// left a malformed note invisible and a stale PR-sourced row still
+		// reconciled.
+		if !parsed && noteConcernsRepo(note, repo) {
 			return operatingModeDecision{
 				unreadableID:  note.ID,
 				unreadableWhy: "has a malformed field list, so its mode cannot be read",

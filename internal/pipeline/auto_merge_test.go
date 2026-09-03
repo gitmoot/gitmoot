@@ -198,51 +198,149 @@ func TestPipelineAutoMergeGateExecutesAfterApprovedReviewAndGreenChecks(t *testi
 	}
 }
 
-// A TRANSIENT merge-boundary refusal must keep the gate waiting. The fold turned
-// any !Merged into "retry stopped", so a workload-mode reconciliation hold that
-// Evaluate reports as Waiting terminally blocked the run once it appeared in the
-// Evaluate->Merge window, and the at-most-once claim was already consumed
-// (#1783 review, F4). The claim is why the retry is safe: the next scan cannot
-// call Merge again.
-func TestPipelineAutoMergeWaitingResultKeepsTheGateRetryable(t *testing.T) {
+// A TRANSIENT merge-boundary refusal must keep the gate waiting AND stay
+// mergeable once the condition clears. My first version of this test asserted
+// the opposite and called it safety: it required mergeReqs to stay at 1 on
+// rescan, which is exactly the defect the round-3 review measured - the
+// at-most-once claim is keyed on run/stage/PR/head, so a consumed claim meant
+// Merge was NEVER re-attempted and the reconciliation row landing merged
+// nothing, forever, with the reason discarded. The claim is now RELEASED on a
+// Waiting return, which is sound because that return happens before any GitHub
+// mutation.
+func TestPipelineAutoMergeWaitingHoldClearsWhenTheConditionClears(t *testing.T) {
 	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
 	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	const holdReason = "workload-mode change requires reconciliation at head 0123456 against operating-mode note 41"
 	executor := &stubPipelineAutoMerger{
-		readiness: workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
-		mergeResult: workflow.PipelineAutoMergeResult{
-			Waiting: true,
-			Reason:  "workload-mode change requires reconciliation at head 0123456 against operating-mode note 41",
-		},
+		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		mergeResult: workflow.PipelineAutoMergeResult{Waiting: true, Reason: holdReason},
 	}
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), executor)
 
 	if len(executor.mergeReqs) != 1 {
-		t.Fatalf("merge calls = %d, want exactly one attempt", len(executor.mergeReqs))
-	}
-	gate := stageRow(t, store, run.ID, "merge")
-	if gate.State == StageBlocked || gate.State == StageFailed {
-		t.Fatalf("a transient hold ended the run: gate=%+v run=%+v", gate, run)
-	}
-	if run.State == RunBlocked || run.State == RunFailed {
-		t.Fatalf("run = %q, want it still open after a transient hold", run.State)
-	}
-
-	// The consumed claim keeps the retry at-most-once: a later scan must not
-	// call Merge again, and the gate must still not be terminal.
-	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(3*time.Second), executor)
-	if len(executor.mergeReqs) != 1 {
-		t.Fatalf("rescan merge calls = %d, want the claim to hold at one", len(executor.mergeReqs))
+		t.Fatalf("merge calls = %d, want one attempt", len(executor.mergeReqs))
 	}
 	if gate := stageRow(t, store, run.ID, "merge"); gate.State == StageBlocked || gate.State == StageFailed {
-		t.Fatalf("rescan ended the run: gate=%+v", gate)
+		t.Fatalf("a transient hold ended the run: gate=%+v run=%+v", gate, run)
 	}
+	// The hold is RECORDED, not silent: the pre-change terminal block carried the
+	// reason and a bare wait threw it away.
 	events, err := store.ListJobEvents(context.Background(), sourceJobID)
 	if err != nil {
 		t.Fatalf("ListJobEvents(source): %v", err)
 	}
+	held := ""
 	for _, event := range events {
-		if event.Kind == "pipeline_auto_merge_confirmed" {
+		switch event.Kind {
+		case "pipeline_auto_merge_held":
+			held = event.Message
+		case "pipeline_auto_merge_confirmed":
 			t.Fatalf("a held merge recorded a confirmation: %+v", event)
+		}
+	}
+	if !strings.Contains(held, holdReason) {
+		t.Fatalf("the hold reason was not recorded: %q", held)
+	}
+
+	// The condition clears. THIS is the property that matters: the next scan must
+	// re-attempt and merge.
+	executor.mergeResult = workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-after-hold"}
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(3*time.Second), executor)
+	if len(executor.mergeReqs) != 2 {
+		t.Fatalf("merge calls = %d after the hold cleared, want a second attempt", len(executor.mergeReqs))
+	}
+	if run.State != RunSucceeded || stageRow(t, store, run.ID, "merge").State != StageSucceeded {
+		t.Fatalf("run/gate = %+v / %+v, want succeeded once the hold cleared", run, stageRow(t, store, run.ID, "merge"))
+	}
+
+	// At-most-once still holds AFTER a real merge: the confirmed claim is not
+	// released, so a later scan must not merge again.
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(4*time.Second), executor)
+	if len(executor.mergeReqs) != 2 {
+		t.Fatalf("post-merge rescan merge calls = %d, want the claim to hold at two", len(executor.mergeReqs))
+	}
+}
+
+// A hold that outlives the gate's timeout must park with its CAUSE, not only
+// with what it was waiting for. The round-3 review measured an empty summary
+// here, and a spec that sets no timeout waits forever - documented pipeline
+// policy for gate stages, but only defensible while the hold is retryable and
+// recorded, which the test above pins.
+func TestPipelineAutoMergeHoldTimeoutCarriesTheReason(t *testing.T) {
+	timedSpec := strings.Replace(pipelineAutoMergeSpec, "    merge: auto\n", "    merge: auto\n    timeout: 1m\n", 1)
+	store := pipelineAdvanceStore(t)
+	rec, spec := newTestPipeline(t, store, "auto-merge", timedSpec)
+	enqueue := testStageEnqueuer(store)
+	now := time.Date(2026, 7, 11, 8, 0, 0, 0, time.UTC)
+	run := startTestRun(t, store, rec, spec, enqueue, now)
+	impl := stageRow(t, store, run.ID, "impl")
+	settleBoundImplementStageJob(t, store, impl.JobID, "implemented",
+		PipelineStagePRBinding{PullRequest: 813, HeadSHA: "0123456789abcdef", Branch: "feat/813", TaskID: "task-813", LeadAgent: "coder"})
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second), &stubPipelineAutoMerger{})
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+
+	const holdReason = "workload-mode change requires reconciliation at head 0123456 against operating-mode note 41"
+	executor := &stubPipelineAutoMerger{
+		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		mergeResult: workflow.PipelineAutoMergeResult{Waiting: true, Reason: holdReason},
+	}
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), executor)
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Hour), executor)
+
+	gate := stageRow(t, store, run.ID, "merge")
+	if gate.State != StageBlocked {
+		t.Fatalf("gate = %q after the timeout, want blocked", gate.State)
+	}
+	if !strings.Contains(gate.Summary, holdReason) {
+		t.Fatalf("park summary must carry the cause: %q", gate.Summary)
+	}
+}
+
+// With NO gate timeout the reviewer measured this parked silently at now+72h.
+// The hold now carries its own bound, measured from the first recorded hold, and
+// parks WITH the cause. A test that only exercises the happy reconcile is not a
+// test of this (#1783 round-3 review, F-A).
+func TestPipelineAutoMergeHoldIsBoundedWithoutAGateTimeout(t *testing.T) {
+	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	const holdReason = "workload-mode change requires reconciliation at head 0123456 against operating-mode note 41"
+	executor := &stubPipelineAutoMerger{
+		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		mergeResult: workflow.PipelineAutoMergeResult{Waiting: true, Reason: holdReason},
+	}
+	// The spec's merge stage sets no timeout, so only the hold's own bound applies.
+	for _, stage := range spec.Stages {
+		if stage.ID == "merge" && strings.TrimSpace(stage.Timeout) != "" {
+			t.Fatalf("fixture must have no gate timeout, got %q", stage.Timeout)
+		}
+	}
+
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), executor)
+	if gate := stageRow(t, store, run.ID, "merge"); gate.State == StageBlocked {
+		t.Fatalf("the first hold must wait, not park: %+v", gate)
+	}
+	// Retries keep happening inside the bound.
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Hour), executor)
+	if len(executor.mergeReqs) != 2 {
+		t.Fatalf("merge attempts inside the bound = %d, want 2", len(executor.mergeReqs))
+	}
+	if gate := stageRow(t, store, run.ID, "merge"); gate.State == StageBlocked {
+		t.Fatalf("a hold inside its bound must not park: %+v", gate)
+	}
+
+	// Past the bound it parks, carrying the cause.
+	held, err := firstAutoMergeHoldAt(context.Background(), store, sourceJobID)
+	if err != nil || held.IsZero() {
+		t.Fatalf("first hold time = %v err=%v, want a recorded hold", held, err)
+	}
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, held.Add(autoMergeHoldMaxWait+time.Minute), executor)
+	gate := stageRow(t, store, run.ID, "merge")
+	if gate.State != StageBlocked {
+		t.Fatalf("gate = %q past the hold bound, want blocked", gate.State)
+	}
+	for _, want := range []string{holdReason, "no gate timeout is set", autoMergeHoldMaxWait.String()} {
+		if !strings.Contains(gate.Summary, want) {
+			t.Fatalf("park summary must contain %q: %q", want, gate.Summary)
 		}
 	}
 }

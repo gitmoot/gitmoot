@@ -538,9 +538,12 @@ file a new exact-head row. It is a recency boundary, not a veto, so a fresh row
 that agrees with the PR's own marker still merges, and correcting the note is
 optional rather than the only exit. The gate only refuses outright when nothing
 readable remains, meaning the note is unreadable AND the PR's marker patch is
-missing or ambiguous. And a reconciliation hold at the merge boundary is
-retryable, not terminal: the pipeline gate keeps waiting until the row lands or
-the gate times out.
+missing or ambiguous. A reconciliation hold at the merge boundary is retryable:
+the pipeline gate RELEASES its at-most-once merge claim, records the cause as a
+`pipeline_auto_merge_held` job event, and re-attempts on a later scan, so the
+row landing merges. If the gate stage sets a `timeout` the park summary carries
+that cause; a stage with no timeout waits indefinitely, which is documented
+pipeline policy and is only safe because the hold retries and is recorded.
 
 Resolve the active decision from both durable sources: read the marker from
 `origin/main:AGENTS.md`, never a seat worktree, and read the newest typed
