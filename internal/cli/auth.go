@@ -274,6 +274,13 @@ func runAuthProbe(args []string, stdout, stderr io.Writer) int {
 	probeErr := runtime.ClaudeLiveCheckEnv(context.Background(), runner, "", nil)
 	status := runtime.ClaudeClassifyProbe(probeErr)
 	writeLine(stdout, "Claude auth: %s", status.String())
+	// The probe above measures the AMBIENT credential, which is not what a
+	// read-only seat authenticates with: a seat stages a snapshot of the
+	// configured config dir and, before this change, received no ambient token at
+	// all. That is why `auth probe claude` stayed green through an outage in
+	// which every review job failed. Report the staged file too, so one command
+	// covers both credentials rather than the one no review uses.
+	writeSeatCredentialProbe(stdout, *home)
 	if probeErr != nil {
 		fmt.Fprintf(stderr, "auth probe: %v\n", probeErr)
 		return 1

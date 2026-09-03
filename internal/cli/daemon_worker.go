@@ -348,6 +348,22 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		runtimeConfigDir = selectedRuntimeConfigDir(agent.Runtime)
 	}
 	applyReadOnlySeat(readOnlySeat, runtimeConfigDir, &agent)
+	// A seat stages a credential SNAPSHOT, so check the expiry it is about to
+	// copy BEFORE launching a runtime that can only fail on it. Provably
+	// unusable (expired, no refresh token) fails here; expired-but-refreshable
+	// records the fact so a later auth failure is not read as a fresh OAuth
+	// problem. See readonly_seat_credential.go for the measurement.
+	if credentialDiagnosis, credentialErr := readOnlySeatCredentialPreflight(agent, runtimeConfigDir, time.Now().UTC()); credentialErr != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, credentialErr); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, "", credentialErr)
+		return nil
+	} else if credentialDiagnosis != "" {
+		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "readonly_seat_credential_expired", Message: credentialDiagnosis}); eventErr != nil {
+			writeLine(w.Stdout, "job %s readonly_seat_credential_expired event failed: %v", job.ID, eventErr)
+		}
+	}
 	preflightRequest := runtime.RuntimeContractRequest{Plan: payload.Plan}
 	if result, checked, preflightErr := w.runtimeContractPreflight(ctx, execBackend, execConfig, agent, preflightRequest); preflightErr != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, preflightErr); finishErr != nil {
@@ -1454,9 +1470,24 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 	if err != nil {
 		return nil, err
 	}
+	// A seat's env is rebuilt from scratch, which DROPPED the runtime auth the
+	// non-seat path injects (runtimeJobRunnerWithAuth appends
+	// runtimeAuthInjectionEnv onto the curated BaseEnv). The seat was therefore
+	// left with nothing but its staged credential snapshot, and once that
+	// snapshot expired every claude review failed with "OAuth session expired and
+	// could not be refreshed" while `gitmoot auth probe claude` stayed green,
+	// because the probe reads the resolved auth the seat never received. Inject
+	// the same overlay here so a seat authenticates exactly like every other job.
+	// Gateway mode is excluded: there the gateway holds the credential and the
+	// seat is deliberately given none.
+	seatAuthEnv, err := readOnlySeatRuntimeAuthEnv(home, agent.Runtime, gatewayMode)
+	if err != nil {
+		return nil, err
+	}
 	wrap := func(runner subprocess.Runner) subprocess.Runner {
+		baseEnv := readOnlyRuntimeBaseEnv(agent.Runtime, os.Environ(), filepath.Join(grants.cacheRoot, "gh"))
 		curated := graftRuntimeBaseRunner(runner, subprocess.CuratedGroupRunner{
-			BaseEnv: readOnlyRuntimeBaseEnv(agent.Runtime, os.Environ(), filepath.Join(grants.cacheRoot, "gh")),
+			BaseEnv: append(baseEnv, seatAuthEnv...),
 		})
 		return landlockReadOnlyRunner(curated, grants.reads, grants.readFiles, grants.writes, grants.env)
 	}
@@ -1864,7 +1895,18 @@ func produceRuntimeSandboxGrants(runtimeName string, readable, readFiles, writab
 	var env []string
 	switch runtimeName {
 	case runtime.ClaudeRuntime:
-		stateDir := filepath.Join(home, ".claude")
+		// An operator-set CLAUDE_CONFIG_DIR selects the ACCOUNT the engine runs
+		// as. Hard-coding $HOME/.claude here silently replaced it, so a daemon
+		// configured onto a live account still pointed produce jobs at a dead
+		// one: on this host /root/.claude has carried expiresAt 0 with no refresh
+		// token since 2026-08-31, which yields exactly "OAuth session expired and
+		// could not be refreshed". Honor the configured dir and fall back only
+		// when none is set.
+		stateDir := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR"))
+		if stateDir == "" {
+			stateDir = filepath.Join(home, ".claude")
+		}
+		stateDir = filepath.Clean(stateDir)
 		cacheRoot, err := os.UserCacheDir()
 		if err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("resolve Claude cache root: %w", err)
