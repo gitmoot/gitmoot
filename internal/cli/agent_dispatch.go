@@ -397,7 +397,9 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		promptHeadWarnings = dispatchPromptHeadContradictionWarnings(ctx, jobGitClient(checkoutPath, localDispatchJobRunner(request)), request.Instructions, request.HeadSHA)
 	}
 	if readOnlyWorktreePath != "" {
-		applyReadOnlySeat(true, selectedRuntimeConfigDir(effectiveAgent.Runtime), &effectiveAgent)
+		if err := applyReadOnlySeat(true, selectedRuntimeConfigDir(effectiveAgent.Runtime), jobID, &effectiveAgent); err != nil {
+			return localAgentJobOutput{}, fmt.Errorf("isolate read-only seat session: %w", err)
+		}
 		if request.Action != "review" {
 			// An ask worktree is the committed tip of checkout HEAD, which may have
 			// advanced past its inherited HeadSHA. Review is different: its worktree

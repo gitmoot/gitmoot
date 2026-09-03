@@ -926,7 +926,9 @@ func TestApplyReadOnlySeatClearsInheritedGrants(t *testing.T) {
 				ReadablePaths: []string{"/host"},
 				ReadableFiles: []string{"/host/secret"},
 			}
-			applyReadOnlySeat(test.marked, " /profiles/reviewer ", &agent)
+			if err := applyReadOnlySeat(test.marked, " /profiles/reviewer ", "job-grants", &agent); err != nil {
+				t.Fatalf("applyReadOnlySeat: %v", err)
+			}
 			if agent.ReadOnlySeat != test.wantSeat || agent.RuntimeConfigDir != test.wantConfig {
 				t.Fatalf("read-only marker = %v config = %q, want %v %q", agent.ReadOnlySeat, agent.RuntimeConfigDir, test.wantSeat, test.wantConfig)
 			}

@@ -347,7 +347,13 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	if readOnlySeat && runtimeConfigDir == "" {
 		runtimeConfigDir = selectedRuntimeConfigDir(agent.Runtime)
 	}
-	applyReadOnlySeat(readOnlySeat, runtimeConfigDir, &agent)
+	if err := applyReadOnlySeat(readOnlySeat, runtimeConfigDir, job.ID, &agent); err != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
+		return nil
+	}
 	preflightRequest := runtime.RuntimeContractRequest{Plan: payload.Plan}
 	if result, checked, preflightErr := w.runtimeContractPreflight(ctx, execBackend, execConfig, agent, preflightRequest); preflightErr != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, preflightErr); finishErr != nil {
@@ -1522,15 +1528,73 @@ func wrapReadOnlyAdapterRunner(runtimeName string, adapter workflow.DeliveryAdap
 	}
 }
 
-func applyReadOnlySeat(readOnlySeat bool, configDir string, agent *runtime.Agent) {
+// applyReadOnlySeat rewrites an agent for hard runtime isolation.
+//
+// SESSION SAFETY: prepareReadOnlyRuntimeState builds the seat's runtime state
+// dir EMPTY (RemoveAll, MkdirAll, then only the credential file is staged)
+// and points CLAUDE_CONFIG_DIR/CODEX_HOME at it. An isolated home therefore can
+// never contain the session history a concrete ref names, so a seat resuming
+// the agent's stored ref fails: a codex review died with "thread/resume: no
+// rollout found for thread id <uuid>" while that rollout sat in the real
+// ~/.codex/sessions tree the seat cannot see. Run the seat on a job-scoped
+// FRESH ref instead, which also stops a disposable review seat from OCCUPYING
+// the runtime-session lock key of the agent's live default-runtime session
+// (the lock is taken on this effective agent), and keeps the mailbox from
+// persisting the minted session id back onto the stored agent row
+// (runtime.IsFreshRef gates that write).
+//
+// An already-fresh ref is left alone: a per-job runtime override minted a
+// unique ref at enqueue and a registered fresh:<seat> ref was already scoped by
+// scopeRegisteredFreshRefForJob, and both are the keys the scheduler gate
+// computed, so rewriting them would desync gate from acquisition.
+//
+// ONLY RESUMABLE RUNTIMES ARE REWRITTEN. A shell ref is a COMMAND, not a
+// session: overwriting it with a fresh ref would replace the stage's work with
+// nothing. Isolated shell pipeline stages carry ReadOnlySeat=true, so this
+// guard is load-bearing rather than defensive.
+func applyReadOnlySeat(readOnlySeat bool, configDir string, jobID string, agent *runtime.Agent) error {
 	if agent == nil || !readOnlySeat {
-		return
+		return nil
 	}
 	agent.ReadOnlySeat = true
 	agent.RuntimeConfigDir = strings.TrimSpace(configDir)
 	agent.WritablePaths = nil
 	agent.ReadablePaths = nil
 	agent.ReadableFiles = nil
+	if !resumableSessionRuntime(agent.Runtime) || runtime.IsFreshRef(agent.RuntimeRef) {
+		return nil
+	}
+	ref, err := readOnlySeatRuntimeRef(jobID)
+	if err != nil {
+		return err
+	}
+	agent.RuntimeRef = ref
+	return nil
+}
+
+// resumableSessionRuntime reports whether a runtime's RuntimeRef names a
+// resumable session (rather than a shell command or nothing at all). It is the
+// same set runtimeSessionResourceKey keys locks for.
+func resumableSessionRuntime(runtimeName string) bool {
+	switch strings.TrimSpace(runtimeName) {
+	case runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime:
+		return true
+	default:
+		return false
+	}
+}
+
+// readOnlySeatRuntimeRef is the fresh session ref a read-only seat runs on.
+// queuedJobRuntimeResourceKey (the scheduler gate) and the worker's lock
+// acquisition both derive their key from this one function, so they cannot
+// disagree. That is the #1034 isolated-shell-stage shape. A job id is always
+// available at both call sites; the unnamed case still gets a fresh, never
+// resumed ref rather than silently falling back to a resumable session.
+func readOnlySeatRuntimeRef(jobID string) (string, error) {
+	if id := strings.TrimSpace(jobID); id != "" {
+		return runtime.FreshRefForJob(id), nil
+	}
+	return runtime.NewFreshRef()
 }
 
 func selectedRuntimeConfigDir(runtimeName string) string {
