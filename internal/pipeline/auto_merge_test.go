@@ -556,6 +556,57 @@ func TestPipelineAutoMergeHoldAnchorsOnTheEarliestDuplicate(t *testing.T) {
 	}
 }
 
+// F-3's ordering, pinned by INJECTING the failure it exists for. A lost release
+// must leave the hold RECORDED, because the !claimed branch bounds the run from
+// that record; recording after the release left one transient DELETE error with
+// a consumed claim and no record, which is the unbounded silent wait the review
+// measured at now+72h. Nothing else distinguishes the two orderings, so without
+// this the correct order survives its own mutant.
+func TestPipelineAutoMergeHoldIsRecordedEvenWhenTheReleaseFails(t *testing.T) {
+	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	const holdReason = "workload-mode change requires reconciliation at head 0123456 against operating-mode note 41"
+	// One advance moves the gate row from queued to running; the settle path
+	// promotes a queued row and returns before it can claim.
+	waiting := &stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: "0123456789abcdef"}}
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second), waiting)
+
+	executor := &stubPipelineAutoMerger{
+		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		mergeResult: workflow.PipelineAutoMergeResult{Waiting: true, Reason: holdReason},
+	}
+	var gateStage Stage
+	for _, candidate := range spec.Stages {
+		if candidate.ID == "merge" {
+			gateStage = candidate
+		}
+	}
+	deps := pipelineStageSettleDeps{
+		store: store, rec: rec, run: run, now: now.Add(2 * time.Second), autoMerge: executor,
+		releaseClaim: func(context.Context, db.JobEvent) (bool, error) {
+			return false, errors.New("injected release failure")
+		},
+	}
+
+	_, _, _, _, _, err := gateStageSettleOutcome(context.Background(), deps, spec, gateStage, stageRow(t, store, run.ID, "merge"))
+	if err == nil {
+		t.Fatal("a failing release must surface its error")
+	}
+	if len(executor.mergeReqs) != 1 {
+		t.Fatalf("merge attempts = %d, want the hold path to have run", len(executor.mergeReqs))
+	}
+
+	// The hold survived the failed release, so the next scan is bounded rather
+	// than silent - which is the whole point of the ordering.
+	held, holdErr := latestAutoMergeHold(context.Background(), store, sourceJobID, "0123456789abcdef")
+	if holdErr != nil {
+		t.Fatal(holdErr)
+	}
+	if held.at.IsZero() || held.reason != holdReason {
+		t.Fatalf("hold record after a failed release = %+v, want the cause recorded", held)
+	}
+}
+
 // #1685. A review fan-out is refused at STAGE SETTLEMENT, before anything
 // depends on it. That is the load-bearing layer: a succeeded stage satisfies
 // pipelineStageDepsSucceeded and authorizes every dependent stage, so folding an

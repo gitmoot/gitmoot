@@ -1329,6 +1329,19 @@ type pipelineStageSettleDeps struct {
 	autoMerge        PipelineAutoMergeExecutor
 	events           *pipelineJobEventSnapshot
 	terminalJobState *string
+	// releaseClaim overrides the auto-merge claim release. Production leaves it
+	// nil and uses the store; a test injects a FAILING release, which is the only
+	// way to observe that the hold is recorded BEFORE the release - the ordering
+	// that keeps a lost release bounded instead of silently stranding the run
+	// (#1783 round-4 review, F-3).
+	releaseClaim func(context.Context, db.JobEvent) (bool, error)
+}
+
+func (d pipelineStageSettleDeps) releaseAutoMergeClaim(ctx context.Context, event db.JobEvent) (bool, error) {
+	if d.releaseClaim != nil {
+		return d.releaseClaim(ctx, event)
+	}
+	return d.store.ReleaseJobEventClaim(ctx, event)
 }
 
 // stageSettleOutcome is the per-stage-kind SETTLE PREDICATE seam. Given an in-flight
@@ -2004,7 +2017,7 @@ func autoMergeGateStageSettleOutcome(ctx context.Context, deps pipelineStageSett
 			if holdErr != nil {
 				return false, "", "", nil, nil, holdErr
 			}
-			if _, releaseErr := deps.store.ReleaseJobEventClaim(ctx, db.JobEvent{
+			if _, releaseErr := deps.releaseAutoMergeClaim(ctx, db.JobEvent{
 				JobID: sourceJobID, Kind: "pipeline_auto_merge_claim", Message: string(claim),
 			}); releaseErr != nil {
 				return false, "", "", nil, nil, releaseErr
