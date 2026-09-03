@@ -84,6 +84,24 @@ for missing credentials, unclear scope, unavailable tools, failing external
 services, or required human decisions.
 Always redact secrets from summaries, findings, raw command output, and examples.
 
+## String lists: `changes_made`, `tests_run`, `needs`
+
+Emit **strings**. An **object** element is also accepted, because agents send
+them and refusing one used to fail the entire result: a review reporting
+
+```json
+"tests_run": [{"name": "diff scope", "command": "git show --stat", "result": "pass"}]
+```
+
+was rejected with `cannot unmarshal object into Go struct field
+AgentResult.tests_run of type string` and spent a repair attempt, which made a
+job that did the work indistinguishable from one that returned nothing. An
+object element is stored as compact JSON with keys in canonical order: every
+field is kept, since the contract names none of them.
+
+Nothing else is accepted. A number, a boolean, a nested array, or a bare string
+where the array belongs still fails the result.
+
 ## Display-only in-session review state
 
 An inline PR review can be recorded with `job open --type review --pr <n>

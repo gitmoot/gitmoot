@@ -68,6 +68,29 @@ None of these keys is mandatory. String findings still render exactly as the
 plain text you provide, and any finding the renderer cannot map (for example a
 top-level array) falls back to a pretty-printed fenced ```json``` block.
 
+## String lists: `changes_made`, `tests_run`, `needs`
+
+Emit **strings**. That is the contract, and it is what the renderers and the
+result digest are built for.
+
+An **object** element is also accepted, because agents send them and refusing
+one used to fail the entire result. A review that reported
+
+```json
+"tests_run": [{"name": "diff scope", "command": "git show --stat", "result": "pass"}]
+```
+
+was rejected with `cannot unmarshal object into Go struct field
+AgentResult.tests_run of type string` and spent a repair attempt, which made a
+job that did the work and reported it richly indistinguishable from one that
+returned nothing. An object element is now stored as compact JSON with its keys
+in canonical order: every field is kept, because the contract names none of them
+and picking one would be a guess.
+
+Nothing else is accepted. A number, a boolean, a nested array, or a bare string
+where the array belongs still fails the result. Prefer a string and put the
+detail in it.
+
 ## Delegations
 
 Orchestra is gitmoot's name for structured multi-agent delegation: a conductor

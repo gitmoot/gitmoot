@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -135,6 +136,79 @@ type Learning struct {
 // falls back to the default "repo" and is accepted separately).
 var LearningScopes = []string{"repo", "general"}
 
+// ResultStringList is a gitmoot_result list of strings that also accepts OBJECT
+// elements, because agents send them and a strict element decode failed the
+// whole envelope.
+//
+// Measured: review job local-review-gm-review-opus-18d1b91052453964 returned
+//
+//	"tests_run":[{"name":"PR diff scope confirmation","command":"git show --stat 663321c9...","result":"pass","detail":"..."}]
+//
+// and the decode failed with "json: cannot unmarshal object into Go struct
+// field AgentResult.tests_run of type string", which burned repair_retry
+// attempt 1 of 2. The job had done the work and reported it in a richer shape;
+// the parser made that indistinguishable from returning nothing.
+//
+// An object element is re-encoded as compact JSON rather than reduced to one of
+// its fields. The contract names no element fields, so picking "command" or
+// "name" would be a guess, and dropping the rest would lose what the agent
+// measured. Consumers treat entries as opaque strings (they are printed,
+// written into PR comments, counted, and digested), so a JSON-shaped entry is
+// legible and lossless.
+//
+// Nothing else widens. A number, a boolean, null in place of the array, or a
+// bare string where an array belongs still fails: there is no evidence agents
+// send those, and accepting them would change the contract on a guess. The
+// prompt contract keeps asking for strings.
+type ResultStringList []string
+
+func (l *ResultStringList) UnmarshalJSON(data []byte) error {
+	if l == nil {
+		return errors.New("unmarshal into nil ResultStringList")
+	}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		*l = nil
+		return nil
+	}
+	var elements []json.RawMessage
+	if err := json.Unmarshal(trimmed, &elements); err != nil {
+		return err
+	}
+	list := make(ResultStringList, 0, len(elements))
+	for _, element := range elements {
+		element = bytes.TrimSpace(element)
+		if len(element) == 0 {
+			continue
+		}
+		switch element[0] {
+		case '"':
+			var value string
+			if err := json.Unmarshal(element, &value); err != nil {
+				return err
+			}
+			list = append(list, value)
+		case '{':
+			// Re-encode through a map so key order is canonical (encoding/json
+			// sorts map keys) and two agents reporting the same object produce
+			// the same entry.
+			var object map[string]json.RawMessage
+			if err := json.Unmarshal(element, &object); err != nil {
+				return err
+			}
+			encoded, err := json.Marshal(object)
+			if err != nil {
+				return err
+			}
+			list = append(list, string(encoded))
+		default:
+			return fmt.Errorf("gitmoot_result list element must be a string or an object, got %s", string(element))
+		}
+	}
+	*l = list
+	return nil
+}
+
 type AgentResult struct {
 	Decision string `json:"decision"`
 	// SupersededPullRequestClosed marks a SYNTHETIC result minted by the closed-PR
@@ -154,9 +228,9 @@ type AgentResult struct {
 	Severity     string            `json:"severity,omitempty"`
 	Summary      string            `json:"summary"`
 	Findings     []json.RawMessage `json:"findings"`
-	ChangesMade  []string          `json:"changes_made"`
-	TestsRun     []string          `json:"tests_run"`
-	Needs        []string          `json:"needs"`
+	ChangesMade  ResultStringList  `json:"changes_made"`
+	TestsRun     ResultStringList  `json:"tests_run"`
+	Needs        ResultStringList  `json:"needs"`
 	Delegations  []Delegation      `json:"delegations"`
 	ArtifactBody string            `json:"artifact_body,omitempty"`
 	// Learnings, when non-empty, carries durable keyed facts the agent chose to
