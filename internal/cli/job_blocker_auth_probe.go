@@ -3,12 +3,15 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -127,7 +130,19 @@ func (w jobWorker) authProbeDedupKey(ctx context.Context, job db.Job, payload wo
 		return "agent:" + job.Agent
 	}
 	agent := applyJobRuntimeOverride(runtimeAgent(record), payload)
-	return "runtime:" + strings.TrimSpace(agent.Runtime)
+	key := "runtime:" + strings.TrimSpace(agent.Runtime)
+	// A READ-ONLY SEAT authenticates with a staged snapshot of its effective
+	// config dir, not with the ambient credential. Include the selected default
+	// as well as an explicit payload value so changing the daemon's account
+	// cannot reuse a cached verdict from the prior account.
+	if payload.ReadOnlySeat {
+		configDir := selectedReadOnlyRuntimeConfigDir(agent.Runtime, payload.RuntimeConfigDir)
+		if resolved, resolveErr := resolveRuntimeConfigDir(agent.Runtime, configDir); resolveErr == nil {
+			configDir = resolved
+		}
+		key += ":seat:" + configDir
+	}
+	return key
 }
 
 // extendAuthBlockerHold pushes a runtime_auth deferral's earliest-retry-at forward
@@ -145,11 +160,10 @@ func (w jobWorker) extendAuthBlockerHold(ctx context.Context, job db.Job, payloa
 	_ = w.Store.UpdateJobPayload(ctx, job.ID, string(encoded))
 }
 
-// defaultAuthProbe is the daemon's live credential probe. It probes the EFFECTIVE
-// runtime the re-dispatch would use (the agent's runtime, honoring a per-job
-// runtime override): claude gets a bounded live runtime.ClaudeLiveCheck classified
-// SET-vs-VALID; every other runtime has no wired live probe, so it returns Unknown
-// and the coarse cadence stays in charge.
+// defaultAuthProbe probes the credential domain the held job will actually use.
+// Non-seat Claude jobs use runtimeJobRunnerWithAuth; read-only seats use a
+// disposable copy of their configured credential plus the resolved auth
+// overlay. Other runtimes remain Unknown.
 func (w jobWorker) defaultAuthProbe(ctx context.Context, job db.Job, payload workflow.JobPayload) authProbeVerdict {
 	record, err := w.Store.GetAgent(ctx, job.Agent)
 	if err != nil {
@@ -162,20 +176,76 @@ func (w jobWorker) defaultAuthProbe(ctx context.Context, job db.Job, payload wor
 	jobBackend, jobBackendPresent := payload.ExecBackendOverride()
 	backend, _, err := daemonJobExecBackendFor(w, jobBackend, jobBackendPresent)
 	if err != nil {
-		// run() owns the loud terminal selector failure. This scheduler gate is
-		// advisory; an unresolved backend must not launch a host probe, and Unknown
-		// lets the queued job reach run() where the canonical error is persisted.
 		return authProbeUnknown
 	}
 	verdict, err := authProbeForBackend(backend, func() authProbeVerdict {
 		probeCtx, cancel := context.WithTimeout(ctx, authProbeTimeout)
 		defer cancel()
-		return classifyClaudeAuthProbe(runtime.ClaudeLiveCheck(probeCtx, nil, ""))
+		if payload.ReadOnlySeat {
+			return w.probeReadOnlySeatClaudeAuth(probeCtx, agent, payload)
+		}
+		runner, _, _, err := runtimeJobRunnerWithAuth(w.ConfigHome, runtime.ClaudeRuntime, nil)
+		if err != nil {
+			return authProbeUnknown
+		}
+		return classifyClaudeAuthProbe(claudeAuthLiveCheck(probeCtx, runner, "", nil))
 	})
 	if err != nil {
 		return authProbeUnknown
 	}
 	return verdict
+}
+
+var claudeAuthLiveCheck = runtime.ClaudeLiveCheckEnv
+
+func (w jobWorker) probeReadOnlySeatClaudeAuth(ctx context.Context, agent runtime.Agent, payload workflow.JobPayload) authProbeVerdict {
+	gatewayMode := seatModelGatewayMode(w.ConfigHome)
+	if gatewayMode {
+		runner, _, _, err := runtimeJobRunnerWithAuth(w.ConfigHome, runtime.ClaudeRuntime, nil)
+		if err != nil {
+			return authProbeUnknown
+		}
+		return classifyClaudeAuthProbe(claudeAuthLiveCheck(ctx, runner, "", nil))
+	}
+	cacheRoot, err := os.MkdirTemp("", "gitmoot-seat-auth-probe-*")
+	if err != nil {
+		return authProbeUnknown
+	}
+	defer os.RemoveAll(cacheRoot)
+	agent.ReadOnlySeat = true
+	agent.RuntimeConfigDir = selectedReadOnlyRuntimeConfigDir(agent.Runtime, payload.RuntimeConfigDir)
+	stateDir, stateEnv, err := prepareReadOnlyRuntimeState(agent, cacheRoot, false)
+	if err != nil {
+		return authProbeUnknown
+	}
+	overlay, err := readOnlySeatRuntimeAuthEnv(w.ConfigHome, agent.Runtime, false)
+	if err != nil {
+		return authProbeUnknown
+	}
+	probeHome := filepath.Join(cacheRoot, "home")
+	probeTmp := filepath.Join(cacheRoot, "tmp")
+	for _, dir := range []string{probeHome, probeTmp} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return authProbeUnknown
+		}
+	}
+	baseEnv := readOnlyRuntimeBaseEnv(agent.Runtime, os.Environ(), filepath.Join(cacheRoot, "gh"))
+	baseEnv = append(baseEnv, stateEnv...)
+	baseEnv = append(baseEnv,
+		"HOME="+probeHome,
+		"XDG_CONFIG_HOME="+filepath.Join(cacheRoot, "xdg-config"),
+		"XDG_CACHE_HOME="+filepath.Join(cacheRoot, "xdg-cache"),
+		"XDG_DATA_HOME="+filepath.Join(cacheRoot, "xdg-data"),
+		"XDG_STATE_HOME="+filepath.Join(cacheRoot, "xdg-state"),
+		"TMPDIR="+probeTmp,
+		"TMP="+probeTmp,
+		"TEMP="+probeTmp,
+	)
+	baseEnv = append(baseEnv, overlay...)
+	if stateDir == "" {
+		return authProbeUnknown
+	}
+	return classifyClaudeAuthProbe(claudeAuthLiveCheck(ctx, subprocess.CuratedGroupRunner{BaseEnv: baseEnv}, "", nil))
 }
 
 func authProbeForBackend(backend execbackend.Backend, local func() authProbeVerdict) (authProbeVerdict, error) {

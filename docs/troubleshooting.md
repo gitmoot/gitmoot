@@ -441,6 +441,19 @@ Fixes:
   (a failing probe extends the hold without spending a retry). Over `[events]`
   the deferral is a first-class `job.deferred` emitted instead of `job.failed`.
   Only act when the retry budget is spent and the job stays failed.
+- A read-only seat (every `review`/`ask` job under the read-only autonomy
+  policy) does NOT authenticate with the ambient credential: it stages a
+  SNAPSHOT of its runtime config dir (`payload.runtime_config_dir`, else the
+  daemon's `CLAUDE_CONFIG_DIR`, else `~/.claude`) and carries the resolved
+  `runtime-auth.env` overlay. When that snapshot is already expired the job
+  records one `readonly_seat_credential_expired` event naming the expiry, the
+  refresh-token state and whether an overlay was available — read it with
+  `gitmoot job events <job-id>` before treating the runtime's own "OAuth session
+  expired and could not be refreshed" wording as an account problem. It never
+  refuses the job. `gitmoot doctor` and `gitmoot auth probe claude` both report
+  that seat credential beside the ambient one, and doctor FAILS (non-zero exit)
+  when it is expired with no refresh token, since every read-only seat job on
+  that runtime will fail until the account is re-logged in.
 - A `stale_worktree_dirty_blocked` task event is not an auto-retrying
   `checkout_contention` deferral. It means the existing task worktree is off the
   resolved base lineage and has uncommitted changes, so Gitmoot preserves it and

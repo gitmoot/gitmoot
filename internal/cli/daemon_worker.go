@@ -343,20 +343,27 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// secondary adapter rebuild consumes the same backend selection.
 	agent.ExecBackend = string(execBackend)
 	readOnlySeat := payload.ReadOnlySeat
-	runtimeConfigDir := strings.TrimSpace(payload.RuntimeConfigDir)
-	if readOnlySeat && runtimeConfigDir == "" {
-		runtimeConfigDir = selectedRuntimeConfigDir(agent.Runtime)
+	runtimeConfigDir := ""
+	if readOnlySeat {
+		runtimeConfigDir = selectedReadOnlyRuntimeConfigDir(agent.Runtime, payload.RuntimeConfigDir)
 	}
 	applyReadOnlySeat(readOnlySeat, runtimeConfigDir, &agent)
-	// A seat stages a credential SNAPSHOT. Record it when that snapshot is already
-	// expired, so a later auth failure is attributable to gitmoot's staging rather
-	// than read as a fresh OAuth problem. It never refuses: a runtime-auth
-	// rejection is a DEFERRABLE blocker (classifyOperationalBlocker plus the
-	// documented job.deferred), and the auth overlay this same commit injects
-	// means an expired snapshot is no longer decisive.
-	if diagnosis := readOnlySeatCredentialPreflight(agent, runtimeConfigDir, seatModelGatewayMode(w.ConfigHome), time.Now().UTC()); diagnosis != "" {
-		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "readonly_seat_credential_expired", Message: diagnosis}); eventErr != nil {
-			writeLine(w.Stdout, "job %s readonly_seat_credential_expired event failed: %v", job.ID, eventErr)
+	// A seat stages a credential SNAPSHOT. Record it when already expired so a
+	// later auth failure is attributable to staging, not read as a fresh OAuth
+	// problem. It never refuses: runtime auth failures use the deferrable
+	// blocker path. Resolve the gateway decision and overlay only for read-only
+	// seats; evaluating them for every job performed avoidable config reads and
+	// let the diagnosis use a different predicate from the eventual wrapper.
+	if agent.ReadOnlySeat {
+		gatewayMode := seatModelGatewayMode(w.ConfigHome)
+		seatAuthOverlay, seatAuthErr := readOnlySeatRuntimeAuthEnv(w.ConfigHome, agent.Runtime, gatewayMode)
+		if seatAuthErr != nil {
+			writeLine(w.Stdout, "job %s read-only seat auth overlay unresolved: %v", job.ID, seatAuthErr)
+		}
+		if diagnosis := readOnlySeatCredentialPreflight(agent, runtimeConfigDir, gatewayMode, len(seatAuthOverlay) > 0, time.Now().UTC()); diagnosis != "" {
+			if eventErr := w.recordReadOnlySeatCredentialDiagnosis(ctx, job.ID, diagnosis); eventErr != nil {
+				writeLine(w.Stdout, "job %s %s event failed: %v", job.ID, readOnlySeatCredentialExpiredEvent, eventErr)
+			}
 		}
 	}
 	preflightRequest := runtime.RuntimeContractRequest{Plan: payload.Plan}
@@ -795,61 +802,33 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		meta := cockpitJobMeta(job, payload, agent, deliveryCheckout, policy.CockpitPaneKey)
 		seatMode := policy.CockpitPaneKey == config.CockpitPaneKeySeat
 		// Only when the cockpit will actually wrap (herdr available) do we tee the
-		// child's live output into a log the pane tails (Task 6). The tee rebuilds
-		// the inner adapter with a group-kill-preserving TeeRunner and sets
-		// meta.LogPath; on any log-setup failure it falls back to no LogPath (the P0
-		// `job watch` pane). The non-cockpit / unavailable paths never create a log
-		// file or tee — they stay byte-identical.
+		// child's live output into a log the pane tails. The writer is added to the
+		// already-composed adapter, so runtime auth, the read-only seat sandbox,
+		// gateway leases and pipeline progress all survive; the non-cockpit and
+		// cockpit-off paths create no log and stay byte-identical.
 		//
 		// Job mode uses a per-job truncate log removed when the job finishes. Seat
-		// mode (Task 7) uses a STABLE per-seat append log so the one seat pane tails
-		// one file that accumulates the seat's history across delegation rounds — it
-		// is opened O_APPEND and is NOT removed per job (it persists for the root's
-		// life and is torn down by FinalizeRoot).
+		// mode uses a STABLE per-seat append log so the one seat pane tails one file
+		// that accumulates across delegation rounds; it is removed by FinalizeRoot.
 		if maybeWrapCockpitAvailable(cp, payload.Cockpit, userOptedOff) {
 			if retainedLogFile != nil && !seatMode {
 				// Job-mode cockpit tails the canonical retained file. Presence alone
 				// never creates a pane; LogPath is set only inside this cockpit gate.
 				meta.LogPath = retainedLogPath
-			} else if retainedLogFile != nil && seatMode {
-				// Seat logs remain transient. Add the seat writer to the existing
-				// retained/progress runner chain without rebuilding the adapter.
-				seatPath, seatFile := w.cockpitSeatLogFile(cp, job.ID, meta.RootJobID, meta.PaneKey)
-				if seatFile != nil {
-					seatAdapter, seatErr := appendDeliveryAdapterOutput(adapter, seatFile)
-					if seatErr != nil {
-						_ = seatFile.Close()
-						writeLine(w.Stdout, "job %s cockpit seat tee build failed: %v", job.ID, seatErr)
-					} else {
-						adapter = seatAdapter
-						meta.LogPath = seatPath
-						defer func() { _ = seatFile.Close() }()
+			} else if teeAdapter, logPath, logFile := w.cockpitLogAdapter(cp, adapter, job.ID, meta.RootJobID, meta.PaneKey, seatMode); logFile != nil {
+				defer func() {
+					if err := logFile.Close(); err != nil {
+						writeLine(w.Stdout, "job %s cockpit log close failed: %v", job.ID, err)
 					}
-				}
-			} else {
-				var teeAdapter workflow.DeliveryAdapter
-				var logPath string
-				var logFile *os.File
-				if progressTracker != nil {
-					teeAdapter, logPath, logFile = w.cockpitLogAdapter(cp, agent, deliveryCheckout, job.ID, meta.RootJobID, meta.PaneKey, seatMode, progressTracker)
-				} else {
-					teeAdapter, logPath, logFile = w.cockpitLogAdapter(cp, agent, deliveryCheckout, job.ID, meta.RootJobID, meta.PaneKey, seatMode)
-				}
-				if logFile != nil {
-					defer func() {
-						if err := logFile.Close(); err != nil {
-							writeLine(w.Stdout, "job %s cockpit log close failed: %v", job.ID, err)
-						}
-						// Job mode: the per-job log only backs a per-job pane torn down with
-						// the job, so remove it. Seat mode: keep the append log — it backs the
-						// persisted seat pane and is removed on root finalize.
-						if !seatMode {
-							_ = os.Remove(logPath)
-						}
-					}()
-					adapter = teeAdapter
-					meta.LogPath = logPath
-				}
+					// Job mode: the per-job log only backs a per-job pane torn down with
+					// the job, so remove it. Seat mode: keep the append log — it backs the
+					// persisted seat pane and is removed on root finalize.
+					if !seatMode {
+						_ = os.Remove(logPath)
+					}
+				}()
+				adapter = teeAdapter
+				meta.LogPath = logPath
 			}
 		}
 		var unavailable bool
@@ -1565,6 +1544,13 @@ func applyReadOnlySeat(readOnlySeat bool, configDir string, agent *runtime.Agent
 	agent.ReadableFiles = nil
 }
 
+func selectedReadOnlyRuntimeConfigDir(runtimeName string, configuredDir string) string {
+	if configuredDir = strings.TrimSpace(configuredDir); configuredDir != "" {
+		return configuredDir
+	}
+	return selectedRuntimeConfigDir(runtimeName)
+}
+
 func selectedRuntimeConfigDir(runtimeName string) string {
 	switch runtimeName {
 	case runtime.ClaudeRuntime:
@@ -1636,33 +1622,20 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 }
 
 func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string, gatewayMode bool) (string, []string, error) {
-	userHome, err := os.UserHomeDir()
-	if err != nil {
-		return "", nil, fmt.Errorf("resolve read-only runtime state home: %w", err)
-	}
 	sourceDir := strings.TrimSpace(agent.RuntimeConfigDir)
 	var relativeState, credentialFile, credentialSection string
 	stateRoot := filepath.Join(cacheRoot, "runtime-state")
 	switch agent.Runtime {
 	case runtime.ClaudeRuntime:
-		if sourceDir == "" {
-			sourceDir = filepath.Join(userHome, ".claude")
-		}
 		relativeState = ".claude"
 		if !gatewayMode {
 			credentialFile = ".credentials.json"
 			credentialSection = "claudeAiOauth"
 		}
 	case runtime.CodexRuntime:
-		if sourceDir == "" {
-			sourceDir = filepath.Join(userHome, ".codex")
-		}
 		relativeState = ".codex"
 		credentialFile = "auth.json"
 	case runtime.KimiRuntime:
-		if sourceDir == "" {
-			sourceDir = filepath.Join(userHome, ".kimi-code")
-		}
 		// Kimi reads HOME/.kimi-code. The sandbox supplies HOME=cacheRoot/home,
 		// so stage its isolated profile at that exact path.
 		stateRoot = cacheRoot
@@ -1675,12 +1648,9 @@ func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string, gatewayM
 	default:
 		return "", nil, fmt.Errorf("read-only seat runtime %q has no isolated state policy", agent.Runtime)
 	}
-	sourceDir, err = filepath.Abs(sourceDir)
+	sourceDir, err := resolveRuntimeConfigDir(agent.Runtime, sourceDir)
 	if err != nil {
-		return "", nil, fmt.Errorf("resolve runtime state directory %q: %w", sourceDir, err)
-	}
-	if resolved, resolveErr := filepath.EvalSymlinks(sourceDir); resolveErr == nil {
-		sourceDir = resolved
+		return "", nil, err
 	}
 	stateDir := filepath.Join(stateRoot, relativeState)
 	if err := os.RemoveAll(stateDir); err != nil {
@@ -1903,20 +1873,10 @@ func produceRuntimeSandboxGrants(runtimeName string, readable, readFiles, writab
 		// token since 2026-08-31, which yields exactly "OAuth session expired and
 		// could not be refreshed". Honor the configured dir and fall back only
 		// when none is set.
-		stateDir := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR"))
+		stateDir := os.Getenv("CLAUDE_CONFIG_DIR")
 		if stateDir == "" {
 			stateDir = filepath.Join(home, ".claude")
 		}
-		// A landlock grant and a MkdirAll both need an ABSOLUTE path. A relative or
-		// ~-prefixed CLAUDE_CONFIG_DIR would otherwise grant a path relative to the
-		// worker's cwd and create a stray directory there (#1810 review, P3).
-		if strings.HasPrefix(stateDir, "~") {
-			stateDir = filepath.Join(home, strings.TrimPrefix(stateDir, "~"))
-		}
-		if absolute, absErr := filepath.Abs(stateDir); absErr == nil {
-			stateDir = absolute
-		}
-		stateDir = filepath.Clean(stateDir)
 		cacheRoot, err := os.UserCacheDir()
 		if err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("resolve Claude cache root: %w", err)
@@ -2234,19 +2194,11 @@ func cockpitJobMeta(job db.Job, payload workflow.JobPayload, agent runtime.Agent
 	}
 }
 
-// cockpitTeeAdapter creates the per-job log the cockpit pane tails and rebuilds
-// the runtime adapter to tee the child's live stdout/stderr into it. It is called
-// ONLY on the wrapping path (herdr available), so non-cockpit and cockpit-off
-// jobs never create a log file or tee and stay byte-identical. The log lives at
-// <home>/logs/jobs/<jobid>.log and is created+truncated so each run starts fresh.
-// The tee uses a TeeRunner whose inner is GroupRunner{}, so process-group kill is
-// preserved and the buffered Result the adapter consumes is unchanged.
-//
-// It is fail-open: any failure (paths unresolved, mkdir, create, or an
-// unsupported runtime) returns a nil *os.File so the caller skips teeing and the
-// pane falls back to the P0 `job watch` command. The returned *os.File is the
-// caller's to Close after the job runs; when nil the adapter/path are ignored.
-func (w jobWorker) cockpitTeeAdapter(agent runtime.Agent, checkout string, jobID string, additionalOutput ...io.Writer) (workflow.DeliveryAdapter, string, *os.File) {
+// cockpitTeeAdapter creates the per-job log the cockpit pane tails and adds its
+// writer to the already-composed adapter. Composing in place preserves runtime
+// auth, read-only Landlock, isolated state, gateway leases, and progress output;
+// rebuilding from w.executionRunner discarded all of them.
+func (w jobWorker) cockpitTeeAdapter(adapter workflow.DeliveryAdapter, jobID string) (workflow.DeliveryAdapter, string, *os.File) {
 	paths, err := pathsFromFlag(w.ConfigHome)
 	if err != nil {
 		writeLine(w.Stdout, "job %s cockpit log path resolve failed: %v", jobID, err)
@@ -2257,11 +2209,6 @@ func (w jobWorker) cockpitTeeAdapter(agent runtime.Agent, checkout string, jobID
 		writeLine(w.Stdout, "job %s cockpit log dir create failed: %v", jobID, err)
 		return nil, "", nil
 	}
-	// Sanitize the job id into a flat, path-safe filename: delegation/continuation
-	// job ids contain '/' (e.g. "root/delegation/haiku-ocean", ".../continuation"),
-	// which would nest the log into dirs that are never created and fail os.Create →
-	// the live tail silently falls back to the P0 pane. A flat slug keeps it one
-	// file in this dir (no deep per-job dir trees).
 	logPath := filepath.Join(dir, cockpit.SafeLogName(jobID)+".log")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -2273,62 +2220,37 @@ func (w jobWorker) cockpitTeeAdapter(agent runtime.Agent, checkout string, jobID
 		writeLine(w.Stdout, "job %s cockpit log chmod failed: %v", jobID, err)
 		return nil, "", nil
 	}
-	return w.cockpitTeeOnFile(agent, checkout, jobID, logPath, logFile, additionalOutput...)
+	return w.cockpitTeeOnFile(adapter, jobID, logPath, logFile)
 }
 
-// cockpitTeeOnFile rebuilds the runtime adapter to tee the child's live
-// stdout/stderr into an already-open log file, shared by the per-job (truncate)
-// and per-seat (append) log paths. It is fail-open: an unsupported runtime closes
-// the file and returns nils so the caller falls back to the P0 pane.
-func (w jobWorker) cockpitTeeOnFile(agent runtime.Agent, checkout, jobID, logPath string, logFile *os.File, additionalOutput ...io.Writer) (workflow.DeliveryAdapter, string, *os.File) {
-	outputs := append([]io.Writer{logFile}, additionalOutput...)
-	inner := subprocess.StreamRunner(subprocess.GroupRunner{})
-	if w.executionRunner != nil {
-		stream, ok := w.executionRunner.(subprocess.StreamRunner)
-		if !ok {
-			_ = logFile.Close()
-			writeLine(w.Stdout, "job %s cockpit tee backend runner lacks streaming", jobID)
-			return nil, "", nil
-		}
-		inner = stream
-	}
-	adapter, err := buildRuntimeAdapter(w.ConfigHome, agent, checkout, subprocess.TeeRunner{Inner: inner, Out: runtimeOutputWriter(outputs...)})
+// cockpitTeeOnFile adds the log writer at the existing runner base. A
+// composition error closes the file and returns nils so the pane falls back to
+// `job watch` without replacing the working adapter.
+func (w jobWorker) cockpitTeeOnFile(adapter workflow.DeliveryAdapter, jobID, logPath string, logFile *os.File) (workflow.DeliveryAdapter, string, *os.File) {
+	teed, err := appendDeliveryAdapterOutput(adapter, logFile)
 	if err != nil {
-		// Unsupported runtime: this should never happen (AdapterFactory already
-		// built one above), but stay fail-open rather than leak the open file.
 		_ = logFile.Close()
 		writeLine(w.Stdout, "job %s cockpit tee adapter build failed: %v", jobID, err)
 		return nil, "", nil
 	}
-	return adapter, logPath, logFile
+	return teed, logPath, logFile
 }
 
-// cockpitLogAdapter picks the live-output log per PaneKeyMode (Task 7): seat mode
-// uses the stable per-seat append log so the one seat pane tails one accumulating
-// file across rounds; job mode keeps the per-job truncate log (byte-identical to
-// P1). It is called only on the wrapping path (herdr available); a nil *os.File
-// means fall back to the P0 pane.
-func (w jobWorker) cockpitLogAdapter(cp *cockpit.Cockpit, agent runtime.Agent, checkout, jobID, rootJobID, paneKey string, seatMode bool, additionalOutput ...io.Writer) (workflow.DeliveryAdapter, string, *os.File) {
+// cockpitLogAdapter picks the live-output log per PaneKeyMode: job mode uses a
+// per-job truncate log; seat mode uses one stable append log across rounds.
+func (w jobWorker) cockpitLogAdapter(cp *cockpit.Cockpit, adapter workflow.DeliveryAdapter, jobID, rootJobID, paneKey string, seatMode bool) (workflow.DeliveryAdapter, string, *os.File) {
 	if seatMode {
-		return w.cockpitSeatLogAdapter(cp, agent, checkout, jobID, rootJobID, paneKey, additionalOutput...)
+		return w.cockpitSeatLogAdapter(cp, adapter, jobID, rootJobID, paneKey)
 	}
-	return w.cockpitTeeAdapter(agent, checkout, jobID, additionalOutput...)
+	return w.cockpitTeeAdapter(adapter, jobID)
 }
 
-// cockpitSeatLogAdapter opens the stable per-seat append log the seat's one pane
-// tails across delegation rounds (Task 7) and tees the child's stdout/stderr into
-// it. The path is <home>/logs/seats/<rootShort>/<seatSlug>.log, opened O_APPEND so
-// each round's output accumulates rather than truncating the prior round's — no
-// tail re-pointing needed. The log is NOT removed per job; it persists for the
-// root's life and is removed by FinalizeRoot. It is fail-open: any failure
-// (unresolved path, mkdir, create, unsupported runtime) returns nils so the caller
-// falls back to the P0 pane.
-func (w jobWorker) cockpitSeatLogAdapter(cp *cockpit.Cockpit, agent runtime.Agent, checkout, jobID, rootJobID, paneKey string, additionalOutput ...io.Writer) (workflow.DeliveryAdapter, string, *os.File) {
+func (w jobWorker) cockpitSeatLogAdapter(cp *cockpit.Cockpit, adapter workflow.DeliveryAdapter, jobID, rootJobID, paneKey string) (workflow.DeliveryAdapter, string, *os.File) {
 	logPath, logFile := w.cockpitSeatLogFile(cp, jobID, rootJobID, paneKey)
 	if logFile == nil {
 		return nil, "", nil
 	}
-	return w.cockpitTeeOnFile(agent, checkout, jobID, logPath, logFile, additionalOutput...)
+	return w.cockpitTeeOnFile(adapter, jobID, logPath, logFile)
 }
 
 func (w jobWorker) cockpitSeatLogFile(cp *cockpit.Cockpit, jobID, rootJobID, paneKey string) (string, *os.File) {

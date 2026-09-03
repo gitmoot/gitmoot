@@ -13,6 +13,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/transcript"
 )
 
@@ -78,7 +79,13 @@ func TestCockpitAndProgressShareRuntimeOutput(t *testing.T) {
 	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard, home)
 	agent := runtime.Agent{Name: "lead", Role: "builder", Runtime: runtime.ShellRuntime, RuntimeRef: "echo shared-line"}
 	tracker := &pipelineProgressLineTracker{}
-	adapter, logPath, logFile := worker.cockpitTeeAdapter(agent, t.TempDir(), "job-shared", tracker)
+	// Progress output is attached when the adapter is built, so the cockpit tee
+	// must ADD its writer to that adapter rather than rebuild it.
+	progressAdapter, err := appendDeliveryAdapterOutput(runtime.ShellAdapter{Runner: subprocess.GroupRunner{}}, tracker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, logPath, logFile := worker.cockpitTeeAdapter(progressAdapter, "job-shared")
 	if logFile == nil {
 		t.Fatal("expected cockpit log")
 	}

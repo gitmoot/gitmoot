@@ -287,6 +287,24 @@ printf '{"type":"result","is_error":false,"result":"%s"}\n' "$fingerprint"
 	if !strings.Contains(probeOut.String(), "source: "+runtimeAuthFileName) || !strings.Contains(probeOut.String(), "Claude auth: valid") {
 		t.Fatalf("auth probe output=%q", probeOut.String())
 	}
+	// The ambient verdict above says nothing about the credential a READ-ONLY
+	// SEAT stages, which is the pair that stayed green through the outage. One
+	// command must report both (#1810 review F8: nothing pinned this line).
+	if !strings.Contains(probeOut.String(), "read-only seat credential") {
+		t.Fatalf("auth probe omitted the read-only seat credential: %q", probeOut.String())
+	}
+
+	deadSeatDir := t.TempDir()
+	writeClaudeCredential(t, deadSeatDir, 0, "")
+	t.Setenv("CLAUDE_CONFIG_DIR", deadSeatDir)
+	probeOut.Reset()
+	probeErr.Reset()
+	if code := runAuthProbe([]string{"claude", "--home", home}, &probeOut, &probeErr); code != 1 {
+		t.Fatalf("auth probe code=%d, want 1 for unusable seat credential; stdout=%q stderr=%q", code, probeOut.String(), probeErr.String())
+	}
+	if !strings.Contains(probeOut.String(), "UNUSABLE") {
+		t.Fatalf("auth probe did not identify unusable seat credential: %q", probeOut.String())
+	}
 
 	var stdout, stderr bytes.Buffer
 	if code := runAuthUnset([]string{"claude", "--home", home}, &stdout, &stderr); code != 0 {

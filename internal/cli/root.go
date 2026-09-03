@@ -188,7 +188,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	// The checks above measure the AMBIENT claude credential; a read-only seat
 	// authenticates with a staged snapshot, and reporting only the ambient one is
 	// the false green this outage ran on (#1810 review).
-	if check, ok := seatCredentialDoctorCheck(); ok {
+	if check, ok := seatCredentialDoctorCheck(paths); ok {
 		checks = append(checks, check)
 	}
 	// #631: surface a stale backlog of blocked jobs (each paused awaiting a human)

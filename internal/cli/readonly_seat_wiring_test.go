@@ -1,86 +1,17 @@
 package cli
 
 import (
-	"context"
-	"errors"
+	"io"
 	"os"
 	"strings"
 	"testing"
 
+	"github.com/gitmoot/gitmoot/internal/credgw"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
 
-// F3 from the #1810 review: the fix reach is SHAPE-DEPENDENT, and nothing tested
-// the wiring. graftRuntimeBaseRunner has no CuratedGroupRunner case, so only the
-// execbackend InstanceRunner shape rebuilds a seat env from
-// readOnlyRuntimeBaseEnv (this host uses it). This pins that the injected
-// overlay reaches the runner the adapter actually calls, for that shape.
-func TestWrapReadOnlySandboxAdapterCarriesResolvedAuthIntoTheRunner(t *testing.T) {
-	home := t.TempDir()
-	paths, err := pathsFromFlag(home)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(paths.Home, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(runtimeAuthFilePath(paths.Home),
-		[]byte("CLAUDE_CODE_OAUTH_TOKEN=seat-overlay-token-value\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
-
-	recorder := &envRecordingRunner{}
-	agent := runtime.Agent{
-		Runtime:       runtime.ClaudeRuntime,
-		ReadOnlySeat:  true,
-		WritablePaths: nil,
-	}
-	wrapped, err := wrapReadOnlySandboxAdapter(home, agent, checkout, runtime.ClaudeAdapter{Runner: recorder})
-	if err != nil {
-		t.Fatalf("wrapReadOnlySandboxAdapter: %v", err)
-	}
-	// The seat wrapper returns readOnlyRuntimeAdapter, which embeds the runtime
-	// adapter it wrapped; reach the inner ClaudeAdapter to inspect its runner.
-	seat, ok := wrapped.(readOnlyRuntimeAdapter)
-	if !ok {
-		t.Fatalf("wrapped adapter type %T, want readOnlyRuntimeAdapter", wrapped)
-	}
-	t.Cleanup(func() { _ = seat.cleanup() })
-	adapter, ok := seat.Adapter.(runtime.ClaudeAdapter)
-	if !ok {
-		t.Fatalf("inner adapter type %T, want runtime.ClaudeAdapter", seat.Adapter)
-	}
-	envRunner, ok := adapter.Runner.(subprocess.EnvRunner)
-	if !ok {
-		t.Fatalf("wrapped seat runner %T does not accept an environment", adapter.Runner)
-	}
-	if _, err := envRunner.RunEnv(context.Background(), checkout, nil, "/bin/true"); err != nil && recorder.env == nil {
-		t.Fatalf("runner never ran: %v", err)
-	}
-	if !containsEnv(recorder.env, "CLAUDE_CODE_OAUTH_TOKEN=seat-overlay-token-value") {
-		t.Fatalf("seat runner env lacks the resolved overlay: %v", redactEnvNames(recorder.env))
-	}
-}
-
-// envRecordingRunner captures the environment the innermost runner is handed.
-type envRecordingRunner struct {
-	env []string
-}
-
-func (r *envRecordingRunner) Run(context.Context, string, string, ...string) (subprocess.Result, error) {
-	return subprocess.Result{}, errors.New("env-recording runner requires RunEnv")
-}
-
-func (r *envRecordingRunner) LookPath(file string) (string, error) {
-	return file, nil
-}
-
-func (r *envRecordingRunner) RunEnv(_ context.Context, _ string, env []string, _ string, _ ...string) (subprocess.Result, error) {
-	r.env = append([]string(nil), env...)
-	return subprocess.Result{}, nil
-}
 
 // redactEnvNames returns NAMES only, so a failure message never prints a token.
 func redactEnvNames(env []string) []string {
@@ -90,4 +21,213 @@ func redactEnvNames(env []string) []string {
 		names = append(names, name)
 	}
 	return names
+}
+
+// Every runner shape used by the daemon must receive the same curated BaseEnv.
+// In particular, the default CuratedGroupRunner and execbackend InstanceRunner
+// must both carry the auth overlay and drop ambient GitHub credentials.
+func TestWrapReadOnlySandboxAdapterCuratesEveryRunnerShape(t *testing.T) {
+	const overlay = "CLAUDE_CODE_OAUTH_TOKEN=seat-shape-token-value"
+	home := t.TempDir()
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(paths.Home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(runtimeAuthFilePath(paths.Home), []byte(overlay+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// An ambient GH_TOKEN must never reach a read-only seat: gh prefers it over
+	// the redirected GH_CONFIG_DIR, so inheriting it hands a review a live
+	// GitHub credential.
+	t.Setenv("GH_TOKEN", "ambient-github-token")
+	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
+	agent := runtime.Agent{Runtime: runtime.ClaudeRuntime, ReadOnlySeat: true}
+
+	for name, runner := range map[string]subprocess.Runner{
+		"nil runner":                    nil,
+		"group runner":                  subprocess.GroupRunner{},
+		"curated group runner":          subprocess.CuratedGroupRunner{BaseEnv: []string{"GH_TOKEN=ambient-github-token"}},
+		"execbackend instance runner":   execbackend.InstanceRunner{BaseEnv: []string{"GH_TOKEN=ambient-github-token"}},
+		"tee over curated group runner": subprocess.TeeRunner{Inner: subprocess.CuratedGroupRunner{BaseEnv: []string{"GH_TOKEN=ambient-github-token"}}},
+		"env injecting over group":      subprocess.EnvInjectingRunner{Inner: subprocess.GroupRunner{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			wrapped, err := wrapReadOnlySandboxAdapter(home, agent, checkout, runtime.ClaudeAdapter{Runner: runner})
+			if err != nil {
+				t.Fatalf("wrapReadOnlySandboxAdapter: %v", err)
+			}
+			seat, ok := wrapped.(readOnlyRuntimeAdapter)
+			if !ok {
+				t.Fatalf("wrapped adapter %T, want readOnlyRuntimeAdapter", wrapped)
+			}
+			t.Cleanup(func() { _ = seat.cleanup() })
+			inner, ok := seat.Adapter.(runtime.ClaudeAdapter)
+			if !ok {
+				t.Fatalf("inner adapter %T, want runtime.ClaudeAdapter", seat.Adapter)
+			}
+			sandboxEnv, baseEnv := seatRunnerEnvironments(t, inner.Runner)
+			if !containsEnv(sandboxEnv, overlay) {
+				t.Fatalf("sandbox env lacks the overlay: %v", redactEnvNames(sandboxEnv))
+			}
+			if !containsEnv(baseEnv, overlay) {
+				t.Fatalf("runner base env lacks the overlay: %v", redactEnvNames(baseEnv))
+			}
+			for _, entry := range baseEnv {
+				if strings.HasPrefix(entry, "GH_TOKEN=") {
+					t.Fatalf("seat base env inherited GH_TOKEN: %v", redactEnvNames(baseEnv))
+				}
+			}
+		})
+	}
+}
+
+// Gateway mode holds the credential itself, so the seat is deliberately given
+// no overlay: injecting one would hand the sandboxed child a real token the
+// gateway exists to withhold.
+func TestWrapReadOnlySandboxAdapterWithholdsAuthInGatewayMode(t *testing.T) {
+	home := t.TempDir()
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(paths.Home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(runtimeAuthFilePath(paths.Home),
+		[]byte("CLAUDE_CODE_OAUTH_TOKEN=gateway-withheld-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
+	gatewayRunner := &credgw.Runner{Inner: subprocess.CuratedGroupRunner{}}
+	adapter := modelGatewayRuntimeAdapter{
+		Adapter: runtime.ClaudeAdapter{Runner: gatewayRunner},
+		runner:  gatewayRunner,
+	}
+	agent := runtime.Agent{Runtime: runtime.ClaudeRuntime, ReadOnlySeat: true}
+
+	wrapped, err := wrapReadOnlySandboxAdapter(home, agent, checkout, adapter)
+	if err != nil {
+		t.Fatalf("wrapReadOnlySandboxAdapter: %v", err)
+	}
+	seat, ok := wrapped.(readOnlyRuntimeAdapter)
+	if !ok {
+		t.Fatalf("wrapped adapter %T, want readOnlyRuntimeAdapter", wrapped)
+	}
+	t.Cleanup(func() { _ = seat.cleanup() })
+	gateway, ok := seat.Adapter.(modelGatewayRuntimeAdapter)
+	if !ok {
+		t.Fatalf("inner adapter %T, want modelGatewayRuntimeAdapter", seat.Adapter)
+	}
+	claude, ok := gateway.Adapter.(runtime.ClaudeAdapter)
+	if !ok {
+		t.Fatalf("gateway inner adapter %T, want runtime.ClaudeAdapter", gateway.Adapter)
+	}
+	sandboxEnv, baseEnv := seatRunnerEnvironments(t, claude.Runner)
+	for _, env := range [][]string{sandboxEnv, baseEnv} {
+		for _, entry := range env {
+			if strings.HasPrefix(entry, "CLAUDE_CODE_OAUTH_TOKEN=") && !strings.HasSuffix(entry, "=") {
+				t.Fatalf("gateway seat received a real token: %v", redactEnvNames(env))
+			}
+		}
+	}
+}
+
+// seatRunnerEnvironments returns the sandbox wrapper's env and the innermost
+// runner's base env, so a test can tell the grants route from the graft route
+// apart instead of passing on either alone.
+func seatRunnerEnvironments(t *testing.T, runner subprocess.Runner) (sandboxEnv []string, baseEnv []string) {
+	t.Helper()
+	for {
+		switch r := runner.(type) {
+		case subprocess.WrappingRunner:
+			sandboxEnv = append(sandboxEnv, r.Env...)
+			runner = r.Inner
+		case *subprocess.WrappingRunner:
+			sandboxEnv = append(sandboxEnv, r.Env...)
+			runner = r.Inner
+		case subprocess.TeeRunner:
+			runner = r.Inner
+		case *subprocess.TeeRunner:
+			runner = r.Inner
+		case subprocess.EnvInjectingRunner:
+			sandboxEnv = append(sandboxEnv, r.Env...)
+			runner = r.Inner
+		case *subprocess.EnvInjectingRunner:
+			sandboxEnv = append(sandboxEnv, r.Env...)
+			runner = r.Inner
+		case *credgw.Runner:
+			runner = r.Inner
+		case subprocess.CuratedGroupRunner:
+			return sandboxEnv, r.BaseEnv
+		case *subprocess.CuratedGroupRunner:
+			return sandboxEnv, r.BaseEnv
+		case execbackend.InstanceRunner:
+			return sandboxEnv, r.BaseEnv
+		case *execbackend.InstanceRunner:
+			return sandboxEnv, r.BaseEnv
+		default:
+			t.Fatalf("runner shape %T carries no base environment", runner)
+			return sandboxEnv, nil
+		}
+	}
+}
+
+// The cockpit log tee REBUILT the adapter from the worker's execution runner and
+// assigned over the composed one, discarding the whole read-only seat wrapper:
+// no Landlock, no isolated state dir, no auth overlay. With produce grants
+// already applied by then, the rebuilt job would even receive a WRITE grant on
+// the operator's live credential dir (#1810 review F5). Teeing must ADD a writer
+// to the composed adapter instead.
+func TestCockpitTeeKeepsTheReadOnlySeatSandbox(t *testing.T) {
+	const overlay = "CLAUDE_CODE_OAUTH_TOKEN=seat-cockpit-token-value"
+	home := t.TempDir()
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(paths.Home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(runtimeAuthFilePath(paths.Home), []byte(overlay+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
+	agent := runtime.Agent{Runtime: runtime.ClaudeRuntime, ReadOnlySeat: true}
+	seatAdapter, err := wrapReadOnlySandboxAdapter(home, agent, checkout,
+		runtime.ClaudeAdapter{Runner: subprocess.CuratedGroupRunner{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seat, ok := seatAdapter.(readOnlyRuntimeAdapter)
+	if !ok {
+		t.Fatalf("wrapped adapter %T, want readOnlyRuntimeAdapter", seatAdapter)
+	}
+	t.Cleanup(func() { _ = seat.cleanup() })
+
+	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard, home)
+	teed, logPath, logFile := worker.cockpitTeeAdapter(seatAdapter, "seat-cockpit-job")
+	if logFile == nil {
+		t.Fatalf("cockpit tee returned no log file (path %q)", logPath)
+	}
+	defer logFile.Close()
+
+	teedSeat, ok := teed.(readOnlyRuntimeAdapter)
+	if !ok {
+		t.Fatalf("teed adapter %T discarded the read-only seat wrapper", teed)
+	}
+	inner, ok := teedSeat.Adapter.(runtime.ClaudeAdapter)
+	if !ok {
+		t.Fatalf("teed inner adapter %T, want runtime.ClaudeAdapter", teedSeat.Adapter)
+	}
+	sandboxEnv, baseEnv := seatRunnerEnvironments(t, inner.Runner)
+	if !containsEnv(sandboxEnv, overlay) || !containsEnv(baseEnv, overlay) {
+		t.Fatalf("teeing dropped the seat auth overlay: sandbox=%v base=%v",
+			redactEnvNames(sandboxEnv), redactEnvNames(baseEnv))
+	}
+	if !containsEnvPrefix(sandboxEnv, "CLAUDE_CONFIG_DIR=") {
+		t.Fatalf("teeing dropped the isolated runtime state dir: %v", redactEnvNames(sandboxEnv))
+	}
 }

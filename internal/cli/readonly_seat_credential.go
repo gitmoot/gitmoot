@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
@@ -62,19 +64,9 @@ func (s readOnlySeatCredentialState) Expired(now time.Time) bool {
 // preflight then has nothing to assert, which is the honest outcome rather than
 // a guess about a format gitmoot has not measured.
 func readOnlySeatCredentialStatePath(runtimeName string, sourceDir string) string {
-	sourceDir = strings.TrimSpace(sourceDir)
-	if sourceDir == "" {
+	sourceDir, err := resolveRuntimeConfigDir(runtimeName, sourceDir)
+	if err != nil || sourceDir == "" {
 		return ""
-	}
-	// Resolve exactly as prepareReadOnlyRuntimeState does before staging:
-	// absolute, then symlinks evaluated. Reading a DIFFERENT path from the one
-	// that gets staged would let this report on a file the seat never uses, which
-	// the #1810 review flagged.
-	if absolute, err := filepath.Abs(sourceDir); err == nil {
-		sourceDir = absolute
-	}
-	if resolved, err := filepath.EvalSymlinks(sourceDir); err == nil {
-		sourceDir = resolved
 	}
 	switch runtimeName {
 	case runtime.ClaudeRuntime:
@@ -149,7 +141,7 @@ func inspectReadOnlySeatCredential(runtimeName string, sourceDir string) (readOn
 // gitmoot staged an expired credential and from where, instead of leaving the
 // reader with the runtime's own "OAuth session expired" wording. Gateway mode
 // stages no credential file at all, so there is nothing to diagnose there.
-func readOnlySeatCredentialPreflight(agent runtime.Agent, sourceDir string, gatewayMode bool, now time.Time) string {
+func readOnlySeatCredentialPreflight(agent runtime.Agent, sourceDir string, gatewayMode bool, haveOverlay bool, now time.Time) string {
 	if !agent.ReadOnlySeat || gatewayMode {
 		return ""
 	}
@@ -165,15 +157,27 @@ func readOnlySeatCredentialPreflight(agent runtime.Agent, sourceDir string, gate
 	if state.Refreshable {
 		refresh = "and must be refreshed by the runtime to work on its own"
 	}
+	// Only claim the overlay when one was actually resolved. Asserting it
+	// unconditionally was false on any host with no runtime-auth.env and no
+	// ambient credentials, which is precisely the host this diagnosis matters on
+	// (#1810 review, round 2).
+	fallback := "and NO resolved runtime auth was available to the seat, so this staged credential is all it has"
+	if haveOverlay {
+		fallback = "and the seat also carries the resolved runtime auth, so this is context for any later auth failure rather than a refusal"
+	}
 	return fmt.Sprintf(
-		"read-only seat staged an expired %s credential (expired %s) %s; the seat also carries the resolved runtime auth, so this is context for any later auth failure rather than a refusal",
-		agent.Runtime, expiry, refresh,
+		"read-only seat staged an expired %s credential (expired %s) %s; %s",
+		agent.Runtime, expiry, refresh, fallback,
 	)
 }
 
-// readOnlySeatRuntimeAuthEnv resolves the runtime auth a seat must carry. It is
-// the same overlay runtimeJobRunnerWithAuth injects for every other job; the
-// seat path rebuilt its environment and silently dropped it.
+// readOnlySeatRuntimeAuthEnv resolves the runtime auth a seat must carry: the
+// same overlay runtimeJobRunnerWithAuth injects for every other job, which the
+// seat path rebuilt its environment without.
+//
+// It bootstraps first, exactly as runtimeJobRunnerWithAuth does. Reading
+// runtime-auth.env alone returned an empty overlay on a host that authenticates
+// from ambient credentials and had never written that file.
 func readOnlySeatRuntimeAuthEnv(home string, runtimeName string, gatewayMode bool) ([]string, error) {
 	if gatewayMode || runtimeName != runtime.ClaudeRuntime {
 		return nil, nil
@@ -182,6 +186,9 @@ func readOnlySeatRuntimeAuthEnv(home string, runtimeName string, gatewayMode boo
 	if err != nil {
 		return nil, fmt.Errorf("resolve read-only seat runtime auth paths: %w", err)
 	}
+	if _, err := bootstrapRuntimeAuth(paths.Home, runtimeAuthEnvLookup, runtimeAuthLogf); err != nil {
+		return nil, fmt.Errorf("bootstrap read-only seat runtime auth: %w", err)
+	}
 	state, err := loadRuntimeAuthFile(paths.Home)
 	if err != nil {
 		return nil, fmt.Errorf("load read-only seat runtime auth: %w", err)
@@ -189,43 +196,56 @@ func readOnlySeatRuntimeAuthEnv(home string, runtimeName string, gatewayMode boo
 	return runtimeAuthInjectionEnv(state), nil
 }
 
-// writeSeatCredentialProbe reports the credential a READ-ONLY SEAT would stage,
-// which is a different credential from the ambient one every probe measured
-// until now. Measured 2026-09-03: `gitmoot auth probe claude` and `gitmoot
-// doctor` were green for hours while every claude review job failed, because
-// the seat staged /root/.claude/.credentials.json (expiresAt 0, refresh
-// rejected) and the probe never looked at it. A green that cannot see the
-// credential under test is the false green this reports on.
-func writeSeatCredentialProbe(stdout io.Writer, home string) {
-	sourceDir := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR"))
-	origin := "CLAUDE_CONFIG_DIR"
-	if sourceDir == "" {
-		userHome, err := os.UserHomeDir()
-		if err != nil {
-			writeLine(stdout, "read-only seat credential: unknown (cannot resolve the host home: %v)", err)
-			return
-		}
-		sourceDir = filepath.Join(userHome, ".claude")
-		origin = "host default"
+const readOnlySeatCredentialExpiredEvent = "readonly_seat_credential_expired"
+
+func (w jobWorker) recordReadOnlySeatCredentialDiagnosis(ctx context.Context, jobID, diagnosis string) error {
+	events, err := w.Store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		return err
 	}
-	state, ok := inspectReadOnlySeatCredential(runtime.ClaudeRuntime, sourceDir)
+	for _, event := range events {
+		if event.Kind == readOnlySeatCredentialExpiredEvent {
+			return nil
+		}
+	}
+	return w.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID: jobID, Kind: readOnlySeatCredentialExpiredEvent, Message: diagnosis,
+	})
+}
+
+// writeSeatCredentialProbe reports the credential a READ-ONLY SEAT would stage
+// and returns false only when that credential is known to be unusable. Unknown
+// expiry data and an expired credential with a refresh token remain non-failing:
+// neither proves the runtime will reject the credential.
+//
+// It resolves the source the same way the doctor check does, preferring the
+// DAEMON's own CLAUDE_CONFIG_DIR because the invoking shell may describe an
+// account no job uses.
+func writeSeatCredentialProbe(stdout io.Writer, paths config.Paths) bool {
+	source := resolveSeatCredentialSource(paths)
+	if source.dir == "" {
+		writeLine(stdout, "read-only seat credential: unknown (cannot resolve the seat config dir)")
+		return true
+	}
+	state, ok := inspectReadOnlySeatCredential(runtime.ClaudeRuntime, source.dir)
 	if !ok {
-		writeLine(stdout, "read-only seat credential (%s %s): no readable expiry; a seat stages what is there and the runtime decides", origin, sourceDir)
-		return
+		writeLine(stdout, "read-only seat credential (%s, %s): no readable expiry; a seat stages what is there and the runtime decides", source.dir, source.origin)
+		return true
 	}
 	if !state.Expired(time.Now().UTC()) {
-		writeLine(stdout, "read-only seat credential (%s): declares expiry %s, not yet reached; this reads a field and does not prove the credential authenticates", state.Source, state.ExpiresAt.Format(time.RFC3339))
-		return
+		writeLine(stdout, "read-only seat credential (%s, %s): declares expiry %s, not yet reached; this reads a field and does not prove the credential authenticates", state.Source, source.origin, state.ExpiresAt.Format(time.RFC3339))
+		return true
 	}
 	expiry := "no expiry recorded (a failed refresh writes this)"
 	if !state.ExpiresAt.IsZero() {
 		expiry = state.ExpiresAt.Format(time.RFC3339)
 	}
 	if state.Refreshable {
-		writeLine(stdout, "read-only seat credential (%s): EXPIRED %s, refresh token present; a seat must refresh it inside a disposable home, and the rotated token is discarded with the job", state.Source, expiry)
-		return
+		writeLine(stdout, "read-only seat credential (%s, %s): EXPIRED %s, refresh token present; a seat must refresh it inside a disposable home, and the rotated token is discarded with the job", state.Source, source.origin, expiry)
+		return true
 	}
-	writeLine(stdout, "read-only seat credential (%s): UNUSABLE, expired %s with no refresh token; every read-only seat job on this runtime will fail until that account is re-logged in", state.Source, expiry)
+	writeLine(stdout, "read-only seat credential (%s, %s): UNUSABLE, expired %s with no refresh token; every read-only seat job on this runtime will fail until that account is re-logged in", state.Source, source.origin, expiry)
+	return false
 }
 
 // seatModelGatewayMode reports whether claude deliveries run through the local
@@ -242,4 +262,50 @@ func seatModelGatewayMode(home string) bool {
 		return false
 	}
 	return cfg.ModelGateway
+}
+
+// resolveRuntimeConfigDir is the one path contract shared by every caller that
+// inspects, stages, or grants a runtime profile: the host default when unset,
+// current-user ~ expansion, symlinks resolved when the path exists.
+//
+// It REFUSES a relative or ~user path instead of repairing it. Both used to be
+// silently rewritten — a relative dir against the daemon's arbitrary working
+// directory (creating a stray profile there) and ~user under the CURRENT user's
+// home — so the engine granted, staged and inspected an account the operator
+// never named. That is the failure class this change exists to remove, so it
+// fails loudly with the configured value in the message.
+func resolveRuntimeConfigDir(runtimeName string, configuredDir string) (string, error) {
+	userHome, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve runtime state home: %w", err)
+	}
+	dir := strings.TrimSpace(configuredDir)
+	if dir == "" {
+		switch runtimeName {
+		case runtime.ClaudeRuntime:
+			dir = filepath.Join(userHome, ".claude")
+		case runtime.CodexRuntime:
+			dir = filepath.Join(userHome, ".codex")
+		case runtime.KimiRuntime:
+			dir = filepath.Join(userHome, ".kimi-code")
+		default:
+			return "", nil
+		}
+	} else {
+		switch {
+		case dir == "~":
+			dir = userHome
+		case strings.HasPrefix(dir, "~/"):
+			dir = filepath.Join(userHome, strings.TrimPrefix(dir, "~/"))
+		case strings.HasPrefix(dir, "~"):
+			return "", fmt.Errorf("runtime state directory %q uses unsupported ~user expansion; name an absolute path", configuredDir)
+		}
+		if !filepath.IsAbs(dir) {
+			return "", fmt.Errorf("runtime state directory %q must be absolute; a relative path resolves against the daemon's working directory", configuredDir)
+		}
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(dir); resolveErr == nil {
+		dir = resolved
+	}
+	return filepath.Clean(dir), nil
 }
