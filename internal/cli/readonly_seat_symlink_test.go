@@ -41,7 +41,7 @@ func TestReadOnlySeatStagesSymlinkedInputsAndCredentials(t *testing.T) {
 	}
 
 	agent := runtime.Agent{Runtime: runtime.KimiRuntime, RuntimeConfigDir: source}
-	stateDir, _, err := prepareReadOnlyRuntimeState(agent, t.TempDir(), false)
+	stateDir, _, _, err := prepareReadOnlyRuntimeState(agent, t.TempDir(), false)
 	if err != nil {
 		t.Fatalf("a symlinked profile must be stageable, got: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestReadOnlySeatStillRefusesInputsThatAreNotFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	agent := runtime.Agent{Runtime: runtime.CodexRuntime, RuntimeConfigDir: source}
-	_, _, err := prepareReadOnlyRuntimeState(agent, t.TempDir(), false)
+	_, _, _, err := prepareReadOnlyRuntimeState(agent, t.TempDir(), false)
 	if err == nil {
 		t.Fatal("a directory named config.toml was accepted as a runtime input")
 	}
@@ -96,7 +96,7 @@ func TestReadOnlySeatStillRefusesInputsThatAreNotFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	agent = runtime.Agent{Runtime: runtime.CodexRuntime, RuntimeConfigDir: linked}
-	if _, _, err := prepareReadOnlyRuntimeState(agent, t.TempDir(), false); err == nil {
+	if _, _, _, err := prepareReadOnlyRuntimeState(agent, t.TempDir(), false); err == nil {
 		t.Fatal("a symlink to a directory was accepted as a runtime input")
 	}
 }
@@ -115,7 +115,7 @@ func TestReadOnlySeatTreatsADanglingSymlinkAsMissing(t *testing.T) {
 	if err := os.Symlink(filepath.Join(home, "gone.toml"), filepath.Join(codexSource, "config.toml")); err != nil {
 		t.Fatal(err)
 	}
-	stateDir, _, err := prepareReadOnlyRuntimeState(runtime.Agent{Runtime: runtime.CodexRuntime, RuntimeConfigDir: codexSource}, t.TempDir(), false)
+	stateDir, _, _, err := prepareReadOnlyRuntimeState(runtime.Agent{Runtime: runtime.CodexRuntime, RuntimeConfigDir: codexSource}, t.TempDir(), false)
 	if err != nil {
 		t.Fatalf("a dangling optional input must be skipped, got: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestReadOnlySeatTreatsADanglingSymlinkAsMissing(t *testing.T) {
 	if err := os.Symlink(filepath.Join(home, "gone.toml"), filepath.Join(kimiSource, "config.toml")); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err = prepareReadOnlyRuntimeState(runtime.Agent{Runtime: runtime.KimiRuntime, RuntimeConfigDir: kimiSource}, t.TempDir(), false)
+	_, _, _, err = prepareReadOnlyRuntimeState(runtime.Agent{Runtime: runtime.KimiRuntime, RuntimeConfigDir: kimiSource}, t.TempDir(), false)
 	if err == nil {
 		t.Fatal("a dangling REQUIRED input was accepted")
 	}

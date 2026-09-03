@@ -230,7 +230,7 @@ func TestPrepareReadOnlyRuntimeStateNamesAMissingRequiredInput(t *testing.T) {
 	}
 	agent := runtime.Agent{Runtime: runtime.KimiRuntime, RuntimeConfigDir: sourceDir, ReadOnlySeat: true}
 
-	_, _, err := prepareReadOnlyRuntimeState(agent, t.TempDir(), false)
+	_, _, _, err := prepareReadOnlyRuntimeState(agent, t.TempDir(), false)
 	if err == nil {
 		t.Fatal("a kimi seat without config.toml must be refused, not launched")
 	}
@@ -242,7 +242,7 @@ func TestPrepareReadOnlyRuntimeStateNamesAMissingRequiredInput(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(sourceDir, "config.toml"), []byte("default_model = \"kimi-code/k3\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	stateDir, _, err := prepareReadOnlyRuntimeState(agent, t.TempDir(), false)
+	stateDir, _, _, err := prepareReadOnlyRuntimeState(agent, t.TempDir(), false)
 	if err != nil {
 		t.Fatalf("prepareReadOnlyRuntimeState: %v", err)
 	}

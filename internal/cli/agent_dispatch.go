@@ -33,7 +33,10 @@ var localAgentDispatchRuntimeAdapterFor foregroundRuntimeAdapterFactory = func(h
 	if err != nil {
 		return nil, err
 	}
-	delivery, err := wrapReadOnlySandboxAdapter(home, agent, checkout, adapter)
+	// The withheld-config report is dropped here deliberately: foreground
+	// dispatch has no job row to attach an event to, and the same narrowing is
+	// recorded by the daemon path that runs seats unattended.
+	delivery, _, err := wrapReadOnlySandboxAdapter(home, agent, checkout, adapter)
 	if err != nil {
 		return nil, err
 	}

@@ -85,7 +85,7 @@ func TestReadOnlySeatRefusesAnUnusableClaudeProfileByName(t *testing.T) {
 	}
 
 	agent := runtime.Agent{Runtime: runtime.ClaudeRuntime, RuntimeConfigDir: source}
-	_, _, err := prepareReadOnlyRuntimeState(agent, t.TempDir(), false)
+	_, _, _, err := prepareReadOnlyRuntimeState(agent, t.TempDir(), false)
 	if err == nil {
 		t.Fatal("an expired, unrefreshable claude profile staged cleanly; the seat would fail later and opaquely")
 	}
@@ -100,7 +100,7 @@ func TestReadOnlySeatRefusesAnUnusableClaudeProfileByName(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(source, ".credentials.json"), []byte(good), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	stateDir, _, err := prepareReadOnlyRuntimeState(agent, t.TempDir(), false)
+	stateDir, _, _, err := prepareReadOnlyRuntimeState(agent, t.TempDir(), false)
 	if err != nil {
 		t.Fatalf("a working claude profile must stage, got: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestReadOnlySeatGatewayModeStagesNoCredential(t *testing.T) {
 	}
 
 	agent := runtime.Agent{Runtime: runtime.ClaudeRuntime, RuntimeConfigDir: source}
-	stateDir, stateEnv, err := prepareReadOnlyRuntimeState(agent, t.TempDir(), true)
+	stateDir, stateEnv, _, err := prepareReadOnlyRuntimeState(agent, t.TempDir(), true)
 	if err != nil {
 		t.Fatalf("gateway mode must not stage or judge the host credential, got: %v", err)
 	}
@@ -139,5 +139,54 @@ func TestReadOnlySeatGatewayModeStagesNoCredential(t *testing.T) {
 	}
 	if len(stateEnv) == 0 || !strings.Contains(fmt.Sprint(stateEnv), "CLAUDE_CONFIG_DIR") {
 		t.Errorf("gateway mode state env = %v, want CLAUDE_CONFIG_DIR pointed at the isolated dir", stateEnv)
+	}
+}
+
+// TestClaudeOAuthToleratesFormatDrift is the round-2 P3: expiresAt decoded as a
+// strict int64, so a third party writing it as a STRING or in exponent
+// notation aborted the entire seat with a raw Go unmarshal error - a hard
+// outage caused by how gitmoot READS a file it does not own. Both staged fine
+// at merge base.
+func TestClaudeOAuthToleratesFormatDrift(t *testing.T) {
+	future := time.Now().Add(2 * time.Hour).UnixMilli()
+	noVerdict := map[string]string{
+		"expiresAt as a string":          `{"claudeAiOauth":{"accessToken":"t","expiresAt":"32503680000000"}}`,
+		"expiresAt in exponent form":     `{"claudeAiOauth":{"accessToken":"t","expiresAt":1.9e12}}`,
+		"expiresAt in SECONDS":           `{"claudeAiOauth":{"accessToken":"t","expiresAt":1756000000}}`,
+		"expiresAt as a bool":            `{"claudeAiOauth":{"accessToken":"t","expiresAt":true}}`,
+		"claudeAiOauth is not an object": `{"claudeAiOauth":"opaque"}`,
+		"not our format at all":          `{"somethingElse":{}}`,
+	}
+	for name, credential := range noVerdict {
+		t.Run("no verdict/"+name, func(t *testing.T) {
+			if err := claudeOAuthUsable([]byte(credential)); err != nil {
+				t.Fatalf("format drift became a hard seat outage: %v", err)
+			}
+		})
+	}
+
+	// Judgements it CAN prove are unchanged.
+	if err := claudeOAuthUsable([]byte(`{"claudeAiOauth":{"accessToken":"t","expiresAt":` + fmt.Sprint(future) + `}}`)); err != nil {
+		t.Errorf("an unexpired token was rejected: %v", err)
+	}
+	expired := time.Now().Add(-2 * time.Hour).UnixMilli()
+	if err := claudeOAuthUsable([]byte(`{"claudeAiOauth":{"accessToken":"t","expiresAt":` + fmt.Sprint(expired) + `}}`)); err == nil {
+		t.Error("an expired token with no refreshToken was accepted")
+	}
+
+	// A PAST exponent value decodes and yields the ordinary verdict - the
+	// round-2 finding was the raw unmarshal error, not the judgement.
+	err := claudeOAuthUsable([]byte(`{"claudeAiOauth":{"accessToken":"t","expiresAt":1.75e12}}`))
+	if err == nil {
+		t.Error("a past exponent-form expiry produced no verdict")
+	} else if strings.Contains(err.Error(), "cannot unmarshal") {
+		t.Errorf("exponent form still aborts with a raw Go json error: %v", err)
+	}
+
+	// Clock skew must not condemn a seat: a token that just expired is inside
+	// the grace window.
+	justExpired := time.Now().Add(-time.Minute).UnixMilli()
+	if err := claudeOAuthUsable([]byte(`{"claudeAiOauth":{"accessToken":"t","expiresAt":` + fmt.Sprint(justExpired) + `}}`)); err != nil {
+		t.Errorf("a token one minute past expiry was refused, which is a clock-skew verdict: %v", err)
 	}
 }

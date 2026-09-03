@@ -368,7 +368,7 @@ func TestWrapReadOnlySandboxAdapterUsesExplicitReadsAndIsolatedState(t *testing.
 		ReadOnlySeat:     true,
 		RuntimeConfigDir: stateDir,
 	}
-	wrapped, err := wrapReadOnlySandboxAdapter(configHome, agent, checkout, runtime.ClaudeAdapter{Runner: subprocess.GroupRunner{}})
+	wrapped, _, err := wrapReadOnlySandboxAdapter(configHome, agent, checkout, runtime.ClaudeAdapter{Runner: subprocess.GroupRunner{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -440,7 +440,7 @@ func TestWrapReadOnlySandboxAdapterKeepsModelGatewayCredentialFree(t *testing.T)
 		Adapter: runtime.ClaudeAdapter{Runner: gatewayRunner},
 		runner:  gatewayRunner,
 	}
-	wrapped, err := wrapReadOnlySandboxAdapter(t.TempDir(), runtime.Agent{
+	wrapped, _, err := wrapReadOnlySandboxAdapter(t.TempDir(), runtime.Agent{
 		Runtime:          runtime.ClaudeRuntime,
 		ReadOnlySeat:     true,
 		RuntimeConfigDir: sourceState,
@@ -794,7 +794,7 @@ func TestForegroundReviewRuntimeStateSurvivesRepairAndCleansAtBoundary(t *testin
 
 	previousAdapterFactory := localAgentDispatchRuntimeAdapterFor
 	localAgentDispatchRuntimeAdapterFor = func(configHome string, agent runtime.Agent, deliveryCheckout string) (runtime.Adapter, error) {
-		delivery, err := wrapReadOnlySandboxAdapter(configHome, agent, deliveryCheckout, runtime.ClaudeAdapter{Runner: runner})
+		delivery, _, err := wrapReadOnlySandboxAdapter(configHome, agent, deliveryCheckout, runtime.ClaudeAdapter{Runner: runner})
 		if err != nil {
 			return nil, err
 		}
@@ -854,7 +854,7 @@ func TestReadOnlyRuntimeAdapterNeverPersistsStagedCredential(t *testing.T) {
 		AutonomyPolicy: runtime.AutonomyPolicyReadOnly, ReadOnlySeat: true,
 		RuntimeConfigDir: sourceDir,
 	}
-	wrapped, err := wrapReadOnlySandboxAdapter(configHome, agent, checkout, runtime.ClaudeAdapter{
+	wrapped, _, err := wrapReadOnlySandboxAdapter(configHome, agent, checkout, runtime.ClaudeAdapter{
 		Runner: &sandboxAdapterCaptureRunner{stdout: `{"result":"done"}`},
 	})
 	if err != nil {
@@ -920,7 +920,7 @@ func TestWrapReadOnlySandboxAdapterRejectsOmpWithoutCredentialBroker(t *testing.
 		t.Fatal(err)
 	}
 	agent := runtime.Agent{Runtime: runtime.OmpRuntime, ReadOnlySeat: true}
-	_, err := wrapReadOnlySandboxAdapter(t.TempDir(), agent, checkout, runtime.OmpAdapter{})
+	_, _, err := wrapReadOnlySandboxAdapter(t.TempDir(), agent, checkout, runtime.OmpAdapter{})
 	if err == nil || !strings.Contains(err.Error(), "isolated credential broker") {
 		t.Fatalf("omp read-only seat error = %v", err)
 	}

@@ -41,7 +41,7 @@ http_headers = { Authorization = "Bearer LEAKED-HEADER" }
 	}
 	cacheRoot := t.TempDir()
 	agent := runtime.Agent{Runtime: runtime.CodexRuntime, RuntimeConfigDir: src}
-	stateDir, _, err := prepareReadOnlyRuntimeState(agent, cacheRoot, false)
+	stateDir, _, _, err := prepareReadOnlyRuntimeState(agent, cacheRoot, false)
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}

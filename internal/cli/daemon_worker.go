@@ -716,7 +716,15 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
 	}
-	adapter, err = wrapReadOnlySandboxAdapter(w.ConfigHome, agent, deliveryCheckout, adapter)
+	adapter, narrowingDropped, err := wrapReadOnlySandboxAdapter(w.ConfigHome, agent, deliveryCheckout, adapter)
+	if err == nil && len(narrowingDropped) > 0 {
+		// Narrowing is not silent: a reviewer whose MCP tool is missing, or a
+		// seat that cannot authenticate to a provider whose key was withheld,
+		// can find out why from the job's own event log.
+		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "read_only_seat_config_narrowed", Message: "withheld from the seat's staged config: " + strings.Join(narrowingDropped, ", ")}); eventErr != nil {
+			return eventErr
+		}
+	}
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
@@ -1421,6 +1429,10 @@ func wrapProduceSandboxAdapter(action string, agent runtime.Agent, adapter workf
 const maxReadOnlyRuntimeStateFileBytes = 1 << 20
 
 type readOnlySandboxGrants struct {
+	// dropped names what narrowing withheld from the staged config, so the
+	// caller can record it. A seat that silently starts without its MCP
+	// servers gives the reviewer no way to learn why a tool is missing.
+	dropped   []string
 	reads     []string
 	readFiles []string
 	writes    []string
@@ -1457,14 +1469,14 @@ func (a readOnlyRuntimeAdapter) cleanup() error {
 	return nil
 }
 
-func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout string, adapter workflow.DeliveryAdapter) (workflow.DeliveryAdapter, error) {
+func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout string, adapter workflow.DeliveryAdapter) (workflow.DeliveryAdapter, []string, error) {
 	if !agent.ReadOnlySeat {
-		return adapter, nil
+		return adapter, nil, nil
 	}
 	_, gatewayMode := adapter.(modelGatewayRuntimeAdapter)
 	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, gatewayMode)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	wrap := func(runner subprocess.Runner) subprocess.Runner {
 		curated := graftRuntimeBaseRunner(runner, subprocess.CuratedGroupRunner{
@@ -1474,19 +1486,19 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 	}
 	wrapped, err := wrapReadOnlyAdapterRunner(agent.Runtime, adapter, grants.stateDir, wrap)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if grants.stateDir == "" {
-		return wrapped, nil
+		return wrapped, grants.dropped, nil
 	}
 	runtimeAdapter, ok := wrapped.(runtime.Adapter)
 	if !ok {
-		return nil, fmt.Errorf("read-only Landlock sandbox returned incompatible %T adapter", wrapped)
+		return nil, nil, fmt.Errorf("read-only Landlock sandbox returned incompatible %T adapter", wrapped)
 	}
 	return readOnlyRuntimeAdapter{
 		Adapter:     runtimeAdapter,
 		cleanupRoot: grants.cacheRoot,
-	}, nil
+	}, grants.dropped, nil
 }
 
 func wrapReadOnlyAdapterRunner(runtimeName string, adapter workflow.DeliveryAdapter, stateDir string, wrap func(subprocess.Runner) subprocess.Runner) (workflow.DeliveryAdapter, error) {
@@ -1590,10 +1602,20 @@ func resumableSessionRuntime(runtimeName string) bool {
 	}
 }
 
-// readOnlySeatRuntimeRef is the fresh session ref a read-only seat runs on.
-// queuedJobRuntimeResourceKey (the scheduler gate) and the worker's lock
-// acquisition both derive their key from this one function, so they cannot
-// disagree. That is the #1034 isolated-shell-stage shape. A job id is always
+// readOnlySeatRuntimeRef is the fresh session ref a read-only seat DELIVERS on.
+//
+// It is never a lock key, and that is the point: the seat locks on the agent's
+// REGISTERED ref (jobWorker.run keeps a pre-seat copy in sessionLockAgent) and
+// the scheduler gate needs no seat branch at all, because
+// queuedJobRuntimeResourceKey reads the stored agent and therefore computes the
+// same registered key. Gate and acquisition agree because neither one uses this
+// function.
+//
+// An earlier version of this comment claimed both derived their key from HERE.
+// That is the opposite of the code, and acting on it is exactly the mutation
+// TestDaemonWorkerLocksTheRegisteredSessionForAReadOnlySeat exists to kill. The
+// genuine #1034 shared-key shape is one branch up, in the
+// isolatedShellStageRuntimeSessionKey path. A job id is always
 // available at both call sites; the unnamed case still gets a fresh, never
 // resumed ref rather than silently falling back to a resumable session.
 func readOnlySeatRuntimeRef(jobID string) (string, error) {
@@ -1638,12 +1660,13 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	}
 	grants.reads = append(grants.reads, metadata...)
 
-	stateDir, stateEnv, err := prepareReadOnlyRuntimeState(agent, grants.cacheRoot, gatewayMode)
+	stateDir, stateEnv, dropped, err := prepareReadOnlyRuntimeState(agent, grants.cacheRoot, gatewayMode)
 	if err != nil {
 		return grants, err
 	}
 	grants.stateDir = stateDir
 	grants.env = append(grants.env, stateEnv...)
+	grants.dropped = dropped
 
 	tempDir := filepath.Join(grants.cacheRoot, "tmp")
 	grants.env = append(grants.env,
@@ -1713,8 +1736,9 @@ type readOnlySeatStatePolicy struct {
 	// optionalInputs are staged when present and skipped when absent.
 	optionalInputs []string
 	// inputNarrowers strip content an input must not carry into the seat,
-	// keyed by input name. An input with no narrower is staged verbatim.
-	inputNarrowers map[string]func([]byte) ([]byte, error)
+	// keyed by input name. An input with no narrower is staged VERBATIM, which
+	// is only correct for a file that cannot carry a third-party credential.
+	inputNarrowers map[string]func([]byte) (narrowedConfig, error)
 	// stateEnv names the environment variable that points the runtime at the
 	// staged dir. Empty when the runtime finds it through HOME.
 	stateEnv string
@@ -1747,8 +1771,8 @@ func readOnlySeatStatePolicyFor(runtimeName string, userHome string, gatewayMode
 			// host has one. It is NARROWED first: the same file holds
 			// third-party credentials, and stateDir is writable by the seat.
 			optionalInputs: []string{"config.toml"},
-			inputNarrowers: map[string]func([]byte) ([]byte, error){
-				"config.toml": narrowCodexConfig,
+			inputNarrowers: map[string]func([]byte) (narrowedConfig, error){
+				"config.toml": narrowCodexConfigDetailed,
 			},
 			stateEnv: "CODEX_HOME",
 		}, true, nil
@@ -1764,6 +1788,14 @@ func readOnlySeatStatePolicyFor(runtimeName string, userHome string, gatewayMode
 			// Without it kimi starts, authenticates, and then refuses with
 			// "No model configured", which reads as an auth failure.
 			requiredInputs: []string{"config.toml"},
+			// NARROWED for the same reason codex's is, and this file needs it
+			// MORE: measured on a live host it carries api_key under
+			// [services.*] and a key under [services.*.oauth], and for kimi
+			// stateAtCacheRoot puts the staged copy directly inside the seat's
+			// one writable root.
+			inputNarrowers: map[string]func([]byte) (narrowedConfig, error){
+				"config.toml": narrowKimiConfigDetailed,
+			},
 		}, true, nil
 	case runtime.ShellRuntime:
 		return readOnlySeatStatePolicy{}, false, nil
@@ -1774,14 +1806,14 @@ func readOnlySeatStatePolicyFor(runtimeName string, userHome string, gatewayMode
 	}
 }
 
-func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string, gatewayMode bool) (string, []string, error) {
+func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string, gatewayMode bool) (string, []string, []string, error) {
 	userHome, err := os.UserHomeDir()
 	if err != nil {
-		return "", nil, fmt.Errorf("resolve read-only runtime state home: %w", err)
+		return "", nil, nil, fmt.Errorf("resolve read-only runtime state home: %w", err)
 	}
 	policy, needsState, err := readOnlySeatStatePolicyFor(agent.Runtime, userHome, gatewayMode)
 	if err != nil || !needsState {
-		return "", nil, err
+		return "", nil, nil, err
 	}
 	sourceDir := strings.TrimSpace(agent.RuntimeConfigDir)
 	if sourceDir == "" {
@@ -1789,7 +1821,7 @@ func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string, gatewayM
 	}
 	sourceDir, err = filepath.Abs(sourceDir)
 	if err != nil {
-		return "", nil, fmt.Errorf("resolve runtime state directory %q: %w", sourceDir, err)
+		return "", nil, nil, fmt.Errorf("resolve runtime state directory %q: %w", sourceDir, err)
 	}
 	if resolved, resolveErr := filepath.EvalSymlinks(sourceDir); resolveErr == nil {
 		sourceDir = resolved
@@ -1800,36 +1832,45 @@ func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string, gatewayM
 	}
 	stateDir := filepath.Join(stateRoot, policy.relativeState)
 	if err := os.RemoveAll(stateDir); err != nil {
-		return "", nil, fmt.Errorf("reset isolated runtime state %q: %w", stateDir, err)
+		return "", nil, nil, fmt.Errorf("reset isolated runtime state %q: %w", stateDir, err)
 	}
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		return "", nil, fmt.Errorf("create isolated runtime state %q: %w", stateDir, err)
+		return "", nil, nil, fmt.Errorf("create isolated runtime state %q: %w", stateDir, err)
 	}
 	if policy.credentialFile != "" {
+		credentialDestination, err := containedStagePath(stateDir, policy.credentialFile)
+		if err != nil {
+			return "", nil, nil, err
+		}
 		if err := stageReadOnlyRuntimeCredential(
 			filepath.Join(sourceDir, policy.credentialFile),
-			filepath.Join(stateDir, policy.credentialFile),
+			credentialDestination,
 			policy.credentialSection,
 			policy.credentialUsable,
 		); err != nil {
-			return "", nil, err
+			return "", nil, nil, err
 		}
 	}
+	var dropped []string
 	for _, name := range policy.requiredInputs {
-		if err := stageReadOnlyRuntimeInput(sourceDir, stateDir, name, true, policy.inputNarrowers[name]); err != nil {
-			return "", nil, err
+		withheld, err := stageReadOnlyRuntimeInput(sourceDir, stateDir, name, true, policy.inputNarrowers[name])
+		if err != nil {
+			return "", nil, nil, err
 		}
+		dropped = append(dropped, withheld...)
 	}
 	for _, name := range policy.optionalInputs {
-		if err := stageReadOnlyRuntimeInput(sourceDir, stateDir, name, false, policy.inputNarrowers[name]); err != nil {
-			return "", nil, err
+		withheld, err := stageReadOnlyRuntimeInput(sourceDir, stateDir, name, false, policy.inputNarrowers[name])
+		if err != nil {
+			return "", nil, nil, err
 		}
+		dropped = append(dropped, withheld...)
 	}
 	var stateEnv []string
 	if policy.stateEnv != "" {
 		stateEnv = append(stateEnv, policy.stateEnv+"="+stateDir)
 	}
-	return stateDir, stateEnv, nil
+	return stateDir, stateEnv, dropped, nil
 }
 
 // containedStagePath joins a staged input name under the seat's state dir and
@@ -1898,47 +1939,69 @@ func resolveStagedRuntimeInput(source string) (string, os.FileInfo, error) {
 // isolated state dir. A required input that the host does not have is an error
 // that NAMES the file: the runtime's own diagnostic for a missing config is
 // what cost a day here, so gitmoot must not depend on it.
-func stageReadOnlyRuntimeInput(sourceDir, stateDir, name string, required bool, narrow func([]byte) ([]byte, error)) error {
+func stageReadOnlyRuntimeInput(sourceDir, stateDir, name string, required bool, narrow func([]byte) (narrowedConfig, error)) ([]string, error) {
 	source := filepath.Join(sourceDir, name)
 	resolved, info, err := resolveStagedRuntimeInput(source)
 	if errors.Is(err, os.ErrNotExist) {
 		if required {
-			return fmt.Errorf("read-only seat requires runtime input %q, and %s does not exist: the runtime will start and then refuse for a reason of its own choosing", name, source)
+			return nil, fmt.Errorf("read-only seat requires runtime input %q, and %s does not exist: the runtime will start and then refuse for a reason of its own choosing", name, source)
 		}
-		return nil
+		return nil, nil
 	}
 	if errors.Is(err, errStagedInputNotRegular) {
-		return fmt.Errorf("runtime input %q must be a regular file", source)
+		return nil, fmt.Errorf("runtime input %q must be a regular file", source)
 	}
 	if err != nil {
-		return fmt.Errorf("inspect runtime input %q: %w", source, err)
+		return nil, fmt.Errorf("inspect runtime input %q: %w", source, err)
 	}
 	source = resolved
 	if info.Size() > maxReadOnlyRuntimeStateFileBytes {
-		return fmt.Errorf("runtime input %q must be no larger than %d bytes", source, maxReadOnlyRuntimeStateFileBytes)
+		return nil, fmt.Errorf("runtime input %q must be no larger than %d bytes", source, maxReadOnlyRuntimeStateFileBytes)
 	}
-	data, err := os.ReadFile(source)
+	data, err := readStagedRuntimeInput(source)
 	if err != nil {
-		return fmt.Errorf("read runtime input %q: %w", source, err)
+		return nil, err
 	}
+	var dropped []string
 	if narrow != nil {
 		narrowed, narrowErr := narrow(data)
 		if narrowErr != nil {
-			return fmt.Errorf("narrow runtime input %q: %w", source, narrowErr)
+			return nil, fmt.Errorf("narrow runtime input %q: %w", source, narrowErr)
 		}
-		data = narrowed
+		data, dropped = narrowed.data, narrowed.dropped
 	}
 	destination, err := containedStagePath(stateDir, name)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
-		return fmt.Errorf("create runtime input directory for %q: %w", destination, err)
+		return nil, fmt.Errorf("create runtime input directory for %q: %w", destination, err)
 	}
 	if err := os.WriteFile(destination, data, 0o600); err != nil {
-		return fmt.Errorf("stage runtime input %q: %w", destination, err)
+		return nil, fmt.Errorf("stage runtime input %q: %w", destination, err)
 	}
-	return nil
+	return dropped, nil
+}
+
+// readStagedRuntimeInput reads a staged input under a HARD byte cap.
+//
+// The size check above uses the FileInfo from resolveStagedRuntimeInput, so on
+// its own it is advisory: the file can grow between the stat and the read. An
+// io.LimitReader makes the cap real, and costs nothing.
+func readStagedRuntimeInput(source string) ([]byte, error) {
+	handle, err := os.Open(source)
+	if err != nil {
+		return nil, fmt.Errorf("read runtime input %q: %w", source, err)
+	}
+	defer handle.Close()
+	data, err := io.ReadAll(io.LimitReader(handle, maxReadOnlyRuntimeStateFileBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read runtime input %q: %w", source, err)
+	}
+	if int64(len(data)) > maxReadOnlyRuntimeStateFileBytes {
+		return nil, fmt.Errorf("runtime input %q must be no larger than %d bytes", source, maxReadOnlyRuntimeStateFileBytes)
+	}
+	return data, nil
 }
 
 func stageReadOnlyRuntimeCredential(source, destination, section string, usable func([]byte) error) error {
@@ -2002,31 +2065,76 @@ func stageReadOnlyRuntimeCredential(source, destination, section string, usable 
 // a late opaque failure into an early wrong one.
 func claudeOAuthUsable(data []byte) error {
 	var envelope struct {
-		OAuth struct {
-			AccessToken  string `json:"accessToken"`
-			RefreshToken string `json:"refreshToken"`
-			ExpiresAt    int64  `json:"expiresAt"`
-		} `json:"claudeAiOauth"`
+		OAuth json.RawMessage `json:"claudeAiOauth"`
 	}
 	if err := json.Unmarshal(data, &envelope); err != nil {
-		return fmt.Errorf("read claudeAiOauth section: %w", err)
+		// Not our file format: nothing to compare is not a verdict.
+		return nil
 	}
-	oauth := envelope.OAuth
+	var oauth struct {
+		AccessToken  string      `json:"accessToken"`
+		RefreshToken string      `json:"refreshToken"`
+		ExpiresAt    json.Number `json:"expiresAt"`
+	}
+	if err := json.Unmarshal(envelope.OAuth, &oauth); err != nil {
+		// A claudeAiOauth that is not the shape we read is the same "nothing
+		// to compare" case. Aborting here turned a third party's format drift
+		// into a hard seat outage reported as a raw Go unmarshal error.
+		return nil
+	}
 	if strings.TrimSpace(oauth.AccessToken) == "" {
 		return errors.New("claudeAiOauth has no accessToken, so the seat has nothing to authenticate with")
 	}
-	if oauth.ExpiresAt <= 0 {
-		return nil
-	}
-	// claude records expiresAt in milliseconds.
-	expiry := time.UnixMilli(oauth.ExpiresAt).UTC()
-	if time.Now().UTC().Before(expiry) {
-		return nil
-	}
 	if strings.TrimSpace(oauth.RefreshToken) != "" {
+		// Refreshing is the runtime's job, so an expiry cannot condemn it.
+		return nil
+	}
+	expiry, ok := claudeOAuthExpiry(oauth.ExpiresAt)
+	if !ok {
+		return nil
+	}
+	// A few minutes of grace: a seat refused for clock skew is a wrong
+	// verdict, and this path only fires when there is no refresh token at all.
+	if time.Now().UTC().Before(expiry.Add(claudeOAuthExpiryGrace)) {
 		return nil
 	}
 	return fmt.Errorf("claudeAiOauth expired at %s and carries no refreshToken, so the seat cannot obtain a working token: re-authenticate the host profile", expiry.Format(time.RFC3339))
+}
+
+// claudeOAuthExpiryGrace absorbs clock skew between the host that wrote the
+// credential and this one.
+const claudeOAuthExpiryGrace = 5 * time.Minute
+
+// claudeOAuthExpiry reads expiresAt without depending on how a third party
+// encodes it. A string, a float in exponent notation, and an integer all decode;
+// anything else is NO VERDICT rather than an error, because this function's
+// whole purpose is to avoid depending on another tool's diagnostics.
+//
+// The unit is milliseconds, and a value small enough to be seconds is rejected
+// as unreadable: read as milliseconds it lands in 1970, which produced a
+// confident and wrong "expired at 1971 - re-authenticate".
+func claudeOAuthExpiry(value json.Number) (time.Time, bool) {
+	text := strings.TrimSpace(value.String())
+	if text == "" {
+		return time.Time{}, false
+	}
+	milliseconds, err := value.Int64()
+	if err != nil {
+		float, floatErr := value.Float64()
+		if floatErr != nil {
+			return time.Time{}, false
+		}
+		milliseconds = int64(float)
+	}
+	if milliseconds <= 0 {
+		return time.Time{}, false
+	}
+	// 1e11 ms is 1973; any real millisecond expiry is far above it, and any
+	// plausible SECONDS value is far below.
+	if milliseconds < 100_000_000_000 {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(milliseconds).UTC(), true
 }
 
 func readOnlyRuntimeBaseEnv(runtimeName string, environ []string, githubDir string) []string {
@@ -2896,7 +3004,13 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		// property this path's caller was gated on. The wrap is a no-op for an
 		// ordinary temp worker (it returns the adapter unchanged unless
 		// ReadOnlySeat is set), so this cannot affect the common path.
-		adapter, err = wrapReadOnlySandboxAdapter(w.ConfigHome, started.Agent, checkout, adapter)
+		var forkDropped []string
+		adapter, forkDropped, err = wrapReadOnlySandboxAdapter(w.ConfigHome, started.Agent, checkout, adapter)
+		if err == nil && len(forkDropped) > 0 {
+			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "read_only_seat_config_narrowed", Message: "withheld from the seat's staged config: " + strings.Join(forkDropped, ", ")}); eventErr != nil {
+				return eventErr
+			}
+		}
 	}
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {

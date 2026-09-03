@@ -630,6 +630,42 @@ Dotted and quoted forms are classified the same way, so
 `mcp_servers.github.env.TOKEN = "..."` at the top level and
 `[mcp_servers."my server".env]` are both dropped.
 
+### The staged kimi config.toml is narrowed too
+
+kimi's `config.toml` is REQUIRED, and it carries more than codex's does:
+measured on a live host, `api_key` under `[services.*]` and a key under
+`[services.*.oauth]` alongside `[providers.*]`. For kimi the staged copy lands
+directly inside the seat's writable root, so it is narrowed on the same rule:
+
+- `[services.*]` is dropped ENTIRELY. It configures optional tooling (moonshot
+  search and fetch) and carries those tools' credentials.
+- `[providers.*]` keeps its structure and keeps `api_key` and its `env`
+  sub-table ONLY for the provider `default_model` resolves to - the model's
+  segment before the first `/` matched against the provider name's segment
+  after the last `:`, so `default_model = "kimi-code/k3"` selects
+  `[providers."managed:kimi-code"]`. Dropping every provider credential is not
+  an option: kimi refuses to start when both `api_key` and the `env` sub-table
+  are absent, so the seat legitimately needs exactly one.
+- If NO provider can be resolved, or two match ambiguously, every provider
+  credential is withheld. A credential nobody can prove is needed is not
+  staged.
+
+The same rule now applies to codex: `[model_providers.*]` keeps `api_key` and
+`http_headers` for the provider `model_provider` selects and strips every
+other. Stripping the selected provider's key too left the seat unable to
+authenticate at all, because `env_key` names a variable the sandbox's
+environment allowlist does not pass through.
+
+### Finding out what was withheld
+
+Narrowing is not silent. When anything is withheld the job records a
+`read_only_seat_config_narrowed` event naming it, so a reviewer whose MCP tool
+is missing - or a seat that cannot reach a provider - can find out why:
+
+```sh
+gitmoot job events <job-id> | grep read_only_seat_config_narrowed
+```
+
 ## Isolated worktrees duplicate gigabytes of tool cache
 
 An isolated-worktree job re-materializing its own `uv`/`go`/`npm`/`pip` cache
