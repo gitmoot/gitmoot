@@ -12,7 +12,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
 
-
 // redactEnvNames returns NAMES only, so a failure message never prints a token.
 func redactEnvNames(env []string) []string {
 	names := make([]string, 0, len(env))

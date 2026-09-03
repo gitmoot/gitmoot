@@ -706,6 +706,14 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		return nil
 	}
 	if produceStateDir != "" {
+		produceStateDir, err = newProduceRunStateDir(produceStateDir)
+		if err != nil {
+			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+				return finishErr
+			}
+			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
+			return nil
+		}
 		defer os.RemoveAll(produceStateDir)
 	}
 	adapter, err = wrapProduceSandboxAdapter(job.Type, agent, adapter, produceStateDir)
@@ -1865,6 +1873,11 @@ func pathsOverlap(left, right string) bool {
 	return contains(left, right) || contains(right, left)
 }
 
+type stagedProduceProfileFile struct {
+	source      string
+	destination string
+}
+
 func produceRuntimeSandboxGrants(runtimeName string, runtimeStateDir string, readable, readFiles, writable []string) ([]string, []string, []string, []string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -1873,12 +1886,17 @@ func produceRuntimeSandboxGrants(runtimeName string, runtimeStateDir string, rea
 	home = filepath.Clean(home)
 	var statePaths []string
 	var env []string
+	var staged []stagedProduceProfileFile
 	switch runtimeName {
 	case runtime.ClaudeRuntime:
-		// CLAUDE_CONFIG_DIR selects the account the daemon must authenticate as,
-		// but it may name a live operator profile outside the job's intended
-		// write scope. Expose that profile read-only and redirect all granted
-		// runtime writes into the caller's job-private state root.
+		// CLAUDE_CONFIG_DIR names the account the job must authenticate as, and
+		// it normally points at a live operator profile. The Claude CLI writes
+		// inside its own config dir during normal operation - settings, project
+		// state, statsig, and a refreshed OAuth token - so exposing that profile
+		// read-only denies writes the runtime needs, while exposing it writable
+		// lets a job mutate operator credentials. Stage the account into a
+		// job-private profile, point the runtime at that copy, and never expose
+		// the operator profile to the sandbox at all.
 		configDir, err := resolveRuntimeConfigDir(runtime.ClaudeRuntime, os.Getenv("CLAUDE_CONFIG_DIR"))
 		if err != nil {
 			return nil, nil, nil, nil, err
@@ -1890,11 +1908,19 @@ func produceRuntimeSandboxGrants(runtimeName string, runtimeStateDir string, rea
 			return nil, nil, nil, nil, fmt.Errorf("reset Claude produce runtime state %q: %w", runtimeStateDir, err)
 		}
 		writeStateDir := filepath.Join(runtimeStateDir, ".claude")
-		cacheDir := filepath.Join(runtimeStateDir, "claude-cli-nodejs")
-		statePaths = []string{writeStateDir, cacheDir}
-		env = []string{"CLAUDE_CONFIG_DIR=" + configDir}
-		if configDir != writeStateDir {
-			readable = append(readable, configDir)
+		// The CLI resolves its node cache under XDG_CACHE_HOME, so redirect the
+		// cache instead of granting write to the ambient one.
+		cacheHome := filepath.Join(runtimeStateDir, "xdg-cache")
+		statePaths = []string{writeStateDir, cacheHome}
+		env = []string{
+			"CLAUDE_CONFIG_DIR=" + writeStateDir,
+			"XDG_CACHE_HOME=" + cacheHome,
+		}
+		for _, name := range []string{".credentials.json", "settings.json"} {
+			staged = append(staged, stagedProduceProfileFile{
+				source:      filepath.Join(configDir, name),
+				destination: filepath.Join(writeStateDir, name),
+			})
 		}
 	case runtime.KimiRuntime:
 		statePaths = []string{filepath.Join(home, ".kimi-code")}
@@ -1904,6 +1930,14 @@ func produceRuntimeSandboxGrants(runtimeName string, runtimeStateDir string, rea
 	for _, path := range statePaths {
 		if err := os.MkdirAll(path, 0o700); err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("create %s runtime state directory %q: %w", runtimeName, path, err)
+		}
+	}
+	// Staging runs in the daemon, outside the sandbox, so the operator profile
+	// needs no grant. A missing profile stages nothing and is not an error: a
+	// fresh host with no profile is a valid configuration.
+	for _, file := range staged {
+		if err := stageReadOnlyRuntimeCredential(file.source, file.destination, ""); err != nil {
+			return nil, nil, nil, nil, err
 		}
 	}
 	reads := compactCleanPaths(readable)
@@ -1922,6 +1956,22 @@ func jobProduceRuntimeStateDir(home, jobID, runtimeName string) (string, error) 
 	}
 	sum := sha256.Sum256([]byte(strings.TrimSpace(jobID)))
 	return filepath.Join(paths.Home, "cache", "produce-runtime", fmt.Sprintf("%x", sum[:8])), nil
+}
+
+// newProduceRunStateDir carves a directory unique to one dispatch out of a
+// job's produce state root. The root is keyed on the job id alone, so a lease
+// takeover or a deferral re-dispatch can run the same id twice at once; each
+// run resets its own directory at grant time and removes it when the job
+// finishes, and neither may touch a live sibling's state.
+func newProduceRunStateDir(root string) (string, error) {
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return "", fmt.Errorf("create produce runtime state root %q: %w", root, err)
+	}
+	dir, err := os.MkdirTemp(root, "run-")
+	if err != nil {
+		return "", fmt.Errorf("create produce runtime state directory under %q: %w", root, err)
+	}
+	return dir, nil
 }
 
 func compactCleanPaths(paths []string) []string {
@@ -2646,6 +2696,10 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		return err
 	}
 	if produceStateDir != "" {
+		produceStateDir, err = newProduceRunStateDir(produceStateDir)
+		if err != nil {
+			return err
+		}
 		defer os.RemoveAll(produceStateDir)
 	}
 	adapter, err = wrapProduceSandboxAdapter(delegatedJob.Type, started.Agent, adapter, produceStateDir)

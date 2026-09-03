@@ -248,31 +248,49 @@ func TestReadOnlySeatRuntimeAuthEnvDoesNotInventCredentialStoreOverlay(t *testin
 	}
 }
 
-// Produce jobs authenticate as the account selected by CLAUDE_CONFIG_DIR, but
-// their Landlock grant must never make that live operator profile writable.
-// Mutable runtime state stays under a job-private root.
-func TestProduceRuntimeSandboxGrantsReadButDoNotWriteConfiguredClaudeDir(t *testing.T) {
+// Produce jobs authenticate as the account selected by CLAUDE_CONFIG_DIR, and
+// the Claude CLI writes inside its own config dir during normal operation, so
+// a read-only grant on the operator profile denies writes the runtime needs
+// (#1810 review round 4, P1). The contract is therefore: stage the configured
+// account into a job-private profile, point the runtime at that writable copy,
+// and keep the operator profile out of the sandbox entirely.
+func TestProduceRuntimeSandboxGrantsStageConfiguredAccountIntoWritableJobPrivateProfile(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	configured := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", configured)
+	if err := os.WriteFile(filepath.Join(configured, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"operator-account"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	stateRoot := t.TempDir()
 	reads, _, writes, env, err := produceRuntimeSandboxGrants(runtime.ClaudeRuntime, stateRoot, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("produceRuntimeSandboxGrants: %v", err)
 	}
 	writeState := filepath.Join(stateRoot, ".claude")
-	if !containsEnv(env, "CLAUDE_CONFIG_DIR="+configured) {
-		t.Fatalf("produce env = %v, want configured account %q", env, configured)
+	cacheHome := filepath.Join(stateRoot, "xdg-cache")
+	if !containsEnv(env, "CLAUDE_CONFIG_DIR="+writeState) {
+		t.Fatalf("produce env = %v, want the runtime pointed at writable %q", env, writeState)
 	}
-	if !containsPath(reads, configured) {
-		t.Fatalf("produce reads = %v, want configured account %q readable", reads, configured)
+	if !containsEnv(env, "XDG_CACHE_HOME="+cacheHome) {
+		t.Fatalf("produce env = %v, want the node cache redirected to %q", env, cacheHome)
 	}
-	if !containsPath(writes, writeState) {
-		t.Fatalf("produce writes = %v, want mutable state under %q", writes, writeState)
+	if !containsPath(writes, writeState) || !containsPath(writes, cacheHome) {
+		t.Fatalf("produce writes = %v, want both %q and %q writable", writes, writeState, cacheHome)
 	}
 	if containsPath(writes, configured) {
 		t.Fatalf("produce writes = %v, must not grant live configured dir %q", writes, configured)
+	}
+	if containsPath(reads, configured) {
+		t.Fatalf("produce reads = %v, must not expose live configured dir %q to the sandbox", reads, configured)
+	}
+	// The account must be the CONFIGURED one: staging content, not just a path.
+	staged, err := os.ReadFile(filepath.Join(writeState, ".credentials.json"))
+	if err != nil {
+		t.Fatalf("read staged credential: %v", err)
+	}
+	if !strings.Contains(string(staged), "operator-account") {
+		t.Fatalf("staged credential = %s, want the configured account", staged)
 	}
 
 	for _, invalid := range []string{"relative-claude", "~someone/claude"} {
@@ -280,6 +298,114 @@ func TestProduceRuntimeSandboxGrantsReadButDoNotWriteConfiguredClaudeDir(t *test
 		if _, _, _, _, err := produceRuntimeSandboxGrants(runtime.ClaudeRuntime, stateRoot, nil, nil, nil); err == nil {
 			t.Fatalf("CLAUDE_CONFIG_DIR=%q must be refused by the produce path", invalid)
 		}
+	}
+}
+
+// A profile that does not exist yet is a VALID configuration - a fresh host, or
+// a configured dir the operator has not created. Round 4 of the #1810 review
+// reproduced a hard failure here ("sandbox read path ...: no such file or
+// directory") for both the configured and the default case.
+func TestProduceRuntimeSandboxGrantsAcceptMissingProfile(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		configure func(t *testing.T, home string)
+	}{
+		{name: "configured-missing", configure: func(t *testing.T, home string) {
+			t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, "never-created-claude"))
+		}},
+		{name: "unset-host-default-missing", configure: func(t *testing.T, _ string) {
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			tc.configure(t, home)
+			stateRoot := t.TempDir()
+			reads, _, writes, env, err := produceRuntimeSandboxGrants(runtime.ClaudeRuntime, stateRoot, nil, nil, nil)
+			if err != nil {
+				t.Fatalf("a missing profile must not fail the job: %v", err)
+			}
+			writeState := filepath.Join(stateRoot, ".claude")
+			if !containsEnv(env, "CLAUDE_CONFIG_DIR="+writeState) || !containsPath(writes, writeState) {
+				t.Fatalf("grants = reads %v writes %v env %v, want a writable job-private profile", reads, writes, env)
+			}
+			if _, err := os.Stat(writeState); err != nil {
+				t.Fatalf("job-private profile was not created: %v", err)
+			}
+		})
+	}
+}
+
+// M7: the guard that refuses an unplumbed caller. A produce job with no
+// job-private root would otherwise fall back to granting shared state.
+func TestProduceRuntimeSandboxGrantsRefuseMissingStateRoot(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	for _, root := range []string{"", "   "} {
+		_, _, _, _, err := produceRuntimeSandboxGrants(runtime.ClaudeRuntime, root, nil, nil, nil)
+		if err == nil {
+			t.Fatalf("state root %q must be refused", root)
+		}
+		if !strings.Contains(err.Error(), "job-private runtime state root") {
+			t.Fatalf("error = %v, want it to name the missing job-private root", err)
+		}
+	}
+}
+
+// M8: each dispatch resets its own state root, so a previous run's runtime
+// state - including a stale credential copy - cannot survive into the next.
+func TestProduceRuntimeSandboxGrantsResetStaleRuntimeState(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	stateRoot := t.TempDir()
+	stale := filepath.Join(stateRoot, ".claude", "stale-session.json")
+	if err := os.MkdirAll(filepath.Dir(stale), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stale, []byte(`{"from":"previous run"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, _, err := produceRuntimeSandboxGrants(runtime.ClaudeRuntime, stateRoot, nil, nil, nil); err != nil {
+		t.Fatalf("produceRuntimeSandboxGrants: %v", err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale runtime state survived the reset: %v", err)
+	}
+}
+
+// P3 round 4: two concurrent dispatches of the SAME job id - a lease takeover,
+// or a deferral re-dispatch - must not share a state root, because each resets
+// its root at grant time and removes it when it finishes.
+func TestNewProduceRunStateDirIsUniquePerDispatch(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "job-root")
+	first, err := newProduceRunStateDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := newProduceRunStateDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatalf("concurrent dispatches share runtime state %q", first)
+	}
+	for _, dir := range []string{first, second} {
+		if filepath.Dir(dir) != filepath.Clean(root) {
+			t.Fatalf("run dir %q is outside the job root %q", dir, root)
+		}
+		if _, err := os.Stat(dir); err != nil {
+			t.Fatalf("run dir %q was not created: %v", dir, err)
+		}
+	}
+	// Removing one dispatch's state must leave a live sibling untouched.
+	if err := os.RemoveAll(first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(second); err != nil {
+		t.Fatalf("sibling dispatch state was destroyed: %v", err)
 	}
 }
 

@@ -266,14 +266,25 @@ func TestWorkerClaudeKimiProduceDispatchWrappedArgv(t *testing.T) {
 			}
 			wantPrefix := []string{"sandbox-exec", "--read", "/data/input"}
 			if tc.runtime == runtime.ClaudeRuntime {
-				if claudeConfigDir != filepath.Join(runtimeStateDir, ".claude") {
-					wantPrefix = append(wantPrefix, "--read", claudeConfigDir)
+				// The operator profile is staged into the job-private copy by
+				// the daemon, outside the sandbox, so it is never granted.
+				if containsPath([]string{claudeConfigDir}, filepath.Join(runtimeStateDir, ".claude")) {
+					t.Fatalf("test setup resolved the configured dir onto the job-private copy: %q", claudeConfigDir)
 				}
 				wantPrefix = append(wantPrefix, "--read-file", home+"/.claude.json")
 				wantPrefix = append(wantPrefix, "--write", "/data/out")
-				wantPrefix = append(wantPrefix, "--write", filepath.Join(runtimeStateDir, ".claude"), "--write", filepath.Join(runtimeStateDir, "claude-cli-nodejs"))
-				if !reflect.DeepEqual(capture.env, []string{"CLAUDE_CONFIG_DIR=" + claudeConfigDir}) {
-					t.Fatalf("Claude sandbox env = %v", capture.env)
+				wantPrefix = append(wantPrefix, "--write", filepath.Join(runtimeStateDir, ".claude"), "--write", filepath.Join(runtimeStateDir, "xdg-cache"))
+				wantEnv := []string{
+					"CLAUDE_CONFIG_DIR=" + filepath.Join(runtimeStateDir, ".claude"),
+					"XDG_CACHE_HOME=" + filepath.Join(runtimeStateDir, "xdg-cache"),
+				}
+				if !reflect.DeepEqual(capture.env, wantEnv) {
+					t.Fatalf("Claude sandbox env = %v, want %v", capture.env, wantEnv)
+				}
+				for _, arg := range capture.args {
+					if arg == claudeConfigDir {
+						t.Fatalf("operator profile %q reached the sandbox argv: %v", claudeConfigDir, capture.args)
+					}
 				}
 			} else {
 				wantPrefix = append(wantPrefix, "--write", "/data/out")
@@ -330,13 +341,20 @@ func TestProduceRunnerComposesUnderTeeAndScopesByAction(t *testing.T) {
 	if _, ok := shim.Inner.(subprocess.GroupRunner); !ok {
 		t.Fatalf("shim inner = %T, want GroupRunner", shim.Inner)
 	}
+	// Produce grants expose no config dir at all: the runtime is pointed at the
+	// job-private copy, and the operator profile is read by the daemon during
+	// staging, outside the sandbox.
 	wantReads := []string{"/input"}
-	if configDir != filepath.Join(runtimeStateDir, ".claude") {
-		wantReads = append(wantReads, configDir)
+	wantPaths := []string{"/data", filepath.Join(runtimeStateDir, ".claude"), filepath.Join(runtimeStateDir, "xdg-cache")}
+	wantEnv := []string{
+		"CLAUDE_CONFIG_DIR=" + filepath.Join(runtimeStateDir, ".claude"),
+		"XDG_CACHE_HOME=" + filepath.Join(runtimeStateDir, "xdg-cache"),
 	}
-	wantPaths := []string{"/data", filepath.Join(runtimeStateDir, ".claude"), filepath.Join(runtimeStateDir, "claude-cli-nodejs")}
-	if !reflect.DeepEqual(shim.ReadablePaths, wantReads) || !reflect.DeepEqual(shim.ReadableFiles, []string{stateFile}) || !reflect.DeepEqual(shim.WritablePaths, wantPaths) || !reflect.DeepEqual(shim.Env, []string{"CLAUDE_CONFIG_DIR=" + configDir}) {
-		t.Fatalf("Claude shim = reads %v writes %v env %v, want reads %v, writes %v + config env", shim.ReadablePaths, shim.WritablePaths, shim.Env, wantReads, wantPaths)
+	if !reflect.DeepEqual(shim.ReadablePaths, wantReads) || !reflect.DeepEqual(shim.ReadableFiles, []string{stateFile}) || !reflect.DeepEqual(shim.WritablePaths, wantPaths) || !reflect.DeepEqual(shim.Env, wantEnv) {
+		t.Fatalf("Claude shim = reads %v writes %v env %v, want reads %v, writes %v, env %v", shim.ReadablePaths, shim.WritablePaths, shim.Env, wantReads, wantPaths, wantEnv)
+	}
+	if containsPath(shim.ReadablePaths, configDir) || containsPath(shim.WritablePaths, configDir) {
+		t.Fatalf("operator profile %q reached the sandbox grants: reads %v writes %v", configDir, shim.ReadablePaths, shim.WritablePaths)
 	}
 
 	nonProduce, err := wrapProduceSandboxAdapter("ask", agent, base, runtimeStateDir)
@@ -997,4 +1015,147 @@ func containsEnvPrefix(env []string, prefix string) bool {
 		}
 	}
 	return false
+}
+
+// findProduceSandboxShim walks the composed runner chain the same way
+// runnerReachesExecutionInstance does, so the assertions below bind to the
+// shim the runtime actually executes rather than to a helper's return value.
+func findProduceSandboxShim(t *testing.T, runner subprocess.Runner) subprocess.WrappingRunner {
+	t.Helper()
+	switch typed := runner.(type) {
+	case subprocess.WrappingRunner:
+		return typed
+	case *subprocess.WrappingRunner:
+		if typed != nil {
+			return *typed
+		}
+	case subprocess.TeeRunner:
+		return findProduceSandboxShim(t, typed.Inner)
+	case *subprocess.EnvInjectingRunner:
+		if typed != nil {
+			return findProduceSandboxShim(t, typed.Inner)
+		}
+	}
+	t.Fatalf("no sandbox shim in runner chain: %T", runner)
+	return subprocess.WrappingRunner{}
+}
+
+// The local composition path keys produce state on checkout and runtime ref.
+// Collapsing that key makes every local produce run share one state root, so
+// two runs would reset and delete each other's runtime state.
+func TestBuildLocalRuntimeAdapterKeysProduceStatePerCheckoutAndRuntimeRef(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	agent := runtime.Agent{Runtime: runtime.ClaudeRuntime, RuntimeRef: "session-a", WritablePaths: []string{"/data"}}
+	stateOf := func(checkout string, agent runtime.Agent) string {
+		t.Helper()
+		adapter, err := buildLocalRuntimeAdapter(home, agent, checkout, subprocess.GroupRunner{})
+		if err != nil {
+			t.Fatalf("buildLocalRuntimeAdapter: %v", err)
+		}
+		claude, ok := adapter.(runtime.ClaudeAdapter)
+		if !ok {
+			t.Fatalf("adapter = %T, want ClaudeAdapter", adapter)
+		}
+		shim := findProduceSandboxShim(t, claude.Runner)
+		state := envValue(shim.Env, "CLAUDE_CONFIG_DIR")
+		if state == "" {
+			t.Fatalf("shim env = %v, want a job-private config dir", shim.Env)
+		}
+		return state
+	}
+	firstCheckout := stateOf("/checkout-one", agent)
+	secondCheckout := stateOf("/checkout-two", agent)
+	if firstCheckout == secondCheckout {
+		t.Fatalf("two checkouts share produce state %q", firstCheckout)
+	}
+	otherRef := agent
+	otherRef.RuntimeRef = "session-b"
+	if second := stateOf("/checkout-one", otherRef); second == firstCheckout {
+		t.Fatalf("two runtime refs share produce state %q", firstCheckout)
+	}
+	if repeated := stateOf("/checkout-one", agent); repeated != firstCheckout {
+		t.Fatalf("same checkout and ref resolved to %q then %q", firstCheckout, repeated)
+	}
+}
+
+// Entry through jobWorker.run, not through the grant helper: the state root the
+// runtime is pointed at must be the one the worker removes when the job ends.
+// A mutant that drops the worker's cleanup, or that grants a different root
+// than it cleans, leaves runtime state - including a staged credential copy -
+// behind on disk.
+func TestWorkerProduceRunRemovesTheStateRootItGranted(t *testing.T) {
+	ctx := context.Background()
+	store, home := blockerE2EHome(t)
+	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	operatorProfile := t.TempDir()
+	const operatorCredential = `{"claudeAiOauth":{"accessToken":"operator-account"}}`
+	if err := os.WriteFile(filepath.Join(operatorProfile, ".credentials.json"), []byte(operatorCredential), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", operatorProfile)
+	seedDaemonWorkerAgentWithPolicy(t, store, "producer", runtime.ClaudeRuntime,
+		"550e8400-e29b-41d4-a716-446655440007", []string{"produce"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
+	// Produce jobs are created by pipeline stages, not the mailbox, which
+	// refuses the action outright.
+	outputDir := filepath.Join(t.TempDir(), "out")
+	if err := os.MkdirAll(outputDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	produceJob := db.Job{
+		ID: "produce-state-cleanup", Agent: "producer", Type: "produce", Repo: "owner/repo",
+		State: string(workflow.JobQueued),
+		Payload: mustJobPayload(t, workflow.JobPayload{
+			Repo: "owner/repo", WorktreePath: checkout, PipelineName: "p",
+			Sender:        workflow.PipelineJobSender,
+			WritablePaths: []string{outputDir},
+		}),
+	}
+	if err := store.CreateJob(ctx, produceJob); err != nil {
+		t.Fatal(err)
+	}
+	capture := &sandboxAdapterCaptureRunner{stdout: `{"result":"ok"}`}
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.SandboxProbe = func() sandbox.ProbeResult { return sandbox.ProbeResult{Supported: true, ABI: 5} }
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	// BOTH adapter seams must be stubbed. Produce delivery streams output, so it
+	// resolves OutputAdapterFactory; leaving that at its production default runs
+	// a REAL runtime binary from the test.
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return runtime.ClaudeAdapter{Runner: capture, Dir: checkout}, nil
+	}
+	worker.OutputAdapterFactory = func(_ runtime.Agent, _ string, _ io.Writer) (workflow.DeliveryAdapter, error) {
+		return runtime.ClaudeAdapter{Runner: capture, Dir: checkout}, nil
+	}
+	job, err := store.GetJob(ctx, "produce-state-cleanup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.run(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	grantedConfigDir := envValue(capture.env, "CLAUDE_CONFIG_DIR")
+	if grantedConfigDir == "" {
+		stored, _ := store.GetJob(ctx, produceJob.ID)
+		events, _ := store.ListJobEvents(ctx, produceJob.ID)
+		t.Fatalf("produce job never reached the sandbox: env=%v args=%v state=%q payload=%s events=%+v",
+			capture.env, capture.args, stored.State, stored.Payload, events)
+	}
+	if grantedConfigDir == operatorProfile {
+		t.Fatalf("produce job ran against the operator profile %q", operatorProfile)
+	}
+	stateRoot := filepath.Dir(grantedConfigDir)
+	if !containsPath(capture.args, stateRoot) && !containsPath(capture.args, grantedConfigDir) {
+		t.Fatalf("granted state %q never reached the sandbox argv: %v", grantedConfigDir, capture.args)
+	}
+	if _, err := os.Stat(stateRoot); !os.IsNotExist(err) {
+		t.Fatalf("produce runtime state %q survived the job boundary: %v", stateRoot, err)
+	}
+	if data, err := os.ReadFile(filepath.Join(operatorProfile, ".credentials.json")); err != nil || string(data) != operatorCredential {
+		t.Fatalf("operator credential changed to %q, err=%v", data, err)
+	}
 }

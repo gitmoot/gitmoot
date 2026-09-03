@@ -323,6 +323,21 @@ beside the ambient one, and doctor FAILS (non-zero exit) when it is expired with
 no refresh token, since every read-only seat job on that runtime will fail until
 the account is re-logged in.
 
+A Claude `produce` stage does NOT run against the operator profile. The daemon
+stages the configured account (`CLAUDE_CONFIG_DIR`, else `~/.claude`) into a
+job-private profile, points the runtime's `CLAUDE_CONFIG_DIR` and
+`XDG_CACHE_HOME` at that job-private state root under
+`<gitmoot home>/cache/produce-runtime/<hash>/`, and removes the root when the job
+finishes. The operator profile is never granted writable and is never exposed to
+the sandbox, so a token the runtime refreshes mid-job lands in the discarded
+copy: re-login on the host, not in the job. A configured profile that does not
+exist yet is valid and starts the job with an empty one.
+
+`sandbox-exec: sandbox read path "…": no such file or directory` means a path
+granted to the sandbox does not exist on disk. Explicit read grants are required,
+not skipped — check `readable_paths` in `gitmoot job show <job-id> --json` and
+create (or stop granting) the named path.
+
 A job stuck in `running` is recovered automatically once it shows no lease
 progress past the staleness window (default 30m; tune with the
 `GITMOOT_STALE_RUNNING_AFTER` environment variable; the smallest honored value
