@@ -514,6 +514,52 @@ func (w jobWorker) reviewPullRequestOpen(ctx context.Context, repo string, numbe
 	return state != "closed" && state != "merged", nil
 }
 
+// Job-event kinds recorded by resyncReviewHead. Each names the relationship the
+// code actually MEASURED between the dispatched head and the checkout head, so a
+// coordinator reading a job's record can tell a fast-forward re-target from a
+// same-commit expansion from a refusal (#1561) — the previous single kind claimed
+// "branch advanced" for all three, a direction the code never measured.
+const (
+	reviewHeadResyncedEvent      = "review_head_resynced"
+	reviewHeadNormalizedEvent    = "review_head_normalized"
+	reviewHeadResyncRefusedEvent = "review_head_resync_refused"
+)
+
+// normalizeCommitSHA renders a recorded SHA in the form git reports one, so a
+// payload head and a `rev-parse HEAD` result are compared as commits rather than
+// as raw strings.
+func normalizeCommitSHA(sha string) string {
+	return strings.ToLower(strings.TrimSpace(sha))
+}
+
+// commitSHAAbbreviation reports whether short could be a hex abbreviation of long
+// (both already normalized). It is only a cheap pre-filter that avoids a pointless
+// subprocess: git's rev-parse is the authority on what an abbreviation actually
+// resolves to, and the caller requires that resolution to equal the SAME 40-char
+// head the checkout reports. Seven is git's conventional abbreviation length and
+// the floor accepted here; recorded review heads are 12 or 40 hex characters.
+func commitSHAAbbreviation(short, long string) bool {
+	if len(short) < 7 || len(short) >= len(long) {
+		return false
+	}
+	if !isHexSHA(short) || !isHexSHA(long) {
+		return false
+	}
+	return strings.HasPrefix(long, short)
+}
+
+func isHexSHA(sha string) bool {
+	if sha == "" {
+		return false
+	}
+	for _, c := range sha {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // resyncReviewHead handles #684 head-SHA drift for a PR review job. A review is
 // pinned to the PR head SHA at enqueue; in an active dev loop the branch often
 // advances (a newer commit is pushed) before the queued review runs, so the
@@ -527,13 +573,29 @@ func (w jobWorker) reviewPullRequestOpen(ctx context.Context, repo string, numbe
 //   - the validation failure was specifically the review head-SHA mismatch (a
 //     dirty tree, a missing head, or a branch mismatch is left untouched), and
 //   - the PR is still OPEN (a closed/merged PR keeps the existing terminal path so
-//     a stale review of a dead PR does not silently pass).
+//     a stale review of a dead PR does not silently pass), and
+//   - the checkout head is a strict FAST-FORWARD of the dispatched head, i.e. the
+//     dispatched commit is an ancestor of it (#1561).
+//
+// That last gate is what makes the re-target directional. Measured on this host,
+// a queued review could be re-pointed at a commit that was NOT the branch tip in
+// either direction: backwards onto a superseded commit, and — after a force-push —
+// onto a commit reachable from zero remote branches, so a verdict described an
+// orphan (#1561 comments 5326259747 and 5330559022). A non-descendant checkout
+// head is now refused rather than reviewed, and the refusal is recorded on the job.
+//
+// A same-commit expansion is not a re-target at all: a 12-char dispatched head and
+// the checkout's 40-char head are one commit, and counting those as re-syncs is the
+// measurement error that produced #1561's retracted headline. Those persist the
+// normalized head (so the string head-check at validateReviewCheckout passes and
+// the review still runs, exactly as before) but record the distinct normalization
+// event instead of a re-sync.
 //
 // On a re-sync it persists the current head onto the job payload (RunJob re-reads
 // the payload from the store, so the delivered review prompt and the posted PR
-// comment carry the new head) and records a review_head_resynced event, then
-// returns true so defaultCheckoutForRunner proceeds with the review. Every declined case
-// returns false so the caller's existing error path runs byte-identically.
+// comment carry the new head) and records the measured event, then returns true so
+// defaultCheckoutForRunner proceeds with the review. Every declined case returns
+// false so the caller's existing error path runs byte-identically.
 func (w jobWorker) resyncReviewHeadForRunner(ctx context.Context, job db.Job, payload workflow.JobPayload, checkout string, runner subprocess.Runner, cause error) (bool, error) {
 	if !isReviewHeadMismatch(cause) {
 		return false, nil
@@ -552,6 +614,7 @@ func (w jobWorker) resyncReviewHeadForRunner(ctx context.Context, job db.Job, pa
 		// #532 deferral / terminal path — only a definitively-open PR is re-synced.
 		return false, nil
 	}
+	git := jobGitClient(checkout, runner)
 	// Confirm the resolved checkout is actually on the PR's head branch before
 	// re-targeting. A review that falls back to the registered shared checkout (which
 	// sits on `main`, not the PR branch) must NOT be re-synced to main's head — that
@@ -559,40 +622,100 @@ func (w jobWorker) resyncReviewHeadForRunner(ctx context.Context, job db.Job, pa
 	// the PR head. We only decline when we can POSITIVELY confirm the branch differs:
 	// a detached-HEAD worktree (CurrentBranch errors) is a legitimate #684 target and
 	// is left to proceed. We deliberately do NOT gate on head == pr.HeadSHA because the
-	// PR-watcher can lag the push, which is exactly the drift #684 exists to tolerate.
-	if b, err := jobGitClient(checkout, runner).CurrentBranch(ctx); err == nil &&
+	// PR-watcher can lag the push, which is exactly the drift #684 exists to tolerate;
+	// the ancestry gate below compares the checkout head against the head this job was
+	// DISPATCHED with, never against the watcher's possibly-lagging PR record.
+	if b, err := git.CurrentBranch(ctx); err == nil &&
 		strings.TrimSpace(b) != strings.TrimSpace(payload.Branch) {
 		return false, nil
 	}
-	head, err := jobGitClient(checkout, runner).HeadSHA(ctx)
+	head, err := git.HeadSHA(ctx)
 	if err != nil {
 		return false, err
 	}
-	head = strings.TrimSpace(head)
-	previous := strings.TrimSpace(payload.HeadSHA)
-	if head == "" || head == previous {
-		// Nothing to re-target to (empty or already-current head); let the caller's
+	head = normalizeCommitSHA(head)
+	dispatched := normalizeCommitSHA(payload.HeadSHA)
+	if head == "" || dispatched == "" {
+		// Nothing to re-target to, or nothing to re-target FROM; let the caller's
 		// existing path handle it.
 		return false, nil
 	}
-	payload.HeadSHA = head
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return false, err
+	if strings.TrimSpace(payload.HeadSHA) == head {
+		// Already recorded exactly; there is nothing to write.
+		return false, nil
 	}
-	if err := w.Store.UpdateJobPayload(ctx, job.ID, string(encoded)); err != nil {
+	if commitSHAAbbreviation(dispatched, head) {
+		resolved, resolveErr := git.RevParse(ctx, dispatched)
+		if resolveErr == nil && normalizeCommitSHA(resolved) == head {
+			if err := w.persistReviewHead(ctx, job, payload, head); err != nil {
+				return false, err
+			}
+			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{
+				JobID: job.ID,
+				Kind:  reviewHeadNormalizedEvent,
+				Message: fmt.Sprintf("PR #%d dispatched head %s and checkout head %s are the SAME commit; recording the full SHA, not re-targeting the review",
+					payload.PullRequest, dispatched, head),
+			}); eventErr != nil {
+				return false, eventErr
+			}
+			writeLine(w.Stdout, "job %s review head %s recorded in full as %s (PR #%d same commit)", job.ID, dispatched, head, payload.PullRequest)
+			return true, nil
+		}
+		// The abbreviation does not resolve here, or resolves to a different commit;
+		// it is not provably the same commit, so it goes through the ancestry gate.
+	}
+	fastForward, err := git.IsAncestor(ctx, dispatched, head)
+	if err != nil {
+		// merge-base could not decide: "the dispatched object is not in this
+		// repository" (an orphaned force-push target or an unfetched commit) is a
+		// DIFFERENT fact from "not an ancestor" and must not be laundered into a
+		// silent refusal. Surface it, matching implementationFinalizationTargetForRunner
+		// (daemon_workflow.go:405-408), which wraps the same comparison's error.
+		return false, fmt.Errorf("compare review checkout head %s with dispatched head %s: %w", head, dispatched, err)
+	}
+	if !fastForward {
+		// Record the refusal on the JOB, not just the daemon journal (#1561 ask 2):
+		// this is precisely the case a coordinator cannot otherwise see. Best-effort
+		// on purpose — the caller must keep propagating the original head-mismatch
+		// error, so an event-write failure must not replace it with a DB error.
+		_ = w.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID: job.ID,
+			Kind:  reviewHeadResyncRefusedEvent,
+			Message: fmt.Sprintf("PR #%d checkout head %s does not have dispatched head %s as an ancestor (superseded, divergent, or unreachable commit); refusing to re-target the review",
+				payload.PullRequest, head, dispatched),
+		})
+		writeLine(w.Stdout, "job %s review head re-sync refused: %s is not a descendant of dispatched head %s (PR #%d)", job.ID, head, dispatched, payload.PullRequest)
+		return false, nil
+	}
+	if err := w.persistReviewHead(ctx, job, payload, head); err != nil {
 		return false, err
 	}
 	if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{
 		JobID: job.ID,
-		Kind:  "review_head_resynced",
-		Message: fmt.Sprintf("PR #%d branch advanced from %s to %s before the review ran; re-targeting the review to the current head",
-			payload.PullRequest, previous, head),
+		Kind:  reviewHeadResyncedEvent,
+		Message: fmt.Sprintf("PR #%d checkout head %s has dispatched head %s as an ancestor (fast-forward); re-targeting the review to the checkout head",
+			payload.PullRequest, head, dispatched),
 	}); eventErr != nil {
 		return false, eventErr
 	}
-	writeLine(w.Stdout, "job %s review head re-synced %s -> %s (PR #%d advanced)", job.ID, previous, head, payload.PullRequest)
+	writeLine(w.Stdout, "job %s review head re-synced %s -> %s (PR #%d fast-forward)", job.ID, dispatched, head, payload.PullRequest)
 	return true, nil
+}
+
+// persistReviewHead writes the head the review will actually be delivered against
+// onto the job payload; RunJob re-reads the payload from the store, so the review
+// prompt and the posted PR comment carry it. The dispatched head survives only in
+// the event message above: that audit trail exists, but a machine-readable
+// dispatched-vs-read contract does not, because both SHAs are interpolated into
+// prose. Giving it a structured form needs a JobPayload field plus the consumer
+// that reads it, outside this seam; #1561 ask 3 stays open for that.
+func (w jobWorker) persistReviewHead(ctx context.Context, job db.Job, payload workflow.JobPayload, head string) error {
+	payload.HeadSHA = head
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return w.Store.UpdateJobPayload(ctx, job.ID, string(encoded))
 }
 
 func implementationLockOwner(agent runtime.Agent, payload workflow.JobPayload) string {

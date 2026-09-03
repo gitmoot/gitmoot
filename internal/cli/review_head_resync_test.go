@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -294,6 +295,256 @@ func TestDefaultCheckoutDeclinesResyncWhenCheckoutOnWrongBranch(t *testing.T) {
 	}
 	if hasResyncEvent(events, "review_head_resynced") {
 		t.Fatalf("events = %+v, want NO review_head_resynced event for a wrong-branch checkout", events)
+	}
+}
+
+// commitDaemonWorkerFile writes and commits one file in a test checkout, so a
+// direction case can build a specific commit graph.
+func commitDaemonWorkerFile(t *testing.T, dir, name, body, message string) string {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+		t.Fatalf("WriteFile %s returned error: %v", name, err)
+	}
+	runDaemonWorkerGit(t, dir, "add", name)
+	runDaemonWorkerGit(t, dir, "commit", "-m", message)
+	return daemonWorkerHeadSHA(t, dir)
+}
+
+func jobEventMessages(events []db.JobEvent, kind string) []string {
+	var messages []string
+	for _, e := range events {
+		if e.Kind == kind {
+			messages = append(messages, e.Message)
+		}
+	}
+	return messages
+}
+
+// #1561: the re-sync is DIRECTIONAL now. Its only gates were "the checkout is on
+// the payload branch" and "the head differs from the payload head", so a queued
+// review could be re-pointed at a commit that was not the branch tip in either
+// direction — backwards onto a superseded commit, and after a force-push onto a
+// commit reachable from no branch at all (issue comments 5326259747 and
+// 5330559022) — while the recorded event asserted "branch advanced", a direction
+// nothing measured. Re-targeting now requires the checkout head to have the
+// DISPATCHED head as an ancestor; a same-commit abbreviation is recorded as an
+// expansion rather than a re-sync; and every refusal keeps the caller's existing
+// head-mismatch failure with the payload untouched.
+func TestDefaultCheckoutReviewHeadResyncMeasuresDirection(t *testing.T) {
+	// A syntactically valid SHA that is in no object database, so `merge-base
+	// --is-ancestor` cannot decide the relationship at all.
+	const absentHead = "0123456789abcdef0123456789abcdef01234567"
+
+	cases := []struct {
+		name string
+		// branch is the branch recorded on the review payload; empty means the
+		// checkout's own branch (feat/x).
+		branch string
+		// setup shapes the checkout's commit graph and returns the head SHA the
+		// review is dispatched with.
+		setup func(t *testing.T, checkout string) string
+		// wantErr is the substring the resolution must fail with; empty means the
+		// resolution must succeed and return the checkout.
+		wantErr string
+		// wantHead is the payload head expected afterwards, given the dispatched head.
+		wantHead func(t *testing.T, checkout, dispatched string) string
+		// wantEvent is the single event kind the job must carry, with wantMessage a
+		// substring of it. Empty wantEvent means no re-sync event of any kind.
+		wantEvent   string
+		wantMessage string
+	}{
+		{
+			name: "fast_forward_descendant_re_syncs",
+			setup: func(t *testing.T, checkout string) string {
+				dispatched := daemonWorkerHeadSHA(t, checkout)
+				commitDaemonWorkerFile(t, checkout, "feature.txt", "more work\n", "advance the branch")
+				return dispatched
+			},
+			wantHead: func(t *testing.T, checkout, _ string) string {
+				return daemonWorkerHeadSHA(t, checkout)
+			},
+			wantEvent:   "review_head_resynced",
+			wantMessage: "has dispatched head",
+		},
+		{
+			name: "backwards_onto_superseded_head_refused",
+			setup: func(t *testing.T, checkout string) string {
+				base := daemonWorkerHeadSHA(t, checkout)
+				dispatched := commitDaemonWorkerFile(t, checkout, "feature.txt", "newer work\n", "advance the branch")
+				// The checkout falls back to the older commit the review was NOT
+				// dispatched against: re-targeting here reviews superseded code.
+				runDaemonWorkerGit(t, checkout, "reset", "--hard", base)
+				return dispatched
+			},
+			wantErr: "not review job head",
+			wantHead: func(_ *testing.T, _, dispatched string) string {
+				return dispatched
+			},
+			wantEvent:   "review_head_resync_refused",
+			wantMessage: "does not have dispatched head",
+		},
+		{
+			name: "orphaned_dispatch_head_refused",
+			setup: func(t *testing.T, checkout string) string {
+				base := daemonWorkerHeadSHA(t, checkout)
+				// The force-push shape from #1564: the dispatched commit is still in the
+				// object database but reachable from no branch, and the checkout head is
+				// on a divergent line, so neither is an ancestor of the other.
+				dispatched := commitDaemonWorkerFile(t, checkout, "feature.txt", "force-pushed away\n", "discarded work")
+				runDaemonWorkerGit(t, checkout, "reset", "--hard", base)
+				commitDaemonWorkerFile(t, checkout, "rebuilt.txt", "rebuilt branch\n", "rebuild the branch")
+				return dispatched
+			},
+			wantErr: "not review job head",
+			wantHead: func(_ *testing.T, _, dispatched string) string {
+				return dispatched
+			},
+			wantEvent:   "review_head_resync_refused",
+			wantMessage: "superseded, divergent, or unreachable commit",
+		},
+		{
+			name: "undecidable_relationship_is_an_error_not_a_refusal",
+			setup: func(t *testing.T, checkout string) string {
+				commitDaemonWorkerFile(t, checkout, "feature.txt", "more work\n", "advance the branch")
+				return absentHead
+			},
+			// "the dispatched object is not in this repository" is a different fact
+			// from "not an ancestor" and must not be laundered into a silent refusal.
+			wantErr: "compare review checkout head",
+			wantHead: func(_ *testing.T, _, dispatched string) string {
+				return dispatched
+			},
+		},
+		{
+			name: "abbreviated_same_commit_is_an_expansion_not_a_re_sync",
+			setup: func(t *testing.T, checkout string) string {
+				// The branch does NOT move; only the recorded form is short. Measured on
+				// this host, 260 of 1819 review_head_resynced rows (14.3%, including the
+				// three most recent) record a "previous" that is a PREFIX of the "new"
+				// head — the same commit with an abbreviation expanded — while the old
+				// message claimed "branch advanced". The driver below asserts
+				// review_head_resynced is NOT emitted for this case.
+				return daemonWorkerHeadSHA(t, checkout)[:12]
+			},
+			wantHead: func(t *testing.T, checkout, _ string) string {
+				return daemonWorkerHeadSHA(t, checkout)
+			},
+			wantEvent:   "review_head_normalized",
+			wantMessage: "are the SAME commit",
+		},
+		{
+			name:   "wrong_branch_checkout_still_declines_before_any_measurement",
+			branch: "feat/other",
+			setup: func(t *testing.T, checkout string) string {
+				dispatched := daemonWorkerHeadSHA(t, checkout)
+				commitDaemonWorkerFile(t, checkout, "feature.txt", "more work\n", "advance the branch")
+				return dispatched
+			},
+			wantErr: "not review job head",
+			wantHead: func(_ *testing.T, _, dispatched string) string {
+				return dispatched
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			checkout := createDaemonWorkerGitCheckout(t, "feat/x")
+			store := daemonWorkerStore(t)
+			seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+			worker := defaultJobWorker(store, io.Discard)
+
+			dispatched := tc.setup(t, checkout)
+			branch := tc.branch
+			if branch == "" {
+				branch = "feat/x"
+			}
+
+			// The PR is OPEN, so the store green-lights a re-sync and the ancestry gate
+			// is the only thing that can refuse one.
+			if err := store.UpsertPullRequest(ctx, db.PullRequest{
+				RepoFullName: "owner/repo",
+				Number:       23,
+				HeadBranch:   branch,
+				HeadSHA:      dispatched,
+				State:        "open",
+			}); err != nil {
+				t.Fatalf("UpsertPullRequest returned error: %v", err)
+			}
+
+			const jobID = "workflow-review-direction"
+			enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+				ID:          jobID,
+				Agent:       "reviewer",
+				Action:      "review",
+				Repo:        "owner/repo",
+				Branch:      branch,
+				PullRequest: 23,
+				HeadSHA:     dispatched,
+				TaskID:      "review-task-direction", // no task row → resolves the shared checkout
+			})
+			job, err := store.GetJob(ctx, jobID)
+			if err != nil {
+				t.Fatalf("GetJob returned error: %v", err)
+			}
+			payload, err := daemonJobPayload(job)
+			if err != nil {
+				t.Fatalf("daemonJobPayload returned error: %v", err)
+			}
+
+			got, err := worker.defaultCheckoutForRunner(ctx, job, payload, runtime.Agent{Name: "reviewer"}, subprocess.ExecRunner{})
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("defaultCheckoutForRunner returned error: %v", err)
+				}
+				if got != checkout {
+					t.Fatalf("defaultCheckoutForRunner = %q, want the shared checkout %q", got, checkout)
+				}
+			} else {
+				if err == nil {
+					t.Fatalf("defaultCheckoutForRunner returned %q and no error, want a failure containing %q", got, tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error = %v, want it to contain %q", err, tc.wantErr)
+				}
+			}
+
+			reloaded, err := store.GetJob(ctx, jobID)
+			if err != nil {
+				t.Fatalf("GetJob (reload) returned error: %v", err)
+			}
+			reloadedPayload, err := daemonJobPayload(reloaded)
+			if err != nil {
+				t.Fatalf("daemonJobPayload (reload) returned error: %v", err)
+			}
+			if want := tc.wantHead(t, checkout, dispatched); reloadedPayload.HeadSHA != want {
+				t.Fatalf("payload HeadSHA = %q, want %q (dispatched %q)", reloadedPayload.HeadSHA, want, dispatched)
+			}
+
+			events, err := store.ListJobEvents(ctx, jobID)
+			if err != nil {
+				t.Fatalf("ListJobEvents returned error: %v", err)
+			}
+			for _, kind := range []string{"review_head_resynced", "review_head_normalized", "review_head_resync_refused"} {
+				if kind == tc.wantEvent {
+					continue
+				}
+				if hasResyncEvent(events, kind) {
+					t.Fatalf("events = %+v, want NO %s event", events, kind)
+				}
+			}
+			if tc.wantEvent == "" {
+				return
+			}
+			messages := jobEventMessages(events, tc.wantEvent)
+			if len(messages) != 1 {
+				t.Fatalf("events = %+v, want exactly one %s event", events, tc.wantEvent)
+			}
+			if !strings.Contains(messages[0], tc.wantMessage) {
+				t.Fatalf("%s message = %q, want it to contain %q", tc.wantEvent, messages[0], tc.wantMessage)
+			}
+		})
 	}
 }
 

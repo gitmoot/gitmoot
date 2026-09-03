@@ -1299,6 +1299,7 @@ the older re-sync behavior only for legacy/fallback review jobs that lack an
 owned read-only worktree: when their shared checkout advances and the PR remains
 open on the same branch, it re-targets the payload and records
 `review_head_resynced`; closed/merged, dirty, or wrong-branch checkouts fail.
+A re-target requires the checkout head to have the dispatched head as an ancestor: a non-descendant head is refused and recorded as `review_head_resync_refused`, and an abbreviated payload head naming the same commit records `review_head_normalized` rather than a re-sync.
 Relatedly,
 when a foreground `agent review` finds the agent's serialized runtime session
 **busy**, the review is now **left queued** for the daemon to run when the session
