@@ -30,7 +30,7 @@ func TestSeatCredentialProbeReportsTheStagedCredential(t *testing.T) {
 		},
 		"valid": {
 			expiresAt: time.Now().UTC().Add(8 * time.Hour).UnixMilli(), refreshToken: "r",
-			want: []string{"valid until"},
+			want: []string{"declares expiry", "does not prove"},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -69,7 +69,7 @@ func TestSeatCredentialProbeStatesWhenItCannotAssert(t *testing.T) {
 	if !strings.Contains(out, "no readable expiry") {
 		t.Fatalf("probe output %q must say it cannot assert", out)
 	}
-	for _, forbidden := range []string{"UNUSABLE", "EXPIRED", "valid until"} {
+	for _, forbidden := range []string{"UNUSABLE", "EXPIRED", "declares expiry"} {
 		if strings.Contains(out, forbidden) {
 			t.Fatalf("probe output %q must not claim %q without an expiry", out, forbidden)
 		}

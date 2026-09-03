@@ -15,11 +15,13 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// End to end through jobWorker.run: an unusable staged credential must fail the
-// job BEFORE any runtime launch. Measured cause: three seat reviews failed at
-// 06:31-06:36Z relaying "OAuth session expired and could not be refreshed",
-// which named OAuth rather than the snapshot gitmoot had staged.
-func TestWorkerRefusesSeatWithUnusableStagedCredential(t *testing.T) {
+// End to end through jobWorker.run: an expired staged credential must be
+// RECORDED and the job must still run. The first version of this change failed
+// the job here instead, and the #1810 review showed that converted a deferrable
+// runtime-auth blocker into a terminal failure with a PR comment, while the auth
+// overlay in the same commit means the staged snapshot no longer decides whether
+// the seat can authenticate.
+func TestWorkerRecordsExpiredSeatCredentialAndStillRuns(t *testing.T) {
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
@@ -36,6 +38,7 @@ func TestWorkerRefusesSeatWithUnusableStagedCredential(t *testing.T) {
 		WorktreePath: checkout, ReadOnlySeat: true, RuntimeConfigDir: sourceDir,
 	})
 
+	runner := &repairStateRunner{}
 	launched := false
 	worker := defaultJobWorker(store, io.Discard, home)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
@@ -43,8 +46,7 @@ func TestWorkerRefusesSeatWithUnusableStagedCredential(t *testing.T) {
 	}
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
 		launched = true
-		t.Error("the runtime must not be launched on a credential that cannot authenticate")
-		return nil, nil
+		return runtime.ClaudeAdapter{Runner: runner}, nil
 	}
 	job, err := store.GetJob(ctx, "cred-review")
 	if err != nil {
@@ -54,28 +56,31 @@ func TestWorkerRefusesSeatWithUnusableStagedCredential(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stored, err := store.GetJob(ctx, job.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stored.State != string(workflow.JobFailed) || launched {
-		t.Fatalf("job state=%q launched=%v, want failed without a launch", stored.State, launched)
+	if !launched {
+		t.Fatal("an expired staged credential must not stop the runtime from launching")
 	}
 	events, err := store.ListJobEvents(ctx, job.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var reason string
+	var recorded string
 	for _, event := range events {
-		if strings.Contains(event.Message, ".credentials.json") {
-			reason = event.Message
+		if event.Kind == "readonly_seat_credential_expired" {
+			recorded = event.Message
 		}
 	}
-	if reason == "" {
-		t.Fatalf("no event names the staged credential; events=%+v", events)
+	if recorded == "" {
+		t.Fatalf("expected a readonly_seat_credential_expired event; events=%+v", events)
 	}
-	if !strings.Contains(reason, "no refresh token") || !strings.Contains(reason, "re-login") {
-		t.Fatalf("failure reason %q must say what is wrong and what fixes it", reason)
+	if strings.Contains(recorded, sourceDir) {
+		t.Fatalf("event %q publishes the absolute host credential path", recorded)
+	}
+	// No terminal failure was minted BY THE PREFLIGHT: whatever the runtime does
+	// next owns the outcome.
+	for _, event := range events {
+		if event.Kind == string(workflow.JobFailed) && strings.Contains(event.Message, "credential") {
+			t.Fatalf("preflight minted a terminal credential failure: %q", event.Message)
+		}
 	}
 }
 
@@ -131,8 +136,13 @@ func TestWorkerRecordsExpiredButRefreshableSeatCredential(t *testing.T) {
 	if recorded == "" {
 		t.Fatalf("expected a readonly_seat_credential_expired event; events=%+v", events)
 	}
-	if !strings.Contains(recorded, expiry.Format(time.RFC3339)) || !strings.Contains(recorded, sourceDir) {
-		t.Fatalf("event %q must name the expiry and the source dir", recorded)
+	if !strings.Contains(recorded, expiry.Format(time.RFC3339)) {
+		t.Fatalf("event %q must name the expiry", recorded)
+	}
+	// The absolute host path is deliberately NOT in the message: this text used to
+	// reach a PR comment, and #1810's review flagged publishing it.
+	if strings.Contains(recorded, sourceDir) {
+		t.Fatalf("event %q publishes the absolute host credential path", recorded)
 	}
 	stored, err := store.GetJob(ctx, job.ID)
 	if err != nil {

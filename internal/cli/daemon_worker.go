@@ -348,19 +348,14 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		runtimeConfigDir = selectedRuntimeConfigDir(agent.Runtime)
 	}
 	applyReadOnlySeat(readOnlySeat, runtimeConfigDir, &agent)
-	// A seat stages a credential SNAPSHOT, so check the expiry it is about to
-	// copy BEFORE launching a runtime that can only fail on it. Provably
-	// unusable (expired, no refresh token) fails here; expired-but-refreshable
-	// records the fact so a later auth failure is not read as a fresh OAuth
-	// problem. See readonly_seat_credential.go for the measurement.
-	if credentialDiagnosis, credentialErr := readOnlySeatCredentialPreflight(agent, runtimeConfigDir, time.Now().UTC()); credentialErr != nil {
-		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, credentialErr); finishErr != nil {
-			return finishErr
-		}
-		_ = w.postJobResultComment(ctx, job.ID, agent, "", credentialErr)
-		return nil
-	} else if credentialDiagnosis != "" {
-		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "readonly_seat_credential_expired", Message: credentialDiagnosis}); eventErr != nil {
+	// A seat stages a credential SNAPSHOT. Record it when that snapshot is already
+	// expired, so a later auth failure is attributable to gitmoot's staging rather
+	// than read as a fresh OAuth problem. It never refuses: a runtime-auth
+	// rejection is a DEFERRABLE blocker (classifyOperationalBlocker plus the
+	// documented job.deferred), and the auth overlay this same commit injects
+	// means an expired snapshot is no longer decisive.
+	if diagnosis := readOnlySeatCredentialPreflight(agent, runtimeConfigDir, seatModelGatewayMode(w.ConfigHome), time.Now().UTC()); diagnosis != "" {
+		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "readonly_seat_credential_expired", Message: diagnosis}); eventErr != nil {
 			writeLine(w.Stdout, "job %s readonly_seat_credential_expired event failed: %v", job.ID, eventErr)
 		}
 	}
@@ -1489,7 +1484,13 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 		curated := graftRuntimeBaseRunner(runner, subprocess.CuratedGroupRunner{
 			BaseEnv: append(baseEnv, seatAuthEnv...),
 		})
-		return landlockReadOnlyRunner(curated, grants.reads, grants.readFiles, grants.writes, grants.env)
+		// The overlay ALSO rides on the landlock runner's env, and that is the
+		// path that actually reaches every shape. graftRuntimeBaseRunner has no
+		// CuratedGroupRunner case, so for a plain (non-instance) runner the graft
+		// above is a no-op and BaseEnv is dropped: a wiring test proved the child
+		// then saw only the grant env. #1810's review called this shape-dependence
+		// out; routing through grants.env is what makes the fix shape-independent.
+		return landlockReadOnlyRunner(curated, grants.reads, grants.readFiles, grants.writes, append(grants.env, seatAuthEnv...))
 	}
 	wrapped, err := wrapReadOnlyAdapterRunner(agent.Runtime, adapter, grants.stateDir, wrap)
 	if err != nil {
@@ -1905,6 +1906,15 @@ func produceRuntimeSandboxGrants(runtimeName string, readable, readFiles, writab
 		stateDir := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR"))
 		if stateDir == "" {
 			stateDir = filepath.Join(home, ".claude")
+		}
+		// A landlock grant and a MkdirAll both need an ABSOLUTE path. A relative or
+		// ~-prefixed CLAUDE_CONFIG_DIR would otherwise grant a path relative to the
+		// worker's cwd and create a stray directory there (#1810 review, P3).
+		if strings.HasPrefix(stateDir, "~") {
+			stateDir = filepath.Join(home, strings.TrimPrefix(stateDir, "~"))
+		}
+		if absolute, absErr := filepath.Abs(stateDir); absErr == nil {
+			stateDir = absolute
 		}
 		stateDir = filepath.Clean(stateDir)
 		cacheRoot, err := os.UserCacheDir()

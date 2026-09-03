@@ -185,6 +185,12 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	if check, ok := remoteExecDoctorCheck(paths); ok {
 		checks = append(checks, check)
 	}
+	// The checks above measure the AMBIENT claude credential; a read-only seat
+	// authenticates with a staged snapshot, and reporting only the ambient one is
+	// the false green this outage ran on (#1810 review).
+	if check, ok := seatCredentialDoctorCheck(); ok {
+		checks = append(checks, check)
+	}
 	// #631: surface a stale backlog of blocked jobs (each paused awaiting a human)
 	// so an operator knows they can be bulk-dismissed. Best-effort and appended to
 	// both the text table and the --json array; the dashboard's cheaper

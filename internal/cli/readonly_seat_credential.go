@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
@@ -61,8 +62,19 @@ func (s readOnlySeatCredentialState) Expired(now time.Time) bool {
 // preflight then has nothing to assert, which is the honest outcome rather than
 // a guess about a format gitmoot has not measured.
 func readOnlySeatCredentialStatePath(runtimeName string, sourceDir string) string {
-	if strings.TrimSpace(sourceDir) == "" {
+	sourceDir = strings.TrimSpace(sourceDir)
+	if sourceDir == "" {
 		return ""
+	}
+	// Resolve exactly as prepareReadOnlyRuntimeState does before staging:
+	// absolute, then symlinks evaluated. Reading a DIFFERENT path from the one
+	// that gets staged would let this report on a file the seat never uses, which
+	// the #1810 review flagged.
+	if absolute, err := filepath.Abs(sourceDir); err == nil {
+		sourceDir = absolute
+	}
+	if resolved, err := filepath.EvalSymlinks(sourceDir); err == nil {
+		sourceDir = resolved
 	}
 	switch runtimeName {
 	case runtime.ClaudeRuntime:
@@ -114,32 +126,49 @@ func inspectReadOnlySeatCredential(runtimeName string, sourceDir string) (readOn
 	return state, true
 }
 
-// readOnlySeatCredentialPreflight classifies the credential a seat will stage.
-// It returns a fatal error for the provably-unusable case and a non-empty
-// diagnosis for the expired-but-refreshable case. Both name the source file and
-// the expiry, so the reader is never left with only the runtime's own wording.
-func readOnlySeatCredentialPreflight(agent runtime.Agent, sourceDir string, now time.Time) (string, error) {
-	if !agent.ReadOnlySeat {
-		return "", nil
+// readOnlySeatCredentialPreflight returns a DIAGNOSIS when the credential a seat
+// is about to stage is already expired, and never refuses.
+//
+// It refused in the first version of this change, and the exact-head review of
+// #1810 (job local-review-gm-review-opus-18d1be80ca9b36c9) showed both halves of
+// that were wrong:
+//
+//   - the refusal contradicted the engine's own policy for this class.
+//     classifyOperationalBlocker maps a runtime-auth rejection to
+//     blockerClassRuntimeAuth with authBlockerRetryDelay, and docs/events.md
+//     documents job.deferred emitted INSTEAD of job.failed, so a run self-heals
+//     after a re-login with no job.failed and no PR comment. Failing at
+//     preflight turned a deferrable blocker into a terminal one;
+//   - after the auth-overlay injection in this same commit, an expired staged
+//     snapshot is no longer decisive: the seat authenticates with the resolved
+//     runtime auth, so the refusal could hard-fail a job the same commit had
+//     just made authenticable.
+//
+// What survives is the reporting half, which is the part the outage actually
+// needed: when a job later fails to authenticate, the record already says that
+// gitmoot staged an expired credential and from where, instead of leaving the
+// reader with the runtime's own "OAuth session expired" wording. Gateway mode
+// stages no credential file at all, so there is nothing to diagnose there.
+func readOnlySeatCredentialPreflight(agent runtime.Agent, sourceDir string, gatewayMode bool, now time.Time) string {
+	if !agent.ReadOnlySeat || gatewayMode {
+		return ""
 	}
 	state, ok := inspectReadOnlySeatCredential(agent.Runtime, sourceDir)
 	if !ok || !state.Expired(now) {
-		return "", nil
+		return ""
 	}
 	expiry := "no expiry recorded (a failed refresh writes this)"
 	if !state.ExpiresAt.IsZero() {
 		expiry = state.ExpiresAt.Format(time.RFC3339)
 	}
-	if !state.Refreshable {
-		return "", fmt.Errorf(
-			"read-only seat credential %s is unusable: it expired (%s) and carries no refresh token, so the %s runtime cannot authenticate; re-login that account",
-			state.Source, expiry, agent.Runtime,
-		)
+	refresh := "and carries no refresh token, so it cannot authenticate on its own"
+	if state.Refreshable {
+		refresh = "and must be refreshed by the runtime to work on its own"
 	}
 	return fmt.Sprintf(
-		"read-only seat staged an EXPIRED credential from %s (expired %s); the %s runtime must refresh it to succeed, and an auth failure on this job is gitmoot's staged snapshot rather than a new OAuth problem",
-		state.Source, expiry, agent.Runtime,
-	), nil
+		"read-only seat staged an expired %s credential (expired %s) %s; the seat also carries the resolved runtime auth, so this is context for any later auth failure rather than a refusal",
+		agent.Runtime, expiry, refresh,
+	)
 }
 
 // readOnlySeatRuntimeAuthEnv resolves the runtime auth a seat must carry. It is
@@ -185,7 +214,7 @@ func writeSeatCredentialProbe(stdout io.Writer, home string) {
 		return
 	}
 	if !state.Expired(time.Now().UTC()) {
-		writeLine(stdout, "read-only seat credential (%s): valid until %s", state.Source, state.ExpiresAt.Format(time.RFC3339))
+		writeLine(stdout, "read-only seat credential (%s): declares expiry %s, not yet reached; this reads a field and does not prove the credential authenticates", state.Source, state.ExpiresAt.Format(time.RFC3339))
 		return
 	}
 	expiry := "no expiry recorded (a failed refresh writes this)"
@@ -197,4 +226,20 @@ func writeSeatCredentialProbe(stdout io.Writer, home string) {
 		return
 	}
 	writeLine(stdout, "read-only seat credential (%s): UNUSABLE, expired %s with no refresh token; every read-only seat job on this runtime will fail until that account is re-logged in", state.Source, expiry)
+}
+
+// seatModelGatewayMode reports whether claude deliveries run through the local
+// model gateway, resolved the same way runtimeJobRunnerWithAuth resolves it. In
+// gateway mode no credential file is staged for a seat, so both the auth overlay
+// and the staged-credential diagnosis are deliberately silent there.
+func seatModelGatewayMode(home string) bool {
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		return false
+	}
+	cfg, err := config.LoadCredentialsConfig(paths)
+	if err != nil {
+		return false
+	}
+	return cfg.ModelGateway
 }
