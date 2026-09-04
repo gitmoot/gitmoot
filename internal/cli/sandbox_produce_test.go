@@ -164,8 +164,9 @@ func (r *repairStateRunner) RunEnv(_ context.Context, _ string, env []string, co
 func (r *repairStateRunner) LookPath(file string) (string, error) { return file, nil }
 
 type kimiHomeStateRunner struct {
-	home               string
-	credentialObserved bool
+	home                string
+	credentialObserved  bool
+	modelConfigObserved bool
 }
 
 func (r *kimiHomeStateRunner) Run(context.Context, string, string, ...string) (subprocess.Result, error) {
@@ -182,6 +183,18 @@ func (r *kimiHomeStateRunner) RunEnv(_ context.Context, _ string, env []string, 
 		return subprocess.Result{}, fmt.Errorf("read Kimi credential under HOME: %w", err)
 	}
 	r.credentialObserved = true
+	// Kimi reads default_model plus its provider and model blocks from
+	// config.toml. Staging only the credential produced a seat that
+	// authenticated and then refused with "No model configured" behind an auth
+	// message, so this runner reads what the real runtime reads at startup.
+	modelConfig, err := os.ReadFile(filepath.Join(r.home, ".kimi-code", "config.toml"))
+	if err != nil {
+		return subprocess.Result{}, fmt.Errorf("read Kimi config.toml under HOME: %w", err)
+	}
+	if !strings.Contains(string(modelConfig), "default_model") {
+		return subprocess.Result{}, errors.New("staged Kimi config.toml carries no default_model")
+	}
+	r.modelConfigObserved = true
 	return subprocess.Result{
 		Command: command,
 		Args:    args,
@@ -392,7 +405,7 @@ func TestWrapReadOnlySandboxAdapterUsesExplicitReadsAndIsolatedState(t *testing.
 		ReadOnlySeat:     true,
 		RuntimeConfigDir: stateDir,
 	}
-	wrapped, err := wrapReadOnlySandboxAdapter(configHome, agent, checkout, runtime.ClaudeAdapter{Runner: subprocess.GroupRunner{}})
+	wrapped, _, err := wrapReadOnlySandboxAdapter(configHome, agent, checkout, runtime.ClaudeAdapter{Runner: subprocess.GroupRunner{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,7 +477,7 @@ func TestWrapReadOnlySandboxAdapterKeepsModelGatewayCredentialFree(t *testing.T)
 		Adapter: runtime.ClaudeAdapter{Runner: gatewayRunner},
 		runner:  gatewayRunner,
 	}
-	wrapped, err := wrapReadOnlySandboxAdapter(t.TempDir(), runtime.Agent{
+	wrapped, _, err := wrapReadOnlySandboxAdapter(t.TempDir(), runtime.Agent{
 		Runtime:          runtime.ClaudeRuntime,
 		ReadOnlySeat:     true,
 		RuntimeConfigDir: sourceState,
@@ -602,6 +615,10 @@ func TestWorkerKimiReadOnlySeatStagesProfileUnderEffectiveHome(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(credentialDir, "kimi-code.json"), []byte(sourceCredential), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	const sourceModelConfig = "default_model = \"kimi-code/k3\"\n\n[providers.\"managed:kimi-code\"]\ntype = \"kimi\"\n"
+	if err := os.WriteFile(filepath.Join(sourceDir, "config.toml"), []byte(sourceModelConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	seedDaemonWorkerAgentWithPolicy(t, store, "kimi-reviewer", runtime.KimiRuntime,
 		"session_550e8400-e29b-41d4-a716-446655440000", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
@@ -627,8 +644,8 @@ func TestWorkerKimiReadOnlySeatStagesProfileUnderEffectiveHome(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.State != string(workflow.JobSucceeded) || !runner.credentialObserved {
-		t.Fatalf("Kimi job state=%q credentialObserved=%v payload=%s", stored.State, runner.credentialObserved, stored.Payload)
+	if stored.State != string(workflow.JobSucceeded) || !runner.credentialObserved || !runner.modelConfigObserved {
+		t.Fatalf("Kimi job state=%q credentialObserved=%v modelConfigObserved=%v payload=%s", stored.State, runner.credentialObserved, runner.modelConfigObserved, stored.Payload)
 	}
 	if data, err := os.ReadFile(filepath.Join(credentialDir, "kimi-code.json")); err != nil || string(data) != sourceCredential {
 		t.Fatalf("shared Kimi credential changed to %q, err=%v", data, err)
@@ -814,7 +831,7 @@ func TestForegroundReviewRuntimeStateSurvivesRepairAndCleansAtBoundary(t *testin
 
 	previousAdapterFactory := localAgentDispatchRuntimeAdapterFor
 	localAgentDispatchRuntimeAdapterFor = func(configHome string, agent runtime.Agent, deliveryCheckout string) (runtime.Adapter, error) {
-		delivery, err := wrapReadOnlySandboxAdapter(configHome, agent, deliveryCheckout, runtime.ClaudeAdapter{Runner: runner})
+		delivery, _, err := wrapReadOnlySandboxAdapter(configHome, agent, deliveryCheckout, runtime.ClaudeAdapter{Runner: runner})
 		if err != nil {
 			return nil, err
 		}
@@ -874,7 +891,7 @@ func TestReadOnlyRuntimeAdapterNeverPersistsStagedCredential(t *testing.T) {
 		AutonomyPolicy: runtime.AutonomyPolicyReadOnly, ReadOnlySeat: true,
 		RuntimeConfigDir: sourceDir,
 	}
-	wrapped, err := wrapReadOnlySandboxAdapter(configHome, agent, checkout, runtime.ClaudeAdapter{
+	wrapped, _, err := wrapReadOnlySandboxAdapter(configHome, agent, checkout, runtime.ClaudeAdapter{
 		Runner: &sandboxAdapterCaptureRunner{stdout: `{"result":"done"}`},
 	})
 	if err != nil {
@@ -913,7 +930,7 @@ func TestStageReadOnlyRuntimeCredentialCopiesOnlyProviderSection(t *testing.T) {
 	if err := os.WriteFile(source, []byte(sourceCredential), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := stageReadOnlyRuntimeCredential(source, staged, "claudeAiOauth"); err != nil {
+	if err := stageReadOnlyRuntimeCredential(source, staged, "claudeAiOauth", nil); err != nil {
 		t.Fatal(err)
 	}
 	stagedData, err := os.ReadFile(staged)
@@ -940,7 +957,7 @@ func TestWrapReadOnlySandboxAdapterRejectsOmpWithoutCredentialBroker(t *testing.
 		t.Fatal(err)
 	}
 	agent := runtime.Agent{Runtime: runtime.OmpRuntime, ReadOnlySeat: true}
-	_, err := wrapReadOnlySandboxAdapter(t.TempDir(), agent, checkout, runtime.OmpAdapter{})
+	_, _, err := wrapReadOnlySandboxAdapter(t.TempDir(), agent, checkout, runtime.OmpAdapter{})
 	if err == nil || !strings.Contains(err.Error(), "isolated credential broker") {
 		t.Fatalf("omp read-only seat error = %v", err)
 	}
@@ -963,7 +980,9 @@ func TestApplyReadOnlySeatClearsInheritedGrants(t *testing.T) {
 				ReadablePaths: []string{"/host"},
 				ReadableFiles: []string{"/host/secret"},
 			}
-			applyReadOnlySeat(test.marked, " /profiles/reviewer ", &agent)
+			if err := applyReadOnlySeat(test.marked, " /profiles/reviewer ", "job-grants", &agent); err != nil {
+				t.Fatalf("applyReadOnlySeat: %v", err)
+			}
 			if agent.ReadOnlySeat != test.wantSeat || agent.RuntimeConfigDir != test.wantConfig {
 				t.Fatalf("read-only marker = %v config = %q, want %v %q", agent.ReadOnlySeat, agent.RuntimeConfigDir, test.wantSeat, test.wantConfig)
 			}
@@ -1269,7 +1288,7 @@ func TestProduceLaunchesOnTheImplicitWriteRootPathUnlikeAReadOnlySeat(t *testing
 		Name: "r", Role: "reviewer", Runtime: runtime.ClaudeRuntime, RuntimeRef: "last",
 		AutonomyPolicy: runtime.AutonomyPolicyReadOnly, ReadOnlySeat: true,
 	}
-	seatWrapped, err := wrapReadOnlySandboxAdapter(t.TempDir(), seat, seatCheckout, runtime.ClaudeAdapter{Runner: seatCapture, Dir: seatCheckout})
+	seatWrapped, _, err := wrapReadOnlySandboxAdapter(t.TempDir(), seat, seatCheckout, runtime.ClaudeAdapter{Runner: seatCapture, Dir: seatCheckout})
 	if err != nil {
 		t.Fatal(err)
 	}

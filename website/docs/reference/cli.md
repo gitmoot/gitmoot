@@ -1017,6 +1017,8 @@ the older re-sync behavior only for legacy/fallback review jobs that lack an
 owned read-only worktree: when their shared checkout advances and the PR remains
 open on the same branch, it re-targets the payload and records
 `review_head_resynced`; closed/merged, dirty, or wrong-branch checkouts fail.
+A re-target requires the checkout head to have the dispatched head as an ancestor, so a review queued before an amend or a rebase force-push will **not** follow the branch: it refuses (recording `review_head_resync_refused`) and keeps the original wrong-head error, which a **non-delegation** review job defers and auto-retries within the shared blocker budget before failing terminally, while a **delegation-child** leg (a high-risk lens child, say) is routed terminally by its own DAG on the first tick and a leg carrying a **fix worktree** likewise gets no deferral — either way the remedy is to dispatch a **new** review at the new head, which is what exact-head review does anyway.
+Any dispatched head that git resolves to the checkout's own commit — an abbreviation of any length, a case-differing 40-character SHA, a rev expression, a ref name — is recorded as `review_head_normalized` and is never a re-sync, while a dispatched head this checkout cannot resolve at all leaves the re-sync refused and keeps the original wrong-head failure, deferrable on the same non-delegation terms.
 Relatedly,
 when a foreground `agent review` finds the agent's serialized runtime session
 **busy**, the review is now **left queued** for the daemon to run when the session
@@ -1459,10 +1461,10 @@ matching label binding, or replaces a non-empty binding only when its former
 target no longer resolves. It does not rewrite existing policy or duplicate
 routes.
 
-`gitmoot org seat rm <name> [--home DIR]` resolves the role's live pane when it
-has a binding and checks every distinct Git checkout reported by that pane's
-`cwd` and `foreground_cwd`. It refuses a dirty checkout or a branch whose `HEAD`
-is not merged into the locally known `origin/HEAD` (falling back to
+`gitmoot org seat rm <name> [--force] [--home DIR]` resolves the role's live pane
+when it has a binding and checks every distinct Git checkout reported by that
+pane's `cwd` and `foreground_cwd`. It refuses a dirty checkout or a branch whose
+`HEAD` is not merged into the locally known `origin/HEAD` (falling back to
 `origin/main`); unreadable branch state also fails closed. A safe removal deletes
 the role and all of its wake routes, closes a resolved live pane, and validates
 that the role, routes, and closed pane are absent. A role with no configured
@@ -1471,6 +1473,20 @@ its routes. A configured binding that is stale, absent, or ambiguous fails
 closed before mutation and reports the `org seat add` rebind command. A provider
 error for a configured binding also fails closed. Roles that still parent
 another role cannot be removed.
+
+`--force` retires a seat whose configured pane will never resolve again, which
+is otherwise unreachable: rebinding is impossible when the pane is gone, so the
+role and its wake routes cannot be deleted at all. Per #1175 an unbound role is
+a defect with two remedies, bind it or remove it, and `--force` is the second
+one. It applies ONLY to an unresolved binding, and the removal prints
+`pane check skipped under --force` with the reason the binding did not resolve.
+A stale id may still name a LIVE pane holding work that the check cannot
+inspect, so forcing a stale binding asserts that pane is gone. An ambiguous
+label warning names every matching live pane ID; removal does not guess which
+one belongs to the role and therefore closes none of them. Inspect or close
+those panes separately before forcing the removal. `--force` does not weaken
+anything else: a pane that DOES resolve is still refused when its branch check
+fails, and a provider error still fails closed rather than being forced through.
 
 The five provisioned routes are enabled, addressed, and have an empty match
 filter. Remove one by its stable ID with `org events rule rm` to quiet that kind;

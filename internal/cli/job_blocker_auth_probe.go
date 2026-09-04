@@ -214,7 +214,7 @@ func (w jobWorker) probeReadOnlySeatClaudeAuth(ctx context.Context, agent runtim
 	defer os.RemoveAll(cacheRoot)
 	agent.ReadOnlySeat = true
 	agent.RuntimeConfigDir = selectedReadOnlyRuntimeConfigDir(agent.Runtime, payload.RuntimeConfigDir)
-	stateDir, stateEnv, err := prepareReadOnlyRuntimeState(agent, cacheRoot, false)
+	stateDir, stateEnv, _, err := prepareReadOnlyRuntimeState(agent, cacheRoot, false)
 	if err != nil {
 		return authProbeUnknown
 	}

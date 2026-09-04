@@ -137,7 +137,7 @@ func TestPrepareReadOnlyRuntimeStateRefusesARelativeCacheRoot(t *testing.T) {
 	}
 	agent := runtime.Agent{Name: "reviewer", Runtime: runtime.CodexRuntime, ReadOnlySeat: true, RuntimeConfigDir: source}
 
-	stateDir, env, err := prepareReadOnlyRuntimeState(agent, relative, false)
+	stateDir, env, _, err := prepareReadOnlyRuntimeState(agent, relative, false)
 	if err == nil {
 		t.Fatalf("a relative cacheRoot was accepted: stateDir=%q env=%v; credentials would be staged inside the working directory", stateDir, env)
 	}
@@ -159,7 +159,7 @@ func TestPrepareReadOnlyRuntimeStateRefusesARelativeCacheRoot(t *testing.T) {
 	// An ABSOLUTE cacheRoot must still stage and inject: the guard is a
 	// precondition, not a feature removal.
 	absolute := t.TempDir()
-	stateDir, env, err = prepareReadOnlyRuntimeState(agent, absolute, false)
+	stateDir, env, _, err = prepareReadOnlyRuntimeState(agent, absolute, false)
 	if err != nil {
 		t.Fatalf("absolute cacheRoot rejected: %v", err)
 	}
