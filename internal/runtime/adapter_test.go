@@ -2412,7 +2412,13 @@ func TestKimiHealthRunsFreshSession(t *testing.T) {
 	runner.want(t, 0, "kimi", "-p", KimiLiveCheckPrompt, "--output-format", "stream-json")
 }
 
-func TestKimiHealthClassifiesAuthFailure(t *testing.T) {
+// TestKimiHealthSurfacesTheChildsOwnFailureText is the post-#1857 contract for
+// what used to be TestKimiHealthClassifiesAuthFailure: gitmoot adds NO auth
+// label of its own, and the kimi CLI's own words survive intact. Kimi relays
+// its tools' output through the same streams it reports itself on, so a
+// gitmoot-added label derived from that text was labelling whichever program
+// happened to speak last.
+func TestKimiHealthSurfacesTheChildsOwnFailureText(t *testing.T) {
 	runner := &fakeRunner{
 		results: []subprocess.Result{{Stderr: "Please run `kimi login` to authenticate."}},
 		errs:    []error{errors.New("exit 1")},
@@ -2425,9 +2431,15 @@ func TestKimiHealthClassifiesAuthFailure(t *testing.T) {
 		t.Fatal("Health accepted auth failure")
 	}
 	errText := err.Error()
-	for _, want := range []string{"Kimi Code authentication required", "kimi login", "restart the Gitmoot daemon"} {
-		if !strings.Contains(errText, want) {
-			t.Fatalf("error missing %q:\n%s", want, errText)
+	if !strings.Contains(errText, "Please run `kimi login` to authenticate.") {
+		t.Fatalf("error dropped the CLI's own text:\n%s", errText)
+	}
+	if !strings.Contains(errText, "exit 1") {
+		t.Fatalf("error dropped the child's own cause:\n%s", errText)
+	}
+	for _, forbidden := range []string{"Kimi Code authentication required", "restart the Gitmoot daemon so it inherits the session"} {
+		if strings.Contains(errText, forbidden) {
+			t.Fatalf("error carries gitmoot's own auth label %q:\n%s", forbidden, errText)
 		}
 	}
 }
