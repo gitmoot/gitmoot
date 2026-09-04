@@ -626,10 +626,6 @@ func (w jobWorker) resyncReviewHeadForRunner(ctx context.Context, job db.Job, pa
 		// existing path handle it.
 		return false, nil
 	}
-	if dispatchedRev == head {
-		// Already recorded exactly; there is nothing to write.
-		return false, nil
-	}
 	// IDENTITY IS DECIDED BY RESOLUTION, NEVER BY SHAPE. The dispatched rev and the
 	// checkout head are compared as the 40-character object ids git resolves them
 	// to, so no spelling of one commit can be mistaken for a different commit:
@@ -683,10 +679,25 @@ func (w jobWorker) resyncReviewHeadForRunner(ctx context.Context, job db.Job, pa
 	}
 	fastForward, err := git.IsAncestor(ctx, dispatched, head)
 	if err != nil {
-		// Both operands are resolved object ids present in this repository, so
-		// merge-base cannot fail for a missing object; a failure here is a real
-		// repository fault and is surfaced rather than read as a direction.
-		return false, fmt.Errorf("compare review checkout head %s with dispatched head %s: %w", head, dispatched, err)
+		// merge-base could not answer. A non-1 exit is NOT confined to a corrupt
+		// object: a cancelled context at daemon shutdown, a killed subprocess, or a
+		// broken git binary all land here, and shutdown cancellation is the ordinary
+		// case. Returning a distinctly-worded error was a defect — the caller
+		// propagates it verbatim (:68), classifyCheckoutContention scores it
+		// checkoutContentionNone (job_blocker_checkout.go:104) and the job fails
+		// terminally, where the SAME job on the original wrong-head error scores
+		// Dirty and defers. It also contradicted this package's own test, which
+		// constructs that wording as the string a refusal must NOT introduce. So
+		// this branch does what the other two refusals do: record the diagnosis on
+		// the job and return false, leaving the caller's original error untouched.
+		_ = w.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID: job.ID,
+			Kind:  reviewHeadResyncRefusedEvent,
+			Message: fmt.Sprintf("PR #%d could not compare checkout head %s with dispatched head %s (%v); refusing to re-target the review",
+				payload.PullRequest, head, dispatched, err),
+		})
+		writeLine(w.Stdout, "job %s review head re-sync refused: comparing %s with dispatched head %s failed: %v (PR #%d)", job.ID, head, dispatched, err, payload.PullRequest)
+		return false, nil
 	}
 	if !fastForward {
 		// Record the refusal on the JOB, not just the daemon journal (#1561 ask 2):

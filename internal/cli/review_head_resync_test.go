@@ -651,6 +651,233 @@ func TestReviewHeadMismatchErrorStaysDeferrable(t *testing.T) {
 	}
 }
 
+// ancestryFailingRunner fails exactly `git merge-base --is-ancestor` with a
+// failure that is NOT git's exit-1 "not an ancestor", and runs every other
+// command for real. IsAncestor reads exit 1 as the ordinary false; anything else
+// — a cancelled context at daemon shutdown, a killed subprocess, a broken git
+// binary — is an error, and none of those is repository corruption.
+type ancestryFailingRunner struct {
+	subprocess.ExecRunner
+}
+
+func (r ancestryFailingRunner) Run(ctx context.Context, dir string, command string, args ...string) (subprocess.Result, error) {
+	if len(args) >= 2 && args[0] == "merge-base" && args[1] == "--is-ancestor" {
+		return subprocess.Result{Command: command, Args: args, Stderr: "fatal: simulated merge-base failure"},
+			fmt.Errorf("git merge-base --is-ancestor: %w", context.Canceled)
+	}
+	return r.ExecRunner.Run(ctx, dir, command, args...)
+}
+
+// #1561 round-2 F-1: when the ancestry comparison itself cannot answer, the
+// refusal must leave the CALLER's original wrong-head error in place. Returning
+// a comparison-specific error instead cost the job its deferral: the caller
+// propagates it verbatim, classifyCheckoutContention scores it
+// checkoutContentionNone, and the job fails terminally — while the same job on
+// the original error scores Dirty and defers. This drives the real path (a
+// genuine fast-forward whose merge-base call fails) rather than asserting the
+// string in isolation.
+func TestDefaultCheckoutRefusesUndecidableAncestryWithoutRewordingTheError(t *testing.T) {
+	ctx := context.Background()
+	checkout := createDaemonWorkerGitCheckout(t, "feat/x")
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	worker := defaultJobWorker(store, io.Discard)
+
+	dispatched := daemonWorkerHeadSHA(t, checkout)
+	commitDaemonWorkerFile(t, checkout, "feature.txt", "more work\n", "advance the branch")
+	newHead := daemonWorkerHeadSHA(t, checkout)
+
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: "owner/repo",
+		Number:       23,
+		HeadBranch:   "feat/x",
+		HeadSHA:      dispatched,
+		State:        "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+	const jobID = "workflow-review-ancestry-error"
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID:          jobID,
+		Agent:       "reviewer",
+		Action:      "review",
+		Repo:        "owner/repo",
+		Branch:      "feat/x",
+		PullRequest: 23,
+		HeadSHA:     dispatched,
+		TaskID:      "review-task-ancestry-error",
+	})
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatalf("daemonJobPayload returned error: %v", err)
+	}
+
+	_, err = worker.defaultCheckoutForRunner(ctx, job, payload, runtime.Agent{Name: "reviewer"}, ancestryFailingRunner{})
+	if err == nil {
+		t.Fatal("defaultCheckoutForRunner re-synced despite an undecidable ancestry comparison")
+	}
+	// The caller's original error, VERBATIM: anything else loses the deferral.
+	want := fmt.Sprintf("checkout head is %s, not review job head %s", newHead, dispatched)
+	if err.Error() != want {
+		t.Fatalf("error = %q, want the caller's original error verbatim %q", err.Error(), want)
+	}
+	kind, action := classifyCheckoutContention(err)
+	if kind != checkoutContentionDirty || strings.TrimSpace(action) == "" {
+		t.Fatalf("classifyCheckoutContention = (%v, %q), want checkoutContentionDirty with a suggested_action so the job defers", kind, action)
+	}
+	// The consequence, not just the classification: the job actually DEFERS on the
+	// propagated error. A re-worded error scored checkoutContentionNone and this
+	// call returned false, which is how the deferral was lost.
+	deferred, deferErr := worker.deferCheckoutContention(ctx, job, payload, err)
+	if deferErr != nil {
+		t.Fatalf("deferCheckoutContention returned error: %v", deferErr)
+	}
+	if !deferred {
+		t.Fatal("deferCheckoutContention did not defer the job on the propagated wrong-head error")
+	}
+
+	reloaded, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob (reload) returned error: %v", err)
+	}
+	reloadedPayload, err := daemonJobPayload(reloaded)
+	if err != nil {
+		t.Fatalf("daemonJobPayload (reload) returned error: %v", err)
+	}
+	if reloadedPayload.HeadSHA != dispatched {
+		t.Fatalf("payload HeadSHA = %q, want it left at the dispatched head %q", reloadedPayload.HeadSHA, dispatched)
+	}
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if !hasResyncEvent(events, "review_head_resync_refused") {
+		t.Fatalf("events = %+v, want a review_head_resync_refused event recording the undecidable comparison", events)
+	}
+	if hasResyncEvent(events, "review_head_resynced") {
+		t.Fatalf("events = %+v, want NO review_head_resynced event", events)
+	}
+
+	// CONTROL, same job and same seam with the fault removed: the ancestry
+	// comparison answers, the re-sync proceeds, and the payload moves to the
+	// checkout head. The test therefore states a DIFFERENCE the faulted seam makes,
+	// not a property that would hold either way.
+	controlJob, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob (control) returned error: %v", err)
+	}
+	controlPayload, err := daemonJobPayload(controlJob)
+	if err != nil {
+		t.Fatalf("daemonJobPayload (control) returned error: %v", err)
+	}
+	if _, err := worker.defaultCheckoutForRunner(ctx, controlJob, controlPayload, runtime.Agent{Name: "reviewer"}, subprocess.ExecRunner{}); err != nil {
+		t.Fatalf("control run (unfaulted seam) failed instead of re-syncing: %v", err)
+	}
+	controlReloaded, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob (control reload) returned error: %v", err)
+	}
+	controlReloadedPayload, err := daemonJobPayload(controlReloaded)
+	if err != nil {
+		t.Fatalf("daemonJobPayload (control reload) returned error: %v", err)
+	}
+	if controlReloadedPayload.HeadSHA != newHead {
+		t.Fatalf("control payload HeadSHA = %q, want the checkout head %q", controlReloadedPayload.HeadSHA, newHead)
+	}
+	controlEvents, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents (control) returned error: %v", err)
+	}
+	if !hasResyncEvent(controlEvents, "review_head_resynced") {
+		t.Fatalf("control events = %+v, want a review_head_resynced event once the seam answers", controlEvents)
+	}
+}
+
+// #1561 round-2 F-5: identity follows GIT's resolution, not a prefix test over
+// the recorded string. A ref whose NAME is the checkout head's abbreviation but
+// which points at a different commit is the case that separates the two: a
+// prefix test would call it the same commit, while rev-parse resolves the ref
+// and the mismatch goes to the ancestry gate.
+func TestDefaultCheckoutResolvesAmbiguousAbbreviationAsARef(t *testing.T) {
+	ctx := context.Background()
+	checkout := createDaemonWorkerGitCheckout(t, "feat/x")
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	worker := defaultJobWorker(store, io.Discard)
+
+	base := daemonWorkerHeadSHA(t, checkout)
+	commitDaemonWorkerFile(t, checkout, "feature.txt", "more work\n", "advance the branch")
+	head := daemonWorkerHeadSHA(t, checkout)
+	// A branch named exactly like the head's 12-char abbreviation, pointing at the
+	// PARENT commit. Resolution must follow the ref, so this is not identity.
+	abbrev := head[:12]
+	runDaemonWorkerGit(t, checkout, "branch", abbrev, base)
+
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: "owner/repo",
+		Number:       23,
+		HeadBranch:   "feat/x",
+		HeadSHA:      abbrev,
+		State:        "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+	const jobID = "workflow-review-ambiguous-abbrev"
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID:          jobID,
+		Agent:       "reviewer",
+		Action:      "review",
+		Repo:        "owner/repo",
+		Branch:      "feat/x",
+		PullRequest: 23,
+		HeadSHA:     abbrev,
+		TaskID:      "review-task-ambiguous-abbrev",
+	})
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatalf("daemonJobPayload returned error: %v", err)
+	}
+
+	got, err := worker.defaultCheckoutForRunner(ctx, job, payload, runtime.Agent{Name: "reviewer"}, subprocess.ExecRunner{})
+	if err != nil {
+		t.Fatalf("defaultCheckoutForRunner returned error: %v", err)
+	}
+	if got != checkout {
+		t.Fatalf("defaultCheckoutForRunner = %q, want the shared checkout %q", got, checkout)
+	}
+	reloaded, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob (reload) returned error: %v", err)
+	}
+	reloadedPayload, err := daemonJobPayload(reloaded)
+	if err != nil {
+		t.Fatalf("daemonJobPayload (reload) returned error: %v", err)
+	}
+	if reloadedPayload.HeadSHA != head {
+		t.Fatalf("payload HeadSHA = %q, want the checkout head %q", reloadedPayload.HeadSHA, head)
+	}
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	// The ref resolves to the PARENT of the checkout head, so this is a genuine
+	// fast-forward re-sync — never a same-commit normalization.
+	if !hasResyncEvent(events, "review_head_resynced") {
+		t.Fatalf("events = %+v, want a review_head_resynced event", events)
+	}
+	if hasResyncEvent(events, "review_head_normalized") {
+		t.Fatalf("events = %+v, want NO review_head_normalized event: the ref names a different commit", events)
+	}
+}
+
 // #684 failure mode B: a foreground review whose serialized runtime session is
 // busy must be LEFT QUEUED for the daemon to run (a review is naturally
 // asynchronous), not cancelled and dropped. Ask/implement keep their existing
