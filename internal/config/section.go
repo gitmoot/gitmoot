@@ -23,7 +23,7 @@ import "strings"
 //
 // WHAT THIS DOES NOT COVER, because a comment that overstates its own reach
 // stops the next reader checking. It is used by the plain section scanners in
-// this package - 26 call sites across 22 files. Deliberately EXCLUDED per the
+// this package. Deliberately EXCLUDED per the
 // #1759 ruling (workflow note 107889) on their measured structural
 // differences: agent_types.go (LoadAgentTypes and removeAgentTypeBlocks) and
 // memory_pipelines.go keep the pre-#1759 two-bracket form, so LoadAgentTypes
@@ -36,17 +36,19 @@ import "strings"
 //
 // So: one classification for the plain scanners, NOT one for the package.
 //
-// ROUTING COVERAGE is partial, and the count is NOT repeated here on purpose.
-// It is derived in exactly one place - the COVERAGE block above
-// TestMalformedHeaderRoutingPerCallSite in gate_malformed_header_test.go, which
-// enumerates every pinned site by file and line, names the unpinned remainder,
-// and closes against the total. A revert of an unpinned site would not fail the
-// suite today; which sites those are is stated there.
+// ROUTING COVERAGE is partial, and NO CURRENT COUNT IS STATED HERE on purpose -
+// the only numbers below are historical, inside the retraction. The
+// call-site set is DERIVED FROM THE AST and ENFORCED, not asserted in prose:
+// TestSectionHeaderCoverageIsDerivedNotAsserted parses this package, requires
+// pinnedSectionHeaderSites and unpinnedSectionHeaderSites to partition every
+// discovered site exactly, and fails naming any site that is neither. Adding a
+// call site therefore breaks a test rather than quietly outdating a comment. A
+// revert of an unpinned site would still not fail the suite today; which sites
+// those are is listed there, by symbol.
 //
 // Two copies of a number is what produced the original error: this comment said
-// 16 while 15 were pinned, and the count could drift again the moment a pin is
-// added or removed here rather than there (#1795 review N1, and the residual
-// after it). One derivation, everything else points at it.
+// 16 while 15 were pinned (#1795 review N1). Prose could drift silently, which
+// is why the successor is a test and not a better sentence (#1795 review P3-2).
 //
 // A valid header is byte-equivalent to the old behaviour: same trimming, same
 // name. Only the invalid-input path changes.

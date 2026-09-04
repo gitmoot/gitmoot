@@ -137,34 +137,37 @@ func TestWellFormedGateConfigIsUnchanged(t *testing.T) {
 // the malformed line stops being a boundary, the override is misattributed to
 // the still-open section, and the loader returns the override - so a revert at
 // any covered site fails here rather than passing quietly.
-// COVERAGE, STATED AS A COUNT RATHER THAN IMPLIED, and derived here because
-// this is the only place the number is actually computed - the previous
-// decomposition double-counted admission and is what produced section.go's
-// wrong 16 while 15 were pinned (#1795 review N1, P2-1c).
+// COVERAGE IS ENFORCED, NOT COUNTED IN PROSE. The authority for which
+// sectionHeader call sites exist and which are pinned is
+// TestSectionHeaderCoverageIsDerivedNotAsserted in section_coverage_test.go: it
+// derives the set from the AST and requires pinnedSectionHeaderSites and
+// unpinnedSectionHeaderSites to partition it exactly. This block explains the
+// METHOD and groups the pinned sites by how they are proven; it deliberately
+// states no total, because the previous shape kept a count here and another in
+// section.go, they drifted, and that is what produced the wrong 16 while 15
+// were pinned (#1795 review N1, P2-1c, P3-1, P3-2).
 //
-// sectionHeader has 26 call sites across 22 files in this package. PINNED
-// through a production loader, 16 DISTINCT sites:
+// The pinned sites, grouped by the mechanism that proves each one. FILE:LINE
+// citations are ADVISORY and are not enforced: the subtests pin BEHAVIOUR, and
+// enforcing line numbers would fail on any ordinary edit above a call site.
+// The enforced identity is file::function, in section_coverage_test.go.
 //
-//	4 guard loaders, by refusal, in TestGateLoadersRefuseTheirOwnMalformedHeader:
+//	guard loaders, by refusal, in TestGateLoadersRefuseTheirOwnMalformedHeader:
 //	  merge_gate.go:112, admission.go:74, require_workflow.go:71,
 //	  orchestrate.go:625 (via LoadReviewConfig)
-//	8 by routing, here: parallel_sessions.go:46, transcripts.go:50, router.go:46,
+//	by routing, here: parallel_sessions.go:46, transcripts.go:50, router.go:46,
 //	  daemon_runtime.go:99, github_limiter.go:80, remote_exec.go:72,
 //	  credentials.go:52, heartbeats.go:61
-//	4 in TestMalformedHeaderRoutingRemainingLoaders: result_checks.go:59,
+//	in TestMalformedHeaderRoutingRemainingLoaders: result_checks.go:59,
 //	  memory.go:185, runtime_registry.go:61, repo_concurrency.go:56
 //
 // admission appears ONCE, under the guard loaders. Its routing regression is
-// the same call site proven a second way, not a seventeenth site.
+// the same call site proven a second way, not an additional site.
 //
-// NOT PINNED, the remaining 10, named so the next reader does not have to
-// re-derive them: github_remote, implement_base, stale_tasks (3 sites),
-// workflow_lifecycle, orchestrate's LoadOrchestratePolicy and LoadEventsPolicy,
-// org.go's parseOrgContent (which has its own stricter org-shaped refusal), and
-// edit_compat's configSectionAtParseError (a diagnostic, not a loader). Those
-// loaders key off prefixes, repo-scoped names or no fixed section string, so
-// each needs its own observable field; a revert at one of them would NOT fail
-// this test. 16 pinned + 10 unpinned = 26.
+// The unpinned remainder is listed by symbol in unpinnedSectionHeaderSites.
+// Those loaders key off prefixes, repo-scoped names or no fixed section string,
+// so each needs its own observable field; a revert at one of them would NOT
+// fail this test.
 func TestMalformedHeaderRoutingPerCallSite(t *testing.T) {
 	t.Run("parallel_sessions", func(t *testing.T) {
 		paths := writeGateConfig(t, "[parallel_sessions]\nsame_session = \"queue\"\n[parallel_sessions\nsame_session = \"fork_temp_session\"\n")
