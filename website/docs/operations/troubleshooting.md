@@ -133,10 +133,7 @@ gitmoot report bug --job <job-id> --create --yes
 ```
 
 The command prints either `created issue: ...` or `existing issue: ...`; use that
-URL when sharing status. In the interactive dashboard, select a failed, blocked,
-or cancelled job and press `B report bug` to open the same preview, then `g` to
-create or reuse the issue. If creation fails, the preview stays open and shows
-the error inline.
+URL when sharing status.
 
 ## Plugin Doctor Fails
 
@@ -475,25 +472,6 @@ this head` and leaves any real gate verdict untouched. A `blocked` or
 cleared and Gitmoot can still resolve it when the task resumes. A draft pull
 request keeps the marker until it is undrafted.
 
-## Dashboard Blank Or Noninteractive
-
-Symptom: `gitmoot dashboard` does not open the TUI, prints plain output, or
-looks blank under a script/agent.
-
-Likely cause: stdin/stdout is not a TTY, `TERM=dumb`, or TUI was disabled.
-
-Check:
-
-```sh
-gitmoot dashboard --plain
-gitmoot dashboard --json
-gitmoot dashboard --watch
-echo "$TERM"
-```
-
-Fix: run from a real terminal for the interactive TUI, or use `--plain` /
-`--json` in agents, CI, pipes, and redirected output.
-
 ## Live Docs Or LLM Context Stale
 
 Symptom: `gitmoot.io/docs` or `/llms.txt` does not show current source docs.
@@ -648,6 +626,43 @@ export TMPDIR=<seat cache>/tmp GOCACHE=<seat cache>/gocache GOMODCACHE=<seat cac
   toolchain name, and it fails with "toolchain not available".
 - Quote `go version` output in any note making a baseline claim. It is the check
   that works without knowing which binary you got.
+
+### Codex reviews report zero executed checks (`bwrap: setting up uid map`)
+
+A codex read-only seat used to fail EVERY command before running it, so its
+reviews came back static-only with an executed-check count of zero. Codex's own
+sandbox is bwrap, which needs a user namespace that gitmoot's Landlock domain
+denies, so two sandboxes were fighting.
+
+Measured on this box, one command with only the domain differing:
+
+```
+bwrap --dev-bind / / --unshare-user -- /bin/true
+  outside the Landlock domain        -> rc=0
+  inside the domain                  -> rc=1  bwrap: setting up uid map: Permission denied
+  inside + /proc writable            -> rc=1  bwrap: Failed to make / slave
+  inside + /proc + /dev writable     -> rc=1  bwrap: Failed to make / slave
+plain /bin/true inside the domain    -> rc=0
+```
+
+So the domain executes fine and NESTING was the cause; granting more only moved
+the error from the uid map to mount propagation, which is why widening grants
+could not settle it.
+
+A codex seat therefore now runs with its own sandbox OFF and relies on the
+Landlock domain, which is the boundary gitmoot builds and tests. End to end in
+that seat, same grants either way:
+
+- before: `bwrap: setting up uid map: Permission denied`, nothing executed
+- after: `/bin/bash -lc 'echo PROBE_RAN' … succeeded in 0ms: PROBE_RAN`
+- writing outside the granted roots is still refused - `sh: cannot create
+  /root/…: Permission denied`, and no file appears on the host
+
+If a codex seat still reports zero executed checks, the seat's own state
+directory is the usual cause: `CODEX_HOME` must be WRITABLE (it is staged
+inside the seat's cache root). A read-only `CODEX_HOME` fails earlier and
+differently, with `failed to initialize in-process app-server client:
+Permission denied`.
 
 ### A review reporting it could not read prior verdicts
 

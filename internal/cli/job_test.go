@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gitmoot/gitmoot/internal/cockpit"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
@@ -307,7 +306,7 @@ func TestRunJobWatchTranscriptRendersExplicitShellLog(t *testing.T) {
 		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo"}),
 	}, "succeeded")
 	store.Close()
-	logPath := filepath.Join(home, "cockpit shell.log")
+	logPath := filepath.Join(home, "runtime shell.log")
 	if err := os.WriteFile(logPath, []byte("working\ndone without newline"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -395,7 +394,7 @@ func TestRunJobTranscriptRequiresMarkdownAndRetainedLog(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	code := Run([]string{"job", "transcript", "job-no-log", "--home", home, "--export", "md", "--runtime", runtime.ShellRuntime}, &stdout, &stderr)
-	if code != 1 || !strings.Contains(stderr.String(), "cockpit logs may already have been delivered and removed") {
+	if code != 1 || !strings.Contains(stderr.String(), "transcript log unavailable") {
 		t.Fatalf("missing-log code=%d stderr=%q", code, stderr.String())
 	}
 }
@@ -512,7 +511,7 @@ func TestJobWatchTranscriptShellNoLLME2E(t *testing.T) {
 		State:   string(workflow.JobRunning),
 		Payload: mustJobPayload(t, payload),
 	}, "running")
-	logPath := filepath.Join(config.PathsForHome(home).Logs, "jobs", cockpit.SafeLogName("job-shell-e2e")+".log")
+	logPath := filepath.Join(config.PathsForHome(home).Logs, "jobs", transcript.LegacyLogName("job-shell-e2e")+".log")
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
 		t.Fatal(err)
 	}

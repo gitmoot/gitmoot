@@ -11,7 +11,7 @@ import (
 const jobLogHashBytes = 6
 
 // LegacyLogName is the historical lossy job-id slug. It remains exported only
-// for locating cockpit logs written before collision-proof names were added.
+// for locating transcript logs written before collision-proof names were added.
 func LegacyLogName(jobID string) string {
 	key := strings.TrimSpace(jobID)
 	if key == "" {

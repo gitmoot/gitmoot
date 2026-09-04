@@ -108,5 +108,5 @@ silently ignored — always resume on the tree's open PR:
 ```
 
 See the [result contract](../reference/result-contract.md) for the
-`escalate_human` / ask-gate pause semantics, TTLs, and how a paused tree is
-surfaced under the dashboard's Attention page.
+`escalate_human` / ask-gate pause semantics, TTLs, and how a paused tree
+announces itself on the PR.

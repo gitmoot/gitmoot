@@ -61,7 +61,7 @@ gitmoot task list --repo owner/repo
 gitmoot job list
 gitmoot job show <job-id>
 gitmoot job watch <job-id>
-gitmoot job watch <job-id> --transcript   # readable cockpit tee log; falls back to events if unavailable
+gitmoot job watch <job-id> --transcript   # readable tee log of the runtime session; falls back to events if unavailable
 gitmoot job transcript <job-id> --export md|jsonl
 gitmoot job transcript --all --state succeeded,failed --since 720h --export jsonl
 gitmoot job retry <job-id>

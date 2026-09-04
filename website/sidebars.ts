@@ -29,7 +29,6 @@ const sidebars: SidebarsConfig = {
         'workflows/template-capture-workflow',
         'workflows/review-agent-workflow',
         'workflows/coordinator-recipes-workflow',
-        'workflows/cockpit-orchestrate-workflow',
         'workflows/parallel-jobs-workflow',
         'workflows/heartbeat-schedules-workflow',
         'workflows/pipelines-workflow',

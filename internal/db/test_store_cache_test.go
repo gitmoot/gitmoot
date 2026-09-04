@@ -96,6 +96,11 @@ func TestStoreOpenPolicy(t *testing.T) {
 	// store cannot express.
 	realPathTests["TestUpsertTaskWithJobEventUnlessStatesRollsBackTheTaskWhenTheEventFails"] = true
 	realPathTests["TestChatRemovalMigrationDropsTablesAndPendingChatWakes"] = true
+	// #1753's table-drop migration: both arms need a real on-disk database,
+	// because the upgrade arm builds the PREVIOUS release's schema first and
+	// then reopens the same file to run the migration over it.
+	realPathTests["TestCockpitRemovalMigrationOnFreshHome"] = true
+	realPathTests["TestCockpitRemovalMigrationDropsPopulatedTablesOnUpgrade"] = true
 	directOpenFunctions := map[string]bool{
 		"ensureCachedMigratedTestTemplateOnce": true,
 		"openRealTestStore":                    true,

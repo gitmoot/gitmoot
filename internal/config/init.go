@@ -160,15 +160,7 @@ max_temp_sessions_per_agent = 4
 eligible_actions = ["ask", "review", "implement"]
 
 [orchestrate]
-# Render one live herdr pane per delegation subagent when a job opts in with
-# --cockpit. cockpit_mode: on | off | auto (auto gates on herdr reachability).
-# cockpit_max_panes caps concurrent panes (constrained hosts ~4); beyond the cap
-# a job runs status-only with no pane. cockpit_pane_key: job (one pane per job)
-# or seat (reuse one pane per seat). cockpit_session is an optional named session.
-cockpit_mode = "auto"
-cockpit_session = ""
-cockpit_max_panes = 4
-cockpit_pane_key = "job"
+# Escalation handling for a job that opts in with the
 # escalate_human failure_policy (#340): when a delegation pauses awaiting a human,
 # the daemon @-tags escalation_handle (default: the repo owner) in a comment with
 # the resume instructions. escalation_ttl auto-finalizes a never-answered pause

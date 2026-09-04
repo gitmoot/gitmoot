@@ -17,8 +17,8 @@ const orgHerdrUpgradeMessage = "org requires herdr >=0.7.5; upgrade herdr (0.7.0
 var strictSemVerPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`)
 
 // CheckHerdrVersion enforces the org provider's minimum supported Herdr CLI.
-// It does not fall back to cockpit availability: versions 0.7.0-0.7.4 are
-// present but have delivery bugs and therefore fail this required check.
+// A basic reachability probe is insufficient: versions 0.7.0-0.7.4 are present
+// but have delivery bugs and therefore fail this required check.
 func CheckHerdrVersion(ctx context.Context, runner subprocess.Runner, minimum string) Check {
 	check := Check{Name: "herdr", Required: true}
 	if runner == nil {

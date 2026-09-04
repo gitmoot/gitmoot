@@ -106,6 +106,18 @@ kimi -S <session-id> -p '<job-prompt>' --output-format stream-json
 Kimi runs against a logged-in Kimi CLI. Run `kimi login`, then restart the
 Gitmoot daemon so it inherits the session.
 
+Gitmoot does NOT classify kimi auth failures from the child's output (#1857).
+A failed kimi job reports the CLI's own text and exit cause verbatim, with no
+gitmoot-added "authentication required" label — in either direction, so a
+genuine authorization rejection is unlabelled too. Kimi relays its TOOLS'
+output through the same stdout/stderr it reports itself on, and the previous
+substring test ("login", "authenticate", "unauthorized", "authentication")
+therefore labelled a read-only sandbox denial as an auth failure because the
+GitHub CLI printed `To log in, run: gh auth login` inside it, sending the
+operator to re-login a session that was never the problem. Kimi's stream-json
+envelope carries no error or auth field and the adapter sees no exit code, so
+there is nothing of kimi's own to classify from.
+
 omp (oh-my-pi) startup and every later job run the SAME argument vector — one
 builder, so no flag can appear on one path and go missing on the other:
 

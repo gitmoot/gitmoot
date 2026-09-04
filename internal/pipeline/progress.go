@@ -104,9 +104,9 @@ func truncatePipelineProgressLine(value string, limit int) string {
 	return value
 }
 
-// RuntimeOutputWriter is the one runtime-output composition point. Cockpit and
-// progress share one MultiWriter beneath one SyncWriter, so concurrent stdout /
-// stderr copies cannot race either destination.
+// RuntimeOutputWriter is the one runtime-output composition point. Destinations
+// share one MultiWriter beneath one SyncWriter, so concurrent stdout and stderr
+// copies cannot race any destination.
 func RuntimeOutputWriter(writers ...io.Writer) io.Writer {
 	nonNil := make([]io.Writer, 0, len(writers))
 	for _, writer := range writers {

@@ -530,9 +530,9 @@ func runJobWatch(args []string, stdout, stderr io.Writer) int {
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	poll := fs.Duration("poll", time.Second, "poll interval")
 	jsonOutput := fs.Bool("json", false, "print final job and events as JSON")
-	transcriptOutput := fs.Bool("transcript", false, "render the cockpit tee log as a human-readable transcript")
-	logPath := fs.String("log-path", "", "cockpit-internal transcript log path")
-	runtimeName := fs.String("runtime", "", "cockpit-internal transcript runtime")
+	transcriptOutput := fs.Bool("transcript", false, "render the retained runtime log as a human-readable transcript")
+	logPath := fs.String("log-path", "", "transcript log path override")
+	runtimeName := fs.String("runtime", "", "runtime used to render the transcript")
 	jobID, ok := parseSingleJobID(fs, args, stderr, "job watch")
 	if !ok {
 		return parseSingleJobIDExitCode(args)
@@ -672,8 +672,8 @@ func runJobTranscript(args []string, stdout, stderr io.Writer) int {
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	exportFormat := fs.String("export", "", "export format (md or jsonl)")
 	outputPath := fs.String("output", "", "write export to this file instead of stdout")
-	logPathFlag := fs.String("log-path", "", "cockpit-internal transcript log path")
-	runtimeNameFlag := fs.String("runtime", "", "cockpit-internal transcript runtime")
+	logPathFlag := fs.String("log-path", "", "transcript log path override")
+	runtimeNameFlag := fs.String("runtime", "", "runtime used to render the transcript")
 	all := fs.Bool("all", false, "export every job matching the bulk filters")
 	stateFilter := fs.String("state", "", "bulk mode: comma-separated job states")
 	sinceValue := fs.String("since", "", "bulk mode: jobs created within this duration")
@@ -778,7 +778,7 @@ func exportOneJobTranscript(ctx context.Context, store *db.Store, home, jobID, f
 	events, err := readTranscriptEvents(logPath, translator)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("transcript log unavailable at %s (cockpit logs may already have been delivered and removed)", logPath)
+			return fmt.Errorf("transcript log unavailable at %s", logPath)
 		}
 		return err
 	}

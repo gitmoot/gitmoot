@@ -155,9 +155,8 @@ func IsSettledJobState(state string) bool {
 // `blocked` is deliberately EXCLUDED (#632): a blocked job (awaiting a
 // permission/approval or an interactive answer) can be resumed via RetryJob, so
 // it is settled (see IsSettledJobState) but NOT final. Callers that stamp an end
-// time (dashboard EndedAt) or tear down live resources (cockpit root
-// finalization) must use this predicate, never the settled one, or they would
-// prematurely end a job that can still come back to life.
+// time or tear down live resources must use this predicate, never the settled
+// one, or they would prematurely end a job that can still come back to life.
 func IsFinalJobState(state string) bool {
 	switch JobState(state) {
 	case JobSucceeded, JobFailed, JobCancelled:

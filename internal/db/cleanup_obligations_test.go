@@ -138,12 +138,13 @@ func TestMigrationsUpgradeFromPreviousReleasedVersion(t *testing.T) {
 	// The marker names THIS BRANCH's migration, and it has moved six times as main
 	// advanced: the cleanup_obligations rebuild, #1766's SkillOpt/evals teardown,
 	// #1770's Activepieces trigger removal, #1731's escalation_rounds table,
-	// #1754's chat/moot teardown and #1756's preset-delivery removal each joined
-	// the released prefix, leaving #1822's findings ledger appended last. Two
-	// branches cannot both be "last", and the ordering that matters is the one a
-	// deployed database sees, which is why this marker MUST be repointed on every
-	// branch that appends a migration, and why the failure reads as "not appended
-	// last" rather than as a merge conflict.
+	// #1754's chat/moot teardown, #1756's preset-delivery removal and #1753's
+	// cockpit/interactive table drop each joined the released prefix, leaving
+	// #1822's findings ledger appended last. Two branches cannot both be "last",
+	// and the ordering that matters is the one a deployed database sees, which is
+	// why this marker MUST be repointed on every branch that appends a migration,
+	// and why the failure reads as "not appended last" rather than as a merge
+	// conflict.
 	// The marker must name THIS BRANCH'S LAST migration and must be UNIQUE. The
 	// #1850 round 2 F3 fix appends a rebuild of review_finding_observations, so
 	// the bare CREATE string now matches TWO migrations (the original additive one

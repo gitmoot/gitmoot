@@ -143,6 +143,40 @@ func TestPipelineAddListShowEnableDisableRemove(t *testing.T) {
 	}
 }
 
+func TestPipelineDisablePreservesLeadingDelimiter(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	if err := store.CreateOrUpdatePipeline(context.Background(), db.Pipeline{
+		Name:     "--home",
+		SpecYAML: "name: --home\nstages:\n  - {id: run, cmd: echo}\n",
+		Enabled:  true,
+	}); err != nil {
+		t.Fatalf("seed pipeline: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close seed store: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"pipeline", "disable", "--home", home, "--", "--home"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("disable exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+
+	store = openCLIJobStore(t, home)
+	defer store.Close()
+	record, ok, err := store.GetPipeline(context.Background(), "--home")
+	if err != nil {
+		t.Fatalf("get pipeline: %v", err)
+	}
+	if !ok {
+		t.Fatal("pipeline --home disappeared")
+	}
+	if record.Enabled {
+		t.Fatal("pipeline --home remained enabled")
+	}
+}
+
 func TestPipelineDisplayMode(t *testing.T) {
 	t.Parallel()
 	pipelineTriggerSpec := "name: downstream\nrepo: owner/downstream\ntrigger: {kind: pipeline, pipeline: upstream}\nstages:\n  - {id: run, cmd: echo}\n"

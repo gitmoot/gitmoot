@@ -34,7 +34,7 @@ func TestLoadReviewConfigDefaultsNativeFanoutOff(t *testing.T) {
 		t.Fatalf("missing config blocking severity = %q, want %q", cfg.For("owner/repo").BlockingSeverity, reviewseverity.DefaultBlocking)
 	}
 
-	cfg, err = LoadReviewConfig(writeReviewConfig(t, "[orchestrate]\ncockpit_mode = \"off\"\n"))
+	cfg, err = LoadReviewConfig(writeReviewConfig(t, "[orchestrate]\nescalation_handle = \"@owner\"\n"))
 	if err != nil {
 		t.Fatalf("LoadReviewConfig(no section) error: %v", err)
 	}

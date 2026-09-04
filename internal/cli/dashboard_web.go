@@ -269,10 +269,9 @@ func (d *webDataSource) writeDashboardAPIJSON(w http.ResponseWriter, value any, 
 }
 
 // webDataSource implements dashboard.DataSource over a local Gitmoot home. It
-// reuses the existing read paths only — buildDashboardSnapshot for the run list
-// and the same store APIs the dashboard TUI reads (ListJobs / ListJobEvents /
-// GetJob / workflow.ParseJobPayload) — so it never duplicates a store query or
-// touches workflow state.
+// reuses existing read paths, including buildDashboardSnapshot for the run list
+// and store APIs for job and workflow details, so it does not duplicate store
+// queries or mutate workflow state.
 type webDataSource struct {
 	home string
 
@@ -402,7 +401,7 @@ var _ dashboard.ChangeCursorDataSource = (*webDataSource)(nil)
 
 // Runs lists every orchestration run (delegation tree) rooted at an originating
 // job, newest activity first. It reuses buildDashboardSnapshot so the run list
-// is assembled from the same read path the plain/TUI dashboard uses.
+// shares the one-shot dashboard's read path.
 func (d *webDataSource) Runs(ctx context.Context) ([]dashboard.RunSummary, error) {
 	paths, err := initializedPaths(d.home)
 	if err != nil {
@@ -2262,8 +2261,8 @@ func resolveDelegationEdges(job db.Job, payloadByID map[string]workflow.JobPaylo
 	return deps, meta.action
 }
 
-// delegMeta is a delegation's declared action and deps, read off the parent's
-// settled result (the same source buildDelegationTree uses).
+// delegMeta is a delegation's declared action and deps, read from its parent's
+// settled result.
 type delegMeta struct {
 	action string
 	deps   []string
@@ -2330,7 +2329,7 @@ func summarizeRuns(jobs []db.Job) []dashboard.RunSummary {
 		}
 		// A run's "done" count uses FINAL (resumability) semantics: a blocked job is
 		// not counted as done because it can still resume via RetryJob (#632),
-		// keeping the run active — mirroring runStateActive and the cockpit.
+		// keeping the run active and matching runStateActive.
 		if workflow.IsFinalJobState(strings.TrimSpace(j.State)) {
 			a.done++
 		}
@@ -2407,8 +2406,13 @@ const maxRunSummaries = 60
 func runStateActive(state dashboard.NodeState) bool {
 	// Active is the negation of FINAL (resumability) semantics: a blocked run is
 	// still "active" because it can resume via RetryJob (#632). Uses IsFinalJobState
-	// (not IsSettledJobState) so blocked surfaces as live, matching the cockpit.
+	// rather than IsSettledJobState so blocked work remains live.
 	return !workflow.IsFinalJobState(string(state))
+}
+
+// activityJobActive is the web dashboard's liveness predicate for a job row.
+func activityJobActive(state string) bool {
+	return state == "queued" || state == "running"
 }
 
 // mostRecentRunRoot returns the run root to show when no run is requested: the

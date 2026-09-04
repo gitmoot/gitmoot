@@ -764,29 +764,6 @@ resource scheduling rules.
    instances, different runtime references can run concurrently, and
    `gitmoot agent gc` later removes expired idle instances.
 
-## Dashboard Cockpit Smoke Test
-
-Goal: confirm the interactive `gitmoot dashboard` TUI opens, renders its pages,
-and exposes pending prompts for the daemon's work.
-
-```sh
-gitmoot dashboard
-```
-
-Expected signals:
-
-- The cockpit opens with the Attention, Activity, Trains, Agents, Workers,
-  Jobs, Locks, Health, and Config pages.
-- Pending prompts (for example a coordinator awaiting input) appear under the
-  Attention page.
-- Job, lock, agent, and runtime-session state matches the equivalent
-  `gitmoot job list`, `gitmoot lock list`, `gitmoot agent list`, and runtime
-  session views.
-
-> The interactive `gitmoot dashboard` is a TUI cockpit. Its pages are
-> Attention, Activity, Trains, Agents, Workers, Jobs, Locks, Health, and
-> Config; pending prompts live under the Attention page.
-
 ## Recovery Checks
 
 Run these against one smoke job if you need to verify recovery UX:

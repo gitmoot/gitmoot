@@ -80,7 +80,7 @@ type directiveTTLDependencies struct {
 
 func defaultBlockedRoleWakeDependencies() blockedRoleWakeDependencies {
 	return blockedRoleWakeDependencies{
-		availability: cockpit.New(cockpit.Options{HerdrBin: "herdr"}, nil),
+		availability: cockpit.New(cockpit.Options{HerdrBin: "herdr"}),
 		provider:     cockpit.NewHerdrOrgProvider,
 		eventSink:    enabledBlockedSinceEventSink,
 		archiveList:  defaultHerdrAgentList,

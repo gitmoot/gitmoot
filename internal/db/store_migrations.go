@@ -2593,6 +2593,17 @@ DROP TABLE IF EXISTS preset_session_state;
 ALTER TABLE agents DROP COLUMN preset_delivery;
 	`,
 
+	// #1753 deleted the `gitmoot orchestrate --cockpit` pane wrapper and the
+	// `gitmoot interactive` prompt command. Their tables have no remaining reader
+	// or writer, so drop them rather than leaving three orphaned schemas behind.
+	// Dropping a table drops its indexes with it, so
+	// idx_cockpit_panes_job / idx_cockpit_panes_root /
+	// idx_interactive_prompts_state need no separate statement.
+	`
+DROP TABLE IF EXISTS cockpit_panes;
+DROP TABLE IF EXISTS cockpit_workspaces;
+DROP TABLE IF EXISTS interactive_prompts;
+	`,
 	// #1822 findings ledger. One row per (finding, head) OBSERVATION. The key is
 	// (finding_uid, head_sha) so the SAME finding at two heads is two rows and
 	// nothing is ever silently carried; there is deliberately no column meaning

@@ -108,7 +108,7 @@ func TestLoadEventsPolicyDoesNotBleedIntoOrchestrate(t *testing.T) {
 	}
 	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
 [orchestrate]
-cockpit_mode = "on"
+escalation_handle = "@owner"
 max_verify_replan_attempts = 4
 
 [events]
@@ -130,7 +130,7 @@ timeout = "3s"
 	if err != nil {
 		t.Fatalf("LoadOrchestratePolicy returned error: %v", err)
 	}
-	if orch.CockpitMode != CockpitModeOn || orch.MaxVerifyReplanAttempts != 4 {
-		t.Fatalf("orchestrate policy = %+v, want cockpit_mode=on + verify cap=4 from [orchestrate] only", orch)
+	if orch.MaxVerifyReplanAttempts != 4 {
+		t.Fatalf("orchestrate policy = %+v, want verify cap=4 from [orchestrate] only", orch)
 	}
 }

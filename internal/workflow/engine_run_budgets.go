@@ -1058,10 +1058,10 @@ func effectiveDelegationTimeout(d Delegation, defaults DelegationTimeoutDefaults
 // identical, idempotent requests for the same delegation ID.
 func (e Engine) delegationRequest(job db.Job, payload JobPayload, d Delegation) JobRequest {
 	// An ephemeral delegation has no pre-registered agent: synthesize a stable
-	// agent name (carrying the "-ephemeral-" infix the TUI filters on) and thread
-	// the worker spec through so the daemon can materialize the worker and the
-	// engine can skip the registered-agent checks. A non-ephemeral delegation
-	// keeps routing to its named agent unchanged.
+	// agent name carrying the "-ephemeral-" infix used to exclude transient
+	// workers from registry listings, and thread the worker spec through so the
+	// daemon can materialize the worker and the engine can skip registered-agent
+	// checks. A non-ephemeral delegation keeps routing to its named agent unchanged.
 	agent := d.Agent
 	var ephemeral *EphemeralSpec
 	if d.Ephemeral != nil {
@@ -1116,11 +1116,6 @@ func (e Engine) delegationRequest(job db.Job, payload JobPayload, d Delegation) 
 		// how this tree is reviewed, so it belongs to the whole tree, not to the one
 		// job that happened to receive the flag.
 		SkipNativeReviewFanout: payload.SkipNativeReviewFanout,
-		// Cockpit settings are inherited from the coordinator so every delegation
-		// subagent in one tree renders a pane under the same workspace/session.
-		Cockpit:        payload.Cockpit,
-		CockpitSession: payload.CockpitSession,
-		CockpitPaneKey: payload.CockpitPaneKey,
 	}
 }
 

@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -28,29 +27,8 @@ func dashboardTestHome(t *testing.T) string {
 	return home
 }
 
-func seedDashboardPrompt(t *testing.T, home, id, question string, choices []string) {
-	t.Helper()
-	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
-	if err != nil {
-		t.Fatalf("Open returned error: %v", err)
-	}
-	defer store.Close()
-	if err := store.UpsertInteractivePrompt(context.Background(), db.InteractivePrompt{
-		ID:            id,
-		Question:      question,
-		Choices:       choices,
-		Required:      true,
-		AnswerFormat:  "text",
-		SourceCommand: "test",
-	}); err != nil {
-		t.Fatalf("UpsertInteractivePrompt returned error: %v", err)
-	}
-}
-
 func TestDashboardSnapshotRendersSections(t *testing.T) {
 	home := dashboardTestHome(t)
-	seedDashboardPrompt(t, home, "dash.prompt.one", "Pick a value", nil)
-
 	var stdout, stderr bytes.Buffer
 	if code := Run([]string{"dashboard", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("dashboard exit code = %d, stderr=%s", code, stderr.String())
@@ -63,176 +41,9 @@ func TestDashboardSnapshotRendersSections(t *testing.T) {
 		"runtime_sessions: 0",
 		"jobs: 0",
 		"branch_locks: 0",
-		"pending_prompts: 1",
-		"dash.prompt.one\tPick a value",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("dashboard output missing %q:\n%s", want, out)
-		}
-	}
-}
-
-func TestDashboardJSONPromptsMatchInteractiveList(t *testing.T) {
-	home := dashboardTestHome(t)
-	seedDashboardPrompt(t, home, "dash.prompt.alpha", "Alpha?", nil)
-	seedDashboardPrompt(t, home, "dash.prompt.beta", "Beta?", []string{"x", "y"})
-
-	var dashOut, dashErr bytes.Buffer
-	if code := Run([]string{"dashboard", "--home", home, "--json"}, &dashOut, &dashErr); code != 0 {
-		t.Fatalf("dashboard --json exit code = %d, stderr=%s", code, dashErr.String())
-	}
-	var snapshot dashboardSnapshot
-	if err := json.Unmarshal(dashOut.Bytes(), &snapshot); err != nil {
-		t.Fatalf("decode dashboard snapshot: %v\n%s", err, dashOut.String())
-	}
-	dashIDs := map[string]bool{}
-	for _, prompt := range snapshot.PendingPrompts {
-		dashIDs[prompt.ID] = true
-	}
-
-	var listOut, listErr bytes.Buffer
-	if code := Run([]string{"interactive", "list", "--home", home, "--state", "pending", "--json"}, &listOut, &listErr); code != 0 {
-		t.Fatalf("interactive list exit code = %d, stderr=%s", code, listErr.String())
-	}
-	var listPrompts []db.InteractivePrompt
-	if err := json.Unmarshal(listOut.Bytes(), &listPrompts); err != nil {
-		t.Fatalf("decode interactive list: %v\n%s", err, listOut.String())
-	}
-	if len(listPrompts) != len(snapshot.PendingPrompts) {
-		t.Fatalf("dashboard pending prompts (%d) != interactive list (%d)", len(snapshot.PendingPrompts), len(listPrompts))
-	}
-	for _, prompt := range listPrompts {
-		if !dashIDs[prompt.ID] {
-			t.Fatalf("interactive list prompt %q missing from dashboard: %+v", prompt.ID, snapshot.PendingPrompts)
-		}
-	}
-}
-
-func TestDashboardAnswerResolvesPromptThroughSharedAPI(t *testing.T) {
-	home := dashboardTestHome(t)
-	seedDashboardPrompt(t, home, "dash.prompt.answerable", "Choose", []string{"keep", "drop"})
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{"dashboard", "--home", home, "--answer", "dash.prompt.answerable", "--value", "keep", "--source", "test"}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("dashboard --answer exit code = %d, stderr=%s", code, stderr.String())
-	}
-	// The snapshot after answering shows no pending prompts.
-	if !strings.Contains(stdout.String(), "pending_prompts: 0") {
-		t.Fatalf("answered prompt should not remain pending:\n%s", stdout.String())
-	}
-	// The prompt is resolved through the same store API interactive answer uses.
-	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
-	if err != nil {
-		t.Fatalf("Open returned error: %v", err)
-	}
-	defer store.Close()
-	prompt, err := store.GetInteractivePrompt(context.Background(), "dash.prompt.answerable")
-	if err != nil {
-		t.Fatalf("GetInteractivePrompt returned error: %v", err)
-	}
-	if prompt.State != db.InteractivePromptStateResolved || prompt.AnswerValue != "keep" || prompt.AnswerSource != "test" {
-		t.Fatalf("prompt not resolved via shared API: %+v", prompt)
-	}
-}
-
-func TestDashboardAnswerRejectsInvalidChoiceAndKeepsPrompt(t *testing.T) {
-	home := dashboardTestHome(t)
-	seedDashboardPrompt(t, home, "dash.prompt.choice", "Choose", []string{"keep", "drop"})
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{"dashboard", "--home", home, "--answer", "dash.prompt.choice", "--value", "bogus"}, &stdout, &stderr)
-	if code != 1 {
-		t.Fatalf("invalid dashboard answer exit code = %d, want 1; stderr=%s", code, stderr.String())
-	}
-	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
-	if err != nil {
-		t.Fatalf("Open returned error: %v", err)
-	}
-	defer store.Close()
-	prompt, err := store.GetInteractivePrompt(context.Background(), "dash.prompt.choice")
-	if err != nil {
-		t.Fatalf("GetInteractivePrompt returned error: %v", err)
-	}
-	if prompt.State != db.InteractivePromptStatePending {
-		t.Fatalf("invalid answer should leave prompt pending: %+v", prompt)
-	}
-}
-
-func TestDashboardWithoutAnswerDoesNotMutate(t *testing.T) {
-	home := dashboardTestHome(t)
-	seedDashboardPrompt(t, home, "dash.prompt.untouched", "Choose", nil)
-
-	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"dashboard", "--home", home}, &stdout, &stderr); code != 0 {
-		t.Fatalf("dashboard exit code = %d, stderr=%s", code, stderr.String())
-	}
-	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
-	if err != nil {
-		t.Fatalf("Open returned error: %v", err)
-	}
-	defer store.Close()
-	prompt, err := store.GetInteractivePrompt(context.Background(), "dash.prompt.untouched")
-	if err != nil {
-		t.Fatalf("GetInteractivePrompt returned error: %v", err)
-	}
-	if prompt.State != db.InteractivePromptStatePending {
-		t.Fatalf("dashboard without --answer must not resolve prompts: %+v", prompt)
-	}
-}
-
-func TestDashboardDismissDeletesPrompt(t *testing.T) {
-	home := dashboardTestHome(t)
-	seedDashboardPrompt(t, home, "dash.prompt.dismiss", "Choose", nil)
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{"dashboard", "--home", home, "--dismiss", "dash.prompt.dismiss"}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("dashboard --dismiss exit code = %d, stderr=%s", code, stderr.String())
-	}
-	if !strings.Contains(stdout.String(), "pending_prompts: 0") {
-		t.Fatalf("dismissed prompt should not remain pending:\n%s", stdout.String())
-	}
-	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
-	if err != nil {
-		t.Fatalf("Open returned error: %v", err)
-	}
-	defer store.Close()
-	prompts, err := store.ListInteractivePrompts(context.Background(), "")
-	if err != nil {
-		t.Fatalf("ListInteractivePrompts returned error: %v", err)
-	}
-	if len(prompts) != 0 {
-		t.Fatalf("dismiss should delete the prompt entirely: %+v", prompts)
-	}
-}
-
-func TestDashboardDismissMissingPromptFails(t *testing.T) {
-	home := dashboardTestHome(t)
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{"dashboard", "--home", home, "--dismiss", "ghost"}, &stdout, &stderr)
-	if code != 1 || !strings.Contains(stderr.String(), "not found") {
-		t.Fatalf("dashboard --dismiss missing code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
-	}
-}
-
-func TestDashboardAttentionBlock(t *testing.T) {
-	home := dashboardTestHome(t)
-	seedDashboardPrompt(t, home, "attn.prompt", "Pick", nil)
-
-	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"dashboard", "--home", home}, &stdout, &stderr); code != 0 {
-		t.Fatalf("dashboard exit = %d, stderr=%s", code, stderr.String())
-	}
-	out := stdout.String()
-	for _, want := range []string{
-		"needs attention:",
-		"prompt attn.prompt",
-		"gitmoot interactive answer --home " + home + " attn.prompt <value>",
-	} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("attention block missing %q:\n%s", want, out)
 		}
 	}
 }
@@ -241,23 +52,12 @@ func TestDashboardStyledRendering(t *testing.T) {
 	t.Setenv("CLICOLOR_FORCE", "1")
 	t.Setenv("NO_COLOR", "")
 	home := dashboardTestHome(t)
-	seedDashboardPrompt(t, home, "styled.prompt", "Pick", nil)
-
 	var stdout, stderr bytes.Buffer
 	if code := Run([]string{"dashboard", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("dashboard exit = %d, stderr=%s", code, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "\x1b[") {
 		t.Fatalf("expected ANSI styling with CLICOLOR_FORCE:\n%q", stdout.String())
-	}
-}
-
-func TestDashboardAnswerCommand(t *testing.T) {
-	if got := dashboardAnswerCommand("/h", "p1"); got != "gitmoot interactive answer --home /h p1 <value>" {
-		t.Fatalf("with home = %q", got)
-	}
-	if got := dashboardAnswerCommand("", "p1"); got != "gitmoot interactive answer p1 <value>" {
-		t.Fatalf("no home = %q", got)
 	}
 }
 
@@ -314,18 +114,163 @@ func TestDashboardLockStale(t *testing.T) {
 }
 
 func TestDashboardWatchRejectsInvalidCombos(t *testing.T) {
+	// ASSERT THE REASON, NOT ONLY THE CODE. Two of these cases used to pass the
+	// removed --answer/--value/--dismiss flags and "passed" on exit 2 from the
+	// flag parser, never reaching the combination check they were named for
+	// (#1787 review N1). Exit code alone cannot tell those apart, so every case
+	// now names the message it expects.
 	home := dashboardTestHome(t)
-	cases := [][]string{
-		{"dashboard", "--home", home, "--watch", "--json"},
-		{"dashboard", "--home", home, "--watch", "--answer", "p1", "--value", "x"},
-		{"dashboard", "--home", home, "--watch", "--dismiss", "p1"},
-		{"dashboard", "--home", home, "--watch"}, // stdout is a bytes.Buffer, not a terminal
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "watch with json",
+			args: []string{"dashboard", "--home", home, "--watch", "--json"},
+			want: "dashboard --watch cannot be combined with --json",
+		},
+		{
+			name: "watch without a terminal",
+			args: []string{"dashboard", "--home", home, "--watch"},
+			want: "dashboard --watch requires a terminal",
+		},
+
+		{
+			name: "positional argument",
+			args: []string{"dashboard", "--home", home, "extra"},
+			want: "dashboard does not accept positional arguments",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := Run(tc.args, &stdout, &stderr)
+			if code != 2 {
+				t.Fatalf("Run(%v) = %d, want 2; stderr=%s", tc.args, code, stderr.String())
+			}
+			if strings.Contains(stderr.String(), "flag provided but not defined") {
+				t.Fatalf("Run(%v) exited 2 from the FLAG PARSER, not from the check this case names: %s", tc.args, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), tc.want) {
+				t.Fatalf("Run(%v) stderr = %q, want it to contain %q", tc.args, stderr.String(), tc.want)
+			}
+		})
 	}
-	for _, args := range cases {
+}
+
+// The interval guard sits BEHIND the terminal guard, so a bytes.Buffer stdout
+// can never reach it: style.IsTerminal is false for any writer without Stat(),
+// so runDashboard exits at "requires a terminal" first. The previous version of
+// this case lived in the combos table with the loose want "dashboard --watch",
+// which the TERMINAL message also contains - so it passed green while measuring
+// the wrong guard, which is precisely the class that round claimed to close
+// (#1787 review F1).
+//
+// Reaching the interval guard needs a stdout that satisfies IsTerminal. /dev/null
+// is a character device, so it does - the same weakness filed as #1838, used
+// here deliberately and named so nobody reads it as an accident.
+func TestDashboardWatchRejectsANonPositiveInterval(t *testing.T) {
+	home := dashboardTestHome(t)
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devNull.Close()
+	if !style.IsTerminal(devNull) {
+		t.Skip("this host does not report /dev/null as a character device, so the terminal guard cannot be passed here")
+	}
+	original := runDashboardWatchFn
+	t.Cleanup(func() { runDashboardWatchFn = original })
+	started := 0
+	runDashboardWatchFn = func(io.Writer, string, bool, time.Duration) int {
+		started++
+		return 0
+	}
+	var stderr bytes.Buffer
+	code := Run([]string{"dashboard", "--home", home, "--watch", "--interval", "0s"}, devNull, &stderr)
+	if started != 0 {
+		t.Fatal("the watch loop started with a non-positive interval")
+	}
+	if code != 2 {
+		t.Fatalf("Run = %d, want 2; stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "dashboard --interval must be greater than zero") {
+		t.Fatalf("stderr = %q, want the INTERVAL guard's own message: a substring that the terminal message also matches proves nothing", stderr.String())
+	}
+}
+
+// The flags deleted with the TUI must still be REJECTED, and that is a separate
+// property from the combination checks above - conflating them is what let two
+// combination cases pass on a parse error.
+func TestDashboardRejectsFlagsRemovedWithTheTUI(t *testing.T) {
+	home := dashboardTestHome(t)
+	for _, args := range [][]string{
+		{"dashboard", "--home", home, "--answer", "p1", "--value", "x"},
+		{"dashboard", "--home", home, "--dismiss", "p1"},
+		{"dashboard", "--home", home, "--watch", "--answer", "p1"},
+	} {
 		var stdout, stderr bytes.Buffer
 		if code := Run(args, &stdout, &stderr); code != 2 {
-			t.Fatalf("Run(%v) = %d, want 2; stderr=%s", args, code, stderr.String())
+			t.Fatalf("Run(%v) = %d, want 2 for a removed flag; stderr=%s", args, code, stderr.String())
 		}
+		if !strings.Contains(stderr.String(), "flag provided but not defined") {
+			t.Fatalf("Run(%v) stderr = %q, want the parser to reject the removed flag", args, stderr.String())
+		}
+	}
+}
+
+// The --watch terminal guard must be observable WITHOUT running the watch loop.
+// Before the seam, deleting the guard did not fail this suite cleanly: the test
+// reached the blocking loop and the package died on its 10m timeout, naming
+// whichever test the panic landed in (#1787 review N3). Now the guard's absence
+// fails here, in seconds, with the right name on it.
+func TestDashboardWatchNeverStartsWithoutATerminal(t *testing.T) {
+	home := dashboardTestHome(t)
+	original := runDashboardWatchFn
+	t.Cleanup(func() { runDashboardWatchFn = original })
+	started := 0
+	runDashboardWatchFn = func(io.Writer, string, bool, time.Duration) int {
+		started++
+		return 0
+	}
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"dashboard", "--home", home, "--watch"}, &stdout, &stderr)
+	if started != 0 {
+		t.Fatalf("the watch loop STARTED with a non-terminal stdout; on a real run it would block until interrupted")
+	}
+	if code != 2 || !strings.Contains(stderr.String(), "requires a terminal") {
+		t.Fatalf("Run = %d stderr=%q, want exit 2 naming the terminal requirement", code, stderr.String())
+	}
+}
+
+// The --web branch returns BEFORE the one-shot snapshot. A mutant deleting that
+// early return survived the entire package (#1787 review N2), because --web
+// blocks until interrupted and nothing could observe the branch. The seam makes
+// the invariant observable without starting a server.
+func TestDashboardWebReturnsBeforeTheSnapshot(t *testing.T) {
+	home := dashboardTestHome(t)
+	original := runDashboardWebFn
+	t.Cleanup(func() { runDashboardWebFn = original })
+	var calledHome, calledAddr string
+	calls := 0
+	runDashboardWebFn = func(home, addr string, stdout, stderr io.Writer) int {
+		calls++
+		calledHome, calledAddr = home, addr
+		return 7
+	}
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"dashboard", "--home", home, "--web", "--addr", "127.0.0.1:0"}, &stdout, &stderr)
+	if calls != 1 {
+		t.Fatalf("--web took the snapshot path instead of returning early: calls=%d stdout=%q", calls, stdout.String())
+	}
+	if code != 7 {
+		t.Fatalf("Run returned %d, want the web server's own %d: the branch must RETURN, not fall through", code, 7)
+	}
+	if calledHome != home || calledAddr != "127.0.0.1:0" {
+		t.Fatalf("web server received home=%q addr=%q, want %q and 127.0.0.1:0", calledHome, calledAddr, home)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("the one-shot snapshot ran anyway and wrote %d bytes", stdout.Len())
 	}
 }
 

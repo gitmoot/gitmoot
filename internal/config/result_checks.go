@@ -82,7 +82,7 @@ func LoadResultChecksMode(paths Paths) (ResultChecksMode, error) {
 // ParseResultChecksMode validates and normalizes a result_checks value. It
 // accepts both the bare (result_checks = off) and quoted (result_checks = "off")
 // TOML styles — the docs and the default-config writer use the quoted form, which
-// matches the sibling cockpit_mode/daemon-runtime convention (see
+// matches the sibling escalation_handle/daemon-runtime convention (see
 // parseConfigDuration) — so a quoted value is unquoted before matching. The empty
 // string falls back to the default (warn) so an operator can clear the key; any
 // other unrecognized value is an error.

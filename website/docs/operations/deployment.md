@@ -28,7 +28,7 @@ Smoke checks:
 
 ```sh
 curl -fsS https://gitmoot.io/docs/intro >/dev/null
-curl -fsS https://gitmoot.io/docs/reference/cli | rg 'gitmoot dashboard|agent run|interactive'
+curl -fsS https://gitmoot.io/docs/reference/cli | rg 'gitmoot dashboard|agent run'
 curl -fsS https://gitmoot.io/docs/release-notes/v0.3.0-beta.1 | rg 'v0.3.0-beta.1|dashboard'
 curl -fsS https://gitmoot.io/llms.txt | rg 'Dashboard|Release Notes'
 curl -fsS https://gitmoot.io/llms-full.txt | rg 'CLI.md|release-notes'

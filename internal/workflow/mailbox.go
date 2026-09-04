@@ -321,9 +321,6 @@ type JobRequest struct {
 	// leaves ordinary and root shell jobs byte-identical.
 	ShellUpstreamContext   string
 	Phase                  string
-	Cockpit                bool
-	CockpitSession         string
-	CockpitPaneKey         string
 	SkipNativeReviewFanout bool
 	ValidatedPullRequest   bool
 	Ephemeral              *EphemeralSpec
@@ -472,9 +469,6 @@ type JobPayload struct {
 	PipelineEnv            map[string]string   `json:"pipeline_env,omitempty"`
 	ShellUpstreamContext   string              `json:"shell_upstream_context,omitempty"`
 	Phase                  string              `json:"phase,omitempty"`
-	Cockpit                bool                `json:"cockpit,omitempty"`
-	CockpitSession         string              `json:"cockpit_session,omitempty"`
-	CockpitPaneKey         string              `json:"cockpit_pane_key,omitempty"`
 	SkipNativeReviewFanout bool                `json:"skip_native_review_fanout,omitempty"`
 	ValidatedPullRequest   bool                `json:"validated_pull_request,omitempty"`
 	Ephemeral              *EphemeralSpec      `json:"ephemeral,omitempty"`
@@ -705,9 +699,6 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		PipelineEnv:            request.PipelineEnv,
 		ShellUpstreamContext:   request.ShellUpstreamContext,
 		Phase:                  request.Phase,
-		Cockpit:                request.Cockpit,
-		CockpitSession:         strings.TrimSpace(request.CockpitSession),
-		CockpitPaneKey:         strings.TrimSpace(request.CockpitPaneKey),
 		SkipNativeReviewFanout: skipNativeReviewFanout,
 		ValidatedPullRequest:   request.ValidatedPullRequest,
 		Ephemeral:              request.Ephemeral,

@@ -2086,66 +2086,6 @@ func (f *fakeDelivery) Deliver(_ context.Context, agent runtime.Agent, job runti
 	return result, nil
 }
 
-func TestMailboxEnqueuePersistsCockpitFields(t *testing.T) {
-	ctx := context.Background()
-	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
-
-	if _, err := mailbox.Enqueue(ctx, JobRequest{
-		ID:             "job-cockpit",
-		Agent:          "audit",
-		Action:         "ask",
-		Repo:           "gitmoot/gitmoot",
-		Branch:         "task-005",
-		Sender:         "local",
-		Cockpit:        true,
-		CockpitSession: "  review-room  ",
-		CockpitPaneKey: "  seat-1  ",
-	}); err != nil {
-		t.Fatalf("Enqueue returned error: %v", err)
-	}
-	stored, err := store.GetJob(ctx, "job-cockpit")
-	if err != nil {
-		t.Fatalf("GetJob returned error: %v", err)
-	}
-	payload, err := unmarshalPayload(stored.Payload)
-	if err != nil {
-		t.Fatalf("unmarshalPayload returned error: %v", err)
-	}
-	if !payload.Cockpit {
-		t.Fatalf("payload.Cockpit = false, want true")
-	}
-	// CockpitSession/CockpitPaneKey are trimmed on enqueue.
-	if payload.CockpitSession != "review-room" {
-		t.Fatalf("payload.CockpitSession = %q, want %q", payload.CockpitSession, "review-room")
-	}
-	if payload.CockpitPaneKey != "seat-1" {
-		t.Fatalf("payload.CockpitPaneKey = %q, want %q", payload.CockpitPaneKey, "seat-1")
-	}
-}
-
-func TestJobPayloadCockpitRoundTrip(t *testing.T) {
-	encoded, err := marshalPayload(JobPayload{Cockpit: true, CockpitSession: "room", CockpitPaneKey: "job"})
-	if err != nil {
-		t.Fatalf("marshalPayload: %v", err)
-	}
-	got, err := unmarshalPayload(encoded)
-	if err != nil {
-		t.Fatalf("unmarshalPayload: %v", err)
-	}
-	if !got.Cockpit || got.CockpitSession != "room" || got.CockpitPaneKey != "job" {
-		t.Fatalf("round-trip wrong: %+v", got)
-	}
-	// Cockpit defaults are omitempty: a zero payload encodes without the keys.
-	zero, err := marshalPayload(JobPayload{})
-	if err != nil {
-		t.Fatalf("marshalPayload zero: %v", err)
-	}
-	if strings.Contains(zero, "cockpit") {
-		t.Fatalf("zero payload should omit cockpit keys: %s", zero)
-	}
-}
-
 func TestParseJobPayloadExported(t *testing.T) {
 	encoded, err := marshalPayload(JobPayload{Repo: "o/r", PullRequest: 7, Instructions: "do it", Result: &AgentResult{Decision: "approved", Summary: "done"}})
 	if err != nil {
@@ -2161,5 +2101,44 @@ func TestParseJobPayloadExported(t *testing.T) {
 	// Empty/malformed input errors (caller treats as no detail).
 	if _, err := ParseJobPayload(""); err == nil {
 		t.Fatal("empty payload should error")
+	}
+}
+
+// #1753 deleted the cockpit pane wrapper and its three JobPayload fields, but
+// every job row enqueued before that still carries "cockpit", "cockpit_session"
+// and "cockpit_pane_key" in its persisted JSON. Decoding one must keep working:
+// the daemon reads old rows on recovery, and a decode error there would fail the
+// job rather than ignore a retired key.
+func TestUnmarshalPayloadIgnoresRetiredCockpitKeys(t *testing.T) {
+	legacy := `{"repo":"gitmoot/gitmoot","pull_request":7,"instructions":"do it","cockpit":true,"cockpit_session":"review-room","cockpit_pane_key":"seat"}`
+	payload, err := unmarshalPayload(legacy)
+	if err != nil {
+		t.Fatalf("a payload carrying retired cockpit keys must decode: %v", err)
+	}
+	if payload.Repo != "gitmoot/gitmoot" || payload.PullRequest != 7 || payload.Instructions != "do it" {
+		t.Fatalf("surviving fields lost: %+v", payload)
+	}
+	// JobPayload deliberately round-trips keys it does not know
+	// (unknownJSONFields, job_payload_json.go), so re-encoding PRESERVES the
+	// retired keys rather than silently rewriting a stored row. Pin that: the
+	// alternative — dropping them on the first re-encode — would rewrite history
+	// on every payload the daemon touches.
+	encoded, err := marshalPayload(payload)
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	for _, key := range []string{`"cockpit":true`, `"cockpit_session":"review-room"`, `"cockpit_pane_key":"seat"`} {
+		if !strings.Contains(encoded, key) {
+			t.Fatalf("re-encoded payload dropped %s: %s", key, encoded)
+		}
+	}
+
+	// A payload written TODAY carries none of them.
+	fresh, err := marshalPayload(JobPayload{Repo: "gitmoot/gitmoot"})
+	if err != nil {
+		t.Fatalf("marshalPayload fresh: %v", err)
+	}
+	if strings.Contains(fresh, "cockpit") {
+		t.Fatalf("a freshly built payload still emits a cockpit key: %s", fresh)
 	}
 }

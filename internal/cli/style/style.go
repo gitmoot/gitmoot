@@ -14,13 +14,12 @@ import (
 )
 
 const (
-	ansiReset  = "\x1b[0m"
-	ansiBold   = "\x1b[1m"
-	ansiDim    = "\x1b[2m"
-	ansiRed    = "\x1b[31m"
-	ansiGreen  = "\x1b[32m"
-	ansiYellow = "\x1b[33m"
-	ansiCyan   = "\x1b[36m"
+	ansiReset = "\x1b[0m"
+	ansiBold  = "\x1b[1m"
+	ansiDim   = "\x1b[2m"
+	ansiRed   = "\x1b[31m"
+	ansiGreen = "\x1b[32m"
+	ansiCyan  = "\x1b[36m"
 )
 
 // Style applies terminal styling when enabled. The zero value is a disabled
@@ -50,9 +49,6 @@ func (s Style) Red(text string) string { return s.wrap(ansiRed, text) }
 
 // Green returns text wrapped in green when styling is enabled.
 func (s Style) Green(text string) string { return s.wrap(ansiGreen, text) }
-
-// Yellow returns text wrapped in yellow when styling is enabled.
-func (s Style) Yellow(text string) string { return s.wrap(ansiYellow, text) }
 
 // Cyan returns text wrapped in cyan when styling is enabled.
 func (s Style) Cyan(text string) string { return s.wrap(ansiCyan, text) }

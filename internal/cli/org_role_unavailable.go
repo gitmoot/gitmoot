@@ -17,7 +17,7 @@ import (
 const orgRoleUnavailableReasonQuota = "quota"
 
 var newQuotaRoleUnavailableWakeClient = func() eventWakeClient {
-	return cockpit.New(cockpit.Options{HerdrBin: "herdr"}, nil)
+	return cockpit.New(cockpit.Options{HerdrBin: "herdr"})
 }
 
 type quotaRoleUnavailableHooks struct {

@@ -26,6 +26,14 @@ agent template and rendered job prompt before handing work to an adapter.
   the limit. Normal-size prompts are passed verbatim as before, unchanged. (The
   Claude and Codex adapters pass the prompt as an argv argument too, but their
   CLIs can also read it from stdin, so they have a native escape hatch.)
+  **Auth failures are not classified from output (#1857):** a failed kimi job
+  reports the CLI's own text and exit cause verbatim, with no gitmoot-added
+  "authentication required" label, and a genuine authorization rejection is
+  unlabelled too. Kimi relays its tools' output through the same streams it
+  reports itself on, so the previous substring test labelled a read-only
+  sandbox denial as an auth failure when the GitHub CLI printed `To log in,
+  run: gh auth login` inside it. Kimi's stream-json envelope carries no error
+  or auth field, so there is nothing of kimi's own to classify from.
 - **omp** is the oh-my-pi CLI (v17.2.4), a multi-provider *routing harness*
   rather than one vendor's CLI. Select it with `gitmoot agent start <name>
   --runtime omp`. It advertises `review`, `implement`, and `ask` — **not**
