@@ -391,7 +391,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		return nil
 	}
 	if readOnlyImplementationBlocked(job.Type, agent) {
-		transitioned, err := markJobPermissionBlocked(ctx, w.Store, job)
+		transitioned, blockedFrom, err := markJobPermissionBlocked(ctx, w.Store, job)
 		if err != nil {
 			return err
 		}
@@ -416,10 +416,19 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		// BEFORE finishQueuedJob, via markJobPermissionBlocked (a direct transition)
 		// — and blockTaskForPermissionBlockedJob only blocks the task, it never
 		// advances the parent DAG. So without this the parent strands exactly like
-		// #409. Route the delegation child through the SAME finalize helper so its
-		// failure_policy fires. Gated strictly on a delegation child (ParentJobID set,
-		// Result nil), so a NON-delegation permission-blocked job is byte-identical.
-		if err := w.finalizePreflightDelegationChild(ctx, job.ID, errors.New(agentPermissionBlockedMessage)); err != nil {
+		// #409. Route the delegation child through the finalize helper its MATCHED
+		// SOURCE STATE selects, so its failure_policy fires with a truthful cause.
+		// The admitted row cannot be that witness: queued→running does not bump the
+		// generation this CAS is anchored to, so a concurrent claim makes the
+		// JobRunning arm match and a label keyed on the handed-in row would call a
+		// child that DID run "refused before it ran" (#1852). Gated strictly on a
+		// delegation child (ParentJobID set, Result nil), so a NON-delegation
+		// permission-blocked job is byte-identical.
+		finalize, finalizeErr := w.permissionBlockFinalizerFor(blockedFrom)
+		if finalizeErr != nil {
+			return finalizeErr
+		}
+		if err := finalize(ctx, job.ID, errors.New(agentPermissionBlockedMessage)); err != nil {
 			return err
 		}
 		return nil
@@ -751,7 +760,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			}
 		}
 	}
-	adapter, narrowingDropped, err := wrapReadOnlySandboxAdapter(w.ConfigHome, agent, deliveryCheckout, adapter)
+	adapter, narrowingDropped, err := wrapReadOnlySandboxAdapter(w.ConfigHome, agent, deliveryCheckout, payload.Repo, adapter)
 	if len(narrowingDropped) > 0 {
 		// Narrowing is not silent: a reviewer whose MCP tool is missing, or a
 		// seat that cannot authenticate to a provider whose key was withheld,
@@ -1446,6 +1455,10 @@ type readOnlySandboxGrants struct {
 	env       []string
 	cacheRoot string
 	stateDir  string
+	// evidenceFile is the rendered, repo-scoped list of prior verdicts, or ""
+	// when none could be staged. It is inside cacheRoot, so it needs no grant
+	// of its own.
+	evidenceFile string
 }
 
 type readOnlyRuntimeAdapter struct {
@@ -1476,12 +1489,16 @@ func (a readOnlyRuntimeAdapter) cleanup() error {
 	return nil
 }
 
-func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout string, adapter workflow.DeliveryAdapter) (workflow.DeliveryAdapter, []string, error) {
+// reviewRepo is the repo of the JOB being run, which is what the seat's
+// evidence must be scoped to. It is distinct from agent.RepoScope: a seat's
+// registered scope is an authorisation boundary, not a statement about the job
+// in hand, and nothing in the tree makes the two agree.
+func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout string, reviewRepo string, adapter workflow.DeliveryAdapter) (workflow.DeliveryAdapter, []string, error) {
 	if !agent.ReadOnlySeat {
 		return adapter, nil, nil
 	}
 	_, gatewayMode := adapter.(modelGatewayRuntimeAdapter)
-	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, gatewayMode)
+	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, reviewRepo, gatewayMode)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1676,7 +1693,151 @@ func selectedRuntimeConfigDir(runtimeName string) string {
 	}
 }
 
-func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout string, gatewayMode bool) (readOnlySandboxGrants, error) {
+// stagePriorVerdicts writes the read-only seat a RENDERED, REPO-SCOPED list of
+// the prior review verdicts it needs, inside its own cache root.
+//
+// #1839 rounds 2-3. The first attempt granted the live database as read-only
+// files, which was INERT: SQLite opens the -wal and -shm sidecars
+// O_RDWR|O_CREAT and a read-file grant refuses both, so the open failed before
+// a verdict was read. The second attempt staged a VACUUM INTO snapshot of the
+// WHOLE store, which worked and was far too wide - every repo's jobs, prompts
+// and results, plus resource_locks.owner_token and task_state_claims.token,
+// handed to an untrusted runtime that forwards what it reads to a third-party
+// model API. For a daemon managing several repos that is cross-repo disclosure.
+//
+// A RENDERED artifact fixes both at once and deletes four other defects rather
+// than patching them: there is no database to open, so no sidecar problem and
+// no staleness ambiguity (the file states its own as-of time); it carries only
+// the verdict fields a reviewer needs, so tokens, memories and org state are
+// structurally absent rather than merely unmentioned; and nothing has to teach
+// the CLI to read an alternate home, so no write path can be redirected into a
+// throwaway copy.
+//
+// A failure here is NEVER fatal: the seat loses evidence and says so through
+// the returned diagnostic.
+func stagePriorVerdicts(ctx context.Context, paths config.Paths, cacheRoot string, reviewRepo string) (string, string) {
+	if strings.TrimSpace(paths.Database) == "" || strings.TrimSpace(cacheRoot) == "" {
+		return "", ""
+	}
+	switch info, err := os.Stat(paths.Database); {
+	case err != nil && os.IsNotExist(err):
+		// No store yet is the normal case on a fresh home, not a defect, and
+		// it is the ONLY error that may pass silently.
+		return "", ""
+	case err != nil:
+		// Everything else - EACCES, ENOTDIR, EIO, a dangling symlink - used to
+		// return silently here and read as "fresh home", so the seat reviewed
+		// with no prior verdicts and the operator saw no diagnostic. That is
+		// the silent degradation this function exists to remove.
+		return "", fmt.Sprintf("workflow evidence: stat store %s: %v", paths.Database, err)
+	case info.IsDir():
+		return "", fmt.Sprintf("workflow evidence: store path %s is a directory", paths.Database)
+	}
+	repo := strings.TrimSpace(reviewRepo)
+	if repo == "" || strings.Contains(repo, "*") {
+		// Without the repo of the job in hand there is nothing to scope TO,
+		// and an unscoped copy is the defect this function exists to remove.
+		//
+		// The key is deliberately the REVIEWED repo and not agent.RepoScope. A
+		// seat's registered scope is an authorisation boundary - it may be a
+		// wildcard, and nothing in the tree makes it agree with a job's repo -
+		// so keying on it could hand a seat a different repo's verdicts than
+		// the one it is reviewing while the artifact claimed otherwise.
+		return "", "workflow evidence: no repo under review, so no prior-verdict list was staged"
+	}
+	store, err := db.OpenReadOnly(paths.Database)
+	if err != nil {
+		return "", fmt.Sprintf("workflow evidence: open store read-only: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+	jobs, err := store.ListJobsByRepo(ctx, repo)
+	if err != nil {
+		return "", fmt.Sprintf("workflow evidence: list prior verdicts: %v", err)
+	}
+	rendered := renderPriorVerdicts(repo, jobs)
+	body, err := json.MarshalIndent(rendered, "", "  ")
+	if err != nil {
+		return "", fmt.Sprintf("workflow evidence: render prior verdicts: %v", err)
+	}
+	dir := filepath.Join(cacheRoot, "evidence")
+	// The daemon owns this root and has just re-created it, so a leftover from
+	// a job whose cleanup never ran must not make THIS seat evidence-less -
+	// that was a real defect: the destination-exists refusal turned a crashed
+	// predecessor into a silently unreviewed head.
+	if err := os.RemoveAll(dir); err != nil {
+		return "", fmt.Sprintf("workflow evidence: clear %s: %v", dir, err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Sprintf("workflow evidence: create %s: %v", dir, err)
+	}
+	file := filepath.Join(dir, "prior-verdicts.json")
+	if err := os.WriteFile(file, append(body, '\n'), 0o600); err != nil {
+		return "", fmt.Sprintf("workflow evidence: write %s: %v", file, err)
+	}
+	return file, ""
+}
+
+// priorVerdictList is the rendered artifact's shape. It states its own scope
+// and as-of time, because a reader who cannot tell a frozen list from a live
+// query is the failure mode this whole change is about.
+type priorVerdictList struct {
+	Repo     string         `json:"repo"`
+	AsOf     string         `json:"as_of"`
+	Note     string         `json:"note"`
+	Verdicts []priorVerdict `json:"verdicts"`
+}
+
+// priorVerdict carries only what a reviewer needs to enumerate what came
+// before: who decided what, at which head, on what evidence.
+type priorVerdict struct {
+	JobID       string `json:"job_id"`
+	Agent       string `json:"agent"`
+	PullRequest int    `json:"pull_request,omitempty"`
+	HeadSHA     string `json:"head_sha,omitempty"`
+	Decision    string `json:"decision,omitempty"`
+	Severity    string `json:"severity,omitempty"`
+	Evidence    string `json:"evidence,omitempty"`
+	Findings    int    `json:"findings"`
+	Summary     string `json:"summary,omitempty"`
+}
+
+// renderPriorVerdicts projects review jobs onto the artifact. Anything not
+// named here is structurally absent from what the seat can read.
+func renderPriorVerdicts(repo string, jobs []db.Job) priorVerdictList {
+	list := priorVerdictList{
+		Repo: repo,
+		AsOf: time.Now().UTC().Format(time.RFC3339),
+		Note: "Frozen at as_of, scoped to the repo of the job under review, rendered from the workflow store. " +
+			"Not a live query: a verdict recorded after as_of is absent rather than missing.",
+		Verdicts: []priorVerdict{},
+	}
+	for _, job := range jobs {
+		if strings.TrimSpace(job.Type) != "review" {
+			continue
+		}
+		var payload workflow.JobPayload
+		if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
+			continue
+		}
+		if payload.Result == nil {
+			continue
+		}
+		list.Verdicts = append(list.Verdicts, priorVerdict{
+			JobID:       job.ID,
+			Agent:       job.Agent,
+			PullRequest: payload.PullRequest,
+			HeadSHA:     payload.HeadSHA,
+			Decision:    payload.Result.Decision,
+			Severity:    payload.Result.Severity,
+			Evidence:    payload.Result.Evidence,
+			Findings:    len(payload.Result.Findings),
+			Summary:     payload.Result.Summary,
+		})
+	}
+	return list
+}
+
+func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout string, reviewRepo string, gatewayMode bool) (readOnlySandboxGrants, error) {
 	var grants readOnlySandboxGrants
 	paths, err := pathsFromFlag(home)
 	if err != nil {
@@ -1707,6 +1868,21 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	grants.stateDir = stateDir
 	grants.env = append(grants.env, stateEnv...)
 	grants.dropped = dropped
+	// BOUNDED, because a read on the worker path must not be able to hang seat
+	// setup: the previous form copied the entire database under a hardcoded
+	// context.Background() with no deadline and no cancellation. Rendering a
+	// repo-scoped list is a bounded read of its own, and this makes the bound
+	// explicit rather than incidental.
+	evidenceCtx, cancelEvidence := context.WithTimeout(context.Background(), 30*time.Second)
+	evidenceFile, evidenceDiagnostic := stagePriorVerdicts(evidenceCtx, paths, grants.cacheRoot, reviewRepo)
+	cancelEvidence()
+	if evidenceFile != "" {
+		grants.evidenceFile = evidenceFile
+		grants.env = append(grants.env, "GITMOOT_PRIOR_VERDICTS="+evidenceFile)
+	}
+	if evidenceDiagnostic != "" {
+		grants.dropped = append(grants.dropped, evidenceDiagnostic)
+	}
 
 	tempDir := filepath.Join(grants.cacheRoot, "tmp")
 	grants.env = append(grants.env,
@@ -3206,7 +3382,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		// ordinary temp worker (it returns the adapter unchanged unless
 		// ReadOnlySeat is set), so this cannot affect the common path.
 		var forkDropped []string
-		adapter, forkDropped, err = wrapReadOnlySandboxAdapter(w.ConfigHome, started.Agent, checkout, adapter)
+		adapter, forkDropped, err = wrapReadOnlySandboxAdapter(w.ConfigHome, started.Agent, checkout, payload.Repo, adapter)
 		if len(forkDropped) > 0 {
 			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "read_only_seat_config_narrowed", Message: "withheld from the seat's staged config: " + strings.Join(forkDropped, ", ")}); eventErr != nil {
 				return eventErr

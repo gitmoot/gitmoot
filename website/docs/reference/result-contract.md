@@ -42,6 +42,49 @@ The `decision` field reports the outcome of the job:
   stage state, not the separate skipped state used for downstream stages that
   never ran.
 
+## Review evidence: executed or static-only
+
+Review results carry a top-level `"evidence"` field with one of two values:
+
+- `"executed"` — you ran the commands you cite and read their real output.
+- `"static_only"` — you read code, diffs or prior verdicts and could not run
+  anything (no usable toolchain, no network, a sandbox refusal).
+
+Declare it on every review. Say `"executed"` only for commands you actually
+ran. **Never infer test success, or failure, from an inability to execute** —
+"the tests presumably still pass" is not evidence, and neither is a red result
+that came from a broken instrument rather than the code.
+
+A static-only review is a legitimate verdict: an honest one that names what it
+inspected and says plainly that it could not execute is more useful than a
+verdict that pretends. A MISLABELLED one is not, because a merge decision
+cannot tell the difference afterwards.
+
+Omitting the field records `static_only`. Silence never becomes an execution
+claim, so a producer that does not know about this field cannot be read as
+having run anything. An unrecognised value is rejected outright.
+
+**No check fails a static-only review.** The distinction a merge decision needs
+is carried by the stored field, not by refusing the verdict. An earlier version
+of this feature failed every static-only review, which under
+`result_checks = block` does not warn but KILLS the job - so an honest reviewer
+that could not execute would have been discarded instead of read.
+
+Two result checks consume this field:
+
+- `review-verdict-has-evidence` - does the verdict account for itself at all?
+- `review-executed-claim-is-substantiated` - if it claims `executed`, does it
+  name something it actually ran? Declaring `static_only` always passes; a bare
+  "everything looks fine" beside `executed` does not.
+
+## Rollout ordering for the evidence field
+
+Upgrade PARSERS before EMITTERS. A daemon older than this change rejects
+unknown result fields outright, so a result carrying `evidence` produced against
+a newer prompt fails on an older daemon. Absence is always accepted and recorded
+as `static_only`, so the reverse direction - a newer daemon reading an older
+producer's result - is safe.
+
 ## Review severity
 
 Review results may add a top-level `"severity": "P0"` field. A
