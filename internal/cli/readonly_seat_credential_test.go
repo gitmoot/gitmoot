@@ -1,14 +1,20 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 func writeClaudeCredential(t *testing.T, dir string, expiresAtMillis int64, refreshToken string) {
@@ -650,5 +656,225 @@ func writeProfileFile(t *testing.T, dir, name, body string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// FAIL-OPEN is the property that keeps a broken probe from stranding every seat
+// job, and round 3 of the #1810 review showed it unpinned: a mutant flipping all
+// six early returns to authProbeInvalid survived the whole scoped suite. A probe
+// that cannot decide must release the job, never hold it.
+func TestSeatAuthProbeFailsOpenOnEveryUndecidableOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"binary missing", exec.ErrNotFound},
+		{"probe timed out", context.DeadlineExceeded},
+		{"empty stdout", errors.New("claude auth probe produced no output")},
+		{"unparseable output", errors.New("invalid character 'x' looking for beginning of value")},
+		{"sandbox denied the probe", errors.New("fork/exec: permission denied")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			configured := t.TempDir()
+			writeClaudeCredential(t, configured, time.Now().Add(time.Hour).UnixMilli(), "refresh")
+			t.Setenv("CLAUDE_CONFIG_DIR", configured)
+			original := claudeAuthLiveCheck
+			t.Cleanup(func() { claudeAuthLiveCheck = original })
+			claudeAuthLiveCheck = func(context.Context, subprocess.Runner, string, []string) error {
+				return tc.err
+			}
+			worker := jobWorker{ConfigHome: home}
+			verdict := worker.probeReadOnlySeatClaudeAuth(context.Background(),
+				runtime.Agent{Name: "reviewer", Runtime: runtime.ClaudeRuntime},
+				workflow.JobPayload{RuntimeConfigDir: configured})
+			if verdict != authProbeUnknown {
+				t.Fatalf("verdict = %v, want authProbeUnknown: an undecidable probe must not hold the job", verdict)
+			}
+			if verdict == authProbeInvalid {
+				t.Fatalf("verdict = authProbeInvalid; an undecidable probe would hold the job and strand every seat run")
+			}
+		})
+	}
+}
+
+// The overlay is claude-only BY POLICY, not by "codex happens to be excluded".
+// Round 3 measured a mutant widening it to kimi surviving, because the test
+// named codex instead of enumerating the runtimes.
+func TestSeatRuntimeAuthOverlayIsClaudeOnlyAcrossEverySupportedRuntime(t *testing.T) {
+	home := t.TempDir()
+	configured := t.TempDir()
+	writeClaudeCredential(t, configured, time.Now().Add(time.Hour).UnixMilli(), "refresh")
+	t.Setenv("CLAUDE_CONFIG_DIR", configured)
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "seat-overlay-token")
+	supported := runtime.SupportedRuntimes()
+	if len(supported) < 2 {
+		t.Fatalf("SupportedRuntimes() = %v, expected the full runtime set", supported)
+	}
+	sawClaude := false
+	for _, name := range supported {
+		env, err := readOnlySeatRuntimeAuthEnv(home, name, false)
+		if err != nil {
+			t.Fatalf("readOnlySeatRuntimeAuthEnv(%s): %v", name, err)
+		}
+		if name == runtime.ClaudeRuntime {
+			sawClaude = true
+			if len(env) == 0 {
+				t.Fatalf("claude lost its runtime-auth overlay: %v", env)
+			}
+			continue
+		}
+		if len(env) != 0 {
+			t.Fatalf("runtime %q received a claude overlay (%d entries): the overlay is claude-only by policy", name, len(env))
+		}
+	}
+	if !sawClaude {
+		t.Fatalf("SupportedRuntimes() = %v, missing claude; the policy assertion measured nothing", supported)
+	}
+	// Gateway mode withholds it from claude too.
+	gatewayEnv, err := readOnlySeatRuntimeAuthEnv(home, runtime.ClaudeRuntime, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gatewayEnv) != 0 {
+		t.Fatalf("gateway-mode claude seat received an overlay: %v", redactEnvNames(gatewayEnv))
+	}
+}
+
+// Round 3 of the #1810 review reproduced BOTH directions of dishonesty in the
+// operator-facing checks: a false RED in gateway mode and with a live overlay,
+// where every seat job succeeds, and a hard exit driven by a file read that
+// cannot see the per-job override which actually decides the seat's source.
+func TestSeatCredentialDoctorCheckReservesTheHardFailForWhatItProves(t *testing.T) {
+	dead := time.Now().Add(-24 * time.Hour).UnixMilli()
+	for _, tc := range []struct {
+		name         string
+		gateway      bool
+		overlayToken string
+		wantOK       bool
+		wantRequired bool
+		wantDetail   string
+	}{
+		{name: "gateway mode asserts nothing", gateway: true, wantOK: true, wantRequired: false, wantDetail: "model gateway"},
+		{name: "overlay present is untidy not broken", overlayToken: "live-overlay-token", wantOK: false, wantRequired: false, wantDetail: "overlay is present"},
+		{name: "no gateway no overlay is the proven failure", wantOK: false, wantRequired: true, wantDetail: "UNUSABLE"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			paths := seatDoctorTestPaths(t, home, tc.gateway)
+			configured := t.TempDir()
+			writeClaudeCredential(t, configured, dead, "")
+			t.Setenv("CLAUDE_CONFIG_DIR", configured)
+			t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", tc.overlayToken)
+			check, ok := seatCredentialDoctorCheck(paths)
+			if !ok {
+				t.Fatal("seatCredentialDoctorCheck declined to report")
+			}
+			if check.OK != tc.wantOK || check.Required != tc.wantRequired {
+				t.Fatalf("check = OK %v Required %v, want OK %v Required %v: %s", check.OK, check.Required, tc.wantOK, tc.wantRequired, check.Detail)
+			}
+			if !strings.Contains(check.Detail, tc.wantDetail) {
+				t.Fatalf("detail = %q, want it to mention %q", check.Detail, tc.wantDetail)
+			}
+			// Every verdict must name the source it measured and admit the
+			// per-job override it cannot see.
+			if !strings.Contains(check.Detail, "runtime_config_dir") {
+				t.Fatalf("detail = %q, want it to disclose the per-job override blind spot", check.Detail)
+			}
+		})
+	}
+}
+
+func seatDoctorTestPaths(t *testing.T, home string, gateway bool) config.Paths {
+	t.Helper()
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	body := config.DefaultConfig(paths)
+	if gateway {
+		body += "\n[credentials]\nmodel_gateway = true\n"
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return paths
+}
+
+// The seat path has always narrowed its staged credential to the OAuth section.
+// Round 3 measured produce copying the file VERBATIM, so a sibling secret in the
+// operator's credential file rode into the job-private profile.
+func TestProduceStagesOnlyTheOAuthSectionLikeTheSeatPath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	configured := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", configured)
+	body := `{"claudeAiOauth":{"accessToken":"account-token","refreshToken":"ref"},"bedrockApiKey":"SIBLING-SECRET-XYZ"}`
+	if err := os.WriteFile(filepath.Join(configured, ".credentials.json"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateRoot := t.TempDir()
+	if _, _, _, _, err := produceRuntimeSandboxGrants(runtime.ClaudeRuntime, stateRoot, nil, nil, nil); err != nil {
+		t.Fatalf("produceRuntimeSandboxGrants: %v", err)
+	}
+	staged, err := os.ReadFile(filepath.Join(stateRoot, ".claude", ".credentials.json"))
+	if err != nil {
+		t.Fatalf("read staged credential: %v", err)
+	}
+	if !strings.Contains(string(staged), "account-token") {
+		t.Fatalf("staged credential lost the account: %s", staged)
+	}
+	if strings.Contains(string(staged), "SIBLING-SECRET-XYZ") {
+		t.Fatalf("a sibling secret rode into the job-private profile: %s", staged)
+	}
+}
+
+// The live-check stub above exercises only the LAST return in the probe. The
+// six EARLY returns - temp-dir creation, staging, overlay resolution, probe-home
+// mkdir, an empty state dir, and backend resolution - are the ones a mutant
+// flipped to fail-closed and survived (#1810 review round 3, M9). Each of these
+// drives a real early return, so flipping any of them to authProbeInvalid fails
+// here.
+func TestSeatAuthProbeFailsOpenOnSetupFailuresNotOnlyOnTheLiveCheck(t *testing.T) {
+	original := claudeAuthLiveCheck
+	t.Cleanup(func() { claudeAuthLiveCheck = original })
+	claudeAuthLiveCheck = func(context.Context, subprocess.Runner, string, []string) error {
+		t.Fatal("probe reached the live check; this test must fail EARLIER, or it is not measuring the early returns")
+		return nil
+	}
+	for _, tc := range []struct {
+		name    string
+		prepare func(t *testing.T) (runtime.Agent, workflow.JobPayload)
+	}{
+		{
+			// os.MkdirTemp("", ...) honours TMPDIR, so an unusable TMPDIR fails
+			// the very first step.
+			name: "temp state root cannot be created",
+			prepare: func(t *testing.T) (runtime.Agent, workflow.JobPayload) {
+				t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "does-not-exist"))
+				configured := t.TempDir()
+				writeClaudeCredential(t, configured, time.Now().Add(time.Hour).UnixMilli(), "r")
+				return runtime.Agent{Name: "reviewer", Runtime: runtime.ClaudeRuntime}, workflow.JobPayload{RuntimeConfigDir: configured}
+			},
+		},
+		{
+			// A relative config dir is refused by resolveRuntimeConfigDir, so
+			// staging fails before anything is written.
+			name: "staging refuses the configured dir",
+			prepare: func(t *testing.T) (runtime.Agent, workflow.JobPayload) {
+				return runtime.Agent{Name: "reviewer", Runtime: runtime.ClaudeRuntime}, workflow.JobPayload{RuntimeConfigDir: "relative-not-absolute"}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent, payload := tc.prepare(t)
+			worker := jobWorker{ConfigHome: t.TempDir()}
+			if verdict := worker.probeReadOnlySeatClaudeAuth(context.Background(), agent, payload); verdict != authProbeUnknown {
+				t.Fatalf("verdict = %v, want authProbeUnknown: a probe that cannot set itself up must release the job, not hold it", verdict)
+			}
+		})
 	}
 }

@@ -32,8 +32,13 @@ func TestSeatCredentialDoctorCheckReportsTheStagedCredential(t *testing.T) {
 			dir := t.TempDir()
 			writeClaudeCredential(t, dir, test.expiresAt, test.refreshToken)
 			t.Setenv("CLAUDE_CONFIG_DIR", dir)
+			// The verdict now depends on the runtime-auth overlay and on gateway
+			// mode as well as on the snapshot, so both must be pinned here or the
+			// test reads whatever this host happens to export (#1810 round 3).
+			t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+			t.Setenv("ANTHROPIC_API_KEY", "")
 
-			check, ok := seatCredentialDoctorCheck(config.Paths{})
+			check, ok := seatCredentialDoctorCheck(seatDoctorTestPaths(t, t.TempDir(), false))
 			if !ok {
 				t.Fatal("check must be emitted")
 			}
@@ -76,8 +81,12 @@ func TestSeatCredentialDoctorCheckIsRequiredWhenUnusable(t *testing.T) {
 	dir := t.TempDir()
 	writeClaudeCredential(t, dir, 0, "")
 	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	// The required failure is reserved for no-gateway AND no-overlay, so both
+	// must be pinned rather than inherited from the host (#1810 round 3).
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
 
-	check, ok := seatCredentialDoctorCheck(config.Paths{})
+	check, ok := seatCredentialDoctorCheck(seatDoctorTestPaths(t, t.TempDir(), false))
 	if !ok {
 		t.Fatal("check must be emitted")
 	}
@@ -120,6 +129,10 @@ func TestDoctorRegistersTheSeatCredentialCheck(t *testing.T) {
 	dir := t.TempDir()
 	writeClaudeCredential(t, dir, 0, "")
 	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	// The required failure is the no-gateway, no-overlay case; pin both rather
+	// than inheriting whatever this host exports (#1810 round 3).
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
 
 	var out bytes.Buffer
 	code := runDoctor([]string{"--json", "--home", home}, &out, &out)
@@ -175,6 +188,8 @@ func TestSeatCredentialDoctorCheckPrefersTheDaemonEnvironment(t *testing.T) {
 	shellDir := t.TempDir()
 	writeClaudeCredential(t, shellDir, time.Now().UTC().Add(8*time.Hour).UnixMilli(), "r")
 	t.Setenv("CLAUDE_CONFIG_DIR", shellDir)
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
 
 	original := daemonEnvironReader
 	daemonEnvironReader = func(pid int) ([]byte, error) {

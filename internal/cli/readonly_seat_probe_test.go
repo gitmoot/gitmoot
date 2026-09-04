@@ -46,9 +46,13 @@ func TestSeatCredentialProbeReportsTheStagedCredential(t *testing.T) {
 			dir := t.TempDir()
 			writeClaudeCredential(t, dir, test.expiresAt, test.refreshToken)
 			t.Setenv("CLAUDE_CONFIG_DIR", dir)
+			// Gateway mode and the runtime-auth overlay both change this verdict
+			// now, so pin them instead of inheriting the host's (#1810 round 3).
+			t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+			t.Setenv("ANTHROPIC_API_KEY", "")
 
 			var stdout bytes.Buffer
-			writeSeatCredentialProbe(&stdout, config.Paths{})
+			writeSeatCredentialProbe(&stdout, seatDoctorTestPaths(t, t.TempDir(), false))
 			out := stdout.String()
 			if !strings.Contains(out, dir) {
 				t.Fatalf("probe output must name the staged file; got %q", out)

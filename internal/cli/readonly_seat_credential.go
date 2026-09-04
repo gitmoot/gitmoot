@@ -184,6 +184,17 @@ func readOnlySeatRuntimeAuthEnv(home string, runtimeName string, gatewayMode boo
 	if err != nil {
 		return nil, fmt.Errorf("resolve read-only seat runtime auth paths: %w", err)
 	}
+	return readOnlySeatRuntimeAuthEnvForPaths(paths, runtimeName, gatewayMode)
+}
+
+// readOnlySeatRuntimeAuthEnvForPaths is the same lookup for a caller that has
+// already resolved its paths. Handing paths.Home to the flag-taking variant
+// re-resolves a DIFFERENT home, which is the mistake that made the operator
+// checks read the wrong overlay (#1810 review, round 3).
+func readOnlySeatRuntimeAuthEnvForPaths(paths config.Paths, runtimeName string, gatewayMode bool) ([]string, error) {
+	if gatewayMode || runtimeName != runtime.ClaudeRuntime {
+		return nil, nil
+	}
 	if _, err := bootstrapRuntimeAuth(paths.Home, runtimeAuthEnvLookup, runtimeAuthLogf); err != nil {
 		return nil, fmt.Errorf("bootstrap read-only seat runtime auth: %w", err)
 	}
@@ -225,24 +236,39 @@ func writeSeatCredentialProbe(stdout io.Writer, paths config.Paths) bool {
 		writeLine(stdout, "read-only seat credential: unknown (cannot resolve the seat config dir)")
 		return true
 	}
+	// Same three inputs as the doctor check, and the same rule: a non-zero exit
+	// is reserved for the case that is actually proven broken - no gateway, no
+	// overlay, expired with no refresh token (#1810 review, round 3).
+	blindSpot := "cannot see a per-job payload runtime_config_dir override"
+	gatewayMode := seatModelGatewayModeForPaths(paths)
+	if gatewayMode {
+		writeLine(stdout, "read-only seat credential: model gateway holds it; no snapshot is staged from %s (%s), so nothing is asserted (%s)", source.dir, source.origin, blindSpot)
+		return true
+	}
+	overlay, overlayErr := readOnlySeatRuntimeAuthEnvForPaths(paths, runtime.ClaudeRuntime, gatewayMode)
+	haveOverlay := overlayErr == nil && len(overlay) > 0
 	state, ok := inspectReadOnlySeatCredential(runtime.ClaudeRuntime, source.dir)
 	if !ok {
-		writeLine(stdout, "read-only seat credential (%s, %s): no readable expiry; a seat stages what is there and the runtime decides", source.dir, source.origin)
+		writeLine(stdout, "read-only seat credential (%s, %s): no readable expiry; a seat stages what is there and the runtime decides (%s)", source.dir, source.origin, blindSpot)
 		return true
 	}
 	if !state.Expired(time.Now().UTC()) {
-		writeLine(stdout, "read-only seat credential (%s, %s): declares expiry %s, not yet reached; this reads a field and does not prove the credential authenticates", state.Source, source.origin, state.ExpiresAt.Format(time.RFC3339))
+		writeLine(stdout, "read-only seat credential (%s, %s): declares expiry %s, not yet reached; this reads a field and does not prove the credential authenticates (%s)", state.Source, source.origin, state.ExpiresAt.Format(time.RFC3339), blindSpot)
 		return true
 	}
 	expiry := "no expiry recorded (a failed refresh writes this)"
 	if !state.ExpiresAt.IsZero() {
 		expiry = state.ExpiresAt.Format(time.RFC3339)
 	}
-	if state.Refreshable {
-		writeLine(stdout, "read-only seat credential (%s, %s): EXPIRED %s, refresh token present; a seat must refresh it inside a disposable home, and the rotated token is discarded with the job", state.Source, source.origin, expiry)
+	if haveOverlay {
+		writeLine(stdout, "read-only seat credential (%s, %s): snapshot expired %s, but a resolved runtime-auth overlay is present and is what a seat authenticates with; clean up the stale snapshot (%s)", state.Source, source.origin, expiry, blindSpot)
 		return true
 	}
-	writeLine(stdout, "read-only seat credential (%s, %s): UNUSABLE, expired %s with no refresh token; every read-only seat job on this runtime will fail until that account is re-logged in", state.Source, source.origin, expiry)
+	if state.Refreshable {
+		writeLine(stdout, "read-only seat credential (%s, %s): EXPIRED %s, refresh token present; a seat must refresh it inside a disposable home, and the rotated token is discarded with the job (%s)", state.Source, source.origin, expiry, blindSpot)
+		return true
+	}
+	writeLine(stdout, "read-only seat credential (%s, %s): UNUSABLE, expired %s with no refresh token, no model gateway and no runtime-auth overlay; every read-only seat job on this runtime will fail until that account is re-logged in (%s)", state.Source, source.origin, expiry, blindSpot)
 	return false
 }
 
@@ -255,6 +281,15 @@ func seatModelGatewayMode(home string) bool {
 	if err != nil {
 		return false
 	}
+	return seatModelGatewayModeForPaths(paths)
+}
+
+// seatModelGatewayModeForPaths is the same question asked of ALREADY-RESOLVED
+// paths. The operator-facing checks hold a config.Paths, not a --home flag
+// value, and re-deriving one from paths.Home silently resolves a DIFFERENT
+// config - which read gateway mode as off and produced the false red this
+// round was reported for (#1810 review, round 3).
+func seatModelGatewayModeForPaths(paths config.Paths) bool {
 	cfg, err := config.LoadCredentialsConfig(paths)
 	if err != nil {
 		return false

@@ -1647,7 +1647,7 @@ func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string, gatewayM
 		relativeState = ".claude"
 		if !gatewayMode {
 			credentialFile = ".credentials.json"
-			credentialSection = "claudeAiOauth"
+			credentialSection = claudeCredentialSection
 		}
 	case runtime.CodexRuntime:
 		relativeState = ".codex"
@@ -1873,12 +1873,22 @@ func pathsOverlap(left, right string) bool {
 	return contains(left, right) || contains(right, left)
 }
 
+// claudeCredentialSection is the only key a Claude credential file needs to
+// carry an account. Both staging paths - the read-only seat and produce - narrow
+// to it, so a sibling secret in the operator's file cannot ride along.
+const claudeCredentialSection = "claudeAiOauth"
+
 type stagedProduceProfileFile struct {
 	source      string
 	destination string
 	// required marks a file whose presence-but-unusability is a dispatch
 	// failure rather than something to skip.
 	required bool
+	// section narrows the copy to one top-level JSON key. The read-only seat
+	// path has always narrowed its credential; produce copied the whole file,
+	// so a sibling key such as bedrockApiKey rode along into the job-private
+	// profile (#1810 review, round 3). Empty means copy the object whole.
+	section string
 }
 
 // stageProduceProfileFile copies one operator profile file into a job-private
@@ -1920,6 +1930,17 @@ func stageProduceProfileFile(file stagedProduceProfileFile) error {
 			err = errors.New("content must be a JSON object")
 		}
 		return skip(fmt.Errorf("validate runtime profile file %q: %w", file.source, err))
+	}
+	if file.section != "" {
+		value, ok := object[file.section]
+		if !ok {
+			return skip(fmt.Errorf("runtime profile file %q lacks required %q section", file.source, file.section))
+		}
+		narrowed, marshalErr := json.Marshal(map[string]json.RawMessage{file.section: value})
+		if marshalErr != nil {
+			return skip(fmt.Errorf("isolate runtime profile file %q: %w", file.source, marshalErr))
+		}
+		data = narrowed
 	}
 	if err := os.MkdirAll(filepath.Dir(file.destination), 0o700); err != nil {
 		return fmt.Errorf("create job-private profile directory: %w", err)
@@ -1987,6 +2008,9 @@ func produceRuntimeSandboxGrants(runtimeName string, runtimeStateDir string, rea
 				source:      filepath.Join(configDir, ".credentials.json"),
 				destination: filepath.Join(writeStateDir, ".credentials.json"),
 				required:    true,
+				// Narrowed to the OAuth section, matching the seat path: a
+				// produce job needs the account it runs as and nothing else.
+				section: claudeCredentialSection,
 			},
 			stagedProduceProfileFile{
 				source:      filepath.Join(configDir, "settings.json"),

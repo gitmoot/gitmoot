@@ -99,13 +99,32 @@ func seatCredentialDoctorCheck(paths config.Paths) (doctor.Check, bool) {
 	if source.dir == "" {
 		return doctor.Check{}, false
 	}
+	// A seat's credential domain is decided by THREE inputs, and this check can
+	// see only one of them (#1810 review, round 3). Gateway mode means no
+	// snapshot is staged at all; a resolved auth overlay means the seat
+	// authenticates from the environment regardless of what the snapshot says;
+	// and a per-job payload.runtime_config_dir, recorded by whichever process
+	// dispatched the job, overrides the source entirely and is invisible here.
+	// So a non-zero exit is reserved for the one case this actually proves.
+	gatewayMode := seatModelGatewayModeForPaths(paths)
+	blindSpot := "this cannot see a per-job payload runtime_config_dir override, which the dispatching process records and the worker prefers"
+	if gatewayMode {
+		return doctor.Check{
+			Name:     seatCredentialDoctorCheckName,
+			OK:       true,
+			Required: false,
+			Detail:   fmt.Sprintf("claude runs through the model gateway, which holds the credential; no seat snapshot is staged, so nothing is asserted about %s (%s). %s", source.dir, source.origin, blindSpot),
+		}, true
+	}
+	overlay, overlayErr := readOnlySeatRuntimeAuthEnvForPaths(paths, runtime.ClaudeRuntime, gatewayMode)
+	haveOverlay := overlayErr == nil && len(overlay) > 0
 	state, ok := inspectReadOnlySeatCredential(runtime.ClaudeRuntime, source.dir)
 	if !ok {
 		return doctor.Check{
 			Name:     seatCredentialDoctorCheckName,
 			OK:       true,
 			Required: false,
-			Detail:   fmt.Sprintf("claude seat stages from %s (%s); no readable expiry, so nothing is asserted", source.dir, source.origin),
+			Detail:   fmt.Sprintf("claude seat stages from %s (%s); no readable expiry, so nothing is asserted. %s", source.dir, source.origin, blindSpot),
 		}, true
 	}
 	if !state.Expired(time.Now().UTC()) {
@@ -113,22 +132,39 @@ func seatCredentialDoctorCheck(paths config.Paths) (doctor.Check, bool) {
 			Name:     seatCredentialDoctorCheckName,
 			OK:       true,
 			Required: false,
-			Detail: fmt.Sprintf("claude seat credential declares expiry %s, not yet reached (%s); this reads a field and does not prove it authenticates",
-				state.ExpiresAt.Format(time.RFC3339), source.origin),
+			Detail: fmt.Sprintf("claude seat credential at %s (%s) declares expiry %s, not yet reached; this reads a field and does not prove it authenticates. %s",
+				source.dir, source.origin, state.ExpiresAt.Format(time.RFC3339), blindSpot),
 		}, true
 	}
 	expiry := "no expiry recorded (a failed refresh writes this)"
 	if !state.ExpiresAt.IsZero() {
 		expiry = state.ExpiresAt.Format(time.RFC3339)
 	}
-	remedy := "re-login that account"
+	if haveOverlay {
+		// The overlay is what the seat authenticates with; a dead snapshot beside
+		// a live overlay is untidy, not broken, and must not fail the exit code.
+		return doctor.Check{
+			Name:     seatCredentialDoctorCheckName,
+			OK:       false,
+			Required: false,
+			Detail: fmt.Sprintf("claude seat snapshot at %s (%s) is expired (%s), but a resolved runtime-auth overlay is present and is what a seat authenticates with; clean up the stale snapshot. %s",
+				source.dir, source.origin, expiry, blindSpot),
+		}, true
+	}
 	if state.Refreshable {
-		remedy = "the runtime must refresh it, and a seat discards the rotated token with the job"
+		return doctor.Check{
+			Name:     seatCredentialDoctorCheckName,
+			OK:       false,
+			Required: false,
+			Detail: fmt.Sprintf("claude seat credential at %s (%s) is expired (%s) but carries a refresh token; the runtime must refresh it, and a seat discards the rotated token with the job. %s",
+				source.dir, source.origin, expiry, blindSpot),
+		}, true
 	}
 	return doctor.Check{
 		Name:     seatCredentialDoctorCheckName,
 		OK:       false,
 		Required: true,
-		Detail:   fmt.Sprintf("claude seat credential is EXPIRED (%s, %s); %s", expiry, source.origin, remedy),
+		Detail: fmt.Sprintf("claude seat credential at %s (%s) is UNUSABLE: expired %s, no refresh token, no model gateway and no runtime-auth overlay, so every read-only seat job fails; re-login that account. %s",
+			source.dir, source.origin, expiry, blindSpot),
 	}, true
 }
