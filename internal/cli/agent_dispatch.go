@@ -841,7 +841,9 @@ func enqueuePermissionBlockedLocalAgentJob(ctx context.Context, store *db.Store,
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "route_selected", Message: routeSelectedMessage(request)}); err != nil {
 		return localAgentJobOutput{}, err
 	}
-	if _, err := markJobPermissionBlocked(ctx, store, job); err != nil {
+	// The matched source state is not consulted here: this site only blocks the job
+	// and reports State: blocked, it never describes the transition afterwards.
+	if _, _, err := markJobPermissionBlocked(ctx, store, job); err != nil {
 		return localAgentJobOutput{}, err
 	}
 	return localAgentJobOutput{

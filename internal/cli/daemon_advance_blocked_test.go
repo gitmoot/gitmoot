@@ -948,7 +948,7 @@ func TestPermissionBlockDoesNotBlockANewerRun(t *testing.T) {
 		t.Fatalf("admitted generation = %d, observed generation = %d", admitted.LifecycleGeneration, observed.generation)
 	}
 
-	if _, err := markJobPermissionBlocked(ctx, store, admitted); err != nil {
+	if _, _, err := markJobPermissionBlocked(ctx, store, admitted); err != nil {
 		t.Fatalf("markJobPermissionBlocked returned error: %v", err)
 	}
 	after, err := store.GetJob(ctx, "perm-aba")

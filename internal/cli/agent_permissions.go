@@ -83,12 +83,18 @@ func markJobPermissionBlockedAtGeneration(ctx context.Context, store *db.Store, 
 
 // markJobPermissionBlocked derives the atomic-write anchor from the admitted
 // row. Callers must retain that row rather than re-read before writing: a queued
-// cancellation and retry can produce the same state at a newer generation. It
-// drops the matched source state: its callers block a job, they do not describe
-// the transition afterwards.
-func markJobPermissionBlocked(ctx context.Context, store *db.Store, job db.Job) (bool, error) {
-	transitioned, _, err := markJobPermissionBlockedAtGeneration(ctx, store, job.ID, job.LifecycleGeneration)
-	return transitioned, err
+// cancellation and retry can produce the same state at a newer generation.
+//
+// It PASSES THROUGH the matched source state, because a caller that goes on to
+// DESCRIBE the transition needs it and the admitted row cannot supply it:
+// queued→running does not bump the generation (the bump fires only on a
+// transition TO queued, store_jobs.go's bumpLifecycleGenerationSQL), so a
+// concurrent claim leaves the row running at the SAME generation this CAS is
+// anchored to and the JobRunning arm matches. A caller keying its label on the
+// row it was handed would then record a child that DID run as "refused before it
+// ran and never started" — the #1848 defect at the sibling site (#1852).
+func markJobPermissionBlocked(ctx context.Context, store *db.Store, job db.Job) (bool, workflow.JobState, error) {
+	return markJobPermissionBlockedAtGeneration(ctx, store, job.ID, job.LifecycleGeneration)
 }
 
 func runtimePermissionFailure(err error) bool {
