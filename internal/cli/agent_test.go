@@ -3850,38 +3850,6 @@ func TestRunOrchestrateRejectsUninstalledRecipe(t *testing.T) {
 	}
 }
 
-func TestParseAgentRunOptionsCapturesCockpit(t *testing.T) {
-	tests := []struct {
-		name        string
-		args        []string
-		wantCockpit bool
-		wantSession string
-	}{
-		{name: "absent leaves off", args: []string{"planner", "fan out fixes"}, wantCockpit: false, wantSession: ""},
-		{name: "--cockpit turns on", args: []string{"planner", "fan out fixes", "--cockpit"}, wantCockpit: true, wantSession: ""},
-		{name: "--herdr alias turns on", args: []string{"planner", "fan out fixes", "--herdr"}, wantCockpit: true, wantSession: ""},
-		{name: "session space form", args: []string{"planner", "fan out fixes", "--cockpit", "--cockpit-session", "review-room"}, wantCockpit: true, wantSession: "review-room"},
-		// --cockpit-session implies --cockpit, so the session is never silently ignored.
-		{name: "session space form implies cockpit", args: []string{"planner", "fan out fixes", "--cockpit-session", "review-room"}, wantCockpit: true, wantSession: "review-room"},
-		{name: "session inline form implies cockpit", args: []string{"planner", "fan out fixes", "--cockpit-session=review-room"}, wantCockpit: true, wantSession: "review-room"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var stderr bytes.Buffer
-			options, ok := parseAgentRunOptions("orchestrate", tt.args, &stderr)
-			if !ok {
-				t.Fatalf("parseAgentRunOptions failed: %q", stderr.String())
-			}
-			if options.cockpit != tt.wantCockpit {
-				t.Fatalf("cockpit = %v, want %v", options.cockpit, tt.wantCockpit)
-			}
-			if options.cockpitSession != tt.wantSession {
-				t.Fatalf("cockpitSession = %q, want %q", options.cockpitSession, tt.wantSession)
-			}
-		})
-	}
-}
-
 func TestParseAgentAskOptionsCapturesModel(t *testing.T) {
 	tests := []struct {
 		name string
@@ -3988,21 +3956,37 @@ func TestAgentModelRoundTripsThroughStorageMapping(t *testing.T) {
 	}
 }
 
-func TestCockpitAutoEnabled(t *testing.T) {
-	cases := []struct {
-		explicit bool
-		env      string
-		want     bool
-	}{
-		{false, "", false},   // outside Herdr, no flag -> off
-		{false, "1", true},   // inside a Herdr session -> auto on
-		{false, "  ", false}, // whitespace HERDR_ENV -> off
-		{true, "", true},     // explicit --cockpit -> on even outside Herdr
-		{true, "1", true},    // explicit + in Herdr -> on
-	}
-	for _, c := range cases {
-		if got := cockpitAutoEnabled(c.explicit, c.env); got != c.want {
-			t.Errorf("cockpitAutoEnabled(%v, %q) = %v, want %v", c.explicit, c.env, got, c.want)
+// The flags removed with the TUI must be rejected BY NAME in every position. The
+// unknown-flag arm only fires once two positionals exist, so before this a stale
+// --cockpit in the message position was swallowed as the message and the run
+// proceeded past parsing entirely (#1787 review F6).
+func TestParseAgentRunOptionsRejectsRemovedCockpitFlagsInAnyPosition(t *testing.T) {
+	for _, args := range [][]string{
+		{"myagent", "do it", "--cockpit"},
+		{"myagent", "--cockpit", "do it"},
+		{"--cockpit", "myagent", "do it"},
+		{"myagent", "--cockpit"},
+		{"myagent", "--herdr", "do it"},
+		{"myagent", "--cockpit-session", "abc", "do it"},
+		{"myagent", "--cockpit-session=abc", "do it"},
+	} {
+		var stderr bytes.Buffer
+		options, ok := parseAgentRunOptions("orchestrate", args, &stderr)
+		if ok {
+			t.Fatalf("args %q parsed successfully as agent=%q message=%q, want a rejection", args, options.agent, options.message)
 		}
+		if !strings.Contains(stderr.String(), "removed with the terminal cockpit") {
+			t.Fatalf("args %q produced %q, want an error naming the removed flag", args, stderr.String())
+		}
+	}
+}
+
+// The rejection must not swallow a legitimate message that merely begins with a
+// dash, which is the failure mode a blanket unknown-flag rule would introduce.
+func TestParseAgentRunOptionsStillAcceptsOrdinaryRuns(t *testing.T) {
+	var stderr bytes.Buffer
+	options, ok := parseAgentRunOptions("orchestrate", []string{"myagent", "do it"}, &stderr)
+	if !ok || options.agent != "myagent" || options.message != "do it" {
+		t.Fatalf("ordinary run = %+v ok=%v stderr=%q", options, ok, stderr.String())
 	}
 }

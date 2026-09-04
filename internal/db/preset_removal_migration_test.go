@@ -14,9 +14,19 @@ import (
 const presetRemovalMarker = "ALTER TABLE agents DROP COLUMN preset_delivery"
 
 // releasedMigrationsBeforePresetRemoval returns the strict migration prefix that
-// shipped before #1756, and asserts the new migration is APPENDED LAST. A database
-// at the released version would otherwise apply somebody else's already-applied
-// migration under a shifted version number and fail to open.
+// shipped before #1756: everything ahead of #1756's own entry, located by marker
+// rather than by slicing off the tail, so a reordered slice cannot produce a
+// synthetic "released" database that already contains the migration under test.
+//
+// This used to also assert #1756's migration was the LAST element. That held only
+// while #1756 was the newest branch; #1753 then appended the cockpit/interactive
+// table drop after it, and two branches cannot both be last. The invariant that
+// actually protects a deployed database — a new migration is APPENDED, never
+// inserted, so no already-applied entry shifts version number — is enforced once,
+// for whichever migration is currently newest, by
+// TestMigrationsUpgradeFromPreviousReleasedVersion's branchMigrationMarker in
+// cleanup_obligations_test.go. Asserting it here as well only ever fires on the
+// NEXT branch to append, which is a merge conflict wearing a test's clothes.
 func releasedMigrationsBeforePresetRemoval(t *testing.T) []string {
 	t.Helper()
 	index := -1
@@ -30,9 +40,6 @@ func releasedMigrationsBeforePresetRemoval(t *testing.T) []string {
 	}
 	if index < 0 {
 		t.Fatalf("marker %q matches no migration", presetRemovalMarker)
-	}
-	if index != len(migrations)-1 {
-		t.Fatalf("the #1756 migration is at index %d of %d; a new migration must be appended last", index, len(migrations)-1)
 	}
 	return append([]string(nil), migrations[:index]...)
 }

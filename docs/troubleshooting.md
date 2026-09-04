@@ -96,7 +96,6 @@ Symptoms:
 
 - A job is failed, blocked, or cancelled and the user wants to send the details
   upstream.
-- The dashboard shows `B report bug` for the selected job.
 - An agent needs to file a report without copying raw runtime logs into chat.
 
 Checks:
@@ -121,9 +120,6 @@ Fixes:
 - Report the printed GitHub issue URL back to the user. If Gitmoot prints
   `existing issue: ...`, use that URL instead of creating or describing a new
   issue.
-- In the dashboard TUI, press `B` on a failed, blocked, or cancelled job to open
-  the same redacted preview. Press `g` from that preview to create or reuse the
-  issue; errors stay inline so the preview is not lost.
 
 ## Codex
 

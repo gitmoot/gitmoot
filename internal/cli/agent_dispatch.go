@@ -116,8 +116,6 @@ type localAgentDispatchRequest struct {
 	TaskTitle              string
 	LeadAgent              string
 	Reviewers              []string
-	Cockpit                bool
-	CockpitSession         string
 	SkipNativeReviewFanout bool
 	Recipe                 string
 	SelectedAction         string
@@ -466,8 +464,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		RuntimeConfigDir:       effectiveAgent.RuntimeConfigDir,
 		EffectiveRuntime:       effectiveRuntimeAtEnqueue,
 		RequiredEvents:         requiredEvents,
-		Cockpit:                request.Cockpit,
-		CockpitSession:         request.CockpitSession,
 		SkipNativeReviewFanout: request.SkipNativeReviewFanout,
 		ValidatedPullRequest:   request.ImplementPRValidated,
 		TemplateOverride:       recipeTemplate,
@@ -611,7 +607,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	}
 	// Foreground dispatch bypasses the daemon worker, so attach opt-in retained
 	// capture explicitly. Open/composition failures remain fail-open.
-	_, retainedLogFile, retainedLogErr := openRetainedTranscriptLog(request.Home, job.ID)
+	retainedLogFile, retainedLogErr := openRetainedTranscriptLog(request.Home, job.ID)
 	if retainedLogErr == nil && retainedLogFile != nil {
 		teeAdapter, teeErr := appendDeliveryAdapterOutput(adapter, retainedLogFile)
 		if teeErr != nil {

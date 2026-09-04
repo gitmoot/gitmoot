@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"io"
 	"os"
 	"strings"
 	"testing"
@@ -174,14 +173,19 @@ func seatRunnerEnvironments(t *testing.T, runner subprocess.Runner) (sandboxEnv 
 	}
 }
 
-// The cockpit log tee REBUILT the adapter from the worker's execution runner and
-// assigned over the composed one, discarding the whole read-only seat wrapper:
-// no Landlock, no isolated state dir, no auth overlay. With produce grants
-// already applied by then, the rebuilt job would even receive a WRITE grant on
-// the operator's live credential dir (#1810 review F5). Teeing must ADD a writer
-// to the composed adapter instead.
-func TestCockpitTeeKeepsTheReadOnlySeatSandbox(t *testing.T) {
-	const overlay = "CLAUDE_CODE_OAUTH_TOKEN=seat-cockpit-token-value"
+// #1810 review F5: the cockpit log tee REBUILT the adapter from the worker's
+// execution runner and assigned over the composed one, discarding the whole
+// read-only seat wrapper - no Landlock, no isolated state dir, no auth overlay -
+// and with produce grants already applied the rebuilt job would even receive a
+// WRITE grant on the operator's live credential dir.
+//
+// This commit deletes the cockpit tee, so the test no longer has a cockpit call
+// site. The PROPERTY survives and is retargeted rather than dropped: transcript
+// output is attached with appendDeliveryAdapterOutput, which must ADD a writer to
+// the composed adapter. If that ever rebuilds instead, a seat loses its sandbox
+// the same way, and this test fails the same way.
+func TestTranscriptOutputKeepsTheReadOnlySeatSandbox(t *testing.T) {
+	const overlay = "CLAUDE_CODE_OAUTH_TOKEN=seat-transcript-token-value"
 	home := t.TempDir()
 	paths, err := pathsFromFlag(home)
 	if err != nil {
@@ -206,16 +210,22 @@ func TestCockpitTeeKeepsTheReadOnlySeatSandbox(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = seat.cleanup() })
 
-	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard, home)
-	teed, logPath, logFile := worker.cockpitTeeAdapter(seatAdapter, "seat-cockpit-job")
+	logFile, err := openRetainedTranscriptLog(home, "seat-transcript-job")
+	if err != nil {
+		t.Fatalf("openRetainedTranscriptLog: %v", err)
+	}
 	if logFile == nil {
-		t.Fatalf("cockpit tee returned no log file (path %q)", logPath)
+		t.Fatal("expected a retained transcript log")
 	}
 	defer logFile.Close()
 
+	teed, err := appendDeliveryAdapterOutput(seatAdapter, logFile)
+	if err != nil {
+		t.Fatalf("appendDeliveryAdapterOutput: %v", err)
+	}
 	teedSeat, ok := teed.(readOnlyRuntimeAdapter)
 	if !ok {
-		t.Fatalf("teed adapter %T discarded the read-only seat wrapper", teed)
+		t.Fatalf("attaching transcript output discarded the read-only seat wrapper: %T", teed)
 	}
 	inner, ok := teedSeat.Adapter.(runtime.ClaudeAdapter)
 	if !ok {
@@ -223,10 +233,10 @@ func TestCockpitTeeKeepsTheReadOnlySeatSandbox(t *testing.T) {
 	}
 	sandboxEnv, baseEnv := seatRunnerEnvironments(t, inner.Runner)
 	if !containsEnv(sandboxEnv, overlay) || !containsEnv(baseEnv, overlay) {
-		t.Fatalf("teeing dropped the seat auth overlay: sandbox=%v base=%v",
+		t.Fatalf("attaching transcript output dropped the seat auth overlay: sandbox=%v base=%v",
 			redactEnvNames(sandboxEnv), redactEnvNames(baseEnv))
 	}
 	if !containsEnvPrefix(sandboxEnv, "CLAUDE_CONFIG_DIR=") {
-		t.Fatalf("teeing dropped the isolated runtime state dir: %v", redactEnvNames(sandboxEnv))
+		t.Fatalf("attaching transcript output dropped the isolated runtime state dir: %v", redactEnvNames(sandboxEnv))
 	}
 }

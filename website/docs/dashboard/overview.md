@@ -1,13 +1,13 @@
 # Dashboard Overview
 
 The web dashboard is a **read-only, live browser view** over your local Gitmoot
-store. It renders the same state the `gitmoot dashboard` TUI shows — runs, jobs,
-agents, locks, daemon health — but as an orchestration graph you can watch update
-in real time, with click-through to each job's prompt and output.
+store. It renders the same state the `gitmoot dashboard` snapshot shows — runs,
+jobs, agents, locks, daemon health — but as an orchestration graph you can watch
+update in real time, with click-through to each job's prompt and output.
 
 It is strictly read-only: it never mutates workflow state, never touches the
-daemon path, and exposes no action controls. To *act* on a job (retry, cancel,
-answer a prompt) use the CLI or the interactive TUI — see the
+daemon path, and exposes no action controls. To *act* on a job (retry, cancel)
+use the CLI — see the
 [CLI Reference](../reference/cli.md#jobs-and-locks).
 
 ## Launching it
@@ -29,8 +29,8 @@ gitmoot dashboard serving read-only at http://127.0.0.1:8080 (Ctrl-C to stop)
 - The server is separate from the daemon — it reads the store directly, so it
   works whether or not the daemon is running (a stopped daemon simply shows as
   stopped on the Health page).
-- `--web` is one mode of `gitmoot dashboard`; without it the command runs the
-  interactive TUI or a one-shot snapshot instead. See the
+- `--web` is one mode of `gitmoot dashboard`; without it the command prints the
+  one-shot snapshot instead. See the
   [`dashboard` command](../reference/cli.md#repo-and-daemon-status) for the full
   flag set.
 

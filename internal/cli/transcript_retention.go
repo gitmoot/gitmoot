@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -28,31 +29,37 @@ const (
 
 // openRetainedTranscriptLog is side-effect-free when capture is explicitly
 // disabled. Enabled logs are canonical, private, and append-only across retries.
-func openRetainedTranscriptLog(home, jobID string) (string, *os.File, error) {
+// openRetainedTranscriptLog opens the append-only transcript for a job. It
+// returns only the file: every production caller writes through the handle and
+// none of them needs the path, so returning one would be a value with no
+// production reader (#1787 review F5). Tests that assert the on-disk location
+// derive it from transcript.JobLogPath, which is the same authority this
+// function uses, rather than being handed it back.
+func openRetainedTranscriptLog(home, jobID string) (*os.File, error) {
 	paths, err := pathsFromFlag(home)
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
 	if !config.LoadTranscriptsConfig(paths).Enabled {
-		return "", nil, nil
+		return nil, nil
 	}
 	dir := filepath.Join(paths.Logs, "jobs")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", nil, err
+		return nil, err
 	}
 	if err := os.Chmod(dir, 0o700); err != nil {
-		return "", nil, err
+		return nil, err
 	}
 	path := transcript.JobLogPath(paths.Logs, jobID)
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
 	if err := file.Chmod(0o600); err != nil {
 		_ = file.Close()
-		return "", nil, err
+		return nil, err
 	}
-	return path, file, nil
+	return file, nil
 }
 
 // appendDeliveryAdapterOutput adds a writer at the existing runner base instead
@@ -189,8 +196,62 @@ func startTranscriptRetentionLoop(ctx context.Context, paths config.Paths, store
 	}()
 }
 
+// reapOrphanedSeatLogs deletes <logs>/seats, the unreachable remains of
+// seat-mode cockpit logging. Those files hold UNREDACTED runtime output as
+// 0600 files, and the only code that ever removed them - cockpit.FinalizeRoot -
+// went with the TUI. Nothing at head writes, reads or prunes that tree, so an
+// existing installation would keep unredacted transcripts forever.
+//
+// This is a SWEEP rather than a one-time migration on purpose: the sweep is
+// idempotent and self-healing, so it also reaps a tree written after an upgrade
+// by an older daemon still sharing this home, which a migration that runs once
+// cannot. It deliberately runs BEFORE the transcripts-enabled check, because
+// turning transcripts off must not be a way to preserve secrets on disk, and it
+// uses the injected remove for directories too - os.Remove empties them only
+// when they are already empty, so a concurrently-written file is never lost.
+func reapOrphanedSeatLogs(paths config.Paths, remove func(string) error) (int, int) {
+	root := filepath.Join(paths.Logs, "seats")
+	var files, dirs []string
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			dirs = append(dirs, path)
+			return nil
+		}
+		files = append(files, path)
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, 0
+		}
+		return 0, 1
+	}
+	var removed, failed int
+	for _, path := range files {
+		if rmErr := remove(path); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			failed++
+			continue
+		}
+		removed++
+	}
+	// Deepest first, so each directory is empty by the time it is removed.
+	sort.Sort(sort.Reverse(sort.StringSlice(dirs)))
+	for _, dir := range dirs {
+		if rmErr := remove(dir); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			failed++
+		}
+	}
+	return removed, failed
+}
+
 func sweepTranscriptRetention(ctx context.Context, paths config.Paths, store *db.Store, now time.Time, remove func(string) error) (transcriptRetentionStats, error) {
 	var stats transcriptRetentionStats
+	seatRemoved, seatFailed := reapOrphanedSeatLogs(paths, remove)
+	stats.Removed += seatRemoved
+	stats.Errors += seatFailed
 	cfg := config.LoadTranscriptsConfig(paths)
 	if !cfg.Enabled {
 		return stats, nil

@@ -156,7 +156,8 @@ boundary — component tests miss the home double-resolution bug class (#446/#45
   template + per-section loaders).
 - `internal/db/` — the SQLite store + the migrations slice.
 - Other notable `internal/` packages: `agenttemplate`, `report` (bug reports),
-  `presence`, `memory`, `doctor`, `cockpit`, `plugin*`.
+  `presence`, `memory`, `doctor`, `cockpit` (the herdr wake client + org
+  provider), `plugin*`.
 - `skills/gitmoot/` — the packaged Agent Skill: `SKILL.md` + `references/`
   (`CLI.md`, `WORKFLOWS.md`, `RESULT_CONTRACT.md`, `SAFETY.md`, …) +
   `agent-templates/`.

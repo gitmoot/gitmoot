@@ -18,18 +18,6 @@ func TestLoadOrchestratePolicyDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadOrchestratePolicy returned error: %v", err)
 	}
-	if policy.CockpitMode != CockpitModeAuto {
-		t.Fatalf("CockpitMode = %q, want %q", policy.CockpitMode, CockpitModeAuto)
-	}
-	if policy.CockpitSession != "" {
-		t.Fatalf("CockpitSession = %q, want empty", policy.CockpitSession)
-	}
-	if policy.CockpitMaxPanes != 4 {
-		t.Fatalf("CockpitMaxPanes = %d, want 4", policy.CockpitMaxPanes)
-	}
-	if policy.CockpitPaneKey != CockpitPaneKeyJob {
-		t.Fatalf("CockpitPaneKey = %q, want %q", policy.CockpitPaneKey, CockpitPaneKeyJob)
-	}
 	if policy.InlineArtifactBodies {
 		t.Fatalf("InlineArtifactBodies = true, want false by default")
 	}
@@ -128,7 +116,6 @@ max_delegation_non_progress_streak = 3
 	// Absent key keeps the engine-default (0) even with the section present.
 	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
 [orchestrate]
-cockpit_mode = "auto"
 `), 0o600); err != nil {
 		t.Fatalf("write config returned error: %v", err)
 	}
@@ -167,7 +154,6 @@ max_verify_replan_attempts = 3
 	// Absent key keeps the engine-default (0) even with the section present.
 	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
 [orchestrate]
-cockpit_mode = "auto"
 `), 0o600); err != nil {
 		t.Fatalf("write config returned error: %v", err)
 	}
@@ -206,7 +192,6 @@ max_delegation_cost_usd = 2.50
 	// Absent key keeps the unlimited default even with the section present.
 	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
 [orchestrate]
-cockpit_mode = "auto"
 `), 0o600); err != nil {
 		t.Fatalf("write config returned error: %v", err)
 	}
@@ -245,7 +230,6 @@ max_delegation_token_budget = 500000
 	// Absent key keeps the unlimited default even with the section present.
 	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
 [orchestrate]
-cockpit_mode = "auto"
 `), 0o600); err != nil {
 		t.Fatalf("write config returned error: %v", err)
 	}
@@ -287,7 +271,6 @@ escalation_ttl = "36h"
 	// Absent keys keep the empty defaults even with the section present.
 	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
 [orchestrate]
-cockpit_mode = "auto"
 `), 0o600); err != nil {
 		t.Fatalf("write config returned error: %v", err)
 	}
@@ -324,7 +307,6 @@ func TestLoadOrchestratePolicyBlockedTTL(t *testing.T) {
 	// Disabled by default: an [orchestrate] section without blocked_ttl keeps it empty.
 	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
 [orchestrate]
-cockpit_mode = "auto"
 `), 0o600); err != nil {
 		t.Fatalf("write config returned error: %v", err)
 	}
@@ -491,7 +473,6 @@ inline_artifact_max_bytes = 4096
 	// Absent keys keep the off default even when the section is otherwise present.
 	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
 [orchestrate]
-cockpit_mode = "auto"
 `), 0o600); err != nil {
 		t.Fatalf("write config returned error: %v", err)
 	}
@@ -530,7 +511,6 @@ inject_upstream_dep_context = true
 	// Absent key keeps the off default even when the section is otherwise present.
 	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
 [orchestrate]
-cockpit_mode = "auto"
 `), 0o600); err != nil {
 		t.Fatalf("write config returned error: %v", err)
 	}
@@ -550,10 +530,8 @@ func TestLoadOrchestratePolicyOverrides(t *testing.T) {
 	}
 	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
 [orchestrate]
-cockpit_mode = "on"
-cockpit_session = "review-room"
-cockpit_max_panes = 8
-cockpit_pane_key = "seat"
+escalation_handle = "@owner"
+max_delegation_token_budget = 12345
 `), 0o600); err != nil {
 		t.Fatalf("write config returned error: %v", err)
 	}
@@ -563,8 +541,60 @@ cockpit_pane_key = "seat"
 	if err != nil {
 		t.Fatalf("LoadOrchestratePolicy returned error: %v", err)
 	}
-	if policy.CockpitMode != CockpitModeOn || policy.CockpitSession != "review-room" || policy.CockpitMaxPanes != 8 || policy.CockpitPaneKey != CockpitPaneKeySeat {
+	if policy.EscalationHandle != "owner" || policy.MaxDelegationTokenBudget != 12345 {
 		t.Fatalf("policy = %+v", policy)
+	}
+}
+
+// #1753 deleted the cockpit pane wrapper and its four [orchestrate].cockpit_*
+// keys. Every config.toml `gitmoot init` has ever written carries those keys, so
+// the deletion is only safe if an EXISTING config still loads. This is the
+// migration arm: a config that still names all four keys, including values that
+// the old validator would have REJECTED, must load clean and produce the same
+// policy as one without them.
+func TestLoadOrchestratePolicyIgnoresRetiredCockpitKeys(t *testing.T) {
+	withKeys := PathsForHome(t.TempDir())
+	if err := Initialize(withKeys); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(withKeys.ConfigFile, []byte(DefaultConfig(withKeys)+`
+[orchestrate]
+cockpit_mode = "maybe"
+cockpit_session = "review-room"
+cockpit_max_panes = 0
+cockpit_pane_key = "row"
+escalation_handle = "@owner"
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	legacy, err := LoadOrchestratePolicy(withKeys)
+	if err != nil {
+		t.Fatalf("a config still carrying cockpit_* keys must load: %v", err)
+	}
+
+	fresh := PathsForHome(t.TempDir())
+	if err := Initialize(fresh); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(fresh.ConfigFile, []byte(DefaultConfig(fresh)+`
+[orchestrate]
+escalation_handle = "@owner"
+`), 0o600); err != nil {
+		t.Fatalf("write config returned error: %v", err)
+	}
+	current, err := LoadOrchestratePolicy(fresh)
+	if err != nil {
+		t.Fatalf("a freshly initialized config must load: %v", err)
+	}
+	if legacy != current {
+		t.Fatalf("retired keys changed the policy:\n legacy = %+v\ncurrent = %+v", legacy, current)
+	}
+
+	// And a fresh `gitmoot init` must not write the retired keys back out.
+	for _, key := range []string{"cockpit_mode", "cockpit_session", "cockpit_max_panes", "cockpit_pane_key"} {
+		if strings.Contains(DefaultConfig(fresh), key) {
+			t.Fatalf("DefaultConfig still writes the retired key %q", key)
+		}
 	}
 }
 
@@ -574,30 +604,6 @@ func TestLoadOrchestratePolicyRejectsInvalidValues(t *testing.T) {
 		body    string
 		wantErr string
 	}{
-		{
-			name: "cockpit_mode",
-			body: `
-[orchestrate]
-cockpit_mode = "maybe"
-`,
-			wantErr: "unsupported orchestrate.cockpit_mode",
-		},
-		{
-			name: "cockpit_max_panes",
-			body: `
-[orchestrate]
-cockpit_max_panes = 0
-`,
-			wantErr: "cockpit_max_panes must be positive",
-		},
-		{
-			name: "cockpit_pane_key",
-			body: `
-[orchestrate]
-cockpit_pane_key = "row"
-`,
-			wantErr: "unsupported orchestrate.cockpit_pane_key",
-		},
 		{
 			name: "max_delegation_token_budget_non_int",
 			body: `

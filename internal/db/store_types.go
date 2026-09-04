@@ -279,27 +279,6 @@ type JobGate struct {
 	SatisfiedAt string
 }
 
-type InteractivePrompt struct {
-	ID            string   `json:"id"`
-	Question      string   `json:"question"`
-	Choices       []string `json:"choices,omitempty"`
-	Default       string   `json:"default,omitempty"`
-	Required      bool     `json:"required"`
-	AnswerFormat  string   `json:"answer_format"`
-	SourceCommand string   `json:"source_command"`
-	State         string   `json:"state"`
-	AnswerValue   string   `json:"answer_value,omitempty"`
-	AnswerSource  string   `json:"answer_source,omitempty"`
-	CreatedAt     string   `json:"created_at,omitempty"`
-	UpdatedAt     string   `json:"updated_at,omitempty"`
-	AnsweredAt    string   `json:"answered_at,omitempty"`
-}
-
-const (
-	InteractivePromptStatePending  = "pending"
-	InteractivePromptStateResolved = "resolved"
-)
-
 type BranchLock struct {
 	RepoFullName           string
 	Branch                 string

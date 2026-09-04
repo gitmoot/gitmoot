@@ -11,8 +11,8 @@ import (
 // hop. A coordinator dispatched with --skip-native-review-fanout that delegates
 // its implement leg produced a child whose payload had the flag CLEARED, so the
 // child's PR-open re-armed the native fanout and enlisted the implementer as its
-// own reviewer (#1236). delegationRequest inherits ~25 parent fields — including
-// RiskTier, ActingOrgRole and the cockpit trio — but dropped this one.
+// own reviewer (#1236). delegationRequest inherits many parent fields, including
+// RiskTier and ActingOrgRole, but dropped this one.
 func TestDelegationChildInheritsSkipNativeReviewFanout(t *testing.T) {
 	store := openEngineStore(t)
 	engine := testEngine(store)

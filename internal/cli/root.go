@@ -51,7 +51,6 @@ var rootCommands = []command{
 	{name: "workflow", summary: "inspect external-coordinator workflow groups and notes", run: runWorkflowJournal},
 	{name: "report", summary: "build and file bug reports", run: runReport},
 	{name: "lock", summary: "inspect and release branch locks", run: runLock},
-	{name: "interactive", summary: "inspect and answer interactive prompts", run: runInteractive},
 	{name: "escalation", summary: "inspect and repair blocked human-escalation rounds", run: runEscalation},
 	{name: "dashboard", summary: "show a snapshot of local Gitmoot state", run: runDashboard},
 	{name: "memory", summary: "inspect and measure agent persistent memory", run: runMemory},
@@ -149,8 +148,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 
 	// The one-shot `gitmoot doctor` opts into the live claude probe (LiveProbe)
 	// so a cached-creds box is reported accurately rather than false-warned. The
-	// dashboard (dashboard_tui.go) leaves LiveProbe false so its refresh loop
-	// never spawns claude.
+	// dashboard leaves LiveProbe false so refreshes never spawn claude.
 	// Resolve paths best-effort so the daemon-aware claude auth check (#427) can
 	// locate the running daemon. A failure here (no initialized home) just leaves
 	// Paths zero, which skips the daemon check and keeps the shell-local one —

@@ -196,8 +196,8 @@ func TestRetainedTranscriptLogAppendPermissionsDisabledAndOpenFailure(t *testing
 	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+"\n[transcripts]\nenabled = false\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if path, file, err := openRetainedTranscriptLog(home, "disabled"); err != nil || path != "" || file != nil {
-		t.Fatalf("disabled open = path %q file %v err %v", path, file, err)
+	if file, err := openRetainedTranscriptLog(home, "disabled"); err != nil || file != nil {
+		t.Fatalf("disabled open = file %v err %v, want no file and no error", file, err)
 	}
 	if _, err := os.Stat(filepath.Join(paths.Logs, "jobs")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("disabled capture created jobs dir: %v", err)
@@ -206,7 +206,8 @@ func TestRetainedTranscriptLogAppendPermissionsDisabledAndOpenFailure(t *testing
 	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	path, first, err := openRetainedTranscriptLog(home, "retry/id")
+	first, err := openRetainedTranscriptLog(home, "retry/id")
+	path := retainedTranscriptLogPathForTest(t, home, "retry/id")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +215,7 @@ func TestRetainedTranscriptLogAppendPermissionsDisabledAndOpenFailure(t *testing
 		t.Fatal(err)
 	}
 	_ = first.Close()
-	_, second, err := openRetainedTranscriptLog(home, "retry/id")
+	second, err := openRetainedTranscriptLog(home, "retry/id")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +234,7 @@ func TestRetainedTranscriptLogAppendPermissionsDisabledAndOpenFailure(t *testing
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("mode = %v, want 0600", info.Mode().Perm())
 	}
-	if _, file, err := openRetainedTranscriptLog(home, strings.Repeat("x", 5000)); err == nil || file != nil {
+	if file, err := openRetainedTranscriptLog(home, strings.Repeat("x", 5000)); err == nil || file != nil {
 		t.Fatalf("oversized filename open = file %v err %v, want fail-open signal", file, err)
 	}
 }
@@ -244,7 +245,8 @@ func TestRetainedTranscriptLogDefaultOn(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatal(err)
 	}
-	path, file, err := openRetainedTranscriptLog(home, "default-on")
+	file, err := openRetainedTranscriptLog(home, "default-on")
+	path := retainedTranscriptLogPathForTest(t, home, "default-on")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,5 +265,95 @@ func TestRetainedTranscriptLogDefaultOn(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 || info.Size() == 0 {
 		t.Fatalf("default-on log mode=%v size=%d", info.Mode().Perm(), info.Size())
+	}
+}
+
+// retainedTranscriptLogPathForTest derives the on-disk transcript location the
+// way production does. openRetainedTranscriptLog no longer returns the path
+// (#1787 review F5): no production caller read it, and a test can ask the same
+// authority production asks.
+func retainedTranscriptLogPathForTest(t *testing.T, home, jobID string) string {
+	t.Helper()
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		t.Fatalf("pathsFromFlag: %v", err)
+	}
+	return transcript.JobLogPath(paths.Logs, jobID)
+}
+
+// Seat-mode cockpit logs held UNREDACTED runtime output at 0600, and the only
+// code that ever removed them went with the TUI, so an upgraded installation
+// keeps them forever with no writer, reader or reaper (#1787 review F2). The
+// retention sweep now reaps that tree. Two properties matter beyond "the files
+// are gone": the reap must NOT be gated on the transcripts config, or turning
+// transcripts off becomes a way to preserve secrets, and it must leave the jobs
+// tree alone.
+func TestSweepReapsOrphanedSeatLogsEvenWhenTranscriptsAreDisabled(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		name := "transcripts_enabled"
+		if !enabled {
+			name = "transcripts_disabled"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			home := t.TempDir()
+			paths, err := pathsFromFlag(home)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := config.Initialize(paths); err != nil {
+				t.Fatal(err)
+			}
+			body := config.DefaultConfig(paths) + "\n[transcripts]\nenabled = " + map[bool]string{true: "true", false: "false"}[enabled] + "\n"
+			if err := os.WriteFile(paths.ConfigFile, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			seatDir := filepath.Join(paths.Logs, "seats", "root123")
+			if err := os.MkdirAll(seatDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			seatLog := filepath.Join(seatDir, "seat-a.log")
+			if err := os.WriteFile(seatLog, []byte("unredacted secret\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			jobsDir := filepath.Join(paths.Logs, "jobs")
+			if err := os.MkdirAll(jobsDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			keep := filepath.Join(jobsDir, "keep-me.log")
+			if err := os.WriteFile(keep, []byte("recent\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			store := daemonWorkerStore(t)
+			if _, err := sweepTranscriptRetention(ctx, paths, store, time.Now().UTC(), os.Remove); err != nil {
+				t.Fatalf("sweepTranscriptRetention: %v", err)
+			}
+			if _, err := os.Stat(seatLog); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("orphaned seat log survived the sweep: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(paths.Logs, "seats")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("orphaned seats tree survived the sweep: %v", err)
+			}
+			if _, err := os.Stat(keep); err != nil {
+				t.Fatalf("the sweep removed a live job transcript: %v", err)
+			}
+		})
+	}
+}
+
+// A home with no seats tree is the normal case after the first sweep, and must
+// not be an error or a repeated cost.
+func TestSweepWithNoSeatLogsIsClean(t *testing.T) {
+	home := t.TempDir()
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	removed, failed := reapOrphanedSeatLogs(paths, os.Remove)
+	if removed != 0 || failed != 0 {
+		t.Fatalf("reap on a home with no seats tree = removed %d failed %d, want 0/0", removed, failed)
 	}
 }

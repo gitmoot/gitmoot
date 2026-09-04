@@ -391,8 +391,6 @@ type agentRunOptions struct {
 	lead                   string
 	agent                  string
 	message                string
-	cockpit                bool
-	cockpitSession         string
 	skipNativeReviewFanout bool
 	recipe                 string
 }
@@ -444,11 +442,6 @@ func runOrchestrate(args []string, stdout, stderr io.Writer) int {
 	}
 	// Force the background run path: orchestrate always fans out delegations.
 	options.background = true
-	// Auto-detect: when orchestrate is launched from inside a Herdr session, default
-	// the cockpit on so panes "just appear" without an explicit --cockpit. An
-	// explicit --cockpit/--herdr/--cockpit-session already set it; outside Herdr it
-	// stays off; and the daemon's [orchestrate] cockpit_mode = off still vetoes.
-	options.cockpit = cockpitAutoEnabled(options.cockpit, os.Getenv("HERDR_ENV"))
 	selected, reason := selectOrchestrateAction(options)
 	output, exit := dispatchAgentCommand(options, selected, reason, "orchestrate", stdout, stderr)
 	if exit != 0 {
@@ -468,7 +461,7 @@ func runOrchestrate(args []string, stdout, stderr io.Writer) int {
 
 func printOrchestrateUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--recipe id] [--cockpit] [--cockpit-session name] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--recipe id] [--home path] [--json]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Orchestrate work across agents (a coordinator that fans out delegations).")
 	fmt.Fprintln(w, "Sugar for `gitmoot agent run <agent> --background`: the named agent is the")
@@ -629,8 +622,6 @@ func localAgentDispatchRequestFromOptions(options agentRunOptions, action, reaso
 		ImplementBase:          options.base,
 		Branch:                 options.branch,
 		LeadAgent:              options.lead,
-		Cockpit:                options.cockpit,
-		CockpitSession:         options.cockpitSession,
 		SkipNativeReviewFanout: options.skipNativeReviewFanout,
 		Recipe:                 options.recipe,
 		SelectedAction:         action,
@@ -663,12 +654,20 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
 		switch {
+		// Flags removed with the TUI are rejected BY NAME, before any positional
+		// counting. The unknown-flag arm below only fires once two positionals
+		// exist, so `orchestrate agent --cockpit "do it"` used to swallow the
+		// stale flag as the agent's message, and `orchestrate agent --cockpit`
+		// ran all the way to repo inference with message "--cockpit" (#1787
+		// review F6). A script that still passes one must be told what happened.
+		case arg == "--cockpit" || arg == "--herdr" || arg == "--cockpit-session" ||
+			strings.HasPrefix(arg, "--cockpit-session="):
+			fmt.Fprintf(stderr, "%s: %s was removed with the terminal cockpit; drop the flag\n", label, strings.SplitN(arg, "=", 2)[0])
+			return agentRunOptions{}, false
 		case arg == "--background":
 			options.background = true
 		case arg == "--json":
 			options.jsonOutput = true
-		case arg == "--cockpit" || arg == "--herdr":
-			options.cockpit = true
 		case arg == "--skip-native-review-fanout":
 			options.skipNativeReviewFanout = true
 		case arg == "--draft" || arg == "--ready":
@@ -679,7 +678,7 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			}
 			options.pullRequestMode = mode
 			options.pullRequestReady = mode == "ready"
-		case arg == "--type" || arg == "--action" || arg == "--model" || arg == "--effort" || arg == "--workflow" || arg == "--org-role" || arg == "--runtime" || arg == "--session" || arg == "--repo" || arg == "--home" || arg == "--task" || arg == "--pr" || arg == "--head-sha" || arg == "--base" || arg == "--branch" || arg == "--lead" || arg == "--cockpit-session" || arg == "--recipe":
+		case arg == "--type" || arg == "--action" || arg == "--model" || arg == "--effort" || arg == "--workflow" || arg == "--org-role" || arg == "--runtime" || arg == "--session" || arg == "--repo" || arg == "--home" || arg == "--task" || arg == "--pr" || arg == "--head-sha" || arg == "--base" || arg == "--branch" || arg == "--lead" || arg == "--recipe":
 			if index+1 >= len(args) {
 				fmt.Fprintf(stderr, "%s requires a value for %s\n", label, arg)
 				return agentRunOptions{}, false
@@ -688,8 +687,6 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			if !setAgentRunOption(&options, arg, args[index], stderr) {
 				return agentRunOptions{}, false
 			}
-		case strings.HasPrefix(arg, "--cockpit-session="):
-			options.cockpitSession = strings.TrimSpace(strings.TrimPrefix(arg, "--cockpit-session="))
 		case strings.HasPrefix(arg, "--type="):
 			options.typeName = strings.TrimPrefix(arg, "--type=")
 		case strings.HasPrefix(arg, "--action="):
@@ -751,11 +748,6 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 		fmt.Fprintf(stderr, "%s requires exactly one agent and one message\n", label)
 		return agentRunOptions{}, false
 	}
-	// --cockpit-session implies --cockpit so naming a session does not silently
-	// no-op when the bare --cockpit flag was omitted.
-	if strings.TrimSpace(options.cockpitSession) != "" {
-		options.cockpit = true
-	}
 	normalizedRecipe, err := validateRecipeID(options.recipe)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", label, err)
@@ -791,14 +783,6 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 		return agentRunOptions{}, false
 	}
 	return options, true
-}
-
-// cockpitAutoEnabled implements the cockpit "auto" default: it stays whatever the
-// user explicitly chose, otherwise turns on when launched from inside a Herdr
-// session (a non-empty HERDR_ENV). The daemon's [orchestrate] cockpit_mode = off
-// is the host-level veto applied later.
-func cockpitAutoEnabled(explicit bool, herdrEnv string) bool {
-	return explicit || strings.TrimSpace(herdrEnv) != ""
 }
 
 func setAgentRunOption(options *agentRunOptions, flagName string, value string, stderr io.Writer) bool {
@@ -846,8 +830,6 @@ func setAgentRunOption(options *agentRunOptions, flagName string, value string, 
 			return false
 		}
 		options.lead = value
-	case "--cockpit-session":
-		options.cockpitSession = value
 	case "--recipe":
 		options.recipe = value
 	case "--pr":
@@ -902,7 +884,7 @@ func printAgentRunUsage(w io.Writer, command string) {
 	fmt.Fprintln(w, "Usage:")
 	switch command {
 	case "orchestrate":
-		fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--draft|--ready] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--recipe id] [--cockpit] [--cockpit-session name] [--skip-native-review-fanout] [--home path] [--json]")
+		fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--draft|--ready] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--recipe id] [--skip-native-review-fanout] [--home path] [--json]")
 	case "review":
 		fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--lead implementer] [--head-sha sha] [--branch branch] [--background] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--home path] [--json]")
 	case "implement":
@@ -1990,7 +1972,7 @@ func runAgentList(args []string, stdout, stderr io.Writer) int {
 // isEphemeralAgentName reports whether an agent name is a transient ephemeral
 // worker materialized from a delegation spec (#325). Such workers are persisted
 // only for the duration of their job and auto-disposed; they are excluded from
-// the registry listings (mirroring the dashboard TUI's isEphemeralAgent filter).
+// registry listings.
 func isEphemeralAgentName(name string) bool {
 	return strings.Contains(name, "-ephemeral-")
 }

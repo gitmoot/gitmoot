@@ -494,80 +494,23 @@ Open-PR repos remain at base cadence because their per-PR comment reads are not
 conditional. Decay gates repository GitHub calls only; heartbeat and pipeline
 maintenance still wakes at the base interval.
 
-`gitmoot dashboard` shows local state — daemon health, repos, agents and runtime
-sessions, jobs by state, worktrees, branch locks, and pending interactive
-prompts.
-
-On a real terminal (stdin and stdout both a TTY) and with no other output/mutation
-flag, `gitmoot dashboard` launches an **interactive TUI**: a sidebar of pages
-(Attention, Activity, Agents, Workers, Jobs, Locks, Health, Config)
-that auto-refreshes.
-Navigate with `tab`/`shift+tab` or `←/→`; `↑/↓` selects a row; `?` opens a
-per-page key reference; `r` refreshes, `q` quits. The TUI is the cockpit — every
-page can act, and each action runs the same store/workflow code as its CLI
-equivalent:
-
-- **Attention** lists pending prompts (`a` answer inline, `d` dismiss) and the
-  actual blocked/failed/cancelled jobs with their latest event message
-  (`enter` detail, `R` retry, `B` report bug). A red banner appears when the
-  daemon is stopped; `s` restarts it with its previously persisted flags.
-- **Activity** shows the **live orchestras**: each active delegation root with
-  its children, so "what are my agents working on right now" is answered at a
-  glance; `enter` opens the request/result detail of a root or a specific
-  delegate.
-- **Agents** lists registered agents: `enter` opens a detail with the template,
-  recent jobs, and the template's version history — in the detail `↑/↓` selects a
-  recent job (then a version) and `enter` opens it: a recent job opens that job's
-  detail (`esc` returns), and the list scrolls when an agent has many jobs; `n`
-  registers a new agent
-  (name, codex/claude/kimi runtime, installed template); `o` starts a training
-  session for the agent's template via a pre-filled form (review/workspace
-  repos, request, codex/claude backend, optional model — the backend/model are
-  stored in the session's optimizer defaults so `train continue` inherits
-  them), then drops into the live phase view; `D` deletes the agent (refused
-  while jobs reference it); `v` in the detail reverts the template to a
-  previous version (same as `gitmoot agent template revert`).
-- **Jobs** lists every job with a state summary: `enter` shows the event
-  history, `R` retries failed/blocked/cancelled jobs (same path as
-  `gitmoot job retry`), `c` cancels queued, running, AND blocked jobs (same as
-  `gitmoot job cancel`; running ones show `cancelling…` until the daemon
-  settles them), and `B` opens a redacted bug-report preview for
-  failed/blocked/cancelled jobs. In the preview, `g` creates or reuses the
-  GitHub issue and keeps the issue URL visible.
-- **Locks** explains and lists locks, stale resource locks first in red (the
-  owning process died; a running daemon reclaims them automatically); active
-  locks collapse to a count. Branch locks are released with
-  `gitmoot lock release owner/repo <branch> --owner <agent>`.
-- **Workers** lists runtime workers (agent sessions). **Health** shows the
-  daemon block (running state, persisted flags, log error tail) plus
-  environment checks. **Config** renders the effective config with inline
-  edits for scalar fields (or `$EDITOR` for the full file).
-
-Form questions are also published as interactive prompt records, so an agent can
-answer them with `gitmoot interactive answer` while the form is open. Inline
-answers/dismissals use the same store APIs as `gitmoot interactive answer` /
-`clear`.
-
-Everywhere else — pipes, redirects, CI, `--plain`, `--json`, `--all`, `--watch`,
-`--answer`, `--dismiss` — it prints the one-shot snapshot instead, unchanged. Set
-`GITMOOT_NO_TUI=1` or `TERM=dumb` to force the non-interactive path globally.
+`gitmoot dashboard` prints a styled one-shot snapshot of local state — daemon
+health, repos, agents and runtime sessions, jobs by state, worktrees, and branch
+locks. It prints the same snapshot everywhere: terminal, pipe, or CI.
 
 ```sh
-gitmoot dashboard                  # interactive TUI on a terminal
-gitmoot dashboard --plain          # one-shot snapshot on a terminal
+gitmoot dashboard                  # styled one-shot snapshot
 gitmoot dashboard --json
 gitmoot dashboard --all
-gitmoot dashboard --answer <prompt-id> --value <value>
-gitmoot dashboard --dismiss <prompt-id>
-gitmoot dashboard --watch          # plain redraw until Ctrl-C (terminal only)
+gitmoot dashboard --watch          # redraw until Ctrl-C (terminal only)
 gitmoot dashboard --watch --interval 2s
 gitmoot dashboard --web [--addr 127.0.0.1:8080]
 ```
 
-In the one-shot styled output the dashboard leads with a "needs attention" block,
-colors and truncates long lists, and groups near-identical runtime sessions;
-`--all` shows everything. `--watch` redraws on an interval (default 5s) and cannot
-be combined with `--json`, `--answer`, or `--dismiss`.
+The styled output leads with a "needs attention" block, colors and truncates
+long lists, and groups near-identical runtime sessions; `--all` shows
+everything. `--watch` redraws on an interval (default 5s) and cannot be
+combined with `--json`.
 
 `gitmoot dashboard --web` serves the **read-only web dashboard** until
 interrupted: a live orchestration/delegation graph plus whole-history Galaxy,
@@ -1765,8 +1708,7 @@ or job update has been quiet for `[workflow].auto_settle_after` (default `24h`;
 set `"0"` to disable). Daemon receipts do not extend the quiet period.
 Auto-settle appends an `[auto:workflow:settled]` note, sets status to `settled`,
 never deletes data, and any later note revives the workflow. Two edges are
-reversible-by-note rather than auto-revived: a task paused at `awaiting_human`
-(still shown in the dashboard Attention section regardless of workflow status),
+reversible-by-note rather than auto-revived: a task paused at `awaiting_human`,
 and a PR reopened after auto-settle — post a workflow note to revive it.
 
 Linked PR transitions add structured `[auto:pr:...]` notes as author `daemon`
@@ -2050,12 +1992,12 @@ runtime/model (per-job override first, then the agent default), workflow label,
 and the redacted, length-capped prompt — so a pane or saved transcript is
 self-describing.
 
-`job watch --transcript` follows a cockpit tee log from offset zero and renders
+`job watch --transcript` follows a runtime tee log from offset zero and renders
 redacted, bounded human-readable runtime output until the job settles, then
 drains the file to EOF. It is incompatible with `--json`. Without `--log-path`,
 Gitmoot derives the job-mode path under `<home>/logs/jobs/`; if that file is not
 available, it prints `transcript unavailable; showing job events` and uses the
-normal event watcher. `--log-path` and `--runtime` are primarily cockpit wiring
+normal event watcher. `--log-path` and `--runtime` are primarily internal wiring
 flags, but remain usable for diagnosis. When `--runtime` is omitted, the job's
 runtime override wins over the registered agent runtime.
 
@@ -2089,7 +2031,7 @@ Verified Codex command/file-change events and Kimi function tool calls/results
 render as typed compact lines; unrecognized shapes keep the generic/raw
 fail-open path. Render-time redaction is a per-line best-effort defense in depth:
 a secret split across physical lines may be only partially masked, and the raw
-cockpit log plus the external `tail -F` fallback remain unredacted.
+tee log plus the external `tail -F` fallback remain unredacted.
 
 ### Resumable gates (make `blocked` + `needs` actionable)
 
@@ -2430,18 +2372,6 @@ system owns the merge decision, set `GITMOOT_DISABLE_NATIVE_MERGE_GATE=1`
 (also `true`/`yes`/`on`; #545): Gitmoot then **abstains** from its native merge
 gate — fail-closed, it never merges gatelessly; the external gate makes the
 call.
-
-## Interactive Prompts
-
-Pending interactive prompts (dashboard form questions, ask-gate questions) can
-be answered from the CLI:
-
-```sh
-gitmoot interactive list [--state pending|resolved|all] [--json]
-gitmoot interactive show <id> --json
-gitmoot interactive answer <id> <value> [--source source]
-gitmoot interactive clear <id> [<id>...] | --resolved | --all
-```
 
 ## Result Checks
 

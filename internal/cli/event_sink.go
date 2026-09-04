@@ -94,7 +94,7 @@ func resolveDaemonEventSinkWithRules(store *db.Store, home string, rules []db.Ev
 		inner: webhook,
 		store: store,
 		home:  home,
-		wake:  cockpit.New(cockpit.Options{HerdrBin: "herdr"}, nil),
+		wake:  cockpit.New(cockpit.Options{HerdrBin: "herdr"}),
 	}
 	eventSinkCache.rules[key] = sink
 	return sink

@@ -221,8 +221,8 @@ func (w *jobWorker) executionDeliveryAdapter(agent runtime.Agent, checkout strin
 	if runner == nil {
 		return nil, errors.New("execution-backend runtime runner is required")
 	}
-	// Keep the run-scoped base runner so a later cockpit tee rebuild preserves
-	// backend execution.
+	// Keep the run-scoped base runner so a later live-output adapter rebuild
+	// preserves backend execution.
 	w.executionRunner = runner
 	if len(outputs) > 0 && outputs[0] != nil {
 		stream, ok := runner.(subprocess.StreamRunner)
