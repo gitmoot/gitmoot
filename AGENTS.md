@@ -106,15 +106,14 @@ go test -timeout 25m -skip 'TestClaudeProduceHookAutoReadLandlockE2E' ./...
 `-buildvcs=false` is required, not optional, inside a gitmoot worktree (#1209):
 Go's VCS auto-stamp only recognizes a `.git` **directory** as a repo root
 (`cmd/go/internal/vcs.vcsGit.RootNames`), but a linked worktree's `.git` is a
-**file** (a `gitdir:` pointer). Go's root-detection walk-up skips past the
-worktree's real root looking for any ancestor with a `.git`-shaped directory,
-and can land on an unrelated one — hard-failing with `error obtaining VCS
-status: exit status 128` even though `git status` itself works fine from the
-same directory. This is a genuine Go toolchain limitation with linked
-worktrees (confirmed by reading `cmd/go/internal/vcs/vcs.go`'s `FromDir` /
-`isVCSRoot`), not something gitmoot's code or config can fix, and even the
-non-failing cases can silently stamp the wrong VCS metadata (wrong commit,
-wrong dirty bit) from whatever directory the walk-up happened to land on.
+**file** (a `gitdir:` pointer), so the root-detection walk-up skips the
+worktree's real root and keeps going up. What happens next depends on what the
+walk finds, and it is stated once in the deploy recipe below rather than twice
+here: see "Deploy recipe (this host)", step 1. The short version is that the
+quiet outcome is the dangerous one, not the `exit status 128` failure. This is a
+Go toolchain behavior with linked worktrees, not something gitmoot's code or
+config can fix.
+
 Disabling it here costs nothing real: release binaries get their version
 info from the explicit `-ldflags -X ...Commit=$(git rev-parse HEAD)` recipe
 in the deploy section below, never from Go's auto-stamp.
@@ -261,17 +260,53 @@ detection.
 
 ## Deploy recipe (this host)
 
-1. On `main` after merge, build with the pinned toolchain (above). Stamp the
-   version the way `release.yml` does, or `gitmoot version` reports
-   `commit: unknown`:
+1. On `main` after merge, build with the pinned toolchain (above), from a clean
+   detached worktree at the exact tip rather than the shared `/root/gitmoot`
+   checkout, which usually carries uncommitted work. Stamp the version the way
+   `release.yml` does, or `gitmoot version` reports `commit: unknown`.
+   `-buildvcs=false` is required for the same reason as the test gate above: in
+   a linked worktree `.git` is a **file**, which the pinned toolchain does not
+   treat as a repository root, so it walks up to the parent directories. What
+   that walk finds decides the outcome. Measured with a throwaway module on
+   go1.26.4:
+
+   - **no repository anywhere above it**: the build succeeds and simply omits
+     the stamp. This case is tolerated, not an error;
+   - **a `.git` DIRECTORY above it that git rejects as a repository**: the build
+     **fails** with `error obtaining VCS status: exit status 128`. A `.git`
+     **file** never produces this: it is skipped, and the walk continues past
+     it. This is not hypothetical here: `/tmp/.git` exists on this host as a
+     directory (`ls -A` returns nothing, and `git -C /tmp status` fails), so a
+     deploy worktree anywhere under `/tmp` hits it, and it will not be the only
+     such directory on any given host;
+   - **a working unrelated repository above it**: the build **succeeds** and
+     stamps that repository's metadata. A binary built from commit `1f76f143`
+     embedded the ancestor's `vcs.revision 60f8282c` and `vcs.modified true`.
+
+   The third case is the one to design against, because it is silent. The
+   `-ldflags` below override `Commit`, so `gitmoot version` still prints the
+   right value and the wrong stamp stays hidden in the embedded build info.
+   Drop the ldflags and `buildinfo.Current` falls back to that VCS revision
+   (`internal/buildinfo/buildinfo.go`), so an unstamped binary reports an
+   ancestor's commit as its own and the daemon build-skew check compares a
+   false identity rather than an unknown one.
+
+   Treat the `.git`-file behavior as version-specific rather than permanent:
+   Go's handling of it is being changed upstream, and `-buildvcs=false` is what
+   makes all three outcomes moot.
 
    ```sh
+   git worktree add --detach /root/gitmoot-deploy "$(git rev-parse HEAD)"
+   cd /root/gitmoot-deploy
    PKG=github.com/gitmoot/gitmoot/internal/buildinfo
-   CGO_ENABLED=0 go build -trimpath -ldflags \
+   CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags \
      "-s -w -X $PKG.Version=dev-$(git rev-parse --short HEAD) \
       -X $PKG.Commit=$(git rev-parse HEAD) -X $PKG.Date=$(date -Iseconds)" \
      -o /root/.local/bin/gitmoot.new ./cmd/gitmoot
    ```
+
+   Remove the deploy worktree when the deploy is done:
+   `git worktree remove /root/gitmoot-deploy`.
 
 2. `mv`-rename the new binary into `/root/.local/bin/gitmoot` (same filesystem;
    the rename avoids `ETXTBSY`).
@@ -462,7 +497,7 @@ Under ultracode, orchestrate via the Workflow tool with opus sub-agents
 
 ## Workload mode
 
-**Current mode: STEADY.**
+**Current mode: THROUGHPUT.**
 
 A mode decision is an append-only
 `[operating-mode repo=<owner/repo> mode=<THROUGHPUT|STEADY|DRAIN>]` workflow
@@ -517,13 +552,16 @@ detail and keying on it let unrelated churn defer the bound indefinitely.
 A scan that LOSES the at-most-once claim is a separate case and never parks the
 run: it cannot see whether the winner is alive, and a hold record has no expiry,
 so believing one killed runs whose reconciliation had already succeeded. It ages
-the wait from the GATE STAGE'S OWN `StartedAt` - one clock, one write, no second
-row to fall out of step with the claim - and records
-`pipeline_auto_merge_claim_orphaned` once the wait passes 15m, with
-`cause=held_past_bound`. A gate row with no recorded start time cannot be aged
-at all, and a wait that cannot be aged is recorded immediately with
-`cause=gate_start_unrecorded` rather than left silent. Either way it keeps
-waiting, and a stage `timeout` is what turns that into a park.
+the wait from THE CLAIM ROW'S OWN `created_at` - one write, no second row to fall
+out of step with the claim, and a value resume does not reset - and records
+`pipeline_auto_merge_claim_orphaned` once the claim has been held 15m, with
+`cause=held_past_bound`. If a genuinely orphaned claim is the cause, THIS run
+cannot merge: nothing in the pipeline releases that claim, its key is fixed for
+the run, and a stage `timeout` on the gate parks the run rather than recovering
+it - re-running the pipeline takes a fresh claim. A claim whose `created_at`
+will not parse cannot be aged at all; that is recorded immediately with
+`cause=claim_timestamp_unreadable`, and a stage `timeout` CANNOT park that wait,
+because `pipelineGateTimedOut` needs a start stamp it does not have.
 
 Resolve the active decision from both durable sources: read the marker from
 `origin/main:AGENTS.md`, never a seat worktree, and read the newest typed

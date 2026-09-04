@@ -3844,10 +3844,12 @@ Pending checks wait; skipped/neutral check-runs pass; failures block; and zero
 external statuses/checks always block regardless of `require_external_ci`. The
 source job atomically records `pipeline_auto_merge_claim` before the write,
 `pipeline_auto_merge_confirmed` after GitHub confirms it. A scan that loses the
-claim never parks the run; it ages its wait from the gate stage's own
-`StartedAt` and records `pipeline_auto_merge_claim_orphaned` past 15m, or
-immediately with `cause=gate_start_unrecorded` when that stamp is missing, and
-keeps waiting. A workload-mode
+claim never parks the run; it ages its wait from the claim row's own
+`created_at` and records `pipeline_auto_merge_claim_orphaned` past 15m, or
+immediately with `cause=claim_timestamp_unreadable` when that value will not
+parse, and keeps waiting. A stage `timeout` parks the aged case terminally
+rather than recovering it - nothing releases an orphaned claim, so a new run is
+the remedy - and cannot park the unreadable case at all. A workload-mode
 reconciliation hold records `pipeline_auto_merge_held` with its cause, releases
 the claim so the merge is re-attempted when the row lands, and parks with that
 cause at the gate `timeout` or 24h after the hold began when no timeout is set;

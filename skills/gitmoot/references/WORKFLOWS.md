@@ -1047,10 +1047,11 @@ the write and `pipeline_auto_merge_confirmed` after GitHub confirms it, plus
 `pipeline_auto_merge_held` when a workload-mode reconciliation hold parks the
 gate: that hold releases the claim and retries, and is bounded by the gate
 `timeout` or by 24h from the start of the hold episode, keyed on the head and
-the decision rather than the cause text. A scan that loses the claim ages its wait from the gate stage's own `StartedAt`
+the decision rather than the cause text. A scan that loses the claim ages its wait from the claim row's own `created_at`
 and records `pipeline_auto_merge_claim_orphaned` past 15m - or immediately, with
-`cause=gate_start_unrecorded`, when that stamp is missing - and waits rather
-than parking.
+`cause=claim_timestamp_unreadable`, when that value will not parse - and waits
+rather than parking. A stage `timeout` parks the aged case terminally instead of
+recovering it, and cannot park the unreadable case at all.
 
 `pipeline add` warns (does not block) when an agent stage names an agent that does
 not exist yet; create it before the stage runs. The
