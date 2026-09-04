@@ -410,13 +410,78 @@ const minRunnableTargetChars = 4
 
 // namesARunnableTarget reports whether one entry names something with the shape
 // of a command, path or target rather than a bare phrase.
+//
+// A TERMINAL DOT IS NOT A TARGET, and that distinction is the whole fix. An
+// earlier form accepted any token of four or more characters containing "/" or
+// ".", which SENTENCE-FINAL PUNCTUATION supplies: measured, "none run." and
+// "nothing to run." satisfied it, so four of five entries stating the OPPOSITE
+// of execution passed as proof of it - and so did "everything looks fine.",
+// the exact phrase the shipped contract promises is refused. tests_run entries
+// are agent-written prose, so terminal punctuation is the common case rather
+// than an edge one.
+//
+// A real target is therefore recognised by SHAPE: it contains a path separator
+// in a path-like position, or an INTERIOR dot with an alphanumeric on both
+// sides - "./...", "internal/workflow/", "go1.26.4", "main.go". A sentence
+// ending in a full stop has neither.
 func namesARunnableTarget(entry string) bool {
 	for _, field := range strings.Fields(entry) {
-		if len(field) >= minRunnableTargetChars && strings.ContainsAny(field, "/.") {
+		// NO PUNCTUATION TRIMMING. It was tried and removed: a mutant deleting
+		// it changed no outcome, because the two rules below already refuse a
+		// token whose only dot is terminal. Keeping a line that cannot fail
+		// would have implied the fix rested on it, and it does not.
+		if isPathShaped(field) {
+			return true
+		}
+		if len(field) >= minRunnableTargetChars && hasInteriorDot(field) {
 			return true
 		}
 	}
 	return false
+}
+
+// isPathShaped reports whether value looks like a path or package target.
+//
+// Length alone cannot decide this: "./..." is five characters and is a real
+// target, while "n/a" is three and is a phrase meaning the opposite. So a slash
+// counts when the token is long enough to be a path OR carries path SHAPE - a
+// leading "./" or "../", or a trailing separator.
+func isPathShaped(value string) bool {
+	if !strings.Contains(value, "/") {
+		return false
+	}
+	switch {
+	case strings.HasPrefix(value, "./"), strings.HasPrefix(value, "../"), strings.HasPrefix(value, "/"):
+		return true
+	case strings.HasSuffix(value, "/"):
+		return true
+	default:
+		return len(value) >= minRunnableTargetChars+2
+	}
+}
+
+// hasInteriorDot reports whether value carries a dot with an alphanumeric
+// character on both sides, which is what separates "main.go" or "go1.26.4"
+// from a sentence that merely ends in a full stop.
+func hasInteriorDot(value string) bool {
+	for i := 1; i < len(value)-1; i++ {
+		if value[i] != '.' {
+			continue
+		}
+		if isAlphanumericByte(value[i-1]) && isAlphanumericByte(value[i+1]) {
+			return true
+		}
+	}
+	return false
+}
+
+func isAlphanumericByte(c byte) bool {
+	switch {
+	case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		return true
+	default:
+		return false
+	}
 }
 
 // reviewVerdictAccountsForItself reports whether a terminal review verdict

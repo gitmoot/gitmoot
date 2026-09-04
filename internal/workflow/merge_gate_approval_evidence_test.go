@@ -71,3 +71,84 @@ func TestMergeGateRecordsApprovalEvidence(t *testing.T) {
 		})
 	}
 }
+
+// TestMergeGateRecordsNothingForARefusedApproval pins the F2 defect: the
+// annotation used to fire the moment a row LOOKED approved, before the gate
+// could refuse it. Measured then: an approval the gate rejects still wrote
+// "approval by selfy ... evidence=executed", so the durable record could not
+// tell an approval that authorised a merge from one that was refused - the very
+// ambiguity the field exists to remove.
+func TestMergeGateRecordsNothingForARefusedApproval(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	// An approval with NO recorded reviewer author, which the gate refuses
+	// because an independent reviewer cannot be verified. (A literal
+	// self-approval cannot be built through this helper: it renames the
+	// implementer whenever the reviewer would collide with it.)
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-self", Agent: "", Type: "review"}, JobPayload{
+		Repo: "mobile/app", Branch: "task-9", PullRequest: 9, HeadSHA: "head123",
+		TaskID: "task-9", ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "approved", Summary: "approved at head123 with no recorded author, which the gate must refuse",
+			TestsRun: []string{"go test ./... -> ok"}, Evidence: EvidenceExecuted,
+		},
+	})
+
+	err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
+		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9",
+	}, "head123")
+	if err == nil {
+		t.Fatal("an unattributed approval must not clear the gate; this test's premise is broken")
+	}
+
+	events, listErr := store.ListJobEvents(ctx, "review-self")
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	for _, event := range events {
+		if event.Kind == mergeApprovalEvidenceEvent {
+			t.Fatalf("the gate recorded %q for an approval it REFUSED (%v): nothing was authorised", event.Message, err)
+		}
+	}
+}
+
+// TestMergeGateApprovalEvidenceIsRecordedOnce pins F3. ensureFinalReviewCaptured
+// runs on every merge-gate pass, so a PR pending on CI is re-evaluated on every
+// poll; the first version wrote one row per evaluation. The earlier test could
+// not see it, because it called the gate once and kept only the LAST matching
+// event - it would have passed at any duplication factor.
+func TestMergeGateApprovalEvidenceIsRecordedOnce(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-1", Agent: "gm-review-opus", Type: "review"}, JobPayload{
+		Repo: "mobile/app", Branch: "task-9", PullRequest: 9, HeadSHA: "head123",
+		TaskID: "task-9", ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "approved", Summary: "verified the head at head123",
+			TestsRun: []string{"go test ./... -> ok"}, Evidence: EvidenceExecuted,
+		},
+	})
+
+	gate := PolicyMergeGate{Store: store}
+	for i := 0; i < 5; i++ {
+		if err := gate.ensureFinalReviewCaptured(ctx, MergeRequest{
+			Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "gm-review-opus",
+		}, "head123"); err != nil {
+			t.Fatalf("evaluation %d: %v", i, err)
+		}
+	}
+
+	events, err := store.ListJobEvents(ctx, "review-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, event := range events {
+		if event.Kind == mergeApprovalEvidenceEvent {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("5 gate evaluations of ONE approval produced %d annotations, want exactly 1: the row count scales with poll count, not approvals", count)
+	}
+}

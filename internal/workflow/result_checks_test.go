@@ -431,7 +431,20 @@ func keys(m map[string]ResultCheck) []string {
 // stating the OPPOSITE of execution were accepted as proof of it: "none run"
 // and "could not run" are two words each, so the two-word arm let them through.
 func TestExecutedClaimNeedsARunnableTarget(t *testing.T) {
-	hollow := []string{"none run", "could not run", "nothing to run", "ok", "n/a"}
+	// PUNCTUATED VARIANTS ARE THE COMMON CASE, not an edge one: tests_run
+	// entries are agent-written prose. A trailing full stop used to supply the
+	// "." that satisfied the predicate, so four of the five bare phrases below
+	// passed once punctuated - including "everything looks fine.", the exact
+	// phrase the shipped contract promises is refused.
+	hollow := []string{
+		"none run", "could not run", "nothing to run", "ok", "n/a",
+		"none run.", "could not run.", "nothing to run.", "n/a.", "ok.",
+		"everything looks fine.", "no tests were run.", "Nothing.",
+		"tests could not be executed in this sandbox.",
+		"I did not run anything at all.",
+		"unable to run the suite; static review only.",
+		"none - sandbox refused execution.",
+	}
 	for _, entry := range hollow {
 		result := AgentResult{
 			Decision: "approved",
@@ -445,7 +458,15 @@ func TestExecutedClaimNeedsARunnableTarget(t *testing.T) {
 		}
 	}
 
-	real := []string{"go test ./... -> ok", "go build ./internal/workflow/ rc=0", "gofmt -l internal/ -> clean"}
+	real := []string{
+		"go test ./... -> ok", "go build ./internal/workflow/ rc=0",
+		"gofmt -l internal/ -> clean",
+		// Punctuated REAL entries must still pass: the fix strips trailing
+		// punctuation rather than refusing anything that carries it.
+		"ran go test ./internal/cli/ and it passed.",
+		"go version go1.26.4 linux/amd64.",
+		"inspected main.go and result_checks.go.",
+	}
 	for _, entry := range real {
 		result := AgentResult{
 			Decision: "approved",

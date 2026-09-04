@@ -751,7 +751,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			}
 		}
 	}
-	adapter, narrowingDropped, err := wrapReadOnlySandboxAdapter(w.ConfigHome, agent, deliveryCheckout, adapter)
+	adapter, narrowingDropped, err := wrapReadOnlySandboxAdapter(w.ConfigHome, agent, deliveryCheckout, payload.Repo, adapter)
 	if len(narrowingDropped) > 0 {
 		// Narrowing is not silent: a reviewer whose MCP tool is missing, or a
 		// seat that cannot authenticate to a provider whose key was withheld,
@@ -1480,12 +1480,16 @@ func (a readOnlyRuntimeAdapter) cleanup() error {
 	return nil
 }
 
-func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout string, adapter workflow.DeliveryAdapter) (workflow.DeliveryAdapter, []string, error) {
+// reviewRepo is the repo of the JOB being run, which is what the seat's
+// evidence must be scoped to. It is distinct from agent.RepoScope: a seat's
+// registered scope is an authorisation boundary, not a statement about the job
+// in hand, and nothing in the tree makes the two agree.
+func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout string, reviewRepo string, adapter workflow.DeliveryAdapter) (workflow.DeliveryAdapter, []string, error) {
 	if !agent.ReadOnlySeat {
 		return adapter, nil, nil
 	}
 	_, gatewayMode := adapter.(modelGatewayRuntimeAdapter)
-	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, gatewayMode)
+	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, reviewRepo, gatewayMode)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1702,19 +1706,35 @@ func selectedRuntimeConfigDir(runtimeName string) string {
 //
 // A failure here is NEVER fatal: the seat loses evidence and says so through
 // the returned diagnostic.
-func stagePriorVerdicts(ctx context.Context, paths config.Paths, cacheRoot string, repoScope string) (string, string) {
+func stagePriorVerdicts(ctx context.Context, paths config.Paths, cacheRoot string, reviewRepo string) (string, string) {
 	if strings.TrimSpace(paths.Database) == "" || strings.TrimSpace(cacheRoot) == "" {
 		return "", ""
 	}
-	if info, err := os.Stat(paths.Database); err != nil || info.IsDir() {
-		// No store yet is the normal case on a fresh home, not a defect.
+	switch info, err := os.Stat(paths.Database); {
+	case err != nil && os.IsNotExist(err):
+		// No store yet is the normal case on a fresh home, not a defect, and
+		// it is the ONLY error that may pass silently.
 		return "", ""
+	case err != nil:
+		// Everything else - EACCES, ENOTDIR, EIO, a dangling symlink - used to
+		// return silently here and read as "fresh home", so the seat reviewed
+		// with no prior verdicts and the operator saw no diagnostic. That is
+		// the silent degradation this function exists to remove.
+		return "", fmt.Sprintf("workflow evidence: stat store %s: %v", paths.Database, err)
+	case info.IsDir():
+		return "", fmt.Sprintf("workflow evidence: store path %s is a directory", paths.Database)
 	}
-	repo := strings.TrimSpace(repoScope)
+	repo := strings.TrimSpace(reviewRepo)
 	if repo == "" || strings.Contains(repo, "*") {
-		// Without a single concrete repo there is nothing to scope TO, and an
-		// unscoped copy is the defect this function exists to remove.
-		return "", "workflow evidence: seat has no single repo scope, so no verdict list was staged"
+		// Without the repo of the job in hand there is nothing to scope TO,
+		// and an unscoped copy is the defect this function exists to remove.
+		//
+		// The key is deliberately the REVIEWED repo and not agent.RepoScope. A
+		// seat's registered scope is an authorisation boundary - it may be a
+		// wildcard, and nothing in the tree makes it agree with a job's repo -
+		// so keying on it could hand a seat a different repo's verdicts than
+		// the one it is reviewing while the artifact claimed otherwise.
+		return "", "workflow evidence: no repo under review, so no prior-verdict list was staged"
 	}
 	store, err := db.OpenReadOnly(paths.Database)
 	if err != nil {
@@ -1778,7 +1798,7 @@ func renderPriorVerdicts(repo string, jobs []db.Job) priorVerdictList {
 	list := priorVerdictList{
 		Repo: repo,
 		AsOf: time.Now().UTC().Format(time.RFC3339),
-		Note: "Frozen at as_of, scoped to this repo, rendered from the workflow store. " +
+		Note: "Frozen at as_of, scoped to the repo of the job under review, rendered from the workflow store. " +
 			"Not a live query: a verdict recorded after as_of is absent rather than missing.",
 		Verdicts: []priorVerdict{},
 	}
@@ -1808,7 +1828,7 @@ func renderPriorVerdicts(repo string, jobs []db.Job) priorVerdictList {
 	return list
 }
 
-func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout string, gatewayMode bool) (readOnlySandboxGrants, error) {
+func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout string, reviewRepo string, gatewayMode bool) (readOnlySandboxGrants, error) {
 	var grants readOnlySandboxGrants
 	paths, err := pathsFromFlag(home)
 	if err != nil {
@@ -1845,7 +1865,7 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	// repo-scoped list is a bounded read of its own, and this makes the bound
 	// explicit rather than incidental.
 	evidenceCtx, cancelEvidence := context.WithTimeout(context.Background(), 30*time.Second)
-	evidenceFile, evidenceDiagnostic := stagePriorVerdicts(evidenceCtx, paths, grants.cacheRoot, agent.RepoScope)
+	evidenceFile, evidenceDiagnostic := stagePriorVerdicts(evidenceCtx, paths, grants.cacheRoot, reviewRepo)
 	cancelEvidence()
 	if evidenceFile != "" {
 		grants.evidenceFile = evidenceFile
@@ -3353,7 +3373,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		// ordinary temp worker (it returns the adapter unchanged unless
 		// ReadOnlySeat is set), so this cannot affect the common path.
 		var forkDropped []string
-		adapter, forkDropped, err = wrapReadOnlySandboxAdapter(w.ConfigHome, started.Agent, checkout, adapter)
+		adapter, forkDropped, err = wrapReadOnlySandboxAdapter(w.ConfigHome, started.Agent, checkout, payload.Repo, adapter)
 		if len(forkDropped) > 0 {
 			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "read_only_seat_config_narrowed", Message: "withheld from the seat's staged config: " + strings.Join(forkDropped, ", ")}); eventErr != nil {
 				return eventErr

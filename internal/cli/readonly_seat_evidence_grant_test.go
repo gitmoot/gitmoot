@@ -169,11 +169,16 @@ func TestReadOnlyGrantsStagePriorVerdictsThroughProduction(t *testing.T) {
 	runGit(t, checkout, "config", "user.name", "Gitmoot")
 	runGit(t, checkout, "commit", "--allow-empty", "-m", "init")
 
+	// The agent's registered scope is DELIBERATELY a different repo from the
+	// one under review, because the artifact must follow the JOB and not the
+	// seat's authorisation boundary. Keyed on the agent, this seat would have
+	// received acme/secret-service's verdicts while the artifact claimed to be
+	// scoped to the repo it was reviewing.
 	agent := runtime.Agent{
 		Name: "seat", Runtime: runtime.CodexRuntime, ReadOnlySeat: true,
-		RepoScope: "gitmoot/gitmoot",
+		RepoScope: "acme/secret-service",
 	}
-	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, true)
+	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, "gitmoot/gitmoot", true)
 	if err != nil {
 		t.Fatalf("readOnlyRuntimeSandboxGrants: %v", err)
 	}
@@ -204,5 +209,27 @@ func TestReadOnlyGrantsStagePriorVerdictsThroughProduction(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "mine-1") {
 		t.Errorf("the production artifact holds no verdicts: %s", body)
+	}
+	if strings.Contains(string(body), "acme/secret-service") {
+		t.Errorf("the artifact followed the AGENT's scope rather than the repo under review: %s", body)
+	}
+
+	// And with no repo under review there is no artifact and a stated reason,
+	// rather than a fallback to the agent's scope.
+	unscoped, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, "", true)
+	if err != nil {
+		t.Fatalf("readOnlyRuntimeSandboxGrants without a repo: %v", err)
+	}
+	if unscoped.evidenceFile != "" {
+		t.Errorf("staged %q with no repo under review", unscoped.evidenceFile)
+	}
+	var said bool
+	for _, dropped := range unscoped.dropped {
+		if strings.Contains(dropped, "no repo under review") {
+			said = true
+		}
+	}
+	if !said {
+		t.Errorf("declined silently; dropped=%v", unscoped.dropped)
 	}
 }

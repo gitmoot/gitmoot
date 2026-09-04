@@ -12,13 +12,13 @@ import (
 )
 
 // TestMergeGateStoreAccessSurface is the interface-level firewall between the
-// merge authority and display-only review evidence. The eighteen calls below are
+// merge authority and display-only review evidence. The nineteen calls below are
 // the complete *db.Store surface used by PolicyMergeGate, plus the native review
 // aggregation read in allRequiredReviewersApproved. Adding any store call makes
 // this test fail until its authority implications are reviewed explicitly.
 func TestMergeGateStoreAccessSurface(t *testing.T) {
 	want := []string{
-		// AddJobEvent is a WRITE of an annotation about the verdict the gate has
+		// AddJobEventIfAbsent is a WRITE of an annotation about the verdict the gate has
 		// just accepted, added for #1839 so a merge record can say whether the
 		// approving review EXECUTED its checks or was static-only. Its authority
 		// implications, stated explicitly as this guard demands:
@@ -30,7 +30,7 @@ func TestMergeGateStoreAccessSurface(t *testing.T) {
 		//   - it cannot change a merge decision: the value is derived from the
 		//     verdict the gate already accepted, and its own failure is
 		//     discarded, so no annotation error can block or permit a merge.
-		"AddJobEvent",
+		"AddJobEventIfAbsent",
 		"AcquireResourceLock",
 		"ClaimTaskState",
 		"ClearTaskWorktreePath",

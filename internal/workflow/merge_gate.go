@@ -609,7 +609,7 @@ const mergeApprovalEvidenceEvent = "merge_gate_approval_evidence"
 // Best effort: losing the annotation must never fail a merge that the gate has
 // otherwise approved.
 func (g PolicyMergeGate) recordApprovalEvidence(ctx context.Context, job db.Job, payload JobPayload) {
-	if g.Store == nil || payload.Result == nil {
+	if g.Store == nil || payload.Result == nil || strings.TrimSpace(job.ID) == "" {
 		return
 	}
 	evidence := strings.TrimSpace(payload.Result.Evidence)
@@ -620,7 +620,12 @@ func (g PolicyMergeGate) recordApprovalEvidence(ctx context.Context, job db.Job,
 	if !EvidenceWasExecuted(*payload.Result) {
 		detail = "NOT executed - this approval's claims were not produced by running anything"
 	}
-	_ = g.Store.AddJobEvent(ctx, db.JobEvent{
+	// IF ABSENT, because ensureFinalReviewCaptured runs on EVERY merge-gate
+	// pass: a PR pending on CI is re-evaluated on every poll, so AddJobEvent
+	// grew one row per poll rather than one per approval. Measured at five
+	// rows for five evaluations of a single approval, against a store that
+	// already has documented job_events volume pain.
+	_ = g.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
 		JobID: job.ID,
 		Kind:  mergeApprovalEvidenceEvent,
 		Message: fmt.Sprintf("approval by %s at %s: evidence=%s (%s)",
@@ -861,6 +866,8 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		var unattributedReviewerReason string
 		var undispatchedFanOuts []string
 		satisfied := false
+		var acceptedJob db.Job
+		var acceptedPayload JobPayload
 		for _, review := range activeAtHead {
 			reviewer := strings.TrimSpace(review.job.Agent)
 			if JobState(review.job.State) != JobSucceeded {
@@ -894,7 +901,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 					return err
 				}
 				satisfied = true
-				g.recordApprovalEvidence(ctx, review.job, review.payload)
+				acceptedJob, acceptedPayload = review.job, review.payload
 				switch {
 				case reviewer == "":
 					if unattributedReviewerReason == "" {
@@ -925,6 +932,10 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 				"no review verdict at evaluated head: %s declared delegations that never reported; a fan-out is a coordinator continuation, not a verdict",
 				strings.Join(undispatchedFanOuts, ", "))
 		}
+		// AFTER every refusal, never inside the loop: an approval the gate then
+		// rejects (self-approval, unknown implementer, an undispatched fan-out)
+		// must not leave a record saying it authorised anything.
+		g.recordApprovalEvidence(ctx, acceptedJob, acceptedPayload)
 		return nil
 	}
 	var latest reviewRoundKey
@@ -946,6 +957,8 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		return errors.New("final agent review is not captured")
 	}
 	approved := false
+	var acceptedJob db.Job
+	var acceptedPayload JobPayload
 	var selfApprovalReason string
 	var unknownImplementerReason string
 	var unattributedReviewerReason string
@@ -1022,7 +1035,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 				return err
 			}
 			approved = true
-			g.recordApprovalEvidence(ctx, job, payload)
+			acceptedJob, acceptedPayload = job, payload
 		case "changes_requested", "blocked", "failed":
 			// A captured blocking review is an authoritative template-quality rejection
 			// (mergeBlocked), distinct from the transient/process review errors below
@@ -1042,6 +1055,8 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		}
 		return errors.New("required reviewer approval is missing")
 	}
+	// AFTER every refusal: see the same call on the other acceptance path.
+	g.recordApprovalEvidence(ctx, acceptedJob, acceptedPayload)
 	return nil
 }
 
