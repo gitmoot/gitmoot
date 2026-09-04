@@ -36,7 +36,12 @@ var localAgentDispatchRuntimeAdapterFor foregroundRuntimeAdapterFactory = func(h
 	// The withheld-config report is dropped here deliberately: foreground
 	// dispatch has no job row to attach an event to, and the same narrowing is
 	// recorded by the daemon path that runs seats unattended.
-	delivery, _, err := wrapReadOnlySandboxAdapter(home, agent, checkout, adapter)
+	// No repo is passed because FOREGROUND DISPATCH HAS NO JOB ROW, so there is
+	// no repo under review to scope evidence to. The seat then gets no
+	// prior-verdict artifact, which is correct: the alternative is guessing
+	// from the agent's registered scope, and a seat's scope is an
+	// authorisation boundary rather than a statement about the work in hand.
+	delivery, _, err := wrapReadOnlySandboxAdapter(home, agent, checkout, "", adapter)
 	if err != nil {
 		return nil, err
 	}

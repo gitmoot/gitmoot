@@ -697,6 +697,62 @@ Fixes:
   then abstains from its native merge gate — fail-closed, it never merges
   gatelessly; the external gate makes the call.
 
+## Read-Only Review Seat Cannot Run Go Or Read Prior Verdicts
+
+A read-only review seat is Landlock-confined. Two symptoms have the same root
+cause - it is reaching for something outside its grants - and neither needs a
+wider grant to fix.
+
+### `Permission denied`, exit 126, running Go
+
+NEVER INVOKE AN UNGRANTED TOOLCHAIN PATH FROM A SEAT. A pinned install such as
+`/root/.local/toolchains/go1.26.4/bin/go` is not readable there and returns exit
+126 whatever `GOTOOLCHAIN` says. Measured: three verdicts on one box in one
+hour, and the discriminator was not the flag - the two that failed both invoked
+the pinned path and the one that executed the full gate never referenced it.
+
+Use the distro bootstrap and let it fetch the release into the seat's OWN
+writable cache:
+
+```sh
+export GOTOOLCHAIN=go1.26.4          # an explicit RELEASE name
+export CGO_ENABLED=0                 # cgo dies on /usr/include EACCES; -race is unavailable
+export TMPDIR=<seat cache>/tmp GOCACHE=<seat cache>/gocache GOMODCACHE=<seat cache>/gomodcache
+/usr/lib/go-1.22/bin/go version      # -> go version go1.26.4 linux/amd64
+```
+
+- `TMPDIR` must be a concrete path under the seat's own cache root. Both `/tmp`
+  and the workspace return EACCES on `mkdir` there, and "a writable dir" reads
+  as satisfied by `/tmp` when it is not.
+- Never pair `GOTOOLCHAIN=local` with the distro bootstrap: `local` forbids the
+  fetch, so you silently get 1.22.2, which cannot satisfy a `go 1.26` directive
+  and looks like a broken environment rather than a wrong flag. On a binary that
+  is ALREADY the required release, `local` is correct and more hermetic - the
+  hazard is the pairing, not the flag.
+- Never use a bare `go1.26`: that is the `go.mod` directive, not a released
+  toolchain name, and it fails with "toolchain not available".
+- Quote `go version` output in any note making a baseline claim. It is the check
+  that works without knowing which binary you got.
+
+### A review reporting it could not read prior verdicts
+
+The seat is given a RENDERED, REPO-SCOPED list of prior verdicts inside its own
+cache root, and `GITMOOT_PRIOR_VERDICTS` names the file. It states its own
+`as_of` time and scope, so a frozen list cannot be mistaken for a live query.
+
+Rendered rather than a copy of the database, for two measured reasons. Granting
+the live store as read-only files does not work at all: SQLite opens the `-wal`
+and `-shm` sidecars `O_RDWR|O_CREAT`, which a read-only grant refuses, so the
+open fails before any verdict is read - and `journal_mode=wal` persists in the
+header, so a quiescent database behaves the same. And a whole-database snapshot
+is far too wide: it would hand every repo's jobs, prompts and results, plus
+lock and fencing tokens, to a runtime that forwards what it reads to a
+third-party model API. The rendered list carries only verdict fields, so
+everything else is structurally absent rather than merely unmentioned.
+
+If a seat has no single repo scope, no list is staged and the reason is recorded
+in the job's `dropped` diagnostics rather than passing silently.
+
 ## Read-Only Reviewer Seat Refuses To Start
 
 A read-only seat runs the runtime against an ISOLATED home rather than yours, so

@@ -225,6 +225,38 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 			// This cannot detect FABRICATED evidence, and no deterministic check can.
 			// It detects a verdict that accounts for nothing, which is the shape that
 			// reached a near-merge twice.
+			// #1839: execution provenance must be VISIBLE to a merge decision,
+			// and the way to get that is a durable field on the result - not a
+			// check that punishes honesty.
+			//
+			// An earlier form of this check passed only when evidence was
+			// "executed", which FAILED EVERY HONEST STATIC-ONLY REVIEW. Under
+			// result_checks=block that is not a warning: mailbox routes a
+			// failed check to m.fail as a contract violation, so a verdict the
+			// shipped contract calls legitimate would have been killed rather
+			// than read - and the very review that found this was static-only,
+			// so it would have been failed instead of listened to. It also
+			// repeats a trap already documented for #1685 twenty lines above
+			// the same routing site.
+			//
+			// So the check asks the only question a static-only verdict cannot
+			// answer dishonestly: if you CLAIM you executed, name something you
+			// ran. Declaring static_only always passes; claiming execution with
+			// nothing to show does not. The executed/static-only distinction
+			// itself is carried by the persisted Evidence field, which is
+			// stated in every explanation below so it is legible wherever these
+			// checks are read.
+			substantiated := !EvidenceWasExecuted(r) || reviewNamesSomethingItRan(r)
+			checks = append(checks, ResultCheck{
+				ID:       "review-executed-claim-is-substantiated",
+				Action:   "review",
+				Question: "If the review claims it EXECUTED its checks, does it name something it actually ran?",
+				Pass:     substantiated,
+				Explanation: explain(substantiated, fmt.Sprintf(
+					"the review declared evidence %q but no tests_run or changes_made entry names a command, path or target a reader could check, so the execution claim cannot be verified; list what you ran in tests_run, or declare %q if it could not run",
+					strings.TrimSpace(r.Evidence), EvidenceStaticOnly)),
+			})
+
 			pass := reviewVerdictAccountsForItself(r)
 			checks = append(checks, ResultCheck{
 				ID:       "review-verdict-has-evidence",
@@ -232,8 +264,8 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 				Question: "Does the review verdict cite findings, name evidence it produced, or explain why there was none?",
 				Pass:     pass,
 				Explanation: explain(pass, fmt.Sprintf(
-					"the review returned terminal decision %q with no findings, no substantive tests_run or changes_made entry, and a summary too short to be a rationale, so it accounts for nothing the reviewer did",
-					strings.TrimSpace(r.Decision))),
+					"the review returned terminal decision %q (evidence %q) with no findings, no substantive tests_run or changes_made entry, and a summary too short to be a rationale, so it accounts for nothing the reviewer did",
+					strings.TrimSpace(r.Decision), strings.TrimSpace(r.Evidence))),
 			})
 		}
 	case "ask":
@@ -436,6 +468,121 @@ const minReviewRationaleChars = 40
 // still name something real — a path or a target. It exists so `tests_run: ["."]`
 // is not mistaken for evidence while `internal/workflow/result_checks.go` is.
 const minEvidenceTokenChars = 8
+
+// reviewNamesSomethingItRan reports whether a verdict names a COMMAND, TEST OR
+// ARTIFACT a reader could go and check, as the substance behind an EXECUTED
+// claim.
+//
+// It deliberately requires MORE than the accounting check, and an earlier
+// comment here wrongly claimed the two shared a predicate. They do not, and
+// they should not: reviewVerdictAccountsForItself accepts four routes -
+// findings, tests_run, changes_made, or a long-enough summary - because a
+// verdict can account for itself in prose. An EXECUTED claim cannot: it must
+// name something runnable.
+//
+// The two-word arm of isSubstantiveEvidenceEntry is not enough on its own here.
+// `tests_run: ["none run"]` and ["could not run"] are two words each, so they
+// satisfied it - entries stating the OPPOSITE of execution were accepted as
+// proof of execution. An executed claim therefore needs a command- or
+// path-shaped token - see minRunnableTargetChars - which "none run" is not and
+// "go test ./... -> ok" is.
+func reviewNamesSomethingItRan(r AgentResult) bool {
+	for _, entries := range [][]string{r.TestsRun, r.ChangesMade} {
+		for _, entry := range entries {
+			if namesARunnableTarget(entry) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// minRunnableTargetChars is the floor for a token that sits BESIDE other words
+// in an evidence entry, and it is deliberately lower than
+// minEvidenceTokenChars.
+//
+// That constant governs a single token standing ALONE as a whole entry, where
+// more length is the only thing separating a path from "ok". Here the token has
+// context around it, and real targets are short: "./..." is five characters and
+// is exactly what a Go reviewer runs. Measured against the existing fixture -
+// "go test ./... -> ok" - which an 8-character floor rejected.
+const minRunnableTargetChars = 4
+
+// namesARunnableTarget reports whether one entry names something with the shape
+// of a command, path or target rather than a bare phrase.
+//
+// A TERMINAL DOT IS NOT A TARGET, and that distinction is the whole fix. An
+// earlier form accepted any token of four or more characters containing "/" or
+// ".", which SENTENCE-FINAL PUNCTUATION supplies: measured, "none run." and
+// "nothing to run." satisfied it, so four of five entries stating the OPPOSITE
+// of execution passed as proof of it - and so did "everything looks fine.",
+// the exact phrase the shipped contract promises is refused. tests_run entries
+// are agent-written prose, so terminal punctuation is the common case rather
+// than an edge one.
+//
+// A real target is therefore recognised by SHAPE: it contains a path separator
+// in a path-like position, or an INTERIOR dot with an alphanumeric on both
+// sides - "./...", "internal/workflow/", "go1.26.4", "main.go". A sentence
+// ending in a full stop has neither.
+func namesARunnableTarget(entry string) bool {
+	for _, field := range strings.Fields(entry) {
+		// NO PUNCTUATION TRIMMING. It was tried and removed: a mutant deleting
+		// it changed no outcome, because the two rules below already refuse a
+		// token whose only dot is terminal. Keeping a line that cannot fail
+		// would have implied the fix rested on it, and it does not.
+		if isPathShaped(field) {
+			return true
+		}
+		if len(field) >= minRunnableTargetChars && hasInteriorDot(field) {
+			return true
+		}
+	}
+	return false
+}
+
+// isPathShaped reports whether value looks like a path or package target.
+//
+// Length alone cannot decide this: "./..." is five characters and is a real
+// target, while "n/a" is three and is a phrase meaning the opposite. So a slash
+// counts when the token is long enough to be a path OR carries path SHAPE - a
+// leading "./" or "../", or a trailing separator.
+func isPathShaped(value string) bool {
+	if !strings.Contains(value, "/") {
+		return false
+	}
+	switch {
+	case strings.HasPrefix(value, "./"), strings.HasPrefix(value, "../"), strings.HasPrefix(value, "/"):
+		return true
+	case strings.HasSuffix(value, "/"):
+		return true
+	default:
+		return len(value) >= minRunnableTargetChars+2
+	}
+}
+
+// hasInteriorDot reports whether value carries a dot with an alphanumeric
+// character on both sides, which is what separates "main.go" or "go1.26.4"
+// from a sentence that merely ends in a full stop.
+func hasInteriorDot(value string) bool {
+	for i := 1; i < len(value)-1; i++ {
+		if value[i] != '.' {
+			continue
+		}
+		if isAlphanumericByte(value[i-1]) && isAlphanumericByte(value[i+1]) {
+			return true
+		}
+	}
+	return false
+}
+
+func isAlphanumericByte(c byte) bool {
+	switch {
+	case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		return true
+	default:
+		return false
+	}
+}
 
 // reviewVerdictAccountsForItself reports whether a terminal review verdict
 // accounts for what the reviewer did, by any of the three routes a real one
