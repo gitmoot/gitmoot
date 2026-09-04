@@ -194,19 +194,28 @@ func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, observed
 				// once here. The following finalizePreflightDelegationChild only attaches
 				// a synthetic result (savePayload, no transition), so it never re-emits.
 				emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, jobID, daemonTerminalPermissionGuard, string(workflow.JobBlocked), agentPermissionBlockedMessage)
-				// A WRITABLE implement DELEGATION child whose runtime fails MID-RUN
-				// with a permission error (read-only FS / sandbox denies write) is
-				// transitioned JobRunning->JobBlocked here and returns early — it never
-				// reaches the ParentJobID finalize branch below, so the parent DAG
-				// strands exactly like #409 (the mid-run sibling of the pre-flight
-				// read-only-implement case fixed at ~2127). It advances the DAG through
-				// the same terminalizer, but this child DID RUN, so it records the
-				// MID-RUN cause: "refused before it ran" would be false of it and the
-				// timeout kind would assert a deadline that never expired (#1512). The
-				// helper no-ops for a non-delegation job (ParentJobID empty) or one that
-				// already stored a result, so the solo-implement case stays
+				// A WRITABLE implement DELEGATION child whose runtime fails with a
+				// permission error (read-only FS / sandbox denies write) is transitioned
+				// to JobBlocked here and returns early — it never reaches the
+				// ParentJobID finalize branch below, so the parent DAG strands exactly
+				// like #409 (the mid-run sibling of the pre-flight read-only-implement
+				// case fixed at ~2127). It advances the DAG through the same
+				// terminalizer either way, but the RECORDED CAUSE is chosen by the
+				// child's OBSERVED STATE rather than by the error's shape (#1512):
+				// markJobPermissionBlockedAtGeneration accepts a transition from
+				// JobQueued, JobRunning or JobFailed (agent_permissions.go:41), so this
+				// branch is reached by a child that never started as well as by one
+				// that did. Keying on the error would label a never-claimed child
+				// "failed mid-run"; keying on `latest`, read at the top of this
+				// function before any transition, records what actually happened. Both
+				// helpers no-op for a non-delegation job (ParentJobID empty) or one
+				// that already stored a result, so the solo-implement case stays
 				// byte-identical.
-				if err := w.finalizeMidRunDelegationChild(ctx, jobID, errors.New(agentPermissionBlockedMessage)); err != nil {
+				finalize := w.finalizeMidRunDelegationChild
+				if latest.State == string(workflow.JobQueued) {
+					finalize = w.finalizePreflightDelegationChild
+				}
+				if err := finalize(ctx, jobID, errors.New(agentPermissionBlockedMessage)); err != nil {
 					return err
 				}
 				return nil
