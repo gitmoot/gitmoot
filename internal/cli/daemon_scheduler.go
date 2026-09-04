@@ -2141,24 +2141,57 @@ func runQueuedJobsForRepoPool(ctx context.Context, worker jobWorker, limit int, 
 // operator can state instead of "however long the longest running job takes"
 // (measured starvation before the bound: 22m42s and 27m40s).
 //
-// Cost, stated precisely because the first version of this comment was wrong:
-// one listPendingQueuedJobs per interval per repo that has a job IN FLIGHT and
-// nothing dispatchable. An EMPTY QUEUE does reach this seam whenever something
-// is running — that is exactly what
+// Cost, stated precisely because the first two versions of this comment were
+// wrong: per interval, per repo that has a job IN FLIGHT and nothing
+// dispatchable, the pass re-pays the WHOLE top of the loop, not just one query.
+// That is one listPendingQueuedJobs store scan, the admission estimate for every
+// job the selector considers, AND one allocatePoolIsolationWorktree attempt per
+// isolation-eligible blocked job — each of which can spend up to
+// workflow.ReadOnlyWorktreeDispatchLockWaitBudget waiting on the checkout
+// mutation lock. The isolation retries are therefore paced by
+// poolIsolationRetryBackoff rather than by this interval; without that backoff a
+// 2s interval and a 5s lock budget compose into a permanent lock-wait spin on a
+// job that can never isolate. An EMPTY QUEUE does reach this seam whenever
+// something is running — that is exactly what
 // TestPoolRequeryBoundIsPacedAndDispatchesNothingWhenIdle constructs. What
 // returns above is `running == 0 && dispatched == 0`, i.e. nothing running AND
-// nothing dispatchable, so a fully idle daemon never re-queries. That query is
-// a store scan whose cost grows with the queue, not an O(1) probe; the bound
-// caps its FREQUENCY, not its size.
+// nothing dispatchable, so a fully idle daemon never re-queries. The store scan's
+// cost grows with the queue, not an O(1) probe, and it is skipped entirely when
+// the repo has no dispatch slots; the bound caps its FREQUENCY, not its size.
 //
 // A var, not a const, so tests can shorten it; production never reassigns it.
 var poolRequeryInterval = 2 * time.Second
+
+// poolIsolationRetryBackoff / poolIsolationRetryBackoffMax pace a FAILING
+// allocatePoolIsolationWorktree retry inside one live pass. The retry cost is
+// not the 2s re-query it rides on: each attempt can spend up to
+// workflow.ReadOnlyWorktreeDispatchLockWaitBudget (5s) waiting on the checkout
+// mutation lock, on the dispatcher goroutine, so an unpaced retry both exceeds
+// the interval it is supposed to obey and keeps a lock the merge gate wants
+// under permanent contention. The delay doubles from the first value to the max
+// per consecutive failure of the SAME job, and is dropped as soon as that job
+// leaves the pending set (allocated, dispatched, reaped, or gone), so a
+// transient failure recovers on the next re-query while a job that can never
+// isolate settles at one attempt per max interval.
+//
+// Vars, not consts, so tests can shorten them; production never reassigns them.
+var (
+	poolIsolationRetryBackoff    = 2 * time.Second
+	poolIsolationRetryBackoffMax = 30 * time.Second
+)
 
 // poolRequeryObserver is a test hook fired when the bound (rather than a job
 // completion) wakes the pass. nil in production. It lets a test distinguish
 // "re-queries on the bound" from "re-queries in a tight loop", which a
 // wall-clock assertion cannot.
 var poolRequeryObserver func()
+
+// poolIsolationAttemptObserver is a test hook fired immediately before each
+// allocatePoolIsolationWorktree ATTEMPT. nil in production. It exists because
+// the retry cost this backoff bounds is otherwise unobservable: the skip EVENT
+// is throttled to one row per job, so an event count cannot distinguish "retried
+// once" from "retried every re-query" — the two behaviours the backoff separates.
+var poolIsolationAttemptObserver func(jobID string)
 
 // poolDispatchSlots is a pool pass's dispatch budget: the repo's free slots,
 // clamped by the host-global remainder (hostCap − tracked in-flight across ALL
@@ -2225,6 +2258,13 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 	// above, so no lock; reset each invocation, so a later pass reports the skip
 	// again for a job that is still serialized.
 	isolationSkipLogged := map[string]bool{}
+	// isolationRetryNext / isolationRetryDelay pace a FAILING isolation allocation
+	// for one job across the re-queries of THIS pass (see poolIsolationRetryBackoff).
+	// Both are keyed by job id, pruned to the live pending set on every pass so a
+	// long-lived pass cannot accumulate entries for jobs that have left the queue,
+	// and dispatcher-goroutine-owned like the sets above, so no lock.
+	isolationRetryNext := map[string]time.Time{}
+	isolationRetryDelay := map[string]time.Duration{}
 	// runtimeKeyMemo caches queuedJobRuntimeResourceKey per job id for the lifetime of
 	// this dispatcher invocation (#615 review). excludeBouncedBusy re-derives the key
 	// for every still-pending job on every dispatch pass, and each miss is a GetAgent
@@ -2310,10 +2350,23 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 
 		dispatched := 0
 		if firstErr == nil {
-			pending, err := listPendingQueuedJobs(ctx, worker, repoFilter, rootFilter, true)
-			if err != nil {
-				firstErr = err
-			} else if slots := poolDispatchSlots(limit, running, hostCap, tracker); slots > 0 {
+			// Ask for the budget BEFORE the scan. A saturated repo (every slot taken,
+			// or the host-global remainder exhausted) cannot dispatch anything this
+			// pass, and the old order paid a full listPendingQueuedJobs store scan
+			// every poolRequeryInterval only to discard the result at the `slots > 0`
+			// test. The wake still happens — the pass must stay alive to reap — it
+			// just no longer re-scans a queue it is not allowed to draw from.
+			slots := poolDispatchSlots(limit, running, hostCap, tracker)
+			pending := []db.Job(nil)
+			if slots > 0 {
+				scanned, err := listPendingQueuedJobs(ctx, worker, repoFilter, rootFilter, true)
+				if err != nil {
+					firstErr = err
+				} else {
+					pending = scanned
+				}
+			}
+			if firstErr == nil && slots > 0 {
 				// Drop jobs that already bounced busy this invocation before ANY
 				// selection (#598). pending is fresh each pass and feeds BOTH the
 				// primary selection and the isolation `remaining` loop below, so
@@ -2323,6 +2376,27 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 				// busy-excluded the loop reaches dispatched==0 && running==0 and
 				// returns, so "busy must not count as progress" holds structurally.
 				pending = excludeBouncedBusy(ctx, worker, pending, bouncedBusy, bouncedBusyRuntimes, runtimeKeyMemo)
+				// Prune the isolation retry/skip state to the jobs still queued. This
+				// pass can outlive many jobs (it holds poolRuns[repo] for as long as
+				// anything runs), so without this the three maps would grow with every
+				// job id the pass ever saw. Dropping a job also drops its backoff, which
+				// is the intended semantics: a job that leaves and returns is a fresh
+				// isolation attempt, not a continuation of the old one's penalty.
+				live := make(map[string]bool, len(pending))
+				for _, job := range pending {
+					live[job.ID] = true
+				}
+				for id := range isolationRetryNext {
+					if !live[id] {
+						delete(isolationRetryNext, id)
+						delete(isolationRetryDelay, id)
+					}
+				}
+				for id := range isolationSkipLogged {
+					if !live[id] {
+						delete(isolationSkipLogged, id)
+					}
+				}
 				// Union in the supervisor tracker's in-flight keys (#562): a tracked
 				// non-pool job (e.g. dispatched before a warm scheduler flip) must
 				// block same-key pool dispatch exactly like a pool-local one. Jobs
@@ -2403,6 +2477,14 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 						!(inflightCheckouts["repo:"+payload.Repo] || seedCheckouts["repo:"+payload.Repo]) {
 						continue // not blocked by a contended same-repo checkout
 					}
+					// Backoff gate: a failing allocation is retried on a doubling delay
+					// rather than on every re-query. Placed after the cheap eligibility
+					// and contention filters and BEFORE the admission reservation, so a
+					// backed-off job neither reserves admission nor touches the checkout
+					// mutation lock this pass.
+					if next, ok := isolationRetryNext[job.ID]; ok && time.Now().Before(next) {
+						continue
+					}
 					runtimeKey := queuedJobRuntimeResourceKey(ctx, worker.Store, job)
 					if runtimeKey != "" && (inflightRuntimes[runtimeKey] || seedRuntimes[runtimeKey] || runtimeResourceLocked(ctx, worker.Store, runtimeKey)) {
 						continue // also runtime-contended; leave it to the runtime/temp-worker path
@@ -2416,6 +2498,9 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 						continue
 					}
 					payloadBeforeIsolation := job.Payload
+					if poolIsolationAttemptObserver != nil {
+						poolIsolationAttemptObserver(job.ID)
+					}
 					iso, ok, allocErr := worker.allocatePoolIsolationWorktree(ctx, job, payload)
 					if !ok {
 						worker.Admission.Release(job.ID)
@@ -2426,15 +2511,39 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 						// allocErr means the job was simply not isolable (no home/checkout) —
 						// not a failure — so stay quiet there.
 						// Throttled to once per job per pass invocation: this branch is
-						// reached on EVERY re-query, and re-queries are now paced by
-						// poolRequeryInterval rather than by job completions, so an
-						// unthrottled write turned one event per completion into one every
-						// two seconds for as long as the job stayed blocked.
+						// reached on every retry, so an unthrottled write turned one event
+						// per completion into one row per retry for as long as the job
+						// stayed blocked. The flag MUST be set here — reading it without
+						// ever writing it is a throttle that throttles nothing, which is
+						// what the first version of this branch shipped.
 						if allocErr != nil && !isolationSkipLogged[job.ID] {
+							isolationSkipLogged[job.ID] = true
 							_ = worker.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "pool_isolation_skipped", Message: fmt.Sprintf("pool read-only isolation skipped (#739); job stays serialized in the shared checkout: %v", allocErr)})
+						}
+						// Arm the backoff on a real FAILURE only. allocErr == nil means the
+						// job was simply not isolable, which is cheap and stateless to
+						// re-test, and the expensive lock wait never happened.
+						if allocErr != nil {
+							delay := isolationRetryDelay[job.ID]
+							if delay <= 0 {
+								delay = poolIsolationRetryBackoff
+							} else if delay < poolIsolationRetryBackoffMax {
+								delay *= 2
+								if delay > poolIsolationRetryBackoffMax {
+									delay = poolIsolationRetryBackoffMax
+								}
+							}
+							isolationRetryDelay[job.ID] = delay
+							isolationRetryNext[job.ID] = time.Now().Add(delay)
 						}
 						continue
 					}
+					// Allocation succeeded: drop this job's backoff and skip-throttle so a
+					// later blocked spell starts from a clean slate rather than inheriting
+					// the penalty of an earlier one.
+					delete(isolationRetryNext, job.ID)
+					delete(isolationRetryDelay, job.ID)
+					delete(isolationSkipLogged, job.ID)
 					if !tracker.beginWithin(hostCap, iso.job.ID, repoFilter, iso.checkoutKey, iso.runtimeKey) {
 						worker.Admission.Release(iso.job.ID)
 						// Undo the allocation completely: the payload now points at the
@@ -2494,7 +2603,13 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 				timer.Stop()
 				reap(f)
 			case <-timer.C:
-				if poolRequeryObserver != nil {
+				// Fire the observer ONLY when a re-query will actually follow. Once
+				// firstErr is set (including a cancelled ctx) the top of the loop skips
+				// the whole dispatch block and the pass is just draining in-flight
+				// workers, so a wake here re-queries nothing. A test that counts these
+				// wakes as re-queries would otherwise credit the bound with work it did
+				// not do — the same class of false positive as an unwritten throttle.
+				if firstErr == nil && ctx.Err() == nil && poolRequeryObserver != nil {
 					poolRequeryObserver()
 				}
 			}

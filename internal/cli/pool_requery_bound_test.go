@@ -241,3 +241,183 @@ func TestPoolRequeryObserverIsSilentOnTheBarrierPath(t *testing.T) {
 		t.Fatal("worker loop did not stop after context cancellation")
 	}
 }
+
+// TestPoolIsolationSkipEventIsThrottledAndRetriesBackOff is the production-path
+// proof for the two P2s the round-4 review found in the code this PR added.
+//
+// Scenario, through the same real supervisor wiring as the tests above: job A
+// hangs holding the shared repo checkout key, then job B — an ask job with no
+// worktree, so isolation-ELIGIBLE — is enqueued behind it. The repo's checkout
+// path is a plain directory rather than a git repo, so every
+// allocatePoolIsolationWorktree call FAILS with an error, which is precisely the
+// state both defects live in.
+//
+// DESIRED, and both halves are separate mutants:
+//  1. exactly ONE pool_isolation_skipped row for B, however many retries happen.
+//     FAILS WITHOUT THE FIX: isolationSkipLogged was read and never written, so
+//     the "once per job per pass" throttle throttled nothing and the row was
+//     written on every retry. Mutation proof: delete the
+//     `isolationSkipLogged[job.ID] = true` line and this assertion fails with a
+//     row count that tracks the retry count.
+//  2. retries are paced by poolIsolationRetryBackoff, NOT by poolRequeryInterval.
+//     FAILS WITHOUT THE FIX: each re-query re-ran an allocation that can spend
+//     up to workflow.ReadOnlyWorktreeDispatchLockWaitBudget (5s in production)
+//     on the checkout mutation lock, so a 2s interval and a 5s lock budget
+//     composed into a permanent lock-wait spin. Mutation proof: delete the
+//     backoff gate and attempts jump from <=5 to ~window/interval.
+//
+// The attempt count is read from poolIsolationAttemptObserver rather than from
+// the event rows on purpose: the throttle makes the EVENT count 1 either way, so
+// an event-based assertion cannot see a retry spin at all — it would be a check
+// that passes on the code it is meant to reject.
+func TestPoolIsolationSkipEventIsThrottledAndRetriesBackOff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const repo = "owner/repo"
+	const intervalMS, backoffMS, windowMS = 20, 200, 700
+	var attempts int64
+	restoreInterval, restoreAttempt := poolRequeryInterval, poolIsolationAttemptObserver
+	restoreBackoff, restoreBackoffMax := poolIsolationRetryBackoff, poolIsolationRetryBackoffMax
+	poolRequeryInterval = intervalMS * time.Millisecond
+	poolIsolationRetryBackoff = backoffMS * time.Millisecond
+	poolIsolationRetryBackoffMax = backoffMS * time.Millisecond
+	poolIsolationAttemptObserver = func(jobID string) {
+		if jobID == "job-b" {
+			atomic.AddInt64(&attempts, 1)
+		}
+	}
+	t.Cleanup(func() {
+		poolRequeryInterval, poolIsolationAttemptObserver = restoreInterval, restoreAttempt
+		poolIsolationRetryBackoff, poolIsolationRetryBackoffMax = restoreBackoff, restoreBackoffMax
+	})
+
+	store := daemonWorkerStore(t)
+	// A plain directory, NOT a git repo: the read-only worktree allocation fails
+	// with an error, which is the allocErr != nil branch under test. A nil
+	// allocErr ("not isolable") is a different, quiet path.
+	seedDaemonWorkerRepo(t, store, repo, t.TempDir())
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, repo)
+
+	adapter := newWedgeBlockingAdapter("job-a")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "audit", Action: "ask", Repo: repo, Branch: "main", PullRequest: 1})
+	// ConfigHome must be non-empty or the allocation short-circuits to "not
+	// isolable" with a nil error and this test pins a path that never runs — which
+	// is exactly what the first version of it did.
+	_, errCh := startTrackedWedgeLoop(t, ctx, store, adapter, 2, true, io.Discard, func(w *jobWorker) {
+		w.ConfigHome = t.TempDir()
+	})
+
+	if !waitForCondition(t, 5*time.Second, adapter.stillBlocked) {
+		t.Fatalf("job-a never started delivering; delivered=%v", adapter.deliveredJobs())
+	}
+	// Enqueue B only once A genuinely holds the checkout, so B is blocked by
+	// contention rather than by arrival order.
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-b", Agent: "audit", Action: "ask", Repo: repo, Branch: "main", PullRequest: 2})
+	if !waitForCondition(t, 5*time.Second, func() bool { return atomic.LoadInt64(&attempts) > 0 }) {
+		t.Fatal("no isolation attempt was made for job-b; the scenario never reached the isolation path")
+	}
+	time.Sleep(windowMS * time.Millisecond)
+
+	gotAttempts := atomic.LoadInt64(&attempts)
+	// Paced by the backoff the window fits about 700/200 = 3.5, so ~4 with the
+	// first attempt. Paced by the re-query interval it would be ~35. The cap is
+	// generous enough that a slow box cannot fail it (a timer can only fire FEWER
+	// times than expected) and still an order of magnitude below unpaced.
+	if maxPaced := int64(windowMS/backoffMS + 2); gotAttempts > maxPaced {
+		t.Fatalf("isolation retried %d times in %dms at a %dms backoff, want <= %d (retries are paced by the re-query interval, not by the backoff)", gotAttempts, windowMS, backoffMS, maxPaced)
+	}
+	events, err := store.ListJobEvents(ctx, "job-b")
+	if err != nil {
+		t.Fatalf("ListJobEvents(job-b): %v", err)
+	}
+	skips := 0
+	for _, event := range events {
+		if event.Kind == "pool_isolation_skipped" {
+			skips++
+		}
+	}
+	if skips == 0 {
+		t.Fatalf("no pool_isolation_skipped event for job-b after %d isolation attempts; the lost-parallelism serialize is unobservable", gotAttempts)
+	}
+	if skips != 1 {
+		t.Fatalf("pool_isolation_skipped rows for job-b = %d after %d attempts, want exactly 1; the throttle is not writing isolationSkipLogged", skips, gotAttempts)
+	}
+
+	close(adapter.release)
+	if got := waitForJobState(t, store, "job-a", string(workflow.JobSucceeded), 10*time.Second); got != string(workflow.JobSucceeded) {
+		t.Fatalf("job-a state = %q after release, want succeeded", got)
+	}
+	cancel()
+	select {
+	case <-errCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker loop did not stop after context cancellation")
+	}
+}
+
+// TestPoolRequeryObserverIsSilentWhileDrainingAfterCancellation pins the third
+// round-4 finding: the bounded wait also fired while the pass was DRAINING after
+// cancellation, when the top of the loop skips dispatch entirely and no re-query
+// follows.
+//
+// The blocking job is deliberately deaf to context cancellation (ignoreCtx), so
+// the pass stays parked in its bounded wait with a worker still in flight long
+// after ctx is cancelled — the drain window a ctx-obeying job does not leave.
+//
+// DESIRED: zero observer fires after cancellation.
+//
+// FAILS WITHOUT THE FIX: the timer branch called the observer unconditionally,
+// so a draining pass reported ~window/interval re-queries it never performed —
+// crediting the bound with work it did not do, the same class of false positive
+// as the unwritten throttle above.
+func TestPoolRequeryObserverIsSilentWhileDrainingAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const repo = "owner/repo"
+	const intervalMS, drainMS = 20, 300
+	var wakes int64
+	restoreInterval, restoreObserver := poolRequeryInterval, poolRequeryObserver
+	poolRequeryInterval = intervalMS * time.Millisecond
+	poolRequeryObserver = func() { atomic.AddInt64(&wakes, 1) }
+	t.Cleanup(func() { poolRequeryInterval, poolRequeryObserver = restoreInterval, restoreObserver })
+
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, repo, t.TempDir())
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, repo)
+
+	adapter := newWedgeBlockingAdapter("job-a")
+	adapter.ignoreCtx = true
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "audit", Action: "ask", Repo: repo, Branch: "main", PullRequest: 1})
+	_, errCh := startTrackedWedgeLoop(t, ctx, store, adapter, 2, true, io.Discard)
+
+	if !waitForCondition(t, 5*time.Second, adapter.stillBlocked) {
+		t.Fatalf("job-a never started delivering; delivered=%v", adapter.deliveredJobs())
+	}
+	// Positive control FIRST: the observer must be firing while the pass is live,
+	// otherwise a zero after cancellation proves nothing about the gate.
+	if !waitForCondition(t, 5*time.Second, func() bool { return atomic.LoadInt64(&wakes) > 0 }) {
+		t.Fatal("bound never fired while the pass was live; a post-cancellation zero would be an instrument failure, not a result")
+	}
+
+	cancel()
+	// Let the pass observe cancellation before sampling, so the baseline is taken
+	// from a pass that is already draining rather than one still dispatching.
+	time.Sleep(4 * poolRequeryInterval)
+	baseline := atomic.LoadInt64(&wakes)
+	time.Sleep(drainMS * time.Millisecond)
+	if drained := atomic.LoadInt64(&wakes) - baseline; drained != 0 {
+		t.Fatalf("bound fired %d times in %dms while DRAINING after cancellation, want 0 (the wake re-queries nothing once firstErr is set)", drained, drainMS)
+	}
+	if !adapter.stillBlocked() {
+		t.Fatal("job-a stopped blocking; the drain window was not exercised")
+	}
+
+	close(adapter.release)
+	select {
+	case <-errCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("worker loop did not stop after the blocking job was released")
+	}
+}
