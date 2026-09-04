@@ -173,16 +173,25 @@ func (e Engine) finalizeTimedOutJob(ctx context.Context, jobID string, reason st
 }
 
 // Finalize event kinds for a delegation child terminalized WITHOUT a stored
-// result. All three used to be recorded as delegation_timeout_finalized, so a
-// timed-out child, a superseded child and one refused before it ever ran were
-// indistinguishable in the event stream and any host's count of delegation
-// timeouts was inflated by the other two (#1512). The kind now names the cause
-// the caller actually observed.
+// result. All of these used to be recorded as delegation_timeout_finalized, so a
+// timed-out child, a superseded child, one that failed mid-run and one refused
+// before it ever ran were indistinguishable in the event stream and any host's
+// count of delegation timeouts was inflated by the other three (#1512). The kind
+// now names the cause the caller actually observed.
 const (
-	JobEventDelegationTimeoutFinalized    = "delegation_timeout_finalized"
-	JobEventDelegationSupersededFinalized = "delegation_superseded_finalized"
-	JobEventDelegationRefusedFinalized    = "delegation_refused_finalized"
+	JobEventDelegationTimeoutFinalized        = "delegation_timeout_finalized"
+	JobEventDelegationSupersededFinalized     = "delegation_superseded_finalized"
+	JobEventDelegationRefusedFinalized        = "delegation_refused_finalized"
+	JobEventDelegationRuntimeFailureFinalized = "delegation_runtime_failure_finalized"
 )
+
+// FinalizeFailedDelegationChild terminalizes a delegation child that RAN and
+// then failed without storing a result — a mid-run runtime failure such as a
+// sandbox permission denial. It is neither a spent deadline nor a refusal, and
+// recording it as either asserts something that did not happen.
+func (e Engine) FinalizeFailedDelegationChild(ctx context.Context, jobID string, reason string) (bool, error) {
+	return e.finalizeTimedOutJob(ctx, jobID, reason, JobEventDelegationRuntimeFailureFinalized, reason, true, nil)
+}
 
 // FinalizeTimedOutDelegationChild preserves the established engine API for
 // delegation callers while routing through the all-job terminalizer. It is for a

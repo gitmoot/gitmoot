@@ -95,24 +95,22 @@ func (w jobWorker) afterQueuedJobTransition(ctx context.Context, jobID string, s
 	return nil
 }
 
-// finalizePreflightDelegationChild drives the parent delegation DAG for a child
-// that was just transitioned queued→failed in a daemon pre-flight step, so the
-// delegation's failure_policy fires exactly as it would for a runtime failure.
-// It is a no-op for a non-delegation job or a child that already stored a result
-// (finalizeRefusedDelegationChild / Engine.FinalizeRefusedDelegationChild are
-// idempotent), so a re-run (retry / stale-running recovery) re-enters cleanly. It
-// mirrors handleRunJobError (~4169-4189): an AwaitingHumanError (escalate_human
-// paused the tree awaiting a human, #340) and a BlockedError (block_parent blocked
-// the shared parent task) are EXPECTED terminal outcomes of advancing the DAG, not
-// errors to propagate.
+// finalizeDelegationChildTerminal drives the parent delegation DAG for a child
+// the daemon just settled terminally, so the delegation's failure_policy fires
+// exactly as it would for any runtime failure. It is a no-op for a
+// non-delegation job or a child that already stored a result (the engine
+// finalizers are idempotent), so a re-run (retry / stale-running recovery)
+// re-enters cleanly. It mirrors handleRunJobError: an AwaitingHumanError
+// (escalate_human paused the tree awaiting a human, #340) and a BlockedError
+// (block_parent blocked the shared parent task) are EXPECTED terminal outcomes of
+// advancing the DAG, not errors to propagate.
 //
-// The child reaching here NEVER RAN: the pre-flight refused it before any adapter
-// was built, any prompt was delivered, or any deadline started. It therefore
-// finalizes through the REFUSED path, not the timeout one. Recording it as a
-// timeout that "ended without a result" asserted both an elapsed deadline and a
-// run, neither of which happened, and made refusals indistinguishable from real
-// timeouts in the event stream (#1512).
-func (w jobWorker) finalizePreflightDelegationChild(ctx context.Context, jobID string, cause error) error {
+// finalize decides WHICH cause is recorded, and the caller owns that choice
+// because only the caller knows whether the child ran (#1512). A single
+// hard-coded reason for every caller is how the timeout verb came to describe a
+// refusal in the first place; a single hard-coded "never started" would repeat
+// the mistake in the opposite direction for the mid-run callers.
+func (w jobWorker) finalizeDelegationChildTerminal(ctx context.Context, jobID string, cause error, finalize func(context.Context, db.Job, error) (bool, error)) error {
 	job, err := w.Store.GetJob(ctx, jobID)
 	if err != nil {
 		return err
@@ -121,7 +119,7 @@ func (w jobWorker) finalizePreflightDelegationChild(ctx context.Context, jobID s
 	if payloadErr != nil || strings.TrimSpace(payload.ParentJobID) == "" || payload.Result != nil {
 		return nil
 	}
-	if _, finalizeErr := w.finalizeRefusedDelegationChild(ctx, job, cause); finalizeErr != nil {
+	if _, finalizeErr := finalize(ctx, job, cause); finalizeErr != nil {
 		var awaiting workflow.AwaitingHumanError
 		if errors.As(finalizeErr, &awaiting) {
 			return nil
@@ -133,6 +131,22 @@ func (w jobWorker) finalizePreflightDelegationChild(ctx context.Context, jobID s
 		return finalizeErr
 	}
 	return nil
+}
+
+// finalizePreflightDelegationChild is for a child that NEVER RAN: a daemon
+// pre-flight refused it before any adapter was built, any prompt was delivered,
+// or any deadline started.
+func (w jobWorker) finalizePreflightDelegationChild(ctx context.Context, jobID string, cause error) error {
+	return w.finalizeDelegationChildTerminal(ctx, jobID, cause, w.finalizeRefusedDelegationChild)
+}
+
+// finalizeMidRunDelegationChild is for a child that DID run and then failed
+// without storing a result — the writable implement child whose runtime hits a
+// sandbox permission denial mid-run is the live case. It must not be recorded as
+// "refused before it ran", which would be false, nor as a timeout, which asserts
+// an elapsed deadline that never expired.
+func (w jobWorker) finalizeMidRunDelegationChild(ctx context.Context, jobID string, cause error) error {
+	return w.finalizeDelegationChildTerminal(ctx, jobID, cause, w.finalizeFailedDelegationChild)
 }
 
 type jobTimeoutEvidence struct {
@@ -185,11 +199,14 @@ func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, observed
 				// transitioned JobRunning->JobBlocked here and returns early — it never
 				// reaches the ParentJobID finalize branch below, so the parent DAG
 				// strands exactly like #409 (the mid-run sibling of the pre-flight
-				// read-only-implement case fixed at ~2127). Route it through the SAME
-				// finalize helper so its failure_policy fires. The helper no-ops for a
-				// non-delegation job (ParentJobID empty) or one that already stored a
-				// result, so the solo-implement case stays byte-identical.
-				if err := w.finalizePreflightDelegationChild(ctx, jobID, errors.New(agentPermissionBlockedMessage)); err != nil {
+				// read-only-implement case fixed at ~2127). It advances the DAG through
+				// the same terminalizer, but this child DID RUN, so it records the
+				// MID-RUN cause: "refused before it ran" would be false of it and the
+				// timeout kind would assert a deadline that never expired (#1512). The
+				// helper no-ops for a non-delegation job (ParentJobID empty) or one that
+				// already stored a result, so the solo-implement case stays
+				// byte-identical.
+				if err := w.finalizeMidRunDelegationChild(ctx, jobID, errors.New(agentPermissionBlockedMessage)); err != nil {
 					return err
 				}
 				return nil
@@ -357,6 +374,21 @@ func (w jobWorker) finalizeRefusedDelegationChild(ctx context.Context, job db.Jo
 	}
 	engine := w.workflowForJob(w.delegationParentCheckout(ctx, job), runner)
 	return engine.FinalizeRefusedDelegationChild(ctx, job.ID, reason)
+}
+
+// finalizeFailedDelegationChild is for a child that RAN and then failed with no
+// stored result: the writable implement child whose runtime hits a sandbox
+// permission denial mid-run. "Refused before it ran" would be false for it and
+// "ended without a result" under the TIMEOUT kind asserts a deadline that never
+// expired, so it carries its own cause (#1512).
+func (w jobWorker) finalizeFailedDelegationChild(ctx context.Context, job db.Job, cause error) (bool, error) {
+	reason := fmt.Sprintf("delegation child %s failed mid-run without a result: %v", job.ID, cause)
+	runner, err := w.subprocessRunnerForJob(job)
+	if err != nil {
+		return false, err
+	}
+	engine := w.workflowForJob(w.delegationParentCheckout(ctx, job), runner)
+	return engine.FinalizeFailedDelegationChild(ctx, job.ID, reason)
 }
 
 // delegationParentCheckout returns the repo's main registered checkout for a

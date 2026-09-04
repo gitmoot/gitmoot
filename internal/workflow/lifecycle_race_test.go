@@ -381,7 +381,7 @@ func runSupersedeDebtInterleaveCase(t *testing.T, stage string) {
 		return nil
 	}
 	t.Cleanup(func() { supersedeDebtInterleaveHook = nil })
-	finalizedBefore := countWorkflowJobEvents(t, store, child, "delegation_timeout_finalized")
+	finalizedBefore := countWorkflowJobEvents(t, store, child, JobEventDelegationSupersededFinalized)
 	confirmedBefore := countWorkflowJobEvents(t, store, child, JobEventSupersedeAdvanceConfirmed)
 
 	handled, err := engine.CompletePendingSupersedeFinalization(ctx, child)
@@ -407,10 +407,22 @@ func runSupersedeDebtInterleaveCase(t *testing.T, stage string) {
 	}
 	// The finalizer runs BEFORE the advance bracket, so at before-advance-claim it has
 	// legitimately finalized the still-claimed lifecycle by the time the retry lands.
-	// Every earlier stage must show no new finalization at all.
+	// Every earlier stage must show no new finalization at all. The kind is the
+	// SUPERSEDED one: this path is finalizeSupersededDelegationChildAtGeneration, so
+	// counting the timeout kind here watched a string the code can no longer emit and
+	// the guard could not fail (#1512).
 	if stage != supersedeDebtStageBeforeAdvanceClaim {
-		if got := countWorkflowJobEvents(t, store, child, "delegation_timeout_finalized"); got != finalizedBefore {
-			t.Fatalf("delegation_timeout_finalized events = %d, want %d: the claimed run was finalized", got, finalizedBefore)
+		if got := countWorkflowJobEvents(t, store, child, JobEventDelegationSupersededFinalized); got != finalizedBefore {
+			t.Fatalf("%s events = %d, want %d: the claimed run was finalized", JobEventDelegationSupersededFinalized, got, finalizedBefore)
+		}
+	} else {
+		// LIVENESS of the counter itself: at this one stage the finalizer HAS run, so
+		// the counted kind must actually have been emitted. Without this, a future
+		// rename would leave the guard above watching a dead string, which is exactly
+		// how it became vacuous.
+		if got := countWorkflowJobEvents(t, store, child, JobEventDelegationSupersededFinalized); got <= finalizedBefore {
+			t.Fatalf("%s events = %d, want more than %d: the counter is watching a kind this path does not emit",
+				JobEventDelegationSupersededFinalized, got, finalizedBefore)
 		}
 	}
 	// The parent advance is only ever CONFIRMED for a lifecycle that never moved, so

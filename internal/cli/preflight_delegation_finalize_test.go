@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -161,6 +162,17 @@ func countWorkerJobEvents(t *testing.T, store *db.Store, jobID, kind string) int
 		}
 	}
 	return n
+}
+
+// workerJobEvents returns every recorded event for a job so an assertion can read
+// the finalize MESSAGE, not just the kind.
+func workerJobEvents(t *testing.T, store *db.Store, jobID string) []db.JobEvent {
+	t.Helper()
+	events, err := store.ListJobEvents(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents(%s) returned error: %v", jobID, err)
+	}
+	return events
 }
 
 func workerTaskState(t *testing.T, store *db.Store, taskID string) string {
@@ -818,9 +830,31 @@ func TestMidRunPermissionBlockedDelegationChildAdvancesParent(t *testing.T) {
 	if cp.Result == nil || cp.Result.Decision != "failed" {
 		t.Fatalf("child result = %+v, want a synthetic failed result", cp.Result)
 	}
-	// The finalize bridge ran exactly once.
-	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_refused_finalized"); got != 1 {
-		t.Fatalf("delegation_refused_finalized events = %d, want 1", got)
+	// The finalize bridge ran exactly once, and it recorded the MID-RUN cause. This
+	// child RAN — Mailbox.Run claimed it and Deliver failed — so labelling it
+	// "refused before it ran" would be false in the opposite direction from the
+	// timeout verb this issue removed (#1512).
+	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_runtime_failure_finalized"); got != 1 {
+		t.Fatalf("delegation_runtime_failure_finalized events = %d, want 1", got)
+	}
+	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_refused_finalized"); got != 0 {
+		t.Fatalf("delegation_refused_finalized events = %d, want 0: this child ran before it failed", got)
+	}
+	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_timeout_finalized"); got != 0 {
+		t.Fatalf("delegation_timeout_finalized events = %d, want 0: no deadline elapsed", got)
+	}
+	// And the MESSAGE must not claim the child never started, which is what a single
+	// hard-coded reason for every caller of the shared helper produced.
+	for _, ev := range workerJobEvents(t, h.store, "parent-job/delegation/api") {
+		if ev.Kind != "delegation_runtime_failure_finalized" {
+			continue
+		}
+		if strings.Contains(ev.Message, "never started") || strings.Contains(ev.Message, "refused before it ran") {
+			t.Fatalf("mid-run finalize message = %q, must not claim the child never started", ev.Message)
+		}
+		if !strings.Contains(ev.Message, "failed mid-run without a result") {
+			t.Fatalf("mid-run finalize message = %q, want it to name the mid-run failure", ev.Message)
+		}
 	}
 	// The DAG advanced and escalate_human fired: the shared parent task is paused
 	// awaiting a human and the human was notified once with the resume context.
@@ -841,8 +875,8 @@ func TestMidRunPermissionBlockedDelegationChildAdvancesParent(t *testing.T) {
 	if err := h.worker.run(ctx, child2); err != nil {
 		t.Fatalf("second worker.run(child) returned error: %v", err)
 	}
-	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_refused_finalized"); got != 1 {
-		t.Fatalf("delegation_refused_finalized events after second tick = %d, want 1 (idempotent)", got)
+	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_runtime_failure_finalized"); got != 1 {
+		t.Fatalf("delegation_runtime_failure_finalized events after second tick = %d, want 1 (idempotent)", got)
 	}
 	if len(h.notifier.calls) != 1 {
 		t.Fatalf("notifier calls after second tick = %d, want 1 (idempotent)", len(h.notifier.calls))
@@ -875,8 +909,8 @@ func TestMidRunPermissionBlockedDelegationChildBlockParent(t *testing.T) {
 	if cp.Result == nil || cp.Result.Decision != "failed" {
 		t.Fatalf("child result = %+v, want a synthetic failed result", cp.Result)
 	}
-	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_refused_finalized"); got != 1 {
-		t.Fatalf("delegation_refused_finalized events = %d, want 1", got)
+	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_runtime_failure_finalized"); got != 1 {
+		t.Fatalf("delegation_runtime_failure_finalized events = %d, want 1", got)
 	}
 	if got := workerTaskState(t, h.store, "task-5"); got != string(workflow.TaskBlocked) {
 		t.Fatalf("task state = %q, want blocked (block_parent fired for the mid-run permission-blocked child)", got)
