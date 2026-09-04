@@ -156,10 +156,20 @@ func TestDeletePipelineCleansKeychainGrantsInSameTransaction(t *testing.T) {
 	}
 }
 
-func TestAgentKeychainGrantsAreProxiedOnlyAndDeletionCleansBothPaths(t *testing.T) {
+// The two seats are not redundant: removing the first must delete ITS grants and
+// leave the second's standing, which is what proves the cleanup is scoped by
+// consumer_id rather than clearing the grants table. Removing the second then
+// shows the table does empty when its last consumer goes.
+//
+// It was named ...CleansBothPaths when the two seats exercised two different
+// deletion entry points; #1753 deleted DeleteAgentChecked, so both now go
+// through RemoveAgent - which runs the byte-identical grant delete - and the
+// name and the "checked-seat" fixture were left over-claiming (#1787 review
+// round 3, F4).
+func TestAgentKeychainGrantsAreProxiedOnlyAndDeletionCleansThemUp(t *testing.T) {
 	store := openPipelineStore(t)
 	ctx := context.Background()
-	for _, name := range []string{"remove-seat", "checked-seat"} {
+	for _, name := range []string{"remove-seat", "second-seat"} {
 		if err := store.UpsertAgent(ctx, Agent{Name: name, Runtime: "codex"}); err != nil {
 			t.Fatal(err)
 		}
@@ -179,7 +189,7 @@ func TestAgentKeychainGrantsAreProxiedOnlyAndDeletionCleansBothPaths(t *testing.
 	if _, err := store.ConfigureKeychainProxy(ctx, "PROXY", "https://api.example.test/v1", KeychainProxyAuthBearer, ""); err != nil {
 		t.Fatal(err)
 	}
-	for _, seat := range []string{"remove-seat", "checked-seat"} {
+	for _, seat := range []string{"remove-seat", "second-seat"} {
 		if changed, err := store.GrantKeychainKey(ctx, KeychainConsumerAgent, seat, "PROXY"); err != nil || !changed {
 			t.Fatalf("grant %s = changed %v err %v", seat, changed, err)
 		}
@@ -202,10 +212,10 @@ func TestAgentKeychainGrantsAreProxiedOnlyAndDeletionCleansBothPaths(t *testing.
 	if removed, err := store.RemoveAgent(ctx, "remove-seat"); err != nil || !removed {
 		t.Fatalf("RemoveAgent = removed %v err %v", removed, err)
 	}
-	if grants, err := store.ListKeychainGrants(ctx, "PROXY"); err != nil || len(grants) != 1 || grants[0].ConsumerID != "checked-seat" {
+	if grants, err := store.ListKeychainGrants(ctx, "PROXY"); err != nil || len(grants) != 1 || grants[0].ConsumerID != "second-seat" {
 		t.Fatalf("grants after RemoveAgent = %+v err=%v", grants, err)
 	}
-	if _, err := store.RemoveAgent(ctx, "checked-seat"); err != nil {
+	if _, err := store.RemoveAgent(ctx, "second-seat"); err != nil {
 		t.Fatalf("RemoveAgent: %v", err)
 	}
 	if grants, err := store.ListKeychainGrants(ctx, "PROXY"); err != nil || len(grants) != 0 {

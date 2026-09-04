@@ -119,3 +119,54 @@ func TestUpdateAgentRuntimeRef(t *testing.T) {
 		t.Fatal("re-pinning an unregistered agent must error")
 	}
 }
+
+// AgentActiveJobCount is the busy pre-flight behind `agent restart`'s refusal to
+// rebind an agent with in-flight work (cli/agent.go) and the heartbeat
+// scheduler's max_background skip (cli/daemon_supervision.go). Its state list is
+// ('queued','running') and BOTH halves are load-bearing: a queued job is work
+// that has not started, so rebinding past it orphans it.
+//
+// The queued half used to be pinned by TestDeleteAgentChecked, which died with
+// its method in #1753 - and both surviving CLI-level tests of the guard seed
+// only "running", so a mutant narrowing the state list to ('running') survived
+// the whole suite (#1787 review round 3, F1). This pins it at the store, where
+// the state list actually lives.
+func TestAgentActiveJobCountCountsQueuedAndRunning(t *testing.T) {
+	store := openStoreOperationsTestStore(t)
+	ctx := context.Background()
+	if err := store.UpsertAgent(ctx, Agent{Name: "worker", Runtime: "codex"}); err != nil {
+		t.Fatalf("upsert agent: %v", err)
+	}
+	for _, tc := range []struct {
+		state string
+		want  int
+	}{
+		{"queued", 1},
+		{"running", 1},
+		{"succeeded", 0},
+		{"failed", 0},
+		{"cancelled", 0},
+	} {
+		jobID := "job-" + tc.state
+		if err := store.CreateJob(ctx, Job{ID: jobID, Agent: "worker", Type: "ask", State: tc.state}); err != nil {
+			t.Fatalf("create %s job: %v", tc.state, err)
+		}
+		got, err := store.AgentActiveJobCount(ctx, "worker")
+		if err != nil {
+			t.Fatalf("AgentActiveJobCount after %s: %v", tc.state, err)
+		}
+		if got != tc.want {
+			t.Fatalf("AgentActiveJobCount with one %s job = %d, want %d: the busy count must include queued AND running work and nothing else", tc.state, got, tc.want)
+		}
+		if _, err := store.db.ExecContext(ctx, `DELETE FROM jobs WHERE id = ?`, jobID); err != nil {
+			t.Fatalf("clear %s job: %v", tc.state, err)
+		}
+	}
+	// Scoped to the named agent, not a global count.
+	if err := store.CreateJob(ctx, Job{ID: "other", Agent: "someone-else", Type: "ask", State: "queued"}); err != nil {
+		t.Fatalf("create foreign job: %v", err)
+	}
+	if got, err := store.AgentActiveJobCount(ctx, "worker"); err != nil || got != 0 {
+		t.Fatalf("AgentActiveJobCount = %d err=%v, want 0: another agent's queued job is not this agent's busy work", got, err)
+	}
+}

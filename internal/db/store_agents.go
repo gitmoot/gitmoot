@@ -137,14 +137,22 @@ type rowQuerier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// ErrAgentHasActiveJobs is the sentinel callers wrap when they refuse an agent
-// that still has queued/running jobs. Callers classify "skip vs hard error"
-// with errors.Is rather than matching the message text.
+// ErrAgentHasActiveJobs is wrapped into the refusal when an agent that still has
+// queued or running jobs would be disturbed. Its only producer today is
+// `agent restart` (cli/agent.go), and it currently has NO errors.Is consumer:
+// #1753 deleted the dashboard TUI's bulk delete, which was the one classifier.
+// It is retained for the wrap so a future caller can classify skip-vs-hard-error
+// without re-deriving the condition from message text - but do not read the
+// wrap as an exercised contract, because nothing observes it (#1787 review
+// round 3, F3, which proved it with a %w -> %v mutant the whole suite ignored).
 var ErrAgentHasActiveJobs = errors.New("agent has queued or running jobs")
 
 // AgentActiveJobCount returns how many queued or running jobs reference the
-// named agent. It is the restart rebind's busy pre-flight; callers wrap
-// ErrAgentHasActiveJobs to classify the refusal.
+// named agent. It is the busy pre-flight for `agent restart`'s rebind refusal
+// and for the heartbeat scheduler's max_background skip. BOTH states in the
+// list are load-bearing - a queued job is work that has not started, so
+// rebinding past it orphans it - and TestAgentActiveJobCountCountsQueuedAndRunning
+// pins that, the CLI-level tests of both guards seeding only "running".
 func (s *Store) AgentActiveJobCount(ctx context.Context, name string) (int, error) {
 	var active int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE agent = ? AND state IN ('queued', 'running')`, name).Scan(&active); err != nil {
