@@ -221,21 +221,36 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 			// This cannot detect FABRICATED evidence, and no deterministic check can.
 			// It detects a verdict that accounts for nothing, which is the shape that
 			// reached a near-merge twice.
-			// #1839: the gate must be able to tell an EXECUTED verdict from a
-			// STATIC-ONLY one. It is a separate check rather than a stricter
-			// version of the one below, because the two ask different things:
-			// this one asks whether the gate was run, that one asks whether the
-			// verdict accounts for itself. A static-only verdict can honestly
-			// pass the second and must still not read as executed evidence.
-			executed := EvidenceWasExecuted(r)
+			// #1839: execution provenance must be VISIBLE to a merge decision,
+			// and the way to get that is a durable field on the result - not a
+			// check that punishes honesty.
+			//
+			// An earlier form of this check passed only when evidence was
+			// "executed", which FAILED EVERY HONEST STATIC-ONLY REVIEW. Under
+			// result_checks=block that is not a warning: mailbox routes a
+			// failed check to m.fail as a contract violation, so a verdict the
+			// shipped contract calls legitimate would have been killed rather
+			// than read - and the very review that found this was static-only,
+			// so it would have been failed instead of listened to. It also
+			// repeats a trap already documented for #1685 twenty lines above
+			// the same routing site.
+			//
+			// So the check asks the only question a static-only verdict cannot
+			// answer dishonestly: if you CLAIM you executed, name something you
+			// ran. Declaring static_only always passes; claiming execution with
+			// nothing to show does not. The executed/static-only distinction
+			// itself is carried by the persisted Evidence field, which is
+			// stated in every explanation below so it is legible wherever these
+			// checks are read.
+			substantiated := !EvidenceWasExecuted(r) || reviewNamesSomethingItRan(r)
 			checks = append(checks, ResultCheck{
-				ID:       "review-evidence-executed",
+				ID:       "review-executed-claim-is-substantiated",
 				Action:   "review",
-				Question: "Did the review execute the repository gate, rather than reasoning statically?",
-				Pass:     executed,
-				Explanation: explain(executed, fmt.Sprintf(
-					"the review declared evidence %q, so its test claims were not produced by running anything; a merge decision must not treat this as executed evidence",
-					strings.TrimSpace(r.Evidence))),
+				Question: "If the review claims it EXECUTED its checks, does it name something it actually ran?",
+				Pass:     substantiated,
+				Explanation: explain(substantiated, fmt.Sprintf(
+					"the review declared evidence %q but names no command, test or artifact it produced, so the execution claim cannot be checked by a reader; declare %q instead if it could not run",
+					strings.TrimSpace(r.Evidence), EvidenceStaticOnly)),
 			})
 
 			pass := reviewVerdictAccountsForItself(r)
@@ -245,8 +260,8 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 				Question: "Does the review verdict cite findings, name evidence it produced, or explain why there was none?",
 				Pass:     pass,
 				Explanation: explain(pass, fmt.Sprintf(
-					"the review returned terminal decision %q with no findings, no substantive tests_run or changes_made entry, and a summary too short to be a rationale, so it accounts for nothing the reviewer did",
-					strings.TrimSpace(r.Decision))),
+					"the review returned terminal decision %q (evidence %q) with no findings, no substantive tests_run or changes_made entry, and a summary too short to be a rationale, so it accounts for nothing the reviewer did",
+					strings.TrimSpace(r.Decision), strings.TrimSpace(r.Evidence))),
 			})
 		}
 	case "ask":
@@ -353,6 +368,24 @@ const minReviewRationaleChars = 40
 // still name something real — a path or a target. It exists so `tests_run: ["."]`
 // is not mistaken for evidence while `internal/workflow/result_checks.go` is.
 const minEvidenceTokenChars = 8
+
+// reviewNamesSomethingItRan reports whether a verdict names any command, test
+// or artifact a reader could go and check. It is the substance requirement
+// behind an EXECUTED claim - deliberately the same predicate the accounting
+// check uses, so the two cannot drift into disagreeing about what counts.
+func reviewNamesSomethingItRan(r AgentResult) bool {
+	for _, entry := range r.TestsRun {
+		if isSubstantiveEvidenceEntry(entry) {
+			return true
+		}
+	}
+	for _, entry := range r.ChangesMade {
+		if isSubstantiveEvidenceEntry(entry) {
+			return true
+		}
+	}
+	return false
+}
 
 // reviewVerdictAccountsForItself reports whether a terminal review verdict
 // accounts for what the reviewer did, by any of the three routes a real one

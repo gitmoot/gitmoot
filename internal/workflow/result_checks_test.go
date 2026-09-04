@@ -110,48 +110,62 @@ func TestRunResultChecksReviewChangesRequestedNeedsEvidence(t *testing.T) {
 	}
 }
 
-// TestRunResultChecksKeepsStaticOnlyDistinctFromExecuted is #1839's gate guard:
-// it fails if the surface that consumes review verdicts ever collapses a
-// static-only verdict into an executed one.
+// TestRunResultChecksNeverPunishesAnHonestStaticOnlyReview is #1839's
+// corrected contract, and it exists because the first version of this check
+// was wrong in the dangerous direction.
 //
-// The distinction has to be visible in the CHECK SET, not only in the stored
-// field, because that is what a merge decision reads. A static-only verdict may
-// legitimately account for itself - a reviewer that could not execute still
-// explains what it inspected - so it passes review-verdict-has-evidence and
-// must still fail review-evidence-executed. One check answering both questions
-// would make the two indistinguishable again.
-func TestRunResultChecksKeepsStaticOnlyDistinctFromExecuted(t *testing.T) {
-	base := AgentResult{
+// That version passed only when evidence was "executed", so EVERY honest
+// static-only verdict failed it - and under result_checks=block a failed check
+// is routed to m.fail as a contract violation, killing a verdict the shipped
+// contract calls legitimate. The review that caught it was itself static-only.
+//
+// The distinction the gate needs is carried by the PERSISTED field, which this
+// test asserts directly; the check only refuses an execution claim that names
+// nothing.
+func TestRunResultChecksNeverPunishesAnHonestStaticOnlyReview(t *testing.T) {
+	honest := AgentResult{
 		Decision: "approved",
-		Summary:  "read the diff and the prior verdicts; nothing further to run for a docs-only change",
+		Summary:  "read the diff and the prior verdicts; the pinned toolchain is unreachable in this sandbox so nothing could be run",
 		TestsRun: []string{"go build ./... -> could not execute: EACCES on the pinned toolchain"},
+		Evidence: EvidenceStaticOnly,
+	}
+	if failed := failedIDs(ResultCheckInput{Action: "review", Result: honest}); len(failed) != 0 {
+		t.Fatalf("an honest static-only review failed checks %v; under result_checks=block that KILLS the job", keys(failed))
 	}
 
-	staticOnly := base
-	staticOnly.Evidence = EvidenceStaticOnly
-	failed := failedIDs(ResultCheckInput{Action: "review", Result: staticOnly})
-	if _, ok := failed["review-evidence-executed"]; !ok {
-		t.Fatalf("a static-only verdict must fail review-evidence-executed; failed=%v", keys(failed))
-	}
-	if _, ok := failed["review-verdict-has-evidence"]; ok {
-		t.Fatalf("a static-only verdict that accounts for itself must still pass the accounting check; failed=%v", keys(failed))
-	}
-
-	executed := base
-	executed.Evidence = EvidenceExecuted
-	if failed := failedIDs(ResultCheckInput{Action: "review", Result: executed}); len(failed) != 0 {
-		t.Fatalf("an executed verdict must pass; failed=%v", keys(failed))
-	}
-
-	// An OMITTED declaration is stored as static_only, never as executed, so a
-	// verdict that never said it ran anything cannot read as executed evidence.
-	omitted := base
+	// Omitted is stored as static_only and is equally not punished.
+	omitted := honest
+	omitted.Evidence = ""
 	normalizeAgentResult(&omitted)
 	if omitted.Evidence != EvidenceStaticOnly {
-		t.Fatalf("omitted evidence normalized to %q, want %q: silence must never become executed", omitted.Evidence, EvidenceStaticOnly)
+		t.Fatalf("omitted evidence normalized to %q, want %q: silence must never become an execution claim", omitted.Evidence, EvidenceStaticOnly)
 	}
-	if _, ok := failedIDs(ResultCheckInput{Action: "review", Result: omitted})["review-evidence-executed"]; !ok {
-		t.Fatal("a verdict with no declaration must fail review-evidence-executed")
+	if failed := failedIDs(ResultCheckInput{Action: "review", Result: omitted}); len(failed) != 0 {
+		t.Fatalf("a verdict with no declaration failed checks %v; absence is not an error", keys(failed))
+	}
+
+	// An EXECUTED claim that names nothing it ran is the one shape refused.
+	hollow := AgentResult{
+		Decision: "approved",
+		Summary:  "everything looks fine and the suite is green, trust me on this one please",
+		Evidence: EvidenceExecuted,
+	}
+	failed := failedIDs(ResultCheckInput{Action: "review", Result: hollow})
+	if _, ok := failed["review-executed-claim-is-substantiated"]; !ok {
+		t.Fatalf("a hollow EXECUTED claim must be refused; failed=%v", keys(failed))
+	}
+
+	// The same claim WITH something a reader can check passes.
+	substantiated := hollow
+	substantiated.TestsRun = []string{"go test ./internal/workflow/ -> ok, 0 failures"}
+	if failed := failedIDs(ResultCheckInput{Action: "review", Result: substantiated}); len(failed) != 0 {
+		t.Fatalf("a substantiated executed review must pass; failed=%v", keys(failed))
+	}
+
+	// And the two remain DISTINGUISHABLE, which is the whole requirement: the
+	// stored field differs even though both verdicts pass every check.
+	if honest.Evidence == substantiated.Evidence {
+		t.Fatal("static-only and executed verdicts carry the same evidence value: they are indistinguishable again")
 	}
 }
 

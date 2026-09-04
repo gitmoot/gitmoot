@@ -22,6 +22,11 @@ func makeGoroot(t *testing.T, root string) string {
 	if err := os.WriteFile(filepath.Join(root, "bin", "go"), []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// A real GOROOT declares its release, and that file is the discriminator
+	// that separates a toolchain from a GOPATH.
+	if err := os.WriteFile(filepath.Join(root, "VERSION"), []byte("go1.26.4\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	return filepath.Join(root, "bin", "go")
 }
 
@@ -33,11 +38,17 @@ func makeGoroot(t *testing.T, root string) string {
 func TestOptionalGoToolchainRootGrantsPinnedToolchains(t *testing.T) {
 	base := t.TempDir()
 
-	// The shape and naming of the pinned toolchain on this box, under a parent
-	// that the old prefix list refused.
+	// The shape and placement of the pinned toolchain on this box, under a
+	// parent that the old prefix list refused. It is grantable because it is
+	// the toolchain the daemon itself was built against - the anchor that
+	// replaced the basename rule, which would have trusted any go-named
+	// directory including a user's home.
 	pinned := filepath.Join(base, "root", ".local", "toolchains", "go1.26.4")
-	if got := optionalGoToolchainRoot(makeGoroot(t, pinned)); got != pinned {
-		t.Fatalf("optionalGoToolchainRoot(pinned) = %q, want %q: a pinned toolchain outside /opt|/usr/local|/nix/store|/snap must still be granted", got, pinned)
+	oldOwn := daemonBuildGoroot
+	daemonBuildGoroot = func() string { return pinned }
+	t.Cleanup(func() { daemonBuildGoroot = oldOwn })
+	if got := GoToolchainRoot(makeGoroot(t, pinned)); got != pinned {
+		t.Fatalf("GoToolchainRoot(pinned) = %q, want %q: a pinned toolchain outside /opt|/usr/local|/nix/store|/snap must still be granted", got, pinned)
 	}
 
 	// A package-root install keeps working even though its leaf is not
@@ -48,8 +59,8 @@ func TestOptionalGoToolchainRootGrantsPinnedToolchains(t *testing.T) {
 	toolchainPackageRoots = []string{filepath.Join(base, "opt")}
 	t.Cleanup(func() { toolchainPackageRoots = previous })
 	hosted := filepath.Join(base, "opt", "hostedtoolcache", "go", "1.26.0", "x64")
-	if got := optionalGoToolchainRoot(makeGoroot(t, hosted)); got != hosted {
-		t.Fatalf("optionalGoToolchainRoot(hosted) = %q, want %q", got, hosted)
+	if got := GoToolchainRoot(makeGoroot(t, hosted)); got != hosted {
+		t.Fatalf("GoToolchainRoot(hosted) = %q, want %q", got, hosted)
 	}
 }
 
@@ -68,8 +79,8 @@ func TestOptionalGoToolchainRootStillRefusesCredentialBearingParents(t *testing.
 	} {
 		t.Run(name, func(t *testing.T) {
 			root := filepath.Join(append([]string{base}, rel...)...)
-			if got := optionalGoToolchainRoot(makeGoroot(t, root)); got != "" {
-				t.Fatalf("optionalGoToolchainRoot(%q) = %q, want refusal: granting it would expose a credential-bearing parent", root, got)
+			if got := GoToolchainRoot(makeGoroot(t, root)); got != "" {
+				t.Fatalf("GoToolchainRoot(%q) = %q, want refusal: granting it would expose a credential-bearing parent", root, got)
 			}
 		})
 	}
@@ -89,8 +100,8 @@ func TestOptionalGoToolchainRootRefusesThingsThatAreNotToolchains(t *testing.T) 
 	if err := os.WriteFile(filepath.Join(plant, "bin", "go"), []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if got := optionalGoToolchainRoot(filepath.Join(plant, "bin", "go")); got != "" {
-		t.Fatalf("optionalGoToolchainRoot(plant) = %q, want refusal: no src/runtime means it is not a toolchain", got)
+	if got := GoToolchainRoot(filepath.Join(plant, "bin", "go")); got != "" {
+		t.Fatalf("GoToolchainRoot(plant) = %q, want refusal: no src/runtime means it is not a toolchain", got)
 	}
 
 	// Not in a bin/ directory at all.
@@ -101,8 +112,8 @@ func TestOptionalGoToolchainRootRefusesThingsThatAreNotToolchains(t *testing.T) 
 	if err := os.WriteFile(filepath.Join(loose, "go"), []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if got := optionalGoToolchainRoot(filepath.Join(loose, "go")); got != "" {
-		t.Fatalf("optionalGoToolchainRoot(loose) = %q, want refusal", got)
+	if got := GoToolchainRoot(filepath.Join(loose, "go")); got != "" {
+		t.Fatalf("GoToolchainRoot(loose) = %q, want refusal", got)
 	}
 }
 

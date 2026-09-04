@@ -64,12 +64,26 @@ Omitting the field records `static_only`. Silence never becomes an execution
 claim, so a producer that does not know about this field cannot be read as
 having run anything. An unrecognised value is rejected outright.
 
-Two result checks consume this. `review-verdict-has-evidence` asks whether the
-verdict accounts for itself at all; `review-evidence-executed` asks whether its
-claims were executed. They are deliberately separate: collapsing them would
-make an executed verdict and a static-only one indistinguishable at the point
-where they are used, which is what made a static-only review readable as a
-tested one.
+**No check fails a static-only review.** The distinction a merge decision needs
+is carried by the stored field, not by refusing the verdict. An earlier version
+of this feature failed every static-only review, which under
+`result_checks = block` does not warn but KILLS the job - so an honest reviewer
+that could not execute would have been discarded instead of read.
+
+Two result checks consume this field:
+
+- `review-verdict-has-evidence` - does the verdict account for itself at all?
+- `review-executed-claim-is-substantiated` - if it claims `executed`, does it
+  name something it actually ran? Declaring `static_only` always passes; a bare
+  "everything looks fine" beside `executed` does not.
+
+## Rollout ordering for the evidence field
+
+Upgrade PARSERS before EMITTERS. A daemon older than this change rejects
+unknown result fields outright, so a result carrying `evidence` produced against
+a newer prompt fails on an older daemon. Absence is always accepted and recorded
+as `static_only`, so the reverse direction - a newer daemon reading an older
+producer's result - is safe.
 
 ## Review severity
 

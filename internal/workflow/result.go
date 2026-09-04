@@ -191,18 +191,18 @@ type AgentResult struct {
 	// beside a declared panel is still a fan-out.
 	FanOut bool `json:"fan_out,omitempty"`
 	// Evidence declares whether this verdict's claims were EXECUTED or are
-	// STATIC-ONLY. It is REQUIRED for a review result (#1839).
+	// STATIC-ONLY, so a merge decision can tell a review that ran the gate from
+	// one that read the diff and could not run anything.
 	//
-	// It exists because the two were indistinguishable at the merge gate. A
-	// read-only review seat could not execute the pinned toolchain or read the
-	// store, so every engine verdict was static-only in fact while looking
-	// exactly like an executed one - and a merge decision that treats a static
-	// verdict as executed evidence is relying on something that did not happen.
+	// ABSENCE IS NOT AN ERROR: normalizeAgentResult records an omitted field as
+	// EvidenceStaticOnly, because silence must never be readable as an execution
+	// claim, and because a producer built against an older prompt cannot know to
+	// send it. A NON-EMPTY value that is not one of EvidenceKinds IS rejected -
+	// a misspelling would otherwise be silently downgraded to static_only and
+	// look like modesty rather than a bug.
 	//
-	// ABSENCE IS NOT "EXECUTED", and it is not silently "static_only" either: a
-	// review result that omits it FAILS VALIDATION and names the field. A
-	// default in either direction is the ambiguity this field was added to
-	// remove.
+	// A static-only verdict is LEGITIMATE and no check fails it. What fails is
+	// claiming execution while naming nothing that was run.
 	Evidence string `json:"evidence,omitempty"`
 }
 

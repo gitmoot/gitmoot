@@ -2526,11 +2526,50 @@ func withStore(home string, fn func(*db.Store) error) error {
 	})
 }
 
+// withInspectionStore opens the store a READ-ONLY inspection command should
+// read: the daemon-staged evidence snapshot when one exists and the caller
+// named no home, otherwise the live store (#1839).
+//
+// The snapshot lives in the seat's own writable cache root, so it opens
+// through the ordinary path with no grant of the live database - which is why
+// nothing beside the live database is exposed either.
+func withInspectionStore(home string, fn func(*db.Store) error) error {
+	paths, err := inspectionPathsFromFlag(home)
+	if err != nil {
+		return err
+	}
+	// The snapshot supplies the DATA; the operator's own home still supplies
+	// the review policy, so a snapshot read cannot silently change a verdict's
+	// effective severity.
+	livePolicyHome := home
+	return withStoreAtPaths(paths, livePolicyHome, func(_ config.Paths, store *db.Store) error {
+		return fn(store)
+	})
+}
+
+// withInspectionStoreAndPaths is withInspectionStore for callers that also
+// need the resolved paths.
+func withInspectionStoreAndPaths(home string, fn func(config.Paths, *db.Store) error) error {
+	paths, err := inspectionPathsFromFlag(home)
+	if err != nil {
+		return err
+	}
+	return withStoreAtPaths(paths, home, fn)
+}
+
 func withStoreAndPaths(home string, fn func(config.Paths, *db.Store) error) error {
 	paths, err := pathsFromFlag(home)
 	if err != nil {
 		return err
 	}
+	return withStoreAtPaths(paths, home, fn)
+}
+
+// withStoreAtPaths is the shared body: reviewHome is the home whose [review]
+// policy the store should render wake details with, which is NOT always the
+// home the database came from - an inspection command reading a snapshot must
+// still apply the operator's real policy.
+func withStoreAtPaths(paths config.Paths, reviewHome string, fn func(config.Paths, *db.Store) error) error {
 	if err := config.Initialize(paths); err != nil {
 		return err
 	}
@@ -2548,7 +2587,7 @@ func withStoreAndPaths(home string, fn func(config.Paths, *db.Store) error) erro
 	// the daemon reconstructs that engine each tick; this callback independently
 	// keeps the transactional wake detail fresh at its own invocation boundary.
 	store.SetReviewBlockingSeverity(func(repo string) string {
-		return loadReviewConfig(home).For(repo).BlockingSeverity
+		return loadReviewConfig(reviewHome).For(repo).BlockingSeverity
 	})
 	defer store.Close()
 	return fn(paths, store)

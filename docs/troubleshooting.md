@@ -710,9 +710,26 @@ granted, so reviews came back static-only with no defect in the code:
   (a `bin/go` with a `src/runtime` beside it) rather than by location, and it
   covers the toolchain root only, never its parent.
 - A reviewer reporting it could not read prior review verdicts for the head it
-  is reviewing. The workflow store was outside the seat's read grants. The
-  database and its sqlite sidecars are now granted AS FILES - never the
-  directory, because credentials live beside them.
+  is reviewing. The seat is now given a CONSISTENT SNAPSHOT of the workflow
+  store inside its own cache root, named by `GITMOOT_EVIDENCE_HOME`. Inspection
+  commands (`job list`, `job show`, `job events`) read it when no `--home` is
+  given; an explicit `--home` always wins, and commands that WRITE always use
+  the live store.
+
+  A snapshot rather than a grant of the live database, because granting the live
+  files does not work: SQLite opens the `-wal` and `-shm` sidecars
+  `O_RDWR|O_CREAT`, which a read-only grant refuses, so the open fails before
+  any verdict is read - and `journal_mode=wal` persists in the header, so a
+  quiescent database behaves the same. The snapshot also means nothing beside
+  the live database is exposed, because the live database is not granted at all.
+
+- `go toolchain: granted <root> (<release>) cannot satisfy the checkout's go
+  <directive> directive` - the seat can execute a toolchain but cannot build
+  this repository. Common cause: the daemon's PATH resolves the system Go
+  (`/usr/bin/go` -> `/usr/lib/go-1.22`) while `go.mod` requires a newer release,
+  and `GOTOOLCHAIN=auto` cannot rescue it without a toolchain download. Put the
+  pinned toolchain on the daemon's PATH. Without this diagnostic the seat simply
+  degraded into a static-only review with no stated reason.
 
 If a review still comes back unable to execute, that is now a real refusal
 worth reading rather than a missing grant: the verdict must say

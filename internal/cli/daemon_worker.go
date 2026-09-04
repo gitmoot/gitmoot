@@ -1446,6 +1446,14 @@ type readOnlySandboxGrants struct {
 	env       []string
 	cacheRoot string
 	stateDir  string
+	// evidenceHome is the home-shaped directory holding the seat's CONSISTENT
+	// SNAPSHOT of the workflow store, or "" when none could be staged. It is
+	// inside cacheRoot, so it needs no grant of its own.
+	evidenceHome string
+	// toolchainDiagnostic names a granted toolchain that cannot build the
+	// checkout, so an unusable environment is diagnosable rather than a
+	// silently static-only review.
+	toolchainDiagnostic string
 }
 
 type readOnlyRuntimeAdapter struct {
@@ -1676,34 +1684,80 @@ func selectedRuntimeConfigDir(runtimeName string) string {
 	}
 }
 
-// reviewEvidenceReadFiles grants a read-only seat the MINIMUM it needs to
-// enumerate prior verdicts: the workflow store's database files, and nothing
-// else.
+// stageReviewEvidenceSnapshot gives a read-only seat a CONSISTENT COPY of the
+// workflow store inside its own cache root, and returns the home-shaped
+// directory to point a `gitmoot --home` invocation at.
 //
-// #1839: a seat could not read the store at all, so a reviewer had no way to
-// find the prior verdicts on the head it was reviewing and every engine
-// verdict was static-only by construction.
+// #1839, round 2: granting the live database as read-only FILES did not work.
+// Measured by strace of the exact mode=ro DSN: SQLite opens the database
+// O_RDONLY but opens the -wal and -shm sidecars O_RDWR|O_CREAT, which a
+// read-file grant refuses, so the open fails before any verdict is read - and
+// journal_mode=wal persists in the header, so a quiescent database behaves the
+// same. The first fix was inert for the case it existed to serve.
 //
-// FILES, DELIBERATELY NOT THE DIRECTORY. The store sits in the same directory
-// as credential-bearing state - bridge.token and config.toml live beside it -
-// so granting the parent would hand a reviewer host credentials to buy it
-// evidence. Landlock's ROFiles rule covers exactly the named files, and
-// sqlite's sidecars are included because a read of a live database needs them.
-// Missing sidecars are skipped rather than failing the seat: a database with no
-// pending WAL is the normal case, and readableFiles refuses a path that does
-// not exist.
-func reviewEvidenceReadFiles(paths config.Paths) []string {
-	database := strings.TrimSpace(paths.Database)
-	if database == "" {
-		return nil
+// A snapshot is strictly better than the alternatives. It needs no write grant
+// on the live store (mode=ro&immutable=1 would, in effect, and returns torn
+// pages against a live writer), it lands with no sidecars in a directory the
+// seat already owns, and it removes the credential adjacency entirely: nothing
+// beside the live database is granted, because the live database is no longer
+// granted at all.
+//
+// A failure here is NEVER fatal. The seat loses evidence and says so through
+// the returned diagnostic; it does not lose its job.
+func stageReviewEvidenceSnapshot(ctx context.Context, paths config.Paths, cacheRoot string) (string, string) {
+	if strings.TrimSpace(paths.Database) == "" || strings.TrimSpace(cacheRoot) == "" {
+		return "", ""
 	}
-	files := make([]string, 0, 3)
-	for _, candidate := range []string{database, database + "-wal", database + "-shm"} {
-		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
-			files = append(files, candidate)
-		}
+	if info, err := os.Stat(paths.Database); err != nil || info.IsDir() {
+		// No store yet is the normal case on a fresh home, not a defect.
+		return "", ""
 	}
-	return files
+	evidenceHome := filepath.Join(cacheRoot, "evidence-home")
+	// The snapshot must land where the HOME CONTRACT looks for it, not merely
+	// inside the directory: config.PathsForHome puts the database under a
+	// nested state dir, so writing it at the top level leaves `gitmoot --home
+	// <evidenceHome>` opening a fresh EMPTY database and reporting no prior
+	// verdicts - dead wiring that reads exactly like "there is no evidence".
+	// Caught by the sufficiency test, not by inspection.
+	dest := config.PathsForHome(evidenceHome).Database
+	if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
+		return "", fmt.Sprintf("workflow evidence: create %s: %v", filepath.Dir(dest), err)
+	}
+	store, err := db.OpenReadOnly(paths.Database)
+	if err != nil {
+		return "", fmt.Sprintf("workflow evidence: open store read-only: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+	if err := store.SnapshotInto(ctx, dest); err != nil {
+		return "", fmt.Sprintf("workflow evidence: %v", err)
+	}
+	return evidenceHome, ""
+}
+
+// reviewToolchainDiagnostic names the case where a seat is granted a perfectly
+// valid Go toolchain that CANNOT BUILD the checkout.
+//
+// #1839 P2-4: measured on this box, a seat whose PATH is the system PATH
+// resolves go1.22.2 while go.mod requires 1.26, and GOTOOLCHAIN=auto cannot
+// rescue it ("download go1.26 for linux/amd64: toolchain not available"). The
+// grant succeeds, so a seat that can never run the gate is indistinguishable
+// from a correctly provisioned one and simply degrades into a static-only
+// review. Naming it is the difference between a diagnosable environment and a
+// silent one; it is deliberately NOT an error, because a review that cannot
+// build is still a legitimate review.
+func reviewToolchainDiagnostic(checkout string) string {
+	directive := sandbox.GoDirectiveForModule(checkout)
+	if directive == "" {
+		return ""
+	}
+	root, release := sandbox.ResolveGoToolchainFromPATH()
+	if root == "" {
+		return fmt.Sprintf("go toolchain: none grantable on PATH, but %s requires go %s: this seat cannot build or test the checkout", filepath.Join(checkout, "go.mod"), directive)
+	}
+	if ok, _, _ := sandbox.GoToolchainSatisfies(release, directive); ok {
+		return ""
+	}
+	return fmt.Sprintf("go toolchain: granted %s (%s) cannot satisfy the checkout's go %s directive: this seat can execute a toolchain but not build the repository", root, release, directive)
 }
 
 func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout string, gatewayMode bool) (readOnlySandboxGrants, error) {
@@ -1729,7 +1783,9 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 		return grants, err
 	}
 	grants.reads = append(grants.reads, metadata...)
-	grants.readFiles = append(grants.readFiles, reviewEvidenceReadFiles(paths)...)
+	if diagnostic := reviewToolchainDiagnostic(checkout); diagnostic != "" {
+		grants.toolchainDiagnostic = diagnostic
+	}
 
 	stateDir, stateEnv, dropped, err := prepareReadOnlyRuntimeState(agent, grants.cacheRoot, gatewayMode)
 	if err != nil {
@@ -1738,6 +1794,17 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	grants.stateDir = stateDir
 	grants.env = append(grants.env, stateEnv...)
 	grants.dropped = dropped
+	if grants.toolchainDiagnostic != "" {
+		grants.dropped = append(grants.dropped, grants.toolchainDiagnostic)
+	}
+	evidenceHome, evidenceDiagnostic := stageReviewEvidenceSnapshot(context.Background(), paths, grants.cacheRoot)
+	if evidenceHome != "" {
+		grants.evidenceHome = evidenceHome
+		grants.env = append(grants.env, "GITMOOT_EVIDENCE_HOME="+evidenceHome)
+	}
+	if evidenceDiagnostic != "" {
+		grants.dropped = append(grants.dropped, evidenceDiagnostic)
+	}
 
 	tempDir := filepath.Join(grants.cacheRoot, "tmp")
 	grants.env = append(grants.env,
