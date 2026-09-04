@@ -59,6 +59,7 @@ var resultFieldAnnotations = map[string]fieldAnnotation{
 	"tests_run":       {example: "[]"},
 	"needs":           {example: "[]"},
 	"delegations":     {example: "[]"},
+	"evidence":        {help: `top-level evidence (string, one of ` + enumList(workflow.EvidenceKinds) + `): REQUIRED on reviews. Say "executed" only if you actually ran the commands you cite; say "static_only" when you read code and could not run it (no toolchain, no network, a sandbox refusal). Never infer test success from inability to execute, and never claim "executed" for a command you could not run - a static-only review is a legitimate verdict, a mislabeled one is not. Omitting it is recorded as static_only.`},
 	"artifact_body":   {help: `top-level artifact_body (string) is required when any delegation requests artifacts.`},
 	"human_questions": {help: `top-level human_questions (object[], optional): use SPARINGLY to pause for a specific human decision instead of guessing; each entry is {` + humanQuestionFieldsHelp() + `}. Returning it pauses the tree awaiting a human answer (no leg fails, no continuation runs); a human replies with /gitmoot resume <job> answer "<id>: ...". Leave it absent when you can proceed.`},
 	"learnings":       {help: `top-level learnings (object[], optional): use RARELY to record a durable, keyed FACT worth remembering next time (e.g. "this repo's arm64 CI is flaky"), NOT a directive and NOT for this job only. Each entry is {` + learningFieldsHelp() + `}. Most jobs return none; leave it absent unless you learned something that will help a future job.`},
@@ -258,6 +259,9 @@ func renderDelegationHelp() string {
 	// severity is a top-level review field. It stays out of the generic example
 	// shape because non-review results must not invent a review severity.
 	if h := resultFieldAnnotations["severity"].help; h != "" {
+		b.WriteString("- " + h + "\n")
+	}
+	if h := resultFieldAnnotations["evidence"].help; h != "" {
 		b.WriteString("- " + h + "\n")
 	}
 	// artifact_body lives on the top-level result, not on a delegation, but it

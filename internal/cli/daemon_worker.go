@@ -1676,6 +1676,36 @@ func selectedRuntimeConfigDir(runtimeName string) string {
 	}
 }
 
+// reviewEvidenceReadFiles grants a read-only seat the MINIMUM it needs to
+// enumerate prior verdicts: the workflow store's database files, and nothing
+// else.
+//
+// #1839: a seat could not read the store at all, so a reviewer had no way to
+// find the prior verdicts on the head it was reviewing and every engine
+// verdict was static-only by construction.
+//
+// FILES, DELIBERATELY NOT THE DIRECTORY. The store sits in the same directory
+// as credential-bearing state - bridge.token and config.toml live beside it -
+// so granting the parent would hand a reviewer host credentials to buy it
+// evidence. Landlock's ROFiles rule covers exactly the named files, and
+// sqlite's sidecars are included because a read of a live database needs them.
+// Missing sidecars are skipped rather than failing the seat: a database with no
+// pending WAL is the normal case, and readableFiles refuses a path that does
+// not exist.
+func reviewEvidenceReadFiles(paths config.Paths) []string {
+	database := strings.TrimSpace(paths.Database)
+	if database == "" {
+		return nil
+	}
+	files := make([]string, 0, 3)
+	for _, candidate := range []string{database, database + "-wal", database + "-shm"} {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			files = append(files, candidate)
+		}
+	}
+	return files
+}
+
 func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout string, gatewayMode bool) (readOnlySandboxGrants, error) {
 	var grants readOnlySandboxGrants
 	paths, err := pathsFromFlag(home)
@@ -1699,6 +1729,7 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 		return grants, err
 	}
 	grants.reads = append(grants.reads, metadata...)
+	grants.readFiles = append(grants.readFiles, reviewEvidenceReadFiles(paths)...)
 
 	stateDir, stateEnv, dropped, err := prepareReadOnlyRuntimeState(agent, grants.cacheRoot, gatewayMode)
 	if err != nil {

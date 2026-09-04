@@ -221,6 +221,23 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 			// This cannot detect FABRICATED evidence, and no deterministic check can.
 			// It detects a verdict that accounts for nothing, which is the shape that
 			// reached a near-merge twice.
+			// #1839: the gate must be able to tell an EXECUTED verdict from a
+			// STATIC-ONLY one. It is a separate check rather than a stricter
+			// version of the one below, because the two ask different things:
+			// this one asks whether the gate was run, that one asks whether the
+			// verdict accounts for itself. A static-only verdict can honestly
+			// pass the second and must still not read as executed evidence.
+			executed := EvidenceWasExecuted(r)
+			checks = append(checks, ResultCheck{
+				ID:       "review-evidence-executed",
+				Action:   "review",
+				Question: "Did the review execute the repository gate, rather than reasoning statically?",
+				Pass:     executed,
+				Explanation: explain(executed, fmt.Sprintf(
+					"the review declared evidence %q, so its test claims were not produced by running anything; a merge decision must not treat this as executed evidence",
+					strings.TrimSpace(r.Evidence))),
+			})
+
 			pass := reviewVerdictAccountsForItself(r)
 			checks = append(checks, ResultCheck{
 				ID:       "review-verdict-has-evidence",

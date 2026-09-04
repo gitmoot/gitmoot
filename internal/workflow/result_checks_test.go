@@ -96,16 +96,62 @@ func TestRunResultChecksReviewChangesRequestedNeedsEvidence(t *testing.T) {
 		t.Fatalf("evidence-free approval must fail the evidence floor; failed=%v", keys(bare))
 	}
 
-	// With evidence, an approval owes nothing further.
+	// With evidence AND a declared execution, an approval owes nothing further.
 	approved := failedIDs(ResultCheckInput{
 		Action: "review",
 		Result: AgentResult{
 			Decision: "approved", Summary: "looks good",
 			TestsRun: []string{"go test ./... -> ok"},
+			Evidence: EvidenceExecuted,
 		},
 	})
 	if len(approved) != 0 {
-		t.Fatalf("evidence-bearing approved review should pass all checks; failed=%v", keys(approved))
+		t.Fatalf("executed evidence-bearing approved review should pass all checks; failed=%v", keys(approved))
+	}
+}
+
+// TestRunResultChecksKeepsStaticOnlyDistinctFromExecuted is #1839's gate guard:
+// it fails if the surface that consumes review verdicts ever collapses a
+// static-only verdict into an executed one.
+//
+// The distinction has to be visible in the CHECK SET, not only in the stored
+// field, because that is what a merge decision reads. A static-only verdict may
+// legitimately account for itself - a reviewer that could not execute still
+// explains what it inspected - so it passes review-verdict-has-evidence and
+// must still fail review-evidence-executed. One check answering both questions
+// would make the two indistinguishable again.
+func TestRunResultChecksKeepsStaticOnlyDistinctFromExecuted(t *testing.T) {
+	base := AgentResult{
+		Decision: "approved",
+		Summary:  "read the diff and the prior verdicts; nothing further to run for a docs-only change",
+		TestsRun: []string{"go build ./... -> could not execute: EACCES on the pinned toolchain"},
+	}
+
+	staticOnly := base
+	staticOnly.Evidence = EvidenceStaticOnly
+	failed := failedIDs(ResultCheckInput{Action: "review", Result: staticOnly})
+	if _, ok := failed["review-evidence-executed"]; !ok {
+		t.Fatalf("a static-only verdict must fail review-evidence-executed; failed=%v", keys(failed))
+	}
+	if _, ok := failed["review-verdict-has-evidence"]; ok {
+		t.Fatalf("a static-only verdict that accounts for itself must still pass the accounting check; failed=%v", keys(failed))
+	}
+
+	executed := base
+	executed.Evidence = EvidenceExecuted
+	if failed := failedIDs(ResultCheckInput{Action: "review", Result: executed}); len(failed) != 0 {
+		t.Fatalf("an executed verdict must pass; failed=%v", keys(failed))
+	}
+
+	// An OMITTED declaration is stored as static_only, never as executed, so a
+	// verdict that never said it ran anything cannot read as executed evidence.
+	omitted := base
+	normalizeAgentResult(&omitted)
+	if omitted.Evidence != EvidenceStaticOnly {
+		t.Fatalf("omitted evidence normalized to %q, want %q: silence must never become executed", omitted.Evidence, EvidenceStaticOnly)
+	}
+	if _, ok := failedIDs(ResultCheckInput{Action: "review", Result: omitted})["review-evidence-executed"]; !ok {
+		t.Fatal("a verdict with no declaration must fail review-evidence-executed")
 	}
 }
 

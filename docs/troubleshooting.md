@@ -697,6 +697,27 @@ Fixes:
   then abstains from its native merge gate — fail-closed, it never merges
   gatelessly; the external gate makes the call.
 
+## Read-Only Review Seat Cannot Run The Toolchain Or Read Prior Verdicts
+
+A read-only review seat is Landlock-confined. Two things it needs were not
+granted, so reviews came back static-only with no defect in the code:
+
+- `go: cannot find GOROOT` or `permission denied` / `EACCES` when the seat runs
+  a build or test, while the same command works in your shell. The sandbox
+  granted only Go installs under `/opt`, `/usr/local`, `/nix/store` or
+  `/snap`, so a toolchain pinned anywhere else - `/root/.local/toolchains/go1.26.4`
+  is the usual shape - was never readable. The grant is now decided by SHAPE
+  (a `bin/go` with a `src/runtime` beside it) rather than by location, and it
+  covers the toolchain root only, never its parent.
+- A reviewer reporting it could not read prior review verdicts for the head it
+  is reviewing. The workflow store was outside the seat's read grants. The
+  database and its sqlite sidecars are now granted AS FILES - never the
+  directory, because credentials live beside them.
+
+If a review still comes back unable to execute, that is now a real refusal
+worth reading rather than a missing grant: the verdict must say
+`evidence: static_only`, and a merge decision can see that it did not run.
+
 ## Read-Only Reviewer Seat Refuses To Start
 
 A read-only seat runs the runtime against an ISOLATED home rather than yours, so

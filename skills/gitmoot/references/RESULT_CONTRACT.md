@@ -17,6 +17,35 @@ truthful, and tied to work that actually happened.
 }
 ```
 
+## Review evidence: executed or static-only
+
+Review results carry a top-level `"evidence"` field with one of two values:
+
+- `"executed"` — you ran the commands you cite and read their real output.
+- `"static_only"` — you read code, diffs or prior verdicts and could not run
+  anything (no usable toolchain, no network, a sandbox refusal).
+
+Declare it on every review. Say `"executed"` only for commands you actually
+ran. **Never infer test success, or failure, from an inability to execute** —
+"the tests presumably still pass" is not evidence, and neither is a red result
+that came from a broken instrument rather than the code.
+
+A static-only review is a legitimate verdict: an honest one that names what it
+inspected and says plainly that it could not execute is more useful than a
+verdict that pretends. A MISLABELLED one is not, because a merge decision
+cannot tell the difference afterwards.
+
+Omitting the field records `static_only`. Silence never becomes an execution
+claim, so a producer that does not know about this field cannot be read as
+having run anything. An unrecognised value is rejected outright.
+
+Two result checks consume this. `review-verdict-has-evidence` asks whether the
+verdict accounts for itself at all; `review-evidence-executed` asks whether its
+claims were executed. They are deliberately separate: collapsing them would
+make an executed verdict and a static-only one indistinguishable at the point
+where they are used, which is what made a static-only review readable as a
+tested one.
+
 ## Review severity
 
 Review results may add a top-level `"severity": "P0"` field. A

@@ -212,7 +212,7 @@ func readableRoots(paths []string, executable string) ([]string, error) {
 		return nil, err
 	}
 	if goExecutable, err := execLookPath("go"); err == nil {
-		if root := optionalSystemToolchainRoot(goExecutable); root != "" {
+		if root := optionalGoToolchainRoot(goExecutable); root != "" {
 			if err := add(root, true); err != nil {
 				return nil, err
 			}
@@ -242,11 +242,38 @@ func addExecutableReadRoots(add func(string, bool) error, executable string) err
 	return nil
 }
 
-// optionalSystemToolchainRoot grants the Go installation selected by PATH when
-// it lives under a system package root. Review agents must be able to run the
-// repository's toolchain, while a user-controlled binary under /root or /home
-// must not turn its credential-bearing parent into a readable subtree.
-func optionalSystemToolchainRoot(executable string) string {
+// toolchainPackageRoots are the package roots whose Go installs are trusted
+// regardless of the install's own leaf name, because a packaged toolchain is
+// not necessarily go-named (/opt/hostedtoolcache/go/1.26.0/x64). It is a
+// variable so a test can point it at a fixture tree: an on-disk fixture cannot
+// live under a real /opt, and an untestable arm is how the #1839 defect
+// survived in the first place.
+var toolchainPackageRoots = []string{"/opt", "/usr/local", "/nix/store", "/snap"}
+
+// optionalGoToolchainRoot returns the GOROOT that owns executable, or "" when
+// executable is not a Go toolchain the seat may read.
+//
+// #1839: the previous form allowlisted four prefixes - /opt, /usr/local,
+// /nix/store, /snap - so a toolchain installed anywhere else was silently not
+// granted. This box pins Go at /root/.local/toolchains/go1.26.4, which matches
+// none of them, so every read-only review seat got EACCES on execve of the
+// pinned `go` and could not run the repository gate at all.
+//
+// The ORIGINAL SECURITY INTENT IS PRESERVED, and it is why this is not simply a
+// wider prefix list: a user-controlled binary under /root or /home must not
+// turn its credential-bearing parent into a readable subtree. So a root is
+// granted only when BOTH hold:
+//
+//   - IT IS SHAPED LIKE A GOROOT: bin/go is a regular file and src/runtime
+//     exists. A planted directory holding a file named go does not qualify.
+//   - IT IS NAMED OR PLACED LIKE A TOOLCHAIN: the root's own name begins with
+//     "go" (go, go1.26.4, ...), or it sits under one of the package roots the
+//     previous policy already trusted. /root/.local and /home/<user> satisfy
+//     neither, so the cases the old test pinned still refuse.
+//
+// The grant is READ-ONLY; Landlock adds no write right here, and a GOROOT holds
+// no credentials.
+func optionalGoToolchainRoot(executable string) string {
 	if resolved, err := filepath.EvalSymlinks(executable); err == nil {
 		executable = resolved
 	}
@@ -255,7 +282,16 @@ func optionalSystemToolchainRoot(executable string) string {
 		return ""
 	}
 	root := filepath.Dir(binDir)
-	for _, allowed := range []string{"/opt", "/usr/local", "/nix/store", "/snap"} {
+	if info, err := os.Stat(filepath.Join(root, "bin", "go")); err != nil || info.IsDir() {
+		return ""
+	}
+	if _, err := os.Stat(filepath.Join(root, "src", "runtime")); err != nil {
+		return ""
+	}
+	if strings.HasPrefix(strings.ToLower(filepath.Base(root)), "go") {
+		return root
+	}
+	for _, allowed := range toolchainPackageRoots {
 		rel, err := filepath.Rel(allowed, root)
 		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			return root
