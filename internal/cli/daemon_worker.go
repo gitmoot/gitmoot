@@ -1639,6 +1639,15 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 }
 
 func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string, gatewayMode bool) (string, []string, error) {
+	// THE THIRD WRITER. This stages three of the seven credential-overlay names
+	// (.credentials.json, auth.json, kimi-code.json) by joining onto cacheRoot,
+	// so a relative cacheRoot writes them relative to the working directory -
+	// the exact mechanism that published a token in #1810. Production supplies
+	// an absolute cacheRoot from the isolated-tool-cache grant today; this makes
+	// that a checked precondition rather than a property of the current caller.
+	if err := requireAbsoluteCredentialHome(cacheRoot, "runtime-state"); err != nil {
+		return "", nil, err
+	}
 	sourceDir := strings.TrimSpace(agent.RuntimeConfigDir)
 	var relativeState, credentialFile, credentialSection string
 	stateRoot := filepath.Join(cacheRoot, "runtime-state")

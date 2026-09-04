@@ -130,9 +130,33 @@ func TestReadOnlySeatCredentialPreflightStaysSilentWhereItCannotAssert(t *testin
 		}
 	})
 	t.Run("no source dir", func(t *testing.T) {
+		// An empty source resolves through the HOST DEFAULT by design (that is
+		// this PR's fix for a silently-dead default profile), so this subtest is
+		// only meaningful with the host pinned. Unpinned it read the real
+		// ~/.claude and started failing the moment that credential expired -
+		// the assertion was measuring the box, not the code.
+		t.Setenv("HOME", t.TempDir())
+		t.Setenv("CLAUDE_CONFIG_DIR", "")
 		agent := runtime.Agent{Runtime: runtime.ClaudeRuntime, ReadOnlySeat: true}
 		if diagnosis := readOnlySeatCredentialPreflight(agent, "  ", false, true, time.Now().UTC()); diagnosis != "" {
-			t.Fatalf("diagnosis=%q, want silence", diagnosis)
+			t.Fatalf("diagnosis=%q, want silence when the host default profile does not exist", diagnosis)
+		}
+	})
+	t.Run("no source dir resolves the host default when one exists", func(t *testing.T) {
+		// The other half of the same contract, pinned rather than assumed: an
+		// empty source is NOT ignored, it resolves to ~/.claude, and an expired
+		// profile there is diagnosed instead of passing silently.
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("CLAUDE_CONFIG_DIR", "")
+		hostDefault := filepath.Join(home, ".claude")
+		if err := os.MkdirAll(hostDefault, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		writeClaudeCredential(t, hostDefault, 0, "")
+		agent := runtime.Agent{Runtime: runtime.ClaudeRuntime, ReadOnlySeat: true}
+		if diagnosis := readOnlySeatCredentialPreflight(agent, "  ", false, false, time.Now().UTC()); diagnosis == "" {
+			t.Fatal("an empty source must resolve the host default profile, not pass silently")
 		}
 	})
 }

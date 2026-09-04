@@ -19,6 +19,13 @@
 # the host that exercises it will produce these files in a work tree. None of
 # them is a tracked repository artifact - verified with git ls-files before
 # adding these rules - so ignoring them by name hides nothing legitimate.
+#
+# LIMIT, stated because a name list reads as completeness and is not:
+# [credentials].keychain_path accepts ANY absolute path, so an operator can
+# point a credential at a filename nothing here lists. Rules matched by name,
+# and a guard matched by basename, are structurally incapable of covering that
+# case. They cover the names this code CHOOSES, not every path an operator can
+# configure.
 runtime-auth.env
 **/runtime-auth.env
 daemon-runtime.env

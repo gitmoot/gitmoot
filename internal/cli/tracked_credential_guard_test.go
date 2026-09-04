@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
 // credentialOverlayFileNames is enumerated from the RESOLVER, not from memory.
@@ -116,5 +117,65 @@ func TestCredentialWritersRefuseANonAbsoluteHome(t *testing.T) {
 	}
 	if !filepath.IsAbs(tokenPath) || filepath.Dir(tokenPath) != paths.Home {
 		t.Fatalf("token path %q is not inside the absolute home %q", tokenPath, paths.Home)
+	}
+}
+
+// THE THIRD WRITER. prepareReadOnlyRuntimeState stages three of the seven
+// overlay names by joining onto cacheRoot, and it was the one writer the
+// previous head left unguarded: driven with a relative cacheRoot it returned a
+// relative stateDir and wrote auth.json there. The cacheRoot must EXIST, or the
+// test would pass on a later mkdir failure rather than on the guard.
+func TestPrepareReadOnlyRuntimeStateRefusesARelativeCacheRoot(t *testing.T) {
+	t.Chdir(t.TempDir())
+	const relative = "relative-cache"
+	if err := os.MkdirAll(relative, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "auth.json"), []byte(`{"tokens":{"access":"placeholder-not-a-token"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	agent := runtime.Agent{Name: "reviewer", Runtime: runtime.CodexRuntime, ReadOnlySeat: true, RuntimeConfigDir: source}
+
+	stateDir, env, err := prepareReadOnlyRuntimeState(agent, relative, false)
+	if err == nil {
+		t.Fatalf("a relative cacheRoot was accepted: stateDir=%q env=%v; credentials would be staged inside the working directory", stateDir, env)
+	}
+	if stateDir != "" {
+		t.Fatalf("stateDir = %q on refusal, want empty", stateDir)
+	}
+	// Nothing may have been created under the relative root.
+	var created []string
+	_ = filepath.Walk(relative, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr == nil && info != nil && !info.IsDir() {
+			created = append(created, path)
+		}
+		return nil
+	})
+	if len(created) > 0 {
+		t.Fatalf("the refused call still wrote %v under the relative cacheRoot", created)
+	}
+
+	// An ABSOLUTE cacheRoot must still stage and inject: the guard is a
+	// precondition, not a feature removal.
+	absolute := t.TempDir()
+	stateDir, env, err = prepareReadOnlyRuntimeState(agent, absolute, false)
+	if err != nil {
+		t.Fatalf("absolute cacheRoot rejected: %v", err)
+	}
+	if !filepath.IsAbs(stateDir) || !strings.HasPrefix(stateDir, absolute) {
+		t.Fatalf("stateDir = %q, want an absolute path under %q", stateDir, absolute)
+	}
+	if _, statErr := os.Stat(filepath.Join(stateDir, "auth.json")); statErr != nil {
+		t.Fatalf("absolute cacheRoot did not stage the credential: %v", statErr)
+	}
+	var injected bool
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "CODEX_HOME=") {
+			injected = true
+		}
+	}
+	if !injected {
+		t.Fatalf("absolute cacheRoot did not inject the runtime state env: %v", env)
 	}
 }
