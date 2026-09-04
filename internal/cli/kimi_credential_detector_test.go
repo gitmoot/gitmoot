@@ -54,12 +54,11 @@ func kimiDetectorEvents(t *testing.T, store *db.Store, jobID string) []db.JobEve
 // that only reported on failures would miss the shape it was built for.
 func TestNonSeatKimiDeliveryRecordsCredentialDegradation(t *testing.T) {
 	store := daemonWorkerStore(t)
-	worker := defaultJobWorker(store, io.Discard)
 	profile := t.TempDir()
 	path := writeKimiDetectorCredential(t, profile, kimiDetectorLiveCredential)
 	agent := runtime.Agent{Name: "kimi-impl", Runtime: runtime.KimiRuntime, RuntimeConfigDir: profile}
 
-	before, observed := worker.observeNonSeatKimiCredential(agent)
+	before, observed := observeNonSeatKimiCredential(agent)
 	if !observed || !before.HasToken() {
 		t.Fatalf("pre-run observation = %+v observed = %v, want a token", before, observed)
 	}
@@ -67,7 +66,7 @@ func TestNonSeatKimiDeliveryRecordsCredentialDegradation(t *testing.T) {
 	// shape, reproduced without running kimi.
 	writeKimiDetectorCredential(t, profile, kimiDetectorBlankedCredential)
 
-	worker.recordKimiCredentialDegradation(context.Background(), "job-kimi-1", agent, before, observed)
+	recordKimiCredentialDegradation(context.Background(), store, io.Discard, "job-kimi-1", agent, before, observed)
 
 	events := kimiDetectorEvents(t, store, "job-kimi-1")
 	if len(events) != 1 {
@@ -85,13 +84,64 @@ func TestNonSeatKimiDeliveryRecordsCredentialDegradation(t *testing.T) {
 	}
 }
 
+// TestKimiCredentialDegradationIsRecordedAtMostOncePerJob pins the bound the
+// #1856 ruling states explicitly. The two CLI dispatch boundaries are mutually
+// exclusive arms of one if/else, so they cannot double-fire today - but the
+// bound is enforced in the recorder rather than left to that control flow, so a
+// retried job re-entering delivery cannot append a second copy of the same
+// observation and a future caller cannot reintroduce the duplicate.
+func TestKimiCredentialDegradationIsRecordedAtMostOncePerJob(t *testing.T) {
+	store := daemonWorkerStore(t)
+	profile := t.TempDir()
+	writeKimiDetectorCredential(t, profile, kimiDetectorLiveCredential)
+	agent := runtime.Agent{Name: "kimi-impl", Runtime: runtime.KimiRuntime, RuntimeConfigDir: profile}
+
+	before, observed := observeNonSeatKimiCredential(agent)
+	if !observed || !before.HasToken() {
+		t.Fatalf("pre-run observation = %+v observed = %v, want a token", before, observed)
+	}
+	writeKimiDetectorCredential(t, profile, kimiDetectorBlankedCredential)
+	for range 3 {
+		recordKimiCredentialDegradation(context.Background(), store, io.Discard, "job-once", agent, before, observed)
+	}
+	if events := kimiDetectorEvents(t, store, "job-once"); len(events) != 1 {
+		t.Fatalf("%s events = %d after three recordings, want exactly 1", kimiCredentialDegradedEvent, len(events))
+	}
+}
+
+// TestDelegatedKimiDeliveryRecordsCredentialDegradation covers the SECOND
+// bracketed delivery route (daemon_worker.go's delegated-job path). A
+// delegation child whose action is neither ask nor review is never given a
+// read-only seat (engine_delegation.go sets ReadOnlySeat only for those two),
+// so its kimi child reads the LIVE profile and belongs to the observed
+// population. The route runs through the SAME recorder, so this test pins the
+// route's coverage rather than re-testing the predicate.
+func TestDelegatedKimiDeliveryRecordsCredentialDegradation(t *testing.T) {
+	store := daemonWorkerStore(t)
+	profile := t.TempDir()
+	writeKimiDetectorCredential(t, profile, kimiDetectorLiveCredential)
+	// A delegation child's own agent, as the delegated path passes it
+	// (started.Agent): an implement action, so no seat.
+	delegated := runtime.Agent{Name: "kimi-delegate", Runtime: runtime.KimiRuntime, RuntimeConfigDir: profile}
+
+	before, observed := observeNonSeatKimiCredential(delegated)
+	if !observed || !before.HasToken() {
+		t.Fatalf("pre-run observation = %+v observed = %v, want a token", before, observed)
+	}
+	writeKimiDetectorCredential(t, profile, kimiDetectorBlankedCredential)
+	recordKimiCredentialDegradation(context.Background(), store, io.Discard, "delegated-kimi-1", delegated, before, observed)
+
+	if events := kimiDetectorEvents(t, store, "delegated-kimi-1"); len(events) != 1 {
+		t.Fatalf("%s events = %d, want exactly 1 for the delegated route", kimiCredentialDegradedEvent, len(events))
+	}
+}
+
 // TestReadOnlySeatKimiDeliveryIsNotObserved pins the POPULATION as a property
 // of the code. A seat reads a staged clone inside its own writable cache root,
 // so a change there says nothing about the operator's profile; observing it
 // would emit events indistinguishable from real ones.
 func TestReadOnlySeatKimiDeliveryIsNotObserved(t *testing.T) {
 	store := daemonWorkerStore(t)
-	worker := defaultJobWorker(store, io.Discard)
 	profile := t.TempDir()
 	writeKimiDetectorCredential(t, profile, kimiDetectorLiveCredential)
 
@@ -103,13 +153,13 @@ func TestReadOnlySeatKimiDeliveryIsNotObserved(t *testing.T) {
 		{"another runtime", runtime.Agent{Name: "claude", Runtime: runtime.ClaudeRuntime, RuntimeConfigDir: profile}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			before, observed := worker.observeNonSeatKimiCredential(tc.agent)
+			before, observed := observeNonSeatKimiCredential(tc.agent)
 			if observed {
 				t.Fatalf("observation = %+v, want none for %s", before, tc.name)
 			}
 			writeKimiDetectorCredential(t, profile, kimiDetectorBlankedCredential)
 			jobID := "job-" + tc.name
-			worker.recordKimiCredentialDegradation(context.Background(), jobID, tc.agent, before, observed)
+			recordKimiCredentialDegradation(context.Background(), store, io.Discard, jobID, tc.agent, before, observed)
 			if events := kimiDetectorEvents(t, store, jobID); len(events) != 0 {
 				t.Fatalf("%s events = %d, want 0 for %s", kimiCredentialDegradedEvent, len(events), tc.name)
 			}
@@ -123,7 +173,6 @@ func TestReadOnlySeatKimiDeliveryIsNotObserved(t *testing.T) {
 // host that was already logged out before the run.
 func TestNonSeatKimiDeliveryStaysSilentWithoutADegradation(t *testing.T) {
 	store := daemonWorkerStore(t)
-	worker := defaultJobWorker(store, io.Discard)
 
 	for _, tc := range []struct {
 		name   string
@@ -138,13 +187,13 @@ func TestNonSeatKimiDeliveryStaysSilentWithoutADegradation(t *testing.T) {
 			profile := t.TempDir()
 			writeKimiDetectorCredential(t, profile, tc.before)
 			agent := runtime.Agent{Name: "kimi-impl", Runtime: runtime.KimiRuntime, RuntimeConfigDir: profile}
-			observation, observed := worker.observeNonSeatKimiCredential(agent)
+			observation, observed := observeNonSeatKimiCredential(agent)
 			if !observed {
 				t.Fatal("expected an observation for a non-seat kimi agent")
 			}
 			writeKimiDetectorCredential(t, profile, tc.after)
 			jobID := "job-silent-" + tc.name
-			worker.recordKimiCredentialDegradation(context.Background(), jobID, agent, observation, observed)
+			recordKimiCredentialDegradation(context.Background(), store, io.Discard, jobID, agent, observation, observed)
 			if events := kimiDetectorEvents(t, store, jobID); len(events) != 0 {
 				t.Fatalf("%s events = %d, want 0", kimiCredentialDegradedEvent, len(events))
 			}
