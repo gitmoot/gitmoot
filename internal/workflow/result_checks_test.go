@@ -96,16 +96,76 @@ func TestRunResultChecksReviewChangesRequestedNeedsEvidence(t *testing.T) {
 		t.Fatalf("evidence-free approval must fail the evidence floor; failed=%v", keys(bare))
 	}
 
-	// With evidence, an approval owes nothing further.
+	// With evidence AND a declared execution, an approval owes nothing further.
 	approved := failedIDs(ResultCheckInput{
 		Action: "review",
 		Result: AgentResult{
 			Decision: "approved", Summary: "looks good",
 			TestsRun: []string{"go test ./... -> ok"},
+			Evidence: EvidenceExecuted,
 		},
 	})
 	if len(approved) != 0 {
-		t.Fatalf("evidence-bearing approved review should pass all checks; failed=%v", keys(approved))
+		t.Fatalf("executed evidence-bearing approved review should pass all checks; failed=%v", keys(approved))
+	}
+}
+
+// TestRunResultChecksNeverPunishesAnHonestStaticOnlyReview is #1839's
+// corrected contract, and it exists because the first version of this check
+// was wrong in the dangerous direction.
+//
+// That version passed only when evidence was "executed", so EVERY honest
+// static-only verdict failed it - and under result_checks=block a failed check
+// is routed to m.fail as a contract violation, killing a verdict the shipped
+// contract calls legitimate. The review that caught it was itself static-only.
+//
+// The distinction the gate needs is carried by the PERSISTED field, which this
+// test asserts directly; the check only refuses an execution claim that names
+// nothing.
+func TestRunResultChecksNeverPunishesAnHonestStaticOnlyReview(t *testing.T) {
+	honest := AgentResult{
+		Decision: "approved",
+		Summary:  "read the diff and the prior verdicts; the pinned toolchain is unreachable in this sandbox so nothing could be run",
+		TestsRun: []string{"go build ./... -> could not execute: EACCES on the pinned toolchain"},
+		Evidence: EvidenceStaticOnly,
+	}
+	if failed := failedIDs(ResultCheckInput{Action: "review", Result: honest}); len(failed) != 0 {
+		t.Fatalf("an honest static-only review failed checks %v; under result_checks=block that KILLS the job", keys(failed))
+	}
+
+	// Omitted is stored as static_only and is equally not punished.
+	omitted := honest
+	omitted.Evidence = ""
+	normalizeAgentResult(&omitted)
+	if omitted.Evidence != EvidenceStaticOnly {
+		t.Fatalf("omitted evidence normalized to %q, want %q: silence must never become an execution claim", omitted.Evidence, EvidenceStaticOnly)
+	}
+	if failed := failedIDs(ResultCheckInput{Action: "review", Result: omitted}); len(failed) != 0 {
+		t.Fatalf("a verdict with no declaration failed checks %v; absence is not an error", keys(failed))
+	}
+
+	// An EXECUTED claim that names nothing it ran is the one shape refused.
+	hollow := AgentResult{
+		Decision: "approved",
+		Summary:  "everything looks fine and the suite is green, trust me on this one please",
+		Evidence: EvidenceExecuted,
+	}
+	failed := failedIDs(ResultCheckInput{Action: "review", Result: hollow})
+	if _, ok := failed["review-executed-claim-is-substantiated"]; !ok {
+		t.Fatalf("a hollow EXECUTED claim must be refused; failed=%v", keys(failed))
+	}
+
+	// The same claim WITH something a reader can check passes.
+	substantiated := hollow
+	substantiated.TestsRun = []string{"go test ./internal/workflow/ -> ok, 0 failures"}
+	if failed := failedIDs(ResultCheckInput{Action: "review", Result: substantiated}); len(failed) != 0 {
+		t.Fatalf("a substantiated executed review must pass; failed=%v", keys(failed))
+	}
+
+	// And the two remain DISTINGUISHABLE, which is the whole requirement: the
+	// stored field differs even though both verdicts pass every check.
+	if honest.Evidence == substantiated.Evidence {
+		t.Fatal("static-only and executed verdicts carry the same evidence value: they are indistinguishable again")
 	}
 }
 
@@ -365,4 +425,69 @@ func keys(m map[string]ResultCheck) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TestExecutedClaimNeedsARunnableTarget pins the round-3 finding that entries
+// stating the OPPOSITE of execution were accepted as proof of it: "none run"
+// and "could not run" are two words each, so the two-word arm let them through.
+func TestExecutedClaimNeedsARunnableTarget(t *testing.T) {
+	// PUNCTUATED VARIANTS ARE THE COMMON CASE, not an edge one: tests_run
+	// entries are agent-written prose. A trailing full stop used to supply the
+	// "." that satisfied the predicate, so four of the five bare phrases below
+	// passed once punctuated - including "everything looks fine.", the exact
+	// phrase the shipped contract promises is refused.
+	hollow := []string{
+		"none run", "could not run", "nothing to run", "ok", "n/a",
+		"none run.", "could not run.", "nothing to run.", "n/a.", "ok.",
+		"everything looks fine.", "no tests were run.", "Nothing.",
+		"tests could not be executed in this sandbox.",
+		"I did not run anything at all.",
+		"unable to run the suite; static review only.",
+		"none - sandbox refused execution.",
+	}
+	for _, entry := range hollow {
+		result := AgentResult{
+			Decision: "approved",
+			Summary:  "a summary long enough to satisfy the accounting floor on its own merits",
+			TestsRun: []string{entry},
+			Evidence: EvidenceExecuted,
+		}
+		failed := failedIDs(ResultCheckInput{Action: "review", Result: result})
+		if _, ok := failed["review-executed-claim-is-substantiated"]; !ok {
+			t.Errorf("tests_run %q substantiated an EXECUTED claim; failed=%v", entry, keys(failed))
+		}
+	}
+
+	real := []string{
+		"go test ./... -> ok", "go build ./internal/workflow/ rc=0",
+		"gofmt -l internal/ -> clean",
+		// Punctuated REAL entries must still pass: the fix strips trailing
+		// punctuation rather than refusing anything that carries it.
+		"ran go test ./internal/cli/ and it passed.",
+		"go version go1.26.4 linux/amd64.",
+		"inspected main.go and result_checks.go.",
+	}
+	for _, entry := range real {
+		result := AgentResult{
+			Decision: "approved",
+			Summary:  "a summary long enough to satisfy the accounting floor on its own merits",
+			TestsRun: []string{entry},
+			Evidence: EvidenceExecuted,
+		}
+		if failed := failedIDs(ResultCheckInput{Action: "review", Result: result}); len(failed) != 0 {
+			t.Errorf("tests_run %q is a real command and must pass; failed=%v", entry, keys(failed))
+		}
+	}
+
+	// An honest static-only verdict still passes with the SAME hollow entries,
+	// because it claims nothing.
+	honest := AgentResult{
+		Decision: "approved",
+		Summary:  "read the diff and prior verdicts; the toolchain was unreachable so nothing could be run",
+		TestsRun: []string{"none run"},
+		Evidence: EvidenceStaticOnly,
+	}
+	if failed := failedIDs(ResultCheckInput{Action: "review", Result: honest}); len(failed) != 0 {
+		t.Fatalf("an honest static-only review failed %v; under result_checks=block that KILLS the job", keys(failed))
+	}
 }

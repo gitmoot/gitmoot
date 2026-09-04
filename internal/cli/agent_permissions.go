@@ -34,9 +34,15 @@ func readOnlyImplementationBlocked(jobType string, agent runtime.Agent) bool {
 // that read and this write; the state-only CAS below then accepts the NEWER run's `running` and
 // blocks it. Review reproduced exactly that: new run state = "blocked", want running. The
 // guarantee has to live in the WRITE, not in a preceding read.
-func markJobPermissionBlockedAtGeneration(ctx context.Context, store *db.Store, jobID string, atGeneration int64) (bool, error) {
+// The matched source state is returned alongside the outcome: the CAS is the only
+// party that knows WHICH `from` actually won, and a caller that DESCRIBES the
+// transition needs that fact. A pre-write read cannot serve — the very window this
+// anchored form exists to close (#1407) sits between the read and the write — so
+// "did this child ever run" is answered by the arm that matched, never by a
+// snapshot taken before it (#1848).
+func markJobPermissionBlockedAtGeneration(ctx context.Context, store *db.Store, jobID string, atGeneration int64) (bool, workflow.JobState, error) {
 	if store == nil {
-		return false, errors.New("job store is required")
+		return false, "", errors.New("job store is required")
 	}
 	for _, from := range []workflow.JobState{workflow.JobQueued, workflow.JobRunning, workflow.JobFailed} {
 		event := db.JobEvent{
@@ -47,13 +53,13 @@ func markJobPermissionBlockedAtGeneration(ctx context.Context, store *db.Store, 
 		if atGeneration >= 0 {
 			transitioned, err := store.TransitionJobStateWithEventAtGeneration(ctx, jobID, string(from), atGeneration, string(workflow.JobBlocked), event)
 			if err != nil {
-				return false, err
+				return false, "", err
 			}
 			if transitioned {
 				if err := store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "permission_blocked", Message: agentPermissionBlockedMessage}); err != nil {
-					return false, err
+					return false, "", err
 				}
-				return true, nil
+				return true, from, nil
 			}
 			continue
 		}
@@ -63,22 +69,31 @@ func markJobPermissionBlockedAtGeneration(ctx context.Context, store *db.Store, 
 			Message: agentPermissionBlockedMessage,
 		})
 		if err != nil {
-			return false, err
+			return false, "", err
 		}
 		if transitioned {
 			if err := store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "permission_blocked", Message: agentPermissionBlockedMessage}); err != nil {
-				return false, err
+				return false, "", err
 			}
-			return true, nil
+			return true, from, nil
 		}
 	}
-	return false, nil
+	return false, "", nil
 }
 
 // markJobPermissionBlocked derives the atomic-write anchor from the admitted
 // row. Callers must retain that row rather than re-read before writing: a queued
 // cancellation and retry can produce the same state at a newer generation.
-func markJobPermissionBlocked(ctx context.Context, store *db.Store, job db.Job) (bool, error) {
+//
+// It PASSES THROUGH the matched source state, because a caller that goes on to
+// DESCRIBE the transition needs it and the admitted row cannot supply it:
+// queued→running does not bump the generation (the bump fires only on a
+// transition TO queued, store_jobs.go's bumpLifecycleGenerationSQL), so a
+// concurrent claim leaves the row running at the SAME generation this CAS is
+// anchored to and the JobRunning arm matches. A caller keying its label on the
+// row it was handed would then record a child that DID run as "refused before it
+// ran and never started" — the #1848 defect at the sibling site (#1852).
+func markJobPermissionBlocked(ctx context.Context, store *db.Store, job db.Job) (bool, workflow.JobState, error) {
 	return markJobPermissionBlockedAtGeneration(ctx, store, job.ID, job.LifecycleGeneration)
 }
 

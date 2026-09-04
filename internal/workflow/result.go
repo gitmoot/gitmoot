@@ -42,6 +42,11 @@ var ResultDecisions = []string{"approved", "changes_requested", "blocked", "impl
 // engine-readable field rather than only in prose.
 var ReviewSeverities = reviewseverity.Values
 
+// EvidenceKinds are the allowed values of AgentResult.Evidence, ordered from
+// strongest to weakest. One source so the prompt, the validator and the gate
+// cannot disagree about what a reviewer may say.
+var EvidenceKinds = []string{EvidenceExecuted, EvidenceStaticOnly}
+
 // DelegationActions is the canonical set of delegation/session job actions.
 var DelegationActions = []string{"ask", "review", "implement"}
 
@@ -371,6 +376,46 @@ type AgentResult struct {
 	// ResultIsFanOut ORs it with the delegations it can see, so `fan_out: false`
 	// beside a declared panel is still a fan-out.
 	FanOut bool `json:"fan_out,omitempty"`
+	// Evidence declares whether this verdict's claims were EXECUTED or are
+	// STATIC-ONLY, so a merge decision can tell a review that ran the gate from
+	// one that read the diff and could not run anything.
+	//
+	// ABSENCE IS NOT AN ERROR: normalizeAgentResult records an omitted field as
+	// EvidenceStaticOnly, because silence must never be readable as an execution
+	// claim, and because a producer built against an older prompt cannot know to
+	// send it. A NON-EMPTY value that is not one of EvidenceKinds IS rejected -
+	// a misspelling would otherwise be silently downgraded to static_only and
+	// look like modesty rather than a bug.
+	//
+	// A static-only verdict is LEGITIMATE and no check fails it. What fails is
+	// claiming execution while naming nothing that was run.
+	Evidence string `json:"evidence,omitempty"`
+}
+
+// The two values Evidence accepts. A closed pair of strings rather than a
+// bool: both read correctly in a stored result and in an operator surface,
+// while `executed: false` invites being read as a missing field.
+const (
+	EvidenceExecuted   = "executed"
+	EvidenceStaticOnly = "static_only"
+)
+
+// ValidEvidence reports whether value is one of the declared evidence modes.
+func ValidEvidence(value string) bool {
+	switch strings.TrimSpace(value) {
+	case EvidenceExecuted, EvidenceStaticOnly:
+		return true
+	default:
+		return false
+	}
+}
+
+// EvidenceWasExecuted reports whether a result declares EXECUTED evidence. A
+// consumer that wants to rely on a verdict's test claims must ask this rather
+// than reading TestsRun, because a static-only verdict can carry a populated
+// TestsRun describing what it could NOT run.
+func EvidenceWasExecuted(r AgentResult) bool {
+	return strings.TrimSpace(r.Evidence) == EvidenceExecuted
 }
 
 // authorityGrantingResultFields are AgentResult fields an agent may NEVER supply,
@@ -493,6 +538,9 @@ func validateAgentResultForAction(result AgentResult, action string) error {
 	}
 	if strings.TrimSpace(action) == "review" && result.Decision == "changes_requested" && result.Severity == "" {
 		return errors.New("gitmoot_result severity is required when a review requests changes")
+	}
+	if strings.TrimSpace(result.Evidence) != "" && !ValidEvidence(result.Evidence) {
+		return fmt.Errorf("gitmoot_result evidence %q is not recognised; use %q or %q", result.Evidence, EvidenceExecuted, EvidenceStaticOnly)
 	}
 	return nil
 }
@@ -930,6 +978,18 @@ func normalizeAgentResult(result *AgentResult) {
 	}
 	if result.TestsRun == nil {
 		result.TestsRun = []string{}
+	}
+	// #1839: evidence is ALWAYS one of the two declared values in a stored
+	// result, and an omission becomes STATIC_ONLY rather than executed.
+	//
+	// This is the safe direction and it is not a compatibility shim: the stored
+	// result is explicit either way, so no consumer has to interpret an absent
+	// field, and nothing can read "we could not run the gate" as "the gate
+	// passed". A reviewer that DID execute says so; silence is treated as the
+	// weaker claim, because the alternative is inferring an execution that may
+	// never have happened.
+	if !ValidEvidence(result.Evidence) {
+		result.Evidence = EvidenceStaticOnly
 	}
 	if result.Needs == nil {
 		result.Needs = []string{}

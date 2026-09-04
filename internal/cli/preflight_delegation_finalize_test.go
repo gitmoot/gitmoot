@@ -843,18 +843,23 @@ func TestMidRunPermissionBlockedDelegationChildAdvancesParent(t *testing.T) {
 	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_timeout_finalized"); got != 0 {
 		t.Fatalf("delegation_timeout_finalized events = %d, want 0: no deadline elapsed", got)
 	}
-	// And the MESSAGE must not claim the child never started, which is what a single
-	// hard-coded reason for every caller of the shared helper produced.
+	// The MESSAGE must NAME the mid-run failure. Asserting the positive is the point:
+	// enumerating forbidden phrasings ("never started", "refused before it ran") let
+	// the semantically identical "was not started" through, so the guard passed while
+	// the claim it forbids was present in spirit. A message that names a mid-run
+	// failure cannot also be asserting the child never started (#1512).
+	found := 0
 	for _, ev := range workerJobEvents(t, h.store, "parent-job/delegation/api") {
 		if ev.Kind != "delegation_runtime_failure_finalized" {
 			continue
 		}
-		if strings.Contains(ev.Message, "never started") || strings.Contains(ev.Message, "refused before it ran") {
-			t.Fatalf("mid-run finalize message = %q, must not claim the child never started", ev.Message)
-		}
+		found++
 		if !strings.Contains(ev.Message, "failed mid-run without a result") {
-			t.Fatalf("mid-run finalize message = %q, want it to name the mid-run failure", ev.Message)
+			t.Fatalf("mid-run finalize message = %q, want it to name the mid-run failure this child actually had", ev.Message)
 		}
+	}
+	if found != 1 {
+		t.Fatalf("mid-run finalize messages inspected = %d, want 1: the loop above asserted nothing", found)
 	}
 	// The DAG advanced and escalate_human fired: the shared parent task is paused
 	// awaiting a human and the human was notified once with the resume context.
@@ -967,8 +972,31 @@ func TestMidRunPermissionBlockedNonDelegationUnaffected(t *testing.T) {
 	if cp.Result != nil {
 		t.Fatalf("non-delegation permission-blocked job must NOT get a synthetic result: %+v", cp.Result)
 	}
-	if n := countWorkerJobEvents(t, store, "impl-job", "delegation_refused_finalized"); n != 0 {
-		t.Fatalf("delegation_refused_finalized events = %d, want 0 for a non-delegation job", n)
+	// BOTH kinds must be zero, not just whichever one this path happens to emit
+	// today. Counting only the emitted kind was a swap, not coverage: since
+	// daemon_result.go can now legitimately route a permission-blocked child to the
+	// REFUSED kind as well, a regression leaking either kind onto a NON-delegation
+	// job would go uncounted here (#1852). Counting the emitted kind is what makes
+	// the guard able to fail at all — the previous form watched a dead string
+	// (#1512) — and counting both is what makes it cover the path.
+	for _, kind := range []string{"delegation_runtime_failure_finalized", "delegation_refused_finalized"} {
+		if n := countWorkerJobEvents(t, store, "impl-job", kind); n != 0 {
+			t.Fatalf("%s events = %d, want 0 for a non-delegation job", kind, n)
+		}
+	}
+	// LIVENESS of that counter: the identical assertion on a DELEGATION child of the
+	// same mid-run path must observe exactly one such event, so a rename that killed
+	// the guard above would fail here instead of passing silently.
+	live := newPreflightHarnessForAction(t, "escalate_human", "implement")
+	live.worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return live.checkout, nil
+	}
+	live.worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return permissionErrorAdapter{}, nil
+	}
+	live.runChildTick(t)
+	if n := countWorkerJobEvents(t, live.store, "parent-job/delegation/api", "delegation_runtime_failure_finalized"); n != 1 {
+		t.Fatalf("delegation_runtime_failure_finalized events on the delegation child = %d, want 1: the counted kind is not emitted by this path at all", n)
 	}
 	// Exactly one engine build (RunJob's), proving the finalize helper short-circuited
 	// for the non-delegation job rather than rebuilding the engine to advance a DAG.
