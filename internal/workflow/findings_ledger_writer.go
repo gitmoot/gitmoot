@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -177,29 +178,80 @@ func (e Engine) ledgerObservationFor(job db.Job, payload JobPayload, wire review
 		obs.State = db.FindingOpen
 	}
 	commands := []string(payload.Result.TestsRun)
+	// THE VERDICT'S OWN evidence FIELD IS THE AUTHORITY, NOT THE LENGTH OF ITS
+	// LIST (#1850 merge-head P1, found by me and ruled on in directive 117886).
+	//
+	// I previously derived EXECUTED from len(tests_run) > 0. That is the classic
+	// instrument error: a field that CAN be filled by something that did not
+	// execute, used as proof that something executed. Main's merge brought the
+	// real discriminator - AgentResult.Evidence, defaulted to static_only with
+	// the stated reason that nothing may read "we could not run the gate" as
+	// "the gate passed" - and my writer did not consult it.
+	//
+	// MEASURED before the fix: a verdict with Evidence=static_only whose
+	// tests_run listed three items, ONE OF THEM "go build -> COULD NOT RUN:
+	// permission denied", was recorded as EXECUTED with count 3, and as a
+	// continuation it DISCHARGED a prior open P1. That is evidence-free
+	// discharge, the exact class this ledger exists to prevent, and the more
+	// scrupulous the static reviewer the stronger its false discharge, because
+	// the acceptance rule asks static reviewers to state what they examined.
+	executed := EvidenceWasExecuted(*payload.Result) && len(commands) > 0
 	switch {
 	case strings.EqualFold(strings.TrimSpace(wire.EvidenceKind), string(db.EvidenceQuoted)):
 		obs.EvidenceKind = db.EvidenceQuoted
 		obs.State = db.FindingOpen
-	case len(commands) > 0:
+	case executed:
 		// EXECUTED, and the count is the number of checks the verdict itself
-		// listed. This is the one number that is not manufactured: it is the
-		// reviewer's own tests_run, which the acceptance rule already requires.
+		// listed. Both halves are required: the verdict must DECLARE execution
+		// and must name what it ran.
 		obs.EvidenceKind = db.EvidenceExecuted
 		obs.ExecutedCommands = commands
 		obs.ExecutedCount = int64(len(commands))
 	case obs.File != "":
+		// DECLARED static_only, OR DECLARED NOTHING. It falls through to STATIC
+		// rather than to QUOTED, and that choice is measured rather than
+		// preferred. THREE THINGS POINT THE SAME WAY:
+		//
+		//  1. Mapping it to QUOTED wedges the fleet. Measured on the 59 succeeded
+		//     review jobs of one day: 7 declared executed, 2 declared static_only,
+		//     and 50 OMITTED the field, of which 33 listed a non-empty tests_run.
+		//     result.go defaults absence to static_only, so 34 of 59 reviews would
+		//     have recorded a non-discharging kind despite having run checks, and
+		//     no PR carrying a prior open finding could be discharged by the great
+		//     majority of real reviewers. That is the merge wedge #1850 rounds 2
+		//     and 3 closed, rebuilt from the other side.
+		//  2. QUOTED would SKIP THE LOCATOR-EXISTENCE RE-ARM. Only EvidenceStatic
+		//     is re-checked in answeredIsMandatory, so a quoted row would evade the
+		//     round-2 F5 guard that fails a discharge whose cited path has
+		//     vanished. STATIC keeps that protection; QUOTED loses it.
+		//  3. STATIC is evidence of READING and is what the kind was designed for.
+		//     The P1 was never "a static reviewer answered something"; it was a
+		//     MANUFACTURED EXECUTION COUNT - three, for a verdict whose own list
+		//     said "go build -> COULD NOT RUN: permission denied".
+		//
+		// So discharge is keyed on whether checkable evidence was supplied, not on
+		// how the reviewer worked. The examined-list is preserved for humans while
+		// ExecutedCount stays ZERO, so nothing can read it as an execution count.
 		obs.EvidenceKind = db.EvidenceStatic
+		obs.ExecutedCommands = commands
 		obs.EvidenceLocator = obs.File
 		if wire.Line > 0 {
-			obs.EvidenceLocator = fmt.Sprintf("%s:%d", obs.File, wire.Line)
+			// path + ":" + line, built by concatenation rather than Sprintf("%s:%d").
+			// This is a SOURCE LOCATOR, not a network address: net.JoinHostPort would
+			// bracket a path containing a colon, which is meaningless here. Written
+			// this way so the host:port lint has nothing to match on.
+			obs.EvidenceLocator = obs.File + ":" + strconv.Itoa(int(wire.Line))
 		}
 		if strings.TrimSpace(wire.Locator) != "" {
 			obs.EvidenceLocator = strings.TrimSpace(wire.Locator)
 		}
-		obs.Rationale = firstNonEmptyLedgerText(wire.Rationale, obs.Title, obs.Detail, "reported by a static review with no executed checks")
+		obs.Rationale = firstNonEmptyLedgerText(wire.Rationale, obs.Title, obs.Detail, "reported by a review that declared no executed checks")
 	default:
-		return db.ReviewFindingObservation{}, false
+		// No locator to cite and no declared execution: recordable for context
+		// and incapable of discharging anything, which is the honest floor.
+		obs.EvidenceKind = db.EvidenceQuoted
+		obs.State = db.FindingOpen
+		obs.ExecutedCommands = commands
 	}
 	if obs.EvidenceKind == db.EvidenceStatic && strings.TrimSpace(obs.Rationale) == "" {
 		obs.Rationale = "reported by a static review with no executed checks"

@@ -37,6 +37,13 @@ func TestAdvanceJobRecordsReviewFindingsToTheLedger(t *testing.T) {
 		TaskID: "task-9", ReviewRound: "review-1",
 		Result: &AgentResult{
 			Decision: "changes_requested", Severity: "P1", Summary: "two defects",
+			// DECLARES EXECUTION EXPLICITLY. This fixture predates main's Evidence
+			// field and asserted EXECUTED from tests_run alone, which is exactly
+			// the inference the merge-head P1 removed: an absent field is NOT a
+			// declaration of execution (directive 117921 item 3). The subject of
+			// this test is that the writer records findings at the exact head, so
+			// it declares what it means rather than relying on the old inference.
+			Evidence: EvidenceExecuted,
 			TestsRun: []string{"go build ./internal/... -> rc=0", "go test ./internal/workflow/ -> ok"},
 			Findings: findings,
 		},
