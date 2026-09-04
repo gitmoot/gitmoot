@@ -197,10 +197,34 @@ func writeRuntimeAuthFile(path string, values map[string]string) error {
 // bootstrapRuntimeAuth performs the one-release transition only when the new
 // authoritative file is absent. Legacy persisted auth wins over ambient auth;
 // an existing runtime-auth.env is never rewritten from either source.
+
+// requireAbsoluteRuntimeAuthHome refuses any runtime-auth home that would place
+// a credential file somewhere relative to the current working directory.
+func requireAbsoluteRuntimeAuthHome(homeDir string) error {
+	trimmed := strings.TrimSpace(homeDir)
+	if trimmed == "" {
+		return fmt.Errorf("refusing to write %s: no runtime auth home was resolved", runtimeAuthFileName)
+	}
+	if !filepath.IsAbs(trimmed) {
+		return fmt.Errorf("refusing to write %s under relative path %q: a credential must never land in the working directory", runtimeAuthFileName, trimmed)
+	}
+	return nil
+}
+
 func bootstrapRuntimeAuth(homeDir string, lookup func(string) (string, bool), logf func(string, ...any)) (bool, error) {
 	runtimeAuthBootstrapMu.Lock()
 	defer runtimeAuthBootstrapMu.Unlock()
 
+	// P0 (#1810): this function WRITES A CREDENTIAL FILE, and runtimeAuthFilePath
+	// joins onto homeDir, so an empty or relative homeDir resolves to a RELATIVE
+	// path and the credential lands in the process's working directory. That
+	// happened: a caller passing a zero config.Paths wrote runtime-auth.env into
+	// the package source directory during a test run, where git add -A tracked it
+	// and it reached a public remote. A credential must only ever be written to
+	// an ABSOLUTE, deliberately chosen home.
+	if err := requireAbsoluteRuntimeAuthHome(homeDir); err != nil {
+		return false, err
+	}
 	path := runtimeAuthFilePath(homeDir)
 	if _, err := os.Stat(path); err == nil {
 		return false, nil

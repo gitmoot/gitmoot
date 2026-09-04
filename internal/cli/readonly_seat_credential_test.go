@@ -878,3 +878,47 @@ func TestSeatAuthProbeFailsOpenOnSetupFailuresNotOnlyOnTheLiveCheck(t *testing.T
 		})
 	}
 }
+
+// P0 REGRESSION (#1810): runtime-auth.env is a CREDENTIAL FILE, and its path is
+// filepath.Join(home, name) - so an empty or relative home resolves to a
+// relative path and the credential is written into the process's working
+// directory. During a test run that directory is the package source tree, which
+// is how a live token became a tracked file and reached a public remote. No
+// caller may write a credential anywhere but an absolute home.
+func TestRuntimeAuthNeverWritesACredentialIntoTheWorkingDirectory(t *testing.T) {
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "test-only-placeholder-not-a-token")
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stray := filepath.Join(cwd, runtimeAuthFileName)
+	if _, err := os.Stat(stray); err == nil {
+		t.Fatalf("%s already exists in the package directory before this test ran; a credential is sitting in the work tree", stray)
+	}
+	t.Cleanup(func() {
+		if _, err := os.Stat(stray); err == nil {
+			_ = os.Remove(stray)
+			t.Errorf("a credential file was written into the work tree at %s", stray)
+		}
+	})
+
+	for _, home := range []string{"", "   ", "relative/home", "."} {
+		if _, err := bootstrapRuntimeAuth(home, runtimeAuthEnvLookup, runtimeAuthLogf); err == nil {
+			t.Fatalf("bootstrapRuntimeAuth(%q) accepted a non-absolute home; a credential must only be written to a deliberate absolute path", home)
+		}
+	}
+
+	// The operator-facing checks reach the same primitive, and pre-existing
+	// callers pass a zero config.Paths. They must not create anything either.
+	dir := t.TempDir()
+	writeClaudeCredential(t, dir, 0, "")
+	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	if _, ok := seatCredentialDoctorCheck(config.Paths{}); !ok {
+		t.Fatal("doctor check must still be emitted with a zero config.Paths")
+	}
+	var probeOut strings.Builder
+	writeSeatCredentialProbe(&probeOut, config.Paths{})
+	if _, err := os.Stat(stray); err == nil {
+		t.Fatalf("the operator-facing checks wrote a credential into the work tree at %s", stray)
+	}
+}
