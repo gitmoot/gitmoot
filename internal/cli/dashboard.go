@@ -150,6 +150,18 @@ type dashboardBranchLock struct {
 	Owner  string `json:"owner,omitempty"`
 }
 
+// runDashboardWebFn is the --web entry point, replaceable in tests so the
+// early-return invariant can be observed without starting a blocking server.
+var runDashboardWebFn = runDashboardWeb
+
+// runDashboardWatchFn is the --watch entry point, replaceable for the same
+// reason as the web one: it blocks until interrupted, so a test that reaches it
+// HANGS instead of failing. A hang is killed by the package timeout, which
+// names whichever test the panic lands in - the #1549 misattribution shape this
+// repo's ci.yml documents. With the seam, a missing terminal guard fails fast
+// and in the right test (#1787 review N3).
+var runDashboardWatchFn = runDashboardWatch
+
 func runDashboard(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("dashboard", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -183,12 +195,17 @@ func runDashboard(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "dashboard --interval must be greater than zero")
 			return 2
 		}
-		return runDashboardWatch(stdout, *home, *all, *interval)
+		return runDashboardWatchFn(stdout, *home, *all, *interval)
 	}
 	// The web dashboard is a separate read-only HTTP server (never the daemon
 	// path); branch out before the one-shot snapshot, mirroring --watch.
+	//
+	// The indirection is a TEST SEAM, not indirection for its own sake: --web
+	// blocks until interrupted, so the early return cannot be pinned by calling
+	// it. A mutant that deleted this branch survived the whole package (#1787
+	// review N2) precisely because nothing could observe the branch being taken.
 	if *web {
-		return runDashboardWeb(*home, *webAddr, stdout, stderr)
+		return runDashboardWebFn(*home, *webAddr, stdout, stderr)
 	}
 
 	// Everything else prints the styled one-shot snapshot.

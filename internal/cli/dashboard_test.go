@@ -114,18 +114,126 @@ func TestDashboardLockStale(t *testing.T) {
 }
 
 func TestDashboardWatchRejectsInvalidCombos(t *testing.T) {
+	// ASSERT THE REASON, NOT ONLY THE CODE. Two of these cases used to pass the
+	// removed --answer/--value/--dismiss flags and "passed" on exit 2 from the
+	// flag parser, never reaching the combination check they were named for
+	// (#1787 review N1). Exit code alone cannot tell those apart, so every case
+	// now names the message it expects.
 	home := dashboardTestHome(t)
-	cases := [][]string{
-		{"dashboard", "--home", home, "--watch", "--json"},
-		{"dashboard", "--home", home, "--watch", "--answer", "p1", "--value", "x"},
-		{"dashboard", "--home", home, "--watch", "--dismiss", "p1"},
-		{"dashboard", "--home", home, "--watch"}, // stdout is a bytes.Buffer, not a terminal
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "watch with json",
+			args: []string{"dashboard", "--home", home, "--watch", "--json"},
+			want: "dashboard --watch cannot be combined with --json",
+		},
+		{
+			name: "watch without a terminal",
+			args: []string{"dashboard", "--home", home, "--watch"},
+			want: "dashboard --watch requires a terminal",
+		},
+		{
+			name: "watch with a non-positive interval",
+			args: []string{"dashboard", "--home", home, "--watch", "--interval", "0s"},
+			want: "dashboard --watch",
+		},
+		{
+			name: "positional argument",
+			args: []string{"dashboard", "--home", home, "extra"},
+			want: "dashboard does not accept positional arguments",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := Run(tc.args, &stdout, &stderr)
+			if code != 2 {
+				t.Fatalf("Run(%v) = %d, want 2; stderr=%s", tc.args, code, stderr.String())
+			}
+			if strings.Contains(stderr.String(), "flag provided but not defined") {
+				t.Fatalf("Run(%v) exited 2 from the FLAG PARSER, not from the check this case names: %s", tc.args, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), tc.want) {
+				t.Fatalf("Run(%v) stderr = %q, want it to contain %q", tc.args, stderr.String(), tc.want)
+			}
+		})
 	}
-	for _, args := range cases {
+}
+
+// The flags deleted with the TUI must still be REJECTED, and that is a separate
+// property from the combination checks above - conflating them is what let two
+// combination cases pass on a parse error.
+func TestDashboardRejectsFlagsRemovedWithTheTUI(t *testing.T) {
+	home := dashboardTestHome(t)
+	for _, args := range [][]string{
+		{"dashboard", "--home", home, "--answer", "p1", "--value", "x"},
+		{"dashboard", "--home", home, "--dismiss", "p1"},
+		{"dashboard", "--home", home, "--watch", "--answer", "p1"},
+	} {
 		var stdout, stderr bytes.Buffer
 		if code := Run(args, &stdout, &stderr); code != 2 {
-			t.Fatalf("Run(%v) = %d, want 2; stderr=%s", args, code, stderr.String())
+			t.Fatalf("Run(%v) = %d, want 2 for a removed flag; stderr=%s", args, code, stderr.String())
 		}
+		if !strings.Contains(stderr.String(), "flag provided but not defined") {
+			t.Fatalf("Run(%v) stderr = %q, want the parser to reject the removed flag", args, stderr.String())
+		}
+	}
+}
+
+// The --watch terminal guard must be observable WITHOUT running the watch loop.
+// Before the seam, deleting the guard did not fail this suite cleanly: the test
+// reached the blocking loop and the package died on its 10m timeout, naming
+// whichever test the panic landed in (#1787 review N3). Now the guard's absence
+// fails here, in seconds, with the right name on it.
+func TestDashboardWatchNeverStartsWithoutATerminal(t *testing.T) {
+	home := dashboardTestHome(t)
+	original := runDashboardWatchFn
+	t.Cleanup(func() { runDashboardWatchFn = original })
+	started := 0
+	runDashboardWatchFn = func(io.Writer, string, bool, time.Duration) int {
+		started++
+		return 0
+	}
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"dashboard", "--home", home, "--watch"}, &stdout, &stderr)
+	if started != 0 {
+		t.Fatalf("the watch loop STARTED with a non-terminal stdout; on a real run it would block until interrupted")
+	}
+	if code != 2 || !strings.Contains(stderr.String(), "requires a terminal") {
+		t.Fatalf("Run = %d stderr=%q, want exit 2 naming the terminal requirement", code, stderr.String())
+	}
+}
+
+// The --web branch returns BEFORE the one-shot snapshot. A mutant deleting that
+// early return survived the entire package (#1787 review N2), because --web
+// blocks until interrupted and nothing could observe the branch. The seam makes
+// the invariant observable without starting a server.
+func TestDashboardWebReturnsBeforeTheSnapshot(t *testing.T) {
+	home := dashboardTestHome(t)
+	original := runDashboardWebFn
+	t.Cleanup(func() { runDashboardWebFn = original })
+	var calledHome, calledAddr string
+	calls := 0
+	runDashboardWebFn = func(home, addr string, stdout, stderr io.Writer) int {
+		calls++
+		calledHome, calledAddr = home, addr
+		return 7
+	}
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"dashboard", "--home", home, "--web", "--addr", "127.0.0.1:0"}, &stdout, &stderr)
+	if calls != 1 {
+		t.Fatalf("--web took the snapshot path instead of returning early: calls=%d stdout=%q", calls, stdout.String())
+	}
+	if code != 7 {
+		t.Fatalf("Run returned %d, want the web server's own %d: the branch must RETURN, not fall through", code, 7)
+	}
+	if calledHome != home || calledAddr != "127.0.0.1:0" {
+		t.Fatalf("web server received home=%q addr=%q, want %q and 127.0.0.1:0", calledHome, calledAddr, home)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("the one-shot snapshot ran anyway and wrote %d bytes", stdout.Len())
 	}
 }
 
