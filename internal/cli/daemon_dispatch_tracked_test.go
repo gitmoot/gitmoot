@@ -49,9 +49,19 @@ func (b *syncBuffer) String() string {
 // startTrackedWedgeLoop wires the common scaffolding for the tracked-loop
 // regression tests: a real store, one repo + shell agent, the given adapter, and
 // the REAL production single-repo worker loop at a fast interval.
-func startTrackedWedgeLoop(t *testing.T, ctx context.Context, store *db.Store, adapter workflow.DeliveryAdapter, workers int, usePool bool, stdout io.Writer) (*inflightJobTracker, <-chan error) {
+//
+// configure runs against the assembled worker before the loop starts, for a test
+// that needs a field this harness leaves zero. ConfigHome is the one that bites:
+// left empty, allocatePoolIsolationWorktree returns "not isolable" with a NIL
+// error before it can reach the failure branch, so a test asserting on the skip
+// event or the retry backoff would be pinning a path that never executes.
+// Variadic, so every existing caller is unchanged.
+func startTrackedWedgeLoop(t *testing.T, ctx context.Context, store *db.Store, adapter workflow.DeliveryAdapter, workers int, usePool bool, stdout io.Writer, configure ...func(*jobWorker)) (*inflightJobTracker, <-chan error) {
 	t.Helper()
 	worker := poolSchedulerWorker(t, store, adapter, usePool)
+	for _, apply := range configure {
+		apply(&worker)
+	}
 	live := newDaemonReloadableConfig(30*time.Second, workers, usePool)
 	var checkoutLock sync.Mutex
 	tracker := newInflightJobTracker(ctx)

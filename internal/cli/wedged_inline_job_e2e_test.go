@@ -26,6 +26,12 @@ type wedgeBlockingAdapter struct {
 	delivered []string
 	blocked   bool
 	output    string
+	// ignoreCtx makes the blocking job deaf to context cancellation, so it stays
+	// in flight while the scheduler pass DRAINS. Default false keeps every
+	// existing test byte-identical; only a test that needs to observe the pass's
+	// post-cancellation behaviour sets it, because a ctx-obeying job returns
+	// immediately and leaves no drain window to observe.
+	ignoreCtx bool
 }
 
 func newWedgeBlockingAdapter(blockJob string) *wedgeBlockingAdapter {
@@ -53,13 +59,17 @@ func (a *wedgeBlockingAdapter) Deliver(ctx context.Context, _ runtime.Agent, job
 	}
 	a.mu.Unlock()
 	if blocking {
-		select {
-		case <-a.release:
-		case <-ctx.Done():
-			a.mu.Lock()
-			a.blocked = false
-			a.mu.Unlock()
-			return runtime.Result{}, ctx.Err()
+		if a.ignoreCtx {
+			<-a.release
+		} else {
+			select {
+			case <-a.release:
+			case <-ctx.Done():
+				a.mu.Lock()
+				a.blocked = false
+				a.mu.Unlock()
+				return runtime.Result{}, ctx.Err()
+			}
 		}
 		a.mu.Lock()
 		a.blocked = false
