@@ -695,6 +695,33 @@ NO credential file for any runtime - claude's `.credentials.json`, codex's
 `auth.json` and kimi's `credentials/kimi-code.json` are all withheld. Model
 settings are still staged, narrowed as above.
 
+### Comments, and what a seat does when a config cannot be narrowed
+
+Narrowing classifies the COMMENT-FREE part of each line and stages the line
+unchanged, so an ordinary TOML comment cannot change what is withheld. Both
+directions were defects: `[services] # see [docs]` used to have the comment's
+`]` swallowed into the section name, staging that section's secrets verbatim,
+and `default_model = "kimi-code/k3" # pinned` used to make the comment part of
+the provider name, withholding the one credential the seat needs. Your comments
+survive into the staged file.
+
+A key/value pair is split on the first `=` OUTSIDE quotes, so a quoted key
+containing `=` is kept rather than dropped.
+
+**A config that cannot be narrowed is treated by whether the runtime needs it:**
+
+- codex's `config.toml` is OPTIONAL. If it cannot be narrowed - an unbalanced
+  `[` or `{` at end of file, an unreadable section header, or a selected
+  provider that can only authenticate through `env_key` - the seat starts
+  WITHOUT it and falls back to the runtime default. The file is not staged and
+  the reason is named in the `read_only_seat_config_narrowed` job event.
+- kimi's `config.toml` is REQUIRED, so the same refusal fails the seat by name.
+  kimi cannot start without it, and a silent fallback would surface later as
+  "No model configured".
+
+In GATEWAY mode no runtime stages a credential file, and the policy the seat
+computes says so rather than naming files it then withholds.
+
 ## Isolated worktrees duplicate gigabytes of tool cache
 
 An isolated-worktree job re-materializing its own `uv`/`go`/`npm`/`pip` cache

@@ -1752,6 +1752,23 @@ type readOnlySeatStatePolicy struct {
 // readOnlySeatStatePolicyFor returns the staging policy for a runtime. The
 // second result is false for a runtime that needs no isolated state at all.
 func readOnlySeatStatePolicyFor(runtimeName string, userHome string, gatewayMode bool) (readOnlySeatStatePolicy, bool, error) {
+	policy, needsState, err := readOnlySeatStatePolicyForRuntime(runtimeName, userHome, gatewayMode)
+	if err != nil || !needsState || !gatewayMode {
+		return policy, needsState, err
+	}
+	// In gateway mode the gateway supplies the credential, so NO runtime's
+	// credential file is staged. This is applied HERE rather than at the
+	// staging call site so the policy this function returns is the policy that
+	// is actually enforced: a caller (or a test) reading it back used to see
+	// codex's auth.json and kimi's token still listed while the seat withheld
+	// them, which is a policy that disagrees with itself.
+	policy.credentialFile = ""
+	policy.credentialSection = ""
+	policy.credentialUsable = nil
+	return policy, needsState, nil
+}
+
+func readOnlySeatStatePolicyForRuntime(runtimeName string, userHome string, gatewayMode bool) (readOnlySeatStatePolicy, bool, error) {
 	switch runtimeName {
 	case runtime.ClaudeRuntime:
 		policy := readOnlySeatStatePolicy{
@@ -1817,15 +1834,6 @@ func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string, gatewayM
 		return "", nil, nil, fmt.Errorf("resolve read-only runtime state home: %w", err)
 	}
 	policy, needsState, err := readOnlySeatStatePolicyFor(agent.Runtime, userHome, gatewayMode)
-	if gatewayMode {
-		// The gateway supplies the credential, as the claude branch has always
-		// said. Only claude acted on it, so a gateway seat still staged
-		// codex's auth.json and kimi's token - neither of which it needs.
-		// Model settings (the narrowed config inputs) are still staged.
-		policy.credentialFile = ""
-		policy.credentialSection = ""
-		policy.credentialUsable = nil
-	}
 	if err != nil || !needsState {
 		return "", nil, nil, err
 	}
@@ -1979,7 +1987,15 @@ func stageReadOnlyRuntimeInput(sourceDir, stateDir, name string, required bool, 
 	var dropped []string
 	if narrow != nil {
 		narrowed, narrowErr := narrow(data)
-		if narrowErr != nil {
+		switch {
+		case narrowErr != nil && !required:
+			// OPTIONAL means optional for CONTENT too, not only for absence.
+			// A file gitmoot cannot narrow is one it must not stage - but the
+			// runtime's own default is a working outcome for an optional
+			// input, so refusing the whole seat would turn "we could not read
+			// your config" into a dead reviewer. Withhold it and SAY SO.
+			return []string{fmt.Sprintf("%s (not staged: %v)", name, narrowErr)}, nil
+		case narrowErr != nil:
 			return nil, fmt.Errorf("narrow runtime input %q: %w", source, narrowErr)
 		}
 		data, dropped = narrowed.data, narrowed.dropped

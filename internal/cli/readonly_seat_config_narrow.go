@@ -62,6 +62,11 @@ type tomlLine struct {
 	// readable is false for a pair whose key could not be parsed. Such a line
 	// is dropped rather than guessed at.
 	readable bool
+	// value is the pair's value with any trailing comment REMOVED and the
+	// key/value split done lexically, so no consumer re-parses raw. A trailing
+	// comment on model_provider used to become part of the selected provider
+	// name, which withheld the one credential the seat needed.
+	value string
 }
 
 // scanTOMLLines tokenizes a config file into classified lines.
@@ -102,9 +107,14 @@ func scanTOMLLines(data []byte) ([]tomlLine, error) {
 			continue
 		}
 
-		line := strings.TrimSpace(raw)
+		// Everything below classifies the COMMENT-FREE code portion and emits
+		// the raw line unchanged.
+		code, nextMultiline, nextPending := scanTOMLLineCode(raw)
+		line := strings.TrimSpace(code)
+		opens := nextMultiline != "" || nextPending > 0
+
 		switch {
-		case line == "" || strings.HasPrefix(line, "#"):
+		case line == "" || strings.HasPrefix(strings.TrimSpace(raw), "#"):
 			lines = append(lines, tomlLine{raw: raw, kind: tomlLineOther, section: section})
 		case strings.HasPrefix(line, "["):
 			path, ok := parseTOMLSectionHeader(line)
@@ -114,21 +124,20 @@ func scanTOMLLines(data []byte) ([]tomlLine, error) {
 			section = path
 			lines = append(lines, tomlLine{raw: raw, kind: tomlLineHeader, path: path, section: path, readable: true})
 		default:
-			key, value, isPair := strings.Cut(line, "=")
+			key, value, isPair := splitTOMLPair(line)
 			if !isPair {
 				lines = append(lines, tomlLine{raw: raw, kind: tomlLineOther, section: section})
 				continue
 			}
 			path, ok := parseTOMLKeyPath(strings.TrimSpace(key))
-			entry := tomlLine{raw: raw, kind: tomlLinePair, section: section, readable: ok}
+			entry := tomlLine{raw: raw, kind: tomlLinePair, section: section, readable: ok, value: strings.TrimSpace(value)}
 			if ok {
 				entry.path = append(append([]string{}, section...), path...)
 			}
-			nextMultiline, nextPending := advanceTOMLState(value, "", 0)
-			entry.opensRun = nextMultiline != "" || nextPending > 0
-			multiline, pending = nextMultiline, nextPending
+			entry.opensRun = opens
 			lines = append(lines, entry)
 		}
+		multiline, pending = nextMultiline, nextPending
 	}
 	if multiline != "" {
 		return nil, fmt.Errorf("config has a multi-line string that never closes, so narrowing it would corrupt the file: fix the file or remove it from the host state dir")
@@ -199,6 +208,101 @@ func advanceTOMLState(text, multiline string, pending int) (string, int) {
 		}
 	}
 	return multiline, pending
+}
+
+const (
+	tripleBasic   = "\"\"\""
+	tripleLiteral = "'''"
+)
+
+// scanTOMLLineCode splits one line into its CODE portion and the state it
+// leaves open, honouring strings, escapes and comments.
+//
+// Every consumer classifies on the code portion and emits the raw line, so a
+// trailing comment can never reach a section name, a key path or a value. That
+// was a P1: `[services] # see [docs]` had the comment's ']' swallowed into the
+// section NAME by a LastIndex scan, so the drop rule never matched and every
+// secret under that section was staged verbatim with dropped empty.
+func scanTOMLLineCode(text string) (code string, multiline string, pending int) {
+	runes := []rune(text)
+	for index := 0; index < len(runes); {
+		rest := string(runes[index:])
+		switch {
+		case strings.HasPrefix(rest, tripleBasic):
+			index += 3
+			index, multiline = consumeMultiline(runes, index, tripleBasic)
+		case strings.HasPrefix(rest, tripleLiteral):
+			index += 3
+			index, multiline = consumeMultiline(runes, index, tripleLiteral)
+		case runes[index] == '"' || runes[index] == '\'':
+			quote := runes[index]
+			index++
+			for index < len(runes) {
+				if quote == '"' && runes[index] == '\\' {
+					index += 2
+					continue
+				}
+				if runes[index] == quote {
+					index++
+					break
+				}
+				index++
+			}
+		case runes[index] == '#':
+			// Outside a string: the rest of the line is a comment.
+			return string(runes[:index]), multiline, pending
+		case runes[index] == '[' || runes[index] == '{':
+			pending++
+			index++
+		case runes[index] == ']' || runes[index] == '}':
+			pending--
+			if pending < 0 {
+				pending = 0
+			}
+			index++
+		default:
+			index++
+		}
+	}
+	return text, multiline, pending
+}
+
+// consumeMultiline advances past a multi-line string that may close on the same
+// line it opened. An unclosed one is reported back as still-open state.
+func consumeMultiline(runes []rune, index int, delimiter string) (int, string) {
+	for index < len(runes) {
+		if strings.HasPrefix(string(runes[index:]), delimiter) {
+			return index + len([]rune(delimiter)), ""
+		}
+		index++
+	}
+	return index, delimiter
+}
+
+// splitTOMLPair splits a key from its value on the first '=' OUTSIDE quotes, so
+// a valid quoted key containing '=' is not dropped as an anonymous unreadable
+// key.
+func splitTOMLPair(code string) (key string, value string, ok bool) {
+	runes := []rune(code)
+	var quote rune
+	for index := 0; index < len(runes); index++ {
+		r := runes[index]
+		switch {
+		case quote != 0:
+			if r == '\\' && quote == '"' {
+				index++
+				continue
+			}
+			if r == quote {
+				quote = 0
+			}
+		case r == '"' || r == '\'':
+			quote = r
+		case r == '=':
+			return string(runes[:index]), string(runes[index+1:]), true
+		}
+	}
+	return "", "", false
 }
 
 // narrowTOML rewrites a config file, dropping every path the classifier
@@ -487,11 +591,9 @@ func tomlTopLevelScalar(lines []tomlLine, wanted string) string {
 		if len(line.path) != 1 || line.path[0] != wanted {
 			continue
 		}
-		_, value, ok := strings.Cut(strings.TrimSpace(line.raw), "=")
-		if !ok {
-			continue
-		}
-		return strings.Trim(strings.TrimSpace(value), `"'`)
+		// line.value is already comment-free and lexically split, so a
+		// trailing comment cannot become part of the selected provider name.
+		return strings.Trim(line.value, "\"'")
 	}
 	return ""
 }
