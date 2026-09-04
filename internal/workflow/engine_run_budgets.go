@@ -811,7 +811,23 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			if !ready {
 				return e.setReviewingIfNotChangesRequested(ctx, ref)
 			}
-			_, err = e.runMergeGate(ctx, reviewer, payload, ref, TaskReviewing)
+			// #1834: the expectation handed to the gate must be the task's ACTUAL
+			// state, not a constant. A task that reached changes_requested can only
+			// be claimed as changes_requested, and only when this approval is bound
+			// to the current head and unopposed there; otherwise the objection
+			// stands and the approval is recorded rather than silently dropped.
+			expectedState, proceed, held, err := e.mergeGateExpectedTaskState(ctx, ref, payload)
+			if err != nil {
+				return err
+			}
+			if !proceed {
+				return e.Store.AddJobEvent(ctx, db.JobEvent{
+					JobID:   job.ID,
+					Kind:    "review_advance_held",
+					Message: held,
+				})
+			}
+			_, err = e.runMergeGate(ctx, reviewer, payload, ref, expectedState)
 			return err
 		}
 	}

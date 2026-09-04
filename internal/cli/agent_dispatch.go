@@ -1014,8 +1014,17 @@ func prepareLocalReviewTask(ctx context.Context, store *db.Store, repo github.Re
 		Title:        firstNonEmpty(request.TaskTitle, fmt.Sprintf("Review PR #%d", request.PullRequest)),
 		State:        string(workflow.TaskReviewing),
 	}
+	// changes_requested joins the disposed states here for a DIFFERENT reason, so
+	// the two must not be read as one list: a disposed task refuses the dispatch,
+	// while a task with a live objection ACCEPTS it and keeps its state. Writing
+	// reviewing here would clear a changes_requested that no approval had answered
+	// yet, which is the same erasure #1834's one-way re-arm guard exists to
+	// prevent - and it made the branchless path disagree with the --branch path
+	// above, which returns before any state write. An approval only leaves
+	// changes_requested through the head-bound admission in the merge gate.
 	updated, err := store.UpsertTaskUnlessStates(ctx, task, []string{
 		string(workflow.TaskDismissed), string(workflow.TaskSuperseded), string(workflow.TaskStranded),
+		string(workflow.TaskChangesRequested),
 	})
 	if err != nil {
 		return localAgentDispatchRequest{}, err
@@ -1025,7 +1034,11 @@ func prepareLocalReviewTask(ctx context.Context, store *db.Store, repo github.Re
 		if loadErr != nil {
 			return localAgentDispatchRequest{}, loadErr
 		}
-		return localAgentDispatchRequest{}, disposedReviewTaskError(existing)
+		if existing.State != string(workflow.TaskChangesRequested) {
+			return localAgentDispatchRequest{}, disposedReviewTaskError(existing)
+		}
+		task.GoalID = firstNonEmpty(existing.GoalID, task.GoalID)
+		task.Title = firstNonEmpty(existing.Title, task.Title)
 	}
 	request.TaskID = task.ID
 	request.GoalID = task.GoalID

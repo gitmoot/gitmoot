@@ -272,6 +272,118 @@ func (e Engine) setReviewingIfNotChangesRequested(ctx context.Context, ref taskR
 	return e.setTaskState(ctx, ref, TaskReviewing)
 }
 
+// mergeGateExpectedTaskState resolves the task state the merge gate must claim
+// before it merges, and reports whether the approval may proceed at all.
+//
+// It exists because the approved arm used to hand runMergeGate a CONSTANT
+// TaskReviewing. Once a task reached changes_requested that claim could never
+// match, so a later approval at a fresh head could not clear the gate and the
+// task wedged permanently (#1834) - setReviewingIfNotChangesRequested is one-way
+// by design and correctly refuses to erase a live objection, so nothing re-armed
+// it. The fix is not to erase the objection earlier but to let an approval that
+// is DEMONSTRABLY NEWER than it own the claim.
+func (e Engine) mergeGateExpectedTaskState(ctx context.Context, ref taskRef, payload JobPayload) (TaskState, bool, string, error) {
+	if strings.TrimSpace(ref.ID) == "" {
+		return TaskReviewing, true, "", nil
+	}
+	task, err := e.Store.GetTask(ctx, ref.ID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", false, "", err
+	}
+	if err != nil || task.State != string(TaskChangesRequested) {
+		return TaskReviewing, true, "", nil
+	}
+	admitted, reason, err := e.approvalSupersedesChangesRequested(ctx, payload)
+	if err != nil {
+		return "", false, "", err
+	}
+	if !admitted {
+		return "", false, reason, nil
+	}
+	return TaskChangesRequested, true, "", nil
+}
+
+// approvalSupersedesChangesRequested answers whether THIS approving review is
+// bound to the task's current head and is unopposed there. It returns the reason
+// when it refuses, so the caller can record why an approval did not advance
+// rather than leaving a silent no-op - silence is what made #1834 invisible
+// until four tasks had wedged.
+//
+// THE CURRENT HEAD COMES FROM THE OBSERVED PULL REQUEST, not from guessing which
+// review row is newest. `tasks` has no head column, but `pull_requests.head_sha`
+// already records what the forge last reported and is maintained by the daemon
+// poll, the PR lifecycle and the merge gate - so this needs no migration and no
+// recency heuristic. Ordering review rows would have been unsound: ListJobs
+// orders BY ID, and created_at is an ISO string with SECOND granularity, so two
+// reviews dispatched in the same second cannot be separated at all. A tie-break
+// on job id is deterministic but arbitrary, which is precisely the "accident of
+// iteration order" this rule must not rest on.
+//
+// THE SAME-HEAD TIE IS RULED EXPLICITLY: if any succeeded review at the current
+// head requested changes, the objection stands even when a different reviewer
+// approved the same head. An approval must not merge over a peer's live
+// objection; the objector re-reviews, or a new head supersedes them both.
+func (e Engine) approvalSupersedesChangesRequested(ctx context.Context, payload JobPayload) (bool, string, error) {
+	approvingHead := strings.TrimSpace(payload.HeadSHA)
+	if approvingHead == "" {
+		return false, "the approving review carries no head SHA, so it cannot be bound to the current head", nil
+	}
+	currentHead := ""
+	if payload.PullRequest > 0 {
+		pr, err := e.Store.GetPullRequest(ctx, payload.Repo, int64(payload.PullRequest))
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return false, "", err
+		}
+		if err == nil {
+			currentHead = strings.TrimSpace(pr.HeadSHA)
+		}
+	}
+	if currentHead != "" && approvingHead != currentHead {
+		return false, fmt.Sprintf(
+			"approval is bound to head %s but the pull request's current head is %s; an approval at a superseded head does not clear changes_requested",
+			approvingHead, currentHead), nil
+	}
+	jobs, err := e.Store.ListJobs(ctx)
+	if err != nil {
+		return false, "", err
+	}
+	blockingSeverity := e.reviewBlockingSeverity(payload.Repo)
+	objectionElsewhere := false
+	for _, job := range jobs {
+		if job.Type != "review" || job.State != "succeeded" {
+			continue
+		}
+		jobPayload, err := unmarshalPayload(job.Payload)
+		if err != nil {
+			return false, "", err
+		}
+		if !sameTask(payload, jobPayload) || jobPayload.Result == nil || ResultIsFanOut(jobPayload.Result) {
+			continue
+		}
+		if effectiveReviewDecisionForPayload(jobPayload, blockingSeverity) != "changes_requested" {
+			continue
+		}
+		head := strings.TrimSpace(jobPayload.HeadSHA)
+		if head == approvingHead {
+			return false, fmt.Sprintf(
+				"a review at head %s requested changes, so the objection stands even though this review approved the same head",
+				approvingHead), nil
+		}
+		if head != "" {
+			objectionElsewhere = true
+		}
+	}
+	if currentHead == "" && !objectionElsewhere {
+		// No observed pull request row AND no objection at another head: nothing
+		// here shows the tree moved past whatever set changes_requested, so admitting
+		// would be a guess. Refuse and say which fact is missing.
+		return false, fmt.Sprintf(
+			"no observed pull request row records a current head for %s#%d and no review objected at a different head, so this approval cannot be shown to supersede the objection",
+			payload.Repo, payload.PullRequest), nil
+	}
+	return true, "", nil
+}
+
 func (e Engine) latestReviewRound(ctx context.Context, current JobPayload) (string, error) {
 	jobs, err := e.Store.ListJobs(ctx)
 	if err != nil {
