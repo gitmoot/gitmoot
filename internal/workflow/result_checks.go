@@ -150,7 +150,10 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 		// list the tests it ran, so a human/continuation can see what actually
 		// happened rather than trusting the summary prose.
 		if r.Decision == "implemented" {
-			madePass := len(r.ChangesMade) > 0
+			// Same content test the needs gate uses: two gates disagreeing
+			// about the same input is the defect, not the leniency. Before
+			// this, the {} that the needs gate rejects satisfied these.
+			madePass := hasActionableEntries(r.ChangesMade)
 			checks = append(checks, ResultCheck{
 				ID:          "implement-changes-listed",
 				Action:      "implement",
@@ -175,7 +178,7 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 					)),
 				})
 			}
-			testsPass := len(r.TestsRun) > 0
+			testsPass := hasActionableEntries(r.TestsRun)
 			checks = append(checks, ResultCheck{
 				ID:          "implement-tests-listed",
 				Action:      "implement",
@@ -318,6 +321,28 @@ func isActionableAnswer(r AgentResult) bool {
 
 // hasActionableEntries reports whether a string slice contains at least one
 // non-blank entry, so an all-empty or single-blank list counts as no entries.
+// rawJSONCarriesContent applies the content test to one JSON value taken from
+// inside a container.
+//
+// The unquoting step is load-bearing and my own test caught its absence: a
+// container's values arrive as RAW JSON, so an empty string inside one is the
+// two-byte text `""`, which reads as non-empty text unless it is decoded
+// first. Without this, {"name":"","command":""} still counted as evidence -
+// the exact false-accept this round is closing.
+func rawJSONCarriesContent(raw json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return false
+	}
+	if trimmed[0] == '"' {
+		var text string
+		if err := json.Unmarshal(raw, &text); err == nil {
+			return strings.TrimSpace(text) != ""
+		}
+	}
+	return entryCarriesContent(trimmed)
+}
+
 func hasActionableEntries(values []string) bool {
 	for _, v := range values {
 		if entryCarriesContent(v) {
@@ -349,13 +374,29 @@ func entryCarriesContent(value string) bool {
 		if trimmed[0] == '{' {
 			var object map[string]json.RawMessage
 			if err := json.Unmarshal([]byte(trimmed), &object); err == nil {
-				return len(object) > 0
+				// NOT len(object) > 0: an object whose VALUES are all empty
+				// carries no more information than "". A review reporting
+				// {"name":"","command":""} reads as populated evidence to a
+				// coordinator while saying nothing, which is worse than a hard
+				// failure - the false-accept this check exists to close was
+				// only half closed by counting keys.
+				for _, value := range object {
+					if rawJSONCarriesContent(value) {
+						return true
+					}
+				}
+				return false
 			}
 			// Unparseable: it is still text a human can read, so keep it.
 			return true
 		}
 		if err := json.Unmarshal([]byte(trimmed), &container); err == nil {
-			return len(container) > 0
+			for _, value := range container {
+				if rawJSONCarriesContent(value) {
+					return true
+				}
+			}
+			return false
 		}
 		return true
 	default:

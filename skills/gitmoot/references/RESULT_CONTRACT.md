@@ -84,11 +84,11 @@ was rejected with `cannot unmarshal object into Go struct field
 AgentResult.tests_run of type string` and spent a repair attempt, which made a
 job that did the work and reported it richly indistinguishable from one that
 returned nothing. An object element is now stored as compact JSON with its keys
-in canonical order, and every field is carried through verbatim — including
+in canonical order at the TOP level, and every field is carried through verbatim — including
 shell metacharacters, so a recorded `command` can be copy-pasted back. The
 contract names none of the keys, so picking one would be a guess.
 
-**Duplicate keys are rejected**, not merged. `[{"name":"a","name":"b"}]` fails
+**Duplicate keys are rejected** at the top level, not merged. `[{"name":"a","name":"b"}]` fails
 with the duplicate named, because the alternative is keeping one silently and
 losing the other, which would contradict the guarantee above.
 
@@ -96,6 +96,28 @@ A `null` element is accepted and becomes an **empty entry**, which is what it
 did before object elements were supported. It is not an error: failing the whole
 result over one null would spend a repair attempt on an envelope that already
 parsed.
+
+**Both properties stop at the top level, and the digest consumes nested values.**
+A NESTED object keeps whatever key order the agent sent, and a duplicate key
+inside a nested object is resolved silently by the decoder rather than rejected.
+Only the outermost object of a list element is canonicalised and duplicate-checked.
+So two agents reporting the same nested entry can produce different bytes, and
+the result digest reads those bytes.
+
+**The evidence gate also changed, not only the decoder.** A list entry that
+decodes cleanly but carries no information — `{}`, `[]`, `{"name":"","command":""}`,
+`["",""]` — is NOT evidence. `changes_made` and `tests_run` are judged by the
+same test the `needs` gate uses, so a content-free entry no longer satisfies
+`implement-changes-listed` or `implement-tests-listed`. An entry with at least
+one populated value, at any depth, still counts.
+
+**Which lists accept an object at all.** Only the narrative lists an agent
+writes for a human: `changes_made`, `tests_run` and `needs`. The engine's
+structural lists stay STRICT and reject an object element — `capabilities`,
+`artifacts`, `deps` and `choices` are identifiers the engine consumes (a
+capability name, an artifact path, a delegation id, a prompt option), so an
+object there is not a richer report, it is an unusable value that would corrupt
+routing. That asymmetry is deliberate.
 
 Nothing else is accepted. A number, a boolean, a nested array, or a bare string
 where the array belongs still fails the result — and the error names the field,
