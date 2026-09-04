@@ -98,15 +98,21 @@ result over one null would spend a repair attempt on an envelope that already
 parsed.
 
 **Both properties stop at the top level, and the digest consumes nested values.**
-A NESTED object keeps whatever key order the agent sent, and a duplicate key
-inside a nested object is resolved silently by the decoder rather than rejected.
+A NESTED object keeps whatever key order the agent sent, and a duplicate key inside a nested object is
+NEITHER rejected NOR resolved: BOTH copies are kept verbatim in the stored
+entry, because the value is copied as raw bytes and re-marshalling only
+compacts it. Measured, not inferred.
 Only the outermost object of a list element is canonicalised and duplicate-checked.
 So two agents reporting the same nested entry can produce different bytes, and
 the result digest reads those bytes.
 
 **The evidence gate also changed, not only the decoder.** A list entry that
-decodes cleanly but carries no information — `{}`, `[]`, `{"name":"","command":""}`,
-`["",""]` — is NOT evidence. `changes_made` and `tests_run` are judged by the
+decodes cleanly but carries no information — `{}`, or an object whose values
+are all empty such as `{"name":"","command":""}` — is NOT evidence. A bare
+array element like `[]` or `["",""]` is NOT in this category: the decoder
+rejects any element that is not a string or an object, so those fail the whole
+result rather than reaching the gate. Empty containers ARE reachable nested
+inside an object value, and are judged there.
 same test the `needs` gate uses, so a content-free entry no longer satisfies
 `implement-changes-listed` or `implement-tests-listed`. An entry with at least
 one populated value, at any depth, still counts.

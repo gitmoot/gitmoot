@@ -319,8 +319,6 @@ func isActionableAnswer(r AgentResult) bool {
 	return len(r.Findings) > 0
 }
 
-// hasActionableEntries reports whether a string slice contains at least one
-// non-blank entry, so an all-empty or single-blank list counts as no entries.
 // rawJSONCarriesContent applies the content test to one JSON value taken from
 // inside a container.
 //
@@ -343,6 +341,30 @@ func rawJSONCarriesContent(raw json.RawMessage) bool {
 	return entryCarriesContent(trimmed)
 }
 
+// actionableEntries returns only the entries that carry information.
+//
+// hasActionableEntries answers "is there anything here"; this answers "which of
+// these is worth persisting". The gate-RECORDING path needs the second: the
+// #1809 review found that `needs: [{}]` was admitted on a raw len() and written
+// to job_gates verbatim, so a durable row whose need column is the two-byte
+// text {} surfaced to a human through `gitmoot job gates` and the dashboard's
+// "Needs a human" view. Filtering here keeps the gate that RECORDS agreeing
+// with the gates that JUDGE - the principle this branch already applied to
+// implement-changes-listed and implement-tests-listed, applied to the consumer
+// literally named gates.
+func actionableEntries(values []string) []string {
+	filtered := make([]string, 0, len(values))
+	for _, value := range values {
+		if entryCarriesContent(value) {
+			filtered = append(filtered, value)
+		}
+	}
+	return filtered
+}
+
+// hasActionableEntries reports whether a string slice contains at least one
+// entry that carries information, so an all-empty list - including one whose
+// only entries are content-free containers - counts as no entries.
 func hasActionableEntries(values []string) bool {
 	for _, v := range values {
 		if entryCarriesContent(v) {
