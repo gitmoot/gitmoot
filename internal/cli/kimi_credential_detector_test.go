@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/github/githubtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
@@ -232,5 +234,156 @@ func TestAgentDoctorObservesTheLiveKimiCredential(t *testing.T) {
 	}
 	if report := kimiCredentialDegradationSinceDoctor(claude, before, false); report != "" {
 		t.Fatalf("unobserved agent produced a report: %q", report)
+	}
+}
+
+// dispatchArmCredentialProfile redirects HOME to a throwaway profile and writes
+// a live-looking credential into it.
+//
+// The HOME redirect is load-bearing rather than cosmetic: db.Agent carries no
+// RuntimeConfigDir and runtimeAgent sets none, so effectiveAgent.RuntimeConfigDir
+// is EMPTY on the dispatch path and observeNonSeatKimiCredential falls back to
+// $HOME/.kimi-code. Without t.Setenv("HOME", ...) these tests would read the
+// operator's real profile, which is the one thing #1856's work must never do.
+func dispatchArmCredentialProfile(t *testing.T) string {
+	t.Helper()
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	profile := filepath.Join(fakeHome, ".kimi-code")
+	writeKimiDetectorCredential(t, profile, kimiDetectorLiveCredential)
+	return filepath.Join(profile, runtime.KimiCredentialRelPath)
+}
+
+// dispatchArmKimiAdapter returns a fake adapter that blanks the credential IN
+// PLACE while it "delivers" - the measured #1856 shape, reproduced without a
+// kimi binary through the package-level adapter seam five other test files
+// already use (localAgentDispatchRuntimeAdapterFor).
+func dispatchArmKimiAdapter(t *testing.T, credentialPath string) *cliWorkerFakeAdapter {
+	t.Helper()
+	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}
+	adapter.onDeliver = func() {
+		if err := os.WriteFile(credentialPath, []byte(kimiDetectorBlankedCredential), 0o600); err != nil {
+			t.Errorf("blanking the fixture credential returned error: %v", err)
+		}
+	}
+	previousAdapter := localAgentDispatchRuntimeAdapterFor
+	localAgentDispatchRuntimeAdapterFor = func(string, runtime.Agent, string) (runtime.Adapter, error) { return adapter, nil }
+	t.Cleanup(func() { localAgentDispatchRuntimeAdapterFor = previousAdapter })
+	previousPreflight := localRuntimeContractPreflight
+	localRuntimeContractPreflight = func(context.Context, runtime.Agent) runtime.RuntimeContractResult {
+		return runtime.RuntimeContractResult{Runtime: runtime.KimiRuntime, Version: "fake", State: runtime.RuntimeContractUnknown, Instrument: "test"}
+	}
+	t.Cleanup(func() { localRuntimeContractPreflight = previousPreflight })
+	return adapter
+}
+
+// TestCLIDispatchArmsObserveCredentialBlanking is the behavioural arm my first
+// PR body wrongly called impossible: it drives dispatchLocalAgentJob end to end
+// on BOTH local child-delivery boundaries and asserts the event.
+//
+// The two arms are separate cases because they are separate code paths, not one
+// path with a flag: an ask delivers through mailbox.Run (agent_dispatch.go's
+// then-branch) and never reaches engine.RunJob (the else branch). Deleting
+// either recorder call fails exactly one of these cases, which is what makes the
+// PR's coverage claim self-checking instead of an argument from symmetry.
+func TestCLIDispatchArmsObserveCredentialBlanking(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		action     string
+		capability string
+	}{
+		{"ask arm delivers through mailbox.Run", "ask", "ask"},
+		{"else arm delivers through engine.RunJob", "implement", "implement"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, home := blockerE2EHome(t)
+			checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
+			seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+			seedDaemonWorkerAgent(t, store, "kimi-responder", runtime.KimiRuntime, "fresh", []string{tc.capability}, "owner/repo")
+			credentialPath := dispatchArmCredentialProfile(t)
+			dispatchArmKimiAdapter(t, credentialPath)
+
+			out, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
+				RepoFlag:     "owner/repo",
+				Agent:        "kimi-responder",
+				Action:       tc.action,
+				Instructions: "work",
+				Home:         home,
+			})
+			if err != nil {
+				t.Fatalf("dispatchLocalAgentJob returned error: %v", err)
+			}
+			events := kimiDetectorEvents(t, store, out.JobID)
+			if len(events) != 1 {
+				t.Fatalf("%s events = %d, want exactly 1 on the %s arm", kimiCredentialDegradedEvent, len(events), tc.action)
+			}
+			message := events[0].Message
+			for _, want := range []string{credentialPath, "token/", "blank_token/", "INFERRED"} {
+				if !strings.Contains(message, want) {
+					t.Fatalf("event message %q is missing %q", message, want)
+				}
+			}
+			if strings.Contains(message, "tok") && !strings.Contains(message, "kimi-code.json") {
+				t.Fatalf("event message may not carry credential contents: %q", message)
+			}
+		})
+	}
+}
+
+// TestForegroundReviewKimiDispatchIsSeatExcluded is an EXCLUSION test and is
+// labelled as one deliberately: it asserts ZERO events, so it would still pass
+// if a bracket were deleted, and it must never be read as coverage of one.
+//
+// What it does prove, at the real CLI dispatch route rather than in the unit
+// table, is the truth table for this file:
+//
+//	Action "ask"       -> arm 1 (mailbox.Run), non-seat  -> observed
+//	Action "implement" -> arm 2 (engine.RunJob), non-seat -> observed
+//	Action "review"    -> arm 2, but a read-only SEAT     -> NOT observed
+//
+// A foreground review allocates a read-only worktree, so effectiveAgent
+// carries ReadOnlySeat=true and the observer declines. The next person to
+// extend this file will reach for "review" as the obvious else-arm case (a
+// coordinator's probe did exactly that and measured zero events); this test
+// records why that is the exclusion rather than the bracket.
+func TestForegroundReviewKimiDispatchIsSeatExcluded(t *testing.T) {
+	ctx := context.Background()
+	store, home := blockerE2EHome(t)
+	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "kimi-reviewer", runtime.KimiRuntime, "fresh", []string{"review"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "lead", runtime.ShellRuntime, "unused", []string{"implement"}, "owner/repo")
+	credentialPath := dispatchArmCredentialProfile(t)
+	dispatchArmKimiAdapter(t, credentialPath)
+	previousGitHubFactory := newAgentDispatchGitHubClient
+	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
+	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
+
+	out, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
+		RepoFlag: "owner/repo", Agent: "kimi-reviewer", LeadAgent: "lead",
+		Action: "review", Instructions: "review the head", PullRequest: 7,
+		Branch: "main", HeadSHA: readonlyWorktreeHead(t, checkout), Home: home,
+	})
+	if err != nil {
+		t.Fatalf("dispatchLocalAgentJob returned error: %v", err)
+	}
+	events, err := store.ListJobEvents(ctx, out.JobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	seat := false
+	for _, event := range events {
+		if event.Kind == "readonly_worktree_allocated" {
+			seat = true
+		}
+		if event.Kind == kimiCredentialDegradedEvent {
+			t.Fatalf("a read-only seat dispatch must not be observed: %s", event.Message)
+		}
+	}
+	// Without this the test could pass by never having taken the seat path at
+	// all, which would make its zero-event assertion vacuous.
+	if !seat {
+		t.Fatal("expected a readonly_worktree_allocated event: the review dispatch did not take the seat path, so the exclusion was not exercised")
 	}
 }
