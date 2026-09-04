@@ -282,9 +282,15 @@ END;`); err != nil {
 		t.Fatalf("completed markers = %d, want exactly 1", got)
 	}
 	// The finalizer must NOT have re-run: exactly one synthetic finalization for the
-	// whole recovery, so the parent was advanced once rather than twice.
-	if got := countJobEventKind(t, store, child, "delegation_timeout_finalized"); got != 1 {
-		t.Fatalf("delegation_timeout_finalized events = %d, want exactly 1", got)
+	// whole recovery, so the parent was advanced once rather than twice. The kind is
+	// the SUPERSEDED one — this child's work was superseded by a closed PR, it did
+	// not time out, and recording it as a timeout made the two indistinguishable in
+	// the event stream (#1512).
+	if got := countJobEventKind(t, store, child, workflow.JobEventDelegationSupersededFinalized); got != 1 {
+		t.Fatalf("%s events = %d, want exactly 1", workflow.JobEventDelegationSupersededFinalized, got)
+	}
+	if got := countJobEventKind(t, store, child, workflow.JobEventDelegationTimeoutFinalized); got != 0 {
+		t.Fatalf("%s events = %d, want 0: nothing timed out", workflow.JobEventDelegationTimeoutFinalized, got)
 	}
 	if err := daemon.PollOnce(ctx); err != nil {
 		t.Fatalf("third PollOnce: %v", err)

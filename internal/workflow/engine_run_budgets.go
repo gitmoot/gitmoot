@@ -172,16 +172,51 @@ func (e Engine) finalizeTimedOutJob(ctx context.Context, jobID string, reason st
 	return true, nil
 }
 
+// Finalize event kinds for a delegation child terminalized WITHOUT a stored
+// result. All of these used to be recorded as delegation_timeout_finalized, so a
+// timed-out child, a superseded child, one that failed mid-run and one refused
+// before it ever ran were indistinguishable in the event stream and any host's
+// count of delegation timeouts was inflated by the other three (#1512). The kind
+// now names the cause the caller actually observed.
+const (
+	JobEventDelegationTimeoutFinalized        = "delegation_timeout_finalized"
+	JobEventDelegationSupersededFinalized     = "delegation_superseded_finalized"
+	JobEventDelegationRefusedFinalized        = "delegation_refused_finalized"
+	JobEventDelegationRuntimeFailureFinalized = "delegation_runtime_failure_finalized"
+)
+
+// FinalizeFailedDelegationChild terminalizes a delegation child that RAN and
+// then failed without storing a result — a mid-run runtime failure such as a
+// sandbox permission denial. It is neither a spent deadline nor a refusal, and
+// recording it as either asserts something that did not happen.
+func (e Engine) FinalizeFailedDelegationChild(ctx context.Context, jobID string, reason string) (bool, error) {
+	return e.finalizeTimedOutJob(ctx, jobID, reason, JobEventDelegationRuntimeFailureFinalized, reason, true, nil)
+}
+
 // FinalizeTimedOutDelegationChild preserves the established engine API for
-// delegation callers while routing through the all-job terminalizer.
+// delegation callers while routing through the all-job terminalizer. It is for a
+// child that RAN and produced no result: a spent run deadline, or a runtime
+// failure mid-delivery.
 func (e Engine) FinalizeTimedOutDelegationChild(ctx context.Context, jobID string, reason string) (bool, error) {
-	return e.finalizeTimedOutJob(ctx, jobID, reason, "delegation_timeout_finalized", reason, true, nil)
+	return e.finalizeTimedOutJob(ctx, jobID, reason, JobEventDelegationTimeoutFinalized, reason, true, nil)
+}
+
+// FinalizeRefusedDelegationChild terminalizes a delegation child that NEVER RAN:
+// a daemon pre-flight refused it, so no adapter was built, no prompt was
+// delivered and no deadline was spent. Same terminalizer and same DAG
+// advancement as the timeout path — only the recorded cause differs, which is
+// the point: recording this as a timeout asserted an elapsed deadline that never
+// started (#1512).
+func (e Engine) FinalizeRefusedDelegationChild(ctx context.Context, jobID string, reason string) (bool, error) {
+	return e.finalizeTimedOutJob(ctx, jobID, reason, JobEventDelegationRefusedFinalized, reason, true, nil)
 }
 
 // finalizeSupersededDelegationChildAtGeneration is the closed-PR recovery's
-// finalizer: the same terminalizer, pinned to the lifecycle the debt names.
+// finalizer: the same terminalizer, pinned to the lifecycle the debt names. The
+// child is neither timed out nor refused — its work was superseded — so it
+// carries its own kind rather than borrowing the timeout verb.
 func (e Engine) finalizeSupersededDelegationChildAtGeneration(ctx context.Context, jobID string, reason string, generation int64) (bool, error) {
-	return e.finalizeTimedOutJob(ctx, jobID, reason, "delegation_timeout_finalized", reason, true, &generation)
+	return e.finalizeTimedOutJob(ctx, jobID, reason, JobEventDelegationSupersededFinalized, reason, true, &generation)
 }
 
 func (e Engine) refreshJobPayload(ctx context.Context, jobID string) error {
