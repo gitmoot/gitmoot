@@ -3847,9 +3847,10 @@ source job atomically records `pipeline_auto_merge_claim` before the write,
 claim never parks the run; it ages its wait from the claim row's own
 `created_at` and records `pipeline_auto_merge_claim_orphaned` past 15m, or
 immediately with `cause=claim_timestamp_unreadable` when that value will not
-parse, and keeps waiting. A stage `timeout` parks the aged case terminally
-rather than recovering it - nothing releases an orphaned claim, so a new run is
-the remedy - and cannot park the unreadable case at all. A workload-mode
+parse, and keeps waiting. A stage `timeout` parks either case terminally rather
+than recovering it - nothing releases an orphaned claim, so a new run is the
+remedy. A claim released in the window between a losing scan's failed claim and
+its read is the ordinary hold cycle and is reported as nothing. A workload-mode
 reconciliation hold records `pipeline_auto_merge_held` with its cause, releases
 the claim so the merge is re-attempted when the row lands, and parks with that
 cause at the gate `timeout` or 24h after the hold began when no timeout is set;

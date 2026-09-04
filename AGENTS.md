@@ -560,8 +560,11 @@ cannot merge: nothing in the pipeline releases that claim, its key is fixed for
 the run, and a stage `timeout` on the gate parks the run rather than recovering
 it - re-running the pipeline takes a fresh claim. A claim whose `created_at`
 will not parse cannot be aged at all; that is recorded immediately with
-`cause=claim_timestamp_unreadable`, and a stage `timeout` CANNOT park that wait,
-because `pipelineGateTimedOut` needs a start stamp it does not have.
+`cause=claim_timestamp_unreadable`, and a stage `timeout` still parks that wait
+like any other - the gate row carries its ordinary start stamp, and only the
+claim's timestamp is unreadable. A claim released between a losing scan's failed
+claim attempt and its read is neither case: that is the ordinary hold cycle, so
+the loser waits quietly and the next scan takes the claim.
 
 Resolve the active decision from both durable sources: read the marker from
 `origin/main:AGENTS.md`, never a seat worktree, and read the newest typed
@@ -610,17 +613,43 @@ Record every activation with:
 `observed_at: <RFC3339>`, zero or more
 `implementer: <seat> issue=<number> pr=<number|none> accepted_at=<RFC3339>`
 lines, zero or more `review: <job-id> pr=<number> created_at=<RFC3339>` lines,
-then `[/workload-mode-transition]`. A direct STEADY/THROUGHPUT note may be both
-the decision and activation reference. A PR activates at its merge commit. A
-note-sourced DRAIN uses a later activation-marker note, so no field claims a
-commit that does not exist.
+then `[/workload-mode-transition]`.
+
+RESOLVED IN ONE DIRECTION, because this document said both and a reader could
+pick either (#1783 round-8 review, F-3): ONLY A MERGED COMMIT ACTIVATES A MODE.
+`activation_ref` is therefore always `commit:<40-character merge SHA>`, and its
+`workflow-note:<id>` form is for RECORDING a decision that has not yet been
+materialised by a merged marker PR - never for claiming a mode is active. That
+matches point 1 of "DERIVE, never trust a marker id" above: the active mode is
+the marker line in `origin/main:AGENTS.md`, changed by a merged PR, and a
+decision note is not itself the marker. `decision_ref` carries the note,
+`change_ref` the PR and its reviewed head, `decided_at` the note's timestamp,
+and `effective_at` the merge commit's `mergedAt`.
+
+A note-sourced DRAIN therefore does not become active on its note alone: it is
+decided at the note, freezes admissions from `decided_at` as below, and
+activates when its marker PR merges. If no marker PR has merged yet, post the
+record with `activation_ref: none` and `effective_at: none`, and re-post with
+both filled once it does.
+
+`activation_ref` and `change_ref` SHAs are 40 characters, matching
+`head=<40-character-reviewed-head>` in the reconciliation grammar above; an
+abbreviation grows ambiguous as the repository grows (F-6).
+
+RECORDS POSTED UNDER THE PRIOR GRAMMAR ARE GRANDFATHERED, stated rather than
+left undefined: a `[workload-mode-transition]` record carrying
+`effective_commit: <40-character SHA>` instead of `activation_ref`/`effective_at`
+remains valid and needs no re-post - the #1840 DRAIN-to-THROUGHPUT record at
+639fd973d83aa513575201e132587ab1313e6ca5 is one, and `effective_commit` maps to
+`activation_ref: commit:<same SHA>`. New records use the grammar above.
 
 A DRAIN decision freezes new admissions at `decided_at`; the previously active
 mode remains active while DRAIN prerequisites are installed. The transition
 wave is the non-terminal implementation assignments accepted before
 `decided_at` plus review jobs created before it that were queued or running
-then. DRAIN becomes active only at `effective_at`: `mergedAt` for a reconciled
-PR after its prerequisites, or the activation-marker note's `created_at` for a
+then. DRAIN becomes active only at `effective_at`, which is the `mergedAt` of the
+reconciled marker PR after its prerequisites are installed - not a note's
+`created_at`, per the resolution above. The remaining note-sourced case for a
 note source. A later owner decision cancels an unactivated DRAIN.
 `accepted_at` is the Herdr pane's first `working` event after the issue-backed
 assignment prompt; review `created_at` is the job-store timestamp. Mode changes

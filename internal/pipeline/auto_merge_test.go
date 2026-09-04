@@ -563,6 +563,80 @@ func TestPipelineAutoMergeLostClaimReportsAnOrphanedClaim(t *testing.T) {
 	}
 }
 
+// ROUND-8 F-1, and it is the reachable interleaving I asserted could not happen.
+// A losing scan's failed ClaimJobEvent and its read are two un-transacted
+// round-trips. Between them the winner can reach the Merge-side Waiting branch,
+// record its hold and RELEASE the claim - the ordinary hold cycle, and now once
+// per hold for every mode-marker PR because the mode gate runs at the merge
+// boundary. The loser then finds no claim row, and collapsing that into
+// "unreadable timestamp" wrote a durable, deduped, never-retracted orphan event
+// on a healthy run.
+//
+// MY FIRST VERSION OF THIS TEST WAS VACUOUS and the mutants said so: it released
+// the claim before advancing, so the next scan WON the claim and never entered
+// the loser branch at all - it passed while testing nothing, and three mutants
+// survived. The window only exists INSIDE a pass, so it is driven with the
+// afterLostClaim seam, which deletes the row exactly where the winner's release
+// would.
+func TestPipelineAutoMergeLostClaimTreatsAReleasedClaimAsANormalRace(t *testing.T) {
+	ctx := context.Background()
+	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second),
+		&stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: "0123456789abcdef"}})
+
+	claim, err := json.Marshal(map[string]any{
+		"phase": "claim", "pipeline": rec.Name, "run_id": run.ID,
+		"stage_id": "merge", "pull_request": 813, "head_sha": "0123456789abcdef",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The claim is held, so this scan LOSES it...
+	seedConsumedAutoMergeClaim(t, store, rec, run, sourceJobID)
+
+	var gateStage Stage
+	for _, candidate := range spec.Stages {
+		if candidate.ID == "merge" {
+			gateStage = candidate
+			break
+		}
+	}
+	released := false
+	deps := pipelineStageSettleDeps{
+		store: store, rec: rec, run: run,
+		// Far past every bound, so a false report cannot hide behind a young claim.
+		now: time.Now().UTC().Add(48 * time.Hour),
+		autoMerge: &stubPipelineAutoMerger{
+			readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+			mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-sha"},
+		},
+		// ...and the winner releases it in the window before this scan reads it.
+		afterLostClaim: func() {
+			ok, relErr := store.ReleaseJobEventClaim(ctx, db.JobEvent{
+				JobID: sourceJobID, Kind: autoMergeClaimEventKind, Message: string(claim),
+			})
+			if relErr != nil || !ok {
+				t.Fatalf("releasing in the window: ok=%v err=%v", ok, relErr)
+			}
+			released = true
+		},
+	}
+	settled, state, summary, _, _, err := gateStageSettleOutcome(ctx, deps, spec, gateStage, stageRow(t, store, run.ID, "merge"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !released {
+		t.Fatal("the seam never fired, so this scan did not lose the claim and the test proves nothing")
+	}
+	if settled && state == StageBlocked {
+		t.Fatalf("a released claim must not park: %q", summary)
+	}
+	if rows := autoMergeEventCount(t, store, sourceJobID, autoMergeClaimOrphanEventKind); rows != 0 {
+		t.Fatalf("orphan reports for a RELEASED claim = %d, want 0 - a normal hold cycle must not look like a fault", rows)
+	}
+}
+
 // F-6's calibration, pinned directly. The gate's StartedAt is stamped when the
 // gate goes in-flight, typically long before readiness, so aging the wait from
 // the GATE made a healthy two-second race on a gate that had waited past the
@@ -629,21 +703,21 @@ func TestPipelineAutoMergeClaimTimestampParsesTheStoreFormat(t *testing.T) {
 		t.Fatalf("seeding the claim: claimed=%v err=%v", claimed, err)
 	}
 
-	at, knowable, err := autoMergeClaimTakenAt(context.Background(), store, sourceJobID, string(claim))
+	at, lookup, _, err := autoMergeClaimTakenAt(context.Background(), store, sourceJobID, string(claim))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !knowable {
+	if lookup != autoMergeClaimFound {
 		t.Fatal("the store's own created_at format must parse, or every losing scan reports an unreadable timestamp")
 	}
 	if at.Before(before) || at.After(time.Now().UTC().Add(2*time.Minute)) {
 		t.Fatalf("claim taken at %v, want a value near now - the parse succeeded but the value is wrong", at)
 	}
 	// And a message that is not this claim must not be mistaken for it.
-	if _, found, err := autoMergeClaimTakenAt(context.Background(), store, sourceJobID, `{"phase":"claim","other":true}`); err != nil {
+	if _, lookup, _, err := autoMergeClaimTakenAt(context.Background(), store, sourceJobID, `{"phase":"claim","other":true}`); err != nil {
 		t.Fatal(err)
-	} else if found {
-		t.Fatal("a different claim message must not match this claim's row")
+	} else if lookup != autoMergeClaimGone {
+		t.Fatalf("a different claim message must report Gone, got %v", lookup)
 	}
 }
 

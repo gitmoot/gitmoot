@@ -1329,6 +1329,14 @@ type pipelineStageSettleDeps struct {
 	autoMerge        PipelineAutoMergeExecutor
 	events           *pipelineJobEventSnapshot
 	terminalJobState *string
+	// afterLostClaim runs immediately after a FAILED claim attempt and before the
+	// claim row is read. Production leaves it nil. It exists because the round-8
+	// F-1 interleaving - the winner releasing the claim in the window between a
+	// loser's failed ClaimJobEvent and its read - cannot be driven deterministically
+	// from outside: both calls are sequential in one goroutine, so only something
+	// inside that window can delete the row. Same seam pattern as releaseClaim
+	// below, which pinned round-4's F-3 for the same reason.
+	afterLostClaim func()
 	// releaseClaim overrides the auto-merge claim release. Production leaves it
 	// nil and uses the store; a test injects a FAILING release, which is the only
 	// way to observe that the hold is recorded BEFORE the release - the ordering
@@ -2002,6 +2010,9 @@ func autoMergeGateStageSettleOutcome(ctx context.Context, deps pipelineStageSett
 		// durable record on the unbounded path is therefore the job event, not the
 		// summary - a probe through the advancer showed state="running" with an
 		// empty summary and the event present.
+		if deps.afterLostClaim != nil {
+			deps.afterLostClaim()
+		}
 		return autoMergeLostClaimOutcome(ctx, deps, stage, stageRow, sourceJobID, payload.PullRequest, reviewedHead, string(claim))
 	}
 
@@ -2174,11 +2185,23 @@ const (
 // this gate parks the run rather than recovering it, and the reason text says
 // so instead of promising recovery.
 func autoMergeLostClaimOutcome(ctx context.Context, deps pipelineStageSettleDeps, stage Stage, stageRow db.PipelineRunStage, sourceJobID string, pr int, head string, claim string) (bool, string, string, []string, *db.PipelineRunStage, error) {
-	claimedAt, knowable, err := autoMergeClaimTakenAt(ctx, deps.store, sourceJobID, claim)
+	claimedAt, lookup, rawClaimStamp, err := autoMergeClaimTakenAt(ctx, deps.store, sourceJobID, claim)
 	if err != nil {
 		return false, "", "", nil, nil, err
 	}
-	if !knowable {
+	if lookup == autoMergeClaimGone {
+		// The claim was RELEASED between this scan's failed claim and this read.
+		// That is the ordinary hold cycle, not a fault, and it is now the common
+		// case rather than a rarity: the mode gate calls ensureWorkloadModeReconciled
+		// at the merge boundary, so hold -> record -> release runs once per hold for
+		// every mode-marker PR. The next scan takes the claim. Reporting anything
+		// here would put a permanent orphan event on a healthy run, which is exactly
+		// what collapsing this case into "unreadable" did (#1783 round-8 review,
+		// F-1).
+		return autoMergeGateWaitingWithReason(stage, stageRow, deps.now, pr,
+			fmt.Sprintf("the auto-merge claim for head %s was released while this scan was reading it, so the next scan takes it", shortPipelineSHA(head)))
+	}
+	if lookup == autoMergeClaimUnreadable {
 		// The claim row is present - it is why this branch runs - but its
 		// created_at is empty or unparseable, so the age cannot be read. That is a
 		// DATA cause, not a lifecycle one: a legacy row written before this column
@@ -2188,23 +2211,35 @@ func autoMergeLostClaimOutcome(ctx context.Context, deps pipelineStageSettleDeps
 		// skips any row that is not queued or running, and the same advance
 		// re-stamps it before a settle pass can look (#1783 round-7 review, F-3).
 		//
-		// It records rather than only carrying a reason, because a wait that cannot
-		// be aged also cannot be parked by a stage `timeout` - so the reason alone
-		// would reach nothing an operator can read.
+		// It records rather than only carrying a reason so the condition is durable
+		// even when no timeout is configured. It does NOT claim the wait is
+		// unparkable: that reasoning was inherited from round 6, where the unageable
+		// case was a zero StartedAt on the GATE row. Here the gate row carries its
+		// ordinary stamp and only the CLAIM row's timestamp is unreadable, so a
+		// configured stage `timeout` parks this wait exactly as it parks any other
+		// (#1783 round-8 review, F-2).
 		//
-		// THIS BRANCH IS DEFENSIVE AND UNPINNED, stated rather than pretended: no
-		// store API can write created_at (every INSERT INTO job_events names only
-		// job_id, kind and message), so no test in this package can produce a
-		// malformed value. The reachable side IS pinned, by
+		// THIS BRANCH IS DEFENSIVE AND UNPINNED, stated rather than pretended. No
+		// INSERT INTO job_events accepts created_at - all 30-odd sites name only
+		// (job_id, kind, message) - so no test in this package can produce a
+		// malformed value through an insert. The precise claim matters, because a
+		// store-wide "nothing can write it" is FALSE: UpsertLatestJobEvent and
+		// RefreshLatestAdvanceRetry both set created_at = CURRENT_TIMESTAMP. Neither
+		// can touch a claim row, because each is pinned to a different event kind in
+		// its own SQL, so the age cannot be refreshed - but the safety rests on that
+		// kind discipline, not on impossibility, and a kind-parameterised upsert
+		// would silently reset the bound (#1783 round-8 review, F-4).
+		//
+		// The reachable side IS pinned, by
 		// TestPipelineAutoMergeClaimTimestampParsesTheStoreFormat, which guards the
 		// hazard that matters - if the store's timestamp format changed, every
 		// claim would fall down here and every losing scan would report an
 		// unreadable timestamp.
-		if err := recordAutoMergeClaimOrphanSuspicion(ctx, deps, stage, sourceJobID, pr, head, autoMergeClaimAgeUnknown, time.Time{}); err != nil {
+		if err := recordAutoMergeClaimOrphanSuspicion(ctx, deps, stage, sourceJobID, pr, head, autoMergeClaimAgeUnknown, time.Time{}, rawClaimStamp); err != nil {
 			return false, "", "", nil, nil, err
 		}
 		return autoMergeGateWaitingWithReason(stage, stageRow, deps.now, pr,
-			fmt.Sprintf("another scan holds the auto-merge claim for head %s and the claim carries no readable timestamp, so its age cannot be measured and a stage `timeout` cannot park this wait", shortPipelineSHA(head)))
+			fmt.Sprintf("another scan holds the auto-merge claim for head %s and the claim carries no readable timestamp, so its age cannot be measured; a stage `timeout` on this gate still parks the wait, and re-running the pipeline takes a fresh claim", shortPipelineSHA(head)))
 	}
 	held := deps.now.Sub(claimedAt)
 	if held < autoMergeClaimOrphanAfter {
@@ -2222,36 +2257,65 @@ func autoMergeLostClaimOutcome(ctx context.Context, deps pipelineStageSettleDeps
 	// id, so a re-run takes a fresh claim (#1783 round-7 review, F-1).
 	reason := fmt.Sprintf("the auto-merge claim for head %s was taken %s ago and is still held with no merge and no release; if the scan that took it is gone, nothing in the pipeline releases that claim - the key is fixed for this run, so THIS run cannot merge and a stage `timeout` would park it rather than recover it, while re-running the pipeline takes a fresh claim",
 		shortPipelineSHA(head), held.Truncate(time.Second))
-	if err := recordAutoMergeClaimOrphanSuspicion(ctx, deps, stage, sourceJobID, pr, head, autoMergeClaimHeldPastBound, claimedAt); err != nil {
+	if err := recordAutoMergeClaimOrphanSuspicion(ctx, deps, stage, sourceJobID, pr, head, autoMergeClaimHeldPastBound, claimedAt, ""); err != nil {
 		return false, "", "", nil, nil, err
 	}
 	return autoMergeGateWaitingWithReason(stage, stageRow, deps.now, pr, reason)
 }
 
+// autoMergeClaimLookup is what a losing scan learned about the claim it lost.
+// THREE outcomes, not two, and collapsing the last two was a real defect: a
+// released claim and an unreadable timestamp are different facts with different
+// dispositions (#1783 round-8 review, F-1).
+type autoMergeClaimLookup int
+
+const (
+	// autoMergeClaimFound: the row is there and its created_at parsed.
+	autoMergeClaimFound autoMergeClaimLookup = iota
+	// autoMergeClaimGone: no row matches. The claim was RELEASED between this
+	// scan's failed ClaimJobEvent and its read - two un-transacted round-trips -
+	// which is the ordinary hold cycle, not a fault: the winner records its hold
+	// and releases the claim on the Merge-side Waiting path, and with the mode
+	// gate calling ensureWorkloadModeReconciled at the merge boundary that cycle
+	// runs once per hold for every mode-marker PR. The next scan simply claims it.
+	autoMergeClaimGone
+	// autoMergeClaimUnreadable: the row is there and its created_at will not
+	// parse. Defensive; see the caller.
+	autoMergeClaimUnreadable
+)
+
 // autoMergeClaimTakenAt reads when THIS claim was inserted, from the claim row's
 // own created_at. `claim` is the exact message the caller built, so the lookup is
 // by identity rather than by scanning for the newest anything.
-func autoMergeClaimTakenAt(ctx context.Context, store *db.Store, sourceJobID, claim string) (time.Time, bool, error) {
+//
+// It previously returned a bare (zero, false) for BOTH "no row matches" and
+// "timestamp unparseable", and the caller's comment asserted "the claim row is
+// present - it is why this branch runs". That premise was false: the claim can
+// be released between the failed claim attempt and this read, so a healthy run
+// wrote a durable, deduped, never-retracted "unreadable timestamp" event on the
+// ordinary hold path (#1783 round-8 review, F-1).
+func autoMergeClaimTakenAt(ctx context.Context, store *db.Store, sourceJobID, claim string) (time.Time, autoMergeClaimLookup, string, error) {
 	events, err := store.ListJobEvents(ctx, sourceJobID)
 	if err != nil {
-		return time.Time{}, false, err
+		return time.Time{}, autoMergeClaimGone, "", err
 	}
 	for _, event := range events {
 		if event.Kind != autoMergeClaimEventKind || event.Message != claim {
 			continue
 		}
-		at, parseErr := time.Parse(time.DateTime, strings.TrimSpace(event.CreatedAt))
+		raw := strings.TrimSpace(event.CreatedAt)
+		at, parseErr := time.Parse(time.DateTime, raw)
 		if parseErr != nil {
 			// Also accept an RFC3339 store, so this does not depend on one backend's
 			// timestamp spelling.
-			at, parseErr = time.Parse(time.RFC3339Nano, strings.TrimSpace(event.CreatedAt))
+			at, parseErr = time.Parse(time.RFC3339Nano, raw)
 			if parseErr != nil {
-				return time.Time{}, false, nil
+				return time.Time{}, autoMergeClaimUnreadable, raw, nil
 			}
 		}
-		return at.UTC(), true, nil
+		return at.UTC(), autoMergeClaimFound, raw, nil
 	}
-	return time.Time{}, false, nil
+	return time.Time{}, autoMergeClaimGone, "", nil
 }
 
 // autoMergeClaimSuspicionCause names WHY a losing scan reported the claim, so
@@ -2280,7 +2344,7 @@ const (
 // time, so every scan wrote a different message and the dedup never matched -
 // measured as 2 rows from 2 losing scans. Elapsed time belongs in the stage
 // summary, which is regenerated per scan by design.
-func recordAutoMergeClaimOrphanSuspicion(ctx context.Context, deps pipelineStageSettleDeps, stage Stage, sourceJobID string, pr int, head string, cause autoMergeClaimSuspicionCause, claimedAt time.Time) error {
+func recordAutoMergeClaimOrphanSuspicion(ctx context.Context, deps pipelineStageSettleDeps, stage Stage, sourceJobID string, pr int, head string, cause autoMergeClaimSuspicionCause, claimedAt time.Time, rawStamp string) error {
 	body := map[string]any{
 		"phase": "claim_orphan_suspected", "pipeline": deps.rec.Name, "run_id": deps.run.ID,
 		"stage_id": stage.ID, "pull_request": pr, "head_sha": head,
@@ -2289,6 +2353,14 @@ func recordAutoMergeClaimOrphanSuspicion(ctx context.Context, deps pipelineStage
 	if cause == autoMergeClaimHeldPastBound {
 		body["after"] = autoMergeClaimOrphanAfter.String()
 		body["claim_taken_at"] = claimedAt.UTC().Format(time.RFC3339Nano)
+	} else {
+		// PER-EPISODE for this cause too. Round 7 earned "once per claim" by
+		// carrying the claim's timestamp, and this cause has no parseable one - so
+		// it carries the RAW value instead, which is stable for a row and differs
+		// between rows. Without it the body fell back to the once-per-RUN key that
+		// round-7 F-5 rejected, on the one branch that keeps it (#1783 round-8
+		// review, F-5).
+		body["claim_raw_stamp"] = rawStamp
 	}
 	message, err := json.Marshal(body)
 	if err != nil {

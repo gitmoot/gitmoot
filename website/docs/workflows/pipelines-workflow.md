@@ -592,9 +592,10 @@ do not park the run; a loser ages its wait from the claim row's own `created_at`
 and records `pipeline_auto_merge_claim_orphaned` with `cause=held_past_bound`
 once the claim has been held 15m, or immediately with
 `cause=claim_timestamp_unreadable` when that timestamp will not parse. A stage
-`timeout` turns the first into a terminal park rather than a recovery - nothing
-releases an orphaned claim, so a new run is the remedy - and cannot park the
-second at all. A workload-mode reconciliation hold records
+`timeout` turns either into a terminal park rather than a recovery - nothing
+releases an orphaned claim, so a new run is the remedy. A claim released in the
+window between a losing scan's failed claim and its read is reported as nothing:
+that is the ordinary hold cycle. A workload-mode reconciliation hold records
 `pipeline_auto_merge_held` with its cause: the gate releases the claim and
 re-attempts, so the hold is retryable rather than terminal, and it parks with
 that cause at the gate `timeout` or, when no timeout is set, 24h after the hold

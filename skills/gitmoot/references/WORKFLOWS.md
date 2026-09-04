@@ -1050,8 +1050,9 @@ gate: that hold releases the claim and retries, and is bounded by the gate
 the decision rather than the cause text. A scan that loses the claim ages its wait from the claim row's own `created_at`
 and records `pipeline_auto_merge_claim_orphaned` past 15m - or immediately, with
 `cause=claim_timestamp_unreadable`, when that value will not parse - and waits
-rather than parking. A stage `timeout` parks the aged case terminally instead of
-recovering it, and cannot park the unreadable case at all.
+rather than parking. A stage `timeout` parks either case terminally instead of
+recovering it. A claim released while a losing scan was reading it is the
+ordinary hold cycle and is reported as nothing.
 
 `pipeline add` warns (does not block) when an agent stage names an agent that does
 not exist yet; create it before the stage runs. The

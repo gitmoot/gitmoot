@@ -622,8 +622,10 @@ stages:
   converts that wait into a terminal park rather than a recovery, because nothing
   releases an orphaned claim; a NEW RUN takes a fresh claim. A claim whose
   `created_at` will not parse is recorded immediately with
-  `cause=claim_timestamp_unreadable`, and a stage `timeout` cannot park that one
-  at all.
+  `cause=claim_timestamp_unreadable`, which a stage `timeout` parks like any
+  other wait. A claim RELEASED in the window between a losing scan's failed
+  claim and its read is reported as nothing at all: that is the ordinary hold
+  cycle and the next scan takes the claim.
 - A workload-mode reconciliation hold is a THIRD event,
   `pipeline_auto_merge_held`, carrying the cause plus the head and the time the
   hold began. The hold is retryable, not terminal: the gate releases its
