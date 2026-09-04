@@ -1781,31 +1781,9 @@ func runtimeEventSession(message string) (string, string) {
 	return runtimeName, ref
 }
 
-// LatestJobEvents returns the most recent event for every job that has one,
-// keyed by job id, in a single query (the dashboard refresh would otherwise
-// issue one ListJobEvents per job).
-func (s *Store) LatestJobEvents(ctx context.Context) (map[string]JobEvent, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT job_id, kind, message FROM job_events
-		WHERE id IN (SELECT MAX(id) FROM job_events GROUP BY job_id)`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	events := map[string]JobEvent{}
-	for rows.Next() {
-		var event JobEvent
-		if err := rows.Scan(&event.JobID, &event.Kind, &event.Message); err != nil {
-			return nil, err
-		}
-		events[event.JobID] = event
-	}
-	return events, rows.Err()
-}
-
 // JobIDsWithEventKind returns a map jobID -> message of the LATEST job_event of
 // the given kind, one entry per job that has at least one such event. It is a
-// single indexed query mirroring LatestJobEvents (but scoped to one kind) so a
+// single indexed query scoped to one kind so a
 // caller can surface, e.g., a delegation_preflight_failed reason in `job list`
 // without an N-per-job lookup and regardless of whether that event is the job's
 // overall latest event (a corrective continuation makes delegation_continuation_enqueued
@@ -1830,8 +1808,8 @@ func (s *Store) JobIDsWithEventKind(ctx context.Context, kind string) (map[strin
 }
 
 // LatestJobEventsOfKinds returns, per job, the LATEST job_event whose kind is one
-// of the given kinds, keyed by job id, in a single indexed query. It mirrors
-// LatestJobEvents but restricts the candidate set to the caller's "reason" kinds
+// of the given kinds, keyed by job id, in a single indexed query. It restricts
+// the candidate set to the caller's "reason" kinds
 // so a stuck-job surface (issue #552) can find the most recent event that
 // actually explains why a queued/blocked job is waiting — ignoring benign
 // lifecycle events (queued, route_selected, delegation_continuation_enqueued)

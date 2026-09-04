@@ -46,37 +46,10 @@ func (s *Store) UpsertAgent(ctx context.Context, agent Agent) error {
 	return tx.Commit()
 }
 
-// UpdateAgentRuntime switches a registered agent's runtime (codex, claude, kimi,
-// or omp — the allow-list below, which now matches the adapter registry exactly:
-// the legacy kimi-cli runtime it used to omit (#1428) is gone (#1756)),
-// preserving its role, capabilities, repo scope, template, and policy. The warm
-// runtime_ref is cleared because it is bound to the old runtime — the next job
-// starts a fresh session for the new runtime. The old agent_instance, if any,
-// idle-expires on its own.
-func (s *Store) UpdateAgentRuntime(ctx context.Context, name, runtime string) error {
-	runtime = strings.TrimSpace(runtime)
-	if runtime != "codex" && runtime != "claude" && runtime != "kimi" && runtime != "omp" {
-		return fmt.Errorf("unknown runtime %q (want codex, claude, kimi, or omp)", runtime)
-	}
-	row := s.db.QueryRowContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, template_id, model, effort, capabilities_json, autonomy_policy, health_status
-		FROM agents WHERE name = ?`, name)
-	agent, err := scanAgent(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("agent %q is not registered", name)
-	}
-	if err != nil {
-		return err
-	}
-	agent.Runtime = runtime
-	agent.RuntimeRef = ""
-	return s.UpsertAgent(ctx, agent)
-}
-
 // UpdateAgentRuntimeRef re-pins an agent's runtime_ref in place, updating only
-// that column (#443). Unlike UpdateAgentRuntime — which switches runtimes and
-// deliberately CLEARS runtime_ref — this is used by the self-heal path to record
-// a freshly minted session id while preserving every other field. It returns an
-// error if no agent row matched the name.
+// that column (#443). It is used by the self-heal path to record a freshly
+// minted session id while preserving every other field. It returns an error if
+// no agent row matched the name.
 func (s *Store) UpdateAgentRuntimeRef(ctx context.Context, name, ref string) error {
 	result, err := s.db.ExecContext(ctx,
 		`UPDATE agents SET runtime_ref = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?`,
@@ -158,83 +131,26 @@ func (s *Store) RemoveAgent(ctx context.Context, name string) (bool, error) {
 	return affected > 0, tx.Commit()
 }
 
-// ErrAgentHasActiveJobs is the sentinel DeleteAgentChecked wraps when it refuses
-// an agent that still has queued/running jobs. Callers (e.g. the dashboard's
-// bulk delete) classify "skip vs hard error" with errors.Is rather than matching
-// the message text.
-var ErrAgentHasActiveJobs = errors.New("agent has queued or running jobs")
-
-// rowQuerier is the QueryRowContext shape shared by *sql.DB and *sql.Tx, so
-// countActiveJobsTx can run on either a plain connection or inside a transaction.
+// rowQuerier is the QueryRowContext shape shared by *sql.DB and *sql.Tx, so a
+// helper can run on either a plain connection or inside a transaction.
 type rowQuerier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// countActiveJobsTx is the single source of the queued/running busy count for an
-// agent. Both AgentActiveJobCount (own connection) and DeleteAgentChecked (inside
-// its delete transaction) call it, so the SQL and the ('queued','running') state
-// list live in exactly one place and can't drift.
-func countActiveJobsTx(ctx context.Context, q rowQuerier, name string) (int, error) {
+// ErrAgentHasActiveJobs is the sentinel callers wrap when they refuse an agent
+// that still has queued/running jobs. Callers classify "skip vs hard error"
+// with errors.Is rather than matching the message text.
+var ErrAgentHasActiveJobs = errors.New("agent has queued or running jobs")
+
+// AgentActiveJobCount returns how many queued or running jobs reference the
+// named agent. It is the restart rebind's busy pre-flight; callers wrap
+// ErrAgentHasActiveJobs to classify the refusal.
+func (s *Store) AgentActiveJobCount(ctx context.Context, name string) (int, error) {
 	var active int
-	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE agent = ? AND state IN ('queued', 'running')`, name).Scan(&active); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE agent = ? AND state IN ('queued', 'running')`, name).Scan(&active); err != nil {
 		return 0, err
 	}
 	return active, nil
-}
-
-// AgentActiveJobCount returns how many queued or running jobs reference the
-// named agent. It is the restart rebind's busy pre-flight; it shares its query
-// with DeleteAgentChecked via countActiveJobsTx so both refuse an agent with
-// in-flight work identically (callers wrap ErrAgentHasActiveJobs to classify the
-// refusal).
-func (s *Store) AgentActiveJobCount(ctx context.Context, name string) (int, error) {
-	return countActiveJobsTx(ctx, s.db, name)
-}
-
-// DeleteAgentChecked removes an agent (and its instances) unless queued or
-// running jobs still reference it, in which case it refuses (wrapping
-// ErrAgentHasActiveJobs) so in-flight work is never orphaned.
-func (s *Store) DeleteAgentChecked(ctx context.Context, name string) error {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return errors.New("agent name is required")
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	// Same query as AgentActiveJobCount, but run on tx so the check + the deletes
-	// below stay in one transaction (atomic). countActiveJobsTx is the shared
-	// source of the SQL/state-list.
-	active, err := countActiveJobsTx(ctx, tx, name)
-	if err != nil {
-		return err
-	}
-	if active > 0 {
-		return fmt.Errorf("agent %s has %d queued or running job(s); cancel them first: %w", name, active, ErrAgentHasActiveJobs)
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM agent_repos WHERE agent_name = ?`, name); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM keychain_grants WHERE consumer_kind = 'agent' AND consumer_id = ?`, name); err != nil {
-		return err
-	}
-	// agent_instances are NOT deleted: their `type` column references a managed
-	// agent type, not this agents.name, so deleting by name could remove another
-	// type's instances. Instances are ephemeral (expiry-reaped) either way.
-	result, err := tx.ExecContext(ctx, `DELETE FROM agents WHERE name = ?`, name)
-	if err != nil {
-		return err
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if affected == 0 {
-		return fmt.Errorf("agent %q not found", name)
-	}
-	return tx.Commit()
 }
 
 func (s *Store) AllowAgentRepo(ctx context.Context, agentName string, repoFullName string) error {
@@ -475,24 +391,6 @@ func (s *Store) DeleteAgentInstance(ctx context.Context, name string) error {
 		return err
 	}
 	return requireAffected(result, "agent instance", name)
-}
-
-// StopAgentInstance removes a runtime session (warm agent_instance) by name. It
-// refuses a session that is mid-job (state "running") so an in-flight job is
-// never orphaned — the caller cancels the job first. A missing session errors.
-func (s *Store) StopAgentInstance(ctx context.Context, name string) error {
-	name = strings.TrimSpace(name)
-	instance, err := s.GetAgentInstance(ctx, name)
-	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("session %q not found", name)
-	}
-	if err != nil {
-		return err
-	}
-	if instance.State == "running" {
-		return fmt.Errorf("session %q is running a job; cancel it from Jobs first", name)
-	}
-	return s.DeleteAgentInstance(ctx, name)
 }
 
 func (s *Store) DeleteExpiredAgentInstances(ctx context.Context, now time.Time) (int64, error) {

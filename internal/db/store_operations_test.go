@@ -2,7 +2,6 @@ package db
 
 import (
 	"context"
-	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -78,32 +77,11 @@ func TestRevertAgentTemplateVersion(t *testing.T) {
 	}
 }
 
-func TestDeleteAgentChecked(t *testing.T) {
-	store := openStoreOperationsTestStore(t)
-	ctx := context.Background()
-	if err := store.UpsertAgent(ctx, Agent{Name: "worker", Runtime: "codex"}); err != nil {
-		t.Fatalf("upsert agent: %v", err)
-	}
-	if err := store.CreateJob(ctx, Job{ID: "j1", Agent: "worker", Type: "ask", State: "queued"}); err != nil {
-		t.Fatalf("job: %v", err)
-	}
-	// Refused while a queued job references the agent — wraps the sentinel so
-	// callers can classify with errors.Is, not message text.
-	if err := store.DeleteAgentChecked(ctx, "worker"); err == nil || !errors.Is(err, ErrAgentHasActiveJobs) {
-		t.Fatalf("expected job-reference refusal (ErrAgentHasActiveJobs), got %v", err)
-	}
-	if err := store.UpdateJobState(ctx, "j1", "succeeded"); err != nil {
-		t.Fatalf("settle job: %v", err)
-	}
-	if err := store.DeleteAgentChecked(ctx, "worker"); err != nil {
-		t.Fatalf("delete: %v", err)
-	}
-	if err := store.DeleteAgentChecked(ctx, "worker"); err == nil || !strings.Contains(err.Error(), "not found") {
-		t.Fatalf("expected not-found on second delete, got %v", err)
-	}
-}
-
-func TestUpdateAgentRuntime(t *testing.T) {
+// UpdateAgentRuntimeRef is the self-heal path's re-pin (#443): it updates only
+// runtime_ref and leaves every other column alone. Its coverage used to ride
+// along inside TestUpdateAgentRuntime, whose subject went with the dashboard
+// TUI (#1753), so it is pinned directly here.
+func TestUpdateAgentRuntimeRef(t *testing.T) {
 	store := openStoreOperationsTestStore(t)
 	ctx := context.Background()
 	original := Agent{
@@ -120,85 +98,24 @@ func TestUpdateAgentRuntime(t *testing.T) {
 	if err := store.UpsertAgent(ctx, original); err != nil {
 		t.Fatalf("upsert agent: %v", err)
 	}
-
-	// Unknown runtime is rejected, leaving the row untouched.
-	if err := store.UpdateAgentRuntime(ctx, "worker", "gpt"); err == nil || !strings.Contains(err.Error(), "unknown runtime") {
-		t.Fatalf("expected unknown-runtime error, got %v", err)
-	}
-	// Missing agent errors.
-	if err := store.UpdateAgentRuntime(ctx, "ghost", "claude"); err == nil || !strings.Contains(err.Error(), "not registered") {
-		t.Fatalf("expected not-registered error, got %v", err)
-	}
-
-	if err := store.UpdateAgentRuntime(ctx, "worker", "claude"); err != nil {
-		t.Fatalf("switch runtime: %v", err)
+	if err := store.UpdateAgentRuntimeRef(ctx, "worker", "sess-def"); err != nil {
+		t.Fatalf("re-pin runtime_ref: %v", err)
 	}
 	got, err := store.GetAgent(ctx, "worker")
 	if err != nil {
 		t.Fatalf("get agent: %v", err)
 	}
-	if got.Runtime != "claude" {
-		t.Fatalf("runtime = %q, want claude", got.Runtime)
+	if got.RuntimeRef != "sess-def" {
+		t.Fatalf("runtime_ref = %q, want sess-def", got.RuntimeRef)
 	}
-	if got.RuntimeRef != "" {
-		t.Fatalf("runtime_ref = %q, want cleared", got.RuntimeRef)
+	// In place: the runtime itself and every other field survive the re-pin.
+	if got.Runtime != "codex" || got.Role != "implement" || got.RepoScope != "owner/repo" ||
+		got.TemplateID != "worker-tpl" || got.AutonomyPolicy != "auto" ||
+		strings.Join(got.Capabilities, ",") != "implement,review" {
+		t.Fatalf("re-pin altered preserved fields: %+v", got)
 	}
-	// Everything else preserved.
-	if got.Role != "implement" || got.RepoScope != "owner/repo" || got.TemplateID != "worker-tpl" ||
-		got.AutonomyPolicy != "auto" || strings.Join(got.Capabilities, ",") != "implement,review" {
-		t.Fatalf("switch runtime altered preserved fields: %+v", got)
-	}
-
-	// omp is in the allow-list too (#1428). Re-warm the ref first so the clear is a
-	// real observation and not vacuously satisfied by the claude switch above.
-	if err := store.UpdateAgentRuntimeRef(ctx, "worker", "sess-def"); err != nil {
-		t.Fatalf("re-warm runtime_ref: %v", err)
-	}
-	if err := store.UpdateAgentRuntime(ctx, "worker", "omp"); err != nil {
-		t.Fatalf("switch runtime to omp: %v", err)
-	}
-	got, err = store.GetAgent(ctx, "worker")
-	if err != nil {
-		t.Fatalf("get agent: %v", err)
-	}
-	if got.Runtime != "omp" {
-		t.Fatalf("runtime = %q, want omp", got.Runtime)
-	}
-	// omp is stateless, so the old runtime's warm ref is doubly meaningless here.
-	if got.RuntimeRef != "" {
-		t.Fatalf("runtime_ref = %q, want cleared on the omp switch", got.RuntimeRef)
-	}
-}
-
-func TestLatestJobEvents(t *testing.T) {
-	store := openStoreOperationsTestStore(t)
-	ctx := context.Background()
-	if err := store.CreateJob(ctx, Job{ID: "job-a", Agent: "planner", Type: "ask", State: "failed"}); err != nil {
-		t.Fatalf("CreateJob: %v", err)
-	}
-	if err := store.CreateJob(ctx, Job{ID: "job-b", Agent: "planner", Type: "review", State: "queued"}); err != nil {
-		t.Fatalf("CreateJob: %v", err)
-	}
-	for _, event := range []JobEvent{
-		{JobID: "job-a", Kind: "queued", Message: "created"},
-		{JobID: "job-a", Kind: "failed", Message: "boom"},
-		{JobID: "job-b", Kind: "queued", Message: "created"},
-	} {
-		if err := store.AddJobEvent(ctx, event); err != nil {
-			t.Fatalf("AddJobEvent: %v", err)
-		}
-	}
-	latest, err := store.LatestJobEvents(ctx)
-	if err != nil {
-		t.Fatalf("LatestJobEvents: %v", err)
-	}
-	if got := latest["job-a"]; got.Kind != "failed" || got.Message != "boom" {
-		t.Fatalf("job-a latest = %+v", got)
-	}
-	if got := latest["job-b"]; got.Kind != "queued" || got.Message != "created" {
-		t.Fatalf("job-b latest = %+v", got)
-	}
-	if _, ok := latest["job-missing"]; ok {
-		t.Fatal("jobs without events must be absent from the map")
+	// No agent row matched is an error, not a silent no-op.
+	if err := store.UpdateAgentRuntimeRef(ctx, "ghost", "sess-x"); err == nil {
+		t.Fatal("re-pinning an unregistered agent must error")
 	}
 }

@@ -60,9 +60,10 @@ func TestCockpitRemovalMigrationOnFreshHome(t *testing.T) {
 
 // The UPGRADE arm, which is the one that matters: build a database at the last
 // released schema - where these tables DO exist and hold rows - then run the
-// full slice over it and require the tables gone. Populating them first means a
-// migration that silently no-opped, or that dropped only some of the three,
-// cannot pass.
+// full slice over it and require the tables gone. What catches a no-op or a
+// partial drop is the sqlite_master sweep below, which checks all three tables
+// regardless of row count; seeding a row proves only that the drop survives
+// DATA (#1787 review F4, correcting an over-claim this comment used to make).
 func TestCockpitRemovalMigrationDropsPopulatedTablesOnUpgrade(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "previous-release.db")

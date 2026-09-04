@@ -23,8 +23,7 @@
 //
 // Callers own that boundary. Every current call site builds `<literal command>
 // <quoted arguments>` — `gh release view <repo>`, `codex plugin marketplace add
-// <root>`, `<gitmootBin> job watch <id>` — and gitmootBin is deliberately NOT
-// routed through here.
+// <root>` — and a command word is never routed through here.
 //
 // ONE CALL SITE IS AN EXCEPTION, and an earlier version of this comment claimed
 // otherwise: internal/cli/plugin.go passes args[0] through the quoter when it

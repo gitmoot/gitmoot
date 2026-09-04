@@ -169,14 +169,3 @@ func TestNilCockpitDegrades(t *testing.T) {
 		t.Fatalf("nil cockpit ResolvePaneByLabel = (%q, %v), want (\"\", false)", pane, ok)
 	}
 }
-
-// TestWatchCommandKeepsReservedTokensInArgumentPosition is the CLI-path half of
-// the #1795 review's shellquote finding. internal/shellquote's contract is
-// scoped to ARGUMENT position, so this asserts the property that scope depends
-// on: values that would be reinterpreted in command position - the reserved
-// word `if`, the assignment form `FOO=bar` - land after a flag or after the
-// command word, never as the command word itself.
-//
-// The command word here is gitmootBin, which is deliberately NOT routed through
-// shellquote.Posix. If a future change ever built the command word from a quoted
-// value, this test is where that shows up.

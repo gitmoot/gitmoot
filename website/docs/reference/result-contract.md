@@ -226,7 +226,14 @@ the same `delegations` field, `coordinator`, and `continuation` mechanics.
   only after every listed sibling job succeeds. Each entry must reference a
   known sibling in the same result, may not be self-referential, and may not
   form a cycle. Delegations form a directed acyclic graph (DAG), and cycles are
-  rejected at validation time.
+  rejected at validation time. By default a dependent leg runs *blind* to its
+  deps' outputs. The opt-in `[orchestrate].inject_upstream_dep_context = true`
+  (#419) makes `deps[]` real dataflow: when a ready dependent leg is enqueued,
+  each succeeded direct dep's result (decision, summary preview, PR link,
+  `changes_made` count, short HeadSHA, then the fenced `artifact_body`) is
+  appended to the dependent's prompt as a byte-budgeted "Upstream dependency
+  results" block, with the same size caps as artifact-body inlining. Off by
+  default; with the flag off the enqueued prompt is byte-identical.
 - `failure_policy` (optional): one of `block_parent`, `continue`, `escalate`, or
   `escalate_human`. Defaults to `block_parent` when omitted.
   - `block_parent` — a failed child blocks the shared parent task (terminal).

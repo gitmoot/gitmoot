@@ -205,11 +205,11 @@ func TestAgentKeychainGrantsAreProxiedOnlyAndDeletionCleansBothPaths(t *testing.
 	if grants, err := store.ListKeychainGrants(ctx, "PROXY"); err != nil || len(grants) != 1 || grants[0].ConsumerID != "checked-seat" {
 		t.Fatalf("grants after RemoveAgent = %+v err=%v", grants, err)
 	}
-	if err := store.DeleteAgentChecked(ctx, "checked-seat"); err != nil {
-		t.Fatalf("DeleteAgentChecked: %v", err)
+	if _, err := store.RemoveAgent(ctx, "checked-seat"); err != nil {
+		t.Fatalf("RemoveAgent: %v", err)
 	}
 	if grants, err := store.ListKeychainGrants(ctx, "PROXY"); err != nil || len(grants) != 0 {
-		t.Fatalf("grants after DeleteAgentChecked = %+v err=%v", grants, err)
+		t.Fatalf("grants after RemoveAgent = %+v err=%v", grants, err)
 	}
 	if changed, err := store.GrantKeychainKey(ctx, KeychainConsumerAgent, "missing-seat", "PROXY"); changed || !errors.Is(err, ErrKeychainConsumerNotFound) {
 		t.Fatalf("missing agent grant = changed %v err %v", changed, err)
