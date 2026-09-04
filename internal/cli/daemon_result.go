@@ -180,7 +180,7 @@ func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, observed
 	if latest.Type == "implement" && runtimePermissionFailure(cause) {
 		payload, payloadErr := daemonJobPayload(latest)
 		if payloadErr != nil || payload.Result == nil {
-			transitioned, err := markJobPermissionBlockedAtGeneration(ctx, w.Store, jobID, observed.generation)
+			transitioned, blockedFrom, err := markJobPermissionBlockedAtGeneration(ctx, w.Store, jobID, observed.generation)
 			if err != nil {
 				return err
 			}
@@ -194,19 +194,27 @@ func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, observed
 				// once here. The following finalizePreflightDelegationChild only attaches
 				// a synthetic result (savePayload, no transition), so it never re-emits.
 				emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, jobID, daemonTerminalPermissionGuard, string(workflow.JobBlocked), agentPermissionBlockedMessage)
-				// A WRITABLE implement DELEGATION child whose runtime fails MID-RUN
-				// with a permission error (read-only FS / sandbox denies write) is
-				// transitioned JobRunning->JobBlocked here and returns early — it never
-				// reaches the ParentJobID finalize branch below, so the parent DAG
-				// strands exactly like #409 (the mid-run sibling of the pre-flight
-				// read-only-implement case fixed at ~2127). It advances the DAG through
-				// the same terminalizer, but this child DID RUN, so it records the
-				// MID-RUN cause: "refused before it ran" would be false of it and the
-				// timeout kind would assert a deadline that never expired (#1512). The
-				// helper no-ops for a non-delegation job (ParentJobID empty) or one that
-				// already stored a result, so the solo-implement case stays
-				// byte-identical.
-				if err := w.finalizeMidRunDelegationChild(ctx, jobID, errors.New(agentPermissionBlockedMessage)); err != nil {
+				// A WRITABLE implement DELEGATION child whose runtime fails with a
+				// permission error (read-only FS / sandbox denies write) is transitioned
+				// to JobBlocked here and returns early — it never reaches the
+				// ParentJobID finalize branch below, so the parent DAG strands exactly
+				// like #409 (the mid-run sibling of the pre-flight read-only-implement
+				// case fixed at ~2127). It advances the DAG through the same
+				// terminalizer either way, but the RECORDED CAUSE comes from the
+				// TRANSITION'S MATCHED SOURCE STATE, never from the error's shape
+				// (#1848). The CAS accepts JobQueued, JobRunning or JobFailed
+				// (agent_permissions.go:47), so this branch is reached by a child that
+				// never started as well as by one that did; keying on the error labelled
+				// a never-claimed child "failed mid-run". The matched arm is the only
+				// witness of which happened — a pre-write read cannot be, because the
+				// #1407 window sits between that read and this write. Both helpers
+				// no-op for a non-delegation job (ParentJobID empty) or one that already
+				// stored a result, so the solo-implement case stays byte-identical.
+				finalize := w.finalizeMidRunDelegationChild
+				if blockedFrom == workflow.JobQueued {
+					finalize = w.finalizePreflightDelegationChild
+				}
+				if err := finalize(ctx, jobID, errors.New(agentPermissionBlockedMessage)); err != nil {
 					return err
 				}
 				return nil
