@@ -743,7 +743,7 @@ func TestNativeReviewWorktreeHardFailureStaysTerminalForLensChild(t *testing.T) 
 	if payload.Result == nil || payload.Result.Decision != "failed" {
 		t.Fatalf("unallocatable-head lens child result = %+v, want a synthetic failed verdict", payload.Result)
 	}
-	if !blockerE2EHasEventKind(t, store, jobID, "delegation_timeout_finalized") {
+	if !blockerE2EHasEventKind(t, store, jobID, "delegation_refused_finalized") {
 		t.Fatal("unallocatable-head lens child never ran finalizePreflightDelegationChild")
 	}
 	if runErr == nil || !strings.Contains(runErr.Error(), parentID) {

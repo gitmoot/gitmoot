@@ -99,12 +99,19 @@ func (w jobWorker) afterQueuedJobTransition(ctx context.Context, jobID string, s
 // that was just transitioned queued→failed in a daemon pre-flight step, so the
 // delegation's failure_policy fires exactly as it would for a runtime failure.
 // It is a no-op for a non-delegation job or a child that already stored a result
-// (finalizeTimedOutDelegationChild / Engine.FinalizeTimedOutDelegationChild are
+// (finalizeRefusedDelegationChild / Engine.FinalizeRefusedDelegationChild are
 // idempotent), so a re-run (retry / stale-running recovery) re-enters cleanly. It
 // mirrors handleRunJobError (~4169-4189): an AwaitingHumanError (escalate_human
 // paused the tree awaiting a human, #340) and a BlockedError (block_parent blocked
 // the shared parent task) are EXPECTED terminal outcomes of advancing the DAG, not
 // errors to propagate.
+//
+// The child reaching here NEVER RAN: the pre-flight refused it before any adapter
+// was built, any prompt was delivered, or any deadline started. It therefore
+// finalizes through the REFUSED path, not the timeout one. Recording it as a
+// timeout that "ended without a result" asserted both an elapsed deadline and a
+// run, neither of which happened, and made refusals indistinguishable from real
+// timeouts in the event stream (#1512).
 func (w jobWorker) finalizePreflightDelegationChild(ctx context.Context, jobID string, cause error) error {
 	job, err := w.Store.GetJob(ctx, jobID)
 	if err != nil {
@@ -114,7 +121,7 @@ func (w jobWorker) finalizePreflightDelegationChild(ctx context.Context, jobID s
 	if payloadErr != nil || strings.TrimSpace(payload.ParentJobID) == "" || payload.Result != nil {
 		return nil
 	}
-	if _, finalizeErr := w.finalizeTimedOutDelegationChild(ctx, job, cause); finalizeErr != nil {
+	if _, finalizeErr := w.finalizeRefusedDelegationChild(ctx, job, cause); finalizeErr != nil {
 		var awaiting workflow.AwaitingHumanError
 		if errors.As(finalizeErr, &awaiting) {
 			return nil
@@ -332,6 +339,24 @@ func (w jobWorker) finalizeTimedOutDelegationChild(ctx context.Context, job db.J
 	}
 	engine := w.workflowForJob(w.delegationParentCheckout(ctx, job), runner)
 	return engine.FinalizeTimedOutDelegationChild(ctx, job.ID, reason)
+}
+
+// finalizeRefusedDelegationChild is finalizeTimedOutDelegationChild's sibling for
+// a child that was REFUSED BEFORE IT RAN by a daemon pre-flight — a checkout head
+// the leg's pinned head can never match, a dirty tree, a blocked permission. It
+// takes the same engine terminalizer and drives the same parent DAG advancement,
+// so the delegation's failure_policy is unchanged; only the recorded cause
+// differs, and that is the whole point. The old message asserted the child "ended
+// without a result", which reads as a child that ran and returned nothing, on a
+// leg that never started (#1512).
+func (w jobWorker) finalizeRefusedDelegationChild(ctx context.Context, job db.Job, cause error) (bool, error) {
+	reason := fmt.Sprintf("delegation child %s was refused before it ran and never started: %v", job.ID, cause)
+	runner, err := w.subprocessRunnerForJob(job)
+	if err != nil {
+		return false, err
+	}
+	engine := w.workflowForJob(w.delegationParentCheckout(ctx, job), runner)
+	return engine.FinalizeRefusedDelegationChild(ctx, job.ID, reason)
 }
 
 // delegationParentCheckout returns the repo's main registered checkout for a

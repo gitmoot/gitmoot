@@ -214,8 +214,8 @@ func TestPreflightDelegationChildEscalateHumanPausesTree(t *testing.T) {
 		t.Fatal("escalate_human pause must NOT enqueue a continuation")
 	}
 	// The DAG advance was recorded (the finalize bridge ran).
-	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_timeout_finalized"); got != 1 {
-		t.Fatalf("delegation_timeout_finalized events = %d, want 1", got)
+	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_refused_finalized"); got != 1 {
+		t.Fatalf("delegation_refused_finalized events = %d, want 1", got)
 	}
 
 	// Idempotency: a second tick is a no-op — the child already has a result, so
@@ -282,8 +282,8 @@ func TestPreflightDelegationChildFailurePolicies(t *testing.T) {
 			if cp.Result == nil {
 				t.Fatalf("child result = nil, want a synthetic result so advanceDelegations ran")
 			}
-			if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_timeout_finalized"); got != 1 {
-				t.Fatalf("delegation_timeout_finalized events = %d, want 1", got)
+			if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_refused_finalized"); got != 1 {
+				t.Fatalf("delegation_refused_finalized events = %d, want 1", got)
 			}
 
 			if tc.wantTask != "" {
@@ -388,8 +388,8 @@ func TestPreflightCancelledChildIsNotForceFinalized(t *testing.T) {
 	if cp.Result != nil {
 		t.Fatalf("cancelled child must NOT get a synthetic result: %+v", cp.Result)
 	}
-	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_timeout_finalized"); got != 0 {
-		t.Fatalf("delegation_timeout_finalized events = %d, want 0 for a cancelled child", got)
+	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_refused_finalized"); got != 0 {
+		t.Fatalf("delegation_refused_finalized events = %d, want 0 for a cancelled child", got)
 	}
 	// The parent must not be paused by a cancelled child.
 	if jobExistsForWorker(t, h.store, "parent-job/continuation") {
@@ -474,8 +474,8 @@ func TestPreflightDelegationChildBlockedAdvancesParent(t *testing.T) {
 		t.Fatalf("child result = %+v, want a synthetic failed result", cp.Result)
 	}
 	// The finalize bridge ran exactly once.
-	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_timeout_finalized"); got != 1 {
-		t.Fatalf("delegation_timeout_finalized events = %d, want 1", got)
+	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_refused_finalized"); got != 1 {
+		t.Fatalf("delegation_refused_finalized events = %d, want 1", got)
 	}
 	// The DAG advanced and escalate_human fired: the shared parent task is paused
 	// awaiting a human and the human was notified once with the resume context.
@@ -496,8 +496,8 @@ func TestPreflightDelegationChildBlockedAdvancesParent(t *testing.T) {
 	if err := h.worker.run(ctx, child2); err != nil {
 		t.Fatalf("second worker.run(child) returned error: %v", err)
 	}
-	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_timeout_finalized"); got != 1 {
-		t.Fatalf("delegation_timeout_finalized events after second tick = %d, want 1 (idempotent)", got)
+	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_refused_finalized"); got != 1 {
+		t.Fatalf("delegation_refused_finalized events after second tick = %d, want 1 (idempotent)", got)
 	}
 	if len(h.notifier.calls) != 1 {
 		t.Fatalf("notifier calls after second tick = %d, want 1 (idempotent)", len(h.notifier.calls))
@@ -553,8 +553,8 @@ func TestPreflightReadOnlyImplementDelegationChildAdvancesParent(t *testing.T) {
 	if cp.Result == nil || cp.Result.Decision != "failed" {
 		t.Fatalf("child result = %+v, want a synthetic failed result (finalize must run for a delegation child)", cp.Result)
 	}
-	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_timeout_finalized"); got != 1 {
-		t.Fatalf("delegation_timeout_finalized events = %d, want 1", got)
+	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_refused_finalized"); got != 1 {
+		t.Fatalf("delegation_refused_finalized events = %d, want 1", got)
 	}
 	// The DAG advanced and escalate_human fired for the read-only-implement leg.
 	if got := workerTaskState(t, h.store, "task-5"); got != string(workflow.TaskAwaitingHuman) {
@@ -569,8 +569,8 @@ func TestPreflightReadOnlyImplementDelegationChildAdvancesParent(t *testing.T) {
 	if err := h.worker.run(ctx, child2); err != nil {
 		t.Fatalf("second worker.run(child) returned error: %v", err)
 	}
-	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_timeout_finalized"); got != 1 {
-		t.Fatalf("delegation_timeout_finalized events after second tick = %d, want 1 (idempotent)", got)
+	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_refused_finalized"); got != 1 {
+		t.Fatalf("delegation_refused_finalized events after second tick = %d, want 1 (idempotent)", got)
 	}
 	if len(h.notifier.calls) != 1 {
 		t.Fatalf("notifier calls after second tick = %d, want 1 (idempotent)", len(h.notifier.calls))
@@ -615,8 +615,8 @@ func TestPreflightReadOnlyImplementNonDelegationUnaffected(t *testing.T) {
 	if cp.Result != nil {
 		t.Fatalf("non-delegation permission-blocked job must NOT get a synthetic result: %+v", cp.Result)
 	}
-	if n := countWorkerJobEvents(t, store, "impl-job", "delegation_timeout_finalized"); n != 0 {
-		t.Fatalf("delegation_timeout_finalized events = %d, want 0 for a non-delegation job", n)
+	if n := countWorkerJobEvents(t, store, "impl-job", "delegation_refused_finalized"); n != 0 {
+		t.Fatalf("delegation_refused_finalized events = %d, want 0 for a non-delegation job", n)
 	}
 }
 
@@ -751,8 +751,8 @@ func TestPreflightEphemeralDelegationChildAdvancesParent(t *testing.T) {
 	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "ephemeral_worker_failed"); got != 1 {
 		t.Fatalf("ephemeral_worker_failed events = %d, want 1 (the ephemeral wrapper path was taken)", got)
 	}
-	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_timeout_finalized"); got != 1 {
-		t.Fatalf("delegation_timeout_finalized events = %d, want 1", got)
+	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_refused_finalized"); got != 1 {
+		t.Fatalf("delegation_refused_finalized events = %d, want 1", got)
 	}
 	// The DAG advanced and escalate_human fired.
 	if got := workerTaskState(t, h.store, "task-5"); got != string(workflow.TaskAwaitingHuman) {
@@ -819,8 +819,8 @@ func TestMidRunPermissionBlockedDelegationChildAdvancesParent(t *testing.T) {
 		t.Fatalf("child result = %+v, want a synthetic failed result", cp.Result)
 	}
 	// The finalize bridge ran exactly once.
-	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_timeout_finalized"); got != 1 {
-		t.Fatalf("delegation_timeout_finalized events = %d, want 1", got)
+	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_refused_finalized"); got != 1 {
+		t.Fatalf("delegation_refused_finalized events = %d, want 1", got)
 	}
 	// The DAG advanced and escalate_human fired: the shared parent task is paused
 	// awaiting a human and the human was notified once with the resume context.
@@ -841,8 +841,8 @@ func TestMidRunPermissionBlockedDelegationChildAdvancesParent(t *testing.T) {
 	if err := h.worker.run(ctx, child2); err != nil {
 		t.Fatalf("second worker.run(child) returned error: %v", err)
 	}
-	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_timeout_finalized"); got != 1 {
-		t.Fatalf("delegation_timeout_finalized events after second tick = %d, want 1 (idempotent)", got)
+	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_refused_finalized"); got != 1 {
+		t.Fatalf("delegation_refused_finalized events after second tick = %d, want 1 (idempotent)", got)
 	}
 	if len(h.notifier.calls) != 1 {
 		t.Fatalf("notifier calls after second tick = %d, want 1 (idempotent)", len(h.notifier.calls))
@@ -875,8 +875,8 @@ func TestMidRunPermissionBlockedDelegationChildBlockParent(t *testing.T) {
 	if cp.Result == nil || cp.Result.Decision != "failed" {
 		t.Fatalf("child result = %+v, want a synthetic failed result", cp.Result)
 	}
-	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_timeout_finalized"); got != 1 {
-		t.Fatalf("delegation_timeout_finalized events = %d, want 1", got)
+	if got := countWorkerJobEvents(t, h.store, "parent-job/delegation/api", "delegation_refused_finalized"); got != 1 {
+		t.Fatalf("delegation_refused_finalized events = %d, want 1", got)
 	}
 	if got := workerTaskState(t, h.store, "task-5"); got != string(workflow.TaskBlocked) {
 		t.Fatalf("task state = %q, want blocked (block_parent fired for the mid-run permission-blocked child)", got)
@@ -933,8 +933,8 @@ func TestMidRunPermissionBlockedNonDelegationUnaffected(t *testing.T) {
 	if cp.Result != nil {
 		t.Fatalf("non-delegation permission-blocked job must NOT get a synthetic result: %+v", cp.Result)
 	}
-	if n := countWorkerJobEvents(t, store, "impl-job", "delegation_timeout_finalized"); n != 0 {
-		t.Fatalf("delegation_timeout_finalized events = %d, want 0 for a non-delegation job", n)
+	if n := countWorkerJobEvents(t, store, "impl-job", "delegation_refused_finalized"); n != 0 {
+		t.Fatalf("delegation_refused_finalized events = %d, want 0 for a non-delegation job", n)
 	}
 	// Exactly one engine build (RunJob's), proving the finalize helper short-circuited
 	// for the non-delegation job rather than rebuilding the engine to advance a DAG.
