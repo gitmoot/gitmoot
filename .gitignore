@@ -5,9 +5,25 @@
 /gitmoot
 /*.log
 
-# A credential file. It is written to the gitmoot home; if it ever appears in
-# the work tree that is a defect (#1810), but never let it be committed.
+# CREDENTIAL-BEARING OVERLAY FILENAMES (#1810). Every name here is one this
+# codebase RESOLVES AND READS as a credential input, enumerated from the
+# resolver rather than from memory:
+#   runtime-auth.env      internal/cli/daemon_runtime_auth.go:24 (runtimeAuthFileName)
+#   daemon-runtime.env    internal/cli/daemon_runtime_auth.go:25 (legacyRuntimeAuthFileName)
+#   .credentials.json     internal/cli/daemon_worker.go:1649, readonly_seat_credential.go:71
+#   auth.json             internal/cli/daemon_worker.go:1654 (codex)
+#   kimi-code.json        internal/cli/daemon_worker.go:1660 (kimi)
+# The feature's contract is "read a credential overlay out of a directory", so
+# the host that exercises it will produce these files in a work tree. None of
+# them is a tracked repository artifact - verified with git ls-files before
+# adding these rules - so ignoring them by name hides nothing legitimate.
 runtime-auth.env
 **/runtime-auth.env
+daemon-runtime.env
+**/daemon-runtime.env
 .credentials.json
 **/.credentials.json
+auth.json
+**/auth.json
+kimi-code.json
+**/kimi-code.json
