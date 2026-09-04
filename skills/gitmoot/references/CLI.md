@@ -3842,11 +3842,15 @@ Merge errors are not retried. Scheduled pipelines need both `allow_auto_merge` a
 the existing `allow_scheduled_writes` key. Omitting `merge` preserves human merge.
 Pending checks wait; skipped/neutral check-runs pass; failures block; and zero
 external statuses/checks always block regardless of `require_external_ci`. The
-source job atomically records `pipeline_auto_merge_claim` before the write and
-`pipeline_auto_merge_confirmed` after GitHub confirms it. A workload-mode
+source job atomically records `pipeline_auto_merge_claim` before the write,
+`pipeline_auto_merge_claim_at` for the claim's age, and
+`pipeline_auto_merge_confirmed` after GitHub confirms it. A scan that loses the
+claim never parks the run; past 15m it records
+`pipeline_auto_merge_claim_orphaned` and keeps waiting. A workload-mode
 reconciliation hold records `pipeline_auto_merge_held` with its cause, releases
 the claim so the merge is re-attempted when the row lands, and parks with that
-cause at the gate `timeout` or 6h after the hold began when no timeout is set.
+cause at the gate `timeout` or 24h after the hold began when no timeout is set;
+the episode is keyed on the head and the decision, not on the cause text.
 
 `pipeline install-defaults` installs the built-in memory pipelines
 `memory-ingest-sweep` and `memory-groom-propose`. The daemon also runs this

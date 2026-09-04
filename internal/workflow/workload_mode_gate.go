@@ -184,20 +184,41 @@ type operatingModeDecision struct {
 	unreadableWhy string
 }
 
-func ensureWorkloadModeReconciled(ctx context.Context, store *db.Store, gh MergeGateGitHub, repo github.Repository, number int64, headSHA string) (required, reconciled bool, reason string, err error) {
+// workloadModeHold is one reconciliation hold, split into the two things a
+// caller needs for different reasons.
+//
+// `detail` is the operator-facing cause and deliberately carries VOLATILE
+// context: whichever near-miss row the scan saw last, note ids, row heads, and
+// a scan-window notice that appears once the window fills. `key` is the STABLE
+// discriminator for the hold's EPISODE - the head and the decision it must
+// reconcile against - and nothing else.
+//
+// They are separate because the pipeline keys a hold episode's budget on the
+// cause. Keying it on `detail` let external churn reset the bound: one new
+// reconciliation row anywhere in the repo changes the appended near-miss, which
+// opened a fresh episode with a full budget and appended another held row, so a
+// repo whose notes churn could defer the bound indefinitely - the unbounded
+// silent wait this campaign exists to remove, reachable with no code defect at
+// all (#1783 round-5 review, F-11).
+type workloadModeHold struct {
+	key    string
+	detail string
+}
+
+func ensureWorkloadModeReconciled(ctx context.Context, store *db.Store, gh MergeGateGitHub, repo github.Repository, number int64, headSHA string) (required, reconciled bool, hold workloadModeHold, err error) {
 	observed, err := inspectModeSensitivePullRequest(ctx, gh, repo, number)
 	if err != nil {
-		return false, false, "", err
+		return false, false, workloadModeHold{}, err
 	}
 	if !observed.required {
-		return false, true, "", nil
+		return false, true, workloadModeHold{}, nil
 	}
 	if store == nil {
-		return true, false, "", fmt.Errorf("workload-mode reconciliation requires a store")
+		return true, false, workloadModeHold{}, fmt.Errorf("workload-mode reconciliation requires a store")
 	}
 	decision, err := latestOperatingModeDecision(ctx, store, repo.FullName())
 	if err != nil {
-		return true, false, "", err
+		return true, false, workloadModeHold{}, err
 	}
 	// An UNREADABLE newest decision is not "no decision". Skipping it returned
 	// id==0, which dropped the supersession check AND made decision_note=none
@@ -223,10 +244,13 @@ func ensureWorkloadModeReconciled(ctx context.Context, store *db.Store, gh Merge
 		if observed.patchUnavailable {
 			remedy = "GitHub omitted this PR's AGENTS.md patch, so the marker cannot be read here and is not the author's to fix; " + remedy
 		}
-		return true, false, fmt.Sprintf(
-			"workload-mode change cannot be reconciled: operating-mode note %d %s and this PR's own mode marker is missing or ambiguous, so no readable decision remains; %s",
-			decision.unreadableID, decision.unreadableWhy, remedy,
-		), nil
+		return true, false, workloadModeHold{
+			key: fmt.Sprintf("head=%s unreadable-note=%d", strings.TrimSpace(headSHA), decision.unreadableID),
+			detail: fmt.Sprintf(
+				"workload-mode change cannot be reconciled: operating-mode note %d %s and this PR's own mode marker is missing or ambiguous, so no readable decision remains; %s",
+				decision.unreadableID, decision.unreadableWhy, remedy,
+			),
+		}, nil
 	}
 	expectedMode := strings.ToUpper(strings.TrimSpace(observed.mode))
 	if expectedMode == "" && decision.id > 0 {
@@ -244,7 +268,7 @@ func ensureWorkloadModeReconciled(ctx context.Context, store *db.Store, gh Merge
 	}
 	notes, err := store.ListRepoWorkflowNotesByBodyPrefix(ctx, modeReconciliationNotePrefix, repo.FullName(), workloadModeReconciliationScan)
 	if err != nil {
-		return true, false, "", fmt.Errorf("list workload-mode reconciliation notes: %w", err)
+		return true, false, workloadModeHold{}, fmt.Errorf("list workload-mode reconciliation notes: %w", err)
 	}
 	// Two rejections used to be silent, and the #1783 review found both.
 	//
@@ -305,12 +329,12 @@ func ensureWorkloadModeReconciled(ctx context.Context, store *db.Store, gh Merge
 		cited := strings.TrimSpace(fields["decision_note"])
 		if cited == "none" {
 			// PR-sourced: this PR is the decision, so no earlier note must agree.
-			return true, true, "", nil
+			return true, true, workloadModeHold{}, nil
 		}
 		// A row may cite the unreadable note itself: it names what the coordinator
 		// saw, and the mode check above already bound it to the PR's marker.
 		if decision.unreadableID > 0 && cited == strconv.FormatInt(decision.unreadableID, 10) {
-			return true, true, "", nil
+			return true, true, workloadModeHold{}, nil
 		}
 		if cited != decisionID {
 			nearMiss = fmt.Sprintf("; row %d cites decision_note=%s but the newest operating-mode note is %s", note.ID, cited, decisionID)
@@ -320,7 +344,7 @@ func ensureWorkloadModeReconciled(ctx context.Context, store *db.Store, gh Merge
 			nearMiss = fmt.Sprintf("; row %d cites operating-mode note %d, which decided %s, so it cannot ratify %s", note.ID, decision.id, decision.mode, mode)
 			continue
 		}
-		return true, true, "", nil
+		return true, true, workloadModeHold{}, nil
 	}
 	detail := fmt.Sprintf("workload-mode change requires reconciliation at head %s against operating-mode note %s", shortSHA(headSHA), decisionID)
 	if observed.ambiguous {
@@ -347,7 +371,13 @@ func ensureWorkloadModeReconciled(ctx context.Context, store *db.Store, gh Merge
 		nearMiss = misfiledReconciliationRow(ctx, store, repo.FullName(), number, headSHA)
 	}
 	detail += nearMiss
-	return true, false, detail, nil
+	// The key names the head and the decision the row must reconcile against,
+	// and stops there. Every string appended above is volatile by design, and an
+	// episode keyed on volatile text has no bound (#1783 round-5 review, F-11).
+	return true, false, workloadModeHold{
+		key:    fmt.Sprintf("head=%s decision-note=%s mode=%s", strings.TrimSpace(headSHA), decisionID, expectedMode),
+		detail: detail,
+	}, nil
 }
 
 // misfiledReconciliationRow finds a row that names THIS repo in its body but was

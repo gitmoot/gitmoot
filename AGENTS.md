@@ -508,10 +508,17 @@ RELEASES its at-most-once merge claim, records the cause as a
 `pipeline_auto_merge_held` job event, and re-attempts on a later scan, so the
 row landing merges. It is also BOUNDED, and the bound applies on both the
 ordinary Evaluate path and the merge boundary: with a gate `timeout` the stage
-parks at that timeout carrying the cause, and with no `timeout` it parks 6h
-after the hold episode began. A hold whose cause or head changes starts a new
-episode with a fresh budget, so a later hold is never charged for an earlier
-one.
+parks at that timeout carrying the cause, and with no `timeout` it parks 24h
+after the hold episode began, with the park summary naming the `timeout` as the
+lever. A hold against a new head or a new DECISION starts a new episode with a
+fresh budget, so a later hold is never charged for an earlier one - but a
+changed CAUSE alone does not, because the cause carries volatile near-miss
+detail and keying on it let unrelated churn defer the bound indefinitely.
+A scan that LOSES the at-most-once claim is a separate case and never parks the
+run: it cannot see whether the winner is alive, and a hold record has no expiry,
+so believing one killed runs whose reconciliation had already succeeded. Past
+15m of a held claim it records `pipeline_auto_merge_claim_orphaned` and keeps
+waiting; a stage `timeout` is what turns that into a park.
 
 Resolve the active decision from both durable sources: read the marker from
 `origin/main:AGENTS.md`, never a seat worktree, and read the newest typed

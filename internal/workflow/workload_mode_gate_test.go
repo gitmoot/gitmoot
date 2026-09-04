@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -870,6 +871,87 @@ func TestWorkloadModeGateBoundaryToleratesHandWrittenRepoFields(t *testing.T) {
 					decision, decision.Reason.Render())
 			}
 		})
+	}
+}
+
+// F-11 at the SOURCE. The pipeline keys a hold episode's budget on this key, so
+// the key must not move when the operator-facing detail does. Driven through
+// Evaluate, because a pipeline test that injects a key through a stub pins the
+// stub, not the construction.
+func TestPipelineAutoMergerReconciliationKeyIgnoresVolatileDetail(t *testing.T) {
+	store, gh, _, _ := newWorkloadModeGateScenario(t)
+	decision := insertOperatingModeDecision(t, store, "STEADY")
+	// A row for the WRONG head: reconciliation still holds, and the hold's detail
+	// names this row as the near miss.
+	insertModeReconciliation(t, store, decision, "STEADY", "otherhead1")
+	merger := PipelineAutoMerger{Store: store, GitHub: gh}
+	request := PipelineAutoMergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, HeadSHA: "head123", Pipeline: "release", RunID: "run-1", StageID: "merge"}
+
+	first, err := merger.Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if !first.ReconciliationHold || strings.TrimSpace(first.ReconciliationKey) == "" {
+		t.Fatalf("readiness = %+v, want a keyed reconciliation hold", first)
+	}
+
+	// Churn in the volatile half: the same hold, same head, same decision, but
+	// the marker patch now reads as ambiguous, which appends a clause to the
+	// detail. The DETAIL must move and the KEY must not.
+	gh.files = []github.PullRequestFile{{
+		Filename: "AGENTS.md",
+		Patch:    "@@ -1 +1 @@\n-**Current mode: DRAIN.**",
+	}}
+	second, err := merger.Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Evaluate after churn: %v", err)
+	}
+	if second.Reason == first.Reason {
+		t.Fatalf("this fixture must change the detail, or it proves nothing: %q", second.Reason)
+	}
+	if second.ReconciliationKey != first.ReconciliationKey {
+		t.Fatalf("episode key moved with the detail: %q then %q - external churn would reset the hold's budget",
+			first.ReconciliationKey, second.ReconciliationKey)
+	}
+	// And the key must not simply embed the detail, which would key on churn
+	// while comparing equal in this pair by accident.
+	if strings.Contains(first.ReconciliationKey, "otherhead1") || strings.Contains(first.ReconciliationKey, "near") {
+		t.Fatalf("episode key carries near-miss text: %q", first.ReconciliationKey)
+	}
+	for _, want := range []string{"head=head123", "decision-note=" + strconv.FormatInt(decision.ID, 10)} {
+		if !strings.Contains(first.ReconciliationKey, want) {
+			t.Fatalf("episode key %q must name %q", first.ReconciliationKey, want)
+		}
+	}
+}
+
+// Waiting carries a SAFETY PRECONDITION - no GitHub mutation was attempted -
+// because the pipeline RELEASES its at-most-once merge claim on a Waiting
+// return. The type says so, and a comment is not a guard: a mutant that mapped a
+// post-request merge error onto {Waiting: true} passed internal/workflow and
+// internal/pipeline fully green, because nothing pinned the mapping (#1783
+// round-5 review, F-9). A merge API error may have reached GitHub, so it must
+// surface as an ERROR, never as a releasable wait.
+func TestPipelineAutoMergerMergeNeverMapsAMutationErrorToWaiting(t *testing.T) {
+	store, gh, _, _ := newWorkloadModeGateScenario(t)
+	mode := insertOperatingModeDecision(t, store, "STEADY")
+	// Reconciliation satisfied, so Merge reaches the mutation rather than
+	// returning the legitimate reconciliation Waiting before it.
+	insertModeReconciliation(t, store, mode, "STEADY", "head123")
+	mergeErr := errors.New("merge API timed out after the request was sent")
+	gh.mergeErr = mergeErr
+	merger := PipelineAutoMerger{Store: store, GitHub: gh}
+	request := PipelineAutoMergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, HeadSHA: "head123", Pipeline: "release", RunID: "run-1", StageID: "merge"}
+
+	result, err := merger.Merge(context.Background(), request)
+	if !errors.Is(err, mergeErr) {
+		t.Fatalf("Merge error = %v, want the merge API error to surface", err)
+	}
+	if result.Waiting {
+		t.Fatalf("a refusal that may have reached GitHub must not set Waiting: %+v", result)
+	}
+	if result.Merged {
+		t.Fatalf("a failed merge must not report Merged: %+v", result)
 	}
 }
 

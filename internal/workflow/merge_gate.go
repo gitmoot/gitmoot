@@ -386,10 +386,10 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	if pr.Mergeable != nil && !*pr.Mergeable {
 		return g.block(ctx, request, headSHA, "pull request is not mergeable; rebase or update the branch", MergeBlockTransient)
 	}
-	if required, reconciled, reason, err := ensureWorkloadModeReconciled(ctx, g.Store, g.GitHub, repo, int64(request.PullRequest), headSHA); err != nil {
+	if required, reconciled, hold, err := ensureWorkloadModeReconciled(ctx, g.Store, g.GitHub, repo, int64(request.PullRequest), headSHA); err != nil {
 		return MergeDecision{}, err
 	} else if required && !reconciled {
-		return g.pending(ctx, request, headSHA, reason)
+		return g.pending(ctx, request, headSHA, hold.detail)
 	}
 	result, err := g.executePullRequestMergeFenced(ctx, request, github.MergePullRequestInput{
 		Repo:            repo,

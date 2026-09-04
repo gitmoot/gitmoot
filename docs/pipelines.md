@@ -614,16 +614,26 @@ stages:
   a merge API failure is tried once and never retry-spammed.
 - The source job timeline atomically records `pipeline_auto_merge_claim` before
   the write and `pipeline_auto_merge_confirmed` afterward, carrying pipeline/run,
-  stage, PR, and head SHA. Racing scans that lose the claim never call merge.
+  stage, PR, and head SHA, plus `pipeline_auto_merge_claim_at` carrying when the
+  claim was taken. The age row is released WITH the claim, so it measures only a
+  claim that still exists. Racing scans that lose the claim never call merge, and
+  never park the run either: a loser cannot see whether the winner is alive, so
+  once the claim has been held past 15m it records
+  `pipeline_auto_merge_claim_orphaned` and keeps waiting. A stage `timeout` is
+  what converts that wait into a park.
 - A workload-mode reconciliation hold is a THIRD event,
   `pipeline_auto_merge_held`, carrying the cause plus the head and the time the
   hold began. The hold is retryable, not terminal: the gate releases its
   at-most-once claim (safe because that refusal is returned before any GitHub
   mutation) and re-attempts on later scans, so the reconciliation row landing
   merges. It is also bounded — with a gate `timeout` the stage parks at that
-  timeout carrying the cause; with no `timeout` the hold parks 6h after the
-  episode began. A hold whose cause or head changes starts a new episode with a
-  fresh 6h budget.
+  timeout carrying the cause; with no `timeout` the hold parks 24h after the
+  episode began, and the park summary names the `timeout` as the way to change
+  that. An episode is keyed on the head and the DECISION the row must reconcile
+  against, not on the cause text: the cause deliberately carries volatile
+  near-miss detail, and keying on it let unrelated note churn hand every hold a
+  fresh budget. A hold against a new head or a new decision starts a new episode
+  with a fresh 24h budget.
 
 ### Orchestrate stages
 

@@ -1959,7 +1959,7 @@ func autoMergeGateStageSettleOutcome(ctx context.Context, deps pipelineStageSett
 			// Merge, so this is where a workload-mode hold actually surfaces;
 			// instrumenting only the Merge-side window left this branch silent,
 			// unrecorded and unbounded (#1783 round-4 review, F-1).
-			return autoMergeHoldOutcome(ctx, deps, stage, stageRow, sourceJobID, payload.PullRequest, reviewedHead, readiness.Reason)
+			return autoMergeHoldOutcome(ctx, deps, stage, stageRow, sourceJobID, payload.PullRequest, reviewedHead, readiness.ReconciliationKey, readiness.Reason)
 		}
 		return autoMergeGateWaiting(stage, stageRow, deps.now, payload.PullRequest)
 	}
@@ -1971,22 +1971,41 @@ func autoMergeGateStageSettleOutcome(ctx context.Context, deps pipelineStageSett
 	if marshalErr != nil {
 		return false, "", "", nil, nil, marshalErr
 	}
-	claimed, claimErr := deps.store.ClaimJobEvent(ctx, db.JobEvent{JobID: sourceJobID, Kind: "pipeline_auto_merge_claim", Message: string(claim)})
+	claimed, claimErr := deps.store.ClaimJobEvent(ctx, db.JobEvent{JobID: sourceJobID, Kind: autoMergeClaimEventKind, Message: string(claim)})
 	if claimErr != nil {
 		return false, "", "", nil, nil, claimErr
 	}
 	if !claimed {
 		// Another scan owns this exact run/stage/PR/head write. Do not call Merge;
-		// the next scan observes either the merged PR or the winner's fold. A hold
-		// already recorded for this head keeps its bound here too, so a lost
-		// release cannot park the run in an unbounded silent wait (F-3).
-		if held, holdErr := latestAutoMergeHold(ctx, deps.store, sourceJobID, reviewedHead); holdErr != nil {
-			return false, "", "", nil, nil, holdErr
-		} else if held.at.IsZero() {
-			return autoMergeGateWaiting(stage, stageRow, deps.now, payload.PullRequest)
-		} else {
-			return autoMergeHoldDisposition(stage, stageRow, deps.now, payload.PullRequest, held)
-		}
+		// the next scan observes either the merged PR or the winner's fold.
+		//
+		// This branch does NOT consult the reconciliation hold record, and must
+		// not. Reaching it means Evaluate reported Ready for this head IN THIS
+		// PASS, so any recorded hold has already been contradicted by a live
+		// measurement - and hold records are never cleared, so believing one
+		// terminally parked runs whose reconciliation had finished hours earlier,
+		// with a summary telling the operator to go fix it (#1783 round-5 review,
+		// F-10). The rule that settles: a scan may park a run terminally only on a
+		// condition it observed ITSELF in the same pass. A lost race is not that
+		// condition - the loser cannot see whether the winner is alive.
+		//
+		// It can still stop being SILENT, which was F-3's real complaint. The
+		// defect F-3 found is an ORPHANED claim: a winner that died between
+		// claiming and writing, or whose release failed, leaves the claim consumed
+		// and Merge never re-attempted. So a losing scan RECORDS the suspicion as
+		// a job event once the claim's own age passes the bound, and stays
+		// non-terminal and self-healing (#1783 round-4 review, F-3).
+		//
+		// Measured, because the obvious assumption is wrong: a waiting stage's
+		// summary is written only when it SETTLES, so the cause reaches a summary
+		// only if the stage has a `timeout` for pipelineGateTimedOut to fire. The
+		// durable record on the unbounded path is therefore the job event, not the
+		// summary - a probe through the advancer showed state="running" with an
+		// empty summary and the event present.
+		return autoMergeLostClaimOutcome(ctx, deps, stage, stageRow, sourceJobID, payload.PullRequest, reviewedHead)
+	}
+	if err := recordAutoMergeClaimAt(ctx, deps, stage, sourceJobID, payload.PullRequest, reviewedHead); err != nil {
+		return false, "", "", nil, nil, err
 	}
 
 	result, mergeErr := deps.autoMerge.Merge(ctx, request)
@@ -2013,13 +2032,20 @@ func autoMergeGateStageSettleOutcome(ctx context.Context, deps pipelineStageSett
 			// claim and no held event, after which every scan took the unbounded
 			// silent !claimed branch (#1783 round-4 review, F-3). Recording first
 			// means that branch finds the hold and keeps its bound.
-			held, holdErr := recordAutoMergeHold(ctx, deps, stage, sourceJobID, payload.PullRequest, reviewedHead, reason)
+			held, holdErr := recordAutoMergeHold(ctx, deps, stage, sourceJobID, payload.PullRequest, reviewedHead, autoMergeEpisodeKey(result.ReconciliationKey, reviewedHead), reason)
 			if holdErr != nil {
 				return false, "", "", nil, nil, holdErr
 			}
 			if _, releaseErr := deps.releaseAutoMergeClaim(ctx, db.JobEvent{
-				JobID: sourceJobID, Kind: "pipeline_auto_merge_claim", Message: string(claim),
+				JobID: sourceJobID, Kind: autoMergeClaimEventKind, Message: string(claim),
 			}); releaseErr != nil {
+				return false, "", "", nil, nil, releaseErr
+			}
+			// The claim's age row is released WITH the claim. That pairing is the
+			// whole reason the loser branch may trust it: the row exists exactly
+			// while the claim it measures does, so it cannot become the kind of
+			// never-cleared record that F-10 is about.
+			if releaseErr := releaseAutoMergeClaimAt(ctx, deps, stage, sourceJobID, payload.PullRequest, reviewedHead); releaseErr != nil {
 				return false, "", "", nil, nil, releaseErr
 			}
 			return autoMergeHoldDisposition(stage, stageRow, deps.now, payload.PullRequest, held)
@@ -2062,7 +2088,171 @@ func autoMergeGateWaitingWithReason(stage Stage, stageRow db.PipelineRunStage, n
 // timeout takes precedence. Tests pin the MAGNITUDE with a literal: deriving the
 // clock from this constant made a mutant that restores an unbounded wait
 // invisible (#1783 round-4 review, F-5).
-const autoMergeHoldMaxWait = 6 * time.Hour
+//
+// 24h, not the 6h this shipped with. The satisfying event is a HUMAN writing an
+// operating-mode note or a reconciliation row, and the park is terminal - a run
+// that needs an owner overnight, over a timezone, or across a weekend morning
+// exceeded 6h routinely and died on a hold that was progressing normally
+// (#1783 round-5 review, F-12). A repo that wants a shorter leash sets a stage
+// `timeout`, which still takes precedence in both directions.
+const autoMergeHoldMaxWait = 24 * time.Hour
+
+// autoMergeEpisodeKey is the episode discriminator, with the head as the floor.
+// Falling back to the CAUSE when a caller has no key would restore exactly the
+// volatile keying that let external churn reset the bound (#1783 round-5
+// review, F-11).
+func autoMergeEpisodeKey(key, head string) string {
+	if key = strings.TrimSpace(key); key != "" {
+		return key
+	}
+	return "head=" + strings.TrimSpace(head)
+}
+
+// autoMergeClaimOrphanAfter is how long the at-most-once merge claim may be held
+// by another scan before a losing scan says so out loud.
+//
+// It is not a park: the loser never learns whether the winner is alive, so it
+// may not end the run (#1783 round-5 review, F-10). A live winner holds the
+// claim for one Merge API call, so anything past this is either a winner that
+// died between claiming and writing or a release that failed - F-3's defect,
+// which used to be an unbounded SILENT wait. Tests pin the magnitude with a
+// literal, as with autoMergeHoldMaxWait.
+const autoMergeClaimOrphanAfter = 15 * time.Minute
+
+const (
+	autoMergeClaimEventKind       = "pipeline_auto_merge_claim"
+	autoMergeClaimAtEventKind     = "pipeline_auto_merge_claim_at"
+	autoMergeClaimOrphanEventKind = "pipeline_auto_merge_claim_orphaned"
+)
+
+// autoMergeClaimAtMessage is the companion row's exact content. The CLAIM row
+// itself cannot carry a timestamp: its message is the identity that makes
+// ClaimJobEvent's insert-if-absent at-most-once, so varying it would let every
+// scan win. The companion carries the pipeline's clock instead, and is released
+// with the claim, so its lifetime is exactly the claim's.
+func autoMergeClaimAtMessage(deps pipelineStageSettleDeps, stage Stage, pr int, head string) (string, error) {
+	message, err := json.Marshal(map[string]any{
+		"phase": "claim_at", "pipeline": deps.rec.Name, "run_id": deps.run.ID,
+		"stage_id": stage.ID, "pull_request": pr, "head_sha": head,
+		"claimed_at": deps.now.UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(message), nil
+}
+
+func recordAutoMergeClaimAt(ctx context.Context, deps pipelineStageSettleDeps, stage Stage, sourceJobID string, pr int, head string) error {
+	message, err := autoMergeClaimAtMessage(deps, stage, pr, head)
+	if err != nil {
+		return err
+	}
+	_, err = deps.store.ClaimJobEvent(ctx, db.JobEvent{JobID: sourceJobID, Kind: autoMergeClaimAtEventKind, Message: message})
+	return err
+}
+
+// releaseAutoMergeClaimAt drops the companion when the claim is released. A
+// leftover row - this delete failing after the claim's succeeded - can only be
+// OLDER than the next winner's, and the reader takes the newest, so the worst
+// case is that a suspicion is reported late rather than early.
+func releaseAutoMergeClaimAt(ctx context.Context, deps pipelineStageSettleDeps, stage Stage, sourceJobID string, pr int, head string) error {
+	message, err := autoMergeClaimAtMessage(deps, stage, pr, head)
+	if err != nil {
+		return err
+	}
+	_, err = deps.store.ReleaseJobEventClaim(ctx, db.JobEvent{JobID: sourceJobID, Kind: autoMergeClaimAtEventKind, Message: message})
+	return err
+}
+
+// latestAutoMergeClaimAt reports when the CURRENT claim for this head was taken,
+// or the zero time when nothing recorded it. Newest wins: see
+// releaseAutoMergeClaimAt for why that is the safe direction.
+func latestAutoMergeClaimAt(ctx context.Context, store *db.Store, sourceJobID, head string) (time.Time, error) {
+	events, err := store.ListJobEvents(ctx, sourceJobID)
+	if err != nil {
+		return time.Time{}, err
+	}
+	var newest time.Time
+	for _, event := range events {
+		if event.Kind != autoMergeClaimAtEventKind {
+			continue
+		}
+		var body struct {
+			HeadSHA   string `json:"head_sha"`
+			ClaimedAt string `json:"claimed_at"`
+		}
+		if json.Unmarshal([]byte(event.Message), &body) != nil {
+			continue
+		}
+		if strings.TrimSpace(body.HeadSHA) != strings.TrimSpace(head) {
+			continue
+		}
+		at, parseErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(body.ClaimedAt))
+		if parseErr != nil {
+			continue
+		}
+		if at = at.UTC(); newest.IsZero() || at.After(newest) {
+			newest = at
+		}
+	}
+	return newest, nil
+}
+
+// autoMergeLostClaimOutcome is the losing scan's disposition. It is ALWAYS
+// non-terminal on its own account: the only terminal exit is the operator's own
+// stage `timeout`, applied by autoMergeGateWaitingWithReason.
+//
+// The trade this makes, stated rather than hidden: with no stage `timeout`, a
+// genuinely orphaned claim waits indefinitely. That is deliberate. The loser
+// cannot tell an orphan from a live winner, and round 5 measured what happens
+// when it guesses - a terminal park on a run that was merging fine. So the cause
+// becomes a durable job event an operator can query, and the operator's own
+// `timeout` remains the lever that converts it into a park.
+func autoMergeLostClaimOutcome(ctx context.Context, deps pipelineStageSettleDeps, stage Stage, stageRow db.PipelineRunStage, sourceJobID string, pr int, head string) (bool, string, string, []string, *db.PipelineRunStage, error) {
+	claimedAt, err := latestAutoMergeClaimAt(ctx, deps.store, sourceJobID, head)
+	if err != nil {
+		return false, "", "", nil, nil, err
+	}
+	if claimedAt.IsZero() {
+		// Nothing recorded the claim, so nothing is known about its age. Waiting
+		// with no cause is the honest report.
+		return autoMergeGateWaiting(stage, stageRow, deps.now, pr)
+	}
+	held := deps.now.Sub(claimedAt)
+	if held < autoMergeClaimOrphanAfter {
+		return autoMergeGateWaitingWithReason(stage, stageRow, deps.now, pr,
+			fmt.Sprintf("another scan holds the auto-merge claim for head %s (%s)", shortPipelineSHA(head), held.Truncate(time.Second)))
+	}
+	reason := fmt.Sprintf("the auto-merge claim for head %s has been held for %s with no merge and no release, which is the signature of a claim orphaned by a scan that stopped between claiming and writing; the run keeps re-observing and merges as soon as the claim is released, and setting a `timeout` on this gate stage is what turns this wait into a park",
+		shortPipelineSHA(head), held.Truncate(time.Second))
+	if err := recordAutoMergeClaimOrphanSuspicion(ctx, deps, stage, sourceJobID, pr, head, claimedAt); err != nil {
+		return false, "", "", nil, nil, err
+	}
+	return autoMergeGateWaitingWithReason(stage, stageRow, deps.now, pr, reason)
+}
+
+// recordAutoMergeClaimOrphanSuspicion writes the suspicion once per claim, so a
+// scan loop cannot append a row a minute. The claim's own timestamp is part of
+// the content, so a NEW claim gets a new row.
+//
+// The content carries NOTHING that changes between scans. The first version
+// embedded the rendered cause, which states the elapsed time, so every scan
+// wrote a different message and the dedup never matched - measured as 2 rows
+// from 2 losing scans. The elapsed time belongs in the stage summary, which is
+// regenerated per scan by design.
+func recordAutoMergeClaimOrphanSuspicion(ctx context.Context, deps pipelineStageSettleDeps, stage Stage, sourceJobID string, pr int, head string, claimedAt time.Time) error {
+	message, err := json.Marshal(map[string]any{
+		"phase": "claim_orphan_suspected", "pipeline": deps.rec.Name, "run_id": deps.run.ID,
+		"stage_id": stage.ID, "pull_request": pr, "head_sha": head,
+		"claimed_at": claimedAt.UTC().Format(time.RFC3339Nano),
+		"after":      autoMergeClaimOrphanAfter.String(),
+	})
+	if err != nil {
+		return err
+	}
+	_, err = deps.store.ClaimJobEvent(ctx, db.JobEvent{JobID: sourceJobID, Kind: autoMergeClaimOrphanEventKind, Message: string(message)})
+	return err
+}
 
 // autoMergeHold is one hold EPISODE: the cause, and when that cause was first
 // recorded for the current head. The bound is measured from the episode, not
@@ -2087,8 +2277,8 @@ type autoMergeHold struct {
 // insert rather than atomic, and that is deliberate: two scans racing the same
 // new episode write two rows with near-identical held_at values, and the episode
 // anchor takes the EARLIEST, so the duplicate is harmless.
-func recordAutoMergeHold(ctx context.Context, deps pipelineStageSettleDeps, stage Stage, sourceJobID string, pr int, head, reason string) (autoMergeHold, error) {
-	existing, err := autoMergeHoldEpisode(ctx, deps.store, sourceJobID, head, reason)
+func recordAutoMergeHold(ctx context.Context, deps pipelineStageSettleDeps, stage Stage, sourceJobID string, pr int, head, episodeKey, reason string) (autoMergeHold, error) {
+	existing, err := autoMergeHoldEpisode(ctx, deps.store, sourceJobID, head, episodeKey)
 	if err != nil {
 		return autoMergeHold{}, err
 	}
@@ -2100,7 +2290,8 @@ func recordAutoMergeHold(ctx context.Context, deps pipelineStageSettleDeps, stag
 		"phase": "held", "pipeline": deps.rec.Name, "run_id": deps.run.ID,
 		"stage_id": stage.ID, "pull_request": pr,
 		"head_sha": head, "reason": reason,
-		"held_at": held.at.Format(time.RFC3339Nano),
+		"episode_key": episodeKey,
+		"held_at":     held.at.Format(time.RFC3339Nano),
 	})
 	if marshalErr != nil {
 		return autoMergeHold{}, marshalErr
@@ -2116,16 +2307,22 @@ func recordAutoMergeHold(ctx context.Context, deps pipelineStageSettleDeps, stag
 const autoMergeHeldEventKind = "pipeline_auto_merge_held"
 
 // autoMergeHoldEpisode returns the earliest recorded hold for this head whose
-// cause matches `reason`, i.e. the start of the current episode. An empty
-// `reason` matches the newest recorded cause for that head, which is what the
-// !claimed branch needs when it has no reason of its own.
-func autoMergeHoldEpisode(ctx context.Context, store *db.Store, sourceJobID, head, reason string) (autoMergeHold, error) {
+// EPISODE KEY matches, i.e. the start of the current episode.
+//
+// It is called only by recordAutoMergeHold, i.e. only by a scan that has just
+// observed this hold for itself. There is deliberately NO "match whatever was
+// recorded last" mode: that mode existed for the !claimed branch, which had no
+// cause of its own, and it is what let a never-cleared record park a healthy run
+// (#1783 round-5 review, F-10). A caller with no observed cause has no business
+// reading a hold.
+func autoMergeHoldEpisode(ctx context.Context, store *db.Store, sourceJobID, head, episodeKey string) (autoMergeHold, error) {
 	events, err := store.ListJobEvents(ctx, sourceJobID)
 	if err != nil {
 		return autoMergeHold{}, err
 	}
 	type row struct {
 		at     time.Time
+		key    string
 		reason string
 	}
 	var rows []row
@@ -2134,9 +2331,10 @@ func autoMergeHoldEpisode(ctx context.Context, store *db.Store, sourceJobID, hea
 			continue
 		}
 		var body struct {
-			HeadSHA string `json:"head_sha"`
-			Reason  string `json:"reason"`
-			HeldAt  string `json:"held_at"`
+			HeadSHA    string `json:"head_sha"`
+			EpisodeKey string `json:"episode_key"`
+			Reason     string `json:"reason"`
+			HeldAt     string `json:"held_at"`
 		}
 		if json.Unmarshal([]byte(event.Message), &body) != nil {
 			continue
@@ -2153,50 +2351,36 @@ func autoMergeHoldEpisode(ctx context.Context, store *db.Store, sourceJobID, hea
 				continue
 			}
 		}
-		rows = append(rows, row{at: at.UTC(), reason: strings.TrimSpace(body.Reason)})
+		rows = append(rows, row{
+			at:     at.UTC(),
+			key:    strings.TrimSpace(body.EpisodeKey),
+			reason: strings.TrimSpace(body.Reason),
+		})
 	}
-	if len(rows) == 0 {
-		return autoMergeHold{}, nil
-	}
-	want := strings.TrimSpace(reason)
-	if want == "" {
-		newest := rows[0]
-		for _, candidate := range rows[1:] {
-			if candidate.at.After(newest.at) {
-				newest = candidate
-			}
-		}
-		want = newest.reason
-	}
-	episode := autoMergeHold{reason: want}
+	want := strings.TrimSpace(episodeKey)
+	var episode autoMergeHold
 	for _, candidate := range rows {
-		if candidate.reason != want {
+		if candidate.key != want {
 			continue
 		}
 		if episode.at.IsZero() || candidate.at.Before(episode.at) {
 			episode.at = candidate.at
+			episode.reason = candidate.reason
 		}
 	}
 	return episode, nil
-}
-
-// latestAutoMergeHold reports the current episode for a head with no reason in
-// hand, for the !claimed branch: a hold recorded by the scan that lost its
-// release must still bound this one (#1783 round-4 review, F-3).
-func latestAutoMergeHold(ctx context.Context, store *db.Store, sourceJobID, head string) (autoMergeHold, error) {
-	return autoMergeHoldEpisode(ctx, store, sourceJobID, head, "")
 }
 
 // autoMergeHoldOutcome records a hold and returns its disposition. Both paths a
 // reconciliation hold can take - Evaluate-side readiness and the Merge-side
 // Waiting return - go through here, because instrumenting only one left the
 // other silent, unrecorded and unbounded (#1783 round-4 review, F-1).
-func autoMergeHoldOutcome(ctx context.Context, deps pipelineStageSettleDeps, stage Stage, stageRow db.PipelineRunStage, sourceJobID string, pr int, head, reason string) (bool, string, string, []string, *db.PipelineRunStage, error) {
+func autoMergeHoldOutcome(ctx context.Context, deps pipelineStageSettleDeps, stage Stage, stageRow db.PipelineRunStage, sourceJobID string, pr int, head, episodeKey, reason string) (bool, string, string, []string, *db.PipelineRunStage, error) {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		reason = "auto-merge is waiting on workload-mode reconciliation"
 	}
-	held, err := recordAutoMergeHold(ctx, deps, stage, sourceJobID, pr, head, reason)
+	held, err := recordAutoMergeHold(ctx, deps, stage, sourceJobID, pr, head, autoMergeEpisodeKey(episodeKey, head), reason)
 	if err != nil {
 		return false, "", "", nil, nil, err
 	}
@@ -2208,7 +2392,12 @@ func autoMergeHoldOutcome(ctx context.Context, deps pipelineStageSettleDeps, sta
 func autoMergeHoldDisposition(stage Stage, stageRow db.PipelineRunStage, now time.Time, pr int, held autoMergeHold) (bool, string, string, []string, *db.PipelineRunStage, error) {
 	if strings.TrimSpace(stage.Timeout) == "" && !held.at.IsZero() {
 		if waited := now.Sub(held.at); waited >= autoMergeHoldMaxWait {
-			summary := fmt.Sprintf("gate auto-merge blocked: auto-merge held %s without reconciliation (no gate timeout is set, so the hold's own bound of %s applied): %s",
+			// The summary states the ESCAPE HATCH, not just the bound that fired.
+			// "no gate timeout is set, so the bound applied" was true and left the
+			// operator with nothing to do about it; the actionable half is that a
+			// stage `timeout` overrides this bound in both directions (#1783
+			// round-5 review, F-12).
+			summary := fmt.Sprintf("gate auto-merge blocked: auto-merge held %s without reconciliation (no gate timeout is set, so the hold's own bound of %s applied - set a `timeout` on this gate stage if reconciliations here legitimately take longer): %s",
 				waited.Truncate(time.Second), autoMergeHoldMaxWait, held.reason)
 			return true, StageBlocked, summary, []string{held.reason}, nil, nil
 		}

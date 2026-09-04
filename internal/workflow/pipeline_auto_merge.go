@@ -35,11 +35,15 @@ type PipelineAutoMergeReadiness struct {
 	// same check first - silent, unbounded and unrecorded (#1783 round-4 review,
 	// F-1, measured at now+72h).
 	ReconciliationHold bool
-	Blocked            bool
-	Merged             bool
-	CurrentHeadSHA     string
-	MergeCommitSHA     string
-	Reason             string
+	// ReconciliationKey is the STABLE episode discriminator for that hold. Reason
+	// carries volatile near-miss text for the operator, so the pipeline keys the
+	// hold's budget on this instead (#1783 round-5 review, F-11).
+	ReconciliationKey string
+	Blocked           bool
+	Merged            bool
+	CurrentHeadSHA    string
+	MergeCommitSHA    string
+	Reason            string
 }
 
 // PipelineAutoMergeResult is the result of the single audited merge attempt.
@@ -51,10 +55,13 @@ type PipelineAutoMergeReadiness struct {
 // would silently convert at-most-once into at-least-once (#1783 round-4 review,
 // F-9). A refusal that may have reached GitHub must NOT set Waiting.
 type PipelineAutoMergeResult struct {
-	Merged         bool
-	Waiting        bool
-	MergeCommitSHA string
-	Reason         string
+	Merged  bool
+	Waiting bool
+	// ReconciliationKey is set only for a workload-mode reconciliation Waiting,
+	// and is the stable episode key for it (#1783 round-5 review, F-11).
+	ReconciliationKey string
+	MergeCommitSHA    string
+	Reason            string
 }
 
 // PipelineAutoMerger adapts the existing policy merge-gate checks and the shared
@@ -121,12 +128,13 @@ func (m PipelineAutoMerger) Evaluate(ctx context.Context, request PipelineAutoMe
 		readiness.Reason = "pull request is not mergeable; rebase or update the branch"
 		return readiness, nil
 	}
-	if required, reconciled, reason, err := ensureWorkloadModeReconciled(ctx, m.Store, m.GitHub, repo, int64(request.PullRequest), head); err != nil {
+	if required, reconciled, hold, err := ensureWorkloadModeReconciled(ctx, m.Store, m.GitHub, repo, int64(request.PullRequest), head); err != nil {
 		return PipelineAutoMergeReadiness{}, err
 	} else if required && !reconciled {
 		readiness.Waiting = true
 		readiness.ReconciliationHold = true
-		readiness.Reason = reason
+		readiness.ReconciliationKey = hold.key
+		readiness.Reason = hold.detail
 		return readiness, nil
 	}
 	gate := PolicyMergeGate{
@@ -181,12 +189,12 @@ func (m PipelineAutoMerger) Merge(ctx context.Context, request PipelineAutoMerge
 	if head != strings.TrimSpace(request.HeadSHA) {
 		return PipelineAutoMergeResult{Reason: fmt.Sprintf("pull request head drifted after review: reviewed %s, current %s", shortSHA(request.HeadSHA), shortSHA(head))}, nil
 	}
-	if required, reconciled, reason, err := ensureWorkloadModeReconciled(ctx, m.Store, m.GitHub, repo, int64(request.PullRequest), head); err != nil {
+	if required, reconciled, hold, err := ensureWorkloadModeReconciled(ctx, m.Store, m.GitHub, repo, int64(request.PullRequest), head); err != nil {
 		return PipelineAutoMergeResult{}, err
 	} else if required && !reconciled {
 		// Waiting, matching Evaluate: a reconciliation row or an owner note can
 		// land at any moment, so the run must re-observe rather than end.
-		return PipelineAutoMergeResult{Waiting: true, Reason: reason}, nil
+		return PipelineAutoMergeResult{Waiting: true, ReconciliationKey: hold.key, Reason: hold.detail}, nil
 	}
 	result, err := executePullRequestMerge(ctx, m.GitHub, github.MergePullRequestInput{
 		Repo:            repo,
