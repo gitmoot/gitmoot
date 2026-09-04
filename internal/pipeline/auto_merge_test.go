@@ -666,11 +666,15 @@ func prepareTimedAutoMergeGate(t *testing.T) (*db.Store, PipelineStageEnqueuer, 
 			break
 		}
 	}
-	// The guard that makes every test below able to fail for the right reason:
-	// without the timeout the reason can never reach a caller, so a passing
-	// assertion would be proving nothing.
+	// A TRIPWIRE, AND ONLY A TRIPWIRE - stated correctly this time. An earlier
+	// version of this comment claimed that without the timeout "a passing
+	// assertion would be proving nothing"; the round-12 review disproved that by
+	// compound mutation: with the injection removed AND this guard deleted, all
+	// four tests still fail at the park check, which runs first. So the guard
+	// buys a precise failure message, never the protection itself. Its own
+	// deletion is correctly a worthless mutant (#1783 round-12).
 	if strings.TrimSpace(gateStage.Timeout) == "" {
-		t.Fatal("this fixture must carry a gate timeout, or no reason can ever reach a summary")
+		t.Fatal("this fixture must carry a gate timeout; without it these tests fail at the park check with a less obvious message")
 	}
 	return store, enqueue, rec, spec, run, impl.JobID, now, gateStage
 }
@@ -738,11 +742,49 @@ func TestPipelineAutoMergeLostClaimReleasedReasonReachesAParkedSummary(t *testin
 	if !slices.ContainsFunc(needs, func(need string) bool { return strings.Contains(need, want) }) {
 		t.Fatalf("park needs must carry the cause so it survives into the run's needs: %v", needs)
 	}
+	// The HEAD RENDERING, the fourth of the six interpolated values in these four
+	// reasons, bound by the words after it because sha[:7] is a prefix of the raw
+	// head (#1783 round-12 F-1, survivor 3).
+	if head := "claim for head " + shortPipelineSHA(autoMergeProbeHead) + " was released"; !strings.Contains(summary, head) {
+		t.Fatalf("park summary must render the head SHORT, as %q: %q", head, summary)
+	}
 	// Still not a fault: parking on a timeout is the operator's choice, and the
 	// released claim itself is a normal race that must record nothing.
 	if rows := autoMergeEventCount(t, store, sourceJobID, autoMergeClaimOrphanEventKind); rows != 0 {
 		t.Fatalf("orphan reports for a RELEASED claim = %d, want 0", rows)
 	}
+}
+
+// autoMergeProbeHead is the head every auto-merge fixture binds to. Named rather
+// than repeated as a literal so an assertion about its RENDERING cannot drift
+// from the value the fixture injects (#1783 round-12 F-1, survivor 3).
+const autoMergeProbeHead = "0123456789abcdef"
+
+// parseParkedClaimAge pulls the rendered duration out of a parked summary and
+// FAILS if it is not there or does not parse. It exists so the age can be
+// BOUNDED rather than asserted by the punctuation around it (#1783 round-12
+// F-1): `(taken -1s ago)` satisfies a `(taken `/` ago)` check and is nonsense.
+//
+// It is deliberately strict about the delimiters, because a mutant that changed
+// the surrounding words while leaving a plausible number would otherwise make
+// this helper return an age from text no operator would recognise.
+func parseParkedClaimAge(t *testing.T, summary, prefix, suffix string) time.Duration {
+	t.Helper()
+	start := strings.Index(summary, prefix)
+	if start < 0 {
+		t.Fatalf("summary does not contain %q, so it states no claim age: %q", prefix, summary)
+	}
+	rest := summary[start+len(prefix):]
+	end := strings.Index(rest, suffix)
+	if end < 0 {
+		t.Fatalf("summary does not close the age with %q: %q", suffix, summary)
+	}
+	raw := strings.TrimSpace(rest[:end])
+	age, err := time.ParseDuration(raw)
+	if err != nil {
+		t.Fatalf("claim age %q in the park summary does not parse as a duration: %v (%q)", raw, err, summary)
+	}
+	return age
 }
 
 // ROUND-11 F-1, AND IT IS THE CLASS ROUND-10 F-6 OPENED WITHOUT CLOSING.
@@ -799,30 +841,41 @@ func TestPipelineAutoMergeLostClaimReasonsAllReachAParkedSummary(t *testing.T) {
 				t.Fatalf("park needs must carry %q: %v", want, needs)
 			}
 		}
+		// THE HEAD RENDERING, bound by the word that follows it (round-12 F-1,
+		// survivor 3). shortPipelineSHA returns sha[:7], a PREFIX of the raw head,
+		// so `for head 0123456` is satisfied by the full SHA too - a bare short-SHA
+		// substring cannot detect the substitution. Including the next literal word
+		// closes that.
+		if want := "claim for head " + shortPipelineSHA(autoMergeProbeHead) + " and the claim carries"; !strings.Contains(summary, want) {
+			t.Fatalf("park summary must render the head SHORT, as %q: %q", want, summary)
+		}
 	})
 
 	// The INSIDE-THE-WINDOW reason. Not mutated by any review; found by
 	// enumerating the function instead of the findings.
 	t.Run("held_inside_the_window", func(t *testing.T) {
-		store, _, rec, spec, run, sourceJobID, _, gateStage := prepareTimedAutoMergeGate(t)
-		// The gate has been in flight for hours on real time, so it is past its
-		// 1m timeout...
-		gate := stageRow(t, store, run.ID, "merge")
-		realNow := time.Now().UTC()
-		gate.StartedAt = realNow.Add(-2 * time.Hour)
-		if err := store.UpdatePipelineRunStage(ctx, gate); err != nil {
-			t.Fatal(err)
-		}
-		// ...while the claim was taken just now, so it is INSIDE the 15m window.
+		store, _, rec, spec, run, sourceJobID, now, gateStage := prepareTimedAutoMergeGate(t)
 		seedConsumedAutoMergeClaim(t, store, rec, run, sourceJobID)
 		if autoMergeClaimOrphanAfter != 15*time.Minute {
 			t.Fatalf("autoMergeClaimOrphanAfter = %s, want 15m0s; this test's clock is written in literals", autoMergeClaimOrphanAfter)
 		}
+		// THE AGE IS INJECTED, so the rendering is EXACT rather than bounded.
+		// Round-12 F-1 killed the range version: with a real elapsed age of a few
+		// milliseconds, `0 <= age < 1m` admits a Truncate(time.Minute) mutant that
+		// renders "0s", and admitted a precision-widening mutant too. Pinning
+		// created_at against a fixed deps.now makes held exactly 90s, so the
+		// rendered string is deterministic and every corruption of the value -
+		// negation, truncation granularity, added words - changes it.
+		settleAt := now.Add(2 * time.Hour)
+		if err := store.ExecForTest(ctx, `UPDATE job_events SET created_at = ? WHERE job_id = ? AND kind = ?`,
+			settleAt.Add(-90*time.Second).Format(time.DateTime), sourceJobID, autoMergeClaimEventKind); err != nil {
+			t.Fatalf("injecting a known claim age: %v", err)
+		}
 		deps := pipelineStageSettleDeps{
 			store: store, rec: rec, run: run,
-			now: realNow.Add(time.Second),
+			now: settleAt,
 			autoMerge: &stubPipelineAutoMerger{
-				readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+				readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: autoMergeProbeHead},
 				mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-sha"},
 			},
 		}
@@ -833,13 +886,16 @@ func TestPipelineAutoMergeLostClaimReasonsAllReachAParkedSummary(t *testing.T) {
 		if !settled || state != StageBlocked {
 			t.Fatalf("a gate past its timeout must park: settled=%v state=%q", settled, state)
 		}
-		if want := "another scan holds the auto-merge claim for head"; !strings.Contains(summary, want) {
-			t.Fatalf("park summary must carry %q: %q", want, summary)
+		// One assertion covering BOTH interpolated values of this reason: the head
+		// rendered SHORT (bound by the following punctuation, since sha[:7] is a
+		// prefix of the raw head and a bare substring cannot tell them apart) and
+		// the age rendered from the injected 90 seconds.
+		if want := "another scan holds the auto-merge claim for head " + shortPipelineSHA(autoMergeProbeHead) + " (taken 1m30s ago)"; !strings.Contains(summary, want) {
+			t.Fatalf("park summary must render exactly %q: %q", want, summary)
 		}
-		// The AGE is the whole content of this branch's message - it is what tells
-		// an operator the claim is young rather than orphaned.
-		if !strings.Contains(summary, "(taken ") || !strings.Contains(summary, " ago)") {
-			t.Fatalf("park summary must state how long ago the claim was taken: %q", summary)
+		// And the parsed value must still sit inside the window this branch is for.
+		if age := parseParkedClaimAge(t, summary, "(taken ", " ago)"); age != 90*time.Second || age >= autoMergeClaimOrphanAfter {
+			t.Fatalf("rendered age %s, want exactly 1m30s and below the %s bound: %q", age, autoMergeClaimOrphanAfter, summary)
 		}
 		// And it must NOT report a fault: inside the window there is nothing wrong.
 		if rows := autoMergeEventCount(t, store, sourceJobID, autoMergeClaimOrphanEventKind); rows != 0 {
@@ -851,20 +907,26 @@ func TestPipelineAutoMergeLostClaimReasonsAllReachAParkedSummary(t *testing.T) {
 	// review used here reinstated exactly the falsehood round 7 removed ("just
 	// wait, it will resolve itself"), so the assertion names the true remedy.
 	t.Run("held_past_the_bound", func(t *testing.T) {
-		store, _, rec, spec, run, sourceJobID, _, gateStage := prepareTimedAutoMergeGate(t)
+		store, _, rec, spec, run, sourceJobID, now, gateStage := prepareTimedAutoMergeGate(t)
 		seedConsumedAutoMergeClaim(t, store, rec, run, sourceJobID)
-		// Anchored to REAL time, because the claim's created_at is the store's own
-		// CURRENT_TIMESTAMP and a fixture clock in the past yields a NEGATIVE age
-		// that can never cross the bound (#1783 round-7).
-		realNow := time.Now().UTC()
 		if autoMergeClaimOrphanAfter != 15*time.Minute {
 			t.Fatalf("autoMergeClaimOrphanAfter = %s, want 15m0s; this test's clock is written in literals", autoMergeClaimOrphanAfter)
 		}
+		// Age INJECTED against a fixed settle clock, exactly as in the sibling
+		// subtest. Round 7 rejected a fixture clock here because the store wrote
+		// created_at itself and a past clock yielded a NEGATIVE age; pinning the
+		// column removes that obstacle rather than working around it, and makes
+		// the rendered duration deterministic (#1783 round-12 F-1).
+		settleAt := now.Add(2 * time.Hour)
+		if err := store.ExecForTest(ctx, `UPDATE job_events SET created_at = ? WHERE job_id = ? AND kind = ?`,
+			settleAt.Add(-(16*time.Minute + 30*time.Second)).Format(time.DateTime), sourceJobID, autoMergeClaimEventKind); err != nil {
+			t.Fatalf("injecting a known claim age: %v", err)
+		}
 		deps := pipelineStageSettleDeps{
 			store: store, rec: rec, run: run,
-			now: realNow.Add(16 * time.Minute),
+			now: settleAt,
 			autoMerge: &stubPipelineAutoMerger{
-				readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+				readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: autoMergeProbeHead},
 				mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-sha"},
 			},
 		}
@@ -894,6 +956,18 @@ func TestPipelineAutoMergeLostClaimReasonsAllReachAParkedSummary(t *testing.T) {
 		// Past the bound this branch DOES record, once.
 		if rows := autoMergeEventCount(t, store, sourceJobID, autoMergeClaimOrphanEventKind); rows != 1 {
 			t.Fatalf("suspicion rows past the bound = %d, want exactly 1", rows)
+		}
+		// BOTH interpolated values of this reason, in one exact assertion: the
+		// head rendered SHORT and bound by the words that follow it, and the age
+		// rendered from the injected 16m30s. The mutant that widened
+		// Truncate(time.Second) to time.Hour rendered "taken 0s ago" here - an
+		// orphan declared at zero seconds by a bound whose whole premise is
+		// fifteen minutes - and satisfied every phrase assertion above.
+		if want := "claim for head " + shortPipelineSHA(autoMergeProbeHead) + " was taken 16m30s ago and is still held"; !strings.Contains(summary, want) {
+			t.Fatalf("park summary must render exactly %q: %q", want, summary)
+		}
+		if age := parseParkedClaimAge(t, summary, "was taken ", " ago and"); age != 16*time.Minute+30*time.Second || age < autoMergeClaimOrphanAfter {
+			t.Fatalf("rendered age %s, want exactly 16m30s and at or past the %s bound: %q", age, autoMergeClaimOrphanAfter, summary)
 		}
 	})
 }
