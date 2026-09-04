@@ -1831,9 +1831,15 @@ func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobS
 	// clear` RetryJob the OLD stage job id — an orphaned re-execution the
 	// pipeline advancer never folds, and a double execution once the run is
 	// properly resumed.
-	if state == JobBlocked && payload.Result != nil && len(payload.Result.Needs) > 0 && payload.Sender != PipelineJobSender {
-		if _, gateErr := m.store.RecordJobGates(writeCtx, jobID, payload.Result.Needs); gateErr == nil {
-			_ = m.addEvent(writeCtx, jobID, "gates_recorded", fmt.Sprintf("recorded %d resumable gate(s) from needs", len(payload.Result.Needs)))
+	// Content-free needs are dropped BEFORE admission and before recording:
+	// `needs: [{}]` used to be admitted on a raw len() and written to
+	// job_gates verbatim, so a human saw a gate row reading "{}".
+	if state == JobBlocked && payload.Result != nil && payload.Sender != PipelineJobSender {
+		recordable := actionableEntries(payload.Result.Needs)
+		if len(recordable) > 0 {
+			if _, gateErr := m.store.RecordJobGates(writeCtx, jobID, recordable); gateErr == nil {
+				_ = m.addEvent(writeCtx, jobID, "gates_recorded", fmt.Sprintf("recorded %d resumable gate(s) from needs", len(recordable)))
+			}
 		}
 	}
 	return nil

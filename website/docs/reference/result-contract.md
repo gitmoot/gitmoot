@@ -84,6 +84,60 @@ for missing credentials, unclear scope, unavailable tools, failing external
 services, or required human decisions.
 Always redact secrets from summaries, findings, raw command output, and examples.
 
+## String lists: `changes_made`, `tests_run`, `needs`
+
+Emit **strings**. An **object** element is also accepted, because agents send
+them and refusing one used to fail the entire result: a review reporting
+
+```json
+"tests_run": [{"name": "diff scope", "command": "git show --stat", "result": "pass"}]
+```
+
+was rejected with `cannot unmarshal object into Go struct field
+AgentResult.tests_run of type string` and spent a repair attempt, which made a
+job that did the work indistinguishable from one that returned nothing. An
+object element is stored as compact JSON with keys in canonical order at the TOP level, and every
+field is carried through verbatim — including shell metacharacters, so a
+recorded `command` can be copy-pasted back.
+
+**Duplicate keys are rejected** at the top level, not merged: `[{"name":"a","name":"b"}]` fails
+with the duplicate named, rather than silently keeping one of them.
+
+A `null` element is accepted and becomes an **empty entry**, matching the
+behaviour before object elements were supported.
+
+**Both properties stop at the top level, and the digest consumes nested values.**
+A NESTED object keeps whatever key order the agent sent, and a duplicate key inside a nested object is
+NEITHER rejected NOR resolved: BOTH copies are kept verbatim in the stored
+entry, because the value is copied as raw bytes and re-marshalling only
+compacts it. Measured, not inferred.
+Only the outermost object of a list element is canonicalised and duplicate-checked.
+So two agents reporting the same nested entry can produce different bytes, and
+the result digest reads those bytes.
+
+**The evidence gate also changed, not only the decoder.** A list entry that
+decodes cleanly but carries no information — `{}`, or an object whose values
+are all empty such as `{"name":"","command":""}` — is NOT evidence. A bare
+array element like `[]` or `["",""]` is NOT in this category: the decoder
+rejects any element that is not a string or an object, so those fail the whole
+result rather than reaching the gate. Empty containers ARE reachable nested
+inside an object value, and are judged there.
+same test the `needs` gate uses, so a content-free entry no longer satisfies
+`implement-changes-listed` or `implement-tests-listed`. An entry with at least
+one populated value, at any depth, still counts.
+
+**Which lists accept an object at all.** Only the narrative lists an agent
+writes for a human: `changes_made`, `tests_run` and `needs`. The engine's
+structural lists stay STRICT and reject an object element — `capabilities`,
+`artifacts`, `deps` and `choices` are identifiers the engine consumes (a
+capability name, an artifact path, a delegation id, a prompt option), so an
+object there is not a richer report, it is an unusable value that would corrupt
+routing. That asymmetry is deliberate.
+
+Nothing else is accepted. A number, a boolean, a nested array, or a bare string
+where the array belongs still fails the result, and the error names the field so
+a repair attempt knows which list to fix.
+
 ## Display-only in-session review state
 
 An inline PR review can be recorded with `job open --type review --pr <n>

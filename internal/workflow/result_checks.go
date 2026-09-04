@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -149,7 +150,10 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 		// list the tests it ran, so a human/continuation can see what actually
 		// happened rather than trusting the summary prose.
 		if r.Decision == "implemented" {
-			madePass := len(r.ChangesMade) > 0
+			// Same content test the needs gate uses: two gates disagreeing
+			// about the same input is the defect, not the leniency. Before
+			// this, the {} that the needs gate rejects satisfied these.
+			madePass := hasActionableEntries(r.ChangesMade)
 			checks = append(checks, ResultCheck{
 				ID:          "implement-changes-listed",
 				Action:      "implement",
@@ -174,7 +178,7 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 					)),
 				})
 			}
-			testsPass := len(r.TestsRun) > 0
+			testsPass := hasActionableEntries(r.TestsRun)
 			checks = append(checks, ResultCheck{
 				ID:          "implement-tests-listed",
 				Action:      "implement",
@@ -315,15 +319,111 @@ func isActionableAnswer(r AgentResult) bool {
 	return len(r.Findings) > 0
 }
 
+// rawJSONCarriesContent applies the content test to one JSON value taken from
+// inside a container.
+//
+// The unquoting step is load-bearing and my own test caught its absence: a
+// container's values arrive as RAW JSON, so an empty string inside one is the
+// two-byte text `""`, which reads as non-empty text unless it is decoded
+// first. Without this, {"name":"","command":""} still counted as evidence -
+// the exact false-accept this round is closing.
+func rawJSONCarriesContent(raw json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return false
+	}
+	if trimmed[0] == '"' {
+		var text string
+		if err := json.Unmarshal(raw, &text); err == nil {
+			return strings.TrimSpace(text) != ""
+		}
+	}
+	return entryCarriesContent(trimmed)
+}
+
+// actionableEntries returns only the entries that carry information.
+//
+// hasActionableEntries answers "is there anything here"; this answers "which of
+// these is worth persisting". The gate-RECORDING path needs the second: the
+// #1809 review found that `needs: [{}]` was admitted on a raw len() and written
+// to job_gates verbatim, so a durable row whose need column is the two-byte
+// text {} surfaced to a human through `gitmoot job gates` and the dashboard's
+// "Needs a human" view. Filtering here keeps the gate that RECORDS agreeing
+// with the gates that JUDGE - the principle this branch already applied to
+// implement-changes-listed and implement-tests-listed, applied to the consumer
+// literally named gates.
+func actionableEntries(values []string) []string {
+	filtered := make([]string, 0, len(values))
+	for _, value := range values {
+		if entryCarriesContent(value) {
+			filtered = append(filtered, value)
+		}
+	}
+	return filtered
+}
+
 // hasActionableEntries reports whether a string slice contains at least one
-// non-blank entry, so an all-empty or single-blank list counts as no entries.
+// entry that carries information, so an all-empty list - including one whose
+// only entries are content-free containers - counts as no entries.
 func hasActionableEntries(values []string) bool {
 	for _, v := range values {
-		if strings.TrimSpace(v) != "" {
+		if entryCarriesContent(v) {
 			return true
 		}
 	}
 	return false
+}
+
+// entryCarriesContent reports whether one list entry says anything.
+//
+// Trimming whitespace is no longer sufficient (#1805): object elements now
+// decode into entries, so `needs: [{}]` arrives as the two-character string
+// "{}" - non-empty to TrimSpace, and therefore actionable to the old check.
+// That let a BLOCKED result whose ONLY blocker is an empty object pass the
+// evidence heuristic, which is a GATE behaviour change rather than a cosmetic
+// one. A content-free JSON container carries exactly as much information as ""
+// and is treated the same.
+//
+// An object WITH fields still counts: the test is emptiness, not shape.
+func entryCarriesContent(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return false
+	}
+	switch trimmed[0] {
+	case '{', '[':
+		var container []json.RawMessage
+		if trimmed[0] == '{' {
+			var object map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(trimmed), &object); err == nil {
+				// NOT len(object) > 0: an object whose VALUES are all empty
+				// carries no more information than "". A review reporting
+				// {"name":"","command":""} reads as populated evidence to a
+				// coordinator while saying nothing, which is worse than a hard
+				// failure - the false-accept this check exists to close was
+				// only half closed by counting keys.
+				for _, value := range object {
+					if rawJSONCarriesContent(value) {
+						return true
+					}
+				}
+				return false
+			}
+			// Unparseable: it is still text a human can read, so keep it.
+			return true
+		}
+		if err := json.Unmarshal([]byte(trimmed), &container); err == nil {
+			for _, value := range container {
+				if rawJSONCarriesContent(value) {
+					return true
+				}
+			}
+			return false
+		}
+		return true
+	default:
+		return true
+	}
 }
 
 // minReviewRationaleChars is the floor at which a review summary can carry the
