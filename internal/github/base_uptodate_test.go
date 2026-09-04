@@ -58,6 +58,14 @@ func TestBaseRequiresUpToDateHead(t *testing.T) {
 			{"empty stdout", subprocess.Result{Stdout: ""}, nil},
 			{"null stdout", subprocess.Result{Stdout: "null\n"}, nil},
 			{"unfiltered json", subprocess.Result{Stdout: "{\"strict\":true}\n"}, nil},
+			// #1870 round-2 finding (P3): every case above pairs its error with
+			// empty or non-determinate stdout, so the stdout switch alone could
+			// satisfy them and the explicit error check survived deletion. These
+			// two pair a gh FAILURE with determinate-looking output, so only the
+			// error check can make them fail closed - gh writes partial or stale
+			// stdout alongside a non-zero exit often enough to matter.
+			{"error with determinate true stdout", subprocess.Result{Stdout: "true\n", Stderr: "HTTP 403: Resource not accessible by integration"}, errors.New("exit status 1")},
+			{"error with determinate false stdout", subprocess.Result{Stdout: "false\n", Stderr: "HTTP 502: Bad Gateway"}, errors.New("exit status 1")},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
