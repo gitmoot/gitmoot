@@ -149,7 +149,7 @@ func prepareAutoMergeGate(t *testing.T) (*db.Store, PipelineStageEnqueuer, db.Pi
 	now := time.Date(2026, 7, 11, 8, 0, 0, 0, time.UTC)
 	run := startTestRun(t, store, rec, spec, enqueue, now)
 	impl := stageRow(t, store, run.ID, "impl")
-	setttle := PipelineStagePRBinding{PullRequest: 813, HeadSHA: "0123456789abcdef", Branch: "feat/813", TaskID: "task-813", LeadAgent: "coder"}
+	setttle := PipelineStagePRBinding{PullRequest: 813, HeadSHA: autoMergeProbeHead, Branch: "feat/813", TaskID: "task-813", LeadAgent: "coder"}
 	settleBoundImplementStageJob(t, store, impl.JobID, "implemented", setttle)
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second), &stubPipelineAutoMerger{})
 	return store, enqueue, rec, spec, run, impl.JobID, now
@@ -160,7 +160,7 @@ func TestPipelineAutoMergeGateExecutesAfterApprovedReviewAndGreenChecks(t *testi
 	review := stageRow(t, store, run.ID, "review")
 	settleBoundReviewJob(t, store, review.JobID, "approved", "0123456789abcdef")
 	executor := &stubPipelineAutoMerger{
-		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: autoMergeProbeHead},
 		mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-sha"},
 	}
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), executor)
@@ -210,10 +210,10 @@ func TestPipelineAutoMergeGateExecutesAfterApprovedReviewAndGreenChecks(t *testi
 // mutation.
 func TestPipelineAutoMergeWaitingHoldClearsWhenTheConditionClears(t *testing.T) {
 	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
-	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", autoMergeProbeHead)
 	const holdReason = "workload-mode change requires reconciliation at head 0123456 against operating-mode note 41"
 	executor := &stubPipelineAutoMerger{
-		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: autoMergeProbeHead},
 		mergeResult: workflow.PipelineAutoMergeResult{Waiting: true, Reason: holdReason},
 	}
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), executor)
@@ -278,11 +278,11 @@ func TestPipelineAutoMergeHoldTimeoutCarriesTheReason(t *testing.T) {
 	settleBoundImplementStageJob(t, store, impl.JobID, "implemented",
 		PipelineStagePRBinding{PullRequest: 813, HeadSHA: "0123456789abcdef", Branch: "feat/813", TaskID: "task-813", LeadAgent: "coder"})
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second), &stubPipelineAutoMerger{})
-	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", autoMergeProbeHead)
 
 	const holdReason = "workload-mode change requires reconciliation at head 0123456 against operating-mode note 41"
 	executor := &stubPipelineAutoMerger{
-		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: autoMergeProbeHead},
 		mergeResult: workflow.PipelineAutoMergeResult{Waiting: true, Reason: holdReason},
 	}
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), executor)
@@ -306,10 +306,10 @@ func TestPipelineAutoMergeHoldTimeoutCarriesTheReason(t *testing.T) {
 // cannot fail on the value it is meant to pin (#1783 round-4 review, F-5).
 func TestPipelineAutoMergeHoldIsBoundedWithoutAGateTimeout(t *testing.T) {
 	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
-	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", autoMergeProbeHead)
 	const holdReason = "workload-mode change requires reconciliation at head 0123456 against operating-mode note 41"
 	executor := &stubPipelineAutoMerger{
-		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: autoMergeProbeHead},
 		mergeResult: workflow.PipelineAutoMergeResult{Waiting: true, Reason: holdReason},
 	}
 	for _, stage := range spec.Stages {
@@ -358,10 +358,10 @@ func TestPipelineAutoMergeHoldIsBoundedWithoutAGateTimeout(t *testing.T) {
 // cause froze at the first reason (#1783 round-4 review, F-2).
 func TestPipelineAutoMergeHoldBudgetResetsForANewEpisode(t *testing.T) {
 	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
-	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", autoMergeProbeHead)
 	first := "workload-mode change requires reconciliation at head 0123456 against operating-mode note 41"
 	executor := &stubPipelineAutoMerger{
-		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: autoMergeProbeHead},
 		mergeResult: workflow.PipelineAutoMergeResult{Waiting: true, Reason: first},
 	}
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), executor)
@@ -409,7 +409,7 @@ func TestPipelineAutoMergeHoldBudgetResetsForANewEpisode(t *testing.T) {
 // round-3 defect verbatim on the common path (F-1).
 func TestPipelineAutoMergeEvaluateSideHoldIsRecordedAndBounded(t *testing.T) {
 	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
-	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", autoMergeProbeHead)
 	const holdReason = "workload-mode change requires reconciliation at head 0123456 against operating-mode note 41"
 	executor := &stubPipelineAutoMerger{
 		readiness: workflow.PipelineAutoMergeReadiness{
@@ -465,10 +465,10 @@ func TestPipelineAutoMergeEvaluateSideHoldIsRecordedAndBounded(t *testing.T) {
 // contradicted by a live measurement.
 func TestPipelineAutoMergeLostClaimNeverParksAResolvedHold(t *testing.T) {
 	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
-	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", autoMergeProbeHead)
 	const holdReason = "workload-mode change requires reconciliation at head 0123456 against operating-mode note 41"
 	executor := &stubPipelineAutoMerger{
-		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: autoMergeProbeHead},
 		mergeResult: workflow.PipelineAutoMergeResult{Waiting: true, Reason: holdReason},
 	}
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), executor)
@@ -507,14 +507,14 @@ func TestPipelineAutoMergeLostClaimNeverParksAResolvedHold(t *testing.T) {
 // records it, and stays non-terminal.
 func TestPipelineAutoMergeLostClaimReportsAnOrphanedClaim(t *testing.T) {
 	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
-	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", autoMergeProbeHead)
 	executor := &stubPipelineAutoMerger{
-		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: autoMergeProbeHead},
 		mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-sha"},
 	}
 	// One advance promotes the queued gate row without claiming.
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second),
-		&stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: "0123456789abcdef"}})
+		&stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: autoMergeProbeHead}})
 	seedConsumedAutoMergeClaim(t, store, rec, run, sourceJobID)
 	// THE CLOCK HERE IS ANCHORED TO REAL TIME, deliberately. The bound compares
 	// deps.now against the claim row's created_at, which the store writes from its
@@ -582,13 +582,13 @@ func TestPipelineAutoMergeLostClaimReportsAnOrphanedClaim(t *testing.T) {
 func TestPipelineAutoMergeLostClaimTreatsAReleasedClaimAsANormalRace(t *testing.T) {
 	ctx := context.Background()
 	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
-	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", autoMergeProbeHead)
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second),
-		&stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: "0123456789abcdef"}})
+		&stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: autoMergeProbeHead}})
 
 	claim, err := json.Marshal(map[string]any{
 		"phase": "claim", "pipeline": rec.Name, "run_id": run.ID,
-		"stage_id": "merge", "pull_request": 813, "head_sha": "0123456789abcdef",
+		"stage_id": "merge", "pull_request": 813, "head_sha": autoMergeProbeHead,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -609,7 +609,7 @@ func TestPipelineAutoMergeLostClaimTreatsAReleasedClaimAsANormalRace(t *testing.
 		// Far past every bound, so a false report cannot hide behind a young claim.
 		now: time.Now().UTC().Add(48 * time.Hour),
 		autoMerge: &stubPipelineAutoMerger{
-			readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+			readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: autoMergeProbeHead},
 			mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-sha"},
 		},
 		// ...and the winner releases it in the window before this scan reads it.
@@ -653,11 +653,11 @@ func prepareTimedAutoMergeGate(t *testing.T) (*db.Store, PipelineStageEnqueuer, 
 	run := startTestRun(t, store, rec, spec, enqueue, now)
 	impl := stageRow(t, store, run.ID, "impl")
 	settleBoundImplementStageJob(t, store, impl.JobID, "implemented",
-		PipelineStagePRBinding{PullRequest: 813, HeadSHA: "0123456789abcdef", Branch: "feat/813", TaskID: "task-813", LeadAgent: "coder"})
+		PipelineStagePRBinding{PullRequest: 813, HeadSHA: autoMergeProbeHead, Branch: "feat/813", TaskID: "task-813", LeadAgent: "coder"})
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second), &stubPipelineAutoMerger{})
-	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", autoMergeProbeHead)
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second),
-		&stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: "0123456789abcdef"}})
+		&stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: autoMergeProbeHead}})
 
 	var gateStage Stage
 	for _, candidate := range spec.Stages {
@@ -698,7 +698,7 @@ func TestPipelineAutoMergeLostClaimReleasedReasonReachesAParkedSummary(t *testin
 
 	claim, err := json.Marshal(map[string]any{
 		"phase": "claim", "pipeline": rec.Name, "run_id": run.ID,
-		"stage_id": "merge", "pull_request": 813, "head_sha": "0123456789abcdef",
+		"stage_id": "merge", "pull_request": 813, "head_sha": autoMergeProbeHead,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -710,7 +710,7 @@ func TestPipelineAutoMergeLostClaimReleasedReasonReachesAParkedSummary(t *testin
 		// Past the gate's 1m timeout, so the park path runs and carries the cause.
 		now: now.Add(2 * time.Hour),
 		autoMerge: &stubPipelineAutoMerger{
-			readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+			readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: autoMergeProbeHead},
 			mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-sha"},
 		},
 		afterLostClaim: func() {
@@ -735,6 +735,7 @@ func TestPipelineAutoMergeLostClaimReleasedReasonReachesAParkedSummary(t *testin
 	}
 	// The exact operator-facing sentence, not a paraphrase: this is the string a
 	// human reads off a parked run, and mutating it must fail a test.
+	assertParkWrapper(t, summary, "1h59m59s")
 	const want = "was released while this scan was reading it, so the next scan takes it"
 	if !strings.Contains(summary, want) {
 		t.Fatalf("park summary must carry the released-claim cause %q: %q", want, summary)
@@ -755,10 +756,38 @@ func TestPipelineAutoMergeLostClaimReleasedReasonReachesAParkedSummary(t *testin
 	}
 }
 
-// autoMergeProbeHead is the head every auto-merge fixture binds to. Named rather
-// than repeated as a literal so an assertion about its RENDERING cannot drift
-// from the value the fixture injects (#1783 round-12 F-1, survivor 3).
+// autoMergeProbeHead is the head the auto-merge FIXTURE PATH binds to:
+// prepareAutoMergeGate, prepareTimedAutoMergeGate, seedConsumedAutoMergeClaim and
+// the four reason tests all read this one constant, so an assertion about the
+// head's RENDERING moves with the value being injected instead of merely
+// matching a second copy of it (#1783 round-12 F-1, survivor 3).
+//
+// THE SCOPE IS EXACTLY THAT, and the first version of this comment overclaimed
+// it. It said no assertion could drift from the fixture while three injection
+// sites in prepareTimedAutoMergeGate were still literals - the assertion and the
+// injection were two independent strings that happened to be equal. DEMONSTRATED
+// rather than asserted this time: changing this constant leaves the four reason
+// tests GREEN, because everything they touch moves together. 33 literal heads
+// remain in this file, in older tests with their own fixtures and their own
+// assertions, and changing this constant DOES fail those - they are outside this
+// constant's reach and this comment does not claim otherwise.
 const autoMergeProbeHead = "0123456789abcdef"
+
+// assertParkWrapper pins the THREE values autoMergeGateWaitingWithReason
+// interpolates around every reason: the gate name, the rendered wait, and the
+// wait description. Round-13 F-2: this PR introduced that wrapper and nothing in
+// the package asserted any of them - `grep "timed out after"` across the test
+// files returned nothing - so the same operator-facing string these tests check
+// carried three unpinned values. `waited` is a rendered duration in a park
+// summary, which is exactly the category round-10 F-6 and round-12 F-1 put in
+// scope, and the fixed fixture clock makes all three deterministic.
+func assertParkWrapper(t *testing.T, summary, waited string) {
+	t.Helper()
+	want := "gate pr_merged timed out after " + waited + " waiting for auto-merge readiness for PR #813 merged: "
+	if !strings.HasPrefix(summary, want) {
+		t.Fatalf("park summary must open with the wrapper %q: %q", want, summary)
+	}
+}
 
 // parseParkedClaimAge pulls the rendered duration out of a parked summary and
 // FAILS if it is not there or does not parse. It exists so the age can be
@@ -816,7 +845,7 @@ func TestPipelineAutoMergeLostClaimReasonsAllReachAParkedSummary(t *testing.T) {
 			store: store, rec: rec, run: run,
 			now: now.Add(2 * time.Hour),
 			autoMerge: &stubPipelineAutoMerger{
-				readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+				readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: autoMergeProbeHead},
 				mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-sha"},
 			},
 		}
@@ -829,6 +858,7 @@ func TestPipelineAutoMergeLostClaimReasonsAllReachAParkedSummary(t *testing.T) {
 		}
 		// BOTH remedies, because carrying both is what round-8 F-2 corrected: the
 		// wait parks under a timeout, and a re-run takes a fresh claim.
+		assertParkWrapper(t, summary, "1h59m59s")
 		for _, want := range []string{
 			"carries no readable timestamp",
 			"a stage `timeout` on this gate still parks the wait",
@@ -866,7 +896,7 @@ func TestPipelineAutoMergeLostClaimReasonsAllReachAParkedSummary(t *testing.T) {
 		// created_at against a fixed deps.now makes held exactly 90s, so the
 		// rendered string is deterministic and every corruption of the value -
 		// negation, truncation granularity, added words - changes it.
-		settleAt := now.Add(2 * time.Hour)
+		settleAt := now.Add(2*time.Hour + 750*time.Millisecond)
 		if err := store.ExecForTest(ctx, `UPDATE job_events SET created_at = ? WHERE job_id = ? AND kind = ?`,
 			settleAt.Add(-90*time.Second).Format(time.DateTime), sourceJobID, autoMergeClaimEventKind); err != nil {
 			t.Fatalf("injecting a known claim age: %v", err)
@@ -890,6 +920,7 @@ func TestPipelineAutoMergeLostClaimReasonsAllReachAParkedSummary(t *testing.T) {
 		// rendered SHORT (bound by the following punctuation, since sha[:7] is a
 		// prefix of the raw head and a bare substring cannot tell them apart) and
 		// the age rendered from the injected 90 seconds.
+		assertParkWrapper(t, summary, "1h59m59.75s")
 		if want := "another scan holds the auto-merge claim for head " + shortPipelineSHA(autoMergeProbeHead) + " (taken 1m30s ago)"; !strings.Contains(summary, want) {
 			t.Fatalf("park summary must render exactly %q: %q", want, summary)
 		}
@@ -917,7 +948,7 @@ func TestPipelineAutoMergeLostClaimReasonsAllReachAParkedSummary(t *testing.T) {
 		// created_at itself and a past clock yielded a NEGATIVE age; pinning the
 		// column removes that obstacle rather than working around it, and makes
 		// the rendered duration deterministic (#1783 round-12 F-1).
-		settleAt := now.Add(2 * time.Hour)
+		settleAt := now.Add(2*time.Hour + 750*time.Millisecond)
 		if err := store.ExecForTest(ctx, `UPDATE job_events SET created_at = ? WHERE job_id = ? AND kind = ?`,
 			settleAt.Add(-(16*time.Minute + 30*time.Second)).Format(time.DateTime), sourceJobID, autoMergeClaimEventKind); err != nil {
 			t.Fatalf("injecting a known claim age: %v", err)
@@ -937,6 +968,7 @@ func TestPipelineAutoMergeLostClaimReasonsAllReachAParkedSummary(t *testing.T) {
 		if !settled || state != StageBlocked {
 			t.Fatalf("a gate past its timeout must park: settled=%v state=%q", settled, state)
 		}
+		assertParkWrapper(t, summary, "1h59m59.75s")
 		for _, want := range []string{
 			"is still held with no merge and no release",
 			"nothing in the pipeline releases that claim",
@@ -980,9 +1012,9 @@ func TestPipelineAutoMergeLostClaimReasonsAllReachAParkedSummary(t *testing.T) {
 // hour-old gate, a claim taken seconds ago, no orphan report.
 func TestPipelineAutoMergeLostClaimIgnoresGateAgeWhenTheClaimIsYoung(t *testing.T) {
 	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
-	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", autoMergeProbeHead)
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second),
-		&stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: "0123456789abcdef"}})
+		&stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: autoMergeProbeHead}})
 
 	// The gate has been waiting for hours on the pipeline's clock.
 	gate := stageRow(t, store, run.ID, "merge")
@@ -995,7 +1027,7 @@ func TestPipelineAutoMergeLostClaimIgnoresGateAgeWhenTheClaimIsYoung(t *testing.
 	seedConsumedAutoMergeClaim(t, store, rec, run, sourceJobID)
 
 	executor := &stubPipelineAutoMerger{
-		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: autoMergeProbeHead},
 		mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-sha"},
 	}
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, realNow.Add(time.Minute), executor)
@@ -1024,13 +1056,13 @@ func TestPipelineAutoMergeLostClaimIgnoresGateAgeWhenTheClaimIsYoung(t *testing.
 func TestPipelineAutoMergeLostClaimReportsAnUnreadableClaimTimestamp(t *testing.T) {
 	ctx := context.Background()
 	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
-	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", autoMergeProbeHead)
 	executor := &stubPipelineAutoMerger{
-		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: autoMergeProbeHead},
 		mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-sha"},
 	}
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second),
-		&stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: "0123456789abcdef"}})
+		&stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: autoMergeProbeHead}})
 	// The claim is held, so the scan below LOSES it.
 	seedConsumedAutoMergeClaim(t, store, rec, run, sourceJobID)
 
@@ -1082,7 +1114,7 @@ func TestPipelineAutoMergeClaimTimestampParsesTheStoreFormat(t *testing.T) {
 	store, _, rec, _, run, sourceJobID, _ := prepareAutoMergeGate(t)
 	claim, err := json.Marshal(map[string]any{
 		"phase": "claim", "pipeline": rec.Name, "run_id": run.ID,
-		"stage_id": "merge", "pull_request": 813, "head_sha": "0123456789abcdef",
+		"stage_id": "merge", "pull_request": 813, "head_sha": autoMergeProbeHead,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1119,7 +1151,7 @@ func TestPipelineAutoMergeClaimTimestampParsesTheStoreFormat(t *testing.T) {
 // budget and deferred the bound indefinitely.
 func TestPipelineAutoMergeHoldBudgetSurvivesVolatileCauseText(t *testing.T) {
 	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
-	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", autoMergeProbeHead)
 	const stableKey = "head=0123456789abcdef decision-note=41 mode=STEADY"
 	base := "workload-mode change requires reconciliation at head 0123456 against operating-mode note 41"
 	executor := &stubPipelineAutoMerger{
@@ -1163,7 +1195,7 @@ func seedConsumedAutoMergeClaim(t *testing.T, store *db.Store, rec db.Pipeline, 
 	t.Helper()
 	claim, err := json.Marshal(map[string]any{
 		"phase": "claim", "pipeline": rec.Name, "run_id": run.ID,
-		"stage_id": "merge", "pull_request": 813, "head_sha": "0123456789abcdef",
+		"stage_id": "merge", "pull_request": 813, "head_sha": autoMergeProbeHead,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1212,7 +1244,7 @@ func autoMergeEventCount(t *testing.T, store *db.Store, sourceJobID, kind string
 // check-then-insert race actually produces).
 func TestPipelineAutoMergeHoldAnchorsOnTheEarliestDuplicate(t *testing.T) {
 	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
-	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", autoMergeProbeHead)
 	const holdReason = "workload-mode change requires reconciliation at head 0123456 against operating-mode note 41"
 	executor := &stubPipelineAutoMerger{
 		readiness: workflow.PipelineAutoMergeReadiness{
@@ -1229,7 +1261,7 @@ func TestPipelineAutoMergeHoldAnchorsOnTheEarliestDuplicate(t *testing.T) {
 	// The racing scan's row: same head and cause, a LATER held_at.
 	duplicate, marshalErr := json.Marshal(map[string]any{
 		"phase": "held", "pipeline": rec.Name, "run_id": run.ID,
-		"stage_id": "merge", "pull_request": 813, "head_sha": "0123456789abcdef",
+		"stage_id": "merge", "pull_request": 813, "head_sha": autoMergeProbeHead,
 		"reason": holdReason, "episode_key": "head=0123456789abcdef",
 		"held_at": first.at.Add(23 * time.Hour).Format(time.RFC3339Nano),
 	})
@@ -1269,15 +1301,15 @@ func TestPipelineAutoMergeHoldAnchorsOnTheEarliestDuplicate(t *testing.T) {
 // this the correct order survives its own mutant.
 func TestPipelineAutoMergeHoldIsRecordedEvenWhenTheReleaseFails(t *testing.T) {
 	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
-	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", autoMergeProbeHead)
 	const holdReason = "workload-mode change requires reconciliation at head 0123456 against operating-mode note 41"
 	// One advance moves the gate row from queued to running; the settle path
 	// promotes a queued row and returns before it can claim.
-	waiting := &stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: "0123456789abcdef"}}
+	waiting := &stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: autoMergeProbeHead}}
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second), waiting)
 
 	executor := &stubPipelineAutoMerger{
-		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: autoMergeProbeHead},
 		mergeResult: workflow.PipelineAutoMergeResult{Waiting: true, Reason: holdReason},
 	}
 	var gateStage Stage
@@ -1320,7 +1352,7 @@ func TestPipelineFanOutReviewNeverSettlesAsStageSuccess(t *testing.T) {
 	settleBoundReviewJob(t, store, review.JobID, "approved", "0123456789abcdef")
 	declareBoundReviewDelegations(t, store, review.JobID)
 	executor := &stubPipelineAutoMerger{
-		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: autoMergeProbeHead},
 		mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-sha"},
 	}
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), executor)
@@ -1360,7 +1392,7 @@ func TestPipelineAutoMergeGateRefusesFanOutReview(t *testing.T) {
 	declareBoundReviewDelegations(t, store, review.JobID)
 
 	executor := &stubPipelineAutoMerger{
-		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: autoMergeProbeHead},
 		mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-sha"},
 	}
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), executor)
@@ -1444,8 +1476,8 @@ func TestPipelineAutoMergeGateRequiresEverySourceBoundReview(t *testing.T) {
 
 func TestPipelineAutoMergeClaimAllowsExactlyOneRacingMerge(t *testing.T) {
 	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
-	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
-	waiting := &stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: "0123456789abcdef"}}
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", autoMergeProbeHead)
+	waiting := &stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: autoMergeProbeHead}}
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), waiting)
 	gateRow := stageRow(t, store, run.ID, "merge")
 	var gateStage Stage
