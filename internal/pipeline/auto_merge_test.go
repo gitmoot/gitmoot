@@ -638,6 +638,43 @@ func TestPipelineAutoMergeLostClaimTreatsAReleasedClaimAsANormalRace(t *testing.
 	}
 }
 
+// prepareTimedAutoMergeGate is prepareAutoMergeGate with a stage `timeout` on the
+// gate. Every reason autoMergeLostClaimOutcome emits is observable ONLY through a
+// timeout park - autoMergeGateWaitingWithReason drops the reason on the ordinary
+// waiting path - so each of the four texts needs this fixture to be asserted at
+// all (#1783 round-11 F-1).
+func prepareTimedAutoMergeGate(t *testing.T) (*db.Store, PipelineStageEnqueuer, db.Pipeline, Spec, db.PipelineRun, string, time.Time, Stage) {
+	t.Helper()
+	timedSpec := strings.Replace(pipelineAutoMergeSpec, "    merge: auto\n", "    merge: auto\n    timeout: 1m\n", 1)
+	store := pipelineAdvanceStore(t)
+	rec, spec := newTestPipeline(t, store, "auto-merge", timedSpec)
+	enqueue := testStageEnqueuer(store)
+	now := time.Date(2026, 7, 11, 8, 0, 0, 0, time.UTC)
+	run := startTestRun(t, store, rec, spec, enqueue, now)
+	impl := stageRow(t, store, run.ID, "impl")
+	settleBoundImplementStageJob(t, store, impl.JobID, "implemented",
+		PipelineStagePRBinding{PullRequest: 813, HeadSHA: "0123456789abcdef", Branch: "feat/813", TaskID: "task-813", LeadAgent: "coder"})
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second), &stubPipelineAutoMerger{})
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second),
+		&stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: "0123456789abcdef"}})
+
+	var gateStage Stage
+	for _, candidate := range spec.Stages {
+		if candidate.ID == "merge" {
+			gateStage = candidate
+			break
+		}
+	}
+	// The guard that makes every test below able to fail for the right reason:
+	// without the timeout the reason can never reach a caller, so a passing
+	// assertion would be proving nothing.
+	if strings.TrimSpace(gateStage.Timeout) == "" {
+		t.Fatal("this fixture must carry a gate timeout, or no reason can ever reach a summary")
+	}
+	return store, enqueue, rec, spec, run, impl.JobID, now, gateStage
+}
+
 // ROUND-10 F-6: the released-claim reason - this round's new operator-facing
 // output - was asserted by nothing, and corrupting its text survived the test
 // above. That reason is the branch's whole product: autoMergeGateWaitingWithReason
@@ -653,20 +690,7 @@ func TestPipelineAutoMergeLostClaimTreatsAReleasedClaimAsANormalRace(t *testing.
 // other, and that claim was itself only prose until now.
 func TestPipelineAutoMergeLostClaimReleasedReasonReachesAParkedSummary(t *testing.T) {
 	ctx := context.Background()
-	timedSpec := strings.Replace(pipelineAutoMergeSpec, "    merge: auto\n", "    merge: auto\n    timeout: 1m\n", 1)
-	store := pipelineAdvanceStore(t)
-	rec, spec := newTestPipeline(t, store, "auto-merge", timedSpec)
-	enqueue := testStageEnqueuer(store)
-	now := time.Date(2026, 7, 11, 8, 0, 0, 0, time.UTC)
-	run := startTestRun(t, store, rec, spec, enqueue, now)
-	impl := stageRow(t, store, run.ID, "impl")
-	sourceJobID := impl.JobID
-	settleBoundImplementStageJob(t, store, impl.JobID, "implemented",
-		PipelineStagePRBinding{PullRequest: 813, HeadSHA: "0123456789abcdef", Branch: "feat/813", TaskID: "task-813", LeadAgent: "coder"})
-	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second), &stubPipelineAutoMerger{})
-	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
-	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second),
-		&stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: "0123456789abcdef"}})
+	store, _, rec, spec, run, sourceJobID, now, gateStage := prepareTimedAutoMergeGate(t)
 
 	claim, err := json.Marshal(map[string]any{
 		"phase": "claim", "pipeline": rec.Name, "run_id": run.ID,
@@ -676,17 +700,6 @@ func TestPipelineAutoMergeLostClaimReleasedReasonReachesAParkedSummary(t *testin
 		t.Fatal(err)
 	}
 	seedConsumedAutoMergeClaim(t, store, rec, run, sourceJobID)
-
-	var gateStage Stage
-	for _, candidate := range spec.Stages {
-		if candidate.ID == "merge" {
-			gateStage = candidate
-			break
-		}
-	}
-	if strings.TrimSpace(gateStage.Timeout) == "" {
-		t.Fatal("this fixture must carry a gate timeout, or the reason can never reach a summary")
-	}
 	released := false
 	deps := pipelineStageSettleDeps{
 		store: store, rec: rec, run: run,
@@ -730,6 +743,159 @@ func TestPipelineAutoMergeLostClaimReleasedReasonReachesAParkedSummary(t *testin
 	if rows := autoMergeEventCount(t, store, sourceJobID, autoMergeClaimOrphanEventKind); rows != 0 {
 		t.Fatalf("orphan reports for a RELEASED claim = %d, want 0", rows)
 	}
+}
+
+// ROUND-11 F-1, AND IT IS THE CLASS ROUND-10 F-6 OPENED WITHOUT CLOSING.
+// F-6 established the standard - an operator-facing reason asserted by nothing is
+// not pinned - and the previous head applied it to ONE of the four reasons
+// autoMergeLostClaimOutcome emits. The review mutated two of the remaining three
+// and both survived; enumerating the function rather than the two it named finds
+// a THIRD, the inside-the-window text at the `held < autoMergeClaimOrphanAfter`
+// branch, which nobody had mutated either. All four are pinned here.
+//
+// The two the review named are not strawmen, which is why they are pinned to the
+// exact sentence: the unreadable text is the round-8 F-2 CORRECTION (this wait
+// DOES park under a stage timeout, replacing wording that said it could not), and
+// the held-past-bound text is the round-7 F-1 CORRECTION (re-run the pipeline;
+// nothing releases that claim). Left unasserted, either can silently regress to
+// the falsified wording that review already removed.
+func TestPipelineAutoMergeLostClaimReasonsAllReachAParkedSummary(t *testing.T) {
+	ctx := context.Background()
+
+	// The UNREADABLE branch's reason - round-8 F-2's correction.
+	t.Run("unreadable_timestamp", func(t *testing.T) {
+		store, _, rec, spec, run, sourceJobID, now, gateStage := prepareTimedAutoMergeGate(t)
+		seedConsumedAutoMergeClaim(t, store, rec, run, sourceJobID)
+		if err := store.ExecForTest(ctx, `UPDATE job_events SET created_at = ? WHERE job_id = ? AND kind = ?`,
+			"not-a-timestamp", sourceJobID, autoMergeClaimEventKind); err != nil {
+			t.Fatalf("corrupting the claim row's created_at: %v", err)
+		}
+		deps := pipelineStageSettleDeps{
+			store: store, rec: rec, run: run,
+			now: now.Add(2 * time.Hour),
+			autoMerge: &stubPipelineAutoMerger{
+				readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+				mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-sha"},
+			},
+		}
+		settled, state, summary, needs, _, err := gateStageSettleOutcome(ctx, deps, spec, gateStage, stageRow(t, store, run.ID, "merge"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !settled || state != StageBlocked {
+			t.Fatalf("a gate past its timeout must park: settled=%v state=%q", settled, state)
+		}
+		// BOTH remedies, because carrying both is what round-8 F-2 corrected: the
+		// wait parks under a timeout, and a re-run takes a fresh claim.
+		for _, want := range []string{
+			"carries no readable timestamp",
+			"a stage `timeout` on this gate still parks the wait",
+			"re-running the pipeline takes a fresh claim",
+		} {
+			if !strings.Contains(summary, want) {
+				t.Fatalf("park summary must carry %q: %q", want, summary)
+			}
+			if !slices.ContainsFunc(needs, func(need string) bool { return strings.Contains(need, want) }) {
+				t.Fatalf("park needs must carry %q: %v", want, needs)
+			}
+		}
+	})
+
+	// The INSIDE-THE-WINDOW reason. Not mutated by any review; found by
+	// enumerating the function instead of the findings.
+	t.Run("held_inside_the_window", func(t *testing.T) {
+		store, _, rec, spec, run, sourceJobID, _, gateStage := prepareTimedAutoMergeGate(t)
+		// The gate has been in flight for hours on real time, so it is past its
+		// 1m timeout...
+		gate := stageRow(t, store, run.ID, "merge")
+		realNow := time.Now().UTC()
+		gate.StartedAt = realNow.Add(-2 * time.Hour)
+		if err := store.UpdatePipelineRunStage(ctx, gate); err != nil {
+			t.Fatal(err)
+		}
+		// ...while the claim was taken just now, so it is INSIDE the 15m window.
+		seedConsumedAutoMergeClaim(t, store, rec, run, sourceJobID)
+		if autoMergeClaimOrphanAfter != 15*time.Minute {
+			t.Fatalf("autoMergeClaimOrphanAfter = %s, want 15m0s; this test's clock is written in literals", autoMergeClaimOrphanAfter)
+		}
+		deps := pipelineStageSettleDeps{
+			store: store, rec: rec, run: run,
+			now: realNow.Add(time.Second),
+			autoMerge: &stubPipelineAutoMerger{
+				readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+				mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-sha"},
+			},
+		}
+		settled, state, summary, _, _, err := gateStageSettleOutcome(ctx, deps, spec, gateStage, stageRow(t, store, run.ID, "merge"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !settled || state != StageBlocked {
+			t.Fatalf("a gate past its timeout must park: settled=%v state=%q", settled, state)
+		}
+		if want := "another scan holds the auto-merge claim for head"; !strings.Contains(summary, want) {
+			t.Fatalf("park summary must carry %q: %q", want, summary)
+		}
+		// The AGE is the whole content of this branch's message - it is what tells
+		// an operator the claim is young rather than orphaned.
+		if !strings.Contains(summary, "(taken ") || !strings.Contains(summary, " ago)") {
+			t.Fatalf("park summary must state how long ago the claim was taken: %q", summary)
+		}
+		// And it must NOT report a fault: inside the window there is nothing wrong.
+		if rows := autoMergeEventCount(t, store, sourceJobID, autoMergeClaimOrphanEventKind); rows != 0 {
+			t.Fatalf("orphan reports inside the window = %d, want 0", rows)
+		}
+	})
+
+	// The HELD-PAST-BOUND reason - round-7 F-1's correction. The mutant the
+	// review used here reinstated exactly the falsehood round 7 removed ("just
+	// wait, it will resolve itself"), so the assertion names the true remedy.
+	t.Run("held_past_the_bound", func(t *testing.T) {
+		store, _, rec, spec, run, sourceJobID, _, gateStage := prepareTimedAutoMergeGate(t)
+		seedConsumedAutoMergeClaim(t, store, rec, run, sourceJobID)
+		// Anchored to REAL time, because the claim's created_at is the store's own
+		// CURRENT_TIMESTAMP and a fixture clock in the past yields a NEGATIVE age
+		// that can never cross the bound (#1783 round-7).
+		realNow := time.Now().UTC()
+		if autoMergeClaimOrphanAfter != 15*time.Minute {
+			t.Fatalf("autoMergeClaimOrphanAfter = %s, want 15m0s; this test's clock is written in literals", autoMergeClaimOrphanAfter)
+		}
+		deps := pipelineStageSettleDeps{
+			store: store, rec: rec, run: run,
+			now: realNow.Add(16 * time.Minute),
+			autoMerge: &stubPipelineAutoMerger{
+				readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+				mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-sha"},
+			},
+		}
+		settled, state, summary, needs, _, err := gateStageSettleOutcome(ctx, deps, spec, gateStage, stageRow(t, store, run.ID, "merge"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !settled || state != StageBlocked {
+			t.Fatalf("a gate past its timeout must park: settled=%v state=%q", settled, state)
+		}
+		for _, want := range []string{
+			"is still held with no merge and no release",
+			"nothing in the pipeline releases that claim",
+			"re-running the pipeline takes a fresh claim",
+		} {
+			if !strings.Contains(summary, want) {
+				t.Fatalf("park summary must carry %q: %q", want, summary)
+			}
+			if !slices.ContainsFunc(needs, func(need string) bool { return strings.Contains(need, want) }) {
+				t.Fatalf("park needs must carry %q: %v", want, needs)
+			}
+		}
+		// The text must NOT promise the recovery round 7 removed.
+		if strings.Contains(summary, "merges as soon as the claim is released") {
+			t.Fatalf("park summary promises a release nothing performs: %q", summary)
+		}
+		// Past the bound this branch DOES record, once.
+		if rows := autoMergeEventCount(t, store, sourceJobID, autoMergeClaimOrphanEventKind); rows != 1 {
+			t.Fatalf("suspicion rows past the bound = %d, want exactly 1", rows)
+		}
+	})
 }
 
 // F-6's calibration, pinned directly. The gate's StartedAt is stamped when the

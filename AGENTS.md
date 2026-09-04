@@ -607,9 +607,9 @@ Record every activation with:
 `mode: <THROUGHPUT|STEADY|DRAIN>`,
 `decision_ref: workflow-note:<id>`,
 `change_ref: none|pr:<owner/repo>#<number>@<40-character-reviewed-head>`,
-`activation_ref: none|workflow-note:<id>|commit:<40-character merge SHA>`,
+`activation_ref: none|workflow-note:<id>|commit:<40-character-merge-sha>`,
 `decided_at: <RFC3339>`,
-`effective_at: <RFC3339>`,
+`effective_at: none|<RFC3339>`,
 `observed_at: <RFC3339>`, zero or more
 `implementer: <seat> issue=<number> pr=<number|none> accepted_at=<RFC3339>`
 lines, zero or more `review: <job-id> pr=<number> created_at=<RFC3339>` lines,
@@ -617,7 +617,7 @@ then `[/workload-mode-transition]`.
 
 RESOLVED IN ONE DIRECTION, because this document said both and a reader could
 pick either (#1783 round-8 review, F-3): ONLY A MERGED COMMIT ACTIVATES A MODE.
-`commit:<40-character merge SHA>` is therefore the ONLY ACTIVATING form. The
+`commit:<40-character-merge-sha>` is therefore the ONLY ACTIVATING form. The
 other two record a mode that is not active yet: `workflow-note:<id>` for a
 decision not yet materialised by a merged marker PR, and `none` for a record
 posted before any marker PR exists - never for claiming a mode is active. That
@@ -625,7 +625,8 @@ matches point 1 of "DERIVE, never trust a marker id" above: the active mode is
 the marker line in `origin/main:AGENTS.md`, changed by a merged PR, and a
 decision note is not itself the marker. `decision_ref` carries the note,
 `change_ref` the PR and its reviewed head, `decided_at` the note's timestamp,
-and `effective_at` the merge commit's `mergedAt`.
+and `effective_at` the merge commit's `mergedAt` - or `none` on both while no
+marker PR has merged, which the grammar line above now admits.
 
 A note-sourced DRAIN therefore does not become active on its note alone: it is
 decided at the note, freezes admissions from `decided_at` as below, and
