@@ -137,23 +137,34 @@ func TestWellFormedGateConfigIsUnchanged(t *testing.T) {
 // the malformed line stops being a boundary, the override is misattributed to
 // the still-open section, and the loader returns the override - so a revert at
 // any covered site fails here rather than passing quietly.
-// COVERAGE, STATED AS A COUNT RATHER THAN IMPLIED. sectionHeader has 26 call
-// sites across 22 files in this package. Pinned through a production loader
-// here: the 4 guard loaders by refusal (merge_gate, admission, workflow,
-// review) and 8 by routing (parallel_sessions, transcripts, router, daemon,
-// github, remote_exec, credentials, plus admission's original regression) - 12
-// of 26 (8 routing + 4 guards + admission original, then 4 more in
-// TestMalformedHeaderRoutingRemainingLoaders = 16).
+// COVERAGE, STATED AS A COUNT RATHER THAN IMPLIED, and derived here because
+// this is the only place the number is actually computed - the previous
+// decomposition double-counted admission and is what produced section.go's
+// wrong 16 while 15 were pinned (#1795 review N1, P2-1c).
 //
-// NOT PINNED, and named so the next reader does not have to re-derive it:
-// github_remote, heartbeats, implement_base, memory, repo_concurrency,
-// result_checks, runtime_registry, stale_tasks (3 sites), workflow_lifecycle,
-// orchestrate's LoadOrchestratePolicy and LoadEventsPolicy, org.go's
-// parseOrgContent (which has its own stricter org-shaped refusal), and
+// sectionHeader has 26 call sites across 22 files in this package. PINNED
+// through a production loader, 16 DISTINCT sites:
+//
+//	4 guard loaders, by refusal, in TestGateLoadersRefuseTheirOwnMalformedHeader:
+//	  merge_gate.go:112, admission.go:74, require_workflow.go:71,
+//	  orchestrate.go:625 (via LoadReviewConfig)
+//	8 by routing, here: parallel_sessions.go:46, transcripts.go:50, router.go:46,
+//	  daemon_runtime.go:99, github_limiter.go:80, remote_exec.go:72,
+//	  credentials.go:52, heartbeats.go:61
+//	4 in TestMalformedHeaderRoutingRemainingLoaders: result_checks.go:59,
+//	  memory.go:185, runtime_registry.go:61, repo_concurrency.go:56
+//
+// admission appears ONCE, under the guard loaders. Its routing regression is
+// the same call site proven a second way, not a seventeenth site.
+//
+// NOT PINNED, the remaining 10, named so the next reader does not have to
+// re-derive them: github_remote, implement_base, stale_tasks (3 sites),
+// workflow_lifecycle, orchestrate's LoadOrchestratePolicy and LoadEventsPolicy,
+// org.go's parseOrgContent (which has its own stricter org-shaped refusal), and
 // edit_compat's configSectionAtParseError (a diagnostic, not a loader). Those
 // loaders key off prefixes, repo-scoped names or no fixed section string, so
 // each needs its own observable field; a revert at one of them would NOT fail
-// this test.
+// this test. 16 pinned + 10 unpinned = 26.
 func TestMalformedHeaderRoutingPerCallSite(t *testing.T) {
 	t.Run("parallel_sessions", func(t *testing.T) {
 		paths := writeGateConfig(t, "[parallel_sessions]\nsame_session = \"queue\"\n[parallel_sessions\nsame_session = \"fork_temp_session\"\n")
@@ -224,8 +235,6 @@ func TestMalformedHeaderRoutingPerCallSite(t *testing.T) {
 		}
 	})
 
-	// The valid-header path for the same loaders, so these assertions cannot be
-	// satisfied by a loader that simply ignores everything.
 	t.Run("agents heartbeats", func(t *testing.T) {
 		// The site section.go previously recorded as unpinnable. A same-shape
 		// fixture DID pass under the reverted call site, but only because it
@@ -249,6 +258,8 @@ func TestMalformedHeaderRoutingPerCallSite(t *testing.T) {
 		}
 	})
 
+	// The valid-header path for the same loaders, so these assertions cannot be
+	// satisfied by a loader that simply ignores everything.
 	t.Run("valid headers still apply their values", func(t *testing.T) {
 		policy, err := LoadParallelSessionPolicy(writeGateConfig(t, "[parallel_sessions]\nsame_session = \"fork_temp_session\"\n"))
 		if err != nil {
@@ -277,11 +288,13 @@ func TestMalformedHeaderRoutingPerCallSite(t *testing.T) {
 // each was MUTATION-PROVEN: reverting that loader's call site to the inline
 // two-bracket form fails the matching subtest.
 //
-// NOT INCLUDED, and stated rather than quietly omitted: [agents.*] heartbeats.
-// A test of the same shape PASSED under the reverted call site, because an
-// enabled flag alone does not make LoadHeartbeats emit a distinguishable
-// entry - so it would have been coverage in name only. That site remains
-// unpinned and is counted as such.
+// [agents.*] heartbeats WAS listed here as not-included, on the grounds that a
+// same-shape test passed under the reverted call site. That was wrong twice
+// over and is retracted: the fixture omitted a PRECEDING heartbeat whose field
+// the misattributed key could overwrite, and a heartbeat without
+// repo/interval/prompt fails validation at BOTH arms, so it discriminated
+// nothing. The site is pinned in TestMalformedHeaderRoutingPerCallSite
+// ("agents heartbeats") and counted there (#1795 review N2, P2-1a).
 func TestMalformedHeaderRoutingRemainingLoaders(t *testing.T) {
 	t.Run("result_checks", func(t *testing.T) {
 		mode, err := LoadResultChecksMode(writeGateConfig(t, "[workflow]\nresult_checks = warn\n[workflow\nresult_checks = block\n"))

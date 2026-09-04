@@ -65,8 +65,10 @@ type rowScanner = interface {
 // promise `[]` rather than `null` say so in one readable token and a grep for
 // emptyIfNil enumerates exactly which list methods carry that promise.
 //
-// ONE SHAPE DIVERGENCE, stated because the call-site comments justify this
-// wrapper by the LATE-iteration path and were silent about the early one: on a
+// ONE SHAPE DIVERGENCE, stated here because this is the single source of truth
+// for the wrapper's contract. The call sites USED TO justify it by the
+// LATE-iteration path and were silent about the early one; they now point here
+// instead of restating it (#1795 review N4, P3-2). The divergence: on a
 // QUERY-time failure these methods now return a non-nil len-0 slice alongside
 // the error, where the pre-#1759 bodies returned nil because they failed before
 // any normalisation could run. Only a caller that IGNORES err and tests the
