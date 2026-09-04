@@ -207,10 +207,12 @@ func (s *Store) ListDashboardBlockedJobs(ctx context.Context) ([]DashboardJobRow
 				&item.Payload, &item.CreatedAt, &item.UpdatedAt, &item.Reason)
 			return item, err
 		})
-	// Pre-#1759 these loaders returned `accumulator, rows.Err()`, so a LATE
-	// iteration error arrived WITH the rows already read. Returning nil here
-	// would silently convert an iteration failure into an empty result, which
-	// is the one shape a caller checking only the slice cannot notice.
+	// emptyIfNil (query_list.go) is the whole contract, including the QUERY-time
+	// divergence this justification used to omit: on an early failure these
+	// methods return a non-nil len-0 slice with the error, where the pre-#1759
+	// bodies returned nil. Stated once there rather than restated here, because
+	// six copies of a justification drift and the previous six were already
+	// silent about half of it (#1795 review N4).
 	return emptyIfNil(out), err
 }
 

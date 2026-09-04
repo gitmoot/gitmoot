@@ -442,10 +442,12 @@ func (s *Store) FindActiveAgentInstance(ctx context.Context, typ string, repo st
 func (s *Store) ListAgentInstances(ctx context.Context) ([]AgentInstance, error) {
 	out, err := queryList(ctx, s.db, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, template_id, model, effort, capabilities_json, autonomy_policy, state, created_at, last_used_at, expires_at
 		FROM agent_instances ORDER BY type, repo_full_name, name`, nil, scanAgentInstance)
-	// Pre-#1759 these loaders returned `accumulator, rows.Err()`, so a LATE
-	// iteration error arrived WITH the rows already read. Returning nil here
-	// would silently convert an iteration failure into an empty result, which
-	// is the one shape a caller checking only the slice cannot notice.
+	// emptyIfNil (query_list.go) is the whole contract, including the QUERY-time
+	// divergence this justification used to omit: on an early failure these
+	// methods return a non-nil len-0 slice with the error, where the pre-#1759
+	// bodies returned nil. Stated once there rather than restated here, because
+	// six copies of a justification drift and the previous six were already
+	// silent about half of it (#1795 review N4).
 	return emptyIfNil(out), err
 }
 

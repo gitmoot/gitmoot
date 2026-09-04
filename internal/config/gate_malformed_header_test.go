@@ -226,6 +226,29 @@ func TestMalformedHeaderRoutingPerCallSite(t *testing.T) {
 
 	// The valid-header path for the same loaders, so these assertions cannot be
 	// satisfied by a loader that simply ignores everything.
+	t.Run("agents heartbeats", func(t *testing.T) {
+		// The site section.go previously recorded as unpinnable. A same-shape
+		// fixture DID pass under the reverted call site, but only because it
+		// omitted a PRECEDING heartbeat whose field the misattributed key could
+		// overwrite - and because a heartbeat missing repo/interval/prompt fails
+		// validation at both arms, which reads as "unpinnable" rather than as a
+		// broken fixture (#1795 review N2).
+		paths := writeGateConfig(t, "[agents.a.heartbeats.h1]\nrepo = \"owner/repo\"\ninterval = \"1h\"\nprompt = \"first\"\n[agents.a.heartbeats.h2\nprompt = \"second\"\n")
+		beats, err := LoadHeartbeats(paths)
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if len(beats) != 1 {
+			t.Fatalf("heartbeats = %d (%+v), want exactly h1: the malformed header must open nothing", len(beats), beats)
+		}
+		if beats[0].Name != "h1" {
+			t.Fatalf("heartbeat name = %q, want h1", beats[0].Name)
+		}
+		if beats[0].Prompt != "first" {
+			t.Fatalf("prompt = %q, want first: the key under the malformed header was misattributed to the previous heartbeat", beats[0].Prompt)
+		}
+	})
+
 	t.Run("valid headers still apply their values", func(t *testing.T) {
 		policy, err := LoadParallelSessionPolicy(writeGateConfig(t, "[parallel_sessions]\nsame_session = \"fork_temp_session\"\n"))
 		if err != nil {

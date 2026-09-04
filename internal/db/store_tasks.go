@@ -84,10 +84,12 @@ func (s *Store) GetRepo(ctx context.Context, fullName string) (Repo, error) {
 func (s *Store) ListRepos(ctx context.Context) ([]Repo, error) {
 	out, err := queryList(ctx, s.db, `SELECT owner, name, default_branch, remote_url, checkout_path, primary_checkout_path, enabled, poll_interval, last_poll_at, last_error
 		FROM repos ORDER BY full_name`, nil, scanRepo)
-	// Pre-#1759 these loaders returned `accumulator, rows.Err()`, so a LATE
-	// iteration error arrived WITH the rows already read. Returning nil here
-	// would silently convert an iteration failure into an empty result, which
-	// is the one shape a caller checking only the slice cannot notice.
+	// emptyIfNil (query_list.go) is the whole contract, including the QUERY-time
+	// divergence this justification used to omit: on an early failure these
+	// methods return a non-nil len-0 slice with the error, where the pre-#1759
+	// bodies returned nil. Stated once there rather than restated here, because
+	// six copies of a justification drift and the previous six were already
+	// silent about half of it (#1795 review N4).
 	return emptyIfNil(out), err
 }
 
@@ -196,10 +198,12 @@ func (s *Store) ListGoals(ctx context.Context) ([]Goal, error) {
 			err := row.Scan(&goal.ID, &goal.Title, &goal.Source, &goal.Status)
 			return goal, err
 		})
-	// Pre-#1759 these loaders returned `accumulator, rows.Err()`, so a LATE
-	// iteration error arrived WITH the rows already read. Returning nil here
-	// would silently convert an iteration failure into an empty result, which
-	// is the one shape a caller checking only the slice cannot notice.
+	// emptyIfNil (query_list.go) is the whole contract, including the QUERY-time
+	// divergence this justification used to omit: on an early failure these
+	// methods return a non-nil len-0 slice with the error, where the pre-#1759
+	// bodies returned nil. Stated once there rather than restated here, because
+	// six copies of a justification drift and the previous six were already
+	// silent about half of it (#1795 review N4).
 	return emptyIfNil(out), err
 }
 

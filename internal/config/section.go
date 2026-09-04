@@ -41,9 +41,16 @@ import "strings"
 // is MUTATION-PROVEN - reverting that site to the old two-bracket form fails a
 // named subtest. See TestMalformedHeaderRoutingPerCallSite and
 // TestMalformedHeaderRoutingRemainingLoaders, which together name what is NOT
-// pinned, including one site ([agents.*] heartbeats) where a same-shape test
-// passed under the reverted call site and was therefore rejected rather than
-// counted. A revert of an unpinned site would not fail the suite today.
+// pinned. A revert of an unpinned site would not fail the suite today.
+//
+// The count is 16 only since the [agents.*] heartbeats pin landed. This comment
+// previously claimed 16 while 15 were pinned, and explained the shortfall by
+// calling that site unpinnable because a same-shape test passed under the
+// reverted call site. Both halves were wrong (#1795 review N1/N2): the site is
+// pinnable, and the fixture was at fault twice over - it omitted a PRECEDING
+// heartbeat whose field the misattributed key could overwrite, and a heartbeat
+// without repo/interval/prompt fails validation at BOTH arms, which reads as
+// "the site cannot be pinned" rather than as "this fixture proves nothing".
 //
 // A valid header is byte-equivalent to the old behaviour: same trimming, same
 // name. Only the invalid-input path changes.
