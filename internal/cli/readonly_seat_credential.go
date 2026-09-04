@@ -207,6 +207,13 @@ func readOnlySeatRuntimeAuthEnvForPaths(paths config.Paths, runtimeName string, 
 
 const readOnlySeatCredentialExpiredEvent = "readonly_seat_credential_expired"
 
+// kimiCredentialDegradedEvent names the #1856 report-only observation: the LIVE
+// kimi credential was usable before a non-seat delivery and is not after it.
+// Attribution is INFERRED - the event records that a kimi child ran while the
+// file changed, never that this child wrote it, because gitmoot writes this
+// file nowhere and the only writer is the vendor CLI.
+const kimiCredentialDegradedEvent = "kimi_credential_degraded"
+
 func (w jobWorker) recordReadOnlySeatCredentialDiagnosis(ctx context.Context, jobID, diagnosis string) error {
 	events, err := w.Store.ListJobEvents(ctx, jobID)
 	if err != nil {

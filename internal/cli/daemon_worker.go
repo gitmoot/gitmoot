@@ -883,7 +883,13 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 	}
 	nativeReviewDeliveryStarted = true
+	// #1856 report-only detector, caller 2 of 2: a NON-SEAT delivery runs the
+	// runtime CLI against the operator's live profile (a read-only seat reads a
+	// staged clone instead, which the child may legitimately rewrite - so seats
+	// are excluded here rather than filtered later).
+	credentialBefore, credentialObserved := w.observeNonSeatKimiCredential(agent)
 	_, err = engine.RunJob(runCtx, job.ID, agent, adapter)
+	w.recordKimiCredentialDegradation(ctx, job.ID, agent, credentialBefore, credentialObserved)
 	stopKillPending()
 	stopProgress()
 	if readOnlyState != nil {
@@ -4318,4 +4324,47 @@ func (w jobWorker) workflowHome() string {
 
 func (w jobWorker) defaultCommenter(_ string) github.Client {
 	return github.NewClient("")
+}
+
+// observeNonSeatKimiCredential reads the LIVE kimi credential a non-seat
+// delivery is about to exercise (#1856).
+//
+// It observes nothing for a read-only seat: that child reads a staged clone
+// inside its own writable cache root, so a change there says nothing about the
+// operator's profile and its events would be indistinguishable from real ones.
+// It also observes nothing for other runtimes - claude's credential has its own
+// staging-side machinery (#1808) and codex was never reported for this.
+func (w jobWorker) observeNonSeatKimiCredential(agent runtime.Agent) (runtime.KimiCredentialObservation, bool) {
+	if agent.Runtime != runtime.KimiRuntime || agent.ReadOnlySeat {
+		return runtime.KimiCredentialObservation{}, false
+	}
+	dir, err := resolveRuntimeConfigDir(runtime.KimiRuntime, agent.RuntimeConfigDir)
+	if err != nil {
+		return runtime.KimiCredentialObservation{}, false
+	}
+	return runtime.ObserveKimiCredential(dir)
+}
+
+// recordKimiCredentialDegradation re-reads the credential after the run and
+// records ONE job event when it got worse, on success and failure alike - a
+// blanking during a run that SUCCEEDS is the measured #1856 shape.
+//
+// Report-only: it never writes the credential, and a recording failure is
+// swallowed to a line on stdout rather than affecting the job's outcome.
+func (w jobWorker) recordKimiCredentialDegradation(ctx context.Context, jobID string, agent runtime.Agent, before runtime.KimiCredentialObservation, observed bool) {
+	if !observed {
+		return
+	}
+	after, ok := w.observeNonSeatKimiCredential(agent)
+	degraded := runtime.KimiCredentialDegradation(before, after, ok)
+	if degraded == "" {
+		return
+	}
+	if err := w.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   jobID,
+		Kind:    kimiCredentialDegradedEvent,
+		Message: degraded,
+	}); err != nil {
+		writeLine(w.Stdout, "job %s kimi credential degradation record failed: %v", jobID, err)
+	}
 }

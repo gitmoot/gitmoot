@@ -2478,9 +2478,22 @@ func runAgentDoctor(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "agent %s ok\n", rtAgent.Name)
 		return 0
 	}
-	if err := adapter.Health(context.Background(), rtAgent); err != nil {
+	// #1856 report-only detector, caller 1 of 2: runAgentDoctor's Health path runs
+	// the runtime CLI through the PLAIN runner with no seat sandbox and no staged
+	// profile, so a kimi child here reads the LIVE profile. Bracket it.
+	//
+	// `agent doctor` is a command, not a job, so there is no job row to attach an
+	// event to and the observation is reported on stderr beside the health result.
+	// The daemon's non-seat delivery path records the same observation as a job
+	// event; this one names the command instead.
+	credentialBefore, credentialObserved := observeKimiDoctorCredential(rtAgent)
+	healthErr := adapter.Health(context.Background(), rtAgent)
+	if degraded := kimiCredentialDegradationSinceDoctor(rtAgent, credentialBefore, credentialObserved); degraded != "" {
+		fmt.Fprintf(stderr, "agent %s %s (observed across `gitmoot agent doctor`)\n", rtAgent.Name, degraded)
+	}
+	if healthErr != nil {
 		_ = persistAgentHealth(*home, name, "failed")
-		fmt.Fprintf(stderr, "agent %s health failed: %v\n", rtAgent.Name, err)
+		fmt.Fprintf(stderr, "agent %s health failed: %v\n", rtAgent.Name, healthErr)
 		return 1
 	}
 	if err := persistAgentHealth(*home, name, "ok"); err != nil {
@@ -2489,6 +2502,30 @@ func runAgentDoctor(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "agent %s ok\n", rtAgent.Name)
 	return 0
+}
+
+// observeKimiDoctorCredential reads the live kimi credential a doctor Health
+// check is about to exercise. Non-kimi runtimes and an unresolvable profile
+// return observed=false, so nothing is claimed about them.
+func observeKimiDoctorCredential(agent runtime.Agent) (runtime.KimiCredentialObservation, bool) {
+	if agent.Runtime != runtime.KimiRuntime {
+		return runtime.KimiCredentialObservation{}, false
+	}
+	dir, err := resolveRuntimeConfigDir(runtime.KimiRuntime, agent.RuntimeConfigDir)
+	if err != nil {
+		return runtime.KimiCredentialObservation{}, false
+	}
+	return runtime.ObserveKimiCredential(dir)
+}
+
+// kimiCredentialDegradationSinceDoctor re-reads the same credential after the
+// check and reports only a degradation.
+func kimiCredentialDegradationSinceDoctor(agent runtime.Agent, before runtime.KimiCredentialObservation, observed bool) string {
+	if !observed {
+		return ""
+	}
+	after, ok := observeKimiDoctorCredential(agent)
+	return runtime.KimiCredentialDegradation(before, after, ok)
 }
 
 func persistAgentHealth(home, name, status string) error {
