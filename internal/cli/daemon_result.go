@@ -149,6 +149,27 @@ func (w jobWorker) finalizeMidRunDelegationChild(ctx context.Context, jobID stri
 	return w.finalizeDelegationChildTerminal(ctx, jobID, cause, w.finalizeFailedDelegationChild)
 }
 
+// permissionBlockFinalizerFor maps the source state a permission-block CAS
+// actually matched to the finalizer that describes it truthfully. It is an
+// EXHAUSTIVE switch over the three arms markJobPermissionBlockedAtGeneration
+// accepts, with a default that REFUSES rather than guessing: the previous form
+// tested JobQueued by equality and let every other state fall through to the
+// mid-run label, so appending a fourth `from` to that CAS would have silently
+// acquired "failed mid-run without a result" — the same defect one iteration
+// later (#1852). A new arm now fails loudly here instead.
+func (w jobWorker) permissionBlockFinalizerFor(blockedFrom workflow.JobState) (func(context.Context, string, error) error, error) {
+	switch blockedFrom {
+	case workflow.JobQueued:
+		// Never claimed: no adapter, no prompt, no deadline started.
+		return w.finalizePreflightDelegationChild, nil
+	case workflow.JobRunning, workflow.JobFailed:
+		// It ran. A row that reached failed had a run to fail.
+		return w.finalizeMidRunDelegationChild, nil
+	default:
+		return nil, fmt.Errorf("permission block matched unexpected source state %q: no finalizer describes it, and guessing one would record a cause that did not happen", blockedFrom)
+	}
+}
+
 type jobTimeoutEvidence struct {
 	Deadline time.Time
 	Started  time.Time
@@ -210,9 +231,9 @@ func (w jobWorker) handleRunJobError(ctx context.Context, jobID string, observed
 				// #1407 window sits between that read and this write. Both helpers
 				// no-op for a non-delegation job (ParentJobID empty) or one that already
 				// stored a result, so the solo-implement case stays byte-identical.
-				finalize := w.finalizeMidRunDelegationChild
-				if blockedFrom == workflow.JobQueued {
-					finalize = w.finalizePreflightDelegationChild
+				finalize, finalizeErr := w.permissionBlockFinalizerFor(blockedFrom)
+				if finalizeErr != nil {
+					return finalizeErr
 				}
 				if err := finalize(ctx, jobID, errors.New(agentPermissionBlockedMessage)); err != nil {
 					return err

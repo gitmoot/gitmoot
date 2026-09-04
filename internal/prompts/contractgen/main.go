@@ -59,6 +59,7 @@ var resultFieldAnnotations = map[string]fieldAnnotation{
 	"tests_run":       {example: "[]"},
 	"needs":           {example: "[]"},
 	"delegations":     {example: "[]"},
+	"evidence":        {help: `top-level evidence (string, one of ` + enumList(workflow.EvidenceKinds) + `): REQUIRED on reviews. Say "executed" only if you actually ran the commands you cite; say "static_only" when you read code and could not run it (no toolchain, no network, a sandbox refusal). Never infer test success from inability to execute, and never claim "executed" for a command you could not run - a static-only review is a legitimate verdict, a mislabeled one is not. Omitting it is recorded as static_only.`},
 	"artifact_body":   {help: `top-level artifact_body (string) is required when any delegation requests artifacts.`},
 	"human_questions": {help: `top-level human_questions (object[], optional): use SPARINGLY to pause for a specific human decision instead of guessing; each entry is {` + humanQuestionFieldsHelp() + `}. Returning it pauses the tree awaiting a human answer (no leg fails, no continuation runs); a human replies with /gitmoot resume <job> answer "<id>: ...". Leave it absent when you can proceed.`},
 	"learnings":       {help: `top-level learnings (object[], optional): use RARELY to record a durable, keyed FACT worth remembering next time (e.g. "this repo's arm64 CI is flaky"), NOT a directive and NOT for this job only. Each entry is {` + learningFieldsHelp() + `}. Most jobs return none; leave it absent unless you learned something that will help a future job.`},
@@ -260,6 +261,14 @@ func renderDelegationHelp() string {
 	if h := resultFieldAnnotations["severity"].help; h != "" {
 		b.WriteString("- " + h + "\n")
 	}
+	if h := resultFieldAnnotations["evidence"].help; h != "" {
+		b.WriteString("- " + h + "\n")
+	}
+	// #1839: the seat is HANDED prior verdicts and had no way to learn it.
+	// Runtime agents receive only this prompt - not the skill docs - so an
+	// artifact announced solely through an environment variable and an
+	// operator-facing troubleshooting page is staged and undirected.
+	b.WriteString("- if the environment variable GITMOOT_PRIOR_VERDICTS names a file, it holds the prior review verdicts for the repo under review, rendered as JSON and frozen at its own as_of time. READ IT before concluding there are none, and treat a verdict recorded after as_of as absent rather than missing. Each entry carries the reviewer, head_sha, decision, severity, findings count and that verdict's own evidence mode.\n")
 	// artifact_body lives on the top-level result, not on a delegation, but it
 	// is conditionally required by delegations, so document it here.
 	if h := resultFieldAnnotations["artifact_body"].help; h != "" {

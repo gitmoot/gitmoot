@@ -53,7 +53,7 @@ func TestWrapReadOnlySandboxAdapterCuratesEveryRunnerShape(t *testing.T) {
 		"env injecting over group":      subprocess.EnvInjectingRunner{Inner: subprocess.GroupRunner{}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			wrapped, _, err := wrapReadOnlySandboxAdapter(home, agent, checkout, runtime.ClaudeAdapter{Runner: runner})
+			wrapped, _, err := wrapReadOnlySandboxAdapter(home, agent, checkout, "", runtime.ClaudeAdapter{Runner: runner})
 			if err != nil {
 				t.Fatalf("wrapReadOnlySandboxAdapter: %v", err)
 			}
@@ -106,7 +106,7 @@ func TestWrapReadOnlySandboxAdapterWithholdsAuthInGatewayMode(t *testing.T) {
 	}
 	agent := runtime.Agent{Runtime: runtime.ClaudeRuntime, ReadOnlySeat: true}
 
-	wrapped, _, err := wrapReadOnlySandboxAdapter(home, agent, checkout, adapter)
+	wrapped, _, err := wrapReadOnlySandboxAdapter(home, agent, checkout, "", adapter)
 	if err != nil {
 		t.Fatalf("wrapReadOnlySandboxAdapter: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestTranscriptOutputKeepsTheReadOnlySeatSandbox(t *testing.T) {
 	}
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
 	agent := runtime.Agent{Runtime: runtime.ClaudeRuntime, ReadOnlySeat: true}
-	seatAdapter, _, err := wrapReadOnlySandboxAdapter(home, agent, checkout,
+	seatAdapter, _, err := wrapReadOnlySandboxAdapter(home, agent, checkout, "",
 		runtime.ClaudeAdapter{Runner: subprocess.CuratedGroupRunner{}})
 	if err != nil {
 		t.Fatal(err)

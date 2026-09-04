@@ -972,13 +972,17 @@ func TestMidRunPermissionBlockedNonDelegationUnaffected(t *testing.T) {
 	if cp.Result != nil {
 		t.Fatalf("non-delegation permission-blocked job must NOT get a synthetic result: %+v", cp.Result)
 	}
-	// The kind counted here must be one this path CAN emit, or the guard cannot fail:
-	// the mid-run permission branch now records delegation_runtime_failure_finalized,
-	// so counting delegation_refused_finalized watched a dead string — the same
-	// vacuity this issue removed from lifecycle_race_test.go, reintroduced one file
-	// over (#1512).
-	if n := countWorkerJobEvents(t, store, "impl-job", "delegation_runtime_failure_finalized"); n != 0 {
-		t.Fatalf("delegation_runtime_failure_finalized events = %d, want 0 for a non-delegation job", n)
+	// BOTH kinds must be zero, not just whichever one this path happens to emit
+	// today. Counting only the emitted kind was a swap, not coverage: since
+	// daemon_result.go can now legitimately route a permission-blocked child to the
+	// REFUSED kind as well, a regression leaking either kind onto a NON-delegation
+	// job would go uncounted here (#1852). Counting the emitted kind is what makes
+	// the guard able to fail at all — the previous form watched a dead string
+	// (#1512) — and counting both is what makes it cover the path.
+	for _, kind := range []string{"delegation_runtime_failure_finalized", "delegation_refused_finalized"} {
+		if n := countWorkerJobEvents(t, store, "impl-job", kind); n != 0 {
+			t.Fatalf("%s events = %d, want 0 for a non-delegation job", kind, n)
+		}
 	}
 	// LIVENESS of that counter: the identical assertion on a DELEGATION child of the
 	// same mid-run path must observe exactly one such event, so a rename that killed
