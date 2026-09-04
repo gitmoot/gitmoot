@@ -338,7 +338,21 @@ func (e Engine) approvalSupersedesChangesRequested(ctx context.Context, payload 
 			currentHead = strings.TrimSpace(pr.HeadSHA)
 		}
 	}
-	if currentHead != "" && approvingHead != currentHead {
+	if currentHead == "" {
+		// The current head could not be confirmed, so there is NO evidence this
+		// approval is newer than the objection. An earlier draft admitted here when
+		// some review had objected at a different head, but "a different head"
+		// carries no ordering: this PR rejects job recency as unsound precisely
+		// because ListJobs orders by id and created_at is second-granularity, and
+		// the same argument disqualifies it here. Admitting would let an approval
+		// merge over a live, current objection whenever the row is missing - which
+		// the CLI dispatch path can reach on a PR the daemon never polled
+		// (#1871 review, P1). Refusing only leaves the task where it already is.
+		return false, fmt.Sprintf(
+			"no observed pull request row records a current head for %s#%d, so this approval cannot be shown to be bound to it",
+			payload.Repo, payload.PullRequest), nil
+	}
+	if approvingHead != currentHead {
 		return false, fmt.Sprintf(
 			"approval is bound to head %s but the pull request's current head is %s; an approval at a superseded head does not clear changes_requested",
 			approvingHead, currentHead), nil
@@ -348,7 +362,6 @@ func (e Engine) approvalSupersedesChangesRequested(ctx context.Context, payload 
 		return false, "", err
 	}
 	blockingSeverity := e.reviewBlockingSeverity(payload.Repo)
-	objectionElsewhere := false
 	for _, job := range jobs {
 		if job.Type != "review" || job.State != "succeeded" {
 			continue
@@ -363,23 +376,14 @@ func (e Engine) approvalSupersedesChangesRequested(ctx context.Context, payload 
 		if effectiveReviewDecisionForPayload(jobPayload, blockingSeverity) != "changes_requested" {
 			continue
 		}
-		head := strings.TrimSpace(jobPayload.HeadSHA)
-		if head == approvingHead {
+		// Only an objection AT THE CURRENT HEAD can block: by here the approving
+		// head IS the current head, and an objection at any other head is one the
+		// current head supersedes. No ordering is needed or attempted.
+		if strings.TrimSpace(jobPayload.HeadSHA) == approvingHead {
 			return false, fmt.Sprintf(
 				"a review at head %s requested changes, so the objection stands even though this review approved the same head",
 				approvingHead), nil
 		}
-		if head != "" {
-			objectionElsewhere = true
-		}
-	}
-	if currentHead == "" && !objectionElsewhere {
-		// No observed pull request row AND no objection at another head: nothing
-		// here shows the tree moved past whatever set changes_requested, so admitting
-		// would be a guess. Refuse and say which fact is missing.
-		return false, fmt.Sprintf(
-			"no observed pull request row records a current head for %s#%d and no review objected at a different head, so this approval cannot be shown to supersede the objection",
-			payload.Repo, payload.PullRequest), nil
 	}
 	return true, "", nil
 }

@@ -260,3 +260,72 @@ func TestApprovalOnReviewingTaskStillClaimsReviewing(t *testing.T) {
 		t.Fatal("task stayed in reviewing; the approval should have advanced it")
 	}
 }
+
+// The missing-pull_requests-row branch, in BOTH directions (#1871 review P1/P3).
+// Every other test here seeds the observed row, so without these the refusal path
+// has no coverage - and the first version of it ADMITTED whenever some review had
+// objected at a different head, which carries no ordering at all and could merge
+// over a live objection.
+func TestApprovalWithoutAnObservedPullRequestRowIsRefused(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name            string
+		objectionAtHead string
+	}{
+		// The dangerous case: an objection elsewhere used to be read as "the tree
+		// moved on", which it is not - nothing orders the two heads.
+		{name: "objection at another head", objectionAtHead: "head-old"},
+		{name: "objection at this head", objectionAtHead: "head-new"},
+		{name: "no objection recorded", objectionAtHead: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openEngineStore(t)
+			seedWedgedTask(t, store)
+			seedImplementAttribution(t, store)
+			// Deliberately NO seedObservedPullRequest: the forge head is unknown.
+			engine, gh := wedgeEngine(t, store)
+			if tc.objectionAtHead != "" {
+				seedReviewJob(t, store, "review-objection", "auditor", tc.objectionAtHead, "changes_requested", JobSucceeded)
+			}
+			seedReviewJob(t, store, "review-new", "auditor", "head-new", "approved", JobSucceeded)
+
+			if err := engine.AdvanceJob(ctx, "review-new"); err != nil {
+				t.Fatalf("AdvanceJob returned error: %v", err)
+			}
+			assertTaskState(t, store, "task-9", TaskChangesRequested)
+			if len(gh.merges) != 0 {
+				t.Fatalf("merge calls = %d, want 0: an unconfirmed current head must never admit an approval", len(gh.merges))
+			}
+			if reason := heldReason(t, store, "review-new"); !strings.Contains(reason, "no observed pull request row") {
+				t.Fatalf("held reason = %q, want it to name the missing pull request row", reason)
+			}
+		})
+	}
+}
+
+// ...and once the row appears, the same approval is admitted. This is the pair to
+// the refusal above: it proves the refusal is about the MISSING EVIDENCE and not a
+// blanket block that would re-wedge every task.
+func TestApprovalAdmittedOnceThePullRequestRowAppears(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedWedgedTask(t, store)
+	seedImplementAttribution(t, store)
+	engine, gh := wedgeEngine(t, store)
+	seedReviewJob(t, store, "review-old", "auditor", "head-old", "changes_requested", JobSucceeded)
+	seedReviewJob(t, store, "review-new", "auditor", "head-new", "approved", JobSucceeded)
+
+	if err := engine.AdvanceJob(ctx, "review-new"); err != nil {
+		t.Fatalf("AdvanceJob (no row) returned error: %v", err)
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("merged with no observed pull request row")
+	}
+	seedObservedPullRequest(t, store, "head-new")
+	if err := engine.AdvanceJob(ctx, "review-new"); err != nil {
+		t.Fatalf("AdvanceJob (row present) returned error: %v", err)
+	}
+	if len(gh.merges) != 1 {
+		t.Fatalf("merge calls = %d, want 1 once the current head is observable", len(gh.merges))
+	}
+}
