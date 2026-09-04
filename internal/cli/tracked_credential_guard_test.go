@@ -1,10 +1,14 @@
 package cli
 
 import (
+	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/gitmoot/gitmoot/internal/config"
 )
 
 // credentialOverlayFileNames is enumerated from the RESOLVER, not from memory.
@@ -15,12 +19,22 @@ import (
 //	.credentials.json   daemon_worker.go (claude staging), readonly_seat_credential.go
 //	auth.json           daemon_worker.go (codex staging)
 //	kimi-code.json      daemon_worker.go (kimi staging)
+//	keychain.env        pipeline/env_runtime.go, ResolveKeychainPath
+//	bridge.token        bridge.go, bridgeTokenName
+//
+// The first five were the list this guard shipped with, and it was INCOMPLETE:
+// the review measured keychain.env and bridge.token resolving through the same
+// class of code with neither an ignore rule nor a guard entry. The enumeration
+// is now derived by searching every credential-adjacent filename literal in
+// internal/ and cmd/, not by recalling the ones already known.
 var credentialOverlayFileNames = []string{
 	runtimeAuthFileName,
 	legacyRuntimeAuthFileName,
 	claudeCredentialsFile,
 	"auth.json",
 	"kimi-code.json",
+	"keychain.env",
+	bridgeTokenName,
 }
 
 // This guard enters through the REAL REPOSITORY INDEX, because the index is
@@ -68,4 +82,39 @@ func TestNoCredentialOverlayFileIsTracked(t *testing.T) {
 		t.Fatalf("credential-bearing overlay files are TRACKED: %v. This repository is public and secret scanning is disabled; remove them, rotate the credential, and keep the .gitignore rules that stop them returning", found)
 	}
 	t.Logf("scanned %d tracked paths against %d credential overlay names, 0 matches", len(tracked), len(credentialOverlayFileNames))
+}
+
+// The ignore rules and the tracked-file guard stop a credential reaching the
+// INDEX. This asserts the property one level earlier, at the WRITERS: a
+// credential must never be placed relative to the working directory in the
+// first place. bridge.token had no such guard when #1810 was reviewed.
+func TestCredentialWritersRefuseANonAbsoluteHome(t *testing.T) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, home := range []string{"", "   ", "relative/home", "."} {
+		if err := requireAbsoluteCredentialHome(home, "bridge.token"); err == nil {
+			t.Fatalf("requireAbsoluteCredentialHome(%q) accepted a non-absolute home", home)
+		}
+		if _, err := ensureBridgeToken(config.Paths{Home: home}, false); err == nil {
+			t.Fatalf("ensureBridgeToken accepted home %q; a token would be written relative to the working directory", home)
+		}
+	}
+	// Nothing may have been created beside the package source while proving it.
+	for _, name := range credentialOverlayFileNames {
+		if _, err := os.Stat(filepath.Join(cwd, name)); err == nil {
+			_ = os.Remove(filepath.Join(cwd, name))
+			t.Fatalf("a credential file %q was created in the work tree while asserting the guard", name)
+		}
+	}
+	// An absolute home still works: the guard must not break the feature.
+	paths := config.Paths{Home: t.TempDir()}
+	tokenPath, err := ensureBridgeToken(paths, false)
+	if err != nil {
+		t.Fatalf("ensureBridgeToken with an absolute home: %v", err)
+	}
+	if !filepath.IsAbs(tokenPath) || filepath.Dir(tokenPath) != paths.Home {
+		t.Fatalf("token path %q is not inside the absolute home %q", tokenPath, paths.Home)
+	}
 }

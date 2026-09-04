@@ -13,6 +13,8 @@
 #   .credentials.json     internal/cli/daemon_worker.go:1649, readonly_seat_credential.go:71
 #   auth.json             internal/cli/daemon_worker.go:1654 (codex)
 #   kimi-code.json        internal/cli/daemon_worker.go:1660 (kimi)
+#   keychain.env          internal/pipeline/env_runtime.go, ResolveKeychainPath
+#   bridge.token          internal/cli/bridge.go:37, bridgeTokenName
 # The feature's contract is "read a credential overlay out of a directory", so
 # the host that exercises it will produce these files in a work tree. None of
 # them is a tracked repository artifact - verified with git ls-files before
@@ -27,3 +29,7 @@ auth.json
 **/auth.json
 kimi-code.json
 **/kimi-code.json
+keychain.env
+**/keychain.env
+bridge.token
+**/bridge.token

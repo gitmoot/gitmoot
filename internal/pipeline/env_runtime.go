@@ -397,9 +397,20 @@ func ResolveKeychainPath(store *db.Store, home string) (string, error) {
 		return "", fmt.Errorf("load credentials config: %w", err)
 	}
 	if cfg.KeychainPath != "" {
+		// No absolute check here on purpose: config.LoadCredentialsConfig above
+		// already refuses a relative [credentials].keychain_path, and a second
+		// check would be unreachable code that looks like a guard. Measured, not
+		// assumed - disabling a duplicate check here changed no test outcome,
+		// which is exactly how dead safety code hides.
 		return cfg.KeychainPath, nil
 	}
+	// The DEFAULT path is derived from paths.Home, which is not operator-checked.
+	// A relative home resolves keychain.env inside the working directory, which
+	// is the class that published a token in #1810.
 	baseHome := filepath.Dir(paths.Home)
+	if !filepath.IsAbs(baseHome) {
+		return "", fmt.Errorf("refusing to resolve keychain.env under relative path %q: a credential must never resolve inside the working directory", baseHome)
+	}
 	return filepath.Join(baseHome, ".config", "gitmoot", "keychain.env"), nil
 }
 

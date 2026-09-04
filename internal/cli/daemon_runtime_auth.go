@@ -198,17 +198,25 @@ func writeRuntimeAuthFile(path string, values map[string]string) error {
 // authoritative file is absent. Legacy persisted auth wins over ambient auth;
 // an existing runtime-auth.env is never rewritten from either source.
 
-// requireAbsoluteRuntimeAuthHome refuses any runtime-auth home that would place
-// a credential file somewhere relative to the current working directory.
-func requireAbsoluteRuntimeAuthHome(homeDir string) error {
+// requireAbsoluteCredentialHome refuses any home that would place a credential
+// file somewhere relative to the current working directory. #1810 published a
+// live token exactly that way: the path was joined onto an empty home, resolved
+// relative, and the file landed in the package source tree during a test run.
+// Every writer of a credential-bearing file goes through this.
+func requireAbsoluteCredentialHome(homeDir, fileName string) error {
 	trimmed := strings.TrimSpace(homeDir)
 	if trimmed == "" {
-		return fmt.Errorf("refusing to write %s: no runtime auth home was resolved", runtimeAuthFileName)
+		return fmt.Errorf("refusing to write %s: no home was resolved", fileName)
 	}
 	if !filepath.IsAbs(trimmed) {
-		return fmt.Errorf("refusing to write %s under relative path %q: a credential must never land in the working directory", runtimeAuthFileName, trimmed)
+		return fmt.Errorf("refusing to write %s under relative path %q: a credential must never land in the working directory", fileName, trimmed)
 	}
 	return nil
+}
+
+// requireAbsoluteRuntimeAuthHome is the runtime-auth caller of the shared guard.
+func requireAbsoluteRuntimeAuthHome(homeDir string) error {
+	return requireAbsoluteCredentialHome(homeDir, runtimeAuthFileName)
 }
 
 func bootstrapRuntimeAuth(homeDir string, lookup func(string) (string, bool), logf func(string, ...any)) (bool, error) {
