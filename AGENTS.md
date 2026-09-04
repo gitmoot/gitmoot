@@ -606,8 +606,8 @@ Record every activation with:
 `[workload-mode-transition]`,
 `mode: <THROUGHPUT|STEADY|DRAIN>`,
 `decision_ref: workflow-note:<id>`,
-`change_ref: none|pr:<owner/repo>#<number>@<reviewed-head>`,
-`activation_ref: workflow-note:<id>|commit:<merge-sha>`,
+`change_ref: none|pr:<owner/repo>#<number>@<40-character-reviewed-head>`,
+`activation_ref: none|workflow-note:<id>|commit:<40-character merge SHA>`,
 `decided_at: <RFC3339>`,
 `effective_at: <RFC3339>`,
 `observed_at: <RFC3339>`, zero or more
@@ -617,9 +617,10 @@ then `[/workload-mode-transition]`.
 
 RESOLVED IN ONE DIRECTION, because this document said both and a reader could
 pick either (#1783 round-8 review, F-3): ONLY A MERGED COMMIT ACTIVATES A MODE.
-`activation_ref` is therefore always `commit:<40-character merge SHA>`, and its
-`workflow-note:<id>` form is for RECORDING a decision that has not yet been
-materialised by a merged marker PR - never for claiming a mode is active. That
+`commit:<40-character merge SHA>` is therefore the ONLY ACTIVATING form. The
+other two record a mode that is not active yet: `workflow-note:<id>` for a
+decision not yet materialised by a merged marker PR, and `none` for a record
+posted before any marker PR exists - never for claiming a mode is active. That
 matches point 1 of "DERIVE, never trust a marker id" above: the active mode is
 the marker line in `origin/main:AGENTS.md`, changed by a merged PR, and a
 decision note is not itself the marker. `decision_ref` carries the note,
@@ -649,8 +650,9 @@ wave is the non-terminal implementation assignments accepted before
 `decided_at` plus review jobs created before it that were queued or running
 then. DRAIN becomes active only at `effective_at`, which is the `mergedAt` of the
 reconciled marker PR after its prerequisites are installed - not a note's
-`created_at`, per the resolution above. The remaining note-sourced case for a
-note source. A later owner decision cancels an unactivated DRAIN.
+`created_at`, per the resolution above. The remaining note-sourced case is the
+DRAIN decision itself, which freezes admissions at `decided_at` without
+activating. A later owner decision cancels an unactivated DRAIN.
 `accepted_at` is the Herdr pane's first `working` event after the issue-backed
 assignment prompt; review `created_at` is the job-store timestamp. Mode changes
 never relax correctness, exact-head review, CI, or org merge authority.

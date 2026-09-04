@@ -6,6 +6,7 @@ import (
 	"errors"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/workflow"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -637,6 +638,100 @@ func TestPipelineAutoMergeLostClaimTreatsAReleasedClaimAsANormalRace(t *testing.
 	}
 }
 
+// ROUND-10 F-6: the released-claim reason - this round's new operator-facing
+// output - was asserted by nothing, and corrupting its text survived the test
+// above. That reason is the branch's whole product: autoMergeGateWaitingWithReason
+// exists (see its doc comment) so the human who finds a parked run reads WHY it
+// waited.
+//
+// THE REVIEWER'S SUGGESTED SITE CANNOT OBSERVE IT, which is why it needs its own
+// test rather than one more assertion above. On the ordinary waiting path
+// autoMergeGateWaitingWithReason DROPS the reason and falls through to
+// autoMergeGateWaiting; the text only reaches a caller when a stage
+// `timeout` parks the wait. So this arm gives the gate a timeout and ages it past
+// it - which also pins the round-8 F-2 correction, that this wait parks like any
+// other, and that claim was itself only prose until now.
+func TestPipelineAutoMergeLostClaimReleasedReasonReachesAParkedSummary(t *testing.T) {
+	ctx := context.Background()
+	timedSpec := strings.Replace(pipelineAutoMergeSpec, "    merge: auto\n", "    merge: auto\n    timeout: 1m\n", 1)
+	store := pipelineAdvanceStore(t)
+	rec, spec := newTestPipeline(t, store, "auto-merge", timedSpec)
+	enqueue := testStageEnqueuer(store)
+	now := time.Date(2026, 7, 11, 8, 0, 0, 0, time.UTC)
+	run := startTestRun(t, store, rec, spec, enqueue, now)
+	impl := stageRow(t, store, run.ID, "impl")
+	sourceJobID := impl.JobID
+	settleBoundImplementStageJob(t, store, impl.JobID, "implemented",
+		PipelineStagePRBinding{PullRequest: 813, HeadSHA: "0123456789abcdef", Branch: "feat/813", TaskID: "task-813", LeadAgent: "coder"})
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second), &stubPipelineAutoMerger{})
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second),
+		&stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: "0123456789abcdef"}})
+
+	claim, err := json.Marshal(map[string]any{
+		"phase": "claim", "pipeline": rec.Name, "run_id": run.ID,
+		"stage_id": "merge", "pull_request": 813, "head_sha": "0123456789abcdef",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedConsumedAutoMergeClaim(t, store, rec, run, sourceJobID)
+
+	var gateStage Stage
+	for _, candidate := range spec.Stages {
+		if candidate.ID == "merge" {
+			gateStage = candidate
+			break
+		}
+	}
+	if strings.TrimSpace(gateStage.Timeout) == "" {
+		t.Fatal("this fixture must carry a gate timeout, or the reason can never reach a summary")
+	}
+	released := false
+	deps := pipelineStageSettleDeps{
+		store: store, rec: rec, run: run,
+		// Past the gate's 1m timeout, so the park path runs and carries the cause.
+		now: now.Add(2 * time.Hour),
+		autoMerge: &stubPipelineAutoMerger{
+			readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+			mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-sha"},
+		},
+		afterLostClaim: func() {
+			ok, relErr := store.ReleaseJobEventClaim(ctx, db.JobEvent{
+				JobID: sourceJobID, Kind: autoMergeClaimEventKind, Message: string(claim),
+			})
+			if relErr != nil || !ok {
+				t.Fatalf("releasing in the window: ok=%v err=%v", ok, relErr)
+			}
+			released = true
+		},
+	}
+	settled, state, summary, needs, _, err := gateStageSettleOutcome(ctx, deps, spec, gateStage, stageRow(t, store, run.ID, "merge"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !released {
+		t.Fatal("the seam never fired, so this scan did not lose the claim and the test proves nothing")
+	}
+	if !settled || state != StageBlocked {
+		t.Fatalf("a gate past its timeout must park: settled=%v state=%q", settled, state)
+	}
+	// The exact operator-facing sentence, not a paraphrase: this is the string a
+	// human reads off a parked run, and mutating it must fail a test.
+	const want = "was released while this scan was reading it, so the next scan takes it"
+	if !strings.Contains(summary, want) {
+		t.Fatalf("park summary must carry the released-claim cause %q: %q", want, summary)
+	}
+	if !slices.ContainsFunc(needs, func(need string) bool { return strings.Contains(need, want) }) {
+		t.Fatalf("park needs must carry the cause so it survives into the run's needs: %v", needs)
+	}
+	// Still not a fault: parking on a timeout is the operator's choice, and the
+	// released claim itself is a normal race that must record nothing.
+	if rows := autoMergeEventCount(t, store, sourceJobID, autoMergeClaimOrphanEventKind); rows != 0 {
+		t.Fatalf("orphan reports for a RELEASED claim = %d, want 0", rows)
+	}
+}
+
 // F-6's calibration, pinned directly. The gate's StartedAt is stamped when the
 // gate goes in-flight, typically long before readiness, so aging the wait from
 // the GATE made a healthy two-second race on a gate that had waited past the
@@ -672,6 +767,62 @@ func TestPipelineAutoMergeLostClaimIgnoresGateAgeWhenTheClaimIsYoung(t *testing.
 	}
 }
 
+// ROUND-10 F-1: the branch the previous head called unconstructible. Its comment
+// justified leaving the unreadable case unpinned on "no store API can construct
+// it", and the review disproved that by experiment rather than by argument -
+// db.Store.ExecForTest is exported, is already used cross-package, and its own
+// doc comment says it exists "so a test can put the database into a state no
+// production code path creates". So the branch was unpinned by CHOICE reported
+// as an inability, which also left round-9's claim_raw_stamp discriminator
+// verified by nothing.
+//
+// The corruption is applied to the STORE COLUMN, then the branch is reached
+// through the production advancer, so nothing here manufactures the report
+// itself - which is the objection round 7 raised against row surgery (F-3) and
+// the reason this drives AdvancePipelineRunWithAutoMerge rather than asserting
+// on a helper.
+func TestPipelineAutoMergeLostClaimReportsAnUnreadableClaimTimestamp(t *testing.T) {
+	ctx := context.Background()
+	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
+	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
+	executor := &stubPipelineAutoMerger{
+		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
+		mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-sha"},
+	}
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second),
+		&stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: "0123456789abcdef"}})
+	// The claim is held, so the scan below LOSES it.
+	seedConsumedAutoMergeClaim(t, store, rec, run, sourceJobID)
+
+	// A value the store itself would never write. Production can still hold one:
+	// a legacy row, a restore, a manual edit, or a kind-parameterised upsert
+	// reaching this kind (see autoMergeClaimUnreadable's branch in run.go).
+	if err := store.ExecForTest(ctx, `UPDATE job_events SET created_at = ? WHERE job_id = ? AND kind = ?`,
+		"not-a-timestamp", sourceJobID, autoMergeClaimEventKind); err != nil {
+		t.Fatalf("corrupting the claim row's created_at: %v", err)
+	}
+	// CONTROL, because a missing row would drive the GONE branch and this test
+	// would pass while proving something else entirely.
+	if body := autoMergeEventBody(t, store, sourceJobID, autoMergeClaimEventKind); body == "" {
+		t.Fatal("the claim row is absent, so this scan would take the Gone branch, not the unreadable one")
+	}
+
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, time.Now().UTC().Add(16*time.Minute), executor)
+	if gate := stageRow(t, store, run.ID, "merge"); gate.State == StageBlocked {
+		t.Fatalf("an unreadable claim timestamp is not a condition this scan observed, so it must not park: %q", gate.Summary)
+	}
+	if rows := autoMergeEventCount(t, store, sourceJobID, autoMergeClaimOrphanEventKind); rows != 1 {
+		t.Fatalf("suspicion rows for an unreadable claim timestamp = %d, want exactly 1", rows)
+	}
+	// The cause is a DIFFERENT fact from held_past_bound, and it carries the raw
+	// stamp as its per-episode key - round-9's F-5 fix, unverified until now.
+	for _, want := range []string{`"cause":"claim_timestamp_unreadable"`, `"claim_raw_stamp":"not-a-timestamp"`} {
+		if body := autoMergeEventBody(t, store, sourceJobID, autoMergeClaimOrphanEventKind); !strings.Contains(body, want) {
+			t.Fatalf("suspicion row must contain %s: %s", want, body)
+		}
+	}
+}
+
 // THE SUCCESS-PATH CONTROL for the claim clock, and it guards a real hazard.
 // autoMergeClaimTakenAt reads the claim row's created_at and falls back to a
 // "cannot age this" branch when it will not parse. If the store's timestamp
@@ -679,14 +830,14 @@ func TestPipelineAutoMergeLostClaimIgnoresGateAgeWhenTheClaimIsYoung(t *testing.
 // scan would report an unreadable timestamp. This pins that the format the store
 // actually writes does parse.
 //
-// The failure side is deliberately NOT tested here and that is stated rather
-// than hidden: no store API can write created_at - every INSERT INTO job_events
-// names only (job_id, kind, message), so the column is always its
-// CURRENT_TIMESTAMP default. A malformed value comes from a corrupted or legacy
-// row, which this package cannot construct. Round 6 manufactured an equivalent
-// state by row surgery and the review called that out (#1783 round-7 F-3); the
-// honest answer is a control on the reachable side plus this note, not a fixture
-// that pins a state the system does not produce.
+// The failure side is pinned by
+// TestPipelineAutoMergeLostClaimReportsAnUnreadableClaimTimestamp above, so this
+// stays a pure success-path control. The claim this comment used to carry - "no
+// store API can write created_at" - was FALSE and is now stated once, correctly,
+// in autoMergeClaimUnreadable's branch in run.go; two copies of a reason are how
+// the round-8 F-2 defect
+// happened, so this one points at the authoritative statement instead of
+// restating it (#1783 round-10 F-2).
 func TestPipelineAutoMergeClaimTimestampParsesTheStoreFormat(t *testing.T) {
 	store, _, rec, _, run, sourceJobID, _ := prepareAutoMergeGate(t)
 	claim, err := json.Marshal(map[string]any{

@@ -2219,18 +2219,33 @@ func autoMergeLostClaimOutcome(ctx context.Context, deps pipelineStageSettleDeps
 		// configured stage `timeout` parks this wait exactly as it parks any other
 		// (#1783 round-8 review, F-2).
 		//
-		// THIS BRANCH IS DEFENSIVE AND UNPINNED, stated rather than pretended. No
-		// INSERT INTO job_events accepts created_at - all 30-odd sites name only
-		// (job_id, kind, message) - so no test in this package can produce a
-		// malformed value through an insert. The precise claim matters, because a
-		// store-wide "nothing can write it" is FALSE: UpsertLatestJobEvent and
-		// RefreshLatestAdvanceRetry both set created_at = CURRENT_TIMESTAMP. Neither
-		// can touch a claim row, because each is pinned to a different event kind in
-		// its own SQL, so the age cannot be refreshed - but the safety rests on that
-		// kind discipline, not on impossibility, and a kind-parameterised upsert
-		// would silently reset the bound (#1783 round-8 review, F-4).
+		// THIS BRANCH IS PINNED, and the previous head's reason for leaving it
+		// unpinned was FALSE. It said the state "cannot be constructed by any
+		// store API"; the round-10 review disproved that by experiment.
+		// db.Store.ExecForTest (internal/db/store_escalation_rounds.go) is exported,
+		// already used cross-package, and its own doc comment says it exists "so a
+		// test can put the database into a state no production code path creates" -
+		// verbatim the situation that claim called impossible. It is now driven by
+		// TestPipelineAutoMergeLostClaimReportsAnUnreadableClaimTimestamp, which
+		// also pins the claim_raw_stamp discriminator below (#1783 round-10 F-1).
 		//
-		// The reachable side IS pinned, by
+		// No INSERT INTO job_events accepts created_at - all 30-odd sites name only
+		// (job_id, kind, message) - so PRODUCTION cannot write this value on an
+		// insert. Two functions do write it, and the reason each is safe DIFFERS:
+		// RefreshLatestAdvanceRetry carries the literal kind = 'advance_retry' in its
+		// SQL and so cannot reach a claim row at all, while UpsertLatestJobEvent pins
+		// NO kind - it binds `kind = ?` from event.Kind. That one is safe only by
+		// CALL-SITE discipline: its single caller, the progress writer in
+		// progress.go, passes the literal Kind: "progress" (both in internal/db's
+		// store_jobs.go; NAMED, not line-cited, because #1841 moved both bodies
+		// while this PR was in review and a line number would already be stale).
+		// The blast radius if that ever slipped is worth naming, because its UPDATE
+		// has no message predicate: it would rewrite every row of the given kind for
+		// the job and reset created_at, resetting the 15-minute bound exactly as
+		// feared (#1783 round-10 F-3, correcting the round-8 F-4 fix, which
+		// attributed SQL kind-pinning to both).
+		//
+		// The reachable side is pinned separately by
 		// TestPipelineAutoMergeClaimTimestampParsesTheStoreFormat, which guards the
 		// hazard that matters - if the store's timestamp format changed, every
 		// claim would fall down here and every losing scan would report an
