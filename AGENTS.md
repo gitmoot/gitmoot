@@ -404,7 +404,7 @@ Under ultracode, orchestrate via the Workflow tool with opus sub-agents
 
 ## Workload mode
 
-**Current mode: DRAIN.**
+**Current mode: THROUGHPUT.**
 
 A mode switch is a merged PR that changes the line above. It takes effect at
 that PR's `mergedAt` time. At the next check-in, the coordinator must:
