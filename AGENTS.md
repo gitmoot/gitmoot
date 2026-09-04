@@ -357,12 +357,17 @@ fix → verify on the integrated tree → reviewed PR → deploy affected-only �
 live-probe before close. **Merge authority is whatever the org config records
 for your role**: `merge_rule = "self"` lets the coordinator merge its own
 lane's PRs only under the standing delegation and safeguards below;
-`merge_rule = "owner"` leaves the merge with the owner. The policy that moved
-merge authority off the owner is owner row **115499**, relayed to this lane as
-directive **115517**: once a PR is clean at its current head and carries one
-independent non-implementer verdict, the merge-authorized role merges it
-without asking jarvis or the owner. One review is sufficient and a second model
-family is never a gate. The
+`merge_rule = "owner"` leaves the merge with the owner. THREE DATED EVENTS, kept
+distinct because collapsing them into one date is what made this section
+contradict itself: the role field was set to `"self"` on **2026-08-31**
+(`config.toml` records jarvis setting it on the owner's direct instruction);
+owner row **107983** granted the standing merge delegation on **2026-09-02**,
+with the six safeguards below; and owner row **115499**, relayed to this lane as
+directive **115517**, removed the approval GATE on **2026-09-04** - once a PR is
+clean at its current head and carries one independent non-implementer verdict,
+the merge-authorized role merges it without asking jarvis or the owner. One
+review is sufficient; another model family is preferred when available but never
+a gate. The
 field is **advisory** — `merge_gate.go` never reads it (`internal/config/org.go`
 calls it "deliberately advisory in phase 1a"), so nothing mechanically stops a
 merge you are not entitled to make; the gate enforces exact-head review, CI and
@@ -381,8 +386,8 @@ settle any future disagreement with a config read — `gitmoot org chart` prints
 `merge_rule: <rule>`, `gitmoot org status --json` carries the field, and
 `[org.roles]` in `config.toml` is the source. Plain `gitmoot org status` has no
 merge column, so it cannot answer this. **Public releases are unchanged and
-still need explicit OWNER sign-off** — merge authority moved on 2026-08-31,
-release authority did not.
+still need explicit OWNER sign-off** — the three events above moved MERGE
+authority; release authority never moved.
 
 For the `gitmoot` role, owner standing-delegation row **107983** makes every
 self-merge conditional on all six checks below:
