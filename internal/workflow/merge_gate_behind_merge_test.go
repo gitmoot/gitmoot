@@ -180,3 +180,56 @@ func TestMergeGateMergesUpToDateBranchUnchanged(t *testing.T) {
 		})
 	}
 }
+
+// #1870 review finding 1 (P2): `compare.BehindBy > 0` in the guard at
+// merge_gate.go:1503 was a SURVIVING mutant - deleting it left the whole
+// internal/workflow suite green, so nothing pinned the numeric behind-check and
+// a later edit could delete it unnoticed. Without that term a compare response
+// carrying BehindBy > 0 under an unexpected status string falls through to
+// `return MergeDecision{}, false, nil`: merged with NO protection read and NO
+// update, which is worse than the pre-#1865 behaviour.
+//
+// These cases pass ONLY while the numeric check is present.
+func TestMergeGateTreatsNumericBehindAsBehindWhateverTheStatusString(t *testing.T) {
+	// "" and "unknown" are the DISCRIMINATING cases: they kill the mutant.
+	// "BEHIND" does NOT - the guard lowercases the status, so that arm matches
+	// the string check with or without the numeric term. It is kept as coverage
+	// of the case-folding, not as part of the kill.
+	for _, status := range []string{"", "unknown", "BEHIND"} {
+		t.Run("status="+status, func(t *testing.T) {
+			t.Run("protection allows behind merges", func(t *testing.T) {
+				gh := behindMergeGateClient(github.CompareResult{Status: status, BehindBy: 3})
+				gh.strictKnown = true
+				gh.strictBase = false
+
+				decision := evaluateBehindMergeGate(t, gh)
+
+				// The numeric term is what routes this into the behind branch at
+				// all. Drop it and protection is never consulted.
+				if gh.strictCalls == 0 {
+					t.Fatal("BehindBy > 0 must route through the behind branch and consult protection")
+				}
+				if !decision.Merged || len(gh.updates) != 0 {
+					t.Fatalf("decision = %+v updates = %+v", decision, gh.updates)
+				}
+				if len(gh.merges) != 1 || gh.merges[0].MatchHeadCommit != "head123" {
+					t.Fatalf("merge must stay fenced to the reviewed head: %+v", gh.merges)
+				}
+			})
+
+			t.Run("protection undetermined still updates", func(t *testing.T) {
+				gh := behindMergeGateClient(github.CompareResult{Status: status, BehindBy: 3})
+				gh.strictKnown = false
+
+				decision := evaluateBehindMergeGate(t, gh)
+
+				if decision.Merged {
+					t.Fatalf("numeric-behind head must not merge on an undetermined read: %+v", decision)
+				}
+				if len(gh.updates) != 1 || gh.updates[0].ExpectedHeadSHA != "head123" {
+					t.Fatalf("update inputs = %+v", gh.updates)
+				}
+			})
+		})
+	}
+}
