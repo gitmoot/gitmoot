@@ -2367,21 +2367,21 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 				}
 			}
 			if firstErr == nil && slots > 0 {
-				// Drop jobs that already bounced busy this invocation before ANY
-				// selection (#598). pending is fresh each pass and feeds BOTH the
-				// primary selection and the isolation `remaining` loop below, so
-				// filtering it here excludes bounced jobs from both. A bounced job
-				// removed from pending is never re-selected, so dispatched is not
-				// re-incremented for it: once every remaining pending job is
-				// busy-excluded the loop reaches dispatched==0 && running==0 and
-				// returns, so "busy must not count as progress" holds structurally.
-				pending = excludeBouncedBusy(ctx, worker, pending, bouncedBusy, bouncedBusyRuntimes, runtimeKeyMemo)
-				// Prune the isolation retry/skip state to the jobs still queued. This
-				// pass can outlive many jobs (it holds poolRuns[repo] for as long as
-				// anything runs), so without this the three maps would grow with every
-				// job id the pass ever saw. Dropping a job also drops its backoff, which
-				// is the intended semantics: a job that leaves and returns is a fresh
-				// isolation attempt, not a continuation of the old one's penalty.
+				// Prune the isolation retry/skip state to the jobs still queued, BEFORE
+				// excludeBouncedBusy and against the freshly scanned queue. This pass can
+				// outlive many jobs (it holds poolRuns[repo] for as long as anything
+				// runs), so without pruning the three maps would grow with every job id
+				// the pass ever saw. Dropping a job also drops its backoff, which is the
+				// intended semantics: a job that leaves the QUEUE and returns is a fresh
+				// isolation attempt, not a continuation of an old penalty.
+				//
+				// The ORDER is load-bearing and the first version had it backwards. A job
+				// that bounced runtime-busy this pass is REMOVED from pending, so pruning
+				// against the post-exclusion list deleted that job's isolation penalty
+				// even though it never waited the penalty out — and it would then re-pay
+				// the 5s-lock-budget allocation immediately on its next appearance, which
+				// is the spin the backoff exists to stop. A busy bounce and an isolation
+				// failure are independent facts about a job; neither may clear the other.
 				live := make(map[string]bool, len(pending))
 				for _, job := range pending {
 					live[job.ID] = true
@@ -2397,6 +2397,15 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 						delete(isolationSkipLogged, id)
 					}
 				}
+				// Drop jobs that already bounced busy this invocation before ANY
+				// selection (#598). pending is fresh each pass and feeds BOTH the
+				// primary selection and the isolation `remaining` loop below, so
+				// filtering it here excludes bounced jobs from both. A bounced job
+				// removed from pending is never re-selected, so dispatched is not
+				// re-incremented for it: once every remaining pending job is
+				// busy-excluded the loop reaches dispatched==0 && running==0 and
+				// returns, so "busy must not count as progress" holds structurally.
+				pending = excludeBouncedBusy(ctx, worker, pending, bouncedBusy, bouncedBusyRuntimes, runtimeKeyMemo)
 				// Union in the supervisor tracker's in-flight keys (#562): a tracked
 				// non-pool job (e.g. dispatched before a warm scheduler flip) must
 				// block same-key pool dispatch exactly like a pool-local one. Jobs
@@ -2473,17 +2482,20 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					if perr != nil || !poolIsolationEligible(job, payload) {
 						continue
 					}
+					// Backoff gate FIRST, before anything that reads the store or
+					// reserves admission. The reviewer measured the earlier placement:
+					// 19 attempts over 400ms at a 20ms interval, each one still paying
+					// queuedJobCheckoutKey, queuedJobRuntimeResourceKey and an admission
+					// estimate before being turned away — so "backed off" cost almost as
+					// much as attempting. daemonJobPayload and poolIsolationEligible are
+					// pure functions of the job row already in hand, so they stay above
+					// the gate; everything below it touches the store.
+					if next, ok := isolationRetryNext[job.ID]; ok && time.Now().Before(next) {
+						continue
+					}
 					if queuedJobCheckoutKey(ctx, worker.Store, job) != "repo:"+payload.Repo ||
 						!(inflightCheckouts["repo:"+payload.Repo] || seedCheckouts["repo:"+payload.Repo]) {
 						continue // not blocked by a contended same-repo checkout
-					}
-					// Backoff gate: a failing allocation is retried on a doubling delay
-					// rather than on every re-query. Placed after the cheap eligibility
-					// and contention filters and BEFORE the admission reservation, so a
-					// backed-off job neither reserves admission nor touches the checkout
-					// mutation lock this pass.
-					if next, ok := isolationRetryNext[job.ID]; ok && time.Now().Before(next) {
-						continue
 					}
 					runtimeKey := queuedJobRuntimeResourceKey(ctx, worker.Store, job)
 					if runtimeKey != "" && (inflightRuntimes[runtimeKey] || seedRuntimes[runtimeKey] || runtimeResourceLocked(ctx, worker.Store, runtimeKey)) {
@@ -2520,22 +2532,31 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 							isolationSkipLogged[job.ID] = true
 							_ = worker.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "pool_isolation_skipped", Message: fmt.Sprintf("pool read-only isolation skipped (#739); job stays serialized in the shared checkout: %v", allocErr)})
 						}
-						// Arm the backoff on a real FAILURE only. allocErr == nil means the
-						// job was simply not isolable, which is cheap and stateless to
-						// re-test, and the expensive lock wait never happened.
-						if allocErr != nil {
-							delay := isolationRetryDelay[job.ID]
-							if delay <= 0 {
-								delay = poolIsolationRetryBackoff
-							} else if delay < poolIsolationRetryBackoffMax {
-								delay *= 2
-								if delay > poolIsolationRetryBackoffMax {
-									delay = poolIsolationRetryBackoffMax
-								}
+						// Arm the backoff on EITHER outcome, and my earlier claim here was
+						// wrong: I wrote that allocErr == nil ("not isolable") was "cheap
+						// and stateless to re-test", and the reviewer measured otherwise —
+						// 19 attempts over 400ms, each reaching this point only after two
+						// or three store reads and an admission reserve/release pair.
+						// Nothing about that is cheap, and the not-isolable verdict is a
+						// stable property of the job and its repo, so re-testing it every
+						// re-query buys nothing. A real FAILURE additionally paid the lock
+						// wait, so it keeps the doubling curve; a not-isolable job is held
+						// flat at the first interval, which stops the spin without
+						// delaying a job whose repo config might legitimately change.
+						delay := isolationRetryDelay[job.ID]
+						switch {
+						case allocErr == nil:
+							delay = poolIsolationRetryBackoff
+						case delay <= 0:
+							delay = poolIsolationRetryBackoff
+						case delay < poolIsolationRetryBackoffMax:
+							delay *= 2
+							if delay > poolIsolationRetryBackoffMax {
+								delay = poolIsolationRetryBackoffMax
 							}
-							isolationRetryDelay[job.ID] = delay
-							isolationRetryNext[job.ID] = time.Now().Add(delay)
 						}
+						isolationRetryDelay[job.ID] = delay
+						isolationRetryNext[job.ID] = time.Now().Add(delay)
 						continue
 					}
 					// Allocation succeeded: drop this job's backoff and skip-throttle so a

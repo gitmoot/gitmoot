@@ -421,3 +421,180 @@ func TestPoolRequeryObserverIsSilentWhileDrainingAfterCancellation(t *testing.T)
 		t.Fatal("worker loop did not stop after the blocking job was released")
 	}
 }
+
+// TestPoolIsolationPenaltyIsDroppedWhenAJobLeavesTheQueue pins the prune block
+// that the reviewer's M5 mutant SURVIVED against the whole package — the
+// clearest kind of coverage gap, since disabling the prune broke nothing any
+// test asserted.
+//
+// The prune's OBSERVABLE contract is not "the maps stay small": it is that a job
+// which leaves the pending queue and comes back is a FRESH isolation attempt
+// rather than a continuation of an old penalty. So this measures the TIMING of
+// the retry, not the size of a map — a map-size assertion would have to reach
+// inside the pass and would still pass on a build that pruned the wrong entries.
+//
+// Scenario: job B is blocked and fails isolation, arming a backoff far longer
+// than the test's patience. B is then deleted from the queue and re-enqueued
+// under the same id. With the prune the new B is attempted promptly; without it
+// the stale isolationRetryNext entry suppresses attempts for the full backoff.
+func TestPoolIsolationPenaltyIsDroppedWhenAJobLeavesTheQueue(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const repo = "owner/repo"
+	const intervalMS, backoffMS = 20, 60000
+	var attempts int64
+	restoreInterval, restoreAttempt := poolRequeryInterval, poolIsolationAttemptObserver
+	restoreBackoff, restoreBackoffMax := poolIsolationRetryBackoff, poolIsolationRetryBackoffMax
+	poolRequeryInterval = intervalMS * time.Millisecond
+	// A backoff far beyond this test's own timeouts: any attempt observed after
+	// the re-enqueue can ONLY come from the penalty having been dropped.
+	poolIsolationRetryBackoff = backoffMS * time.Millisecond
+	poolIsolationRetryBackoffMax = backoffMS * time.Millisecond
+	poolIsolationAttemptObserver = func(jobID string) {
+		if jobID == "job-b" {
+			atomic.AddInt64(&attempts, 1)
+		}
+	}
+	t.Cleanup(func() {
+		poolRequeryInterval, poolIsolationAttemptObserver = restoreInterval, restoreAttempt
+		poolIsolationRetryBackoff, poolIsolationRetryBackoffMax = restoreBackoff, restoreBackoffMax
+	})
+
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, repo, t.TempDir())
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, repo)
+
+	adapter := newWedgeBlockingAdapter("job-a")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "audit", Action: "ask", Repo: repo, Branch: "main", PullRequest: 1})
+	_, errCh := startTrackedWedgeLoop(t, ctx, store, adapter, 2, true, io.Discard, func(w *jobWorker) {
+		w.ConfigHome = t.TempDir()
+	})
+
+	if !waitForCondition(t, 5*time.Second, adapter.stillBlocked) {
+		t.Fatalf("job-a never started delivering; delivered=%v", adapter.deliveredJobs())
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-b", Agent: "audit", Action: "ask", Repo: repo, Branch: "main", PullRequest: 2})
+	if !waitForCondition(t, 5*time.Second, func() bool { return atomic.LoadInt64(&attempts) >= 1 }) {
+		t.Fatal("no isolation attempt for job-b; the scenario never reached the isolation path")
+	}
+	// The penalty is now armed for a minute. Prove it BINDS before relying on its
+	// release, or the release proves nothing.
+	first := atomic.LoadInt64(&attempts)
+	time.Sleep(200 * time.Millisecond)
+	if again := atomic.LoadInt64(&attempts); again != first {
+		t.Fatalf("isolation attempts went %d -> %d while the %dms backoff was armed; the penalty does not bind", first, again, backoffMS)
+	}
+
+	// B LEAVES the pending queue (a cancel is the cheapest real transition out of
+	// it) and then RETURNS under the same id. The prune runs on a pass that sees
+	// B absent, so the penalty must be gone when B comes back.
+	if err := store.UpdateJobState(ctx, "job-b", string(workflow.JobCancelled)); err != nil {
+		t.Fatalf("UpdateJobState(job-b, cancelled): %v", err)
+	}
+	// Give the pass at least one re-query with B absent - that is when the prune
+	// runs.
+	time.Sleep(6 * poolRequeryInterval)
+	baseline := atomic.LoadInt64(&attempts)
+	if err := store.UpdateJobState(ctx, "job-b", string(workflow.JobQueued)); err != nil {
+		t.Fatalf("UpdateJobState(job-b, queued): %v", err)
+	}
+
+	if !waitForCondition(t, 5*time.Second, func() bool { return atomic.LoadInt64(&attempts) > baseline }) {
+		t.Fatalf("job-b was re-enqueued and never re-attempted within 5s while its backoff was %dms; the stale isolation penalty survived the job leaving the queue, so the prune is not running", backoffMS)
+	}
+
+	close(adapter.release)
+	if got := waitForJobState(t, store, "job-a", string(workflow.JobSucceeded), 10*time.Second); got != string(workflow.JobSucceeded) {
+		t.Fatalf("job-a state = %q after release, want succeeded", got)
+	}
+	cancel()
+	select {
+	case <-errCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker loop did not stop after context cancellation")
+	}
+}
+
+// TestPoolIsolationNotIsolablePathIsPacedToo pins the round-1 F-1 fix, and it
+// exists because my own comment asserted the opposite. The first remediation
+// armed the backoff only when allocErr != nil, on the stated grounds that the
+// nil-error "not isolable" verdict was "cheap and stateless to re-test". The
+// reviewer measured that claim and it was false: 19 attempts over 400ms, each
+// reaching the allocation only after two or three store reads and an admission
+// reserve/release pair.
+//
+// Here worker.ConfigHome is left EMPTY, which is exactly the shape that returns
+// (false, nil) — not isolable, no error, no lock wait. The attempts must still
+// be paced by the backoff rather than by the re-query interval.
+//
+// Mutation proof: restrict the arming switch to allocErr != nil again and this
+// test fails with an attempt count that tracks the re-query interval.
+func TestPoolIsolationNotIsolablePathIsPacedToo(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const repo = "owner/repo"
+	const intervalMS, backoffMS, windowMS = 20, 200, 700
+	var attempts int64
+	restoreInterval, restoreAttempt := poolRequeryInterval, poolIsolationAttemptObserver
+	restoreBackoff, restoreBackoffMax := poolIsolationRetryBackoff, poolIsolationRetryBackoffMax
+	poolRequeryInterval = intervalMS * time.Millisecond
+	poolIsolationRetryBackoff = backoffMS * time.Millisecond
+	poolIsolationRetryBackoffMax = backoffMS * time.Millisecond
+	poolIsolationAttemptObserver = func(jobID string) {
+		if jobID == "job-b" {
+			atomic.AddInt64(&attempts, 1)
+		}
+	}
+	t.Cleanup(func() {
+		poolRequeryInterval, poolIsolationAttemptObserver = restoreInterval, restoreAttempt
+		poolIsolationRetryBackoff, poolIsolationRetryBackoffMax = restoreBackoff, restoreBackoffMax
+	})
+
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, repo, t.TempDir())
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, repo)
+
+	adapter := newWedgeBlockingAdapter("job-a")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "audit", Action: "ask", Repo: repo, Branch: "main", PullRequest: 1})
+	// NO ConfigHome override: the allocation short-circuits to "not isolable"
+	// with a nil error, which is the branch under test.
+	_, errCh := startTrackedWedgeLoop(t, ctx, store, adapter, 2, true, io.Discard)
+
+	if !waitForCondition(t, 5*time.Second, adapter.stillBlocked) {
+		t.Fatalf("job-a never started delivering; delivered=%v", adapter.deliveredJobs())
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-b", Agent: "audit", Action: "ask", Repo: repo, Branch: "main", PullRequest: 2})
+	if !waitForCondition(t, 5*time.Second, func() bool { return atomic.LoadInt64(&attempts) > 0 }) {
+		t.Fatal("no isolation attempt for job-b; the not-isolable branch was never reached")
+	}
+	time.Sleep(windowMS * time.Millisecond)
+
+	gotAttempts := atomic.LoadInt64(&attempts)
+	if maxPaced := int64(windowMS/backoffMS + 2); gotAttempts > maxPaced {
+		t.Fatalf("not-isolable isolation retried %d times in %dms at a %dms backoff, want <= %d (the nil-allocErr branch is still paced by the re-query interval)", gotAttempts, windowMS, backoffMS, maxPaced)
+	}
+
+	// A not-isolable job must be QUIET: the skip event is for real failures.
+	events, err := store.ListJobEvents(ctx, "job-b")
+	if err != nil {
+		t.Fatalf("ListJobEvents(job-b): %v", err)
+	}
+	for _, event := range events {
+		if event.Kind == "pool_isolation_skipped" {
+			t.Fatalf("a not-isolable job emitted pool_isolation_skipped; that event means a real allocation failure")
+		}
+	}
+
+	close(adapter.release)
+	if got := waitForJobState(t, store, "job-a", string(workflow.JobSucceeded), 10*time.Second); got != string(workflow.JobSucceeded) {
+		t.Fatalf("job-a state = %q after release, want succeeded", got)
+	}
+	cancel()
+	select {
+	case <-errCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker loop did not stop after context cancellation")
+	}
+}
