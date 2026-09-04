@@ -391,7 +391,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		return nil
 	}
 	if readOnlyImplementationBlocked(job.Type, agent) {
-		transitioned, err := markJobPermissionBlocked(ctx, w.Store, job)
+		transitioned, blockedFrom, err := markJobPermissionBlocked(ctx, w.Store, job)
 		if err != nil {
 			return err
 		}
@@ -416,10 +416,19 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		// BEFORE finishQueuedJob, via markJobPermissionBlocked (a direct transition)
 		// — and blockTaskForPermissionBlockedJob only blocks the task, it never
 		// advances the parent DAG. So without this the parent strands exactly like
-		// #409. Route the delegation child through the SAME finalize helper so its
-		// failure_policy fires. Gated strictly on a delegation child (ParentJobID set,
-		// Result nil), so a NON-delegation permission-blocked job is byte-identical.
-		if err := w.finalizePreflightDelegationChild(ctx, job.ID, errors.New(agentPermissionBlockedMessage)); err != nil {
+		// #409. Route the delegation child through the finalize helper its MATCHED
+		// SOURCE STATE selects, so its failure_policy fires with a truthful cause.
+		// The admitted row cannot be that witness: queued→running does not bump the
+		// generation this CAS is anchored to, so a concurrent claim makes the
+		// JobRunning arm match and a label keyed on the handed-in row would call a
+		// child that DID run "refused before it ran" (#1852). Gated strictly on a
+		// delegation child (ParentJobID set, Result nil), so a NON-delegation
+		// permission-blocked job is byte-identical.
+		finalize, finalizeErr := w.permissionBlockFinalizerFor(blockedFrom)
+		if finalizeErr != nil {
+			return finalizeErr
+		}
+		if err := finalize(ctx, job.ID, errors.New(agentPermissionBlockedMessage)); err != nil {
 			return err
 		}
 		return nil
