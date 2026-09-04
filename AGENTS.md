@@ -357,7 +357,12 @@ fix → verify on the integrated tree → reviewed PR → deploy affected-only �
 live-probe before close. **Merge authority is whatever the org config records
 for your role**: `merge_rule = "self"` lets the coordinator merge its own
 lane's PRs only under the standing delegation and safeguards below;
-`merge_rule = "owner"` leaves the merge with the owner. The
+`merge_rule = "owner"` leaves the merge with the owner. The policy that moved
+merge authority off the owner is owner row **115499**, relayed to this lane as
+directive **115517**: once a PR is clean at its current head and carries one
+independent non-implementer verdict, the merge-authorized role merges it
+without asking jarvis or the owner. One review is sufficient and a second model
+family is never a gate. The
 field is **advisory** — `merge_gate.go` never reads it (`internal/config/org.go`
 calls it "deliberately advisory in phase 1a"), so nothing mechanically stops a
 merge you are not entitled to make; the gate enforces exact-head review, CI and
