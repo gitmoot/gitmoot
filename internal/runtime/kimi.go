@@ -12,8 +12,7 @@ import (
 )
 
 const (
-	KimiLiveCheckPrompt  = "Gitmoot Kimi live check. Return OK only."
-	KimiAuthSetupMessage = "Kimi Code background jobs need a logged-in Kimi CLI. Run: kimi login, then restart the Gitmoot daemon so it inherits the session."
+	KimiLiveCheckPrompt = "Gitmoot Kimi live check. Return OK only."
 
 	// kimiMaxArgvPromptBytes is the conservative per-argument size ceiling for
 	// the kimi prompt. Linux caps any SINGLE execve argument at MAX_ARG_STRLEN
@@ -115,7 +114,7 @@ func (a KimiAdapter) Start(ctx context.Context, request StartRequest) (StartResu
 	args = append(args, "-p", promptArg, "--output-format", "stream-json")
 	result, err := a.runner().Run(ctx, a.Dir, "kimi", args...)
 	if err != nil {
-		return StartResult{Raw: result.Stdout + result.Stderr}, kimiCommandError(result, err)
+		return StartResult{Raw: result.Stdout + result.Stderr}, commandError(result, err)
 	}
 	content, sessionID, _, parseErr := parseKimiStreamJSON(result.Stdout)
 	if parseErr != nil {
@@ -164,7 +163,7 @@ func (a KimiAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result,
 	// The fresh per-job kimi session never reports its id, so SessionID stays
 	// empty; the exit/stderr diagnostics still apply.
 	if err != nil {
-		return Result{Raw: result.Stdout + result.Stderr, SessionDiag: newSessionDiag(result, err, "")}, kimiCommandError(result, err)
+		return Result{Raw: result.Stdout + result.Stderr, SessionDiag: newSessionDiag(result, err, "")}, commandError(result, err)
 	}
 	content, _, usage, parseErr := parseKimiStreamJSON(result.Stdout)
 	if parseErr != nil {
@@ -289,18 +288,34 @@ func isKimiRuntime(runtimeName string) bool {
 	return runtimeName == KimiRuntime
 }
 
-func kimiCommandError(result subprocess.Result, err error) error {
-	base := commandError(result, err)
-	if !isKimiAuthFailure(result) {
-		return base
-	}
-	return fmt.Errorf("Kimi Code authentication required. %s: %w", KimiAuthSetupMessage, base)
-}
-
-func isKimiAuthFailure(result subprocess.Result) bool {
-	text := strings.ToLower(strings.Join([]string{result.Stdout, result.Stderr}, "\n"))
-	return strings.Contains(text, "login") ||
-		strings.Contains(text, "authenticate") ||
-		strings.Contains(text, "unauthorized") ||
-		strings.Contains(text, "authentication")
-}
+// KIMI HAS NO POST-HOC AUTH CLASSIFIER, DELIBERATELY (#1857).
+//
+// kimiCommandError used to wrap any failure whose combined stdout+stderr
+// contained "login", "authenticate", "unauthorized" or "authentication" as
+// "Kimi Code authentication required ... Run: kimi login". Kimi relays its
+// TOOLS' output through those same streams, so the test measured OTHER
+// programs' vocabulary: the measured instance (#1857) was a read-only sandbox
+// denial whose 80,440-char failure text carried the GitHub CLI's own "To log
+// in, run: gh auth login", and gitmoot labelled the sandbox denial an auth
+// failure and sent the operator to re-login a session that was never the
+// problem.
+//
+// Kimi's own machinery offers nothing to classify from: the stream-json
+// envelope (ExtractKimiStreamEvent, transcript_extract.go) carries only
+// role/type/content/session_id/usage/tool_calls, with no error or auth field,
+// and subprocess.Result carries no exit code, so no auth-reserved status is
+// available either. So a failed kimi child now surfaces its own cause
+// UNWRAPPED through commandError, and gitmoot no longer claims to detect kimi
+// auth from text in either direction: a genuine authorization rejection is
+// unlabelled too, which is the deliberate cost of not reporting another
+// program's words as kimi's.
+//
+// The obvious replacement - refuse before running when kimi's stored
+// credential is unusable - is NOT here, and deliberately: kimi has TWO auth
+// sources (credentials/kimi-code.json and the selected provider's api_key/env/
+// oauth key in config.toml, which gitmoot's own read-only staging already
+// treats as credential material in narrowKimiConfigDetailed), and which one
+// actually authenticates is unmeasured. On the host that produced #1857 the
+// token pair is blank while the selected provider's oauth key is populated, so
+// a preflight keyed on the token pair would refuse exactly the sandbox-denied
+// jobs this change stops mislabelling.
