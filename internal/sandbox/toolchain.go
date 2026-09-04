@@ -20,7 +20,25 @@ var toolchainPackageRoots = []string{"/opt", "/usr/local", "/nix/store", "/snap"
 // what makes an operator-pinned install outside every package root grantable -
 // the #1839 case - without trusting a path the confined code could itself have
 // created. A variable so a test can supply a fixture root.
-var daemonBuildGoroot = func() string { return runtime.GOROOT() }
+var daemonBuildGoroot = func() string {
+	// runtime.GOROOT() returns the GOROOT ENVIRONMENT VARIABLE when one is
+	// set, and only otherwise the build-time value - which is why it is
+	// deprecated. MEASURED on one binary built once, varying only the
+	// environment: with no GOROOT it reports the pinned toolchain; with
+	// GOROOT=/tmp/evil-goroot it reports /tmp/evil-goroot. The SAME compiled
+	// binary names an attacker-supplied anchor, so an anchor taken from it
+	// straight would have precisely the environment-controlled property the
+	// anchor exists to avoid.
+	//
+	// An environment-supplied GOROOT therefore FAILS CLOSED: the anchor is
+	// withheld, the grant falls back to the package roots, and a seat that
+	// consequently cannot reach its toolchain gets a named diagnostic rather
+	// than silence. An EMPTY value is treated as absent, matching the runtime.
+	if value, ok := os.LookupEnv("GOROOT"); ok && strings.TrimSpace(value) != "" {
+		return ""
+	}
+	return runtime.GOROOT()
+}
 
 // goToolchainHomeRoots are directories that must never be granted as a
 // toolchain however they are shaped: somebody's home. A variable so a test can

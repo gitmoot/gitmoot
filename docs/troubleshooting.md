@@ -723,6 +723,16 @@ granted, so reviews came back static-only with no defect in the code:
   quiescent database behaves the same. The snapshot also means nothing beside
   the live database is exposed, because the live database is not granted at all.
 
+- `go toolchain: none grantable on PATH, but <path>/go.mod requires go <n>` when
+  the toolchain plainly exists. Check whether the daemon runs with `GOROOT` set
+  in its environment. The pinned-toolchain anchor is derived from the toolchain
+  the daemon was BUILT against, and `runtime.GOROOT()` returns the environment's
+  value when one is set - so an environment-supplied `GOROOT` is refused as an
+  anchor rather than trusted, and the grant falls back to the package install
+  roots. Measured: the same compiled binary reports `/tmp/evil-goroot` as its
+  GOROOT when launched with `GOROOT=/tmp/evil-goroot`, which is why this fails
+  closed. Do not set `GOROOT` for the daemon; put the toolchain on its PATH.
+
 - `go toolchain: granted <root> (<release>) cannot satisfy the checkout's go
   <directive> directive` - the seat can execute a toolchain but cannot build
   this repository. Common cause: the daemon's PATH resolves the system Go
