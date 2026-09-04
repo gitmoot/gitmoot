@@ -649,6 +649,43 @@ export TMPDIR=<seat cache>/tmp GOCACHE=<seat cache>/gocache GOMODCACHE=<seat cac
 - Quote `go version` output in any note making a baseline claim. It is the check
   that works without knowing which binary you got.
 
+### Codex reviews report zero executed checks (`bwrap: setting up uid map`)
+
+A codex read-only seat used to fail EVERY command before running it, so its
+reviews came back static-only with an executed-check count of zero. Codex's own
+sandbox is bwrap, which needs a user namespace that gitmoot's Landlock domain
+denies, so two sandboxes were fighting.
+
+Measured on this box, one command with only the domain differing:
+
+```
+bwrap --dev-bind / / --unshare-user -- /bin/true
+  outside the Landlock domain        -> rc=0
+  inside the domain                  -> rc=1  bwrap: setting up uid map: Permission denied
+  inside + /proc writable            -> rc=1  bwrap: Failed to make / slave
+  inside + /proc + /dev writable     -> rc=1  bwrap: Failed to make / slave
+plain /bin/true inside the domain    -> rc=0
+```
+
+So the domain executes fine and NESTING was the cause; granting more only moved
+the error from the uid map to mount propagation, which is why widening grants
+could not settle it.
+
+A codex seat therefore now runs with its own sandbox OFF and relies on the
+Landlock domain, which is the boundary gitmoot builds and tests. End to end in
+that seat, same grants either way:
+
+- before: `bwrap: setting up uid map: Permission denied`, nothing executed
+- after: `/bin/bash -lc 'echo PROBE_RAN' … succeeded in 0ms: PROBE_RAN`
+- writing outside the granted roots is still refused - `sh: cannot create
+  /root/…: Permission denied`, and no file appears on the host
+
+If a codex seat still reports zero executed checks, the seat's own state
+directory is the usual cause: `CODEX_HOME` must be WRITABLE (it is staged
+inside the seat's cache root). A read-only `CODEX_HOME` fails earlier and
+differently, with `failed to initialize in-process app-server client:
+Permission denied`.
+
 ### A review reporting it could not read prior verdicts
 
 The seat is given a RENDERED, REPO-SCOPED list of prior verdicts inside its own
