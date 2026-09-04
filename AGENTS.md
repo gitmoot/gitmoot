@@ -363,11 +363,14 @@ contradict itself: the role field was set to `"self"` on **2026-08-31**
 (`config.toml` records jarvis setting it on the owner's direct instruction);
 owner row **107983** granted the standing merge delegation on **2026-09-02**,
 with the six safeguards below; and owner row **115499**, relayed to this lane as
-directive **115517**, removed the approval GATE on **2026-09-04** - once a PR is
-clean at its current head and carries one independent non-implementer verdict,
-the merge-authorized role merges it without asking jarvis or the owner. One
-review is sufficient; another model family is preferred when available but never
-a gate. The
+directive **115517**, removed the approval GATE on **2026-09-04** - the
+merge-authorized role merges without asking jarvis or the owner once ALL SIX
+safeguards below hold. The full condition is not summarised here on purpose: an
+earlier draft compressed it to "clean head plus one independent verdict", which
+silently dropped the non-empty `tests_run` evidence bar and the immediate
+pre-merge re-read - the two that caught a verdict which executed nothing and
+every head that moved under a review. One review is sufficient; another model
+family is preferred when available but never a gate. The `merge_rule`
 field is **advisory** — `merge_gate.go` never reads it (`internal/config/org.go`
 calls it "deliberately advisory in phase 1a"), so nothing mechanically stops a
 merge you are not entitled to make; the gate enforces exact-head review, CI and
