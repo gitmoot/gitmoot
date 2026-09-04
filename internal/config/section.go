@@ -19,9 +19,22 @@ import "strings"
 // once, so `[workflow` failed the test entirely, was not treated as a header,
 // and every key after it was applied to whichever section was open before -
 // silently misattributing configuration on invalid input. tool_cache.go and
-// disk_guard.go already cleared state here, each citing the #1113 finder; this
-// makes all of them agree rather than leaving twenty-one loaders with the unsafe
-// reading.
+// disk_guard.go already cleared state here, each citing the #1113 finder.
+//
+// WHAT THIS DOES NOT COVER, because a comment that overstates its own reach
+// stops the next reader checking. It is used by the plain section scanners in
+// this package - 26 call sites across 22 files. Deliberately EXCLUDED per the
+// #1759 ruling (workflow note 107889) on their measured structural
+// differences: agent_types.go (LoadAgentTypes and removeAgentTypeBlocks) and
+// memory_pipelines.go keep the pre-#1759 two-bracket form, so LoadAgentTypes
+// still MISATTRIBUTES keys after a malformed header and removeAgentTypeBlocks
+// - a WRITE path - still drops the malformed line and the lines under it from
+// the operator's file. Both are pre-existing, both sit outside what that
+// ruling scoped, and neither is fixed here. disk_guard.go and tool_cache.go
+// additionally keep private inline copies of this classification:
+// behaviourally identical, but a second implementation.
+//
+// So: one classification for the plain scanners, NOT one for the package.
 //
 // A valid header is byte-equivalent to the old behaviour: same trimming, same
 // name. Only the invalid-input path changes.
@@ -34,4 +47,26 @@ func sectionHeader(line string) (name string, ok bool) {
 		return "", true
 	}
 	return strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")), true
+}
+
+// malformedHeaderTargets reports whether a MALFORMED header (one that opened
+// with '[' and never closed) names section as a complete dotted segment.
+//
+// It exists so a GATE loader can refuse a file whose own section is unreadable
+// without refusing files whose typo is somewhere else entirely. org.go set this
+// precedent for [org: fail closed only for a genuinely org-shaped header, so
+// that "a typo in an unrelated section must not brick dispatch". The same
+// asymmetry applies here - `[disk_guard` must not stop the merge gate loading,
+// while `[merge_gate` must stop it returning a permissive default.
+//
+// Matching is per dotted SEGMENT, so `[repos.owner/repo.merge_gate` targets
+// merge_gate and `[merge_gateway` does not.
+func malformedHeaderTargets(line, section string) bool {
+	body := strings.TrimSpace(strings.TrimPrefix(line, "["))
+	for _, segment := range strings.Split(body, ".") {
+		if strings.TrimSpace(segment) == section {
+			return true
+		}
+	}
+	return false
 }

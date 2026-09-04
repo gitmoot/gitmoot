@@ -23,10 +23,17 @@
 //
 // Callers own that boundary. Every current call site builds `<literal command>
 // <quoted arguments>` — `gh release view <repo>`, `codex plugin marketplace add
-// <root>`, `<gitmootBin> job watch <id>` — so no Posix result ever lands in
-// command position, and gitmootBin is deliberately NOT routed through here. A
-// future caller that needs a computed COMMAND WORD must not use this function
-// and must not assume it protects that position.
+// <root>`, `<gitmootBin> job watch <id>` — and gitmootBin is deliberately NOT
+// routed through here.
+//
+// ONE CALL SITE IS AN EXCEPTION, and an earlier version of this comment claimed
+// otherwise: internal/cli/plugin.go passes args[0] through the quoter when it
+// builds a plugin launch command, so a quoted value CAN land in command
+// position there. It is not exploitable today because the operator supplies
+// that value with --cli, but the general claim "no Posix result ever lands in
+// command position" was false, and a future caller must not rely on it. A
+// caller that needs a computed COMMAND WORD must not use this function and must
+// not assume it protects that position.
 //
 // Deliberately NOT solved by quoting reserved words and assignment-form tokens:
 // that would mean enumerating every shell's reserved list correctly, forever,

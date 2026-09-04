@@ -110,6 +110,13 @@ func LoadMergeGatePolicy(paths Paths) (MergeGateConfig, error) {
 			continue
 		}
 		if section, ok := sectionHeader(line); ok {
+			if section == "" && malformedHeaderTargets(line, "merge_gate") {
+				// A malformed merge_gate header must not fall through to
+				// DefaultMergeGatePolicy: that default is the PERMISSIVE one
+				// (auto-merge on, external CI not required), so a typo would
+				// silently loosen the gate while returning a nil error.
+				return MergeGateConfig{}, fmt.Errorf("parse merge_gate section: missing closing ]")
+			}
 			repo, inSection = parseMergeGateSection(section)
 			if inSection && repo != "" {
 				if _, ok := cfg.repos[repo]; !ok {

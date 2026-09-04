@@ -69,6 +69,9 @@ func LoadRequireWorkflow(paths Paths) (RequireWorkflowConfig, error) {
 			continue
 		}
 		if section, ok := sectionHeader(line); ok {
+			if section == "" && malformedHeaderTargets(line, "workflow") {
+				return RequireWorkflowConfig{}, fmt.Errorf("parse workflow section: missing closing ]")
+			}
 			repo, inSection = parseRequireWorkflowSection(section)
 			if inSection && repo != "" {
 				if _, ok := cfg.repos[repo]; !ok {

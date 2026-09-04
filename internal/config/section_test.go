@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestSectionHeaderClassification is the helper table. The load-bearing rows are
@@ -45,36 +46,40 @@ func TestSectionHeaderClassification(t *testing.T) {
 }
 
 // TestMalformedHeaderNeverMisattributesKeys is the regression that matters, and
-// it runs through PRODUCTION LOADERS rather than the helper: a table test on
-// sectionHeader would stay green if a loader kept its own inline classification,
-// which is exactly the mutant this consolidation could leave behind.
+// it runs through a PRODUCTION LOADER rather than the helper: a table test on
+// sectionHeader would stay green if a loader kept its own inline
+// classification, which is exactly the mutant this consolidation could leave
+// behind.
 //
 // The fixture is the hazard shape from the #1113 finder: a valid section, then a
 // botched header with no closing bracket, then a key that the malformed header
 // must prevent from landing in the earlier section.
+//
+// It used to drive LoadAdmissionPolicy. Admission is a GUARD loader and now
+// REFUSES its own malformed header outright (#1795 review P2-1: resetting to
+// the zero policy silently disabled admission accounting), so the
+// no-misattribution property is demonstrated here through a non-guard loader
+// and the refusal is pinned in TestGateLoadersRefuseTheirOwnMalformedHeader.
 func TestMalformedHeaderNeverMisattributesKeys(t *testing.T) {
 	paths := PathsForHome(t.TempDir())
 	if err := os.MkdirAll(paths.Home, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(paths.ConfigFile, []byte(`
-[admission]
-max_memory_gb = 1.0
+[transcripts]
+retain = "48h"
 
-[admission
-max_memory_gb = 99.0
+[transcripts
+retain = "1h"
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	policy, err := LoadAdmissionPolicy(paths)
-	if err != nil {
-		t.Fatalf("LoadAdmissionPolicy: %v", err)
+	got := LoadTranscriptsConfig(paths)
+	if got.Retain == time.Hour {
+		t.Fatal("a key after a malformed header was applied to [transcripts]; the header must end the section")
 	}
-	if policy.MaxMemoryGB == 99.0 {
-		t.Fatal("a key after a malformed header was applied to [admission]; the header must end the section")
-	}
-	if policy.MaxMemoryGB != 1.0 {
-		t.Fatalf("MaxMemoryGB = %v, want 1.0 (keys BEFORE the malformed header must still apply)", policy.MaxMemoryGB)
+	if got.Retain != 48*time.Hour {
+		t.Fatalf("Retain = %v, want 48h (keys BEFORE the malformed header must still apply)", got.Retain)
 	}
 }
 

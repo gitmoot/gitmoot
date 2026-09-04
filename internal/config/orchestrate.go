@@ -623,6 +623,9 @@ func LoadReviewConfig(paths Paths) (ReviewConfig, error) {
 			continue
 		}
 		if section, ok := sectionHeader(line); ok {
+			if section == "" && malformedHeaderTargets(line, "review") {
+				return ReviewConfig{}, fmt.Errorf("parse review section: missing closing ]")
+			}
 			repo, inSection = parseReviewSection(section)
 			if inSection && repo != "" {
 				if _, ok := cfg.repos[repo]; !ok {

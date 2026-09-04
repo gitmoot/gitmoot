@@ -72,6 +72,11 @@ func LoadAdmissionPolicy(paths Paths) (AdmissionPolicy, error) {
 			continue
 		}
 		if section, ok := sectionHeader(line); ok {
+			if section == "" && malformedHeaderTargets(line, "admission") {
+				// Falling back to the zero policy makes Enabled() false, which
+				// makes the daemon skip admission accounting entirely.
+				return AdmissionPolicy{}, fmt.Errorf("parse admission section: missing closing ]")
+			}
 			current = section == "admission"
 			continue
 		}

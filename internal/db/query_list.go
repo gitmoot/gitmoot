@@ -64,6 +64,15 @@ type rowScanner = interface {
 // emptyIfNil normalises a nil slice to an empty one, so the call sites that
 // promise `[]` rather than `null` say so in one readable token and a grep for
 // emptyIfNil enumerates exactly which list methods carry that promise.
+//
+// ONE SHAPE DIVERGENCE, stated because the call-site comments justify this
+// wrapper by the LATE-iteration path and were silent about the early one: on a
+// QUERY-time failure these methods now return a non-nil len-0 slice alongside
+// the error, where the pre-#1759 bodies returned nil because they failed before
+// any normalisation could run. Only a caller that IGNORES err and tests the
+// slice for nil can observe it, and err is non-nil in both shapes - but the
+// wrapper is not a full equivalence, and nil-preserving list methods in this
+// package still return nil on the same path.
 func emptyIfNil[T any](in []T) []T {
 	if in == nil {
 		return []T{}
