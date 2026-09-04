@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
@@ -113,44 +112,6 @@ func openWritable(path string) (*Store, error) {
 		return nil, err
 	}
 	return &Store{db: db, path: path}, nil
-}
-
-// SnapshotInto writes a CONSISTENT, self-contained copy of this database to
-// dest, which must not already exist.
-//
-// #1839: a read-only review seat cannot open the live store at all. Measured
-// by strace of the exact mode=ro DSN: SQLite opens gitmoot.db O_RDONLY but
-// opens gitmoot.db-wal and gitmoot.db-shm with O_RDWR|O_CREAT, and Landlock's
-// read-file grant refuses both - so the open fails before a single verdict is
-// read. It holds even for a cleanly closed database, because journal_mode=wal
-// persists in the header, and O_CREAT additionally needs directory write,
-// which a read-only seat must not have.
-//
-// Granting write on the sidecars would trade the read-only property away, and
-// mode=ro&immutable=1 returns stale or torn pages against a live writer. A
-// snapshot has neither problem: VACUUM INTO takes a read transaction, so the
-// copy is consistent as of one point in time, and it lands with NO WAL
-// sidecars in a directory the seat already owns.
-func (s *Store) SnapshotInto(ctx context.Context, dest string) error {
-	if strings.TrimSpace(dest) == "" {
-		return errors.New("snapshot destination is empty")
-	}
-	if _, err := os.Stat(dest); err == nil {
-		return fmt.Errorf("snapshot destination %s already exists", dest)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("stat snapshot destination %s: %w", dest, err)
-	}
-	// A literal is required: VACUUM INTO does not accept a bound parameter.
-	if _, err := s.db.ExecContext(ctx, "VACUUM INTO "+sqliteStringLiteral(dest)); err != nil {
-		return fmt.Errorf("snapshot database into %s: %w", dest, err)
-	}
-	return nil
-}
-
-// sqliteStringLiteral quotes a value for a SQL position that cannot take a
-// bound parameter. Doubling embedded quotes is SQLite's own escape.
-func sqliteStringLiteral(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func OpenReadOnly(path string) (*Store, error) {

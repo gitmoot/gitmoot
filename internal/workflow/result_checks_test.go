@@ -426,3 +426,47 @@ func keys(m map[string]ResultCheck) []string {
 	}
 	return out
 }
+
+// TestExecutedClaimNeedsARunnableTarget pins the round-3 finding that entries
+// stating the OPPOSITE of execution were accepted as proof of it: "none run"
+// and "could not run" are two words each, so the two-word arm let them through.
+func TestExecutedClaimNeedsARunnableTarget(t *testing.T) {
+	hollow := []string{"none run", "could not run", "nothing to run", "ok", "n/a"}
+	for _, entry := range hollow {
+		result := AgentResult{
+			Decision: "approved",
+			Summary:  "a summary long enough to satisfy the accounting floor on its own merits",
+			TestsRun: []string{entry},
+			Evidence: EvidenceExecuted,
+		}
+		failed := failedIDs(ResultCheckInput{Action: "review", Result: result})
+		if _, ok := failed["review-executed-claim-is-substantiated"]; !ok {
+			t.Errorf("tests_run %q substantiated an EXECUTED claim; failed=%v", entry, keys(failed))
+		}
+	}
+
+	real := []string{"go test ./... -> ok", "go build ./internal/workflow/ rc=0", "gofmt -l internal/ -> clean"}
+	for _, entry := range real {
+		result := AgentResult{
+			Decision: "approved",
+			Summary:  "a summary long enough to satisfy the accounting floor on its own merits",
+			TestsRun: []string{entry},
+			Evidence: EvidenceExecuted,
+		}
+		if failed := failedIDs(ResultCheckInput{Action: "review", Result: result}); len(failed) != 0 {
+			t.Errorf("tests_run %q is a real command and must pass; failed=%v", entry, keys(failed))
+		}
+	}
+
+	// An honest static-only verdict still passes with the SAME hollow entries,
+	// because it claims nothing.
+	honest := AgentResult{
+		Decision: "approved",
+		Summary:  "read the diff and prior verdicts; the toolchain was unreachable so nothing could be run",
+		TestsRun: []string{"none run"},
+		Evidence: EvidenceStaticOnly,
+	}
+	if failed := failedIDs(ResultCheckInput{Action: "review", Result: honest}); len(failed) != 0 {
+		t.Fatalf("an honest static-only review failed %v; under result_checks=block that KILLS the job", keys(failed))
+	}
+}

@@ -14,10 +14,9 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// seedVerdictStore creates a REAL database at paths.Database holding one prior
-// review verdict, then leaves it in WAL mode - which is the state that made the
-// first version of this fix inert.
-func seedVerdictStore(t *testing.T, paths config.Paths, summary string) {
+// seedVerdict writes one prior review verdict for repo into a REAL database,
+// left in WAL mode - the state that made an earlier form of this fix inert.
+func seedVerdict(t *testing.T, paths config.Paths, repo, jobID, summary string) {
 	t.Helper()
 	if err := os.MkdirAll(paths.Home, 0o700); err != nil {
 		t.Fatal(err)
@@ -26,94 +25,143 @@ func seedVerdictStore(t *testing.T, paths config.Paths, summary string) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
+	defer func() { _ = store.Close() }()
 	payload, err := json.Marshal(workflow.JobPayload{
-		Repo:        "gitmoot/gitmoot",
+		Repo:        repo,
 		PullRequest: 1845,
-		Result:      &workflow.AgentResult{Decision: "approved", Summary: summary, Evidence: workflow.EvidenceExecuted},
+		HeadSHA:     "cdda6b319e9c24945d40cd44bc10d843c60dd93a",
+		Result: &workflow.AgentResult{
+			Decision: "changes_requested",
+			Severity: "P2",
+			Evidence: workflow.EvidenceStaticOnly,
+			Summary:  summary,
+		},
 	})
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)
 	}
-	if err := store.UpsertAgent(context.Background(), db.Agent{
-		Name: "gm-omp-gate", Role: "implementer", Runtime: "codex", RuntimeRef: "last",
-		RepoScope: "gitmoot/gitmoot", Capabilities: []string{"implement"},
-		AutonomyPolicy: "auto", HealthStatus: "ok",
-	}); err != nil {
-		t.Fatalf("seed agent: %v", err)
-	}
 	if err := store.CreateJobWithEvent(context.Background(), db.Job{
-		ID: "prior-verdict", Agent: "gm-review-opus", Type: "review",
+		ID: jobID, Agent: "gm-review-opus", Type: "review",
 		State: string(workflow.JobSucceeded), Payload: string(payload),
 	}, db.JobEvent{Kind: string(workflow.JobSucceeded), Message: "verdict"}); err != nil {
 		t.Fatalf("seed verdict: %v", err)
 	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("close store: %v", err)
-	}
 }
 
-// TestEvidenceSnapshotCanActuallyBeQueried is the SUFFICIENCY test the round-1
-// version lacked.
+// TestPriorVerdictsArtifactIsReadableAndScoped is the SUFFICIENCY test.
 //
-// That version wrote the 6-byte string "sqlite" as the database and asserted
-// the path appeared in a grant slice. It therefore could not notice that a
-// read-only seat cannot open the live WAL store AT ALL - SQLite opens the -wal
-// and -shm sidecars O_RDWR|O_CREAT, which a read-file grant refuses. Path
-// membership is not readability, so this test opens the staged copy and reads
-// a verdict out of it.
-func TestEvidenceSnapshotCanActuallyBeQueried(t *testing.T) {
+// An earlier version asserted that a path appeared in a grant slice, which
+// could not notice that a read-only seat cannot open the live WAL store at all.
+// Path membership is not readability, so this reads the artifact the seat is
+// actually given and checks what is in it - and what is NOT.
+func TestPriorVerdictsArtifactIsReadableAndScoped(t *testing.T) {
 	live := config.PathsForHome(t.TempDir())
-	seedVerdictStore(t, live, "the prior verdict a reviewer must be able to enumerate")
+	seedVerdict(t, live, "gitmoot/gitmoot", "mine-1", "a verdict on the repo under review")
+	seedVerdict(t, live, "other/repo", "theirs-1", "a verdict on a DIFFERENT repo")
 
-	cacheRoot := t.TempDir()
-	evidenceHome, diagnostic := stageReviewEvidenceSnapshot(context.Background(), live, cacheRoot)
+	file, diagnostic := stagePriorVerdicts(context.Background(), live, t.TempDir(), "gitmoot/gitmoot")
 	if diagnostic != "" {
 		t.Fatalf("staging reported %q", diagnostic)
 	}
-	if evidenceHome == "" {
-		t.Fatal("no evidence home staged from a database that exists")
+	if file == "" {
+		t.Fatal("no artifact staged from a store that exists: the seat cannot enumerate prior verdicts, which is the #1839 defect")
 	}
 
-	snapshot := config.PathsForHome(evidenceHome)
-	if _, err := os.Stat(snapshot.Database); err != nil {
-		t.Fatalf("snapshot database missing: %v", err)
+	body, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("read the artifact the seat is given: %v", err)
 	}
-	// A snapshot carries no WAL sidecars, which is the point: nothing has to
-	// be created to read it.
-	for _, sidecar := range []string{"-wal", "-shm"} {
-		if _, err := os.Stat(snapshot.Database + sidecar); err == nil {
-			t.Errorf("snapshot shipped a %s sidecar; the open would need to write it", sidecar)
-		}
+	var list priorVerdictList
+	if err := json.Unmarshal(body, &list); err != nil {
+		t.Fatalf("the artifact is not readable as JSON: %v", err)
+	}
+	if list.Repo != "gitmoot/gitmoot" || strings.TrimSpace(list.AsOf) == "" {
+		t.Errorf("artifact does not state its own scope and as-of time: repo=%q as_of=%q", list.Repo, list.AsOf)
+	}
+	if len(list.Verdicts) != 1 {
+		t.Fatalf("got %d verdicts, want exactly the one in scope: %+v", len(list.Verdicts), list.Verdicts)
+	}
+	got := list.Verdicts[0]
+	if got.JobID != "mine-1" || got.Decision != "changes_requested" || got.Severity != "P2" {
+		t.Errorf("verdict does not carry what a reviewer needs: %+v", got)
+	}
+	if got.Evidence != workflow.EvidenceStaticOnly {
+		t.Errorf("evidence = %q, want %q: the executed/static-only distinction must survive into what the seat reads", got.Evidence, workflow.EvidenceStaticOnly)
 	}
 
-	store, err := db.OpenReadOnly(snapshot.Database)
-	if err != nil {
-		t.Fatalf("open the snapshot READ-ONLY: %v", err)
+	// CROSS-REPO DISCLOSURE is the property that matters most here: an earlier
+	// form copied the whole database, so every other repo's jobs, prompts and
+	// results travelled to an untrusted runtime.
+	if strings.Contains(string(body), "other/repo") || strings.Contains(string(body), "theirs-1") {
+		t.Error("the artifact contains another repo's verdicts: cross-repo disclosure")
 	}
-	defer func() { _ = store.Close() }()
-	jobs, err := store.ListJobs(context.Background())
-	if err != nil {
-		t.Fatalf("enumerate prior verdicts: %v", err)
-	}
-	found := false
-	for _, job := range jobs {
-		if job.ID == "prior-verdict" && strings.Contains(job.Payload, "must be able to enumerate") {
-			found = true
+	// And the fields a database copy would have carried are structurally
+	// absent, not merely unmentioned.
+	for _, forbidden := range []string{"owner_token", "task_state_claims", "confirmed_memories", "prompt"} {
+		if strings.Contains(string(body), forbidden) {
+			t.Errorf("the artifact carries %q, which a rendered verdict list must not", forbidden)
 		}
-	}
-	if !found {
-		t.Fatalf("the seeded verdict is not readable from the snapshot; %d jobs found", len(jobs))
 	}
 }
 
-// TestReadOnlyGrantsStageEvidenceThroughProduction drives the real grant
-// builder rather than the helper, and asserts the live store is NOT granted -
-// the credential-adjacency property, now held by construction because nothing
-// beside the live database is reachable when the database itself is not.
-func TestReadOnlyGrantsStageEvidenceThroughProduction(t *testing.T) {
+// TestPriorVerdictsRefusesAnUnscopedSeat pins the fail-closed direction: with
+// no single repo to scope to, staging must decline and SAY SO rather than fall
+// back to everything.
+func TestPriorVerdictsRefusesAnUnscopedSeat(t *testing.T) {
+	live := config.PathsForHome(t.TempDir())
+	seedVerdict(t, live, "gitmoot/gitmoot", "mine-1", "verdict")
+
+	for _, scope := range []string{"", "gitmoot/*", "   "} {
+		file, diagnostic := stagePriorVerdicts(context.Background(), live, t.TempDir(), scope)
+		if file != "" {
+			t.Errorf("scope %q staged %q; an unscoped copy is the defect this replaces", scope, file)
+		}
+		if strings.TrimSpace(diagnostic) == "" {
+			t.Errorf("scope %q declined SILENTLY; a seat losing its evidence must be told why", scope)
+		}
+	}
+}
+
+// TestPriorVerdictsSurvivesAnUncleanedPredecessor pins the defect where a
+// leftover directory from a crashed job made the NEXT seat evidence-less.
+//
+// The staging destination lives in a root the daemon owns and has just
+// re-created, so a leftover must be cleared rather than treated as an error.
+func TestPriorVerdictsSurvivesAnUncleanedPredecessor(t *testing.T) {
+	live := config.PathsForHome(t.TempDir())
+	seedVerdict(t, live, "gitmoot/gitmoot", "mine-1", "verdict")
+	cacheRoot := t.TempDir()
+
+	// A predecessor's artifact, plus junk beside it, left behind by a job whose
+	// cleanup never ran.
+	stale := filepath.Join(cacheRoot, "evidence")
+	if err := os.MkdirAll(stale, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stale, "prior-verdicts.json"), []byte("STALE"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	file, diagnostic := stagePriorVerdicts(context.Background(), live, cacheRoot, "gitmoot/gitmoot")
+	if file == "" {
+		t.Fatalf("a leftover directory made this seat evidence-less (%s): that is the silent degradation this change removes", diagnostic)
+	}
+	body, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "STALE") {
+		t.Error("the seat was handed the PREDECESSOR's artifact")
+	}
+}
+
+// TestReadOnlyGrantsStagePriorVerdictsThroughProduction drives the real grant
+// builder rather than the helper - the "test pins a helper production never
+// reaches" trap, which a mutant deleting the wiring survived once already.
+func TestReadOnlyGrantsStagePriorVerdictsThroughProduction(t *testing.T) {
 	home := t.TempDir()
 	live := config.PathsForHome(home)
-	seedVerdictStore(t, live, "prior verdict via production")
+	seedVerdict(t, live, "gitmoot/gitmoot", "mine-1", "prior verdict via production")
 
 	checkout := t.TempDir()
 	runGit(t, checkout, "init", "-b", "main")
@@ -121,201 +169,40 @@ func TestReadOnlyGrantsStageEvidenceThroughProduction(t *testing.T) {
 	runGit(t, checkout, "config", "user.name", "Gitmoot")
 	runGit(t, checkout, "commit", "--allow-empty", "-m", "init")
 
-	agent := runtime.Agent{Name: "seat", Runtime: runtime.CodexRuntime, ReadOnlySeat: true}
+	agent := runtime.Agent{
+		Name: "seat", Runtime: runtime.CodexRuntime, ReadOnlySeat: true,
+		RepoScope: "gitmoot/gitmoot",
+	}
 	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, true)
 	if err != nil {
 		t.Fatalf("readOnlyRuntimeSandboxGrants: %v", err)
 	}
-	if grants.evidenceHome == "" {
-		t.Fatal("production staged no evidence home: a seat cannot enumerate prior verdicts, the #1839 defect")
+	if grants.evidenceFile == "" {
+		t.Fatal("production staged no verdict list: a seat cannot enumerate prior verdicts, the #1839 defect")
 	}
-	if !strings.HasPrefix(grants.evidenceHome, grants.cacheRoot) {
-		t.Errorf("evidence home %q is outside the seat's own cache root %q, so it would need a grant of its own", grants.evidenceHome, grants.cacheRoot)
+	if !strings.HasPrefix(grants.evidenceFile, grants.cacheRoot) {
+		t.Errorf("artifact %q is outside the seat's own cache root %q, so it would need a grant of its own", grants.evidenceFile, grants.cacheRoot)
 	}
-	if want := EvidenceHomeEnv + "=" + grants.evidenceHome; !containsString(grants.env, want) {
-		t.Errorf("env %v does not export %q, so nothing can select the snapshot", grants.env, want)
+	if want := "GITMOOT_PRIOR_VERDICTS=" + grants.evidenceFile; !containsString(grants.env, want) {
+		t.Errorf("env %v does not export %q, so nothing can find the artifact", grants.env, want)
 	}
+	// The live store is never granted, which is what retires the
+	// credential-adjacency question rather than mitigating it.
 	for _, granted := range grants.readFiles {
 		if granted == live.Database || strings.HasPrefix(granted, live.Home+string(filepath.Separator)) {
-			t.Errorf("the LIVE store or a file beside it is granted (%q); a snapshot exists so nothing there needs to be", granted)
+			t.Errorf("the LIVE store or a file beside it is granted (%q); a rendered artifact exists so nothing there needs to be", granted)
 		}
 	}
 	for _, root := range grants.reads {
 		if root == live.Home {
-			t.Errorf("the gitmoot home %q is granted as a read root, exposing every credential beside the store", root)
+			t.Errorf("the gitmoot home %q is granted as a read root, exposing everything beside the store", root)
 		}
 	}
-	// And the staged copy is queryable, so this is sufficiency and not just
-	// wiring.
-	store, err := db.OpenReadOnly(config.PathsForHome(grants.evidenceHome).Database)
+	body, err := os.ReadFile(grants.evidenceFile)
 	if err != nil {
-		t.Fatalf("open the production-staged snapshot: %v", err)
+		t.Fatalf("read the production artifact: %v", err)
 	}
-	defer func() { _ = store.Close() }()
-	if jobs, err := store.ListJobs(context.Background()); err != nil || len(jobs) == 0 {
-		t.Fatalf("production snapshot holds no verdicts (jobs=%d err=%v)", len(jobs), err)
-	}
-}
-
-// TestEvidenceHomeNeverRedirectsWrites is the guard on the selection
-// mechanism, and it is why GITMOOT_EVIDENCE_HOME is honoured by INSPECTION
-// commands only.
-//
-// A blanket fallback for --home was considered and rejected: `job record`
-// would then land in a throwaway snapshot copy and vanish, which is a worse
-// failure than not reading evidence - it looks like success. So a write must
-// reach the LIVE store even with the variable set.
-func TestEvidenceHomeNeverRedirectsWrites(t *testing.T) {
-	home := t.TempDir()
-	live := config.PathsForHome(home)
-	seedVerdictStore(t, live, "live store")
-
-	cacheRoot := t.TempDir()
-	evidenceHome, diagnostic := stageReviewEvidenceSnapshot(context.Background(), live, cacheRoot)
-	if evidenceHome == "" {
-		t.Fatalf("no snapshot staged (%s)", diagnostic)
-	}
-	t.Setenv(EvidenceHomeEnv, evidenceHome)
-
-	var stdout, stderr strings.Builder
-	if code := Run([]string{"repo", "add", "gitmoot/gitmoot", "--home", home, "--force"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("repo add exited %d: %s%s", code, stdout.String(), stderr.String())
-	}
-	stdout.Reset()
-	stderr.Reset()
-
-	// A WRITE command while the evidence variable is set.
-	if code := Run([]string{"job", "record", "--agent", "gm-omp-gate", "--repo", "gitmoot/gitmoot",
-		"--type", "implement", "--decision", "implemented", "--pr", "1845", "--home", home}, &stdout, &stderr); code != 0 {
-		t.Fatalf("job record exited %d: %s%s", code, stdout.String(), stderr.String())
-	}
-
-	liveStore, err := db.OpenReadOnly(live.Database)
-	if err != nil {
-		t.Fatalf("open live store: %v", err)
-	}
-	defer func() { _ = liveStore.Close() }()
-	liveJobs, err := liveStore.ListJobs(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	snapStore, err := db.OpenReadOnly(config.PathsForHome(evidenceHome).Database)
-	if err != nil {
-		t.Fatalf("open snapshot: %v", err)
-	}
-	defer func() { _ = snapStore.Close() }()
-	snapJobs, err := snapStore.ListJobs(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	countImplement := func(jobs []db.Job) int {
-		n := 0
-		for _, job := range jobs {
-			if job.Type == "implement" {
-				n++
-			}
-		}
-		return n
-	}
-	if countImplement(liveJobs) != 1 {
-		t.Errorf("the LIVE store holds %d implement rows, want 1: the write did not land where it must", countImplement(liveJobs))
-	}
-	if got := countImplement(snapJobs); got != 0 {
-		t.Errorf("the SNAPSHOT holds %d implement rows, want 0: a write was redirected into a throwaway copy", got)
-	}
-}
-
-// TestInspectionCommandsReadTheSnapshot proves the selection mechanism has a
-// real CONSUMER: the production `job list` code path, with no --home, reads the
-// staged snapshot rather than the operator's live store.
-//
-// Without this the whole snapshot would be dead wiring - staged, exported, and
-// never opened by anything.
-func TestInspectionCommandsReadTheSnapshot(t *testing.T) {
-	live := config.PathsForHome(t.TempDir())
-	seedVerdictStore(t, live, "a verdict that exists ONLY in the snapshot")
-
-	cacheRoot := t.TempDir()
-	evidenceHome, diagnostic := stageReviewEvidenceSnapshot(context.Background(), live, cacheRoot)
-	if evidenceHome == "" {
-		t.Fatalf("no snapshot staged (%s)", diagnostic)
-	}
-
-	// Point the DEFAULT home somewhere empty, so reading the seeded verdict
-	// can only come from the snapshot.
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv(EvidenceHomeEnv, evidenceHome)
-
-	var stdout, stderr strings.Builder
-	if code := Run([]string{"job", "list"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("job list exited %d: %s%s", code, stdout.String(), stderr.String())
-	}
-	if !strings.Contains(stdout.String(), "prior-verdict") {
-		t.Fatalf("job list did not read the snapshot; output=%q", stdout.String())
-	}
-
-	// And an explicit --home still wins, so the variable can never override a
-	// caller who named a home.
-	stdout.Reset()
-	stderr.Reset()
-	empty := t.TempDir()
-	if code := Run([]string{"job", "list", "--home", empty}, &stdout, &stderr); code != 0 {
-		t.Fatalf("job list --home exited %d: %s%s", code, stdout.String(), stderr.String())
-	}
-	if strings.Contains(stdout.String(), "prior-verdict") {
-		t.Fatalf("an explicit --home was overridden by %s; output=%q", EvidenceHomeEnv, stdout.String())
-	}
-}
-
-func TestWriteCommandsNeverConsultTheEvidenceSnapshot(t *testing.T) {
-	// The guard that catches the mistake I actually made: wiring a WRITE
-	// command to the inspection store. A mutant pointing `job answer` at the
-	// snapshot SURVIVED every other test here, because nothing exercised a
-	// write command with the variable set. The discriminator needs no
-	// interactivity: the job exists ONLY in the snapshot, so a command that
-	// finds it has consulted the snapshot, and one that reports it missing has
-	// correctly read the live store.
-	live := config.PathsForHome(t.TempDir())
-	seedVerdictStore(t, live, "verdict")
-
-	cacheRoot := t.TempDir()
-	evidenceHome, diagnostic := stageReviewEvidenceSnapshot(context.Background(), live, cacheRoot)
-	if evidenceHome == "" {
-		t.Fatalf("no snapshot staged (%s)", diagnostic)
-	}
-	snapshotOnly := config.PathsForHome(evidenceHome)
-	store, err := db.Open(snapshotOnly.Database)
-	if err != nil {
-		t.Fatalf("open snapshot writable: %v", err)
-	}
-	if err := store.CreateJobWithEvent(context.Background(), db.Job{
-		ID: "snapshot-only-job", Agent: "gm-review-opus", Type: "ask",
-		State: string(workflow.JobQueued), Payload: `{"repo":"gitmoot/gitmoot"}`,
-	}, db.JobEvent{Kind: string(workflow.JobQueued), Message: "queued"}); err != nil {
-		t.Fatalf("seed snapshot-only job: %v", err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv(EvidenceHomeEnv, evidenceHome)
-
-	// `job cancel` is the right probe: its outcome DIVERGES on which store it
-	// read. `job answer` was tried first and could not discriminate - it exits
-	// nonzero either way, because a job with no pending escalation fails for a
-	// second reason, so the mutant survived a green test.
-	var stdout, stderr strings.Builder
-	code := Run([]string{"job", "cancel", "snapshot-only-job"}, &stdout, &stderr)
-	combined := stdout.String() + stderr.String()
-	if code == 0 {
-		t.Fatalf("a WRITE command MUTATED a job that exists only in the snapshot; output=%q", combined)
-	}
-
-	stdout.Reset()
-	stderr.Reset()
-	if code := Run([]string{"job", "show", "snapshot-only-job"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("job show could not read the snapshot-only job, so this test's control is broken: %s%s", stdout.String(), stderr.String())
+	if !strings.Contains(string(body), "mine-1") {
+		t.Errorf("the production artifact holds no verdicts: %s", body)
 	}
 }

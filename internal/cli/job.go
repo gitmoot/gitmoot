@@ -232,7 +232,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 	var locks []db.ResourceLock
 	var reviewStatuses map[string]reviewStatusDisplay
 	var paths config.Paths
-	if err := withInspectionStoreAndPaths(*home, func(resolvedPaths config.Paths, store *db.Store) error {
+	if err := withStoreAndPaths(*home, func(resolvedPaths config.Paths, store *db.Store) error {
 		paths = resolvedPaths
 		var err error
 		if strings.TrimSpace(*workflowID) != "" {
@@ -387,7 +387,7 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 	var reason stuckReason
 	var deliveryStatus string
 	var reviewStatus reviewStatusDisplay
-	if err := withInspectionStore(*home, func(store *db.Store) error {
+	if err := withStore(*home, func(store *db.Store) error {
 		var err error
 		job, err = store.GetJob(context.Background(), jobID)
 		if err != nil {
@@ -502,7 +502,7 @@ func runJobEvents(args []string, stdout, stderr io.Writer) int {
 		return parseSingleJobIDExitCode(args)
 	}
 	var events []db.JobEvent
-	if err := withInspectionStore(*home, func(store *db.Store) error {
+	if err := withStore(*home, func(store *db.Store) error {
 		var err error
 		if _, err = store.GetJob(context.Background(), jobID); err != nil {
 			return err

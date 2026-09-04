@@ -344,28 +344,6 @@ func repoCheckoutDoctorChecks(paths config.Paths) []doctor.Check {
 	return checks
 }
 
-// EvidenceHomeEnv names the home holding a read-only review seat's CONSISTENT
-// SNAPSHOT of the workflow store. The daemon stages it inside the seat's own
-// writable cache root and exports this variable (#1839).
-//
-// It is honoured by INSPECTION commands only - job list/show/events - and
-// never by anything that writes. A blanket fallback for --home was considered
-// and rejected: `job record` and `workflow note` would then silently land in a
-// throwaway copy, which is a worse failure than not reading evidence at all.
-const EvidenceHomeEnv = "GITMOOT_EVIDENCE_HOME"
-
-// inspectionPathsFromFlag resolves the home for a READ-ONLY inspection
-// command. An explicit --home always wins; the evidence snapshot is used only
-// when the caller named no home and the daemon staged one.
-func inspectionPathsFromFlag(home string) (config.Paths, error) {
-	if strings.TrimSpace(home) == "" {
-		if evidence := strings.TrimSpace(os.Getenv(EvidenceHomeEnv)); evidence != "" {
-			return config.PathsForHome(evidence), nil
-		}
-	}
-	return pathsFromFlag(home)
-}
-
 func pathsFromFlag(home string) (config.Paths, error) {
 	if home != "" {
 		return config.PathsForHome(home), nil

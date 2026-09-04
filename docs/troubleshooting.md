@@ -697,53 +697,61 @@ Fixes:
   then abstains from its native merge gate — fail-closed, it never merges
   gatelessly; the external gate makes the call.
 
-## Read-Only Review Seat Cannot Run The Toolchain Or Read Prior Verdicts
+## Read-Only Review Seat Cannot Run Go Or Read Prior Verdicts
 
-A read-only review seat is Landlock-confined. Two things it needs were not
-granted, so reviews came back static-only with no defect in the code:
+A read-only review seat is Landlock-confined. Two symptoms have the same root
+cause - it is reaching for something outside its grants - and neither needs a
+wider grant to fix.
 
-- `go: cannot find GOROOT` or `permission denied` / `EACCES` when the seat runs
-  a build or test, while the same command works in your shell. The sandbox
-  granted only Go installs under `/opt`, `/usr/local`, `/nix/store` or
-  `/snap`, so a toolchain pinned anywhere else - `/root/.local/toolchains/go1.26.4`
-  is the usual shape - was never readable. The grant is now decided by SHAPE
-  (a `bin/go` with a `src/runtime` beside it) rather than by location, and it
-  covers the toolchain root only, never its parent.
-- A reviewer reporting it could not read prior review verdicts for the head it
-  is reviewing. The seat is now given a CONSISTENT SNAPSHOT of the workflow
-  store inside its own cache root, named by `GITMOOT_EVIDENCE_HOME`. Inspection
-  commands (`job list`, `job show`, `job events`) read it when no `--home` is
-  given; an explicit `--home` always wins, and commands that WRITE always use
-  the live store.
+### `Permission denied`, exit 126, running Go
 
-  A snapshot rather than a grant of the live database, because granting the live
-  files does not work: SQLite opens the `-wal` and `-shm` sidecars
-  `O_RDWR|O_CREAT`, which a read-only grant refuses, so the open fails before
-  any verdict is read - and `journal_mode=wal` persists in the header, so a
-  quiescent database behaves the same. The snapshot also means nothing beside
-  the live database is exposed, because the live database is not granted at all.
+NEVER INVOKE AN UNGRANTED TOOLCHAIN PATH FROM A SEAT. A pinned install such as
+`/root/.local/toolchains/go1.26.4/bin/go` is not readable there and returns exit
+126 whatever `GOTOOLCHAIN` says. Measured: three verdicts on one box in one
+hour, and the discriminator was not the flag - the two that failed both invoked
+the pinned path and the one that executed the full gate never referenced it.
 
-- `go toolchain: none grantable on PATH, but <path>/go.mod requires go <n>` when
-  the toolchain plainly exists. Check whether the daemon runs with `GOROOT` set
-  in its environment. The pinned-toolchain anchor is derived from the toolchain
-  the daemon was BUILT against, and `runtime.GOROOT()` returns the environment's
-  value when one is set - so an environment-supplied `GOROOT` is refused as an
-  anchor rather than trusted, and the grant falls back to the package install
-  roots. Measured: the same compiled binary reports `/tmp/evil-goroot` as its
-  GOROOT when launched with `GOROOT=/tmp/evil-goroot`, which is why this fails
-  closed. Do not set `GOROOT` for the daemon; put the toolchain on its PATH.
+Use the distro bootstrap and let it fetch the release into the seat's OWN
+writable cache:
 
-- `go toolchain: granted <root> (<release>) cannot satisfy the checkout's go
-  <directive> directive` - the seat can execute a toolchain but cannot build
-  this repository. Common cause: the daemon's PATH resolves the system Go
-  (`/usr/bin/go` -> `/usr/lib/go-1.22`) while `go.mod` requires a newer release,
-  and `GOTOOLCHAIN=auto` cannot rescue it without a toolchain download. Put the
-  pinned toolchain on the daemon's PATH. Without this diagnostic the seat simply
-  degraded into a static-only review with no stated reason.
+```sh
+export GOTOOLCHAIN=go1.26.4          # an explicit RELEASE name
+export CGO_ENABLED=0                 # cgo dies on /usr/include EACCES; -race is unavailable
+export TMPDIR=<seat cache>/tmp GOCACHE=<seat cache>/gocache GOMODCACHE=<seat cache>/gomodcache
+/usr/lib/go-1.22/bin/go version      # -> go version go1.26.4 linux/amd64
+```
 
-If a review still comes back unable to execute, that is now a real refusal
-worth reading rather than a missing grant: the verdict must say
-`evidence: static_only`, and a merge decision can see that it did not run.
+- `TMPDIR` must be a concrete path under the seat's own cache root. Both `/tmp`
+  and the workspace return EACCES on `mkdir` there, and "a writable dir" reads
+  as satisfied by `/tmp` when it is not.
+- Never pair `GOTOOLCHAIN=local` with the distro bootstrap: `local` forbids the
+  fetch, so you silently get 1.22.2, which cannot satisfy a `go 1.26` directive
+  and looks like a broken environment rather than a wrong flag. On a binary that
+  is ALREADY the required release, `local` is correct and more hermetic - the
+  hazard is the pairing, not the flag.
+- Never use a bare `go1.26`: that is the `go.mod` directive, not a released
+  toolchain name, and it fails with "toolchain not available".
+- Quote `go version` output in any note making a baseline claim. It is the check
+  that works without knowing which binary you got.
+
+### A review reporting it could not read prior verdicts
+
+The seat is given a RENDERED, REPO-SCOPED list of prior verdicts inside its own
+cache root, and `GITMOOT_PRIOR_VERDICTS` names the file. It states its own
+`as_of` time and scope, so a frozen list cannot be mistaken for a live query.
+
+Rendered rather than a copy of the database, for two measured reasons. Granting
+the live store as read-only files does not work at all: SQLite opens the `-wal`
+and `-shm` sidecars `O_RDWR|O_CREAT`, which a read-only grant refuses, so the
+open fails before any verdict is read - and `journal_mode=wal` persists in the
+header, so a quiescent database behaves the same. And a whole-database snapshot
+is far too wide: it would hand every repo's jobs, prompts and results, plus
+lock and fencing tokens, to a runtime that forwards what it reads to a
+third-party model API. The rendered list carries only verdict fields, so
+everything else is structurally absent rather than merely unmentioned.
+
+If a seat has no single repo scope, no list is staged and the reason is recorded
+in the job's `dropped` diagnostics rather than passing silently.
 
 ## Read-Only Reviewer Seat Refuses To Start
 

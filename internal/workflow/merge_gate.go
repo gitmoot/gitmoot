@@ -586,6 +586,48 @@ func (g PolicyMergeGate) finishMerged(ctx context.Context, request MergeRequest,
 	return MergeDecision{Ready: true, Merged: true, MergeCommitSHA: mergeSHA, Reason: PlainReason(reason)}, nil
 }
 
+// mergeApprovalEvidenceEvent records, on the approving review job, the
+// execution provenance of the verdict that authorised a merge.
+const mergeApprovalEvidenceEvent = "merge_gate_approval_evidence"
+
+// recordApprovalEvidence makes the executed/static-only distinction VISIBLE
+// where merges are decided (#1839).
+//
+// Without this the distinction was durable JSON inside jobs.result and nothing
+// more: a review caught that EvidenceWasExecuted had exactly one production
+// caller - the result check that deliberately ignores it for static_only - so
+// the gate behaved identically for a verdict that ran the suite and one that
+// could not run anything. The claim that the gate consumed the field named a
+// consumer that did not exist. This is that consumer.
+//
+// It records rather than REFUSES on purpose. A static-only verdict is a
+// legitimate verdict, and refusing merges on it would be a policy change with
+// a fleet-wide blast radius that belongs to whoever owns merge policy, not to
+// the change that added the field. What must not happen is a merge whose record
+// cannot say which kind of review authorised it.
+//
+// Best effort: losing the annotation must never fail a merge that the gate has
+// otherwise approved.
+func (g PolicyMergeGate) recordApprovalEvidence(ctx context.Context, job db.Job, payload JobPayload) {
+	if g.Store == nil || payload.Result == nil {
+		return
+	}
+	evidence := strings.TrimSpace(payload.Result.Evidence)
+	if evidence == "" {
+		evidence = EvidenceStaticOnly
+	}
+	detail := "executed"
+	if !EvidenceWasExecuted(*payload.Result) {
+		detail = "NOT executed - this approval's claims were not produced by running anything"
+	}
+	_ = g.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID: job.ID,
+		Kind:  mergeApprovalEvidenceEvent,
+		Message: fmt.Sprintf("approval by %s at %s: evidence=%s (%s)",
+			strings.TrimSpace(job.Agent), strings.TrimSpace(payload.HeadSHA), evidence, detail),
+	})
+}
+
 func (g PolicyMergeGate) cleanupTaskWorktree(ctx context.Context, request MergeRequest, headBranch string) error {
 	if g.Worktrees == nil || strings.TrimSpace(request.TaskID) == "" {
 		return nil
@@ -852,6 +894,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 					return err
 				}
 				satisfied = true
+				g.recordApprovalEvidence(ctx, review.job, review.payload)
 				switch {
 				case reviewer == "":
 					if unattributedReviewerReason == "" {
@@ -979,6 +1022,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 				return err
 			}
 			approved = true
+			g.recordApprovalEvidence(ctx, job, payload)
 		case "changes_requested", "blocked", "failed":
 			// A captured blocking review is an authoritative template-quality rejection
 			// (mergeBlocked), distinct from the transient/process review errors below

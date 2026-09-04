@@ -1446,14 +1446,10 @@ type readOnlySandboxGrants struct {
 	env       []string
 	cacheRoot string
 	stateDir  string
-	// evidenceHome is the home-shaped directory holding the seat's CONSISTENT
-	// SNAPSHOT of the workflow store, or "" when none could be staged. It is
-	// inside cacheRoot, so it needs no grant of its own.
-	evidenceHome string
-	// toolchainDiagnostic names a granted toolchain that cannot build the
-	// checkout, so an unusable environment is diagnosable rather than a
-	// silently static-only review.
-	toolchainDiagnostic string
+	// evidenceFile is the rendered, repo-scoped list of prior verdicts, or ""
+	// when none could be staged. It is inside cacheRoot, so it needs no grant
+	// of its own.
+	evidenceFile string
 }
 
 type readOnlyRuntimeAdapter struct {
@@ -1684,27 +1680,29 @@ func selectedRuntimeConfigDir(runtimeName string) string {
 	}
 }
 
-// stageReviewEvidenceSnapshot gives a read-only seat a CONSISTENT COPY of the
-// workflow store inside its own cache root, and returns the home-shaped
-// directory to point a `gitmoot --home` invocation at.
+// stagePriorVerdicts writes the read-only seat a RENDERED, REPO-SCOPED list of
+// the prior review verdicts it needs, inside its own cache root.
 //
-// #1839, round 2: granting the live database as read-only FILES did not work.
-// Measured by strace of the exact mode=ro DSN: SQLite opens the database
-// O_RDONLY but opens the -wal and -shm sidecars O_RDWR|O_CREAT, which a
-// read-file grant refuses, so the open fails before any verdict is read - and
-// journal_mode=wal persists in the header, so a quiescent database behaves the
-// same. The first fix was inert for the case it existed to serve.
+// #1839 rounds 2-3. The first attempt granted the live database as read-only
+// files, which was INERT: SQLite opens the -wal and -shm sidecars
+// O_RDWR|O_CREAT and a read-file grant refuses both, so the open failed before
+// a verdict was read. The second attempt staged a VACUUM INTO snapshot of the
+// WHOLE store, which worked and was far too wide - every repo's jobs, prompts
+// and results, plus resource_locks.owner_token and task_state_claims.token,
+// handed to an untrusted runtime that forwards what it reads to a third-party
+// model API. For a daemon managing several repos that is cross-repo disclosure.
 //
-// A snapshot is strictly better than the alternatives. It needs no write grant
-// on the live store (mode=ro&immutable=1 would, in effect, and returns torn
-// pages against a live writer), it lands with no sidecars in a directory the
-// seat already owns, and it removes the credential adjacency entirely: nothing
-// beside the live database is granted, because the live database is no longer
-// granted at all.
+// A RENDERED artifact fixes both at once and deletes four other defects rather
+// than patching them: there is no database to open, so no sidecar problem and
+// no staleness ambiguity (the file states its own as-of time); it carries only
+// the verdict fields a reviewer needs, so tokens, memories and org state are
+// structurally absent rather than merely unmentioned; and nothing has to teach
+// the CLI to read an alternate home, so no write path can be redirected into a
+// throwaway copy.
 //
-// A failure here is NEVER fatal. The seat loses evidence and says so through
-// the returned diagnostic; it does not lose its job.
-func stageReviewEvidenceSnapshot(ctx context.Context, paths config.Paths, cacheRoot string) (string, string) {
+// A failure here is NEVER fatal: the seat loses evidence and says so through
+// the returned diagnostic.
+func stagePriorVerdicts(ctx context.Context, paths config.Paths, cacheRoot string, repoScope string) (string, string) {
 	if strings.TrimSpace(paths.Database) == "" || strings.TrimSpace(cacheRoot) == "" {
 		return "", ""
 	}
@@ -1712,52 +1710,102 @@ func stageReviewEvidenceSnapshot(ctx context.Context, paths config.Paths, cacheR
 		// No store yet is the normal case on a fresh home, not a defect.
 		return "", ""
 	}
-	evidenceHome := filepath.Join(cacheRoot, "evidence-home")
-	// The snapshot must land where the HOME CONTRACT looks for it, not merely
-	// inside the directory: config.PathsForHome puts the database under a
-	// nested state dir, so writing it at the top level leaves `gitmoot --home
-	// <evidenceHome>` opening a fresh EMPTY database and reporting no prior
-	// verdicts - dead wiring that reads exactly like "there is no evidence".
-	// Caught by the sufficiency test, not by inspection.
-	dest := config.PathsForHome(evidenceHome).Database
-	if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
-		return "", fmt.Sprintf("workflow evidence: create %s: %v", filepath.Dir(dest), err)
+	repo := strings.TrimSpace(repoScope)
+	if repo == "" || strings.Contains(repo, "*") {
+		// Without a single concrete repo there is nothing to scope TO, and an
+		// unscoped copy is the defect this function exists to remove.
+		return "", "workflow evidence: seat has no single repo scope, so no verdict list was staged"
 	}
 	store, err := db.OpenReadOnly(paths.Database)
 	if err != nil {
 		return "", fmt.Sprintf("workflow evidence: open store read-only: %v", err)
 	}
 	defer func() { _ = store.Close() }()
-	if err := store.SnapshotInto(ctx, dest); err != nil {
-		return "", fmt.Sprintf("workflow evidence: %v", err)
+	jobs, err := store.ListJobsByRepo(ctx, repo)
+	if err != nil {
+		return "", fmt.Sprintf("workflow evidence: list prior verdicts: %v", err)
 	}
-	return evidenceHome, ""
+	rendered := renderPriorVerdicts(repo, jobs)
+	body, err := json.MarshalIndent(rendered, "", "  ")
+	if err != nil {
+		return "", fmt.Sprintf("workflow evidence: render prior verdicts: %v", err)
+	}
+	dir := filepath.Join(cacheRoot, "evidence")
+	// The daemon owns this root and has just re-created it, so a leftover from
+	// a job whose cleanup never ran must not make THIS seat evidence-less -
+	// that was a real defect: the destination-exists refusal turned a crashed
+	// predecessor into a silently unreviewed head.
+	if err := os.RemoveAll(dir); err != nil {
+		return "", fmt.Sprintf("workflow evidence: clear %s: %v", dir, err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Sprintf("workflow evidence: create %s: %v", dir, err)
+	}
+	file := filepath.Join(dir, "prior-verdicts.json")
+	if err := os.WriteFile(file, append(body, '\n'), 0o600); err != nil {
+		return "", fmt.Sprintf("workflow evidence: write %s: %v", file, err)
+	}
+	return file, ""
 }
 
-// reviewToolchainDiagnostic names the case where a seat is granted a perfectly
-// valid Go toolchain that CANNOT BUILD the checkout.
-//
-// #1839 P2-4: measured on this box, a seat whose PATH is the system PATH
-// resolves go1.22.2 while go.mod requires 1.26, and GOTOOLCHAIN=auto cannot
-// rescue it ("download go1.26 for linux/amd64: toolchain not available"). The
-// grant succeeds, so a seat that can never run the gate is indistinguishable
-// from a correctly provisioned one and simply degrades into a static-only
-// review. Naming it is the difference between a diagnosable environment and a
-// silent one; it is deliberately NOT an error, because a review that cannot
-// build is still a legitimate review.
-func reviewToolchainDiagnostic(checkout string) string {
-	directive := sandbox.GoDirectiveForModule(checkout)
-	if directive == "" {
-		return ""
+// priorVerdictList is the rendered artifact's shape. It states its own scope
+// and as-of time, because a reader who cannot tell a frozen list from a live
+// query is the failure mode this whole change is about.
+type priorVerdictList struct {
+	Repo     string         `json:"repo"`
+	AsOf     string         `json:"as_of"`
+	Note     string         `json:"note"`
+	Verdicts []priorVerdict `json:"verdicts"`
+}
+
+// priorVerdict carries only what a reviewer needs to enumerate what came
+// before: who decided what, at which head, on what evidence.
+type priorVerdict struct {
+	JobID       string `json:"job_id"`
+	Agent       string `json:"agent"`
+	PullRequest int    `json:"pull_request,omitempty"`
+	HeadSHA     string `json:"head_sha,omitempty"`
+	Decision    string `json:"decision,omitempty"`
+	Severity    string `json:"severity,omitempty"`
+	Evidence    string `json:"evidence,omitempty"`
+	Findings    int    `json:"findings"`
+	Summary     string `json:"summary,omitempty"`
+}
+
+// renderPriorVerdicts projects review jobs onto the artifact. Anything not
+// named here is structurally absent from what the seat can read.
+func renderPriorVerdicts(repo string, jobs []db.Job) priorVerdictList {
+	list := priorVerdictList{
+		Repo: repo,
+		AsOf: time.Now().UTC().Format(time.RFC3339),
+		Note: "Frozen at as_of, scoped to this repo, rendered from the workflow store. " +
+			"Not a live query: a verdict recorded after as_of is absent rather than missing.",
+		Verdicts: []priorVerdict{},
 	}
-	root, release := sandbox.ResolveGoToolchainFromPATH()
-	if root == "" {
-		return fmt.Sprintf("go toolchain: none grantable on PATH, but %s requires go %s: this seat cannot build or test the checkout", filepath.Join(checkout, "go.mod"), directive)
+	for _, job := range jobs {
+		if strings.TrimSpace(job.Type) != "review" {
+			continue
+		}
+		var payload workflow.JobPayload
+		if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
+			continue
+		}
+		if payload.Result == nil {
+			continue
+		}
+		list.Verdicts = append(list.Verdicts, priorVerdict{
+			JobID:       job.ID,
+			Agent:       job.Agent,
+			PullRequest: payload.PullRequest,
+			HeadSHA:     payload.HeadSHA,
+			Decision:    payload.Result.Decision,
+			Severity:    payload.Result.Severity,
+			Evidence:    payload.Result.Evidence,
+			Findings:    len(payload.Result.Findings),
+			Summary:     payload.Result.Summary,
+		})
 	}
-	if ok, _, _ := sandbox.GoToolchainSatisfies(release, directive); ok {
-		return ""
-	}
-	return fmt.Sprintf("go toolchain: granted %s (%s) cannot satisfy the checkout's go %s directive: this seat can execute a toolchain but not build the repository", root, release, directive)
+	return list
 }
 
 func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout string, gatewayMode bool) (readOnlySandboxGrants, error) {
@@ -1783,9 +1831,6 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 		return grants, err
 	}
 	grants.reads = append(grants.reads, metadata...)
-	if diagnostic := reviewToolchainDiagnostic(checkout); diagnostic != "" {
-		grants.toolchainDiagnostic = diagnostic
-	}
 
 	stateDir, stateEnv, dropped, err := prepareReadOnlyRuntimeState(agent, grants.cacheRoot, gatewayMode)
 	if err != nil {
@@ -1794,13 +1839,17 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	grants.stateDir = stateDir
 	grants.env = append(grants.env, stateEnv...)
 	grants.dropped = dropped
-	if grants.toolchainDiagnostic != "" {
-		grants.dropped = append(grants.dropped, grants.toolchainDiagnostic)
-	}
-	evidenceHome, evidenceDiagnostic := stageReviewEvidenceSnapshot(context.Background(), paths, grants.cacheRoot)
-	if evidenceHome != "" {
-		grants.evidenceHome = evidenceHome
-		grants.env = append(grants.env, "GITMOOT_EVIDENCE_HOME="+evidenceHome)
+	// BOUNDED, because a read on the worker path must not be able to hang seat
+	// setup: the previous form copied the entire database under a hardcoded
+	// context.Background() with no deadline and no cancellation. Rendering a
+	// repo-scoped list is a bounded read of its own, and this makes the bound
+	// explicit rather than incidental.
+	evidenceCtx, cancelEvidence := context.WithTimeout(context.Background(), 30*time.Second)
+	evidenceFile, evidenceDiagnostic := stagePriorVerdicts(evidenceCtx, paths, grants.cacheRoot, agent.RepoScope)
+	cancelEvidence()
+	if evidenceFile != "" {
+		grants.evidenceFile = evidenceFile
+		grants.env = append(grants.env, "GITMOOT_PRIOR_VERDICTS="+evidenceFile)
 	}
 	if evidenceDiagnostic != "" {
 		grants.dropped = append(grants.dropped, evidenceDiagnostic)

@@ -249,7 +249,7 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 				Question: "If the review claims it EXECUTED its checks, does it name something it actually ran?",
 				Pass:     substantiated,
 				Explanation: explain(substantiated, fmt.Sprintf(
-					"the review declared evidence %q but names no command, test or artifact it produced, so the execution claim cannot be checked by a reader; declare %q instead if it could not run",
+					"the review declared evidence %q but no tests_run or changes_made entry names a command, path or target a reader could check, so the execution claim cannot be verified; list what you ran in tests_run, or declare %q if it could not run",
 					strings.TrimSpace(r.Evidence), EvidenceStaticOnly)),
 			})
 
@@ -369,18 +369,50 @@ const minReviewRationaleChars = 40
 // is not mistaken for evidence while `internal/workflow/result_checks.go` is.
 const minEvidenceTokenChars = 8
 
-// reviewNamesSomethingItRan reports whether a verdict names any command, test
-// or artifact a reader could go and check. It is the substance requirement
-// behind an EXECUTED claim - deliberately the same predicate the accounting
-// check uses, so the two cannot drift into disagreeing about what counts.
+// reviewNamesSomethingItRan reports whether a verdict names a COMMAND, TEST OR
+// ARTIFACT a reader could go and check, as the substance behind an EXECUTED
+// claim.
+//
+// It deliberately requires MORE than the accounting check, and an earlier
+// comment here wrongly claimed the two shared a predicate. They do not, and
+// they should not: reviewVerdictAccountsForItself accepts four routes -
+// findings, tests_run, changes_made, or a long-enough summary - because a
+// verdict can account for itself in prose. An EXECUTED claim cannot: it must
+// name something runnable.
+//
+// The two-word arm of isSubstantiveEvidenceEntry is not enough on its own here.
+// `tests_run: ["none run"]` and ["could not run"] are two words each, so they
+// satisfied it - entries stating the OPPOSITE of execution were accepted as
+// proof of execution. An executed claim therefore needs a command- or
+// path-shaped token - see minRunnableTargetChars - which "none run" is not and
+// "go test ./... -> ok" is.
 func reviewNamesSomethingItRan(r AgentResult) bool {
-	for _, entry := range r.TestsRun {
-		if isSubstantiveEvidenceEntry(entry) {
-			return true
+	for _, entries := range [][]string{r.TestsRun, r.ChangesMade} {
+		for _, entry := range entries {
+			if namesARunnableTarget(entry) {
+				return true
+			}
 		}
 	}
-	for _, entry := range r.ChangesMade {
-		if isSubstantiveEvidenceEntry(entry) {
+	return false
+}
+
+// minRunnableTargetChars is the floor for a token that sits BESIDE other words
+// in an evidence entry, and it is deliberately lower than
+// minEvidenceTokenChars.
+//
+// That constant governs a single token standing ALONE as a whole entry, where
+// more length is the only thing separating a path from "ok". Here the token has
+// context around it, and real targets are short: "./..." is five characters and
+// is exactly what a Go reviewer runs. Measured against the existing fixture -
+// "go test ./... -> ok" - which an 8-character floor rejected.
+const minRunnableTargetChars = 4
+
+// namesARunnableTarget reports whether one entry names something with the shape
+// of a command, path or target rather than a bare phrase.
+func namesARunnableTarget(entry string) bool {
+	for _, field := range strings.Fields(entry) {
+		if len(field) >= minRunnableTargetChars && strings.ContainsAny(field, "/.") {
 			return true
 		}
 	}

@@ -18,6 +18,19 @@ import (
 // this test fail until its authority implications are reviewed explicitly.
 func TestMergeGateStoreAccessSurface(t *testing.T) {
 	want := []string{
+		// AddJobEvent is a WRITE of an annotation about the verdict the gate has
+		// just accepted, added for #1839 so a merge record can say whether the
+		// approving review EXECUTED its checks or was static-only. Its authority
+		// implications, stated explicitly as this guard demands:
+		//
+		//   - it moves data OUT of the authority plane, never in. The firewall
+		//     exists to keep display-plane evidence from deciding merges, and
+		//     the forbidden list below still refuses every display READ,
+		//     ListJobEvents included.
+		//   - it cannot change a merge decision: the value is derived from the
+		//     verdict the gate already accepted, and its own failure is
+		//     discarded, so no annotation error can block or permit a merge.
+		"AddJobEvent",
 		"AcquireResourceLock",
 		"ClaimTaskState",
 		"ClearTaskWorktreePath",
