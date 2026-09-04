@@ -264,7 +264,7 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 	if err != nil || len(observations) == 0 {
 		return ""
 	}
-	pending := LedgerObligationsAtHead(ctx, observations, head, e.LedgerScopeFor(repo, pullRequest, taskID))
+	pending := LedgerObligationsAtHead(ctx, observations, head, e.ledgerScopeFor(repo, pullRequest, taskID))
 	if len(pending) == 0 {
 		return ""
 	}
@@ -286,15 +286,9 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 	return b.String()
 }
 
-// LedgerScopeFor builds the ledger scope from the engine's own seams. It is the
-// SINGLE construction both the review brief and the merge gate use, so the two
-// cannot compute different obligation sets (#1850 round 2 F1).
-func (e Engine) LedgerScopeFor(repo string, pullRequest int, taskID string) LedgerScope {
-	scope := LedgerScope{TaskID: taskID, PathExistsAtHead: e.LedgerPathExists}
-	if e.ReviewChangedFiles != nil {
-		scope.ChangedSince = func(ctx context.Context, previousHead string, currentHead string) ([]string, error) {
-			return e.ReviewChangedFiles(ctx, repo, pullRequest, previousHead, currentHead)
-		}
-	}
-	return scope
+// ledgerScopeFor binds the engine's SHARED resolvers to this repo and PR. The
+// gate binds the same value the same way, which is what makes the brief and the
+// gate incapable of disagreeing (#1850 round 3 item 1).
+func (e Engine) ledgerScopeFor(repo string, pullRequest int, taskID string) LedgerScope {
+	return e.LedgerResolvers.ScopeFor(repo, pullRequest, taskID)
 }

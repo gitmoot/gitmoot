@@ -364,3 +364,54 @@ func TestLedgerAcceptsTheDocumentedFileLineConvention(t *testing.T) {
 		t.Fatalf("relevance keys %v do not match the finding's own file, so the colon was seeded verbatim", keys)
 	}
 }
+
+// #1850 round 3 item 3. The nil-PathExistsAtHead arm used to skip the existence
+// check SILENTLY, while the nil-ChangedSince arm degraded and the engine field's
+// own comment claimed nil "records a degradation". An inert half with no
+// diagnostic is invisible in production, which is exactly how the
+// locator-existence wedge survived two review rounds: nothing anywhere said the
+// check was not running.
+//
+// Both nil arms must now record a degradation naming what went unverified.
+func TestLedgerScopeDegradesWhenLocatorResolverIsAbsent(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	h1, h2 := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	uid := seedOpenFinding(t, store, h1)
+	if _, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
+		Repo: "owner/repo", PullRequest: 7, HeadSHA: h1, ObserverJob: "review-2",
+		ContinuesUID: uid, State: db.FindingAnswered, Title: "the defect", File: "internal/run.go",
+		EvidenceKind: db.EvidenceStatic, EvidenceLocator: "internal/run.go:42",
+		Rationale: "the guard lives here",
+	}); err != nil {
+		t.Fatalf("answer with STATIC evidence: %v", err)
+	}
+
+	var notes []string
+	scope := LedgerScope{Degraded: func(note string) { notes = append(notes, note) }}
+	if err := EnsureLedgerObligationsObserved(ctx, store, "owner/repo", 7, h2, scope); err != nil {
+		t.Fatalf("a missing resolver must DEGRADE, never block: %v", err)
+	}
+
+	var sawLocator, sawChanged bool
+	for _, note := range notes {
+		if strings.Contains(note, "no locator resolver") && strings.Contains(note, "internal/run.go:42") {
+			sawLocator = true
+		}
+		if strings.Contains(note, "no changed-file resolver") {
+			sawChanged = true
+		}
+	}
+	if !sawLocator {
+		t.Fatalf("the nil locator resolver recorded no degradation naming the unverified locator; notes=%v", notes)
+	}
+	if !sawChanged {
+		t.Fatalf("the nil changed-file resolver recorded no degradation; notes=%v", notes)
+	}
+	// AND THE PASSING PROPERTY: degrading must not manufacture an obligation. A
+	// guard that blocked here would convert an instrument outage into a merge
+	// block, which is the inversion this whole design forbids.
+	if len(notes) == 0 {
+		t.Fatal("no degradation notes at all, so this test proved nothing")
+	}
+}

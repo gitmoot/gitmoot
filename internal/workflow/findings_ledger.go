@@ -41,25 +41,60 @@ type LedgerObligation struct {
 	Reason string
 }
 
-// LedgerScope supplies the two facts the acceptance check cannot derive from the
-// ledger alone: what a range CHANGED, and whether a cited locator EXISTS at the
-// head. Both are optional and both DEGRADE rather than reject, because the
-// ledger's declared failure mode is "it did not remind you" and never "it told
-// you the defect was fixed" - converting an instrument outage into a merge block
-// would invert that (#1850 review F4/F5).
-type LedgerScope struct {
+// LedgerResolvers is the SINGLE source of the two facts the acceptance check
+// cannot derive from the ledger alone: what a range CHANGED, and whether a cited
+// locator EXISTS at a head.
+//
+// IT IS ONE VALUE HELD BY BOTH CONSUMERS, IN CODE, BECAUSE A COMMENT SAYING SO
+// FAILED TWICE. The merge gate refuses a verdict naming an unobserved finding's
+// uid; the review brief is the ONLY way a reviewer can learn that uid. If the
+// two compute different obligation sets the merge wedges permanently. Round 2
+// wedged because the brief passed an empty scope. Round 3 wedged again through a
+// narrower door: an engine field documented as "the SAME resolver the merge gate
+// uses" that nothing ever assigned, while the gate's copy was wired. Three
+// separate comments asserted the equality while two independent structs were
+// built from different inputs.
+//
+// So the equality is now structural: the daemon builds ONE LedgerResolvers and
+// hands the same value to both, and neither consumer can be configured alone.
+type LedgerResolvers struct {
 	// ChangedSince enumerates paths changed between two heads. In production this
-	// is the engine's ReviewChangedFiles seam, which proves completeness from the
-	// daemon's own checkout and fails CLOSED on a capped API page.
+	// is the daemon's own checkout enumeration, which proves the range complete
+	// and fails CLOSED on a capped API page.
+	ChangedSince func(ctx context.Context, repo string, pullRequest int, previousHead string, currentHead string) ([]string, error)
+	// PathExistsAtHead reports whether a repo-relative path exists at a head, so a
+	// STATIC discharge citing a deleted file stops counting as an answer.
+	PathExistsAtHead func(ctx context.Context, head string, path string) (bool, error)
+}
+
+// ScopeFor binds a repo, PR and task to the resolvers. This is the ONLY way a
+// LedgerScope is constructed for production use, which is what makes the brief
+// and the gate incapable of disagreeing.
+func (r LedgerResolvers) ScopeFor(repo string, pullRequest int, taskID string) LedgerScope {
+	scope := LedgerScope{TaskID: taskID, PathExistsAtHead: r.PathExistsAtHead}
+	if r.ChangedSince != nil {
+		scope.ChangedSince = func(ctx context.Context, previousHead string, currentHead string) ([]string, error) {
+			return r.ChangedSince(ctx, repo, pullRequest, previousHead, currentHead)
+		}
+	}
+	return scope
+}
+
+// LedgerScope is the bound form the acceptance check consumes. Both resolvers
+// are optional and both DEGRADE rather than reject, because the ledger's
+// declared failure mode is "it did not remind you" and never "it told you the
+// defect was fixed" - converting an instrument outage into a merge block would
+// invert that.
+type LedgerScope struct {
+	// ChangedSince enumerates paths changed between two heads for THIS pr.
 	ChangedSince func(ctx context.Context, previousHead string, currentHead string) ([]string, error)
 	// PathExistsAtHead reports whether a repo-relative path exists at a head.
 	PathExistsAtHead func(ctx context.Context, head string, path string) (bool, error)
 	// TaskID lets the acceptance check record a degradation as a task event
-	// WITHOUT the merge gate itself gaining a store write. That matters: the
-	// gate's *db.Store surface is a deliberate firewall pinned by
-	// TestMergeGateStoreAccessSurface, and widening the merge authority's
-	// surface for an audit note would be the wrong trade. The gate passes DATA;
-	// the ledger, which already holds the store, does the writing.
+	// WITHOUT the merge gate itself gaining a store write. The gate's *db.Store
+	// surface is a deliberate firewall pinned by TestMergeGateStoreAccessSurface,
+	// so the gate passes DATA and the ledger, which already holds the store, does
+	// the writing.
 	TaskID string
 	// Degraded overrides the default task-event recording, for tests.
 	Degraded func(note string)
@@ -207,13 +242,23 @@ func (s LedgerScope) answeredIsMandatory(ctx context.Context, obs db.ReviewFindi
 	// a path that no longer exists at this head is not an answer any more.
 	if obs.EvidenceKind == db.EvidenceStatic {
 		locator := strings.TrimSpace(obs.EvidenceLocator)
-		if path, _, ok := splitLocator(locator); ok && s.PathExistsAtHead != nil {
-			exists, err := s.PathExistsAtHead(ctx, head, path)
+		if path, _, ok := splitLocator(locator); ok {
 			switch {
-			case err != nil:
-				s.degrade("findings ledger: locator existence for %q at %s could not be resolved: %v", locator, shortHead(head), err)
-			case !exists:
-				return "", true, fmt.Sprintf("answered at %s by STATIC evidence citing %q, which does not exist at this head", shortHead(obs.HeadSHA), locator)
+			case s.PathExistsAtHead == nil:
+				// #1850 round 3 item 3. This arm used to skip SILENTLY while the
+				// ChangedSince-nil arm degraded, and the engine field's own comment
+				// claimed nil "records a degradation". An inert half with no
+				// diagnostic is invisible in production, which is exactly how this
+				// class survived two review rounds.
+				s.degrade("findings ledger: no locator resolver, so the STATIC answer citing %q is unverified at %s", locator, shortHead(head))
+			default:
+				exists, err := s.PathExistsAtHead(ctx, head, path)
+				switch {
+				case err != nil:
+					s.degrade("findings ledger: locator existence for %q at %s could not be resolved: %v", locator, shortHead(head), err)
+				case !exists:
+					return "", true, fmt.Sprintf("answered at %s by STATIC evidence citing %q, which does not exist at this head", shortHead(obs.HeadSHA), locator)
+				}
 			}
 		}
 	}

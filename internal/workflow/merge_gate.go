@@ -104,18 +104,11 @@ type PolicyMergeGate struct {
 	// unchanged, then falls through to conclude no-CI so such PRs still merge instead
 	// of wedging forever. Zero means use the built-in default (defaultMaxCIWait).
 	MaxCIWait time.Duration
-	// ChangedFilesSince enumerates the paths changed between two heads, used by
-	// the #1822 findings ledger to decide whether an ANSWERED finding is mandatory
-	// again at this head. In production the daemon wires the engine's
-	// ReviewChangedFiles seam, which proves completeness from its own checkout and
-	// fails closed on a capped API page. Nil leaves answered findings advisory and
-	// records that degradation; it does NOT block a merge, because the ledger's
-	// failure mode is "it did not remind you" (#1850 review F4).
-	ChangedFilesSince func(ctx context.Context, repo string, number int, previousHead string, currentHead string) ([]string, error)
-	// PathExistsAtHead resolves whether a repo-relative path exists at a head, so
-	// a STATIC discharge citing a deleted file stops counting as an answer
-	// (#1850 review F5). Nil skips the existence half and records it.
-	PathExistsAtHead func(ctx context.Context, head string, path string) (bool, error)
+	// LedgerResolvers is the #1822 ledger's SHARED resolver value, the SAME value
+	// the engine holds. Nil resolvers DEGRADE with a recorded note rather than
+	// either pretending or blocking, because the ledger's failure mode is "it did
+	// not remind you".
+	LedgerResolvers LedgerResolvers
 	// Clock is injectable for deterministic tests. Nil means time.Now.
 	Clock                      func() time.Time
 	taskClaimTTL               time.Duration
@@ -255,29 +248,17 @@ type workflowAwareGitHub interface {
 	WorkflowsExistAtRef(ctx context.Context, repo github.Repository, ref string) (bool, error)
 }
 
-// ledgerScope builds the ledger scope for the gate. It is the SAME shape the
-// review brief uses via Engine.LedgerScopeFor, and that is load-bearing: when
-// the brief and the gate computed different scopes, the gate demanded two
-// classes of obligation the brief could not disclose and the merge wedged
-// permanently (#1850 round 2 F1). TestLedgerBriefSetEqualsGateSet pins the
-// equality; this comment is not the guarantee.
+// ledgerScope binds the gate's SHARED resolvers. It is the SAME value and the
+// SAME binding call the review brief uses (Engine.ledgerScopeFor), which is why
+// the two cannot demand different obligation sets. Round 2 and round 3 both
+// wedged on that divergence while comments asserted the equality, so it is one
+// construction now rather than two plus a promise (#1850 round 3 item 1).
 //
-// IT PASSES DATA, NEVER A STORE CALL. TestMergeGateStoreAccessSurface pins the
-// gate's *db.Store surface as a firewall between merge authority and
-// display-only evidence, and recording a degradation note is not worth widening
-// it, so the TaskID travels in the scope and the ledger does the writing.
+// TaskID travels as DATA and never as a store call: TestMergeGateStoreAccessSurface
+// pins the gate's *db.Store surface as a firewall, and an audit note is not
+// worth widening it.
 func (g PolicyMergeGate) ledgerScope(request MergeRequest) LedgerScope {
-	scope := LedgerScope{
-		PathExistsAtHead: g.PathExistsAtHead,
-		TaskID:           request.TaskID,
-	}
-	if g.ChangedFilesSince != nil {
-		repo, number := request.Repo, request.PullRequest
-		scope.ChangedSince = func(ctx context.Context, previousHead string, currentHead string) ([]string, error) {
-			return g.ChangedFilesSince(ctx, repo, number, previousHead, currentHead)
-		}
-	}
-	return scope
+	return g.LedgerResolvers.ScopeFor(request.Repo, request.PullRequest, request.TaskID)
 }
 
 func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (MergeDecision, error) {

@@ -113,6 +113,11 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 	// so a >300-file follow-up is only scopable by enumerating it with local git.
 	// With no checkout the seam still installs and fails closed instead.
 	wireReviewChangedFiles(&engine, gh, checkout, runner)
+	// #1850 rounds 2 and 3 both wedged because the review brief and the merge gate
+	// built the ledger's scope from DIFFERENT inputs while three comments claimed
+	// they were the same. ONE value is constructed here and handed to BOTH
+	// consumers, so no future wiring can supply one side and not the other.
+	engine.LedgerResolvers = daemonLedgerResolvers(gh, checkout, runner)
 	if strings.TrimSpace(home) != "" {
 		// Root delegation artifacts under GITMOOT_HOME (alongside worktrees)
 		// rather than inside the repo checkout, so generated briefs stay out of
@@ -971,13 +976,23 @@ func newDaemonPolicyMergeGateForRunner(store *db.Store, gh github.Client, checko
 		Worktrees:    jobGitClient(checkout, runner),
 		CheckoutPath: checkout,
 		DeleteBranch: true,
-		// #1822 findings-ledger scope, WIRED HERE BECAUSE A FIELD NOTHING SETS IS
-		// THE SAME DEFECT AS A COMMENT NAMING A CALL SITE THAT DOES NOT EXIST
-		// (#1850 review F4/A). Both resolvers are real production instruments:
-		// changed files come from the daemon's own checkout, and locator existence
-		// from `git cat-file -e <head>:<path>` in that same checkout.
-		ChangedFilesSince: daemonLedgerChangedFiles(gh, checkout, runner),
-		PathExistsAtHead:  daemonLedgerPathExists(checkout, runner),
+		// THE SAME construction the engine gets. A field nothing sets is the same
+		// defect as a comment naming a call site that does not exist, and this
+		// pairing is the one that wedged twice (#1850 R2-F1 and R3-F1).
+		LedgerResolvers: daemonLedgerResolvers(gh, checkout, runner),
+	}
+}
+
+// daemonLedgerResolvers builds the ONE #1822 ledger resolver value that both the
+// review brief (via Engine.LedgerResolvers) and the merge gate (via
+// PolicyMergeGate.LedgerResolvers) hold. Having a single constructor is the
+// structural fix for #1850 R3-F1: the previous version had two call sites and
+// only one of them was ever wired, so the gate demanded obligations the brief
+// could not disclose and the merge wedged permanently.
+func daemonLedgerResolvers(gh github.Client, checkout string, runner subprocess.Runner) workflow.LedgerResolvers {
+	return workflow.LedgerResolvers{
+		ChangedSince:     daemonLedgerChangedFiles(gh, checkout, runner),
+		PathExistsAtHead: daemonLedgerPathExists(checkout, runner),
 	}
 }
 

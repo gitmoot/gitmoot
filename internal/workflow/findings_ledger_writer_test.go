@@ -222,11 +222,19 @@ func TestLedgerBriefSetEqualsGateSet(t *testing.T) {
 		t.Fatalf("answer: %v", err)
 	}
 
-	engine := testEngine(store)
-	engine.ReviewChangedFiles = func(context.Context, string, int, string, string) ([]string, error) {
-		return []string{"internal/workflow/findings_ledger.go"}, nil
+	// BOTH RESOLVER HALVES ON BOTH SIDES (#1850 round 3 item 4). The previous
+	// version set neither PathExistsAtHead, so it passed while the two sides
+	// diverged on exactly the locator-existence class that wedged round 3. Both
+	// consumers now take the SAME LedgerResolvers value, so this constructs one.
+	resolvers := LedgerResolvers{
+		ChangedSince: func(context.Context, string, int, string, string) ([]string, error) {
+			return []string{"internal/workflow/findings_ledger.go"}, nil
+		},
+		PathExistsAtHead: func(context.Context, string, string) (bool, error) { return true, nil },
 	}
-	gate := PolicyMergeGate{Store: store, ChangedFilesSince: engine.ReviewChangedFiles}
+	engine := testEngine(store)
+	engine.LedgerResolvers = resolvers
+	gate := PolicyMergeGate{Store: store, LedgerResolvers: resolvers}
 
 	gateErr := EnsureLedgerObligationsObserved(ctx, store, "gitmoot/gitmoot", 1850, h3,
 		gate.ledgerScope(MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 1850, TaskID: "task-9"}))
@@ -239,7 +247,46 @@ func TestLedgerBriefSetEqualsGateSet(t *testing.T) {
 
 	brief := engine.ledgerObligationBrief(ctx, "gitmoot/gitmoot", 1850, h3, "task-9")
 	if !strings.Contains(brief, uid) {
-		t.Fatalf("THE WEDGE: the gate demands %s and the brief does not disclose it, so no reviewer can ever discharge it.\nbrief=%q", uid, brief)
+		t.Fatalf("THE WEDGE via relevance: the gate demands %s and the brief does not disclose it, so no reviewer can ever discharge it.\nbrief=%q", uid, brief)
+	}
+
+	// THE LOCATOR-EXISTENCE CLASS, which is how round 3 wedged after round 2 was
+	// fixed. A STATIC answer whose cited path has vanished is mandatory again;
+	// the brief must say so too.
+	staticStore := openEngineStore(t)
+	staticUID, err := staticStore.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
+		Repo: "gitmoot/gitmoot", PullRequest: 1851, HeadSHA: h1, ObserverJob: "review-1",
+		State: db.FindingOpen, Severity: "P1", RoundLabel: "F-1", Title: "static defect",
+		File: "internal/gone.go", EvidenceKind: db.EvidenceExecuted,
+		ExecutedCommands: []string{"go test -> FAIL"}, ExecutedCount: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed static: %v", err)
+	}
+	if _, err := staticStore.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
+		Repo: "gitmoot/gitmoot", PullRequest: 1851, HeadSHA: h2, ObserverJob: "review-2",
+		ContinuesUID: staticUID, State: db.FindingAnswered, Severity: "P1", Title: "static defect",
+		File: "internal/gone.go", EvidenceKind: db.EvidenceStatic,
+		EvidenceLocator: "internal/gone.go:9999", Rationale: "the guard lives here now",
+	}); err != nil {
+		t.Fatalf("answer static: %v", err)
+	}
+	gone := LedgerResolvers{
+		ChangedSince:     func(context.Context, string, int, string, string) ([]string, error) { return nil, nil },
+		PathExistsAtHead: func(context.Context, string, string) (bool, error) { return false, nil },
+	}
+	staticEngine := testEngine(staticStore)
+	staticEngine.LedgerResolvers = gone
+	staticGate := PolicyMergeGate{Store: staticStore, LedgerResolvers: gone}
+
+	staticGateErr := EnsureLedgerObligationsObserved(ctx, staticStore, "gitmoot/gitmoot", 1851, h3,
+		staticGate.ledgerScope(MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 1851, TaskID: "task-9"}))
+	if staticGateErr == nil {
+		t.Fatal("the gate accepted a STATIC answer whose locator is gone, so this arm cannot discriminate")
+	}
+	staticBrief := staticEngine.ledgerObligationBrief(ctx, "gitmoot/gitmoot", 1851, h3, "task-9")
+	if !strings.Contains(staticBrief, staticUID) {
+		t.Fatalf("THE WEDGE via locator existence: the gate demands %s and the brief does not disclose it.\nbrief=%q", staticUID, staticBrief)
 	}
 }
 
