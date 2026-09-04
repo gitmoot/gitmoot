@@ -587,11 +587,12 @@ merge never synthesizes a no-CI success. Head drift, unmergeability/conflict, or
 merge API failure also folds the gate blocked; merge errors are not retried. A
 scheduled auto-merge flow requires both `allow_auto_merge: true` and the existing
 `pipeline_auto_merge_claim` before the write and `pipeline_auto_merge_confirmed`
-after GitHub confirms it, plus `pipeline_auto_merge_claim_at` recording when the
-claim was taken and released with it. Racing scans that lose the claim do not
-call merge and do not park the run; past 15m of a held claim a loser records
-`pipeline_auto_merge_claim_orphaned` and keeps waiting, which a stage `timeout`
-turns into a park. A workload-mode reconciliation hold records
+after GitHub confirms it. Racing scans that lose the claim do not call merge and
+do not park the run; a loser ages its wait from the gate stage's own `StartedAt`
+and records `pipeline_auto_merge_claim_orphaned` with `cause=held_past_bound`
+once that wait passes 15m, or immediately with `cause=gate_start_unrecorded`
+when the gate row carries no start time and the wait cannot be aged. Either way
+it keeps waiting, which a stage `timeout` turns into a park. A workload-mode reconciliation hold records
 `pipeline_auto_merge_held` with its cause: the gate releases the claim and
 re-attempts, so the hold is retryable rather than terminal, and it parks with
 that cause at the gate `timeout` or, when no timeout is set, 24h after the hold

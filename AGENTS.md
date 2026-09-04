@@ -516,9 +516,14 @@ changed CAUSE alone does not, because the cause carries volatile near-miss
 detail and keying on it let unrelated churn defer the bound indefinitely.
 A scan that LOSES the at-most-once claim is a separate case and never parks the
 run: it cannot see whether the winner is alive, and a hold record has no expiry,
-so believing one killed runs whose reconciliation had already succeeded. Past
-15m of a held claim it records `pipeline_auto_merge_claim_orphaned` and keeps
-waiting; a stage `timeout` is what turns that into a park.
+so believing one killed runs whose reconciliation had already succeeded. It ages
+the wait from the GATE STAGE'S OWN `StartedAt` - one clock, one write, no second
+row to fall out of step with the claim - and records
+`pipeline_auto_merge_claim_orphaned` once the wait passes 15m, with
+`cause=held_past_bound`. A gate row with no recorded start time cannot be aged
+at all, and a wait that cannot be aged is recorded immediately with
+`cause=gate_start_unrecorded` rather than left silent. Either way it keeps
+waiting, and a stage `timeout` is what turns that into a park.
 
 Resolve the active decision from both durable sources: read the marker from
 `origin/main:AGENTS.md`, never a seat worktree, and read the newest typed

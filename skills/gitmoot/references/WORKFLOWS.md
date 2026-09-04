@@ -1044,12 +1044,13 @@ Pending checks wait; skipped/neutral check-runs pass; failures block; and zero
 external statuses/checks always block regardless of `require_external_ci`. The
 source job event timeline atomically records `pipeline_auto_merge_claim` before
 the write and `pipeline_auto_merge_confirmed` after GitHub confirms it, plus
-`pipeline_auto_merge_claim_at` for the claim's age and
 `pipeline_auto_merge_held` when a workload-mode reconciliation hold parks the
 gate: that hold releases the claim and retries, and is bounded by the gate
 `timeout` or by 24h from the start of the hold episode, keyed on the head and
-the decision rather than the cause text. A scan that loses the claim records
-`pipeline_auto_merge_claim_orphaned` past 15m and waits rather than parking.
+the decision rather than the cause text. A scan that loses the claim ages its wait from the gate stage's own `StartedAt`
+and records `pipeline_auto_merge_claim_orphaned` past 15m - or immediately, with
+`cause=gate_start_unrecorded`, when that stamp is missing - and waits rather
+than parking.
 
 `pipeline add` warns (does not block) when an agent stage names an agent that does
 not exist yet; create it before the stage runs. The

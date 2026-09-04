@@ -614,13 +614,13 @@ stages:
   a merge API failure is tried once and never retry-spammed.
 - The source job timeline atomically records `pipeline_auto_merge_claim` before
   the write and `pipeline_auto_merge_confirmed` afterward, carrying pipeline/run,
-  stage, PR, and head SHA, plus `pipeline_auto_merge_claim_at` carrying when the
-  claim was taken. The age row is released WITH the claim, so it measures only a
-  claim that still exists. Racing scans that lose the claim never call merge, and
+  stage, PR, and head SHA. Racing scans that lose the claim never call merge, and
   never park the run either: a loser cannot see whether the winner is alive, so
-  once the claim has been held past 15m it records
-  `pipeline_auto_merge_claim_orphaned` and keeps waiting. A stage `timeout` is
-  what converts that wait into a park.
+  it ages its wait from the gate stage's own `StartedAt` and records
+  `pipeline_auto_merge_claim_orphaned` with `cause=held_past_bound` once that
+  wait passes 15m. A gate row carrying no start time cannot be aged, and that
+  case is recorded immediately with `cause=gate_start_unrecorded` instead of
+  waiting silently. A stage `timeout` is what converts either wait into a park.
 - A workload-mode reconciliation hold is a THIRD event,
   `pipeline_auto_merge_held`, carrying the cause plus the head and the time the
   hold began. The hold is retryable, not terminal: the gate releases its

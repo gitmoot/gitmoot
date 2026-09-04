@@ -480,12 +480,11 @@ func TestPipelineAutoMergeLostClaimNeverParksAResolvedHold(t *testing.T) {
 	executor.mergeResult = workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-sha"}
 
 	// And this scan loses the race - seeded exactly as a failed release leaves
-	// it, by re-consuming the claim by hand. The claim's age is seeded too, and
-	// deliberately older than every bound in this file: without it the branch
-	// takes the no-age fail-open path and the test would pass while parking on a
-	// known-age claim.
+	// it, by re-consuming the claim by hand. No age row is seeded because none
+	// exists any more: the loser ages the wait from the gate stage's own
+	// StartedAt, so there is no state in which the claim is consumed and the age
+	// is missing (#1783 round-6 review, N-1).
 	seedConsumedAutoMergeClaim(t, store, rec, run, sourceJobID)
-	seedAutoMergeClaimAt(t, store, rec, run, sourceJobID, held.at)
 
 	// Well past the hold's bound. The run must NOT be dead: the winner merges,
 	// or the claim is released and the next scan merges.
@@ -516,8 +515,10 @@ func TestPipelineAutoMergeLostClaimReportsAnOrphanedClaim(t *testing.T) {
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second),
 		&stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: "0123456789abcdef"}})
 	seedConsumedAutoMergeClaim(t, store, rec, run, sourceJobID)
-	claimedAt := now.Add(time.Second)
-	seedAutoMergeClaimAt(t, store, rec, run, sourceJobID, claimedAt)
+	gateStartedAt := stageRow(t, store, run.ID, "merge").StartedAt
+	if gateStartedAt.IsZero() {
+		t.Fatal("premise broken: the gate stage must carry a StartedAt for the wait to be ageable")
+	}
 
 	// LITERALS, not autoMergeClaimOrphanAfter arithmetic. Deriving this clock
 	// from the constant it pins made widening the bound to 720h invisible -
@@ -527,7 +528,7 @@ func TestPipelineAutoMergeLostClaimReportsAnOrphanedClaim(t *testing.T) {
 	}
 
 	// Inside the window: waiting, and honest that another scan holds the claim.
-	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, claimedAt.Add(14*time.Minute), executor)
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, gateStartedAt.Add(14*time.Minute), executor)
 	if gate := stageRow(t, store, run.ID, "merge"); gate.State == StageBlocked {
 		t.Fatalf("a claim held inside the window must not park: %q", gate.Summary)
 	}
@@ -536,7 +537,7 @@ func TestPipelineAutoMergeLostClaimReportsAnOrphanedClaim(t *testing.T) {
 	}
 
 	// Past it: still not parked, but the cause is recorded and stated.
-	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, claimedAt.Add(16*time.Minute), executor)
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, gateStartedAt.Add(16*time.Minute), executor)
 	gate := stageRow(t, store, run.ID, "merge")
 	if gate.State == StageBlocked {
 		t.Fatalf("an orphaned claim is not a condition this scan observed, so it must not park: %q", gate.Summary)
@@ -547,85 +548,53 @@ func TestPipelineAutoMergeLostClaimReportsAnOrphanedClaim(t *testing.T) {
 	// The EVENT is the durable record on this path, not the summary: a waiting
 	// stage's summary is written only when it settles, so an operator with no
 	// stage `timeout` has the event and nothing else. It has to name the claim.
-	for _, want := range []string{`"head_sha":"0123456789abcdef"`, `"claimed_at":"` + claimedAt.UTC().Format(time.RFC3339Nano), `"after":"15m0s"`} {
+	for _, want := range []string{`"head_sha":"0123456789abcdef"`, `"after":"15m0s"`, `"cause":"held_past_bound"`} {
 		if !strings.Contains(autoMergeEventBody(t, store, sourceJobID, autoMergeClaimOrphanEventKind), want) {
 			t.Fatalf("suspicion row must contain %s: %s", want, autoMergeEventBody(t, store, sourceJobID, autoMergeClaimOrphanEventKind))
 		}
 	}
 	// Recorded ONCE per claim, however many scans lose the race.
-	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, claimedAt.Add(17*time.Minute), executor)
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, gateStartedAt.Add(17*time.Minute), executor)
 	if events := autoMergeEventCount(t, store, sourceJobID, autoMergeClaimOrphanEventKind); events != 1 {
 		t.Fatalf("suspicion rows after a second losing scan = %d, want the same 1", events)
 	}
 }
 
-// The claim-age row is only trustworthy because it dies WITH the claim. If a
-// release left it behind, a later losing scan would measure a claim that no
-// longer exists and report an orphan for a healthy race - which is F-10's defect
-// re-created by F-10's own fix, so it is pinned rather than argued.
-func TestPipelineAutoMergeClaimAgeIsReleasedWithTheClaim(t *testing.T) {
-	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
-	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
-	const holdReason = "workload-mode change requires reconciliation at head 0123456 against operating-mode note 41"
-	executor := &stubPipelineAutoMerger{
-		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
-		mergeResult: workflow.PipelineAutoMergeResult{Waiting: true, Reason: holdReason},
-	}
-	// A full winning pass: claim, record the age, hold, release both.
-	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*time.Second), executor)
-	if claimAtRows := autoMergeEventCount(t, store, sourceJobID, autoMergeClaimAtEventKind); claimAtRows != 0 {
-		t.Fatalf("claim-age rows after the claim was released = %d, want 0", claimAtRows)
-	}
-	if claimedAt, err := latestAutoMergeClaimAt(context.Background(), store, sourceJobID, "0123456789abcdef"); err != nil {
-		t.Fatal(err)
-	} else if !claimedAt.IsZero() {
-		t.Fatalf("a released claim must leave no age to measure, got %v", claimedAt)
-	}
-
-	// So a scan that loses a LATER race reports no orphan on the strength of the
-	// released claim.
-	seedConsumedAutoMergeClaim(t, store, rec, run, sourceJobID)
-	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(2*autoMergeHoldMaxWait), executor)
-	if gate := stageRow(t, store, run.ID, "merge"); gate.State == StageBlocked {
-		t.Fatalf("gate parked on a released claim: %q", gate.Summary)
-	}
-	if rows := autoMergeEventCount(t, store, sourceJobID, autoMergeClaimOrphanEventKind); rows != 0 {
-		t.Fatalf("orphan suspicions from a released claim = %d, want 0", rows)
-	}
-}
-
-// The age reader takes the NEWEST row, and that direction is load-bearing: a
-// leftover row from an earlier episode is always older, so taking the earliest
-// would report an orphan for a claim taken seconds ago. Needs two rows to be a
-// choice at all, which is why the single-row tests above cannot pin it.
-func TestPipelineAutoMergeClaimAgeTakesTheNewestRow(t *testing.T) {
+// N-1's second half: a gate row with NO recorded start time. A resumed run
+// zeroes StartedAt, so the loser cannot age its wait AND pipelineGateTimedOut
+// cannot fire, which means a reason string alone reaches nothing an operator can
+// read. It therefore has to RECORD. Measured: a mutant that dropped the reason
+// here changed nothing observable until the record was added.
+func TestPipelineAutoMergeLostClaimReportsAnUnageableWait(t *testing.T) {
 	store, enqueue, rec, spec, run, sourceJobID, now := prepareAutoMergeGate(t)
 	settleBoundReviewJob(t, store, stageRow(t, store, run.ID, "review").JobID, "approved", "0123456789abcdef")
 	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Second),
 		&stubPipelineAutoMerger{readiness: workflow.PipelineAutoMergeReadiness{Waiting: true, CurrentHeadSHA: "0123456789abcdef"}})
 	seedConsumedAutoMergeClaim(t, store, rec, run, sourceJobID)
 
-	stale := now.Add(-48 * time.Hour)
-	current := now.Add(time.Second)
-	seedAutoMergeClaimAt(t, store, rec, run, sourceJobID, stale)
-	seedAutoMergeClaimAt(t, store, rec, run, sourceJobID, current)
-
-	claimedAt, err := latestAutoMergeClaimAt(context.Background(), store, sourceJobID, "0123456789abcdef")
-	if err != nil {
+	// Zero the gate row's start stamp, exactly as a resume does.
+	gate := stageRow(t, store, run.ID, "merge")
+	gate.StartedAt = time.Time{}
+	if err := store.UpdatePipelineRunStage(context.Background(), gate); err != nil {
 		t.Fatal(err)
 	}
-	if !claimedAt.Equal(current.UTC()) {
-		t.Fatalf("claim age = %v, want the NEWEST row %v", claimedAt, current.UTC())
+	if got := stageRow(t, store, run.ID, "merge"); !got.StartedAt.IsZero() {
+		t.Fatalf("premise broken: StartedAt = %v, want zero", got.StartedAt)
 	}
 
-	// So the young claim reports no orphan, however old the leftover row is.
 	executor := &stubPipelineAutoMerger{
 		readiness:   workflow.PipelineAutoMergeReadiness{Ready: true, CurrentHeadSHA: "0123456789abcdef"},
 		mergeResult: workflow.PipelineAutoMergeResult{Merged: true, MergeCommitSHA: "merge-sha"},
 	}
-	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, current.Add(time.Minute), executor)
-	if rows := autoMergeEventCount(t, store, sourceJobID, autoMergeClaimOrphanEventKind); rows != 0 {
-		t.Fatalf("orphan suspicions for a one-minute-old claim = %d, want 0", rows)
+	run = advanceWithAutoMerge(t, store, enqueue, rec, spec, run, now.Add(time.Hour), executor)
+	if gate := stageRow(t, store, run.ID, "merge"); gate.State == StageBlocked {
+		t.Fatalf("an unageable wait must not park: %q", gate.Summary)
+	}
+	if rows := autoMergeEventCount(t, store, sourceJobID, autoMergeClaimOrphanEventKind); rows != 1 {
+		t.Fatalf("suspicion rows for an unageable wait = %d, want exactly 1", rows)
+	}
+	if body := autoMergeEventBody(t, store, sourceJobID, autoMergeClaimOrphanEventKind); !strings.Contains(body, `"cause":"gate_start_unrecorded"`) {
+		t.Fatalf("suspicion row must name the cause: %s", body)
 	}
 }
 
@@ -689,25 +658,6 @@ func seedConsumedAutoMergeClaim(t *testing.T, store *db.Store, rec db.Pipeline, 
 		JobID: sourceJobID, Kind: autoMergeClaimEventKind, Message: string(claim),
 	}); err != nil || !claimed {
 		t.Fatalf("seeding the consumed claim: claimed=%v err=%v", claimed, err)
-	}
-}
-
-// seedAutoMergeClaimAt records when that claim was taken, on the pipeline's own
-// clock, which is what the losing scan measures its age against.
-func seedAutoMergeClaimAt(t *testing.T, store *db.Store, rec db.Pipeline, run db.PipelineRun, sourceJobID string, at time.Time) {
-	t.Helper()
-	message, err := json.Marshal(map[string]any{
-		"phase": "claim_at", "pipeline": rec.Name, "run_id": run.ID,
-		"stage_id": "merge", "pull_request": 813, "head_sha": "0123456789abcdef",
-		"claimed_at": at.UTC().Format(time.RFC3339Nano),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.AddJobEvent(context.Background(), db.JobEvent{
-		JobID: sourceJobID, Kind: autoMergeClaimAtEventKind, Message: string(message),
-	}); err != nil {
-		t.Fatal(err)
 	}
 }
 

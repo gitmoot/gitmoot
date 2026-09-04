@@ -3843,10 +3843,11 @@ the existing `allow_scheduled_writes` key. Omitting `merge` preserves human merg
 Pending checks wait; skipped/neutral check-runs pass; failures block; and zero
 external statuses/checks always block regardless of `require_external_ci`. The
 source job atomically records `pipeline_auto_merge_claim` before the write,
-`pipeline_auto_merge_claim_at` for the claim's age, and
 `pipeline_auto_merge_confirmed` after GitHub confirms it. A scan that loses the
-claim never parks the run; past 15m it records
-`pipeline_auto_merge_claim_orphaned` and keeps waiting. A workload-mode
+claim never parks the run; it ages its wait from the gate stage's own
+`StartedAt` and records `pipeline_auto_merge_claim_orphaned` past 15m, or
+immediately with `cause=gate_start_unrecorded` when that stamp is missing, and
+keeps waiting. A workload-mode
 reconciliation hold records `pipeline_auto_merge_held` with its cause, releases
 the claim so the merge is re-attempted when the row lands, and parks with that
 cause at the gate `timeout` or 24h after the hold began when no timeout is set;
