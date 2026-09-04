@@ -602,7 +602,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	}
 	// Foreground dispatch bypasses the daemon worker, so attach opt-in retained
 	// capture explicitly. Open/composition failures remain fail-open.
-	_, retainedLogFile, retainedLogErr := openRetainedTranscriptLog(request.Home, job.ID)
+	retainedLogFile, retainedLogErr := openRetainedTranscriptLog(request.Home, job.ID)
 	if retainedLogErr == nil && retainedLogFile != nil {
 		teeAdapter, teeErr := appendDeliveryAdapterOutput(adapter, retainedLogFile)
 		if teeErr != nil {

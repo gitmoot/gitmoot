@@ -210,12 +210,12 @@ func TestTranscriptOutputKeepsTheReadOnlySeatSandbox(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = seat.cleanup() })
 
-	logPath, logFile, err := openRetainedTranscriptLog(home, "seat-transcript-job")
+	logFile, err := openRetainedTranscriptLog(home, "seat-transcript-job")
 	if err != nil {
 		t.Fatalf("openRetainedTranscriptLog: %v", err)
 	}
 	if logFile == nil {
-		t.Fatalf("expected a retained transcript log (path %q)", logPath)
+		t.Fatal("expected a retained transcript log")
 	}
 	defer logFile.Close()
 

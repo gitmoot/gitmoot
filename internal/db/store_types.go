@@ -279,8 +279,6 @@ type JobGate struct {
 	SatisfiedAt string
 }
 
-const ()
-
 type BranchLock struct {
 	RepoFullName           string
 	Branch                 string

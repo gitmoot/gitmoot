@@ -654,6 +654,16 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
 		switch {
+		// Flags removed with the TUI are rejected BY NAME, before any positional
+		// counting. The unknown-flag arm below only fires once two positionals
+		// exist, so `orchestrate agent --cockpit "do it"` used to swallow the
+		// stale flag as the agent's message, and `orchestrate agent --cockpit`
+		// ran all the way to repo inference with message "--cockpit" (#1787
+		// review F6). A script that still passes one must be told what happened.
+		case arg == "--cockpit" || arg == "--herdr" || arg == "--cockpit-session" ||
+			strings.HasPrefix(arg, "--cockpit-session="):
+			fmt.Fprintf(stderr, "%s: %s was removed with the terminal cockpit; drop the flag\n", label, strings.SplitN(arg, "=", 2)[0])
+			return agentRunOptions{}, false
 		case arg == "--background":
 			options.background = true
 		case arg == "--json":

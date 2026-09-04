@@ -3955,3 +3955,38 @@ func TestAgentModelRoundTripsThroughStorageMapping(t *testing.T) {
 		t.Fatalf("runtimeAgent effort = %q, want high", roundTripped.Effort)
 	}
 }
+
+// The flags removed with the TUI must be rejected BY NAME in every position. The
+// unknown-flag arm only fires once two positionals exist, so before this a stale
+// --cockpit in the message position was swallowed as the message and the run
+// proceeded past parsing entirely (#1787 review F6).
+func TestParseAgentRunOptionsRejectsRemovedCockpitFlagsInAnyPosition(t *testing.T) {
+	for _, args := range [][]string{
+		{"myagent", "do it", "--cockpit"},
+		{"myagent", "--cockpit", "do it"},
+		{"--cockpit", "myagent", "do it"},
+		{"myagent", "--cockpit"},
+		{"myagent", "--herdr", "do it"},
+		{"myagent", "--cockpit-session", "abc", "do it"},
+		{"myagent", "--cockpit-session=abc", "do it"},
+	} {
+		var stderr bytes.Buffer
+		options, ok := parseAgentRunOptions("orchestrate", args, &stderr)
+		if ok {
+			t.Fatalf("args %q parsed successfully as agent=%q message=%q, want a rejection", args, options.agent, options.message)
+		}
+		if !strings.Contains(stderr.String(), "removed with the terminal cockpit") {
+			t.Fatalf("args %q produced %q, want an error naming the removed flag", args, stderr.String())
+		}
+	}
+}
+
+// The rejection must not swallow a legitimate message that merely begins with a
+// dash, which is the failure mode a blanket unknown-flag rule would introduce.
+func TestParseAgentRunOptionsStillAcceptsOrdinaryRuns(t *testing.T) {
+	var stderr bytes.Buffer
+	options, ok := parseAgentRunOptions("orchestrate", []string{"myagent", "do it"}, &stderr)
+	if !ok || options.agent != "myagent" || options.message != "do it" {
+		t.Fatalf("ordinary run = %+v ok=%v stderr=%q", options, ok, stderr.String())
+	}
+}

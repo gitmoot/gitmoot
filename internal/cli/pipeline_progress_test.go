@@ -73,16 +73,17 @@ func TestEmitPipelineProgressThresholdCadenceAndCancel(t *testing.T) {
 	}
 }
 
-// The retained transcript log and the pipeline progress tracker must share ONE
-// The retained transcript, follower, and tracker share the universal runtime
-// output writer, so all three observe the same line.
+// The retained transcript log, the follower, and the pipeline progress tracker
+// must share ONE universal runtime output writer, so all three observe the same
+// line.
 func TestRetainedTranscriptAndProgressShareRuntimeOutput(t *testing.T) {
 	home := t.TempDir()
 	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard, home)
 	agent := runtime.Agent{Name: "lead", Role: "builder", Runtime: runtime.ShellRuntime, RuntimeRef: "echo shared-line"}
 	tracker := &pipelineProgressLineTracker{}
 
-	logPath, logFile, err := openRetainedTranscriptLog(home, "job-shared")
+	logFile, err := openRetainedTranscriptLog(home, "job-shared")
+	logPath := retainedTranscriptLogPathForTest(t, home, "job-shared")
 	if err != nil {
 		t.Fatalf("openRetainedTranscriptLog: %v", err)
 	}
