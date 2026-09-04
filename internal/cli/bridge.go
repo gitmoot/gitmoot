@@ -192,6 +192,12 @@ func bridgeHostIsLoopback(host string) bool {
 }
 
 func ensureBridgeToken(paths config.Paths, rotate bool) (string, error) {
+	// bridge.token IS a credential. Same guard as runtime-auth.env: a home that
+	// is empty or relative would write it beside whatever the process happens to
+	// be running in, which is how #1810 put a live token in a public repo.
+	if err := requireAbsoluteCredentialHome(paths.Home, bridgeTokenName); err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(paths.Home, 0o700); err != nil {
 		return "", err
 	}

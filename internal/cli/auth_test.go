@@ -287,6 +287,29 @@ printf '{"type":"result","is_error":false,"result":"%s"}\n' "$fingerprint"
 	if !strings.Contains(probeOut.String(), "source: "+runtimeAuthFileName) || !strings.Contains(probeOut.String(), "Claude auth: valid") {
 		t.Fatalf("auth probe output=%q", probeOut.String())
 	}
+	// The ambient verdict above says nothing about the credential a READ-ONLY
+	// SEAT stages, which is the pair that stayed green through the outage. One
+	// command must report both (#1810 review F8: nothing pinned this line).
+	if !strings.Contains(probeOut.String(), "read-only seat credential") {
+		t.Fatalf("auth probe omitted the read-only seat credential: %q", probeOut.String())
+	}
+
+	deadSeatDir := t.TempDir()
+	writeClaudeCredential(t, deadSeatDir, 0, "")
+	t.Setenv("CLAUDE_CONFIG_DIR", deadSeatDir)
+	probeOut.Reset()
+	probeErr.Reset()
+	// A dead SNAPSHOT beside a live runtime-auth OVERLAY is untidy, not broken:
+	// the overlay is what a seat authenticates with, so every seat job succeeds
+	// and a non-zero exit here would be a false red on a working host (#1810
+	// review round 3, F2). This run has an overlay - the rotation above wrote
+	// runtime-auth.env - so the probe must say so and still exit 0.
+	if code := runAuthProbe([]string{"claude", "--home", home}, &probeOut, &probeErr); code != 0 {
+		t.Fatalf("auth probe code=%d, want 0 while a runtime-auth overlay is present; stdout=%q stderr=%q", code, probeOut.String(), probeErr.String())
+	}
+	if !strings.Contains(probeOut.String(), "overlay is present") {
+		t.Fatalf("auth probe did not name the overlay that keeps seats working: %q", probeOut.String())
+	}
 
 	var stdout, stderr bytes.Buffer
 	if code := runAuthUnset([]string{"claude", "--home", home}, &stdout, &stderr); code != 0 {
@@ -300,4 +323,26 @@ printf '{"type":"result","is_error":false,"result":"%s"}\n' "$fingerprint"
 func shaFingerprint(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
+}
+
+// The other half of the same contract, kept out of the rotation E2E so it does
+// not have to tear down that test's live overlay mid-flow: with NO overlay and
+// NO gateway, the same dead snapshot is the proven failure and the probe exits
+// non-zero (#1810 review round 3, F2).
+func TestAuthProbeExitsNonZeroForADeadSeatCredentialWithNoOverlay(t *testing.T) {
+	home := t.TempDir()
+	paths := seatDoctorTestPaths(t, home, false)
+	deadSeatDir := t.TempDir()
+	writeClaudeCredential(t, deadSeatDir, 0, "")
+	t.Setenv("CLAUDE_CONFIG_DIR", deadSeatDir)
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	_ = os.Remove(runtimeAuthFilePath(paths.Home))
+	var out, errOut bytes.Buffer
+	if code := runAuthProbe([]string{"claude", "--home", home}, &out, &errOut); code != 1 {
+		t.Fatalf("auth probe code=%d, want 1 with no overlay and no gateway; stdout=%q stderr=%q", code, out.String(), errOut.String())
+	}
+	if !strings.Contains(out.String(), "UNUSABLE") {
+		t.Fatalf("auth probe did not identify the unusable seat credential: %q", out.String())
+	}
 }

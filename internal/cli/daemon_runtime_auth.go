@@ -197,10 +197,42 @@ func writeRuntimeAuthFile(path string, values map[string]string) error {
 // bootstrapRuntimeAuth performs the one-release transition only when the new
 // authoritative file is absent. Legacy persisted auth wins over ambient auth;
 // an existing runtime-auth.env is never rewritten from either source.
+
+// requireAbsoluteCredentialHome refuses any home that would place a credential
+// file somewhere relative to the current working directory. #1810 published a
+// live token exactly that way: the path was joined onto an empty home, resolved
+// relative, and the file landed in the package source tree during a test run.
+// Every writer of a credential-bearing file goes through this.
+func requireAbsoluteCredentialHome(homeDir, fileName string) error {
+	trimmed := strings.TrimSpace(homeDir)
+	if trimmed == "" {
+		return fmt.Errorf("refusing to write %s: no home was resolved", fileName)
+	}
+	if !filepath.IsAbs(trimmed) {
+		return fmt.Errorf("refusing to write %s under relative path %q: a credential must never land in the working directory", fileName, trimmed)
+	}
+	return nil
+}
+
+// requireAbsoluteRuntimeAuthHome is the runtime-auth caller of the shared guard.
+func requireAbsoluteRuntimeAuthHome(homeDir string) error {
+	return requireAbsoluteCredentialHome(homeDir, runtimeAuthFileName)
+}
+
 func bootstrapRuntimeAuth(homeDir string, lookup func(string) (string, bool), logf func(string, ...any)) (bool, error) {
 	runtimeAuthBootstrapMu.Lock()
 	defer runtimeAuthBootstrapMu.Unlock()
 
+	// P0 (#1810): this function WRITES A CREDENTIAL FILE, and runtimeAuthFilePath
+	// joins onto homeDir, so an empty or relative homeDir resolves to a RELATIVE
+	// path and the credential lands in the process's working directory. That
+	// happened: a caller passing a zero config.Paths wrote runtime-auth.env into
+	// the package source directory during a test run, where git add -A tracked it
+	// and it reached a public remote. A credential must only ever be written to
+	// an ABSOLUTE, deliberately chosen home.
+	if err := requireAbsoluteRuntimeAuthHome(homeDir); err != nil {
+		return false, err
+	}
 	path := runtimeAuthFilePath(homeDir)
 	if _, err := os.Stat(path); err == nil {
 		return false, nil

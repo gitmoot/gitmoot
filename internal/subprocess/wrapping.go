@@ -20,7 +20,9 @@ type WrappingRunner struct {
 	ReadOnlyWorkdir bool
 	// Env is appended to the sandbox-exec process environment and inherited by
 	// the exec'd runtime. It is empty for every existing wrapper except Claude
-	// produce, which relocates its mutable config into its granted state dir.
+	// produce, which points CLAUDE_CONFIG_DIR and XDG_CACHE_HOME at the
+	// job-private state root it was granted, so the runtime never writes the
+	// operator profile or the ambient cache.
 	Env []string
 }
 

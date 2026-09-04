@@ -309,6 +309,46 @@ deferral is a first-class `job.deferred` emitted instead of `job.failed`. A job
 that "failed then reappeared as queued" is the deferral working; only act when
 the retry budget is spent and the job stays failed.
 
+A read-only seat (every `review`/`ask` job under the read-only autonomy policy)
+does NOT authenticate with the ambient credential: it stages a SNAPSHOT of its
+runtime config dir (`payload.runtime_config_dir`, else the daemon's
+`CLAUDE_CONFIG_DIR`, else `~/.claude`) and carries the resolved
+`runtime-auth.env` overlay. When that snapshot is already expired the job records
+one `readonly_seat_credential_expired` event naming the expiry, the refresh-token
+state and whether an overlay was available; read it with `gitmoot job events
+<job-id>` before treating the runtime's own "OAuth session expired and could not
+be refreshed" wording as an account problem. It never refuses the job.
+`gitmoot doctor` and `gitmoot auth probe claude` both report that seat credential
+beside the ambient one, and doctor FAILS (non-zero exit) when it is expired with
+no refresh token, since every read-only seat job on that runtime will fail until
+the account is re-logged in.
+
+A Claude `produce` stage does NOT run against the operator profile. The daemon
+copies `.credentials.json` and `settings.json` from the configured account
+(`CLAUDE_CONFIG_DIR`, else `~/.claude`) into a job-private profile, points the
+runtime's `CLAUDE_CONFIG_DIR` and `XDG_CACHE_HOME` at that job-private state root
+under `<gitmoot home>/cache/produce-runtime/<hash>/run-*/` — one directory per
+dispatch, so two runs of one job id cannot wipe each other — and removes it when
+the job finishes. The operator profile is never granted writable and is never
+named in any read grant, so a token the runtime refreshes mid-job lands in the
+discarded copy: re-login on the host, not in the job. It may still be READABLE:
+an agent that declares no readable paths falls back to a read-only grant over
+`/`, which is a read, never a write.
+
+Only those two files cross into a produce job. Everything else in the operator
+profile — `agents/`, `commands/`, `plugins/`, `CLAUDE.md`, `settings.local.json`,
+`~/.claude.json` — deliberately does not, so a produce job sees runtime defaults
+rather than operator customisation. A profile that does not exist yet is valid
+and starts the job with an empty one. A `settings.json` that is symlinked is
+followed; one that is empty, holds a non-object, or is not a file at all is
+SKIPPED rather than failing the job. An unusable `.credentials.json` does fail
+the job, because it decides which account the work runs as.
+
+`sandbox-exec: sandbox read path "…": no such file or directory` means a path
+granted to the sandbox does not exist on disk. Explicit read grants are required,
+not skipped — check `readable_paths` in `gitmoot job show <job-id> --json` and
+create (or stop granting) the named path.
+
 A job stuck in `running` is recovered automatically once it shows no lease
 progress past the staleness window (default 30m; tune with the
 `GITMOOT_STALE_RUNNING_AFTER` environment variable; the smallest honored value

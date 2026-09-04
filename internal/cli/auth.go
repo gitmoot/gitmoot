@@ -274,8 +274,21 @@ func runAuthProbe(args []string, stdout, stderr io.Writer) int {
 	probeErr := runtime.ClaudeLiveCheckEnv(context.Background(), runner, "", nil)
 	status := runtime.ClaudeClassifyProbe(probeErr)
 	writeLine(stdout, "Claude auth: %s", status.String())
+	// The probe above measures the ambient/runtime-auth credential. A read-only
+	// seat also stages the daemon's configured credential snapshot. Report that
+	// distinct credential and make a known-unusable snapshot affect the command
+	// result, or automation still receives the false green from the outage.
+	seatCredentialUsable := true
+	probePaths, pathsErr := pathsFromFlag(*home)
+	if pathsErr != nil {
+		writeLine(stdout, "read-only seat credential: unknown (%v)", pathsErr)
+	} else {
+		seatCredentialUsable = writeSeatCredentialProbe(stdout, probePaths)
+	}
 	if probeErr != nil {
 		fmt.Fprintf(stderr, "auth probe: %v\n", probeErr)
+	}
+	if probeErr != nil || !seatCredentialUsable {
 		return 1
 	}
 	return 0

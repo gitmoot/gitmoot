@@ -4,3 +4,39 @@
 /.gitmoot/evals/
 /gitmoot
 /*.log
+
+# CREDENTIAL-BEARING OVERLAY FILENAMES (#1810). Every name here is one this
+# codebase RESOLVES AND READS as a credential input, enumerated from the
+# resolver rather than from memory:
+#   runtime-auth.env      internal/cli/daemon_runtime_auth.go:24 (runtimeAuthFileName)
+#   daemon-runtime.env    internal/cli/daemon_runtime_auth.go:25 (legacyRuntimeAuthFileName)
+#   .credentials.json     internal/cli/daemon_worker.go:1649, readonly_seat_credential.go:71
+#   auth.json             internal/cli/daemon_worker.go:1654 (codex)
+#   kimi-code.json        internal/cli/daemon_worker.go:1660 (kimi)
+#   keychain.env          internal/pipeline/env_runtime.go, ResolveKeychainPath
+#   bridge.token          internal/cli/bridge.go:37, bridgeTokenName
+# The feature's contract is "read a credential overlay out of a directory", so
+# the host that exercises it will produce these files in a work tree. None of
+# them is a tracked repository artifact - verified with git ls-files before
+# adding these rules - so ignoring them by name hides nothing legitimate.
+#
+# LIMIT, stated because a name list reads as completeness and is not:
+# [credentials].keychain_path accepts ANY absolute path, so an operator can
+# point a credential at a filename nothing here lists. Rules matched by name,
+# and a guard matched by basename, are structurally incapable of covering that
+# case. They cover the names this code CHOOSES, not every path an operator can
+# configure.
+runtime-auth.env
+**/runtime-auth.env
+daemon-runtime.env
+**/daemon-runtime.env
+.credentials.json
+**/.credentials.json
+auth.json
+**/auth.json
+kimi-code.json
+**/kimi-code.json
+keychain.env
+**/keychain.env
+bridge.token
+**/bridge.token

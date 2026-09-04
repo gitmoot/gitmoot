@@ -284,7 +284,7 @@ func TestFreshIsolatedProduceRunnerStreamsInjectedEnvAndPID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("applyIsolatedToolCacheGrants: %v", err)
 	}
-	adapter, err = wrapProduceSandboxAdapter("produce", agent, adapter)
+	adapter, err = wrapProduceSandboxAdapter("produce", agent, adapter, t.TempDir())
 	if err != nil {
 		t.Fatalf("wrapProduceSandboxAdapter: %v", err)
 	}

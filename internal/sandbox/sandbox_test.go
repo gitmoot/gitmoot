@@ -296,3 +296,46 @@ func TestSandboxExecStrictReadModeReachesProcfsE2E(t *testing.T) {
 		t.Fatalf("overflowuid read returned %q, want the kernel value; procfs is not genuinely readable", output)
 	}
 }
+
+// The produce sandbox grants implicit write roots, so a path that merely is not
+// named in the grant list is still writable when it sits under one of them.
+// #1810 round 4 measured this directly: a configured Claude profile placed under
+// TMPDIR accepted WRITE_CONFIGDIR_NEWFILE. Landlock adds access and cannot
+// subtract it, so this is a precondition on where operator profiles live, not
+// something a caller can grant its way out of. This test exists so that the
+// conditionality is a measured fact rather than a comment, and so that anything
+// which changes the implicit-root set has to change a test that says why.
+func TestWritableRootsGrantImplicitTempRootsSoUnnamedPathsCanStillBeWritten(t *testing.T) {
+	workdir := t.TempDir()
+	profileUnderTemp := filepath.Join(os.TempDir(), "gitmoot-precondition-profile")
+	if err := os.MkdirAll(profileUnderTemp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(profileUnderTemp) })
+
+	withImplicit, err := writableRoots(nil, workdir, true)
+	if err != nil {
+		t.Fatalf("writableRoots with implicit roots: %v", err)
+	}
+	covered := func(roots []string, path string) bool {
+		for _, root := range roots {
+			if rel, err := filepath.Rel(root, path); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return true
+			}
+		}
+		return false
+	}
+	if !covered(withImplicit, profileUnderTemp) {
+		t.Fatalf("implicit roots %v no longer cover %q: the produce precondition documented in daemon_worker.go changed", withImplicit, profileUnderTemp)
+	}
+
+	// A read-only seat excludes the implicit roots, which is why the same path
+	// is NOT writable there. If this ever starts covering, seats lost isolation.
+	withoutImplicit, err := writableRoots(nil, workdir, false)
+	if err != nil {
+		t.Fatalf("writableRoots without implicit roots: %v", err)
+	}
+	if covered(withoutImplicit, profileUnderTemp) {
+		t.Fatalf("explicit-only roots %v unexpectedly cover %q", withoutImplicit, profileUnderTemp)
+	}
+}

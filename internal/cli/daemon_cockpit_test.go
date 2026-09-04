@@ -258,7 +258,7 @@ func TestCockpitTeeAdapterCreatesLogAndTees(t *testing.T) {
 	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard, home)
 	agent := runtime.Agent{Name: "lead", Role: "builder", Runtime: runtime.ShellRuntime, RuntimeRef: "echo streamed-line"}
 
-	adapter, logPath, logFile := worker.cockpitTeeAdapter(agent, t.TempDir(), "job-tee")
+	adapter, logPath, logFile := worker.cockpitTeeAdapter(runtime.ShellAdapter{Runner: subprocess.GroupRunner{}}, "job-tee")
 	if logFile == nil {
 		t.Fatal("expected a non-nil log file on the wrapping path")
 	}
@@ -320,8 +320,7 @@ func TestCockpitTeeAdapterTruncatesExistingLog(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	agent := runtime.Agent{Name: "lead", Role: "builder", Runtime: runtime.ShellRuntime, RuntimeRef: "true"}
-	_, _, logFile := worker.cockpitTeeAdapter(agent, t.TempDir(), "job-trunc")
+	_, _, logFile := worker.cockpitTeeAdapter(runtime.ShellAdapter{Runner: subprocess.GroupRunner{}}, "job-trunc")
 	if logFile == nil {
 		t.Fatal("expected a non-nil log file")
 	}
@@ -346,10 +345,8 @@ func TestCockpitTeeAdapterTruncatesExistingLog(t *testing.T) {
 func TestCockpitTeeAdapterDelegationJobIDFlatPath(t *testing.T) {
 	home := t.TempDir()
 	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard, home)
-	agent := runtime.Agent{Name: "lead", Role: "builder", Runtime: runtime.ShellRuntime, RuntimeRef: "true"}
-
 	jobID := "local-ask-conductor-1234/delegation/haiku-ocean"
-	adapter, logPath, logFile := worker.cockpitTeeAdapter(agent, t.TempDir(), jobID)
+	adapter, logPath, logFile := worker.cockpitTeeAdapter(runtime.ShellAdapter{Runner: subprocess.GroupRunner{}}, jobID)
 	if logFile == nil || adapter == nil {
 		t.Fatalf("expected a non-nil adapter+log file for a slashed job id; adapter=%v file=%v", adapter, logFile)
 	}
@@ -378,8 +375,7 @@ func TestCockpitTeeAdapterDelegationJobIDFlatPath(t *testing.T) {
 func TestCockpitTeeAdapterFailOpenUnsupportedRuntime(t *testing.T) {
 	home := t.TempDir()
 	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard, home)
-	agent := runtime.Agent{Name: "x", Runtime: "nope-not-a-runtime"}
-	adapter, logPath, logFile := worker.cockpitTeeAdapter(agent, t.TempDir(), "job-bad")
+	adapter, logPath, logFile := worker.cockpitTeeAdapter(cockpitStubAdapter{}, "job-bad")
 	if adapter != nil || logPath != "" || logFile != nil {
 		t.Fatalf("expected fail-open nils, got adapter=%v path=%q file=%v", adapter, logPath, logFile)
 	}
@@ -632,7 +628,8 @@ func TestCockpitSeatLogAdapterAppends(t *testing.T) {
 	}
 
 	agent := runtime.Agent{Name: "builder", Role: "builder", Runtime: runtime.ShellRuntime, RuntimeRef: "echo ROUND2"}
-	adapter, logPath, logFile := worker.cockpitSeatLogAdapter(cp, agent, t.TempDir(), "job-r2", "root-seat", "builder")
+	base := runtime.ShellAdapter{Runner: subprocess.GroupRunner{}}
+	adapter, logPath, logFile := worker.cockpitSeatLogAdapter(cp, base, "job-r2", "root-seat", "builder")
 	if logFile == nil {
 		t.Fatal("expected a non-nil seat log file")
 	}
@@ -678,8 +675,7 @@ func TestCockpitSeatLogAdapterFailOpenNoHome(t *testing.T) {
 	// An empty GITMOOT_HOME makes the cockpit's home empty, so SeatLogPath returns "".
 	t.Setenv("GITMOOT_HOME", "")
 	cp := cockpit.New(cockpit.Options{HerdrBin: "herdr-does-not-exist-for-tests", PaneKeyMode: config.CockpitPaneKeySeat}, nil)
-	agent := runtime.Agent{Name: "builder", Runtime: runtime.ShellRuntime, RuntimeRef: "true"}
-	adapter, logPath, logFile := worker.cockpitSeatLogAdapter(cp, agent, t.TempDir(), "job-x", "root-seat", "builder")
+	adapter, logPath, logFile := worker.cockpitSeatLogAdapter(cp, runtime.ShellAdapter{}, "job-x", "root-seat", "builder")
 	if adapter != nil || logPath != "" || logFile != nil {
 		t.Fatalf("expected fail-open nils with no home, got adapter=%v path=%q file=%v", adapter, logPath, logFile)
 	}
@@ -694,10 +690,9 @@ func TestCockpitLogAdapterPicksLogPerMode(t *testing.T) {
 	t.Setenv("GITMOOT_HOME", home)
 	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard, home)
 	cp := cockpit.New(cockpit.Options{HerdrBin: "herdr-does-not-exist-for-tests", PaneKeyMode: config.CockpitPaneKeySeat}, nil)
-	agent := runtime.Agent{Name: "builder", Role: "builder", Runtime: runtime.ShellRuntime, RuntimeRef: "true"}
 
 	// Job mode -> per-job log under logs/jobs.
-	_, jobLog, jobFile := worker.cockpitLogAdapter(cp, agent, t.TempDir(), "job-1", "root-1", "builder", false)
+	_, jobLog, jobFile := worker.cockpitLogAdapter(cp, runtime.ShellAdapter{}, "job-1", "root-1", "builder", false)
 	if jobFile == nil {
 		t.Fatal("job-mode log file is nil")
 	}
@@ -708,7 +703,7 @@ func TestCockpitLogAdapterPicksLogPerMode(t *testing.T) {
 	}
 
 	// Seat mode -> stable per-seat log under logs/seats/<rootShort>.
-	_, seatLog, seatFile := worker.cockpitLogAdapter(cp, agent, t.TempDir(), "job-1", "root-1", "builder", true)
+	_, seatLog, seatFile := worker.cockpitLogAdapter(cp, runtime.ShellAdapter{}, "job-1", "root-1", "builder", true)
 	if seatFile == nil {
 		t.Fatal("seat-mode log file is nil")
 	}
