@@ -274,7 +274,13 @@ func lensPrompt(lens string, event PullRequestEvent, scope *ReviewScope) string 
 // refutation, reported as `blocked`) fails the quorum and blocks the merge, while
 // unanimous approval satisfies it. Reviewers are assigned round-robin; with a
 // single configured reviewer every lens runs as a distinct job on that reviewer.
-func highRiskLensDelegations(reviewers []string, event PullRequestEvent, reviewScopes map[reviewScopeKey]*ReviewScope) []Delegation {
+// ledgerBrief is threaded in rather than fetched here because this builder is
+// pure: the #1822 obligations must reach the LENS path too, and they did not
+// (#1850 round 2 F4). Lens delegations carry Action "review", so their findings
+// ARE written to the ledger by the writer via AdvanceJob - the write half ran on
+// this path while the disclosure half did not, which is the same undischargeable
+// wedge as F1 reached by a second route.
+func highRiskLensDelegations(reviewers []string, event PullRequestEvent, reviewScopes map[reviewScopeKey]*ReviewScope, ledgerBrief string) []Delegation {
 	reviewers = compactStrings(reviewers)
 	if len(reviewers) == 0 {
 		return nil
@@ -292,7 +298,7 @@ func highRiskLensDelegations(reviewers []string, event PullRequestEvent, reviewS
 			ID:            lens,
 			Agent:         reviewer,
 			Action:        "review",
-			Prompt:        lensPrompt(lens, event, scope),
+			Prompt:        lensPrompt(lens, event, scope) + ledgerBrief,
 			ReviewScope:   scope,
 			SynthesisRule: "quorum",
 			Quorum:        quorum,

@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -98,7 +99,7 @@ func TestLedgerObligationBriefNamesEveryUIDAReviewerMustCite(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	brief := engine.ledgerObligationBrief(ctx, "gitmoot/gitmoot", 1850, headB)
+	brief := engine.ledgerObligationBrief(ctx, "gitmoot/gitmoot", 1850, headB, "task-9")
 	if !strings.Contains(brief, uid) {
 		t.Fatalf("the brief does not name uid %q, so no reviewer can discharge it: %q", uid, brief)
 	}
@@ -106,7 +107,7 @@ func TestLedgerObligationBriefNamesEveryUIDAReviewerMustCite(t *testing.T) {
 		t.Fatal("the brief does not tell the reviewer HOW to continue a prior finding")
 	}
 	// A PR with no ledger history must produce a byte-identical default brief.
-	if empty := engine.ledgerObligationBrief(ctx, "gitmoot/gitmoot", 9999, headB); empty != "" {
+	if empty := engine.ledgerObligationBrief(ctx, "gitmoot/gitmoot", 9999, headB, "task-9"); empty != "" {
 		t.Fatalf("brief for a PR with no ledger = %q, want empty", empty)
 	}
 	// And once observed here, the brief stops asking.
@@ -117,7 +118,183 @@ func TestLedgerObligationBriefNamesEveryUIDAReviewerMustCite(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("observe: %v", err)
 	}
-	if again := engine.ledgerObligationBrief(ctx, "gitmoot/gitmoot", 1850, headB); again != "" {
+	if again := engine.ledgerObligationBrief(ctx, "gitmoot/gitmoot", 1850, headB, "task-9"); again != "" {
 		t.Fatalf("brief still asks for an observed finding: %q", again)
+	}
+}
+
+// THE ARM I PUBLISHED AS UNTESTABLE, AND I WAS WRONG. I grepped for
+// `type Store interface`, found zero, and concluded no injection point existed.
+// The repo's actual idiom is a SQL TRIGGER, used in at least six places
+// including merge_gate_test.go in this very package. I measured for a Go seam
+// and reported the absence of one as the absence of any, which is the
+// convenient-zero class this whole campaign has been about.
+//
+// THE PROPERTY: a failure to write the closing AUDIT event must NOT fail the
+// review advance. Before the fix the writer returned that error and AdvanceJob
+// propagated it, so a transient 'database is locked' on an audit row would have
+// discarded a REAL VERDICT. SQLITE_BUSY is measured reality on this box
+// (directive 117187). Reverting `_ =` to `return` there makes this fail.
+func TestAdvanceJobSurvivesAFailedLedgerAuditEvent(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "gm-review-opus", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	head := strings.Repeat("e", 40)
+
+	insertCompletedJob(t, store, db.Job{ID: "review-audit", Agent: "gm-review-opus", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-9", PullRequest: 1851, HeadSHA: head,
+		TaskID: "task-9", ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "changes_requested", Severity: "P1", Summary: "one defect",
+			TestsRun: []string{"go test ./internal/workflow/ -> ok"},
+			Findings: []json.RawMessage{json.RawMessage(`{"id":"F1","severity":"P1","file":"internal/run.go","title":"a defect"}`)},
+		},
+	})
+
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("open raw database: %v", err)
+	}
+	defer raw.Close()
+	// Abort ONLY the ledger's audit event, so the observation write is untouched
+	// and the failure is attributable to the audit path alone.
+	if _, err := raw.ExecContext(ctx, `
+CREATE TRIGGER fail_findings_ledger_audit_event
+BEFORE INSERT ON job_events
+WHEN NEW.kind = 'findings_ledger_recorded'
+BEGIN
+	SELECT RAISE(ABORT, 'forced findings ledger audit failure');
+END`); err != nil {
+		t.Fatalf("create audit failure trigger: %v", err)
+	}
+
+	// POSITIVE CONTROL: prove the trigger fires, or this test pins nothing.
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: "review-audit", Kind: "findings_ledger_recorded", Message: "control"}); err == nil {
+		t.Fatal("the trigger did not fire, so this test cannot discriminate")
+	}
+
+	if err := engine.AdvanceJob(ctx, "review-audit"); err != nil {
+		t.Fatalf("a failed AUDIT event failed the whole review advance, discarding a real verdict: %v", err)
+	}
+	observations, err := store.ListReviewFindingObservations(ctx, "gitmoot/gitmoot", 1851)
+	if err != nil {
+		t.Fatalf("list observations: %v", err)
+	}
+	if len(observations) != 1 {
+		t.Fatalf("ledger holds %d observation(s); the finding was lost with the audit row", len(observations))
+	}
+	if observations[0].HeadSHA != head {
+		t.Fatalf("observation head = %q, want %q", observations[0].HeadSHA, head)
+	}
+}
+
+// #1850 round 2 F1, P1, THE WEDGE. The brief and the gate must compute the SAME
+// obligation set. My first version passed LedgerScope{} to the brief while the
+// gate passed a populated scope, so the gate demanded two classes the brief
+// could not disclose - answered findings re-armed by relevance, and answered
+// findings whose STATIC locator had gone - and neither was dischargeable,
+// because a uid can only be cited by a reviewer that was told it. The reviewer
+// reproduced it end to end through a full round-3 review (ADV-1, ADV-2).
+//
+// THIS TEST USES THE ANSWERED-PLUS-RELEVANCE CLASS DELIBERATELY, because the
+// open case is the one class where the two agreed, which is exactly why my
+// earlier brief test passed while the wedge was live.
+func TestLedgerBriefSetEqualsGateSet(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	h1, h2, h3 := strings.Repeat("1", 40), strings.Repeat("2", 40), strings.Repeat("3", 40)
+	uid, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
+		Repo: "gitmoot/gitmoot", PullRequest: 1850, HeadSHA: h1, ObserverJob: "review-1",
+		State: db.FindingOpen, Severity: "P1", RoundLabel: "F-1", Title: "the defect",
+		File: "internal/workflow/findings_ledger.go", RelevanceKeys: []string{"internal/workflow"},
+		EvidenceKind: db.EvidenceExecuted, ExecutedCommands: []string{"go test -> FAIL"}, ExecutedCount: 1,
+	})
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
+		Repo: "gitmoot/gitmoot", PullRequest: 1850, HeadSHA: h2, ObserverJob: "review-2",
+		ContinuesUID: uid, State: db.FindingAnswered, Severity: "P1", Title: "the defect",
+		File: "internal/workflow/findings_ledger.go", RelevanceKeys: []string{"internal/workflow"},
+		EvidenceKind: db.EvidenceExecuted, ExecutedCommands: []string{"go test -> ok"}, ExecutedCount: 1,
+	}); err != nil {
+		t.Fatalf("answer: %v", err)
+	}
+
+	engine := testEngine(store)
+	engine.ReviewChangedFiles = func(context.Context, string, int, string, string) ([]string, error) {
+		return []string{"internal/workflow/findings_ledger.go"}, nil
+	}
+	gate := PolicyMergeGate{Store: store, ChangedFilesSince: engine.ReviewChangedFiles}
+
+	gateErr := EnsureLedgerObligationsObserved(ctx, store, "gitmoot/gitmoot", 1850, h3,
+		gate.ledgerScope(MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 1850, TaskID: "task-9"}))
+	if gateErr == nil {
+		t.Fatal("the gate accepted an answered finding whose relevance key the diff touches, so this test cannot discriminate")
+	}
+	if !strings.Contains(gateErr.Error(), uid) {
+		t.Fatalf("gate refusal does not name %s: %v", uid, gateErr)
+	}
+
+	brief := engine.ledgerObligationBrief(ctx, "gitmoot/gitmoot", 1850, h3, "task-9")
+	if !strings.Contains(brief, uid) {
+		t.Fatalf("THE WEDGE: the gate demands %s and the brief does not disclose it, so no reviewer can ever discharge it.\nbrief=%q", uid, brief)
+	}
+}
+
+// #1850 round 2 F7, ADV-8. A reviewer whose round was superseded WHILE STILL
+// RUNNING found a real defect at a real head. Dropping it was completely
+// silent: no ledger row, no event of any kind, and the stale verdict is
+// discarded too, so the finding was unrecoverable. This is the case where a
+// later round most needs the reminder.
+//
+// THE SAFETY PROPERTY IS ASSERTED TOO: the stale observation is keyed by the
+// STALE round's own head, so it must NOT discharge anything at the current head.
+func TestAdvanceJobPreservesASupersededRoundsFindings(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "gm-review-opus", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	h1, h2 := strings.Repeat("7", 40), strings.Repeat("8", 40)
+
+	// Round 2 lands first and is the latest round for this PR.
+	insertCompletedJob(t, store, db.Job{ID: "review-round2", Agent: "gm-review-opus", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-9", PullRequest: 1860, HeadSHA: h2,
+		TaskID: "task-9", ReviewRound: "review-2",
+		Result: &AgentResult{Decision: "approved", Summary: "clean", TestsRun: []string{"go test -> ok"}},
+	})
+	// The slow round-1 reviewer then finishes at the OLDER head with a real P1.
+	insertCompletedJob(t, store, db.Job{ID: "review-round1", Agent: "gm-review-opus", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-9", PullRequest: 1860, HeadSHA: h1,
+		TaskID: "task-9", ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "changes_requested", Severity: "P1", Summary: "data loss on merge",
+			TestsRun: []string{"go test ./internal/ -> FAIL"},
+			Findings: []json.RawMessage{json.RawMessage(`{"id":"F1","severity":"P1","file":"internal/run.go","title":"data loss on merge"}`)},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "review-round1"); err != nil {
+		t.Fatalf("AdvanceJob on a superseded round: %v", err)
+	}
+
+	observations, err := store.ListReviewFindingObservations(ctx, "gitmoot/gitmoot", 1860)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(observations) != 1 {
+		t.Fatalf("ledger holds %d observation(s); a superseded round's REAL P1 was dropped silently", len(observations))
+	}
+	if observations[0].HeadSHA != h1 {
+		t.Fatalf("stale observation recorded at %q, want the stale round's own head %q", observations[0].HeadSHA, h1)
+	}
+	if countJobEvents(t, store, "review-round1", "findings_ledger_recorded") != 1 {
+		t.Fatal("no durable accounting event for the superseded round's findings")
+	}
+	// SAFETY: keyed by the stale head, it cannot have discharged the current one,
+	// so a verdict at h2 is still blocked by the open finding.
+	if err := EnsureLedgerObligationsObserved(ctx, store, "gitmoot/gitmoot", 1860, h2, LedgerScope{}); err == nil {
+		t.Fatal("the stale round's observation discharged the obligation at the CURRENT head")
 	}
 }

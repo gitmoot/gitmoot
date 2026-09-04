@@ -602,6 +602,22 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			return err
 		}
 		if latest != "" && strings.TrimSpace(payload.ReviewRound) != latest {
+			// #1850 round 2 F7. A reviewer whose round was superseded WHILE STILL
+			// RUNNING found a real defect at a real head, and a later round label
+			// does not make that defect untrue. Dropping it here was silent: no
+			// ledger row, no recorded event, and the stale verdict is discarded
+			// too, so the finding was unrecoverable - which contradicts this
+			// writer's own doctrine that a silent skip is indistinguishable from a
+			// successful write, and loses exactly the finding a later round most
+			// needs reminding of.
+			//
+			// The observations are keyed by the STALE round's own head, so they
+			// can never discharge anything at the current head, and this runs
+			// AFTER effectiveDecision is computed and BEFORE any state change, so
+			// a stale round still cannot influence the decision.
+			if err := e.RecordReviewFindingsToLedger(ctx, job, payload); err != nil {
+				return err
+			}
 			return nil
 		}
 		// Pipeline-sender reviews already returned above as report-only, so this is

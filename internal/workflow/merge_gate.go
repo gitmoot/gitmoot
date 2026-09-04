@@ -255,14 +255,17 @@ type workflowAwareGitHub interface {
 	WorkflowsExistAtRef(ctx context.Context, repo github.Repository, ref string) (bool, error)
 }
 
-// ledgerScope adapts the gate's optional resolvers into the ledger's scope,
-// binding the repo and PR number the ledger does not carry.
+// ledgerScope builds the ledger scope for the gate. It is the SAME shape the
+// review brief uses via Engine.LedgerScopeFor, and that is load-bearing: when
+// the brief and the gate computed different scopes, the gate demanded two
+// classes of obligation the brief could not disclose and the merge wedged
+// permanently (#1850 round 2 F1). TestLedgerBriefSetEqualsGateSet pins the
+// equality; this comment is not the guarantee.
 //
 // IT PASSES DATA, NEVER A STORE CALL. TestMergeGateStoreAccessSurface pins the
 // gate's *db.Store surface as a firewall between merge authority and
 // display-only evidence, and recording a degradation note is not worth widening
-// it. So the TaskID travels in the scope and the ledger does the writing with
-// the store it already holds.
+// it, so the TaskID travels in the scope and the ledger does the writing.
 func (g PolicyMergeGate) ledgerScope(request MergeRequest) LedgerScope {
 	scope := LedgerScope{
 		PathExistsAtHead: g.PathExistsAtHead,

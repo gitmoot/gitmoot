@@ -144,7 +144,12 @@ func TestMigrationsUpgradeFromPreviousReleasedVersion(t *testing.T) {
 	// deployed database sees, which is why this marker MUST be repointed on every
 	// branch that appends a migration, and why the failure reads as "not appended
 	// last" rather than as a merge conflict.
-	const branchMigrationMarker = "CREATE TABLE review_finding_observations"
+	// The marker must name THIS BRANCH'S LAST migration and must be UNIQUE. The
+	// #1850 round 2 F3 fix appends a rebuild of review_finding_observations, so
+	// the bare CREATE string now matches TWO migrations (the original additive one
+	// and the rebuild) and this test correctly refused it as ambiguous. The
+	// rebuild's own table name is unique to it.
+	const branchMigrationMarker = "review_finding_observations_1850 RENAME TO"
 	branchIndex := -1
 	for index, migration := range migrations {
 		if strings.Contains(migration, branchMigrationMarker) {

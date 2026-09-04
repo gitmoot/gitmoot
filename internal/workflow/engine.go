@@ -311,6 +311,12 @@ type Engine struct {
 	// wired only in cli (a GitHub read), keeping the engine free of the github
 	// client coupling.
 	PullRequestSignals func(ctx context.Context, repo string, number int) (labels []string, changedPaths []string, err error)
+	// LedgerPathExists resolves whether a repo-relative path exists at a head, so
+	// the #1822 ledger can tell a STATIC answer whose cited file has been deleted
+	// from one that still stands. It is the SAME resolver the merge gate uses; the
+	// review brief and the gate must not compute different obligation sets
+	// (#1850 round 2 F1). Nil skips the existence half and records a degradation.
+	LedgerPathExists func(ctx context.Context, head string, path string) (bool, error)
 	// ReviewChangedFiles resolves the repository-relative files changed from the
 	// exact head a reviewer last saw to the current PR head. A scoped follow-up
 	// never degrades SILENTLY: when this seam is unavailable or cannot scope the

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -120,14 +121,58 @@ var (
 var (
 	headSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 	locatorPattern = regexp.MustCompile(`^[A-Za-z0-9_./-]+(:[0-9]+)?$`)
-	// relevanceKeyPattern admits only PATH-LIKE keys, because the matcher compares
-	// keys against changed PATHS and nothing resolves a symbol to the file that
-	// defines it. Accepting "EnsureLedgerObligationsObserved" would store a key
-	// that can never match, so a reviewer naming a symbol would get no protection
-	// AND no warning (#1850 review F7). A refusal at the boundary is the loud
-	// version of that, and it is the same place locatorPattern already lives.
+	// relevanceKeyPattern is the CHARACTER-level gate only. Path-likeness is
+	// decided by pathLikeRelevanceKey below, because a regexp over this character
+	// class cannot express it: my previous version WAS this pattern alone, and a
+	// bare Go identifier is entirely inside [A-Za-z0-9_.-]+, so it matched and was
+	// accepted. The comment claimed the opposite and its test passed only because
+	// its fixture carried parentheses, dying on punctuation rather than on
+	// symbol-ness (#1850 round 2 F6, the fourteenth mutant the reviewer built).
 	relevanceKeyPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*/?$`)
 )
+
+// pathLikeRelevanceKey reports whether a key can ever match a CHANGED PATH,
+// which is the only thing relevanceTouched compares against.
+//
+// WHAT IT REFUSES AND WHY EACH ONE CAN NEVER MATCH:
+//   - a bare identifier ("EnsureLedgerObligationsObserved"): no diff path is a
+//     bare symbol, and nothing here resolves a symbol to its defining file.
+//   - a Go package or URL path ("github.com/gitmoot/gitmoot/internal/db"): diff
+//     paths are repo-relative, so a first segment that looks like a hostname
+//     can never be the head of one.
+//   - an absolute path or one containing "..": not repo-relative.
+//
+// A single-segment key with an extension ("AGENTS.md") is a FILE and is
+// accepted. A multi-segment key without a dotted first segment
+// ("internal/db") is a DIRECTORY and is accepted.
+func pathLikeRelevanceKey(key string) bool {
+	key = strings.TrimSpace(key)
+	// A TRAILING SLASH IS AN EXPLICIT DIRECTORY and needs no extension: "docs/"
+	// is a legitimate key and my first version rejected it, because trimming the
+	// slash turned it into the bare identifier "docs". Measured before shipping.
+	explicitDir := strings.HasSuffix(key, "/")
+	key = strings.TrimSuffix(key, "/")
+	if key == "" || strings.HasPrefix(key, "/") {
+		return false
+	}
+	for _, segment := range strings.Split(key, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+	}
+	first, _, hasSlash := strings.Cut(key, "/")
+	if !hasSlash {
+		if explicitDir {
+			return true
+		}
+		// One segment: it must name a file, so it must carry an extension.
+		// Rejecting a bare identifier here is the whole point.
+		dot := strings.LastIndex(first, ".")
+		return dot > 0 && dot < len(first)-1
+	}
+	// Multi-segment: a dotted FIRST segment reads as a host or module path.
+	return !strings.Contains(first, ".")
+}
 
 // RecordReviewFindingObservation validates at the STORE BOUNDARY and inserts.
 // Every rejection here is a refusal, never a warning: a warning on a write path
@@ -197,14 +242,31 @@ func (s *Store) RecordReviewFindingObservation(ctx context.Context, obs ReviewFi
 	}
 
 	// KEYS ARE VALIDATED BEFORE THE TRANSACTION so a bad key costs no write lock.
-	// normaliseKeys seeds from File, so the seed is checked too: a finding whose
-	// own file is not path-like would otherwise smuggle in an unmatchable key.
-	normalised := normaliseKeys(obs.RelevanceKeys, obs.File)
-	for _, key := range normalised {
-		if !relevanceKeyPattern.MatchString(key) {
+	//
+	// ASSERTED KEYS ARE REFUSED; DERIVED KEYS ARE SANITISED. That asymmetry is the
+	// #1850 round 2 F5 fix and it is proportionality, not laxity: a key the
+	// REVIEWER supplied that can never match is a mistake it needs told about,
+	// but the File-derived seed is a convenience THIS STORE synthesised, and
+	// rejecting a whole observation over the store's own derived key is how a P1
+	// finding got dropped for reporting "file": "internal/run.go:800" - the
+	// file:line convention this repo asks reviewers to use.
+	for _, key := range obs.RelevanceKeys {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if !relevanceKeyPattern.MatchString(key) || !pathLikeRelevanceKey(key) {
 			return "", fmt.Errorf("%w: got %q", ErrFindingRelevanceKey, key)
 		}
 	}
+	normalised := normaliseKeys(obs.RelevanceKeys, obs.File)
+	kept := make([]string, 0, len(normalised))
+	for _, key := range normalised {
+		if relevanceKeyPattern.MatchString(key) && pathLikeRelevanceKey(key) {
+			kept = append(kept, key)
+		}
+	}
+	normalised = kept
 
 	// THE MINT MUST BE ATOMIC WITH THE INSERT (#1850 review F2, P1). The previous
 	// version read COUNT(DISTINCT finding_uid) and then inserted as two separate
@@ -298,9 +360,15 @@ VALUES (?, ?, ?, ?, COALESCE(NULLIF(?, ''), strftime('%Y-%m-%dT%H:%M:%fZ','now')
 // empty by accident, while leaving the reviewer free to widen it. The seed is a
 // floor, not the boundary: see the RelevanceKeys comment.
 func normaliseKeys(keys []string, file string) []string {
+	out := make([]string, 0, len(keys)+1)
 	seen := map[string]bool{}
-	out := []string{}
-	for _, key := range append(append([]string{}, keys...), strings.TrimSpace(file)) {
+	// A file:line value is SPLIT before seeding (#1850 round 2 F5). The repo's own
+	// per-finding convention is "path:line", so seeding it verbatim produced a key
+	// carrying a colon, which no changed path ever has.
+	if path, _, ok := splitPathLine(file); ok {
+		file = path
+	}
+	for _, key := range append([]string{}, append(keys, file)...) {
 		key = strings.TrimSpace(key)
 		if key == "" || seen[key] {
 			continue
@@ -309,6 +377,25 @@ func normaliseKeys(keys []string, file string) []string {
 		out = append(out, key)
 	}
 	return out
+}
+
+// splitPathLine separates "path" or "path:line" into its parts. It is the store
+// side of the same split findings_ledger.splitLocator performs on evidence
+// locators, and it exists here so a seeded key never carries a colon.
+func splitPathLine(value string) (string, int, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", 0, false
+	}
+	path, lineText, found := strings.Cut(value, ":")
+	if !found {
+		return value, 0, true
+	}
+	line, err := strconv.Atoi(strings.TrimSpace(lineText))
+	if err != nil || line < 0 {
+		return value, 0, true
+	}
+	return path, line, true
 }
 
 // ListReviewFindingObservations returns every observation for a PR in INSERTION

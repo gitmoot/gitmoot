@@ -80,3 +80,131 @@ func TestReviewFindingListReportsCorruptRelevanceKeys(t *testing.T) {
 		t.Fatalf("error does not name the corrupt column: %v", err)
 	}
 }
+
+// #1850 round 2 F3, ADV-11: THE UPGRADE PROOF FROM A PRE-FIX DATABASE.
+//
+// The prior head fixed the PK and the CHECK by EDITING the applied #1822
+// migration. Migrate iterates positionally and skips versions already in
+// schema_migrations, so every database that ran the prior head kept the pre-fix
+// table forever - the fixes reached only databases created afterwards. This test
+// reconstructs exactly that state and proves the appended rebuild upgrades it.
+//
+// IT ASSERTS ITS OWN PREMISE FIRST: the pre-fix table really does accept a
+// non-hex head and really does reject a second observer, so a later PASS cannot
+// come from a fixture that was already correct.
+func TestReviewFindingRebuildUpgradesAPreFixDatabase(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "prefix.db")
+	store, err := openCachedTestStore(t, path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	// Recreate the PRE-FIX shape, leaving every migration version recorded as
+	// applied, which is precisely the state a developer daemon is in.
+	for _, statement := range []string{
+		`DROP TABLE review_finding_observations`,
+		`CREATE TABLE review_finding_observations (
+			finding_uid TEXT NOT NULL,
+			repo TEXT NOT NULL,
+			pull_request INTEGER NOT NULL DEFAULT 0,
+			head_sha TEXT NOT NULL CHECK(length(head_sha) = 40 AND head_sha GLOB '[0-9a-f]*'),
+			observed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+			observer_job TEXT NOT NULL DEFAULT '',
+			state TEXT NOT NULL CHECK(state IN ('open','answered','withdrawn','superseded')),
+			severity TEXT NOT NULL DEFAULT '',
+			round_label TEXT NOT NULL DEFAULT '',
+			label_absent INTEGER NOT NULL DEFAULT 0,
+			title TEXT NOT NULL DEFAULT '',
+			detail TEXT NOT NULL DEFAULT '',
+			file TEXT NOT NULL DEFAULT '',
+			line INTEGER NOT NULL DEFAULT 0,
+			relevance_keys TEXT NOT NULL DEFAULT '[]',
+			evidence_kind TEXT NOT NULL CHECK(evidence_kind IN ('EXECUTED','STATIC','QUOTED')),
+			executed_commands TEXT NOT NULL DEFAULT '[]',
+			executed_count INTEGER NOT NULL DEFAULT 0,
+			evidence_locator TEXT NOT NULL DEFAULT '',
+			rationale TEXT NOT NULL DEFAULT '',
+			source_job TEXT NOT NULL DEFAULT '',
+			withdraw_reason TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (finding_uid, head_sha)
+		)`,
+	} {
+		if _, err := store.db.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("recreate pre-fix table: %v", err)
+		}
+	}
+	// A DAEMON ON THE PRIOR HEAD HAS APPLIED EVERY VERSION EXCEPT THE NEWEST, so
+	// the fixture must remove the rebuild's bookkeeping row. Without this the
+	// cached template has ALL versions recorded, Migrate finds nothing to do, and
+	// the test fails for a fixture reason rather than a code one - which is
+	// exactly how it failed on its first run, and why the premise assertions
+	// above matter more than the verdict below.
+	var applied int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&applied); err != nil {
+		t.Fatalf("count applied migrations: %v", err)
+	}
+	if applied != len(migrations) {
+		t.Fatalf("fixture holds %d applied migrations for %d defined; the template is not fully migrated", applied, len(migrations))
+	}
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version = ?`, len(migrations)); err != nil {
+		t.Fatalf("un-apply the newest migration: %v", err)
+	}
+	insert := `INSERT INTO review_finding_observations(
+		finding_uid, repo, pull_request, head_sha, observer_job, state, evidence_kind)
+		VALUES (?, 'owner/repo', 7, ?, ?, 'open', 'EXECUTED')`
+	nonHex := "a" + strings.Repeat("Z", 39)
+
+	// PREMISE 1: the pre-fix CHECK accepts a non-hex head.
+	if _, err := store.db.ExecContext(ctx, insert, "uid-prefix", nonHex, "observer-a"); err != nil {
+		t.Fatalf("premise failed: the pre-fix CHECK already rejected %q, so this fixture is not pre-fix: %v", nonHex, err)
+	}
+	// PREMISE 2: the pre-fix key rejects a SECOND observer at one head.
+	realHead := strings.Repeat("abcdef0123", 4)
+	if _, err := store.db.ExecContext(ctx, insert, "uid-two", realHead, "observer-a"); err != nil {
+		t.Fatalf("seed first observer: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, insert, "uid-two", realHead, "observer-b"); err == nil {
+		t.Fatal("premise failed: the pre-fix key already admitted a second observer, so this fixture is not pre-fix")
+	}
+
+	// Carry one row across the rebuild to prove the copy is not lossy.
+	rowsBefore := reviewFindingRowCount(t, store)
+
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate on a pre-fix database: %v", err)
+	}
+
+	// ACCOUNT FOR THE COPY IMMEDIATELY, before the post-upgrade probes below add
+	// rows of their own. My first attempt counted after them and mis-stated the
+	// arithmetic, which is a test bug that would have read as a lossy copy.
+	if got, want := reviewFindingRowCount(t, store), rowsBefore-1; got != want {
+		t.Fatalf("row count = %d after the rebuild, want %d (%d before, minus the one non-hex row the new CHECK cannot hold)", got, want, rowsBefore)
+	}
+	var survivingJunk int
+	if err := store.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM review_finding_observations WHERE head_sha = ?`, nonHex).Scan(&survivingJunk); err != nil {
+		t.Fatalf("count junk rows: %v", err)
+	}
+	if survivingJunk != 0 {
+		t.Fatalf("%d non-conforming row(s) survived a CHECK that forbids them", survivingJunk)
+	}
+
+	// AFTER: the CHECK covers all forty characters.
+	if _, err := store.db.ExecContext(ctx, insert, "uid-after", nonHex, "observer-a"); err == nil {
+		t.Fatalf("after upgrade the CHECK still accepted %q, so F9 did not reach this database", nonHex)
+	}
+	// AFTER: a second observer at one head is admitted.
+	if _, err := store.db.ExecContext(ctx, insert, "uid-two", realHead, "observer-b"); err != nil {
+		t.Fatalf("after upgrade a second observer was still rejected, so F8 did not reach this database: %v", err)
+	}
+}
+
+func reviewFindingRowCount(t *testing.T, store *Store) int {
+	t.Helper()
+	var n int
+	if err := store.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM review_finding_observations`).Scan(&n); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	return n
+}

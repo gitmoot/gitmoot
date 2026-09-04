@@ -49,13 +49,42 @@ type reviewFindingWire struct {
 	Locator        string   `json:"evidence_locator"`
 	Rationale      string   `json:"rationale"`
 	WithdrawReason string   `json:"withdraw_reason"`
+	// Evidence is the REFUTATION-LENS finding shape (risk.go): a lens emits
+	// {lens,refuted,severity,confidence,evidence:"file:line - why"} and NO file
+	// field, so before this the key set came out EMPTY and such a finding could
+	// never be re-armed by relevance once answered (#1850 round 2 F4).
+	Evidence string `json:"evidence"`
+	Lens     string `json:"lens"`
+}
+
+// pathFromLensEvidence extracts the leading repo-relative path from a lens
+// evidence string of the form "file:line - why". It returns "" when the value
+// does not begin with something path-shaped, because inventing a key is worse
+// than having none: a wrong key re-arms the wrong finding.
+func pathFromLensEvidence(evidence string) string {
+	evidence = strings.TrimSpace(evidence)
+	if evidence == "" {
+		return ""
+	}
+	head := strings.Fields(evidence)[0]
+	head = strings.TrimSuffix(strings.TrimSpace(head), ",")
+	path, _, _ := strings.Cut(head, ":")
+	path = strings.TrimSpace(path)
+	if path == "" || !strings.Contains(path, "/") && !strings.Contains(path, ".") {
+		return ""
+	}
+	return path
 }
 
 // RecordReviewFindingsToLedger writes one observation per reported finding at the
-// review's exact head. It is best-effort PER FINDING and never fails the review:
-// a review that produced a real verdict must not be discarded because a ledger
-// row would not serialise. Every skip is recorded as a job event, because a
-// silent skip on a write path is indistinguishable from a successful write.
+// review's exact head.
+//
+// IT NEVER FAILS THE REVIEW, and that is now true of every path rather than of
+// most of them: a review that produced a real verdict must not be discarded
+// because a ledger row would not serialise. Per-finding failures are recorded
+// as job events and skipped, because a silent skip on a write path is
+// indistinguishable from a successful write. The closing summary event is
+// likewise best-effort - see the comment at its call.
 func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, payload JobPayload) error {
 	if e.Store == nil || payload.Result == nil || job.Type != "review" {
 		return nil
@@ -93,12 +122,27 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 		}
 		written++
 	}
-	return e.Store.AddJobEvent(ctx, db.JobEvent{
+	// THE SUMMARY EVENT IS BEST-EFFORT AND ITS FAILURE MUST NOT FAIL THE REVIEW.
+	// Returning it would hand AdvanceJob an error, and AdvanceJob's caller treats
+	// that as a failed advance - so a TRANSIENT 'database is locked' on an AUDIT
+	// write would discard a real verdict. SQLITE_BUSY is not hypothetical on this
+	// box: it was measured killing workflow-note writes the same day this was
+	// written. The durable evidence does not depend on this row anyway: the
+	// observations are already committed in the ledger, and every skip already
+	// recorded its own event.
+	//
+	// I found this by applying directive 117383 to my own change: its doc comment
+	// claimed the function "never fails the review" while this line could. That
+	// is the same defect class the directive describes - a stale premise one line
+	// above the code that violates it - so the fix is BOTH the code and the
+	// sentence, not either alone.
+	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
 		JobID: job.ID,
 		Kind:  "findings_ledger_recorded",
 		Message: fmt.Sprintf("recorded %d of %d reported finding(s) to the #1822 ledger at head %s (%d skipped)",
 			written, len(payload.Result.Findings), head, skipped),
 	})
+	return nil
 }
 
 // ledgerObservationFor builds the observation, choosing the evidence kind from
@@ -113,7 +157,7 @@ func (e Engine) ledgerObservationFor(job db.Job, payload JobPayload, wire review
 		RoundLabel:     strings.TrimSpace(wire.ID),
 		Title:          strings.TrimSpace(wire.Title),
 		Detail:         strings.TrimSpace(wire.Detail),
-		File:           strings.TrimSpace(wire.File),
+		File:           firstNonEmptyLedgerText(strings.TrimSpace(wire.File), pathFromLensEvidence(wire.Evidence)),
 		Line:           int64(wire.Line),
 		RelevanceKeys:  wire.RelevanceKeys,
 		ContinuesUID:   strings.TrimSpace(wire.ContinuesUID),
@@ -194,9 +238,25 @@ func (e Engine) recordLedgerSkip(ctx context.Context, jobID string, index int, r
 // GATE FROM REJECTING VALID INPUT: an obligation can only be discharged by
 // citing a uid, and a uid is only obtainable by being told it.
 //
+// IT MUST BE COMPUTED WITH THE SAME SCOPE THE GATE USES, and my first version
+// was not (#1850 round 2 F1, P1). It passed LedgerScope{}, so with both
+// resolvers nil the answered arms degraded to not-mandatory and the brief listed
+// ONLY findings whose latest state was open. The gate, using a POPULATED scope,
+// additionally demanded answered findings whose relevance keys a later diff
+// touched and answered findings whose STATIC locator had gone. Those two classes
+// were mandatory to the gate and INVISIBLE to the brief, so no reviewer could
+// ever discharge them: a permanent, undischargeable merge wedge, reproduced end
+// to end by the reviewer through a full round-3 review.
+//
+// THE DIVERGENCE IS NOW STRUCTURAL RATHER THAN DISCIPLINED: both callers build
+// their scope from the same engine seams, and TestLedgerBriefSetEqualsGateSet
+// pins set equality under a POPULATED scope. My earlier test exercised only the
+// open case, which is the one class where the two agree - a test that passed for
+// a reason other than the property it named.
+//
 // It returns "" when there is nothing to say, so the default review brief is
 // byte-identical on a PR with no ledger history.
-func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequest int, head string) string {
+func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequest int, head string, taskID string) string {
 	if e.Store == nil || pullRequest <= 0 || strings.TrimSpace(head) == "" {
 		return ""
 	}
@@ -204,7 +264,7 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 	if err != nil || len(observations) == 0 {
 		return ""
 	}
-	pending := LedgerObligationsAtHead(ctx, observations, head, LedgerScope{})
+	pending := LedgerObligationsAtHead(ctx, observations, head, e.LedgerScopeFor(repo, pullRequest, taskID))
 	if len(pending) == 0 {
 		return ""
 	}
@@ -214,7 +274,7 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 	b.WriteString("until every one carries an observation here, so silence is not an answer. To continue a prior\n")
 	b.WriteString("finding, emit a finding object citing its uid as \"continues_uid\" - typing its old label is naming,\n")
 	b.WriteString("not reference, and mints a NEW finding instead. Set \"state\": \"answered\" only if you CHECKED it at\n")
-	b.WriteString("this head, and say what you ran; \"withdrawn\" requires \"withdraw_reason\".\n")
+	b.WriteString("this head, and say what you ran; \"withdrawn\" requires \"withdraw_reason\" and is refused without one.\n")
 	for _, obligation := range pending {
 		label := obligation.RoundLabel
 		if strings.TrimSpace(label) == "" {
@@ -224,4 +284,17 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 			obligation.FindingUID, label, obligation.Severity, obligation.Reason, obligation.Title))
 	}
 	return b.String()
+}
+
+// LedgerScopeFor builds the ledger scope from the engine's own seams. It is the
+// SINGLE construction both the review brief and the merge gate use, so the two
+// cannot compute different obligation sets (#1850 round 2 F1).
+func (e Engine) LedgerScopeFor(repo string, pullRequest int, taskID string) LedgerScope {
+	scope := LedgerScope{TaskID: taskID, PathExistsAtHead: e.LedgerPathExists}
+	if e.ReviewChangedFiles != nil {
+		scope.ChangedSince = func(ctx context.Context, previousHead string, currentHead string) ([]string, error) {
+			return e.ReviewChangedFiles(ctx, repo, pullRequest, previousHead, currentHead)
+		}
+	}
+	return scope
 }

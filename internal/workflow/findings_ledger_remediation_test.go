@@ -288,3 +288,79 @@ func TestLedgerQuotedMentionDoesNotReopenAnAnsweredFinding(t *testing.T) {
 		t.Fatalf("a quoted mention reopened an answered finding: %v", err)
 	}
 }
+
+// #1850 round 2 F6, ADV-6, WITH ITS FIVE-SYMBOL CONTROL SET rather than the one
+// parenthesised fixture. My previous guard's pattern accepted every bare Go
+// identifier: the test passed because its fixture carried "()" and died on
+// punctuation, not on symbol-ness. The reviewer built that as the fourteenth
+// mutant. This is the same test re-fixtured on the shape it names.
+func TestLedgerRefusesSymbolKeysAndAcceptsRealPaths(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	head := strings.Repeat("a", 40)
+	record := func(key string) error {
+		_, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
+			Repo: "owner/repo", PullRequest: 7, HeadSHA: head, ObserverJob: "review-" + key,
+			State: db.FindingOpen, Title: "t", File: "internal/run.go",
+			RelevanceKeys: []string{key},
+			EvidenceKind:  db.EvidenceExecuted, ExecutedCommands: []string{"probe"}, ExecutedCount: 1,
+		})
+		return err
+	}
+	// THE FIVE SYMBOLS FROM ADV-6, none parenthesised.
+	for _, symbol := range []string{
+		"EnsureLedgerObligationsObserved",
+		"LedgerScope",
+		"AdvanceJob",
+		"RecordReviewFindingObservation",
+		"relevanceTouched",
+	} {
+		if err := record(symbol); !errors.Is(err, db.ErrFindingRelevanceKey) {
+			t.Fatalf("bare symbol key %q was accepted (err=%v); it can never match a changed path", symbol, err)
+		}
+	}
+	// A Go package path can never head a repo-relative diff path either.
+	if err := record("github.com/gitmoot/gitmoot/internal/db"); !errors.Is(err, db.ErrFindingRelevanceKey) {
+		t.Fatalf("a Go package path was accepted: %v", err)
+	}
+	// AND THE PASSING CONTROL SET, so the guard cannot be satisfied by refusing
+	// everything: each of these is a real repo path shape.
+	for _, path := range []string{"internal/run.go", "internal/db", "AGENTS.md", "docs/"} {
+		if err := record(path); err != nil {
+			t.Fatalf("legitimate path key %q was refused: %v", path, err)
+		}
+	}
+}
+
+// #1850 round 2 F5, ADV-3. The repo's documented per-finding convention is
+// "path:line", and a reviewer using it in the `file` field had its ENTIRE
+// observation refused, dropping a P1 from the ledger. A derived key is
+// sanitised; a key the REVIEWER asserted is still refused.
+func TestLedgerAcceptsTheDocumentedFileLineConvention(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	head := strings.Repeat("b", 40)
+	uid, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
+		Repo: "owner/repo", PullRequest: 7, HeadSHA: head, ObserverJob: "review-1",
+		State: db.FindingOpen, Severity: "P1", Title: "the dropped P1",
+		File:         "internal/workflow/merge_gate.go:800",
+		EvidenceKind: db.EvidenceExecuted, ExecutedCommands: []string{"probe"}, ExecutedCount: 1,
+	})
+	if err != nil {
+		t.Fatalf("the documented path:line convention was refused: %v", err)
+	}
+	// The derived key must be the PATH, so relevance can actually match a diff.
+	observations, err := store.ListReviewFindingObservations(ctx, "owner/repo", 7)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	var keys []string
+	for _, obs := range observations {
+		if obs.FindingUID == uid {
+			keys = obs.RelevanceKeys
+		}
+	}
+	if _, touched := relevanceTouched(keys, []string{"internal/workflow/merge_gate.go"}); !touched {
+		t.Fatalf("relevance keys %v do not match the finding's own file, so the colon was seeded verbatim", keys)
+	}
+}
