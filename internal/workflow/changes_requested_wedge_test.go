@@ -289,15 +289,26 @@ func TestApprovalWithoutAnObservedPullRequestRowIsRefused(t *testing.T) {
 			}
 			seedReviewJob(t, store, "review-new", "auditor", "head-new", "approved", JobSucceeded)
 
-			if err := engine.AdvanceJob(ctx, "review-new"); err != nil {
-				t.Fatalf("AdvanceJob returned error: %v", err)
+			// The hold must be RETRYABLE, not settled: AdvanceJob returns an error so
+			// the advancement stays unreconciled and the daemon's advance-retry
+			// re-drives it once the pull_requests row lands. Returning nil here would
+			// record the approval as advanced and nothing would ever re-drive it -
+			// measured as a recovery wedge in the #1871 round-3 review.
+			err := engine.AdvanceJob(ctx, "review-new")
+			if err == nil {
+				t.Fatal("AdvanceJob returned nil: an unconfirmable head must leave the advancement retryable, not settle it")
+			}
+			if !strings.Contains(err.Error(), "no observed pull request row") {
+				t.Fatalf("error = %v, want it to name the missing pull request row", err)
 			}
 			assertTaskState(t, store, "task-9", TaskChangesRequested)
 			if len(gh.merges) != 0 {
 				t.Fatalf("merge calls = %d, want 0: an unconfirmed current head must never admit an approval", len(gh.merges))
 			}
-			if reason := heldReason(t, store, "review-new"); !strings.Contains(reason, "no observed pull request row") {
-				t.Fatalf("held reason = %q, want it to name the missing pull request row", reason)
+			// And it must NOT write a durable held event on this path: it is re-entered
+			// every tick, and a row per tick is what grew job_events to ~1.8M once.
+			if reason := heldReason(t, store, "review-new"); reason != "" {
+				t.Fatalf("retryable hold wrote a review_advance_held event (%q); the deduped advance_retry marker carries it instead", reason)
 			}
 		})
 	}
@@ -315,8 +326,8 @@ func TestApprovalAdmittedOnceThePullRequestRowAppears(t *testing.T) {
 	seedReviewJob(t, store, "review-old", "auditor", "head-old", "changes_requested", JobSucceeded)
 	seedReviewJob(t, store, "review-new", "auditor", "head-new", "approved", JobSucceeded)
 
-	if err := engine.AdvanceJob(ctx, "review-new"); err != nil {
-		t.Fatalf("AdvanceJob (no row) returned error: %v", err)
+	if err := engine.AdvanceJob(ctx, "review-new"); err == nil {
+		t.Fatal("AdvanceJob (no row) returned nil; the hold must stay retryable")
 	}
 	if len(gh.merges) != 0 {
 		t.Fatalf("merged with no observed pull request row")

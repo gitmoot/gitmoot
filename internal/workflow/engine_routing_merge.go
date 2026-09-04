@@ -282,25 +282,29 @@ func (e Engine) setReviewingIfNotChangesRequested(ctx context.Context, ref taskR
 // by design and correctly refuses to erase a live objection, so nothing re-armed
 // it. The fix is not to erase the objection earlier but to let an approval that
 // is DEMONSTRABLY NEWER than it own the claim.
-func (e Engine) mergeGateExpectedTaskState(ctx context.Context, ref taskRef, payload JobPayload) (TaskState, bool, string, error) {
+// The third return is the refusal reason and the fourth says whether the hold is
+// TRANSIENT. A transient hold must be retried rather than settled: the caller
+// returns an error so the advancement stays unreconciled and the daemon's
+// advance-retry re-drives it. A terminal hold records a durable event and stops.
+func (e Engine) mergeGateExpectedTaskState(ctx context.Context, ref taskRef, payload JobPayload) (TaskState, bool, string, bool, error) {
 	if strings.TrimSpace(ref.ID) == "" {
-		return TaskReviewing, true, "", nil
+		return TaskReviewing, true, "", false, nil
 	}
 	task, err := e.Store.GetTask(ctx, ref.ID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return "", false, "", err
+		return "", false, "", false, err
 	}
 	if err != nil || task.State != string(TaskChangesRequested) {
-		return TaskReviewing, true, "", nil
+		return TaskReviewing, true, "", false, nil
 	}
-	admitted, reason, err := e.approvalSupersedesChangesRequested(ctx, payload)
+	admitted, reason, retryable, err := e.approvalSupersedesChangesRequested(ctx, payload)
 	if err != nil {
-		return "", false, "", err
+		return "", false, "", false, err
 	}
 	if !admitted {
-		return "", false, reason, nil
+		return "", false, reason, retryable, nil
 	}
-	return TaskChangesRequested, true, "", nil
+	return TaskChangesRequested, true, "", false, nil
 }
 
 // approvalSupersedesChangesRequested answers whether THIS approving review is
@@ -323,16 +327,17 @@ func (e Engine) mergeGateExpectedTaskState(ctx context.Context, ref taskRef, pay
 // head requested changes, the objection stands even when a different reviewer
 // approved the same head. An approval must not merge over a peer's live
 // objection; the objector re-reviews, or a new head supersedes them both.
-func (e Engine) approvalSupersedesChangesRequested(ctx context.Context, payload JobPayload) (bool, string, error) {
+func (e Engine) approvalSupersedesChangesRequested(ctx context.Context, payload JobPayload) (bool, string, bool, error) {
 	approvingHead := strings.TrimSpace(payload.HeadSHA)
 	if approvingHead == "" {
-		return false, "the approving review carries no head SHA, so it cannot be bound to the current head", nil
+		// Terminal: a review row does not gain a head later.
+		return false, "the approving review carries no head SHA, so it cannot be bound to the current head", false, nil
 	}
 	currentHead := ""
 	if payload.PullRequest > 0 {
 		pr, err := e.Store.GetPullRequest(ctx, payload.Repo, int64(payload.PullRequest))
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return false, "", err
+			return false, "", false, err
 		}
 		if err == nil {
 			currentHead = strings.TrimSpace(pr.HeadSHA)
@@ -348,18 +353,23 @@ func (e Engine) approvalSupersedesChangesRequested(ctx context.Context, payload 
 		// merge over a live, current objection whenever the row is missing - which
 		// the CLI dispatch path can reach on a PR the daemon never polled
 		// (#1871 review, P1). Refusing only leaves the task where it already is.
+		//
+		// TRANSIENT: the row appears as soon as the daemon polls the PR, so this
+		// hold must be RETRIED, not settled. Settling it silently is the recovery
+		// wedge the round-3 review measured - the approval was recorded as advanced
+		// and nothing re-drove it once the row landed (#1871 review round 3, P1).
 		return false, fmt.Sprintf(
 			"no observed pull request row records a current head for %s#%d, so this approval cannot be shown to be bound to it",
-			payload.Repo, payload.PullRequest), nil
+			payload.Repo, payload.PullRequest), true, nil
 	}
 	if approvingHead != currentHead {
 		return false, fmt.Sprintf(
 			"approval is bound to head %s but the pull request's current head is %s; an approval at a superseded head does not clear changes_requested",
-			approvingHead, currentHead), nil
+			approvingHead, currentHead), false, nil
 	}
 	jobs, err := e.Store.ListJobs(ctx)
 	if err != nil {
-		return false, "", err
+		return false, "", false, err
 	}
 	blockingSeverity := e.reviewBlockingSeverity(payload.Repo)
 	for _, job := range jobs {
@@ -368,7 +378,7 @@ func (e Engine) approvalSupersedesChangesRequested(ctx context.Context, payload 
 		}
 		jobPayload, err := unmarshalPayload(job.Payload)
 		if err != nil {
-			return false, "", err
+			return false, "", false, err
 		}
 		if !sameTask(payload, jobPayload) || jobPayload.Result == nil || ResultIsFanOut(jobPayload.Result) {
 			continue
@@ -382,10 +392,10 @@ func (e Engine) approvalSupersedesChangesRequested(ctx context.Context, payload 
 		if strings.TrimSpace(jobPayload.HeadSHA) == approvingHead {
 			return false, fmt.Sprintf(
 				"a review at head %s requested changes, so the objection stands even though this review approved the same head",
-				approvingHead), nil
+				approvingHead), false, nil
 		}
 	}
-	return true, "", nil
+	return true, "", false, nil
 }
 
 func (e Engine) latestReviewRound(ctx context.Context, current JobPayload) (string, error) {

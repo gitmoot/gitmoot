@@ -816,11 +816,29 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			// be claimed as changes_requested, and only when this approval is bound
 			// to the current head and unopposed there; otherwise the objection
 			// stands and the approval is recorded rather than silently dropped.
-			expectedState, proceed, held, err := e.mergeGateExpectedTaskState(ctx, ref, payload)
+			expectedState, proceed, held, retryable, err := e.mergeGateExpectedTaskState(ctx, ref, payload)
 			if err != nil {
 				return err
 			}
 			if !proceed {
+				if retryable {
+					// A TRANSIENT hold - the current head is not observable YET. Returning
+					// an error leaves the advancement unreconciled, so the daemon's
+					// advance-retry re-drives this approval once the daemon poll inserts
+					// the pull_requests row. Recording an event and returning nil would
+					// SETTLE it, and nothing would ever re-drive it: the approval reads as
+					// advanced while the task stays wedged (#1871 review round 3, P1,
+					// measured with a two-poll probe that ended gate_requests=0).
+					//
+					// No job event is written here on purpose. This path is re-entered on
+					// every tick until the row appears, and recordAdvanceRetryOnce already
+					// dedups the advance_retry marker that carries this message - appending
+					// a row per tick is what grew job_events to ~1.8M rows once before.
+					return fmt.Errorf("review approval held: %s", held)
+				}
+				// TERMINAL: a superseded head or a live objection at the current head.
+				// Nothing will change without a new review or a new head, so settle it
+				// with a durable reason instead of retrying forever.
 				return e.Store.AddJobEvent(ctx, db.JobEvent{
 					JobID:   job.ID,
 					Kind:    "review_advance_held",
