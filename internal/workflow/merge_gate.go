@@ -748,6 +748,22 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		}
 		reviewsAtHead = append(reviewsAtHead, review)
 	}
+	// #1822 findings ledger. A prior finding that carries no observation at THIS
+	// head blocks acceptance, so a ledger hit ADDS an obligation rather than
+	// removing one. That is what keeps the ledger from becoming a reviewer's only
+	// input: a round cannot trade a ledger read for a diff read.
+	//
+	// SCOPE AT THIS CALL SITE, STATED BECAUSE IT IS NARROWER THAN THE LEDGER'S:
+	// changedPaths is nil here. MergeGateGitHub has no ListPullRequestFiles, and
+	// widening the interface would force every fake in the suite to implement it
+	// for a relevance check the gate can already live without. With no change set
+	// in hand only OPEN findings are mandatory; an answered finding whose
+	// relevance keys a later diff touches is enforced by the ledger's own
+	// acceptance call, which is made where the diff is already known. So the gate
+	// enforces the half it can prove and claims nothing about the half it cannot.
+	if err := EnsureLedgerObligationsObserved(ctx, g.Store, request.Repo, int64(request.PullRequest), headSHA, nil); err != nil {
+		return err
+	}
 	// Supersession is resolved BEFORE any state or verdict scan, and it covers a
 	// row in any state: a strictly later terminal verdict from the same reviewer
 	// is what clears a crashed or requeued slot. Rows whose order cannot be

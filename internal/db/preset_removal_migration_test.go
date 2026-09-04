@@ -31,9 +31,15 @@ func releasedMigrationsBeforePresetRemoval(t *testing.T) []string {
 	if index < 0 {
 		t.Fatalf("marker %q matches no migration", presetRemovalMarker)
 	}
-	if index != len(migrations)-1 {
-		t.Fatalf("the #1756 migration is at index %d of %d; a new migration must be appended last", index, len(migrations)-1)
-	}
+	// NO "must be last" ASSERTION HERE, deliberately, and this is a change of
+	// ownership rather than a weakened guard. When #1756 was the branch migration
+	// it was last, so asserting it here was free. It is now a RELEASED migration
+	// in the middle of the slice (#1822 appended after it), and what this test
+	// validates is that the preset removal works on a populated pre-change
+	// database, which does not depend on its index. The append-last guard still
+	// exists exactly once, in TestMigrationsUpgradeFromPreviousReleasedVersion,
+	// pointed at the BRANCH migration, which is where it belongs: otherwise every
+	// future branch has to repoint a test whose subject is not the branch.
 	return append([]string(nil), migrations[:index]...)
 }
 

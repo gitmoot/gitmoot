@@ -2592,4 +2592,43 @@ DROP TABLE IF EXISTS preset_session_state;
 
 ALTER TABLE agents DROP COLUMN preset_delivery;
 	`,
+
+	// #1822 findings ledger. One row per (finding, head) OBSERVATION. The key is
+	// (finding_uid, head_sha) so the SAME finding at two heads is two rows and
+	// nothing is ever silently carried; there is deliberately no column meaning
+	// "still true". head_sha is CHECKed as 40 hex because an abbreviation reads as
+	// proof it is not. finding_uid is minted by the store, never by the reviewer:
+	// measured on #1783, reviewers number findings per round and F-1 named four
+	// different defects across four rounds, so an obligation keyed on a
+	// reviewer-supplied label is discharged by a coincidence of naming.
+	// round_label keeps that label for humans and is matched on by nothing.
+	`
+CREATE TABLE review_finding_observations (
+	finding_uid TEXT NOT NULL,
+	repo TEXT NOT NULL,
+	pull_request INTEGER NOT NULL DEFAULT 0,
+	head_sha TEXT NOT NULL CHECK(length(head_sha) = 40 AND head_sha GLOB '[0-9a-f]*'),
+	observed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+	observer_job TEXT NOT NULL DEFAULT '',
+	state TEXT NOT NULL CHECK(state IN ('open','answered','withdrawn','superseded')),
+	severity TEXT NOT NULL DEFAULT '',
+	round_label TEXT NOT NULL DEFAULT '',
+	label_absent INTEGER NOT NULL DEFAULT 0,
+	title TEXT NOT NULL DEFAULT '',
+	detail TEXT NOT NULL DEFAULT '',
+	file TEXT NOT NULL DEFAULT '',
+	line INTEGER NOT NULL DEFAULT 0,
+	relevance_keys TEXT NOT NULL DEFAULT '[]',
+	evidence_kind TEXT NOT NULL CHECK(evidence_kind IN ('EXECUTED','STATIC','QUOTED')),
+	executed_commands TEXT NOT NULL DEFAULT '[]',
+	executed_count INTEGER NOT NULL DEFAULT 0,
+	evidence_locator TEXT NOT NULL DEFAULT '',
+	rationale TEXT NOT NULL DEFAULT '',
+	source_job TEXT NOT NULL DEFAULT '',
+	withdraw_reason TEXT NOT NULL DEFAULT '',
+	PRIMARY KEY (finding_uid, head_sha)
+);
+
+CREATE INDEX idx_review_findings_pr ON review_finding_observations(repo, pull_request, observed_at);
+	`,
 }
