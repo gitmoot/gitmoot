@@ -36,6 +36,12 @@ import "strings"
 //
 // So: one classification for the plain scanners, NOT one for the package.
 //
+// ROUTING COVERAGE is also partial and counted rather than implied: 12 of the
+// 26 call sites are pinned through their production loader (see
+// TestMalformedHeaderRoutingPerCallSite, which names the 14 that are not). A
+// revert of an unpinned site to the old two-bracket form would not fail the
+// suite today.
+//
 // A valid header is byte-equivalent to the old behaviour: same trimming, same
 // name. Only the invalid-input path changes.
 func sectionHeader(line string) (name string, ok bool) {

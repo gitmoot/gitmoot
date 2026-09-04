@@ -137,6 +137,22 @@ func TestWellFormedGateConfigIsUnchanged(t *testing.T) {
 // the malformed line stops being a boundary, the override is misattributed to
 // the still-open section, and the loader returns the override - so a revert at
 // any covered site fails here rather than passing quietly.
+// COVERAGE, STATED AS A COUNT RATHER THAN IMPLIED. sectionHeader has 26 call
+// sites across 22 files in this package. Pinned through a production loader
+// here: the 4 guard loaders by refusal (merge_gate, admission, workflow,
+// review) and 8 by routing (parallel_sessions, transcripts, router, daemon,
+// github, remote_exec, credentials, plus admission's original regression) - 12
+// of 26.
+//
+// NOT PINNED, and named so the next reader does not have to re-derive it:
+// github_remote, heartbeats, implement_base, memory, repo_concurrency,
+// result_checks, runtime_registry, stale_tasks (3 sites), workflow_lifecycle,
+// orchestrate's LoadOrchestratePolicy and LoadEventsPolicy, org.go's
+// parseOrgContent (which has its own stricter org-shaped refusal), and
+// edit_compat's configSectionAtParseError (a diagnostic, not a loader). Those
+// loaders key off prefixes, repo-scoped names or no fixed section string, so
+// each needs its own observable field; a revert at one of them would NOT fail
+// this test.
 func TestMalformedHeaderRoutingPerCallSite(t *testing.T) {
 	t.Run("parallel_sessions", func(t *testing.T) {
 		paths := writeGateConfig(t, "[parallel_sessions]\nsame_session = \"queue\"\n[parallel_sessions\nsame_session = \"fork_temp_session\"\n")
@@ -164,6 +180,46 @@ func TestMalformedHeaderRoutingPerCallSite(t *testing.T) {
 		}
 		if settings.ContextEnabled {
 			t.Fatal("context_enabled = true after a malformed header was misattributed to [router]")
+		}
+	})
+
+	t.Run("daemon", func(t *testing.T) {
+		cfg, err := LoadDaemonRuntimeConfig(writeGateConfig(t, "[daemon]\nworkers = 2\n[daemon\nworkers = 99\n"))
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if cfg.Workers != 2 {
+			t.Fatalf("workers = %d, want 2: the override after a malformed header was misattributed", cfg.Workers)
+		}
+	})
+
+	t.Run("github", func(t *testing.T) {
+		policy, err := LoadGitHubLimiterPolicy(writeGateConfig(t, "[github]\nmax_concurrent = 2\n[github\nmax_concurrent = 99\n"))
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if policy.MaxConcurrent != 2 {
+			t.Fatalf("max_concurrent = %d, want 2", policy.MaxConcurrent)
+		}
+	})
+
+	t.Run("remote_exec", func(t *testing.T) {
+		cfg, err := LoadRemoteExecConfig(writeGateConfig(t, "[remote_exec]\nbackend = \"local\"\n[remote_exec\nbackend = \"remote\"\n"))
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if cfg.Backend != "local" {
+			t.Fatalf("backend = %q, want local", cfg.Backend)
+		}
+	})
+
+	t.Run("credentials", func(t *testing.T) {
+		cfg, err := LoadCredentialsConfig(writeGateConfig(t, "[credentials]\nenv_curation = false\n[credentials\nenv_curation = true\n"))
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if cfg.EnvCuration {
+			t.Fatal("env_curation = true after a malformed header was misattributed to [credentials]")
 		}
 	})
 
