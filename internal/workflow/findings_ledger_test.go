@@ -51,7 +51,7 @@ func TestLedgerRefusesAVerdictThatSkipsAPriorFindingAtANewHead(t *testing.T) {
 		t.Fatalf("record: %v", err)
 	}
 
-	err = EnsureLedgerObligationsObserved(ctx, store, "owner/repo", 7, headB, nil)
+	err = EnsureLedgerObligationsObserved(ctx, store, "owner/repo", 7, headB, LedgerScope{})
 	if err == nil {
 		t.Fatal("a verdict at a new head with no observation of the open finding was ACCEPTED; the ledger let the round skip verification")
 	}
@@ -66,7 +66,7 @@ func TestLedgerRefusesAVerdictThatSkipsAPriorFindingAtANewHead(t *testing.T) {
 	if _, err := store.RecordReviewFindingObservation(ctx, obs); err != nil {
 		t.Fatalf("record continuation: %v", err)
 	}
-	if err := EnsureLedgerObligationsObserved(ctx, store, "owner/repo", 7, headB, nil); err != nil {
+	if err := EnsureLedgerObligationsObserved(ctx, store, "owner/repo", 7, headB, LedgerScope{}); err != nil {
 		t.Fatalf("a round that observed every mandatory finding at head B was refused: %v", err)
 	}
 }
@@ -98,7 +98,7 @@ func TestLedgerLabelCollisionDoesNotDischargeThePriorFinding(t *testing.T) {
 		t.Fatalf("a renumbered label reused the prior finding's identity: both are %q", newUID)
 	}
 
-	err = EnsureLedgerObligationsObserved(ctx, store, "owner/repo", 7, headB, nil)
+	err = EnsureLedgerObligationsObserved(ctx, store, "owner/repo", 7, headB, LedgerScope{})
 	if err == nil {
 		t.Fatal("a label collision DISCHARGED the prior finding: the obligation was satisfied by a coincidence of naming")
 	}
@@ -189,10 +189,10 @@ func TestLedgerAcceptsWhenItHasNothingToSay(t *testing.T) {
 	ctx := context.Background()
 	store := ledgerStore(t)
 
-	if err := EnsureLedgerObligationsObserved(ctx, store, "owner/repo", 7, headB, nil); err != nil {
+	if err := EnsureLedgerObligationsObserved(ctx, store, "owner/repo", 7, headB, LedgerScope{}); err != nil {
 		t.Fatalf("an EMPTY ledger refused a verdict: %v", err)
 	}
-	if err := EnsureLedgerObligationsObserved(ctx, nil, "owner/repo", 7, headB, nil); err != nil {
+	if err := EnsureLedgerObligationsObserved(ctx, nil, "owner/repo", 7, headB, LedgerScope{}); err != nil {
 		t.Fatalf("a nil store refused a verdict: %v", err)
 	}
 
@@ -202,7 +202,7 @@ func TestLedgerAcceptsWhenItHasNothingToSay(t *testing.T) {
 	if _, err := store.RecordReviewFindingObservation(ctx, withdrawn); err != nil {
 		t.Fatalf("record withdrawn: %v", err)
 	}
-	if err := EnsureLedgerObligationsObserved(ctx, store, "owner/repo", 7, headB, nil); err != nil {
+	if err := EnsureLedgerObligationsObserved(ctx, store, "owner/repo", 7, headB, LedgerScope{}); err != nil {
 		t.Fatalf("a withdrawn finding created an obligation: %v", err)
 	}
 
@@ -214,7 +214,7 @@ func TestLedgerAcceptsWhenItHasNothingToSay(t *testing.T) {
 	if _, err := store.RecordReviewFindingObservation(ctx, answered); err != nil {
 		t.Fatalf("record answered: %v", err)
 	}
-	if err := EnsureLedgerObligationsObserved(ctx, store, "owner/repo", 7, headB, []string{"internal/cli/unrelated.go"}); err != nil {
+	if err := EnsureLedgerObligationsObserved(ctx, store, "owner/repo", 7, headB, fixedScope("internal/cli/unrelated.go")); err != nil {
 		t.Fatalf("an answered finding untouched by the diff blocked acceptance: %v", err)
 	}
 }
@@ -236,11 +236,20 @@ func TestLedgerRelevanceReachesBeyondTheNamedFile(t *testing.T) {
 	}
 
 	// The diff touches AGENTS.md and NOT run.go.
-	err = EnsureLedgerObligationsObserved(ctx, store, "owner/repo", 7, headB, []string{"AGENTS.md"})
+	err = EnsureLedgerObligationsObserved(ctx, store, "owner/repo", 7, headB, fixedScope("AGENTS.md"))
 	if err == nil {
 		t.Fatal("a diff touching a declared relevance key left the answered finding advisory: relevance is still file-scoped")
 	}
 	if !strings.Contains(err.Error(), uid) {
 		t.Fatalf("refusal does not name %q: %v", uid, err)
+	}
+}
+
+// fixedScope supplies a constant change set for every range, so a test can pin
+// relevance behaviour without a git tree. Production wires the engine's
+// ReviewChangedFiles seam instead, which proves the range complete.
+func fixedScope(paths ...string) LedgerScope {
+	return LedgerScope{
+		ChangedSince: func(context.Context, string, string) ([]string, error) { return paths, nil },
 	}
 }

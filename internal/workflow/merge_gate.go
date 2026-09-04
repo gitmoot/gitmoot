@@ -104,6 +104,18 @@ type PolicyMergeGate struct {
 	// unchanged, then falls through to conclude no-CI so such PRs still merge instead
 	// of wedging forever. Zero means use the built-in default (defaultMaxCIWait).
 	MaxCIWait time.Duration
+	// ChangedFilesSince enumerates the paths changed between two heads, used by
+	// the #1822 findings ledger to decide whether an ANSWERED finding is mandatory
+	// again at this head. In production the daemon wires the engine's
+	// ReviewChangedFiles seam, which proves completeness from its own checkout and
+	// fails closed on a capped API page. Nil leaves answered findings advisory and
+	// records that degradation; it does NOT block a merge, because the ledger's
+	// failure mode is "it did not remind you" (#1850 review F4).
+	ChangedFilesSince func(ctx context.Context, repo string, number int, previousHead string, currentHead string) ([]string, error)
+	// PathExistsAtHead resolves whether a repo-relative path exists at a head, so
+	// a STATIC discharge citing a deleted file stops counting as an answer
+	// (#1850 review F5). Nil skips the existence half and records it.
+	PathExistsAtHead func(ctx context.Context, head string, path string) (bool, error)
 	// Clock is injectable for deterministic tests. Nil means time.Now.
 	Clock                      func() time.Time
 	taskClaimTTL               time.Duration
@@ -241,6 +253,28 @@ func (g PolicyMergeGate) mergeOutcomeConfirmationTimeout() time.Duration {
 // toward the grace path (never toward an instant no-CI stamp).
 type workflowAwareGitHub interface {
 	WorkflowsExistAtRef(ctx context.Context, repo github.Repository, ref string) (bool, error)
+}
+
+// ledgerScope adapts the gate's optional resolvers into the ledger's scope,
+// binding the repo and PR number the ledger does not carry.
+//
+// IT PASSES DATA, NEVER A STORE CALL. TestMergeGateStoreAccessSurface pins the
+// gate's *db.Store surface as a firewall between merge authority and
+// display-only evidence, and recording a degradation note is not worth widening
+// it. So the TaskID travels in the scope and the ledger does the writing with
+// the store it already holds.
+func (g PolicyMergeGate) ledgerScope(request MergeRequest) LedgerScope {
+	scope := LedgerScope{
+		PathExistsAtHead: g.PathExistsAtHead,
+		TaskID:           request.TaskID,
+	}
+	if g.ChangedFilesSince != nil {
+		repo, number := request.Repo, request.PullRequest
+		scope.ChangedSince = func(ctx context.Context, previousHead string, currentHead string) ([]string, error) {
+			return g.ChangedFilesSince(ctx, repo, number, previousHead, currentHead)
+		}
+	}
+	return scope
 }
 
 func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (MergeDecision, error) {
@@ -753,15 +787,17 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	// removing one. That is what keeps the ledger from becoming a reviewer's only
 	// input: a round cannot trade a ledger read for a diff read.
 	//
-	// SCOPE AT THIS CALL SITE, STATED BECAUSE IT IS NARROWER THAN THE LEDGER'S:
-	// changedPaths is nil here. MergeGateGitHub has no ListPullRequestFiles, and
-	// widening the interface would force every fake in the suite to implement it
-	// for a relevance check the gate can already live without. With no change set
-	// in hand only OPEN findings are mandatory; an answered finding whose
-	// relevance keys a later diff touches is enforced by the ledger's own
-	// acceptance call, which is made where the diff is already known. So the gate
-	// enforces the half it can prove and claims nothing about the half it cannot.
-	if err := EnsureLedgerObligationsObserved(ctx, g.Store, request.Repo, int64(request.PullRequest), headSHA, nil); err != nil {
+	// THE SCOPE IS SUPPLIED, NOT DEFERRED (#1850 review F4/A, both verdicts). The
+	// previous comment here promised that the relevance half was "enforced by the
+	// ledger's own acceptance call, which is made where the diff is already
+	// known" - THERE WAS NO SUCH CALL. A comment naming a call site that was
+	// never written is worse than silence, because it stops the next reader
+	// looking, and it is the same defect class as a finding label that names four
+	// different defects. The gate now passes a real scope: ChangedSince resolves
+	// per-finding ranges, PathExistsAtHead resolves cited locators, and a missing
+	// or failing resolver DEGRADES with a recorded note rather than either
+	// pretending or blocking.
+	if err := EnsureLedgerObligationsObserved(ctx, g.Store, request.Repo, int64(request.PullRequest), headSHA, g.ledgerScope(request)); err != nil {
 		return err
 	}
 	// Supersession is resolved BEFORE any state or verdict scan, and it covers a

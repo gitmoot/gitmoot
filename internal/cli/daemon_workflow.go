@@ -971,6 +971,84 @@ func newDaemonPolicyMergeGateForRunner(store *db.Store, gh github.Client, checko
 		Worktrees:    jobGitClient(checkout, runner),
 		CheckoutPath: checkout,
 		DeleteBranch: true,
+		// #1822 findings-ledger scope, WIRED HERE BECAUSE A FIELD NOTHING SETS IS
+		// THE SAME DEFECT AS A COMMENT NAMING A CALL SITE THAT DOES NOT EXIST
+		// (#1850 review F4/A). Both resolvers are real production instruments:
+		// changed files come from the daemon's own checkout, and locator existence
+		// from `git cat-file -e <head>:<path>` in that same checkout.
+		ChangedFilesSince: daemonLedgerChangedFiles(gh, checkout, runner),
+		PathExistsAtHead:  daemonLedgerPathExists(checkout, runner),
+	}
+}
+
+// daemonLedgerChangedFiles resolves the paths changed between two heads for the
+// ledger's relevance half. It reuses localReviewChangedFiles, the SAME
+// instrument the review-scope seam uses, which proves the range complete from
+// local objects and returns ReviewScopeUnavailableError when it can prove the
+// range is not a direct follow-up. The compare API is the fallback for a cold
+// checkout and fails closed on a capped page.
+//
+// A nil return here is deliberate when neither instrument is available: the
+// ledger then reports a DEGRADATION and leaves answered findings advisory,
+// rather than blocking a merge on a missing diff.
+func daemonLedgerChangedFiles(gh github.Client, checkout string, runner subprocess.Runner) func(context.Context, string, int, string, string) ([]string, error) {
+	checkout = strings.TrimSpace(checkout)
+	if gh == nil && checkout == "" {
+		return nil
+	}
+	return func(ctx context.Context, repo string, number int, previousHead string, currentHead string) ([]string, error) {
+		base, head := strings.TrimSpace(previousHead), strings.TrimSpace(currentHead)
+		if base == "" || head == "" {
+			return nil, fmt.Errorf("findings ledger scope needs both heads, got base=%q head=%q", base, head)
+		}
+		if base == head {
+			// The finding was answered AT this head, so nothing has changed since.
+			return nil, nil
+		}
+		if checkout != "" {
+			paths, err := localReviewChangedFiles(ctx, jobGitClient(checkout, runner), number, base, head)
+			if err == nil {
+				return paths, nil
+			}
+			var unavailable workflow.ReviewScopeUnavailableError
+			if errors.As(err, &unavailable) {
+				return nil, err
+			}
+		}
+		if gh == nil {
+			return nil, workflow.ReviewScopeUnavailableError{
+				Reason: "findings ledger scope has no local checkout and no GitHub client",
+			}
+		}
+		owner, name, ok := strings.Cut(strings.TrimSpace(repo), "/")
+		if !ok || owner == "" || name == "" {
+			return nil, fmt.Errorf("findings ledger scope: invalid repo %q", repo)
+		}
+		compare, err := gh.CompareCommits(ctx, github.Repository{Owner: owner, Name: name}, base, head)
+		if err != nil {
+			return nil, err
+		}
+		if compare.Truncated {
+			return nil, workflow.ReviewScopeUnavailableError{
+				Reason: fmt.Sprintf("findings ledger scope compare is capped at %d files", len(compare.Files)),
+			}
+		}
+		paths := make([]string, 0, len(compare.Files))
+		for _, file := range compare.Files {
+			paths = append(paths, file.Filename)
+		}
+		return sortedUniqueReviewPaths(paths), nil
+	}
+}
+
+// daemonLedgerPathExists resolves whether a cited locator still exists at a head.
+func daemonLedgerPathExists(checkout string, runner subprocess.Runner) func(context.Context, string, string) (bool, error) {
+	checkout = strings.TrimSpace(checkout)
+	if checkout == "" {
+		return nil
+	}
+	return func(ctx context.Context, head string, path string) (bool, error) {
+		return jobGitClient(checkout, runner).PathExistsAtRev(ctx, head, path)
 	}
 }
 

@@ -249,6 +249,15 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 		if scope != nil {
 			instructions = scopedReviewInstructions(event, scope)
 		}
+		// DISCLOSE THE LEDGER'S OBLIGATIONS IN THE BRIEF (#1850 review F1's other
+		// half). The gate refuses a verdict at this head while a prior finding
+		// carries no observation, and an obligation is dischargeable only by
+		// citing its uid - a value obtainable ONLY by being told it. Writing the
+		// ledger without disclosing it would convert the inert feature into a
+		// guard that blocks legitimate merges, which is strictly worse. Empty
+		// string on a PR with no ledger history, so the default brief is
+		// byte-identical.
+		instructions += e.ledgerObligationBrief(ctx, event.Repo, event.PullRequest, event.HeadSHA)
 		request := JobRequest{
 			PolicyExempt: "exempt",
 			// #1250: fanout children were enqueued with NO attribution — measured at

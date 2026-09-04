@@ -200,6 +200,34 @@ func (c Client) BranchExists(ctx context.Context, branch string) (bool, error) {
 	return true, nil
 }
 
+// PathExistsAtRev reports whether a repo-relative path exists in the tree at
+// rev, via `git cat-file -e <rev>:<path>`.
+//
+// It exists for the #1822 findings ledger (#1850 review F5): a STATIC discharge
+// cites a locator, and an answer whose cited path no longer exists at the head
+// is not an answer any more. The structural check on that locator lives at the
+// store boundary, which has no tree; this is the existence half.
+//
+// A NON-ZERO EXIT MEANS "ABSENT", NOT "BROKEN", which is why the error is
+// swallowed here in the same shape as BranchExists: cat-file exits non-zero for
+// a path that is not in the tree, and the caller treats a resolution FAILURE
+// (returned as an error by its own resolver wiring) differently from a confident
+// absence. Distinguishing the two inside git plumbing would need stderr
+// classification for no gain to this caller.
+func (c Client) PathExistsAtRev(ctx context.Context, rev string, path string) (bool, error) {
+	rev, path = strings.TrimSpace(rev), strings.TrimSpace(path)
+	if rev == "" || path == "" {
+		return false, fmt.Errorf("path existence needs both a rev and a path, got rev=%q path=%q", rev, path)
+	}
+	if strings.HasPrefix(path, "-") || strings.HasPrefix(rev, "-") {
+		return false, fmt.Errorf("refusing a rev or path that reads as a flag: rev=%q path=%q", rev, path)
+	}
+	if _, err := c.run(ctx, "cat-file", "-e", rev+":"+path); err != nil {
+		return false, nil
+	}
+	return true, nil
+}
+
 // RemoteBranches returns the requested branches that exist on origin using one
 // exact-ref ls-remote call. Callers batch a bounded candidate set so stale-task
 // reconciliation never performs one subprocess/network round trip per task.

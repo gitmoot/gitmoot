@@ -2607,7 +2607,7 @@ CREATE TABLE review_finding_observations (
 	finding_uid TEXT NOT NULL,
 	repo TEXT NOT NULL,
 	pull_request INTEGER NOT NULL DEFAULT 0,
-	head_sha TEXT NOT NULL CHECK(length(head_sha) = 40 AND head_sha GLOB '[0-9a-f]*'),
+	head_sha TEXT NOT NULL CHECK(length(head_sha) = 40 AND NOT head_sha GLOB '*[^0-9a-f]*'),
 	observed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
 	observer_job TEXT NOT NULL DEFAULT '',
 	state TEXT NOT NULL CHECK(state IN ('open','answered','withdrawn','superseded')),
@@ -2626,7 +2626,7 @@ CREATE TABLE review_finding_observations (
 	rationale TEXT NOT NULL DEFAULT '',
 	source_job TEXT NOT NULL DEFAULT '',
 	withdraw_reason TEXT NOT NULL DEFAULT '',
-	PRIMARY KEY (finding_uid, head_sha)
+	PRIMARY KEY (finding_uid, head_sha, observer_job)
 );
 
 CREATE INDEX idx_review_findings_pr ON review_finding_observations(repo, pull_request, observed_at);

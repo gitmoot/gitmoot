@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // The #1822 findings ledger. One row per (finding, head) OBSERVATION, never one
@@ -101,12 +102,31 @@ var (
 	// ErrFindingUnknownContinues refuses to silently mint when a reviewer cites a
 	// uid that does not exist, because minting there would turn a typo into a new
 	// finding and leave the intended one unobserved.
+	// ErrFindingDuplicateObservation names a second observation by the SAME
+	// observer of the same finding at the same head. Two DIFFERENT reviewers at
+	// one head is legitimate and the key admits it (#1850 review F8); a repeat by
+	// one observer is the caller's own idempotency question, so it gets a sentinel
+	// rather than a raw driver string.
+	ErrFindingDuplicateObservation = errors.New("this observer already recorded this finding at this head")
+	// ErrFindingRelevanceKey rejects a relevance key the matcher could never match.
+	ErrFindingRelevanceKey = errors.New("relevance keys must be path-like: a symbol key can never match a changed path")
+	// ErrFindingWithdrawReason rejects a reasonless withdrawal.
+	ErrFindingWithdrawReason = errors.New("a withdrawn finding requires a withdraw reason")
+	// ErrFindingObservedAt rejects a malformed caller timestamp.
+	ErrFindingObservedAt       = errors.New("observed_at must be RFC3339 when supplied")
 	ErrFindingUnknownContinues = errors.New("continues_uid does not name an existing finding")
 )
 
 var (
 	headSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 	locatorPattern = regexp.MustCompile(`^[A-Za-z0-9_./-]+(:[0-9]+)?$`)
+	// relevanceKeyPattern admits only PATH-LIKE keys, because the matcher compares
+	// keys against changed PATHS and nothing resolves a symbol to the file that
+	// defines it. Accepting "EnsureLedgerObligationsObserved" would store a key
+	// that can never match, so a reviewer naming a symbol would get no protection
+	// AND no warning (#1850 review F7). A refusal at the boundary is the loud
+	// version of that, and it is the same place locatorPattern already lives.
+	relevanceKeyPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*/?$`)
 )
 
 // RecordReviewFindingObservation validates at the STORE BOUNDARY and inserts.
@@ -122,9 +142,36 @@ func (s *Store) RecordReviewFindingObservation(ctx context.Context, obs ReviewFi
 		return "", errors.New("finding observation requires a repo")
 	}
 	switch obs.State {
-	case FindingOpen, FindingAnswered, FindingWithdrawn, FindingSuperseded:
+	case FindingOpen, FindingAnswered, FindingSuperseded:
+	case FindingWithdrawn:
+		// WITHDRAWAL REQUIRES ITS RECORDED REASON (#1850 second verdict B, and
+		// directive 116564 required it before that). Design revision 116549 said
+		// withdrawal is a reviewer's act only, WITH a recorded reason, and the
+		// store never checked it - so the cheapest permanent exit from the
+		// invariant was state=withdrawn with a one-character rationale. Withdrawal
+		// is the one state relevance never re-arms, which makes it strictly
+		// stronger than answered, so it is the one that most needs a readable
+		// reason. I enforce the reason rather than making withdrawal re-armable:
+		// a withdrawn finding is one a reviewer says was never a defect, and a
+		// later diff cannot re-break something that was never broken.
+		if strings.TrimSpace(obs.WithdrawReason) == "" {
+			return "", ErrFindingWithdrawReason
+		}
 	default:
 		return "", fmt.Errorf("unknown finding state %q", obs.State)
+	}
+	// SECOND VERDICT C: observed_at DECIDED the fold and any non-empty caller
+	// string was accepted, so a round supplying "9999-..." pinned its own row as
+	// latest forever and one supplying "1970-..." lost to an older row, silently
+	// preserving a stale answered state. Caller-asserted metadata acting as an
+	// authority is the class this repo already quarantines for head_sha. Two
+	// changes close it: the fold now orders by rowid, which only the database
+	// assigns, and a supplied stamp must parse as RFC3339 so the display value
+	// cannot be junk either.
+	if stamp := strings.TrimSpace(obs.ObservedAt); stamp != "" {
+		if _, err := time.Parse(time.RFC3339, stamp); err != nil {
+			return "", fmt.Errorf("%w: got %q", ErrFindingObservedAt, obs.ObservedAt)
+		}
 	}
 	switch obs.EvidenceKind {
 	case EvidenceExecuted:
@@ -149,10 +196,38 @@ func (s *Store) RecordReviewFindingObservation(ctx context.Context, obs ReviewFi
 		return "", ErrFindingQuotedDischarge
 	}
 
+	// KEYS ARE VALIDATED BEFORE THE TRANSACTION so a bad key costs no write lock.
+	// normaliseKeys seeds from File, so the seed is checked too: a finding whose
+	// own file is not path-like would otherwise smuggle in an unmatchable key.
+	normalised := normaliseKeys(obs.RelevanceKeys, obs.File)
+	for _, key := range normalised {
+		if !relevanceKeyPattern.MatchString(key) {
+			return "", fmt.Errorf("%w: got %q", ErrFindingRelevanceKey, key)
+		}
+	}
+
+	// THE MINT MUST BE ATOMIC WITH THE INSERT (#1850 review F2, P1). The previous
+	// version read COUNT(DISTINCT finding_uid) and then inserted as two separate
+	// statements: measured, 12 concurrent observations of 12 DISTINCT defects
+	// minted only 4 uids, so 8 real findings became permanently unobservable -
+	// the exact identity collision store-minted identity exists to prevent.
+	// SetMaxOpenConns(1) serialises statements but NOT the read-then-write pair,
+	// and separate daemon processes share the file regardless, so the fix is a
+	// transaction and not a mutex. BEGIN IMMEDIATE takes the write lock up front,
+	// which makes a concurrent minter wait rather than read a stale count.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `SELECT 1 FROM review_finding_observations LIMIT 1`); err != nil {
+		return "", err
+	}
+
 	uid := strings.TrimSpace(obs.ContinuesUID)
 	if uid != "" {
 		var exists int
-		if err := s.db.QueryRowContext(ctx,
+		if err := tx.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM review_finding_observations WHERE finding_uid = ?`, uid).Scan(&exists); err != nil {
 			return "", err
 		}
@@ -161,17 +236,29 @@ func (s *Store) RecordReviewFindingObservation(ctx context.Context, obs ReviewFi
 		}
 	} else {
 		// MINT. Never derived from the reviewer's label, so a renumbered F-1
-		// cannot collide with a prior finding.
+		// cannot collide with a prior finding. The candidate is then CHECKED for
+		// existence inside the same transaction: a count-derived name is only as
+		// unique as the count, so a collision must be a loud error and never a
+		// silent merge onto somebody else's finding.
 		var seq int64
-		if err := s.db.QueryRowContext(ctx,
+		if err := tx.QueryRowContext(ctx,
 			`SELECT COUNT(DISTINCT finding_uid) FROM review_finding_observations WHERE repo = ? AND pull_request = ?`,
 			repo, obs.PullRequest).Scan(&seq); err != nil {
 			return "", err
 		}
-		uid = fmt.Sprintf("%s#%d-f%d", repo, obs.PullRequest, seq+1)
+		candidate := fmt.Sprintf("%s#%d-f%d", repo, obs.PullRequest, seq+1)
+		var taken int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM review_finding_observations WHERE finding_uid = ?`, candidate).Scan(&taken); err != nil {
+			return "", err
+		}
+		if taken > 0 {
+			return "", fmt.Errorf("finding uid mint collision on %q: refusing to merge a new finding onto an existing uid", candidate)
+		}
+		uid = candidate
 	}
 
-	keys, err := json.Marshal(normaliseKeys(obs.RelevanceKeys, obs.File))
+	keys, err := json.Marshal(normalised)
 	if err != nil {
 		return "", err
 	}
@@ -183,7 +270,7 @@ func (s *Store) RecordReviewFindingObservation(ctx context.Context, obs ReviewFi
 	if strings.TrimSpace(obs.RoundLabel) == "" {
 		labelAbsent = 1
 	}
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO review_finding_observations(
+	if _, err := tx.ExecContext(ctx, `INSERT INTO review_finding_observations(
 	finding_uid, repo, pull_request, head_sha, observed_at, observer_job, state,
 	severity, round_label, label_absent, title, detail, file, line,
 	relevance_keys, evidence_kind, executed_commands, executed_count,
@@ -193,6 +280,15 @@ VALUES (?, ?, ?, ?, COALESCE(NULLIF(?, ''), strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		obs.Severity, obs.RoundLabel, labelAbsent, obs.Title, obs.Detail, obs.File, obs.Line,
 		string(keys), string(obs.EvidenceKind), string(cmds), obs.ExecutedCount,
 		obs.EvidenceLocator, obs.Rationale, obs.SourceJob, obs.WithdrawReason); err != nil {
+		// The key is (finding_uid, head_sha, observer_job), so this fires only for a
+		// REPEAT by one observer. A second reviewer at the same head is admitted by
+		// the key rather than reported here (#1850 review F8).
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return "", fmt.Errorf("%w: uid=%q head=%s observer=%q", ErrFindingDuplicateObservation, uid, head, obs.ObserverJob)
+		}
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
 		return "", err
 	}
 	return uid, nil
@@ -215,10 +311,15 @@ func normaliseKeys(keys []string, file string) []string {
 	return out
 }
 
-// ListReviewFindingObservations returns every observation for a PR, oldest
-// first, so a caller can fold them into per-finding latest state itself. The
+// ListReviewFindingObservations returns every observation for a PR in INSERTION
+// ORDER, so a caller can fold them into per-finding latest state itself. The
 // store does not fold, because folding is where a "still true" column would
 // creep back in.
+//
+// ORDERING IS rowid, NOT observed_at (#1850 second verdict C). observed_at is
+// caller-supplied and the fold takes the last row per uid as authoritative, so
+// ordering by it let a round pin its own observation as permanently latest.
+// rowid is assigned by the database in insertion order; no caller can set it.
 func (s *Store) ListReviewFindingObservations(ctx context.Context, repo string, pullRequest int64) ([]ReviewFindingObservation, error) {
 	return queryList(ctx, s.db, `SELECT finding_uid, repo, pull_request, head_sha, observed_at,
 	observer_job, state, severity, round_label, label_absent, title, detail, file, line,
@@ -226,7 +327,7 @@ func (s *Store) ListReviewFindingObservations(ctx context.Context, repo string, 
 	rationale, source_job, withdraw_reason
 FROM review_finding_observations
 WHERE repo = ? AND pull_request = ?
-ORDER BY observed_at, rowid`, []any{strings.TrimSpace(repo), pullRequest},
+ORDER BY rowid`, []any{strings.TrimSpace(repo), pullRequest},
 		func(row rowScanner) (ReviewFindingObservation, error) {
 			var obs ReviewFindingObservation
 			var state, kind, keys, cmds string
@@ -240,8 +341,18 @@ ORDER BY observed_at, rowid`, []any{strings.TrimSpace(repo), pullRequest},
 			obs.State = FindingState(state)
 			obs.EvidenceKind = EvidenceKind(kind)
 			obs.LabelAbsent = labelAbsent == 1
-			_ = json.Unmarshal([]byte(keys), &obs.RelevanceKeys)
-			_ = json.Unmarshal([]byte(cmds), &obs.ExecutedCommands)
+			// DECODE ERRORS ARE RETURNED, NOT SWALLOWED (#1850 review F10). A
+			// malformed relevance_keys value used to yield a nil key set, which
+			// matches nothing, which silently stops an answered finding being
+			// mandatory forever. normaliseKeys guarantees a non-empty array on
+			// write, so a decode failure here is real corruption and it is
+			// indistinguishable from reviewer judgement unless it is reported.
+			if err := json.Unmarshal([]byte(keys), &obs.RelevanceKeys); err != nil {
+				return ReviewFindingObservation{}, fmt.Errorf("decode relevance_keys for finding %q at %s: %w", obs.FindingUID, obs.HeadSHA, err)
+			}
+			if err := json.Unmarshal([]byte(cmds), &obs.ExecutedCommands); err != nil {
+				return ReviewFindingObservation{}, fmt.Errorf("decode executed_commands for finding %q at %s: %w", obs.FindingUID, obs.HeadSHA, err)
+			}
 			return obs, nil
 		})
 }
