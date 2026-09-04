@@ -36,11 +36,14 @@ import "strings"
 //
 // So: one classification for the plain scanners, NOT one for the package.
 //
-// ROUTING COVERAGE is also partial and counted rather than implied: 12 of the
-// 26 call sites are pinned through their production loader (see
-// TestMalformedHeaderRoutingPerCallSite, which names the 14 that are not). A
-// revert of an unpinned site to the old two-bracket form would not fail the
-// suite today.
+// ROUTING COVERAGE is partial and counted rather than implied: 16 of the 26
+// call sites are pinned through their production loader and every one of those
+// is MUTATION-PROVEN - reverting that site to the old two-bracket form fails a
+// named subtest. See TestMalformedHeaderRoutingPerCallSite and
+// TestMalformedHeaderRoutingRemainingLoaders, which together name what is NOT
+// pinned, including one site ([agents.*] heartbeats) where a same-shape test
+// passed under the reverted call site and was therefore rejected rather than
+// counted. A revert of an unpinned site would not fail the suite today.
 //
 // A valid header is byte-equivalent to the old behaviour: same trimming, same
 // name. Only the invalid-input path changes.

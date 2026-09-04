@@ -142,7 +142,8 @@ func TestWellFormedGateConfigIsUnchanged(t *testing.T) {
 // here: the 4 guard loaders by refusal (merge_gate, admission, workflow,
 // review) and 8 by routing (parallel_sessions, transcripts, router, daemon,
 // github, remote_exec, credentials, plus admission's original regression) - 12
-// of 26.
+// of 26 (8 routing + 4 guards + admission original, then 4 more in
+// TestMalformedHeaderRoutingRemainingLoaders = 16).
 //
 // NOT PINNED, and named so the next reader does not have to re-derive it:
 // github_remote, heartbeats, implement_base, memory, repo_concurrency,
@@ -242,6 +243,67 @@ func TestMalformedHeaderRoutingPerCallSite(t *testing.T) {
 		}
 		if !settings.ContextEnabled {
 			t.Error("router context_enabled = true was not applied")
+		}
+	})
+}
+
+// TestMalformedHeaderRoutingRemainingLoaders extends per-call-site coverage to
+// loaders whose section name is compared after assignment rather than at the
+// header. Each case uses the loader's REAL entrypoint and a field that
+// distinguishes pre-header state from a post-malformed-header override, and
+// each was MUTATION-PROVEN: reverting that loader's call site to the inline
+// two-bracket form fails the matching subtest.
+//
+// NOT INCLUDED, and stated rather than quietly omitted: [agents.*] heartbeats.
+// A test of the same shape PASSED under the reverted call site, because an
+// enabled flag alone does not make LoadHeartbeats emit a distinguishable
+// entry - so it would have been coverage in name only. That site remains
+// unpinned and is counted as such.
+func TestMalformedHeaderRoutingRemainingLoaders(t *testing.T) {
+	t.Run("result_checks", func(t *testing.T) {
+		mode, err := LoadResultChecksMode(writeGateConfig(t, "[workflow]\nresult_checks = warn\n[workflow\nresult_checks = block\n"))
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if string(mode) != "warn" {
+			t.Fatalf("result_checks = %q, want warn: the override after a malformed header was misattributed", mode)
+		}
+	})
+
+	t.Run("memory", func(t *testing.T) {
+		settings, err := LoadMemorySettings(writeGateConfig(t, "[memory]\ntoken_budget = 111\n[memory\ntoken_budget = 999\n"))
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if settings.TokenBudget == 999 {
+			t.Fatal("token_budget = 999 after a malformed header was misattributed to [memory]")
+		}
+		if settings.TokenBudget != 111 {
+			t.Fatalf("token_budget = %d, want 111 (keys BEFORE the malformed header must still apply)", settings.TokenBudget)
+		}
+	})
+
+	t.Run("runtime_registry", func(t *testing.T) {
+		overrides, err := LoadRuntimeOverrides(writeGateConfig(t, "[runtimes.codex]\ndefault_model = \"keep\"\n[runtimes.codex\ndefault_model = \"leaked\"\n"))
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		for _, override := range overrides {
+			if override.DefaultModel == "leaked" {
+				t.Fatalf("a key after a malformed header was misattributed: %+v", override)
+			}
+		}
+	})
+
+	t.Run("repo_concurrency", func(t *testing.T) {
+		limits, err := LoadRepoConcurrency(writeGateConfig(t, "[repos.\"owner/repo\"]\nmax_parallel = 2\n[repos.\"owner/repo\"\nmax_parallel = 99\n"))
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		for _, limit := range limits {
+			if limit.MaxParallel == 99 {
+				t.Fatalf("max_parallel = 99 after a malformed header was misattributed: %+v", limit)
+			}
 		}
 	})
 }
