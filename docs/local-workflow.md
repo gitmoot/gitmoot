@@ -609,9 +609,18 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    a transient deferral while one exists, leaves the task in `ready_to_merge`,
    and re-evaluates on the next daemon tick. No blocked state or merge-gate error
    is emitted for this retry-later condition. If a parallel PR became behind the
-   base branch because another PR merged first, Gitmoot asks GitHub to update the
-   PR branch with the expected head SHA and leaves the merge gate pending so the
-   daemon can reload the new head and checks on a later poll tick.
+   base branch because another PR merged first, what happens next depends on the
+   base branch's protection. Where GitHub **requires** an up-to-date head,
+   Gitmoot asks GitHub to update the PR branch with the expected head SHA and
+   leaves the merge gate pending so the daemon can reload the new head and
+   checks on a later poll tick. Where the base does **not** require it, the
+   reviewed head is merged as it stands and no update is requested: the update
+   creates a merge commit that supersedes the very head the approving verdict is
+   bound to, so the next poll would find an unreviewed head and dispatch a fresh
+   review round. A **diverged** branch is never merged this way — it can
+   conflict — and an *undetermined* protection read (an unprotected branch and a
+   token that cannot read protection are indistinguishable) fails closed onto
+   the update-and-retry path.
 
    When review independence cannot be verified, the decline names the observed
    cause: no implement job for the task, task-identity mismatch, a matching job

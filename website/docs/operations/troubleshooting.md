@@ -472,6 +472,29 @@ this head` and leaves any real gate verdict untouched. A `blocked` or
 cleared and Gitmoot can still resolve it when the task resumes. A draft pull
 request keeps the marker until it is undrafted.
 
+## No Branch Update For A PR That Is Behind Main
+
+Symptom: a pull request is behind its base and Gitmoot merges it anyway, with no
+`pull request branch update from main requested` pending verdict.
+
+Likely cause: this is the intended behaviour. Requesting the update creates a
+merge commit that supersedes the head the approving verdict is bound to, so the
+next poll would find an unreviewed head and dispatch a fresh review round.
+Gitmoot skips the update where GitHub does not require an up-to-date head and
+merges the reviewed head instead.
+
+Check:
+
+```sh
+gh api repos/owner/repo/branches/<base>/protection --jq '.required_status_checks.strict'
+```
+
+Fix: nothing to do in the common case. `true` keeps the update-and-retry path.
+A 404 or a permission error is *undetermined* — indistinguishable from an
+unprotected branch — and also keeps it, so the guard fails closed. Only an
+explicit `false` skips the update, and a **diverged** branch always takes the
+update because merging it can conflict.
+
 ## Live Docs Or LLM Context Stale
 
 Symptom: `gitmoot.io/docs` or `/llms.txt` does not show current source docs.

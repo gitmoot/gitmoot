@@ -59,6 +59,7 @@ type MergeGateGitHub interface {
 	CreateCommitStatus(ctx context.Context, input github.CommitStatusInput) (github.CommitStatus, error)
 	PostIssueComment(ctx context.Context, repo github.Repository, issueNumber int64, body string) (github.IssueComment, error)
 	UpdatePullRequestBranch(ctx context.Context, input github.UpdatePullRequestBranchInput) (github.UpdatePullRequestBranchResult, error)
+	BaseRequiresUpToDateHead(ctx context.Context, repo github.Repository, branch string) (required bool, known bool, err error)
 	MergePullRequest(ctx context.Context, input github.MergePullRequestInput) (github.MergeResult, error)
 }
 
@@ -1500,6 +1501,14 @@ func (g PolicyMergeGate) ensureBranchFresh(ctx context.Context, repo github.Repo
 	}
 	status := strings.ToLower(strings.TrimSpace(compare.Status))
 	if compare.BehindBy > 0 || status == "behind" || status == "diverged" {
+		if status != "diverged" && g.baseAllowsBehindMerge(ctx, repo, base) {
+			// #1865: merely behind, and GitHub does not require an up-to-date
+			// head here. Requesting the update at this point would create a
+			// merge commit and supersede the head the verdict is bound to
+			// within seconds, buying a fresh paid review round. Merge the
+			// reviewed head instead.
+			return MergeDecision{}, false, nil
+		}
 		_, err := g.GitHub.UpdatePullRequestBranch(ctx, github.UpdatePullRequestBranchInput{
 			Repo:            repo,
 			Number:          int64(request.PullRequest),
@@ -1531,6 +1540,23 @@ func (g PolicyMergeGate) ensureBranchFresh(ctx context.Context, repo github.Repo
 		return decision, true, err
 	}
 	return MergeDecision{}, false, nil
+}
+
+// baseAllowsBehindMerge reports whether a head that is merely BEHIND base may be
+// merged without first requesting a branch update (#1865).
+//
+// It FAILS CLOSED: an undetermined protection read keeps the pre-#1865
+// behaviour of updating the branch and retrying, because an unprotected branch
+// and a token that cannot read protection are indistinguishable from here.
+func (g PolicyMergeGate) baseAllowsBehindMerge(ctx context.Context, repo github.Repository, base string) bool {
+	if g.GitHub == nil {
+		return false
+	}
+	required, known, err := g.GitHub.BaseRequiresUpToDateHead(ctx, repo, base)
+	if err != nil || !known {
+		return false
+	}
+	return !required
 }
 
 func (g PolicyMergeGate) postMergeConflictComment(ctx context.Context, repo github.Repository, request MergeRequest, pr github.PullRequest, reason string) error {
