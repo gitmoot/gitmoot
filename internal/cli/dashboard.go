@@ -42,9 +42,10 @@ type dashboardSnapshot struct {
 	BranchLocks     []dashboardBranchLock   `json:"branch_locks"`
 	ResourceLocks   []dashboardResourceLock `json:"resource_locks"`
 
-	// jobRows carries per-job rows (and, for blocked/failed jobs, the latest
-	// event message). Unexported so --json and the plain renderer stay
-	// byte-stable.
+	// jobRows carries per-job rows for the web dashboard's run summary. The
+	// latest-event message it also carried went with the attention grouping the
+	// TUI owned (#1787 review F2). Unexported so --json and the plain renderer
+	// stay byte-stable.
 	jobRows []dashboardJobRow
 	// daemonDetail carries the persisted daemon flags/workdir and a tail of
 	// recent log errors. Unexported for the same reason.
@@ -60,17 +61,16 @@ type dashboardDaemonDetail struct {
 	LogErrors []string
 }
 
-// dashboardJobRow is one job with the context the web dashboard's run summary
-// and the attention grouping need.
+// dashboardJobRow is one job as the web dashboard's run summary consumes it.
+//
+// It carried LatestEvent, Repo and PreflightFailed for the attention grouping
+// in the deleted TUI. The only remaining consumer, webDataSource.Runs, projects
+// each row to row.Job and discards everything else, so those three fields were
+// write-only after the deletion and are gone rather than hardened - along with
+// the two per-refresh DB round-trips and the per-job payload unmarshal that
+// existed solely to populate them (#1787 review F2).
 type dashboardJobRow struct {
 	db.Job
-	LatestEvent string
-	Repo        string // parsed from the payload for reportable jobs (attention grouping)
-	// PreflightFailed marks a coordinator whose delegation fan-out could not be
-	// routed (#451). It no longer terminal-blocks (it takes a corrective
-	// continuation and ends succeeded), so this surfaces it regardless of state,
-	// mirroring the `job list` PREFLIGHT_FAILED column.
-	PreflightFailed bool
 }
 
 type dashboardResourceLock struct {
@@ -407,50 +407,13 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 		// Live "active work" view (#505): reuse the already-loaded jobs slice (no
 		// extra DB round-trip) so a running @agent ask is visible while it runs.
 		snapshot.ActiveJobs = buildDashboardActiveJobs(jobs)
-		// One batched read of every job's latest event; blocked/failed rows
-		// surface WHY in the attention list.
-		latestEvents, err := store.LatestJobEvents(ctx)
-		if err != nil {
-			return err
-		}
-		// A delegation preflight failure (#451) no longer terminal-blocks the
-		// coordinator — it takes a corrective continuation and ends succeeded — so
-		// its state and overall-latest event hide the zero-child fan-out. This one
-		// batched read (mirroring the `job list` treatment, reusing the same helper
-		// rather than parallel plumbing) lets the Attention page surface it anyway.
-		// Best-effort: a lookup error just leaves the surfacing off.
-		preflightFailed, _ := store.JobIDsWithEventKind(ctx, "delegation_preflight_failed")
 		for _, job := range jobs {
 			state := job.State
 			if strings.TrimSpace(state) == "" {
 				state = "unknown"
 			}
 			snapshot.Jobs.ByState[state]++
-			row := dashboardJobRow{Job: job}
-			if job.State == "blocked" || job.State == "failed" {
-				row.LatestEvent = latestEvents[job.ID].Message
-			}
-			if reason, ok := preflightFailed[job.ID]; ok && strings.TrimSpace(reason) != "" {
-				row.PreflightFailed = true
-				// Prefer the preflight reason as the "why" unless a blocked/failed
-				// latest event already carries a more specific message.
-				if strings.TrimSpace(row.LatestEvent) == "" {
-					row.LatestEvent = "PREFLIGHT_FAILED: " + reason
-				}
-			}
-			// Reportable jobs (and preflight-failed coordinators, whatever their
-			// state) surface on the Attention page grouped by repo; the repo lives in
-			// the payload, so parse it only for that small subset to keep the refresh
-			// tick cheap.
-			if job.State == "blocked" || job.State == "failed" || job.State == "cancelled" || row.PreflightFailed {
-				var p struct {
-					Repo string `json:"repo"`
-				}
-				if err := json.Unmarshal([]byte(job.Payload), &p); err == nil {
-					row.Repo = strings.TrimSpace(p.Repo)
-				}
-			}
-			snapshot.jobRows = append(snapshot.jobRows, row)
+			snapshot.jobRows = append(snapshot.jobRows, dashboardJobRow{Job: job})
 		}
 		// Newest-first for dashboard run listings (ISO timestamps sort lexically;
 		// id breaks ties deterministically). jobRows is unexported, so the --json

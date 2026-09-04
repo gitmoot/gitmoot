@@ -135,11 +135,7 @@ func TestDashboardWatchRejectsInvalidCombos(t *testing.T) {
 			args: []string{"dashboard", "--home", home, "--watch"},
 			want: "dashboard --watch requires a terminal",
 		},
-		{
-			name: "watch with a non-positive interval",
-			args: []string{"dashboard", "--home", home, "--watch", "--interval", "0s"},
-			want: "dashboard --watch",
-		},
+
 		{
 			name: "positional argument",
 			args: []string{"dashboard", "--home", home, "extra"},
@@ -159,6 +155,47 @@ func TestDashboardWatchRejectsInvalidCombos(t *testing.T) {
 				t.Fatalf("Run(%v) stderr = %q, want it to contain %q", tc.args, stderr.String(), tc.want)
 			}
 		})
+	}
+}
+
+// The interval guard sits BEHIND the terminal guard, so a bytes.Buffer stdout
+// can never reach it: style.IsTerminal is false for any writer without Stat(),
+// so runDashboard exits at "requires a terminal" first. The previous version of
+// this case lived in the combos table with the loose want "dashboard --watch",
+// which the TERMINAL message also contains - so it passed green while measuring
+// the wrong guard, which is precisely the class that round claimed to close
+// (#1787 review F1).
+//
+// Reaching the interval guard needs a stdout that satisfies IsTerminal. /dev/null
+// is a character device, so it does - the same weakness filed as #1838, used
+// here deliberately and named so nobody reads it as an accident.
+func TestDashboardWatchRejectsANonPositiveInterval(t *testing.T) {
+	home := dashboardTestHome(t)
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devNull.Close()
+	if !style.IsTerminal(devNull) {
+		t.Skip("this host does not report /dev/null as a character device, so the terminal guard cannot be passed here")
+	}
+	original := runDashboardWatchFn
+	t.Cleanup(func() { runDashboardWatchFn = original })
+	started := 0
+	runDashboardWatchFn = func(io.Writer, string, bool, time.Duration) int {
+		started++
+		return 0
+	}
+	var stderr bytes.Buffer
+	code := Run([]string{"dashboard", "--home", home, "--watch", "--interval", "0s"}, devNull, &stderr)
+	if started != 0 {
+		t.Fatal("the watch loop started with a non-positive interval")
+	}
+	if code != 2 {
+		t.Fatalf("Run = %d, want 2; stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "dashboard --interval must be greater than zero") {
+		t.Fatalf("stderr = %q, want the INTERVAL guard's own message: a substring that the terminal message also matches proves nothing", stderr.String())
 	}
 }
 

@@ -93,8 +93,11 @@ func TestCockpitRemovalMigrationDropsPopulatedTablesOnUpgrade(t *testing.T) {
 			t.Fatalf("table %q is absent at the previous release, so this test would prove nothing", table)
 		}
 	}
-	// Seed real rows: a migration that dropped nothing, or dropped only some of
-	// the three, must not be able to pass because the tables happened to be empty.
+	// Seed a real row so the drop is exercised against a NON-EMPTY table rather
+	// than an empty one. It is only interactive_prompts, and the sqlite_master
+	// assertions below already cover all three tables regardless of row count -
+	// so this proves the drop survives data, not that a partial drop is caught
+	// (#1787 review F4, correcting an over-claim in the previous comment).
 	if _, err := raw.ExecContext(ctx, `INSERT INTO interactive_prompts (id, question, state)
 		VALUES ('p1', 'which branch?', 'pending')`); err != nil {
 		_ = raw.Close()
