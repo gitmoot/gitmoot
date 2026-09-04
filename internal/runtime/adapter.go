@@ -941,14 +941,42 @@ func effectiveEffort(agent Agent, job Job) string {
 
 func codexSandboxArgs(agent Agent, workdir string) ([]string, PermissionPolicyApplication) {
 	if agent.ReadOnlySeat {
-		args := []string{"--sandbox", "workspace-write"}
-		for _, path := range agent.WritablePaths {
-			if path = strings.TrimSpace(path); path != "" {
-				args = append(args, "--add-dir", path)
-			}
-		}
-		args = append(args, "-c", "sandbox_workspace_write.network_access=true")
-		return args, PermissionPolicyWidened
+		// #1812: A READ-ONLY SEAT MUST NOT NEST A SECOND SANDBOX.
+		//
+		// The seat already runs inside gitmoot's Landlock domain, and codex's
+		// own sandbox is bwrap, which needs a user namespace the domain denies.
+		// Measured on this box, one command with only the domain differing:
+		//
+		//	bwrap --dev-bind / / --unshare-user -- /bin/true
+		//	  outside the domain            -> rc=0
+		//	  inside the domain             -> rc=1, "setting up uid map: Permission denied"
+		//	  inside + /proc writable       -> rc=1, "Failed to make / slave"
+		//	  inside + /proc + /dev writable-> rc=1, "Failed to make / slave"
+		//	plain /bin/true inside the domain -> rc=0
+		//
+		// So the domain itself executes fine and NESTING is the isolated cause.
+		// The grant escalation is also a dead end: /proc write clears the uid
+		// map only to fail on mount propagation, which is why #1812 concluded
+		// grants cannot settle it. Every codex command in such a seat failed
+		// BEFORE running, giving reviews an executed-check count of zero.
+		//
+		// Codex's own help names this exact situation for this exact flag:
+		// "Intended solely for running in environments that are externally
+		// sandboxed". That is what the seat is.
+		//
+		// THE BOUNDARY IS NOT WEAKENED, because it was never codex's: the
+		// Landlock ruleset is unchanged, still read-only outside the seat's
+		// single writable cache root, and it is the boundary gitmoot builds and
+		// tests. Turning codex's sandbox off removes a nested mechanism that
+		// could not start; it grants the seat nothing. --add-dir and the
+		// network toggle are dropped with it because they only ever configured
+		// that sandbox.
+		//
+		// Declared WIDENED, unchanged from the nesting form: this reports what
+		// gitmoot puts on argv relative to the stored autonomy policy, and it
+		// must not claim credit for confinement the runtime is no longer asked
+		// to perform.
+		return []string{"--dangerously-bypass-approvals-and-sandbox"}, PermissionPolicyWidened
 	}
 	switch NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {
 	case AutonomyPolicyReadOnly:

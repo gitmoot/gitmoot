@@ -364,7 +364,21 @@ func TestCodexStartCommandAppliesAutonomyPolicy(t *testing.T) {
 	}
 }
 
-func TestCodexDeliverReadOnlySeatCanRunToolsAndNetwork(t *testing.T) {
+// TestCodexDeliverReadOnlySeatDoesNotNestASandbox is #1812's guard, pinned at
+// the PRODUCTION argv path (Deliver -> codexDeliverArgs), not at the helper.
+//
+// A read-only seat already runs inside gitmoot's Landlock domain, and codex's
+// own sandbox is bwrap, which needs a user namespace that domain denies.
+// Measured: `bwrap --dev-bind / / --unshare-user -- /bin/true` returns rc=0
+// outside the domain and rc=1 "setting up uid map: Permission denied" inside,
+// while a plain command inside returns rc=0 - so nesting, not the domain, is
+// the cause. Every codex command in such a seat therefore failed BEFORE
+// running, and reviews came back with an executed-check count of zero.
+//
+// The assertion is deliberately two-sided: the bypass flag must be present AND
+// no sandbox-selecting flag may reappear. Asserting only the former would pass
+// if a future change emitted both.
+func TestCodexDeliverReadOnlySeatDoesNotNestASandbox(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: "ok"}}}
 	adapter := CodexAdapter{Runner: runner}
 	agent := Agent{
@@ -375,7 +389,20 @@ func TestCodexDeliverReadOnlySeatCanRunToolsAndNetwork(t *testing.T) {
 	if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "review"}); err != nil {
 		t.Fatalf("Deliver returned error: %v", err)
 	}
-	runner.want(t, 0, "codex", "exec", "--sandbox", "workspace-write", "--add-dir", "/cache/tools", "-c", "sandbox_workspace_write.network_access=true", "--json", "resume", "--last", "--", "review")
+	runner.want(t, 0, "codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "--json", "resume", "--last", "--", "review")
+
+	// The nesting-prone policy must not return by any route, including beside
+	// the bypass flag.
+	argv := runner.calls[0]
+	for i, arg := range argv {
+		switch arg {
+		case "--sandbox", "-s":
+			t.Fatalf("read-only seat argv selects a codex sandbox at %d (%v): bwrap cannot start inside the Landlock domain", i, argv)
+		}
+		if strings.HasPrefix(arg, "--sandbox=") || strings.HasPrefix(arg, "sandbox_workspace_write.") {
+			t.Fatalf("read-only seat argv configures a codex sandbox at %d (%v)", i, argv)
+		}
+	}
 }
 
 // TestCodexDeliverNonSeatSandboxUnchanged proves a NON-seat read-only job keeps
