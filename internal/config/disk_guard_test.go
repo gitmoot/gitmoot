@@ -68,3 +68,45 @@ func TestLoadDiskGuardPolicyValidation(t *testing.T) {
 		})
 	}
 }
+
+// TestLoadDiskGuardPolicyMalformedHeaderEndsTheSection pins the malformed-header
+// reset that disk_guard.go shares with tool_cache.go: a header with no closing
+// bracket ENDS whatever section was active rather than silently continuing it.
+//
+// Without the reset, the "[disk_guard" typo below would leave [disk_guard] the
+// active section, and min_free_percent = 99 would be applied to the policy - the
+// same class of bug the #1113 finder raised for [cache].
+//
+// This test exists because the behaviour was UNPINNED. Measured by deleting the
+// reset branch from disk_guard.go: the mutant compiled and the whole
+// internal/config package stayed green, while the equivalent mutant in
+// tool_cache.go is caught by TestLoadToolCache. A shared section scanner would
+// therefore have been free to drop the reset here and nothing would have said so.
+func TestLoadDiskGuardPolicyMalformedHeaderEndsTheSection(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := os.MkdirAll(paths.Home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(`
+[disk_guard]
+enabled = true
+min_free_bytes = 111
+[disk_guard
+min_free_percent = 99
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadDiskGuardPolicy(paths)
+	if err != nil {
+		t.Fatalf("LoadDiskGuardPolicy: %v", err)
+	}
+	if got.MinFreeBytes != 111 {
+		t.Fatalf("MinFreeBytes = %d, want 111 (keys before the malformed header must still apply)", got.MinFreeBytes)
+	}
+	if got.MinFreePercent == 99 {
+		t.Fatal("min_free_percent after a malformed header was applied to [disk_guard]; the header must end the section")
+	}
+	if got.MinFreePercent != DefaultDiskGuardPolicy().MinFreePercent {
+		t.Fatalf("MinFreePercent = %v, want the default %v", got.MinFreePercent, DefaultDiskGuardPolicy().MinFreePercent)
+	}
+}

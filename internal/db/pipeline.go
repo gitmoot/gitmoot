@@ -93,22 +93,10 @@ func (s *Store) GetPipeline(ctx context.Context, name string) (Pipeline, bool, e
 
 // ListPipelines returns every registered pipeline ordered by name.
 func (s *Store) ListPipelines(ctx context.Context) ([]Pipeline, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT name, repo, spec_yaml, spec_hash, enabled, interval, jitter,
+	// Returns NIL for zero rows, as before #1759 (see queryList).
+	return queryList(ctx, s.db, `SELECT name, repo, spec_yaml, spec_hash, enabled, interval, jitter,
 		last_run_at, next_due_at, last_run_id, last_status, created_at, updated_at
-		FROM pipelines ORDER BY name`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var pipelines []Pipeline
-	for rows.Next() {
-		pipeline, err := scanPipeline(rows)
-		if err != nil {
-			return nil, err
-		}
-		pipelines = append(pipelines, pipeline)
-	}
-	return pipelines, rows.Err()
+		FROM pipelines ORDER BY name`, nil, scanPipeline)
 }
 
 // SetPipelineEnabled flips the enabled flag for a pipeline. It returns an error

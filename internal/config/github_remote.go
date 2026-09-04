@@ -47,9 +47,8 @@ func loadGitHubRemote(paths Paths, section string) (GitHubRemotePolicy, error) {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			name := strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
-			current = strings.TrimSpace(name) == section
+		if header, ok := sectionHeader(line); ok {
+			current = header == section
 			continue
 		}
 		if !current {

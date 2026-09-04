@@ -58,9 +58,8 @@ func LoadHeartbeats(paths Paths) ([]Heartbeat, error) {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+		if section, ok := sectionHeader(line); ok {
 			current = nil
-			section := strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
 			agent, name, ok := parseHeartbeatSection(section)
 			if !ok {
 				continue

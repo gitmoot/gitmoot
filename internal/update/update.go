@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/buildinfo"
+	"github.com/gitmoot/gitmoot/internal/shellquote"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
 
@@ -96,7 +97,7 @@ func Check(ctx context.Context, client ReleaseClient, repo string, current build
 			CurrentVersion: current.Version,
 			LatestVersion:  "none",
 			NoRelease:      true,
-			ManualCommands: []string{"gh release view --repo " + shellQuote(repo)},
+			ManualCommands: []string{"gh release view --repo " + shellquote.Posix(repo)},
 		}, nil
 	}
 	if err != nil {
@@ -153,15 +154,15 @@ func Apply(ctx context.Context, runner subprocess.Runner, repo string, check Che
 func ManualCommands(repo string, tag string, asset *Asset, executable string) []string {
 	if asset == nil {
 		return []string{
-			"gh release view " + shellQuote(tag) + " --repo " + shellQuote(repo),
-			"gh release download " + shellQuote(tag) + " --repo " + shellQuote(repo) + " --dir /tmp/gitmoot-update",
+			"gh release view " + shellquote.Posix(tag) + " --repo " + shellquote.Posix(repo),
+			"gh release download " + shellquote.Posix(tag) + " --repo " + shellquote.Posix(repo) + " --dir /tmp/gitmoot-update",
 		}
 	}
 	downloadPath := "/tmp/gitmoot-update/" + asset.Name
 	return []string{
 		"mkdir -p /tmp/gitmoot-update",
-		"gh release download " + shellQuote(tag) + " --repo " + shellQuote(repo) + " --pattern " + shellQuote(asset.Name) + " --output " + shellQuote(downloadPath),
-		"install -m 0755 " + shellQuote(downloadPath) + " " + shellExecutable(executable),
+		"gh release download " + shellquote.Posix(tag) + " --repo " + shellquote.Posix(repo) + " --pattern " + shellquote.Posix(asset.Name) + " --output " + shellquote.Posix(downloadPath),
+		"install -m 0755 " + shellquote.Posix(downloadPath) + " " + shellExecutable(executable),
 	}
 }
 
@@ -309,23 +310,11 @@ func replaceExecutable(source string, target string) error {
 	return os.Remove(backup)
 }
 
-func shellQuote(value string) string {
-	if value == "" {
-		return "''"
-	}
-	if strings.IndexFunc(value, func(r rune) bool {
-		return !(r == '/' || r == '.' || r == '-' || r == '_' || r == ':' || r == '@' || r == '+' || r == '=' || r >= '0' && r <= '9' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z')
-	}) == -1 {
-		return value
-	}
-	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
-}
-
 func shellExecutable(value string) string {
 	if strings.TrimSpace(value) == "" {
 		return "$(command -v gitmoot)"
 	}
-	return shellQuote(value)
+	return shellquote.Posix(value)
 }
 
 func commandError(result subprocess.Result, err error) error {

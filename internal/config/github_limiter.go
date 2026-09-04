@@ -77,8 +77,7 @@ func LoadGitHubLimiterPolicy(paths Paths) (GitHubLimiterPolicy, error) {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "["), "]"))
+		if section, ok := sectionHeader(line); ok {
 			current = section == "github"
 			continue
 		}

@@ -50,19 +50,18 @@ func (s *Store) ClearRecycleOverdueEpisode(ctx context.Context, subject string) 
 
 // ListRecycleOverdueEpisodes returns every open episode in stable subject order.
 func (s *Store) ListRecycleOverdueEpisodes(ctx context.Context) ([]RecycleOverdueEpisode, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT subject, overdue_since, COALESCE(emitted_at, ''), updated_at
-		FROM org_recycle_overdue_episodes ORDER BY subject`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	result := []RecycleOverdueEpisode{}
-	for rows.Next() {
-		var episode RecycleOverdueEpisode
-		if err := rows.Scan(&episode.Subject, &episode.OverdueSince, &episode.EmittedAt, &episode.UpdatedAt); err != nil {
-			return nil, err
-		}
-		result = append(result, episode)
-	}
-	return result, rows.Err()
+	result, err := queryList(ctx, s.db, `SELECT subject, overdue_since, COALESCE(emitted_at, ''), updated_at
+		FROM org_recycle_overdue_episodes ORDER BY subject`, nil,
+		func(row rowScanner) (RecycleOverdueEpisode, error) {
+			var episode RecycleOverdueEpisode
+			err := row.Scan(&episode.Subject, &episode.OverdueSince, &episode.EmittedAt, &episode.UpdatedAt)
+			return episode, err
+		})
+	// emptyIfNil (query_list.go) is the whole contract, including the QUERY-time
+	// divergence this justification used to omit: on an early failure these
+	// methods return a non-nil len-0 slice with the error, where the pre-#1759
+	// bodies returned nil. Stated once there rather than restated here, because
+	// six copies of a justification drift and the previous six were already
+	// silent about half of it (#1795 review N4).
+	return emptyIfNil(result), err
 }

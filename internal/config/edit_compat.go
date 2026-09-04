@@ -68,8 +68,13 @@ func configSectionAtParseError(contents string, parseErr error) string {
 	section := ""
 	for _, raw := range lines[:lineNumber] {
 		line := strings.TrimSpace(stripConfigComment(raw))
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section = strings.TrimSpace(line[1 : len(line)-1])
+		// Shares the package's section classification (#1759), which also means a
+		// malformed header CLEARS the reported section rather than leaving the
+		// previous one named. That is the right answer for a diagnostic: an
+		// unclosed bracket is frequently the parse error itself, so naming the
+		// section before it would point the operator at the wrong place.
+		if header, ok := sectionHeader(line); ok {
+			section = header
 		}
 	}
 	return section

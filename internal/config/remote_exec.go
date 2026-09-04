@@ -69,9 +69,8 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section := strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
-			current = strings.TrimSpace(section) == "remote_exec"
+		if section, ok := sectionHeader(line); ok {
+			current = section == "remote_exec"
 			continue
 		}
 		if !current {

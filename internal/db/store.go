@@ -334,21 +334,9 @@ func (s *Store) ListCockpitPanesByRoot(ctx context.Context, rootJobID string) ([
 // The reconcile GC uses it to find orphaned rows (pane gone from herdr + owning
 // root terminal) without scanning per-root.
 func (s *Store) ListAllCockpitPanes(ctx context.Context) ([]CockpitPane, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, job_id, pane_key, root_job_id, pane_id, workspace_id, source, created_at
-		FROM cockpit_panes ORDER BY created_at, rowid`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var panes []CockpitPane
-	for rows.Next() {
-		pane, err := scanCockpitPane(rows)
-		if err != nil {
-			return nil, err
-		}
-		panes = append(panes, pane)
-	}
-	return panes, rows.Err()
+	// Returns NIL for zero rows, as before #1759 (see queryList).
+	return queryList(ctx, s.db, `SELECT id, job_id, pane_key, root_job_id, pane_id, workspace_id, source, created_at
+		FROM cockpit_panes ORDER BY created_at, rowid`, nil, scanCockpitPane)
 }
 
 // DeleteCockpitPane removes a pane record by ID. Deleting a missing row is a

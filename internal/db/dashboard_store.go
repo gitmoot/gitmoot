@@ -196,25 +196,24 @@ func (s *Store) ListDashboardUnlabeledJobs(ctx context.Context, since string) ([
 }
 
 func (s *Store) ListDashboardBlockedJobs(ctx context.Context) ([]DashboardJobRow, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT j.id, j.agent, j.state, j.workflow_id, j.repo,
+	out, err := queryList(ctx, s.db, `SELECT j.id, j.agent, j.state, j.workflow_id, j.repo,
 		j.payload, j.created_at, j.updated_at,
 		COALESCE(NULLIF(j.blocker_suggested_action, ''),
 			(SELECT e.message FROM job_events e WHERE e.job_id = j.id ORDER BY e.id DESC LIMIT 1), '')
-	FROM jobs j WHERE j.state = 'blocked' ORDER BY j.updated_at DESC, j.id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []DashboardJobRow{}
-	for rows.Next() {
-		var item DashboardJobRow
-		if err := rows.Scan(&item.ID, &item.Agent, &item.State, &item.WorkflowID, &item.Repo,
-			&item.Payload, &item.CreatedAt, &item.UpdatedAt, &item.Reason); err != nil {
-			return nil, err
-		}
-		out = append(out, item)
-	}
-	return out, rows.Err()
+	FROM jobs j WHERE j.state = 'blocked' ORDER BY j.updated_at DESC, j.id`, nil,
+		func(row rowScanner) (DashboardJobRow, error) {
+			var item DashboardJobRow
+			err := row.Scan(&item.ID, &item.Agent, &item.State, &item.WorkflowID, &item.Repo,
+				&item.Payload, &item.CreatedAt, &item.UpdatedAt, &item.Reason)
+			return item, err
+		})
+	// emptyIfNil (query_list.go) is the whole contract, including the QUERY-time
+	// divergence this justification used to omit: on an early failure these
+	// methods return a non-nil len-0 slice with the error, where the pre-#1759
+	// bodies returned nil. Stated once there rather than restated here, because
+	// six copies of a justification drift and the previous six were already
+	// silent about half of it (#1795 review N4).
+	return emptyIfNil(out), err
 }
 
 func (s *Store) ListDashboardTerminalBuckets(ctx context.Context, since, now string) ([]DashboardTerminalBucket, error) {

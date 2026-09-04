@@ -71,9 +71,13 @@ func LoadAdmissionPolicy(paths Paths) (AdmissionPolicy, error) {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section := strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
-			current = strings.TrimSpace(section) == "admission"
+		if section, ok := sectionHeader(line); ok {
+			if section == "" && malformedHeaderTargets(line, "admission") {
+				// Falling back to the zero policy makes Enabled() false, which
+				// makes the daemon skip admission accounting entirely.
+				return AdmissionPolicy{}, fmt.Errorf("parse admission section: missing closing ]")
+			}
+			current = section == "admission"
 			continue
 		}
 		if !current {

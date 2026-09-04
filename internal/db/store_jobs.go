@@ -1636,59 +1636,52 @@ func (s *Store) LatestAdvancementMarker(ctx context.Context, jobID string) (stri
 // GetLatestJobEventsByKind returns the newest event of kind for each requested
 // job in one indexed query. Empty input returns an initialized empty map.
 func (s *Store) GetLatestJobEventsByKind(ctx context.Context, jobIDs []string, kind string) (map[string]JobEvent, error) {
-	out := map[string]JobEvent{}
-	if len(jobIDs) == 0 {
-		return out, nil
-	}
-	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(jobIDs)), ",")
-	args := make([]any, 0, 2*(len(jobIDs)+1))
-	args = append(args, kind)
-	for _, jobID := range jobIDs {
-		args = append(args, jobID)
-	}
-	args = append(args, kind)
-	for _, jobID := range jobIDs {
-		args = append(args, jobID)
-	}
-	query := `SELECT job_id, kind, message, created_at FROM job_events
-		WHERE kind = ? AND job_id IN (` + placeholders + `)
-		  AND id IN (SELECT MAX(id) FROM job_events
-			WHERE kind = ? AND job_id IN (` + placeholders + `) GROUP BY job_id)`
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var event JobEvent
-		if err := rows.Scan(&event.JobID, &event.Kind, &event.Message, &event.CreatedAt); err != nil {
-			return nil, err
-		}
-		out[event.JobID] = event
-	}
-	return out, rows.Err()
+	return s.jobEventsByKindExtreme(ctx, jobIDs, kind, jobEventPickNewest)
 }
 
 // GetEarliestJobEventsByKind returns the oldest event of kind for each requested
 // job in one indexed query. Empty input returns an initialized empty map.
 func (s *Store) GetEarliestJobEventsByKind(ctx context.Context, jobIDs []string, kind string) (map[string]JobEvent, error) {
+	return s.jobEventsByKindExtreme(ctx, jobIDs, kind, jobEventPickOldest)
+}
+
+// jobEventPick names the aggregate that selects one event per job. It is a
+// closed set of package-private constants rather than a string parameter
+// precisely because its value is INTERPOLATED into the statement below: a caller
+// able to supply that text would be supplying SQL. The two exported methods
+// above are the only way in, and each names a constant.
+type jobEventPick string
+
+const (
+	jobEventPickNewest jobEventPick = "MAX"
+	jobEventPickOldest jobEventPick = "MIN"
+)
+
+// jobEventsByKindExtreme is the shared body of GetLatestJobEventsByKind and
+// GetEarliestJobEventsByKind, which were line-for-line identical apart from
+// MAX(id) versus MIN(id) (#1759). Both exported names are kept: they are called
+// from the daemon's hot path and from the escalation ladder, and renaming them
+// would be a behaviour change dressed as deduplication.
+//
+// Returns an INITIALIZED EMPTY MAP for empty input, as both twins did - a nil
+// map would still read as empty but would panic on assignment for any future
+// caller that tried to add to the result.
+func (s *Store) jobEventsByKindExtreme(ctx context.Context, jobIDs []string, kind string, pick jobEventPick) (map[string]JobEvent, error) {
 	out := map[string]JobEvent{}
 	if len(jobIDs) == 0 {
 		return out, nil
 	}
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(jobIDs)), ",")
 	args := make([]any, 0, 2*(len(jobIDs)+1))
-	args = append(args, kind)
-	for _, jobID := range jobIDs {
-		args = append(args, jobID)
-	}
-	args = append(args, kind)
-	for _, jobID := range jobIDs {
-		args = append(args, jobID)
+	for range 2 {
+		args = append(args, kind)
+		for _, jobID := range jobIDs {
+			args = append(args, jobID)
+		}
 	}
 	query := `SELECT job_id, kind, message, created_at FROM job_events
 		WHERE kind = ? AND job_id IN (` + placeholders + `)
-		  AND id IN (SELECT MIN(id) FROM job_events
+		  AND id IN (SELECT ` + string(pick) + `(id) FROM job_events
 			WHERE kind = ? AND job_id IN (` + placeholders + `) GROUP BY job_id)`
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {

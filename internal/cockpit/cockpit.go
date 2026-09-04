@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/shellquote"
 	"github.com/gitmoot/gitmoot/internal/transcript"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -514,16 +515,16 @@ func (a *paneAdapter) workspaceRoot() string {
 // watcher remains the best-effort fallback.
 func (a *paneAdapter) watchCommand() string {
 	if a.meta.LogPath != "" {
-		path := shellQuote(a.meta.LogPath)
-		cmd := fmt.Sprintf("%s job watch %s --transcript --log-path %s --runtime %s", a.cockpit.gitmootBin, shellQuote(a.meta.JobID), path, shellQuote(a.meta.Runtime))
+		path := shellquote.Posix(a.meta.LogPath)
+		cmd := fmt.Sprintf("%s job watch %s --transcript --log-path %s --runtime %s", a.cockpit.gitmootBin, shellquote.Posix(a.meta.JobID), path, shellquote.Posix(a.meta.Runtime))
 		if a.cockpit.home != "" {
-			cmd += fmt.Sprintf(" --home %s", shellQuote(a.cockpit.home))
+			cmd += fmt.Sprintf(" --home %s", shellquote.Posix(a.cockpit.home))
 		}
 		return cmd + fmt.Sprintf(" || exec tail -n +1 -F %s", path)
 	}
-	cmd := fmt.Sprintf("%s job watch %s", a.cockpit.gitmootBin, shellQuote(a.meta.JobID))
+	cmd := fmt.Sprintf("%s job watch %s", a.cockpit.gitmootBin, shellquote.Posix(a.meta.JobID))
 	if a.cockpit.home != "" {
-		cmd += fmt.Sprintf(" --home %s", shellQuote(a.cockpit.home))
+		cmd += fmt.Sprintf(" --home %s", shellquote.Posix(a.cockpit.home))
 	}
 	return cmd
 }
@@ -532,9 +533,6 @@ func (a *paneAdapter) watchCommand() string {
 // command the pane runs, so a log path with spaces or shell metacharacters is
 // passed as one literal argument. Single quotes preserve everything except a
 // single quote, which is closed, escaped, and reopened.
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
 
 // rootPaneFor derives a best-effort split-parent for a workspace whose root pane
 // id was not captured at create time (legacy registry rows predating that

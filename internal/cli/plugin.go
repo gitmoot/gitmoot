@@ -20,6 +20,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/plugininstall"
 	"github.com/gitmoot/gitmoot/internal/pluginpack"
 	gitmootruntime "github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/shellquote"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/skills"
 )
@@ -601,14 +602,12 @@ func shellQuote(value string, shell string) string {
 	}
 }
 
+// posixQuote delegates to the single shared implementation (#1759). It kept a
+// DENYLIST until then, which passed '~', '#' and every non-ASCII rune through
+// unquoted; the shared allowlist quotes them. The multi-shell dispatch in
+// shellQuote above is a real feature and stays.
 func posixQuote(value string) string {
-	if value == "" {
-		return "''"
-	}
-	if !strings.ContainsAny(value, " \t\r\n'\"\\$`!&;()<>|*?[]{}") {
-		return value
-	}
-	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+	return shellquote.Posix(value)
 }
 
 func powershellQuote(value string) string {

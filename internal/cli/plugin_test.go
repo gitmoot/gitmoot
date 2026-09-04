@@ -70,7 +70,11 @@ func TestRunPluginCodexLaunchConfigSnippet(t *testing.T) {
 
 func TestFormatCodexLaunchCommandQuotesShellArguments(t *testing.T) {
 	posix := formatCodexLaunchCommand("codex-face", "/tmp/repo with spaces", "/tmp/git'moot", "posix")
-	if !strings.Contains(posix, "'/tmp/repo with spaces'") || !strings.Contains(posix, "'/tmp/git'\\''moot'") {
+	// #1759 moved the embedded-single-quote idiom from '\'' to '"'"' when the four
+	// shellQuote implementations were consolidated. Both are valid POSIX and mean
+	// the same thing to sh - internal/shellquote's /bin/sh round-trip covers that
+	// - but the bytes differ, so this expectation names the current idiom.
+	if !strings.Contains(posix, "'/tmp/repo with spaces'") || !strings.Contains(posix, `'/tmp/git'"'"'moot'`) {
 		t.Fatalf("posix command did not quote safely: %s", posix)
 	}
 	powershell := formatCodexLaunchCommand("codex-face", `C:\Repo With Spaces`, `C:\Users\O'Brien\.gitmoot`, "powershell")

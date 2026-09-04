@@ -210,8 +210,8 @@ func parseOrgContent(content []byte) (OrgConfig, error) {
 			}
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			name, role, ok, err := parseOrgSection(strings.TrimSpace(line[1 : len(line)-1]))
+		if header, isHeader := sectionHeader(line); isHeader {
+			name, role, ok, err := parseOrgSection(header)
 			if err != nil {
 				return OrgConfig{}, err
 			}

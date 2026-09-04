@@ -157,9 +157,8 @@ func LoadOrchestratePolicy(paths Paths) (OrchestratePolicy, error) {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section := strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
-			current = strings.TrimSpace(section) == "orchestrate"
+		if section, ok := sectionHeader(line); ok {
+			current = section == "orchestrate"
 			continue
 		}
 		if !current {
@@ -432,9 +431,8 @@ func LoadEventsPolicy(paths Paths) (EventsPolicy, error) {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section := strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
-			current = strings.TrimSpace(section) == "events"
+		if section, ok := sectionHeader(line); ok {
+			current = section == "events"
 			continue
 		}
 		if !current {
@@ -624,8 +622,10 @@ func LoadReviewConfig(paths Paths) (ReviewConfig, error) {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section := strings.TrimSuffix(strings.TrimPrefix(line, "["), "]")
+		if section, ok := sectionHeader(line); ok {
+			if section == "" && malformedHeaderTargets(line, "review") {
+				return ReviewConfig{}, fmt.Errorf("parse review section: missing closing ]")
+			}
 			repo, inSection = parseReviewSection(section)
 			if inSection && repo != "" {
 				if _, ok := cfg.repos[repo]; !ok {
