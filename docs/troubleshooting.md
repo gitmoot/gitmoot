@@ -660,6 +660,156 @@ Fixes:
   then abstains from its native merge gate — fail-closed, it never merges
   gatelessly; the external gate makes the call.
 
+## Read-Only Reviewer Seat Refuses To Start
+
+A read-only seat runs the runtime against an ISOLATED home rather than yours, so
+anything the runtime reads at startup must be staged into that home first. When
+a startup input is missing, Gitmoot now fails BY NAME instead of letting the
+runtime report something unrelated.
+
+Symptoms:
+
+- `read-only seat requires runtime input "config.toml", and <path> does not
+  exist` - the host profile has no such file. This is a HARD PREREQUISITE for
+  kimi: `~/.kimi-code/config.toml` must exist on the host, or the seat cannot
+  start. Previously this surfaced as "No model configured" behind an auth
+  message that pointed at `kimi login`, which cannot fix it.
+- `runtime input "<path>" must be a regular file` - the path is a directory,
+  socket, device or fifo. A SYMLINK is fine and is followed, so a
+  stow/chezmoi-managed profile works; a symlink whose target is missing counts
+  as missing, and a symlink to a directory is refused.
+- `read-only seat credential <path> is unusable: claudeAiOauth expired at
+  <time> and carries no refreshToken` - the profile stages and parses but cannot
+  authenticate. Re-authenticate the host claude profile. An expired token WITH a
+  refresh token is accepted, because refreshing it is the runtime's job.
+- `narrow runtime input "<path>": codex config.toml has a section header that is
+  not readable` - the file has a section header that never closes, so Gitmoot
+  cannot locate the credentials it must strip. It refuses rather than stage a
+  file it cannot classify. Fix the TOML or remove it from the host state dir.
+
+What the seat stages, per runtime:
+
+| runtime | staged from | inputs |
+| --- | --- | --- |
+| claude | `~/.claude` | `.credentials.json`, narrowed to `claudeAiOauth` and checked for usability. Nothing is staged in gateway mode, where the gateway supplies the credential. |
+| codex | `~/.codex` | `auth.json`, plus `config.toml` when present - NARROWED, see below |
+| kimi | `~/.kimi-code` | `config.toml` (REQUIRED), `credentials/kimi-code.json` |
+
+### Why the staged codex config.toml is not a copy
+
+The seat's staged state lives inside the one writable path granted to the
+sandbox, so a reviewer can read anything placed there. A codex `config.toml`
+routinely carries credentials that have nothing to do with running the model, so
+Gitmoot narrows it before staging:
+
+- `[mcp_servers.*]` is dropped ENTIRELY. Its `env` table holds tokens, `args`
+  can hold them just as easily, and a read-only reviewer seat has no business
+  spawning third-party servers. MCP servers are optional to codex, so dropping
+  them cannot stop the seat starting.
+- `[model_providers.*]` KEEPS its structure and loses only `api_key` and
+  `http_headers`. Dropping the section would look stricter and would break a
+  custom `model`, because removing `base_url` and `wire_api` makes the provider
+  unresolvable. `env_key` and `env_http_headers` name environment variables
+  rather than hold values, so they stay.
+- Everything else is kept: those are the model and sandbox settings the file is
+  staged for.
+
+Dotted and quoted forms are classified the same way, so
+`mcp_servers.github.env.TOKEN = "..."` at the top level and
+`[mcp_servers."my server".env]` are both dropped.
+
+### The staged kimi config.toml is narrowed too
+
+kimi's `config.toml` is REQUIRED, and it carries more than codex's does:
+measured on a live host, `api_key` under `[services.*]` and a key under
+`[services.*.oauth]` alongside `[providers.*]`. For kimi the staged copy lands
+directly inside the seat's writable root, so it is narrowed on the same rule:
+
+- `[services.*]` is dropped ENTIRELY. It configures optional tooling (moonshot
+  search and fetch) and carries those tools' credentials.
+- `[providers.*]` keeps its structure and keeps `api_key` and its `env`
+  sub-table ONLY for the provider `default_model` resolves to - the model's
+  segment before the first `/` matched against the provider name's segment
+  after the last `:`, so `default_model = "kimi-code/k3"` selects
+  `[providers."managed:kimi-code"]`. Dropping every provider credential is not
+  an option: kimi refuses to start when both `api_key` and the `env` sub-table
+  are absent, so the seat legitimately needs exactly one.
+- If NO provider can be resolved, or two match ambiguously, every provider
+  credential is withheld. A credential nobody can prove is needed is not
+  staged.
+
+The same rule now applies to codex: `[model_providers.*]` keeps `api_key` and
+`http_headers` for the provider `model_provider` selects and strips every
+other. Stripping the selected provider's key too left the seat unable to
+authenticate at all, because `env_key` names a variable the sandbox's
+environment allowlist does not pass through.
+
+### Finding out what was withheld
+
+Narrowing is not silent. When anything is withheld the job records a
+`read_only_seat_config_narrowed` event naming it, so a reviewer whose MCP tool
+is missing - or a seat that cannot reach a provider - can find out why:
+
+```sh
+gitmoot job events <job-id> | grep read_only_seat_config_narrowed
+```
+
+### Two more refusals, and what gateway mode withholds
+
+Narrowing reads the file with ONE scanner shared by narrowing and provider
+selection, so escapes, comments, multi-line strings and unbalanced brackets are
+interpreted identically everywhere. Two shapes are refused rather than staged,
+because in both cases part of the file could not be classified, and staging an
+unclassified tail is the leak the narrowing exists to prevent:
+
+- `config has an array or inline table that never closes` - an unbalanced `[`
+  or `{` reached the end of the file.
+- `config has a multi-line string that never closes` - as before.
+
+A triple delimiter inside a COMMENT or inside a single-line string is not a
+multi-line string, and a backslash-escaped quote is valid TOML that stages
+unchanged.
+
+One provider shape is refused for a different reason:
+
+- `codex model_provider "<name>" authenticates only through env_key, and a
+  read-only seat's environment allowlist does not pass that variable through` -
+  set an inline `api_key` for that provider, or point `model_provider` at one
+  the seat can reach. Previously this staged cleanly and the seat failed later
+  with the runtime's own message.
+
+In GATEWAY mode the gateway supplies the credential, so a gateway seat stages
+NO credential file for any runtime - claude's `.credentials.json`, codex's
+`auth.json` and kimi's `credentials/kimi-code.json` are all withheld. Model
+settings are still staged, narrowed as above.
+
+### Comments, and what a seat does when a config cannot be narrowed
+
+Narrowing classifies the COMMENT-FREE part of each line and stages the line
+unchanged, so an ordinary TOML comment cannot change what is withheld. Both
+directions were defects: `[services] # see [docs]` used to have the comment's
+`]` swallowed into the section name, staging that section's secrets verbatim,
+and `default_model = "kimi-code/k3" # pinned` used to make the comment part of
+the provider name, withholding the one credential the seat needs. Your comments
+survive into the staged file.
+
+A key/value pair is split on the first `=` OUTSIDE quotes, so a quoted key
+containing `=` is kept rather than dropped.
+
+**A config that cannot be narrowed is treated by whether the runtime needs it:**
+
+- codex's `config.toml` is OPTIONAL. If it cannot be narrowed - an unbalanced
+  `[` or `{` at end of file, an unreadable section header, or a selected
+  provider that can only authenticate through `env_key` - the seat starts
+  WITHOUT it and falls back to the runtime default. The file is not staged and
+  the reason is named in the `read_only_seat_config_narrowed` job event.
+- kimi's `config.toml` is REQUIRED, so the same refusal fails the seat by name.
+  kimi cannot start without it, and a silent fallback would surface later as
+  "No model configured".
+
+In GATEWAY mode no runtime stages a credential file, and the policy the seat
+computes says so rather than naming files it then withholds.
+
 ## Worktrees consume too much disk
 
 The daemon checks task-owned worktrees every five minutes. A task is eligible

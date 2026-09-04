@@ -164,9 +164,7 @@ func startRuntimeSessionLockHeartbeatWithCadence(ctx context.Context, store *db.
 func runtimeSessionResourceKey(agent runtime.Agent) (string, bool) {
 	runtimeName := strings.TrimSpace(agent.Runtime)
 	runtimeRef := strings.TrimSpace(agent.RuntimeRef)
-	switch runtimeName {
-	case runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime:
-	default:
+	if !resumableSessionRuntime(runtimeName) {
 		return "", false
 	}
 	if runtimeRef == "" {
