@@ -812,19 +812,22 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			// #1903's third review round caught that residue.
 			//
 			// The safety is supplied elsewhere, by PolicyMergeGate - but only for the
-			// rows a given evaluation actually reaches, so name the population, never
-			// a coverage absolute (#1903's fifth round killed "a row carrying a head
-			// is reached by one or the other", which is false). Line numbers are
-			// relative to THIS BRANCH's tree; merge_gate.go moved on main after this
-			// base (#1783), where the same symbols sit ~6 lines later.
-			// An objection at the CURRENT head enters the STRICT evaluated-head
-			// population (merge_gate.go:288/:311 live head, :809-816 head filter,
-			// :895-898 mergeBlocked) and holds the merge there. When that population
-			// is EMPTY the LATEST-ROUND fallback runs (:978-1044) and head-checks
-			// only the SELECTED round's eligible rows (:1048, refused at :1629). A
-			// row at a STALE head is therefore reached by NEITHER path - which is
-			// head-binding working rather than a gap, since a verdict about a commit
-			// the branch moved past has no claim on the current head.
+			// rows a given evaluation actually reaches, so name the population and
+			// never a coverage absolute. Two rounds of this PR died on exactly that:
+			// "reached by one path or the other" (round 5) and then "a stale row is
+			// reached by NEITHER" (round 6), both false. Cited by SYMBOL rather than
+			// by line, because the line maps were measured against a different tree
+			// and, once corrected, still pointed at declarations instead of returns.
+			// An objection at the CURRENT head enters the strict evaluated-head
+			// population that Evaluate builds from the live GetPullRequest head, and
+			// holds the merge there. When that population is EMPTY the latest-round
+			// fallback selects the newest round and puts its authorship-eligible rows
+			// through ensureReviewMatchesHead. A STALE-headed row therefore has three
+			// cases, not one: excluded while a current-head row survives; REACHED AND
+			// REFUSED by the fallback ("is for a different head SHA") when it is in
+			// the selected round and nothing current exists; or not reached at all
+			// when the selection passes over it. See the three pins named on
+			// TestObjectionWithNoObservedPullRequestRowStillRequestsChanges.
 			//
 			// What differs between the two sides is the consequence of refusing:
 			// refusing an unconfirmable APPROVAL fails safe, because nothing merges

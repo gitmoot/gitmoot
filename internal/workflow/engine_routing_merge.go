@@ -880,22 +880,26 @@ func (e Engine) parkTaskAwaitingHumanMerge(ctx context.Context, ref taskRef, rea
 // objection nobody recorded". That claim is FALSE, and #1903's independent
 // review is what caught it:
 //
-//   - PolicyMergeGate blocks on the OBJECTION ROW itself, not on task state - for
-//     the rows a given evaluation reaches, which is a population and never a
-//     coverage absolute (#1903's fifth round killed "a row carrying a head is
-//     reached either way"). Line numbers are relative to THIS BRANCH's tree;
-//     merge_gate.go moved on main after this base (#1783).
-//     On the STRICT path it derives the head live (merge_gate.go:288
-//     GetPullRequest -> :311), selects review rows whose payload.HeadSHA equals
-//     that head (:809-816), and returns mergeBlocked "review at evaluated head
-//     has blocking result" for changes_requested, blocked or failed (:895-898).
-//     When that population is EMPTY the LATEST-ROUND fallback (:978-1044)
-//     head-checks only the SELECTED round's eligible rows (:1048, refused at
-//     :1629). So a CURRENT-head objection is held at the gate, and a STALE one is
-//     reached by neither path - head-binding working, not a gap. Either way,
-//     refusing the TASK transition does not un-record the review row, so refusing
-//     here buys no merge protection. The headless case depends on the review
-//     population and is documented at TestObjectionWithNoHeadStillRequestsChanges.
+//   - PolicyMergeGate blocks on the OBJECTION ROW itself, not on task state - but
+//     only for the rows a given evaluation reaches, which is a POPULATION and
+//     never a coverage absolute. Two later rounds of this PR killed two
+//     successive attempts to state it as one, and a third killed the line numbers
+//     for pointing at another tree and then at declarations rather than returns,
+//     so this cites SYMBOLS and ordering.
+//     On the STRICT path, Evaluate derives the head LIVE through
+//     MergeGateGitHub.GetPullRequest, collects rows whose payload.HeadSHA equals
+//     it, and returns mergeBlocked "review at evaluated head has blocking result"
+//     for changes_requested, blocked or failed. When that population is EMPTY the
+//     latest-round fallback selects the newest round and puts its
+//     authorship-eligible rows through ensureReviewMatchesHead. So a CURRENT-head
+//     objection is held at the gate; a STALE one is excluded while something
+//     current survives, REFUSED by the fallback ("is for a different head SHA")
+//     when it is in the selected round and nothing current exists, and not
+//     reached at all when the selection passes over it. In every case refusing
+//     the TASK transition does not un-record the review row, so refusing HERE
+//     buys no merge protection. The three cases are pinned by name on
+//     TestObjectionWithNoObservedPullRequestRowStillRequestsChanges; the headless
+//     case is documented at TestObjectionWithNoHeadStillRequestsChanges.
 //
 // What refusing would actually cost is the CONSERVATIVE transition and, because
 // dispatchFix is called inline from this arm, the FIX PASS - for an objection
