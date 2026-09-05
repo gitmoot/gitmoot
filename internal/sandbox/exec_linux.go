@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -243,9 +244,22 @@ func addExecutableReadRoots(add func(string, bool) error, executable string) err
 }
 
 // optionalSystemToolchainRoot grants the Go installation selected by PATH when
-// it lives under a system package root. Review agents must be able to run the
-// repository's toolchain, while a user-controlled binary under /root or /home
-// must not turn its credential-bearing parent into a readable subtree.
+// granting it cannot expose a credential-bearing directory. Review agents must
+// be able to run the repository's toolchain, while a user-controlled binary
+// under a home directory must not turn that home into a readable subtree.
+//
+// TWO ARMS. A system package root is granted outright. Otherwise the root is
+// granted only when it sits at least minToolchainDepthBelowHome segments below
+// the invoking operator's home, which is what lets an operator-pinned
+// toolchain under ~/.local/toolchains/<version> run while ~/bin/go stays
+// refused (#1878).
+//
+// The prefix list alone left this sandbox unable to exec the toolchain this
+// repository pins, so every read-only review seat reported
+// evidence=static_only after four exit-126 refusals: `go` was resolvable and
+// readable but not executable, because a Landlock domain that never received
+// the grant denies exec with EACCES. #1839 named that defect and was closed
+// without ever changing this function.
 func optionalSystemToolchainRoot(executable string) string {
 	if resolved, err := filepath.EvalSymlinks(executable); err == nil {
 		executable = resolved
@@ -261,7 +275,64 @@ func optionalSystemToolchainRoot(executable string) string {
 			return root
 		}
 	}
+	if toolchainRootBelowHome(root, operatorHomeDir()) {
+		return root
+	}
 	return ""
+}
+
+// minToolchainDepthBelowHome is how far below the operator's home a grantable
+// toolchain root must sit.
+//
+// The value is load-bearing rather than cautious. The directories this sandbox
+// exists to withhold from a review seat - ~/.gitmoot, ~/.codex, ~/.claude -
+// are all EXACTLY ONE segment below home, so requiring two or more makes a
+// credential directory unreachable by this rule while ~/.local/toolchains/go1.26.4
+// (three) is reachable. ~/bin/go resolves to a root at depth zero and stays
+// refused, which is the case the prefix list was protecting.
+//
+// It bounds only which root may be granted, never what that root contains: a
+// deep root can still hold something sensitive, so only the toolchain root
+// itself is added and TestReadableRootsWithholdsOperatorCredentialDirectories
+// pins that the resulting list excludes home and the withheld dotdirs.
+const minToolchainDepthBelowHome = 2
+
+// toolchainRootBelowHome reports whether root is a strict descendant of home by
+// at least minToolchainDepthBelowHome segments. Pure string logic so it is
+// testable without a filesystem or a particular operator account.
+func toolchainRootBelowHome(root, home string) bool {
+	root = strings.TrimSpace(root)
+	home = strings.TrimSpace(home)
+	if root == "" || home == "" || !filepath.IsAbs(root) || !filepath.IsAbs(home) {
+		return false
+	}
+	rel, err := filepath.Rel(filepath.Clean(home), filepath.Clean(root))
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return len(strings.Split(rel, string(filepath.Separator))) >= minToolchainDepthBelowHome
+}
+
+// operatorHomeDir resolves the INVOKING OPERATOR's home from the passwd
+// database, deliberately NOT from $HOME.
+//
+// MEASURED, and the whole reason this helper exists: a read-only seat rewrites
+// HOME to its own throwaway cache root, and sandbox-exec inherits that env, so
+// os.UserHomeDir() inside this process returns the SEAT's home. With HOME
+// pointed at a scratch directory, os.UserHomeDir() returned that scratch path
+// while user.Current().HomeDir still returned the operator's real home. A depth
+// rule written against os.UserHomeDir() would therefore never match the
+// operator's toolchain and this fix would be INERT in exactly the process it
+// exists to serve.
+//
+// Called before RestrictPaths installs any rule, so reading passwd needs no
+// grant of its own.
+func operatorHomeDir() string {
+	current, err := user.Current()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(current.HomeDir)
 }
 
 func writableRoots(paths []string, workdir string, includeImplicitRoots bool) ([]string, error) {
