@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -1038,30 +1039,359 @@ func TestIrregularMembersAreRefusedWithoutBlocking(t *testing.T) {
 // parallel run without saying so is the same class as the racing regression it
 // replaced, so a second installer must FAIL rather than win.
 func TestOpenWindowHookAdmitsOneInstaller(t *testing.T) {
-	// CONTROL: install and release cleanly, twice in sequence, so the refusal
-	// below is about concurrency rather than about the hook being unusable.
-	for i := 0; i < 2; i++ {
-		release := installOpenWindowHook(func(string) {})
-		release()
+	for _, seam := range []struct {
+		name    string
+		install func(func(string)) func()
+		loaded  func() bool
+	}{
+		{name: "openWindowHook", install: installOpenWindowHook, loaded: func() bool { return openWindowHook.Load() != nil }},
+		{name: "dirWindowHook", install: installDirWindowHook, loaded: func() bool { return dirWindowHook.Load() != nil }},
+	} {
+		t.Run(seam.name, func(t *testing.T) {
+			// CONTROL: install and release cleanly, twice in sequence, so the
+			// refusal below is about concurrency rather than the seam being
+			// unusable.
+			for i := 0; i < 2; i++ {
+				seam.install(func(string) {})()
+			}
+			if seam.loaded() {
+				t.Fatal("release did not clear the hook")
+			}
+
+			release := seam.install(func(string) {})
+			defer release()
+
+			panicked := func() (caught bool) {
+				defer func() {
+					if recover() != nil {
+						caught = true
+					}
+				}()
+				seam.install(func(string) {})()
+				return false
+			}()
+			if !panicked {
+				t.Fatal("a second installer succeeded; two parallel tests could interfere silently")
+			}
+		})
 	}
-	if openWindowHook.Load() != nil {
-		t.Fatal("release did not clear the hook")
+}
+
+// TestIntermediateDirectoryReplacementCannotRedirectTheWalk is the P1 regression.
+//
+// THE DEFECT: walkAnchored used to ReadDir a directory, CLOSE the handle, then
+// re-resolve each child FROM THE TOP ROOT by joined pathname. Replacing the PARENT
+// in that gap redirected the children, and openVerified could not see it because
+// both of its observations of the child agreed on the replacement object. A
+// reviewer reproduced it publishing content from a directory never selected.
+//
+// WHY IT NEEDS ITS OWN SEAM, and this is the measured reason rather than a
+// preference: scheduling the swap on openWindowHook - the child's Lstat-to-open
+// window - does NOT reproduce it. That window straddles the swap, so sameObject
+// refuses with "changed between inspection and open". I tried exactly that first
+// and got a refusal, which is why the suite could be green against a live defect.
+// dirWindowHook fires at the only interval where the swap is observable: entries
+// known, no child resolved yet.
+func TestIntermediateDirectoryReplacementCannotRedirectTheWalk(t *testing.T) {
+	base := t.TempDir()
+	source := goInstall(t, filepath.Join(base, "src"), "bin")
+
+	member := filepath.Join(source, "lib")
+	if err := os.MkdirAll(member, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(member, "marker"), []byte("legit"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	decoy := filepath.Join(source, "decoy")
+	if err := os.MkdirAll(decoy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(decoy, "marker"), []byte("PRIVATE-UNSELECTED"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 
-	release := installOpenWindowHook(func(string) {})
+	// CONTROL: a clean stage copies the real member, so an exposure below is a
+	// redirection rather than the copy doing its job.
+	clean, err := Stage(filepath.Join(base, "home-clean"), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(clean, "lib", "marker"))
+	if err != nil || string(body) != "legit" {
+		t.Fatalf("precondition: clean stage produced %q err=%v", body, err)
+	}
+
+	// FIRE ON THE SECOND VISIT, i.e. DURING THE COPY PASS. Stage walks the source
+	// twice - once to fingerprint, once to copy - and firing on the FIRST visit
+	// swaps the tree BEFORE the copy pass starts, so the copy legitimately reads
+	// the replacement and this test would be measuring the CROSS-PASS gap instead.
+	// I wrote it that way first and it failed for exactly that reason; the
+	// cross-pass reconciliation is deliberately a separate issue, so this test
+	// targets the WITHIN-PASS window it is named for.
+	visits := 0
+	fired := false
+	release := installDirWindowHook(func(name string) {
+		if name != "lib" {
+			return
+		}
+		visits++
+		if visits < 2 || fired {
+			return
+		}
+		fired = true
+		// swap the PARENT after its entries are known, before any child resolves
+		if err := os.Rename(member, filepath.Join(base, "lib-moved")); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.Rename(decoy, member); err != nil {
+			t.Error(err)
+		}
+	})
 	defer release()
 
-	panicked := func() (caught bool) {
-		defer func() {
-			if recover() != nil {
-				caught = true
+	staged, stageErr := Stage(filepath.Join(base, "home"), source)
+	if !fired {
+		t.Fatalf("the seam never fired on the copy pass (visits=%d), so this test proved nothing", visits)
+	}
+	if stageErr == nil {
+		if got, readErr := os.ReadFile(filepath.Join(staged, "lib", "marker")); readErr == nil {
+			if string(got) == "PRIVATE-UNSELECTED" {
+				t.Fatalf("the walk was redirected: staged lib/marker holds %q from a directory never selected", got)
 			}
-		}()
-		second := installOpenWindowHook(func(string) {})
-		second()
-		return false
-	}()
-	if !panicked {
-		t.Fatal("a second installer succeeded; two parallel tests could interfere silently")
+			// the held descriptor must still see the ORIGINAL directory
+			if string(got) != "legit" {
+				t.Fatalf("staged lib/marker holds %q, want the validated content", got)
+			}
+		}
+	}
+	// either outcome is acceptable - refuse, or copy the validated inode - as long
+	// as the unselected directory's content is never published.
+	if staged != "" {
+		if _, err := os.Stat(filepath.Join(staged, "decoy")); err == nil {
+			t.Fatal("the decoy directory itself was published")
+		}
+	}
+}
+
+// TestDirectorySubstitutedBetweenInspectionAndResolutionIsRefused reaches the
+// window openVerifiedRoot guards, which nothing could reach before.
+//
+// openVerifiedRoot Lstats a directory, opens it as a sub-root, and reconciles the
+// two with sameObject. That reconciliation was correct and UNTESTABLE: a mutant
+// deleting it survived every test, because no seam fired in its window. This is
+// the third guard on this PR that was right and unreachable, so the remedy is a
+// seam at the window rather than a better argument for the guard.
+func TestDirectorySubstitutedBetweenInspectionAndResolutionIsRefused(t *testing.T) {
+	base := t.TempDir()
+	source := goInstall(t, filepath.Join(base, "src"), "bin")
+	member := filepath.Join(source, "lib")
+	if err := os.MkdirAll(member, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(member, "marker"), []byte("legit"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	decoy := filepath.Join(source, "decoy")
+	if err := os.MkdirAll(decoy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(decoy, "marker"), []byte("PRIVATE-UNSELECTED"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// CONTROL first: the same tree stages and yields the validated content.
+	clean, err := Stage(filepath.Join(base, "home-clean"), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body, _ := os.ReadFile(filepath.Join(clean, "lib", "marker")); string(body) != "legit" {
+		t.Fatalf("precondition: clean stage produced %q", body)
+	}
+
+	fired := false
+	release := installOpenWindowHook(func(name string) {
+		if name != "lib" || fired {
+			return
+		}
+		fired = true
+		// swap the directory between its Lstat and its OpenRoot
+		if err := os.Rename(member, filepath.Join(base, "lib-moved")); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.Rename(decoy, member); err != nil {
+			t.Error(err)
+		}
+	})
+	defer release()
+
+	// COUNT DESCRIPTORS ACROSS REPEATED REFUSALS. This is the only path that
+	// reaches openVerifiedRoot's reconcile failure, where the sub-root has already
+	// been opened and must be released before returning. A mutant dropping that
+	// release survived every other test, including the fd test, because nothing
+	// else fails in that branch.
+	fdCount := func() int {
+		entries, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			return -1
+		}
+		return len(entries)
+	}
+	beforeFds := fdCount()
+	for attempt := 0; attempt < 5; attempt++ {
+		fired = false
+		if err := os.RemoveAll(filepath.Join(base, "home-leak", strconv.Itoa(attempt))); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = Stage(filepath.Join(base, "home-leak", strconv.Itoa(attempt)), source)
+		// restore the tree so each attempt reaches the same window
+		if _, err := os.Lstat(filepath.Join(base, "lib-moved")); err == nil {
+			_ = os.Rename(member, decoy)
+			_ = os.Rename(filepath.Join(base, "lib-moved"), member)
+		}
+	}
+	if afterFds := fdCount(); beforeFds > 0 && afterFds > beforeFds+4 {
+		t.Errorf("descriptors grew from %d to %d across 5 refused directory substitutions", beforeFds, afterFds)
+	}
+
+	fired = false
+	staged, stageErr := Stage(filepath.Join(base, "home"), source)
+	if !fired {
+		t.Fatal("the seam never fired on a directory, so this test proved nothing")
+	}
+	if stageErr != nil {
+		if !errors.Is(stageErr, ErrSymlink) {
+			t.Fatalf("refusal %v does not wrap ErrSymlink", stageErr)
+		}
+		if !strings.Contains(stageErr.Error(), "changed between inspection and open") {
+			t.Errorf("refusal %q does not name the substitution", stageErr)
+		}
+		return
+	}
+	if body, readErr := os.ReadFile(filepath.Join(staged, "lib", "marker")); readErr == nil && string(body) == "PRIVATE-UNSELECTED" {
+		t.Fatalf("a directory substituted in its own resolution window was published: %q", body)
+	}
+}
+
+// TestIdentityIsIndependentOfTraversalOrder pins a hazard THIS round introduced.
+//
+// Moving the fingerprint from "collect names, sort, digest" to "digest during the
+// walk" made the identity depend on traversal order. A mutant removing the
+// per-directory entry sort survived every test, which means two identical trees
+// could have produced different identities and the same tree could have rehashed
+// differently on another filesystem - a silently wrong answer, not an error.
+//
+// The fix folds PER-FILE digests by sorted path, so the identity is a property of
+// the content set. This test drives that property directly rather than hoping the
+// walk order is stable.
+func TestIdentityIsIndependentOfTraversalOrder(t *testing.T) {
+	build := func(dir string, order []string) string {
+		root := goInstall(t, dir, "bin")
+		nested := filepath.Join(root, "pkg", "tool", "linux_amd64")
+		if err := os.MkdirAll(nested, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// create the same set in DIFFERENT orders
+		for _, name := range order {
+			if err := os.WriteFile(filepath.Join(nested, name), []byte("body-"+name), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return root
+	}
+	base := t.TempDir()
+	forward := build(filepath.Join(base, "forward"), []string{"aa", "bb", "cc", "dd", "ee"})
+	reverse := build(filepath.Join(base, "reverse"), []string{"ee", "dd", "cc", "bb", "aa"})
+
+	one, err := Identify(forward)
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := Identify(reverse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one != two {
+		t.Fatalf("identity depends on creation order: %v vs %v", one, two)
+	}
+
+	// CONTROL: a genuinely different content set MUST differ, so the equality
+	// above is order-independence rather than the digest ignoring content.
+	changed := build(filepath.Join(base, "changed"), []string{"aa", "bb", "cc", "dd", "ff"})
+	three, err := Identify(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if three == one {
+		t.Fatal("a different content set produced the same identity; the digest is not covering names")
+	}
+}
+
+// TestStageReleasesEveryDescriptor pins descriptor lifetime, which per-directory
+// sub-roots made a live concern.
+//
+// The walk now holds an os.Root per ANCESTOR, released as each subtree completes,
+// so the live count is the tree DEPTH rather than the directory count - measured on
+// the pinned distribution as max depth 13 across 1667 directories. Mutants that
+// dropped the release on the normal path AND on the reconcile-failure path both
+// survived every test, so nothing was guarding it. This counts real descriptors
+// around both a succeeding and a FAILING stage, because the failing path is where a
+// leak actually accumulates.
+func TestStageReleasesEveryDescriptor(t *testing.T) {
+	open := func() int {
+		entries, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			t.Skipf("cannot count descriptors on this platform: %v", err)
+		}
+		return len(entries)
+	}
+
+	base := t.TempDir()
+	deep := goInstall(t, filepath.Join(base, "src"), "bin")
+	// a tree deep enough that a per-directory leak would be obvious
+	nested := deep
+	for i := 0; i < 12; i++ {
+		nested = filepath.Join(nested, "pkg")
+		if err := os.MkdirAll(nested, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(nested, "tool"), []byte("x"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	before := open()
+	for i := 0; i < 5; i++ {
+		home := filepath.Join(base, "home", strconv.Itoa(i))
+		if _, err := Stage(home, deep); err != nil {
+			t.Fatalf("stage %d failed: %v", i, err)
+		}
+	}
+	afterSuccess := open()
+	if afterSuccess > before+4 {
+		t.Errorf("descriptors grew from %d to %d across 5 successful stages", before, afterSuccess)
+	}
+
+	// THE FAILING PATH, which is where a missing release accumulates: a refused
+	// stage must release every sub-root it opened on the way down.
+	broken := goInstall(t, filepath.Join(base, "broken"), "bin")
+	victim := filepath.Join(broken, "pkg", "deep")
+	if err := os.MkdirAll(victim, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(base, "elsewhere"), filepath.Join(victim, "link")); err != nil {
+		t.Fatal(err)
+	}
+	beforeFail := open()
+	for i := 0; i < 5; i++ {
+		if _, err := Stage(filepath.Join(base, "home-fail", strconv.Itoa(i)), broken); err == nil {
+			t.Fatal("precondition: the broken tree must be refused")
+		}
+	}
+	afterFail := open()
+	if afterFail > beforeFail+4 {
+		t.Errorf("descriptors grew from %d to %d across 5 REFUSED stages", beforeFail, afterFail)
 	}
 }

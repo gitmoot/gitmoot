@@ -387,6 +387,96 @@ func installOpenWindowHook(fn func(name string)) (release func()) {
 	return func() { openWindowHook.Store(nil) }
 }
 
+// openVerifiedRoot is openVerified for a DIRECTORY: it returns a *os.Root that
+// HOLDS a descriptor for that directory, so every name resolved through it is
+// relative to the inode we validated.
+//
+// WHY THIS EXISTS. walkAnchored used to ReadDir a directory, CLOSE the handle,
+// and then re-resolve each child FROM THE TOP ROOT by joined pathname. Replacing
+// the PARENT directory in that gap redirected the children, and openVerified
+// could not see it because both its observations of the child agreed on the
+// replacement object. Reviewer-reproduced, and it published content from a
+// directory that was never selected.
+//
+// Measured at the primitive, with a control that discriminates:
+//
+//	top.Open("real/inner/f") after the parent swap   "PRIVATE-UNSELECTED"
+//	held sub.Open("inner/f") across the same swap    "LEGIT"
+//	CONTROL top.Open by path, same moment            "PRIVATE-UNSELECTED"
+//
+// So a held sub-root removes the class rather than narrowing it. The shape was
+// already in this package - verifyPublished has always identified through
+// destinationRoot.OpenRoot - so this applies it to the source walk rather than
+// inventing anything.
+//
+// THE OpenRoot CALL IS ITSELF A RESOLUTION, so it is reconciled the same way a
+// file open is: the directory is Lstat'd, refused if it is a symlink, opened as a
+// root, and then that root's own "." is compared against the Lstat with
+// sameObject. Without that comparison this function would have reproduced the very
+// defect it exists to remove, one call deeper.
+func openVerifiedRoot(root *os.Root, name string) (*os.Root, fs.FileInfo, error) {
+	before, err := root.Lstat(name)
+	if err != nil {
+		return nil, nil, err
+	}
+	if before.Mode()&fs.ModeSymlink != 0 {
+		return nil, nil, fmt.Errorf("%w: %s", ErrSymlink, name)
+	}
+	if !before.IsDir() {
+		return nil, nil, fmt.Errorf("%w: %s is not a directory", ErrNotPinned, name)
+	}
+	// SAME WINDOW, SAME SEAM. openWindowHook means "between inspecting a name and
+	// resolving it", which is exactly the interval here, so the directory case
+	// reuses it rather than inventing a third hook. Without this the sameObject
+	// reconciliation below was real but UNTESTABLE - a mutant deleting it survived
+	// every test, because nothing could schedule a swap in its window. That is the
+	// third time on this PR that a guard was correct and unreachable by any
+	// instrument; the remedy is a seam at the window, not a better argument.
+	if hook := openWindowHook.Load(); hook != nil {
+		(*hook)(name)
+	}
+	sub, err := root.OpenRoot(name)
+	if err != nil {
+		return nil, nil, err
+	}
+	after, err := sub.Stat(".")
+	if err != nil {
+		sub.Close()
+		return nil, nil, err
+	}
+	if err := sameObject(before, after, name); err != nil {
+		sub.Close()
+		return nil, nil, err
+	}
+	return sub, after, nil
+}
+
+// dirWindowHook is unset in production and installed only by tests. It fires
+// AFTER a directory's entries have been read and BEFORE any child is resolved,
+// which is the only interval in which an intermediate-directory replacement is
+// observable.
+//
+// IT EXISTS BECAUSE openWindowHook PROVABLY CANNOT SEE THIS. That hook fires
+// between a child's Lstat and its open, so it STRADDLES the swap and sameObject
+// refuses - measured: scheduling the swap there produced "lib/marker changed
+// between inspection and open" rather than an exposure. A suite can therefore be
+// green against a live intermediate-swap defect, which is what happened. The
+// remedy is a seam at the real window, not a better race.
+//
+// Single-installer and atomic for the same reason as openWindowHook, and now with
+// more force: two test seams double the chance of one test firing inside
+// another's traversal.
+var dirWindowHook atomic.Pointer[func(name string)]
+
+// installDirWindowHook installs fn and returns its release function, panicking if
+// a hook is already installed.
+func installDirWindowHook(fn func(name string)) (release func()) {
+	if !dirWindowHook.CompareAndSwap(nil, &fn) {
+		panic("toolchain: dirWindowHook is already installed; this seam admits one installer at a time")
+	}
+	return func() { dirWindowHook.Store(nil) }
+}
+
 // sameObject is the comparison, extracted as a PURE predicate so both arms are
 // reachable by a deterministic test rather than only by winning a race.
 func sameObject(inspected, opened fs.FileInfo, name string) error {
@@ -444,106 +534,164 @@ func readVersion(root *os.Root) (string, error) {
 // fingerprintExecutables digests every regular file carrying an exec bit, in
 // sorted order, path and content.
 func fingerprintExecutables(root *os.Root) (string, error) {
-	var names []string
+	perFile := make(map[string][sha256.Size]byte, 64)
 	for _, member := range requiredMembers {
-		found, err := collectExecutables(root, member)
-		if err != nil {
+		if err := digestMember(root, member, perFile); err != nil {
 			return "", fmt.Errorf("required member %s: %w", member, err)
 		}
-		names = append(names, found...)
 	}
 	for _, member := range optionalMembers {
-		found, err := collectExecutables(root, member)
-		if err != nil {
+		if err := digestMember(root, member, perFile); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
 			return "", fmt.Errorf("optional member %s: %w", member, err)
 		}
-		names = append(names, found...)
 	}
-	if len(names) == 0 {
+	if len(perFile) == 0 {
 		return "", fmt.Errorf("%w: no executables found to fingerprint", ErrNotPinned)
 	}
+	names := make([]string, 0, len(perFile))
+	for name := range perFile {
+		names = append(names, name)
+	}
+	// SORTED FOLD, so the identity is a property of the CONTENT SET and not of the
+	// order the filesystem happened to return entries in.
 	sort.Strings(names)
-
 	digest := sha256.New()
 	for _, name := range names {
-		handle, _, err := openVerified(root, name, os.O_RDONLY)
-		if err != nil {
-			return "", fmt.Errorf("%w: fingerprint %s: %v", ErrNotPinned, name, err)
-		}
 		fmt.Fprintf(digest, "%s\n", name)
-		_, copyErr := io.Copy(digest, handle)
-		closeErr := handle.Close()
-		if copyErr != nil {
-			return "", fmt.Errorf("%w: fingerprint %s: %v", ErrNotPinned, name, copyErr)
-		}
-		if closeErr != nil {
-			return "", closeErr
-		}
+		sum := perFile[name]
+		digest.Write(sum[:])
 	}
 	return fmt.Sprintf("%x", digest.Sum(nil))[:16], nil
 }
 
-// collectExecutables walks a member anchored to root and returns the root-relative
-// names of executable regular files.
-func collectExecutables(root *os.Root, member string) ([]string, error) {
-	var found []string
-	err := walkAnchored(root, member, func(name string, info fs.FileInfo) error {
-		if info.Mode().IsRegular() && info.Mode().Perm()&0o111 != 0 {
-			found = append(found, name)
+// digestMember walks a member and records a PER-MEMBER digest for every executable,
+// reading each one THROUGH THE ROOT THAT HOLDS ITS PARENT.
+//
+// IT DIGESTS DURING THE WALK rather than collecting names to re-open later,
+// because a name collected now and opened later is a second resolution, which is
+// the whole defect class. A sub-root cannot be kept for later either: it is
+// released when its subtree completes so the live descriptor count stays at the
+// tree depth.
+//
+// PER-FILE DIGESTS FOLDED IN SORTED ORDER, NOT A SINGLE ROLLING HASH, and this is
+// a defect this round introduced and then caught. The first version streamed every
+// file into one rolling sha256 in WALK order, which made the identity depend on
+// traversal order; a mutant removing the per-directory entry sort survived every
+// test, so two identical trees could have hashed differently and the same tree
+// could have rehashed differently across filesystems. Recording per-file digests
+// and folding them by sorted path restores order-independence without
+// reintroducing a second read.
+//
+// It also happens to retain exactly the per-member values the deferred cross-pass
+// reconciliation needs, which is the one thing that decides that issue's cost.
+func digestMember(root *os.Root, member string, into map[string][sha256.Size]byte) error {
+	return walkAnchored(root, member, func(parent *os.Root, leaf, displayPath string, info fs.FileInfo) error {
+		if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+			return nil
 		}
+		handle, _, err := openVerified(parent, leaf, os.O_RDONLY)
+		if err != nil {
+			return fmt.Errorf("%w: fingerprint %s: %v", ErrNotPinned, displayPath, err)
+		}
+		perFile := sha256.New()
+		_, copyErr := io.Copy(perFile, handle)
+		closeErr := handle.Close()
+		if copyErr != nil {
+			return fmt.Errorf("%w: fingerprint %s: %v", ErrNotPinned, displayPath, copyErr)
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		into[displayPath] = [sha256.Size]byte(perFile.Sum(nil))
 		return nil
 	})
-	return found, err
 }
 
-// walkAnchored walks name anchored to root, refusing symlinks and irregular files,
-// and calls visit for every entry.
+// walkAnchored walks name and hands every entry to visit ALONG WITH THE ROOT THAT
+// HOLDS ITS PARENT, so the visitor can resolve it by leaf name rather than
+// re-resolving a path from the top.
 //
-// CLASSIFY WHAT YOU HOLD, AND THIS NOW ACTUALLY DOES. Every entry goes through
-// openVerified, which refuses a symlinked name and then proves the object it
-// opened is the object it inspected.
+// THE VISITOR CONTRACT IS PART OF THE FIX, not decoration. An earlier attempt
+// carried handles through the traversal but left visit taking only a display
+// path, so copyOneFile re-resolved that path FROM THE TOP ROOT and the walk was
+// still redirected by an intermediate swap. The regression caught it: the fix was
+// cosmetic until the descriptor reached the consumer. My own plan had marked this
+// site "handle can be carried: yes" and I had wired only the traversal.
+func walkAnchored(root *os.Root, name string, visit func(parent *os.Root, leaf, displayPath string, info fs.FileInfo) error) error {
+	return walkHeld(root, name, name, visit)
+}
+
+// walkHeld resolves leaf THROUGH root, which holds a descriptor for leaf's parent,
+// and reports displayPath to visit.
 //
-// TWO EARLIER VERSIONS OF THIS COMMENT WERE WRONG, both retracted here. The first
-// claimed "there is no interval in which a swapped component could redirect the
-// operation"; an interval did exist, because the Lstat and the open were separate
-// steps. The second claimed the interval's consequence was bounded to copying a
-// duplicate of a file already selected - that was disproved by a probe which
-// published an UNSELECTED root file through the window. The interval is now
-// closed by comparing inodes across it rather than described.
-func walkAnchored(root *os.Root, name string, visit func(string, fs.FileInfo) error) error {
-	// openVerified covers the name this walk was entered with as well as every
-	// entry the recursion reaches, and proves each opened object is the one it
-	// inspected. A symlinked top-level member was copied before the first half
-	// existed, and an inode-swapped one before the second.
-	handle, info, err := openVerified(root, name, os.O_RDONLY)
+// NO CALL HERE EVER RESOLVES A MULTI-SEGMENT PATH. Children are resolved by LEAF
+// NAME through the sub-root of the directory that listed them, so an ancestor
+// being replaced mid-walk cannot redirect anything: the descriptor still refers to
+// the inode we validated. That is what removes the intermediate-replacement class
+// rather than narrowing it.
+//
+// DESCRIPTOR LIFETIME IS TREE DEPTH, NOT DIRECTORY COUNT, which is the bound the
+// ruling required and the reason this is affordable. A sub-root is held only while
+// its own subtree is being walked and is released by defer as each level completes,
+// so the live count is the number of ANCESTORS. Measured on the pinned
+// distribution: max depth 13 across 1667 directories, so at most 14 descriptors at
+// once rather than 1667. A per-directory lifetime would have risked EMFILE under
+// concurrent workers, which is a refusal of VALID input - the failure mode every
+// bound in this campaign has had a version of.
+func walkHeld(root *os.Root, leaf, displayPath string, visit func(parent *os.Root, leaf, displayPath string, info fs.FileInfo) error) error {
+	before, err := root.Lstat(leaf)
 	if err != nil {
 		return err
 	}
-	if !info.IsDir() {
+	if before.Mode()&fs.ModeSymlink != 0 {
+		return fmt.Errorf("%w: %s", ErrSymlink, displayPath)
+	}
+	if !before.IsDir() {
+		handle, info, err := openVerified(root, leaf, os.O_RDONLY)
+		if err != nil {
+			return err
+		}
 		defer handle.Close()
 		if !info.Mode().IsRegular() {
-			return fmt.Errorf("%w: %s is not a regular file", ErrNotPinned, name)
+			return fmt.Errorf("%w: %s is not a regular file", ErrNotPinned, displayPath)
 		}
-		return visit(name, info)
+		return visit(root, leaf, displayPath, info)
+	}
+
+	sub, info, err := openVerifiedRoot(root, leaf)
+	if err != nil {
+		return err
+	}
+	// RELEASED WHEN THIS SUBTREE COMPLETES, including on every error return below,
+	// which is what keeps the live descriptor count at the depth rather than
+	// leaking one per directory visited.
+	defer sub.Close()
+
+	handle, err := sub.Open(".")
+	if err != nil {
+		return err
 	}
 	entries, readErr := handle.ReadDir(-1)
 	handle.Close()
 	if readErr != nil {
 		return readErr
 	}
-	if err := visit(name, info); err != nil {
+	if err := visit(root, leaf, displayPath, info); err != nil {
 		return err
 	}
+
+	// The only interval in which an intermediate replacement is observable: the
+	// entries are known, and no child has been resolved yet.
+	if hook := dirWindowHook.Load(); hook != nil {
+		(*hook)(displayPath)
+	}
+
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 	for _, entry := range entries {
-		// No directory-entry symlink check here: the recursive call's own
-		// openVerified covers it. An earlier version had both, and a mutant
-		// deleting this one survived every test, which is what a redundant guard
-		// looks like. Deleted rather than given a test that could only ever pass.
-		if err := walkAnchored(root, path.Join(name, entry.Name()), visit); err != nil {
+		if err := walkHeld(sub, entry.Name(), path.Join(displayPath, entry.Name()), visit); err != nil {
 			return err
 		}
 	}
@@ -725,7 +873,7 @@ func copyInstallation(sourceRoot, destinationRoot *os.Root, destination string) 
 		}
 	}
 	for _, name := range rootFiles {
-		if err := copyOneFile(sourceRoot, destinationRoot, name, path.Join(destination, name)); err != nil {
+		if err := copyOneFile(sourceRoot, name, destinationRoot, path.Join(destination, name)); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
@@ -736,12 +884,14 @@ func copyInstallation(sourceRoot, destinationRoot *os.Root, destination string) 
 }
 
 func copyMember(sourceRoot, destinationRoot *os.Root, destination, member string) error {
-	return walkAnchored(sourceRoot, member, func(name string, info fs.FileInfo) error {
-		target := path.Join(destination, name)
+	return walkAnchored(sourceRoot, member, func(parent *os.Root, leaf, displayPath string, info fs.FileInfo) error {
+		target := path.Join(destination, displayPath)
 		if info.IsDir() {
 			return destinationRoot.MkdirAll(target, 0o755)
 		}
-		return copyOneFile(sourceRoot, destinationRoot, name, target)
+		// resolved by LEAF through the root holding its parent, never by
+		// displayPath from the top
+		return copyOneFile(parent, leaf, destinationRoot, target)
 	})
 }
 
@@ -751,7 +901,7 @@ func copyMember(sourceRoot, destinationRoot *os.Root, destination, member string
 //
 // NO PER-FILE fsync: measured at 136.18s against 1.07s on 15022 files. Data
 // integrity comes from re-verifying the digest on reuse (see stage).
-func copyOneFile(sourceRoot, destinationRoot *os.Root, name, target string) error {
+func copyOneFile(sourceRoot *os.Root, name string, destinationRoot *os.Root, target string) error {
 	handle, info, err := openVerified(sourceRoot, name, os.O_RDONLY)
 	if err != nil {
 		return err

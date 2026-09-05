@@ -775,22 +775,25 @@ exactly as it was before this feature existed rather than failing the launch:
   GiB. Reclaim space; do not lower the floor to make the message go away.
 - **The source contains a symlink.** A symlinked name is refused anywhere in the
   copied set, because following one copies something the daemon never validated.
-  The check also proves the file it opened is the file it inspected, so a source
-  whose *name* is redirected while it is being copied is refused rather than
-  copied.
+  The check also proves the file it opened is the file it inspected, and staging
+  walks a directory through a held handle rather than re-resolving its path, so a
+  source whose *name* is redirected mid-copy is refused rather than followed -
+  including when the directory containing it is the thing replaced.
 
-**One limit of that check, stated rather than left implied.** It proves the file
+**Two limits of that, stated rather than left implied.** First, it proves the file
 did not **change** between being inspected and being opened. A hardlink does not
 change the file - it is the same underlying object - so replacing a source file
 with a hardlink to another file is **not** detected. Two things bound this rather
 than excuse it: with the kernel default `fs.protected_hardlinks=1`, creating such
 a link already requires read and write access to the target, so it gains nothing
 an attacker did not already have; and the operator-pinned toolchain is root-owned
-and not writable by a seat, so a seat cannot create one. Staging also reads the
-source twice, once to fingerprint it and once to copy it, and only executables are
-reconciled between those two reads. **If you point staging at a directory that
-untrusted processes can write, these are the gaps to know about** - the intended
-source is an installation only the operator can modify.
+and not writable by a seat, so a seat cannot create one. Second, staging reads the source **twice**, once to
+fingerprint it and once to copy it, and only executables are reconciled between
+those two reads: a non-executable that differs between them is not detected. Each
+read is internally consistent, so this is a gap between the passes rather than
+inside one. **If you point staging at a directory that untrusted processes can
+write, these are the gaps to know about** - the intended source is an installation
+only the operator can modify.
 
 To recover, fix the cause and restart the daemon, or run the seat's job again:
 staging is attempted per launch and a previously failed stage is retried rather
