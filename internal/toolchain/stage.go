@@ -75,6 +75,13 @@ const MinFreeBytes = 4 << 30
 // path component.
 const maxVersionLength = 64
 
+// SENTINELS ARE WRAPPED WITH %w, NEVER %v. A wrap that formats the inner error
+// with %v discards the chain, so errors.Is on an inner sentinel silently returns
+// false. Found by a test of mine asserting errors.Is(err, ErrSymlink) on a genuine
+// symlink refusal and getting false, because requireExecutableGo had formatted the
+// inner error with %v - the refusal message was right and the sentinel was
+// unreachable. A caller branching on the sentinel would have taken the wrong path
+// on a correct refusal.
 var (
 	// ErrNotPinned reports a source that is not an operator-pinned Go
 	// installation. It is not a failure: callers leave the sandbox's
@@ -189,7 +196,7 @@ func Identify(source string) (Identity, error) {
 	}
 	root, err := os.OpenRoot(source)
 	if err != nil {
-		return Identity{}, fmt.Errorf("%w: %v", ErrNotPinned, err)
+		return Identity{}, fmt.Errorf("%w: %w", ErrNotPinned, err)
 	}
 	defer root.Close()
 	return identifyRoot(root)
@@ -489,11 +496,21 @@ func sameObject(inspected, opened fs.FileInfo, name string) error {
 // requireExecutableGo proves bin/go is a real executable regular file, from a
 // descriptor rather than from a name.
 func requireExecutableGo(root *os.Root) error {
-	// openVerified refuses a symlinked name AND proves the opened object is the
-	// one it inspected, so this site needs no separate guard of its own.
-	handle, info, err := openVerified(root, "bin/go", os.O_RDONLY)
+	// bin IS OPENED AS A SUB-ROOT AND go IS RESOLVED BY LEAF THROUGH IT, the same
+	// shape as the walk. This site previously called openVerified(root, "bin/go"),
+	// so BOTH its Lstat and its open resolved the intermediate bin component from
+	// the top source root - exactly the multi-component operation the
+	// descriptor-per-directory invariant excludes, and a reviewer found it
+	// surviving the round that claimed to close the class. One surviving site
+	// reinstates the defect.
+	binRoot, _, err := openVerifiedRoot(root, "bin")
 	if err != nil {
-		return fmt.Errorf("%w: bin/go: %v", ErrNotPinned, err)
+		return fmt.Errorf("%w: bin: %w", ErrNotPinned, err)
+	}
+	defer binRoot.Close()
+	handle, info, err := openVerified(binRoot, "go", os.O_RDONLY)
+	if err != nil {
+		return fmt.Errorf("%w: bin/go: %w", ErrNotPinned, err)
 	}
 	defer handle.Close()
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
@@ -517,7 +534,7 @@ func requireExecutableGo(root *os.Root) error {
 func readVersion(root *os.Root) (string, error) {
 	handle, info, err := openVerified(root, "VERSION", os.O_RDONLY)
 	if err != nil {
-		return "", fmt.Errorf("%w: VERSION: %v", ErrNotPinned, err)
+		return "", fmt.Errorf("%w: VERSION: %w", ErrNotPinned, err)
 	}
 	defer handle.Close()
 	if !info.Mode().IsRegular() {
@@ -526,7 +543,7 @@ func readVersion(root *os.Root) (string, error) {
 	buffer := make([]byte, maxVersionLength+1)
 	read, err := handle.Read(buffer)
 	if err != nil && read == 0 {
-		return "", fmt.Errorf("%w: VERSION: %v", ErrNotPinned, err)
+		return "", fmt.Errorf("%w: VERSION: %w", ErrNotPinned, err)
 	}
 	return strings.SplitN(string(buffer[:read]), "\n", 2)[0], nil
 }
@@ -588,22 +605,14 @@ func fingerprintExecutables(root *os.Root) (string, error) {
 // It also happens to retain exactly the per-member values the deferred cross-pass
 // reconciliation needs, which is the one thing that decides that issue's cost.
 func digestMember(root *os.Root, member string, into map[string][sha256.Size]byte) error {
-	return walkAnchored(root, member, func(parent *os.Root, leaf, displayPath string, info fs.FileInfo) error {
+	return walkAnchored(root, member, func(parent *os.Root, leaf, displayPath string, info fs.FileInfo, handle *os.File) error {
 		if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
 			return nil
 		}
-		handle, _, err := openVerified(parent, leaf, os.O_RDONLY)
-		if err != nil {
-			return fmt.Errorf("%w: fingerprint %s: %v", ErrNotPinned, displayPath, err)
-		}
+		// reads the handle the WALK opened; no second resolution of this name
 		perFile := sha256.New()
-		_, copyErr := io.Copy(perFile, handle)
-		closeErr := handle.Close()
-		if copyErr != nil {
-			return fmt.Errorf("%w: fingerprint %s: %v", ErrNotPinned, displayPath, copyErr)
-		}
-		if closeErr != nil {
-			return closeErr
+		if _, err := io.Copy(perFile, handle); err != nil {
+			return fmt.Errorf("%w: fingerprint %s: %w", ErrNotPinned, displayPath, err)
 		}
 		into[displayPath] = [sha256.Size]byte(perFile.Sum(nil))
 		return nil
@@ -620,7 +629,13 @@ func digestMember(root *os.Root, member string, into map[string][sha256.Size]byt
 // still redirected by an intermediate swap. The regression caught it: the fix was
 // cosmetic until the descriptor reached the consumer. My own plan had marked this
 // site "handle can be carried: yes" and I had wired only the traversal.
-func walkAnchored(root *os.Root, name string, visit func(parent *os.Root, leaf, displayPath string, info fs.FileInfo) error) error {
+// A REGULAR FILE IS OPENED ONCE AND THE HANDLE IS HANDED TO visit. A reviewer's
+// structural probe found walkHeld and its visitors each opening every member file,
+// which is not merely wasteful: the two opens are separate resolutions and nothing
+// reconciled them, so the file classified by the walk could differ from the file
+// the visitor then read. That is the same class this round exists to close, one
+// level further down. The handle is closed by walkHeld after visit returns.
+func walkAnchored(root *os.Root, name string, visit func(parent *os.Root, leaf, displayPath string, info fs.FileInfo, handle *os.File) error) error {
 	return walkHeld(root, name, name, visit)
 }
 
@@ -641,7 +656,7 @@ func walkAnchored(root *os.Root, name string, visit func(parent *os.Root, leaf, 
 // once rather than 1667. A per-directory lifetime would have risked EMFILE under
 // concurrent workers, which is a refusal of VALID input - the failure mode every
 // bound in this campaign has had a version of.
-func walkHeld(root *os.Root, leaf, displayPath string, visit func(parent *os.Root, leaf, displayPath string, info fs.FileInfo) error) error {
+func walkHeld(root *os.Root, leaf, displayPath string, visit func(parent *os.Root, leaf, displayPath string, info fs.FileInfo, handle *os.File) error) error {
 	before, err := root.Lstat(leaf)
 	if err != nil {
 		return err
@@ -658,7 +673,7 @@ func walkHeld(root *os.Root, leaf, displayPath string, visit func(parent *os.Roo
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("%w: %s is not a regular file", ErrNotPinned, displayPath)
 		}
-		return visit(root, leaf, displayPath, info)
+		return visit(root, leaf, displayPath, info, handle)
 	}
 
 	sub, info, err := openVerifiedRoot(root, leaf)
@@ -679,7 +694,7 @@ func walkHeld(root *os.Root, leaf, displayPath string, visit func(parent *os.Roo
 	if readErr != nil {
 		return readErr
 	}
-	if err := visit(root, leaf, displayPath, info); err != nil {
+	if err := visit(root, leaf, displayPath, info, nil); err != nil {
 		return err
 	}
 
@@ -707,7 +722,7 @@ func Stage(gitmootHome, source string) (string, error) {
 	}
 	sourceRoot, err := os.OpenRoot(source)
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrNotPinned, err)
+		return "", fmt.Errorf("%w: %w", ErrNotPinned, err)
 	}
 	defer sourceRoot.Close()
 
@@ -788,7 +803,7 @@ func stage(root string, identity Identity, sourceRoot *os.Root) (string, error) 
 	if err := verifyPublished(destinationRoot, temp, identity); err != nil {
 		return "", fmt.Errorf("staged copy does not match its source identity: %w", err)
 	}
-	if err := syncTree(filepath.Join(root, temp)); err != nil {
+	if err := syncHeld(destinationRoot, temp); err != nil {
 		return "", err
 	}
 	if err := destinationRoot.Rename(temp, name); err != nil {
@@ -884,23 +899,18 @@ func copyInstallation(sourceRoot, destinationRoot *os.Root, destination string) 
 }
 
 func copyMember(sourceRoot, destinationRoot *os.Root, destination, member string) error {
-	return walkAnchored(sourceRoot, member, func(parent *os.Root, leaf, displayPath string, info fs.FileInfo) error {
+	return walkAnchored(sourceRoot, member, func(parent *os.Root, leaf, displayPath string, info fs.FileInfo, handle *os.File) error {
 		target := path.Join(destination, displayPath)
 		if info.IsDir() {
 			return destinationRoot.MkdirAll(target, 0o755)
 		}
-		// resolved by LEAF through the root holding its parent, never by
-		// displayPath from the top
-		return copyOneFile(parent, leaf, destinationRoot, target)
+		// writes from the handle the WALK opened; no second resolution
+		return writeCopy(handle, info, destinationRoot, target)
 	})
 }
 
-// copyOneFile copies one regular file, PRESERVING the executable bit and STRIPPING
-// setuid and setgid, so a staged tree can never carry privilege the source
-// happened to have.
-//
-// NO PER-FILE fsync: measured at 136.18s against 1.07s on 15022 files. Data
-// integrity comes from re-verifying the digest on reuse (see stage).
+// copyOneFile opens name through sourceRoot and writes it to target. It is the
+// entry point for ROOT FILES, which are named individually rather than walked.
 func copyOneFile(sourceRoot *os.Root, name string, destinationRoot *os.Root, target string) error {
 	handle, info, err := openVerified(sourceRoot, name, os.O_RDONLY)
 	if err != nil {
@@ -910,6 +920,19 @@ func copyOneFile(sourceRoot *os.Root, name string, destinationRoot *os.Root, tar
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("%w: %s is not a regular file", ErrNotPinned, name)
 	}
+	return writeCopy(handle, info, destinationRoot, target)
+}
+
+// writeCopy writes an ALREADY-OPEN source handle to target, PRESERVING the
+// executable bit and STRIPPING setuid and setgid.
+//
+// IT TAKES A HANDLE RATHER THAN A NAME so the walk's open is the only resolution
+// of a member file. A reviewer's probe found the walk and its visitor each opening
+// every file, which left two unreconciled resolutions of the same name.
+//
+// NO PER-FILE fsync: measured at 136.18s against 1.07s on 15022 files. Data
+// integrity comes from re-verifying the digest on reuse (see stage).
+func writeCopy(handle *os.File, info fs.FileInfo, destinationRoot *os.Root, target string) error {
 	if parent := path.Dir(target); parent != "." {
 		if err := destinationRoot.MkdirAll(parent, 0o755); err != nil {
 			return err
@@ -918,28 +941,23 @@ func copyOneFile(sourceRoot *os.Root, name string, destinationRoot *os.Root, tar
 	// Perm() masks to 0o777 and therefore cannot represent setuid or setgid at
 	// all, which is what makes the strip structural rather than a subtraction.
 	mode := info.Mode().Perm() & 0o755
-	// O_EXCL IS THE ONE FLAG HERE THAT IS NOT INERT, and it is also the one
-	// mutant nothing kills. Unlike the deleted O_NOFOLLOW bits it has semantics
-	// os.Root does not supply: it REFUSES an existing target with "file exists".
+
+	// O_EXCL IS THE ONE FLAG HERE THAT IS NOT INERT, and it is also the one mutant
+	// nothing kills. Removing it leaves O_WRONLY|O_CREATE, which does NOT
+	// truncate: it opens the existing file and overwrites from offset zero,
+	// leaving any longer tail. Measured through os.Root - an existing
+	// "ABCDEFGHIJ" became "xyCDEFGHIJ" after a two-byte write - so removal would
+	// silently CORRUPT a target rather than replace it.
 	//
-	// AN EARLIER VERSION OF THIS COMMENT DESCRIBED THE WRONG ALTERNATIVE. It said
-	// the flag refuses "rather than truncating" the file. Removing O_EXCL leaves
-	// O_WRONLY|O_CREATE, which does NOT truncate: it opens the existing file and
-	// overwrites from offset zero, leaving any longer tail in place. Measured
-	// through os.Root - an existing "ABCDEFGHIJ" became "xyCDEFGHIJ" after a
-	// two-byte write. So removing the flag would silently CORRUPT a target rather
-	// than replace it, which is worse than the truncation I described.
+	// I described that wrongly at first because my mutant SUBSTITUTED O_TRUNC
+	// instead of REMOVING O_EXCL, so the instrument could only show the comparison
+	// I had already assumed. A substituting mutant tests the substitute.
 	//
-	// The reason I described it wrongly is worth keeping: my mutant SUBSTITUTED
-	// O_TRUNC instead of REMOVING O_EXCL, so the instrument could only ever show
-	// me the comparison I had already assumed. A substituting mutant tests the
-	// substitute.
-	//
-	// No test kills its removal because both callers write beneath a staging
-	// directory created fresh in this same call, and target names come from a
-	// filesystem walk so two entries cannot produce one target. That makes the
-	// unkillability structural rather than untested. It is kept so a future
-	// change which reuses a destination fails loudly instead of corrupting.
+	// Nothing kills its removal because every caller writes beneath a staging
+	// directory created fresh in the same Stage call, and target names come from a
+	// filesystem walk so two entries cannot produce one target. Structural rather
+	// than untested, and kept so a future change which reuses a destination fails
+	// loudly instead of corrupting.
 	destination, err := destinationRoot.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
 		return err
@@ -951,25 +969,50 @@ func copyOneFile(sourceRoot *os.Root, name string, destinationRoot *os.Root, tar
 	return destination.Close()
 }
 
-// syncTree fsyncs DIRECTORIES so the rename publishes a durable name. There are a
-// few hundred directories rather than 15022 files, so the cost is in the noise
-// beside the copy itself.
-func syncTree(root string) error {
-	return filepath.WalkDir(root, func(target string, entry fs.DirEntry, err error) error {
-		if err != nil || !entry.IsDir() {
-			return err
-		}
-		handle, openErr := os.Open(target)
-		if openErr != nil {
-			return openErr
-		}
-		syncErr := handle.Sync()
-		closeErr := handle.Close()
-		if syncErr != nil {
-			return syncErr
-		}
+// syncHeld fsyncs DIRECTORIES through the HELD destination descriptor.
+//
+// IT NO LONGER TAKES A PATH. The previous form was syncTree(filepath.Join(root,
+// temp)) using filepath.WalkDir plus os.Open on absolute paths, which abandoned
+// destinationRoot and re-resolved the daemon root and every descendant by
+// pathname. That directly contradicted this file's own claim that every
+// destination operation goes through destinationRoot, and a reviewer found it
+// surviving the round that claimed to close the class. Ruled for the fix rather
+// than the comment edit, which was the right call: the comment was the symptom.
+//
+// Directories only, so the cost is a few hundred fsyncs rather than 15022 - the
+// per-file fsync that cost 136.18s against 1.07s is not being reintroduced.
+func syncHeld(root *os.Root, name string) error {
+	sub, err := root.OpenRoot(name)
+	if err != nil {
+		return err
+	}
+	defer sub.Close()
+
+	handle, err := sub.Open(".")
+	if err != nil {
+		return err
+	}
+	entries, readErr := handle.ReadDir(-1)
+	if readErr != nil {
+		handle.Close()
+		return readErr
+	}
+	syncErr := handle.Sync()
+	closeErr := handle.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	if closeErr != nil {
 		return closeErr
-	})
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			if err := syncHeld(sub, entry.Name()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // Collect removes staged copies that no live pin references, plus leftovers from

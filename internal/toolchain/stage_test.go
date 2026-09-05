@@ -1329,6 +1329,75 @@ func TestIdentityIsIndependentOfTraversalOrder(t *testing.T) {
 	}
 }
 
+// TestDescriptorPeakStaysAtTreeDepth measures the PEAK, which the leak test cannot.
+//
+// TestStageReleasesEveryDescriptor samples /proc/self/fd only before and after a
+// complete Stage, so it kills a retained leak but CANNOT distinguish an
+// implementation that accumulates one descriptor per directory and closes them all
+// at the end. The "at most tree depth, not directory count" bound is a claim in
+// both the code and the review record, and an unmeasured bound is not a bound.
+//
+// dirWindowHook fires once per directory with every ancestor's sub-root still
+// held, so sampling there gives the live count at each level and the maximum over
+// the walk is the peak.
+func TestDescriptorPeakStaysAtTreeDepth(t *testing.T) {
+	fdCount := func() int {
+		entries, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			t.Skipf("cannot count descriptors on this platform: %v", err)
+		}
+		return len(entries)
+	}
+
+	base := t.TempDir()
+	source := goInstall(t, filepath.Join(base, "src"), "bin")
+	// a deliberately deep chain plus breadth at every level, so a per-directory
+	// implementation would climb far above the depth while this one must not
+	const depth = 12
+	const breadth = 6
+	nested := filepath.Join(source, "pkg")
+	for level := 0; level < depth; level++ {
+		nested = filepath.Join(nested, "d")
+		if err := os.MkdirAll(nested, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for sibling := 0; sibling < breadth; sibling++ {
+			if err := os.MkdirAll(filepath.Join(nested, "s"+strconv.Itoa(sibling)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(nested, "s"+strconv.Itoa(sibling), "tool"), []byte("x"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	baseline := fdCount()
+	peak := 0
+	deepestSeen := 0
+	release := installDirWindowHook(func(name string) {
+		if live := fdCount() - baseline; live > peak {
+			peak = live
+		}
+		if d := strings.Count(name, "/") + 1; d > deepestSeen {
+			deepestSeen = d
+		}
+	})
+	defer release()
+
+	if _, err := Stage(filepath.Join(base, "home"), source); err != nil {
+		t.Fatal(err)
+	}
+	if deepestSeen < depth {
+		t.Fatalf("the walk only reached depth %d of %d, so the peak was never exercised", deepestSeen, depth)
+	}
+	// the bound is ancestors-plus-a-small-constant, NOT the directory count, of
+	// which this tree has depth*breadth + depth = far more than the depth
+	if limit := deepestSeen + 6; peak > limit {
+		t.Fatalf("descriptor peak %d exceeds the depth bound %d at depth %d; the walk is accumulating per directory", peak, limit, deepestSeen)
+	}
+	t.Logf("peak live descriptors %d at max depth %d across %d directories", peak, deepestSeen, depth*(breadth+1))
+}
+
 // TestStageReleasesEveryDescriptor pins descriptor lifetime, which per-directory
 // sub-roots made a live concern.
 //
@@ -1393,5 +1462,77 @@ func TestStageReleasesEveryDescriptor(t *testing.T) {
 	afterFail := open()
 	if afterFail > beforeFail+4 {
 		t.Errorf("descriptors grew from %d to %d across 5 REFUSED stages", beforeFail, afterFail)
+	}
+}
+
+// TestBinDirectoryReplacementCannotRedirectTheCompilerCheck guards P2 #1.
+//
+// requireExecutableGo used to call openVerified(root, "bin/go"), so BOTH its Lstat
+// and its open resolved the intermediate bin component from the top source root -
+// the multi-component operation the descriptor-per-directory invariant excludes.
+// A reviewer found it surviving the round that claimed to close the class.
+//
+// IT NEEDED A TEST, NOT JUST A FIX: reverting the fix survived every existing
+// test, which is the inert-fix pattern that has cost this PR several rounds. bin
+// is now opened as a sub-root and go resolved by leaf through it, so replacing bin
+// after it is held cannot redirect the compiler check.
+func TestBinDirectoryReplacementCannotRedirectTheCompilerCheck(t *testing.T) {
+	base := t.TempDir()
+	source := goInstall(t, filepath.Join(base, "src"), "bin")
+
+	// a decoy bin whose go is NOT executable: if the check follows the swap it
+	// will read this one and must then refuse for the wrong reason, or accept a
+	// compiler that was never validated.
+	decoy := filepath.Join(source, "decoybin")
+	if err := os.MkdirAll(decoy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(decoy, "go"), []byte("#!/bin/sh\necho decoy\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// CONTROL: the tree identifies cleanly before any interference.
+	baseline, err := Identify(source)
+	if err != nil {
+		t.Fatalf("control failed: %v", err)
+	}
+
+	// FIRE ON EITHER NAME THE IMPLEMENTATION MIGHT RESOLVE. The fixed code opens
+	// "bin" as a sub-root; the broken code resolved "bin/go" as one path. Filtering
+	// on "bin" alone let the reverted shape slip past, because its first firing was
+	// "bin/go" and the swap then landed later during the member walk, after the
+	// compiler check had already passed. That is how a regression can look present
+	// and discriminate nothing.
+	fired := false
+	release := installOpenWindowHook(func(name string) {
+		if fired || (name != "bin" && name != "bin/go") {
+			return
+		}
+		fired = true
+		// swap bin between its inspection and its resolution
+		if err := os.Rename(filepath.Join(source, "bin"), filepath.Join(base, "bin-moved")); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.Rename(decoy, filepath.Join(source, "bin")); err != nil {
+			t.Error(err)
+		}
+	})
+	defer release()
+
+	got, err := Identify(source)
+	if !fired {
+		t.Fatal("the seam never fired on bin, so this test proved nothing")
+	}
+	if err != nil {
+		// refusing is correct: the substitution was detected
+		if !errors.Is(err, ErrSymlink) {
+			t.Fatalf("refusal %v does not wrap ErrSymlink", err)
+		}
+		return
+	}
+	// or the held descriptor saw through it and produced the ORIGINAL identity
+	if got != baseline {
+		t.Fatalf("identity changed to %v after a bin swap; the compiler check followed the replacement", got)
 	}
 }
