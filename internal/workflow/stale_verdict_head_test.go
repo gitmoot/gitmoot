@@ -181,6 +181,7 @@ func TestStaleObjectionDispatchesNoFixLeg(t *testing.T) {
 		t.Fatal("no advance_skipped_stale_head event recorded for the stale objection")
 	}
 }
+
 // AN UNBOUND OBJECTION STILL ADVANCES, pinned deliberately rather than left as a
 // side effect of six tests written about ownership routing (#1900's shape: a
 // property owned by one file, relied on by another, asserted nowhere).
