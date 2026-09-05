@@ -49,6 +49,7 @@ type Client interface {
 	GetUserPermission(ctx context.Context, repo Repository, username string) (UserPermission, error)
 	MergePullRequest(ctx context.Context, input MergePullRequestInput) (MergeResult, error)
 	UpdatePullRequestBranch(ctx context.Context, input UpdatePullRequestBranchInput) (UpdatePullRequestBranchResult, error)
+	BaseRequiresUpToDateHead(ctx context.Context, repo Repository, branch string) (required bool, known bool, err error)
 	GetCombinedStatus(ctx context.Context, repo Repository, ref string) (CombinedStatus, error)
 	ListCheckRunsForRef(ctx context.Context, repo Repository, ref string) ([]PullRequestCheck, error)
 	CompareCommits(ctx context.Context, repo Repository, base string, head string) (CompareResult, error)
@@ -1057,6 +1058,43 @@ func (c *GhClient) MergePullRequest(ctx context.Context, input MergePullRequestI
 		return MergeResult{Message: fmt.Sprintf("pull request merge is pending; current state is %q", pr.State)}, nil
 	}
 	return MergeResult{SHA: pr.MergeSHA, Merged: true}, nil
+}
+
+// BaseRequiresUpToDateHead reports whether branch protection on branch demands
+// that a pull request head be up to date with the base before merging, and
+// whether that could be DETERMINED at all.
+//
+// #1865: the merge gate used to request a branch update for every behind head
+// at verdict-advancement time, which created a merge commit and superseded the
+// head the verdict was bound to within seconds - buying a fresh paid review per
+// occurrence. Skipping that update is only safe where GitHub does not require
+// an up-to-date head, so the gate has to be able to ask.
+//
+// known=false means UNDETERMINED, not "not required": an unprotected branch
+// returns 404, but so does a token without the permission to read protection.
+// Callers must fail closed on known=false and keep requesting the update.
+func (c *GhClient) BaseRequiresUpToDateHead(ctx context.Context, repo Repository, branch string) (required bool, known bool, err error) {
+	branch = strings.TrimSpace(branch)
+	if strings.TrimSpace(repo.FullName()) == "" || branch == "" {
+		return false, false, nil
+	}
+	result, err := c.run(ctx, false, "api",
+		fmt.Sprintf("repos/%s/branches/%s/protection", repo.FullName(), branch),
+		"--jq", ".required_status_checks.strict // false")
+	if err != nil {
+		// 404 on an unprotected branch, or a permission failure. Both are
+		// UNDETERMINED here; the distinction needs a scope probe this call has
+		// no business making.
+		return false, false, nil
+	}
+	switch strings.TrimSpace(result.Stdout) {
+	case "true":
+		return true, true, nil
+	case "false":
+		return false, true, nil
+	default:
+		return false, false, nil
+	}
 }
 
 func (c *GhClient) UpdatePullRequestBranch(ctx context.Context, input UpdatePullRequestBranchInput) (UpdatePullRequestBranchResult, error) {

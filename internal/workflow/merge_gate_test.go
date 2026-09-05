@@ -5169,6 +5169,11 @@ type fakeMergeGateGitHub struct {
 	prCheckCalls   int
 	checkRefs      []string
 	noChecks       bool
+	strictBase     bool
+	strictKnown    bool
+	strictErr      error
+	strictCalls    int
+	strictBranches []string
 }
 
 func (f *fakeMergeGateGitHub) GetPullRequest(context.Context, github.Repository, int64) (github.PullRequest, error) {
@@ -5215,6 +5220,15 @@ func (f *fakeMergeGateGitHub) CreateCommitStatus(_ context.Context, input github
 func (f *fakeMergeGateGitHub) PostIssueComment(_ context.Context, _ github.Repository, _ int64, body string) (github.IssueComment, error) {
 	f.comments = append(f.comments, body)
 	return github.IssueComment{Body: body}, nil
+}
+
+func (f *fakeMergeGateGitHub) BaseRequiresUpToDateHead(_ context.Context, _ github.Repository, branch string) (bool, bool, error) {
+	f.strictCalls++
+	f.strictBranches = append(f.strictBranches, branch)
+	if f.strictErr != nil {
+		return false, false, f.strictErr
+	}
+	return f.strictBase, f.strictKnown, nil
 }
 
 func (f *fakeMergeGateGitHub) UpdatePullRequestBranch(_ context.Context, input github.UpdatePullRequestBranchInput) (github.UpdatePullRequestBranchResult, error) {
