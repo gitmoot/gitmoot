@@ -235,11 +235,64 @@ func addExecutableReadRoots(add func(string, bool) error, executable string) err
 	}
 	if base := filepath.Base(executableDir); base == "bin" || base == "sbin" {
 		installRoot := filepath.Dir(executableDir)
-		if installRoot != "/" && installRoot != "/usr" {
-			return add(installRoot, true)
+		if installRoot == "/" || installRoot == "/usr" {
+			return nil
 		}
+		// PROMOTION IS FOR AN INSTALLATION TREE, NOT A PROFILE (#1921 review).
+		//
+		// node-packaged runtimes need it: codex resolves to
+		// <node>/lib/node_modules/@openai/codex/bin/codex.js and cannot run
+		// without its package root beside that bin dir. But a runtime installed
+		// INSIDE its own credential-bearing profile turns the same rule into a
+		// credential grant — kimi is a self-contained ELF alone in
+		// ~/.kimi-code/bin, so promoting its parent makes ~/.kimi-code/credentials
+		// and ~/.kimi-code/oauth readable to every read-only seat.
+		//
+		// This was reachable only once PATH inheritance made those binaries
+		// resolvable at all (#1918): the fix restored availability and, with it,
+		// a grant that had previously been unreachable because the launch failed
+		// first. The exec dir alone is enough to run such a binary.
+		//
+		// Detection is by CONTENT rather than by directory name so it holds for
+		// an operator-relocated profile (CLAUDE_CODE_CONFIG_DIR and friends) and
+		// does not fire on an ordinary package root that merely sits under /root.
+		if holdsCredentialMaterial(installRoot) {
+			return nil
+		}
+		return add(installRoot, true)
 	}
 	return nil
+}
+
+// credentialMaterialEntries are the profile members that make a directory a
+// credential store rather than an installation tree. Each is a real on-disk
+// name used by a runtime this engine launches: `credentials/` and `oauth/` are
+// kimi's, `auth.json` and `.credentials.json` are codex's and claude's.
+var credentialMaterialEntries = []string{
+	"credentials",
+	"oauth",
+	"auth.json",
+	".credentials.json",
+	".claude.json",
+}
+
+// holdsCredentialMaterial reports whether a candidate install root is really a
+// runtime profile holding secrets.
+//
+// It fails CLOSED: an unreadable or unstattable candidate is treated as
+// credential-bearing, because withholding a grant degrades to a launch failure
+// that names itself, while granting one leaks an account.
+func holdsCredentialMaterial(root string) bool {
+	for _, entry := range credentialMaterialEntries {
+		_, err := os.Lstat(filepath.Join(root, entry))
+		if err == nil {
+			return true
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return true
+		}
+	}
+	return false
 }
 
 // optionalSystemToolchainRoot grants the Go installation selected by PATH when
