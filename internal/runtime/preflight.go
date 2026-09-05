@@ -29,6 +29,13 @@ type RuntimeRequirementKind string
 const (
 	RuntimeRequirementFlag        RuntimeRequirementKind = "flag"
 	RuntimeRequirementNonRootEUID RuntimeRequirementKind = "non-root-euid"
+	// RuntimeRequirementBinaryPresent is SYNTHESISED by check, never declared by
+	// an adapter: every contract that names a binary implicitly requires that
+	// binary to exist, so declaring it per-adapter would be five copies of the
+	// same fact. It exists as its own kind so the refusal can say "the executable
+	// is not there" instead of borrowing a flag requirement's wording and
+	// claiming an installed CLI lacks a flag (#1817).
+	RuntimeRequirementBinaryPresent RuntimeRequirementKind = "binary-present"
 )
 
 // RuntimeRequirement declares one fact an adapter's argv depends on.
@@ -108,6 +115,10 @@ type binaryProbe struct {
 	version    string
 	help       string
 	helpParsed bool
+	// unresolved records that LookPath itself failed, which is categorically
+	// different from a binary that exists and answered unusably: the first is the
+	// most definitive answer this probe can obtain, the second is no answer.
+	unresolved bool
 	instrument string
 	detail     string
 }
@@ -186,6 +197,52 @@ func (c *RuntimeContractChecker) Inspect(ctx context.Context, runtimeName string
 	return c.check(ctx, meta, RuntimeContractRequest{}, func(req RuntimeRequirement) bool { return !req.PlanMode })
 }
 
+// ResolveContractBinary answers ONLY the context-free half of a runtime's
+// contract: does the executable this runtime's adapter will exec resolve on
+// PATH? It returns nil when the runtime declares no binary, or when the binary
+// resolves.
+//
+// WHY A NARROW QUESTION EXISTS SEPARATELY FROM Inspect AND CheckRequest.
+// Everything else in a contract is REQUEST-SCOPED: the non-root-EUID
+// precondition applies only to agents whose autonomy policy needs
+// `--permission-mode bypassPermissions`, and the plan-mode flags apply only to
+// deliveries that enable plan mode (see requirementApplies). Inspect answers as
+// if every non-plan requirement applied, which is right for an operator
+// display and WRONG for a dispatch gate: measured on this box, running as root,
+// Inspect reports `claude` unsupported for effective-uid reasons, so a
+// pre-dispatch gate built on it would refuse every claude leg whether or not
+// the CLI is installed.
+//
+// Binary resolution is the one question that needs no request context, and it
+// is the measured #1817 failure: two #1910 review legs died on
+// `resolve sandbox target "claude": executable file not found in $PATH`. The
+// full contract stays with the worker, which holds the agent and the request.
+//
+// Resolution uses the runner's LookPath, which wraps the same exec.LookPath the
+// sandbox target resolves with (internal/sandbox/lookpath.go), so this refuses
+// exactly what would have failed rather than consulting a different PATH.
+func (c *RuntimeContractChecker) ResolveContractBinary(runtimeName string) error {
+	meta, ok := c.registry().Metadata(strings.TrimSpace(runtimeName))
+	if !ok {
+		// An unknown runtime is a registration question, not a capability one.
+		return nil
+	}
+	binary := strings.TrimSpace(meta.Contract.Binary)
+	if binary == "" {
+		// The shell runtime declares no contract and no binary; it must be
+		// unaffected by a binary-resolution rule.
+		return nil
+	}
+	runner := c.Runner
+	if runner == nil {
+		runner = subprocess.GroupRunner{}
+	}
+	if _, err := runner.LookPath(binary); err != nil {
+		return fmt.Errorf("runtime %q requires executable %q and it does not resolve on PATH: %w", meta.Name, binary, err)
+	}
+	return nil
+}
+
 func (c *RuntimeContractChecker) registry() Registry {
 	if len(c.Registry.order) == 0 {
 		return BuiltinRuntimeRegistry()
@@ -214,6 +271,35 @@ func (c *RuntimeContractChecker) check(ctx context.Context, meta RuntimeMetadata
 	probe := c.probeBinary(ctx, meta.Contract.Binary)
 	result.ResolvedPath = probe.path
 	result.Version = probe.version
+	// #1817: AN EXECUTABLE THAT DOES NOT RESOLVE IS A DEFINITIVE NO, NOT AN ABSENT
+	// ANSWER. Falling through to the per-flag loop below would mark every flag
+	// unknown, and unknown is documented above to MUST RUN, so the leg dispatched
+	// and died at exec time instead: two #1910 review legs on 2026-09-05 17:28
+	// spent a worktree and about fifteen seconds each to reach
+	// `resolve sandbox target "claude": executable file not found in $PATH`.
+	//
+	// LookPath here is the SAME exec.LookPath the sandbox target resolves with
+	// (internal/sandbox/lookpath.go), so this refuses exactly what would have
+	// failed rather than guessing at a different PATH.
+	//
+	// Reported ONCE as its own requirement rather than once per declared flag:
+	// omp declares six, and six identical "unknown flag" rows describe the
+	// wrong defect. The tri-state is untouched for every other probe outcome -
+	// a binary that exists and answers unusably stays unknown and still runs.
+	if probe.unresolved {
+		rr := RuntimeRequirementResult{
+			Kind:       RuntimeRequirementBinaryPresent,
+			Name:       fmt.Sprintf("executable %q", meta.Contract.Binary),
+			Source:     fmt.Sprintf("runtime %q contract binary", meta.Name),
+			Remedy:     fmt.Sprintf("install %s on the dispatching host PATH, or dispatch this job to an agent whose runtime is installed", meta.Contract.Binary),
+			State:      RuntimeContractUnsupported,
+			Instrument: probe.instrument,
+			Detail:     probe.detail,
+		}
+		result.Requirements = append(result.Requirements, rr)
+		mergeContractState(&result, rr)
+		return result
+	}
 	for _, req := range flagRequirements {
 		rr := RuntimeRequirementResult{Kind: req.Kind, Name: req.Name, Flag: req.Flag, Source: req.Source, Remedy: req.Remedy, Instrument: probe.instrument}
 		switch {
@@ -274,7 +360,7 @@ func (c *RuntimeContractChecker) probeBinary(ctx context.Context, binary string)
 	}
 	path, err := runner.LookPath(binary)
 	if err != nil {
-		return binaryProbe{version: "unknown", instrument: "look-path", detail: fmt.Sprintf("resolve %s: %v", binary, err)}
+		return binaryProbe{version: "unknown", unresolved: true, instrument: "look-path", detail: fmt.Sprintf("resolve %s: %v", binary, err)}
 	}
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
@@ -411,6 +497,14 @@ func RuntimeContractDispatchError(agent Agent, result RuntimeContractResult) err
 	for _, requirement := range result.Requirements {
 		if requirement.State != RuntimeContractUnsupported {
 			continue
+		}
+		// An absent executable must not be reported as an installed version failing
+		// a requirement: "installed version %q" is a lie when nothing is installed,
+		// and it sends the reader looking for a CLI upgrade instead of a missing
+		// binary (#1817).
+		if requirement.Kind == RuntimeRequirementBinaryPresent {
+			return fmt.Errorf("runtime preflight blocked agent %q: runtime %q requires %s and it does not resolve on PATH (%s); remedy: %s",
+				agent.Name, result.Runtime, requirement.Name, requirement.Detail, requirement.Remedy)
 		}
 		return fmt.Errorf("runtime preflight blocked agent %q: runtime %q installed version %q does not satisfy %s required by %s; remedy: %s",
 			agent.Name, result.Runtime, result.Version, requirement.Name, requirement.Source, requirement.Remedy)
