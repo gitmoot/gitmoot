@@ -1070,9 +1070,25 @@ case-insensitively on repository:
 - RECONCILIATION: `[workload-mode-reconciliation repo=<owner/repo> pr=<number> head=<40-character reviewed head> mode=<mode> decision_note=<note id|none>]`
 
 Every field is `key=value`, whitespace separated, inside the leading bracket. A
-field with an empty key or value makes the whole body unparseable, so write the
-row with `gitmoot workflow note --repo <owner/repo>` rather than by hand where a
-missing `--repo` is easy.
+field with an empty key or value makes the whole body unparseable, so the
+`repo=` field inside the body is what identifies the repository:
+
+```
+gitmoot workflow note <label> "[operating-mode repo=owner/repo mode=STEADY]"
+```
+
+`<label>` must be a workflow that already has jobs - `workflow note` refuses an
+unknown label to guard against a typo - so file the row under the lane the PR is
+already being coordinated in rather than inventing a label.
+
+The note's repo COLUMN is a separate, optional thing. A note whose column is
+empty still counts when its body names this repository, which is the ordinary
+case: `gitmoot workflow note` writes an empty column unless you pass
+`--remember --repo <owner/repo>`, and `--repo` is REJECTED without `--remember`
+(`--agent, --repo, and --remember-status require --remember`), because that flag
+set also opts the note into durable memory. Setting the column is therefore
+optional and costs a memory write; getting `repo=` right in the BODY is not
+optional.
 
 PRECEDENCE. The NEWEST decision wins, and a reconciliation row must be newer than
 it. `decision_note=none` means the PR itself is the decision, and the row's own
