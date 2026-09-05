@@ -154,3 +154,63 @@ func TestEmptyAttributionStillNamesTheAnomaly(t *testing.T) {
 		t.Errorf("reason = %q, want the empty-agent anomaly still named", decision.Reason.Render())
 	}
 }
+
+// TestSameNameAgentAndRoleRowsAreOrderIndependent is F1 from the #1920 review.
+//
+// The agent-wins rule was applied WITHIN a single job and omitted ACROSS rows, so
+// a task carrying both a dispatchable agent row named X and a session row for role
+// X kept whichever ListJobs visited last. autoFixOwner discards role identities,
+// so it could report no dispatchable implementer while the agent row existed -
+// routing decided by job-id ordering.
+//
+// BOTH ORDERS ARE EXERCISED because one order passed before the fix. A single-order
+// test here would have been the same shape of vacuous guard as the self-approval
+// assertion this file already carries a note about.
+func TestSameNameAgentAndRoleRowsAreOrderIndependent(t *testing.T) {
+	base := JobPayload{
+		Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+		Result: &AgentResult{Decision: "implemented", Summary: "implemented"},
+	}
+	rolePayload := base
+	rolePayload.ActingOrgRole = "audit"
+
+	for _, order := range []struct {
+		name string
+		seed func(*testing.T, *db.Store)
+	}{
+		{
+			name: "agent row first",
+			seed: func(t *testing.T, store *db.Store) {
+				insertCompletedJob(t, store, db.Job{ID: "a-implement-agent", Agent: "audit", Type: "implement"}, base)
+				insertCompletedJob(t, store, db.Job{ID: "b-implement-role", Type: "implement"}, rolePayload)
+			},
+		},
+		{
+			name: "role row first",
+			seed: func(t *testing.T, store *db.Store) {
+				insertCompletedJob(t, store, db.Job{ID: "a-implement-role", Type: "implement"}, rolePayload)
+				insertCompletedJob(t, store, db.Job{ID: "b-implement-agent", Agent: "audit", Type: "implement"}, base)
+			},
+		},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			store := openEngineStore(t)
+			order.seed(t, store)
+			jobs, err := store.ListJobs(context.Background())
+			if err != nil {
+				t.Fatalf("ListJobs returned error: %v", err)
+			}
+			evidence := collectImplementerAttribution(jobs, base)
+			identity, recorded := evidence.agents["audit"]
+			if !recorded {
+				t.Fatalf("no attribution recorded for audit; evidence = %+v", evidence)
+			}
+			if identity.FromActingRole {
+				t.Errorf("identity = %+v, want the DISPATCHABLE agent row to dominate regardless of row order", identity)
+			}
+			if len(evidence.agents) != 1 {
+				t.Errorf("agents = %+v, want exactly one identity for one name", evidence.agents)
+			}
+		})
+	}
+}

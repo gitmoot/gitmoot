@@ -274,7 +274,7 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 
 	var out jobSessionOutput
 	if err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
-		fullName, err := validateSessionActorRepo(context.Background(), store, *agent, *actingRole, *repo)
+		fullName, err := validateSessionActorRepo(context.Background(), store, paths, *agent, *actingRole, *repo)
 		if err != nil {
 			return err
 		}
@@ -409,17 +409,30 @@ func validateSessionAgentRepo(ctx context.Context, store *db.Store, agentName, r
 // validateSessionActorRepo validates whichever actor the caller named. Exactly one
 // of agentName/roleName is non-empty by the time this runs.
 //
-// A ROLE IS VALIDATED AGAINST THE ROLE REGISTRY, NOT THE AGENT ONE. That is the
-// whole correction: GetOrgRolePresence already records every role that has acted,
-// so no new table is introduced, and an unknown role is still refused rather than
-// recorded on trust.
-func validateSessionActorRepo(ctx context.Context, store *db.Store, agentName, roleName, repoFlag string) (string, error) {
+// A ROLE IS VALIDATED AGAINST THE CONFIGURED ORG REGISTRY, NOT THE PRESENCE TABLE.
+// The first version of this used GetOrgRolePresence, which was the wrong existing
+// source and got both directions wrong: that table records roles that have
+// PREVIOUSLY ACTED, so a newly configured role was refused until some unrelated
+// command happened to create its presence row, while a role deleted from the
+// registry stayed acceptable forever. "Must exist" has to mean configured, and
+// config.LoadOrg plus cfg.Role is what validateAndTouchActingOrgRole - the other
+// ingress that takes a role - already uses.
+//
+// POLICY, STATED RATHER THAN IMPLIED: existence is the ONLY check applied here.
+// Availability and recycle enforcement are dispatch-time policies, and this
+// command records work that has ALREADY HAPPENED. Refusing to write down a
+// completed implementation because its role has since gone idle or unavailable
+// would destroy attribution to enforce a scheduling rule, which is backwards.
+func validateSessionActorRepo(ctx context.Context, store *db.Store, paths config.Paths, agentName, roleName, repoFlag string) (string, error) {
 	if role := strings.TrimSpace(roleName); role != "" {
-		_, found, err := store.GetOrgRolePresence(ctx, role)
+		cfg, err := config.LoadOrg(paths)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("load org registry: %w", err)
 		}
-		if !found {
+		if !cfg.Enabled() {
+			return "", errors.New("--acting-role requires an enabled organization registry; run `gitmoot org init`")
+		}
+		if _, ok := cfg.Role(role); !ok {
 			return "", fmt.Errorf("org role %q not found", roleName)
 		}
 		return validateSessionRepo(ctx, store, repoFlag)

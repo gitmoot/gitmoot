@@ -1344,14 +1344,26 @@ func collectImplementerAttribution(jobs []db.Job, current JobPayload) implemente
 		role := NormalizeActingOrgRole(payload.ActingOrgRole)
 		switch {
 		case agent != "":
-			// AN AGENT COLUMN ALWAYS WINS OVER A ROLE ON THE SAME JOB, and the order
-			// is load-bearing rather than cosmetic. Ordinary dispatched implement
-			// jobs carry the DISPATCHING coordinator's role in this same payload, so
-			// reading the role first would attribute every agent's work to its
-			// coordinator, make that coordinator an implementer of everything, and
-			// then disqualify it from reviewing anything.
+			// AN AGENT COLUMN ALWAYS WINS OVER A ROLE, and the order is load-bearing
+			// rather than cosmetic. Ordinary dispatched implement jobs carry the
+			// DISPATCHING coordinator's role in this same payload, so reading the role
+			// first would attribute every agent's work to its coordinator, make that
+			// coordinator an implementer of everything, and then disqualify it from
+			// reviewing anything.
 			evidence.agents[agent] = implementerIdentity{Name: agent}
 		case role != "":
+			// A ROLE NEVER DOWNGRADES AN AGENT ALREADY RECORDED UNDER THE SAME NAME,
+			// AND THAT IS WHY THIS IS A CONDITIONAL WRITE RATHER THAN A PLAIN ONE.
+			// The first version of this switch applied the agent-wins rule WITHIN one
+			// job and left it out ACROSS rows, so a task carrying both a dispatchable
+			// agent row named X and a session row for role X kept whichever ListJobs
+			// happened to visit last. autoFixOwner then discards role identities and
+			// could report no dispatchable implementer while the agent row sat right
+			// there - routing decided by job-id order. Found in review, and it is the
+			// same rule I had already written one scope too narrow.
+			if existing, recorded := evidence.agents[role]; recorded && !existing.FromActingRole {
+				continue
+			}
 			// The #1916 shape: implemented in session by an org role, no agent to
 			// name. Attributable, and still subject to the independence check.
 			evidence.agents[role] = implementerIdentity{Name: role, FromActingRole: true}

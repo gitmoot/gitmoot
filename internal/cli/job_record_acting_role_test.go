@@ -4,17 +4,45 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// seedActingRole registers an org role the way every local ingress does, through
-// the presence table that already tracks which roles have acted. No new registry
-// is introduced by #1718: the role namespace already exists, it was simply never
-// readable from the attribution path.
-func seedActingRole(t *testing.T, home, role string) {
+// seedConfiguredRole writes the org REGISTRY, which is what "the role exists"
+// means. F2 of the #1920 review: the first version validated against the presence
+// table instead, which records roles that have previously ACTED - so a newly
+// configured role was refused until an unrelated command created its row, and a
+// role deleted from the registry stayed acceptable forever.
+func seedConfiguredRole(t *testing.T, home string, roles ...string) {
+	t.Helper()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	// The registry requires its ROOT role to be named "owner", so the roles under
+	// test are children of it. Learned from the loader's own refusal rather than
+	// assumed: `root org role must be named "owner"`.
+	body := "[org.roles.\"owner\"]\nscope=[\"*\"]\n"
+	for _, role := range roles {
+		if role == "owner" {
+			continue
+		}
+		body += "[org.roles.\"" + role + "\"]\nparent=\"owner\"\nscope=[\"*\"]\n"
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(body), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+}
+
+// seedRolePresenceOnly creates the historical presence row WITHOUT configuring the
+// role, which is the stale case F2 names: acceptable indefinitely under the old
+// check, and it must now be refused.
+func seedRolePresenceOnly(t *testing.T, home, role string) {
 	t.Helper()
 	store := openCLIJobStore(t, home)
 	defer store.Close()
@@ -34,7 +62,7 @@ func TestJobRecordAcceptsAnActingRole(t *testing.T) {
 	store := openCLIJobStore(t, home)
 	seedSessionAgentRepo(t, store)
 	store.Close()
-	seedActingRole(t, home, "gitmoot")
+	seedConfiguredRole(t, home, "gitmoot", "lead-role")
 
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{
@@ -125,7 +153,7 @@ func TestJobRecordActorFlagsAreExclusiveAndValidated(t *testing.T) {
 			store := openCLIJobStore(t, home)
 			seedSessionAgentRepo(t, store)
 			store.Close()
-			seedActingRole(t, home, "gitmoot")
+			seedConfiguredRole(t, home, "gitmoot", "lead-role")
 
 			args := append([]string{
 				"job", "record", "--home", home,
@@ -141,4 +169,65 @@ func TestJobRecordActorFlagsAreExclusiveAndValidated(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestJobRecordRoleValidationUsesTheConfiguredRegistry is F2 from the #1920 review,
+// and it pins BOTH directions the presence table got wrong.
+func TestJobRecordRoleValidationUsesTheConfiguredRegistry(t *testing.T) {
+	t.Run("configured but never seen is ACCEPTED", func(t *testing.T) {
+		home := t.TempDir()
+		store := openCLIJobStore(t, home)
+		seedSessionAgentRepo(t, store)
+		store.Close()
+		// registry only: deliberately NO presence row, which the old check required
+		seedConfiguredRole(t, home, "fresh-role")
+
+		var stdout, stderr bytes.Buffer
+		if code := Run([]string{
+			"job", "record", "--home", home, "--acting-role", "fresh-role",
+			"--repo", "owner/repo", "--type", "implement", "--decision", "implemented", "--json",
+		}, &stdout, &stderr); code != 0 {
+			t.Fatalf("exit = %d, want 0: a configured role must not wait for a presence row (stderr=%s)", code, stderr.String())
+		}
+	})
+
+	t.Run("present but NOT configured is REFUSED", func(t *testing.T) {
+		home := t.TempDir()
+		store := openCLIJobStore(t, home)
+		seedSessionAgentRepo(t, store)
+		store.Close()
+		seedConfiguredRole(t, home, "some-other-role")
+		seedRolePresenceOnly(t, home, "removed-role")
+
+		var stdout, stderr bytes.Buffer
+		code := Run([]string{
+			"job", "record", "--home", home, "--acting-role", "removed-role",
+			"--repo", "owner/repo", "--type", "implement", "--decision", "implemented",
+		}, &stdout, &stderr)
+		if code == 0 {
+			t.Fatal("a role with only a historical presence row was accepted; deletion from the registry must take effect")
+		}
+		if !strings.Contains(stderr.String(), `org role "removed-role" not found`) {
+			t.Errorf("stderr = %q, want the unknown-role refusal", stderr.String())
+		}
+	})
+
+	t.Run("no registry at all names the remedy", func(t *testing.T) {
+		home := t.TempDir()
+		store := openCLIJobStore(t, home)
+		seedSessionAgentRepo(t, store)
+		store.Close()
+
+		var stdout, stderr bytes.Buffer
+		code := Run([]string{
+			"job", "record", "--home", home, "--acting-role", "any-role",
+			"--repo", "owner/repo", "--type", "implement", "--decision", "implemented",
+		}, &stdout, &stderr)
+		if code == 0 {
+			t.Fatal("a role was accepted with no organization registry configured")
+		}
+		if !strings.Contains(stderr.String(), "gitmoot org init") {
+			t.Errorf("stderr = %q, want the refusal to name the remedy", stderr.String())
+		}
+	})
 }
