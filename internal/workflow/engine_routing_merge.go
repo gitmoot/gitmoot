@@ -880,12 +880,16 @@ func (e Engine) parkTaskAwaitingHumanMerge(ctx context.Context, ref taskRef, rea
 // objection nobody recorded". That claim is FALSE, and #1903's independent
 // review is what caught it:
 //
-//   - PolicyMergeGate blocks on the OBJECTION ROW itself, not on task state. It
-//     derives the head live (merge_gate.go:288 GetPullRequest -> :311), selects
-//     every review row whose payload.HeadSHA equals that head (:809-816), and
-//     returns mergeBlocked "review at evaluated head has blocking result" for
-//     changes_requested, blocked or failed (:895-898). Refusing the TASK
-//     transition does not un-record the review row, so it cannot open a merge.
+//   - PolicyMergeGate blocks on the OBJECTION ROW itself, not on task state. On
+//     the STRICT path it derives the head live (merge_gate.go:288 GetPullRequest
+//     -> :311), selects review rows whose payload.HeadSHA equals that head
+//     (:809-816), and returns mergeBlocked "review at evaluated head has blocking
+//     result" for changes_requested, blocked or failed (:895-898). When that
+//     population is EMPTY the LATEST-ROUND fallback (:984-1004) head-checks the
+//     latest round instead (:1052-1058, :1635-1656). A row carrying a head is
+//     reached either way, so refusing the TASK transition does not un-record the
+//     review row and cannot open a merge. The headless case depends on the review
+//     population and is documented at TestObjectionWithNoHeadStillRequestsChanges.
 //
 // What refusing would actually cost is the CONSERVATIVE transition and, because
 // dispatchFix is called inline from this arm, the FIX PASS - for an objection

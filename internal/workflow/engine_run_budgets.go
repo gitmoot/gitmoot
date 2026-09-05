@@ -811,20 +811,26 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			// earlier version of this comment called it "the safety argument", and
 			// #1903's third review round caught that residue.
 			//
-			// The safety is supplied elsewhere and unconditionally: PolicyMergeGate
-			// blocks on the objection ROW at the evaluated head regardless of task
-			// state (merge_gate.go:288/:311 live head, :809-816 head filtering,
-			// :895-898 mergeBlocked). So refusing here cannot protect a merge.
+			// The safety is supplied elsewhere, by whichever of PolicyMergeGate's two
+			// paths reaches the row: the STRICT evaluated-head population
+			// (merge_gate.go:288/:311 live head, :809-816 head filter, :895-898
+			// mergeBlocked), or - only when that population is EMPTY - the
+			// LATEST-ROUND fallback (:984-1004, head-checked at :1052-1058 and
+			// :1635-1656 before any decision is read). A row carrying a head is
+			// reached by one or the other, so refusing HERE cannot protect that
+			// merge.
 			//
 			// What differs between the two sides is the consequence of refusing:
 			// refusing an unconfirmable APPROVAL fails safe, because nothing merges
 			// while the doubt stands; refusing an objection withholds the
-			// conservative transition and the inline fix pass while the gate blocks
-			// the merge anyway. So when no observed pull request row records a head,
-			// this arm ADMITS - refusing would block a legitimate objection on a PR
-			// the daemon has not polled yet, which is the CLI-dispatch path, and
-			// would make the engine's cheapest transition the one demanding the
-			// most evidence.
+			// conservative transition and the inline fix pass while the gate still
+			// holds the merge on the paths above. So when no observed pull request
+			// row records a head, this arm ADMITS - refusing would block a
+			// legitimate objection on a PR the daemon has not polled yet, which is
+			// the CLI-dispatch path, and would make the engine's cheapest
+			// transition the one demanding the most evidence. The headless case is
+			// governed by the review population instead, and is documented at
+			// TestObjectionWithNoHeadStillRequestsChanges.
 			bound, unboundReason, err := e.objectionBindsToCurrentHead(ctx, payload)
 			if err != nil {
 				return err
