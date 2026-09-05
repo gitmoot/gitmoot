@@ -816,17 +816,11 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			// Refusing would block a legitimate objection on a PR the daemon has
 			// not polled yet, which is the CLI-dispatch path, and would make the
 			// engine's safest transition the one requiring the most evidence.
-			bound, unboundReason, retryable, err := e.objectionBindsToCurrentHead(ctx, payload)
+			bound, unboundReason, err := e.objectionBindsToCurrentHead(ctx, payload)
 			if err != nil {
 				return err
 			}
 			if !bound {
-				if retryable {
-					// Missing evidence, not stale evidence: leave the advancement
-					// unreconciled so the daemon's advance-retry re-drives it once the
-					// observed pull request row lands.
-					return errors.New(unboundReason)
-				}
 				return e.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_skipped_stale_head", Message: unboundReason})
 			}
 			if err := e.setTaskState(ctx, ref, TaskChangesRequested); err != nil {

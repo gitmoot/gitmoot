@@ -865,65 +865,52 @@ func (e Engine) parkTaskAwaitingHumanMerge(ctx context.Context, ref taskRef, rea
 }
 
 // objectionBindsToCurrentHead answers whether a changes_requested verdict may
-// transition the task, mirroring approvalSupersedesChangesRequested's rule and
-// its retryable split (#1524).
+// transition the task (#1524).
 //
 // THE DEFECT: a verdict is evidence about a COMMIT, not about the branch. This
 // arm transitioned the task unconditionally, so an objection bound to a
 // superseded head pulled a PR out of ready_to_merge - and, because dispatchFix
 // is called inline from it, dispatched a fix leg against findings about that
-// superseded commit. #1834/#1871 bound the APPROVING side and left this one, so
-// the tree carried one rule with one direction.
+// superseded commit. #1834/#1871 bound the APPROVING side and left this one.
 //
-// THE SPLIT IS THE SIBLING'S, NOT A NEW POLICY: missing evidence RETRIES,
-// contradicted evidence does not.
-//   - no head on the verdict -> TERMINAL. A review row does not gain a head
-//     later, and a verdict bound to no commit claims nothing about the branch.
-//   - no observed pull_requests row -> TRANSIENT. The row appears as soon as the
-//     daemon polls the PR, so settling here would drop a verdict that is about
-//     to become checkable - the recovery wedge #1871's round-3 review measured.
-//   - head differs from the observed current head -> TERMINAL. The branch has
-//     moved past the commit this verdict describes.
+// ONLY A CONTRADICTED HEAD REFUSES. Both unknowns admit, and that asymmetry
+// with the approval arm is the safety argument rather than an inconsistency:
 //
-// The current head comes from the OBSERVED pull request row for the same reason
-// the approval side reads it there: `tasks` has no head column, ListJobs orders
-// by id, and created_at has second granularity, so review-row recency cannot
-// order verdicts at all.
-func (e Engine) objectionBindsToCurrentHead(ctx context.Context, payload JobPayload) (bool, string, bool, error) {
+//   - refusing a headless or unconfirmable APPROVAL fails safe, because the PR
+//     does not merge;
+//   - refusing an objection fails PERMISSIVE, and not merely unhelpfully. The
+//     two sides do not even read the same source: approvalSupersedesChangesRequested
+//     consults the LOCAL store row above, while PolicyMergeGate fetches the pull
+//     request LIVE from GitHub (merge_gate.go's MergeGateGitHub) and never reads
+//     that table for the head it merges against. So an objection refused for a
+//     missing local row leaves the task OUT of changes_requested,
+//     mergeGateExpectedTaskState then admits, and the gate can merge on an
+//     approval over a real current-head objection nobody recorded - the exact
+//     harm #1871 exists to prevent, reached by declining to record a complaint.
+//
+// Admitting records a complaint and authorises nothing, so it is the
+// claim-nothing direction. A CLI review dispatched without --head-sha produces
+// the headless payload today, which is why that case is real traffic.
+func (e Engine) objectionBindsToCurrentHead(ctx context.Context, payload JobPayload) (bool, string, error) {
 	objectionHead := strings.TrimSpace(payload.HeadSHA)
-	if objectionHead == "" {
-		// ADMIT, and check it FIRST so no store read happens: an objection claims
-		// nothing and authorises nothing, so admitting is the claim-nothing
-		// direction. Refusing a headless APPROVAL fails safe (the PR does not
-		// merge); refusing a headless OBJECTION fails PERMISSIVE - a real
-		// complaint is dropped and the PR keeps whatever merge-ward state it had.
-		// Identical mechanism, opposite consequence, so the arms are deliberately
-		// not symmetric here. A CLI review dispatched without --head-sha produces
-		// exactly this payload today.
-		return true, "", false, nil
-	}
-	if payload.PullRequest <= 0 {
-		// A PR-less review is already terminal earlier in the advance path; this
-		// guard must not become a second, quieter refusal for it.
-		return true, "", false, nil
+	if objectionHead == "" || payload.PullRequest <= 0 {
+		// Checked before any store read: an unbound objection claims nothing about
+		// any commit, and a PR-less review is already terminal earlier in the
+		// advance path.
+		return true, "", nil
 	}
 	pr, err := e.Store.GetPullRequest(ctx, payload.Repo, int64(payload.PullRequest))
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return false, "", false, err
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return true, "", nil
+		}
+		return false, "", err
 	}
-	currentHead := ""
-	if err == nil {
-		currentHead = strings.TrimSpace(pr.HeadSHA)
+	currentHead := strings.TrimSpace(pr.HeadSHA)
+	if currentHead == "" || currentHead == objectionHead {
+		return true, "", nil
 	}
-	if currentHead == "" {
-		return false, fmt.Sprintf(
-			"no observed pull request row records a current head for %s#%d, so this objection cannot be shown to describe it",
-			payload.Repo, payload.PullRequest), true, nil
-	}
-	if objectionHead != currentHead {
-		return false, fmt.Sprintf(
-			"the objection is bound to head %s but the pull request's current head is %s; a verdict at a superseded head describes a commit the branch has moved past, so the task is not transitioned and no fix leg is dispatched",
-			objectionHead, currentHead), false, nil
-	}
-	return true, "", false, nil
+	return false, fmt.Sprintf(
+		"the objection is bound to head %s but the pull request's current head is %s; a verdict at a superseded head describes a commit the branch has moved past, so the task is not transitioned and no fix leg is dispatched",
+		objectionHead, currentHead), nil
 }

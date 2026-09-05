@@ -96,12 +96,18 @@ func TestObjectionAtCurrentHeadStillRequestsChanges(t *testing.T) {
 	}
 }
 
-// MISSING EVIDENCE RETRIES, mirroring approvalSupersedesChangesRequested's own
-// retryable split rather than inventing retry semantics: with no observed pull
-// request row the objection's head cannot be compared, the row appears as soon
-// as the daemon polls the PR, and settling here would drop a verdict about to
-// become checkable.
-func TestObjectionWithNoObservedPullRequestRowIsRetriedNotSettled(t *testing.T) {
+// PIN 1 - AN OBJECTION WITH A HEAD BUT NO OBSERVED PULL REQUEST ROW STILL
+// ADVANCES. This is the case a retracted ruling would have refused transiently,
+// and its ABSENCE from the suite is what let that ruling look safe.
+//
+// Refusing here would not merely withhold a fix pass: the two sides read
+// different sources. approvalSupersedesChangesRequested consults the LOCAL store
+// row, while PolicyMergeGate fetches the pull request LIVE from GitHub and never
+// reads that table for the head it merges against. So an objection refused for a
+// missing local row leaves the task OUT of changes_requested,
+// mergeGateExpectedTaskState then admits, and the gate can merge on an approval
+// over a real current-head objection nobody recorded.
+func TestObjectionWithNoObservedPullRequestRowStillRequestsChanges(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	if err := store.UpsertTask(ctx, db.Task{
@@ -115,19 +121,66 @@ func TestObjectionWithNoObservedPullRequestRowIsRetriedNotSettled(t *testing.T) 
 
 	seedReviewJob(t, store, "review-unobserved", "auditor", "head-old", "changes_requested", JobSucceeded)
 
-	err := engine.AdvanceJob(ctx, "review-unobserved")
-	if err == nil {
-		t.Fatal("AdvanceJob returned nil: an unconfirmable head must be retried, not settled")
+	if err := engine.AdvanceJob(ctx, "review-unobserved"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "no observed pull request row") {
-		t.Fatalf("error = %v, want it to name the missing observation", err)
-	}
-	assertTaskState(t, store, "task-9", TaskReadyToMerge)
+	assertTaskState(t, store, "task-9", TaskChangesRequested)
 	if reason := staleHeadSkipReason(t, store, "review-unobserved"); reason != "" {
-		t.Fatalf("a transient refusal must not record a terminal skip event: %q", reason)
+		t.Fatalf("an unconfirmable head must admit, not skip: %q", reason)
 	}
 }
 
+// PIN 2 - A STALE OBJECTION DISPATCHES NO FIX LEG. dispatchFix is called INLINE
+// from this arm, so refusing the transition without refusing the dispatch would
+// leave the worse half running: a fix job carrying findings about a commit the
+// branch has already moved past is wrong work, not late work (#1730's family).
+func TestStaleObjectionDispatchesNoFixLeg(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	seedObservedPullRequest(t, store, "head-new")
+	seedImplementAttribution(t, store)
+	enableAutoFix(t, store, 9)
+	engine, _ := wedgeEngine(t, store)
+
+	before, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	seedReviewJob(t, store, "review-stale-nofix", "auditor", "head-old", "changes_requested", JobSucceeded)
+
+	if err := engine.AdvanceJob(ctx, "review-stale-nofix"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+	after, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs returned error: %v", err)
+	}
+	// The only new row may be the review fixture itself: no implement job.
+	for _, job := range after {
+		if job.Type != "implement" {
+			continue
+		}
+		known := false
+		for _, existing := range before {
+			if existing.ID == job.ID {
+				known = true
+				break
+			}
+		}
+		if !known {
+			t.Fatalf("a stale objection dispatched a fix leg: %s", job.ID)
+		}
+	}
+	if reason := staleHeadSkipReason(t, store, "review-stale-nofix"); reason == "" {
+		t.Fatal("no advance_skipped_stale_head event recorded for the stale objection")
+	}
+}
 // AN UNBOUND OBJECTION STILL ADVANCES, pinned deliberately rather than left as a
 // side effect of six tests written about ownership routing (#1900's shape: a
 // property owned by one file, relied on by another, asserted nowhere).
