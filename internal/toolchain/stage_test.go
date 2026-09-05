@@ -2,6 +2,8 @@ package toolchain
 
 import (
 	"errors"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1391,8 +1393,15 @@ func TestDescriptorPeakStaysAtTreeDepth(t *testing.T) {
 		t.Fatalf("the walk only reached depth %d of %d, so the peak was never exercised", deepestSeen, depth)
 	}
 	// the bound is ancestors-plus-a-small-constant, NOT the directory count, of
-	// which this tree has depth*breadth + depth = far more than the depth
-	if limit := deepestSeen + 6; peak > limit {
+	// which this tree has depth*breadth + depth = far more than the depth.
+	//
+	// THE BOUND IS deepestSeen+3, NOT +6. An independent review measured
+	// peak = deepestPathDepth + 3 across seven depth/breadth combinations, so +6
+	// was slack I had left myself: it would have admitted three extra descriptors
+	// per walk without failing, which is the "unmeasured bound is not a bound"
+	// error one level milder. The three are the sub-root chain's own head, the
+	// ReadDir handle, and the member file being read.
+	if limit := deepestSeen + 3; peak > limit {
 		t.Fatalf("descriptor peak %d exceeds the depth bound %d at depth %d; the walk is accumulating per directory", peak, limit, deepestSeen)
 	}
 	t.Logf("peak live descriptors %d at max depth %d across %d directories", peak, deepestSeen, depth*(breadth+1))
@@ -1535,4 +1544,179 @@ func TestBinDirectoryReplacementCannotRedirectTheCompilerCheck(t *testing.T) {
 	if got != baseline {
 		t.Fatalf("identity changed to %v after a bin swap; the compiler check followed the replacement", got)
 	}
+}
+
+// memberSwapTree builds a pinned installation carrying one executable member file
+// whose content is known, plus a decoy of the same shape holding different bytes.
+// Both regressions below need exactly this and differ only in the entry point.
+func memberSwapTree(t *testing.T, original, swapped string) (source, member, decoy string) {
+	t.Helper()
+	base := t.TempDir()
+	source = goInstall(t, filepath.Join(base, "src"), "lib")
+	if err := os.MkdirAll(filepath.Join(source, "lib"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	member = filepath.Join(source, "lib", "tool")
+	if err := os.WriteFile(member, []byte(original), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	decoy = filepath.Join(base, "decoy")
+	if err := os.WriteFile(decoy, []byte(swapped), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return source, member, decoy
+}
+
+// TestDigestReadsTheFileTheWalkClassified is the production-path regression for
+// digestMember. It fails if the visitor re-resolves the member name.
+//
+// WHY THE PREVIOUS ROUND'S CHECK WAS NOT ONE: it mutated the walk to hand the
+// visitor a NIL handle, which no shipped implementation would do. The real
+// reintroduction is a visitor that opens parent/leaf for itself, which compiles,
+// keeps every existing test green, and reads whatever the name points at by then.
+// A mutant nobody would write is not coverage for the mutant somebody would.
+func TestDigestReadsTheFileTheWalkClassified(t *testing.T) {
+	const original, swapped = "ORIGINAL-MEMBER-BYTES", "SWAPPED-MEMBER-BYTES!"
+
+	// the control: the same tree, never disturbed
+	pristine, _, _ := memberSwapTree(t, original, swapped)
+	want, err := Identify(pristine)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	source, member, decoy := memberSwapTree(t, original, swapped)
+	fired := 0
+	release := installMemberWindowHook(func(name string) {
+		if name != "lib/tool" {
+			return
+		}
+		fired++
+		// repoint the name AFTER the walk classified it and BEFORE the visitor runs
+		if err := os.Rename(decoy, member); err != nil {
+			t.Error(err)
+		}
+	})
+	defer release()
+
+	got, err := Identify(source)
+	if err != nil {
+		t.Fatalf("Identify after an in-window member swap: %v", err)
+	}
+	if fired != 1 {
+		t.Fatalf("member window fired %d times, want exactly 1: the swap did not land in the window under test", fired)
+	}
+	if body, readErr := os.ReadFile(member); readErr != nil {
+		t.Fatal(readErr)
+	} else if string(body) != swapped {
+		t.Fatalf("precondition: the on-disk file should now hold the swapped bytes, got %q", body)
+	}
+	if got != want {
+		t.Errorf("identity changed under an in-window swap:\n got  %v\n want %v\nthe digest read the REPLACEMENT, so the file classified by the walk is not the file that was read", got, want)
+	}
+}
+
+// TestStageCopiesTheFileTheWalkClassified is the same regression for copyMember,
+// asserting on the STAGED BYTES rather than on an identity, so the two tests fail
+// through different observables and one cannot mask the other.
+func TestStageCopiesTheFileTheWalkClassified(t *testing.T) {
+	const original, swapped = "ORIGINAL-COPY-BYTES", "SWAPPED-COPY-BYTES"
+	source, member, decoy := memberSwapTree(t, original, swapped)
+	home := t.TempDir()
+
+	// Stage fingerprints first and copies second. Arm on the SECOND sighting so the
+	// swap lands in the COPY pass, and assert the count, so a change to that pass
+	// structure fails loudly here instead of silently re-targeting the swap.
+	sightings := 0
+	release := installMemberWindowHook(func(name string) {
+		if name != "lib/tool" {
+			return
+		}
+		sightings++
+		if sightings != 2 {
+			return
+		}
+		if err := os.Rename(decoy, member); err != nil {
+			t.Error(err)
+		}
+	})
+	defer release()
+
+	staged, err := Stage(home, source)
+	if err != nil {
+		t.Fatalf("Stage with an in-window member swap during the copy pass: %v", err)
+	}
+	if sightings < 2 {
+		t.Fatalf("member window fired %d times, want at least 2 (fingerprint pass then copy pass): the swap never reached the copy", sightings)
+	}
+	body, err := os.ReadFile(filepath.Join(staged, "lib", "tool"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != original {
+		t.Errorf("staged member = %q, want %q: the copy re-resolved the name and wrote the REPLACEMENT", body, original)
+	}
+}
+
+// TestVisitorThatClosesTheWalksHandleIsReported pins the ownership rule created by
+// passing an open handle to a visitor. A review confirmed no visitor violates it
+// today; this makes that a checked property rather than a fact someone remembered.
+func TestVisitorThatClosesTheWalksHandleIsReported(t *testing.T) {
+	source := goInstall(t, filepath.Join(t.TempDir(), "src"), "lib")
+	root, err := os.OpenRoot(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+
+	t.Run("a visitor that closes the borrowed handle is caught", func(t *testing.T) {
+		err := walkAnchored(root, "lib", func(parent *os.Root, leaf, displayPath string, info fs.FileInfo, handle *os.File) error {
+			if handle != nil {
+				handle.Close() // the violation: the visitor is only a borrower
+			}
+			return nil
+		})
+		if err == nil {
+			t.Fatal("a visitor closing the walk's handle went unreported")
+		}
+		if !errors.Is(err, ErrNotPinned) || !strings.Contains(err.Error(), "not left intact") {
+			t.Fatalf("error = %v, want it to name the ownership violation", err)
+		}
+	})
+
+	t.Run("CONTROL a visitor that only reads is not reported", func(t *testing.T) {
+		if err := walkAnchored(root, "lib", func(parent *os.Root, leaf, displayPath string, info fs.FileInfo, handle *os.File) error {
+			if handle != nil {
+				io.Copy(io.Discard, handle)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("a read-only visitor was reported: %v", err)
+		}
+	})
+
+	// THE FIRST VERSION OF THIS ARM WAS VACUOUS AND A MUTANT CAUGHT IT. It returned
+	// the sentinel from EVERY visit, including the DIRECTORY visit that runs before
+	// any child is walked, so the walk aborted at "lib" and no file handle was ever
+	// opened. It therefore passed identically with and without the ordering it
+	// claims to pin. Returning the sentinel only from the FILE visit is what makes
+	// it reach the branch under test - and the fired flag proves it got there.
+	t.Run("CONTROL a visitor error is not masked by the close check", func(t *testing.T) {
+		sentinel := errors.New("visitor failed for its own reasons")
+		reachedAFile := false
+		err := walkAnchored(root, "lib", func(parent *os.Root, leaf, displayPath string, info fs.FileInfo, handle *os.File) error {
+			if handle == nil {
+				return nil // a directory: keep walking so a file is reached
+			}
+			reachedAFile = true
+			handle.Close() // violate ownership AND fail, so both signals compete
+			return sentinel
+		})
+		if !reachedAFile {
+			t.Fatal("the walk never reached a file, so this arm proves nothing")
+		}
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("error = %v, want the visitor's own error to survive the close check", err)
+		}
+	})
 }

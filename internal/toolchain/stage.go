@@ -196,7 +196,7 @@ func Identify(source string) (Identity, error) {
 	}
 	root, err := os.OpenRoot(source)
 	if err != nil {
-		return Identity{}, fmt.Errorf("%w: %w", ErrNotPinned, err)
+		return Identity{}, fmt.Errorf("%w: %v", ErrNotPinned, err)
 	}
 	defer root.Close()
 	return identifyRoot(root)
@@ -477,6 +477,29 @@ var dirWindowHook atomic.Pointer[func(name string)]
 
 // installDirWindowHook installs fn and returns its release function, panicking if
 // a hook is already installed.
+// memberWindowHook is unset in production and installed only by tests. It fires
+// between a member FILE's verified open and the visitor call that consumes it.
+//
+// IT EXISTS BECAUSE NEITHER OTHER SEAM CAN SEE THIS WINDOW. openWindowHook fires
+// inside openVerified, before the open, so a swap made there is caught by that
+// function's own inode re-proof. dirWindowHook fires after a DIRECTORY's entries
+// are read, which is upstream of any individual file's classification. The gap
+// they leave is exactly the interval a re-resolving visitor is exposed to, and it
+// went untested through two rounds: independent reverts of the second open in
+// digestMember and copyMember each passed the entire suite.
+//
+// Single-installer and atomic for the same reason as the other two.
+var memberWindowHook atomic.Pointer[func(name string)]
+
+// installMemberWindowHook installs fn and returns its release function, panicking
+// if one is already installed.
+func installMemberWindowHook(fn func(name string)) (release func()) {
+	if !memberWindowHook.CompareAndSwap(nil, &fn) {
+		panic("toolchain: memberWindowHook is already installed; this seam admits one installer at a time")
+	}
+	return func() { memberWindowHook.Store(nil) }
+}
+
 func installDirWindowHook(fn func(name string)) (release func()) {
 	if !dirWindowHook.CompareAndSwap(nil, &fn) {
 		panic("toolchain: dirWindowHook is already installed; this seam admits one installer at a time")
@@ -505,12 +528,28 @@ func requireExecutableGo(root *os.Root) error {
 	// reinstates the defect.
 	binRoot, _, err := openVerifiedRoot(root, "bin")
 	if err != nil {
+		// THE ONLY INNER %w IN THIS FILE, AND THE ONLY ONE ANYTHING ENFORCES.
+		// TestBinDirectoryReplacementCannotRedirectTheCompilerCheck asserts
+		// errors.Is(err, ErrSymlink) here, because WHY the compiler check refused
+		// is what distinguishes a repointed bin from an absent one, and that
+		// distinction is what a #1878-class diagnosis turns on.
+		//
+		// Every other site in this file wraps its inner error with %v ON PURPOSE.
+		// A previous round converted seven sites to %w and justified it as fixing
+		// a caller that "would have taken the wrong path on a correct refusal".
+		// NO SUCH CALLER EXISTS: the only consumer is
+		// internal/cli/toolchain_seat.go:52, which tests the OUTER ErrNotPinned and
+		// is unaffected by the inner verb. Six of the seven were unenforced, each
+		// individual reversion passed the whole suite, and their inner errors are
+		// heterogeneous - a missing directory, a short read - with no sentinel to
+		// assert, so "covering" them would have meant inventing contracts nobody
+		// consumes. They are gone rather than pinned.
 		return fmt.Errorf("%w: bin: %w", ErrNotPinned, err)
 	}
 	defer binRoot.Close()
 	handle, info, err := openVerified(binRoot, "go", os.O_RDONLY)
 	if err != nil {
-		return fmt.Errorf("%w: bin/go: %w", ErrNotPinned, err)
+		return fmt.Errorf("%w: bin/go: %v", ErrNotPinned, err)
 	}
 	defer handle.Close()
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
@@ -534,7 +573,7 @@ func requireExecutableGo(root *os.Root) error {
 func readVersion(root *os.Root) (string, error) {
 	handle, info, err := openVerified(root, "VERSION", os.O_RDONLY)
 	if err != nil {
-		return "", fmt.Errorf("%w: VERSION: %w", ErrNotPinned, err)
+		return "", fmt.Errorf("%w: VERSION: %v", ErrNotPinned, err)
 	}
 	defer handle.Close()
 	if !info.Mode().IsRegular() {
@@ -543,7 +582,7 @@ func readVersion(root *os.Root) (string, error) {
 	buffer := make([]byte, maxVersionLength+1)
 	read, err := handle.Read(buffer)
 	if err != nil && read == 0 {
-		return "", fmt.Errorf("%w: VERSION: %w", ErrNotPinned, err)
+		return "", fmt.Errorf("%w: VERSION: %v", ErrNotPinned, err)
 	}
 	return strings.SplitN(string(buffer[:read]), "\n", 2)[0], nil
 }
@@ -612,7 +651,7 @@ func digestMember(root *os.Root, member string, into map[string][sha256.Size]byt
 		// reads the handle the WALK opened; no second resolution of this name
 		perFile := sha256.New()
 		if _, err := io.Copy(perFile, handle); err != nil {
-			return fmt.Errorf("%w: fingerprint %s: %w", ErrNotPinned, displayPath, err)
+			return fmt.Errorf("%w: fingerprint %s: %v", ErrNotPinned, displayPath, err)
 		}
 		into[displayPath] = [sha256.Size]byte(perFile.Sum(nil))
 		return nil
@@ -669,11 +708,32 @@ func walkHeld(root *os.Root, leaf, displayPath string, visit func(parent *os.Roo
 		if err != nil {
 			return err
 		}
-		defer handle.Close()
 		if !info.Mode().IsRegular() {
+			handle.Close()
 			return fmt.Errorf("%w: %s is not a regular file", ErrNotPinned, displayPath)
 		}
-		return visit(root, leaf, displayPath, info, handle)
+		// THE ONLY WINDOW IN WHICH A MEMBER FILE'S NAME CAN BE REPOINTED AFTER THIS
+		// WALK HAS CLASSIFIED IT: the handle above is open and proven to be the
+		// object that was inspected, and the visitor has not run yet. A visitor that
+		// RE-RESOLVES leaf instead of reading this handle reads whatever the name
+		// points at now, so the file the walk classified and the file the visitor
+		// consumed are different objects with nothing reconciling them.
+		if hook := memberWindowHook.Load(); hook != nil {
+			(*hook)(displayPath)
+		}
+		visitErr := visit(root, leaf, displayPath, info, handle)
+		// THE WALK OWNS THIS HANDLE AND THE VISITOR ONLY BORROWS IT, and that is now
+		// ENFORCED rather than merely true. Handing an open file to a visitor created
+		// an ownership rule with nothing behind it: a visitor that closed it would
+		// make this close fail silently, and one that retained it past return would
+		// hold a descriptor the walk believes released, breaking the depth bound
+		// asserted by TestDescriptorPeakStaysAtTreeDepth. A review confirmed no
+		// visitor does either TODAY, which is exactly the kind of fact that stops
+		// being true without anyone noticing. The failing close is the signal.
+		if closeErr := handle.Close(); closeErr != nil && visitErr == nil {
+			return fmt.Errorf("%w: %s: the walk's handle was not left intact by its visitor: %v", ErrNotPinned, displayPath, closeErr)
+		}
+		return visitErr
 	}
 
 	sub, info, err := openVerifiedRoot(root, leaf)
@@ -722,7 +782,7 @@ func Stage(gitmootHome, source string) (string, error) {
 	}
 	sourceRoot, err := os.OpenRoot(source)
 	if err != nil {
-		return "", fmt.Errorf("%w: %w", ErrNotPinned, err)
+		return "", fmt.Errorf("%w: %v", ErrNotPinned, err)
 	}
 	defer sourceRoot.Close()
 
@@ -898,6 +958,30 @@ func copyInstallation(sourceRoot, destinationRoot *os.Root, destination string) 
 	return nil
 }
 
+// copyMember resolves SOURCE names by leaf through held sub-roots and DESTINATION
+// names as multi-component paths from destinationRoot. THAT ASYMMETRY IS DELIBERATE
+// AND IT IS NOT AN OVERSIGHT LEFT BY THE SOURCE-SIDE FIX.
+//
+// The source is the operator's pinned installation. This package does not own it,
+// cannot lock it, and #1878 exists precisely because it may sit outside the
+// daemon's control - so any name resolved there must be pinned to a descriptor
+// that was inspected, or an intermediate component can be repointed mid-walk.
+//
+// The destination is ours, and three properties are what make the difference:
+// stage() creates the root with os.MkdirAll(root, 0o700), so no other user can
+// write into it; the staging directory is ".staging-" plus eight bytes from
+// crypto/rand, created fresh in the same call, so its name cannot be predicted or
+// pre-planted; and every destination operation in this file goes through
+// destinationRoot, the single os.Root over that tree - the only os.* call taking a
+// destination path is the MkdirAll that creates the root itself. An attacker able
+// to swap an intermediate directory under there could replace the published tree
+// outright, so the resolution shape would not be the weakest link.
+//
+// AND BROADENING IT WOULD COST THE BOUND THIS ROUND WAS ASKED TO PRESERVE.
+// Per-directory sub-roots on the destination would add a second held chain,
+// roughly doubling the live descriptors that TestDescriptorPeakStaysAtTreeDepth
+// bounds at deepestPathDepth+3, for no threat-model gain. Mechanical symmetry
+// here would trade a measured invariant for an appearance of consistency.
 func copyMember(sourceRoot, destinationRoot *os.Root, destination, member string) error {
 	return walkAnchored(sourceRoot, member, func(parent *os.Root, leaf, displayPath string, info fs.FileInfo, handle *os.File) error {
 		target := path.Join(destination, displayPath)
