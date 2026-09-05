@@ -991,3 +991,107 @@ func TestPipelineAutoMergerEvaluateMarksTheReconciliationHold(t *testing.T) {
 		t.Fatalf("a mergeability wait must not be a reconciliation hold: %+v", pendingReadiness)
 	}
 }
+
+// #1783 round-6 review, P2a. A note whose body PARSES but whose repo= field does
+// not confirm this repository, while its repo COLUMN says it IS this
+// repository's, used to satisfy neither arm of latestOperatingModeDecision and
+// was skipped entirely. A stale `decision_note=none` row then answered and the
+// reviewer's probe reproduced Merged=true. Mode-resolution failure must fail
+// CLOSED here, like every other unreadable decision.
+func TestWorkloadModeGateHoldsWhenThisReposNoteNamesAnotherRepo(t *testing.T) {
+	for name, body := range map[string]string{
+		"repo field omitted":  "[operating-mode mode=DRAIN]",
+		"repo field conflict": "[operating-mode repo=other/repo mode=DRAIN]",
+	} {
+		t.Run(name, func(t *testing.T) {
+			store, gh, gate, request := newWorkloadModeGateScenario(t)
+			// The row that would satisfy the gate if the newest decision vanished.
+			insertRawModeReconciliation(t, store, "STEADY", "head123", "none")
+			note := insertRawOperatingMode(t, store, "gitmoot/gitmoot", body)
+
+			decision, err := gate.Evaluate(context.Background(), request)
+			if err != nil {
+				t.Fatalf("Evaluate: %v", err)
+			}
+			if decision.Merged || len(gh.merges) != 0 {
+				t.Fatalf("a note recorded for this repo whose body does not name it must HOLD, not be skipped: decision=%+v merges=%d reason=%q",
+					decision, len(gh.merges), decision.Reason.Render())
+			}
+			if rendered := decision.Reason.Render(); !strings.Contains(rendered, strconv.FormatInt(note.ID, 10)) {
+				t.Fatalf("hold must name note %d: %q", note.ID, rendered)
+			}
+		})
+	}
+}
+
+// #1783 round-6 review, P2b. The decision window admitted every repo-less note
+// and truncated at the scan limit BEFORE the body-repo filter ran, so unrelated
+// repo-less traffic could push this repository's decision out of the window. The
+// reviewer's probe buried a valid DRAIN decision under 201 newer repo-less notes
+// and a stale PR-sourced reconciliation merged.
+func TestWorkloadModeGateFindsTheDecisionBehindRepolessNotes(t *testing.T) {
+	store, gh, gate, request := newWorkloadModeGateScenario(t)
+	decisionNote := insertOperatingModeDecision(t, store, "STEADY")
+	for i := 0; i < workloadModeReconciliationScan+10; i++ {
+		// repo COLUMN empty - the shape that used to consume the window - and a
+		// body naming a DIFFERENT repository, so it can never answer for this one.
+		insertRawOperatingMode(t, store, "",
+			fmt.Sprintf("[operating-mode repo=other/repo-%d mode=DRAIN]", i))
+	}
+	insertRawModeReconciliation(t, store, "STEADY", "head123", strconv.FormatInt(decisionNote.ID, 10))
+
+	decision, err := gate.Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if !decision.Merged || len(gh.merges) != 1 {
+		t.Fatalf("this repository's decision must survive unrelated repo-less traffic: decision=%+v merges=%d reason=%q",
+			decision, len(gh.merges), decision.Reason.Render())
+	}
+}
+
+// #1783 round-6 review, P2c. Every unreadable decision reported decisionID
+// "none", so two DIFFERENT malformed notes at one head produced the same hold
+// key. run.go reuses the earliest matching hold timestamp, so the second
+// decision inherited the first one's elapsed budget. A new decision - readable
+// or not - starts a new episode, and the key is what carries that.
+func TestWorkloadModeGateGivesEachUnreadableDecisionItsOwnEpisode(t *testing.T) {
+	// ONE store, two successive unreadable decisions - the real scenario. A fresh
+	// store per arm would hand both notes the same rowid and prove nothing about
+	// the key; the first version of this test did exactly that and failed for that
+	// reason rather than for the defect.
+	//
+	// ensureWorkloadModeReconciled is the function the merge gate calls and the
+	// one that MINTS the episode key; the key is not carried on MergeDecision, so
+	// this reads it where production produces it.
+	store, gh, _, request := newWorkloadModeGateScenario(t)
+	insertRawModeReconciliation(t, store, "STEADY", "head123", "none")
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	keyNow := func(t *testing.T) string {
+		t.Helper()
+		required, reconciled, hold, err := ensureWorkloadModeReconciled(
+			context.Background(), store, gh, repo, int64(request.PullRequest), "head123")
+		if err != nil {
+			t.Fatalf("ensureWorkloadModeReconciled: %v", err)
+		}
+		if !required || reconciled {
+			t.Fatalf("an unreadable decision must be required-and-unreconciled: required=%v reconciled=%v", required, reconciled)
+		}
+		return hold.key
+	}
+	firstNote := insertRawOperatingMode(t, store, "gitmoot/gitmoot", "[operating-mode repo=gitmoot/gitmoot mode=DRAIN urgent]")
+	first := keyNow(t)
+	secondNote := insertRawOperatingMode(t, store, "gitmoot/gitmoot", "[operating-mode repo=gitmoot/gitmoot mode=PAUSED]")
+	second := keyNow(t)
+
+	if firstNote.ID == secondNote.ID {
+		t.Fatalf("fixture defect: both notes have id %d, so the key could not differ either way", firstNote.ID)
+	}
+	if first == "" || second == "" {
+		t.Fatalf("both holds must carry an episode key: %q / %q", first, second)
+	}
+	if first == second {
+		t.Fatalf("unreadable decisions %d and %d shared one episode key %q, so the second inherits the first's elapsed budget",
+			firstNote.ID, secondNote.ID, first)
+	}
+}

@@ -596,7 +596,9 @@ once the claim has been held 15m, or immediately with
 `cause=claim_timestamp_unreadable` when that timestamp will not parse. A stage
 `timeout` turns either into a terminal park rather than a recovery - nothing
 releases an orphaned claim, so a new run is the remedy. A claim released in the
-window between a losing scan's failed claim and its read is reported as nothing:
+window between a losing scan's failed claim and its read is reported as nothing
+while the gate keeps waiting, and its reason reaches the terminal parked summary
+if the stage `timeout` has elapsed:
 that is the ordinary hold cycle. A workload-mode reconciliation hold records
 `pipeline_auto_merge_held` with its cause: the gate releases the claim and
 re-attempts, so the hold is retryable rather than terminal, and it parks with
@@ -636,6 +638,48 @@ codex — no per-job shell override):
 Agent stages fold by `gitmoot_result` `decision` and park/advance exactly like shell
 stages — an `approved`/`implemented` review advances dependents, a `blocked` result
 parks the run with its `needs`, `changes_requested` is a failure by default.
+
+## Satisfying the workload-mode gate
+
+A pull request whose diff changes the `**Current mode:` marker in `AGENTS.md` is
+HELD until an exact-head reconciliation row exists. The gate is keyed on the
+repository OWNER, so every `gitmoot/*` repository is held, human-requested merges
+included.
+
+Two note streams decide it, both matched by an exact body PREFIX and compared
+case-insensitively on repository:
+
+- DECISION: `[operating-mode repo=<owner/repo> mode=<THROUGHPUT|STEADY|DRAIN>]`
+- RECONCILIATION: `[workload-mode-reconciliation repo=<owner/repo> pr=<number> head=<40-character reviewed head> mode=<mode> decision_note=<note id|none>]`
+
+Every field is `key=value`, whitespace separated, inside the leading bracket. A
+field with an empty key or value makes the whole body unparseable, so write the
+row with `gitmoot workflow note --repo <owner/repo>` rather than by hand where a
+missing `--repo` is easy.
+
+PRECEDENCE. The NEWEST decision wins, and a reconciliation row must be newer than
+it. `decision_note=none` means the PR itself is the decision, and the row's own
+`created_at` is `decided_at`; otherwise `decision_note` names the newest
+operating-mode note the exact head implements. A row that cites a note the PR
+contradicts cannot ratify it.
+
+WHEN A DECISION CANNOT BE READ. An unreadable newest decision - a malformed field
+list, a `mode` that is not a workload mode, or a note recorded for this
+repository whose body omits or contradicts `repo=` - SUPERSEDES like any other
+decision rather than reading as "no decision". It is a recency boundary, not a
+veto: a fresh exact-head row that agrees with the PR's own marker still merges,
+so correcting the note is optional. The gate refuses outright only when nothing
+readable remains - the note is unreadable AND the PR's marker patch is missing or
+ambiguous - and the hold then names both exits: append a readable operating-mode
+note, and file an exact-head row citing it.
+
+CLEARING A HOLD. The hold is retryable: the pipeline gate releases its
+at-most-once merge claim, records `pipeline_auto_merge_held` with the cause, and
+merges on a later scan once the row lands. It is bounded on both the ordinary
+evaluate path and the final merge boundary - the stage parks at the gate
+`timeout`, or 24h after the episode began when no `timeout` is set. An episode is
+keyed on the head and the decision, so a new head or a new decision (including a
+new unreadable one) starts a fresh budget rather than inheriting the old one.
 
 ## Produce data without changing the repo
 

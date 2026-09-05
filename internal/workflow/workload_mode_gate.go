@@ -262,9 +262,27 @@ func ensureWorkloadModeReconciled(ctx context.Context, store *db.Store, gh Merge
 	if decision.unreadableID > supersededBy {
 		supersededBy = decision.unreadableID
 	}
+	// The episode key must change when the DECISION changes, including when the
+	// new decision is unreadable. Leaving decisionID at "none" for every
+	// unreadable note gave two different malformed notes at one head the SAME
+	// key, and run.go reuses the earliest matching hold timestamp - so a fresh
+	// unreadable decision inherited the previous one's 24h budget and could park
+	// immediately (#1783 review, P2c). An unreadable decision is still a
+	// decision: it gets its own identity, distinguishable from a readable one so
+	// the two can never collide on the same id.
+	// decisionID is the EPISODE IDENTITY; decisionLabel is what an operator reads.
+	// They differ only for an unreadable decision, where the key needs a value
+	// that cannot collide with a readable note's id and the message needs a
+	// sentence.
 	decisionID := "none"
-	if decision.id > 0 {
+	decisionLabel := "none"
+	switch {
+	case decision.id > 0:
 		decisionID = strconv.FormatInt(decision.id, 10)
+		decisionLabel = decisionID
+	case decision.unreadableID > 0:
+		decisionID = "unreadable-" + strconv.FormatInt(decision.unreadableID, 10)
+		decisionLabel = fmt.Sprintf("%d (unreadable: it %s)", decision.unreadableID, decision.unreadableWhy)
 	}
 	notes, err := store.ListRepoWorkflowNotesByBodyPrefix(ctx, modeReconciliationNotePrefix, repo.FullName(), workloadModeReconciliationScan)
 	if err != nil {
@@ -337,7 +355,7 @@ func ensureWorkloadModeReconciled(ctx context.Context, store *db.Store, gh Merge
 			return true, true, workloadModeHold{}, nil
 		}
 		if cited != decisionID {
-			nearMiss = fmt.Sprintf("; row %d cites decision_note=%s but the newest operating-mode note is %s", note.ID, cited, decisionID)
+			nearMiss = fmt.Sprintf("; row %d cites decision_note=%s but the newest operating-mode note is %s", note.ID, cited, decisionLabel)
 			continue
 		}
 		if decision.id > 0 && mode != decision.mode {
@@ -346,7 +364,7 @@ func ensureWorkloadModeReconciled(ctx context.Context, store *db.Store, gh Merge
 		}
 		return true, true, workloadModeHold{}, nil
 	}
-	detail := fmt.Sprintf("workload-mode change requires reconciliation at head %s against operating-mode note %s", shortSHA(headSHA), decisionID)
+	detail := fmt.Sprintf("workload-mode change requires reconciliation at head %s against operating-mode note %s", shortSHA(headSHA), decisionLabel)
 	if observed.ambiguous {
 		if observed.patchUnavailable {
 			detail += "; GitHub omitted this PR's AGENTS.md patch, so the mode marker could not be read"
@@ -421,6 +439,23 @@ func latestOperatingModeDecision(ctx context.Context, store *db.Store, repo stri
 			return operatingModeDecision{
 				unreadableID:  note.ID,
 				unreadableWhy: fmt.Sprintf("declares mode=%q, which is not a workload mode", fields["mode"]),
+			}, nil
+		}
+		// A note whose body PARSED but whose repo FIELD does not confirm this
+		// repository is NOT automatically another lane's problem. If the note is
+		// demonstrably this repository's - its repo COLUMN says so - then its body
+		// omits or contradicts repo=, and that is an unreadable decision for THIS
+		// repo, so it must HOLD. Skipping it let the next-oldest row answer and a
+		// stale PR-sourced reconciliation merge; the #1783 review reproduced
+		// Merged=true through PolicyMergeGate.Evaluate with exactly that shape.
+		// Only a note that neither parses for this repo nor belongs to it by column
+		// is skipped, so one lane's typo still cannot freeze every repository.
+		if parsed && noteConcernsRepo(note, repo) {
+			return operatingModeDecision{
+				unreadableID: note.ID,
+				unreadableWhy: fmt.Sprintf(
+					"was recorded for this repository but its body declares repo=%q, so it cannot be read as this repository's decision",
+					strings.TrimSpace(fields["repo"])),
 			}, nil
 		}
 		// An unparseable body cannot answer "is this note for this repo?" through

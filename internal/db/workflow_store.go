@@ -9,6 +9,7 @@ import (
 	mrand "math/rand/v2"
 	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1000,12 +1001,50 @@ func (s *Store) ListRepoWorkflowNotesByBodyPrefix(ctx context.Context, prefix st
 	if limit <= 0 || limit > 200 {
 		limit = 200
 	}
+	// TWO BOUNDED QUERIES, NOT ONE. A single `repo = ? OR repo = ''` window
+	// ordered by recency and truncated to LIMIT still let repo-less notes from
+	// OTHER repositories consume the whole window: the #1783 review inserted a
+	// valid DRAIN decision followed by 201 newer repo-less notes for other repos,
+	// the target decision fell out of the window, and a stale PR-sourced
+	// reconciliation merged (fail-open). The mirror case hides a valid
+	// reconciliation and falsely holds.
+	//
+	// The body-repo test is NOT replicated in SQL on purpose. The marker grammar
+	// the gate accepts tolerates `repo=x`, `repo = x` and case differences
+	// (leadingRepoValue), so an instr() predicate would silently EXCLUDE forms Go
+	// accepts - trading a fail-open for a wrong answer. Instead each scope gets
+	// its own bounded window and the caller still decides, on the same grammar,
+	// which note answers for this repository.
+	scoped, err := s.workflowNotesByBodyPrefixWhere(ctx,
+		`repo = ? COLLATE NOCASE`, []any{prefix, prefix, repo, limit}, prefix)
+	if err != nil {
+		return nil, err
+	}
+	repoless, err := s.workflowNotesByBodyPrefixWhere(ctx,
+		`repo = ''`, []any{prefix, prefix, limit}, prefix)
+	if err != nil {
+		return nil, err
+	}
+	notes := append(scoped, repoless...)
+	// Newest first across the union. The union is at most 2*limit rows and is
+	// deliberately NOT truncated back to limit: truncating the merged list would
+	// reintroduce exactly the crowd-out this split exists to remove.
+	sort.SliceStable(notes, func(i, j int) bool {
+		if notes[i].CreatedAt != notes[j].CreatedAt {
+			return notes[i].CreatedAt > notes[j].CreatedAt
+		}
+		return notes[i].ID > notes[j].ID
+	})
+	return notes, nil
+}
+
+func (s *Store) workflowNotesByBodyPrefixWhere(ctx context.Context, scope string, args []any, prefix string) ([]WorkflowNote, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, workflow_id, author, body, repo, memory_observation_id, created_at
 FROM workflow_notes
 WHERE substr(body, 1, length(?)) = ?
-  AND (repo = ? COLLATE NOCASE OR repo = '')
+  AND `+scope+`
 ORDER BY created_at DESC, id DESC
-LIMIT ?`, prefix, prefix, repo, limit)
+LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
 	}

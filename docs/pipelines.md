@@ -624,7 +624,9 @@ stages:
   `created_at` will not parse is recorded immediately with
   `cause=claim_timestamp_unreadable`, which a stage `timeout` parks like any
   other wait. A claim RELEASED in the window between a losing scan's failed
-  claim and its read is reported as nothing at all: that is the ordinary hold
+  claim and its read is reported as nothing while the gate keeps waiting - the
+  reason reaches the terminal parked summary once the stage `timeout` elapses -
+  and that is the ordinary hold
   cycle and the next scan takes the claim.
 - A workload-mode reconciliation hold is a THIRD event,
   `pipeline_auto_merge_held`, carrying the cause plus the head and the time the
