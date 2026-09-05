@@ -649,6 +649,15 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		// the daemon worker: it must never replace the foreground job's outcome.
 		_ = quotaHooks.recordRuntimeOutcome(ctx, job, payload, effectiveAgent, runErr, time.Now().UTC())
 	}
+	// #1856: the two LOCAL CLI child-delivery boundaries. They are the arms of
+	// this one if/else - an ask delivers through mailbox.Run and never reaches
+	// engine.RunJob - so bracketing only the else arm would leave foreground and
+	// task-scoped asks, the largest non-seat CLI population, unobserved.
+	//
+	// effectiveAgent is deliberately the observed value rather than `agent`: a
+	// per-job runtime override can make them differ, and the observation must
+	// describe the child that actually ran.
+	credentialBefore, credentialObserved := observeNonSeatKimiCredential(effectiveAgent)
 	if request.Action == "ask" {
 		// Wire the home-aware registry defaults so a foreground ask with no
 		// agent/job model or effort pin honors the runtime's defaults too.
@@ -656,9 +665,11 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("foreground ask delivery"))
 		mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(request.Home)
 		mailbox.RuntimeDefaultEffort = runtimeDefaultEffortResolver(request.Home)
-		if _, err := mailbox.Run(runCtx, job.ID, effectiveAgent, adapter); err != nil {
-			recordRuntimeOutcome(err)
-			return localAgentJobOutput{}, foregroundAskTimeoutError(runCtx, jobTimeout, err)
+		_, runErr := mailbox.Run(runCtx, job.ID, effectiveAgent, adapter)
+		recordKimiCredentialDegradation(ctx, store, io.Discard, job.ID, effectiveAgent, credentialBefore, credentialObserved)
+		if runErr != nil {
+			recordRuntimeOutcome(runErr)
+			return localAgentJobOutput{}, foregroundAskTimeoutError(runCtx, jobTimeout, runErr)
 		}
 		recordRuntimeOutcome(nil)
 		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_completed", Message: "workflow advancement completed"}); err != nil {
@@ -670,13 +681,15 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			workflowHome = paths.Home
 		}
 		engine := daemonWorkflowEngineForRunner(store, newAgentDispatchGitHubClient(checkoutPath), checkoutPath, workflowHome, localDispatchJobRunner(request), nil)
-		if _, err := engine.RunJob(runCtx, job.ID, effectiveAgent, adapter); err != nil {
-			if out, ok, _ := recoverAdvanceErrorOutput(ctx, store, job.ID, request, err); ok {
+		_, runErr := engine.RunJob(runCtx, job.ID, effectiveAgent, adapter)
+		recordKimiCredentialDegradation(ctx, store, io.Discard, job.ID, effectiveAgent, credentialBefore, credentialObserved)
+		if runErr != nil {
+			if out, ok, _ := recoverAdvanceErrorOutput(ctx, store, job.ID, request, runErr); ok {
 				recordRuntimeOutcome(nil)
 				return out, nil
 			}
-			recordRuntimeOutcome(err)
-			return localAgentJobOutput{}, err
+			recordRuntimeOutcome(runErr)
+			return localAgentJobOutput{}, runErr
 		}
 		recordRuntimeOutcome(nil)
 	}

@@ -883,7 +883,13 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 	}
 	nativeReviewDeliveryStarted = true
+	// #1856 report-only detector, caller 2 of 2: a NON-SEAT delivery runs the
+	// runtime CLI against the operator's live profile (a read-only seat reads a
+	// staged clone instead, which the child may legitimately rewrite - so seats
+	// are excluded here rather than filtered later).
+	credentialBefore, credentialObserved := observeNonSeatKimiCredential(agent)
 	_, err = engine.RunJob(runCtx, job.ID, agent, adapter)
+	recordKimiCredentialDegradation(ctx, w.Store, w.Stdout, job.ID, agent, credentialBefore, credentialObserved)
 	stopKillPending()
 	stopProgress()
 	if readOnlyState != nil {
@@ -3171,7 +3177,12 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		adapter = w.observePermissionPolicyEffects(adapter, delegatedJob.ID, checkout)
 	}
 	engine := w.workflowForJob(checkout, jobRunner)
+	// #1856: the DELEGATED-job delivery route. A delegation child whose action is
+	// neither ask nor review is non-seat (engine_delegation.go only sets
+	// ReadOnlySeat for those two), so a kimi child here reads the LIVE profile.
+	delegatedCredentialBefore, delegatedCredentialObserved := observeNonSeatKimiCredential(started.Agent)
 	_, err = engine.RunJob(runCtx, delegatedJob.ID, started.Agent, adapter)
+	recordKimiCredentialDegradation(ctx, w.Store, w.Stdout, delegatedJob.ID, started.Agent, delegatedCredentialBefore, delegatedCredentialObserved)
 	stopKillPending()
 	if err != nil {
 		if quotaErr := w.quotaRoleUnavailableHooks().recordRuntimeOutcome(ctx, delegatedJob, payload, started.Agent, err, time.Now().UTC()); quotaErr != nil {
@@ -4318,4 +4329,77 @@ func (w jobWorker) workflowHome() string {
 
 func (w jobWorker) defaultCommenter(_ string) github.Client {
 	return github.NewClient("")
+}
+
+// kimiCredentialDegradedEvent names the #1856 report-only observation: the LIVE
+// kimi credential was usable before a non-seat delivery and is not after it.
+// Attribution is INFERRED - the event records that a kimi child ran while the
+// file changed, never that this child wrote it, because gitmoot writes this file
+// nowhere and the only writer is the vendor CLI.
+const kimiCredentialDegradedEvent = "kimi_credential_degraded"
+
+// observeNonSeatKimiCredential reads the LIVE kimi credential a non-seat
+// delivery is about to exercise (#1856).
+//
+// It observes nothing for a read-only seat: that child reads a staged clone
+// inside its own writable cache root, so a change there says nothing about the
+// operator's profile and its events would be indistinguishable from real ones.
+// It also observes nothing for other runtimes - claude's credential has its own
+// staging-side machinery (#1808) and codex was never reported for this.
+//
+// Callers pass the agent DELIVERY actually runs with (the daemon's resolved
+// agent, the dispatch path's effectiveAgent), never the registered row: a
+// per-job runtime override can make those differ, and the observation must
+// describe the child that ran.
+func observeNonSeatKimiCredential(agent runtime.Agent) (runtime.KimiCredentialObservation, bool) {
+	if agent.Runtime != runtime.KimiRuntime || agent.ReadOnlySeat {
+		return runtime.KimiCredentialObservation{}, false
+	}
+	dir, err := resolveRuntimeConfigDir(runtime.KimiRuntime, agent.RuntimeConfigDir)
+	if err != nil {
+		return runtime.KimiCredentialObservation{}, false
+	}
+	return runtime.ObserveKimiCredential(dir)
+}
+
+// recordKimiCredentialDegradation re-reads the credential after the child and
+// records AT MOST ONE job event when it got worse, on success and failure alike
+// - a blanking during a run that SUCCEEDS is the measured #1856 shape.
+//
+// The one-event-per-job bound is enforced HERE rather than left to the call
+// sites' shape. The two CLI dispatch boundaries are mutually exclusive arms of
+// one if/else (agent_dispatch.go's ask arm delivers through mailbox.Run, the
+// else arm through engine.RunJob) so today they cannot double-fire, but a reader
+// should not have to re-derive that from the control flow, and a retried job
+// re-entering delivery must not append a second copy of the same observation.
+// This mirrors recordReadOnlySeatCredentialDiagnosis's existing convention.
+//
+// Report-only: it never writes the credential, and a recording failure is
+// swallowed to a line on stdout rather than affecting the job's outcome.
+func recordKimiCredentialDegradation(ctx context.Context, store *db.Store, stdout io.Writer, jobID string, agent runtime.Agent, before runtime.KimiCredentialObservation, observed bool) {
+	if !observed || store == nil {
+		return
+	}
+	after, ok := observeNonSeatKimiCredential(agent)
+	degraded := runtime.KimiCredentialDegradation(before, after, ok)
+	if degraded == "" {
+		return
+	}
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		writeLine(stdout, "job %s kimi credential degradation lookup failed: %v", jobID, err)
+		return
+	}
+	for _, event := range events {
+		if event.Kind == kimiCredentialDegradedEvent {
+			return
+		}
+	}
+	if err := store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   jobID,
+		Kind:    kimiCredentialDegradedEvent,
+		Message: degraded,
+	}); err != nil {
+		writeLine(stdout, "job %s kimi credential degradation record failed: %v", jobID, err)
+	}
 }

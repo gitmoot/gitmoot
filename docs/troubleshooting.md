@@ -450,6 +450,29 @@ Fixes:
   that seat credential beside the ambient one, and doctor FAILS (non-zero exit)
   when it is expired with no refresh token, since every read-only seat job on
   that runtime will fail until the account is re-logged in.
+- A kimi credential that goes blank mid-session is REPORTED, not repaired
+  (#1856). Kimi's credential (`~/.kimi-code/credentials/kimi-code.json`) has
+  been observed blanked IN PLACE after a failed refresh: still-valid JSON, 136
+  bytes, with `access_token` and `refresh_token` empty strings and `expires_at`
+  0, while `scope` and `token_type` stay populated. Gitmoot writes that file
+  NOWHERE — the only writer is the vendor CLI — so it cannot make the write
+  atomic, and a safety net whose failure mode is "gitmoot corrupted the owner's
+  credential" would be worse than the defect. Instead the two paths that run a
+  kimi child against the LIVE profile — a non-seat delivery, and `gitmoot agent
+  doctor`'s health check — read the credential immediately before and after the
+  child and report a degradation: the delivery records one
+  `kimi_credential_degraded` job event (on success and failure alike, because
+  the measured case ran to success), and doctor prints the same observation on
+  stderr since a command has no job row. It fires only on a credential that
+  demonstrably carried a token before and demonstrably carries none after, so a
+  host that is simply logged out stays silent, and a reading gitmoot cannot
+  interpret (unreadable file, unmeasured schema) is never treated as evidence in
+  either direction. Read it with `gitmoot job events <job-id>`. **Attribution is
+  inferred, not confirmed**: the event records that a kimi child ran while the
+  file changed, never that this child wrote it. A read-only seat is deliberately
+  NOT observed — it reads a staged clone inside its own writable cache root,
+  which the child may legitimately rewrite, and gitmoot never grants a seat read
+  or write access to the live profile.
 - A Claude `produce` stage does NOT run against the operator profile. The daemon
   copies `.credentials.json` and `settings.json` from the configured account
   (`CLAUDE_CONFIG_DIR`, else `~/.claude`) into a job-private profile, points the
@@ -632,6 +655,14 @@ Fixes:
   visibly unjudged, so an unevaluated head stops reading as an approved one. A
   later gate evaluation replaces it with the specific pending, failure, or
   success verdict for that same head.
+- A PR that is merely **behind** its base is merged on its reviewed head, and no
+  branch update is requested, unless the base branch requires an up-to-date head.
+  If you expected a `pull request branch update from main requested` pending
+  verdict and do not see one, that is why. Confirm what the gate saw with
+  `gh api repos/<owner>/<repo>/branches/<base>/protection --jq
+  '.required_status_checks.strict'`: `true` keeps the update-and-retry path, and
+  a 404 or a permission error is *undetermined* and also keeps it. Only an
+  explicit `false` skips the update. Diverged branches always take the update.
 - Gitmoot publishes it only while it owns the merge decision. With
   `[merge_gate] auto_merge = false`, with `GITMOOT_DISABLE_NATIVE_MERGE_GATE=1`,
   or once a task reaches `awaiting_human_merge`, `dismissed`, `superseded`,
