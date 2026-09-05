@@ -166,18 +166,17 @@ func TestDashboardWatchRejectsInvalidCombos(t *testing.T) {
 // the wrong guard, which is precisely the class that round claimed to close
 // (#1787 review F1).
 //
-// Reaching the interval guard needs a stdout that satisfies IsTerminal. /dev/null
-// is a character device, so it does - the same weakness filed as #1838, used
-// here deliberately and named so nobody reads it as an accident.
+// Reaching the interval guard needs a stdout that satisfies IsTerminal. This
+// case USED TO open /dev/null for that, relying on the #1838 weakness it names.
+// With that weakness fixed, /dev/null no longer passes and the old version
+// would have SILENTLY SKIPPED - still green, testing nothing. It now uses a
+// genuine terminal instead, so it exercises the same production ordering
+// without depending on a defect.
 func TestDashboardWatchRejectsANonPositiveInterval(t *testing.T) {
 	home := dashboardTestHome(t)
-	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer devNull.Close()
-	if !style.IsTerminal(devNull) {
-		t.Skip("this host does not report /dev/null as a character device, so the terminal guard cannot be passed here")
+	tty := openTerminalForTest(t)
+	if !style.IsTerminal(tty) {
+		t.Fatal("openTerminalForTest did not return a terminal, so the terminal guard cannot be passed here")
 	}
 	original := runDashboardWatchFn
 	t.Cleanup(func() { runDashboardWatchFn = original })
@@ -187,7 +186,7 @@ func TestDashboardWatchRejectsANonPositiveInterval(t *testing.T) {
 		return 0
 	}
 	var stderr bytes.Buffer
-	code := Run([]string{"dashboard", "--home", home, "--watch", "--interval", "0s"}, devNull, &stderr)
+	code := Run([]string{"dashboard", "--home", home, "--watch", "--interval", "0s"}, tty, &stderr)
 	if started != 0 {
 		t.Fatal("the watch loop started with a non-positive interval")
 	}
