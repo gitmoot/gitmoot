@@ -101,6 +101,11 @@ func TestStoreOpenPolicy(t *testing.T) {
 	// then reopens the same file to run the migration over it.
 	realPathTests["TestCockpitRemovalMigrationOnFreshHome"] = true
 	realPathTests["TestCockpitRemovalMigrationDropsPopulatedTablesOnUpgrade"] = true
+	// #1836: holds the write lock from a SECOND connection to the same file for
+	// longer than a caller's budget, which is the only way to observe that a
+	// contended write is discarded rather than shortened. A cached shared-memory
+	// store has no file for a second connection to contend over.
+	realPathTests["TestShortCallerBudgetDiscardsAWriteItAlreadyWon"] = true
 	directOpenFunctions := map[string]bool{
 		"ensureCachedMigratedTestTemplateOnce": true,
 		"openRealTestStore":                    true,

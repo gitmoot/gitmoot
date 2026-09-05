@@ -63,6 +63,30 @@ type sqlExecer interface {
 // daemon its own home via GITMOOT_HOME_DIR so they do not share a DB at all.)
 const sqliteBusyTimeoutMillis = 15000
 
+// DurableWriteBudget is the MINIMUM context deadline a caller must allow a
+// durability write against this store, and it is DERIVED from
+// sqliteBusyTimeoutMillis rather than hand-set beside it.
+//
+// THE BUG SHAPE THIS EXISTS TO REMOVE (#1836). A caller bounded a wake-outbox
+// terminal-state write at 5s while the driver was still legitimately waiting on
+// the write lock for up to 15s, so the write was abandoned before the store's
+// own budget was spent. The row stayed `attempted`, the age-out sweep relabelled
+// it `delivery_unknown` with policy=expire_without_retry, and a wake that WAS
+// delivered decayed into an unknown that is never retried. Measured on the live
+// home: 15 of 167 delivered wakes in one 2h33m window lost that write.
+//
+// The defect was never one number being wrong. It was TWO CONSTANTS IN TWO
+// PACKAGES whose relative order nothing enforced: a caller in internal/cli
+// could be edited without ever seeing internal/db's budget. Deriving the
+// caller's floor from the store's own wait makes that ordering impossible to
+// get wrong by construction, and TestDurableWriteBudgetExceedsBusyTimeout pins
+// it so the pair cannot drift apart again.
+//
+// The margin is for the statement itself: a deadline equal to the busy timeout
+// still abandons at the instant the driver gives up waiting, leaving no time to
+// execute the write it just won the lock for.
+const DurableWriteBudget = sqliteBusyTimeoutMillis*time.Millisecond + 3*time.Second
+
 func Open(path string) (*Store, error) {
 	store, err := openWritable(path)
 	if err != nil {

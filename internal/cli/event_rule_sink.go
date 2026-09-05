@@ -390,11 +390,59 @@ func (s *eventRuleSink) completeWakeOutbox(ctx context.Context, event events.Eve
 	return errors.Join(cause, finishErr)
 }
 
+// finishWakeOutbox records the wake's TERMINAL OUTCOME. It is a durability
+// write, not a probe, and the distinction is the whole of #1836.
+//
+// IT USED eventRuleProbeTimeout, WHICH IS 5s AND IS NOT ITS BUDGET. That
+// constant's own doc says it bounds "the availability probe and each pane-label
+// resolution (a herdr `pane list`)" - subprocess calls to herdr, where cutting
+// early is right because a hung probe must not hang the wake path. Reusing it
+// here pointed a herdr-probe deadline at a SQLite write whose driver waits up to
+// sqliteBusyTimeoutMillis = 15s for the lock. So under >5s contention the caller
+// abandoned a write the driver was still legitimately waiting to perform, the row
+// stayed `attempted`, the age-out sweep relabelled it `delivery_unknown` with
+// policy=expire_without_retry, and a wake that WAS DELIVERED became an unknown
+// that is never retried. Measured live: 15 of 167 delivered wakes in one 2h33m
+// window, every one preceded at exactly delta=5s by the counter-reset failure
+// for the same job.
+//
+// The probe timeout is deliberately LEFT AT 5s. Widening it would trade a stale
+// annotation for a stalled wake path, which is the trade jarvis documented on
+// this issue and asked not to disturb.
+//
+// ONE ATTEMPT, WITH THE STORE'S FULL BUDGET, AND NO RETRY. I built a two-attempt
+// retry first and REMOVED IT on measurement, which is worth recording because
+// the reasoning is not obvious:
+//
+//   - The ceiling is the DRIVER, not the caller. Probed on this store with a
+//     40s caller deadline and another connection holding the write lock, the
+//     contended write returns plain SQLITE_BUSY after 13.67s. Waiting longer
+//     than the driver's own busy budget buys nothing.
+//   - So a second attempt only helps if the stall ends inside the narrow band
+//     between one busy window and the next.
+//   - And it cost the thing that matters more: with a retry present the pre-fix
+//     path covers ~15s (the 5s counter reset plus two 5s attempts) while the
+//     fixed path's two attempts reach only ~14.5s, because its first attempt
+//     burns a full driver window. The coverage ranges OVERLAP, so no contention
+//     value can make an outcome-based test separate the deadline fix from the
+//     retry. Measured: at 7s and at 12s every mutant survived, including the one
+//     that reverts the actual defect.
+//
+// A mechanism that adds a narrow band of coverage while making the fix
+// unfalsifiable is a bad trade. One attempt with the correct budget is the fix;
+// TestDeliveredWakeSurvivesContendedTerminalWrite discriminates it, and
+// db.TestDurableWriteBudgetExceedsBusyTimeout keeps the two constants ordered.
+//
+// A stall that outlasts the driver's whole budget still loses this record, and
+// that is a REAL residual rather than a solved case. It is bounded by the
+// driver, not by anything this caller chooses, so closing it belongs with the
+// shared-connection contention in #1226 and with the age-out sweep's inability
+// to tell "no outcome observed" from "outcome observed, record write lost".
 func (s *eventRuleSink) finishWakeOutbox(ctx context.Context, event events.Event, state, detail string) error {
 	if s == nil || s.store == nil || len(event.WakeOutboxIDs) == 0 {
 		return nil
 	}
-	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), eventRuleProbeTimeout)
+	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), db.DurableWriteBudget)
 	defer cancel()
 	if err := s.store.FinishWakeOutbox(finishCtx, event.WakeOutboxIDs, state, detail, time.Now().UTC()); err != nil {
 		slog.Warn("wake outbox state update failed", "job_id", event.JobID, "state", state, "error", err)
