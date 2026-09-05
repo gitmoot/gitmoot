@@ -11,8 +11,8 @@ import (
 	"time"
 )
 
-// goInstall builds a minimal but REAL installation: the signature is a content
-// proof, so a fixture that only names paths would assert nothing about it.
+// goInstall builds a minimal but REAL installation. The signature is a content
+// proof, so a fixture that only named paths would assert nothing about it.
 func goInstall(t *testing.T, root string, members ...string) string {
 	t.Helper()
 	if len(members) == 0 {
@@ -26,6 +26,9 @@ func goInstall(t *testing.T, root string, members ...string) string {
 			t.Fatal(err)
 		}
 	}
+	if err := os.MkdirAll(filepath.Join(root, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(root, "bin", "go"), []byte("#!/bin/sh\necho go\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -38,40 +41,196 @@ func goInstall(t *testing.T, root string, members ...string) string {
 	return root
 }
 
-func TestIdentifyKeysOnContentNotVersionAlone(t *testing.T) {
+// withCompiler adds an executable under pkg/tool, which is where the ACTUAL
+// compiler lives. The identity must cover it.
+func withCompiler(t *testing.T, root, bytes string) string {
+	t.Helper()
+	dir := filepath.Join(root, "pkg", "tool", "linux_amd64")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "compile"), []byte(bytes), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+func escapesRoot(root, candidate string) bool {
+	rel, err := filepath.Rel(root, filepath.Clean(candidate))
+	if err != nil {
+		return true
+	}
+	return rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// TestVersionTraversalCannotEscapeTheDaemonRoot is the P1 regression.
+//
+// REPRODUCED BEFORE IT WAS FIXED: at head 65bdda18 a VERSION of "go/../../escaped"
+// was embedded verbatim in the published name and Stage published OUTSIDE the
+// daemon-owned root. The pair here is deliberate: a positive control proves a
+// legitimate VERSION still stages, so a passing test cannot mean "everything is
+// refused".
+func TestVersionTraversalCannotEscapeTheDaemonRoot(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		version  string
+		accepted bool
+	}{
+		{name: "CONTROL a real version stages", version: "go1.26.4\n", accepted: true},
+		{name: "CONTROL a release candidate stages", version: "go1.27rc1\n", accepted: true},
+		{name: "parent traversal", version: "go/../../escaped\n"},
+		{name: "separator only", version: "go/escaped\n"},
+		{name: "absolute path", version: "go//etc/passwd\n"},
+		{name: "dot dot suffix", version: "go..\n"},
+		{name: "NUL byte", version: "go1.26\x004\n"},
+		{name: "does not name go", version: "1.26.4\n"},
+		{name: "over length", version: "go" + strings.Repeat("9", maxVersionLength) + "\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base := t.TempDir()
+			home := filepath.Join(base, "home")
+			source := goInstall(t, filepath.Join(base, "src"))
+			if err := os.WriteFile(filepath.Join(source, "VERSION"), []byte(test.version), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			staged, err := Stage(home, source)
+			if test.accepted {
+				if err != nil {
+					t.Fatalf("Stage(%q) refused a legitimate version: %v", test.version, err)
+				}
+				if escapesRoot(Root(home), staged) {
+					t.Fatalf("even the control published outside the root at %q", staged)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Stage(%q) succeeded at %q; an untrusted VERSION must not name the publish path", test.version, staged)
+			}
+			if escapesRoot(Root(home), staged) && staged != "" {
+				t.Fatalf("published OUTSIDE the daemon root at %q", staged)
+			}
+			// and nothing may exist outside the root either way
+			if _, statErr := os.Stat(filepath.Join(base, "home", "escaped")); statErr == nil {
+				t.Fatal("an entry was created outside the staging root")
+			}
+		})
+	}
+}
+
+// TestPublishedSymlinkIsRefusedAndReplaced is the second P1 regression.
+//
+// REPRODUCED AT 65bdda18 on a clean worktree: stage() used os.Stat, so a symlink
+// planted at the published name was accepted as a valid staged copy and the
+// external target was readable through the staged path. PROVENANCE, settled at
+// that head rather than assumed: internal/toolchain is ABSENT at origin/main and
+// at the merge base and was added by this PR's own commit, so the defect is this
+// PR's rather than pre-existing.
+func TestPublishedSymlinkIsRefusedAndReplaced(t *testing.T) {
 	base := t.TempDir()
-	first := goInstall(t, filepath.Join(base, "a"))
-	second := goInstall(t, filepath.Join(base, "b"))
+	home := filepath.Join(base, "home")
+	source := goInstall(t, filepath.Join(base, "src"))
+	outside := filepath.Join(base, "outside")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "SECRET"), []byte("private"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := Identify(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(Root(home), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	planted := filepath.Join(Root(home), identity.String())
+	if err := os.Symlink(outside, planted); err != nil {
+		t.Fatal(err)
+	}
 
-	one, err := Identify(first)
+	staged, err := Stage(home, source)
+	if err != nil {
+		t.Fatalf("Stage must replace the planted link rather than fail: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(staged, "SECRET")); statErr == nil {
+		t.Fatal("the planted symlink was followed; the external target is readable through the staged path")
+	}
+	info, err := os.Lstat(staged)
 	if err != nil {
 		t.Fatal(err)
 	}
-	two, err := Identify(second)
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("the staged path is still a symlink")
+	}
+	if !info.IsDir() {
+		t.Fatalf("staged path is not a directory, mode %v", info.Mode())
+	}
+	if _, statErr := os.Stat(filepath.Join(staged, "bin", "go")); statErr != nil {
+		t.Fatalf("the replacement copy is not a real installation: %v", statErr)
+	}
+	// the external directory itself must be untouched
+	if _, statErr := os.Stat(filepath.Join(outside, "SECRET")); statErr != nil {
+		t.Fatalf("replacing the link damaged the external target: %v", statErr)
+	}
+}
+
+// TestIdentityCoversEveryCopiedExecutable is the P2 regression.
+//
+// REPRODUCED: the identity hashed VERSION plus bin/go, so two sources agreeing on
+// those but differing in pkg/tool/linux_amd64/compile - the ACTUAL compiler -
+// produced the same identity, and the second source was served the first's
+// compiler from cache.
+func TestIdentityCoversEveryCopiedExecutable(t *testing.T) {
+	base := t.TempDir()
+	home := filepath.Join(base, "home")
+	clean := withCompiler(t, goInstall(t, filepath.Join(base, "clean")), "CLEAN-COMPILER")
+	poisoned := withCompiler(t, goInstall(t, filepath.Join(base, "poisoned")), "POISONED-COMPILER")
+
+	one, err := Identify(clean)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if one != two {
-		t.Fatalf("identical installations produced different identities %v and %v", one, two)
+	two, err := Identify(poisoned)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if one.Version != "go1.26.4" {
-		t.Fatalf("Version = %q, want go1.26.4", one.Version)
+	if one.Version != two.Version {
+		t.Fatalf("precondition failed: versions differ (%q vs %q), so this would not test the fingerprint", one.Version, two.Version)
+	}
+	if one == two {
+		t.Fatal("two installations differing only in pkg/tool share an identity; the key omits the real compiler")
 	}
 
-	// A PATCHED REBUILD AT THE SAME VERSION: the version string is unchanged and
-	// the identity must still differ, or a stale copy would be served.
-	if err := os.WriteFile(filepath.Join(second, "bin", "go"), []byte("#!/bin/sh\necho patched\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	patched, err := Identify(second)
+	first, err := Stage(home, clean)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if patched.Version != one.Version {
-		t.Fatalf("precondition failed: versions differ (%q vs %q), so this would not test the fingerprint", patched.Version, one.Version)
+	second, err := Stage(home, poisoned)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if patched == one {
-		t.Fatal("a patched rebuild at the same VERSION produced the same identity; a path-or-version key would serve a stale compiler")
+	if first == second {
+		t.Fatalf("both sources published at the same path %q", first)
+	}
+	for path, want := range map[string]string{first: "CLEAN-COMPILER", second: "POISONED-COMPILER"} {
+		served, readErr := os.ReadFile(filepath.Join(path, "pkg", "tool", "linux_amd64", "compile"))
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if string(served) != want {
+			t.Fatalf("staged copy %q serves compiler %q, want %q", filepath.Base(path), served, want)
+		}
+	}
+
+	// CONTROL: identical sources DO share, so the discrimination above is about
+	// content rather than about never reusing anything.
+	twin := withCompiler(t, goInstall(t, filepath.Join(base, "twin")), "CLEAN-COMPILER")
+	again, err := Stage(home, twin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != first {
+		t.Fatalf("an identical source published separately at %q; reuse is broken", again)
 	}
 }
 
@@ -91,27 +250,8 @@ func TestIdentifyRefusesNonInstallations(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wrongVersion := goInstall(t, filepath.Join(base, "wrong-version"))
-	if err := os.WriteFile(filepath.Join(wrongVersion, "VERSION"), []byte("1.26.4\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
 	notExecutable := goInstall(t, filepath.Join(base, "not-exec"))
 	if err := os.Chmod(filepath.Join(notExecutable, "bin", "go"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	// A SYMLINKED VERSION: without O_NOFOLLOW the check reads an unrelated file
-	// and a non-installation passes the signature.
-	symlinkedVersion := goInstall(t, filepath.Join(base, "symlinked-version"))
-	elsewhere := filepath.Join(base, "elsewhere-version")
-	if err := os.WriteFile(elsewhere, []byte("go1.26.4\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(filepath.Join(symlinkedVersion, "VERSION")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(elsewhere, filepath.Join(symlinkedVersion, "VERSION")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -127,30 +267,46 @@ func TestIdentifyRefusesNonInstallations(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	symlinkedVersion := goInstall(t, filepath.Join(base, "symlinked-version"))
+	elsewhere := filepath.Join(base, "elsewhere-version")
+	if err := os.WriteFile(elsewhere, []byte("go1.26.4\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(symlinkedVersion, "VERSION")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, filepath.Join(symlinkedVersion, "VERSION")); err != nil {
+		t.Fatal(err)
+	}
+
 	for _, test := range []struct {
 		name   string
 		source string
-		want   error
 	}{
-		{name: "no bin/go", source: noBin, want: ErrNotPinned},
-		{name: "no VERSION", source: noVersion, want: ErrNotPinned},
-		{name: "VERSION does not name Go", source: wrongVersion, want: ErrNotPinned},
-		{name: "bin/go not executable", source: notExecutable, want: ErrNotPinned},
-		{name: "bin/go is a symlink", source: symlinkedGo, want: ErrSymlink},
-		{name: "VERSION is a symlink to a valid version string", source: symlinkedVersion, want: ErrNotPinned},
-		{name: "relative path", source: "relative/path", want: ErrNotPinned},
-		{name: "empty path", source: "", want: ErrNotPinned},
+		{name: "no bin/go", source: noBin},
+		{name: "no VERSION", source: noVersion},
+		{name: "bin/go not executable", source: notExecutable},
+		{name: "bin/go is a symlink out of the tree", source: symlinkedGo},
+		{name: "VERSION is a symlink out of the tree", source: symlinkedVersion},
+		{name: "relative path", source: "relative/path"},
+		{name: "empty path", source: ""},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if _, err := Identify(test.source); !errors.Is(err, test.want) {
-				t.Fatalf("Identify(%q) error = %v, want %v", test.source, err, test.want)
+			if _, err := Identify(test.source); err == nil {
+				t.Fatalf("Identify(%q) succeeded; it is not a pinned installation", test.source)
 			}
 		})
 	}
+
+	// CONTROL: a real installation IS identified, so the refusals above are about
+	// the fixtures rather than about refusing everything.
+	if _, err := Identify(goInstall(t, filepath.Join(base, "good"))); err != nil {
+		t.Fatalf("control failed: a real installation must identify: %v", err)
+	}
 }
 
-// TestReadVersionRefusesAFifoWithoutBlocking pins the availability half: opening
-// a FIFO with no writer before proving its type would BLOCK staging, which is a
+// TestReadVersionRefusesAFifoWithoutBlocking pins the availability half: opening a
+// FIFO with no writer before proving its type would BLOCK seat launch, which is a
 // defect in the launch path rather than a leak.
 func TestReadVersionRefusesAFifoWithoutBlocking(t *testing.T) {
 	root := goInstall(t, filepath.Join(t.TempDir(), "fifo"))
@@ -167,69 +323,45 @@ func TestReadVersionRefusesAFifoWithoutBlocking(t *testing.T) {
 	}()
 	select {
 	case err := <-done:
-		if !errors.Is(err, ErrNotPinned) {
-			t.Fatalf("Identify with a FIFO VERSION = %v, want ErrNotPinned", err)
+		if err == nil {
+			t.Fatal("a FIFO VERSION was accepted")
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("Identify BLOCKED on a FIFO with no writer; staging would hang")
+		t.Fatal("Identify BLOCKED on a FIFO with no writer; seat launch would hang")
 	}
 }
 
-// TestStageRefusesASymlinkAnywhereInTheTree is the back door this shape must
-// keep shut: a copier that follows a symlink copies something outside the tree
-// it validated, and the outside-root problem returns wearing a copy's clothes.
+// TestStageRefusesASymlinkAnywhereInTheTree is the back door the copy shape must
+// keep shut: a copier that follows a link copies something outside the tree it
+// validated, and the outside-root problem returns wearing a copy's clothes.
 func TestStageRefusesASymlinkAnywhereInTheTree(t *testing.T) {
 	base := t.TempDir()
-	home := filepath.Join(base, "home")
 	outside := filepath.Join(base, "outside")
-	if err := os.MkdirAll(outside, 0o700); err != nil {
+	if err := os.MkdirAll(outside, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(outside, "id_ed25519"), []byte("PRIVATE"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	// CONTROL: the same tree without the symlink stages successfully, so a
-	// refusal below is about the symlink rather than about the fixture.
-	clean := goInstall(t, filepath.Join(base, "clean"))
-	if _, err := Stage(home, clean); err != nil {
+	// CONTROL first: the same shape without the symlink stages successfully.
+	if _, err := Stage(filepath.Join(base, "home-control"), goInstall(t, filepath.Join(base, "clean"))); err != nil {
 		t.Fatalf("control failed: a clean tree must stage: %v", err)
 	}
 
-	for _, test := range []struct{ name, member string }{
-		{name: "symlinked optional member", member: "src"},
-		{name: "symlinked required member", member: "bin"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			source := goInstall(t, filepath.Join(base, "src-"+test.member))
-			if err := os.RemoveAll(filepath.Join(source, test.member)); err != nil {
+	for _, member := range []string{"src", "doc", "pkg"} {
+		t.Run("symlinked "+member, func(t *testing.T) {
+			source := goInstall(t, filepath.Join(base, "src-"+member))
+			if err := os.RemoveAll(filepath.Join(source, member)); err != nil {
 				t.Fatal(err)
 			}
-			if test.member == "bin" {
-				// keep the signature satisfiable through the link so the refusal
-				// is about the symlink rather than a missing compiler
-				if err := os.MkdirAll(filepath.Join(outside, "bin"), 0o755); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(filepath.Join(outside, "bin", "go"), []byte("#!/bin/sh\n"), 0o755); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.Symlink(filepath.Join(outside, "bin"), filepath.Join(source, "bin")); err != nil {
-					t.Fatal(err)
-				}
-			} else {
-				if err := os.Symlink(outside, filepath.Join(source, test.member)); err != nil {
-					t.Fatal(err)
-				}
+			if err := os.Symlink(outside, filepath.Join(source, member)); err != nil {
+				t.Fatal(err)
 			}
-			_, err := Stage(home, source)
-			if err == nil {
+			home := filepath.Join(base, "home-"+member)
+			if _, err := Stage(home, source); err == nil {
 				t.Fatal("a symlinked member staged successfully; the outside-root problem returns through it")
 			}
-			if !errors.Is(err, ErrSymlink) && !errors.Is(err, ErrNotPinned) {
-				t.Fatalf("Stage error = %v, want a symlink or not-pinned refusal", err)
-			}
-			// and nothing may be published from a refused stage
 			entries, _ := os.ReadDir(Root(home))
 			for _, entry := range entries {
 				if strings.Contains(entry.Name(), "staging") {
@@ -272,7 +404,6 @@ func TestStageSkipsAbsentOptionalMembersButRefusesOperationalFailure(t *testing.
 	}
 }
 
-// TestStagePublishesAtomicallyAndLeavesNoPartialTree pins the publish protocol.
 func TestStagePublishesAtomicallyAndLeavesNoPartialTree(t *testing.T) {
 	base := t.TempDir()
 	home := filepath.Join(base, "home")
@@ -289,6 +420,9 @@ func TestStagePublishesAtomicallyAndLeavesNoPartialTree(t *testing.T) {
 	if filepath.Base(staged) != identity.String() {
 		t.Fatalf("published at %q, want the identity directory %q", filepath.Base(staged), identity.String())
 	}
+	if filepath.Dir(staged) != Root(home) {
+		t.Fatalf("published at %q, want it under %q", staged, Root(home))
+	}
 	entries, err := os.ReadDir(Root(home))
 	if err != nil {
 		t.Fatal(err)
@@ -298,18 +432,44 @@ func TestStagePublishesAtomicallyAndLeavesNoPartialTree(t *testing.T) {
 		for _, entry := range entries {
 			names = append(names, entry.Name())
 		}
-		t.Fatalf("staged root holds %v, want exactly the published identity; a temporary tree must not survive", names)
+		t.Fatalf("staged root holds %v, want exactly the published identity", names)
 	}
 
-	// idempotent: a second stage returns the same path and publishes nothing new
 	again, err := Stage(home, source)
 	if err != nil || again != staged {
 		t.Fatalf("second Stage = %q err=%v, want the same published path", again, err)
 	}
 }
 
-// TestStageIsSingleFlightPerIdentity pins that concurrent jobs on one version do
-// not race to publish the same tree.
+// TestStageRestagesACorruptedPublishedCopy pins the durability mechanism that
+// REPLACED per-file fsync, which cost 136.18s against 1.07s on 15022 files.
+func TestStageRestagesACorruptedPublishedCopy(t *testing.T) {
+	base := t.TempDir()
+	home := filepath.Join(base, "home")
+	source := goInstall(t, filepath.Join(base, "src"))
+
+	staged, err := Stage(home, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// simulate what a crash after rename leaves behind: the name is durable, the
+	// data is not.
+	if err := os.WriteFile(filepath.Join(staged, "bin", "go"), []byte(""), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	restaged, err := Stage(home, source)
+	if err != nil {
+		t.Fatalf("a corrupted copy must be restaged, not served: %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(restaged, "bin", "go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(content) == 0 {
+		t.Fatal("the truncated bin/go was served as if correct; verification did not run")
+	}
+}
+
 func TestStageIsSingleFlightPerIdentity(t *testing.T) {
 	base := t.TempDir()
 	home := filepath.Join(base, "home")
@@ -344,46 +504,57 @@ func TestStageIsSingleFlightPerIdentity(t *testing.T) {
 	}
 }
 
-// TestStagePreservesExecBitsAndStripsSetuid pins the permission contract.
-func TestStagePreservesExecBitsAndStripsSetuid(t *testing.T) {
-	base := t.TempDir()
-	source := goInstall(t, filepath.Join(base, "src"))
-	// os.ModeSetuid, NOT octal 0o4000: a FileMode's setuid is bit 1<<23, so
-	// os.Chmod(f, 0o4755) sets 0755 and silently drops the setuid request. This
-	// arm asserted nothing until the mutant that should have died survived.
-	goBinary := filepath.Join(source, "bin", "go")
-	if err := os.Chmod(goBinary, 0o755|os.ModeSetuid); err != nil {
-		t.Skipf("cannot set setuid on the fixture: %v", err)
-	}
-	if before, err := os.Stat(goBinary); err != nil || before.Mode()&os.ModeSetuid == 0 {
-		t.Skipf("fixture precondition: setuid did not stick on this filesystem (mode %v)", before.Mode())
-	}
-	staged, err := Stage(filepath.Join(base, "home"), source)
-	if err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Stat(filepath.Join(staged, "bin", "go"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode()&os.ModeSetuid != 0 {
-		t.Fatalf("staged bin/go mode %v retains setuid", info.Mode())
-	}
-	if info.Mode().Perm()&0o111 == 0 {
-		t.Fatalf("staged bin/go mode %v lost its executable bit", info.Mode())
+// TestStagePreservesExecBitsAndStripsSetuidAndSetgid covers BOTH bits.
+//
+// A setgid-only mutant survived the reviewer's run because this test checked
+// ModeSetuid alone. And the fixture itself was vacuous before that: os.Chmod(f,
+// 0o4755) does not set setuid in Go, because a FileMode's setuid is bit 1<<23
+// rather than octal 0o4000, so the assertion could not fail. Both are fixed, and
+// the fixture now asserts its own precondition.
+func TestStagePreservesExecBitsAndStripsSetuidAndSetgid(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		mode os.FileMode
+		bit  os.FileMode
+	}{
+		{name: "setuid", mode: 0o755 | os.ModeSetuid, bit: os.ModeSetuid},
+		{name: "setgid", mode: 0o755 | os.ModeSetgid, bit: os.ModeSetgid},
+		{name: "both", mode: 0o755 | os.ModeSetuid | os.ModeSetgid, bit: os.ModeSetuid | os.ModeSetgid},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base := t.TempDir()
+			source := goInstall(t, filepath.Join(base, "src"))
+			goBinary := filepath.Join(source, "bin", "go")
+			if err := os.Chmod(goBinary, test.mode); err != nil {
+				t.Skipf("cannot set %s on the fixture: %v", test.name, err)
+			}
+			before, err := os.Stat(goBinary)
+			if err != nil || before.Mode()&test.bit == 0 {
+				t.Skipf("fixture precondition: %s did not stick on this filesystem (mode %v)", test.name, before.Mode())
+			}
+			staged, err := Stage(filepath.Join(base, "home"), source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Stat(filepath.Join(staged, "bin", "go"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Mode()&test.bit != 0 {
+				t.Fatalf("staged bin/go mode %v retains %s", info.Mode(), test.name)
+			}
+			if info.Mode().Perm()&0o111 == 0 {
+				t.Fatalf("staged bin/go mode %v lost its executable bit", info.Mode())
+			}
+		})
 	}
 }
 
-// TestCollectKeepsCurrentPinsAndRemovesTheRest pins retention by CURRENT PIN
-// rather than by age or count, and that leftovers from interrupted stages go.
 func TestCollectKeepsCurrentPinsAndRemovesTheRest(t *testing.T) {
 	base := t.TempDir()
 	home := filepath.Join(base, "home")
-	current := goInstall(t, filepath.Join(base, "current"))
-	stale := goInstall(t, filepath.Join(base, "stale"))
-	if err := os.WriteFile(filepath.Join(stale, "bin", "go"), []byte("#!/bin/sh\necho other\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	current := withCompiler(t, goInstall(t, filepath.Join(base, "current")), "CURRENT")
+	stale := withCompiler(t, goInstall(t, filepath.Join(base, "stale")), "STALE")
 
 	currentPath, err := Stage(home, current)
 	if err != nil {
@@ -419,15 +590,145 @@ func TestCollectKeepsCurrentPinsAndRemovesTheRest(t *testing.T) {
 	}
 }
 
-// TestMinFreeBytesIsAStatedFloor pins that the refusal threshold is a NUMBER in
-// the code rather than whatever the disk happens to be at that minute.
 func TestMinFreeBytesIsAStatedFloor(t *testing.T) {
 	if MinFreeBytes < 1<<30 {
 		t.Fatalf("MinFreeBytes = %d, want an explicit floor of at least 1 GiB", MinFreeBytes)
 	}
-	// and the refusal names the shortfall, so the failure is actionable
-	err := checkFreeSpace(t.TempDir())
-	if err != nil && !strings.Contains(err.Error(), "floor is") {
-		t.Fatalf("checkFreeSpace error %q does not name the floor", err)
+	if err := checkFreeSpace(t.TempDir()); err != nil {
+		if !errors.Is(err, ErrLowDisk) {
+			t.Fatalf("checkFreeSpace error = %v, want ErrLowDisk", err)
+		}
+		if !strings.Contains(err.Error(), "floor is") {
+			t.Fatalf("refusal %q does not name the floor", err)
+		}
+	}
+}
+
+// TestInternalSymlinksAreRefusedNotFollowed covers the layer os.Root does NOT.
+//
+// os.Root refuses a symlink that ESCAPES the root, which is why every
+// outside-aiming fixture in this file passes whether or not the inner guards are
+// present. It deliberately FOLLOWS links that stay inside the root. So the
+// O_NOFOLLOW opens and the directory-entry type check are the only things
+// refusing an internal link, and they need fixtures that stay inside to be tested
+// at all. Three mutants survived until these existed.
+func TestInternalSymlinksAreRefusedNotFollowed(t *testing.T) {
+	t.Run("VERSION is an internal symlink", func(t *testing.T) {
+		base := t.TempDir()
+		source := goInstall(t, filepath.Join(base, "src"))
+		// a decoy INSIDE the tree, so os.Root permits the traversal and only
+		// O_NOFOLLOW can refuse it
+		if err := os.WriteFile(filepath.Join(source, "lib", "decoy"), []byte("go9.9.9\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(source, "VERSION")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("lib/decoy", filepath.Join(source, "VERSION")); err != nil {
+			t.Fatal(err)
+		}
+		identity, err := Identify(source)
+		if err == nil {
+			t.Fatalf("an internal VERSION symlink was followed and yielded version %q", identity.Version)
+		}
+	})
+
+	t.Run("a member is an internal symlink", func(t *testing.T) {
+		base := t.TempDir()
+		source := goInstall(t, filepath.Join(base, "src"))
+		if err := os.RemoveAll(filepath.Join(source, "src")); err != nil {
+			t.Fatal(err)
+		}
+		// points at a sibling INSIDE the tree
+		if err := os.Symlink("lib", filepath.Join(source, "src")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Stage(filepath.Join(base, "home"), source); err == nil {
+			t.Fatal("an internal member symlink was followed and copied rather than refused")
+		}
+	})
+
+	t.Run("a nested entry is an internal symlink", func(t *testing.T) {
+		base := t.TempDir()
+		source := goInstall(t, filepath.Join(base, "src"))
+		if err := os.Symlink("../lib/marker", filepath.Join(source, "pkg", "link")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Stage(filepath.Join(base, "home"), source); err == nil {
+			t.Fatal("a nested internal symlink was followed and copied rather than refused")
+		}
+	})
+
+	t.Run("bin/go is an internal symlink", func(t *testing.T) {
+		base := t.TempDir()
+		source := goInstall(t, filepath.Join(base, "src"))
+		// a real executable INSIDE the tree, so os.Root permits the traversal
+		// and only the Lstat guard can refuse it
+		if err := os.WriteFile(filepath.Join(source, "lib", "realgo"), []byte("#!/bin/sh\necho go\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(source, "bin", "go")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("../lib/realgo", filepath.Join(source, "bin", "go")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Identify(source); err == nil {
+			t.Fatal("an internal bin/go symlink was followed and accepted as the pinned compiler")
+		}
+	})
+
+	t.Run("CONTROL the same trees without links stage", func(t *testing.T) {
+		base := t.TempDir()
+		if _, err := Stage(filepath.Join(base, "home"), goInstall(t, filepath.Join(base, "src"))); err != nil {
+			t.Fatalf("control failed: %v", err)
+		}
+	})
+}
+
+// TestStageRefusesToPublishUnderAnIdentityItCannotProve covers the mid-copy
+// source-change guard, which nothing else reaches.
+//
+// It calls the production stage() with an identity that does NOT describe the
+// source, which is exactly the state a source mutated between identification and
+// copying would produce. Without the post-copy re-proof a tree is published under
+// a name that lies about its contents and handed to the CURRENT caller; reuse
+// verification would only catch it on a later call, after this seat already had it.
+func TestStageRefusesToPublishUnderAnIdentityItCannotProve(t *testing.T) {
+	base := t.TempDir()
+	root := Root(filepath.Join(base, "home"))
+	source := goInstall(t, filepath.Join(base, "src"))
+
+	sourceRoot, err := os.OpenRoot(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sourceRoot.Close()
+
+	honest, err := identifyRoot(sourceRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// CONTROL: the honest identity publishes.
+	if _, err := stage(root, honest, sourceRoot); err != nil {
+		t.Fatalf("control failed: an honest identity must publish: %v", err)
+	}
+
+	lying := Identity{Version: honest.Version, Fingerprint: "deadbeefdeadbeef"}
+	published, err := stage(root, lying, sourceRoot)
+	if err == nil {
+		t.Fatalf("published at %q under an identity the copy cannot prove", published)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, lying.String())); statErr == nil {
+		t.Fatal("a tree was published under the unprovable identity")
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), "staging") {
+			t.Fatalf("a refused publish left a temporary tree behind: %s", entry.Name())
+		}
 	}
 }

@@ -1799,11 +1799,24 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	// escape-class defects in three review rounds, including a member symlink
 	// that redirected a grant outside containment with no privilege at all. The
 	// copy is staged under the gitmoot home, which this seat can never write,
-	// and is added as an ordinary read. Failure is NOT fatal: the seat then
-	// behaves exactly as it did before this change, which is a visible exit 126
-	// rather than a broken launch.
+	// and is added as an ordinary read.
+	//
+	// A STAGING MISS IS LOGGED, NOT EVENTED, AND IT IS DELIBERATELY NOT PUT IN
+	// grants.dropped. That field is documented above as what narrowing WITHHELD
+	// from the staged config, and its event text says so; a copy that never
+	// materialised was never in the config to be withheld, so reporting it there
+	// would claim a narrowing that did not happen. It would also make a seat's
+	// EVENT SEQUENCE depend on the host's toolchain and disk state, which a CI
+	// race shard caught: TestExecBackendLocalDefaultDaemonE2E asserts an exact
+	// baseline, passed on a host where staging succeeded, and failed on a runner
+	// where it did not. An operator-visible fact about the host belongs in the
+	// daemon's log, not in a job's event stream.
+	//
+	// Failure is NOT fatal either way: the seat then behaves exactly as it did
+	// before this change, which is a visible exit 126 rather than a broken
+	// launch. "Exactly as before" has to include emitting no extra event.
 	if staged, stagedEnv, diagnostic := stageSeatToolchain(paths); diagnostic != "" {
-		grants.dropped = append(grants.dropped, diagnostic)
+		fmt.Fprintf(os.Stderr, "gitmoot: read-only seat toolchain: %s\n", diagnostic)
 	} else if staged != "" {
 		if err := validateStagedToolchainPlacement(staged, grants.writes); err != nil {
 			return grants, err

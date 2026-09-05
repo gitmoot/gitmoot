@@ -355,6 +355,14 @@ For the required result shape and decision meanings, read
 [RESULT_CONTRACT.md](references/RESULT_CONTRACT.md).
 
 ## Safety Rules
+A read-only review seat is handed an immutable, daemon-owned COPY of the
+operator-pinned Go toolchain: run `go` normally, with `GOROOT`, `PATH` and
+`GOTOOLCHAIN=local` already set. Do NOT invoke a toolchain path directly and do
+not download Go into the seat cache; that workaround is retired. `CGO_ENABLED=0`
+is still required and `-race` is still unavailable in a seat. If `go` returns exit
+126 the copy was not staged, and the reason is on the daemon's stderr
+(`gitmoot: read-only seat toolchain:`) rather than in the job's events.
+
 
 Preserve existing behavior unless the job explicitly changes it. Keep work
 scoped to the target repo. Do not commit generated data, caches, logs, secrets,

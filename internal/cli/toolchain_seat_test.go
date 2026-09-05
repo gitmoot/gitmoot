@@ -1,9 +1,14 @@
 package cli
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/toolchain"
 )
 
 // TestStagedToolchainIsNeverInsideASeatWriteGrant is THIS SHAPE'S P1 AS A TEST.
@@ -140,45 +145,105 @@ func TestPinnedToolchainRootRefusesSystemPrefixes(t *testing.T) {
 	}
 }
 
-// TestSeatToolchainGrantIsAddedAsAReadAndNotAWrite pins the grant SHAPE at the
-// wiring site: the staged path must arrive in reads, never in writes, and the
-// seat's single isolated cache grant must remain its only write.
+// TestReadOnlyGrantsStageTheToolchainThroughProduction drives the REAL grant
+// builder, because the test it replaces did not.
 //
-// This is the produce-arm half of the coverage too, stated as the fact that
-// matters: readableRoots is shared by the produce arm and the seat arm, and this
-// change adds nothing to it. The staged read is appended in
-// readOnlyRuntimeSandboxGrants, which ONLY the seat path calls, so produce
-// behaviour is unchanged by construction rather than by assertion. My own
-// salvage finding was that a grant change is never seat-only when it touches the
-// SHARED derivation; this one does not touch it, and the test states which.
-func TestSeatToolchainGrantIsAddedAsAReadAndNotAWrite(t *testing.T) {
-	staged := "/var/lib/gitmoot/toolchains/go1.26.4-abc123"
-	grants := readOnlySandboxGrants{
-		cacheRoot: "/var/lib/gitmoot/cache/agent-7",
-		writes:    []string{"/var/lib/gitmoot/cache/agent-7"},
-		reads:     []string{"/checkout"},
+// WHY THIS EXISTS. The previous test constructed readOnlySandboxGrants itself and
+// appended the staged path by hand, so a mutant deleting the staged-toolchain
+// block in daemon_worker.go left it green. A reviewer demonstrated exactly that.
+// A test that pins a helper is not a test of the path: this one enters through
+// readOnlyRuntimeSandboxGrants and therefore fails when the wiring is removed.
+//
+// The fixture is a SMALL pinned installation on PATH rather than the host's real
+// 269 MiB toolchain, so the test proves the wiring without paying for a full copy.
+func TestReadOnlyGrantsStageTheToolchainThroughProduction(t *testing.T) {
+	home := t.TempDir()
+	live := config.PathsForHome(home)
+
+	// a minimal but real Go installation the stager will accept
+	install := filepath.Join(t.TempDir(), "go1.26.4")
+	binDir := filepath.Join(install, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "go"), []byte("#!/bin/sh\necho go1.26.4\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(install, "VERSION"), []byte("go1.26.4\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(install, "go.env"), []byte("GOTOOLCHAIN=local\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// prepend so LookPath finds the fixture, while git and friends still resolve
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	checkout := t.TempDir()
+	runGit(t, checkout, "init", "-b", "main")
+	runGit(t, checkout, "config", "user.email", "gitmoot@example.com")
+	runGit(t, checkout, "config", "user.name", "Gitmoot")
+	runGit(t, checkout, "commit", "--allow-empty", "-m", "init")
+
+	agent := runtime.Agent{
+		Name: "seat", Runtime: runtime.CodexRuntime, ReadOnlySeat: true,
+		RepoScope: "gitmoot/gitmoot",
+	}
+	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, "gitmoot/gitmoot", true)
+	if err != nil {
+		t.Fatalf("readOnlyRuntimeSandboxGrants: %v", err)
 	}
 
-	if err := validateStagedToolchainPlacement(staged, grants.writes); err != nil {
-		t.Fatalf("a correctly placed copy was refused: %v", err)
+	// 1. the staged copy is granted as a READ. This is the assertion the deletion
+	//    mutant must break.
+	stagedRoot := toolchain.Root(live.Home)
+	var staged string
+	for _, granted := range grants.reads {
+		if strings.HasPrefix(granted, stagedRoot+string(filepath.Separator)) || granted == stagedRoot {
+			staged = granted
+		}
 	}
-	grants.reads = append(grants.reads, staged)
+	if staged == "" {
+		t.Fatalf("production granted no staged toolchain read; reads = %v. Deleting the daemon_worker wiring must fail HERE", grants.reads)
+	}
+	if _, statErr := os.Stat(filepath.Join(staged, "bin", "go")); statErr != nil {
+		t.Fatalf("the granted read %q is not a real installation: %v", staged, statErr)
+	}
 
+	// 2. it is NEVER writable. A seat that can rewrite its own go binary would
+	//    reproduce the defect this whole shape exists to remove.
 	for _, write := range grants.writes {
-		if write == staged {
-			t.Fatal("the staged toolchain appeared in the seat's WRITE set")
+		if pathWithin(staged, write) || pathWithin(write, staged) {
+			t.Errorf("staged toolchain %q overlaps seat-writable %q", staged, write)
 		}
 	}
-	found := false
-	for _, read := range grants.reads {
-		if read == staged {
-			found = true
+	if err := validateStagedToolchainPlacement(staged, grants.writes); err != nil {
+		t.Errorf("production placement is unsafe: %v", err)
+	}
+
+	// 3. the seat is actually pointed at it, or the grant is inert.
+	for _, want := range []string{
+		"GOROOT=" + staged,
+		"GOTOOLCHAIN=local",
+	} {
+		if !containsString(grants.env, want) {
+			t.Errorf("env %v does not export %q, so the seat would not use the staged copy", grants.env, want)
 		}
 	}
-	if !found {
-		t.Fatal("the staged toolchain is not in the seat's read set")
+	pathSet := false
+	for _, entry := range grants.env {
+		if strings.HasPrefix(entry, "PATH=") && strings.Contains(entry, filepath.Join(staged, "bin")) {
+			pathSet = true
+		}
 	}
-	if len(grants.writes) != 1 || grants.writes[0] != grants.cacheRoot {
-		t.Fatalf("writes = %q, want exactly the isolated cache grant", grants.writes)
+	if !pathSet {
+		t.Errorf("env %v does not put the staged bin on PATH", grants.env)
+	}
+
+	// 4. a staging miss must NOT become a job event. Three CI race shards caught
+	//    that as a host-dependent event stream.
+	for _, dropped := range grants.dropped {
+		if strings.Contains(strings.ToLower(dropped), "toolchain") {
+			t.Errorf("a toolchain diagnostic reached grants.dropped (%q), which is evented as a config narrowing", dropped)
+		}
 	}
 }
