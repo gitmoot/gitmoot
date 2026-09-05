@@ -486,6 +486,19 @@ type JobPayload struct {
 	CheckRetries     int          `json:"check_retries,omitempty"`
 	RawOutputs       []string     `json:"raw_outputs,omitempty"`
 	Result           *AgentResult `json:"result,omitempty"`
+	// ResultRepair names the engine repair the ACCEPTED parse required, or is
+	// absent for a clean parse (#1507). Today the only value is
+	// AgentResultRepairDelimiterBalance: the agent's bytes were JSON closers
+	// short and appending exactly the missing closers yielded a schema-valid
+	// result.
+	//
+	// It rides the ENGINE'S envelope record and never the agent-authored
+	// gitmoot_result object, so `result` keeps matching what the agent emitted
+	// and raw_outputs stays a usable audit trail. Omitempty is load-bearing: a
+	// clean parse must carry NO key, so "repaired" can never be inferred from a
+	// zero value. contract_version is untouched - a payload annotation is not a
+	// contract field.
+	ResultRepair string `json:"gitmoot_result_repair,omitempty"`
 	// ReviewStatusGrade records the evidence strength of an externally-driven
 	// review when it closes. Caller-supplied session inputs are always reported.
 	ReviewStatusGrade evidence.Grade `json:"review_status_grade,omitempty"`
@@ -1181,7 +1194,15 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	}
 	payload.RawOutputs = append(payload.RawOutputs, firstRaw)
 
-	result, parseErr := extractAgentResultForAction(firstRaw, job.Type)
+	// #1507: a delimiter-short envelope is CLOSED and accepted here rather than
+	// re-asked. A clean parse always wins and carries no marker; the close is
+	// only tried after the clean path failed on the whole output.
+	result, resultRepair, parseErr := extractAgentResultForActionAllowingRepair(firstRaw, job.Type)
+	if parseErr == nil {
+		if err := m.recordResultRepair(ctx, job.ID, &payload, resultRepair); err != nil {
+			return AgentResult{}, err
+		}
+	}
 	if parseErr != nil {
 		// The agent may have delivered useful work but omitted the required
 		// gitmoot_result envelope. Re-ask with the repair prompt up to
@@ -1243,16 +1264,37 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 			if repairRefreshedRef != "" {
 				agent.RuntimeRef = repairRefreshedRef
 			}
+			// #1507 fix 2, BEFORE the parse: a re-ask whose bytes equal the prior
+			// attempt's cannot succeed where that attempt failed, so the loop stops
+			// with its remaining attempt UNSPENT rather than paying another
+			// round-trip. Measured: 51 of 63 retained malformed-envelope deaths on
+			// this host contained a byte-identical consecutive re-ask.
+			identicalRetry := RetryCannotDiffer(lastRaw, repairRaw)
 			payload.RawOutputs = append(payload.RawOutputs, repairRaw)
 			lastRaw = repairRaw
 			lastDiag = repairDiag
 
-			result, parseErr = extractAgentResultForAction(repairRaw, job.Type)
+			// #1507 fix 1's PLACEMENT, which the issue got wrong and the record
+			// settled: every one of the 18 measured recoverable outputs sits at a
+			// REPAIR attempt (indices 1 and 2), never the first delivery, so a close
+			// attempted only before the loop would have recovered NONE of them.
+			result, resultRepair, parseErr = extractAgentResultForActionAllowingRepair(repairRaw, job.Type)
 			if parseErr == nil {
+				// A clean parse here CLEARS a marker an earlier attempt set: the
+				// marker describes the accepted parse, not the job.
+				if err := m.recordResultRepair(ctx, job.ID, &payload, resultRepair); err != nil {
+					return AgentResult{}, err
+				}
 				break
 			}
 			if err := m.savePayload(ctx, job.ID, payload); err != nil {
 				return AgentResult{}, err
+			}
+			if identicalRetry {
+				if err := m.addEvent(ctx, job.ID, repairRetryIdenticalEvent, fmt.Sprintf("stopping after attempt %d of %d: the re-ask returned byte-identical output (%d bytes), so a further attempt cannot differ", attempt, maxRepairAttempts, len(repairRaw))); err != nil {
+					return AgentResult{}, err
+				}
+				break
 			}
 		}
 
@@ -2185,4 +2227,37 @@ func compactPipelineKeyAccess(values []PipelineKeyAccess) []PipelineKeyAccess {
 		out = append(out, value)
 	}
 	return out
+}
+
+// repairRetryIdenticalEvent records that the repair loop STOPPED EARLY because a
+// re-ask returned byte-identical output (#1507). The distinct kind is the point:
+// "a retry that cannot differ is not a retry", and an operator reading the
+// record must be able to tell an exhausted budget from a budget deliberately
+// left unspent.
+const repairRetryIdenticalEvent = "repair_retry_identical"
+
+// resultRepairedEvent records that the ACCEPTED envelope was closed by the
+// engine rather than terminated by the agent (#1507). It fires once, on the
+// attempt whose parse was accepted, and never for a clean parse.
+const resultRepairedEvent = "result_repaired"
+
+// recordResultRepair stamps the accepted parse's repair marker onto the engine's
+// envelope record and, when a repair was needed, records it as an event.
+//
+// A CLEAN parse CLEARS any marker a previous attempt set - that is the ranking
+// the marker exists for, applied where the engine chooses which parse to accept.
+// The clearing is silent by design: the event stream already carries the earlier
+// attempt's marker event, so the surviving record is "an attempt was repaired,
+// and the accepted one was not".
+func (m *Mailbox) recordResultRepair(ctx context.Context, jobID string, payload *JobPayload, repair string) error {
+	if payload == nil {
+		return nil
+	}
+	repair = strings.TrimSpace(repair)
+	if repair == "" {
+		payload.ResultRepair = ""
+		return nil
+	}
+	payload.ResultRepair = repair
+	return m.addEvent(ctx, jobID, resultRepairedEvent, fmt.Sprintf("accepted envelope repaired by %s: the agent's output was JSON closers short and the engine appended exactly the missing closers; the stored result is a repaired parse, not a clean one", repair))
 }

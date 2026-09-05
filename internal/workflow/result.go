@@ -512,7 +512,10 @@ func ExtractAgentResult(output string) (AgentResult, error) {
 	if validationErr != nil {
 		return AgentResult{}, validationErr
 	}
-	return AgentResult{}, errors.New("missing valid gitmoot_result JSON object")
+	// #1507 fix 3: name the cause when the output is TRUNCATED rather than
+	// merely envelope-less. "missing valid gitmoot_result JSON object" told an
+	// operator nothing about a 3.8 KB verdict that was one closing brace short.
+	return AgentResult{}, unterminatedEnvelopeError(output)
 }
 
 // extractAgentResultForAction applies action-specific contract rules after the
@@ -1067,4 +1070,140 @@ func balancedJSONObject(input string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// AgentResultRepairDelimiterBalance marks an envelope the ENGINE closed: the
+// agent's bytes were one or more JSON closers short of parsing, and appending
+// exactly the missing closers produced a schema-valid gitmoot_result (#1507).
+//
+// It is a marker on the engine's own envelope record, never a field inside the
+// agent-authored gitmoot_result object. The agent did not write those closers;
+// writing engine-derived data into the agent's object would blur the provenance
+// boundary this marker exists to preserve, and would mean the stored object no
+// longer matches raw_outputs - which is the audit trail the recovery relies on.
+// A clean parse carries NO marker, and contract_version is untouched because a
+// payload-side annotation is not a contract field.
+const AgentResultRepairDelimiterBalance = "delimiter-balance"
+
+// RetryCannotDiffer reports whether re-running a deterministic operation
+// produced output byte-identical to the previous attempt.
+//
+// "A RETRY THAT CANNOT DIFFER IS NOT A RETRY" (#1507). It is deliberately
+// general rather than welded to the result-parse path: any loop that re-runs an
+// operation hoping for a different answer can consult it, and the caller decides
+// what to do with the answer. Measured on this host's store, 51 of 63 retained
+// malformed-envelope job deaths (81%) contained a byte-identical consecutive
+// re-ask - each one a paid LLM round-trip that could not have succeeded.
+//
+// Empty previous output is NOT a match: there is nothing to have repeated.
+func RetryCannotDiffer(previous, next string) bool {
+	return previous != "" && previous == next
+}
+
+// jsonCloserDeficit returns the closers a truncated JSON document is missing,
+// in the order that would terminate it, plus whether the scan ended INSIDE a
+// string literal.
+//
+// A scan that ends mid-string is NOT repairable by appending closers: the value
+// itself is cut, so any completion the engine invents is content rather than
+// punctuation. The caller must refuse those.
+func jsonCloserDeficit(output string) (string, bool) {
+	inString := false
+	escaped := false
+	var stack []byte
+	for index := 0; index < len(output); index++ {
+		char := output[index]
+		if inString {
+			switch {
+			case escaped:
+				escaped = false
+			case char == '\\':
+				escaped = true
+			case char == '"':
+				inString = false
+			}
+			continue
+		}
+		switch char {
+		case '"':
+			inString = true
+		case '{':
+			stack = append(stack, '}')
+		case '[':
+			stack = append(stack, ']')
+		case '}', ']':
+			if len(stack) == 0 {
+				// More closers than openers: not a truncation, and appending
+				// anything would be guesswork on a malformed document.
+				return "", inString
+			}
+			stack = stack[:len(stack)-1]
+		}
+	}
+	if inString {
+		return "", true
+	}
+	closers := make([]byte, 0, len(stack))
+	for index := len(stack) - 1; index >= 0; index-- {
+		closers = append(closers, stack[index])
+	}
+	return string(closers), false
+}
+
+// unterminatedEnvelopeError names WHY the envelope did not parse when the cause
+// is a truncation, instead of the generic "missing valid gitmoot_result JSON
+// object" that told an operator nothing about a document that was one character
+// short (#1507).
+func unterminatedEnvelopeError(output string) error {
+	closers, midString := jsonCloserDeficit(strings.TrimSpace(output))
+	switch {
+	case midString:
+		return errors.New("unterminated string at EOF: the output ends inside a JSON string literal, so no closer can complete it")
+	case closers != "":
+		braces := strings.Count(closers, "}")
+		brackets := strings.Count(closers, "]")
+		switch {
+		case brackets == 0:
+			return fmt.Errorf("unterminated object: %d unclosed '{' at EOF", braces)
+		case braces == 0:
+			return fmt.Errorf("unterminated array: %d unclosed '[' at EOF", brackets)
+		default:
+			return fmt.Errorf("unterminated object: %d unclosed '{' and %d unclosed '[' at EOF", braces, brackets)
+		}
+	default:
+		return errors.New("missing valid gitmoot_result JSON object")
+	}
+}
+
+// extractAgentResultForActionAllowingRepair is the engine's parse seam for a
+// delivered output. It returns the repair marker that applies to the accepted
+// parse, or "" for a clean one.
+//
+// RANKING, which is the point rather than a detail: a CLEAN parse always wins.
+// The delimiter close is attempted ONLY after the clean path has failed on the
+// whole output, so an output carrying both a truncated envelope and a complete
+// one parses clean and carries no marker (one such job exists in the measured
+// record). A clean parse at any later attempt therefore also clears a marker set
+// by an earlier one - the marker describes the accepted parse, not the job.
+//
+// The close is refused unless it yields a SCHEMA-VALID result for this action:
+// balancing delimiters must not turn a contract violation into an accepted
+// verdict.
+func extractAgentResultForActionAllowingRepair(output, action string) (AgentResult, string, error) {
+	result, err := extractAgentResultForAction(output, action)
+	if err == nil {
+		return result, "", nil
+	}
+	closers, midString := jsonCloserDeficit(strings.TrimSpace(output))
+	if midString || closers == "" {
+		return AgentResult{}, "", err
+	}
+	repaired, repairErr := extractAgentResultForAction(strings.TrimSpace(output)+closers, action)
+	if repairErr != nil {
+		// The deficit was real but closing it did not produce a valid contract
+		// object. Report the ORIGINAL failure: the engine's speculative close is
+		// not a fact about the agent's output.
+		return AgentResult{}, "", err
+	}
+	return repaired, AgentResultRepairDelimiterBalance, nil
 }
