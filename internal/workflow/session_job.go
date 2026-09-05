@@ -73,7 +73,7 @@ func (m Mailbox) OpenExternalJob(ctx context.Context, request JobRequest) (db.Jo
 	if m.store == nil {
 		return db.Job{}, errors.New("mailbox store is required")
 	}
-	if err := validateJobRequest(request); err != nil {
+	if err := validateExternalJobRequest(request); err != nil {
 		return db.Job{}, err
 	}
 
@@ -96,6 +96,10 @@ func (m Mailbox) OpenExternalJob(ctx context.Context, request JobRequest) (db.Jo
 		TemplateID:             snapshot.ID,
 		TemplateResolvedCommit: snapshot.ResolvedCommit,
 		TemplateContent:        snapshot.Content,
+		// Carried so attribution can name a role for in-session work (#1718). It
+		// was previously dropped here, which is why a recorded session job could
+		// only ever be attributed to an agent.
+		ActingOrgRole: NormalizeActingOrgRole(request.ActingOrgRole),
 	})
 	if err != nil {
 		return db.Job{}, err

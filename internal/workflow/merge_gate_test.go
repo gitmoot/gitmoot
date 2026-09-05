@@ -1858,8 +1858,16 @@ func TestImplementerAttributionAnomalyDeclinesRemainByteStable(t *testing.T) {
 		// text assembled AROUND this constant. Those two are genuinely independent, measured
 		// with production mutants in both directions.
 		"no implement job": {
-			got:  noImplementJobAttributionReason,
-			want: "latest review round's approval is NOT disqualified, but independence cannot be verified: no implement job is recorded for this task, so the gate cannot establish who implemented it. This is an attribution gap, not a failed independence check, and it is the expected state for in-session implementation. Remedy, runnable by the implementing lane: record the durable attribution row with gitmoot job record --agent <implementing-agent> --repo <owner/repo> --type implement --decision implemented --task <task-id> --pr <number> --head-sha <sha>, then re-evaluate. Do not record an agent that did not implement, and do not record the reviewer",
+			got: noImplementJobAttributionReason,
+			// EXTENDED DELIBERATELY (#1718), and this pin is why it had to be deliberate.
+			// The old text named only --agent, so for in-session role work the remedy it
+			// printed was UNRUNNABLE: `job record --agent gitmoot` is refused, gitmoot
+			// being an org role rather than one of the registered agents. A decline that
+			// hands the operator a command which cannot succeed is a dead end wearing the
+			// costume of a remedy. The added clause names --acting-role and states that
+			// independence is still enforced, so the escape hatch cannot be read as a
+			// waiver.
+			want: "latest review round's approval is NOT disqualified, but independence cannot be verified: no implement job is recorded for this task, so the gate cannot establish who implemented it. This is an attribution gap, not a failed independence check, and it is the expected state for in-session implementation. Remedy, runnable by the implementing lane: record the durable attribution row with gitmoot job record --agent <implementing-agent> --repo <owner/repo> --type implement --decision implemented --task <task-id> --pr <number> --head-sha <sha>, then re-evaluate. Do not record an agent that did not implement, and do not record the reviewer. If the work was done in session by an org role that is not a registered agent, record --acting-role <role> in place of --agent: attribution is then the role, and independence is still enforced against it",
 		},
 	}
 	for name, check := range wants {
