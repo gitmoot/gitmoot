@@ -585,10 +585,12 @@ merge gate; failures block. Zero external statuses/checks always block pipeline
 auto-merge—even when `[merge_gate] require_external_ci` is false—so unattended
 merge never synthesizes a no-CI success. Head drift, unmergeability/conflict, or a
 merge API failure also folds the gate blocked; merge errors are not retried. A
-scheduled auto-merge flow requires both `allow_auto_merge: true` and the existing
-`pipeline_auto_merge_claim` before the write and `pipeline_auto_merge_confirmed`
-after GitHub confirms it. Racing scans that lose the claim do not call merge and
-do not park the run; a loser ages its wait from the claim row's own `created_at`
+scheduled auto-merge flow requires two spec keys, `allow_scheduled_writes: true`
+and `allow_auto_merge: true`, because the merge is a write on an unattended
+schedule and each gate is spelled separately. The claim itself is not a key: the
+run RECORDS the `pipeline_auto_merge_claim` event before the write and
+`pipeline_auto_merge_confirmed` after GitHub confirms it. Racing scans that lose
+the claim do not call merge and do not park the run; a loser ages its wait from the claim row's own `created_at`
 and records `pipeline_auto_merge_claim_orphaned` with `cause=held_past_bound`
 once the claim has been held 15m, or immediately with
 `cause=claim_timestamp_unreadable` when that timestamp will not parse. A stage
