@@ -77,12 +77,12 @@ func printKeyUsage(w io.Writer) {
 }
 
 func inspectKeychain(ctx context.Context, store *db.Store, home string) keychainPathStatus {
-	path, err := resolveKeychainPath(store, home)
+	path, err := pipeline.ResolveKeychainPath(store, home)
 	if err != nil {
 		return keychainPathStatus{Status: "invalid", Detail: err.Error()}
 	}
 	status := keychainPathStatus{Path: path, Status: "ready"}
-	if _, _, err := loadValidatedKeychainFile(ctx, store, home); err != nil {
+	if _, _, err := pipeline.LoadValidatedKeychainFile(ctx, store, home); err != nil {
 		status.Status = "invalid"
 		status.Detail = err.Error()
 		if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
@@ -196,7 +196,7 @@ func runKeyAdd(args []string, stdout, stderr io.Writer) int {
 		} else if found {
 			return fmt.Errorf("key %s is already registered", name)
 		}
-		path, values, err := loadValidatedKeychainFile(ctx, store, *home)
+		path, values, err := pipeline.LoadValidatedKeychainFile(ctx, store, *home)
 		if err != nil {
 			return err
 		}
@@ -567,7 +567,7 @@ func runKeyGrantMutation(grant bool, args []string, stdout, stderr io.Writer) in
 			if key.Mode == db.KeychainModeProxied && !key.ProxyConfigured() {
 				return fmt.Errorf("key %s uses proxied mode but is not configured; run %s", name, keyConfigureCommand(name))
 			}
-			path, values, err := loadValidatedKeychainFile(ctx, store, *home)
+			path, values, err := pipeline.LoadValidatedKeychainFile(ctx, store, *home)
 			if err != nil {
 				return err
 			}

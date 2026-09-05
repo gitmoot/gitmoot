@@ -80,8 +80,8 @@ func TestPipelineServiceRetrySuccessFinalizesProofAndReceipt(t *testing.T) {
 		t.Fatalf("retried service run did not succeed: run=%+v ok=%v err=%v", run, ok, err)
 	}
 	stage := stageRow(t, store, accepted.RunID, "check")
-	failedID := pipelineStageJobID(accepted.RunID, "check", 0)
-	succeededID := pipelineStageJobID(accepted.RunID, "check", 1)
+	failedID := pipeline.PipelineStageJobID(accepted.RunID, "check", 0)
+	succeededID := pipeline.PipelineStageJobID(accepted.RunID, "check", 1)
 	if stage.Attempt != 1 || stage.JobID != succeededID {
 		t.Fatalf("current stage attempt=%d job=%q, want attempt 1 job %q", stage.Attempt, stage.JobID, succeededID)
 	}

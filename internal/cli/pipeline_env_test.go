@@ -176,21 +176,21 @@ func TestClassifyPipelineEnvFileStatuses(t *testing.T) {
 		want          string
 		wrongOwnerUID bool
 	}{
-		{name: "none", path: func(*testing.T) string { return "" }, want: pipelineEnvFileStatusNone},
+		{name: "none", path: func(*testing.T) string { return "" }, want: pipeline.PipelineEnvFileStatusNone},
 		{name: "ok", path: func(t *testing.T) string {
 			return writePipelineEnvFile(t, t.TempDir(), "ALPHA=secret\nBETA=secret\n", 0o600)
-		}, want: pipelineEnvFileStatusOK},
-		{name: "missing", path: func(t *testing.T) string { return filepath.Join(t.TempDir(), "missing.env") }, want: pipelineEnvFileStatusMissing},
+		}, want: pipeline.PipelineEnvFileStatusOK},
+		{name: "missing", path: func(t *testing.T) string { return filepath.Join(t.TempDir(), "missing.env") }, want: pipeline.PipelineEnvFileStatusMissing},
 		{name: "bad mode before parse", path: func(t *testing.T) string {
 			return writePipelineEnvFile(t, t.TempDir(), "BROKEN", 0o644)
-		}, want: pipelineEnvFileStatusBadMode},
+		}, want: pipeline.PipelineEnvFileStatusBadMode},
 		{name: "bad owner before parse", path: func(t *testing.T) string {
 			return writePipelineEnvFile(t, t.TempDir(), "BROKEN", 0o600)
-		}, want: pipelineEnvFileStatusBadOwner, wrongOwnerUID: true},
-		{name: "bad location before parse", path: func(*testing.T) string { return insideHome }, want: pipelineEnvFileStatusBadLocation},
+		}, want: pipeline.PipelineEnvFileStatusBadOwner, wrongOwnerUID: true},
+		{name: "bad location before parse", path: func(*testing.T) string { return insideHome }, want: pipeline.PipelineEnvFileStatusBadLocation},
 		{name: "invalid parse", path: func(t *testing.T) string {
 			return writePipelineEnvFile(t, t.TempDir(), "BROKEN", 0o600)
-		}, want: pipelineEnvFileStatusInvalid},
+		}, want: pipeline.PipelineEnvFileStatusInvalid},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -200,17 +200,17 @@ func TestClassifyPipelineEnvFileStatuses(t *testing.T) {
 			}
 			defer func() { pipeline.PipelineEnvCurrentUID = originalUID }()
 
-			got := classifyPipelineEnvFile(context.Background(), store, home, tt.path(t))
+			got := pipeline.ClassifyPipelineEnvFile(context.Background(), store, home, tt.path(t))
 			if got.Status != tt.want {
 				t.Fatalf("status = %q, want %q (inspection=%+v)", got.Status, tt.want, got)
 			}
 			if got.Names == nil {
 				t.Fatal("Names is nil")
 			}
-			if tt.want == pipelineEnvFileStatusOK && !reflect.DeepEqual(got.Names, map[string]struct{}{"ALPHA": {}, "BETA": {}}) {
+			if tt.want == pipeline.PipelineEnvFileStatusOK && !reflect.DeepEqual(got.Names, map[string]struct{}{"ALPHA": {}, "BETA": {}}) {
 				t.Fatalf("ok names = %#v", got.Names)
 			}
-			if tt.want != pipelineEnvFileStatusOK && len(got.Names) != 0 {
+			if tt.want != pipeline.PipelineEnvFileStatusOK && len(got.Names) != 0 {
 				t.Fatalf("unsafe file exposed names: %#v", got.Names)
 			}
 		})
@@ -321,9 +321,9 @@ func TestPipelineKeyAccessResolutionPrecedenceAndGrantBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []workflow.PipelineKeyAccess{
-		{Stage: "run", Name: "OVERLAP", Source: pipelineKeySourceOwn, Mode: db.KeychainModeInjected},
-		{Stage: "run", Name: "SHARED_ONLY", Source: pipelineKeySourceShared, Mode: db.KeychainModeInjected},
-		{Stage: "run", Name: "DEFAULT_ONLY", Source: pipelineKeySourceDefault, Mode: db.KeychainModeInjected},
+		{Stage: "run", Name: "OVERLAP", Source: pipeline.PipelineKeySourceOwn, Mode: db.KeychainModeInjected},
+		{Stage: "run", Name: "SHARED_ONLY", Source: pipeline.PipelineKeySourceShared, Mode: db.KeychainModeInjected},
+		{Stage: "run", Name: "DEFAULT_ONLY", Source: pipeline.PipelineKeySourceDefault, Mode: db.KeychainModeInjected},
 	}
 	if !reflect.DeepEqual(resolution.Access, want) || len(resolution.Unresolved) != 0 {
 		t.Fatalf("resolution=%#v unresolved=%#v, want %#v", resolution.Access, resolution.Unresolved, want)
@@ -336,7 +336,7 @@ func TestPipelineKeyAccessResolutionPrecedenceAndGrantBoundary(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(got.Access) != 0 || !reflect.DeepEqual(got.Unresolved, []pipelineEnvUnresolved{{Stage: "run", Selector: selector}}) {
+		if len(got.Access) != 0 || !reflect.DeepEqual(got.Unresolved, []pipeline.PipelineEnvUnresolved{{Stage: "run", Selector: selector}}) {
 			t.Fatalf("selector %q resolved without a grant: access=%#v unresolved=%#v", selector, got.Access, got.Unresolved)
 		}
 	}
@@ -430,11 +430,11 @@ func TestPipelineAgentKeyResolutionRequiresSeatGrantAndProxiedMode(t *testing.T)
 		t.Fatal(err)
 	}
 	wantAccess := []workflow.PipelineKeyAccess{
-		{Stage: "agent", Name: "AGENT_PROXY", Source: pipelineKeySourceShared, Mode: db.KeychainModeProxied},
-		{Stage: "shell", Name: "PIPELINE_ONLY", Source: pipelineKeySourceShared, Mode: db.KeychainModeProxied},
-		{Stage: "shell", Name: "DEFAULT_ONLY", Source: pipelineKeySourceDefault, Mode: db.KeychainModeInjected},
+		{Stage: "agent", Name: "AGENT_PROXY", Source: pipeline.PipelineKeySourceShared, Mode: db.KeychainModeProxied},
+		{Stage: "shell", Name: "PIPELINE_ONLY", Source: pipeline.PipelineKeySourceShared, Mode: db.KeychainModeProxied},
+		{Stage: "shell", Name: "DEFAULT_ONLY", Source: pipeline.PipelineKeySourceDefault, Mode: db.KeychainModeInjected},
 	}
-	wantUnresolved := []pipelineEnvUnresolved{
+	wantUnresolved := []pipeline.PipelineEnvUnresolved{
 		{Stage: "agent", Selector: "PIPELINE_ONLY"},
 		{Stage: "agent", Selector: "AGENT_INJECTED"},
 		{Stage: "agent", Selector: "OWN_ONLY"},
@@ -443,7 +443,7 @@ func TestPipelineAgentKeyResolutionRequiresSeatGrantAndProxiedMode(t *testing.T)
 	if !reflect.DeepEqual(resolution.Access, wantAccess) || !reflect.DeepEqual(resolution.Unresolved, wantUnresolved) {
 		t.Fatalf("resolution access=%#v unresolved=%#v", resolution.Access, resolution.Unresolved)
 	}
-	if err := pipeline.PipelineEnvironmentResolutionError(spec, []pipelineEnvUnresolved{{Stage: "agent", Selector: "MISSING"}}); err == nil || !strings.Contains(err.Error(), "gitmoot key grant MISSING --agent scout") {
+	if err := pipeline.PipelineEnvironmentResolutionError(spec, []pipeline.PipelineEnvUnresolved{{Stage: "agent", Selector: "MISSING"}}); err == nil || !strings.Contains(err.Error(), "gitmoot key grant MISSING --agent scout") {
 		t.Fatalf("agent unresolved hint = %v", err)
 	}
 }
@@ -469,7 +469,7 @@ func TestPipelineOwnKeyDoesNotRequireLowerPriorityKeychain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("own source consulted missing lower-priority keychain: %v", err)
 	}
-	want := []workflow.PipelineKeyAccess{{Stage: "run", Name: "OVERLAP", Source: pipelineKeySourceOwn, Mode: db.KeychainModeInjected}}
+	want := []workflow.PipelineKeyAccess{{Stage: "run", Name: "OVERLAP", Source: pipeline.PipelineKeySourceOwn, Mode: db.KeychainModeInjected}}
 	if !reflect.DeepEqual(resolution.Access, want) || len(resolution.Unresolved) != 0 {
 		t.Fatalf("resolution=%#v unresolved=%#v", resolution.Access, resolution.Unresolved)
 	}
@@ -544,7 +544,7 @@ func TestPipelineProxiedKeyResolutionAndDeliveryLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []workflow.PipelineKeyAccess{{Stage: "run", Name: "PROXY_KEY", Source: pipelineKeySourceShared, Mode: db.KeychainModeProxied}}
+	want := []workflow.PipelineKeyAccess{{Stage: "run", Name: "PROXY_KEY", Source: pipeline.PipelineKeySourceShared, Mode: db.KeychainModeProxied}}
 	if !reflect.DeepEqual(access.Access, want) {
 		t.Fatalf("proxied access = %#v, want %#v", access.Access, want)
 	}
@@ -636,7 +636,7 @@ func TestPipelineAgentProxiedKeyDeliveryE2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantAccess := []workflow.PipelineKeyAccess{{Stage: "inspect", Name: keyName, Source: pipelineKeySourceShared, Mode: db.KeychainModeProxied}}
+	wantAccess := []workflow.PipelineKeyAccess{{Stage: "inspect", Name: keyName, Source: pipeline.PipelineKeySourceShared, Mode: db.KeychainModeProxied}}
 	if !reflect.DeepEqual(access.Access, wantAccess) {
 		t.Fatalf("agent access = %#v, want %#v", access.Access, wantAccess)
 	}
@@ -649,7 +649,7 @@ func TestPipelineAgentProxiedKeyDeliveryE2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := advancePipelineRun(ctx, store, testStageEnqueuer(store), rec, spec, run, now); err != nil {
+	if _, err := pipeline.AdvancePipelineRun(ctx, store, testStageEnqueuer(store), rec, spec, run, now); err != nil {
 		t.Fatal(err)
 	}
 	stageRow, ok, err := store.GetPipelineRunStage(ctx, run.ID, "inspect")
@@ -680,7 +680,7 @@ func TestPipelineAgentProxiedKeyDeliveryE2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(detail.Keys.Stages) != 1 || !reflect.DeepEqual(detail.Keys.Stages[0].Keys, []dashboard.PipelineKeyEntry{{Name: keyName, Source: pipelineKeySourceShared, Mode: db.KeychainModeProxied}}) {
+	if len(detail.Keys.Stages) != 1 || !reflect.DeepEqual(detail.Keys.Stages[0].Keys, []dashboard.PipelineKeyEntry{{Name: keyName, Source: pipeline.PipelineKeySourceShared, Mode: db.KeychainModeProxied}}) {
 		t.Fatalf("agent Keys projection = %+v", detail.Keys)
 	}
 	detailJSON, err := json.Marshal(detail)
@@ -1128,9 +1128,9 @@ stages:
 	}
 
 	wantSources := map[string]map[string]string{
-		"a":       {sharedA: pipelineKeySourceShared, override: pipelineKeySourceOwn},
-		"b":       {sharedB: pipelineKeySourceShared},
-		"revoked": {revoked: pipelineKeySourceShared},
+		"a":       {sharedA: pipeline.PipelineKeySourceShared, override: pipeline.PipelineKeySourceOwn},
+		"b":       {sharedB: pipeline.PipelineKeySourceShared},
+		"revoked": {revoked: pipeline.PipelineKeySourceShared},
 	}
 	for stageID, names := range wantSources {
 		row := stageRow(t, store, runID, stageID)
@@ -1365,7 +1365,7 @@ stages:
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantAccess := []workflow.PipelineKeyAccess{{Stage: "call", Name: keyName, Source: pipelineKeySourceShared, Mode: db.KeychainModeProxied}}
+	wantAccess := []workflow.PipelineKeyAccess{{Stage: "call", Name: keyName, Source: pipeline.PipelineKeySourceShared, Mode: db.KeychainModeProxied}}
 	if !reflect.DeepEqual(payload.PipelineKeyAccess, wantAccess) {
 		t.Fatalf("proxied payload access = %#v", payload.PipelineKeyAccess)
 	}

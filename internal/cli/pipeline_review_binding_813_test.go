@@ -371,7 +371,7 @@ func TestPipelineSourceReviewEnqueueReplayAdoptsExistingJob(t *testing.T) {
 		t.Fatalf("review row after interrupted enqueue = %+v, want pending without JobID", reviewRow)
 	}
 
-	reviewJobID := pipelineStageJobID(run.ID, "review", 0)
+	reviewJobID := pipeline.PipelineStageJobID(run.ID, "review", 0)
 	created, err := store.GetJob(ctx, reviewJobID)
 	if err != nil {
 		t.Fatalf("GetJob(interrupted review): %v", err)

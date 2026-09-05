@@ -457,7 +457,7 @@ stages:
 		t.Fatalf("dirty the worktree: %v", err)
 	}
 	settleStageJob(t, store, impl.JobID, "failed", "boom", nil)
-	_, err = advancePipelineRun(ctx, store, enqueue, rec, parsed, run, now)
+	_, err = pipeline.AdvancePipelineRun(ctx, store, enqueue, rec, parsed, run, now)
 	if err == nil {
 		t.Fatalf("retry into a dirty worktree should FAIL CLOSED, got nil error")
 	}

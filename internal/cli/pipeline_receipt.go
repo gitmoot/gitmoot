@@ -60,7 +60,7 @@ func (d *webDataSource) handlePipelineReceiptBundle(w http.ResponseWriter, r *ht
 }
 
 func (d *webDataSource) loadPublicPipelineReceipt(ctx context.Context, runID string) (publicPipelineReceipt, error) {
-	if !pipelineServiceRunIDPattern.MatchString(runID) {
+	if !pipeline.PipelineServiceRunIDPattern.MatchString(runID) {
 		return publicPipelineReceipt{}, errors.New("invalid service run id")
 	}
 	paths, err := pathsFromFlag(d.home)
@@ -106,7 +106,7 @@ func (d *webDataSource) loadPublicPipelineReceipt(ctx context.Context, runID str
 	if _, err := os.Stat(receiptArchive); os.IsNotExist(err) {
 		// Backward compatibility for already-finalized #1011 receipts: their sole
 		// archive is safe to expose only when it contains no artifact entries.
-		contains, inspectErr := archiveContainsPrefix(artifact, pipelineServiceArtifactsDir+"/")
+		contains, inspectErr := archiveContainsPrefix(artifact, pipeline.PipelineServiceArtifactsDir+"/")
 		if inspectErr != nil || contains {
 			return publicPipelineReceipt{}, errors.New("sanitized receipt archive is absent")
 		}
@@ -121,7 +121,7 @@ func (d *webDataSource) loadPublicPipelineReceipt(ctx context.Context, runID str
 	if err := proof.VerifyManifest(receiptManifest); err != nil {
 		return publicPipelineReceipt{}, err
 	}
-	if contains, err := archiveContainsPrefix(receiptArchive, pipelineServiceArtifactsDir+"/"); err != nil || contains {
+	if contains, err := archiveContainsPrefix(receiptArchive, pipeline.PipelineServiceArtifactsDir+"/"); err != nil || contains {
 		return publicPipelineReceipt{}, errors.New("sanitized receipt archive contains artifact bytes")
 	}
 	var tree bytes.Buffer

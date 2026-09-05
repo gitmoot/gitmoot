@@ -218,7 +218,7 @@ func (h *pipelineServiceHandler) handleCreateRun(w http.ResponseWriter, r *http.
 		h.writeError(w, http.StatusInternalServerError, "bundle_freeze_failed")
 		return
 	}
-	root, _, _, _, _ := pipelineServiceRunPaths(h.paths, runID)
+	root, _, _, _, _ := pipeline.PipelineServiceRunPaths(h.paths, runID)
 	accepted := false
 	defer func() {
 		if !accepted {
@@ -231,7 +231,7 @@ func (h *pipelineServiceHandler) handleCreateRun(w http.ResponseWriter, r *http.
 	}
 	stages := make([]db.PipelineRunStage, 0, len(spec.Stages))
 	for _, stage := range spec.Stages {
-		stages = append(stages, db.PipelineRunStage{RunID: runID, StageID: stage.ID, State: pipeline.StagePending, NeedsJSON: marshalPipelineNeeds(stage.Needs)})
+		stages = append(stages, db.PipelineRunStage{RunID: runID, StageID: stage.ID, State: pipeline.StagePending, NeedsJSON: pipeline.MarshalPipelineNeeds(stage.Needs)})
 	}
 	err = h.store.AdmitServiceRun(ctx, db.ServiceRunAdmission{
 		Run: run, Stages: stages, ServiceRun: db.PipelineServiceRun{RunID: runID, PipelineName: name, CreatedAt: now},
@@ -243,7 +243,7 @@ func (h *pipelineServiceHandler) handleCreateRun(w http.ResponseWriter, r *http.
 		return
 	}
 	accepted = true
-	if _, err := advancePipelineRun(ctx, h.store, newPipelineStageEnqueuer(h.store, h.rawHome), record, spec, run, now); err != nil {
+	if _, err := pipeline.AdvancePipelineRun(ctx, h.store, newPipelineStageEnqueuer(h.store, h.rawHome), record, spec, run, now); err != nil {
 		fmt.Fprintf(h.stderr, "pipeline service: immediate advance %s: %v\n", runID, err)
 	}
 	h.writeJSON(w, http.StatusAccepted, pipelineServiceAccepted{
@@ -305,7 +305,7 @@ func (h *pipelineServiceHandler) handleGetBundle(w http.ResponseWriter, r *http.
 }
 
 func (h *pipelineServiceHandler) authorizedRun(w http.ResponseWriter, r *http.Request, runID string) (db.PipelineServiceRun, db.PipelineRun, bool) {
-	if !pipelineServiceRunIDPattern.MatchString(runID) {
+	if !pipeline.PipelineServiceRunIDPattern.MatchString(runID) {
 		h.writeUnauthorized(w)
 		return db.PipelineServiceRun{}, db.PipelineRun{}, false
 	}
@@ -354,7 +354,7 @@ func bearerToken(header string) (string, bool) {
 func (h *pipelineServiceHandler) finalize(ctx context.Context, runID string) (db.PipelineServiceRun, error) {
 	h.finalizeMu.Lock()
 	defer h.finalizeMu.Unlock()
-	root, _, _, _, err := pipelineServiceRunPaths(h.paths, runID)
+	root, _, _, _, err := pipeline.PipelineServiceRunPaths(h.paths, runID)
 	if err != nil {
 		return db.PipelineServiceRun{}, err
 	}
@@ -374,7 +374,7 @@ func (h *pipelineServiceHandler) finalize(ctx context.Context, runID string) (db
 	if serviceRun.ArtifactRelpath != "" {
 		return serviceRun, nil
 	}
-	verified, err := verifyPipelineRunFromStore(ctx, h.store, h.paths, runID)
+	verified, err := pipeline.VerifyPipelineRunFromStore(ctx, h.store, h.paths, runID)
 	if err != nil {
 		return db.PipelineServiceRun{}, err
 	}
@@ -388,21 +388,21 @@ func (h *pipelineServiceHandler) finalize(ctx context.Context, runID string) (db
 	if err != nil {
 		return db.PipelineServiceRun{}, err
 	}
-	_, base, _, archive, err := pipelineServiceRunPaths(h.paths, runID)
+	_, base, _, archive, err := pipeline.PipelineServiceRunPaths(h.paths, runID)
 	if err != nil {
 		return db.PipelineServiceRun{}, err
 	}
-	actualArtifacts, err := loadPipelineServiceArtifacts(h.paths, runID)
+	actualArtifacts, err := pipeline.LoadPipelineServiceArtifacts(h.paths, runID)
 	if err != nil {
 		return db.PipelineServiceRun{}, err
 	}
-	if err := verifyPipelineServiceArtifactProof(verified.Manifest, actualArtifacts); err != nil {
+	if err := pipeline.VerifyPipelineServiceArtifactProof(verified.Manifest, actualArtifacts); err != nil {
 		return db.PipelineServiceRun{}, err
 	}
 	if err := writePipelineServiceArchive(base, archive, manifestJSON, verificationJSON, true); err != nil {
 		return db.PipelineServiceRun{}, err
 	}
-	if err := verifyPipelineServiceArchiveArtifacts(archive, verified.Manifest); err != nil {
+	if err := pipeline.VerifyPipelineServiceArchiveArtifacts(archive, verified.Manifest); err != nil {
 		return db.PipelineServiceRun{}, err
 	}
 	receiptArchive, err := pipelineServiceReceiptArchivePath(h.paths, runID)
@@ -483,7 +483,7 @@ func newPipelineServiceRunID() (string, error) {
 }
 
 func freezePipelineServiceBundle(ctx context.Context, store *db.Store, paths config.Paths, record db.Pipeline, runID string) error {
-	root, base, sourceSpec, _, err := pipelineServiceRunPaths(paths, runID)
+	root, base, sourceSpec, _, err := pipeline.PipelineServiceRunPaths(paths, runID)
 	if err != nil {
 		return err
 	}
@@ -534,7 +534,7 @@ func writePipelineServiceArchive(base, archive string, proofJSON, verificationJS
 			return errors.New("frozen bundle contains an invalid path")
 		}
 		slashRel := filepath.ToSlash(rel)
-		if !includeArtifacts && (slashRel == pipelineServiceArtifactsDir || strings.HasPrefix(slashRel, pipelineServiceArtifactsDir+"/")) {
+		if !includeArtifacts && (slashRel == pipeline.PipelineServiceArtifactsDir || strings.HasPrefix(slashRel, pipeline.PipelineServiceArtifactsDir+"/")) {
 			return nil
 		}
 		content, err := os.ReadFile(path)
@@ -619,7 +619,7 @@ func containedServiceArtifactPath(paths config.Paths, relpath string) (string, e
 		return "", errors.New("artifact path is not a rooted relative path")
 	}
 	path := filepath.Join(paths.Home, filepath.FromSlash(relpath))
-	rel, err := filepath.Rel(filepath.Join(paths.Home, pipelineServiceRunsDir), path)
+	rel, err := filepath.Rel(filepath.Join(paths.Home, pipeline.PipelineServiceRunsDir), path)
 	if err != nil || !containedRelativePath(rel) {
 		return "", errors.New("artifact path is outside pipeline service storage")
 	}
@@ -677,10 +677,10 @@ func (h *pipelineServiceHandler) writeServiceAdmissionError(w http.ResponseWrite
 
 func (h *pipelineServiceHandler) writeServiceFinalizationError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, errPipelineServiceArtifactBundleTooLarge):
-		h.writeError(w, http.StatusInternalServerError, errPipelineServiceArtifactBundleTooLarge.Error())
-	case errors.Is(err, errPipelineServiceArtifactCollectionFailed):
-		h.writeError(w, http.StatusInternalServerError, errPipelineServiceArtifactCollectionFailed.Error())
+	case errors.Is(err, pipeline.ErrPipelineServiceArtifactBundleTooLarge):
+		h.writeError(w, http.StatusInternalServerError, pipeline.ErrPipelineServiceArtifactBundleTooLarge.Error())
+	case errors.Is(err, pipeline.ErrPipelineServiceArtifactCollectionFailed):
+		h.writeError(w, http.StatusInternalServerError, pipeline.ErrPipelineServiceArtifactCollectionFailed.Error())
 	default:
 		h.writeError(w, http.StatusInternalServerError, "proof_finalization_failed")
 	}

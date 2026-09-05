@@ -18,6 +18,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/execbackend/e2b"
 	remoteexec "github.com/gitmoot/gitmoot/internal/execbackend/remote"
+	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -229,7 +230,7 @@ func (w *jobWorker) executionDeliveryAdapter(agent runtime.Agent, checkout strin
 		if !ok {
 			return nil, errors.New("execution-backend runtime runner does not support streaming")
 		}
-		runner = subprocess.TeeRunner{Inner: stream, Out: runtimeOutputWriter(outputs...)}
+		runner = subprocess.TeeRunner{Inner: stream, Out: pipeline.RuntimeOutputWriter(outputs...)}
 	}
 	return buildRuntimeAdapter(w.ConfigHome, agent, checkout, runner)
 }

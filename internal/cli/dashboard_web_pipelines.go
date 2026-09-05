@@ -157,7 +157,7 @@ func (d *webDataSource) PipelineRun(ctx context.Context, id string) (dashboard.P
 			SpecHash:   run.SpecHash,
 			HaltStage:  run.HaltStage,
 			HaltReason: run.HaltReason,
-			Needs:      decodePipelineNeeds(run.NeedsJSON),
+			Needs:      pipeline.DecodePipelineNeeds(run.NeedsJSON),
 			StartedAt:  pipelineTimeMillis(run.StartedAt),
 			FinishedAt: pipelineTimeMillis(run.FinishedAt),
 			Stages:     make([]dashboard.PipelineStage, 0, len(ordered)),
@@ -175,7 +175,7 @@ func (d *webDataSource) PipelineRun(ctx context.Context, id string) (dashboard.P
 				Deps:       deps,
 				JobID:      row.JobID,
 				Attempt:    row.Attempt,
-				Needs:      decodePipelineNeeds(row.NeedsJSON),
+				Needs:      pipeline.DecodePipelineNeeds(row.NeedsJSON),
 				Summary:    row.Summary,
 				StartedAt:  pipelineTimeMillis(row.StartedAt),
 				FinishedAt: pipelineTimeMillis(row.FinishedAt),
@@ -195,7 +195,7 @@ func (d *webDataSource) PipelineRun(ctx context.Context, id string) (dashboard.P
 			}
 			if row.State == pipeline.StageRunning {
 				if event, ok := progressByJobID[row.JobID]; ok {
-					var payload pipelineProgressEventPayload
+					var payload pipeline.PipelineProgressEventPayload
 					if json.Unmarshal([]byte(event.Message), &payload) == nil {
 						stage.ProgressActivity = payload.Activity
 						stage.ProgressAt = parseJobTimeMillis(event.CreatedAt)
@@ -309,7 +309,7 @@ func (d *webDataSource) PipelineDetail(ctx context.Context, name string) (dashbo
 		Declared: []dashboard.PipelineStage{},
 		Runs:     []dashboard.PipelineRunHistoryEntry{},
 		Keys: dashboard.PipelineKeys{
-			EnvFile: dashboard.PipelineEnvFileStatus{Status: pipelineEnvFileStatusNone},
+			EnvFile: dashboard.PipelineEnvFileStatus{Status: pipeline.PipelineEnvFileStatusNone},
 			Stages:  []dashboard.PipelineStageKeys{},
 		},
 	}

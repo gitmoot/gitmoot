@@ -500,9 +500,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 	}
 	deliveryCheckout := checkout
-	var progressTracker *pipelineProgressLineTracker
+	var progressTracker *pipeline.PipelineProgressLineTracker
 	if payload.Sender == workflow.PipelineJobSender {
-		progressTracker = &pipelineProgressLineTracker{}
+		progressTracker = &pipeline.PipelineProgressLineTracker{}
 	}
 	var adapter workflow.DeliveryAdapter
 	if progressTracker != nil {
@@ -862,20 +862,20 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		done := make(chan struct{})
 		threshold := w.PipelineProgressThreshold
 		if threshold <= 0 {
-			threshold = pipelineProgressThreshold
+			threshold = pipeline.PipelineProgressThreshold
 		}
 		interval := w.PipelineProgressInterval
 		if interval <= 0 {
-			interval = pipelineProgressInterval
+			interval = pipeline.PipelineProgressInterval
 		}
 		tickSource := w.ProgressTickSource
 		if tickSource == nil {
-			tickSource = pipelineProgressTicks
+			tickSource = pipeline.PipelineProgressTicks
 		}
 		startedAt := time.Now().UTC()
 		go func() {
 			defer close(done)
-			emitPipelineProgress(progressCtx, w.Store, w.Stdout, job.ID, startedAt, progressTracker, tickSource(progressCtx, threshold, interval))
+			pipeline.EmitPipelineProgress(progressCtx, w.Store, w.Stdout, job.ID, startedAt, progressTracker, tickSource(progressCtx, threshold, interval))
 		}()
 		stopProgress = func() {
 			cancelProgress()
@@ -4054,7 +4054,7 @@ func (w jobWorker) defaultAdapter(agent runtime.Agent, checkout string) (workflo
 }
 
 func (w jobWorker) outputAdapter(agent runtime.Agent, checkout string, out io.Writer) (workflow.DeliveryAdapter, error) {
-	return buildRuntimeAdapter(w.ConfigHome, agent, checkout, subprocess.TeeRunner{Inner: subprocess.GroupRunner{}, Out: runtimeOutputWriter(out)})
+	return buildRuntimeAdapter(w.ConfigHome, agent, checkout, subprocess.TeeRunner{Inner: subprocess.GroupRunner{}, Out: pipeline.RuntimeOutputWriter(out)})
 }
 
 // buildJobAdapterForBackend consumes the already-resolved backend at the

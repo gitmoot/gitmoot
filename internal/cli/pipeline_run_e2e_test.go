@@ -118,7 +118,7 @@ func TestPipelineBlockedParkE2E(t *testing.T) {
 	if run.HaltStage != "score" {
 		t.Fatalf("halt_stage = %q, want score", run.HaltStage)
 	}
-	if got := decodePipelineNeeds(run.NeedsJSON); len(got) != 1 || got[0] != "R2 token" {
+	if got := pipeline.DecodePipelineNeeds(run.NeedsJSON); len(got) != 1 || got[0] != "R2 token" {
 		t.Fatalf("run needs = %v, want [R2 token]", got)
 	}
 
@@ -130,7 +130,7 @@ func TestPipelineBlockedParkE2E(t *testing.T) {
 	if scr.State != pipeline.StageBlocked {
 		t.Fatalf("stage score = %s, want blocked", scr.State)
 	}
-	if got := decodePipelineNeeds(scr.NeedsJSON); len(got) != 1 || got[0] != "R2 token" {
+	if got := pipeline.DecodePipelineNeeds(scr.NeedsJSON); len(got) != 1 || got[0] != "R2 token" {
 		t.Fatalf("stage score needs = %v, want [R2 token]", got)
 	}
 	dep := stageRow(t, store, runID, "deploy")
@@ -290,7 +290,7 @@ stages:
 	if gate.State != pipeline.StageBlocked {
 		t.Fatalf("gate stage = %+v, want blocked", gate)
 	}
-	if got := decodePipelineNeeds(gate.NeedsJSON); len(got) != 1 || got[0] != "source stage succeeded without opening a PR; nothing to wait for" {
+	if got := pipeline.DecodePipelineNeeds(gate.NeedsJSON); len(got) != 1 || got[0] != "source stage succeeded without opening a PR; nothing to wait for" {
 		t.Fatalf("gate needs = %v", got)
 	}
 	events, err := store.ListJobEvents(ctx, impl.JobID)

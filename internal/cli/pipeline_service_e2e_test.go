@@ -86,7 +86,7 @@ func TestPipelineServiceAcceptanceE2E(t *testing.T) {
 	}
 	var accepted pipelineServiceAccepted
 	decodeResponse(t, acceptedResponse, &accepted)
-	if !pipelineServiceRunIDPattern.MatchString(accepted.RunID) || strings.HasPrefix(accepted.RunID, "prun-") {
+	if !pipeline.PipelineServiceRunIDPattern.MatchString(accepted.RunID) || strings.HasPrefix(accepted.RunID, "prun-") {
 		t.Fatalf("service run id is not unpredictable 128-bit form: %q", accepted.RunID)
 	}
 	if accepted.StatusURL != pipelineServiceStatusURL(accepted.RunID) || accepted.ReceiptURL != pipelineServiceReceiptURL(accepted.RunID) {
@@ -100,7 +100,7 @@ func TestPipelineServiceAcceptanceE2E(t *testing.T) {
 	if runs, err := store.ListPipelineRuns(ctx, "count-service"); err != nil || len(runs) != 1 {
 		t.Fatalf("overlap conflict created a partial run: runs=%v err=%v", runs, err)
 	}
-	frozen, err := os.ReadDir(filepath.Join(paths.Home, pipelineServiceRunsDir))
+	frozen, err := os.ReadDir(filepath.Join(paths.Home, pipeline.PipelineServiceRunsDir))
 	if err != nil || len(frozen) != 1 || frozen[0].Name() != accepted.RunID {
 		t.Fatalf("happy path/conflict froze bundles=%v err=%v, want exactly %s", frozen, err, accepted.RunID)
 	}

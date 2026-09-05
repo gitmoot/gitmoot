@@ -127,7 +127,7 @@ func assertNoPipelineServiceFreeze(t *testing.T, home string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = os.Stat(filepath.Join(paths.Home, pipelineServiceRunsDir))
+	_, err = os.Stat(filepath.Join(paths.Home, pipeline.PipelineServiceRunsDir))
 	if !os.IsNotExist(err) {
 		t.Fatalf("rejected request touched pipeline service bundle storage: err=%v", err)
 	}

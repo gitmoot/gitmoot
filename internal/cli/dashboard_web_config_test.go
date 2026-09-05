@@ -13,10 +13,10 @@ import (
 	"time"
 
 	dashboard "github.com/gitmoot/gitmoot-dashboard"
-
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
+	"github.com/gitmoot/gitmoot/internal/pipeline"
 )
 
 func TestDashboardConfigProjectionAllowlist(t *testing.T) {
@@ -200,7 +200,7 @@ func TestWebDataSourceConfigKeychainProjection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.Keychain.File.Path != path || snapshot.Keychain.File.Status != pipelineEnvFileStatusOK {
+	if snapshot.Keychain.File.Path != path || snapshot.Keychain.File.Status != pipeline.PipelineEnvFileStatusOK {
 		t.Fatalf("keychain file = %+v", snapshot.Keychain.File)
 	}
 	wantNames := []string{"GH_TOKEN", "OPENAI_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"}
@@ -241,7 +241,7 @@ func TestWebDataSourceConfigKeychainLiveDriftKeepsRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.Keychain.File.Path != path || snapshot.Keychain.File.Status != pipelineEnvFileStatusMissing || len(snapshot.Keychain.Keys) != 4 {
+	if snapshot.Keychain.File.Path != path || snapshot.Keychain.File.Status != pipeline.PipelineEnvFileStatusMissing || len(snapshot.Keychain.Keys) != 4 {
 		t.Fatalf("drifted keychain = %+v", snapshot.Keychain)
 	}
 	if got := snapshot.Keychain.Keys[0].Grants; !reflect.DeepEqual(got, []dashboard.KeychainGrantView{
