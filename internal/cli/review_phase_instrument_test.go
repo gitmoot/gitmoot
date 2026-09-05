@@ -44,6 +44,19 @@ func TestClassifyPhaseCommandClassifiesEverySegment(t *testing.T) {
 		{"absolute go", "/root/.local/toolchains/go1.26.4/bin/go test ./...", phaseBucketTest},
 		// #1824 review F3, all three measured by the reviewer.
 		{"cd prefix is plumbing", "cd /root/gm-1824 && go test ./...", phaseBucketTest},
+		// #1824 review F8: all three were classified `other`, and the first is
+		// this repository's own documented gate shape - so the bucket under
+		// investigation was the one being undercounted.
+		{"timeout consumes its duration", "timeout 25m go test ./...", phaseBucketTest},
+		{"timeout with seconds", "timeout 90s go build ./...", phaseBucketBuild},
+		{"timeout with a bare number", "timeout 600 go test ./...", phaseBucketTest},
+		{"timeout with a signal flag", "timeout -s KILL -k 10s 25m go test ./...", phaseBucketTest},
+		{"time -p takes no value", "time -p go test ./...", phaseBucketTest},
+		{"gnu time -f takes a value", `time -f %e go test ./...`, phaseBucketTest},
+		{"sudo -u consumes the user", "sudo -u nobody go test ./...", phaseBucketTest},
+		{"nice -n consumes the level", "nice -n 5 go test ./...", phaseBucketTest},
+		{"wrapper must not swallow the command", "timeout 25m git status", phaseBucketVCS},
+		{"a wrapper alone is not a phase", "timeout 25m", phaseBucketOther},
 		{"time wrapper", "time go test ./...", phaseBucketTest},
 		{"test AND build is mixed, not test", "go test ./... && go build ./...", phaseBucketMixed},
 		{"build then vcs is mixed", "go build ./... && git status", phaseBucketMixed},
@@ -327,7 +340,7 @@ func TestPhaseInstrumentObservesOnlyPersistedBytes(t *testing.T) {
 	sink := &truncatingWriter{limit: len(start)}
 	handle := &retainedTranscript{
 		sink: sink, translator: translator, started: time.Now(),
-		pending: map[string]pendingCommand{}, bucketNS: map[string]int64{}, bucketCount: map[string]int{},
+		pending: map[string]pendingCommand{}, nonShellCalls: map[string]struct{}{}, bucketNS: map[string]int64{}, bucketCount: map[string]int{},
 	}
 
 	n, writeErr := handle.Write([]byte(start + end))
@@ -529,7 +542,7 @@ func TestPhaseInstrumentTagsEachAttemptSeparately(t *testing.T) {
 func TestPhaseInstrumentCloseWithoutAStoreDoesNotPanic(t *testing.T) {
 	handle := &retainedTranscript{
 		jobID: "no-store", runtime: "codex", translator: opaqueTranslator{}, started: time.Now(),
-		pending: map[string]pendingCommand{}, bucketNS: map[string]int64{}, bucketCount: map[string]int{},
+		pending: map[string]pendingCommand{}, nonShellCalls: map[string]struct{}{}, bucketNS: map[string]int64{}, bucketCount: map[string]int{},
 	}
 	if err := handle.Close(); err != nil {
 		t.Fatalf("close with no store: %v", err)
@@ -620,7 +633,7 @@ func BenchmarkRetainedTranscriptWrite(b *testing.B) {
 			defer func() { _ = file.Close() }()
 			handle := &retainedTranscript{
 				sink: file, translator: tc.translator, started: time.Now(),
-				pending: map[string]pendingCommand{}, bucketNS: map[string]int64{}, bucketCount: map[string]int{},
+				pending: map[string]pendingCommand{}, nonShellCalls: map[string]struct{}{}, bucketNS: map[string]int64{}, bucketCount: map[string]int{},
 			}
 			b.SetBytes(int64(len(payload)))
 			b.ResetTimer()
@@ -640,4 +653,191 @@ func mustBenchTranslator(b *testing.B) transcript.Translator {
 		b.Fatal(err)
 	}
 	return translator
+}
+
+// The three tests below came from CONSTRUCTED ADVERSARIAL INPUTS, not from
+// mutating the implementation. That distinction is the point: 13 mutants all
+// died against this file while every one of these defects was live, because a
+// mutant asks "do the tests notice a change to this code" and only a
+// counterexample asks "can the claimed invariant be violated".
+
+// TestPhaseInstrumentKeepsTheFirstCallOnAToolIDCollision. Two concurrent
+// commands arriving on the SAME id used to overwrite the pending entry, so the
+// first result adopted the second command's text and billed a `go test` run
+// wholly to `vcs` - the exact misattribution id pairing was introduced to fix.
+func TestPhaseInstrumentKeepsTheFirstCallOnAToolIDCollision(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	store := seedInstrumentJob(t, paths, "collision", "codex-reviewer", "codex")
+	handle := openInstrumentedTranscript(t, home, "collision", "codex", store)
+
+	firstStart, firstEnd := codexToolLines("dup", "go test ./...")
+	secondStart, secondEnd := codexToolLines("dup", "git status --porcelain")
+	if _, err := handle.Write([]byte(firstStart)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if _, err := handle.Write([]byte(secondStart)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handle.Write([]byte(firstEnd + secondEnd)); err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	profile := readPhaseProfile(t, store, "collision")
+	assertProfileIdentities(t, profile)
+	if profile.IDCollisions != 1 {
+		t.Fatalf("id_collisions = %d, want 1 (%+v)", profile.IDCollisions, profile)
+	}
+	// The surviving call is the `go test` one, so its time must be in test and
+	// NOT in vcs.
+	if profile.BucketMS[phaseBucketTest] <= 0 {
+		t.Fatalf("test bucket = %dms, want the first call's time (%+v)", profile.BucketMS[phaseBucketTest], profile)
+	}
+	if profile.BucketCount[phaseBucketVCS] != 0 {
+		t.Fatalf("vcs count = %d, want 0 - the colliding call must not replace the first (%+v)", profile.BucketCount[phaseBucketVCS], profile)
+	}
+}
+
+// TestPhaseInstrumentCountsCommandsStillRunningAtClose. A command in flight
+// when the transcript closed used to contribute NO bucket time, so its
+// duration fell into residual and a review killed mid-`go test` reported as
+// almost entirely idle - the opposite of the truth.
+func TestPhaseInstrumentCountsCommandsStillRunningAtClose(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	store := seedInstrumentJob(t, paths, "inflight", "codex-reviewer", "codex")
+	handle := openInstrumentedTranscript(t, home, "inflight", "codex", store)
+
+	start, _ := codexToolLines("never", "go test ./...")
+	if _, err := handle.Write([]byte(start)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if err := handle.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	profile := readPhaseProfile(t, store, "inflight")
+	assertProfileIdentities(t, profile)
+	if profile.InFlight != 1 || profile.Commands != 1 {
+		t.Fatalf("in_flight=%d commands=%d, want 1 and 1 (%+v)", profile.InFlight, profile.Commands, profile)
+	}
+	if profile.BucketMS[phaseBucketTest] <= 0 {
+		t.Fatalf("test bucket = %dms, want the time the command actually ran (%+v)", profile.BucketMS[phaseBucketTest], profile)
+	}
+	// The whole run was inside one command, so residual must be small - the
+	// defect reported it as the entire run.
+	if profile.ResidualMS >= profile.BucketMS[phaseBucketTest] {
+		t.Fatalf("residual %dms >= command time %dms - in-flight time leaked into idle (%+v)",
+			profile.ResidualMS, profile.BucketMS[phaseBucketTest], profile)
+	}
+}
+
+// TestPhaseInstrumentCapsAnUnterminatedLine. A stream with no newline grew the
+// pending buffer without bound: 1 MiB measured, and nothing stops it at 1 GiB
+// inside the daemon. The cap must also RECORD the loss, or the profile looks
+// complete while silently missing commands.
+func TestPhaseInstrumentCapsAnUnterminatedLine(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	store := seedInstrumentJob(t, paths, "flood", "codex-reviewer", "codex")
+	handle := openInstrumentedTranscript(t, home, "flood", "codex", store)
+
+	chunk := []byte(strings.Repeat("x", 64*1024))
+	for range 24 {
+		if _, err := handle.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(handle.partial) > maxPartialLineBytes {
+		t.Fatalf("pending buffer = %d bytes, want at most %d", len(handle.partial), maxPartialLineBytes)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	profile := readPhaseProfile(t, store, "flood")
+	if profile.DroppedBytes <= 0 {
+		t.Fatalf("dropped_bytes = %d, want the discarded fragment recorded (%+v)", profile.DroppedBytes, profile)
+	}
+	// The transcript itself must still hold every byte.
+	onDisk, err := os.ReadFile(filepath.Join(paths.Logs, "jobs", "flood.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(onDisk) != 24*64*1024 {
+		t.Fatalf("transcript holds %d bytes, want %d - capping the PARSER must never drop a retained byte", len(onDisk), 24*64*1024)
+	}
+}
+
+// TestPhaseInstrumentReportsAResultWhoseCallWasNeverSeenAsUnpaired is #1824
+// review F9. Kimi names a result whose call it never saw "tool", so a
+// shell-ness test taken BEFORE the id lookup filed a genuinely lost pairing as
+// ordinary tool activity and left unpaired at zero - contradicting what both
+// the payload and the documentation say those fields mean.
+func TestPhaseInstrumentReportsAResultWhoseCallWasNeverSeenAsUnpaired(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	store := seedInstrumentJob(t, paths, "orphan", "kimi-reviewer", "kimi")
+	handle := openInstrumentedTranscript(t, home, "orphan", "kimi", store)
+
+	// A kimi tool result with no preceding assistant tool_call.
+	orphan, err := json.Marshal(map[string]any{
+		"role": "tool", "tool_call_id": "call_never_opened", "content": "done",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handle.Write(append(orphan, '\n')); err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	profile := readPhaseProfile(t, store, "orphan")
+	if profile.Unpaired != 1 {
+		t.Fatalf("unpaired = %d, want 1 - the call id was never opened (%+v)", profile.Unpaired, profile)
+	}
+	if profile.ToolEvents != 0 {
+		t.Fatalf("tool_events = %d, want 0 - a lost pairing is not ordinary tool activity (%+v)", profile.ToolEvents, profile)
+	}
+}
+
+// TestPhaseProfileMillisecondsIsExactOnDeterministicInput is #1824 review F10.
+// A +1ms per-bucket bias survived the end-to-end tests because real durations
+// are not deterministic, so their tolerance had to be loose. The arithmetic is
+// a pure function precisely so it can be pinned on exact nanoseconds.
+func TestPhaseProfileMillisecondsIsExactOnDeterministicInput(t *testing.T) {
+	ms := time.Millisecond.Nanoseconds()
+	buckets := map[string]int64{phaseBucketTest: 40 * ms, phaseBucketVCS: 10 * ms}
+	bucketMS, wall, covered, overlap := phaseProfileMilliseconds(buckets, 100*ms, 50*ms, 50*ms)
+	if bucketMS[phaseBucketTest] != 40 || bucketMS[phaseBucketVCS] != 10 {
+		t.Fatalf("buckets = %v, want exactly {test:40, vcs:10}", bucketMS)
+	}
+	if wall != 100 || covered != 50 || overlap != 0 {
+		t.Fatalf("wall=%d covered=%d overlap=%d, want 100/50/0", wall, covered, overlap)
+	}
+	if wall-covered != 50 {
+		t.Fatalf("residual = %d, want exactly 50", wall-covered)
+	}
+	// Overlap is the excess of summed command time over the union, exactly.
+	if _, _, _, over := phaseProfileMilliseconds(buckets, 100*ms, 30*ms, 50*ms); over != 20 {
+		t.Fatalf("overlap = %d, want exactly 20", over)
+	}
+	// Sub-millisecond remainders round half-up once, not per interval.
+	if _, w, _, _ := phaseProfileMilliseconds(nil, 1_500_000, 0, 0); w != 2 {
+		t.Fatalf("1.5ms rounded to %d, want 2", w)
+	}
+	if _, w, _, _ := phaseProfileMilliseconds(nil, 1_400_000, 0, 0); w != 1 {
+		t.Fatalf("1.4ms rounded to %d, want 1", w)
+	}
+	// A negative excess (rounding artefact) must clamp to zero, never negative.
+	if _, _, _, over := phaseProfileMilliseconds(nil, 10*ms, 5*ms, 4*ms); over != 0 {
+		t.Fatalf("overlap = %d, want 0 rather than a negative", over)
+	}
 }

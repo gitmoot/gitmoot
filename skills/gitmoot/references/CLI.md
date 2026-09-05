@@ -2347,6 +2347,16 @@ run CONCURRENTLY, so their durations do not partition anything:
   results whose call id was never seen (they contribute no time, and are
   reported so a stream this cannot follow stays visible); and non-shell tool
   results such as `file_change`, which are tool activity but not commands.
+- `in_flight` — commands still running when the transcript closed. Their
+  measured-so-far time IS counted: a review killed mid-`go test` otherwise
+  reported that time as residual and looked idle when it was busiest.
+- `id_collisions` — tool calls that arrived on an id already open. The FIRST
+  call is kept; a non-zero value means the stream reused ids and some command
+  text was not recorded.
+- `dropped_bytes` — bytes discarded from an over-long unterminated line. The
+  parser's pending buffer is capped so a runtime emitting one enormous line
+  cannot grow daemon memory without bound; the loss is recorded rather than
+  silent, and the retained transcript still holds every byte.
 - `attempt` — the job's lifecycle generation. `job retry` preserves prior
   events and re-delivers the same job id, so one job id can hold several
   profiles; this field is the attempt boundary.

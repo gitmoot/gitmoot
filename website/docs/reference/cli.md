@@ -2027,6 +2027,47 @@ follow-up. Usage is labeled
 Malformed or unknown lines degrade individually to redacted capped raw output
 without stopping later lines.
 
+### Where a review's wall time went (`phase_profile`)
+
+Every **review** job with a retained transcript emits one `phase_profile` job
+event per attempt, visible in `gitmoot job events <job-id>`. Other job types
+are deliberately untouched: the profile is appended after a job's terminal
+events, so emitting it everywhere would change the observable event sequence of
+jobs this measurement has no business affecting.
+
+The transcript records *what* ran, not *when* — the runtime streams carry no
+event timestamps, and snapshot replay deliberately refuses to invent elapsed
+time from parser speed — so the timing is recorded live or not at all.
+
+Two identities, and the difference between them is the finding. Commands can
+run concurrently, so their durations do not partition anything on their own:
+
+```
+covered_ms + residual_ms == wall_ms
+sum(bucket_ms)           == covered_ms + overlap_ms
+```
+
+- `covered_ms` — wall time with at least one command in flight (the **union**
+  of command intervals).
+- `residual_ms` — wall time with **no command in flight**; non-negative by
+  construction because it is `wall - covered`, never `wall - sum`.
+- `overlap_ms` — concurrent command time, reported rather than absorbed.
+- `bucket_ms` / `bucket_count` — per-command measured time classified as
+  `test`, `build`, `vcs`, `mixed` or `other`. Classification reads every
+  segment and consumes wrapper arguments, so `timeout 25m go test ./...` is
+  `test` and `git commit -m "go test is slow"` is `vcs`.
+- `commands`, `in_flight` (still running at close — their time is counted),
+  `unpaired` (a result whose call id was never opened), `tool_events`
+  (non-shell tool activity such as `file_change`), `id_collisions`, and
+  `dropped_bytes` (from a capped over-long unterminated line).
+- `attempt` — the job's lifecycle generation, because `job retry` re-delivers
+  the same job id.
+- `coverage` — **read this before the buckets.** `decomposed` means the runtime
+  emits per-tool events (Codex, Kimi). `opaque_runtime` means it does not:
+  Claude reports one final envelope and no tool events, so an opaque row has
+  zero commands however long the job took. That is a blind spot, not a
+  measurement that the job spent its time outside commands.
+
 `job transcript <job-id> --export md` remains the deterministic, ANSI-free
 Markdown snapshot. `--export jsonl` emits schema-versioned, self-contained
 trajectory rows for every normalized event. Bulk export requires the explicit

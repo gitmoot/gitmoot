@@ -19,7 +19,9 @@ import (
 // phaseProfileEventKind is the job-event kind carrying a review's command-phase
 // decomposition (#1824). Event kinds are free-form strings, so this needs no
 // store schema change and no edit to internal/db.
-const phaseProfileEventKind = "phase_profile"
+// The kind is defined in internal/db because the operator-facing SQL that must
+// EXCLUDE it lives there (#1824 review F6).
+const phaseProfileEventKind = db.PhaseProfileEventKind
 
 // Phase buckets. These classify a command's OWN measured time. They do not
 // partition the run on their own - see phaseProfile for the identity that does.
@@ -149,6 +151,92 @@ func splitCommandSegments(command string) []string {
 	return segments
 }
 
+// consumeWrapperArguments drops a wrapper's own flags and, for wrappers that
+// take a positional operand of their own, that operand too. It stops at the
+// first token that is neither, which is the wrapped command.
+func consumeWrapperArguments(wrapper string, fields []string) []string {
+	for len(fields) > 0 {
+		token := strings.Trim(fields[0], "'\"")
+		if strings.HasPrefix(token, "-") {
+			// `-u nobody`, `-n 5`, `-p`, `--preserve-status`, `-o L`: a flag may
+			// or may not take a value. Consume a following NON-FLAG token only
+			// when the flag is not a known standalone boolean, which keeps
+			// `time -p go test` correct (-p takes nothing) and `sudo -u nobody`
+			// correct (-u takes a user).
+			fields = fields[1:]
+			if flagTakesValue(wrapper, token) && len(fields) > 0 && !strings.HasPrefix(fields[0], "-") {
+				fields = fields[1:]
+			}
+			continue
+		}
+		if wrapper == "timeout" && isDurationOperand(token) {
+			// timeout's first positional argument is a duration, not a command.
+			fields = fields[1:]
+			continue
+		}
+		return fields
+	}
+	return fields
+}
+
+// flagTakesValue reports whether a wrapper flag consumes the following token.
+// Unknown flags are treated as value-taking ONLY when the wrapper is known to
+// use that shape, so a boolean flag never swallows the wrapped command.
+func flagTakesValue(wrapper, flag string) bool {
+	if strings.Contains(flag, "=") {
+		return false
+	}
+	switch wrapper {
+	case "sudo":
+		return flag == "-u" || flag == "-g" || flag == "-U" || flag == "--user" || flag == "--group"
+	case "nice", "ionice":
+		return flag == "-n" || flag == "-c" || flag == "--adjustment"
+	case "timeout":
+		return flag == "-s" || flag == "-k" || flag == "--signal" || flag == "--kill-after"
+	case "xargs":
+		return flag == "-n" || flag == "-P" || flag == "-I" || flag == "-d"
+	case "stdbuf":
+		return flag == "-i" || flag == "-o" || flag == "-e"
+	case "time":
+		// GNU time's -f/-o take values; -p and -v do not.
+		return flag == "-f" || flag == "-o" || flag == "--format" || flag == "--output"
+	}
+	return false
+}
+
+// isDurationOperand reports whether a token is a bare timeout duration such as
+// 25m, 90, 1.5h or 30s. It deliberately does NOT match a command name.
+func isDurationOperand(token string) bool {
+	if token == "" {
+		return false
+	}
+	body := strings.TrimRight(token, "smhd")
+	if body == "" || body == token && !isAllDigitsOrDot(token) {
+		return false
+	}
+	return isAllDigitsOrDot(body)
+}
+
+func isAllDigitsOrDot(token string) bool {
+	if token == "" {
+		return false
+	}
+	dots := 0
+	for _, r := range token {
+		switch {
+		case r >= '0' && r <= '9':
+		case r == '.':
+			dots++
+			if dots > 1 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // classifyCommandSegment classifies one segment, or returns "" for pure
 // plumbing (cd, export, an env-only line) that should not colour the result.
 func classifyCommandSegment(segment string) string {
@@ -168,9 +256,20 @@ func classifyCommandSegment(segment string) string {
 			plumbing = true
 			continue
 		}
-		switch normalize(fields[0]) {
-		case "bash", "sh", "zsh", "env", "-c", "-lc", "-lic", "time", "nice", "nohup", "sudo", "xargs":
+		switch head := normalize(fields[0]); head {
+		case "bash", "sh", "zsh", "env", "-c", "-lc", "-lic", "nohup":
 			fields = fields[1:]
+			continue
+		case "timeout", "time", "nice", "sudo", "xargs", "stdbuf", "ionice":
+			// A WRAPPER OWNS ITS OWN ARGUMENTS. Skipping only the wrapper token
+			// left `timeout 25m go test ./...` classified as other - and that is
+			// this repository's own documented gate shape, so the bucket under
+			// investigation was the one being undercounted (#1824 review F8).
+			// Consume the wrapper, then its flags, then the one non-flag operand
+			// those flags take (timeout's duration, sudo -u's user is already a
+			// flag value, nice -n's level likewise).
+			fields = fields[1:]
+			fields = consumeWrapperArguments(head, fields)
 			continue
 		case "cd", "export", "pushd", "popd", "source", "mkdir", "rm", "cp", "mv", "echo", "set":
 			return ""
@@ -241,9 +340,21 @@ type phaseProfile struct {
 	// visible instead of silently short-measuring the run.
 	Unpaired int `json:"unpaired"`
 	// ToolEvents counts non-shell tool results (file_change and friends).
-	ToolEvents  int              `json:"tool_events"`
-	BucketMS    map[string]int64 `json:"bucket_ms"`
-	BucketCount map[string]int   `json:"bucket_count"`
+	ToolEvents int `json:"tool_events"`
+	// InFlight counts commands still running when the transcript closed. Their
+	// measured-so-far time IS counted, because leaving it out silently moved a
+	// killed review's command time into residual and reported the run as idle.
+	InFlight int `json:"in_flight"`
+	// IDCollisions counts tool calls arriving on an id that was already open.
+	// The FIRST call is kept: overwriting it made the first result adopt the
+	// second command's text, which is the same misattribution the id pairing
+	// was introduced to remove.
+	IDCollisions int `json:"id_collisions"`
+	// DroppedBytes counts bytes discarded from an over-long unterminated line.
+	// Without a cap the pending buffer grows without bound inside the daemon.
+	DroppedBytes int64            `json:"dropped_bytes"`
+	BucketMS     map[string]int64 `json:"bucket_ms"`
+	BucketCount  map[string]int   `json:"bucket_count"`
 }
 
 type pendingCommand struct {
@@ -276,16 +387,29 @@ type retainedTranscript struct {
 
 	translator transcript.Translator
 	pending    map[string]pendingCommand
-	intervals  []commandInterval
-	partial    []byte
-	started    time.Time
+	// nonShellCalls remembers ids opened by NON-shell tools, so a result whose
+	// id was never opened at all can be told apart from a file_change - the
+	// distinction between a lost pairing and ordinary tool activity.
+	nonShellCalls map[string]struct{}
+	intervals     []commandInterval
+	partial       []byte
+	started       time.Time
 
-	bucketNS    map[string]int64
-	bucketCount map[string]int
-	commands    int
-	unpaired    int
-	toolEvents  int
+	bucketNS     map[string]int64
+	bucketCount  map[string]int
+	commands     int
+	unpaired     int
+	toolEvents   int
+	inFlight     int
+	idCollisions int
+	droppedBytes int64
 }
+
+// maxPartialLineBytes caps the buffer held for a line that has not yet ended.
+// Streams are newline-delimited JSON, so a line longer than this is malformed
+// or hostile; retaining it unboundedly is a memory defect in the daemon, and a
+// 1 MiB line carries no command the profile can describe anyway.
+const maxPartialLineBytes = 1 << 20
 
 // newRetainedTranscript attaches the phase instrument to an open transcript
 // file. A job whose runtime is unknown, or whose runtime emits no tool events,
@@ -293,15 +417,16 @@ type retainedTranscript struct {
 // indistinguishable from a fast run.
 func newRetainedTranscript(file *os.File, jobID, jobType, runtimeName string, attempt int64, store *db.Store) *retainedTranscript {
 	handle := &retainedTranscript{
-		sink:        file,
-		closer:      file,
-		store:       store,
-		jobID:       jobID,
-		attempt:     attempt,
-		started:     time.Now(),
-		pending:     map[string]pendingCommand{},
-		bucketNS:    map[string]int64{},
-		bucketCount: map[string]int{},
+		sink:          file,
+		closer:        file,
+		store:         store,
+		jobID:         jobID,
+		attempt:       attempt,
+		started:       time.Now(),
+		pending:       map[string]pendingCommand{},
+		nonShellCalls: map[string]struct{}{},
+		bucketNS:      map[string]int64{},
+		bucketCount:   map[string]int{},
 	}
 	if file == nil {
 		handle.sink = nil
@@ -357,6 +482,14 @@ func (r *retainedTranscript) Write(p []byte) (int, error) {
 
 func (r *retainedTranscript) observe(p []byte) {
 	r.partial = append(r.partial, p...)
+	if len(r.partial) > maxPartialLineBytes {
+		// Drop the oversized fragment rather than grow forever, and RECORD the
+		// loss: a silently dropped fragment would under-count commands while
+		// the profile still looked complete.
+		r.droppedBytes += int64(len(r.partial))
+		r.partial = nil
+		return
+	}
 	// Scan the BYTES. An earlier form called string(r.partial) once per
 	// iteration, copying the whole pending buffer per line - measured at 25x
 	// the bare write path. An instrument built to measure cost must not be the
@@ -377,23 +510,52 @@ func (r *retainedTranscript) consume(events []transcript.Event) {
 		switch event.Kind {
 		case transcript.KindToolCall:
 			if !isShellToolName(event.Name) {
+				// Remember the id anyway. At result time an unknown id must
+				// mean "a pairing was lost", and without this a file_change
+				// result would be indistinguishable from one (#1824 review F9
+				// wanted the opposite error fixed; both need the id, not a
+				// guess from the result's name).
+				if id := strings.TrimSpace(event.ToolID); id != "" {
+					r.nonShellCalls[id] = struct{}{}
+				}
 				continue
 			}
 			// Pair by TOOL ID. Arrival order is wrong the moment two tools
 			// overlap: a probe where vcs finished first swapped the two
 			// durations outright (#1824 review F1).
+			if _, open := r.pending[event.ToolID]; open {
+				// Keep the FIRST call. Overwriting made the next result adopt
+				// this command's text and bill one command's time to the other
+				// bucket entirely.
+				r.idCollisions++
+				continue
+			}
 			r.pending[event.ToolID] = pendingCommand{
 				command: extractToolCommand(event.InputDigest),
 				tool:    event.Name,
 				started: time.Now(),
 			}
 		case transcript.KindToolResult:
-			if !isShellToolName(event.Name) {
-				r.toolEvents++
-				continue
-			}
+			// THE ID DECIDES FIRST. Kimi names a result whose call it never saw
+			// "tool" (internal/transcript/translate.go), so a shell-ness test
+			// ahead of the id lookup filed a genuinely unpaired result as a
+			// non-shell tool event and left unpaired at zero - contradicting
+			// the documented meaning of both fields (#1824 review F9).
 			call, ok := r.pending[event.ToolID]
 			if !ok {
+				if id := strings.TrimSpace(event.ToolID); id != "" {
+					if _, seen := r.nonShellCalls[id]; seen {
+						delete(r.nonShellCalls, id)
+						r.toolEvents++
+						continue
+					}
+				} else if !isShellToolName(event.Name) {
+					r.toolEvents++
+					continue
+				}
+				// The id was never opened by any call, so a pairing is
+				// genuinely lost. Kimi names such a result "tool", which is why
+				// this decision must not consult the name (#1824 review F9).
 				r.unpaired++
 				continue
 			}
@@ -428,6 +590,7 @@ func (r *retainedTranscript) Close() error {
 			r.partial = nil
 		}
 		r.consume(r.translator.Flush())
+		r.closeInFlight(time.Now())
 		r.emit()
 	}
 	if r.closer == nil {
@@ -461,6 +624,22 @@ func unionNS(intervals []commandInterval) int64 {
 	return total.Nanoseconds()
 }
 
+// closeInFlight attributes commands that were still running when the transcript
+// closed. Their time is real - a review killed or timing out mid-`go test` spent
+// it - and leaving the interval out moved it into residual, reporting the run as
+// idle exactly when it was busiest.
+func (r *retainedTranscript) closeInFlight(now time.Time) {
+	for id, call := range r.pending {
+		delete(r.pending, id)
+		bucket := classifyPhaseCommand(call.command)
+		r.bucketNS[bucket] += now.Sub(call.started).Nanoseconds()
+		r.bucketCount[bucket]++
+		r.intervals = append(r.intervals, commandInterval{start: call.started, end: now})
+		r.commands++
+		r.inFlight++
+	}
+}
+
 func (r *retainedTranscript) emit() {
 	if r.store == nil || strings.TrimSpace(r.jobID) == "" {
 		return
@@ -482,38 +661,27 @@ func (r *retainedTranscript) emit() {
 		// a negative residual is exactly what this rewrite removes.
 		coveredNS = wallNS
 	}
-	roundMS := func(ns int64) int64 {
-		return (ns + int64(time.Millisecond)/2) / int64(time.Millisecond)
-	}
-	bucketMS := make(map[string]int64, len(r.bucketNS))
-	for bucket, ns := range r.bucketNS {
-		bucketMS[bucket] = roundMS(ns)
-	}
-	wall := roundMS(wallNS)
-	covered := roundMS(coveredNS)
-	if covered > wall {
-		covered = wall
-	}
+	bucketMS, wall, covered, overlap := phaseProfileMilliseconds(r.bucketNS, wallNS, coveredNS, summedNS)
 	coverage := phaseCoverageDecomposed
 	if !runtimeEmitsToolEvents(r.runtime) {
 		coverage = phaseCoverageOpaque
 	}
 	profile := phaseProfile{
-		Coverage:    coverage,
-		Runtime:     strings.TrimSpace(r.runtime),
-		Attempt:     r.attempt,
-		WallMS:      wall,
-		CoveredMS:   covered,
-		ResidualMS:  wall - covered,
-		OverlapMS:   roundMS(summedNS - coveredNS),
-		Commands:    r.commands,
-		Unpaired:    r.unpaired,
-		ToolEvents:  r.toolEvents,
-		BucketMS:    bucketMS,
-		BucketCount: r.bucketCount,
-	}
-	if profile.OverlapMS < 0 {
-		profile.OverlapMS = 0
+		Coverage:     coverage,
+		Runtime:      strings.TrimSpace(r.runtime),
+		Attempt:      r.attempt,
+		WallMS:       wall,
+		CoveredMS:    covered,
+		ResidualMS:   wall - covered,
+		OverlapMS:    overlap,
+		Commands:     r.commands,
+		Unpaired:     r.unpaired,
+		ToolEvents:   r.toolEvents,
+		InFlight:     r.inFlight,
+		IDCollisions: r.idCollisions,
+		DroppedBytes: r.droppedBytes,
+		BucketMS:     bucketMS,
+		BucketCount:  r.bucketCount,
 	}
 	encoded, err := json.Marshal(profile)
 	if err != nil {
@@ -526,6 +694,31 @@ func (r *retainedTranscript) emit() {
 		Kind:    phaseProfileEventKind,
 		Message: string(encoded),
 	})
+}
+
+// phaseProfileMilliseconds converts the nanosecond accounting into the emitted
+// millisecond fields. It is a PURE FUNCTION so the arithmetic can be tested on
+// exact inputs: a +1ms per-bucket bias survived the end-to-end tests, whose
+// tolerance was necessarily loose because real durations are not deterministic
+// (#1824 review F10).
+func phaseProfileMilliseconds(bucketNS map[string]int64, wallNS, coveredNS, summedNS int64) (map[string]int64, int64, int64, int64) {
+	roundMS := func(ns int64) int64 {
+		if ns <= 0 {
+			return 0
+		}
+		return (ns + int64(time.Millisecond)/2) / int64(time.Millisecond)
+	}
+	bucketMS := make(map[string]int64, len(bucketNS))
+	for bucket, ns := range bucketNS {
+		bucketMS[bucket] = roundMS(ns)
+	}
+	wall := roundMS(wallNS)
+	covered := roundMS(coveredNS)
+	if covered > wall {
+		covered = wall
+	}
+	overlap := roundMS(summedNS - coveredNS)
+	return bucketMS, wall, covered, overlap
 }
 
 // sortedBuckets is used by tests and by any reader that wants deterministic
