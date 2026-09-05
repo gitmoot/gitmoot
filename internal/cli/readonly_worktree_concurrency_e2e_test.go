@@ -1,3 +1,5 @@
+//go:build e2e
+
 package cli
 
 import (
@@ -208,24 +210,6 @@ func drivePoolConcurrently(t *testing.T, ctx context.Context, worker jobWorker, 
 	close(stop)
 	<-done
 	return bothRunning
-}
-
-// terminalJobDecision returns a terminal job and its parsed gitmoot_result decision.
-func terminalJobDecision(t *testing.T, ctx context.Context, store *db.Store, jobID string) (db.Job, string) {
-	t.Helper()
-	job, err := store.GetJob(ctx, jobID)
-	if err != nil {
-		t.Fatalf("GetJob(%s): %v", jobID, err)
-	}
-	payload, err := daemonJobPayload(job)
-	if err != nil {
-		t.Fatalf("payload(%s): %v", jobID, err)
-	}
-	decision := ""
-	if payload.Result != nil {
-		decision = payload.Result.Decision
-	}
-	return job, decision
 }
 
 // TestReadOnlyWorktreeConcurrentAsksE2E is the primary #739 proof: two BACKGROUND

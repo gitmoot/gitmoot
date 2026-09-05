@@ -13,7 +13,12 @@ name: CI
 #     run everything.
 #   - BUILD / VET / TEST: build, generated-contract check, vet, and plain
 #     `go test ./...` stay together with the partition-script self-test as the
-#     non-race gate.
+#     non-race gate. Since #1760 step 3 this lane runs the UNTAGGED tests only:
+#     36 e2e/live files carry `//go:build e2e` and are invisible without it.
+#   - E2E: the same `go test ./...` WITH `-tags e2e`, which is the only lane that
+#     compiles those 36 files. Tagging them without this job would have stopped
+#     them running forever, silently, and a green suite is exactly what that
+#     failure looks like.
 #   - RACE BUILD: five package jobs compile one -race test binary each. Every
 #     package's full current test list is partitioned and asserted to appear
 #     exactly once before its binary + shard plan are uploaded.
@@ -109,6 +114,31 @@ jobs:
       - name: Test
         run: go test -timeout 25m ./...
 
+  e2e:
+    name: e2e (tagged)
+    needs: changes
+    # Skipped on dep-only PRs for the same reason as the race lanes (#754).
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # THE ONLY LANE THAT COMPILES THE TAGGED FILES. `./...` rather than the
+      # three packages that hold them today, because a package list would silently
+      # stop covering a tagged file added to a fourth package later — the same
+      # silent-stop this job exists to prevent, one level up. The cost is that the
+      # untagged tests run here a second time; that is the price of a lane that
+      # cannot drift, and it runs concurrently with build-test rather than after.
+      - name: Test (e2e tag)
+        run: go test -tags e2e -timeout 30m ./...
+
   race-build:
     name: race build (internal/${{ matrix.package }})
     needs: changes
@@ -148,7 +178,13 @@ jobs:
           bundle="$RUNNER_TEMP/race-$PACKAGE"
           mkdir -p "$bundle/partitions"
 
-          go test -c -race -o "$bundle/$PACKAGE.test" "./internal/$PACKAGE/"
+          # -tags e2e is REQUIRED here, not optional: without it this compile
+          # silently drops the 33 tagged internal/cli files (plus 2 in workflow
+          # and 1 in daemon) from the race binary, and the shard plan derived
+          # from `-test.list` would shrink to match with nothing failing. That is
+          # the same silent-stop as tagging with no runner, one layer down. Race
+          # coverage is therefore byte-for-byte what it was before the tag.
+          go test -c -race -tags e2e -o "$bundle/$PACKAGE.test" "./internal/$PACKAGE/"
           # `go tool -n` resolves the matching test2json executable even when
           # the Go distribution materializes it in the build cache on demand.
           cp "$(go tool -n test2json)" "$bundle/test2json"
