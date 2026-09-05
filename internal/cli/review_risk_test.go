@@ -154,6 +154,10 @@ func TestApplyReviewPolicyInvalidRepoSeverityOverridesPermissiveGlobal(t *testin
 }
 
 func TestApplyReviewPolicyEmptyHomeIsOff(t *testing.T) {
+	// applyReviewPolicy("") resolves config.DefaultPaths() from $HOME, so without
+	// this the assertions below read the operator's live ~/.gitmoot/config.toml
+	// and a host with [review] set turns the whole package red (#1924).
+	t.Setenv("HOME", t.TempDir())
 	var engine workflow.Engine
 	applyReviewPolicy(&engine, "")
 	if engine.RiskTiersEnabled {
