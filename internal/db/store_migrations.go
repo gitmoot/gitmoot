@@ -2604,4 +2604,107 @@ DROP TABLE IF EXISTS cockpit_panes;
 DROP TABLE IF EXISTS cockpit_workspaces;
 DROP TABLE IF EXISTS interactive_prompts;
 	`,
+	// #1822 findings ledger. One row per (finding, head) OBSERVATION. The key is
+	// (finding_uid, head_sha) so the SAME finding at two heads is two rows and
+	// nothing is ever silently carried; there is deliberately no column meaning
+	// "still true". head_sha is CHECKed as 40 hex because an abbreviation reads as
+	// proof it is not. finding_uid is minted by the store, never by the reviewer:
+	// measured on #1783, reviewers number findings per round and F-1 named four
+	// different defects across four rounds, so an obligation keyed on a
+	// reviewer-supplied label is discharged by a coincidence of naming.
+	// round_label keeps that label for humans and is matched on by nothing.
+	`
+CREATE TABLE review_finding_observations (
+	finding_uid TEXT NOT NULL,
+	repo TEXT NOT NULL,
+	pull_request INTEGER NOT NULL DEFAULT 0,
+	head_sha TEXT NOT NULL CHECK(length(head_sha) = 40 AND head_sha GLOB '[0-9a-f]*'),
+	observed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+	observer_job TEXT NOT NULL DEFAULT '',
+	state TEXT NOT NULL CHECK(state IN ('open','answered','withdrawn','superseded')),
+	severity TEXT NOT NULL DEFAULT '',
+	round_label TEXT NOT NULL DEFAULT '',
+	label_absent INTEGER NOT NULL DEFAULT 0,
+	title TEXT NOT NULL DEFAULT '',
+	detail TEXT NOT NULL DEFAULT '',
+	file TEXT NOT NULL DEFAULT '',
+	line INTEGER NOT NULL DEFAULT 0,
+	relevance_keys TEXT NOT NULL DEFAULT '[]',
+	evidence_kind TEXT NOT NULL CHECK(evidence_kind IN ('EXECUTED','STATIC','QUOTED')),
+	executed_commands TEXT NOT NULL DEFAULT '[]',
+	executed_count INTEGER NOT NULL DEFAULT 0,
+	evidence_locator TEXT NOT NULL DEFAULT '',
+	rationale TEXT NOT NULL DEFAULT '',
+	source_job TEXT NOT NULL DEFAULT '',
+	withdraw_reason TEXT NOT NULL DEFAULT '',
+	PRIMARY KEY (finding_uid, head_sha)
+);
+
+CREATE INDEX idx_review_findings_pr ON review_finding_observations(repo, pull_request, observed_at);
+	`,
+	// #1850 round 2 F3. The previous head EDITED the #1822 migration in place, and
+	// Migrate iterates POSITIONALLY and skips any version already recorded in
+	// schema_migrations - so every database that ran the prior head kept the
+	// pre-fix table forever, including every developer and reviewer daemon on this
+	// box. The reviewer proved it: recreating the pre-fix table with the version
+	// still marked applied and running a full Migrate left PRIMARY KEY
+	// (finding_uid, head_sha) and the first-character-only hex CHECK in place, so
+	// F8's second-reviewer fix and F9's CHECK fix reached nothing.
+	//
+	// This is the append-only remedy the file's own comments demand a dozen times.
+	// It rebuilds the table with BOTH corrections and copies every existing row.
+	// It is idempotent for a fresh database too: the additive migration above
+	// created the old shape, this one replaces it, and the end state is identical
+	// either way, so there is exactly ONE table definition a reader must trust.
+	//
+	// THE COPY IS FILTERED, AND THE PROOF IS WHY. My first version copied every
+	// row, and TestReviewFindingRebuildUpgradesAPreFixDatabase failed with
+	// 'CHECK constraint failed' - because the OLD check pinned only the first
+	// character, so a pre-fix table can hold a head the NEW check rejects, and an
+	// aborting migration leaves a daemon unable to start. That is strictly worse
+	// than the defect being fixed, and I found it only because the directive
+	// demanded an upgrade proof from a pre-fix database rather than a fresh one.
+	//
+	// A DROPPED ROW COULD NOT HAVE COME FROM THIS STORE: RecordReviewFindingObservation
+	// has always rejected anything but a 40-hex head via headSHAPattern, on every
+	// write, since the first version. So a non-conforming row can only have been
+	// inserted by direct SQL, and preserving hand-written junk at the cost of
+	// wedging startup is the wrong trade.
+	`
+CREATE TABLE review_finding_observations_1850 (
+	finding_uid TEXT NOT NULL,
+	repo TEXT NOT NULL,
+	pull_request INTEGER NOT NULL DEFAULT 0,
+	head_sha TEXT NOT NULL CHECK(length(head_sha) = 40 AND NOT head_sha GLOB '*[^0-9a-f]*'),
+	observed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+	observer_job TEXT NOT NULL DEFAULT '',
+	state TEXT NOT NULL CHECK(state IN ('open','answered','withdrawn','superseded')),
+	severity TEXT NOT NULL DEFAULT '',
+	round_label TEXT NOT NULL DEFAULT '',
+	label_absent INTEGER NOT NULL DEFAULT 0,
+	title TEXT NOT NULL DEFAULT '',
+	detail TEXT NOT NULL DEFAULT '',
+	file TEXT NOT NULL DEFAULT '',
+	line INTEGER NOT NULL DEFAULT 0,
+	relevance_keys TEXT NOT NULL DEFAULT '[]',
+	evidence_kind TEXT NOT NULL CHECK(evidence_kind IN ('EXECUTED','STATIC','QUOTED')),
+	executed_commands TEXT NOT NULL DEFAULT '[]',
+	executed_count INTEGER NOT NULL DEFAULT 0,
+	evidence_locator TEXT NOT NULL DEFAULT '',
+	rationale TEXT NOT NULL DEFAULT '',
+	source_job TEXT NOT NULL DEFAULT '',
+	withdraw_reason TEXT NOT NULL DEFAULT '',
+	PRIMARY KEY (finding_uid, head_sha, observer_job)
+);
+INSERT INTO review_finding_observations_1850 SELECT
+	finding_uid, repo, pull_request, head_sha, observed_at, observer_job, state,
+	severity, round_label, label_absent, title, detail, file, line,
+	relevance_keys, evidence_kind, executed_commands, executed_count,
+	evidence_locator, rationale, source_job, withdraw_reason
+FROM review_finding_observations
+WHERE length(head_sha) = 40 AND NOT head_sha GLOB '*[^0-9a-f]*';
+DROP TABLE review_finding_observations;
+ALTER TABLE review_finding_observations_1850 RENAME TO review_finding_observations;
+CREATE INDEX IF NOT EXISTS idx_review_findings_pr ON review_finding_observations(repo, pull_request, observed_at);
+`,
 }

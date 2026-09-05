@@ -311,6 +311,12 @@ type Engine struct {
 	// wired only in cli (a GitHub read), keeping the engine free of the github
 	// client coupling.
 	PullRequestSignals func(ctx context.Context, repo string, number int) (labels []string, changedPaths []string, err error)
+	// LedgerResolvers is the #1822 ledger's SHARED resolver value. The merge gate
+	// holds the SAME value, assigned from one construction in the daemon, so the
+	// review brief and the gate cannot compute different obligation sets. Two
+	// review rounds wedged on that divergence while three comments asserted the
+	// equality, so it is now one field rather than one promise.
+	LedgerResolvers LedgerResolvers
 	// ReviewChangedFiles resolves the repository-relative files changed from the
 	// exact head a reviewer last saw to the current PR head. A scoped follow-up
 	// never degrades SILENTLY: when this seam is unavailable or cannot scope the

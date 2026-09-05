@@ -602,6 +602,22 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			return err
 		}
 		if latest != "" && strings.TrimSpace(payload.ReviewRound) != latest {
+			// #1850 round 2 F7. A reviewer whose round was superseded WHILE STILL
+			// RUNNING found a real defect at a real head, and a later round label
+			// does not make that defect untrue. Dropping it here was silent: no
+			// ledger row, no recorded event, and the stale verdict is discarded
+			// too, so the finding was unrecoverable - which contradicts this
+			// writer's own doctrine that a silent skip is indistinguishable from a
+			// successful write, and loses exactly the finding a later round most
+			// needs reminding of.
+			//
+			// The observations are keyed by the STALE round's own head, so they
+			// can never discharge anything at the current head, and this runs
+			// AFTER effectiveDecision is computed and BEFORE any state change, so
+			// a stale round still cannot influence the decision.
+			if err := e.RecordReviewFindingsToLedger(ctx, job, payload); err != nil {
+				return err
+			}
 			return nil
 		}
 		// Pipeline-sender reviews already returned above as report-only, so this is
@@ -609,6 +625,18 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		// anyway keeps the invariant LOCAL rather than dependent on that distant
 		// early return surviving future edits.
 		effectiveDecision = effectiveReviewDecisionForPayload(payload, e.reviewBlockingSeverity(payload.Repo))
+		// THE #1822 LEDGER'S PRODUCTION WRITER (#1850 review F1). This is the only
+		// place a review's findings become ledger observations, and without it the
+		// entire feature was inert at runtime: every guard passed against a table
+		// nothing ever wrote. It runs for the CURRENT round only (the staleness
+		// check above already returned for a superseded round) and it never fails
+		// the review, because a real verdict must not be discarded over a ledger
+		// row. Placed BEFORE the blocked/failed early return would record findings
+		// from a review that never ran; placed here it records exactly the reviews
+		// whose verdicts the gate will later read.
+		if err := e.RecordReviewFindingsToLedger(ctx, job, payload); err != nil {
+			return err
+		}
 	}
 	if payload.Result.Decision == "blocked" || payload.Result.Decision == "failed" {
 		return e.block(ctx, ref, payload.Result.Summary)

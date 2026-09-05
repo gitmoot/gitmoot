@@ -113,6 +113,11 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 	// so a >300-file follow-up is only scopable by enumerating it with local git.
 	// With no checkout the seam still installs and fails closed instead.
 	wireReviewChangedFiles(&engine, gh, checkout, runner)
+	// #1850 rounds 2 and 3 both wedged because the review brief and the merge gate
+	// built the ledger's scope from DIFFERENT inputs while three comments claimed
+	// they were the same. ONE value is constructed here and handed to BOTH
+	// consumers, so no future wiring can supply one side and not the other.
+	engine.LedgerResolvers = daemonLedgerResolvers(gh, checkout, runner)
 	if strings.TrimSpace(home) != "" {
 		// Root delegation artifacts under GITMOOT_HOME (alongside worktrees)
 		// rather than inside the repo checkout, so generated briefs stay out of
@@ -971,6 +976,94 @@ func newDaemonPolicyMergeGateForRunner(store *db.Store, gh github.Client, checko
 		Worktrees:    jobGitClient(checkout, runner),
 		CheckoutPath: checkout,
 		DeleteBranch: true,
+		// THE SAME construction the engine gets. A field nothing sets is the same
+		// defect as a comment naming a call site that does not exist, and this
+		// pairing is the one that wedged twice (#1850 R2-F1 and R3-F1).
+		LedgerResolvers: daemonLedgerResolvers(gh, checkout, runner),
+	}
+}
+
+// daemonLedgerResolvers builds the ONE #1822 ledger resolver value that both the
+// review brief (via Engine.LedgerResolvers) and the merge gate (via
+// PolicyMergeGate.LedgerResolvers) hold. Having a single constructor is the
+// structural fix for #1850 R3-F1: the previous version had two call sites and
+// only one of them was ever wired, so the gate demanded obligations the brief
+// could not disclose and the merge wedged permanently.
+func daemonLedgerResolvers(gh github.Client, checkout string, runner subprocess.Runner) workflow.LedgerResolvers {
+	return workflow.LedgerResolvers{
+		ChangedSince:     daemonLedgerChangedFiles(gh, checkout, runner),
+		PathExistsAtHead: daemonLedgerPathExists(checkout, runner),
+	}
+}
+
+// daemonLedgerChangedFiles resolves the paths changed between two heads for the
+// ledger's relevance half. It reuses localReviewChangedFiles, the SAME
+// instrument the review-scope seam uses, which proves the range complete from
+// local objects and returns ReviewScopeUnavailableError when it can prove the
+// range is not a direct follow-up. The compare API is the fallback for a cold
+// checkout and fails closed on a capped page.
+//
+// A nil return here is deliberate when neither instrument is available: the
+// ledger then reports a DEGRADATION and leaves answered findings advisory,
+// rather than blocking a merge on a missing diff.
+func daemonLedgerChangedFiles(gh github.Client, checkout string, runner subprocess.Runner) func(context.Context, string, int, string, string) ([]string, error) {
+	checkout = strings.TrimSpace(checkout)
+	if gh == nil && checkout == "" {
+		return nil
+	}
+	return func(ctx context.Context, repo string, number int, previousHead string, currentHead string) ([]string, error) {
+		base, head := strings.TrimSpace(previousHead), strings.TrimSpace(currentHead)
+		if base == "" || head == "" {
+			return nil, fmt.Errorf("findings ledger scope needs both heads, got base=%q head=%q", base, head)
+		}
+		if base == head {
+			// The finding was answered AT this head, so nothing has changed since.
+			return nil, nil
+		}
+		if checkout != "" {
+			paths, err := localReviewChangedFiles(ctx, jobGitClient(checkout, runner), number, base, head)
+			if err == nil {
+				return paths, nil
+			}
+			var unavailable workflow.ReviewScopeUnavailableError
+			if errors.As(err, &unavailable) {
+				return nil, err
+			}
+		}
+		if gh == nil {
+			return nil, workflow.ReviewScopeUnavailableError{
+				Reason: "findings ledger scope has no local checkout and no GitHub client",
+			}
+		}
+		owner, name, ok := strings.Cut(strings.TrimSpace(repo), "/")
+		if !ok || owner == "" || name == "" {
+			return nil, fmt.Errorf("findings ledger scope: invalid repo %q", repo)
+		}
+		compare, err := gh.CompareCommits(ctx, github.Repository{Owner: owner, Name: name}, base, head)
+		if err != nil {
+			return nil, err
+		}
+		if compare.Truncated {
+			return nil, workflow.ReviewScopeUnavailableError{
+				Reason: fmt.Sprintf("findings ledger scope compare is capped at %d files", len(compare.Files)),
+			}
+		}
+		paths := make([]string, 0, len(compare.Files))
+		for _, file := range compare.Files {
+			paths = append(paths, file.Filename)
+		}
+		return sortedUniqueReviewPaths(paths), nil
+	}
+}
+
+// daemonLedgerPathExists resolves whether a cited locator still exists at a head.
+func daemonLedgerPathExists(checkout string, runner subprocess.Runner) func(context.Context, string, string) (bool, error) {
+	checkout = strings.TrimSpace(checkout)
+	if checkout == "" {
+		return nil
+	}
+	return func(ctx context.Context, head string, path string) (bool, error) {
+		return jobGitClient(checkout, runner).PathExistsAtRev(ctx, head, path)
 	}
 }
 

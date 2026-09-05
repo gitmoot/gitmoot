@@ -200,6 +200,47 @@ func (c Client) BranchExists(ctx context.Context, branch string) (bool, error) {
 	return true, nil
 }
 
+// PathExistsAtRev reports whether a repo-relative path exists in the tree at
+// rev, via `git cat-file -e <rev>:<path>`.
+//
+// It exists for the #1822 findings ledger: a STATIC discharge cites a locator,
+// and an answer whose cited path no longer exists at the head is not an answer
+// any more. The structural check on that locator lives at the store boundary,
+// which has no tree; this is the existence half.
+//
+// AN UNRESOLVABLE REV IS AN ERROR, NOT AN ABSENCE, AND THAT DISTINCTION IS THE
+// WHOLE POINT OF THIS METHOD'S SHAPE (#1850 round 2 F2, P1). My first version
+// swallowed EVERY non-zero exit as "absent". But cat-file also exits non-zero
+// when the REV is unknown to this checkout, which is the normal state after a
+// force-push, on a cold or stale checkout, and for a fork head. The ledger's
+// consumer branches on error-versus-absent, so a swallowed rev failure landed on
+// the ABSENT arm and re-armed every STATIC-answered finding as a spurious
+// obligation - turning an instrument outage into a merge block, the exact
+// inversion of the doctrine LedgerScope declares. Its own comment argued the
+// swallow was safe because some other layer distinguished them; no such layer
+// existed, which is the same false premise class as a comment naming a caller
+// that does not exist.
+//
+// So the rev is resolved FIRST and separately. A failure there returns an error
+// the caller can degrade on; only a resolvable rev reaches the path probe, where
+// a non-zero exit really does mean the path is not in that tree.
+func (c Client) PathExistsAtRev(ctx context.Context, rev string, path string) (bool, error) {
+	rev, path = strings.TrimSpace(rev), strings.TrimSpace(path)
+	if rev == "" || path == "" {
+		return false, fmt.Errorf("path existence needs both a rev and a path, got rev=%q path=%q", rev, path)
+	}
+	if strings.HasPrefix(path, "-") || strings.HasPrefix(rev, "-") {
+		return false, fmt.Errorf("refusing a rev or path that reads as a flag: rev=%q path=%q", rev, path)
+	}
+	if _, err := c.run(ctx, "rev-parse", "--verify", "--quiet", rev+"^{commit}"); err != nil {
+		return false, fmt.Errorf("rev %s does not resolve in %s: %w", rev, c.dir, err)
+	}
+	if _, err := c.run(ctx, "cat-file", "-e", rev+":"+path); err != nil {
+		return false, nil
+	}
+	return true, nil
+}
+
 // RemoteBranches returns the requested branches that exist on origin using one
 // exact-ref ls-remote call. Callers batch a bounded candidate set so stale-task
 // reconciliation never performs one subprocess/network round trip per task.

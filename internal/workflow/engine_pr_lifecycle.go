@@ -249,6 +249,15 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 		if scope != nil {
 			instructions = scopedReviewInstructions(event, scope)
 		}
+		// DISCLOSE THE LEDGER'S OBLIGATIONS IN THE BRIEF (#1850 review F1's other
+		// half). The gate refuses a verdict at this head while a prior finding
+		// carries no observation, and an obligation is dischargeable only by
+		// citing its uid - a value obtainable ONLY by being told it. Writing the
+		// ledger without disclosing it would convert the inert feature into a
+		// guard that blocks legitimate merges, which is strictly worse. Empty
+		// string on a PR with no ledger history, so the default brief is
+		// byte-identical.
+		instructions += e.ledgerObligationBrief(ctx, event.Repo, event.PullRequest, event.HeadSHA, event.TaskID)
 		request := JobRequest{
 			PolicyExempt: "exempt",
 			// #1250: fanout children were enqueued with NO attribution — measured at
@@ -458,7 +467,11 @@ func (e Engine) dispatchHighRiskReview(ctx context.Context, event PullRequestEve
 		return err
 	}
 
-	delegations := highRiskLensDelegations(reviewers, event, reviewScopes)
+	// #1850 round 2 F4: the lens path writes to the ledger via AdvanceJob, so it
+	// must disclose the ledger too or its rounds cannot discharge what the gate
+	// will demand.
+	delegations := highRiskLensDelegations(reviewers, event, reviewScopes,
+		e.ledgerObligationBrief(ctx, event.Repo, event.PullRequest, event.HeadSHA, event.TaskID))
 	if len(delegations) < 2 {
 		// Defensive: no reviewers to fan out to. Fall back to recording the baseline
 		// rather than silently dropping the PR (should not happen — callers guarantee

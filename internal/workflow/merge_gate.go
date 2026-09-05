@@ -105,6 +105,11 @@ type PolicyMergeGate struct {
 	// unchanged, then falls through to conclude no-CI so such PRs still merge instead
 	// of wedging forever. Zero means use the built-in default (defaultMaxCIWait).
 	MaxCIWait time.Duration
+	// LedgerResolvers is the #1822 ledger's SHARED resolver value, the SAME value
+	// the engine holds. Nil resolvers DEGRADE with a recorded note rather than
+	// either pretending or blocking, because the ledger's failure mode is "it did
+	// not remind you".
+	LedgerResolvers LedgerResolvers
 	// Clock is injectable for deterministic tests. Nil means time.Now.
 	Clock                      func() time.Time
 	taskClaimTTL               time.Duration
@@ -242,6 +247,19 @@ func (g PolicyMergeGate) mergeOutcomeConfirmationTimeout() time.Duration {
 // toward the grace path (never toward an instant no-CI stamp).
 type workflowAwareGitHub interface {
 	WorkflowsExistAtRef(ctx context.Context, repo github.Repository, ref string) (bool, error)
+}
+
+// ledgerScope binds the gate's SHARED resolvers. It is the SAME value and the
+// SAME binding call the review brief uses (Engine.ledgerScopeFor), which is why
+// the two cannot demand different obligation sets. Round 2 and round 3 both
+// wedged on that divergence while comments asserted the equality, so it is one
+// construction now rather than two plus a promise (#1850 round 3 item 1).
+//
+// TaskID travels as DATA and never as a store call: TestMergeGateStoreAccessSurface
+// pins the gate's *db.Store surface as a firewall, and an audit note is not
+// worth widening it.
+func (g PolicyMergeGate) ledgerScope(request MergeRequest) LedgerScope {
+	return g.LedgerResolvers.ScopeFor(request.Repo, request.PullRequest, request.TaskID)
 }
 
 func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (MergeDecision, error) {
@@ -795,6 +813,24 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			continue
 		}
 		reviewsAtHead = append(reviewsAtHead, review)
+	}
+	// #1822 findings ledger. A prior finding that carries no observation at THIS
+	// head blocks acceptance, so a ledger hit ADDS an obligation rather than
+	// removing one. That is what keeps the ledger from becoming a reviewer's only
+	// input: a round cannot trade a ledger read for a diff read.
+	//
+	// THE SCOPE IS SUPPLIED, NOT DEFERRED (#1850 review F4/A, both verdicts). The
+	// previous comment here promised that the relevance half was "enforced by the
+	// ledger's own acceptance call, which is made where the diff is already
+	// known" - THERE WAS NO SUCH CALL. A comment naming a call site that was
+	// never written is worse than silence, because it stops the next reader
+	// looking, and it is the same defect class as a finding label that names four
+	// different defects. The gate now passes a real scope: ChangedSince resolves
+	// per-finding ranges, PathExistsAtHead resolves cited locators, and a missing
+	// or failing resolver DEGRADES with a recorded note rather than either
+	// pretending or blocking.
+	if err := EnsureLedgerObligationsObserved(ctx, g.Store, request.Repo, int64(request.PullRequest), headSHA, g.ledgerScope(request)); err != nil {
+		return err
 	}
 	// Supersession is resolved BEFORE any state or verdict scan, and it covers a
 	// row in any state: a strictly later terminal verdict from the same reviewer
