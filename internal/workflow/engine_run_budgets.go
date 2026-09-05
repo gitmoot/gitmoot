@@ -797,6 +797,32 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		reviewer := reviewDecisionAgent(job, payload)
 		switch effectiveDecision {
 		case "changes_requested":
+			// #1524: an objection transitions the task ONLY when it describes the
+			// pull request's CURRENT head. #1871 bound the approving side
+			// (approvalSupersedesChangesRequested); this arm was left
+			// unconditional, so an objection at a superseded head still pulled a
+			// PR out of ready_to_merge over a commit the branch had moved past -
+			// and, because dispatchFix is called INLINE below, also dispatched a
+			// fix leg against findings about that superseded commit. Returning
+			// early refuses both in one place.
+			//
+			// THE GUARD IS DELIBERATELY ASYMMETRIC WITH THE APPROVAL SIDE, and the
+			// asymmetry is the safety argument rather than an oversight: an
+			// approval whose current head cannot be confirmed is refused
+			// TRANSIENTLY there, because admitting it could merge over a live
+			// objection and merging is irreversible. An objection is the
+			// conservative direction - it stops a merge - so when no observed pull
+			// request row records a head, this arm ADMITS rather than refusing.
+			// Refusing would block a legitimate objection on a PR the daemon has
+			// not polled yet, which is the CLI-dispatch path, and would make the
+			// engine's safest transition the one requiring the most evidence.
+			superseded, reason, err := e.objectionDescribesASupersededHead(ctx, payload)
+			if err != nil {
+				return err
+			}
+			if superseded {
+				return e.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_skipped_stale_head", Message: reason})
+			}
 			if err := e.setTaskState(ctx, ref, TaskChangesRequested); err != nil {
 				return err
 			}

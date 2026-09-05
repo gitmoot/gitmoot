@@ -863,3 +863,51 @@ func (e Engine) parkTaskAwaitingHumanMerge(ctx context.Context, ref taskRef, rea
 	// a merged, dismissed, or newly reviewed task from a stale gate result.
 	return nil
 }
+
+// objectionDescribesASupersededHead answers whether a changes_requested verdict
+// describes a commit the branch has already moved past (#1524).
+//
+// THE DEFECT: a verdict is evidence about a COMMIT, not about the branch. The
+// objection arm transitioned the task unconditionally, so an objection bound to
+// a superseded head pulled a PR out of ready_to_merge - and dispatched a fix leg
+// against findings about that superseded commit - which is the mirror of the
+// approval-side hole #1834/#1871 closed in approvalSupersedesChangesRequested
+// above. That fix bound only the approving side, leaving one rule with one
+// direction.
+//
+// The current head comes from the OBSERVED pull request row, the same source and
+// for the same reason as the approval side: `tasks` has no head column,
+// pull_requests.head_sha is maintained by the daemon poll, the PR lifecycle and
+// the merge gate, and ordering review rows would be unsound (ListJobs orders by
+// id and created_at has second granularity).
+//
+// UNKNOWN IS NOT SUPERSEDED, and that is the deliberate asymmetry with the
+// approval side. An approval whose current head cannot be confirmed is refused
+// TRANSIENTLY there, because admitting it could merge over a live objection and
+// a merge is irreversible. An objection is the conservative direction, so an
+// unconfirmable head admits here: refusing would block a legitimate objection on
+// a PR the daemon has not polled - reachable from the CLI dispatch path - and
+// would make the engine demand the most evidence for its safest transition.
+func (e Engine) objectionDescribesASupersededHead(ctx context.Context, payload JobPayload) (bool, string, error) {
+	objectionHead := strings.TrimSpace(payload.HeadSHA)
+	if objectionHead == "" || payload.PullRequest <= 0 {
+		// An unbound objection claims nothing about any commit, and a PR-less
+		// review is already terminal earlier in the advance path. Neither is a
+		// SUPERSEDED head, so neither is refused here.
+		return false, "", nil
+	}
+	pr, err := e.Store.GetPullRequest(ctx, payload.Repo, int64(payload.PullRequest))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, "", nil
+		}
+		return false, "", err
+	}
+	currentHead := strings.TrimSpace(pr.HeadSHA)
+	if currentHead == "" || currentHead == objectionHead {
+		return false, "", nil
+	}
+	return true, fmt.Sprintf(
+		"the objection is bound to head %s but the pull request's current head is %s; a verdict at a superseded head describes a commit the branch has moved past, so the task is not transitioned and no fix leg is dispatched",
+		objectionHead, currentHead), nil
+}
