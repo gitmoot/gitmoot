@@ -2,6 +2,7 @@ package cli
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -245,5 +246,107 @@ func TestReadOnlyGrantsStageTheToolchainThroughProduction(t *testing.T) {
 		if strings.Contains(strings.ToLower(dropped), "toolchain") {
 			t.Errorf("a toolchain diagnostic reached grants.dropped (%q), which is evented as a config narrowing", dropped)
 		}
+	}
+}
+
+// TestReadOnlySeatEnvKeepsRuntimeBinariesResolvable is #1918 AS A TEST.
+//
+// #1879 replaced the seat's PATH with a fixed list instead of extending the
+// inherited one, and every claude and kimi read-only seat stopped launching:
+// sandbox-exec resolves argv[0] with exec.LookPath BEFORE any Landlock rule is
+// applied (internal/sandbox/exec_linux.go), and the runtime binaries live in
+// neither /usr/local/bin nor /usr/bin. Measured boundary: gm-review-opus was
+// 11-for-11 before the deploy and 0-for-2 after.
+//
+// IT ASSERTS RESOLUTION, NOT THE PATH STRING. A test that greps the PATH value
+// for a directory passes on any list that happens to contain the substring,
+// including one whose entries do not hold the binaries; the failure this
+// reproduces is exec.LookPath returning ErrNotFound, so that is what is
+// exercised. The go arm is the other half of the boundary: extending PATH must
+// not cost the toolchain pin, so `go` must still resolve INSIDE the staged copy
+// even though a different go sits earlier on the inherited PATH.
+func TestReadOnlySeatEnvKeepsRuntimeBinariesResolvable(t *testing.T) {
+	home := t.TempDir()
+	live := config.PathsForHome(home)
+
+	install := filepath.Join(t.TempDir(), "go1.26.4")
+	installBin := filepath.Join(install, "bin")
+	if err := os.MkdirAll(installBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(installBin, "go"), []byte("#!/bin/sh\necho go1.26.4\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(install, "VERSION"), []byte("go1.26.4\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(install, "go.env"), []byte("GOTOOLCHAIN=local\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two SEPARATE directories, because that is the shape on the live host:
+	// claude sits in /root/.local/bin and kimi in /root/.kimi-code/bin, so a fix
+	// that rescues one hardcoded directory would still strand the other.
+	claudeDir := t.TempDir()
+	kimiDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(claudeDir, "claude"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(kimiDir, "kimi"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", strings.Join([]string{installBin, claudeDir, kimiDir, "/usr/bin", "/bin"}, string(os.PathListSeparator)))
+
+	checkout := t.TempDir()
+	runGit(t, checkout, "init", "-b", "main")
+	runGit(t, checkout, "config", "user.email", "gitmoot@example.com")
+	runGit(t, checkout, "config", "user.name", "Gitmoot")
+	runGit(t, checkout, "commit", "--allow-empty", "-m", "init")
+
+	agent := runtime.Agent{
+		Name: "seat", Runtime: runtime.ClaudeRuntime, ReadOnlySeat: true,
+		RepoScope: "gitmoot/gitmoot",
+	}
+	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, "gitmoot/gitmoot", true)
+	if err != nil {
+		t.Fatalf("readOnlyRuntimeSandboxGrants: %v", err)
+	}
+
+	// The seat's effective PATH is the LAST PATH= in the env, because
+	// exec.Cmd dedups cmd.Env keeping the last occurrence of each key and
+	// grants.env is appended to os.Environ() by the subprocess runners.
+	seatPath := ""
+	for _, entry := range grants.env {
+		if strings.HasPrefix(entry, "PATH=") {
+			seatPath = strings.TrimPrefix(entry, "PATH=")
+		}
+	}
+	if seatPath == "" {
+		t.Fatalf("production set no PATH for the seat; env = %v", grants.env)
+	}
+	if !strings.Contains(seatPath, filepath.Join(toolchain.Root(live.Home))) {
+		t.Fatalf("seat PATH %q does not carry the staged toolchain, so this test is measuring the wrong environment", seatPath)
+	}
+
+	t.Setenv("PATH", seatPath)
+	for _, binary := range []string{"claude", "kimi"} {
+		resolved, lookErr := exec.LookPath(binary)
+		if lookErr != nil {
+			t.Errorf("seat PATH cannot resolve %q: %v\nsandbox-exec resolves argv[0] with exec.LookPath, so this is exactly the launch failure in #1918.\nseat PATH = %q", binary, lookErr, seatPath)
+			continue
+		}
+		if _, statErr := os.Stat(resolved); statErr != nil {
+			t.Errorf("resolved %q to %q, which does not exist: %v", binary, resolved, statErr)
+		}
+	}
+
+	// The pin must survive the widening: `go` resolves to the staged copy even
+	// though the operator's own installation sits earlier on the inherited PATH.
+	resolvedGo, err := exec.LookPath("go")
+	if err != nil {
+		t.Fatalf("seat PATH cannot resolve go: %v (PATH = %q)", err, seatPath)
+	}
+	if !pathWithin(resolvedGo, toolchain.Root(live.Home)) {
+		t.Errorf("go resolved to %q, outside the staged toolchain root %q: extending PATH must not cost the toolchain pin", resolvedGo, toolchain.Root(live.Home))
 	}
 }

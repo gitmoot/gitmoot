@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -56,12 +57,47 @@ func stageSeatToolchain(paths config.Paths) (string, []string, string) {
 	}
 	return staged, []string{
 		"GOROOT=" + staged,
-		"PATH=" + filepath.Join(staged, "bin") + ":/usr/local/bin:/usr/bin:/bin",
-		// The staged tree is the only toolchain the seat can see, so pin the
+		"PATH=" + seatPath(staged),
+		// The staged copy is the only toolchain the seat can BUILD with — it is
+		// first on PATH and the only Go tree under a read grant — so pin the
 		// selector too: an empty GOTOOLCHAIN invites the auto-download a
 		// sandboxed seat cannot complete.
 		"GOTOOLCHAIN=local",
 	}, ""
+}
+
+// seatPath puts the staged toolchain first and KEEPS the inherited PATH behind
+// it.
+//
+// WHY NOT A FIXED LIST (#1918). The first form of this returned
+// `<staged>/bin:/usr/local/bin:/usr/bin:/bin`, which does not extend PATH, it
+// REPLACES it: grants.env is appended to os.Environ() by the subprocess
+// runners and exec.Cmd dedups by key keeping the last occurrence, so that list
+// became the seat's whole PATH. Runtime binaries do not live in those three
+// directories — on the host that shipped it, `claude` is in /root/.local/bin
+// and `kimi` in /root/.kimi-code/bin — and sandbox-exec resolves argv[0] with
+// exec.LookPath BEFORE it installs any Landlock rule, so EVERY claude and kimi
+// read-only seat failed to launch with "executable file not found in $PATH".
+// Measured boundary: gm-review-opus was 11-for-11 in the fourteen hours before
+// the deploy and 0-for-2 after it.
+//
+// PATH IS NOT THE CONTAINMENT BOUNDARY, so widening it grants nothing: the
+// Landlock ruleset decides what a seat may read or execute, and a PATH entry
+// with no read grant behind it is simply an exec that fails. The pin is not
+// weakened either — the staged bin is first, so `go` resolves inside the copy
+// the daemon owns even when the operator's own installation is still on the
+// inherited PATH, and GOROOT plus GOTOOLCHAIN=local hold independently of
+// lookup order.
+//
+// An empty inherited PATH keeps the previous system defaults rather than
+// shipping a seat with only one directory on PATH.
+func seatPath(staged string) string {
+	stagedBin := filepath.Join(staged, "bin")
+	inherited := strings.TrimSpace(os.Getenv("PATH"))
+	if inherited == "" {
+		return stagedBin + ":/usr/local/bin:/usr/bin:/bin"
+	}
+	return stagedBin + string(os.PathListSeparator) + inherited
 }
 
 // pinnedToolchainRoot reports the installation root of an OPERATOR-PINNED
