@@ -217,60 +217,124 @@ func identifyRoot(root *os.Root) (Identity, error) {
 
 // A CALLER-SUPPLIED O_NOFOLLOW WOULD BE AN INERT BIT HERE, WHICH IS WHY THERE IS
 // NOT ONE. This package previously passed syscall.O_NOFOLLOW on every root-
-// relative open and claimed each flag was the only thing covering the
-// Lstat-to-open window below. THAT CLAIM WAS FALSE and a reviewer disproved it.
-// Read from the pinned toolchain's own source: os/root_unix.go:85 ORs
-// syscall.O_NOFOLLOW into the openat flags unconditionally, and line 91 then
-// calls checkSymlink, which resolves an in-root symlink and retries. So the flag
-// is already set whatever the caller passes, and the traversal happens anyway.
+// relative open and claimed each flag covered the Lstat-to-open window. THAT
+// CLAIM WAS FALSE and a reviewer disproved it. From the pinned toolchain's own
+// source, os/root_unix.go ORs syscall.O_NOFOLLOW into the openat flags at all
+// three call sites (:67, :85, :117) unconditionally, and :91 then calls
+// checkSymlink, which resolves an in-root symlink and retries. The flag is
+// already set whatever the caller passes.
 //
-// Measured independently before deleting them, with controls:
+// Measured before deleting them, with controls, for files AND directories:
 //
-//	in-root symlink, no caller flag    opened, body "followed"
-//	in-root symlink, caller O_NOFOLLOW opened, body "followed"   (identical)
-//	CONTROL escaping symlink           refused, "path escapes from parent", both ways
-//	CONTROL Lstat on the same name     still reports a symlink
+//	in-root file symlink, no caller flag    opened, body "followed"
+//	in-root file symlink, caller O_NOFOLLOW opened, body "followed"   identical
+//	in-root dir symlink, either way         opened, entries listed    identical
+//	CONTROL escaping symlink                refused, "path escapes from parent"
+//	CONTROL Lstat on the same name          still reports a symlink
 //
-// So they were behaviourally identical to the two duplicate guards deleted
-// elsewhere in this file, and are deleted for the same reason. Keeping them while
-// claiming they closed a race was a false evidence claim, not defence in depth.
+// openVerified below is what actually holds the line.
+
+// openVerified opens name anchored to root and PROVES the object it opened is the
+// same object the symlink check inspected.
 //
-// WHAT ACTUALLY REFUSES A SYMLINKED NAME is refuseSymlinkedName's Lstat, which
-// does not follow the final component. ELOOP is still mapped where it can occur,
-// but it means a symlink LOOP rather than a symlinked name: measured, os.Root
-// returns ELOOP for a self-referential or mutually-referential link and
-// "path escapes from parent" for an escaping one, both regardless of the flag.
+// WHY THE INODE COMPARISON EXISTS, and it is not defensive decoration: an earlier
+// version of this package did an Lstat to refuse symlinked names and then a
+// separate open, and documented the gap between them as bounded - "at worst a
+// duplicate of a file already being copied". THAT BOUND WAS WRONG. A reviewer
+// swapped go.env to an in-root symlink immediately after its successful Lstat,
+// aiming at a root file this package never selects, and the staged copy published
+// that file's contents AS go.env. I reproduced it by racing: a clean stage never
+// copies PRIVATE-NOTES, and a raced stage published its contents, on attempt 284
+// of 3000. os.Root prevents leaving the root; it does NOT constrain the target to
+// files the copy had selected.
 //
-// AND THE Lstat-TO-OPEN WINDOW IS THEREFORE UNCLOSED, stated plainly rather than
-// claimed shut. Nothing in this package closes it. What BOUNDS it is os.Root's
-// containment: a name swapped between the Lstat and the open can only resolve to
-// something inside the source installation, so the worst case is copying a
-// duplicate of a file that was already going to be copied. It is not an escape,
-// and no rule can close a window on a tree the daemon does not own.
+// It also composed with a decision that looked safe alone: the identity digest
+// covers only executables, so a NON-executable substitution passed post-copy
+// verification untouched. Neither the exec-set scope nor the Lstat gap implies
+// the exposure by itself.
 //
-// refuseSymlinkedName rejects a name whose FINAL COMPONENT is a symlink.
+// So the check runs on EVERY file this package opens from the source, not only
+// the executables, because a non-executable swap is exactly what got through.
+// Measured discriminator, with a positive control:
 //
-// MEASURED BEHAVIOUR OF os.Root, and it invalidated an assumption this package
-// started with: os.Root performs its OWN component-by-component resolution, so
-// O_NOFOLLOW applies to the resolved target rather than to the name given. A
-// symlinked VERSION was therefore followed and yielded a version from another
-// file, and a symlinked top-level member was copied rather than refused. Root's
-// resolution refuses only links that ESCAPE; links that stay inside are followed
-// by design. Lstat does not follow the final component, so it is what refuses.
+//	no swap                          os.SameFile(lstat, opened) = true
+//	name swapped to an in-root link  os.SameFile(lstat, opened) = FALSE
 //
-// STATED RESIDUAL: this is an Lstat followed by an open, so a name swapped
-// between the two is resolved by Root rather than by us. The consequence is
-// BOUNDED by Root itself - the swap can only point somewhere inside the same
-// source installation, so the worst case is copying a duplicate of a file that
-// was already going to be copied. It is not an escape, and no rule can close a
-// window on a tree the daemon does not own.
-func refuseSymlinkedName(root *os.Root, name string) error {
-	info, err := root.Lstat(name)
+// THE ALTERNATIVE WAS DELIBERATELY NOT TAKEN. Widening the identity digest to
+// cover every published file would also have detected this, and was offered.
+// It is rejected because it would re-hash 221.6 MiB on every seat launch, which
+// is the same class as the per-file fsync that cost 136.18s against 1.07s, and
+// because it DETECTS after copying where this PREVENTS during it. The digest
+// therefore stays exec-set only, on purpose rather than by omission.
+func openVerified(root *os.Root, name string, flag int) (*os.File, fs.FileInfo, error) {
+	before, err := root.Lstat(name)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	if info.Mode()&fs.ModeSymlink != 0 {
-		return fmt.Errorf("%w: %s", ErrSymlink, name)
+	// THIS REFUSAL IS REDUNDANT WITH sameObject BELOW, and is kept anyway with
+	// that stated rather than dressed up as protection. A symlink and its target
+	// are different inodes, so a symlinked name is refused by the comparison even
+	// without this check, and a mutant deleting this survives every test.
+	//
+	// I originally justified keeping it on the grounds that without it a symlinked
+	// FIFO would be OPENED and block. That argument is now void: writing the test
+	// for it found that O_NONBLOCK had never been applied to member opens at all,
+	// and centralising O_NONBLOCK below covers the FIFO case regardless of this
+	// check. So the honest reason to keep it is narrower - it refuses the common
+	// case before opening anything and names it accurately ("symlink refused"
+	// rather than "changed between inspection and open"), which is a readability
+	// and diagnostics argument, not a security one.
+	if before.Mode()&fs.ModeSymlink != 0 {
+		return nil, nil, fmt.Errorf("%w: %s", ErrSymlink, name)
+	}
+	// THE WINDOW IS SCHEDULED HERE, NOT RACED, so the guard below has a
+	// deterministic test. Without this seam the only way to reach the substituted
+	// -object case was to win a race, and a racing test is a COIN-FLIP KILLER:
+	// measured, neutering sameObject's comparison was killed while REMOVING its
+	// call - the semantically identical mutation - survived the same run. A guard
+	// whose regression fires by luck is not a regression.
+	//
+	// nil in production, with exactly one caller, so it costs a nil check on a
+	// path that is already doing two syscalls.
+	if openWindowHook != nil {
+		openWindowHook(name)
+	}
+	// O_NONBLOCK ON EVERY OPEN, NOT JUST VERSION, and this closes a defect that
+	// predates the inode check. A FIFO with no writer BLOCKS a blocking open, and
+	// until now only the VERSION read passed O_NONBLOCK - every member open went
+	// without it. Measured: a FIFO placed directly inside a normal member hung
+	// Stage indefinitely (8s timeout, no return), while a member SYMLINKED to a
+	// FIFO was correctly refused by the check above. So the symlink guard was
+	// doing its job and the plain irregular-file case was not covered at all.
+	// Hanging seat launch is an availability defect rather than a leak, which is
+	// the same class the VERSION flag was already there to prevent; it belongs on
+	// every open rather than on one.
+	handle, err := root.OpenFile(name, flag|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	after, err := handle.Stat()
+	if err != nil {
+		handle.Close()
+		return nil, nil, err
+	}
+	if err := sameObject(before, after, name); err != nil {
+		handle.Close()
+		return nil, nil, err
+	}
+	return handle, after, nil
+}
+
+// openWindowHook is nil in production and set only by tests, to substitute an
+// object between openVerified's Lstat and its open. It exists because the
+// interval it opens is otherwise reachable only by racing.
+var openWindowHook func(name string)
+
+// sameObject is the comparison, extracted as a PURE predicate so both arms are
+// reachable by a deterministic test rather than only by winning a race.
+func sameObject(inspected, opened fs.FileInfo, name string) error {
+	if !os.SameFile(inspected, opened) {
+		return fmt.Errorf("%w: %s changed between inspection and open", ErrSymlink, name)
 	}
 	return nil
 }
@@ -278,22 +342,13 @@ func refuseSymlinkedName(root *os.Root, name string) error {
 // requireExecutableGo proves bin/go is a real executable regular file, from a
 // descriptor rather than from a name.
 func requireExecutableGo(root *os.Root) error {
-	// NO Lstat guard here: a symlinked bin/go is refused by the fingerprint walk,
-	// which visits bin/go through walkAnchored and applies refuseSymlinkedName. A
-	// duplicate CHECK here was deleted as redundant, and so was the inert
-	// caller-supplied O_NOFOLLOW - see the note at refuseSymlinkedName.
-	handle, err := root.OpenFile("bin/go", os.O_RDONLY, 0)
+	// openVerified refuses a symlinked name AND proves the opened object is the
+	// one it inspected, so this site needs no separate guard of its own.
+	handle, info, err := openVerified(root, "bin/go", os.O_RDONLY)
 	if err != nil {
-		if errors.Is(err, syscall.ELOOP) {
-			return fmt.Errorf("%w: bin/go is a symlink", ErrSymlink)
-		}
 		return fmt.Errorf("%w: bin/go: %v", ErrNotPinned, err)
 	}
 	defer handle.Close()
-	info, err := handle.Stat()
-	if err != nil {
-		return fmt.Errorf("%w: bin/go: %v", ErrNotPinned, err)
-	}
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
 		return fmt.Errorf("%w: bin/go is not an executable regular file", ErrNotPinned)
 	}
@@ -306,24 +361,19 @@ func requireExecutableGo(root *os.Root) error {
 // launch: an availability defect rather than a leak. The type is proven from the
 // descriptor BEFORE any content is read.
 //
-// O_NONBLOCK is load-bearing and IS killed by
-// TestReadVersionRefusesAFifoWithoutBlocking. A caller-supplied O_NOFOLLOW was
-// removed as inert; refuseSymlinkedName above is what refuses a symlinked
-// VERSION.
+// O_NONBLOCK is load-bearing and now lives in openVerified so it applies to EVERY
+// open rather than this one; it is killed by
+// TestReadVersionRefusesAFifoWithoutBlocking and by
+// TestIrregularMembersAreRefusedWithoutBlocking. A caller-supplied O_NOFOLLOW was
+// removed as inert; openVerified is what refuses a symlinked VERSION and what
+// proves the opened file is the one it inspected.
 func readVersion(root *os.Root) (string, error) {
-	if err := refuseSymlinkedName(root, "VERSION"); err != nil {
-		return "", err
-	}
-	handle, err := root.OpenFile("VERSION", os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	handle, info, err := openVerified(root, "VERSION", os.O_RDONLY)
 	if err != nil {
-		if errors.Is(err, syscall.ELOOP) {
-			return "", fmt.Errorf("%w: VERSION is a symlink", ErrSymlink)
-		}
 		return "", fmt.Errorf("%w: VERSION: %v", ErrNotPinned, err)
 	}
 	defer handle.Close()
-	info, err := handle.Stat()
-	if err != nil || !info.Mode().IsRegular() {
+	if !info.Mode().IsRegular() {
 		return "", fmt.Errorf("%w: VERSION is not a regular file", ErrNotPinned)
 	}
 	buffer := make([]byte, maxVersionLength+1)
@@ -362,7 +412,7 @@ func fingerprintExecutables(root *os.Root) (string, error) {
 
 	digest := sha256.New()
 	for _, name := range names {
-		handle, err := root.OpenFile(name, os.O_RDONLY, 0)
+		handle, _, err := openVerified(root, name, os.O_RDONLY)
 		if err != nil {
 			return "", fmt.Errorf("%w: fingerprint %s: %v", ErrNotPinned, name, err)
 		}
@@ -395,34 +445,25 @@ func collectExecutables(root *os.Root, member string) ([]string, error) {
 // walkAnchored walks name anchored to root, refusing symlinks and irregular files,
 // and calls visit for every entry.
 //
-// CLASSIFY WHAT YOU HOLD, AS FAR AS THAT GOES. Each entry is refused by name via
-// refuseSymlinkedName and then opened against the same root descriptor.
+// CLASSIFY WHAT YOU HOLD, AND THIS NOW ACTUALLY DOES. Every entry goes through
+// openVerified, which refuses a symlinked name and then proves the object it
+// opened is the object it inspected.
 //
-// AN EARLIER VERSION OF THIS COMMENT CLAIMED "there is no interval in which a
-// swapped component could redirect the operation". That was wrong and is
-// retracted: the Lstat and the open are two steps, so an interval exists. What
-// changed from the previous pathname-based walk is not that the interval is gone
-// but that its CONSEQUENCE is bounded - every resolution is anchored to a held
-// root descriptor, so a swap can only land inside the source installation and
-// can no longer redirect the copy outside it.
+// TWO EARLIER VERSIONS OF THIS COMMENT WERE WRONG, both retracted here. The first
+// claimed "there is no interval in which a swapped component could redirect the
+// operation"; an interval did exist, because the Lstat and the open were separate
+// steps. The second claimed the interval's consequence was bounded to copying a
+// duplicate of a file already selected - that was disproved by a probe which
+// published an UNSELECTED root file through the window. The interval is now
+// closed by comparing inodes across it rather than described.
 func walkAnchored(root *os.Root, name string, visit func(string, fs.FileInfo) error) error {
-	// The directory-entry check below covers entries found by ReadDir, but NOT
-	// the name this walk was entered with. A symlinked top-level member was
-	// copied until this existed.
-	if err := refuseSymlinkedName(root, name); err != nil {
-		return err
-	}
-	handle, err := root.OpenFile(name, os.O_RDONLY, 0)
+	// openVerified covers the name this walk was entered with as well as every
+	// entry the recursion reaches, and proves each opened object is the one it
+	// inspected. A symlinked top-level member was copied before the first half
+	// existed, and an inode-swapped one before the second.
+	handle, info, err := openVerified(root, name, os.O_RDONLY)
 	if err != nil {
-		if errors.Is(err, syscall.ELOOP) {
-			return fmt.Errorf("%w: %s", ErrSymlink, name)
-		}
 		return err
-	}
-	info, statErr := handle.Stat()
-	if statErr != nil {
-		handle.Close()
-		return statErr
 	}
 	if !info.IsDir() {
 		defer handle.Close()
@@ -442,10 +483,9 @@ func walkAnchored(root *os.Root, name string, visit func(string, fs.FileInfo) er
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 	for _, entry := range entries {
 		// No directory-entry symlink check here: the recursive call's own
-		// refuseSymlinkedName covers it. An earlier version had both, and a
-		// mutant deleting this one survived every test, which is what a
-		// redundant guard looks like. Deleted rather than given a test that
-		// could only ever pass.
+		// openVerified covers it. An earlier version had both, and a mutant
+		// deleting this one survived every test, which is what a redundant guard
+		// looks like. Deleted rather than given a test that could only ever pass.
 		if err := walkAnchored(root, path.Join(name, entry.Name()), visit); err != nil {
 			return err
 		}
@@ -655,21 +695,11 @@ func copyMember(sourceRoot, destinationRoot *os.Root, destination, member string
 // NO PER-FILE fsync: measured at 136.18s against 1.07s on 15022 files. Data
 // integrity comes from re-verifying the digest on reuse (see stage).
 func copyOneFile(sourceRoot, destinationRoot *os.Root, name, target string) error {
-	if err := refuseSymlinkedName(sourceRoot, name); err != nil {
-		return err
-	}
-	handle, err := sourceRoot.OpenFile(name, os.O_RDONLY, 0)
+	handle, info, err := openVerified(sourceRoot, name, os.O_RDONLY)
 	if err != nil {
-		if errors.Is(err, syscall.ELOOP) {
-			return fmt.Errorf("%w: %s", ErrSymlink, name)
-		}
 		return err
 	}
 	defer handle.Close()
-	info, err := handle.Stat()
-	if err != nil {
-		return err
-	}
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("%w: %s is not a regular file", ErrNotPinned, name)
 	}
@@ -683,12 +713,26 @@ func copyOneFile(sourceRoot, destinationRoot *os.Root, name, target string) erro
 	mode := info.Mode().Perm() & 0o755
 	// O_EXCL IS THE ONE FLAG HERE THAT IS NOT INERT, and it is also the one
 	// mutant nothing kills. Unlike the deleted O_NOFOLLOW bits it has semantics
-	// os.Root does not supply: it refuses to open an existing file rather than
-	// truncating it. No test kills its removal because the destination is always
-	// a directory this function's caller just created, so a collision cannot
-	// occur on any reachable path. It asserts that invariant rather than
-	// defending an attack, and it is kept so that a future change which reuses a
-	// destination fails loudly instead of silently overwriting.
+	// os.Root does not supply: it REFUSES an existing target with "file exists".
+	//
+	// AN EARLIER VERSION OF THIS COMMENT DESCRIBED THE WRONG ALTERNATIVE. It said
+	// the flag refuses "rather than truncating" the file. Removing O_EXCL leaves
+	// O_WRONLY|O_CREATE, which does NOT truncate: it opens the existing file and
+	// overwrites from offset zero, leaving any longer tail in place. Measured
+	// through os.Root - an existing "ABCDEFGHIJ" became "xyCDEFGHIJ" after a
+	// two-byte write. So removing the flag would silently CORRUPT a target rather
+	// than replace it, which is worse than the truncation I described.
+	//
+	// The reason I described it wrongly is worth keeping: my mutant SUBSTITUTED
+	// O_TRUNC instead of REMOVING O_EXCL, so the instrument could only ever show
+	// me the comparison I had already assumed. A substituting mutant tests the
+	// substitute.
+	//
+	// No test kills its removal because both callers write beneath a staging
+	// directory created fresh in this same call, and target names come from a
+	// filesystem walk so two entries cannot produce one target. That makes the
+	// unkillability structural rather than untested. It is kept so a future
+	// change which reuses a destination fails loudly instead of corrupting.
 	destination, err := destinationRoot.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
 		return err

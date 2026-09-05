@@ -685,8 +685,11 @@ exactly as it was before this feature existed rather than failing the launch:
 - **Free space is below the floor.** Staging refuses up front rather than filling the
   filesystem, and the message names both the free bytes and the floor, which is 4
   GiB. Reclaim space; do not lower the floor to make the message go away.
-- **The source contains a symlink.** Symlinks are refused anywhere in the copied
-  set, because following one copies something from outside the validated tree.
+- **The source contains a symlink.** A symlinked name is refused anywhere in the
+  copied set, because following one copies something the daemon never validated.
+  The check also proves the file it opened is the file it inspected, so a source
+  that is modified *while* it is being copied is refused rather than copied
+  partially.
 
 To recover, fix the cause and restart the daemon, or run the seat's job again:
 staging is attempted per launch and a previously failed stage is retried rather

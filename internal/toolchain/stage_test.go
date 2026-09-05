@@ -644,16 +644,25 @@ func TestMinFreeBytesIsAStatedFloor(t *testing.T) {
 //
 // os.Root refuses a symlink that ESCAPES the root, which is why every
 // outside-aiming fixture in this file passes whether or not the inner guards are
-// present. It deliberately FOLLOWS links that stay inside the root. So the
+// present. It deliberately FOLLOWS links that stay inside the root, so an
+// in-root link needs a fixture that stays inside to be tested at all. Three
+// mutants survived until these existed.
+//
+// AN EARLIER VERSION OF THIS COMMENT NAMED THE WRONG GUARDS. It said "the
 // O_NOFOLLOW opens and the directory-entry type check are the only things
-// refusing an internal link, and they need fixtures that stay inside to be tested
-// at all. Three mutants survived until these existed.
+// refusing an internal link". Both of those are gone at this head: the
+// directory-entry check was deleted as redundant, and the caller-supplied
+// O_NOFOLLOW bits were deleted as INERT, because os.Root ORs that flag itself at
+// every openat call site. THE LOAD-BEARING GUARD IS openVerified, which refuses a
+// symlinked name by Lstat and then proves the opened object is the inspected one.
+// Left stale, this comment contradicted the production rationale it was supposed
+// to be testing.
 func TestInternalSymlinksAreRefusedNotFollowed(t *testing.T) {
 	t.Run("VERSION is an internal symlink", func(t *testing.T) {
 		base := t.TempDir()
 		source := goInstall(t, filepath.Join(base, "src"))
 		// a decoy INSIDE the tree, so os.Root permits the traversal and only
-		// O_NOFOLLOW can refuse it
+		// openVerified's Lstat can refuse it
 		if err := os.WriteFile(filepath.Join(source, "lib", "decoy"), []byte("go9.9.9\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -789,5 +798,234 @@ func TestStageRefusesToPublishUnderAnIdentityItCannotProve(t *testing.T) {
 		if strings.Contains(entry.Name(), "staging") {
 			t.Fatalf("a refused publish left a temporary tree behind: %s", entry.Name())
 		}
+	}
+}
+
+// TestSameObjectRefusesASubstitutedObject drives the inode comparison DIRECTLY,
+// both arms, because the end-to-end version can only be reached by winning a race.
+//
+// This is the pure-predicate half of the F1 fix. A racing test that fails to
+// expose anything is weak evidence; a predicate driven to both outcomes is not.
+func TestSameObjectRefusesASubstitutedObject(t *testing.T) {
+	base := t.TempDir()
+	first := filepath.Join(base, "first")
+	second := filepath.Join(base, "second")
+	if err := os.WriteFile(first, []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte("two"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	firstInfo, err := os.Lstat(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondInfo, err := os.Lstat(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// CONTROL: the same object compares equal, so a passing refusal below cannot
+	// mean "this function refuses everything".
+	if err := sameObject(firstInfo, firstInfo, "first"); err != nil {
+		t.Fatalf("control failed: an unchanged object was refused: %v", err)
+	}
+	// and a re-stat of the same path is still the same object
+	again, err := os.Lstat(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sameObject(firstInfo, again, "first"); err != nil {
+		t.Fatalf("control failed: a re-stat of the same path was refused: %v", err)
+	}
+
+	// THE ARM THAT MATTERS: a different object at the same name is refused.
+	err = sameObject(firstInfo, secondInfo, "victim")
+	if err == nil {
+		t.Fatal("a substituted object was accepted; the Lstat-to-open window is open again")
+	}
+	if !errors.Is(err, ErrSymlink) {
+		t.Fatalf("error = %v, want it to wrap ErrSymlink", err)
+	}
+	if !strings.Contains(err.Error(), "changed between inspection and open") {
+		t.Errorf("refusal %q does not say what happened", err)
+	}
+	if !strings.Contains(err.Error(), "victim") {
+		t.Errorf("refusal %q does not name the file", err)
+	}
+}
+
+// TestSubstitutedSourceCannotExposeAnUnselectedFile closes F1 deterministically.
+//
+// REPRODUCED BEFORE THE FIX: a clean stage never copies PRIVATE-NOTES, and a stage
+// racing a go.env swap published its contents AS go.env, on attempt 284 of 3000.
+// Post-copy identity verification missed it because go.env is non-executable and
+// therefore outside the fingerprint, so the hole was the COMPOSITION of the
+// exec-set digest scope with the Lstat-to-open gap.
+//
+// WHY THIS USES A HOOK RATHER THAN A RACE. The racing version was a coin-flip
+// killer: measured, neutering sameObject's comparison died while REMOVING its call
+// - the same mutation semantically - survived the identical run. Scheduling the
+// substitution makes the guard's regression deterministic. The hook is nil in
+// production with one caller.
+func TestSubstitutedSourceCannotExposeAnUnselectedFile(t *testing.T) {
+	base := t.TempDir()
+	source := goInstall(t, filepath.Join(base, "src"), "bin")
+	if err := os.WriteFile(filepath.Join(source, "PRIVATE-NOTES"), []byte("NEVER-SELECTED-FOR-COPY"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// CONTROL: the file is genuinely not selected, so an exposure would be a real
+	// change rather than the copy doing its job.
+	clean, err := Stage(filepath.Join(base, "home-clean"), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(clean, "PRIVATE-NOTES")); err == nil {
+		t.Fatal("precondition failed: the file IS selected for copying")
+	}
+
+	goEnv := filepath.Join(source, "go.env")
+	swapped := false
+	openWindowHook = func(name string) {
+		if name != "go.env" || swapped {
+			return
+		}
+		swapped = true
+		if err := os.Remove(goEnv); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.Symlink("PRIVATE-NOTES", goEnv); err != nil {
+			t.Error(err)
+		}
+	}
+	defer func() { openWindowHook = nil }()
+
+	staged, err := Stage(filepath.Join(base, "home"), source)
+	if !swapped {
+		t.Fatal("the hook never fired, so this test proved nothing about the window")
+	}
+	if err == nil {
+		body, readErr := os.ReadFile(filepath.Join(staged, "go.env"))
+		if readErr == nil && string(body) == "NEVER-SELECTED-FOR-COPY" {
+			t.Fatalf("an unselected file was published as go.env: %q", body)
+		}
+		t.Fatalf("a source substituted inside the open window was staged anyway, at %q", staged)
+	}
+	if !errors.Is(err, ErrSymlink) {
+		t.Fatalf("error = %v, want it to wrap ErrSymlink", err)
+	}
+	if !strings.Contains(err.Error(), "changed between inspection and open") {
+		t.Errorf("refusal %q does not name the substitution", err)
+	}
+}
+
+// TestRacingSourceCannotExposeAnUnselectedFile corroborates the above through the
+// production path with no hook. A negative race result is weak evidence, which is
+// why the deterministic test above is the actual regression.
+func TestRacingSourceCannotExposeAnUnselectedFile(t *testing.T) {
+	base := t.TempDir()
+	source := goInstall(t, filepath.Join(base, "src"), "bin")
+	if err := os.WriteFile(filepath.Join(source, "PRIVATE-NOTES"), []byte("NEVER-SELECTED-FOR-COPY"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	goEnv := filepath.Join(source, "go.env")
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = os.Remove(goEnv)
+			_ = os.Symlink("PRIVATE-NOTES", goEnv)
+			_ = os.Remove(goEnv)
+			_ = os.WriteFile(goEnv, []byte("GOTOOLCHAIN=local\n"), 0o644)
+		}
+	}()
+	defer func() {
+		close(stop)
+		<-done
+	}()
+
+	home := filepath.Join(base, "home")
+	for attempt := 0; attempt < 400; attempt++ {
+		_ = os.RemoveAll(Root(home))
+		staged, err := Stage(home, source)
+		if err != nil {
+			continue
+		}
+		if body, readErr := os.ReadFile(filepath.Join(staged, "go.env")); readErr == nil && string(body) == "NEVER-SELECTED-FOR-COPY" {
+			t.Fatalf("attempt %d published an unselected file's contents as go.env", attempt)
+		}
+	}
+}
+
+// TestIrregularMembersAreRefusedWithoutBlocking covers a defect this test found
+// rather than the one it was written for.
+//
+// It was written to justify openVerified's pre-open symlink refusal, on the theory
+// that without it a symlinked FIFO would be opened and block. The SYMLINKED arm was
+// refused correctly, so that theory was right about the guard. The DIRECT arm hung
+// for the full timeout: a FIFO sitting inside an ordinary member was opened with a
+// blocking open, because O_NONBLOCK had only ever been passed at the VERSION call
+// site and never on member opens. That is an availability defect - it hangs seat
+// launch rather than refusing it - and it predates the inode check entirely.
+//
+// O_NONBLOCK now lives inside openVerified so it covers every open. Both arms are
+// kept because they fail for different reasons and a single arm would have hidden
+// one of them.
+func TestIrregularMembersAreRefusedWithoutBlocking(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		symlinked bool
+	}{
+		{name: "a FIFO directly inside a member", symlinked: false},
+		{name: "a member symlinked to a FIFO", symlinked: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base := t.TempDir()
+			source := goInstall(t, filepath.Join(base, "src"))
+			if test.symlinked {
+				if err := syscall.Mkfifo(filepath.Join(base, "outside-pipe"), 0o644); err != nil {
+					t.Skipf("cannot create a FIFO fixture: %v", err)
+				}
+				if err := os.RemoveAll(filepath.Join(source, "doc")); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(filepath.Join(base, "outside-pipe"), filepath.Join(source, "doc")); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := syscall.Mkfifo(filepath.Join(source, "lib", "pipe"), 0o644); err != nil {
+					t.Skipf("cannot create a FIFO fixture: %v", err)
+				}
+			}
+
+			done := make(chan error, 1)
+			go func() {
+				_, err := Stage(filepath.Join(base, "home"), source)
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("an irregular file was staged successfully")
+				}
+			case <-time.After(15 * time.Second):
+				t.Fatal("Stage BLOCKED on a FIFO; every open must be O_NONBLOCK")
+			}
+		})
+	}
+
+	// CONTROL: the same tree with no irregular file stages, so the refusals above
+	// are about the FIFO rather than about the fixture.
+	base := t.TempDir()
+	if _, err := Stage(filepath.Join(base, "home"), goInstall(t, filepath.Join(base, "src"))); err != nil {
+		t.Fatalf("control failed: a clean tree must stage: %v", err)
 	}
 }
