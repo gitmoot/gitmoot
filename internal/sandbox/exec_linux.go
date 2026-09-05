@@ -85,7 +85,7 @@ func execSandbox(readPaths, readFiles, writePaths []string, argv []string, readO
 		// stages: the filesystem is readable while writes remain allowlisted.
 		rules = append(rules, landlock.RODirs("/"))
 	} else {
-		readable, held, err := readableRoots(readPaths, executable)
+		readable, toolchainFiles, held, err := readableRoots(readPaths, executable)
 		if err != nil {
 			return err
 		}
@@ -100,7 +100,10 @@ func execSandbox(readPaths, readFiles, writePaths []string, argv []string, readO
 			}
 		}()
 		rules = append(rules, landlock.RODirs(readable...))
-		files, err := readableFiles(readFiles)
+		// Toolchain root files (VERSION, go.env) are validated by the same
+		// helper as caller-declared files, so nothing is granted that does not
+		// exist and is not a regular file.
+		files, err := readableFiles(append(append([]string{}, readFiles...), toolchainFiles...))
 		if err != nil {
 			return err
 		}
@@ -168,7 +171,7 @@ func readableFiles(paths []string) ([]string, error) {
 // /proc/self/fd/<n> so the rule binds the inode that was validated rather than
 // a name that can be repointed afterwards (#1878 round 2, P1-1). Closing them
 // early would invalidate the path the rule is being added for.
-func readableRoots(paths []string, executable string) ([]string, []*os.File, error) {
+func readableRoots(paths []string, executable string) ([]string, []string, []*os.File, error) {
 	roots := make([]string, 0, len(paths)+12)
 	seen := make(map[string]struct{}, len(paths)+12)
 	add := func(candidate string, required bool) error {
@@ -205,7 +208,7 @@ func readableRoots(paths []string, executable string) ([]string, []*os.File, err
 	for _, candidate := range paths {
 		if err := add(candidate, true); err != nil {
 			closeHeld()
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
 	for _, candidate := range []string{
@@ -235,12 +238,12 @@ func readableRoots(paths []string, executable string) ([]string, []*os.File, err
 	} {
 		if err := add(candidate, false); err != nil {
 			closeHeld()
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
 	if err := addExecutableReadRoots(add, executable); err != nil {
 		closeHeld()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	// The toolchain grant is OPTIONAL and FAILS CLOSED. A host with no `go`, or
 	// with one whose installation cannot be validated, simply gets no grant:
@@ -248,16 +251,20 @@ func readableRoots(paths []string, executable string) ([]string, []*os.File, err
 	// would refuse to launch every sandbox on such a host. The visible
 	// consequence of a refusal is the seat's own exit 126, which is exactly the
 	// pre-#1878 behaviour rather than a new failure.
+	var extraFiles []string
 	if goExecutable, err := execLookPath("go"); err == nil {
-		if handle := grantableToolchainRootHandle(goExecutable); handle != nil {
-			held = append(held, handle)
-			if err := add(procFdPath(handle), true); err != nil {
-				closeHeld()
-				return nil, nil, err
+		if grant := grantableToolchain(goExecutable); grant != nil {
+			held = append(held, grant.handles...)
+			for _, dir := range grant.dirs {
+				if err := add(dir, true); err != nil {
+					closeHeld()
+					return nil, nil, nil, err
+				}
 			}
+			extraFiles = append(extraFiles, grant.files...)
 		}
 	}
-	return roots, held, nil
+	return roots, extraFiles, held, nil
 }
 
 // procFdPath names an open descriptor's magic-symlink path. A Landlock rule
@@ -326,22 +333,36 @@ func addExecutableReadRoots(add func(string, bool) error, executable string) err
 // direction. A positive identity needs no list, so the ownership question
 // disappears.
 //
+// WHAT IS GRANTED IS NARROWER THAN WHAT IS VALIDATED, and that is what closes
+// round 2's second P1. Positive identity proved a Go installation was PRESENT
+// in a directory; it never proved the directory held nothing else, so a root
+// carrying both the signature and a credential - ~/.ssh/bin/go beside
+// ~/.ssh/id_ed25519 - was granted WHOLESALE. Only the installation's own
+// members are granted now: the member directories plus the two root files go
+// reads. A sibling secret is never named, so it is never granted.
+//
+// MEASURED, with controls in both directions: granting only members leaves
+// `go version`, `go build ./...` and `go test ./...` all at rc=0 inside a seat
+// domain, while listing the installation root is rc=2 and reading an unnamed
+// root file is rc=1. Landlock also accepts rules for paths UNDER a descriptor's
+// magic symlink, so the narrow paths stay descriptor-derived; in a child
+// process the granted children were readable, the root unlistable and a sibling
+// secret denied.
+//
 // WHAT THE SIGNATURE DOES AND DOES NOT COVER, because claiming more than a
 // check delivers is how #1839 was closed the first time. It covers ACCIDENTAL
 // satisfaction: a credential store, cache or data directory does not happen to
 // contain an executable bin/go beside a VERSION file reading "go...". It does
 // NOT cover an attacker who can already WRITE into the operator's home - such
-// an attacker can fabricate the signature anywhere, and could equally replace
-// the real toolchain binary or the daemon's own config. The signature raises
-// the bar from "any directory shaped like a path" to "a directory that proves
-// it holds a Go installation"; it is not an authenticity proof.
+// an attacker can fabricate the signature anywhere. With the narrowed grant the
+// residual exposure of such a directory is exactly its Go-layout members and
+// the two named root files, and nothing else it holds.
 //
-// FAILS CLOSED throughout: any resolution, open or validation error yields no
-// grant. Deliberately not an error - a host whose toolchain cannot be validated
-// must still launch sandboxes, and the visible consequence of refusal is the
-// seat's own exit 126, which is the pre-#1878 behaviour rather than a new
-// failure mode.
-func grantableToolchainRootHandle(executable string) *os.File {
+// FAILS CLOSED throughout: any resolution, open, identity or validation error
+// yields no grant. Deliberately not an error - a host whose toolchain cannot be
+// validated must still launch sandboxes, and the visible consequence of refusal
+// is the seat's own exit 126, the pre-#1878 behaviour rather than a new failure.
+func grantableToolchain(executable string) *toolchainGrant {
 	resolved, err := filepath.EvalSymlinks(strings.TrimSpace(executable))
 	if err != nil {
 		return nil
@@ -350,17 +371,140 @@ func grantableToolchainRootHandle(executable string) *os.File {
 	if base := filepath.Base(binDir); base != "bin" && base != "sbin" {
 		return nil
 	}
-	root := filepath.Dir(binDir)
-	handle, err := os.Open(root)
+	handle, err := os.Open(filepath.Dir(binDir))
 	if err != nil {
 		return nil
 	}
-	if systemToolchainRoot(root) || operatorToolchainRoot(root, operatorHomeDir(), handle) {
-		return handle
+	grant := describeToolchain(handle)
+	if grant == nil {
+		_ = handle.Close()
+		return nil
 	}
-	_ = handle.Close()
-	return nil
+	return grant
 }
+
+// describeToolchain classifies and enumerates a candidate installation using
+// ONLY the open descriptor it is given.
+//
+// THE NAME IS NEVER TRUSTED AGAIN AFTER THE OPEN, which is round 2's first P1.
+// Previously EvalSymlinks produced a string, os.Open RE-WALKED that string, and
+// containment was then checked on the string while the grant used the handle -
+// so an exchange between the two calls left a home-descendant name classified
+// while a different directory was opened and granted. Descriptor pinning
+// defeated swaps after the open; it did not bind the DECISION to the opened
+// inode. Here the classification path comes from readlink on the descriptor's
+// own /proc/self/fd entry, an unlinked directory is refused by its " (deleted)"
+// suffix, and os.SameFile proves that path still names the very inode held
+// before the path is used for anything.
+func describeToolchain(handle *os.File) *toolchainGrant {
+	info, err := handle.Stat()
+	if err != nil || !info.IsDir() {
+		return nil
+	}
+	base := procFdPath(handle)
+	classified, err := os.Readlink(base)
+	// THE " (deleted)" REFUSAL AND THE IDENTITY CHECK BELOW ARE DEFENCE IN
+	// DEPTH, AND THEIR MUTANTS SURVIVE BY EQUIVALENCE - stated here rather than
+	// claimed as covered. Measured: unlinking a directory takes its contents
+	// with it, so readlink reports " (deleted)" AND goInstallationAt then fails
+	// to stat bin/go through the descriptor. For every input a deterministic
+	// test can construct, these two refuse exactly what the signature check
+	// refuses one step later. What they add is the RACING case - a path swapped
+	// between readlink and use - which cannot be constructed without
+	// concurrency, so no test here pins them. They are kept because a future
+	// reordering that moved the signature check earlier, or relaxed it, would
+	// otherwise lose the property silently.
+	if err != nil || !filepath.IsAbs(classified) || strings.HasSuffix(classified, " (deleted)") {
+		return nil
+	}
+	named, err := os.Lstat(classified)
+	if err != nil || !os.SameFile(info, named) {
+		return nil
+	}
+	if !systemToolchainRoot(classified) && !operatorToolchainRoot(classified, operatorHomeDir()) {
+		return nil
+	}
+	if !goInstallationAt(handle) {
+		return nil
+	}
+	grant := &toolchainGrant{handles: []*os.File{handle}}
+	// EVERY MEMBER IS ITS OWN DESCRIPTOR. Granting filepath.Join(base, member)
+	// would pin the ROOT inode and then resolve "bin", "pkg" and the rest BY
+	// NAME one level down, re-creating the same open-time race the root fix just
+	// closed: a swap of <root>/bin between enumeration and RestrictPaths would
+	// grant a directory that was never validated. Opening each member relative
+	// to the held root and installing ITS descriptor path removes that.
+	for _, member := range goInstallationMembers {
+		entry, err := os.OpenFile(filepath.Join(base, member), os.O_RDONLY|syscall.O_DIRECTORY, 0)
+		if err != nil {
+			// ABSENT MEMBERS SKIP RATHER THAN REFUSE: a trimmed or future
+			// installation without misc, test or doc must still work.
+			continue
+		}
+		if info, statErr := entry.Stat(); statErr != nil || !info.IsDir() {
+			_ = entry.Close()
+			continue
+		}
+		grant.handles = append(grant.handles, entry)
+		grant.dirs = append(grant.dirs, procFdPath(entry))
+	}
+	for _, member := range goInstallationRootFiles {
+		entry, err := os.OpenFile(filepath.Join(base, member), os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			continue
+		}
+		if info, statErr := entry.Stat(); statErr != nil || !info.Mode().IsRegular() {
+			_ = entry.Close()
+			continue
+		}
+		grant.handles = append(grant.handles, entry)
+		grant.files = append(grant.files, procFdPath(entry))
+	}
+	// A LOUD REFUSAL RATHER THAN AN EMPTY GRANT. The member list is coupled to
+	// the Go distribution layout, so a future rename would otherwise install
+	// nothing, look like a working sandbox, and fail at exec with the same
+	// exit 126 this issue is about.
+	//
+	// MEASURED UNREACHABLE TODAY, and its mutant therefore survives: the
+	// signature requires an executable bin/go, so "bin" always resolves as a
+	// member and this set is never empty. It is a tripwire for a future change
+	// that drops or loosens the bin/go requirement, not a live branch, and it is
+	// documented as such rather than counted as tested.
+	if len(grant.dirs) == 0 {
+		grant.close()
+		return nil
+	}
+	return grant
+}
+
+// toolchainGrant is the set of descriptors whose inodes were classified,
+// together with the narrow paths installed for them. Every descriptor must
+// outlive rule installation, because each installed path names one of them.
+type toolchainGrant struct {
+	handles []*os.File
+	dirs    []string
+	files   []string
+}
+
+func (g *toolchainGrant) close() {
+	for _, handle := range g.handles {
+		_ = handle.Close()
+	}
+}
+
+// goInstallationMembers are the directories a Go installation exposes that a
+// build or test run needs. Enumerated positively so the installation root
+// itself is never granted; a member that is absent is simply skipped.
+var goInstallationMembers = []string{"bin", "pkg", "src", "lib", "api", "misc", "test", "doc"}
+
+// goInstallationRootFiles are the files go reads from the installation ROOT.
+//
+// go.env is here because of a measurement, not for completeness: with it
+// unreadable and GOTOOLCHAIN unset, build and test still pass but
+// `go env GOTOOLCHAIN` returns EMPTY rather than its configured default, and an
+// empty GOTOOLCHAIN is what invites the toolchain auto-download a sandboxed
+// seat cannot complete.
+var goInstallationRootFiles = []string{"VERSION", "go.env"}
 
 // systemToolchainRoot reports whether root lives under a system package root.
 // Unchanged from #1711 apart from being named.
@@ -377,19 +521,22 @@ func systemToolchainRoot(root string) bool {
 // operatorToolchainRoot reports whether root is a strict descendant of the
 // operator's home that PROVES it is a Go installation.
 //
-// SYMLINKED INTERMEDIATES ARE ACCEPTED, and that is a decision rather than an
-// oversight. The resolved path is used, so an operator who symlinks ~/.local to
-// a data volume or keeps a current -> go1.26.4 pointer still gets a working
-// seat. Requiring realpath == lexical would refuse those layouts, and it buys
-// nothing here: the caller installs the rule through the descriptor validated
-// below, so the inode is already pinned against a later swap. Refusing them
-// would be the reject-valid-input direction for no security gain.
+// SYMLINKS ARE RESOLVED BEFORE CONTAINMENT, WHICH HAS A CONSEQUENCE THE
+// PREVIOUS COMMENT DENIED. That comment claimed an operator who symlinks
+// ~/.local to a data volume still gets a working seat. That is FALSE: such a
+// path RESOLVES OUTSIDE the home directory and is therefore refused here, and a
+// test now pins the refusal. A symlink that stays inside home - a
+// current -> go1.26.4 pointer, say - is still accepted, because its resolved
+// path is a home descendant. Accepting a toolchain whose real location is
+// outside home would mean classifying a path outside the very boundary this arm
+// exists to enforce, so the refusal is the policy and the old comment was the
+// error.
 //
 // A ROOT-VALUED HOME IS REJECTED. With home "/" every absolute path is a
 // descendant and the boundary means nothing: /var/secrets was measured
 // grantable under the previous shape (#1878 round 2, P1-3), whose tests SKIPPED
 // that case rather than asserting it.
-func operatorToolchainRoot(root, home string, handle *os.File) bool {
+func operatorToolchainRoot(root, home string) bool {
 	home = strings.TrimSpace(home)
 	if home == "" || home == "/" || !filepath.IsAbs(home) || !filepath.IsAbs(root) {
 		return false
@@ -398,7 +545,7 @@ func operatorToolchainRoot(root, home string, handle *os.File) bool {
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return false
 	}
-	return goInstallationAt(handle)
+	return true
 }
 
 // goInstallationAt proves, THROUGH an open directory descriptor, that the
@@ -424,7 +571,12 @@ func goInstallationAt(handle *os.File) bool {
 	if err != nil || !goBinary.Mode().IsRegular() || goBinary.Mode().Perm()&0o111 == 0 {
 		return false
 	}
-	version, err := os.Open(filepath.Join(base, "VERSION"))
+	// O_NOFOLLOW so a VERSION symlink cannot point the check at an unrelated
+	// regular file, and O_NONBLOCK because opening a FIFO with no writer would
+	// otherwise BLOCK SANDBOX STARTUP - an availability defect in the launch
+	// path, not a leak. Type is proven from the descriptor BEFORE any content is
+	// read, which is what the previous version claimed and did not do.
+	version, err := os.OpenFile(filepath.Join(base, "VERSION"), os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return false
 	}
