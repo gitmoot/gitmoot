@@ -873,24 +873,38 @@ func (e Engine) parkTaskAwaitingHumanMerge(ctx context.Context, ref taskRef, rea
 // is called inline from it, dispatched a fix leg against findings about that
 // superseded commit. #1834/#1871 bound the APPROVING side and left this one.
 //
-// ONLY A CONTRADICTED HEAD REFUSES. Both unknowns admit, and that asymmetry
-// with the approval arm is the safety argument rather than an inconsistency:
+// ONLY A CONTRADICTED HEAD REFUSES. Both unknowns admit, and the asymmetry with
+// the approval arm is deliberate - but the reason is LIVENESS, not merge safety.
+// An earlier version of this comment claimed that refusing on a missing local
+// row would let the merge gate merge on an approval "over a real current-head
+// objection nobody recorded". That claim is FALSE, and #1903's independent
+// review is what caught it:
 //
-//   - refusing a headless or unconfirmable APPROVAL fails safe, because the PR
-//     does not merge;
-//   - refusing an objection fails PERMISSIVE, and not merely unhelpfully. The
-//     two sides do not even read the same source: approvalSupersedesChangesRequested
-//     consults the LOCAL store row above, while PolicyMergeGate fetches the pull
-//     request LIVE from GitHub (merge_gate.go's MergeGateGitHub) and never reads
-//     that table for the head it merges against. So an objection refused for a
-//     missing local row leaves the task OUT of changes_requested,
-//     mergeGateExpectedTaskState then admits, and the gate can merge on an
-//     approval over a real current-head objection nobody recorded - the exact
-//     harm #1871 exists to prevent, reached by declining to record a complaint.
+//   - PolicyMergeGate blocks on the OBJECTION ROW itself, not on task state. It
+//     derives the head live (merge_gate.go:288 GetPullRequest -> :311), selects
+//     every review row whose payload.HeadSHA equals that head (:809-816), and
+//     returns mergeBlocked "review at evaluated head has blocking result" for
+//     changes_requested, blocked or failed (:895-898). Refusing the TASK
+//     transition does not un-record the review row, so it cannot open a merge.
+//
+// What refusing would actually cost is the CONSERVATIVE transition and, because
+// dispatchFix is called inline from this arm, the FIX PASS - for an objection
+// nobody can show is stale. Withholding both from an objection that is
+// legitimately about the current head as far as any available evidence goes is a
+// liveness loss, which is why the unknowns admit; the approval side refuses the
+// mirror cases because withholding a merge fails safe.
 //
 // Admitting records a complaint and authorises nothing, so it is the
 // claim-nothing direction. A CLI review dispatched without --head-sha produces
 // the headless payload today, which is why that case is real traffic.
+//
+// ACCEPTED LIMITATION (#1512's family): when the ONLY objection on a PR is bound
+// to a superseded head, this arm strands it. The task does not transition, no fix
+// leg is dispatched, and nothing here re-drives anything - the PR waits for a
+// review at the current head. That is deliberate: a fix pass carrying findings
+// about a commit the branch has moved past is wrong work, not late work. It is
+// also the reason the refusal is terminal rather than retried, and it is not
+// mitigated in this change.
 func (e Engine) objectionBindsToCurrentHead(ctx context.Context, payload JobPayload) (bool, string, error) {
 	objectionHead := strings.TrimSpace(payload.HeadSHA)
 	if objectionHead == "" || payload.PullRequest <= 0 {
