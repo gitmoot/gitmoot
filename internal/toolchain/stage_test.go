@@ -594,13 +594,49 @@ func TestMinFreeBytesIsAStatedFloor(t *testing.T) {
 	if MinFreeBytes < 1<<30 {
 		t.Fatalf("MinFreeBytes = %d, want an explicit floor of at least 1 GiB", MinFreeBytes)
 	}
-	if err := checkFreeSpace(t.TempDir()); err != nil {
-		if !errors.Is(err, ErrLowDisk) {
-			t.Fatalf("checkFreeSpace error = %v, want ErrLowDisk", err)
-		}
-		if !strings.Contains(err.Error(), "floor is") {
-			t.Fatalf("refusal %q does not name the floor", err)
-		}
+
+	// FORCING, NOT CONDITIONAL. The previous version asserted only inside
+	// `if err != nil`, so on any host above the floor the refusal branch never
+	// ran and the test would have passed even if the check always returned nil.
+	// Driving the predicate directly reaches both arms on a host of any size.
+	for _, test := range []struct {
+		name    string
+		free    uint64
+		floor   uint64
+		refused bool
+	}{
+		{name: "below the floor is refused", free: 1 << 20, floor: 4 << 30, refused: true},
+		{name: "one byte below is refused", free: (4 << 30) - 1, floor: 4 << 30, refused: true},
+		{name: "empty disk is refused", free: 0, floor: 4 << 30, refused: true},
+		{name: "CONTROL exactly at the floor is allowed", free: 4 << 30, floor: 4 << 30},
+		{name: "CONTROL far above the floor is allowed", free: 900 << 30, floor: 4 << 30},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := enoughFree(test.free, test.floor, "/staged")
+			if test.refused {
+				if err == nil {
+					t.Fatalf("enoughFree(%d, %d) allowed a copy that cannot fit", test.free, test.floor)
+				}
+				if !errors.Is(err, ErrLowDisk) {
+					t.Fatalf("error = %v, want ErrLowDisk", err)
+				}
+				// the refusal must name BOTH numbers, or an operator cannot act
+				for _, want := range []string{"floor is", "/staged"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("refusal %q does not contain %q", err, want)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("enoughFree(%d, %d) refused a copy that fits: %v", test.free, test.floor, err)
+			}
+		})
+	}
+
+	// and the production wiring still reaches the predicate
+	if err := checkFreeSpace(t.TempDir()); err != nil && !errors.Is(err, ErrLowDisk) {
+		t.Fatalf("checkFreeSpace returned an unexpected error: %v", err)
 	}
 }
 

@@ -15,10 +15,22 @@
 // directory could be swapped between the two resolutions; and it embedded the
 // VERSION string into the published path, so a hostile VERSION of "go/../.."
 // published outside the daemon root entirely. Both were reproduced at the
-// reviewed head. Both are gone because there is no longer a second pathname
-// resolution to lose: source reads and destination writes go through an os.Root
-// opened once, which refuses any name escaping it, and each entry is classified
-// from its own directory entry then opened O_NOFOLLOW against that same root.
+// reviewed head.
+//
+// WHAT os.Root PROVIDES IS CONTAINMENT. Source reads and destination writes go
+// through a root opened once, which refuses any name that escapes it, so neither
+// a hostile VERSION nor a swapped component can address anything outside the
+// tree. That is what closed the traversal and the planted-symlink escapes.
+//
+// WHAT CLOSES THE SWAP IS THE DIGEST, NOT AN ABSENCE OF RESOLUTIONS, and an
+// earlier version of this comment overstated it. It claimed "there is no longer
+// a second pathname resolution to lose". A reviewer disproved that: Stage still
+// walks the shared source TWICE, once to fingerprint and once to copy, and a
+// swap between the two passes IS copied. What stops it mattering is that the
+// identity is re-proven against the COPY afterwards, so a source mutated
+// mid-flight yields a refused publish rather than a poisoned tree. The
+// guarantee is two resolutions reconciled by a content digest, FAILING CLOSED
+// on disagreement. The duller sentence is the true one.
 //
 // Measured on this box with go1.26.4, including a positive control:
 //
@@ -203,6 +215,33 @@ func identifyRoot(root *os.Root) (Identity, error) {
 	return Identity{Version: version, Fingerprint: fingerprint}, nil
 }
 
+// EVERY O_NOFOLLOW IN THIS PACKAGE IS UNKILLABLE BY A DETERMINISTIC TEST, AND
+// THIS IS THE AUTHORITATIVE LIST. A reviewer found one such survivor and I had
+// disclosed a different one; enumerating the whole class rather than patching the
+// site it was found at turned up six, so the honest count is stated here once
+// instead of claimed in aggregate anywhere else:
+//
+//	stage.go requireExecutableGo   O_NOFOLLOW on bin/go      SURVIVES
+//	stage.go readVersion           O_NOFOLLOW on VERSION     SURVIVES
+//	stage.go fingerprintExecutables O_NOFOLLOW on the digest read  SURVIVES
+//	stage.go walkAnchored          O_NOFOLLOW on the walked name   SURVIVES
+//	stage.go copyOneFile           O_NOFOLLOW on the copied file   SURVIVES
+//	stage.go copyOneFile           O_EXCL on the destination create SURVIVES
+//
+// THE SAME CAUSE AT ALL FIVE O_NOFOLLOW SITES: refuseSymlinkedName's Lstat fires
+// first and refuses the name, so removing the flag changes no observable
+// behaviour and no test can see it. O_EXCL survives for a different reason - the
+// destination is always a freshly created temp directory, so a collision cannot
+// occur; it asserts an invariant rather than defending an attack.
+//
+// THEY ARE KEPT RATHER THAN DELETED, and that is the opposite call from the two
+// guards deleted elsewhere in this file, so the difference matters: those were
+// duplicate CHECKS with no distinct effect, whereas each O_NOFOLLOW is the only
+// thing covering the Lstat-to-open window documented below. Deleting them would
+// widen a residual that is real but not deterministically constructible. A guard
+// that only matters inside a race cannot be killed by a deterministic test, and
+// claiming coverage for one would be a false evidence claim.
+//
 // refuseSymlinkedName rejects a name whose FINAL COMPONENT is a symlink.
 //
 // MEASURED BEHAVIOUR OF os.Root, and it invalidated an assumption this package
@@ -233,12 +272,10 @@ func refuseSymlinkedName(root *os.Root, name string) error {
 // requireExecutableGo proves bin/go is a real executable regular file, from a
 // descriptor rather than from a name.
 func requireExecutableGo(root *os.Root) error {
-	// NO Lstat guard here. A symlinked bin/go is refused by the fingerprint walk,
-	// which visits bin/go through walkAnchored and applies refuseSymlinkedName to
-	// it. A guard here as well was redundant: a mutant deleting it survived every
-	// test including an internal-symlink fixture written specifically to kill it,
-	// which is what a redundant guard looks like. Deleted rather than given a
-	// test that could only ever pass.
+	// NO Lstat guard here: a symlinked bin/go is refused by the fingerprint walk,
+	// which visits bin/go through walkAnchored and applies refuseSymlinkedName. A
+	// duplicate CHECK here was deleted as redundant. The O_NOFOLLOW below is KEPT
+	// and is a known survivor - see the enumerated list at refuseSymlinkedName.
 	handle, err := root.OpenFile("bin/go", os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
@@ -263,13 +300,9 @@ func requireExecutableGo(root *os.Root) error {
 // launch: an availability defect rather than a leak. The type is proven from the
 // descriptor BEFORE any content is read.
 //
-// O_NOFOLLOW IS DELIBERATELY UNKILLED BY ANY TEST, and that is reported rather
-// than papered over. refuseSymlinkedName above already rejects a symlinked
-// VERSION, so a mutant removing this flag passes every test. It is kept because
-// it narrows the documented Lstat-to-open window, which is a race and therefore
-// not deterministically constructible. A guard that only matters inside a race
-// cannot be killed by a deterministic test; claiming otherwise would be a false
-// coverage claim.
+// This O_NOFOLLOW is a known survivor, one of six enumerated at
+// refuseSymlinkedName. O_NONBLOCK by contrast IS killed, by
+// TestReadVersionRefusesAFifoWithoutBlocking.
 func readVersion(root *os.Root) (string, error) {
 	if err := refuseSymlinkedName(root, "VERSION"); err != nil {
 		return "", err
@@ -547,9 +580,21 @@ func checkFreeSpace(target string) error {
 	if err := syscall.Statfs(target, &stat); err != nil {
 		return err
 	}
-	free := stat.Bavail * uint64(stat.Bsize)
-	if free < MinFreeBytes {
-		return fmt.Errorf("%w: %d bytes free at %s, floor is %d", ErrLowDisk, free, target, uint64(MinFreeBytes))
+	return enoughFree(stat.Bavail*uint64(stat.Bsize), MinFreeBytes, target)
+}
+
+// enoughFree is the floor comparison, extracted as a PURE predicate so a test can
+// force BOTH arms.
+//
+// The test guarding this before only asserted inside `if err != nil`, so on any
+// host with more than the floor free - which is every CI runner, and this box has
+// sat at 95 percent used all hour - the refusal branch never ran, and the test
+// would have passed even if checkFreeSpace always returned nil. That is a vacuous
+// row, and a reviewer found it in my own test. Taking the floor as an argument
+// makes both outcomes reachable without needing a full disk.
+func enoughFree(free, floor uint64, target string) error {
+	if free < floor {
+		return fmt.Errorf("%w: %d bytes free at %s, floor is %d", ErrLowDisk, free, target, floor)
 	}
 	return nil
 }
