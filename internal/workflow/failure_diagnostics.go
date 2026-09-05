@@ -29,6 +29,14 @@ const (
 // the stored string never exceeds this many bytes.
 const MaxStderrTailBytes = 4096
 
+// FailurePhaseFinalized: the job was terminalized by the ENGINE after the fact,
+// without a stored result and without session evidence - a spent deadline, a
+// supersession, a refusal before it ran, or a mid-run runtime failure whose
+// delivery never recorded anything. It is a distinct phase from the four above
+// because no CLI process state was observed: the marker says "the engine ended
+// this", which is exactly what 169 delegation legs in one store could not say.
+const FailurePhaseFinalized = "finalized"
+
 // FailureDiagnostics captures process-level crash context for a job whose
 // runtime session ended WITHOUT producing a gitmoot_result envelope (#806), or
 // whose durable running row was terminally settled by daemon recovery (#1308).
