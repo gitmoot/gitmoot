@@ -1794,6 +1794,23 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	grants.stateDir = stateDir
 	grants.env = append(grants.env, stateEnv...)
 	grants.dropped = dropped
+	// A DAEMON-OWNED COPY RATHER THAN A GRANT ON THE OPERATOR'S TREE (#1878).
+	// Granting a seat a rule over the operator's installation produced
+	// escape-class defects in three review rounds, including a member symlink
+	// that redirected a grant outside containment with no privilege at all. The
+	// copy is staged under the gitmoot home, which this seat can never write,
+	// and is added as an ordinary read. Failure is NOT fatal: the seat then
+	// behaves exactly as it did before this change, which is a visible exit 126
+	// rather than a broken launch.
+	if staged, stagedEnv, diagnostic := stageSeatToolchain(paths); diagnostic != "" {
+		grants.dropped = append(grants.dropped, diagnostic)
+	} else if staged != "" {
+		if err := validateStagedToolchainPlacement(staged, grants.writes); err != nil {
+			return grants, err
+		}
+		grants.reads = append(grants.reads, staged)
+		grants.env = append(grants.env, stagedEnv...)
+	}
 	// BOUNDED, because a read on the worker path must not be able to hang seat
 	// setup: the previous form copied the entire database under a hardcoded
 	// context.Background() with no deadline and no cancellation. Rendering a
