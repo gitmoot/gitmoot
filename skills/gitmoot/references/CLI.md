@@ -2310,6 +2310,38 @@ syscall, so this is a bounded-wait guarantee rather than a promise that kernel
 I/O itself is cancelled. Failures are recorded and never prevent worktree
 removal.
 
+### Where a job's wall time went (`phase_profile`)
+
+Every job with a retained transcript emits one `phase_profile` job event at
+close, visible in `gitmoot job events <job-id>`. It answers "where did the wall
+time go" without a second measurement pass, because the transcript records what
+ran and not when: the streams carry no event timestamps, and replay
+deliberately refuses to invent elapsed time from parser speed, so the timing
+has to be recorded live or not at all.
+
+The message is one JSON object:
+
+- `bucket_ms` / `bucket_count` — measured command time by class: `test`
+  (`go test`), `build` (`go build`, `vet`, `generate`, `gofmt`), `vcs` (`git`,
+  `gh`), `other`. Classification reads the LEADING command, so
+  `git commit -m "go test is slow"` is `vcs`.
+- `wall_ms` — the run's wall time.
+- `residual_ms` — wall time with **no command in flight**. Buckets plus
+  residual equal `wall_ms` by construction, so a dominant residual is visible
+  rather than distributed across the buckets.
+- `coverage` — **read this before the buckets**. `decomposed` means the
+  runtime emits per-tool events (codex, kimi). `opaque_runtime` means it does
+  not: Claude reports a single final envelope and no tool events, so an opaque
+  row has zero commands however long the job took. An opaque profile is
+  therefore a blind spot, NOT a measurement that the job spent all its time
+  outside commands - exclude those rows from any decomposition rather than
+  averaging them in.
+
+Two confounders to hold fixed when comparing profiles, both measured: jobs
+whose id does not begin `local-review-` include `workflow-*` rows that run an
+order of magnitude shorter and will halve an aggregate median, and
+concurrency-at-start alone moves p50 by roughly 2.6x.
+
 ### Evidence-graded proof manifests
 
 ```sh
