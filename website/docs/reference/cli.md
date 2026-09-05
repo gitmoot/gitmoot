@@ -31,6 +31,19 @@ job whose directly recorded runtime PID is confirmably dead is a
 required `stuck jobs` failure; legacy jobs with no recorded PID and hosts where
 process identity cannot be verified are neutral and produce no ghost-job
 finding.
+A runtime that is installed and contract-valid is not necessarily SERVING, and
+`doctor` reports the difference (#1558). When the engine is currently holding a
+job off a provider refusal - a `runtime_quota` or `runtime_auth` blocker whose
+recorded retry time is still in the future - the `runtime serving` check warns
+and names the runtime, the blocker class, the retry time and the job id. The
+verdict is the engine's own forward-looking hold, not a second opinion about the
+provider: a hold whose retry time has passed, a job that reached a terminal
+state, a blocker row carrying no retry time, and a job whose runtime cannot be
+attributed are all neutral, so a stale row can never be read as a current
+refusal. It is a warning rather than a failure because the binary and its
+contract are fine; what the operator needs is to not put that runtime on a
+review panel today.
+
 Doctor validates `[remote_exec]` through the same configuration loader used by
 job dispatch. An absent section passes because remote execution is opt-in; an
 invalid backend, identity pair, numeric identity, or local root is a required

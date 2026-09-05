@@ -159,6 +159,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	paths, pathsErr := pathsFromFlag(*home)
 	buildStatus := daemonBuildStatus(paths)
 	stuckStatus := stuckJobsStatus(paths)
+	servingStatus := runtimeServingStatus(paths)
 	logStatus := daemonLogStatus(paths)
 	probeRunner, authState, authSource, authErr := runtimeJobRunnerWithAuth(*home, runtime.ClaudeRuntime, nil)
 	contractResults := make([]runtime.RuntimeContractResult, 0, len(runtime.BuiltinRuntimeRegistry().All()))
@@ -176,6 +177,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		SkipDaemonAuth:    true,
 		Build:             &buildStatus,
 		StuckJobs:         stuckStatus,
+		RuntimeServing:    servingStatus,
 		LogStatus:         &logStatus,
 		RuntimeContracts:  contractResults,
 	}

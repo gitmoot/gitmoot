@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -102,6 +103,11 @@ type Checker struct {
 	// StuckJobs is supplied by the CLI, which owns store access and process
 	// probing. Nil omits the check for callers such as the dashboard.
 	StuckJobs *StuckJobsStatus
+	// RuntimeServing is supplied by the CLI, which owns store access, and names
+	// the runtimes the engine is currently holding off a provider refusal
+	// (#1558). Nil omits the check: a dashboard that cannot resolve holds must
+	// not imply every runtime is serving.
+	RuntimeServing *RuntimeServingStatus
 	// LogStatus is supplied by the one-shot CLI. Nil omits the check for callers
 	// such as the continuously refreshed terminal dashboard.
 	LogStatus *DaemonLogStatus
@@ -146,6 +152,9 @@ func (c Checker) GlobalChecks(ctx context.Context) []Check {
 	}
 	if c.StuckJobs != nil {
 		checks = append(checks, CheckStuckJobs(*c.StuckJobs))
+	}
+	if c.RuntimeServing != nil {
+		checks = append(checks, CheckRuntimeServing(*c.RuntimeServing))
 	}
 	if c.LogStatus != nil {
 		// Preserve the existing doctor surface unless staleness is positively
@@ -577,4 +586,78 @@ func firstLine(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// RuntimeServingBlock is one runtime the ENGINE is currently holding off a
+// provider refusal (#1558). It is inert data: the CLI resolves it from the
+// store and doctor renders it, so this package keeps its store independence.
+type RuntimeServingBlock struct {
+	// Runtime is the runtime the blocked job would have run on, resolved by the
+	// caller. A job whose runtime cannot be attributed is NOT reported at all.
+	Runtime string
+	// Class is the blocker class the classifier recorded (runtime_quota or
+	// runtime_auth).
+	Class string
+	// JobID and Detail name the evidence so the row is actionable rather than
+	// merely red.
+	JobID  string
+	Detail string
+	// RetryAt is the engine's own forward-looking hold: the moment it intends to
+	// retry. The caller reports a block ONLY while this is in the future, so the
+	// verdict is the engine's current belief rather than a guess from a clock.
+	RetryAt time.Time
+}
+
+// RuntimeServingStatus records the provider-refusal holds the engine is sitting
+// on right now.
+type RuntimeServingStatus struct {
+	Blocks []RuntimeServingBlock
+}
+
+// CheckRuntimeServing distinguishes "installed and contract-valid" from
+// "serving" (#1558).
+//
+// The false green this replaces: `doctor` reported kimi `ok 0.29.2 / contract
+// ok` while the daemon had, eleven minutes earlier, deferred two review jobs on
+// `provider.api_error: 403 You've reached your usage limit for this billing
+// cycle`. Capability present, service unavailable - the same shape AGENTS.md
+// already records for CLAUDE_CODE_OAUTH_TOKEN, one layer out. It cost a real
+// decision: kimi went on a review panel on doctor's word and its legs deferred
+// indefinitely.
+//
+// WHAT THIS CHECK DELIBERATELY IS NOT: a second opinion about the provider. It
+// reports only what the ENGINE currently believes, keyed on the forward-looking
+// BlockerRetryAt the classifier wrote when it deferred the job. A verdict
+// derived from "the store says 403 sometime" would be a stale row read as
+// current - and replacing a false green with a false red is the same defect with
+// the sign flipped. The caller therefore filters to holds that have not expired,
+// and every state it cannot interpret is neutral.
+//
+// It is a WARNING, not a failure: the runtime is installed and its contract is
+// valid, the provider is refusing today, and the operator's decision is which
+// runtime to put on a panel rather than whether the box is broken.
+func CheckRuntimeServing(status RuntimeServingStatus) Check {
+	check := Check{
+		Name:   "runtime serving",
+		OK:     true,
+		Detail: "no runtime is held on a provider refusal the engine is still waiting out",
+	}
+	if len(status.Blocks) == 0 {
+		return check
+	}
+	details := make([]string, 0, len(status.Blocks))
+	for _, block := range status.Blocks {
+		detail := fmt.Sprintf("%s: %s until %s (job %s)", block.Runtime, block.Class,
+			block.RetryAt.UTC().Format(time.RFC3339), block.JobID)
+		if strings.TrimSpace(block.Detail) != "" {
+			detail += ": " + strings.TrimSpace(block.Detail)
+		}
+		details = append(details, detail)
+	}
+	sort.Strings(details)
+	check.OK = false
+	check.State = "warn"
+	check.Detail = fmt.Sprintf("%d runtime(s) installed and contract-valid but NOT serving - the engine is holding a provider refusal: %s",
+		len(status.Blocks), strings.Join(details, "; "))
+	return check
 }
