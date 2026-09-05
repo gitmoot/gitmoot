@@ -106,27 +106,41 @@ func TestObjectionAtCurrentHeadStillRequestsChanges(t *testing.T) {
 // #1903's third review round found that claim still living here after the
 // function comment had been corrected.
 //
-// PolicyMergeGate reaches the objection ROW independently of task state, by
-// EITHER of two paths - naming only the first is what produced the P1 on the
-// comment below this one:
+// PolicyMergeGate reaches a review ROW independently of task state, but WHICH
+// rows it reaches depends on the review population - naming a path without its
+// population is what produced the P1s on this comment and the one below it. Line
+// numbers here are relative to THIS BRANCH's tree: merge_gate.go moved on main
+// after this base (#1783 added ListPullRequestFiles and the
+// ensureWorkloadModeReconciled block), so the same symbols sit ~6 lines later
+// there.
 //
 //   - STRICT evaluated-head population: the head is derived live
 //     (merge_gate.go:288 GetPullRequest -> :311), review evaluation is entered
 //     unconditionally (:320 -> :439), rows whose payload.HeadSHA equals that head
 //     are collected (:809-816), and changes_requested/blocked/failed among them
-//     returns mergeBlocked (:895-898).
+//     returns mergeBlocked (:895-898). A row at a STALE head is EXCLUDED here
+//     whenever any current-head row survives: see
+//     TestPolicyMergeGateIgnoresReviewJobsAtStaleHeadForQuorum
+//     (merge_gate_test.go:4111), which merges a PR while a stale headed FAILED
+//     row is ignored.
 //   - LATEST-ROUND fallback, taken only when that population is EMPTY
-//     (:984-1004 select the latest round over all taskReviews, :1052-1058 call
-//     ensureReviewMatchesHead before any decision is inspected, :1635-1656 refuse
-//     a NON-EMPTY head that mismatches). An ABSENT head is governed by the
-//     integration markers instead, not by this arm - see
-//     TestObjectionWithNoHeadStillRequestsChanges below.
+//     (:978-1044 select the latest round over all taskReviews and head-check its
+//     eligible rows at :1048 before any decision is inspected; :1629 refuses a
+//     NON-EMPTY head that mismatches). It examines only the SELECTED round, so an
+//     older headed row is not reached here either -
+//     TestPolicyMergeGateEmptyReviewRoundUsesRecordedRecency (:1874) pins that
+//     selection. An ABSENT head is governed by the integration markers instead,
+//     not by this arm - see TestObjectionWithNoHeadStillRequestsChanges below.
 //
-// This arm's row HAS a head, so it lands in the strict population or, if
-// superseded there, is refused by the fallback. Refusing the TASK transition does
-// not un-record the REVIEW ROW, so it cannot open a merge. What it costs is the
-// conservative transition and the inline fix pass, withheld from an objection
-// nobody can show is stale.
+// This arm's row carries a head the engine CANNOT CONFIRM (there is no observed
+// pull request row to compare it against), so which gate path reaches it is
+// decided at gate time by the live head: equal to it, the row enters the strict
+// population and blocks the merge; not equal, it is ignored by BOTH paths. The
+// second case is not a coverage gap - a verdict about a commit the branch moved
+// past has no claim on the current head, which is this PR's own rule. In neither
+// case does refusing the TASK transition un-record the REVIEW ROW, so refusing
+// here buys no merge protection. What it costs is the conservative transition and
+// the inline fix pass, withheld from an objection nobody can show is stale.
 func TestObjectionWithNoObservedPullRequestRowStillRequestsChanges(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -216,13 +230,13 @@ func TestStaleObjectionDispatchesNoFixLeg(t *testing.T) {
 // and independent of the equality arm), not invisibility to the gate:
 //
 //   - No current-head review exists -> the strict population is empty, so the
-//     LATEST-ROUND fallback runs (:984-1004) and calls ensureReviewMatchesHead on
-//     each eligible row BEFORE any decision is inspected (:1052-1058). What
-//     happens next depends on the INTEGRATION MARKERS, and this branch is
-//     first-class rather than a footnote: a headless row lacking BOTH
-//     DelegationID and WorktreePath is refused at :1635-1656 ("does not record a
-//     head SHA; rerun review"), while an integration-marked headless row is
-//     ACCEPTED by isIntegrationWorktreeReview (:1662-1664) and evaluated on its
+//     LATEST-ROUND fallback runs (:978-1044) and calls ensureReviewMatchesHead on
+//     each eligible row BEFORE any decision is inspected (:1048). What happens
+//     next depends on the INTEGRATION MARKERS, and this branch is first-class
+//     rather than a footnote: a headless row lacking BOTH DelegationID and
+//     WorktreePath is refused at :1629 ("does not record a head SHA; rerun
+//     review"), while an integration-marked headless row is ACCEPTED by
+//     isIntegrationWorktreeReview (:1657) and evaluated on its
 //     decision. Measured on this host's store when this comment was written: 179
 //     headless review rows, of which 164 carry both markers and take the ACCEPT
 //     path and 15 take "rerun review". So "the fallback refuses headless rows" is
@@ -239,7 +253,7 @@ func TestStaleObjectionDispatchesNoFixLeg(t *testing.T) {
 // TestPolicyMergeGateBlocksLegacyReviewWithoutHeadSHA (merge_gate_test.go:4939)
 // pins the head-check rejection, but its headless row carries decision
 // "approved" - the rejection is decision-agnostic BY CODE PATH, because the head
-// check at :1052-1058 runs before the decision switch, so the OBJECTION variant
+// check at :1048 runs before the decision switch, so the OBJECTION variant
 // follows from shared code rather than from a fixture.
 // TestPolicyMergeGateHeadlessIntegrationObjectionDoesNotMatchEveryHead
 // (merge_gate_test.go:4862) pins the strict-population/skip mechanism, but its

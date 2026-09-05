@@ -811,20 +811,27 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			// earlier version of this comment called it "the safety argument", and
 			// #1903's third review round caught that residue.
 			//
-			// The safety is supplied elsewhere, by whichever of PolicyMergeGate's two
-			// paths reaches the row: the STRICT evaluated-head population
-			// (merge_gate.go:288/:311 live head, :809-816 head filter, :895-898
-			// mergeBlocked), or - only when that population is EMPTY - the
-			// LATEST-ROUND fallback (:984-1004, head-checked at :1052-1058 and
-			// :1635-1656 before any decision is read). A row carrying a head is
-			// reached by one or the other, so refusing HERE cannot protect that
-			// merge.
+			// The safety is supplied elsewhere, by PolicyMergeGate - but only for the
+			// rows a given evaluation actually reaches, so name the population, never
+			// a coverage absolute (#1903's fifth round killed "a row carrying a head
+			// is reached by one or the other", which is false). Line numbers are
+			// relative to THIS BRANCH's tree; merge_gate.go moved on main after this
+			// base (#1783), where the same symbols sit ~6 lines later.
+			// An objection at the CURRENT head enters the STRICT evaluated-head
+			// population (merge_gate.go:288/:311 live head, :809-816 head filter,
+			// :895-898 mergeBlocked) and holds the merge there. When that population
+			// is EMPTY the LATEST-ROUND fallback runs (:978-1044) and head-checks
+			// only the SELECTED round's eligible rows (:1048, refused at :1629). A
+			// row at a STALE head is therefore reached by NEITHER path - which is
+			// head-binding working rather than a gap, since a verdict about a commit
+			// the branch moved past has no claim on the current head.
 			//
 			// What differs between the two sides is the consequence of refusing:
 			// refusing an unconfirmable APPROVAL fails safe, because nothing merges
 			// while the doubt stands; refusing an objection withholds the
-			// conservative transition and the inline fix pass while the gate still
-			// holds the merge on the paths above. So when no observed pull request
+			// conservative transition and the inline fix pass without buying any
+			// merge protection, because refusing the TASK transition does not
+			// un-record the REVIEW ROW. So when no observed pull request
 			// row records a head, this arm ADMITS - refusing would block a
 			// legitimate objection on a PR the daemon has not polled yet, which is
 			// the CLI-dispatch path, and would make the engine's cheapest
