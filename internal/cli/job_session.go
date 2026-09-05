@@ -216,6 +216,7 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	agent := fs.String("agent", "", "agent that performed the session work (must exist)")
+	actingRole := fs.String("acting-role", "", "org role that performed the session work in place of an agent (must exist)")
 	repo := fs.String("repo", "", "repo scope as owner/repo (must be tracked)")
 	typeName := fs.String("type", "", "job type: "+strings.Join(workflow.DelegationActions, "|"))
 	decision := fs.String("decision", "", "result decision: "+strings.Join(workflow.ResultDecisions, "|"))
@@ -245,8 +246,19 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 	if !ok {
 		return 2
 	}
-	if strings.TrimSpace(*agent) == "" || strings.TrimSpace(*repo) == "" {
-		fmt.Fprintln(stderr, "job record requires --agent and --repo")
+	// EXACTLY ONE ACTOR, NAMED HONESTLY. An org role is not an agent (#1718): the
+	// two are separate namespaces, and the documented remedy for an attribution gap
+	// was unrunnable for in-session coordinator work because only --agent existed.
+	// Accepting BOTH at once would let a caller record work as an agent's while
+	// claiming a role did it, which is the false attribution this guards against.
+	hasAgent := strings.TrimSpace(*agent) != ""
+	hasRole := strings.TrimSpace(*actingRole) != ""
+	switch {
+	case hasAgent && hasRole:
+		fmt.Fprintln(stderr, "job record accepts --agent or --acting-role, not both: one job has one implementer")
+		return 2
+	case !hasAgent && !hasRole, strings.TrimSpace(*repo) == "":
+		fmt.Fprintln(stderr, "job record requires --agent or --acting-role, and --repo")
 		return 2
 	}
 	if !validateSessionDecision(*decision, stderr) {
@@ -262,7 +274,7 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 
 	var out jobSessionOutput
 	if err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
-		fullName, err := validateSessionAgentRepo(context.Background(), store, *agent, *repo)
+		fullName, err := validateSessionActorRepo(context.Background(), store, *agent, *actingRole, *repo)
 		if err != nil {
 			return err
 		}
@@ -271,16 +283,17 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 		}
 		engine := sessionWorkflowEngine(store, paths.Home)
 		opened, err := engine.OpenExternalJob(context.Background(), workflow.JobRequest{
-			ID:          sessionJobID(action, *agent),
-			Agent:       *agent,
-			Action:      action,
-			Repo:        fullName,
-			TaskID:      strings.TrimSpace(*task),
-			TaskTitle:   strings.TrimSpace(*title),
-			ParentJobID: strings.TrimSpace(*parentJobID),
-			PullRequest: *pr,
-			HeadSHA:     strings.TrimSpace(*headSHA),
-			Sender:      "session",
+			ID:            sessionJobID(action, firstNonEmptySessionActor(*agent, *actingRole)),
+			Agent:         strings.TrimSpace(*agent),
+			ActingOrgRole: strings.TrimSpace(*actingRole),
+			Action:        action,
+			Repo:          fullName,
+			TaskID:        strings.TrimSpace(*task),
+			TaskTitle:     strings.TrimSpace(*title),
+			ParentJobID:   strings.TrimSpace(*parentJobID),
+			PullRequest:   *pr,
+			HeadSHA:       strings.TrimSpace(*headSHA),
+			Sender:        "session",
 		})
 		if err != nil {
 			return err
@@ -391,6 +404,36 @@ func validateSessionAgentRepo(ctx context.Context, store *db.Store, agentName, r
 		return "", err
 	}
 	return validateSessionRepo(ctx, store, repoFlag)
+}
+
+// validateSessionActorRepo validates whichever actor the caller named. Exactly one
+// of agentName/roleName is non-empty by the time this runs.
+//
+// A ROLE IS VALIDATED AGAINST THE ROLE REGISTRY, NOT THE AGENT ONE. That is the
+// whole correction: GetOrgRolePresence already records every role that has acted,
+// so no new table is introduced, and an unknown role is still refused rather than
+// recorded on trust.
+func validateSessionActorRepo(ctx context.Context, store *db.Store, agentName, roleName, repoFlag string) (string, error) {
+	if role := strings.TrimSpace(roleName); role != "" {
+		_, found, err := store.GetOrgRolePresence(ctx, role)
+		if err != nil {
+			return "", err
+		}
+		if !found {
+			return "", fmt.Errorf("org role %q not found", roleName)
+		}
+		return validateSessionRepo(ctx, store, repoFlag)
+	}
+	return validateSessionAgentRepo(ctx, store, agentName, repoFlag)
+}
+
+// firstNonEmptySessionActor keeps the generated job id discriminated by whichever
+// actor was named, so role-recorded jobs do not collide on a shared prefix.
+func firstNonEmptySessionActor(agentName, roleName string) string {
+	if agent := strings.TrimSpace(agentName); agent != "" {
+		return agent
+	}
+	return strings.TrimSpace(roleName)
 }
 
 // validateSessionParentJob keeps the optional parent link factual: a supplied id
