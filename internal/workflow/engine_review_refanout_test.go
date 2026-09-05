@@ -51,6 +51,16 @@ func TestReviewingTaskResumeWorkRearmsNextHeadFanout(t *testing.T) {
 func TestFollowUpReviewScopesFindingsAndFilesFromReviewerHead(t *testing.T) {
 	ctx := context.Background()
 	store, engine := reviewRefanoutFixture(t)
+	// #1524: the objection arm refuses a verdict whose head cannot be compared to
+	// the pull request's observed head. This test is about the FOLLOW-UP review's
+	// scoping, and it drives a prior changes_requested at "head-one", so it seeds
+	// that observation rather than changing its subject.
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: "gitmoot/gitmoot", Number: 1678, HeadBranch: "task-1678", BaseBranch: "main",
+		HeadSHA: "head-one", State: "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
 	insertCompletedJob(t, store, db.Job{ID: "initial-implement", Agent: "lead", Type: "implement"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		Branch:      "task-1678",

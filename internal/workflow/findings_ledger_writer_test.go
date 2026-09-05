@@ -27,6 +27,15 @@ func TestAdvanceJobRecordsReviewFindingsToTheLedger(t *testing.T) {
 	seedAgent(t, store, "gm-review-opus", []string{"review"}, "gitmoot/gitmoot")
 	engine := testEngine(store)
 	head := strings.Repeat("d", 40)
+	// #1524: the objection arm now refuses a verdict whose head cannot be compared
+	// to the pull request's observed head. This fixture is about the findings ledger writer, not about
+	// heads, so it seeds the observation explicitly and keeps its own subject.
+	if err := store.UpsertPullRequest(context.Background(), db.PullRequest{
+		RepoFullName: "gitmoot/gitmoot", Number: 1850, HeadBranch: "task-9", BaseBranch: "main",
+		HeadSHA: head, State: "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
 
 	findings := []json.RawMessage{
 		json.RawMessage(`{"id":"F1","severity":"P1","file":"internal/db/review_findings.go","line":115,"title":"no production writer","detail":"the ledger is inert"}`),
@@ -148,6 +157,15 @@ func TestAdvanceJobSurvivesAFailedLedgerAuditEvent(t *testing.T) {
 	seedAgent(t, store, "gm-review-opus", []string{"review"}, "gitmoot/gitmoot")
 	engine := testEngine(store)
 	head := strings.Repeat("e", 40)
+	// #1524: the objection arm now refuses a verdict whose head cannot be compared
+	// to the pull request's observed head. This fixture is about ledger audit-event failure handling, not about
+	// heads, so it seeds the observation explicitly and keeps its own subject.
+	if err := store.UpsertPullRequest(context.Background(), db.PullRequest{
+		RepoFullName: "gitmoot/gitmoot", Number: 1851, HeadBranch: "task-9", BaseBranch: "main",
+		HeadSHA: head, State: "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
 
 	insertCompletedJob(t, store, db.Job{ID: "review-audit", Agent: "gm-review-opus", Type: "review"}, JobPayload{
 		Repo: "gitmoot/gitmoot", Branch: "task-9", PullRequest: 1851, HeadSHA: head,

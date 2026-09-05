@@ -157,6 +157,15 @@ func TestEngineReviewVerdictResolverErrorDoesNotFallbackToLead(t *testing.T) {
 func TestEngineReturnsChangesRequestedToRequesterWithoutDefaultAutoFix(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
+	// #1524: the objection arm now refuses a verdict whose head cannot be compared
+	// to the pull request's observed head. This fixture is about the event sink, not about
+	// heads, so it seeds the observation explicitly and keeps its own subject.
+	if err := store.UpsertPullRequest(context.Background(), db.PullRequest{
+		RepoFullName: "gitmoot/gitmoot", Number: 43, HeadBranch: "task-9", BaseBranch: "main",
+		HeadSHA: "head43", State: "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
 
 	seedAgent(t, store, "author", []string{"implement"}, "gitmoot/gitmoot")
 	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")

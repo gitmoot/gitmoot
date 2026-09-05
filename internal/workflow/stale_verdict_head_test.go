@@ -96,16 +96,12 @@ func TestObjectionAtCurrentHeadStillRequestsChanges(t *testing.T) {
 	}
 }
 
-// UNKNOWN IS NOT SUPERSEDED. With no observed pull request row the objection's
-// head cannot be compared, and this arm ADMITS - the deliberate asymmetry with
-// the approval side, which refuses transiently there because a merge is
-// irreversible while an objection only stops one.
-//
-// This arm exists because my first implementation refused here, and six
-// pre-existing engine tests failed: their fixtures carry no observed PR row, so
-// a legitimate objection was blocked. The tests were right and the design was
-// wrong.
-func TestObjectionWithNoObservedPullRequestRowStillRequestsChanges(t *testing.T) {
+// MISSING EVIDENCE RETRIES, mirroring approvalSupersedesChangesRequested's own
+// retryable split rather than inventing retry semantics: with no observed pull
+// request row the objection's head cannot be compared, the row appears as soon
+// as the daemon polls the PR, and settling here would drop a verdict about to
+// become checkable.
+func TestObjectionWithNoObservedPullRequestRowIsRetriedNotSettled(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	if err := store.UpsertTask(ctx, db.Task{
@@ -119,11 +115,49 @@ func TestObjectionWithNoObservedPullRequestRowStillRequestsChanges(t *testing.T)
 
 	seedReviewJob(t, store, "review-unobserved", "auditor", "head-old", "changes_requested", JobSucceeded)
 
-	if err := engine.AdvanceJob(ctx, "review-unobserved"); err != nil {
+	err := engine.AdvanceJob(ctx, "review-unobserved")
+	if err == nil {
+		t.Fatal("AdvanceJob returned nil: an unconfirmable head must be retried, not settled")
+	}
+	if !strings.Contains(err.Error(), "no observed pull request row") {
+		t.Fatalf("error = %v, want it to name the missing observation", err)
+	}
+	assertTaskState(t, store, "task-9", TaskReadyToMerge)
+	if reason := staleHeadSkipReason(t, store, "review-unobserved"); reason != "" {
+		t.Fatalf("a transient refusal must not record a terminal skip event: %q", reason)
+	}
+}
+
+// AN UNBOUND OBJECTION STILL ADVANCES, pinned deliberately rather than left as a
+// side effect of six tests written about ownership routing (#1900's shape: a
+// property owned by one file, relied on by another, asserted nowhere).
+//
+// A CLI review dispatched as `gitmoot agent review <r> --repo o/r --pr N` with no
+// --head-sha produces exactly this payload today, so this is real traffic rather
+// than a fixture artefact. Admitting is the claim-nothing direction: refusing a
+// headless APPROVAL fails safe because the PR does not merge, while refusing a
+// headless OBJECTION fails PERMISSIVE - it drops a real complaint and leaves the
+// PR in whatever merge-ward state it held.
+func TestObjectionWithNoHeadStillRequestsChanges(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	seedObservedPullRequest(t, store, "head-new")
+	seedImplementAttribution(t, store)
+	engine, _ := wedgeEngine(t, store)
+
+	seedReviewJob(t, store, "review-headless", "auditor", "", "changes_requested", JobSucceeded)
+
+	if err := engine.AdvanceJob(ctx, "review-headless"); err != nil {
 		t.Fatalf("AdvanceJob returned error: %v", err)
 	}
 	assertTaskState(t, store, "task-9", TaskChangesRequested)
-	if reason := staleHeadSkipReason(t, store, "review-unobserved"); reason != "" {
-		t.Fatalf("an unconfirmable head must admit, not skip: %q", reason)
+	if reason := staleHeadSkipReason(t, store, "review-headless"); reason != "" {
+		t.Fatalf("a headless objection must advance, not be skipped: %q", reason)
 	}
 }

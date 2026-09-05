@@ -39,6 +39,15 @@ func TestAdvanceJobRefusesToRecordStaticOnlyAsExecuted(t *testing.T) {
 	seedAgent(t, store, "gm-review-opus", []string{"review"}, "gitmoot/gitmoot")
 	engine := testEngine(store)
 	head := strings.Repeat("c", 40)
+	// #1524: the objection arm now refuses a verdict whose head cannot be compared
+	// to the pull request's observed head. This fixture is about static-only evidence recording, not about
+	// heads, so it seeds the observation explicitly and keeps its own subject.
+	if err := store.UpsertPullRequest(context.Background(), db.PullRequest{
+		RepoFullName: "gitmoot/gitmoot", Number: 1900, HeadBranch: "task-9", BaseBranch: "main",
+		HeadSHA: head, State: "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
 	prior := strings.Repeat("d", 40)
 
 	uid, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
