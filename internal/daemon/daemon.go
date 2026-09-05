@@ -2524,22 +2524,34 @@ func pullRequestListedAsMerged(pull github.PullRequest) bool {
 // head reports sql.ErrNoRows, which every caller already handles as "this pull
 // request has no managed task".
 func (d Daemon) lookupPolledPullRequestTask(ctx context.Context, pull github.PullRequest) (db.Task, error) {
+	repo := d.Repo.FullName()
 	if !d.pullRequestHeadIsLocal(pull) {
 		// #1909: a refusal that names only the branch is undiagnosable — three
 		// reproductions on gitmoot/gitmoot#1783 could not say WHICH input
 		// mismatched, because the ack text carries pull.HeadRef and nothing else.
 		// Log every value the decision was made on, at the one site that makes it.
 		d.logf("task resolution refused for %s#%d: reason=fork_head repo=%q head_repo=%q head_ref=%q",
-			d.Repo.FullName(), pull.Number, d.Repo.FullName(), pull.HeadRepoFullName, pull.HeadRef)
+			repo, pull.Number, repo, pull.HeadRepoFullName, pull.HeadRef)
 		return db.Task{}, sql.ErrNoRows
 	}
-	task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
-	if errors.Is(err, sql.ErrNoRows) {
+	task, err := d.lookupPullRequestTask(ctx, repo, pull.HeadRef)
+	// The repo-mismatch arm below already logged the values it decided on. Adding
+	// no_task_for_branch on top would give ONE refusal TWO contradictory reason
+	// tags — the exact ambiguity #1909 exists to remove — so log this reason only
+	// when the inner resolver refused for want of a task row.
+	if errors.Is(err, sql.ErrNoRows) && !errors.Is(err, errTaskRepoMismatch) {
 		d.logf("task resolution refused for %s#%d: reason=no_task_for_branch repo=%q head_repo=%q head_ref=%q",
-			d.Repo.FullName(), pull.Number, d.Repo.FullName(), pull.HeadRepoFullName, pull.HeadRef)
+			repo, pull.Number, repo, pull.HeadRepoFullName, pull.HeadRef)
 	}
 	return task, err
 }
+
+// errTaskRepoMismatch marks the refusal arm where the branch string resolved a
+// task BY ID whose task belongs to another repository. It always accompanies
+// sql.ErrNoRows, so every caller's "this pull request has no managed task"
+// branch is unchanged; it exists only so the resolver above can tell that arm
+// apart from an absent task row and emit exactly one reason per refusal.
+var errTaskRepoMismatch = errors.New("task belongs to another repository")
 
 func (d Daemon) lookupPullRequestTask(ctx context.Context, repoFullName string, branch string) (db.Task, error) {
 	task, err := d.Store.GetTaskByRepoBranch(ctx, repoFullName, branch)
@@ -2559,7 +2571,7 @@ func (d Daemon) lookupPullRequestTask(ctx context.Context, repoFullName string, 
 		// logged (#1909).
 		d.logf("task resolution refused for %s: reason=task_repo_mismatch lookup_repo=%q task=%q task_repo=%q",
 			branch, repoFullName, task.ID, task.RepoFullName)
-		return db.Task{}, sql.ErrNoRows
+		return db.Task{}, fmt.Errorf("%w: %w", errTaskRepoMismatch, sql.ErrNoRows)
 	}
 	return task, nil
 }

@@ -157,6 +157,54 @@ func TestLookupPullRequestTaskLogsTaskRepoMismatchInputs(t *testing.T) {
 	}
 }
 
+// The composed path, which the direct-call test above cannot reach: a polled PR
+// whose HeadRef happens to equal ANOTHER repository's task ID. lookupPullRequestTask's
+// id fallback (db.Store.GetTask is a global lookup, not repo-scoped) refuses with
+// the repo-mismatch reason, and the polled resolver used to add no_task_for_branch
+// on top - one event, two contradictory reason tags, which is the ambiguity #1909
+// exists to remove. Exactly one refusal line must survive, and it must be the arm
+// that actually decided.
+func TestLookupPolledPullRequestTaskLogsOneReasonWhenTaskBelongsToAnotherRepo(t *testing.T) {
+	ctx := context.Background()
+	store, daemon, logs := newResolverLogDaemon(t)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "task-elsewhere",
+		RepoFullName: "other/repo",
+		GoalID:       "goal-1",
+		Title:        "Task in another repository",
+		State:        "pr_open",
+		Branch:       "some-branch",
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+
+	_, err := daemon.lookupPolledPullRequestTask(ctx, github.PullRequest{
+		Number:           42,
+		HeadRef:          "task-elsewhere",
+		HeadRepoFullName: "gitmoot/gitmoot",
+	})
+	// Resolution behaviour is unchanged: every caller reads this as "no managed
+	// task", so the reason marker must not become visible as a different error.
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("error = %v, want sql.ErrNoRows through the polled resolver", err)
+	}
+
+	line := onlyRefusalLog(t, *logs)
+	for _, want := range []string{
+		"reason=task_repo_mismatch",
+		`lookup_repo="gitmoot/gitmoot"`,
+		`task="task-elsewhere"`,
+		`task_repo="other/repo"`,
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("composed refusal log = %q, want it to contain %q", line, want)
+		}
+	}
+	if strings.Contains(line, "reason=no_task_for_branch") {
+		t.Fatalf("composed refusal log = %q, want the deciding arm's reason only", line)
+	}
+}
+
 // Successful resolution must stay silent: a log line per resolved PR per poll
 // would bury the refusals this change exists to surface.
 func TestLookupPolledPullRequestTaskLogsNothingOnSuccess(t *testing.T) {
