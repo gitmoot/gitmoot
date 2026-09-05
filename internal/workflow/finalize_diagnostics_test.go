@@ -130,3 +130,50 @@ func TestFinalizeDelegationChildPreservesExistingDiagnostics(t *testing.T) {
 		t.Fatalf("the finalizer overwrote a real crash report with a generic marker: %+v", payload.FailureDiagnostics)
 	}
 }
+
+// The other finalizer. FinalizeFailedDelegationChild is a DIFFERENT entry point
+// with its own event kind (JobEventDelegationRuntimeFailureFinalized), and #1512
+// split these four kinds apart precisely because a timed-out leg, a superseded
+// one, a refused one and a mid-run runtime failure used to be indistinguishable.
+// A guard proven only on the timeout path would leave three of the four causes
+// still unreadable, so this pins the runtime-failure entry too.
+func TestFinalizeFailedDelegationChildRecordsWhyItEnded(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := Engine{Store: store}
+
+	insertQueuedJob(t, store, db.Job{ID: "parent-3", Agent: "coordinator", Type: "review"},
+		JobPayload{Repo: "gitmoot/gitmoot", PullRequest: 1910, TaskID: "task-3"})
+	insertQueuedJob(t, store, db.Job{
+		ID: "parent-3/delegation/lens-regression", Agent: "lens", Type: "review", DelegationID: "lens-regression",
+	}, JobPayload{
+		Repo: "gitmoot/gitmoot", PullRequest: 1910, TaskID: "task-3", ParentJobID: "parent-3",
+	})
+	if _, err := store.TransitionJobState(ctx, "parent-3/delegation/lens-regression", string(JobQueued), string(JobRunning)); err != nil {
+		t.Fatalf("TransitionJobState: %v", err)
+	}
+
+	const reason = `sandbox-exec: resolve sandbox target "claude": executable file not found in $PATH`
+	if _, err := engine.FinalizeFailedDelegationChild(ctx, "parent-3/delegation/lens-regression", reason); err != nil &&
+		!strings.Contains(err.Error(), "workflow blocked") {
+		t.Fatalf("FinalizeFailedDelegationChild returned an unexpected error: %v", err)
+	}
+
+	job, err := store.GetJob(ctx, "parent-3/delegation/lens-regression")
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	payload, err := unmarshalPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload: %v", err)
+	}
+	if payload.FailureDiagnostics == nil {
+		t.Fatal("a mid-run runtime failure finalized without a result carries NO diagnostics")
+	}
+	if payload.FailureDiagnostics.Phase != FailurePhaseFinalized {
+		t.Fatalf("phase = %q, want %q: no CLI session state was observed, so it must not claim one", payload.FailureDiagnostics.Phase, FailurePhaseFinalized)
+	}
+	if !strings.Contains(payload.FailureDiagnostics.DeliveryError, "executable file not found") {
+		t.Fatalf("the observed cause was lost: %+v", payload.FailureDiagnostics)
+	}
+}
