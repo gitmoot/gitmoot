@@ -644,34 +644,82 @@ wider grant to fix.
 
 ### `Permission denied`, exit 126, running Go
 
-NEVER INVOKE AN UNGRANTED TOOLCHAIN PATH FROM A SEAT. A pinned install such as
-`/root/.local/toolchains/go1.26.4/bin/go` is not readable there and returns exit
-126 whatever `GOTOOLCHAIN` says. Measured: three verdicts on one box in one
-hour, and the discriminator was not the flag - the two that failed both invoked
-the pinned path and the one that executed the full gate never referenced it.
+**A read-only seat is now given a Go toolchain automatically, and the old
+bootstrap-and-download workaround is retired.** The daemon stages an immutable
+COPY of the operator-pinned installation into a directory it owns, under the
+gitmoot home, and grants the seat a read on that copy plus `GOROOT`, `PATH` and
+`GOTOOLCHAIN=local`. A seat should simply run `go`.
 
-Use the distro bootstrap and let it fetch the release into the seat's OWN
-writable cache:
+The copy exists because a seat cannot be granted the operator's own installation
+safely: three review rounds on that shape each produced an escape, most recently
+a member symlink that walked a grant outside containment with no privilege
+required. A copy the daemon owns has no outside root to contain.
 
-```sh
-export GOTOOLCHAIN=go1.26.4          # an explicit RELEASE name
-export CGO_ENABLED=0                 # cgo dies on /usr/include EACCES; -race is unavailable
-export TMPDIR=<seat cache>/tmp GOCACHE=<seat cache>/gocache GOMODCACHE=<seat cache>/gomodcache
-/usr/lib/go-1.22/bin/go version      # -> go version go1.26.4 linux/amd64
-```
+What to expect:
 
-- `TMPDIR` must be a concrete path under the seat's own cache root. Both `/tmp`
-  and the workspace return EACCES on `mkdir` there, and "a writable dir" reads
-  as satisfied by `/tmp` when it is not.
-- Never pair `GOTOOLCHAIN=local` with the distro bootstrap: `local` forbids the
-  fetch, so you silently get 1.22.2, which cannot satisfy a `go 1.26` directive
-  and looks like a broken environment rather than a wrong flag. On a binary that
-  is ALREADY the required release, `local` is correct and more hermetic - the
-  hazard is the pairing, not the flag.
-- Never use a bare `go1.26`: that is the `go.mod` directive, not a released
-  toolchain name, and it fails with "toolchain not available".
-- Quote `go version` output in any note making a baseline claim. It is the check
-  that works without knowing which binary you got.
+- **`go version` works and reports the pinned release.** `GOTOOLCHAIN=local` is
+  correct here and more hermetic, because the staged copy already IS the required
+  release; there is nothing to fetch.
+- **The copy is per pinned version, materialised on first use, and reused.** It is
+  keyed on content, so an operator re-pinning the same version in place gets a new
+  copy rather than a stale compiler.
+- **The staged copy is read-only to the seat, always.** If it were writable a seat
+  could rewrite its own `go` binary, which is the defect the copy exists to remove.
+- **`CGO_ENABLED=0` is still required.** cgo reads `/usr/include`, which is outside
+  the seat's grants, so `-race` remains unavailable in a seat.
+- **`TMPDIR`, `GOCACHE` and `GOMODCACHE` must still be concrete paths under the
+  seat's own cache root.** Both `/tmp` and the workspace return `EACCES` on
+  `mkdir`, and "a writable dir" reads as satisfied by `/tmp` when it is not.
+
+If a seat still gets exit 126 running `go`, staging did not happen. **The reason is
+on the daemon's stderr, not in the job's events** - deliberately, because a fact
+about the host must not change a job's event stream. Look for
+`gitmoot: read-only seat toolchain:`. The causes, all of which leave the seat
+exactly as it was before this feature existed rather than failing the launch:
+
+- **No pinned toolchain on the daemon's `PATH`.** A toolchain under `/opt`,
+  `/usr/local`, `/nix/store` or `/snap` is treated as a system package and is NOT
+  copied; those keep their pre-existing location-only grant.
+- **The source is not a Go installation.** It must have an executable `bin/go` and a
+  `VERSION` file naming a Go release, both real files rather than symlinks.
+- **Free space is below the floor.** Staging refuses up front rather than filling the
+  filesystem, and the message names both the free bytes and the floor, which is 4
+  GiB. Reclaim space; do not lower the floor to make the message go away.
+- **The source contains a symlink.** A symlinked name is refused anywhere in the
+  copied set, because following one copies something the daemon never validated.
+  The check also proves the file it opened is the file it inspected, and staging
+  walks a directory through a held handle rather than re-resolving its path, so a
+  source whose *name* is redirected mid-copy is refused rather than followed -
+  including when the directory containing it is the thing replaced.
+
+**Two limits of that, stated rather than left implied.** First, it proves the file
+did not **change** between being inspected and being opened. A hardlink does not
+change the file - it is the same underlying object - so replacing a source file
+with a hardlink to another file is **not** detected. Two things bound this rather
+than excuse it: with the kernel default `fs.protected_hardlinks=1`, creating such
+a link already requires read and write access to the target, so it gains nothing
+an attacker did not already have; and the operator-pinned toolchain is root-owned
+and not writable by a seat, so a seat cannot create one. Second, staging reads the source **twice**, once to
+fingerprint it and once to copy it, and only executables are reconciled between
+those two reads: a non-executable that differs between them is not detected. Each
+read is internally consistent, so this is a gap between the passes rather than
+inside one. **If you point staging at a directory that untrusted processes can
+write, these are the gaps to know about** - the intended source is an installation
+only the operator can modify.
+
+To recover, fix the cause and restart the daemon, or run the seat's job again:
+staging is attempted per launch and a previously failed stage is retried rather
+than remembered. A staged copy that has become corrupt is detected on reuse and
+re-staged automatically, so deleting it by hand is not required. Staged copies
+are retained by current pin: a version still pinned is never collected, and a
+version nothing references is removed.
+
+**One limit, stated rather than implied:** the identity covers every executable in
+the copy, so a substituted compiler is always detected. It does not cover
+non-executable members such as `src` or `doc`, because re-hashing the whole 221.6
+MiB tree on every seat launch would cost more than the copy itself. The
+consequence of a torn non-executable member is a visibly broken toolchain and a
+build error, not a silently wrong compiler.
 
 ### Codex reviews report zero executed checks (`bwrap: setting up uid map`)
 
