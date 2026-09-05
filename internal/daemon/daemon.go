@@ -2525,9 +2525,20 @@ func pullRequestListedAsMerged(pull github.PullRequest) bool {
 // request has no managed task".
 func (d Daemon) lookupPolledPullRequestTask(ctx context.Context, pull github.PullRequest) (db.Task, error) {
 	if !d.pullRequestHeadIsLocal(pull) {
+		// #1909: a refusal that names only the branch is undiagnosable — three
+		// reproductions on gitmoot/gitmoot#1783 could not say WHICH input
+		// mismatched, because the ack text carries pull.HeadRef and nothing else.
+		// Log every value the decision was made on, at the one site that makes it.
+		d.logf("task resolution refused for %s#%d: reason=fork_head repo=%q head_repo=%q head_ref=%q",
+			d.Repo.FullName(), pull.Number, d.Repo.FullName(), pull.HeadRepoFullName, pull.HeadRef)
 		return db.Task{}, sql.ErrNoRows
 	}
-	return d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
+	task, err := d.lookupPullRequestTask(ctx, d.Repo.FullName(), pull.HeadRef)
+	if errors.Is(err, sql.ErrNoRows) {
+		d.logf("task resolution refused for %s#%d: reason=no_task_for_branch repo=%q head_repo=%q head_ref=%q",
+			d.Repo.FullName(), pull.Number, d.Repo.FullName(), pull.HeadRepoFullName, pull.HeadRef)
+	}
+	return task, err
 }
 
 func (d Daemon) lookupPullRequestTask(ctx context.Context, repoFullName string, branch string) (db.Task, error) {
@@ -2543,6 +2554,11 @@ func (d Daemon) lookupPullRequestTask(ctx context.Context, repoFullName string, 
 		return db.Task{}, err
 	}
 	if task.RepoFullName != "" && task.RepoFullName != repoFullName {
+		// The branch string resolved a task BY ID, but that task belongs to another
+		// repository. Distinguishable from "no such task" only when both values are
+		// logged (#1909).
+		d.logf("task resolution refused for %s: reason=task_repo_mismatch lookup_repo=%q task=%q task_repo=%q",
+			branch, repoFullName, task.ID, task.RepoFullName)
 		return db.Task{}, sql.ErrNoRows
 	}
 	return task, nil
