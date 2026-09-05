@@ -2312,8 +2312,11 @@ removal.
 
 ### Where a job's wall time went (`phase_profile`)
 
-Every job with a retained transcript emits one `phase_profile` job event at
-close, visible in `gitmoot job events <job-id>`. It answers "where did the wall
+Every **review** job with a retained transcript emits one `phase_profile` job
+event at close, visible in `gitmoot job events <job-id>`. Other job types are
+deliberately untouched: the profile is appended after a job's terminal events,
+so emitting it everywhere would change the observable event sequence of jobs
+this measurement has no business affecting. It answers "where did the wall
 time go" without a second measurement pass, because the transcript records what
 ran and not when: the streams carry no event timestamps, and replay
 deliberately refuses to invent elapsed time from parser speed, so the timing

@@ -95,7 +95,7 @@ func codexToolLines(callID, command string) (string, string) {
 
 func openInstrumentedTranscript(t *testing.T, home, jobID, runtimeName string, store *db.Store) *retainedTranscript {
 	t.Helper()
-	handle, err := openRetainedTranscriptLog(home, jobID, runtimeName, store)
+	handle, err := openRetainedTranscriptLog(home, jobID, "review", runtimeName, store)
 	if err != nil {
 		t.Fatalf("open retained transcript: %v", err)
 	}

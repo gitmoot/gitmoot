@@ -153,7 +153,7 @@ type retainedTranscript struct {
 // file. A job whose runtime is unknown, or whose runtime emits no tool events,
 // still gets a profile row - tagged opaque, because a silent absence is
 // indistinguishable from a fast run.
-func newRetainedTranscript(file *os.File, jobID, runtimeName string, store *db.Store) *retainedTranscript {
+func newRetainedTranscript(file *os.File, jobID, jobType, runtimeName string, store *db.Store) *retainedTranscript {
 	handle := &retainedTranscript{
 		file:        file,
 		store:       store,
@@ -161,6 +161,14 @@ func newRetainedTranscript(file *os.File, jobID, runtimeName string, store *db.S
 		started:     time.Now(),
 		bucketMS:    map[string]int64{},
 		bucketCount: map[string]int{},
+	}
+	// #1824 asks where a REVIEW's wall time goes, and the profile is appended
+	// after a job's terminal events. Emitting it for every job type would change
+	// the observable event sequence of jobs this work has no business touching -
+	// three exec-backend E2Es assert their sequence exactly, as their acceptance
+	// contract. Scope the instrument to the population it was built to measure.
+	if !strings.EqualFold(strings.TrimSpace(jobType), "review") {
+		return handle
 	}
 	handle.runtime = strings.TrimSpace(runtimeName)
 	if store == nil {

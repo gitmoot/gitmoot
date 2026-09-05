@@ -82,7 +82,7 @@ func TestRetainedTranscriptAndProgressShareRuntimeOutput(t *testing.T) {
 	agent := runtime.Agent{Name: "lead", Role: "builder", Runtime: runtime.ShellRuntime, RuntimeRef: "echo shared-line"}
 	tracker := &pipeline.PipelineProgressLineTracker{}
 
-	logFile, err := openRetainedTranscriptLog(home, "job-shared", "codex", nil)
+	logFile, err := openRetainedTranscriptLog(home, "job-shared", "review", "codex", nil)
 	logPath := retainedTranscriptLogPathForTest(t, home, "job-shared")
 	if err != nil {
 		t.Fatalf("openRetainedTranscriptLog: %v", err)
