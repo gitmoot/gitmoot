@@ -1,3 +1,5 @@
+//go:build e2e
+
 package cli
 
 import (
@@ -155,21 +157,6 @@ func runPipelineShellUpstreamContextE2E(t *testing.T, name, sourceSummary string
 	}
 	t.Fatalf("pipeline %s did not settle", name)
 	return "", nil
-}
-
-func pipelineShellResultCommand(t *testing.T, decision, summary string) string {
-	t.Helper()
-	raw, err := json.Marshal(map[string]any{
-		"gitmoot_result": map[string]any{
-			"decision": decision, "summary": summary,
-			"findings": []any{}, "changes_made": []any{}, "tests_run": []any{},
-			"needs": []any{}, "delegations": []any{},
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return `printf '%s' ` + posixQuote(string(raw))
 }
 
 func jsonString(t *testing.T, value string) string {

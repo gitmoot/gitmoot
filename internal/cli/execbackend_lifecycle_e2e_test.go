@@ -1,3 +1,5 @@
+//go:build e2e
+
 package cli
 
 import (
@@ -301,15 +303,6 @@ func TestRuntimeContractPreflightUsesConfiguredExecutionIdentityOnlyForLifecycle
 			}
 		})
 	}
-}
-
-func executionBackendConfigForTest(t *testing.T, worker jobWorker) config.RemoteExecConfig {
-	t.Helper()
-	cfg, err := worker.executionBackendConfig()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return cfg
 }
 
 func configuredLocalTestIdentity(t *testing.T) (uint32, uint32) {

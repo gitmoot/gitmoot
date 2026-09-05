@@ -1,3 +1,5 @@
+//go:build e2e
+
 package cli
 
 import (
@@ -436,38 +438,6 @@ func TestPipelineRemoveRefusesActiveServiceRun(t *testing.T) {
 	if _, ok, err := store.GetPipeline(ctx, "active-service"); err != nil || !ok {
 		t.Fatalf("active service pipeline was removed: ok=%v err=%v", ok, err)
 	}
-}
-
-func serviceRequest(t *testing.T, method, url, token, body string) *http.Response {
-	t.Helper()
-	request, err := http.NewRequest(method, url, strings.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if token != "" {
-		request.Header.Set("Authorization", "Bearer "+token)
-	}
-	request.Header.Set("Content-Type", "application/json")
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return response
-}
-
-func readResponse(t *testing.T, response *http.Response) string {
-	t.Helper()
-	return string(readResponseBytes(t, response))
-}
-
-func readResponseBytes(t *testing.T, response *http.Response) []byte {
-	t.Helper()
-	defer response.Body.Close()
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return body
 }
 
 func decodeResponse(t *testing.T, response *http.Response, target any) {

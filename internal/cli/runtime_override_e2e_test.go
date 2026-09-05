@@ -1,3 +1,5 @@
+//go:build e2e
+
 package cli
 
 import (
@@ -42,30 +44,6 @@ import (
 // The foreground test drives the CLI dispatch path; the daemon test drives
 // enqueue-with-override -> the REAL worker tick, proving background jobs
 // honor the override identically.
-
-const runtimeOverrideCodexRef = "codex-session-never-invoked"
-
-func runtimeOverrideE2EHome(t *testing.T) (string, *db.Store, string) {
-	t.Helper()
-	home, _, store := heartbeatLoopE2EHome(t)
-	checkout := createDaemonWorkerGitCheckout(t, "main")
-	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	// Default runtime codex with a stored model: the override must use neither.
-	if err := store.UpsertAgent(context.Background(), db.Agent{
-		Name:           "maintainer",
-		Role:           "worker",
-		Runtime:        runtime.CodexRuntime,
-		RuntimeRef:     runtimeOverrideCodexRef,
-		RepoScope:      "owner/repo",
-		Capabilities:   []string{"ask"},
-		AutonomyPolicy: runtime.AutonomyPolicyAuto,
-		Model:          "gpt-5.5-codex",
-		HealthStatus:   "ok",
-	}); err != nil {
-		t.Fatalf("UpsertAgent: %v", err)
-	}
-	return home, store, checkout
-}
 
 // runtimeOverrideShellScript is the shell-runtime session body run as
 // `sh -c <script> gitmoot <prompt>`: it records that the SHELL adapter really
