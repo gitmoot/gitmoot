@@ -413,6 +413,85 @@ The delegation does **not** authorize releases, `gh release create`, deploys,
 service restarts, force-pushes to `main`, or merging work outside the PR's
 issue. Those actions remain owner-gated.
 
+**A green, mergeable PR is not necessarily a REVIEWED one — check two axes
+independently: did the head move, and did the base move?**
+`mergeable: MERGEABLE` / `mergeStateStatus: CLEAN` is a claim about *git* — that
+the branch applies with no textual conflict. It says nothing about whether
+anyone reviewed the tree that will land.
+
+CI is a **stronger** instrument than a file-level argument, but it has a
+staleness hazard. `.github/workflows/ci.yml` runs on `pull_request` with no
+`ref:` override, so each `actions/checkout` resolves `github.ref` =
+`refs/pull/N/merge` and GitHub **does** build the branch merged into the base —
+measured on this file's own PR, whose run log reads
+`git checkout --force refs/remotes/pull/1783/merge` /
+`HEAD is now at 7057f594 Merge 4b245ac5… into c3785d6d…`. But GitHub recomputes
+that merge ref when the base moves and **does not re-run CI**, and the
+check-runs are reported against the *branch head*. So a green check is a claim
+about `merge(head, base AS OF THAT RUN)` displayed against the head — which is
+exactly what makes a stale green look current. (Whether a manual "Re-run all
+jobs" re-resolves the merge ref against the new base or replays the original
+merge SHA is **unmeasured** — do not rely on either.)
+
+The two axes — the head axis has two shapes — and both axes can be true at once:
+
+- **The head moved — new commits were pushed.** The verdict is void: it
+  described a tree that no longer exists. Re-review at the new head, scoped to
+  the delta since the approved head, not the whole PR again. Verify the branch
+  carries only what you intended: `git diff origin/<baseRefName>..HEAD` and a
+  tree read confirming no file you never touched reappears or vanishes.
+  - **Sub-case of the head axis: the head moved BACK** — a force-push restored
+    an earlier approved SHA. `ensureFinalReviewCaptured` binds approval to
+    `head_sha`; it does not persist the reviewed base SHA. If the base stayed
+    unchanged, the restored head and merge tree are identical and discarded
+    intermediate commits are irrelevant. The current gate cannot prove that
+    invariant, so treat the restored head as unreviewed as a conservative
+    fail-closed policy, not because the base necessarily changed.
+- **The base moved.** The verdict still names a commit that still exists and git
+  still reports CLEAN, yet nobody reviewed `base` + branch, which is what lands.
+  **The sound instrument is to build and test the merge result** — re-trigger CI
+  at the current base and read that run. To re-trigger it, **push to the
+  branch** (rebase onto the base, or merge the base in): that fires
+  `pull_request: synchronize`, which produces a fresh merge ref AND a fresh run.
+  Do not rely on the GitHub UI's "Re-run all jobs" — whether it re-resolves the
+  merge ref against the new base or replays the original merge SHA is unmeasured
+  here, so it may report green for the tree you were trying to leave behind.
+
+  **A green merge build is necessary, not sufficient.** It proves the merged tree
+  compiles and its tests pass; it cannot notice an assertion that stopped
+  existing. Where the base delta and the PR touch the same region, a clean
+  textual merge silently produces wrong code: two migrations appended to the same
+  slice merge without conflict and can still renumber, and two edits to one test
+  function merge with one assertion dropped — after which the merged tree builds
+  and every remaining test passes, so CI is green and reports nothing. That is
+  what file/package overlap is for: it is useful only to scope how much of the
+  diff a human re-reads, and it is **not** a merge predicate. It has no direction and no
+  transitivity, while "depends on" has both: a PR changing a signature in
+  `internal/workflow` and a base commit adding a call site in `internal/daemon`
+  share zero files and zero packages, pass any overlap test, and produce a tree
+  that does not compile. Same shape when a PR deletes a symbol the base has just
+  begun to reference — live risk during a reduction epic.
+
+Measured on the first push of this very PR: it was stacked on a PR whose own
+base predated a large deletion; that parent was **squash**-merged, which makes
+the reviewed branch commits non-ancestors of the base, so the stack silently
+kept the parent's stale base. The branch reported MERGEABLE, no conflict, green
+CI — while its diff against the moved base re-added ~10,200 deleted lines, a
+mass revert of a merge from half an hour earlier. Stacking on a PR that will be
+squash-merged always requires a rebuild on the base once the parent lands.
+
+Where a tree comparison is the right tool, use **trees, not diff output**, with a
+positive control on every instrument. #1731 was waived on "only `AGENTS.md`
+changed" by the role that benefited from the waiver; reversing that bought a
+content-addressed proof instead — `git ls-tree -r` over all 1173 tracked files,
+pairwise-equal subtree hashes, identical blob hashes for all 57 PR-changed
+files, each instrument shown to report differences on a known-different pair.
+
+And **`CLEAN` beside an empty check rollup is not green** — a head whose checks
+have not registered yet reports zero check-runs and still reads CLEAN. An empty
+check list right after a push means "not started", never "not required". Read
+the count, not the label.
+
 Under ultracode, orchestrate via the Workflow tool with opus sub-agents
 (protect the scarcer fable quota).
 
@@ -420,30 +499,166 @@ Under ultracode, orchestrate via the Workflow tool with opus sub-agents
 
 **Current mode: THROUGHPUT.**
 
-A mode switch is a merged PR that changes the line above. It takes effect at
-that PR's `mergedAt` time. At the next check-in, the coordinator must:
+A mode decision is an append-only
+`[operating-mode repo=<owner/repo> mode=<THROUGHPUT|STEADY|DRAIN>]` workflow
+note from the owner (or a coordinator acting on a recorded owner instruction).
+A PR that changes the marker above is a second materialization path, but it
+cannot invent a later decision merely by merging later. STEADY was decided by
+owner instruction in note 107313 on 2026-09-02: that is the decision's dated
+provenance, not a claim about today. Derive the ACTIVE mode as described below,
+because an id repeated in prose freezes while the ledger moves.
 
-1. fetch `origin/main`, read the marker from `origin/main:AGENTS.md` rather than
-   the seat's worktree, and steer every active seat to the merged mode;
-2. comment on the merged mode-switch PR with this exact transition record:
-   `[workload-mode-transition]`, `mode: <THROUGHPUT|DRAIN>`,
-   `effective_commit: <40-character SHA>`, `observed_at: <RFC3339>`, zero or more
-   `implementer: <seat> issue=<number> pr=<number|none> accepted_at=<RFC3339>`
-   lines, zero or more `review: <job-id> pr=<number> created_at=<RFC3339>`
-   lines, then
-   `[/workload-mode-transition]`.
+Before a mode-marker PR is marked ready, post
+`[workload-mode-reconciliation repo=<owner/repo> pr=<number> head=<40-character-reviewed-head> mode=<mode> decision_note=<id|none>]`.
+For a PR-sourced decision, use `decision_note=none`; the reconciliation row's
+`created_at` is then `decided_at`. Otherwise `decision_note` names the newest
+operating-mode note the exact head implements, and that note's `created_at` is
+`decided_at`. A later operating-mode note supersedes the reconciliation and
+requires a new exact-head row.
 
-For DRAIN, the listed transition wave is derived from durable timestamps:
-implementation assignments accepted before `mergedAt` that have not reached a
-terminal handoff, plus review jobs created before `mergedAt` that were queued or
-running then. `accepted_at` is the timestamp of the Herdr pane's first
-`working` status event after the issue-backed assignment prompt; `created_at` is
-the job-store timestamp. The merged PR always exists, so this record does not
-depend on a pre-existing workflow. The mode changes how much work may start; it
-never relaxes correctness, exact-head review, CI, or the merge authority
-recorded in the org config.
+This is mechanically enforced, not a pre-merge memory check. Both the native
+`PolicyMergeGate` and the separate `PipelineAutoMerger` read the paginated PR
+file list. A changed `+`/`-` line containing the exact `**Current mode:` marker
+requires a matching reconciliation row. An `AGENTS.md` entry whose patch is
+missing or ambiguous fails closed. `PipelineAutoMerger.Merge` re-reads the PR
+and both note streams at the final merge boundary; an older reconciled PR that
+merges after a newer owner decision cannot override the newer decision.
 
-Across both modes, use exactly one independent reviewer per corrected head.
+Four properties of that enforcement are worth knowing before you write a row.
+Enforcement is keyed on the repository OWNER, so every `gitmoot/*` repo is held
+until a row exists, human-requested merges included. Repository names are
+compared case-insensitively on every stream, so a note recorded as
+`Gitmoot/gitmoot` still counts. A newest operating-mode note that cannot be
+read — a malformed field list, or a `mode` that is not a workload mode —
+SUPERSEDES like any other decision instead of reading as no decision: a row
+filed before it no longer reconciles, and the hold names the note and says to
+file a new exact-head row. It is a recency boundary, not a veto, so a fresh row
+that agrees with the PR's own marker still merges, and correcting the note is
+optional rather than the only exit. The gate only refuses outright when nothing
+readable remains, meaning the note is unreadable AND the PR's marker patch is
+missing or ambiguous, and the hold then names both steps of the exit: append a
+fresh readable operating-mode note AND file an exact-head row citing it. A
+reconciliation hold at the merge boundary is retryable: the pipeline gate
+RELEASES its at-most-once merge claim, records the cause as a
+`pipeline_auto_merge_held` job event, and re-attempts on a later scan, so the
+row landing merges. It is also BOUNDED, and the bound applies on both the
+ordinary Evaluate path and the merge boundary: with a gate `timeout` the stage
+parks at that timeout carrying the cause, and with no `timeout` it parks 24h
+after the hold episode began, with the park summary naming the `timeout` as the
+lever. A hold against a new head or a new DECISION starts a new episode with a
+fresh budget, so a later hold is never charged for an earlier one - but a
+changed CAUSE alone does not, because the cause carries volatile near-miss
+detail and keying on it let unrelated churn defer the bound indefinitely.
+A scan that LOSES the at-most-once claim is a separate case and never parks the
+run: it cannot see whether the winner is alive, and a hold record has no expiry,
+so believing one killed runs whose reconciliation had already succeeded. It ages
+the wait from THE CLAIM ROW'S OWN `created_at` - one write, no second row to fall
+out of step with the claim, and a value resume does not reset - and records
+`pipeline_auto_merge_claim_orphaned` once the claim has been held 15m, with
+`cause=held_past_bound`. If a genuinely orphaned claim is the cause, THIS run
+cannot merge: nothing in the pipeline releases that claim, its key is fixed for
+the run, and a stage `timeout` on the gate parks the run rather than recovering
+it - re-running the pipeline takes a fresh claim. A claim whose `created_at`
+will not parse cannot be aged at all; that is recorded immediately with
+`cause=claim_timestamp_unreadable`, and a stage `timeout` still parks that wait
+like any other - the gate row carries its ordinary start stamp, and only the
+claim's timestamp is unreadable. A claim released between a losing scan's failed
+claim attempt and its read is neither case: that is the ordinary hold cycle, so
+the loser waits quietly and the next scan takes the claim.
+
+Resolve the active decision from both durable sources: read the marker from
+`origin/main:AGENTS.md`, never a seat worktree, and read the newest typed
+operating-mode/reconciliation note. Decisions are ordered by `decided_at`
+(the decision row's `created_at`), not by when their materialization later
+activates. Name both sources in the handoff.
+
+DERIVE, never trust a marker id quoted in a rules file — including any id quoted
+in THIS file. Two things are separate and were conflated on 2026-09-03, at the
+cost of two coordinators reporting the wrong mode:
+
+1. THE ACTIVE MODE IS THE MARKER LINE, `**Current mode: <MODE>.**`, in
+   `origin/main:AGENTS.md`. A switch is a MERGED PR that changes that line and
+   takes effect at its `mergedAt`. Fetch `origin/main` and read it there, never
+   from a seat worktree — a seat tree can be weeks stale, and a local grep miss
+   in one is an instrument failure, not evidence the marker moved.
+2. `[operating-mode ...]` workflow notes are DECISION rows: they record who
+   decided what and when, and the reconciliation gate above uses them to bind a
+   marker-changing PR to a decision. A decision note is not itself the marker,
+   and a note cannot switch the mode without the merged line.
+
+When you do need the newest decision note, anchor on the LITERAL PREFIX and read
+that note's own body for what it supersedes and at what scope:
+
+```sql
+select id, created_at, substr(body,1,80) from workflow_notes
+where body like '[operating-mode%' order by id desc limit 5;
+```
+
+The prefix is load-bearing: `body like '%operating-mode%'` also matches every
+note that merely DISCUSSES a marker — directives, reviews, this rule's own
+commit — so it returns a confident, current-looking row that is not a decision
+at all. A ledger whose notes debate markers cannot be counted by matching marker
+text, and a heading or phrase copied from the artifact you are trying to
+discredit makes the search self-confirming: list the headings and read the
+section instead.
+
+Record every activation with:
+`[workload-mode-transition]`,
+`mode: <THROUGHPUT|STEADY|DRAIN>`,
+`decision_ref: workflow-note:<id>`,
+`change_ref: none|pr:<owner/repo>#<number>@<40-character-reviewed-head>`,
+`activation_ref: none|workflow-note:<id>|commit:<40-character-merge-sha>`,
+`decided_at: <RFC3339>`,
+`effective_at: none|<RFC3339>`,
+`observed_at: <RFC3339>`, zero or more
+`implementer: <seat> issue=<number> pr=<number|none> accepted_at=<RFC3339>`
+lines, zero or more `review: <job-id> pr=<number> created_at=<RFC3339>` lines,
+then `[/workload-mode-transition]`.
+
+RESOLVED IN ONE DIRECTION, because this document said both and a reader could
+pick either (#1783 round-8 review, F-3): ONLY A MERGED COMMIT ACTIVATES A MODE.
+`commit:<40-character-merge-sha>` is therefore the ONLY ACTIVATING form. The
+other two record a mode that is not active yet: `workflow-note:<id>` for a
+decision not yet materialised by a merged marker PR, and `none` for a record
+posted before any marker PR exists - never for claiming a mode is active. That
+matches point 1 of "DERIVE, never trust a marker id" above: the active mode is
+the marker line in `origin/main:AGENTS.md`, changed by a merged PR, and a
+decision note is not itself the marker. `decision_ref` carries the note,
+`change_ref` the PR and its reviewed head, `decided_at` the note's timestamp,
+and `effective_at` the merge commit's `mergedAt` - or `none` on both while no
+marker PR has merged, which the grammar line above now admits.
+
+A note-sourced DRAIN therefore does not become active on its note alone: it is
+decided at the note, freezes admissions from `decided_at` as below, and
+activates when its marker PR merges. If no marker PR has merged yet, post the
+record with `activation_ref: none` and `effective_at: none`, and re-post with
+both filled once it does.
+
+`activation_ref` and `change_ref` SHAs are 40 characters, matching
+`head=<40-character-reviewed-head>` in the reconciliation grammar above; an
+abbreviation grows ambiguous as the repository grows (F-6).
+
+RECORDS POSTED UNDER THE PRIOR GRAMMAR ARE GRANDFATHERED, stated rather than
+left undefined: a `[workload-mode-transition]` record carrying
+`effective_commit: <40-character SHA>` instead of `activation_ref`/`effective_at`
+remains valid and needs no re-post - the #1840 DRAIN-to-THROUGHPUT record at
+639fd973d83aa513575201e132587ab1313e6ca5 is one, and `effective_commit` maps to
+`activation_ref: commit:<same SHA>`. New records use the grammar above.
+
+A DRAIN decision freezes new admissions at `decided_at`; the previously active
+mode remains active while DRAIN prerequisites are installed. The transition
+wave is the non-terminal implementation assignments accepted before
+`decided_at` plus review jobs created before it that were queued or running
+then. DRAIN becomes active only at `effective_at`, which is the `mergedAt` of the
+reconciled marker PR after its prerequisites are installed - not a note's
+`created_at`, per the resolution above. The remaining note-sourced case is the
+DRAIN decision itself, which freezes admissions at `decided_at` without
+activating. A later owner decision cancels an unactivated DRAIN.
+`accepted_at` is the Herdr pane's first `working` event after the issue-backed
+assignment prompt; review `created_at` is the job-store timestamp. Mode changes
+never relax correctness, exact-head review, CI, or org merge authority.
+
+Across ALL THREE modes, use exactly one independent reviewer per corrected head.
 Parallel review lanes mean different PRs, not multiple reviewers on one head.
 Review panels and fanout require explicit, durable owner authorization for that
 specific incident; an incident does not override this rule by itself.
@@ -456,6 +671,41 @@ specific incident; an incident does not override this rule by itself.
   different PRs under the repository's normal safety rules.
 - Stop opening new lanes when work queues behind shared files, unresolved
   integration order, or repeated review findings.
+
+### Steady mode
+
+Between throughput and drain: the **cap stays, the admission gate goes**. Set by
+the owner on 2026-09-02, because drain's cost was never its concurrency limit but
+its permission step — a seat sat on four ready, gated fixes through two
+escalations, and an armed merge gate then merged the PR without them.
+
+- At most **four implementation seats and two independent reviewers** at once.
+  The owner gave those numbers illustratively ("4 implementations and 2 reviews
+  for example"); note 107313 hardened them, and a rules file needs a definite
+  cap rather than an example.
+- **No admission gate.** A seat that finishes takes the next item itself: no
+  escalation for permission, no waiting for an authorization row.
+- Work comes off an **ordered list**, not a free choice — for a reduction epic,
+  that epic's own dependency-sorted sub-issue order. **Nothing outside the
+  scoped list is in scope**: with no admission gate, exclusivity is the only
+  clause that bounds what a finishing seat may pick up (owner instruction, note
+  107313: "Nothing outside #1762 is in scope").
+- **Claim before editing.** A seat posts a one-line claim note naming issue,
+  seat and branch BEFORE its first edit. No permission, no wait, no reply — it
+  is a record other seats can read. Removing the admission gate removed the
+  permission step, not the coordination signal: on 2026-09-02 two seats built
+  incompatible answers to one issue (#1757, PRs #1786 and #1789 sharing 18 files
+  and treating `NoopClient` two ways) because the second seat checked for a
+  claim, correctly found none, and started.
+- **One in, one out**: no second PR from a seat while its first is unmerged.
+  This is what keeps the queue from growing, without anyone deciding.
+- Escalate only for a **P2-or-worse finding**, a **scope boundary wider than the
+  assigned item**, or **live-service impact**. Everything else is the seat's call.
+- Steady mode names its own **exit condition and its destination**: when the
+  scoped list is merged, `gitmoot/*` returns to **DRAIN**. The coordinator first
+  completes every DRAIN activation precondition below and only then posts the
+  drain marker itself rather than waiting to be told (owner instruction, note
+  107313: "we need to stop and go back to DRAIN mode once those are merged").
 
 ### Drain mode
 
@@ -471,17 +721,19 @@ specific incident; an incident does not override this rule by itself.
 - After activation, cap the `gitmoot/*` scope at **two active implementers and
   one running reviewer**. An active implementer is a persistent seat currently
   changing code or a running engine implementation job.
-- A DRAIN mode-switch PR is not merge-ready until the coordinator configures
-  the shared daemon with `[daemon] workers = 1`; every active
-  `[repos."gitmoot/*"].max_parallel` override must be absent, zero, or one.
-  Apply the warm reload and verify both the effective global worker count and
-  every effective per-repository limit. This is the atomic runtime gate shared
-  by native PR fanout, heartbeats, and manual background reviews.
-- Before that PR merges, every foreground or persistent-seat review already in
+- A DRAIN decision freezes admission immediately, but DRAIN is not active until
+  the coordinator configures the shared daemon with `[daemon] workers = 1`;
+  every active `[repos."gitmoot/*"].max_parallel` override must be absent, zero,
+  or one. Apply the warm reload and verify the live worker setting plus every
+  effective per-repository limit; plain `gitmoot daemon status` renders process
+  arguments and is not proof of a warm-reloaded value. For a PR source, finish
+  these prerequisites before marking the reconciled PR ready and merging it.
+  For a note source, finish them before posting the separate activation marker.
+- Before DRAIN activates, every foreground or persistent-seat review already in
   progress must reach a terminal handoff; those reviews cannot be grandfathered.
   All DRAIN reviews then run as background engine jobs. Never bypass the shared
   gate with a foreground or persistent-seat reviewer.
-- Before that PR merges, disable every `action=review` heartbeat and allow
+- Before DRAIN activates, disable every `action=review` heartbeat and allow
   exactly one review-capable agent on each active `gitmoot/*` repository. For a
   PR with a branch lock, the native PR watcher is the sole producer; do not also
   dispatch a manual review. For a PR without a branch lock, native fanout cannot

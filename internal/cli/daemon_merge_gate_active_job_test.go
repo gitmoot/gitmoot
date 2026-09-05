@@ -24,12 +24,17 @@ import (
 type activeJobMergeGateGitHub struct {
 	githubtest.NoopClient
 	pr          github.PullRequest
+	files       []github.PullRequestFile
 	mergeInputs []github.MergePullRequestInput
 	statuses    []github.CommitStatusInput
 }
 
 func (f *activeJobMergeGateGitHub) GetPullRequest(context.Context, github.Repository, int64) (github.PullRequest, error) {
 	return f.pr, nil
+}
+
+func (f *activeJobMergeGateGitHub) ListPullRequestFiles(context.Context, github.Repository, int64) ([]github.PullRequestFile, error) {
+	return append([]github.PullRequestFile(nil), f.files...), nil
 }
 
 func (f *activeJobMergeGateGitHub) GetCombinedStatus(context.Context, github.Repository, string) (github.CombinedStatus, error) {
@@ -118,6 +123,88 @@ func TestDaemonMergeGateDefaultPreservesMergePathWhenMandatoryGatePasses(t *test
 	if len(gh.mergeInputs) != 1 || gh.mergeInputs[0].Method != "squash" || gh.mergeInputs[0].Number != 17 ||
 		!gh.mergeInputs[0].DeleteBranch || gh.mergeInputs[0].MatchHeadCommit != "head123" {
 		t.Fatalf("merge inputs = %+v, want one unchanged squash/delete request", gh.mergeInputs)
+	}
+}
+
+func TestDaemonMergeGateRequiresModeReconciliationBeforeNativeMerge(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	const repo = "gitmoot/gitmoot"
+	seedDaemonWorkerRepo(t, store, repo, checkout)
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-mode", RepoFullName: repo, GoalID: "goal-mode", Title: "Switch mode",
+		State: string(workflow.TaskReadyToMerge), Branch: "mode-switch",
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: repo, Number: 17, URL: "https://github.com/gitmoot/gitmoot/pull/17",
+		HeadBranch: "mode-switch", BaseBranch: "main", HeadSHA: "head123", State: "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest: %v", err)
+	}
+	seedDaemonMergeGateJob(t, store, db.Job{
+		ID: "mode-implement", Agent: "implementer", Type: "implement", State: string(workflow.JobSucceeded),
+	}, workflow.JobPayload{
+		Repo: repo, Branch: "mode-switch", PullRequest: 17, HeadSHA: "head123", TaskID: "task-mode",
+		Result: &workflow.AgentResult{Decision: "implemented", Summary: "implemented"},
+	})
+	seedDaemonMergeGateJob(t, store, db.Job{
+		ID: "mode-review", Agent: "reviewer", Type: "review", State: string(workflow.JobSucceeded),
+	}, workflow.JobPayload{
+		Repo: repo, Branch: "mode-switch", PullRequest: 17, HeadSHA: "head123", TaskID: "task-mode",
+		ReviewRound: "review-1", Result: &workflow.AgentResult{Decision: "approved", Summary: "ready"},
+	})
+	mode, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "gitmoot/worktree-lifecycle", Author: "owner", Repo: repo,
+		Body: "[operating-mode repo=gitmoot/gitmoot mode=STEADY]",
+	})
+	if err != nil {
+		t.Fatalf("InsertWorkflowNote mode: %v", err)
+	}
+	mergeable := true
+	gh := &activeJobMergeGateGitHub{
+		pr: github.PullRequest{
+			Number: 17, Title: "Switch mode", State: "open", URL: "https://github.com/gitmoot/gitmoot/pull/17",
+			HeadRef: "mode-switch", BaseSHA: "base123", HeadSHA: "head123", Mergeable: &mergeable,
+		},
+		files: []github.PullRequestFile{{
+			Filename: "AGENTS.md",
+			Patch:    "@@ -1 +1 @@\n-**Current mode: DRAIN.**\n+**Current mode: STEADY.**",
+		}},
+	}
+	request := workflow.MergeRequest{
+		Repo: repo, Branch: "mode-switch", PullRequest: 17, HeadSHA: "head123",
+		TaskID: "task-mode", Reviewer: "reviewer",
+	}
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize config: %v", err)
+	}
+	gate := newDaemonMergeGate(store, gh, checkout, paths.Home, subprocess.ExecRunner{})
+
+	decision, err := gate.Evaluate(ctx, request)
+	if err != nil {
+		t.Fatalf("Evaluate without reconciliation: %v", err)
+	}
+	if !decision.Ready || decision.Merged || len(gh.mergeInputs) != 0 {
+		t.Fatalf("decision=%+v merges=%d, want ready-to-merge hold before merge", decision, len(gh.mergeInputs))
+	}
+	if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "gitmoot/worktree-lifecycle", Author: "coordinator", Repo: repo,
+		Body: fmt.Sprintf("[workload-mode-reconciliation repo=gitmoot/gitmoot pr=17 head=head123 mode=STEADY decision_note=%d]", mode.ID),
+	}); err != nil {
+		t.Fatalf("InsertWorkflowNote reconciliation: %v", err)
+	}
+
+	decision, err = gate.Evaluate(ctx, request)
+	if err != nil {
+		t.Fatalf("Evaluate with reconciliation: %v", err)
+	}
+	if !decision.Merged || len(gh.mergeInputs) != 1 {
+		t.Fatalf("decision=%+v merges=%d, want one native merge", decision, len(gh.mergeInputs))
 	}
 }
 

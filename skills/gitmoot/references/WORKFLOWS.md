@@ -1043,7 +1043,76 @@ Without `merge: auto`, human merge remains unchanged.
 Pending checks wait; skipped/neutral check-runs pass; failures block; and zero
 external statuses/checks always block regardless of `require_external_ci`. The
 source job event timeline atomically records `pipeline_auto_merge_claim` before
-the write and `pipeline_auto_merge_confirmed` after GitHub confirms it.
+the write and `pipeline_auto_merge_confirmed` after GitHub confirms it, plus
+`pipeline_auto_merge_held` when a workload-mode reconciliation hold parks the
+gate: that hold releases the claim and retries, and is bounded by the gate
+`timeout` or by 24h from the start of the hold episode, keyed on the head and
+the decision rather than the cause text. A scan that loses the claim ages its wait from the claim row's own `created_at`
+and records `pipeline_auto_merge_claim_orphaned` past 15m - or immediately, with
+`cause=claim_timestamp_unreadable`, when that value will not parse - and waits
+rather than parking. A stage `timeout` parks either case terminally instead of
+recovering it. A claim released while a losing scan was reading it is the
+ordinary hold cycle and is reported as nothing WHILE THE GATE KEEPS WAITING - the
+scan simply retries. After the stage `timeout` elapses the release reason is
+carried into the terminal parked summary rather than dropped.
+
+### Satisfying the workload-mode gate
+
+A pull request whose diff changes the `**Current mode:` marker in `AGENTS.md` is
+HELD until an exact-head reconciliation row exists. The gate is keyed on the
+repository OWNER, so every `gitmoot/*` repository is held, human-requested merges
+included.
+
+Two note streams decide it, both matched by an exact body PREFIX and compared
+case-insensitively on repository:
+
+- DECISION: `[operating-mode repo=<owner/repo> mode=<THROUGHPUT|STEADY|DRAIN>]`
+- RECONCILIATION: `[workload-mode-reconciliation repo=<owner/repo> pr=<number> head=<40-character reviewed head> mode=<mode> decision_note=<note id|none>]`
+
+Every field is `key=value`, whitespace separated, inside the leading bracket. A
+field with an empty key or value makes the whole body unparseable, so the
+`repo=` field inside the body is what identifies the repository:
+
+```
+gitmoot workflow note <label> "[operating-mode repo=owner/repo mode=STEADY]"
+```
+
+`<label>` must be a workflow that already has jobs - `workflow note` refuses an
+unknown label to guard against a typo - so file the row under the lane the PR is
+already being coordinated in rather than inventing a label.
+
+The note's repo COLUMN is a separate, optional thing. A note whose column is
+empty still counts when its body names this repository, which is the ordinary
+case: `gitmoot workflow note` writes an empty column unless you pass
+`--remember --repo <owner/repo>`, and `--repo` is REJECTED without `--remember`
+(`--agent, --repo, and --remember-status require --remember`), because that flag
+set also opts the note into durable memory. Setting the column is therefore
+optional and costs a memory write; getting `repo=` right in the BODY is not
+optional.
+
+PRECEDENCE. The NEWEST decision wins, and a reconciliation row must be newer than
+it. `decision_note=none` means the PR itself is the decision, and the row's own
+`created_at` is `decided_at`; otherwise `decision_note` names the newest
+operating-mode note the exact head implements. A row that cites a note the PR
+contradicts cannot ratify it.
+
+WHEN A DECISION CANNOT BE READ. An unreadable newest decision - a malformed field
+list, a `mode` that is not a workload mode, or a note recorded for this
+repository whose body omits or contradicts `repo=` - SUPERSEDES like any other
+decision rather than reading as "no decision". It is a recency boundary, not a
+veto: a fresh exact-head row that agrees with the PR's own marker still merges,
+so correcting the note is optional. The gate refuses outright only when nothing
+readable remains - the note is unreadable AND the PR's marker patch is missing or
+ambiguous - and the hold then names both exits: append a readable operating-mode
+note, and file an exact-head row citing it.
+
+CLEARING A HOLD. The hold is retryable: the pipeline gate releases its
+at-most-once merge claim, records `pipeline_auto_merge_held` with the cause, and
+merges on a later scan once the row lands. It is bounded on both the ordinary
+evaluate path and the final merge boundary - the stage parks at the gate
+`timeout`, or 24h after the episode began when no `timeout` is set. An episode is
+keyed on the head and the decision, so a new head or a new decision (including a
+new unreadable one) starts a fresh budget rather than inheriting the old one.
 
 `pipeline add` warns (does not block) when an agent stage names an agent that does
 not exist yet; create it before the stage runs. The

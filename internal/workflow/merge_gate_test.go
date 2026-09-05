@@ -5151,6 +5151,7 @@ type fakeMergeGateGitHub struct {
 	status         github.CombinedStatus
 	compare        github.CompareResult
 	checks         []github.PullRequestCheck
+	files          []github.PullRequestFile
 	mergeResult    github.MergeResult
 	getPullRequest func(int) (github.PullRequest, error)
 	mergeErr       error
@@ -5182,6 +5183,10 @@ func (f *fakeMergeGateGitHub) GetPullRequest(context.Context, github.Repository,
 		return f.getPullRequest(f.getCalls)
 	}
 	return f.pr, nil
+}
+
+func (f *fakeMergeGateGitHub) ListPullRequestFiles(context.Context, github.Repository, int64) ([]github.PullRequestFile, error) {
+	return append([]github.PullRequestFile(nil), f.files...), nil
 }
 
 func (f *fakeMergeGateGitHub) GetCombinedStatus(context.Context, github.Repository, string) (github.CombinedStatus, error) {

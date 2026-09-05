@@ -3484,6 +3484,7 @@ type fakeGitHub struct {
 	pulls                  []github.PullRequest
 	pullsByState           map[string][]github.PullRequest
 	pullsByNumber          map[int64]github.PullRequest
+	pullRequestFiles       []github.PullRequestFile
 	issues                 []github.Issue
 	comments               map[int64][]github.IssueComment
 	repoComments           []github.IssueComment
@@ -3706,7 +3707,7 @@ func (f *fakeGitHub) CreateCommitStatus(context.Context, github.CommitStatusInpu
 }
 
 func (f *fakeGitHub) ListPullRequestFiles(context.Context, github.Repository, int64) ([]github.PullRequestFile, error) {
-	return nil, errors.New("not implemented")
+	return append([]github.PullRequestFile(nil), f.pullRequestFiles...), nil
 }
 
 func (f *fakeGitHub) ListPullRequestCommits(context.Context, github.Repository, int64) ([]github.PullRequestCommit, error) {

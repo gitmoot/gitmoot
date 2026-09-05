@@ -614,7 +614,33 @@ stages:
   a merge API failure is tried once and never retry-spammed.
 - The source job timeline atomically records `pipeline_auto_merge_claim` before
   the write and `pipeline_auto_merge_confirmed` afterward, carrying pipeline/run,
-  stage, PR, and head SHA. Racing scans that lose the claim never call merge.
+  stage, PR, and head SHA. Racing scans that lose the claim never call merge, and
+  never park the run either: a loser cannot see whether the winner is alive, so
+  it ages its wait from the CLAIM ROW's own `created_at` - which resume does not
+  reset - and records `pipeline_auto_merge_claim_orphaned` with
+  `cause=held_past_bound` once the claim has been held 15m. A stage `timeout`
+  converts that wait into a terminal park rather than a recovery, because nothing
+  releases an orphaned claim; a NEW RUN takes a fresh claim. A claim whose
+  `created_at` will not parse is recorded immediately with
+  `cause=claim_timestamp_unreadable`, which a stage `timeout` parks like any
+  other wait. A claim RELEASED in the window between a losing scan's failed
+  claim and its read is reported as nothing while the gate keeps waiting - the
+  reason reaches the terminal parked summary once the stage `timeout` elapses -
+  and that is the ordinary hold
+  cycle and the next scan takes the claim.
+- A workload-mode reconciliation hold is a THIRD event,
+  `pipeline_auto_merge_held`, carrying the cause plus the head and the time the
+  hold began. The hold is retryable, not terminal: the gate releases its
+  at-most-once claim (safe because that refusal is returned before any GitHub
+  mutation) and re-attempts on later scans, so the reconciliation row landing
+  merges. It is also bounded — with a gate `timeout` the stage parks at that
+  timeout carrying the cause; with no `timeout` the hold parks 24h after the
+  episode began, and the park summary names the `timeout` as the way to change
+  that. An episode is keyed on the head and the DECISION the row must reconcile
+  against, not on the cause text: the cause deliberately carries volatile
+  near-miss detail, and keying on it let unrelated note churn hand every hold a
+  fresh budget. A hold against a new head or a new decision starts a new episode
+  with a fresh 24h budget.
 
 ### Orchestrate stages
 
