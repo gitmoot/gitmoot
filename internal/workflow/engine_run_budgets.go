@@ -104,6 +104,23 @@ func (e Engine) finalizeTimedOutJob(ctx context.Context, jobID string, reason st
 		Decision: "failed",
 		Summary:  reason,
 	}
+	// #1351/#1417/#1557. Synthesizing the result and leaving FailureDiagnostics
+	// nil is what made a finalized leg unreadable: phase, exit_code and signal
+	// all absent, so the row could not say WHY it ended and every cause looked
+	// alike. Only the delivery path recorded diagnostics, so a leg the ENGINE
+	// terminalized after the fact carried none at all.
+	//
+	// An EXISTING block is never overwritten: a real crash report (phase,
+	// exit code, stderr tail) is strictly better evidence than this marker, and
+	// replacing it would destroy the cause in favour of the observation.
+	if payload.FailureDiagnostics == nil {
+		payload.FailureDiagnostics = WithDeliveryError(&FailureDiagnostics{Phase: FailurePhaseFinalized}, eventDetail)
+		if payload.FailureDiagnostics != nil && strings.TrimSpace(payload.FailureDiagnostics.DeliveryError) == "" {
+			// A detail that redacts away to nothing still leaves the phase, which
+			// is the fact the reader most needs: the engine ended this job.
+			payload.FailureDiagnostics.Phase = FailurePhaseFinalized
+		}
+	}
 	mailbox := e.mailbox()
 	if job.State == string(JobRunning) {
 		if atGeneration != nil {

@@ -219,7 +219,13 @@ func (e Engine) allRequiredReviewersApproved(ctx context.Context, currentReviewe
 
 	blockingSeverity := e.reviewBlockingSeverity(payload.Repo)
 	approved := map[string]bool{}
-	if currentReviewer != "" {
+	// The seed credits the reviewer whose job is being advanced right now, whose
+	// own row the loop below has not read yet. #1351/#1417/#1557: seeding it
+	// UNCONDITIONALLY let a fan-out coordinator satisfy its own required-reviewer
+	// slot, which is the one boundary the loop's own ResultIsFanOut skip cannot
+	// reach - the skip only stops OTHER stored fan-out rows. A coordinator that
+	// announces a panel has approved nothing, including on its own behalf.
+	if currentReviewer != "" && !ResultIsFanOut(payload.Result) {
 		approved[currentReviewer] = true
 	}
 
