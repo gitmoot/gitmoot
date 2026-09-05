@@ -36,22 +36,27 @@ func newResolverLogDaemon(t *testing.T) (*db.Store, Daemon, *[]string) {
 	return store, daemon, logs
 }
 
-// onlyRefusalLog counts REASON-BEARING lines, not lines carrying a particular
-// prose prefix. #1910's round-2 review built a production mutant that emitted a
-// second reason=no_task_for_branch line under the wording "task resolution
-// rejected"; a prose-matching helper kept this whole file green while an
-// operator saw two contradictory reasons again. The property is "exactly one
-// reason per refusal", so the reason tag is the only thing to match on.
+// onlyRefusalLog counts reason= TAG OCCURRENCES across every captured line, not
+// lines carrying a prose prefix and not reason-bearing lines. Two review rounds
+// on #1910 each defeated a weaker rule with a compiling production mutant:
+// round 2 renamed the prose ("task resolution rejected") past a prefix match,
+// and round 3 merged both reasons onto ONE line
+// ("reason=task_repo_mismatch reason=fork_head") past a per-line count. An
+// operator reading two reasons for one refusal cannot tell which input decided
+// it, and that is true whether they sit on one line or two - so the property is
+// one reason tag per refusal, and the tag is what gets counted.
 func onlyRefusalLog(t *testing.T, logs []string) string {
 	t.Helper()
 	reasons := []string{}
+	tags := 0
 	for _, line := range logs {
-		if strings.Contains(line, "reason=") {
+		if count := strings.Count(line, "reason="); count > 0 {
 			reasons = append(reasons, line)
+			tags += count
 		}
 	}
-	if len(reasons) != 1 {
-		t.Fatalf("reason-bearing log lines = %d (%q), want exactly 1", len(reasons), reasons)
+	if tags != 1 {
+		t.Fatalf("reason= tags = %d across %d line(s) (%q), want exactly 1", tags, len(reasons), reasons)
 	}
 	return reasons[0]
 }
