@@ -52,10 +52,17 @@ func TestOptionalSystemToolchainRootGrantsThePinnedOperatorToolchain(t *testing.
 	}
 }
 
-// TestToolchainRootBelowHome pins the depth boundary in both directions,
-// because a rule that only ever admits is not a rule. Depth one is the
-// credential-directory depth (~/.gitmoot, ~/.codex, ~/.claude) and MUST be
-// refused; depth two is the shallowest grantable root.
+// TestToolchainRootBelowHome pins the boundary in both directions, because a
+// rule that only ever admits is not a rule.
+//
+// Three groups. Depth one is the credential-directory depth (~/.gitmoot,
+// ~/.codex, ~/.claude) and MUST be refused. NESTED credential paths must also
+// be refused: the depth rule alone was measured GRANTING
+// ~/.codex/toolchains/go1.26.4, because depth answers "is this the credential
+// directory" and cannot answer "is this under one". And the SHOULD-SUCCEED
+// group is here deliberately - every bound added to this repo recently had a
+// version that rejected valid input, so real toolchain layouts are asserted to
+// pass, not merely assumed to.
 func TestToolchainRootBelowHome(t *testing.T) {
 	tests := []struct {
 		name string
@@ -76,6 +83,22 @@ func TestToolchainRootBelowHome(t *testing.T) {
 		{name: "empty root", root: "", home: "/root"},
 		{name: "relative root", root: "a/b", home: "/root"},
 		{name: "unclean path", root: "/root/.local/../.local/toolchains/go", home: "/root", want: true},
+
+		// nested inside a withheld credential directory - depth alone admitted these
+		{name: "nested in codex", root: "/root/.codex/toolchains/go1.26.4", home: "/root"},
+		{name: "nested in gitmoot", root: "/root/.gitmoot/x/y", home: "/root"},
+		{name: "nested in claude", root: "/root/.claude/a/b", home: "/root"},
+		{name: "nested in ssh", root: "/root/.ssh/a/b", home: "/root"},
+		{name: "nested in config", root: "/root/.config/a/b", home: "/root"},
+		{name: "withheld segment deeper in the path", root: "/root/tools/.codex/go", home: "/root"},
+		{name: "withheld segment case-insensitive", root: "/root/.CoDeX/toolchains/go", home: "/root"},
+
+		// SHOULD SUCCEED: real toolchain layouts a valid operator may pick
+		{name: "go official sdk layout", root: "/root/sdk/go1.26.4", home: "/root", want: true},
+		{name: "gopath toolchain", root: "/root/go/toolchains/go1.26.4", home: "/root", want: true},
+		{name: "version manager", root: "/root/.asdf/installs/golang/1.26.4", home: "/root", want: true},
+		{name: "plain nested dir", root: "/root/opt/go", home: "/root", want: true},
+		{name: "dotdir that is not withheld", root: "/root/.cache/toolchains/go", home: "/root", want: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -83,6 +106,23 @@ func TestToolchainRootBelowHome(t *testing.T) {
 				t.Fatalf("toolchainRootBelowHome(%q, %q) = %v, want %v", test.root, test.home, got, test.want)
 			}
 		})
+	}
+}
+
+// TestWithheldHomeSubdirectoriesCoverRuntimeCredentialStores pins the cost of
+// choosing a deny-list. Every runtime whose credential store a read-only seat
+// stages or withholds must appear, or a toolchain nested inside that store
+// becomes grantable and nothing fails.
+func TestWithheldHomeSubdirectoriesCoverRuntimeCredentialStores(t *testing.T) {
+	required := []string{".gitmoot", ".codex", ".claude", ".ssh", ".config"}
+	present := make(map[string]bool, len(withheldHomeSubdirectories))
+	for _, dir := range withheldHomeSubdirectories {
+		present[dir] = true
+	}
+	for _, dir := range required {
+		if !present[dir] {
+			t.Fatalf("withheldHomeSubdirectories omits %q, so a toolchain nested inside it would be granted; have %v", dir, withheldHomeSubdirectories)
+		}
 	}
 }
 

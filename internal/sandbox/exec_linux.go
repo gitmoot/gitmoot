@@ -287,19 +287,38 @@ func optionalSystemToolchainRoot(executable string) string {
 // The value is load-bearing rather than cautious. The directories this sandbox
 // exists to withhold from a review seat - ~/.gitmoot, ~/.codex, ~/.claude -
 // are all EXACTLY ONE segment below home, so requiring two or more makes a
-// credential directory unreachable by this rule while ~/.local/toolchains/go1.26.4
-// (three) is reachable. ~/bin/go resolves to a root at depth zero and stays
-// refused, which is the case the prefix list was protecting.
-//
-// It bounds only which root may be granted, never what that root contains: a
-// deep root can still hold something sensitive, so only the toolchain root
-// itself is added and TestReadableRootsWithholdsOperatorCredentialDirectories
-// pins that the resulting list excludes home and the withheld dotdirs.
+// credential directory itself unreachable by this rule while
+// ~/.local/toolchains/go1.26.4 (three) is reachable. ~/bin/go resolves to a
+// root at depth zero and stays refused, which is the case the prefix list was
+// protecting.
 const minToolchainDepthBelowHome = 2
 
+// withheldHomeSubdirectories may never contribute any part of a toolchain
+// grant path.
+//
+// DEPTH ALONE WAS NOT ENOUGH, and this list exists because the depth rule was
+// measured admitting a root NESTED INSIDE a withheld directory:
+// ~/.codex/toolchains/go1.26.4/bin/go sits three segments below home and was
+// granted, as did ~/.gitmoot/x/y and ~/.claude/a/b. Depth answers "is this the
+// credential directory" and cannot answer "is this UNDER one".
+//
+// It is a DENY-list rather than an allow-list on purpose. An allow-list would
+// have to enumerate every legitimate toolchain layout - ~/.local/toolchains,
+// Go's own ~/sdk/go1.26.4, ~/go, version managers - and would refuse valid
+// input the first time an operator picked a location nobody listed. Refusing
+// named credential directories cannot reject a valid toolchain unless the
+// operator installed one inside their credential store. The cost of the choice
+// is that a NEW credential directory must be added here;
+// TestWithheldHomeSubdirectoriesCoverRuntimeCredentialStores pins the runtime
+// set so an addition is not silently forgotten.
+var withheldHomeSubdirectories = []string{
+	".gitmoot", ".codex", ".claude", ".config", ".ssh", ".aws", ".gnupg", ".kube", ".docker",
+}
+
 // toolchainRootBelowHome reports whether root is a strict descendant of home by
-// at least minToolchainDepthBelowHome segments. Pure string logic so it is
-// testable without a filesystem or a particular operator account.
+// at least minToolchainDepthBelowHome segments, with no segment naming a
+// withheld credential directory. Pure string logic so it is testable without a
+// filesystem or a particular operator account.
 func toolchainRootBelowHome(root, home string) bool {
 	root = strings.TrimSpace(root)
 	home = strings.TrimSpace(home)
@@ -310,7 +329,18 @@ func toolchainRootBelowHome(root, home string) bool {
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return false
 	}
-	return len(strings.Split(rel, string(filepath.Separator))) >= minToolchainDepthBelowHome
+	segments := strings.Split(rel, string(filepath.Separator))
+	if len(segments) < minToolchainDepthBelowHome {
+		return false
+	}
+	for _, segment := range segments {
+		for _, withheld := range withheldHomeSubdirectories {
+			if strings.EqualFold(segment, withheld) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // operatorHomeDir resolves the INVOKING OPERATOR's home from the passwd
