@@ -100,13 +100,20 @@ func TestObjectionAtCurrentHeadStillRequestsChanges(t *testing.T) {
 // ADVANCES. This is the case a retracted ruling would have refused transiently,
 // and its ABSENCE from the suite is what let that ruling look safe.
 //
-// Refusing here would not merely withhold a fix pass: the two sides read
-// different sources. approvalSupersedesChangesRequested consults the LOCAL store
-// row, while PolicyMergeGate fetches the pull request LIVE from GitHub and never
-// reads that table for the head it merges against. So an objection refused for a
-// missing local row leaves the task OUT of changes_requested,
-// mergeGateExpectedTaskState then admits, and the gate can merge on an approval
-// over a real current-head objection nobody recorded.
+// Refusing here would be a LIVENESS loss, not a merge risk. An earlier version
+// of this comment claimed the opposite - that refusing would let the gate "merge
+// on an approval over a real current-head objection nobody recorded" - and
+// #1903's third review round found that claim still living here after the
+// function comment had been corrected.
+//
+// PolicyMergeGate blocks on the objection ROW independently of task state: it
+// derives the head live (merge_gate.go:288 GetPullRequest -> :311), enters
+// unconditionally (:320 -> :439), selects every review row whose payload.HeadSHA
+// equals that head (:809-816), and returns mergeBlocked for changes_requested,
+// blocked or failed (:895-898). Refusing the TASK transition does not un-record
+// the REVIEW ROW, so it cannot open a merge. What it does cost is the
+// conservative transition and the inline fix pass, withheld from an objection
+// nobody can show is stale.
 func TestObjectionWithNoObservedPullRequestRowStillRequestsChanges(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -188,10 +195,16 @@ func TestStaleObjectionDispatchesNoFixLeg(t *testing.T) {
 //
 // A CLI review dispatched as `gitmoot agent review <r> --repo o/r --pr N` with no
 // --head-sha produces exactly this payload today, so this is real traffic rather
-// than a fixture artefact. Admitting is the claim-nothing direction: refusing a
-// headless APPROVAL fails safe because the PR does not merge, while refusing a
-// headless OBJECTION fails PERMISSIVE - it drops a real complaint and leaves the
-// PR in whatever merge-ward state it held.
+// than a fixture artefact.
+//
+// THIS ARM'S RATIONALE IS SAFETY, NOT LIVENESS, AND IT IS THE ONE PLACE THAT
+// DIFFERS. The gate's protection does not extend to a headless row: merge_gate.go
+// SKIPS any review whose head is empty (`if reviewHead == "" || reviewHead !=
+// headSHA { continue }`, :809-816), so a headless objection is invisible to it.
+// For an objection that HAS a head the gate blocks independently and refusing
+// costs only liveness - but refusing a HEADLESS objection drops a real complaint
+// that nothing else will catch, leaving the PR in whatever merge-ward state it
+// held. Refusing a headless APPROVAL still fails safe, because nothing merges.
 func TestObjectionWithNoHeadStillRequestsChanges(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
