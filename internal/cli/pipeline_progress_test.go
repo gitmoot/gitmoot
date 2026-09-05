@@ -17,7 +17,7 @@ import (
 )
 
 func TestPipelineProgressLineTrackerSanitizesRedactsCapsAndIgnoresEmpty(t *testing.T) {
-	tracker := &pipelineProgressLineTracker{}
+	tracker := &pipeline.PipelineProgressLineTracker{}
 	_, _ = tracker.Write([]byte("first\n\n\x1b[31mtoken=abcdefghijklmnopqrstuvwxyz1234567890\x1b[0m\x00\n"))
 	got := tracker.LastLine()
 	if strings.Contains(got, "\x1b") || strings.ContainsRune(got, '\x00') || strings.Contains(got, "abcdefghijklmnopqrstuvwxyz") || !strings.Contains(got, "[REDACTED]") {
@@ -25,7 +25,7 @@ func TestPipelineProgressLineTrackerSanitizesRedactsCapsAndIgnoresEmpty(t *testi
 	}
 	_, _ = tracker.Write([]byte(strings.Repeat("\u00e9", 300)))
 	got = tracker.LastLine()
-	if len(got) > pipelineProgressLineBytes || !strings.Contains(got, "\u00e9") {
+	if len(got) > pipeline.PipelineProgressLineBytes || !strings.Contains(got, "\u00e9") {
 		t.Fatalf("capped UTF-8 line bytes=%d valid content=%q", len(got), got)
 	}
 }
@@ -37,13 +37,13 @@ func TestEmitPipelineProgressThresholdCadenceAndCancel(t *testing.T) {
 	if err := store.CreateJob(ctx, db.Job{ID: "job-progress", Agent: "worker", Type: "ask", State: "running"}); err != nil {
 		t.Fatal(err)
 	}
-	tracker := &pipelineProgressLineTracker{}
+	tracker := &pipeline.PipelineProgressLineTracker{}
 	_, _ = tracker.Write([]byte("working\n"))
 	ticks := make(chan time.Time, 2)
 	done := make(chan struct{})
 	start := time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC)
 	go func() {
-		emitPipelineProgress(ctx, store, io.Discard, "job-progress", start, tracker, ticks)
+		pipeline.EmitPipelineProgress(ctx, store, io.Discard, "job-progress", start, tracker, ticks)
 		close(done)
 	}()
 	if _, ok, err := store.GetLatestJobEventByKind(ctx, "job-progress", "progress"); err != nil || ok {
@@ -62,7 +62,7 @@ func TestEmitPipelineProgressThresholdCadenceAndCancel(t *testing.T) {
 	stopped := make(chan struct{})
 	blockedTicks := make(chan time.Time)
 	go func() {
-		emitPipelineProgress(ctx2, store, io.Discard, "job-progress", start, tracker, blockedTicks)
+		pipeline.EmitPipelineProgress(ctx2, store, io.Discard, "job-progress", start, tracker, blockedTicks)
 		close(stopped)
 	}()
 	cancel2()
@@ -80,7 +80,7 @@ func TestRetainedTranscriptAndProgressShareRuntimeOutput(t *testing.T) {
 	home := t.TempDir()
 	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard, home)
 	agent := runtime.Agent{Name: "lead", Role: "builder", Runtime: runtime.ShellRuntime, RuntimeRef: "echo shared-line"}
-	tracker := &pipelineProgressLineTracker{}
+	tracker := &pipeline.PipelineProgressLineTracker{}
 
 	logFile, err := openRetainedTranscriptLog(home, "job-shared")
 	logPath := retainedTranscriptLogPathForTest(t, home, "job-shared")
@@ -187,8 +187,8 @@ func TestSumPipelineRunTokensIncludesOrchestrateTreesWithoutDoubleCounting(t *te
 		}
 	}
 	create("ordinary", runID, 7, 3)
-	orch0 := pipelineStageJobID(runID, "tree", 0)
-	orch1 := pipelineStageJobID(runID, "tree", 1)
+	orch0 := pipeline.PipelineStageJobID(runID, "tree", 0)
+	orch1 := pipeline.PipelineStageJobID(runID, "tree", 1)
 	create(orch0, orch0, 11, 1)
 	create(orch0+"/child", orch0, 13, 2)
 	create(orch1, orch1, 17, 4)

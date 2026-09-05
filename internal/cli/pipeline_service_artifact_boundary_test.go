@@ -1,12 +1,14 @@
 package cli
 
 import (
-	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/proof"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/pipeline"
+	"github.com/gitmoot/gitmoot/internal/proof"
 )
 
 func TestVerifyPipelineServiceArtifactProofRejectsDigestMismatch(t *testing.T) {
@@ -22,8 +24,8 @@ func TestVerifyPipelineServiceArtifactProofRejectsDigestMismatch(t *testing.T) {
 	}
 	actual := want
 	actual.SHA256 = "cb8379ac2098aa165029e3938a51da0bcecfc008fd6795f401178647f96c5b34"
-	if err := verifyPipelineServiceArtifactProof(manifest, []proof.ArtifactEvidence{actual}); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
-		t.Fatalf("verifyPipelineServiceArtifactProof error = %v, want digest mismatch", err)
+	if err := pipeline.VerifyPipelineServiceArtifactProof(manifest, []proof.ArtifactEvidence{actual}); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
+		t.Fatalf("pipeline.VerifyPipelineServiceArtifactProof error = %v, want digest mismatch", err)
 	}
 	base := t.TempDir()
 	artifactPath := filepath.Join(base, filepath.FromSlash(want.Relpath))
@@ -37,7 +39,7 @@ func TestVerifyPipelineServiceArtifactProofRejectsDigestMismatch(t *testing.T) {
 	if err := writePipelineServiceArchive(base, archive, []byte(`{}`), []byte(`{}`), true); err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyPipelineServiceArchiveArtifacts(archive, manifest); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
-		t.Fatalf("verifyPipelineServiceArchiveArtifacts error = %v, want digest mismatch", err)
+	if err := pipeline.VerifyPipelineServiceArchiveArtifacts(archive, manifest); err == nil || !strings.Contains(err.Error(), "digest mismatch") {
+		t.Fatalf("pipeline.VerifyPipelineServiceArchiveArtifacts error = %v, want digest mismatch", err)
 	}
 }

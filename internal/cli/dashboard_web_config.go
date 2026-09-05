@@ -11,9 +11,9 @@ import (
 	"github.com/creachadair/tomledit"
 	"github.com/creachadair/tomledit/parser"
 	dashboard "github.com/gitmoot/gitmoot-dashboard"
-
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/pipeline"
 )
 
 type dashboardConfigSettings struct {
@@ -134,11 +134,11 @@ func (d *webDataSource) Config(ctx context.Context) (dashboard.ConfigSnapshot, e
 // check reuses the names-only pipeline classifier; credential values have no
 // representation in this projection or in the dashboard contract.
 func projectDashboardConfigKeychain(ctx context.Context, store *db.Store, home string) (dashboard.KeychainView, error) {
-	path, err := resolveKeychainPath(store, home)
+	path, err := pipeline.ResolveKeychainPath(store, home)
 	if err != nil {
 		return dashboard.KeychainView{}, err
 	}
-	inspection := classifyPipelineEnvFile(ctx, store, home, path)
+	inspection := pipeline.ClassifyPipelineEnvFile(ctx, store, home, path)
 	out := dashboard.KeychainView{
 		File: dashboard.KeychainFileStatus{Path: path, Status: inspection.Status},
 		Keys: []dashboard.KeychainKeyView{},

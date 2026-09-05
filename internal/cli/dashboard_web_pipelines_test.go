@@ -105,14 +105,14 @@ func seedDiamondBlockedRun(t *testing.T, home, runID, specHash string) {
 			ID: runID, Pipeline: "listing-refresh", Trigger: "manual", SpecHash: runHash,
 			State: pipeline.RunBlocked, HaltStage: "ascore",
 			HaltReason: "scoring model needs the R2 token",
-			NeedsJSON:  marshalPipelineNeeds(blockedNeeds),
+			NeedsJSON:  pipeline.MarshalPipelineNeeds(blockedNeeds),
 			StartedAt:  started, FinishedAt: finished,
 		},
 		[]db.PipelineRunStage{
 			{StageID: "zfetch", State: pipeline.StageSucceeded, JobID: "job-zfetch", StartedAt: started, FinishedAt: started.Add(10 * time.Second)},
 			{StageID: "bdedupe", State: pipeline.StageSucceeded, JobID: "job-bdedupe", StartedAt: started, FinishedAt: started.Add(20 * time.Second)},
 			{StageID: "ascore", State: pipeline.StageBlocked, JobID: "job-ascore", Attempt: 1,
-				NeedsJSON: marshalPipelineNeeds(blockedNeeds), Summary: "scoring blocked: needs R2 <token> & creds"},
+				NeedsJSON: pipeline.MarshalPipelineNeeds(blockedNeeds), Summary: "scoring blocked: needs R2 <token> & creds"},
 			{StageID: "publish", State: pipeline.StageSkipped},
 		})
 }
@@ -774,18 +774,18 @@ stages:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if detail.Keys.EnvFile != (dashboard.PipelineEnvFileStatus{Path: envFile, Status: pipelineEnvFileStatusOK}) {
+	if detail.Keys.EnvFile != (dashboard.PipelineEnvFileStatus{Path: envFile, Status: pipeline.PipelineEnvFileStatusOK}) {
 		t.Fatalf("envFile = %+v", detail.Keys.EnvFile)
 	}
 	if len(detail.Keys.Stages) != 3 {
 		t.Fatalf("stages = %+v", detail.Keys.Stages)
 	}
 	wantKeys := []dashboard.PipelineKeyEntry{
-		{Name: "OWN_ONE", Source: pipelineKeySourceOwn, Mode: db.KeychainModeInjected},
-		{Name: "OWN_TWO", Source: pipelineKeySourceOwn, Mode: db.KeychainModeInjected},
-		{Name: "SHARED_TOKEN", Source: pipelineKeySourceShared, Mode: db.KeychainModeInjected},
-		{Name: "PROXY_TOKEN", Source: pipelineKeySourceShared, Mode: db.KeychainModeProxied},
-		{Name: "DEFAULT_TOKEN", Source: pipelineKeySourceDefault, Mode: db.KeychainModeInjected},
+		{Name: "OWN_ONE", Source: pipeline.PipelineKeySourceOwn, Mode: db.KeychainModeInjected},
+		{Name: "OWN_TWO", Source: pipeline.PipelineKeySourceOwn, Mode: db.KeychainModeInjected},
+		{Name: "SHARED_TOKEN", Source: pipeline.PipelineKeySourceShared, Mode: db.KeychainModeInjected},
+		{Name: "PROXY_TOKEN", Source: pipeline.PipelineKeySourceShared, Mode: db.KeychainModeProxied},
+		{Name: "DEFAULT_TOKEN", Source: pipeline.PipelineKeySourceDefault, Mode: db.KeychainModeInjected},
 	}
 	if got := detail.Keys.Stages[0]; got.ID != "deliver" || got.Kind != "shell" || !reflect.DeepEqual(got.Keys, wantKeys) || len(got.UnresolvedSelectors) != 0 {
 		t.Fatalf("deliver keys = %+v", got)
@@ -795,7 +795,7 @@ stages:
 	}
 	if got, want := detail.Keys.Stages[2], (dashboard.PipelineStageKeys{
 		ID: "inspect", Kind: "agent_ask",
-		Keys:                []dashboard.PipelineKeyEntry{{Name: "PROXY_TOKEN", Source: pipelineKeySourceShared, Mode: db.KeychainModeProxied}},
+		Keys:                []dashboard.PipelineKeyEntry{{Name: "PROXY_TOKEN", Source: pipeline.PipelineKeySourceShared, Mode: db.KeychainModeProxied}},
 		UnresolvedSelectors: []string{},
 	}); !reflect.DeepEqual(got, want) {
 		t.Fatalf("agent stage keys = %+v, want %+v", got, want)
@@ -817,7 +817,7 @@ stages:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if drifted.Keys.EnvFile.Status != pipelineEnvFileStatusMissing {
+	if drifted.Keys.EnvFile.Status != pipeline.PipelineEnvFileStatusMissing {
 		t.Fatalf("drifted envFile = %+v", drifted.Keys.EnvFile)
 	}
 	if got, want := drifted.Keys.Stages[0].Keys, wantKeys[2:]; !reflect.DeepEqual(got, want) {
@@ -877,7 +877,7 @@ func TestWebDataSourcePipelineDetailKeysFailOpenSpec(t *testing.T) {
 	if detail.Declared == nil || detail.Runs == nil || detail.Keys.Stages == nil {
 		t.Fatalf("fail-open slices must be non-nil: %+v", detail)
 	}
-	if detail.Keys.EnvFile.Status != pipelineEnvFileStatusNone || len(detail.Keys.Stages) != 0 {
+	if detail.Keys.EnvFile.Status != pipeline.PipelineEnvFileStatusNone || len(detail.Keys.Stages) != 0 {
 		t.Fatalf("fail-open keys = %+v", detail.Keys)
 	}
 }

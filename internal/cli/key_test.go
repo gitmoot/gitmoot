@@ -287,7 +287,7 @@ func TestKeychainFileWrongOwner(t *testing.T) {
 	original := pipeline.PipelineEnvCurrentUID
 	pipeline.PipelineEnvCurrentUID = func() uint32 { return original() + 1 }
 	t.Cleanup(func() { pipeline.PipelineEnvCurrentUID = original })
-	_, _, err := loadValidatedKeychainFile(context.Background(), store, home)
+	_, _, err := pipeline.LoadValidatedKeychainFile(context.Background(), store, home)
 	if err == nil || !strings.Contains(err.Error(), "owned by uid") || strings.Contains(err.Error(), keychainSentinel) {
 		t.Fatalf("wrong-owner error=%v", err)
 	}

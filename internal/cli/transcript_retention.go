@@ -15,6 +15,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/transcript"
@@ -129,15 +130,15 @@ func appendDeliveryAdapterOutput(adapter workflow.DeliveryAdapter, out io.Writer
 
 func appendRuntimeOutputRunner(runner subprocess.Runner, out io.Writer) subprocess.Runner {
 	if runner == nil {
-		return subprocess.TeeRunner{Inner: subprocess.GroupRunner{}, Out: runtimeOutputWriter(out)}
+		return subprocess.TeeRunner{Inner: subprocess.GroupRunner{}, Out: pipeline.RuntimeOutputWriter(out)}
 	}
 	switch r := runner.(type) {
 	case subprocess.TeeRunner:
-		r.Out = runtimeOutputWriter(r.Out, out)
+		r.Out = pipeline.RuntimeOutputWriter(r.Out, out)
 		return r
 	case *subprocess.TeeRunner:
 		copy := *r
-		copy.Out = runtimeOutputWriter(copy.Out, out)
+		copy.Out = pipeline.RuntimeOutputWriter(copy.Out, out)
 		return &copy
 	case subprocess.EnvInjectingRunner:
 		r.Inner = appendRuntimeOutputRunner(r.Inner, out)
@@ -159,7 +160,7 @@ func appendRuntimeOutputRunner(runner subprocess.Runner, out io.Writer) subproce
 		return &copy
 	default:
 		if stream, ok := runner.(subprocess.StreamRunner); ok {
-			return subprocess.TeeRunner{Inner: stream, Out: runtimeOutputWriter(out)}
+			return subprocess.TeeRunner{Inner: stream, Out: pipeline.RuntimeOutputWriter(out)}
 		}
 		return runner
 	}

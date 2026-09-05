@@ -1282,7 +1282,7 @@ func sumPipelineRunTokens(ctx context.Context, store *db.Store, runID string, st
 			continue
 		}
 		for attempt := 0; attempt <= stage.Attempt; attempt++ {
-			stageTotal, err := store.SumJobTokensByRoot(ctx, pipelineStageJobID(runID, stage.StageID, attempt))
+			stageTotal, err := store.SumJobTokensByRoot(ctx, pipeline.PipelineStageJobID(runID, stage.StageID, attempt))
 			if err != nil {
 				return 0, err
 			}
@@ -1349,7 +1349,7 @@ func printPipelineRunFunnelAt(stdout io.Writer, view pipelineRunView, now time.T
 	if strings.TrimSpace(run.HaltReason) != "" {
 		writeLine(stdout, "halt_reason: %s", run.HaltReason)
 	}
-	if needs := decodePipelineNeeds(run.NeedsJSON); len(needs) > 0 {
+	if needs := pipeline.DecodePipelineNeeds(run.NeedsJSON); len(needs) > 0 {
 		writeLine(stdout, "needs: %s", strings.Join(needs, ", "))
 	}
 	writeLine(stdout, "")
@@ -1476,15 +1476,15 @@ func pipelineProgressFresh(now time.Time, createdAt string) bool {
 		return false
 	}
 	age := now.Sub(created)
-	return age >= 0 && age <= 2*pipelineProgressInterval
+	return age >= 0 && age <= 2*pipeline.PipelineProgressInterval
 }
 
-func decodePipelineProgress(message string) (pipelineProgressEventPayload, bool) {
-	var payload pipelineProgressEventPayload
+func decodePipelineProgress(message string) (pipeline.PipelineProgressEventPayload, bool) {
+	var payload pipeline.PipelineProgressEventPayload
 	if err := json.Unmarshal([]byte(message), &payload); err != nil {
-		return pipelineProgressEventPayload{}, false
+		return pipeline.PipelineProgressEventPayload{}, false
 	}
-	payload.Activity = sanitizePipelineProgressLine(payload.Activity)
+	payload.Activity = pipeline.SanitizePipelineProgressLine(payload.Activity)
 	return payload, strings.TrimSpace(payload.Elapsed) != "" || payload.Activity != ""
 }
 
@@ -1505,7 +1505,7 @@ func pipelineStageFunnelLabel(stage db.PipelineRunStage) string {
 	case pipeline.StageSucceeded:
 		return "OK"
 	case pipeline.StageBlocked:
-		if needs := decodePipelineNeeds(stage.NeedsJSON); len(needs) > 0 {
+		if needs := pipeline.DecodePipelineNeeds(stage.NeedsJSON); len(needs) > 0 {
 			return fmt.Sprintf("BLOCKED (needs: %s)", strings.Join(needs, ", "))
 		}
 		return "BLOCKED"
@@ -1577,7 +1577,7 @@ func pipelineRunToJSON(view pipelineRunView) pipelineRunJSON {
 		State:       run.State,
 		HaltStage:   run.HaltStage,
 		HaltReason:  run.HaltReason,
-		Needs:       decodePipelineNeeds(run.NeedsJSON),
+		Needs:       pipeline.DecodePipelineNeeds(run.NeedsJSON),
 		SpecHash:    run.SpecHash,
 		StartedAt:   pipelineRunTimeJSON(run.StartedAt),
 		FinishedAt:  pipelineRunTimeJSON(run.FinishedAt),
@@ -1593,7 +1593,7 @@ func pipelineRunToJSON(view pipelineRunView) pipelineRunJSON {
 			State:      stage.State,
 			JobID:      stage.JobID,
 			Attempt:    stage.Attempt,
-			Needs:      decodePipelineNeeds(stage.NeedsJSON),
+			Needs:      pipeline.DecodePipelineNeeds(stage.NeedsJSON),
 			Summary:    stage.Summary,
 			StartedAt:  pipelineRunTimeJSON(stage.StartedAt),
 			FinishedAt: pipelineRunTimeJSON(stage.FinishedAt),

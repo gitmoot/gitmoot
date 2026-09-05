@@ -96,7 +96,7 @@ func TestPipelineAgentStageAdvanceAndParkE2E(t *testing.T) {
 	if run.HaltStage != "audit" {
 		t.Fatalf("halt_stage = %q, want audit", run.HaltStage)
 	}
-	if got := decodePipelineNeeds(run.NeedsJSON); len(got) != 1 || got[0] != "prod creds" {
+	if got := pipeline.DecodePipelineNeeds(run.NeedsJSON); len(got) != 1 || got[0] != "prod creds" {
 		t.Fatalf("run needs = %v, want [prod creds]", got)
 	}
 
@@ -122,7 +122,7 @@ func TestPipelineAgentStageAdvanceAndParkE2E(t *testing.T) {
 	if aud.State != pipeline.StageBlocked {
 		t.Fatalf("stage audit = %s, want blocked", aud.State)
 	}
-	if got := decodePipelineNeeds(aud.NeedsJSON); len(got) != 1 || got[0] != "prod creds" {
+	if got := pipeline.DecodePipelineNeeds(aud.NeedsJSON); len(got) != 1 || got[0] != "prod creds" {
 		t.Fatalf("stage audit needs = %v, want [prod creds]", got)
 	}
 
