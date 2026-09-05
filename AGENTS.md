@@ -30,6 +30,32 @@ export GOCACHE=/tmp/gitmoot-go-build-cache
 mkdir -p "$GOCACHE"
 ```
 
+**Inside a read-only review seat, both exports above are wrong** — a seat that
+follows them gets `exit 126` and a denied cache, which read as broken
+infrastructure rather than the documented boundary they are:
+
+- **Never invoke `/root/.local/toolchains/go1.26.4/bin/go`.** The daemon stages a
+  copy it owns and points the seat at it via injected `GOROOT` and `PATH`
+  (`internal/cli/toolchain_seat.go`); granting the operator's own installation was
+  rejected as escape-class (symlink redirect out of containment, and an
+  unclosable TOCTOU on a path the daemon does not own). Execution denial on that
+  path is **expected and is never a finding** — probe with plain `go version` and
+  `go env GOROOT`, which should report a `GOROOT` under `<home>/.gitmoot/toolchains/`.
+- **Never use the shared `/tmp/gitmoot-go-build-cache`.** It is not writable from a
+  seat; use a seat-owned `GOCACHE` under `$TMPDIR`. Note the cost: each building
+  seat then populates its own cache instead of sharing one, so seat builds are
+  coupled to the dispatch disk floor.
+- **Set `CGO_ENABLED=0`.** The sandbox denies `/usr/include/stdc-predef.h`, so any
+  default-cgo `build`/`vet`/`test` fails on a C header.
+- **`-race` is unreachable in a seat**, because race requires cgo. It is covered by
+  CI's race shards only, and its absence from a seat verdict is not a regression.
+
+When a seat's plain `go` really does return 126, staging did not happen and the
+reason is on the daemon's stderr rather than in the job's events — see
+`docs/troubleshooting.md`, "`Permission denied`, exit 126, running Go", which
+enumerates the staging refusals (unpinned source, system-package prefix, symlink
+in the source set, free space below the 4 GiB floor).
+
 Run from the repo root and make these pass before committing — they mirror the CI
 gate in `.github/workflows/ci.yml`:
 
