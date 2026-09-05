@@ -36,18 +36,24 @@ func newResolverLogDaemon(t *testing.T) (*db.Store, Daemon, *[]string) {
 	return store, daemon, logs
 }
 
+// onlyRefusalLog counts REASON-BEARING lines, not lines carrying a particular
+// prose prefix. #1910's round-2 review built a production mutant that emitted a
+// second reason=no_task_for_branch line under the wording "task resolution
+// rejected"; a prose-matching helper kept this whole file green while an
+// operator saw two contradictory reasons again. The property is "exactly one
+// reason per refusal", so the reason tag is the only thing to match on.
 func onlyRefusalLog(t *testing.T, logs []string) string {
 	t.Helper()
-	refusals := []string{}
+	reasons := []string{}
 	for _, line := range logs {
-		if strings.Contains(line, "task resolution refused") {
-			refusals = append(refusals, line)
+		if strings.Contains(line, "reason=") {
+			reasons = append(reasons, line)
 		}
 	}
-	if len(refusals) != 1 {
-		t.Fatalf("refusal log lines = %d (%q), want exactly 1", len(refusals), refusals)
+	if len(reasons) != 1 {
+		t.Fatalf("reason-bearing log lines = %d (%q), want exactly 1", len(reasons), reasons)
 	}
-	return refusals[0]
+	return reasons[0]
 }
 
 // A fork head that merely collides with a local branch name must log the head
@@ -232,9 +238,11 @@ func TestLookupPolledPullRequestTaskLogsNothingOnSuccess(t *testing.T) {
 	if task.ID != "task-ok" {
 		t.Fatalf("task = %+v, want task-ok", task)
 	}
+	// Same prose-independence as onlyRefusalLog: a renamed refusal line must
+	// still fail this test.
 	for _, line := range *logs {
-		if strings.Contains(line, "task resolution refused") {
-			t.Fatalf("logs = %q, want no refusal line on successful resolution", *logs)
+		if strings.Contains(line, "reason=") {
+			t.Fatalf("logs = %q, want no reason-bearing line on successful resolution", *logs)
 		}
 	}
 }
