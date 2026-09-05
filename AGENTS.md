@@ -30,6 +30,40 @@ export GOCACHE=/tmp/gitmoot-go-build-cache
 mkdir -p "$GOCACHE"
 ```
 
+**Inside a read-only review seat, both exports above are wrong** — a seat that
+follows them gets `exit 126` and a denied cache, which read as broken
+infrastructure rather than the documented boundary they are:
+
+- **Never invoke `/root/.local/toolchains/go1.26.4/bin/go`.** The daemon stages a
+  copy it owns and points the seat at it via injected `GOROOT` and `PATH`
+  (`internal/cli/toolchain_seat.go`); granting the operator's own installation was
+  rejected as escape-class (symlink redirect out of containment, and an
+  unclosable TOCTOU on a path the daemon does not own). Execution denial on that
+  path is **expected and is never a finding** — probe with plain `go version` and
+  `go env GOROOT`, which should report a `GOROOT` under `<home>/.gitmoot/toolchains/`.
+- **Never use the shared `/tmp/gitmoot-go-build-cache`.** It is not writable from a
+  seat; use a seat-owned `GOCACHE` under `$TMPDIR`. Note the cost: each building
+  seat then populates its own cache instead of sharing one, so seat builds are
+  coupled to the dispatch disk floor.
+- **Set `CGO_ENABLED=0`.** The sandbox denies `/usr/include/stdc-predef.h`, so
+  anything that actually reaches `runtime/cgo` fails on a C header — which
+  includes the repo-wide gate and `./cmd/gitmoot`. A pure-Go package still builds
+  and tests with default cgo, so a passing single-package run proves nothing about
+  the gate.
+- **`-race` is unreachable in a seat**, because race requires cgo (`go: -race
+  requires cgo; enable cgo by setting CGO_ENABLED=1`). It is covered by CI's race
+  shards only, and its absence from a seat verdict is not a regression.
+
+When a seat's plain `go` returns 126, staging did not happen — but **only some of
+those cases say why.** `stageSeatToolchain` deliberately stays SILENT when no `go`
+is on the daemon's `PATH`, when the toolchain sits under a system-package prefix,
+or when the source is not a pinned installation (`ErrNotPinned`): the seat is left
+exactly as it was, with no diagnostic. Other staging failures do print
+`gitmoot: read-only seat toolchain:` on the daemon's stderr, never in the job's
+events. See `docs/troubleshooting.md`, "`Permission denied`, exit 126, running
+Go", for the refusal list (unpinned source, system-package prefix, symlink in the
+source set, free space below the 4 GiB floor).
+
 Run from the repo root and make these pass before committing — they mirror the CI
 gate in `.github/workflows/ci.yml`:
 
