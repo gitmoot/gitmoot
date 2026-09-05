@@ -54,6 +54,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 )
 
@@ -260,6 +261,38 @@ func identifyRoot(root *os.Root) (Identity, error) {
 //	no swap                          os.SameFile(lstat, opened) = true
 //	name swapped to an in-root link  os.SameFile(lstat, opened) = FALSE
 //
+// WHAT THIS DOES NOT CLOSE, STATED BECAUSE "THE WINDOW IS CLOSED" WOULD BE THE
+// FOURTH OVERSTATEMENT ABOUT THIS MECHANISM ON THIS PR. The three before it were
+// "there is no longer a second pathname resolution to lose", "each O_NOFOLLOW is
+// the only thing covering the window", and "at worst a duplicate of a file
+// already being copied" - each written confidently and each disproved by a probe.
+// So, precisely:
+//
+// This proves the object did not CHANGE between inspection and open. A HARDLINK
+// does not change the object - it IS the same inode - so a hardlink substitution
+// passes this check. Reproduced: go.env replaced by a hardlink to an unselected
+// root file was staged with that file's contents. Symlink substitution is closed;
+// hardlink substitution is not.
+//
+// AND Stage STILL WALKS THE SOURCE TWICE, to fingerprint and then to copy. Each
+// individual open is now internally consistent, but nothing reconciles the two
+// walks for NON-EXECUTABLE files: the post-copy digest covers only the executable
+// set, so a non-executable that differs between the two walks is not detected.
+// The hardlink case is the concrete instance of that.
+//
+// WHY IT IS NOT CLOSED HERE, and it is a bound rather than an argument that it
+// does not matter: with fs.protected_hardlinks=1 (the kernel default) a hardlinker
+// must already hold read and write on the target, so making the link requires the
+// access it would supposedly gain - not an escalation. And the operator-pinned
+// source is root-owned and not seat-writable, so a seat cannot create the link at
+// all. A link-count refusal was deliberately NOT added: every bound added in this
+// campaign had a version that rejected valid input, and refusing a legitimate
+// layout is a worse defect than a documented gap that is unreachable as deployed.
+// Measured for the record: 0 of 15022 regular files in the pinned distribution
+// have nlink>1, with a control confirming the finder detects hardlinks when
+// present - so the refusal would not break THIS distribution, which is not the
+// same as not breaking any.
+//
 // THE ALTERNATIVE WAS DELIBERATELY NOT TAKEN. Widening the identity digest to
 // cover every published file would also have detected this, and was offered.
 // It is rejected because it would re-hash 221.6 MiB on every seat launch, which
@@ -296,8 +329,8 @@ func openVerified(root *os.Root, name string, flag int) (*os.File, fs.FileInfo, 
 	//
 	// nil in production, with exactly one caller, so it costs a nil check on a
 	// path that is already doing two syscalls.
-	if openWindowHook != nil {
-		openWindowHook(name)
+	if hook := openWindowHook.Load(); hook != nil {
+		(*hook)(name)
 	}
 	// O_NONBLOCK ON EVERY OPEN, NOT JUST VERSION, and this closes a defect that
 	// predates the inode check. A FIFO with no writer BLOCKS a blocking open, and
@@ -325,10 +358,34 @@ func openVerified(root *os.Root, name string, flag int) (*os.File, fs.FileInfo, 
 	return handle, after, nil
 }
 
-// openWindowHook is nil in production and set only by tests, to substitute an
-// object between openVerified's Lstat and its open. It exists because the
-// interval it opens is otherwise reachable only by racing.
-var openWindowHook func(name string)
+// openWindowHook is unset in production and installed only by tests, to
+// substitute an object between openVerified's Lstat and its open. It exists
+// because the interval it opens is otherwise reachable only by racing.
+//
+// STRUCTURALLY SINGLE-INSTALLER AND ATOMIC, rather than a comment asking callers
+// to be careful. The first version was a plain package-level func var: safe today
+// because this package has no t.Parallel, and a silent data race the moment
+// anyone adds one. Two failure modes had to close, not one:
+//
+//	torn access      an atomic pointer removes the data race outright
+//	interference     installOpenWindowHook PANICS if a hook is already installed,
+//	                 so two concurrent installers fail loudly instead of one
+//	                 silently firing inside the other's Stage
+//
+// A test seam that corrupts a parallel run without saying so is the same class as
+// the racing regression this hook replaced, which killed one mutation and let its
+// identical twin through. Loud beats convenient.
+var openWindowHook atomic.Pointer[func(name string)]
+
+// installOpenWindowHook installs fn and returns its release function. It panics
+// if a hook is already installed, which is the assertion that makes the seam
+// single-threaded by construction rather than by convention.
+func installOpenWindowHook(fn func(name string)) (release func()) {
+	if !openWindowHook.CompareAndSwap(nil, &fn) {
+		panic("toolchain: openWindowHook is already installed; this seam admits one installer at a time")
+	}
+	return func() { openWindowHook.Store(nil) }
+}
 
 // sameObject is the comparison, extracted as a PURE predicate so both arms are
 // reachable by a deterministic test rather than only by winning a race.

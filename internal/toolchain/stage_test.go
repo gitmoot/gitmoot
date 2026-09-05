@@ -887,7 +887,7 @@ func TestSubstitutedSourceCannotExposeAnUnselectedFile(t *testing.T) {
 
 	goEnv := filepath.Join(source, "go.env")
 	swapped := false
-	openWindowHook = func(name string) {
+	defer installOpenWindowHook(func(name string) {
 		if name != "go.env" || swapped {
 			return
 		}
@@ -899,8 +899,7 @@ func TestSubstitutedSourceCannotExposeAnUnselectedFile(t *testing.T) {
 		if err := os.Symlink("PRIVATE-NOTES", goEnv); err != nil {
 			t.Error(err)
 		}
-	}
-	defer func() { openWindowHook = nil }()
+	})()
 
 	staged, err := Stage(filepath.Join(base, "home"), source)
 	if !swapped {
@@ -1027,5 +1026,42 @@ func TestIrregularMembersAreRefusedWithoutBlocking(t *testing.T) {
 	base := t.TempDir()
 	if _, err := Stage(filepath.Join(base, "home"), goInstall(t, filepath.Join(base, "src"))); err != nil {
 		t.Fatalf("control failed: a clean tree must stage: %v", err)
+	}
+}
+
+// TestOpenWindowHookAdmitsOneInstaller pins the assertion that makes the test
+// seam single-threaded by construction rather than by convention.
+//
+// The first version of the hook was a plain package-level func var: safe while
+// this package has no t.Parallel, and a silent data race plus silent
+// cross-test interference the moment anyone adds one. A seam that corrupts a
+// parallel run without saying so is the same class as the racing regression it
+// replaced, so a second installer must FAIL rather than win.
+func TestOpenWindowHookAdmitsOneInstaller(t *testing.T) {
+	// CONTROL: install and release cleanly, twice in sequence, so the refusal
+	// below is about concurrency rather than about the hook being unusable.
+	for i := 0; i < 2; i++ {
+		release := installOpenWindowHook(func(string) {})
+		release()
+	}
+	if openWindowHook.Load() != nil {
+		t.Fatal("release did not clear the hook")
+	}
+
+	release := installOpenWindowHook(func(string) {})
+	defer release()
+
+	panicked := func() (caught bool) {
+		defer func() {
+			if recover() != nil {
+				caught = true
+			}
+		}()
+		second := installOpenWindowHook(func(string) {})
+		second()
+		return false
+	}()
+	if !panicked {
+		t.Fatal("a second installer succeeded; two parallel tests could interfere silently")
 	}
 }

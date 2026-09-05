@@ -776,8 +776,21 @@ exactly as it was before this feature existed rather than failing the launch:
 - **The source contains a symlink.** A symlinked name is refused anywhere in the
   copied set, because following one copies something the daemon never validated.
   The check also proves the file it opened is the file it inspected, so a source
-  that is modified *while* it is being copied is refused rather than copied
-  partially.
+  whose *name* is redirected while it is being copied is refused rather than
+  copied.
+
+**One limit of that check, stated rather than left implied.** It proves the file
+did not **change** between being inspected and being opened. A hardlink does not
+change the file - it is the same underlying object - so replacing a source file
+with a hardlink to another file is **not** detected. Two things bound this rather
+than excuse it: with the kernel default `fs.protected_hardlinks=1`, creating such
+a link already requires read and write access to the target, so it gains nothing
+an attacker did not already have; and the operator-pinned toolchain is root-owned
+and not writable by a seat, so a seat cannot create one. Staging also reads the
+source twice, once to fingerprint it and once to copy it, and only executables are
+reconciled between those two reads. **If you point staging at a directory that
+untrusted processes can write, these are the gaps to know about** - the intended
+source is an installation only the operator can modify.
 
 To recover, fix the cause and restart the daemon, or run the seat's job again:
 staging is attempted per launch and a previously failed stage is retried rather
