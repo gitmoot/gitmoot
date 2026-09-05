@@ -714,6 +714,29 @@ func TestInternalSymlinksAreRefusedNotFollowed(t *testing.T) {
 		}
 	})
 
+	t.Run("go.env is an internal symlink", func(t *testing.T) {
+		base := t.TempDir()
+		source := goInstall(t, filepath.Join(base, "src"))
+		// go.env is the ONE root file nothing else validates before the copy:
+		// VERSION is proven by readVersion during Identify and bin/go by the
+		// fingerprint walk, so copyOneFile's own guard is the only thing between
+		// a symlinked go.env and a followed link. A mutant removing that guard
+		// survived every test until this fixture existed - it was untested, not
+		// redundant, which is the opposite diagnosis from the deleted guards.
+		if err := os.WriteFile(filepath.Join(source, "lib", "decoy-env"), []byte("GOTOOLCHAIN=auto\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(source, "go.env")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("lib/decoy-env", filepath.Join(source, "go.env")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Stage(filepath.Join(base, "home"), source); err == nil {
+			t.Fatal("an internal go.env symlink was followed and copied rather than refused")
+		}
+	})
+
 	t.Run("CONTROL the same trees without links stage", func(t *testing.T) {
 		base := t.TempDir()
 		if _, err := Stage(filepath.Join(base, "home"), goInstall(t, filepath.Join(base, "src"))); err != nil {

@@ -215,32 +215,38 @@ func identifyRoot(root *os.Root) (Identity, error) {
 	return Identity{Version: version, Fingerprint: fingerprint}, nil
 }
 
-// EVERY O_NOFOLLOW IN THIS PACKAGE IS UNKILLABLE BY A DETERMINISTIC TEST, AND
-// THIS IS THE AUTHORITATIVE LIST. A reviewer found one such survivor and I had
-// disclosed a different one; enumerating the whole class rather than patching the
-// site it was found at turned up six, so the honest count is stated here once
-// instead of claimed in aggregate anywhere else:
+// A CALLER-SUPPLIED O_NOFOLLOW WOULD BE AN INERT BIT HERE, WHICH IS WHY THERE IS
+// NOT ONE. This package previously passed syscall.O_NOFOLLOW on every root-
+// relative open and claimed each flag was the only thing covering the
+// Lstat-to-open window below. THAT CLAIM WAS FALSE and a reviewer disproved it.
+// Read from the pinned toolchain's own source: os/root_unix.go:85 ORs
+// syscall.O_NOFOLLOW into the openat flags unconditionally, and line 91 then
+// calls checkSymlink, which resolves an in-root symlink and retries. So the flag
+// is already set whatever the caller passes, and the traversal happens anyway.
 //
-//	stage.go requireExecutableGo   O_NOFOLLOW on bin/go      SURVIVES
-//	stage.go readVersion           O_NOFOLLOW on VERSION     SURVIVES
-//	stage.go fingerprintExecutables O_NOFOLLOW on the digest read  SURVIVES
-//	stage.go walkAnchored          O_NOFOLLOW on the walked name   SURVIVES
-//	stage.go copyOneFile           O_NOFOLLOW on the copied file   SURVIVES
-//	stage.go copyOneFile           O_EXCL on the destination create SURVIVES
+// Measured independently before deleting them, with controls:
 //
-// THE SAME CAUSE AT ALL FIVE O_NOFOLLOW SITES: refuseSymlinkedName's Lstat fires
-// first and refuses the name, so removing the flag changes no observable
-// behaviour and no test can see it. O_EXCL survives for a different reason - the
-// destination is always a freshly created temp directory, so a collision cannot
-// occur; it asserts an invariant rather than defending an attack.
+//	in-root symlink, no caller flag    opened, body "followed"
+//	in-root symlink, caller O_NOFOLLOW opened, body "followed"   (identical)
+//	CONTROL escaping symlink           refused, "path escapes from parent", both ways
+//	CONTROL Lstat on the same name     still reports a symlink
 //
-// THEY ARE KEPT RATHER THAN DELETED, and that is the opposite call from the two
-// guards deleted elsewhere in this file, so the difference matters: those were
-// duplicate CHECKS with no distinct effect, whereas each O_NOFOLLOW is the only
-// thing covering the Lstat-to-open window documented below. Deleting them would
-// widen a residual that is real but not deterministically constructible. A guard
-// that only matters inside a race cannot be killed by a deterministic test, and
-// claiming coverage for one would be a false evidence claim.
+// So they were behaviourally identical to the two duplicate guards deleted
+// elsewhere in this file, and are deleted for the same reason. Keeping them while
+// claiming they closed a race was a false evidence claim, not defence in depth.
+//
+// WHAT ACTUALLY REFUSES A SYMLINKED NAME is refuseSymlinkedName's Lstat, which
+// does not follow the final component. ELOOP is still mapped where it can occur,
+// but it means a symlink LOOP rather than a symlinked name: measured, os.Root
+// returns ELOOP for a self-referential or mutually-referential link and
+// "path escapes from parent" for an escaping one, both regardless of the flag.
+//
+// AND THE Lstat-TO-OPEN WINDOW IS THEREFORE UNCLOSED, stated plainly rather than
+// claimed shut. Nothing in this package closes it. What BOUNDS it is os.Root's
+// containment: a name swapped between the Lstat and the open can only resolve to
+// something inside the source installation, so the worst case is copying a
+// duplicate of a file that was already going to be copied. It is not an escape,
+// and no rule can close a window on a tree the daemon does not own.
 //
 // refuseSymlinkedName rejects a name whose FINAL COMPONENT is a symlink.
 //
@@ -274,9 +280,9 @@ func refuseSymlinkedName(root *os.Root, name string) error {
 func requireExecutableGo(root *os.Root) error {
 	// NO Lstat guard here: a symlinked bin/go is refused by the fingerprint walk,
 	// which visits bin/go through walkAnchored and applies refuseSymlinkedName. A
-	// duplicate CHECK here was deleted as redundant. The O_NOFOLLOW below is KEPT
-	// and is a known survivor - see the enumerated list at refuseSymlinkedName.
-	handle, err := root.OpenFile("bin/go", os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	// duplicate CHECK here was deleted as redundant, and so was the inert
+	// caller-supplied O_NOFOLLOW - see the note at refuseSymlinkedName.
+	handle, err := root.OpenFile("bin/go", os.O_RDONLY, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
 			return fmt.Errorf("%w: bin/go is a symlink", ErrSymlink)
@@ -300,14 +306,15 @@ func requireExecutableGo(root *os.Root) error {
 // launch: an availability defect rather than a leak. The type is proven from the
 // descriptor BEFORE any content is read.
 //
-// This O_NOFOLLOW is a known survivor, one of six enumerated at
-// refuseSymlinkedName. O_NONBLOCK by contrast IS killed, by
-// TestReadVersionRefusesAFifoWithoutBlocking.
+// O_NONBLOCK is load-bearing and IS killed by
+// TestReadVersionRefusesAFifoWithoutBlocking. A caller-supplied O_NOFOLLOW was
+// removed as inert; refuseSymlinkedName above is what refuses a symlinked
+// VERSION.
 func readVersion(root *os.Root) (string, error) {
 	if err := refuseSymlinkedName(root, "VERSION"); err != nil {
 		return "", err
 	}
-	handle, err := root.OpenFile("VERSION", os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	handle, err := root.OpenFile("VERSION", os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
 			return "", fmt.Errorf("%w: VERSION is a symlink", ErrSymlink)
@@ -355,7 +362,7 @@ func fingerprintExecutables(root *os.Root) (string, error) {
 
 	digest := sha256.New()
 	for _, name := range names {
-		handle, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		handle, err := root.OpenFile(name, os.O_RDONLY, 0)
 		if err != nil {
 			return "", fmt.Errorf("%w: fingerprint %s: %v", ErrNotPinned, name, err)
 		}
@@ -388,11 +395,16 @@ func collectExecutables(root *os.Root, member string) ([]string, error) {
 // walkAnchored walks name anchored to root, refusing symlinks and irregular files,
 // and calls visit for every entry.
 //
-// CLASSIFY WHAT YOU HOLD. Each entry's kind comes from its DIRECTORY ENTRY, which
-// is a property of the directory content rather than a separate path resolution,
-// and every open is O_NOFOLLOW against the same root descriptor. So there is no
-// interval in which a swapped component could redirect the operation, which is
-// the race the previous pathname-based walk had.
+// CLASSIFY WHAT YOU HOLD, AS FAR AS THAT GOES. Each entry is refused by name via
+// refuseSymlinkedName and then opened against the same root descriptor.
+//
+// AN EARLIER VERSION OF THIS COMMENT CLAIMED "there is no interval in which a
+// swapped component could redirect the operation". That was wrong and is
+// retracted: the Lstat and the open are two steps, so an interval exists. What
+// changed from the previous pathname-based walk is not that the interval is gone
+// but that its CONSEQUENCE is bounded - every resolution is anchored to a held
+// root descriptor, so a swap can only land inside the source installation and
+// can no longer redirect the copy outside it.
 func walkAnchored(root *os.Root, name string, visit func(string, fs.FileInfo) error) error {
 	// The directory-entry check below covers entries found by ReadDir, but NOT
 	// the name this walk was entered with. A symlinked top-level member was
@@ -400,7 +412,7 @@ func walkAnchored(root *os.Root, name string, visit func(string, fs.FileInfo) er
 	if err := refuseSymlinkedName(root, name); err != nil {
 		return err
 	}
-	handle, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	handle, err := root.OpenFile(name, os.O_RDONLY, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
 			return fmt.Errorf("%w: %s", ErrSymlink, name)
@@ -646,7 +658,7 @@ func copyOneFile(sourceRoot, destinationRoot *os.Root, name, target string) erro
 	if err := refuseSymlinkedName(sourceRoot, name); err != nil {
 		return err
 	}
-	handle, err := sourceRoot.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	handle, err := sourceRoot.OpenFile(name, os.O_RDONLY, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
 			return fmt.Errorf("%w: %s", ErrSymlink, name)
@@ -669,6 +681,14 @@ func copyOneFile(sourceRoot, destinationRoot *os.Root, name, target string) erro
 	// Perm() masks to 0o777 and therefore cannot represent setuid or setgid at
 	// all, which is what makes the strip structural rather than a subtraction.
 	mode := info.Mode().Perm() & 0o755
+	// O_EXCL IS THE ONE FLAG HERE THAT IS NOT INERT, and it is also the one
+	// mutant nothing kills. Unlike the deleted O_NOFOLLOW bits it has semantics
+	// os.Root does not supply: it refuses to open an existing file rather than
+	// truncating it. No test kills its removal because the destination is always
+	// a directory this function's caller just created, so a collision cannot
+	// occur on any reachable path. It asserts that invariant rather than
+	// defending an attack, and it is kept so that a future change which reuses a
+	// destination fails loudly instead of silently overwriting.
 	destination, err := destinationRoot.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
 		return err
