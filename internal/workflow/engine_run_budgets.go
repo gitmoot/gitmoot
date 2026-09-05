@@ -811,15 +811,20 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			// earlier version of this comment called it "the safety argument", and
 			// #1903's third review round caught that residue.
 			//
-			// The safety does NOT depend on which rows PolicyMergeGate reaches, and
-			// this comment no longer claims to know: three rounds of this PR killed
-			// three descriptions - "reached by one path or the other" (round 5), "a
-			// stale row is reached by NEITHER" (round 6), and an "exactly three
-			// cases" enumeration that omitted the authorship filter (round 7).
-			// THE INVARIANT THAT ACTUALLY CARRIES IT: refusing the TASK transition
-			// never un-records the REVIEW ROW, so refusing here neither adds nor
-			// removes evidence the gate can see. That is why the asymmetry is a
-			// LIVENESS argument and needs no coverage claim at all.
+			// THIS COMMENT NO LONGER CLAIMS TO KNOW WHICH ROWS PolicyMergeGate
+			// REACHES, nor that this arm is merge-safe. Four rounds of this PR killed
+			// four attempts: "reached by one path or the other" (round 5), "a stale
+			// row is reached by NEITHER" (round 6), an "exactly three cases"
+			// enumeration that omitted the authorship filter (round 7), and the
+			// INFERENCE that unchanged review evidence means unchanged merge safety
+			// (round 9).
+			// WHAT SURVIVES, AND ONLY THIS: refusing the TASK transition never
+			// un-records the REVIEW ROW, so refusing here neither adds nor removes
+			// review evidence. It does NOT follow that this arm cannot affect a
+			// merge: the gate decides from the review rows AND the task state, and it
+			// fences an external merge by claiming that state, so a persisted
+			// objection can lose a race rather than merely be deferred - reproduces
+			// on main, tracked as gitmoot#1933, neither introduced nor fixed here.
 			// For the ordering itself - live head, strict evaluated-head population,
 			// then a latest-round fallback whose decision and authorship filters run
 			// BEFORE ensureReviewMatchesHead - see the comment on

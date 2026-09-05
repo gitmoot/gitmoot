@@ -107,19 +107,28 @@ func TestObjectionAtCurrentHeadStillRequestsChanges(t *testing.T) {
 // function comment had been corrected.
 //
 // WHAT THIS ARM NEEDS FROM PolicyMergeGate IS ONE INVARIANT, NOT A MAP OF ITS
-// BEHAVIOUR. Six review rounds on this PR each killed a different attempt to
+// BEHAVIOUR. Seven review rounds on this PR each killed a different attempt to
 // describe the gate here: three coverage absolutes, then the line numbers
 // themselves (measured against another tree, and once corrected still pointing at
 // declarations rather than at the returns), then an "exactly three cases"
-// enumeration that omitted a fourth path. The enumerations kept failing because
-// the gate's behaviour is a function of the whole review population and of
-// filters applied in an order this file does not own. So:
+// enumeration that omitted a fourth path, and finally a merge-safety INFERENCE
+// drawn from a true sentence. The attempts kept failing because the gate's
+// behaviour is a function of the whole review population, of filters applied in
+// an order this file does not own, AND of the task state. So:
 //
-// THE INVARIANT: refusing the TASK transition NEVER un-records the REVIEW ROW.
-// Nothing about admitting or refusing here adds or removes evidence the gate can
-// see, which is the only thing that could make this arm a merge-safety question.
-// Hence the asymmetry with the approval side is about LIVENESS, and that argument
-// needs no claim about which rows the gate reaches.
+// THE INVARIANT, AND ONLY THIS: refusing the TASK transition NEVER un-records the
+// REVIEW ROW. The terminal result-bearing row is committed before the advance
+// runs, so nothing about admitting or refusing here adds or removes review
+// evidence.
+//
+// WHAT THAT DOES NOT ESTABLISH, stated because the previous version of this
+// comment claimed it: it does NOT follow that this arm cannot affect merge
+// safety. PolicyMergeGate decides from the review rows AND the task state, and it
+// fences an external merge by CLAIMING that state - so a persisted objection can
+// lose a race rather than merely be deferred. That race reproduces on main and is
+// tracked as gitmoot#1933; it is neither introduced nor fixed here. The asymmetry
+// with the approval side is still deliberate, but argue it from the admits
+// themselves rather than from a safety property this arm does not have.
 //
 // WHAT THE GATE DOES WITH A ROW, described as ordering rather than as coverage,
 // and deliberately NOT exhaustive: Evaluate derives the head LIVE via
