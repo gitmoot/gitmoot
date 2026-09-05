@@ -269,13 +269,14 @@ func TestLookupPolledPullRequestTaskLogsNothingOnSuccess(t *testing.T) {
 	if task.ID != "task-ok" {
 		t.Fatalf("task = %+v, want task-ok", task)
 	}
-	// Same metadata independence as onlyRefusalLog: a renamed refusal line
-	// must still fail this test, while "reason=" inside rendered input data must
-	// not. Resolver diagnostics must also stay behind the injected sink.
+	// The contract is SILENCE, not merely the absence of a reason tag. Round 4's
+	// review defeated the tag-only form with a compiling production mutant that
+	// logged "task resolution succeeded for %s#%d" after a successful lookup: no
+	// reason= tag, test still green, and an operator handed a diagnostic for a
+	// path that decided nothing. Assert the sink is EMPTY, which also keeps the
+	// process-logger escape closed.
 	logs.assertSingleSink(t)
-	for _, entry := range logs.entries {
-		if strings.Contains(entry.format, "reason=") {
-			t.Fatalf("logs = %q, want no reason-bearing Logf call on successful resolution", logs.entries)
-		}
+	if len(logs.entries) != 0 {
+		t.Fatalf("Logf calls = %d (%+v), want successful resolution to log nothing", len(logs.entries), logs.entries)
 	}
 }
