@@ -238,25 +238,40 @@ func addExecutableReadRoots(add func(string, bool) error, executable string) err
 		if installRoot == "/" || installRoot == "/usr" {
 			return nil
 		}
-		// PROMOTION IS FOR AN INSTALLATION TREE, NOT A PROFILE (#1921 review).
+		// PROMOTION REQUIRES POSITIVE PROOF OF A PACKAGE TREE (#1921 review, both P1s).
 		//
-		// node-packaged runtimes need it: codex resolves to
-		// <node>/lib/node_modules/@openai/codex/bin/codex.js and cannot run
-		// without its package root beside that bin dir. But a runtime installed
-		// INSIDE its own credential-bearing profile turns the same rule into a
-		// credential grant — kimi is a self-contained ELF alone in
-		// ~/.kimi-code/bin, so promoting its parent makes ~/.kimi-code/credentials
-		// and ~/.kimi-code/oauth readable to every read-only seat.
+		// Promotion exists for one reason: a node-packaged runtime cannot run
+		// without its package root. codex resolves to
+		// <node>/lib/node_modules/@openai/codex/bin/codex.js and needs the files
+		// beside that bin dir. Nothing else needs it — a self-contained
+		// executable runs from its exec dir, which is already granted above.
 		//
-		// This was reachable only once PATH inheritance made those binaries
-		// resolvable at all (#1918): the fix restored availability and, with it,
-		// a grant that had previously been unreachable because the launch failed
-		// first. The exec dir alone is enough to run such a binary.
+		// THE PREVIOUS RULE ASKED THE WRONG QUESTION AND COULD NOT BE REPAIRED BY
+		// ASKING IT BETTER. It promoted any install root that did NOT contain a
+		// known credential name, which failed twice for reasons that are the same
+		// reason: absence is not proof.
 		//
-		// Detection is by CONTENT rather than by directory name so it holds for
-		// an operator-relocated profile (CLAUDE_CODE_CONFIG_DIR and friends) and
-		// does not fire on an ordinary package root that merely sits under /root.
-		if holdsCredentialMaterial(installRoot) {
+		//   - The name list can never be complete (review F1). kimi's config.toml
+		//     carries api_key and OAuth material (internal/runtime/kimi.go,
+		//     internal/cli/daemon_worker.go read it), and it was not on the list,
+		//     so a profile holding bin/kimi plus a secret-bearing config.toml was
+		//     granted whole. A kernel probe read it: CONFIG_CREDENTIAL=READABLE.
+		//   - The scan can never be timely (review F2). Lstat is a time-of-check
+		//     decision and the Landlock grant is recursive, so a credential
+		//     CREATED AFTER setup lands inside an already-granted root. A
+		//     synchronized probe created profile/credentials/late-token.json after
+		//     the seat had entered and read it: LATE_CREDENTIAL=READABLE. No
+		//     longer list and no repeated pre-exec scan closes a temporal gap.
+		//
+		// So the rule is inverted: grant only a root PROVEN to be a package tree,
+		// and withhold otherwise. A mutable operator-owned profile can never
+		// present that proof, which is what makes both findings unreachable rather
+		// than merely unlikely — there is no credential name to enumerate and no
+		// window in which to create one, because the root is never granted.
+		//
+		// Withholding degrades to a launch failure that names itself; granting
+		// leaks an account. That asymmetry is why the unproven case loses.
+		if !isPackageInstallRoot(installRoot) {
 			return nil
 		}
 		return add(installRoot, true)
@@ -264,31 +279,34 @@ func addExecutableReadRoots(add func(string, bool) error, executable string) err
 	return nil
 }
 
-// credentialMaterialEntries are the profile members that make a directory a
-// credential store rather than an installation tree. Each is a real on-disk
-// name used by a runtime this engine launches: `credentials/` and `oauth/` are
-// kimi's, `auth.json` and `.credentials.json` are codex's and claude's.
-var credentialMaterialEntries = []string{
-	"credentials",
-	"oauth",
-	"auth.json",
-	".credentials.json",
-	".claude.json",
+// isPackageInstallRoot reports whether a candidate root is a node package tree,
+// the only shape promotion is for.
+//
+// The proof has two parts and needs both: the root must carry a regular
+// `package.json`, and it must sit under a `node_modules` path segment. Either
+// alone is too weak — an operator profile may hold a stray package.json, and a
+// `node_modules` ancestor alone does not make an arbitrary directory a package.
+//
+// It fails CLOSED on every uncertainty: any Lstat error, including a permission
+// error, and any non-regular package.json (a symlink or directory, which is what
+// a planted marker looks like) withholds the grant.
+func isPackageInstallRoot(root string) bool {
+	root = filepath.Clean(root)
+	if !hasPathSegment(root, "node_modules") {
+		return false
+	}
+	info, err := os.Lstat(filepath.Join(root, "package.json"))
+	if err != nil {
+		return false
+	}
+	return info.Mode().IsRegular()
 }
 
-// holdsCredentialMaterial reports whether a candidate install root is really a
-// runtime profile holding secrets.
-//
-// It fails CLOSED: an unreadable or unstattable candidate is treated as
-// credential-bearing, because withholding a grant degrades to a launch failure
-// that names itself, while granting one leaks an account.
-func holdsCredentialMaterial(root string) bool {
-	for _, entry := range credentialMaterialEntries {
-		_, err := os.Lstat(filepath.Join(root, entry))
-		if err == nil {
-			return true
-		}
-		if !errors.Is(err, os.ErrNotExist) {
+// hasPathSegment reports whether name appears as a WHOLE element of path, so
+// `/opt/node_modules_backup/x` does not match `node_modules`.
+func hasPathSegment(path string, name string) bool {
+	for _, element := range strings.Split(filepath.Clean(path), string(filepath.Separator)) {
+		if element == name {
 			return true
 		}
 	}

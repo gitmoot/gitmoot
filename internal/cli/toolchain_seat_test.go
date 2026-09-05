@@ -351,7 +351,6 @@ func TestReadOnlySeatEnvKeepsRuntimeBinariesResolvable(t *testing.T) {
 	}
 }
 
-
 // TestSeatPathRefusesAStagedPathHoldingAListSeparator is the #1921 review P3.
 //
 // `--home` may legally contain a colon, and a PATH entry may not: the entry

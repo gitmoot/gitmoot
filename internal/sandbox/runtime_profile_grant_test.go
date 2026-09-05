@@ -1,11 +1,13 @@
 package sandbox
 
 import (
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestSandboxExecResolvesInheritedPathBinaryWithoutGrantingProfileKernelE2E is
@@ -97,17 +99,26 @@ func TestSandboxExecResolvesInheritedPathBinaryWithoutGrantingProfileKernelE2E(t
 // <node>/lib/node_modules/@openai/codex/bin/codex.js), so a fix that simply
 // stopped promoting would trade a credential leak for a launch failure. Only the
 // profile case may lose the grant.
-func TestExecutableInstallRootPromotionSkipsCredentialProfiles(t *testing.T) {
+func TestExecutableInstallRootPromotionRequiresProvenPackageTree(t *testing.T) {
 	base := t.TempDir()
 
 	packageRoot := filepath.Join(base, "node_modules", "@openai", "codex")
 	packageBin := filepath.Join(packageRoot, "bin")
+	// A profile holding NO recognized credential name at all: this is review F1's
+	// fixture. The old rule promoted exactly this shape, and a kernel probe then
+	// read the api_key out of config.toml.
 	profile := filepath.Join(base, ".kimi-code")
 	profileBin := filepath.Join(profile, "bin")
-	for _, dir := range []string{packageBin, profileBin, filepath.Join(profile, "oauth")} {
+	for _, dir := range []string{packageBin, profileBin} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := os.WriteFile(filepath.Join(packageRoot, "package.json"), []byte(`{"name":"@openai/codex"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profile, "config.toml"), []byte("api_key = \"seat-must-not-read-this\"\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	for _, executable := range []string{filepath.Join(packageBin, "codex.js"), filepath.Join(profileBin, "kimi")} {
 		if err := os.WriteFile(executable, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
@@ -128,44 +139,180 @@ func TestExecutableInstallRootPromotionSkipsCredentialProfiles(t *testing.T) {
 		return granted
 	}
 
+	// Availability direction. A node-packaged runtime is UNRUNNABLE without its
+	// package root, so this half is what stops the fix from trading a credential
+	// leak for a launch failure.
 	packageGrants := collect(filepath.Join(packageBin, "codex.js"))
 	if !packageGrants[packageBin] {
 		t.Errorf("the exec dir %q was not granted, so the runtime cannot launch at all", packageBin)
 	}
 	if !packageGrants[packageRoot] {
-		t.Errorf("an ordinary installation tree lost its package root %q; codex cannot run without the files beside its bin dir", packageRoot)
+		t.Errorf("a proven package tree lost its root %q; codex cannot run without the files beside its bin dir", packageRoot)
 	}
 
+	// Containment direction, and note the profile carries NO name from the old
+	// denylist. Under the previous rule this passed while leaking.
 	profileGrants := collect(filepath.Join(profileBin, "kimi"))
 	if !profileGrants[profileBin] {
 		t.Errorf("the exec dir %q was not granted, so the runtime cannot launch at all", profileBin)
 	}
 	if profileGrants[profile] {
-		t.Errorf("credential-bearing profile %q was promoted to a readable root; oauth/ and credentials/ live there", profile)
+		t.Errorf("profile %q was promoted with no proof it is a package tree; its config.toml carries api_key and OAuth material (review F1)", profile)
 	}
 }
 
-// TestHoldsCredentialMaterialFailsClosed covers the branch the two tests above
-// cannot reach: a candidate root that cannot be inspected.
-//
-// Withholding a grant degrades to a launch failure that names itself, whereas
-// granting one leaks an account, so the unreadable case must read as
-// credential-bearing. A permission-denied Lstat is the realistic shape.
-func TestHoldsCredentialMaterialFailsClosed(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root bypasses directory permission bits, so an unstattable candidate cannot be staged")
-	}
+// TestIsPackageInstallRootRequiresBothHalvesAndFailsClosed pins the
+// discriminator's edges, each of which is a way a planted marker could buy a
+// grant it should not get.
+func TestIsPackageInstallRootRequiresBothHalvesAndFailsClosed(t *testing.T) {
 	base := t.TempDir()
-	unreadable := filepath.Join(base, "opaque")
-	if err := os.MkdirAll(unreadable, 0o000); err != nil {
+
+	proven := filepath.Join(base, "node_modules", "pkg")
+	strayManifest := filepath.Join(base, ".profile-root")
+	nodeModulesNoManifest := filepath.Join(base, "node_modules", "bare")
+	lookalike := filepath.Join(base, "node_modules_backup", "pkg")
+	manifestIsDir := filepath.Join(base, "node_modules", "dirmanifest")
+	for _, dir := range []string{proven, strayManifest, nodeModulesNoManifest, lookalike, filepath.Join(manifestIsDir, "package.json")} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, root := range []string{proven, strayManifest, lookalike} {
+		if err := os.WriteFile(filepath.Join(root, "package.json"), []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if !isPackageInstallRoot(proven) {
+		t.Errorf("a real package root %q was rejected; every node-packaged runtime would stop launching", proven)
+	}
+	if isPackageInstallRoot(strayManifest) {
+		t.Errorf("profile %q bought a grant with a stray package.json and no node_modules ancestor", strayManifest)
+	}
+	if isPackageInstallRoot(nodeModulesNoManifest) {
+		t.Errorf("directory %q under node_modules with no manifest was accepted as a package root", nodeModulesNoManifest)
+	}
+	if isPackageInstallRoot(lookalike) {
+		t.Errorf("path %q matched node_modules as a substring rather than a whole path element", lookalike)
+	}
+	if isPackageInstallRoot(manifestIsDir) {
+		t.Errorf("a DIRECTORY named package.json in %q was accepted; only a regular manifest may prove a package tree", manifestIsDir)
+	}
+	if isPackageInstallRoot(filepath.Join(base, "node_modules", "absent")) {
+		t.Errorf("a nonexistent root was accepted; an Lstat error must fail closed")
+	}
+}
+
+// TestSandboxExecDeniesCredentialCreatedAfterSetupKernelE2E is review F2 at the
+// only boundary that can show it: the seat is already RUNNING when the
+// credential appears.
+//
+// The old rule made a time-of-check decision (Lstat the direct children) and
+// then installed a RECURSIVE Landlock grant, so a credential created afterwards
+// landed inside an already-granted root. The reviewer proved it with a
+// synchronized probe that waited for the seat to enter, created
+// profile/credentials/late-token.json externally, and read it back:
+// LATE_CREDENTIAL=READABLE.
+//
+// The synchronisation is the whole test, so it is explicit rather than timed:
+// the seat announces it is inside by creating a ready file in its writable
+// workdir, then blocks until the test creates a go file. Only then does it read.
+// A sleep would make this flaky in both directions; a file handshake makes the
+// ordering an invariant.
+//
+// Under the inverted rule this cannot fail for a new reason: the profile root is
+// never granted at all, so there is no window in which a later descendant
+// becomes readable.
+func TestSandboxExecDeniesCredentialCreatedAfterSetupKernelE2E(t *testing.T) {
+	requireLandlockABI(t)
+	gitmoot := buildGitmootBinary(t)
+
+	// Not t.TempDir(): /tmp is granted implicitly, which would make this pass for
+	// the wrong reason. Same reasoning as the sibling E2E above.
+	base, err := os.MkdirTemp(".", ".gitmoot-late-cred-*")
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(unreadable, 0o700) })
-
-	if !holdsCredentialMaterial(unreadable) {
-		t.Fatalf("an uninspectable candidate %q was treated as safe to promote; this path must fail closed", unreadable)
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	base, err = filepath.Abs(base)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if holdsCredentialMaterial(base) {
-		t.Fatalf("an ordinary readable directory %q was reported as credential-bearing, which would strip grants every runtime needs", base)
+
+	profile := filepath.Join(base, ".kimi-code")
+	profileBin := filepath.Join(profile, "bin")
+	credentials := filepath.Join(profile, "credentials")
+	workdir := filepath.Join(base, "seat-worktree")
+	for _, dir := range []string{profileBin, workdir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	late := filepath.Join(credentials, "late-token.json")
+	ready := filepath.Join(workdir, "seat-entered")
+	proceed := filepath.Join(workdir, "credential-planted")
+
+	probe := filepath.Join(profileBin, "kimi")
+	script := "#!/bin/sh\n" +
+		": > \"$2\"\n" +
+		"i=0\n" +
+		"while [ ! -e \"$3\" ] && [ $i -lt 200 ]; do i=$((i+1)); sleep 0.05; done\n" +
+		"if [ ! -e \"$3\" ]; then printf 'HANDSHAKE=TIMEOUT\\n'; exit 0; fi\n" +
+		"if cat \"$1\" >/dev/null 2>&1; then printf 'LATE_CREDENTIAL=READABLE\\n'; else printf 'LATE_CREDENTIAL=DENIED\\n'; fi\n"
+	if err := os.WriteFile(probe, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(gitmoot, "sandbox-exec", "--read", workdir, "--write", workdir, "--", "kimi", late, ready, proceed)
+	cmd.Dir = workdir
+	cmd.Env = append(os.Environ(), "PATH="+profileBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for the seat to be INSIDE the sandbox before the credential exists.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if _, statErr := os.Stat(ready); statErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			t.Fatal("the sandboxed seat never signalled that it had entered; the handshake, not the grant, is broken")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// The credential is created AFTER the sandbox is established. This is the
+	// exact sequence the reviewer used.
+	if err := os.MkdirAll(credentials, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(late, []byte(`{"access_token":"created-after-the-scan"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(proceed, []byte("go\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := io.ReadAll(stdout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("sandboxed seat failed: %v\noutput=%s", err, output)
+	}
+	got := strings.TrimSpace(string(output))
+	if got == "HANDSHAKE=TIMEOUT" {
+		t.Fatal("the seat timed out waiting for the planted credential, so this run measured nothing")
+	}
+	if got != "LATE_CREDENTIAL=DENIED" {
+		t.Fatalf("seat verdict = %q, want %q.\nA credential CREATED AFTER sandbox setup was readable, so promotion of a mutable operator root is a time-of-check decision guarding a recursive grant (review F2). Withhold the root instead of scanning it.", got, "LATE_CREDENTIAL=DENIED")
 	}
 }
