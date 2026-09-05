@@ -2310,40 +2310,65 @@ syscall, so this is a bounded-wait guarantee rather than a promise that kernel
 I/O itself is cancelled. Failures are recorded and never prevent worktree
 removal.
 
-### Where a job's wall time went (`phase_profile`)
+### Where a review's wall time went (`phase_profile`)
 
 Every **review** job with a retained transcript emits one `phase_profile` job
-event at close, visible in `gitmoot job events <job-id>`. Other job types are
+event per ATTEMPT, visible in `gitmoot job events <job-id>`. Other job types are
 deliberately untouched: the profile is appended after a job's terminal events,
 so emitting it everywhere would change the observable event sequence of jobs
-this measurement has no business affecting. It answers "where did the wall
-time go" without a second measurement pass, because the transcript records what
-ran and not when: the streams carry no event timestamps, and replay
-deliberately refuses to invent elapsed time from parser speed, so the timing
-has to be recorded live or not at all.
+this measurement has no business affecting.
 
-The message is one JSON object:
+It answers "where did the wall time go" without a second measurement pass,
+because the transcript records what ran and not when: the streams carry no
+event timestamps, and replay deliberately refuses to invent elapsed time from
+parser speed. The timing is therefore recorded live or not at all.
 
-- `bucket_ms` / `bucket_count` — measured command time by class: `test`
-  (`go test`), `build` (`go build`, `vet`, `generate`, `gofmt`), `vcs` (`git`,
-  `gh`), `other`. Classification reads the LEADING command, so
-  `git commit -m "go test is slow"` is `vcs`.
-- `wall_ms` — the run's wall time.
-- `residual_ms` — wall time with **no command in flight**. Buckets plus
-  residual equal `wall_ms` by construction, so a dominant residual is visible
-  rather than distributed across the buckets.
-- `coverage` — **read this before the buckets**. `decomposed` means the
-  runtime emits per-tool events (codex, kimi). `opaque_runtime` means it does
-  not: Claude reports a single final envelope and no tool events, so an opaque
-  row has zero commands however long the job took. An opaque profile is
-  therefore a blind spot, NOT a measurement that the job spent all its time
-  outside commands - exclude those rows from any decomposition rather than
-  averaging them in.
+The message is one JSON object.
 
-Two confounders to hold fixed when comparing profiles, both measured: jobs
-whose id does not begin `local-review-` include `workflow-*` rows that run an
-order of magnitude shorter and will halve an aggregate median, and
-concurrency-at-start alone moves p50 by roughly 2.6x.
+**TWO IDENTITIES, and the difference between them is the finding.** Commands can
+run CONCURRENTLY, so their durations do not partition anything:
+
+    covered_ms + residual_ms == wall_ms          (exact, up to ms rounding)
+    sum(bucket_ms)           == covered_ms + overlap_ms
+
+- `covered_ms` — wall time during which at least one command was in flight (the
+  UNION of command intervals).
+- `residual_ms` — wall time with **no command in flight**. Non-negative by
+  construction, because it is `wall - covered` and never `wall - sum`.
+- `overlap_ms` — how much command time ran concurrently. Reported, not absorbed:
+  an earlier version subtracted the SUM and clamped a negative result to zero,
+  which silently swallowed 24ms of a measured 76ms run and made the documented
+  partition false exactly when overlap occurred.
+- `bucket_ms` / `bucket_count` — each command's OWN measured time, classified as
+  `test` (`go test`), `build` (`go build`, `vet`, `generate`, `gofmt`), `vcs`
+  (`git`, `gh`), `mixed`, or `other`. Under overlap these sum to more than
+  `covered_ms`, and `overlap_ms` is the difference.
+- `commands` / `unpaired` / `tool_events` — shell commands measured; tool
+  results whose call id was never seen (they contribute no time, and are
+  reported so a stream this cannot follow stays visible); and non-shell tool
+  results such as `file_change`, which are tool activity but not commands.
+- `attempt` — the job's lifecycle generation. `job retry` preserves prior
+  events and re-delivers the same job id, so one job id can hold several
+  profiles; this field is the attempt boundary.
+- `coverage` — **read this before the buckets.** `decomposed` means the runtime
+  emits per-tool events (codex, kimi). `opaque_runtime` means it does not:
+  Claude reports a single final envelope and no tool events, so an opaque row
+  has zero commands however long the job took. An opaque profile is a blind
+  spot, NOT a measurement that the job spent all its time outside commands -
+  exclude those rows from any decomposition rather than averaging them in.
+
+Classification reads EVERY segment of a command, not the leading token:
+`go test ./... && go build ./...` is `mixed` rather than being billed wholly to
+`test`, `cd repo && go test ./...` and `time go test ./...` are `test` (the
+prefix is plumbing), `go test ./... | grep FAIL` is `test` (a pipeline consumer
+is a filter, not a phase), and `git commit -m "go test is slow"` is `vcs`. A
+tool payload may be a bare command or JSON (`{"command":"go test ./..."}`),
+which kimi uses; both are read.
+
+Two confounders to hold fixed when comparing profiles, both measured: jobs whose
+id does not begin `local-review-` include `workflow-*` rows that run an order of
+magnitude shorter and will halve an aggregate median, and concurrency-at-start
+alone moves p50 by roughly 2.6x.
 
 ### Evidence-graded proof manifests
 

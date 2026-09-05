@@ -797,7 +797,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// Default-on retained capture is attached to the already-composed adapter so
 	// relay env, credential curation, gateway leases, Landlock, and pipeline
 	// progress all survive. Any open/composition failure is fail-open.
-	retainedLogFile, retainedLogErr := openRetainedTranscriptLog(w.ConfigHome, job.ID, job.Type, effectiveTranscriptRuntime(payload, agent), w.Store)
+	retainedLogFile, retainedLogErr := openRetainedTranscriptLog(w.ConfigHome, job.ID, job.Type, effectiveTranscriptRuntime(payload, agent), job.LifecycleGeneration, w.Store)
 	if retainedLogErr != nil {
 		writeLine(w.Stdout, "job %s transcript log open failed: %v", job.ID, retainedLogErr)
 	}
@@ -3165,7 +3165,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	adapter = pipeline.WrapPipelineEnvDeliveryAdapter(w.Store, w.ConfigHome, payload, adapter)
 	// Temp-session delivery is a separate early-return path; attach the same
 	// append-only capture here or it would be absent from the trajectory corpus.
-	retainedLogFile, retainedLogErr := openRetainedTranscriptLog(w.ConfigHome, delegatedJob.ID, delegatedJob.Type, effectiveTranscriptRuntime(payload, started.Agent), w.Store)
+	retainedLogFile, retainedLogErr := openRetainedTranscriptLog(w.ConfigHome, delegatedJob.ID, delegatedJob.Type, effectiveTranscriptRuntime(payload, started.Agent), delegatedJob.LifecycleGeneration, w.Store)
 	if retainedLogErr != nil {
 		writeLine(w.Stdout, "job %s transcript log open failed: %v", delegatedJob.ID, retainedLogErr)
 	}

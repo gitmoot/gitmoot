@@ -16,18 +16,18 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// phaseProfileEventKind is the job-event kind carrying a run's command-phase
+// phaseProfileEventKind is the job-event kind carrying a review's command-phase
 // decomposition (#1824). Event kinds are free-form strings, so this needs no
 // store schema change and no edit to internal/db.
 const phaseProfileEventKind = "phase_profile"
 
-// Phase buckets. These partition a run's OBSERVED command time; whatever is
-// left of the run's wall clock is reported as residual rather than being
-// distributed across them, so the buckets can never sum to more than the run.
+// Phase buckets. These classify a command's OWN measured time. They do not
+// partition the run on their own - see phaseProfile for the identity that does.
 const (
 	phaseBucketTest  = "test"
 	phaseBucketBuild = "build"
 	phaseBucketVCS   = "vcs"
+	phaseBucketMixed = "mixed"
 	phaseBucketOther = "other"
 )
 
@@ -43,8 +43,8 @@ const (
 	phaseCoverageOpaque     = "opaque_runtime"
 )
 
-// runtimesWithToolEvents lists the runtimes whose translators emit per-tool
-// events with durations. Anything else is opaque and is reported as such.
+// runtimeEmitsToolEvents reports whether a runtime's translator emits per-tool
+// events at all. Anything else is opaque and is reported as such.
 func runtimeEmitsToolEvents(runtimeName string) bool {
 	switch strings.ToLower(strings.TrimSpace(runtimeName)) {
 	case "codex", "kimi":
@@ -54,14 +54,104 @@ func runtimeEmitsToolEvents(runtimeName string) bool {
 	}
 }
 
-// classifyPhaseCommand maps a shell command to a bucket. It reads the FIRST
-// meaningful token sequence rather than searching anywhere in the string, so
-// `git commit -m "go test is slow"` is vcs and not test.
+// shellToolNames are the tool names whose payload is a shell command. Only
+// these contribute to the command decomposition; a file_change or a web fetch
+// is a tool event but not a command, and counting it as one inflates the
+// command count with rows the buckets cannot describe (#1824 review F2).
+func isShellToolName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "bash", "sh", "shell", "zsh", "powershell", "command", "command_execution", "exec", "exec_command", "terminal":
+		return true
+	default:
+		return false
+	}
+}
+
+// extractToolCommand pulls the shell command out of a tool's input payload.
+// Codex sends the command as a bare string; kimi sends function arguments as
+// JSON, e.g. {"command":"go test ./..."}, and handing that JSON to a
+// leading-token classifier lands every kimi command in `other` (#1824 review
+// F2). Unknown shapes return the raw text, which classifies as other honestly.
+func extractToolCommand(input string) string {
+	trimmed := strings.TrimSpace(input)
+	if !strings.HasPrefix(trimmed, "{") {
+		return trimmed
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &decoded); err != nil {
+		return trimmed
+	}
+	for _, key := range []string{"command", "cmd", "script", "shell_command"} {
+		switch value := decoded[key].(type) {
+		case string:
+			if strings.TrimSpace(value) != "" {
+				return strings.TrimSpace(value)
+			}
+		case []any:
+			parts := make([]string, 0, len(value))
+			for _, item := range value {
+				if text, ok := item.(string); ok {
+					parts = append(parts, text)
+				}
+			}
+			if len(parts) > 0 {
+				return strings.Join(parts, " ")
+			}
+		}
+	}
+	return trimmed
+}
+
+// classifyPhaseCommand maps a shell command to a bucket by classifying EVERY
+// segment of it. A single leading token cannot describe `go test ./... && go
+// build ./...` (which bills build time to test) or `cd repo && go test ./...`
+// and `time go test ./...` (which land in other) - all three measured in #1824
+// review F3. Segments that disagree yield `mixed`, which says "this command
+// spans phases" rather than picking one and being wrong.
 func classifyPhaseCommand(command string) string {
-	// Real codex commands arrive as `/bin/bash -lc 'go test ./...'`, so tokens
-	// carry quoting and the interpreter carries a path. Both are stripped
-	// before matching, or every wrapped command silently lands in other -
-	// which is the whole population of a codex review.
+	segments := splitCommandSegments(extractToolCommand(command))
+	seen := ""
+	for _, segment := range segments {
+		bucket := classifyCommandSegment(segment)
+		// A pure `cd`/`export` prefix is plumbing, not a phase: it must not
+		// turn `cd repo && go test` into mixed.
+		if bucket == "" {
+			continue
+		}
+		switch {
+		case seen == "":
+			seen = bucket
+		case seen != bucket:
+			return phaseBucketMixed
+		}
+	}
+	if seen == "" {
+		return phaseBucketOther
+	}
+	return seen
+}
+
+// splitCommandSegments splits on shell sequencing operators. It is deliberately
+// naive about quoting: a `&&` inside a quoted string over-splits into segments
+// that classify as other, which degrades a label rather than inventing time.
+func splitCommandSegments(command string) []string {
+	fields := strings.FieldsFunc(command, func(r rune) bool { return r == '\n' || r == ';' })
+	segments := make([]string, 0, len(fields))
+	for _, field := range fields {
+		for _, part := range strings.Split(strings.ReplaceAll(field, "||", "&&"), "&&") {
+			for _, piped := range strings.Split(part, "|") {
+				if trimmed := strings.TrimSpace(piped); trimmed != "" {
+					segments = append(segments, trimmed)
+				}
+			}
+		}
+	}
+	return segments
+}
+
+// classifyCommandSegment classifies one segment, or returns "" for pure
+// plumbing (cd, export, an env-only line) that should not colour the result.
+func classifyCommandSegment(segment string) string {
 	normalize := func(token string) string {
 		token = strings.Trim(token, "'\"")
 		if idx := strings.LastIndex(token, "/"); idx >= 0 && idx+1 < len(token) {
@@ -69,26 +159,34 @@ func classifyPhaseCommand(command string) string {
 		}
 		return token
 	}
-	fields := strings.Fields(strings.ToLower(strings.TrimSpace(command)))
-	// Step past env-var assignments and a leading interpreter wrapper so
-	// `GOFLAGS=-mod=mod go test ./...` classifies as test.
+	fields := strings.Fields(strings.ToLower(strings.TrimSpace(segment)))
+	plumbing := false
 	for len(fields) > 0 {
-		// The env-assignment test reads the RAW token: normalizing first strips
-		// the path out of `GOCACHE=/tmp/x` and with it the `=` that identifies
-		// an assignment.
 		raw := strings.Trim(fields[0], "'\"")
 		if strings.Contains(raw, "=") && !strings.HasPrefix(raw, "-") {
 			fields = fields[1:]
+			plumbing = true
 			continue
 		}
 		switch normalize(fields[0]) {
-		case "bash", "sh", "zsh", "env", "-c", "-lc", "-lic":
+		case "bash", "sh", "zsh", "env", "-c", "-lc", "-lic", "time", "nice", "nohup", "sudo", "xargs":
 			fields = fields[1:]
 			continue
+		case "cd", "export", "pushd", "popd", "source", "mkdir", "rm", "cp", "mv", "echo", "set":
+			return ""
+		case "grep", "rg", "awk", "sed", "head", "tail", "cut", "tr", "sort", "uniq", "wc", "tee", "jq", "cat":
+			// A pipeline consumer is a FILTER on another command's output, not
+			// a phase of its own: `go test ./... | grep FAIL` is a test run,
+			// and calling it mixed would label most real invocations
+			// unclassifiable.
+			return ""
 		}
 		break
 	}
 	if len(fields) == 0 {
+		if plumbing {
+			return ""
+		}
 		return phaseBucketOther
 	}
 	head := normalize(fields[0])
@@ -117,14 +215,46 @@ func classifyPhaseCommand(command string) string {
 
 // phaseProfile is the emitted payload. Durations are milliseconds so the row is
 // readable without unit guessing.
+//
+// TWO IDENTITIES, and the difference is the point (#1824 review F1). Command
+// intervals can OVERLAP, so their durations do not partition anything:
+//
+//	CoveredMS + ResidualMS == WallMS          (exact, always)
+//	sum(BucketMS)          == CoveredMS + OverlapMS
+//
+// Covered is the UNION of command intervals, so residual - time with no command
+// in flight - is non-negative by construction with nothing clamped. An earlier
+// version subtracted the SUM and clamped a negative result to zero, which
+// silently absorbed 24ms of a measured 76ms run and made the documented
+// partition false exactly when overlap occurred.
 type phaseProfile struct {
-	Coverage    string           `json:"coverage"`
-	Runtime     string           `json:"runtime"`
-	WallMS      int64            `json:"wall_ms"`
-	ResidualMS  int64            `json:"residual_ms"`
-	Commands    int              `json:"commands"`
+	Coverage   string `json:"coverage"`
+	Runtime    string `json:"runtime"`
+	Attempt    int64  `json:"attempt"`
+	WallMS     int64  `json:"wall_ms"`
+	CoveredMS  int64  `json:"covered_ms"`
+	ResidualMS int64  `json:"residual_ms"`
+	OverlapMS  int64  `json:"overlap_ms"`
+	Commands   int    `json:"commands"`
+	// Unpaired counts tool results with no matching call id. They contribute
+	// no time; reporting them keeps a stream this instrument cannot follow
+	// visible instead of silently short-measuring the run.
+	Unpaired int `json:"unpaired"`
+	// ToolEvents counts non-shell tool results (file_change and friends).
+	ToolEvents  int              `json:"tool_events"`
 	BucketMS    map[string]int64 `json:"bucket_ms"`
 	BucketCount map[string]int   `json:"bucket_count"`
+}
+
+type pendingCommand struct {
+	command string
+	tool    string
+	started time.Time
+}
+
+type commandInterval struct {
+	start time.Time
+	end   time.Time
 }
 
 // retainedTranscript is the handle every production caller writes through. It
@@ -132,35 +262,50 @@ type phaseProfile struct {
 // returning an interface would hand them a non-nil interface holding a nil
 // pointer on the capture-disabled path.
 type retainedTranscript struct {
-	file *os.File
+	// sink is an io.Writer rather than *os.File so a test can inject a short
+	// or failing write. Without that the observe-before-write mutant is
+	// unkillable, which is how it survived while being reported as killed
+	// (#1824 review F4).
+	sink   io.Writer
+	closer io.Closer
 
-	store *db.Store
-	jobID string
-
+	store   *db.Store
+	jobID   string
 	runtime string
+	attempt int64
 
 	translator transcript.Translator
-	pending    []string
+	pending    map[string]pendingCommand
+	intervals  []commandInterval
 	partial    []byte
 	started    time.Time
 
-	bucketMS    map[string]int64
+	bucketNS    map[string]int64
 	bucketCount map[string]int
 	commands    int
+	unpaired    int
+	toolEvents  int
 }
 
 // newRetainedTranscript attaches the phase instrument to an open transcript
 // file. A job whose runtime is unknown, or whose runtime emits no tool events,
 // still gets a profile row - tagged opaque, because a silent absence is
 // indistinguishable from a fast run.
-func newRetainedTranscript(file *os.File, jobID, jobType, runtimeName string, store *db.Store) *retainedTranscript {
+func newRetainedTranscript(file *os.File, jobID, jobType, runtimeName string, attempt int64, store *db.Store) *retainedTranscript {
 	handle := &retainedTranscript{
-		file:        file,
+		sink:        file,
+		closer:      file,
 		store:       store,
 		jobID:       jobID,
+		attempt:     attempt,
 		started:     time.Now(),
-		bucketMS:    map[string]int64{},
+		pending:     map[string]pendingCommand{},
+		bucketNS:    map[string]int64{},
 		bucketCount: map[string]int{},
+	}
+	if file == nil {
+		handle.sink = nil
+		handle.closer = nil
 	}
 	// #1824 asks where a REVIEW's wall time goes, and the profile is appended
 	// after a job's terminal events. Emitting it for every job type would change
@@ -192,6 +337,24 @@ func newRetainedTranscript(file *os.File, jobID, jobType, runtimeName string, st
 // still produces a profile tagged opaque_runtime rather than no row at all.
 type opaqueTranslator struct{}
 
+func (opaqueTranslator) Translate(string) []transcript.Event { return nil }
+func (opaqueTranslator) Flush() []transcript.Event           { return nil }
+
+// Write persists the bytes FIRST and observes only what was actually persisted.
+// Instrumentation must never be able to lose, reorder or double-count a
+// transcript byte, so the sink write is the only operation whose error is
+// returned, and a short write observes p[:n] rather than all of p.
+func (r *retainedTranscript) Write(p []byte) (int, error) {
+	if r == nil || r.sink == nil {
+		return len(p), nil
+	}
+	n, err := r.sink.Write(p)
+	if r.translator != nil && n > 0 {
+		r.observe(p[:n])
+	}
+	return n, err
+}
+
 func (r *retainedTranscript) observe(p []byte) {
 	r.partial = append(r.partial, p...)
 	// Scan the BYTES. An earlier form called string(r.partial) once per
@@ -209,97 +372,148 @@ func (r *retainedTranscript) observe(p []byte) {
 	}
 }
 
-func (opaqueTranslator) Translate(string) []transcript.Event { return nil }
-func (opaqueTranslator) Flush() []transcript.Event           { return nil }
-
-// Write persists the bytes FIRST and observes them second. Instrumentation must
-// never be able to lose or reorder a transcript byte, so the file write is the
-// only operation whose error is returned; a parse that goes wrong degrades the
-// profile and nothing else.
-func (r *retainedTranscript) Write(p []byte) (int, error) {
-	if r == nil || r.file == nil {
-		return len(p), nil
-	}
-	n, err := r.file.Write(p)
-	if r.translator != nil && n > 0 {
-		r.observe(p[:n])
-	}
-	return n, err
-}
-
 func (r *retainedTranscript) consume(events []transcript.Event) {
 	for _, event := range events {
 		switch event.Kind {
 		case transcript.KindToolCall:
-			// The emitted result event carries the tool NAME but not its input,
-			// so the command text is remembered here and paired in arrival
-			// order. Reviews run their tools sequentially, so order is the
-			// pairing the stream actually supports.
-			r.pending = append(r.pending, event.InputDigest)
-		case transcript.KindToolResult:
-			command := ""
-			if len(r.pending) > 0 {
-				command = r.pending[0]
-				r.pending = r.pending[1:]
+			if !isShellToolName(event.Name) {
+				continue
 			}
-			bucket := classifyPhaseCommand(command)
-			r.bucketMS[bucket] += event.Duration.Milliseconds()
+			// Pair by TOOL ID. Arrival order is wrong the moment two tools
+			// overlap: a probe where vcs finished first swapped the two
+			// durations outright (#1824 review F1).
+			r.pending[event.ToolID] = pendingCommand{
+				command: extractToolCommand(event.InputDigest),
+				tool:    event.Name,
+				started: time.Now(),
+			}
+		case transcript.KindToolResult:
+			if !isShellToolName(event.Name) {
+				r.toolEvents++
+				continue
+			}
+			call, ok := r.pending[event.ToolID]
+			if !ok {
+				r.unpaired++
+				continue
+			}
+			delete(r.pending, event.ToolID)
+			end := time.Now()
+			// Time the interval HERE rather than reading event.Duration: the
+			// duration cannot be attributed to a command without the pairing
+			// this branch just did, and owning both ends keeps the interval
+			// available for the union that residual needs.
+			bucket := classifyPhaseCommand(call.command)
+			r.bucketNS[bucket] += end.Sub(call.started).Nanoseconds()
 			r.bucketCount[bucket]++
+			r.intervals = append(r.intervals, commandInterval{start: call.started, end: end})
 			r.commands++
 		}
 	}
 }
 
 // Close flushes the translator, emits one bounded profile row, and closes the
-// file. One row per job rather than one per command is deliberate: job_events
-// already reached ~1.8M rows once from per-tick writes, and the analysis needs
-// totals, not a per-command timeline.
+// file. One row per ATTEMPT rather than per job: RetryJob preserves prior
+// job_events and re-delivers the same job id, so a retried review would
+// otherwise double-count against a one-row-per-job contract (#1824 review F5).
 func (r *retainedTranscript) Close() error {
 	if r == nil {
 		return nil
 	}
 	if r.translator != nil {
 		if len(r.partial) > 0 {
+			// The final line of a stream that ends without a newline is a real
+			// command result; dropping it silently short-measures the run.
 			r.consume(r.translator.Translate(string(r.partial)))
 			r.partial = nil
 		}
 		r.consume(r.translator.Flush())
 		r.emit()
 	}
-	if r.file == nil {
+	if r.closer == nil {
 		return nil
 	}
-	return r.file.Close()
+	return r.closer.Close()
+}
+
+// unionMS returns the total wall time during which at least one command was in
+// flight, merging overlapping intervals.
+func unionNS(intervals []commandInterval) int64 {
+	if len(intervals) == 0 {
+		return 0
+	}
+	sorted := make([]commandInterval, len(intervals))
+	copy(sorted, intervals)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].start.Before(sorted[j].start) })
+	var total time.Duration
+	current := sorted[0]
+	for _, interval := range sorted[1:] {
+		if interval.start.After(current.end) {
+			total += current.end.Sub(current.start)
+			current = interval
+			continue
+		}
+		if interval.end.After(current.end) {
+			current.end = interval.end
+		}
+	}
+	total += current.end.Sub(current.start)
+	return total.Nanoseconds()
 }
 
 func (r *retainedTranscript) emit() {
 	if r.store == nil || strings.TrimSpace(r.jobID) == "" {
 		return
 	}
-	wall := time.Since(r.started)
-	var observed int64
-	for _, ms := range r.bucketMS {
-		observed += ms
+	// ARITHMETIC IN NANOSECONDS, rounded once at the edge. Truncating each
+	// interval to milliseconds first loses sub-millisecond remainders, and the
+	// bucket sum then disagrees with the union by a millisecond per command -
+	// small, but it makes a documented identity false, which is the same defect
+	// class as the clamp this rewrite removed.
+	wallNS := time.Since(r.started).Nanoseconds()
+	var summedNS int64
+	for _, ns := range r.bucketNS {
+		summedNS += ns
+	}
+	coveredNS := unionNS(r.intervals)
+	if coveredNS > wallNS {
+		// Cannot happen while both ends come from the same monotonic clock, but
+		// a covered span longer than the run would make residual negative, and
+		// a negative residual is exactly what this rewrite removes.
+		coveredNS = wallNS
+	}
+	roundMS := func(ns int64) int64 {
+		return (ns + int64(time.Millisecond)/2) / int64(time.Millisecond)
+	}
+	bucketMS := make(map[string]int64, len(r.bucketNS))
+	for bucket, ns := range r.bucketNS {
+		bucketMS[bucket] = roundMS(ns)
+	}
+	wall := roundMS(wallNS)
+	covered := roundMS(coveredNS)
+	if covered > wall {
+		covered = wall
 	}
 	coverage := phaseCoverageDecomposed
 	if !runtimeEmitsToolEvents(r.runtime) {
 		coverage = phaseCoverageOpaque
 	}
-	residual := wall.Milliseconds() - observed
-	if residual < 0 {
-		// Tool durations are measured from arrival and can overlap if a runtime
-		// ever reports concurrent tools. Clamp rather than emit a negative, and
-		// never let the clamp inflate a bucket.
-		residual = 0
-	}
 	profile := phaseProfile{
 		Coverage:    coverage,
 		Runtime:     strings.TrimSpace(r.runtime),
-		WallMS:      wall.Milliseconds(),
-		ResidualMS:  residual,
+		Attempt:     r.attempt,
+		WallMS:      wall,
+		CoveredMS:   covered,
+		ResidualMS:  wall - covered,
+		OverlapMS:   roundMS(summedNS - coveredNS),
 		Commands:    r.commands,
-		BucketMS:    r.bucketMS,
+		Unpaired:    r.unpaired,
+		ToolEvents:  r.toolEvents,
+		BucketMS:    bucketMS,
 		BucketCount: r.bucketCount,
+	}
+	if profile.OverlapMS < 0 {
+		profile.OverlapMS = 0
 	}
 	encoded, err := json.Marshal(profile)
 	if err != nil {
@@ -325,8 +539,6 @@ func sortedBuckets(buckets map[string]int64) []string {
 	return names
 }
 
-var _ io.Writer = (*retainedTranscript)(nil)
-
 // effectiveTranscriptRuntime mirrors resolveTranscriptRuntime's precedence -
 // payload override first, then the agent's registered runtime - without the
 // store lookup that function needs when it starts from only a job id. Callers
@@ -337,3 +549,5 @@ func effectiveTranscriptRuntime(payload workflow.JobPayload, agent runtime.Agent
 	}
 	return strings.TrimSpace(agent.Runtime)
 }
+
+var _ io.Writer = (*retainedTranscript)(nil)

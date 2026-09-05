@@ -46,7 +46,7 @@ const (
 // time, which put a DB read on the job-dispatch path purely for
 // instrumentation. An instrument must not add contention to the path it
 // measures.
-func openRetainedTranscriptLog(home, jobID, jobType, runtimeName string, store *db.Store) (*retainedTranscript, error) {
+func openRetainedTranscriptLog(home, jobID, jobType, runtimeName string, attempt int64, store *db.Store) (*retainedTranscript, error) {
 	paths, err := pathsFromFlag(home)
 	if err != nil {
 		return nil, err
@@ -70,7 +70,7 @@ func openRetainedTranscriptLog(home, jobID, jobType, runtimeName string, store *
 		_ = file.Close()
 		return nil, err
 	}
-	return newRetainedTranscript(file, jobID, jobType, runtimeName, store), nil
+	return newRetainedTranscript(file, jobID, jobType, runtimeName, attempt, store), nil
 }
 
 // appendDeliveryAdapterOutput adds a writer at the existing runner base instead
