@@ -863,3 +863,76 @@ func (e Engine) parkTaskAwaitingHumanMerge(ctx context.Context, ref taskRef, rea
 	// a merged, dismissed, or newly reviewed task from a stale gate result.
 	return nil
 }
+
+// objectionBindsToCurrentHead answers whether a changes_requested verdict may
+// transition the task (#1524).
+//
+// THE DEFECT: a verdict is evidence about a COMMIT, not about the branch. This
+// arm transitioned the task unconditionally, so an objection bound to a
+// superseded head pulled a PR out of ready_to_merge - and, because dispatchFix
+// is called inline from it, dispatched a fix leg against findings about that
+// superseded commit. #1834/#1871 bound the APPROVING side and left this one.
+//
+// ONLY A CONTRADICTED HEAD REFUSES. Both unknowns admit, and the asymmetry with
+// the approval arm is deliberate - but the reason is LIVENESS, not merge safety.
+// An earlier version of this comment claimed that refusing on a missing local
+// row would let the merge gate merge on an approval "over a real current-head
+// objection nobody recorded". That claim is FALSE, and #1903's independent
+// review is what caught it:
+//
+//   - THE INVARIANT, which is all this arm needs: refusing the TASK transition
+//     never un-records the REVIEW ROW. Admitting or refusing here neither adds nor
+//     removes evidence PolicyMergeGate can see, so this arm cannot be a
+//     merge-safety question in either direction - which is why the asymmetry with
+//     the approval side is about LIVENESS.
+//     THIS COMMENT DELIBERATELY DOES NOT ENUMERATE WHICH ROWS THE GATE REACHES.
+//     Three successive rounds of this PR killed three attempts to: two coverage
+//     absolutes and then an "exactly three cases" list that omitted the fallback's
+//     decision and authorship filters. For the ordering - live head via
+//     MergeGateGitHub.GetPullRequest, the strict evaluated-head population, then a
+//     latest-round fallback whose filters run BEFORE ensureReviewMatchesHead - see
+//     the comment on TestObjectionWithNoObservedPullRequestRowStillRequestsChanges,
+//     which states it as ordering with named pins and no case count. The headless
+//     case is documented at TestObjectionWithNoHeadStillRequestsChanges.
+//
+// What refusing would actually cost is the CONSERVATIVE transition and, because
+// dispatchFix is called inline from this arm, the FIX PASS - for an objection
+// nobody can show is stale. Withholding both from an objection that is
+// legitimately about the current head as far as any available evidence goes is a
+// liveness loss, which is why the unknowns admit; the approval side refuses the
+// mirror cases because withholding a merge fails safe.
+//
+// Admitting records a complaint and authorises nothing, so it is the
+// claim-nothing direction. A CLI review dispatched without --head-sha produces
+// the headless payload today, which is why that case is real traffic.
+//
+// ACCEPTED LIMITATION (#1512's family): when the ONLY objection on a PR is bound
+// to a superseded head, this arm strands it. The task does not transition, no fix
+// leg is dispatched, and nothing here re-drives anything - the PR waits for a
+// review at the current head. That is deliberate: a fix pass carrying findings
+// about a commit the branch has moved past is wrong work, not late work. It is
+// also the reason the refusal is terminal rather than retried, and it is not
+// mitigated in this change.
+func (e Engine) objectionBindsToCurrentHead(ctx context.Context, payload JobPayload) (bool, string, error) {
+	objectionHead := strings.TrimSpace(payload.HeadSHA)
+	if objectionHead == "" || payload.PullRequest <= 0 {
+		// Checked before any store read: an unbound objection claims nothing about
+		// any commit, and a PR-less review is already terminal earlier in the
+		// advance path.
+		return true, "", nil
+	}
+	pr, err := e.Store.GetPullRequest(ctx, payload.Repo, int64(payload.PullRequest))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return true, "", nil
+		}
+		return false, "", err
+	}
+	currentHead := strings.TrimSpace(pr.HeadSHA)
+	if currentHead == "" || currentHead == objectionHead {
+		return true, "", nil
+	}
+	return false, fmt.Sprintf(
+		"the objection is bound to head %s but the pull request's current head is %s; a verdict at a superseded head describes a commit the branch has moved past, so the task is not transitioned and no fix leg is dispatched",
+		objectionHead, currentHead), nil
+}

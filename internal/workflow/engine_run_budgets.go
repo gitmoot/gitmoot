@@ -797,6 +797,54 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		reviewer := reviewDecisionAgent(job, payload)
 		switch effectiveDecision {
 		case "changes_requested":
+			// #1524: an objection transitions the task ONLY when it describes the
+			// pull request's CURRENT head. #1871 bound the approving side
+			// (approvalSupersedesChangesRequested); this arm was left
+			// unconditional, so an objection at a superseded head still pulled a
+			// PR out of ready_to_merge over a commit the branch had moved past -
+			// and, because dispatchFix is called INLINE below, also dispatched a
+			// fix leg against findings about that superseded commit. Returning
+			// early refuses both in one place.
+			//
+			// THE GUARD IS DELIBERATELY ASYMMETRIC WITH THE APPROVAL SIDE, and the
+			// asymmetry is a LIVENESS argument rather than a safety one - an
+			// earlier version of this comment called it "the safety argument", and
+			// #1903's third review round caught that residue.
+			//
+			// The safety does NOT depend on which rows PolicyMergeGate reaches, and
+			// this comment no longer claims to know: three rounds of this PR killed
+			// three descriptions - "reached by one path or the other" (round 5), "a
+			// stale row is reached by NEITHER" (round 6), and an "exactly three
+			// cases" enumeration that omitted the authorship filter (round 7).
+			// THE INVARIANT THAT ACTUALLY CARRIES IT: refusing the TASK transition
+			// never un-records the REVIEW ROW, so refusing here neither adds nor
+			// removes evidence the gate can see. That is why the asymmetry is a
+			// LIVENESS argument and needs no coverage claim at all.
+			// For the ordering itself - live head, strict evaluated-head population,
+			// then a latest-round fallback whose decision and authorship filters run
+			// BEFORE ensureReviewMatchesHead - see the comment on
+			// TestObjectionWithNoObservedPullRequestRowStillRequestsChanges, which
+			// states it as ordering and deliberately not as an enumeration.
+			//
+			// What differs between the two sides is the consequence of refusing:
+			// refusing an unconfirmable APPROVAL fails safe, because nothing merges
+			// while the doubt stands; refusing an objection withholds the
+			// conservative transition and the inline fix pass without buying any
+			// merge protection, because refusing the TASK transition does not
+			// un-record the REVIEW ROW. So when no observed pull request
+			// row records a head, this arm ADMITS - refusing would block a
+			// legitimate objection on a PR the daemon has not polled yet, which is
+			// the CLI-dispatch path, and would make the engine's cheapest
+			// transition the one demanding the most evidence. The headless case is
+			// governed by the review population instead, and is documented at
+			// TestObjectionWithNoHeadStillRequestsChanges.
+			bound, unboundReason, err := e.objectionBindsToCurrentHead(ctx, payload)
+			if err != nil {
+				return err
+			}
+			if !bound {
+				return e.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_skipped_stale_head", Message: unboundReason})
+			}
 			if err := e.setTaskState(ctx, ref, TaskChangesRequested); err != nil {
 				return err
 			}
