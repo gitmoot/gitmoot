@@ -1,10 +1,12 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"testing"
 
@@ -22,41 +24,65 @@ import (
 // the values the decision was actually made on. A refusal that stops naming its
 // inputs fails here even though resolution behaviour is unchanged.
 
-func newResolverLogDaemon(t *testing.T) (*db.Store, Daemon, *[]string) {
+type resolverLogEntry struct {
+	format   string
+	rendered string
+}
+
+type resolverLogCapture struct {
+	entries     []resolverLogEntry
+	processLogs bytes.Buffer
+}
+
+func newResolverLogDaemon(t *testing.T) (*db.Store, Daemon, *resolverLogCapture) {
 	t.Helper()
 	store := testStore(t)
-	logs := &[]string{}
+	logs := &resolverLogCapture{}
+	previousLogWriter := log.Writer()
+	log.SetOutput(&logs.processLogs)
+	t.Cleanup(func() {
+		log.SetOutput(previousLogWriter)
+	})
 	daemon := Daemon{
 		Repo:  github.Repository{Owner: "gitmoot", Name: "gitmoot"},
 		Store: store,
 		Logf: func(format string, args ...any) {
-			*logs = append(*logs, fmt.Sprintf(format, args...))
+			logs.entries = append(logs.entries, resolverLogEntry{
+				format:   format,
+				rendered: fmt.Sprintf(format, args...),
+			})
 		},
 	}
 	return store, daemon, logs
 }
 
-// onlyRefusalLog counts reason= TAG OCCURRENCES across every captured line, not
-// lines carrying a prose prefix and not reason-bearing lines. Two review rounds
-// on #1910 each defeated a weaker rule with a compiling production mutant:
-// round 2 renamed the prose ("task resolution rejected") past a prefix match,
-// and round 3 merged both reasons onto ONE line
-// ("reason=task_repo_mismatch reason=fork_head") past a per-line count. An
-// operator reading two reasons for one refusal cannot tell which input decided
-// it, and that is true whether they sit on one line or two - so the property is
-// one reason tag per refusal, and the tag is what gets counted.
-func onlyRefusalLog(t *testing.T, logs []string) string {
+func (logs *resolverLogCapture) assertSingleSink(t *testing.T) {
 	t.Helper()
+	if logs.processLogs.Len() != 0 {
+		t.Fatalf("resolver wrote outside Daemon.Logf: %q", logs.processLogs.String())
+	}
+}
+
+// onlyRefusalLog counts reason= tags in the Logf FORMAT, not the rendered
+// diagnostic. Four review rounds on #1910 each defeated a weaker rule: prose
+// renaming bypassed a prefix match; two reasons on one rendered line bypassed a
+// per-line count; and valid input containing "reason=" looked like a second tag
+// when rendered data was counted. Capturing the format separately distinguishes
+// schema from data. Capturing the process logger as well prevents a second
+// operator-visible sink from bypassing the assertion.
+func onlyRefusalLog(t *testing.T, logs *resolverLogCapture) string {
+	t.Helper()
+	logs.assertSingleSink(t)
 	reasons := []string{}
 	tags := 0
-	for _, line := range logs {
-		if count := strings.Count(line, "reason="); count > 0 {
-			reasons = append(reasons, line)
+	for _, entry := range logs.entries {
+		if count := strings.Count(entry.format, "reason="); count > 0 {
+			reasons = append(reasons, entry.rendered)
 			tags += count
 		}
 	}
 	if tags != 1 {
-		t.Fatalf("reason= tags = %d across %d line(s) (%q), want exactly 1", tags, len(reasons), reasons)
+		t.Fatalf("reason= tags = %d across %d Logf call(s) (%q), want exactly 1", tags, len(reasons), reasons)
 	}
 	return reasons[0]
 }
@@ -87,7 +113,7 @@ func TestLookupPolledPullRequestTaskLogsForkHeadRefusalInputs(t *testing.T) {
 		t.Fatalf("error = %v, want sql.ErrNoRows for a fork head", err)
 	}
 
-	line := onlyRefusalLog(t, *logs)
+	line := onlyRefusalLog(t, logs)
 	for _, want := range []string{
 		"reason=fork_head",
 		`head_repo="outsider/gitmoot"`,
@@ -109,19 +135,19 @@ func TestLookupPolledPullRequestTaskLogsMissingTaskRefusalInputs(t *testing.T) {
 
 	_, err := daemon.lookupPolledPullRequestTask(ctx, github.PullRequest{
 		Number:           7,
-		HeadRef:          "feat/unregistered",
+		HeadRef:          "feat/reason=embedded",
 		HeadRepoFullName: "gitmoot/gitmoot",
 	})
 	if !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("error = %v, want sql.ErrNoRows for an unregistered branch", err)
 	}
 
-	line := onlyRefusalLog(t, *logs)
+	line := onlyRefusalLog(t, logs)
 	for _, want := range []string{
 		"reason=no_task_for_branch",
 		`repo="gitmoot/gitmoot"`,
 		`head_repo="gitmoot/gitmoot"`,
-		`head_ref="feat/unregistered"`,
+		`head_ref="feat/reason=embedded"`,
 		"gitmoot/gitmoot#7",
 	} {
 		if !strings.Contains(line, want) {
@@ -155,7 +181,7 @@ func TestLookupPullRequestTaskLogsTaskRepoMismatchInputs(t *testing.T) {
 		t.Fatalf("error = %v, want sql.ErrNoRows when the task belongs to another repository", err)
 	}
 
-	line := onlyRefusalLog(t, *logs)
+	line := onlyRefusalLog(t, logs)
 	for _, want := range []string{
 		"reason=task_repo_mismatch",
 		`lookup_repo="gitmoot/gitmoot"`,
@@ -200,7 +226,7 @@ func TestLookupPolledPullRequestTaskLogsOneReasonWhenTaskBelongsToAnotherRepo(t 
 		t.Fatalf("error = %v, want sql.ErrNoRows through the polled resolver", err)
 	}
 
-	line := onlyRefusalLog(t, *logs)
+	line := onlyRefusalLog(t, logs)
 	for _, want := range []string{
 		"reason=task_repo_mismatch",
 		`lookup_repo="gitmoot/gitmoot"`,
@@ -243,11 +269,13 @@ func TestLookupPolledPullRequestTaskLogsNothingOnSuccess(t *testing.T) {
 	if task.ID != "task-ok" {
 		t.Fatalf("task = %+v, want task-ok", task)
 	}
-	// Same prose-independence as onlyRefusalLog: a renamed refusal line must
-	// still fail this test.
-	for _, line := range *logs {
-		if strings.Contains(line, "reason=") {
-			t.Fatalf("logs = %q, want no reason-bearing line on successful resolution", *logs)
+	// Same metadata independence as onlyRefusalLog: a renamed refusal line
+	// must still fail this test, while "reason=" inside rendered input data must
+	// not. Resolver diagnostics must also stay behind the injected sink.
+	logs.assertSingleSink(t)
+	for _, entry := range logs.entries {
+		if strings.Contains(entry.format, "reason=") {
+			t.Fatalf("logs = %q, want no reason-bearing Logf call on successful resolution", logs.entries)
 		}
 	}
 }
