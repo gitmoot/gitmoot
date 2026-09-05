@@ -45,16 +45,24 @@ infrastructure rather than the documented boundary they are:
   seat; use a seat-owned `GOCACHE` under `$TMPDIR`. Note the cost: each building
   seat then populates its own cache instead of sharing one, so seat builds are
   coupled to the dispatch disk floor.
-- **Set `CGO_ENABLED=0`.** The sandbox denies `/usr/include/stdc-predef.h`, so any
-  default-cgo `build`/`vet`/`test` fails on a C header.
-- **`-race` is unreachable in a seat**, because race requires cgo. It is covered by
-  CI's race shards only, and its absence from a seat verdict is not a regression.
+- **Set `CGO_ENABLED=0`.** The sandbox denies `/usr/include/stdc-predef.h`, so
+  anything that actually reaches `runtime/cgo` fails on a C header — which
+  includes the repo-wide gate and `./cmd/gitmoot`. A pure-Go package still builds
+  and tests with default cgo, so a passing single-package run proves nothing about
+  the gate.
+- **`-race` is unreachable in a seat**, because race requires cgo (`go: -race
+  requires cgo; enable cgo by setting CGO_ENABLED=1`). It is covered by CI's race
+  shards only, and its absence from a seat verdict is not a regression.
 
-When a seat's plain `go` really does return 126, staging did not happen and the
-reason is on the daemon's stderr rather than in the job's events — see
-`docs/troubleshooting.md`, "`Permission denied`, exit 126, running Go", which
-enumerates the staging refusals (unpinned source, system-package prefix, symlink
-in the source set, free space below the 4 GiB floor).
+When a seat's plain `go` returns 126, staging did not happen — but **only some of
+those cases say why.** `stageSeatToolchain` deliberately stays SILENT when no `go`
+is on the daemon's `PATH`, when the toolchain sits under a system-package prefix,
+or when the source is not a pinned installation (`ErrNotPinned`): the seat is left
+exactly as it was, with no diagnostic. Other staging failures do print
+`gitmoot: read-only seat toolchain:` on the daemon's stderr, never in the job's
+events. See `docs/troubleshooting.md`, "`Permission denied`, exit 126, running
+Go", for the refusal list (unpinned source, system-package prefix, symlink in the
+source set, free space below the 4 GiB floor).
 
 Run from the repo root and make these pass before committing — they mirror the CI
 gate in `.github/workflows/ci.yml`:
