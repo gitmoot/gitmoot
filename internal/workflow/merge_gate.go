@@ -808,7 +808,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		PullRequest: request.PullRequest,
 		TaskID:      request.TaskID,
 	}
-	implementerAttribution := collectImplementerAttribution(jobs, current)
+	implementerAttribution := collectGateImplementerAttribution(jobs, current)
 	implementingAgents := implementerAttribution.agents
 	missingImplementerReason := implementerAttribution.failureReason()
 	// One row per (parent, delegation): the LATEST attempt, exactly as continuation
@@ -1358,7 +1358,29 @@ type implementerAttributionEvidence struct {
 	sawMalformedPayload bool
 }
 
+// collectImplementerAttribution is the STRICT-KEY collector, and it is the one
+// Engine.autoFixOwner uses (engine_routing_merge.go). Its result routes
+// WRITE-CAPABLE work: autoFixOwner resolves an owner from this evidence and
+// dispatchFix then enqueues an implementation job against it. #1519's positional
+// fallback is deliberately NOT applied here - widening ownership routing is a
+// different decision from widening a read-only independence check, and #1519
+// asked for the latter. #1929's review caught the collector being shared and the
+// widening leaking through it.
 func collectImplementerAttribution(jobs []db.Job, current JobPayload) implementerAttributionEvidence {
+	return collectImplementerAttributionMatching(jobs, current, sameTask)
+}
+
+// collectGateImplementerAttribution is the merge gate's own collector. It
+// correlates positionally when task identity has migrated (#1519), because the
+// gate's question is "who implemented the PR in front of me" and its answer
+// authorises nothing by itself: independence is then decided on the recorded
+// agent identities, and a self-approval still refuses.
+func collectGateImplementerAttribution(jobs []db.Job, current JobPayload) implementerAttributionEvidence {
+	return collectImplementerAttributionMatching(jobs, current, sameCorrelatedTask)
+}
+
+func collectImplementerAttributionMatching(jobs []db.Job, current JobPayload,
+	matches func(current JobPayload, payload JobPayload) bool) implementerAttributionEvidence {
 	evidence := implementerAttributionEvidence{agents: make(map[string]struct{})}
 	for _, job := range jobs {
 		if job.Type != "implement" {
@@ -1370,13 +1392,15 @@ func collectImplementerAttribution(jobs []db.Job, current JobPayload) implemente
 			evidence.sawMalformedPayload = true
 			continue
 		}
-		// #1519: a row whose TaskID diverges but whose repo and pull request agree
-		// is ATTRIBUTION, not an anomaly. This branch previously computed exactly
-		// that positional agreement and used it only to raise
-		// "may indicate a stable-task-identity regression" - which was a true
-		// diagnosis reached through a false verdict, because the identity migrates
-		// legitimately between review rounds while the agents stay distinct.
-		if !sameCorrelatedTask(current, payload) {
+		// The caller's predicate decides belonging: strict TaskID equality for
+		// ownership routing, or #1519's positional correlation for the gate, where
+		// a row whose TaskID diverged but whose repo and pull request agree is
+		// ATTRIBUTION rather than an anomaly. The old code computed exactly that
+		// positional agreement here and used it only to raise "may indicate a
+		// stable-task-identity regression" - a true diagnosis reached through a
+		// false verdict, since the identity migrates legitimately between review
+		// rounds while the agents stay distinct.
+		if !matches(current, payload) {
 			continue
 		}
 		agent := strings.TrimSpace(job.Agent)
