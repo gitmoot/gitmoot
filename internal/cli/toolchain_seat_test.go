@@ -350,3 +350,37 @@ func TestReadOnlySeatEnvKeepsRuntimeBinariesResolvable(t *testing.T) {
 		t.Errorf("go resolved to %q, outside the staged toolchain root %q: extending PATH must not cost the toolchain pin", resolvedGo, toolchain.Root(live.Home))
 	}
 }
+
+
+// TestSeatPathRefusesAStagedPathHoldingAListSeparator is the #1921 review P3.
+//
+// `--home` may legally contain a colon, and a PATH entry may not: the entry
+// would SPLIT, so the staged bin directory would stop being one path and `go`
+// would resolve to whatever came next — silently unpinning the seat while every
+// other signal still claimed a staged toolchain.
+//
+// The refusal is asserted through stageSeatToolchain's own contract rather than
+// seatPath alone where it can be: production must ship a diagnostic AND no env,
+// because returning GOROOT with a PATH that does not point at the staged copy
+// would claim a pin this shape cannot hold.
+func TestSeatPathRefusesAStagedPathHoldingAListSeparator(t *testing.T) {
+	separator := string(os.PathListSeparator)
+
+	path, diagnostic := seatPath(filepath.Join("/tmp", "home"+separator+"colon", "toolchains", "go1.26.4"))
+	if path != "" {
+		t.Errorf("seatPath returned PATH %q for a staged path holding %q; the first entry would be a fragment", path, separator)
+	}
+	if !strings.Contains(diagnostic, separator) {
+		t.Errorf("diagnostic %q does not name the separator that caused the refusal; an operator cannot act on it", diagnostic)
+	}
+
+	// An ordinary staged path still yields a PATH and no diagnostic — a guard
+	// that also refuses the normal case would disable staging everywhere.
+	ordinary, ordinaryDiagnostic := seatPath(filepath.Join(t.TempDir(), "toolchains", "go1.26.4"))
+	if ordinaryDiagnostic != "" {
+		t.Errorf("a separator-free staged path was refused: %q", ordinaryDiagnostic)
+	}
+	if ordinary == "" {
+		t.Error("a separator-free staged path produced no PATH")
+	}
+}

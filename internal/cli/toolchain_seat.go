@@ -55,9 +55,16 @@ func stageSeatToolchain(paths config.Paths) (string, []string, string) {
 		}
 		return "", nil, fmt.Sprintf("staged toolchain unavailable, seat has no Go toolchain: %v", err)
 	}
+	path, diagnostic := seatPath(staged)
+	if diagnostic != "" {
+		// No staged toolchain rather than an unpinned one: returning the staged
+		// root with a PATH that does not point at it would claim a pin this
+		// shape cannot hold.
+		return "", nil, diagnostic
+	}
 	return staged, []string{
 		"GOROOT=" + staged,
-		"PATH=" + seatPath(staged),
+		"PATH=" + path,
 		// The staged copy is the only toolchain the seat can BUILD with — it is
 		// first on PATH and the only Go tree under a read grant — so pin the
 		// selector too: an empty GOTOOLCHAIN invites the auto-download a
@@ -81,23 +88,39 @@ func stageSeatToolchain(paths config.Paths) (string, []string, string) {
 // Measured boundary: gm-review-opus was 11-for-11 in the fourteen hours before
 // the deploy and 0-for-2 after it.
 //
-// PATH IS NOT THE CONTAINMENT BOUNDARY, so widening it grants nothing: the
-// Landlock ruleset decides what a seat may read or execute, and a PATH entry
-// with no read grant behind it is simply an exec that fails. The pin is not
-// weakened either — the staged bin is first, so `go` resolves inside the copy
-// the daemon owns even when the operator's own installation is still on the
-// inherited PATH, and GOROOT plus GOTOOLCHAIN=local hold independently of
+// PATH IS NOT THE CONTAINMENT BOUNDARY FOR WHAT A SEAT MAY READ — the Landlock
+// ruleset decides that, and a PATH entry with no read grant behind it is simply
+// an exec that fails. It IS, however, an input to the grant computation:
+// sandbox-exec resolves argv[0] from PATH and grants the resolved binary's
+// directory, so widening PATH can widen grants (#1921 review found kimi's
+// self-contained binary promoting ~/.kimi-code, a credential store, to a
+// readable root). That promotion is now withheld for credential-bearing roots
+// in internal/sandbox, which is where the grant is decided; PATH stays wide so
+// the binaries remain resolvable.
+//
+// The pin is not weakened: the staged bin is first, so `go` resolves inside the
+// copy the daemon owns even when the operator's own installation is still on
+// the inherited PATH, and GOROOT plus GOTOOLCHAIN=local hold independently of
 // lookup order.
 //
 // An empty inherited PATH keeps the previous system defaults rather than
 // shipping a seat with only one directory on PATH.
-func seatPath(staged string) string {
+func seatPath(staged string) (string, string) {
 	stagedBin := filepath.Join(staged, "bin")
+	// A PATH entry cannot contain the list separator, so a staged path holding
+	// one cannot be expressed on PATH at all: the entry would split and `go`
+	// would resolve outside the staged copy. Refuse rather than ship a PATH
+	// whose first entry is a fragment, and say which value did it — a home
+	// containing ':' is legal on disk and the diagnostic is the only way an
+	// operator learns why the seat has no staged toolchain.
+	if strings.ContainsRune(stagedBin, os.PathListSeparator) {
+		return "", fmt.Sprintf("staged toolchain path %q contains %q, which cannot be expressed as a PATH entry; seat has no staged Go toolchain", stagedBin, string(os.PathListSeparator))
+	}
 	inherited := strings.TrimSpace(os.Getenv("PATH"))
 	if inherited == "" {
-		return stagedBin + ":/usr/local/bin:/usr/bin:/bin"
+		return stagedBin + ":/usr/local/bin:/usr/bin:/bin", ""
 	}
-	return stagedBin + string(os.PathListSeparator) + inherited
+	return stagedBin + string(os.PathListSeparator) + inherited, ""
 }
 
 // pinnedToolchainRoot reports the installation root of an OPERATOR-PINNED
