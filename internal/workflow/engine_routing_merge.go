@@ -880,25 +880,19 @@ func (e Engine) parkTaskAwaitingHumanMerge(ctx context.Context, ref taskRef, rea
 // objection nobody recorded". That claim is FALSE, and #1903's independent
 // review is what caught it:
 //
-//   - PolicyMergeGate blocks on the OBJECTION ROW itself, not on task state - but
-//     only for the rows a given evaluation reaches, which is a POPULATION and
-//     never a coverage absolute. Two later rounds of this PR killed two
-//     successive attempts to state it as one, and a third killed the line numbers
-//     for pointing at another tree and then at declarations rather than returns,
-//     so this cites SYMBOLS and ordering.
-//     On the STRICT path, Evaluate derives the head LIVE through
-//     MergeGateGitHub.GetPullRequest, collects rows whose payload.HeadSHA equals
-//     it, and returns mergeBlocked "review at evaluated head has blocking result"
-//     for changes_requested, blocked or failed. When that population is EMPTY the
-//     latest-round fallback selects the newest round and puts its
-//     authorship-eligible rows through ensureReviewMatchesHead. So a CURRENT-head
-//     objection is held at the gate; a STALE one is excluded while something
-//     current survives, REFUSED by the fallback ("is for a different head SHA")
-//     when it is in the selected round and nothing current exists, and not
-//     reached at all when the selection passes over it. In every case refusing
-//     the TASK transition does not un-record the review row, so refusing HERE
-//     buys no merge protection. The three cases are pinned by name on
-//     TestObjectionWithNoObservedPullRequestRowStillRequestsChanges; the headless
+//   - THE INVARIANT, which is all this arm needs: refusing the TASK transition
+//     never un-records the REVIEW ROW. Admitting or refusing here neither adds nor
+//     removes evidence PolicyMergeGate can see, so this arm cannot be a
+//     merge-safety question in either direction - which is why the asymmetry with
+//     the approval side is about LIVENESS.
+//     THIS COMMENT DELIBERATELY DOES NOT ENUMERATE WHICH ROWS THE GATE REACHES.
+//     Three successive rounds of this PR killed three attempts to: two coverage
+//     absolutes and then an "exactly three cases" list that omitted the fallback's
+//     decision and authorship filters. For the ordering - live head via
+//     MergeGateGitHub.GetPullRequest, the strict evaluated-head population, then a
+//     latest-round fallback whose filters run BEFORE ensureReviewMatchesHead - see
+//     the comment on TestObjectionWithNoObservedPullRequestRowStillRequestsChanges,
+//     which states it as ordering with named pins and no case count. The headless
 //     case is documented at TestObjectionWithNoHeadStillRequestsChanges.
 //
 // What refusing would actually cost is the CONSERVATIVE transition and, because

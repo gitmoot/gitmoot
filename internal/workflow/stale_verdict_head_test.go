@@ -106,52 +106,51 @@ func TestObjectionAtCurrentHeadStillRequestsChanges(t *testing.T) {
 // #1903's third review round found that claim still living here after the
 // function comment had been corrected.
 //
-// PolicyMergeGate reaches a review ROW independently of task state, but WHICH
-// rows it reaches depends on the review population. Cited by SYMBOL and ordering
-// rather than by line: three review rounds killed three successive coverage
-// absolutes here, and a fourth killed the line numbers themselves (they were
-// measured against a tree this branch does not contain, and even corrected they
-// pointed at declarations rather than at the returns that do the work). Symbols
-// survive both rebases and reformatting; line maps duplicated across three files
-// do not.
+// WHAT THIS ARM NEEDS FROM PolicyMergeGate IS ONE INVARIANT, NOT A MAP OF ITS
+// BEHAVIOUR. Six review rounds on this PR each killed a different attempt to
+// describe the gate here: three coverage absolutes, then the line numbers
+// themselves (measured against another tree, and once corrected still pointing at
+// declarations rather than at the returns), then an "exactly three cases"
+// enumeration that omitted a fourth path. The enumerations kept failing because
+// the gate's behaviour is a function of the whole review population and of
+// filters applied in an order this file does not own. So:
 //
-//   - STRICT evaluated-head population: merge_gate.go's Evaluate derives the head
-//     LIVE via MergeGateGitHub.GetPullRequest, enters review evaluation
-//     unconditionally through ensureFinalReviewCaptured, collects into
-//     reviewsAtHead only rows whose payload.HeadSHA equals that head, and returns
-//     mergeBlocked for changes_requested/blocked/failed among them. A STALE-headed
-//     row is EXCLUDED from this population - see
-//     TestPolicyMergeGateIgnoresReviewJobsAtStaleHeadForQuorum, which merges a PR
-//     while a stale headed FAILED row is ignored.
-//   - LATEST-ROUND fallback, taken only when reviewsAtHead is EMPTY: the newest
-//     round is selected over all taskReviews by reviewRoundKeyAfter, its rows are
-//     filtered for authorship, and each surviving row goes through
-//     ensureReviewMatchesHead, which refuses a NON-EMPTY mismatching head with
-//     "is for a different head SHA" and an ABSENT head with "does not record a
-//     head SHA" unless isIntegrationWorktreeReview admits it.
+// THE INVARIANT: refusing the TASK transition NEVER un-records the REVIEW ROW.
+// Nothing about admitting or refusing here adds or removes evidence the gate can
+// see, which is the only thing that could make this arm a merge-safety question.
+// Hence the asymmetry with the approval side is about LIVENESS, and that argument
+// needs no claim about which rows the gate reaches.
 //
-// SO A STALE-HEADED ROW HAS THREE CASES, NOT ONE - the absolute this comment kept
-// reinventing is that any of them is universal:
-//  1. a current-head row survives -> the stale row is excluded from the strict
-//     population and does not block. Pinned by
-//     TestPolicyMergeGateIgnoresReviewJobsAtStaleHeadForQuorum.
-//  2. no current-head row AND the stale row is in the selected latest round ->
-//     the fallback DOES reach it and ensureReviewMatchesHead refuses it, leaving
-//     the PR open. Pinned by TestPolicyMergeGateBlocksReviewForStaleHead.
-//  3. no current-head row AND the stale row is NOT in the selected round -> it is
-//     not reached at all. The selection itself is pinned by
-//     TestPolicyMergeGateEmptyReviewRoundUsesRecordedRecency.
+// WHAT THE GATE DOES WITH A ROW, described as ordering rather than as coverage,
+// and deliberately NOT exhaustive: Evaluate derives the head LIVE via
+// MergeGateGitHub.GetPullRequest and collects into reviewsAtHead only rows whose
+// payload.HeadSHA equals it, returning mergeBlocked for a blocking decision among
+// them. When reviewsAtHead is EMPTY, the newest round is selected over all
+// taskReviews by reviewRoundKeyAfter; effectiveReviewDecisionForPayload and the
+// authorship filters run FIRST and can drop or re-characterise a row - a
+// sub-threshold objection can become an approval and then be refused for
+// independence, which is what TestPolicyMergeGateFallbackKeepsPipelineReviewVerdictRaw
+// constructs - and only survivors reach ensureReviewMatchesHead, which refuses a
+// NON-EMPTY mismatching head with "is for a different head SHA" and an ABSENT head
+// with "does not record a head SHA" unless isIntegrationWorktreeReview admits it.
+// Named pins for the parts that matter here:
+// TestPolicyMergeGateIgnoresReviewJobsAtStaleHeadForQuorum (a stale row is
+// excluded from the strict population while something current survives),
+// TestPolicyMergeGateBlocksReviewForStaleHead (the fallback can reach a stale row
+// and refuse it), TestPolicyMergeGateEmptyReviewRoundUsesRecordedRecency (how the
+// round is selected). DO NOT ADD A CASE COUNT TO THIS LIST: whether a particular
+// stale row is reached depends on decision thresholds, attribution and round
+// selection together, and every attempt to close the enumeration here has been
+// wrong.
 //
 // An ABSENT head is governed by the integration markers instead of by this arm -
 // see TestObjectionWithNoHeadStillRequestsChanges below.
 //
 // This arm's row carries a head the engine CANNOT CONFIRM: there is no observed
-// pull request row to compare it against, so which of the three cases applies is
-// decided at gate time by the live head and by what else has been reviewed. In
-// NONE of them does refusing the TASK transition un-record the REVIEW ROW, which
-// is the only thing that would matter for merge safety - so refusing here buys no
-// protection. What it costs is the conservative transition and the inline fix
-// pass, withheld from an objection nobody can show is stale.
+// pull request row to compare it against. That is why admitting is right - the
+// engine cannot show the objection is stale - and the invariant above is why
+// admitting is also safe. What refusing would cost is the conservative transition
+// and the inline fix pass, withheld from an objection nobody can show is stale.
 func TestObjectionWithNoObservedPullRequestRowStillRequestsChanges(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

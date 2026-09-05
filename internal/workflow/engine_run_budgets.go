@@ -811,23 +811,20 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			// earlier version of this comment called it "the safety argument", and
 			// #1903's third review round caught that residue.
 			//
-			// The safety is supplied elsewhere, by PolicyMergeGate - but only for the
-			// rows a given evaluation actually reaches, so name the population and
-			// never a coverage absolute. Two rounds of this PR died on exactly that:
-			// "reached by one path or the other" (round 5) and then "a stale row is
-			// reached by NEITHER" (round 6), both false. Cited by SYMBOL rather than
-			// by line, because the line maps were measured against a different tree
-			// and, once corrected, still pointed at declarations instead of returns.
-			// An objection at the CURRENT head enters the strict evaluated-head
-			// population that Evaluate builds from the live GetPullRequest head, and
-			// holds the merge there. When that population is EMPTY the latest-round
-			// fallback selects the newest round and puts its authorship-eligible rows
-			// through ensureReviewMatchesHead. A STALE-headed row therefore has three
-			// cases, not one: excluded while a current-head row survives; REACHED AND
-			// REFUSED by the fallback ("is for a different head SHA") when it is in
-			// the selected round and nothing current exists; or not reached at all
-			// when the selection passes over it. See the three pins named on
-			// TestObjectionWithNoObservedPullRequestRowStillRequestsChanges.
+			// The safety does NOT depend on which rows PolicyMergeGate reaches, and
+			// this comment no longer claims to know: three rounds of this PR killed
+			// three descriptions - "reached by one path or the other" (round 5), "a
+			// stale row is reached by NEITHER" (round 6), and an "exactly three
+			// cases" enumeration that omitted the authorship filter (round 7).
+			// THE INVARIANT THAT ACTUALLY CARRIES IT: refusing the TASK transition
+			// never un-records the REVIEW ROW, so refusing here neither adds nor
+			// removes evidence the gate can see. That is why the asymmetry is a
+			// LIVENESS argument and needs no coverage claim at all.
+			// For the ordering itself - live head, strict evaluated-head population,
+			// then a latest-round fallback whose decision and authorship filters run
+			// BEFORE ensureReviewMatchesHead - see the comment on
+			// TestObjectionWithNoObservedPullRequestRowStillRequestsChanges, which
+			// states it as ordering and deliberately not as an enumeration.
 			//
 			// What differs between the two sides is the consequence of refusing:
 			// refusing an unconfirmable APPROVAL fails safe, because nothing merges
