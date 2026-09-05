@@ -11,6 +11,8 @@ import (
 	"os"
 	"runtime"
 	"strings"
+
+	"github.com/charmbracelet/x/term"
 )
 
 const (
@@ -95,11 +97,23 @@ func windowsVTCapable(lookup func(string) (string, bool)) bool {
 	return false
 }
 
-// IsTerminal reports whether w is a character device (a real terminal),
-// independent of the NO_COLOR / TERM color conventions. Use it to gate
-// terminal-only features such as a refreshing watch loop.
+// IsTerminal reports whether w is a real interactive terminal, independent of
+// the NO_COLOR / TERM color conventions. Use it to gate terminal-only features
+// such as a refreshing watch loop.
+//
+// #1838: this used to be a CHARACTER-DEVICE check, which /dev/null, /dev/zero
+// and /dev/full all satisfy - so `dashboard --watch >/dev/null` passed the
+// guard and looped forever against a sink nobody could see. The property the
+// callers want is "a human is watching", and the instrument for that is an
+// ioctl against the fd (TCGETS), which term.IsTerminal performs.
 func IsTerminal(w io.Writer) bool {
-	return isCharDevice(w)
+	fder, ok := w.(interface {
+		Fd() uintptr
+	})
+	if !ok {
+		return false
+	}
+	return term.IsTerminal(fder.Fd())
 }
 
 func isCharDevice(w io.Writer) bool {
