@@ -747,13 +747,68 @@ func (g PolicyMergeGate) validate() error {
 	return nil
 }
 
+// sameCorrelatedTask decides whether a stored job row belongs to the pull request
+// the gate is evaluating. It is the gate's own correlation rule, deliberately
+// weaker than sameTask (engine_routing_merge.go), which the gate keeps calling
+// first: an equal TaskID remains the strongest evidence of belonging.
+//
+// The weakening exists because TASK IDENTITY MIGRATES BETWEEN REVIEW ROUNDS
+// (#1519). On PR #1518 the implement jobs and round-1 reviews carried
+// `adhoc-64daeee4` while round-2 reviews were issued `review-pr-1518-3f3a1026`,
+// with repo, pull request and branch identical throughout - so after the
+// migration no implement row could ever match a review row again, and the gate
+// false-blocked a PR whose approval was genuinely independent. sameTask cannot
+// be relaxed for this: it decides task-scoped routing for callers outside the
+// gate, whose semantics this change does not measure. The narrower rule lives
+// here, where the question is only "is this row about the PR in front of me".
+//
+// Repo AND pull request must both agree positionally, so rows from another PR or
+// another repository never correlate (a divergent identity must not become a
+// wildcard). Branch is compared only when BOTH sides record one: a stored row is
+// not required to carry a branch, and demanding one would re-block the rows this
+// fix exists to admit. Measured on this host's store when this was written:
+// 6,730 implement+review rows, of which 2,256 implement and 4,326 review rows
+// carry a branch at all; 322 pull requests have a non-empty branch on both sides
+// and ZERO of those disagree - so the conditional check rejects nothing observed
+// while still refusing a genuine cross-branch mismatch.
+//
+// What the gate then decides from the correlated rows is UNCHANGED: independence
+// is judged on the recorded AGENT identities, and a self-approval still refuses -
+// see TestPolicyMergeGateStillBlocksSelfApprovalAcrossDivergentTaskIdentities and
+// TestPolicyMergeGateDoesNotCorrelateImplementRowFromAnotherPullRequest.
+func sameCorrelatedTask(current JobPayload, payload JobPayload) bool {
+	if sameTask(current, payload) {
+		return true
+	}
+	if current.Repo == "" || current.Repo != payload.Repo {
+		return false
+	}
+	if current.PullRequest <= 0 || current.PullRequest != payload.PullRequest {
+		return false
+	}
+	currentBranch := strings.TrimSpace(current.Branch)
+	payloadBranch := strings.TrimSpace(payload.Branch)
+	if currentBranch != "" && payloadBranch != "" && currentBranch != payloadBranch {
+		return false
+	}
+	return true
+}
+
 func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request MergeRequest, headSHA string) error {
 	jobs, err := g.Store.ListJobs(ctx)
 	if err != nil {
 		return err
 	}
-	current := JobPayload{Repo: request.Repo, PullRequest: request.PullRequest, TaskID: request.TaskID}
-	implementerAttribution := collectImplementerAttribution(jobs, current)
+	// Branch is carried so sameCorrelatedTask can refuse a cross-branch row when
+	// both sides record one (#1519); it is empty for callers that do not track a
+	// branch, which the correlation treats as "no evidence" rather than a mismatch.
+	current := JobPayload{
+		Repo:        request.Repo,
+		Branch:      request.Branch,
+		PullRequest: request.PullRequest,
+		TaskID:      request.TaskID,
+	}
+	implementerAttribution := collectGateImplementerAttribution(jobs, current)
 	implementingAgents := implementerAttribution.agents
 	missingImplementerReason := implementerAttribution.failureReason()
 	// One row per (parent, delegation): the LATEST attempt, exactly as continuation
@@ -806,7 +861,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if err != nil {
 			return err
 		}
-		if !sameTask(current, payload) {
+		if !sameCorrelatedTask(current, payload) {
 			continue
 		}
 		taskReviews = append(taskReviews, taskReview{job: job, payload: payload})
@@ -1292,7 +1347,6 @@ const (
 	// reads. The gate still refuses — attribution genuinely is unknown — but the
 	// lane can now clear it without a coordinator round.
 	noImplementJobAttributionReason            = "latest review round's approval is NOT disqualified, but independence cannot be verified: no implement job is recorded for this task, so the gate cannot establish who implemented it. This is an attribution gap, not a failed independence check, and it is the expected state for in-session implementation. Remedy, runnable by the implementing lane: record the durable attribution row with gitmoot job record --agent <implementing-agent> --repo <owner/repo> --type implement --decision implemented --task <task-id> --pr <number> --head-sha <sha>, then re-evaluate. Do not record an agent that did not implement, and do not record the reviewer"
-	mismatchedImplementTaskAttributionReason   = "latest review round's approval cannot be verified as independent: implement jobs are recorded, but none match this task identity; this is an attribution anomaly and may indicate a stable-task-identity regression"
 	emptyImplementAgentAttributionReason       = "latest review round's approval cannot be verified as independent: an implement job matches this task but has no recorded agent; this is an attribution data anomaly"
 	malformedImplementPayloadAttributionReason = "latest review round's approval cannot be verified as independent: an implement job has a malformed payload, so attribution for this task cannot be verified; this is a corrupt-record anomaly"
 )
@@ -1300,12 +1354,33 @@ const (
 type implementerAttributionEvidence struct {
 	agents              map[string]struct{}
 	sawImplementJob     bool
-	sawTaskMismatch     bool
 	sawEmptyAgent       bool
 	sawMalformedPayload bool
 }
 
+// collectImplementerAttribution is the STRICT-KEY collector, and it is the one
+// Engine.autoFixOwner uses (engine_routing_merge.go). Its result routes
+// WRITE-CAPABLE work: autoFixOwner resolves an owner from this evidence and
+// dispatchFix then enqueues an implementation job against it. #1519's positional
+// fallback is deliberately NOT applied here - widening ownership routing is a
+// different decision from widening a read-only independence check, and #1519
+// asked for the latter. #1929's review caught the collector being shared and the
+// widening leaking through it.
 func collectImplementerAttribution(jobs []db.Job, current JobPayload) implementerAttributionEvidence {
+	return collectImplementerAttributionMatching(jobs, current, sameTask)
+}
+
+// collectGateImplementerAttribution is the merge gate's own collector. It
+// correlates positionally when task identity has migrated (#1519), because the
+// gate's question is "who implemented the PR in front of me" and its answer
+// authorises nothing by itself: independence is then decided on the recorded
+// agent identities, and a self-approval still refuses.
+func collectGateImplementerAttribution(jobs []db.Job, current JobPayload) implementerAttributionEvidence {
+	return collectImplementerAttributionMatching(jobs, current, sameCorrelatedTask)
+}
+
+func collectImplementerAttributionMatching(jobs []db.Job, current JobPayload,
+	matches func(current JobPayload, payload JobPayload) bool) implementerAttributionEvidence {
 	evidence := implementerAttributionEvidence{agents: make(map[string]struct{})}
 	for _, job := range jobs {
 		if job.Type != "implement" {
@@ -1317,11 +1392,15 @@ func collectImplementerAttribution(jobs []db.Job, current JobPayload) implemente
 			evidence.sawMalformedPayload = true
 			continue
 		}
-		if !sameTask(current, payload) {
-			if current.Repo != "" && current.Repo == payload.Repo &&
-				current.PullRequest > 0 && current.PullRequest == payload.PullRequest {
-				evidence.sawTaskMismatch = true
-			}
+		// The caller's predicate decides belonging: strict TaskID equality for
+		// ownership routing, or #1519's positional correlation for the gate, where
+		// a row whose TaskID diverged but whose repo and pull request agree is
+		// ATTRIBUTION rather than an anomaly. The old code computed exactly that
+		// positional agreement here and used it only to raise "may indicate a
+		// stable-task-identity regression" - a true diagnosis reached through a
+		// false verdict, since the identity migrates legitimately between review
+		// rounds while the agents stay distinct.
+		if !matches(current, payload) {
 			continue
 		}
 		agent := strings.TrimSpace(job.Agent)
@@ -1343,8 +1422,6 @@ func (e implementerAttributionEvidence) failureReason() string {
 		return malformedImplementPayloadAttributionReason
 	case e.sawEmptyAgent:
 		return emptyImplementAgentAttributionReason
-	case e.sawTaskMismatch:
-		return mismatchedImplementTaskAttributionReason
 	case !e.sawImplementJob:
 		return noImplementJobAttributionReason
 	default:
