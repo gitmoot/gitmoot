@@ -230,6 +230,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 	var deliveryEvents map[string]db.JobEvent
 	var deliveryEventsKnown bool
 	var locks []db.ResourceLock
+	var branchLocks []db.BranchLock
 	var reviewStatuses map[string]reviewStatusDisplay
 	var paths config.Paths
 	if err := withStoreAndPaths(*home, func(resolvedPaths config.Paths, store *db.Store) error {
@@ -248,6 +249,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 		deliveryEvents, err = store.LatestJobEventsOfKinds(context.Background(), deliveryStatusEventKinds)
 		deliveryEventsKnown = err == nil
 		locks, _ = store.ListResourceLocks(context.Background())
+		branchLocks, _ = store.ListBranchLocks(context.Background(), "")
 		reviewStatuses = deriveReviewStatuses(context.Background(), store, jobs, time.Now().UTC())
 		return nil
 	}); err != nil {
@@ -263,7 +265,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 		for _, job := range filtered {
 			payload, _ := jobListPayload(job)
 			ev, ok := reasonEvents[job.ID]
-			reason := deriveStuckReason(job, ev, ok, locks)
+			reason := deriveStuckReason(job, ev, ok, locks, branchLocks)
 			processActive := deriveWorktreeProcessActive(job, jobWorktreeLiveness)
 			deliveryEvent, hasDeliveryEvent := deliveryEvents[job.ID]
 			var deliveryStatus string
@@ -318,7 +320,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "\tPREFLIGHT_FAILED: %s", reason)
 		}
 		ev, ok := reasonEvents[job.ID]
-		if reason := deriveStuckReason(job, ev, ok, locks); !reason.empty() {
+		if reason := deriveStuckReason(job, ev, ok, locks, branchLocks); !reason.empty() {
 			fmt.Fprintf(stdout, "\tWHY: %s", reason.Reason)
 			if reason.NextRetryAt != "" {
 				fmt.Fprintf(stdout, " (next retry %s)", reason.NextRetryAt)
@@ -475,7 +477,8 @@ func loadStuckReason(store *db.Store, job db.Job) stuckReason {
 	}
 	ev, ok := latestReasonEvent(events)
 	locks, _ := store.ListResourceLocks(context.Background())
-	return deriveStuckReason(job, ev, ok, locks)
+	branchLocks, _ := store.ListBranchLocks(context.Background(), "")
+	return deriveStuckReason(job, ev, ok, locks, branchLocks)
 }
 
 // latestReasonEvent returns the last event whose kind is a stuck-reason kind.
@@ -601,13 +604,25 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, s
 			// the deferral fired; anyone attaching afterwards sees nothing until the
 			// job settles, which is how a review sat queued 16 minutes with no
 			// visible cause. The reason is already persisted, so surface it.
-			if reason := loadStuckReason(store, job); !reason.empty() {
-				held = reason
-				line := holdLine(reason)
-				if line != lastHold {
-					lastHold = line
-					if !jsonOutput {
-						fmt.Fprintln(stdout, line)
+			// SURFACE THE HOLD ONLY WHEN NO REASON-BEARING EVENT EXISTS, and the
+			// previous version of this was wrong in a way a reviewer caught: the
+			// watcher replays EVERY event from index zero, so when a deferral has a
+			// blocker_deferred event the operator has already been told, and deriving
+			// HOLD from that same event printed the identical quota detail twice under
+			// two different labels. It also disproves the comment that used to sit
+			// here claiming an operator attaching afterwards "sees nothing" - the
+			// events replay, so they see it. What they genuinely cannot see is a hold
+			// that lives ONLY in the payload or the branch lock, which is #1887's
+			// actual case and the only one this line now speaks for.
+			if _, hasReason := latestReasonEvent(events); !hasReason {
+				if reason := loadStuckReason(store, job); !reason.empty() {
+					held = reason
+					line := holdLine(reason)
+					if line != lastHold {
+						lastHold = line
+						if !jsonOutput {
+							fmt.Fprintln(stdout, line)
+						}
 					}
 				}
 			}
@@ -690,20 +705,32 @@ func runJobTranscriptWatch(jobID, home, requestedLogPath, requestedRuntime strin
 		if err := renderer.RenderHeader(transcriptHeader(context.Background(), store, job, payload, runtimeName)); err != nil {
 			return err
 		}
-		// --transcript MUST NOT BE THE ONE WATCH MODE THAT HIDES THE HOLD (#1887
-		// names `job watch` without excluding transcript mode). The no-log path
-		// above already delegates to runJobEventWatch and inherits its HOLD line;
-		// THIS is the path where a log EXISTS, so transcript.Follow blocks on new
-		// log lines and would show nothing while the job sits held.
-		if reason := loadStuckReason(store, job); !reason.empty() {
-			fmt.Fprintln(stdout, holdLine(reason))
-		}
+		// THE HOLD IS OBSERVED EVERY POLL, NOT ONCE, and the first version of this
+		// got it wrong in the exact way a reviewer proved: it sampled the hold once
+		// before Follow, so a hold that BEGAN AFTER startup never printed. Extracting
+		// holdLine had made the two watch modes share their FORMATTING and I reported
+		// that as non-divergence - it was not, because the POLLING was still
+		// different, and the no-log arm passed only because it delegates to the event
+		// path, which does poll. Settled already runs on every interval, so the
+		// observation belongs here.
+		//
+		// AND UNLIKE THE EVENT PATH, THERE IS NO NO-REASON-EVENT GUARD HERE ON
+		// PURPOSE: transcript mode renders LOG LINES, never job events, so a hold
+		// derived from a blocker_deferred event is the only way this operator learns
+		// of it and is not the duplicate the event path had to suppress.
+		lastHold := ""
 		return transcript.Follow(context.Background(), logPath, transcript.FollowOptions{
 			PollInterval: poll,
 			Settled: func(ctx context.Context) (bool, error) {
 				current, err := store.GetJob(ctx, jobID)
 				if err != nil {
 					return false, err
+				}
+				if reason := loadStuckReason(store, current); !reason.empty() {
+					if line := holdLine(reason); line != lastHold {
+						lastHold = line
+						fmt.Fprintln(stdout, line)
+					}
 				}
 				return workflow.IsSettledJobState(current.State), nil
 			},

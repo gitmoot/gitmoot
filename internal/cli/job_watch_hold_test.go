@@ -310,40 +310,157 @@ func TestJobWatchTranscriptSurfacesHoldWithAnExistingLog(t *testing.T) {
 	}
 }
 
-// TestJobWatchSurfacesWithheldHolderDirectly is the DIRECT observable assertion
-// for #1553's cause on the watch surface. #1887 requires both causes on the
-// surface, and until now the withheld arm was covered only on `job list` plus an
-// inference that watch shares loadStuckReason - which is reasoning, not evidence.
+// TestJobWatchSurfacesWithheldHolderDirectly is #1553's cause observed DIRECTLY
+// on the watch surface, not inferred from shared code. It kills the reversion
+// "surface the hold only for the blocker-payload class", which would leave a
+// withheld job silent on watch while job list explained it.
 func TestJobWatchSurfacesWithheldHolderDirectly(t *testing.T) {
 	home := t.TempDir()
 	store := openCLIJobStore(t, home)
 	seedSessionAgentRepo(t, store)
 	seedQueuedJob(t, store, "watch-withheld", workflow.JobPayload{
 		Repo:        "owner/repo",
+		Branch:      "task-17",
 		PullRequest: 17,
 	})
-	acquired, err := store.AcquireResourceLock(context.Background(), db.ResourceLock{
-		ResourceKey: "checkout:owner/repo",
-		OwnerJobID:  "implement-holds-the-repo",
-		OwnerToken:  "implement-holds-the-repo-token",
-		ExpiresAt:   time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano),
-	}, time.Now().UTC())
-	if err != nil {
-		t.Fatalf("AcquireResourceLock: %v", err)
-	}
-	if !acquired {
-		t.Fatal("AcquireResourceLock reported not acquired; this arm would prove nothing")
-	}
 	store.Close()
+	seedBranchLock(t, home, "owner/repo", "task-17", "implement-holds-the-repo")
 
 	out, code := watchUntil(t, home, "watch-withheld", "HOLD:", false)
 	if code != 0 {
 		t.Fatalf("job watch exit = %d, output:\n%s", code, out)
 	}
 	if !strings.Contains(out, "implement-holds-the-repo") {
-		t.Errorf("job watch output = %q, want the HOLDING JOB named on the watch surface", out)
+		t.Errorf("job watch output = %q, want the holding owner named on the watch surface", out)
 	}
-	if !strings.Contains(out, "checkout:owner/repo") {
-		t.Errorf("job watch output = %q, want the resource key named", out)
+	if !strings.Contains(out, "task-17") {
+		t.Errorf("job watch output = %q, want the held branch named", out)
+	}
+}
+
+// TestJobWatchTranscriptSurfacesHoldThatBeginsAfterStartup is F1's regression and
+// it kills the reversion "sample the hold once before Follow instead of on every
+// poll" - the exact defect the review proved, where extracting holdLine made the
+// two modes share their FORMATTING while their POLLING stayed divergent.
+//
+// The job starts RUNNING with no hold, so a one-shot sample before Follow sees
+// nothing; the hold is applied only after the watch is already following.
+func TestJobWatchTranscriptSurfacesHoldThatBeginsAfterStartup(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HERDR_ENV", "")
+	t.Setenv("HERDR_SOCKET_PATH", filepath.Join(t.TempDir(), "absent-herdr.sock"))
+	store := openCLIJobStore(t, home)
+	if err := store.UpsertAgent(context.Background(), db.Agent{Name: "shell-seat", Runtime: runtime.ShellRuntime}); err != nil {
+		t.Fatal(err)
+	}
+	// RUNNING and unheld at startup, so the pre-Follow sample can see nothing.
+	encoded, err := json.Marshal(workflow.JobPayload{Repo: "owner/repo", PullRequest: 18})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(context.Background(), db.Job{
+		ID: "watch-late-hold", Agent: "shell-seat", Type: "ask",
+		State: string(workflow.JobRunning), Payload: string(encoded), Repo: "owner/repo",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	logPath := filepath.Join(config.PathsForHome(home).Logs, "jobs", transcript.LegacyLogName("watch-late-hold")+".log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte("shell started\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out := &syncBuffer{}
+	var stderr syncBuffer
+	done := make(chan int, 1)
+	go func() {
+		done <- Run([]string{"job", "watch", "watch-late-hold", "--home", home, "--transcript", "--poll", "20ms"}, out, &stderr)
+	}()
+	// let the watch attach and take its one pre-Follow look while nothing is held
+	time.Sleep(200 * time.Millisecond)
+	if strings.Contains(out.String(), "HOLD:") {
+		t.Fatalf("a hold printed before one was applied; fixture is wrong:\n%s", out.String())
+	}
+
+	// NOW apply the hold, after the watch is already following.
+	late := openCLIJobStore(t, home)
+	heldPayload, err := json.Marshal(workflow.JobPayload{
+		Repo: "owner/repo", PullRequest: 18,
+		BlockerClass: "runtime_quota", BlockerRetryAt: "2026-09-06T06:30:00Z",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved, err := late.TransitionJobStatePayloadWithEvent(context.Background(), "watch-late-hold",
+		string(workflow.JobRunning), string(workflow.JobQueued), string(heldPayload),
+		db.JobEvent{JobID: "watch-late-hold", Kind: "blocker_deferred", Message: "runtime_quota: attempt 1"})
+	if err != nil {
+		t.Fatalf("apply late hold: %v", err)
+	}
+	if !moved {
+		t.Fatal("late hold transition moved no row")
+	}
+	late.Close()
+
+	deadline := time.Now().Add(15 * time.Second)
+	for !strings.Contains(out.String(), "HOLD:") {
+		if time.Now().After(deadline) {
+			t.Fatalf("a hold that began AFTER startup never printed; --transcript samples it once instead of polling:\n%s", out.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	settleWatchedJob(t, home, "watch-late-hold")
+	<-done
+	if !strings.Contains(out.String(), "runtime_quota") {
+		t.Errorf("--transcript output = %q, want the late hold's class", out.String())
+	}
+}
+
+// TestJobWatchDoesNotRestateAReplayedDeferralEvent is F4's regression and it kills
+// the reversion "derive HOLD even when a reason-bearing event exists" - which
+// printed the identical quota detail twice, once as the replayed blocker_deferred
+// event and again as HOLD, in a change whose own comment claimed the operator
+// would otherwise see nothing.
+func TestJobWatchDoesNotRestateAReplayedDeferralEvent(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	seedSessionAgentRepo(t, store)
+	seedQueuedJob(t, store, "watch-replayed", workflow.JobPayload{
+		Repo: "owner/repo", PullRequest: 19,
+		BlockerClass: "runtime_quota", BlockerRetryAt: "2026-09-06T07:00:00Z",
+	})
+	if err := store.AddJobEvent(context.Background(), db.JobEvent{
+		JobID: "watch-replayed", Kind: "blocker_deferred", Message: "runtime_quota: attempt 1",
+	}); err != nil {
+		t.Fatalf("AppendJobEvent: %v", err)
+	}
+	store.Close()
+
+	out := &syncBuffer{}
+	var stderr syncBuffer
+	done := make(chan int, 1)
+	go func() {
+		done <- Run([]string{"job", "watch", "watch-replayed", "--home", home, "--poll", "20ms"}, out, &stderr)
+	}()
+	deadline := time.Now().Add(15 * time.Second)
+	for !strings.Contains(out.String(), "blocker_deferred") {
+		if time.Now().After(deadline) {
+			t.Fatalf("the deferral event never replayed; fixture is wrong:\n%s", out.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(400 * time.Millisecond) // many polls in which a duplicate could appear
+	settleWatchedJob(t, home, "watch-replayed")
+	<-done
+
+	if n := strings.Count(out.String(), "HOLD:"); n != 0 {
+		t.Errorf("HOLD printed %d times alongside the replayed blocker_deferred event; the event already told the operator:\n%s", n, out.String())
+	}
+	if strings.Count(out.String(), "runtime_quota") != 1 {
+		t.Errorf("the quota detail appears %d times, want exactly once:\n%s", strings.Count(out.String(), "runtime_quota"), out.String())
 	}
 }

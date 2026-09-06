@@ -63,7 +63,7 @@ func (r stuckReason) empty() bool { return strings.TrimSpace(r.Reason) == "" }
 // for a runtime-session lock wait, the owning lock's lease. It is a pure function
 // over already-queried state so it is trivially testable. Healthy (non-queued/
 // blocked) jobs and jobs with no derivable signal return the zero value.
-func deriveStuckReason(job db.Job, reasonEvent db.JobEvent, hasReasonEvent bool, locks []db.ResourceLock) stuckReason {
+func deriveStuckReason(job db.Job, reasonEvent db.JobEvent, hasReasonEvent bool, locks []db.ResourceLock, branchLocks []db.BranchLock) stuckReason {
 	state := strings.TrimSpace(job.State)
 	queued := state == string(workflow.JobQueued)
 	blocked := state == string(workflow.JobBlocked)
@@ -77,7 +77,7 @@ func deriveStuckReason(job db.Job, reasonEvent db.JobEvent, hasReasonEvent bool,
 		// resource locks, so a row rendering as bare `queued` is a DISPLAY gap over
 		// data that exists rather than an absence of data. The operator cost is
 		// real: a review sat queued 16 minutes with nothing surfacing why.
-		if held := deriveQueueHoldReason(job, locks); !held.empty() {
+		if held := deriveQueueHoldReason(job, branchLocks); !held.empty() {
 			return held
 		}
 		// A blocked job with no reason-bearing event is still stuck by definition;
@@ -153,7 +153,7 @@ func deriveStuckReason(job db.Job, reasonEvent db.JobEvent, hasReasonEvent bool,
 // must stay byte-stable, so this must not become an annotation on every queued
 // row - which is exactly what a reader would see if the two guards below were
 // dropped.
-func deriveQueueHoldReason(job db.Job, locks []db.ResourceLock) stuckReason {
+func deriveQueueHoldReason(job db.Job, branchLocks []db.BranchLock) stuckReason {
 	payload, err := daemonJobPayload(job)
 	if err != nil {
 		return stuckReason{}
@@ -163,11 +163,9 @@ func deriveQueueHoldReason(job db.Job, locks []db.ResourceLock) stuckReason {
 		reason := "deferred (" + class + ")"
 		if retry == "" {
 			// A MISSING RETRY TIME MUST READ AS UNKNOWN, NEVER AS A ZERO TIME.
-			// Measured on this host: 42 of 55 succeeded checkout_contention rows
-			// carry a null retry_at, so absence is the COMMON case on at least one
-			// path rather than an edge. Formatting an empty timestamp would print
-			// 0001-01-01, which an operator reads as a retry long overdue - the
-			// opposite of the truth, and worse than saying nothing.
+			// Measured: 42 of 55 succeeded checkout_contention rows carry a null
+			// retry_at, so absence is the COMMON case. Formatting an empty timestamp
+			// would print 0001-01-01, which reads as a retry long overdue.
 			reason += ", retry time unknown"
 		}
 		return stuckReason{
@@ -176,26 +174,41 @@ func deriveQueueHoldReason(job db.Job, locks []db.ResourceLock) stuckReason {
 			SuggestedAction: strings.TrimSpace(payload.BlockerSuggestedAction),
 		}
 	}
+	// #1553's WITHHELD CAUSE COMES FROM THE BRANCH LOCK, NOT FROM RESOURCE LOCKS,
+	// AND THE FIRST VERSION OF THIS GOT IT WRONG IN A WAY THAT INVENTED CAUSES.
+	// It scanned resource_locks with strings.Contains(key, repo), so any key merely
+	// CONTAINING the repo text was attributed to this job: a review probe with the
+	// production-shaped key "merge-queue:owner/repository:main" rendered an ordinary
+	// owner/repo job as withheld and printed that unrelated key, holder and expiry,
+	// sending an operator to chase a holder that was never blocking it. Real
+	// resource-lock keys are "runtime:<rt>:<ref>" and
+	// "checkout-mutation:<absolute path>" - NEITHER encodes owner/repo as a
+	// segment - so no amount of tightening that match could make it sound. What
+	// actually withholds a job while another job works the repo is the BRANCH LOCK
+	// (branch_locks: repo_full_name, branch, owner), so that is what is read here,
+	// and a resource-lock key can no longer produce a withheld cause at all.
 	repo := strings.TrimSpace(payload.Repo)
 	if repo == "" {
 		return stuckReason{}
 	}
-	for _, lock := range locks {
-		owner := strings.TrimSpace(lock.OwnerJobID)
+	for _, lock := range branchLocks {
+		if !strings.EqualFold(strings.TrimSpace(lock.RepoFullName), repo) {
+			continue
+		}
+		owner := strings.TrimSpace(lock.Owner)
 		if owner == "" || owner == job.ID {
 			continue
 		}
-		key := strings.TrimSpace(lock.ResourceKey)
-		if key == "" || !strings.Contains(key, repo) {
+		// A job that names no branch cannot prove WHICH branch withholds it, so it
+		// stays silent rather than attributing the first lock in the repo.
+		if branch := strings.TrimSpace(payload.Branch); branch != "" &&
+			!strings.EqualFold(strings.TrimSpace(lock.Branch), branch) {
 			continue
 		}
-		// The lock row proves WHO holds WHAT and nothing more, so the rendering
-		// names the key and the holder verbatim and does not claim the holder is an
-		// implement job. An operator can follow the job id; a guess about its type
-		// would be a display inventing a fact.
+		// NO NextRetryAt: a branch lock carries no lease, so naming a retry time
+		// here would be the same invention in a different field.
 		return stuckReason{
-			Reason:      fmt.Sprintf("withheld: %s held by job %s", key, owner),
-			NextRetryAt: strings.TrimSpace(lock.ExpiresAt),
+			Reason: fmt.Sprintf("withheld: branch %s held by %s", strings.TrimSpace(lock.Branch), owner),
 		}
 	}
 	return stuckReason{}

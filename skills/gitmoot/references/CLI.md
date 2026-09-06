@@ -2567,36 +2567,49 @@ show` also carries a `suggested_action` naming the concrete fix. `gitmoot doctor
 proactively validates `gh auth` (with an actionable remediation hint) and the
 Claude runtime token so a bad credential is caught before a job stalls on it.
 
-A `queued` job whose reason is already recorded in its payload no longer renders
-as a bare `queued` row (#1887). When the classifier has deferred a job, `job
-list` and `job show` append `WHY: deferred (<class>)` — for example `deferred
-(runtime_quota)` — with the recorded earliest retry as `(next retry <RFC3339>)`
-and, when the deferral usually needs a human, `[action: …]`. **A row whose
-`blocker_retry_at` is absent renders `deferred (<class>), retry time unknown`
-and leaves `next_retry_at` empty; it never shows a zero time.** Absence is the
-common case on at least one path, and a formatted empty timestamp would read as
-a retry long overdue.
+A `queued` job whose reason is already recorded no longer renders as a bare
+`queued` row (#1887), and **which form you see depends on whether a
+reason-bearing event exists**, because the event is the more authoritative
+signal:
+
+- When the classifier deferred the job it wrote a `blocker_deferred` event, and
+  that event is rendered: `WHY: blocked-operational: <class>: attempt <n>/<max>`.
+  This is the common case for a real runtime deferral.
+- When the hold exists only in the payload — no reason-bearing event available —
+  the payload is read directly and rendered `WHY: deferred (<class>)`, with the
+  recorded earliest retry as `(next retry <RFC3339>)` and, when the deferral
+  usually needs a human, `[action: …]`.
+
+**A row whose `blocker_retry_at` is absent renders `deferred (<class>), retry
+time unknown` and leaves `next_retry_at` empty; it never shows a zero time.**
+Absence is the common case on at least one path, and a formatted empty timestamp
+would read as a retry long overdue.
+
+`gitmoot job show` prints the same reason as `why_stuck:` (and `next_retry_at:`,
+`suggested_action:`) rather than the `WHY:` column form used by `job list`.
 
 The sibling cause is surfaced on the same pass (#1553): a job withheld because
-another job holds a resource naming its repo renders `WHY: withheld: <resource
-key> held by job <id>`, and the lease expiry appears as the next retry when the
-lock carries one. The rendering names only what the lock row proves — the key
-and the holding job id — and does not claim what kind of job the holder is.
+another job holds the **branch lock** for its repo and branch renders `WHY:
+withheld: branch <branch> held by <owner>`. It is read from `branch_locks`, not
+from `resource_locks`, because resource-lock keys are `runtime:<rt>:<ref>` and
+`checkout-mutation:<absolute path>` and encode no repository segment — matching
+them against a repo name attributed unrelated holders. No retry time is shown
+for this cause: a branch lock carries no lease, so naming one would invent it.
 
-`gitmoot job watch` surfaces the same hold while it waits, as `HOLD: <reason>`
-with the optional `(next retry <RFC3339>)` and `[action: …]` suffixes. This
-matters because a deferred job never settles: streamed events only help an
-operator who was already attached when the deferral fired, so anyone attaching
-afterwards would otherwise see nothing until the job settles. The line is
-reprinted only when the hold **changes**, so an unchanged hold does not repeat
-on every poll. `job watch --transcript` prints it too, after the transcript
-header.
+`gitmoot job watch` surfaces a hold while it waits, as `HOLD: <reason>` with the
+optional `(next retry <RFC3339>)` and `[action: …]` suffixes, re-checked on every
+poll so a hold that begins after the watch attached is still shown. The line is
+reprinted only when the hold **changes**. In the default event mode the watcher
+already replays every job event, so `HOLD:` is emitted only when no
+reason-bearing event exists — otherwise the deferral would be stated twice under
+two labels. `job watch --transcript` renders log lines rather than job events, so
+it prints the hold in every case.
 
 `gitmoot job watch --json` carries the last hold observed during the watch as
 `held_reason`, `held_next_retry_at` and `held_suggested_action`. They are named
 for that distinction deliberately: the JSON object is emitted once the job has
-settled, so a field called `why_stuck` would assert a condition that is no
-longer true. All three are omitted when no hold was observed.
+settled, so a field called `why_stuck` would assert a condition that is no longer
+true. All three are omitted when no hold was observed.
 
 For a terminal (`succeeded`, `failed`, `blocked`, or `cancelled`) job whose
 recorded worktree still has a locally observable process, `job list` reports

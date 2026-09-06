@@ -1680,6 +1680,11 @@ func (d *webDataSource) Health(ctx context.Context) (dashboard.Health, error) {
 		cutoff := time.Now().UTC().Add(-stuckQueuedThreshold).UnixMilli()
 		var stuck []dashboard.HealthStuckJob
 		var failures []dashboard.HealthFailure
+		// Branch locks are listed ONCE for the same reason as the resource locks
+		// above: deriveStuckReason reads them to explain a job withheld while
+		// another job holds its branch (#1553), and re-listing per job would turn
+		// one query into one per stuck row.
+		stuckBranchLocks, _ := store.ListBranchLocks(ctx, "")
 		for _, j := range jobs {
 			ns := mapNodeState(j.State)
 			switch ns {
@@ -1704,7 +1709,7 @@ func (d *webDataSource) Health(ctx context.Context) (dashboard.Health, error) {
 				reason := ""
 				if events, eerr := store.ListJobEvents(ctx, j.ID); eerr == nil {
 					ev, ok := latestReasonEvent(events)
-					reason = deriveStuckReason(j, ev, ok, resourceLocks).Reason
+					reason = deriveStuckReason(j, ev, ok, resourceLocks, stuckBranchLocks).Reason
 				}
 				stuck = append(stuck, dashboard.HealthStuckJob{
 					ID:     j.ID,

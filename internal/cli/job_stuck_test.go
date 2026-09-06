@@ -129,7 +129,7 @@ func TestDeriveStuckReason(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			got := deriveStuckReason(tt.job, tt.event, tt.hasEvent, locks)
+			got := deriveStuckReason(tt.job, tt.event, tt.hasEvent, locks, nil)
 			if tt.wantReason == "" {
 				if !got.empty() {
 					t.Fatalf("deriveStuckReason = %+v, want empty", got)
