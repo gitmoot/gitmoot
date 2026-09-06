@@ -150,6 +150,7 @@ func splitCommandSegments(command string) []string {
 	var segments []string
 	var current strings.Builder
 	quote := rune(0)
+	escaped := false
 	runes := []rune(command)
 	flush := func() {
 		if trimmed := strings.TrimSpace(current.String()); trimmed != "" {
@@ -157,8 +158,31 @@ func splitCommandSegments(command string) []string {
 		}
 		current.Reset()
 	}
+	// A COMMENT STARTS AFTER WHITESPACE, not at the start of a segment. Asking
+	// whether the segment was empty made `go test ./...  # A&B` keep the '#' as
+	// an ordinary character, so the '&' inside the comment still split the
+	// command and it classified as mixed.
+	afterWhitespace := func() bool {
+		written := current.String()
+		if written == "" {
+			return true
+		}
+		last := []rune(written)[len([]rune(written))-1]
+		return last == ' ' || last == '\t'
+	}
 	for i := 0; i < len(runes); i++ {
 		r := runes[i]
+		if escaped {
+			current.WriteRune(r)
+			escaped = false
+			continue
+		}
+		if r == '\\' && quote != '\'' {
+			// Escaped data, not syntax: `PROBE=A\&B go test` is one command.
+			escaped = true
+			current.WriteRune(r)
+			continue
+		}
 		if quote != 0 {
 			current.WriteRune(r)
 			if r == quote {
@@ -170,35 +194,40 @@ func splitCommandSegments(command string) []string {
 		case '\'', '"':
 			quote = r
 			current.WriteRune(r)
+		case '#':
+			if afterWhitespace() {
+				// A COMMENT IS NOT A COMMAND. Everything after an unquoted '#'
+				// at a token boundary is text, and an '&' inside it is not an
+				// operator (#1930 review f20).
+				flush()
+				return segments
+			}
+			current.WriteRune(r)
+		case '<':
+			if i+1 < len(runes) && runes[i+1] == '<' {
+				// HEREDOC DATA IS NOT COMMANDS. Everything from `<<` onward is
+				// the document body plus its delimiter; an '&' in it is data.
+				// The command up to this point is the segment.
+				flush()
+				return segments
+			}
+			current.WriteRune(r)
 		case '\n', ';', '|':
-			// `||` and `|` both separate; the second rune of `||` simply
-			// flushes an already-empty buffer.
 			flush()
 		case '&':
-			// `N>&M` IS ONE TOKEN, NOT TWO COMMANDS. A lone '&' after a
-			// redirect operator duplicates a file descriptor - `2>&1` is the
-			// single most common suffix on a real test command - so flushing on
-			// it split `go test ./... 2>&1` into two segments and returned
-			// `mixed` for a plain test run. Third time this class has
-			// undercounted the bucket under investigation (#1930 review f19).
 			previous := rune(0)
 			if written := current.String(); written != "" {
 				previous = []rune(written)[len([]rune(written))-1]
 			}
 			switch {
 			case i+1 < len(runes) && runes[i+1] == '&':
-				// `&&` sequences.
 				i++
 				flush()
 			case previous == '>' || previous == '<':
-				// `2>&1`, `1>&2`: part of the redirect.
 				current.WriteRune(r)
 			case i+1 < len(runes) && runes[i+1] == '>':
-				// `&>file`, `&>>file`: bash's combined redirect.
 				current.WriteRune(r)
 			default:
-				// A bare trailing `&` backgrounds the command; the command
-				// itself is still the segment.
 				flush()
 			}
 		default:
@@ -209,23 +238,34 @@ func splitCommandSegments(command string) []string {
 	return segments
 }
 
-// shellFields splits on whitespace but keeps a QUOTED value as one field, so a
-// wrapper flag whose value contains a space is consumed whole. Splitting on
-// whitespace alone left the tail of `time -f "%e %M" go test` looking like the
-// wrapped command, which then classified as other - undercounting the very
-// bucket under investigation (#1930 review F12).
 func shellFields(command string) []string {
 	var fields []string
 	var current strings.Builder
 	quote := rune(0)
+	escaped := false
+	runes := []rune(command)
 	flush := func() {
 		if current.Len() > 0 {
 			fields = append(fields, current.String())
 			current.Reset()
 		}
 	}
-	for _, r := range command {
+	for _, r := range runes {
+		if escaped {
+			// A BACKSLASH-ESCAPED RUNE IS DATA, never syntax. The scanner used
+			// to close a quote on any matching rune, so Codex's own
+			// `/bin/bash -lc "bash -c \"go test\" ..."` wrapper ended its
+			// quoted region early and everything after it was scanned as bare
+			// text (#1930 review f20).
+			current.WriteRune(r)
+			escaped = false
+			continue
+		}
 		switch {
+		case r == '\\' && quote != '\'':
+			// Single quotes are literal in POSIX shells: a backslash inside
+			// them is data, not an escape.
+			escaped = true
 		case quote != 0:
 			if r == quote {
 				quote = 0

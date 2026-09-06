@@ -944,3 +944,77 @@ func TestShellFieldsKeepsQuotedValuesWhole(t *testing.T) {
 		})
 	}
 }
+
+// TestPhaseInstrumentClassifiesThroughTheProductionPath is #1930 review f20's
+// real lesson, and it is the one this campaign kept relearning: a test that
+// pins the classifier is NOT a test of the path that reaches it.
+//
+// TestClassifyPhaseCommandClassifiesEverySegment calls classifyPhaseCommand
+// directly on raw text. Production never does. The real path is
+// retainedTranscript.Write -> translator -> consume -> classifyPhaseCommand,
+// and Codex wraps every command in an outer `/bin/bash -lc "..."` whose inner
+// quotes arrive BACKSLASH-ESCAPED. Every case below passed the raw table while
+// failing through this wrapper, so the table was green on input production
+// does not produce.
+func TestPhaseInstrumentClassifiesThroughTheProductionPath(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		command string
+		want    string
+	}{
+		// The reviewer's measured counterexamples, in its own words.
+		{"nested quotes then redirects", `bash -c "go test ./..." >test.log 2>&1`, phaseBucketTest},
+		{"redirect after quoted words", `go test ./... -run "TestA|TestB" >out.log 2>&1`, phaseBucketTest},
+		{"quoted ampersand", `go test ./... -run "TestA&TestB"`, phaseBucketTest},
+		{"escaped ampersand", `go test ./... -run TestA\&TestB`, phaseBucketTest},
+		{"ampersand in a comment", "go test ./...  # A&B matters", phaseBucketTest},
+		{"escaped ampersand in an env assignment", `PROBE=A\&B go test ./...`, phaseBucketTest},
+		{"heredoc data is not a command", "go test ./... <<EOF\nA&B\nEOF", phaseBucketTest},
+		// And the operators must still work through the same wrapper.
+		// A backslash inside SINGLE quotes is literal data in POSIX shells, not
+		// an escape. Treating it as an escape swallows the closing quote, so
+		// the `&&` that follows stays "inside" the quoted region and a genuine
+		// two-phase chain reads as a single test run. This case is what makes
+		// the single-quote arm of the escape rule observable at all.
+		{"backslash is literal inside single quotes", `go test ./... -run 'A\' && git status`, phaseBucketMixed},
+		// A '#' that is NOT preceded by whitespace is an ordinary character, not
+		// a comment: truncating there would drop the rest of a real chain and
+		// report one phase where two ran. This is what makes the
+		// after-whitespace half of the comment rule observable.
+		{"hash inside a word is not a comment", `git commit -m msg#1 && go test ./...`, phaseBucketMixed},
+		{"real chain is still mixed", "go build ./... && go test ./...", phaseBucketMixed},
+		{"redirect idiom still classifies", "go test ./... 2>&1", phaseBucketTest},
+		{"vcs is still vcs", `git commit -m "go test is slow"`, phaseBucketVCS},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			paths := config.PathsForHome(home)
+			store := seedInstrumentJob(t, paths, "prodpath", "codex-reviewer", "codex")
+			handle := openInstrumentedTranscript(t, home, "prodpath", "codex", store)
+
+			// codexToolLines wraps the command exactly as Codex does, with
+			// %q's backslash-escaped inner quotes - the wrapper is the point.
+			start, end := codexToolLines("p1", tc.command)
+			if _, err := handle.Write([]byte(start)); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(20 * time.Millisecond)
+			if _, err := handle.Write([]byte(end)); err != nil {
+				t.Fatal(err)
+			}
+			if err := handle.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+
+			profile := readPhaseProfile(t, store, "prodpath")
+			assertProfileIdentities(t, profile)
+			if profile.Commands != 1 {
+				t.Fatalf("commands = %d, want 1 (%+v)", profile.Commands, profile)
+			}
+			if profile.BucketCount[tc.want] != 1 {
+				t.Fatalf("through the production path %q landed in %v, want %s",
+					tc.command, profile.BucketCount, tc.want)
+			}
+		})
+	}
+}
