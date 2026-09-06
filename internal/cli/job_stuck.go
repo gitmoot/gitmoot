@@ -71,6 +71,15 @@ func deriveStuckReason(job db.Job, reasonEvent db.JobEvent, hasReasonEvent bool,
 		return stuckReason{}
 	}
 	if !hasReasonEvent {
+		// THE REASON MAY ALREADY BE PERSISTED EVEN WITH NO REASON-BEARING EVENT
+		// HERE (#1887, #1553). A deferral writes payload.blocker_class before the
+		// job goes back on the queue, and a withheld job's holder is visible in the
+		// resource locks, so a row rendering as bare `queued` is a DISPLAY gap over
+		// data that exists rather than an absence of data. The operator cost is
+		// real: a review sat queued 16 minutes with nothing surfacing why.
+		if held := deriveQueueHoldReason(job, locks); !held.empty() {
+			return held
+		}
 		// A blocked job with no reason-bearing event is still stuck by definition;
 		// surface the bare state so it is never silently unexplained. A plain queued
 		// job with only lifecycle events is not yet "stuck" — leave it silent.
@@ -131,6 +140,65 @@ func deriveStuckReason(job db.Job, reasonEvent db.JobEvent, hasReasonEvent bool,
 		}
 		return stuckReason{Reason: withDetail(label, msg)}
 	}
+}
+
+// deriveQueueHoldReason explains a queued/blocked row from state that is ALREADY
+// persisted, for the case where no reason-bearing event is available to this
+// caller: #1887's operational deferral (payload.blocker_class, written by the
+// classifier in job_blocker.go) and #1553's withheld job (another job holds a
+// resource naming this job's repo).
+//
+// IT RENDERS NOTHING FOR AN ORDINARY QUEUED JOB, and that is load-bearing rather
+// than incidental. The zero value means "no derivable reason" and healthy output
+// must stay byte-stable, so this must not become an annotation on every queued
+// row - which is exactly what a reader would see if the two guards below were
+// dropped.
+func deriveQueueHoldReason(job db.Job, locks []db.ResourceLock) stuckReason {
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		return stuckReason{}
+	}
+	if class := strings.TrimSpace(payload.BlockerClass); class != "" {
+		retry := strings.TrimSpace(payload.BlockerRetryAt)
+		reason := "deferred (" + class + ")"
+		if retry == "" {
+			// A MISSING RETRY TIME MUST READ AS UNKNOWN, NEVER AS A ZERO TIME.
+			// Measured on this host: 42 of 55 succeeded checkout_contention rows
+			// carry a null retry_at, so absence is the COMMON case on at least one
+			// path rather than an edge. Formatting an empty timestamp would print
+			// 0001-01-01, which an operator reads as a retry long overdue - the
+			// opposite of the truth, and worse than saying nothing.
+			reason += ", retry time unknown"
+		}
+		return stuckReason{
+			Reason:          reason,
+			NextRetryAt:     retry,
+			SuggestedAction: strings.TrimSpace(payload.BlockerSuggestedAction),
+		}
+	}
+	repo := strings.TrimSpace(payload.Repo)
+	if repo == "" {
+		return stuckReason{}
+	}
+	for _, lock := range locks {
+		owner := strings.TrimSpace(lock.OwnerJobID)
+		if owner == "" || owner == job.ID {
+			continue
+		}
+		key := strings.TrimSpace(lock.ResourceKey)
+		if key == "" || !strings.Contains(key, repo) {
+			continue
+		}
+		// The lock row proves WHO holds WHAT and nothing more, so the rendering
+		// names the key and the holder verbatim and does not claim the holder is an
+		// implement job. An operator can follow the job id; a guess about its type
+		// would be a display inventing a fact.
+		return stuckReason{
+			Reason:      fmt.Sprintf("withheld: %s held by job %s", key, owner),
+			NextRetryAt: strings.TrimSpace(lock.ExpiresAt),
+		}
+	}
+	return stuckReason{}
 }
 
 // classifyAuthQuota labels a stuck-reason message as an auth or throttling

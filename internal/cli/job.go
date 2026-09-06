@@ -522,6 +522,13 @@ func runJobEvents(args []string, stdout, stderr io.Writer) int {
 type jobWatchOutput struct {
 	Job    db.Job        `json:"job"`
 	Events []db.JobEvent `json:"events"`
+	// Held* describe the LAST HOLD OBSERVED WHILE WATCHING, not the settled state
+	// (#1887). Named for that distinction deliberately: by the time this object is
+	// emitted the job has settled, so a field called why_stuck would assert a
+	// present condition that is no longer true. Empty means no hold was seen.
+	HeldReason          string `json:"held_reason,omitempty"`
+	HeldNextRetryAt     string `json:"held_next_retry_at,omitempty"`
+	HeldSuggestedAction string `json:"held_suggested_action,omitempty"`
 }
 
 func runJobWatch(args []string, stdout, stderr io.Writer) int {
@@ -555,6 +562,11 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, s
 	var output jobWatchOutput
 	if err := withStore(home, func(store *db.Store) error {
 		nextEvent := 0
+		// lastHold suppresses repetition: this loop polls every interval, so an
+		// unconditional print would emit the same line for the whole life of a
+		// deferral. Only a CHANGE is news.
+		lastHold := ""
+		var held stuckReason
 		for {
 			job, err := store.GetJob(context.Background(), jobID)
 			if err != nil {
@@ -575,8 +587,35 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, s
 				}
 			}
 			if workflow.IsSettledJobState(job.State) {
-				output = jobWatchOutput{Job: job, Events: events}
+				output = jobWatchOutput{
+					Job:                 job,
+					Events:              events,
+					HeldReason:          held.Reason,
+					HeldNextRetryAt:     held.NextRetryAt,
+					HeldSuggestedAction: held.SuggestedAction,
+				}
 				return nil
+			}
+			// A DEFERRED JOB NEVER SETTLES, SO THIS LOOP IS WHERE AN OPERATOR SITS
+			// BLIND (#1887). Streamed events only help someone already attached when
+			// the deferral fired; anyone attaching afterwards sees nothing until the
+			// job settles, which is how a review sat queued 16 minutes with no
+			// visible cause. The reason is already persisted, so surface it.
+			if reason := loadStuckReason(store, job); !reason.empty() {
+				held = reason
+				line := "HOLD: " + reason.Reason
+				if reason.NextRetryAt != "" {
+					line += " (next retry " + reason.NextRetryAt + ")"
+				}
+				if reason.SuggestedAction != "" {
+					line += " [action: " + reason.SuggestedAction + "]"
+				}
+				if line != lastHold {
+					lastHold = line
+					if !jsonOutput {
+						fmt.Fprintln(stdout, line)
+					}
+				}
 			}
 			time.Sleep(poll)
 		}
