@@ -567,15 +567,18 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, s
 		// deferral. Only a CHANGE is news.
 		lastHold := ""
 		var held stuckReason
-		// pendingSuppress names the class of a deferral this loop has ALREADY
-		// rendered as HOLD, and it is CONSUMED by the one event it pairs with
-		// rather than latched (#1943, second round). Latching on the class was a
-		// real defect: a class-only test that never cleared suppressed EVERY later
-		// blocker_deferred event of that class, so a distinct `attempt 2/3` retry
-		// vanished from a live watch entirely. Suppressing exactly one event per
-		// rendered hold keeps the split-write window closed without hiding the
-		// retries that follow it.
-		pendingSuppress := ""
+		// pendingClass/pendingAttempt name the deferral this loop has ALREADY
+		// rendered as HOLD, and they are CONSUMED by the one event that deferral
+		// pairs with. Two earlier shapes were wrong in opposite directions and each
+		// hid or duplicated something: guarding only on the current poll's events
+		// could not retract a HOLD already emitted, so a deferral was stated twice;
+		// latching on the CLASS then swallowed every later blocker_deferred of that
+		// class, so a distinct `attempt 2/3` retry vanished from a live watch, and
+		// the class survived even when its own paired event never arrived at all.
+		// Identifying the pair by class AND attempt is what closes the split-write
+		// window without hiding the retries that follow it.
+		pendingClass := ""
+		pendingAttempt := 0
 		for {
 			job, err := store.GetJob(context.Background(), jobID)
 			if err != nil {
@@ -601,9 +604,20 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, s
 					// HOLD has spoken for a deferral, the event it pairs with is
 					// redundant - and ONLY that one: consuming the match is what lets a
 					// later retry of the same class still be reported.
-					if pendingSuppress != "" && event.Kind == blockerDeferredEventKind &&
-						strings.Contains(event.Message, pendingSuppress) {
-						pendingSuppress = ""
+					// Suppress ONLY the event paired with the hold already announced,
+					// identified by class AND attempt. Class alone hid a later retry
+					// whenever the paired event never arrived: the daemon writes payload
+					// then event as two operations and documents a crash between them
+					// (job_blocker.go:499), so attempt 1's arming outlived attempt 1 and
+					// swallowed attempt 2's event (#1943 f6). A zero attempt identifies
+					// nothing and so suppresses nothing - stating a deferral twice is a
+					// smaller fault than hiding a retry.
+					if pendingClass != "" && pendingAttempt > 0 &&
+						event.Kind == blockerDeferredEventKind &&
+						strings.Contains(event.Message, pendingClass) &&
+						strings.Contains(event.Message, fmt.Sprintf("attempt %d/", pendingAttempt)) {
+						pendingClass = ""
+						pendingAttempt = 0
 						continue
 					}
 					fmt.Fprintf(stdout, "%s\t%s\n", event.Kind, event.Message)
@@ -644,7 +658,8 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, s
 						// announced. Re-arming on each CHANGE is what makes a later
 						// retry work: attempt 2 renders its own HOLD and then consumes
 						// its own paired event.
-						pendingSuppress = reason.Class
+						pendingClass = reason.Class
+						pendingAttempt = reason.Attempt
 						if !jsonOutput {
 							fmt.Fprintln(stdout, line)
 						}

@@ -723,3 +723,85 @@ func TestJobWatchStillReportsALaterRetryOfTheSameClass(t *testing.T) {
 		t.Fatalf("a DISTINCT later retry of the same class was swallowed by latched suppression; output = %q", got)
 	}
 }
+
+// TestJobWatchReportsALaterRetryWhenTheEarlierEventNeverLanded is #1943 f6's
+// MISSING-PAIR boundary, and it is a different failure from the sticky-class one
+// next to it. The daemon writes the blocker payload and its event as two store
+// operations and job_blocker.go:499 documents a crash between them as expected,
+// so attempt 1's event can simply never exist. Suppression armed on the CLASS
+// alone then outlived the deferral it was armed for and consumed attempt 2's
+// event instead, hiding the retry entirely.
+//
+// Modelled exactly as the reviewer's probe: attempt 1's HOLD is rendered, its
+// event is deliberately omitted, then attempt 2 lands WITH its event.
+func TestJobWatchReportsALaterRetryWhenTheEarlierEventNeverLanded(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	seedSessionAgentRepo(t, store)
+	seedQueuedJob(t, store, "missing-pair", workflow.JobPayload{
+		Repo:            "owner/repo",
+		Branch:          "task-7",
+		PullRequest:     7,
+		BlockerClass:    "checkout_contention",
+		BlockerRetryAt:  time.Now().UTC().Add(30 * time.Second).Format(time.RFC3339Nano),
+		BlockerAttempts: 1,
+	})
+
+	var out syncBuffer
+	done := make(chan int, 1)
+	go func() {
+		done <- runJobWatch([]string{"missing-pair", "--home", home, "--poll", "20ms"}, &out, &out)
+	}()
+	deadline := time.Now().Add(8 * time.Second)
+	for !strings.Contains(out.String(), "HOLD:") {
+		if time.Now().After(deadline) {
+			t.Fatalf("HOLD never printed for attempt 1; output = %q", out.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// ATTEMPT 1'S EVENT IS DELIBERATELY NEVER WRITTEN - the daemon died in the
+	// documented window between the payload and the event.
+	//
+	// Attempt 2 now lands with its own payload AND its own event.
+	job, err := store.GetJob(context.Background(), "missing-pair")
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	payload, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload: %v", err)
+	}
+	payload.BlockerAttempts = 2
+	payload.BlockerRetryAt = time.Now().UTC().Add(90 * time.Second).Format(time.RFC3339Nano)
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if err := store.UpdateJobPayload(context.Background(), "missing-pair", string(encoded)); err != nil {
+		t.Fatalf("UpdateJobPayload: %v", err)
+	}
+	if err := store.AddJobEvent(context.Background(), db.JobEvent{
+		JobID:   "missing-pair",
+		Kind:    blockerDeferredEventKind,
+		Message: "checkout_contention: attempt 2/3, retry at 2026-09-06T18:00:00Z: branch task-7 is locked by other-agent",
+	}); err != nil {
+		t.Fatalf("AddJobEvent attempt 2: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	if _, err := store.TransitionJobState(context.Background(), "missing-pair",
+		string(workflow.JobQueued), string(workflow.JobSucceeded)); err != nil {
+		t.Fatalf("TransitionJobState: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(8 * time.Second):
+		t.Fatalf("watch did not exit; output = %q", out.String())
+	}
+	store.Close()
+
+	if got := out.String(); !strings.Contains(got, "attempt 2/3") {
+		t.Fatalf("attempt 2 was swallowed by attempt 1's arming, whose own event never landed; output = %q", got)
+	}
+}

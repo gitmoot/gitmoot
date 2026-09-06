@@ -48,11 +48,18 @@ var stuckReasonEventKinds = []string{
 // "not stuck / no derivable reason" — callers must render nothing so healthy
 // output is byte-stable.
 type stuckReason struct {
-	// Class is the payload BlockerClass this hold came from, empty for holds
-	// derived from an event. It exists so a watcher that already printed HOLD can
-	// recognise the SAME deferral arriving later as a blocker_deferred event and
-	// not state it twice (#1943 F4). It is never rendered.
+	// Class and Attempt identify WHICH deferral this hold came from, empty/zero for
+	// holds derived from an event. They exist so a watcher that already printed HOLD
+	// can recognise the one blocker_deferred event PAIRED with it and not state that
+	// deferral twice (#1943 F4/f6). Class alone was not enough: it also matched every
+	// later retry of the same class. Neither field is ever rendered.
+	//
+	// The pairing is exact rather than heuristic because ONE function writes both
+	// sides: job_blocker_checkout.go:199 sets payload.BlockerAttempts = attempt and
+	// :215 formats "attempt <attempt>/<max>" into the event, and job_blocker.go does
+	// the same for the other classes.
 	Class       string
+	Attempt     int
 	Reason      string // e.g. "waiting on runtime session lock ...", "blocked: awaiting human", "auth failing: ..."
 	NextRetryAt string // an RFC3339 lease expiry when one applies (a runtime-session lock), else ""
 	// SuggestedAction is a concrete human-facing remedy for a deferral that usually
@@ -175,6 +182,7 @@ func deriveQueueHoldReason(job db.Job) stuckReason {
 		}
 		return stuckReason{
 			Class:           class,
+			Attempt:         payload.BlockerAttempts,
 			Reason:          reason,
 			NextRetryAt:     retry,
 			SuggestedAction: strings.TrimSpace(payload.BlockerSuggestedAction),
