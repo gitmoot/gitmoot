@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -41,11 +42,54 @@ type eventWakeClient interface {
 // eventRuleSink decorates the existing outbound sink. Durable event families
 // persist their obligations before Emit returns; remaining rule work is detached
 // and timeout-bounded so delivery failures cannot fail the emitting job.
+//
+// DETACHED IS NOT UNOWNED (#1938). The detached work reads event rules from the
+// SAME store the emitting command owns, and a one-shot CLI closes that store as
+// soon as its command function returns. Nothing used to join those goroutines,
+// so `gitmoot job record` closed the store underneath an outstanding
+// ListEventRules: the row committed, the command printed success and exited 0,
+// and the only trace was `org event rules list failed ... sql: database is
+// closed` - on a SUCCESS path. The wake that read was supposed to decide never
+// happened either, so a subscribed role waited forever in front of a green
+// command. pending lets a command wait for its own rule work before releasing
+// the store; the daemon, whose store outlives every emit, simply never waits.
 type eventRuleSink struct {
 	inner events.Sink
 	store *db.Store
 	home  string
 	wake  eventWakeClient
+
+	// pending counts detached rule goroutines spawned by Emit. It is NOT a
+	// substitute for the goroutines' own timeouts: each herdr call stays bounded,
+	// and waitForPendingRuleWork bounds the join itself, so a hung wake delays a
+	// command by at most that bound rather than pinning it to herdr's liveness.
+	pending sync.WaitGroup
+}
+
+// waitForPendingRuleWork blocks until every detached rule goroutine spawned by
+// Emit has returned, or until the bound elapses. It reports whether the join
+// completed, so a caller can distinguish "rule work finished" from "rule work is
+// still outstanding and the store is about to close anyway".
+//
+// The bound exists because the store's owner must not be hostage to a wake: the
+// detached path probes herdr (eventRuleProbeTimeout) and may prompt it
+// (eventRuleWakeTimeout), so the join is sized to cover one such sequence and
+// then give up rather than hold a CLI open indefinitely.
+func (s *eventRuleSink) waitForPendingRuleWork(bound time.Duration) bool {
+	if s == nil {
+		return true
+	}
+	done := make(chan struct{})
+	go func() {
+		s.pending.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(bound):
+		return false
+	}
 }
 
 func (s *eventRuleSink) Emit(ctx context.Context, event events.Event) {
@@ -110,7 +154,9 @@ func (s *eventRuleSink) Emit(ctx context.Context, event events.Event) {
 			return
 		}
 		base := context.WithoutCancel(ctx)
+		s.pending.Add(1)
 		go func() {
+			defer s.pending.Done()
 			if err := s.evaluateSafely(base, event, remainingRules); err != nil {
 				slog.Warn("org event wake failed", "job_id", event.JobID, "error", err)
 			}
@@ -124,7 +170,9 @@ func (s *eventRuleSink) Emit(ctx context.Context, event events.Event) {
 	// wake) with NO deadline of its own: each herdr call below bounds itself, so a
 	// slow earlier rule cannot starve a later rule's wake.
 	base := context.WithoutCancel(ctx)
+	s.pending.Add(1)
 	go func() {
+		defer s.pending.Done()
 		if err := s.evaluateSafely(base, event, nil); err != nil {
 			slog.Warn("org event wake failed", "job_id", event.JobID, "error", err)
 		}

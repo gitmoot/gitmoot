@@ -364,6 +364,20 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 			HeadSHA:          displayHead,
 			HeadSHAPlane:     headPlane,
 		}
+		// #1938: CloseExternalJobWithUsage emits the terminal job event, and the
+		// event-rule sink evaluates a non-durable wake on a DETACHED goroutine that
+		// reads event_rules from THIS store. withStoreAndPaths closes the store the
+		// moment this function returns, so without a join the read raced a closed
+		// database: the row committed, the command exited 0, and the operator got
+		// `org event rules list failed ... sql: database is closed` on a success
+		// path while the wake it was deciding never fired.
+		//
+		// Join here rather than suppressing that warning: the log line is the only
+		// honest report of a rules-lookup failure, and a fix that silences it would
+		// make the next genuine failure - on a path where the write did NOT land -
+		// read identically. An incomplete join is deliberately NOT an error: the
+		// write has committed, and the goroutine's own timeouts still bound it.
+		waitForEventRuleWork(paths.Home, store, sessionRuleWorkJoinBound)
 		return nil
 	}); err != nil {
 		fmt.Fprintf(stderr, "job record: %v\n", err)

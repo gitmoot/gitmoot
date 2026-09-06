@@ -286,3 +286,36 @@ func emitDaemonTerminalEvent(ctx context.Context, sink events.Sink, store *db.St
 	}
 	events.EmitEvent(ctx, sink, event)
 }
+
+// sessionRuleWorkJoinBound sizes the join a one-shot command performs before it
+// releases its store (#1938). It covers one detached wake sequence - the herdr
+// availability probe plus a single agent prompt - so ordinary rule work
+// completes against an OPEN store, while a wedged herdr costs the command this
+// bound instead of hanging it.
+const sessionRuleWorkJoinBound = eventRuleProbeTimeout + eventRuleWakeTimeout + time.Second
+
+// waitForEventRuleWork joins the detached org-event-rule goroutines that this
+// process spawned for the given home and store, so a command that is about to
+// close that store does not pull the rules table out from under its own wake.
+//
+// It resolves the sink through the SAME cache key resolveDaemonEventSinkWithRules
+// stores it under, because the sink is per (home, database) and a process may
+// legitimately hold several. A miss means no rule sink was ever built for this
+// pair - rules are off, or the store is nil - and there is nothing to join.
+//
+// It returns whether the join completed. The caller decides what an incomplete
+// join means; nothing here logs, because "rule work is still running" is not by
+// itself an error on a path whose write has already committed.
+func waitForEventRuleWork(home string, store *db.Store, bound time.Duration) bool {
+	if store == nil {
+		return true
+	}
+	key := strings.TrimSpace(home) + "\x00" + store.DatabasePath()
+	eventSinkCache.Lock()
+	sink := eventSinkCache.rules[key]
+	eventSinkCache.Unlock()
+	if sink == nil {
+		return true
+	}
+	return sink.waitForPendingRuleWork(bound)
+}
