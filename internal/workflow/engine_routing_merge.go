@@ -871,22 +871,23 @@ func (e Engine) parkTaskAwaitingHumanMerge(ctx context.Context, ref taskRef, rea
 // arm transitioned the task unconditionally, so an objection bound to a
 // superseded head pulled a PR out of ready_to_merge - and, because dispatchFix
 // is called inline from it, dispatched a fix leg against findings about that
-// superseded commit. #1834/#1871 bound the APPROVING side and left this one.
+// superseded commit.
 //
 // ONLY A CONTRADICTED HEAD REFUSES; both unknowns admit. What refusing would
 // cost is the CONSERVATIVE transition and, inline from here, the FIX PASS - for
 // an objection nobody can show is stale. That liveness cost is the whole reason
-// the unknowns admit. What this arm establishes about the review record is one
-// invariant: refusing the TASK transition never un-records the REVIEW ROW,
-// because the terminal result-bearing row is committed before the advance runs.
-// Nothing here describes what any of that does to a merge; that is the merge
-// gate's behaviour and is specified where the gate is, not here.
+// the unknowns admit.
+//
+// This function establishes only that refusing the task transition never
+// un-records the review row, because the terminal result-bearing row is
+// committed before the advance runs; merge authorization and merge-gate
+// outcomes are outside its scope.
 //
 // A CLI review dispatched without --head-sha produces the headless payload
 // today, which is why that case is real traffic. The arms are pinned in
 // stale_verdict_head_test.go.
 //
-// ACCEPTED LIMITATION (#1512's family): when the ONLY objection on a PR is bound
+// ACCEPTED LIMITATION: when the ONLY objection on a PR is bound
 // to a superseded head, this arm strands it. The task does not transition, no fix
 // leg is dispatched, and nothing here re-drives anything - the PR waits for a
 // review at the current head. That is deliberate: a fix pass carrying findings

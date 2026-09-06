@@ -798,13 +798,12 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		switch effectiveDecision {
 		case "changes_requested":
 			// #1524: an objection transitions the task ONLY when it describes the
-			// pull request's CURRENT head. #1871 bound the approving side
-			// (approvalSupersedesChangesRequested); this arm was left
-			// unconditional, so an objection at a superseded head still pulled a
-			// PR out of ready_to_merge over a commit the branch had moved past -
-			// and, because dispatchFix is called INLINE below, also dispatched a
-			// fix leg against findings about that superseded commit. Returning
-			// early refuses both in one place.
+			// pull request's CURRENT head. This arm was left unconditional, so an
+			// objection at a superseded head still pulled a PR out of
+			// ready_to_merge over a commit the branch had moved past - and,
+			// because dispatchFix is called INLINE below, also dispatched a fix
+			// leg against findings about that superseded commit. Returning early
+			// refuses both in one place.
 			//
 			// THE GUARD IS DELIBERATELY ASYMMETRIC WITH THE APPROVAL SIDE, and the
 			// asymmetry is a LIVENESS argument: refusing an objection withholds the
@@ -815,11 +814,10 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			// the CLI-dispatch path, and would make the engine's cheapest
 			// transition the one demanding the most evidence.
 			//
-			// One invariant governs the review record: refusing the TASK transition
-			// never un-records the REVIEW ROW, so refusing here neither adds nor
-			// removes review evidence. What the merge gate then does with those
-			// rows is its own behaviour and is not described here. The headless
-			// case is documented at TestObjectionWithNoHeadStillRequestsChanges.
+			// This case establishes only that refusing the task transition never
+			// un-records the review row; merge authorization and merge-gate
+			// outcomes are outside its scope. The headless case is documented at
+			// TestObjectionWithNoHeadStillRequestsChanges.
 			bound, unboundReason, err := e.objectionBindsToCurrentHead(ctx, payload)
 			if err != nil {
 				return err
