@@ -878,11 +878,6 @@ func (e Engine) parkTaskAwaitingHumanMerge(ctx context.Context, ref taskRef, rea
 // an objection nobody can show is stale. That liveness cost is the whole reason
 // the unknowns admit.
 //
-// This function establishes only that refusing the task transition never
-// un-records the review row, because the terminal result-bearing row is
-// committed before the advance runs; merge authorization and merge-gate
-// outcomes are outside its scope.
-//
 // A CLI review dispatched without --head-sha produces the headless payload
 // today, which is why that case is real traffic. The arms are pinned in
 // stale_verdict_head_test.go.

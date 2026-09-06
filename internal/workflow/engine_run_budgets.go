@@ -813,11 +813,6 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			// legitimate objection on a PR the daemon has not polled yet, which is
 			// the CLI-dispatch path, and would make the engine's cheapest
 			// transition the one demanding the most evidence.
-			//
-			// This case establishes only that refusing the task transition never
-			// un-records the review row; merge authorization and merge-gate
-			// outcomes are outside its scope. The headless case is documented at
-			// TestObjectionWithNoHeadStillRequestsChanges.
 			bound, unboundReason, err := e.objectionBindsToCurrentHead(ctx, payload)
 			if err != nil {
 				return err

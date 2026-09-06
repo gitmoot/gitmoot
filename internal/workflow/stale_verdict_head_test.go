@@ -108,11 +108,6 @@ func TestObjectionAtCurrentHeadStillRequestsChanges(t *testing.T) {
 // well be about the current head. The argument for this arm is that liveness
 // cost and nothing else.
 //
-// This test establishes only that refusing the task transition never un-records
-// the review row, because the terminal result-bearing row is committed before
-// the advance runs; merge authorization and merge-gate outcomes are outside its
-// scope.
-//
 // An ABSENT head is governed by the integration markers instead of by this arm -
 // see TestObjectionWithNoHeadStillRequestsChanges below.
 func TestObjectionWithNoObservedPullRequestRowStillRequestsChanges(t *testing.T) {
