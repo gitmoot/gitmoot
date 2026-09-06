@@ -1492,8 +1492,11 @@ func TestPhaseInstrumentOnlyEnvConsumesAssignments(t *testing.T) {
 		{"sh does not", "sh PROBE=1 go test ./...", phaseBucketOther},
 		{"zsh does not", "zsh PROBE=1 go test ./...", phaseBucketOther},
 		{"nohup does not", "nohup PROBE=1 go test ./...", phaseBucketOther},
-		// and the wrapper still unwraps normally when its operand is a command.
-		{"bash still unwraps a real command", "bash go test ./...", phaseBucketTest},
+		// INVERTED IN ROUND 12: this case previously asserted `test` and was a
+		// confident false measurement of my own making. `bash go test ./...`
+		// does not run the Go toolchain - it runs a SCRIPT NAMED go. See
+		// TestPhaseInstrumentTreatsInterpreterOperandsAsScripts.
+		{"bash does not unwrap a script operand", "bash go test ./...", phaseBucketOther},
 		// A leading assignment before those wrappers is still a real
 		// assignment, consumed by the acceptor rather than by the wrapper.
 		{"assignment before bash stays an assignment", "OUTER=1 bash script.sh", phaseBucketOther},
@@ -1531,6 +1534,63 @@ func TestPhaseInstrumentRefusesMixedProvenanceOperators(t *testing.T) {
 	for _, tc := range []struct{ name, command, want string }{
 		{"quoted then unquoted angle", `">">x go test ./...`, phaseBucketUnknown},
 		{"quoted descriptor then unquoted angle", `2">">x go test ./...`, phaseBucketUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentTreatsInterpreterOperandsAsScripts is #1930 round-12 F1.
+// Round 11 stripped bash/sh/zsh unconditionally, so their operand became the
+// command word and `bash go test ./...` reported a confident `test`. A shell
+// interpreter without a command-string option does not execute its operand as
+// a command: it RUNS IT AS A SCRIPT FILE. Measured against real shells with a
+// local script named `go` on PATH-adjacent disk - bash and sh each exited 0
+// having run that script with argv `test ./...`, and invoked no Go at all.
+//
+// The split is between INTERPRETERS (bash, sh, zsh) and EXEC WRAPPERS (nohup,
+// env, timeout, ...), which really do exec their operand: `nohup go version`
+// invokes Go, also measured.
+func TestPhaseInstrumentTreatsInterpreterOperandsAsScripts(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		// Script operands: the shell runs, but Go does not.
+		{"bash script operand named go", "bash go test ./...", phaseBucketOther},
+		{"sh script operand named go", "sh go test ./...", phaseBucketOther},
+		{"zsh script operand named go", "zsh go test ./...", phaseBucketOther},
+		{"absolute bash script operand", "/bin/bash go test ./...", phaseBucketOther},
+		{"ordinary script operand", "bash scripts/ci.sh", phaseBucketOther},
+		{"interpreter options before a script", "bash -x go test ./...", phaseBucketOther},
+		// Command-string options DO run the command, and must keep working.
+		{"bash -c runs the command string", `bash -c "go test ./..."`, phaseBucketTest},
+		{"bash -lc runs the command string", `bash -lc "go test ./..."`, phaseBucketTest},
+		{"sh -c runs the command string", `sh -c "go test ./..."`, phaseBucketTest},
+		// Exec wrappers keep execing their operand.
+		{"nohup execs its operand", "nohup go test ./...", phaseBucketTest},
+		{"env execs its operand", "env go test ./...", phaseBucketTest},
+		{"timeout execs its operand", "timeout 25m go test ./...", phaseBucketTest},
+		{"sudo execs its operand", "sudo go test ./...", phaseBucketTest},
+		// WHAT THIS FIX MADE POSSIBLE, asked before shipping rather than after:
+		// separating interpreters from wrappers is a new branch boundary, so a
+		// wrapper WRAPPING an interpreter is a composition that did not exist
+		// last round. All of these run a script, not Go.
+		{"sudo over an interpreter", "sudo bash go test ./...", phaseBucketOther},
+		{"timeout over an interpreter", "timeout 25m bash go test ./...", phaseBucketOther},
+		{"nohup over an interpreter", "nohup bash go test ./...", phaseBucketOther},
+		{"env over an interpreter", "env PROBE=1 bash go test ./...", phaseBucketOther},
+		{"xargs over an interpreter", "xargs bash go test ./...", phaseBucketOther},
+		// And BUNDLED command-string options, which the same boundary exposed:
+		// I taught the interpreter arm about bundles while the recursion arm
+		// still matched a literal list, so `bash -ce ...` classified `other` -
+		// a confident-false bucket in the opposite direction. One predicate now
+		// decides both.
+		{"bundled -ce runs the command string", `bash -ce "go test ./..."`, phaseBucketTest},
+		{"bundled -ec runs the command string", `sh -ec "go test ./..."`, phaseBucketTest},
+		{"long option before -c", `bash --noprofile -c "go test ./..."`, phaseBucketTest},
+		// A LONG OPTION IS NEVER A COMMAND-STRING OPTION, however many 'c's it
+		// contains. Without the "--" exclusion `--noprofile` is read as one and
+		// the script operand becomes a Go test - the discriminator that turned
+		// a claimed-equivalent mutant into a killed one.
+		{"long option before a script operand", "bash --noprofile go test ./...", phaseBucketOther},
+		{"long option with a c before a script", "bash --rcfile go test ./...", phaseBucketOther},
 	} {
 		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
 	}

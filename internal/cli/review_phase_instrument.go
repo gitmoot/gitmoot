@@ -125,6 +125,18 @@ func classifyPhaseCommand(command string) string {
 // than any real agent command and terminates on hostile input.
 const maxWrapperRecursion = 3
 
+// isCommandStringOption reports whether a shell interpreter option introduces a
+// COMMAND STRING rather than a script file. `bash -lc "go test"` runs the
+// command; `bash script.sh` runs a file. The bundled forms matter because Codex
+// invokes `bash -lc` and operators write `-xc` while debugging (#1930
+// round-12 F1).
+func isCommandStringOption(option string) bool {
+	if !strings.HasPrefix(option, "-") || strings.HasPrefix(option, "--") || option == "-" {
+		return false
+	}
+	return strings.ContainsRune(option[1:], 'c')
+}
+
 func classifyPhaseCommandDepth(command string, depth int) string {
 	text := extractToolCommand(command)
 	if _, unsupported := unsupportedShellContext(text); unsupported {
@@ -425,8 +437,8 @@ func classifyCommandSegment(segment string, depth int) string {
 	tokens := accepted
 	plumbing := false
 	for len(tokens) > 0 {
-		switch head := normalize(tokens[0].text()); head {
-		case "-c", "-lc", "-lic":
+		head := normalize(tokens[0].text())
+		if isCommandStringOption(head) {
 			// The next field is a COMMAND STRING, not a token: quote-aware
 			// splitting keeps `bash -c "go test ./..."` whole, so it must be
 			// re-parsed rather than matched as one word (#1930 review F12
@@ -441,6 +453,8 @@ func classifyCommandSegment(segment string, depth int) string {
 			}
 			tokens = tokens[1:]
 			continue
+		}
+		switch head {
 		case "env":
 			// ONLY env TAKES ASSIGNMENTS. `env PROBE=1 go test` runs go test
 			// with PROBE set, so prefix consumption re-runs after this wrapper.
@@ -450,16 +464,42 @@ func classifyCommandSegment(segment string, depth int) string {
 			}
 			tokens = rest
 			continue
-		case "bash", "sh", "zsh", "nohup":
-			// THESE WRAPPERS DO NOT, and applying env's rule to all of them
-			// manufactured the exact defect this PR exists to remove:
-			// `bash PROBE=1 go test`, `sh PROBE=1 go test` and
-			// `nohup PROBE=1 go test` exit 127, 2 and 127 WITHOUT invoking Go,
-			// because PROBE=1 is the script or command operand rather than an
-			// assignment those wrappers own. Dropping only the wrapper leaves
-			// PROBE=1 as the command word, which acceptedCommandWord refuses
-			// for its '=' - so these refuse instead of reporting a Go test that
-			// never ran (#1930 round-11 f29).
+		case "bash", "sh", "zsh":
+			// A SHELL INTERPRETER IS NOT AN EXEC WRAPPER. Without a
+			// command-string option its operand is a SCRIPT FILE, so `bash go
+			// test ./...` runs a script NAMED go and never invokes the Go
+			// toolchain. Measured with a real local script named `go`: bash
+			// and sh both exited 0 having run it with argv `test ./...`, zero
+			// Go invocations. Round 11 stripped these unconditionally and my
+			// own new test pinned the wrong answer (#1930 round-12 F1).
+			rest := tokens[1:]
+			for len(rest) > 0 {
+				next := normalize(rest[0].text())
+				if isCommandStringOption(next) {
+					// `bash -lc "go test ./..."` DOES run the command string,
+					// so hand the option to the arm above rather than guessing.
+					break
+				}
+				if strings.HasPrefix(next, "-") {
+					rest = rest[1:]
+					continue
+				}
+				// A script operand. The shell really runs, and what it runs is
+				// not a Go test - `other`, not a refusal, because every token
+				// here is understood.
+				return phaseBucketOther
+			}
+			if len(rest) == 0 {
+				// An interpreter with no operand is an interactive shell.
+				return phaseBucketOther
+			}
+			tokens = rest
+			continue
+		case "nohup":
+			// nohup EXECS ITS OPERAND, so it really is an exec wrapper:
+			// `nohup go version` invokes Go (measured). It owns no assignments
+			// though - `nohup PROBE=1 go test` execs a command named PROBE=1
+			// and exits 127 (#1930 round-11 f29).
 			tokens = tokens[1:]
 			continue
 		case "timeout", "time", "nice", "sudo", "xargs", "stdbuf", "ionice":

@@ -2096,6 +2096,14 @@ variable assignments, so `env PROBE=1 go test ./...` is a test while
 `bash PROBE=1 go test ./...` is not - bash, sh, zsh and nohup take that word as
 their script or command operand, and really do exit without invoking Go.
 
+Shell INTERPRETERS are not executable wrappers. `bash`, `sh` and `zsh` unwrap
+only when a command-string option is present (`-c`, `-lc`, `-ce`, and other
+short bundles containing `c`; long options never qualify). Without one, the
+operand is a SCRIPT FILE - `bash go test ./...` runs a script named `go` and
+never invokes the Go toolchain, so it is not reported as a test. Executable
+wrappers (`nohup`, `env`, `timeout`, `sudo`, ...) do exec their operand and
+keep unwrapping.
+
 
 `job transcript <job-id> --export md` remains the deterministic, ANSI-free
 Markdown snapshot. `--export jsonl` emits schema-versioned, self-contained
