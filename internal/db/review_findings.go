@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 )
 
 // The #1822 findings ledger. One row per (finding, head) OBSERVATION, never one
@@ -116,6 +118,14 @@ var (
 	// ErrFindingObservedAt rejects a malformed caller timestamp.
 	ErrFindingObservedAt       = errors.New("observed_at must be RFC3339 when supplied")
 	ErrFindingUnknownContinues = errors.New("continues_uid does not name an existing finding")
+	// ErrFindingSeverity rejects a row no severity policy could ever disposition
+	// (#1928). Three rows for jerryfane/joltra#831 persisted with severity "",
+	// and an empty severity is NOT P3: it is an obligation that fails closed
+	// forever, because reviewseverity.Blocks treats an unrankable value as
+	// blocking. Defaulting it here would be worse than refusing - it would
+	// silently downgrade an unknown-severity defect to the least severe class at
+	// the one boundary that still knows the value was missing.
+	ErrFindingSeverity = errors.New("finding observation requires an explicit severity of P0, P1, P2 or P3")
 )
 
 var (
@@ -185,6 +195,15 @@ func (s *Store) RecordReviewFindingObservation(ctx context.Context, obs ReviewFi
 	repo := strings.TrimSpace(obs.Repo)
 	if repo == "" {
 		return "", errors.New("finding observation requires a repo")
+	}
+	// SEVERITY IS VALIDATED AT THE WRITE BOUNDARY, alongside head and state,
+	// because this is the last point that can tell a missing severity from a
+	// chosen one. Legacy empty-severity rows already in the ledger are NOT
+	// touched and NOT auto-dismissed: they stay fail-closed obligations until a
+	// reviewer observes them explicitly.
+	severity := strings.TrimSpace(obs.Severity)
+	if !reviewseverity.Valid(severity) {
+		return "", fmt.Errorf("%w: got %q", ErrFindingSeverity, obs.Severity)
 	}
 	switch obs.State {
 	case FindingOpen, FindingAnswered, FindingSuperseded:
@@ -339,7 +358,7 @@ func (s *Store) RecordReviewFindingObservation(ctx context.Context, obs ReviewFi
 	evidence_locator, rationale, source_job, withdraw_reason)
 VALUES (?, ?, ?, ?, COALESCE(NULLIF(?, ''), strftime('%Y-%m-%dT%H:%M:%fZ','now')), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		uid, repo, obs.PullRequest, head, strings.TrimSpace(obs.ObservedAt), obs.ObserverJob, string(obs.State),
-		obs.Severity, obs.RoundLabel, labelAbsent, obs.Title, obs.Detail, obs.File, obs.Line,
+		severity, obs.RoundLabel, labelAbsent, obs.Title, obs.Detail, obs.File, obs.Line,
 		string(keys), string(obs.EvidenceKind), string(cmds), obs.ExecutedCount,
 		obs.EvidenceLocator, obs.Rationale, obs.SourceJob, obs.WithdrawReason); err != nil {
 		// The key is (finding_uid, head_sha, observer_job), so this fires only for a

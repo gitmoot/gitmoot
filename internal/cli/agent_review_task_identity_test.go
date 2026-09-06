@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +35,32 @@ func TestStableReviewTaskIdentityKeepsHeadRoundIsolation(t *testing.T) {
 	}
 }
 
+// C1 (#1404 slice 1, commit d621bbd9) made review task identity STABLE across
+// rounds, and this test measured that: an `after_C1` arm asserting stable minting
+// resolves one implementing agent and merges, beside a `before_C1` arm asserting
+// that the LEGACY `review-pr-<N>-<hash>` identities - minted per head, so
+// divergent between rounds - resolved ZERO agents and failed the independence
+// check closed.
+//
+// THE before_C1 ARM IS RETIRED, NOT RE-PINNED (#1519). C1 fixed the MINTING so
+// identities stop diverging; #1519 fixes the DEPENDENCE, so the merge gate
+// correlates rows positionally (repo and pull request, plus branch when both
+// sides record one) when the identities diverge anyway. Divergent legacy
+// identities therefore resolve their implementing agent and merge, which is
+// exactly the outcome before_C1 required NOT to happen: the two artefacts are a
+// direct contradiction on the same input, written sixteen days apart by
+// different hands with neither citing the other.
+//
+// It is retired rather than inverted for a reason worth keeping: once the gate no
+// longer depends on identity sameness, before_C1 and after_C1 describe the SAME
+// outcome, so a table with both arms could no longer fail informatively. The
+// negatives that matter now live where the behaviour does -
+// TestPolicyMergeGateStillBlocksSelfApprovalAcrossDivergentTaskIdentities and
+// TestPolicyMergeGateDoesNotCorrelateImplementRowFromAnotherPullRequest in
+// internal/workflow keep self-approval refused and cross-PR rows uncorrelated.
+//
+// after_C1 is unchanged below: stable minting yielding one agent and a merge is
+// C1's actual contract and #1519 does not touch it.
 func TestC1MeasurementEngineDispatchedImplementerIdentity(t *testing.T) {
 	repoDir, oldHead, newHead := c1ReviewRepository(t)
 	if oldHead == newHead {
@@ -43,8 +68,6 @@ func TestC1MeasurementEngineDispatchedImplementerIdentity(t *testing.T) {
 	}
 	stableFirst := mintC1ReviewTaskID(t, repoDir, oldHead)
 	stableSecond := mintC1ReviewTaskID(t, repoDir, newHead)
-	legacyFirst := fmt.Sprintf("review-pr-%d-%s", 17, shortHash("owner/repo\x00"+oldHead))
-	legacySecond := fmt.Sprintf("review-pr-%d-%s", 17, shortHash("owner/repo\x00"+newHead))
 
 	for _, tc := range []struct {
 		name            string
@@ -53,7 +76,6 @@ func TestC1MeasurementEngineDispatchedImplementerIdentity(t *testing.T) {
 		wantAgents      int
 		wantFailClosed  bool
 	}{
-		{name: "before_C1", implementTaskID: legacyFirst, reviewTaskID: legacySecond, wantAgents: 0, wantFailClosed: true},
 		{name: "after_C1", implementTaskID: stableFirst, reviewTaskID: stableSecond, wantAgents: 1, wantFailClosed: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

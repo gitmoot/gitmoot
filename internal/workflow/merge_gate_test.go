@@ -1588,14 +1588,6 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 			doNotWant: []string{"implemented in a pane"},
 		},
 		{
-			name: "task_identity_mismatch",
-			seed: func(t *testing.T, store *db.Store, payload JobPayload) {
-				payload.TaskID = "different-task"
-				insertCompletedJob(t, store, db.Job{ID: "implement-mismatch", Agent: "implementer", Type: "implement"}, payload)
-			},
-			want: []string{"none match this task identity", "stable-task-identity regression"},
-		},
-		{
 			name: "empty_implement_agent",
 			seed: func(t *testing.T, store *db.Store, payload JobPayload) {
 				insertCompletedJob(t, store, db.Job{ID: "implement-empty-agent", Type: "implement"}, payload)
@@ -1829,10 +1821,6 @@ func TestImplementerAttributionAnomalyDeclinesRemainByteStable(t *testing.T) {
 		got  string
 		want string
 	}{
-		"task mismatch": {
-			got:  mismatchedImplementTaskAttributionReason,
-			want: "latest review round's approval cannot be verified as independent: implement jobs are recorded, but none match this task identity; this is an attribution anomaly and may indicate a stable-task-identity regression",
-		},
 		"empty agent": {
 			got:  emptyImplementAgentAttributionReason,
 			want: "latest review round's approval cannot be verified as independent: an implement job matches this task but has no recorded agent; this is an attribution data anomaly",

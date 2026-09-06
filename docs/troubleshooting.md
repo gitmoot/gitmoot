@@ -759,10 +759,15 @@ What to expect:
   seat's own cache root.** Both `/tmp` and the workspace return `EACCES` on
   `mkdir`, and "a writable dir" reads as satisfied by `/tmp` when it is not.
 
-If a seat still gets exit 126 running `go`, staging did not happen. **The reason is
-on the daemon's stderr, not in the job's events** - deliberately, because a fact
-about the host must not change a job's event stream. Look for
-`gitmoot: read-only seat toolchain:`. The causes, all of which leave the seat
+If a seat still gets exit 126 running `go`, staging did not happen. **Some of those
+cases print the reason on the daemon's stderr, not in the job's events** -
+deliberately, because a fact about the host must not change a job's event stream.
+Look for `gitmoot: read-only seat toolchain:`. **The first three causes below are
+SILENT by design**: no `go` on the daemon's `PATH`, a system-package prefix, and a
+source that is not a pinned installation all leave the seat as it was and emit
+nothing at all, so an absent log line does not mean staging succeeded. Only the
+remaining staging failures - free space below the floor, a symlink in the source
+set, and other copy errors - carry a diagnostic. All of them leave the seat
 exactly as it was before this feature existed rather than failing the launch:
 
 - **No pinned toolchain on the daemon's `PATH`.** A toolchain under `/opt`,
