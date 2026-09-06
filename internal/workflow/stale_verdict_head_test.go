@@ -246,10 +246,11 @@ func TestStaleObjectionDispatchesNoFixLeg(t *testing.T) {
 // --head-sha produces exactly this payload today, so this is real traffic rather
 // than a fixture artefact.
 //
-// WHY ADMITTING MATTERS HERE IS CONDITIONAL ON THE REVIEW POPULATION, not a
+// WHICH ROWS REACH THIS ARM IS CONDITIONAL ON THE REVIEW POPULATION, not a
 // property of headlessness. Headlessness is EXCLUSION from the strict
 // evaluated-head population - the reviewsAtHead filter tests the empty-head case
 // FIRST and independently of the equality case - not invisibility to the gate.
+// This is ORDERING, and it makes no claim about what any row does to a merge.
 // Cited by symbol, for the reason given on the PIN 1 comment above:
 //
 //   - No current-head review exists -> the strict population is empty, so the
@@ -263,9 +264,11 @@ func TestStaleObjectionDispatchesNoFixLeg(t *testing.T) {
 //     markers and take the ACCEPT path and 15 take "rerun review". So "the
 //     fallback refuses headless rows" is NOT a statement this code supports; only
 //     the marker test is.
-//   - A current-head review exists -> the strict population is non-empty, the
-//     fallback never runs, and a headless objection does not block that merge.
-//     THAT is the case this arm's admit exists for.
+//   - A current-head review exists -> the strict population is non-empty and the
+//     fallback never runs, so this row is not reached. NOTHING IS CLAIMED HERE
+//     ABOUT MERGE CONSEQUENCES IN EITHER BRANCH: the gate decides from the review
+//     rows and the task state, and admitting can race its claim of that state
+//     (gitmoot#1933).
 //
 // These are the branches the CODE TESTS FOR, not an exhaustive account of how
 // rows arise: 1,222 rows in the same store carry WorktreePath with no
