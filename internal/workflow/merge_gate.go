@@ -958,6 +958,136 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			return mergeBlocked{reason: fmt.Sprintf("review at evaluated head has blocking result from %s", review.job.Agent)}
 		}
 	}
+	// #1933. A PERSISTED HEADLESS OBJECTION MUST BLOCK HERE, BEFORE THE EXTERNAL
+	// MERGE CLAIM. This is an ORDERING fix, and the ordering is the whole fix:
+	// evaluating the objection after ClaimTaskState is what loses the race.
+	//
+	// The interleaving that shipped: reviewsAtHead holds only rows whose
+	// payload.HeadSHA equals the evaluated head, so a headless objection is
+	// invisible to it; the latest-round fallback below never runs because the
+	// strict population is non-empty whenever ANY current-head review exists; the
+	// gate then returns clean, executePullRequestMergeFenced acquires the task
+	// state for the external merge, and the objection's own AdvanceJob transition
+	// fails against that claim with ErrTaskStateClaimed while the merge completes.
+	// The objection was not deferred, it was BYPASSED - which inverts the one
+	// property the gate exists to hold.
+	//
+	// Every qualifier below is load-bearing, and each has a should-SUCCEED arm in
+	// the tests, because a gate that blocks valid merges is its own defect:
+	//   - HEADLESS: a row bound to a head is owned by the strict population above.
+	//     An objection rendered against a DIFFERENT head must still merge.
+	//   - ORDINARY: a fan-out announces a panel and is never a verdict (#1685).
+	//   - SUCCEEDED with a result: a queued, crashed or abstaining row is not an
+	//     objection, and the arms above already speak for rows at this head.
+	//   - UNSUPERSEDED: a strictly later terminal verdict from the SAME reviewer
+	//     is how an objection is answered or withdrawn, so a superseded row must
+	//     not block.
+	//   - APPLICABLE, and it takes FOUR exclusions, because a naive "ordinary
+	//     headless changes_requested" predicate deadlocks legitimate merges in three
+	//     distinct ways. sameCorrelatedTask already filtered by repo/PR/branch. Then:
+	//     a DELEGATION CHILD is headless by engine design and is judged through its
+	//     parent's fan-out evidence; an INTEGRATION-WORKTREE row has its head
+	//     cleared so it can validate an isolated tree; and a row with NEITHER head
+	//     NOR round is an unattributable delegation remnant, not a verdict. All
+	//     three point the OPPOSITE way from everything else here - including any of
+	//     them would block every head forever, which no push could ever clear.
+	//   - LATEST: among survivors the newest row decides, by the same
+	//     reviewRoundKey ordering supersession and round selection use, so no two
+	//     decisions here can disagree about which row is newer.
+	var headlessObjection *taskReview
+	var headlessObjectionKey reviewRoundKey
+	for i := range taskReviews {
+		review := taskReviews[i]
+		if strings.TrimSpace(review.payload.HeadSHA) != "" {
+			continue
+		}
+		if JobState(review.job.State) != JobSucceeded || review.payload.Result == nil {
+			continue
+		}
+		if isRoundHistoryDuplicate(review.job, taskReviewIDs) {
+			continue
+		}
+		// NOT APPLICABLE, FIRST DEADLOCK SHAPE, and it is only visible to the FULL
+		// package: a DELEGATION CHILD is headless because the engine clears a child's
+		// inherited HeadSHA, and its verdict is accounted through its parent's
+		// fan-out evidence (ensureDelegatedReviewEvidence), never as a standalone
+		// verdict about this head. isRoundHistoryDuplicate above is NOT enough - it
+		// only covers a child whose PARENT is itself a task review row, so a child of
+		// any other parent survived it.
+		//
+		// Found by execution rather than reading: a version of this block carrying
+		// only the superseded and integration exclusions passed every scoped headless
+		// test AND both ordering mutants, then failed
+		// TestPolicyMergeGateDelegatedReviewEvidenceEnumeration/H04_CHANGES_REQUESTED
+		// in the full package. A green scoped run is precisely what hides this class.
+		if isDelegationChild(review.job) {
+			continue
+		}
+		// NOT APPLICABLE, THIRD SHAPE, and this one is a JUDGEMENT I am recording
+		// rather than burying. A row that records NEITHER a head NOR a review round
+		// matches no production path that produces a reviewer verdict: an
+		// engine-dispatched review carries a ReviewRound, and a CLI-dispatched
+		// `gitmoot agent review` carries a HeadSHA and no round (which is what
+		// mergeGateReviewFixture.emptyRound documents), so it is never headless. What
+		// does produce this shape is a delegation child whose linkage columns were
+		// never written, and
+		// TestPolicyMergeGateDelegatedReviewEvidenceEnumeration's PARENT_ONLY and
+		// NEITHER_PARENT linkage variants assert - as wantExcluded - that such a row
+		// is UNATTRIBUTABLE and must be ignored rather than allowed to block.
+		//
+		// THE RISK, stated for the reviewer to attack: if some production path can
+		// persist a genuine reviewer objection with no head AND no round, this
+		// qualifier would leave #1933's bypass reachable for that shape. I could not
+		// find one, and the two shapes above are the only writers I traced.
+		if strings.TrimSpace(review.payload.ReviewRound) == "" {
+			continue
+		}
+		// NOT APPLICABLE, and this exclusion is the difference between a gate and a
+		// deadlock (#332 decompose-and-verify, #388). An integration-worktree review
+		// carries no head because the ENGINE CLEARS IT deliberately: the worktree has
+		// no branch and is validated against its own fresh HEAD, so the row's verdict
+		// is about that isolated tree, not about this pull request's head. Treating it
+		// as an objection against the head makes it an objection against EVERY head,
+		// which no push can ever clear -
+		// TestPolicyMergeGateHeadlessIntegrationObjectionDoesNotMatchEveryHead is the
+		// pre-existing test that holds this line, and the first version of this block
+		// failed it by including every headless row indiscriminately.
+		if isIntegrationWorktreeReview(review.payload) {
+			continue
+		}
+		if reviewRowIsFanOut(review.payload.Result) {
+			continue
+		}
+		if effectiveReviewDecisionForPayload(review.payload, request.ReviewBlockingSeverity) != "changes_requested" {
+			continue
+		}
+		reviewer := strings.TrimSpace(review.job.Agent)
+		superseded := false
+		if reviewer != "" {
+			for _, candidate := range taskReviews {
+				if candidate.payload.Result != nil &&
+					strings.TrimSpace(candidate.job.Agent) == reviewer &&
+					isReviewReplacementDecision(candidate.payload.Result.Decision) &&
+					reviewJobSupersedes(candidate.job, candidate.payload, review.job, review.payload) {
+					superseded = true
+					break
+				}
+			}
+		}
+		if superseded {
+			continue
+		}
+		key := reviewRoundKeyForJob(review.job, review.payload)
+		if headlessObjection == nil || reviewRoundKeyAfter(key, headlessObjectionKey) {
+			headlessObjection = &taskReviews[i]
+			headlessObjectionKey = key
+		}
+	}
+	if headlessObjection != nil {
+		return mergeBlocked{reason: fmt.Sprintf(
+			"unanswered review objection from %s (job %s) carries no evaluated head; answer or supersede that row, or re-render the verdict against this head",
+			strings.TrimSpace(headlessObjection.job.Agent), headlessObjection.job.ID)}
+	}
 	if len(activeAtHead) > 0 {
 		var selfApprovalReason string
 		var unknownImplementerReason string
