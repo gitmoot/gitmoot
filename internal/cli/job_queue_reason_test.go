@@ -169,138 +169,90 @@ func seedBranchLock(t *testing.T, home, repo, branch, owner string) {
 // TestJobListSurfacesWithheldByBranchLockHolder is #1553's half. It kills the
 // semantic reversion "drop the branch-lock arm", which would return the row to a
 // bare `queued` with the holder invisible.
-func TestJobListSurfacesWithheldByBranchLockHolder(t *testing.T) {
-	home := t.TempDir()
-	store := openCLIJobStore(t, home)
-	seedSessionAgentRepo(t, store)
-	seedQueuedJob(t, store, "withheld-by-branch", workflow.JobPayload{
-		Repo:        "owner/repo",
-		Branch:      "task-9",
-		PullRequest: 9,
-	})
-	store.Close()
-	seedBranchLock(t, home, "owner/repo", "task-9", "implement-holding-repo")
-
-	line := jobListLine(t, home, "withheld-by-branch")
-	if !strings.Contains(line, "implement-holding-repo") {
-		t.Errorf("job list line = %q, want the holding owner named", line)
-	}
-	if !strings.Contains(line, "task-9") {
-		t.Errorf("job list line = %q, want the held branch named", line)
-	}
-
-	entry := jobListJSONEntry(t, home, "withheld-by-branch")
-	if !strings.Contains(entry.WhyStuck, "implement-holding-repo") {
-		t.Errorf("--json why_stuck = %q, want the holding owner named", entry.WhyStuck)
-	}
-	if entry.NextRetryAt != "" {
-		t.Errorf("--json next_retry_at = %q, want EMPTY: a branch lock carries no lease, so naming a retry time would invent one", entry.NextRetryAt)
-	}
-}
-
-// TestJobListDoesNotInventAWithheldCause holds the negative controls the review
-// demanded, and each kills a distinct reversion of the matching rule.
+// TestJobListNeverInfersAHoldFromABranchLaneRow covers the three compiled-CLI
+// probes from #1943's review, each of which produced a FALSE withheld cause from
+// a branch-lock row. They are one test because they are one defect: a branch lock
+// records who owns a LANE, never who is withholding THIS job.
 //
-// The defect these replace was real and measured by the reviewer: matching with
-// strings.Contains(key, repo) against RESOURCE locks rendered an ordinary
-// owner/repo job as withheld from the production-shaped key
-// "merge-queue:owner/repository:main", printing an unrelated key, holder and
-// expiry - sending an operator to chase a holder that never blocked it.
-func TestJobListDoesNotInventAWithheldCause(t *testing.T) {
-	for _, tc := range []struct {
-		name      string
-		kills     string
-		seed      func(t *testing.T, home string)
-		jobRepo   string
-		jobBranch string
+// The self-owned arm is the decisive one. Production takes the lock with
+// Owner=<agent> BEFORE enqueuing that same agent's implement job
+// (internal/cli/workflow.go:1273), and the deleted code excluded only
+// lock.Owner == job.ID - an AGENT name compared against a JOB id, so it could
+// never fire on the production shape and an ordinary queued job rendered as
+// "withheld: branch task-self held by lead".
+func TestJobListNeverInfersAHoldFromABranchLaneRow(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		jobBranch    string
+		lockBranch   string
+		lockOwner    string
+		resourceKey  string
+		resourceHold bool
+		probe        string
 	}{
 		{
-			name:  "a longer repo name that merely contains ours",
-			kills: "reverting to substring repo matching",
-			// SAME BRANCH AS THE JOB ON PURPOSE. An earlier version used "main"
-			// while the job was on task-1, so the BRANCH guard rejected the lock
-			// before the repo guard was ever consulted - the control passed under a
-			// substring-matching mutant and proved nothing about repo boundaries.
-			seed: func(t *testing.T, home string) {
-				seedBranchLock(t, home, "owner/repository", "task-1", "other-job")
-			},
-			jobRepo: "owner/repo", jobBranch: "task-1",
+			name:       "the lock is owned by the job's OWN agent",
+			jobBranch:  "task-self",
+			lockBranch: "task-self",
+			lockOwner:  "lead",
+			probe:      "printed `withheld: branch task-self held by lead` for an ordinary queued job",
 		},
 		{
-			name:  "our repo name as a substring of a different owner",
-			kills: "matching on the repo segment without the owner",
-			seed: func(t *testing.T, home string) {
-				seedBranchLock(t, home, "otherowner/repo", "task-1", "other-job")
-			},
-			jobRepo: "owner/repo", jobBranch: "task-1",
+			name:       "the job names no branch at all",
+			jobBranch:  "",
+			lockBranch: "task-1",
+			lockOwner:  "other-agent",
+			probe:      "attributed task-1 to a job with an empty branch, contradicting the comment above it",
 		},
 		{
-			name:  "a lock on a DIFFERENT branch of our own repo",
-			kills: "dropping the branch comparison and attributing any lock in the repo",
-			seed: func(t *testing.T, home string) {
-				seedBranchLock(t, home, "owner/repo", "some-other-branch", "other-job")
-			},
-			jobRepo: "owner/repo", jobBranch: "task-1",
+			name:       "the lock branch differs only by case",
+			jobBranch:  "Task-Case",
+			lockBranch: "task-case",
+			lockOwner:  "other-agent",
+			probe:      "EqualFold matched a branch the lock store keys exactly",
 		},
 		{
-			name:  "a non-withholding resource lock naming our repo",
-			kills: "reading resource_locks for the withheld cause at all",
-			seed: func(t *testing.T, home string) {
-				store := openCLIJobStore(t, home)
-				defer store.Close()
-				ok, err := store.AcquireResourceLock(context.Background(), db.ResourceLock{
-					ResourceKey: "merge-queue:owner/repository:main",
-					OwnerJobID:  "unrelated-holder",
-					OwnerToken:  "unrelated-token",
-					ExpiresAt:   time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano),
-				}, time.Now().UTC())
-				if err != nil {
-					t.Fatalf("AcquireResourceLock: %v", err)
-				}
-				if !ok {
-					t.Fatal("AcquireResourceLock reported not acquired")
-				}
-			},
-			jobRepo: "owner/repo", jobBranch: "task-1",
+			// The FIRST version of this defect read resource_locks with
+			// strings.Contains(key, repo). Kept as a probe so a resurrection of
+			// either inference arm fails here.
+			name:         "a resource lock whose key merely contains the repo",
+			jobBranch:    "task-4",
+			resourceKey:  "merge-queue:owner/repository:main",
+			resourceHold: true,
+			probe:        "attributed the production-shaped merge-queue key to an unrelated job",
 		},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			home := t.TempDir()
 			store := openCLIJobStore(t, home)
 			seedSessionAgentRepo(t, store)
-			seedQueuedJob(t, store, "plain-job-21", workflow.JobPayload{
-				Repo:        tc.jobRepo,
-				Branch:      tc.jobBranch,
-				PullRequest: 21,
+			seedQueuedJob(t, store, "lane-row", workflow.JobPayload{
+				Repo:        "owner/repo",
+				Branch:      tt.jobBranch,
+				PullRequest: 31,
 			})
-			store.Close()
-			tc.seed(t, home)
-
-			line := jobListLine(t, home, "plain-job-21")
-			// NEEDLE CARRIES THE COLON. An earlier version searched for "withheld"
-			// and matched the FIXTURE'S OWN JOB ID, so the control failed on its own
-			// name rather than on production output.
-			if strings.Contains(line, "withheld:") {
-				t.Errorf("job list line = %q, want NO withheld cause (kills: %s)", line, tc.kills)
-			}
-			for _, forbidden := range []string{"other-job", "unrelated-holder", "owner/repository", "otherowner"} {
-				if strings.Contains(line, forbidden) {
-					t.Errorf("job list line = %q names %q, which does not withhold this job (kills: %s)", line, forbidden, tc.kills)
+			if tt.resourceHold {
+				if _, err := store.AcquireResourceLock(context.Background(), db.ResourceLock{
+					ResourceKey: tt.resourceKey,
+					OwnerJobID:  "some-other-job",
+					OwnerToken:  "tok",
+					ExpiresAt:   time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano),
+				}, time.Now().UTC()); err != nil {
+					t.Fatalf("AcquireResourceLock: %v", err)
 				}
+			} else {
+				seedBranchLock(t, home, "owner/repo", tt.lockBranch, tt.lockOwner)
 			}
-			entry := jobListJSONEntry(t, home, "plain-job-21")
-			if entry.WhyStuck != "" {
-				t.Errorf("--json why_stuck = %q, want EMPTY (kills: %s)", entry.WhyStuck, tc.kills)
+			store.Close()
+
+			line := jobListLine(t, home, "lane-row")
+			if strings.Contains(line, "withheld:") || strings.Contains(line, "held by") {
+				t.Fatalf("job list line = %q, want NO inferred hold; the deleted code %s", line, tt.probe)
 			}
 		})
 	}
 }
 
-// TestJobListOrdinaryQueuedJobRenderingIsUnchanged is the control, and without it
-// the three tests above would be satisfied by annotating every queued row. A
-// queued job with no blocker payload and no lock must keep rendering exactly as
-// it does today: the zero value of stuckReason means "no derivable reason" and
-// healthy output has to stay byte-stable.
 func TestJobListOrdinaryQueuedJobRenderingIsUnchanged(t *testing.T) {
 	home := t.TempDir()
 	store := openCLIJobStore(t, home)
@@ -324,5 +276,35 @@ func TestJobListOrdinaryQueuedJobRenderingIsUnchanged(t *testing.T) {
 	entry := jobListJSONEntry(t, home, "plain-queued")
 	if entry.WhyStuck != "" || entry.NextRetryAt != "" || entry.SuggestedAction != "" {
 		t.Errorf("--json entry = %+v, want the why-stuck fields empty for an ordinary queued job", entry)
+	}
+}
+
+// TestJobListSurfacesTheCausalCheckoutContentionHold is #1553's half, kept but
+// moved onto the signal that actually proves it. The daemon pre-flight emits
+// "branch %s is locked by %s" (internal/cli/workflow.go:1283),
+// job_blocker_checkout.go classifies it as checkout_contention and persists both
+// the payload class and a blocker_deferred event. This asserts the withheld job
+// no longer renders as a bare `queued` row - the original #1887/#1553 ask - and
+// that the holder it names comes from the daemon's own message rather than from a
+// lane row this renderer guessed at.
+func TestJobListSurfacesTheCausalCheckoutContentionHold(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	seedSessionAgentRepo(t, store)
+	seedQueuedJob(t, store, "causal-hold", workflow.JobPayload{
+		Repo:         "owner/repo",
+		Branch:       "task-9",
+		PullRequest:  9,
+		BlockerClass: "checkout_contention",
+	})
+	store.Close()
+
+	line := jobListLine(t, home, "causal-hold")
+	if strings.Contains(line, "queued\t\t") || !strings.Contains(line, "checkout_contention") {
+		t.Fatalf("job list line = %q, want the causal checkout_contention hold, not a bare queued row", line)
+	}
+	// The absent retry time must still read as unknown, never as a zero time.
+	if !strings.Contains(line, "retry time unknown") {
+		t.Fatalf("job list line = %q, want the absent retry rendered unknown", line)
 	}
 }

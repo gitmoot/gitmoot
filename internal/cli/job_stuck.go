@@ -48,6 +48,11 @@ var stuckReasonEventKinds = []string{
 // "not stuck / no derivable reason" — callers must render nothing so healthy
 // output is byte-stable.
 type stuckReason struct {
+	// Class is the payload BlockerClass this hold came from, empty for holds
+	// derived from an event. It exists so a watcher that already printed HOLD can
+	// recognise the SAME deferral arriving later as a blocker_deferred event and
+	// not state it twice (#1943 F4). It is never rendered.
+	Class       string
 	Reason      string // e.g. "waiting on runtime session lock ...", "blocked: awaiting human", "auth failing: ..."
 	NextRetryAt string // an RFC3339 lease expiry when one applies (a runtime-session lock), else ""
 	// SuggestedAction is a concrete human-facing remedy for a deferral that usually
@@ -63,7 +68,7 @@ func (r stuckReason) empty() bool { return strings.TrimSpace(r.Reason) == "" }
 // for a runtime-session lock wait, the owning lock's lease. It is a pure function
 // over already-queried state so it is trivially testable. Healthy (non-queued/
 // blocked) jobs and jobs with no derivable signal return the zero value.
-func deriveStuckReason(job db.Job, reasonEvent db.JobEvent, hasReasonEvent bool, locks []db.ResourceLock, branchLocks []db.BranchLock) stuckReason {
+func deriveStuckReason(job db.Job, reasonEvent db.JobEvent, hasReasonEvent bool, locks []db.ResourceLock) stuckReason {
 	state := strings.TrimSpace(job.State)
 	queued := state == string(workflow.JobQueued)
 	blocked := state == string(workflow.JobBlocked)
@@ -77,7 +82,7 @@ func deriveStuckReason(job db.Job, reasonEvent db.JobEvent, hasReasonEvent bool,
 		// resource locks, so a row rendering as bare `queued` is a DISPLAY gap over
 		// data that exists rather than an absence of data. The operator cost is
 		// real: a review sat queued 16 minutes with nothing surfacing why.
-		if held := deriveQueueHoldReason(job, branchLocks); !held.empty() {
+		if held := deriveQueueHoldReason(job); !held.empty() {
 			return held
 		}
 		// A blocked job with no reason-bearing event is still stuck by definition;
@@ -153,7 +158,7 @@ func deriveStuckReason(job db.Job, reasonEvent db.JobEvent, hasReasonEvent bool,
 // must stay byte-stable, so this must not become an annotation on every queued
 // row - which is exactly what a reader would see if the two guards below were
 // dropped.
-func deriveQueueHoldReason(job db.Job, branchLocks []db.BranchLock) stuckReason {
+func deriveQueueHoldReason(job db.Job) stuckReason {
 	payload, err := daemonJobPayload(job)
 	if err != nil {
 		return stuckReason{}
@@ -169,48 +174,32 @@ func deriveQueueHoldReason(job db.Job, branchLocks []db.BranchLock) stuckReason 
 			reason += ", retry time unknown"
 		}
 		return stuckReason{
+			Class:           class,
 			Reason:          reason,
 			NextRetryAt:     retry,
 			SuggestedAction: strings.TrimSpace(payload.BlockerSuggestedAction),
 		}
 	}
-	// #1553's WITHHELD CAUSE COMES FROM THE BRANCH LOCK, NOT FROM RESOURCE LOCKS,
-	// AND THE FIRST VERSION OF THIS GOT IT WRONG IN A WAY THAT INVENTED CAUSES.
-	// It scanned resource_locks with strings.Contains(key, repo), so any key merely
-	// CONTAINING the repo text was attributed to this job: a review probe with the
-	// production-shaped key "merge-queue:owner/repository:main" rendered an ordinary
-	// owner/repo job as withheld and printed that unrelated key, holder and expiry,
-	// sending an operator to chase a holder that was never blocking it. Real
-	// resource-lock keys are "runtime:<rt>:<ref>" and
-	// "checkout-mutation:<absolute path>" - NEITHER encodes owner/repo as a
-	// segment - so no amount of tightening that match could make it sound. What
-	// actually withholds a job while another job works the repo is the BRANCH LOCK
-	// (branch_locks: repo_full_name, branch, owner), so that is what is read here,
-	// and a resource-lock key can no longer produce a withheld cause at all.
-	repo := strings.TrimSpace(payload.Repo)
-	if repo == "" {
-		return stuckReason{}
-	}
-	for _, lock := range branchLocks {
-		if !strings.EqualFold(strings.TrimSpace(lock.RepoFullName), repo) {
-			continue
-		}
-		owner := strings.TrimSpace(lock.Owner)
-		if owner == "" || owner == job.ID {
-			continue
-		}
-		// A job that names no branch cannot prove WHICH branch withholds it, so it
-		// stays silent rather than attributing the first lock in the repo.
-		if branch := strings.TrimSpace(payload.Branch); branch != "" &&
-			!strings.EqualFold(strings.TrimSpace(lock.Branch), branch) {
-			continue
-		}
-		// NO NextRetryAt: a branch lock carries no lease, so naming a retry time
-		// here would be the same invention in a different field.
-		return stuckReason{
-			Reason: fmt.Sprintf("withheld: branch %s held by %s", strings.TrimSpace(lock.Branch), owner),
-		}
-	}
+	// #1553's WITHHELD CAUSE IS NOT INFERRED HERE, ON PURPOSE, AND TWO ATTEMPTS TO
+	// INFER IT BOTH INVENTED HOLDS. The first scanned resource_locks with
+	// strings.Contains(key, repo), so the production-shaped key
+	// "merge-queue:owner/repository:main" was attributed to an ordinary owner/repo
+	// job; real keys are "runtime:<rt>:<ref>" and "checkout-mutation:<abs path>" and
+	// encode no repo segment, so that match could not be made sound. The second read
+	// branch_locks, which was the wrong INFERENCE rather than the wrong table: a
+	// branch lock records who owns a LANE, not who is withholding THIS job.
+	// Production acquires that lock with Owner=<agent> BEFORE enqueuing that same
+	// agent's implement job (workflow.go:1273), so a compiled-CLI probe rendered an
+	// ordinary queued job as "withheld ... held by lead" - by its own agent's lock.
+	//
+	// THE ENGINE ALREADY RECORDS THIS CAUSALLY, so nothing needs inferring: the
+	// daemon pre-flight emits "branch %s is locked by %s" (workflow.go:1283),
+	// job_blocker_checkout.go classifies it as the checkout_contention BlockerClass,
+	// and persists it with a blocker_deferred event that names the branch AND the
+	// holder. That flows through the payload arm above and the reason-event path, and
+	// it is strictly better evidence: it is written only when the contention actually
+	// blocked this job. A queued row with no recorded blocker is therefore left
+	// silent rather than given a holder that a lane row cannot prove.
 	return stuckReason{}
 }
 

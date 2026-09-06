@@ -314,37 +314,28 @@ func TestJobWatchTranscriptSurfacesHoldWithAnExistingLog(t *testing.T) {
 // on the watch surface, not inferred from shared code. It kills the reversion
 // "surface the hold only for the blocker-payload class", which would leave a
 // withheld job silent on watch while job list explained it.
-func TestJobWatchSurfacesWithheldHolderDirectly(t *testing.T) {
+// TestJobWatchNeverInfersAHoldFromABranchLaneRow is the watch-surface half of
+// the same defect: the withheld cause was read through shared derivation, so the
+// watch path inherited the false hold. The causal rendering it is replaced by is
+// covered by TestJobWatchSurfacesTheCausalCheckoutContentionHold below.
+func TestJobWatchNeverInfersAHoldFromABranchLaneRow(t *testing.T) {
 	home := t.TempDir()
 	store := openCLIJobStore(t, home)
 	seedSessionAgentRepo(t, store)
-	seedQueuedJob(t, store, "watch-withheld", workflow.JobPayload{
+	seedQueuedJob(t, store, "watch-lane-row", workflow.JobPayload{
 		Repo:        "owner/repo",
 		Branch:      "task-17",
 		PullRequest: 17,
 	})
-	store.Close()
 	seedBranchLock(t, home, "owner/repo", "task-17", "implement-holds-the-repo")
+	store.Close()
 
-	out, code := watchUntil(t, home, "watch-withheld", "HOLD:", false)
-	if code != 0 {
-		t.Fatalf("job watch exit = %d, output:\n%s", code, out)
-	}
-	if !strings.Contains(out, "implement-holds-the-repo") {
-		t.Errorf("job watch output = %q, want the holding owner named on the watch surface", out)
-	}
-	if !strings.Contains(out, "task-17") {
-		t.Errorf("job watch output = %q, want the held branch named", out)
+	out, _ := watchUntil(t, home, "watch-lane-row", "", false)
+	if strings.Contains(out, "HOLD:") {
+		t.Fatalf("job watch output = %q, want no HOLD: a lane row cannot prove this job is withheld", out)
 	}
 }
 
-// TestJobWatchTranscriptSurfacesHoldThatBeginsAfterStartup is F1's regression and
-// it kills the reversion "sample the hold once before Follow instead of on every
-// poll" - the exact defect the review proved, where extracting holdLine made the
-// two modes share their FORMATTING while their POLLING stayed divergent.
-//
-// The job starts RUNNING with no hold, so a one-shot sample before Follow sees
-// nothing; the hold is applied only after the watch is already following.
 func TestJobWatchTranscriptSurfacesHoldThatBeginsAfterStartup(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HERDR_ENV", "")
@@ -462,5 +453,160 @@ func TestJobWatchDoesNotRestateAReplayedDeferralEvent(t *testing.T) {
 	}
 	if strings.Count(out.String(), "runtime_quota") != 1 {
 		t.Errorf("the quota detail appears %d times, want exactly once:\n%s", strings.Count(out.String(), "runtime_quota"), out.String())
+	}
+}
+
+// TestJobWatchAttachedInsideTheWriteWindowStatesTheDeferralOnce reproduces
+// #1943's F4 probe exactly: the checkout-contention path writes the blocker
+// PAYLOAD and the blocker_deferred EVENT in two separate store operations
+// (internal/cli/job_blocker_checkout.go:212 then :217), so a watcher can attach
+// between them. It then sees the payload and prints HOLD, and the event arrives
+// on a later poll - and the previous guard, which only consulted the CURRENT
+// poll's events, could not retract the HOLD it had already emitted.
+//
+// The deferral must be stated ONCE across the whole watch, not once per label.
+func TestJobWatchAttachedInsideTheWriteWindowStatesTheDeferralOnce(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	seedSessionAgentRepo(t, store)
+	// State 1: payload written, event NOT yet - the window the watcher attaches in.
+	seedQueuedJob(t, store, "window-job", workflow.JobPayload{
+		Repo:            "owner/repo",
+		Branch:          "task-3",
+		PullRequest:     3,
+		BlockerClass:    "checkout_contention",
+		BlockerRetryAt:  time.Now().UTC().Add(30 * time.Second).Format(time.RFC3339Nano),
+		BlockerAttempts: 1,
+	})
+
+	var out syncBuffer
+	done := make(chan int, 1)
+	go func() {
+		done <- runJobWatch([]string{"window-job", "--home", home, "--poll", "20ms"}, &out, &out)
+	}()
+
+	// Wait for the HOLD to be printed from the payload alone.
+	deadline := time.Now().Add(8 * time.Second)
+	for !strings.Contains(out.String(), "HOLD:") {
+		if time.Now().After(deadline) {
+			t.Fatalf("HOLD never printed from the payload; output = %q", out.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// State 2: the production-shaped event lands, exactly as the classifier writes it.
+	if err := store.AddJobEvent(context.Background(), db.JobEvent{
+		JobID:   "window-job",
+		Kind:    blockerDeferredEventKind,
+		Message: "checkout_contention: attempt 1/3, retry at 2026-09-06T16:00:00Z: branch task-3 is locked by other-agent",
+	}); err != nil {
+		t.Fatalf("AddJobEvent: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	if _, err := store.TransitionJobState(context.Background(), "window-job",
+		string(workflow.JobQueued), string(workflow.JobSucceeded)); err != nil {
+		t.Fatalf("TransitionJobState: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(8 * time.Second):
+		t.Fatalf("watch did not exit; output = %q", out.String())
+	}
+	store.Close()
+
+	got := out.String()
+	holds := strings.Count(got, "HOLD:")
+	events := strings.Count(got, blockerDeferredEventKind)
+	if holds != 1 {
+		t.Fatalf("HOLD printed %d times, want exactly 1; output = %q", holds, got)
+	}
+	// The event must NOT also be printed: HOLD already told the operator this.
+	if events != 0 {
+		t.Fatalf("the same deferral was ALSO printed as a %s event (%d times) - stated twice under two labels; output = %q",
+			blockerDeferredEventKind, events, got)
+	}
+}
+
+// TestJobWatchTranscriptNoLogDelegatesAndInheritsSuppression pins #1943's F3:
+// the docs asserted --transcript renders log lines rather than events and prints
+// HOLD in EVERY case, which is false for its own no-log fallback. With no
+// retained log the command prints "transcript unavailable; showing job events"
+// and delegates to event watch, so it inherits that mode's reason-event
+// suppression and shows the EVENT rather than HOLD.
+//
+// Both arms are asserted because the documented contract now distinguishes them,
+// and a fix that simply always printed HOLD would satisfy the second alone.
+func TestJobWatchTranscriptNoLogDelegatesAndInheritsSuppression(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		withEvent bool
+		wantHold  bool
+	}{
+		{
+			name:      "a reason event exists, so the event speaks and HOLD stays silent",
+			withEvent: true,
+			wantHold:  false,
+		},
+		{
+			name:      "no reason event, so the payload-only hold is still surfaced",
+			withEvent: false,
+			wantHold:  true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HERDR_ENV", "")
+			t.Setenv("HERDR_SOCKET_PATH", filepath.Join(t.TempDir(), "absent-herdr.sock"))
+			store := openCLIJobStore(t, home)
+			if err := store.UpsertAgent(context.Background(), db.Agent{Name: "shell-seat", Runtime: runtime.ShellRuntime}); err != nil {
+				t.Fatal(err)
+			}
+			seedQueuedJobAs(t, store, "no-log-job", "shell-seat", workflow.JobPayload{
+				Repo:           "owner/repo",
+				PullRequest:    18,
+				BlockerClass:   "checkout_contention",
+				BlockerRetryAt: "2026-09-06T05:00:00Z",
+			})
+			if tt.withEvent {
+				if err := store.AddJobEvent(context.Background(), db.JobEvent{
+					JobID:   "no-log-job",
+					Kind:    blockerDeferredEventKind,
+					Message: "checkout_contention: attempt 1/3, retry at 2026-09-06T05:00:00Z: branch task-8 is locked by other-agent",
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			store.Close()
+			// NO log file is written on purpose: that is what selects the fallback.
+
+			out := &syncBuffer{}
+			var stderr syncBuffer
+			done := make(chan int, 1)
+			go func() {
+				done <- Run([]string{"job", "watch", "no-log-job", "--home", home, "--transcript", "--poll", "20ms"}, out, &stderr)
+			}()
+			deadline := time.Now().Add(15 * time.Second)
+			for !strings.Contains(out.String(), "transcript unavailable") {
+				if time.Now().After(deadline) {
+					t.Fatalf("the no-log fallback was never taken; output:\n%s\nstderr:\n%s", out.String(), stderr.String())
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			// Give the delegated loop several polls in which it could print either form.
+			time.Sleep(300 * time.Millisecond)
+			settleWatchedJob(t, home, "no-log-job")
+			<-done
+
+			got := out.String()
+			gotHold := strings.Contains(got, "HOLD:")
+			if gotHold != tt.wantHold {
+				t.Fatalf("no-log --transcript HOLD present = %v, want %v; the docs now state this case explicitly. output:\n%s",
+					gotHold, tt.wantHold, got)
+			}
+			if tt.withEvent && !strings.Contains(got, blockerDeferredEventKind) {
+				t.Fatalf("no-log --transcript output = %q, want the delegated event line", got)
+			}
+		})
 	}
 }

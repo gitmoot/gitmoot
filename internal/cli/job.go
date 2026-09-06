@@ -230,7 +230,6 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 	var deliveryEvents map[string]db.JobEvent
 	var deliveryEventsKnown bool
 	var locks []db.ResourceLock
-	var branchLocks []db.BranchLock
 	var reviewStatuses map[string]reviewStatusDisplay
 	var paths config.Paths
 	if err := withStoreAndPaths(*home, func(resolvedPaths config.Paths, store *db.Store) error {
@@ -249,7 +248,6 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 		deliveryEvents, err = store.LatestJobEventsOfKinds(context.Background(), deliveryStatusEventKinds)
 		deliveryEventsKnown = err == nil
 		locks, _ = store.ListResourceLocks(context.Background())
-		branchLocks, _ = store.ListBranchLocks(context.Background(), "")
 		reviewStatuses = deriveReviewStatuses(context.Background(), store, jobs, time.Now().UTC())
 		return nil
 	}); err != nil {
@@ -265,7 +263,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 		for _, job := range filtered {
 			payload, _ := jobListPayload(job)
 			ev, ok := reasonEvents[job.ID]
-			reason := deriveStuckReason(job, ev, ok, locks, branchLocks)
+			reason := deriveStuckReason(job, ev, ok, locks)
 			processActive := deriveWorktreeProcessActive(job, jobWorktreeLiveness)
 			deliveryEvent, hasDeliveryEvent := deliveryEvents[job.ID]
 			var deliveryStatus string
@@ -320,7 +318,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "\tPREFLIGHT_FAILED: %s", reason)
 		}
 		ev, ok := reasonEvents[job.ID]
-		if reason := deriveStuckReason(job, ev, ok, locks, branchLocks); !reason.empty() {
+		if reason := deriveStuckReason(job, ev, ok, locks); !reason.empty() {
 			fmt.Fprintf(stdout, "\tWHY: %s", reason.Reason)
 			if reason.NextRetryAt != "" {
 				fmt.Fprintf(stdout, " (next retry %s)", reason.NextRetryAt)
@@ -477,8 +475,7 @@ func loadStuckReason(store *db.Store, job db.Job) stuckReason {
 	}
 	ev, ok := latestReasonEvent(events)
 	locks, _ := store.ListResourceLocks(context.Background())
-	branchLocks, _ := store.ListBranchLocks(context.Background(), "")
-	return deriveStuckReason(job, ev, ok, locks, branchLocks)
+	return deriveStuckReason(job, ev, ok, locks)
 }
 
 // latestReasonEvent returns the last event whose kind is a stuck-reason kind.
@@ -585,8 +582,19 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, s
 			if !jsonOutput {
 				for nextEvent < len(events) {
 					event := events[nextEvent]
-					fmt.Fprintf(stdout, "%s\t%s\n", event.Kind, event.Message)
 					nextEvent++
+					// THE PAYLOAD AND THE EVENT ARE WRITTEN IN SEPARATE STORE
+					// OPERATIONS (job_blocker_checkout.go:212 then :217), so a watcher
+					// can attach INSIDE that window: it sees the payload, prints HOLD,
+					// and the event lands on a later poll. Guarding only on the current
+					// poll's events cannot retract a HOLD already emitted, so one
+					// deferral was still stated twice under two labels (#1943 F4). Once
+					// HOLD has spoken for a class, the matching event is redundant.
+					if held.Class != "" && event.Kind == blockerDeferredEventKind &&
+						strings.Contains(event.Message, held.Class) {
+						continue
+					}
+					fmt.Fprintf(stdout, "%s\t%s\n", event.Kind, event.Message)
 				}
 			}
 			if workflow.IsSettledJobState(job.State) {

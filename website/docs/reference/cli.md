@@ -2223,8 +2223,14 @@ poll so a hold that begins after the watch attached is still shown. The line is
 reprinted only when the hold **changes**. In the default event mode the watcher
 already replays every job event, so `HOLD:` is emitted only when no
 reason-bearing event exists — otherwise the deferral would be stated twice under
-two labels. `job watch --transcript` renders log lines rather than job events, so
-it prints the hold in every case.
+two labels. `job watch --transcript` has TWO paths and they differ, so the guarantee is
+qualified: with a retained log it enters `transcript.Follow` and renders log
+lines rather than job events, and the hold is printed there in every case
+because no event can have spoken for it. With NO retained log it prints
+`transcript unavailable; showing job events` and DELEGATES to event watch,
+inheriting that mode's behavior exactly - including the reason-event
+suppression above, so a deferral that already has a `blocker_deferred` event
+appears as the event and not as `HOLD:`.
 
 `gitmoot job watch --json` carries the last hold observed during the watch as
 `held_reason`, `held_next_retry_at` and `held_suggested_action`. They are named
