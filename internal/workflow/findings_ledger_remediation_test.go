@@ -38,7 +38,8 @@ func TestLedgerQuotedObservationCannotSilenceAnOpenFinding(t *testing.T) {
 	headA, headB, headC := strings.Repeat("a", 40), strings.Repeat("b", 40), strings.Repeat("c", 40)
 	uid := seedOpenFinding(t, store, headA)
 	if _, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
-		Repo: "owner/repo", PullRequest: 7, HeadSHA: headB, ObserverJob: "review-2",
+		Severity: "P2",
+		Repo:     "owner/repo", PullRequest: 7, HeadSHA: headB, ObserverJob: "review-2",
 		ContinuesUID: uid, State: db.FindingOpen, Title: "the defect", File: "internal/run.go",
 		EvidenceKind: db.EvidenceQuoted, SourceJob: "review-1",
 	}); err != nil {
@@ -62,7 +63,8 @@ func TestLedgerExecutedObservationDischargesAtThatHead(t *testing.T) {
 	headA, headB := strings.Repeat("a", 40), strings.Repeat("b", 40)
 	uid := seedOpenFinding(t, store, headA)
 	if _, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
-		Repo: "owner/repo", PullRequest: 7, HeadSHA: headB, ObserverJob: "review-2",
+		Severity: "P2",
+		Repo:     "owner/repo", PullRequest: 7, HeadSHA: headB, ObserverJob: "review-2",
 		ContinuesUID: uid, State: db.FindingAnswered, Title: "the defect", File: "internal/run.go",
 		EvidenceKind: db.EvidenceExecuted, ExecutedCommands: []string{"go test ./internal/ -> ok"}, ExecutedCount: 1,
 	}); err != nil {
@@ -130,7 +132,8 @@ func TestLedgerStaticDischargeIsReArmedWhenItsLocatorIsGone(t *testing.T) {
 	headA, headB := strings.Repeat("a", 40), strings.Repeat("b", 40)
 	uid := seedOpenFinding(t, store, headA)
 	if _, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
-		Repo: "owner/repo", PullRequest: 7, HeadSHA: headA, ObserverJob: "review-2",
+		Severity: "P2",
+		Repo:     "owner/repo", PullRequest: 7, HeadSHA: headA, ObserverJob: "review-2",
 		ContinuesUID: uid, State: db.FindingAnswered, Title: "the defect", File: "internal/run.go",
 		EvidenceKind: db.EvidenceStatic, EvidenceLocator: "internal/gone.go:9999",
 		Rationale: "the guard now lives here",
@@ -171,7 +174,8 @@ func TestLedgerRefusesASymbolRelevanceKey(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	_, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
-		Repo: "owner/repo", PullRequest: 7, HeadSHA: strings.Repeat("a", 40), ObserverJob: "review-1",
+		Severity: "P2",
+		Repo:     "owner/repo", PullRequest: 7, HeadSHA: strings.Repeat("a", 40), ObserverJob: "review-1",
 		State: db.FindingOpen, Title: "t", File: "internal/run.go",
 		RelevanceKeys: []string{"EnsureLedgerObligationsObserved()"},
 		EvidenceKind:  db.EvidenceExecuted, ExecutedCommands: []string{"probe"}, ExecutedCount: 1,
@@ -188,7 +192,8 @@ func TestLedgerRefusesAReasonlessWithdrawal(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	_, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
-		Repo: "owner/repo", PullRequest: 7, HeadSHA: strings.Repeat("a", 40), ObserverJob: "review-1",
+		Severity: "P2",
+		Repo:     "owner/repo", PullRequest: 7, HeadSHA: strings.Repeat("a", 40), ObserverJob: "review-1",
 		State: db.FindingWithdrawn, Title: "t", File: "internal/run.go",
 		EvidenceKind: db.EvidenceStatic, EvidenceLocator: "a", Rationale: "n",
 	})
@@ -206,7 +211,8 @@ func TestLedgerFoldIgnoresACallerSuppliedFutureTimestamp(t *testing.T) {
 	headA, headB := strings.Repeat("a", 40), strings.Repeat("b", 40)
 	uid := seedOpenFinding(t, store, headA)
 	if _, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
-		Repo: "owner/repo", PullRequest: 7, HeadSHA: headA, ObserverJob: "review-2",
+		Severity: "P2",
+		Repo:     "owner/repo", PullRequest: 7, HeadSHA: headA, ObserverJob: "review-2",
 		ContinuesUID: uid, State: db.FindingAnswered, Title: "t", File: "internal/run.go",
 		ObservedAt:   "9999-01-01T00:00:00Z",
 		EvidenceKind: db.EvidenceExecuted, ExecutedCommands: []string{"go test -> ok"}, ExecutedCount: 1,
@@ -214,7 +220,8 @@ func TestLedgerFoldIgnoresACallerSuppliedFutureTimestamp(t *testing.T) {
 		t.Fatalf("a valid RFC3339 stamp must be accepted: %v", err)
 	}
 	if _, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
-		Repo: "owner/repo", PullRequest: 7, HeadSHA: headA, ObserverJob: "review-3",
+		Severity: "P2",
+		Repo:     "owner/repo", PullRequest: 7, HeadSHA: headA, ObserverJob: "review-3",
 		ContinuesUID: uid, State: db.FindingOpen, Title: "t", File: "internal/run.go",
 		EvidenceKind: db.EvidenceExecuted, ExecutedCommands: []string{"go test -> FAIL"}, ExecutedCount: 1,
 	}); err != nil {
@@ -224,7 +231,8 @@ func TestLedgerFoldIgnoresACallerSuppliedFutureTimestamp(t *testing.T) {
 		t.Fatal("the future-stamped answer won the fold, so a reopened finding read as answered")
 	}
 	_, bad := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
-		Repo: "owner/repo", PullRequest: 7, HeadSHA: headB, ObserverJob: "review-4",
+		Severity: "P2",
+		Repo:     "owner/repo", PullRequest: 7, HeadSHA: headB, ObserverJob: "review-4",
 		State: db.FindingOpen, Title: "t", File: "internal/run.go", ObservedAt: "not-a-time",
 		EvidenceKind: db.EvidenceExecuted, ExecutedCommands: []string{"probe"}, ExecutedCount: 1,
 	})
@@ -242,7 +250,8 @@ func TestLedgerAdmitsASecondReviewerAtTheSameHead(t *testing.T) {
 	head := strings.Repeat("a", 40)
 	uid := seedOpenFinding(t, store, head)
 	second := db.ReviewFindingObservation{
-		Repo: "owner/repo", PullRequest: 7, HeadSHA: head, ObserverJob: "reviewer-b",
+		Severity: "P2",
+		Repo:     "owner/repo", PullRequest: 7, HeadSHA: head, ObserverJob: "reviewer-b",
 		ContinuesUID: uid, State: db.FindingOpen, Title: "still broken", File: "internal/run.go",
 		EvidenceKind: db.EvidenceExecuted, ExecutedCommands: []string{"go test -> FAIL"}, ExecutedCount: 1,
 	}
@@ -267,7 +276,8 @@ func TestLedgerQuotedMentionDoesNotReopenAnAnsweredFinding(t *testing.T) {
 	headA, headB, headC := strings.Repeat("a", 40), strings.Repeat("b", 40), strings.Repeat("c", 40)
 	uid := seedOpenFinding(t, store, headA)
 	if _, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
-		Repo: "owner/repo", PullRequest: 7, HeadSHA: headA, ObserverJob: "review-2",
+		Severity: "P2",
+		Repo:     "owner/repo", PullRequest: 7, HeadSHA: headA, ObserverJob: "review-2",
 		ContinuesUID: uid, State: db.FindingAnswered, Title: "the defect", File: "internal/run.go",
 		EvidenceKind: db.EvidenceExecuted, ExecutedCommands: []string{"go test -> ok"}, ExecutedCount: 1,
 	}); err != nil {
@@ -276,7 +286,8 @@ func TestLedgerQuotedMentionDoesNotReopenAnAnsweredFinding(t *testing.T) {
 	// A later round merely QUOTES it for context. Nothing was re-checked and
 	// nothing was re-broken.
 	if _, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
-		Repo: "owner/repo", PullRequest: 7, HeadSHA: headB, ObserverJob: "review-3",
+		Severity: "P2",
+		Repo:     "owner/repo", PullRequest: 7, HeadSHA: headB, ObserverJob: "review-3",
 		ContinuesUID: uid, State: db.FindingOpen, Title: "the defect", File: "internal/run.go",
 		EvidenceKind: db.EvidenceQuoted, SourceJob: "review-2",
 	}); err != nil {
@@ -300,7 +311,8 @@ func TestLedgerRefusesSymbolKeysAndAcceptsRealPaths(t *testing.T) {
 	head := strings.Repeat("a", 40)
 	record := func(key string) error {
 		_, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
-			Repo: "owner/repo", PullRequest: 7, HeadSHA: head, ObserverJob: "review-" + key,
+			Severity: "P2",
+			Repo:     "owner/repo", PullRequest: 7, HeadSHA: head, ObserverJob: "review-" + key,
 			State: db.FindingOpen, Title: "t", File: "internal/run.go",
 			RelevanceKeys: []string{key},
 			EvidenceKind:  db.EvidenceExecuted, ExecutedCommands: []string{"probe"}, ExecutedCount: 1,
@@ -379,7 +391,8 @@ func TestLedgerScopeDegradesWhenLocatorResolverIsAbsent(t *testing.T) {
 	h1, h2 := strings.Repeat("a", 40), strings.Repeat("b", 40)
 	uid := seedOpenFinding(t, store, h1)
 	if _, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
-		Repo: "owner/repo", PullRequest: 7, HeadSHA: h1, ObserverJob: "review-2",
+		Severity: "P2",
+		Repo:     "owner/repo", PullRequest: 7, HeadSHA: h1, ObserverJob: "review-2",
 		ContinuesUID: uid, State: db.FindingAnswered, Title: "the defect", File: "internal/run.go",
 		EvidenceKind: db.EvidenceStatic, EvidenceLocator: "internal/run.go:42",
 		Rationale: "the guard lives here",

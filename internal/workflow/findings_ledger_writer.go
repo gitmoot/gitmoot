@@ -327,6 +327,9 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 	b.WriteString("finding, emit a finding object citing its uid as \"continues_uid\" - typing its old label is naming,\n")
 	b.WriteString("not reference, and mints a NEW finding instead. Set \"state\": \"answered\" only if you CHECKED it at\n")
 	b.WriteString("this head, and say what you ran; \"withdrawn\" requires \"withdraw_reason\" and is refused without one.\n")
+	b.WriteString("EVERY finding you emit needs an explicit \"severity\" of P0, P1, P2 or P3. A finding with none is\n")
+	b.WriteString("REFUSED rather than stored, because a row with no severity is an obligation no severity policy\n")
+	b.WriteString("can ever disposition, and it is not the same thing as P3 (#1928).\n")
 	for _, obligation := range pending {
 		label := obligation.RoundLabel
 		if strings.TrimSpace(label) == "" {
@@ -334,6 +337,13 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 		}
 		b.WriteString(fmt.Sprintf("  uid=%s  was=%s  severity=%s  reason=%s  title=%s\n",
 			obligation.FindingUID, label, obligation.Severity, obligation.Reason, obligation.Title))
+		if strings.TrimSpace(obligation.Severity) == "" {
+			// A LEGACY EMPTY-SEVERITY ROW MUST NOT PRINT AS "severity=". The
+			// reviewer reads this line to decide how to answer; a blank there
+			// reads as "unset, therefore minor", which is the inference #1928
+			// exists to stop. It is named for what it is instead.
+			b.WriteString("    (that row predates the severity requirement and carries none; treat it as unranked and blocking until you observe it)\n")
+		}
 	}
 	return b.String()
 }
