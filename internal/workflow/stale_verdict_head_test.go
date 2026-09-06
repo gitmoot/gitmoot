@@ -156,10 +156,13 @@ func TestObjectionAtCurrentHeadStillRequestsChanges(t *testing.T) {
 // see TestObjectionWithNoHeadStillRequestsChanges below.
 //
 // This arm's row carries a head the engine CANNOT CONFIRM: there is no observed
-// pull request row to compare it against. That is why admitting is right - the
-// engine cannot show the objection is stale - and the invariant above is why
-// admitting is also safe. What refusing would cost is the conservative transition
-// and the inline fix pass, withheld from an objection nobody can show is stale.
+// pull request row to compare it against. That is the whole reason it admits -
+// the engine cannot show the objection is stale, so refusing would withhold the
+// conservative transition and the inline fix pass from an objection that may
+// well be about the current head. NO CLAIM IS MADE HERE THAT ADMITTING IS SAFE:
+// the task state participates in merge safety and admitting can race the gate's
+// claim (gitmoot#1933), so the argument for this arm is liveness and nothing
+// more.
 func TestObjectionWithNoObservedPullRequestRowStillRequestsChanges(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

@@ -910,9 +910,11 @@ func (e Engine) parkTaskAwaitingHumanMerge(ctx context.Context, ref taskRef, rea
 // liveness loss, which is why the unknowns admit; the approval side refuses the
 // mirror cases because withholding a merge fails safe.
 //
-// Admitting records a complaint and authorises nothing, so it is the
-// claim-nothing direction. A CLI review dispatched without --head-sha produces
-// the headless payload today, which is why that case is real traffic.
+// THIS CODE MAKES NO CLAIM THAT ADMITTING IS MERGE-SAFE: the task state
+// participates in merge safety, and an admitted objection can race the gate's
+// claim of it (gitmoot#1933). The argument here is liveness only. A CLI review
+// dispatched without --head-sha produces the headless payload today, which is
+// why that case is real traffic.
 //
 // ACCEPTED LIMITATION (#1512's family): when the ONLY objection on a PR is bound
 // to a superseded head, this arm strands it. The task does not transition, no fix

@@ -834,15 +834,17 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			// What differs between the two sides is the consequence of refusing:
 			// refusing an unconfirmable APPROVAL fails safe, because nothing merges
 			// while the doubt stands; refusing an objection withholds the
-			// conservative transition and the inline fix pass without buying any
-			// merge protection, because refusing the TASK transition does not
-			// un-record the REVIEW ROW. So when no observed pull request
-			// row records a head, this arm ADMITS - refusing would block a
-			// legitimate objection on a PR the daemon has not polled yet, which is
-			// the CLI-dispatch path, and would make the engine's cheapest
-			// transition the one demanding the most evidence. The headless case is
-			// governed by the review population instead, and is documented at
-			// TestObjectionWithNoHeadStillRequestsChanges.
+			// conservative transition and the inline fix pass from a complaint that
+			// may well be about the current head. That is a LIVENESS argument and
+			// the only one this arm has: THIS CODE MAKES NO CLAIM THAT ADMITTING IS
+			// MERGE-SAFE. The task state participates in merge safety, and an
+			// admitted objection can race the gate's claim of it (gitmoot#1933).
+			// So when no observed pull request row records a head, this arm ADMITS -
+			// refusing would block a legitimate objection on a PR the daemon has not
+			// polled yet, which is the CLI-dispatch path, and would make the engine's
+			// cheapest transition the one demanding the most evidence. The headless
+			// case is governed by the review population instead, and is documented
+			// at TestObjectionWithNoHeadStillRequestsChanges.
 			bound, unboundReason, err := e.objectionBindsToCurrentHead(ctx, payload)
 			if err != nil {
 				return err
