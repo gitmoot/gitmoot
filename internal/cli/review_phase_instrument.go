@@ -410,43 +410,29 @@ func classifyCommandSegment(segment string, depth int) string {
 		}
 		return token
 	}
-	fields := shellFields(strings.ToLower(strings.TrimSpace(segment)))
-	// STRIP REDIRECTIONS WHEREVER THEY APPEAR. The declared grammar permits
-	// them before, between and after words, so `>out.log go test` and
-	// `go >out.log test` are both simple commands; removing them only after the
-	// command word left both classified as other (#1930 round-8 F2).
-	kept := make([]string, 0, len(fields))
-	for i := 0; i < len(fields); i++ {
-		redirection, takesOperand := redirectionWord(fields[i])
-		if !redirection {
-			kept = append(kept, fields[i])
-			continue
-		}
-		if takesOperand && i+1 < len(fields) {
-			i++
-		}
-	}
-	fields = kept
-	// STRUCTURE ANYWHERE REFUSES.
-	for _, word := range fields {
-		if structuralShellToken(strings.Trim(word, "'\"")) {
-			return phaseBucketUnknown
-		}
-	}
-	// AN EMPTY QUOTED COMMAND WORD IS NOT A COMMAND: `"" go test` exits 127 in
-	// both sh and bash without running Go, so calling it test was a false
-	// measurement (#1930 round-8 F2).
-	if len(fields) > 0 && strings.TrimSpace(strings.Trim(fields[0], "'\"")) == "" {
+	// THE ACCEPTOR DECIDES FIRST. acceptSimpleCommand validates every token
+	// against the declared grammar in review_phase_grammar.go and returns the
+	// command's words with assignments and redirections already consumed. It
+	// keeps QUOTE PROVENANCE, which the previous flow discarded before
+	// stripping redirections - so a quoted ">not-a-command" was deleted as an
+	// operator and the surviving words classified as a Go command, and an
+	// escaped redirect-looking argument vanished the same way (#1930 round-9
+	// P2 class two).
+	accepted, ok := acceptSimpleCommand(strings.TrimSpace(segment))
+	if !ok {
 		return phaseBucketUnknown
+	}
+	if len(accepted) == 0 {
+		// Assignments or redirections only: no command ran, so there is no
+		// phase to report and nothing was misread.
+		return ""
+	}
+	fields := make([]string, 0, len(accepted))
+	for _, word := range accepted {
+		fields = append(fields, strings.ToLower(word))
 	}
 	plumbing := false
 	for len(fields) > 0 {
-		raw := strings.Trim(fields[0], "'\"")
-		if strings.Contains(raw, "=") && !strings.HasPrefix(raw, "-") {
-			fields = fields[1:]
-			plumbing = true
-			continue
-		}
 		switch head := normalize(fields[0]); head {
 		case "-c", "-lc", "-lic":
 			// The next field is a COMMAND STRING, not a token: quote-aware

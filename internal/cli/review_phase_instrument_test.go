@@ -88,7 +88,11 @@ func TestClassifyPhaseCommandClassifiesEverySegment(t *testing.T) {
 		// #1824 review F2: kimi sends function arguments as JSON.
 		{"kimi json payload", `{"command":"go test ./..."}`, phaseBucketTest},
 		{"kimi json argv payload", `{"command":["go","build","./..."]}`, phaseBucketBuild},
-		{"kimi json unrelated payload", `{"path":"/tmp/x"}`, phaseBucketOther},
+		// A payload with no command key is not a command at all, and under the
+		// acceptor it refuses rather than being filed as `other` - `other`
+		// claims the text was understood and matched no phase, which is a
+		// stronger statement than this input supports.
+		{"kimi json unrelated payload", `{"path":"/tmp/x"}`, phaseBucketUnknown},
 		{"go run is neither", "go run ./cmd/gitmoot", phaseBucketOther},
 		{"unrelated", "sleep 30", phaseBucketOther},
 		{"pure plumbing", "cd /root/gm-1824", phaseBucketOther},
@@ -1205,6 +1209,103 @@ func TestPhaseInstrumentKeepsTruthfulBucketsInsideTheBoundary(t *testing.T) {
 				t.Fatalf("close: %v", err)
 			}
 			profile := readPhaseProfile(t, store, "boundary")
+			assertProfileIdentities(t, profile)
+			if profile.BucketCount[tc.want] != 1 {
+				t.Fatalf("%q landed in %v, want %s", tc.command, profile.BucketCount, tc.want)
+			}
+		})
+	}
+}
+
+// TestPhaseInstrumentRefusesUnimplementedRedirectAndExpansionForms is #1930
+// round-9 P2 class one: the boundary was still a BLACKLIST, so valid syntax it
+// simply did not implement bypassed into a confident bucket. Every construct
+// here is accepted by `bash -n`, and none of them is punctuation the old
+// character scan looked for - which is exactly why enumerating rejects failed
+// three rounds running.
+func TestPhaseInstrumentRefusesUnimplementedRedirectAndExpansionForms(t *testing.T) {
+	for _, tc := range []struct{ name, command string }{
+		{"read-write redirect", "go test ./... <>io.log"},
+		{"clobber redirect", "go test ./... >|out.log"},
+		{"appending combined redirect", "go test ./... &>>out.log"},
+		{"pipe with stderr", "go test ./... |& tee out.log"},
+		{"brace expansion", "go test ./internal/{cli,db}"},
+		{"pathname expansion", "go test ./internal/*/"},
+		{"tilde expansion", "go test ~/repo/..."},
+		{"dynamic file descriptor", "go test ./... {fd}>out.log"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			paths := config.PathsForHome(home)
+			store := seedInstrumentJob(t, paths, "unimpl", "codex-reviewer", "codex")
+			handle := openInstrumentedTranscript(t, home, "unimpl", "codex", store)
+			start, end := codexToolLines("u1", tc.command)
+			if _, err := handle.Write([]byte(start + end)); err != nil {
+				t.Fatal(err)
+			}
+			if err := handle.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+			profile := readPhaseProfile(t, store, "unimpl")
+			if profile.BucketCount[phaseBucketUnknown] != 1 {
+				t.Fatalf("%q landed in %v, want unknown - the acceptor must refuse syntax it does not implement",
+					tc.command, profile.BucketCount)
+			}
+		})
+	}
+}
+
+// TestPhaseInstrumentHonoursQuoteProvenance is #1930 round-9 P2 class two.
+// Every expectation below was MEASURED against bash rather than reasoned about,
+// because the whole class came from erasing quoting before deciding what a
+// token was:
+//
+//	PROBE=A\&B env      -> PROBE=A&B          (escaped VALUE: still an assignment)
+//	PROBE="A B" env      -> PROBE=A B          (quoted VALUE: still an assignment)
+//	"PROBE=AB" env       -> command not found  (quoted NAME: a command)
+//	"PROBE"=AB env       -> command not found
+//	not-an-assignment=x  -> command not found  (invalid identifier: a command)
+func TestPhaseInstrumentHonoursQuoteProvenance(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		command string
+		want    string
+	}{
+		// A quoted or escaped command word is a LITERAL command name. Bash
+		// invokes it and exits 127; it is not a redirection and not Go.
+		{"quoted redirect-looking command word", `">not-a-command" go test ./...`, phaseBucketUnknown},
+		{"escaped redirect-looking command word", `\>not-a-command go test ./...`, phaseBucketUnknown},
+		// A quoted or escaped ARGUMENT that looks like a redirect must be kept,
+		// not deleted - deleting it left a truncated command reported as test.
+		{"quoted redirect-looking argument", `go test ./... -run ">TestA"`, phaseBucketTest},
+		{"escaped redirect-looking argument", `go test ./... -run \>TestA`, phaseBucketTest},
+		// Assignment recognition follows the NAME's provenance.
+		{"escaped value keeps the assignment", `PROBE=A\&B go test ./...`, phaseBucketTest},
+		{"quoted value keeps the assignment", `PROBE="A B" go test ./...`, phaseBucketTest},
+		{"quoted name is a command, not an assignment", `"PROBE=AB" go test ./...`, phaseBucketUnknown},
+		{"invalid identifier is a command", "not-an-assignment=x go test ./...", phaseBucketUnknown},
+		// A redirect operand may be quoted and contain a space.
+		{"quoted redirect operand with a space", `go test ./... > "out file.log"`, phaseBucketTest},
+		// An empty quoted command word runs nothing, even after a prefix.
+		{"empty quoted command word after an assignment", `PROBE=1 "" go test ./...`, phaseBucketUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			paths := config.PathsForHome(home)
+			store := seedInstrumentJob(t, paths, "provenance", "codex-reviewer", "codex")
+			handle := openInstrumentedTranscript(t, home, "provenance", "codex", store)
+			start, end := codexToolLines("p1", tc.command)
+			if _, err := handle.Write([]byte(start)); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(15 * time.Millisecond)
+			if _, err := handle.Write([]byte(end)); err != nil {
+				t.Fatal(err)
+			}
+			if err := handle.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+			profile := readPhaseProfile(t, store, "provenance")
 			assertProfileIdentities(t, profile)
 			if profile.BucketCount[tc.want] != 1 {
 				t.Fatalf("%q landed in %v, want %s", tc.command, profile.BucketCount, tc.want)
