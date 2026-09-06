@@ -57,6 +57,14 @@ func TestClassifyPhaseCommandClassifiesEverySegment(t *testing.T) {
 		{"nice -n consumes the level", "nice -n 5 go test ./...", phaseBucketTest},
 		{"wrapper must not swallow the command", "timeout 25m git status", phaseBucketVCS},
 		{"a wrapper alone is not a phase", "timeout 25m", phaseBucketOther},
+		// #1930 review F12: whitespace-only splitting consumed just the first
+		// quoted word of a flag value, leaving its tail looking like the
+		// wrapped command - which classified as other.
+		{"quoted multi-word time format", `time -f "%e %M" go test ./...`, phaseBucketTest},
+		{"quoted multi-word sudo user", `sudo -u "display name" go test ./...`, phaseBucketTest},
+		{"quoted value with single quotes", `time -f '%e %M' go build ./...`, phaseBucketBuild},
+		{"nested shell command string", `bash -c "cd repo && go test ./..."`, phaseBucketTest},
+		{"nested shell with a mixed body", `bash -c "go test ./... && go build ./..."`, phaseBucketMixed},
 		{"time wrapper", "time go test ./...", phaseBucketTest},
 		{"test AND build is mixed, not test", "go test ./... && go build ./...", phaseBucketMixed},
 		{"build then vcs is mixed", "go build ./... && git status", phaseBucketMixed},
@@ -839,5 +847,86 @@ func TestPhaseProfileMillisecondsIsExactOnDeterministicInput(t *testing.T) {
 	// A negative excess (rounding artefact) must clamp to zero, never negative.
 	if _, _, _, over := phaseProfileMilliseconds(nil, 10*ms, 5*ms, 4*ms); over != 0 {
 		t.Fatalf("overlap = %d, want 0 rather than a negative", over)
+	}
+}
+
+// TestPhaseInstrumentResyncsAfterDroppingAnOverLongLine is #1930 review F13.
+// After the cap discards a run-on line, the REST of that line is not a line of
+// its own. Resuming normal accumulation handed the translator a fragment
+// starting mid-token; the following legitimate command must still be measured
+// and no spurious command may be invented from the discarded remainder.
+func TestPhaseInstrumentResyncsAfterDroppingAnOverLongLine(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	store := seedInstrumentJob(t, paths, "resync", "codex-reviewer", "codex")
+	handle := openInstrumentedTranscript(t, home, "resync", "codex", store)
+
+	// A run-on line that trips the cap, then its own terminator, then a real
+	// command exchange.
+	chunk := []byte(strings.Repeat("x", 64*1024))
+	for range 20 {
+		if _, err := handle.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !handle.skipToNewline {
+		t.Fatal("cap did not engage: skipToNewline is false")
+	}
+	if _, err := handle.Write([]byte("tail-of-the-dropped-line\n")); err != nil {
+		t.Fatal(err)
+	}
+	if handle.skipToNewline {
+		t.Fatal("still skipping after the dropped line ended")
+	}
+	start, end := codexToolLines("after", "go test ./...")
+	if _, err := handle.Write([]byte(start)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(25 * time.Millisecond)
+	if _, err := handle.Write([]byte(end)); err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	profile := readPhaseProfile(t, store, "resync")
+	assertProfileIdentities(t, profile)
+	if profile.Commands != 1 {
+		t.Fatalf("commands = %d, want exactly the one real command after the drop (%+v)", profile.Commands, profile)
+	}
+	if profile.BucketMS[phaseBucketTest] <= 0 {
+		t.Fatalf("test bucket = %dms, want the command that followed the drop (%+v)", profile.BucketMS[phaseBucketTest], profile)
+	}
+	if profile.DroppedBytes <= 0 {
+		t.Fatalf("dropped_bytes = %d, want the discarded run-on line recorded (%+v)", profile.DroppedBytes, profile)
+	}
+}
+
+// TestShellFieldsKeepsQuotedValuesWhole pins the splitter F12 required.
+func TestShellFieldsKeepsQuotedValuesWhole(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{"plain", "go test ./...", []string{"go", "test", "./..."}},
+		{"double quoted value", `time -f "%e %M" go test`, []string{"time", "-f", "%e %M", "go", "test"}},
+		{"single quoted value", `sudo -u 'display name' go test`, []string{"sudo", "-u", "display name", "go", "test"}},
+		{"quoted command string", `bash -c "go test ./..."`, []string{"bash", "-c", "go test ./..."}},
+		{"unterminated quote keeps the rest", `time -f "%e %M`, []string{"time", "-f", "%e %M"}},
+		{"empty", "   ", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := shellFields(tc.input)
+			if len(got) != len(tc.want) {
+				t.Fatalf("shellFields(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("shellFields(%q)[%d] = %q, want %q", tc.input, i, got[i], tc.want[i])
+				}
+			}
+		})
 	}
 }

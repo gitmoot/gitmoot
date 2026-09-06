@@ -111,10 +111,18 @@ func extractToolCommand(input string) string {
 // review F3. Segments that disagree yield `mixed`, which says "this command
 // spans phases" rather than picking one and being wrong.
 func classifyPhaseCommand(command string) string {
+	return classifyPhaseCommandDepth(command, 0)
+}
+
+// maxWrapperRecursion bounds `sh -c "sh -c ..."` nesting. Three levels is more
+// than any real agent command and terminates on hostile input.
+const maxWrapperRecursion = 3
+
+func classifyPhaseCommandDepth(command string, depth int) string {
 	segments := splitCommandSegments(extractToolCommand(command))
 	seen := ""
 	for _, segment := range segments {
-		bucket := classifyCommandSegment(segment)
+		bucket := classifyCommandSegment(segment, depth)
 		// A pure `cd`/`export` prefix is plumbing, not a phase: it must not
 		// turn `cd repo && go test` into mixed.
 		if bucket == "" {
@@ -133,22 +141,85 @@ func classifyPhaseCommand(command string) string {
 	return seen
 }
 
-// splitCommandSegments splits on shell sequencing operators. It is deliberately
-// naive about quoting: a `&&` inside a quoted string over-splits into segments
-// that classify as other, which degrades a label rather than inventing time.
+// splitCommandSegments splits on shell sequencing operators OUTSIDE quotes.
+// Quote awareness is load-bearing rather than tidy: `bash -c "cd repo && go
+// test ./..."` is ONE command whose body happens to contain `&&`, and splitting
+// inside the quotes tore the body apart before it could be re-parsed, yielding
+// `mixed` for a plain test run (#1930 review F12's fix exposed this).
 func splitCommandSegments(command string) []string {
-	fields := strings.FieldsFunc(command, func(r rune) bool { return r == '\n' || r == ';' })
-	segments := make([]string, 0, len(fields))
-	for _, field := range fields {
-		for _, part := range strings.Split(strings.ReplaceAll(field, "||", "&&"), "&&") {
-			for _, piped := range strings.Split(part, "|") {
-				if trimmed := strings.TrimSpace(piped); trimmed != "" {
-					segments = append(segments, trimmed)
-				}
+	var segments []string
+	var current strings.Builder
+	quote := rune(0)
+	runes := []rune(command)
+	flush := func() {
+		if trimmed := strings.TrimSpace(current.String()); trimmed != "" {
+			segments = append(segments, trimmed)
+		}
+		current.Reset()
+	}
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		if quote != 0 {
+			current.WriteRune(r)
+			if r == quote {
+				quote = 0
 			}
+			continue
+		}
+		switch r {
+		case '\'', '"':
+			quote = r
+			current.WriteRune(r)
+		case '\n', ';', '|':
+			// `||` and `|` both separate; the second rune of `||` simply
+			// flushes an already-empty buffer.
+			flush()
+		case '&':
+			if i+1 < len(runes) && runes[i+1] == '&' {
+				i++
+			}
+			flush()
+		default:
+			current.WriteRune(r)
 		}
 	}
+	flush()
 	return segments
+}
+
+// shellFields splits on whitespace but keeps a QUOTED value as one field, so a
+// wrapper flag whose value contains a space is consumed whole. Splitting on
+// whitespace alone left the tail of `time -f "%e %M" go test` looking like the
+// wrapped command, which then classified as other - undercounting the very
+// bucket under investigation (#1930 review F12).
+func shellFields(command string) []string {
+	var fields []string
+	var current strings.Builder
+	quote := rune(0)
+	flush := func() {
+		if current.Len() > 0 {
+			fields = append(fields, current.String())
+			current.Reset()
+		}
+	}
+	for _, r := range command {
+		switch {
+		case quote != 0:
+			if r == quote {
+				quote = 0
+				continue
+			}
+			current.WriteRune(r)
+		case r == '\'' || r == '"':
+			quote = r
+		case r == ' ' || r == '\t':
+			flush()
+		default:
+			current.WriteRune(r)
+		}
+	}
+	flush()
+	return fields
 }
 
 // consumeWrapperArguments drops a wrapper's own flags and, for wrappers that
@@ -158,11 +229,6 @@ func consumeWrapperArguments(wrapper string, fields []string) []string {
 	for len(fields) > 0 {
 		token := strings.Trim(fields[0], "'\"")
 		if strings.HasPrefix(token, "-") {
-			// `-u nobody`, `-n 5`, `-p`, `--preserve-status`, `-o L`: a flag may
-			// or may not take a value. Consume a following NON-FLAG token only
-			// when the flag is not a known standalone boolean, which keeps
-			// `time -p go test` correct (-p takes nothing) and `sudo -u nobody`
-			// correct (-u takes a user).
 			fields = fields[1:]
 			if flagTakesValue(wrapper, token) && len(fields) > 0 && !strings.HasPrefix(fields[0], "-") {
 				fields = fields[1:]
@@ -170,7 +236,6 @@ func consumeWrapperArguments(wrapper string, fields []string) []string {
 			continue
 		}
 		if wrapper == "timeout" && isDurationOperand(token) {
-			// timeout's first positional argument is a duration, not a command.
 			fields = fields[1:]
 			continue
 		}
@@ -180,7 +245,7 @@ func consumeWrapperArguments(wrapper string, fields []string) []string {
 }
 
 // flagTakesValue reports whether a wrapper flag consumes the following token.
-// Unknown flags are treated as value-taking ONLY when the wrapper is known to
+// Unknown flags are treated as value-taking ONLY where the wrapper is known to
 // use that shape, so a boolean flag never swallows the wrapped command.
 func flagTakesValue(wrapper, flag string) bool {
 	if strings.Contains(flag, "=") {
@@ -211,7 +276,7 @@ func isDurationOperand(token string) bool {
 		return false
 	}
 	body := strings.TrimRight(token, "smhd")
-	if body == "" || body == token && !isAllDigitsOrDot(token) {
+	if body == "" {
 		return false
 	}
 	return isAllDigitsOrDot(body)
@@ -239,7 +304,7 @@ func isAllDigitsOrDot(token string) bool {
 
 // classifyCommandSegment classifies one segment, or returns "" for pure
 // plumbing (cd, export, an env-only line) that should not colour the result.
-func classifyCommandSegment(segment string) string {
+func classifyCommandSegment(segment string, depth int) string {
 	normalize := func(token string) string {
 		token = strings.Trim(token, "'\"")
 		if idx := strings.LastIndex(token, "/"); idx >= 0 && idx+1 < len(token) {
@@ -247,7 +312,7 @@ func classifyCommandSegment(segment string) string {
 		}
 		return token
 	}
-	fields := strings.Fields(strings.ToLower(strings.TrimSpace(segment)))
+	fields := shellFields(strings.ToLower(strings.TrimSpace(segment)))
 	plumbing := false
 	for len(fields) > 0 {
 		raw := strings.Trim(fields[0], "'\"")
@@ -257,7 +322,18 @@ func classifyCommandSegment(segment string) string {
 			continue
 		}
 		switch head := normalize(fields[0]); head {
-		case "bash", "sh", "zsh", "env", "-c", "-lc", "-lic", "nohup":
+		case "-c", "-lc", "-lic":
+			// The next field is a COMMAND STRING, not a token: quote-aware
+			// splitting keeps `bash -c "go test ./..."` whole, so it must be
+			// re-parsed rather than matched as one word (#1930 review F12
+			// made the quoting correct and this is what correct quoting then
+			// requires).
+			if len(fields) > 1 && depth < maxWrapperRecursion {
+				return classifyPhaseCommandDepth(strings.Join(fields[1:], " "), depth+1)
+			}
+			fields = fields[1:]
+			continue
+		case "bash", "sh", "zsh", "env", "nohup":
 			fields = fields[1:]
 			continue
 		case "timeout", "time", "nice", "sudo", "xargs", "stdbuf", "ionice":
@@ -393,6 +469,9 @@ type retainedTranscript struct {
 	nonShellCalls map[string]struct{}
 	intervals     []commandInterval
 	partial       []byte
+	// skipToNewline is set after an over-long line is dropped, so the REST of
+	// that line is discarded rather than parsed as a line of its own.
+	skipToNewline bool
 	started       time.Time
 
 	bucketNS     map[string]int64
@@ -481,6 +560,16 @@ func (r *retainedTranscript) Write(p []byte) (int, error) {
 }
 
 func (r *retainedTranscript) observe(p []byte) {
+	if r.skipToNewline {
+		idx := bytes.IndexByte(p, '\n')
+		if idx < 0 {
+			r.droppedBytes += int64(len(p))
+			return
+		}
+		r.droppedBytes += int64(idx + 1)
+		p = p[idx+1:]
+		r.skipToNewline = false
+	}
 	r.partial = append(r.partial, p...)
 	if len(r.partial) > maxPartialLineBytes {
 		// Drop the oversized fragment rather than grow forever, and RECORD the
@@ -488,6 +577,14 @@ func (r *retainedTranscript) observe(p []byte) {
 		// the profile still looked complete.
 		r.droppedBytes += int64(len(r.partial))
 		r.partial = nil
+		// SKIP TO THE NEXT NEWLINE. The rest of that run-on line is not a line
+		// of its own, and resuming normal accumulation hands the translator a
+		// fragment starting mid-token (#1930 review F13). Inert today because
+		// every translator routes a parse failure to KindRaw, which consume
+		// ignores - aligned anyway with ScanSnapshot's skip-to-next-newline so
+		// it cannot become live the first time a translator grows a lenient
+		// path.
+		r.skipToNewline = true
 		return
 	}
 	// Scan the BYTES. An earlier form called string(r.partial) once per
