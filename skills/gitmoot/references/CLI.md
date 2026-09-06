@@ -168,8 +168,14 @@ Before an engine job launches, Gitmoot lazily checks the compiled runtime
 contract against the installed CLI. Required argv flags are read from bounded
 `<binary> --help` probes and environmental restrictions are declared beside the
 argv that triggers them. Results are `supported`, `unsupported`, or `unknown`:
-only a positively `unsupported` contract blocks; missing binaries, timeouts, and
-unparseable help are `unknown`, emit `runtime_contract_unknown`, and still run.
+only a positively `unsupported` contract blocks on the contract itself; missing
+binaries, timeouts, and unparseable help stay `unknown` and emit
+`runtime_contract_unknown`. A missing binary is additionally refused BEFORE any
+job row or worktree is created, but only when the dispatcher explicitly declares
+that this dispatch builds a real adapter which will exec that declared CLI and
+the execution backend runs on the local host. Injected or fake adapters, remote
+or attached backends, and present binaries all stay dispatchable, and the
+classification remains `unknown` for reporting either way.
 Parsed help results are cached by resolved executable path, size, and mtime;
 unknown results use a 60-second TTL before probing again, while an in-place CLI
 update immediately invalidates either cached result. `gitmoot doctor --json`

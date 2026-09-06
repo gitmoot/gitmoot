@@ -176,10 +176,17 @@ refusals live beside the triggering argv. A parsed help document that omits a
 required flag, or a definitively failed precondition, is `unsupported` and
 blocks with the runtime, installed version, exact requirement, and remedy. A
 missing binary, timeout, unparseable help, or undecidable precondition is
-`unknown`: Gitmoot records that fact and dispatches anyway. This fail-open
-unknown state is deliberate; inability to inspect a CLI is not proof that the
-CLI rejected the contract. Unknown binary probes use a 60-second cache TTL;
-successful probes cache by resolved path, size, and mtime without a TTL.
+`unknown`: Gitmoot records that fact rather than treating it as a refusal. This
+fail-open unknown state is deliberate; inability to inspect a CLI is not proof
+that the CLI rejected the contract. A missing binary carries one added refusal,
+and only under three explicit conditions together: the dispatcher declares that
+this dispatch builds a real adapter which will exec that declared CLI, the
+execution backend runs on the local host, and the executable does not resolve.
+That refusal lands before any job row or worktree exists, and it leaves the
+`unknown` classification intact; injected or fake adapters, remote or attached
+backends, and present binaries stay dispatchable. Unknown binary probes use a
+60-second cache TTL; successful probes cache by resolved path, size, and mtime
+without a TTL.
 Claude 2.1.223 refuses Gitmoot's exact `--permission-mode bypassPermissions`
 prompt invocation under effective uid 0, while misleadingly reporting the
 failure as `--dangerously-skip-permissions`; the precondition changes no argv

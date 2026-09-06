@@ -2,10 +2,12 @@ package cli
 
 import (
 	"context"
+	"reflect"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // refuseDispatchOnAbsentRuntimeBinary is the #1817 dispatch predicate settled by
@@ -85,3 +87,30 @@ func dispatchLocalAgentJobFromCLI(ctx context.Context, store *db.Store, request 
 // which is what "caller-supplied" has to mean when the caller is a command
 // rather than a struct literal.
 var cliDispatchExecsDeclaredBinary = true
+
+// setRealAdapterFactory records a delivery adapter factory AND the fact that it
+// builds a real adapter which execs its runtime's declared CLI binary
+// (#1926-f5).
+//
+// It stores the factory's CODE POINTER, not merely a boolean, and that is the
+// load-bearing part. AdapterFactory is an exported plain field that ~22 test
+// fixtures assign directly to inject a fake; a bare boolean set by the
+// constructor would survive that assignment and refuse an injected adapter for
+// an absence it will never reach. Measured: it did exactly that on the first
+// attempt. Binding the claim to the function it was made ABOUT means replacing
+// the factory silently withdraws the claim, which is the behaviour the injected
+// exemption requires and needs no edit to any fixture.
+func (w *jobWorker) setRealAdapterFactory(factory func(runtime.Agent, string) (workflow.DeliveryAdapter, error)) {
+	w.AdapterFactory = factory
+	w.adapterExecsDeclaredBinary = true
+	w.declaredRealAdapterPtr = reflect.ValueOf(factory).Pointer()
+}
+
+// adapterIsDeclaredReal reports whether the factory currently installed is the
+// one that was declared to exec its runtime's declared binary.
+func (w jobWorker) adapterIsDeclaredReal() bool {
+	if !w.adapterExecsDeclaredBinary || w.AdapterFactory == nil || w.declaredRealAdapterPtr == 0 {
+		return false
+	}
+	return reflect.ValueOf(w.AdapterFactory).Pointer() == w.declaredRealAdapterPtr
+}

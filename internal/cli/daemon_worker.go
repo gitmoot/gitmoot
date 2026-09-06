@@ -46,6 +46,24 @@ type jobWorker struct {
 	ConfigHomeExplicit bool
 	AgentLookup        func(context.Context, string) (db.Agent, error)
 	AdapterFactory     func(runtime.Agent, string) (workflow.DeliveryAdapter, error)
+	// adapterExecsDeclaredBinary is the daemon half of the #1817 discriminator
+	// (ledger row gitmoot/gitmoot#1926-f5): it states that AdapterFactory builds a
+	// REAL adapter which will exec the runtime's declared CLI binary.
+	//
+	// UNEXPORTED AND SET ONLY BY setRealAdapterFactory, and both properties are
+	// load-bearing. A test that injects a fake assigns AdapterFactory directly, as
+	// ~22 of them already do, so the flag keeps its zero value and the dispatch
+	// stays exempt - which is why the 24-test over-block regression stays green
+	// without a single test edit. Production goes through the setter, where the
+	// factory and the claim about it cannot drift apart.
+	//
+	// Opt-in, because the unsafe direction is refusal: a production path that
+	// forgot the setter degrades to the pre-#1817 late failure rather than
+	// refusing work that would have run.
+	adapterExecsDeclaredBinary bool
+	// declaredRealAdapterPtr is the code pointer of the factory the claim above was
+	// made about, so replacing AdapterFactory withdraws the claim automatically.
+	declaredRealAdapterPtr uintptr
 	// OutputAdapterFactory rebuilds a production runtime adapter around the
 	// shared live-output writer used by progress and retained transcript capture.
 	// Tests that inject an opaque fake AdapterFactory may leave this nil and still
@@ -173,7 +191,9 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 		configHomeExplicit = true
 	}
 	worker := jobWorker{Store: store, Stdout: serializeWrites(stdout), ConfigHome: configHome, ConfigHomeExplicit: configHomeExplicit}
-	worker.AdapterFactory = worker.defaultAdapter
+	// PRODUCTION assigns through the setter so the factory and the claim that it
+	// execs the declared binary are written together (#1926-f5).
+	worker.setRealAdapterFactory(worker.defaultAdapter)
 	worker.OutputAdapterFactory = worker.outputAdapter
 	worker.StartAdapterFactory = worker.defaultStartAdapter
 	worker.AuthProbe = worker.defaultAuthProbe
@@ -379,6 +399,25 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "runtime_contract_unknown", Message: runtime.RuntimeContractEventMessage(job.ID, agent, result)}); eventErr != nil {
 				writeLine(w.Stdout, "job %s runtime_contract_unknown event failed: %v", job.ID, eventErr)
 			}
+		}
+		// #1926-f5: THE SECOND SEAM. The check above is RETAINED UNCHANGED and
+		// blocks only a positively `unsupported` contract; an absent executable is
+		// honestly `unknown`, so it fell through the event above and ran on to
+		// review-worktree allocation and adapter construction below - which is how
+		// a delegated or daemon-created job still reproduced the original missing
+		// `claude` failure after the CLI ingress was gated.
+		//
+		// Refused here only when this worker's factory was declared REAL through
+		// setRealAdapterFactory, so an injected fake stays exempt by construction,
+		// and only for a backend on this host, decided by the same
+		// execbackend.Consume routing the preflight above already used. Absence
+		// classification is untouched: the unknown event is still recorded.
+		if err := runtime.RuntimeContractAbsentBinaryError(agent, result); err != nil && w.adapterIsDeclaredReal() {
+			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, err); finishErr != nil {
+				return finishErr
+			}
+			_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
+			return nil
 		}
 	}
 	if err := w.produceDispatchError(job.Type, agent); err != nil {

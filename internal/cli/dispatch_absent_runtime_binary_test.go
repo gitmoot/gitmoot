@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"os"
@@ -18,41 +19,65 @@ import (
 
 // absentBinaryContract is the probe answer for a runtime whose declared CLI is
 // not installed: honestly classified UNKNOWN, carrying the binary-present row
-// this dispatch predicate keys on.
-func absentBinaryContract() runtime.RuntimeContractResult {
+// the dispatch predicate keys on. Absence classification is never changed by
+// this feature, only what the caller does about it.
+func absentBinaryContract(runtimeName, binary string) runtime.RuntimeContractResult {
 	return runtime.RuntimeContractResult{
-		Runtime:    runtime.ClaudeRuntime,
+		Runtime:    runtimeName,
 		Version:    "unknown",
 		State:      runtime.RuntimeContractUnknown,
 		Instrument: "look-path",
 		Requirements: []runtime.RuntimeRequirementResult{{
 			Kind:       runtime.RuntimeRequirementBinaryPresent,
-			Name:       `executable "claude"`,
-			Source:     `runtime "claude" contract binary`,
-			Remedy:     "install claude on the host that will run this job, or dispatch it to an agent whose runtime is installed",
+			Name:       `executable "` + binary + `"`,
+			Source:     `runtime "` + runtimeName + `" contract binary`,
+			Remedy:     "install " + binary + " on the host that will run this job, or dispatch it to an agent whose runtime is installed",
 			State:      runtime.RuntimeContractUnknown,
 			Instrument: "look-path",
-			Detail:     `resolve claude: exec: "claude": executable file not found in $PATH`,
+			Detail:     `resolve ` + binary + `: exec: "` + binary + `": executable file not found in $PATH`,
 		}},
 	}
 }
 
-func stubAbsentBinaryProbe(t *testing.T) {
+// presentBinaryContract is a runtime that DOES declare a CLI binary and whose
+// binary resolves. Deliberately not ShellRuntime: shell declares no binary at
+// all, so using it as the "present" arm proves nothing about presence.
+func presentBinaryContract(runtimeName string) runtime.RuntimeContractResult {
+	return runtime.RuntimeContractResult{
+		Runtime:      runtimeName,
+		Version:      "stub 1.2.3",
+		State:        runtime.RuntimeContractSupported,
+		Instrument:   "binary-help",
+		ResolvedPath: "/usr/bin/" + runtimeName,
+	}
+}
+
+func stubForegroundProbe(t *testing.T, result runtime.RuntimeContractResult) *int {
 	t.Helper()
+	calls := 0
 	previous := localRuntimeContractPreflight
 	localRuntimeContractPreflight = func(context.Context, runtime.Agent) runtime.RuntimeContractResult {
-		return absentBinaryContract()
+		calls++
+		return result
 	}
 	t.Cleanup(func() { localRuntimeContractPreflight = previous })
+	return &calls
+}
+
+func stubForegroundAdapter(t *testing.T) {
+	t.Helper()
+	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}
+	previous := localAgentDispatchRuntimeAdapterFor
+	localAgentDispatchRuntimeAdapterFor = func(string, runtime.Agent, string) (runtime.Adapter, error) { return adapter, nil }
+	t.Cleanup(func() { localAgentDispatchRuntimeAdapterFor = previous })
 }
 
 // readOnlySeatWorktreeCount counts allocated read-only seat worktrees under the
-// dispatch home, which is the artifact the ruling requires must not exist.
+// dispatch home: the artifact that must not exist after a refusal.
 func readOnlySeatWorktreeCount(t *testing.T, home string) int {
 	t.Helper()
-	root := filepath.Join(config.PathsForHome(home).Home, "worktrees")
 	count := 0
-	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+	_ = filepath.WalkDir(filepath.Join(config.PathsForHome(home).Home, "worktrees"), func(_ string, entry os.DirEntry, err error) error {
 		if err != nil || entry == nil || !entry.IsDir() {
 			return nil //nolint:nilerr // a missing root is zero worktrees
 		}
@@ -64,100 +89,99 @@ func readOnlySeatWorktreeCount(t *testing.T, home string) int {
 	return count
 }
 
-// #1817 / ruling 123815: FOREGROUND real-adapter refusal, BEFORE any row or
-// worktree exists.
-func TestForegroundRealAdapterRefusesAbsentBinaryBeforeRowOrWorktree(t *testing.T) {
-	ctx := context.Background()
+func seedAbsentBinaryReviewRepo(t *testing.T) (*db.Store, string) {
+	t.Helper()
 	store, home := blockerE2EHome(t)
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "responder", runtime.ClaudeRuntime, "unused", []string{"review"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "responder", runtime.ClaudeRuntime, "unused", []string{"review", "ask"}, "owner/repo")
 	seedDaemonWorkerAgent(t, store, "lead", runtime.ShellRuntime, "true", []string{"implement"}, "owner/repo")
-	stubAbsentBinaryProbe(t)
+	return store, home
+}
 
-	_, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
-		RepoFlag: "owner/repo", Agent: "responder", Action: "review", Instructions: "review it",
-		PullRequest: 1926, Home: home, LeadAgent: "lead",
-		// What the production CLI entry declares.
-		ExecsDeclaredBinary: true,
-	})
-	if err == nil {
-		t.Fatal("a real-adapter dispatch with an absent runtime binary was accepted")
+// #1926-f6: THE BACKGROUND ARM, ANCHORED AT THE PRODUCTION COMMAND ENTRY.
+//
+// Driven through dispatchAgentCommand - the function `gitmoot agent review`
+// actually calls - rather than through dispatchLocalAgentJob with the flag set
+// by hand. The previous version set ExecsDeclaredBinary itself, so a mutant that
+// bypassed the production wrapper left it green.
+//
+// Background is the route that matters: the foreground contract gate is guarded
+// by !request.Background while the review arm allocates the read-only worktree
+// at enqueue, so this is where a review dispatched --background used to reach
+// allocation with no capability question asked.
+func TestProductionBackgroundReviewRefusesAbsentBinaryBeforeRowOrWorktree(t *testing.T) {
+	ctx := context.Background()
+	store, home := seedAbsentBinaryReviewRepo(t)
+	probeCalls := stubForegroundProbe(t, absentBinaryContract(runtime.ClaudeRuntime, "claude"))
+
+	var stdout, stderr bytes.Buffer
+	_, code := dispatchAgentCommand(agentRunOptions{
+		repo: "owner/repo", agent: "responder", lead: "lead", message: "review it",
+		prNumber: 1926, background: true, home: home,
+	}, "review", "", "", &stdout, &stderr)
+
+	if code == 0 {
+		t.Fatalf("production background review accepted an absent runtime binary; stdout=%s stderr=%s", stdout.String(), stderr.String())
 	}
-	for _, want := range []string{`agent "responder"`, `runtime "claude"`, `executable "claude"`, "does not resolve on PATH", "install claude"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("refusal does not name %q: %v", want, err)
+	for _, want := range []string{`runtime "claude"`, `executable "claude"`, "does not resolve on PATH", "install claude"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("production stderr does not name %q: %s", want, stderr.String())
 		}
 	}
-	jobs, listErr := store.ListJobs(ctx)
-	if listErr != nil {
-		t.Fatal(listErr)
+	if *probeCalls == 0 {
+		t.Fatal("the production route never consulted the runtime probe, so this test is not exercising the predicate")
+	}
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if len(jobs) != 0 {
-		t.Fatalf("jobs = %+v, want none: the refusal must precede row creation", jobs)
+		t.Fatalf("jobs = %+v, want none: refusal must precede row creation", jobs)
 	}
 	if n := readOnlySeatWorktreeCount(t, home); n != 0 {
-		t.Fatalf("read-only seat worktrees = %d, want 0: the refusal must precede allocation", n)
+		t.Fatalf("read-only seat worktrees = %d, want 0: refusal must precede allocation", n)
 	}
 }
 
-// BACKGROUND is the arm that actually mattered and the one the previous heads
-// could not satisfy: the foreground contract gate is guarded by
-// `!request.Background`, while the review arm allocates the read-only worktree
-// at enqueue. Every review on this box is dispatched --background, so this is
-// the real path.
-func TestBackgroundRealAdapterRefusesAbsentBinaryBeforeRowOrWorktree(t *testing.T) {
+// FOREGROUND, same production entry, no --background.
+func TestProductionForegroundAskRefusesAbsentBinaryBeforeRow(t *testing.T) {
 	ctx := context.Background()
-	store, home := blockerE2EHome(t)
-	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
-	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "responder", runtime.ClaudeRuntime, "unused", []string{"review"}, "owner/repo")
-	seedDaemonWorkerAgent(t, store, "lead", runtime.ShellRuntime, "true", []string{"implement"}, "owner/repo")
-	stubAbsentBinaryProbe(t)
+	store, home := seedAbsentBinaryReviewRepo(t)
+	stubForegroundProbe(t, absentBinaryContract(runtime.ClaudeRuntime, "claude"))
 
-	_, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
-		RepoFlag: "owner/repo", Agent: "responder", Action: "review", Instructions: "review it",
-		PullRequest: 1926, Home: home, LeadAgent: "lead", Background: true,
-		ExecsDeclaredBinary: true,
-	})
-	if err == nil {
-		t.Fatal("a BACKGROUND real-adapter dispatch with an absent runtime binary was accepted")
+	var stdout, stderr bytes.Buffer
+	_, code := dispatchAgentCommand(agentRunOptions{
+		repo: "owner/repo", agent: "responder", message: "hello", home: home,
+	}, "ask", "", "", &stdout, &stderr)
+
+	if code == 0 {
+		t.Fatalf("production foreground ask accepted an absent runtime binary; stderr=%s", stderr.String())
 	}
-	if !strings.Contains(err.Error(), "does not resolve on PATH") {
-		t.Fatalf("background refusal lost its cause: %v", err)
+	if !strings.Contains(stderr.String(), "does not resolve on PATH") {
+		t.Fatalf("foreground refusal lost its cause: %s", stderr.String())
 	}
-	jobs, listErr := store.ListJobs(ctx)
-	if listErr != nil {
-		t.Fatal(listErr)
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if len(jobs) != 0 {
-		t.Fatalf("jobs = %+v, want none: a background refusal must precede row creation", jobs)
-	}
-	if n := readOnlySeatWorktreeCount(t, home); n != 0 {
-		t.Fatalf("read-only seat worktrees = %d, want 0: a background refusal must precede allocation", n)
+		t.Fatalf("jobs = %+v, want none", jobs)
 	}
 }
 
-// NEGATIVE ARM, and the one that keeps this from repeating the 24-test
-// regression: the SAME absent binary, but the caller does not declare that it
-// will exec it - which is every dispatch that delivers through an injected
-// adapter. It must still enqueue.
+// NEGATIVE ARM: an injected adapter with the SAME absent binary must still
+// dispatch. This is the 24-test over-block regression in miniature, and it is
+// what stops the predicate from keying on absence alone.
 func TestInjectedAdapterWithAbsentBinaryStillDispatches(t *testing.T) {
 	ctx := context.Background()
-	store, home := blockerE2EHome(t)
-	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
-	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "responder", runtime.ClaudeRuntime, "unused", []string{"ask"}, "owner/repo")
-	stubAbsentBinaryProbe(t)
-
-	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}
-	previousAdapter := localAgentDispatchRuntimeAdapterFor
-	localAgentDispatchRuntimeAdapterFor = func(string, runtime.Agent, string) (runtime.Adapter, error) { return adapter, nil }
-	t.Cleanup(func() { localAgentDispatchRuntimeAdapterFor = previousAdapter })
+	store, home := seedAbsentBinaryReviewRepo(t)
+	stubForegroundProbe(t, absentBinaryContract(runtime.ClaudeRuntime, "claude"))
+	stubForegroundAdapter(t)
 
 	out, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
 		RepoFlag: "owner/repo", Agent: "responder", Action: "ask", Instructions: "hello", Home: home,
-		// Deliberately NOT set: an injected adapter execs nothing.
+		// Deliberately NOT declared: an injected adapter execs nothing.
 	})
 	if err != nil {
 		t.Fatalf("an injected adapter with an absent binary was refused: %v", err)
@@ -167,54 +191,129 @@ func TestInjectedAdapterWithAbsentBinaryStillDispatches(t *testing.T) {
 	}
 }
 
-// PRESENT binary, real adapter, everything else equal: must dispatch. Without
-// this the refusal could be keyed on the declaration alone and still pass the
-// arms above.
-func TestRealAdapterWithPresentBinaryStillDispatches(t *testing.T) {
+// PRESENT-BINARY ARM, on a runtime that actually DECLARES a binary. The prior
+// version used ShellRuntime, which declares none, so it could not distinguish
+// "present" from "not applicable" - the reviewer was right about that.
+func TestProductionDispatchWithPresentBinaryStillDispatches(t *testing.T) {
 	ctx := context.Background()
-	store, home := blockerE2EHome(t)
-	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
-	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "responder", runtime.ShellRuntime, "true", []string{"ask"}, "owner/repo")
+	store, home := seedAbsentBinaryReviewRepo(t)
+	stubForegroundProbe(t, presentBinaryContract(runtime.ClaudeRuntime))
+	stubForegroundAdapter(t)
 
-	previous := localRuntimeContractPreflight
-	localRuntimeContractPreflight = func(context.Context, runtime.Agent) runtime.RuntimeContractResult {
-		// Present and satisfied: no binary-present row at all.
-		return runtime.RuntimeContractResult{Runtime: runtime.ShellRuntime, Version: "stub 1.2.3", State: runtime.RuntimeContractSupported, Instrument: "binary-help"}
+	var stdout, stderr bytes.Buffer
+	_, code := dispatchAgentCommand(agentRunOptions{
+		repo: "owner/repo", agent: "responder", message: "hello", home: home,
+	}, "ask", "", "", &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("a PRESENT declared binary was refused by the production route; stderr=%s", stderr.String())
 	}
-	t.Cleanup(func() { localRuntimeContractPreflight = previous })
-
-	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}
-	previousAdapter := localAgentDispatchRuntimeAdapterFor
-	localAgentDispatchRuntimeAdapterFor = func(string, runtime.Agent, string) (runtime.Adapter, error) { return adapter, nil }
-	t.Cleanup(func() { localAgentDispatchRuntimeAdapterFor = previousAdapter })
-
-	if _, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
-		RepoFlag: "owner/repo", Agent: "responder", Action: "ask", Instructions: "hello", Home: home,
-		ExecsDeclaredBinary: true,
-	}); err != nil {
-		t.Fatalf("a present binary was refused: %v", err)
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) == 0 {
+		t.Fatal("a present binary produced no job")
 	}
 }
 
-// DAEMON CLAIM BEHAVIOUR, driven through the worker's real claim path rather
-// than through the predicate helper (ruling 123815).
-//
-// The daemon gate is RETAINED UNCHANGED by this correction, and this test pins
-// what that means: with the declared binary absent, the claim still DELIVERS -
-// it does not block - and it records the honest runtime_contract_unknown fact.
-// That is the behaviour the 24-test regression proved is required, because a
-// claimed job's delivery may go through an adapter that never execs the binary.
-// The refusal belongs at enqueue, which the two arms above cover.
-func TestDaemonClaimWithAbsentBinaryStillDeliversAndRecordsUnknown(t *testing.T) {
+// REMOTE BACKEND, and this arm now CONSUMES the resolver override it installs.
+// The previous version installed localAgentDispatchExecBackendFor and then
+// passed execbackend.Remote straight to the predicate, so the override was
+// decorative and a broken backend resolver would not have been caught.
+func TestProductionRemoteBackendWithAbsentLocalBinaryIsNotRefused(t *testing.T) {
+	store, home := seedAbsentBinaryReviewRepo(t)
+	probeCalls := stubForegroundProbe(t, absentBinaryContract(runtime.ClaudeRuntime, "claude"))
+
+	previousBackend := localAgentDispatchExecBackendFor
+	resolverCalls := 0
+	localAgentDispatchExecBackendFor = func(string) (execbackend.Backend, error) {
+		resolverCalls++
+		return execbackend.Remote, nil
+	}
+	t.Cleanup(func() { localAgentDispatchExecBackendFor = previousBackend })
+
+	var stdout, stderr bytes.Buffer
+	_, _ = dispatchAgentCommand(agentRunOptions{
+		repo: "owner/repo", agent: "responder", message: "hello", background: true, home: home,
+	}, "ask", "", "", &stdout, &stderr)
+
+	if resolverCalls == 0 {
+		t.Fatal("the backend resolver override was never consumed, so this test says nothing about backend routing")
+	}
+	// The absence must NOT be the reason anything failed: a remote backend's
+	// binary lives on another host, so the local probe answers about the wrong
+	// machine and must not even be consulted.
+	if strings.Contains(stderr.String(), "does not resolve on PATH") {
+		t.Fatalf("a remote-backend dispatch was refused on a LOCAL binary absence: %s", stderr.String())
+	}
+	if *probeCalls != 0 {
+		t.Fatalf("local binary probe ran %d times for a REMOTE backend; that answer is about the wrong host", *probeCalls)
+	}
+	_ = store
+}
+
+// #1926-f5: THE DAEMON CLAIM ROUTE, REAL ADAPTER, driven through the worker as
+// it actually claims. This is the seam the previous head left open: a delegated
+// or daemon-created job reached adapter construction with an absent executable
+// and reproduced the original missing-claude failure.
+func TestDaemonClaimRealAdapterRefusesAbsentBinary(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
 	checkout := t.TempDir()
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 	seedDaemonWorkerAgent(t, store, "lead", runtime.ClaudeRuntime, "unused", []string{"implement"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
-		ID: "job-absent-binary", Agent: "lead", Action: "implement", Repo: "owner/repo",
-		Branch: "task-1", PullRequest: 31, GoalID: "goal-1", TaskID: "task-1", TaskTitle: "Task 1",
+		ID: "job-daemon-absent", Agent: "lead", Action: "implement", Repo: "owner/repo",
+		Branch: "task-1", PullRequest: 41, GoalID: "goal-1", TaskID: "task-1", TaskTitle: "Task 1",
+	})
+
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	worker.CommenterFactory = func(string) github.Client { return &cliPollFakeGitHub{} }
+	worker.RuntimePreflight = func(context.Context, runtime.Agent, runtime.RuntimeContractRequest) runtime.RuntimeContractResult {
+		return absentBinaryContract(runtime.ClaudeRuntime, "claude")
+	}
+	// NOTE: AdapterFactory is left as defaultJobWorker set it, through
+	// setRealAdapterFactory, so this worker declares a REAL adapter. That is the
+	// whole point of the arm.
+
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+	job, err := store.GetJob(ctx, "job-daemon-absent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.State != string(workflow.JobBlocked) {
+		t.Fatalf("job state = %q, want blocked: a real daemon adapter with an absent executable must be refused at claim", job.State)
+	}
+	events, err := store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ABSENCE CLASSIFICATION PRESERVED: the honest unknown fact is still recorded
+	// alongside the refusal, not replaced by it.
+	if !daemonWorkerHasEvent(events, "runtime_contract_unknown") {
+		t.Fatalf("events = %+v, want runtime_contract_unknown retained beside the refusal", events)
+	}
+}
+
+// NEGATIVE ARM ON THE SAME SEAM: an INJECTED daemon adapter with the same absent
+// binary must still deliver. A test that injects assigns AdapterFactory
+// directly, which is exactly what the ~22 existing fixtures do, so the
+// discriminator stays false and they keep working unmodified.
+func TestDaemonClaimInjectedAdapterWithAbsentBinaryStillDelivers(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	seedDaemonWorkerAgent(t, store, "lead", runtime.ClaudeRuntime, "unused", []string{"implement"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "job-daemon-injected", Agent: "lead", Action: "implement", Repo: "owner/repo",
+		Branch: "task-1", PullRequest: 42, GoalID: "goal-1", TaskID: "task-1", TaskTitle: "Task 1",
 	})
 
 	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}
@@ -222,102 +321,46 @@ func TestDaemonClaimWithAbsentBinaryStillDeliversAndRecordsUnknown(t *testing.T)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		return checkout, nil
 	}
+	// Direct assignment, as every injecting fixture does: no real-adapter claim.
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) { return adapter, nil }
 	worker.CommenterFactory = func(string) github.Client { return &cliPollFakeGitHub{} }
-	// The claim-time probe reports the same honest absence the enqueue predicate
-	// keys on. The daemon must NOT turn that into a refusal.
 	worker.RuntimePreflight = func(context.Context, runtime.Agent, runtime.RuntimeContractRequest) runtime.RuntimeContractResult {
-		return absentBinaryContract()
+		return absentBinaryContract(runtime.ClaudeRuntime, "claude")
 	}
 
 	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
 		t.Fatalf("runQueuedJobs returned error: %v", err)
 	}
-
-	job, err := store.GetJob(ctx, "job-absent-binary")
+	job, err := store.GetJob(ctx, "job-daemon-injected")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if job.State == string(workflow.JobBlocked) {
-		t.Fatalf("the daemon claim BLOCKED on an absent binary; that is the 24-test regression, and the refusal belongs at enqueue")
+		t.Fatal("an INJECTED daemon adapter was refused for an absence it will never hit; that is the 24-test over-block regression")
 	}
 	if job.State != string(workflow.JobSucceeded) {
-		t.Fatalf("job state = %q, want succeeded: an injected adapter execs nothing and must still deliver", job.State)
-	}
-	events, err := store.ListJobEvents(ctx, job.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !daemonWorkerHasEvent(events, "runtime_contract_unknown") {
-		t.Fatalf("events = %+v, want runtime_contract_unknown: absence must still be recorded honestly", events)
+		t.Fatalf("job state = %q, want succeeded", job.State)
 	}
 }
 
-// THE PRODUCTION ENTRY MUST DECLARE THE REAL ADAPTER, and this is the arm that
-// pins it. Every test above supplies ExecsDeclaredBinary itself, so all of them
-// stay green if the production request builder stops setting it - measured: a
-// mutant flipping agent.go's declaration to false SURVIVED the whole set until
-// this test existed. An opt-in flag that production forgets is a gate that
-// never fires, which is the quietest way for this fix to become inert.
-func TestProductionDispatchEntryDeclaresRealAdapter(t *testing.T) {
-	ctx := context.Background()
-	store, home := blockerE2EHome(t)
-	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
-	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "responder", runtime.ClaudeRuntime, "unused", []string{"ask"}, "owner/repo")
-	stubAbsentBinaryProbe(t)
-
-	// Through the PRODUCTION wrapper, with the declaration deliberately absent
-	// from the request: the wrapper must supply it, so this refuses.
-	_, err := dispatchLocalAgentJobFromCLI(ctx, store, localAgentDispatchRequest{
-		RepoFlag: "owner/repo", Agent: "responder", Action: "ask", Instructions: "hello", Home: home,
-	})
-	if err == nil || !strings.Contains(err.Error(), "does not resolve on PATH") {
-		t.Fatalf("the production dispatch entry did not declare the real adapter, so the absent-binary gate can never fire from the CLI: err=%v", err)
+// The production worker constructor must declare its adapter real. Without this
+// the daemon seam is inert: a mutant reverting setRealAdapterFactory to a plain
+// assignment leaves every arm above green except this one.
+func TestProductionWorkerDeclaresRealAdapter(t *testing.T) {
+	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard)
+	if !worker.adapterIsDeclaredReal() {
+		t.Fatal("defaultJobWorker did not declare its adapter real, so the daemon absent-binary seam can never fire in production")
+	}
+	// And the claim must be BOUND to that factory: replacing it withdraws the
+	// claim, which is what keeps ~22 injecting fixtures exempt without edits.
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) { return nil, nil }
+	if worker.adapterIsDeclaredReal() {
+		t.Fatal("replacing AdapterFactory left the real-adapter claim standing; an injected fake would be refused for an absence it never reaches")
 	}
 }
 
-// REMOTE/ATTACHED EXECUTION MUST REMAIN DISPATCHABLE: the binary lives on the
-// other host, so a local PATH probe answers about the wrong machine. Pinned
-// because a mutant that ignored the backend discriminator survived without it.
-func TestRemoteBackendWithAbsentLocalBinaryStillDispatches(t *testing.T) {
-	previousBackend := localAgentDispatchExecBackendFor
-	localAgentDispatchExecBackendFor = func(string) (execbackend.Backend, error) { return execbackend.Remote, nil }
-	t.Cleanup(func() { localAgentDispatchExecBackendFor = previousBackend })
-
-	agent := runtime.Agent{Name: "responder", Runtime: runtime.ClaudeRuntime}
-	previousProbe := localRuntimeContractPreflight
-	localRuntimeContractPreflight = func(context.Context, runtime.Agent) runtime.RuntimeContractResult {
-		return absentBinaryContract()
-	}
-	t.Cleanup(func() { localRuntimeContractPreflight = previousProbe })
-
-	probes := 0
-	localRuntimeContractPreflight = func(context.Context, runtime.Agent) runtime.RuntimeContractResult {
-		probes++
-		return absentBinaryContract()
-	}
-
-	if err := refuseDispatchOnAbsentRuntimeBinary(context.Background(), execbackend.Remote, agent, true); err != nil {
-		t.Fatalf("a remote-backend dispatch was refused on a LOCAL binary absence: %v", err)
-	}
-	// THE MECHANISM, not just the outcome: a remote backend must not even ask the
-	// local PATH, because that answer is about the wrong machine.
-	if probes != 0 {
-		t.Fatalf("the local binary probe ran %d times for a REMOTE backend; it answers about the wrong host", probes)
-	}
-	// CONTROL, so the assertion above cannot pass because the probe is broken:
-	// the same predicate on a LOCAL backend does probe, and does refuse.
-	if err := refuseDispatchOnAbsentRuntimeBinary(context.Background(), execbackend.Local, agent, true); err == nil {
-		t.Fatal("the local arm did not refuse, so the remote assertion proves nothing")
-	}
-	if probes != 1 {
-		t.Fatalf("local probe invocations = %d, want 1", probes)
-	}
-}
-
-// declareNoRealAdapterExec marks this test as one that drives a CLI dispatch
-// entry WITHOUT ever execing a runtime binary (#1817). Its subject is dispatch
+// declareNoRealAdapterExec marks a test as one that drives a CLI dispatch entry
+// WITHOUT ever execing a runtime binary (#1817). Its subject is dispatch
 // bookkeeping, and the runner it must pass on has no runtime CLIs installed, so
 // the production declaration would refuse it for an absence that never matters.
 func declareNoRealAdapterExec(t *testing.T) {
