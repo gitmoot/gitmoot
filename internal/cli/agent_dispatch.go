@@ -90,6 +90,18 @@ type localAgentDispatchRequest struct {
 	WorkflowID     string
 	ActingOrgRole  string
 	OperatorOrigin bool
+	// ExecsDeclaredBinary is EXPLICIT and CALLER-SUPPLIED (#1817, ruling 123815):
+	// the dispatch entry declares that this request will build a REAL runtime
+	// adapter which execs its runtime's declared CLI binary. It is deliberately
+	// OPT-IN and never inferred inside preflight.
+	//
+	// Opt-in rather than opt-out because the unsafe direction is refusal. Only
+	// the production CLI entry sets it, so any caller that constructs a request
+	// directly - every test that injects a fake adapter - is dispatchable by
+	// omission and the gate cannot reject valid input by being forgotten. A
+	// production path that forgets it degrades to the pre-#1817 late failure,
+	// which is the safe way to be wrong.
+	ExecsDeclaredBinary bool
 	// Runtime, when non-empty, is the per-job runtime override (#531): this one
 	// job runs through the named runtime while the agent's registered default
 	// runtime (and its session) stays untouched. RuntimeSession optionally names
@@ -338,6 +350,21 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			}
 			foregroundContract = &result
 		}
+	}
+	// #1817 / ruling 123815: REFUSE BEFORE WORKTREE ALLOCATION, and only when all
+	// three facts hold - a real adapter that will exec the declared binary, an
+	// execution backend on THIS host, and that executable absent.
+	//
+	// IT MUST SIT ABOVE THIS SWITCH. The review arm below allocates the read-only
+	// worktree at ENQUEUE, and the foreground contract gate above is guarded by
+	// `!request.Background` - so a --background review, which is how every review
+	// on this box is dispatched, previously reached allocation with no capability
+	// question asked at all. Measured on job
+	// local-review-omprouter-review-sol-18d2b4c9ccd0cb15: readonly_worktree_allocated
+	// at 10:33:00, sixteen minutes before the daemon claimed it. The daemon claim
+	// gate is retained unchanged as the second line.
+	if err := refuseDispatchOnAbsentRuntimeBinary(ctx, execBackend, effectiveAgent, request.ExecsDeclaredBinary); err != nil {
+		return localAgentJobOutput{}, err
 	}
 	switch request.Action {
 	case "review":

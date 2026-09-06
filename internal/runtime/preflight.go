@@ -475,6 +475,28 @@ func RuntimeContractDispatchError(agent Agent, result RuntimeContractResult) err
 	return fmt.Errorf("runtime preflight blocked agent %q: runtime %q installed version %q has an unsupported contract; remedy: run the job on a runtime whose installed CLI satisfies its declared contract", agent.Name, result.Runtime, result.Version)
 }
 
+// RuntimeContractAbsentBinaryError reports the runtime's declared executable as
+// missing, or nil when the result records no such absence (#1817, ruling
+// 123815).
+//
+// IT DECIDES NOTHING ABOUT WHETHER TO REFUSE. Absence alone is not the deciding
+// fact: a dispatch that delivers through an injected adapter, or whose execution
+// backend is another host, never execs this binary and must stay dispatchable.
+// Establishing that is the CALLER's job, supplied explicitly at the dispatch
+// site; this function only renders the absence it was handed. That split is the
+// ruling's requirement and it is also what keeps the old over-blocking form
+// from being reachable from here.
+func RuntimeContractAbsentBinaryError(agent Agent, result RuntimeContractResult) error {
+	for _, requirement := range result.Requirements {
+		if requirement.Kind != RuntimeRequirementBinaryPresent {
+			continue
+		}
+		return fmt.Errorf("dispatch refused for agent %q: runtime %q will exec %s on this host and it does not resolve on PATH (%s); remedy: %s",
+			agent.Name, result.Runtime, requirement.Name, requirement.Detail, requirement.Remedy)
+	}
+	return nil
+}
+
 func RuntimeContractEventMessage(jobID string, agent Agent, result RuntimeContractResult) string {
 	payload := struct {
 		JobID string `json:"job_id"`

@@ -146,7 +146,7 @@ func runAgentAsk(args []string, stdout, stderr io.Writer) int {
 	var output localAgentJobOutput
 	if err := withStore(options.home, func(store *db.Store) error {
 		var err error
-		output, err = dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
+		output, err = dispatchLocalAgentJobFromCLI(context.Background(), store, localAgentDispatchRequest{
 			RepoFlag:             options.repo,
 			Agent:                options.agent,
 			Action:               "ask",
@@ -567,7 +567,7 @@ func dispatchAgentCommand(options agentRunOptions, action string, reason string,
 		request.DispatchWarning = func(warning string) {
 			fmt.Fprintf(stderr, "%s: warning: %s\n", errLabel, warning)
 		}
-		output, err = dispatchLocalAgentJob(dispatchCtx, store, request)
+		output, err = dispatchLocalAgentJobFromCLI(dispatchCtx, store, request)
 		return err
 	}); err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", errLabel, err)

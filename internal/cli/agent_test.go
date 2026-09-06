@@ -1445,6 +1445,7 @@ func TestRunAgentAskBackgroundJSON(t *testing.T) {
 }
 
 func TestRunAgentTypeSetListShowAndManagedBackgroundAsk(t *testing.T) {
+	declareNoRealAdapterExec(t)
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -1800,6 +1801,7 @@ func TestDispatchForegroundAskUnknownNameStillErrors(t *testing.T) {
 }
 
 func TestDispatchManagedAgentStartsFreshInstanceWhenPolicyChanges(t *testing.T) {
+	declareNoRealAdapterExec(t)
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
