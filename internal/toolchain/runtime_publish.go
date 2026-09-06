@@ -173,22 +173,6 @@ func (s *stageSource) copyInto(destination *os.Root, staging string) error {
 	return nil
 }
 
-// publishedDigest recomputes the length-framed digest of an ALREADY PUBLISHED
-// tree using the same descriptor-bound, symlink-refusing traversal.
-//
-// This is what a rename loser and every reuse must satisfy (#1921 panel class 3
-// and directive 122816): the previous code returned success after an Lstat of
-// the winner's directory, so a seat could proceed against a tree this process
-// never validated - the host-fallthrough the whole change exists to end.
-func publishedDigest(publishedPath string, entrypoint string) (string, error) {
-	source, err := openStageSource(publishedPath, entrypoint, true)
-	if err != nil {
-		return "", err
-	}
-	defer source.close()
-	return source.digest()
-}
-
 // readRecordedDigests reads the two values recorded beside a published tree:
 // the digest of its members, and the fingerprint it was published under. They
 // differ when a script runtime's identity folds in its staged interpreter, and
