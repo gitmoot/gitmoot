@@ -1081,6 +1081,12 @@ func TestPhaseInstrumentRefusesUnsupportedSyntaxOnABareKimiPayload(t *testing.T)
 		{"unquoted command substitution refuses", "go test $(go list ./...)", phaseBucketUnknown},
 		{"unquoted parameter expansion refuses", "${TOOL} test ./...", phaseBucketUnknown},
 		{"plain command still classifies", "go test ./internal/cli/", phaseBucketTest},
+		// REAL NEWLINES arrive here: kimi sends the command as a JSON string,
+		// so a comment ends at the newline and the next line is another
+		// command - exactly what bash does with an unescaped newline.
+		{"comment ends at a real newline", "# note\ngo test ./...", phaseBucketTest},
+		{"two lines are two phases", "go test ./... # first\ngit status", phaseBucketMixed},
+		{"leading output redirect", ">out.log go test ./...", phaseBucketTest},
 		{"redirect idiom still classifies", "go test ./... 2>&1", phaseBucketTest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1105,6 +1111,103 @@ func TestPhaseInstrumentRefusesUnsupportedSyntaxOnABareKimiPayload(t *testing.T)
 			assertProfileIdentities(t, profile)
 			if profile.BucketCount[tc.want] != 1 {
 				t.Fatalf("bare kimi payload %q landed in %v, want %s", tc.command, profile.BucketCount, tc.want)
+			}
+		})
+	}
+}
+
+// TestPhaseInstrumentRefusesUnrecognisedCompoundCommands is #1930 round-8 f22,
+// and it is the case my previous coverage could not make: every unknown arm I
+// had exercised a branch the BLACKLIST already enumerated, so nine mutant kills
+// proved the blacklist worked and said nothing about the boundary. These
+// constructs are spelled entirely in ordinary words - no '$', no backquote, no
+// '(' in most of them - so a character-level blacklist cannot see them at all.
+// They are chosen from the shell grammar rather than from my own detector, and
+// `sh -n` accepts every corresponding program.
+func TestPhaseInstrumentRefusesUnrecognisedCompoundCommands(t *testing.T) {
+	for _, tc := range []struct{ name, command string }{
+		{"brace group", "{ go test ./... ; }"},
+		{"if compound", "if go build ./...; then go test ./...; fi"},
+		{"for loop", "for p in ./internal/...; do go test $p; done"},
+		{"while loop", "while go test ./...; do go build ./...; done"},
+		{"until loop", "until go test ./...; do go build ./...; done"},
+		{"negation", "! go test ./..."},
+		{"function definition", "run() { go test ./...; }"},
+		{"double-bracket test", "[[ -f go.mod ]] && go test ./..."},
+		{"exec", "exec go test ./..."},
+		{"command builtin", "command go test ./..."},
+		{"eval", "eval go test ./..."},
+		{"source", "source env.sh && go test ./..."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			paths := config.PathsForHome(home)
+			store := seedInstrumentJob(t, paths, "compound", "codex-reviewer", "codex")
+			handle := openInstrumentedTranscript(t, home, "compound", "codex", store)
+			start, end := codexToolLines("c1", tc.command)
+			if _, err := handle.Write([]byte(start + end)); err != nil {
+				t.Fatal(err)
+			}
+			if err := handle.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+			profile := readPhaseProfile(t, store, "compound")
+			if profile.BucketCount[phaseBucketUnknown] != 1 {
+				t.Fatalf("%q landed in %v, want unknown - a construct outside the declared grammar must refuse, not receive a confident bucket",
+					tc.command, profile.BucketCount)
+			}
+		})
+	}
+}
+
+// TestPhaseInstrumentKeepsTruthfulBucketsInsideTheBoundary is #1930 round-8
+// f23: these are all INSIDE the grammar I advertised, so each wrong answer was
+// a false measurement rather than missing coverage.
+func TestPhaseInstrumentKeepsTruthfulBucketsInsideTheBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		command string
+		want    string
+	}{
+		// Redirections are permitted anywhere in a simple command.
+		{"leading output redirect", ">out.log go test ./...", phaseBucketTest},
+		{"redirect between command and argument", "go >out.log test ./...", phaseBucketTest},
+		{"leading input redirect", "<input.txt go test ./...", phaseBucketTest},
+		{"appending redirect", ">>out.log go build ./...", phaseBucketBuild},
+		// COMMENTS UNDER THE CODEX WRAPPER, verified against real bash rather
+		// than assumed. Codex builds its command with Go's %q, which escapes a
+		// newline as the two characters backslash-n, and inside double quotes
+		// bash treats that as literal text - so the comment swallows the rest
+		// of the line and only the first command runs. Measured:
+		//   bash -lc "echo RAN-GO # first\ngit status"  -> prints RAN-GO only
+		//   bash -lc $'echo RAN-GO # first\necho RAN-GIT' -> prints both
+		// The reviewer's counterexamples describe the REAL-newline form, which
+		// reaches production through kimi's bare payload and is asserted there.
+		{"trailing comment swallows an escaped newline", "go test ./... # first\ngit status", phaseBucketTest},
+		{"comment-only command has no phase", "# note\ngo test ./...", phaseBucketOther},
+		// An empty quoted command word runs nothing at all.
+		{"empty quoted command word", `"" go test ./...`, phaseBucketUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			paths := config.PathsForHome(home)
+			store := seedInstrumentJob(t, paths, "boundary", "codex-reviewer", "codex")
+			handle := openInstrumentedTranscript(t, home, "boundary", "codex", store)
+			start, end := codexToolLines("b1", tc.command)
+			if _, err := handle.Write([]byte(start)); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(15 * time.Millisecond)
+			if _, err := handle.Write([]byte(end)); err != nil {
+				t.Fatal(err)
+			}
+			if err := handle.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+			profile := readPhaseProfile(t, store, "boundary")
+			assertProfileIdentities(t, profile)
+			if profile.BucketCount[tc.want] != 1 {
+				t.Fatalf("%q landed in %v, want %s", tc.command, profile.BucketCount, tc.want)
 			}
 		})
 	}

@@ -142,6 +142,12 @@ func classifyPhaseCommandDepth(command string, depth int) string {
 		if bucket == "" {
 			continue
 		}
+		if bucket == phaseBucketUnknown {
+			// One unclassifiable segment makes the whole command
+			// unclassifiable: reporting the rest would attribute a run whose
+			// shape this lexer does not model.
+			return phaseBucketUnknown
+		}
 		switch {
 		case seen == "":
 			seen = bucket
@@ -210,6 +216,17 @@ func splitCommandSegments(command string) []string {
 			current.WriteRune(r)
 		case '#':
 			if afterWhitespace() {
+				// A comment ends at the NEWLINE, not at the command. Returning
+				// here discarded every later line, so `go test # note` followed
+				// by `git status` reported one phase where two ran (#1930
+				// round-8 F2).
+				flush()
+				for i+1 < len(runes) && runes[i+1] != '\n' {
+					i++
+				}
+				continue
+			}
+			if false {
 				// A COMMENT IS NOT A COMMAND. Everything after an unquoted '#'
 				// at a token boundary is text, and an '&' inside it is not an
 				// operator (#1930 review f20).
@@ -258,11 +275,15 @@ func shellFields(command string) []string {
 	quote := rune(0)
 	escaped := false
 	runes := []rune(command)
+	quoted := false
 	flush := func() {
-		if current.Len() > 0 {
+		// A QUOTED word survives even when empty, so the classifier can refuse
+		// it; dropping it made `"" go test` read as a Go test run.
+		if current.Len() > 0 || quoted {
 			fields = append(fields, current.String())
 			current.Reset()
 		}
+		quoted = false
 	}
 	for _, r := range runes {
 		if escaped {
@@ -288,6 +309,7 @@ func shellFields(command string) []string {
 			current.WriteRune(r)
 		case r == '\'' || r == '"':
 			quote = r
+			quoted = true
 		case r == ' ' || r == '\t':
 			flush()
 		default:
@@ -389,6 +411,34 @@ func classifyCommandSegment(segment string, depth int) string {
 		return token
 	}
 	fields := shellFields(strings.ToLower(strings.TrimSpace(segment)))
+	// STRIP REDIRECTIONS WHEREVER THEY APPEAR. The declared grammar permits
+	// them before, between and after words, so `>out.log go test` and
+	// `go >out.log test` are both simple commands; removing them only after the
+	// command word left both classified as other (#1930 round-8 F2).
+	kept := make([]string, 0, len(fields))
+	for i := 0; i < len(fields); i++ {
+		redirection, takesOperand := redirectionWord(fields[i])
+		if !redirection {
+			kept = append(kept, fields[i])
+			continue
+		}
+		if takesOperand && i+1 < len(fields) {
+			i++
+		}
+	}
+	fields = kept
+	// STRUCTURE ANYWHERE REFUSES.
+	for _, word := range fields {
+		if structuralShellToken(strings.Trim(word, "'\"")) {
+			return phaseBucketUnknown
+		}
+	}
+	// AN EMPTY QUOTED COMMAND WORD IS NOT A COMMAND: `"" go test` exits 127 in
+	// both sh and bash without running Go, so calling it test was a false
+	// measurement (#1930 round-8 F2).
+	if len(fields) > 0 && strings.TrimSpace(strings.Trim(fields[0], "'\"")) == "" {
+		return phaseBucketUnknown
+	}
 	plumbing := false
 	for len(fields) > 0 {
 		raw := strings.Trim(fields[0], "'\"")
@@ -423,7 +473,10 @@ func classifyCommandSegment(segment string, depth int) string {
 			fields = fields[1:]
 			fields = consumeWrapperArguments(head, fields)
 			continue
-		case "cd", "export", "pushd", "popd", "source", "mkdir", "rm", "cp", "mv", "echo", "set":
+		case "cd", "export", "pushd", "popd", "mkdir", "rm", "cp", "mv", "echo", "set":
+			// `source` is deliberately NOT here: it runs another file, which
+			// can change PATH and therefore which binary a later word means,
+			// so it belongs to the refusing set (#1930 round-8 f22).
 			return ""
 		case "grep", "rg", "awk", "sed", "head", "tail", "cut", "tr", "sort", "uniq", "wc", "tee", "jq", "cat":
 			// A pipeline consumer is a FILTER on another command's output, not
@@ -439,6 +492,9 @@ func classifyCommandSegment(segment string, depth int) string {
 			return ""
 		}
 		return phaseBucketOther
+	}
+	if reservedShellWord(normalize(fields[0])) {
+		return phaseBucketUnknown
 	}
 	head := normalize(fields[0])
 	sub := ""

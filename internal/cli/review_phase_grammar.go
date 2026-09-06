@@ -1,5 +1,7 @@
 package cli
 
+import "strings"
+
 // SUPPORTED GRAMMAR - the explicit boundary ruling 123815 required.
 //
 // The phase classifier is a cheap lexer, deliberately NOT a shell parser. It
@@ -26,6 +28,78 @@ package cli
 // instrument whose purpose is attribution a wrong bucket is worse than an
 // absent one. Unknown time is still counted in covered_ms, so refusing to
 // classify narrows the claim without demoting the signal.
+// reservedShellWord reports whether a COMMAND WORD is shell syntax or a
+// builtin whose effect this lexer cannot model, rather than a command whose
+// phase can be read from its name.
+//
+// This is the ACCEPTOR half of the boundary, and it is why the first version
+// was unsound: unsupportedShellContext is a character-level blacklist, so a
+// construct spelled entirely in ordinary words - a brace group, if/for/while,
+// negation, a function definition, [[...]], exec, command - slid past it and
+// received a confident bucket. "Everything else yields unknown" cannot be
+// enforced by enumerating punctuation (#1930 round-8 F1).
+//
+// IT IS CHECKED AT THE COMMAND-WORD POSITION ONLY. Several of these words are
+// ordinary arguments elsewhere - `go test` has `test` as its subcommand, and
+// `git add .` ends in a dot - so scanning every word for them would refuse the
+// commands this instrument exists to measure.
+func reservedShellWord(word string) bool {
+	switch word {
+	case "if", "then", "else", "elif", "fi",
+		"for", "while", "until", "do", "done", "select",
+		"case", "esac",
+		"function", "coproc",
+		"exec", "command", "eval", "builtin", "source", ".",
+		"return", "break", "continue", "trap",
+		"declare", "typeset", "local", "readonly", "unset", "alias", "unalias":
+		return true
+	}
+	// A function definition reads `name() { ... }`, with the parenthesis
+	// attached to the name.
+	return strings.HasSuffix(word, "()")
+}
+
+// structuralShellToken reports whether a token is shell STRUCTURE wherever it
+// appears, so a compound command is refused even when its keyword is not the
+// first word: `! go test`, `{ go test; }` and `[[ -f x ]] && go test` are all
+// outside the declared simple-command grammar.
+func structuralShellToken(word string) bool {
+	switch word {
+	case "{", "}", "!", "[[", "]]", "(", ")", "then", "else", "elif", "fi", "do", "done", "esac":
+		return true
+	}
+	return false
+}
+
+// redirectionWord reports whether a token is a redirection rather than an
+// argument, and whether its operand is a SEPARATE following token. The declared
+// grammar permits redirections anywhere in a simple command - `>out.log go
+// test` and `go >out.log test` are both valid - so they must be removed
+// wherever they appear, not only after the command word (#1930 round-8 F2).
+func redirectionWord(word string) (redirection bool, takesOperand bool) {
+	// A REDIRECTION IS A SINGLE WORD. Codex delivers the wrapped command as one
+	// QUOTED field, so `bash -lc ">out.log go test ./..."` arrives as a token
+	// that begins with '>' and contains the whole command - treating it as a
+	// redirection deleted the command outright (#1930 round-8 F2, found by my
+	// own fix rather than by the reviewer).
+	if strings.ContainsAny(word, " \t\n") {
+		return false, false
+	}
+	trimmed := strings.TrimLeft(word, "0123456789")
+	switch {
+	case strings.HasPrefix(trimmed, ">>"), strings.HasPrefix(trimmed, ">"),
+		strings.HasPrefix(trimmed, "<"), strings.HasPrefix(word, "&>"):
+	default:
+		return false, false
+	}
+	body := strings.TrimLeft(trimmed, "<>&")
+	if strings.HasPrefix(word, "&>") {
+		body = strings.TrimLeft(strings.TrimPrefix(word, "&>"), ">")
+	}
+	// `>out.log` carries its own operand; a bare `>` takes the next token.
+	return true, strings.TrimSpace(body) == ""
+}
+
 func unsupportedShellContext(command string) (string, bool) {
 	const (
 		backslash   = '\\'
