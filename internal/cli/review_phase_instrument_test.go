@@ -1595,3 +1595,61 @@ func TestPhaseInstrumentTreatsInterpreterOperandsAsScripts(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
 	}
 }
+
+// TestPhaseInstrumentHonoursInterpreterOptionState is #1930 round-13 F1, the
+// FOURTH round of one class: per-token option heuristics producing confident
+// buckets in both directions. Every expectation below is a real shell
+// measurement, run before the code was written:
+//
+//	bash -- -c "go version"                 exit 127, no Go
+//	sh   -- -c "go version"                 exit 2,   no Go
+//	bash -zc "go version"                   exit 2,   no Go
+//	sh   -zc "go version"                   exit 2,   no Go
+//	nohup   -c "go version"                 exit 127, no Go
+//	bash --rcfile /dev/null -c "go version" exit 0,   Go RAN
+//	bash -O extglob -c "go version"         exit 0,   Go RAN
+//	bash -o pipefail -c "go version"        exit 0,   Go RAN
+//	bash -s -c "go version"                 exit 0,   Go RAN
+func TestPhaseInstrumentHonoursInterpreterOptionState(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		// `--` ENDS OPTION PARSING, so the following -c is a script FILENAME.
+		{"bash option termination", `bash -- -c "go test ./..."`, phaseBucketOther},
+		{"sh option termination", `sh -- -c "go test ./..."`, phaseBucketOther},
+		{"zsh option termination", `zsh -- -c "go test ./..."`, phaseBucketOther},
+		// and it stays right underneath every executable wrapper.
+		{"termination under sudo", `sudo bash -- -c "go test ./..."`, phaseBucketOther},
+		{"termination under timeout", `timeout 25m bash -- -c "go test ./..."`, phaseBucketOther},
+		{"termination under nohup", `nohup bash -- -c "go test ./..."`, phaseBucketOther},
+		{"termination under env", `env bash -- -c "go test ./..."`, phaseBucketOther},
+		// AN INVALID BUNDLE ABORTS THE SHELL. Nothing ran, and this lexer does
+		// not implement the option, so it refuses rather than buckets.
+		{"invalid bash bundle", `bash -zc "go test ./..."`, phaseBucketUnknown},
+		{"invalid sh bundle", `sh -zc "go test ./..."`, phaseBucketUnknown},
+		{"undeclared long option", `bash --nonesuch -c "go test ./..."`, phaseBucketUnknown},
+		// -c BELONGS TO AN INTERPRETER, not to any command shaped like one.
+		{"nohup has no -c", `nohup -c "go test ./..."`, phaseBucketOther},
+		// VALUE-TAKING OPTIONS CONSUME THEIR ARGUMENT, and the -c after them is
+		// still a real command string: Go runs, so the bucket is test.
+		{"long option with a separate value", `bash --rcfile /dev/null -c "go test ./..."`, phaseBucketTest},
+		{"long option with an inline value", `bash --rcfile=/dev/null -c "go test ./..."`, phaseBucketTest},
+		{"shopt option value", `bash -O extglob -c "go test ./..."`, phaseBucketTest},
+		{"set -o option value", `bash -o pipefail -c "go test ./..."`, phaseBucketTest},
+		{"stdin flag before -c", `bash -s -c "go test ./..."`, phaseBucketTest},
+		// A value-taking option whose value is a SCRIPT still runs no Go test.
+		{"value option then script", "bash -O extglob script.sh", phaseBucketOther},
+		// A DECLARED BOUNDARY, stated rather than hidden. bash's -O takes an
+		// OPTIONAL argument, so a value-taking letter in the middle of a
+		// cluster is genuinely ambiguous: measured, `bash -Ox extglob -c "go
+		// version"` exits 0 and DOES run Go, so `unknown` here is a false
+		// refusal. It is the allowed direction - the ruling permits refusing
+		// what the grammar does not implement and forbids confident buckets -
+		// and emulating optional-argument clusters is the token-by-token
+		// guessing this round exists to stop. Pinned so the refusal is a
+		// decision, not an accident, and so that removing the mid-cluster
+		// check is a killable mutant.
+		{"ambiguous mid-cluster value letter refuses", `bash -Ox extglob -c "go test ./..."`, phaseBucketUnknown},
+		{"value letter with attached c refuses", `bash -Oc "go test ./..."`, phaseBucketUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}

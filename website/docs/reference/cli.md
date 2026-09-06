@@ -2104,6 +2104,15 @@ never invokes the Go toolchain, so it is not reported as a test. Executable
 wrappers (`nohup`, `env`, `timeout`, `sudo`, ...) do exec their operand and
 keep unwrapping.
 
+Interpreter OPTION STATE is honoured, not guessed from token shape: `--` ends
+option parsing (so `bash -- -c cmd` runs a script named `-c`), value-taking
+options consume their argument (`--rcfile FILE`, `-O NAME`, `-o NAME`), and an
+option outside the declared set - an invalid bundle such as `-zc`, or an
+ambiguous value letter in mid-cluster - is reported as `unknown` rather than
+given a bucket, because the shell aborts or the parse is ambiguous. A `-c` is
+honoured only when it belongs to an interpreter: `nohup -c cmd` execs a command
+named `-c`.
+
 
 `job transcript <job-id> --export md` remains the deterministic, ANSI-free
 Markdown snapshot. `--export jsonl` emits schema-versioned, self-contained
