@@ -814,6 +814,29 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		reviewer := reviewDecisionAgent(job, payload)
 		switch effectiveDecision {
 		case "changes_requested":
+			// #1524: an objection transitions the task ONLY when it describes the
+			// pull request's CURRENT head. This arm was left unconditional, so an
+			// objection at a superseded head still pulled a PR out of
+			// ready_to_merge over a commit the branch had moved past - and,
+			// because dispatchFix is called INLINE below, also dispatched a fix
+			// leg against findings about that superseded commit. Returning early
+			// refuses both in one place.
+			//
+			// THE GUARD IS DELIBERATELY ASYMMETRIC WITH THE APPROVAL SIDE, and the
+			// asymmetry is a LIVENESS argument: refusing an objection withholds the
+			// conservative transition and the inline fix pass from a complaint that
+			// may well be about the current head. So when no observed pull request
+			// row records a head, this arm ADMITS - refusing would block a
+			// legitimate objection on a PR the daemon has not polled yet, which is
+			// the CLI-dispatch path, and would make the engine's cheapest
+			// transition the one demanding the most evidence.
+			bound, unboundReason, err := e.objectionBindsToCurrentHead(ctx, payload)
+			if err != nil {
+				return err
+			}
+			if !bound {
+				return e.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_skipped_stale_head", Message: unboundReason})
+			}
 			if err := e.setTaskState(ctx, ref, TaskChangesRequested); err != nil {
 				return err
 			}
