@@ -2076,6 +2076,22 @@ sum(bucket_ms)           == covered_ms + overlap_ms
   zero commands however long the job took. That is a blind spot, not a
   measurement that the job spent its time outside commands.
 
+**The grammar is an ACCEPTOR with per-character provenance.** A command is
+classified only if every token positively matches the declared shapes:
+assignments (whose NAME characters are unquoted and form an identifier),
+redirections (whose OPERATOR characters are unquoted, with a validated operand),
+a plain command word, and arguments carrying no UNQUOTED `{ } * ? [ ] ~ < > | &`.
+Quoting is tracked per character, because a quote around one fragment does not
+disable expansion in the rest: `go test ./internal/"cli"*` still globs and
+returns `unknown`, while `go test "./internal/cli*"` is literal and returns
+`test`. A redirection and its operand are validated as ONE unit, so
+`go >probe* test` and `go > "" test` refuse, while `go 2>"out file" test` and
+`go 2>&"1" test` classify normally. Backslashes follow bash: inside double
+quotes a backslash is literal unless it precedes `$`, a backquote, `"` or `\`,
+and an unquoted backslash-newline is a line continuation. `env` consumes its own
+assignments, so `env PROBE=1 go test` is `test`.
+
+
 `job transcript <job-id> --export md` remains the deterministic, ANSI-free
 Markdown snapshot. `--export jsonl` emits schema-versioned, self-contained
 trajectory rows for every normalized event. Bulk export requires the explicit

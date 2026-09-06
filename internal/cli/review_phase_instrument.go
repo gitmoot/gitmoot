@@ -410,43 +410,48 @@ func classifyCommandSegment(segment string, depth int) string {
 		}
 		return token
 	}
-	// THE ACCEPTOR DECIDES FIRST. acceptSimpleCommand validates every token
-	// against the declared grammar in review_phase_grammar.go and returns the
-	// command's words with assignments and redirections already consumed. It
-	// keeps QUOTE PROVENANCE, which the previous flow discarded before
-	// stripping redirections - so a quoted ">not-a-command" was deleted as an
-	// operator and the surviving words classified as a Go command, and an
-	// escaped redirect-looking argument vanished the same way (#1930 round-9
-	// P2 class two).
+	// THE ACCEPTOR DECIDES FIRST, and it hands back TOKENS rather than strings.
+	// Flattening to strings here is what lost per-character provenance, and it
+	// also hid `env`'s own assignments: after the wrapper was stripped,
+	// `PROBE=1` became the command word (#1930 round-10 P2 four).
 	accepted, ok := acceptSimpleCommand(strings.TrimSpace(segment))
 	if !ok {
 		return phaseBucketUnknown
 	}
 	if len(accepted) == 0 {
-		// Assignments or redirections only: no command ran, so there is no
-		// phase to report and nothing was misread.
+		// Assignments or redirections only: no command ran.
 		return ""
 	}
-	fields := make([]string, 0, len(accepted))
-	for _, word := range accepted {
-		fields = append(fields, strings.ToLower(word))
-	}
+	tokens := accepted
 	plumbing := false
-	for len(fields) > 0 {
-		switch head := normalize(fields[0]); head {
+	for len(tokens) > 0 {
+		switch head := normalize(tokens[0].text()); head {
 		case "-c", "-lc", "-lic":
 			// The next field is a COMMAND STRING, not a token: quote-aware
 			// splitting keeps `bash -c "go test ./..."` whole, so it must be
 			// re-parsed rather than matched as one word (#1930 review F12
 			// made the quoting correct and this is what correct quoting then
 			// requires).
-			if len(fields) > 1 && depth < maxWrapperRecursion {
-				return classifyPhaseCommandDepth(strings.Join(fields[1:], " "), depth+1)
+			if len(tokens) > 1 && depth < maxWrapperRecursion {
+				rest := make([]string, 0, len(tokens)-1)
+				for _, token := range tokens[1:] {
+					rest = append(rest, token.text())
+				}
+				return classifyPhaseCommandDepth(strings.Join(rest, " "), depth+1)
 			}
-			fields = fields[1:]
+			tokens = tokens[1:]
 			continue
 		case "bash", "sh", "zsh", "env", "nohup":
-			fields = fields[1:]
+			// `env` takes its OWN assignments before the command:
+			// `env PROBE=1 go test` and `OUTER=1 env INNER=2 go test` both run
+			// go test. Re-running prefix consumption after the wrapper is what
+			// makes those classify rather than reporting the assignment as the
+			// command (#1930 round-10 P2 four).
+			rest, prefixesOK := consumePrefixes(tokens[1:])
+			if !prefixesOK {
+				return phaseBucketUnknown
+			}
+			tokens = rest
 			continue
 		case "timeout", "time", "nice", "sudo", "xargs", "stdbuf", "ionice":
 			// A WRAPPER OWNS ITS OWN ARGUMENTS. Skipping only the wrapper token
@@ -456,8 +461,13 @@ func classifyCommandSegment(segment string, depth int) string {
 			// Consume the wrapper, then its flags, then the one non-flag operand
 			// those flags take (timeout's duration, sudo -u's user is already a
 			// flag value, nice -n's level likewise).
-			fields = fields[1:]
-			fields = consumeWrapperArguments(head, fields)
+			tokens = tokens[1:]
+			words := make([]string, 0, len(tokens))
+			for _, token := range tokens {
+				words = append(words, token.text())
+			}
+			words = consumeWrapperArguments(head, words)
+			tokens = tokens[len(tokens)-len(words):]
 			continue
 		case "cd", "export", "pushd", "popd", "mkdir", "rm", "cp", "mv", "echo", "set":
 			// `source` is deliberately NOT here: it runs another file, which
@@ -473,19 +483,19 @@ func classifyCommandSegment(segment string, depth int) string {
 		}
 		break
 	}
-	if len(fields) == 0 {
+	if len(tokens) == 0 {
 		if plumbing {
 			return ""
 		}
 		return phaseBucketOther
 	}
-	if reservedShellWord(normalize(fields[0])) {
+	if reservedShellWord(normalize(tokens[0].text())) {
 		return phaseBucketUnknown
 	}
-	head := normalize(fields[0])
+	head := normalize(tokens[0].text())
 	sub := ""
-	if len(fields) > 1 {
-		sub = normalize(fields[1])
+	if len(tokens) > 1 {
+		sub = normalize(tokens[1].text())
 	}
 	switch head {
 	case "git", "gh":

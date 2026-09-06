@@ -2,149 +2,229 @@ package cli
 
 import "strings"
 
-// THE DECLARED GRAMMAR IS AN ACCEPTOR. Nothing here enumerates rejected syntax:
-// a segment is classified only if EVERY token positively matches one of the
-// shapes below, and anything else yields phaseBucketUnknown.
+// THE DECLARED GRAMMAR IS AN ACCEPTOR, AND ITS PROVENANCE IS PER CHARACTER.
 //
-// That inversion is the whole correction, and it took three rounds to accept.
-// A blacklist of punctuation cannot express "everything else refuses", because
-// the shell grammar is open-ended - each round named more valid syntax that
-// walked past the list: compound commands, then <>, >|, &>>, |&, brace,
-// pathname and tilde expansion, and dynamic-file-descriptor redirection. An
-// acceptor over a finite declared grammar is not a shell parser; it recognises
-// a simple command and refuses everything else.
+// A segment is classified only if EVERY token positively matches one of the
+// shapes below; anything else yields phaseBucketUnknown. Round 10 showed that
+// one quoted bit PER TOKEN cannot decide that, because bash quotes CHARACTERS,
+// not words: `./internal/"cli"*` still globs on its unquoted `*`, `g"\o"` runs
+// a command named `g\o`, and `2>"out file"` is an ordinary redirection whose
+// operand merely happens to be quoted. Each token therefore carries a mask
+// recording which of its characters were quoted or escaped.
 //
 // ACCEPTED SEGMENT := prefix* commandWord word*
 //
 //	prefix      := assignment | redirection
-//	assignment  := UNQUOTED name=value, name matching [A-Za-z_][A-Za-z0-9_]*
-//	redirection := UNQUOTED, exactly one of  >  >>  <  N>  N>>  N<  N>&M
-//	               N<&M  &>  - carrying its operand or taking the next word
-//	commandWord := a plain name (letters, digits, '.', '_', '-', '/', ':', '+'),
-//	               quoted or not, because a quoted word is LITERAL
-//	word        := any token needing no expansion this lexer cannot perform; an
-//	               UNQUOTED word containing { } * ? [ ] ~ is refused, since
-//	               brace, pathname and tilde expansion decide what it becomes
+//	assignment  := name=value whose NAME characters are all unquoted and match
+//	               [A-Za-z_][A-Za-z0-9_]*
+//	redirection := operator characters UNQUOTED, exactly one of
+//	                 >  >>  <  N>  N>>  N<  N>&M  N<&M  &>
+//	               with a non-empty operand carrying no unquoted expansion
+//	commandWord := a plain name (letters, digits, '.', '_', '-', '/', ':', '+')
+//	word        := no UNQUOTED { } * ? [ ] ~ < > | &
+//
+// A REJECTED SYNTAX TOKEN NEVER RE-ENTERS ORDINARY-ARGUMENT ACCEPTANCE. That
+// fall-through is what admitted partially quoted redirects as arguments, so
+// redirect-shaped tokens that fail the redirection rule refuse outright.
 
-// shellToken carries the provenance the classifier needs. Discarding it caused a
-// whole class of false measurements: with quoting erased, a QUOTED
-// ">not-a-command" is indistinguishable from a redirection, and an ESCAPED
-// \>out from an operator - so one was deleted and the other believed.
+// shellToken carries per-character provenance: quoted[i] reports whether rune i
+// came from inside quotes or from a backslash escape.
 type shellToken struct {
-	text   string
-	quoted bool
-	// nameQuoted records whether quoting or escaping occurred BEFORE the first
-	// '=' in this token. Bash recognises an assignment by its NAME, so
-	// `PROBE=A\&B` and `PROBE="A B"` ARE assignments while `"PROBE=AB"` and
-	// `"PROBE"=AB` are commands - all four measured. Tracking one flag for the
-	// whole token refused the first two (#1930 round-9).
-	nameQuoted bool
+	runes  []rune
+	quoted []bool
 }
 
-// shellTokens splits a segment into tokens, KEEPING quote provenance. Single
-// quotes are literal (backslashes included); double quotes honour backslash
-// escapes; an unquoted backslash escapes the next rune.
+func (t shellToken) text() string { return string(t.runes) }
+
+func (t shellToken) empty() bool { return len(t.runes) == 0 }
+
+// hasUnquoted reports whether any UNQUOTED character of the token is in set.
+func (t shellToken) hasUnquoted(set string) bool {
+	for i, r := range t.runes {
+		if !t.quoted[i] && strings.ContainsRune(set, r) {
+			return true
+		}
+	}
+	return false
+}
+
+// unquotedPrefixThrough reports whether every character up to and including
+// index end is unquoted.
+func (t shellToken) unquotedPrefixThrough(end int) bool {
+	if end >= len(t.quoted) {
+		return false
+	}
+	for i := 0; i <= end; i++ {
+		if t.quoted[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// shellTokens splits a segment into tokens with per-character provenance.
+//
+// Backslash handling follows bash rather than "strip it everywhere", which was
+// untruthful in two directions: inside DOUBLE quotes a backslash is literal
+// unless it precedes $, `, " or \, and an unquoted backslash-newline is a LINE
+// CONTINUATION that disappears entirely.
 func shellTokens(command string) []shellToken {
 	var tokens []shellToken
-	var current strings.Builder
+	var current shellToken
+	started := false
 	quote := rune(0)
-	quoted := false
-	nameQuoted := false
-	escaped := false
+	runes := []rune(command)
+	add := func(r rune, quoted bool) {
+		current.runes = append(current.runes, r)
+		current.quoted = append(current.quoted, quoted)
+		started = true
+	}
 	flush := func() {
-		if current.Len() > 0 || quoted {
-			tokens = append(tokens, shellToken{text: current.String(), quoted: quoted, nameQuoted: nameQuoted})
-			current.Reset()
-		}
-		quoted = false
-		nameQuoted = false
-	}
-	markQuoted := func() {
-		quoted = true
-		if !strings.Contains(current.String(), "=") {
-			nameQuoted = true
+		if started {
+			tokens = append(tokens, current)
+			current = shellToken{}
+			started = false
 		}
 	}
-	for _, r := range command {
-		if escaped {
-			// An escaped rune is DATA, so this token is no longer a bare word:
-			// \>out is a literal filename, not a redirection. Mark BEFORE
-			// writing, so the '=' test sees the name as it stood.
-			markQuoted()
-			current.WriteRune(r)
-			escaped = false
-			continue
-		}
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
 		switch {
-		case r == '\\' && quote != '\'':
-			escaped = true
-		case quote != 0:
-			if r == quote {
+		case quote == '\'':
+			if r == '\'' {
 				quote = 0
 				continue
 			}
-			current.WriteRune(r)
+			add(r, true)
+		case quote == '"':
+			if r == '\\' && i+1 < len(runes) {
+				switch next := runes[i+1]; next {
+				case '$', '`', '"', '\\':
+					i++
+					add(next, true)
+				case '\n':
+					i++
+				default:
+					// Bash KEEPS the backslash before anything else.
+					add('\\', true)
+				}
+				continue
+			}
+			if r == '"' {
+				quote = 0
+				continue
+			}
+			add(r, true)
+		case r == '\\':
+			if i+1 < len(runes) {
+				if runes[i+1] == '\n' {
+					// Unquoted line continuation: both runes disappear, which
+					// is why `go te\<newline>st` runs `go test`.
+					i++
+					continue
+				}
+				i++
+				add(runes[i], true)
+				continue
+			}
+			add('\\', true)
 		case r == '\'' || r == '"':
 			quote = r
-			markQuoted()
+			started = true
 		case r == ' ' || r == '\t':
 			flush()
 		default:
-			current.WriteRune(r)
+			add(r, false)
 		}
 	}
 	flush()
 	return tokens
 }
 
-// acceptedRedirection reports whether an UNQUOTED token is one of the redirect
-// forms this lexer implements. There is deliberately no {fd}> guard: such a
-// token matches none of the forms below and is refused here anyway, and the
-// unquoted-word arm refuses it again for its braces - a mutation showed the
-// guard could not change any outcome, so it is deleted rather than kept as
-// unkillable code (#1930 round-9).
+// acceptedRedirection reports whether a token is one of the redirect forms this
+// lexer implements. The OPERATOR characters must be unquoted; the operand may be
+// quoted, because `2>"out file"` is an ordinary redirection.
 //
-// acceptedRedirection reports whether an UNQUOTED token is one of the redirect
-// forms this lexer implements, and whether its operand is the next word. Any
-// other redirect-looking token is REFUSED rather than guessed at, which is what
-// keeps <>, >|, &>> and {fd}> out of a confident bucket.
-func acceptedRedirection(token shellToken) (accepted bool, takesOperand bool) {
-	if token.quoted || token.text == "" {
-		return false, false
+// redirectShaped is returned separately so a REJECTED redirect refuses instead
+// of being admitted as an argument.
+func acceptedRedirection(token shellToken) (accepted bool, takesOperand bool, redirectShaped bool) {
+	if token.empty() {
+		return false, false, false
 	}
-	text := token.text
-	if strings.HasPrefix(text, "&>") {
-		operand := text[2:]
-		if strings.ContainsAny(operand, "<>|&") {
-			// &>> appends; unimplemented.
-			return false, false
-		}
-		return true, operand == ""
-	}
+	text := token.text()
 	digits := 0
-	for digits < len(text) && text[digits] >= '0' && text[digits] <= '9' {
+	for digits < len(token.runes) && token.runes[digits] >= '0' && token.runes[digits] <= '9' && !token.quoted[digits] {
 		digits++
 	}
 	rest := text[digits:]
+	shaped := token.hasUnquoted("<>") || strings.HasPrefix(rest, "&>")
+	if !shaped {
+		return false, false, false
+	}
+	if strings.HasPrefix(rest, "&>") {
+		if !token.unquotedPrefixThrough(digits + 1) {
+			return false, false, true
+		}
+		operand := rest[2:]
+		if strings.ContainsAny(operand, "<>|&") {
+			return false, false, true
+		}
+		return acceptAttachedOperand(token, digits+2, operand)
+	}
 	for _, form := range []string{">>", ">&", "<&", ">", "<"} {
 		if !strings.HasPrefix(rest, form) {
 			continue
 		}
+		if !token.unquotedPrefixThrough(digits + len(form) - 1) {
+			// A quoted operator is not an operator. This guard is DEFENCE IN
+			// DEPTH and is currently equivalent: every token reaching it with a
+			// quoted operator also carries the operator character in its
+			// operand, which the ContainsAny check below refuses anyway. It is
+			// kept rather than deleted because it states the rule directly,
+			// where the operand check states it only incidentally - if that
+			// check is ever narrowed, this one still holds the line.
+			return false, false, true
+		}
 		operand := rest[len(form):]
 		if form == ">&" || form == "<&" {
-			// N>&M duplicates a descriptor; N>&- closes it.
+			// N>&M duplicates a descriptor and N>&- closes it; the operand may
+			// be quoted, so `2>&"1"` is accepted.
 			if operand == "-" || allDigits(operand) {
-				return true, false
+				return true, false, true
 			}
-			return false, false
+			return false, false, true
 		}
 		if strings.ContainsAny(operand, "<>|&") {
-			// >| (clobber) and <> (read-write) reach here.
-			return false, false
+			// `>|` (clobber) and `<>` (read-write) reach here.
+			return false, false, true
 		}
-		return true, operand == ""
+		return acceptAttachedOperand(token, digits+len(form), operand)
 	}
-	return false, false
+	return false, false, true
+}
+
+// acceptAttachedOperand validates an operand carried by the redirect token
+// itself. An empty attached operand means the operand is the NEXT token.
+func acceptAttachedOperand(token shellToken, start int, operand string) (accepted bool, takesOperand bool, redirectShaped bool) {
+	if operand == "" {
+		return true, true, true
+	}
+	for i := start; i < len(token.runes); i++ {
+		if !token.quoted[i] && strings.ContainsRune("{}*?[]~", token.runes[i]) {
+			// `>redirprobe*` globs; bash decides that filename, not this lexer.
+			return false, false, true
+		}
+	}
+	return true, false, true
+}
+
+// acceptedOperandToken validates a SEPARATE operand token, which used to be
+// skipped unconditionally: `go > "" test` is an ambiguous redirect bash refuses,
+// and `go > {one,two} test` brace-expands.
+func acceptedOperandToken(token shellToken) bool {
+	if token.empty() {
+		return false
+	}
+	return !token.hasUnquoted("{}*?[]~<>|&")
 }
 
 func allDigits(text string) bool {
@@ -159,22 +239,18 @@ func allDigits(text string) bool {
 	return true
 }
 
-// acceptedAssignment reports whether an UNQUOTED token is a real environment
-// assignment. Treating any word containing '=' as one was wrong: bash runs
-// not-an-assignment=x as a COMMAND, because the text before '=' is not a valid
-// identifier.
+// acceptedAssignment reports whether a token is a real environment assignment.
+// The NAME's characters must be unquoted and form an identifier: bash runs
+// `"PROBE=AB"` and `not-an-assignment=x` as commands, both measured.
 func acceptedAssignment(token shellToken) bool {
-	if token.nameQuoted {
-		// A quoted NAME is not an assignment: bash reports
-		// `"PROBE=AB": command not found`. A quoted or escaped VALUE is fine.
-		return false
-	}
-	name, _, found := strings.Cut(token.text, "=")
+	name, _, found := strings.Cut(token.text(), "=")
 	if !found || name == "" {
 		return false
 	}
-	for i := 0; i < len(name); i++ {
-		c := name[i]
+	if !token.unquotedPrefixThrough(len([]rune(name)) - 1) {
+		return false
+	}
+	for i, c := range name {
 		switch {
 		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '_':
 		case c >= '0' && c <= '9' && i > 0:
@@ -186,29 +262,20 @@ func acceptedAssignment(token shellToken) bool {
 }
 
 // acceptedWord reports whether a token needs no expansion this lexer cannot
-// perform. A QUOTED word is literal and always acceptable; an unquoted word
-// carrying brace, pathname or tilde expansion is refused, because what it
-// becomes is decided by the shell and the filesystem rather than by its text.
+// perform. The test is PER CHARACTER, because a quoted fragment does not bless
+// the unquoted remainder.
 func acceptedWord(token shellToken) bool {
-	if token.quoted {
-		return true
-	}
-	// An UNQUOTED word carrying redirect or list operators is not a word at
-	// all: the shell would have split there. `<>io.log` and `&>>out.log` are
-	// redirect forms this lexer does not implement, and acceptedRedirection
-	// correctly refuses them - so they must not then be admitted through the
-	// argument arm, which is how both reached a confident bucket (#1930
-	// round-9 class one).
-	return !strings.ContainsAny(token.text, "{}*?[]~<>|&")
+	return !token.hasUnquoted("{}*?[]~<>|&")
 }
 
 // acceptedCommandWord reports whether a token can name a command this lexer can
-// classify. Deliberately narrow: a plain name, quoted or not.
+// classify. A quoted command word is LITERAL, so `g"\o"` names `g\o` and is
+// refused rather than read as `go`.
 func acceptedCommandWord(token shellToken) bool {
-	if token.text == "" {
+	if token.empty() {
 		return false
 	}
-	for _, r := range token.text {
+	for _, r := range token.runes {
 		switch {
 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
 		case r == '.' || r == '_' || r == '-' || r == '/' || r == ':' || r == '+':
@@ -221,8 +288,7 @@ func acceptedCommandWord(token shellToken) bool {
 
 // reservedShellWord reports whether a COMMAND WORD is shell syntax or a builtin
 // whose effect this lexer cannot model. Checked at the command-word position
-// only: test is go's subcommand and . is a git argument, so scanning every word
-// would refuse the commands this instrument exists to measure.
+// only: `test` is go's subcommand and `.` is a git argument.
 func reservedShellWord(word string) bool {
 	switch word {
 	case "if", "then", "else", "elif", "fi",
@@ -238,8 +304,7 @@ func reservedShellWord(word string) bool {
 }
 
 // structuralShellToken reports whether a token is shell STRUCTURE wherever it
-// appears, so a compound command is refused even when its keyword is not the
-// first word: ! go test, { go test; }, [[ -f x ]] && go test.
+// appears.
 func structuralShellToken(word string) bool {
 	switch word {
 	case "{", "}", "!", "[[", "]]", "(", ")", "then", "else", "elif", "fi", "do", "done", "esac":
@@ -248,20 +313,11 @@ func structuralShellToken(word string) bool {
 	return false
 }
 
-// acceptSimpleCommand validates a segment against the declared grammar and
-// returns its words with prefixes removed. ok=false means REFUSE: the caller
-// must yield phaseBucketUnknown rather than classify anything. An empty word
-// slice with ok=true means the segment ran no command at all (assignments or
-// redirections only), which is plumbing rather than a phase.
-//
-// ORDER IS LOAD-BEARING: prefixes are consumed BEFORE the command word is
-// examined, because checking for an empty command word first read the
-// assignment as the command.
-func acceptSimpleCommand(segment string) (words []string, ok bool) {
-	tokens := shellTokens(segment)
-	if len(tokens) == 0 {
-		return nil, true
-	}
+// consumePrefixes removes assignments and redirections from the head of tokens.
+// The classifier calls it AGAIN after recognising an `env` wrapper, because env
+// is followed by its own assignments: `env PROBE=1 go test` otherwise left
+// `PROBE=1` as the command word.
+func consumePrefixes(tokens []shellToken) (rest []shellToken, ok bool) {
 	index := 0
 	for index < len(tokens) {
 		token := tokens[index]
@@ -269,54 +325,74 @@ func acceptSimpleCommand(segment string) (words []string, ok bool) {
 			index++
 			continue
 		}
-		accepted, takesOperand := acceptedRedirection(token)
+		accepted, takesOperand, shaped := acceptedRedirection(token)
 		if !accepted {
+			if shaped {
+				return nil, false
+			}
 			break
 		}
 		index++
 		if takesOperand {
-			if index >= len(tokens) {
+			if index >= len(tokens) || !acceptedOperandToken(tokens[index]) {
 				return nil, false
 			}
 			index++
 		}
 	}
-	if index >= len(tokens) {
-		return nil, true
-	}
-	if structuralShellToken(tokens[index].text) || !acceptedCommandWord(tokens[index]) {
+	return tokens[index:], true
+}
+
+// acceptSimpleCommand validates a segment and returns its words with prefixes
+// removed. ok=false means REFUSE. An empty word slice with ok=true means the
+// segment ran no command at all.
+func acceptSimpleCommand(segment string) (words []shellToken, ok bool) {
+	tokens, ok := consumePrefixes(shellTokens(segment))
+	if !ok {
 		return nil, false
 	}
-	words = append(words, tokens[index].text)
-	index++
+	if len(tokens) == 0 {
+		return nil, true
+	}
+	if structuralShellToken(tokens[0].text()) || !acceptedCommandWord(tokens[0]) {
+		return nil, false
+	}
+	words = append(words, tokens[0])
+	index := 1
 	for index < len(tokens) {
 		token := tokens[index]
-		if structuralShellToken(token.text) {
+		if structuralShellToken(token.text()) {
 			return nil, false
 		}
-		if accepted, takesOperand := acceptedRedirection(token); accepted {
+		accepted, takesOperand, _ := acceptedRedirection(token)
+		if accepted {
 			index++
 			if takesOperand {
-				if index >= len(tokens) {
+				if index >= len(tokens) || !acceptedOperandToken(tokens[index]) {
 					return nil, false
 				}
 				index++
 			}
 			continue
 		}
+		// NO `if shaped { refuse }` HERE, and that is proved rather than
+		// assumed: shaped implies the token carries an unquoted '<' or '>',
+		// and acceptedWord refuses exactly those, so the branch was
+		// unreachable. A search over 26 redirect-shaped candidates found zero
+		// tokens that are shaped, rejected, and word-acceptable. Dead code a
+		// mutant cannot kill is deleted rather than excused (#1930 round-10).
 		if !acceptedWord(token) {
 			return nil, false
 		}
-		words = append(words, token.text)
+		words = append(words, token)
 		index++
 	}
 	return words, true
 }
 
-// unsupportedShellContext is the character-level half of the boundary, kept for
-// constructs that are not single tokens at all: substitutions, subshells,
-// heredocs, |&, and malformed quoting. The acceptor above decides everything
-// token-shaped.
+// unsupportedShellContext is the character-level half of the boundary, for
+// constructs that are not single tokens: substitutions, subshells, heredocs,
+// `|&`, and malformed quoting.
 func unsupportedShellContext(command string) (string, bool) {
 	const (
 		backslash   = '\\'
@@ -372,8 +448,6 @@ func unsupportedShellContext(command string) (string, bool) {
 			}
 		case '|':
 			if i+1 < len(runes) && runes[i+1] == '&' {
-				// |& pipes stderr too; the segment splitter would treat the '&'
-				// as a separator and confidently classify both halves.
 				return "pipe with stderr", true
 			}
 		case ';':

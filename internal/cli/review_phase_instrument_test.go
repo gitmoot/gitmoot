@@ -1313,3 +1313,159 @@ func TestPhaseInstrumentHonoursQuoteProvenance(t *testing.T) {
 		})
 	}
 }
+
+// classifyThroughBothProductionPaths drives one command through the REAL
+// production path for BOTH runtimes and asserts the same bucket: Codex wraps in
+// /bin/bash -lc with %q escaping, Kimi sends the command bare inside JSON. The
+// two disagree about escaping, so a defect that hides behind one wrapper shows
+// through the other - which is why 124392 requires both.
+func classifyThroughBothProductionPaths(t *testing.T, command, want string) {
+	t.Helper()
+	for _, path := range []struct {
+		name    string
+		runtime string
+		agent   string
+		lines   func(string, string) (string, string)
+	}{
+		{"codex", "codex", "codex-reviewer", codexToolLines},
+		{"kimi", "kimi", "kimi-reviewer", kimiToolLines},
+	} {
+		t.Run(path.name, func(t *testing.T) {
+			home := t.TempDir()
+			paths := config.PathsForHome(home)
+			store := seedInstrumentJob(t, paths, "dual", path.agent, path.runtime)
+			handle := openInstrumentedTranscript(t, home, "dual", path.runtime, store)
+			start, end := path.lines("d1", command)
+			if _, err := handle.Write([]byte(start)); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(12 * time.Millisecond)
+			if _, err := handle.Write([]byte(end)); err != nil {
+				t.Fatal(err)
+			}
+			if err := handle.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+			profile := readPhaseProfile(t, store, "dual")
+			assertProfileIdentities(t, profile)
+			if profile.BucketCount[want] != 1 {
+				t.Fatalf("%s path: %q landed in %v, want %s", path.name, command, profile.BucketCount, want)
+			}
+		})
+	}
+}
+
+// TestPhaseInstrumentProvenanceIsPerCharacter is #1930 round-10 finding one. A
+// quote around ONE fragment must not bless the unquoted remainder: bash still
+// performs pathname, brace and tilde expansion on the parts outside the quotes,
+// so these commands do not run what their text says.
+func TestPhaseInstrumentProvenanceIsPerCharacter(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"quoted fragment then glob", `go test ./internal/"cli"*`, phaseBucketUnknown},
+		{"quoted fragment then brace", `go test ./internal/"x"{cli,db}`, phaseBucketUnknown},
+		{"tilde before a quoted fragment", `go test ~/"repo"/...`, phaseBucketUnknown},
+		// Fully quoted expansion characters are literal and stay classifiable.
+		{"fully quoted glob is literal", `go test "./internal/cli*"`, phaseBucketTest},
+		{"single-quoted brace is literal", `go test './internal/{cli,db}'`, phaseBucketTest},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentValidatesRedirectionAsAUnit is #1930 round-10 finding two.
+// A redirection and its operand are ONE syntactic unit: an invalid or partially
+// quoted redirect must refuse rather than fall through to ordinary-argument
+// acceptance, and a valid one whose operand is quoted must still classify.
+func TestPhaseInstrumentValidatesRedirectionAsAUnit(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		// Bash rejects each of these redirections before running go.
+		{"globbing operand", "go >redirprobe* test", phaseBucketUnknown},
+		{"brace operand", "go >{one,two} test", phaseBucketUnknown},
+		{"empty separate operand", `go > "" test`, phaseBucketUnknown},
+		// Bash runs go test in both of these, so `other` would be a false
+		// measurement; the operand may be quoted and the target may be a
+		// quoted descriptor.
+		{"quoted operand with a space", `go 2>"out file" test`, phaseBucketTest},
+		{"quoted descriptor duplicate", `go 2>&"1" test`, phaseBucketTest},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentModelsBackslashLikeBash is #1930 round-10 finding three.
+// Inside double quotes bash KEEPS a backslash unless it precedes $, `, " or \;
+// an unquoted backslash-newline is a line continuation that disappears.
+func TestPhaseInstrumentModelsBackslashLikeBash(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		// `g"\o"` names the command g\o, which is not go.
+		{"backslash inside a quoted command word", `g"\o" test`, phaseBucketUnknown},
+		// `go t"e\st"` passes the literal subcommand te\st, which is not test.
+		{"backslash inside a quoted argument", `go t"e\st"`, phaseBucketOther},
+		// The interior line continuation is asserted PER PATH below, because
+		// the two wrappers deliver genuinely different commands.
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentConsumesEnvAssignments is #1930 round-10 finding four: the
+// env wrapper takes its own assignments, and dropping only the wrapper left
+// them at the head to be read as the command.
+func TestPhaseInstrumentConsumesEnvAssignments(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"env with one assignment", "env PROBE=1 go test ./...", phaseBucketTest},
+		{"absolute env with a quoted value", `/usr/bin/env PROBE="A B" go test ./...`, phaseBucketTest},
+		{"assignment before and after env", "OUTER=1 env INNER=2 go test ./...", phaseBucketTest},
+		{"env with a redirect and an assignment", "env PROBE=1 go test ./... >out.log", phaseBucketTest},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentLineContinuationDiffersByRuntime pins the one round-10
+// case whose CORRECT answer differs between the two production paths, measured
+// with bash rather than assumed:
+//
+//	raw (kimi sends this)      bash -lc $'echo RAN-te\<newline>st' -> RAN-test
+//	%q-wrapped (codex sends)   bash -lc "echo RAN-te\\\nst"      -> RAN-te\nst
+//
+// So the continuation JOINS on the kimi path and does not survive Codex's
+// escaping, where the argument is literally te\nst. Reporting `test` for the
+// Codex form would be a false measurement of a command that never ran, and
+// reporting `other` for the kimi form would lose a real one.
+func TestPhaseInstrumentLineContinuationDiffersByRuntime(t *testing.T) {
+	const command = "go te\\\nst ./..."
+	for _, tc := range []struct {
+		name    string
+		runtime string
+		agent   string
+		lines   func(string, string) (string, string)
+		want    string
+	}{
+		{"kimi joins the continuation", "kimi", "kimi-reviewer", kimiToolLines, phaseBucketTest},
+		{"codex sends a different command", "codex", "codex-reviewer", codexToolLines, phaseBucketOther},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			paths := config.PathsForHome(home)
+			store := seedInstrumentJob(t, paths, "cont", tc.agent, tc.runtime)
+			handle := openInstrumentedTranscript(t, home, "cont", tc.runtime, store)
+			start, end := tc.lines("c1", command)
+			if _, err := handle.Write([]byte(start)); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(12 * time.Millisecond)
+			if _, err := handle.Write([]byte(end)); err != nil {
+				t.Fatal(err)
+			}
+			if err := handle.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+			profile := readPhaseProfile(t, store, "cont")
+			assertProfileIdentities(t, profile)
+			if profile.BucketCount[tc.want] != 1 {
+				t.Fatalf("%s: landed in %v, want %s", tc.name, profile.BucketCount, tc.want)
+			}
+		})
+	}
+}
