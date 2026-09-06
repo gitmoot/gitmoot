@@ -603,13 +603,7 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, s
 			// visible cause. The reason is already persisted, so surface it.
 			if reason := loadStuckReason(store, job); !reason.empty() {
 				held = reason
-				line := "HOLD: " + reason.Reason
-				if reason.NextRetryAt != "" {
-					line += " (next retry " + reason.NextRetryAt + ")"
-				}
-				if reason.SuggestedAction != "" {
-					line += " [action: " + reason.SuggestedAction + "]"
-				}
+				line := holdLine(reason)
 				if line != lastHold {
 					lastHold = line
 					if !jsonOutput {
@@ -632,6 +626,21 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, s
 	}
 	fmt.Fprintf(stdout, "state: %s\n", output.Job.State)
 	return 0
+}
+
+// holdLine renders a hold for the watch surfaces. It exists so `job watch` and
+// `job watch --transcript` cannot drift: #1887 asks for the hold on `job watch`
+// without excluding transcript mode, and two copies of this formatting would let
+// one mode gain a field the other silently lacks.
+func holdLine(reason stuckReason) string {
+	line := "HOLD: " + reason.Reason
+	if reason.NextRetryAt != "" {
+		line += " (next retry " + reason.NextRetryAt + ")"
+	}
+	if reason.SuggestedAction != "" {
+		line += " [action: " + reason.SuggestedAction + "]"
+	}
+	return line
 }
 
 func runJobTranscriptWatch(jobID, home, requestedLogPath, requestedRuntime string, poll time.Duration, stdout, stderr io.Writer) int {
@@ -680,6 +689,14 @@ func runJobTranscriptWatch(jobID, home, requestedLogPath, requestedRuntime strin
 		}
 		if err := renderer.RenderHeader(transcriptHeader(context.Background(), store, job, payload, runtimeName)); err != nil {
 			return err
+		}
+		// --transcript MUST NOT BE THE ONE WATCH MODE THAT HIDES THE HOLD (#1887
+		// names `job watch` without excluding transcript mode). The no-log path
+		// above already delegates to runJobEventWatch and inherits its HOLD line;
+		// THIS is the path where a log EXISTS, so transcript.Follow blocks on new
+		// log lines and would show nothing while the job sits held.
+		if reason := loadStuckReason(store, job); !reason.empty() {
+			fmt.Fprintln(stdout, holdLine(reason))
 		}
 		return transcript.Follow(context.Background(), logPath, transcript.FollowOptions{
 			PollInterval: poll,

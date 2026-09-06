@@ -2188,6 +2188,37 @@ is derived from the most authoritative existing signal (the latest
 reason-bearing `job events` entry plus the owning resource lock's lease); a
 healthy job's output is unchanged.
 
+A `queued` job whose reason is already recorded in its payload no longer renders
+as a bare `queued` row (#1887). When the classifier has deferred a job, `job
+list` and `job show` append `WHY: deferred (<class>)` — for example `deferred
+(runtime_quota)` — with the recorded earliest retry as `(next retry <RFC3339>)`
+and, when the deferral usually needs a human, `[action: …]`. **A row whose
+`blocker_retry_at` is absent renders `deferred (<class>), retry time unknown`
+and leaves `next_retry_at` empty; it never shows a zero time.** Absence is the
+common case on at least one path, and a formatted empty timestamp would read as
+a retry long overdue.
+
+The sibling cause is surfaced on the same pass (#1553): a job withheld because
+another job holds a resource naming its repo renders `WHY: withheld: <resource
+key> held by job <id>`, and the lease expiry appears as the next retry when the
+lock carries one. The rendering names only what the lock row proves — the key
+and the holding job id — and does not claim what kind of job the holder is.
+
+`gitmoot job watch` surfaces the same hold while it waits, as `HOLD: <reason>`
+with the optional `(next retry <RFC3339>)` and `[action: …]` suffixes. This
+matters because a deferred job never settles: streamed events only help an
+operator who was already attached when the deferral fired, so anyone attaching
+afterwards would otherwise see nothing until the job settles. The line is
+reprinted only when the hold **changes**, so an unchanged hold does not repeat
+on every poll. `job watch --transcript` prints it too, after the transcript
+header.
+
+`gitmoot job watch --json` carries the last hold observed during the watch as
+`held_reason`, `held_next_retry_at` and `held_suggested_action`. They are named
+for that distinction deliberately: the JSON object is emitted once the job has
+settled, so a field called `why_stuck` would assert a condition that is no
+longer true. All three are omitted when no hold was observed.
+
 For a terminal (`succeeded`, `failed`, `blocked`, or `cancelled`) job whose
 recorded worktree still has a locally observable process, `job list` reports
 `LIVE PROCESS: worktree still has an active process` and `job show` prints the

@@ -3,12 +3,36 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/transcript"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
+
+func seedQueuedJobAs(t *testing.T, store *db.Store, id, agent string, payload workflow.JobPayload) {
+	t.Helper()
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if err := store.CreateJob(context.Background(), db.Job{
+		ID:      id,
+		Agent:   agent,
+		Type:    "ask",
+		State:   string(workflow.JobQueued),
+		Payload: string(encoded),
+		Repo:    payload.Repo,
+	}); err != nil {
+		t.Fatalf("CreateJob(%s): %v", id, err)
+	}
+}
 
 // watchUntil drives the REAL `job watch` CLI entry point against a job that is
 // deliberately NOT settled, waits for `want` to appear (or for the deadline),
@@ -222,5 +246,104 @@ func TestJobWatchOrdinaryQueuedJobPrintsNoHold(t *testing.T) {
 	}
 	if strings.Contains(out.String(), "HOLD:") {
 		t.Errorf("job watch output = %q, want NO hold line for an ordinary queued job", out.String())
+	}
+}
+
+// TestJobWatchTranscriptSurfacesHoldWithAnExistingLog covers `job watch
+// --transcript` through runJobTranscriptWatch's REAL renderer rather than by
+// inference from shared code.
+//
+// The distinction that makes this test necessary: when no log exists, that
+// function prints "transcript unavailable" and DELEGATES to runJobEventWatch,
+// inheriting its HOLD line for free. This test seeds a log so the delegation is
+// NOT taken, which is the path where transcript.Follow blocks on new log lines
+// and would otherwise show nothing at all while the job sits held - the mode an
+// operator is likelier to reach for on a job that already ran once.
+func TestJobWatchTranscriptSurfacesHoldWithAnExistingLog(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HERDR_ENV", "")
+	t.Setenv("HERDR_SOCKET_PATH", filepath.Join(t.TempDir(), "absent-herdr.sock"))
+	store := openCLIJobStore(t, home)
+	if err := store.UpsertAgent(context.Background(), db.Agent{Name: "shell-seat", Runtime: runtime.ShellRuntime}); err != nil {
+		t.Fatal(err)
+	}
+	seedQueuedJobAs(t, store, "watch-transcript-hold", "shell-seat", workflow.JobPayload{
+		Repo:           "owner/repo",
+		PullRequest:    16,
+		BlockerClass:   "runtime_quota",
+		BlockerRetryAt: "2026-09-06T04:20:00Z",
+	})
+	store.Close()
+
+	logPath := filepath.Join(config.PathsForHome(home).Logs, "jobs", transcript.LegacyLogName("watch-transcript-hold")+".log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte("shell started\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out := &syncBuffer{}
+	var stderr syncBuffer
+	done := make(chan int, 1)
+	go func() {
+		done <- Run([]string{"job", "watch", "watch-transcript-hold", "--home", home, "--transcript", "--poll", "20ms"}, out, &stderr)
+	}()
+	deadline := time.Now().Add(15 * time.Second)
+	for !strings.Contains(out.String(), "HOLD:") {
+		if time.Now().After(deadline) {
+			t.Fatalf("no HOLD line from --transcript; output:\n%s\nstderr:\n%s", out.String(), stderr.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	settleWatchedJob(t, home, "watch-transcript-hold")
+	<-done
+
+	if strings.Contains(out.String(), "transcript unavailable") {
+		t.Fatal("the delegation path was taken, so this did not exercise transcript.Follow at all")
+	}
+	if !strings.Contains(out.String(), "runtime_quota") {
+		t.Errorf("--transcript output = %q, want the blocker class", out.String())
+	}
+	if !strings.Contains(out.String(), "2026-09-06T04:20:00Z") {
+		t.Errorf("--transcript output = %q, want the recorded retry time", out.String())
+	}
+}
+
+// TestJobWatchSurfacesWithheldHolderDirectly is the DIRECT observable assertion
+// for #1553's cause on the watch surface. #1887 requires both causes on the
+// surface, and until now the withheld arm was covered only on `job list` plus an
+// inference that watch shares loadStuckReason - which is reasoning, not evidence.
+func TestJobWatchSurfacesWithheldHolderDirectly(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	seedSessionAgentRepo(t, store)
+	seedQueuedJob(t, store, "watch-withheld", workflow.JobPayload{
+		Repo:        "owner/repo",
+		PullRequest: 17,
+	})
+	acquired, err := store.AcquireResourceLock(context.Background(), db.ResourceLock{
+		ResourceKey: "checkout:owner/repo",
+		OwnerJobID:  "implement-holds-the-repo",
+		OwnerToken:  "implement-holds-the-repo-token",
+		ExpiresAt:   time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano),
+	}, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("AcquireResourceLock: %v", err)
+	}
+	if !acquired {
+		t.Fatal("AcquireResourceLock reported not acquired; this arm would prove nothing")
+	}
+	store.Close()
+
+	out, code := watchUntil(t, home, "watch-withheld", "HOLD:", false)
+	if code != 0 {
+		t.Fatalf("job watch exit = %d, output:\n%s", code, out)
+	}
+	if !strings.Contains(out, "implement-holds-the-repo") {
+		t.Errorf("job watch output = %q, want the HOLDING JOB named on the watch surface", out)
+	}
+	if !strings.Contains(out, "checkout:owner/repo") {
+		t.Errorf("job watch output = %q, want the resource key named", out)
 	}
 }
