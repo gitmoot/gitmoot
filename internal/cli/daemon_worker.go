@@ -380,6 +380,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
 		return nil
 	}
+	var absentBinaryRefusal error
 	preflightRequest := runtime.RuntimeContractRequest{Plan: payload.Plan}
 	if result, checked, preflightErr := w.runtimeContractPreflight(ctx, execBackend, execConfig, agent, preflightRequest); preflightErr != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, preflightErr); finishErr != nil {
@@ -400,25 +401,14 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 				writeLine(w.Stdout, "job %s runtime_contract_unknown event failed: %v", job.ID, eventErr)
 			}
 		}
-		// #1926-f5: THE SECOND SEAM. The check above is RETAINED UNCHANGED and
-		// blocks only a positively `unsupported` contract; an absent executable is
-		// honestly `unknown`, so it fell through the event above and ran on to
-		// review-worktree allocation and adapter construction below - which is how
-		// a delegated or daemon-created job still reproduced the original missing
-		// `claude` failure after the CLI ingress was gated.
-		//
-		// Refused here only when this worker's factory was declared REAL through
-		// setRealAdapterFactory, so an injected fake stays exempt by construction,
-		// and only for a backend on this host, decided by the same
-		// execbackend.Consume routing the preflight above already used. Absence
-		// classification is untouched: the unknown event is still recorded.
-		if err := runtime.RuntimeContractAbsentBinaryError(agent, result); err != nil && w.adapterIsDeclaredReal() {
-			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, err); finishErr != nil {
-				return finishErr
-			}
-			_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
-			return nil
-		}
+		// #1926-f5: CAPTURE the absent-executable refusal here, where the contract
+		// result is in scope, but ACT on it after the policy guards below. Ordering
+		// is behavioural, not cosmetic: refusing here pre-empted the read-only
+		// implement permission block, and CI caught it -
+		// TestPreflightReadOnlyImplementEmitsJobBlocked got my capability message
+		// where it required the permission one. A policy refusal is true whether or
+		// not the binary exists, so it must win the diagnosis.
+		absentBinaryRefusal = runtime.RuntimeContractAbsentBinaryError(agent, result)
 	}
 	if err := w.produceDispatchError(job.Type, agent); err != nil {
 		w.recordProduceSandboxDiagnostic(ctx, job.ID, job.Type, agent)
@@ -469,6 +459,24 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		if err := finalize(ctx, job.ID, errors.New(agentPermissionBlockedMessage)); err != nil {
 			return err
 		}
+		return nil
+	}
+	// #1926-f5: THE SECOND SEAM, ACTED ON HERE - after the policy guards above, and
+	// BEFORE review-worktree allocation on the next line and adapter construction
+	// below. That is the ordering the ruling asks for: a delegated or
+	// daemon-created job whose declared CLI is absent is refused before it spends
+	// a worktree, rather than dying at exec.
+	//
+	// Only when this worker's factory was declared REAL through
+	// setRealAdapterFactory, so an injected fake stays exempt by construction, and
+	// only for a local backend, since the preflight that produced this result was
+	// itself routed by execbackend.Consume. The `unknown` classification and its
+	// event are untouched.
+	if absentBinaryRefusal != nil && w.adapterIsDeclaredReal() {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, absentBinaryRefusal); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, "", absentBinaryRefusal)
 		return nil
 	}
 	nativeReviewDeliveryStarted := false
