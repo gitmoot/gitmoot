@@ -441,17 +441,26 @@ func classifyCommandSegment(segment string, depth int) string {
 			}
 			tokens = tokens[1:]
 			continue
-		case "bash", "sh", "zsh", "env", "nohup":
-			// `env` takes its OWN assignments before the command:
-			// `env PROBE=1 go test` and `OUTER=1 env INNER=2 go test` both run
-			// go test. Re-running prefix consumption after the wrapper is what
-			// makes those classify rather than reporting the assignment as the
-			// command (#1930 round-10 P2 four).
+		case "env":
+			// ONLY env TAKES ASSIGNMENTS. `env PROBE=1 go test` runs go test
+			// with PROBE set, so prefix consumption re-runs after this wrapper.
 			rest, prefixesOK := consumePrefixes(tokens[1:])
 			if !prefixesOK {
 				return phaseBucketUnknown
 			}
 			tokens = rest
+			continue
+		case "bash", "sh", "zsh", "nohup":
+			// THESE WRAPPERS DO NOT, and applying env's rule to all of them
+			// manufactured the exact defect this PR exists to remove:
+			// `bash PROBE=1 go test`, `sh PROBE=1 go test` and
+			// `nohup PROBE=1 go test` exit 127, 2 and 127 WITHOUT invoking Go,
+			// because PROBE=1 is the script or command operand rather than an
+			// assignment those wrappers own. Dropping only the wrapper leaves
+			// PROBE=1 as the command word, which acceptedCommandWord refuses
+			// for its '=' - so these refuse instead of reporting a Go test that
+			// never ran (#1930 round-11 f29).
+			tokens = tokens[1:]
 			continue
 		case "timeout", "time", "nice", "sudo", "xargs", "stdbuf", "ionice":
 			// A WRAPPER OWNS ITS OWN ARGUMENTS. Skipping only the wrapper token

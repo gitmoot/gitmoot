@@ -1469,3 +1469,69 @@ func TestPhaseInstrumentLineContinuationDiffersByRuntime(t *testing.T) {
 		})
 	}
 }
+
+// TestPhaseInstrumentOnlyEnvConsumesAssignments is #1930 round-11 f29. My env
+// fix was applied to the SHARED wrapper arm, so bash/sh/zsh/nohup inherited a
+// rule that is only true of env - and that manufactured the exact defect this
+// PR exists to remove: a confident `test` for a command that never ran Go.
+// Measured by the reviewer: bash exits 127, sh exits 2, nohup exits 127,
+// because PROBE=1 is their script or command OPERAND, not an assignment.
+func TestPhaseInstrumentOnlyEnvConsumesAssignments(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		// env owns assignments.
+		{"env consumes its assignment", "env PROBE=1 go test ./...", phaseBucketTest},
+		{"absolute env consumes its assignment", `/usr/bin/env PROBE="A B" go test ./...`, phaseBucketTest},
+		// These do not: the assignment-looking word is their OPERAND, so it
+		// becomes the command word and the segment is a real command that is
+		// not a Go test. The bucket is `other`, not `unknown` - MEASURED, not
+		// chosen: `bash PROBE=1 go version` exits 127, `sh ...` exits 2 and
+		// `nohup ...` exits 127, none of them invoking Go, and the lexer
+		// understands every token, so refusing to classify would be an
+		// admission we do not owe. What matters is that none of them is `test`.
+		{"bash does not", "bash PROBE=1 go test ./...", phaseBucketOther},
+		{"sh does not", "sh PROBE=1 go test ./...", phaseBucketOther},
+		{"zsh does not", "zsh PROBE=1 go test ./...", phaseBucketOther},
+		{"nohup does not", "nohup PROBE=1 go test ./...", phaseBucketOther},
+		// and the wrapper still unwraps normally when its operand is a command.
+		{"bash still unwraps a real command", "bash go test ./...", phaseBucketTest},
+		// A leading assignment before those wrappers is still a real
+		// assignment, consumed by the acceptor rather than by the wrapper.
+		{"assignment before bash stays an assignment", "OUTER=1 bash script.sh", phaseBucketOther},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentAcceptsFullyQuotedOperatorLookingArguments is #1930
+// round-11 f30, and it exists because a proof of mine was wrong. I deleted a
+// fall-through branch after arguing that "shaped implies an unquoted angle
+// bracket", and searched 26 candidates for a counterexample. Every candidate I
+// chose carried an unquoted operator, so the search could not have found the
+// case that mattered: strings.HasPrefix ignores provenance, so a FULLY QUOTED
+// "&>literal" was reported shaped while being an ordinary argument. Bash runs
+// go test with that literal.
+func TestPhaseInstrumentAcceptsFullyQuotedOperatorLookingArguments(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"fully quoted combined redirect is an argument", `go test ./... "&>literal"`, phaseBucketTest},
+		{"fully quoted angle argument", `go test ./... ">literal"`, phaseBucketTest},
+		{"single-quoted angle argument", `go test ./... '>literal'`, phaseBucketTest},
+		// while a genuine operator still refuses when it fails validation.
+		{"unquoted combined append still refuses", "go test ./... &>>out.log", phaseBucketUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentRefusesMixedProvenanceOperators is #1930 round-11 f31: the
+// quoted-operator guard is LOAD-BEARING, not the defence-in-depth I labelled
+// it. With the first '>' quoted and the second unquoted, removing the guard
+// reads the token as a redirection and reports test, while bash invokes a
+// command literally named '>', creates the target, exits 127 and never runs Go.
+func TestPhaseInstrumentRefusesMixedProvenanceOperators(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"quoted then unquoted angle", `">">x go test ./...`, phaseBucketUnknown},
+		{"quoted descriptor then unquoted angle", `2">">x go test ./...`, phaseBucketUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}

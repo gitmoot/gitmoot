@@ -2395,6 +2395,11 @@ quotes a backslash is literal unless it precedes `$`, a backquote, `"` or `\`,
 and an unquoted backslash-newline is a line continuation. `env` consumes its own
 assignments, so `env PROBE=1 go test` is `test`.
 
+Wrapper handling follows each wrapper's real semantics: only `env` consumes
+variable assignments, so `env PROBE=1 go test ./...` is a test while
+`bash PROBE=1 go test ./...` is not - bash, sh, zsh and nohup take that word as
+their script or command operand, and really do exit without invoking Go.
+
 
 
 Classification reads EVERY segment of a command, not the leading token:

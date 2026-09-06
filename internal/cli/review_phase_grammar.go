@@ -156,7 +156,15 @@ func acceptedRedirection(token shellToken) (accepted bool, takesOperand bool, re
 		digits++
 	}
 	rest := text[digits:]
-	shaped := token.hasUnquoted("<>") || strings.HasPrefix(rest, "&>")
+	// SHAPED MUST RESPECT PROVENANCE. strings.HasPrefix ignores quoting, so a
+	// FULLY QUOTED "&>literal" was reported shaped while acceptedWord correctly
+	// accepts it as an ordinary argument - bash really does run
+	// `go test "&>literal"` with that literal. My "shaped implies an unquoted
+	// angle bracket" proof was therefore FALSE, and the 0-of-26 discriminator
+	// search inherited the same blind spot because every candidate I chose
+	// carried an unquoted operator (#1930 round-11 f30).
+	shaped := token.hasUnquoted("<>") ||
+		(strings.HasPrefix(rest, "&>") && token.unquotedPrefixThrough(digits+1))
 	if !shaped {
 		return false, false, false
 	}
@@ -175,13 +183,14 @@ func acceptedRedirection(token shellToken) (accepted bool, takesOperand bool, re
 			continue
 		}
 		if !token.unquotedPrefixThrough(digits + len(form) - 1) {
-			// A quoted operator is not an operator. This guard is DEFENCE IN
-			// DEPTH and is currently equivalent: every token reaching it with a
-			// quoted operator also carries the operator character in its
-			// operand, which the ContainsAny check below refuses anyway. It is
-			// kept rather than deleted because it states the rule directly,
-			// where the operand check states it only incidentally - if that
-			// check is ever narrowed, this one still holds the line.
+			// A QUOTED OPERATOR IS NOT AN OPERATOR, and this guard is REQUIRED
+			// rather than defence in depth - I called it equivalent and the
+			// next review disproved it by execution. A mixed-provenance token
+			// whose FIRST '>' is quoted and whose SECOND is not reaches here:
+			// without the guard it reads as a redirection and the command
+			// classifies as test, while bash invokes a command literally named
+			// '>', creates the target, exits 127 and never runs Go
+			// (#1930 round-11 f31).
 			return false, false, true
 		}
 		operand := rest[len(form):]
@@ -375,12 +384,21 @@ func acceptSimpleCommand(segment string) (words []shellToken, ok bool) {
 			}
 			continue
 		}
-		// NO `if shaped { refuse }` HERE, and that is proved rather than
-		// assumed: shaped implies the token carries an unquoted '<' or '>',
-		// and acceptedWord refuses exactly those, so the branch was
-		// unreachable. A search over 26 redirect-shaped candidates found zero
-		// tokens that are shaped, rejected, and word-acceptable. Dead code a
-		// mutant cannot kill is deleted rather than excused (#1930 round-10).
+		// NO `if shaped { refuse }` HERE - and this time the reason is checked
+		// by a test rather than asserted. Round 10 deleted that branch on the
+		// claim that shaped implies an unquoted angle bracket. The claim was
+		// FALSE as written, because shaped ignored provenance: a fully quoted
+		// "&>literal" was shaped while being an ordinary argument, which is the
+		// live class the round-11 review found (f30). The provenance fix in
+		// acceptedRedirection is what MAKES the implication true - shaped now
+		// requires an unquoted '<' or '>', and acceptedWord bars exactly those
+		// - so re-adding the branch would ship code no mutant can kill.
+		// TestPhaseGrammarShapedImpliesWordRefusal pins the implication and is
+		// KILLED by dropping provenance from shaped - it reports the reviewer's
+		// own "&>literal" token as the resurrected case. It is NOT killed by
+		// unbarring '<' and '>' in acceptedWord (measured): every shaped token
+		// that acceptedRedirection rejects also carries a barred OPERAND
+		// character, so the angles are not what closes that leg.
 		if !acceptedWord(token) {
 			return nil, false
 		}
