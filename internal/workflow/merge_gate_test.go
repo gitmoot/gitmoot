@@ -5814,3 +5814,83 @@ func insertMergeGateHeadlessReviewAt(t *testing.T, store *db.Store, id, agent, d
 
 // boolPtr expresses an explicit false in a table whose default is true.
 func boolPtr(v bool) *bool { return &v }
+
+// TestPolicyMergeGateBlocksASessionReviewObjectionWithNeitherHeadNorRound is
+// #1950's P1 F1, and it is built through the PRODUCTION session writers rather
+// than a hand-assembled row, because the whole point is what those writers
+// actually persist: OpenExternalJob stores neither HeadSHA nor ReviewRound and
+// demotes any supplied head to a display event (session_job.go:85-125), and
+// CloseExternalJobWithUsage then stores the verdict and succeeds the row
+// (session_job.go:170-190). That is `gitmoot job record --type review`
+// (internal/cli/job_session.go:214-305).
+//
+// A predicate that excluded roundless rows dropped this real objection and let
+// the external merge complete. The discriminator is ORIGIN - the row is
+// externally driven - never the absence of a round.
+func TestPolicyMergeGateBlocksASessionReviewObjectionWithNeitherHeadNorRound(t *testing.T) {
+	ctx := context.Background()
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
+	})
+
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	if _, err := mailbox.OpenExternalJob(ctx, JobRequest{
+		ID:          "session-review-objection",
+		Agent:       "session-reviewer",
+		Action:      "review",
+		Repo:        "gitmoot/gitmoot",
+		PullRequest: 9,
+		TaskID:      "task-9",
+		HeadSHA:     "head123", // demoted to a display event on purpose
+		Sender:      "session",
+	}); err != nil {
+		t.Fatalf("OpenExternalJob returned error: %v", err)
+	}
+	closed, err := mailbox.CloseExternalJobWithUsage(ctx, "session-review-objection", AgentResult{
+		Decision: "changes_requested", Severity: reviewseverity.P1, Summary: "session objection",
+	}, 0, "", "", ExternalJobUsage{})
+	if err != nil {
+		t.Fatalf("CloseExternalJobWithUsage returned error: %v", err)
+	}
+	// The writers really do leave both fields empty - assert it rather than trust
+	// the comment, since the whole finding turned on this being true.
+	closedPayload, err := unmarshalPayload(closed.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload: %v", err)
+	}
+	if strings.TrimSpace(closedPayload.HeadSHA) != "" || strings.TrimSpace(closedPayload.ReviewRound) != "" {
+		t.Fatalf("session review payload head=%q round=%q, want both empty; the fixture no longer reproduces the finding",
+			closedPayload.HeadSHA, closedPayload.ReviewRound)
+	}
+	if !closed.ExternallyDriven {
+		t.Fatalf("session review job ExternallyDriven=false, want true; the discriminator this fix relies on is absent")
+	}
+
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request.Reviewer = "audit"
+	request.ExpectedTaskState = string(TaskReadyToMerge)
+
+	decision, evalErr := gate.Evaluate(ctx, request)
+
+	if evalErr != nil {
+		t.Fatalf("Evaluate returned error: %v", evalErr)
+	}
+	if decision.Merged || len(gh.merges) != 0 {
+		t.Fatalf("decision=%+v merges=%d, want NO merge: a session review objection carrying neither head nor round is a real blocking verdict (#1933/#1950 F1)",
+			decision, len(gh.merges))
+	}
+	task, taskErr := store.GetTask(ctx, "task-9")
+	if taskErr != nil {
+		t.Fatalf("GetTask: %v", taskErr)
+	}
+	if task.State != string(TaskReadyToMerge) {
+		t.Fatalf("task state = %q, want %q: the gate must not transition or claim the task state when a session objection blocks",
+			task.State, string(TaskReadyToMerge))
+	}
+}

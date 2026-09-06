@@ -987,8 +987,10 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	//     distinct ways. sameCorrelatedTask already filtered by repo/PR/branch. Then:
 	//     a DELEGATION CHILD is headless by engine design and is judged through its
 	//     parent's fan-out evidence; an INTEGRATION-WORKTREE row has its head
-	//     cleared so it can validate an isolated tree; and a row with NEITHER head
-	//     NOR round is an unattributable delegation remnant, not a verdict. All
+	//     cleared so it can validate an isolated tree; and an ENGINE-INSERTED
+	//     roundless row is an unattributable delegation remnant. That last test is
+	//     on ORIGIN, never on roundlessness: an EXTERNALLY DRIVEN session review
+	//     legitimately carries neither head nor round and IS a real objection. All
 	//     three point the OPPOSITE way from everything else here - including any of
 	//     them would block every head forever, which no push could ever clear.
 	//   - LATEST: among survivors the newest row decides, by the same
@@ -1023,23 +1025,32 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if isDelegationChild(review.job) {
 			continue
 		}
-		// NOT APPLICABLE, THIRD SHAPE, and this one is a JUDGEMENT I am recording
-		// rather than burying. A row that records NEITHER a head NOR a review round
-		// matches no production path that produces a reviewer verdict: an
-		// engine-dispatched review carries a ReviewRound, and a CLI-dispatched
-		// `gitmoot agent review` carries a HeadSHA and no round (which is what
-		// mergeGateReviewFixture.emptyRound documents), so it is never headless. What
-		// does produce this shape is a delegation child whose linkage columns were
-		// never written, and
-		// TestPolicyMergeGateDelegatedReviewEvidenceEnumeration's PARENT_ONLY and
-		// NEITHER_PARENT linkage variants assert - as wantExcluded - that such a row
-		// is UNATTRIBUTABLE and must be ignored rather than allowed to block.
+		// NOT APPLICABLE, THIRD SHAPE - AND ROUNDLESSNESS IS NOT THE TEST. An earlier
+		// version excluded EVERY roundless row, reasoning that no production path
+		// persists a verdict with neither head nor round. THAT WAS FALSE, and a
+		// reviewer proved it by execution rather than by argument: `gitmoot job record
+		// --type review` (internal/cli/job_session.go:214-305) opens an EXTERNALLY
+		// DRIVEN session job through OpenExternalJob, which deliberately persists
+		// neither HeadSHA nor ReviewRound and demotes any supplied head to a display
+		// event (internal/workflow/session_job.go:85-125); CloseExternalJobWithUsage
+		// then stores changes_requested and succeeds the row (session_job.go:170-190).
+		// A roundless headless row can therefore be a REAL blocking objection, and
+		// excluding it left #1933's bypass reachable while the ledger claimed a fix.
 		//
-		// THE RISK, stated for the reviewer to attack: if some production path can
-		// persist a genuine reviewer objection with no head AND no round, this
-		// qualifier would leave #1933's bypass reachable for that shape. I could not
-		// find one, and the two shapes above are the only writers I traced.
-		if strings.TrimSpace(review.payload.ReviewRound) == "" {
+		// What must still be ignored is the UNATTRIBUTABLE DELEGATION REMNANT: a child
+		// whose linkage columns were never written, which
+		// TestPolicyMergeGateDelegatedReviewEvidenceEnumeration's PARENT_ONLY and
+		// NEITHER_PARENT variants assert as wantExcluded. The discriminator is ORIGIN:
+		// db.Job.ExternallyDriven is set only by CreateExternallyDrivenJobWithEvent and
+		// every other insert leaves it at its default 0
+		// (internal/db/store_jobs.go:184), so a session review is positively
+		// identified rather than inferred from what its payload lacks.
+		//
+		// IT FAILS CLOSED BY CONSTRUCTION: a row is excluded only when it is BOTH
+		// engine-inserted AND roundless - provably the remnant shape. Every other
+		// combination, including any shape neither I nor the reviewer has enumerated,
+		// reaches the block below rather than slipping past it.
+		if !review.job.ExternallyDriven && strings.TrimSpace(review.payload.ReviewRound) == "" {
 			continue
 		}
 		// NOT APPLICABLE, and this exclusion is the difference between a gate and a
