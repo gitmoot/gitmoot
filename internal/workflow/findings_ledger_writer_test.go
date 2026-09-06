@@ -119,7 +119,8 @@ func TestLedgerObligationBriefNamesEveryUIDAReviewerMustCite(t *testing.T) {
 	}
 	// And once observed here, the brief stops asking.
 	if _, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
-		Repo: "gitmoot/gitmoot", PullRequest: 1850, HeadSHA: headB, ObserverJob: "review-2",
+		Severity: "P2",
+		Repo:     "gitmoot/gitmoot", PullRequest: 1850, HeadSHA: headB, ObserverJob: "review-2",
 		ContinuesUID: uid, State: db.FindingAnswered, Title: "unfixed defect", File: "internal/run.go",
 		EvidenceKind: db.EvidenceExecuted, ExecutedCommands: []string{"go test -> ok"}, ExecutedCount: 1,
 	}); err != nil {

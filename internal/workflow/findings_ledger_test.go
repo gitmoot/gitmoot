@@ -148,7 +148,8 @@ func TestLedgerRefusesAnEvidenceFreeDischarge(t *testing.T) {
 	store := ledgerStore(t)
 
 	staticNoRationale := db.ReviewFindingObservation{
-		Repo: "owner/repo", PullRequest: 7, HeadSHA: headA, State: db.FindingOpen,
+		Severity: "P2",
+		Repo:     "owner/repo", PullRequest: 7, HeadSHA: headA, State: db.FindingOpen,
 		EvidenceKind: db.EvidenceStatic, EvidenceLocator: "internal/workflow/run.go:1977",
 	}
 	if _, err := store.RecordReviewFindingObservation(ctx, staticNoRationale); !errors.Is(err, db.ErrFindingDischarge) {
@@ -163,7 +164,8 @@ func TestLedgerRefusesAnEvidenceFreeDischarge(t *testing.T) {
 
 	// QUOTED establishes nothing, so it cannot discharge.
 	quoted := db.ReviewFindingObservation{
-		Repo: "owner/repo", PullRequest: 7, HeadSHA: headA, State: db.FindingAnswered,
+		Severity: "P2",
+		Repo:     "owner/repo", PullRequest: 7, HeadSHA: headA, State: db.FindingAnswered,
 		EvidenceKind: db.EvidenceQuoted, SourceJob: "local-implement-1",
 	}
 	if _, err := store.RecordReviewFindingObservation(ctx, quoted); !errors.Is(err, db.ErrFindingQuotedDischarge) {
