@@ -30,8 +30,17 @@ var ErrRuntimeNotStageable = errors.New("runtime cannot be staged")
 var runtimeStagers sync.Map // published path -> *sync.Mutex
 
 // RuntimeRoot returns the daemon-owned directory holding staged runtime copies.
+//
+// IT IS A SIBLING OF THE TOOLCHAIN ROOT, NOT A CHILD OF IT, and that placement
+// is load-bearing. Collect() removes every entry under Root() that is not a
+// PINNED TOOLCHAIN IDENTITY, so a runtimes/ directory living there was deleted
+// out from under staging: measured as "mkdirat codex-….staging-…: no such file
+// or directory" and a deterministic failure of
+// TestTrackedPoolIsolationHonorsSamePassRuntimeSibling - 3/3 fail with the
+// nested placement, 3/3 pass at base. Runtime copies are not toolchain versions
+// and must not be judged by a toolchain retention list.
 func RuntimeRoot(gitmootHome string) string {
-	return filepath.Join(Root(gitmootHome), RuntimeDirName)
+	return filepath.Join(gitmootHome, RuntimeDirName)
 }
 
 // StageRuntime materialises a daemon-owned copy of ONE runtime's executable and,
