@@ -48,6 +48,18 @@ var stuckReasonEventKinds = []string{
 // "not stuck / no derivable reason" — callers must render nothing so healthy
 // output is byte-stable.
 type stuckReason struct {
+	// Class and Attempt identify WHICH deferral this hold came from, empty/zero for
+	// holds derived from an event. They exist so a watcher that already printed HOLD
+	// can recognise the one blocker_deferred event PAIRED with it and not state that
+	// deferral twice (#1943 F4/f6). Class alone was not enough: it also matched every
+	// later retry of the same class. Neither field is ever rendered.
+	//
+	// The pairing is exact rather than heuristic because ONE function writes both
+	// sides: job_blocker_checkout.go:199 sets payload.BlockerAttempts = attempt and
+	// :215 formats "attempt <attempt>/<max>" into the event, and job_blocker.go does
+	// the same for the other classes.
+	Class       string
+	Attempt     int
 	Reason      string // e.g. "waiting on runtime session lock ...", "blocked: awaiting human", "auth failing: ..."
 	NextRetryAt string // an RFC3339 lease expiry when one applies (a runtime-session lock), else ""
 	// SuggestedAction is a concrete human-facing remedy for a deferral that usually
@@ -71,6 +83,15 @@ func deriveStuckReason(job db.Job, reasonEvent db.JobEvent, hasReasonEvent bool,
 		return stuckReason{}
 	}
 	if !hasReasonEvent {
+		// THE REASON MAY ALREADY BE PERSISTED EVEN WITH NO REASON-BEARING EVENT
+		// HERE (#1887, #1553). A deferral writes payload.blocker_class before the
+		// job goes back on the queue, and a withheld job's holder is visible in the
+		// resource locks, so a row rendering as bare `queued` is a DISPLAY gap over
+		// data that exists rather than an absence of data. The operator cost is
+		// real: a review sat queued 16 minutes with nothing surfacing why.
+		if held := deriveQueueHoldReason(job); !held.empty() {
+			return held
+		}
 		// A blocked job with no reason-bearing event is still stuck by definition;
 		// surface the bare state so it is never silently unexplained. A plain queued
 		// job with only lifecycle events is not yet "stuck" — leave it silent.
@@ -131,6 +152,63 @@ func deriveStuckReason(job db.Job, reasonEvent db.JobEvent, hasReasonEvent bool,
 		}
 		return stuckReason{Reason: withDetail(label, msg)}
 	}
+}
+
+// deriveQueueHoldReason explains a queued/blocked row from state that is ALREADY
+// persisted, for the case where no reason-bearing event is available to this
+// caller: #1887's operational deferral (payload.blocker_class, written by the
+// classifier in job_blocker.go) and #1553's withheld job (another job holds a
+// resource naming this job's repo).
+//
+// IT RENDERS NOTHING FOR AN ORDINARY QUEUED JOB, and that is load-bearing rather
+// than incidental. The zero value means "no derivable reason" and healthy output
+// must stay byte-stable, so this must not become an annotation on every queued
+// row - which is exactly what a reader would see if the two guards below were
+// dropped.
+func deriveQueueHoldReason(job db.Job) stuckReason {
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		return stuckReason{}
+	}
+	if class := strings.TrimSpace(payload.BlockerClass); class != "" {
+		retry := strings.TrimSpace(payload.BlockerRetryAt)
+		reason := "deferred (" + class + ")"
+		if retry == "" {
+			// A MISSING RETRY TIME MUST READ AS UNKNOWN, NEVER AS A ZERO TIME.
+			// Measured: 42 of 55 succeeded checkout_contention rows carry a null
+			// retry_at, so absence is the COMMON case. Formatting an empty timestamp
+			// would print 0001-01-01, which reads as a retry long overdue.
+			reason += ", retry time unknown"
+		}
+		return stuckReason{
+			Class:           class,
+			Attempt:         payload.BlockerAttempts,
+			Reason:          reason,
+			NextRetryAt:     retry,
+			SuggestedAction: strings.TrimSpace(payload.BlockerSuggestedAction),
+		}
+	}
+	// #1553's WITHHELD CAUSE IS NOT INFERRED HERE, ON PURPOSE, AND TWO ATTEMPTS TO
+	// INFER IT BOTH INVENTED HOLDS. The first scanned resource_locks with
+	// strings.Contains(key, repo), so the production-shaped key
+	// "merge-queue:owner/repository:main" was attributed to an ordinary owner/repo
+	// job; real keys are "runtime:<rt>:<ref>" and "checkout-mutation:<abs path>" and
+	// encode no repo segment, so that match could not be made sound. The second read
+	// branch_locks, which was the wrong INFERENCE rather than the wrong table: a
+	// branch lock records who owns a LANE, not who is withholding THIS job.
+	// Production acquires that lock with Owner=<agent> BEFORE enqueuing that same
+	// agent's implement job (workflow.go:1273), so a compiled-CLI probe rendered an
+	// ordinary queued job as "withheld ... held by lead" - by its own agent's lock.
+	//
+	// THE ENGINE ALREADY RECORDS THIS CAUSALLY, so nothing needs inferring: the
+	// daemon pre-flight emits "branch %s is locked by %s" (workflow.go:1283),
+	// job_blocker_checkout.go classifies it as the checkout_contention BlockerClass,
+	// and persists it with a blocker_deferred event that names the branch AND the
+	// holder. That flows through the payload arm above and the reason-event path, and
+	// it is strictly better evidence: it is written only when the contention actually
+	// blocked this job. A queued row with no recorded blocker is therefore left
+	// silent rather than given a holder that a lane row cannot prove.
+	return stuckReason{}
 }
 
 // classifyAuthQuota labels a stuck-reason message as an auth or throttling

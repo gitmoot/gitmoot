@@ -522,6 +522,13 @@ func runJobEvents(args []string, stdout, stderr io.Writer) int {
 type jobWatchOutput struct {
 	Job    db.Job        `json:"job"`
 	Events []db.JobEvent `json:"events"`
+	// Held* describe the LAST HOLD OBSERVED WHILE WATCHING, not the settled state
+	// (#1887). Named for that distinction deliberately: by the time this object is
+	// emitted the job has settled, so a field called why_stuck would assert a
+	// present condition that is no longer true. Empty means no hold was seen.
+	HeldReason          string `json:"held_reason,omitempty"`
+	HeldNextRetryAt     string `json:"held_next_retry_at,omitempty"`
+	HeldSuggestedAction string `json:"held_suggested_action,omitempty"`
 }
 
 func runJobWatch(args []string, stdout, stderr io.Writer) int {
@@ -555,6 +562,23 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, s
 	var output jobWatchOutput
 	if err := withStore(home, func(store *db.Store) error {
 		nextEvent := 0
+		// lastHold suppresses repetition: this loop polls every interval, so an
+		// unconditional print would emit the same line for the whole life of a
+		// deferral. Only a CHANGE is news.
+		lastHold := ""
+		var held stuckReason
+		// pendingClass/pendingAttempt name the deferral this loop has ALREADY
+		// rendered as HOLD, and they are CONSUMED by the one event that deferral
+		// pairs with. Two earlier shapes were wrong in opposite directions and each
+		// hid or duplicated something: guarding only on the current poll's events
+		// could not retract a HOLD already emitted, so a deferral was stated twice;
+		// latching on the CLASS then swallowed every later blocker_deferred of that
+		// class, so a distinct `attempt 2/3` retry vanished from a live watch, and
+		// the class survived even when its own paired event never arrived at all.
+		// Identifying the pair by class AND attempt is what closes the split-write
+		// window without hiding the retries that follow it.
+		pendingClass := ""
+		pendingAttempt := 0
 		for {
 			job, err := store.GetJob(context.Background(), jobID)
 			if err != nil {
@@ -570,13 +594,82 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, s
 			if !jsonOutput {
 				for nextEvent < len(events) {
 					event := events[nextEvent]
-					fmt.Fprintf(stdout, "%s\t%s\n", event.Kind, event.Message)
 					nextEvent++
+					// THE PAYLOAD AND THE EVENT ARE WRITTEN IN SEPARATE STORE
+					// OPERATIONS (job_blocker_checkout.go:212 then :217), so a watcher
+					// can attach INSIDE that window: it sees the payload, prints HOLD,
+					// and the event lands on a later poll. Guarding only on the current
+					// poll's events cannot retract a HOLD already emitted, so one
+					// deferral was still stated twice under two labels (#1943 F4). Once
+					// HOLD has spoken for a deferral, the event it pairs with is
+					// redundant - and ONLY that one: consuming the match is what lets a
+					// later retry of the same class still be reported.
+					// Suppress ONLY the event paired with the hold already announced,
+					// matched against the CANONICAL PREFIX the classifiers write:
+					// "<class>: attempt <n>/" (job_blocker_checkout.go:215,
+					// job_blocker.go:504). Anchoring is load-bearing, not tidiness.
+					// Searching the whole message with Contains was wrong twice over:
+					// on the class alone it swallowed every later retry once the paired
+					// event was missing, and even with the attempt added, the FREE-FORM
+					// checkout error is appended after that prefix - so a valid attempt-2
+					// message whose detail happens to read ".../tmp/attempt 1/stale has
+					// uncommitted changes" matched the stale attempt-1 token and the
+					// retry vanished (#1943 f6, twice). The prefix is the only part of
+					// the message this code writes the format for; the tail is data.
+					// A zero attempt identifies nothing and so suppresses nothing -
+					// stating a deferral twice is a smaller fault than hiding a retry.
+					if pendingClass != "" && pendingAttempt > 0 &&
+						event.Kind == blockerDeferredEventKind &&
+						strings.HasPrefix(event.Message, fmt.Sprintf("%s: attempt %d/", pendingClass, pendingAttempt)) {
+						pendingClass = ""
+						pendingAttempt = 0
+						continue
+					}
+					fmt.Fprintf(stdout, "%s\t%s\n", event.Kind, event.Message)
 				}
 			}
 			if workflow.IsSettledJobState(job.State) {
-				output = jobWatchOutput{Job: job, Events: events}
+				output = jobWatchOutput{
+					Job:                 job,
+					Events:              events,
+					HeldReason:          held.Reason,
+					HeldNextRetryAt:     held.NextRetryAt,
+					HeldSuggestedAction: held.SuggestedAction,
+				}
 				return nil
+			}
+			// A DEFERRED JOB NEVER SETTLES, SO THIS LOOP IS WHERE AN OPERATOR SITS
+			// BLIND (#1887). Streamed events only help someone already attached when
+			// the deferral fired; anyone attaching afterwards sees nothing until the
+			// job settles, which is how a review sat queued 16 minutes with no
+			// visible cause. The reason is already persisted, so surface it.
+			// SURFACE THE HOLD ONLY WHEN NO REASON-BEARING EVENT EXISTS, and the
+			// previous version of this was wrong in a way a reviewer caught: the
+			// watcher replays EVERY event from index zero, so when a deferral has a
+			// blocker_deferred event the operator has already been told, and deriving
+			// HOLD from that same event printed the identical quota detail twice under
+			// two different labels. It also disproves the comment that used to sit
+			// here claiming an operator attaching afterwards "sees nothing" - the
+			// events replay, so they see it. What they genuinely cannot see is a hold
+			// that lives ONLY in the payload, which is #1887's actual case and the
+			// only one this line now speaks for.
+			if _, hasReason := latestReasonEvent(events); !hasReason {
+				if reason := loadStuckReason(store, job); !reason.empty() {
+					held = reason
+					line := holdLine(reason)
+					if line != lastHold {
+						lastHold = line
+						// Arm the one-event suppression for the deferral just
+						// announced. Re-arming on each CHANGE is what makes a later
+						// retry work: attempt 2 renders its own HOLD and then consumes
+						// its own paired event.
+						pendingClass = reason.Class
+						pendingAttempt = reason.Attempt
+						if !jsonOutput {
+							fmt.Fprintln(stdout, line)
+						}
+					}
+				}
 			}
 			time.Sleep(poll)
 		}
@@ -593,6 +686,21 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, s
 	}
 	fmt.Fprintf(stdout, "state: %s\n", output.Job.State)
 	return 0
+}
+
+// holdLine renders a hold for the watch surfaces. It exists so `job watch` and
+// `job watch --transcript` cannot drift: #1887 asks for the hold on `job watch`
+// without excluding transcript mode, and two copies of this formatting would let
+// one mode gain a field the other silently lacks.
+func holdLine(reason stuckReason) string {
+	line := "HOLD: " + reason.Reason
+	if reason.NextRetryAt != "" {
+		line += " (next retry " + reason.NextRetryAt + ")"
+	}
+	if reason.SuggestedAction != "" {
+		line += " [action: " + reason.SuggestedAction + "]"
+	}
+	return line
 }
 
 func runJobTranscriptWatch(jobID, home, requestedLogPath, requestedRuntime string, poll time.Duration, stdout, stderr io.Writer) int {
@@ -642,12 +750,32 @@ func runJobTranscriptWatch(jobID, home, requestedLogPath, requestedRuntime strin
 		if err := renderer.RenderHeader(transcriptHeader(context.Background(), store, job, payload, runtimeName)); err != nil {
 			return err
 		}
+		// THE HOLD IS OBSERVED EVERY POLL, NOT ONCE, and the first version of this
+		// got it wrong in the exact way a reviewer proved: it sampled the hold once
+		// before Follow, so a hold that BEGAN AFTER startup never printed. Extracting
+		// holdLine had made the two watch modes share their FORMATTING and I reported
+		// that as non-divergence - it was not, because the POLLING was still
+		// different, and the no-log arm passed only because it delegates to the event
+		// path, which does poll. Settled already runs on every interval, so the
+		// observation belongs here.
+		//
+		// AND UNLIKE THE EVENT PATH, THERE IS NO NO-REASON-EVENT GUARD HERE ON
+		// PURPOSE: transcript mode renders LOG LINES, never job events, so a hold
+		// derived from a blocker_deferred event is the only way this operator learns
+		// of it and is not the duplicate the event path had to suppress.
+		lastHold := ""
 		return transcript.Follow(context.Background(), logPath, transcript.FollowOptions{
 			PollInterval: poll,
 			Settled: func(ctx context.Context) (bool, error) {
 				current, err := store.GetJob(ctx, jobID)
 				if err != nil {
 					return false, err
+				}
+				if reason := loadStuckReason(store, current); !reason.empty() {
+					if line := holdLine(reason); line != lastHold {
+						lastHold = line
+						fmt.Fprintln(stdout, line)
+					}
 				}
 				return workflow.IsSettledJobState(current.State), nil
 			},
