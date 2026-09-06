@@ -11,6 +11,21 @@ import (
 	"testing"
 )
 
+// toolchainRootForTest returns the installation root of a resolved Go
+// executable, which is what a caller must grant now that the sandbox no longer
+// promotes one for itself. It follows symlinks first because a PATH entry is
+// frequently a link into a versioned tree.
+func toolchainRootForTest(executable string) (string, bool) {
+	if resolved, err := filepath.EvalSymlinks(executable); err == nil {
+		executable = resolved
+	}
+	binDir := filepath.Dir(filepath.Clean(executable))
+	if base := filepath.Base(binDir); base != "bin" && base != "sbin" {
+		return "", false
+	}
+	return filepath.Dir(binDir), true
+}
+
 func buildGitmootBinary(t *testing.T) string {
 	t.Helper()
 	if runtime.GOOS != "linux" {
@@ -145,7 +160,27 @@ if { printf mutated > "$2"; } 2>/dev/null; then exit 41; fi
 if { printf metadata-mutated > "$3"; } 2>/dev/null; then exit 42; fi
 if cat "$4" >/dev/null 2>&1; then exit 43; fi
 `
-	command := exec.Command(gitmoot, "sandbox-exec", "--read-only-workdir", "--read", workdir, "--read", gitMetadataDir, "--write", cacheDir, "--", "/bin/sh", "-c", script, "gitmoot-test", cacheArtifact, source, metadataFile, outsideFile)
+	// THE TOOLCHAIN ROOT IS GRANTED EXPLICITLY, exactly as production now grants
+	// its daemon-owned staged copy (#1921, ruling 122157). This test runs the
+	// HOST `go` inside the sandbox, and it used to work only because the sandbox
+	// PROMOTED the toolchain install root into the read set by itself. That
+	// promotion is deleted, so a caller that needs a toolchain must say so -
+	// which is the whole point of the ownership change. Measured on CI without
+	// this grant: "gitmoot-test: 2: go: Permission denied", exit 126, because
+	// GitHub runners install Go at /usr/local/go.
+	//
+	// It grants ONLY the toolchain, so every assertion below still bites: the
+	// workdir stays read-only, the linked git metadata stays immutable, and the
+	// outside credential stays unreadable.
+	readArgs := []string{"--read", workdir, "--read", gitMetadataDir}
+	if resolved, lookErr := exec.LookPath("go"); lookErr == nil {
+		if root, ok := toolchainRootForTest(resolved); ok {
+			readArgs = append(readArgs, "--read", root)
+		}
+	}
+	args := append([]string{"sandbox-exec", "--read-only-workdir"}, readArgs...)
+	args = append(args, "--write", cacheDir, "--", "/bin/sh", "-c", script, "gitmoot-test", cacheArtifact, source, metadataFile, outsideFile)
+	command := exec.Command(gitmoot, args...)
 	command.Dir = workdir
 	command.Env = []string{
 		"PATH=" + os.Getenv("PATH"),

@@ -26,6 +26,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/sandbox"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
+	"github.com/gitmoot/gitmoot/internal/toolchain"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -1812,17 +1813,46 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	// where it did not. An operator-visible fact about the host belongs in the
 	// daemon's log, not in a job's event stream.
 	//
-	// Failure is NOT fatal either way: the seat then behaves exactly as it did
-	// before this change, which is a visible exit 126 rather than a broken
-	// launch. "Exactly as before" has to include emitting no extra event.
-	if staged, stagedEnv, diagnostic := stageSeatToolchain(paths); diagnostic != "" {
+	// Failure publishes an engine-owned exit-126 command; inability to publish
+	// that fail-closed path aborts setup rather than exposing the host copy.
+	staged, stagedEnv, diagnostic, err := stageSeatToolchain(paths)
+	if err != nil {
+		return grants, err
+	}
+	if diagnostic != "" {
 		fmt.Fprintf(os.Stderr, "gitmoot: read-only seat toolchain: %s\n", diagnostic)
-	} else if staged != "" {
+	}
+	if staged != "" {
 		if err := validateStagedToolchainPlacement(staged, grants.writes); err != nil {
 			return grants, err
 		}
 		grants.reads = append(grants.reads, staged)
 		grants.env = append(grants.env, stagedEnv...)
+	}
+	// Runtime executables are staged beside the Go toolchain and exposed by
+	// fingerprint-local shims. Grant the PUBLISHED roots the daemon owns, never
+	// the operator PATH roots they were copied from (#1921, ruling 122157).
+	stagedRuntimes, runtimeDiagnostics, err := stageSeatRuntimes(paths)
+	if err != nil {
+		return grants, err
+	}
+	for _, diagnostic := range runtimeDiagnostics {
+		fmt.Fprintf(os.Stderr, "gitmoot: read-only seat runtime: %s\n", diagnostic)
+	}
+	for _, shim := range stagedRuntimes {
+		root, err := toolchain.StagedRuntimeRoot(paths.Home, shim)
+		if err != nil {
+			return grants, err
+		}
+		if err := validateStagedToolchainPlacement(root, grants.writes); err != nil {
+			return grants, err
+		}
+		grants.reads = append(grants.reads, root)
+	}
+	var pathDiagnostics []string
+	grants.env, pathDiagnostics = withSeatRuntimePath(grants.env, stagedRuntimes)
+	for _, diagnostic := range pathDiagnostics {
+		fmt.Fprintf(os.Stderr, "gitmoot: read-only seat runtime: %s\n", diagnostic)
 	}
 	// BOUNDED, because a read on the worker path must not be able to hang seat
 	// setup: the previous form copied the entire database under a hardcoded
