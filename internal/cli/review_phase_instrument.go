@@ -175,10 +175,32 @@ func splitCommandSegments(command string) []string {
 			// flushes an already-empty buffer.
 			flush()
 		case '&':
-			if i+1 < len(runes) && runes[i+1] == '&' {
-				i++
+			// `N>&M` IS ONE TOKEN, NOT TWO COMMANDS. A lone '&' after a
+			// redirect operator duplicates a file descriptor - `2>&1` is the
+			// single most common suffix on a real test command - so flushing on
+			// it split `go test ./... 2>&1` into two segments and returned
+			// `mixed` for a plain test run. Third time this class has
+			// undercounted the bucket under investigation (#1930 review f19).
+			previous := rune(0)
+			if written := current.String(); written != "" {
+				previous = []rune(written)[len([]rune(written))-1]
 			}
-			flush()
+			switch {
+			case i+1 < len(runes) && runes[i+1] == '&':
+				// `&&` sequences.
+				i++
+				flush()
+			case previous == '>' || previous == '<':
+				// `2>&1`, `1>&2`: part of the redirect.
+				current.WriteRune(r)
+			case i+1 < len(runes) && runes[i+1] == '>':
+				// `&>file`, `&>>file`: bash's combined redirect.
+				current.WriteRune(r)
+			default:
+				// A bare trailing `&` backgrounds the command; the command
+				// itself is still the segment.
+				flush()
+			}
 		default:
 			current.WriteRune(r)
 		}

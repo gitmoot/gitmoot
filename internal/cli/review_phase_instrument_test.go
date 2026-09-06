@@ -60,6 +60,20 @@ func TestClassifyPhaseCommandClassifiesEverySegment(t *testing.T) {
 		// #1930 review F12: whitespace-only splitting consumed just the first
 		// quoted word of a flag value, leaving its tail looking like the
 		// wrapped command - which classified as other.
+		// #1930 review f19, all seven measured by the reviewer: `N>&M` is ONE
+		// token (a file-descriptor duplication), not two commands joined by a
+		// background operator, and `2>&1` is the most common suffix on a real
+		// test command. My quote-aware rewrite flushed on any unquoted '&',
+		// so every one of these returned mixed.
+		{"stderr redirect", "go test ./... 2>&1", phaseBucketTest},
+		{"stdout to null plus stderr redirect", "go build ./... > /dev/null 2>&1", phaseBucketBuild},
+		{"redirect then pipe", "go test ./... 2>&1 | tee test.log", phaseBucketTest},
+		{"stdout into stderr", "go test ./... 1>&2", phaseBucketTest},
+		{"nested shell with redirects", `bash -c "go test ./..." > test.log 2>&1`, phaseBucketTest},
+		{"combined redirect", "go test ./... &> test.log", phaseBucketTest},
+		{"backgrounded command still classifies", "go test ./... &", phaseBucketTest},
+		// And the operator must still separate when it really is one.
+		{"real background-and-then sequence", "go build ./... && go test ./...", phaseBucketMixed},
 		{"quoted multi-word time format", `time -f "%e %M" go test ./...`, phaseBucketTest},
 		{"quoted multi-word sudo user", `sudo -u "display name" go test ./...`, phaseBucketTest},
 		{"quoted value with single quotes", `time -f '%e %M' go build ./...`, phaseBucketBuild},
