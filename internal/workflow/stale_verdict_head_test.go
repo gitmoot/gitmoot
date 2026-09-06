@@ -100,11 +100,14 @@ func TestObjectionAtCurrentHeadStillRequestsChanges(t *testing.T) {
 // ADVANCES. This is the case a retracted ruling would have refused transiently,
 // and its ABSENCE from the suite is what let that ruling look safe.
 //
-// Refusing here would be a LIVENESS loss, not a merge risk. An earlier version
-// of this comment claimed the opposite - that refusing would let the gate "merge
-// on an approval over a real current-head objection nobody recorded" - and
-// #1903's third review round found that claim still living here after the
-// function comment had been corrected.
+// Refusing here would be a LIVENESS loss - the conservative transition and the
+// inline fix pass withheld. NO CLAIM IS MADE HERE ABOUT WHAT REFUSING DOES TO A
+// MERGE, in either direction: that inference is the same one round 10 killed as a
+// P1, because the gate reads the review rows AND the task state. An earlier
+// version of this comment made it in the merge-ward direction - that refusing
+// would let the gate "merge on an approval over a real current-head objection
+// nobody recorded" - and #1903's third review round found that claim still living
+// here after the function comment had been corrected.
 //
 // WHAT THIS ARM NEEDS FROM PolicyMergeGate IS ONE INVARIANT, NOT A MAP OF ITS
 // BEHAVIOUR. Seven review rounds on this PR each killed a different attempt to
