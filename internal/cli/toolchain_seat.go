@@ -24,43 +24,34 @@ import (
 // cannot be closed by any rule, only narrowed. Copying a tree the daemon owns
 // removes the outside root, so there is nothing left to contain.
 //
-// SCOPE IS THE OPERATOR-PINNED TOOLCHAIN ONLY. A toolchain under a system
-// package root keeps its pre-existing location-only grant inside
-// internal/sandbox and is deliberately untouched here: that behaviour predates
-// #1878, was never the requirement, and there is no evidence about packaged
-// layouts that would justify changing it. A previous attempt changed that arm
-// without such evidence and regressed all four prefixes.
+// EVERY INSTALLATION PREFIX IS IN SCOPE (#1921, ruling 122157). `/opt`,
+// `/usr/local`, `/nix/store`, `/snap`, and profile paths all take the same copy
+// path; ownership of the operator's parent directory is irrelevant once no
+// recursive rule is granted over it.
 //
-// FAILURE IS A DIAGNOSTIC, NOT AN ERROR. If `go` cannot be found, is not a
-// pinned installation, or cannot be staged, the seat is left exactly as it was
-// before this change: no grant, and a visible exit 126 if it tries to build.
-// Refusing to launch the sandbox instead would turn a missing convenience into
-// an outage.
-func stageSeatToolchain(paths config.Paths) (string, []string, string) {
+// FAILURE IS EXPLICIT. If `go` is absent, unpinned, or cannot be copied, an
+// engine-owned exit-126 command shadows any later host PATH entry. Failure to
+// publish that command aborts seat setup: falling through to the host copy would
+// silently restore the grant class this cutover removes.
+func stageSeatToolchain(paths config.Paths) (string, []string, string, error) {
 	resolved, err := exec.LookPath("go")
 	if err != nil {
-		return "", nil, ""
+		return unavailableSeatToolchain(paths, "")
 	}
-	source, ok := pinnedToolchainRoot(resolved)
+	source, ok := toolchainInstallRoot(resolved)
 	if !ok {
-		// A system-prefix or otherwise unpinned toolchain: not this path's
-		// business, and silence rather than a diagnostic because it is the
-		// normal case on a packaged host.
-		return "", nil, ""
+		return unavailableSeatToolchain(paths, "resolved Go executable is not inside a bin/ or sbin/ installation; host copy is shadowed")
 	}
 	staged, err := toolchain.Stage(paths.Home, source)
 	if err != nil {
 		if errors.Is(err, toolchain.ErrNotPinned) {
-			return "", nil, ""
+			return unavailableSeatToolchain(paths, "resolved Go installation is not pinned; host copy is shadowed")
 		}
-		return "", nil, fmt.Sprintf("staged toolchain unavailable, seat has no Go toolchain: %v", err)
+		return unavailableSeatToolchain(paths, fmt.Sprintf("staged toolchain unavailable; host copy is shadowed: %v", err))
 	}
 	path, diagnostic := seatPath(staged)
 	if diagnostic != "" {
-		// No staged toolchain rather than an unpinned one: returning the staged
-		// root with a PATH that does not point at it would claim a pin this
-		// shape cannot hold.
-		return "", nil, diagnostic
+		return unavailableSeatToolchain(paths, diagnostic)
 	}
 	return staged, []string{
 		"GOROOT=" + staged,
@@ -70,7 +61,136 @@ func stageSeatToolchain(paths config.Paths) (string, []string, string) {
 		// selector too: an empty GOTOOLCHAIN invites the auto-download a
 		// sandboxed seat cannot complete.
 		"GOTOOLCHAIN=local",
-	}, ""
+	}, "", nil
+}
+
+func unavailableSeatToolchain(paths config.Paths, diagnostic string) (string, []string, string, error) {
+	command, err := toolchain.StageUnavailableRuntime(paths.Home, "go")
+	if err != nil {
+		return "", nil, diagnostic, fmt.Errorf("publish unavailable Go command: %w", err)
+	}
+	root, err := toolchain.StagedRuntimeRoot(paths.Home, command)
+	if err != nil {
+		return "", nil, diagnostic, err
+	}
+	env, pathDiagnostics := withSeatRuntimePath(nil, []string{command})
+	if len(pathDiagnostics) != 0 {
+		return "", nil, diagnostic, fmt.Errorf("publish unavailable Go command: %s", strings.Join(pathDiagnostics, "; "))
+	}
+	return root, env, diagnostic, nil
+}
+
+// seatRuntimeNames are the runtimes a read-only seat may need to LAUNCH. Each is
+// a runtime this engine dispatches jobs to, so the list is derived from what the
+// engine can start rather than from what happens to be installed on a host.
+var seatRuntimeNames = []string{"claude", "kimi", "codex"}
+
+// stageSeatRuntimes materialises one engine-owned command for every runtime
+// class the engine can dispatch. Each INSTALLED runtime becomes a copied
+// artifact; each missing or unstageable one becomes an explicit exit-126 command
+// so inherited PATH entries cannot route around the policy.
+//
+// EVERY INSTALLED RUNTIME IS STAGED, not only the seat's own. A seat's prompt
+// may legitimately invoke a sibling runtime, and contract item 5 of ruling
+// 122157 requires the actual installed Claude, Kimi and Codex to LAUNCH from
+// staged copies - "a design that merely turns all four into MISSING is not
+// accepted". Copies are content-addressed, so the second seat wanting the same
+// runtime reuses the first seat's tree instead of copying again.
+//
+// WHY COPIES AND NOT GRANTS (#1921 review rounds 1-3, ruling 122157). Three
+// rounds tried to make a recursive Landlock grant over the OPERATOR's install
+// root safe by inspecting that root. Round 1 withheld the grant for a list of
+// credential filenames; the list can never be complete, and kimi's config.toml
+// carried api_key material that was not on it. Round 3 required positive proof of
+// a package tree; both markers are PLANTABLE, and a probe built
+// node_modules/operator-profile/{package.json,bin/kimi,config.toml} and read the
+// mode-0600 config. That round also showed the Lstat scan is a time-of-check
+// decision guarding a RECURSIVE grant, so a credential created after setup lands
+// inside an already-granted tree.
+//
+// Markers prove SHAPE, never IMMUTABILITY, and no pre-exec check constrains
+// descendants that do not exist yet. So the grant is REMOVED rather than
+// narrowed: the engine copies each runtime's own artifact into a tree it created
+// and grants that. A daemon-owned tree has no operator-writable descendants to
+// appear later, which closes the class rather than its two known instances.
+func stageSeatRuntimes(paths config.Paths) ([]string, []string, error) {
+	var staged []string
+	var diagnostics []string
+	for _, name := range seatRuntimeNames {
+		if resolved, lookupErr := exec.LookPath(name); lookupErr == nil {
+			copied, stageErr := toolchain.StageRuntime(paths.Home, name, resolved)
+			if stageErr == nil {
+				staged = append(staged, copied)
+				continue
+			}
+			diagnostics = append(diagnostics, fmt.Sprintf("runtime %s could not be staged; installed copy is shadowed: %v", name, stageErr))
+		}
+		unavailable, err := toolchain.StageUnavailableRuntime(paths.Home, name)
+		if err != nil {
+			return nil, diagnostics, fmt.Errorf("publish unavailable runtime %s: %w", name, err)
+		}
+		staged = append(staged, unavailable)
+	}
+	return staged, diagnostics, nil
+}
+
+// seatRuntimePathEntries turns staged executables into PATH entries, deduplicated
+// and in a stable order.
+//
+// An entry containing the list separator is REFUSED rather than shipped: PATH
+// cannot express one, so it would split and the seat would resolve the operator's
+// copy instead of the staged one, which is the exposure this change removes.
+func seatRuntimePathEntries(stagedExecutables []string) ([]string, []string) {
+	var entries []string
+	var diagnostics []string
+	seen := map[string]bool{}
+	for _, executable := range stagedExecutables {
+		dir := filepath.Dir(executable)
+		if strings.ContainsRune(dir, os.PathListSeparator) {
+			diagnostics = append(diagnostics, fmt.Sprintf("staged runtime path %q contains %q and cannot be a PATH entry", dir, string(os.PathListSeparator)))
+			continue
+		}
+		if seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		entries = append(entries, dir)
+	}
+	return entries, diagnostics
+}
+
+// withSeatRuntimePath prepends fingerprint-local runtime shim directories to
+// the PATH already prepared for the staged Go toolchain. If Go was not staged,
+// it prepends them to the inherited PATH directly.
+//
+// The host PATH remains behind the shims for ordinary system commands. The
+// runtime names cannot fall through to their host copies when staging succeeds,
+// because every configured name has a shim in the prefix. A staging failure is
+// emitted by stageSeatRuntimes; the follow-up fail-stub test pins the explicit
+// exit rather than silently executing the host copy.
+func withSeatRuntimePath(env []string, stagedExecutables []string) ([]string, []string) {
+	entries, diagnostics := seatRuntimePathEntries(stagedExecutables)
+	if len(entries) == 0 {
+		return env, diagnostics
+	}
+	prefix := strings.Join(entries, string(os.PathListSeparator))
+	for i, item := range env {
+		if !strings.HasPrefix(item, "PATH=") {
+			continue
+		}
+		current := strings.TrimPrefix(item, "PATH=")
+		if current == "" {
+			env[i] = "PATH=" + prefix
+		} else {
+			env[i] = "PATH=" + prefix + string(os.PathListSeparator) + current
+		}
+		return env, diagnostics
+	}
+	current := strings.TrimSpace(os.Getenv("PATH"))
+	if current == "" {
+		current = "/usr/local/bin:/usr/bin:/bin"
+	}
+	return append(env, "PATH="+prefix+string(os.PathListSeparator)+current), diagnostics
 }
 
 // seatPath puts the staged toolchain first and KEEPS the inherited PATH behind
@@ -123,25 +243,23 @@ func seatPath(staged string) (string, string) {
 	return stagedBin + string(os.PathListSeparator) + inherited, ""
 }
 
-// pinnedToolchainRoot reports the installation root of an OPERATOR-PINNED
-// toolchain, and refuses a system package root.
+// toolchainInstallRoot reports the installation root containing a Go
+// executable. Every root is staged — including /opt, /usr/local, /nix/store and
+// /snap — because ruling 122157 removed the split ownership that previously
+// handed those prefixes to optionalSystemToolchainRoot.
 //
-// The four system prefixes are named here only to EXCLUDE them, so that the
-// pre-existing grant in internal/sandbox remains the single owner of that case
-// and this path cannot silently start competing with it.
-func pinnedToolchainRoot(goExecutable string) (string, bool) {
+// THE OLD SYSTEM-PREFIX EXCLUSION WAS THE SAME DEFECT AT A DIFFERENT SITE. It
+// left the operator's root in place and compensated with a recursive read grant.
+// Review round 3 proved that no inspection can make such a grant safe: the
+// root's shape says nothing about who can create a descendant after setup.
+// Returning every installation layout here does not TRUST the root; it makes the
+// daemon COPY it before the seat sees it.
+func toolchainInstallRoot(goExecutable string) (string, bool) {
 	binDir := filepath.Dir(filepath.Clean(goExecutable))
 	if base := filepath.Base(binDir); base != "bin" && base != "sbin" {
 		return "", false
 	}
-	root := filepath.Dir(binDir)
-	for _, systemPrefix := range []string{"/opt", "/usr/local", "/nix/store", "/snap"} {
-		relative, err := filepath.Rel(systemPrefix, root)
-		if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-			return "", false
-		}
-	}
-	return root, true
+	return filepath.Dir(binDir), true
 }
 
 // validateStagedToolchainPlacement is this shape's P1 expressed as code.

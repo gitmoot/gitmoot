@@ -8,7 +8,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/toolchain"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -102,10 +104,20 @@ func TestReadOnlySeatJobRunShipsAPathThatResolvesRuntimeBinariesE2E(t *testing.T
 		t.Fatalf("the job did not run as a read-only seat, so this test measured the wrong environment: payload=%+v", payload)
 	}
 	summary := payload.Result.Summary
-	for binary, dir := range map[string]string{"claude": claudeDir, "kimi": kimiDir} {
-		want := "=" + filepath.Join(dir, binary)
-		if !strings.Contains(summary, want) {
-			t.Errorf("the seat the worker launched could not resolve %q (wanted %q in %q).\nThe env readOnlyRuntimeSandboxGrants builds is not reaching the seat, which is the wiring half of #1918.", binary, want, summary)
+	live := config.PathsForHome(home)
+	for binary, hostDir := range map[string]string{"claude": claudeDir, "kimi": kimiDir} {
+		// The seat must resolve the binary (the #1918 availability half) and it
+		// must resolve to the DAEMON'S copy, never the host installation the
+		// copy was made from (the #1921 containment half).
+		if strings.Contains(summary, binary+"=MISSING") {
+			t.Errorf("the seat the worker launched could not resolve %q at all (summary %q).\nThe env readOnlyRuntimeSandboxGrants builds is not reaching the seat, which is the wiring half of #1918.", binary, summary)
+			continue
+		}
+		if strings.Contains(summary, "="+filepath.Join(hostDir, binary)) {
+			t.Errorf("the seat resolved %q to the operator's own installation %q (summary %q); ruling 122157 requires the staged copy", binary, filepath.Join(hostDir, binary), summary)
+		}
+		if !strings.Contains(summary, "="+filepath.Join(toolchain.RuntimeRoot(live.Home))) {
+			t.Errorf("the seat resolved %q outside the engine runtime root %q (summary %q)", binary, toolchain.RuntimeRoot(live.Home), summary)
 		}
 	}
 }

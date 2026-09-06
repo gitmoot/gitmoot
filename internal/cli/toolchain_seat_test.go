@@ -108,41 +108,64 @@ func TestStagedToolchainIsNeverInsideASeatWriteGrant(t *testing.T) {
 	}
 }
 
-// TestPinnedToolchainRootRefusesSystemPrefixes is the scope boundary jarvis set:
-// system-prefix toolchains keep their pre-existing location-only grant inside
-// internal/sandbox and are NOT copied. If this path ever started returning them,
-// two owners would be competing for one decision.
-func TestPinnedToolchainRootRefusesSystemPrefixes(t *testing.T) {
-	for _, refused := range []string{
-		"/opt/go/bin/go",
-		"/opt/nested/deeper/go/bin/go",
-		"/usr/local/go/bin/go",
-		"/usr/local/bin/go",
-		"/nix/store/abc-go-1.26.4/bin/go",
-		"/snap/go/current/bin/go",
-	} {
-		if root, ok := pinnedToolchainRoot(refused); ok {
-			t.Fatalf("pinnedToolchainRoot(%q) = %q, want refused: system prefixes belong to internal/sandbox", refused, root)
-		}
-	}
-
-	// CONTROL: an operator-pinned path IS returned, so the refusals above are
-	// about the prefixes rather than about the function refusing everything.
+// TestToolchainInstallRootAcceptsEveryInstallationPrefix is ruling 122157's
+// ownership cutover: /opt, /usr/local, /nix/store and /snap are now STAGED and
+// the recursive host-root grant is deleted. A test that still refused these
+// paths would protect the defect the ruling removed.
+func TestToolchainInstallRootAcceptsEveryInstallationPrefix(t *testing.T) {
 	for path, want := range map[string]string{
+		"/opt/go/bin/go":                          "/opt/go",
+		"/opt/nested/deeper/go/bin/go":            "/opt/nested/deeper/go",
+		"/usr/local/go/bin/go":                    "/usr/local/go",
+		"/usr/local/bin/go":                       "/usr/local",
+		"/nix/store/abc-go-1.26.4/bin/go":         "/nix/store/abc-go-1.26.4",
+		"/snap/go/current/bin/go":                 "/snap/go/current",
 		"/root/.local/toolchains/go1.26.4/bin/go": "/root/.local/toolchains/go1.26.4",
 		"/home/op/sdk/go1.26.4/bin/go":            "/home/op/sdk/go1.26.4",
 		"/opt-not-a-prefix/go/bin/go":             "/opt-not-a-prefix/go",
 		"/usr/localish/go/bin/go":                 "/usr/localish/go",
 	} {
-		root, ok := pinnedToolchainRoot(path)
+		root, ok := toolchainInstallRoot(path)
 		if !ok || root != want {
-			t.Fatalf("pinnedToolchainRoot(%q) = %q,%v; want %q,true", path, root, ok, want)
+			t.Errorf("toolchainInstallRoot(%q) = %q,%v; want %q,true. Refusing a system prefix leaves that operator root for the recursive host grant this change deletes.", path, root, ok, want)
 		}
 	}
 
-	// and a path that is not an installation layout at all
-	if _, ok := pinnedToolchainRoot("/somewhere/go"); ok {
-		t.Fatal("a go NOT under bin/ or sbin/ was accepted as an installation")
+	// CONTROL: a path that is not an installation layout is still refused, so
+	// accepting the prefixes above did not turn this into filepath.Dir twice.
+	if _, ok := toolchainInstallRoot("/somewhere/go"); ok {
+		t.Fatal("a go executable not under bin/ or sbin/ was accepted as an installation")
+	}
+}
+
+func TestStageSeatToolchainShadowsMissingGo(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	paths := config.PathsForHome(t.TempDir())
+	root, env, diagnostic, err := stageSeatToolchain(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diagnostic != "" {
+		t.Fatalf("an ordinarily absent Go emitted a host diagnostic: %q", diagnostic)
+	}
+	if !pathWithin(root, toolchain.RuntimeRoot(paths.Home)) {
+		t.Fatalf("missing Go command root = %q, outside engine runtime root %q", root, toolchain.RuntimeRoot(paths.Home))
+	}
+	var path string
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "PATH=") {
+			path = strings.TrimPrefix(entry, "PATH=")
+		}
+	}
+	t.Setenv("PATH", path)
+	command, err := exec.LookPath("go")
+	if err != nil {
+		t.Fatalf("missing Go has no explicit command on seat PATH: %v", err)
+	}
+	output, runErr := exec.Command(command).CombinedOutput()
+	exitErr, ok := runErr.(*exec.ExitError)
+	if !ok || exitErr.ExitCode() != 126 || !strings.Contains(string(output), "runtime unavailable") {
+		t.Fatalf("missing Go did not fail explicitly: err=%v output=%q", runErr, output)
 	}
 }
 
@@ -176,8 +199,9 @@ func TestReadOnlyGrantsStageTheToolchainThroughProduction(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(install, "go.env"), []byte("GOTOOLCHAIN=local\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// prepend so LookPath finds the fixture, while git and friends still resolve
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// Keep the host's large runtime installations out of this toolchain-only
+	// test; the production runtime wiring has its own small fixtures below.
+	t.Setenv("PATH", strings.Join([]string{binDir, "/usr/bin", "/bin"}, string(os.PathListSeparator)))
 
 	checkout := t.TempDir()
 	runGit(t, checkout, "init", "-b", "main")
@@ -199,8 +223,9 @@ func TestReadOnlyGrantsStageTheToolchainThroughProduction(t *testing.T) {
 	stagedRoot := toolchain.Root(live.Home)
 	var staged string
 	for _, granted := range grants.reads {
-		if strings.HasPrefix(granted, stagedRoot+string(filepath.Separator)) || granted == stagedRoot {
+		if filepath.Dir(granted) == stagedRoot {
 			staged = granted
+			break
 		}
 	}
 	if staged == "" {
@@ -284,18 +309,21 @@ func TestReadOnlySeatEnvKeepsRuntimeBinariesResolvable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Two SEPARATE directories, because that is the shape on the live host:
-	// claude sits in /root/.local/bin and kimi in /root/.kimi-code/bin, so a fix
-	// that rescues one hardcoded directory would still strand the other.
-	claudeDir := t.TempDir()
-	kimiDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(claudeDir, "claude"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatal(err)
+	// Three separate runtime locations model profile/package installations.
+	// None may survive as a recursive sandbox grant: production must copy each
+	// executable into the engine-owned runtime root and resolve the shim there.
+	runtimeDirs := map[string]string{}
+	pathEntries := []string{installBin}
+	for _, name := range []string{"claude", "kimi", "codex"} {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		runtimeDirs[name] = dir
+		pathEntries = append(pathEntries, dir)
 	}
-	if err := os.WriteFile(filepath.Join(kimiDir, "kimi"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", strings.Join([]string{installBin, claudeDir, kimiDir, "/usr/bin", "/bin"}, string(os.PathListSeparator)))
+	pathEntries = append(pathEntries, "/usr/bin", "/bin")
+	t.Setenv("PATH", strings.Join(pathEntries, string(os.PathListSeparator)))
 
 	checkout := t.TempDir()
 	runGit(t, checkout, "init", "-b", "main")
@@ -327,16 +355,29 @@ func TestReadOnlySeatEnvKeepsRuntimeBinariesResolvable(t *testing.T) {
 	if !strings.Contains(seatPath, filepath.Join(toolchain.Root(live.Home))) {
 		t.Fatalf("seat PATH %q does not carry the staged toolchain, so this test is measuring the wrong environment", seatPath)
 	}
-
 	t.Setenv("PATH", seatPath)
-	for _, binary := range []string{"claude", "kimi"} {
+
+	for _, binary := range []string{"claude", "kimi", "codex"} {
 		resolved, lookErr := exec.LookPath(binary)
 		if lookErr != nil {
 			t.Errorf("seat PATH cannot resolve %q: %v\nsandbox-exec resolves argv[0] with exec.LookPath, so this is exactly the launch failure in #1918.\nseat PATH = %q", binary, lookErr, seatPath)
 			continue
 		}
-		if _, statErr := os.Stat(resolved); statErr != nil {
-			t.Errorf("resolved %q to %q, which does not exist: %v", binary, resolved, statErr)
+		if !pathWithin(resolved, toolchain.RuntimeRoot(live.Home)) {
+			t.Errorf("%q resolved to host path %q, outside engine-owned runtime root %q", binary, resolved, toolchain.RuntimeRoot(live.Home))
+			continue
+		}
+		// Every installed runtime must LAUNCH from its staged copy, not merely
+		// resolve: an unrunnable copy is the #1918 regression with extra steps.
+		if output, runErr := exec.Command(resolved).CombinedOutput(); runErr != nil {
+			t.Errorf("staged runtime %q does not launch: %v: %s", binary, runErr, output)
+		}
+	}
+	for name, sourceDir := range runtimeDirs {
+		for _, granted := range grants.reads {
+			if pathWithin(granted, sourceDir) || pathWithin(sourceDir, granted) {
+				t.Errorf("host runtime %q source %q escaped into recursive read grant %q", name, sourceDir, granted)
+			}
 		}
 	}
 
@@ -348,6 +389,60 @@ func TestReadOnlySeatEnvKeepsRuntimeBinariesResolvable(t *testing.T) {
 	}
 	if !pathWithin(resolvedGo, toolchain.Root(live.Home)) {
 		t.Errorf("go resolved to %q, outside the staged toolchain root %q: extending PATH must not cost the toolchain pin", resolvedGo, toolchain.Root(live.Home))
+	}
+}
+
+// TestStageSeatRuntimesCopiesInstalledAndShadowsAbsentRuntimes pins both halves
+// of ruling 122157's availability/containment trade: an installed runtime must
+// LAUNCH from the engine's own copy, and an absent one must FAIL EXPLICITLY
+// rather than fall through to whatever the inherited PATH offers later.
+func TestStageSeatRuntimesCopiesInstalledAndShadowsAbsentRuntimes(t *testing.T) {
+	// One runtime is deliberately left uninstalled, so the absent arm is
+	// measured rather than assumed.
+	absent := seatRuntimeNames[len(seatRuntimeNames)-1]
+	var pathEntries []string
+	for _, name := range seatRuntimeNames {
+		if name == absent {
+			continue
+		}
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\nprintf '"+name+"-ran\\n'\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		pathEntries = append(pathEntries, dir)
+	}
+	// FIXTURES ONLY, deliberately: /usr/bin holds a real codex on this host, so
+	// appending the system directories made the "absent" arm resolve the
+	// operator's own installation and measure nothing (observed).
+	t.Setenv("PATH", strings.Join(pathEntries, string(os.PathListSeparator)))
+
+	paths := config.PathsForHome(t.TempDir())
+	commands, diagnostics, err := stageSeatRuntimes(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diagnostics) != 0 {
+		t.Fatalf("stageSeatRuntimes diagnostics = %v", diagnostics)
+	}
+	if len(commands) != len(seatRuntimeNames) {
+		t.Fatalf("stageSeatRuntimes returned %d commands for %d runtime classes: %v", len(commands), len(seatRuntimeNames), commands)
+	}
+	for _, command := range commands {
+		name := filepath.Base(command)
+		if !pathWithin(command, toolchain.RuntimeRoot(paths.Home)) {
+			t.Errorf("%q is outside the engine runtime root: %q", name, command)
+		}
+		output, runErr := exec.Command(command).CombinedOutput()
+		if name == absent {
+			exitErr, ok := runErr.(*exec.ExitError)
+			if !ok || exitErr.ExitCode() != 126 || !strings.Contains(string(output), "runtime unavailable") {
+				t.Errorf("absent runtime %q did not fail explicitly: err=%v output=%q", name, runErr, output)
+			}
+			continue
+		}
+		if runErr != nil || strings.TrimSpace(string(output)) != name+"-ran" {
+			t.Errorf("installed runtime %q did not launch from its staged copy: err=%v output=%q", name, runErr, output)
+		}
 	}
 }
 

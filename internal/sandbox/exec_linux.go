@@ -82,18 +82,25 @@ func execSandbox(readPaths, readFiles, writePaths []string, argv []string, readO
 		// stages: the filesystem is readable while writes remain allowlisted.
 		rules = append(rules, landlock.RODirs("/"))
 	} else {
-		readable, err := readableRoots(readPaths, executable)
+		readable, err := readableRoots(readPaths)
 		if err != nil {
 			return err
 		}
 		rules = append(rules, landlock.RODirs(readable...))
-		files, err := readableFiles(readFiles)
+		// The executable itself is a FILE grant, never a recursive grant of
+		// its host directory. Runtime package trees and Go roots arrive through
+		// readPaths only after the daemon has staged them into an engine-owned
+		// tree. This is ruling 122157's clean ownership boundary.
+		executableFiles := append([]string{}, readFiles...)
+		executableFiles = append(executableFiles, executable)
+		if resolved, resolveErr := filepath.EvalSymlinks(executable); resolveErr == nil && resolved != executable {
+			executableFiles = append(executableFiles, resolved)
+		}
+		files, err := readableFiles(executableFiles)
 		if err != nil {
 			return err
 		}
-		if len(files) > 0 {
-			rules = append(rules, landlock.ROFiles(files...))
-		}
+		rules = append(rules, landlock.ROFiles(files...))
 		rules = append(rules, landlock.ROFiles(runtimeHostReadFiles...).IgnoreIfMissing())
 	}
 	if len(writable) > 0 {
@@ -145,11 +152,16 @@ func readableFiles(paths []string) ([]string, error) {
 	return files, nil
 }
 
-// readableRoots returns the explicit read-only inputs plus the fixed host roots
-// needed to execute a runtime. Writable roots are intentionally absent: their
-// stronger RWDirs rules already include read rights. Existing stages with no
-// reads declaration bypass this helper and retain the historical RO `/` rule.
-func readableRoots(paths []string, executable string) ([]string, error) {
+// readableRoots returns explicit read-only inputs plus fixed system roots needed
+// to execute a runtime. Writable roots are intentionally absent: their stronger
+// RWDirs rules already include read rights. Existing stages with no reads
+// declaration bypass this helper and retain the historical RO `/` rule.
+//
+// It deliberately knows NOTHING about the executable or Go installation.
+// Runtime package trees and toolchains are copied into daemon-owned roots by the
+// caller and arrive in paths. The executable itself is granted as a file by
+// execSandbox. This removes all recursive host-root inference from the sandbox.
+func readableRoots(paths []string) ([]string, error) {
 	roots := make([]string, 0, len(paths)+12)
 	seen := make(map[string]struct{}, len(paths)+12)
 	add := func(candidate string, required bool) error {
@@ -185,154 +197,17 @@ func readableRoots(paths []string, executable string) ([]string, error) {
 	for _, candidate := range []string{
 		"/bin", "/sbin", "/lib", "/lib64", "/dev",
 		"/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64", "/usr/libexec", "/usr/share",
-		"/usr/local/bin", "/usr/local/sbin", "/usr/local/lib", "/usr/local/lib64", "/usr/local/share",
 		"/etc/ssl/certs", "/etc/pki",
-		// procfs read is a runtime BOOTSTRAP requirement, not a convenience: the
-		// Bun-based Claude/Kimi binaries abort with an opaque crash without it,
-		// and codex's managed bwrap fails reading /proc/sys/kernel/overflowuid.
-		// The legacy no-reads mode always had it via RODirs("/"), so strict read
-		// mode was the regression rather than this grant being a widening.
-		//
-		// EXPOSURE, stated as narrowly as it was measured. One subcase is proven:
-		// /proc/<other-pid>/environ stays denied to a sandboxed process because
-		// Landlock's ptrace domain check gates it (measured — own environ
-		// readable, the live daemon's denied, while an unsandboxed root read of
-		// that same path succeeds). That is NOT a general claim: /proc/<pid>/cmdline,
-		// /proc/net/* and /proc/sys/* are gated by ordinary DAC and hidepid, which
-		// this rule neither tightens nor loosens. Narrowing the grant to /proc/self
-		// plus specific files is a live follow-up, untested here because Landlock
-		// resolves paths at rule-add time while nested runtimes fork new pids.
+		// procfs read is a runtime BOOTSTRAP requirement, not a convenience:
+		// Bun-based Claude/Kimi binaries abort without it and codex's managed
+		// bwrap reads /proc/sys/kernel/overflowuid.
 		"/proc",
 	} {
 		if err := add(candidate, false); err != nil {
 			return nil, err
 		}
 	}
-	if err := addExecutableReadRoots(add, executable); err != nil {
-		return nil, err
-	}
-	if goExecutable, err := execLookPath("go"); err == nil {
-		if root := optionalSystemToolchainRoot(goExecutable); root != "" {
-			if err := add(root, true); err != nil {
-				return nil, err
-			}
-		}
-	}
 	return roots, nil
-}
-
-func addExecutableReadRoots(add func(string, bool) error, executable string) error {
-	if err := add(filepath.Dir(executable), true); err != nil {
-		return err
-	}
-	resolvedExecutable := executable
-	if resolved, err := filepath.EvalSymlinks(executable); err == nil {
-		resolvedExecutable = resolved
-	}
-	executableDir := filepath.Dir(resolvedExecutable)
-	if err := add(executableDir, true); err != nil {
-		return err
-	}
-	if base := filepath.Base(executableDir); base == "bin" || base == "sbin" {
-		installRoot := filepath.Dir(executableDir)
-		if installRoot == "/" || installRoot == "/usr" {
-			return nil
-		}
-		// PROMOTION REQUIRES POSITIVE PROOF OF A PACKAGE TREE (#1921 review, both P1s).
-		//
-		// Promotion exists for one reason: a node-packaged runtime cannot run
-		// without its package root. codex resolves to
-		// <node>/lib/node_modules/@openai/codex/bin/codex.js and needs the files
-		// beside that bin dir. Nothing else needs it — a self-contained
-		// executable runs from its exec dir, which is already granted above.
-		//
-		// THE PREVIOUS RULE ASKED THE WRONG QUESTION AND COULD NOT BE REPAIRED BY
-		// ASKING IT BETTER. It promoted any install root that did NOT contain a
-		// known credential name, which failed twice for reasons that are the same
-		// reason: absence is not proof.
-		//
-		//   - The name list can never be complete (review F1). kimi's config.toml
-		//     carries api_key and OAuth material (internal/runtime/kimi.go,
-		//     internal/cli/daemon_worker.go read it), and it was not on the list,
-		//     so a profile holding bin/kimi plus a secret-bearing config.toml was
-		//     granted whole. A kernel probe read it: CONFIG_CREDENTIAL=READABLE.
-		//   - The scan can never be timely (review F2). Lstat is a time-of-check
-		//     decision and the Landlock grant is recursive, so a credential
-		//     CREATED AFTER setup lands inside an already-granted root. A
-		//     synchronized probe created profile/credentials/late-token.json after
-		//     the seat had entered and read it: LATE_CREDENTIAL=READABLE. No
-		//     longer list and no repeated pre-exec scan closes a temporal gap.
-		//
-		// So the rule is inverted: grant only a root PROVEN to be a package tree,
-		// and withhold otherwise. A mutable operator-owned profile can never
-		// present that proof, which is what makes both findings unreachable rather
-		// than merely unlikely — there is no credential name to enumerate and no
-		// window in which to create one, because the root is never granted.
-		//
-		// Withholding degrades to a launch failure that names itself; granting
-		// leaks an account. That asymmetry is why the unproven case loses.
-		if !isPackageInstallRoot(installRoot) {
-			return nil
-		}
-		return add(installRoot, true)
-	}
-	return nil
-}
-
-// isPackageInstallRoot reports whether a candidate root is a node package tree,
-// the only shape promotion is for.
-//
-// The proof has two parts and needs both: the root must carry a regular
-// `package.json`, and it must sit under a `node_modules` path segment. Either
-// alone is too weak — an operator profile may hold a stray package.json, and a
-// `node_modules` ancestor alone does not make an arbitrary directory a package.
-//
-// It fails CLOSED on every uncertainty: any Lstat error, including a permission
-// error, and any non-regular package.json (a symlink or directory, which is what
-// a planted marker looks like) withholds the grant.
-func isPackageInstallRoot(root string) bool {
-	root = filepath.Clean(root)
-	if !hasPathSegment(root, "node_modules") {
-		return false
-	}
-	info, err := os.Lstat(filepath.Join(root, "package.json"))
-	if err != nil {
-		return false
-	}
-	return info.Mode().IsRegular()
-}
-
-// hasPathSegment reports whether name appears as a WHOLE element of path, so
-// `/opt/node_modules_backup/x` does not match `node_modules`.
-func hasPathSegment(path string, name string) bool {
-	for _, element := range strings.Split(filepath.Clean(path), string(filepath.Separator)) {
-		if element == name {
-			return true
-		}
-	}
-	return false
-}
-
-// optionalSystemToolchainRoot grants the Go installation selected by PATH when
-// it lives under a system package root. Review agents must be able to run the
-// repository's toolchain, while a user-controlled binary under /root or /home
-// must not turn its credential-bearing parent into a readable subtree.
-func optionalSystemToolchainRoot(executable string) string {
-	if resolved, err := filepath.EvalSymlinks(executable); err == nil {
-		executable = resolved
-	}
-	binDir := filepath.Dir(filepath.Clean(executable))
-	if base := filepath.Base(binDir); base != "bin" && base != "sbin" {
-		return ""
-	}
-	root := filepath.Dir(binDir)
-	for _, allowed := range []string{"/opt", "/usr/local", "/nix/store", "/snap"} {
-		rel, err := filepath.Rel(allowed, root)
-		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return root
-		}
-	}
-	return ""
 }
 
 func writableRoots(paths []string, workdir string, includeImplicitRoots bool) ([]string, error) {

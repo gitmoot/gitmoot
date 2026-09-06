@@ -671,20 +671,22 @@ What to expect:
   seat's own cache root.** Both `/tmp` and the workspace return `EACCES` on
   `mkdir`, and "a writable dir" reads as satisfied by `/tmp` when it is not.
 
-If a seat still gets exit 126 running `go`, staging did not happen. **The reason is
-on the daemon's stderr, not in the job's events** - deliberately, because a fact
-about the host must not change a job's event stream. Look for
-`gitmoot: read-only seat toolchain:`. The causes, all of which leave the seat
-exactly as it was before this feature existed rather than failing the launch:
+If a seat gets exit 126 running `go`, no usable toolchain was staged. The command
+is an engine-owned failure stub, not a fallthrough to an operator installation;
+it prints `gitmoot: runtime unavailable: no daemon-staged artifact exists`.
+Host-specific causes also print `gitmoot: read-only seat toolchain:` on the
+daemon's stderr rather than changing the job event stream.
 
-- **No pinned toolchain on the daemon's `PATH`.** A toolchain under `/opt`,
-  `/usr/local`, `/nix/store` or `/snap` is treated as a system package and is NOT
-  copied; those keep their pre-existing location-only grant.
-- **The source is not a Go installation.** It must have an executable `bin/go` and a
-  `VERSION` file naming a Go release, both real files rather than symlinks.
-- **Free space is below the floor.** Staging refuses up front rather than filling the
-  filesystem, and the message names both the free bytes and the floor, which is 4
-  GiB. Reclaim space; do not lower the floor to make the message go away.
+- **No Go installation is on the daemon's `PATH`.** This normal case has no
+  daemon diagnostic, but invoking `go` still fails explicitly through the stub.
+- **The source is not a pinned Go installation.** It must have an executable
+  `bin/go` and a `VERSION` file naming a Go release, both real files rather than
+  symlinks.
+- **Every installation prefix is copied.** `/opt`, `/usr/local`, `/nix/store`,
+  `/snap`, and profile paths follow the same staging path; none receives a
+  recursive host-root grant.
+- **Free space is below the floor.** Staging refuses up front rather than filling
+  the filesystem, and the message names both the free bytes and the 4 GiB floor.
 - **The source contains a symlink.** A symlinked name is refused anywhere in the
   copied set, because following one copies something the daemon never validated.
   The check also proves the file it opened is the file it inspected, and staging
@@ -720,6 +722,23 @@ non-executable members such as `src` or `doc`, because re-hashing the whole 221.
 MiB tree on every seat launch would cost more than the copy itself. The
 consequence of a torn non-executable member is a visibly broken toolchain and a
 build error, not a silently wrong compiler.
+
+### Read-only seat runtime executable is unavailable
+
+Claude, Kimi, and Codex read-only seats run a copied runtime artifact from
+`<gitmoot-home>/toolchains/runtimes`, never a recursive read grant over the
+operator's profile or package root. Self-contained executables are copied alone;
+a detected Node package copies its package tree while skipping symlinks.
+Credential files beside a profile executable are therefore neither copied nor
+granted, including files created after seat setup.
+
+Only the selected seat runtime is staged. The other runtime names, an absent
+runtime, and a runtime whose artifact cannot be copied resolve to engine-owned
+commands that print `gitmoot: runtime unavailable: no daemon-staged artifact
+exists` and exit 126. This preserves ordinary system commands through the
+inherited `PATH` without permitting a runtime name to fall through to its host
+copy. Copy failures also appear as `gitmoot: read-only seat runtime:` on daemon
+stderr.
 
 ### Codex reviews report zero executed checks (`bwrap: setting up uid map`)
 

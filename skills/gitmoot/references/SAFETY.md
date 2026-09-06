@@ -223,6 +223,14 @@ plan explicitly says they are intended tracked fixtures or release assets.
 Redact secrets from GitHub comments, job summaries, raw examples, and copied
 command output.
 
+Read-only seats never receive recursive read access to an operator runtime or Go
+installation. Gitmoot copies the selected Claude, Kimi, or Codex artifact and
+the pinned Go toolchain into daemon-owned roots under the gitmoot home, then
+grants only those copies. Missing or unstageable commands are shadowed by
+engine-owned exit-126 commands; inherited `PATH` remains available for ordinary
+system tools but cannot fall through to a host runtime with an ungranted profile.
+See `docs/troubleshooting.md` for diagnostics and staging boundaries.
+
 Claude runtime credentials live only in the owner-readable (mode `0600`)
 `~/.gitmoot/runtime-auth.env`. Write them with `gitmoot auth set claude`, which
 reads stdin and replaces the file atomically; rotate without restarting the
