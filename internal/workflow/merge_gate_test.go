@@ -5894,3 +5894,121 @@ func TestPolicyMergeGateBlocksASessionReviewObjectionWithNeitherHeadNorRound(t *
 			task.State, string(TaskReadyToMerge))
 	}
 }
+
+// openSessionReviewObjection records a changes_requested session review through
+// the PRODUCTION writers. agent and actingRole are passed exactly as a caller
+// would: OpenExternalJob supports a role IN PLACE OF an agent, and that shape is
+// what #1950 F2 turned on.
+func openSessionReviewObjection(t *testing.T, store *db.Store, id, agent, actingRole, decision string, severity string) {
+	t.Helper()
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	if _, err := mailbox.OpenExternalJob(context.Background(), JobRequest{
+		ID:            id,
+		Agent:         agent,
+		ActingOrgRole: actingRole,
+		Action:        "review",
+		Repo:          "gitmoot/gitmoot",
+		PullRequest:   9,
+		TaskID:        "task-9",
+		Sender:        "session",
+	}); err != nil {
+		t.Fatalf("OpenExternalJob(%s) returned error: %v", id, err)
+	}
+	result := AgentResult{Decision: decision, Summary: "session verdict"}
+	if severity != "" {
+		result.Severity = severity
+	}
+	if _, err := mailbox.CloseExternalJobWithUsage(context.Background(), id, result, 0, "", "", ExternalJobUsage{}); err != nil {
+		t.Fatalf("CloseExternalJobWithUsage(%s) returned error: %v", id, err)
+	}
+}
+
+// TestPolicyMergeGateAllowsAnActingRoleSessionObjectionToBeSuperseded is #1950
+// F2: OpenExternalJob supports ActingOrgRole in place of Agent, persisting
+// Agent="" with the normalized role. The headless scan derived reviewer identity
+// from job.Agent alone, so with an empty agent supersession was SKIPPED - a
+// role's objection could never be answered by that role's own later approval,
+// which is a block with no operator move available.
+//
+// Both arms run through the production writers. The blocking arm also asserts the
+// refusal NAMES the role: rendering "objection from  " tells an operator nothing.
+func TestPolicyMergeGateAllowsAnActingRoleSessionObjectionToBeSuperseded(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		addApproval bool
+		wantMerge   bool
+		// noIdentity drops BOTH the agent and the acting role, which is the shape
+		// that can never be superseded and therefore must never be excluded.
+		noIdentity bool
+	}{
+		{name: "the role's objection alone still blocks, and names the role", addApproval: false, wantMerge: false},
+		{name: "a later approval from the SAME role supersedes it", addApproval: true, wantMerge: true},
+		{
+			// ROUND 1 MUST NOT BE WEAKENED. A row with no usable identity at all -
+			// neither agent nor acting role - can never be superseded by anyone, so it
+			// must still BLOCK rather than be skipped. Under-blocking is how F1
+			// happened; this arm is what stops the identity fix from re-introducing it.
+			name: "no usable identity at all still blocks", noIdentity: true, wantMerge: false,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, gh, gate, request := newMergeGateQuorumScenario(t)
+			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+				id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
+			})
+			if tt.noIdentity {
+				// NOT through OpenExternalJob: that writer REFUSES a row with neither
+				// agent nor acting role - "job agent or acting org role is required" -
+				// so the no-identity shape is unreachable through the session path and
+				// pretending otherwise would be a fiction. It IS reachable as an
+				// engine-inserted row that records a round and no author, so that is
+				// the shape asserted here.
+				insertCompletedJob(t, store, db.Job{ID: "session-role-objection", Agent: "", Type: "review"}, JobPayload{
+					Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", ReviewRound: "review-1",
+					Result: &AgentResult{Decision: "changes_requested", Severity: reviewseverity.P1, Summary: "authorless objection"},
+				})
+			} else {
+				openSessionReviewObjection(t, store, "session-role-objection", "", "reviewer", "changes_requested", reviewseverity.P1)
+			}
+			if tt.addApproval {
+				// Same ROLE, no agent, strictly later: this is the only move the
+				// operator has, and before the fix it could not clear the block.
+				setMergeGateJobTimestamps(t, store, "session-role-objection", "2026-09-01T10:00:00Z")
+				openSessionReviewObjection(t, store, "session-role-approval", "", "reviewer", "approved", "")
+				setMergeGateJobTimestamps(t, store, "session-role-approval", "2026-09-01T14:00:00Z")
+			}
+			if err := store.UpsertTask(ctx, db.Task{
+				ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+				State: string(TaskReadyToMerge),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			request.Reviewer = "audit"
+			request.ExpectedTaskState = string(TaskReadyToMerge)
+
+			decision, err := gate.Evaluate(ctx, request)
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if tt.wantMerge && (!decision.Merged || len(gh.merges) != 1) {
+				t.Fatalf("decision=%+v merges=%d, want ONE merge: a later approval from the same acting role must supersede that role's objection (#1950 F2)",
+					decision, len(gh.merges))
+			}
+			if !tt.wantMerge {
+				if decision.Merged || len(gh.merges) != 0 {
+					t.Fatalf("decision=%+v merges=%d, want NO merge: an acting-role session objection is a real blocking verdict", decision, len(gh.merges))
+				}
+				wantAuthor := "reviewer"
+				if tt.noIdentity {
+					// Never an empty name: that is the line a human reads while working
+					// out why a merge is stuck.
+					wantAuthor = "an unattributed reviewer"
+				}
+				if rendered := decision.Reason.Render(); !strings.Contains(rendered, wantAuthor) {
+					t.Fatalf("reason = %q, want %q named; an empty author leaves an operator with nobody to go to", rendered, wantAuthor)
+				}
+			}
+		})
+	}
+}

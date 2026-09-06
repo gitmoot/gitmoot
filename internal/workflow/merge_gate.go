@@ -1072,12 +1072,24 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if effectiveReviewDecisionForPayload(review.payload, request.ReviewBlockingSeverity) != "changes_requested" {
 			continue
 		}
-		reviewer := strings.TrimSpace(review.job.Agent)
+		// IDENTITY IS AGENT-OR-ROLE, NOT AGENT ALONE, and reading it from job.Agent
+		// only was a P1 deadlock of my own making (#1950 F2). OpenExternalJob supports
+		// ActingOrgRole IN PLACE OF an agent and persists Agent="" with
+		// ActingOrgRole=<role> (session_job.go, mailbox.go:665). With an empty agent
+		// the supersession scan below was skipped entirely, so a role's objection
+		// could NEVER be answered by that same role's later approval - a block with no
+		// operator move available - and the refusal text named nobody at all.
+		//
+		// The precedent is already in this file: collectGateImplementerAttribution
+		// resolves the same identity with NormalizeActingOrgRole (merge_gate.go:1564),
+		// so this uses that rather than inventing a second rule. Both SIDES of the
+		// comparison resolve identically, or a role could still never supersede itself.
+		reviewer := headlessReviewerIdentity(review.job, review.payload)
 		superseded := false
 		if reviewer != "" {
 			for _, candidate := range taskReviews {
 				if candidate.payload.Result != nil &&
-					strings.TrimSpace(candidate.job.Agent) == reviewer &&
+					headlessReviewerIdentity(candidate.job, candidate.payload) == reviewer &&
 					isReviewReplacementDecision(candidate.payload.Result.Decision) &&
 					reviewJobSupersedes(candidate.job, candidate.payload, review.job, review.payload) {
 					superseded = true
@@ -1095,9 +1107,16 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		}
 	}
 	if headlessObjection != nil {
+		// Name the AGENT-OR-ROLE, never the bare agent: an acting-role session review
+		// has no agent, and the first version of this rendered "objection from  "
+		// with an empty name, which tells an operator nothing about who to go to.
+		author := headlessReviewerIdentity(headlessObjection.job, headlessObjection.payload)
+		if author == "" {
+			author = "an unattributed reviewer"
+		}
 		return mergeBlocked{reason: fmt.Sprintf(
 			"unanswered review objection from %s (job %s) carries no evaluated head; answer or supersede that row, or re-render the verdict against this head",
-			strings.TrimSpace(headlessObjection.job.Agent), headlessObjection.job.ID)}
+			author, headlessObjection.job.ID)}
 	}
 	if len(activeAtHead) > 0 {
 		var selfApprovalReason string
@@ -1918,6 +1937,21 @@ func (g PolicyMergeGate) ensureReviewMatchesHead(payload JobPayload, headSHA str
 // allocated worktree path). The engine clears the inherited HeadSHA for exactly
 // these children so they validate against their isolated worktree HEAD, mirroring
 // isDelegationWorktreeChild in the daemon's checkout validation.
+// headlessReviewerIdentity is the effective reviewer identity for the headless
+// objection scan: the agent when a row records one, otherwise the normalized
+// ActingOrgRole. OpenExternalJob supports a role IN PLACE OF an agent
+// (mailbox.go:665 persists the normalized role; the job's Agent stays empty), so
+// keying on job.Agent alone made a role's objection unanswerable by that same
+// role - #1950 F2. collectGateImplementerAttribution already resolves identity
+// this way (merge_gate.go, NormalizeActingOrgRole), and sharing the rule is what
+// keeps the two from disagreeing about who a row belongs to.
+func headlessReviewerIdentity(job db.Job, payload JobPayload) string {
+	if agent := strings.TrimSpace(job.Agent); agent != "" {
+		return agent
+	}
+	return NormalizeActingOrgRole(payload.ActingOrgRole)
+}
+
 func isIntegrationWorktreeReview(payload JobPayload) bool {
 	return strings.TrimSpace(payload.DelegationID) != "" && strings.TrimSpace(payload.WorktreePath) != ""
 }
