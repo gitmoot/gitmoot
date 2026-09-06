@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 )
 
 // THE PRODUCTION WRITER (#1850 review F1, P1, found by both verdicts).
@@ -56,6 +57,23 @@ type reviewFindingWire struct {
 	// never be re-armed by relevance once answered (#1850 round 2 F4).
 	Evidence string `json:"evidence"`
 	Lens     string `json:"lens"`
+	// ALTERNATE PROSE KEYS, MEASURED FROM REAL VERDICTS (#1928). Findings ride as
+	// free-form json.RawMessage, so a reviewer that names its prose differently
+	// silently loses it: the row is written with an EMPTY title or detail and the
+	// text survives only inside the job payload, where no ledger reader looks.
+	// Four instances in one evening, three distinct schemas, each dropping a
+	// different column:
+	//
+	//   #1930 round 1 emitted {title, body}            -> detail EMPTY
+	//   #1921 round 3 emitted {title, evidence}        -> detail EMPTY
+	//   #1930 round 3 emitted {summary, detail, location} -> title EMPTY, file EMPTY
+	//
+	// A row nobody can read cannot be dispositioned, which is exactly what the
+	// gate's obligation message needs it for. These keys are READ, never invented:
+	// each one is a field a real reviewer actually sent.
+	Body     string `json:"body"`
+	Summary  string `json:"summary"`
+	Location string `json:"location"`
 }
 
 // pathFromLensEvidence extracts the leading repo-relative path from a lens
@@ -95,7 +113,7 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 	if head == "" || repo == "" || payload.PullRequest <= 0 || len(payload.Result.Findings) == 0 {
 		return nil
 	}
-	written, skipped := 0, 0
+	written, skipped, downgrades := 0, 0, 0
 	for index, raw := range payload.Result.Findings {
 		var wire reviewFindingWire
 		if err := json.Unmarshal(raw, &wire); err != nil {
@@ -108,9 +126,9 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 				e.recordLedgerSkip(ctx, job.ID, index, fmt.Sprintf("finding is neither an object nor a string: %v", err))
 				continue
 			}
-			wire = reviewFindingWire{Title: text}
+			wire = wireFromBareFindingText(text)
 		}
-		obs, ok := e.ledgerObservationFor(job, payload, wire, head, repo)
+		obs, declared, ok := e.ledgerObservationWithDeclaredState(job, payload, wire, head, repo)
 		if !ok {
 			skipped++
 			e.recordLedgerSkip(ctx, job.ID, index, "finding carries no file and the review executed nothing, so no evidence kind is truthful")
@@ -122,6 +140,15 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 			continue
 		}
 		written++
+		// #1936: A REVERSAL THE REVIEWER DID NOT ASK FOR IS NOW AUDIBLE. The row
+		// is recorded either way - dropping it would lose the observation - but a
+		// declared disposition that did not survive is named, with the reason, so
+		// the lane can supply a `file` or an execution instead of discovering the
+		// reversal from a gate refusal several steps later.
+		if downgraded, reason := ledgerStateDowngrade(declared, obs); downgraded {
+			e.recordLedgerDowngrade(ctx, job.ID, index, declared, obs.State, reason)
+			downgrades++
+		}
 	}
 	// THE SUMMARY EVENT IS BEST-EFFORT AND ITS FAILURE MUST NOT FAIL THE REVIEW.
 	// Returning it would hand AdvanceJob an error, and AdvanceJob's caller treats
@@ -140,8 +167,12 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
 		JobID: job.ID,
 		Kind:  "findings_ledger_recorded",
-		Message: fmt.Sprintf("recorded %d of %d reported finding(s) to the #1822 ledger at head %s (%d skipped)",
-			written, len(payload.Result.Findings), head, skipped),
+		// THE COUNT NO LONGER OVERSTATES ITSELF (#1936). "recorded 4 of 4 ... (0
+		// skipped)" was true of the WRITE and false of the OUTCOME: three of those
+		// four rows had their declared disposition reversed. A summary that cannot
+		// distinguish those two facts is the false-success half of this defect.
+		Message: fmt.Sprintf("recorded %d of %d reported finding(s) to the #1822 ledger at head %s (%d skipped, %d downgraded)",
+			written, len(payload.Result.Findings), head, skipped, downgrades),
 	})
 	return nil
 }
@@ -149,23 +180,59 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 // ledgerObservationFor builds the observation, choosing the evidence kind from
 // what the review ACTUALLY did rather than from what would be convenient.
 func (e Engine) ledgerObservationFor(job db.Job, payload JobPayload, wire reviewFindingWire, head string, repo string) (db.ReviewFindingObservation, bool) {
+	obs, _, ok := e.ledgerObservationWithDeclaredState(job, payload, wire, head, repo)
+	return obs, ok
+}
+
+// ledgerObservationWithDeclaredState additionally reports the state the REVIEWER
+// declared, so the caller can say when the recorded state is not the declared
+// one. #1936: a declared `answered` silently became `open` while the summary
+// event still read "recorded 4 of 4 ... (0 skipped)" - a false success beside a
+// silent reversal, which is the pair this lane exists to remove.
+func (e Engine) ledgerObservationWithDeclaredState(job db.Job, payload JobPayload, wire reviewFindingWire, head string, repo string) (db.ReviewFindingObservation, db.FindingState, bool) {
 	obs := db.ReviewFindingObservation{
-		Repo:           repo,
-		PullRequest:    int64(payload.PullRequest),
-		HeadSHA:        head,
-		ObserverJob:    job.ID,
-		Severity:       strings.TrimSpace(wire.Severity),
-		RoundLabel:     strings.TrimSpace(wire.ID),
-		Title:          strings.TrimSpace(wire.Title),
-		Detail:         strings.TrimSpace(wire.Detail),
-		File:           firstNonEmptyLedgerText(strings.TrimSpace(wire.File), pathFromLensEvidence(wire.Evidence)),
+		Repo:        repo,
+		PullRequest: int64(payload.PullRequest),
+		HeadSHA:     head,
+		ObserverJob: job.ID,
+		Severity:    strings.TrimSpace(wire.Severity),
+		RoundLabel:  strings.TrimSpace(wire.ID),
+		// PROSE IS TAKEN FROM WHICHEVER KEY THE REVIEWER USED (#1928). Order is
+		// specific-to-general: the canonical key wins, then the observed
+		// alternates. `evidence` is last for detail because it is also the lens
+		// shape parsed for a path below, so a lens finding keeps its locator and
+		// still contributes its prose instead of writing an empty row.
+		Title:  firstNonEmptyLedgerText(strings.TrimSpace(wire.Title), strings.TrimSpace(wire.Summary)),
+		Detail: firstNonEmptyLedgerText(strings.TrimSpace(wire.Detail), strings.TrimSpace(wire.Body), strings.TrimSpace(wire.Evidence)),
+		File: firstNonEmptyLedgerText(
+			strings.TrimSpace(wire.File),
+			pathFromLensEvidence(wire.Evidence),
+			pathFromLensEvidence(wire.Location),
+			// #1936: evidence_locator LAST. A reviewer that cites
+			// "internal/workflow/merge_gate.go: collectImplementerAttribution
+			// (~lines 1436-1449)" and no `file` used to fall through to QUOTED,
+			// which forced its declared `answered` to `open` - so three real
+			// dispositions became three open rows and the gate refused a head
+			// whose reviewer had done the work. Zero STATIC rows had ever reached
+			// answered in this store, against 13 EXECUTED, which is what that
+			// looks like from the outside.
+			//
+			// NO FILESYSTEM CHECK HERE, deliberately: the writer has no tree, which
+			// is the same reason the store boundary does not check either. A
+			// path-SHAPED leading token is enough, because answeredIsMandatory
+			// re-resolves the locator against the head via PathExistsAtHead and
+			// fails the discharge when it has vanished. A locator that is prose
+			// only yields "" here and still lands in QUOTED, now with an event.
+			pathFromLensEvidence(wire.Locator),
+		),
 		Line:           int64(wire.Line),
 		RelevanceKeys:  wire.RelevanceKeys,
 		ContinuesUID:   strings.TrimSpace(wire.ContinuesUID),
 		WithdrawReason: strings.TrimSpace(wire.WithdrawReason),
 		SourceJob:      job.ID,
 	}
-	switch db.FindingState(strings.ToLower(strings.TrimSpace(wire.State))) {
+	declared := db.FindingState(strings.ToLower(strings.TrimSpace(wire.State)))
+	switch declared {
 	case db.FindingAnswered:
 		obs.State = db.FindingAnswered
 	case db.FindingWithdrawn:
@@ -242,10 +309,31 @@ func (e Engine) ledgerObservationFor(job db.Job, payload JobPayload, wire review
 			// this way so the host:port lint has nothing to match on.
 			obs.EvidenceLocator = obs.File + ":" + strconv.Itoa(int(wire.Line))
 		}
-		if strings.TrimSpace(wire.Locator) != "" {
-			obs.EvidenceLocator = strings.TrimSpace(wire.Locator)
+		// THE REVIEWER'S LOCATOR IS ONLY USED AS THE LOCATOR WHEN IT IS
+		// STRUCTURALLY ONE (#1936). This override used to be unconditional, and
+		// the store requires a locator matching `path` or `path:line` for a STATIC
+		// discharge - so a reviewer that wrote a citation in prose
+		// ("internal/workflow/merge_gate.go: collectImplementerAttribution
+		// (~lines 1436-1449)") had its whole observation REFUSED, even when it
+		// had also supplied a usable `file`. Measured: that exact finding was
+		// rejected with ErrFindingDischarge while its rationale was non-empty,
+		// which is why the ledger held zero answered STATIC rows.
+		//
+		// So a structural locator replaces the derived one, and a prose citation
+		// is preserved as RATIONALE instead of destroying the row. Nothing is
+		// invented: both values came from the reviewer.
+		proseCitation := ""
+		if locator := strings.TrimSpace(wire.Locator); locator != "" {
+			if db.IsStructuralFindingLocator(locator) {
+				obs.EvidenceLocator = locator
+			} else {
+				proseCitation = locator
+			}
 		}
-		obs.Rationale = firstNonEmptyLedgerText(wire.Rationale, obs.Title, obs.Detail, "reported by a review that declared no executed checks")
+		// The prose citation ranks above title/detail because it is what the
+		// reviewer offered as the thing it READ, which is exactly what a STATIC
+		// rationale is for. An explicit `rationale` still wins over both.
+		obs.Rationale = firstNonEmptyLedgerText(wire.Rationale, proseCitation, obs.Title, obs.Detail, "reported by a review that declared no executed checks")
 	default:
 		// No locator to cite and no declared execution: recordable for context
 		// and incapable of discharging anything, which is the honest floor.
@@ -262,7 +350,7 @@ func (e Engine) ledgerObservationFor(job db.Job, payload JobPayload, wire review
 		// dropping the row entirely would lose the observation.
 		obs.State = db.FindingOpen
 	}
-	return obs, true
+	return obs, declared, true
 }
 
 func firstNonEmptyLedgerText(values ...string) string {
@@ -374,4 +462,76 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 // gate incapable of disagreeing (#1850 round 3 item 1).
 func (e Engine) ledgerScopeFor(repo string, pullRequest int, taskID string) LedgerScope {
 	return e.LedgerResolvers.ScopeFor(repo, pullRequest, taskID)
+}
+
+// ledgerStateDowngrade reports whether the recorded state differs from the one
+// the reviewer declared, and why. It never invents a downgrade for an omitted
+// state: silence means OPEN by design, so only a DECLARED disposition that did
+// not survive is a reversal worth naming.
+func ledgerStateDowngrade(declared db.FindingState, obs db.ReviewFindingObservation) (bool, string) {
+	switch declared {
+	case db.FindingAnswered, db.FindingWithdrawn, db.FindingSuperseded:
+	default:
+		return false, ""
+	}
+	if obs.State == declared {
+		return false, ""
+	}
+	switch {
+	case declared == db.FindingWithdrawn && strings.TrimSpace(obs.WithdrawReason) == "":
+		return true, "withdrawal carried no withdraw_reason"
+	case obs.EvidenceKind == db.EvidenceQuoted:
+		return true, "evidence QUOTED: no file or path-shaped evidence_locator, and the review declared no executed checks"
+	default:
+		return true, "recorded state differs from the declared one"
+	}
+}
+
+func (e Engine) recordLedgerDowngrade(ctx context.Context, jobID string, index int, declared db.FindingState, recorded db.FindingState, reason string) {
+	if e.Store == nil {
+		return
+	}
+	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID: jobID,
+		Kind:  "findings_ledger_downgraded",
+		Message: fmt.Sprintf("finding[%d] declared %s, recorded %s (%s)",
+			index, declared, recorded, reason),
+	})
+}
+
+// wireFromBareFindingText reads a finding an agent emitted as ONE PROSE STRING.
+//
+// MEASURED, not hypothesised: review job
+// local-review-joltra-sol-review-18d2b773bd0c534b returned six real findings
+// and the ledger recorded ZERO, six times over -
+// `requires an explicit severity of P0, P1, P2 or P3: got ""` - because every
+// finding arrived as "P2 apps/web/src/views/LandingView.vue:365 (mirrored at
+// ...) - prose". The severity and the locator were both PRESENT, inline, and
+// the writer read neither, so the store refused all six and a review that found
+// six defects left an empty ledger.
+//
+// That skip was LOUD, which is the correct half of the invariant, and it stays
+// loud for anything unparseable. What was wrong is that the writer discarded
+// values the reviewer actually sent. Only a LEADING severity token is read, and
+// only a path-shaped token after it - nothing is inferred from prose, because a
+// wrong locator re-arms the wrong finding.
+func wireFromBareFindingText(text string) reviewFindingWire {
+	wire := reviewFindingWire{Title: strings.TrimSpace(text)}
+	fields := strings.Fields(wire.Title)
+	if len(fields) == 0 {
+		return wire
+	}
+	severity := strings.ToUpper(strings.Trim(fields[0], ":,"))
+	if !reviewseverity.Valid(severity) {
+		return wire
+	}
+	wire.Severity = severity
+	rest := strings.TrimSpace(strings.TrimPrefix(wire.Title, fields[0]))
+	wire.Title = firstNonEmptyLedgerText(rest, wire.Title)
+	// The locator, when the next token is path-shaped. pathFromLensEvidence is
+	// the same parser the lens shape already uses, so one rule governs both.
+	if path := pathFromLensEvidence(rest); path != "" {
+		wire.File = path
+	}
+	return wire
 }

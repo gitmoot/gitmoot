@@ -187,6 +187,14 @@ func pathLikeRelevanceKey(key string) bool {
 // RecordReviewFindingObservation validates at the STORE BOUNDARY and inserts.
 // Every rejection here is a refusal, never a warning: a warning on a write path
 // is indistinguishable from success to the caller that ignores it.
+// IsStructuralFindingLocator reports whether value is a locator this store will
+// accept for a STATIC discharge: a repo-relative path, optionally with a line.
+// Exported because the WRITER must be able to ask before it builds a row - it
+// previously guessed, and a prose citation cost the whole observation.
+func IsStructuralFindingLocator(value string) bool {
+	return locatorPattern.MatchString(strings.TrimSpace(value))
+}
+
 func (s *Store) RecordReviewFindingObservation(ctx context.Context, obs ReviewFindingObservation) (string, error) {
 	head := strings.TrimSpace(obs.HeadSHA)
 	if !headSHAPattern.MatchString(head) {
