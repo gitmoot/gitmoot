@@ -805,3 +805,67 @@ func TestJobWatchReportsALaterRetryWhenTheEarlierEventNeverLanded(t *testing.T) 
 		t.Fatalf("attempt 2 was swallowed by attempt 1's arming, whose own event never landed; output = %q", got)
 	}
 }
+
+// TestJobWatchReportsARetryWhoseDetailQuotesAnEarlierAttempt is #1943 f6's
+// SECOND shape, and it is a defect in my own previous fix rather than in the
+// original code. Binding suppression to class AND attempt was right, but the
+// match searched the WHOLE event message with strings.Contains, and the
+// classifiers append a free-form checkout error after the canonical prefix
+// (job_blocker_checkout.go:215). A perfectly valid attempt-2 event whose DETAIL
+// contains the text "attempt 1/" - here a checkout path - therefore matched
+// attempt 1's stale token and was swallowed.
+//
+// The prefix is the only part of that message this code owns the format of; the
+// tail is arbitrary data and must never be matched against.
+func TestJobWatchReportsARetryWhoseDetailQuotesAnEarlierAttempt(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	seedSessionAgentRepo(t, store)
+	seedQueuedJob(t, store, "detail-quote", workflow.JobPayload{
+		Repo:            "owner/repo",
+		Branch:          "task-11",
+		PullRequest:     11,
+		BlockerClass:    "checkout_contention",
+		BlockerRetryAt:  time.Now().UTC().Add(30 * time.Second).Format(time.RFC3339Nano),
+		BlockerAttempts: 1,
+	})
+
+	var out syncBuffer
+	done := make(chan int, 1)
+	go func() {
+		done <- runJobWatch([]string{"detail-quote", "--home", home, "--poll", "20ms"}, &out, &out)
+	}()
+	deadline := time.Now().Add(8 * time.Second)
+	for !strings.Contains(out.String(), "HOLD:") {
+		if time.Now().After(deadline) {
+			t.Fatalf("HOLD never printed for attempt 1; output = %q", out.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Attempt 1's event never commits (the documented crash window), and attempt
+	// 2's VALID event carries "attempt 1/" inside its free-form detail.
+	if err := store.AddJobEvent(context.Background(), db.JobEvent{
+		JobID:   "detail-quote",
+		Kind:    blockerDeferredEventKind,
+		Message: "checkout_contention: attempt 2/3, retry at 2026-09-06T19:30:00Z: checkout /tmp/attempt 1/stale has uncommitted changes",
+	}); err != nil {
+		t.Fatalf("AddJobEvent attempt 2: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	if _, err := store.TransitionJobState(context.Background(), "detail-quote",
+		string(workflow.JobQueued), string(workflow.JobSucceeded)); err != nil {
+		t.Fatalf("TransitionJobState: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(8 * time.Second):
+		t.Fatalf("watch did not exit; output = %q", out.String())
+	}
+	store.Close()
+
+	if got := out.String(); !strings.Contains(got, "attempt 2/3") {
+		t.Fatalf("attempt 2 was swallowed because its DETAIL quoted an earlier attempt token - the match must be anchored to the canonical prefix; output = %q", got)
+	}
+}

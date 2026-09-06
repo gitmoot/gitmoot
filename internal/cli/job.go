@@ -605,17 +605,22 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, s
 					// redundant - and ONLY that one: consuming the match is what lets a
 					// later retry of the same class still be reported.
 					// Suppress ONLY the event paired with the hold already announced,
-					// identified by class AND attempt. Class alone hid a later retry
-					// whenever the paired event never arrived: the daemon writes payload
-					// then event as two operations and documents a crash between them
-					// (job_blocker.go:499), so attempt 1's arming outlived attempt 1 and
-					// swallowed attempt 2's event (#1943 f6). A zero attempt identifies
-					// nothing and so suppresses nothing - stating a deferral twice is a
-					// smaller fault than hiding a retry.
+					// matched against the CANONICAL PREFIX the classifiers write:
+					// "<class>: attempt <n>/" (job_blocker_checkout.go:215,
+					// job_blocker.go:504). Anchoring is load-bearing, not tidiness.
+					// Searching the whole message with Contains was wrong twice over:
+					// on the class alone it swallowed every later retry once the paired
+					// event was missing, and even with the attempt added, the FREE-FORM
+					// checkout error is appended after that prefix - so a valid attempt-2
+					// message whose detail happens to read ".../tmp/attempt 1/stale has
+					// uncommitted changes" matched the stale attempt-1 token and the
+					// retry vanished (#1943 f6, twice). The prefix is the only part of
+					// the message this code writes the format for; the tail is data.
+					// A zero attempt identifies nothing and so suppresses nothing -
+					// stating a deferral twice is a smaller fault than hiding a retry.
 					if pendingClass != "" && pendingAttempt > 0 &&
 						event.Kind == blockerDeferredEventKind &&
-						strings.Contains(event.Message, pendingClass) &&
-						strings.Contains(event.Message, fmt.Sprintf("attempt %d/", pendingAttempt)) {
+						strings.HasPrefix(event.Message, fmt.Sprintf("%s: attempt %d/", pendingClass, pendingAttempt)) {
 						pendingClass = ""
 						pendingAttempt = 0
 						continue
