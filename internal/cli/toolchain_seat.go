@@ -38,6 +38,14 @@ func stageSeatToolchain(paths config.Paths) (string, []string, string, error) {
 	if err != nil {
 		return unavailableSeatToolchain(paths, "")
 	}
+	// RESOLVE THE SYMLINK BEFORE CLASSIFYING. A PATH entry is frequently a link
+	// into the real installation: /usr/bin/go on this host points at
+	// /usr/lib/go-1.22/bin/go. Classifying the RAW path yields the install root
+	// "/usr", so staging would try to copy the entire system tree instead of a
+	// toolchain - StageRuntime already resolves for exactly this reason.
+	if target, linkErr := filepath.EvalSymlinks(resolved); linkErr == nil {
+		resolved = target
+	}
 	source, ok := toolchainInstallRoot(resolved)
 	if !ok {
 		return unavailableSeatToolchain(paths, "resolved Go executable is not inside a bin/ or sbin/ installation; host copy is shadowed")
@@ -121,6 +129,19 @@ func stageSeatRuntimes(paths config.Paths) ([]string, []string, error) {
 			copied, stageErr := toolchain.StageRuntime(paths.Home, name, resolved)
 			if stageErr == nil {
 				staged = append(staged, copied)
+				// A SCRIPT ENTRYPOINT IS NOT RUNNABLE WITHOUT ITS INTERPRETER,
+				// and the interpreter is the one thing a copy of the script does
+				// not bring. codex is "#!/usr/bin/env node" whose node lives in
+				// the operator's HOME, so without this the seat either reads an
+				// ungranted operator path or cannot exec at all.
+				if interpreter, target, needs := toolchain.RuntimeInterpreter(resolved); needs {
+					interpreterShim, interpreterErr := toolchain.StageRuntime(paths.Home, interpreter, target)
+					if interpreterErr != nil {
+						diagnostics = append(diagnostics, fmt.Sprintf("runtime %s needs interpreter %s, which could not be staged: %v", name, interpreter, interpreterErr))
+					} else {
+						staged = append(staged, interpreterShim)
+					}
+				}
 				continue
 			}
 			diagnostics = append(diagnostics, fmt.Sprintf("runtime %s could not be staged; installed copy is shadowed: %v", name, stageErr))

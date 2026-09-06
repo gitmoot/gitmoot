@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -101,6 +102,99 @@ func StageRuntime(gitmootHome string, name string, executable string) (string, e
 		return "", err
 	}
 	return filepath.Join(published, ".bin", name), nil
+}
+
+// RuntimeInterpreter reports the interpreter a staged entrypoint needs, and the
+// resolved absolute path to stage for it.
+//
+// WHY THIS EXISTS, and it is the hole a launch probe cannot see from outside
+// Landlock: codex's resolved artifact is
+// <node>/lib/node_modules/@openai/codex/bin/codex.js, whose first line is
+// "#!/usr/bin/env node". Staging that file copies the SCRIPT and nothing that
+// can run it. The interpreter on this host resolves to
+// /root/.nvm/versions/node/<v>/bin/node - inside the operator's HOME, which is
+// exactly the root this whole change refuses to grant. So the seat would either
+// read an ungranted operator path or fail to exec at all: the #1918 symptom
+// wearing the #1921 exposure.
+//
+// It returns ok=false for a binary (claude and kimi are ELF here) and for a
+// shebang it cannot resolve, because copying less can only fail closed.
+func RuntimeInterpreter(executable string) (name string, resolved string, ok bool) {
+	handle, err := os.Open(executable)
+	if err != nil {
+		return "", "", false
+	}
+	defer handle.Close()
+	header := make([]byte, 256)
+	read, err := handle.Read(header)
+	if err != nil && read == 0 {
+		return "", "", false
+	}
+	header = header[:read]
+	if !strings.HasPrefix(string(header), "#!") {
+		return "", "", false
+	}
+	line := string(header[2:])
+	if end := strings.IndexAny(line, "\r\n"); end >= 0 {
+		line = line[:end]
+	}
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return "", "", false
+	}
+	candidate := fields[0]
+	// "#!/usr/bin/env node" names the LOOKUP TOOL, not the interpreter. The
+	// argument is what has to exist on the seat's PATH, so that is what is
+	// staged; /usr/bin/env itself is a system binary already inside the fixed
+	// read set.
+	if filepath.Base(candidate) == "env" {
+		if len(fields) < 2 {
+			return "", "", false
+		}
+		candidate = fields[1]
+	}
+	target, err := exec.LookPath(candidate)
+	if err != nil {
+		return "", "", false
+	}
+	target, err = filepath.Abs(target)
+	if err != nil {
+		return "", "", false
+	}
+	base := filepath.Base(target)
+	if resolvedTarget, linkErr := filepath.EvalSymlinks(target); linkErr == nil {
+		target = resolvedTarget
+	}
+	// The NAME is the one the shebang will look up, never the resolved file's
+	// name: a versioned target (node -> node22) must still answer to "node".
+	if filepath.Base(candidate) != "" && !strings.ContainsAny(candidate, `/\`) {
+		base = candidate
+	}
+	// A SYSTEM INTERPRETER IS ALREADY REACHABLE AND MUST NOT BE COPIED. The
+	// sandbox grants the fixed system roots unconditionally, so /bin/sh needs no
+	// staging - and staging it would put an engine copy of the shell ahead of
+	// the real one on the seat's PATH for no gain. Measured: without this,
+	// every "#!/bin/sh" runtime fixture staged /bin/sh as a runtime command.
+	//
+	// Only an interpreter OUTSIDE those roots is the codex case - node in the
+	// operator's home - which is the one that must be copied.
+	if systemInterpreterRoots(target) {
+		return "", "", false
+	}
+	return base, target, true
+}
+
+// systemInterpreterRoots reports whether an interpreter already lives under a
+// root the sandbox grants unconditionally. The list mirrors internal/sandbox's
+// fixed read set; a path not on it is treated as operator-owned, which is the
+// direction that fails closed (an unnecessary copy, never a missing grant).
+func systemInterpreterRoots(target string) bool {
+	for _, root := range []string{"/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/", "/usr/libexec/", "/usr/lib/", "/usr/lib64/", "/lib/", "/lib64/"} {
+		if strings.HasPrefix(target, root) {
+			return true
+		}
+	}
+	return false
 }
 
 // StageUnavailableRuntime publishes an engine-owned command that fails with an
