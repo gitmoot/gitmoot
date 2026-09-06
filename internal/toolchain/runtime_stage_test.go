@@ -74,7 +74,10 @@ func TestStageRuntimeStagesASelfContainedExecutableWithoutItsProfile(t *testing.
 		if walkErr != nil {
 			return walkErr
 		}
-		if entry.Type().IsRegular() {
+		// The generated .bin shim and the recorded entrypoint digest are ENGINE
+		// metadata, not copied source, so they are excluded exactly as the shim
+		// already was. Anything else under here came from the operator's tree.
+		if entry.Type().IsRegular() && filepath.Base(path) != entrypointDigestName {
 			copied = append(copied, filepath.Base(path))
 		}
 		return nil
