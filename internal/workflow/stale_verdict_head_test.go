@@ -98,75 +98,23 @@ func TestObjectionAtCurrentHeadStillRequestsChanges(t *testing.T) {
 }
 
 // PIN 1 - AN OBJECTION WITH A HEAD BUT NO OBSERVED PULL REQUEST ROW STILL
-// ADVANCES. This is the case a retracted ruling would have refused transiently,
-// and its ABSENCE from the suite is what let that ruling look safe.
-//
-// Refusing here would be a LIVENESS loss - the conservative transition and the
-// inline fix pass withheld. NO CLAIM IS MADE HERE ABOUT WHAT REFUSING DOES TO A
-// MERGE, in either direction: that inference is the same one round 10 killed as a
-// P1, because the gate reads the review rows AND the task state. An earlier
-// version of this comment made it in the merge-ward direction - that refusing
-// would let the gate "merge on an approval over a real current-head objection
-// nobody recorded" - and #1903's third review round found that claim still living
-// here after the function comment had been corrected.
-//
-// WHAT THIS ARM NEEDS FROM PolicyMergeGate IS ONE INVARIANT, NOT A MAP OF ITS
-// BEHAVIOUR. Seven review rounds on this PR each killed a different attempt to
-// describe the gate here: three coverage absolutes, then the line numbers
-// themselves (measured against another tree, and once corrected still pointing at
-// declarations rather than at the returns), then an "exactly three cases"
-// enumeration that omitted a fourth path, and finally a merge-safety INFERENCE
-// drawn from a true sentence. The attempts kept failing because the gate's
-// behaviour is a function of the whole review population, of filters applied in
-// an order this file does not own, AND of the task state. So:
-//
-// THE INVARIANT, AND ONLY THIS: refusing the TASK transition NEVER un-records the
-// REVIEW ROW. The terminal result-bearing row is committed before the advance
-// runs, so nothing about admitting or refusing here adds or removes review
-// evidence.
-//
-// WHAT THAT DOES NOT ESTABLISH, stated because the previous version of this
-// comment claimed it: it does NOT follow that this arm cannot affect merge
-// safety. PolicyMergeGate decides from the review rows AND the task state, and it
-// fences an external merge by CLAIMING that state - so a persisted objection can
-// lose a race rather than merely be deferred. That race reproduces on main and is
-// tracked as gitmoot#1933; it is neither introduced nor fixed here. The asymmetry
-// with the approval side is still deliberate, but argue it from the admits
-// themselves rather than from a safety property this arm does not have.
-//
-// WHAT THE GATE DOES WITH A ROW, described as ordering rather than as coverage,
-// and deliberately NOT exhaustive: Evaluate derives the head LIVE via
-// MergeGateGitHub.GetPullRequest and collects into reviewsAtHead only rows whose
-// payload.HeadSHA equals it, returning mergeBlocked for a blocking decision among
-// them. When reviewsAtHead is EMPTY, the newest round is selected over all
-// taskReviews by reviewRoundKeyAfter; effectiveReviewDecisionForPayload and the
-// authorship filters run FIRST and can drop or re-characterise a row - a
-// sub-threshold objection can become an approval and then be refused for
-// independence, which is what TestPolicyMergeGateFallbackKeepsPipelineReviewVerdictRaw
-// constructs - and only survivors reach ensureReviewMatchesHead, which refuses a
-// NON-EMPTY mismatching head with "is for a different head SHA" and an ABSENT head
-// with "does not record a head SHA" unless isIntegrationWorktreeReview admits it.
-// Named pins for the parts that matter here:
-// TestPolicyMergeGateIgnoresReviewJobsAtStaleHeadForQuorum (a stale row is
-// excluded from the strict population while something current survives),
-// TestPolicyMergeGateBlocksReviewForStaleHead (the fallback can reach a stale row
-// and refuse it), TestPolicyMergeGateEmptyReviewRoundUsesRecordedRecency (how the
-// round is selected). DO NOT ADD A CASE COUNT TO THIS LIST: whether a particular
-// stale row is reached depends on decision thresholds, attribution and round
-// selection together, and every attempt to close the enumeration here has been
-// wrong.
-//
-// An ABSENT head is governed by the integration markers instead of by this arm -
-// see TestObjectionWithNoHeadStillRequestsChanges below.
+// ADVANCES.
 //
 // This arm's row carries a head the engine CANNOT CONFIRM: there is no observed
 // pull request row to compare it against. That is the whole reason it admits -
 // the engine cannot show the objection is stale, so refusing would withhold the
 // conservative transition and the inline fix pass from an objection that may
-// well be about the current head. NO CLAIM IS MADE HERE THAT ADMITTING IS SAFE:
-// the task state participates in merge safety and admitting can race the gate's
-// claim (gitmoot#1933), so the argument for this arm is liveness and nothing
-// more.
+// well be about the current head. The argument for this arm is that liveness
+// cost and nothing else.
+//
+// The one thing this arm establishes about the review record: refusing the TASK
+// transition never un-records the REVIEW ROW, because the terminal
+// result-bearing row is committed before the advance runs. What the merge gate
+// decides from those rows is the gate's behaviour, specified and pinned where
+// the gate is - see merge_gate.go and its tests. This file describes neither.
+//
+// An ABSENT head is governed by the integration markers instead of by this arm -
+// see TestObjectionWithNoHeadStillRequestsChanges below.
 func TestObjectionWithNoObservedPullRequestRowStillRequestsChanges(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -269,10 +217,7 @@ func TestStaleObjectionDispatchesNoFixLeg(t *testing.T) {
 //     fallback refuses headless rows" is NOT a statement this code supports; only
 //     the marker test is.
 //   - A current-head review exists -> the strict population is non-empty and the
-//     fallback never runs, so this row is not reached. NOTHING IS CLAIMED HERE
-//     ABOUT MERGE CONSEQUENCES IN EITHER BRANCH: the gate decides from the review
-//     rows and the task state, and admitting can race its claim of that state
-//     (gitmoot#1933).
+//     fallback never runs, so this row is not reached.
 //
 // These are the branches the CODE TESTS FOR, not an exhaustive account of how
 // rows arise: 1,222 rows in the same store carry WorktreePath with no

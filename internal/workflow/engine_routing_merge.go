@@ -873,48 +873,18 @@ func (e Engine) parkTaskAwaitingHumanMerge(ctx context.Context, ref taskRef, rea
 // is called inline from it, dispatched a fix leg against findings about that
 // superseded commit. #1834/#1871 bound the APPROVING side and left this one.
 //
-// ONLY A CONTRADICTED HEAD REFUSES. Both unknowns admit, and the asymmetry with
-// the approval arm is deliberate - but the reason is LIVENESS, not merge safety.
-// An earlier version of this comment claimed that refusing on a missing local
-// row would let the merge gate merge on an approval "over a real current-head
-// objection nobody recorded". That claim is FALSE, and #1903's independent
-// review is what caught it:
+// ONLY A CONTRADICTED HEAD REFUSES; both unknowns admit. What refusing would
+// cost is the CONSERVATIVE transition and, inline from here, the FIX PASS - for
+// an objection nobody can show is stale. That liveness cost is the whole reason
+// the unknowns admit. What this arm establishes about the review record is one
+// invariant: refusing the TASK transition never un-records the REVIEW ROW,
+// because the terminal result-bearing row is committed before the advance runs.
+// Nothing here describes what any of that does to a merge; that is the merge
+// gate's behaviour and is specified where the gate is, not here.
 //
-//   - THE INVARIANT, AND ONLY THIS: refusing the TASK transition never
-//     un-records the REVIEW ROW. Admitting or refusing here neither adds nor
-//     removes review evidence, because the terminal result-bearing row is
-//     committed before the advance runs.
-//     IT DOES NOT FOLLOW THAT THIS ARM CANNOT AFFECT A MERGE, and the previous
-//     version of this comment claimed it did: PolicyMergeGate decides from the
-//     review rows AND the task state, and it fences an external merge by claiming
-//     that state, so a persisted objection can lose a race rather than merely be
-//     deferred. That reproduces on main and is tracked as gitmoot#1933 - neither
-//     introduced nor fixed here. The asymmetry with the approval side is still
-//     deliberate; argue it from the admits rather than from a safety property
-//     this arm does not have.
-//     THIS COMMENT DELIBERATELY DOES NOT ENUMERATE WHICH ROWS THE GATE REACHES.
-//     Four successive rounds of this PR killed four attempts: two coverage
-//     absolutes, an "exactly three cases" list that omitted the fallback's
-//     decision and authorship filters, and the merge-safety inference above.
-//     For the ordering - live head via
-//     MergeGateGitHub.GetPullRequest, the strict evaluated-head population, then a
-//     latest-round fallback whose filters run BEFORE ensureReviewMatchesHead - see
-//     the comment on TestObjectionWithNoObservedPullRequestRowStillRequestsChanges,
-//     which states it as ordering with named pins and no case count. The headless
-//     case is documented at TestObjectionWithNoHeadStillRequestsChanges.
-//
-// What refusing would actually cost is the CONSERVATIVE transition and, because
-// dispatchFix is called inline from this arm, the FIX PASS - for an objection
-// nobody can show is stale. Withholding both from an objection that is
-// legitimately about the current head as far as any available evidence goes is a
-// liveness loss, which is why the unknowns admit; the approval side refuses its
-// mirror cases, and why it does is that arm's business, not this one's.
-//
-// THIS CODE MAKES NO CLAIM THAT ADMITTING IS MERGE-SAFE: the task state
-// participates in merge safety, and an admitted objection can race the gate's
-// claim of it (gitmoot#1933). The argument here is liveness only. A CLI review
-// dispatched without --head-sha produces the headless payload today, which is
-// why that case is real traffic.
+// A CLI review dispatched without --head-sha produces the headless payload
+// today, which is why that case is real traffic. The arms are pinned in
+// stale_verdict_head_test.go.
 //
 // ACCEPTED LIMITATION (#1512's family): when the ONLY objection on a PR is bound
 // to a superseded head, this arm strands it. The task does not transition, no fix

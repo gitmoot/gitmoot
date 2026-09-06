@@ -807,42 +807,19 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			// early refuses both in one place.
 			//
 			// THE GUARD IS DELIBERATELY ASYMMETRIC WITH THE APPROVAL SIDE, and the
-			// asymmetry is a LIVENESS argument rather than a safety one - an
-			// earlier version of this comment called it "the safety argument", and
-			// #1903's third review round caught that residue.
+			// asymmetry is a LIVENESS argument: refusing an objection withholds the
+			// conservative transition and the inline fix pass from a complaint that
+			// may well be about the current head. So when no observed pull request
+			// row records a head, this arm ADMITS - refusing would block a
+			// legitimate objection on a PR the daemon has not polled yet, which is
+			// the CLI-dispatch path, and would make the engine's cheapest
+			// transition the one demanding the most evidence.
 			//
-			// THIS COMMENT NO LONGER CLAIMS TO KNOW WHICH ROWS PolicyMergeGate
-			// REACHES, nor that this arm is merge-safe. Four rounds of this PR killed
-			// four attempts: "reached by one path or the other" (round 5), "a stale
-			// row is reached by NEITHER" (round 6), an "exactly three cases"
-			// enumeration that omitted the authorship filter (round 7), and the
-			// INFERENCE that unchanged review evidence means unchanged merge safety
-			// (round 9).
-			// WHAT SURVIVES, AND ONLY THIS: refusing the TASK transition never
-			// un-records the REVIEW ROW, so refusing here neither adds nor removes
-			// review evidence. It does NOT follow that this arm cannot affect a
-			// merge: the gate decides from the review rows AND the task state, and it
-			// fences an external merge by claiming that state, so a persisted
-			// objection can lose a race rather than merely be deferred - reproduces
-			// on main, tracked as gitmoot#1933, neither introduced nor fixed here.
-			// For the ordering itself - live head, strict evaluated-head population,
-			// then a latest-round fallback whose decision and authorship filters run
-			// BEFORE ensureReviewMatchesHead - see the comment on
-			// TestObjectionWithNoObservedPullRequestRowStillRequestsChanges, which
-			// states it as ordering and deliberately not as an enumeration.
-			//
-			// Refusing an objection withholds the conservative transition and the
-			// inline fix pass from a complaint that may well be about the current
-			// head. That is a LIVENESS argument and
-			// the only one this arm has: THIS CODE MAKES NO CLAIM THAT ADMITTING IS
-			// MERGE-SAFE. The task state participates in merge safety, and an
-			// admitted objection can race the gate's claim of it (gitmoot#1933).
-			// So when no observed pull request row records a head, this arm ADMITS -
-			// refusing would block a legitimate objection on a PR the daemon has not
-			// polled yet, which is the CLI-dispatch path, and would make the engine's
-			// cheapest transition the one demanding the most evidence. The headless
-			// case is governed by the review population instead, and is documented
-			// at TestObjectionWithNoHeadStillRequestsChanges.
+			// One invariant governs the review record: refusing the TASK transition
+			// never un-records the REVIEW ROW, so refusing here neither adds nor
+			// removes review evidence. What the merge gate then does with those
+			// rows is its own behaviour and is not described here. The headless
+			// case is documented at TestObjectionWithNoHeadStillRequestsChanges.
 			bound, unboundReason, err := e.objectionBindsToCurrentHead(ctx, payload)
 			if err != nil {
 				return err
