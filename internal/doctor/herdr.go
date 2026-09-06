@@ -63,16 +63,28 @@ type semVersion struct {
 	prerelease          []string
 }
 
+// parseHerdrVersion extracts the version from `herdr --version` output.
+//
+// IT SCANS FOR THE FIRST SEMVER FIELD RATHER THAN TAKING THE LAST (#1736, and
+// #1664 which reported the same defect first). herdr prints
+// "herdr 0.8.2 (4c745b97)", so the LAST field is the commit hash: the check
+// reported `malformed "herdr 0.8.2 (4c745b97)"` and failed a >=0.7.5 floor that
+// 0.8.2 plainly satisfies. Because this check is REQUIRED that made
+// `gitmoot doctor` exit 1 permanently - measured on this host - and a
+// permanently red required check is worse than cosmetic: it hides a genuine
+// failure of any other required check behind noise an operator learns to ignore.
+//
+// A leading "v" is deliberately NOT accepted. The existing contract pins
+// "herdr v0.7.5" as malformed, that is not the defect being fixed, and quietly
+// widening what counts as a version is how a parser stops being a check.
 func parseHerdrVersion(output string) (string, error) {
 	fields := strings.Fields(strings.TrimSpace(output))
-	if len(fields) == 0 {
-		return "", fmt.Errorf("malformed `herdr --version` output")
+	for _, field := range fields {
+		if _, err := parseStrictSemVer(field); err == nil {
+			return field, nil
+		}
 	}
-	version := fields[len(fields)-1]
-	if _, err := parseStrictSemVer(version); err != nil {
-		return "", fmt.Errorf("malformed `herdr --version` output %q", strings.TrimSpace(output))
-	}
-	return version, nil
+	return "", fmt.Errorf("malformed `herdr --version` output %q", strings.TrimSpace(output))
 }
 
 func parseStrictSemVer(value string) (semVersion, error) {
