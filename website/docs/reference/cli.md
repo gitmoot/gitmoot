@@ -2113,6 +2113,16 @@ given a bucket, because the shell aborts or the parse is ambiguous. A `-c` is
 honoured only when it belongs to an interpreter: `nohup -c cmd` execs a command
 named `-c`.
 
+The implemented boundary, stated exactly. After `-c`, exactly ONE operand is the
+command string; following words are positional parameters, so
+`bash -c "go" test ./...` is not a Go test. Options that parse or print instead
+of executing - `-n`, `-D`, `--help`, `--version` - mean the command string never
+runs. Option grammars are PER INTERPRETER: POSIX sh rejects `--noprofile`, `-O`
+and `-o` here, boolean long options take no inline value (`--noprofile=x`
+aborts), and zsh is UNMEASURED on this box, so only `-c` and `--` are declared
+for it and every other zsh option is reported `unknown`. Anything outside a
+declared grammar is `unknown`, never a bucket.
+
 
 `job transcript <job-id> --export md` remains the deterministic, ANSI-free
 Markdown snapshot. `--export jsonl` emits schema-versioned, self-contained

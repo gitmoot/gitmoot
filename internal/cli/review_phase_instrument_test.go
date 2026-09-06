@@ -1610,6 +1610,17 @@ func TestPhaseInstrumentTreatsInterpreterOperandsAsScripts(t *testing.T) {
 //	bash -O extglob -c "go version"         exit 0,   Go RAN
 //	bash -o pipefail -c "go version"        exit 0,   Go RAN
 //	bash -s -c "go version"                 exit 0,   Go RAN
+//
+// ACCOUNTING CORRECTION (#1930 round-14 F2). The f45ec049 commit body says this
+// table failed "30 of 34" Codex/Kimi leaves against the 3e5b4a89 production
+// blob. THAT NUMBER IS WRONG. It was measured before the last two -Ox cases
+// were added and never re-measured, so it described an earlier tree. Re-run
+// against the same blob: 19 cases, 38 leaves, 34 FAIL and 4 PASS - the
+// reviewer's count, reproduced here. The commit is immutable, so the
+// correction lives where the table does.
+//
+// The habit this cost: a count is only evidence of the tree it was taken from,
+// so measure it AFTER the last edit, in the same run you quote it from.
 func TestPhaseInstrumentHonoursInterpreterOptionState(t *testing.T) {
 	for _, tc := range []struct{ name, command, want string }{
 		// `--` ENDS OPTION PARSING, so the following -c is a script FILENAME.
@@ -1649,6 +1660,158 @@ func TestPhaseInstrumentHonoursInterpreterOptionState(t *testing.T) {
 		// check is a killable mutant.
 		{"ambiguous mid-cluster value letter refuses", `bash -Ox extglob -c "go test ./..."`, phaseBucketUnknown},
 		{"value letter with attached c refuses", `bash -Oc "go test ./..."`, phaseBucketUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentHonoursCommandStringArity is #1930 round-14 F1, first gap.
+// Only the FIRST token after -c is the command string; the rest become $0 and
+// the positional parameters. Joining them invented a command nobody ran.
+// Measured: `bash -c "go version" test ./...` exits 0 and runs Go WITHOUT the
+// test subcommand, and `bash -c "" go version` runs nothing at all.
+func TestPhaseInstrumentHonoursCommandStringArity(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"trailing words are positional parameters", `bash -c "go" test ./...`, phaseBucketOther},
+		{"command string keeps its own arguments", `bash -c "go test ./..." extra`, phaseBucketTest},
+		{"empty command string runs nothing", `bash -c "" go test ./...`, phaseBucketOther},
+		{"empty command string under sh", `sh -c "" go test ./...`, phaseBucketOther},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentHonoursSuppressingOptions is #1930 round-14 F1, second
+// gap. An option that parses or prints instead of executing means the command
+// string never runs, however ordinary it looks. All four measured at exit 0
+// with zero Go invocations.
+func TestPhaseInstrumentHonoursSuppressingOptions(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"bash noexec", `bash -n -c "go test ./..."`, phaseBucketOther},
+		{"sh noexec", `sh -n -c "go test ./..."`, phaseBucketOther},
+		{"bash noexec in a bundle", `bash -nc "go test ./..."`, phaseBucketOther},
+		{"bash dump strings", `bash -D -c "go test ./..."`, phaseBucketOther},
+		{"bash help", `bash --help -c "go test ./..."`, phaseBucketOther},
+		{"bash version", `bash --version -c "go test ./..."`, phaseBucketOther},
+		// and a suppressing option must not disturb the ordinary case.
+		{"no suppressing option still runs", `bash -c "go test ./..."`, phaseBucketTest},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentUsesPerInterpreterGrammars is #1930 round-14 F1, third
+// gap: one bash-shaped table was applied to every interpreter. POSIX sh on this
+// box is dash and rejects all three of bash's options below (measured, exit 2),
+// while `sh -l -c` works. Boolean long flags take no value: `--noprofile=x`
+// aborts.
+//
+// zsh IS NOT INSTALLED HERE, so its grammar could not be measured. Only the two
+// universals are declared for it - `-c` and `--` - and everything else refuses.
+// That is deliberately narrower than bash rather than copied from it.
+func TestPhaseInstrumentUsesPerInterpreterGrammars(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"sh rejects a bash long option", `sh --noprofile -c "go test ./..."`, phaseBucketUnknown},
+		{"sh rejects shopt", `sh -O extglob -c "go test ./..."`, phaseBucketUnknown},
+		{"sh rejects set -o here", `sh -o pipefail -c "go test ./..."`, phaseBucketUnknown},
+		{"sh accepts login", `sh -l -c "go test ./..."`, phaseBucketTest},
+		{"bash boolean flag takes no value", `bash --noprofile=x -c "go test ./..."`, phaseBucketUnknown},
+		{"bash accepts the same long option bare", `bash --noprofile -c "go test ./..."`, phaseBucketTest},
+		{"zsh command string is universal", `zsh -c "go test ./..."`, phaseBucketTest},
+		{"unmeasured zsh options refuse", `zsh -O extglob -c "go test ./..."`, phaseBucketUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// classifyThroughSplitWrites drives one command through the production path in
+// SEVEN-BYTE WRITES, which is how the round-14 reviewer reproduced its
+// findings. classifyThroughBothProductionPaths writes each JSON line whole; a
+// scanner that only reassembles on line boundaries would pass that and fail
+// this, so the two helpers are not redundant (#1930 round-14).
+func classifyThroughSplitWrites(t *testing.T, command, want string) {
+	t.Helper()
+	for _, path := range []struct {
+		name    string
+		runtime string
+		agent   string
+		lines   func(string, string) (string, string)
+	}{
+		{"codex", "codex", "codex-reviewer", codexToolLines},
+		{"kimi", "kimi", "kimi-reviewer", kimiToolLines},
+	} {
+		t.Run(path.name, func(t *testing.T) {
+			home := t.TempDir()
+			paths := config.PathsForHome(home)
+			store := seedInstrumentJob(t, paths, "split", path.agent, path.runtime)
+			handle := openInstrumentedTranscript(t, home, "split", path.runtime, store)
+			start, end := path.lines("s1", command)
+			for index, payload := range []string{start, end} {
+				for offset := 0; offset < len(payload); offset += 7 {
+					limit := offset + 7
+					if limit > len(payload) {
+						limit = len(payload)
+					}
+					if _, err := handle.Write([]byte(payload[offset:limit])); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if index == 0 {
+					time.Sleep(12 * time.Millisecond)
+				}
+			}
+			if err := handle.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+			profile := readPhaseProfile(t, store, "split")
+			assertProfileIdentities(t, profile)
+			if profile.BucketCount[want] != 1 {
+				t.Fatalf("%s split-write path: %q landed in %v, want %s",
+					path.name, command, profile.BucketCount, want)
+			}
+		})
+	}
+}
+
+// TestPhaseInstrumentSplitWritesAgreeWithWholeLines runs the round-14
+// counterexamples through the seven-byte split-write path, and pairs each
+// refusing case with a SHOULD-SUCCEED command of the same shape. Without the
+// positives a blanket "always unknown" regression would pass this table, which
+// is the failure mode a conservative fix invites.
+func TestPhaseInstrumentSplitWritesAgreeWithWholeLines(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"arity counterexample", `bash -c "go" test ./...`, phaseBucketOther},
+		{"arity positive", `bash -c "go test ./..." extra`, phaseBucketTest},
+		{"empty command string", `bash -c "" go test ./...`, phaseBucketOther},
+		{"suppressing counterexample", `bash -n -c "go test ./..."`, phaseBucketOther},
+		{"suppressing positive", `bash -c "go test ./..."`, phaseBucketTest},
+		{"sh grammar counterexample", `sh -O extglob -c "go test ./..."`, phaseBucketUnknown},
+		{"sh grammar positive", `sh -c "go test ./..."`, phaseBucketTest},
+		{"inline boolean value counterexample", `bash --noprofile=x -c "go test ./..."`, phaseBucketUnknown},
+		{"inline boolean value positive", `bash --noprofile -c "go test ./..."`, phaseBucketTest},
+		{"script operand counterexample", "bash go test ./...", phaseBucketOther},
+		{"wrapper positive", "timeout 25m go test ./...", phaseBucketTest},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughSplitWrites(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentHonoursWrapperStacks covers the `nohup ... -c` shape the
+// round-14 directive names, and every other wrapper stacked over an
+// interpreter. Each refusing row is paired with a succeeding one so the table
+// cannot be satisfied by refusing everything.
+func TestPhaseInstrumentHonoursWrapperStacks(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"nohup over a suppressed interpreter", `nohup bash -n -c "go test ./..."`, phaseBucketOther},
+		{"nohup over a real command string", `nohup bash -c "go test ./..."`, phaseBucketTest},
+		{"sudo over a suppressed interpreter", `sudo bash -n -c "go test ./..."`, phaseBucketOther},
+		{"sudo over a real command string", `sudo bash -c "go test ./..."`, phaseBucketTest},
+		{"timeout over a terminal option", `timeout 25m bash --version -c "go test ./..."`, phaseBucketOther},
+		{"timeout over a real command string", `timeout 25m bash -c "go test ./..."`, phaseBucketTest},
+		{"env over an undeclared sh option", `env sh -O extglob -c "go test ./..."`, phaseBucketUnknown},
+		{"env over a real command string", `env sh -c "go test ./..."`, phaseBucketTest},
+		{"nohup owns no -c of its own", `nohup -c "go test ./..."`, phaseBucketOther},
+		{"nohup execs a real command", "nohup go test ./...", phaseBucketTest},
 	} {
 		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
 	}

@@ -125,50 +125,86 @@ func classifyPhaseCommand(command string) string {
 // than any real agent command and terminates on hostile input.
 const maxWrapperRecursion = 3
 
-// INTERPRETER OPTION STATE (#1930 round-13 F1). Four rounds of per-token
-// heuristics kept producing confident buckets in BOTH directions, so the option
-// grammar is declared here and anything outside it is refused, exactly as
-// ruling 123815 requires of the command grammar.
+// INTERPRETER OPTION STATE (#1930 round-13 F1, round-14 F1). Four rounds of
+// per-token heuristics produced confident buckets in both directions, so the
+// option grammar is declared here PER INTERPRETER and anything outside it is
+// refused, as ruling 123815 requires of the command grammar.
 //
-// Every rule below was measured against real bash and sh rather than read off a
-// man page:
+// Every rule was measured against the real shell before it was written:
 //
-//	bash -- -c "go version"                 exit 127, no Go   (-- ends options; -c is a FILENAME)
-//	sh   -- -c "go version"                 exit 2,   no Go
-//	bash -zc "go version"                   exit 2,   no Go   (invalid option; the shell aborts)
-//	sh   -zc "go version"                   exit 2,   no Go
-//	bash --rcfile /dev/null -c "go version" exit 0,   Go RAN  (--rcfile consumes its value)
-//	bash -O extglob -c "go version"         exit 0,   Go RAN  (-O consumes its value)
-//	bash -o pipefail -c "go version"        exit 0,   Go RAN
-//	bash -s -c "go version"                 exit 0,   Go RAN
-const (
-	// Short flags that take no value. Undeclared letters are REFUSED rather
-	// than skipped, because an invalid option makes the shell exit without
-	// running anything - reporting a test there is the defect this closes.
-	interpreterShortFlags = "abefhiklmnprstuvxBCDEHPT"
-	// Short flags that consume the NEXT token as their value.
-	interpreterValueFlags = "oO"
-)
+//	bash -- -c "go version"                   exit 127, no Go  (-- ends options)
+//	sh   -- -c "go version"                   exit 2,   no Go
+//	bash -zc "go version"                     exit 2,   no Go  (invalid option aborts)
+//	bash --rcfile /dev/null -c "go version"   exit 0,   Go RAN (value consumed)
+//	bash -O extglob -c "go version"           exit 0,   Go RAN
+//	bash -o pipefail -c "go version"          exit 0,   Go RAN
+//	bash -s -c "go version"                   exit 0,   Go RAN
+//	bash -c "go version" test ./...           exit 0,   Go RAN WITHOUT `test`
+//	bash -c "" go version                     exit 0,   no Go  (empty command string)
+//	bash -n -c "go version"                   exit 0,   no Go  (noexec)
+//	sh   -n -c "go version"                   exit 0,   no Go
+//	bash -D -c "go version"                   exit 0,   no Go
+//	bash --help    -c "go version"            exit 0,   no Go  (terminal option)
+//	bash --version -c "go version"            exit 0,   no Go
+//	sh --noprofile -c "go version"            exit 2,   no Go  (not a POSIX sh option)
+//	sh -O extglob  -c "go version"            exit 2,   no Go
+//	sh -o pipefail -c "go version"            exit 2,   no Go  (dash rejects -o here)
+//	sh -l -c "go version"                     exit 0,   Go RAN
+//	bash --noprofile=x -c "go version"        exit 2,   no Go  (boolean flag takes no value)
+type interpreterGrammar struct {
+	// shortFlags take no value.
+	shortFlags string
+	// valueFlags consume the NEXT token as their value.
+	valueFlags string
+	// suppressingFlags parse or print instead of executing, so the command
+	// string does not run.
+	suppressingFlags string
+	longFlags        map[string]bool
+	longValueFlags   map[string]bool
+	// longSuppressing options print and exit.
+	longSuppressing map[string]bool
+}
 
-var (
-	interpreterLongFlags = map[string]bool{
-		"--login": true, "--noprofile": true, "--norc": true, "--posix": true,
-		"--restricted": true, "--verbose": true, "--version": true, "--help": true,
-		"--debugger": true, "--noediting": true, "--dump-strings": true,
-		"--dump-po-strings": true, "--pretty-print": true,
-	}
-	interpreterLongValueFlags = map[string]bool{"--rcfile": true, "--init-file": true}
-)
+var interpreterGrammars = map[string]interpreterGrammar{
+	"bash": {
+		shortFlags:       "abefhiklmprstuvxBCEHPT",
+		valueFlags:       "oO",
+		suppressingFlags: "nD",
+		longFlags: map[string]bool{
+			"--login": true, "--noprofile": true, "--norc": true, "--posix": true,
+			"--restricted": true, "--verbose": true, "--noediting": true, "--debugger": true,
+		},
+		longValueFlags: map[string]bool{"--rcfile": true, "--init-file": true},
+		longSuppressing: map[string]bool{
+			"--help": true, "--version": true, "--dump-strings": true,
+			"--dump-po-strings": true, "--pretty-print": true,
+		},
+	},
+	// POSIX sh is dash on this box, and it is NOT bash: it rejects --noprofile,
+	// -O and even `-o pipefail`, all measured. Applying bash's table to it was
+	// the third gap in round-14 F1.
+	"sh": {
+		shortFlags:       "abCefhilmuvx",
+		suppressingFlags: "n",
+		longSuppressing:  map[string]bool{"--help": true, "--version": true},
+	},
+	// zsh IS NOT INSTALLED ON THIS BOX, so I could not measure it. Rather than
+	// copy bash's table and hope, only the two universals are declared - `-c`
+	// introduces a command string in every Bourne-family shell, and `--` ends
+	// options - and every other option refuses. An unmeasured grammar is not a
+	// grammar; this is the honest floor until someone can run zsh.
+	"zsh": {},
+}
 
 // interpreterOptionOutcome is what scanning an interpreter's options decided.
 type interpreterOptionOutcome int
 
 const (
-	// interpreterRunsScript: the operand is a script FILE, so the shell runs
-	// but the Go toolchain does not.
-	interpreterRunsScript interpreterOptionOutcome = iota
-	// interpreterRunsCommandString: a -c belonging to THIS interpreter, so the
-	// following tokens are a command string to re-parse.
+	// interpreterRunsNoCommandString: the shell runs, but no command string
+	// does - either the operand is a script FILE, or an option suppressed
+	// execution (-n, -D, --help, --version). Either way no Go test ran.
+	interpreterRunsNoCommandString interpreterOptionOutcome = iota
+	// interpreterRunsCommandString: a -c belonging to THIS interpreter.
 	interpreterRunsCommandString
 	// interpreterUndeclared: an option outside the declared grammar. The shell
 	// aborts on these, and we refuse rather than guess.
@@ -176,30 +212,42 @@ const (
 )
 
 // scanInterpreterOptions walks a shell interpreter's own options and reports
-// what the interpreter will do, plus the index at which its command string
-// begins. It NEVER treats an option as a command string on shape alone: `--`
-// terminates option parsing, value-taking options consume their argument, and
-// an undeclared letter refuses.
-func scanInterpreterOptions(tokens []shellToken) (interpreterOptionOutcome, int) {
+// what it will do, plus the index of its command string. It NEVER decides on
+// token shape alone: `--` terminates options, value-taking options consume
+// their argument, suppressing options cancel execution, and an option outside
+// THIS interpreter's declared grammar refuses.
+func scanInterpreterOptions(interpreter string, tokens []shellToken) (interpreterOptionOutcome, int) {
+	grammar, declared := interpreterGrammars[interpreter]
+	if !declared {
+		return interpreterUndeclared, 0
+	}
+	suppressed := false
 	for index := 0; index < len(tokens); index++ {
 		text := tokens[index].text()
 		switch {
 		case text == "--":
-			// OPTION TERMINATION. Everything after this is a filename, so a
-			// following `-c` is a script named "-c" (measured: exit 127).
-			return interpreterRunsScript, 0
+			// OPTION TERMINATION: a following -c is a script named "-c".
+			return interpreterRunsNoCommandString, 0
 		case strings.HasPrefix(text, "--"):
-			name := text
-			inlineValue := false
+			name, inlineValue := text, false
 			if equals := strings.Index(text, "="); equals > 0 {
 				name, inlineValue = text[:equals], true
 			}
 			switch {
-			case interpreterLongValueFlags[name]:
+			case grammar.longValueFlags[name]:
 				if !inlineValue {
 					index++
 				}
-			case interpreterLongFlags[name]:
+			case grammar.longSuppressing[name]:
+				if inlineValue {
+					// A BOOLEAN FLAG TAKES NO VALUE: `--version=x` aborts.
+					return interpreterUndeclared, 0
+				}
+				suppressed = true
+			case grammar.longFlags[name]:
+				if inlineValue {
+					return interpreterUndeclared, 0
+				}
 			default:
 				return interpreterUndeclared, 0
 			}
@@ -210,14 +258,16 @@ func scanInterpreterOptions(tokens []shellToken) (interpreterOptionOutcome, int)
 				switch {
 				case letter == 'c':
 					commandString = true
-				case strings.ContainsRune(interpreterValueFlags, letter):
+				case strings.ContainsRune(grammar.suppressingFlags, letter):
+					suppressed = true
+				case strings.ContainsRune(grammar.valueFlags, letter):
 					if position != len(letters)-1 {
-						// A value-taking letter mid-cluster owns the rest of
-						// the cluster as its value, which is not declared here.
+						// A value letter mid-cluster owns the rest of the
+						// cluster in some shells and not others; undeclared.
 						return interpreterUndeclared, 0
 					}
 					needsValue = true
-				case strings.ContainsRune(interpreterShortFlags, letter):
+				case strings.ContainsRune(grammar.shortFlags, letter):
 				default:
 					return interpreterUndeclared, 0
 				}
@@ -226,6 +276,9 @@ func scanInterpreterOptions(tokens []shellToken) (interpreterOptionOutcome, int)
 				return interpreterUndeclared, 0
 			}
 			if commandString {
+				if suppressed {
+					return interpreterRunsNoCommandString, 0
+				}
 				return interpreterRunsCommandString, index + 1
 			}
 			if needsValue {
@@ -233,11 +286,11 @@ func scanInterpreterOptions(tokens []shellToken) (interpreterOptionOutcome, int)
 			}
 		default:
 			// A non-option token: the script file.
-			return interpreterRunsScript, 0
+			return interpreterRunsNoCommandString, 0
 		}
 	}
 	// No operand at all - an interactive shell, which runs no Go test.
-	return interpreterRunsScript, 0
+	return interpreterRunsNoCommandString, 0
 }
 
 func classifyPhaseCommandDepth(command string, depth int) string {
@@ -565,13 +618,13 @@ func classifyCommandSegment(segment string, depth int) string {
 			// `test ./...`). Option STATE decides which case this is, rather
 			// than the shape of any single token (#1930 round-12 F1,
 			// round-13 F1).
-			outcome, commandStringAt := scanInterpreterOptions(tokens[1:])
+			outcome, commandStringAt := scanInterpreterOptions(head, tokens[1:])
 			switch outcome {
 			case interpreterUndeclared:
 				// The shell exits without running anything, and this lexer does
 				// not implement the option. Refuse rather than bucket.
 				return phaseBucketUnknown
-			case interpreterRunsScript:
+			case interpreterRunsNoCommandString:
 				// Every token is understood and what runs is not a Go test.
 				return phaseBucketOther
 			}
@@ -579,11 +632,19 @@ func classifyCommandSegment(segment string, depth int) string {
 			if len(rest) == 0 || depth >= maxWrapperRecursion {
 				return phaseBucketUnknown
 			}
-			words := make([]string, 0, len(rest))
-			for _, token := range rest {
-				words = append(words, token.text())
-			}
-			return classifyPhaseCommandDepth(strings.Join(words, " "), depth+1)
+			// ONLY THE FIRST TOKEN IS THE COMMAND STRING. Everything after it
+			// is $0 and the positional parameters, so joining them invented a
+			// command nobody ran: `bash -c "go version" test ./...` runs Go
+			// WITHOUT the test subcommand (measured), and joining turned that
+			// into a test bucket (#1930 round-14 F1).
+			// NO EXPLICIT EMPTY-STRING GUARD. `bash -c "" go test` runs nothing
+			// (measured: exit 0, no Go) and must not be a test - but recursing
+			// on "" already yields `other`, so a guard here would be code no
+			// mutant can kill. Removing it was checked, not assumed: with the
+			// guard present the mutant that disables it SURVIVED the suite.
+			// The behaviour is pinned by TestPhaseInstrumentHonoursCommandStringArity
+			// instead, which fails if that recursion ever stops returning other.
+			return classifyPhaseCommandDepth(rest[0].text(), depth+1)
 		case "nohup":
 			// nohup EXECS ITS OPERAND, so it really is an exec wrapper:
 			// `nohup go version` invokes Go (measured). It owns no assignments
