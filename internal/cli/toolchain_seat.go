@@ -126,35 +126,25 @@ func stageSeatRuntimes(paths config.Paths) ([]string, []string, error) {
 	var diagnostics []string
 	for _, name := range seatRuntimeNames {
 		if resolved, lookupErr := exec.LookPath(name); lookupErr == nil {
-			copied, stageErr := toolchain.StageRuntime(paths.Home, name, resolved)
+			// STAGING NOW OWNS THE WHOLE ARTIFACT, INTERPRETER INCLUDED. The
+			// engine reads the entrypoint's shebang from the descriptor it will
+			// copy from, stages the interpreter it names, and writes a launcher
+			// that execs the STAGED interpreter with the STAGED entrypoint - so
+			// the kernel never resolves the original absolute shebang, which
+			// may not exist under the seat's grants and, where it does, is the
+			// operator's copy (#1921 panel, directive 122816).
+			//
+			// ANY failure here - an unresolvable interpreter, an ambiguous
+			// package member, openat2 unavailable - publishes the runtime NAME
+			// as the exit-126 command below rather than leaving it
+			// host-resolvable. That is the whole point: an explicit
+			// unavailability instead of a silent fallback.
+			launcher, stageErr := toolchain.StageRuntime(paths.Home, name, resolved)
 			if stageErr == nil {
-				// A SCRIPT ENTRYPOINT IS NOT RUNNABLE WITHOUT ITS INTERPRETER,
-				// and the interpreter is the one thing a copy of the script does
-				// not bring. codex is "#!/usr/bin/env node" whose node lives in
-				// the operator's HOME, so without this the seat either reads an
-				// ungranted operator path or cannot exec at all.
-				//
-				// A MISSING REQUIRED INTERPRETER MAKES THE RUNTIME UNAVAILABLE
-				// (bridge F4). Leaving the script's own shim in place after a
-				// failed interpreter stage is the worst of both worlds: the name
-				// resolves, so the seat either falls back to the operator's
-				// interpreter through the inherited PATH or dies with an opaque
-				// exec error. Republishing the NAME as the exit-126 command
-				// makes the outcome explicit and unambiguous.
-				interpreter, target, needs := toolchain.RuntimeInterpreter(resolved)
-				if !needs {
-					staged = append(staged, copied)
-					continue
-				}
-				interpreterShim, interpreterErr := toolchain.StageRuntime(paths.Home, interpreter, target)
-				if interpreterErr == nil {
-					staged = append(staged, copied, interpreterShim)
-					continue
-				}
-				diagnostics = append(diagnostics, fmt.Sprintf("runtime %s needs interpreter %s, which could not be staged, so %s is published unavailable rather than left host-resolvable: %v", name, interpreter, name, interpreterErr))
-			} else {
-				diagnostics = append(diagnostics, fmt.Sprintf("runtime %s could not be staged; installed copy is shadowed: %v", name, stageErr))
+				staged = append(staged, launcher)
+				continue
 			}
+			diagnostics = append(diagnostics, fmt.Sprintf("runtime %s could not be staged, so it is published unavailable rather than left host-resolvable: %v", name, stageErr))
 		}
 		unavailable, err := toolchain.StageUnavailableRuntime(paths.Home, name)
 		if err != nil {

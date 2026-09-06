@@ -9,8 +9,8 @@ import (
 	"testing"
 )
 
-// stagedPackageFixture builds a node-package boundary and returns its root and
-// entrypoint. Every boundary test below starts from the same shape, so a
+// stagedPackageFixture builds a clean node-package boundary and returns its root
+// and entrypoint. Every boundary test starts from the same shape, so a
 // difference in outcome is attributable to the member under test.
 func stagedPackageFixture(t *testing.T) (pkg string, entrypoint string) {
 	t.Helper()
@@ -29,37 +29,35 @@ func stagedPackageFixture(t *testing.T) (pkg string, entrypoint string) {
 	return pkg, entrypoint
 }
 
-func stagedMembers(t *testing.T, root string) map[string]bool {
+// stageCleanFixtureRuns is the PASSING CONTROL every refusal test below shares:
+// a clean tree must stage and run. Without it, "refused" could mean "refuses
+// everything", which is the failure mode a security guard slides into.
+func stageCleanFixtureRuns(t *testing.T) {
 	t.Helper()
-	members := map[string]bool{}
-	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		members[rel] = true
-		return nil
-	}); err != nil {
-		t.Fatal(err)
+	home := t.TempDir()
+	_, entrypoint := stagedPackageFixture(t)
+	launcher, err := StageRuntime(home, "tool", entrypoint)
+	if err != nil {
+		t.Fatalf("a clean package boundary was refused: %v", err)
 	}
-	return members
+	output, runErr := exec.Command(launcher).CombinedOutput()
+	if runErr != nil || strings.TrimSpace(string(output)) != "tool-ran" {
+		t.Fatalf("clean staged runtime did not run: err=%v output=%q", runErr, output)
+	}
 }
 
-// TestStageRuntimeSkipsAPrivateAncestorsReadableChild is bridge finding F1.
+// TestStageRefusesATreeWithAPrivateAncestor is bridge F1 under the accepted
+// boundary (plan 122812, directive 122816): an ambiguous tree is REFUSED WHOLE
+// rather than filtered.
 //
-// The filter I first shipped tested only a member's OWN permission bits, so a
-// 0700 credentials/ directory holding a mode-0644 token was copied: the leaf
-// looked public because its private DIRECTORY was never consulted. Privacy is a
-// property of the ancestor chain, not of the leaf.
-func TestStageRuntimeSkipsAPrivateAncestorsReadableChild(t *testing.T) {
+// The measured defect was a 0700 credentials/ directory holding a mode-0644
+// token being copied, because only the leaf's own bits were consulted. Filtering
+// the subtree was the first fix and the panel showed why it is not enough: mode
+// bits cannot classify secrets at all, so the safe answer is to refuse a runtime
+// whose package carries operator-private state and publish it unavailable.
+func TestStageRefusesATreeWithAPrivateAncestor(t *testing.T) {
 	home := t.TempDir()
 	pkg, entrypoint := stagedPackageFixture(t)
-
-	// The exact shape of the finding: a private directory whose child is
-	// world-readable, so the child alone cannot reveal that it is a secret.
 	private := filepath.Join(pkg, "credentials")
 	if err := os.MkdirAll(private, 0o700); err != nil {
 		t.Fatal(err)
@@ -67,204 +65,190 @@ func TestStageRuntimeSkipsAPrivateAncestorsReadableChild(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(private, "token.json"), []byte(`{"access_token":"seat-must-not-read-this"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// CONTROL, in the same fixture so the two cannot differ by accident: a
-	// PUBLIC directory with an identically-permissioned payload must be copied.
-	public := filepath.Join(pkg, "lib")
-	if err := os.MkdirAll(public, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(public, "payload.js"), []byte("module.exports=1\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
 
-	staged, err := StageRuntime(home, "tool", entrypoint)
-	if err != nil {
-		t.Fatalf("StageRuntime: %v", err)
+	launcher, err := StageRuntime(home, "tool", entrypoint)
+	if !errors.Is(err, ErrRuntimeNotStageable) {
+		t.Fatalf("a tree containing a 0700 directory staged anyway: launcher=%q err=%v", launcher, err)
 	}
-	root, err := StagedRuntimeRoot(home, staged)
-	if err != nil {
-		t.Fatal(err)
+	if !strings.Contains(err.Error(), "world-traversable") {
+		t.Errorf("refusal does not name the private ancestor: %v", err)
 	}
-	members := stagedMembers(t, root)
-	if members[filepath.Join("credentials", "token.json")] {
-		t.Error("a mode-0644 child of a 0700 directory was copied; privacy must be decided by the ancestor chain, not the leaf")
-	}
-	if members["credentials"] {
-		t.Error("the private directory itself was reproduced in the staged tree")
-	}
-	if !members[filepath.Join("lib", "payload.js")] {
-		t.Error("a mode-0644 child of a 0755 directory was NOT copied, so the rule is refusing everything rather than refusing privacy")
-	}
-	if output, runErr := exec.Command(staged).CombinedOutput(); runErr != nil || strings.TrimSpace(string(output)) != "tool-ran" {
-		t.Fatalf("staged runtime does not run: err=%v output=%q", runErr, output)
-	}
+	assertNoStagedBytes(t, home, "seat-must-not-read-this")
+	stageCleanFixtureRuns(t)
 }
 
-// TestStageRuntimeDoesNotFollowAnInRootSymlinkToAPrivateSibling is bridge
-// finding F2.
-//
-// os.Root refuses escapes OUT of the root; it does NOT refuse redirection
-// WITHIN it. The copier decided from readdir metadata and then opened by NAME,
-// so a link named like a payload delivered a private sibling's bytes into the
-// staged tree. The fix decides from the open descriptor, with O_NOFOLLOW as the
-// authoritative check.
-//
-// THE FIXTURE IS A COMPOSITE ON PURPOSE, and my first version was not. It
-// pointed the link at a mode-0600 file, so the LEAF-PRIVACY rule skipped it and
-// the test passed with the symlink rule deleted - measured by mutation. The
-// target is now a mode-0644 file under a 0700 directory: leaf privacy says
-// "public", the ancestor rule never sees it because the walked name's own parent
-// is public, and only refusing to FOLLOW the link keeps those bytes out.
-func TestStageRuntimeDoesNotFollowAnInRootSymlinkToAPrivateSibling(t *testing.T) {
+// TestStageRefusesANonWorldReadableMember is the same rule at the leaf.
+func TestStageRefusesANonWorldReadableMember(t *testing.T) {
 	home := t.TempDir()
 	pkg, entrypoint := stagedPackageFixture(t)
-
-	secretBytes := []byte("api_key = \"seat-must-not-read-this\"\n")
-	private := filepath.Join(pkg, "credentials")
-	if err := os.MkdirAll(private, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(private, "token.json"), secretBytes, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// A link that LOOKS like ordinary package payload and points, inside the
-	// same root, at a readable file whose PRIVACY comes only from its directory.
-	if err := os.Symlink(filepath.Join("credentials", "token.json"), filepath.Join(pkg, "payload.json")); err != nil {
+	if err := os.WriteFile(filepath.Join(pkg, "config.toml"), []byte("api_key = \"seat-must-not-read-this\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	staged, err := StageRuntime(home, "tool", entrypoint)
-	if err != nil {
-		t.Fatalf("StageRuntime: %v", err)
+	if _, err := StageRuntime(home, "tool", entrypoint); !errors.Is(err, ErrRuntimeNotStageable) {
+		t.Fatalf("a tree containing a mode-0600 member staged anyway: %v", err)
 	}
-	root, err := StagedRuntimeRoot(home, staged)
-	if err != nil {
+	assertNoStagedBytes(t, home, "seat-must-not-read-this")
+	stageCleanFixtureRuns(t)
+}
+
+// TestStageRefusesASymlinkedMember covers the static half of class 1.
+func TestStageRefusesASymlinkedMember(t *testing.T) {
+	home := t.TempDir()
+	pkg, entrypoint := stagedPackageFixture(t)
+	if err := os.WriteFile(filepath.Join(pkg, "secret.toml"), []byte("api_key = \"seat-must-not-read-this\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if members := stagedMembers(t, root); members["payload.json"] {
-		t.Error("an in-root symlink was reproduced or followed into the staged tree")
-	}
-	// The bytes are what matter, not the name: assert no staged file carries the
-	// secret, whatever it is called.
-	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil || !entry.Type().IsRegular() {
-			return walkErr
-		}
-		content, readErr := os.ReadFile(path)
-		if readErr != nil {
-			return readErr
-		}
-		if strings.Contains(string(content), "seat-must-not-read-this") {
-			t.Errorf("staged file %q carries the private sibling's bytes", path)
-		}
-		return nil
-	}); err != nil {
+	if err := os.Symlink("secret.toml", filepath.Join(pkg, "payload.json")); err != nil {
 		t.Fatal(err)
 	}
-	// CONTROL: a REAL regular member of the same name is copied, so the rule
-	// refuses links rather than refusing that filename.
+
+	if _, err := StageRuntime(home, "tool", entrypoint); !errors.Is(err, ErrRuntimeNotStageable) {
+		t.Fatalf("a tree containing an in-root symlink staged anyway: %v", err)
+	}
+	assertNoStagedBytes(t, home, "seat-must-not-read-this")
+	stageCleanFixtureRuns(t)
+}
+
+// TestStageRefusesASymlinkSwappedBetweenEnumerationAndOpen is class 1's RACE,
+// made DETERMINISTIC as directive 122816 requires.
+//
+// A high-iteration race loop was refused as proof, and rightly: it passes on a
+// slow machine for the wrong reason and proves only the author's patience. The
+// swapBarrier seam fires in exactly the window the attack needs - after the name
+// is enumerated, before it is opened - so the substitution happens every time.
+//
+// THE ASSERTION IS ON BYTES, NOT NAMES: the private content must not appear
+// anywhere under the engine root, whatever a staged file is called. os.Root with
+// O_NOFOLLOW followed such a link (measured), and a panel lens landed exactly
+// this race against the previous implementation at attempt 54; openat2 with
+// RESOLVE_NO_SYMLINKS refuses it in the kernel, in the same syscall as the open.
+func TestStageRefusesASymlinkSwappedBetweenEnumerationAndOpen(t *testing.T) {
+	home := t.TempDir()
+	pkg, entrypoint := stagedPackageFixture(t)
+	const secret = "seat-must-not-read-this"
+	if err := os.WriteFile(filepath.Join(pkg, "secret.toml"), []byte("api_key = \""+secret+"\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	payload := filepath.Join(pkg, "payload.json")
+	if err := os.WriteFile(payload, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	swapped := false
+	swapBarrier = func(relative string) {
+		if relative != "payload.json" || swapped {
+			return
+		}
+		swapped = true
+		if err := os.Remove(payload); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("secret.toml", payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { swapBarrier = nil })
+
+	_, err := StageRuntime(home, "tool", entrypoint)
+	if !swapped {
+		t.Fatal("the barrier never fired, so this test did not exercise the substitution window")
+	}
+	if !errors.Is(err, ErrRuntimeNotStageable) {
+		t.Fatalf("staging accepted a member replaced by a symlink mid-walk: %v", err)
+	}
+	assertNoStagedBytes(t, home, secret)
+
+	// CONTROL: the same barrier replacing the member with a REGULAR file of
+	// different content is accepted, so the refusal is about symlinks and not
+	// about "anything changed".
 	controlHome := t.TempDir()
 	controlPkg, controlEntry := stagedPackageFixture(t)
-	if err := os.WriteFile(filepath.Join(controlPkg, "payload.json"), []byte("{}\n"), 0o644); err != nil {
+	controlPayload := filepath.Join(controlPkg, "payload.json")
+	if err := os.WriteFile(controlPayload, []byte("{}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	controlStaged, err := StageRuntime(controlHome, "tool", controlEntry)
-	if err != nil {
-		t.Fatal(err)
+	replaced := false
+	swapBarrier = func(relative string) {
+		if relative != "payload.json" || replaced {
+			return
+		}
+		replaced = true
+		if err := os.WriteFile(controlPayload, []byte("{\"replaced\":true}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	controlRoot, err := StagedRuntimeRoot(controlHome, controlStaged)
-	if err != nil {
-		t.Fatal(err)
+	launcher, controlErr := StageRuntime(controlHome, "tool", controlEntry)
+	if !replaced {
+		t.Fatal("the control barrier never fired")
 	}
-	if !stagedMembers(t, controlRoot)["payload.json"] {
-		t.Error("a regular payload.json was not copied, so the F2 assertion above passes for the wrong reason")
+	if controlErr != nil {
+		t.Fatalf("a regular-file replacement was refused, so the symlink assertion above proves nothing: %v", controlErr)
+	}
+	if output, runErr := exec.Command(launcher).CombinedOutput(); runErr != nil {
+		t.Fatalf("control staged runtime did not run: %v: %s", runErr, output)
 	}
 }
 
-// TestStageRuntimeRefusesReuseWhenPublishedContentChanged is bridge finding F3.
-//
-// The name is content-addressed from a FIRST read while the copy comes from a
-// SECOND, so the published name could describe a tree that was never published,
-// and reuse only checked that a file and a shim existed. Reuse now re-proves the
-// entrypoint's CONTENT.
-func TestStageRuntimeRefusesReuseWhenPublishedContentChanged(t *testing.T) {
+// TestStageRefusesReuseWhenPublishedContentChanged is class 3 plus bridge F3.
+func TestStageRefusesReuseWhenPublishedContentChanged(t *testing.T) {
 	home := t.TempDir()
 	source := filepath.Join(t.TempDir(), "tool")
 	if err := os.WriteFile(source, []byte("#!/bin/sh\nprintf 'v1\\n'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	staged, err := StageRuntime(home, "tool", source)
+	launcher, err := StageRuntime(home, "tool", source)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// CONTROL FIRST: an untouched published tree is reused, returning the same
-	// path. Without this, the refusal below could mean "never reuses anything".
+	// CONTROL FIRST: an untouched published tree is reused and returns the same
+	// launcher, so the refusal below cannot mean "never reuses anything".
 	reused, err := StageRuntime(home, "tool", source)
 	if err != nil {
 		t.Fatalf("an untouched published tree was not reused: %v", err)
 	}
-	if reused != staged {
-		t.Fatalf("reuse returned %q, want %q", reused, staged)
+	if reused != launcher {
+		t.Fatalf("reuse returned %q, want %q", reused, launcher)
 	}
 
-	root, err := StagedRuntimeRoot(home, staged)
+	published, err := StagedRuntimeRoot(home, launcher)
 	if err != nil {
 		t.Fatal(err)
 	}
-	entrypoint := filepath.Join(root, "tool")
+	entrypoint := filepath.Join(published, "tool")
 	if err := os.Chmod(entrypoint, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(entrypoint, []byte("#!/bin/sh\nprintf 'substituted\\n'\n"), 0o600); err != nil {
+	if err := os.WriteFile(entrypoint, []byte("#!/bin/sh\nprintf 'substituted\\n'\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := StageRuntime(home, "tool", source); !errors.Is(err, ErrRuntimeNotStageable) {
-		t.Fatalf("reuse of a published tree whose entrypoint bytes changed returned %v, want ErrRuntimeNotStageable", err)
+		t.Fatalf("reuse of a published tree whose bytes changed returned %v, want ErrRuntimeNotStageable", err)
 	}
 }
 
-// TestRuntimeInterpreterReportsAnUnresolvableInterpreterAsRequired is bridge
-// finding F4 at the unit boundary.
-//
-// A shebang naming an interpreter that cannot be resolved must be reported as
-// REQUIRED-but-unstageable, not as "no interpreter needed". The latter leaves a
-// runnable shim whose script can only fall back to the host or fail opaquely.
-func TestRuntimeInterpreterReportsAnUnresolvableInterpreterAsRequired(t *testing.T) {
-	dir := t.TempDir()
-	script := filepath.Join(dir, "tool")
-	if err := os.WriteFile(script, []byte("#!/usr/bin/env definitely-not-installed-anywhere\n"), 0o755); err != nil {
+// assertNoStagedBytes fails if any file under the engine root contains needle.
+// It asserts on CONTENT because a refusal that merely renames the leak is not a
+// refusal.
+func assertNoStagedBytes(t *testing.T, home string, needle string) {
+	t.Helper()
+	root := RuntimeRoot(home)
+	if _, err := os.Stat(root); err != nil {
+		return
+	}
+	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil || !entry.Type().IsRegular() {
+			return nil
+		}
+		content, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return nil
+		}
+		if strings.Contains(string(content), needle) {
+			t.Errorf("staged file %q carries private bytes %q", path, needle)
+		}
+		return nil
+	}); err != nil {
 		t.Fatal(err)
-	}
-	t.Setenv("PATH", dir)
-
-	name, target, required := RuntimeInterpreter(script)
-	if !required {
-		t.Fatal("an unresolvable interpreter was reported as not required; the runtime would stage as a script that cannot run")
-	}
-	if target != "" {
-		t.Errorf("target = %q, want empty so StageRuntime refuses", target)
-	}
-	if name != "definitely-not-installed-anywhere" {
-		t.Errorf("name = %q, want the declared interpreter so the diagnostic can name it", name)
-	}
-	// Staging that empty target must refuse rather than succeed quietly.
-	if _, err := StageRuntime(t.TempDir(), name, target); !errors.Is(err, ErrRuntimeNotStageable) {
-		t.Fatalf("StageRuntime with an empty interpreter path returned %v, want ErrRuntimeNotStageable", err)
-	}
-
-	// CONTROL: a resolvable non-system interpreter is still reported required
-	// WITH a path, so this test cannot pass by calling everything unresolvable.
-	interpreterDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(interpreterDir, "probenode"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	resolvableScript := filepath.Join(dir, "tool2")
-	if err := os.WriteFile(resolvableScript, []byte("#!/usr/bin/env probenode\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", strings.Join([]string{dir, interpreterDir}, string(os.PathListSeparator)))
-	name, target, required = RuntimeInterpreter(resolvableScript)
-	if !required || target == "" || name != "probenode" {
-		t.Fatalf("resolvable interpreter reported name=%q target=%q required=%v", name, target, required)
 	}
 }

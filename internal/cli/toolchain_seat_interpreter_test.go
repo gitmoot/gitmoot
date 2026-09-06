@@ -65,35 +65,37 @@ func TestStageSeatRuntimesStagesAScriptRuntimesInterpreter(t *testing.T) {
 		t.Fatalf("diagnostics = %v", diagnostics)
 	}
 
-	var stagedCodex, stagedInterpreter string
+	var stagedCodex string
 	for _, command := range commands {
-		switch filepath.Base(command) {
-		case "codex":
+		if filepath.Base(command) == "codex" {
 			stagedCodex = command
-		case "probenode":
-			stagedInterpreter = command
 		}
 	}
-	if stagedInterpreter == "" {
-		t.Fatalf("the script runtime's interpreter was not staged; commands = %v.\nA staged script whose interpreter lives in the operator's home can only run by reaching an ungranted root, which is #1921's exposure and #1918's failure at once", commands)
-	}
-	if !pathWithin(stagedInterpreter, toolchain.RuntimeRoot(paths.Home)) {
-		t.Errorf("staged interpreter %q is outside the engine runtime root", stagedInterpreter)
-	}
 	if stagedCodex == "" {
-		t.Fatalf("the script runtime itself was not staged; commands = %v", commands)
+		t.Fatalf("the script runtime was not staged; commands = %v", commands)
+	}
+	if !pathWithin(stagedCodex, toolchain.RuntimeRoot(paths.Home)) {
+		t.Errorf("staged runtime %q is outside the engine runtime root", stagedCodex)
 	}
 
-	// LAUNCH THROUGH THE SEAT'S PATH ONLY: the host interpreter directory is
-	// deliberately absent, so the staged script can only run if the staged
-	// interpreter is what /usr/bin/env finds.
-	seatPath := strings.Join([]string{filepath.Dir(stagedCodex), filepath.Dir(stagedInterpreter), "/usr/bin", "/bin"}, string(os.PathListSeparator))
+	// THE INTERPRETER IS NO LONGER A SEPARATE SEAT COMMAND, and that is the
+	// point of directive 122816: the launcher EXECS the staged interpreter by
+	// its staged absolute path, so nothing has to be resolvable on the seat's
+	// PATH and the kernel never resolves the entrypoint's original shebang.
+	//
+	// So the assertion is the strongest available: launch with the host
+	// interpreter directory ABSENT from PATH entirely. Under the old shape this
+	// could only work if something resolved "probenode" for /usr/bin/env; now it
+	// works because the launcher names the staged copy outright.
+	seatPath := strings.Join([]string{filepath.Dir(stagedCodex), "/usr/bin", "/bin"}, string(os.PathListSeparator))
 	command := exec.Command(stagedCodex)
 	command.Env = append(os.Environ(), "PATH="+seatPath)
 	output, runErr := command.CombinedOutput()
 	if runErr != nil {
-		t.Fatalf("the staged script did not launch with only staged commands on PATH: %v\noutput=%s", runErr, output)
+		t.Fatalf("the staged script did not launch with its host interpreter directory absent from PATH: %v\noutput=%s", runErr, output)
 	}
+	// The probe interpreter prints the script path it was handed, so this proves
+	// the STAGED interpreter ran the STAGED entrypoint.
 	if !strings.Contains(string(output), toolchain.RuntimeRoot(paths.Home)) {
 		t.Errorf("staged script ran but not from the engine root: output=%q", output)
 	}

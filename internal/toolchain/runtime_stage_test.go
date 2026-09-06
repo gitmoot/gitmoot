@@ -77,7 +77,12 @@ func TestStageRuntimeStagesASelfContainedExecutableWithoutItsProfile(t *testing.
 		// The generated .bin shim and the recorded entrypoint digest are ENGINE
 		// metadata, not copied source, so they are excluded exactly as the shim
 		// already was. Anything else under here came from the operator's tree.
-		if entry.Type().IsRegular() && filepath.Base(path) != entrypointDigestName {
+		relative, relErr := filepath.Rel(published, path)
+		if relErr != nil {
+			return relErr
+		}
+		engineMetadata := relative == entrypointDigestName || strings.HasPrefix(relative, launcherDirName+string(filepath.Separator))
+		if entry.Type().IsRegular() && !engineMetadata {
 			copied = append(copied, filepath.Base(path))
 		}
 		return nil
@@ -100,7 +105,7 @@ func TestStageRuntimeStagesANodePackageBoundary(t *testing.T) {
 	base := t.TempDir()
 	pkg := filepath.Join(base, "lib", "node_modules", "@openai", "codex")
 	pkgBin := filepath.Join(pkg, "bin")
-	if err := os.MkdirAll(pkgBin, 0o700); err != nil {
+	if err := os.MkdirAll(pkgBin, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(pkg, "package.json"), []byte(`{"name":"@openai/codex"}`), 0o644); err != nil {
@@ -136,105 +141,6 @@ func TestStageRuntimeStagesANodePackageBoundary(t *testing.T) {
 	}
 	if strings.TrimSpace(string(output)) != "codex-ran" {
 		t.Fatalf("staged copy output = %q, want %q", strings.TrimSpace(string(output)), "codex-ran")
-	}
-}
-
-// TestStageRuntimeRefusesToCopyOwnerPrivatePackageMembers is round 3's escape
-// probe re-run against the COPY, which is contract item 6's first arm.
-//
-// The probe planted node_modules/operator-profile/{package.json,bin/kimi,
-// config.toml} and read the mode-0600 config through a recursive grant. Deleting
-// the grant is not sufficient on its own: if the copier still took the private
-// file, the seat would read the same bytes from the engine tree it IS granted.
-// The runnable payload must survive; the secret must not.
-func TestStageRuntimeRefusesToCopyOwnerPrivatePackageMembers(t *testing.T) {
-	home := t.TempDir()
-	pkg := filepath.Join(t.TempDir(), "node_modules", "operator-profile")
-	pkgBin := filepath.Join(pkg, "bin")
-	if err := os.MkdirAll(pkgBin, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(pkg, "package.json"), []byte(`{"name":"operator-profile"}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(pkg, "config.toml"), []byte("api_key = \"seat-must-not-read-this\"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(pkg, "credentials"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(pkg, "credentials", "kimi-code.json"), []byte(`{"access_token":"x"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	executable := filepath.Join(pkgBin, "kimi")
-	if err := os.WriteFile(executable, []byte("#!/bin/sh\nprintf 'kimi-ran\\n'\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	staged, err := StageRuntime(home, "kimi", executable)
-	if err != nil {
-		t.Fatalf("StageRuntime: %v", err)
-	}
-	root, err := StagedRuntimeRoot(home, staged)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, secret := range []string{"config.toml", filepath.Join("credentials", "kimi-code.json")} {
-		if _, err := os.Lstat(filepath.Join(root, secret)); err == nil {
-			t.Errorf("owner-private member %q was copied into the staged tree; a package marker laundered a secret", secret)
-		}
-	}
-	// CONTROL: the runnable payload still arrives, so the exclusion is not
-	// "copy nothing" passing for containment.
-	if _, err := os.Stat(filepath.Join(root, "package.json")); err != nil {
-		t.Errorf("group-readable package payload was excluded too: %v", err)
-	}
-	output, runErr := exec.Command(staged).CombinedOutput()
-	if runErr != nil || strings.TrimSpace(string(output)) != "kimi-ran" {
-		t.Fatalf("staged copy did not run: err=%v output=%q", runErr, output)
-	}
-}
-
-// TestStageRuntimeSkipsSymlinksInsideAPackage covers contract item 4: the copier
-// must reject path escapes rather than follow them.
-//
-// A symlink inside an operator-owned tree is the escape the whole change removes,
-// so it is SKIPPED. The consequence is a runtime that needs one fails to launch
-// and says so, which is the safe direction; following it would re-import the
-// exposure.
-func TestStageRuntimeSkipsSymlinksInsideAPackage(t *testing.T) {
-	home := t.TempDir()
-	base := t.TempDir()
-	outside := filepath.Join(base, "outside-secret.json")
-	if err := os.WriteFile(outside, []byte(`{"token":"must-not-be-copied"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	pkg := filepath.Join(base, "node_modules", "pkg")
-	pkgBin := filepath.Join(pkg, "bin")
-	if err := os.MkdirAll(pkgBin, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(pkg, "package.json"), []byte("{}"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(outside, filepath.Join(pkg, "escape.json")); err != nil {
-		t.Fatal(err)
-	}
-	executable := filepath.Join(pkgBin, "tool")
-	if err := os.WriteFile(executable, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	staged, err := StageRuntime(home, "tool", executable)
-	if err != nil {
-		t.Fatalf("StageRuntime: %v", err)
-	}
-	packageRoot, err := StagedRuntimeRoot(home, staged)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Lstat(filepath.Join(packageRoot, "escape.json")); err == nil {
-		t.Fatal("a symlink inside the package was reproduced in the staged tree; it must be skipped so the copy cannot address anything outside the boundary")
 	}
 }
 

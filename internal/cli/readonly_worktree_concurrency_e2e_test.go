@@ -241,9 +241,13 @@ func drivePoolConcurrently(t *testing.T, ctx context.Context, worker jobWorker, 
 // (proven by the 2-of-2 rendezvous + a live state sampler), each carry a
 // readonly_worktree_allocated event, and each worktree is DISPOSED on terminal.
 //
-// MUTATION PROOF: revert the dispatch-time allocation (so both asks key
-// repo:owner/repo) and the first seat serializes behind the second — it waits out
-// the rendezvous, emits `failed`, and the both-succeeded assertion flips RED.
+// MUTATION PROOF, restated for the barrier this test now uses: the seats no
+// longer carry a private receive deadline, so a serialized seat does not "wait
+// out the rendezvous" - it waits until the barrier is abandoned. Driving the
+// pool with ONE worker (genuine serialization) therefore fails at the outer
+// 60-second pool-tick bound with "seats likely serialized", which is measured
+// rather than asserted. Reverting the dispatch-time allocation, so both asks
+// key repo:owner/repo, produces the same failure by the same route.
 func TestReadOnlyWorktreeConcurrentAsksE2E(t *testing.T) {
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)

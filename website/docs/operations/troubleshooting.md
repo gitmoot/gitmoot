@@ -726,19 +726,46 @@ build error, not a silently wrong compiler.
 ### Read-only seat runtime executable is unavailable
 
 Claude, Kimi, and Codex read-only seats run a copied runtime artifact from
-`<gitmoot-home>/toolchains/runtimes`, never a recursive read grant over the
-operator's profile or package root. Self-contained executables are copied alone;
-a detected Node package copies its package tree while skipping symlinks.
-Credential files beside a profile executable are therefore neither copied nor
-granted, including files created after seat setup.
+`<gitmoot-home>/runtimes`, never a recursive read grant over the operator's
+profile or package root. That directory is a SIBLING of `toolchains/`, not a
+child: the toolchain collector removes anything under `toolchains/` that is not
+a pinned toolchain, which would delete staged runtimes mid-launch.
 
-Only the selected seat runtime is staged. The other runtime names, an absent
-runtime, and a runtime whose artifact cannot be copied resolve to engine-owned
-commands that print `gitmoot: runtime unavailable: no daemon-staged artifact
-exists` and exit 126. This preserves ordinary system commands through the
-inherited `PATH` without permitting a runtime name to fall through to its host
-copy. Copy failures also appear as `gitmoot: read-only seat runtime:` on daemon
-stderr.
+Every source read uses `openat2` with `RESOLVE_NO_SYMLINKS` and
+`RESOLVE_BENEATH`, so no component of a source path may be a symlink and nothing
+resolves outside the boundary. `os.Root` is not sufficient here: it refuses
+escapes out of a root but follows symlinks that stay inside one, so a member
+replaced by a link to a sibling credential was previously copied.
+
+An AMBIGUOUS SOURCE TREE IS REFUSED WHOLE rather than filtered, because file
+mode bits cannot distinguish a secret from a payload - a 0640 file under a 0750
+or setgid directory reads as group-readable, and a POSIX ACL shows up in the
+group bits. Staging therefore refuses, and publishes the runtime unavailable, if
+the boundary contains a symlink, a non-regular member, a setuid or setgid
+member, any POSIX ACL, a directory the world cannot traverse, or a member that
+is not world-readable. The resolved entrypoint itself is exempt from the
+world-readable rule only, so a runtime installed mode 0700 still runs.
+
+A SCRIPT RUNTIME GETS AN EXPLICIT LAUNCHER. Codex resolves to `codex.js` with
+`#!/usr/bin/env node`, so the engine stages that interpreter too and writes a
+launcher that execs the STAGED interpreter with the STAGED entrypoint. The
+kernel never resolves the entrypoint's original shebang, which would reach the
+operator's copy. A binary runtime gets a relative symlink instead, needing no
+shell.
+
+Every runtime class the engine can dispatch is staged, not only the seat's own.
+An absent runtime, an unresolvable interpreter, an ambiguous tree, or a kernel
+without `openat2` all resolve to engine-owned commands that print
+`gitmoot: runtime unavailable: no daemon-staged artifact exists` and exit 126.
+This preserves ordinary system commands through the inherited `PATH` without
+permitting a runtime name to fall through to its host copy. Failures also appear
+as `gitmoot: read-only seat runtime:` on daemon stderr.
+
+**One limit, stated rather than implied:** published runtime copies are not
+reclaimed. Each distinct content fingerprint publishes a new directory and
+nothing removes it, because safe reclamation needs to know which trees live
+seats are executing. `toolchain.Collect` has no production caller either, so the
+same is true of staged Go toolchains.
 
 ### Codex reviews report zero executed checks (`bwrap: setting up uid map`)
 

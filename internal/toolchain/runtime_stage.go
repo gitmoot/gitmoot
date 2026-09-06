@@ -1,18 +1,14 @@
 package toolchain
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 )
 
 // RuntimeDirName holds staged runtime copies beside the staged Go toolchains.
@@ -67,9 +63,10 @@ func RuntimeRoot(gitmootHome string) string {
 // <node>/lib/node_modules/@openai/codex/bin/codex.js and cannot run without the
 // files beside its bin dir.
 //
-// EVERY read and write goes through an os.Root, so a symlink or ".." inside the
-// source cannot address anything outside the boundary, and no name derived from
-// the source can address anything outside the daemon's own directory.
+// EVERY read goes through openat2 with RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH, so
+// no component of any source path can be a symlink and nothing resolves outside
+// the boundary. The digest and the copy read the SAME descriptors, so the
+// published name describes the published bytes by construction.
 func StageRuntime(gitmootHome string, name string, executable string) (string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" || strings.ContainsAny(name, `/\`) || name == "." || name == ".." {
@@ -87,31 +84,49 @@ func StageRuntime(gitmootHome string, name string, executable string) (string, e
 	if err != nil {
 		return "", fmt.Errorf("%w: resolve %q: %v", ErrRuntimeNotStageable, executable, err)
 	}
-	info, err := os.Lstat(resolved)
-	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrRuntimeNotStageable, err)
-	}
-	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("%w: %q is not a regular file", ErrRuntimeNotStageable, resolved)
-	}
-
 	boundary, relative, packaged := runtimeBoundary(resolved)
-	fingerprint, err := fingerprintRuntime(boundary, relative, packaged)
+	source, err := openStageSource(boundary, relative, packaged)
+	if err != nil {
+		return "", err
+	}
+	defer source.close()
+
+	fingerprint, err := source.digest()
 	if err != nil {
 		return "", err
 	}
 
+	// THE INTERPRETER IS PART OF THE IDENTITY. A script runtime that cannot run
+	// without node is a different artifact when node changes, so the staged
+	// interpreter's own published directory folds into this fingerprint - a
+	// stale launcher can never point at a retired interpreter tree.
+	interpreter, err := source.stageInterpreter(gitmootHome)
+	if err != nil {
+		return "", err
+	}
+	if interpreter != "" {
+		fingerprint = shortDigest(fingerprint + "\x00" + interpreter)
+	}
+
 	root := RuntimeRoot(gitmootHome)
-	published := filepath.Join(root, name+"-"+fingerprint)
+	publishedName := name + "-" + fingerprint
+	published := filepath.Join(root, publishedName)
+	launcher := filepath.Join(published, launcherDirName, name)
 	entry, _ := runtimeStagers.LoadOrStore(published, &sync.Mutex{})
 	lock := entry.(*sync.Mutex)
 	lock.Lock()
 	defer lock.Unlock()
 
-	if err := publishRuntime(root, name+"-"+fingerprint, name, boundary, relative, packaged, fingerprint); err != nil {
+	if _, err := os.Lstat(published); err == nil {
+		if err := validatePublished(published, name, relative, fingerprint); err != nil {
+			return "", err
+		}
+		return launcher, nil
+	}
+	if err := source.publish(root, publishedName, name, relative, interpreter, fingerprint); err != nil {
 		return "", err
 	}
-	return filepath.Join(published, ".bin", name), nil
+	return launcher, nil
 }
 
 // RuntimeInterpreter reports the interpreter a staged entrypoint needs, and the
@@ -345,446 +360,4 @@ func hasPathElement(path string, name string) bool {
 		}
 	}
 	return false
-}
-
-// stagedTreeMember decides whether a package-tree member is part of the runtime
-// or part of the operator's private state.
-//
-// A PACKAGE MARKER MUST NOT LAUNDER A SECRET (#1921 contract item 4). Round 3's
-// probe planted node_modules/operator-profile/{package.json,bin/kimi,config.toml}
-// and read the mode-0600 config. Deleting the recursive GRANT does not close that
-// by itself: copying the same file into an engine tree the seat may read exposes
-// exactly the same bytes, one indirection later.
-//
-// So a member that denies group AND other read - the shape of every credential
-// and private config measured here, against 0644 package payloads - is neither
-// hashed nor copied. The resolved ENTRYPOINT is always included, because a
-// runtime installed mode 0700 must still run. Excluding too much costs a visible
-// launch failure, never a silent exposure, which is the direction to fail in.
-func stagedTreeMember(name string, relative string, perm fs.FileMode) bool {
-	if name == relative {
-		return true
-	}
-	return perm&0o044 != 0
-}
-
-// fingerprintRuntime identifies the boundary by CONTENT so a runtime upgrade
-// publishes a new tree instead of silently reusing the previous one.
-//
-// A single file hashes its own bytes. A package tree hashes every INCLUDED
-// regular file's path and contents: package trees here are small (codex ships
-// under 40 MiB), unlike the 269 MiB Go toolchain whose full hash the Go path
-// deliberately avoids.
-func fingerprintRuntime(boundary string, relative string, packaged bool) (string, error) {
-	root, err := os.OpenRoot(boundary)
-	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrRuntimeNotStageable, err)
-	}
-	defer root.Close()
-
-	digest := sha256.New()
-	if !packaged {
-		if err := hashRuntimeFile(root, relative, digest); err != nil {
-			return "", err
-		}
-		return hex.EncodeToString(digest.Sum(nil))[:16], nil
-	}
-	// ONE PRIVACY RULE, APPLIED IN BOTH PLACES. The first version of the
-	// ancestor rule lived only in the copier, so any tree containing a private
-	// subtree produced a fingerprint over files the copy would never take - and
-	// mechanism 3's own digest comparison then failed the stage. That mismatch
-	// was the bug's tell: if the name and the bytes are computed by different
-	// rules, one of them is describing a tree that does not exist.
-	private := map[string]bool{}
-	if err := fs.WalkDir(root.FS(), ".", func(name string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if name == "." {
-			return nil
-		}
-		if private[filepath.Dir(name)] && name != relative {
-			if entry.IsDir() {
-				private[name] = true
-			}
-			return nil
-		}
-		info, infoErr := entry.Info()
-		if infoErr != nil {
-			return infoErr
-		}
-		if entry.IsDir() {
-			if info.Mode().Perm()&0o044 == 0 {
-				private[name] = true
-			}
-			return nil
-		}
-		if !entry.Type().IsRegular() {
-			// A symlink inside the package is neither hashed nor copied. Copying
-			// it could point outside the boundary, and following it would import
-			// exactly the escape this whole change removes.
-			return nil
-		}
-		// Hashed exactly when copied, so identity describes the tree the seat
-		// actually gets rather than one that includes files it never receives.
-		if !stagedTreeMember(name, relative, info.Mode().Perm()) {
-			return nil
-		}
-		return hashRuntimeFile(root, name, digest)
-	}); err != nil {
-		return "", fmt.Errorf("%w: fingerprint %q: %v", ErrRuntimeNotStageable, boundary, err)
-	}
-	return hex.EncodeToString(digest.Sum(nil))[:16], nil
-}
-
-func hashRuntimeFile(root *os.Root, name string, digest io.Writer) error {
-	handle, err := root.Open(name)
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrRuntimeNotStageable, err)
-	}
-	defer handle.Close()
-	// The NAME is hashed with the bytes so two trees differing only in layout
-	// cannot collide.
-	if _, err := io.WriteString(digest, name+"\x00"); err != nil {
-		return err
-	}
-	if _, err := io.Copy(digest, handle); err != nil {
-		return fmt.Errorf("%w: %v", ErrRuntimeNotStageable, err)
-	}
-	return nil
-}
-
-// publishRuntime copies the boundary into the daemon root and publishes it by
-// rename, reusing an existing copy only when the published name already exists.
-//
-// Identity is by content, so an existing name is a tree whose fingerprint already
-// matched; a partially copied tree never acquires the published name, because the
-// rename is the last step.
-func publishRuntime(root string, name string, runtimeName string, boundary string, relative string, packaged bool, fingerprint string) error {
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		return err
-	}
-	destinationRoot, err := os.OpenRoot(root)
-	if err != nil {
-		return err
-	}
-	defer destinationRoot.Close()
-
-	if info, err := destinationRoot.Lstat(name); err == nil {
-		// Lstat, never Stat: a symlink planted at the published name must not be
-		// mistaken for a staged copy. An existing content-addressed directory is
-		// reusable only while both its copied artifact and shim remain intact.
-		if !info.IsDir() {
-			return fmt.Errorf("%w: published name %q is not a directory", ErrRuntimeNotStageable, name)
-		}
-		if err := validatePublishedRuntime(destinationRoot, name, runtimeName, relative, fingerprint, packaged); err != nil {
-			return err
-		}
-		return nil
-	}
-
-	if err := checkFreeSpace(root); err != nil {
-		return err
-	}
-
-	staging := name + ".staging-" + randomSuffix()
-	if err := destinationRoot.Mkdir(staging, 0o700); err != nil {
-		return err
-	}
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.RemoveAll(filepath.Join(root, staging))
-		}
-	}()
-
-	sourceRoot, err := os.OpenRoot(boundary)
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrRuntimeNotStageable, err)
-	}
-	defer sourceRoot.Close()
-
-	// THE DIGEST COMES FROM THE COPY PATH, and the published name is only
-	// claimed if it matches the fingerprint the source produced (bridge F3).
-	// Staging reads the source TWICE - once to fingerprint, once to copy - so
-	// without this the name can describe a tree that was never published.
-	var copied string
-	if packaged {
-		copied, err = copyRuntimeTree(sourceRoot, destinationRoot, staging, relative)
-		if err != nil {
-			return err
-		}
-	} else {
-		digest := sha256.New()
-		if err := copyRuntimeFile(sourceRoot, relative, destinationRoot, filepath.Join(staging, relative), relative, digest); err != nil {
-			return err
-		}
-		copied = hex.EncodeToString(digest.Sum(nil))[:16]
-	}
-	if copied != fingerprint {
-		return fmt.Errorf("%w: staged content digest %q does not match the fingerprint %q the source produced; the source changed between the fingerprint and the copy", ErrRuntimeNotStageable, copied, fingerprint)
-	}
-
-	// RECORD THE ENTRYPOINT DIGEST INSIDE THE ENGINE TREE so reuse can compare
-	// like with like for a package boundary, whose full tree is too expensive to
-	// re-hash on every launch.
-	entrypointDigest := sha256.New()
-	entrypointHandle, err := destinationRoot.OpenFile(filepath.Join(staging, relative), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return fmt.Errorf("%w: reopen staged entrypoint: %v", ErrRuntimeNotStageable, err)
-	}
-	if _, err := io.WriteString(entrypointDigest, relative+"\x00"); err != nil {
-		_ = entrypointHandle.Close()
-		return err
-	}
-	if _, err := io.Copy(entrypointDigest, entrypointHandle); err != nil {
-		_ = entrypointHandle.Close()
-		return fmt.Errorf("%w: rehash staged entrypoint: %v", ErrRuntimeNotStageable, err)
-	}
-	if err := entrypointHandle.Close(); err != nil {
-		return err
-	}
-	digestFile, err := destinationRoot.OpenFile(filepath.Join(staging, entrypointDigestName), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o400)
-	if err != nil {
-		return err
-	}
-	if _, err := io.WriteString(digestFile, hex.EncodeToString(entrypointDigest.Sum(nil))[:16]+"\n"); err != nil {
-		_ = digestFile.Close()
-		return err
-	}
-	if err := digestFile.Close(); err != nil {
-		return err
-	}
-
-	// The caller executes the runtime by its configured name, but resolved
-	// artifacts do not necessarily carry that name: claude's target is a
-	// version number and codex's is codex.js. Publish a fingerprint-local shim,
-	// not a stable global one, so a concurrent upgrade cannot retarget an
-	// already-running seat to a tree its Landlock rules never granted.
-	shimDir := filepath.Join(staging, ".bin")
-	if err := destinationRoot.Mkdir(shimDir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-		return err
-	}
-	shimTarget, err := filepath.Rel(".bin", relative)
-	if err != nil || strings.HasPrefix(shimTarget, ".."+string(filepath.Separator)+"..") {
-		return fmt.Errorf("%w: executable %q cannot be addressed from its staged shim", ErrRuntimeNotStageable, relative)
-	}
-	if err := destinationRoot.Symlink(shimTarget, filepath.Join(shimDir, runtimeName)); err != nil {
-		return fmt.Errorf("%w: create runtime shim: %v", ErrRuntimeNotStageable, err)
-	}
-
-	if err := destinationRoot.Rename(staging, name); err != nil {
-		if _, statErr := destinationRoot.Lstat(name); statErr == nil {
-			// A concurrent publisher won. Its tree proved the same fingerprint,
-			// so the loser discards its own copy rather than failing the launch.
-			return nil
-		}
-		return err
-	}
-	cleanup = false
-	return nil
-}
-
-// validatePublishedRuntime re-proves an existing published tree before it is
-// reused. It verifies CONTENT, not merely shape (bridge F3): a tree whose
-// entrypoint bytes changed after publication no longer matches the name it was
-// published under, and reusing it would serve a copy nothing ever fingerprinted.
-func validatePublishedRuntime(root *os.Root, published string, runtimeName string, relative string, fingerprint string, packaged bool) error {
-	artifact := filepath.Join(published, relative)
-	info, err := root.Lstat(artifact)
-	if err != nil || !info.Mode().IsRegular() {
-		return fmt.Errorf("%w: published runtime artifact %q is missing or not regular", ErrRuntimeNotStageable, artifact)
-	}
-	shim := filepath.Join(published, ".bin", runtimeName)
-	info, err = root.Lstat(shim)
-	if err != nil || info.Mode()&os.ModeSymlink == 0 {
-		return fmt.Errorf("%w: published runtime shim %q is missing or not a symlink", ErrRuntimeNotStageable, shim)
-	}
-	target, err := root.Readlink(shim)
-	if err != nil {
-		return fmt.Errorf("%w: read published runtime shim: %v", ErrRuntimeNotStageable, err)
-	}
-	want, err := filepath.Rel(".bin", relative)
-	if err != nil || target != want {
-		return fmt.Errorf("%w: published runtime shim %q targets %q, want %q", ErrRuntimeNotStageable, shim, target, want)
-	}
-	// A SINGLE-FILE RUNTIME IS RE-HASHED IN FULL. A package tree is not, because
-	// re-hashing every member on every launch costs more than the copy; its
-	// ENTRYPOINT is the file that runs, so that is the one re-proven. A torn
-	// non-entrypoint member surfaces as a visible launch failure, never as a
-	// silently wrong binary - the same trade the Go toolchain path documents.
-	entrypointDigest := sha256.New()
-	handle, err := root.OpenFile(artifact, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return fmt.Errorf("%w: reopen published artifact %q: %v", ErrRuntimeNotStageable, artifact, err)
-	}
-	defer handle.Close()
-	if _, err := io.WriteString(entrypointDigest, relative+"\x00"); err != nil {
-		return err
-	}
-	if _, err := io.Copy(entrypointDigest, handle); err != nil {
-		return fmt.Errorf("%w: reread published artifact %q: %v", ErrRuntimeNotStageable, artifact, err)
-	}
-	got := hex.EncodeToString(entrypointDigest.Sum(nil))[:16]
-	if !packaged && got != fingerprint {
-		return fmt.Errorf("%w: published artifact %q hashes to %q, not the %q it was published under", ErrRuntimeNotStageable, artifact, got, fingerprint)
-	}
-	if packaged {
-		// For a tree, the entrypoint digest is recorded beside the copy at
-		// publish time so reuse can compare like with like.
-		expected, readErr := publishedEntrypointDigest(root, published)
-		if readErr != nil {
-			return readErr
-		}
-		if expected != got {
-			return fmt.Errorf("%w: published entrypoint %q hashes to %q, recorded %q", ErrRuntimeNotStageable, artifact, got, expected)
-		}
-	}
-	return nil
-}
-
-// entrypointDigestName holds the entrypoint digest recorded at publish time. It
-// lives inside the engine-owned tree, which no seat can write.
-const entrypointDigestName = ".entrypoint-digest"
-
-func publishedEntrypointDigest(root *os.Root, published string) (string, error) {
-	handle, err := root.OpenFile(filepath.Join(published, entrypointDigestName), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return "", fmt.Errorf("%w: published tree %q records no entrypoint digest", ErrRuntimeNotStageable, published)
-	}
-	defer handle.Close()
-	recorded, err := io.ReadAll(io.LimitReader(handle, 64))
-	if err != nil {
-		return "", fmt.Errorf("%w: read recorded entrypoint digest: %v", ErrRuntimeNotStageable, err)
-	}
-	return strings.TrimSpace(string(recorded)), nil
-}
-
-// copyRuntimeTree copies a package boundary and returns the digest of what it
-// ACTUALLY wrote, so the caller can prove the published name describes the
-// published bytes (#1921 bridge F3).
-//
-// EVERY DECISION COMES FROM AN OPEN DESCRIPTOR, NOT FROM READDIR (bridge F2).
-// The previous form took entry.Info() from the directory listing and then opened
-// the member by NAME, so the name could be replaced between the two - and an
-// in-root symlink pointing at a private sibling was followed, because os.Root
-// refuses escapes OUT of the root, never redirection WITHIN it. Opening first
-// and testing the descriptor removes the window rather than narrowing it.
-//
-// ANCESTOR PRIVACY DECIDES A SUBTREE (bridge F1). A leaf's own permission bits
-// cannot tell you it lives in credentials/: a 0700 directory holding a 0644
-// token was copied because only the token was consulted. A directory that denies
-// group AND other read marks its whole subtree operator-private and is skipped.
-func copyRuntimeTree(sourceRoot *os.Root, destinationRoot *os.Root, destination string, relative string) (string, error) {
-	digest := sha256.New()
-	private := map[string]bool{}
-	err := fs.WalkDir(sourceRoot.FS(), ".", func(name string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if name == "." {
-			return nil
-		}
-		// A member under a private ancestor is the operator's, whatever its own
-		// mode says. The entrypoint is the sole exemption: a runtime installed
-		// mode 0700 must still run, and then only that file is taken.
-		if private[filepath.Dir(name)] && name != relative {
-			if entry.IsDir() {
-				private[name] = true
-			}
-			return nil
-		}
-		target := filepath.Join(destination, name)
-		if entry.IsDir() {
-			info, infoErr := entry.Info()
-			if infoErr != nil {
-				return infoErr
-			}
-			if info.Mode().Perm()&0o044 == 0 {
-				private[name] = true
-				// The directory itself is still created only if something
-				// inside it is later taken; skipping it entirely keeps the
-				// staged tree free of empty private shells.
-				return nil
-			}
-			if err := destinationRoot.Mkdir(target, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-				return err
-			}
-			return nil
-		}
-		// Sockets, devices and symlinks never reach copyRuntimeFile: it opens
-		// with O_NOFOLLOW and refuses anything that is not a regular file on the
-		// descriptor it holds.
-		return copyRuntimeFile(sourceRoot, name, destinationRoot, target, relative, digest)
-	})
-	if err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(digest.Sum(nil))[:16], nil
-}
-
-// copyRuntimeFile opens the source member, decides from the OPEN descriptor, and
-// hashes the same bytes it writes.
-//
-// O_NOFOLLOW is the load-bearing flag: it makes a symlink at this name an error
-// rather than a redirection, which is what closes bridge F2's substitution
-// window. A non-regular file is skipped rather than failing the whole stage,
-// because a package tree may legitimately contain a socket or a fifo.
-func copyRuntimeFile(sourceRoot *os.Root, name string, destinationRoot *os.Root, target string, relative string, digest io.Writer) error {
-	// TWO LAYERS, deliberately, because each catches what the other cannot.
-	// Lstat identifies a symlink WITHOUT following it, so an in-root link to a
-	// private sibling and a link that escapes the root are both skipped cleanly
-	// rather than surfacing as an error. O_NOFOLLOW below is the AUTHORITATIVE
-	// check: if the name is swapped after this Lstat, the open fails instead of
-	// following the substitute (bridge F2).
-	if info, lstatErr := sourceRoot.Lstat(name); lstatErr == nil && info.Mode()&os.ModeSymlink != 0 {
-		return nil
-	}
-	handle, err := sourceRoot.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		if errors.Is(err, syscall.ELOOP) {
-			// The name became a symlink between the Lstat and the open. Skipped,
-			// not followed: the substitution window is closed, not merely small.
-			return nil
-		}
-		return fmt.Errorf("%w: %v", ErrRuntimeNotStageable, err)
-	}
-	defer handle.Close()
-	info, err := handle.Stat()
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrRuntimeNotStageable, err)
-	}
-	if !info.Mode().IsRegular() {
-		return nil
-	}
-	// THE PRIVACY TEST NOW READS THE DESCRIPTOR, so it describes the file being
-	// copied rather than the name that was listed earlier.
-	if !stagedTreeMember(name, relative, info.Mode().Perm()) {
-		return nil
-	}
-	// EXECUTE BITS ARE PRESERVED because the copy must be runnable; write bits
-	// are not, so the staged tree is read-only to the seat that uses it.
-	mode := fs.FileMode(0o500)
-	if info.Mode().Perm()&0o111 == 0 {
-		mode = 0o400
-	}
-	if parent := filepath.Dir(target); parent != "." {
-		if err := destinationRoot.MkdirAll(parent, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-			return err
-		}
-	}
-	written, err := destinationRoot.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
-	if err != nil {
-		return err
-	}
-	defer written.Close()
-	// The NAME is hashed with the bytes, and the digest is taken from the copy
-	// path itself, so the fingerprint describes what was written.
-	if _, err := io.WriteString(digest, name+"\x00"); err != nil {
-		return err
-	}
-	if _, err := io.Copy(io.MultiWriter(written, digest), handle); err != nil {
-		return err
-	}
-	return written.Close()
 }
