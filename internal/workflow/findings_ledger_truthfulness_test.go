@@ -79,8 +79,17 @@ func TestAdvanceJobAcceptsAPathShapedLocatorAsStaticEvidence(t *testing.T) {
 	// citation is preserved as the RATIONALE instead of being lost or destroying
 	// the row - both values came from the reviewer, and each lands where it is
 	// usable.
-	if !db.IsStructuralFindingLocator(l1.EvidenceLocator) {
-		t.Fatalf("[L1] evidence locator = %q, want a structurally checkable path the re-arm can resolve", l1.EvidenceLocator)
+	// BEHAVIOURAL, not a helper call (#1941 review f3): the reviewer noted the
+	// previous version invoked db.IsStructuralFindingLocator directly, which pins
+	// a helper rather than the path. The store REFUSES a STATIC discharge whose
+	// locator is not path-shaped, so the row existing as STATIC/answered above
+	// already proves structural validity; what remains to assert is that the
+	// locator is the path and carries none of the prose.
+	if l1.EvidenceLocator != "internal/workflow/merge_gate.go" {
+		t.Fatalf("[L1] evidence locator = %q, want exactly the path the re-arm can resolve", l1.EvidenceLocator)
+	}
+	if strings.Contains(l1.EvidenceLocator, " ") {
+		t.Fatalf("[L1] evidence locator %q carries prose; the store would refuse it", l1.EvidenceLocator)
 	}
 	if !strings.Contains(l1.Rationale, "collectImplementerAttribution") {
 		t.Fatalf("[L1] rationale = %q, want the reviewer's prose citation preserved", l1.Rationale)
@@ -197,5 +206,248 @@ func TestAdvanceJobReadsSeverityAndPathFromABareStringFinding(t *testing.T) {
 	}
 	if !strings.Contains(summary, "recorded 1 of 2") || !strings.Contains(summary, "1 skipped") {
 		t.Fatalf("summary event = %q, want an honest 1 of 2 with 1 skipped", summary)
+	}
+}
+
+// #1941 review f2 and f3, reproduced as the reviewer measured them on the
+// production path. Each input is one it actually ran, and each arm pins a
+// behaviour my first head got wrong in the PERMISSIVE direction: the parser
+// rescued a severity and then recorded a row that said nothing, or invented a
+// locator out of prose.
+func TestAdvanceJobRefusesManufacturedBareStringFindings(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "g7-review", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	head := strings.Repeat("e", 40)
+
+	insertCompletedJob(t, store, db.Job{ID: "review-manufactured", Agent: "g7-review", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-man", PullRequest: 1942, HeadSHA: head,
+		TaskID: "task-man", ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "changes_requested", Severity: "P2", Summary: "manufactured shapes",
+			Evidence: EvidenceStaticOnly,
+			Findings: []json.RawMessage{
+				// [M1] A severity token alone. Recorded as QUOTED with the token as
+				// its whole title before this change.
+				json.RawMessage(`"P2:"`),
+				// [M2] A version is not a path. Invented File/EvidenceLocator "v1.2"
+				// and recorded STATIC before this change.
+				json.RawMessage(`"P2 v1.2 is a version, not a repository file"`),
+				// [M3] An object carrying only id and severity: recorded with title
+				// and detail both empty.
+				json.RawMessage(`{"id":"M3","severity":"P2"}`),
+				// [M4] LOWERCASE severity, which is the fifth mutant's discriminator:
+				// with strings.ToUpper removed this records nothing at all.
+				json.RawMessage(`"p2 internal/workflow/findings_ledger_writer.go:226 - lowercase severities are real reviewer output"`),
+				// [M5] Colon-suffixed severity followed by a real path.
+				json.RawMessage(`"P2: internal/db/review_findings.go:247 - the discharge bar refuses a prose locator"`),
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "review-manufactured"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+
+	observations, err := store.ListReviewFindingObservations(ctx, "gitmoot/gitmoot", 1942)
+	if err != nil {
+		t.Fatalf("ListReviewFindingObservations returned error: %v", err)
+	}
+	byLabel := map[string]db.ReviewFindingObservation{}
+	for _, obs := range observations {
+		byLabel[obs.RoundLabel] = obs
+	}
+
+	// M1 and M3 say nothing, so they must not be rows at all. M2 says something,
+	// so it IS recorded - but with no invented locator.
+	if len(observations) != 3 {
+		var got []string
+		for _, obs := range observations {
+			got = append(got, obs.RoundLabel+"/"+string(obs.EvidenceKind)+"/"+obs.File)
+		}
+		t.Fatalf("ledger holds %d row(s) %v; want 3 - the two content-free findings must be skipped, not recorded", len(observations), got)
+	}
+
+	for _, obs := range observations {
+		if strings.TrimSpace(obs.Title) == "" && strings.TrimSpace(obs.Detail) == "" {
+			t.Fatalf("row %q was recorded with no title and no detail; that is the empty-row defect this lane closes", obs.RoundLabel)
+		}
+		if obs.File == "v1.2" || obs.EvidenceLocator == "v1.2" {
+			t.Fatalf("row %q invented a locator from prose: file=%q locator=%q", obs.RoundLabel, obs.File, obs.EvidenceLocator)
+		}
+	}
+
+	// M4 is the lowercase discriminator: it must be recorded, with its severity
+	// normalised and its real path read.
+	lower := byLabel[""]
+	found := false
+	for _, obs := range observations {
+		if strings.Contains(obs.Title, "lowercase severities") {
+			found = true
+			lower = obs
+		}
+	}
+	if !found {
+		t.Fatal("the lowercase-severity finding was not recorded; strings.ToUpper is the only thing that reads it")
+	}
+	if lower.Severity != "P2" {
+		t.Fatalf("lowercase severity recorded as %q, want normalised P2", lower.Severity)
+	}
+	if lower.File != "internal/workflow/findings_ledger_writer.go" {
+		t.Fatalf("lowercase finding file = %q, want the real path", lower.File)
+	}
+
+	// The skips must be LOUD and the summary must count them.
+	events, err := store.ListJobEvents(ctx, "review-manufactured")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	skips, summary := 0, ""
+	for _, event := range events {
+		switch event.Kind {
+		case "findings_ledger_skipped":
+			skips++
+		case "findings_ledger_recorded":
+			summary = event.Message
+		}
+	}
+	if skips != 2 {
+		t.Fatalf("skip events = %d, want 2: a finding that cannot be recorded must fail loudly", skips)
+	}
+	if !strings.Contains(summary, "recorded 3 of 5") || !strings.Contains(summary, "2 skipped") {
+		t.Fatalf("summary = %q, want an honest 3 of 5 with 2 skipped", summary)
+	}
+}
+
+// #1941 review f1, THE P1, reproduced through the production path. A
+// path-shaped locator was promoted to File and STATIC, and the writer then
+// MANUFACTURED the rationale the store demands for a discharge - so a
+// continuation whose only content was a path I parsed myself persisted as
+// answered/STATIC and cleared its obligation. That is inventing evidence, the
+// permissive mirror of the defect this lane was opened to fix.
+//
+// A STATIC row now requires that the REVIEWER supplied something of its own.
+func TestAdvanceJobRefusesToDischargeOnAManufacturedRationale(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "g7-review", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	head := strings.Repeat("f", 40)
+
+	insertCompletedJob(t, store, db.Job{ID: "review-manufactured-rationale", Agent: "g7-review", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-mr", PullRequest: 1944, HeadSHA: head,
+		TaskID: "task-mr", ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "approved", Summary: "content-free discharge attempt",
+			Evidence: EvidenceStaticOnly,
+			Findings: []json.RawMessage{
+				// [N1] The reviewer's own construction: a declared answer whose only
+				// content is a locator citing a path that does not exist. No title,
+				// no detail, no rationale, nothing executed.
+				json.RawMessage(`{"id":"N1","severity":"P1","state":"answered","evidence_locator":"does/not/exist.go"}`),
+				// [N2] The same locator WITH reviewer prose. This one is a legitimate
+				// static reading and must still be recorded as STATIC, so the guard
+				// cannot be satisfied by refusing everything.
+				json.RawMessage(`{"id":"N2","severity":"P1","state":"answered","evidence_locator":"does/not/exist.go","detail":"read the call site at this head and the guard is present"}`),
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "review-manufactured-rationale"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+
+	observations, err := store.ListReviewFindingObservations(ctx, "gitmoot/gitmoot", 1944)
+	if err != nil {
+		t.Fatalf("ListReviewFindingObservations returned error: %v", err)
+	}
+	byLabel := map[string]db.ReviewFindingObservation{}
+	for _, obs := range observations {
+		byLabel[obs.RoundLabel] = obs
+	}
+
+	// N1 carries NOTHING of the reviewer's own - no title, no detail, no
+	// rationale, nothing executed - so it is refused outright and never counted.
+	// That is stronger than recording it as QUOTED: it cannot discharge AND it
+	// cannot pad a "recorded n of n" line. What must never happen is the
+	// original behaviour, a STATIC row whose rationale this writer invented.
+	if n1, ok := byLabel["N1"]; ok {
+		t.Fatalf("N1 was recorded (kind=%s state=%s rationale=%q); a finding whose only content is a path the WRITER parsed must not become a row",
+			n1.EvidenceKind, n1.State, n1.Rationale)
+	}
+
+	// The positive control. Without it, refusing everything would pass.
+	n2 := byLabel["N2"]
+	if n2.EvidenceKind != db.EvidenceStatic {
+		t.Fatalf("N2 evidence kind = %q, want STATIC: a reviewer that supplied prose and a locator did the work STATIC exists for", n2.EvidenceKind)
+	}
+	if n2.State != db.FindingAnswered {
+		t.Fatalf("N2 state = %q, want answered", n2.State)
+	}
+
+	// And N1's reversal is audible rather than silent.
+	events, err := store.ListJobEvents(ctx, "review-manufactured-rationale")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	skip, summary := "", ""
+	for _, event := range events {
+		switch event.Kind {
+		case "findings_ledger_skipped":
+			skip = event.Message
+		case "findings_ledger_recorded":
+			summary = event.Message
+		}
+	}
+	if skip == "" {
+		t.Fatal("N1 was refused with NO skip event; a silent drop is the other half of this lane's defect")
+	}
+	if !strings.Contains(summary, "recorded 1 of 2") || !strings.Contains(summary, "1 skipped") {
+		t.Fatalf("summary = %q, want an honest 1 of 2 with 1 skipped", summary)
+	}
+}
+
+// The control for the ENTRY check, and it exists because my own first
+// remediation would have broken it: refusing every finding with no title and no
+// detail newly rejected a legitimate one carrying a `file` and a `rationale`,
+// which is a real static reading with its evidence in the rationale field. A
+// guard that refuses valid input is the failure mode every bound in this
+// campaign has had a version of.
+func TestAdvanceJobStillRecordsAFindingWhoseContentIsItsRationale(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "g7-review", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	head := strings.Repeat("a", 40)
+
+	insertCompletedJob(t, store, db.Job{ID: "review-rationale-only", Agent: "g7-review", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-ro", PullRequest: 1945, HeadSHA: head,
+		TaskID: "task-ro", ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "approved", Summary: "rationale carries the reading",
+			Evidence: EvidenceStaticOnly,
+			Findings: []json.RawMessage{
+				json.RawMessage(`{"id":"R1","severity":"P2","state":"answered","file":"internal/workflow/findings_ledger.go","line":198,"rationale":"read dischargedAtHead at this head: a same-head non-QUOTED row is treated as discharged"}`),
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "review-rationale-only"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+	observations, err := store.ListReviewFindingObservations(ctx, "gitmoot/gitmoot", 1945)
+	if err != nil {
+		t.Fatalf("ListReviewFindingObservations returned error: %v", err)
+	}
+	if len(observations) != 1 {
+		t.Fatalf("ledger holds %d row(s); a finding whose content is its rationale must still be recorded", len(observations))
+	}
+	obs := observations[0]
+	if obs.EvidenceKind != db.EvidenceStatic || obs.State != db.FindingAnswered {
+		t.Fatalf("row = kind %s / state %s, want STATIC/answered", obs.EvidenceKind, obs.State)
+	}
+	if obs.EvidenceLocator != "internal/workflow/findings_ledger.go:198" {
+		t.Fatalf("evidence locator = %q, want path:line built from the declared file", obs.EvidenceLocator)
 	}
 }

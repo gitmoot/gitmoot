@@ -89,7 +89,7 @@ func pathFromLensEvidence(evidence string) string {
 	head = strings.TrimSuffix(strings.TrimSpace(head), ",")
 	path, _, _ := strings.Cut(head, ":")
 	path = strings.TrimSpace(path)
-	if path == "" || !strings.Contains(path, "/") && !strings.Contains(path, ".") {
+	if !looksLikeRepoPath(path) {
 		return ""
 	}
 	return path
@@ -127,6 +127,21 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 				continue
 			}
 			wire = wireFromBareFindingText(text)
+		}
+		// A SEVERITY TOKEN IS NOT A FINDING (#1941 review f2). "P2:" was recorded
+		// as a QUOTED row whose only title was the severity itself, and an object
+		// carrying nothing but {id, severity} was recorded with title and detail
+		// both empty. Both are the empty-row defect #1932 was filed against,
+		// reached from the permissive side: my parser rescued the severity and
+		// then had nothing left to record. The invariant's loud-failure half
+		// covers this, so it skips and is never counted.
+		if strings.TrimSpace(wire.Title) == "" && strings.TrimSpace(wire.Detail) == "" &&
+			strings.TrimSpace(wire.Body) == "" && strings.TrimSpace(wire.Summary) == "" &&
+			strings.TrimSpace(wire.Evidence) == "" && strings.TrimSpace(wire.Rationale) == "" {
+			skipped++
+			e.recordLedgerSkip(ctx, job.ID, index,
+				"finding carries no title, detail, body, summary or evidence, so the row would say nothing about what it observed")
+			continue
 		}
 		obs, declared, ok := e.ledgerObservationWithDeclaredState(job, payload, wire, head, repo)
 		if !ok {
@@ -231,6 +246,33 @@ func (e Engine) ledgerObservationWithDeclaredState(job db.Job, payload JobPayloa
 		WithdrawReason: strings.TrimSpace(wire.WithdrawReason),
 		SourceJob:      job.ID,
 	}
+	// #1941 review f1, P1. A STATIC row is DISCHARGEABLE, and the store demands a
+	// rationale for one - which this writer then manufactured
+	// ("reported by a review that declared no executed checks") even when the
+	// reviewer had supplied no title, no detail and no rationale. Combined with
+	// my locator promotion that produced a discharge built entirely out of a
+	// path I parsed myself, which is inventing evidence: the exact opposite of
+	// this lane's invariant, arriving from the permissive side.
+	//
+	// THE GUARD LIVES AT THE ENTRY, NOT HERE, AND A SURVIVING MUTANT IS WHY.
+	// My first remediation put a second condition on this STATIC branch
+	// requiring reviewer-supplied content. Mutating it away left every test
+	// green, and the reason is structural rather than a missing fixture:
+	// RecordReviewFindingsToLedger already refuses a finding carrying no title,
+	// detail, body, summary, evidence or rationale, and every one of those feeds
+	// obs.Title, obs.Detail or obs.Rationale - so nothing content-free can reach
+	// this branch at all. A condition that cannot fail is not a guard, so it is
+	// deleted rather than kept for reassurance. The entry check is the single
+	// place the invariant is enforced, and mutating IT fails two tests.
+	//
+	// AND A LIMIT I AM NAMING RATHER THAN IMPLYING I CLOSED: the reviewer also
+	// showed that a SAME-HEAD non-QUOTED observation never reaches
+	// answeredIsMandatory at all - dischargedAtHead (findings_ledger.go) marks it
+	// discharged and LedgerObligationsAtHead skips it - so PathExistsAtHead is
+	// not consulted for a discharge recorded at the head under review. I
+	// verified that in source. It predates this PR, affects file-based STATIC
+	// rows identically, and lives outside this lane's file boundary, so it is
+	// reported rather than patched here.
 	declared := db.FindingState(strings.ToLower(strings.TrimSpace(wire.State)))
 	switch declared {
 	case db.FindingAnswered:
@@ -526,12 +568,50 @@ func wireFromBareFindingText(text string) reviewFindingWire {
 		return wire
 	}
 	wire.Severity = severity
+	// NO FALLBACK TO THE WHOLE STRING (#1941 review f2). This used to read
+	// firstNonEmptyLedgerText(rest, wire.Title), so a bare "P2:" - nothing but a
+	// severity - kept the token itself as its title, passed the content check,
+	// and was recorded as a row whose only content was the severity it had just
+	// been parsed out of. An empty remainder means the finding said nothing, and
+	// saying nothing must skip loudly rather than round-trip through a title.
 	rest := strings.TrimSpace(strings.TrimPrefix(wire.Title, fields[0]))
-	wire.Title = firstNonEmptyLedgerText(rest, wire.Title)
+	wire.Title = rest
 	// The locator, when the next token is path-shaped. pathFromLensEvidence is
 	// the same parser the lens shape already uses, so one rule governs both.
 	if path := pathFromLensEvidence(rest); path != "" {
 		wire.File = path
 	}
 	return wire
+}
+
+// looksLikeRepoPath is the tightened rule (#1941 review f2). "any token
+// containing a dot" was too loose and INVENTED locators out of prose: a bare
+// "P2 v1.2 is a version, not a repository file" produced File and
+// EvidenceLocator "v1.2" and recorded a STATIC row - manufacture from nothing,
+// which is the defect this lane exists to remove, arriving from the permissive
+// side.
+//
+// A directory separator is accepted outright. Otherwise the token must carry an
+// ALPHABETIC extension - "exec_linux.go", "LandingView.vue" - because a numeric
+// or absent extension is what versions, line ranges and ordinary prose look
+// like. Nothing here proves the path EXISTS: that is answeredIsMandatory's job,
+// where a tree is available.
+func looksLikeRepoPath(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	if strings.Contains(path, "/") {
+		return true
+	}
+	dot := strings.LastIndex(path, ".")
+	if dot <= 0 || dot == len(path)-1 {
+		return false
+	}
+	for _, r := range path[dot+1:] {
+		if !((r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z')) {
+			return false
+		}
+	}
+	return true
 }
