@@ -6,95 +6,151 @@ import (
 	"testing"
 )
 
-// #1817: A RUNTIME WHOSE EXECUTABLE DOES NOT EXIST MUST NOT BE DISPATCHED.
+// #1817: AN ABSENT RUNTIME EXECUTABLE MUST BE NAMED AS ITSELF, AND MUST NOT
+// BLOCK A DISPATCH.
 //
-// Measured instance this pins, from 2026-09-05 17:28: two #1910 review lens legs
-// were dispatched and died about fifteen seconds later with
+// The measured failure this makes legible:
 //
 //	sandbox-exec: resolve sandbox target "claude": exec: "claude": executable
 //	file not found in $PATH
 //
-// The preflight had already run and had not blocked them. probeBinary resolves
-// the runtime binary with the same exec.LookPath the sandbox target uses
-// (internal/sandbox/lookpath.go), so both sides agree the binary is absent - but
-// a LookPath failure produced helpParsed=false, every flag requirement became
-// RuntimeContractUnknown, and unknown is documented to MUST RUN. So the most
-// DEFINITIVE answer the probe can obtain was classified as no answer at all.
+// which killed two #1910 review lens legs on 2026-09-05 17:28 and two joltra
+// review jobs on 2026-09-06 at 10:51:15 and 11:06:20. Before this change the
+// probe reported that absence as "binary help output was not parseable", once
+// per declared flag, so the one actionable fact was both mis-described and
+// duplicated.
 //
-// The pair below is the whole point and must be read together: absence blocks,
-// and everything that is merely unestablished still runs.
-func TestRuntimePreflightMissingBinaryBlocksDispatch(t *testing.T) {
+// WHY IT DOES NOT BLOCK, measured rather than assumed. I first classified
+// absence as unsupported so dispatch would refuse it, and CI answered: 24
+// internal/cli tests went `blocked, want succeeded/failed/queued`, because the
+// runner has no runtime CLIs installed while those dispatches deliver through an
+// injected adapter that never execs the declared binary. Every pre-existing
+// `unsupported` case presupposes a PRESENT binary whose help was parsed. This
+// layer cannot know whether the real adapter will exec that binary on this host,
+// so refusing here rejects valid input.
+func TestMissingBinaryIsNamedAsAbsentAndDoesNotBlock(t *testing.T) {
 	// path "" makes the harness LookPath fail, which is what an absent CLI does.
 	checker := NewRuntimeContractChecker(&contractProbeRunner{}, BuiltinRuntimeRegistry())
 	agent := Agent{Name: "gm-review-claude", Runtime: ClaudeRuntime, AutonomyPolicy: AutonomyPolicyAuto}
 
 	result := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{})
 
-	if result.State != RuntimeContractUnsupported {
-		t.Fatalf("state = %q, want %q; an executable that cannot be resolved is a definitive answer, not an unestablished one, and %q lets the leg dispatch and die at exec time",
-			result.State, RuntimeContractUnsupported, RuntimeContractUnknown)
+	// UNKNOWN, not unsupported: the tri-state's own contract is that only
+	// unsupported blocks, and absence is not an answer this layer may act on.
+	if result.State != RuntimeContractUnknown {
+		t.Fatalf("state = %q, want %q", result.State, RuntimeContractUnknown)
 	}
-	err := RuntimeContractDispatchError(agent, result)
-	if err == nil {
-		t.Fatal("dispatch was not blocked for a runtime whose executable does not resolve")
+	if err := RuntimeContractDispatchError(agent, result); err != nil {
+		t.Fatalf("an absent executable blocked a dispatch this layer cannot judge: %v", err)
 	}
-	// Fail loudly with a NAMED cause. Asserted as SHAPE, not as token presence,
-	// and that distinction is measured: ClaudeRuntime, the contract binary and
-	// this agent's name all contain the substring "claude", so a
-	// strings.Contains(err, "claude") triple is one assertion wearing three hats
-	// and a mutant that dropped the runtime field entirely survived it. These
-	// fragments cannot all be produced by the probe detail alone.
-	for _, want := range []string{
-		`agent "gm-review-claude"`,
-		`runtime "claude"`,
-		`executable "claude"`,
-		"does not resolve on PATH",
-		"install claude on the dispatching host PATH",
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("dispatch error is missing %q, so the refusal does not name its cause: %v", want, err)
+
+	// EXACTLY ONE requirement row describes the absence, and it is its own kind.
+	// Claude declares two flag requirements and omp declares six; reporting
+	// absence per-flag both multiplies the row and mis-names the defect.
+	var absence []RuntimeRequirementResult
+	for _, requirement := range result.Requirements {
+		if requirement.Kind == RuntimeRequirementBinaryPresent {
+			absence = append(absence, requirement)
 		}
 	}
-	// And it must NOT claim an installed version failed a requirement: nothing is
-	// installed, and that wording sends the reader after a CLI upgrade.
-	if strings.Contains(err.Error(), "installed version") {
-		t.Fatalf("refusal describes an absent binary as an installed version: %v", err)
+	if len(absence) != 1 {
+		t.Fatalf("binary-present rows = %d, want exactly 1 (requirements=%+v)", len(absence), result.Requirements)
+	}
+	// No flag row may be emitted at all: a flag verdict about a binary that does
+	// not exist is a statement about nothing.
+	for _, requirement := range result.Requirements {
+		if requirement.Kind == RuntimeRequirementFlag {
+			t.Fatalf("a flag requirement was judged against an absent binary: %+v", requirement)
+		}
+	}
+
+	// The row must NAME the executable and carry the resolver's own error, or an
+	// operator reading `runtime inspect` still cannot tell what to install.
+	row := absence[0]
+	for _, want := range []string{`executable "claude"`} {
+		if !strings.Contains(row.Name, want) {
+			t.Fatalf("requirement name %q does not contain %q", row.Name, want)
+		}
+	}
+	if !strings.Contains(row.Detail, "claude") {
+		t.Fatalf("requirement detail %q does not carry the resolver error naming the binary", row.Detail)
+	}
+	if !strings.Contains(row.Remedy, "install claude") {
+		t.Fatalf("requirement remedy %q does not say what to install", row.Remedy)
+	}
+	// And it must NOT be described as an installed version failing a check.
+	if strings.Contains(row.Detail, "not parseable") {
+		t.Fatalf("absence is still being reported as an unparseable help response: %q", row.Detail)
 	}
 }
 
-// POSITIVE CONTROL, and it is the guard that matters most on this change: every
-// bound added to this repo lately has had a version that rejected valid input.
-// A binary that EXISTS whose help cannot be parsed is genuinely unestablished -
-// the CLI has not said no - so it must stay unknown and must still dispatch.
-// If this test ever fails, the change has started refusing runnable reviewers.
-func TestRuntimePreflightPresentBinaryWithUnparseableHelpStillDispatches(t *testing.T) {
+// CONTROL: a binary that EXISTS whose help cannot be parsed is a different fact
+// and must keep its existing shape - unknown, non-blocking, flag rows present,
+// and NO binary-present row. Without this, a mutant that reported every probe as
+// absence would satisfy the test above.
+func TestPresentBinaryWithUnparseableHelpKeepsFlagRows(t *testing.T) {
 	checker, _, path := newContractCheckerForTest(t, "unparseable")
 	agent := Agent{Name: "seat", Runtime: KimiRuntime, AutonomyPolicy: AutonomyPolicyAuto}
 
 	result := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{})
 
 	if result.State != RuntimeContractUnknown {
-		t.Fatalf("state = %q, want %q for a present binary whose help is unparseable", result.State, RuntimeContractUnknown)
+		t.Fatalf("state = %q, want %q", result.State, RuntimeContractUnknown)
 	}
 	if result.ResolvedPath != path {
-		t.Fatalf("resolved path = %q, want %q; the probe must still report where it found the binary", result.ResolvedPath, path)
+		t.Fatalf("resolved path = %q, want %q", result.ResolvedPath, path)
+	}
+	for _, requirement := range result.Requirements {
+		if requirement.Kind == RuntimeRequirementBinaryPresent {
+			t.Fatalf("a present binary produced an absence row: %+v", requirement)
+		}
+	}
+	flags := 0
+	for _, requirement := range result.Requirements {
+		if requirement.Kind == RuntimeRequirementFlag {
+			flags++
+		}
+	}
+	if flags == 0 {
+		t.Fatal("a present binary produced no flag requirement rows, so the existing probe path was skipped")
 	}
 	if err := RuntimeContractDispatchError(agent, result); err != nil {
-		t.Fatalf("an unparseable help response blocked a dispatch it must not block: %v", err)
+		t.Fatalf("an unparseable help response blocked a dispatch: %v", err)
 	}
 }
 
-// The shell runtime declares no contract and therefore no binary. It must be
-// untouched by a binary-resolution rule, or subscribing a shell agent starts
-// failing preflight on a binary it never names.
-func TestRuntimePreflightContractlessRuntimeIsUnaffected(t *testing.T) {
+// A genuinely unsupported runtime - present binary, help parsed, required flag
+// absent - must STILL block. This is the arm that proves the change did not
+// disarm the gate while making absence quieter.
+func TestParsedHelpMissingRequiredFlagStillBlocks(t *testing.T) {
+	checker, _, _ := newContractCheckerForTest(t, "unsupported")
+	agent := Agent{Name: "seat", Runtime: KimiRuntime, AutonomyPolicy: AutonomyPolicyAuto}
+
+	result := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{})
+
+	if result.State != RuntimeContractUnsupported {
+		t.Fatalf("state = %q, want %q", result.State, RuntimeContractUnsupported)
+	}
+	if err := RuntimeContractDispatchError(agent, result); err == nil {
+		t.Fatal("a parsed help response missing a required flag no longer blocks dispatch")
+	}
+}
+
+// The shell runtime declares no contract and no binary, so it must produce no
+// absence row and must not block.
+func TestContractlessRuntimeProducesNoAbsenceRow(t *testing.T) {
 	checker := NewRuntimeContractChecker(&contractProbeRunner{}, BuiltinRuntimeRegistry())
 	agent := Agent{Name: "shell-seat", Runtime: ShellRuntime, AutonomyPolicy: AutonomyPolicyAuto}
 
 	result := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{})
 
 	if result.State != RuntimeContractSupported {
-		t.Fatalf("state = %q, want %q for a runtime that declares no contract", result.State, RuntimeContractSupported)
+		t.Fatalf("state = %q, want %q", result.State, RuntimeContractSupported)
+	}
+	for _, requirement := range result.Requirements {
+		if requirement.Kind == RuntimeRequirementBinaryPresent {
+			t.Fatalf("a contractless runtime produced an absence row: %+v", requirement)
+		}
 	}
 	if err := RuntimeContractDispatchError(agent, result); err != nil {
 		t.Fatalf("contractless runtime was blocked: %v", err)
