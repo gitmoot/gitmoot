@@ -113,6 +113,24 @@ printf '%%s' '%s'`, stateDir, self, stateDir, peers, failResult, okResult)
 	}
 	return body
 }
+
+// loopbackRendezvous is a 2-of-N BARRIER, and the barrier itself owns the only
+// clock (ruling 122694).
+//
+// IT USED TO HAVE THREE CLOCKS, and the tightest one decided: the listener
+// stopped accepting 5s after it started, while each seat waited just 2s for its
+// peer. So a seat that merely ARRIVED LATE - because read-only seat setup copies
+// a pinned Go toolchain and one artifact per runtime class before the script
+// runs - made its ON-TIME peer report "serialized", which is the opposite of
+// what this test exists to prove.
+//
+// The bound now lives where the knowledge is. The listener holds every arriving
+// connection until `peers` are present and only then acks, and the seats wait
+// for that ack without a private deadline. Nothing hangs: the caller's own
+// 60-second pool-tick timeout in drivePoolConcurrently is the outer bound, and
+// it fails with a message about serialization only when serialization is
+// actually what happened. Widening the seat timeout was the alternative and it
+// was refused - a limit tuned to a fast machine is not a limit.
 func loopbackRendezvous(t *testing.T, peers int) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -121,9 +139,6 @@ func loopbackRendezvous(t *testing.T, peers int) string {
 	}
 	t.Cleanup(func() { _ = listener.Close() })
 	go func() {
-		if tcp, ok := listener.(*net.TCPListener); ok {
-			_ = tcp.SetDeadline(time.Now().Add(5 * time.Second))
-		}
 		connections := make([]net.Conn, 0, peers)
 		defer func() {
 			for _, connection := range connections {
@@ -133,10 +148,14 @@ func loopbackRendezvous(t *testing.T, peers int) string {
 		for len(connections) < peers {
 			connection, err := listener.Accept()
 			if err != nil {
+				// The cleanup closed the listener, which is how this goroutine
+				// ends when a test finishes before the barrier fills.
 				return
 			}
 			connections = append(connections, connection)
 		}
+		// EVERY PEER IS PRESENT, so acking cannot be a false positive: a seat
+		// only proceeds once its sibling is genuinely running beside it.
 		for _, connection := range connections {
 			_, _ = connection.Write([]byte{1})
 		}
@@ -146,7 +165,11 @@ func loopbackRendezvous(t *testing.T, peers int) string {
 
 func loopbackRendezvousSeatScript(address, self, okResult string) string {
 	failResult := rendezvousResult("failed", "rendezvous timeout: seat "+self+" serialized (#739 regression)")
-	probe := `import socket,sys; host,port=sys.argv[1].rsplit(":",1); s=socket.create_connection((host,int(port)),2); s.settimeout(2); s.sendall(sys.argv[2].encode()); ok=s.recv(1); s.close(); sys.exit(0 if ok else 1)`
+	// The CONNECT keeps a short timeout - an unreachable barrier is a broken
+	// fixture and should fail fast - but the WAIT FOR THE ACK has none, because
+	// only the barrier knows when the peer has arrived. The outer pool-tick
+	// timeout bounds the whole thing.
+	probe := `import socket,sys; host,port=sys.argv[1].rsplit(":",1); s=socket.create_connection((host,int(port)),5); s.settimeout(None); s.sendall(sys.argv[2].encode()); ok=s.recv(1); s.close(); sys.exit(0 if ok else 1)`
 	return fmt.Sprintf(
 		"if python3 -c %s %s %s; then sleep 0.3; printf '%%s' %s; else printf '%%s' %s; fi",
 		shellQuote(probe, "posix"),
@@ -218,14 +241,22 @@ func drivePoolConcurrently(t *testing.T, ctx context.Context, worker jobWorker, 
 // (proven by the 2-of-2 rendezvous + a live state sampler), each carry a
 // readonly_worktree_allocated event, and each worktree is DISPOSED on terminal.
 //
-// MUTATION PROOF: revert the dispatch-time allocation (so both asks key
-// repo:owner/repo) and the first seat serializes behind the second — it waits out
-// the rendezvous, emits `failed`, and the both-succeeded assertion flips RED.
+// MUTATION PROOF, restated for the barrier this test now uses: the seats no
+// longer carry a private receive deadline, so a serialized seat does not "wait
+// out the rendezvous" - it waits until the barrier is abandoned. Driving the
+// pool with ONE worker (genuine serialization) therefore fails at the outer
+// 60-second pool-tick bound with "seats likely serialized", which is measured
+// rather than asserted. Reverting the dispatch-time allocation, so both asks
+// key repo:owner/repo, produces the same failure by the same route.
 func TestReadOnlyWorktreeConcurrentAsksE2E(t *testing.T) {
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := staleBranchGitCheckout(t, "owner/repo")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	// READY BARRIER (ruling 122694): take the one-time seat-staging copy out of
+	// the concurrency window, so "peer has not arrived yet" cannot be read as
+	// "peer serialized". The limits below are unchanged.
+	warmSeatStaging(t, home)
 
 	rendezvous := loopbackRendezvous(t, 2)
 	seedDaemonWorkerAgent(t, store, "alice", runtime.ShellRuntime,

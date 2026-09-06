@@ -487,6 +487,12 @@ func TestTrackedPoolIsolationHonorsSamePassRuntimeSibling(t *testing.T) {
 	defer cancel()
 	store := daemonWorkerStore(t)
 	home := t.TempDir()
+	// READY BARRIER (ruling 122694): seat staging copies the pinned toolchain and
+	// one artifact per runtime class ONCE PER HOME. Paying that inside the
+	// 10-second completion assertion below made this test fail on staging cost
+	// rather than on the scheduling property it measures. The deadline is
+	// unchanged; the copy simply happens before the window.
+	warmSeatStaging(t, home)
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 	// ONE codex agent with a session ref: both jobs share runtime key

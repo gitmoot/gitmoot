@@ -759,17 +759,20 @@ What to expect:
   seat's own cache root.** Both `/tmp` and the workspace return `EACCES` on
   `mkdir`, and "a writable dir" reads as satisfied by `/tmp` when it is not.
 
-If a seat still gets exit 126 running `go`, staging did not happen. **The reason is
-on the daemon's stderr, not in the job's events** - deliberately, because a fact
-about the host must not change a job's event stream. Look for
-`gitmoot: read-only seat toolchain:`. The causes, all of which leave the seat
-exactly as it was before this feature existed rather than failing the launch:
+If a seat gets exit 126 running `go`, no usable toolchain was staged. The command
+is an engine-owned failure stub, not a fallthrough to an operator installation;
+it prints `gitmoot: runtime unavailable: no daemon-staged artifact exists`.
+Host-specific causes also print `gitmoot: read-only seat toolchain:` on the
+daemon's stderr rather than changing the job event stream.
 
-- **No pinned toolchain on the daemon's `PATH`.** A toolchain under `/opt`,
-  `/usr/local`, `/nix/store` or `/snap` is treated as a system package and is NOT
-  copied; those keep their pre-existing location-only grant.
-- **The source is not a Go installation.** It must have an executable `bin/go` and a
-  `VERSION` file naming a Go release, both real files rather than symlinks.
+- **No Go installation is on the daemon's `PATH`.** This normal case has no
+  daemon diagnostic, but invoking `go` still fails explicitly through the stub.
+- **The source is not a pinned Go installation.** It must have an executable
+  `bin/go` and a `VERSION` file naming a Go release, both real files rather than
+  symlinks.
+- **Every installation prefix is copied.** `/opt`, `/usr/local`, `/nix/store`,
+  `/snap`, and profile paths follow the same staging path; none receives a
+  recursive host-root grant.
 - **Free space is below the floor.** Staging refuses up front rather than filling the
   filesystem, and the message names both the free bytes and the floor, which is 4
   GiB. Reclaim space; do not lower the floor to make the message go away.
@@ -808,6 +811,50 @@ non-executable members such as `src` or `doc`, because re-hashing the whole 221.
 MiB tree on every seat launch would cost more than the copy itself. The
 consequence of a torn non-executable member is a visibly broken toolchain and a
 build error, not a silently wrong compiler.
+
+### Read-only seat runtime executable is unavailable
+
+Claude, Kimi, and Codex read-only seats run a copied runtime artifact from
+`<gitmoot-home>/runtimes`, never a recursive read grant over the operator's
+profile or package root. That directory is a SIBLING of `toolchains/`, not a
+child: the toolchain collector removes anything under `toolchains/` that is not
+a pinned toolchain, which would delete staged runtimes mid-launch.
+
+Every source read uses `openat2` with `RESOLVE_NO_SYMLINKS` and
+`RESOLVE_BENEATH`, so no component of a source path may be a symlink and nothing
+resolves outside the boundary. `os.Root` is not sufficient here: it refuses
+escapes out of a root but follows symlinks that stay inside one, so a member
+replaced by a link to a sibling credential was previously copied.
+
+An AMBIGUOUS SOURCE TREE IS REFUSED WHOLE rather than filtered, because file
+mode bits cannot distinguish a secret from a payload - a 0640 file under a 0750
+or setgid directory reads as group-readable, and a POSIX ACL shows up in the
+group bits. Staging therefore refuses, and publishes the runtime unavailable, if
+the boundary contains a symlink, a non-regular member, a setuid or setgid
+member, any POSIX ACL, a directory the world cannot traverse, or a member that
+is not world-readable. The resolved entrypoint itself is exempt from the
+world-readable rule only, so a runtime installed mode 0700 still runs.
+
+A SCRIPT RUNTIME GETS AN EXPLICIT LAUNCHER. Codex resolves to `codex.js` with
+`#!/usr/bin/env node`, so the engine stages that interpreter too and writes a
+launcher that execs the STAGED interpreter with the STAGED entrypoint. The
+kernel never resolves the entrypoint's original shebang, which would reach the
+operator's copy. A binary runtime gets a relative symlink instead, needing no
+shell.
+
+Every runtime class the engine can dispatch is staged, not only the seat's own.
+An absent runtime, an unresolvable interpreter, an ambiguous tree, or a kernel
+without `openat2` all resolve to engine-owned commands that print
+`gitmoot: runtime unavailable: no daemon-staged artifact exists` and exit 126.
+This preserves ordinary system commands through the inherited `PATH` without
+permitting a runtime name to fall through to its host copy. Failures also appear
+as `gitmoot: read-only seat runtime:` on daemon stderr.
+
+**One limit, stated rather than implied:** published runtime copies are not
+reclaimed. Each distinct content fingerprint publishes a new directory and
+nothing removes it, because safe reclamation needs to know which trees live
+seats are executing. `toolchain.Collect` has no production caller either, so the
+same is true of staged Go toolchains.
 
 ### Codex reviews report zero executed checks (`bwrap: setting up uid map`)
 

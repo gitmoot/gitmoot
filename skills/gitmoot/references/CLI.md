@@ -2463,13 +2463,24 @@ gitmoot job close <id> --decision approved|changes_requested|blocked|implemented
                  [--model <name>] [--input-tokens <n>] [--output-tokens <n>] [--json]
 
 # One-shot post-hoc: create an already-terminal job (open + close in one).
-gitmoot job record --agent <name> --repo owner/repo --type ask|review|implement \
+gitmoot job record (--agent <name> | --acting-role <role>) --repo owner/repo --type ask|review|implement \
                  --decision <decision> [--severity P0|P1|P2|P3] \
                  [--title "..."] [--summary "..."] [--task <id>] \
                  [--parent-job-id <id>] [--pr <n>] [--head-sha <sha>] \
                  [--branch <name>] [--model <name>] \
                  [--input-tokens <n>] [--output-tokens <n>] [--json]
 ```
+
+`--agent` and `--acting-role` are mutually exclusive and exactly one is required.
+Use `--agent` when a registered agent performed the work. Use `--acting-role` when
+it was done in session by an org role that is not a registered agent (#1718):
+roles and agents are separate namespaces, so recording an agent for role work
+would be a false statement about who acted. The role is validated against the
+configured org registry, and only its existence is checked -- availability and
+recycle enforcement are dispatch-time policies, while this command records work
+that has already happened. Attribution is then the role, and the merge gate still
+enforces independence against it: a reviewer may not approve work attributed to
+the identically named role.
 
 An `externally_driven` job is created directly in `running` (it never queues, so
 the daemon never claims or Delivers it — no runtime subprocess, no runtime-session

@@ -158,7 +158,7 @@ gitmoot job gates <job-id>
 gitmoot job gates clear <job-id> --need "<text>"|--all
 gitmoot job open --agent <name> --repo owner/repo --type ask|review|implement [--title "..."]
 gitmoot job close <job-id> --decision approved|changes_requested|blocked|implemented|failed [--severity P0|P1|P2|P3] [--summary "..."]
-gitmoot job record --agent <name> --repo owner/repo --type ask|review|implement --decision implemented [--severity P0|P1|P2|P3] [--summary "..."]
+gitmoot job record (--agent <name> | --acting-role <role>) --repo owner/repo --type ask|review|implement --decision implemented [--severity P0|P1|P2|P3] [--summary "..."]
 gitmoot report bug --job <job-id> --preview
 gitmoot report bug --job <job-id> --create --yes
 gitmoot lock list --repo owner/repo

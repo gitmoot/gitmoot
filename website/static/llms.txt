@@ -27,6 +27,7 @@ retryable and bounded by the gate `timeout` or 24h from the episode's start.
 - [Introduction](https://gitmoot.io/docs/intro): What Gitmoot is and when to use it.
 - [Install](https://gitmoot.io/docs/getting-started/install): Install and verify Gitmoot.
 - [Quick Start](https://gitmoot.io/docs/getting-started/quick-start): Ask an agent to install Gitmoot, register a repo, start a planner, and route work.
+- [Troubleshooting](https://gitmoot.io/docs/operations/troubleshooting): Diagnose daemon, job, runtime, sandbox, credential, and review failures, including daemon-owned Go/runtime staging and explicit exit-126 behavior for unavailable read-only-seat commands.
 - [PR Comment Workflow](https://gitmoot.io/docs/workflows/pr-comment-workflow): Route auditable work from GitHub comments — `/gitmoot` commands, bare `@agent` mentions, and resuming paused orchestrations.
 - [Planner And Goal Workflow](https://gitmoot.io/docs/workflows/planner-goal-workflow): Create structured plans and goal files; plan-gated implement holds implementation until a recorded plan is explicitly approved.
 - [Template Capture Workflow](https://gitmoot.io/docs/workflows/template-capture-workflow): Turn a current chat workflow into a reviewed reusable template, and back templates up to a GitHub repo (publish/pull).

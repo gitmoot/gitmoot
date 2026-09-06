@@ -58,7 +58,7 @@ func TestReviewFindingListReportsCorruptRelevanceKeys(t *testing.T) {
 	head := strings.Repeat("a", 40)
 	if _, err := store.RecordReviewFindingObservation(ctx, ReviewFindingObservation{
 		Repo: "owner/repo", PullRequest: 7, HeadSHA: head, ObserverJob: "review-1",
-		State: FindingOpen, Title: "t", File: "internal/run.go",
+		State: FindingOpen, Severity: "P2", Title: "t", File: "internal/run.go",
 		EvidenceKind: EvidenceExecuted, ExecutedCommands: []string{"probe"}, ExecutedCount: 1,
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
