@@ -907,8 +907,8 @@ func (e Engine) parkTaskAwaitingHumanMerge(ctx context.Context, ref taskRef, rea
 // dispatchFix is called inline from this arm, the FIX PASS - for an objection
 // nobody can show is stale. Withholding both from an objection that is
 // legitimately about the current head as far as any available evidence goes is a
-// liveness loss, which is why the unknowns admit; the approval side refuses the
-// mirror cases because withholding a merge fails safe.
+// liveness loss, which is why the unknowns admit; the approval side refuses its
+// mirror cases, and why it does is that arm's business, not this one's.
 //
 // THIS CODE MAKES NO CLAIM THAT ADMITTING IS MERGE-SAFE: the task state
 // participates in merge safety, and an admitted objection can race the gate's

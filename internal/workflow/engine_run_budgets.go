@@ -831,11 +831,9 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			// TestObjectionWithNoObservedPullRequestRowStillRequestsChanges, which
 			// states it as ordering and deliberately not as an enumeration.
 			//
-			// What differs between the two sides is the consequence of refusing:
-			// refusing an unconfirmable APPROVAL fails safe, because nothing merges
-			// while the doubt stands; refusing an objection withholds the
-			// conservative transition and the inline fix pass from a complaint that
-			// may well be about the current head. That is a LIVENESS argument and
+			// Refusing an objection withholds the conservative transition and the
+			// inline fix pass from a complaint that may well be about the current
+			// head. That is a LIVENESS argument and
 			// the only one this arm has: THIS CODE MAKES NO CLAIM THAT ADMITTING IS
 			// MERGE-SAFE. The task state participates in merge safety, and an
 			// admitted objection can race the gate's claim of it (gitmoot#1933).

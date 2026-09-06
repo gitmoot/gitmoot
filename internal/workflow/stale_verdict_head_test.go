@@ -70,8 +70,9 @@ func TestObjectionAtSupersededHeadTransitionsNothing(t *testing.T) {
 
 // THE PRESERVED ARM: an objection at the CURRENT head still transitions the task
 // exactly as before. This is the guard against "fixing" the stale case by
-// refusing objections generally - the failure mode that would leave a real
-// objection unable to stop a merge.
+// refusing objections generally, which would withhold the transition and the
+// inline fix pass from live complaints. What that costs a merge is not something
+// this test establishes.
 func TestObjectionAtCurrentHeadStillRequestsChanges(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -292,9 +293,6 @@ func TestStaleObjectionDispatchesNoFixLeg(t *testing.T) {
 // DelegationID + WorktreePath, i.e. the integration-worktree class
 // ensureReviewMatchesHead deliberately ADMITS - so it does not pin the
 // ordinary-CLI-headless variant either.
-//
-// Refusing a headless APPROVAL still fails safe, because nothing merges while the
-// doubt stands.
 func TestObjectionWithNoHeadStillRequestsChanges(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
