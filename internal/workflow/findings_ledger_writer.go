@@ -44,13 +44,23 @@ type reviewFindingWire struct {
 	// Ledger fields. A reviewer that has read the brief can CONTINUE a prior
 	// finding by citing its uid; absent that, mint-by-default creates a new
 	// finding and the prior one stays unobserved, which is the fail-safe.
-	ContinuesUID   string   `json:"continues_uid"`
-	State          string   `json:"state"`
-	RelevanceKeys  []string `json:"relevance_keys"`
-	EvidenceKind   string   `json:"evidence_kind"`
-	Locator        string   `json:"evidence_locator"`
-	Rationale      string   `json:"rationale"`
-	WithdrawReason string   `json:"withdraw_reason"`
+	ContinuesUID  string   `json:"continues_uid"`
+	State         string   `json:"state"`
+	RelevanceKeys []string `json:"relevance_keys"`
+	EvidenceKind  string   `json:"evidence_kind"`
+	Locator       string   `json:"evidence_locator"`
+	// LocatorAlias is the SAME field under the key the real verdict used, and it
+	// is measured rather than guessed: the #1936 instance
+	// (local-review-gm-review-opus-18d2a757546655c2) emitted
+	// `"locator":"internal/workflow/merge_gate.go: collectImplementerAttribution
+	// ... (~lines 1436-1449)"`, not `evidence_locator`. Reading only the
+	// canonical key left the very shape that issue was filed about unread - so
+	// the first head "fixed" #1936 against a schema no reviewer had sent. Same
+	// rule as every other alternate key here: read what reviewers actually
+	// write, invent nothing.
+	LocatorAlias   string `json:"locator"`
+	Rationale      string `json:"rationale"`
+	WithdrawReason string `json:"withdraw_reason"`
 	// Evidence is the REFUTATION-LENS finding shape (risk.go): a lens emits
 	// {lens,refuted,severity,confidence,evidence:"file:line - why"} and NO file
 	// field, so before this the key set came out EMPTY and such a finding could
@@ -238,7 +248,7 @@ func (e Engine) ledgerObservationWithDeclaredState(job db.Job, payload JobPayloa
 			// re-resolves the locator against the head via PathExistsAtHead and
 			// fails the discharge when it has vanished. A locator that is prose
 			// only yields "" here and still lands in QUOTED, now with an event.
-			pathFromLensEvidence(wire.Locator),
+			pathFromLensEvidence(wire.locator()),
 		),
 		Line:           int64(wire.Line),
 		RelevanceKeys:  wire.RelevanceKeys,
@@ -365,7 +375,7 @@ func (e Engine) ledgerObservationWithDeclaredState(job db.Job, payload JobPayloa
 		// is preserved as RATIONALE instead of destroying the row. Nothing is
 		// invented: both values came from the reviewer.
 		proseCitation := ""
-		if locator := strings.TrimSpace(wire.Locator); locator != "" {
+		if locator := strings.TrimSpace(wire.locator()); locator != "" {
 			if db.IsStructuralFindingLocator(locator) {
 				obs.EvidenceLocator = locator
 			} else {
@@ -614,4 +624,11 @@ func looksLikeRepoPath(path string) bool {
 		}
 	}
 	return true
+}
+
+// locator returns whichever key the reviewer used for its citation. The
+// canonical `evidence_locator` wins; `locator` is the alternate a real verdict
+// sent.
+func (w reviewFindingWire) locator() string {
+	return firstNonEmptyLedgerText(w.Locator, w.LocatorAlias)
 }

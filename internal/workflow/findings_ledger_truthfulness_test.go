@@ -451,3 +451,52 @@ func TestAdvanceJobStillRecordsAFindingWhoseContentIsItsRationale(t *testing.T) 
 		t.Fatalf("evidence locator = %q, want path:line built from the declared file", obs.EvidenceLocator)
 	}
 }
+
+// THE REAL #1936 SHAPE, keyed as the actual verdict keyed it. Job
+// local-review-gm-review-opus-18d2a757546655c2 emitted `"locator"`, not
+// `"evidence_locator"`, so reading only the canonical key left the exact
+// instance the issue was filed about unread - my first head fixed #1936
+// against a schema no reviewer had sent. Copied from the stored payload.
+func TestAdvanceJobReadsTheLocatorKeyTheRealVerdictUsed(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "gm-review-opus", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	head := strings.Repeat("9", 40)
+
+	insertCompletedJob(t, store, db.Job{ID: "review-realkey", Agent: "gm-review-opus", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-rk", PullRequest: 1946, HeadSHA: head,
+		TaskID: "task-rk", ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "approved", Summary: "three continuations",
+			Evidence: EvidenceStaticOnly,
+			Findings: []json.RawMessage{
+				json.RawMessage(`{"id":"K1","severity":"P2","state":"answered","locator":"internal/workflow/merge_gate.go: collectImplementerAttribution matching agent/role switch (~lines 1436-1449)","detail":"static read of the merge tree confirms the conditional-write fix survives"}`),
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "review-realkey"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+	observations, err := store.ListReviewFindingObservations(ctx, "gitmoot/gitmoot", 1946)
+	if err != nil {
+		t.Fatalf("ListReviewFindingObservations returned error: %v", err)
+	}
+	if len(observations) != 1 {
+		t.Fatalf("ledger holds %d row(s), want 1", len(observations))
+	}
+	obs := observations[0]
+	if obs.File != "internal/workflow/merge_gate.go" {
+		t.Fatalf("file = %q; the `locator` key was not read, so the real #1936 shape is still dropped", obs.File)
+	}
+	if obs.EvidenceKind != db.EvidenceStatic || obs.State != db.FindingAnswered {
+		t.Fatalf("row = kind %s / state %s, want STATIC/answered: the declared disposition must survive", obs.EvidenceKind, obs.State)
+	}
+	if obs.EvidenceLocator != "internal/workflow/merge_gate.go" {
+		t.Fatalf("evidence locator = %q, want the bare path the re-arm can resolve", obs.EvidenceLocator)
+	}
+	if !strings.Contains(obs.Rationale, "collectImplementerAttribution") {
+		t.Fatalf("rationale = %q, want the reviewer's prose citation preserved", obs.Rationale)
+	}
+}
