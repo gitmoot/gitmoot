@@ -227,8 +227,19 @@ func (e Engine) ledgerObservationWithDeclaredState(job db.Job, payload JobPayloa
 		// alternates. `evidence` is last for detail because it is also the lens
 		// shape parsed for a path below, so a lens finding keeps its locator and
 		// still contributes its prose instead of writing an empty row.
-		Title:  firstNonEmptyLedgerText(strings.TrimSpace(wire.Title), strings.TrimSpace(wire.Summary)),
-		Detail: firstNonEmptyLedgerText(strings.TrimSpace(wire.Detail), strings.TrimSpace(wire.Body), strings.TrimSpace(wire.Evidence)),
+		Title: firstNonEmptyLedgerText(strings.TrimSpace(wire.Title), strings.TrimSpace(wire.Summary)),
+		// The unparseable prose citation lands here, LAST, and never in the
+		// rationale (#1941 f5). It is reviewer text, so dropping it would be the
+		// #1932 defect again - but it describes WHERE the reviewer looked, not
+		// WHY an obligation is answered, so it cannot stand in for a rationale.
+		// When the reviewer also wrote a detail that wins, and the citation's
+		// only unique content, the path, is already captured in File.
+		Detail: firstNonEmptyLedgerText(
+			strings.TrimSpace(wire.Detail),
+			strings.TrimSpace(wire.Body),
+			strings.TrimSpace(wire.Evidence),
+			unstructuredLocatorText(wire.locator()),
+		),
 		File: firstNonEmptyLedgerText(
 			strings.TrimSpace(wire.File),
 			pathFromLensEvidence(wire.Evidence),
@@ -326,7 +337,7 @@ func (e Engine) ledgerObservationWithDeclaredState(job db.Job, payload JobPayloa
 		obs.EvidenceKind = db.EvidenceExecuted
 		obs.ExecutedCommands = commands
 		obs.ExecutedCount = int64(len(commands))
-	case obs.File != "":
+	case obs.File != "" && strings.TrimSpace(wire.Rationale) != "":
 		// DECLARED static_only, OR DECLARED NOTHING. It falls through to STATIC
 		// rather than to QUOTED, and that choice is measured rather than
 		// preferred. THREE THINGS POINT THE SAME WAY:
@@ -374,18 +385,18 @@ func (e Engine) ledgerObservationWithDeclaredState(job db.Job, payload JobPayloa
 		// So a structural locator replaces the derived one, and a prose citation
 		// is preserved as RATIONALE instead of destroying the row. Nothing is
 		// invented: both values came from the reviewer.
-		proseCitation := ""
-		if locator := strings.TrimSpace(wire.locator()); locator != "" {
-			if db.IsStructuralFindingLocator(locator) {
-				obs.EvidenceLocator = locator
-			} else {
-				proseCitation = locator
-			}
+		if locator := strings.TrimSpace(wire.locator()); locator != "" && db.IsStructuralFindingLocator(locator) {
+			obs.EvidenceLocator = locator
 		}
-		// The prose citation ranks above title/detail because it is what the
-		// reviewer offered as the thing it READ, which is exactly what a STATIC
-		// rationale is for. An explicit `rationale` still wins over both.
-		obs.Rationale = firstNonEmptyLedgerText(wire.Rationale, proseCitation, obs.Title, obs.Detail, "reported by a review that declared no executed checks")
+		// THE RATIONALE IS THE REVIEWER'S, VERBATIM, OR THERE IS NO STATIC ROW
+		// (#1941 f5). This used to fall back to the prose citation, then the
+		// title, then the detail, then a string this writer authored - and the
+		// store demands a rationale for a STATIC discharge, so those fallbacks
+		// were manufacturing the very assertion the bar exists to require. A
+		// rationale says WHY an obligation is answered; only the reviewer can
+		// say that. Generic finding prose is not that sentence, and neither is
+		// "reported by a review that declared no executed checks".
+		obs.Rationale = strings.TrimSpace(wire.Rationale)
 	default:
 		// No locator to cite and no declared execution: recordable for context
 		// and incapable of discharging anything, which is the honest floor.
@@ -393,9 +404,10 @@ func (e Engine) ledgerObservationWithDeclaredState(job db.Job, payload JobPayloa
 		obs.State = db.FindingOpen
 		obs.ExecutedCommands = commands
 	}
-	if obs.EvidenceKind == db.EvidenceStatic && strings.TrimSpace(obs.Rationale) == "" {
-		obs.Rationale = "reported by a static review with no executed checks"
-	}
+	// The second synthesis site, deleted for the same reason. A STATIC row is
+	// now only reachable WITH an explicit rationale, so there is nothing left to
+	// fill in; filling it in was what let the store's bar be satisfied by text
+	// the reviewer never wrote.
 	if obs.State == db.FindingWithdrawn && obs.WithdrawReason == "" {
 		// The store refuses a reasonless withdrawal; a review asking for one
 		// without saying why is downgraded to OPEN rather than rejected, because
@@ -611,19 +623,23 @@ func looksLikeRepoPath(path string) bool {
 	if path == "" {
 		return false
 	}
-	if strings.Contains(path, "/") {
-		return true
-	}
-	dot := strings.LastIndex(path, ".")
-	if dot <= 0 || dot == len(path)-1 {
-		return false
-	}
-	for _, r := range path[dot+1:] {
-		if !((r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z')) {
-			return false
-		}
-	}
-	return true
+	// AN EXACT PARSE, NOT A DOTTED-TOKEN HEURISTIC (#1941 f6). Two rounds of
+	// tightening a heuristic failed the same way: "any dotted token" invented
+	// "v1.2", and "any dotted token with an alphabetic extension" invented
+	// "v1.beta". The class is prose that happens to contain a dot, and no
+	// extension rule decides it - a denylist of version spellings least of all.
+	//
+	// A repo-relative locator contains a DIRECTORY SEPARATOR. That is checkable
+	// rather than suggestive; it accepts every locator in the measured evidence
+	// (apps/web/src/views/LandingView.vue, internal/workflow/merge_gate.go) and
+	// rejects version labels and prose BY CONSTRUCTION rather than by
+	// recognising their spelling. Existence is still not claimed here - that is
+	// resolved under the head being judged.
+	//
+	// Cost, stated rather than hidden: a root-level file cited without a
+	// directory is refused. No observed verdict has done that, and refusing is
+	// the safe direction for a value that can authorise a discharge.
+	return strings.Contains(path, "/")
 }
 
 // locator returns whichever key the reviewer used for its citation. The
@@ -631,4 +647,15 @@ func looksLikeRepoPath(path string) bool {
 // sent.
 func (w reviewFindingWire) locator() string {
 	return firstNonEmptyLedgerText(w.Locator, w.LocatorAlias)
+}
+
+// unstructuredLocatorText returns the reviewer's citation when it is NOT a
+// structural locator, so prose is preserved as detail rather than vanishing.
+// A structural locator is already stored as the locator itself.
+func unstructuredLocatorText(locator string) string {
+	locator = strings.TrimSpace(locator)
+	if locator == "" || db.IsStructuralFindingLocator(locator) {
+		return ""
+	}
+	return locator
 }

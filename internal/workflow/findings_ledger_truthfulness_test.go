@@ -35,7 +35,7 @@ func TestAdvanceJobAcceptsAPathShapedLocatorAsStaticEvidence(t *testing.T) {
 			Findings: []json.RawMessage{
 				// The #1936 shape, verbatim in structure: a declared answer whose
 				// only locator is a prose-tailed path.
-				json.RawMessage(`{"id":"L1","severity":"P2","state":"answered","evidence_locator":"internal/workflow/merge_gate.go: collectImplementerAttribution matching agent/role switch (~lines 1436-1449)","title":"attribution switch","detail":"read the switch at this head"}`),
+				json.RawMessage(`{"id":"L1","severity":"P2","state":"answered","evidence_locator":"internal/workflow/merge_gate.go: collectImplementerAttribution matching agent/role switch (~lines 1436-1449)","title":"attribution switch","detail":"read the switch at this head","rationale":"read the agent/role switch at this head; the conditional write is present"}`),
 				// A reviewer that DECLARES quoted evidence and also declares an
 				// answer. QUOTED can never discharge, so the answer cannot stand -
 				// and that reversal must be audible rather than silent. (A finding
@@ -91,8 +91,13 @@ func TestAdvanceJobAcceptsAPathShapedLocatorAsStaticEvidence(t *testing.T) {
 	if strings.Contains(l1.EvidenceLocator, " ") {
 		t.Fatalf("[L1] evidence locator %q carries prose; the store would refuse it", l1.EvidenceLocator)
 	}
-	if !strings.Contains(l1.Rationale, "collectImplementerAttribution") {
-		t.Fatalf("[L1] rationale = %q, want the reviewer's prose citation preserved", l1.Rationale)
+	// The rationale is the REVIEWER'S, verbatim - not the citation, not the
+	// title, not the detail, and not a sentence this writer authored (#1941 f5).
+	if l1.Rationale != "read the agent/role switch at this head; the conditional write is present" {
+		t.Fatalf("[L1] rationale = %q, want the reviewer's own rationale verbatim", l1.Rationale)
+	}
+	if strings.Contains(l1.Rationale, "~lines 1436-1449") {
+		t.Fatalf("[L1] the prose citation was promoted into the rationale: %q", l1.Rationale)
 	}
 	if l1.ExecutedCount != 0 {
 		t.Fatalf("[L1] executed count = %d, want 0: nothing was executed and STATIC must never imply it", l1.ExecutedCount)
@@ -180,8 +185,12 @@ func TestAdvanceJobReadsSeverityAndPathFromABareStringFinding(t *testing.T) {
 	if obs.File != "apps/web/src/views/LandingView.vue" {
 		t.Fatalf("file = %q, want the path parsed from the prose", obs.File)
 	}
-	if obs.EvidenceKind != db.EvidenceStatic {
-		t.Fatalf("evidence kind = %q, want STATIC now that a locator exists", obs.EvidenceKind)
+	// A BARE STRING CARRIES NO RATIONALE KEY, so it can never be STATIC under
+	// #1941 f5: a discharge needs an explicit reviewer rationale and prose
+	// cannot be promoted into one. It records fully, loudly and discharges
+	// nothing, which is the honest floor for a finding whose only form is text.
+	if obs.EvidenceKind != db.EvidenceQuoted {
+		t.Fatalf("evidence kind = %q, want QUOTED: a bare string supplies no rationale, so it cannot discharge", obs.EvidenceKind)
 	}
 	if strings.HasPrefix(obs.Title, "P2 ") {
 		t.Fatalf("title = %q, want the severity token consumed rather than left in the prose", obs.Title)
@@ -349,7 +358,7 @@ func TestAdvanceJobRefusesToDischargeOnAManufacturedRationale(t *testing.T) {
 				// [N2] The same locator WITH reviewer prose. This one is a legitimate
 				// static reading and must still be recorded as STATIC, so the guard
 				// cannot be satisfied by refusing everything.
-				json.RawMessage(`{"id":"N2","severity":"P1","state":"answered","evidence_locator":"does/not/exist.go","detail":"read the call site at this head and the guard is present"}`),
+				json.RawMessage(`{"id":"N2","severity":"P1","state":"answered","evidence_locator":"does/not/exist.go","detail":"read the call site at this head and the guard is present","rationale":"read the call site at this head and the guard is present"}`),
 			},
 		},
 	})
@@ -471,7 +480,7 @@ func TestAdvanceJobReadsTheLocatorKeyTheRealVerdictUsed(t *testing.T) {
 			Decision: "approved", Summary: "three continuations",
 			Evidence: EvidenceStaticOnly,
 			Findings: []json.RawMessage{
-				json.RawMessage(`{"id":"K1","severity":"P2","state":"answered","locator":"internal/workflow/merge_gate.go: collectImplementerAttribution matching agent/role switch (~lines 1436-1449)","detail":"static read of the merge tree confirms the conditional-write fix survives"}`),
+				json.RawMessage(`{"id":"K1","severity":"P2","state":"answered","locator":"internal/workflow/merge_gate.go: collectImplementerAttribution matching agent/role switch (~lines 1436-1449)","detail":"static read of the merge tree confirms the conditional-write fix survives","rationale":"static read of the merge tree at this head confirms the conditional-write fix survives"}`),
 			},
 		},
 	})
@@ -496,7 +505,177 @@ func TestAdvanceJobReadsTheLocatorKeyTheRealVerdictUsed(t *testing.T) {
 	if obs.EvidenceLocator != "internal/workflow/merge_gate.go" {
 		t.Fatalf("evidence locator = %q, want the bare path the re-arm can resolve", obs.EvidenceLocator)
 	}
-	if !strings.Contains(obs.Rationale, "collectImplementerAttribution") {
-		t.Fatalf("rationale = %q, want the reviewer's prose citation preserved", obs.Rationale)
+	if obs.Rationale != "static read of the merge tree at this head confirms the conditional-write fix survives" {
+		t.Fatalf("rationale = %q, want the reviewer's own rationale verbatim", obs.Rationale)
+	}
+}
+
+// #1941 f4, P1: THE SAME-HEAD DISCHARGE MUST NOT BYPASS LOCATOR RESOLUTION.
+// dischargedAtHead ran BEFORE answeredIsMandatory and skipped any same-head
+// non-QUOTED row, so a discharge recorded at the head being judged was accepted
+// without its locator ever being resolved. The reviewer's probe continued a
+// mandatory P1 citing does/not/exist.go, AdvanceJob persisted it STATIC/answered,
+// EnsureLedgerObligationsObserved accepted it, and PathExistsAtHead ran ZERO
+// times.
+//
+// The resolver's invocation count is OBSERVABLE here on purpose: "the obligation
+// was refused" could be true for other reasons, and the specific claim is that
+// the existence check now runs at the same head.
+//
+// KILLS: restoring the early same-head discharge (re-adding STATIC rows to
+// dischargedAtHead, value consumed so the mutant compiles).
+func TestSameHeadDischargeResolvesTheLocatorBeforeAccepting(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "g7-review", []string{"review"}, "gitmoot/gitmoot")
+	head := strings.Repeat("7", 40)
+	uid := "gitmoot/gitmoot#1947-f1"
+
+	// A prior MANDATORY open finding, recorded at an earlier head.
+	if _, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
+		Repo: "gitmoot/gitmoot", PullRequest: 1947, HeadSHA: strings.Repeat("6", 40),
+		ObserverJob: "seed-review", SourceJob: "seed-review", Severity: "P1",
+		State: db.FindingOpen, EvidenceKind: db.EvidenceQuoted,
+		Title: "prior defect", Detail: "the guard is missing",
+	}); err != nil {
+		t.Fatalf("seeding the prior finding: %v", err)
+	}
+	seeded, err := store.ListReviewFindingObservations(ctx, "gitmoot/gitmoot", 1947)
+	if err != nil || len(seeded) != 1 {
+		t.Fatalf("seed rows = %d err=%v", len(seeded), err)
+	}
+	priorUID := seeded[0].FindingUID
+	_ = uid
+
+	// A continuation AT THE HEAD BEING JUDGED, declaring an answer and citing a
+	// path that does not exist, with an explicit rationale so it clears the
+	// store's STATIC bar on its own terms.
+	engine := testEngine(store)
+	insertCompletedJob(t, store, db.Job{ID: "review-samehead", Agent: "g7-review", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-sh", PullRequest: 1947, HeadSHA: head,
+		TaskID: "task-sh", ReviewRound: "review-2",
+		Result: &AgentResult{
+			Decision: "approved", Summary: "answering the prior finding",
+			Evidence: EvidenceStaticOnly,
+			Findings: []json.RawMessage{json.RawMessage(
+				`{"id":"S1","severity":"P1","state":"answered","continues_uid":"` + priorUID +
+					`","evidence_locator":"does/not/exist.go","rationale":"read does/not/exist.go at this head and the guard is present"}`)},
+		},
+	})
+	if err := engine.AdvanceJob(ctx, "review-samehead"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+
+	// The row must exist and be STATIC/answered: this test is about the READER,
+	// so the writer's output has to be the shape the reviewer produced.
+	rows, err := store.ListReviewFindingObservations(ctx, "gitmoot/gitmoot", 1947)
+	if err != nil {
+		t.Fatalf("ListReviewFindingObservations returned error: %v", err)
+	}
+	answered := false
+	for _, obs := range rows {
+		if obs.State == db.FindingAnswered && obs.EvidenceKind == db.EvidenceStatic {
+			answered = true
+		}
+	}
+	if !answered {
+		t.Fatalf("no STATIC/answered row persisted at the judged head; rows=%d - the reader is not being exercised", len(rows))
+	}
+
+	// THE RESOLVER IS COUNTED. Zero invocations is the defect, regardless of the
+	// outcome that follows it.
+	calls := 0
+	missing := LedgerScope{PathExistsAtHead: func(_ context.Context, _ string, _ string) (bool, error) {
+		calls++
+		return false, nil
+	}}
+	err = EnsureLedgerObligationsObserved(ctx, store, "gitmoot/gitmoot", 1947, head, missing)
+	if calls == 0 {
+		t.Fatal("PathExistsAtHead was invoked ZERO times at the judged head: the same-head short-circuit is still bypassing locator resolution")
+	}
+	if err == nil {
+		t.Fatal("an answer citing a nonexistent locator discharged its obligation at the head being judged")
+	}
+
+	// POSITIVE CONTROL, so the guard is not satisfied by refusing everything: the
+	// same row with the path present legitimately answers at its own head.
+	present := LedgerScope{PathExistsAtHead: func(context.Context, string, string) (bool, error) { return true, nil }}
+	if err := EnsureLedgerObligationsObserved(ctx, store, "gitmoot/gitmoot", 1947, head, present); err != nil {
+		t.Fatalf("a same-head answer whose cited path EXISTS was refused: %v", err)
+	}
+}
+
+// #1941 f5's NEGATIVE CONTROL, and it is here because its absence let a mutant
+// survive: re-synthesizing the rationale from title/detail/generated text broke
+// nothing I had written, because every fixture that reached STATIC supplied a
+// rationale of its own. A guard whose violation no test can observe is not
+// guarded.
+//
+// The reviewer's own probe was exactly this shape: detail supplied, rationale
+// absent, detail read back as the persisted rationale, and the store's STATIC
+// bar satisfied by text the reviewer never wrote as a rationale.
+//
+// KILLS: restoring any promotion into Rationale - proseCitation, Title, Detail,
+// or the generated "reported by a review that declared no executed checks".
+func TestAdvanceJobNeverPromotesProseIntoTheRationale(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "g7-review", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	head := strings.Repeat("8", 40)
+
+	insertCompletedJob(t, store, db.Job{ID: "review-nopromote", Agent: "g7-review", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-np", PullRequest: 1948, HeadSHA: head,
+		TaskID: "task-np", ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "approved", Summary: "detail but no rationale",
+			Evidence: EvidenceStaticOnly,
+			Findings: []json.RawMessage{
+				// [P1] A declared answer with a real file, a real detail and NO
+				// rationale. The detail must not become the rationale, so the row
+				// cannot be STATIC and cannot discharge.
+				json.RawMessage(`{"id":"P1","severity":"P1","state":"answered","file":"internal/workflow/findings_ledger.go","line":198,"title":"same-head ordering","detail":"read dischargedAtHead at this head"}`),
+				// [P2] The positive control: the identical finding WITH an explicit
+				// rationale is STATIC and answered, so the guard cannot be satisfied
+				// by refusing every static row.
+				json.RawMessage(`{"id":"P2","severity":"P1","state":"answered","file":"internal/workflow/findings_ledger.go","line":198,"title":"same-head ordering","detail":"read dischargedAtHead at this head","rationale":"resolved the ordering at this head: STATIC rows now reach answeredIsMandatory"}`),
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "review-nopromote"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+	observations, err := store.ListReviewFindingObservations(ctx, "gitmoot/gitmoot", 1948)
+	if err != nil {
+		t.Fatalf("ListReviewFindingObservations returned error: %v", err)
+	}
+	byLabel := map[string]db.ReviewFindingObservation{}
+	for _, obs := range observations {
+		byLabel[obs.RoundLabel] = obs
+	}
+
+	p1 := byLabel["P1"]
+	if p1.EvidenceKind == db.EvidenceStatic {
+		t.Fatalf("[P1] recorded STATIC with rationale %q; the reviewer supplied NO rationale, so this is prose promoted into a discharge claim", p1.Rationale)
+	}
+	if strings.TrimSpace(p1.Rationale) != "" {
+		t.Fatalf("[P1] rationale = %q, want empty: the writer must not author the reviewer's explanation", p1.Rationale)
+	}
+	if p1.State != db.FindingOpen {
+		t.Fatalf("[P1] state = %q, want open: a finding with no explicit rationale discharges nothing", p1.State)
+	}
+	// The detail itself must survive - refusing the discharge must not drop the
+	// reviewer's words, which is the other half of the invariant.
+	if p1.Detail != "read dischargedAtHead at this head" {
+		t.Fatalf("[P1] detail = %q, want the reviewer's detail preserved verbatim", p1.Detail)
+	}
+
+	p2 := byLabel["P2"]
+	if p2.EvidenceKind != db.EvidenceStatic || p2.State != db.FindingAnswered {
+		t.Fatalf("[P2] kind %s / state %s, want STATIC/answered: an explicit rationale is exactly what STATIC requires", p2.EvidenceKind, p2.State)
+	}
+	if p2.Rationale != "resolved the ordering at this head: STATIC rows now reach answeredIsMandatory" {
+		t.Fatalf("[P2] rationale = %q, want the reviewer's own sentence verbatim", p2.Rationale)
 	}
 }
