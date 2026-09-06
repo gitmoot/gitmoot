@@ -2053,9 +2053,17 @@ sum(bucket_ms)           == covered_ms + overlap_ms
   construction because it is `wall - covered`, never `wall - sum`.
 - `overlap_ms` — concurrent command time, reported rather than absorbed.
 - `bucket_ms` / `bucket_count` — per-command measured time classified as
-  `test`, `build`, `vcs`, `mixed` or `other`. Classification reads every
-  segment and consumes wrapper arguments, so `timeout 25m go test ./...` is
-  `test` and `git commit -m "go test is slow"` is `vcs`.
+  `test`, `build`, `vcs`, `mixed`, `unknown` or `other`. Classification reads
+  every segment and consumes wrapper arguments, so `timeout 25m go test ./...`
+  is `test` and `git commit -m "go test is slow"` is `vcs`.
+- `unknown` is a **refusal, not a leftover**. The classifier is a cheap lexer
+  with a declared grammar (quoting, escapes, sequencing operators and redirect
+  forms, comments, wrapper prefixes); anything outside it — substitutions,
+  backquotes, process substitution, subshells, arithmetic commands, heredocs,
+  `;;`, an unterminated quote or a trailing line continuation — yields
+  `unknown` rather than a confident bucket. Its time still counts in
+  `covered_ms`. `other` means "understood, matched no phase"; `unknown` means
+  "not classifiable by this lexer".
 - `commands`, `in_flight` (still running at close — their time is counted),
   `unpaired` (a result whose call id was never opened), `tool_events`
   (non-shell tool activity such as `file_change`), `id_collisions`, and

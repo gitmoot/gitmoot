@@ -969,7 +969,36 @@ func TestPhaseInstrumentClassifiesThroughTheProductionPath(t *testing.T) {
 		{"escaped ampersand", `go test ./... -run TestA\&TestB`, phaseBucketTest},
 		{"ampersand in a comment", "go test ./...  # A&B matters", phaseBucketTest},
 		{"escaped ampersand in an env assignment", `PROBE=A\&B go test ./...`, phaseBucketTest},
-		{"heredoc data is not a command", "go test ./... <<EOF\nA&B\nEOF", phaseBucketTest},
+		// Heredocs are OUTSIDE the declared grammar (ruling 123815): the body
+		// and its delimiter are data this lexer does not track, so it refuses
+		// rather than classifying the prefix confidently. Previously this
+		// asserted `test`, which was a guess that happened to be right.
+		{"heredoc is unsupported, not guessed", "go test ./... <<EOF\nA&B\nEOF", phaseBucketUnknown},
+		// REPRESENTATIVE UNSUPPORTED CONTEXTS - each must refuse, and each is a
+		// construct where the command word itself can differ from the text.
+		{"command substitution", "go test $(go list ./...)", phaseBucketUnknown},
+		{"parameter expansion", "${TOOL} test ./...", phaseBucketUnknown},
+		{"bare parameter", "$TOOL test ./...", phaseBucketUnknown},
+		{"arithmetic expansion", "go test -parallel $((N*2)) ./...", phaseBucketUnknown},
+		{"backquote substitution", "go test `go list ./...`", phaseBucketUnknown},
+		{"process substitution", "diff <(go list ./...) want.txt", phaseBucketUnknown},
+		{"subshell", "(cd repo && go test ./...)", phaseBucketUnknown},
+		{"arithmetic command", "((count++)) && go test ./...", phaseBucketUnknown},
+		{"herestring", "go test ./... <<<data", phaseBucketUnknown},
+		{"case terminator", "case x in a) go test ./... ;; esac", phaseBucketUnknown},
+		{"unterminated quote", `go test -run "TestA`, phaseBucketUnknown},
+		{"trailing line continuation", "go test ./... \\", phaseBucketUnknown},
+		{"substitution inside double quotes", `go test -run "$NAME"`, phaseBucketUnknown},
+		// SUPPORTED CASES MUST RETAIN THEIR BUCKETS - a boundary that swallowed
+		// ordinary commands would be a demotion of the signal, not a refusal.
+		// A CONSEQUENCE WORTH STATING RATHER THAN HIDING: Codex wraps every
+		// command in DOUBLE quotes, where expansions are live, so a '$'
+		// anywhere in a Codex command refuses - even one that a real shell
+		// would treat as literal because no valid expansion follows it.
+		// Deciding that would require implementing expansion grammar, which is
+		// exactly what ruling 123815 forbids, so the lexer refuses instead.
+		{"dollar refuses under the codex wrapper", `go test ./... -run 'TestA$'`, phaseBucketUnknown},
+		{"parens inside single quotes stay classifiable", `git commit -m 'fix (again)'`, phaseBucketVCS},
 		// And the operators must still work through the same wrapper.
 		// A backslash inside SINGLE quotes is literal data in POSIX shells, not
 		// an escape. Treating it as an escape swallows the closing quote, so
@@ -1014,6 +1043,68 @@ func TestPhaseInstrumentClassifiesThroughTheProductionPath(t *testing.T) {
 			if profile.BucketCount[tc.want] != 1 {
 				t.Fatalf("through the production path %q landed in %v, want %s",
 					tc.command, profile.BucketCount, tc.want)
+			}
+		})
+	}
+}
+
+// kimiToolLines renders a kimi exchange, whose Bash arguments arrive as JSON
+// with the command as a BARE string - no outer double-quote wrapper. That is
+// the production path on which the UNQUOTED half of the grammar boundary is
+// reachable at all: Codex double-quotes everything, so its fixture can only
+// exercise the in-double-quotes arm.
+func kimiToolLines(callID, command string) (string, string) {
+	args, _ := json.Marshal(map[string]any{"command": command})
+	call, _ := json.Marshal(map[string]any{
+		"role": "assistant",
+		"tool_calls": []any{map[string]any{
+			"id": callID, "type": "function",
+			"function": map[string]any{"name": "bash", "arguments": string(args)},
+		}},
+	})
+	result, _ := json.Marshal(map[string]any{
+		"role": "tool", "tool_call_id": callID, "content": "done",
+	})
+	return string(call) + "\n", string(result) + "\n"
+}
+
+// TestPhaseInstrumentRefusesUnsupportedSyntaxOnABareKimiPayload closes the one
+// gap the Codex fixture cannot reach. Kimi sends the command unquoted inside
+// JSON, so an unquoted substitution is seen by the boundary's unquoted arm -
+// and a mutant that stops flagging it survives every Codex-wrapped case.
+func TestPhaseInstrumentRefusesUnsupportedSyntaxOnABareKimiPayload(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		command string
+		want    string
+	}{
+		{"unquoted command substitution refuses", "go test $(go list ./...)", phaseBucketUnknown},
+		{"unquoted parameter expansion refuses", "${TOOL} test ./...", phaseBucketUnknown},
+		{"plain command still classifies", "go test ./internal/cli/", phaseBucketTest},
+		{"redirect idiom still classifies", "go test ./... 2>&1", phaseBucketTest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			paths := config.PathsForHome(home)
+			store := seedInstrumentJob(t, paths, "kimipath", "kimi-reviewer", "kimi")
+			handle := openInstrumentedTranscript(t, home, "kimipath", "kimi", store)
+
+			start, end := kimiToolLines("k1", tc.command)
+			if _, err := handle.Write([]byte(start)); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(20 * time.Millisecond)
+			if _, err := handle.Write([]byte(end)); err != nil {
+				t.Fatal(err)
+			}
+			if err := handle.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+
+			profile := readPhaseProfile(t, store, "kimipath")
+			assertProfileIdentities(t, profile)
+			if profile.BucketCount[tc.want] != 1 {
+				t.Fatalf("bare kimi payload %q landed in %v, want %s", tc.command, profile.BucketCount, tc.want)
 			}
 		})
 	}

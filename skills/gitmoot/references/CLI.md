@@ -2341,8 +2341,8 @@ run CONCURRENTLY, so their durations do not partition anything:
   partition false exactly when overlap occurred.
 - `bucket_ms` / `bucket_count` — each command's OWN measured time, classified as
   `test` (`go test`), `build` (`go build`, `vet`, `generate`, `gofmt`), `vcs`
-  (`git`, `gh`), `mixed`, or `other`. Under overlap these sum to more than
-  `covered_ms`, and `overlap_ms` is the difference.
+  (`git`, `gh`), `mixed`, `unknown`, or `other`. Under overlap these sum to more
+  than `covered_ms`, and `overlap_ms` is the difference.
 - `commands` / `unpaired` / `tool_events` — shell commands measured; tool
   results whose call id was never seen (they contribute no time, and are
   reported so a stream this cannot follow stays visible); and non-shell tool
@@ -2366,6 +2366,20 @@ run CONCURRENTLY, so their durations do not partition anything:
   has zero commands however long the job took. An opaque profile is a blind
   spot, NOT a measurement that the job spent all its time outside commands -
   exclude those rows from any decomposition rather than averaging them in.
+
+**`unknown` is a REFUSAL, not a leftover.** The classifier is a cheap lexer, not
+a shell parser, and its supported grammar is declared in
+`internal/cli/review_phase_grammar.go`: quoting (single literal, double with
+backslash escapes), escapes, the sequencing operators and redirect forms,
+comments, and wrapper prefixes. Anything outside it — command/parameter/
+arithmetic substitution, backquotes, process substitution, subshells, arithmetic
+commands, heredocs and herestrings, `;;`, an unterminated quote or a trailing
+line continuation — yields `unknown` rather than a confident bucket. Its time is
+still counted in `covered_ms`, so a refusal narrows the claim without losing the
+measurement. Treat `other` as "understood, matched no phase" and `unknown` as
+"not classifiable by this lexer"; averaging them together reintroduces exactly
+the confidently-wrong attribution the boundary exists to prevent.
+
 
 Classification reads EVERY segment of a command, not the leading token:
 `go test ./... && go build ./...` is `mixed` rather than being billed wholly to

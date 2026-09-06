@@ -31,6 +31,13 @@ const (
 	phaseBucketVCS   = "vcs"
 	phaseBucketMixed = "mixed"
 	phaseBucketOther = "other"
+	// phaseBucketUnknown is CONSERVATIVE REFUSAL, not a residual category.
+	// `other` means "a command this lexer understood, matching no phase";
+	// `unknown` means "this lexer does not implement the shell context this
+	// command uses, so any bucket would be a guess" (ruling 123815, option B).
+	// `other` is a measurement; `unknown` is an admission. Its time is still
+	// counted in covered_ms, so refusing to classify never demotes the signal.
+	phaseBucketUnknown = "unknown"
 )
 
 // Coverage tells a reader whether an EMPTY decomposition is a measurement or a
@@ -119,7 +126,14 @@ func classifyPhaseCommand(command string) string {
 const maxWrapperRecursion = 3
 
 func classifyPhaseCommandDepth(command string, depth int) string {
-	segments := splitCommandSegments(extractToolCommand(command))
+	text := extractToolCommand(command)
+	if _, unsupported := unsupportedShellContext(text); unsupported {
+		// CONSERVATIVE REFUSAL (ruling 123815, option B): the lexer's declared
+		// grammar lives in review_phase_grammar.go, and anything outside it
+		// must not receive a confident bucket.
+		return phaseBucketUnknown
+	}
+	segments := splitCommandSegments(text)
 	seen := ""
 	for _, segment := range segments {
 		bucket := classifyCommandSegment(segment, depth)
