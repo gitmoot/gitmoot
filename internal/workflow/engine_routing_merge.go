@@ -137,9 +137,34 @@ func (e Engine) dispatchFix(ctx context.Context, reviewer string, payload JobPay
 	return nil
 }
 
+// autoFixOwner names the agent that will RUN the auto-fix, so it must return
+// something dispatchable.
+//
+// AN EXPLICIT ACTING ROLE THAT CANNOT BE RESOLVED IS A HARD STOP, AND THAT IS
+// DELIBERATE, NOT A LIMITATION. My first attempt at #1718 made it fall through to
+// attribution-based resolution, and
+// TestEngineAdvanceReviewChangesRequestedDoesNotBypassUnresolvableActingRole
+// caught it: falling back reassigns ownership the coordinator EXPLICITLY set, to
+// the task implementer or a payload default it did not choose. The refusal is the
+// feature.
+//
+// WHAT WAS ACTUALLY WRONG (#1718) IS THE DIAGNOSTIC, NOT THE BLOCK. Returning the
+// role unchanged made it JobRequest.Agent, so the stop surfaced three layers later
+// from an agent-subscription check as `agent "gitmoot" is not subscribed` - a
+// sentence that is false in its own terms, since gitmoot is not an unsubscribed
+// agent but an org ROLE, a different namespace entirely. An operator reading it
+// looks for a subscription that was never the problem. The stop now happens here,
+// where the cause is known, and says so.
 func (e Engine) autoFixOwner(ctx context.Context, payload JobPayload) (string, error) {
 	if role := strings.TrimSpace(payload.ActingOrgRole); role != "" {
-		return role, nil
+		if _, err := e.Store.GetAgent(ctx, role); err == nil {
+			return role, nil
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+		return "", fmt.Errorf(
+			"auto-fix ownership unresolved: acting org role %q is not a registered agent, so it cannot own a fix; org roles and agents are separate namespaces. Assign an implementing agent to this branch or dispatch the fix explicitly - the engine will not reassign an ownership you set",
+			role)
 	}
 	jobs, err := e.Store.ListJobs(ctx)
 	if err != nil {
@@ -153,12 +178,26 @@ func (e Engine) autoFixOwner(ctx context.Context, payload JobPayload) (string, e
 		return "", errors.New("auto-fix ownership unresolved: a matching implement job has no agent")
 	}
 	agents := make([]string, 0, len(evidence.agents))
-	for agent := range evidence.agents {
-		agents = append(agents, agent)
+	roles := make([]string, 0, len(evidence.agents))
+	for name, identity := range evidence.agents {
+		// A ROLE IS ATTRIBUTABLE BUT NOT DISPATCHABLE. Keeping the two apart here is
+		// the whole point: an in-session role can own the credit for the work and
+		// still be an impossible executor for the fix.
+		if identity.FromActingRole {
+			roles = append(roles, name)
+			continue
+		}
+		agents = append(agents, name)
 	}
 	sort.Strings(agents)
+	sort.Strings(roles)
 	switch len(agents) {
 	case 0:
+		if len(roles) > 0 {
+			return "", fmt.Errorf(
+				"auto-fix ownership unresolved: task %s was implemented in session by org role %s, which is not a dispatchable agent; name an implementing agent for the fix instead",
+				payload.TaskID, strings.Join(roles, " "))
+		}
 		return "", fmt.Errorf("auto-fix ownership unresolved: %s", evidence.failureReason())
 	case 1:
 		return agents[0], nil

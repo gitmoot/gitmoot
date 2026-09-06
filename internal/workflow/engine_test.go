@@ -2437,8 +2437,22 @@ func TestEngineAdvanceReviewChangesRequestedDoesNotBypassUnresolvableActingRole(
 
 	err := engine.AdvanceJob(ctx, "review-with-role")
 	var blocked BlockedError
-	if !errors.As(err, &blocked) || !strings.Contains(blocked.Reason, `agent "gitmoot" is not subscribed`) {
+	if !errors.As(err, &blocked) {
 		t.Fatalf("AdvanceJob error = %v, want acting-role BlockedError", err)
+	}
+	// THE MESSAGE MOVED, THE INVARIANT DID NOT (#1718). This previously pinned
+	// `agent "gitmoot" is not subscribed`, which came from an agent-subscription
+	// check three layers downstream and was false in its own terms: gitmoot is not
+	// an unsubscribed agent, it is an org ROLE, a separate namespace. An operator
+	// reading it hunted a subscription that was never the problem. The stop now
+	// happens where the cause is known. What this test defends - that an explicit
+	// but unresolvable acting role is NEVER silently replaced by the task
+	// implementer or a payload default - is asserted below and unchanged.
+	if !strings.Contains(blocked.Reason, "acting org role \"gitmoot\" is not a registered agent") {
+		t.Fatalf("blocked reason = %q, want the role/agent namespace cause named at its source", blocked.Reason)
+	}
+	if strings.Contains(blocked.Reason, "is not subscribed") {
+		t.Errorf("blocked reason = %q, still describes a role as an unsubscribed agent", blocked.Reason)
 	}
 	if allocations != 0 {
 		t.Fatalf("fix worktree allocations = %d, want zero", allocations)

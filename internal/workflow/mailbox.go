@@ -1974,13 +1974,35 @@ func (p JobPayload) prompt(action string) prompts.JobPrompt {
 	}
 }
 
+// validateJobRequest is the STRICT form, used by every dispatch path: a job that
+// will be enqueued must name an agent, because an agent is the only thing that can
+// run it. The externally-driven session path uses validateExternalJobRequest
+// instead, which accepts an org role as attribution for work already done (#1718).
+// The split is deliberate: relaxing THIS function would let a dispatch be created
+// with nobody to execute it.
 func validateJobRequest(request JobRequest) error {
+	if strings.TrimSpace(request.Agent) == "" {
+		return errors.New("job agent is required")
+	}
+	return validateJobRequestExceptActor(request)
+}
+
+// validateExternalJobRequest permits attribution to name an acting ORG ROLE in
+// place of an agent, and is scoped to session records - work the caller already
+// performed, which is never enqueued.
+func validateExternalJobRequest(request JobRequest) error {
+	if strings.TrimSpace(request.Agent) == "" && strings.TrimSpace(request.ActingOrgRole) == "" {
+		return errors.New("job agent or acting org role is required")
+	}
+	return validateJobRequestExceptActor(request)
+}
+
+// validateJobRequestExceptActor holds every rule that does not concern WHO acts.
+func validateJobRequestExceptActor(request JobRequest) error {
 	action := strings.TrimSpace(request.Action)
 	switch {
 	case strings.TrimSpace(request.ID) == "":
 		return errors.New("job id is required")
-	case strings.TrimSpace(request.Agent) == "":
-		return errors.New("job agent is required")
 	case strings.TrimSpace(request.Action) == "":
 		return errors.New("job action is required")
 	case strings.TrimSpace(request.Repo) == "":
