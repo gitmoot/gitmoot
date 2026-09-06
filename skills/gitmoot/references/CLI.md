@@ -2588,13 +2588,24 @@ would read as a retry long overdue.
 `gitmoot job show` prints the same reason as `why_stuck:` (and `next_retry_at:`,
 `suggested_action:`) rather than the `WHY:` column form used by `job list`.
 
-The sibling cause is surfaced on the same pass (#1553): a job withheld because
-another job holds the **branch lock** for its repo and branch renders `WHY:
-withheld: branch <branch> held by <owner>`. It is read from `branch_locks`, not
-from `resource_locks`, because resource-lock keys are `runtime:<rt>:<ref>` and
-`checkout-mutation:<absolute path>` and encode no repository segment — matching
-them against a repo name attributed unrelated holders. No retry time is shown
-for this cause: a branch lock carries no lease, so naming one would invent it.
+The sibling cause is surfaced on the same pass (#1553), but it is **never
+inferred from a lock table**: a job withheld while another job works the repo is
+rendered from the deferral the daemon actually recorded for it. The pre-flight
+emits `branch <branch> is locked by <owner>`, which is classified as the
+`checkout_contention` blocker class and persisted as both the payload class and a
+`blocker_deferred` event naming the branch and the holder, so it renders through
+the two forms above like any other deferral.
+
+Neither `resource_locks` nor `branch_locks` is consulted, and that is a
+deliberate reversal of two earlier attempts. Resource-lock keys are
+`runtime:<rt>:<ref>` and `checkout-mutation:<absolute path>` and encode no
+repository segment, so matching them against a repo name attributed unrelated
+holders. Reading `branch_locks` instead was the wrong inference rather than the
+wrong table: a branch lock records who owns a LANE, not who is withholding a
+given job, and the lock is acquired with the agent as owner BEFORE that agent's
+own job is enqueued — so an ordinary queued job was reported as withheld by its
+own agent. A queued row with no recorded deferral is therefore left silent
+rather than given a holder no lock row can prove.
 
 `gitmoot job watch` surfaces a hold while it waits, as `HOLD: <reason>` with the
 optional `(next retry <RFC3339>)` and `[action: …]` suffixes, re-checked on every

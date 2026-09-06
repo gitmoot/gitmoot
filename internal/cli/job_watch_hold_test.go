@@ -610,3 +610,116 @@ func TestJobWatchTranscriptNoLogDelegatesAndInheritsSuppression(t *testing.T) {
 		})
 	}
 }
+
+// TestJobWatchSurfacesTheWithheldCauseDirectly is the DIRECT observable
+// withheld-watch assertion required by directive 124112: #1887 names both the
+// quota-deferred and the repo-withheld cause, and asserting the withheld half
+// "should render" through shared loadStuckReason is an inference, not evidence.
+//
+// It is observed here through the real watch renderer. The cause it asserts is
+// the CAUSAL one - the daemon pre-flight emits "branch %s is locked by %s"
+// (internal/cli/workflow.go:1283) and job_blocker_checkout.go persists it as the
+// checkout_contention BlockerClass - because #1943's review proved the previous
+// version of this test pinned an INVENTED rendering read out of a branch-lock
+// lane row. That test was deleted; this replaces it on the same surface.
+func TestJobWatchSurfacesTheWithheldCauseDirectly(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	seedSessionAgentRepo(t, store)
+	// The withheld shape: a repo-contention hold with NO retry time recorded,
+	// which is the measured common case (42 of 55 rows).
+	seedQueuedJob(t, store, "withheld-watch", workflow.JobPayload{
+		Repo:         "owner/repo",
+		Branch:       "task-21",
+		PullRequest:  21,
+		BlockerClass: "checkout_contention",
+	})
+	store.Close()
+
+	out, _ := watchUntil(t, home, "withheld-watch", "HOLD:", false)
+	if !strings.Contains(out, "checkout_contention") {
+		t.Fatalf("job watch output = %q, want the withheld cause named on the watch surface", out)
+	}
+	// The absent retry must read as unknown here too, never as a zero time.
+	if !strings.Contains(out, "retry time unknown") {
+		t.Fatalf("job watch output = %q, want the absent retry rendered unknown", out)
+	}
+	if strings.Contains(out, "0001-01-01") || strings.Contains(out, "1970-01-01") {
+		t.Fatalf("job watch output = %q, must never format an absent retry as a zero time", out)
+	}
+}
+
+// TestJobWatchStillReportsALaterRetryOfTheSameClass is the regression for
+// #1943's second-round F4: the first fix latched suppression on the CLASS and
+// never cleared it, so after HOLD spoke for attempt 1 every later
+// blocker_deferred event of that class was swallowed and a distinct
+// `attempt 2/3` retry vanished from a live watch.
+//
+// Suppression is now consumed by the single event it pairs with, so this asserts
+// BOTH halves on one watch: the paired attempt-1 event stays suppressed, and the
+// distinct attempt-2 event is still reported.
+func TestJobWatchStillReportsALaterRetryOfTheSameClass(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	seedSessionAgentRepo(t, store)
+	seedQueuedJob(t, store, "retry-job", workflow.JobPayload{
+		Repo:            "owner/repo",
+		Branch:          "task-5",
+		PullRequest:     5,
+		BlockerClass:    "checkout_contention",
+		BlockerRetryAt:  time.Now().UTC().Add(30 * time.Second).Format(time.RFC3339Nano),
+		BlockerAttempts: 1,
+	})
+
+	var out syncBuffer
+	done := make(chan int, 1)
+	go func() {
+		done <- runJobWatch([]string{"retry-job", "--home", home, "--poll", "20ms"}, &out, &out)
+	}()
+	deadline := time.Now().Add(8 * time.Second)
+	for !strings.Contains(out.String(), "HOLD:") {
+		if time.Now().After(deadline) {
+			t.Fatalf("HOLD never printed from the payload; output = %q", out.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// The event PAIRED with the hold just rendered: must stay suppressed.
+	if err := store.AddJobEvent(context.Background(), db.JobEvent{
+		JobID:   "retry-job",
+		Kind:    blockerDeferredEventKind,
+		Message: "checkout_contention: attempt 1/3, retry at 2026-09-06T17:00:00Z: branch task-5 is locked by other-agent",
+	}); err != nil {
+		t.Fatalf("AddJobEvent attempt 1: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	// A DISTINCT later retry of the SAME class: must be reported.
+	if err := store.AddJobEvent(context.Background(), db.JobEvent{
+		JobID:   "retry-job",
+		Kind:    blockerDeferredEventKind,
+		Message: "checkout_contention: attempt 2/3, retry at 2026-09-06T17:05:00Z: branch task-5 is locked by other-agent",
+	}); err != nil {
+		t.Fatalf("AddJobEvent attempt 2: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	if _, err := store.TransitionJobState(context.Background(), "retry-job",
+		string(workflow.JobQueued), string(workflow.JobSucceeded)); err != nil {
+		t.Fatalf("TransitionJobState: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(8 * time.Second):
+		t.Fatalf("watch did not exit; output = %q", out.String())
+	}
+	store.Close()
+
+	got := out.String()
+	if strings.Contains(got, "attempt 1/3") {
+		t.Fatalf("the event paired with the rendered HOLD was reported too - stated twice; output = %q", got)
+	}
+	if !strings.Contains(got, "attempt 2/3") {
+		t.Fatalf("a DISTINCT later retry of the same class was swallowed by latched suppression; output = %q", got)
+	}
+}

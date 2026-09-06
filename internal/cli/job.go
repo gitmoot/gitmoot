@@ -567,6 +567,15 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, s
 		// deferral. Only a CHANGE is news.
 		lastHold := ""
 		var held stuckReason
+		// pendingSuppress names the class of a deferral this loop has ALREADY
+		// rendered as HOLD, and it is CONSUMED by the one event it pairs with
+		// rather than latched (#1943, second round). Latching on the class was a
+		// real defect: a class-only test that never cleared suppressed EVERY later
+		// blocker_deferred event of that class, so a distinct `attempt 2/3` retry
+		// vanished from a live watch entirely. Suppressing exactly one event per
+		// rendered hold keeps the split-write window closed without hiding the
+		// retries that follow it.
+		pendingSuppress := ""
 		for {
 			job, err := store.GetJob(context.Background(), jobID)
 			if err != nil {
@@ -589,9 +598,12 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, s
 					// and the event lands on a later poll. Guarding only on the current
 					// poll's events cannot retract a HOLD already emitted, so one
 					// deferral was still stated twice under two labels (#1943 F4). Once
-					// HOLD has spoken for a class, the matching event is redundant.
-					if held.Class != "" && event.Kind == blockerDeferredEventKind &&
-						strings.Contains(event.Message, held.Class) {
+					// HOLD has spoken for a deferral, the event it pairs with is
+					// redundant - and ONLY that one: consuming the match is what lets a
+					// later retry of the same class still be reported.
+					if pendingSuppress != "" && event.Kind == blockerDeferredEventKind &&
+						strings.Contains(event.Message, pendingSuppress) {
+						pendingSuppress = ""
 						continue
 					}
 					fmt.Fprintf(stdout, "%s\t%s\n", event.Kind, event.Message)
@@ -620,14 +632,19 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, s
 			// two different labels. It also disproves the comment that used to sit
 			// here claiming an operator attaching afterwards "sees nothing" - the
 			// events replay, so they see it. What they genuinely cannot see is a hold
-			// that lives ONLY in the payload or the branch lock, which is #1887's
-			// actual case and the only one this line now speaks for.
+			// that lives ONLY in the payload, which is #1887's actual case and the
+			// only one this line now speaks for.
 			if _, hasReason := latestReasonEvent(events); !hasReason {
 				if reason := loadStuckReason(store, job); !reason.empty() {
 					held = reason
 					line := holdLine(reason)
 					if line != lastHold {
 						lastHold = line
+						// Arm the one-event suppression for the deferral just
+						// announced. Re-arming on each CHANGE is what makes a later
+						// retry work: attempt 2 renders its own HOLD and then consumes
+						// its own paired event.
+						pendingSuppress = reason.Class
 						if !jsonOutput {
 							fmt.Fprintln(stdout, line)
 						}
