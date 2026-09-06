@@ -377,7 +377,7 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 		// make the next genuine failure - on a path where the write did NOT land -
 		// read identically. An incomplete join is deliberately NOT an error: the
 		// write has committed, and the goroutine's own timeouts still bound it.
-		waitForEventRuleWork(paths.Home, store, sessionRuleWorkJoinBound)
+		waitForEventRuleWork(paths.Home, store, sessionRuleWorkPerRuleBound)
 		return nil
 	}); err != nil {
 		fmt.Fprintf(stderr, "job record: %v\n", err)

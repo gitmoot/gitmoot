@@ -4,12 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/events"
@@ -170,4 +172,160 @@ func (w *blockingEventWake) calls() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.seen
+}
+
+// #1942 review, P2. evaluateRules processes matching rules SERIALLY, each
+// spending its own herdr probe plus prompt, so a join sized for ONE such
+// sequence expired mid-configuration as soon as a second observer rule matched -
+// and the command then closed the store while rule two was in flight, producing
+// `org event wake counter increment failed ... sql: database is closed`. Same
+// operator-facing string as #1938, one layer out.
+//
+// The join is therefore a PROGRESS watchdog: it extends while rules keep
+// completing. This test pins that with two matching observer rules and a
+// per-rule window far smaller than the total work, so a total-budget
+// implementation cannot pass it.
+func TestMultipleObserverRulesExtendTheJoinInsteadOfReleasingTheStore(t *testing.T) {
+	home, store := seedTwoObserverRuleHome(t)
+	defer store.Close()
+	ctx := context.Background()
+
+	const perRule = 150 * time.Millisecond
+	wake := &pacedEventWake{delay: perRule}
+	sink := &eventRuleSink{store: store, home: home, wake: wake}
+
+	sink.Emit(ctx, events.Event{Type: events.EventJobFinished, JobID: "session-implement-impl-3"})
+
+	// The window MUST sit between one rule's cost and the total: wider than a
+	// single rule so honest progress is not punished, narrower than both rules so
+	// a TOTAL-budget implementation expires here and only a progress watchdog
+	// survives. 4*perRule would have passed either way, which is how the first
+	// version of this test failed to pin the fix at all.
+	if !sink.waitForPendingRuleWork(3 * perRule / 2) {
+		t.Fatalf("join abandoned multi-rule work: %d of 2 rules completed, so closing the store here is what #1942's P2 measured", sink.progress.Load())
+	}
+	if got := sink.progress.Load(); got < 2 {
+		t.Fatalf("progress = %d, want both matching rules evaluated before the store is released", got)
+	}
+	if sink.storeReleased() {
+		t.Fatal("store was marked released even though the work completed")
+	}
+}
+
+// The other half of the same guard: when work genuinely wedges, the join gives
+// up AND the residual work must stop asking the store anything, rather than
+// discovering a closed handle inside a counter write.
+func TestWedgedRuleWorkIsAbandonedBeforeTheStoreIsTouched(t *testing.T) {
+	home, store := seedTwoObserverRuleHome(t)
+	defer store.Close()
+	ctx := context.Background()
+
+	release := make(chan struct{})
+	wake := &pacedEventWake{block: release}
+	sink := &eventRuleSink{store: store, home: home, wake: wake}
+	sink.Emit(ctx, events.Event{Type: events.EventJobFinished, JobID: "session-implement-impl-4"})
+
+	if sink.waitForPendingRuleWork(200 * time.Millisecond) {
+		t.Fatal("join reported success while the wake was wedged")
+	}
+	if !sink.storeReleased() {
+		t.Fatal("giving up did not mark the store released, so residual rule work would still query it")
+	}
+	close(release)
+	if !sink.waitForPendingRuleWork(30 * time.Second) {
+		t.Fatal("residual work never unwound after release")
+	}
+	// THE GUARD IS THE POINT: rule one was in flight when the store was released,
+	// so rule two must never be evaluated at all. Without the released check the
+	// loop proceeds to the next rule and reaches its counter write - which is the
+	// closed-store failure #1942's P2 measured, one rule later.
+	if got := wake.prompts(); got != 1 {
+		t.Fatalf("prompts sent = %d, want 1: rule two was evaluated after the store was released", got)
+	}
+}
+
+// pacedEventWake reports herdr available and makes each prompt cost a known
+// delay, so a test can size work against the join's window. With block set it
+// wedges instead, which is the abandon case.
+type pacedEventWake struct {
+	delay time.Duration
+	block chan struct{}
+	mu    sync.Mutex
+	sent  int
+}
+
+func (w *pacedEventWake) Available(context.Context) bool { return true }
+
+func (w *pacedEventWake) AgentPrompt(ctx context.Context, _ string, _ string, _ string) (bool, bool, error) {
+	w.mu.Lock()
+	w.sent++
+	w.mu.Unlock()
+	if w.block != nil {
+		select {
+		case <-w.block:
+		case <-ctx.Done():
+		}
+		// DELIVERED, deliberately: a non-delivery makes evaluateRules return after
+		// this rule, which would let the loop exit for a reason unrelated to the
+		// release guard and leave that guard unpinned. Reporting delivery keeps the
+		// loop alive so the guard is the only thing that can stop rule two.
+		return true, false, nil
+	}
+	select {
+	case <-time.After(w.delay):
+	case <-ctx.Done():
+	}
+	return true, false, nil
+}
+
+func (w *pacedEventWake) ResolvePaneByLabel(context.Context, string) (string, bool) {
+	return "w1:p1", true
+}
+
+func (w *pacedEventWake) prompts() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.sent
+}
+
+// seedTwoObserverRuleHome writes the org config the wake path needs (a pane per
+// role, or resolveRolePane skips every rule and the serial loop never runs) plus
+// two matching observer rules, which is the supported multi-rule configuration
+// #1942's P2 was measured against.
+func seedTwoObserverRuleHome(t *testing.T) (string, *db.Store) {
+	t.Helper()
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configBody := `
+[org.roles."owner"]
+scope=["*"]
+pane="w1:p0"
+[org.roles."watcher-a"]
+parent="owner"
+scope=["*"]
+pane="w1:pa"
+[org.roles."watcher-b"]
+parent="owner"
+scope=["*"]
+pane="w1:pb"
+`
+	if err := os.WriteFile(paths.ConfigFile, []byte(configBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, role := range []string{"watcher-a", "watcher-b"} {
+		if err := store.AddEventRule(context.Background(), db.EventRule{
+			ID: "wake-" + role, OnKind: "job-terminal", WakeRole: role,
+			Scope: db.EventRuleScopeObserver, Enabled: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return home, store
 }

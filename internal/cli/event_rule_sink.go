@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -64,18 +65,39 @@ type eventRuleSink struct {
 	// and waitForPendingRuleWork bounds the join itself, so a hung wake delays a
 	// command by at most that bound rather than pinning it to herdr's liveness.
 	pending sync.WaitGroup
+
+	// progress counts rules whose wake attempt has finished. The join watches it
+	// instead of trusting a single wall-clock budget, because evaluateRules
+	// processes matching rules SERIALLY and each one may spend its own probe plus
+	// prompt: a bound sized for one sequence expires mid-config the moment a
+	// second observer rule matches (#1942 review, P2). Watching progress makes the
+	// join scale with the work actually outstanding rather than with a guess about
+	// how much work a supported config contains.
+	progress atomic.Uint64
+
+	// released records that the store owner has stopped waiting and is about to
+	// close the store. Rule work checks it before every store access, so residual
+	// work reports "abandoned" instead of reaching a closed handle - the failure
+	// mode this whole change exists to remove, one layer out.
+	released atomic.Bool
 }
 
 // waitForPendingRuleWork blocks until every detached rule goroutine spawned by
-// Emit has returned, or until the bound elapses. It reports whether the join
-// completed, so a caller can distinguish "rule work finished" from "rule work is
-// still outstanding and the store is about to close anyway".
+// Emit has returned, and reports whether that happened before it gave up.
 //
-// The bound exists because the store's owner must not be hostage to a wake: the
-// detached path probes herdr (eventRuleProbeTimeout) and may prompt it
-// (eventRuleWakeTimeout), so the join is sized to cover one such sequence and
-// then give up rather than hold a CLI open indefinitely.
-func (s *eventRuleSink) waitForPendingRuleWork(bound time.Duration) bool {
+// It is a PROGRESS watchdog, not a total budget. perRuleBound sizes ONE rule's
+// worst case - herdr probe plus one prompt plus the bounded counter write - and
+// the wait extends for as long as rules keep completing. A supported multi-rule
+// config therefore finishes with the store still open, while genuinely wedged
+// work is abandoned after one idle bound instead of holding a one-shot command
+// open for as many multiples of that bound as someone happened to configure.
+//
+// Giving up MARKS THE STORE RELEASED before returning. Cancelling the work would
+// not be enough on its own: an in-flight iteration can already be past its
+// cancellation check and about to touch the store, which would convert the
+// closed-store warning into a cancelled-context one rather than removing it. The
+// flag is what makes residual work stop asking the store anything at all.
+func (s *eventRuleSink) waitForPendingRuleWork(perRuleBound time.Duration) bool {
 	if s == nil {
 		return true
 	}
@@ -84,12 +106,27 @@ func (s *eventRuleSink) waitForPendingRuleWork(bound time.Duration) bool {
 		s.pending.Wait()
 		close(done)
 	}()
-	select {
-	case <-done:
-		return true
-	case <-time.After(bound):
-		return false
+	for {
+		before := s.progress.Load()
+		select {
+		case <-done:
+			return true
+		case <-time.After(perRuleBound):
+			if s.progress.Load() != before {
+				// A rule completed inside the window, so the work is advancing and
+				// the store is still needed. Extend rather than abandon it.
+				continue
+			}
+			s.released.Store(true)
+			return false
+		}
 	}
+}
+
+// storeReleased reports whether the store owner has stopped waiting. Rule work
+// must consult it immediately before any store access on the detached path.
+func (s *eventRuleSink) storeReleased() bool {
+	return s != nil && s.released.Load()
 }
 
 func (s *eventRuleSink) Emit(ctx context.Context, event events.Event) {
@@ -279,6 +316,14 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 	replyHandled := false
 	addressedReplyHandled := false
 	for _, rule := range rules {
+		// #1942 review P2: rules are processed SERIALLY, each spending its own
+		// probe/prompt budget, so a command that has stopped waiting can release the
+		// store while later rules are still to come. Stop before touching it rather
+		// than discovering it closed inside a counter write.
+		if s.storeReleased() {
+			slog.Warn("org event wake abandoned", "job_id", event.JobID, "reason", "store released before this rule was evaluated")
+			return nil
+		}
 		if !rule.Enabled || !containsEventRuleKind(kinds, rule.OnKind) || !eventRuleMatches(rule.MatchFilter, event) || !eventRuleMatchesAddressee(rule, event) {
 			continue
 		}
@@ -362,6 +407,10 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 			slog.Info("org event wake not delivered", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "delivered", false)
 			return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, "agent prompt was not delivered", errors.New("agent prompt was not delivered"))
 		}
+		// One rule's wake attempt is finished. The join watches this counter, so
+		// recording it here is what lets a multi-rule config extend the wait
+		// instead of being abandoned on a bound sized for a single rule.
+		s.progress.Add(1)
 		// A coalesced reply batch still gives its addressed target one attempt per
 		// window. Observer rules are independent copies and do not consume that
 		// target attempt.
