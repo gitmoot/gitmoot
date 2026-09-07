@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/github"
 )
 
 // #1531: the merge gate's independence check compared reviewer and implementer
@@ -138,5 +139,59 @@ func seedFamilyAgent(t *testing.T, store *db.Store, name string, runtime string)
 		Capabilities: []string{"review", "implement"},
 	}); err != nil {
 		t.Fatalf("UpsertAgent(%s): %v", name, err)
+	}
+}
+
+// THE GATE-LEVEL DISCRIMINATOR, and the test the issue actually asked for: "a
+// firing test where reviewer and implementer have DIFFERENT NAMES and the SAME
+// family, asserting the gate REFUSES".
+//
+// It is the PR #1527 shape end to end through Evaluate, with a real merge client
+// that would perform the merge if the gate let it. The unit tests above cannot
+// serve as a before/after because the helper they call does not exist on base;
+// this one does, so it measures behaviour rather than compilation.
+func TestPolicyMergeGateRefusesSameFamilyApprovalEndToEnd(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	// Same family, different names: the exact PR #1527 pairing.
+	seedFamilyAgent(t, store, "wave-impl", "codex")
+	seedFamilyAgent(t, store, "g7-review", "codex")
+
+	payload := JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-9", PullRequest: 9,
+		HeadSHA: "head123", TaskID: "task-9", ReviewRound: "review-1",
+	}
+	implementPayload := payload
+	implementPayload.ReviewRound = ""
+	implementPayload.EffectiveRuntime = "codex"
+	implementPayload.Result = &AgentResult{Decision: "implemented", Summary: "implemented"}
+	insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: "wave-impl", Type: "implement"}, implementPayload)
+
+	reviewPayload := payload
+	reviewPayload.EffectiveRuntime = "codex"
+	reviewPayload.Result = &AgentResult{Decision: "approved", Summary: "approved"}
+	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "g7-review", Type: "review"}, reviewPayload)
+
+	mergeable := true
+	gh := &fakeMergeGateGitHub{
+		pr: github.PullRequest{
+			Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+			HeadSHA: "head123", Mergeable: &mergeable,
+		},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+		checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+	}
+	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if decision.Merged || len(gh.merges) != 0 {
+		t.Fatalf("the gate MERGED a head whose only approval came from the implementer's own runtime family: decision=%+v merges=%+v", decision, gh.merges)
+	}
+	if !strings.Contains(decision.Reason.Render(), "same family as implementer") {
+		t.Fatalf("decision reason = %q, want it to name the family collision", decision.Reason.Render())
 	}
 }
