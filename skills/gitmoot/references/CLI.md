@@ -657,6 +657,23 @@ backoff is on. Set `max_concurrent` (e.g. `6`) and/or a small `min_interval`
 dropped — they queue/delay. `gitmoot daemon status` shows the configured budget
 (`github limiter: max_concurrent=… min_interval=… secondary_backoff=… conditional_requests=… calls_per_hour_warn=…`).
 
+The **primary** limit is a different failure and now reports itself as one. When
+a call fails on primary exhaustion, Gitmoot re-issues that same request once with
+headers and reports the window its own response named: the resource, how empty it
+is, the reset timestamp and the remaining wait, wrapped around the original `gh`
+text. Waiting is the only remedy, because a primary window carries no
+`Retry-After` and cannot be shortened.
+
+It probes the **failed request**, never `GET /rate_limit`, and that is measured
+rather than stylistic. On one credential and one host, seconds apart,
+`/rate_limit` reported core `4999/5000 used=1` while a real core request returned
+403 with `remaining=0 used=5000`, and their resets were thirteen minutes apart;
+minutes later it reported a completely fresh `5000/5000 used=0` while real calls
+were still refused, and the 403 header's reset was accurate throughout. **Do not
+use `/rate_limit` as a precondition**: it reads full while every real call fails.
+A secondary hit is deliberately not probed, since it answers to `Retry-After` and
+already pauses process-wide.
+
 After `idle_grace_ticks` consecutive successful polls in which every conditional
 read is a 304, a repo's GitHub poll cadence decays to 2x and then up to
 `idle_max_multiplier` (default `4`; `1` disables decay). Any response-body miss,
