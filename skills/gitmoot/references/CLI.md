@@ -1657,8 +1657,13 @@ weekly-quota rejection marks that role `unavailable` until the provider's
 stated reset time. `org status` prints `⚠ UNAVAILABLE`, `reason=quota`, and the
 UTC reset instant in the role detail; `org chart` appends the same warning, and
 their JSON rows expose `provider_state: "unavailable"`,
-`unavailable_reason`, and `unavailable_until`. New operator dispatches to the
-role are refused and already-queued jobs for it stay held. The incident sends
+`unavailable_reason`, and `unavailable_until`. Enforcement is scoped to the runtime that hit the
+wall (#1641): new operator dispatches to the role are refused, and already-queued
+jobs for it stay held, only when the job's selected runtime is the walled one, so
+a Claude wall never blocks the role's Codex or Kimi work. A per-job `--runtime`
+override decides this, in both directions. An incident with no recorded runtime
+(written before per-runtime attribution) still holds the whole role, and an
+unrecognized recorded or selected runtime refuses rather than dispatches. The incident sends
 one best-effort direct wake to the role's configured parent, then clears at the
 reset instant or on that role's first subsequent successful Claude-runtime job,
 whichever happens first. Success on another runtime cannot clear the Claude
@@ -2583,6 +2588,67 @@ deferral usually needs a human (a dirty or wrong-head checkout), the row/`job
 show` also carries a `suggested_action` naming the concrete fix. `gitmoot doctor`
 proactively validates `gh auth` (with an actionable remediation hint) and the
 Claude runtime token so a bad credential is caught before a job stalls on it.
+
+A `queued` job whose reason is already recorded no longer renders as a bare
+`queued` row (#1887), and **which form you see depends on whether a
+reason-bearing event exists**, because the event is the more authoritative
+signal:
+
+- When the classifier deferred the job it wrote a `blocker_deferred` event, and
+  that event is rendered: `WHY: blocked-operational: <class>: attempt <n>/<max>`.
+  This is the common case for a real runtime deferral.
+- When the hold exists only in the payload — no reason-bearing event available —
+  the payload is read directly and rendered `WHY: deferred (<class>)`, with the
+  recorded earliest retry as `(next retry <RFC3339>)` and, when the deferral
+  usually needs a human, `[action: …]`.
+
+**A row whose `blocker_retry_at` is absent renders `deferred (<class>), retry
+time unknown` and leaves `next_retry_at` empty; it never shows a zero time.**
+Absence is the common case on at least one path, and a formatted empty timestamp
+would read as a retry long overdue.
+
+`gitmoot job show` prints the same reason as `why_stuck:` (and `next_retry_at:`,
+`suggested_action:`) rather than the `WHY:` column form used by `job list`.
+
+The sibling cause is surfaced on the same pass (#1553), but it is **never
+inferred from a lock table**: a job withheld while another job works the repo is
+rendered from the deferral the daemon actually recorded for it. The pre-flight
+emits `branch <branch> is locked by <owner>`, which is classified as the
+`checkout_contention` blocker class and persisted as both the payload class and a
+`blocker_deferred` event naming the branch and the holder, so it renders through
+the two forms above like any other deferral.
+
+Neither `resource_locks` nor `branch_locks` is consulted, and that is a
+deliberate reversal of two earlier attempts. Resource-lock keys are
+`runtime:<rt>:<ref>` and `checkout-mutation:<absolute path>` and encode no
+repository segment, so matching them against a repo name attributed unrelated
+holders. Reading `branch_locks` instead was the wrong inference rather than the
+wrong table: a branch lock records who owns a LANE, not who is withholding a
+given job, and the lock is acquired with the agent as owner BEFORE that agent's
+own job is enqueued — so an ordinary queued job was reported as withheld by its
+own agent. A queued row with no recorded deferral is therefore left silent
+rather than given a holder no lock row can prove.
+
+`gitmoot job watch` surfaces a hold while it waits, as `HOLD: <reason>` with the
+optional `(next retry <RFC3339>)` and `[action: …]` suffixes, re-checked on every
+poll so a hold that begins after the watch attached is still shown. The line is
+reprinted only when the hold **changes**. In the default event mode the watcher
+already replays every job event, so `HOLD:` is emitted only when no
+reason-bearing event exists — otherwise the deferral would be stated twice under
+two labels. `job watch --transcript` has TWO paths and they differ, so the guarantee is
+qualified: with a retained log it enters `transcript.Follow` and renders log
+lines rather than job events, and the hold is printed there in every case
+because no event can have spoken for it. With NO retained log it prints
+`transcript unavailable; showing job events` and DELEGATES to event watch,
+inheriting that mode's behavior exactly - including the reason-event
+suppression above, so a deferral that already has a `blocker_deferred` event
+appears as the event and not as `HOLD:`.
+
+`gitmoot job watch --json` carries the last hold observed during the watch as
+`held_reason`, `held_next_retry_at` and `held_suggested_action`. They are named
+for that distinction deliberately: the JSON object is emitted once the job has
+settled, so a field called `why_stuck` would assert a condition that is no longer
+true. All three are omitted when no hold was observed.
 
 For a terminal (`succeeded`, `failed`, `blocked`, or `cancelled`) job whose
 recorded worktree still has a locally observable process, `job list` reports

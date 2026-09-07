@@ -2082,13 +2082,20 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 		if queuedJobBlockerHeld(job, time.Now().UTC()) {
 			continue
 		}
-		// Provider-declared role unavailability (#1136): all queued work attributed
-		// to that role is held until the reset boundary. ListActive... excludes
+		// Provider-declared role unavailability (#1136): queued work attributed to
+		// that role is held until the reset boundary. ListActive... excludes
 		// expired rows (the one-minute sweep removes them), so stale incidents
 		// never suppress dispatch.
+		//
+		// #1641: the hold is runtime-scoped. This is the LIVE half of that defect —
+		// a claude quota row held every queued job of the role, including codex and
+		// kimi work that had no wall. The agent lookup runs only for a job whose
+		// role is actually walled, so the common path stays the map lookup it was.
 		if payload, payloadErr := daemonJobPayload(job); payloadErr == nil {
-			if _, unavailable := unavailableRoles[strings.ToLower(strings.TrimSpace(payload.ActingOrgRole))]; unavailable {
-				continue
+			if row, unavailable := unavailableRoles[strings.ToLower(strings.TrimSpace(payload.ActingOrgRole))]; unavailable {
+				if orgRoleUnavailableRefusesRuntime(row, selectedJobDispatchRuntime(ctx, worker.Store, job, payload)) {
+					continue
+				}
 			}
 		}
 		// Auth-probe gate (#532 slice B): once a runtime_auth deferral's coarse hold
@@ -3028,6 +3035,43 @@ func queuedJobRuntimeResourceKey(ctx context.Context, store *db.Store, job db.Jo
 		}
 		key, ok := overrideRuntimeSessionResourceKey(applyJobRuntimeOverride(runtime.Agent{}, payload))
 		if !ok {
+			return ""
+		}
+		return key
+	}
+	// #1952: an EPHEMERAL job has no agents-table session to schedule under — the
+	// worker materializes the spec and starts a FRESH session, so no row exists
+	// pre-materialization and a stale same-name row yields the wrong key. Either
+	// way this returned "", and admission then read a real session as
+	// not-session-counted (perJobAdmissionEstimate treats "" as no session).
+	//
+	// This key is a SERIALIZATION key — runtimeResourceLocked, inflightRuntimes —
+	// so what it must satisfy is worth stating exactly, because an earlier version
+	// of this comment claimed something FALSE: that the key is byte-identical to
+	// the lock the worker takes. MEASURED, it is not. The gate produces
+	// runtime:<rt>:fresh:job:<hash> while jobWorker.run's journalled lock reads
+	// runtime:<rt>:<the ref adapter.Start returned>. scopeRegisteredFreshRefForJob
+	// only rewrites a ref that IsFreshRef, and a materialized ephemeral agent
+	// carries the live session ref, so it is left alone.
+	//
+	// That gap is inherent and harmless: an ephemeral session does not EXIST until
+	// Start returns, so no pre-dispatch value can name it. What the key must be is
+	// non-empty (so admission counts a real session rather than pricing it free),
+	// job-unique (so two ephemeral jobs never serialize against each other), and
+	// never shaped like a live session ref (so it cannot collide with a real
+	// lock) — which the fresh: prefix guarantees. A fresh ephemeral session
+	// contends with nothing at gate time, so claiming no existing lock is correct
+	// rather than merely convenient.
+	if payload, err := daemonJobPayload(job); err == nil && payload.Ephemeral != nil {
+		agent, ok := selectedJobRuntimeAgent(ctx, store, job, payload)
+		if !ok {
+			return ""
+		}
+		agent.RuntimeRef = runtime.FreshRefForJob(job.ID)
+		key, keyed := runtimeSessionResourceKey(agent)
+		if !keyed {
+			// A non-resumable spec runtime (shell) takes no session lock, exactly
+			// as a non-resumable registered agent does not.
 			return ""
 		}
 		return key

@@ -121,15 +121,17 @@ func (w jobWorker) probeAuthVerdict(ctx context.Context, job db.Job, payload wor
 }
 
 // authProbeDedupKey identifies the credential domain a probe result applies to:
-// the effective runtime (agent runtime + any per-job override). All auth-held jobs
-// that share this key share one ambient-token probe. If the agent can't be read,
-// key by agent name so a lookup failure never merges distinct agents' verdicts.
+// the runtime the job will ACTUALLY run as (#1952 — ephemeral spec first, then
+// the registered row, with any per-job override on top). All auth-held jobs that
+// share this key share one ambient-token probe. Keying off the registered row
+// alone merged an ephemeral Claude job into a stored shell agent's domain, so
+// Claude was never probed. If nothing resolves, key by agent name so a lookup
+// failure never merges distinct agents' verdicts.
 func (w jobWorker) authProbeDedupKey(ctx context.Context, job db.Job, payload workflow.JobPayload) string {
-	record, err := w.Store.GetAgent(ctx, job.Agent)
-	if err != nil {
+	agent, ok := selectedJobRuntimeAgent(ctx, w.Store, job, payload)
+	if !ok {
 		return "agent:" + job.Agent
 	}
-	agent := applyJobRuntimeOverride(runtimeAgent(record), payload)
 	key := "runtime:" + strings.TrimSpace(agent.Runtime)
 	// A READ-ONLY SEAT authenticates with a staged snapshot of its effective
 	// config dir, not with the ambient credential. Include the selected default
@@ -164,12 +166,17 @@ func (w jobWorker) extendAuthBlockerHold(ctx context.Context, job db.Job, payloa
 // Non-seat Claude jobs use runtimeJobRunnerWithAuth; read-only seats use a
 // disposable copy of their configured credential plus the resolved auth
 // overlay. Other runtimes remain Unknown.
+//
+// #1952: the runtime comes from selectedJobRuntimeAgent, so an EPHEMERAL Claude
+// job is probed on Claude even when a same-name agent row says otherwise. It
+// previously read that row, concluded "not Claude", and returned Unknown — and
+// because authProbeAllowsRedispatch releases Unknown, a Claude-auth-deferred
+// ephemeral job re-dispatched without its credential ever being validated.
 func (w jobWorker) defaultAuthProbe(ctx context.Context, job db.Job, payload workflow.JobPayload) authProbeVerdict {
-	record, err := w.Store.GetAgent(ctx, job.Agent)
-	if err != nil {
+	agent, ok := selectedJobRuntimeAgent(ctx, w.Store, job, payload)
+	if !ok {
 		return authProbeUnknown
 	}
-	agent := applyJobRuntimeOverride(runtimeAgent(record), payload)
 	if strings.TrimSpace(agent.Runtime) != runtime.ClaudeRuntime {
 		return authProbeUnknown
 	}

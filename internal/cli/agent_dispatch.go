@@ -326,6 +326,16 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			return localAgentJobOutput{}, fmt.Errorf("runtime override: %w", err)
 		}
 	}
+	// #1641: role unavailability is refused HERE, not at the --org-role ingress
+	// above, because only now is the selected runtime authoritative — a claude
+	// quota wall must not refuse a codex dispatch, and an override to the walled
+	// runtime must still refuse. effectiveAgent is the same expression the
+	// claiming worker resolves (daemon_worker.go), so the two agree by
+	// construction. The agent reservation taken above is released by the deferred
+	// releaseReservation on this error path, so refusing here strands nothing.
+	if err := refuseUnavailableOrgRole(ctx, store, request.ActingOrgRole, effectiveAgent.Runtime, time.Now().UTC()); err != nil {
+		return localAgentJobOutput{}, err
+	}
 	if !request.Background {
 		// The adapter factory closure already carries this selection, but the
 		// workflow engine also owns job-associated subprocesses (produce checks and
