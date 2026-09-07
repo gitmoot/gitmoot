@@ -2058,6 +2058,7 @@ later command is ignored without a reply.
 
 ```sh
 gitmoot job list --repo owner/repo   # add --json for machine-readable rows
+gitmoot job list --killed            # only deliveries a signal killed, which nothing requeues
 gitmoot job show <job-id>            # add --json for the full job + operational detail
 gitmoot job watch <job-id>
 gitmoot job watch <job-id> --transcript [--log-path <path>] [--runtime codex|claude|kimi|omp|shell]
@@ -2077,6 +2078,20 @@ gitmoot job answer <job-id> "<question-id>: answer text" [--json]  # resume a jo
 gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 ```
+
+A delivery killed by a signal records a `delivery_signal_killed` event naming
+the signal and which evidence identified it. Both renderings count: a
+direct-child runtime reports `signal: terminated`, while a wrapped CLI such as
+claude or omp reports `exit status 143` and the signal name is lost, so a
+consumer matching only the first would miss most review deaths. A timeout is
+excluded twice over, by its own deadline error and by its `job_timeout` event,
+because a timeout burned its whole wall rather than being abandoned.
+
+`--killed` lists exactly that population. **Nothing requeues it, deliberately.**
+Work consumed before a restart is never silently re-run: a killed delivery may
+already have pushed a branch, posted a pull-request comment, taken a lock or
+spent tokens, so re-running it trades a lost job for a double-executed one.
+Inspect these rows and retry explicitly with `job retry`.
 
 Terminal background `ask` and `review` jobs that ran in a throwaway read-only
 worktree preserve a bounded `git status --short` plus `git diff HEAD` snapshot

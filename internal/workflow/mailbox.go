@@ -1220,6 +1220,9 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		// Best-effort: diagnostics must never change the failure path.
 		m.storeFailureDiagnostics(ctx, job.ID, &payload, firstDiag)
 		_ = m.fail(ctx, job.ID, fmt.Sprintf("delivery failed: %v", firstErr))
+		// #1726: classify a SIGNALLED death beside the failure so the abandoned
+		// population is findable. Recording only; nothing requeues.
+		m.recordDeliverySignalKill(ctx, job.ID, firstErr)
 		// Record an advisory failure observation (#530) so a runtime/model that
 		// repeatedly crashes at the ADAPTER level (never reaching a parsed decision)
 		// still counts against its success rate — otherwise it contributes zero rows
@@ -1303,6 +1306,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 				// the first-delivery terminal above. Best-effort.
 				m.storeFailureDiagnostics(ctx, job.ID, &payload, repairDiag)
 				_ = m.fail(ctx, job.ID, fmt.Sprintf("repair delivery failed: %v", repairErr))
+				m.recordDeliverySignalKill(ctx, job.ID, repairErr)
 				// Advisory failure observation (#530): a hard adapter error during repair
 				// is still a runtime-level failure — count it so flaky runtimes are not
 				// over-recommended by the coordinator context block.
@@ -1426,6 +1430,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 			if deliveryErr != nil {
 				m.storeFailureDiagnostics(ctx, job.ID, &payload, diag)
 				_ = m.fail(ctx, job.ID, fmt.Sprintf("produce correction delivery failed: %v", deliveryErr))
+				m.recordDeliverySignalKill(ctx, job.ID, deliveryErr)
 				return AgentResult{}, DeliveryError{Err: deliveryErr}
 			}
 			if payload.RuntimeOverride == "" && !registeredFreshRef && !ephemeral {
