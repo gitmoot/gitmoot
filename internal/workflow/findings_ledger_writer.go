@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -123,7 +124,7 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 	if head == "" || repo == "" || payload.PullRequest <= 0 || len(payload.Result.Findings) == 0 {
 		return nil
 	}
-	written, skipped, downgrades := 0, 0, 0
+	written, skipped, downgrades, refused := 0, 0, 0, 0
 	for index, raw := range payload.Result.Findings {
 		var wire reviewFindingWire
 		if err := json.Unmarshal(raw, &wire); err != nil {
@@ -138,21 +139,6 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 			}
 			wire = wireFromBareFindingText(text)
 		}
-		// A SEVERITY TOKEN IS NOT A FINDING (#1941 review f2). "P2:" was recorded
-		// as a QUOTED row whose only title was the severity itself, and an object
-		// carrying nothing but {id, severity} was recorded with title and detail
-		// both empty. Both are the empty-row defect #1932 was filed against,
-		// reached from the permissive side: my parser rescued the severity and
-		// then had nothing left to record. The invariant's loud-failure half
-		// covers this, so it skips and is never counted.
-		if strings.TrimSpace(wire.Title) == "" && strings.TrimSpace(wire.Detail) == "" &&
-			strings.TrimSpace(wire.Body) == "" && strings.TrimSpace(wire.Summary) == "" &&
-			strings.TrimSpace(wire.Evidence) == "" && strings.TrimSpace(wire.Rationale) == "" {
-			skipped++
-			e.recordLedgerSkip(ctx, job.ID, index,
-				"finding carries no title, detail, body, summary or evidence, so the row would say nothing about what it observed")
-			continue
-		}
 		obs, declared, ok := e.ledgerObservationWithDeclaredState(job, payload, wire, head, repo)
 		if !ok {
 			skipped++
@@ -160,6 +146,24 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 			continue
 		}
 		if _, err := e.Store.RecordReviewFindingObservation(ctx, obs); err != nil {
+			// A CONTENT REFUSAL IS NOT A STORE HICCUP, and reporting them the same
+			// way is what let 73 of these become obligations somebody withdrew by
+			// hand (#1968). It is the producer's contract violation, it is
+			// deterministic, and re-running the review changes nothing unless the
+			// reviewer says what it observed. So it gets its own event kind, it
+			// names the severity the reviewer claimed, and it QUOTES the finding
+			// back - the concern is refused, never discarded, which is the whole
+			// difference between this and a silent drop.
+			//
+			// It deliberately does NOT fail the review, and does not need to: the
+			// verdict still blocks the merge on its own severity, so a refused P0
+			// cannot let a head through. Failing here would throw away the other
+			// findings in the same result and the verdict with them.
+			if errors.Is(err, db.ErrFindingNoConcern) {
+				refused++
+				e.recordLedgerContentRefusal(ctx, job.ID, index, obs.Severity, raw)
+				continue
+			}
 			skipped++
 			e.recordLedgerSkip(ctx, job.ID, index, fmt.Sprintf("store refused the observation: %v", err))
 			continue
@@ -196,8 +200,8 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 		// skipped)" was true of the WRITE and false of the OUTCOME: three of those
 		// four rows had their declared disposition reversed. A summary that cannot
 		// distinguish those two facts is the false-success half of this defect.
-		Message: fmt.Sprintf("recorded %d of %d reported finding(s) to the #1822 ledger at head %s (%d skipped, %d downgraded)",
-			written, len(payload.Result.Findings), head, skipped, downgrades),
+		Message: fmt.Sprintf("recorded %d of %d reported finding(s) to the #1822 ledger at head %s (%d skipped, %d downgraded, %d refused for articulating no concern)",
+			written, len(payload.Result.Findings), head, skipped, downgrades, refused),
 	})
 	return nil
 }
@@ -458,6 +462,45 @@ func (e Engine) ReviewObligationBrief(ctx context.Context, repo string, pullRequ
 	return e.ledgerObligationBrief(ctx, repo, pullRequest, head, taskID)
 }
 
+// recordLedgerContentRefusal records a finding the store refused for saying
+// nothing (#1968), and it is deliberately NOT recordLedgerSkip.
+//
+// PHOBOS's condition on this slice: a P0 with no title must not be silently
+// dropped by the gate that refuses it. So this event carries the three things a
+// reader needs to act without the row existing - which finding, at what claimed
+// severity, and the reviewer's own bytes - and it says what to do about it. The
+// raw JSON is bounded because a finding can carry a large evidence blob and a
+// job event is not a place to store one.
+func (e Engine) recordLedgerContentRefusal(ctx context.Context, jobID string, index int, severity string, raw json.RawMessage) {
+	if e.Store == nil {
+		return
+	}
+	claimed := strings.TrimSpace(severity)
+	if claimed == "" {
+		claimed = "(none)"
+	}
+	quoted := strings.TrimSpace(string(raw))
+	if len(quoted) > ledgerRefusalQuoteLimit {
+		quoted = quoted[:ledgerRefusalQuoteLimit] + "... (truncated)"
+	}
+	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID: jobID,
+		Kind:  "findings_ledger_refused",
+		Message: fmt.Sprintf(
+			"finding[%d] at claimed severity %s was REFUSED, not recorded: it carries no title, detail or rationale, "+
+				"so it names no defect that can be evaluated or discharged. The verdict's own severity still blocks the "+
+				"merge, so nothing is unblocked by this refusal. Restate the concern with a title and a detail. "+
+				"Reviewer's finding verbatim: %s",
+			index, claimed, quoted),
+	})
+}
+
+// ledgerRefusalQuoteLimit bounds the reviewer bytes echoed into the refusal
+// event. Long enough for any real finding object observed on this box (the
+// longest recorded title is 464 characters), short enough that an evidence blob
+// cannot turn an audit row into a payload.
+const ledgerRefusalQuoteLimit = 2000
+
 // ledgerObligationBrief renders the prior findings a round at this head must
 // observe, for inclusion in the review brief. THIS IS THE HALF THAT KEEPS THE
 // GATE FROM REJECTING VALID INPUT: an obligation can only be discharged by
@@ -503,6 +546,10 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 	b.WriteString("EVERY finding you emit needs an explicit \"severity\" of P0, P1, P2 or P3. A finding with none is\n")
 	b.WriteString("REFUSED rather than stored, because a row with no severity is an obligation no severity policy\n")
 	b.WriteString("can ever disposition, and it is not the same thing as P3 (#1928).\n")
+	b.WriteString("EVERY finding also needs an articulated concern: a \"title\", a \"detail\" or a \"rationale\". A file\n")
+	b.WriteString("and line alone is REFUSED rather than stored (#1968), because a bare locator says where to look\n")
+	b.WriteString("and nothing about what is wrong there, so no later round can evaluate or discharge it. Return\n")
+	b.WriteString("fewer findings rather than empty ones; a refusal is reported back against your job.\n")
 	for _, obligation := range pending {
 		label := obligation.RoundLabel
 		if strings.TrimSpace(label) == "" {

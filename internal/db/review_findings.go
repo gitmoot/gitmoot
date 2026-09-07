@@ -126,6 +126,36 @@ var (
 	// silently downgrade an unknown-severity defect to the least severe class at
 	// the one boundary that still knows the value was missing.
 	ErrFindingSeverity = errors.New("finding observation requires an explicit severity of P0, P1, P2 or P3")
+	// ErrFindingNoConcern rejects a row that articulates nothing (#1968). It is
+	// the content sibling of ErrFindingSeverity: a severity says how much a defect
+	// matters, and prose says what the defect IS. A row with neither a title, a
+	// detail nor a rationale identifies no defect that can be evaluated
+	// independently, yet it occupies the same ledger as real ones and, with
+	// [review] blocking_severity = "P2", holds a merge on a concern nobody can
+	// read.
+	//
+	// Measured on this box's store on 2026-09-07: 77 of 571 recorded findings
+	// carried an empty title AND detail AND rationale, and 73 of those had already
+	// been withdrawn BY HAND, one written reason at a time, with reviewers saying
+	// things like "provides no title, detail, or articulated concern... should not
+	// have become an obligation". Manual withdrawal is the correct verdict reached
+	// after the row is already an obligation.
+	//
+	// A FILE OR A LOCATOR IS NOT A CONCERN, deliberately: the withdrawn rows all
+	// carried one. "internal/cli/style/style.go:78" names where to look and says
+	// nothing about what is wrong there, and several distinct uids pointed at one
+	// such bare locator.
+	//
+	// REFUSING DOES NOT DROP A BLOCK, which is the property that makes refusal
+	// safe for a P0 (PHOBOS's condition on this slice). The merge gate blocks on
+	// the review's VERDICT - effectiveReviewDecisionForPayload reads
+	// Result.Decision and Result.Severity - not on ledger rows, so a
+	// changes_requested P0 review whose every finding was refused still refuses
+	// the head. Measured by probe: the gate returned "review at evaluated head has
+	// blocking result from reviewer" against a zero-row ledger. What refusal costs
+	// is the itemised, dischargeable obligation, which is exactly what a row with
+	// no prose could never have provided anyway.
+	ErrFindingNoConcern = errors.New("finding observation requires an articulated concern: a title, a detail or a rationale")
 )
 
 var (
@@ -266,6 +296,54 @@ func (s *Store) RecordReviewFindingObservation(ctx context.Context, obs ReviewFi
 	}
 	if obs.EvidenceKind == EvidenceQuoted && obs.State != FindingOpen {
 		return "", ErrFindingQuotedDischarge
+	}
+
+	// CONTENT IS VALIDATED AT THE WRITE BOUNDARY for the same reason severity is
+	// (#1968): this is the last point that still knows the row said nothing. The
+	// bar lives HERE rather than in the writer that produced today's rows,
+	// because the writer is one of several callers and a rule defined against an
+	// open set of callers decays as the set widens - the #1967 chokepoint
+	// argument again. The lens path, continuations and any future writer all
+	// reach the ledger through this function.
+	//
+	// IT RUNS LAST ON PURPOSE, so it is strictly ADDITIVE to the existing
+	// precedence. Placed before the evidence switch it preempted
+	// ErrFindingDischarge for a STATIC row missing its rationale, and
+	// TestLedgerRefusesAnEvidenceFreeDischarge caught that: both errors were
+	// true of that row, but a caller matching the discharge sentinel would have
+	// stopped seeing it. Here it can only refuse a row every older bar already
+	// admitted.
+	//
+	// IT APPLIES ONLY TO AN OBSERVATION THAT OPENS AN OBLIGATION, and that
+	// narrowing is not caution - my first version did not have it and was
+	// measurably wrong. gm-integrity asked whether this rule could contradict the
+	// #1965 continues_uid normalisation, so I measured instead of answering, and
+	// of the 77 no-prose rows on this box's ledger ZERO are open: 58 are
+	// withdrawn and 19 are ANSWERED. Those 19 are genuine discharges - P1, P2 and
+	// P3, EvidenceKind EXECUTED with executed_count 8 apiece, against real paths
+	// like internal/sandbox/exec_linux.go. A state-blind bar would have refused
+	// all 19 and left 19 real obligations, P1s among them, open forever. Removing
+	// noise by refusing real discharges is a worse ledger, not a better one.
+	//
+	// A DISCHARGE IS ALREADY GATED: EXECUTED needs a non-empty command list and a
+	// non-zero count, STATIC needs a structural locator AND a rationale, and
+	// withdrawn needs its written reason. Prose is the articulation an OPENING
+	// observation owes, because opening is the act that creates an obligation
+	// somebody else has to discharge.
+	//
+	// THE LIMIT OF THAT CLAIM, stated because gm-integrity asked for it rather
+	// than left for the next reader to over-read: those bars are about
+	// ARTICULATION, not FRESHNESS. Nothing here requires a discharge's commands
+	// to differ from the ones the finding was opened with, or to name the head
+	// being judged, so "already gated" does not mean "proved re-checked at this
+	// head". Measured on this box: of 99 open-to-answered pairs, 7 repeat the
+	// identical command list and 92 bring a different one, and 0 answer at the
+	// opening head - so the gap is real in this code and largely unexercised by
+	// the population. Whether an EXECUTED discharge should have to prove
+	// freshness is #1970's question, not this bar's.
+	if obs.State == FindingOpen && strings.TrimSpace(obs.Title) == "" &&
+		strings.TrimSpace(obs.Detail) == "" && strings.TrimSpace(obs.Rationale) == "" {
+		return "", fmt.Errorf("%w: file=%q line=%d", ErrFindingNoConcern, obs.File, obs.Line)
 	}
 
 	// KEYS ARE VALIDATED BEFORE THE TRANSACTION so a bad key costs no write lock.

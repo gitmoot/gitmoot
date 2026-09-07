@@ -307,25 +307,45 @@ func TestAdvanceJobRefusesManufacturedBareStringFindings(t *testing.T) {
 		t.Fatalf("lowercase finding file = %q, want the real path", lower.File)
 	}
 
-	// The skips must be LOUD and the summary must count them.
+	// The refusals must be LOUD and the summary must count them.
+	//
+	// #1968 MOVED THE RULE AND SHARPENED THE EVENT. The predicate that lived here
+	// in the writer now lives at the store boundary, so these two findings are
+	// refused by RecordReviewFindingObservation rather than pre-filtered, and a
+	// content refusal is reported as findings_ledger_refused instead of sharing
+	// findings_ledger_skipped with transient store failures. This test keeps
+	// asserting what it always asserted - not recorded, loud, counted - and adds
+	// the two properties that make a refused P0 actionable: the event names the
+	// severity the reviewer claimed, and it quotes the reviewer's own bytes, so
+	// the concern is refused rather than discarded.
 	events, err := store.ListJobEvents(ctx, "review-manufactured")
 	if err != nil {
 		t.Fatalf("ListJobEvents returned error: %v", err)
 	}
-	skips, summary := 0, ""
+	refusals, summary := 0, ""
+	var refusalMessages []string
 	for _, event := range events {
 		switch event.Kind {
-		case "findings_ledger_skipped":
-			skips++
+		case "findings_ledger_refused":
+			refusals++
+			refusalMessages = append(refusalMessages, event.Message)
 		case "findings_ledger_recorded":
 			summary = event.Message
 		}
 	}
-	if skips != 2 {
-		t.Fatalf("skip events = %d, want 2: a finding that cannot be recorded must fail loudly", skips)
+	if refusals != 2 {
+		t.Fatalf("refusal events = %d, want 2: a finding that cannot be recorded must fail loudly", refusals)
 	}
-	if !strings.Contains(summary, "recorded 3 of 5") || !strings.Contains(summary, "2 skipped") {
-		t.Fatalf("summary = %q, want an honest 3 of 5 with 2 skipped", summary)
+	for _, message := range refusalMessages {
+		if !strings.Contains(message, "REFUSED") || !strings.Contains(message, "claimed severity") {
+			t.Fatalf("refusal event %q must say it was refused and at what claimed severity", message)
+		}
+		if !strings.Contains(message, "Reviewer's finding verbatim:") {
+			t.Fatalf("refusal event %q must quote the reviewer's finding back, or the concern is discarded rather than refused", message)
+		}
+	}
+	if !strings.Contains(summary, "recorded 3 of 5") || !strings.Contains(summary, "2 refused for articulating no concern") {
+		t.Fatalf("summary = %q, want an honest 3 of 5 with 2 refused", summary)
 	}
 }
 
@@ -400,20 +420,23 @@ func TestAdvanceJobRefusesToDischargeOnAManufacturedRationale(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListJobEvents returned error: %v", err)
 	}
-	skip, summary := "", ""
+	// #1968: a content refusal now reports as findings_ledger_refused rather than
+	// sharing findings_ledger_skipped with transient store failures. The property
+	// under test is unchanged - the reversal is audible, never silent.
+	refusal, summary := "", ""
 	for _, event := range events {
 		switch event.Kind {
-		case "findings_ledger_skipped":
-			skip = event.Message
+		case "findings_ledger_refused":
+			refusal = event.Message
 		case "findings_ledger_recorded":
 			summary = event.Message
 		}
 	}
-	if skip == "" {
-		t.Fatal("N1 was refused with NO skip event; a silent drop is the other half of this lane's defect")
+	if refusal == "" {
+		t.Fatal("N1 was refused with NO refusal event; a silent drop is the other half of this lane's defect")
 	}
-	if !strings.Contains(summary, "recorded 1 of 2") || !strings.Contains(summary, "1 skipped") {
-		t.Fatalf("summary = %q, want an honest 1 of 2 with 1 skipped", summary)
+	if !strings.Contains(summary, "recorded 1 of 2") || !strings.Contains(summary, "1 refused for articulating no concern") {
+		t.Fatalf("summary = %q, want an honest 1 of 2 with 1 refused", summary)
 	}
 }
 
