@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -510,4 +511,166 @@ func TestRunTaskRunScopesRoleUnavailabilityToTheOwnersRuntime(t *testing.T) {
 			t.Fatalf("jobs after a refused task run = %+v err=%v, want none", jobs, err)
 		}
 	})
+}
+
+// #1952 review P2: the wall must be checked against the runtime that will
+// EXECUTE. daemon_worker materializes an ephemeral worker unconditionally from
+// payload.Ephemeral.Runtime and upserts it over any same-name agent row, so a
+// resolver that consults the agents table first checks a runtime that never
+// runs. Every test below plants an extant same-name agent row of a DIFFERENT
+// runtime, which is the condition that made the defect invisible.
+
+const ephemeralWalledJobAgent = "wave-impl-ephemeral"
+
+func seedEphemeralWalledJob(t *testing.T, store *db.Store, home, jobID, storedRuntime, specRuntime, walledRuntime string) {
+	t.Helper()
+	// The agents-table row the old resolver would have believed.
+	seedDaemonWorkerAgent(t, store, ephemeralWalledJobAgent, storedRuntime, unavailableRuntimeShellScript,
+		[]string{"ask"}, "owner/repo")
+	seedCLIJob(t, store, db.Job{
+		ID:    jobID,
+		Agent: ephemeralWalledJobAgent,
+		Type:  "ask",
+		State: string(workflow.JobQueued),
+		Payload: mustJobPayload(t, workflow.JobPayload{
+			Repo: "owner/repo", Branch: "main", ActingOrgRole: "review",
+			Ephemeral: &workflow.EphemeralSpec{Runtime: specRuntime},
+		}),
+	}, "queued")
+	now := time.Now().UTC()
+	if walledRuntime != "" {
+		if err := store.UpsertOrgRoleUnavailableForRuntime(context.Background(), "review", walledRuntime, "quota", now.Add(time.Hour), now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = home
+}
+
+// TestJobRunRefusesAnEphemeralJobWhoseSpecRuntimeIsWalled is the #1952 P2
+// regression on the `job run` path: stored row says shell, the spec says claude,
+// claude is walled. The old resolver read the stored row and dispatched.
+func TestJobRunRefusesAnEphemeralJobWhoseSpecRuntimeIsWalled(t *testing.T) {
+	home, store := seedRoleUnavailableJobHome(t)
+	seedEphemeralWalledJob(t, store, home, "job-eph-walled", runtime.ShellRuntime, "claude", "claude")
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"job", "run", "job-eph-walled", "--home", home}, &stdout, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), `org role "review" is unavailable`) ||
+		!strings.Contains(stderr.String(), "dispatch refused") {
+		t.Fatalf("ephemeral job on a walled spec runtime was not refused: code=%d stdout=%q stderr=%q",
+			code, stdout.String(), stderr.String())
+	}
+	job, err := store.GetJob(context.Background(), "job-eph-walled")
+	if err != nil || job.State != string(workflow.JobQueued) {
+		t.Fatalf("job = %+v err=%v, want still queued (refused before start)", job, err)
+	}
+}
+
+// TestJobRunDispatchesAnEphemeralJobWhenAnotherRuntimeIsWalled is the
+// should-succeed control: the fix must not buy correctness by refusing every
+// ephemeral job. Spec runtime is shell, the wall names claude, and the stored
+// row deliberately says claude so a resolver that still preferred the agents
+// table would refuse here.
+func TestJobRunDispatchesAnEphemeralJobWhenAnotherRuntimeIsWalled(t *testing.T) {
+	home, store := seedRoleUnavailableJobHome(t)
+	seedEphemeralWalledJob(t, store, home, "job-eph-clear", "claude", runtime.ShellRuntime, "claude")
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"job", "run", "job-eph-clear", "--home", home}, &stdout, &stderr)
+	if strings.Contains(stderr.String(), "dispatch refused") {
+		t.Fatalf("a wall on a non-selected runtime refused an ephemeral dispatch: code=%d stderr=%q", code, stderr.String())
+	}
+	job, err := store.GetJob(context.Background(), "job-eph-clear")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.State == string(workflow.JobQueued) {
+		t.Fatalf("job never left queued, so the wall held it: %+v stderr=%q", job, stderr.String())
+	}
+}
+
+// TestJobRunFailsClosedOnAnEphemeralSpecRuntimeItCannotUse keeps the fail-closed
+// half honest for the new precedence: an ephemeral spec naming nothing usable
+// must refuse rather than be treated as "some runtime other than the walled one".
+func TestJobRunFailsClosedOnAnEphemeralSpecRuntimeItCannotUse(t *testing.T) {
+	for _, specRuntime := range []string{"", "not-a-runtime"} {
+		name := specRuntime
+		if name == "" {
+			name = "empty spec runtime"
+		}
+		t.Run(name, func(t *testing.T) {
+			home, store := seedRoleUnavailableJobHome(t)
+			seedEphemeralWalledJob(t, store, home, "job-eph-closed", runtime.ShellRuntime, specRuntime, "claude")
+			var stdout, stderr bytes.Buffer
+			code := Run([]string{"job", "run", "job-eph-closed", "--home", home}, &stdout, &stderr)
+			if code != 1 || !strings.Contains(stderr.String(), "dispatch refused") {
+				t.Fatalf("unusable ephemeral spec runtime %q not refused: code=%d stderr=%q", specRuntime, code, stderr.String())
+			}
+		})
+	}
+}
+
+// TestQueuedEphemeralJobIsHeldWhenItsSpecRuntimeIsWalled is the same regression
+// through the DAEMON path the reviewer's adversary used: runQueuedJobsForRepo.
+// It asserts the hold lands before start AND before delivery — the adapter
+// factory fails the test if it is ever reached, which is what "refused before
+// delivery" has to mean.
+func TestQueuedEphemeralJobIsHeldWhenItsSpecRuntimeIsWalled(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
+	seedDaemonWorkerAgent(t, store, ephemeralWalledJobAgent, runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "queued-eph-walled", Agent: ephemeralWalledJobAgent, Action: "ask",
+		Repo: "owner/repo", Branch: "main", ActingOrgRole: "review",
+		Ephemeral: &workflow.EphemeralSpec{Runtime: "claude"},
+	})
+	now := time.Now().UTC()
+	if err := store.UpsertOrgRoleUnavailableForRuntime(ctx, "review", "claude", "quota", now.Add(time.Hour), now); err != nil {
+		t.Fatal(err)
+	}
+
+	worker := defaultJobWorker(store, io.Discard)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return t.TempDir(), nil
+	}
+	worker.AdapterFactory = func(agent runtime.Agent, _ string) (workflow.DeliveryAdapter, error) {
+		t.Fatalf("delivery reached for a job whose selected runtime %q is walled", agent.Runtime)
+		return nil, nil
+	}
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
+		t.Fatalf("runQueuedJobsForRepo returned error: %v", err)
+	}
+	job, err := store.GetJob(ctx, "queued-eph-walled")
+	if err != nil || job.State != string(workflow.JobQueued) {
+		t.Fatalf("queued ephemeral job = %+v err=%v, want held in queued", job, err)
+	}
+}
+
+// TestQueuedEphemeralJobRunsWhenAnotherRuntimeIsWalled is the daemon-path
+// should-succeed control, and the reason it matters: the stored row names the
+// WALLED runtime while the spec names a clear one, so a resolver that preferred
+// the agents table would hold a job that is perfectly safe to run.
+func TestQueuedEphemeralJobRunsWhenAnotherRuntimeIsWalled(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
+	seedDaemonWorkerAgent(t, store, ephemeralWalledJobAgent, "claude", "unused", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "queued-eph-clear", Agent: ephemeralWalledJobAgent, Action: "ask",
+		Repo: "owner/repo", Branch: "main", ActingOrgRole: "review",
+		Ephemeral: &workflow.EphemeralSpec{Runtime: runtime.ShellRuntime},
+	})
+	now := time.Now().UTC()
+	if err := store.UpsertOrgRoleUnavailableForRuntime(ctx, "review", "claude", "quota", now.Add(time.Hour), now); err != nil {
+		t.Fatal(err)
+	}
+
+	pending, err := listPendingQueuedJobs(ctx, jobWorker{Store: store}, "", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].ID != "queued-eph-clear" {
+		t.Fatalf("pending = %+v, want the ephemeral job eligible: its spec runtime is not the walled one", pending)
+	}
 }
