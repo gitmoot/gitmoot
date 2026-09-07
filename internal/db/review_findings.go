@@ -457,6 +457,75 @@ func splitPathLine(value string) (string, int, bool) {
 	return path, line, true
 }
 
+// ReviewFindingConsumption is one repository's finding ledger, folded by final
+// state and split by whether an open finding applies to the pull request's
+// CURRENT head (#1970, #1969).
+type ReviewFindingConsumption struct {
+	Repo       string `json:"repo"`
+	Findings   int    `json:"findings"`
+	Open       int    `json:"open"`
+	Answered   int    `json:"answered"`
+	Withdrawn  int    `json:"withdrawn"`
+	Superseded int    `json:"superseded"`
+	// OpenAtCurrentHead and OpenAtEarlierHead partition Open. BOTH still block:
+	// LedgerObligationsAtHead gives an open finding the reason "still open"
+	// unconditionally, so a stale head does not make it stop counting. The split
+	// exists because a single "open" total cannot distinguish a defect that was
+	// just reported from one nobody has looked at for twenty heads, and #1970
+	// measured 239 of 263 open findings sitting at a head the pull request had
+	// already moved past.
+	OpenAtCurrentHead int `json:"open_at_current_head"`
+	OpenAtEarlierHead int `json:"open_at_earlier_head"`
+	// OpenHeadUnknown counts open findings whose pull request has no locally
+	// recorded head, so neither bucket above would be honest. Reported rather
+	// than folded into either, because silently counting an unknown as current
+	// is how a report starts lying.
+	OpenHeadUnknown int `json:"open_head_unknown"`
+}
+
+// ReviewFindingConsumptionByRepo folds the whole ledger per repository.
+//
+// #1969 asked for a report that makes a silent consumer visible without a
+// manual query, and #1970 asked that counting open findings distinguish those
+// that apply at the current head. One read-only fold answers both.
+//
+// The fold is in SQL and the head comparison joins the locally recorded
+// pull_requests row. It deliberately does NOT compute obligations: that needs
+// the merge gate's own LedgerScope resolvers, and a report that guessed at them
+// would disagree with the gate, which is the #1850 R3-F1 failure mode. This
+// counts states and head currency, nothing more.
+func (s *Store) ReviewFindingConsumptionByRepo(ctx context.Context) ([]ReviewFindingConsumption, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT f.repo,
+	COUNT(*),
+	SUM(CASE WHEN f.state = 'open' THEN 1 ELSE 0 END),
+	SUM(CASE WHEN f.state = 'answered' THEN 1 ELSE 0 END),
+	SUM(CASE WHEN f.state = 'withdrawn' THEN 1 ELSE 0 END),
+	SUM(CASE WHEN f.state = 'superseded' THEN 1 ELSE 0 END),
+	SUM(CASE WHEN f.state = 'open' AND p.head_sha != '' AND p.head_sha = f.head_sha THEN 1 ELSE 0 END),
+	SUM(CASE WHEN f.state = 'open' AND p.head_sha != '' AND p.head_sha != f.head_sha THEN 1 ELSE 0 END),
+	SUM(CASE WHEN f.state = 'open' AND COALESCE(p.head_sha, '') = '' THEN 1 ELSE 0 END)
+FROM review_finding_observations f
+LEFT JOIN pull_requests p
+	ON p.repo_full_name = f.repo AND p.number = f.pull_request
+GROUP BY f.repo
+ORDER BY f.repo`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ReviewFindingConsumption
+	for rows.Next() {
+		var row ReviewFindingConsumption
+		if err := rows.Scan(&row.Repo, &row.Findings, &row.Open, &row.Answered, &row.Withdrawn,
+			&row.Superseded, &row.OpenAtCurrentHead, &row.OpenAtEarlierHead, &row.OpenHeadUnknown); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
 // ListReviewFindingObservations returns every observation for a PR in INSERTION
 // ORDER, so a caller can fold them into per-finding latest state itself. The
 // store does not fold, because folding is where a "still true" column would
