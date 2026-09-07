@@ -47,13 +47,42 @@ import (
 //   - #570 escalation: an async infra error (job-level failures already resolve
 //     to nil inside worker.run) is recorded per repo and surfaced as the NEXT
 //     tick's error, so a persistent store fault still trips the ceiling.
-//   - graceful shutdown: every dispatched job runs on the tracker's runCtx;
-//     drain() cancels it and waits (bounded) for in-flight jobs to finish.
+//   - graceful shutdown: every dispatched job runs on the tracker's runCtx,
+//     which DELIBERATELY does not descend from the shutdown signal. drain()
+//     waits (bounded) for in-flight jobs and only then cancels them.
+
+// jobContext has TWO production consumers with OPPOSITE cancellation
+// semantics, and nothing else in this file says so, so it is said here:
+//
+//   - job DELIVERY (the per-job goroutines below, and the two
+//     runPoolJobRecovered sites in daemon_scheduler.go) MUST SURVIVE the
+//     shutdown signal, or a job dies mid-flight the moment SIGTERM lands.
+//   - the pool's ACCEPT/REQUERY loop MUST DIE with the signal, or a
+//     shutting-down daemon keeps hunting for work. pool_requery_bound_test.go
+//     pins that, with its own positive control.
+//
+// One context cannot serve both, so the pool pass takes the SIGNAL context and
+// derives the delivery context from the tracker internally. The obvious
+// three-line fix - re-parenting runCtx and handing it to the pool pass - makes
+// the drain tests pass and breaks shutdown, so it looks correct.
+//
+// Re-ordering drain's cancel does NOT substitute for the parentage: the
+// cancellation never came from drain. It came from runCtx's parent.
 
 // daemonShutdownDrainTimeout bounds how long the daemon waits for in-flight
-// dispatched jobs to observe cancellation on shutdown before abandoning them
-// (a truly ctx-deaf subprocess must not block daemon stop forever).
-const daemonShutdownDrainTimeout = 15 * time.Second
+// dispatched jobs to FINISH on shutdown before abandoning them (a truly
+// ctx-deaf subprocess must not block daemon stop forever).
+//
+// 900s buys p90 of measured daemon-dispatched in-flight duration (median 8s,
+// p90 893s, p95 1383s, peak concurrency 3 over 14 days). It is NECESSARY AND
+// NOT SUFFICIENT: systemd truncates it to TimeoutStopSec, and under
+// KillMode=control-group the children are signalled at t=0 and this never runs
+// at all. Both are operator changes.
+var daemonShutdownDrainTimeout = 900 * time.Second
+
+// drainCancelGrace bounds how long a TRUNCATED drain waits after cancelling,
+// so an abandoned job's death is recorded rather than lost to process exit.
+var drainCancelGrace = 5 * time.Second
 
 // heldBackLogInterval throttles the per-job "held back" observability lines
 // (#562 point 5): a job that stays excluded for the same reason re-logs at most
@@ -91,8 +120,17 @@ type inflightJobTracker struct {
 	liveness                   *daemonLivenessSweep
 }
 
+// newInflightJobTracker takes the SUPERVISOR context, which is cancelled by
+// SIGINT/SIGTERM, and deliberately does NOT derive the job run context from
+// it. WithoutCancel (not context.Background) so every VALUE carried on the
+// supervisor context - loggers, tracing, config handles, store references -
+// still reaches in-flight jobs; only the cancellation is dropped.
+//
+// The supervisor context keeps its own job, which is to stop the accept loops,
+// so no new work begins once it is done. That is what makes drain's wait
+// finite.
 func newInflightJobTracker(ctx context.Context) *inflightJobTracker {
-	runCtx, cancel := context.WithCancel(ctx)
+	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	return &inflightJobTracker{
 		runCtx:    runCtx,
 		cancelRun: cancel,
@@ -106,9 +144,10 @@ func newInflightJobTracker(ctx context.Context) *inflightJobTracker {
 	}
 }
 
-// jobContext returns the context dispatched jobs must run on: cancelled when
-// the supervisor context is cancelled OR drain() begins. A nil tracker falls
-// back to the caller's context.
+// jobContext returns the context dispatched jobs must run on: cancelled ONLY
+// when drain() spends its budget, never by the shutdown signal itself. A nil
+// tracker falls back to the caller's context, which is what keeps
+// runQueuedJobsForRepoPool byte-identical to the historical pool.
 func (t *inflightJobTracker) jobContext(fallback context.Context) context.Context {
 	if t == nil {
 		return fallback
@@ -518,11 +557,26 @@ func (t *inflightJobTracker) takeErr(repo string) error {
 	return err
 }
 
-// drain cancels every dispatched job's context and waits (bounded) for the
-// in-flight jobs to finish, logging what it had to abandon. Called on
-// supervisor exit so daemon stop cancels + drains in-flight work. From the
-// moment drain starts, begin/tryBeginPool refuse new work, so a worker tick
-// racing the shutdown cannot spawn a job the drain would never see.
+// drain waits (bounded) for in-flight dispatched jobs to FINISH, then cancels
+// them unconditionally. Called on supervisor exit, so daemon stop lets live
+// work COMPLETE instead of killing it. From the moment drain starts,
+// begin/tryBeginPool refuse new work, so a worker tick racing the shutdown
+// cannot spawn a job the drain would never see, which is what bounds the wait.
+//
+// Order matters and the old order was the defect's twin: cancelling first
+// killed exactly the work this exists to preserve. The cancel still happens on
+// EVERY path out, because an abandoned job that keeps running past daemon
+// death orphans a runtime child holding a worktree.
+//
+// The post-cancel grace is not decoration. Without it drain returns while the
+// cancellation is still propagating, and the caller (a deferred call at
+// supervisor exit) lets the process die out from under jobs that were about to
+// unwind cleanly - a smaller version of the bug being fixed here.
+//
+// What a truncated drain leaves behind is a KILLED row, never a silent one:
+// the cancel kills the subprocess, delivery fails on the signal, and #1726's
+// classifier records delivery_signal_killed so `job list --killed` finds
+// exactly what this abandoned.
 func (t *inflightJobTracker) drain(stdout io.Writer, timeout time.Duration) {
 	if t == nil {
 		return
@@ -530,21 +584,38 @@ func (t *inflightJobTracker) drain(stdout io.Writer, timeout time.Duration) {
 	t.mu.Lock()
 	t.draining = true
 	t.mu.Unlock()
-	t.cancelRun()
 	done := make(chan struct{})
 	go func() {
 		t.wg.Wait()
 		close(done)
 	}()
-	timer := time.NewTimer(timeout)
+	// The grace comes OUT of the caller's budget, never on top of it: drain's
+	// total wall time is <= timeout on every path, so one number bounds daemon
+	// stop and an operator's TimeoutStopSec has a single thing to exceed.
+	grace := drainCancelGrace
+	if reserved := timeout / 10; reserved < grace {
+		grace = reserved
+	}
+	timer := time.NewTimer(timeout - grace)
 	defer timer.Stop()
 	select {
 	case <-done:
+		t.cancelRun()
+		return
 	case <-timer.C:
-		t.mu.Lock()
-		remaining := len(t.jobs)
-		t.mu.Unlock()
-		writeLine(stdout, "daemon shutdown: abandoned %d in-flight job(s) still running after %s drain", remaining, timeout)
+	}
+	t.mu.Lock()
+	remaining := len(t.jobs)
+	t.mu.Unlock()
+	writeLine(stdout, "daemon shutdown: abandoning %d in-flight job(s) still running after %s drain; they are recorded as killed", remaining, timeout)
+	t.cancelRun()
+	// Let the cancellation reach the subprocesses so their deaths are RECORDED
+	// before the process exits. This is unwind time, not more work time.
+	graceTimer := time.NewTimer(grace)
+	defer graceTimer.Stop()
+	select {
+	case <-done:
+	case <-graceTimer.C:
 	}
 }
 
@@ -667,10 +738,14 @@ func dispatchQueuedJobsTracked(ctx context.Context, worker jobWorker, limit int,
 	}
 	if worker.UsePool {
 		if tracker.tryBeginPool(repoFilter) {
-			runCtx := tracker.jobContext(ctx)
+			// The SIGNAL context, deliberately: the pool pass's accept/requery
+			// loop must stop when the daemon is shutting down. It derives its
+			// own delivery context from the tracker for the jobs it dispatches.
+			// Handing it the surviving context instead keeps a shutting-down
+			// daemon querying for work (pool_requery_bound_test.go).
 			go func() {
 				defer tracker.endPool(repoFilter)
-				err := runQueuedJobsForRepoPoolTracked(runCtx, worker, limit, hostCap, repoFilter, rootFilter, tracker)
+				err := runQueuedJobsForRepoPoolTracked(ctx, worker, limit, hostCap, repoFilter, rootFilter, tracker)
 				if err != nil && !errors.Is(err, context.Canceled) {
 					tracker.recordErr(repoFilter, err)
 				}
