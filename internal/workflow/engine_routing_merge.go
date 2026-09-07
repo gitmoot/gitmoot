@@ -1042,6 +1042,37 @@ func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string,
 	}
 	if !decision.Ready {
 		if decision.Deferred {
+			// A TASK CANNOT BE MERGEABLE AND UNDER REPAIR AT THE SAME TIME (#1555).
+			//
+			// Measured on PR #1546: a reviewer reproduced a host escape with a
+			// compiled probe at 20:18:06, the engine had already dispatched the fix
+			// leg for it at 20:18:04, and at 20:21:12 two later approvals drove the
+			// task to ready_to_merge WHILE that leg was still running. task_events
+			// held zero rows for the transition, so the only remaining permitted
+			// operation was the merge, and a coordinator reading `gitmoot task list`
+			// plus an approval count would have shipped the escape.
+			//
+			// The parking below is not wrong in general: ready_to_merge is what
+			// lookupReadyPullRequestTask polls, so it is how a transient hold gets
+			// re-driven. It is wrong for exactly one deferral, the one where a live
+			// job owns the branch AND the task arrived carrying an objection. There
+			// the state would assert mergeability over an unanswered blocking verdict
+			// AND over the repair addressing it.
+			//
+			// Liveness is preserved without the poll in that case: the holding leg's
+			// own completion advances the task, which is how every fix round already
+			// reaches its next review. Nothing else re-drives from changes_requested,
+			// and nothing needs to.
+			if decision.HeldByJob != "" && expectedTaskState == string(TaskChangesRequested) {
+				return decision, e.recordTaskEventBestEffort(ctx, ref, db.TaskEvent{
+					Kind:      "merge_deferred_branch_held",
+					FromState: expectedTaskState,
+					ToState:   expectedTaskState,
+					Reason: fmt.Sprintf(
+						"not transitioned to ready_to_merge: job %s still owns branch %s while an objection stands at this head; a task cannot be mergeable and under repair at once. %s",
+						decision.HeldByJob, strings.TrimSpace(payload.Branch), decision.Reason.Render()),
+				})
+			}
 			// Park the task in ready_to_merge (NOT whatever state it arrived in) so
 			// the daemon's lookupReadyPullRequestTask poll re-drives it every tick until
 			// the hold settles. A task-owned retry already expected in ready_to_merge
@@ -1049,7 +1080,22 @@ func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string,
 			if expectedTaskState == string(TaskReadyToMerge) {
 				return decision, nil
 			}
-			return decision, e.setTaskState(ctx, ref, TaskReadyToMerge)
+			// AUDITED, because it was not (#1555 ask 2). ready_to_merge is the
+			// strongest merge signal the engine produces and it was written through a
+			// plain upsert with no task_events row, so an operator could see the state
+			// and never learn why. The write itself is unchanged; only the record is
+			// added, and it names the deferral that caused it rather than implying a
+			// clean approval.
+			if err := e.setTaskState(ctx, ref, TaskReadyToMerge); err != nil {
+				return decision, err
+			}
+			return decision, e.recordTaskEventBestEffort(ctx, ref, db.TaskEvent{
+				Kind:      "task_ready_to_merge_deferred",
+				FromState: expectedTaskState,
+				ToState:   string(TaskReadyToMerge),
+				Reason: fmt.Sprintf("parked in ready_to_merge to be re-driven by the merge poll: %s",
+					decision.Reason.Render()),
+			})
 		}
 		reason := decision.Reason.Render()
 		if reason == "" {
@@ -1105,7 +1151,41 @@ func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string,
 		}
 		return decision, nil
 	}
-	return decision, e.setTaskState(ctx, ref, TaskReadyToMerge)
+	// The READY arm, audited for the same reason as the deferred one (#1555 ask 2).
+	// This is the transition that means "this really is mergeable", so it is the one
+	// an operator most needs to be able to audit after the fact.
+	if err := e.setTaskState(ctx, ref, TaskReadyToMerge); err != nil {
+		return decision, err
+	}
+	reason := decision.Reason.Render()
+	if reason == "" {
+		reason = "merge gate reported ready"
+	}
+	return decision, e.recordTaskEventBestEffort(ctx, ref, db.TaskEvent{
+		Kind:      "task_ready_to_merge",
+		FromState: expectedTaskState,
+		ToState:   string(TaskReadyToMerge),
+		Reason:    reason,
+	})
+}
+
+// recordTaskEventBestEffort records a task_events row for a transition the
+// engine has already committed.
+//
+// BEST EFFORT IS DELIBERATE AND IT IS NOT LAXITY. The state write has already
+// landed by the time this is called, so returning an error here would report a
+// failure for an effect that succeeded, and a caller retrying on it would
+// re-drive a transition that does not need re-driving. An audit row that fails
+// to insert must not invalidate the thing it describes. A refused write is
+// visible as a missing row, which is the same signal the absence of these rows
+// was in the first place.
+func (e Engine) recordTaskEventBestEffort(ctx context.Context, ref taskRef, event db.TaskEvent) error {
+	if e.Store == nil || strings.TrimSpace(ref.ID) == "" {
+		return nil
+	}
+	event.TaskID = ref.ID
+	_ = e.Store.AddTaskEvent(ctx, event)
+	return nil
 }
 
 func (e Engine) parkTaskAwaitingHumanMerge(ctx context.Context, ref taskRef, reason string) error {
