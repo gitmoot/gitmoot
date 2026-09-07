@@ -187,9 +187,15 @@ Before an engine job launches, Gitmoot lazily checks the compiled runtime
 contract against the installed CLI. Required argv flags come from bounded
 `<binary> --help` probes; environmental restrictions are declared beside the
 argv that triggers them. Results are `supported`, `unsupported`, or `unknown`.
-Only a positive `unsupported` result blocks. Missing binaries, timeouts, and
-unparseable help are `unknown`, produce a `runtime_contract_unknown` event, and
-still dispatch. Parsed help results are cached by resolved path, size, and mtime;
+Only a positive `unsupported` result blocks on the contract itself. Missing
+binaries, timeouts, and unparseable help stay `unknown` and produce a
+`runtime_contract_unknown` event. A missing binary is additionally refused
+before any job row or worktree is created, but only when the dispatcher
+explicitly declares that this dispatch builds a real adapter which will exec
+that declared CLI and the execution backend runs on the local host; injected or
+fake adapters, remote or attached backends, and present binaries all stay
+dispatchable, and the classification stays `unknown` for reporting either way.
+Parsed help results are cached by resolved path, size, and mtime;
 unknown results use a 60-second TTL before probing again, while an updated binary
 immediately invalidates either cached result. `gitmoot doctor --json` reports
 the tri-state value in `state` alongside every built-in runtime's status,
@@ -197,6 +203,17 @@ installed version, answering instrument, and exact missing flag or precondition.
 Doctor probes its foreground `PATH`, which can differ from the daemon's
 EnvironmentFile `PATH`; compare the reported `resolved_path` with the daemon's
 executable resolution before treating the foreground verdict as the daemon's.
+
+A read-only seat has a second, separate capability precondition, because the
+contract preflight probes the dispatching host's `PATH` while a seat executes a
+daemon-staged copy of its runtime. When the daemon cannot stage a runtime it
+publishes that name as an engine-owned command that exits 126, so an inherited
+`PATH` cannot route the seat back to an ungranted operator installation. If the
+runtime published that way is the seat's own, seat setup ends the job `blocked`
+and records a `seat_runtime_unavailable` event naming the agent, the runtime and
+the staging cause, before any adapter is composed, any agent instance is marked
+running, or any model token is spent. A sibling runtime published unavailable is
+a fact about the host, stays a daemon log line, and refuses nothing.
 
 ## Transcript Retention
 

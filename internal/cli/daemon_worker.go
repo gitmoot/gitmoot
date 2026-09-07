@@ -47,6 +47,24 @@ type jobWorker struct {
 	ConfigHomeExplicit bool
 	AgentLookup        func(context.Context, string) (db.Agent, error)
 	AdapterFactory     func(runtime.Agent, string) (workflow.DeliveryAdapter, error)
+	// adapterExecsDeclaredBinary is the daemon half of the #1817 discriminator
+	// (ledger row gitmoot/gitmoot#1926-f5): it states that AdapterFactory builds a
+	// REAL adapter which will exec the runtime's declared CLI binary.
+	//
+	// UNEXPORTED AND SET ONLY BY setRealAdapterFactory, and both properties are
+	// load-bearing. A test that injects a fake assigns AdapterFactory directly, as
+	// ~22 of them already do, so the flag keeps its zero value and the dispatch
+	// stays exempt - which is why the 24-test over-block regression stays green
+	// without a single test edit. Production goes through the setter, where the
+	// factory and the claim about it cannot drift apart.
+	//
+	// Opt-in, because the unsafe direction is refusal: a production path that
+	// forgot the setter degrades to the pre-#1817 late failure rather than
+	// refusing work that would have run.
+	adapterExecsDeclaredBinary bool
+	// declaredRealAdapterPtr is the code pointer of the factory the claim above was
+	// made about, so replacing AdapterFactory withdraws the claim automatically.
+	declaredRealAdapterPtr uintptr
 	// OutputAdapterFactory rebuilds a production runtime adapter around the
 	// shared live-output writer used by progress and retained transcript capture.
 	// Tests that inject an opaque fake AdapterFactory may leave this nil and still
@@ -174,7 +192,9 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 		configHomeExplicit = true
 	}
 	worker := jobWorker{Store: store, Stdout: serializeWrites(stdout), ConfigHome: configHome, ConfigHomeExplicit: configHomeExplicit}
-	worker.AdapterFactory = worker.defaultAdapter
+	// PRODUCTION assigns through the setter so the factory and the claim that it
+	// execs the declared binary are written together (#1926-f5).
+	worker.setRealAdapterFactory(worker.defaultAdapter)
 	worker.OutputAdapterFactory = worker.outputAdapter
 	worker.StartAdapterFactory = worker.defaultStartAdapter
 	worker.AuthProbe = worker.defaultAuthProbe
@@ -368,6 +388,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
 		return nil
 	}
+	var absentBinaryRefusal error
 	preflightRequest := runtime.RuntimeContractRequest{Plan: payload.Plan}
 	if result, checked, preflightErr := w.runtimeContractPreflight(ctx, execBackend, execConfig, agent, preflightRequest); preflightErr != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, preflightErr); finishErr != nil {
@@ -388,6 +409,14 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 				writeLine(w.Stdout, "job %s runtime_contract_unknown event failed: %v", job.ID, eventErr)
 			}
 		}
+		// #1926-f5: CAPTURE the absent-executable refusal here, where the contract
+		// result is in scope, but ACT on it after the policy guards below. Ordering
+		// is behavioural, not cosmetic: refusing here pre-empted the read-only
+		// implement permission block, and CI caught it -
+		// TestPreflightReadOnlyImplementEmitsJobBlocked got my capability message
+		// where it required the permission one. A policy refusal is true whether or
+		// not the binary exists, so it must win the diagnosis.
+		absentBinaryRefusal = runtime.RuntimeContractAbsentBinaryError(agent, result)
 	}
 	if err := w.produceDispatchError(job.Type, agent); err != nil {
 		w.recordProduceSandboxDiagnostic(ctx, job.ID, job.Type, agent)
@@ -438,6 +467,24 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		if err := finalize(ctx, job.ID, errors.New(agentPermissionBlockedMessage)); err != nil {
 			return err
 		}
+		return nil
+	}
+	// #1926-f5: THE SECOND SEAM, ACTED ON HERE - after the policy guards above, and
+	// BEFORE review-worktree allocation on the next line and adapter construction
+	// below. That is the ordering the ruling asks for: a delegated or
+	// daemon-created job whose declared CLI is absent is refused before it spends
+	// a worktree, rather than dying at exec.
+	//
+	// Only when this worker's factory was declared REAL through
+	// setRealAdapterFactory, so an injected fake stays exempt by construction, and
+	// only for a local backend, since the preflight that produced this result was
+	// itself routed by execbackend.Consume. The `unknown` classification and its
+	// event are untouched.
+	if absentBinaryRefusal != nil && w.adapterIsDeclaredReal() {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, absentBinaryRefusal); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, "", absentBinaryRefusal)
 		return nil
 	}
 	nativeReviewDeliveryStarted := false
@@ -767,12 +814,12 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			}
 		}
 	}
-	adapter, narrowingDropped, err := wrapReadOnlySandboxAdapter(w.ConfigHome, agent, deliveryCheckout, payload.Repo, adapter)
-	if len(narrowingDropped) > 0 {
+	adapter, seatSetup, err := wrapReadOnlySandboxAdapter(w.ConfigHome, agent, deliveryCheckout, payload.Repo, adapter)
+	if len(seatSetup.dropped) > 0 {
 		// Narrowing is not silent: a reviewer whose MCP tool is missing, or a
 		// seat that cannot authenticate to a provider whose key was withheld,
 		// can find out why from the job's own event log.
-		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "read_only_seat_config_narrowed", Message: "withheld from the seat's staged config: " + strings.Join(narrowingDropped, ", ")}); eventErr != nil {
+		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "read_only_seat_config_narrowed", Message: "withheld from the seat's staged config: " + strings.Join(seatSetup.dropped, ", ")}); eventErr != nil {
 			return eventErr
 		}
 	}
@@ -781,6 +828,32 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
+		return nil
+	}
+	// #1817: THE SEAT'S OWN RUNTIME IS PUBLISHED UNAVAILABLE, SO REFUSE HERE -
+	// after the adapter exists, so the real-adapter discriminator can be asked,
+	// and before MarkAgentInstanceRunning and any delivery.
+	//
+	// BLOCKED, NOT FAILED. Every other error out of seat setup means something
+	// went wrong while preparing this job, so failed is right. This one means
+	// the job was fine and the capability it needs is absent - the same
+	// distinction RuntimeContractDispatchError already draws above - and all ten
+	// measured instances recorded `failed`, which reads as "this reviewer tried"
+	// and invites the identical re-dispatch.
+	//
+	// GATED ON adapterIsDeclaredReal for the same reason the absent-binary
+	// refusal is: an injected adapter never execs the runtime, so an absent one
+	// is not its precondition. Measured, not reasoned - refusing unconditionally
+	// failed five existing tests that compose a seat adapter and exec nothing.
+	if seatSetup.runtimeUnavailable != "" && w.adapterIsDeclaredReal() {
+		refusal := error(&seatRuntimeCapabilityError{agentName: agent.Name, runtimeName: agent.Runtime, cause: seatSetup.runtimeUnavailable})
+		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: seatRuntimeUnavailableEvent, Message: refusal.Error()}); eventErr != nil {
+			writeLine(w.Stdout, "job %s %s event failed: %v", job.ID, seatRuntimeUnavailableEvent, eventErr)
+		}
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, refusal); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, refusal)
 		return nil
 	}
 	var readOnlyState *readOnlyRuntimeAdapter
@@ -1393,6 +1466,15 @@ type readOnlySandboxGrants struct {
 	// when none could be staged. It is inside cacheRoot, so it needs no grant
 	// of its own.
 	evidenceFile string
+	// runtimeUnavailable names why the seat's OWN runtime resolves to the
+	// engine's exit-126 unavailable command, or "" when it staged normally
+	// (#1817). It is reported rather than returned as an error because whether
+	// it MATTERS depends on the caller: only a caller that will actually exec
+	// the runtime is entitled to refuse on it. Erroring here refused five
+	// existing tests that legitimately compose a seat adapter and never exec
+	// anything, and it would refuse every claude seat in CI, where no runtime
+	// CLI is installed at all.
+	runtimeUnavailable string
 }
 
 type readOnlyRuntimeAdapter struct {
@@ -1427,14 +1509,14 @@ func (a readOnlyRuntimeAdapter) cleanup() error {
 // evidence must be scoped to. It is distinct from agent.RepoScope: a seat's
 // registered scope is an authorisation boundary, not a statement about the job
 // in hand, and nothing in the tree makes the two agree.
-func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout string, reviewRepo string, adapter workflow.DeliveryAdapter) (workflow.DeliveryAdapter, []string, error) {
+func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout string, reviewRepo string, adapter workflow.DeliveryAdapter) (workflow.DeliveryAdapter, readOnlySeatSetup, error) {
 	if !agent.ReadOnlySeat {
-		return adapter, nil, nil
+		return adapter, readOnlySeatSetup{}, nil
 	}
 	_, gatewayMode := adapter.(modelGatewayRuntimeAdapter)
 	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, reviewRepo, gatewayMode)
 	if err != nil {
-		return nil, nil, err
+		return nil, readOnlySeatSetup{}, err
 	}
 	// A seat's env is rebuilt from scratch, which DROPPED the runtime auth the
 	// non-seat path injects (runtimeJobRunnerWithAuth appends
@@ -1448,8 +1530,9 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 	// seat is deliberately given none.
 	seatAuthEnv, err := readOnlySeatRuntimeAuthEnv(home, agent.Runtime, gatewayMode)
 	if err != nil {
-		return nil, nil, err
+		return nil, readOnlySeatSetup{}, err
 	}
+	setup := readOnlySeatSetup{dropped: grants.dropped, runtimeUnavailable: grants.runtimeUnavailable}
 	wrap := func(runner subprocess.Runner) subprocess.Runner {
 		baseEnv := readOnlyRuntimeBaseEnv(agent.Runtime, os.Environ(), filepath.Join(grants.cacheRoot, "gh"))
 		curated := graftRuntimeBaseRunner(runner, subprocess.CuratedGroupRunner{
@@ -1467,22 +1550,22 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 	if err != nil {
 		// Staging and narrowing are already done at this point, so the
 		// withheld list is reported even though the wrap failed.
-		return nil, grants.dropped, err
+		return nil, setup, err
 	}
 	if grants.stateDir == "" {
-		return wrapped, grants.dropped, nil
+		return wrapped, setup, nil
 	}
 	runtimeAdapter, ok := wrapped.(runtime.Adapter)
 	if !ok {
 		// The narrowing already happened, so report it even though delivery
 		// cannot be built: a withheld credential is news whether or not the
 		// wrap succeeds.
-		return nil, grants.dropped, fmt.Errorf("read-only Landlock sandbox returned incompatible %T adapter", wrapped)
+		return nil, setup, fmt.Errorf("read-only Landlock sandbox returned incompatible %T adapter", wrapped)
 	}
 	return readOnlyRuntimeAdapter{
 		Adapter:     runtimeAdapter,
 		cleanupRoot: grants.cacheRoot,
-	}, grants.dropped, nil
+	}, setup, nil
 }
 
 func wrapReadOnlyAdapterRunner(runtimeName string, adapter workflow.DeliveryAdapter, stateDir string, wrap func(subprocess.Runner) subprocess.Runner) (workflow.DeliveryAdapter, error) {
@@ -1858,6 +1941,26 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	for _, diagnostic := range runtimeDiagnostics {
 		fmt.Fprintf(os.Stderr, "gitmoot: read-only seat runtime: %s\n", diagnostic)
 	}
+	// #1817: THE SEAT'S OWN RUNTIME IS THE CAPABILITY QUESTION, AND THIS IS
+	// WHERE THE ANSWER EXISTS. stageSeatRuntimes has just decided, for this host
+	// and this home, whether the command the seat will exec is the daemon's copy
+	// of the runtime or the exit-126 unavailable shim. Recording it here costs
+	// nothing extra - the staging pass already ran - and it is available before
+	// the adapter is composed, before MarkAgentInstanceRunning, and before any
+	// model token is billed.
+	//
+	// RECORDED, NOT REFUSED. Seat setup has callers that compose a seat adapter
+	// and never exec it, so refusing here refuses valid work: it broke five
+	// existing tests on this host and would refuse every claude seat in CI,
+	// where no runtime CLI is installed. The worker refuses, because the worker
+	// is the caller that knows whether its adapter will exec the binary.
+	//
+	// The question is deliberately NOT answered by probing the dispatching
+	// host's PATH, which #1817's first comment measured as the wrong side of the
+	// boundary: on this deployment a dispatch-time LookPath("claude") resolves
+	// the operator's working installation while every seat receives the shim, so
+	// a host-side check reports "present" for a runtime no seat can run.
+	grants.runtimeUnavailable = seatRuntimeUnavailable(agent.Runtime, stagedRuntimes, runtimeDiagnostics)
 	for _, shim := range stagedRuntimes {
 		root, err := toolchain.StagedRuntimeRoot(paths.Home, shim)
 		if err != nil {
@@ -3125,12 +3228,29 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		// property this path's caller was gated on. The wrap is a no-op for an
 		// ordinary temp worker (it returns the adapter unchanged unless
 		// ReadOnlySeat is set), so this cannot affect the common path.
-		var forkDropped []string
-		adapter, forkDropped, err = wrapReadOnlySandboxAdapter(w.ConfigHome, started.Agent, checkout, payload.Repo, adapter)
-		if len(forkDropped) > 0 {
-			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "read_only_seat_config_narrowed", Message: "withheld from the seat's staged config: " + strings.Join(forkDropped, ", ")}); eventErr != nil {
+		var forkSetup readOnlySeatSetup
+		adapter, forkSetup, err = wrapReadOnlySandboxAdapter(w.ConfigHome, started.Agent, checkout, payload.Repo, adapter)
+		if len(forkSetup.dropped) > 0 {
+			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "read_only_seat_config_narrowed", Message: "withheld from the seat's staged config: " + strings.Join(forkSetup.dropped, ", ")}); eventErr != nil {
 				return eventErr
 			}
+		}
+		// #1817's fourth entry point, measured on 2026-09-05 07:44:52: the
+		// temp-worker fork allocated a read-only worktree, minted a worker,
+		// marked the job running and posted an attributed PR comment, all before
+		// anything asked whether the selected path could start. Refuse the same
+		// capability here as in run(); a temp worker is new work, so its runtime
+		// being unavailable is not less true for being delegated.
+		if err == nil && forkSetup.runtimeUnavailable != "" && w.adapterIsDeclaredReal() {
+			err = &seatRuntimeCapabilityError{agentName: started.Agent.Name, runtimeName: started.Agent.Runtime, cause: forkSetup.runtimeUnavailable}
+			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: seatRuntimeUnavailableEvent, Message: err.Error()}); eventErr != nil {
+				writeLine(w.Stdout, "job %s %s event failed: %v", job.ID, seatRuntimeUnavailableEvent, eventErr)
+			}
+			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, err); finishErr != nil {
+				return finishErr
+			}
+			_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
+			return nil
 		}
 	}
 	if err != nil {

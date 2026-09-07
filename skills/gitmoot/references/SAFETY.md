@@ -179,16 +179,40 @@ refusals live beside the triggering argv. A parsed help document that omits a
 required flag, or a definitively failed precondition, is `unsupported` and
 blocks with the runtime, installed version, exact requirement, and remedy. A
 missing binary, timeout, unparseable help, or undecidable precondition is
-`unknown`: Gitmoot records that fact and dispatches anyway. This fail-open
-unknown state is deliberate; inability to inspect a CLI is not proof that the
-CLI rejected the contract. Unknown binary probes use a 60-second cache TTL;
-successful probes cache by resolved path, size, and mtime without a TTL.
+`unknown`: Gitmoot records that fact rather than treating it as a refusal. This
+fail-open unknown state is deliberate; inability to inspect a CLI is not proof
+that the CLI rejected the contract. A missing binary carries one added refusal,
+and only under three explicit conditions together: the dispatcher declares that
+this dispatch builds a real adapter which will exec that declared CLI, the
+execution backend runs on the local host, and the executable does not resolve.
+That refusal lands before any job row or worktree exists, and it leaves the
+`unknown` classification intact; injected or fake adapters, remote or attached
+backends, and present binaries stay dispatchable. Unknown binary probes use a
+60-second cache TTL; successful probes cache by resolved path, size, and mtime
+without a TTL.
 Claude 2.1.223 refuses Gitmoot's exact `--permission-mode bypassPermissions`
 prompt invocation under effective uid 0, while misleadingly reporting the
 failure as `--dangerously-skip-permissions`; the precondition changes no argv
 and attempts no escape. Doctor uses the foreground process's `PATH`, so compare
 its reported `resolved_path` with the daemon EnvironmentFile's `PATH` when they
 may resolve different binaries.
+
+#### Read-only seat runtime capability
+
+A read-only seat resolves its runtime from a daemon-staged copy, never from the
+host PATH. When the daemon cannot stage a runtime it publishes that name as an
+engine-owned command that exits 126, so an inherited PATH entry cannot route the
+seat back to an ungranted operator installation. If the runtime published that
+way is the seat's OWN runtime, seat setup refuses the job: the job ends
+`blocked`, a `seat_runtime_unavailable` event records the agent, the runtime and
+the staging cause, and no adapter is composed, no agent instance is marked
+running, and no model token is spent. A sibling runtime published unavailable is
+a fact about the host, stays a daemon log line, and refuses nothing.
+
+This check runs where the seat resolves its command, not on the dispatching
+host's PATH. The two answers differ: a host can carry a working installation
+while every seat receives the exit-126 shim, so a dispatch-time `LookPath`
+reports the runtime present for a runtime no seat can run.
 
 #### Shell runtime risk acceptance (2026-08-05)
 

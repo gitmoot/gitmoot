@@ -29,6 +29,13 @@ type RuntimeRequirementKind string
 const (
 	RuntimeRequirementFlag        RuntimeRequirementKind = "flag"
 	RuntimeRequirementNonRootEUID RuntimeRequirementKind = "non-root-euid"
+	// RuntimeRequirementBinaryPresent is SYNTHESISED by check, never declared by
+	// an adapter: every contract that names a binary implicitly requires that
+	// binary to exist, so declaring it per-adapter would be five copies of the
+	// same fact. It exists as its own kind so the refusal can say "the executable
+	// is not there" instead of borrowing a flag requirement's wording and
+	// claiming an installed CLI lacks a flag (#1817).
+	RuntimeRequirementBinaryPresent RuntimeRequirementKind = "binary-present"
 )
 
 // RuntimeRequirement declares one fact an adapter's argv depends on.
@@ -108,6 +115,10 @@ type binaryProbe struct {
 	version    string
 	help       string
 	helpParsed bool
+	// unresolved records that LookPath itself failed, which is categorically
+	// different from a binary that exists and answered unusably: the first is the
+	// most definitive answer this probe can obtain, the second is no answer.
+	unresolved bool
 	instrument string
 	detail     string
 }
@@ -214,6 +225,44 @@ func (c *RuntimeContractChecker) check(ctx context.Context, meta RuntimeMetadata
 	probe := c.probeBinary(ctx, meta.Contract.Binary)
 	result.ResolvedPath = probe.path
 	result.Version = probe.version
+	// #1817: NAME AN ABSENT EXECUTABLE AS ITSELF, AND DO NOT BLOCK ON IT.
+	//
+	// Falling through to the per-flag loop below reports absence as "binary help
+	// output was not parseable", once per declared flag - omp declares six - which
+	// describes the wrong defect and buries the one fact an operator can act on.
+	// This records it once, as its own requirement kind, with the resolver's own
+	// error and a remedy naming the binary. The measured failure it explains:
+	// `resolve sandbox target "claude": executable file not found in $PATH`, which
+	// killed two #1910 review legs on 2026-09-05 17:28 and two joltra review jobs
+	// on 2026-09-06 at 10:51:15 and 11:06:20.
+	//
+	// IT STAYS UNKNOWN, AND THAT IS THE CORRECTION THIS ROUND MADE. I first
+	// classified absence as unsupported so dispatch would refuse it. CI measured
+	// the cost: 24 internal/cli tests went `blocked, want succeeded/failed/queued`,
+	// because the runner has no runtime CLIs installed while those dispatches
+	// deliver through an INJECTED adapter that never execs the declared binary.
+	// Every pre-existing `unsupported` case presupposes a PRESENT binary whose
+	// help was parsed; absence is not knowable-relevant at this layer, which does
+	// not know whether the real adapter will exec that binary on this host. So
+	// refusing here rejects valid input, which is worse than the late failure.
+	//
+	// The refusal belongs at the seam that is about to exec - where
+	// internal/sandbox already produces that exact error - and getting it there
+	// is a separate change, deliberately not smuggled into this one.
+	if probe.unresolved {
+		rr := RuntimeRequirementResult{
+			Kind:       RuntimeRequirementBinaryPresent,
+			Name:       fmt.Sprintf("executable %q", meta.Contract.Binary),
+			Source:     fmt.Sprintf("runtime %q contract binary", meta.Name),
+			Remedy:     fmt.Sprintf("install %s on the host that will run this job, or dispatch it to an agent whose runtime is installed", meta.Contract.Binary),
+			State:      RuntimeContractUnknown,
+			Instrument: probe.instrument,
+			Detail:     probe.detail,
+		}
+		result.Requirements = append(result.Requirements, rr)
+		mergeContractState(&result, rr)
+		return result
+	}
 	for _, req := range flagRequirements {
 		rr := RuntimeRequirementResult{Kind: req.Kind, Name: req.Name, Flag: req.Flag, Source: req.Source, Remedy: req.Remedy, Instrument: probe.instrument}
 		switch {
@@ -274,7 +323,7 @@ func (c *RuntimeContractChecker) probeBinary(ctx context.Context, binary string)
 	}
 	path, err := runner.LookPath(binary)
 	if err != nil {
-		return binaryProbe{version: "unknown", instrument: "look-path", detail: fmt.Sprintf("resolve %s: %v", binary, err)}
+		return binaryProbe{version: "unknown", unresolved: true, instrument: "look-path", detail: fmt.Sprintf("resolve %s: %v", binary, err)}
 	}
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
@@ -412,10 +461,40 @@ func RuntimeContractDispatchError(agent Agent, result RuntimeContractResult) err
 		if requirement.State != RuntimeContractUnsupported {
 			continue
 		}
+		// An absent executable must not be reported as an installed version failing
+		// a requirement: "installed version %q" is a lie when nothing is installed,
+		// and it sends the reader looking for a CLI upgrade instead of a missing
+		// binary (#1817).
+		if requirement.Kind == RuntimeRequirementBinaryPresent {
+			return fmt.Errorf("runtime preflight blocked agent %q: runtime %q requires %s and it does not resolve on PATH (%s); remedy: %s",
+				agent.Name, result.Runtime, requirement.Name, requirement.Detail, requirement.Remedy)
+		}
 		return fmt.Errorf("runtime preflight blocked agent %q: runtime %q installed version %q does not satisfy %s required by %s; remedy: %s",
 			agent.Name, result.Runtime, result.Version, requirement.Name, requirement.Source, requirement.Remedy)
 	}
 	return fmt.Errorf("runtime preflight blocked agent %q: runtime %q installed version %q has an unsupported contract; remedy: run the job on a runtime whose installed CLI satisfies its declared contract", agent.Name, result.Runtime, result.Version)
+}
+
+// RuntimeContractAbsentBinaryError reports the runtime's declared executable as
+// missing, or nil when the result records no such absence (#1817, ruling
+// 123815).
+//
+// IT DECIDES NOTHING ABOUT WHETHER TO REFUSE. Absence alone is not the deciding
+// fact: a dispatch that delivers through an injected adapter, or whose execution
+// backend is another host, never execs this binary and must stay dispatchable.
+// Establishing that is the CALLER's job, supplied explicitly at the dispatch
+// site; this function only renders the absence it was handed. That split is the
+// ruling's requirement and it is also what keeps the old over-blocking form
+// from being reachable from here.
+func RuntimeContractAbsentBinaryError(agent Agent, result RuntimeContractResult) error {
+	for _, requirement := range result.Requirements {
+		if requirement.Kind != RuntimeRequirementBinaryPresent {
+			continue
+		}
+		return fmt.Errorf("dispatch refused for agent %q: runtime %q will exec %s on this host and it does not resolve on PATH (%s); remedy: %s",
+			agent.Name, result.Runtime, requirement.Name, requirement.Detail, requirement.Remedy)
+	}
+	return nil
 }
 
 func RuntimeContractEventMessage(jobID string, agent Agent, result RuntimeContractResult) string {

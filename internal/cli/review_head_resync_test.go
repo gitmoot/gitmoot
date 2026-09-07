@@ -883,6 +883,7 @@ func TestDefaultCheckoutResolvesAmbiguousAbbreviationAsARef(t *testing.T) {
 // asynchronous), not cancelled and dropped. Ask/implement keep their existing
 // synchronous cancel behavior (covered by TestRunAgentAskCancelsQueuedJobWhenRuntimeSessionBusy).
 func TestRunAgentReviewRequeuesQueuedJobWhenRuntimeSessionBusy(t *testing.T) {
+	declareNoRealAdapterExec(t)
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")

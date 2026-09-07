@@ -617,7 +617,7 @@ func (s *bridgeServer) handleAgentAsk(w http.ResponseWriter, r *http.Request, na
 		writeBridgeError(w, http.StatusBadRequest, "repo is required")
 		return
 	}
-	out, err := dispatchLocalAgentJob(r.Context(), s.store, localAgentDispatchRequest{
+	out, err := dispatchLocalAgentJobFromCLI(r.Context(), s.store, localAgentDispatchRequest{
 		RepoFlag:             req.Repo,
 		Agent:                name,
 		Action:               "ask",

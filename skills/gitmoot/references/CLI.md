@@ -168,8 +168,14 @@ Before an engine job launches, Gitmoot lazily checks the compiled runtime
 contract against the installed CLI. Required argv flags are read from bounded
 `<binary> --help` probes and environmental restrictions are declared beside the
 argv that triggers them. Results are `supported`, `unsupported`, or `unknown`:
-only a positively `unsupported` contract blocks; missing binaries, timeouts, and
-unparseable help are `unknown`, emit `runtime_contract_unknown`, and still run.
+only a positively `unsupported` contract blocks on the contract itself; missing
+binaries, timeouts, and unparseable help stay `unknown` and emit
+`runtime_contract_unknown`. A missing binary is additionally refused BEFORE any
+job row or worktree is created, but only when the dispatcher explicitly declares
+that this dispatch builds a real adapter which will exec that declared CLI and
+the execution backend runs on the local host. Injected or fake adapters, remote
+or attached backends, and present binaries all stay dispatchable, and the
+classification remains `unknown` for reporting either way.
 Parsed help results are cached by resolved executable path, size, and mtime;
 unknown results use a 60-second TTL before probing again, while an in-place CLI
 update immediately invalidates either cached result. `gitmoot doctor --json`
@@ -178,6 +184,15 @@ answering instrument, and exact missing flag or precondition. Doctor probes its
 own foreground `PATH`, which can differ from the daemon's EnvironmentFile
 `PATH`; compare the reported `resolved_path` with the daemon's executable
 resolution before treating the foreground verdict as the daemon's.
+
+A read-only seat has a second, separate capability precondition, because the
+contract preflight probes the dispatching host's `PATH` while a seat executes a
+daemon-staged copy. When the daemon cannot stage a runtime it publishes that
+name as an engine-owned exit-126 command; if that runtime is the seat's own,
+seat setup ends the job `blocked` and records a `seat_runtime_unavailable`
+event naming the agent, the runtime and the staging cause, before any adapter
+is composed or model token spent. A sibling runtime published unavailable stays
+a daemon log line and refuses nothing.
 
 ## Runtime Ambient Credential Hygiene
 
