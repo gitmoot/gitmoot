@@ -2047,3 +2047,105 @@ func TestPhaseInstrumentFourAxesSplitWrites(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) { classifyThroughSplitWrites(t, tc.command, tc.want) })
 	}
 }
+
+// TestPhaseInstrumentHonoursWrapperGrammars is #1930 round-17 F33. The previous
+// consumer stripped EVERY dash-prefixed token as a wrapper option, so options
+// the real wrapper rejects vanished and whatever followed was bucketed.
+// Measured against GNU coreutils 9.4 at /usr/bin/timeout:
+//
+//	/usr/bin/timeout --definitely-invalid 1s go version  exit 125, no Go
+//	/usr/bin/timeout -s -999 1s go version               exit 125, no Go
+//	/usr/bin/timeout 1s -- go version                    exit 127, no Go
+//	/usr/bin/timeout 1s go version                       exit 0,   Go RAN
+//	timeout 1s -x go version                             exit 127, no Go
+//	timeout 1x go version / timeout abc go version       exit 125, no Go
+//
+// AND ONE ENVIRONMENT FACT WORTH KEEPING: the `timeout` first on PATH here is
+// NOT GNU - it is a clap-based clone that RUNS `1s -- go version` where GNU
+// exits 127. Two installed implementations disagree, so that form has no
+// confident answer and refuses. "Measured twice with different answers" is a
+// distinct reason from "unmeasured", and my first probe of this case used the
+// wrong binary and appeared to contradict the reviewer.
+func TestPhaseInstrumentHonoursWrapperGrammars(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"unknown option refuses", `timeout --definitely-invalid 1s go test ./internal/transcript`, phaseBucketUnknown},
+		{"delimiter after duration refuses", `timeout 1s -- go test ./internal/transcript`, phaseBucketUnknown},
+		{"invalid signal refuses", `timeout -s -999 1s go test ./internal/transcript`, phaseBucketUnknown},
+		{"invalid duration refuses", `timeout 1x go test ./...`, phaseBucketUnknown},
+		{"invalid inline signal refuses", `timeout --signal=NOPE 1s go test ./...`, phaseBucketUnknown},
+		{"unknown sudo option refuses", "sudo --nonesuch go test ./...", phaseBucketUnknown},
+		// A DASH-PREFIXED TOKEN AFTER THE DURATION IS THE COMMAND, not an
+		// option: `timeout 1s -x go version` exits 127 running "-x".
+		{"dash-prefixed command is not an option", `timeout 1s -x go test ./...`, phaseBucketOther},
+		// SHOULD-SUCCEED CONTROLS, or the fix is just a refusal machine.
+		{"valid timeout control", `timeout 1s go test ./internal/transcript`, phaseBucketTest},
+		{"valid signal and kill-after", "timeout -s KILL -k 10s 25m go test ./...", phaseBucketTest},
+		{"valid inline signal", `timeout --signal=KILL 1s go test ./...`, phaseBucketTest},
+		{"bare number duration", "timeout 600 go test ./...", phaseBucketTest},
+		{"documented gate shape", "timeout 25m go test ./...", phaseBucketTest},
+		{"sudo with a user", "sudo -u root go test ./...", phaseBucketTest},
+		{"nice with a level", "nice -n 10 go test ./...", phaseBucketTest},
+		{"terminal wrapper option", "timeout --help 1s go test ./...", phaseBucketOther},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentHonoursConditionalBashEffects is #1930 round-17 F32
+// continuing. Two bash options have execution effects that depend on the
+// COMMAND rather than on the option, so neither can be decided from the option
+// alone. Measured on bash 5.2.21:
+//
+//	bash -r -c "/usr/bin/go version"    exit 1, no Go   (restricted blocks a slash)
+//	bash -r -c "go version"             exit 0, Go RAN
+//	bash +r -c "..."                    exit 2          (+r is not valid bash)
+//	bash -e -c "false; go version"      exit 1, no Go
+//	bash -e -c "true; go version"       exit 0, Go RAN
+//	bash -e -c "go version; false"      exit 1, Go RAN  (failure comes after)
+//	bash -e -c "go version"             exit 0, Go RAN
+//	bash -e +e -c "false; go version"   exit 0, Go RAN
+//	bash -n +n -e -c "false; go version" exit 1, no Go  (final options decide)
+//
+// RESTRICTED fails closed: it also blocks redirections, cd and PATH
+// assignment, none of which this lexer models, so modelling a fraction of it
+// would be the same over-claim this uid keeps producing. ERREXIT keeps the
+// common single-segment case working and refuses chains, because which segment
+// runs depends on runtime exit status.
+func TestPhaseInstrumentHonoursConditionalBashEffects(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"restricted refuses", `bash -r -c "/root/go/bin/go test ./internal/transcript"`, phaseBucketUnknown},
+		{"restricted refuses even when it would run", `bash -r -c "go test ./..."`, phaseBucketUnknown},
+		{"long restricted refuses", `bash --restricted -c "go test ./..."`, phaseBucketUnknown},
+		{"plus r is not valid bash", `bash +r -c "go test ./..."`, phaseBucketUnknown},
+		{"set -o restricted refuses", `bash -o restricted -c "go test ./..."`, phaseBucketUnknown},
+		{"errexit chain refuses", `bash -e -c "false; go test ./internal/transcript"`, phaseBucketUnknown},
+		{"errexit chain refuses under sh", `sh -e -c "false; go test ./..."`, phaseBucketUnknown},
+		{"set -o errexit chain refuses", `bash -o errexit -c "false; go test ./..."`, phaseBucketUnknown},
+		{"ordering uses the final options", `bash -n +n -e -c "false; go test ./..."`, phaseBucketUnknown},
+		// CONTROLS: unrestricted and cleared-errexit really do execute.
+		{"errexit alone still classifies", `bash -e -c "go test ./..."`, phaseBucketTest},
+		{"cleared errexit classifies the chain", `bash -e +e -c "false; go test ./..."`, phaseBucketMixed},
+		{"cleared set -o errexit classifies", `bash +o errexit -c "false; go test ./..."`, phaseBucketMixed},
+		{"unrestricted control", `bash -c "go test ./..."`, phaseBucketTest},
+		{"plain chain without errexit", `bash -c "false; go test ./..."`, phaseBucketMixed},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentWrapperAndEffectSplitWrites runs the round-17 witnesses
+// through the seven-byte split-write path, each paired with a control.
+func TestPhaseInstrumentWrapperAndEffectSplitWrites(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"timeout unknown option", `timeout --definitely-invalid 1s go test ./internal/transcript`, phaseBucketUnknown},
+		{"timeout delimiter", `timeout 1s -- go test ./internal/transcript`, phaseBucketUnknown},
+		{"timeout invalid signal", `timeout -s -999 1s go test ./internal/transcript`, phaseBucketUnknown},
+		{"timeout control", `timeout 1s go test ./internal/transcript`, phaseBucketTest},
+		{"restricted", `bash -r -c "/root/go/bin/go test ./internal/transcript"`, phaseBucketUnknown},
+		{"restricted control", `bash -c "/root/go/bin/go test ./internal/transcript"`, phaseBucketTest},
+		{"errexit chain", `bash -e -c "false; go test ./internal/transcript"`, phaseBucketUnknown},
+		{"errexit control", `bash -e -c "go test ./internal/transcript"`, phaseBucketTest},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughSplitWrites(t, tc.command, tc.want) })
+	}
+}

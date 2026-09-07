@@ -152,6 +152,20 @@ const (
 	// +n`, `--dump-po-strings +n`, `--help +n`, `--version +n` - each exit 0
 	// with zero Go invocations (#1930 round-16).
 	effectTerminal
+	// effectErrexit: CLEARABLE, and its consequence depends on the COMMAND, not
+	// on the option. Measured: `bash -e -c "false; go version"` runs no Go,
+	// `bash -e -c "true; go version"` and `bash -e -c "go version"` both run,
+	// and `bash -e -c "go version; false"` RUNS Go because the failure comes
+	// after it. A single-segment command string is therefore unaffected; a
+	// multi-segment one cannot be decided statically and refuses.
+	effectErrexit
+	// effectRestricted: FAIL CLOSED. Restricted mode blocks a command
+	// containing a slash - `bash -r -c "/usr/bin/go version"` exits 1 and runs
+	// no Go while `bash -r -c "go version"` runs - and also blocks
+	// redirections, cd and PATH assignment, none of which this lexer models.
+	// Rather than model a fraction of it, any restricted flag refuses. `+r` is
+	// not even valid bash (`bash: +r: invalid option`, exit 2).
+	effectRestricted
 )
 
 // argumentForm is how an option accepts its value. Inline `=` is rejected by
@@ -255,16 +269,22 @@ var interpreterGrammars = map[string]interpreterGrammar{
 		declared:          true,
 		commandStringPlus: true,
 		// Every letter measured on BOTH signs: all 22 run Go.
-		shortOptions: withShortOption(withShortOption(withShortOption(withShortOption(
-			plainShortOptions("abefhiklmprstuvxBCEHPT"),
+		shortOptions: withShortOption(withShortOption(withShortOption(withShortOption(withShortOption(withShortOption(
+			plainShortOptions("abfhiklmpstuvxBCEHPT"),
 			'n', shortOption{effect: effectNoexec}),
+			'e', shortOption{effect: effectErrexit}),
+			'r', shortOption{effect: effectRestricted}),
 			'D', shortOption{effect: effectTerminal}),
 			'o', shortOption{takesValue: true, valueDomain: bashSetOptions,
-				valueEffect: map[string]optionEffect{"noexec": effectNoexec}}),
+				valueEffect: map[string]optionEffect{
+					"noexec": effectNoexec, "errexit": effectErrexit,
+					"restricted": effectRestricted, "privileged": effectNone,
+				}}),
 			'O', shortOption{takesValue: true, valueDomain: bashShoptOptions}),
 		longOptions: map[string]longOption{
 			"--login": {}, "--noprofile": {}, "--norc": {}, "--posix": {},
-			"--restricted": {}, "--verbose": {}, "--noediting": {},
+			"--restricted": {effect: effectRestricted},
+			"--verbose":    {}, "--noediting": {},
 			"--debugger": {}, "--pretty-print": {},
 			"--rcfile":    {form: argSeparate},
 			"--init-file": {form: argSeparate},
@@ -279,11 +299,14 @@ var interpreterGrammars = map[string]interpreterGrammar{
 	"sh": {
 		declared:          true,
 		commandStringPlus: true,
-		shortOptions: withShortOption(withShortOption(
-			plainShortOptions("abCefilmuvx"),
+		shortOptions: withShortOption(withShortOption(withShortOption(
+			plainShortOptions("abCfilmuvx"),
 			'n', shortOption{effect: effectNoexec}),
+			'e', shortOption{effect: effectErrexit}),
 			'o', shortOption{takesValue: true, valueDomain: dashSetOptions,
-				valueEffect: map[string]optionEffect{"noexec": effectNoexec}}),
+				valueEffect: map[string]optionEffect{
+					"noexec": effectNoexec, "errexit": effectErrexit,
+				}}),
 		longOptions: map[string]longOption{},
 	},
 	// zsh IS INSTALLED NOWHERE IN THIS LOOP - not on this box and not in the
@@ -301,6 +324,10 @@ const (
 	// does - a script operand, or an option that suppressed execution.
 	interpreterRunsNoCommandString interpreterOptionOutcome = iota
 	interpreterRunsCommandString
+	// interpreterRunsCommandStringUnderErrexit: the command string runs, but a
+	// failing segment aborts the rest, so only a SINGLE-segment string can be
+	// classified confidently.
+	interpreterRunsCommandStringUnderErrexit
 	// interpreterUndeclared: outside the measured grammar. The shell aborts on
 	// these, and we refuse rather than guess.
 	interpreterUndeclared
@@ -314,6 +341,7 @@ func scanInterpreterOptions(interpreter string, tokens []shellToken) (interprete
 		return interpreterUndeclared, 0
 	}
 	noexec, terminal, sawShortCluster := false, false, false
+	errexit, restricted := false, false
 	for index := 0; index < len(tokens); index++ {
 		text := tokens[index].text()
 		switch {
@@ -341,8 +369,13 @@ func scanInterpreterOptions(interpreter string, tokens []shellToken) (interprete
 			if !declared {
 				return interpreterUndeclared, 0
 			}
-			if option.effect == effectTerminal {
+			switch option.effect {
+			case effectTerminal:
 				terminal = true
+			case effectRestricted:
+				restricted = true
+			case effectErrexit:
+				errexit = true
 			}
 			if option.form == argSeparate {
 				index++
@@ -384,6 +417,10 @@ func scanInterpreterOptions(interpreter string, tokens []shellToken) (interprete
 							noexec = enabling
 						case effectTerminal:
 							terminal = true
+						case effectErrexit:
+							errexit = enabling
+						case effectRestricted:
+							restricted = true
 						}
 					}
 					index++
@@ -395,11 +432,24 @@ func scanInterpreterOptions(interpreter string, tokens []shellToken) (interprete
 				case effectTerminal:
 					// STICKY on either sign, and never cleared by a later +n.
 					terminal = true
+				case effectErrexit:
+					errexit = enabling
+				case effectRestricted:
+					// `+r` is not valid bash at all, so either sign refuses.
+					restricted = true
 				}
 			}
 			if commandString {
+				if restricted {
+					// FAIL CLOSED: whether the command runs depends on text
+					// this lexer does not model.
+					return interpreterUndeclared, 0
+				}
 				if noexec || terminal {
 					return interpreterRunsNoCommandString, 0
+				}
+				if errexit {
+					return interpreterRunsCommandStringUnderErrexit, index + 1
 				}
 				return interpreterRunsCommandString, index + 1
 			}
@@ -610,52 +660,186 @@ func shellFields(command string) []string {
 // consumeWrapperArguments drops a wrapper's own flags and, for wrappers that
 // take a positional operand of their own, that operand too. It stops at the
 // first token that is neither, which is the wrapped command.
-func consumeWrapperArguments(wrapper string, fields []string) []string {
-	for len(fields) > 0 {
-		token := strings.Trim(fields[0], "'\"")
-		if strings.HasPrefix(token, "-") {
-			fields = fields[1:]
-			if flagTakesValue(wrapper, token) && len(fields) > 0 && !strings.HasPrefix(fields[0], "-") {
-				fields = fields[1:]
-			}
-			continue
-		}
-		if wrapper == "timeout" && isDurationOperand(token) {
-			fields = fields[1:]
-			continue
-		}
-		return fields
-	}
-	return fields
+// WRAPPER GRAMMARS, DECLARED PER WRAPPER (#1930 round-17 F33). The previous
+// consumer treated EVERY dash-prefixed token as a wrapper option and stripped
+// it, so an option the real wrapper rejects vanished and whatever followed got
+// a confident bucket. Measured against GNU coreutils 9.4 at /usr/bin/timeout:
+//
+//	/usr/bin/timeout --definitely-invalid 1s go version  exit 125, no Go
+//	/usr/bin/timeout -s -999 1s go version               exit 125, no Go
+//	/usr/bin/timeout 1s -- go version                    exit 127, no Go
+//	/usr/bin/timeout 1s go version                       exit 0,   Go RAN
+//	timeout 1s -x go version                             exit 127, no Go
+//	timeout 1x / abc go version                          exit 125, no Go
+//
+// NOTE ON `timeout <dur> --`: the `timeout` FIRST ON PATH here is not GNU - it
+// is a clap-based clone that RUNS that form (exit 0) where GNU exits 127. Two
+// installed implementations disagree, so no confident bucket exists and it
+// refuses. That is a different reason from "unmeasured": it is measured twice
+// with different answers.
+type wrapperOption struct {
+	takesValue bool
+	// valueDomain reports whether a value is one the real wrapper accepts.
+	// nil means any value is accepted.
+	valueDomain func(string) bool
+	// terminal marks an option that prints and never runs the command.
+	terminal bool
 }
 
-// flagTakesValue reports whether a wrapper flag consumes the following token.
-// Unknown flags are treated as value-taking ONLY where the wrapper is known to
-// use that shape, so a boolean flag never swallows the wrapped command.
-func flagTakesValue(wrapper, flag string) bool {
-	if strings.Contains(flag, "=") {
+type wrapperGrammar struct {
+	options map[string]wrapperOption
+	// requiresDuration marks a wrapper whose first operand is a duration and
+	// whose NEXT token is then the command, dash-prefixed or not.
+	requiresDuration bool
+	declared         bool
+}
+
+func isSignalOperand(value string) bool {
+	name := strings.TrimPrefix(strings.ToUpper(strings.TrimSpace(value)), "SIG")
+	switch name {
+	case "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE", "KILL",
+		"USR1", "SEGV", "USR2", "PIPE", "ALRM", "TERM", "STKFLT", "CHLD",
+		"CONT", "STOP", "TSTP", "TTIN", "TTOU", "URG", "XCPU", "XFSZ",
+		"VTALRM", "PROF", "WINCH", "IO", "PWR", "SYS":
+		return true
+	}
+	if name == "" || !isAllDigitsOrDot(name) || strings.Contains(name, ".") {
 		return false
 	}
-	switch wrapper {
-	case "sudo":
-		return flag == "-u" || flag == "-g" || flag == "-U" || flag == "--user" || flag == "--group"
-	case "nice", "ionice":
-		return flag == "-n" || flag == "-c" || flag == "--adjustment"
-	case "timeout":
-		return flag == "-s" || flag == "-k" || flag == "--signal" || flag == "--kill-after"
-	case "xargs":
-		return flag == "-n" || flag == "-P" || flag == "-I" || flag == "-d"
-	case "stdbuf":
-		return flag == "-i" || flag == "-o" || flag == "-e"
-	case "time":
-		// GNU time's -f/-o take values; -p and -v do not.
-		return flag == "-f" || flag == "-o" || flag == "--format" || flag == "--output"
+	// A numeric signal must be a real one: `-s -999` exits 125.
+	number := 0
+	for _, digit := range name {
+		number = number*10 + int(digit-'0')
+		if number > 64 {
+			return false
+		}
 	}
-	return false
+	return number >= 1 && number <= 64
 }
 
-// isDurationOperand reports whether a token is a bare timeout duration such as
-// 25m, 90, 1.5h or 30s. It deliberately does NOT match a command name.
+var wrapperGrammars = map[string]wrapperGrammar{
+	"timeout": {
+		declared:         true,
+		requiresDuration: true,
+		options: map[string]wrapperOption{
+			"-s":                {takesValue: true, valueDomain: isSignalOperand},
+			"--signal":          {takesValue: true, valueDomain: isSignalOperand},
+			"-k":                {takesValue: true, valueDomain: isDurationOperand},
+			"--kill-after":      {takesValue: true, valueDomain: isDurationOperand},
+			"--preserve-status": {}, "--foreground": {},
+			"-v": {}, "--verbose": {},
+			"--help": {terminal: true}, "--version": {terminal: true},
+		},
+	},
+	"sudo": {declared: true, options: map[string]wrapperOption{
+		"-u": {takesValue: true}, "--user": {takesValue: true},
+		"-g": {takesValue: true}, "--group": {takesValue: true},
+		"-U": {takesValue: true}, "-E": {}, "--preserve-env": {}, "-n": {},
+		"--non-interactive": {}, "-H": {}, "-i": {}, "-s": {},
+	}},
+	"nice": {declared: true, options: map[string]wrapperOption{
+		"-n":           {takesValue: true, valueDomain: isAllDigitsOrDot},
+		"--adjustment": {takesValue: true, valueDomain: isAllDigitsOrDot},
+	}},
+	"ionice": {declared: true, options: map[string]wrapperOption{
+		"-c": {takesValue: true, valueDomain: isAllDigitsOrDot},
+		"-n": {takesValue: true, valueDomain: isAllDigitsOrDot},
+		"-t": {},
+	}},
+	"xargs": {declared: true, options: map[string]wrapperOption{
+		"-n": {takesValue: true}, "-P": {takesValue: true},
+		"-I": {takesValue: true}, "-d": {takesValue: true},
+		"-0": {}, "--null": {}, "-r": {}, "--no-run-if-empty": {},
+	}},
+	"stdbuf": {declared: true, options: map[string]wrapperOption{
+		"-i": {takesValue: true}, "-o": {takesValue: true}, "-e": {takesValue: true},
+	}},
+	"time": {declared: true, options: map[string]wrapperOption{
+		"-f": {takesValue: true}, "--format": {takesValue: true},
+		"-o": {takesValue: true}, "--output": {takesValue: true},
+		"-p": {}, "-v": {}, "--verbose": {},
+	}},
+}
+
+type wrapperOutcome int
+
+const (
+	wrapperRunsCommand wrapperOutcome = iota
+	// wrapperRunsNothing: a terminal option, or no command at all.
+	wrapperRunsNothing
+	// wrapperUndeclared: an option, value or operand the real wrapper rejects,
+	// or a form on which installed implementations disagree.
+	wrapperUndeclared
+)
+
+// scanWrapperArguments consumes a wrapper's OWN options and operands and
+// returns the index at which its command begins.
+func scanWrapperArguments(wrapper string, tokens []shellToken) (wrapperOutcome, int) {
+	grammar, declared := wrapperGrammars[wrapper]
+	if !declared {
+		return wrapperUndeclared, 0
+	}
+	index := 0
+	for index < len(tokens) {
+		text := tokens[index].text()
+		if !strings.HasPrefix(text, "-") || text == "-" {
+			break
+		}
+		name, inlineValue, hasInline := strings.Cut(text, "=")
+		option, known := grammar.options[name]
+		if !known {
+			// The real wrapper exits rather than running anything.
+			return wrapperUndeclared, 0
+		}
+		if option.terminal {
+			return wrapperRunsNothing, 0
+		}
+		if hasInline {
+			if !option.takesValue {
+				return wrapperUndeclared, 0
+			}
+			if option.valueDomain != nil && !option.valueDomain(inlineValue) {
+				return wrapperUndeclared, 0
+			}
+			index++
+			continue
+		}
+		index++
+		if option.takesValue {
+			if index >= len(tokens) {
+				return wrapperUndeclared, 0
+			}
+			value := tokens[index].text()
+			if option.valueDomain != nil && !option.valueDomain(value) {
+				return wrapperUndeclared, 0
+			}
+			index++
+		}
+	}
+	if grammar.requiresDuration {
+		if index >= len(tokens) {
+			return wrapperRunsNothing, 0
+		}
+		if !isDurationOperand(tokens[index].text()) {
+			// `timeout 1x` and `timeout abc` exit 125.
+			return wrapperUndeclared, 0
+		}
+		index++
+		if index < len(tokens) && tokens[index].text() == "--" {
+			// GNU makes `--` the command (exit 127); the clone on PATH runs the
+			// following command instead. Implementations disagree, so refuse.
+			return wrapperUndeclared, 0
+		}
+	}
+	if index >= len(tokens) {
+		return wrapperRunsNothing, 0
+	}
+	// WHATEVER FOLLOWS IS THE COMMAND, dash-prefixed or not: `timeout 1s -x go
+	// version` exits 127 because `-x` is the command, so it must not be
+	// stripped as though it were a wrapper option.
+	return wrapperRunsCommand, index
+}
+
 func isDurationOperand(token string) bool {
 	if token == "" {
 		return false
@@ -738,6 +922,7 @@ func classifyCommandSegment(segment string, depth int) string {
 			// than the shape of any single token (#1930 round-12 F1,
 			// round-13 F1).
 			outcome, commandStringAt := scanInterpreterOptions(head, tokens[1:])
+			underErrexit := outcome == interpreterRunsCommandStringUnderErrexit
 			switch outcome {
 			case interpreterUndeclared:
 				// The shell exits without running anything, and this lexer does
@@ -763,7 +948,14 @@ func classifyCommandSegment(segment string, depth int) string {
 			// guard present the mutant that disables it SURVIVED the suite.
 			// The behaviour is pinned by TestPhaseInstrumentHonoursCommandStringArity
 			// instead, which fails if that recursion ever stops returning other.
-			return classifyPhaseCommandDepth(rest[0].text(), depth+1)
+			commandString := rest[0].text()
+			if underErrexit && len(splitCommandSegments(commandString)) > 1 {
+				// Measured: `bash -e -c "false; go version"` runs no Go while
+				// `bash -e -c "go version; false"` does. Which segments run
+				// depends on runtime exit status, so a chain refuses.
+				return phaseBucketUnknown
+			}
+			return classifyPhaseCommandDepth(commandString, depth+1)
 		case "nohup":
 			// nohup EXECS ITS OPERAND, so it really is an exec wrapper:
 			// `nohup go version` invokes Go (measured). It owns no assignments
@@ -779,13 +971,14 @@ func classifyCommandSegment(segment string, depth int) string {
 			// Consume the wrapper, then its flags, then the one non-flag operand
 			// those flags take (timeout's duration, sudo -u's user is already a
 			// flag value, nice -n's level likewise).
-			tokens = tokens[1:]
-			words := make([]string, 0, len(tokens))
-			for _, token := range tokens {
-				words = append(words, token.text())
+			outcome, commandAt := scanWrapperArguments(head, tokens[1:])
+			switch outcome {
+			case wrapperUndeclared:
+				return phaseBucketUnknown
+			case wrapperRunsNothing:
+				return phaseBucketOther
 			}
-			words = consumeWrapperArguments(head, words)
-			tokens = tokens[len(tokens)-len(words):]
+			tokens = tokens[1+commandAt:]
 			continue
 		case "cd", "export", "pushd", "popd", "mkdir", "rm", "cp", "mv", "echo", "set":
 			// `source` is deliberately NOT here: it runs another file, which
