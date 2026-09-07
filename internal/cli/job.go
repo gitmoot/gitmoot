@@ -194,6 +194,9 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 	repo := fs.String("repo", "", "repo scope as owner/repo")
 	state := fs.String("state", "", "job state filter")
 	workflowID := fs.String("workflow", "", "external-coordinator workflow label")
+	// #1726: the abandoned population is otherwise reachable only by grepping
+	// failure messages for two different renderings of the same fact.
+	killed := fs.Bool("killed", false, "only jobs whose delivery was killed by a signal and which nothing requeued")
 	jsonOutput := fs.Bool("json", false, "print jobs (with operational detail) as JSON")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -231,6 +234,10 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 	var deliveryEventsKnown bool
 	var locks []db.ResourceLock
 	var reviewStatuses map[string]reviewStatusDisplay
+	// signalKilled is the #1726 filter set; killedErr is kept so a lookup failure
+	// refuses the listing rather than widening it.
+	var signalKilled map[string]string
+	var killedErr error
 	var paths config.Paths
 	if err := withStoreAndPaths(*home, func(resolvedPaths config.Paths, store *db.Store) error {
 		paths = resolvedPaths
@@ -244,6 +251,13 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 			return err
 		}
 		preflightFailed, _ = store.JobIDsWithEventKind(context.Background(), "delegation_preflight_failed")
+		if *killed {
+			// A LOOKUP FAILURE MUST NOT SILENTLY WIDEN THE FILTER. Every other map
+			// here is best-effort because losing it only drops a column; losing this
+			// one would list every job as killed, which is the wrong direction for a
+			// filter an operator uses to find abandoned work.
+			signalKilled, killedErr = store.JobIDsWithEventKind(context.Background(), workflow.DeliverySignalKilledEvent)
+		}
 		reasonEvents, _ = store.LatestJobEventsOfKinds(context.Background(), stuckReasonEventKinds)
 		deliveryEvents, err = store.LatestJobEventsOfKinds(context.Background(), deliveryStatusEventKinds)
 		deliveryEventsKnown = err == nil
@@ -253,6 +267,13 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 	}); err != nil {
 		fmt.Fprintf(stderr, "job list: %v\n", err)
 		return 1
+	}
+	if *killed {
+		if killedErr != nil {
+			fmt.Fprintf(stderr, "job list: --killed could not read signal-kill evidence: %v\n", killedErr)
+			return 1
+		}
+		jobs = retainJobsWithID(jobs, signalKilled)
 	}
 	filtered := filterJobs(jobs, *repo, *state)
 	for jobID, status := range deriveDispatchedReviewStatuses(paths, filtered) {
@@ -1505,6 +1526,19 @@ func parseSingleJobIDExitCode(args []string) int {
 		return 0
 	}
 	return 2
+}
+
+// retainJobsWithID keeps only the jobs named in keep, preserving input order.
+// An empty keep set yields an empty result, which is the correct answer for a
+// filter: no matching evidence means no matching jobs, never all of them.
+func retainJobsWithID(jobs []db.Job, keep map[string]string) []db.Job {
+	retained := make([]db.Job, 0, len(keep))
+	for _, job := range jobs {
+		if _, ok := keep[job.ID]; ok {
+			retained = append(retained, job)
+		}
+	}
+	return retained
 }
 
 func filterJobs(jobs []db.Job, repoFilter string, stateFilter string) []db.Job {
