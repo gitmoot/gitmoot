@@ -264,14 +264,19 @@ func PipelineStageJobRequest(rec db.Pipeline, stage Stage, run db.PipelineRun, a
 	}
 	if stage.Agent != "" {
 		request := workflow.JobRequest{
-			ID:               pipelineStageJobID(run.ID, stage.ID, attempt),
-			Agent:            stage.Agent,
-			Action:           stage.Action,
-			Repo:             rec.Repo,
-			Sender:           workflow.PipelineJobSender,
-			Instructions:     instructions,
-			Fingerprint:      pipelineStageFingerprint(rec.Name, run.ID, stage.ID, attempt),
-			RootJobID:        run.ID,
+			ID:           pipelineStageJobID(run.ID, stage.ID, attempt),
+			Agent:        stage.Agent,
+			Action:       stage.Action,
+			Repo:         rec.Repo,
+			Sender:       workflow.PipelineJobSender,
+			Instructions: instructions,
+			Fingerprint:  pipelineStageFingerprint(rec.Name, run.ID, stage.ID, attempt),
+			RootJobID:    run.ID,
+			// #1967: RootJobID already ties the job to its run, but root_id is not
+			// dispatcher identity - a run self-roots when no root is passed, so an
+			// empty-rooted job and a genuinely root-dispatched one are
+			// indistinguishable. Name the pipeline that ordered the stage.
+			DispatchedBy:     "pipeline:" + rec.Name,
 			JobTimeout:       stage.Timeout,
 			PipelineInputEnv: append([]string(nil), pipelineInputEnv...),
 		}

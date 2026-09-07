@@ -1346,13 +1346,29 @@ const (
 	// Type == "implement", which is exactly what collectImplementerAttribution
 	// reads. The gate still refuses — attribution genuinely is unknown — but the
 	// lane can now clear it without a coordinator round.
-	noImplementJobAttributionReason            = "latest review round's approval is NOT disqualified, but independence cannot be verified: no implement job is recorded for this task, so the gate cannot establish who implemented it. This is an attribution gap, not a failed independence check, and it is the expected state for in-session implementation. Remedy, runnable by the implementing lane: record the durable attribution row with gitmoot job record --agent <implementing-agent> --repo <owner/repo> --type implement --decision implemented --task <task-id> --pr <number> --head-sha <sha>, then re-evaluate. Do not record an agent that did not implement, and do not record the reviewer"
+	noImplementJobAttributionReason            = "latest review round's approval is NOT disqualified, but independence cannot be verified: no implement job is recorded for this task, so the gate cannot establish who implemented it. This is an attribution gap, not a failed independence check, and it is the expected state for in-session implementation. Remedy, runnable by the implementing lane: record the durable attribution row with gitmoot job record --agent <implementing-agent> --repo <owner/repo> --type implement --decision implemented --task <task-id> --pr <number> --head-sha <sha>, then re-evaluate. Do not record an agent that did not implement, and do not record the reviewer. If the work was done in session by an org role that is not a registered agent, record --acting-role <role> in place of --agent: attribution is then the role, and independence is still enforced against it"
 	emptyImplementAgentAttributionReason       = "latest review round's approval cannot be verified as independent: an implement job matches this task but has no recorded agent; this is an attribution data anomaly"
 	malformedImplementPayloadAttributionReason = "latest review round's approval cannot be verified as independent: an implement job has a malformed payload, so attribution for this task cannot be verified; this is a corrupt-record anomaly"
 )
 
+// implementerIdentity is WHO implemented a task, and of which KIND. It exists
+// because "the implementer" is not always a registered agent: work done in
+// session by a coordinator has an acting ORG ROLE and no agent at all (#1718),
+// and recording an agent for it would be a false statement about who acted.
+//
+// Independence is compared BY NAME REGARDLESS OF KIND: one name is treated as one
+// actor, so an agent may not approve work attributed to the identically named
+// role. The kind matters for a different question - whether the identity can be
+// DISPATCHED - which is why autoFixOwner filters on it and the gate does not.
+type implementerIdentity struct {
+	Name string
+	// FromActingRole records that this attribution came from the payload's acting
+	// org role rather than the job's agent column. A role cannot be enqueued.
+	FromActingRole bool
+}
+
 type implementerAttributionEvidence struct {
-	agents              map[string]struct{}
+	agents              map[string]implementerIdentity
 	sawImplementJob     bool
 	sawEmptyAgent       bool
 	sawMalformedPayload bool
@@ -1381,7 +1397,7 @@ func collectGateImplementerAttribution(jobs []db.Job, current JobPayload) implem
 
 func collectImplementerAttributionMatching(jobs []db.Job, current JobPayload,
 	matches func(current JobPayload, payload JobPayload) bool) implementerAttributionEvidence {
-	evidence := implementerAttributionEvidence{agents: make(map[string]struct{})}
+	evidence := implementerAttributionEvidence{agents: make(map[string]implementerIdentity)}
 	for _, job := range jobs {
 		if job.Type != "implement" {
 			continue
@@ -1404,11 +1420,35 @@ func collectImplementerAttributionMatching(jobs []db.Job, current JobPayload,
 			continue
 		}
 		agent := strings.TrimSpace(job.Agent)
-		if agent == "" {
+		role := NormalizeActingOrgRole(payload.ActingOrgRole)
+		switch {
+		case agent != "":
+			// AN AGENT COLUMN ALWAYS WINS OVER A ROLE, and the order is load-bearing
+			// rather than cosmetic. Ordinary dispatched implement jobs carry the
+			// DISPATCHING coordinator's role in this same payload, so reading the role
+			// first would attribute every agent's work to its coordinator, make that
+			// coordinator an implementer of everything, and then disqualify it from
+			// reviewing anything.
+			evidence.agents[agent] = implementerIdentity{Name: agent}
+		case role != "":
+			// A ROLE NEVER DOWNGRADES AN AGENT ALREADY RECORDED UNDER THE SAME NAME,
+			// AND THAT IS WHY THIS IS A CONDITIONAL WRITE RATHER THAN A PLAIN ONE.
+			// The first version of this switch applied the agent-wins rule WITHIN one
+			// job and left it out ACROSS rows, so a task carrying both a dispatchable
+			// agent row named X and a session row for role X kept whichever ListJobs
+			// happened to visit last. autoFixOwner then discards role identities and
+			// could report no dispatchable implementer while the agent row sat right
+			// there - routing decided by job-id order. Found in review, and it is the
+			// same rule I had already written one scope too narrow.
+			if existing, recorded := evidence.agents[role]; recorded && !existing.FromActingRole {
+				continue
+			}
+			// The #1916 shape: implemented in session by an org role, no agent to
+			// name. Attributable, and still subject to the independence check.
+			evidence.agents[role] = implementerIdentity{Name: role, FromActingRole: true}
+		default:
 			evidence.sawEmptyAgent = true
-			continue
 		}
-		evidence.agents[agent] = struct{}{}
 	}
 	return evidence
 }

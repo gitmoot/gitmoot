@@ -54,15 +54,14 @@ infrastructure rather than the documented boundary they are:
   requires cgo; enable cgo by setting CGO_ENABLED=1`). It is covered by CI's race
   shards only, and its absence from a seat verdict is not a regression.
 
-When a seat's plain `go` returns 126, staging did not happen — but **only some of
-those cases say why.** `stageSeatToolchain` deliberately stays SILENT when no `go`
-is on the daemon's `PATH`, when the toolchain sits under a system-package prefix,
-or when the source is not a pinned installation (`ErrNotPinned`): the seat is left
-exactly as it was, with no diagnostic. Other staging failures do print
-`gitmoot: read-only seat toolchain:` on the daemon's stderr, never in the job's
-events. See `docs/troubleshooting.md`, "`Permission denied`, exit 126, running
-Go", for the refusal list (unpinned source, system-package prefix, symlink in the
-source set, free space below the 4 GiB floor).
+When a seat's plain `go` returns 126, no usable toolchain was staged. The command
+is an engine-owned failure stub, never a fallthrough to the operator's `go`.
+An absent `go` on the daemon `PATH` is silent; an unpinned source, copy failure,
+or unsafe path prints `gitmoot: read-only seat toolchain:` on daemon stderr,
+never in job events. `/opt`, `/usr/local`, `/nix/store`, `/snap`, and profile
+installations all take the same daemon-owned copy path; none retains a recursive
+host-root grant. See `docs/troubleshooting.md`, "`Permission denied`, exit 126,
+running Go".
 
 Run from the repo root and make these pass before committing — they mirror the CI
 gate in `.github/workflows/ci.yml`:
@@ -811,12 +810,14 @@ pinging X is the action.
   `perf:`, optional scope (e.g. `feat(workflow): …`). Reference issues with
   `(#NNN)`.
 - **Branches / PRs**: do **not** push directly to `main`. Branch, open a PR, let
-  CI (`build / vet / test`) pass, get one clean independent review at the exact
-  head, then whoever holds merge authority for that role in the org config
-  **squash-merges** — the coordinator under `merge_rule = "self"` only after
-  satisfying the row-107983 safeguards above, or the owner under
-  `merge_rule = "owner"`. One PR per issue, with deploy notes in the body.
-  Cutting a public release stays an OWNER decision either way.
+  CI (`build / vet / test`) pass, then whoever holds merge authority for that
+  role in the org config **squash-merges**. An explicit owner authorization is
+  itself sufficient authority to merge, wherever it arrives — including a
+  direct instruction to the seat, which is invisible in a coordinator's
+  channels. Never hold an owner-authorized merge waiting for a process step the
+  owner has waived; verify the head, not the owner's permission. One PR per
+  issue, with deploy notes in the body. Cutting a public release stays an OWNER
+  decision either way.
 - **Scope**: preserve existing behavior unless the change requires otherwise.
 - For machine-local agent notes, use a gitignored `CLAUDE.local.md` rather than
   editing this shared file. Gitignored (local-only, not in the repo): `/GOALS/`,

@@ -63,6 +63,22 @@ func effectiveReviewDecisionForPayload(payload JobPayload, blockingSeverity stri
 	if IsPipelineReviewPayload(payload) {
 		return strings.TrimSpace(payload.Result.Decision)
 	}
+	// Phantom-verdict class #1351/#1417/#1557. A FAN-OUT is a coordinator's
+	// dispatch record, not an answer about the code, so there is nothing to
+	// discount: folding its below-bar severity to "approved" grants a panel the
+	// credit for an inspection none of its lenses has reported. Measured on
+	// #1910, where a parent announcing three lenses - two of which never ran -
+	// was rendered `approved-with-notes` on the PR.
+	//
+	// The raw decision is returned rather than a refusal so the row keeps
+	// describing itself; every consumer that already classifies fan-out (the
+	// merge gate, the wake path, required-reviewer credit) is unaffected, and
+	// the three that did not now inherit the exclusion instead of re-deriving
+	// it. The severity BAR is untouched: an ordinary below-bar review still
+	// folds, which TestDelegatedReviewEvidenceUsesBlockingSeverity pins.
+	if ResultIsFanOut(payload.Result) {
+		return strings.TrimSpace(payload.Result.Decision)
+	}
 	return effectiveReviewDecision(payload.Result, blockingSeverity)
 }
 

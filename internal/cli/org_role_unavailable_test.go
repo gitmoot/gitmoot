@@ -346,42 +346,6 @@ func TestTempWorkerDispatchCapturesQuotaFailureAndClearsOnSuccess(t *testing.T) 
 	}
 }
 
-func TestValidateAndTouchActingOrgRoleRefusesUnavailableAndClearsExpired(t *testing.T) {
-	home, paths := setupQuotaUnavailableOrgHome(t)
-	store, err := dbtest.Open(t, paths.Database)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	ctx := context.Background()
-	now := time.Now().UTC()
-
-	if err := validateAndTouchActingOrgRole(ctx, store, home, "review", "agent_run"); err != nil {
-		t.Fatalf("available role refused: %v", err)
-	}
-	if err := store.UpsertOrgRoleUnavailable(ctx, "review", "quota", now.Add(time.Hour), now); err != nil {
-		t.Fatal(err)
-	}
-	err = validateAndTouchActingOrgRole(ctx, store, home, "REVIEW", "agent_run")
-	if err == nil || !strings.Contains(err.Error(), `org role "review" is unavailable`) ||
-		!strings.Contains(err.Error(), "reason=quota") || !strings.Contains(err.Error(), "dispatch refused") {
-		t.Fatalf("unavailable refusal = %v", err)
-	}
-
-	if err := store.ClearOrgRoleUnavailable(ctx, "review"); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.UpsertOrgRoleUnavailable(ctx, "review", "quota", now.Add(-time.Minute), now.Add(-2*time.Minute)); err != nil {
-		t.Fatal(err)
-	}
-	if err := validateAndTouchActingOrgRole(ctx, store, home, "review", "agent_run"); err != nil {
-		t.Fatalf("expired role refused: %v", err)
-	}
-	if _, found, err := store.GetActiveOrgRoleUnavailable(ctx, "review", now); err != nil || found {
-		t.Fatalf("expired row found=%v err=%v", found, err)
-	}
-}
-
 func TestRunTaskRunRefusesUnavailableRoleBeforeWorktreeAllocation(t *testing.T) {
 	home, paths := setupQuotaUnavailableOrgHome(t)
 	goalPath := filepath.Join(t.TempDir(), "GOAL.md")

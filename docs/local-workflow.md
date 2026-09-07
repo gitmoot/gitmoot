@@ -634,7 +634,11 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    `gitmoot job record --agent <implementing-agent> --repo <owner/repo> --type
    implement --decision implemented --task <task-id> --pr <number> --head-sha
    <sha>`, then re-evaluate. Session-recorded jobs (#657) create rows with
-   `Type == "implement"`, which is exactly what the gate reads. Never record an
+   `Type == "implement"`, which is exactly what the gate reads. If the work was
+   done in session by an org role that is not a registered agent, pass
+   `--acting-role <role>` instead of `--agent`: attribution is then the role,
+   validated against the configured org registry, and the gate still enforces
+   independence against it. Never record an
    agent that did not implement, and never record the reviewer.
 
    When a head reports **no** external CI at all (zero commit-statuses and zero

@@ -82,18 +82,25 @@ func execSandbox(readPaths, readFiles, writePaths []string, argv []string, readO
 		// stages: the filesystem is readable while writes remain allowlisted.
 		rules = append(rules, landlock.RODirs("/"))
 	} else {
-		readable, err := readableRoots(readPaths, executable)
+		readable, err := readableRoots(readPaths)
 		if err != nil {
 			return err
 		}
 		rules = append(rules, landlock.RODirs(readable...))
-		files, err := readableFiles(readFiles)
+		// The executable itself is a FILE grant, never a recursive grant of
+		// its host directory. Runtime package trees and Go roots arrive through
+		// readPaths only after the daemon has staged them into an engine-owned
+		// tree. This is ruling 122157's clean ownership boundary.
+		executableFiles := append([]string{}, readFiles...)
+		executableFiles = append(executableFiles, executable)
+		if resolved, resolveErr := filepath.EvalSymlinks(executable); resolveErr == nil && resolved != executable {
+			executableFiles = append(executableFiles, resolved)
+		}
+		files, err := readableFiles(executableFiles)
 		if err != nil {
 			return err
 		}
-		if len(files) > 0 {
-			rules = append(rules, landlock.ROFiles(files...))
-		}
+		rules = append(rules, landlock.ROFiles(files...))
 		rules = append(rules, landlock.ROFiles(runtimeHostReadFiles...).IgnoreIfMissing())
 	}
 	if len(writable) > 0 {
@@ -145,11 +152,16 @@ func readableFiles(paths []string) ([]string, error) {
 	return files, nil
 }
 
-// readableRoots returns the explicit read-only inputs plus the fixed host roots
-// needed to execute a runtime. Writable roots are intentionally absent: their
-// stronger RWDirs rules already include read rights. Existing stages with no
-// reads declaration bypass this helper and retain the historical RO `/` rule.
-func readableRoots(paths []string, executable string) ([]string, error) {
+// readableRoots returns explicit read-only inputs plus fixed system roots needed
+// to execute a runtime. Writable roots are intentionally absent: their stronger
+// RWDirs rules already include read rights. Existing stages with no reads
+// declaration bypass this helper and retain the historical RO `/` rule.
+//
+// It deliberately knows NOTHING about the executable or Go installation.
+// Runtime package trees and toolchains are copied into daemon-owned roots by the
+// caller and arrive in paths. The executable itself is granted as a file by
+// execSandbox. This removes all recursive host-root inference from the sandbox.
+func readableRoots(paths []string) ([]string, error) {
 	roots := make([]string, 0, len(paths)+12)
 	seen := make(map[string]struct{}, len(paths)+12)
 	add := func(candidate string, required bool) error {
@@ -185,83 +197,17 @@ func readableRoots(paths []string, executable string) ([]string, error) {
 	for _, candidate := range []string{
 		"/bin", "/sbin", "/lib", "/lib64", "/dev",
 		"/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64", "/usr/libexec", "/usr/share",
-		"/usr/local/bin", "/usr/local/sbin", "/usr/local/lib", "/usr/local/lib64", "/usr/local/share",
 		"/etc/ssl/certs", "/etc/pki",
-		// procfs read is a runtime BOOTSTRAP requirement, not a convenience: the
-		// Bun-based Claude/Kimi binaries abort with an opaque crash without it,
-		// and codex's managed bwrap fails reading /proc/sys/kernel/overflowuid.
-		// The legacy no-reads mode always had it via RODirs("/"), so strict read
-		// mode was the regression rather than this grant being a widening.
-		//
-		// EXPOSURE, stated as narrowly as it was measured. One subcase is proven:
-		// /proc/<other-pid>/environ stays denied to a sandboxed process because
-		// Landlock's ptrace domain check gates it (measured — own environ
-		// readable, the live daemon's denied, while an unsandboxed root read of
-		// that same path succeeds). That is NOT a general claim: /proc/<pid>/cmdline,
-		// /proc/net/* and /proc/sys/* are gated by ordinary DAC and hidepid, which
-		// this rule neither tightens nor loosens. Narrowing the grant to /proc/self
-		// plus specific files is a live follow-up, untested here because Landlock
-		// resolves paths at rule-add time while nested runtimes fork new pids.
+		// procfs read is a runtime BOOTSTRAP requirement, not a convenience:
+		// Bun-based Claude/Kimi binaries abort without it and codex's managed
+		// bwrap reads /proc/sys/kernel/overflowuid.
 		"/proc",
 	} {
 		if err := add(candidate, false); err != nil {
 			return nil, err
 		}
 	}
-	if err := addExecutableReadRoots(add, executable); err != nil {
-		return nil, err
-	}
-	if goExecutable, err := execLookPath("go"); err == nil {
-		if root := optionalSystemToolchainRoot(goExecutable); root != "" {
-			if err := add(root, true); err != nil {
-				return nil, err
-			}
-		}
-	}
 	return roots, nil
-}
-
-func addExecutableReadRoots(add func(string, bool) error, executable string) error {
-	if err := add(filepath.Dir(executable), true); err != nil {
-		return err
-	}
-	resolvedExecutable := executable
-	if resolved, err := filepath.EvalSymlinks(executable); err == nil {
-		resolvedExecutable = resolved
-	}
-	executableDir := filepath.Dir(resolvedExecutable)
-	if err := add(executableDir, true); err != nil {
-		return err
-	}
-	if base := filepath.Base(executableDir); base == "bin" || base == "sbin" {
-		installRoot := filepath.Dir(executableDir)
-		if installRoot != "/" && installRoot != "/usr" {
-			return add(installRoot, true)
-		}
-	}
-	return nil
-}
-
-// optionalSystemToolchainRoot grants the Go installation selected by PATH when
-// it lives under a system package root. Review agents must be able to run the
-// repository's toolchain, while a user-controlled binary under /root or /home
-// must not turn its credential-bearing parent into a readable subtree.
-func optionalSystemToolchainRoot(executable string) string {
-	if resolved, err := filepath.EvalSymlinks(executable); err == nil {
-		executable = resolved
-	}
-	binDir := filepath.Dir(filepath.Clean(executable))
-	if base := filepath.Base(binDir); base != "bin" && base != "sbin" {
-		return ""
-	}
-	root := filepath.Dir(binDir)
-	for _, allowed := range []string{"/opt", "/usr/local", "/nix/store", "/snap"} {
-		rel, err := filepath.Rel(allowed, root)
-		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return root
-		}
-	}
-	return ""
 }
 
 func writableRoots(paths []string, workdir string, includeImplicitRoots bool) ([]string, error) {

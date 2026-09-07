@@ -1543,6 +1543,12 @@ func (d Daemon) handlePullRequestWorkflowChange(ctx context.Context, pull github
 		// fanout children identically with zero extra queries. Empty is the legacy
 		// and undirected value; the fanout then behaves exactly as it does today.
 		ActingOrgRole: lock.ActingOrgRole,
+		// #1967: the branch lock owner is the seat whose work caused this review to
+		// be asked for. It is read from the SAME lock row as ActingOrgRole above,
+		// so this costs no extra query, and it is recorded separately from
+		// LeadAgent because LeadAgent means "the reviewer's lead" on other
+		// dispatch paths. An empty owner degrades to Sender ("github").
+		DispatchedBy: lock.Owner,
 	})
 	return mergeReadinessHandled, err
 }

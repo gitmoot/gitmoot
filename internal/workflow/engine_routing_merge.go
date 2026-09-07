@@ -137,9 +137,34 @@ func (e Engine) dispatchFix(ctx context.Context, reviewer string, payload JobPay
 	return nil
 }
 
+// autoFixOwner names the agent that will RUN the auto-fix, so it must return
+// something dispatchable.
+//
+// AN EXPLICIT ACTING ROLE THAT CANNOT BE RESOLVED IS A HARD STOP, AND THAT IS
+// DELIBERATE, NOT A LIMITATION. My first attempt at #1718 made it fall through to
+// attribution-based resolution, and
+// TestEngineAdvanceReviewChangesRequestedDoesNotBypassUnresolvableActingRole
+// caught it: falling back reassigns ownership the coordinator EXPLICITLY set, to
+// the task implementer or a payload default it did not choose. The refusal is the
+// feature.
+//
+// WHAT WAS ACTUALLY WRONG (#1718) IS THE DIAGNOSTIC, NOT THE BLOCK. Returning the
+// role unchanged made it JobRequest.Agent, so the stop surfaced three layers later
+// from an agent-subscription check as `agent "gitmoot" is not subscribed` - a
+// sentence that is false in its own terms, since gitmoot is not an unsubscribed
+// agent but an org ROLE, a different namespace entirely. An operator reading it
+// looks for a subscription that was never the problem. The stop now happens here,
+// where the cause is known, and says so.
 func (e Engine) autoFixOwner(ctx context.Context, payload JobPayload) (string, error) {
 	if role := strings.TrimSpace(payload.ActingOrgRole); role != "" {
-		return role, nil
+		if _, err := e.Store.GetAgent(ctx, role); err == nil {
+			return role, nil
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+		return "", fmt.Errorf(
+			"auto-fix ownership unresolved: acting org role %q is not a registered agent, so it cannot own a fix; org roles and agents are separate namespaces. Assign an implementing agent to this branch or dispatch the fix explicitly - the engine will not reassign an ownership you set",
+			role)
 	}
 	jobs, err := e.Store.ListJobs(ctx)
 	if err != nil {
@@ -153,12 +178,26 @@ func (e Engine) autoFixOwner(ctx context.Context, payload JobPayload) (string, e
 		return "", errors.New("auto-fix ownership unresolved: a matching implement job has no agent")
 	}
 	agents := make([]string, 0, len(evidence.agents))
-	for agent := range evidence.agents {
-		agents = append(agents, agent)
+	roles := make([]string, 0, len(evidence.agents))
+	for name, identity := range evidence.agents {
+		// A ROLE IS ATTRIBUTABLE BUT NOT DISPATCHABLE. Keeping the two apart here is
+		// the whole point: an in-session role can own the credit for the work and
+		// still be an impossible executor for the fix.
+		if identity.FromActingRole {
+			roles = append(roles, name)
+			continue
+		}
+		agents = append(agents, name)
 	}
 	sort.Strings(agents)
+	sort.Strings(roles)
 	switch len(agents) {
 	case 0:
+		if len(roles) > 0 {
+			return "", fmt.Errorf(
+				"auto-fix ownership unresolved: task %s was implemented in session by org role %s, which is not a dispatchable agent; name an implementing agent for the fix instead",
+				payload.TaskID, strings.Join(roles, " "))
+		}
 		return "", fmt.Errorf("auto-fix ownership unresolved: %s", evidence.failureReason())
 	case 1:
 		return agents[0], nil
@@ -219,7 +258,13 @@ func (e Engine) allRequiredReviewersApproved(ctx context.Context, currentReviewe
 
 	blockingSeverity := e.reviewBlockingSeverity(payload.Repo)
 	approved := map[string]bool{}
-	if currentReviewer != "" {
+	// The seed credits the reviewer whose job is being advanced right now, whose
+	// own row the loop below has not read yet. #1351/#1417/#1557: seeding it
+	// UNCONDITIONALLY let a fan-out coordinator satisfy its own required-reviewer
+	// slot, which is the one boundary the loop's own ResultIsFanOut skip cannot
+	// reach - the skip only stops OTHER stored fan-out rows. A coordinator that
+	// announces a panel has approved nothing, including on its own behalf.
+	if currentReviewer != "" && !ResultIsFanOut(payload.Result) {
 		approved[currentReviewer] = true
 	}
 
@@ -862,4 +907,53 @@ func (e Engine) parkTaskAwaitingHumanMerge(ctx context.Context, ref taskRef, rea
 	// A concurrent lifecycle move won the CAS. Preserve it rather than rewriting
 	// a merged, dismissed, or newly reviewed task from a stale gate result.
 	return nil
+}
+
+// objectionBindsToCurrentHead answers whether a changes_requested verdict may
+// transition the task (#1524).
+//
+// THE DEFECT: a verdict is evidence about a COMMIT, not about the branch. This
+// arm transitioned the task unconditionally, so an objection bound to a
+// superseded head pulled a PR out of ready_to_merge - and, because dispatchFix
+// is called inline from it, dispatched a fix leg against findings about that
+// superseded commit.
+//
+// ONLY A CONTRADICTED HEAD REFUSES; both unknowns admit. What refusing would
+// cost is the CONSERVATIVE transition and, inline from here, the FIX PASS - for
+// an objection nobody can show is stale. That liveness cost is the whole reason
+// the unknowns admit.
+//
+// A CLI review dispatched without --head-sha produces the headless payload
+// today, which is why that case is real traffic. The arms are pinned in
+// stale_verdict_head_test.go.
+//
+// ACCEPTED LIMITATION: when the ONLY objection on a PR is bound
+// to a superseded head, this arm strands it. The task does not transition, no fix
+// leg is dispatched, and nothing here re-drives anything - the PR waits for a
+// review at the current head. That is deliberate: a fix pass carrying findings
+// about a commit the branch has moved past is wrong work, not late work. It is
+// also the reason the refusal is terminal rather than retried, and it is not
+// mitigated in this change.
+func (e Engine) objectionBindsToCurrentHead(ctx context.Context, payload JobPayload) (bool, string, error) {
+	objectionHead := strings.TrimSpace(payload.HeadSHA)
+	if objectionHead == "" || payload.PullRequest <= 0 {
+		// Checked before any store read: an unbound objection claims nothing about
+		// any commit, and a PR-less review is already terminal earlier in the
+		// advance path.
+		return true, "", nil
+	}
+	pr, err := e.Store.GetPullRequest(ctx, payload.Repo, int64(payload.PullRequest))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return true, "", nil
+		}
+		return false, "", err
+	}
+	currentHead := strings.TrimSpace(pr.HeadSHA)
+	if currentHead == "" || currentHead == objectionHead {
+		return true, "", nil
+	}
+	return false, fmt.Sprintf(
+		"the objection is bound to head %s but the pull request's current head is %s; a verdict at a superseded head describes a commit the branch has moved past, so the task is not transitioned and no fix leg is dispatched",
+		objectionHead, currentHead), nil
 }

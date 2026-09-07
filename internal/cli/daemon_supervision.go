@@ -610,16 +610,21 @@ func runOneHeartbeat(ctx context.Context, store *db.Store, enqueue heartbeatEnqu
 		}
 	}
 	job, enqueueErr := enqueue(ctx, workflow.JobRequest{
-		ID:                 heartbeatJobID(heartbeat.Agent, heartbeat.Name, now),
-		Agent:              heartbeat.Agent,
-		Action:             heartbeat.Action,
-		Repo:               heartbeat.Repo,
-		Branch:             implementFields.Branch,
-		TaskID:             implementFields.TaskID,
-		TaskTitle:          implementFields.TaskTitle,
-		GoalID:             implementFields.GoalID,
-		HeadSHA:            implementFields.HeadSHA,
-		Sender:             "heartbeat",
+		ID:        heartbeatJobID(heartbeat.Agent, heartbeat.Name, now),
+		Agent:     heartbeat.Agent,
+		Action:    heartbeat.Action,
+		Repo:      heartbeat.Repo,
+		Branch:    implementFields.Branch,
+		TaskID:    implementFields.TaskID,
+		TaskTitle: implementFields.TaskTitle,
+		GoalID:    implementFields.GoalID,
+		HeadSHA:   implementFields.HeadSHA,
+		Sender:    "heartbeat",
+		// #1967: a heartbeat has no seat behind it, so the honest dispatcher is the
+		// schedule that fired. Naming the schedule (not just "heartbeat") is what
+		// lets a finding be traced back to the configuration entry that ordered
+		// the review rather than to the reviewer that wrote it.
+		DispatchedBy:       "heartbeat:" + heartbeat.Name,
 		Instructions:       heartbeat.Prompt,
 		Fingerprint:        fingerprint,
 		RuntimeOverride:    overrideRuntime,

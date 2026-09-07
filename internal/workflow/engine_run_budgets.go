@@ -104,6 +104,23 @@ func (e Engine) finalizeTimedOutJob(ctx context.Context, jobID string, reason st
 		Decision: "failed",
 		Summary:  reason,
 	}
+	// #1351/#1417/#1557. Synthesizing the result and leaving FailureDiagnostics
+	// nil is what made a finalized leg unreadable: phase, exit_code and signal
+	// all absent, so the row could not say WHY it ended and every cause looked
+	// alike. Only the delivery path recorded diagnostics, so a leg the ENGINE
+	// terminalized after the fact carried none at all.
+	//
+	// An EXISTING block is never overwritten: a real crash report (phase,
+	// exit code, stderr tail) is strictly better evidence than this marker, and
+	// replacing it would destroy the cause in favour of the observation.
+	if payload.FailureDiagnostics == nil {
+		payload.FailureDiagnostics = WithDeliveryError(&FailureDiagnostics{Phase: FailurePhaseFinalized}, eventDetail)
+		if payload.FailureDiagnostics != nil && strings.TrimSpace(payload.FailureDiagnostics.DeliveryError) == "" {
+			// A detail that redacts away to nothing still leaves the phase, which
+			// is the fact the reader most needs: the engine ended this job.
+			payload.FailureDiagnostics.Phase = FailurePhaseFinalized
+		}
+	}
 	mailbox := e.mailbox()
 	if job.State == string(JobRunning) {
 		if atGeneration != nil {
@@ -776,6 +793,12 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			RequiredReviewers:       e.requiredReviewers(payload),
 			SkipReviewFanout:        skipFanout,
 			ActingOrgRole:           actingOrgRole,
+			// #1967: the implement job that just opened the PR is the dispatcher.
+			// job.Agent is already used as Sender here, but Sender is a channel on
+			// every other path ("github", "local", "heartbeat"), so attribution
+			// cannot be read off it - it needs its own field to mean the same thing
+			// everywhere.
+			DispatchedBy: job.Agent,
 		}
 		// The branch-lock persist for the daemon's PR-watcher path (trigger 2) now
 		// happens above, before the no-PR early return, so it covers the PR arm and
@@ -797,6 +820,29 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		reviewer := reviewDecisionAgent(job, payload)
 		switch effectiveDecision {
 		case "changes_requested":
+			// #1524: an objection transitions the task ONLY when it describes the
+			// pull request's CURRENT head. This arm was left unconditional, so an
+			// objection at a superseded head still pulled a PR out of
+			// ready_to_merge over a commit the branch had moved past - and,
+			// because dispatchFix is called INLINE below, also dispatched a fix
+			// leg against findings about that superseded commit. Returning early
+			// refuses both in one place.
+			//
+			// THE GUARD IS DELIBERATELY ASYMMETRIC WITH THE APPROVAL SIDE, and the
+			// asymmetry is a LIVENESS argument: refusing an objection withholds the
+			// conservative transition and the inline fix pass from a complaint that
+			// may well be about the current head. So when no observed pull request
+			// row records a head, this arm ADMITS - refusing would block a
+			// legitimate objection on a PR the daemon has not polled yet, which is
+			// the CLI-dispatch path, and would make the engine's cheapest
+			// transition the one demanding the most evidence.
+			bound, unboundReason, err := e.objectionBindsToCurrentHead(ctx, payload)
+			if err != nil {
+				return err
+			}
+			if !bound {
+				return e.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_skipped_stale_head", Message: unboundReason})
+			}
 			if err := e.setTaskState(ctx, ref, TaskChangesRequested); err != nil {
 				return err
 			}

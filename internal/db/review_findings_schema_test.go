@@ -133,12 +133,33 @@ func TestReviewFindingRebuildUpgradesAPreFixDatabase(t *testing.T) {
 			t.Fatalf("recreate pre-fix table: %v", err)
 		}
 	}
-	// A DAEMON ON THE PRIOR HEAD HAS APPLIED EVERY VERSION EXCEPT THE NEWEST, so
+	// A DAEMON ON THE PRIOR HEAD HAS APPLIED EVERY VERSION EXCEPT THE REBUILD, so
 	// the fixture must remove the rebuild's bookkeeping row. Without this the
 	// cached template has ALL versions recorded, Migrate finds nothing to do, and
 	// the test fails for a fixture reason rather than a code one - which is
 	// exactly how it failed on its first run, and why the premise assertions
 	// above matter more than the verdict below.
+	//
+	// THE REBUILD IS FOUND BY ITS MARKER, NOT BY BEING NEWEST. The first version
+	// deleted `version = len(migrations)`, which encoded "the rebuild is the last
+	// migration" - true when it was written and false the moment any branch
+	// appended one (#1967 did, and this test then un-applied THAT migration and
+	// re-ran it, failing with `duplicate column name`). applyMigration checks
+	// each version's own bookkeeping row, so deleting exactly one middle row
+	// re-runs exactly that migration.
+	const rebuildMarker = "review_finding_observations_1850 RENAME TO"
+	rebuildVersion := 0
+	for index, migration := range migrations {
+		if strings.Contains(migration, rebuildMarker) {
+			if rebuildVersion != 0 {
+				t.Fatalf("marker %q matches versions %d and %d", rebuildMarker, rebuildVersion, index+1)
+			}
+			rebuildVersion = index + 1
+		}
+	}
+	if rebuildVersion == 0 {
+		t.Fatalf("marker %q matches no migration", rebuildMarker)
+	}
 	var applied int
 	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&applied); err != nil {
 		t.Fatalf("count applied migrations: %v", err)
@@ -146,8 +167,8 @@ func TestReviewFindingRebuildUpgradesAPreFixDatabase(t *testing.T) {
 	if applied != len(migrations) {
 		t.Fatalf("fixture holds %d applied migrations for %d defined; the template is not fully migrated", applied, len(migrations))
 	}
-	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version = ?`, len(migrations)); err != nil {
-		t.Fatalf("un-apply the newest migration: %v", err)
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version = ?`, rebuildVersion); err != nil {
+		t.Fatalf("un-apply the rebuild migration: %v", err)
 	}
 	insert := `INSERT INTO review_finding_observations(
 		finding_uid, repo, pull_request, head_sha, observer_job, state, evidence_kind)

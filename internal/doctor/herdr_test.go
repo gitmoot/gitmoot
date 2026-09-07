@@ -22,6 +22,13 @@ func TestCheckHerdrVersionBoundaries(t *testing.T) {
 		{name: "newer", output: "herdr version 1.0.0\n", wantOK: true},
 		{name: "minimum prerelease", output: "herdr 0.7.5-rc.1\n", wantOK: false},
 		{name: "malformed", output: "herdr v0.7.5\n", wantOK: false},
+		// #1736/#1664: herdr prints a trailing commit hash, and taking the LAST
+		// field parsed that hash as the version - so a satisfied floor reported
+		// `malformed "herdr 0.8.2 (4c745b97)"` and made a REQUIRED check
+		// permanently red, masking any other required failure behind it.
+		{name: "trailing commit hash", output: "herdr 0.8.2 (4c745b97)\n", wantOK: true},
+		{name: "trailing hash below floor", output: "herdr 0.7.4 (4c745b97)\n", wantOK: false},
+		{name: "no version anywhere", output: "herdr unknown build\n", wantOK: false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
