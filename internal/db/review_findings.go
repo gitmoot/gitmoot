@@ -184,17 +184,6 @@ func pathLikeRelevanceKey(key string) bool {
 	return !strings.Contains(first, ".")
 }
 
-// quoteAll renders candidate uids for a refusal message so the caller can read
-// the exact spelling the store looked for, including the qualified form it
-// derived (#1965).
-func quoteAll(values []string) []string {
-	out := make([]string, 0, len(values))
-	for _, value := range values {
-		out = append(out, fmt.Sprintf("%q", value))
-	}
-	return out
-}
-
 // RecordReviewFindingObservation validates at the STORE BOUNDARY and inserts.
 // Every rejection here is a refusal, never a warning: a warning on a write path
 // is indistinguishable from success to the caller that ignores it.
@@ -413,6 +402,17 @@ VALUES (?, ?, ?, ?, COALESCE(NULLIF(?, ''), strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		return "", err
 	}
 	return uid, nil
+}
+
+// quoteAll renders candidate uids for a refusal message so the caller can read
+// the exact spelling the store looked for, including the qualified form it
+// derived (#1965).
+func quoteAll(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		out = append(out, fmt.Sprintf("%q", value))
+	}
+	return out
 }
 
 // normaliseKeys seeds relevance from the finding's own file so the set is never
