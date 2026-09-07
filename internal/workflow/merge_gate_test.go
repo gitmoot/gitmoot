@@ -6475,29 +6475,6 @@ func seedProductionReviewRow(t *testing.T, store *db.Store, id, agent, decision,
 	return stored
 }
 
-// seedHeadlessRoundCandidate inserts a headless candidate carrying an EXPLICIT
-// review round - the engine-dispatched shape. The distinction from
-// seedHeadlessCandidate is the whole point of the asymmetry probe: roundless
-// against roundless is ordered by TIMESTAMP and legitimately supersedes (that is
-// the session-approval case F1/F2 require), whereas an explicit round against a
-// roundless objection is refused by reviewRoundKey in either direction.
-func seedHeadlessRoundCandidate(t *testing.T, store *db.Store, id, agent, round, decision string) {
-	t.Helper()
-	encoded, err := marshalPayload(JobPayload{
-		Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", ReviewRound: round,
-		Result: &AgentResult{Decision: decision, Summary: "engine-dispatched candidate"},
-	})
-	if err != nil {
-		t.Fatalf("marshalPayload: %v", err)
-	}
-	if err := store.CreateJobWithEvent(context.Background(), db.Job{
-		ID: id, Agent: agent, Type: "review", State: string(JobSucceeded), Payload: encoded,
-	}, db.JobEvent{Kind: string(JobSucceeded), Message: "candidate"}); err != nil {
-		t.Fatalf("CreateJobWithEvent(%s): %v", id, err)
-	}
-	setMergeGateJobTimestamps(t, store, id, "2026-09-01T18:00:00Z")
-}
-
 // TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut covers BOTH P1s the
 // exact-head review of b22667017849b0a460026a68f9bf18d9a89ccd26 found, and they
 // point in OPPOSITE directions - which is why they are pinned together and why
@@ -6621,11 +6598,13 @@ func TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut(t *testing.T) {
 		// and are excluded on stated mechanism, not preference:
 		//
 		//   - the at-head BLOCKING scan is preceded by TWO guards which between them
-		//     admit nothing non-succeeded, so routing it would add an unreachable
-		//     silent skip in place of a loud message. Probed: routing it passes the
-		//     whole control set precisely BECAUSE the added check is dead, which is
-		//     not evidence it belongs. THEY ARE NOT ONE MECHANISM, and the first
-		//     version of this comment wrongly credited one guard with all of it:
+		//     let NOTHING non-succeeded reach a merge - measured per state, not
+		//     argued. An earlier version of this comment also called that routing
+		//     DEAD CODE; the blocked-state control DISPROVES it, because blocked
+		//     does reach that scan (and is refused there). The exemption now rests
+		//     only on the measured outcome, not on reachability. THEY ARE NOT ONE
+		//     MECHANISM, and the first version wrongly credited one guard with all
+		//     of it:
 		//     the crashed-reviewer switch takes queued/running (pending) and
 		//     failed/cancelled (error), while BLOCKED has no case there and is
 		//     taken by the unusable-state guard in the slot scan. Deleting the
@@ -6643,7 +6622,7 @@ func TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut(t *testing.T) {
 		}
 	})
 
-	t.Run("ASYMMETRY PROBE, committed so the divergence cannot silently return", func(t *testing.T) {
+	t.Run("ASYMMETRY: an externally-driven ROUNDLESS DELEGATION CHILD must not retire (#1950 F6)", func(t *testing.T) {
 		ctx := context.Background()
 		store, gh, gate, request := newMergeGateQuorumScenario(t)
 		insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
@@ -6663,14 +6642,31 @@ func TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut(t *testing.T) {
 		}
 		setMergeGateJobTimestamps(t, store, "asym-objection", "2026-09-01T12:00:00Z")
 
-		// This candidate is ADMITTED by the shared predicate: succeeded,
-		// non-fan-out, headless, and externally driven so provenance is satisfied.
-		// What refuses it is reviewRoundKey, which will not order an explicit round
-		// against a roundless objection. The distinction is recorded because the
-		// previous round's comment credited the REFUSAL to the predicate, which does
-		// not perform it - and naming the wrong mechanism is how the next round
-		// "fixes" the wrong function.
-		seedHeadlessRoundCandidate(t, store, "asym-delegation-child", "asym-reviewer", "review-2", "approved")
+		// THE SHAPE IS THE WHOLE TEST, and the version this replaces got it wrong.
+		// It was NAMED "asym-delegation-child" while building a row that was
+		// non-external, carried ReviewRound review-2, and set NEITHER linkage field
+		// - so it was refused by round ordering and proved nothing about delegation
+		// children. A misnamed fixture reads as coverage to every future reader.
+		// This one is what the finding describes: externally driven (provenance
+		// passes), ROUNDLESS (timestamps order it, so round ordering cannot save
+		// us), and carrying BOTH ParentJobID and DelegationID (so the objection
+		// scan excludes it at merge_gate.go:1060). Admitted as a candidate and
+		// absent as an objection is how it cleared a block it could never impose.
+		encoded, err := marshalPayload(JobPayload{
+			Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+			Result: &AgentResult{Decision: "approved", Summary: "delegation child verdict"},
+		})
+		if err != nil {
+			t.Fatalf("marshalPayload: %v", err)
+		}
+		if err := store.CreateExternallyDrivenJobWithEvent(ctx, db.Job{
+			ID: "asym-delegation-child", Agent: "asym-reviewer", Type: "review",
+			State: string(JobSucceeded), Payload: encoded,
+			ParentJobID: "asym-parent", DelegationID: "asym-delegation",
+		}, db.JobEvent{Kind: string(JobSucceeded), Message: "delegation child"}); err != nil {
+			t.Fatalf("CreateExternallyDrivenJobWithEvent: %v", err)
+		}
+		setMergeGateJobTimestamps(t, store, "asym-delegation-child", "2026-09-01T18:00:00Z")
 		job, err := store.GetJob(ctx, "asym-delegation-child")
 		if err != nil {
 			t.Fatalf("GetJob: %v", err)
@@ -6679,8 +6675,14 @@ func TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unmarshalPayload: %v", err)
 		}
-		if !reviewRowIsVerdictAboutHead(job, payload, "head123") {
-			t.Fatalf("shared predicate REFUSED the roundless externally-driven candidate; this probe exists to pin that it ADMITS it and that reviewRoundKey is what refuses it (#1950)")
+		// Assert the fixture really is the finding's shape before asserting
+		// behaviour, so this cannot pass for the wrong reason its predecessor did.
+		if !job.ExternallyDriven || strings.TrimSpace(payload.ReviewRound) != "" || !isDelegationChild(job) {
+			t.Fatalf("fixture is externally_driven=%v round=%q delegation_child=%v; want true/empty/true or it no longer reproduces #1950 F6",
+				job.ExternallyDriven, payload.ReviewRound, isDelegationChild(job))
+		}
+		if reviewRowIsVerdictAboutHead(job, payload, "head123") {
+			t.Fatalf("shared predicate ADMITTED an externally-driven roundless delegation child as a superseding candidate while the objection scan EXCLUDES that same row: it can clear a block it could never impose (#1950 F6)")
 		}
 
 		if err := store.UpsertTask(ctx, db.Task{
@@ -6696,7 +6698,14 @@ func TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut(t *testing.T) {
 			t.Fatalf("Evaluate returned error: %v", evalErr)
 		}
 		if decision.Merged || len(gh.merges) != 0 {
-			t.Fatalf("decision=%+v merges=%d, want NO merge: round ordering must refuse this candidate even though the predicate admits it", decision, len(gh.merges))
+			t.Fatalf("decision=%+v merges=%d, want ZERO external merge calls: a delegation child is accounted through its parent's fan-out evidence and must not retire a session objection (#1950 F6)", decision, len(gh.merges))
+		}
+		task, taskErr := store.GetTask(ctx, "task-9")
+		if taskErr != nil {
+			t.Fatalf("GetTask: %v", taskErr)
+		}
+		if task.State != string(TaskReadyToMerge) {
+			t.Fatalf("task state = %q, want it left UNCLAIMED at ready_to_merge (#1950 F6)", task.State)
 		}
 	})
 }
@@ -6883,4 +6892,83 @@ func TestPolicyMergeGateAtHeadStateGuardAdmitsNothingUnsucceeded(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestReviewRowSupersedingImpliesObjectable is the invariant directive 127201
+// names: A ROW THAT SUPERSEDES MUST BE A ROW THAT CAN OBJECT.
+//
+// #1950 F6 was neither predicate being wrong on its own - it was the two
+// disagreeing about the SAME row. An externally driven, roundless delegation
+// child was admitted as a superseding candidate and simultaneously excluded
+// from the objection population, so it cleared a block it could never impose.
+// Fixing that one shape leaves the NEXT disagreement free to appear, which is
+// how rounds 5, 7, 8, 9 and 10 each found a new one.
+//
+// So this enumerates the cross product of every field either side reads and
+// asserts CONTAINMENT: admitted-as-candidate implies not-excluded-as-objection.
+// A future clause added to one side and not the other fails here by
+// construction, without anyone having to think of the shape first.
+func TestReviewRowSupersedingImpliesObjectable(t *testing.T) {
+	const headSHA = "head123"
+	heads := []string{"", headSHA, "stale999"}
+	rounds := []string{"", "review-2"}
+	bools := []bool{false, true}
+	states := []JobState{JobSucceeded, JobBlocked, JobFailed}
+
+	checked, admitted := 0, 0
+	for _, head := range heads {
+		for _, round := range rounds {
+			for _, ext := range bools {
+				for _, child := range bools {
+					for _, fanOut := range bools {
+						for _, state := range states {
+							checked++
+							result := &AgentResult{Decision: "approved", Summary: "enumerated row"}
+							if fanOut {
+								result.Delegations = []Delegation{{ID: "d1", Agent: "specialist", Action: "review", Prompt: "look"}}
+							}
+							payload := JobPayload{
+								Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+								HeadSHA: head, ReviewRound: round, Result: result,
+							}
+							job := db.Job{
+								ID: "enumerated", Agent: "reviewer", Type: "review",
+								State: string(state), ExternallyDriven: ext,
+							}
+							if child {
+								job.ParentJobID, job.DelegationID = "parent", "delegation"
+							}
+							if !reviewRowIsVerdictAboutHead(job, payload, headSHA) {
+								continue
+							}
+							admitted++
+							// Every reason the OBJECTION populations drop a row. If an
+							// admitted candidate matches any of them, that row can
+							// supersede an objection while being unable to be one.
+							switch {
+							case JobState(job.State) != JobSucceeded:
+								t.Errorf("admitted candidate is not succeeded (state=%s): the objection scans skip it, so it can retire a block it cannot impose", state)
+							case payload.Result == nil:
+								t.Errorf("admitted candidate has no result: the objection scans skip it")
+							case reviewRowIsFanOut(payload.Result):
+								t.Errorf("admitted candidate is a fan-out announcement: all four objection sites skip it")
+							case isDelegationChild(job):
+								t.Errorf("admitted candidate is a delegation child (head=%q round=%q ext=%v): the objection scan excludes it at merge_gate.go:1060 - this is #1950 F6 exactly", head, round, ext)
+							case isIntegrationWorktreeReview(payload):
+								t.Errorf("admitted candidate is an integration-worktree review: the headless objection scan excludes it")
+							case strings.TrimSpace(head) != "" && strings.TrimSpace(head) != headSHA:
+								t.Errorf("admitted candidate carries a foreign head %q", head)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	// Guard against the enumeration silently becoming vacuous: if a future clause
+	// refuses everything, containment holds trivially and proves nothing.
+	if admitted == 0 {
+		t.Fatalf("enumerated %d shapes and NONE were admitted as candidates; containment then holds vacuously and this test proves nothing", checked)
+	}
+	t.Logf("enumerated %d shapes, %d admitted as superseding candidates, all of them objectable", checked, admitted)
 }

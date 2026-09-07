@@ -2106,12 +2106,24 @@ func reviewRowCanRetireAnObjection(job db.Job, payload JobPayload, headSHA strin
 		!job.ExternallyDriven && strings.TrimSpace(payload.ReviewRound) == "" {
 		return false
 	}
-	// A delegation-child candidate is NOT refused here, and this predicate does not
-	// claim to refuse it: it satisfies every clause above. What actually stops it is
-	// reviewRoundKey, which will not order an explicit round against a roundless
-	// objection - measured, with Evaluate blocking and zero merge calls. Naming the
-	// real mechanism matters because the first version of this comment credited the
-	// refusal to this function, which does not perform it.
+	// LINKAGE, AND THIS IS THE CLAUSE MY OWN ROUND-9 PROBE TALKED ME OUT OF (#1950
+	// F6). A delegation child's verdict is accounted through its PARENT's fan-out
+	// evidence (ensureDelegatedReviewEvidence), never as a standalone verdict about
+	// this head - which is exactly why the objection scan already excludes it. Not
+	// excluding it HERE made the two sides asymmetric: such a row was admitted as a
+	// superseding candidate, retired a live session objection, and was then absent
+	// from the blocking population, so it cleared a block it could never impose and
+	// the PR merged.
+	//
+	// Round 9 probed a delegation-child candidate, measured that it needed no
+	// clause, and reported that. The probe carried an explicit ROUND, so what
+	// refused it was reviewRoundKey declining to order a round against a roundless
+	// objection - not the linkage. A ROUNDLESS externally-driven child is ordered by
+	// timestamp instead and nothing refused it. One shape of a thing is not the
+	// class, and "measured, no clause needed" is only as wide as the shape measured.
+	if isDelegationChild(job) {
+		return false
+	}
 	return true
 }
 
