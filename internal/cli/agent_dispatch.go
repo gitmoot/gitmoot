@@ -9,6 +9,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
@@ -1916,9 +1917,30 @@ func ensureLocalAgentAccess(ctx context.Context, store *db.Store, agent db.Agent
 	return nil
 }
 
+// localAgentJobID mints a dispatch id for a locally dispatched job.
+//
+// THE TIME COMPONENT IS NOT SUFFICIENT ON ITS OWN (#1559). Two dispatches for
+// the same agent and action can read the same UnixNano - clock resolution is not
+// guaranteed to be a nanosecond, and the observed collision came from four
+// reviews claimed inside one second under [parallel_sessions] - and the insert
+// then fails with SQLITE_CONSTRAINT_PRIMARYKEY, so the job is silently not
+// written while the caller holds an id it believes exists.
+//
+// A PER-PROCESS COUNTER, NOT RANDOMNESS. It makes a same-instant collision
+// UNREACHABLE within a process rather than merely unlikely, and ids stay sortable
+// by their time component, which several operator queries rely on. Randomness
+// would only have made the collision rarer, which is the failure mode this
+// campaign keeps finding: a defect made invisible instead of impossible.
+//
+// Cross-process collision remains possible in principle and is bounded by the
+// same nanosecond clock; it is not addressed here, and the insert now names the
+// id it failed to write so such a case is diagnosable in one step.
 func localAgentJobID(action string, agent string) string {
-	return fmt.Sprintf("local-%s-%s-%x", action, agent, time.Now().UTC().UnixNano())
+	return fmt.Sprintf("local-%s-%s-%x-%x", action, agent, time.Now().UTC().UnixNano(), localAgentJobSequence.Add(1))
 }
+
+// localAgentJobSequence is monotonic for the life of the process.
+var localAgentJobSequence atomic.Uint64
 
 // dispatchReadOnlyWorktreeEligible reports whether a dispatch should allocate a
 // dedicated detached committed-tip worktree for read-only isolation (#739). It is

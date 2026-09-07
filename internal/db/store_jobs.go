@@ -78,7 +78,7 @@ func (s *Store) CreateJob(ctx context.Context, job Job) error {
 		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy, projection.DispatchedBy,
 		rootIDFromPayload(job.Payload), job.ID, projection.WorkflowID, projection.Repo, projection.PullRequest,
 		projection.BlockerRetryAt, projection.BlockerSuggestedAction)
-	return err
+	return annotateJobInsertConflict(job.ID, err)
 }
 
 func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent, additionalEvents ...JobEvent) error {
@@ -108,17 +108,23 @@ func createJobWithEventTx(ctx context.Context, tx *sql.Tx, s *Store, job Job, ev
 		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy, projection.DispatchedBy,
 		rootIDFromPayload(job.Payload), job.ID, projection.WorkflowID, projection.Repo, projection.PullRequest,
 		projection.BlockerRetryAt, projection.BlockerSuggestedAction); err != nil {
-		return err
+		return annotateJobInsertConflict(job.ID, err)
 	}
 	if event.JobID == "" {
 		event.JobID = job.ID
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
+	// The runtime column travels here too. Carrying it on AddJobEvent and not on
+	// this transactional twin is the "correct where installed, absent at the next
+	// call site" shape, and it is a gap in my own #1534 change: a caller creating
+	// a job together with its runtime-selection event would have lost the
+	// structured value and fallen back to the registry default, which is the
+	// misattribution #1534 exists to stop.
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message, runtime) VALUES (?, ?, ?, ?)`, event.JobID, event.Kind, event.Message, event.Runtime); err != nil {
 		return err
 	}
 	for _, additional := range additionalEvents {
 		additional.JobID = job.ID
-		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, additional.JobID, additional.Kind, additional.Message); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message, runtime) VALUES (?, ?, ?, ?)`, additional.JobID, additional.Kind, additional.Message, additional.Runtime); err != nil {
 			return err
 		}
 	}
@@ -2554,4 +2560,37 @@ func (s *Store) JobRecordedRuntime(ctx context.Context, jobID string, agentName 
 		return "", err
 	}
 	return strings.TrimSpace(recorded), nil
+}
+
+// ErrJobIDConflict reports an insert refused because jobs.id already exists.
+var ErrJobIDConflict = errors.New("job id already exists")
+
+// annotateJobInsertConflict names the id a refused insert was trying to write
+// (#1559).
+//
+// THE RAW ERROR NAMES NOTHING. A dispatch collision surfaced as one journal line
+// - "constraint failed: UNIQUE constraint failed: jobs.id (1555)" - with no id,
+// no agent and no table context beyond the column, so diagnosing it required an
+// inventory of everything dispatched in that second. 1555 is SQLITE_CONSTRAINT_
+// PRIMARYKEY, so the row was silently not written.
+//
+// The severity of the observed instance was zero, and that is the argument FOR
+// naming it rather than against: the same shape on a top-level review means the
+// reviewer does not exist while its coordinator still records a verdict, which
+// is the hollow-panel pattern of #1557. A collision that is benign in one code
+// path is not benign in the path next door.
+//
+// Measured while fixing #1522: the deterministic fix-leg id derives from task
+// and review round, so two objections in one round mint the SAME id and the
+// second advance dies on exactly this error. That collision is currently the
+// only thing preventing a duplicate writer on the branch, and it took hours to
+// attribute because the error named no id.
+func annotateJobInsertConflict(jobID string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if !strings.Contains(err.Error(), "UNIQUE constraint failed: jobs.id") {
+		return err
+	}
+	return fmt.Errorf("%w: %q was not written: %v", ErrJobIDConflict, jobID, err)
 }
