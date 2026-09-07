@@ -854,12 +854,32 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			// context and worktree. A durable per-PR enable is the explicit
 			// unattended-chain opt-in for dispatching a fresh implement job (#1712).
 			if configured && !policy.Disabled {
-				if err := e.dispatchFix(ctx, job, reviewer, payload, *payload.Result, ref); err != nil {
+				// #1522: dispatch on the LAST review to settle at this head, not the
+				// first blocking verdict to arrive.
+				if err := e.dispatchFixWhenHeadHasSettled(ctx, job, payload, ref); err != nil {
 					return err
 				}
 			}
 			return nil
 		case "approved":
+			// #1522: AN APPROVAL CAN BE THE LAST REVIEW TO SETTLE AT THIS HEAD, and
+			// when it is, it owes the head's deferred fix leg. Without this the pair
+			// objection-then-approval defers the leg on the objection's arm and then
+			// nobody dispatches it: the approval fixes nothing and the objection's
+			// arm has already returned. That is a deadlock rather than a delay.
+			//
+			// It runs BEFORE the approval's own logic so the ordering is the honest
+			// one: the objection at this head still stands, and the arm below is
+			// already built to hold rather than merge in that case
+			// (approvalSupersedesChangesRequested). Dispatching here therefore
+			// cannot advance a refuted change toward merge.
+			if autoFixPolicy, autoFixConfigured, err := e.Store.PullRequestAutoFixPolicyFor(ctx, payload.Repo, payload.PullRequest); err != nil {
+				return err
+			} else if autoFixConfigured && !autoFixPolicy.Disabled {
+				if err := e.dispatchFixWhenHeadHasSettled(ctx, job, payload, ref); err != nil {
+					return err
+				}
+			}
 			// High-risk review (#650): the native required-reviewer gate approves a PR
 			// as soon as every required reviewer has ONE approving review in the round.
 			// With the lens fan-out that is too weak — a single approving lens (or one

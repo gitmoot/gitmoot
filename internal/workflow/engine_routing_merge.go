@@ -535,6 +535,134 @@ func (e Engine) approvalSupersedesChangesRequested(ctx context.Context, payload 
 	return true, "", false, nil
 }
 
+// dispatchFixWhenHeadHasSettled dispatches AT MOST ONE fix leg per head, and
+// only once every review dispatched at that head has settled (#1522).
+//
+// THE OLD RULE WAS "THE FIRST BLOCKING VERDICT DISPATCHES", which makes a
+// cross-family pair unsatisfiable in one round whenever it splits: the first
+// objection's leg pushes a new head while the sibling is still reading the old
+// one, so the sibling's verdict is stale the moment it lands. Measured over the
+// live job store: 37 of 334 dispatched fix legs (11.1%) were created while at
+// least one sibling review at the SAME head was still running, and those
+// siblings then landed 51 verdicts against a head that no longer existed - 29
+// approvals, average 12.0 minutes late, worst 58 minutes, and 22 further
+// objections at 9.2 minutes late.
+//
+// The 29 stale APPROVALS are the merge-integrity half: an "approved" recorded
+// for a commit the fix leg superseded minutes later is a record asserting
+// something it cannot support, which is the whole subject of #1520.
+//
+// THE LAST REVIEW TO SETTLE IS THE ONE THAT DISPATCHES, which is why this is
+// reachable from the approving arm too. If only the objecting arm called it, a
+// pair that splits objection-then-approval would defer the leg and then never
+// dispatch it: the approval does not fix anything, and the objection's arm has
+// already returned. That is a deadlock, not a delay, and it is the shape #1524
+// was opened for.
+//
+// ONE LEG PER HEAD is also what makes the concurrency this cannot see impossible
+// in the panel case: two blocking verdicts at one head now produce one leg
+// rather than two racing writers (#1533). It does not replace #1533's guard,
+// which still bounds legs arriving from separate rounds and other routes.
+func (e Engine) dispatchFixWhenHeadHasSettled(ctx context.Context, job db.Job, payload JobPayload, ref taskRef) error {
+	head := strings.TrimSpace(payload.HeadSHA)
+	if head == "" {
+		// No evaluated head means no head to reason about, so behave exactly as
+		// before rather than inventing a reason never to dispatch. Withholding a
+		// fix is a liveness cost and it must never be the accidental default.
+		if payload.Result == nil {
+			return nil
+		}
+		return e.dispatchFix(ctx, job, reviewDecisionAgent(job, payload), payload, *payload.Result, ref)
+	}
+	jobs, err := e.Store.ListJobs(ctx)
+	if err != nil {
+		return err
+	}
+	blockingSeverity := e.reviewBlockingSeverity(payload.Repo)
+	var pending []string
+	var existingLeg string
+	var verdictJob db.Job
+	var verdictPayload JobPayload
+	// The current job is included in the scan on equal terms with its siblings:
+	// the objecting arm arrives here carrying its own blocking result, and the
+	// approving arm arrives carrying none, so a single rule covers both.
+	candidates := append([]db.Job{job}, jobs...)
+	seen := map[string]struct{}{}
+	for _, candidate := range candidates {
+		if _, dup := seen[candidate.ID]; dup {
+			continue
+		}
+		seen[candidate.ID] = struct{}{}
+		candidatePayload, err := unmarshalPayload(candidate.Payload)
+		if err != nil {
+			return err
+		}
+		if !sameTask(payload, candidatePayload) {
+			continue
+		}
+		if strings.TrimSpace(candidatePayload.HeadSHA) != head {
+			continue
+		}
+		switch candidate.Type {
+		case "review":
+			if candidate.ID != job.ID &&
+				(JobState(candidate.State) == JobQueued || JobState(candidate.State) == JobRunning) {
+				pending = append(pending, candidate.ID+" ("+candidate.State+")")
+				continue
+			}
+			if candidatePayload.Result == nil || ResultIsFanOut(candidatePayload.Result) {
+				continue
+			}
+			if effectiveReviewDecisionForPayload(candidatePayload, blockingSeverity) != "changes_requested" {
+				continue
+			}
+			// NEWEST OBJECTION WINS, ordered by the row's own updated_at with the id
+			// as a deterministic tie-break. NOT by ListJobs order: engine job ids are
+			// deterministic strings like "review-audit-task-9-review-2", so id order
+			// is lexical and not chronological. I wrote that claim first and it was
+			// wrong; the leg must carry the most recent statement of the objection at
+			// this head, and two rows in the same second must still pick the same one
+			// on every replay.
+			if verdictPayload.Result != nil {
+				if candidate.UpdatedAt < verdictJob.UpdatedAt {
+					continue
+				}
+				if candidate.UpdatedAt == verdictJob.UpdatedAt && candidate.ID <= verdictJob.ID {
+					continue
+				}
+			}
+			verdictJob, verdictPayload = candidate, candidatePayload
+		case "implement":
+			if candidatePayload.FixWorktree {
+				existingLeg = candidate.ID
+			}
+		}
+	}
+	if len(pending) > 0 {
+		sort.Strings(pending)
+		return e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID: job.ID,
+			Kind:  "auto_fix_deferred_live_sibling",
+			Message: fmt.Sprintf(
+				"auto-fix leg deferred at head %s: sibling review(s) %s have not settled. Dispatching now would push a new head while they are still reading this one, so their verdicts would be stale on arrival; the last review to settle at this head dispatches instead",
+				head, strings.Join(pending, ", ")),
+		})
+	}
+	if existingLeg != "" {
+		return e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID: job.ID,
+			Kind:  "auto_fix_skipped_head_already_dispatched",
+			Message: fmt.Sprintf(
+				"auto-fix leg not dispatched at head %s: implement job %s already carries this head's fix pass",
+				head, existingLeg),
+		})
+	}
+	if verdictPayload.Result == nil {
+		return nil
+	}
+	return e.dispatchFix(ctx, verdictJob, reviewDecisionAgent(verdictJob, verdictPayload), verdictPayload, *verdictPayload.Result, ref)
+}
+
 func (e Engine) latestReviewRound(ctx context.Context, current JobPayload) (string, error) {
 	jobs, err := e.Store.ListJobs(ctx)
 	if err != nil {
