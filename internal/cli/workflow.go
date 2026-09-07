@@ -1020,7 +1020,13 @@ func recoverTaskImplementationForRunner(ctx context.Context, store *db.Store, ta
 	if active, ok, err := workflow.FindLiveTaskJob(ctx, store, task); err != nil {
 		return workflow.JobPayload{}, err
 	} else if ok {
-		return workflow.JobPayload{}, fmt.Errorf("task %s still has live job %s; wait for it, cancel it, or resolve it before recovering", task.ID, active.ID)
+		settled, settleErr := settleStaleAdvancementDebtForRecovery(ctx, store, task, active, owner)
+		if settleErr != nil {
+			return workflow.JobPayload{}, settleErr
+		}
+		if !settled {
+			return workflow.JobPayload{}, fmt.Errorf("task %s still has live job %s; wait for it, cancel it, or resolve it before recovering", task.ID, active.ID)
+		}
 	}
 	if strings.TrimSpace(task.WorktreePath) != "" && taskWorktreeHasLiveProcess(task.WorktreePath) {
 		return workflow.JobPayload{}, fmt.Errorf("task %s worktree %s still has a live process; wait for it to exit or stop the orphaned implementer before recovering", task.ID, task.WorktreePath)
