@@ -1642,7 +1642,14 @@ func TestPhaseInstrumentHonoursInterpreterOptionState(t *testing.T) {
 		// VALUE-TAKING OPTIONS CONSUME THEIR ARGUMENT, and the -c after them is
 		// still a real command string: Go runs, so the bucket is test.
 		{"long option with a separate value", `bash --rcfile /dev/null -c "go test ./..."`, phaseBucketTest},
-		{"long option with an inline value", `bash --rcfile=/dev/null -c "go test ./..."`, phaseBucketTest},
+		// INVERTED IN ROUND 16, AND IT WAS MY OWN FALSE ARM. I wrote this in
+		// round 13 asserting `test` on the assumption that an inline value is
+		// equivalent to a separate one. Measured: `bash --rcfile=/dev/null -c
+		// "go version"` exits 2 with "invalid option" and runs no Go, while the
+		// SEPARATE form runs it. Not deleted - corrected in place, with the
+		// separate form kept below as the control that proves the option still
+		// works. See TestPhaseInstrumentHonoursArgumentForms.
+		{"long option with an inline value refuses", `bash --rcfile=/dev/null -c "go test ./..."`, phaseBucketUnknown},
 		{"shopt option value", `bash -O extglob -c "go test ./..."`, phaseBucketTest},
 		{"set -o option value", `bash -o pipefail -c "go test ./..."`, phaseBucketTest},
 		{"stdin flag before -c", `bash -s -c "go test ./..."`, phaseBucketTest},
@@ -1919,6 +1926,123 @@ func TestPhaseInstrumentPolaritySplitWrites(t *testing.T) {
 		{"dash flag control", `sh -l -c "go test ./..."`, phaseBucketTest},
 		{"zsh witness", `zsh +c "go test ./..."`, phaseBucketUnknown},
 		{"zsh control", `zsh -c "go test ./..."`, phaseBucketTest},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughSplitWrites(t, tc.command, tc.want) })
+	}
+}
+
+// The round-16 tables close uid #1930-f32 on its third round by testing the
+// FOUR AXES the reviewer named - execution effect, argument form, value domain
+// and ordering - rather than fourteen individual sites. Plan note 126177.
+// Every expectation is a real-shell measurement taken before the model was
+// written, against GNU bash 5.2.21 and /usr/bin/dash.
+
+// TestPhaseInstrumentSeparatesTerminalFromClearableSuppression covers the six
+// named counterexamples whose common cause was one shared boolean: `+n` cleared
+// a suppression that a TERMINAL option had set. Terminal is sticky; noexec is
+// clearable; they are now separate states.
+//
+//	bash -D +n -c "go version"                exit 0, no Go
+//	bash +D +n -c "go version"                exit 0, no Go
+//	bash --dump-strings +n -c "go version"    exit 0, no Go
+//	bash --dump-po-strings +n -c "go version" exit 0, no Go
+//	bash --help +n -c "go version"            exit 0, no Go
+//	bash --version +n -c "go version"         exit 0, no Go
+func TestPhaseInstrumentSeparatesTerminalFromClearableSuppression(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"minus D then plus n", `bash -D +n -c "go test ./..."`, phaseBucketOther},
+		{"plus D then plus n", `bash +D +n -c "go test ./..."`, phaseBucketOther},
+		{"dump strings then plus n", `bash --dump-strings +n -c "go test ./..."`, phaseBucketOther},
+		{"dump po strings then plus n", `bash --dump-po-strings +n -c "go test ./..."`, phaseBucketOther},
+		{"help then plus n", `bash --help +n -c "go test ./..."`, phaseBucketOther},
+		{"version then plus n", `bash --version +n -c "go test ./..."`, phaseBucketOther},
+		{"plus n after minus n still clears", `bash -n +n -c "go test ./..."`, phaseBucketTest},
+		{"plus n alone runs", `bash +n -c "go test ./..."`, phaseBucketTest},
+		{"set -o noexec suppresses", `bash -o noexec -c "go test ./..."`, phaseBucketOther},
+		{"plus o noexec clears", `bash +o noexec -c "go test ./..."`, phaseBucketTest},
+		{"set -o noexec then plus n clears", `bash -o noexec +n -c "go test ./..."`, phaseBucketTest},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentHonoursArgumentForms is the argument-form axis. Every long
+// option measured rejects the inline `=` form, value-taking ones included.
+func TestPhaseInstrumentHonoursArgumentForms(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"inline rcfile refuses", `bash --rcfile=/dev/null -c "go test ./..."`, phaseBucketUnknown},
+		{"inline init-file refuses", `bash --init-file=/dev/null -c "go test ./..."`, phaseBucketUnknown},
+		{"inline boolean refuses", `bash --noprofile=x -c "go test ./..."`, phaseBucketUnknown},
+		{"separate rcfile runs", `bash --rcfile /dev/null -c "go test ./..."`, phaseBucketTest},
+		{"separate init-file runs", `bash --init-file /dev/null -c "go test ./..."`, phaseBucketTest},
+		{"bare boolean runs", `bash --noprofile -c "go test ./..."`, phaseBucketTest},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentHonoursValueDomains is the value-domain axis: an unknown
+// `-o`/`-O` name aborts the shell, and the domains differ per interpreter -
+// `sh -o pipefail` exits 2 because pipefail is not in dash's set.
+func TestPhaseInstrumentHonoursValueDomains(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"invalid set option", `bash -o nonesuch -c "go test ./..."`, phaseBucketUnknown},
+		{"invalid set option unset form", `bash +o nonesuch -c "go test ./..."`, phaseBucketUnknown},
+		{"invalid shopt", `bash -O nonesuch -c "go test ./..."`, phaseBucketUnknown},
+		{"invalid shopt unset form", `bash +O nonesuch -c "go test ./..."`, phaseBucketUnknown},
+		{"valid set option", `bash -o pipefail -c "go test ./..."`, phaseBucketTest},
+		{"valid set option unset form", `bash +o pipefail -c "go test ./..."`, phaseBucketTest},
+		{"valid shopt", `bash -O extglob -c "go test ./..."`, phaseBucketTest},
+		{"valid shopt unset form", `bash +O extglob -c "go test ./..."`, phaseBucketTest},
+		{"dash has its own domain", `sh -o errexit -c "go test ./..."`, phaseBucketTest},
+		{"dash rejects a bash-only name", `sh -o pipefail -c "go test ./..."`, phaseBucketUnknown},
+		{"dash has no shopt", `sh -O extglob -c "go test ./..."`, phaseBucketUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentHonoursOptionOrdering is the ordering axis: a NAMED long
+// option after a short cluster aborts, while `--` is exempt and long-after-long
+// is fine.
+func TestPhaseInstrumentHonoursOptionOrdering(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"long after short refuses", `bash -x --noprofile -c "go test ./..."`, phaseBucketUnknown},
+		{"long after stdin flag refuses", `bash -s --noprofile -c "go test ./..."`, phaseBucketUnknown},
+		{"long after interactive refuses", `bash -i --norc -c "go test ./..."`, phaseBucketUnknown},
+		{"long after a value pair refuses", `bash -O extglob --noprofile -c "go test ./..."`, phaseBucketUnknown},
+		{"long before short runs", `bash --noprofile -x -c "go test ./..."`, phaseBucketTest},
+		{"long after long runs", `bash --noprofile --norc -c "go test ./..."`, phaseBucketTest},
+		{"terminator after short is exempt", `bash -x -- -c "go test ./..."`, phaseBucketOther},
+		{"short after short runs", `bash -x -o pipefail -c "go test ./..."`, phaseBucketTest},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentFourAxesSplitWrites runs all FOURTEEN named
+// counterexamples through the seven-byte split-write path, each axis paired
+// with a should-succeed control so a blanket refusal cannot satisfy the table.
+func TestPhaseInstrumentFourAxesSplitWrites(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"terminal 1", `bash -D +n -c "go test ./..."`, phaseBucketOther},
+		{"terminal 2", `bash +D +n -c "go test ./..."`, phaseBucketOther},
+		{"terminal 3", `bash --dump-strings +n -c "go test ./..."`, phaseBucketOther},
+		{"terminal 4", `bash --dump-po-strings +n -c "go test ./..."`, phaseBucketOther},
+		{"terminal 5", `bash --help +n -c "go test ./..."`, phaseBucketOther},
+		{"terminal 6", `bash --version +n -c "go test ./..."`, phaseBucketOther},
+		{"terminal control", `bash +n -c "go test ./..."`, phaseBucketTest},
+		{"argument form 1", `bash --rcfile=/dev/null -c "go test ./..."`, phaseBucketUnknown},
+		{"argument form 2", `bash --init-file=/dev/null -c "go test ./..."`, phaseBucketUnknown},
+		{"argument form control", `bash --rcfile /dev/null -c "go test ./..."`, phaseBucketTest},
+		{"value domain 1", `bash -o nonesuch -c "go test ./..."`, phaseBucketUnknown},
+		{"value domain 2", `bash +o nonesuch -c "go test ./..."`, phaseBucketUnknown},
+		{"value domain 3", `bash -O nonesuch -c "go test ./..."`, phaseBucketUnknown},
+		{"value domain 4", `bash +O nonesuch -c "go test ./..."`, phaseBucketUnknown},
+		{"value domain control", `bash -O extglob -c "go test ./..."`, phaseBucketTest},
+		{"ordering 1", `bash -x --noprofile -c "go test ./..."`, phaseBucketUnknown},
+		{"ordering 2", `bash -s --noprofile -c "go test ./..."`, phaseBucketUnknown},
+		{"ordering control", `bash --noprofile -x -c "go test ./..."`, phaseBucketTest},
 	} {
 		t.Run(tc.name, func(t *testing.T) { classifyThroughSplitWrites(t, tc.command, tc.want) })
 	}

@@ -125,204 +125,283 @@ func classifyPhaseCommand(command string) string {
 // than any real agent command and terminates on hostile input.
 const maxWrapperRecursion = 3
 
-// INTERPRETER OPTION STATE (#1930 round-13 F1, round-14 F1). Four rounds of
-// per-token heuristics produced confident buckets in both directions, so the
-// option grammar is declared here PER INTERPRETER and anything outside it is
-// refused, as ruling 123815 requires of the command grammar.
+// INTERPRETER OPTION STATE, MODELLED PER OPTION (#1930 rounds 13-16, uid f32).
 //
-// Every rule was measured against the real shell before it was written:
+// uid #1930-f32 survived two rounds of patching rows because the grammar stored
+// option ATTRIBUTES as shared character sets. One `suppressed` boolean cannot
+// express what a shell actually does, so `+n` cleared the suppression that `-D`
+// had set and a dumped-and-never-executed command was reported as a test. The
+// four axes the reviewer named are now DATA on each option: execution effect,
+// accepted argument form, value domain, and ordering. Plan note 126177.
 //
-//	bash -- -c "go version"                   exit 127, no Go  (-- ends options)
-//	sh   -- -c "go version"                   exit 2,   no Go
-//	bash -zc "go version"                     exit 2,   no Go  (invalid option aborts)
-//	bash --rcfile /dev/null -c "go version"   exit 0,   Go RAN (value consumed)
-//	bash -O extglob -c "go version"           exit 0,   Go RAN
-//	bash -o pipefail -c "go version"          exit 0,   Go RAN
-//	bash -s -c "go version"                   exit 0,   Go RAN
-//	bash -c "go version" test ./...           exit 0,   Go RAN WITHOUT `test`
-//	bash -c "" go version                     exit 0,   no Go  (empty command string)
-//	bash -n -c "go version"                   exit 0,   no Go  (noexec)
-//	sh   -n -c "go version"                   exit 0,   no Go
-//	bash -D -c "go version"                   exit 0,   no Go
-//	bash --help    -c "go version"            exit 0,   no Go  (terminal option)
-//	bash --version -c "go version"            exit 0,   no Go
-//	sh --noprofile -c "go version"            exit 2,   no Go  (not a POSIX sh option)
-//	sh -O extglob  -c "go version"            exit 2,   no Go
-//	sh -o pipefail -c "go version"            exit 2,   no Go  (dash rejects -o here)
-//	sh -l -c "go version"                     exit 0,   Go RAN
-//	bash --noprofile=x -c "go version"        exit 2,   no Go  (boolean flag takes no value)
+// Everything here was executed against the installed GNU bash 5.2.21 and
+// /usr/bin/dash before it was written down. Anything not executed returns
+// unknown - see interpreterGrammars for the zsh entry.
+type optionEffect int
+
+const (
+	// effectNone: the option does not decide whether the command string runs.
+	effectNone optionEffect = iota
+	// effectNoexec: CLEARABLE. `-n` sets it and `+n` clears it, and `-o noexec`
+	// is the same state spelled differently. Measured: `bash -o noexec -c "go
+	// version"` runs no Go, `+o noexec` runs Go, `-o noexec +n -c` RUNS Go.
+	effectNoexec
+	// effectTerminal: STICKY, and this is the axis that was missing. The shell
+	// prints or dumps and never runs the command string, and a later `+n` does
+	// NOT restore it. Measured on all six: `-D +n`, `+D +n`, `--dump-strings
+	// +n`, `--dump-po-strings +n`, `--help +n`, `--version +n` - each exit 0
+	// with zero Go invocations (#1930 round-16).
+	effectTerminal
+)
+
+// argumentForm is how an option accepts its value. Inline `=` is rejected by
+// every long option measured here: `--rcfile=/dev/null` and
+// `--init-file=/dev/null` exit 2, while `--rcfile /dev/null` runs Go, and
+// `--noprofile=x` exits 2 for a boolean.
+type argumentForm int
+
+const (
+	argNone argumentForm = iota
+	argSeparate
+)
+
+type shortOption struct {
+	effect     optionEffect
+	takesValue bool
+	// valueDomain is the set of values the real shell accepts. An unknown name
+	// ABORTS the shell - `-o nonesuch`, `+o nonesuch`, `-O nonesuch` and
+	// `+O nonesuch` all exit 2 - so a value outside the domain refuses.
+	valueDomain map[string]bool
+	// valueEffect maps a value to the state it controls, so `-o noexec` reaches
+	// the same clearable bit as `-n`.
+	valueEffect map[string]optionEffect
+}
+
+type longOption struct {
+	effect optionEffect
+	form   argumentForm
+}
+
 type interpreterGrammar struct {
-	// shortFlags take no value.
-	shortFlags string
-	// valueFlags consume the NEXT token as their value.
-	valueFlags string
-	// suppressingFlags parse or print instead of executing, so the command
-	// string does not run - but they are SIGN-SENSITIVE and ORDER-SENSITIVE:
-	// `-n` sets noexec and `+n` clears it, so `bash -n +n -c "go version"` runs
-	// Go while `bash +n -n -c "go version"` does not. Both measured.
-	suppressingFlags string
-	// alwaysSuppressing suppress on EITHER sign. Measured: `bash -D` and
-	// `bash +D` both dump strings and run no Go.
-	alwaysSuppressing string
+	shortOptions map[rune]shortOption
+	longOptions  map[string]longOption
 	// commandStringPlus records whether `+c` also introduces a command string.
-	// Measured true for bash and dash (`bash +c "go version"` runs Go); left
-	// false for zsh, which is not installed here and therefore not measured.
+	// Measured true for bash and dash; false for zsh, which is unmeasured.
 	commandStringPlus bool
-	longFlags         map[string]bool
-	longValueFlags    map[string]bool
-	// longSuppressing options print and exit.
-	longSuppressing map[string]bool
+	// declared marks an interpreter whose grammar was measured at all.
+	declared bool
+}
+
+// bashSetOptions and bashShoptOptions are the `-o` and `-O` value domains,
+// harvested from the installed bash rather than typed from a manual.
+var bashSetOptions = map[string]bool{
+	"allexport": true, "braceexpand": true, "emacs": true, "errexit": true,
+	"errtrace": true, "functrace": true, "hashall": true, "histexpand": true,
+	"history": true, "ignoreeof": true, "interactive-comments": true,
+	"keyword": true, "monitor": true, "noclobber": true, "noexec": true,
+	"noglob": true, "nolog": true, "notify": true, "nounset": true,
+	"onecmd": true, "physical": true, "pipefail": true, "posix": true,
+	"privileged": true, "verbose": true, "vi": true, "xtrace": true,
+}
+
+var bashShoptOptions = map[string]bool{
+	"assoc_expand_once": true, "autocd": true, "cdable_vars": true,
+	"cdspell": true, "checkhash": true, "checkjobs": true,
+	"checkwinsize": true, "cmdhist": true, "compat31": true,
+	"compat32": true, "compat40": true, "compat41": true, "compat42": true,
+	"compat43": true, "compat44": true, "complete_fullquote": true,
+	"direxpand": true, "dirspell": true, "dotglob": true, "execfail": true,
+	"expand_aliases": true, "extdebug": true, "extglob": true,
+	"extquote": true, "failglob": true, "force_fignore": true,
+	"globasciiranges": true, "globskipdots": true, "globstar": true,
+	"gnu_errfmt": true, "histappend": true, "histreedit": true,
+	"histverify": true, "hostcomplete": true, "huponexit": true,
+	"inherit_errexit": true, "interactive_comments": true, "lastpipe": true,
+	"lithist": true, "localvar_inherit": true, "localvar_unset": true,
+	"login_shell": true, "mailwarn": true, "no_empty_cmd_completion": true,
+	"nocaseglob": true, "nocasematch": true, "noexpand_translation": true,
+	"nullglob": true, "patsub_replacement": true, "progcomp": true,
+	"progcomp_alias": true, "promptvars": true, "restricted_shell": true,
+	"shift_verbose": true, "sourcepath": true, "varredir_close": true,
+	"xpg_echo": true,
+}
+
+// dashSetOptions is dash's OWN `set -o` domain, which is not bash's: `sh -o
+// pipefail` exits 2 because pipefail is not in it, while `sh -o errexit` and
+// `sh -o nounset` run Go. dash has no shopt at all, so it declares no `-O`.
+var dashSetOptions = map[string]bool{
+	"allexport": true, "debug": true, "emacs": true, "errexit": true,
+	"ignoreeof": true, "interactive": true, "monitor": true,
+	"noclobber": true, "noexec": true, "noglob": true, "nolog": true,
+	"notify": true, "nounset": true, "privileged": true, "stdin": true,
+	"verbose": true, "vi": true, "xtrace": true,
+}
+
+func plainShortOptions(letters string) map[rune]shortOption {
+	options := make(map[rune]shortOption, len(letters))
+	for _, letter := range letters {
+		options[letter] = shortOption{effect: effectNone}
+	}
+	return options
+}
+
+func withShortOption(options map[rune]shortOption, letter rune, option shortOption) map[rune]shortOption {
+	options[letter] = option
+	return options
 }
 
 var interpreterGrammars = map[string]interpreterGrammar{
 	"bash": {
-		// Every letter below was measured on BOTH signs: all 22 run Go with
-		// `-f -c "go version"` and with `+f -c "go version"`.
-		shortFlags:        "abefhiklmprstuvxBCEHPT",
-		valueFlags:        "oO",
-		suppressingFlags:  "n",
-		alwaysSuppressing: "D",
+		declared:          true,
 		commandStringPlus: true,
-		longFlags: map[string]bool{
-			"--login": true, "--noprofile": true, "--norc": true, "--posix": true,
-			"--restricted": true, "--verbose": true, "--noediting": true, "--debugger": true,
-			"--pretty-print": true,
-		},
-		longValueFlags: map[string]bool{"--rcfile": true, "--init-file": true},
-		// MEASURED, and this corrected two of my own entries. `--pretty-print`
-		// was declared suppressing and is NOT: `bash --pretty-print -c "go
-		// version"` exits 0 and RUNS Go, so it belongs with the ordinary
-		// flags. These four really do suppress (all exit 0, zero Go).
-		longSuppressing: map[string]bool{
-			"--help": true, "--version": true, "--dump-strings": true,
-			"--dump-po-strings": true,
+		// Every letter measured on BOTH signs: all 22 run Go.
+		shortOptions: withShortOption(withShortOption(withShortOption(withShortOption(
+			plainShortOptions("abefhiklmprstuvxBCEHPT"),
+			'n', shortOption{effect: effectNoexec}),
+			'D', shortOption{effect: effectTerminal}),
+			'o', shortOption{takesValue: true, valueDomain: bashSetOptions,
+				valueEffect: map[string]optionEffect{"noexec": effectNoexec}}),
+			'O', shortOption{takesValue: true, valueDomain: bashShoptOptions}),
+		longOptions: map[string]longOption{
+			"--login": {}, "--noprofile": {}, "--norc": {}, "--posix": {},
+			"--restricted": {}, "--verbose": {}, "--noediting": {},
+			"--debugger": {}, "--pretty-print": {},
+			"--rcfile":    {form: argSeparate},
+			"--init-file": {form: argSeparate},
+			// Terminal: measured to print and run nothing, even followed by +n.
+			"--help": {effect: effectTerminal}, "--version": {effect: effectTerminal},
+			"--dump-strings": {effect: effectTerminal}, "--dump-po-strings": {effect: effectTerminal},
 		},
 	},
-	// POSIX sh is dash on this box, and it is NOT bash: it rejects --noprofile,
-	// -O and even `-o pipefail`, all measured. Applying bash's table to it was
-	// the third gap in round-14 F1.
+	// POSIX sh here is /usr/bin/dash and is NOT bash: it rejects `-h`, has NO
+	// long options at all (`--help` and `--version` both exit 2), and carries
+	// its own `-o` domain.
 	"sh": {
-		// MEASURED LETTER BY LETTER against the installed /usr/bin/dash. `h` was
-		// declared here from bash's table and is NOT accepted: `sh -h -c "go
-		// version"` exits 2, while this lexer called it a test. Every letter
-		// below ran Go; `n` suppresses and `+n` clears it, both measured.
-		shortFlags:        "abCefilmuvx",
-		suppressingFlags:  "n",
+		declared:          true,
 		commandStringPlus: true,
-		// DASH HAS NO LONG OPTIONS AT ALL. I had copied bash's --help/--version
-		// across; measured, `sh --help -c` and `sh --version -c` BOTH exit 2
-		// with "Illegal option --". So every long option refuses for sh, which
-		// is the same mistake as the `h` flag one level up: an attribute
-		// borrowed from bash rather than measured on the real interpreter.
+		shortOptions: withShortOption(withShortOption(
+			plainShortOptions("abCefilmuvx"),
+			'n', shortOption{effect: effectNoexec}),
+			'o', shortOption{takesValue: true, valueDomain: dashSetOptions,
+				valueEffect: map[string]optionEffect{"noexec": effectNoexec}}),
+		longOptions: map[string]longOption{},
 	},
-	// zsh IS NOT INSTALLED ON THIS BOX, so I could not measure it. Only the two
-	// universals are declared - `-c` introduces a command string in every
-	// Bourne-family shell, and `--` ends options - and every other option
-	// refuses. commandStringPlus stays FALSE, so `zsh +c` refuses too: `+c` was
-	// measured to run a command string in bash and dash, and carrying that
-	// across to an unmeasured shell is exactly the assumption this entry
-	// exists to avoid. An unmeasured grammar is not a grammar.
-	"zsh": {},
+	// zsh IS INSTALLED NOWHERE IN THIS LOOP - not on this box and not in the
+	// review seat - so no zsh behaviour has been executed by anybody. Only the
+	// two universals are declared, and even `+c` refuses although `+c` is
+	// measured to work in bash and dash. An unmeasured grammar is not a
+	// grammar.
+	"zsh": {declared: true},
 }
 
-// interpreterOptionOutcome is what scanning an interpreter's options decided.
 type interpreterOptionOutcome int
 
 const (
 	// interpreterRunsNoCommandString: the shell runs, but no command string
-	// does - either the operand is a script FILE, or an option suppressed
-	// execution (-n, -D, --help, --version). Either way no Go test ran.
+	// does - a script operand, or an option that suppressed execution.
 	interpreterRunsNoCommandString interpreterOptionOutcome = iota
-	// interpreterRunsCommandString: a -c belonging to THIS interpreter.
 	interpreterRunsCommandString
-	// interpreterUndeclared: an option outside the declared grammar. The shell
-	// aborts on these, and we refuse rather than guess.
+	// interpreterUndeclared: outside the measured grammar. The shell aborts on
+	// these, and we refuse rather than guess.
 	interpreterUndeclared
 )
 
 // scanInterpreterOptions walks a shell interpreter's own options and reports
-// what it will do, plus the index of its command string. It NEVER decides on
-// token shape alone: `--` terminates options, value-taking options consume
-// their argument, suppressing options cancel execution, and an option outside
-// THIS interpreter's declared grammar refuses.
+// what it will do, plus the index of its command string.
 func scanInterpreterOptions(interpreter string, tokens []shellToken) (interpreterOptionOutcome, int) {
-	grammar, declared := interpreterGrammars[interpreter]
-	if !declared {
+	grammar := interpreterGrammars[interpreter]
+	if !grammar.declared {
 		return interpreterUndeclared, 0
 	}
-	suppressed := false
+	noexec, terminal, sawShortCluster := false, false, false
 	for index := 0; index < len(tokens); index++ {
 		text := tokens[index].text()
 		switch {
 		case text == "--":
-			// OPTION TERMINATION: a following -c is a script named "-c".
+			// OPTION TERMINATION, and it is exempt from the ordering rule below:
+			// `bash -x -- -c` still runs a script named "-c" (exit 127).
 			return interpreterRunsNoCommandString, 0
 		case strings.HasPrefix(text, "--"):
-			name, inlineValue := text, false
-			if equals := strings.Index(text, "="); equals > 0 {
-				name, inlineValue = text[:equals], true
-			}
-			switch {
-			case grammar.longValueFlags[name]:
-				if !inlineValue {
-					index++
-				}
-			case grammar.longSuppressing[name]:
-				if inlineValue {
-					// A BOOLEAN FLAG TAKES NO VALUE: `--version=x` aborts.
-					return interpreterUndeclared, 0
-				}
-				suppressed = true
-			case grammar.longFlags[name]:
-				if inlineValue {
-					return interpreterUndeclared, 0
-				}
-			default:
+			if sawShortCluster {
+				// ORDERING: a named long option after a short cluster aborts.
+				// `bash -x --noprofile -c`, `-i --norc -c`, `-s --noprofile -c`
+				// and `-O extglob --noprofile -c` all exit 2 (#1930 round-16).
 				return interpreterUndeclared, 0
 			}
+			// ARGUMENT FORM: every long option measured rejects the inline `=`
+			// form, value-taking ones included (`--rcfile=/dev/null` and
+			// `--init-file=/dev/null` exit 2, `--noprofile=x` exits 2). NO
+			// EXPLICIT `=` GUARD IS NEEDED and one is not kept: the lookup
+			// below keys on the WHOLE token, so `--rcfile=/dev/null` is simply
+			// not a declared option and refuses. Measured, not assumed - with
+			// the guard present, the mutant that disabled it SURVIVED, so it
+			// was code no test could kill. TestPhaseInstrumentHonoursArgumentForms
+			// pins the behaviour instead.
+			option, declared := grammar.longOptions[text]
+			if !declared {
+				return interpreterUndeclared, 0
+			}
+			if option.effect == effectTerminal {
+				terminal = true
+			}
+			if option.form == argSeparate {
+				index++
+			}
 		case len(text) > 1 && (text[0] == '-' || text[0] == '+'):
-			// POLARITY AND ORDER BOTH MATTER. `-n` sets noexec, `+n` clears it,
-			// and the LAST setting wins across the whole option list, so the
-			// suppression bit is assigned here rather than only ever set
-			// (#1930 round-15).
+			sawShortCluster = true
 			enabling := text[0] == '-'
-			letters := text[1:]
-			commandString, needsValue := false, false
+			letters := []rune(text[1:])
+			commandString := false
 			for position, letter := range letters {
-				switch {
-				case letter == 'c':
+				if letter == 'c' {
 					if !enabling && !grammar.commandStringPlus {
-						// `+c` is unmeasured for this interpreter.
 						return interpreterUndeclared, 0
 					}
 					commandString = true
-				case strings.ContainsRune(grammar.alwaysSuppressing, letter):
-					suppressed = true
-				case strings.ContainsRune(grammar.suppressingFlags, letter):
-					suppressed = enabling
-				case strings.ContainsRune(grammar.valueFlags, letter):
-					if position != len(letters)-1 {
-						// A value letter mid-cluster owns the rest of the
-						// cluster in some shells and not others; undeclared.
-						return interpreterUndeclared, 0
-					}
-					needsValue = true
-				case strings.ContainsRune(grammar.shortFlags, letter):
-				default:
+					continue
+				}
+				option, declared := grammar.shortOptions[letter]
+				if !declared {
 					return interpreterUndeclared, 0
 				}
-			}
-			if commandString && needsValue {
-				return interpreterUndeclared, 0
+				if option.takesValue {
+					if position != len(letters)-1 || commandString {
+						// bash's -O takes an OPTIONAL argument, so a value
+						// letter that does not end its cluster is ambiguous.
+						return interpreterUndeclared, 0
+					}
+					if index+1 >= len(tokens) {
+						return interpreterUndeclared, 0
+					}
+					value := tokens[index+1].text()
+					if !option.valueDomain[value] {
+						// VALUE DOMAIN: an unknown name aborts the shell.
+						return interpreterUndeclared, 0
+					}
+					if effect, controls := option.valueEffect[value]; controls {
+						switch effect {
+						case effectNoexec:
+							noexec = enabling
+						case effectTerminal:
+							terminal = true
+						}
+					}
+					index++
+					continue
+				}
+				switch option.effect {
+				case effectNoexec:
+					noexec = enabling
+				case effectTerminal:
+					// STICKY on either sign, and never cleared by a later +n.
+					terminal = true
+				}
 			}
 			if commandString {
-				if suppressed {
+				if noexec || terminal {
 					return interpreterRunsNoCommandString, 0
 				}
 				return interpreterRunsCommandString, index + 1
-			}
-			if needsValue {
-				index++
 			}
 		default:
 			// A non-option token: the script file.

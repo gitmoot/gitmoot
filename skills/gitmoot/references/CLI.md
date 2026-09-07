@@ -2436,6 +2436,19 @@ command rather than suppressing it. zsh is unmeasured here, so only `-c` and
 `--` are declared for it and even `+c` refuses, although `+c` does introduce a
 command string in bash and dash.
 
+Options are modelled PER OPTION on four axes, each measured against the
+installed interpreters. EXECUTION EFFECT distinguishes clearable noexec (`-n`,
+`+n`, `-o noexec`) from sticky terminal forms (`-D`, `+D`, `--help`,
+`--version`, `--dump-strings`, `--dump-po-strings`) that print or dump and are
+never restored by a later `+n`. ARGUMENT FORM: long options take a separate
+value only, so `--rcfile=/dev/null` is refused while `--rcfile /dev/null` runs.
+VALUE DOMAIN: `-o`/`-O` values are checked against the shell's own `set -o` and
+`shopt` names, which differ per interpreter - `sh -o pipefail` is refused
+because dash does not have it, and dash has no `shopt` at all. ORDERING: a named
+long option after a short cluster is refused, matching the real shells, while
+the bare `--` terminator is exempt. Anything outside a measured table is
+`unknown`.
+
 
 
 Classification reads EVERY segment of a command, not the leading token:
