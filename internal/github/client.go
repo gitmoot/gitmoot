@@ -1710,7 +1710,24 @@ func (c *GhClient) runRequest(ctx context.Context, mutate bool, conditional bool
 		// failure can be classified as network_outage and short-backoff deferred.
 		// Non-outage failures (and every failure's exact text) are untouched, and
 		// best-effort callers that swallow the error are byte-identical.
-		return result, classifyTransientError(result, commandError(result, err))
+		failure := classifyTransientError(result, commandError(result, err))
+		// #1994: A PRIMARY rate limit reaches the operator with its RESET, because
+		// the reset decides whether waiting or re-dispatching is correct and the
+		// bare message decides nothing. Scoped to the primary class deliberately:
+		// a SECONDARY limit already engages the process-wide backoff above and
+		// answers to Retry-After rather than to a window reset, so probing it
+		// would add a request to an abuse window this code is trying to leave
+		// alone.
+		//
+		// It WRAPS, so the original text and the TransientError marker both
+		// survive, and it is best effort: a probe that cannot answer leaves the
+		// failure exactly as it was.
+		if isRateLimit(result) && !sawSecondary {
+			if window, ok := c.rateLimitWindowForRequest(ctx, runner, args); ok {
+				return result, &RateLimitError{Window: window, Err: failure}
+			}
+		}
+		return result, failure
 	}
 	return result, nil
 }

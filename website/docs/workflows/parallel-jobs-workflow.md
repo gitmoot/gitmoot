@@ -172,6 +172,20 @@ concurrency**, not total volume, so concurrent bursts can trip it (HTTP 403
 fine — the only manual workaround being to stop the daemon and wait out the
 cooldown (#683).
 
+The **primary** limit is a separate failure with a separate remedy. When a call
+fails on primary exhaustion, Gitmoot re-issues that same request once with
+headers and reports the window its own response named: the resource, how empty
+it is, the reset timestamp and the remaining wait. A primary window carries no
+`Retry-After` and cannot be shortened, so waiting is the only remedy and a
+retry before the reset cannot succeed.
+
+It reads the **failed request's** headers, never `GET /rate_limit`. That endpoint
+is not a usable precondition: measured on one credential and one host seconds
+apart, it reported core `4999/5000 used=1` while a real core request returned 403
+with `remaining=0 used=5000`, their resets thirteen minutes apart, and minutes
+later it reported a fresh `5000/5000 used=0` while real calls were still refused.
+The 403 header's reset was accurate throughout.
+
 The opt-in `[github]` section installs a **GitHub call budget + adaptive backoff**
 that is **in-process to the daemon** — it covers the `gh`/API calls gitmoot itself
 issues from the daemon process (polling, comments, merges, status). It is enforced
