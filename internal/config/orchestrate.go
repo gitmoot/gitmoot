@@ -456,6 +456,30 @@ type ReviewPolicy struct {
 	// (risk:high / risk:routine).
 	RiskLabelHigh    string
 	RiskLabelRoutine string
+	// FindingsConsumption declares whether a repository CONSUMES review findings
+	// or treats them as ADVISORY (#1969). Three values, and the empty one is not
+	// a synonym for either:
+	//
+	//   ""           undeclared. Behaves exactly as before this field existed:
+	//                unobserved obligations hold the merge. Reported as
+	//                undeclared so the absence is visible rather than assumed.
+	//   "consuming"  the same behaviour, stated on purpose.
+	//   "advisory"   findings are still recorded and still reported, but they do
+	//                not hold the merge.
+	//
+	// WHY THE ADVISORY OPTION EXISTS, measured. 211 findings were recorded across
+	// five repositories that have never answered one, and the obligation gate is
+	// live: it refused 16 times across 5 repositories, including vetrina#126 on
+	// 37 prior findings all "still open" and coordinator-checkin#3 on 17. That is
+	// exactly the wedge findings_ledger_writer.go's header predicts when the
+	// write half runs without the read half - a guard that rejects valid input.
+	//
+	// It is a DECLARATION, not a default, and it is deliberately not inferred
+	// from behaviour: a repository that has answered nothing might be ignoring
+	// its reviews or might simply be new. Only an operator knows which, so an
+	// undeclared repository keeps the blocking behaviour and shows up as
+	// undeclared in `gitmoot findings`.
+	FindingsConsumption string
 }
 
 func DefaultReviewPolicy() ReviewPolicy {
@@ -463,7 +487,24 @@ func DefaultReviewPolicy() ReviewPolicy {
 		NativeFanoutEnabled: false,
 		BlockingSeverity:    reviewseverity.DefaultBlocking,
 		RiskTiersEnabled:    false,
+		// Undeclared, which behaves as consuming. Defaulting to "consuming" here
+		// would make an operator's explicit declaration indistinguishable from
+		// never having made one, and the whole point is that the absence shows.
+		FindingsConsumption: "",
 	}
+}
+
+// Findings-consumption declarations. A repository is CONSUMING unless it says
+// otherwise, so the zero value cannot relax a gate.
+const (
+	FindingsConsuming = "consuming"
+	FindingsAdvisory  = "advisory"
+)
+
+// FindingsAreAdvisory reports whether unobserved obligations may be recorded
+// without holding the merge. Only an explicit "advisory" relaxes it.
+func (p ReviewPolicy) FindingsAreAdvisory() bool {
+	return strings.EqualFold(strings.TrimSpace(p.FindingsConsumption), FindingsAdvisory)
 }
 
 // ReviewConfig is the parsed global [review] policy plus repository-scoped
@@ -529,6 +570,7 @@ func ReviewConfigErrorsOnlyBlockingSeverity(err error) bool {
 type reviewPolicyOverride struct {
 	nativeFanoutEnabled *bool
 	blockingSeverity    *string
+	findingsConsumption *string
 }
 
 // For resolves the effective policy for repo. Risk-tier settings remain global;
@@ -542,6 +584,9 @@ func (c ReviewConfig) For(repo string) ReviewPolicy {
 	}
 	if ok && override.blockingSeverity != nil {
 		policy.BlockingSeverity = *override.blockingSeverity
+	}
+	if ok && override.findingsConsumption != nil {
+		policy.FindingsConsumption = *override.findingsConsumption
 	}
 	return policy
 }
@@ -675,6 +720,17 @@ func applyReviewPolicyField(policy *ReviewPolicy, key string, value string) erro
 		}
 		policy.RiskLabelRoutine = strings.TrimSpace(parsed)
 		return nil
+	case "findings_consumption":
+		parsed, err := parseFindingsConsumption(value)
+		if err != nil {
+			// Fail CLOSED, like blocking_severity: an unreadable declaration
+			// leaves the repository consuming, never advisory, so a typo can
+			// never quietly stop findings holding a merge.
+			policy.FindingsConsumption = ""
+			return err
+		}
+		policy.FindingsConsumption = parsed
+		return nil
 	default:
 		return nil
 	}
@@ -698,8 +754,35 @@ func applyReviewPolicyOverrideField(override *reviewPolicyOverride, key string, 
 		}
 		override.blockingSeverity = &parsed
 		return nil
+	case "findings_consumption":
+		parsed, err := parseFindingsConsumption(value)
+		if err != nil {
+			safe := ""
+			override.findingsConsumption = &safe
+			return err
+		}
+		override.findingsConsumption = &parsed
+		return nil
 	default:
 		return nil
+	}
+}
+
+// parseFindingsConsumption accepts only the two declarations and the empty
+// string. An unrecognised value is an ERROR rather than a silent fallback,
+// because "advisroy" must not read as undeclared-and-therefore-fine when the
+// operator plainly meant to relax the gate and will believe they did.
+func parseFindingsConsumption(value string) (string, error) {
+	parsed, err := parseConfigString(value)
+	if err != nil {
+		return "", err
+	}
+	declaration := strings.ToLower(strings.TrimSpace(parsed))
+	switch declaration {
+	case "", FindingsConsuming, FindingsAdvisory:
+		return declaration, nil
+	default:
+		return "", fmt.Errorf("unsupported findings_consumption %q; want %q or %q", parsed, FindingsConsuming, FindingsAdvisory)
 	}
 }
 

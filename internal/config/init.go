@@ -384,9 +384,22 @@ path = ""
 # risk_label_high = "risk:high"
 # risk_label_routine = "risk:routine"
 #
+# findings_consumption declares whether a repository CONSUMES review findings or
+# treats them as ADVISORY (#1969). Leaving it unset is NOT the same as declaring
+# "consuming": both keep today's behaviour, where an unobserved prior finding
+# holds the merge, but an unset repository reports as undeclared in
+# 'gitmoot findings' so the absence of a decision is visible. Declaring
+# "advisory" keeps recording and reporting findings while letting the merge
+# proceed past them, and every such merge records a
+# findings_ledger_advisory_merge task event naming what it went past, so
+# advisory means stated rather than silent. Only an explicit "advisory" relaxes
+# anything; an unreadable value fails closed to consuming.
+# findings_consumption = "consuming"
+#
 # [repos."owner/repo".review]
 # native_fanout_enabled = true
 # blocking_severity = "P1"
+# findings_consumption = "advisory"
 
 # [merge_gate] controls native task merges. Native auto-merge is enabled by
 # default, but only when an approved review verdict matches the exact current

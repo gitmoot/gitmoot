@@ -90,6 +90,16 @@ type LedgerScope struct {
 	ChangedSince func(ctx context.Context, previousHead string, currentHead string) ([]string, error)
 	// PathExistsAtHead reports whether a repo-relative path exists at a head.
 	PathExistsAtHead func(ctx context.Context, head string, path string) (bool, error)
+	// FindingsAdvisory carries the repository's #1969 declaration. When true the
+	// acceptance check RECORDS the obligations it is letting through and returns
+	// nil instead of refusing. It lives on the scope, and the recording happens
+	// here rather than in the gate, because the gate's store surface is a
+	// deliberate firewall (TestMergeGateStoreAccessSurface): the gate passes
+	// DATA, and the ledger, which already holds the store, does the writing.
+	FindingsAdvisory bool
+	// Repo names the repository for the advisory record, so the note says which
+	// declaration permitted the pass rather than leaving a reader to infer it.
+	Repo string
 	// TaskID lets the acceptance check record a degradation as a task event
 	// WITHOUT the merge gate itself gaining a store write. The gate's *db.Store
 	// surface is a deliberate firewall pinned by TestMergeGateStoreAccessSurface,
@@ -339,8 +349,29 @@ func EnsureLedgerObligationsObserved(ctx context.Context, store *db.Store, repo 
 		}
 		named = append(named, fmt.Sprintf("%s [%s %s: %s]", obligation.FindingUID, label, obligation.Severity, obligation.Reason))
 	}
-	return fmt.Errorf("findings ledger: %d prior finding(s) carry no observation at head %s: %s",
+	refusal := fmt.Errorf("findings ledger: %d prior finding(s) carry no observation at head %s: %s",
 		len(pending), shortHead(headSHA), strings.Join(named, "; "))
+	if !scope.FindingsAdvisory {
+		return refusal
+	}
+	// ADVISORY MEANS STATED, NOT SILENT (#1969). The declaration permits the
+	// merge; it does not permit losing the record. The issue this answers is 211
+	// findings recorded across five repositories that never answered one, with
+	// nothing surfacing it, so a declaration that quietly dropped the same
+	// obligations would reproduce that defect with an operator's signature on it.
+	//
+	// Best-effort: an audit write must never turn a permitted merge into a
+	// failure. The obligations stay in the ledger regardless, and
+	// `gitmoot findings` reports them whatever the declaration says.
+	if taskID := strings.TrimSpace(scope.TaskID); taskID != "" {
+		_ = store.AddTaskEvent(ctx, db.TaskEvent{
+			TaskID: taskID,
+			Kind:   "findings_ledger_advisory_merge",
+			Reason: fmt.Sprintf("%s declares findings_consumption = %q, so this head proceeded past obligations that would otherwise have held it: %v",
+				strings.TrimSpace(scope.Repo), "advisory", refusal),
+		})
+	}
+	return nil
 }
 
 func shortHead(head string) string {

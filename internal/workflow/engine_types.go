@@ -343,6 +343,12 @@ type MergeRequest struct {
 	// ReviewBlockingSeverity is the resolved repository threshold carried into
 	// the merge gate. Empty preserves the historical block-all behavior.
 	ReviewBlockingSeverity string
+	// FindingsAdvisory carries the repository's #1969 declaration: when true,
+	// unobserved ledger obligations are RECORDED and REPORTED but do not hold
+	// the merge. Empty/false preserves today's behaviour, so an undeclared
+	// repository is unchanged and only an explicit operator declaration relaxes
+	// anything.
+	FindingsAdvisory bool
 	// HumanMergeRequested is an explicit, authorized human instruction. It is
 	// evaluated inside PolicyMergeGate, never by a caller-side bypass.
 	HumanMergeRequested bool
