@@ -6429,3 +6429,266 @@ func seedHeadlessCandidate(t *testing.T, store *db.Store, id, agent string, stat
 	}
 	setMergeGateJobTimestamps(t, store, id, "2026-09-01T18:00:00Z")
 }
+
+// seedProductionReviewRow drives a review through the PRODUCTION writers -
+// Mailbox.Enqueue then finishWithPayload - rather than assembling a row. That is
+// load-bearing for both arms below: the whole of #1950 F5 is that a CLI review
+// carries a HeadSHA and NEITHER a round nor ExternallyDriven, and a hand-built
+// fixture is free to contradict that. This one cannot.
+func seedProductionReviewRow(t *testing.T, store *db.Store, id, agent, decision, headSHA string, delegations []Delegation) db.Job {
+	t.Helper()
+	ctx := context.Background()
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	if _, err := mailbox.Enqueue(ctx, JobRequest{
+		ID: id, Agent: agent, Action: "review", Repo: "gitmoot/gitmoot", Branch: "task-9",
+		TaskID: "task-9", PullRequest: 9, HeadSHA: headSHA, Instructions: "review",
+		SkipNativeReviewFanout: true,
+	}); err != nil {
+		t.Fatalf("Enqueue(%s) returned error: %v", id, err)
+	}
+	// finishWithPayload only accepts a RUNNING job, exactly as the worker leaves it
+	// after claiming. Skipping this made both arms fail on the FIXTURE rather than
+	// on the behaviour under test, which is how the first run of this test failed -
+	// a green or red arm that never reached the predicate proves nothing.
+	if _, err := store.TransitionJobState(ctx, id, string(JobQueued), string(JobRunning)); err != nil {
+		t.Fatalf("TransitionJobState(%s) queued->running: %v", id, err)
+	}
+	queued, err := store.GetJob(ctx, id)
+	if err != nil {
+		t.Fatalf("GetJob(%s): %v", id, err)
+	}
+	payload, err := unmarshalPayload(queued.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(%s): %v", id, err)
+	}
+	payload.Result = &AgentResult{Decision: decision, Summary: "production review", Delegations: delegations}
+	if decision == "changes_requested" {
+		payload.Result.Severity = reviewseverity.P1
+	}
+	if err := mailbox.finishWithPayload(ctx, id, JobSucceeded, "job succeeded", payload); err != nil {
+		t.Fatalf("finishWithPayload(%s): %v", id, err)
+	}
+	stored, err := store.GetJob(ctx, id)
+	if err != nil {
+		t.Fatalf("GetJob(%s) after finish: %v", id, err)
+	}
+	return stored
+}
+
+// seedHeadlessRoundCandidate inserts a headless candidate carrying an EXPLICIT
+// review round - the engine-dispatched shape. The distinction from
+// seedHeadlessCandidate is the whole point of the asymmetry probe: roundless
+// against roundless is ordered by TIMESTAMP and legitimately supersedes (that is
+// the session-approval case F1/F2 require), whereas an explicit round against a
+// roundless objection is refused by reviewRoundKey in either direction.
+func seedHeadlessRoundCandidate(t *testing.T, store *db.Store, id, agent, round, decision string) {
+	t.Helper()
+	encoded, err := marshalPayload(JobPayload{
+		Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", ReviewRound: round,
+		Result: &AgentResult{Decision: decision, Summary: "engine-dispatched candidate"},
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(context.Background(), db.Job{
+		ID: id, Agent: agent, Type: "review", State: string(JobSucceeded), Payload: encoded,
+	}, db.JobEvent{Kind: string(JobSucceeded), Message: "candidate"}); err != nil {
+		t.Fatalf("CreateJobWithEvent(%s): %v", id, err)
+	}
+	setMergeGateJobTimestamps(t, store, id, "2026-09-01T18:00:00Z")
+}
+
+// TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut covers BOTH P1s the
+// exact-head review of b22667017849b0a460026a68f9bf18d9a89ccd26 found, and they
+// point in OPPOSITE directions - which is why they are pinned together and why
+// each has its own mutant:
+//
+//   - F5, OVER-BLOCKING: the provenance clause demanded external origin or a round
+//     of every candidate, and a CLI review has neither, so a legitimate succeeded
+//     approval at the evaluated head could not retire an objection and the PR
+//     deadlocked. Provenance is now asked only of a HEADLESS row.
+//   - F6, UNDER-BLOCKING: default-deny had been added to the headless loop only,
+//     while the at-head loop still tested a bare Result != nil, so an approved
+//     FAN-OUT announcement at the evaluated head retired a real objection and the
+//     PR merged. Both loops now share the predicate - two call sites, asserted
+//     below as a COUNT, because the previous round claimed that property with one.
+func TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut(t *testing.T) {
+	t.Run("a CLI approval at the evaluated head RETIRES a session objection (F5: must MERGE)", func(t *testing.T) {
+		ctx := context.Background()
+		store, gh, gate, request := newMergeGateQuorumScenario(t)
+		insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+			id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
+		})
+		mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+		if _, err := mailbox.OpenExternalJob(ctx, JobRequest{
+			ID: "cli-session-objection", Agent: "returning-reviewer", Action: "review",
+			Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", Sender: "session",
+		}); err != nil {
+			t.Fatalf("OpenExternalJob returned error: %v", err)
+		}
+		if _, err := mailbox.CloseExternalJobWithUsage(ctx, "cli-session-objection", AgentResult{
+			Decision: "changes_requested", Severity: reviewseverity.P1, Summary: "session objection",
+		}, 0, "", "", ExternalJobUsage{}); err != nil {
+			t.Fatalf("CloseExternalJobWithUsage returned error: %v", err)
+		}
+		setMergeGateJobTimestamps(t, store, "cli-session-objection", "2026-09-01T12:00:00Z")
+
+		cli := seedProductionReviewRow(t, store, "cli-review-approval", "returning-reviewer", "approved", "head123", nil)
+		setMergeGateJobTimestamps(t, store, "cli-review-approval", "2026-09-01T18:00:00Z")
+
+		// Assert the shape rather than trust it: if a CLI review ever starts
+		// carrying a round or an external origin, this arm stops reproducing F5 and
+		// must fail loudly instead of passing for the wrong reason.
+		cliPayload, err := unmarshalPayload(cli.Payload)
+		if err != nil {
+			t.Fatalf("unmarshalPayload: %v", err)
+		}
+		if strings.TrimSpace(cliPayload.HeadSHA) != "head123" {
+			t.Fatalf("CLI review head=%q, want head123; fixture no longer reproduces F5", cliPayload.HeadSHA)
+		}
+		if strings.TrimSpace(cliPayload.ReviewRound) != "" || cli.ExternallyDriven {
+			t.Fatalf("CLI review round=%q externally_driven=%v, want empty/false; fixture no longer reproduces F5",
+				cliPayload.ReviewRound, cli.ExternallyDriven)
+		}
+
+		if err := store.UpsertTask(ctx, db.Task{
+			ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9", State: string(TaskReadyToMerge),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		request.Reviewer = "audit"
+		request.ExpectedTaskState = string(TaskReadyToMerge)
+
+		decision, evalErr := gate.Evaluate(ctx, request)
+		if evalErr != nil {
+			t.Fatalf("Evaluate returned error: %v", evalErr)
+		}
+		if !decision.Merged || len(gh.merges) != 1 {
+			t.Fatalf("decision=%+v merges=%d, want ONE merge: a succeeded CLI approval at the evaluated head is a real verdict and must retire that reviewer's own earlier objection (#1950 F5)",
+				decision, len(gh.merges))
+		}
+	})
+
+	t.Run("an at-head approved FAN-OUT does NOT retire an at-head objection (F6: must BLOCK)", func(t *testing.T) {
+		ctx := context.Background()
+		store, gh, gate, request := newMergeGateQuorumScenario(t)
+		insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+			id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
+		})
+		seedProductionReviewRow(t, store, "at-head-objection", "fanout-reviewer", "changes_requested", "head123", nil)
+		setMergeGateJobTimestamps(t, store, "at-head-objection", "2026-09-01T12:00:00Z")
+		seedProductionReviewRow(t, store, "at-head-fanout", "fanout-reviewer", "approved", "head123",
+			[]Delegation{{ID: "d1", Agent: "specialist", Action: "review", Prompt: "look again"}})
+		setMergeGateJobTimestamps(t, store, "at-head-fanout", "2026-09-01T18:00:00Z")
+
+		if err := store.UpsertTask(ctx, db.Task{
+			ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9", State: string(TaskReadyToMerge),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		request.Reviewer = "audit"
+		request.ExpectedTaskState = string(TaskReadyToMerge)
+
+		decision, evalErr := gate.Evaluate(ctx, request)
+		if evalErr != nil {
+			t.Fatalf("Evaluate returned error: %v", evalErr)
+		}
+		if decision.Merged || len(gh.merges) != 0 {
+			t.Fatalf("decision=%+v merges=%d, want NO merge: an approved fan-out is a dispatch announcement, not a verdict, so it cannot retire that reviewer's own at-head objection (#1950 F6)",
+				decision, len(gh.merges))
+		}
+		task, taskErr := store.GetTask(ctx, "task-9")
+		if taskErr != nil {
+			t.Fatalf("GetTask: %v", taskErr)
+		}
+		if task.State == string(TaskMerged) {
+			t.Fatalf("task state = %q, want it NOT merged", task.State)
+		}
+	})
+
+	t.Run("all THREE populations share the predicate (static census, not a claim)", func(t *testing.T) {
+		source, err := os.ReadFile("merge_gate.go")
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		// THE COUNT IS THE POINT. The previous round advertised "the same predicate
+		// governs the objection side" while the helper had ONE call site, and a
+		// one-line grep would have falsified it. A count fails; a sentence does not.
+		//
+		// Three populations decide whether a row may retire or supersede an
+		// objection: the at-head candidate loop, the headless candidate loop, and
+		// the headless objection scan. Two further objection-side sites MUST differ
+		// and are excluded on stated mechanism, not preference:
+		//
+		//   - the at-head BLOCKING scan is preceded by the crashed-reviewer guard,
+		//     which ERRORS on any non-succeeded row at the evaluated head, so
+		//     routing it would add an unreachable silent skip in place of a loud
+		//     error. Probed: routing it passes the whole control set precisely
+		//     BECAUSE the added check is dead, which is not evidence it belongs.
+		//   - the two slot scans decide whether a reviewer's SLOT is filled - a
+		//     fan-out with dispatched children is judged through the children -
+		//     so routing them would change quorum rather than tighten it.
+		guards := strings.Count(string(source), "!reviewRowIsVerdictAboutHead(") +
+			strings.Count(string(source), "!reviewRowCanRetireAnObjection(")
+		if guards != 3 {
+			t.Fatalf("shared-predicate guard call sites = %d, want 3 (at-head candidate, headless candidate, headless objection): if a fourth population appeared it must either route through the shared core or be excluded here with its mechanism (#1950 P1-B)", guards)
+		}
+	})
+
+	t.Run("ASYMMETRY PROBE, committed so the divergence cannot silently return", func(t *testing.T) {
+		ctx := context.Background()
+		store, gh, gate, request := newMergeGateQuorumScenario(t)
+		insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+			id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
+		})
+		mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+		if _, err := mailbox.OpenExternalJob(ctx, JobRequest{
+			ID: "asym-objection", Agent: "asym-reviewer", Action: "review",
+			Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", Sender: "session",
+		}); err != nil {
+			t.Fatalf("OpenExternalJob returned error: %v", err)
+		}
+		if _, err := mailbox.CloseExternalJobWithUsage(ctx, "asym-objection", AgentResult{
+			Decision: "changes_requested", Severity: reviewseverity.P1, Summary: "session objection",
+		}, 0, "", "", ExternalJobUsage{}); err != nil {
+			t.Fatalf("CloseExternalJobWithUsage returned error: %v", err)
+		}
+		setMergeGateJobTimestamps(t, store, "asym-objection", "2026-09-01T12:00:00Z")
+
+		// This candidate is ADMITTED by the shared predicate: succeeded,
+		// non-fan-out, headless, and externally driven so provenance is satisfied.
+		// What refuses it is reviewRoundKey, which will not order an explicit round
+		// against a roundless objection. The distinction is recorded because the
+		// previous round's comment credited the REFUSAL to the predicate, which does
+		// not perform it - and naming the wrong mechanism is how the next round
+		// "fixes" the wrong function.
+		seedHeadlessRoundCandidate(t, store, "asym-delegation-child", "asym-reviewer", "review-2", "approved")
+		job, err := store.GetJob(ctx, "asym-delegation-child")
+		if err != nil {
+			t.Fatalf("GetJob: %v", err)
+		}
+		payload, err := unmarshalPayload(job.Payload)
+		if err != nil {
+			t.Fatalf("unmarshalPayload: %v", err)
+		}
+		if !reviewRowIsVerdictAboutHead(job, payload, "head123") {
+			t.Fatalf("shared predicate REFUSED the roundless externally-driven candidate; this probe exists to pin that it ADMITS it and that reviewRoundKey is what refuses it (#1950)")
+		}
+
+		if err := store.UpsertTask(ctx, db.Task{
+			ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9", State: string(TaskReadyToMerge),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		request.Reviewer = "audit"
+		request.ExpectedTaskState = string(TaskReadyToMerge)
+
+		decision, evalErr := gate.Evaluate(ctx, request)
+		if evalErr != nil {
+			t.Fatalf("Evaluate returned error: %v", evalErr)
+		}
+		if decision.Merged || len(gh.merges) != 0 {
+			t.Fatalf("decision=%+v merges=%d, want NO merge: round ordering must refuse this candidate even though the predicate admits it", decision, len(gh.merges))
+		}
+	})
+}

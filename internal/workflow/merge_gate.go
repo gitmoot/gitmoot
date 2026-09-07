@@ -916,8 +916,23 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			continue
 		}
 		for _, candidate := range reviewsAtHead {
-			if candidate.payload.Result != nil &&
-				effectiveReviewerIdentityName(candidate.job, candidate.payload) == reviewer &&
+			// DEFAULT-DENY HERE TOO (#1950 F6, second instance). This loop tested a
+			// bare Result != nil, which ADMITS BY DEFAULT: a succeeded approved
+			// FAN-OUT at the evaluated head - a dispatch announcement, not a verdict
+			// - retired an earlier same-reviewer changes_requested objection, was
+			// then skipped as an announcement by the blocking scan, and the PR
+			// merged on an independent approval.
+			//
+			// The previous round advertised "the same predicate governs both sides,
+			// so they cannot diverge" while shipping the helper at ONE call site.
+			// The invariant was asserted, not censused, and a one-line grep would
+			// have falsified it. Both candidate loops now call this helper, which is
+			// what makes the property true by construction; the count is reported in
+			// the test rather than the property being claimed again.
+			if !reviewRowCanRetireAnObjection(candidate.job, candidate.payload, headSHA) {
+				continue
+			}
+			if effectiveReviewerIdentityName(candidate.job, candidate.payload) == reviewer &&
 				isReviewReplacementDecision(candidate.payload.Result.Decision) &&
 				reviewJobSupersedes(candidate.job, candidate.payload, review.job, review.payload) {
 				supersededReviewIDs[review.job.ID] = struct{}{}
@@ -1017,7 +1032,13 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if strings.TrimSpace(review.payload.HeadSHA) != "" {
 			continue
 		}
-		if JobState(review.job.State) != JobSucceeded || review.payload.Result == nil {
+		// THIRD POPULATION, SHARED CORE (#1950 P1-B). This scan used to hand-compose
+		// succeeded, non-nil, non-fan-out and provenance inline, one clause at a
+		// time, which is how the candidate and objection sides drifted apart in the
+		// first place. Both candidate loops and this objection scan now ask the same
+		// one-row question, and a census test asserts the call-site COUNT so the
+		// property is checkable rather than advertised.
+		if !reviewRowIsVerdictAboutHead(review.job, review.payload, headSHA) {
 			continue
 		}
 		if isRoundHistoryDuplicate(review.job, taskReviewIDs) {
@@ -1064,9 +1085,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		// engine-inserted AND roundless - provably the remnant shape. Every other
 		// combination, including any shape neither I nor the reviewer has enumerated,
 		// reaches the block below rather than slipping past it.
-		if !review.job.ExternallyDriven && strings.TrimSpace(review.payload.ReviewRound) == "" {
-			continue
-		}
+
 		// NOT APPLICABLE, and this exclusion is the difference between a gate and a
 		// deadlock (#332 decompose-and-verify, #388). An integration-worktree review
 		// carries no head because the ENGINE CLEARS IT deliberately: the worktree has
@@ -1078,9 +1097,6 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		// pre-existing test that holds this line, and the first version of this block
 		// failed it by including every headless row indiscriminately.
 		if isIntegrationWorktreeReview(review.payload) {
-			continue
-		}
-		if reviewRowIsFanOut(review.payload.Result) {
 			continue
 		}
 		if effectiveReviewDecisionForPayload(review.payload, request.ReviewBlockingSeverity) != "changes_requested" {
@@ -2041,6 +2057,21 @@ func (g PolicyMergeGate) ensureReviewMatchesHead(payload JobPayload, headSHA str
 //     different code (#1950 F5). Empty is admitted deliberately, because a headless
 //     replacement is the same class as a headless objection and must be able to
 //     answer it.
+//
+// reviewRowIsVerdictAboutHead is the ONE question both sides of supersession
+// share: is this row a verdict about THIS head at all? It is deliberately a
+// one-row test. Identity, decision class and recency are RELATIONAL - properties
+// of a PAIR of rows - so they cannot live here and stay at the callers.
+//
+// Extracted because #1950 P1-B was a claim, not a mechanism: the previous round
+// reported "the same predicate governs the objection side" while the helper had
+// ONE call site and the at-head loop still tested a bare Result != nil. The
+// call-site count is now asserted by a test that reads this file, so the property
+// is checkable by someone who does not trust the comment.
+func reviewRowIsVerdictAboutHead(job db.Job, payload JobPayload, headSHA string) bool {
+	return reviewRowCanRetireAnObjection(job, payload, headSHA)
+}
+
 func reviewRowCanRetireAnObjection(job db.Job, payload JobPayload, headSHA string) bool {
 	if JobState(job.State) != JobSucceeded {
 		return false
@@ -2051,27 +2082,36 @@ func reviewRowCanRetireAnObjection(job db.Job, payload JobPayload, headSHA strin
 	if head := strings.TrimSpace(payload.HeadSHA); head != "" && head != headSHA {
 		return false
 	}
-	// ATTRIBUTABLE PROVENANCE, and this clause is here because a PROBE MERGED, not
-	// because it completed a symmetry argument. An engine-inserted row with neither
-	// head nor round satisfied every clause above - succeeded, non-fan-out, headless
-	// - retired a live session objection, and was then itself excluded from the
-	// blocking population as the unattributable remnant it is, so the merge
-	// completed. Same shape as F6, one row kind further out.
+	// ATTRIBUTABLE PROVENANCE, REQUIRED ONLY OF A HEADLESS ROW (#1950 F5, second
+	// instance). The clause exists because a probe MERGED: an engine-inserted row
+	// with neither head nor round satisfied every clause above, retired a live
+	// session objection, and was then itself excluded from the blocking population
+	// as the unattributable remnant it is.
 	//
-	// ExternallyDriven is set only by CreateExternallyDrivenJobWithEvent and every
-	// other insert leaves it at 0 (internal/db/store_jobs.go:184), so a session
-	// review is positively identified rather than inferred; a round is the other
-	// provenance an engine-dispatched review carries. This mirrors the objection
-	// side exactly, which is the property that keeps the two from diverging.
+	// But requiring it of EVERY row over-blocked the most ordinary supported shape
+	// there is. A CLI review carries a HeadSHA - agent_dispatch resolves it from the
+	// PR and hard-errors without one - and carries NEITHER a round nor
+	// ExternallyDriven, which is set only by CreateExternallyDrivenJobWithEvent
+	// (internal/db/store_jobs.go:184). So the first version of this clause refused a
+	// succeeded CLI approval at the evaluated head, deadlocking a PR that a human
+	// had legitimately re-reviewed. I had measured "CLI review: head always, round
+	// never" earlier in this same campaign and did not apply it here.
 	//
-	// A sibling probe is NOT reflected here on purpose: a delegation-child candidate
-	// also satisfies the floor, yet it already fails to supersede because an
-	// explicit round cannot be ordered against a roundless objection, so the
-	// existing reviewRoundKey machinery refuses it. Adding a clause for it would
-	// have been an unpinned claim, so it is reported and omitted.
-	if !job.ExternallyDriven && strings.TrimSpace(payload.ReviewRound) == "" {
+	// The head clause above forces a non-empty head to EQUAL the evaluated head, so
+	// such a row is attributable BY ITS HEAD: it demonstrably speaks about this
+	// exact commit. Only a HEADLESS row needs a second source of attribution, which
+	// is exactly the remnant the probe found. Guarding the narrow case rather than
+	// the general one is the whole difference between the two.
+	if strings.TrimSpace(payload.HeadSHA) == "" &&
+		!job.ExternallyDriven && strings.TrimSpace(payload.ReviewRound) == "" {
 		return false
 	}
+	// A delegation-child candidate is NOT refused here, and this predicate does not
+	// claim to refuse it: it satisfies every clause above. What actually stops it is
+	// reviewRoundKey, which will not order an explicit round against a roundless
+	// objection - measured, with Evaluate blocking and zero merge calls. Naming the
+	// real mechanism matters because the first version of this comment credited the
+	// refusal to this function, which does not perform it.
 	return true
 }
 
