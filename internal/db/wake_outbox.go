@@ -474,12 +474,34 @@ ORDER BY attempted_at, id`,
 
 	stamp := at.UTC().Format(BlockedEpisodeTimeLayout)
 	const detail = "delivery outcome unknown after attempted wake aged out; not retried"
+	// A CLAIMED BATCH IS ONE WAKE, AND THIS SWEEP IS THE SIBLING SEAM THAT DID
+	// NOT KNOW IT. #1982 moved the coalescing collapse from claim time to
+	// outcome time, which left a whole batch `attempted` until its outcome; this
+	// function is the other writer of a terminal state, so a crashed batch aged
+	// out as N independent `delivery_unknown` rows. One undelivered wake then
+	// counted as N unproven obligations and the record that they were a single
+	// wake was lost.
+	//
+	// The surviving row takes the unknown outcome, because the wake was its own,
+	// and the rows it collapsed are superseded into it: the same accounting a
+	// delivered or failed batch already uses. Rows are ordered by attempted_at
+	// then id, so the first row of each claim group is its survivor.
+	seenSurvivor := map[string]int64{}
 	for _, entry := range entries {
+		group := strings.ToLower(strings.TrimSpace(entry.TargetRole)) + "\x00" +
+			entry.CoalesceKey + "\x00" + entry.AttemptedAt
+		state, rowDetail := WakeOutboxStateDeliveryUnknown, detail
+		survivor, collapsed := seenSurvivor[group]
+		if collapsed {
+			state, rowDetail = WakeOutboxStateSuperseded, WakeOutboxCoalescedDetail(survivor)
+		} else {
+			seenSurvivor[group] = entry.ID
+		}
 		result, err := tx.ExecContext(ctx, `
 UPDATE wake_outbox
 SET state = ?, last_error = ?, finished_at = ?, updated_at = ?
 WHERE id = ? AND state = 'attempted' AND attempted_at <= ?`,
-			WakeOutboxStateDeliveryUnknown, detail, stamp, stamp, entry.ID,
+			state, rowDetail, stamp, stamp, entry.ID,
 			attemptedBefore.UTC().Format(BlockedEpisodeTimeLayout))
 		if err != nil {
 			return nil, err
@@ -490,6 +512,12 @@ WHERE id = ? AND state = 'attempted' AND attempted_at <= ?`,
 		}
 		if affected != 1 {
 			return nil, fmt.Errorf("expire wake outbox row %d updated %d rows, want 1", entry.ID, affected)
+		}
+		if collapsed {
+			// The audit event belongs to the obligation, not to every row it
+			// carried: N events for one undelivered wake is the same
+			// over-counting in the job-event stream.
+			continue
 		}
 		message := fmt.Sprintf(
 			"source=%s:%s target_role=%s attempted_at=%s policy=expire_without_retry",

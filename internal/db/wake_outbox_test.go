@@ -414,6 +414,82 @@ func TestExpireAgedWakeOutboxRecordsDeliveryUnknownWithoutRetry(t *testing.T) {
 	}
 }
 
+// TestExpireAgedWakeOutboxKeepsACoalescedBatchOneObligation covers the sibling
+// seam of FinishWakeOutbox. #1982 moved the coalescing collapse from claim time
+// to outcome time so a retry could re-coalesce, which left a whole batch
+// `attempted` until its outcome. This function is the OTHER writer of a
+// terminal wake state, and it did not learn that: a crashed batch aged out as
+// N independent `delivery_unknown` rows, so one undelivered wake counted as N
+// unproven obligations and the record that they were a single wake was lost.
+//
+// The surviving row carries the unknown outcome, because the wake was ITS wake;
+// the rest are superseded into it, which is the same accounting a delivered or
+// failed batch already uses.
+func TestExpireAgedWakeOutboxKeepsACoalescedBatchOneObligation(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	for index := range 3 {
+		if _, err := store.InsertWorkflowNote(ctx, WorkflowNote{
+			WorkflowID: "wake/aged-batch", Author: "operator",
+			Body: fmt.Sprint(index), AddressedTarget: "owner",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending, err := store.ListWakeOutbox(ctx, WakeOutboxStatePending)
+	if err != nil || len(pending) != 3 {
+		t.Fatalf("pending = %+v, err=%v", pending, err)
+	}
+	attemptedAt := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	surviving := pending[0].ID
+	coalesced := []int64{pending[1].ID, pending[2].ID}
+	claimed, err := store.ClaimWakeOutbox(ctx, surviving, coalesced, attemptedAt)
+	if err != nil || !claimed {
+		t.Fatalf("claim = %v, err=%v", claimed, err)
+	}
+
+	// The process dies before recording an outcome, so the sweep ages the batch.
+	expired, err := store.ExpireAgedWakeOutbox(ctx, attemptedAt, attemptedAt.Add(time.Minute))
+	if err != nil || len(expired) != 3 {
+		t.Fatalf("expired = %+v, err=%v, want the whole claimed batch", expired, err)
+	}
+	unknown, err := store.ListWakeOutbox(ctx, WakeOutboxStateDeliveryUnknown)
+	if err != nil || len(unknown) != 1 || unknown[0].ID != surviving {
+		t.Fatalf("delivery unknown = %+v, err=%v, want only the surviving row", unknown, err)
+	}
+	if !strings.Contains(unknown[0].LastError, "not retried") || unknown[0].FinishedAt == "" {
+		t.Fatalf("surviving row = %+v, want the unknown-outcome cause and a finish stamp", unknown[0])
+	}
+	superseded, err := store.ListWakeOutbox(ctx, WakeOutboxStateSuperseded)
+	if err != nil || len(superseded) != 2 {
+		t.Fatalf("superseded = %+v, err=%v, want the two collapsed rows", superseded, err)
+	}
+	for _, row := range superseded {
+		if row.LastError != WakeOutboxCoalescedDetail(surviving) {
+			t.Fatalf("collapsed row %d last_error = %q, want the surviving row named", row.ID, row.LastError)
+		}
+		if row.FinishedAt == "" {
+			t.Fatalf("collapsed row %d has no finish stamp: %+v", row.ID, row)
+		}
+	}
+	// One undelivered wake produces ONE audit event, on the row that carried it.
+	events, err := store.ListJobEvents(ctx, fmt.Sprintf("wake-outbox:%d", surviving))
+	if err != nil || len(events) != 1 || events[0].Kind != WakeOutboxDeliveryUnknownEventKind {
+		t.Fatalf("surviving row events = %+v, err=%v", events, err)
+	}
+	for _, id := range coalesced {
+		collapsedEvents, err := store.ListJobEvents(ctx, fmt.Sprintf("wake-outbox:%d", id))
+		if err != nil || len(collapsedEvents) != 0 {
+			t.Fatalf("collapsed row %d events = %+v, err=%v, want none", id, collapsedEvents, err)
+		}
+	}
+	// The sweep must still be idempotent for the whole batch.
+	expired, err = store.ExpireAgedWakeOutbox(ctx, attemptedAt.Add(time.Hour), attemptedAt.Add(2*time.Hour))
+	if err != nil || len(expired) != 0 {
+		t.Fatalf("second expiry = %+v, err=%v", expired, err)
+	}
+}
+
 func TestWakeOutboxSupersededMigrationPreservesRowsAndScopesTerminalMarkers(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "gitmoot.db")
