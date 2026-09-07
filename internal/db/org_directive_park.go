@@ -187,7 +187,10 @@ SELECT d.id, d.workflow_id, d.author, d.body, d.repo, d.memory_observation_id, d
 	COALESCE((
 		SELECT MIN(a.created_at) FROM workflow_notes a
 		WHERE a.workflow_id = d.workflow_id
-			AND substr(a.body, 1, length('[org:directive-ack id=' || d.id || ' ')) = '[org:directive-ack id=' || d.id || ' '
+			AND (
+				substr(a.body, 1, length('[org:directive-ack id=' || d.id || ' ')) = '[org:directive-ack id=' || d.id || ' '
+				OR substr(a.body, 1, length('[org:directive-delivered id=' || d.id || ' ')) = '[org:directive-delivered id=' || d.id || ' '
+			)
 	), '')
 FROM workflow_notes d
 WHERE substr(d.body, 1, length('[org:directive ')) = '[org:directive '

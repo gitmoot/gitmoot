@@ -255,8 +255,10 @@ In org mode, `gitmoot org message send --to <role> --workflow <label>
 heads-up. It creates no acknowledgment, completion, TTL, or nag obligation.
 In org mode, obligations and questions have a full lifecycle and closing it is
 part of the work: `gitmoot org directive send --to <role> --workflow <label>`
-mints a tracked, TTL-nudged obligation; `org directive ack <id>` records
-RECEIPT only; `org directive done <id>` records COMPLETION and ends the
+mints a tracked, TTL-nudged obligation; RECEIPT is recorded by the transport
+when the prompt lands in your pane, so you do not owe an `ack` (`org directive
+ack <id>` still exists for the rare case where a receipt must be asserted by
+hand); `org directive done <id>` records COMPLETION and ends the
 obligation with its nudges (target subtree only — the sender cancels with
 `org directive cancel` instead). Finished work left un-`done` stays an outstanding
 obligation on every owed-work surface (and, where completion TTLs are

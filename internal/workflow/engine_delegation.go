@@ -175,7 +175,7 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 	// immediately rather than only when its deps clear. Use a lightweight check
 	// that does not acquire branch locks or other execution side effects.
 	for _, d := range delegations {
-		request := e.delegationRequest(job, payload, d)
+		request := e.delegationRequest(ctx, job, payload, d)
 		if err := e.preflightDelegation(ctx, request); err != nil {
 			// An unroutable delegation set (an unknown / not-allowed / uncapable
 			// agent — usually a runtime name where an agent NAME was required) is no
@@ -507,7 +507,7 @@ func (e Engine) enqueueFinalizeContinuation(ctx context.Context, job db.Job, pay
 // matches the request, so it is safe to call from both dispatchDelegations and
 // advanceDelegations.
 func (e Engine) enqueueDelegation(ctx context.Context, job db.Job, payload JobPayload, d Delegation, artifactDir string, upstreamContext string, ref taskRef) error {
-	request := e.delegationRequest(job, payload, d)
+	request := e.delegationRequest(ctx, job, payload, d)
 	request.DelegationArtifactDir = artifactDir
 	// Append the #419 "Upstream dependency results" block (built by the caller
 	// from this dependent's succeeded direct deps) to the child's instructions.
@@ -958,7 +958,7 @@ func (e Engine) requeueDelegation(ctx context.Context, parentJob db.Job, parentP
 	}
 	next := attempt + 1
 
-	request := e.delegationRequest(parentJob, parentPayload, d)
+	request := e.delegationRequest(ctx, parentJob, parentPayload, d)
 	request.ID = parentJob.ID + "/delegation/" + d.ID + "/retry/" + strconv.Itoa(next)
 	request.RetryCount = next
 	request.DelegationArtifactDir = artifactDir

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -271,6 +272,7 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 			}
 			ccancel()
 			slog.Info("org event wake delivered", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "delivered", true)
+			s.recordDirectiveDeliveryReceipt(ctx, event)
 			if err := s.finishWakeOutbox(ctx, event, db.WakeOutboxStateDelivered, ""); err != nil {
 				return err
 			}
@@ -451,6 +453,58 @@ func (s *eventRuleSink) finishWakeOutbox(ctx context.Context, event events.Event
 	return nil
 }
 
+// recordDirectiveDeliveryReceipt writes the transport's own receipt for a
+// directive whose prompt Herdr has just confirmed landed (#1980).
+//
+// WHY THE TRANSPORT AND NOT THE SEAT: an acknowledgment answers "did this
+// reach you", which the delivery confirmation already answers. Routing that
+// question through a model turn spent the turn boundary, and the turn boundary
+// is the scarce resource. Measured on this fleet: 3,306 ack markers, 124 of
+// the last 125 written by the addressed seat itself, median 96s after the
+// directive.
+//
+// IT IS BEST-EFFORT ON PURPOSE. A failed receipt write must not turn a
+// DELIVERED wake into a failure: the wake did land. The cost of losing it is
+// one extra acknowledgment-phase nudge, which is the pre-#1980 behaviour, so
+// the failure direction is the old behaviour rather than a new one.
+func (s *eventRuleSink) recordDirectiveDeliveryReceipt(ctx context.Context, event events.Event) {
+	if s == nil || s.store == nil {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(event.WakeKind), db.WakeOutboxKindDirective) {
+		return
+	}
+	role := strings.ToLower(strings.TrimSpace(event.WakeTargetRole))
+	if role == "" {
+		return
+	}
+	directiveID, err := strconv.ParseInt(
+		strings.TrimPrefix(event.RootID, db.WakeOutboxSourceWorkflowNote+":"), 10, 64)
+	if err != nil || directiveID <= 0 {
+		return
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), db.DurableWriteBudget)
+	defer cancel()
+	directive, err := s.store.GetWorkflowNote(writeCtx, directiveID)
+	if err != nil {
+		slog.Warn("directive delivery receipt skipped", "directive", directiveID, "error", err)
+		return
+	}
+	inserted, err := s.store.InsertOrgDirectiveReceipt(writeCtx, db.WorkflowNote{
+		WorkflowID: directive.WorkflowID,
+		Author:     role,
+		Body:       workflow.FormatOrgDirectiveDeliveredNote(directiveID, role),
+		Repo:       directive.Repo,
+	}, directiveID, "delivered")
+	if err != nil {
+		slog.Warn("directive delivery receipt failed", "directive", directiveID, "role", role, "error", err)
+		return
+	}
+	if inserted {
+		slog.Info("directive delivery receipt recorded", "directive", directiveID, "role", role)
+	}
+}
+
 // loadOrgConfig reads the org registry once per event. Best-effort: a missing or
 // unreadable config disables all wakes for this event (no role bindings resolve).
 func (s *eventRuleSink) loadOrgConfig() (config.OrgConfig, bool) {
@@ -578,9 +632,13 @@ func eventRuleWakePrompt(kind string, event events.Event) string {
 		case directiveTerminalCause:
 			return fmt.Sprintf("gitmoot directive %s for %s is already terminal; no receipt or completion action is required", directiveID, event.WakeTargetRole)
 		default:
+			// #1980: the transport records the receipt itself the moment this
+			// prompt lands, so the seat is told what it OWES, not asked to
+			// confirm what delivery already proved. The only remaining receipt
+			// a seat can add information to is completion.
 			return fmt.Sprintf(
-				"gitmoot directive %s for %s; acknowledge receipt with: gitmoot org directive ack %s --by %s",
-				directiveID, event.WakeTargetRole, directiveID, event.WakeTargetRole,
+				"gitmoot directive %s for %s; read it with: gitmoot workflow show-note %s, then record completion with: gitmoot org directive done %s --by %s",
+				directiveID, event.WakeTargetRole, directiveID, directiveID, event.WakeTargetRole,
 			)
 		}
 	}

@@ -1388,7 +1388,7 @@ func (e Engine) resumeRetryLeg(ctx context.Context, parentJob db.Job, parentPayl
 	if err != nil {
 		return err
 	}
-	request := e.delegationRequest(parentJob, parentPayload, d)
+	request := e.delegationRequest(ctx, parentJob, parentPayload, d)
 	request.ID = parentJob.ID + "/delegation/" + d.ID + "/resume"
 	request.Instructions = strings.TrimSpace(d.Prompt)
 	request.DelegationArtifactDir = artifactDir

@@ -1556,6 +1556,28 @@ not completion. `gitmoot org directive cancel <id> [--by <role>] [--home
 from `--by` or `GITMOOT_ORG_ROLE`; missing identity fails closed. They append
 typed markers to the directive's workflow journal.
 
+Receipt is normally recorded by the **transport**, not by the seat. When Herdr
+confirms that a directive prompt landed in the addressed role's pane, Gitmoot
+appends an `[org:directive-delivered id=<id> to=<role>]` marker itself, and
+that marker satisfies the receipt obligation everywhere an `[org:directive-ack ]`
+marker does: the acknowledgment ladder stops and the completion phase starts
+from the delivery time. The delivered marker is a separate verb from `ack` and
+carries `to=` rather than `by=`, because an acknowledgment is the seat's own
+assertion and a machine must not write one on its behalf. Nothing in the
+delivered marker claims the seat read the directive.
+
+`gitmoot org directive ack` therefore remains available but is no longer part
+of the delivery path, and the first-delivery prompt no longer asks for it. An
+acknowledgment answers "did this reach you", which the delivery confirmation
+already answers, and routing that question through a model turn spent the turn
+boundary. The receipt write is best-effort: if it fails, the wake still counts
+as delivered and the directive simply takes another acknowledgment-phase nudge,
+which is the behaviour that predates this change.
+
+**A remaining acknowledgment-phase nudge now means "delivery is not proven".**
+A stalled, failed or `delivery_unknown` wake records no receipt, so the ladder
+keeps running for exactly the directives whose arrival nobody can demonstrate.
+
 `gitmoot org directive done <id> [--by <role>] [--home <dir>]` records
 COMPLETION and ends the obligation, including its TTL nudges. **Completion
 authority is the target subtree**: the addressed role, or a role below it in the

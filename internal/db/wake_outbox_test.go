@@ -77,7 +77,10 @@ SELECT id, source_kind, source_id, target_role, coalesce_key, state,
 				FROM workflow_notes d
 				JOIN workflow_notes r ON r.workflow_id = d.workflow_id
 				WHERE d.id = CAST(wake_outbox.source_id AS INTEGER)
-					AND substr(r.body, 1, length('[org:directive-ack id=' || wake_outbox.source_id || ' ')) = '[org:directive-ack id=' || wake_outbox.source_id || ' '
+					AND (
+						substr(r.body, 1, length('[org:directive-ack id=' || wake_outbox.source_id || ' ')) = '[org:directive-ack id=' || wake_outbox.source_id || ' '
+						OR substr(r.body, 1, length('[org:directive-delivered id=' || wake_outbox.source_id || ' ')) = '[org:directive-delivered id=' || wake_outbox.source_id || ' '
+					)
 			) THEN 'completion'
 			ELSE 'acknowledgment'
 		END

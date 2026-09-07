@@ -394,12 +394,117 @@ func TestDirectiveWakeOutboxUsesSeparateCoalesceNamespace(t *testing.T) {
 	}
 	directivePrompt := ""
 	for _, prompt := range wake.prompts {
-		if strings.Contains(prompt, "gitmoot org directive ack") {
+		if strings.Contains(prompt, "gitmoot org directive") {
 			directivePrompt = prompt
 		}
 	}
-	if wake.promptCalls != 2 || !strings.Contains(directivePrompt, fmt.Sprintf("directive %d", directive.ID)) || !strings.Contains(directivePrompt, fmt.Sprintf("gitmoot org directive ack %d --by owner", directive.ID)) {
+	if wake.promptCalls != 2 || !strings.Contains(directivePrompt, fmt.Sprintf("directive %d", directive.ID)) {
 		t.Fatalf("directive wake calls=%d prompts=%q", wake.promptCalls, wake.prompts)
+	}
+}
+
+// TestDeliveredDirectiveRecordsReceiptWithoutASeatTurn is #1980's
+// reproduction. An acknowledgement is a state transition the transport can
+// observe: it is the pane accepting the prompt. Asking the seat to run
+// `gitmoot org directive ack` spent a whole turn boundary on bookkeeping, and
+// the turn boundary is the scarce resource. Measured on this fleet: 3,306 ack
+// markers all-time, 125 in one day, and 124 of those 125 were recorded by the
+// addressed seat itself with a median 96 seconds from directive to receipt.
+func TestDeliveredDirectiveRecordsReceiptWithoutASeatTurn(t *testing.T) {
+	store, deliverySink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{
+		{name: "owner", pane: "w1:p1"},
+		{name: "worker", pane: "w1:p2"},
+	})
+	ctx := context.Background()
+	if err := store.AddEventRule(ctx, db.EventRule{
+		ID: "directive-worker", OnKind: db.WakeOutboxKindDirective, WakeRole: "worker", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	directive, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "release/receipt", Author: "owner",
+		Body:              workflow.FormatOrgDirectiveNote("owner", "worker", "release/receipt", "carry this"),
+		AddressedTarget:   "worker",
+		AddressedWakeKind: db.WakeOutboxKindDirective,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainReplyWakeAfterAllRowsAreDue(t, store, deliverySink)
+
+	if wake.promptCalls != 1 {
+		t.Fatalf("directive wake calls = %d, want one; prompts=%q", wake.promptCalls, wake.prompts)
+	}
+	// The seat is no longer told to run a receipt command it cannot add
+	// information to.
+	if strings.Contains(wake.prompt, "directive ack") {
+		t.Fatalf("prompt still routes the receipt through the pane: %q", wake.prompt)
+	}
+	receipts, err := store.ListWorkflowNotes(ctx, "release/receipt", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := workflow.FormatOrgDirectiveDeliveredNote(directive.ID, "worker")
+	found := 0
+	for _, note := range receipts {
+		if note.Body == want {
+			found++
+		}
+	}
+	if found != 1 {
+		t.Fatalf("delivered receipt notes = %d, want exactly one %q in %+v", found, want, receipts)
+	}
+	// The obligation that remains is COMPLETION, so the receipt question must be
+	// closed for every reader that asks it.
+	outstanding, err := store.ListUnacknowledgedOrgDirectives(ctx, "worker")
+	if err != nil || len(outstanding) != 0 {
+		t.Fatalf("unacknowledged directives = %+v, err=%v, want none after proven delivery", outstanding, err)
+	}
+	open, err := store.ListOpenOrgDirectiveObligations(ctx, 50)
+	if err != nil || len(open) != 1 || open[0].AckedAt == "" {
+		t.Fatalf("open obligations = %+v, err=%v, want directive %d with a receipt time", open, err, directive.ID)
+	}
+}
+
+// TestUndeliveredDirectiveRecordsNoReceipt is the control that keeps the
+// receipt honest: the marker means the TRANSPORT observed the pane accept the
+// prompt. A stalled wake proves nothing, so the acknowledgment ladder keeps
+// running and now means exactly "delivery is not proven".
+func TestUndeliveredDirectiveRecordsNoReceipt(t *testing.T) {
+	store, deliverySink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{
+		{name: "owner", pane: "w1:p1"},
+		{name: "worker", pane: "w1:p2"},
+	})
+	wake.stalled = true
+	ctx := context.Background()
+	if err := store.AddEventRule(ctx, db.EventRule{
+		ID: "directive-worker", OnKind: db.WakeOutboxKindDirective, WakeRole: "worker", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	directive, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "release/unproven", Author: "owner",
+		Body:              workflow.FormatOrgDirectiveNote("owner", "worker", "release/unproven", "carry this"),
+		AddressedTarget:   "worker",
+		AddressedWakeKind: db.WakeOutboxKindDirective,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainReplyWakeAfterAllRowsAreDue(t, store, deliverySink)
+
+	notes, err := store.ListWorkflowNotes(ctx, "release/unproven", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, note := range notes {
+		if strings.HasPrefix(note.Body, workflow.OrgDirectiveDeliveredPrefix) {
+			t.Fatalf("stalled wake recorded a delivery receipt: %q", note.Body)
+		}
+	}
+	outstanding, err := store.ListUnacknowledgedOrgDirectives(ctx, "worker")
+	if err != nil || len(outstanding) != 1 || outstanding[0].ID != directive.ID {
+		t.Fatalf("unacknowledged directives = %+v, err=%v, want directive %d still outstanding", outstanding, err, directive.ID)
 	}
 }
 
@@ -464,9 +569,12 @@ func TestDirectiveWakeDrainDoesNotCoalesceDifferentObligations(t *testing.T) {
 	var completionPrompt, acknowledgmentPrompt string
 	for _, prompt := range wake.prompts {
 		switch {
-		case strings.Contains(prompt, fmt.Sprintf("gitmoot org directive done %d --by worker", completion.ID)):
+		case strings.Contains(prompt, fmt.Sprintf("directive %d for worker is acknowledged but incomplete", completion.ID)):
 			completionPrompt = prompt
-		case strings.Contains(prompt, fmt.Sprintf("gitmoot org directive ack %d --by worker", unread.ID)):
+		// #1980: the first-delivery prompt no longer asks for a receipt, so the
+		// two phases are told apart by their own wording rather than by which
+		// receipt command they carry.
+		case strings.Contains(prompt, fmt.Sprintf("gitmoot workflow show-note %d", unread.ID)):
 			acknowledgmentPrompt = prompt
 		}
 	}
