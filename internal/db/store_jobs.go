@@ -1498,7 +1498,8 @@ func (s *Store) RecordRuntimeSessionUsageDelta(ctx context.Context, sessionKey s
 }
 
 func (s *Store) AddJobEvent(ctx context.Context, event JobEvent) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message, runtime) VALUES (?, ?, ?, ?)`,
+		event.JobID, event.Kind, event.Message, event.Runtime)
 	return err
 }
 
@@ -1506,11 +1507,11 @@ func (s *Store) AddJobEvent(ctx context.Context, event JobEvent) error {
 // existence check and insert share one SQLite statement, so concurrent callers
 // cannot both pass a check-then-insert window.
 func (s *Store) AddJobEventIfAbsent(ctx context.Context, event JobEvent) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message)
-		SELECT ?, ?, ?
+	_, err := s.db.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message, runtime)
+		SELECT ?, ?, ?, ?
 		WHERE NOT EXISTS (
 			SELECT 1 FROM job_events WHERE job_id = ? AND kind = ?
-		)`, event.JobID, event.Kind, event.Message, event.JobID, event.Kind)
+		)`, event.JobID, event.Kind, event.Message, event.Runtime, event.JobID, event.Kind)
 	return err
 }
 
@@ -1707,7 +1708,7 @@ func (s *Store) jobEventsByKindExtreme(ctx context.Context, jobIDs []string, kin
 			args = append(args, jobID)
 		}
 	}
-	query := `SELECT job_id, kind, message, created_at FROM job_events
+	query := `SELECT job_id, kind, message, created_at, runtime FROM job_events
 		WHERE kind = ? AND job_id IN (` + placeholders + `)
 		  AND id IN (SELECT ` + string(pick) + `(id) FROM job_events
 			WHERE kind = ? AND job_id IN (` + placeholders + `) GROUP BY job_id)`
@@ -1718,7 +1719,7 @@ func (s *Store) jobEventsByKindExtreme(ctx context.Context, jobIDs []string, kin
 	defer rows.Close()
 	for rows.Next() {
 		var event JobEvent
-		if err := rows.Scan(&event.JobID, &event.Kind, &event.Message, &event.CreatedAt); err != nil {
+		if err := rows.Scan(&event.JobID, &event.Kind, &event.Message, &event.CreatedAt, &event.Runtime); err != nil {
 			return nil, err
 		}
 		out[event.JobID] = event
@@ -1727,7 +1728,7 @@ func (s *Store) jobEventsByKindExtreme(ctx context.Context, jobIDs []string, kin
 }
 
 func (s *Store) ListJobEvents(ctx context.Context, jobID string) ([]JobEvent, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT job_id, kind, message, created_at FROM job_events WHERE job_id = ? ORDER BY id`, jobID)
+	rows, err := s.db.QueryContext(ctx, `SELECT job_id, kind, message, created_at, runtime FROM job_events WHERE job_id = ? ORDER BY id`, jobID)
 	if err != nil {
 		return nil, err
 	}
@@ -1736,7 +1737,7 @@ func (s *Store) ListJobEvents(ctx context.Context, jobID string) ([]JobEvent, er
 	var events []JobEvent
 	for rows.Next() {
 		var event JobEvent
-		if err := rows.Scan(&event.JobID, &event.Kind, &event.Message, &event.CreatedAt); err != nil {
+		if err := rows.Scan(&event.JobID, &event.Kind, &event.Message, &event.CreatedAt, &event.Runtime); err != nil {
 			return nil, err
 		}
 		events = append(events, event)
@@ -2512,4 +2513,45 @@ func (s *Store) MaxJobEventID(ctx context.Context) (int64, error) {
 	var id int64
 	err := s.db.QueryRowContext(ctx, maxJobEventIDSQL).Scan(&id)
 	return id, err
+}
+
+// JobRecordedRuntime returns the runtime recorded on a job's append-only
+// runtime-selection event, or "" when none carries one (#1534).
+//
+// THE POINT IS IMMUTABILITY. job_events has no UPDATE and no DELETE anywhere in
+// this package, so a runtime written here cannot later be edited away. The
+// payload's effective_runtime can: it is a field on a row the engine rewrites
+// for other reasons, and it is simply absent on many jobs.
+//
+// It reads the COLUMN and never the message. The message is prose and #1534
+// forbids parsing it, which is why the column exists.
+//
+// THE AGENT IS VERIFIED IN THE SAME QUERY, and this was a defect in my first
+// version that my own bound test caught: the tier read the runtime for a job id
+// while ignoring the agent name it was asked about, so a caller passing a job
+// and an unrelated agent got a confident answer about the wrong one. A resolver
+// that answers a question it was not asked is precisely the proxy-for-property
+// shape this campaign exists to remove. The join makes the answer mean "the
+// runtime THIS AGENT'S job ran on".
+//
+// LATEST WINS, by id, because a job can be re-dispatched within its lifecycle
+// and the last selection is the one that ran.
+func (s *Store) JobRecordedRuntime(ctx context.Context, jobID string, agentName string) (string, error) {
+	id := strings.TrimSpace(jobID)
+	agent := strings.TrimSpace(agentName)
+	if id == "" || agent == "" {
+		return "", nil
+	}
+	var recorded string
+	err := s.db.QueryRowContext(ctx, `SELECT e.runtime FROM job_events e
+		JOIN jobs j ON j.id = e.job_id
+		WHERE e.job_id = ? AND e.runtime != '' AND j.agent = ?
+		ORDER BY e.id DESC LIMIT 1`, id, agent).Scan(&recorded)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(recorded), nil
 }

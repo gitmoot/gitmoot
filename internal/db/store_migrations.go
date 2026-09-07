@@ -2730,4 +2730,23 @@ CREATE INDEX IF NOT EXISTS idx_review_findings_pr ON review_finding_observations
 ALTER TABLE jobs ADD COLUMN dispatched_by TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_jobs_dispatched_by ON jobs(dispatched_by) WHERE dispatched_by != '';
 	`,
+	// #1534: runtime attribution moves onto APPEND-ONLY evidence. job_events has
+	// no UPDATE or DELETE anywhere in internal/db, so a runtime recorded here
+	// cannot later be edited away, unlike the payload's effective_runtime field.
+	//
+	// A COLUMN, NOT THE MESSAGE. The event message is prose - "job runs on
+	// runtime shell (agent default codex); session lock ..." - and #1534
+	// explicitly forbids resolving a family by parsing it. Measured on the live
+	// store: 56 review/implement jobs carry a runtime_override event while their
+	// payload field is absent, so today they resolve to the agent's REGISTRY
+	// DEFAULT rather than the runtime that ran. Agent `lead` defaults to claude
+	// and several of those jobs ran on codex.
+	//
+	// DEFAULT '' preserves every pre-migration row: they keep resolving through
+	// the payload field and the registry exactly as before. The partial index
+	// covers only rows that can answer the question.
+	`
+ALTER TABLE job_events ADD COLUMN runtime TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_job_events_runtime ON job_events(job_id, id) WHERE runtime != '';
+	`,
 }
