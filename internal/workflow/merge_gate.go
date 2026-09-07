@@ -1241,6 +1241,15 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 					if _, selfApproved := implementingAgents[reviewer]; selfApproved && selfApprovalReason == "" {
 						selfApprovalReason = fmt.Sprintf("latest review round's approval was authored by %s, the implementing agent; an independent reviewer is required", reviewer)
 					}
+					if selfApprovalReason == "" {
+						sameFamily, familyReason, err := g.sameRuntimeFamilyAsImplementer(ctx, review.job.ID, reviewer, review.payload.EffectiveRuntime, implementingAgents)
+						if err != nil {
+							return err
+						}
+						if sameFamily {
+							selfApprovalReason = familyReason
+						}
+					}
 				}
 			case "changes_requested", "blocked", "failed":
 				return mergeBlocked{reason: fmt.Sprintf("review at evaluated head has blocking result from %s", reviewer)}
@@ -1326,6 +1335,16 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 				if _, selfApproved := implementingAgents[reviewerAgent]; selfApproved {
 					if selfApprovalReason == "" {
 						selfApprovalReason = fmt.Sprintf("latest review round's approval was authored by %s, the implementing agent; an independent reviewer is required", reviewerAgent)
+					}
+					continue
+				}
+				sameFamily, familyReason, err := g.sameRuntimeFamilyAsImplementer(ctx, job.ID, reviewerAgent, payload.EffectiveRuntime, implementingAgents)
+				if err != nil {
+					return err
+				}
+				if sameFamily {
+					if selfApprovalReason == "" {
+						selfApprovalReason = familyReason
 					}
 					continue
 				}
@@ -1595,6 +1614,11 @@ type implementerIdentity struct {
 	// FromActingRole records that this attribution came from the payload's acting
 	// org role rather than the job's agent column. A role cannot be enqueued.
 	FromActingRole bool
+	// RecordedRuntime is the implement job's own payload effective_runtime, kept
+	// so the gate can resolve a runtime FAMILY without re-reading the job (#1531).
+	// Empty for a job that predates #1528's recording; ResolveRuntimeFamily then
+	// falls back to the agent registry default.
+	RecordedRuntime string
 }
 
 type implementerAttributionEvidence struct {
@@ -1661,7 +1685,7 @@ func collectImplementerAttributionMatching(jobs []db.Job, current JobPayload,
 			// first would attribute every agent's work to its coordinator, make that
 			// coordinator an implementer of everything, and then disqualify it from
 			// reviewing anything.
-			evidence.agents[name] = implementerIdentity{Name: name}
+			evidence.agents[name] = implementerIdentity{Name: name, RecordedRuntime: payload.EffectiveRuntime}
 		case name != "":
 			// A ROLE NEVER DOWNGRADES AN AGENT ALREADY RECORDED UNDER THE SAME NAME,
 			// AND THAT IS WHY THIS IS A CONDITIONAL WRITE RATHER THAN A PLAIN ONE.
@@ -1677,7 +1701,7 @@ func collectImplementerAttributionMatching(jobs []db.Job, current JobPayload,
 			}
 			// The #1916 shape: implemented in session by an org role, no agent to
 			// name. Attributable, and still subject to the independence check.
-			evidence.agents[name] = implementerIdentity{Name: name, FromActingRole: true}
+			evidence.agents[name] = implementerIdentity{Name: name, FromActingRole: true, RecordedRuntime: payload.EffectiveRuntime}
 		default:
 			evidence.sawEmptyAgent = true
 		}
@@ -2536,4 +2560,90 @@ func parseRepoFullName(value string) (github.Repository, error) {
 		return github.Repository{}, fmt.Errorf("invalid repo %q", value)
 	}
 	return github.Repository{Owner: owner, Name: name}, nil
+}
+
+// sameRuntimeFamilyAsImplementer reports whether an approving reviewer shares a
+// RUNTIME FAMILY with any recorded implementer of this pull request (#1531).
+//
+// THE NAME CHECK ABOVE CANNOT ENFORCE THE PROPERTY THE GATE EXISTS FOR. The bar
+// is cross-family review; the comparison was `reviewer != implementer` as
+// strings. Measured on PR #1527 at head 2e0dd2ee: implementer `wave-impl` and
+// reviewer `g7-review` are both codex/gpt-5.6-sol, and `g7-review != wave-impl`,
+// so the self-approval check passed on a same-family, same-model approval. That
+// panel was caught only because the gate failed closed for an unrelated
+// bookkeeping reason and never reached this test.
+//
+// IT USES THE ONE SHARED RESOLVER, whose own doc names this as its second
+// consumer: `ResolveRuntimeFamily` prefers the runtime recorded on the job and
+// falls back to the agent registry default, so an override-run job attributes
+// correctly even after its agent's default later changes.
+//
+// UNRESOLVABLE IS NOT SILENTLY CLEAN, AND IT IS ALSO NOT A BLOCK. This is the
+// tension #1531's own comment warns about: "doing (2) without (1) produces a
+// gate that silently passes whenever the field is absent". Re-measured on jobs
+// since 2026-08-25, resolution now covers 1335 of 1432 reviews and 427 of 449
+// implement jobs once the registry fallback is counted - 93 to 95 percent, up
+// from the 11 percent that made the issue defer this. The residue is dominated
+// by EPHEMERAL and TEMP agents, which are deliberately absent from the registry,
+// plus rows with an empty agent column.
+//
+// Refusing on that residue would block the native review fanout, whose lens legs
+// are ephemeral by construction, so an unresolved family falls through to the
+// name check exactly as before AND records why it could not be compared. That
+// keeps the gate's behaviour unchanged where it cannot see, while never claiming
+// a check it did not perform. Making the residue resolvable - temp agent names
+// embed their parent - is the follow-up that would let this fail closed.
+func (g PolicyMergeGate) sameRuntimeFamilyAsImplementer(ctx context.Context, reviewJobID string, reviewer string,
+	reviewerRuntime string, implementers map[string]implementerIdentity) (bool, string, error) {
+	if g.Store == nil || strings.TrimSpace(reviewer) == "" || len(implementers) == 0 {
+		return false, "", nil
+	}
+	reviewerFamily, ok, err := ResolveRuntimeFamily(ctx, g.Store, reviewer, reviewerRuntime)
+	if err != nil {
+		return false, "", err
+	}
+	if !ok {
+		g.recordFamilyUnresolved(ctx, reviewJobID, fmt.Sprintf(
+			"runtime family unresolved for reviewer %q; independence was decided on agent name alone", reviewer))
+		return false, "", nil
+	}
+	names := make([]string, 0, len(implementers))
+	for name := range implementers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		identity := implementers[name]
+		family, ok, err := ResolveRuntimeFamily(ctx, g.Store, name, identity.RecordedRuntime)
+		if err != nil {
+			return false, "", err
+		}
+		if !ok {
+			g.recordFamilyUnresolved(ctx, reviewJobID, fmt.Sprintf(
+				"runtime family unresolved for implementer %q; independence was decided on agent name alone", name))
+			continue
+		}
+		if family == reviewerFamily {
+			return true, fmt.Sprintf(
+				"latest review round's approval was authored by %s on runtime family %q, the same family as implementer %s; the bar is cross-family review, and distinct agent names are not evidence of independence",
+				reviewer, reviewerFamily, name), nil
+		}
+	}
+	return false, "", nil
+}
+
+// recordFamilyUnresolved makes an uncomparable family visible instead of letting
+// the gate report a check it did not perform. Best effort: the observation must
+// never change the merge decision it describes.
+func (g PolicyMergeGate) recordFamilyUnresolved(ctx context.Context, jobID string, message string) {
+	if g.Store == nil || strings.TrimSpace(jobID) == "" {
+		return
+	}
+	// IfAbsent, for the reason the CI observation beside it gives: a pending PR is
+	// re-evaluated on every poll, so a plain append would grow one row per tick.
+	_ = g.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
+		JobID:   jobID,
+		Kind:    "merge_gate_family_unresolved",
+		Message: message,
+	})
 }
