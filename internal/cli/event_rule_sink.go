@@ -282,14 +282,31 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 				slog.Warn("org event wake counter increment failed", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "error", incrementErr)
 			}
 			ccancel()
-			slog.Info("org event wake stalled", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "delivered", false)
-			if err := s.finishWakeOutbox(ctx, event, db.WakeOutboxStateStalled, "agent_prompt_stalled"); err != nil {
+			// #1982: a stall is herdr reporting that the pane did not take the
+			// prompt, which is transient by construction, so it earns another
+			// attempt against the same coalesced rows rather than dropping the
+			// obligation. Every one of the 674 undelivered rows measured on the
+			// live store had attempt_count = 1.
+			if err := s.retryOrFailWakeOutbox(
+				ctx, event, rule.WakeRole, db.WakeOutboxStateStalled, "agent_prompt_stalled", wakeDeliveryMaxAttempts,
+			); err != nil {
 				return err
 			}
 		case err != nil:
 			// A Herdr outage is infrastructure failure, not a role ignoring a wake;
 			// it must not falsely increment every role's missed-wake counter.
 			slog.Warn("org event wake failed", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "error", err)
+			// A pane blocked by an open dialog is the other transient cause: it
+			// clears when the dialog is answered, and 60 of the 108 failed rows
+			// on the live store carry `agent_blocked`.
+			if wakeFailureIsTransient(err) {
+				if retryErr := s.retryOrFailWakeOutbox(
+					ctx, event, rule.WakeRole, db.WakeOutboxStateFailed, err.Error(), wakeDeliveryMaxAttempts,
+				); retryErr != nil {
+					return errors.Join(err, retryErr)
+				}
+				continue
+			}
 			return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, err.Error(), err)
 		default:
 			// An odd non-delivery is not proof that the role ignored a delivered
@@ -450,6 +467,62 @@ func (s *eventRuleSink) finishWakeOutbox(ctx context.Context, event events.Event
 		slog.Warn("wake outbox state update failed", "job_id", event.JobID, "state", state, "error", err)
 		return fmt.Errorf("finish wake outbox as %s: %w", state, err)
 	}
+	return nil
+}
+
+// wakeDeliveryMaxAttempts bounds re-delivery of a transient failure (#1982).
+// Three attempts across daemon ticks span roughly seven minutes at the
+// observed 143-second median tick gap, which covers a dialog being answered
+// or a pane settling, without turning an unread pane into a permanent
+// retry source.
+const wakeDeliveryMaxAttempts = 3
+
+// wakeFailureIsTransient reports whether a herdr delivery error names a
+// condition that CLEARS ON ITS OWN. Only `agent_blocked` qualifies: the pane
+// exists and holds an interactive dialog, so the same prompt can land once the
+// dialog is answered.
+//
+// Everything else stays terminal on purpose. `agent_not_found` and an
+// unresolved pane binding are configuration, not weather, and retrying them
+// only spends the budget. `agent_prompt_unsubmitted` is deliberately excluded
+// even though it looks transient: the prompt text may already be sitting in
+// the composer, so a re-attempt risks delivering it twice.
+func wakeFailureIsTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "agent_blocked")
+}
+
+// retryOrFailWakeOutbox records a non-delivered outcome for the claimed batch,
+// re-pending it while its budget remains. A row with no outbox ids is an
+// ordinary (non-durable) event and keeps its existing best-effort behaviour.
+func (s *eventRuleSink) retryOrFailWakeOutbox(
+	ctx context.Context,
+	event events.Event,
+	role, state, cause string,
+	budget int,
+) error {
+	if s == nil || s.store == nil || len(event.WakeOutboxIDs) == 0 {
+		return nil
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), db.DurableWriteBudget)
+	defer cancel()
+	retried, attempts, err := s.store.FinishOrRetryWakeOutbox(
+		writeCtx, event.WakeOutboxIDs, state, cause, budget, time.Now().UTC(),
+	)
+	if err != nil {
+		slog.Warn("wake outbox outcome update failed",
+			"job_id", event.JobID, "role", role, "state", state, "error", err)
+		return fmt.Errorf("record wake outbox outcome %s: %w", state, err)
+	}
+	if retried {
+		slog.Info("org event wake retryable",
+			"job_id", event.JobID, "role", role, "cause", cause, "attempts", attempts)
+		return nil
+	}
+	slog.Warn("org event wake undelivered",
+		"job_id", event.JobID, "role", role, "cause", cause, "attempts", attempts, "state", state)
 	return nil
 }
 

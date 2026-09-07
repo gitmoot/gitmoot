@@ -2046,7 +2046,12 @@ literal pane id. The daemon calls `herdr agent prompt <pane> <text> --wait --tim
 8000` and treats delivered (`result.type = "agent_prompted"`, or a post-delivery
 `error.code = "timeout"`) apart from stalled (`error.code =
 "agent_prompt_stalled"`). Stalls increment the role's consecutive missed-wake
-counter and delivery resets it; transport failures leave it unchanged.
+counter and delivery resets it; transport failures leave it unchanged. A stall
+and an `agent_blocked` pane are **transient**: the claimed rows return to
+`pending` with the cause recorded and are re-delivered as one coalesced wake,
+bounded at three attempts. Any other cause, and an exhausted budget, end the
+rows terminally and record a `wake_delivery_failed` job event on
+`wake-outbox:<id>` naming the role, cause and attempts.
 `attention`, `guard`, `job-terminal`, `review-verdict`, `recycle-overdue`, and
 `pane_input_pending` wakes remain best-effort. With no rule rows this path is
 off. Task episodes due in one evaluator pass produce one oldest-first digest

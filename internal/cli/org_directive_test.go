@@ -491,7 +491,11 @@ func TestUndeliveredDirectiveRecordsNoReceipt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	drainReplyWakeAfterAllRowsAreDue(t, store, deliverySink)
+	// A stalled wake is retryable now (#1982), so the drain reports the row as
+	// an outstanding obligation rather than succeeding.
+	if err := drainReplyWakeAfterAllRowsAreDueResult(t, store, deliverySink); err == nil {
+		t.Fatal("stalled directive drain reported healthy; the obligation is outstanding")
+	}
 
 	notes, err := store.ListWorkflowNotes(ctx, "release/unproven", 100)
 	if err != nil {

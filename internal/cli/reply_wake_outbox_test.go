@@ -775,6 +775,11 @@ func TestReplyWakeOutboxFleetDrainRunsWithZeroEnabledRepos(t *testing.T) {
 	}
 }
 
+// TestReplyWakeOutboxRecordsExistingDeliveryOutcomeStates pins the outcomes
+// that are NOT retryable. A stalled prompt moved to the retry test in #1982:
+// herdr reporting `agent_prompt_stalled` means the pane did not take the
+// prompt, which is transient, while a transport error or an odd non-delivery
+// is not something a re-attempt can distinguish from a lie.
 func TestReplyWakeOutboxRecordsExistingDeliveryOutcomeStates(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -782,7 +787,6 @@ func TestReplyWakeOutboxRecordsExistingDeliveryOutcomeStates(t *testing.T) {
 		wantState string
 		wantErr   bool
 	}{
-		{name: "stalled", configure: func(w *fakeEventWake) { w.stalled = true }, wantState: db.WakeOutboxStateStalled},
 		{name: "transport failure", configure: func(w *fakeEventWake) { w.promptErr = errors.New("transport down") }, wantState: db.WakeOutboxStateFailed, wantErr: true},
 		{name: "odd non delivery", configure: func(w *fakeEventWake) { w.oddNonDelivery = true }, wantState: db.WakeOutboxStateFailed, wantErr: true},
 	}
@@ -805,6 +809,113 @@ func TestReplyWakeOutboxRecordsExistingDeliveryOutcomeStates(t *testing.T) {
 				t.Fatalf("%s rows = %+v, err=%v", test.wantState, rows, err)
 			}
 		})
+	}
+}
+
+// TestStalledWakeIsRetriedNotDropped is #1982's reproduction. Measured on the
+// live store: 674 of 8,834 wake rows (7.6%) ended in a state that does not
+// establish the target ever received them, and EVERY ONE of them has
+// attempt_count = 1. Nothing was ever retried, so a pane that was momentarily
+// stalled or blocked by an open dialog simply lost its obligation.
+func TestStalledWakeIsRetriedNotDropped(t *testing.T) {
+	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
+	ctx := context.Background()
+	wake.stalled = true
+	for index := range 2 {
+		if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID: "release/retry", Author: "worker", Body: fmt.Sprint(index),
+			AddressedTarget: "owner",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// First attempt stalls: the rows stay deliverable rather than terminal.
+	if err := drainReplyWakeAfterAllRowsAreDueResult(t, store, sink); err == nil {
+		t.Fatal("stalled drain reported healthy; the obligation is still outstanding")
+	}
+	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
+	if err != nil || len(pending) != 2 {
+		t.Fatalf("pending after stall = %+v, err=%v, want both rows retryable", pending, err)
+	}
+	for _, row := range pending {
+		if row.AttemptCount != 1 || row.LastError == "" || row.FinishedAt != "" {
+			t.Fatalf("retryable row = %+v, want one recorded attempt, a cause, and no finish stamp", row)
+		}
+	}
+	if stalled, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateStalled); err != nil || len(stalled) != 0 {
+		t.Fatalf("stalled rows = %+v, err=%v, want none while the retry budget remains", stalled, err)
+	}
+
+	// The pane recovers, and the retry re-coalesces BOTH rows into one wake:
+	// the retry must not lose the notes a superseded sibling carried.
+	wake.stalled = false
+	wake.promptCalls = 0
+	drainReplyWakeAfterAllRowsAreDue(t, store, sink)
+	if wake.promptCalls != 1 || !strings.Contains(wake.prompt, "2 new items, oldest id ") {
+		t.Fatalf("retry wake = calls=%d prompt=%q, want one wake naming both notes", wake.promptCalls, wake.prompt)
+	}
+	delivered, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateDelivered)
+	if err != nil || len(delivered) != 1 || delivered[0].AttemptCount != 2 {
+		t.Fatalf("delivered = %+v, err=%v, want one survivor on its second attempt", delivered, err)
+	}
+	superseded, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateSuperseded)
+	if err != nil || len(superseded) != 1 ||
+		superseded[0].LastError != db.WakeOutboxCoalescedDetail(delivered[0].ID) {
+		t.Fatalf("superseded = %+v, err=%v, want the sibling collapsed into the survivor", superseded, err)
+	}
+}
+
+// TestStalledWakeStopsAtItsRetryBudget bounds the retry: an obligation that
+// cannot be delivered becomes an explicit, attributable failure instead of
+// retrying forever against a pane nobody is reading.
+func TestStalledWakeStopsAtItsRetryBudget(t *testing.T) {
+	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
+	ctx := context.Background()
+	wake.stalled = true
+	note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "release/budget", Author: "worker", Body: "never lands",
+		AddressedTarget: "owner",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 1; attempt <= wakeDeliveryMaxAttempts; attempt++ {
+		err := drainReplyWakeAfterAllRowsAreDueResult(t, store, sink)
+		if attempt < wakeDeliveryMaxAttempts && err == nil {
+			t.Fatalf("attempt %d reported healthy while the wake was still retryable", attempt)
+		}
+		// The final attempt spends the budget, so the row becomes terminal and
+		// stops being an outstanding obligation. That is the pre-existing
+		// meaning of tick health, which this change deliberately preserves: the
+		// failure is recorded on the row and as a job event instead.
+		if attempt == wakeDeliveryMaxAttempts && err != nil {
+			t.Fatalf("exhausted attempt still reports an obligation: %v", err)
+		}
+	}
+	if wake.promptCalls != wakeDeliveryMaxAttempts {
+		t.Fatalf("prompt calls = %d, want exactly %d attempts", wake.promptCalls, wakeDeliveryMaxAttempts)
+	}
+	stalled, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateStalled)
+	if err != nil || len(stalled) != 1 || stalled[0].AttemptCount != wakeDeliveryMaxAttempts {
+		t.Fatalf("stalled = %+v, err=%v, want one exhausted row", stalled, err)
+	}
+	if stalled[0].FinishedAt == "" || !strings.Contains(stalled[0].LastError, "agent_prompt_stalled") {
+		t.Fatalf("exhausted row = %+v, want a finish stamp and the recorded cause", stalled[0])
+	}
+	// The failure is attributable without reading the daemon log: it names the
+	// role, the cause and how many attempts were spent.
+	events, err := store.ListJobEvents(ctx, fmt.Sprintf("wake-outbox:%d", stalled[0].ID))
+	if err != nil || len(events) != 1 || events[0].Kind != db.WakeOutboxDeliveryFailedEventKind {
+		t.Fatalf("delivery failure events = %+v, err=%v", events, err)
+	}
+	for _, want := range []string{"owner", "agent_prompt_stalled", fmt.Sprintf("attempts=%d", wakeDeliveryMaxAttempts)} {
+		if !strings.Contains(events[0].Message, want) {
+			t.Fatalf("failure event %q does not name %q", events[0].Message, want)
+		}
+	}
+	// And the note itself is still identifiable from the row.
+	if stalled[0].SourceID != fmt.Sprint(note.ID) {
+		t.Fatalf("exhausted row source = %q, want note %d", stalled[0].SourceID, note.ID)
 	}
 }
 
