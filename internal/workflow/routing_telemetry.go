@@ -23,6 +23,19 @@ const maxRouterContextRows = 9
 // effective values the delivery used (a #531 per-job runtime override has already
 // been applied to agent.Runtime by the caller); tokens are re-read from the job
 // row where the delivery persisted them (0 for a runtime that reports none).
+// A SESSION JOB HAS NO ROW HERE, AND THAT IS CORRECT (#1990). Measured on the
+// live store: 0 of 41 externally-driven review jobs have a routing_telemetry
+// row. This function is called only from the mailbox DELIVERY path, and a
+// session job has no engine delivery - the session did the work itself. Every
+// column below describes that delivery: Runtime and Model are the values the
+// delivery resolved, TemplateID/TemplateCommit the snapshot it ran, DurationMS
+// the time it took, and the tokens are re-read from what the delivery
+// persisted. None of those facts exists for a session row.
+//
+// Synthesising one would not be neutral. buildRouterContextBlock feeds this
+// table into coordinator prompts as OBSERVED PERFORMANCE, so rows with an empty
+// runtime, an empty model and a zero duration would degrade routing advice with
+// measurements nobody made. Absent is right; undocumented was not.
 func (m Mailbox) recordRoutingTelemetry(ctx context.Context, job db.Job, agent runtime.Agent, payload JobPayload, result AgentResult, state JobState, duration time.Duration) {
 	if m.store == nil {
 		return
