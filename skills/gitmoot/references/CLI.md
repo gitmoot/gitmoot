@@ -1885,6 +1885,24 @@ newer ones out of the window. TTL nags are delivered through the durable wake
 outbox with coalescing, like blocked and escalation wakes, rather than one live
 prompt per due directive per sweep.
 
+A completion nudge is **not delivered to a seat that is working**. The nudge
+says "acknowledged but incomplete; finish the assigned deliverable", and an
+inbound pane message ends the turn in flight, so nagging a working seat
+terminates the attempt to finish. The sweep reads the persisted live-pane
+observation: a `working` state observed within the last five minutes defers the
+nudge without spending a ladder step, and the nudge fires on the first sweep
+after the seat stops or is superseded by the completion receipt arriving. Any
+other state, including the `unknown` a closed pane reports, and any staler
+observation, deliver the nudge exactly as before.
+
+The deferral is bounded. Past `anchor + directive_done_ttl * (directive_max_nudges + 1)`,
+the point at which the whole ladder could have run, Gitmoot escalates to the
+sender's current parent instead of interrupting the seat, stamps
+`directive_exhausted_at` and records the marker note. A seat that reports
+`working` forever therefore cannot hold an unmet obligation in silence, and it
+is still never interrupted. The acknowledgment phase is unaffected: a receipt
+request is not a nag about unfinished work.
+
 The daemon evaluates directive TTLs on the existing one-minute org supervision
 lane. `[org].directive_ack_ttl` defaults to `10m`,
 `[org].directive_done_ttl` defaults to `0s` (completion nudges off), and

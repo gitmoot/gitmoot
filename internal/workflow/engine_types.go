@@ -375,6 +375,20 @@ type MergeDecision struct {
 	// changes the transition itself (Deferred controls retry-later semantics), so
 	// behavior is byte-identical when the harvester is off.
 	BlockClass MergeBlockClass
+	// HeldByJob names the live job that owns the pull-request branch when THAT is
+	// why the decision deferred. It is a JOB ID rather than a flag so the record
+	// can say which writer the merge is waiting on.
+	//
+	// IT IS TYPED BECAUSE THE ALTERNATIVE WAS MATCHING THE REASON PROSE (#1555).
+	// The deferral reason already reads "active <type> job <id> in flight on
+	// branch <name>", and a consumer deciding a task's state by substring-matching
+	// that sentence is precisely the proxy-instead-of-property defect this
+	// campaign exists to remove.
+	//
+	// Only the branch-ownership deferral sets it. Every other transient hold
+	// (head not yet observable, freshness unknown) leaves it empty and keeps the
+	// pre-existing parking behaviour.
+	HeldByJob string
 }
 
 // MergeBlockClass classifies a merge-gate block (#465 INFRA-NOISE-FILTERED).
