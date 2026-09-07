@@ -6240,3 +6240,57 @@ func TestPolicyMergeGateSupersedesARoleAuthoredAtHeadObjection(t *testing.T) {
 		})
 	}
 }
+
+// TestPolicyMergeGateRefusesWhenAStaleHeadApprovalWouldRetireASessionObjection
+// is #1950 F5 as the certifier reproduced it, and it is a MERGE-INTEGRITY
+// regression rather than a rendering one: at 5423928d this shape MERGED and
+// called the external merge once in each of three runs.
+//
+// The shape: a production session objection carrying neither head nor round; a
+// later approval from the SAME reviewer that is also roundless but names a STALE
+// head; and an independent approval at the evaluated head so nothing else blocks.
+// Both objection and stale approval being roundless, reviewRoundKeyForJob falls
+// back to timestamps, so the stale approval won recency and retired an objection
+// it never spoke for.
+//
+// It enters through Evaluate and asserts ZERO external merge calls, because a
+// helper-level assertion cannot observe the merge this bug performs.
+func TestPolicyMergeGateRefusesWhenAStaleHeadApprovalWouldRetireASessionObjection(t *testing.T) {
+	ctx := context.Background()
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	// Independent approval AT the evaluated head: the gate is otherwise clean.
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
+	})
+	// The objection: production session writers, so neither head nor round.
+	openSessionReviewObjection(t, store, "session-objection", "session-reviewer", "", "changes_requested", reviewseverity.P1)
+	setMergeGateJobTimestamps(t, store, "session-objection", "2026-09-01T10:00:00Z")
+	// The stale-head approval: SAME reviewer, roundless, naming a DIFFERENT head,
+	// recorded LATER so it wins the timestamp fallback.
+	insertCompletedJob(t, store, db.Job{ID: "stale-head-approval", Agent: "session-reviewer", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+		HeadSHA: "staleheadsha",
+		Result:  &AgentResult{Decision: "approved", Summary: "approved an older head"},
+	})
+	setMergeGateJobTimestamps(t, store, "stale-head-approval", "2026-09-01T18:00:00Z")
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request.Reviewer = "audit"
+	request.ExpectedTaskState = string(TaskReadyToMerge)
+
+	decision, err := gate.Evaluate(ctx, request)
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if decision.Merged || len(gh.merges) != 0 {
+		t.Fatalf("decision=%+v merges=%d, want NO merge and ZERO external merge calls: an approval naming %q cannot retire an objection about head %q (#1950 F5)",
+			decision, len(gh.merges), "staleheadsha", "head123")
+	}
+	if task, taskErr := store.GetTask(ctx, "task-9"); taskErr != nil || task.State != string(TaskReadyToMerge) {
+		t.Fatalf("task=%+v err=%v, want the task state unclaimed and unchanged", task, taskErr)
+	}
+}

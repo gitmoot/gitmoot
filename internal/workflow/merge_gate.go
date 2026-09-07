@@ -1102,6 +1102,32 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		superseded := false
 		if reviewer != "" {
 			for _, candidate := range taskReviews {
+				// A HEAD-BEARING CANDIDATE MUST MATCH THE EVALUATED HEAD, and omitting
+				// this was a merge-integrity BYPASS in the first version of this arm
+				// (#1950 F5, escalated to P1). The three tests below - identity, a
+				// replacement decision, recency - never asked WHICH HEAD the candidate
+				// described. A production session objection carries neither head nor
+				// round; a later same-reviewer CLI-shaped approval naming a STALE head
+				// is also roundless, so reviewRoundKeyForJob falls back to timestamps,
+				// the stale approval won recency and retired the objection. With an
+				// independent at-head approval present, Evaluate MERGED - measured at
+				// one external merge call in each of three runs.
+				//
+				// EMPTY-OR-EQUAL, DELIBERATELY NOT EMPTY-ONLY. A replacement rendered AT
+				// the evaluated head legitimately answers a headless objection, which is
+				// the ordinary way a reviewer withdraws one; requiring the candidate to
+				// be headless too would deadlock every objection answered by
+				// re-reviewing the current head. The "replaced it at the evaluated head"
+				// arm pins that direction, and the mutant dropping this condition kills
+				// only the stale-head regression.
+				//
+				// A row's authority is the FULL TUPLE - identity, decision class,
+				// recency, and applicable head. Five rounds of this fix each decided it
+				// from a subset: the writer, then the attempt, then the message prefix,
+				// then the identity source, and now the head.
+				if candidateHead := strings.TrimSpace(candidate.payload.HeadSHA); candidateHead != "" && candidateHead != headSHA {
+					continue
+				}
 				if candidate.payload.Result != nil &&
 					effectiveReviewerIdentityName(candidate.job, candidate.payload) == reviewer &&
 					isReviewReplacementDecision(candidate.payload.Result.Decision) &&
