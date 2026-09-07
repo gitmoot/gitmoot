@@ -430,6 +430,42 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			}
 		}
 	}
+	// #1969: DISCLOSE THE LEDGER OBLIGATIONS ON THIS PATH TOO.
+	//
+	// The findings ledger has a write half and a read half, and the file header
+	// of findings_ledger_writer.go states why one without the other is worse
+	// than neither: obligations accumulate that no reviewer was ever told about,
+	// and the gate then refuses heads whose reviewer could not have discharged
+	// anything, because a uid is obtainable ONLY by being told it.
+	//
+	// The read half was wired to HandlePullRequestOpened's fan-out only. Measured
+	// on this box: all 571 recorded findings came from CLI-dispatched review jobs
+	// and ZERO from the fan-out, so the read half had never run. The separation
+	// across eight repositories is total - every repository that ever answered a
+	// finding had review prompts that mentioned continues_uid because a SEAT had
+	// hand-written the obligations in (gitmoot 32 prompts / 100 answered,
+	// keephair 2 / 11, coordinator-checkin 1 / 17), and every repository whose
+	// prompts never mentioned it answered nothing (joltra 0 / 0 despite 49
+	// implement jobs, plus vetrina, numbra, among-friends, omp-role-router).
+	// Consumption was manual, and where nobody did it by hand 211 findings were
+	// recorded and none was ever answered.
+	//
+	// The resolvers come from daemonLedgerResolvers, the SAME single constructor
+	// the merge gate is built with, so the brief cannot disclose one set of
+	// obligations while the gate demands another (#1850 R3-F1). The brief text
+	// itself is rendered by the engine, never re-implemented here.
+	//
+	// It is additive and fails open: a review with no PR, no head, or no prior
+	// obligations at that head gets a byte-identical prompt.
+	if request.Action == "review" && request.PullRequest > 0 && strings.TrimSpace(request.HeadSHA) != "" {
+		briefEngine := workflow.Engine{
+			Store:           store,
+			LedgerResolvers: daemonLedgerResolvers(nil, record.CheckoutPath, localDispatchJobRunner(request)),
+		}
+		if brief := briefEngine.ReviewObligationBrief(ctx, repo.FullName(), request.PullRequest, request.HeadSHA, request.TaskID); brief != "" {
+			request.Instructions += brief
+		}
+	}
 	// A foreground dispatch already knows the runtime it will execute. Persist it
 	// in the initial job insert so recording cannot fail separately and leave a
 	// daemon-claimable queued row. Background jobs deliberately omit it here: the
