@@ -1651,8 +1651,13 @@ weekly-quota rejection marks that role `unavailable` until the provider's
 stated reset time. `org status` prints `⚠ UNAVAILABLE`, `reason=quota`, and the
 UTC reset instant in the role detail; `org chart` appends the same warning, and
 their JSON rows expose `provider_state: "unavailable"`,
-`unavailable_reason`, and `unavailable_until`. New operator dispatches to the
-role are refused and already-queued jobs for it stay held. The incident sends
+`unavailable_reason`, and `unavailable_until`. Enforcement is scoped to the runtime that hit the
+wall (#1641): new operator dispatches to the role are refused, and already-queued
+jobs for it stay held, only when the job's selected runtime is the walled one, so
+a Claude wall never blocks the role's Codex or Kimi work. A per-job `--runtime`
+override decides this, in both directions. An incident with no recorded runtime
+(written before per-runtime attribution) still holds the whole role, and an
+unrecognized recorded or selected runtime refuses rather than dispatches. The incident sends
 one best-effort direct wake to the role's configured parent, then clears at the
 reset instant or on that role's first subsequent successful Claude-runtime job,
 whichever happens first. Success on another runtime cannot clear the Claude

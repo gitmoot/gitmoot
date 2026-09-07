@@ -349,10 +349,17 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		runtimeConfigDir = selectedReadOnlyRuntimeConfigDir(agent.Runtime, payload.RuntimeConfigDir)
 	}
 	// The runtime-session lock keeps naming the agent's REGISTERED session, so
-	// #684's serialization is unchanged: a read-only seat still queues behind a
-	// busy reviewer session, and the scheduler gate (queuedJobRuntimeResourceKey,
-	// which reads the stored agent) still computes the same key the acquisition
-	// below does. Only DELIVERY moves to the seat's isolated fresh session.
+	// #684's serialization is unchanged for a REGISTERED seat: it still queues
+	// behind a busy reviewer session, and the scheduler gate
+	// (queuedJobRuntimeResourceKey, which reads the stored agent for that case)
+	// computes the same key the acquisition below does. Only DELIVERY moves to
+	// the seat's isolated fresh session.
+	//
+	// #1952: this does NOT hold for an EPHEMERAL seat, and the unqualified
+	// version of this sentence was false. Such a job has no registered session:
+	// the gate keys it synthetically by job id and the worker locks the
+	// materialized live session, so gate and acquisition deliberately differ.
+	// The full explanation is on readOnlySeatRuntimeRef below.
 	sessionLockAgent := agent
 	if err := applyReadOnlySeat(readOnlySeat, runtimeConfigDir, job.ID, &agent); err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
@@ -1583,10 +1590,22 @@ func resumableSessionRuntime(runtimeName string) bool {
 //
 // It is never a lock key, and that is the point: the seat locks on the agent's
 // REGISTERED ref (jobWorker.run keeps a pre-seat copy in sessionLockAgent) and
-// the scheduler gate needs no seat branch at all, because
-// queuedJobRuntimeResourceKey reads the stored agent and therefore computes the
-// same registered key. Gate and acquisition agree because neither one uses this
-// function.
+// queuedJobRuntimeResourceKey reads the stored agent for a REGISTERED seat and
+// therefore computes the same registered key. Gate and acquisition agree because
+// neither one uses this function.
+//
+// #1952 narrowed that to REGISTERED seats, and a first version of this note
+// asserted "no seat job carries an ephemeral spec" on the strength of a grep for
+// co-assignment — which cannot establish absence. TRACED, the opposite is true:
+// delegationRequest (engine_run_budgets.go) sets Ephemeral, and
+// allocateAndEnqueueDelegationInner sets ReadOnlySeat on that SAME request for
+// an ask/review action, so an ephemeral read-only seat exists.
+//
+// It needs no seat branch anyway, because the registered-ref story does not
+// describe it: an ephemeral job has no registered session at all, so the gate
+// keys it by job id (see queuedJobRuntimeResourceKey) whether or not it is a
+// seat, and the worker still locks the materialized session. Nothing here
+// depends on the two flags being mutually exclusive.
 //
 // An earlier version of this comment claimed both derived their key from HERE.
 // That is the opposite of the code, and acting on it is exactly the mutation
@@ -2912,11 +2931,26 @@ func perJobAdmissionEstimate(ctx context.Context, store *db.Store, job db.Job, p
 	if store == nil {
 		return admissionEstimate{session: true, memGB: policy.DefaultMemoryGB}
 	}
-	agent, err := store.GetAgent(ctx, job.Agent)
-	if err != nil {
+	// #1952: resolve the runtime the job will ACTUALLY run as, so an ephemeral
+	// Claude job is charged Claude's RAM prior rather than a stale same-name
+	// agent row's runtime (or the default, when no row exists yet).
+	//
+	// An UNPARSEABLE payload must not degrade to DefaultMemoryGB: before this
+	// change such a job was still charged its registered runtime's prior, and
+	// silently re-pricing every corrupt-payload job would be a regression this
+	// fix has no business causing. A zero payload carries no ephemeral spec and
+	// no override, so selectedJobRuntimeAgent resolves it from the agents table —
+	// byte-for-byte the previous behaviour. TestPerJobAdmissionEstimate caught
+	// exactly this.
+	payload, payloadErr := daemonJobPayload(job)
+	if payloadErr != nil {
+		payload = workflow.JobPayload{}
+	}
+	agent, ok := selectedJobRuntimeAgent(ctx, store, job, payload)
+	if !ok {
 		return admissionEstimate{session: true, memGB: policy.DefaultMemoryGB}
 	}
-	switch strings.TrimSpace(runtimeAgent(agent).Runtime) {
+	switch strings.TrimSpace(agent.Runtime) {
 	case runtime.CodexRuntime:
 		return admissionEstimate{session: true, memGB: policy.CodexMemoryGB}
 	case runtime.ClaudeRuntime:
