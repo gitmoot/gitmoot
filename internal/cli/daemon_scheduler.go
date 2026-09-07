@@ -3046,12 +3046,22 @@ func queuedJobRuntimeResourceKey(ctx context.Context, store *db.Store, job db.Jo
 	// not-session-counted (perJobAdmissionEstimate treats "" as no session).
 	//
 	// This key is a SERIALIZATION key — runtimeResourceLocked, inflightRuntimes —
-	// so it must agree with what the worker actually LOCKS, not merely be
-	// non-empty. jobWorker.run rewrites a fresh ref to runtime.FreshRefForJob(job.ID)
-	// before taking the lock, so building the key from that same formula makes the
-	// gate and the acquisition byte-identical, which is the invariant
-	// runtime_override.go documents. It is also job-unique, so two ephemeral jobs
-	// never falsely serialize.
+	// so what it must satisfy is worth stating exactly, because an earlier version
+	// of this comment claimed something FALSE: that the key is byte-identical to
+	// the lock the worker takes. MEASURED, it is not. The gate produces
+	// runtime:<rt>:fresh:job:<hash> while jobWorker.run's journalled lock reads
+	// runtime:<rt>:<the ref adapter.Start returned>. scopeRegisteredFreshRefForJob
+	// only rewrites a ref that IsFreshRef, and a materialized ephemeral agent
+	// carries the live session ref, so it is left alone.
+	//
+	// That gap is inherent and harmless: an ephemeral session does not EXIST until
+	// Start returns, so no pre-dispatch value can name it. What the key must be is
+	// non-empty (so admission counts a real session rather than pricing it free),
+	// job-unique (so two ephemeral jobs never serialize against each other), and
+	// never shaped like a live session ref (so it cannot collide with a real
+	// lock) — which the fresh: prefix guarantees. A fresh ephemeral session
+	// contends with nothing at gate time, so claiming no existing lock is correct
+	// rather than merely convenient.
 	if payload, err := daemonJobPayload(job); err == nil && payload.Ephemeral != nil {
 		agent, ok := selectedJobRuntimeAgent(ctx, store, job, payload)
 		if !ok {

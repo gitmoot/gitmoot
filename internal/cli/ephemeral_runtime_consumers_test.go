@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/config"
@@ -122,57 +123,116 @@ func TestAuthProbeDedupKeyDistinguishesEphemeralRuntimes(t *testing.T) {
 	}
 }
 
-// TestAdmissionEstimateChargesTheEphemeralSpecRuntime is the P2 admission
-// regression, asserting the measured VALUES (session true, Claude's 0.85 GB
-// prior) rather than pinning a helper. Before the fix an ephemeral session
-// evaded both opt-in admission caps entirely: session false, 0 GB.
-func TestAdmissionEstimateChargesTheEphemeralSpecRuntime(t *testing.T) {
-	store, _ := ephemeralConsumerStore(t)
-	// The stale same-name row is shell: not a session runtime at all, which is
-	// how a real Claude session came to be counted as free.
-	seedDaemonWorkerAgent(t, store, "eph-admit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
-		ID: "eph-admission", Agent: "eph-admit", Action: "ask", Repo: "owner/repo", Branch: "main",
-		Ephemeral: &workflow.EphemeralSpec{Runtime: runtime.ClaudeRuntime},
+// admissionHeldBack dispatches through the REAL tracked scheduler under a given
+// memory cap and reports whether the job was refused admission. Nothing here
+// calls perJobAdmissionEstimate: the estimate is observed through the decision
+// the scheduler actually makes, which is the only place it matters.
+//
+// The verdict is the scheduler's own "held back" line, which names ADMISSION
+// specifically — unlike final job state, which reads "queued" both for a job
+// refused admission and for a job that was never selected, and so cannot tell
+// the two apart. Two instrument corrections are baked in here, both of which
+// cost a round:
+//
+//   - resetHeldBackWarnState() is REQUIRED. That line is throttled per
+//     job+reason by heldBackWarnByJob for heldBackLogInterval (5 minutes) in
+//     PACKAGE state, so without the reset a stdout check silently reports "not
+//     held" on the second and third pass of -count=3. The codebase already had
+//     this helper; TestTrackedDispatchLogsAdmissionNeverFit calls it.
+//   - the job must be dispatch-ELIGIBLE (PullRequest set), or nothing is
+//     selected, stdout is empty, and every assertion reads whatever the empty
+//     case happens to imply.
+func admissionHeldBack(t *testing.T, store *db.Store, jobID string, maxMemoryGB float64) (bool, string) {
+	t.Helper()
+	resetHeldBackWarnState()
+	ctx := context.Background()
+	stdout := &syncBuffer{}
+	worker := poolSchedulerWorker(t, store, &cliWorkerFakeAdapter{output: poolSchedulerAskResult}, false)
+	worker.Stdout = stdout
+	worker.Admission = newAdmissionBudget(config.AdmissionPolicy{
+		MaxMemoryGB:     maxMemoryGB,
+		CodexMemoryGB:   0.2,
+		ClaudeMemoryGB:  0.85,
+		KimiMemoryGB:    0.5,
+		DefaultMemoryGB: 0.5,
 	})
-	job := mustWorkerJob(t, store, "eph-admission")
-	policy := config.DefaultAdmissionPolicy()
-
-	got := perJobAdmissionEstimate(context.Background(), store, job, policy)
-	if !got.session || got.memGB != policy.ClaudeMemoryGB {
-		t.Fatalf("estimate = %+v, want session=true memGB=%v (Claude's prior)", got, policy.ClaudeMemoryGB)
+	tracker := newInflightJobTracker(ctx)
+	if err := dispatchQueuedJobsTracked(ctx, worker, 2, 2, "owner/repo", "", tracker); err != nil {
+		t.Fatalf("dispatchQueuedJobsTracked: %v", err)
 	}
-	if key := queuedJobRuntimeResourceKey(context.Background(), store, job); key == "" {
-		t.Fatalf("resource key is empty for a job that will hold a Claude session")
-	}
+	out := stdout.String()
+	job := mustWorkerJob(t, store, jobID)
+	return strings.Contains(out, "job "+jobID+" held back:"), out + " | final state=" + job.State
 }
 
-// TestAdmissionEstimateStillFreesAGenuinelySessionlessJob is the should-SUCCEED
-// control for admission: the fix must not reserve RAM for everything. A plain
-// shell job takes no session and is charged nothing.
-func TestAdmissionEstimateStillFreesAGenuinelySessionlessJob(t *testing.T) {
+func seedEphemeralAdmissionJob(t *testing.T, store *db.Store, jobID, storedRuntime string, spec *workflow.EphemeralSpec) {
+	t.Helper()
+	seedDaemonWorkerAgent(t, store, "eph-admit-"+jobID, storedRuntime, "unused", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: jobID, Agent: "eph-admit-" + jobID, Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1,
+		Ephemeral: spec,
+	})
+}
+
+// TestAdmissionChargesTheEphemeralSpecRuntimeThroughTheScheduler is the P2
+// admission regression, driven through dispatchQueuedJobsTracked rather than by
+// calling the estimate. It pins Claude's 0.85 GB prior FROM BOTH SIDES: a 0.5 GB
+// cap must refuse the job and a 0.9 GB cap must admit it. A one-sided assertion
+// would also pass for "charges everything infinite RAM", which is the failure
+// mode a correctness fix can easily introduce.
+//
+// Before the fix the stale shell row made this session-less and free, so it was
+// admitted under ANY cap — ephemeral sessions evaded both opt-in limits.
+func TestAdmissionChargesTheEphemeralSpecRuntimeThroughTheScheduler(t *testing.T) {
+	t.Run("a cap below Claude's prior refuses it", func(t *testing.T) {
+		store, _ := ephemeralConsumerStore(t)
+		seedEphemeralAdmissionJob(t, store, "eph-admission-tight", runtime.ShellRuntime,
+			&workflow.EphemeralSpec{Runtime: runtime.ClaudeRuntime})
+		held, out := admissionHeldBack(t, store, "eph-admission-tight", 0.5)
+		if !held {
+			t.Fatalf("a 0.85 GB Claude session was admitted under a 0.5 GB cap; output=%q", out)
+		}
+	})
+
+	t.Run("a cap above Claude's prior admits it", func(t *testing.T) {
+		store, _ := ephemeralConsumerStore(t)
+		seedEphemeralAdmissionJob(t, store, "eph-admission-loose", runtime.ShellRuntime,
+			&workflow.EphemeralSpec{Runtime: runtime.ClaudeRuntime})
+		held, out := admissionHeldBack(t, store, "eph-admission-loose", 0.9)
+		if held {
+			t.Fatalf("a 0.85 GB Claude session was refused under a 0.9 GB cap; output=%q", out)
+		}
+	})
+}
+
+// TestAdmissionStillAdmitsASessionlessJobUnderATinyCap is the should-SUCCEED
+// control: a genuinely session-less shell job contributes no RAM and must be
+// admitted under a cap far below every runtime prior. Without it, "charge
+// everything" would pass the regression above.
+func TestAdmissionStillAdmitsASessionlessJobUnderATinyCap(t *testing.T) {
 	store, _ := ephemeralConsumerStore(t)
 	seedDaemonWorkerAgent(t, store, "shell-admit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
-		ID: "shell-admission", Agent: "shell-admit", Action: "ask", Repo: "owner/repo", Branch: "main",
+		ID: "shell-admission", Agent: "shell-admit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1,
 	})
-	job := mustWorkerJob(t, store, "shell-admission")
-
-	got := perJobAdmissionEstimate(context.Background(), store, job, config.DefaultAdmissionPolicy())
-	if got.session || got.memGB != 0 {
-		t.Fatalf("estimate = %+v, want session=false memGB=0 for a session-less shell job", got)
+	if held, out := admissionHeldBack(t, store, "shell-admission", 0.1); held {
+		t.Fatalf("a session-less shell job was refused admission under a 0.1 GB cap; output=%q", out)
 	}
 }
 
-// TestEphemeralResourceKeyMatchesTheLockTheWorkerTakes pins the property that
-// made the job-id form correct rather than merely non-empty: this key is a
-// SERIALIZATION key (runtimeResourceLocked, inflightRuntimes), and
-// runtime_override.go requires the scheduler gate and the worker's lock
-// acquisition to agree. jobWorker.run rewrites a fresh ref to
-// runtime.FreshRefForJob(job.ID) before locking, so the gate must produce that
-// same string — and it must stay job-unique so two ephemeral jobs do not
-// serialize against each other.
-func TestEphemeralResourceKeyMatchesTheLockTheWorkerTakes(t *testing.T) {
+// TestEphemeralGateKeyIsJobUniqueAndNotASessionRef pins what the gate key must
+// actually satisfy, replacing an earlier assertion of mine that was circular: it
+// computed the expected key from the same helper under test and claimed the gate
+// was byte-identical to the worker's lock. MEASURED, that is false — the gate
+// yields runtime:claude:fresh:job:<hash> while the worker's journalled lock is
+// runtime:claude:<ref returned by adapter.Start>. It cannot be otherwise: the
+// session does not exist until Start returns, so no pre-dispatch value can equal
+// it.
+//
+// What the key must therefore be: non-empty so admission counts the session,
+// job-unique so two ephemeral jobs never serialize against each other, and never
+// equal to a real session ref so it cannot collide with a live lock.
+func TestEphemeralGateKeyIsJobUniqueAndNotASessionRef(t *testing.T) {
 	store, _ := ephemeralConsumerStore(t)
 	seedDaemonWorkerAgent(t, store, "eph-key", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
 	for _, id := range []string{"eph-key-a", "eph-key-b"} {
@@ -185,37 +245,39 @@ func TestEphemeralResourceKeyMatchesTheLockTheWorkerTakes(t *testing.T) {
 	keyA := queuedJobRuntimeResourceKey(ctx, store, mustWorkerJob(t, store, "eph-key-a"))
 	keyB := queuedJobRuntimeResourceKey(ctx, store, mustWorkerJob(t, store, "eph-key-b"))
 
-	want, ok := runtimeSessionResourceKey(runtime.Agent{
-		Runtime:    runtime.ClaudeRuntime,
-		RuntimeRef: runtime.FreshRefForJob("eph-key-a"),
-	})
-	if !ok {
-		t.Fatal("runtimeSessionResourceKey refused the worker's own fresh-ref form")
-	}
-	if keyA != want {
-		t.Fatalf("gate key = %q, worker locks %q: gate and acquisition must agree", keyA, want)
+	if keyA == "" {
+		t.Fatal("gate key is empty for a job that will hold a Claude session; admission would price it free")
 	}
 	if keyA == keyB {
 		t.Fatalf("two ephemeral jobs share the key %q and would falsely serialize", keyA)
 	}
+	if !strings.HasPrefix(keyA, "runtime:"+runtime.ClaudeRuntime+":") {
+		t.Fatalf("gate key %q does not name the spec runtime", keyA)
+	}
+	// A real session ref is not fresh-prefixed, so the gate key can never be
+	// mistaken for one. This is the property the circular test should have made.
+	if !runtime.IsFreshRef(strings.TrimPrefix(keyA, "runtime:"+runtime.ClaudeRuntime+":")) {
+		t.Fatalf("gate key %q is shaped like a live session ref and could collide with a real lock", keyA)
+	}
 }
 
-// TestEphemeralResourceKeyTakesNoSessionForANonResumableSpec: a shell spec takes
-// no session lock, exactly as a shell-registered agent does not. Without this a
-// "make it non-empty" fix would invent a session for every ephemeral job.
-func TestEphemeralResourceKeyTakesNoSessionForANonResumableSpec(t *testing.T) {
+// TestEphemeralGateTakesNoSessionForANonResumableSpec: a shell spec takes no
+// session lock, exactly as a shell-registered agent does not. Without this a
+// "make it non-empty" fix would invent a session for every ephemeral job — and
+// note the stored row here is Claude, so the pre-fix code took a session for a
+// job that runs on shell.
+func TestEphemeralGateTakesNoSessionForANonResumableSpec(t *testing.T) {
 	store, _ := ephemeralConsumerStore(t)
 	seedDaemonWorkerAgent(t, store, "eph-shell", runtime.ClaudeRuntime, "unused", []string{"ask"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
-		ID: "eph-shell-job", Agent: "eph-shell", Action: "ask", Repo: "owner/repo", Branch: "main",
+		ID: "eph-shell-job", Agent: "eph-shell", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1,
 		Ephemeral: &workflow.EphemeralSpec{Runtime: runtime.ShellRuntime},
 	})
 	job := mustWorkerJob(t, store, "eph-shell-job")
 	if key := queuedJobRuntimeResourceKey(context.Background(), store, job); key != "" {
 		t.Fatalf("shell-spec ephemeral job took session key %q, want none", key)
 	}
-	got := perJobAdmissionEstimate(context.Background(), store, job, config.DefaultAdmissionPolicy())
-	if got.session || got.memGB != 0 {
-		t.Fatalf("estimate = %+v, want session=false memGB=0", got)
+	if held, out := admissionHeldBack(t, store, "eph-shell-job", 0.1); held {
+		t.Fatalf("a shell-spec ephemeral job was charged RAM and refused; output=%q", out)
 	}
 }

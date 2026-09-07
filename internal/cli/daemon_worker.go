@@ -1583,12 +1583,22 @@ func resumableSessionRuntime(runtimeName string) bool {
 //
 // It is never a lock key, and that is the point: the seat locks on the agent's
 // REGISTERED ref (jobWorker.run keeps a pre-seat copy in sessionLockAgent) and
-// queuedJobRuntimeResourceKey reads the stored agent for a READ-ONLY SEAT and
+// queuedJobRuntimeResourceKey reads the stored agent for a REGISTERED seat and
 // therefore computes the same registered key. Gate and acquisition agree because
-// neither one uses this function. (#1952 narrowed that claim: the gate no longer
-// reads the stored agent for an EPHEMERAL job, which has no registered session to
-// key on — it keys by job id there. Seats are unaffected, and no seat job carries
-// an ephemeral spec.)
+// neither one uses this function.
+//
+// #1952 narrowed that to REGISTERED seats, and a first version of this note
+// asserted "no seat job carries an ephemeral spec" on the strength of a grep for
+// co-assignment — which cannot establish absence. TRACED, the opposite is true:
+// delegationRequest (engine_run_budgets.go) sets Ephemeral, and
+// allocateAndEnqueueDelegationInner sets ReadOnlySeat on that SAME request for
+// an ask/review action, so an ephemeral read-only seat exists.
+//
+// It needs no seat branch anyway, because the registered-ref story does not
+// describe it: an ephemeral job has no registered session at all, so the gate
+// keys it by job id (see queuedJobRuntimeResourceKey) whether or not it is a
+// seat, and the worker still locks the materialized session. Nothing here
+// depends on the two flags being mutually exclusive.
 //
 // An earlier version of this comment claimed both derived their key from HERE.
 // That is the opposite of the code, and acting on it is exactly the mutation
