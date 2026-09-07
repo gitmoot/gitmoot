@@ -6166,3 +6166,77 @@ func TestPolicyMergeGateReachesIndependenceForARoleAuthoredApproval(t *testing.T
 		})
 	}
 }
+
+// TestPolicyMergeGateSupersedesARoleAuthoredAtHeadObjection is #1950 F4's SIXTH
+// identity site, reproduced as the certifying reviewer's adversary did it.
+// Current-head supersession compared Agent columns inline while every other site
+// had been routed through the resolver, so an at-head objection authored by an
+// acting ROLE could never be superseded by that same role's later at-head
+// approval: both Agent columns are empty, the loop skipped them, and the PR
+// stayed open rendering "blocking result from " with no author.
+//
+// The role is deliberately written " ReVieWer " with padding and mixed case,
+// because NormalizeActingOrgRole trims and lowercases and the two rows must
+// resolve to ONE identity. A fix that compared raw role strings would fail here.
+func TestPolicyMergeGateSupersedesARoleAuthoredAtHeadObjection(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		addApproval bool
+		wantMerge   bool
+	}{
+		{name: "objection alone blocks and NAMES the role", addApproval: false, wantMerge: false},
+		{name: "a later at-head approval from the same normalized role supersedes it", addApproval: true, wantMerge: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: "wave-impl", Type: "implement"}, JobPayload{
+				Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+				Result: &AgentResult{Decision: "implemented", Summary: "implemented"},
+			})
+			insertCompletedJob(t, store, db.Job{ID: "a-review-objection", Agent: "", Type: "review"}, JobPayload{
+				Repo: "gitmoot/gitmoot", PullRequest: 9, HeadSHA: "head123", TaskID: "task-9",
+				ReviewRound:   "review-1",
+				ActingOrgRole: " ReVieWer ",
+				Result:        &AgentResult{Decision: "changes_requested", Severity: reviewseverity.P1, Summary: "role objection at head"},
+			})
+			if tt.addApproval {
+				insertCompletedJob(t, store, db.Job{ID: "b-review-approval", Agent: "", Type: "review"}, JobPayload{
+					Repo: "gitmoot/gitmoot", PullRequest: 9, HeadSHA: "head123", TaskID: "task-9",
+					ReviewRound:   "review-2",
+					ActingOrgRole: "reviewer",
+					Result:        &AgentResult{Decision: "approved", Summary: "same role, later round"},
+				})
+			}
+			mergeable := true
+			gh := &fakeMergeGateGitHub{
+				pr: github.PullRequest{
+					Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+					HeadSHA: "head123", Mergeable: &mergeable,
+				},
+				status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+				checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+				mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+			}
+			gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+			decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			rendered := decision.Reason.Render()
+			if tt.wantMerge && (!decision.Merged || len(gh.merges) != 1) {
+				t.Fatalf("decision=%+v merges=%d, want ONE merge: the same normalized role's later at-head approval must supersede its objection (#1950 F4 site 6). reason=%q",
+					decision, len(gh.merges), rendered)
+			}
+			if !tt.wantMerge {
+				if decision.Merged || len(gh.merges) != 0 {
+					t.Fatalf("decision=%+v merges=%d, want NO merge: an at-head role objection still blocks", decision, len(gh.merges))
+				}
+				if !strings.Contains(rendered, "reviewer") {
+					t.Fatalf("reason = %q, want the normalized ROLE named; rendering \"blocking result from \" with no author is the defect this pins", rendered)
+				}
+			}
+		})
+	}
+}

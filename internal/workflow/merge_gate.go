@@ -654,7 +654,7 @@ func (g PolicyMergeGate) recordApprovalEvidence(ctx context.Context, job db.Job,
 		JobID: job.ID,
 		Kind:  mergeApprovalEvidenceEvent,
 		Message: fmt.Sprintf("approval by %s at %s: evidence=%s (%s)",
-			strings.TrimSpace(job.Agent), strings.TrimSpace(payload.HeadSHA), evidence, detail),
+			effectiveReviewerIdentityName(job, payload), strings.TrimSpace(payload.HeadSHA), evidence, detail),
 	})
 }
 
@@ -900,13 +900,24 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	// in neither direction, so no row is ever hidden by ListJobs' id order.
 	supersededReviewIDs := map[string]struct{}{}
 	for _, review := range reviewsAtHead {
-		reviewer := strings.TrimSpace(review.job.Agent)
+		// THE SIXTH AND LAST INLINE COPY OF THIS RULE (#1950 F4). Every other site
+		// was routed through effectiveReviewerIdentity while THIS one still compared
+		// Agent columns, so an at-head objection authored by an acting ROLE could
+		// never be superseded by that same role's later at-head approval: both Agent
+		// columns are empty, the loop skipped them, and the PR stayed open rendering
+		// "blocking result from " with no author. The helper already resolved both
+		// identities correctly - nothing reached it here.
+		//
+		// Normalization matters on this path specifically: the reviewer's adversary
+		// used " ReVieWer ", and NormalizeActingOrgRole trims and lowercases, so the
+		// objection and its replacement resolve to one identity.
+		reviewer := effectiveReviewerIdentityName(review.job, review.payload)
 		if reviewer == "" {
 			continue
 		}
 		for _, candidate := range reviewsAtHead {
 			if candidate.payload.Result != nil &&
-				strings.TrimSpace(candidate.job.Agent) == reviewer &&
+				effectiveReviewerIdentityName(candidate.job, candidate.payload) == reviewer &&
 				isReviewReplacementDecision(candidate.payload.Result.Decision) &&
 				reviewJobSupersedes(candidate.job, candidate.payload, review.job, review.payload) {
 				supersededReviewIDs[review.job.ID] = struct{}{}
@@ -927,9 +938,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	for _, review := range activeAtHead {
 		switch JobState(review.job.State) {
 		case JobQueued, JobRunning:
-			return mergePending{reason: fmt.Sprintf("waiting for reviewer %s at evaluated head (job %s is %s)", strings.TrimSpace(review.job.Agent), review.job.ID, review.job.State)}
+			return mergePending{reason: fmt.Sprintf("waiting for reviewer %s at evaluated head (job %s is %s)", effectiveReviewerIdentityName(review.job, review.payload), review.job.ID, review.job.State)}
 		case JobFailed, JobCancelled:
-			return fmt.Errorf("crashed reviewer %s at evaluated head (job %s is %s); retry or settle that same job, or push a new head. Reassigning the review to a different agent cannot clear this reviewer's slot", strings.TrimSpace(review.job.Agent), review.job.ID, review.job.State)
+			return fmt.Errorf("crashed reviewer %s at evaluated head (job %s is %s); retry or settle that same job, or push a new head. Reassigning the review to a different agent cannot clear this reviewer's slot", effectiveReviewerIdentityName(review.job, review.payload), review.job.ID, review.job.State)
 		}
 	}
 	for _, review := range activeAtHead {
@@ -955,7 +966,10 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		}
 		switch effectiveReviewDecisionForPayload(review.payload, request.ReviewBlockingSeverity) {
 		case "changes_requested", "blocked", "failed":
-			return mergeBlocked{reason: fmt.Sprintf("review at evaluated head has blocking result from %s", review.job.Agent)}
+			// Named through the resolver: a role-authored objection rendered
+			// "blocking result from " with no author, which is the line an operator
+			// reads while working out why a merge is stuck (#1950 F4).
+			return mergeBlocked{reason: fmt.Sprintf("review at evaluated head has blocking result from %s", effectiveReviewerIdentityName(review.job, review.payload))}
 		}
 	}
 	// #1933. A PERSISTED HEADLESS OBJECTION MUST BLOCK HERE, BEFORE THE EXTERNAL
@@ -1273,7 +1287,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	for _, review := range eligible {
 		job := review.job
 		payload := review.payload
-		if err := g.ensureReviewMatchesHead(payload, headSHA, job.Agent); err != nil {
+		if err := g.ensureReviewMatchesHead(payload, headSHA, effectiveReviewerIdentityName(job, payload)); err != nil {
 			if reason := reviewAuthorshipFailureReason(selfApprovalReason, unknownImplementerReason, unattributedReviewerReason); reason != "" {
 				return errors.New(reason)
 			}
@@ -1286,7 +1300,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			children := delegationChildrenByParent[job.ID]
 			if len(children) == 0 {
 				undispatchedFanOuts = append(undispatchedFanOuts, fmt.Sprintf(
-					"%s (job %s, %d declared)", job.Agent, job.ID, len(payload.Result.Delegations)))
+					"%s (job %s, %d declared)", effectiveReviewerIdentityName(job, payload), job.ID, len(payload.Result.Delegations)))
 				continue
 			}
 			// Decided as "approved" by the single evidence call in the arm below.
@@ -1306,7 +1320,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			// (mergeBlocked), distinct from the transient/process review errors below
 			// (missing approval, not-yet-captured), so the trace-harvester scores only
 			// this one as a negative (#465 INFRA-NOISE-FILTERED).
-			return mergeBlocked{reason: fmt.Sprintf("latest review round has blocking result from %s", job.Agent)}
+			return mergeBlocked{reason: fmt.Sprintf("latest review round has blocking result from %s", effectiveReviewerIdentityName(job, payload))}
 		}
 	}
 	if !approved {
