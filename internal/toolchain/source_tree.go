@@ -40,6 +40,24 @@ type sourceTree struct {
 	// 0700 and whose files are 0400/0500 so no seat can rewrite them. Symlink
 	// refusal still applies - that is openat2's job and it is unconditional.
 	engineOwned bool
+	// excludeRoot names ONE top-level entry the traversal must neither open nor
+	// descend into. It is empty for every operator boundary and is set only by
+	// publishedMembersDigest, for the engine's own launcher directory.
+	//
+	// IT IS A TRAVERSAL RULE BECAUSE THE DIGEST RULE WAS TOO LATE (#1974).
+	// publishedMembersDigest already dropped .bin members AFTER collection, so
+	// the launcher never contributed to the digest - but collection had to OPEN
+	// it first, and writeLauncher publishes a binary runtime's launcher as a
+	// relative SYMLINK, which openat2's RESOLVE_NO_SYMLINKS refuses at any
+	// component. Every reuse of such a root therefore failed with ELOOP and the
+	// caller published the runtime as an exit-126 shim: measured on this host as
+	// claude and kimi permanently unavailable while codex, whose launcher is a
+	// generated script rather than a symlink, kept working.
+	//
+	// Excluding it here is digest-invariant by construction: the value the
+	// publish recorded is the digest of the SOURCE members, a set that cannot
+	// contain a launcher the publish itself created afterwards.
+	excludeRoot string
 }
 
 // resolveFlags apply to every component of every path opened through here.
@@ -149,6 +167,11 @@ func (s *sourceTree) collectMembers(entrypoint string) ([]stagedMember, error) {
 			child := name
 			if relative != "." {
 				child = filepath.Join(relative, name)
+			}
+			// Excluded at the TOP LEVEL ONLY, so a nested directory of the same
+			// name inside an operator boundary is still collected and judged.
+			if relative == "." && s.excludeRoot != "" && name == s.excludeRoot {
+				continue
 			}
 			// THE SUBSTITUTION WINDOW IS HERE: the name has been enumerated and
 			// is about to be opened. In production the barrier is nil; in the

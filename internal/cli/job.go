@@ -1140,7 +1140,15 @@ func runJobRun(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return err
 		}
-		if err := refuseUnavailableOrgRole(context.Background(), store, payload.ActingOrgRole, time.Now().UTC()); err != nil {
+		// #1641/#1952: refuse only when the walled runtime is the one this job will
+		// run as. selectedJobDispatchRuntime mirrors the claiming worker's own
+		// precedence — per-job override, then an EPHEMERAL job's spec, then the
+		// registered agent row — and an unresolvable runtime yields "" and fails
+		// closed inside refuseUnavailableOrgRole. The earlier wording here said
+		// "stored agent, then the payload override", which described neither the
+		// worker nor this code once the spec took precedence.
+		if err := refuseUnavailableOrgRole(context.Background(), store, payload.ActingOrgRole,
+			selectedJobDispatchRuntime(context.Background(), store, job, payload), time.Now().UTC()); err != nil {
 			return err
 		}
 		worker := defaultJobWorker(store, stdout, *home)

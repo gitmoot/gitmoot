@@ -230,12 +230,21 @@ func validatePublished(publishedPath string, runtimeName string, entrypoint stri
 }
 
 // publishedMembersDigest hashes a published tree excluding engine metadata.
+//
+// The launcher directory is excluded BEFORE it is opened (#1974): it is engine
+// metadata that never contributed to the digest, and a binary runtime's launcher
+// is a symlink that openat2's RESOLVE_NO_SYMLINKS refuses, so collecting it and
+// dropping it afterwards turned every reuse of such a root into ELOOP. The
+// recorded digest is unchanged either way - it is the digest of the source
+// members, which cannot contain a launcher the publish created after reading
+// them.
 func publishedMembersDigest(publishedPath string, entrypoint string) (string, error) {
 	tree, err := openSourceTree(publishedPath)
 	if err != nil {
 		return "", err
 	}
 	tree.engineOwned = true
+	tree.excludeRoot = launcherDirName
 	defer tree.close()
 	members, err := tree.collectMembers(entrypoint)
 	if err != nil {
@@ -244,7 +253,7 @@ func publishedMembersDigest(publishedPath string, entrypoint string) (string, er
 	defer closeMembers(members)
 	kept := members[:0]
 	for _, member := range members {
-		if member.relative == entrypointDigestName || strings.HasPrefix(member.relative, launcherDirName+string(filepath.Separator)) {
+		if member.relative == entrypointDigestName {
 			_ = member.file.Close()
 			continue
 		}

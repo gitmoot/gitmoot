@@ -220,12 +220,17 @@ type JobRequest struct {
 	// for this job only (the agent's identity is unchanged). Used by the
 	// orchestrate/run --recipe flag to route a coordinator to a built-in recipe
 	// template's prompt without rebinding the agent.
-	TemplateOverride      *db.AgentTemplate
-	ParentJobID           string
-	DelegationID          string
-	DelegationDepth       int
-	DelegatedBy           string
-	RootJobID             string
+	TemplateOverride *db.AgentTemplate
+	ParentJobID      string
+	DelegationID     string
+	DelegationDepth  int
+	DelegatedBy      string
+	RootJobID        string
+	// DispatchedBy names the identity that asked for this job, when the dispatch
+	// site knows something more specific than DelegatedBy/ActingOrgRole/Sender
+	// can express (#1967). It is optional: dispatcherIdentity resolves a value
+	// for every request, so a dispatch site that omits it is still attributed.
+	DispatchedBy          string
 	Deps                  []string
 	JobTimeout            string
 	RetryCount            int
@@ -375,14 +380,18 @@ type JobPayload struct {
 	DelegationDepth         int          `json:"delegation_depth,omitempty"`
 	DelegatedBy             string       `json:"delegated_by,omitempty"`
 	RootJobID               string       `json:"root_job_id,omitempty"`
-	Deps                    []string     `json:"deps,omitempty"`
-	JobTimeout              string       `json:"job_timeout,omitempty"`
-	RetryCount              int          `json:"retry_count,omitempty"`
-	Fingerprint             string       `json:"fingerprint,omitempty"`
-	FailurePolicy           string       `json:"failure_policy,omitempty"`
-	SynthesisRule           string       `json:"synthesis_rule,omitempty"`
-	DelegationArtifactDir   string       `json:"delegation_artifact_dir,omitempty"`
-	WorktreePath            string       `json:"worktree_path,omitempty"`
+	// DispatchedBy is the resolved dispatcher identity (#1967), the value source
+	// of truth for the denormalized jobs.dispatched_by column. omitempty keeps
+	// pre-#1967 payloads byte-identical.
+	DispatchedBy          string   `json:"dispatched_by,omitempty"`
+	Deps                  []string `json:"deps,omitempty"`
+	JobTimeout            string   `json:"job_timeout,omitempty"`
+	RetryCount            int      `json:"retry_count,omitempty"`
+	Fingerprint           string   `json:"fingerprint,omitempty"`
+	FailurePolicy         string   `json:"failure_policy,omitempty"`
+	SynthesisRule         string   `json:"synthesis_rule,omitempty"`
+	DelegationArtifactDir string   `json:"delegation_artifact_dir,omitempty"`
+	WorktreePath          string   `json:"worktree_path,omitempty"`
 	// RuntimePID is the exact subprocess started by the runtime runner for the
 	// current delivery. RuntimePIDStartTime is Linux /proc starttime field 22,
 	// captured at the same moment so liveness checks cannot mistake a recycled
@@ -577,6 +586,45 @@ type PreparedEnqueue struct {
 	Events []db.JobEvent
 }
 
+// dispatcherIdentity resolves who asked for a job to exist, most specific first.
+//
+// #1967. review_finding_observations records observer_job (the reviewer that
+// found it) and source_job (the job whose claim it repeats). Nothing recorded
+// the DISPATCHER, so no rule of the form "the obligation belongs to the seat
+// that asked for the review" was implementable, and recipient selection fell
+// back to the reviewer agent name - the misrouting mechanism on #1890, where 16
+// escalations authored by one reviewer went to a seat with authority over none
+// of them.
+//
+// The order is deliberate, and the omissions more so:
+//
+//   - DelegatedBy before ActingOrgRole: a delegation child's direct dispatcher
+//     is the coordinator that delegated it, which is narrower than the org role
+//     that whole tree inherits.
+//   - Sender last and never dropped, so the column is non-empty for every
+//     dispatch path. It degrades to a CHANNEL ("local", "github", "heartbeat",
+//     the pipeline sender) rather than a seat, which is honest: a CLI dispatch
+//     with no --org-role and no GITMOOT_ORG_ROLE genuinely carries no seat
+//     identity, and recording the channel says so without inventing one.
+//   - request.Agent and request.LeadAgent are NEVER consulted. On a CLI review
+//     dispatch LeadAgent defaults to the reviewer agent itself
+//     (agent_dispatch.go: firstNonEmpty(request.LeadAgent, agent.Name)), so
+//     either would reintroduce reviewer-name attribution as a fallback and make
+//     the column read as an answer while carrying the same wrong identity.
+func dispatcherIdentity(request JobRequest) string {
+	for _, candidate := range []string{
+		request.DispatchedBy,
+		request.DelegatedBy,
+		request.ActingOrgRole,
+		request.Sender,
+	} {
+		if trimmed := strings.TrimSpace(candidate); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
 // PrepareEnqueue runs Enqueue's read-and-compute half and returns the row to insert.
 // It writes NOTHING durable: that is the whole point, and it is what lets a resolution
 // commit its job insert in the same transaction as its task write and its receipt.
@@ -646,6 +694,14 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		}
 	}
 
+	// #1967: resolve the dispatcher HERE, for the same reason the skip-fanout
+	// intent above is inherited here. Every review-creating request in the tree
+	// is a flat keyed struct literal, and six of them never named a dispatcher
+	// field, so on this box's store 268 of 271 open review findings resolved to
+	// a job whose only identity was Sender: "local" and the reviewer agent's own
+	// name. Fixing the six literals leaves the seventh unattributed; fixing the
+	// chokepoint attributes it for free.
+
 	// Cleanup selectors compare WorktreePath textually with the allocator-derived
 	// obligation path, so managed allocators must preserve their canonical path.
 	payload, err := marshalPayload(JobPayload{
@@ -670,6 +726,7 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		DelegationDepth:        request.DelegationDepth,
 		DelegatedBy:            request.DelegatedBy,
 		RootJobID:              request.RootJobID,
+		DispatchedBy:           dispatcherIdentity(request),
 		Deps:                   compactStrings(request.Deps),
 		JobTimeout:             strings.TrimSpace(request.JobTimeout),
 		RetryCount:             request.RetryCount,

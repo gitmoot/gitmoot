@@ -177,6 +177,14 @@ type Job struct {
 	DelegationID    string
 	DelegationDepth int
 	DelegatedBy     string
+	// DispatchedBy is the identity that CAUSED this job to exist: the delegating
+	// coordinator, the acting org role of the dispatching seat, or, failing both,
+	// the dispatch channel (#1967). It is a denormalized index of
+	// payload.dispatched_by, written by the same projection that denormalizes
+	// workflow_id/repo/pull_request, so every INSERT path carries it without its
+	// caller naming a column. It is deliberately NOT parent_job_id: attribution
+	// must not rewire delegation depth, budget or root-kill semantics.
+	DispatchedBy string
 	// RootID is the id of the coordination tree's originating coordinator,
 	// denormalized onto the row as an indexed column (idx_jobs_root_id, #420) so
 	// root-scoped helpers can answer "which jobs belong to this run?" with one

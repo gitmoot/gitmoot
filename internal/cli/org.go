@@ -1562,6 +1562,15 @@ func orgProviderSnapshot(ctx context.Context, cfg config.OrgConfig) (org.Snapsho
 // validateAndTouchActingOrgRole is the shared local job ingress for --org-role.
 // Validation happens before dispatch mutation; invalid/disabled config creates
 // neither a presence row nor a job.
+//
+// #1641: this ingress deliberately does NOT decide role unavailability. The
+// refusal is runtime-scoped, and the runtime a dispatch will actually use is not
+// known here — dispatchLocalAgentJob calls this before resolveLocalDispatchAgent,
+// which is what picks the agent (and may auto-select one via the managed path).
+// Each dispatch ingress calls refuseUnavailableOrgRole itself once its own
+// selected runtime is authoritative: agent_dispatch.go after effectiveAgent,
+// job.go after the stored agent plus the payload override, workflow.go after the
+// task owner is loaded, and daemon_scheduler.go per queued job.
 func validateAndTouchActingOrgRole(ctx context.Context, store *db.Store, home, role, command string) error {
 	role = strings.TrimSpace(role)
 	if role == "" {
@@ -1581,9 +1590,6 @@ func validateAndTouchActingOrgRole(ctx context.Context, store *db.Store, home, r
 	configuredRole, ok := cfg.Role(role)
 	if !ok {
 		return fmt.Errorf("unknown org role %q", role)
-	}
-	if err := refuseUnavailableOrgRole(ctx, store, configuredRole.Name, time.Now().UTC()); err != nil {
-		return err
 	}
 	// Recycle enforcement only applies to operator-origin --org-role dispatches:
 	// this ingress (dispatchLocalAgentJob) is the sole path passing a non-empty

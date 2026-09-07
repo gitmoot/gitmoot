@@ -307,14 +307,43 @@ func (s *Store) RecordReviewFindingObservation(ctx context.Context, obs ReviewFi
 
 	uid := strings.TrimSpace(obs.ContinuesUID)
 	if uid != "" {
-		var exists int
-		if err := tx.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM review_finding_observations WHERE finding_uid = ?`, uid).Scan(&exists); err != nil {
-			return "", err
+		// A REPO-UNQUALIFIED CITATION IS A SPELLING, NOT A DIFFERENT PERMISSION
+		// (#1965). A minted uid is "<repo>#<pr>-f<n>", and a brief that cited
+		// "#1950-f1" instead of "gitmoot/gitmoot#1950-f1" cost a 47m50s exact-head
+		// verdict its entire ledger effect: the store refused all six observations
+		// and the engine recorded "0 of 6" AFTER the reviewer had finished, so the
+		// only signal was six findings_ledger_skipped job events.
+		//
+		// Qualifying against THIS observation's own repo grants nothing new: the
+		// fully qualified form is already accepted from any observation, since the
+		// existence check is not scoped to repo or pull request. Requiring the
+		// short form's pull request to match would make the abbreviation STRICTER
+		// than the spelling it abbreviates, which is a different rule, not this fix.
+		//
+		// THE REFUSAL ITSELF IS UNCHANGED, deliberately. A uid naming nothing is
+		// still refused - a store that invented a uid would be worse than this bug
+		// - and the refusal now names every form it looked for, so the corrective
+		// spelling is in the error text instead of in someone's memory.
+		candidates := []string{uid}
+		if strings.HasPrefix(uid, "#") {
+			candidates = append(candidates, repo+uid)
 		}
-		if exists == 0 {
-			return "", fmt.Errorf("%w: %q", ErrFindingUnknownContinues, uid)
+		resolved := ""
+		for _, candidate := range candidates {
+			var exists int
+			if err := tx.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM review_finding_observations WHERE finding_uid = ?`, candidate).Scan(&exists); err != nil {
+				return "", err
+			}
+			if exists > 0 {
+				resolved = candidate
+				break
+			}
 		}
+		if resolved == "" {
+			return "", fmt.Errorf("%w: %q (looked for %s)", ErrFindingUnknownContinues, uid, strings.Join(quoteAll(candidates), ", "))
+		}
+		uid = resolved
 	} else {
 		// MINT. Never derived from the reviewer's label, so a renumbered F-1
 		// cannot collide with a prior finding. The candidate is then CHECKED for
@@ -373,6 +402,17 @@ VALUES (?, ?, ?, ?, COALESCE(NULLIF(?, ''), strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		return "", err
 	}
 	return uid, nil
+}
+
+// quoteAll renders candidate uids for a refusal message so the caller can read
+// the exact spelling the store looked for, including the qualified form it
+// derived (#1965).
+func quoteAll(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		out = append(out, fmt.Sprintf("%q", value))
+	}
+	return out
 }
 
 // normaliseKeys seeds relevance from the finding's own file so the set is never

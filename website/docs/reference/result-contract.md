@@ -543,6 +543,32 @@ These fields let Gitmoot connect a child back to its parent, to the specific
 delegation that spawned it, and to the root of the job tree, and they are what
 the termination bounds below are measured against.
 
+Separately from that tree linkage, **every** job Gitmoot creates carries
+`dispatched_by`: the identity that asked for the job to exist. It is resolved at
+the single enqueue chokepoint from the most specific source available, in this
+order: an explicit dispatcher supplied by the dispatch site, then
+`delegated_by`, then the acting org role, then the dispatch channel
+(`local`, `github`, `heartbeat`, the pipeline sender). It never falls back to
+the job's own agent or to `lead_agent`, because on a CLI review dispatch
+`lead_agent` defaults to the reviewer itself.
+
+`dispatched_by` is attribution only. It is deliberately not `parent_job_id`:
+nothing in the scheduler reads it, so recording it cannot change delegation
+depth, the per-root job budget, loop detection or root-kill propagation. Its
+purpose is that a review finding can be resolved to the seat that ordered the
+review, rather than only to the reviewer that wrote it:
+
+```sql
+SELECT f.finding_uid, f.severity, f.state, j.dispatched_by
+FROM review_finding_observations f
+JOIN jobs j ON j.id = f.observer_job
+WHERE f.state = 'open';
+```
+
+Jobs created before this column existed carry an empty `dispatched_by`; there is
+no backfill, because the dispatcher of a past review was never recorded anywhere
+and inventing one would be worse than an honest blank.
+
 ## Top-level fields
 
 - `artifact_body` (optional): the artifact payload made available to delegated
