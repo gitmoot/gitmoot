@@ -2451,10 +2451,15 @@ the bare `--` terminator is exempt. Anything outside a measured table is
 
 WRAPPERS have declared grammars too, one per wrapper: options are matched by
 exact token with value domains measured against the installed binaries - a
-timeout duration is digits with an optional fraction and at most one s/m/h/d
-suffix, a signal is an exact name or 1-64 with no whitespace padding, `nice -n`
-is a signed integer, `ionice -c` is 0-3, `xargs -n` is a positive integer and
-`stdbuf -o` is L, 0 or a size - and the `--` terminator is accepted in option
+timeout duration is any number the shell's own parser accepts (including `.5s`,
+`1.s`, `+1s`, `1e3` and `inf`) with at most one lowercase s/m/h/d suffix and no
+leading minus; a signal is an exact name - the full `kill -l` set including the
+RTMIN/RTMAX family and the IOT/CLD/POLL aliases - or 0-64, with no whitespace
+padding; `nice -n` is a signed integer; `ionice -c` is 0-3 OR a class name
+(`none`, `realtime`, `best-effort`, `idle`) and `ionice -n` has no small upper
+bound; `xargs -n` is at least 1 and `-P` allows 0, both with an optional `+`;
+and stdbuf's THREE STREAMS DO NOT SHARE A DOMAIN - `-o` and `-e` take `L`, `-i`
+does not, and all three take 0 or a size with a unit suffix - and the `--` terminator is accepted in option
 position before the duration, so `timeout --definitely-invalid 1s ...`, `timeout -s -999 1s ...` and
 `timeout 1x ...` are refused rather than stripped. The token after the duration
 is the COMMAND even when it is dash-prefixed. THE CLAIM IS DELIBERATELY NARROW

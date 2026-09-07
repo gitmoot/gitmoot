@@ -140,9 +140,26 @@ func codexToolLines(callID, command string) (string, string) {
 	return line("item.started", "in_progress", nil), line("item.completed", "completed", 0)
 }
 
+// openInstrumentedTranscript opens the transcript THE WAY THE WORKER DOES.
+//
+// It used to pass the runtime name straight through, which meant every
+// production-path test in this file exercised the translators but BYPASSED
+// CALLER ROUTING - so a mutant routing codex and kimi transcripts as claude
+// left the whole suite green (#1930 round-19 F3). daemon_worker.go:800 and
+// :3168 call openRetainedTranscriptLog with effectiveTranscriptRuntime(payload,
+// agent), so the runtime is now derived here the same way, from the seeded job
+// payload and agent row read back out of the store. effectiveTranscriptRuntime
+// is therefore load-bearing for every test that uses this helper.
 func openInstrumentedTranscript(t *testing.T, home, jobID, runtimeName string, store *db.Store) *retainedTranscript {
 	t.Helper()
-	handle, err := openRetainedTranscriptLog(home, jobID, "review", runtimeName, 0, store)
+	routed := runtimeName
+	if store != nil {
+		// ROUTED THROUGH PRODUCTION when there is durable state to route from.
+		// The storeless case has no job row to read, and its own point is that
+		// no event is written, so it keeps the literal name.
+		routed = routedTranscriptRuntime(t, store, jobID)
+	}
+	handle, err := openRetainedTranscriptLog(home, jobID, "review", routed, 0, store)
 	if err != nil {
 		t.Fatalf("open retained transcript: %v", err)
 	}
@@ -150,6 +167,34 @@ func openInstrumentedTranscript(t *testing.T, home, jobID, runtimeName string, s
 		t.Fatal("retained transcript is nil with capture enabled")
 	}
 	return handle
+}
+
+// routedTranscriptRuntime reproduces the worker's routing decision from durable
+// state: read the job, unmarshal its payload, read its agent, and ask
+// effectiveTranscriptRuntime. A test that calls this fails if routing breaks.
+func routedTranscriptRuntime(t *testing.T, store *db.Store, jobID string) string {
+	t.Helper()
+	job, err := store.GetJob(t.Context(), jobID)
+	if err != nil {
+		t.Fatalf("get job for routing: %v", err)
+	}
+	var payload workflow.JobPayload
+	if strings.TrimSpace(job.Payload) != "" {
+		if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
+			t.Fatalf("unmarshal payload for routing: %v", err)
+		}
+	}
+	agentRow, err := store.GetAgent(t.Context(), job.Agent)
+	if err != nil {
+		t.Fatalf("get agent for routing: %v", err)
+	}
+	routed := effectiveTranscriptRuntime(payload, runtime.Agent{
+		Name: agentRow.Name, Runtime: agentRow.Runtime,
+	})
+	if strings.TrimSpace(routed) == "" {
+		t.Fatalf("routing produced an empty runtime for job %s", jobID)
+	}
+	return routed
 }
 
 func seedInstrumentJob(t *testing.T, paths config.Paths, jobID, agent, runtimeName string) *db.Store {
@@ -2268,6 +2313,108 @@ func TestPhaseInstrumentRound18SplitWrites(t *testing.T) {
 		{"stdbuf control", "stdbuf -o L go test ./...", phaseBucketTest},
 		{"terminator control", "timeout -- 1s go test ./...", phaseBucketTest},
 		{"plus r control", `bash +r -c "go test ./..."`, phaseBucketTest},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughSplitWrites(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentStdbufStreamsHaveDifferentDomains is #1930 round-19 F1.
+// One predicate was shared across three streams that do not share a domain:
+// `stdbuf -o L` and `-e L` run, while `stdbuf -i L` exits 125 before launching
+// anything and was still reported as a test.
+func TestPhaseInstrumentStdbufStreamsHaveDifferentDomains(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"input rejects line mode", "stdbuf -i L go test ./...", phaseBucketUnknown},
+		{"output accepts line mode", "stdbuf -o L go test ./...", phaseBucketTest},
+		{"error accepts line mode", "stdbuf -e L go test ./...", phaseBucketTest},
+		{"input accepts a size", "stdbuf -i 1KB go test ./...", phaseBucketTest},
+		{"input accepts unbuffered", "stdbuf -i 0 go test ./...", phaseBucketTest},
+		{"error accepts a size", "stdbuf -e 4096 go test ./...", phaseBucketTest},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentOperandDomainsInBothDirections is #1930 round-19 F2, and
+// it is organised BY DOMAIN with both directions named for each, because the
+// defect is a domain asserted from the values I happened to probe rather than
+// derived from the binary. Every row is executed against the installed binary.
+//
+// Rows marked "retention" pass at the parent too: they are controls that the
+// widening did not re-break, NOT red/green regressions, and the reviewer was
+// right to say I had counted four of them as evidence.
+func TestPhaseInstrumentOperandDomainsInBothDirections(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		// timeout duration - ACCEPTS (all previously refused)
+		{"duration leading dot", "timeout .5s go test ./...", phaseBucketTest},
+		{"duration trailing dot", "timeout 1.s go test ./...", phaseBucketTest},
+		{"duration explicit plus", "timeout +1s go test ./...", phaseBucketTest},
+		{"duration exponent", "timeout 1e3 go test ./...", phaseBucketTest},
+		{"duration infinity", "timeout inf go test ./...", phaseBucketTest},
+		// timeout duration - REJECTS
+		{"duration negative", "timeout -1s go test ./...", phaseBucketUnknown},
+		{"duration uppercase suffix", "timeout 1S go test ./...", phaseBucketUnknown},
+		{"duration two dots", "timeout 1.5.5 go test ./...", phaseBucketUnknown},
+		{"duration two suffixes", "timeout 1d5h go test ./...", phaseBucketUnknown},
+		{"duration millisecond (retention)", "timeout 1ms go test ./...", phaseBucketUnknown},
+		// signals - ACCEPTS (all previously refused)
+		{"signal realtime base", "timeout -s RTMIN 1s go test ./...", phaseBucketTest},
+		{"signal realtime offset", "timeout -s RTMIN+3 1s go test ./...", phaseBucketTest},
+		{"signal realtime prefixed", "timeout -s SIGRTMIN 1s go test ./...", phaseBucketTest},
+		{"signal alias IOT", "timeout -s IOT 1s go test ./...", phaseBucketTest},
+		{"signal alias CLD", "timeout -s CLD 1s go test ./...", phaseBucketTest},
+		{"signal alias POLL", "timeout -s POLL 1s go test ./...", phaseBucketTest},
+		// signals - REJECTS
+		{"signal unknown name (retention)", "timeout -s nope 1s go test ./...", phaseBucketUnknown},
+		{"signal out of range (retention)", "timeout -s 65 1s go test ./...", phaseBucketUnknown},
+		{"signal padded", `timeout -s " KILL " 1s go test ./...`, phaseBucketUnknown},
+		// ionice -c - ACCEPTS names as well as numbers
+		{"ionice class idle", "ionice -c idle go test ./...", phaseBucketTest},
+		{"ionice class best-effort", "ionice -c best-effort go test ./...", phaseBucketTest},
+		{"ionice class realtime", "ionice -c realtime go test ./...", phaseBucketTest},
+		{"ionice class none", "ionice -c none go test ./...", phaseBucketTest},
+		{"ionice class number", "ionice -c 2 go test ./...", phaseBucketTest},
+		{"ionice class word (retention)", "ionice -c nope go test ./...", phaseBucketUnknown},
+		{"ionice class out of range", "ionice -c 999 go test ./...", phaseBucketUnknown},
+		// ionice -n - the 0-8 bound was invented; 99 runs
+		{"ionice level nine", "ionice -n 9 go test ./...", phaseBucketTest},
+		{"ionice level ninety-nine", "ionice -n 99 go test ./...", phaseBucketTest},
+		{"ionice level negative", "ionice -n -1 go test ./...", phaseBucketUnknown},
+		{"ionice level word", "ionice -n nope go test ./...", phaseBucketUnknown},
+		// xargs
+		{"xargs parallel zero", "xargs -P 0 go test ./...", phaseBucketTest},
+		{"xargs parallel plus", "xargs -P +1 go test ./...", phaseBucketTest},
+		{"xargs count plus", "xargs -n +1 go test ./...", phaseBucketTest},
+		{"xargs count zero", "xargs -n 0 go test ./...", phaseBucketUnknown},
+		{"xargs parallel negative", "xargs -P -1 go test ./...", phaseBucketUnknown},
+		// stdbuf sizes
+		{"stdbuf decimal unit", "stdbuf -o 1KB go test ./...", phaseBucketTest},
+		{"stdbuf binary unit", "stdbuf -o 1KiB go test ./...", phaseBucketTest},
+		{"stdbuf terabyte", "stdbuf -o 1T go test ./...", phaseBucketTest},
+		{"stdbuf unknown unit", "stdbuf -o 1Q go test ./...", phaseBucketUnknown},
+		{"stdbuf negative", "stdbuf -o -1 go test ./...", phaseBucketUnknown},
+		// nice --adjustment: the long form had NO discriminator before
+		{"nice long adjustment", "nice --adjustment 5 go test ./...", phaseBucketTest},
+		{"nice long adjustment negative", "nice --adjustment -5 go test ./...", phaseBucketTest},
+		{"nice long adjustment word", "nice --adjustment nope go test ./...", phaseBucketUnknown},
+		{"nice short word (retention)", "nice -n nope go test ./...", phaseBucketUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentRound19SplitWrites carries the same witnesses through the
+// seven-byte split-write path, which also enters via caller routing now.
+func TestPhaseInstrumentRound19SplitWrites(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"stdbuf input line mode", "stdbuf -i L go test ./...", phaseBucketUnknown},
+		{"stdbuf output line mode", "stdbuf -o L go test ./...", phaseBucketTest},
+		{"duration leading dot", "timeout .5s go test ./...", phaseBucketTest},
+		{"duration negative", "timeout -1s go test ./...", phaseBucketUnknown},
+		{"signal realtime", "timeout -s RTMIN 1s go test ./...", phaseBucketTest},
+		{"ionice class name", "ionice -c idle go test ./...", phaseBucketTest},
+		{"xargs parallel zero", "xargs -P 0 go test ./...", phaseBucketTest},
+		{"nice long adjustment", "nice --adjustment 5 go test ./...", phaseBucketTest},
 	} {
 		t.Run(tc.name, func(t *testing.T) { classifyThroughSplitWrites(t, tc.command, tc.want) })
 	}

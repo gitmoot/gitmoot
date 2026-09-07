@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -705,22 +706,45 @@ type wrapperGrammar struct {
 	declared         bool
 }
 
+// signalNames is the installed `kill -l` set plus the aliases GNU accepts.
+// DERIVED: RTMIN, SIGRTMIN, RTMIN+3, IOT, CLD and POLL all run, and my
+// round-18 list rejected every one of them (#1930 round-19 F2).
+var signalNames = map[string]bool{
+	"HUP": true, "INT": true, "QUIT": true, "ILL": true, "TRAP": true,
+	"ABRT": true, "BUS": true, "FPE": true, "KILL": true, "USR1": true,
+	"SEGV": true, "USR2": true, "PIPE": true, "ALRM": true, "TERM": true,
+	"STKFLT": true, "CHLD": true, "CONT": true, "STOP": true, "TSTP": true,
+	"TTIN": true, "TTOU": true, "URG": true, "XCPU": true, "XFSZ": true,
+	"VTALRM": true, "PROF": true, "WINCH": true, "IO": true, "PWR": true,
+	"SYS": true, "EXIT": true,
+	// Aliases the kernel and GNU both accept.
+	"IOT": true, "CLD": true, "POLL": true, "UNUSED": true,
+}
+
 func isSignalOperand(value string) bool {
-	// NO WHITESPACE TRIM. Measured: `-s " KILL "` exits 125, so trimming here
-	// manufactured a validity the binary does not have (#1930 round-18).
+	// NO WHITESPACE TRIM: `-s " KILL "` exits 125, so trimming manufactured a
+	// validity the binary does not have.
 	name := strings.TrimPrefix(strings.ToUpper(value), "SIG")
-	switch name {
-	case "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE", "KILL",
-		"USR1", "SEGV", "USR2", "PIPE", "ALRM", "TERM", "STKFLT", "CHLD",
-		"CONT", "STOP", "TSTP", "TTIN", "TTOU", "URG", "XCPU", "XFSZ",
-		"VTALRM", "PROF", "WINCH", "IO", "PWR", "SYS":
+	if name == "" {
+		return false
+	}
+	if signalNames[name] {
 		return true
+	}
+	// The realtime family, with an optional offset: RTMIN, RTMIN+3, RTMAX-1.
+	for _, base := range []string{"RTMIN", "RTMAX"} {
+		if name == base {
+			return true
+		}
+		if rest, ok := strings.CutPrefix(name, base); ok && len(rest) > 1 {
+			if (rest[0] == '+' || rest[0] == '-') && isAllDigits(rest[1:]) {
+				return true
+			}
+		}
 	}
 	if !isAllDigits(name) {
 		return false
 	}
-	// A numeric signal must be a real one: `-s -999` and `-s 65` exit 125,
-	// while `-s 0`, `-s 9` and `-s 64` run.
 	number := 0
 	for _, digit := range name {
 		number = number*10 + int(digit-'0')
@@ -729,6 +753,53 @@ func isSignalOperand(value string) bool {
 		}
 	}
 	return number <= 64
+}
+
+// ionice -c takes a class NUMBER or a class NAME; `idle`, `best-effort`,
+// `realtime` and `none` all run, and my numeric-only domain rejected them.
+var ioniceClassNames = map[string]bool{
+	"none": true, "realtime": true, "best-effort": true, "idle": true,
+}
+
+func isIoniceClass(token string) bool {
+	if ioniceClassNames[token] {
+		return true
+	}
+	return boundedInteger(0, 3)(token)
+}
+
+// isUnsignedWithPlus accepts an optional leading `+` before digits. xargs -P
+// takes 0 and +1; xargs -n takes +1 but not 0; ionice -n takes 9 and 99, so it
+// has no small upper bound - the 0-8 bound was invented (#1930 round-19 F2).
+func isUnsignedWithPlus(token string) bool {
+	return isAllDigits(strings.TrimPrefix(token, "+"))
+}
+
+func isPositiveWithPlus(token string) bool {
+	body := strings.TrimPrefix(token, "+")
+	return isAllDigits(body) && strings.Trim(body, "0") != ""
+}
+
+// stdbuf: THE THREE STREAMS DO NOT SHARE A DOMAIN. `stdbuf -o L` and `-e L`
+// run, while `stdbuf -i L` exits 125 before launching anything - one shared
+// predicate reported that as a test (#1930 round-19 F1). All three take 0 and
+// a size with an optional unit suffix; none takes `nope`, `1Q` or `-1`.
+func isBufferSize(token string) bool {
+	body := token
+	for _, suffix := range []string{"KB", "KiB", "MB", "MiB", "GB", "GiB",
+		"TB", "TiB", "PB", "PiB", "EB", "EiB", "K", "M", "G", "T", "P", "E"} {
+		if trimmed, ok := strings.CutSuffix(body, suffix); ok {
+			body = trimmed
+			break
+		}
+	}
+	return isAllDigits(body)
+}
+
+func isInputBufferingMode(token string) bool { return isBufferSize(token) }
+
+func isOutputBufferingMode(token string) bool {
+	return token == "L" || isBufferSize(token)
 }
 
 var wrapperGrammars = map[string]wrapperGrammar{
@@ -760,20 +831,20 @@ var wrapperGrammars = map[string]wrapperGrammar{
 		"--adjustment": {takesValue: true, valueDomain: isSignedInteger},
 	}},
 	"ionice": {declared: true, options: map[string]wrapperOption{
-		"-c": {takesValue: true, valueDomain: boundedInteger(0, 3)},
-		"-n": {takesValue: true, valueDomain: boundedInteger(0, 8)},
+		"-c": {takesValue: true, valueDomain: isIoniceClass},
+		"-n": {takesValue: true, valueDomain: isUnsignedWithPlus},
 		"-t": {},
 	}},
 	"xargs": {declared: true, options: map[string]wrapperOption{
-		"-n": {takesValue: true, valueDomain: isPositiveInteger},
-		"-P": {takesValue: true, valueDomain: isPositiveInteger},
+		"-n": {takesValue: true, valueDomain: isPositiveWithPlus},
+		"-P": {takesValue: true, valueDomain: isUnsignedWithPlus},
 		"-I": {takesValue: true}, "-d": {takesValue: true},
 		"-0": {}, "--null": {}, "-r": {}, "--no-run-if-empty": {},
 	}},
 	"stdbuf": {declared: true, options: map[string]wrapperOption{
-		"-i": {takesValue: true, valueDomain: isBufferingMode},
-		"-o": {takesValue: true, valueDomain: isBufferingMode},
-		"-e": {takesValue: true, valueDomain: isBufferingMode},
+		"-i": {takesValue: true, valueDomain: isInputBufferingMode},
+		"-o": {takesValue: true, valueDomain: isOutputBufferingMode},
+		"-e": {takesValue: true, valueDomain: isOutputBufferingMode},
 	}},
 	"time": {declared: true, options: map[string]wrapperOption{
 		"-f": {takesValue: true}, "--format": {takesValue: true},
@@ -871,12 +942,11 @@ func scanWrapperArguments(wrapper string, tokens []shellToken) (wrapperOutcome, 
 }
 
 func isDurationOperand(token string) bool {
-	// MEASURED against GNU coreutils 9.4, and the previous TrimRight predicate
-	// accepted every invalid one of these: `1ms`, `1ss`, `1sm`, `.` and `.s`
-	// all exit 125 without launching anything, while `1s`, `600`, `25m`, `1.5`,
-	// `0.5s`, `1h` and `2d` run. The grammar is digits, an optional fractional
-	// part, and AT MOST ONE suffix - with at least one digit before the point
-	// (#1930 round-18 finding 1).
+	// DERIVED FROM GNU coreutils 9.4, not asserted. ACCEPTS: 1s 600 25m 1.5
+	// 0.5s 1h 2d .5s 1.s +1s 1e3 0 00 inf. REJECTS: 1ms 1ss 1sm . .s -1s 1S
+	// 1.5.5 1d5h. My round-18 predicate rejected .5s, 1.s, +1s and 1e3, which
+	// is exactly the converse defect I claimed to have closed - the domain was
+	// invented from the values I happened to probe (#1930 round-19 F2).
 	body := token
 	if last := len(body) - 1; last >= 0 {
 		switch body[last] {
@@ -884,14 +954,11 @@ func isDurationOperand(token string) bool {
 			body = body[:last]
 		}
 	}
-	if body == "" {
+	if body == "" || strings.HasPrefix(body, "-") {
+		// A negative duration exits 125.
 		return false
 	}
-	whole, fraction, hasFraction := strings.Cut(body, ".")
-	if whole == "" || !isAllDigits(whole) {
-		return false
-	}
-	if hasFraction && (fraction == "" || !isAllDigits(fraction)) {
+	if _, err := strconv.ParseFloat(body, 64); err != nil {
 		return false
 	}
 	return true
@@ -925,28 +992,6 @@ func boundedInteger(low, high int) func(string) bool {
 		}
 		return value >= low
 	}
-}
-
-// isPositiveInteger is xargs's -n and -P domain: `1` and `2` run, `nope` and
-// `1.5` exit 1.
-func isPositiveInteger(token string) bool {
-	return isAllDigits(token) && strings.Trim(token, "0") != ""
-}
-
-// isBufferingMode is stdbuf's -i/-o/-e domain. Measured: `L`, `0`, `4096` and
-// `4K` are accepted; `nope` exits 125.
-func isBufferingMode(token string) bool {
-	if token == "L" || token == "0" {
-		return true
-	}
-	body := token
-	if last := len(body) - 1; last >= 0 {
-		switch body[last] {
-		case 'K', 'M', 'G', 'k', 'm', 'g':
-			body = body[:last]
-		}
-	}
-	return isAllDigits(body)
 }
 
 func isAllDigitsOrDot(token string) bool {
