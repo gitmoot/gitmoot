@@ -842,6 +842,19 @@ kernel never resolves the entrypoint's original shebang, which would reach the
 operator's copy. A binary runtime gets a relative symlink instead, needing no
 shell.
 
+THE ENGINE'S OWN LAUNCHER DIRECTORY IS EXCLUDED FROM REVALIDATION, and the
+exclusion is a traversal rule rather than a filter applied afterwards (#1974).
+A published tree is re-proved on every reuse by recomputing the digest of its
+members with the same symlink-refusing traversal, and `.bin/` never contributed
+to that digest - the recorded value is the digest of the SOURCE members, which
+cannot contain a launcher the publish created after reading them. Collecting it
+and dropping it afterwards still had to OPEN it, so a binary runtime's symlink
+launcher failed the reuse with `too many levels of symbolic links` and the
+runtime was republished as the exit-126 shim on every subsequent staging. Only
+the TOP-LEVEL `.bin` is excluded; a `.bin` directory that came from a source
+package, which is the ordinary shape of a node-packaged runtime, is payload and
+is still hashed.
+
 Every runtime class the engine can dispatch is staged, not only the seat's own.
 An absent runtime, an unresolvable interpreter, an ambiguous tree, or a kernel
 without `openat2` all resolve to engine-owned commands that print

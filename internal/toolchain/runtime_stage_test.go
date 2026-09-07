@@ -262,6 +262,107 @@ func TestStageRuntimeRefusesCorruptedPublishedCopy(t *testing.T) {
 	}
 }
 
+// TestStageRuntimeReusesAPublishedBinaryRuntime is #1974, and the shape is the
+// whole defect: writeLauncher publishes a BINARY runtime's launcher as a
+// relative symlink and a SCRIPT runtime's as a generated file, and only the
+// second shape was ever revalidated.
+//
+// The first staging publishes without validating, so it passed. Every REUSE ran
+// publishedMembersDigest over the published tree, whose traversal refuses a
+// symlink at any component, so it returned ELOOP and stageSeatRuntimes
+// published the runtime as the exit-126 unavailable shim - permanently, because
+// the published name is fingerprint-derived and the same root is chosen every
+// time. Measured on this host as claude and kimi unusable for every read-only
+// seat while codex, a node script, kept working.
+//
+// Every other reuse test in this file uses a "#!/bin/sh" source, which is why
+// the reuse path was covered only for the launcher shape that happens to work.
+func TestStageRuntimeReusesAPublishedBinaryRuntime(t *testing.T) {
+	home := t.TempDir()
+	source := filepath.Join(t.TempDir(), "claude")
+	// No shebang: RuntimeInterpreter reports ok=false, so the runtime stages as
+	// a binary and its launcher is a symlink rather than an exec script.
+	if err := os.WriteFile(source, []byte("\x7fELF\x02\x01\x01 not a script\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	first, err := StageRuntime(home, "claude", source)
+	if err != nil {
+		t.Fatalf("first StageRuntime: %v", err)
+	}
+	// PIN THE MECHANISM. If the launcher ever stops being a symlink this test
+	// still passes while covering nothing, so it must say so out loud.
+	info, err := os.Lstat(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("launcher %q has mode %s, want a symlink: this regression covers the symlink-launcher reuse path and a regular launcher no longer exercises it", first, info.Mode())
+	}
+	second, err := StageRuntime(home, "claude", source)
+	if err != nil {
+		t.Fatalf("reusing the published binary runtime: %v", err)
+	}
+	if second != first {
+		t.Fatalf("reuse published a different launcher %q, want the existing %q", second, first)
+	}
+}
+
+// TestStageRuntimeDigestCoversANestedLauncherDirectory bounds the exclusion the
+// fix above introduces. Only the TOP-LEVEL launcher directory is engine
+// metadata; a ".bin" directory that came from the source package is payload and
+// must still be hashed, or a member could be swapped without changing the
+// digest. A nested node_modules/.bin is the ordinary shape of the packaged
+// runtime this engine stages, so the widened exclusion is a live hazard rather
+// than a hypothetical one.
+func TestStageRuntimeDigestCoversANestedLauncherDirectory(t *testing.T) {
+	home := t.TempDir()
+	base := t.TempDir()
+	pkg := filepath.Join(base, "lib", "node_modules", "@openai", "codex")
+	nested := filepath.Join(pkg, "node_modules", launcherDirName)
+	if err := os.MkdirAll(filepath.Join(pkg, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkg, "package.json"), []byte(`{"name":"@openai/codex"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "helper"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(pkg, "bin", "codex.js")
+	if err := os.WriteFile(source, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	staged, err := StageRuntime(home, "codex", source)
+	if err != nil {
+		t.Fatalf("StageRuntime: %v", err)
+	}
+	published, err := StagedRuntimeRoot(home, staged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishedHelper := filepath.Join(published, "node_modules", launcherDirName, "helper")
+	if _, err := os.Stat(publishedHelper); err != nil {
+		t.Fatalf("a nested %s member was not staged, so the packaged runtime is incomplete: %v", launcherDirName, err)
+	}
+	if _, err := StageRuntime(home, "codex", source); err != nil {
+		t.Fatalf("reusing a package that contains a nested %s directory: %v", launcherDirName, err)
+	}
+	// The engine tree is published read-only, so the tamper needs the directory
+	// writable first. This is the operator-corruption case, not a seat one.
+	if err := os.Chmod(filepath.Dir(publishedHelper), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(publishedHelper); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StageRuntime(home, "codex", source); !errors.Is(err, ErrRuntimeNotStageable) {
+		t.Fatalf("removing a nested %s member left the published digest valid (err = %v); the launcher exclusion must apply to the top level only", launcherDirName, err)
+	}
+}
+
 func TestStagedRuntimeRootRefusesAnotherHome(t *testing.T) {
 	firstHome := t.TempDir()
 	command, err := StageUnavailableRuntime(firstHome, "codex")
