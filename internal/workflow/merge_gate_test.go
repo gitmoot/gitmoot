@@ -6620,11 +6620,19 @@ func TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut(t *testing.T) {
 		// the headless objection scan. Two further objection-side sites MUST differ
 		// and are excluded on stated mechanism, not preference:
 		//
-		//   - the at-head BLOCKING scan is preceded by the crashed-reviewer guard,
-		//     which ERRORS on any non-succeeded row at the evaluated head, so
-		//     routing it would add an unreachable silent skip in place of a loud
-		//     error. Probed: routing it passes the whole control set precisely
-		//     BECAUSE the added check is dead, which is not evidence it belongs.
+		//   - the at-head BLOCKING scan is preceded by TWO guards which between them
+		//     admit nothing non-succeeded, so routing it would add an unreachable
+		//     silent skip in place of a loud message. Probed: routing it passes the
+		//     whole control set precisely BECAUSE the added check is dead, which is
+		//     not evidence it belongs. THEY ARE NOT ONE MECHANISM, and the first
+		//     version of this comment wrongly credited one guard with all of it:
+		//     the crashed-reviewer switch takes queued/running (pending) and
+		//     failed/cancelled (error), while BLOCKED has no case there and is
+		//     taken by the unusable-state guard in the slot scan. Deleting the
+		//     switch makes all five states fall through to that guard and still be
+		//     refused - defence in depth, measured, and now pinned per state with
+		//     its reason by
+		//     TestPolicyMergeGateAtHeadStateGuardAdmitsNothingUnsucceeded.
 		//   - the two slot scans decide whether a reviewer's SLOT is filled - a
 		//     fan-out with dispatched children is judged through the children -
 		//     so routing them would change quorum rather than tighten it.
@@ -6691,4 +6699,188 @@ func TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut(t *testing.T) {
 			t.Fatalf("decision=%+v merges=%d, want NO merge: round ordering must refuse this candidate even though the predicate admits it", decision, len(gh.merges))
 		}
 	})
+}
+
+// seedMatrixCandidate inserts a candidate with EXACTLY the head/provenance
+// combination named, so each cell of the four-cell matrix is explicit in the
+// fixture rather than implied by a helper's defaults.
+func seedMatrixCandidate(t *testing.T, store *db.Store, id, agent, headSHA, round string, externallyDriven bool) {
+	t.Helper()
+	encoded, err := marshalPayload(JobPayload{
+		Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+		HeadSHA: headSHA, ReviewRound: round,
+		Result: &AgentResult{Decision: "approved", Summary: "matrix candidate"},
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	job := db.Job{ID: id, Agent: agent, Type: "review", State: string(JobSucceeded), Payload: encoded}
+	event := db.JobEvent{Kind: string(JobSucceeded), Message: "matrix candidate"}
+	if externallyDriven {
+		if err := store.CreateExternallyDrivenJobWithEvent(context.Background(), job, event); err != nil {
+			t.Fatalf("CreateExternallyDrivenJobWithEvent(%s): %v", id, err)
+		}
+	} else if err := store.CreateJobWithEvent(context.Background(), job, event); err != nil {
+		t.Fatalf("CreateJobWithEvent(%s): %v", id, err)
+	}
+	setMergeGateJobTimestamps(t, store, id, "2026-09-01T18:00:00Z")
+}
+
+// TestPolicyMergeGateProvenanceScopeMatrix measures ALL FOUR cells of the
+// head/provenance matrix SIMULTANEOUSLY at one head. F5's fix is a scope
+// NARROWING - provenance applies only to headless rows - and this campaign's
+// signature failure is trading one cell for another: round 7 traded stale-head
+// admission for a bypass, round 9 traded remnant exclusion for the CLI deadlock.
+// Three cells plus an argument is what allowed both. The table is the argument.
+func TestPolicyMergeGateProvenanceScopeMatrix(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		headSHA     string
+		round       string
+		extDriven   bool
+		wantRetired bool
+		why         string
+	}{
+		{
+			name: "cell 1: headless WITHOUT provenance must NOT retire", headSHA: "", round: "", extDriven: false, wantRetired: false,
+			why: "the unattributable engine-inserted remnant; admitting it retires a live objection and then vanishes from the blocking population",
+		},
+		{
+			name: "cell 2: headless WITH provenance MUST retire", headSHA: "", round: "", extDriven: true, wantRetired: true,
+			why: "a session-written approval is a real verdict; refusing it would deadlock every session re-review",
+		},
+		{
+			name: "cell 3: head-bearing MATCHING without provenance MUST retire", headSHA: "head123", round: "", extDriven: false, wantRetired: true,
+			why: "the CLI shape - head always, round never, never externally driven. This is the #1950 P1-A deadlock",
+		},
+		{
+			name: "cell 4: head-bearing NON-matching must NOT retire", headSHA: "stale999", round: "", extDriven: false, wantRetired: false,
+			why: "a verdict about a different commit cannot speak for this head",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, gh, gate, request := newMergeGateQuorumScenario(t)
+			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+				id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
+			})
+			mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+			if _, err := mailbox.OpenExternalJob(ctx, JobRequest{
+				ID: "matrix-objection", Agent: "matrix-reviewer", Action: "review",
+				Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", Sender: "session",
+			}); err != nil {
+				t.Fatalf("OpenExternalJob returned error: %v", err)
+			}
+			if _, err := mailbox.CloseExternalJobWithUsage(ctx, "matrix-objection", AgentResult{
+				Decision: "changes_requested", Severity: reviewseverity.P1, Summary: "session objection",
+			}, 0, "", "", ExternalJobUsage{}); err != nil {
+				t.Fatalf("CloseExternalJobWithUsage returned error: %v", err)
+			}
+			setMergeGateJobTimestamps(t, store, "matrix-objection", "2026-09-01T12:00:00Z")
+
+			seedMatrixCandidate(t, store, "matrix-candidate", "matrix-reviewer", tt.headSHA, tt.round, tt.extDriven)
+
+			if err := store.UpsertTask(ctx, db.Task{
+				ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9", State: string(TaskReadyToMerge),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			request.Reviewer = "audit"
+			request.ExpectedTaskState = string(TaskReadyToMerge)
+
+			decision, evalErr := gate.Evaluate(ctx, request)
+			if evalErr != nil {
+				t.Fatalf("Evaluate returned error: %v", evalErr)
+			}
+			if tt.wantRetired && (!decision.Merged || len(gh.merges) != 1) {
+				t.Fatalf("decision=%+v merges=%d, want the objection RETIRED (one merge): %s", decision, len(gh.merges), tt.why)
+			}
+			if !tt.wantRetired && (decision.Merged || len(gh.merges) != 0) {
+				t.Fatalf("decision=%+v merges=%d, want the objection to SURVIVE (no merge): %s", decision, len(gh.merges), tt.why)
+			}
+		})
+	}
+}
+
+// TestPolicyMergeGateAtHeadStateGuardAdmitsNothingUnsucceeded drives EVERY
+// non-succeeded job state through Evaluate at the evaluated head and asserts
+// WHICH mechanism refuses it.
+//
+// This is the LOAD-BEARING ASSUMPTION behind not routing the at-head blocking
+// scan through the shared predicate. Asserting only "no merge" does not test
+// it: the FIRST version of this test asserted exactly that, passed on all five
+// states, AND STILL PASSED ON ALL FIVE WITH THE CRASHED-REVIEWER GUARD DELETED.
+// It was measuring a backstop, not the guard. Pinning the reason string is what
+// makes each state's refusal attributable to a named mechanism.
+//
+// TWO guards precede the scan, which is the correction this test encodes:
+//
+//   - the crashed-reviewer switch: queued/running -> PENDING, failed/cancelled
+//     -> a crashed-reviewer error.
+//   - the unusable-state guard in the slot scan (merge_gate.go:1200): BLOCKED.
+//     The switch has no JobBlocked case, so attributing blocked to it - as an
+//     earlier version of the census comment did - is wrong.
+//
+// Measured: with the crashed-reviewer switch deleted, all five fall through to
+// the unusable-state guard and are still refused. Defence in depth, so no
+// bypass - but the two mechanisms are distinct and are named separately.
+func TestPolicyMergeGateAtHeadStateGuardAdmitsNothingUnsucceeded(t *testing.T) {
+	for _, tt := range []struct {
+		state      JobState
+		wantReason string
+		mechanism  string
+	}{
+		{JobQueued, "waiting for reviewer", "crashed-reviewer switch, pending arm"},
+		{JobRunning, "waiting for reviewer", "crashed-reviewer switch, pending arm"},
+		{JobFailed, "crashed reviewer", "crashed-reviewer switch, error arm"},
+		{JobCancelled, "crashed reviewer", "crashed-reviewer switch, error arm"},
+		{JobBlocked, "has unusable job state", "unusable-state guard in the slot scan, NOT the switch"},
+	} {
+		t.Run(string(tt.state), func(t *testing.T) {
+			ctx := context.Background()
+			store, gh, gate, request := newMergeGateQuorumScenario(t)
+			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+				id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
+			})
+			// An APPROVED result in a non-succeeded state is the dangerous
+			// direction: a row that could be mistaken for a verdict satisfying the
+			// gate. It carries the evaluated head so it lands in the at-head
+			// population these guards are responsible for.
+			encoded, err := marshalPayload(JobPayload{
+				Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", HeadSHA: "head123",
+				Result: &AgentResult{Decision: "approved", Summary: "unsucceeded at-head row"},
+			})
+			if err != nil {
+				t.Fatalf("marshalPayload: %v", err)
+			}
+			if err := store.CreateJobWithEvent(ctx, db.Job{
+				ID: "unsucceeded-at-head", Agent: "state-reviewer", Type: "review",
+				State: string(tt.state), Payload: encoded,
+			}, db.JobEvent{Kind: string(tt.state), Message: "at-head row"}); err != nil {
+				t.Fatalf("CreateJobWithEvent: %v", err)
+			}
+			setMergeGateJobTimestamps(t, store, "unsucceeded-at-head", "2026-09-01T18:00:00Z")
+
+			if err := store.UpsertTask(ctx, db.Task{
+				ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9", State: string(TaskReadyToMerge),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			request.Reviewer = "audit"
+			request.ExpectedTaskState = string(TaskReadyToMerge)
+
+			decision, evalErr := gate.Evaluate(ctx, request)
+			if evalErr != nil {
+				t.Fatalf("Evaluate returned error: %v", evalErr)
+			}
+			if decision.Merged || len(gh.merges) != 0 {
+				t.Fatalf("state %s reached a MERGE: decision=%+v merges=%d. The at-head blocking scan is exempt from the shared predicate ONLY because these guards admit nothing non-succeeded; this state slipped past, so that exemption is a live bypass (#1950 arm 2)",
+					tt.state, decision, len(gh.merges))
+			}
+			if rendered := decision.Reason.Render(); !strings.Contains(rendered, tt.wantReason) {
+				t.Fatalf("state %s refused with reason %q, want it to contain %q (%s). A refusal by the WRONG mechanism means the guard this exemption cites is not the one doing the work (#1950 arm 2)",
+					tt.state, rendered, tt.wantReason, tt.mechanism)
+			}
+		})
+	}
 }
