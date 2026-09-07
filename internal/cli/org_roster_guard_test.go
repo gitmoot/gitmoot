@@ -144,6 +144,12 @@ func TestOrgConfigMethodSetIsPinned(t *testing.T) {
 		"RecycleEnforce",
 		"Role",
 		"Roots",
+		// WakeCoalesceHold is a scalar policy read, the same shape as the
+		// DirectiveAckTTL/DirectiveDoneTTL accessors above. It exposes one
+		// duration and no role membership, so the single-choke-point policy
+		// (#1635) is untouched: ResolveOrgRoster remains the only way to
+		// enumerate roles (#1978).
+		"WakeCoalesceHold",
 	}
 	typ := reflect.TypeOf(config.OrgConfig{})
 	got := make([]string, 0, typ.NumMethod())

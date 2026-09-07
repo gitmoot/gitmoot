@@ -9,16 +9,27 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 const (
-	// replyWakeCoalescingWindow is long enough to absorb a burst of separate
-	// short-lived `org escalate` processes while keeping the daemon-tick wake
-	// latency small. Rolling windows start at the oldest pending item.
-	replyWakeCoalescingWindow  = 5 * time.Second
+	// replyWakeCoalescingWindow is the DEFAULT hold, overridable by
+	// [org].wake_coalesce_hold. It absorbs a burst of separate short-lived
+	// `org escalate` processes and, since the owner decision of 2026-09-07,
+	// deliberately trades up to five minutes of wake latency for a measured
+	// 32.1% fewer interrupts on this fleet's own arrival history.
+	//
+	// IT IS A HOLD ON THE OLDEST PENDING ROW, NOT A LIMIT ON BATCH MEMBERSHIP
+	// (#1978). It used to be both: a row created more than one window after
+	// the batch anchor started a SECOND rolling window and therefore a second
+	// wake, even though both rows were pending at the same drain and shared one
+	// coalesce_key. Measured on this box's live store, 8,464 attempted rows were
+	// delivered as 8,091 wakes, so 92.8% of delivery attempts carried exactly
+	// one row while same-key arrivals were 5 seconds to 5 minutes apart.
+	replyWakeCoalescingWindow  = config.DefaultWakeCoalesceHold
 	replyWakeMaxCoalescedItems = 10
 	// A synchronous reply wake gets one 12s Herdr call plus bounded probes and
 	// its terminal store write. Thirty seconds leaves margin for a live owner;
@@ -35,7 +46,13 @@ type replyWakeDeliveryResolver func(context.Context) (replyWakeDelivery, error)
 
 type replyWakeOutboxHealth struct {
 	pending int
-	inert   int
+	// held counts deliverable rows still inside their coalescing hold. They are
+	// SEPARATE from pending because they are waiting BY DESIGN, and with a
+	// 300s default hold nearly every tick observes one (#1978/#1979). Counting
+	// them as an outstanding obligation turned "drain unhealthy" from a real
+	// diagnostic into a line the daemon prints most minutes.
+	held  int
+	inert int
 	// routeRemoved means a durable tombstone proves that a matching rule was
 	// deleted after the pending row existed.
 	routeRemoved  int
@@ -44,8 +61,9 @@ type replyWakeOutboxHealth struct {
 
 func (h replyWakeOutboxHealth) String() string {
 	return fmt.Sprintf(
-		"pending=%d inert=%d route_removed=%d aged_attempted=%d",
+		"pending=%d held=%d inert=%d route_removed=%d aged_attempted=%d",
 		h.pending,
+		h.held,
 		h.inert,
 		h.routeRemoved,
 		h.agedAttempted,
@@ -60,16 +78,24 @@ func (h replyWakeOutboxHealth) String() string {
 type wakeOutboxStore interface {
 	ListWakeOutboxObligations(ctx context.Context, attemptedBefore time.Time) (db.WakeOutboxObligationProjection, error)
 	ExpireAgedWakeOutbox(ctx context.Context, attemptedBefore time.Time, now time.Time) ([]db.WakeOutboxEntry, error)
-	ClaimWakeOutbox(ctx context.Context, ids []int64, now time.Time) (bool, error)
+	ClaimWakeOutbox(ctx context.Context, surviving int64, coalesced []int64, now time.Time) (bool, error)
 	ListDeletedEventRulesForRoutes(ctx context.Context, routes []db.EventRuleRoute) ([]db.DeletedEventRule, error)
 }
 
 // drainReplyWakeOutboxWithHealth is a store-global daemon operation. It
 // deliberately reads durable work before resolving delivery: unreadable outbox
 // state and an empty outbox therefore cannot collapse into the same result.
-func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, now time.Time, resolve replyWakeDeliveryResolver) (replyWakeOutboxHealth, error) {
+//
+// `hold` is how long a pending group waits after its OLDEST row before the
+// whole due group is delivered as one wake. A non-positive value falls back to
+// the default rather than delivering with no hold at all, so a misread config
+// cannot turn every burst back into one wake per note.
+func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, now time.Time, hold time.Duration, resolve replyWakeDeliveryResolver) (replyWakeOutboxHealth, error) {
 	if store == nil {
 		return replyWakeOutboxHealth{}, errors.New("wake outbox store is required")
+	}
+	if hold <= 0 {
+		hold = replyWakeCoalescingWindow
 	}
 	attemptedBefore := now.UTC().Add(-replyWakeAttemptedUnknownAfter)
 	obligations, err := store.ListWakeOutboxObligations(ctx, attemptedBefore)
@@ -124,23 +150,19 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 			if err != nil {
 				return replyWakeOutboxHealth{}, fmt.Errorf("parse wake outbox created_at for row %d: %w", items[start].ID, err)
 			}
-			deadline := startedAt.Add(replyWakeCoalescingWindow)
-			end := start + 1
-			for end < len(items) && end-start < replyWakeMaxCoalescedItems {
-				createdAt, err := time.Parse(time.RFC3339Nano, items[end].CreatedAt)
-				if err != nil {
-					return replyWakeOutboxHealth{}, fmt.Errorf("parse wake outbox created_at for row %d: %w", items[end].ID, err)
-				}
-				if !createdAt.Before(deadline) {
-					break
-				}
-				end++
-			}
+			deadline := startedAt.Add(hold)
 			if now.UTC().Before(deadline) {
-				// Later rows for the same rolling group cannot be due before its
-				// oldest row, so leave the whole tail pending for a future tick.
+				// Later rows for the same group cannot be due before its oldest
+				// row, so leave the whole tail pending for a future tick.
 				break
 			}
+			// EVERY DUE PENDING ROW FOR THIS KEY JOINS THE BATCH, capped only by
+			// replyWakeMaxCoalescedItems (#1978). The anchor's hold above has
+			// already elapsed, and a newer row's own hold cannot matter: it is
+			// carried by a wake this drain is emitting anyway, so including it
+			// only removes a later interrupt. The batch event still names every
+			// member's retrieval command, so collapsing loses no note.
+			end := min(start+replyWakeMaxCoalescedItems, len(items))
 
 			batch := items[start:end]
 			event, err := wakeOutboxEvent(batch, now)
@@ -168,13 +190,17 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 			for _, entry := range batch {
 				ids = append(ids, entry.ID)
 			}
-			claimed, err := store.ClaimWakeOutbox(ctx, ids, now)
+			// The oldest row SURVIVES as the delivered obligation: it is the one
+			// wakeOutboxEvent identifies as `oldest id`. The rest are recorded
+			// superseded into it rather than each reporting an independent
+			// delivery they never had (#1978).
+			claimed, err := store.ClaimWakeOutbox(ctx, ids[0], ids[1:], now)
 			if err != nil {
 				return replyWakeOutboxHealth{}, err
 			}
 			if claimed {
 				mutated = true
-				event.WakeOutboxIDs = ids
+				event.WakeOutboxIDs = ids[:1]
 				if err := emitReplyWakeOutboxEvent(ctx, delivery.sink, event, matchingRules); err != nil {
 					return replyWakeOutboxHealth{}, fmt.Errorf("emit claimed %s wake: %w", event.WakeKind, err)
 				}
@@ -183,26 +209,28 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 		}
 	}
 	if mutated {
-		return wakeOutboxObligationHealth(ctx, store, attemptedBefore, resolve)
+		return wakeOutboxObligationHealth(ctx, store, attemptedBefore, now, hold, resolve)
 	}
 	// The #1200/#1201 contract is untouched by the reuse: an unreadable outbox
 	// already returned its error above, so only a SUCCESSFUL read can reach
 	// here, and an empty one returned early. Reuse therefore never turns "could
 	// not read" into "nothing to do".
-	return classifyWakeOutboxObligations(ctx, store, obligations, attemptedBefore, resolve)
+	return classifyWakeOutboxObligations(ctx, store, obligations, attemptedBefore, now, hold, resolve)
 }
 
 func wakeOutboxObligationHealth(
 	ctx context.Context,
 	store wakeOutboxStore,
 	attemptedBefore time.Time,
+	now time.Time,
+	hold time.Duration,
 	resolve replyWakeDeliveryResolver,
 ) (replyWakeOutboxHealth, error) {
 	obligations, err := store.ListWakeOutboxObligations(ctx, attemptedBefore)
 	if err != nil {
 		return replyWakeOutboxHealth{}, fmt.Errorf("read wake outbox obligations: %w", err)
 	}
-	return classifyWakeOutboxObligations(ctx, store, obligations, attemptedBefore, resolve)
+	return classifyWakeOutboxObligations(ctx, store, obligations, attemptedBefore, now, hold, resolve)
 }
 
 // classifyWakeOutboxObligations grades an ALREADY-READ obligation projection.
@@ -214,6 +242,8 @@ func classifyWakeOutboxObligations(
 	store wakeOutboxStore,
 	obligations db.WakeOutboxObligationProjection,
 	attemptedBefore time.Time,
+	now time.Time,
+	hold time.Duration,
 	resolve replyWakeDeliveryResolver,
 ) (replyWakeOutboxHealth, error) {
 	health := replyWakeOutboxHealth{agedAttempted: len(obligations.AgedAttempted)}
@@ -243,6 +273,17 @@ func classifyWakeOutboxObligations(
 			return replyWakeOutboxHealth{}, fmt.Errorf("classify wake outbox row %d: %w", obligation.ID, err)
 		}
 		if len(matchingWakeRules(delivery.rules, event)) > 0 {
+			createdAt, err := time.Parse(time.RFC3339Nano, obligation.CreatedAt)
+			if err != nil {
+				return replyWakeOutboxHealth{}, fmt.Errorf("parse wake outbox created_at for row %d: %w", obligation.ID, err)
+			}
+			// A deliverable row inside its hold is WAITING, not outstanding: the
+			// next due tick delivers it, and with a 300s hold this is the normal
+			// state of the outbox rather than a fault (#1978).
+			if hold > 0 && now.UTC().Before(createdAt.Add(hold)) {
+				health.held++
+				continue
+			}
 			health.pending++
 			continue
 		}

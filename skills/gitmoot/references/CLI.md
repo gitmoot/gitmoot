@@ -1918,9 +1918,14 @@ over the pane's last `idle` or `working` activity status.
 rows commit atomically with their source note.
 Blocked and escalation rows are persisted synchronously by the event sink after
 the source transition; an insert failure is logged but cannot roll back the
-emitting job. The daemon coalesces a rolling five-second window per event kind
-and role. Reply prompts carry `N new items, oldest id X`; blocked and escalation
-events retain their redacted event detail. Different event kinds never share a
+emitting job. The daemon holds each pending group for `[org].wake_coalesce_hold`
+(default `5m`) after its
+oldest row, then delivers every due pending row for that event kind and role as
+one wake, bounded at ten rows per wake. Reply prompts carry `N new items,
+oldest id X` and a retrieval command for each collapsed row; blocked and
+escalation events retain their redacted event detail. The row the wake names
+records the delivery outcome and each row it collapses is recorded `superseded`
+with `coalesced into wake outbox row <id>`. Different event kinds never share a
 coalescing key, and a later tick flushes a quiet tail without another event.
 Rules default to `--scope addressed`: an addressed rule is eligible only when
 the event names a target role and that role matches `--wake`.

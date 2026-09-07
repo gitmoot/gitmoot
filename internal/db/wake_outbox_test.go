@@ -333,7 +333,7 @@ func TestWakeOutboxClaimAndFinishStatesAreQueryable(t *testing.T) {
 		t.Fatalf("pending = %+v, err=%v", pending, err)
 	}
 	now := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
-	claimed, err := store.ClaimWakeOutbox(ctx, []int64{pending[0].ID}, now)
+	claimed, err := store.ClaimWakeOutbox(ctx, pending[0].ID, nil, now)
 	if err != nil || !claimed {
 		t.Fatalf("ClaimWakeOutbox = %v, %v", claimed, err)
 	}
@@ -364,7 +364,7 @@ func TestExpireAgedWakeOutboxRecordsDeliveryUnknownWithoutRetry(t *testing.T) {
 		t.Fatalf("pending = %+v, err=%v", pending, err)
 	}
 	attemptedAt := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
-	claimed, err := store.ClaimWakeOutbox(ctx, []int64{pending[0].ID}, attemptedAt)
+	claimed, err := store.ClaimWakeOutbox(ctx, pending[0].ID, nil, attemptedAt)
 	if err != nil || !claimed {
 		t.Fatalf("claim = %v, err=%v", claimed, err)
 	}
