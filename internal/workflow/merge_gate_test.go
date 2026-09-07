@@ -5958,12 +5958,21 @@ func TestPolicyMergeGateAllowsAnActingRoleSessionObjectionToBeSuperseded(t *test
 				id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
 			})
 			if tt.noIdentity {
-				// NOT through OpenExternalJob: that writer REFUSES a row with neither
-				// agent nor acting role - "job agent or acting org role is required" -
-				// so the no-identity shape is unreachable through the session path and
-				// pretending otherwise would be a fiction. It IS reachable as an
-				// engine-inserted row that records a round and no author, so that is
-				// the shape asserted here.
+				// THIS ARM IS A DEFENSIVE INVARIANT, NOT PRODUCTION-WRITER COVERAGE, and
+				// the previous comment here overclaimed by calling the row "reachable".
+				// #1950 F3 is right: no supported writer can produce Type=review with a
+				// round, an empty Agent AND an empty ActingOrgRole. OpenExternalJob
+				// refuses it outright - pinned by
+				// TestOpenExternalJobRefusesAReviewWithNeitherAgentNorActingRole below -
+				// and every ordinary engine, CLI, daemon, pipeline, delegation and retry
+				// insert goes through Mailbox validation, which requires an agent.
+				//
+				// It is asserted anyway because the gate must FAIL CLOSED on a row it
+				// cannot attribute, whatever produced it: a legacy row from before that
+				// validation, a corrupted payload, or a future writer nobody has
+				// enumerated. insertCompletedJob deliberately bypasses the validators to
+				// construct that state, which is exactly why this is labelled a
+				// corruption/legacy invariant rather than evidence about production.
 				insertCompletedJob(t, store, db.Job{ID: "session-role-objection", Agent: "", Type: "review"}, JobPayload{
 					Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", ReviewRound: "review-1",
 					Result: &AgentResult{Decision: "changes_requested", Severity: reviewseverity.P1, Summary: "authorless objection"},
