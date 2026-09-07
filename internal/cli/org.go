@@ -124,6 +124,8 @@ func runOrg(args []string, stdout, stderr io.Writer) int {
 		return runOrgAwait(args[1:], stdout, stderr)
 	case "events":
 		return runOrgEvents(args[1:], stdout, stderr)
+	case "interrupts":
+		return runOrgInterrupts(args[1:], stdout, stderr)
 	case "seat":
 		return runOrgSeat(args[1:], stdout, stderr)
 	default:
@@ -156,6 +158,7 @@ func printOrgUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org events rule list [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org events rule set-scope [--home DIR] ID observer|addressed")
 	fmt.Fprintln(w, "  gitmoot org events rule rm [--home DIR] ID")
+	fmt.Fprintln(w, "  gitmoot org interrupts [--window 24h|7d|0] [--json] [--home DIR]")
 }
 
 var orgSeatDefaultRouteKinds = []string{"blocked", "directive", "escalation", "fact", "reply"}

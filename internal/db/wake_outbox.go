@@ -656,8 +656,12 @@ func execWakeOutboxRowUpdate(ctx context.Context, tx *sql.Tx, query string, args
 // names the row that delivered on its behalf, so the saving is countable:
 // `SELECT count(*) FROM wake_outbox WHERE last_error LIKE 'coalesced into%'`.
 func WakeOutboxCoalescedDetail(surviving int64) string {
-	return "coalesced into wake outbox row " + strconv.FormatInt(surviving, 10)
+	return wakeOutboxCoalescedPrefix + strconv.FormatInt(surviving, 10)
 }
+
+// wakeOutboxCoalescedPrefix is the stable prefix a report matches on to count
+// suppressed wakes without re-deriving the sentence (#1983).
+const wakeOutboxCoalescedPrefix = "coalesced into wake outbox row "
 
 // FinishWakeOutbox records the observed delivery outcome for one attempted
 // batch. ids[0] is the SURVIVING row, the one the emitted wake identifies.
