@@ -3,9 +3,14 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gitmoot/gitmoot/internal/config"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
@@ -300,4 +305,209 @@ func TestRefuseUnavailableOrgRoleClearsAnExpiredRowWhateverTheRuntime(t *testing
 	if err != nil || len(rows) != 0 {
 		t.Fatalf("active rows after expiry = %+v err=%v, want none", rows, err)
 	}
+}
+
+// subscribeShellAskAgent registers a shell-runtime agent whose session script
+// returns a terminal approved result, so an `agent ask` dispatch through the
+// real path can reach success rather than stalling on delivery.
+func subscribeShellAskAgent(t *testing.T, home, name, repo string) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "subscribe", name,
+		"--home", home,
+		"--runtime", "shell",
+		"--session", unavailableRuntimeShellScript,
+		"--role", "review",
+		"--repo", repo,
+		"--capability", "ask",
+		"--policy", "workspace-write",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent subscribe %s exit=%d stderr=%q", name, code, stderr.String())
+	}
+}
+
+// TestLocalAgentDispatchScopesRoleUnavailabilityToTheSelectedRuntime is the test
+// arm for the agent_dispatch.go callsite (#1641, authorised in 126292). It drives
+// the REAL `agent ask --org-role` path — dispatchLocalAgentJob — rather than the
+// refusal helper, so a routing mutant that left this path refusing role-wide
+// cannot pass it. The two subtests differ ONLY in which runtime the wall names.
+func TestLocalAgentDispatchScopesRoleUnavailabilityToTheSelectedRuntime(t *testing.T) {
+	setup := func(t *testing.T, walledRuntime string) (string, config.Paths) {
+		t.Helper()
+		home, paths := setupQuotaUnavailableOrgHome(t)
+		subscribeShellAskAgent(t, home, "asker", "gitmoot/gitmoot")
+		checkout := t.TempDir()
+		runGit(t, checkout, "init")
+		runGit(t, checkout, "branch", "-m", "main")
+		runGit(t, checkout, "remote", "add", "origin", "https://github.com/gitmoot/gitmoot.git")
+		if err := os.WriteFile(filepath.Join(checkout, "README.md"), []byte("test\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, checkout, "add", "README.md")
+		runGit(t, checkout, "-c", "user.name=Gitmoot Test", "-c", "user.email=gitmoot@example.com", "commit", "-m", "initial")
+		withWorkingDirectory(t, checkout)
+
+		store, err := dbtest.Open(t, paths.Database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC()
+		if err := store.UpsertOrgRoleUnavailableForRuntime(context.Background(), "review", walledRuntime, "quota", now.Add(time.Hour), now); err != nil {
+			store.Close()
+			t.Fatal(err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return home, paths
+	}
+
+	t.Run("another runtime is walled so the dispatch proceeds", func(t *testing.T) {
+		home, _ := setup(t, "claude")
+		var stdout, stderr bytes.Buffer
+		code := Run([]string{
+			"agent", "ask", "asker", "what is the state of the repo?",
+			"--home", home, "--repo", "gitmoot/gitmoot", "--org-role", "review", "--json",
+		}, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("claude wall refused a shell agent dispatch: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+		}
+		if strings.Contains(stderr.String(), "dispatch refused") {
+			t.Fatalf("cross-runtime dispatch reported a refusal: stderr=%q", stderr.String())
+		}
+		var output localAgentJobOutput
+		if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
+			t.Fatalf("parse ask output %q: %v", stdout.String(), err)
+		}
+		if output.State != string(workflow.JobSucceeded) {
+			t.Fatalf("ask state = %q, want succeeded", output.State)
+		}
+	})
+
+	t.Run("the selected runtime is walled so the dispatch is refused", func(t *testing.T) {
+		home, paths := setup(t, runtime.ShellRuntime)
+		var stdout, stderr bytes.Buffer
+		code := Run([]string{
+			"agent", "ask", "asker", "what is the state of the repo?",
+			"--home", home, "--repo", "gitmoot/gitmoot", "--org-role", "review", "--json",
+		}, &stdout, &stderr)
+		if code == 0 || !strings.Contains(stderr.String(), `org role "review" is unavailable`) ||
+			!strings.Contains(stderr.String(), "dispatch refused") {
+			t.Fatalf("same-runtime dispatch not refused: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+		}
+		store, err := dbtest.Open(t, paths.Database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		if jobs, err := store.ListJobs(context.Background()); err != nil || len(jobs) != 0 {
+			t.Fatalf("jobs after a refused dispatch = %+v err=%v, want none", jobs, err)
+		}
+	})
+}
+
+// TestRunTaskRunScopesRoleUnavailabilityToTheOwnersRuntime is the test arm for
+// the workflow.go callsite. `task run` has no --runtime flag, so the owner
+// agent's runtime IS the selection. The refused half asserts exactly what the
+// pre-existing TestRunTaskRunRefusesUnavailableRoleBeforeWorktreeAllocation
+// asserts; the proceeding half asserts the same facts inverted, so the pair is
+// directly comparable rather than differently shaped.
+func TestRunTaskRunScopesRoleUnavailabilityToTheOwnersRuntime(t *testing.T) {
+	setup := func(t *testing.T, walledRuntime string) (string, config.Paths) {
+		t.Helper()
+		home, paths := setupQuotaUnavailableOrgHome(t)
+		goalPath := filepath.Join(t.TempDir(), "GOAL.md")
+		if err := os.WriteFile(goalPath, []byte("# Build Gitmoot\n\n### Task 1: Bootstrap\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var stdout, stderr bytes.Buffer
+		if code := Run([]string{"goal", "import", "--home", home, "--file", goalPath, "--repo", "gitmoot/gitmoot"}, &stdout, &stderr); code != 0 {
+			t.Fatalf("goal import code=%d stderr=%q", code, stderr.String())
+		}
+		subscribeShellImplementAgent(t, home, "lead", "gitmoot/gitmoot")
+		checkout := t.TempDir()
+		runGit(t, checkout, "init")
+		runGit(t, checkout, "branch", "-m", "main")
+		runGit(t, checkout, "remote", "add", "origin", "https://github.com/gitmoot/gitmoot.git")
+		if err := os.WriteFile(filepath.Join(checkout, "README.md"), []byte("test\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, checkout, "add", "README.md")
+		runGit(t, checkout, "-c", "user.name=Gitmoot Test", "-c", "user.email=gitmoot@example.com", "commit", "-m", "initial")
+		withWorkingDirectory(t, checkout)
+
+		store, err := dbtest.Open(t, paths.Database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC()
+		if err := store.UpsertOrgRoleUnavailableForRuntime(context.Background(), "review", walledRuntime, "quota", now.Add(time.Hour), now); err != nil {
+			store.Close()
+			t.Fatal(err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return home, paths
+	}
+
+	t.Run("another runtime is walled so task run proceeds", func(t *testing.T) {
+		home, paths := setup(t, "claude")
+		var stdout, stderr bytes.Buffer
+		Run([]string{
+			"task", "run", "task-001", "--home", home, "--repo", "gitmoot/gitmoot",
+			"--owner", "lead", "--org-role", "review",
+		}, &stdout, &stderr)
+		if strings.Contains(stderr.String(), "dispatch refused") {
+			t.Fatalf("claude wall refused a shell owner's task run: stderr=%q", stderr.String())
+		}
+		store, err := dbtest.Open(t, paths.Database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		// The pre-existing refusal test asserts the task is untouched and no job
+		// exists. Under a wall on a DIFFERENT runtime both must have happened.
+		task, err := store.GetTask(context.Background(), "task-001")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.TrimSpace(task.WorktreePath) == "" {
+			t.Fatalf("task never allocated a worktree, so the dispatch did not proceed: %+v", task)
+		}
+		jobs, err := store.ListJobs(context.Background())
+		if err != nil || len(jobs) == 0 {
+			t.Fatalf("jobs after a proceeding task run = %+v err=%v, want at least one", jobs, err)
+		}
+	})
+
+	t.Run("the owner's runtime is walled so task run is refused", func(t *testing.T) {
+		home, paths := setup(t, runtime.ShellRuntime)
+		var stdout, stderr bytes.Buffer
+		code := Run([]string{
+			"task", "run", "task-001", "--home", home, "--repo", "gitmoot/gitmoot",
+			"--owner", "lead", "--org-role", "review",
+		}, &stdout, &stderr)
+		if code != 1 || !strings.Contains(stderr.String(), `org role "review" is unavailable`) ||
+			!strings.Contains(stderr.String(), "dispatch refused") {
+			t.Fatalf("task run on the walled runtime: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+		}
+		store, err := dbtest.Open(t, paths.Database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		task, err := store.GetTask(context.Background(), "task-001")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if task.State != string(workflow.TaskPlanned) || strings.TrimSpace(task.WorktreePath) != "" {
+			t.Fatalf("task mutated before the refusal: %+v", task)
+		}
+		if jobs, err := store.ListJobs(context.Background()); err != nil || len(jobs) != 0 {
+			t.Fatalf("jobs after a refused task run = %+v err=%v, want none", jobs, err)
+		}
+	})
 }
