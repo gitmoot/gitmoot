@@ -253,7 +253,25 @@ func TestEngineReturnsChangesRequestedToRequesterWithoutDefaultAutoFix(t *testin
 	}
 }
 
-func TestEngineEmitsSubthresholdReviewVerdictAsApproved(t *testing.T) {
+// #1945 SUPERSEDES THIS TEST'S ORIGINAL EXPECTATION, and it was named
+// TestEngineEmitsSubthresholdReviewVerdictAsApproved when it asserted the
+// opposite. It pinned the emitted wake decision for a recorded
+// changes_requested whose severity is below the repository bar, and it required
+// "approved". That is the defect #1945 records: the wake told a coordinator
+// approved for a job row that says changes_requested, measured twice on #1943.
+//
+// IT NOW ASSERTS BOTH HALVES, which is what the old version could not
+// distinguish and why the defect hid behind it:
+//   - the GATE transform is unchanged. A sub-threshold changes_requested still
+//     resolves to "approved" through effectiveReviewDecisionForPayload, because
+//     a below-bar finding must not block a merge. That is correct and untouched
+//     by #1945; review_threshold.go is not modified.
+//   - the WAKE announces the RECORDED reviewer decision, because a human
+//     notification is not a merge decision.
+//
+// So the sub-threshold behaviour still has a test; only the notification value
+// moved, and this test now fails if either half regresses.
+func TestEngineEmitsSubthresholdReviewVerdictWithRecordedDecision(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
@@ -274,7 +292,7 @@ func TestEngineEmitsSubthresholdReviewVerdictAsApproved(t *testing.T) {
 	engine.EventSink = sink
 	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
 
-	engine.mailbox().emitTerminal(ctx, "review-45", JobSucceeded, JobPayload{
+	payload := JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		Branch:      "task-45",
 		PullRequest: 45,
@@ -283,14 +301,23 @@ func TestEngineEmitsSubthresholdReviewVerdictAsApproved(t *testing.T) {
 			Severity: reviewseverity.P2,
 			Summary:  "non-blocking polish",
 		},
-	})
+	}
+
+	// HALF ONE, the gate: still folds below the bar. If this ever stops being
+	// "approved" the merge gate's behaviour changed, which is NOT this issue.
+	if got := effectiveReviewDecisionForPayload(payload, reviewseverity.P1); got != "approved" {
+		t.Fatalf("gate decision for a sub-threshold verdict = %q, want approved; review_threshold.go must be unchanged by #1945", got)
+	}
+
+	engine.mailbox().emitTerminal(ctx, "review-45", JobSucceeded, payload)
 
 	finished := sink.byType(events.EventJobFinished)
 	if len(finished) != 1 {
 		t.Fatalf("job.finished emissions = %d, want 1; all=%+v", len(finished), sink.snapshot())
 	}
-	if got := finished[0].ReviewDecision; got != "approved" {
-		t.Fatalf("sub-threshold review decision = %q, want approved", got)
+	// HALF TWO, the wake: announces what the reviewer recorded.
+	if got := finished[0].ReviewDecision; got != "changes_requested" {
+		t.Fatalf("sub-threshold wake decision = %q, want changes_requested: the notification must carry the RECORDED verdict (#1945)", got)
 	}
 }
 
