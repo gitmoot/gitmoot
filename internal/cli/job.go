@@ -1140,7 +1140,12 @@ func runJobRun(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return err
 		}
-		if err := refuseUnavailableOrgRole(context.Background(), store, payload.ActingOrgRole, time.Now().UTC()); err != nil {
+		// #1641: refuse only when the walled runtime is the one this job will run
+		// as. selectedJobDispatchRuntime mirrors the claiming worker's own
+		// resolution (stored agent, then the payload override); an unresolvable
+		// agent yields "" and fails closed inside refuseUnavailableOrgRole.
+		if err := refuseUnavailableOrgRole(context.Background(), store, payload.ActingOrgRole,
+			selectedJobDispatchRuntime(context.Background(), store, job, payload), time.Now().UTC()); err != nil {
 			return err
 		}
 		worker := defaultJobWorker(store, stdout, *home)

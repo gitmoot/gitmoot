@@ -458,6 +458,13 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 		if err := ensureLocalAgentAccess(context.Background(), store, agent, requestRepo, "implement"); err != nil {
 			return err
 		}
+		// #1641: `task run` has no --runtime flag, so the owner agent's runtime IS
+		// the selected runtime. Refused here rather than at the --org-role ingress
+		// above because the owner is only known now, and still before any worktree
+		// or branch-lock allocation below.
+		if err := refuseUnavailableOrgRole(context.Background(), store, *orgRole, agent.Runtime, time.Now().UTC()); err != nil {
+			return err
+		}
 		checkout := repoRecord.CheckoutPath
 		requestBranch := firstNonEmpty(*branch, task.Branch, task.ID)
 		if strings.TrimSpace(task.WorktreePath) != "" {

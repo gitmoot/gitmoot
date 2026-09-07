@@ -2082,13 +2082,20 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 		if queuedJobBlockerHeld(job, time.Now().UTC()) {
 			continue
 		}
-		// Provider-declared role unavailability (#1136): all queued work attributed
-		// to that role is held until the reset boundary. ListActive... excludes
+		// Provider-declared role unavailability (#1136): queued work attributed to
+		// that role is held until the reset boundary. ListActive... excludes
 		// expired rows (the one-minute sweep removes them), so stale incidents
 		// never suppress dispatch.
+		//
+		// #1641: the hold is runtime-scoped. This is the LIVE half of that defect —
+		// a claude quota row held every queued job of the role, including codex and
+		// kimi work that had no wall. The agent lookup runs only for a job whose
+		// role is actually walled, so the common path stays the map lookup it was.
 		if payload, payloadErr := daemonJobPayload(job); payloadErr == nil {
-			if _, unavailable := unavailableRoles[strings.ToLower(strings.TrimSpace(payload.ActingOrgRole))]; unavailable {
-				continue
+			if row, unavailable := unavailableRoles[strings.ToLower(strings.TrimSpace(payload.ActingOrgRole))]; unavailable {
+				if orgRoleUnavailableRefusesRuntime(row, selectedJobDispatchRuntime(ctx, worker.Store, job, payload)) {
+					continue
+				}
 			}
 		}
 		// Auth-probe gate (#532 slice B): once a runtime_auth deferral's coarse hold

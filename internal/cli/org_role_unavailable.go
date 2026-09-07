@@ -192,7 +192,57 @@ func unavailableRoleDispatchError(incident db.OrgRoleUnavailable) error {
 		incident.Role, incident.Reason, formatOrgRoleUnavailableUntil(incident.Until))
 }
 
-func refuseUnavailableOrgRole(ctx context.Context, store *db.Store, role string, now time.Time) error {
+// knownRuntimeName reports whether name resolves to a real runtime adapter.
+// This is the same test the per-job --runtime override validation uses
+// (resolveJobRuntimeOverride), so an unrecognized stored or selected runtime is
+// classified identically at both ends.
+func knownRuntimeName(name string) bool {
+	if strings.TrimSpace(name) == "" {
+		return false
+	}
+	_, err := (runtime.Factory{}).Adapter(strings.ToLower(strings.TrimSpace(name)))
+	return err == nil
+}
+
+// orgRoleUnavailableRefusesRuntime decides whether an ACTIVE incident row bars a
+// dispatch whose selected runtime is selectedRuntime (#1641).
+//
+// The row is written per-runtime (UpsertOrgRoleUnavailableForRuntime) because a
+// provider wall is a property of one provider, not of the role: a claude quota
+// wall says nothing about codex or kimi. Enforcement must therefore compare the
+// row's runtime against the runtime this dispatch will ACTUALLY use.
+//
+// FAIL CLOSED, in both directions:
+//   - An empty stored runtime keeps its pre-#1641 whole-role meaning. It is not a
+//     corrupt value: UpsertOrgRoleUnavailable still writes "", and the runtime
+//     column was added by ALTER TABLE ... DEFAULT ” (#1490), so every row
+//     predating runtime attribution is legitimately unattributed.
+//   - An unrecognized stored runtime is corrupt, and corruption is not permission
+//     to dispatch.
+//   - An empty or unrecognized SELECTED runtime means the caller could not say
+//     what this job will run as, so it cannot claim to be a different runtime.
+func orgRoleUnavailableRefusesRuntime(incident db.OrgRoleUnavailable, selectedRuntime string) bool {
+	stored := strings.ToLower(strings.TrimSpace(incident.Runtime))
+	if !knownRuntimeName(stored) {
+		return true
+	}
+	selected := strings.ToLower(strings.TrimSpace(selectedRuntime))
+	if !knownRuntimeName(selected) {
+		return true
+	}
+	return stored == selected
+}
+
+// refuseUnavailableOrgRole refuses a dispatch only when the role's active
+// incident belongs to the runtime this dispatch actually selected. Callers must
+// pass the runtime from their own final resolution — the value the job will run
+// as, overrides included — never the registered agent's default when an override
+// is in play.
+//
+// The store read is unconditional so its eager expiry of a stale row (and
+// #1490's fail-closed error on a malformed until) still happens for every
+// dispatch, whatever the runtime decision turns out to be.
+func refuseUnavailableOrgRole(ctx context.Context, store *db.Store, role, selectedRuntime string, now time.Time) error {
 	role = strings.TrimSpace(role)
 	if role == "" || store == nil {
 		return nil
@@ -201,8 +251,35 @@ func refuseUnavailableOrgRole(ctx context.Context, store *db.Store, role string,
 	if err != nil {
 		return fmt.Errorf("read org role %q unavailability: %w", role, err)
 	}
-	if found {
+	if found && orgRoleUnavailableRefusesRuntime(incident, selectedRuntime) {
 		return unavailableRoleDispatchError(incident)
 	}
 	return nil
+}
+
+// selectedJobDispatchRuntime reports the runtime a QUEUED job will actually run
+// as, resolved exactly as the claiming worker resolves it: the registered
+// agent's runtime, with a per-job --runtime override swapped in when the payload
+// carries one (#531).
+//
+// It returns "" when the agent cannot be resolved, and callers must treat that
+// as unknown rather than as "not the walled runtime" — refuseUnavailableOrgRole
+// fails closed on an empty value. Deliberately NOT resolveTranscriptRuntime:
+// that helper answers "which transcript should I read", accepting a requested
+// override and falling back to payload.Ephemeral.Runtime, which is not the
+// dispatch decision.
+func selectedJobDispatchRuntime(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload) string {
+	if store == nil {
+		return ""
+	}
+	agent, err := store.GetAgent(ctx, job.Agent)
+	if err != nil {
+		// An ephemeral job carries its runtime in the payload rather than the
+		// agents table, and that IS the dispatch decision for such a job.
+		if payload.Ephemeral != nil {
+			return applyJobRuntimeOverride(runtime.Agent{Runtime: payload.Ephemeral.Runtime}, payload).Runtime
+		}
+		return ""
+	}
+	return applyJobRuntimeOverride(runtimeAgent(agent), payload).Runtime
 }
