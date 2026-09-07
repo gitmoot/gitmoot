@@ -644,6 +644,17 @@ func (g PolicyMergeGate) recordApprovalEvidence(ctx context.Context, job db.Job,
 	detail := "executed"
 	if !EvidenceWasExecuted(*payload.Result) {
 		detail = "NOT executed - this approval's claims were not produced by running anything"
+		// #1817: SAY WHETHER THE REVIEWER ACTUALLY CLAIMED THIS. An omitted
+		// evidence field normalises to static_only, so without this the record
+		// reads identically for a reviewer that honestly reported running nothing
+		// and one that has never emitted the field - and the second group is 93%
+		// of succeeded reviews on this store. Anyone reading these rows to decide
+		// whether a static-only refusal is safe needs the two separated.
+		if EvidenceWasDeclared(*payload.Result) {
+			detail += "; the reviewer declared this"
+		} else {
+			detail += "; the reviewer declared NO evidence mode, so this is the safe default rather than a claim"
+		}
 	}
 	// IF ABSENT, because ensureFinalReviewCaptured runs on EVERY merge-gate
 	// pass: a PR pending on CI is re-evaluated on every poll, so AddJobEvent

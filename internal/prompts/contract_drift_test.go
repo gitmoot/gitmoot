@@ -68,6 +68,12 @@ var normalizationOwnedResultFields = map[string]string{
 	// lives in the result so RetryJob clears it along with the result. An agent
 	// claiming it would be asserting a lifecycle fact the product owns.
 	"superseded_pull_request_closed": "set by the closed-pull-request sweep, never requested from an agent",
+	// Assigned by normalizeAgentResult from whether the producer sent `evidence`
+	// at all, so an honest static_only stays distinguishable from a producer that
+	// never emitted the field (#1817). Naming it in the prompt would invite an
+	// agent to assert its own provenance, which is the one thing it must not do:
+	// normalization overwrites any supplied value for exactly that reason.
+	"evidence_declared": "assigned by result normalization from the producer's own silence, never requested from an agent",
 }
 
 func contractFieldNames() []string {

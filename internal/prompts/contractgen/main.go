@@ -81,6 +81,18 @@ var resultFieldAnnotations = map[string]fieldAnnotation{
 	// fact the product owns. The empty entry still satisfies the every-field-accounted
 	// -for check, so a future rename cannot silently drop it.
 	"superseded_pull_request_closed": {},
+	// evidence_declared is ENGINE-OWNED for the same reason, so it carries neither
+	// an example nor help. normalizeAgentResult assigns it from whether the
+	// producer sent `evidence` at all, BEFORE the safe default overwrites the
+	// value, so an honest static_only stays distinguishable from a producer that
+	// never emitted the field (#1817 - measured at 93% of succeeded reviews
+	// omitting it, which is why a policy refusing static_only today would refuse
+	// almost every review). Advertising it would invite an agent to assert its own
+	// provenance, and provenance about a value must not come from that value's
+	// author; normalization overwrites any supplied value for exactly that reason.
+	// The empty entry still satisfies the every-field-accounted-for check, so a
+	// future rename cannot silently drop it.
+	"evidence_declared": {},
 }
 
 // delegationFieldAnnotations covers every JSON field of workflow.Delegation.

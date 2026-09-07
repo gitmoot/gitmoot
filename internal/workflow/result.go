@@ -390,6 +390,25 @@ type AgentResult struct {
 	// A static-only verdict is LEGITIMATE and no check fails it. What fails is
 	// claiming execution while naming nothing that was run.
 	Evidence string `json:"evidence,omitempty"`
+	// EvidenceDeclared records whether the PRODUCER sent an evidence value, as
+	// distinct from the engine defaulting one. It is ENGINE-OWNED: normalizeAgentResult
+	// assigns it unconditionally, so a producer that sends it is overwritten and
+	// cannot assert its own provenance. Same idiom as ReviewStatusGrade - a fact
+	// about where a value came from does not come from the value's author.
+	//
+	// It exists because the default above is safe but LOSSY, and the loss is
+	// large: measured over 3,431 succeeded review jobs, 3,192 of them (93%,
+	// 14.328 G tokens) omit evidence entirely, 198 declare executed and 41
+	// declare static_only. So "I could not execute anything" and "I have never
+	// heard of this field" stored the same value, which makes the field
+	// uninformative in aggregate and makes any policy built on it unsafe: a
+	// refusal on static_only today would refuse 93% of all reviews, the
+	// overwhelming majority of which never made the claim at all.
+	//
+	// It changes no policy. Evidence still normalises to static_only, and
+	// EvidenceWasExecuted still answers the same question. This only makes the
+	// silence countable, which is the prerequisite for anyone acting on it.
+	EvidenceDeclared bool `json:"evidence_declared,omitempty"`
 }
 
 // The two values Evidence accepts. A closed pair of strings rather than a
@@ -416,6 +435,17 @@ func ValidEvidence(value string) bool {
 // TestsRun describing what it could NOT run.
 func EvidenceWasExecuted(r AgentResult) bool {
 	return strings.TrimSpace(r.Evidence) == EvidenceExecuted
+}
+
+// EvidenceWasDeclared reports whether the producer actually stated its evidence
+// mode, rather than the engine defaulting it to static_only.
+//
+// A consumer that wants to ACT on static_only - refuse it, escalate it, count
+// it - must ask this too. Without it, an honest reviewer reporting that it could
+// run nothing is indistinguishable from a producer that has never emitted the
+// field, and on this store the second group is 93% of succeeded reviews.
+func EvidenceWasDeclared(r AgentResult) bool {
+	return r.EvidenceDeclared
 }
 
 // authorityGrantingResultFields are AgentResult fields an agent may NEVER supply,
@@ -991,7 +1021,15 @@ func normalizeAgentResult(result *AgentResult) {
 	// passed". A reviewer that DID execute says so; silence is treated as the
 	// weaker claim, because the alternative is inferring an execution that may
 	// never have happened.
-	if !ValidEvidence(result.Evidence) {
+	//
+	// #1817's adoption measurement showed the default is also LOSSY: 3,192 of
+	// 3,431 succeeded reviews omit the field, so an honest static_only and a
+	// producer that never emitted one stored the same value. Capture DECLARED
+	// before the default overwrites it. Assigned unconditionally, so a producer
+	// that supplies evidence_declared itself is overwritten and cannot assert
+	// its own provenance.
+	result.EvidenceDeclared = ValidEvidence(result.Evidence)
+	if !result.EvidenceDeclared {
 		result.Evidence = EvidenceStaticOnly
 	}
 	if result.Needs == nil {

@@ -39,6 +39,20 @@ Omitting the field records `static_only`. Silence never becomes an execution
 claim, so a producer that does not know about this field cannot be read as
 having run anything. An unrecognised value is rejected outright.
 
+**The engine now records WHETHER YOU DECLARED IT**, alongside the value, in an
+engine-owned `evidence_declared` flag. Do not send that flag: it is assigned
+during normalization and a supplied value is overwritten, because provenance
+about a value must not come from the value's author.
+
+It exists because the safe default is lossy. Measured over 3,431 succeeded
+review jobs on one host, 3,192 of them (93%, 14.3 G tokens) omitted `evidence`
+entirely, 198 declared `executed` and 41 declared `static_only`. So an honest
+"I could run nothing" and "I have never heard of this field" stored the same
+value. **The practical consequence for anyone reading these rows: a policy that
+refused `static_only` would today refuse 93% of all reviews**, almost none of
+which made the claim. Declaring the field is what makes your verdict
+distinguishable from silence, so declare it.
+
 **No check fails a static-only review.** The distinction a merge decision needs
 is carried by the stored field, not by refusing the verdict. An earlier version
 of this feature failed every static-only review, which under
