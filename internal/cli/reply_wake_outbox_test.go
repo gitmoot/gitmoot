@@ -528,8 +528,20 @@ func TestReplyWakeOutboxBurstCoalescesToExactlyOneWake(t *testing.T) {
 		t.Fatalf("wake prompt = %q, want %q", wake.prompt, want)
 	}
 	delivered, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateDelivered)
-	if err != nil || len(delivered) != 10 {
-		t.Fatalf("delivered rows = %+v, err=%v", delivered, err)
+	if err != nil || len(delivered) != 1 || delivered[0].SourceID != fmt.Sprint(oldestID) {
+		t.Fatalf("delivered rows = %+v, err=%v, want only the surviving oldest row", delivered, err)
+	}
+	// One wake was delivered, so exactly one row may claim a delivery. The other
+	// nine are recorded superseded into it (#1978); before that they each read
+	// `delivered`, which is what made the coalescing saving uncountable.
+	superseded, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateSuperseded)
+	if err != nil || len(superseded) != 9 {
+		t.Fatalf("superseded rows = %+v, err=%v", superseded, err)
+	}
+	for _, row := range superseded {
+		if row.LastError != db.WakeOutboxCoalescedDetail(delivered[0].ID) {
+			t.Fatalf("superseded row %d last_error = %q, want the surviving row named", row.ID, row.LastError)
+		}
 	}
 }
 
@@ -595,7 +607,17 @@ func TestReplyWakeOutboxKeepsRolesSeparate(t *testing.T) {
 	}
 }
 
-func TestReplyWakeOutboxStartsNewBatchAfterWindow(t *testing.T) {
+// TestReplyWakeOutboxCollapsesDuePendingRowsBeyondTheWindow pins #1978's
+// contract: coalesce_key is what the store records, so two notes for the same
+// key that are BOTH DUE at one drain are one wake, however far apart they were
+// created. The five-second window is a hold on the OLDEST row, not a limit on
+// batch membership.
+//
+// Before the fix these two rows produced two prompts (two rolling windows), and
+// the row that carried no wake of its own was still recorded `delivered`, which
+// is why 250 of 8,806 live rows are `superseded` and every one of those came
+// from a directive receipt rather than from coalescing.
+func TestReplyWakeOutboxCollapsesDuePendingRowsBeyondTheWindow(t *testing.T) {
 	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
 	ctx := context.Background()
 	first, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
@@ -612,18 +634,45 @@ func TestReplyWakeOutboxStartsNewBatchAfterWindow(t *testing.T) {
 	}
 	base := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	setWakeOutboxCreatedAt(t, store.DatabasePath(), fmt.Sprint(first.ID), base)
-	setWakeOutboxCreatedAt(t, store.DatabasePath(), fmt.Sprint(second.ID), base.Add(replyWakeCoalescingWindow))
+	setWakeOutboxCreatedAt(t, store.DatabasePath(), fmt.Sprint(second.ID), base.Add(6*replyWakeCoalescingWindow))
 
-	if _, err := drainReplyWakeOutboxWithHealth(ctx, store, base.Add(2*replyWakeCoalescingWindow+time.Second), replyWakeTestDeliveryResolver(sink)); err != nil {
+	if _, err := drainReplyWakeOutboxWithHealth(
+		ctx, store, base.Add(7*replyWakeCoalescingWindow), replyWakeTestDeliveryResolver(sink),
+	); err != nil {
 		t.Fatal(err)
 	}
-	if wake.promptCalls != 2 {
-		t.Fatalf("wake calls = %d, want two rolling windows; prompts=%v", wake.promptCalls, wake.prompts)
+	if wake.promptCalls != 1 {
+		t.Fatalf("wake calls = %d, want one collapsed wake; prompts=%v", wake.promptCalls, wake.prompts)
 	}
-	for _, prompt := range wake.prompts {
-		if !strings.Contains(prompt, "1 new items, oldest id ") {
-			t.Fatalf("window prompt = %q", prompt)
+	if !strings.Contains(wake.prompt, "2 new items, oldest id ") {
+		t.Fatalf("collapsed prompt = %q, want both items named", wake.prompt)
+	}
+	// Nothing is dropped: the surviving wake still names every collapsed note.
+	for _, note := range []int64{first.ID, second.ID} {
+		if !strings.Contains(wake.prompt, fmt.Sprintf("gitmoot workflow show-note %d", note)) {
+			t.Fatalf("collapsed prompt = %q, want retrieval command for note %d", wake.prompt, note)
 		}
+	}
+	rows, err := store.ListWakeOutbox(ctx, "")
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("outbox rows = %+v, err=%v", rows, err)
+	}
+	surviving, collapsed := rows[0], rows[1]
+	if surviving.SourceID != fmt.Sprint(first.ID) || collapsed.SourceID != fmt.Sprint(second.ID) {
+		t.Fatalf("row order = %q,%q, want the oldest row first", surviving.SourceID, collapsed.SourceID)
+	}
+	if surviving.State != db.WakeOutboxStateDelivered {
+		t.Fatalf("surviving row state = %q, want %q", surviving.State, db.WakeOutboxStateDelivered)
+	}
+	if collapsed.State != db.WakeOutboxStateSuperseded {
+		t.Fatalf("collapsed row state = %q, want %q", collapsed.State, db.WakeOutboxStateSuperseded)
+	}
+	// The saving is auditable only if the superseded row names its survivor.
+	if want := fmt.Sprintf("coalesced into wake outbox row %d", surviving.ID); collapsed.LastError != want {
+		t.Fatalf("collapsed row last_error = %q, want %q", collapsed.LastError, want)
+	}
+	if collapsed.FinishedAt == "" || collapsed.AttemptCount != 1 {
+		t.Fatalf("collapsed row = %+v, want one recorded attempt and a finish stamp", collapsed)
 	}
 }
 
@@ -885,7 +934,7 @@ func TestReplyWakeOutboxAgedAttemptedExpiresDeliveryUnknownWithoutDuplicateWake(
 		t.Fatalf("pending = %+v, err=%v", pending, err)
 	}
 	attemptedAt := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
-	claimed, err := store.ClaimWakeOutbox(context.Background(), []int64{pending[0].ID}, attemptedAt)
+	claimed, err := store.ClaimWakeOutbox(context.Background(), pending[0].ID, nil, attemptedAt)
 	if err != nil || !claimed {
 		t.Fatalf("simulate pre-crash claim = %v, err=%v", claimed, err)
 	}
@@ -934,23 +983,29 @@ func TestReplyWakeOutboxAgedAttemptedExpiresDeliveryUnknownWithoutDuplicateWake(
 func TestReplyWakeOutboxRuleDeletedMidDrainRefusesLaterBatch(t *testing.T) {
 	store, sink, wake, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
 	ctx := context.Background()
-	first, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
-		WorkflowID: "release/rule-generation", Author: "worker", Body: "first",
-		AddressedTarget: "owner",
-	})
-	if err != nil {
-		t.Fatal(err)
+	// The later batch has to exist for a reason coalescing cannot remove: the
+	// COUNT BOUND, not a second creation window (#1978). Since every due
+	// pending row for one key now joins one batch, replyWakeMaxCoalescedItems+1
+	// rows are what splits a key into two batches.
+	noteIDs := make([]int64, 0, replyWakeMaxCoalescedItems+1)
+	for index := 0; index <= replyWakeMaxCoalescedItems; index++ {
+		note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID: "release/rule-generation", Author: "worker",
+			Body: fmt.Sprintf("item %d", index), AddressedTarget: "owner",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		noteIDs = append(noteIDs, note.ID)
 	}
-	second, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
-		WorkflowID: "release/rule-generation", Author: "worker", Body: "second",
-		AddressedTarget: "owner",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	first, last := noteIDs[0], noteIDs[len(noteIDs)-1]
 	base := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
-	setWakeOutboxCreatedAt(t, store.DatabasePath(), fmt.Sprint(first.ID), base)
-	setWakeOutboxCreatedAt(t, store.DatabasePath(), fmt.Sprint(second.ID), base.Add(replyWakeCoalescingWindow))
+	for index, noteID := range noteIDs {
+		setWakeOutboxCreatedAt(
+			t, store.DatabasePath(), fmt.Sprint(noteID),
+			base.Add(time.Duration(index)*time.Millisecond),
+		)
+	}
 	wake.onPrompt = func() error {
 		return store.DeleteEventRule(ctx, "reply-0")
 	}
@@ -973,11 +1028,15 @@ func TestReplyWakeOutboxRuleDeletedMidDrainRefusesLaterBatch(t *testing.T) {
 		t.Fatalf("wake calls = %d, want only the authorized first batch; prompts=%v", wake.promptCalls, wake.prompts)
 	}
 	delivered, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateDelivered)
-	if err != nil || len(delivered) != 1 || delivered[0].SourceID != fmt.Sprint(first.ID) {
+	if err != nil || len(delivered) != 1 || delivered[0].SourceID != fmt.Sprint(first) {
 		t.Fatalf("delivered = %+v, err=%v", delivered, err)
 	}
+	superseded, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateSuperseded)
+	if err != nil || len(superseded) != replyWakeMaxCoalescedItems-1 {
+		t.Fatalf("superseded = %+v, err=%v", superseded, err)
+	}
 	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
-	if err != nil || len(pending) != 1 || pending[0].SourceID != fmt.Sprint(second.ID) || pending[0].AttemptCount != 0 {
+	if err != nil || len(pending) != 1 || pending[0].SourceID != fmt.Sprint(last) || pending[0].AttemptCount != 0 {
 		t.Fatalf("pending later batch = %+v, err=%v", pending, err)
 	}
 
@@ -1307,8 +1366,8 @@ func (s *countingWakeOutboxStore) ExpireAgedWakeOutbox(ctx context.Context, atte
 	return s.inner.ExpireAgedWakeOutbox(ctx, attemptedBefore, now)
 }
 
-func (s *countingWakeOutboxStore) ClaimWakeOutbox(ctx context.Context, ids []int64, now time.Time) (bool, error) {
-	claimed, err := s.inner.ClaimWakeOutbox(ctx, ids, now)
+func (s *countingWakeOutboxStore) ClaimWakeOutbox(ctx context.Context, surviving int64, coalesced []int64, now time.Time) (bool, error) {
+	claimed, err := s.inner.ClaimWakeOutbox(ctx, surviving, coalesced, now)
 	if claimed {
 		s.claims++
 	}

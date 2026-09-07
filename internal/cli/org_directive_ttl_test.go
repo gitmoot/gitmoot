@@ -951,7 +951,7 @@ func TestDirectiveNagRevivesTheDeliveredWakeRowWithoutDuplicating(t *testing.T) 
 	originalID := initial[0].ID
 
 	// Deliver it, following the real state machine.
-	if _, err := store.ClaimWakeOutbox(ctx, []int64{originalID}, time.Now().UTC()); err != nil {
+	if _, err := store.ClaimWakeOutbox(ctx, originalID, nil, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.FinishWakeOutbox(ctx, []int64{originalID}, db.WakeOutboxStateDelivered, "", time.Now().UTC()); err != nil {

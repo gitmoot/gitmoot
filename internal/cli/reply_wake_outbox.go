@@ -17,7 +17,15 @@ import (
 const (
 	// replyWakeCoalescingWindow is long enough to absorb a burst of separate
 	// short-lived `org escalate` processes while keeping the daemon-tick wake
-	// latency small. Rolling windows start at the oldest pending item.
+	// latency small.
+	//
+	// IT IS A HOLD ON THE OLDEST PENDING ROW, NOT A LIMIT ON BATCH MEMBERSHIP
+	// (#1978). It used to be both: a row created more than five seconds after
+	// the batch anchor started a SECOND rolling window and therefore a second
+	// wake, even though both rows were pending at the same drain and shared one
+	// coalesce_key. Measured on this box's live store, 8,464 attempted rows were
+	// delivered as 8,091 wakes, so 92.8% of delivery attempts carried exactly
+	// one row while same-key arrivals were 5 seconds to 5 minutes apart.
 	replyWakeCoalescingWindow  = 5 * time.Second
 	replyWakeMaxCoalescedItems = 10
 	// A synchronous reply wake gets one 12s Herdr call plus bounded probes and
@@ -60,7 +68,7 @@ func (h replyWakeOutboxHealth) String() string {
 type wakeOutboxStore interface {
 	ListWakeOutboxObligations(ctx context.Context, attemptedBefore time.Time) (db.WakeOutboxObligationProjection, error)
 	ExpireAgedWakeOutbox(ctx context.Context, attemptedBefore time.Time, now time.Time) ([]db.WakeOutboxEntry, error)
-	ClaimWakeOutbox(ctx context.Context, ids []int64, now time.Time) (bool, error)
+	ClaimWakeOutbox(ctx context.Context, surviving int64, coalesced []int64, now time.Time) (bool, error)
 	ListDeletedEventRulesForRoutes(ctx context.Context, routes []db.EventRuleRoute) ([]db.DeletedEventRule, error)
 }
 
@@ -125,22 +133,18 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 				return replyWakeOutboxHealth{}, fmt.Errorf("parse wake outbox created_at for row %d: %w", items[start].ID, err)
 			}
 			deadline := startedAt.Add(replyWakeCoalescingWindow)
-			end := start + 1
-			for end < len(items) && end-start < replyWakeMaxCoalescedItems {
-				createdAt, err := time.Parse(time.RFC3339Nano, items[end].CreatedAt)
-				if err != nil {
-					return replyWakeOutboxHealth{}, fmt.Errorf("parse wake outbox created_at for row %d: %w", items[end].ID, err)
-				}
-				if !createdAt.Before(deadline) {
-					break
-				}
-				end++
-			}
 			if now.UTC().Before(deadline) {
-				// Later rows for the same rolling group cannot be due before its
-				// oldest row, so leave the whole tail pending for a future tick.
+				// Later rows for the same group cannot be due before its oldest
+				// row, so leave the whole tail pending for a future tick.
 				break
 			}
+			// EVERY DUE PENDING ROW FOR THIS KEY JOINS THE BATCH, capped only by
+			// replyWakeMaxCoalescedItems (#1978). The anchor's hold above has
+			// already elapsed, and a newer row's own hold cannot matter: it is
+			// carried by a wake this drain is emitting anyway, so including it
+			// only removes a later interrupt. The batch event still names every
+			// member's retrieval command, so collapsing loses no note.
+			end := min(start+replyWakeMaxCoalescedItems, len(items))
 
 			batch := items[start:end]
 			event, err := wakeOutboxEvent(batch, now)
@@ -168,13 +172,17 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 			for _, entry := range batch {
 				ids = append(ids, entry.ID)
 			}
-			claimed, err := store.ClaimWakeOutbox(ctx, ids, now)
+			// The oldest row SURVIVES as the delivered obligation: it is the one
+			// wakeOutboxEvent identifies as `oldest id`. The rest are recorded
+			// superseded into it rather than each reporting an independent
+			// delivery they never had (#1978).
+			claimed, err := store.ClaimWakeOutbox(ctx, ids[0], ids[1:], now)
 			if err != nil {
 				return replyWakeOutboxHealth{}, err
 			}
 			if claimed {
 				mutated = true
-				event.WakeOutboxIDs = ids
+				event.WakeOutboxIDs = ids[:1]
 				if err := emitReplyWakeOutboxEvent(ctx, delivery.sink, event, matchingRules); err != nil {
 					return replyWakeOutboxHealth{}, fmt.Errorf("emit claimed %s wake: %w", event.WakeKind, err)
 				}

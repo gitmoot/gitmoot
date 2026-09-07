@@ -222,11 +222,18 @@ back the emitting job. `gitmoot org escalate` addresses the same durable note
 and reply obligation upward to an ancestor or downward to a descendant. Upward
 questions remain escalations; downward questions are asks. Same-role questions
 are invalid, and peers are refused by a safe command-level default because no
-configurable peer-question policy exists. The daemon uses rolling five-second
-windows per event kind and role, so same-kind events coalesce while a blocked
-event and a reply for the same role remain separate.
-Pending, attempted, delivered, stalled, failed, and `delivery_unknown` remain
-queryable per outbox row, and outstanding obligations contribute to daemon tick
+configurable peer-question policy exists. The daemon holds each pending group
+for five seconds after its OLDEST row, then delivers every due pending row for
+that event kind and role as ONE wake, bounded at ten rows per wake, so a
+blocked event and a reply for the same role remain separate but two notes for
+the same role are one interrupt however far apart they arrived. The one row the
+wake names carries the delivery outcome; every row it collapses is recorded
+`superseded` with `coalesced into wake outbox row <id>`, so the suppressed
+wakes stay readable and countable rather than each reporting a delivery of its
+own.
+Pending, attempted, delivered, superseded, stalled, failed, and
+`delivery_unknown` remain queryable per outbox row, and outstanding obligations
+contribute to daemon tick
 health. A quiet burst tail is flushed by a later daemon tick; it does not require
 another event. If the outbox or its delivery rules cannot be queried, or an
 outbox row cannot be parsed or claimed, the drain is logged as unhealthy and

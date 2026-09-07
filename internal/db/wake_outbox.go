@@ -487,13 +487,28 @@ WHERE id = ? AND state = 'attempted' AND attempted_at <= ?`,
 	return entries, nil
 }
 
-// ClaimWakeOutbox atomically marks an entire coalesced batch attempted. If any
-// member is no longer pending, none are claimed; this is the cross-daemon
-// mark-before-emit dedup guard.
-func (s *Store) ClaimWakeOutbox(ctx context.Context, ids []int64, at time.Time) (bool, error) {
-	if len(ids) == 0 {
-		return false, errors.New("wake outbox claim requires at least one id")
-	}
+// ClaimWakeOutbox atomically claims one coalesced batch. If any member is no
+// longer pending, none are claimed; this is the cross-daemon mark-before-emit
+// dedup guard.
+//
+// THE BATCH LEAVES THIS CALL AS ONE OBLIGATION, NOT AS N (#1978). `surviving`
+// is the row the emitted wake identifies, and it alone stays `attempted` so
+// that the delivery outcome recorded against it is a real observation. Every
+// `coalesced` row is recorded `superseded`, naming the survivor, because the
+// wake that carries it is the survivor's. Marking them `delivered` instead,
+// which is what happened before this change, reported N deliveries for one
+// delivered wake: 8,806 live rows carried only 250 `superseded` rows and all
+// 250 of those came from directive receipts rather than from coalescing.
+//
+// Superseding here rather than after delivery costs nothing recoverable: every
+// terminal state is terminal, so no wake outbox row is ever re-emitted, and a
+// batch whose delivery then fails records ONE failed obligation, which is the
+// truth. The suppressed rows remain readable and each names the row that
+// carried it.
+func (s *Store) ClaimWakeOutbox(ctx context.Context, surviving int64, coalesced []int64, at time.Time) (bool, error) {
+	ids := make([]int64, 0, len(coalesced)+1)
+	ids = append(ids, surviving)
+	ids = append(ids, coalesced...)
 	query, args, err := wakeOutboxIDUpdate(`
 UPDATE wake_outbox
 SET state = 'attempted', attempt_count = attempt_count + 1,
@@ -518,10 +533,39 @@ WHERE state = 'pending' AND id IN (`, ids, at)
 	if affected != int64(len(ids)) {
 		return false, tx.Rollback()
 	}
+	if len(coalesced) > 0 {
+		supersede, supersedeArgs, err := wakeOutboxIDUpdate(`
+UPDATE wake_outbox
+SET state = 'superseded', last_error = ?, finished_at = ?, updated_at = ?
+WHERE state = 'attempted' AND id IN (`, coalesced, at, WakeOutboxCoalescedDetail(surviving))
+		if err != nil {
+			return false, err
+		}
+		supersedeResult, err := tx.ExecContext(ctx, supersede, supersedeArgs...)
+		if err != nil {
+			return false, err
+		}
+		supersededRows, err := supersedeResult.RowsAffected()
+		if err != nil {
+			return false, err
+		}
+		if supersededRows != int64(len(coalesced)) {
+			return false, fmt.Errorf(
+				"supersede coalesced wake outbox updated %d rows, want %d", supersededRows, len(coalesced),
+			)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+// WakeOutboxCoalescedDetail is the audit text a suppressed wake carries. It
+// names the row that delivered on its behalf, so the saving is countable:
+// `SELECT count(*) FROM wake_outbox WHERE last_error LIKE 'coalesced into%'`.
+func WakeOutboxCoalescedDetail(surviving int64) string {
+	return "coalesced into wake outbox row " + strconv.FormatInt(surviving, 10)
 }
 
 // FinishWakeOutbox records the existing event-rule delivery classification for
