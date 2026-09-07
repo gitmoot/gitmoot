@@ -12,6 +12,15 @@ const ReviewApprovedWithNotesEventKind = "review_approved_with_notes"
 
 // reviewBlockingSeverity resolves the repository policy while preserving the
 // historical fail-closed behavior for engines that are not wired from config.
+// findingsAdvisory resolves the #1969 declaration, defaulting to FALSE so a
+// missing resolver can never relax the obligation gate.
+func (e Engine) findingsAdvisory(repo string) bool {
+	if e.FindingsAdvisory == nil {
+		return false
+	}
+	return e.FindingsAdvisory(repo)
+}
+
 func (e Engine) reviewBlockingSeverity(repo string) string {
 	if e.ReviewBlockingSeverity == nil {
 		return reviewseverity.DefaultBlocking

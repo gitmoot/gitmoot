@@ -7,11 +7,24 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 )
+
+// findingsDeclaration renders a repository's #1969 findings-consumption
+// declaration. An unset value prints as "undeclared" rather than as its
+// behavioural equivalent "consuming", because the whole point of the column is
+// that a repository nobody has decided about is visible as one.
+func findingsDeclaration(cfg config.ReviewConfig, repo string) string {
+	declared := strings.TrimSpace(cfg.For(repo).FindingsConsumption)
+	if declared == "" {
+		return "undeclared"
+	}
+	return strings.ToLower(declared)
+}
 
 // runFindings reports the #1822 findings ledger per repository.
 //
@@ -48,6 +61,7 @@ func runFindings(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	reviewCfg := loadReviewConfig(*home)
 	var rows []db.ReviewFindingConsumption
 	if err := withStoreAndPaths(*home, func(_ config.Paths, store *db.Store) error {
 		var err error
@@ -73,10 +87,11 @@ func runFindings(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	writer := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(writer, "REPO\tFINDINGS\tOPEN\tAT HEAD\tAT EARLIER HEAD\tHEAD UNKNOWN\tANSWERED\tWITHDRAWN\tSUPERSEDED")
+	fmt.Fprintln(writer, "REPO\tDECLARED\tFINDINGS\tOPEN\tAT HEAD\tAT EARLIER HEAD\tHEAD UNKNOWN\tANSWERED\tWITHDRAWN\tSUPERSEDED")
 	for _, row := range rows {
-		fmt.Fprintf(writer, "%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n",
-			row.Repo, row.Findings, row.Open, row.OpenAtCurrentHead, row.OpenAtEarlierHead,
+		fmt.Fprintf(writer, "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n",
+			row.Repo, findingsDeclaration(reviewCfg, row.Repo), row.Findings, row.Open,
+			row.OpenAtCurrentHead, row.OpenAtEarlierHead,
 			row.OpenHeadUnknown, row.Answered, row.Withdrawn, row.Superseded)
 	}
 	if err := writer.Flush(); err != nil {
@@ -90,5 +105,7 @@ func runFindings(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintln(stdout, "OPEN findings block a merge at every later head until a reviewer answers or withdraws them,")
 	fmt.Fprintln(stdout, "so AT EARLIER HEAD is a backlog nobody has looked at, not a set that has expired.")
 	fmt.Fprintln(stdout, "A repository with findings and ANSWERED 0 is recording obligations nothing consumes.")
+	fmt.Fprintln(stdout, "DECLARED undeclared means nobody has decided whether this repository consumes findings;")
+	fmt.Fprintln(stdout, "it behaves as consuming. advisory records and reports findings without holding the merge.")
 	return 0
 }

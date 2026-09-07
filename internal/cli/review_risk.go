@@ -32,7 +32,8 @@ func loadReviewConfig(home string) config.ReviewConfig {
 }
 
 // applyReviewPolicy copies the global risk-tier policy and installs the
-// repository-aware native-fanout and blocking-severity resolvers onto the engine.
+// repository-aware native-fanout, blocking-severity and findings-consumption
+// resolvers onto the engine.
 func applyReviewPolicy(engine *workflow.Engine, home string) {
 	cfg := loadReviewConfig(home)
 	policy := cfg.For("")
@@ -41,6 +42,12 @@ func applyReviewPolicy(engine *workflow.Engine, home string) {
 	}
 	engine.ReviewBlockingSeverity = func(repo string) string {
 		return cfg.For(repo).BlockingSeverity
+	}
+	// #1969: installed beside the severity resolver, from the SAME cfg value, so
+	// a repository cannot end up with one review policy field resolved and
+	// another not. Undeclared and consuming both resolve false.
+	engine.FindingsAdvisory = func(repo string) bool {
+		return cfg.For(repo).FindingsAreAdvisory()
 	}
 	engine.RiskTiersEnabled = policy.RiskTiersEnabled
 	engine.HighRiskPaths = policy.HighRiskPaths
