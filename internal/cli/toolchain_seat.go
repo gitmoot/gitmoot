@@ -155,6 +155,55 @@ func stageSeatRuntimes(paths config.Paths) ([]string, []string, error) {
 	return staged, diagnostics, nil
 }
 
+// seatRuntimeUnavailable reports WHY the runtime a seat is about to execute was
+// published as the exit-126 unavailable shim, or "" when it staged normally.
+//
+// It reads stageSeatRuntimes' OWN OUTPUT rather than re-probing the host, which
+// is the whole point: #1817's first comment measured that a host-side check
+// answers about the wrong side of the seat boundary. The seat resolves the
+// runtime name from the staged shim directories this list becomes, so the
+// published root recorded here IS what argv[0] will resolve to.
+//
+// SCOPED TO THE SEAT'S OWN RUNTIME, deliberately. A sibling runtime published
+// unavailable is a fact about the host, and the comment on the staging call in
+// readOnlyRuntimeSandboxGrants explains why that stays a log line: making a
+// job's outcome depend on an unrelated runtime's disk state broke a CI event
+// baseline once already. A seat whose OWN runtime is unavailable is a different
+// statement - that job cannot execute one command - so it is the only case that
+// refuses.
+//
+// The diagnostic is best-effort context, not the trigger. An absent executable
+// produces no diagnostic at all (stageSeatRuntimes only records one when
+// LookPath succeeded and StageRuntime then failed), so the published shim is
+// the fact and the diagnostic only sharpens the message.
+func seatRuntimeUnavailable(runtimeName string, stagedExecutables []string, diagnostics []string) string {
+	runtimeName = strings.TrimSpace(runtimeName)
+	if runtimeName == "" {
+		return ""
+	}
+	unavailableRoot := runtimeName + toolchain.UnavailableRuntimeSuffix
+	published := false
+	for _, executable := range stagedExecutables {
+		if filepath.Base(executable) != runtimeName {
+			continue
+		}
+		// <runtime root>/<name><suffix>/.bin/<name>
+		if filepath.Base(filepath.Dir(filepath.Dir(executable))) == unavailableRoot {
+			published = true
+			break
+		}
+	}
+	if !published {
+		return ""
+	}
+	for _, diagnostic := range diagnostics {
+		if strings.HasPrefix(diagnostic, "runtime "+runtimeName+" ") {
+			return diagnostic
+		}
+	}
+	return fmt.Sprintf("runtime %s has no daemon-staged artifact, so it is published unavailable rather than left host-resolvable", runtimeName)
+}
+
 // seatRuntimePathEntries turns staged executables into PATH entries, deduplicated
 // and in a stable order.
 //

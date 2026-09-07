@@ -230,6 +230,14 @@ func systemInterpreterRoots(target string) bool {
 	return false
 }
 
+// UnavailableRuntimeSuffix names the published root StageUnavailableRuntime
+// writes for a runtime the daemon could not stage. It is exported so a caller
+// can RECOGNISE that shim in a staging result instead of re-deriving the
+// literal: a dispatch that hands a seat this command has already decided the
+// seat cannot execute that runtime, and #1817 needs to refuse on exactly that
+// fact rather than wait for the exit-126 exec.
+const UnavailableRuntimeSuffix = "-unavailable-v1"
+
 // StageUnavailableRuntime publishes an engine-owned command that fails with an
 // explicit availability error. It shadows a host runtime name when the daemon
 // cannot stage that runtime, so appending the inherited PATH cannot silently
@@ -240,7 +248,7 @@ func StageUnavailableRuntime(gitmootHome string, name string) (string, error) {
 		return "", fmt.Errorf("%w: %q is not usable as one path component", ErrRuntimeNotStageable, name)
 	}
 	root := RuntimeRoot(gitmootHome)
-	publishedName := name + "-unavailable-v1"
+	publishedName := name + UnavailableRuntimeSuffix
 	published := filepath.Join(root, publishedName)
 	entry, _ := runtimeStagers.LoadOrStore(published, &sync.Mutex{})
 	lock := entry.(*sync.Mutex)

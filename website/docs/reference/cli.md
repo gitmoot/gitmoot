@@ -204,6 +204,17 @@ Doctor probes its foreground `PATH`, which can differ from the daemon's
 EnvironmentFile `PATH`; compare the reported `resolved_path` with the daemon's
 executable resolution before treating the foreground verdict as the daemon's.
 
+A read-only seat has a second, separate capability precondition, because the
+contract preflight probes the dispatching host's `PATH` while a seat executes a
+daemon-staged copy of its runtime. When the daemon cannot stage a runtime it
+publishes that name as an engine-owned command that exits 126, so an inherited
+`PATH` cannot route the seat back to an ungranted operator installation. If the
+runtime published that way is the seat's own, seat setup ends the job `blocked`
+and records a `seat_runtime_unavailable` event naming the agent, the runtime and
+the staging cause, before any adapter is composed, any agent instance is marked
+running, or any model token is spent. A sibling runtime published unavailable is
+a fact about the host, stays a daemon log line, and refuses nothing.
+
 ## Transcript Retention
 
 Runtime transcript retention is default-on. Every engine delivery appends its

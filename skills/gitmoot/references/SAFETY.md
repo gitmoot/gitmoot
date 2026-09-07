@@ -197,6 +197,23 @@ and attempts no escape. Doctor uses the foreground process's `PATH`, so compare
 its reported `resolved_path` with the daemon EnvironmentFile's `PATH` when they
 may resolve different binaries.
 
+#### Read-only seat runtime capability
+
+A read-only seat resolves its runtime from a daemon-staged copy, never from the
+host PATH. When the daemon cannot stage a runtime it publishes that name as an
+engine-owned command that exits 126, so an inherited PATH entry cannot route the
+seat back to an ungranted operator installation. If the runtime published that
+way is the seat's OWN runtime, seat setup refuses the job: the job ends
+`blocked`, a `seat_runtime_unavailable` event records the agent, the runtime and
+the staging cause, and no adapter is composed, no agent instance is marked
+running, and no model token is spent. A sibling runtime published unavailable is
+a fact about the host, stays a daemon log line, and refuses nothing.
+
+This check runs where the seat resolves its command, not on the dispatching
+host's PATH. The two answers differ: a host can carry a working installation
+while every seat receives the exit-126 shim, so a dispatch-time `LookPath`
+reports the runtime present for a runtime no seat can run.
+
 #### Shell runtime risk acceptance (2026-08-05)
 
 An operator-authored shell command is accepted as an explicit daemon-permission
