@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -195,6 +197,72 @@ func routedTranscriptRuntime(t *testing.T, store *db.Store, jobID string) string
 		t.Fatalf("routing produced an empty runtime for job %s", jobID)
 	}
 	return routed
+}
+
+// PRODUCTION-PATH FIXTURE, SHARED ON PURPOSE. Measured under -race:
+// db.Open plus migrations costs 8.7s, while opening the transcript, writing
+// through the translators and reading the profile together cost under 20ms. A
+// store per table row therefore spent ~99.8% of the shard's budget on schema
+// setup, which is what timed shard 0/8 out at 20m in CI (#1930 round-19).
+//
+// One store is opened for the package and every case gets its OWN job id, so
+// the isolation that matters - a profile read back by job id - is unchanged.
+var (
+	instrumentFixtureOnce  sync.Once
+	instrumentFixtureHome  string
+	instrumentFixtureStore *db.Store
+	instrumentFixtureErr   error
+	instrumentJobSequence  atomic.Int64
+)
+
+func instrumentFixture(t *testing.T) (string, *db.Store) {
+	t.Helper()
+	instrumentFixtureOnce.Do(func() {
+		home, err := os.MkdirTemp("", "phase-instrument-*")
+		if err != nil {
+			instrumentFixtureErr = err
+			return
+		}
+		paths := config.PathsForHome(home)
+		if err := os.MkdirAll(paths.Home, 0o700); err != nil {
+			instrumentFixtureErr = err
+			return
+		}
+		store, err := db.Open(paths.Database)
+		if err != nil {
+			instrumentFixtureErr = err
+			return
+		}
+		instrumentFixtureHome, instrumentFixtureStore = home, store
+	})
+	if instrumentFixtureErr != nil {
+		t.Fatalf("open shared instrument fixture: %v", instrumentFixtureErr)
+	}
+	return instrumentFixtureHome, instrumentFixtureStore
+}
+
+// seedInstrumentJobIn seeds one job into an ALREADY OPEN store.
+func seedInstrumentJobIn(t *testing.T, store *db.Store, jobID, agent, runtimeName string) {
+	t.Helper()
+	if err := store.UpsertAgent(t.Context(), db.Agent{
+		Name: agent, Role: "reviewer", Runtime: runtimeName, RepoScope: "gitmoot/gitmoot",
+	}); err != nil {
+		t.Fatalf("upsert agent: %v", err)
+	}
+	payload, err := json.Marshal(workflow.JobPayload{Repo: "gitmoot/gitmoot", PullRequest: 1824})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJobWithEvent(t.Context(), db.Job{
+		ID: jobID, Agent: agent, Type: "review",
+		State: string(workflow.JobRunning), Payload: string(payload),
+	}, db.JobEvent{Kind: "running", Message: "dispatched"}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+}
+
+func nextInstrumentJobID(prefix string) string {
+	return fmt.Sprintf("%s-%d", prefix, instrumentJobSequence.Add(1))
 }
 
 func seedInstrumentJob(t *testing.T, paths config.Paths, jobID, agent, runtimeName string) *db.Store {
@@ -1376,10 +1444,10 @@ func classifyThroughBothProductionPaths(t *testing.T, command, want string) {
 		{"kimi", "kimi", "kimi-reviewer", kimiToolLines},
 	} {
 		t.Run(path.name, func(t *testing.T) {
-			home := t.TempDir()
-			paths := config.PathsForHome(home)
-			store := seedInstrumentJob(t, paths, "dual", path.agent, path.runtime)
-			handle := openInstrumentedTranscript(t, home, "dual", path.runtime, store)
+			home, store := instrumentFixture(t)
+			jobID := nextInstrumentJobID("dual")
+			seedInstrumentJobIn(t, store, jobID, path.agent, path.runtime)
+			handle := openInstrumentedTranscript(t, home, jobID, path.runtime, store)
 			start, end := path.lines("d1", command)
 			if _, err := handle.Write([]byte(start)); err != nil {
 				t.Fatal(err)
@@ -1391,7 +1459,7 @@ func classifyThroughBothProductionPaths(t *testing.T, command, want string) {
 			if err := handle.Close(); err != nil {
 				t.Fatalf("close: %v", err)
 			}
-			profile := readPhaseProfile(t, store, "dual")
+			profile := readPhaseProfile(t, store, jobID)
 			assertProfileIdentities(t, profile)
 			if profile.BucketCount[want] != 1 {
 				t.Fatalf("%s path: %q landed in %v, want %s", path.name, command, profile.BucketCount, want)
@@ -1793,10 +1861,10 @@ func classifyThroughSplitWrites(t *testing.T, command, want string) {
 		{"kimi", "kimi", "kimi-reviewer", kimiToolLines},
 	} {
 		t.Run(path.name, func(t *testing.T) {
-			home := t.TempDir()
-			paths := config.PathsForHome(home)
-			store := seedInstrumentJob(t, paths, "split", path.agent, path.runtime)
-			handle := openInstrumentedTranscript(t, home, "split", path.runtime, store)
+			home, store := instrumentFixture(t)
+			jobID := nextInstrumentJobID("split")
+			seedInstrumentJobIn(t, store, jobID, path.agent, path.runtime)
+			handle := openInstrumentedTranscript(t, home, jobID, path.runtime, store)
 			start, end := path.lines("s1", command)
 			for index, payload := range []string{start, end} {
 				for offset := 0; offset < len(payload); offset += 7 {
@@ -1815,7 +1883,7 @@ func classifyThroughSplitWrites(t *testing.T, command, want string) {
 			if err := handle.Close(); err != nil {
 				t.Fatalf("close: %v", err)
 			}
-			profile := readPhaseProfile(t, store, "split")
+			profile := readPhaseProfile(t, store, jobID)
 			assertProfileIdentities(t, profile)
 			if profile.BucketCount[want] != 1 {
 				t.Fatalf("%s split-write path: %q landed in %v, want %s",
