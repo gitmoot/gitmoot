@@ -1156,7 +1156,7 @@ func effectiveDelegationTimeout(d Delegation, defaults DelegationTimeoutDefaults
 // shared by dispatchDelegations (initial enqueue of ready delegations) and
 // advanceDelegations (deferred enqueue once deps clear) so both paths produce
 // identical, idempotent requests for the same delegation ID.
-func (e Engine) delegationRequest(job db.Job, payload JobPayload, d Delegation) JobRequest {
+func (e Engine) delegationRequest(ctx context.Context, job db.Job, payload JobPayload, d Delegation) JobRequest {
 	// An ephemeral delegation has no pre-registered agent: synthesize a stable
 	// agent name carrying the "-ephemeral-" infix used to exclude transient
 	// workers from registry listings, and thread the worker spec through so the
@@ -1177,7 +1177,7 @@ func (e Engine) delegationRequest(job db.Job, payload JobPayload, d Delegation) 
 		Repo:            payload.Repo,
 		Branch:          payload.Branch,
 		PullRequest:     payload.PullRequest,
-		HeadSHA:         payload.HeadSHA,
+		HeadSHA:         e.delegationHeadSHA(ctx, payload, d),
 		GoalID:          payload.GoalID,
 		TaskID:          payload.TaskID,
 		TaskTitle:       payload.TaskTitle,
@@ -1217,6 +1217,48 @@ func (e Engine) delegationRequest(job db.Job, payload JobPayload, d Delegation) 
 		// job that happened to receive the flag.
 		SkipNativeReviewFanout: payload.SkipNativeReviewFanout,
 	}
+}
+
+// delegationHeadSHA resolves the head a delegated REVIEW child will be pinned
+// to, falling back to the stored pull-request mirror when the parent's payload
+// carries none.
+//
+// WHY THIS EXISTS (#1557). A review child with no head cannot run at all:
+// validateReviewCheckoutForRunner refuses it with "review job for PR #N has no
+// head SHA", and that refusal is correct, because a review that cannot name the
+// commit it read is not a review. The defect is upstream, in creating the child
+// at all.
+//
+// MEASURED on the live job store: 156 failed `lens-*` delegation legs between
+// 2026-07-28 and 2026-09-07, of which 145 carry no head, and 135 of the recorded
+// failure reasons are literally "review job for PR #N has no head SHA". Of the
+// 145, 141 carry a PR number, and for ALL 141 the `pull_requests` mirror already
+// held a head SHA at that moment. The head was in the store the whole time; the
+// child simply never asked for it.
+//
+// The issue reports these legs as having "no recorded reason at all - error
+// empty, signal absent, phase absent". That is true of the PAYLOAD and false of
+// the record: all 156 have a `failed` job event carrying the reason. Reported on
+// the issue rather than treated as a second defect.
+//
+// Best-effort and fail-soft: an unresolvable head leaves the request exactly as
+// it was, so nothing that dispatches today stops dispatching. It narrows a
+// silent-failure population; it does not add a new refusal.
+func (e Engine) delegationHeadSHA(ctx context.Context, payload JobPayload, d Delegation) string {
+	head := strings.TrimSpace(payload.HeadSHA)
+	if head != "" || e.Store == nil {
+		return payload.HeadSHA
+	}
+	// REVIEW ONLY. An implement or ask child legitimately runs without a pinned
+	// head, and pinning one would change where it works.
+	if !strings.EqualFold(strings.TrimSpace(d.Action), "review") || payload.PullRequest <= 0 {
+		return payload.HeadSHA
+	}
+	pr, err := e.Store.GetPullRequest(ctx, payload.Repo, int64(payload.PullRequest))
+	if err != nil {
+		return payload.HeadSHA
+	}
+	return strings.TrimSpace(pr.HeadSHA)
 }
 
 // MaxDelegationDepth bounds how deep delegation nesting and coordinator

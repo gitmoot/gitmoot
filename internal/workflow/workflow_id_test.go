@@ -57,7 +57,7 @@ func TestValidateWorkflowID(t *testing.T) {
 
 func TestWorkflowIDInheritedByDelegationAndComparedForIdempotency(t *testing.T) {
 	request := (Engine{}).delegationRequest(
-		db.Job{ID: "parent", Agent: "coord"},
+		context.Background(), db.Job{ID: "parent", Agent: "coord"},
 		JobPayload{Repo: "acme/widget", WorkflowID: "release-42"},
 		Delegation{ID: "child", Agent: "worker", Action: "ask", Prompt: "check"},
 	)

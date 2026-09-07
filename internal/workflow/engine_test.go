@@ -4326,7 +4326,7 @@ func TestEngineDelegationModelAndEffortPlumbedToChildPayload(t *testing.T) {
 func TestEngineDelegationRequestCopiesModelAndEffort(t *testing.T) {
 	engine := Engine{}
 	request := engine.delegationRequest(
-		db.Job{ID: "parent-job", Agent: "audit"},
+		context.Background(), db.Job{ID: "parent-job", Agent: "audit"},
 		JobPayload{Repo: "gitmoot/gitmoot", Effort: "low"},
 		Delegation{ID: "del-1", Agent: "helper", Action: "review", Prompt: "go", Model: "opus", Effort: "high"},
 	)
@@ -4377,7 +4377,7 @@ func TestEngineDelegationPhasePlumbedToChildPayload(t *testing.T) {
 func TestEngineDelegationRequestCopiesPhase(t *testing.T) {
 	engine := Engine{}
 	request := engine.delegationRequest(
-		db.Job{ID: "parent-job", Agent: "audit"},
+		context.Background(), db.Job{ID: "parent-job", Agent: "audit"},
 		JobPayload{Repo: "gitmoot/gitmoot"},
 		Delegation{ID: "del-1", Agent: "helper", Action: "review", Prompt: "go", Phase: "  design  "},
 	)
@@ -4390,7 +4390,7 @@ func TestEngineDelegationRequestThreadsEphemeralSpec(t *testing.T) {
 	engine := Engine{}
 	spec := &EphemeralSpec{Runtime: runtime.CodexRuntime, Model: "gpt-5.4", Effort: "high"}
 	request := engine.delegationRequest(
-		db.Job{ID: "parent-job", Agent: "audit"},
+		context.Background(), db.Job{ID: "parent-job", Agent: "audit"},
 		JobPayload{Repo: "gitmoot/gitmoot"},
 		Delegation{ID: "worker", Ephemeral: spec, Action: "implement", Prompt: "hi"},
 	)
@@ -4408,7 +4408,7 @@ func TestEngineDelegationRequestThreadsEphemeralSpec(t *testing.T) {
 
 	// A non-ephemeral delegation keeps routing to its named agent unchanged.
 	plain := engine.delegationRequest(
-		db.Job{ID: "parent-job", Agent: "audit"},
+		context.Background(), db.Job{ID: "parent-job", Agent: "audit"},
 		JobPayload{Repo: "gitmoot/gitmoot"},
 		Delegation{ID: "del-1", Agent: "helper", Action: "review", Prompt: "go"},
 	)
