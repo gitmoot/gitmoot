@@ -1084,12 +1084,12 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		// resolves the same identity with NormalizeActingOrgRole (merge_gate.go:1564),
 		// so this uses that rather than inventing a second rule. Both SIDES of the
 		// comparison resolve identically, or a role could still never supersede itself.
-		reviewer := headlessReviewerIdentity(review.job, review.payload)
+		reviewer := effectiveReviewerIdentityName(review.job, review.payload)
 		superseded := false
 		if reviewer != "" {
 			for _, candidate := range taskReviews {
 				if candidate.payload.Result != nil &&
-					headlessReviewerIdentity(candidate.job, candidate.payload) == reviewer &&
+					effectiveReviewerIdentityName(candidate.job, candidate.payload) == reviewer &&
 					isReviewReplacementDecision(candidate.payload.Result.Decision) &&
 					reviewJobSupersedes(candidate.job, candidate.payload, review.job, review.payload) {
 					superseded = true
@@ -1110,7 +1110,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		// Name the AGENT-OR-ROLE, never the bare agent: an acting-role session review
 		// has no agent, and the first version of this rendered "objection from  "
 		// with an empty name, which tells an operator nothing about who to go to.
-		author := headlessReviewerIdentity(headlessObjection.job, headlessObjection.payload)
+		author := effectiveReviewerIdentityName(headlessObjection.job, headlessObjection.payload)
 		if author == "" {
 			author = "an unattributed reviewer"
 		}
@@ -1127,7 +1127,12 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		var acceptedJob db.Job
 		var acceptedPayload JobPayload
 		for _, review := range activeAtHead {
-			reviewer := strings.TrimSpace(review.job.Agent)
+			// THE THIRD SITE OF THE SAME IDENTITY RULE (#1950 F4, ruling 126350).
+			// Reading job.Agent alone classified a ROLE-AUTHORED approval as
+			// unattributed and refused it BEFORE the independence check ever ran, so a
+			// role could never approve anything - and the role's own self-approval was
+			// never even tested for. Agent still wins whenever present.
+			reviewer := effectiveReviewerIdentityName(review.job, review.payload)
 			if JobState(review.job.State) != JobSucceeded {
 				return fmt.Errorf("reviewer %s at evaluated head has unusable job state %s (job %s)", reviewer, review.job.State, review.job.ID)
 			}
@@ -1240,7 +1245,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			continue
 		}
 		if effectiveReviewDecisionForPayload(payload, request.ReviewBlockingSeverity) == "approved" {
-			reviewerAgent := strings.TrimSpace(job.Agent)
+			// Same rule, same helper (#1950 F4): the latest-round arm resolved identity
+			// separately, which is the fourth copy that ruling 126350 removes.
+			reviewerAgent := effectiveReviewerIdentityName(job, payload)
 			switch {
 			case reviewerAgent == "":
 				if unattributedReviewerReason == "" {
@@ -1579,18 +1586,20 @@ func collectImplementerAttributionMatching(jobs []db.Job, current JobPayload,
 		if !matches(current, payload) {
 			continue
 		}
-		agent := strings.TrimSpace(job.Agent)
-		role := NormalizeActingOrgRole(payload.ActingOrgRole)
+		// Identity DERIVATION is shared with the headless scan through
+		// effectiveReviewerIdentity (#1950 F4); the branch semantics below remain
+		// this collector's own.
+		name, fromActingRole := effectiveReviewerIdentity(job, payload)
 		switch {
-		case agent != "":
+		case name != "" && !fromActingRole:
 			// AN AGENT COLUMN ALWAYS WINS OVER A ROLE, and the order is load-bearing
 			// rather than cosmetic. Ordinary dispatched implement jobs carry the
 			// DISPATCHING coordinator's role in this same payload, so reading the role
 			// first would attribute every agent's work to its coordinator, make that
 			// coordinator an implementer of everything, and then disqualify it from
 			// reviewing anything.
-			evidence.agents[agent] = implementerIdentity{Name: agent}
-		case role != "":
+			evidence.agents[name] = implementerIdentity{Name: name}
+		case name != "":
 			// A ROLE NEVER DOWNGRADES AN AGENT ALREADY RECORDED UNDER THE SAME NAME,
 			// AND THAT IS WHY THIS IS A CONDITIONAL WRITE RATHER THAN A PLAIN ONE.
 			// The first version of this switch applied the agent-wins rule WITHIN one
@@ -1600,12 +1609,12 @@ func collectImplementerAttributionMatching(jobs []db.Job, current JobPayload,
 			// could report no dispatchable implementer while the agent row sat right
 			// there - routing decided by job-id order. Found in review, and it is the
 			// same rule I had already written one scope too narrow.
-			if existing, recorded := evidence.agents[role]; recorded && !existing.FromActingRole {
+			if existing, recorded := evidence.agents[name]; recorded && !existing.FromActingRole {
 				continue
 			}
 			// The #1916 shape: implemented in session by an org role, no agent to
 			// name. Attributable, and still subject to the independence check.
-			evidence.agents[role] = implementerIdentity{Name: role, FromActingRole: true}
+			evidence.agents[name] = implementerIdentity{Name: name, FromActingRole: true}
 		default:
 			evidence.sawEmptyAgent = true
 		}
@@ -1937,19 +1946,40 @@ func (g PolicyMergeGate) ensureReviewMatchesHead(payload JobPayload, headSHA str
 // allocated worktree path). The engine clears the inherited HeadSHA for exactly
 // these children so they validate against their isolated worktree HEAD, mirroring
 // isDelegationWorktreeChild in the daemon's checkout validation.
-// headlessReviewerIdentity is the effective reviewer identity for the headless
-// objection scan: the agent when a row records one, otherwise the normalized
+// effectiveReviewerIdentityName is the effective reviewer identity used by ALL
+// THREE identity sites in this file - headless objection supersession and its
+// diagnostic, implementer attribution, and the at-head reviewer arms: the agent
+// when a row records one, otherwise the normalized
 // ActingOrgRole. OpenExternalJob supports a role IN PLACE OF an agent
 // (mailbox.go:665 persists the normalized role; the job's Agent stays empty), so
 // keying on job.Agent alone made a role's objection unanswerable by that same
 // role - #1950 F2. collectGateImplementerAttribution already resolves identity
 // this way (merge_gate.go, NormalizeActingOrgRole), and sharing the rule is what
 // keeps the two from disagreeing about who a row belongs to.
-func headlessReviewerIdentity(job db.Job, payload JobPayload) string {
+func effectiveReviewerIdentityName(job db.Job, payload JobPayload) string {
+	name, _ := effectiveReviewerIdentity(job, payload)
+	return name
+}
+
+// effectiveReviewerIdentity is THE Agent-first/normalized-role rule, in ONE
+// place. It reports the resolved identity and whether it came from the acting
+// role, because the attribution collector needs that distinction while the
+// headless scan does not.
+//
+// It exists because the policy was written TWICE - once here and once inline in
+// collectImplementerAttributionMatching - and #1950 F4 is the observation that
+// two copies of a rule can drift even while they currently agree. The collector
+// keeps its own conditional-write semantics (a role must not downgrade an agent
+// already recorded under the same name); what it no longer keeps is a second copy
+// of how an identity is DERIVED.
+func effectiveReviewerIdentity(job db.Job, payload JobPayload) (string, bool) {
 	if agent := strings.TrimSpace(job.Agent); agent != "" {
-		return agent
+		return agent, false
 	}
-	return NormalizeActingOrgRole(payload.ActingOrgRole)
+	if role := NormalizeActingOrgRole(payload.ActingOrgRole); role != "" {
+		return role, true
+	}
+	return "", false
 }
 
 func isIntegrationWorktreeReview(payload JobPayload) bool {

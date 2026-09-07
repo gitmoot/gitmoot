@@ -6014,8 +6014,153 @@ func TestPolicyMergeGateAllowsAnActingRoleSessionObjectionToBeSuperseded(t *test
 					// out why a merge is stuck.
 					wantAuthor = "an unattributed reviewer"
 				}
-				if rendered := decision.Reason.Render(); !strings.Contains(rendered, wantAuthor) {
+				rendered := decision.Reason.Render()
+				if !strings.Contains(rendered, wantAuthor) {
 					t.Fatalf("reason = %q, want %q named; an empty author leaves an operator with nobody to go to", rendered, wantAuthor)
+				}
+				if !tt.noIdentity && strings.Contains(rendered, "an unattributed reviewer") {
+					t.Fatalf("reason = %q, want the ROLE named and NOT the unattributed fallback; matching %q alone also accepts \"an unattributed reviewer\", which is why a diagnostic-only revert stayed green (#1950 F4)", rendered, wantAuthor)
+				}
+			}
+		})
+	}
+}
+
+// TestPolicyMergeGateAttributesAnImplementRowToItsAgentNotItsDispatchingRole
+// pins the AGENT-FIRST half of effectiveReviewerIdentity, which nothing in the
+// package covered: inverting that order so a role wins passed the entire
+// internal/workflow suite. Extracting the rule into one shared function (#1950
+// F4) concentrates the risk, so the order needs its own guard.
+//
+// The hazard is the one the collector's own comment names. An ordinary dispatched
+// implement row carries the DISPATCHING coordinator's ActingOrgRole in its
+// payload. Read the role first and that coordinator becomes an implementer of
+// everything - and is then disqualified from reviewing anything. This asserts the
+// consequence rather than the mechanism: the coordinator's own approval must
+// still count as independent, so the merge proceeds.
+func TestPolicyMergeGateAttributesAnImplementRowToItsAgentNotItsDispatchingRole(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: "wave-impl", Type: "implement"}, JobPayload{
+		Repo:          "gitmoot/gitmoot",
+		PullRequest:   9,
+		TaskID:        "task-9",
+		ActingOrgRole: "coordinator", // the DISPATCHER's role, not the implementer
+		Result:        &AgentResult{Decision: "implemented", Summary: "implemented"},
+	})
+	// AGENT-authored, and its name deliberately COLLIDES with the dispatching role
+	// above. That collision is what makes the attribution order observable: with
+	// agent-first the implement row belongs to wave-impl and this reviewer is
+	// independent, while role-first would make "coordinator" the implementer and
+	// turn this into self-approval. An author-LESS approval cannot be used here -
+	// the current-head arm refuses it as "no recorded reviewer author", which is a
+	// different guard and would test the wrong thing.
+	insertCompletedJob(t, store, db.Job{ID: "review-role-approval", Agent: "coordinator", Type: "review"}, JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		PullRequest: 9,
+		HeadSHA:     "head123",
+		TaskID:      "task-9",
+		ReviewRound: "review-1",
+		Result:      &AgentResult{Decision: "approved", Summary: "approved by an agent named for the role"},
+	})
+	mergeable := true
+	gh := &fakeMergeGateGitHub{
+		pr: github.PullRequest{
+			Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+			HeadSHA: "head123", Mergeable: &mergeable,
+		},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+		checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+	}
+	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.Merged || len(gh.merges) != 1 {
+		t.Fatalf("decision=%+v merges=%d, want ONE merge: reading the acting role BEFORE the agent makes the dispatching coordinator an implementer of everything and disqualifies it from reviewing (#1950 F4). reason=%q",
+			decision, len(gh.merges), decision.Reason.Render())
+	}
+}
+
+// TestPolicyMergeGateReachesIndependenceForARoleAuthoredApproval covers ruling
+// 126350's third identity site. The at-head reviewer arm read job.Agent alone,
+// so a ROLE-AUTHORED approval was refused as "no recorded reviewer author"
+// BEFORE the independence check ran - which also means the role's own
+// self-approval was never tested for. The arms below drive both directions, so a
+// fix that merely stopped refusing such rows would fail the self-approval arm.
+func TestPolicyMergeGateReachesIndependenceForARoleAuthoredApproval(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		implementAgent string
+		implementRole  string
+		approvalRole   string
+		wantMerge      bool
+		wantReason     string
+	}{
+		{
+			name:           "a different role approves an agent's work: independent, so it merges",
+			implementAgent: "wave-impl",
+			approvalRole:   "reviewer",
+			wantMerge:      true,
+		},
+		{
+			name:          "the SAME role that implemented cannot approve its own work",
+			implementRole: "reviewer",
+			approvalRole:  "reviewer",
+			wantMerge:     false,
+			// Self-approval, NOT "no recorded reviewer author": the point of the fix is
+			// that the row reaches the independence check at all.
+			wantReason: "the implementing agent",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: tt.implementAgent, Type: "implement"}, JobPayload{
+				Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+				ActingOrgRole: tt.implementRole,
+				Result:        &AgentResult{Decision: "implemented", Summary: "implemented"},
+			})
+			insertCompletedJob(t, store, db.Job{ID: "review-role-approval", Agent: "", Type: "review"}, JobPayload{
+				Repo: "gitmoot/gitmoot", PullRequest: 9, HeadSHA: "head123", TaskID: "task-9",
+				ReviewRound:   "review-1",
+				ActingOrgRole: tt.approvalRole,
+				Result:        &AgentResult{Decision: "approved", Summary: "approved by a role"},
+			})
+			mergeable := true
+			gh := &fakeMergeGateGitHub{
+				pr: github.PullRequest{
+					Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+					HeadSHA: "head123", Mergeable: &mergeable,
+				},
+				status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+				checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+				mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+			}
+			gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+			decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			rendered := decision.Reason.Render()
+			if tt.wantMerge && (!decision.Merged || len(gh.merges) != 1) {
+				t.Fatalf("decision=%+v merges=%d, want ONE merge: a role-authored approval must reach the independence check through its normalized role. reason=%q",
+					decision, len(gh.merges), rendered)
+			}
+			if !tt.wantMerge {
+				if decision.Merged || len(gh.merges) != 0 {
+					t.Fatalf("decision=%+v merges=%d, want NO merge: the same role cannot approve its own implementation", decision, len(gh.merges))
+				}
+				if !strings.Contains(rendered, tt.wantReason) {
+					t.Fatalf("reason = %q, want it to name %q; refusing the row as merely unattributed would pass a bare no-merge assertion while never reaching independence",
+						rendered, tt.wantReason)
+				}
+				if strings.Contains(rendered, "no recorded reviewer author") {
+					t.Fatalf("reason = %q, want the INDEPENDENCE refusal rather than the unattributed fallback (#1950 F4, ruling 126350)", rendered)
 				}
 			}
 		})

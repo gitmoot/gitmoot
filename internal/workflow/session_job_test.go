@@ -482,7 +482,8 @@ func TestOpenExternalJobRefusesAReviewWithNeitherAgentNorActingRole(t *testing.T
 	if err == nil {
 		t.Fatal("OpenExternalJob accepted a review with neither Agent nor ActingOrgRole; the merge gate's no-identity arm is documented as unreachable through production writers and that is no longer true")
 	}
-	if got := err.Error(); !strings.Contains(got, "job agent or acting org role is required") {
-		t.Fatalf("OpenExternalJob error = %q, want the identity requirement; the refusal this control pins has changed shape", got)
+	const want = "job agent or acting org role is required"
+	if got := err.Error(); got != want {
+		t.Fatalf("OpenExternalJob error = %q, want exactly %q; strings.Contains here let a PREFIXED message pass, so this control did not pin the string it claims to (#1950 F3)", got, want)
 	}
 }
