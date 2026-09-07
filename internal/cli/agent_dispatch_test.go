@@ -352,7 +352,7 @@ func TestCLIReviewLoopUnresolvableReviewerFailsClosedBeforeIdentityGuard(t *test
 	fixture := newCLIReviewLoopFixture(t)
 	seedCLIReviewLoopVerdictForAgent(t, fixture.store, "ghost-reviewer", "prior-review", "same-head", "approved")
 
-	family, resolved, err := workflow.ResolveRuntimeFamily(ctx, fixture.store, "ghost-reviewer", "")
+	family, resolved, err := workflow.ResolveRuntimeFamily(ctx, fixture.store, "", "ghost-reviewer", "")
 	if err != nil {
 		t.Fatalf("ResolveRuntimeFamily: %v", err)
 	}

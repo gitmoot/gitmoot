@@ -1625,6 +1625,11 @@ type implementerIdentity struct {
 	// FromActingRole records that this attribution came from the payload's acting
 	// org role rather than the job's agent column. A role cannot be enqueued.
 	FromActingRole bool
+	// JobID is the implement job this identity came from, kept so the family
+	// resolver can reach that job's append-only runtime evidence (#1534). The
+	// payload field alone is not enough: it is absent on many jobs, and the
+	// registry default then attributes the work to a family that did not run it.
+	JobID string
 	// RecordedRuntime is the implement job's own payload effective_runtime, kept
 	// so the gate can resolve a runtime FAMILY without re-reading the job (#1531).
 	// Empty for a job that predates #1528's recording; ResolveRuntimeFamily then
@@ -1696,7 +1701,7 @@ func collectImplementerAttributionMatching(jobs []db.Job, current JobPayload,
 			// first would attribute every agent's work to its coordinator, make that
 			// coordinator an implementer of everything, and then disqualify it from
 			// reviewing anything.
-			evidence.agents[name] = implementerIdentity{Name: name, RecordedRuntime: payload.EffectiveRuntime}
+			evidence.agents[name] = implementerIdentity{Name: name, JobID: job.ID, RecordedRuntime: payload.EffectiveRuntime}
 		case name != "":
 			// A ROLE NEVER DOWNGRADES AN AGENT ALREADY RECORDED UNDER THE SAME NAME,
 			// AND THAT IS WHY THIS IS A CONDITIONAL WRITE RATHER THAN A PLAIN ONE.
@@ -1712,7 +1717,7 @@ func collectImplementerAttributionMatching(jobs []db.Job, current JobPayload,
 			}
 			// The #1916 shape: implemented in session by an org role, no agent to
 			// name. Attributable, and still subject to the independence check.
-			evidence.agents[name] = implementerIdentity{Name: name, FromActingRole: true, RecordedRuntime: payload.EffectiveRuntime}
+			evidence.agents[name] = implementerIdentity{Name: name, FromActingRole: true, JobID: job.ID, RecordedRuntime: payload.EffectiveRuntime}
 		default:
 			evidence.sawEmptyAgent = true
 		}
@@ -2609,7 +2614,7 @@ func (g PolicyMergeGate) sameRuntimeFamilyAsImplementer(ctx context.Context, rev
 	if g.Store == nil || strings.TrimSpace(reviewer) == "" || len(implementers) == 0 {
 		return false, "", nil
 	}
-	reviewerFamily, ok, err := ResolveRuntimeFamily(ctx, g.Store, reviewer, reviewerRuntime)
+	reviewerFamily, ok, err := ResolveRuntimeFamily(ctx, g.Store, reviewJobID, reviewer, reviewerRuntime)
 	if err != nil {
 		return false, "", err
 	}
@@ -2625,7 +2630,7 @@ func (g PolicyMergeGate) sameRuntimeFamilyAsImplementer(ctx context.Context, rev
 	sort.Strings(names)
 	for _, name := range names {
 		identity := implementers[name]
-		family, ok, err := ResolveRuntimeFamily(ctx, g.Store, name, identity.RecordedRuntime)
+		family, ok, err := ResolveRuntimeFamily(ctx, g.Store, identity.JobID, name, identity.RecordedRuntime)
 		if err != nil {
 			return false, "", err
 		}

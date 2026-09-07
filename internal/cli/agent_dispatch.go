@@ -739,7 +739,10 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	}
 	// Journal runtime selection for every job. Only a real per-job override is
 	// labelled runtime_override; default selection uses effective_runtime.
-	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: jobRuntimeEventKind(overrideRuntime != ""), Message: jobRuntimeOverrideEventMessage(agent.Runtime, effectiveAgent, lockKey)}); err != nil {
+	// Runtime is carried STRUCTURALLY beside the prose (#1534) so a family
+	// resolver reads a column instead of parsing this sentence, and reads an
+	// append-only row instead of a mutable payload field.
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: jobRuntimeEventKind(overrideRuntime != ""), Message: jobRuntimeOverrideEventMessage(agent.Runtime, effectiveAgent, lockKey), Runtime: effectiveAgent.Runtime}); err != nil {
 		return localAgentJobOutput{}, err
 	}
 	quotaHooks := newQuotaRoleUnavailableHooks(store, request.Home, io.Discard)

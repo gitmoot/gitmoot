@@ -694,7 +694,11 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// Expose the effective runtime (and the session lock it runs under) in job
 	// history for every job. Only an actual override uses runtime_override;
 	// default selection is recorded as effective_runtime.
-	if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: jobRuntimeEventKind(overridden), Message: jobRuntimeOverrideEventMessage(defaultRuntime, agent, lockKey)}); eventErr != nil {
+	// Runtime carried STRUCTURALLY beside the prose (#1534): see the sibling
+	// write in agent_dispatch.go. Both run sites must set it or the append-only
+	// tier is only half installed, which is the "correct where installed, absent
+	// at the next call site" shape #1531 warned about.
+	if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: jobRuntimeEventKind(overridden), Message: jobRuntimeOverrideEventMessage(defaultRuntime, agent, lockKey), Runtime: agent.Runtime}); eventErr != nil {
 		writeLine(w.Stdout, "job %s effective-runtime event failed: %v", job.ID, eventErr)
 	}
 	// This is the last filesystem authorization check before adapter delivery.

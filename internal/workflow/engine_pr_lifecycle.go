@@ -837,7 +837,7 @@ func (e Engine) selectNativeReviewFamily(ctx context.Context, reviewers []string
 	dropped := make([]string, 0, len(reviewers))
 	selectedFamily := ""
 	for _, reviewer := range reviewers {
-		family, ok, err := ResolveRuntimeFamily(ctx, e.Store, reviewer, "")
+		family, ok, err := ResolveRuntimeFamily(ctx, e.Store, "", reviewer, "")
 		if err != nil {
 			return nil, nil, "", err
 		}

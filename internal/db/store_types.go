@@ -270,6 +270,12 @@ type JobEvent struct {
 	// ListJobEvents so the web dashboard can order a node's timeline by real
 	// wall-clock time; other readers may leave it zero.
 	CreatedAt string
+	// Runtime is the STRUCTURED, append-only record of the runtime a job ran on
+	// (#1534). Only the two runtime-selection writes set it. It exists because
+	// family attribution previously depended on the payload's effective_runtime,
+	// which is mutable and absent on many jobs, and because the alternative -
+	// parsing the event's prose message - is a fragility trade rather than a fix.
+	Runtime string
 }
 
 // JobGate is one resumable gate row (#682): a single entry from a blocked job's

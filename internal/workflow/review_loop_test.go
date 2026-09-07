@@ -205,7 +205,7 @@ func TestResolveRuntimeFamilyPrecedence(t *testing.T) {
 		{name: "empty name without recording", agent: "", recorded: "", want: "", wantOK: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			family, ok, err := ResolveRuntimeFamily(ctx, store, tc.agent, tc.recorded)
+			family, ok, err := ResolveRuntimeFamily(ctx, store, "", tc.agent, tc.recorded)
 			if err != nil {
 				t.Fatalf("ResolveRuntimeFamily: %v", err)
 			}
