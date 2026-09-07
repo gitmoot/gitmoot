@@ -93,7 +93,7 @@ func seedClaimedWake(t *testing.T, store *db.Store, sourceID, role string) (even
 		t.Fatalf("projected %d obligations for %s, want 1", len(batch), sourceID)
 	}
 	ids := []int64{batch[0].ID}
-	if claimed, err := store.ClaimWakeOutbox(ctx, ids, time.Now().UTC()); err != nil || !claimed {
+	if claimed, err := store.ClaimWakeOutbox(ctx, ids[0], ids[1:], time.Now().UTC()); err != nil || !claimed {
 		t.Fatalf("claim wake outbox: claimed=%v err=%v", claimed, err)
 	}
 	event, err := wakeOutboxEvent(batch, time.Now())

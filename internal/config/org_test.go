@@ -166,6 +166,48 @@ func TestLoadOrgDirectiveTTLPolicy(t *testing.T) {
 	}
 }
 
+// TestLoadOrgWakeCoalesceHold pins the knob #1978 exposes: the hold is
+// configurable, an absent value keeps the pre-existing five seconds, and a
+// zero cannot silently turn the hold off and restore one wake per note.
+func TestLoadOrgWakeCoalesceHold(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name    string
+		fields  string
+		want    time.Duration
+		wantErr string
+	}{
+		{name: "default", want: DefaultWakeCoalesceHold},
+		{name: "configured", fields: "wake_coalesce_hold = \"2m\"\n", want: 2 * time.Minute},
+		{name: "zero refused", fields: "wake_coalesce_hold = \"0s\"\n", wantErr: "wake_coalesce_hold must be positive"},
+		{name: "unparseable refused", fields: "wake_coalesce_hold = \"soon\"\n", wantErr: "parse [org].wake_coalesce_hold"},
+		{name: "duplicate refused", fields: "wake_coalesce_hold = \"1m\"\nwake_coalesce_hold = \"2m\"\n", wantErr: "duplicate [org].wake_coalesce_hold"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := "[org]\n" + test.fields + "[org.roles.\"owner\"]\nscope=[\"*\"]\n"
+			if err := os.WriteFile(paths.ConfigFile, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadOrg(paths)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("LoadOrg() error = %v, want containing %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.WakeCoalesceHold() != test.want {
+				t.Fatalf("WakeCoalesceHold() = %s, want %s", cfg.WakeCoalesceHold(), test.want)
+			}
+		})
+	}
+}
+
 func TestLoadOrgRecycleAfterFailsClosed(t *testing.T) {
 	paths := PathsForHome(t.TempDir())
 	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {

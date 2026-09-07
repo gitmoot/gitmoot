@@ -5433,3 +5433,1542 @@ func insertMergeGatePanelRetry(t *testing.T, store *db.Store, parentID, delegati
 		t.Fatalf("CreateJobWithEvent returned error: %v", err)
 	}
 }
+
+// insertMergeGateHeadlessReview seeds a review row with NO HeadSHA, which
+// insertMergeGateReviewFixture cannot express: it defaults an empty head to
+// "head123". A headless row is what `gitmoot agent review` leaves behind when the
+// head is not recorded, and it is the row issue #1933 turns on.
+func insertMergeGateHeadlessReview(t *testing.T, store *db.Store, id, agent, decision, taskID, round string) {
+	t.Helper()
+	insertCompletedJob(t, store, db.Job{ID: id, Agent: agent, Type: "review"}, JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		PullRequest: 9,
+		HeadSHA:     "",
+		TaskID:      taskID,
+		ReviewRound: round,
+		Result:      &AgentResult{Decision: decision, Summary: "headless verdict"},
+	})
+}
+
+// TestPolicyMergeGateBlocksHeadlessObjectionAheadOfTheExternalMergeClaim is
+// issue #1933, and it enters through Evaluate rather than
+// ensureFinalReviewCaptured because the defect IS the ordering between the
+// review evaluation and the external-merge state claim - a test that called the
+// helper could not observe the claim at all.
+//
+// The interleaving, from the issue: a succeeded current-head APPROVAL and a
+// succeeded ordinary HEADLESS changes_requested row on the same task.
+// reviewsAtHead holds only the approval, because the strict evaluated-head
+// filter drops the headless row; the latest-round fallback never runs because
+// the strict population is non-empty; ClaimTaskState then fences the objection's
+// own transition and the merge completes with the objection unconsumed.
+//
+// Both orderings are asserted because the store returns rows by id and the
+// defect must not be reachable by seeding them the other way round.
+func TestPolicyMergeGateBlocksHeadlessObjectionAheadOfTheExternalMergeClaim(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		objectionFirst bool
+	}{
+		{name: "approval recorded before the headless objection", objectionFirst: false},
+		{name: "headless objection recorded before the approval", objectionFirst: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, gh, gate, request := newMergeGateQuorumScenario(t)
+			if tt.objectionFirst {
+				insertMergeGateHeadlessReview(t, store, "a-review-objection", "gm-review-opus", "changes_requested", "task-9", "review-1")
+				insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+					id: "b-review-approval", agent: "audit", decision: "approved", hasResult: true,
+				})
+			} else {
+				insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+					id: "a-review-approval", agent: "audit", decision: "approved", hasResult: true,
+				})
+				insertMergeGateHeadlessReview(t, store, "b-review-objection", "gm-review-opus", "changes_requested", "task-9", "review-1")
+			}
+			if err := store.UpsertTask(ctx, db.Task{
+				ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+				State: string(TaskReadyToMerge),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			request.Reviewer = "audit"
+			request.ExpectedTaskState = string(TaskReadyToMerge)
+
+			decision, err := gate.Evaluate(ctx, request)
+
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if decision.Merged || len(gh.merges) != 0 {
+				t.Fatalf("decision=%+v merges=%d, want NO merge: a persisted headless changes_requested objection must block BEFORE the external-merge claim (#1933)",
+					decision, len(gh.merges))
+			}
+			// The claim must never have been taken, or the objection's own advance
+			// would still be fenced even though the merge was refused.
+			task, taskErr := store.GetTask(ctx, "task-9")
+			if taskErr != nil {
+				t.Fatalf("GetTask: %v", taskErr)
+			}
+			if task.State != string(TaskReadyToMerge) {
+				t.Fatalf("task state = %q, want %q: the gate must not claim the task state when a headless objection blocks",
+					task.State, string(TaskReadyToMerge))
+			}
+		})
+	}
+}
+
+// TestPolicyMergeGateStillMergesWhenAHeadlessObjectionDoesNotApply is the
+// should-SUCCEED half of #1933, and it is the half that decides whether the fix
+// is a gate or an outage. Every qualifier in the new block gets an arm here, and
+// each arm must still reach a completed external merge.
+//
+// One honest mapping, because the vocabulary does not contain the words: a
+// review row has no "answered" or "withdrawn" DECISION - isReviewReplacementDecision
+// covers approved/changes_requested/blocked/failed only. At row level both are
+// expressed the same way, by a strictly later terminal verdict from the SAME
+// reviewer superseding the objection, which is what the first two arms drive.
+// The findings ledger's own db.FindingAnswered/db.FindingWithdrawn states are a
+// different surface and are enforced by EnsureLedgerObligationsObserved earlier
+// in this same function, not by this block.
+func TestPolicyMergeGateStillMergesWhenAHeadlessObjectionDoesNotApply(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		seed func(t *testing.T, store *db.Store)
+		why  string
+		// requestBranch populates MergeRequest.Branch, without which
+		// sameCorrelatedTask's branch comparison is unreachable: an empty side is
+		// treated as no evidence rather than a mismatch.
+		requestBranch string
+		// wantMerge defaults to TRUE - this table is the should-SUCCEED half - and
+		// is set false only by the arms guarding corrections to it.
+		wantMerge *bool
+		// wantReasonContains pins WHICH path refused, not merely that one did: a
+		// block from the headless pre-pass and a block from the parent's delegation
+		// evidence are different guarantees, and shadowing one with the other would
+		// pass a bare "it did not merge" assertion.
+		wantReasonContains string
+	}{
+		{
+			name: "answered: the same reviewer later approved, superseding it",
+			why:  "a strictly later terminal verdict from the same reviewer is how an objection is answered",
+			seed: func(t *testing.T, store *db.Store) {
+				insertMergeGateHeadlessReviewAt(t, store, "objection-early", "gm-review-opus", "changes_requested", "task-9", "review-1", "2026-09-01T10:00:00Z")
+				insertMergeGateHeadlessReviewAt(t, store, "objection-answered", "gm-review-opus", "approved", "task-9", "review-1", "2026-09-01T12:00:00Z")
+			},
+		},
+		{
+			name: "withdrawn: the same reviewer replaced it at the evaluated head",
+			why:  "withdrawal is expressed as a later terminal verdict from the same reviewer, here rendered at the head",
+			seed: func(t *testing.T, store *db.Store) {
+				insertMergeGateHeadlessReviewAt(t, store, "objection-withdrawn", "gm-review-opus", "changes_requested", "task-9", "review-1", "2026-09-01T10:00:00Z")
+				// A strictly LATER ROUND, not an empty one: reviewRoundKey refuses to
+				// order one explicit review-N against an empty round, so an empty-round
+				// replacement supersedes nothing and the objection correctly still
+				// blocks. The first version of this arm made that mistake and failed.
+				insertCompletedJob(t, store, db.Job{ID: "objection-replacement", Agent: "gm-review-opus", Type: "review"}, JobPayload{
+					Repo: "gitmoot/gitmoot", PullRequest: 9, HeadSHA: "head123", TaskID: "task-9",
+					ReviewRound: "review-2",
+					Result:      &AgentResult{Decision: "approved", Summary: "withdrawn and replaced"},
+				})
+			},
+		},
+		{
+			name: "superseded: a later headless verdict from the same reviewer wins",
+			why:  "supersession is same-reviewer and strictly-later, and it must clear the earlier row",
+			seed: func(t *testing.T, store *db.Store) {
+				insertMergeGateHeadlessReviewAt(t, store, "objection-superseded", "gm-review-opus", "changes_requested", "task-9", "review-1", "2026-09-01T09:00:00Z")
+				insertMergeGateHeadlessReviewAt(t, store, "objection-latest", "gm-review-opus", "approved", "task-9", "review-1", "2026-09-01T11:00:00Z")
+			},
+		},
+		{
+			name: "non-applicable: the objection belongs to a different pull request",
+			why:  "sameCorrelatedTask refuses a row from another pull request outright",
+			seed: func(t *testing.T, store *db.Store) {
+				insertCompletedJob(t, store, db.Job{ID: "objection-other-pr", Agent: "gm-review-opus", Type: "review"}, JobPayload{
+					Repo: "gitmoot/gitmoot", PullRequest: 8, HeadSHA: "", TaskID: "task-8",
+					Result: &AgentResult{Decision: "changes_requested", Summary: "another PR's objection"},
+				})
+			},
+		},
+		{
+			name: "non-applicable: the objection's branch disagrees with the request's",
+			why:  "when both sides record a branch and they differ, the row belongs to another lane (#1519)",
+			// A DIFFERENT TASK ID ALONE IS NOT NON-APPLICABLE. sameCorrelatedTask
+			// correlates on repo+PR whenever the branches do not disagree, REGARDLESS
+			// of task id, because review identity migrates between rounds (#1519). An
+			// earlier version of this arm seeded only a divergent task id and expected
+			// a merge; it FAILED, correctly, and weakening the guard to satisfy it
+			// would have reopened the very bypass this block exists to close. The arm
+			// below pins that reading so the mistake cannot be made again silently.
+			requestBranch: "task-9",
+			seed: func(t *testing.T, store *db.Store) {
+				insertCompletedJob(t, store, db.Job{ID: "objection-other-branch", Agent: "gm-review-opus", Type: "review"}, JobPayload{
+					Repo: "gitmoot/gitmoot", PullRequest: 9, Branch: "some-other-branch", HeadSHA: "", TaskID: "review-pr-9-3f3a1026",
+					Result: &AgentResult{Decision: "changes_requested", Summary: "another branch's objection"},
+				})
+			},
+		},
+		{
+			name:      "APPLICABLE despite a migrated task id: this one must BLOCK",
+			why:       "a divergent task id on the same PR still correlates (#1519), so the objection still applies",
+			wantMerge: boolPtr(false),
+			seed: func(t *testing.T, store *db.Store) {
+				insertMergeGateHeadlessReview(t, store, "objection-migrated-id", "gm-review-opus", "changes_requested", "review-pr-9-3f3a1026", "review-1")
+			},
+		},
+		{
+			name: "rendered against another head: not headless at all",
+			why:  "a head-bound objection is owned by the strict evaluated-head population, not by this block",
+			seed: func(t *testing.T, store *db.Store) {
+				insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+					id: "objection-other-head", agent: "gm-review-opus", decision: "changes_requested",
+					hasResult: true, headSHA: "someotherhead",
+				})
+			},
+		},
+		{
+			name: "not ordinary: a headless fan-out announcement is not a verdict",
+			why:  "#1685 - a row declaring delegations announces a panel and never answers for the head",
+			seed: func(t *testing.T, store *db.Store) {
+				insertCompletedJob(t, store, db.Job{ID: "objection-fanout", Agent: "gm-review-opus", Type: "review"}, JobPayload{
+					Repo: "gitmoot/gitmoot", PullRequest: 9, HeadSHA: "", TaskID: "task-9",
+					Result: &AgentResult{
+						Decision:    "changes_requested",
+						Summary:     "fan-out announcement",
+						Delegations: []Delegation{{ID: "lens-a", Agent: "lens-a", Action: "review", Prompt: "look at it"}},
+					},
+				})
+			},
+		},
+		{
+			name: "not applicable: an integration-worktree objection records no head by design",
+			why:  "#332/#388 - the engine CLEARS the head for these children, so treating one as an objection against this head makes it an objection against every head, which no push can clear",
+			// The pre-existing TestPolicyMergeGateHeadlessIntegrationObjectionDoesNotMatchEveryHead
+			// already holds this line and I did not touch it. This arm exists so the
+			// exclusion is bound from inside the #1933 suite as well: deleting it must
+			// fail a test written by the change that depends on it, not only an
+			// inherited one.
+			seed: func(t *testing.T, store *db.Store) {
+				insertCompletedJob(t, store, db.Job{ID: "objection-integration", Agent: "objector", Type: "review"}, JobPayload{
+					Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", ReviewRound: "review-1",
+					DelegationID: "verify-old",
+					WorktreePath: "/tmp/gitmoot/integration-verify-old",
+					Result:       &AgentResult{Decision: "changes_requested", Summary: "integration objection"},
+				})
+			},
+		},
+		{
+			name:               "a delegation child blocks through its PARENT'S evidence, not through this block",
+			why:                "the engine clears only the inherited HeadSHA so a real child keeps its round; it must be judged by ensureDelegatedReviewEvidence, and the headless block must not shadow that path with its own reason",
+			wantMerge:          boolPtr(false),
+			wantReasonContains: "blocking delegation evidence",
+			seed: func(t *testing.T, store *db.Store) {
+				encoded, err := marshalPayload(JobPayload{
+					Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", ReviewRound: "review-1",
+					Result: &AgentResult{Decision: "changes_requested", Summary: "delegated child verdict"},
+				})
+				if err != nil {
+					t.Fatalf("marshalPayload: %v", err)
+				}
+				if err := store.CreateJobWithEvent(context.Background(), db.Job{
+					ID: "objection-delegation-child", Agent: "lens-a", Type: "review",
+					State: string(JobSucceeded), Payload: encoded,
+					ParentJobID: "review-approval", DelegationID: "lens-a",
+				}, db.JobEvent{Kind: string(JobSucceeded), Message: "child"}); err != nil {
+					t.Fatalf("CreateJobWithEvent: %v", err)
+				}
+			},
+		},
+		{
+			// PINS THE DELEGATION-CHILD EXCLUSION ITSELF. The arm above it does not:
+			// its parent is a review row, so isRoundHistoryDuplicate already excludes
+			// it and deleting isDelegationChild changed nothing - a surviving mutant
+			// proved that. A child of the IMPLEMENT row is not round history, so this
+			// is the shape where the exclusion is the only thing standing between a
+			// headless child and a permanent block.
+			name: "not applicable: a delegation child whose parent is not a review row",
+			why:  "the engine clears a child's inherited head; a child of the implement row is not round history, so only the delegation-child exclusion keeps it from blocking every head",
+			seed: func(t *testing.T, store *db.Store) {
+				encoded, err := marshalPayload(JobPayload{
+					Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", ReviewRound: "review-1",
+					Result: &AgentResult{Decision: "changes_requested", Summary: "verify child of the implement row"},
+				})
+				if err != nil {
+					t.Fatalf("marshalPayload: %v", err)
+				}
+				if err := store.CreateJobWithEvent(context.Background(), db.Job{
+					ID: "objection-child-of-implement", Agent: "verifier", Type: "review",
+					State: string(JobSucceeded), Payload: encoded,
+					ParentJobID: "implement-job", DelegationID: "verify",
+				}, db.JobEvent{Kind: string(JobSucceeded), Message: "child"}); err != nil {
+					t.Fatalf("CreateJobWithEvent: %v", err)
+				}
+			},
+		},
+		{
+			// PINS "LATEST". With two qualifying objections the reason must name the
+			// NEWER one; reversing the selection was a surviving mutant until this arm
+			// existed, because every other scenario has at most one candidate.
+			name:               "two qualifying objections: the LATEST one is the one reported",
+			why:                "latest is decided by the same reviewRoundKey ordering supersession uses, so the block must name the newer reviewer",
+			wantMerge:          boolPtr(false),
+			wantReasonContains: "later-objector",
+			seed: func(t *testing.T, store *db.Store) {
+				insertMergeGateHeadlessReviewAt(t, store, "objection-older", "earlier-objector", "changes_requested", "task-9", "review-1", "2026-09-01T09:00:00Z")
+				insertMergeGateHeadlessReviewAt(t, store, "objection-newer", "later-objector", "changes_requested", "task-9", "review-2", "2026-09-01T15:00:00Z")
+			},
+		},
+		{
+			name: "not applicable: neither head nor round is an unattributable remnant",
+			why:  "matches no production writer of a reviewer verdict - engine reviews carry a round, CLI reviews carry a head - and TestPolicyMergeGateDelegatedReviewEvidenceEnumeration asserts wantExcluded for exactly this shape",
+			seed: func(t *testing.T, store *db.Store) {
+				insertCompletedJob(t, store, db.Job{ID: "objection-no-round", Agent: "orphan", Type: "review"}, JobPayload{
+					Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+					Result: &AgentResult{Decision: "changes_requested", Summary: "unattributable remnant"},
+				})
+			},
+		},
+		{
+			// PINS THE changes_requested NARROWNESS. Widening this block to "anything
+			// not approved" was a surviving mutant until this arm existed, and the
+			// widening is not harmless: an ABSTENTION cannot be answered or superseded
+			// by its author, so blocking on one would deadlock with no operator move.
+			name: "not a changes_requested verdict: a headless abstention must not block",
+			why:  "an abstention is not an objection, and blocking on one would be unanswerable",
+			seed: func(t *testing.T, store *db.Store) {
+				insertMergeGateHeadlessReviewAt(t, store, "objection-abstained", "abstainer", "skipped", "task-9", "review-1", "2026-09-01T10:00:00Z")
+			},
+		},
+		{
+			name: "not succeeded: a queued headless row is not a verdict",
+			why:  "an unfinished row has rendered no objection; rows at the evaluated head are judged above",
+			seed: func(t *testing.T, store *db.Store) {
+				encoded, err := marshalPayload(JobPayload{
+					Repo: "gitmoot/gitmoot", PullRequest: 9, HeadSHA: "", TaskID: "task-9",
+					// A ROUND IS REQUIRED for this arm to reach the succeeded-state
+					// check: without it the round qualifier excludes the row first and
+					// the arm cannot fail, which a surviving mutant proved.
+					ReviewRound: "review-1",
+					Result:      &AgentResult{Decision: "changes_requested", Summary: "still running"},
+				})
+				if err != nil {
+					t.Fatalf("marshalPayload: %v", err)
+				}
+				if err := store.CreateJobWithEvent(context.Background(), db.Job{
+					ID: "objection-queued", Agent: "gm-review-opus", Type: "review",
+					State: string(JobQueued), Payload: encoded,
+				}, db.JobEvent{Kind: string(JobQueued), Message: "queued"}); err != nil {
+					t.Fatalf("CreateJobWithEvent: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, gh, gate, request := newMergeGateQuorumScenario(t)
+			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+				id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
+			})
+			tt.seed(t, store)
+			if err := store.UpsertTask(ctx, db.Task{
+				ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+				State: string(TaskReadyToMerge),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			request.Reviewer = "audit"
+			request.ExpectedTaskState = string(TaskReadyToMerge)
+			request.Branch = tt.requestBranch
+
+			decision, err := gate.Evaluate(ctx, request)
+
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v (%s)", err, tt.why)
+			}
+			wantMerge := tt.wantMerge == nil || *tt.wantMerge
+			if wantMerge && (!decision.Merged || len(gh.merges) != 1) {
+				t.Fatalf("decision=%+v merges=%d, want ONE completed merge: %s", decision, len(gh.merges), tt.why)
+			}
+			if !wantMerge && (decision.Merged || len(gh.merges) != 0) {
+				t.Fatalf("decision=%+v merges=%d, want NO merge: %s", decision, len(gh.merges), tt.why)
+			}
+			if tt.wantReasonContains != "" && !strings.Contains(decision.Reason.Render(), tt.wantReasonContains) {
+				t.Fatalf("reason = %q, want it to contain %q: %s", decision.Reason.Render(), tt.wantReasonContains, tt.why)
+			}
+		})
+	}
+}
+
+// insertMergeGateHeadlessReviewAt is insertMergeGateHeadlessReview with the
+// recorded timestamps pinned, which is the only way to make supersession
+// decidable between two headless rows: reviewRoundKeyForJob falls back to
+// UpdatedAt then CreatedAt when no round is set, and rows whose order cannot be
+// established supersede in neither direction by design.
+func insertMergeGateHeadlessReviewAt(t *testing.T, store *db.Store, id, agent, decision, taskID, round, recorded string) {
+	t.Helper()
+	insertMergeGateHeadlessReview(t, store, id, agent, decision, taskID, round)
+	setMergeGateJobTimestamps(t, store, id, recorded)
+}
+
+// boolPtr expresses an explicit false in a table whose default is true.
+func boolPtr(v bool) *bool { return &v }
+
+// TestPolicyMergeGateBlocksASessionReviewObjectionWithNeitherHeadNorRound is
+// #1950's P1 F1, and it is built through the PRODUCTION session writers rather
+// than a hand-assembled row, because the whole point is what those writers
+// actually persist: OpenExternalJob stores neither HeadSHA nor ReviewRound and
+// demotes any supplied head to a display event (session_job.go:85-125), and
+// CloseExternalJobWithUsage then stores the verdict and succeeds the row
+// (session_job.go:170-190). That is `gitmoot job record --type review`
+// (internal/cli/job_session.go:214-305).
+//
+// A predicate that excluded roundless rows dropped this real objection and let
+// the external merge complete. The discriminator is ORIGIN - the row is
+// externally driven - never the absence of a round.
+func TestPolicyMergeGateBlocksASessionReviewObjectionWithNeitherHeadNorRound(t *testing.T) {
+	ctx := context.Background()
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
+	})
+
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	if _, err := mailbox.OpenExternalJob(ctx, JobRequest{
+		ID:          "session-review-objection",
+		Agent:       "session-reviewer",
+		Action:      "review",
+		Repo:        "gitmoot/gitmoot",
+		PullRequest: 9,
+		TaskID:      "task-9",
+		HeadSHA:     "head123", // demoted to a display event on purpose
+		Sender:      "session",
+	}); err != nil {
+		t.Fatalf("OpenExternalJob returned error: %v", err)
+	}
+	closed, err := mailbox.CloseExternalJobWithUsage(ctx, "session-review-objection", AgentResult{
+		Decision: "changes_requested", Severity: reviewseverity.P1, Summary: "session objection",
+	}, 0, "", "", ExternalJobUsage{})
+	if err != nil {
+		t.Fatalf("CloseExternalJobWithUsage returned error: %v", err)
+	}
+	// The writers really do leave both fields empty - assert it rather than trust
+	// the comment, since the whole finding turned on this being true.
+	closedPayload, err := unmarshalPayload(closed.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload: %v", err)
+	}
+	if strings.TrimSpace(closedPayload.HeadSHA) != "" || strings.TrimSpace(closedPayload.ReviewRound) != "" {
+		t.Fatalf("session review payload head=%q round=%q, want both empty; the fixture no longer reproduces the finding",
+			closedPayload.HeadSHA, closedPayload.ReviewRound)
+	}
+	if !closed.ExternallyDriven {
+		t.Fatalf("session review job ExternallyDriven=false, want true; the discriminator this fix relies on is absent")
+	}
+
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request.Reviewer = "audit"
+	request.ExpectedTaskState = string(TaskReadyToMerge)
+
+	decision, evalErr := gate.Evaluate(ctx, request)
+
+	if evalErr != nil {
+		t.Fatalf("Evaluate returned error: %v", evalErr)
+	}
+	if decision.Merged || len(gh.merges) != 0 {
+		t.Fatalf("decision=%+v merges=%d, want NO merge: a session review objection carrying neither head nor round is a real blocking verdict (#1933/#1950 F1)",
+			decision, len(gh.merges))
+	}
+	task, taskErr := store.GetTask(ctx, "task-9")
+	if taskErr != nil {
+		t.Fatalf("GetTask: %v", taskErr)
+	}
+	if task.State != string(TaskReadyToMerge) {
+		t.Fatalf("task state = %q, want %q: the gate must not transition or claim the task state when a session objection blocks",
+			task.State, string(TaskReadyToMerge))
+	}
+}
+
+// openSessionReviewObjection records a changes_requested session review through
+// the PRODUCTION writers. agent and actingRole are passed exactly as a caller
+// would: OpenExternalJob supports a role IN PLACE OF an agent, and that shape is
+// what #1950 F2 turned on.
+func openSessionReviewObjection(t *testing.T, store *db.Store, id, agent, actingRole, decision string, severity string) {
+	t.Helper()
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	if _, err := mailbox.OpenExternalJob(context.Background(), JobRequest{
+		ID:            id,
+		Agent:         agent,
+		ActingOrgRole: actingRole,
+		Action:        "review",
+		Repo:          "gitmoot/gitmoot",
+		PullRequest:   9,
+		TaskID:        "task-9",
+		Sender:        "session",
+	}); err != nil {
+		t.Fatalf("OpenExternalJob(%s) returned error: %v", id, err)
+	}
+	result := AgentResult{Decision: decision, Summary: "session verdict"}
+	if severity != "" {
+		result.Severity = severity
+	}
+	if _, err := mailbox.CloseExternalJobWithUsage(context.Background(), id, result, 0, "", "", ExternalJobUsage{}); err != nil {
+		t.Fatalf("CloseExternalJobWithUsage(%s) returned error: %v", id, err)
+	}
+}
+
+// TestPolicyMergeGateAllowsAnActingRoleSessionObjectionToBeSuperseded is #1950
+// F2: OpenExternalJob supports ActingOrgRole in place of Agent, persisting
+// Agent="" with the normalized role. The headless scan derived reviewer identity
+// from job.Agent alone, so with an empty agent supersession was SKIPPED - a
+// role's objection could never be answered by that role's own later approval,
+// which is a block with no operator move available.
+//
+// Both arms run through the production writers. The blocking arm also asserts the
+// refusal NAMES the role: rendering "objection from  " tells an operator nothing.
+func TestPolicyMergeGateAllowsAnActingRoleSessionObjectionToBeSuperseded(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		addApproval bool
+		wantMerge   bool
+		// noIdentity drops BOTH the agent and the acting role, which is the shape
+		// that can never be superseded and therefore must never be excluded.
+		noIdentity bool
+	}{
+		{name: "the role's objection alone still blocks, and names the role", addApproval: false, wantMerge: false},
+		{name: "a later approval from the SAME role supersedes it", addApproval: true, wantMerge: true},
+		{
+			// ROUND 1 MUST NOT BE WEAKENED. A row with no usable identity at all -
+			// neither agent nor acting role - can never be superseded by anyone, so it
+			// must still BLOCK rather than be skipped. Under-blocking is how F1
+			// happened; this arm is what stops the identity fix from re-introducing it.
+			name: "DEFENSIVE INVARIANT (no supported writer produces this): a row with no usable identity still blocks", noIdentity: true, wantMerge: false,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, gh, gate, request := newMergeGateQuorumScenario(t)
+			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+				id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
+			})
+			if tt.noIdentity {
+				// THIS ARM IS A DEFENSIVE INVARIANT, NOT PRODUCTION-WRITER COVERAGE, and
+				// the previous comment here overclaimed by calling the row "reachable".
+				// #1950 F3 is right: no supported writer can produce Type=review with a
+				// round, an empty Agent AND an empty ActingOrgRole. OpenExternalJob
+				// refuses it outright - pinned by
+				// TestOpenExternalJobRefusesAReviewWithNeitherAgentNorActingRole below -
+				// and every ordinary engine, CLI, daemon, pipeline, delegation and retry
+				// insert goes through Mailbox validation, which requires an agent.
+				//
+				// It is asserted anyway because the gate must FAIL CLOSED on a row it
+				// cannot attribute, whatever produced it: a legacy row from before that
+				// validation, a corrupted payload, or a future writer nobody has
+				// enumerated. insertCompletedJob deliberately bypasses the validators to
+				// construct that state, which is exactly why this is labelled a
+				// corruption/legacy invariant rather than evidence about production.
+				insertCompletedJob(t, store, db.Job{ID: "session-role-objection", Agent: "", Type: "review"}, JobPayload{
+					Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", ReviewRound: "review-1",
+					Result: &AgentResult{Decision: "changes_requested", Severity: reviewseverity.P1, Summary: "authorless objection"},
+				})
+			} else {
+				openSessionReviewObjection(t, store, "session-role-objection", "", "reviewer", "changes_requested", reviewseverity.P1)
+			}
+			if tt.addApproval {
+				// Same ROLE, no agent, strictly later: this is the only move the
+				// operator has, and before the fix it could not clear the block.
+				setMergeGateJobTimestamps(t, store, "session-role-objection", "2026-09-01T10:00:00Z")
+				openSessionReviewObjection(t, store, "session-role-approval", "", "reviewer", "approved", "")
+				setMergeGateJobTimestamps(t, store, "session-role-approval", "2026-09-01T14:00:00Z")
+			}
+			if err := store.UpsertTask(ctx, db.Task{
+				ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+				State: string(TaskReadyToMerge),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			request.Reviewer = "audit"
+			request.ExpectedTaskState = string(TaskReadyToMerge)
+
+			decision, err := gate.Evaluate(ctx, request)
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if tt.wantMerge && (!decision.Merged || len(gh.merges) != 1) {
+				t.Fatalf("decision=%+v merges=%d, want ONE merge: a later approval from the same acting role must supersede that role's objection (#1950 F2)",
+					decision, len(gh.merges))
+			}
+			if !tt.wantMerge {
+				if decision.Merged || len(gh.merges) != 0 {
+					t.Fatalf("decision=%+v merges=%d, want NO merge: an acting-role session objection is a real blocking verdict", decision, len(gh.merges))
+				}
+				wantAuthor := "reviewer"
+				if tt.noIdentity {
+					// Never an empty name: that is the line a human reads while working
+					// out why a merge is stuck.
+					wantAuthor = "an unattributed reviewer"
+				}
+				rendered := decision.Reason.Render()
+				if !strings.Contains(rendered, wantAuthor) {
+					t.Fatalf("reason = %q, want %q named; an empty author leaves an operator with nobody to go to", rendered, wantAuthor)
+				}
+				if !tt.noIdentity && strings.Contains(rendered, "an unattributed reviewer") {
+					t.Fatalf("reason = %q, want the ROLE named and NOT the unattributed fallback; matching %q alone also accepts \"an unattributed reviewer\", which is why a diagnostic-only revert stayed green (#1950 F4)", rendered, wantAuthor)
+				}
+			}
+		})
+	}
+}
+
+// TestPolicyMergeGateAttributesAnImplementRowToItsAgentNotItsDispatchingRole
+// pins the AGENT-FIRST half of effectiveReviewerIdentity, which nothing in the
+// package covered: inverting that order so a role wins passed the entire
+// internal/workflow suite. Extracting the rule into one shared function (#1950
+// F4) concentrates the risk, so the order needs its own guard.
+//
+// The hazard is the one the collector's own comment names. An ordinary dispatched
+// implement row carries the DISPATCHING coordinator's ActingOrgRole in its
+// payload. Read the role first and that coordinator becomes an implementer of
+// everything - and is then disqualified from reviewing anything. This asserts the
+// consequence rather than the mechanism: the coordinator's own approval must
+// still count as independent, so the merge proceeds.
+func TestPolicyMergeGateAttributesAnImplementRowToItsAgentNotItsDispatchingRole(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: "wave-impl", Type: "implement"}, JobPayload{
+		Repo:          "gitmoot/gitmoot",
+		PullRequest:   9,
+		TaskID:        "task-9",
+		ActingOrgRole: "coordinator", // the DISPATCHER's role, not the implementer
+		Result:        &AgentResult{Decision: "implemented", Summary: "implemented"},
+	})
+	// AGENT-authored, and its name deliberately COLLIDES with the dispatching role
+	// above. That collision is what makes the attribution order observable: with
+	// agent-first the implement row belongs to wave-impl and this reviewer is
+	// independent, while role-first would make "coordinator" the implementer and
+	// turn this into self-approval. An author-LESS approval cannot be used here -
+	// the current-head arm refuses it as "no recorded reviewer author", which is a
+	// different guard and would test the wrong thing.
+	insertCompletedJob(t, store, db.Job{ID: "review-role-approval", Agent: "coordinator", Type: "review"}, JobPayload{
+		Repo:        "gitmoot/gitmoot",
+		PullRequest: 9,
+		HeadSHA:     "head123",
+		TaskID:      "task-9",
+		ReviewRound: "review-1",
+		Result:      &AgentResult{Decision: "approved", Summary: "approved by an agent named for the role"},
+	})
+	mergeable := true
+	gh := &fakeMergeGateGitHub{
+		pr: github.PullRequest{
+			Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+			HeadSHA: "head123", Mergeable: &mergeable,
+		},
+		status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+		checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+		mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+	}
+	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if !decision.Merged || len(gh.merges) != 1 {
+		t.Fatalf("decision=%+v merges=%d, want ONE merge: reading the acting role BEFORE the agent makes the dispatching coordinator an implementer of everything and disqualifies it from reviewing (#1950 F4). reason=%q",
+			decision, len(gh.merges), decision.Reason.Render())
+	}
+}
+
+// TestPolicyMergeGateReachesIndependenceForARoleAuthoredApproval covers ruling
+// 126350's third identity site. The at-head reviewer arm read job.Agent alone,
+// so a ROLE-AUTHORED approval was refused as "no recorded reviewer author"
+// BEFORE the independence check ran - which also means the role's own
+// self-approval was never tested for. The arms below drive both directions, so a
+// fix that merely stopped refusing such rows would fail the self-approval arm.
+func TestPolicyMergeGateReachesIndependenceForARoleAuthoredApproval(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		implementAgent string
+		implementRole  string
+		approvalRole   string
+		wantMerge      bool
+		wantReason     string
+	}{
+		{
+			name:           "a different role approves an agent's work: independent, so it merges",
+			implementAgent: "wave-impl",
+			approvalRole:   "reviewer",
+			wantMerge:      true,
+		},
+		{
+			name:          "the SAME role that implemented cannot approve its own work",
+			implementRole: "reviewer",
+			approvalRole:  "reviewer",
+			wantMerge:     false,
+			// Self-approval, NOT "no recorded reviewer author": the point of the fix is
+			// that the row reaches the independence check at all.
+			wantReason: "the implementing agent",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: tt.implementAgent, Type: "implement"}, JobPayload{
+				Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+				ActingOrgRole: tt.implementRole,
+				Result:        &AgentResult{Decision: "implemented", Summary: "implemented"},
+			})
+			insertCompletedJob(t, store, db.Job{ID: "review-role-approval", Agent: "", Type: "review"}, JobPayload{
+				Repo: "gitmoot/gitmoot", PullRequest: 9, HeadSHA: "head123", TaskID: "task-9",
+				ReviewRound:   "review-1",
+				ActingOrgRole: tt.approvalRole,
+				Result:        &AgentResult{Decision: "approved", Summary: "approved by a role"},
+			})
+			mergeable := true
+			gh := &fakeMergeGateGitHub{
+				pr: github.PullRequest{
+					Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+					HeadSHA: "head123", Mergeable: &mergeable,
+				},
+				status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+				checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+				mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+			}
+			gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+			decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			rendered := decision.Reason.Render()
+			if tt.wantMerge && (!decision.Merged || len(gh.merges) != 1) {
+				t.Fatalf("decision=%+v merges=%d, want ONE merge: a role-authored approval must reach the independence check through its normalized role. reason=%q",
+					decision, len(gh.merges), rendered)
+			}
+			if !tt.wantMerge {
+				if decision.Merged || len(gh.merges) != 0 {
+					t.Fatalf("decision=%+v merges=%d, want NO merge: the same role cannot approve its own implementation", decision, len(gh.merges))
+				}
+				if !strings.Contains(rendered, tt.wantReason) {
+					t.Fatalf("reason = %q, want it to name %q; refusing the row as merely unattributed would pass a bare no-merge assertion while never reaching independence",
+						rendered, tt.wantReason)
+				}
+				if strings.Contains(rendered, "no recorded reviewer author") {
+					t.Fatalf("reason = %q, want the INDEPENDENCE refusal rather than the unattributed fallback (#1950 F4, ruling 126350)", rendered)
+				}
+			}
+		})
+	}
+}
+
+// TestPolicyMergeGateSupersedesARoleAuthoredAtHeadObjection is #1950 F4's SIXTH
+// identity site, reproduced as the certifying reviewer's adversary did it.
+// Current-head supersession compared Agent columns inline while every other site
+// had been routed through the resolver, so an at-head objection authored by an
+// acting ROLE could never be superseded by that same role's later at-head
+// approval: both Agent columns are empty, the loop skipped them, and the PR
+// stayed open rendering "blocking result from " with no author.
+//
+// The role is deliberately written " ReVieWer " with padding and mixed case,
+// because NormalizeActingOrgRole trims and lowercases and the two rows must
+// resolve to ONE identity. A fix that compared raw role strings would fail here.
+func TestPolicyMergeGateSupersedesARoleAuthoredAtHeadObjection(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		addApproval bool
+		wantMerge   bool
+	}{
+		{name: "objection alone blocks and NAMES the role", addApproval: false, wantMerge: false},
+		{name: "a later at-head approval from the same normalized role supersedes it", addApproval: true, wantMerge: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: "wave-impl", Type: "implement"}, JobPayload{
+				Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+				Result: &AgentResult{Decision: "implemented", Summary: "implemented"},
+			})
+			insertCompletedJob(t, store, db.Job{ID: "a-review-objection", Agent: "", Type: "review"}, JobPayload{
+				Repo: "gitmoot/gitmoot", PullRequest: 9, HeadSHA: "head123", TaskID: "task-9",
+				ReviewRound:   "review-1",
+				ActingOrgRole: " ReVieWer ",
+				Result:        &AgentResult{Decision: "changes_requested", Severity: reviewseverity.P1, Summary: "role objection at head"},
+			})
+			if tt.addApproval {
+				insertCompletedJob(t, store, db.Job{ID: "b-review-approval", Agent: "", Type: "review"}, JobPayload{
+					Repo: "gitmoot/gitmoot", PullRequest: 9, HeadSHA: "head123", TaskID: "task-9",
+					ReviewRound:   "review-2",
+					ActingOrgRole: "reviewer",
+					Result:        &AgentResult{Decision: "approved", Summary: "same role, later round"},
+				})
+			}
+			mergeable := true
+			gh := &fakeMergeGateGitHub{
+				pr: github.PullRequest{
+					Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+					HeadSHA: "head123", Mergeable: &mergeable,
+				},
+				status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+				checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+				mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+			}
+			gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+			decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			rendered := decision.Reason.Render()
+			if tt.wantMerge && (!decision.Merged || len(gh.merges) != 1) {
+				t.Fatalf("decision=%+v merges=%d, want ONE merge: the same normalized role's later at-head approval must supersede its objection (#1950 F4 site 6). reason=%q",
+					decision, len(gh.merges), rendered)
+			}
+			if !tt.wantMerge {
+				if decision.Merged || len(gh.merges) != 0 {
+					t.Fatalf("decision=%+v merges=%d, want NO merge: an at-head role objection still blocks", decision, len(gh.merges))
+				}
+				if !strings.Contains(rendered, "reviewer") {
+					t.Fatalf("reason = %q, want the normalized ROLE named; rendering \"blocking result from \" with no author is the defect this pins", rendered)
+				}
+			}
+		})
+	}
+}
+
+// TestPolicyMergeGateRefusesWhenAStaleHeadApprovalWouldRetireASessionObjection
+// is #1950 F5 as the certifier reproduced it, and it is a MERGE-INTEGRITY
+// regression rather than a rendering one: at 5423928d this shape MERGED and
+// called the external merge once in each of three runs.
+//
+// The shape: a production session objection carrying neither head nor round; a
+// later approval from the SAME reviewer that is also roundless but names a STALE
+// head; and an independent approval at the evaluated head so nothing else blocks.
+// Both objection and stale approval being roundless, reviewRoundKeyForJob falls
+// back to timestamps, so the stale approval won recency and retired an objection
+// it never spoke for.
+//
+// It enters through Evaluate and asserts ZERO external merge calls, because a
+// helper-level assertion cannot observe the merge this bug performs.
+func TestPolicyMergeGateRefusesWhenAStaleHeadApprovalWouldRetireASessionObjection(t *testing.T) {
+	ctx := context.Background()
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	// Independent approval AT the evaluated head: the gate is otherwise clean.
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
+	})
+	// The objection: production session writers, so neither head nor round.
+	openSessionReviewObjection(t, store, "session-objection", "session-reviewer", "", "changes_requested", reviewseverity.P1)
+	setMergeGateJobTimestamps(t, store, "session-objection", "2026-09-01T10:00:00Z")
+	// The stale-head approval: SAME reviewer, roundless, naming a DIFFERENT head,
+	// recorded LATER so it wins the timestamp fallback.
+	insertCompletedJob(t, store, db.Job{ID: "stale-head-approval", Agent: "session-reviewer", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+		HeadSHA: "staleheadsha",
+		Result:  &AgentResult{Decision: "approved", Summary: "approved an older head"},
+	})
+	setMergeGateJobTimestamps(t, store, "stale-head-approval", "2026-09-01T18:00:00Z")
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+		State: string(TaskReadyToMerge),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request.Reviewer = "audit"
+	request.ExpectedTaskState = string(TaskReadyToMerge)
+
+	decision, err := gate.Evaluate(ctx, request)
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if decision.Merged || len(gh.merges) != 0 {
+		t.Fatalf("decision=%+v merges=%d, want NO merge and ZERO external merge calls: an approval naming %q cannot retire an objection about head %q (#1950 F5)",
+			decision, len(gh.merges), "staleheadsha", "head123")
+	}
+	if task, taskErr := store.GetTask(ctx, "task-9"); taskErr != nil || task.State != string(TaskReadyToMerge) {
+		t.Fatalf("task=%+v err=%v, want the task state unclaimed and unchanged", task, taskErr)
+	}
+}
+
+// TestPolicyMergeGateRefusesNonVerdictCandidatesRetiringAnObjection is #1950 F6.
+// The candidate loop checked head, identity, decision spelling and recency but
+// never whether the candidate was a VERDICT AT ALL, so a later blocked review,
+// failed review, or approved fan-out announcement from the same reviewer retired
+// a live changes_requested session objection - and each of those rows is then
+// itself absent from the blocking population, so an independent at-head approval
+// merged.
+//
+// The objection is built through the production session writers, because that is
+// what caught F6; a helper-level assertion cannot observe the merge.
+//
+// The last two arms are PROBES rather than reported findings: a delegation-child
+// candidate and an engine-inserted roundless remnant both satisfy the measured
+// floor (succeeded, non-fan-out, headless), so they are executed here to find out
+// whether the floor is sufficient or whether those kinds need admitting clauses
+// of their own. Whatever they show is reported as measured, not asserted.
+func TestPolicyMergeGateRefusesNonVerdictCandidatesRetiringAnObjection(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		seed func(t *testing.T, store *db.Store)
+	}{
+		{
+			name: "a later BLOCKED review from the same reviewer is not a verdict",
+			seed: func(t *testing.T, store *db.Store) {
+				seedHeadlessCandidate(t, store, "later-blocked", "session-reviewer", JobBlocked, "approved", nil)
+			},
+		},
+		{
+			name: "a later FAILED review from the same reviewer is not a verdict",
+			seed: func(t *testing.T, store *db.Store) {
+				seedHeadlessCandidate(t, store, "later-failed", "session-reviewer", JobFailed, "approved", nil)
+			},
+		},
+		{
+			name: "a later APPROVED FAN-OUT announcement is a dispatch record, not a verdict",
+			seed: func(t *testing.T, store *db.Store) {
+				seedHeadlessCandidate(t, store, "later-fanout", "session-reviewer", JobSucceeded, "approved",
+					[]Delegation{{ID: "lens-a", Agent: "lens-a", Action: "review", Prompt: "look"}})
+			},
+		},
+		{
+			name: "a delegation-child candidate is already refused by round ordering (probe needed NO clause)",
+			seed: func(t *testing.T, store *db.Store) {
+				encoded, err := marshalPayload(JobPayload{
+					Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", ReviewRound: "review-2",
+					Result: &AgentResult{Decision: "approved", Summary: "child approval"},
+				})
+				if err != nil {
+					t.Fatalf("marshalPayload: %v", err)
+				}
+				if err := store.CreateJobWithEvent(context.Background(), db.Job{
+					ID: "later-child", Agent: "session-reviewer", Type: "review",
+					State: string(JobSucceeded), Payload: encoded,
+					ParentJobID: "implement-job", DelegationID: "verify",
+				}, db.JobEvent{Kind: string(JobSucceeded), Message: "child"}); err != nil {
+					t.Fatalf("CreateJobWithEvent: %v", err)
+				}
+				setMergeGateJobTimestamps(t, store, "later-child", "2026-09-01T18:00:00Z")
+			},
+		},
+		{
+			name: "an engine-inserted roundless remnant is not attributable (probe MERGED before the clause)",
+			seed: func(t *testing.T, store *db.Store) {
+				insertCompletedJob(t, store, db.Job{ID: "later-remnant", Agent: "session-reviewer", Type: "review"}, JobPayload{
+					Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+					Result: &AgentResult{Decision: "approved", Summary: "roundless remnant"},
+				})
+				setMergeGateJobTimestamps(t, store, "later-remnant", "2026-09-01T18:00:00Z")
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, gh, gate, request := newMergeGateQuorumScenario(t)
+			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+				id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
+			})
+			openSessionReviewObjection(t, store, "session-objection", "session-reviewer", "", "changes_requested", reviewseverity.P1)
+			setMergeGateJobTimestamps(t, store, "session-objection", "2026-09-01T10:00:00Z")
+			tt.seed(t, store)
+			if err := store.UpsertTask(ctx, db.Task{
+				ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+				State: string(TaskReadyToMerge),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			request.Reviewer = "audit"
+			request.ExpectedTaskState = string(TaskReadyToMerge)
+
+			decision, err := gate.Evaluate(ctx, request)
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if decision.Merged || len(gh.merges) != 0 {
+				t.Fatalf("decision=%+v merges=%d, want NO merge and ZERO external merge calls: this candidate is not an authoritative verdict and must not retire a live objection (#1950 F6)",
+					decision, len(gh.merges))
+			}
+			if task, taskErr := store.GetTask(ctx, "task-9"); taskErr != nil || task.State != string(TaskReadyToMerge) {
+				t.Fatalf("task=%+v err=%v, want the task state unclaimed", task, taskErr)
+			}
+		})
+	}
+}
+
+// seedHeadlessCandidate inserts a supersession candidate in the ONLY shape that
+// can actually reach the state and fan-out clauses, which took two wrong fixtures
+// to find and both wrong versions PASSED at the previous head:
+//
+//   - HEADLESS. A candidate carrying the evaluated head enters reviewsAtHead,
+//     where a blocked or failed row is refused as a CRASHED REVIEWER - a different
+//     guard entirely.
+//   - ROUNDLESS. The objection is a session row with no round, and reviewRoundKey
+//     deliberately refuses to order an explicit round against an empty one, so a
+//     candidate carrying a round supersedes NOTHING and the arm proves nothing.
+//   - EXTERNALLY DRIVEN, via CreateExternallyDrivenJobWithEvent, because roundless
+//     alone is refused by the attributable-provenance clause. This is what leaves
+//     recency as the only remaining discriminator, so state and fan-out are the
+//     properties actually under test.
+func seedHeadlessCandidate(t *testing.T, store *db.Store, id, agent string, state JobState, decision string, delegations []Delegation) {
+	t.Helper()
+	encoded, err := marshalPayload(JobPayload{
+		Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+		Result: &AgentResult{Decision: decision, Summary: "later candidate", Delegations: delegations},
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.CreateExternallyDrivenJobWithEvent(context.Background(), db.Job{
+		ID: id, Agent: agent, Type: "review", State: string(state), Payload: encoded,
+	}, db.JobEvent{Kind: string(state), Message: "candidate"}); err != nil {
+		t.Fatalf("CreateExternallyDrivenJobWithEvent(%s): %v", id, err)
+	}
+	setMergeGateJobTimestamps(t, store, id, "2026-09-01T18:00:00Z")
+}
+
+// seedProductionReviewRow drives a review through the PRODUCTION writers -
+// Mailbox.Enqueue then finishWithPayload - rather than assembling a row. That is
+// load-bearing for both arms below: the whole of #1950 F5 is that a CLI review
+// carries a HeadSHA and NEITHER a round nor ExternallyDriven, and a hand-built
+// fixture is free to contradict that. This one cannot.
+func seedProductionReviewRow(t *testing.T, store *db.Store, id, agent, decision, headSHA string, delegations []Delegation) db.Job {
+	t.Helper()
+	ctx := context.Background()
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	if _, err := mailbox.Enqueue(ctx, JobRequest{
+		ID: id, Agent: agent, Action: "review", Repo: "gitmoot/gitmoot", Branch: "task-9",
+		TaskID: "task-9", PullRequest: 9, HeadSHA: headSHA, Instructions: "review",
+		SkipNativeReviewFanout: true,
+	}); err != nil {
+		t.Fatalf("Enqueue(%s) returned error: %v", id, err)
+	}
+	// finishWithPayload only accepts a RUNNING job, exactly as the worker leaves it
+	// after claiming. Skipping this made both arms fail on the FIXTURE rather than
+	// on the behaviour under test, which is how the first run of this test failed -
+	// a green or red arm that never reached the predicate proves nothing.
+	if _, err := store.TransitionJobState(ctx, id, string(JobQueued), string(JobRunning)); err != nil {
+		t.Fatalf("TransitionJobState(%s) queued->running: %v", id, err)
+	}
+	queued, err := store.GetJob(ctx, id)
+	if err != nil {
+		t.Fatalf("GetJob(%s): %v", id, err)
+	}
+	payload, err := unmarshalPayload(queued.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(%s): %v", id, err)
+	}
+	payload.Result = &AgentResult{Decision: decision, Summary: "production review", Delegations: delegations}
+	if decision == "changes_requested" {
+		payload.Result.Severity = reviewseverity.P1
+	}
+	if err := mailbox.finishWithPayload(ctx, id, JobSucceeded, "job succeeded", payload); err != nil {
+		t.Fatalf("finishWithPayload(%s): %v", id, err)
+	}
+	stored, err := store.GetJob(ctx, id)
+	if err != nil {
+		t.Fatalf("GetJob(%s) after finish: %v", id, err)
+	}
+	return stored
+}
+
+// TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut covers BOTH P1s the
+// exact-head review of b22667017849b0a460026a68f9bf18d9a89ccd26 found, and they
+// point in OPPOSITE directions - which is why they are pinned together and why
+// each has its own mutant:
+//
+//   - F5, OVER-BLOCKING: the provenance clause demanded external origin or a round
+//     of every candidate, and a CLI review has neither, so a legitimate succeeded
+//     approval at the evaluated head could not retire an objection and the PR
+//     deadlocked. Provenance is now asked only of a HEADLESS row.
+//   - F6, UNDER-BLOCKING: default-deny had been added to the headless loop only,
+//     while the at-head loop still tested a bare Result != nil, so an approved
+//     FAN-OUT announcement at the evaluated head retired a real objection and the
+//     PR merged. Both loops now share the predicate - two call sites, asserted
+//     below as a COUNT, because the previous round claimed that property with one.
+func TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut(t *testing.T) {
+	t.Run("a CLI approval at the evaluated head RETIRES a session objection (F5: must MERGE)", func(t *testing.T) {
+		ctx := context.Background()
+		store, gh, gate, request := newMergeGateQuorumScenario(t)
+		insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+			id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
+		})
+		mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+		if _, err := mailbox.OpenExternalJob(ctx, JobRequest{
+			ID: "cli-session-objection", Agent: "returning-reviewer", Action: "review",
+			Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", Sender: "session",
+		}); err != nil {
+			t.Fatalf("OpenExternalJob returned error: %v", err)
+		}
+		if _, err := mailbox.CloseExternalJobWithUsage(ctx, "cli-session-objection", AgentResult{
+			Decision: "changes_requested", Severity: reviewseverity.P1, Summary: "session objection",
+		}, 0, "", "", ExternalJobUsage{}); err != nil {
+			t.Fatalf("CloseExternalJobWithUsage returned error: %v", err)
+		}
+		setMergeGateJobTimestamps(t, store, "cli-session-objection", "2026-09-01T12:00:00Z")
+
+		cli := seedProductionReviewRow(t, store, "cli-review-approval", "returning-reviewer", "approved", "head123", nil)
+		setMergeGateJobTimestamps(t, store, "cli-review-approval", "2026-09-01T18:00:00Z")
+
+		// Assert the shape rather than trust it: if a CLI review ever starts
+		// carrying a round or an external origin, this arm stops reproducing F5 and
+		// must fail loudly instead of passing for the wrong reason.
+		cliPayload, err := unmarshalPayload(cli.Payload)
+		if err != nil {
+			t.Fatalf("unmarshalPayload: %v", err)
+		}
+		if strings.TrimSpace(cliPayload.HeadSHA) != "head123" {
+			t.Fatalf("CLI review head=%q, want head123; fixture no longer reproduces F5", cliPayload.HeadSHA)
+		}
+		if strings.TrimSpace(cliPayload.ReviewRound) != "" || cli.ExternallyDriven {
+			t.Fatalf("CLI review round=%q externally_driven=%v, want empty/false; fixture no longer reproduces F5",
+				cliPayload.ReviewRound, cli.ExternallyDriven)
+		}
+
+		if err := store.UpsertTask(ctx, db.Task{
+			ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9", State: string(TaskReadyToMerge),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		request.Reviewer = "audit"
+		request.ExpectedTaskState = string(TaskReadyToMerge)
+
+		decision, evalErr := gate.Evaluate(ctx, request)
+		if evalErr != nil {
+			t.Fatalf("Evaluate returned error: %v", evalErr)
+		}
+		if !decision.Merged || len(gh.merges) != 1 {
+			t.Fatalf("decision=%+v merges=%d, want ONE merge: a succeeded CLI approval at the evaluated head is a real verdict and must retire that reviewer's own earlier objection (#1950 F5)",
+				decision, len(gh.merges))
+		}
+	})
+
+	t.Run("an at-head approved FAN-OUT does NOT retire an at-head objection (F6: must BLOCK)", func(t *testing.T) {
+		ctx := context.Background()
+		store, gh, gate, request := newMergeGateQuorumScenario(t)
+		insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+			id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
+		})
+		seedProductionReviewRow(t, store, "at-head-objection", "fanout-reviewer", "changes_requested", "head123", nil)
+		setMergeGateJobTimestamps(t, store, "at-head-objection", "2026-09-01T12:00:00Z")
+		seedProductionReviewRow(t, store, "at-head-fanout", "fanout-reviewer", "approved", "head123",
+			[]Delegation{{ID: "d1", Agent: "specialist", Action: "review", Prompt: "look again"}})
+		setMergeGateJobTimestamps(t, store, "at-head-fanout", "2026-09-01T18:00:00Z")
+
+		if err := store.UpsertTask(ctx, db.Task{
+			ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9", State: string(TaskReadyToMerge),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		request.Reviewer = "audit"
+		request.ExpectedTaskState = string(TaskReadyToMerge)
+
+		decision, evalErr := gate.Evaluate(ctx, request)
+		if evalErr != nil {
+			t.Fatalf("Evaluate returned error: %v", evalErr)
+		}
+		if decision.Merged || len(gh.merges) != 0 {
+			t.Fatalf("decision=%+v merges=%d, want NO merge: an approved fan-out is a dispatch announcement, not a verdict, so it cannot retire that reviewer's own at-head objection (#1950 F6)",
+				decision, len(gh.merges))
+		}
+		task, taskErr := store.GetTask(ctx, "task-9")
+		if taskErr != nil {
+			t.Fatalf("GetTask: %v", taskErr)
+		}
+		if task.State == string(TaskMerged) {
+			t.Fatalf("task state = %q, want it NOT merged", task.State)
+		}
+	})
+
+	t.Run("all THREE populations share the predicate (static census, not a claim)", func(t *testing.T) {
+		source, err := os.ReadFile("merge_gate.go")
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		// THE COUNT IS THE POINT. The previous round advertised "the same predicate
+		// governs the objection side" while the helper had ONE call site, and a
+		// one-line grep would have falsified it. A count fails; a sentence does not.
+		//
+		// Three populations decide whether a row may retire or supersede an
+		// objection: the at-head candidate loop, the headless candidate loop, and
+		// the headless objection scan. Two further objection-side sites MUST differ
+		// and are excluded on stated mechanism, not preference:
+		//
+		//   - the at-head BLOCKING scan is preceded by TWO guards which between them
+		//     let NOTHING non-succeeded reach a merge - measured per state, not
+		//     argued. An earlier version of this comment also called that routing
+		//     DEAD CODE; the blocked-state control DISPROVES it, because blocked
+		//     does reach that scan (and is refused there). The exemption now rests
+		//     only on the measured outcome, not on reachability. THEY ARE NOT ONE
+		//     MECHANISM, and the first version wrongly credited one guard with all
+		//     of it:
+		//     the crashed-reviewer switch takes queued/running (pending) and
+		//     failed/cancelled (error), while BLOCKED has no case there and is
+		//     taken by the unusable-state guard in the slot scan. Deleting the
+		//     switch makes all five states fall through to that guard and still be
+		//     refused - defence in depth, measured, and now pinned per state with
+		//     its reason by
+		//     TestPolicyMergeGateAtHeadStateGuardAdmitsNothingUnsucceeded.
+		//   - the two slot scans decide whether a reviewer's SLOT is filled - a
+		//     fan-out with dispatched children is judged through the children -
+		//     so routing them would change quorum rather than tighten it.
+		guards := strings.Count(string(source), "!reviewRowIsVerdictAboutHead(") +
+			strings.Count(string(source), "!reviewRowCanRetireAnObjection(")
+		if guards != 3 {
+			t.Fatalf("shared-predicate guard call sites = %d, want 3 (at-head candidate, headless candidate, headless objection): if a fourth population appeared it must either route through the shared core or be excluded here with its mechanism (#1950 P1-B)", guards)
+		}
+	})
+
+	t.Run("ASYMMETRY: an externally-driven ROUNDLESS DELEGATION CHILD must not retire (#1950 F6)", func(t *testing.T) {
+		ctx := context.Background()
+		store, gh, gate, request := newMergeGateQuorumScenario(t)
+		insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+			id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
+		})
+		mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+		if _, err := mailbox.OpenExternalJob(ctx, JobRequest{
+			ID: "asym-objection", Agent: "asym-reviewer", Action: "review",
+			Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", Sender: "session",
+		}); err != nil {
+			t.Fatalf("OpenExternalJob returned error: %v", err)
+		}
+		if _, err := mailbox.CloseExternalJobWithUsage(ctx, "asym-objection", AgentResult{
+			Decision: "changes_requested", Severity: reviewseverity.P1, Summary: "session objection",
+		}, 0, "", "", ExternalJobUsage{}); err != nil {
+			t.Fatalf("CloseExternalJobWithUsage returned error: %v", err)
+		}
+		setMergeGateJobTimestamps(t, store, "asym-objection", "2026-09-01T12:00:00Z")
+
+		// THE SHAPE IS THE WHOLE TEST, and the version this replaces got it wrong.
+		// It was NAMED "asym-delegation-child" while building a row that was
+		// non-external, carried ReviewRound review-2, and set NEITHER linkage field
+		// - so it was refused by round ordering and proved nothing about delegation
+		// children. A misnamed fixture reads as coverage to every future reader.
+		// This one is what the finding describes: externally driven (provenance
+		// passes), ROUNDLESS (timestamps order it, so round ordering cannot save
+		// us), and carrying BOTH ParentJobID and DelegationID (so the objection
+		// scan excludes it at merge_gate.go:1060). Admitted as a candidate and
+		// absent as an objection is how it cleared a block it could never impose.
+		encoded, err := marshalPayload(JobPayload{
+			Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+			Result: &AgentResult{Decision: "approved", Summary: "delegation child verdict"},
+		})
+		if err != nil {
+			t.Fatalf("marshalPayload: %v", err)
+		}
+		if err := store.CreateExternallyDrivenJobWithEvent(ctx, db.Job{
+			ID: "asym-delegation-child", Agent: "asym-reviewer", Type: "review",
+			State: string(JobSucceeded), Payload: encoded,
+			ParentJobID: "asym-parent", DelegationID: "asym-delegation",
+		}, db.JobEvent{Kind: string(JobSucceeded), Message: "delegation child"}); err != nil {
+			t.Fatalf("CreateExternallyDrivenJobWithEvent: %v", err)
+		}
+		setMergeGateJobTimestamps(t, store, "asym-delegation-child", "2026-09-01T18:00:00Z")
+		job, err := store.GetJob(ctx, "asym-delegation-child")
+		if err != nil {
+			t.Fatalf("GetJob: %v", err)
+		}
+		payload, err := unmarshalPayload(job.Payload)
+		if err != nil {
+			t.Fatalf("unmarshalPayload: %v", err)
+		}
+		// Assert the fixture really is the finding's shape before asserting
+		// behaviour, so this cannot pass for the wrong reason its predecessor did.
+		if !job.ExternallyDriven || strings.TrimSpace(payload.ReviewRound) != "" || !isDelegationChild(job) {
+			t.Fatalf("fixture is externally_driven=%v round=%q delegation_child=%v; want true/empty/true or it no longer reproduces #1950 F6",
+				job.ExternallyDriven, payload.ReviewRound, isDelegationChild(job))
+		}
+		if reviewRowIsVerdictAboutHead(job, payload, "head123") {
+			t.Fatalf("shared predicate ADMITTED an externally-driven roundless delegation child as a superseding candidate while the objection scan EXCLUDES that same row: it can clear a block it could never impose (#1950 F6)")
+		}
+
+		if err := store.UpsertTask(ctx, db.Task{
+			ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9", State: string(TaskReadyToMerge),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		request.Reviewer = "audit"
+		request.ExpectedTaskState = string(TaskReadyToMerge)
+
+		decision, evalErr := gate.Evaluate(ctx, request)
+		if evalErr != nil {
+			t.Fatalf("Evaluate returned error: %v", evalErr)
+		}
+		if decision.Merged || len(gh.merges) != 0 {
+			t.Fatalf("decision=%+v merges=%d, want ZERO external merge calls: a delegation child is accounted through its parent's fan-out evidence and must not retire a session objection (#1950 F6)", decision, len(gh.merges))
+		}
+		task, taskErr := store.GetTask(ctx, "task-9")
+		if taskErr != nil {
+			t.Fatalf("GetTask: %v", taskErr)
+		}
+		if task.State != string(TaskReadyToMerge) {
+			t.Fatalf("task state = %q, want it left UNCLAIMED at ready_to_merge (#1950 F6)", task.State)
+		}
+	})
+}
+
+// seedMatrixCandidate inserts a candidate with EXACTLY the head/provenance
+// combination named, so each cell of the four-cell matrix is explicit in the
+// fixture rather than implied by a helper's defaults.
+func seedMatrixCandidate(t *testing.T, store *db.Store, id, agent, headSHA, round string, externallyDriven bool) {
+	t.Helper()
+	encoded, err := marshalPayload(JobPayload{
+		Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+		HeadSHA: headSHA, ReviewRound: round,
+		Result: &AgentResult{Decision: "approved", Summary: "matrix candidate"},
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	job := db.Job{ID: id, Agent: agent, Type: "review", State: string(JobSucceeded), Payload: encoded}
+	event := db.JobEvent{Kind: string(JobSucceeded), Message: "matrix candidate"}
+	if externallyDriven {
+		if err := store.CreateExternallyDrivenJobWithEvent(context.Background(), job, event); err != nil {
+			t.Fatalf("CreateExternallyDrivenJobWithEvent(%s): %v", id, err)
+		}
+	} else if err := store.CreateJobWithEvent(context.Background(), job, event); err != nil {
+		t.Fatalf("CreateJobWithEvent(%s): %v", id, err)
+	}
+	setMergeGateJobTimestamps(t, store, id, "2026-09-01T18:00:00Z")
+}
+
+// TestPolicyMergeGateProvenanceScopeMatrix measures ALL FOUR cells of the
+// head/provenance matrix SIMULTANEOUSLY at one head. F5's fix is a scope
+// NARROWING - provenance applies only to headless rows - and this campaign's
+// signature failure is trading one cell for another: round 7 traded stale-head
+// admission for a bypass, round 9 traded remnant exclusion for the CLI deadlock.
+// Three cells plus an argument is what allowed both. The table is the argument.
+func TestPolicyMergeGateProvenanceScopeMatrix(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		headSHA     string
+		round       string
+		extDriven   bool
+		wantRetired bool
+		why         string
+	}{
+		{
+			name: "cell 1: headless WITHOUT provenance must NOT retire", headSHA: "", round: "", extDriven: false, wantRetired: false,
+			why: "the unattributable engine-inserted remnant; admitting it retires a live objection and then vanishes from the blocking population",
+		},
+		{
+			name: "cell 2: headless WITH provenance MUST retire", headSHA: "", round: "", extDriven: true, wantRetired: true,
+			why: "a session-written approval is a real verdict; refusing it would deadlock every session re-review",
+		},
+		{
+			name: "cell 3: head-bearing MATCHING without provenance MUST retire", headSHA: "head123", round: "", extDriven: false, wantRetired: true,
+			why: "the CLI shape - head always, round never, never externally driven. This is the #1950 P1-A deadlock",
+		},
+		{
+			name: "cell 4: head-bearing NON-matching must NOT retire", headSHA: "stale999", round: "", extDriven: false, wantRetired: false,
+			why: "a verdict about a different commit cannot speak for this head",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, gh, gate, request := newMergeGateQuorumScenario(t)
+			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+				id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
+			})
+			mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+			if _, err := mailbox.OpenExternalJob(ctx, JobRequest{
+				ID: "matrix-objection", Agent: "matrix-reviewer", Action: "review",
+				Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", Sender: "session",
+			}); err != nil {
+				t.Fatalf("OpenExternalJob returned error: %v", err)
+			}
+			if _, err := mailbox.CloseExternalJobWithUsage(ctx, "matrix-objection", AgentResult{
+				Decision: "changes_requested", Severity: reviewseverity.P1, Summary: "session objection",
+			}, 0, "", "", ExternalJobUsage{}); err != nil {
+				t.Fatalf("CloseExternalJobWithUsage returned error: %v", err)
+			}
+			setMergeGateJobTimestamps(t, store, "matrix-objection", "2026-09-01T12:00:00Z")
+
+			seedMatrixCandidate(t, store, "matrix-candidate", "matrix-reviewer", tt.headSHA, tt.round, tt.extDriven)
+
+			if err := store.UpsertTask(ctx, db.Task{
+				ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9", State: string(TaskReadyToMerge),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			request.Reviewer = "audit"
+			request.ExpectedTaskState = string(TaskReadyToMerge)
+
+			decision, evalErr := gate.Evaluate(ctx, request)
+			if evalErr != nil {
+				t.Fatalf("Evaluate returned error: %v", evalErr)
+			}
+			if tt.wantRetired && (!decision.Merged || len(gh.merges) != 1) {
+				t.Fatalf("decision=%+v merges=%d, want the objection RETIRED (one merge): %s", decision, len(gh.merges), tt.why)
+			}
+			if !tt.wantRetired && (decision.Merged || len(gh.merges) != 0) {
+				t.Fatalf("decision=%+v merges=%d, want the objection to SURVIVE (no merge): %s", decision, len(gh.merges), tt.why)
+			}
+		})
+	}
+}
+
+// TestPolicyMergeGateAtHeadStateGuardAdmitsNothingUnsucceeded drives EVERY
+// non-succeeded job state through Evaluate at the evaluated head and asserts
+// WHICH mechanism refuses it.
+//
+// This is the LOAD-BEARING ASSUMPTION behind not routing the at-head blocking
+// scan through the shared predicate. Asserting only "no merge" does not test
+// it: the FIRST version of this test asserted exactly that, passed on all five
+// states, AND STILL PASSED ON ALL FIVE WITH THE CRASHED-REVIEWER GUARD DELETED.
+// It was measuring a backstop, not the guard. Pinning the reason string is what
+// makes each state's refusal attributable to a named mechanism.
+//
+// TWO guards precede the scan, which is the correction this test encodes:
+//
+//   - the crashed-reviewer switch: queued/running -> PENDING, failed/cancelled
+//     -> a crashed-reviewer error.
+//   - the unusable-state guard in the slot scan (merge_gate.go:1200): BLOCKED.
+//     The switch has no JobBlocked case, so attributing blocked to it - as an
+//     earlier version of the census comment did - is wrong.
+//
+// Measured: with the crashed-reviewer switch deleted, all five fall through to
+// the unusable-state guard and are still refused. Defence in depth, so no
+// bypass - but the two mechanisms are distinct and are named separately.
+func TestPolicyMergeGateAtHeadStateGuardAdmitsNothingUnsucceeded(t *testing.T) {
+	for _, tt := range []struct {
+		state      JobState
+		wantReason string
+		mechanism  string
+	}{
+		{JobQueued, "waiting for reviewer", "crashed-reviewer switch, pending arm"},
+		{JobRunning, "waiting for reviewer", "crashed-reviewer switch, pending arm"},
+		{JobFailed, "crashed reviewer", "crashed-reviewer switch, error arm"},
+		{JobCancelled, "crashed reviewer", "crashed-reviewer switch, error arm"},
+		{JobBlocked, "has unusable job state", "unusable-state guard in the slot scan, NOT the switch"},
+	} {
+		t.Run(string(tt.state), func(t *testing.T) {
+			ctx := context.Background()
+			store, gh, gate, request := newMergeGateQuorumScenario(t)
+			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+				id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
+			})
+			// An APPROVED result in a non-succeeded state is the dangerous
+			// direction: a row that could be mistaken for a verdict satisfying the
+			// gate. It carries the evaluated head so it lands in the at-head
+			// population these guards are responsible for.
+			encoded, err := marshalPayload(JobPayload{
+				Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", HeadSHA: "head123",
+				Result: &AgentResult{Decision: "approved", Summary: "unsucceeded at-head row"},
+			})
+			if err != nil {
+				t.Fatalf("marshalPayload: %v", err)
+			}
+			if err := store.CreateJobWithEvent(ctx, db.Job{
+				ID: "unsucceeded-at-head", Agent: "state-reviewer", Type: "review",
+				State: string(tt.state), Payload: encoded,
+			}, db.JobEvent{Kind: string(tt.state), Message: "at-head row"}); err != nil {
+				t.Fatalf("CreateJobWithEvent: %v", err)
+			}
+			setMergeGateJobTimestamps(t, store, "unsucceeded-at-head", "2026-09-01T18:00:00Z")
+
+			if err := store.UpsertTask(ctx, db.Task{
+				ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9", State: string(TaskReadyToMerge),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			request.Reviewer = "audit"
+			request.ExpectedTaskState = string(TaskReadyToMerge)
+
+			decision, evalErr := gate.Evaluate(ctx, request)
+			if evalErr != nil {
+				t.Fatalf("Evaluate returned error: %v", evalErr)
+			}
+			if decision.Merged || len(gh.merges) != 0 {
+				t.Fatalf("state %s reached a MERGE: decision=%+v merges=%d. The at-head blocking scan is exempt from the shared predicate ONLY because these guards admit nothing non-succeeded; this state slipped past, so that exemption is a live bypass (#1950 arm 2)",
+					tt.state, decision, len(gh.merges))
+			}
+			if rendered := decision.Reason.Render(); !strings.Contains(rendered, tt.wantReason) {
+				t.Fatalf("state %s refused with reason %q, want it to contain %q (%s). A refusal by the WRONG mechanism means the guard this exemption cites is not the one doing the work (#1950 arm 2)",
+					tt.state, rendered, tt.wantReason, tt.mechanism)
+			}
+		})
+	}
+}
+
+// TestReviewRowSupersedingImpliesObjectable is the invariant directive 127201
+// names: A ROW THAT SUPERSEDES MUST BE A ROW THAT CAN OBJECT.
+//
+// #1950 F6 was neither predicate being wrong on its own - it was the two
+// disagreeing about the SAME row. An externally driven, roundless delegation
+// child was admitted as a superseding candidate and simultaneously excluded
+// from the objection population, so it cleared a block it could never impose.
+// Fixing that one shape leaves the NEXT disagreement free to appear, which is
+// how rounds 5, 7, 8, 9 and 10 each found a new one.
+//
+// So this enumerates the cross product of every field either side reads and
+// asserts CONTAINMENT: admitted-as-candidate implies not-excluded-as-objection.
+// A future clause added to one side and not the other fails here by
+// construction, without anyone having to think of the shape first.
+func TestReviewRowSupersedingImpliesObjectable(t *testing.T) {
+	const headSHA = "head123"
+	heads := []string{"", headSHA, "stale999"}
+	rounds := []string{"", "review-2"}
+	bools := []bool{false, true}
+	states := []JobState{JobSucceeded, JobBlocked, JobFailed}
+
+	checked, admitted := 0, 0
+	for _, head := range heads {
+		for _, round := range rounds {
+			for _, ext := range bools {
+				for _, child := range bools {
+					for _, fanOut := range bools {
+						for _, state := range states {
+							checked++
+							result := &AgentResult{Decision: "approved", Summary: "enumerated row"}
+							if fanOut {
+								result.Delegations = []Delegation{{ID: "d1", Agent: "specialist", Action: "review", Prompt: "look"}}
+							}
+							payload := JobPayload{
+								Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+								HeadSHA: head, ReviewRound: round, Result: result,
+							}
+							job := db.Job{
+								ID: "enumerated", Agent: "reviewer", Type: "review",
+								State: string(state), ExternallyDriven: ext,
+							}
+							if child {
+								job.ParentJobID, job.DelegationID = "parent", "delegation"
+							}
+							if !reviewRowIsVerdictAboutHead(job, payload, headSHA) {
+								continue
+							}
+							admitted++
+							// Every reason the OBJECTION populations drop a row. If an
+							// admitted candidate matches any of them, that row can
+							// supersede an objection while being unable to be one.
+							switch {
+							case JobState(job.State) != JobSucceeded:
+								t.Errorf("admitted candidate is not succeeded (state=%s): the objection scans skip it, so it can retire a block it cannot impose", state)
+							case payload.Result == nil:
+								t.Errorf("admitted candidate has no result: the objection scans skip it")
+							case reviewRowIsFanOut(payload.Result):
+								t.Errorf("admitted candidate is a fan-out announcement: all four objection sites skip it")
+							case isDelegationChild(job):
+								t.Errorf("admitted candidate is a delegation child (head=%q round=%q ext=%v): the objection scan excludes it at merge_gate.go:1060 - this is #1950 F6 exactly", head, round, ext)
+							case isIntegrationWorktreeReview(payload):
+								t.Errorf("admitted candidate is an integration-worktree review: the headless objection scan excludes it")
+							case strings.TrimSpace(head) != "" && strings.TrimSpace(head) != headSHA:
+								t.Errorf("admitted candidate carries a foreign head %q", head)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	// Guard against the enumeration silently becoming vacuous: if a future clause
+	// refuses everything, containment holds trivially and proves nothing.
+	if admitted == 0 {
+		t.Fatalf("enumerated %d shapes and NONE were admitted as candidates; containment then holds vacuously and this test proves nothing", checked)
+	}
+	t.Logf("enumerated %d shapes, %d admitted as superseding candidates, all of them objectable", checked, admitted)
+}

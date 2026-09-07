@@ -458,3 +458,32 @@ func hasEventKind(events []db.JobEvent, kind string) bool {
 	}
 	return false
 }
+
+// TestOpenExternalJobRefusesAReviewWithNeitherAgentNorActingRole is the
+// committed writer-refusal control #1950 F3 asked for. The merge gate's headless
+// scan carries a fail-closed arm for a review row with no usable identity, and
+// that arm has to be honest about its provenance: no supported writer produces
+// such a row, because this validator refuses it.
+//
+// Pinning the refusal here is what stops the gate's arm from being described as
+// production coverage, and it will fail if the requirement is ever relaxed - at
+// which point that arm stops being merely defensive and needs a real fixture.
+func TestOpenExternalJobRefusesAReviewWithNeitherAgentNorActingRole(t *testing.T) {
+	store := openEngineStore(t)
+	_, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).
+		OpenExternalJob(context.Background(), JobRequest{
+			ID:          "session-no-identity",
+			Action:      "review",
+			Repo:        "gitmoot/gitmoot",
+			PullRequest: 9,
+			TaskID:      "task-9",
+			Sender:      "session",
+		})
+	if err == nil {
+		t.Fatal("OpenExternalJob accepted a review with neither Agent nor ActingOrgRole; the merge gate's no-identity arm is documented as unreachable through production writers and that is no longer true")
+	}
+	const want = "job agent or acting org role is required"
+	if got := err.Error(); got != want {
+		t.Fatalf("OpenExternalJob error = %q, want exactly %q; strings.Contains here let a PREFIXED message pass, so this control did not pin the string it claims to (#1950 F3)", got, want)
+	}
+}

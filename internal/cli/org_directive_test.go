@@ -326,13 +326,15 @@ func TestDirectiveWakeOutboxIsConfigInert(t *testing.T) {
 
 	// MUTANT F3: treating an unmatched directive as an unhealthy obligation
 	// makes this zero-directive-rule drain return a permanent error.
-	if _, err := drainReplyWakeOutboxWithHealth(context.Background(), store, createdAt.Add(replyWakeCoalescingWindow+time.Second), replyWakeTestDeliveryResolver(deliverySink)); err != nil {
+	if _, err := drainReplyWakeOutboxWithHealth(context.Background(), store, createdAt.Add(replyWakeCoalescingWindow+time.Second), replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(deliverySink)); err != nil {
 		t.Fatalf("config-inert drain for directive %d: %v", directive.ID, err)
 	}
 	health, err := wakeOutboxObligationHealth(
 		context.Background(),
 		store,
 		createdAt.Add(-time.Minute),
+		createdAt.Add(replyWakeCoalescingWindow+time.Second),
+		replyWakeCoalescingWindow,
 		replyWakeTestDeliveryResolver(deliverySink),
 	)
 	if err != nil || health.pending != 0 || health.inert != 1 {
@@ -387,7 +389,7 @@ func TestDirectiveWakeOutboxUsesSeparateCoalesceNamespace(t *testing.T) {
 	}
 
 	latest, _ := time.Parse(time.RFC3339Nano, pending[len(pending)-1].CreatedAt)
-	if _, err := drainReplyWakeOutboxWithHealth(ctx, store, latest.Add(replyWakeCoalescingWindow+time.Second), replyWakeTestDeliveryResolver(deliverySink)); err != nil {
+	if _, err := drainReplyWakeOutboxWithHealth(ctx, store, latest.Add(replyWakeCoalescingWindow+time.Second), replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(deliverySink)); err != nil {
 		t.Fatalf("coalesced drain: %v", err)
 	}
 	directivePrompt := ""

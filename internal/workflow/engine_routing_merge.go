@@ -62,7 +62,44 @@ func validatePullRequestEvent(event PullRequestEvent) error {
 	return nil
 }
 
-func (e Engine) dispatchFix(ctx context.Context, reviewer string, payload JobPayload, result AgentResult, ref taskRef) error {
+func (e Engine) dispatchFix(ctx context.Context, verdictJob db.Job, reviewer string, payload JobPayload, result AgentResult, ref taskRef) error {
+	// ONE FIX LEG PER BRANCH AT A TIME (#1533). A two-family panel that both
+	// object dispatches one leg PER VERDICT with no mutual exclusion. Each leg
+	// starts from the head it was dispatched against, works for minutes, and
+	// pushes; whichever finishes second is GUARANTEED a non-fast-forward
+	// rejection, and that rejection is terminal - daemon_workflow.go maps a push
+	// failure to blockedResultDelivery with no rebase, no retry and no salvage,
+	// so a completed leg's work is discarded.
+	//
+	// Measured on the live store: 34 implement jobs carry "failed to push some
+	// refs", 2026-08-27 through 2026-09-07. Of the 20 whose own window is under
+	// 6h, 14 overlapped another short-window implement leg on the SAME branch.
+	//
+	// THE BRANCH LOCK CANNOT SERVE THIS PURPOSE and it is worth saying why, since
+	// the obvious question is why a lock is not enough: Store.AcquireLock returns
+	// true when the existing owner EQUALS the requester, so one lock admits N
+	// concurrent same-owner legs by design. Every leg in the measured races ran
+	// under the same lock.
+	//
+	// SKIP, NOT BLOCK, and not a queue. Blocking the task would need an operator
+	// resume-work for a condition that resolves itself in minutes. Skipping is
+	// safe because the sibling verdict's substance does not live in this dispatch:
+	// its findings are in the #1822 ledger, still open, and the merge gate refuses
+	// a verdict at a head that has not observed them, so the next round re-raises
+	// them against the head the in-flight leg is about to push. A dropped dispatch
+	// costs one round; a lost race costs a completed leg's work and leaves the
+	// finding open anyway.
+	if active, found, err := e.activeImplementLegOnBranch(ctx, payload); err != nil {
+		return err
+	} else if found {
+		return e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID: verdictJob.ID,
+			Kind:  "auto_fix_skipped_active_leg",
+			Message: fmt.Sprintf(
+				"auto-fix leg not dispatched for %s pull request #%d: implement job %s is already %s on branch %q; a second writer would lose the push race and its work would be discarded. The findings stay open in the ledger and are re-raised against the head that leg pushes",
+				payload.Repo, payload.PullRequest, active.ID, active.State, strings.TrimSpace(payload.Branch)),
+		})
+	}
 	policy, configured, err := e.Store.PullRequestAutoFixPolicyFor(ctx, payload.Repo, payload.PullRequest)
 	if err != nil {
 		return err
@@ -135,6 +172,61 @@ func (e Engine) dispatchFix(ctx context.Context, reviewer string, payload JobPay
 		return err
 	}
 	return nil
+}
+
+// activeImplementLegOnBranch reports a queued or running implement job that
+// already owns this fix leg's write target.
+//
+// THE KEY IS THE BRANCH, because the branch is the resource the legs collide on:
+// they race on `git push`, not on the task row. When the payload carries no
+// branch there is nothing to push to and no branch to key on, so it falls back
+// to the task, which is the same pairing the operator-side refusal uses
+// (findActiveImplementJobForTask takes both).
+//
+// The engine could not simply call that refusal: it lives in internal/cli, and
+// workflow must never import cli. The query is duplicated rather than the
+// dependency inverted, for the same reason db.SucceededReviewVerdicts duplicates
+// ResultIsFanOut, and it is a narrower query than the CLI's - implement jobs
+// only, since a review or ask job on the branch does not push a fix leg's work.
+func (e Engine) activeImplementLegOnBranch(ctx context.Context, payload JobPayload) (db.Job, bool, error) {
+	if e.Store == nil {
+		return db.Job{}, false, nil
+	}
+	repo := strings.TrimSpace(payload.Repo)
+	branch := strings.TrimSpace(payload.Branch)
+	taskID := strings.TrimSpace(payload.TaskID)
+	if repo == "" || (branch == "" && taskID == "") {
+		return db.Job{}, false, nil
+	}
+	active, err := e.Store.ListActiveJobs(ctx)
+	if err != nil {
+		return db.Job{}, false, fmt.Errorf("inspect active implement legs on %s branch %q: %w", repo, branch, err)
+	}
+	for _, job := range active {
+		if job.Type != "implement" {
+			continue
+		}
+		candidate, err := unmarshalPayload(job.Payload)
+		if err != nil {
+			// A payload this engine cannot read cannot be proven to target another
+			// branch, and admitting an unreadable row is how a second writer gets
+			// in. Treat it as an owner of the branch it claims to be on.
+			return job, true, nil
+		}
+		if !strings.EqualFold(strings.TrimSpace(candidate.Repo), repo) {
+			continue
+		}
+		if branch != "" {
+			if strings.TrimSpace(candidate.Branch) == branch {
+				return job, true, nil
+			}
+			continue
+		}
+		if strings.TrimSpace(candidate.TaskID) == taskID {
+			return job, true, nil
+		}
+	}
+	return db.Job{}, false, nil
 }
 
 // autoFixOwner names the agent that will RUN the auto-fix, so it must return

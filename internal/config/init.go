@@ -419,6 +419,11 @@ path = ""
 # directive_ack_ttl = "10m"
 # directive_done_ttl = "0s" # disabled; a per-directive override takes precedence
 # directive_max_nudges = 3
+# wake_coalesce_hold = "5m" # hold a pending wake group after its oldest row, then
+#                           # deliver every due row for that role and kind as one
+#                           # wake. Owner-decided default: 5m trades up to five
+#                           # minutes of wake latency for a measured 32%% fewer
+#                           # interrupts; "5s" restores the pre-2026-09 cadence
 # [org.roles."owner"]
 # scope = ["*"]
 # merge_rule = "owner"

@@ -766,7 +766,7 @@ func TestDirectiveNagInsertToDrainDelivers(t *testing.T) {
 	}
 
 	// And the drain must still accept it.
-	if _, err := drainReplyWakeOutboxWithHealth(ctx, store, time.Now().UTC(), func(context.Context) (replyWakeDelivery, error) {
+	if _, err := drainReplyWakeOutboxWithHealth(ctx, store, time.Now().UTC(), replyWakeCoalescingWindow, func(context.Context) (replyWakeDelivery, error) {
 		return replyWakeDelivery{sink: &recordingSink{}, rules: rules}, nil
 	}); err != nil && strings.Contains(err.Error(), "unsupported source kind") {
 		t.Fatalf("drain REFUSED the nag it was just handed: %v", err)
@@ -951,7 +951,7 @@ func TestDirectiveNagRevivesTheDeliveredWakeRowWithoutDuplicating(t *testing.T) 
 	originalID := initial[0].ID
 
 	// Deliver it, following the real state machine.
-	if _, err := store.ClaimWakeOutbox(ctx, []int64{originalID}, time.Now().UTC()); err != nil {
+	if _, err := store.ClaimWakeOutbox(ctx, originalID, nil, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.FinishWakeOutbox(ctx, []int64{originalID}, db.WakeOutboxStateDelivered, "", time.Now().UTC()); err != nil {

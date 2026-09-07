@@ -227,13 +227,15 @@ func TestWakeOutboxTickHealthIncludesBlockedAndEscalation(t *testing.T) {
 		ctx,
 		store,
 		now.Add(-replyWakeAttemptedUnknownAfter),
+		now.Add(replyWakeCoalescingWindow+time.Second),
+		replyWakeCoalescingWindow,
 		func(ctx context.Context) (replyWakeDelivery, error) {
 			rules, err := store.ListEventRules(ctx)
 			return replyWakeDelivery{rules: rules}, err
 		},
 	)
 	if err == nil || health.pending != 2 || health.inert != 0 ||
-		!strings.Contains(err.Error(), "pending=2 inert=0 route_removed=0 aged_attempted=0") {
+		!strings.Contains(err.Error(), "pending=2 held=0 inert=0 route_removed=0 aged_attempted=0") {
 		t.Fatalf("tick health = %s err=%v, want two routable outstanding obligations", health, err)
 	}
 }
@@ -261,12 +263,14 @@ func TestWakeOutboxHealthDistinguishesRemovedRouteFromNeverConfigured(t *testing
 		ctx,
 		store,
 		time.Now().UTC().Add(-replyWakeAttemptedUnknownAfter),
+		time.Now().UTC().Add(replyWakeCoalescingWindow+time.Second),
+		replyWakeCoalescingWindow,
 		func(context.Context) (replyWakeDelivery, error) {
 			return replyWakeDelivery{}, nil
 		},
 	)
 	if err == nil || health.pending != 0 || health.inert != 1 || health.routeRemoved != 1 ||
-		!strings.Contains(err.Error(), "pending=0 inert=1 route_removed=1 aged_attempted=0") {
+		!strings.Contains(err.Error(), "pending=0 held=0 inert=1 route_removed=1 aged_attempted=0") {
 		t.Fatalf("route-history health = %s err=%v", health, err)
 	}
 }
@@ -310,12 +314,14 @@ func TestWakeOutboxHealthBoundsDeletedRuleLookupToPendingRoutes(t *testing.T) {
 		ctx,
 		store,
 		time.Now().UTC().Add(-replyWakeAttemptedUnknownAfter),
+		time.Now().UTC().Add(replyWakeCoalescingWindow+time.Second),
+		replyWakeCoalescingWindow,
 		func(context.Context) (replyWakeDelivery, error) {
 			return replyWakeDelivery{}, nil
 		},
 	)
 	if err == nil || health.routeRemoved != 1 || health.inert != 0 || health.pending != 0 ||
-		!strings.Contains(err.Error(), "pending=0 inert=0 route_removed=1 aged_attempted=0") {
+		!strings.Contains(err.Error(), "pending=0 held=0 inert=0 route_removed=1 aged_attempted=0") {
 		t.Fatalf("bounded route-history health = %s err=%v, want one relevant tombstone from 101 total", health, err)
 	}
 }
@@ -368,12 +374,20 @@ func TestReplyWakeOutboxDrainFailureDoesNotAbortRepoWork(t *testing.T) {
 		ID: "job-after-unhealthy-wake", Agent: "audit", Action: "ask",
 		Repo: "owner/repo", Branch: "main", PullRequest: 1,
 	})
-	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+	note, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
 		WorkflowID: "release/drain-isolation", Author: "worker", Body: "matching route without a delivery sink",
 		AddressedTarget: "owner",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+	// The row must be PAST its coalescing hold: a row still inside the hold is
+	// held rather than outstanding, so the drain would be healthy and this test
+	// would assert on a fault it never provoked (#1978).
+	setWakeOutboxCreatedAt(
+		t, store.DatabasePath(), fmt.Sprint(note.ID),
+		time.Now().UTC().Add(-2*replyWakeCoalescingWindow),
+	)
 	if err := store.AddEventRule(context.Background(), db.EventRule{
 		ID: "reply-owner", OnKind: "reply", WakeRole: "owner", Enabled: true,
 	}); err != nil {
@@ -462,7 +476,7 @@ func TestReplyWakeOutboxInertHealthDoesNotEscalateSingleRepoLoop(t *testing.T) {
 		t.Fatalf("inert reply wake health reached escalation ladder: %q", stdout.String())
 	}
 	if strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") ||
-		!strings.Contains(stdout.String(), "pending=0 inert=1 route_removed=0 aged_attempted=0") {
+		!strings.Contains(stdout.String(), "pending=0 held=0 inert=1 route_removed=0 aged_attempted=0") {
 		t.Fatalf("inert reply wake health log = %q", stdout.String())
 	}
 }
@@ -528,8 +542,20 @@ func TestReplyWakeOutboxBurstCoalescesToExactlyOneWake(t *testing.T) {
 		t.Fatalf("wake prompt = %q, want %q", wake.prompt, want)
 	}
 	delivered, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateDelivered)
-	if err != nil || len(delivered) != 10 {
-		t.Fatalf("delivered rows = %+v, err=%v", delivered, err)
+	if err != nil || len(delivered) != 1 || delivered[0].SourceID != fmt.Sprint(oldestID) {
+		t.Fatalf("delivered rows = %+v, err=%v, want only the surviving oldest row", delivered, err)
+	}
+	// One wake was delivered, so exactly one row may claim a delivery. The other
+	// nine are recorded superseded into it (#1978); before that they each read
+	// `delivered`, which is what made the coalescing saving uncountable.
+	superseded, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateSuperseded)
+	if err != nil || len(superseded) != 9 {
+		t.Fatalf("superseded rows = %+v, err=%v", superseded, err)
+	}
+	for _, row := range superseded {
+		if row.LastError != db.WakeOutboxCoalescedDetail(delivered[0].ID) {
+			t.Fatalf("superseded row %d last_error = %q, want the surviving row named", row.ID, row.LastError)
+		}
 	}
 }
 
@@ -595,7 +621,17 @@ func TestReplyWakeOutboxKeepsRolesSeparate(t *testing.T) {
 	}
 }
 
-func TestReplyWakeOutboxStartsNewBatchAfterWindow(t *testing.T) {
+// TestReplyWakeOutboxCollapsesDuePendingRowsBeyondTheWindow pins #1978's
+// contract: coalesce_key is what the store records, so two notes for the same
+// key that are BOTH DUE at one drain are one wake, however far apart they were
+// created. The five-second window is a hold on the OLDEST row, not a limit on
+// batch membership.
+//
+// Before the fix these two rows produced two prompts (two rolling windows), and
+// the row that carried no wake of its own was still recorded `delivered`, which
+// is why 250 of 8,806 live rows are `superseded` and every one of those came
+// from a directive receipt rather than from coalescing.
+func TestReplyWakeOutboxCollapsesDuePendingRowsBeyondTheWindow(t *testing.T) {
 	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
 	ctx := context.Background()
 	first, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
@@ -612,18 +648,86 @@ func TestReplyWakeOutboxStartsNewBatchAfterWindow(t *testing.T) {
 	}
 	base := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
 	setWakeOutboxCreatedAt(t, store.DatabasePath(), fmt.Sprint(first.ID), base)
-	setWakeOutboxCreatedAt(t, store.DatabasePath(), fmt.Sprint(second.ID), base.Add(replyWakeCoalescingWindow))
+	setWakeOutboxCreatedAt(t, store.DatabasePath(), fmt.Sprint(second.ID), base.Add(6*replyWakeCoalescingWindow))
 
-	if _, err := drainReplyWakeOutboxWithHealth(ctx, store, base.Add(2*replyWakeCoalescingWindow+time.Second), replyWakeTestDeliveryResolver(sink)); err != nil {
+	if _, err := drainReplyWakeOutboxWithHealth(
+		ctx, store, base.Add(7*replyWakeCoalescingWindow), replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(sink),
+	); err != nil {
 		t.Fatal(err)
 	}
-	if wake.promptCalls != 2 {
-		t.Fatalf("wake calls = %d, want two rolling windows; prompts=%v", wake.promptCalls, wake.prompts)
+	if wake.promptCalls != 1 {
+		t.Fatalf("wake calls = %d, want one collapsed wake; prompts=%v", wake.promptCalls, wake.prompts)
 	}
-	for _, prompt := range wake.prompts {
-		if !strings.Contains(prompt, "1 new items, oldest id ") {
-			t.Fatalf("window prompt = %q", prompt)
+	if !strings.Contains(wake.prompt, "2 new items, oldest id ") {
+		t.Fatalf("collapsed prompt = %q, want both items named", wake.prompt)
+	}
+	// Nothing is dropped: the surviving wake still names every collapsed note.
+	for _, note := range []int64{first.ID, second.ID} {
+		if !strings.Contains(wake.prompt, fmt.Sprintf("gitmoot workflow show-note %d", note)) {
+			t.Fatalf("collapsed prompt = %q, want retrieval command for note %d", wake.prompt, note)
 		}
+	}
+	rows, err := store.ListWakeOutbox(ctx, "")
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("outbox rows = %+v, err=%v", rows, err)
+	}
+	surviving, collapsed := rows[0], rows[1]
+	if surviving.SourceID != fmt.Sprint(first.ID) || collapsed.SourceID != fmt.Sprint(second.ID) {
+		t.Fatalf("row order = %q,%q, want the oldest row first", surviving.SourceID, collapsed.SourceID)
+	}
+	if surviving.State != db.WakeOutboxStateDelivered {
+		t.Fatalf("surviving row state = %q, want %q", surviving.State, db.WakeOutboxStateDelivered)
+	}
+	if collapsed.State != db.WakeOutboxStateSuperseded {
+		t.Fatalf("collapsed row state = %q, want %q", collapsed.State, db.WakeOutboxStateSuperseded)
+	}
+	// The saving is auditable only if the superseded row names its survivor.
+	if want := fmt.Sprintf("coalesced into wake outbox row %d", surviving.ID); collapsed.LastError != want {
+		t.Fatalf("collapsed row last_error = %q, want %q", collapsed.LastError, want)
+	}
+	if collapsed.FinishedAt == "" || collapsed.AttemptCount != 1 {
+		t.Fatalf("collapsed row = %+v, want one recorded attempt and a finish stamp", collapsed)
+	}
+}
+
+// TestReplyWakeOutboxHonorsConfiguredHold pins that the hold is a parameter and
+// not the constant: with a two-minute hold, a group whose oldest row is 90s old
+// is not delivered, and the same group is delivered as one wake at 121s. A
+// drain that ignored the configured value would wake the seat at 90s.
+func TestReplyWakeOutboxHonorsConfiguredHold(t *testing.T) {
+	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
+	ctx := context.Background()
+	const hold = 2 * time.Minute
+	base := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	for index := range 2 {
+		note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID: "release/hold", Author: "worker",
+			Body: fmt.Sprint(index), AddressedTarget: "owner",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		setWakeOutboxCreatedAt(
+			t, store.DatabasePath(), fmt.Sprint(note.ID),
+			base.Add(time.Duration(index)*30*time.Second),
+		)
+	}
+	health, err := drainReplyWakeOutboxWithHealth(
+		ctx, store, base.Add(90*time.Second), hold, replyWakeTestDeliveryResolver(sink),
+	)
+	if err != nil || health.held != 2 || health.pending != 0 {
+		t.Fatalf("held drain health = %s err = %v, want two rows held inside the hold and no fault", health, err)
+	}
+	if wake.promptCalls != 0 {
+		t.Fatalf("configured hold ignored: woke at 90s with a %s hold; prompts=%v", hold, wake.prompts)
+	}
+	if _, err := drainReplyWakeOutboxWithHealth(
+		ctx, store, base.Add(hold+time.Second), hold, replyWakeTestDeliveryResolver(sink),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if wake.promptCalls != 1 || !strings.Contains(wake.prompt, "2 new items, oldest id ") {
+		t.Fatalf("post-hold wake = calls=%d prompt=%q", wake.promptCalls, wake.prompt)
 	}
 }
 
@@ -646,9 +750,10 @@ func TestReplyWakeOutboxFleetDrainRunsWithZeroEnabledRepos(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = drainReplyWakeOutboxWithHealth(ctx, store, oldestAt.Add(replyWakeCoalescingWindow-time.Millisecond), replyWakeTestDeliveryResolver(sink))
-	if err == nil || !strings.Contains(err.Error(), "outstanding obligations: pending=4") {
-		t.Fatalf("pre-window drain health = %v, want four pending obligations", err)
+	health, err := drainReplyWakeOutboxWithHealth(ctx, store, oldestAt.Add(replyWakeCoalescingWindow-time.Millisecond), replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(sink))
+	// A row inside its hold is waiting, not outstanding, so the tick is healthy.
+	if err != nil || health.held != 4 || health.pending != 0 {
+		t.Fatalf("pre-hold drain health = %s err = %v, want four held rows", health, err)
 	}
 	if wake.promptCalls != 0 {
 		t.Fatalf("tail woke before window closed: %v", wake.prompts)
@@ -809,7 +914,7 @@ func TestReplyWakeOutboxZeroRulesReportsInertWithoutUnhealthy(t *testing.T) {
 	if tickErr != nil {
 		t.Fatalf("fleet tick aborted on inert pending-obligation health: %v", tickErr)
 	}
-	if !strings.Contains(stdout.String(), "reply wake outbox drain health: pending=0 inert=1 route_removed=0 aged_attempted=0") ||
+	if !strings.Contains(stdout.String(), "reply wake outbox drain health: pending=0 held=0 inert=1 route_removed=0 aged_attempted=0") ||
 		strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") {
 		t.Fatalf("fleet tick log = %q, want visible inert-only health", stdout.String())
 	}
@@ -862,7 +967,7 @@ func TestReplyWakeOutboxUnrelatedEnabledRuleReportsPendingObligationInert(t *tes
 	if tickErr != nil {
 		t.Fatalf("fleet tick aborted on inert pending-obligation health: %v", tickErr)
 	}
-	if !strings.Contains(stdout.String(), "reply wake outbox drain health: pending=0 inert=1 route_removed=0 aged_attempted=0") ||
+	if !strings.Contains(stdout.String(), "reply wake outbox drain health: pending=0 held=0 inert=1 route_removed=0 aged_attempted=0") ||
 		strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") {
 		t.Fatalf("fleet tick log = %q, want visible inert-only health", stdout.String())
 	}
@@ -885,7 +990,7 @@ func TestReplyWakeOutboxAgedAttemptedExpiresDeliveryUnknownWithoutDuplicateWake(
 		t.Fatalf("pending = %+v, err=%v", pending, err)
 	}
 	attemptedAt := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
-	claimed, err := store.ClaimWakeOutbox(context.Background(), []int64{pending[0].ID}, attemptedAt)
+	claimed, err := store.ClaimWakeOutbox(context.Background(), pending[0].ID, nil, attemptedAt)
 	if err != nil || !claimed {
 		t.Fatalf("simulate pre-crash claim = %v, err=%v", claimed, err)
 	}
@@ -934,23 +1039,29 @@ func TestReplyWakeOutboxAgedAttemptedExpiresDeliveryUnknownWithoutDuplicateWake(
 func TestReplyWakeOutboxRuleDeletedMidDrainRefusesLaterBatch(t *testing.T) {
 	store, sink, wake, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
 	ctx := context.Background()
-	first, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
-		WorkflowID: "release/rule-generation", Author: "worker", Body: "first",
-		AddressedTarget: "owner",
-	})
-	if err != nil {
-		t.Fatal(err)
+	// The later batch has to exist for a reason coalescing cannot remove: the
+	// COUNT BOUND, not a second creation window (#1978). Since every due
+	// pending row for one key now joins one batch, replyWakeMaxCoalescedItems+1
+	// rows are what splits a key into two batches.
+	noteIDs := make([]int64, 0, replyWakeMaxCoalescedItems+1)
+	for index := 0; index <= replyWakeMaxCoalescedItems; index++ {
+		note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID: "release/rule-generation", Author: "worker",
+			Body: fmt.Sprintf("item %d", index), AddressedTarget: "owner",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		noteIDs = append(noteIDs, note.ID)
 	}
-	second, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
-		WorkflowID: "release/rule-generation", Author: "worker", Body: "second",
-		AddressedTarget: "owner",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	first, last := noteIDs[0], noteIDs[len(noteIDs)-1]
 	base := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
-	setWakeOutboxCreatedAt(t, store.DatabasePath(), fmt.Sprint(first.ID), base)
-	setWakeOutboxCreatedAt(t, store.DatabasePath(), fmt.Sprint(second.ID), base.Add(replyWakeCoalescingWindow))
+	for index, noteID := range noteIDs {
+		setWakeOutboxCreatedAt(
+			t, store.DatabasePath(), fmt.Sprint(noteID),
+			base.Add(time.Duration(index)*time.Millisecond),
+		)
+	}
 	wake.onPrompt = func() error {
 		return store.DeleteEventRule(ctx, "reply-0")
 	}
@@ -966,18 +1077,22 @@ func TestReplyWakeOutboxRuleDeletedMidDrainRefusesLaterBatch(t *testing.T) {
 		t.Fatalf("fleet tick aborted on later batch refusal: %v", tickErr)
 	}
 	if !strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") ||
-		!strings.Contains(stdout.String(), "pending=0 inert=0 route_removed=1 aged_attempted=0") {
+		!strings.Contains(stdout.String(), "pending=0 held=0 inert=0 route_removed=1 aged_attempted=0") {
 		t.Fatalf("fleet tick log = %q, want later batch refusal", stdout.String())
 	}
 	if wake.promptCalls != 1 {
 		t.Fatalf("wake calls = %d, want only the authorized first batch; prompts=%v", wake.promptCalls, wake.prompts)
 	}
 	delivered, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateDelivered)
-	if err != nil || len(delivered) != 1 || delivered[0].SourceID != fmt.Sprint(first.ID) {
+	if err != nil || len(delivered) != 1 || delivered[0].SourceID != fmt.Sprint(first) {
 		t.Fatalf("delivered = %+v, err=%v", delivered, err)
 	}
+	superseded, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateSuperseded)
+	if err != nil || len(superseded) != replyWakeMaxCoalescedItems-1 {
+		t.Fatalf("superseded = %+v, err=%v", superseded, err)
+	}
 	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
-	if err != nil || len(pending) != 1 || pending[0].SourceID != fmt.Sprint(second.ID) || pending[0].AttemptCount != 0 {
+	if err != nil || len(pending) != 1 || pending[0].SourceID != fmt.Sprint(last) || pending[0].AttemptCount != 0 {
 		t.Fatalf("pending later batch = %+v, err=%v", pending, err)
 	}
 
@@ -990,7 +1105,7 @@ func TestReplyWakeOutboxRuleDeletedMidDrainRefusesLaterBatch(t *testing.T) {
 		t.Fatalf("second fleet tick aborted on durable route removal: %v", tickErr)
 	}
 	if !strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") ||
-		!strings.Contains(stdout.String(), "pending=0 inert=0 route_removed=1 aged_attempted=0") {
+		!strings.Contains(stdout.String(), "pending=0 held=0 inert=0 route_removed=1 aged_attempted=0") {
 		t.Fatalf("second fleet tick log = %q, want durable later-batch refusal", stdout.String())
 	}
 	if wake.promptCalls != 1 {
@@ -1238,7 +1353,7 @@ func drainReplyWakeAfterAllRowsAreDueResult(t *testing.T, store *db.Store, sink 
 			latest = createdAt
 		}
 	}
-	_, drainErr := drainReplyWakeOutboxWithHealth(context.Background(), store, latest.Add(replyWakeCoalescingWindow+time.Second), replyWakeTestDeliveryResolver(sink))
+	_, drainErr := drainReplyWakeOutboxWithHealth(context.Background(), store, latest.Add(replyWakeCoalescingWindow+time.Second), replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(sink))
 	return drainErr
 }
 
@@ -1307,8 +1422,8 @@ func (s *countingWakeOutboxStore) ExpireAgedWakeOutbox(ctx context.Context, atte
 	return s.inner.ExpireAgedWakeOutbox(ctx, attemptedBefore, now)
 }
 
-func (s *countingWakeOutboxStore) ClaimWakeOutbox(ctx context.Context, ids []int64, now time.Time) (bool, error) {
-	claimed, err := s.inner.ClaimWakeOutbox(ctx, ids, now)
+func (s *countingWakeOutboxStore) ClaimWakeOutbox(ctx context.Context, surviving int64, coalesced []int64, now time.Time) (bool, error) {
+	claimed, err := s.inner.ClaimWakeOutbox(ctx, surviving, coalesced, now)
 	if claimed {
 		s.claims++
 	}
@@ -1344,7 +1459,7 @@ func TestReplyWakeOutboxDrainProjectsOnceWhenNothingIsClaimed(t *testing.T) {
 
 	// This row is deliverable, so the drain claims it and must re-read.
 	claiming := &countingWakeOutboxStore{inner: store}
-	if _, err := drainReplyWakeOutboxWithHealth(ctx, claiming, due, replyWakeTestDeliveryResolver(sink)); err != nil {
+	if _, err := drainReplyWakeOutboxWithHealth(ctx, claiming, due, replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(sink)); err != nil {
 		t.Fatalf("claiming drain: %v", err)
 	}
 	if claiming.claims == 0 {
@@ -1356,7 +1471,7 @@ func TestReplyWakeOutboxDrainProjectsOnceWhenNothingIsClaimed(t *testing.T) {
 
 	// Nothing left to claim: one projection for the whole drain.
 	idle := &countingWakeOutboxStore{inner: store}
-	if _, err := drainReplyWakeOutboxWithHealth(ctx, idle, due, replyWakeTestDeliveryResolver(sink)); err != nil {
+	if _, err := drainReplyWakeOutboxWithHealth(ctx, idle, due, replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(sink)); err != nil {
 		t.Fatalf("idle drain: %v", err)
 	}
 	if idle.claims != 0 {
@@ -1390,11 +1505,11 @@ func TestReplyWakeOutboxReusedProjectionGradesIdentically(t *testing.T) {
 	attemptedBefore := due.UTC().Add(-replyWakeAttemptedUnknownAfter)
 
 	counted := &countingWakeOutboxStore{inner: store}
-	reused, reusedErr := drainReplyWakeOutboxWithHealth(ctx, counted, due, replyWakeTestDeliveryResolver(sink))
+	reused, reusedErr := drainReplyWakeOutboxWithHealth(ctx, counted, due, replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(sink))
 	if counted.claims != 0 || counted.projections != 1 {
 		t.Fatalf("claims=%d projections=%d, want the reuse path (0 and 1)", counted.claims, counted.projections)
 	}
-	fresh, freshErr := wakeOutboxObligationHealth(ctx, store, attemptedBefore, replyWakeTestDeliveryResolver(sink))
+	fresh, freshErr := wakeOutboxObligationHealth(ctx, store, attemptedBefore, due, replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(sink))
 	if reused != fresh {
 		t.Fatalf("reused health %s != freshly read health %s", reused, fresh)
 	}
