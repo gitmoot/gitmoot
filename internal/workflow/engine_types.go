@@ -193,7 +193,34 @@ func (e Engine) mailbox() Mailbox {
 					event.Cause = events.EventCauseReviewVerdict
 					wakeTargetRole = owner
 					event.PullRequest = payload.PullRequest
-					event.ReviewDecision = decision
+					// #1945: THE WAKE ANNOUNCES THE REVIEWER'S RECORDED DECISION, NOT
+					// THE GATE'S TRANSFORMED ONE. `decision` above is
+					// threshold-adjusted, and that adjustment is correct for the merge
+					// gate: a changes_requested whose severity is below the repository
+					// bar does not block a merge. It is NOT correct for a human
+					// notification. review_threshold.go:42 folds changes_requested to
+					// "approved" when the severity does not block, so the wake told a
+					// coordinator `approved` for a job row that records
+					// changes_requested. Measured twice on #1943, hours apart, with
+					// distinct reviewer payload shapes. `approved` is precisely the
+					// word that suppresses the reflex to reread the row.
+					//
+					// ONLY THE ANNOUNCED VALUE CHANGES. Admission above and the
+					// changes_requested retargeting below deliberately keep the
+					// threshold-effective decision: which wake fires, and who
+					// receives it, are gate concerns and are not this defect. The
+					// only divergence the transform can produce is
+					// changes_requested -> approved, so whenever admission passes the
+					// recorded word is also one of the two admitted words; there is
+					// no input where this widens the wake vocabulary, and
+					// TestReviewVerdictWakeVocabularyStaysTwoWords pins that rather
+					// than a defensive branch that no mutant could kill.
+					//
+					// #1685's fan-out exclusion is a DIFFERENT mechanism and is
+					// untouched: it suppresses the wake at the guard above because a
+					// coordinator's dispatch record is not an inspection. This line
+					// runs only for payloads that guard already admitted.
+					event.ReviewDecision = strings.TrimSpace(payload.Result.Decision)
 					if decision == "changes_requested" {
 						// Sender is a transport or agent identity, not necessarily a
 						// routable org role. ActingOrgRole is the persisted requester
