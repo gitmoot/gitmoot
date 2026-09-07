@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"log/slog"
@@ -328,4 +329,131 @@ pane="w1:pb"
 		}
 	}
 	return home, store
+}
+
+// joinProbeEventWake records prompts that RAN TO COMPLETION. The distinction
+// matters: a counter incremented on entry is satisfied by a goroutine that has
+// merely started, which is exactly the state an unjoined command leaves behind.
+type joinProbeEventWake struct {
+	delay time.Duration
+	mu    sync.Mutex
+	done  int
+}
+
+func (w *joinProbeEventWake) Available(context.Context) bool { return true }
+
+func (w *joinProbeEventWake) AgentPrompt(ctx context.Context, _, _, _ string) (bool, bool, error) {
+	select {
+	case <-time.After(w.delay):
+	case <-ctx.Done():
+		return false, false, ctx.Err()
+	}
+	w.mu.Lock()
+	w.done++
+	w.mu.Unlock()
+	return true, false, nil
+}
+
+func (w *joinProbeEventWake) ResolvePaneByLabel(context.Context, string) (string, bool) {
+	return "w1:pa", true
+}
+
+func (w *joinProbeEventWake) completed() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.done
+}
+
+// TestJobRecordJoinsRuleWorkBeforeReleasingItsStore is the test this change was
+// MISSING, added when adopting #1938. It pins the CALL SITE rather than the
+// mechanism.
+//
+// Adopting seat's note, because it is why the test exists. All four tests
+// shipped with the original PR drive `sink.waitForPendingRuleWork` directly. I
+// deleted `waitForEventRuleWork(...)` from runJobRecord, which is the entire
+// production fix at the defect's own seam, and every one of them still passed.
+// A join nothing calls is not a fix, and a suite that cannot tell the
+// difference is not a regression guard.
+//
+// The observable is ORDERING, which is precisely what the join establishes: the
+// detached rule work must have finished before the command returns, because the
+// command closes the store on return. The fake pauses long enough that an
+// unjoined command wins the race every time.
+func TestJobRecordJoinsRuleWorkBeforeReleasingItsStore(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(`
+[org.roles."owner"]
+scope=["*"]
+pane="w1:p0"
+[org.roles."watcher-a"]
+parent="owner"
+scope=["*"]
+pane="w1:pa"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedSessionAgentRepo(t, store)
+	if err := store.AddEventRule(context.Background(), db.EventRule{
+		ID: "wake-watcher-a", OnKind: "job-terminal", WakeRole: "watcher-a",
+		Scope: db.EventRuleScopeObserver, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The sink is process-cached per (home, database), so installing one here is
+	// what puts a fake wake client on the command's real detached path.
+	wake := &joinProbeEventWake{delay: 150 * time.Millisecond}
+	sink := &eventRuleSink{store: store, home: paths.Home, wake: wake}
+	key := strings.TrimSpace(paths.Home) + "\x00" + store.DatabasePath()
+	eventSinkCache.Lock()
+	previous, had := eventSinkCache.rules[key]
+	eventSinkCache.rules[key] = sink
+	eventSinkCache.Unlock()
+	t.Cleanup(func() {
+		eventSinkCache.Lock()
+		if had {
+			eventSinkCache.rules[key] = previous
+		} else {
+			delete(eventSinkCache.rules, key)
+		}
+		eventSinkCache.Unlock()
+		_ = store.Close()
+	})
+
+	var stdout, stderr bytes.Buffer
+	startedAt := time.Now()
+	code := Run([]string{
+		"job", "record", "--home", home,
+		"--agent", "lead",
+		"--repo", "owner/repo",
+		"--type", "review",
+		"--decision", "approved",
+		"--summary", "adopted #1938 call-site guard",
+		"--json",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("job record exit = %d, stderr=%s", code, stderr.String())
+	}
+
+	// Asserted with NO waiting: the point is that the work was already done when
+	// the command returned, because after this line the real command has closed
+	// the store the work reads.
+	// COMPLETED, not started. pacedEventWake counts at entry, which passes with
+	// no join at all: measured, an unjoined command returns in 9.8ms with the
+	// prompt already "counted" and still sleeping. The join is about the work
+	// having FINISHED before the store closes, so that is what is asserted.
+	if got := wake.completed(); got != 1 {
+		t.Fatalf("detached rule work had completed %d prompt(s) when the command returned, want 1; the command released its store underneath its own wake", got)
+	}
+	if elapsed := time.Since(startedAt); elapsed < wake.delay {
+		t.Fatalf("command returned in %s, faster than the %s the detached work needs; it cannot have joined", elapsed, wake.delay)
+	}
 }
