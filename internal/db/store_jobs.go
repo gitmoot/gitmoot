@@ -28,8 +28,15 @@ func rootIDFromPayload(payload string) string {
 }
 
 type jobPayloadProjection struct {
-	WorkflowID             string          `json:"workflow_id"`
-	Repo                   string          `json:"repo"`
+	WorkflowID string `json:"workflow_id"`
+	Repo       string `json:"repo"`
+	// DispatchedBy denormalizes payload.dispatched_by onto the indexed
+	// jobs.dispatched_by column (#1967). Projecting it here rather than reading
+	// job.DispatchedBy is what makes attribution unforgettable: all four INSERT
+	// paths already derive their denormalized columns from the payload, so a
+	// caller that hand-builds a db.Job (the high-risk review coordinator does)
+	// cannot land an attributed payload behind an unattributed row.
+	DispatchedBy           string          `json:"dispatched_by"`
 	PullRequest            int             `json:"pull_request"`
 	BlockerRetryAt         string          `json:"blocker_retry_at"`
 	BlockerSuggestedAction string          `json:"blocker_suggested_action"`
@@ -64,11 +71,11 @@ func (s *Store) CreateJob(ctx context.Context, job Job) error {
 	// the invariant — payload root when set, else self-root — holds regardless of
 	// caller. payload.RootJobID stays the value source of truth.
 	projection := jobProjectionFromPayload(job.Payload)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, model, result_hash, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+	_, err := s.db.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, model, result_hash, parent_job_id, delegation_id, delegation_depth, delegated_by, dispatched_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
 		job.ID, job.Agent, job.Type, job.State, job.Payload, job.Model,
 		jobResultHashFromPayload(job.Payload),
-		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy,
+		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy, projection.DispatchedBy,
 		rootIDFromPayload(job.Payload), job.ID, projection.WorkflowID, projection.Repo, projection.PullRequest,
 		projection.BlockerRetryAt, projection.BlockerSuggestedAction)
 	return err
@@ -94,11 +101,11 @@ func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent,
 // job.ID) denormalizes the rootJobID() rule onto the indexed root_id column.
 func createJobWithEventTx(ctx context.Context, tx *sql.Tx, s *Store, job Job, event JobEvent, additionalEvents ...JobEvent) error {
 	projection := jobProjectionFromPayload(job.Payload)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, model, result_hash, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, model, result_hash, parent_job_id, delegation_id, delegation_depth, delegated_by, dispatched_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
 		job.ID, job.Agent, job.Type, job.State, job.Payload, job.Model,
 		jobResultHashFromPayload(job.Payload),
-		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy,
+		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy, projection.DispatchedBy,
 		rootIDFromPayload(job.Payload), job.ID, projection.WorkflowID, projection.Repo, projection.PullRequest,
 		projection.BlockerRetryAt, projection.BlockerSuggestedAction); err != nil {
 		return err
@@ -191,11 +198,11 @@ func (s *Store) CreateExternallyDrivenJobWithEvent(ctx context.Context, job Job,
 	defer tx.Rollback()
 
 	projection := jobProjectionFromPayload(job.Payload)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, model, result_hash, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, externally_driven, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)`,
+	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, agent, type, state, payload, model, result_hash, parent_job_id, delegation_id, delegation_depth, delegated_by, dispatched_by, root_id, workflow_id, repo, pull_request, blocker_retry_at, blocker_suggested_action, externally_driven, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(NULLIF(?,''), ?), ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)`,
 		job.ID, job.Agent, job.Type, job.State, job.Payload, job.Model,
 		jobResultHashFromPayload(job.Payload),
-		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy,
+		job.ParentJobID, job.DelegationID, job.DelegationDepth, job.DelegatedBy, projection.DispatchedBy,
 		rootIDFromPayload(job.Payload), job.ID, projection.WorkflowID, projection.Repo, projection.PullRequest,
 		projection.BlockerRetryAt, projection.BlockerSuggestedAction); err != nil {
 		return err
@@ -255,9 +262,9 @@ func (s *Store) IsRootJobKilled(ctx context.Context, rootID string) (bool, error
 }
 
 func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, workflow_id, root_killed, input_tokens, output_tokens, updated_at, created_at, externally_driven, lifecycle_generation FROM jobs WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, dispatched_by, workflow_id, root_killed, input_tokens, output_tokens, updated_at, created_at, externally_driven, lifecycle_generation FROM jobs WHERE id = ?`, id)
 	var job Job
-	if err := row.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.WorkflowID, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt, &job.ExternallyDriven, &job.LifecycleGeneration); err != nil {
+	if err := row.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.DispatchedBy, &job.WorkflowID, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt, &job.ExternallyDriven, &job.LifecycleGeneration); err != nil {
 		return Job{}, err
 	}
 	return job, nil
@@ -356,7 +363,7 @@ func (s *Store) LatestDelegationWorktreeCleanupOutcome(ctx context.Context, jobI
 // jobColumns is the shared core projection ListJobs and ListJobsByType both
 // read, kept as one const so their SELECT lists and scanJobs order cannot drift.
 // Workflow-only scalar projections are selected by ListJobsByWorkflow.
-const jobColumns = `id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, workflow_id, root_killed, input_tokens, output_tokens, updated_at, created_at, externally_driven, lifecycle_generation`
+const jobColumns = `id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, dispatched_by, workflow_id, root_killed, input_tokens, output_tokens, updated_at, created_at, externally_driven, lifecycle_generation`
 
 const listJobsByStateSQL = `SELECT ` + jobColumns + ` FROM jobs WHERE state = ? ORDER BY updated_at, id`
 
@@ -368,7 +375,7 @@ func scanJobs(rows *sql.Rows) ([]Job, error) {
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.WorkflowID, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt, &job.ExternallyDriven, &job.LifecycleGeneration); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.DispatchedBy, &job.WorkflowID, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt, &job.ExternallyDriven, &job.LifecycleGeneration); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -487,7 +494,7 @@ func (s *Store) ListJobsByParent(ctx context.Context, parentJobID string) ([]Job
 // idx_jobs_root_id for an indexed lookup instead of a full-table scan that
 // unmarshals every payload. ORDER BY id is deterministic.
 func (s *Store) ListJobsByRoot(ctx context.Context, rootID string) ([]Job, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, root_id, workflow_id, repo, pull_request, root_killed, input_tokens, output_tokens, updated_at, created_at, result_hash
+	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, dispatched_by, root_id, workflow_id, repo, pull_request, root_killed, input_tokens, output_tokens, updated_at, created_at, result_hash
 		FROM jobs WHERE root_id = ? ORDER BY id`, rootID)
 	if err != nil {
 		return nil, err
@@ -497,7 +504,7 @@ func (s *Store) ListJobsByRoot(ctx context.Context, rootID string) ([]Job, error
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootID, &job.WorkflowID, &job.Repo, &job.PullRequest, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt, &job.ResultHash); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.DispatchedBy, &job.RootID, &job.WorkflowID, &job.Repo, &job.PullRequest, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.CreatedAt, &job.ResultHash); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)

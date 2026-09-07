@@ -2707,4 +2707,27 @@ DROP TABLE review_finding_observations;
 ALTER TABLE review_finding_observations_1850 RENAME TO review_finding_observations;
 CREATE INDEX IF NOT EXISTS idx_review_findings_pr ON review_finding_observations(repo, pull_request, observed_at);
 `,
+	// #1967 dispatcher attribution. review_finding_observations records
+	// observer_job (who FOUND it) and source_job (whose claim it repeats), and
+	// nothing recorded who ASKED for the review. Measured on this box's store on
+	// 2026-09-07: 268 of 271 open findings resolved to a job whose sender was the
+	// literal "local", 3 of 271 had any dispatcher field set at all, so the only
+	// identity available downstream was the reviewer agent name - which is
+	// exactly the misrouting mechanism recorded on #1890.
+	//
+	// A separate column rather than reusing parent_job_id: parent_job_id carries
+	// DAG semantics (delegation depth, per-root job budget, loop detection,
+	// root-kill propagation, and the #1277 skip-fanout inheritance that is gated
+	// on it). Back-filling it to make attribution work would silently rewire
+	// termination bounds for every fan-out review. dispatched_by is attribution
+	// only and no scheduler reads it.
+	//
+	// DEFAULT '' preserves every pre-migration row: the 426 findings measured on
+	// #1967 stay unattributable, which the issue states as intended. The partial
+	// index skips them, so it indexes only rows that can answer the question.
+	// Append-only tail; migrations are positional.
+	`
+ALTER TABLE jobs ADD COLUMN dispatched_by TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_jobs_dispatched_by ON jobs(dispatched_by) WHERE dispatched_by != '';
+	`,
 }

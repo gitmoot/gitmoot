@@ -793,6 +793,12 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			RequiredReviewers:       e.requiredReviewers(payload),
 			SkipReviewFanout:        skipFanout,
 			ActingOrgRole:           actingOrgRole,
+			// #1967: the implement job that just opened the PR is the dispatcher.
+			// job.Agent is already used as Sender here, but Sender is a channel on
+			// every other path ("github", "local", "heartbeat"), so attribution
+			// cannot be read off it - it needs its own field to mean the same thing
+			// everywhere.
+			DispatchedBy: job.Agent,
 		}
 		// The branch-lock persist for the daemon's PR-watcher path (trigger 2) now
 		// happens above, before the no-PR early return, so it covers the PR arm and
