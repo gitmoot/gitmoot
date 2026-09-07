@@ -1816,3 +1816,110 @@ func TestPhaseInstrumentHonoursWrapperStacks(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
 	}
 }
+
+// TestPhaseInstrumentHonoursOptionPolarity is #1930 round-15 P2. In shell
+// option syntax `-x` SETS and `+x` CLEARS, and the last setting wins. The
+// scanner accepted both signs and set the suppression bit identically, which
+// inverts the meaning of every option modelled. Measured on the installed
+// bash 5.2 and /usr/bin/dash before the fix was written:
+//
+//	bash +n    -c "go version"  exit 0, Go RAN   (+n clears noexec)
+//	sh   +n    -c "go version"  exit 0, Go RAN
+//	bash -n +n -c "go version"  exit 0, Go RAN   (last setting wins)
+//	bash +n -n -c "go version"  exit 0, no Go
+//	bash -n    -c "go version"  exit 0, no Go
+//	bash +D    -c "go version"  exit 0, no Go    (D suppresses on EITHER sign)
+//	bash +c    "go version"     exit 0, Go RAN
+//	sh   +c    "go version"     exit 0, Go RAN
+func TestPhaseInstrumentHonoursOptionPolarity(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"plus n clears noexec", `bash +n -c "go test ./..."`, phaseBucketTest},
+		{"sh plus n clears noexec", `sh +n -c "go test ./..."`, phaseBucketTest},
+		{"last setting wins, enabled", `bash -n +n -c "go test ./..."`, phaseBucketTest},
+		{"last setting wins, suppressed", `bash +n -n -c "go test ./..."`, phaseBucketOther},
+		{"minus n still suppresses", `bash -n -c "go test ./..."`, phaseBucketOther},
+		{"D suppresses on either sign", `bash +D -c "go test ./..."`, phaseBucketOther},
+		{"plus c still runs a command string", `bash +c "go test ./..."`, phaseBucketTest},
+		{"sh plus c still runs a command string", `sh +c "go test ./..."`, phaseBucketTest},
+		{"plus x is not suppressing", `bash +x -c "go test ./..."`, phaseBucketTest},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentMatchesTheInstalledDash is #1930 round-15 P2 second
+// witness, plus two entries I found by asking which OTHER attribute was still
+// borrowed from bash rather than measured. All against /usr/bin/dash:
+//
+//	sh -h        -c "go version"  exit 2  (the flagged one; bash accepts -h)
+//	sh --help    -c "go version"  exit 2  (found here: dash has NO long options)
+//	sh --version -c "go version"  exit 2  (found here)
+//	sh -o pipefail / -O           exit 2
+//	sh -l -c / -a / -b / -C / -e / -f / -i / -m / -u / -v / -x   all ran Go
+func TestPhaseInstrumentMatchesTheInstalledDash(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"dash rejects h", `sh -h -c "go test ./..."`, phaseBucketUnknown},
+		{"dash rejects long help", `sh --help -c "go test ./..."`, phaseBucketUnknown},
+		{"dash rejects long version", `sh --version -c "go test ./..."`, phaseBucketUnknown},
+		{"bash accepts the same h", `bash -h -c "go test ./..."`, phaseBucketTest},
+		// SHOULD-SUCCEED CONTROLS: a table that refused everything would
+		// satisfy the rows above and break the feature.
+		{"dash login", `sh -l -c "go test ./..."`, phaseBucketTest},
+		{"dash errexit", `sh -e -c "go test ./..."`, phaseBucketTest},
+		{"dash noclobber", `sh -C -c "go test ./..."`, phaseBucketTest},
+		{"dash xtrace", `sh -x -c "go test ./..."`, phaseBucketTest},
+		{"plain dash command string", `sh -c "go test ./..."`, phaseBucketTest},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentKeepsTheZshBoundaryHonest is #1930 round-15 P3: the code
+// and both doc trees said unmeasured zsh declares only `-c` and `--`, but `+c`
+// slipped through because the sign was accepted before the letter was checked.
+// `+c` is measured to run a command string in bash and dash - and carrying an
+// unmeasured shell's behaviour across from a measured one is the assumption the
+// zsh entry exists to avoid, so it refuses.
+func TestPhaseInstrumentKeepsTheZshBoundaryHonest(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"zsh plus c refuses", `zsh +c "go test ./..."`, phaseBucketUnknown},
+		{"zsh options refuse", `zsh -x -c "go test ./..."`, phaseBucketUnknown},
+		{"zsh long options refuse", `zsh --version -c "go test ./..."`, phaseBucketUnknown},
+		// The declared boundary still WORKS, or the refusal would be vacuous.
+		{"zsh minus c is declared", `zsh -c "go test ./..."`, phaseBucketTest},
+		{"zsh option termination is declared", `zsh -- -c "go test ./..."`, phaseBucketOther},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentPrettyPrintRunsTheCommand pins the other entry I had
+// wrong: `--pretty-print` was declared suppressing, but `bash --pretty-print
+// -c "go version"` exits 0 and RUNS Go. Paired with the four that genuinely
+// suppress, so the fix cannot be "call nothing suppressing".
+func TestPhaseInstrumentPrettyPrintRunsTheCommand(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"pretty-print runs the command", `bash --pretty-print -c "go test ./..."`, phaseBucketTest},
+		{"dump-strings suppresses", `bash --dump-strings -c "go test ./..."`, phaseBucketOther},
+		{"dump-po-strings suppresses", `bash --dump-po-strings -c "go test ./..."`, phaseBucketOther},
+		{"help suppresses", `bash --help -c "go test ./..."`, phaseBucketOther},
+		{"version suppresses", `bash --version -c "go test ./..."`, phaseBucketOther},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentPolaritySplitWrites runs the three named witnesses through
+// the seven-byte split-write path, each paired with a should-succeed control.
+func TestPhaseInstrumentPolaritySplitWrites(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"polarity witness", `bash +n -c "go test ./..."`, phaseBucketTest},
+		{"polarity control", `bash -n -c "go test ./..."`, phaseBucketOther},
+		{"dash flag witness", `sh -h -c "go test ./..."`, phaseBucketUnknown},
+		{"dash flag control", `sh -l -c "go test ./..."`, phaseBucketTest},
+		{"zsh witness", `zsh +c "go test ./..."`, phaseBucketUnknown},
+		{"zsh control", `zsh -c "go test ./..."`, phaseBucketTest},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughSplitWrites(t, tc.command, tc.want) })
+	}
+}

@@ -157,42 +157,71 @@ type interpreterGrammar struct {
 	// valueFlags consume the NEXT token as their value.
 	valueFlags string
 	// suppressingFlags parse or print instead of executing, so the command
-	// string does not run.
+	// string does not run - but they are SIGN-SENSITIVE and ORDER-SENSITIVE:
+	// `-n` sets noexec and `+n` clears it, so `bash -n +n -c "go version"` runs
+	// Go while `bash +n -n -c "go version"` does not. Both measured.
 	suppressingFlags string
-	longFlags        map[string]bool
-	longValueFlags   map[string]bool
+	// alwaysSuppressing suppress on EITHER sign. Measured: `bash -D` and
+	// `bash +D` both dump strings and run no Go.
+	alwaysSuppressing string
+	// commandStringPlus records whether `+c` also introduces a command string.
+	// Measured true for bash and dash (`bash +c "go version"` runs Go); left
+	// false for zsh, which is not installed here and therefore not measured.
+	commandStringPlus bool
+	longFlags         map[string]bool
+	longValueFlags    map[string]bool
 	// longSuppressing options print and exit.
 	longSuppressing map[string]bool
 }
 
 var interpreterGrammars = map[string]interpreterGrammar{
 	"bash": {
-		shortFlags:       "abefhiklmprstuvxBCEHPT",
-		valueFlags:       "oO",
-		suppressingFlags: "nD",
+		// Every letter below was measured on BOTH signs: all 22 run Go with
+		// `-f -c "go version"` and with `+f -c "go version"`.
+		shortFlags:        "abefhiklmprstuvxBCEHPT",
+		valueFlags:        "oO",
+		suppressingFlags:  "n",
+		alwaysSuppressing: "D",
+		commandStringPlus: true,
 		longFlags: map[string]bool{
 			"--login": true, "--noprofile": true, "--norc": true, "--posix": true,
 			"--restricted": true, "--verbose": true, "--noediting": true, "--debugger": true,
+			"--pretty-print": true,
 		},
 		longValueFlags: map[string]bool{"--rcfile": true, "--init-file": true},
+		// MEASURED, and this corrected two of my own entries. `--pretty-print`
+		// was declared suppressing and is NOT: `bash --pretty-print -c "go
+		// version"` exits 0 and RUNS Go, so it belongs with the ordinary
+		// flags. These four really do suppress (all exit 0, zero Go).
 		longSuppressing: map[string]bool{
 			"--help": true, "--version": true, "--dump-strings": true,
-			"--dump-po-strings": true, "--pretty-print": true,
+			"--dump-po-strings": true,
 		},
 	},
 	// POSIX sh is dash on this box, and it is NOT bash: it rejects --noprofile,
 	// -O and even `-o pipefail`, all measured. Applying bash's table to it was
 	// the third gap in round-14 F1.
 	"sh": {
-		shortFlags:       "abCefhilmuvx",
-		suppressingFlags: "n",
-		longSuppressing:  map[string]bool{"--help": true, "--version": true},
+		// MEASURED LETTER BY LETTER against the installed /usr/bin/dash. `h` was
+		// declared here from bash's table and is NOT accepted: `sh -h -c "go
+		// version"` exits 2, while this lexer called it a test. Every letter
+		// below ran Go; `n` suppresses and `+n` clears it, both measured.
+		shortFlags:        "abCefilmuvx",
+		suppressingFlags:  "n",
+		commandStringPlus: true,
+		// DASH HAS NO LONG OPTIONS AT ALL. I had copied bash's --help/--version
+		// across; measured, `sh --help -c` and `sh --version -c` BOTH exit 2
+		// with "Illegal option --". So every long option refuses for sh, which
+		// is the same mistake as the `h` flag one level up: an attribute
+		// borrowed from bash rather than measured on the real interpreter.
 	},
-	// zsh IS NOT INSTALLED ON THIS BOX, so I could not measure it. Rather than
-	// copy bash's table and hope, only the two universals are declared - `-c`
-	// introduces a command string in every Bourne-family shell, and `--` ends
-	// options - and every other option refuses. An unmeasured grammar is not a
-	// grammar; this is the honest floor until someone can run zsh.
+	// zsh IS NOT INSTALLED ON THIS BOX, so I could not measure it. Only the two
+	// universals are declared - `-c` introduces a command string in every
+	// Bourne-family shell, and `--` ends options - and every other option
+	// refuses. commandStringPlus stays FALSE, so `zsh +c` refuses too: `+c` was
+	// measured to run a command string in bash and dash, and carrying that
+	// across to an unmeasured shell is exactly the assumption this entry
+	// exists to avoid. An unmeasured grammar is not a grammar.
 	"zsh": {},
 }
 
@@ -252,14 +281,25 @@ func scanInterpreterOptions(interpreter string, tokens []shellToken) (interprete
 				return interpreterUndeclared, 0
 			}
 		case len(text) > 1 && (text[0] == '-' || text[0] == '+'):
+			// POLARITY AND ORDER BOTH MATTER. `-n` sets noexec, `+n` clears it,
+			// and the LAST setting wins across the whole option list, so the
+			// suppression bit is assigned here rather than only ever set
+			// (#1930 round-15).
+			enabling := text[0] == '-'
 			letters := text[1:]
 			commandString, needsValue := false, false
 			for position, letter := range letters {
 				switch {
 				case letter == 'c':
+					if !enabling && !grammar.commandStringPlus {
+						// `+c` is unmeasured for this interpreter.
+						return interpreterUndeclared, 0
+					}
 					commandString = true
-				case strings.ContainsRune(grammar.suppressingFlags, letter):
+				case strings.ContainsRune(grammar.alwaysSuppressing, letter):
 					suppressed = true
+				case strings.ContainsRune(grammar.suppressingFlags, letter):
+					suppressed = enabling
 				case strings.ContainsRune(grammar.valueFlags, letter):
 					if position != len(letters)-1 {
 						// A value letter mid-cluster owns the rest of the

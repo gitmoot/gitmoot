@@ -2427,6 +2427,15 @@ aborts), and zsh is UNMEASURED on this box, so only `-c` and `--` are declared
 for it and every other zsh option is reported `unknown`. Anything outside a
 declared grammar is `unknown`, never a bucket.
 
+Option POLARITY and per-interpreter VALIDITY are modelled as data, not shared
+logic. `-x` sets and `+x` clears, and the last setting wins: `bash -n +n -c cmd`
+runs the command while `bash +n -n -c cmd` does not. Tables are measured against
+the interpreters installed on the machine - bash accepts `-h`, the installed
+dash does not and has NO long options at all, and `--pretty-print` runs the
+command rather than suppressing it. zsh is unmeasured here, so only `-c` and
+`--` are declared for it and even `+c` refuses, although `+c` does introduce a
+command string in bash and dash.
+
 
 
 Classification reads EVERY segment of a command, not the leading token:
