@@ -8,6 +8,13 @@ const (
 	OrgDirectiveCancelPrefix    = "[org:directive-cancel "
 	OrgDirectiveDonePrefix      = "[org:directive-done "
 	OrgDirectiveExhaustedPrefix = "[org:directive-exhausted "
+	// OrgDirectiveDeliveredPrefix marks a receipt the TRANSPORT observed: the
+	// pane accepted the directive prompt (#1980). It is deliberately a separate
+	// verb from `ack`, and carries `to=` rather than `by=`, because a seat's
+	// acknowledgment is the seat's own assertion and a machine must not write
+	// one on its behalf. Both satisfy the receipt obligation; only one claims
+	// the seat said anything.
+	OrgDirectiveDeliveredPrefix = "[org:directive-delivered "
 )
 
 func FormatOrgDirectiveNote(from, to, wf, directive string) string {
@@ -68,6 +75,30 @@ func formatOrgDirectiveReceipt(kind string, directiveID int64, by string) string
 	return formatAddressedOrgNote(kind, []addressedOrgNoteField{
 		{key: "id", value: strconv.FormatInt(directiveID, 10)}, {key: "by", value: by},
 	}, "")
+}
+
+// FormatOrgDirectiveDeliveredNote records transport-observed delivery to the
+// addressed role. `to` is the addressee, not an actor: nothing in this note
+// asserts that the seat read or accepted the directive.
+func FormatOrgDirectiveDeliveredNote(directiveID int64, to string) string {
+	if directiveID <= 0 {
+		return ""
+	}
+	return formatAddressedOrgNote("directive-delivered", []addressedOrgNoteField{
+		{key: "id", value: strconv.FormatInt(directiveID, 10)}, {key: "to", value: to},
+	}, "")
+}
+
+func ParseOrgDirectiveDeliveredNote(body string) (directiveID int64, to string, ok bool) {
+	values, content, ok := parseAddressedOrgNote("directive-delivered", body)
+	if !ok || content != "" || len(values) != 2 || values["to"] == "" {
+		return 0, "", false
+	}
+	id, err := strconv.ParseInt(values["id"], 10, 64)
+	if err != nil || id <= 0 {
+		return 0, "", false
+	}
+	return id, values["to"], true
 }
 
 func parseOrgDirectiveReceipt(kind, body string) (directiveID int64, by string, ok bool) {

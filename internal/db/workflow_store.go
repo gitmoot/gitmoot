@@ -308,7 +308,7 @@ func (s *Store) InsertOrgDirectiveReceipt(
 		return false, errors.New("directive receipt requires a positive directive id")
 	}
 	switch kind {
-	case "ack", "done", "cancel":
+	case "ack", "done", "cancel", "delivered":
 	default:
 		return false, fmt.Errorf("unsupported directive receipt kind %q", kind)
 	}
@@ -408,9 +408,15 @@ UPDATE workflow_notes SET workflow_id = workflow_id WHERE id = ?`, directiveID)
 	}
 
 	recordedKinds := []string{kind}
-	if kind == "ack" {
+	switch kind {
+	case "ack":
 		recordedKinds = []string{"ack", "done", "cancel"}
-	} else {
+	case "delivered":
+		// A delivered marker adds nothing once ANY receipt exists, and it must
+		// be at-most-once per directive because a nag revives the same stable
+		// wake row and would otherwise append one marker per delivery (#1980).
+		recordedKinds = []string{"delivered", "ack", "done", "cancel"}
+	default:
 		// Completion and cancellation are both terminal. The first terminal
 		// marker wins; a delayed prompt cannot append the opposite marker.
 		recordedKinds = []string{"done", "cancel"}
@@ -428,8 +434,13 @@ UPDATE workflow_notes SET workflow_id = workflow_id WHERE id = ?`, directiveID)
 	if _, err := insertWorkflowNoteTx(ctx, tx, note); err != nil {
 		return false, err
 	}
-	if err := supersedeDirectiveWakeOutboxTx(ctx, tx, directiveID, kind); err != nil {
-		return false, err
+	// A delivered marker is written WHILE its own wake is being delivered, so
+	// there is no pending row to retire and the supersede reason would be a
+	// falsehood ("recorded before wake delivery").
+	if kind != "delivered" {
+		if err := supersedeDirectiveWakeOutboxTx(ctx, tx, directiveID, kind); err != nil {
+			return false, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return false, err
@@ -1079,6 +1090,7 @@ WHERE substr(d.body, 1, length('[org:directive ')) = '[org:directive '
 		SELECT 1 FROM workflow_notes r
 		WHERE r.workflow_id = d.workflow_id AND (
 			substr(r.body, 1, length('[org:directive-ack id=' || d.id || ' ')) = '[org:directive-ack id=' || d.id || ' '
+			OR substr(r.body, 1, length('[org:directive-delivered id=' || d.id || ' ')) = '[org:directive-delivered id=' || d.id || ' '
 			OR substr(r.body, 1, length('[org:directive-cancel id=' || d.id || ' ')) = '[org:directive-cancel id=' || d.id || ' '
 			OR substr(r.body, 1, length('[org:directive-done id=' || d.id || ' ')) = '[org:directive-done id=' || d.id || ' '
 		)
@@ -1146,7 +1158,10 @@ SELECT d.id, d.workflow_id, d.author, d.body, d.repo, d.memory_observation_id, d
 	COALESCE((
 		SELECT MIN(a.created_at) FROM workflow_notes a
 		WHERE a.workflow_id = d.workflow_id
-			AND substr(a.body, 1, length('[org:directive-ack id=' || d.id || ' ')) = '[org:directive-ack id=' || d.id || ' '
+			AND (
+				substr(a.body, 1, length('[org:directive-ack id=' || d.id || ' ')) = '[org:directive-ack id=' || d.id || ' '
+				OR substr(a.body, 1, length('[org:directive-delivered id=' || d.id || ' ')) = '[org:directive-delivered id=' || d.id || ' '
+			)
 	), '')
 FROM workflow_notes d INDEXED BY idx_workflow_notes_directive_oldest
 WHERE substr(d.body, 1, length('[org:directive ')) = '[org:directive '

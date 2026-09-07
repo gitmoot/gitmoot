@@ -85,10 +85,14 @@ func TestEventRuleDirectiveWakePromptMatchesCurrentPhase(t *testing.T) {
 		forbidden []string
 	}{
 		{
+			// #1980: the first-delivery prompt carries the OBLIGATION, not a
+			// receipt chore. The transport records receipt itself when this very
+			// prompt lands, so asking the seat for an ack spent a turn boundary
+			// to learn what delivery already proved.
 			name:      "receipt",
 			cause:     "addressed_directive",
-			want:      []string{"acknowledge receipt", "gitmoot org directive ack 42 --by worker"},
-			forbidden: []string{"gitmoot org directive done"},
+			want:      []string{"gitmoot workflow show-note 42", "gitmoot org directive done 42 --by worker"},
+			forbidden: []string{"acknowledge receipt", "gitmoot org directive ack"},
 		},
 		{
 			// MUTANT: reverting to the fixed receipt prompt would tell an already
