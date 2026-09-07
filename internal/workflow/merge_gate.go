@@ -1960,16 +1960,29 @@ func (g PolicyMergeGate) ensureReviewMatchesHead(payload JobPayload, headSHA str
 // allocated worktree path). The engine clears the inherited HeadSHA for exactly
 // these children so they validate against their isolated worktree HEAD, mirroring
 // isDelegationWorktreeChild in the daemon's checkout validation.
-// effectiveReviewerIdentityName is the effective reviewer identity used by ALL
-// THREE identity sites in this file - headless objection supersession and its
-// diagnostic, implementer attribution, and the at-head reviewer arms: the agent
-// when a row records one, otherwise the normalized
-// ActingOrgRole. OpenExternalJob supports a role IN PLACE OF an agent
-// (mailbox.go:665 persists the normalized role; the job's Agent stays empty), so
-// keying on job.Agent alone made a role's objection unanswerable by that same
-// role - #1950 F2. collectGateImplementerAttribution already resolves identity
-// this way (merge_gate.go, NormalizeActingOrgRole), and sharing the rule is what
-// keeps the two from disagreeing about who a row belongs to.
+// effectiveReviewerIdentityName resolves a review row's author: the agent when
+// the row records one, otherwise the normalized ActingOrgRole. OpenExternalJob
+// supports a role IN PLACE OF an agent (mailbox.go persists the normalized role
+// and leaves the job's Agent empty), so keying on job.Agent alone made a role's
+// objection unanswerable by that same role (#1950 F2) and rendered diagnostics
+// with a blank author.
+//
+// SCOPE OF THIS HELPER, STATED WITHOUT A COUNT ON PURPOSE (#1950 F5). Every
+// reviewer-identity read IN THIS FILE resolves through it - supersession at the
+// evaluated head and for headless rows, the at-head and latest-round approval
+// arms, implementer attribution, and every author-bearing diagnostic and durable
+// approval-evidence event. Earlier versions of this comment claimed "all three
+// sites", then all five; each count was wrong within a round, and quoting one
+// here is the habit those rounds should have ended.
+//
+// IT IS NOT THE WHOLE REPOSITORY, and two consumers outside this file are known
+// NOT to use it, deliberately left for routing rather than silently swept in:
+//   - review_loop.go's FindRepeatedReviewers drops a role-authored verdict,
+//     because db.SucceededReviewVerdict carries only Agent and would need the
+//     role plumbed through awaited_facts.go's query first;
+//   - proof/project.go reports a role-authored review as not comparable, so its
+//     independence attribute stays unknown rather than being computed. That is
+//     conservative - it emits no false independence claim - but incomplete.
 func effectiveReviewerIdentityName(job db.Job, payload JobPayload) string {
 	name, _ := effectiveReviewerIdentity(job, payload)
 	return name
