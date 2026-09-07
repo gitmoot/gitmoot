@@ -48,6 +48,84 @@ func TestRenderJobResultCommentNeverFoldsAFanOutDispatchRecord(t *testing.T) {
 	}
 }
 
+// TestRenderJobResultCommentHeadlineDecisionIsNotAVerdictForAFanOut is #1963,
+// and the fixture is a VERBATIM reproduction of a comment this renderer already
+// published: gitmoot/gitmoot#1731 issuecomment-5481374373, from job
+// local-review-g6-review-sol-18d0f0b0b9134f90, which reads
+//
+//	**Decision:** `approved`
+//	**Summary:** Convening three report-only reviewers against exact head ...
+//
+// The summary says it is CONVENING reviewers. The headline said it approved.
+//
+// The exclusion above only kept a fan-out out of the approved-with-notes FOLD;
+// the headline scalar still asserted the verdict, which is the field a human
+// reads first and the only one a skimmer reads at all. Measured across the live
+// store: 70 PR-attached rows on 27 pull requests, 62 with an empty tests_run,
+// and every one of them rendered "approved", because a fan-out carrying a
+// terminal verdict has never once carried changes_requested.
+func TestRenderJobResultCommentHeadlineDecisionIsNotAVerdictForAFanOut(t *testing.T) {
+	comment := JobResultComment{
+		AgentName: "g6-review-sol",
+		Runtime:   "codex",
+		JobID:     "local-review-g6-review-sol-18d0f0b0b9134f90",
+		JobType:   "review",
+		JobState:  string(JobSucceeded),
+		Payload:   JobPayload{TemplateID: "review-panel"},
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "Convening three report-only reviewers against exact head 2322fc865580de5d078676fe861219ded5db9352.",
+			Delegations: []Delegation{
+				{ID: "lens-correctness"}, {ID: "lens-security"}, {ID: "lens-regression"},
+			},
+		},
+	}
+	if !ResultIsFanOut(comment.Result) {
+		t.Fatal("fixture is not a fan-out result, so it cannot exercise the announcement path")
+	}
+
+	body := RenderJobResultComment(comment)
+
+	if strings.Contains(body, "**Decision:** `approved`") {
+		t.Fatalf("the published record still asserts a verdict for a coordinator announcement:\n%s", body)
+	}
+	if !strings.Contains(body, "**Decision:** `fan-out`") {
+		t.Fatalf("the headline scalar does not name the row as a dispatch:\n%s", body)
+	}
+	// The announced value must remain auditable. Suppressing it would trade one
+	// dishonest record for an incomplete one.
+	if !strings.Contains(body, "announced `approved`") {
+		t.Fatalf("the announced decision was dropped instead of being labelled:\n%s", body)
+	}
+	if !strings.Contains(body, "3 delegated child job(s)") {
+		t.Fatalf("the record does not say where the evidence actually is:\n%s", body)
+	}
+}
+
+// The negative control, on the exact shape that must NOT change: an ordinary
+// review verdict with no delegations keeps its headline decision. Without this,
+// relabelling every decision would satisfy the case above.
+func TestRenderJobResultCommentKeepsTheHeadlineDecisionForARealVerdict(t *testing.T) {
+	body := RenderJobResultComment(JobResultComment{
+		AgentName: "g7-review",
+		Runtime:   "codex",
+		JobID:     "local-review-g7-review-real",
+		JobType:   "review",
+		JobState:  string(JobSucceeded),
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "Exact-head review of the diff; every check executed.",
+			TestsRun: []string{"go test ./internal/workflow/"},
+		},
+	})
+	if !strings.Contains(body, "**Decision:** `approved`") {
+		t.Fatalf("a real verdict lost its headline decision:\n%s", body)
+	}
+	if strings.Contains(body, "fan-out") {
+		t.Fatalf("a real verdict was labelled a dispatch:\n%s", body)
+	}
+}
+
 // The other half, and the one a one-sided guard would break: an ORDINARY
 // below-bar review must still fold. TestRenderJobResultCommentExplainsApprovedWithNotes
 // already pins the positive case; this restates it beside the exclusion so the
