@@ -260,6 +260,14 @@ type PullRequestEvent struct {
 	// (#1347). Empty means unattributed, which is also the legacy value for locks
 	// predating the migration: the fanout then behaves exactly as it does today.
 	ActingOrgRole string
+	// DispatchedBy is the identity that caused this fan-out to be asked for
+	// (#1967). Both PR-open triggers carry the implementing seat: the daemon
+	// PR-watcher reads the branch lock owner, the in-process trigger uses the
+	// advancing implement job's agent. It is NOT the reviewer and NOT LeadAgent
+	// by coincidence - LeadAgent happens to be the lock owner here, but on a CLI
+	// dispatch it is the reviewer itself, so the two must not be conflated.
+	// Empty degrades to Sender at the enqueue chokepoint.
+	DispatchedBy string
 	// HumanMergeRequested records an explicit authorized @gitmoot merge command.
 	// It permits the native policy gate to merge even when automatic merging is
 	// disabled for the repository; ordinary daemon advancement leaves this false.

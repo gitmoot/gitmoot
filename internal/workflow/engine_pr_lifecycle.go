@@ -266,21 +266,26 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 			// The role rides the event from the branch lock, one source for both
 			// triggers.
 			ActingOrgRole: event.ActingOrgRole,
-			Agent:         reviewer,
-			Action:        "review",
-			Repo:          event.Repo,
-			Branch:        event.Branch,
-			PullRequest:   event.PullRequest,
-			HeadSHA:       event.HeadSHA,
-			GoalID:        event.GoalID,
-			TaskID:        event.TaskID,
-			TaskTitle:     event.TaskTitle,
-			LeadAgent:     event.LeadAgent,
-			Reviewers:     reviewers,
-			ReviewRound:   reviewRound,
-			ReviewScope:   scope,
-			Sender:        event.Sender,
-			Instructions:  instructions,
+			// #1967: the review is dispatched on behalf of the seat that opened the
+			// PR, not by the reviewer that will answer it. Without this the fan-out
+			// child's only identity was Sender ("github" from the daemon), so a
+			// finding it recorded could not be routed back to an owning lane.
+			DispatchedBy: event.DispatchedBy,
+			Agent:        reviewer,
+			Action:       "review",
+			Repo:         event.Repo,
+			Branch:       event.Branch,
+			PullRequest:  event.PullRequest,
+			HeadSHA:      event.HeadSHA,
+			GoalID:       event.GoalID,
+			TaskID:       event.TaskID,
+			TaskTitle:    event.TaskTitle,
+			LeadAgent:    event.LeadAgent,
+			Reviewers:    reviewers,
+			ReviewRound:  reviewRound,
+			ReviewScope:  scope,
+			Sender:       event.Sender,
+			Instructions: instructions,
 		}
 		requests = append(requests, request)
 	}
@@ -495,6 +500,7 @@ func (e Engine) dispatchHighRiskReview(ctx context.Context, event PullRequestEve
 		Reviewers:     reviewers,
 		ReviewRound:   round,
 		Sender:        event.Sender,
+		DispatchedBy:  event.DispatchedBy,
 		Instructions: fmt.Sprintf(
 			"Synthesize the high-risk adversarial review of pull request #%d for task %s from the lens findings below.",
 			event.PullRequest, taskLabel(event.TaskID, event.TaskTitle),
