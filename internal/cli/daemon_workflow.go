@@ -732,6 +732,9 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 			Deferred:   true,
 			Reason:     workflow.PlainReason(fmt.Sprintf("active %s job %s in flight on branch %s; holding merge until it settles", active.Type, active.ID, request.Branch)),
 			BlockClass: workflow.MergeBlockTransient,
+			// #1555: name the writer so the engine can refuse to call the task
+			// mergeable while it holds the branch, without matching this sentence.
+			HeldByJob: active.ID,
 		}, nil
 	}
 	// Resolve the policy before looking up a checkout.
