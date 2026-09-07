@@ -465,6 +465,32 @@ Each child job carries `parent_job_id`, `delegation_id`, `root_job_id`,
 `delegation_depth`, and `task_id`, so a child can be traced to its parent, its
 originating delegation, and the root of the job tree.
 
+Separately from that tree linkage, **every** job Gitmoot creates carries
+`dispatched_by`: the identity that asked for the job to exist. It is resolved at
+the single enqueue chokepoint from the most specific source available, in order:
+an explicit dispatcher supplied by the dispatch site, then `delegated_by`, then
+the acting org role, then the dispatch channel (`local`, `github`, `heartbeat`,
+the pipeline sender). It never falls back to the job's own agent or to
+`lead_agent`, because on a CLI review dispatch `lead_agent` defaults to the
+reviewer itself.
+
+`dispatched_by` is attribution only, deliberately not `parent_job_id`: nothing
+in the scheduler reads it, so recording it cannot change delegation depth, the
+per-root job budget, loop detection or root-kill propagation. Its purpose is
+that a review finding can be resolved to the seat that ORDERED the review
+rather than only to the reviewer that wrote it:
+
+```sql
+SELECT f.finding_uid, f.severity, f.state, j.dispatched_by
+FROM review_finding_observations f
+JOIN jobs j ON j.id = f.observer_job
+WHERE f.state = 'open';
+```
+
+Jobs created before the column existed carry an empty `dispatched_by`. There is
+no backfill: the dispatcher of a past review was never recorded anywhere, and
+inventing one would be worse than an honest blank.
+
 ### Termination bounds
 
 Delegation trees are bounded so they cannot run forever:

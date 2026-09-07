@@ -17,9 +17,17 @@ import (
 // dispatcher field set, and 268 resolved to a job whose entire recorded
 // identity was Sender: "local".
 //
-// READER 1 of 2 - the in-process PR-open trigger. The implement job that just
-// opened the PR is the dispatcher, and it is the ADVANCING job's agent, not the
-// reviewer that will answer.
+// READER 1 of 2 - the in-process PR-open trigger, end to end through AdvanceJob.
+//
+// NOTE ON WHAT THIS DOES AND DOES NOT DISCRIMINATE. On this trigger production
+// sets Sender to the advancing job's agent as well, so the resolution would
+// reach the same value through the Sender fallback: removing the explicit
+// DispatchedBy from the trigger leaves this test green (verified by mutation).
+// It pins the end-to-end outcome, not that one line. The line is kept because
+// Sender means the CHANNEL on every other dispatch path ("github", "local",
+// "heartbeat"), so attribution that reads it is correct only by coincidence -
+// and TestPROpenFanoutPrefersTheDispatcherOverTheSenderChannel below is the
+// test that separates the two.
 func TestInProcessPROpenRecordsTheDispatchingSeatOnFanoutChildren(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -59,6 +67,40 @@ func TestInProcessPROpenRecordsTheDispatchingSeatOnFanoutChildren(t *testing.T) 
 	}
 	if review.DispatchedBy == review.Agent {
 		t.Fatalf("fanout child dispatched_by = %q equals the reviewer agent; that is the attribution #1967 exists to replace", review.DispatchedBy)
+	}
+}
+
+// The fan-out literal itself, at the seam where the two candidate values
+// DIFFER. This is the shape the daemon PR-watcher produces: Sender is the forge
+// channel "github", and the only seat identity on the event is the dispatcher.
+// Before #1967 the fan-out child's whole recorded identity was that channel, so
+// 0 of its findings could name a seat.
+func TestPROpenFanoutPrefersTheDispatcherOverTheSenderChannel(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "reviewer", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	engine.RequiredReviewers = []string{"reviewer"}
+
+	if err := engine.HandlePullRequestOpened(ctx, PullRequestEvent{
+		Repo:              "gitmoot/gitmoot",
+		Branch:            "task-1967-forge",
+		PullRequest:       1968,
+		HeadSHA:           "head1968",
+		TaskID:            "task-1967-forge",
+		TaskTitle:         "Forge-observed PR",
+		LeadAgent:         "lead",
+		Sender:            "github",
+		DispatchedBy:      "impl-seat",
+		RequiredReviewers: []string{"reviewer"},
+	}); err != nil {
+		t.Fatalf("HandlePullRequestOpened returned error: %v", err)
+	}
+
+	review := onlyReviewJob(t, ctx, store)
+	if review.DispatchedBy != "impl-seat" {
+		t.Fatalf("fanout child dispatched_by = %q, want %q; %q is the forge channel and %q is the reviewer, neither of which can own an obligation (#1890)", review.DispatchedBy, "impl-seat", "github", "reviewer")
 	}
 }
 
