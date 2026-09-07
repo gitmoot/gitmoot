@@ -191,16 +191,18 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 				ids = append(ids, entry.ID)
 			}
 			// The oldest row SURVIVES as the delivered obligation: it is the one
-			// wakeOutboxEvent identifies as `oldest id`. The rest are recorded
-			// superseded into it rather than each reporting an independent
-			// delivery they never had (#1978).
+			// wakeOutboxEvent identifies as `oldest id`, and ids[0] is that row.
+			// The WHOLE batch travels to the outcome (#1982): a delivered wake
+			// supersedes the rest into the survivor, while a retryable failure
+			// returns them all to pending so the next attempt re-coalesces every
+			// note instead of losing the ones a survivor carried.
 			claimed, err := store.ClaimWakeOutbox(ctx, ids[0], ids[1:], now)
 			if err != nil {
 				return replyWakeOutboxHealth{}, err
 			}
 			if claimed {
 				mutated = true
-				event.WakeOutboxIDs = ids[:1]
+				event.WakeOutboxIDs = ids
 				if err := emitReplyWakeOutboxEvent(ctx, delivery.sink, event, matchingRules); err != nil {
 					return replyWakeOutboxHealth{}, fmt.Errorf("emit claimed %s wake: %w", event.WakeKind, err)
 				}

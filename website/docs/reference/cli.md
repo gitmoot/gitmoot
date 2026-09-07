@@ -1763,7 +1763,12 @@ Pass only one of `--match` and `--repo`. The wake role must exist and set
 `pane = "<herdr-pane>"`; Gitmoot resolves that value as an exact pane label first
 and otherwise treats it as a literal pane id.
 Delivery is verified with Herdr's `agent_prompted` versus
-`agent_prompt_stalled` result. `attention`, `guard`, `job-terminal`,
+`agent_prompt_stalled` result. A stall, and an `agent_blocked` pane, are
+**transient**: the claimed rows return to `pending` with the cause recorded and
+are re-delivered as one coalesced wake, bounded at three attempts. Anything
+else, and an exhausted budget, ends the rows terminally and records a
+`wake_delivery_failed` job event on `wake-outbox:<id>` naming the role, cause
+and attempts. `attention`, `guard`, `job-terminal`,
 `review-verdict`, `recycle-overdue`, and `pane_input_pending` wakes remain
 best-effort; zero rules leaves the feature off.
 
