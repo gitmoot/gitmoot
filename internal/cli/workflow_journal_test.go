@@ -1241,9 +1241,22 @@ func TestWorkflowRememberHonorsAutoConfirmInSharedPool(t *testing.T) {
 	}
 }
 
-func TestWorkflowShowNoteMarksTruncatedPlainBody(t *testing.T) {
+// TestWorkflowShowNotePrintsTheWholeBody is half of #1981's reproduction. The
+// transport tells a seat to read its directive with `workflow show-note`, and
+// that command used to cut the body at workflowTextLineMaxRunes and say "use
+// --json". Measured over 2,911 directives on this fleet, only 2.7% fit inside
+// that cap, so the command withheld the instruction 97% of the time, which is
+// how a directive could be delivered, fetched, and still not actionable.
+func TestWorkflowShowNotePrintsTheWholeBody(t *testing.T) {
 	home, store := workflowJournalTestHome(t)
-	body := strings.Repeat("x", workflowTextLineMaxRunes+20)
+	// A realistic directive length: past the old cap, with the actionable line
+	// LAST, which is where a remedy line actually sits.
+	body := "[org:directive to=worker from=owner wf=gitmoot/long] " +
+		strings.Repeat("context. ", 400) +
+		"run: gitmoot job record --agent worker --type implement"
+	if len(body) <= workflowTextLineMaxRunes {
+		t.Fatalf("test body is %d runes, must exceed the line cap %d", len(body), workflowTextLineMaxRunes)
+	}
 	note, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
 		WorkflowID: "gitmoot/long-message",
 		Author:     "gm-omp-nag",
@@ -1255,8 +1268,37 @@ func TestWorkflowShowNoteMarksTruncatedPlainBody(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	code := runWorkflowJournal([]string{"show-note", fmt.Sprint(note.ID), "--home", home}, &stdout, &stderr)
-	if code != 0 || !strings.Contains(stdout.String(), "[truncated; use --json for the full body]") {
+	if code != 0 {
 		t.Fatalf("plain show-note code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), body) {
+		t.Fatalf("plain show-note dropped part of the body: out=%q", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "[truncated") {
+		t.Fatalf("plain show-note still truncates a single note: out=%q", stdout.String())
+	}
+
+	// Scrubbing is a safety property and is NOT what was removed: an escape
+	// sequence in a body must still never reach the terminal.
+	unsafe, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+		WorkflowID: "gitmoot/long-message", Author: "gm-omp-nag",
+		Body: "before\x1b[31mred\x1b[0m\x07after",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := runWorkflowJournal([]string{"show-note", fmt.Sprint(unsafe.ID), "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("scrub show-note code=%d err=%q", code, stderr.String())
+	}
+	if strings.ContainsRune(stdout.String(), 0x1b) || strings.ContainsRune(stdout.String(), 0x07) {
+		t.Fatalf("show-note leaked a control sequence: %q", stdout.String())
+	}
+	// The escape sequences are dropped and the BEL becomes a space; every
+	// printable character of the body survives.
+	if !strings.Contains(stdout.String(), "beforered after") {
+		t.Fatalf("scrubbed body = %q, want the escape sequences removed and the text kept", stdout.String())
 	}
 
 	stdout.Reset()

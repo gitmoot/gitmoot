@@ -91,7 +91,7 @@ func TestEventRuleDirectiveWakePromptMatchesCurrentPhase(t *testing.T) {
 			// to learn what delivery already proved.
 			name:      "receipt",
 			cause:     "addressed_directive",
-			want:      []string{"gitmoot workflow show-note 42", "gitmoot org directive done 42 --by worker"},
+			want:      []string{"gitmoot org directive done 42 --by worker"},
 			forbidden: []string{"acknowledge receipt", "gitmoot org directive ack"},
 		},
 		{
@@ -143,6 +143,56 @@ func TestEventRuleReviewVerdictWakePrompt(t *testing.T) {
 			t.Fatalf("prompt %q does not contain %q", prompt, want)
 		}
 	}
+}
+
+// TestDirectiveWakePromptCarriesTheBody is the other half of #1981. A prompt
+// that names a row and leaves the seat to fetch it costs another turn, and the
+// reader it pointed at withheld the body anyway. An over-long body must say
+// how much was omitted and how to read the rest, never stop mid-clause.
+func TestDirectiveWakePromptCarriesTheBody(t *testing.T) {
+	base := events.Event{
+		RootID:         db.WakeOutboxSourceWorkflowNote + ":42",
+		WakeTargetRole: "worker",
+		Cause:          "addressed_directive",
+	}
+
+	t.Run("short body is carried whole", func(t *testing.T) {
+		event := base
+		event.Detail = "[org:directive to=worker from=owner wf=w] rebase the branch and re-run the gate"
+		prompt := eventRuleWakePrompt(db.WakeOutboxKindDirective, event)
+		if !strings.Contains(prompt, "rebase the branch and re-run the gate") {
+			t.Fatalf("prompt %q does not carry the directive body", prompt)
+		}
+		if strings.Contains(prompt, "characters omitted") {
+			t.Fatalf("prompt %q claims truncation for a short body", prompt)
+		}
+		if !strings.Contains(prompt, "gitmoot org directive done 42 --by worker") {
+			t.Fatalf("prompt %q lost the completion command", prompt)
+		}
+	})
+
+	t.Run("over-long body names what it omitted", func(t *testing.T) {
+		event := base
+		event.Detail = strings.Repeat("context ", directiveWakeBodyMaxBytes/4)
+		prompt := eventRuleWakePrompt(db.WakeOutboxKindDirective, event)
+		if len(prompt) > directiveWakeBodyMaxBytes+400 {
+			t.Fatalf("prompt is %d bytes, want the body bounded near %d", len(prompt), directiveWakeBodyMaxBytes)
+		}
+		body := strings.TrimSpace(event.Detail)
+		omitted := len(body) - directiveWakeBodyMaxBytes
+		if !strings.Contains(prompt, fmt.Sprintf("of %d characters omitted", len(body))) {
+			t.Fatalf("prompt %q does not state how much of the %d-character body was omitted (about %d)", prompt, len(body), omitted)
+		}
+		if !strings.Contains(prompt, "gitmoot workflow show-note 42 --json") {
+			t.Fatalf("prompt %q omits the retrieval command for the rest", prompt)
+		}
+		// A word boundary, not a mid-word cut: the carried text must end on a
+		// complete word from the body.
+		carried := prompt[:strings.Index(prompt, " [")]
+		if strings.HasSuffix(carried, "contex") || strings.HasSuffix(carried, "conte") {
+			t.Fatalf("prompt cut mid-word: %q", carried[len(carried)-40:])
+		}
+	})
 }
 
 func TestClassifyEventRuleKinds(t *testing.T) {

@@ -1527,8 +1527,11 @@ The typed note
 `reply:<role>` wake row commit atomically. The wake includes the exact
 `gitmoot workflow show-note <id>` retrieval command; that command renders the
 citable row's workflow, author, optional repository, timestamp, and body, or
-returns the row as JSON. Plain output marks bodies above 512 runes as truncated
-and points to `--json`; JSON preserves the full stored body. Messages create no
+returns the row as JSON. **Plain output prints the whole body**: a single-note
+view is the one place a body must not be cut, and the 512-rune line cap applies
+to timeline and list lines instead. Control characters and ANSI escapes are
+still scrubbed from plain output; JSON preserves the stored body byte for byte.
+Messages create no
 directive, acknowledgment, completion, TTL, or nag obligation.
 
 `gitmoot org escalate resolve <escalation-note-id> [--by <role>] [--note
@@ -1577,6 +1580,19 @@ which is the behaviour that predates this change.
 **A remaining acknowledgment-phase nudge now means "delivery is not proven".**
 A stalled, failed or `delivery_unknown` wake records no receipt, so the ladder
 keeps running for exactly the directives whose arrival nobody can demonstrate.
+
+**The first-delivery prompt carries the directive itself**, not a pointer to
+its row: `gitmoot directive <id> for <role>: <directive text> -- record
+completion with: gitmoot org directive done <id> --by <role>`. Fetching a row
+costs another turn, which is the whole cost this transport work is removing.
+The carried text is the directive body with its `[org:directive to=… from=…
+wf=…]` marker header stripped, since the prompt already states the addressee.
+A body over 4,000 characters is cut at a **word boundary** and states exactly
+how much was omitted plus the command that returns the rest, for example
+`[3126 of 7126 characters omitted; read the whole directive with: gitmoot
+workflow show-note 42 --json]`. Directive bodies on a live fleet have a median
+of about 2,800 characters, so most arrive whole, and none stops mid-clause
+without saying so.
 
 `gitmoot org directive done <id> [--by <role>] [--home <dir>]` records
 COMPLETION and ends the obligation, including its TTL nudges. **Completion
