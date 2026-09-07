@@ -3,12 +3,14 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -279,5 +281,192 @@ func TestEphemeralGateTakesNoSessionForANonResumableSpec(t *testing.T) {
 	}
 	if held, out := admissionHeldBack(t, store, "eph-shell-job", 0.1); held {
 		t.Fatalf("a shell-spec ephemeral job was charged RAM and refused; output=%q", out)
+	}
+}
+
+// #1952 review round 3 (directive 127125). The previous key test called
+// queuedJobRuntimeResourceKey directly, so a compiling mutant that left that
+// helper correct and routed ephemeral jobs through ONE shared key inside the
+// production SELECTOR kept every committed test green while two distinct
+// ephemeral jobs falsely serialized. The helper was never the risk; the routing
+// was. Nothing below names the helper.
+//
+// The seam: queuedJobResourceSelector.selects computes a runtime key per job and
+// refuses a job whose key is already claimed by one selected this pass. It is
+// built in selectRunnableQueuedJobsSeeded and reached from
+// selectRunnableQueuedJobsWithPolicy (runQueuedJobsForRepo) and the pool path.
+
+// seedTwoEphemeralJobs puts the two jobs in DIFFERENT repos on purpose. Measured:
+// with both in one repo they share the checkout key "repo:owner/repo" and the
+// selector serializes them for that reason alone, while their runtime keys are
+// already distinct — so a same-repo pair would have "passed" (or failed) on the
+// checkout confound and proved nothing about runtime routing, which is the whole
+// subject of this PR. Distinct repos leave the runtime key as the only thing that
+// can serialize them.
+func seedTwoEphemeralJobs(t *testing.T, store *db.Store, specRuntime string) []db.Job {
+	t.Helper()
+	for i, repo := range []string{"owner/repo-a", "owner/repo-b"} {
+		seedDaemonWorkerRepo(t, store, repo, t.TempDir())
+		agent := fmt.Sprintf("eph-pair-%d", i)
+		seedDaemonWorkerAgent(t, store, agent, runtime.ShellRuntime, "unused", []string{"ask"}, repo)
+		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+			ID: fmt.Sprintf("eph-pair-%d", i), Agent: agent, Action: "ask", Repo: repo, Branch: "main", PullRequest: 1,
+			Ephemeral: &workflow.EphemeralSpec{Runtime: specRuntime, Capabilities: []string{"ask"}, Role: "worker"},
+		})
+	}
+	return []db.Job{mustWorkerJob(t, store, "eph-pair-0"), mustWorkerJob(t, store, "eph-pair-1")}
+}
+
+// TestSelectorSelectsTwoDistinctEphemeralJobsInOnePass drives the production
+// selector. Two ephemeral jobs on the SAME spec runtime start independent
+// sessions, so both must be selected in a single pass under a serializing
+// same-session policy. A routing mutant that gives them one shared key sends the
+// second to `remaining`, which no assertion about the key helper can see.
+func TestSelectorSelectsTwoDistinctEphemeralJobsInOnePass(t *testing.T) {
+	store, _ := ephemeralConsumerStore(t)
+	jobs := seedTwoEphemeralJobs(t, store, runtime.ClaudeRuntime)
+
+	selected, remaining := selectRunnableQueuedJobsWithPolicy(context.Background(), store, jobs, 2,
+		config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue})
+
+	if len(selected) != 2 {
+		t.Fatalf("selected %d of 2 distinct ephemeral jobs (remaining=%d); they start separate sessions and must not serialize",
+			len(selected), len(remaining))
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("remaining = %+v, want empty", remaining)
+	}
+	if selected[0].ID == selected[1].ID {
+		t.Fatalf("selector returned the same job twice: %+v", selected)
+	}
+}
+
+// TestQueuedDispatchRunsTwoDistinctEphemeralJobsInOnePass is the same property
+// one level up, at the behaviour an operator would notice: two independent
+// ephemeral workers run in one dispatch pass rather than one waiting on the
+// other's session.
+func TestQueuedDispatchRunsTwoDistinctEphemeralJobsInOnePass(t *testing.T) {
+	ctx := context.Background()
+	store, home := ephemeralConsumerStore(t)
+	seedTwoEphemeralJobs(t, store, runtime.ClaudeRuntime)
+
+	starter := &cliWorkerFakeAdapter{startRuntimeRef: "550e8400-e29b-41d4-a716-446655441111"}
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.StartAdapterFactory = func(execbackend.Backend, string, string) (runtime.Adapter, error) { return starter, nil }
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return &cliWorkerFakeAdapter{output: poolSchedulerAskResult}, nil
+	}
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return t.TempDir(), nil
+	}
+	if err := runQueuedJobsForRepo(ctx, worker, 2, "", ""); err != nil {
+		t.Fatalf("runQueuedJobsForRepo: %v", err)
+	}
+
+	var stillQueued []string
+	for _, id := range []string{"eph-pair-0", "eph-pair-1"} {
+		if job := mustWorkerJob(t, store, id); job.State == string(workflow.JobQueued) {
+			stillQueued = append(stillQueued, id)
+		}
+	}
+	if len(stillQueued) != 0 {
+		t.Fatalf("jobs still queued after a 2-slot pass: %v — one ephemeral job waited on the other's session", stillQueued)
+	}
+}
+
+// TestSelectorStillSerializesOneRegisteredSession is the should-SUCCEED control,
+// and it is what stops the cheap fix: independence must come from keying
+// ephemeral jobs separately, NOT from weakening runtime serialization. Two
+// non-ephemeral jobs on the SAME registered resumable session must still yield
+// exactly one selected job under a queueing policy (#684).
+//
+// Green at both heads by construction — it is a control, not a regression — so
+// it is paired with a mutant that removes serialization entirely.
+func TestSelectorStillSerializesOneRegisteredSession(t *testing.T) {
+	store, _ := ephemeralConsumerStore(t)
+	// Different repos again, so the single selection is attributable to the shared
+	// RUNTIME session key rather than to a shared checkout key.
+	for _, repo := range []string{"owner/repo-a", "owner/repo-b"} {
+		seedDaemonWorkerRepo(t, store, repo, t.TempDir())
+	}
+	seedDaemonWorkerAgent(t, store, "shared-session", runtime.ClaudeRuntime, "session-shared", []string{"ask"}, "owner/repo-a,owner/repo-b")
+	for i, repo := range []string{"owner/repo-a", "owner/repo-b"} {
+		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+			ID: fmt.Sprintf("reg-%d", i), Agent: "shared-session", Action: "ask", Repo: repo, Branch: "main", PullRequest: 1,
+		})
+	}
+	jobs := []db.Job{mustWorkerJob(t, store, "reg-0"), mustWorkerJob(t, store, "reg-1")}
+
+	selected, remaining := selectRunnableQueuedJobsWithPolicy(context.Background(), store, jobs, 2,
+		config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue})
+
+	if len(selected) != 1 || len(remaining) != 1 {
+		t.Fatalf("selected=%d remaining=%d, want 1/1: two jobs sharing one registered session must serialize",
+			len(selected), len(remaining))
+	}
+}
+
+// TestBouncedBusyExclusionKeepsADistinctEphemeralJob covers the SECOND routing
+// site, which a mutant found after the first was fixed: excludeBouncedBusy drops
+// any still-pending job whose runtime key is in the bounced-busy set for this
+// pool invocation, via memoizedRuntimeResourceKey. Route ephemeral jobs through
+// one shared key there and a single busy bounce silently excludes EVERY other
+// ephemeral job in the pass — a starvation defect the selector arm cannot see,
+// because the selector never runs for the excluded jobs.
+//
+// The bounced set is built with the same helper production uses, because that is
+// this function's INPUT; the assertion is about which jobs survive, not about the
+// key's value.
+func TestBouncedBusyExclusionKeepsADistinctEphemeralJob(t *testing.T) {
+	ctx := context.Background()
+	store, _ := ephemeralConsumerStore(t)
+	jobs := seedTwoEphemeralJobs(t, store, runtime.ClaudeRuntime)
+	bouncedFirst, other := jobs[0], jobs[1]
+
+	// The bounced set MUST be built through the same memo map excludeBouncedBusy
+	// will use. A first version passed a nil memo, which takes
+	// memoizedRuntimeResourceKey's early-return path — so a mutant injected into
+	// the memoized branch produced a shared key inside the function under test
+	// while the fixture still held real per-job keys, the two never matched, and
+	// the mutant survived. The fixture has to travel the production path too.
+	worker := jobWorker{Store: store}
+	memo := map[string]string{}
+	bouncedRuntimes := map[string]bool{
+		memoizedRuntimeResourceKey(ctx, store, bouncedFirst, memo): true,
+	}
+	kept := excludeBouncedBusy(ctx, worker, []db.Job{other},
+		map[string]bool{bouncedFirst.ID: true}, bouncedRuntimes, memo)
+
+	if len(kept) != 1 || kept[0].ID != other.ID {
+		t.Fatalf("kept = %+v, want only %s: one ephemeral job bouncing busy must not exclude a DISTINCT ephemeral job",
+			kept, other.ID)
+	}
+}
+
+// TestBouncedBusyExclusionStillDropsTheSameSession is that arm's should-SUCCEED
+// control: exclusion must keep working for jobs that genuinely share a runtime
+// session, or "keep everything" would pass the test above.
+func TestBouncedBusyExclusionStillDropsTheSameSession(t *testing.T) {
+	ctx := context.Background()
+	store, _ := ephemeralConsumerStore(t)
+	for _, repo := range []string{"owner/repo-a", "owner/repo-b"} {
+		seedDaemonWorkerRepo(t, store, repo, t.TempDir())
+	}
+	seedDaemonWorkerAgent(t, store, "bounce-shared", runtime.ClaudeRuntime, "session-bounce", []string{"ask"}, "owner/repo-a,owner/repo-b")
+	for i, repo := range []string{"owner/repo-a", "owner/repo-b"} {
+		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+			ID: fmt.Sprintf("bounce-%d", i), Agent: "bounce-shared", Action: "ask", Repo: repo, Branch: "main", PullRequest: 1,
+		})
+	}
+	first := mustWorkerJob(t, store, "bounce-0")
+	second := mustWorkerJob(t, store, "bounce-1")
+
+	memo := map[string]string{}
+	bouncedRuntimes := map[string]bool{memoizedRuntimeResourceKey(ctx, store, first, memo): true}
+	kept := excludeBouncedBusy(ctx, jobWorker{Store: store}, []db.Job{second},
+		map[string]bool{first.ID: true}, bouncedRuntimes, memo)
+
+	if len(kept) != 0 {
+		t.Fatalf("kept = %+v, want empty: a job sharing the bounced session must stay excluded", kept)
 	}
 }

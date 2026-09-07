@@ -349,10 +349,17 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		runtimeConfigDir = selectedReadOnlyRuntimeConfigDir(agent.Runtime, payload.RuntimeConfigDir)
 	}
 	// The runtime-session lock keeps naming the agent's REGISTERED session, so
-	// #684's serialization is unchanged: a read-only seat still queues behind a
-	// busy reviewer session, and the scheduler gate (queuedJobRuntimeResourceKey,
-	// which reads the stored agent) still computes the same key the acquisition
-	// below does. Only DELIVERY moves to the seat's isolated fresh session.
+	// #684's serialization is unchanged for a REGISTERED seat: it still queues
+	// behind a busy reviewer session, and the scheduler gate
+	// (queuedJobRuntimeResourceKey, which reads the stored agent for that case)
+	// computes the same key the acquisition below does. Only DELIVERY moves to
+	// the seat's isolated fresh session.
+	//
+	// #1952: this does NOT hold for an EPHEMERAL seat, and the unqualified
+	// version of this sentence was false. Such a job has no registered session:
+	// the gate keys it synthetically by job id and the worker locks the
+	// materialized live session, so gate and acquisition deliberately differ.
+	// The full explanation is on readOnlySeatRuntimeRef below.
 	sessionLockAgent := agent
 	if err := applyReadOnlySeat(readOnlySeat, runtimeConfigDir, job.ID, &agent); err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
