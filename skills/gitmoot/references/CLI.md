@@ -1969,6 +1969,20 @@ removed role as its exact address, leaving delivery failure observable instead
 of making the wait immortal. Fact wakes are delivery only: they require a `fact`
 event rule but create no acknowledgment or completion ceremony.
 
+`gitmoot org interrupts [--window 24h|7d|0] [--json] [--home <dir>]` reports
+**how often each seat is interrupted** (#1983). Per seat, over the window:
+wakes, wakes per day, median gap, share of gaps under five minutes, a breakdown
+by source (`workflow_note`, `escalation`, `blocked`, `awaited_fact`), delivered
+versus unproven, wakes **collapsed** by coalescing, pending wakes with **no
+enabled route** and the oldest such timestamp, and completion nags recorded
+against the seat's directives. `--window` takes a Go duration, `<n>d`, or
+`0`/`all`; default `7d`.
+
+A collapsed row counts as an interrupt that did NOT happen, never as a wake, so
+the coalescing saving is readable here rather than by hand-written SQL. A
+`pending` row whose kind and role have no enabled rule is an obligation waiting
+on configuration rather than on a tick.
+
 Event-rule wakes are separately opt-in:
 
 ```sh

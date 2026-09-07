@@ -150,7 +150,16 @@ gitmoot org events rule add --on reply --wake operator --scope observer
 gitmoot org events rule list
 gitmoot org events rule set-scope <rule-id> observer
 gitmoot org events rule rm <rule-id>
+gitmoot org interrupts --window 7d
+gitmoot org interrupts --window 24h --json
 ```
+
+`gitmoot org interrupts` reports the interrupt rate the wake transport is
+actually producing: per seat, wakes and wakes per day, the median gap between
+wakes, the share of gaps under five minutes, a source breakdown, delivered
+versus unproven, wakes collapsed by coalescing, pending wakes with no enabled
+route, and completion nags. A collapsed row counts as an interrupt that did not
+happen, so the coalescing saving is readable without hand-written SQL.
 
 Rules default to `--scope addressed`: when an event carries a target role, only
 the matching addressed rule receives it. During rule evaluation,
