@@ -76,6 +76,18 @@ type directiveTTLDependencies struct {
 	markDone  func(context.Context, *db.Store, int64, int, string, time.Time) (int, bool, error)
 	exhaust   func(context.Context, *db.Store, int64, time.Time) (bool, error)
 	countOpen func(context.Context, *db.Store) (int, error)
+	// presence overrides the persisted live-pane read that decides whether a
+	// seat is mid-turn (#1979). The sweep deliberately reads the PERSISTED
+	// observation rather than probing Herdr: it runs before this lane takes its
+	// snapshot, and a nag is not worth a subprocess.
+	presence func(context.Context, *db.Store) ([]db.RoleLivePresence, error)
+}
+
+func (d directiveTTLDependencies) livePresence(ctx context.Context, store *db.Store) ([]db.RoleLivePresence, error) {
+	if d.presence != nil {
+		return d.presence(ctx, store)
+	}
+	return store.ListRoleLivePresence(ctx)
 }
 
 func defaultBlockedRoleWakeDependencies() blockedRoleWakeDependencies {
@@ -471,6 +483,7 @@ func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.
 	if err != nil {
 		return err
 	}
+	workingSeats := directiveWorkingSeats(ctx, store, deps, stdout, now)
 	for _, item := range items {
 		from, to, _, _, ok := workflow.ParseOrgDirectiveNote(item.Body)
 		if !ok {
@@ -485,6 +498,43 @@ func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.
 		anchor, ttl, phase, unacked, due := directiveTTLDue(item, orgConfig, now)
 		if !due {
 			continue
+		}
+		// #1979: NEVER NAG A SEAT THAT IS WORKING. The completion nag's own text
+		// is "acknowledged but incomplete; finish the assigned deliverable", and
+		// every inbound pane message ends the turn in flight, so delivering it
+		// to a working seat TERMINATES the attempt to finish. Measured across
+		// the fleet's transcripts: 675 such prompts delivered, 1,524 completion
+		// ladder firings recorded, and the directive-driven panes ran a 0.9 to
+		// 4.5 minute median turn against 76 to 345 minute turns in the same
+		// panes when the prompt carried a deliverable instead of a reminder.
+		//
+		// Scoped to the COMPLETION phase on purpose: the acknowledgment request
+		// asks for a receipt the seat has not yet given, so it is not a nag
+		// about unfinished work, and routing receipts off the pane entirely is
+		// its own slice (#1980).
+		if !unacked {
+			switch directiveCompletionNagDecision(workingSeats, to, anchor, ttl, orgConfig.DirectiveMaxNudges(), now) {
+			case directiveNagDefer:
+				writeLine(stdout,
+					"org directive %d completion nudge deferred: %s is working (obligation open %s)",
+					item.ID, to, now.Sub(anchor).Round(time.Second))
+				continue
+			case directiveNagEscalate:
+				// The deferral is BOUNDED. A seat that reports working forever
+				// would otherwise hold an unmet obligation with nothing ever
+				// escalating, which trades one defect for a worse one. Stamp
+				// first so the escalation is at-most-once even if this tick
+				// repeats.
+				if terminated := terminateDirectiveCompletionLadder(ctx, store, deps, item, to, stdout, now); !terminated {
+					continue
+				}
+				events.EmitEvent(ctx, sink,
+					buildDirectiveWorkingEscalationEvent(item, orgConfig, from, to, anchor, now))
+				writeLine(stdout,
+					"org directive %d completion nudge escalated instead of interrupting %s, working past its nudge budget",
+					item.ID, to)
+				continue
+			}
 		}
 		// #1352: each phase advances its OWN counter, so each caps independently.
 		var newCount int
@@ -514,27 +564,133 @@ func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.
 			// is its own counter at the cap — pre-existing, queryable, and it does
 			// not block the phase that follows it.
 			if !unacked {
-				if stamped, err := deps.markExhausted(ctx, store, item, now); err != nil {
-					writeLine(stdout, "org directive %d exhausted mark failed: %v", item.ID, err)
-				} else if stamped {
-					// #1352 B1: the COLUMN alone was invisible to operators — Comms
-					// builds threads from NOTES, so a column-only terminal state showed
-					// no thread at all. The marker is what makes exhaustion discoverable;
-					// the column stays for the evaluator's own reads.
-					if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
-						WorkflowID: item.WorkflowID,
-						Author:     to,
-						Body:       workflow.FormatOrgDirectiveExhaustedNote(item.ID, to),
-						Repo:       item.Repo,
-					}); err != nil {
-						writeLine(stdout, "org directive %d exhausted marker note failed: %v", item.ID, err)
-					}
+				if terminateDirectiveCompletionLadder(ctx, store, deps, item, to, stdout, now) {
 					writeLine(stdout, "org directive %d %s ladder exhausted after %d nudges; obligation remains open and queryable", item.ID, phase, newCount)
 				}
 			}
 		}
 	}
 	return nil
+}
+
+// directiveWorkingPresenceFreshness bounds how old a `working` observation may
+// be and still suppress a nag. The lane that persists live presence runs every
+// blockedRoleWakeInterval, so five intervals tolerate missed ticks while
+// refusing to trust an observation from a pane that has since gone away.
+const directiveWorkingPresenceFreshness = 5 * blockedRoleWakeInterval
+
+type directiveNagDecision uint8
+
+const (
+	directiveNagDeliver directiveNagDecision = iota
+	directiveNagDefer
+	directiveNagEscalate
+)
+
+// directiveWorkingSeats returns the roles whose persisted pane observation is a
+// FRESH `working`. An unreadable presence store yields an empty set, so the
+// ladder behaves exactly as it did before #1979: failing toward delivering the
+// nag is the conservative direction, because a missed nag is a missed
+// obligation while a spurious one is only an interrupt.
+func directiveWorkingSeats(ctx context.Context, store *db.Store, deps directiveTTLDependencies, stdout io.Writer, now time.Time) map[string]struct{} {
+	working := map[string]struct{}{}
+	rows, err := deps.livePresence(ctx, store)
+	if err != nil {
+		writeLine(stdout, "org directive nudge presence read failed, nudging as if idle: %v", err)
+		return working
+	}
+	for _, row := range rows {
+		if !strings.EqualFold(strings.TrimSpace(row.State), string(org.StateWorking)) {
+			continue
+		}
+		observedAt := parseTranscriptStoreTime(row.ObservedAt)
+		if observedAt.IsZero() || now.Sub(observedAt) > directiveWorkingPresenceFreshness {
+			continue
+		}
+		working[strings.ToLower(strings.TrimSpace(row.Role))] = struct{}{}
+	}
+	return working
+}
+
+// directiveCompletionNagDecision decides between the seat and its supervisor.
+// A working seat is not interrupted, but the deferral is bounded by the ladder
+// the nag would otherwise have run: past anchor + ttl*(max_nudges+1) the whole
+// ladder could have fired, so the obligation escalates instead of waiting on a
+// turn that may never end.
+func directiveCompletionNagDecision(
+	working map[string]struct{},
+	target string,
+	anchor time.Time,
+	ttl time.Duration,
+	maxNudges int,
+	now time.Time,
+) directiveNagDecision {
+	if _, ok := working[strings.ToLower(strings.TrimSpace(target))]; !ok {
+		return directiveNagDeliver
+	}
+	if anchor.IsZero() || ttl <= 0 || maxNudges <= 0 {
+		return directiveNagDeliver
+	}
+	if now.After(anchor.Add(ttl * time.Duration(maxNudges+1))) {
+		return directiveNagEscalate
+	}
+	return directiveNagDefer
+}
+
+// terminateDirectiveCompletionLadder stamps the completion phase terminal and
+// records the operator-visible marker note (#1352 B1). It reports whether THIS
+// call performed the stamp, so a caller can emit exactly one escalation even if
+// its tick repeats.
+func terminateDirectiveCompletionLadder(
+	ctx context.Context,
+	store *db.Store,
+	deps directiveTTLDependencies,
+	item db.OrgDirectiveObligation,
+	target string,
+	stdout io.Writer,
+	now time.Time,
+) bool {
+	stamped, err := deps.markExhausted(ctx, store, item, now)
+	if err != nil {
+		writeLine(stdout, "org directive %d exhausted mark failed: %v", item.ID, err)
+		return false
+	}
+	if !stamped {
+		return false
+	}
+	if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: item.WorkflowID,
+		Author:     target,
+		Body:       workflow.FormatOrgDirectiveExhaustedNote(item.ID, target),
+		Repo:       item.Repo,
+	}); err != nil {
+		writeLine(stdout, "org directive %d exhausted marker note failed: %v", item.ID, err)
+	}
+	return true
+}
+
+// buildDirectiveWorkingEscalationEvent tells the SENDER'S PARENT that an
+// obligation is unmet while its seat is working, rather than interrupting the
+// seat with the same information (#1979). It keeps the shape of the ordinary
+// ladder escalation so routing and delivery are unchanged.
+func buildDirectiveWorkingEscalationEvent(
+	item db.OrgDirectiveObligation,
+	orgConfig config.OrgConfig,
+	sender, target string,
+	anchor time.Time,
+	now time.Time,
+) events.Event {
+	id := fmt.Sprint(item.ID)
+	detail := fmt.Sprintf(
+		"directive %s to %s remains incomplete after %s while %s is working; escalated instead of interrupting the seat",
+		id, target, now.Sub(anchor).Round(time.Second), target,
+	)
+	ev := events.NewEvent(events.EventJobNeedsAttention, "org-directive:"+id, db.WakeOutboxSourceWorkflowNote+":"+id, item.Repo, "overdue", detail, now, workflow.RedactCommentText)
+	ev.Cause = "escalation"
+	if role, ok := orgConfig.Role(sender); ok {
+		ev.WakeTargetRole = role.Parent
+	}
+	return ev
 }
 
 func directiveTTLDue(item db.OrgDirectiveObligation, orgConfig config.OrgConfig, now time.Time) (anchor time.Time, ttl time.Duration, phase string, unacked, due bool) {

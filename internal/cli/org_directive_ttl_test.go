@@ -16,6 +16,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/events"
+	"github.com/gitmoot/gitmoot/internal/org"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -276,6 +277,140 @@ func TestDirectiveTTLAckSkipsAckNudgesAndDoneOverrideWins(t *testing.T) {
 	}
 	if got := readDirectiveTTLObligation(t, store, ackOnly.ID).NudgeCount; got != 0 {
 		t.Fatalf("acked directive got %d ack nudges, want 0", got)
+	}
+}
+
+// TestDirectiveCompletionNagDefersWhileSeatIsWorking is #1979's reproduction.
+// The completion nag reads "acknowledged but incomplete; finish the assigned
+// deliverable", and every inbound pane message ends the turn in flight, so
+// delivering it to a seat that IS working terminates the attempt to finish.
+// Measured across the fleet's own transcripts: 675 such prompts, and 1,524
+// completion-ladder firings recorded in the store.
+func TestDirectiveCompletionNagDefersWhileSeatIsWorking(t *testing.T) {
+	home := t.TempDir()
+	cfg := writeDirectiveTTLConfig(t, home, "supervisor", 10*time.Minute, time.Hour, 3)
+	store := openDirectiveTTLStore(t, home)
+	defer store.Close()
+	ctx := context.Background()
+	directive := seedDirectiveTTLNote(t, store, "carry this to completion", 0, false)
+	acknowledgeDirectiveTTLNote(t, store, directive)
+	now := time.Now().UTC().Add(2 * time.Hour)
+	// The seat is mid-turn at the moment the nag comes due.
+	if err := store.UpsertRoleLivePresence(ctx, "worker", string(org.StateWorking), now.Add(-30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	sink := &recordingSink{}
+	if err := evaluateOrgDirectiveTTLs(ctx, store, sink, cfg, io.Discard, now, directiveTTLDependencies{}); err != nil {
+		t.Fatal(err)
+	}
+	if wakes := sink.byType(events.EventOrgDirective); len(wakes) != 0 {
+		t.Fatalf("nagged a working seat: %+v", wakes)
+	}
+	// The ladder must not spend a nudge on an undelivered nag either, or the
+	// seat loses its escalation budget while it is working.
+	if got := readDirectiveTTLObligation(t, store, directive.ID).DoneNudgeCount; got != 0 {
+		t.Fatalf("done nudge count while working = %d, want 0", got)
+	}
+
+	// Once the seat stops, the deferred nag fires: deferral is not suppression.
+	if err := store.UpsertRoleLivePresence(ctx, "worker", string(org.StateIdle), now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := evaluateOrgDirectiveTTLs(ctx, store, sink, cfg, io.Discard, now.Add(2*time.Minute), directiveTTLDependencies{}); err != nil {
+		t.Fatal(err)
+	}
+	wakes := sink.byType(events.EventOrgDirective)
+	if len(wakes) != 1 || wakes[0].WakeTargetRole != "worker" || wakes[0].Cause != directiveCompletionOverdueCause {
+		t.Fatalf("post-idle completion wake = %+v, want one completion nag to worker", wakes)
+	}
+	if got := readDirectiveTTLObligation(t, store, directive.ID).DoneNudgeCount; got != 1 {
+		t.Fatalf("done nudge count after idle = %d, want 1", got)
+	}
+}
+
+// TestDirectiveCompletionNagIgnoresUnusableWorkingSignal keeps the deferral
+// narrow. A pane whose observation is stale, or whose state is anything other
+// than `working` (a closed pane reports `unknown`), must not silence the
+// ladder: an obligation to a seat nobody is running has to escalate.
+func TestDirectiveCompletionNagIgnoresUnusableWorkingSignal(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		state      string
+		observedAt func(time.Time) time.Time
+	}{
+		{name: "stale working observation", state: string(org.StateWorking), observedAt: func(now time.Time) time.Time {
+			return now.Add(-directiveWorkingPresenceFreshness - time.Minute)
+		}},
+		{name: "closed pane reports unknown", state: string(org.StateUnknown), observedAt: func(now time.Time) time.Time {
+			return now.Add(-time.Second)
+		}},
+		{name: "seat is done", state: string(org.StateDone), observedAt: func(now time.Time) time.Time {
+			return now.Add(-time.Second)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home := t.TempDir()
+			cfg := writeDirectiveTTLConfig(t, home, "supervisor", 10*time.Minute, time.Hour, 3)
+			store := openDirectiveTTLStore(t, home)
+			defer store.Close()
+			ctx := context.Background()
+			directive := seedDirectiveTTLNote(t, store, "unusable signal", 0, false)
+			acknowledgeDirectiveTTLNote(t, store, directive)
+			now := time.Now().UTC().Add(2 * time.Hour)
+			if err := store.UpsertRoleLivePresence(ctx, "worker", test.state, test.observedAt(now)); err != nil {
+				t.Fatal(err)
+			}
+			sink := &recordingSink{}
+			if err := evaluateOrgDirectiveTTLs(ctx, store, sink, cfg, io.Discard, now, directiveTTLDependencies{}); err != nil {
+				t.Fatal(err)
+			}
+			if wakes := sink.byType(events.EventOrgDirective); len(wakes) != 1 {
+				t.Fatalf("completion wakes = %+v, want one; an unusable working signal must not defer", wakes)
+			}
+		})
+	}
+}
+
+// TestDirectiveCompletionNagEscalatesInsteadOfNaggingAnEndlessTurn bounds the
+// deferral. A seat that reports `working` forever would otherwise hold an
+// unmet obligation with nothing ever escalating, which trades one defect for
+// a worse one. Past the ladder's own budget the supervisor is told instead of
+// the worker being interrupted.
+func TestDirectiveCompletionNagEscalatesInsteadOfNaggingAnEndlessTurn(t *testing.T) {
+	home := t.TempDir()
+	cfg := writeDirectiveTTLConfig(t, home, "supervisor", 10*time.Minute, time.Hour, 3)
+	store := openDirectiveTTLStore(t, home)
+	defer store.Close()
+	ctx := context.Background()
+	directive := seedDirectiveTTLNote(t, store, "endless turn", 0, false)
+	acknowledgeDirectiveTTLNote(t, store, directive)
+	// Past ack + done_ttl * (max_nudges + 1): the whole ladder could have run.
+	now := time.Now().UTC().Add(5 * time.Hour)
+	if err := store.UpsertRoleLivePresence(ctx, "worker", string(org.StateWorking), now.Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	sink := &recordingSink{}
+	for range 2 {
+		if err := evaluateOrgDirectiveTTLs(ctx, store, sink, cfg, io.Discard, now, directiveTTLDependencies{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if wakes := sink.byType(events.EventOrgDirective); len(wakes) != 0 {
+		t.Fatalf("nagged the working seat instead of escalating: %+v", wakes)
+	}
+	escalations := sink.byType(events.EventJobNeedsAttention)
+	if len(escalations) != 1 {
+		t.Fatalf("escalations = %+v, want exactly one past the deferral budget", escalations)
+	}
+	event := escalations[0]
+	if event.WakeTargetRole != "supervisor" || event.Cause != "escalation" {
+		t.Fatalf("escalation routing = %+v, want the sender's parent", event)
+	}
+	if !strings.Contains(event.Detail, "working") || !strings.Contains(event.Detail, "incomplete") {
+		t.Fatalf("escalation detail = %q, want it to name the working seat and the unmet obligation", event.Detail)
+	}
+	if item := readDirectiveTTLObligation(t, store, directive.ID); item.ExhaustedAt == "" {
+		t.Fatalf("obligation = %+v, want the completion ladder stamped terminal once escalated", item)
 	}
 }
 

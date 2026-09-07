@@ -33,6 +33,13 @@ var wakeTargetRoleProducers = []wakeTargetRoleProducer{
 		Kinds:    directiveEscalationDirectedKinds,
 	},
 	{
+		// #1979: the same escalation route as the ladder's terminal escalation,
+		// taken when a completion nag would otherwise interrupt a working seat.
+		File:     "internal/cli/blocked_since.go",
+		Function: "buildDirectiveWorkingEscalationEvent",
+		Kinds:    directiveEscalationDirectedKinds,
+	},
+	{
 		File:     "internal/cli/event_rule_sink.go",
 		Function: "addressBlockedEvent",
 		Kinds:    blockedWakeDirectedKinds,
