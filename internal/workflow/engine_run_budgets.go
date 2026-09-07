@@ -854,7 +854,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			// context and worktree. A durable per-PR enable is the explicit
 			// unattended-chain opt-in for dispatching a fresh implement job (#1712).
 			if configured && !policy.Disabled {
-				if err := e.dispatchFix(ctx, reviewer, payload, *payload.Result, ref); err != nil {
+				if err := e.dispatchFix(ctx, job, reviewer, payload, *payload.Result, ref); err != nil {
 					return err
 				}
 			}
