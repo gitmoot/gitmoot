@@ -285,6 +285,27 @@ func (e Engine) recordLedgerSkip(ctx context.Context, jobID string, index int, r
 	})
 }
 
+// ReviewObligationBrief exposes the obligation brief to a dispatcher outside
+// this package. It exists because the brief was reachable from ONE dispatch
+// path and that path records nothing (#1969).
+//
+// Measured on this box's ledger, 2026-09-05 to 2026-09-07: all 571 recorded
+// findings were written by CLI-dispatched review jobs (observer_job LIKE
+// 'local-%') and ZERO by the daemon fan-out, while ledgerObligationBrief was
+// called only from HandlePullRequestOpened's fan-out loop and the high-risk
+// lens. So the read half of the loop this file's header describes has never
+// fired in production: no reviewer has ever been handed a uid by the engine,
+// and not one of the 571 findings' prompts contains a rendered 'uid=' line.
+//
+// It is a thin accessor ON PURPOSE. The brief's TEXT must have exactly one
+// author, and the scope it is computed with must be the gate's own, or the
+// brief discloses one set of obligations while the gate demands another - the
+// #1850 R3-F1 wedge. Callers supply the same LedgerResolvers value the gate
+// holds; they do not get to render their own version.
+func (e Engine) ReviewObligationBrief(ctx context.Context, repo string, pullRequest int, head string, taskID string) string {
+	return e.ledgerObligationBrief(ctx, repo, pullRequest, head, taskID)
+}
+
 // ledgerObligationBrief renders the prior findings a round at this head must
 // observe, for inclusion in the review brief. THIS IS THE HALF THAT KEEPS THE
 // GATE FROM REJECTING VALID INPUT: an obligation can only be discharged by
