@@ -654,7 +654,7 @@ func (g PolicyMergeGate) recordApprovalEvidence(ctx context.Context, job db.Job,
 		JobID: job.ID,
 		Kind:  mergeApprovalEvidenceEvent,
 		Message: fmt.Sprintf("approval by %s at %s: evidence=%s (%s)",
-			strings.TrimSpace(job.Agent), strings.TrimSpace(payload.HeadSHA), evidence, detail),
+			effectiveReviewerIdentityName(job, payload), strings.TrimSpace(payload.HeadSHA), evidence, detail),
 	})
 }
 
@@ -900,13 +900,39 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	// in neither direction, so no row is ever hidden by ListJobs' id order.
 	supersededReviewIDs := map[string]struct{}{}
 	for _, review := range reviewsAtHead {
-		reviewer := strings.TrimSpace(review.job.Agent)
+		// THE SIXTH AND LAST INLINE COPY OF THIS RULE (#1950 F4). Every other site
+		// was routed through effectiveReviewerIdentity while THIS one still compared
+		// Agent columns, so an at-head objection authored by an acting ROLE could
+		// never be superseded by that same role's later at-head approval: both Agent
+		// columns are empty, the loop skipped them, and the PR stayed open rendering
+		// "blocking result from " with no author. The helper already resolved both
+		// identities correctly - nothing reached it here.
+		//
+		// Normalization matters on this path specifically: the reviewer's adversary
+		// used " ReVieWer ", and NormalizeActingOrgRole trims and lowercases, so the
+		// objection and its replacement resolve to one identity.
+		reviewer := effectiveReviewerIdentityName(review.job, review.payload)
 		if reviewer == "" {
 			continue
 		}
 		for _, candidate := range reviewsAtHead {
-			if candidate.payload.Result != nil &&
-				strings.TrimSpace(candidate.job.Agent) == reviewer &&
+			// DEFAULT-DENY HERE TOO (#1950 F6, second instance). This loop tested a
+			// bare Result != nil, which ADMITS BY DEFAULT: a succeeded approved
+			// FAN-OUT at the evaluated head - a dispatch announcement, not a verdict
+			// - retired an earlier same-reviewer changes_requested objection, was
+			// then skipped as an announcement by the blocking scan, and the PR
+			// merged on an independent approval.
+			//
+			// The previous round advertised "the same predicate governs both sides,
+			// so they cannot diverge" while shipping the helper at ONE call site.
+			// The invariant was asserted, not censused, and a one-line grep would
+			// have falsified it. Both candidate loops now call this helper, which is
+			// what makes the property true by construction; the count is reported in
+			// the test rather than the property being claimed again.
+			if !reviewRowCanRetireAnObjection(candidate.job, candidate.payload, headSHA) {
+				continue
+			}
+			if effectiveReviewerIdentityName(candidate.job, candidate.payload) == reviewer &&
 				isReviewReplacementDecision(candidate.payload.Result.Decision) &&
 				reviewJobSupersedes(candidate.job, candidate.payload, review.job, review.payload) {
 				supersededReviewIDs[review.job.ID] = struct{}{}
@@ -927,9 +953,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	for _, review := range activeAtHead {
 		switch JobState(review.job.State) {
 		case JobQueued, JobRunning:
-			return mergePending{reason: fmt.Sprintf("waiting for reviewer %s at evaluated head (job %s is %s)", strings.TrimSpace(review.job.Agent), review.job.ID, review.job.State)}
+			return mergePending{reason: fmt.Sprintf("waiting for reviewer %s at evaluated head (job %s is %s)", effectiveReviewerIdentityName(review.job, review.payload), review.job.ID, review.job.State)}
 		case JobFailed, JobCancelled:
-			return fmt.Errorf("crashed reviewer %s at evaluated head (job %s is %s); retry or settle that same job, or push a new head. Reassigning the review to a different agent cannot clear this reviewer's slot", strings.TrimSpace(review.job.Agent), review.job.ID, review.job.State)
+			return fmt.Errorf("crashed reviewer %s at evaluated head (job %s is %s); retry or settle that same job, or push a new head. Reassigning the review to a different agent cannot clear this reviewer's slot", effectiveReviewerIdentityName(review.job, review.payload), review.job.ID, review.job.State)
 		}
 	}
 	for _, review := range activeAtHead {
@@ -955,8 +981,205 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		}
 		switch effectiveReviewDecisionForPayload(review.payload, request.ReviewBlockingSeverity) {
 		case "changes_requested", "blocked", "failed":
-			return mergeBlocked{reason: fmt.Sprintf("review at evaluated head has blocking result from %s", review.job.Agent)}
+			// Named through the resolver: a role-authored objection rendered
+			// "blocking result from " with no author, which is the line an operator
+			// reads while working out why a merge is stuck (#1950 F4).
+			return mergeBlocked{reason: fmt.Sprintf("review at evaluated head has blocking result from %s", effectiveReviewerIdentityName(review.job, review.payload))}
 		}
+	}
+	// #1933. A PERSISTED HEADLESS OBJECTION MUST BLOCK HERE, BEFORE THE EXTERNAL
+	// MERGE CLAIM. This is an ORDERING fix, and the ordering is the whole fix:
+	// evaluating the objection after ClaimTaskState is what loses the race.
+	//
+	// The interleaving that shipped: reviewsAtHead holds only rows whose
+	// payload.HeadSHA equals the evaluated head, so a headless objection is
+	// invisible to it; the latest-round fallback below never runs because the
+	// strict population is non-empty whenever ANY current-head review exists; the
+	// gate then returns clean, executePullRequestMergeFenced acquires the task
+	// state for the external merge, and the objection's own AdvanceJob transition
+	// fails against that claim with ErrTaskStateClaimed while the merge completes.
+	// The objection was not deferred, it was BYPASSED - which inverts the one
+	// property the gate exists to hold.
+	//
+	// Every qualifier below is load-bearing, and each has a should-SUCCEED arm in
+	// the tests, because a gate that blocks valid merges is its own defect:
+	//   - HEADLESS: a row bound to a head is owned by the strict population above.
+	//     An objection rendered against a DIFFERENT head must still merge.
+	//   - ORDINARY: a fan-out announces a panel and is never a verdict (#1685).
+	//   - SUCCEEDED with a result: a queued, crashed or abstaining row is not an
+	//     objection, and the arms above already speak for rows at this head.
+	//   - UNSUPERSEDED: a strictly later terminal verdict from the SAME reviewer
+	//     is how an objection is answered or withdrawn, so a superseded row must
+	//     not block.
+	//   - APPLICABLE, and it takes FOUR exclusions, because a naive "ordinary
+	//     headless changes_requested" predicate deadlocks legitimate merges in three
+	//     distinct ways. sameCorrelatedTask already filtered by repo/PR/branch. Then:
+	//     a DELEGATION CHILD is headless by engine design and is judged through its
+	//     parent's fan-out evidence; an INTEGRATION-WORKTREE row has its head
+	//     cleared so it can validate an isolated tree; and an ENGINE-INSERTED
+	//     roundless row is an unattributable delegation remnant. That last test is
+	//     on ORIGIN, never on roundlessness: an EXTERNALLY DRIVEN session review
+	//     legitimately carries neither head nor round and IS a real objection. All
+	//     three point the OPPOSITE way from everything else here - including any of
+	//     them would block every head forever, which no push could ever clear.
+	//   - LATEST: among survivors the newest row decides, by the same
+	//     reviewRoundKey ordering supersession and round selection use, so no two
+	//     decisions here can disagree about which row is newer.
+	var headlessObjection *taskReview
+	var headlessObjectionKey reviewRoundKey
+	for i := range taskReviews {
+		review := taskReviews[i]
+		if strings.TrimSpace(review.payload.HeadSHA) != "" {
+			continue
+		}
+		// THIRD POPULATION, SHARED CORE (#1950 P1-B). This scan used to hand-compose
+		// succeeded, non-nil, non-fan-out and provenance inline, one clause at a
+		// time, which is how the candidate and objection sides drifted apart in the
+		// first place. Both candidate loops and this objection scan now ask the same
+		// one-row question, and a census test asserts the call-site COUNT so the
+		// property is checkable rather than advertised.
+		if !reviewRowIsVerdictAboutHead(review.job, review.payload, headSHA) {
+			continue
+		}
+		if isRoundHistoryDuplicate(review.job, taskReviewIDs) {
+			continue
+		}
+		// NOT APPLICABLE, FIRST DEADLOCK SHAPE, and it is only visible to the FULL
+		// package: a DELEGATION CHILD is headless because the engine clears a child's
+		// inherited HeadSHA, and its verdict is accounted through its parent's
+		// fan-out evidence (ensureDelegatedReviewEvidence), never as a standalone
+		// verdict about this head. isRoundHistoryDuplicate above is NOT enough - it
+		// only covers a child whose PARENT is itself a task review row, so a child of
+		// any other parent survived it.
+		//
+		// Found by execution rather than reading: a version of this block carrying
+		// only the superseded and integration exclusions passed every scoped headless
+		// test AND both ordering mutants, then failed
+		// TestPolicyMergeGateDelegatedReviewEvidenceEnumeration/H04_CHANGES_REQUESTED
+		// in the full package. A green scoped run is precisely what hides this class.
+		if isDelegationChild(review.job) {
+			continue
+		}
+		// NOT APPLICABLE, THIRD SHAPE - AND ROUNDLESSNESS IS NOT THE TEST. An earlier
+		// version excluded EVERY roundless row, reasoning that no production path
+		// persists a verdict with neither head nor round. THAT WAS FALSE, and a
+		// reviewer proved it by execution rather than by argument: `gitmoot job record
+		// --type review` (internal/cli/job_session.go:214-305) opens an EXTERNALLY
+		// DRIVEN session job through OpenExternalJob, which deliberately persists
+		// neither HeadSHA nor ReviewRound and demotes any supplied head to a display
+		// event (internal/workflow/session_job.go:85-125); CloseExternalJobWithUsage
+		// then stores changes_requested and succeeds the row (session_job.go:170-190).
+		// A roundless headless row can therefore be a REAL blocking objection, and
+		// excluding it left #1933's bypass reachable while the ledger claimed a fix.
+		//
+		// What must still be ignored is the UNATTRIBUTABLE DELEGATION REMNANT: a child
+		// whose linkage columns were never written, which
+		// TestPolicyMergeGateDelegatedReviewEvidenceEnumeration's PARENT_ONLY and
+		// NEITHER_PARENT variants assert as wantExcluded. The discriminator is ORIGIN:
+		// db.Job.ExternallyDriven is set only by CreateExternallyDrivenJobWithEvent and
+		// every other insert leaves it at its default 0
+		// (internal/db/store_jobs.go:184), so a session review is positively
+		// identified rather than inferred from what its payload lacks.
+		//
+		// IT FAILS CLOSED BY CONSTRUCTION: a row is excluded only when it is BOTH
+		// engine-inserted AND roundless - provably the remnant shape. Every other
+		// combination, including any shape neither I nor the reviewer has enumerated,
+		// reaches the block below rather than slipping past it.
+
+		// NOT APPLICABLE, and this exclusion is the difference between a gate and a
+		// deadlock (#332 decompose-and-verify, #388). An integration-worktree review
+		// carries no head because the ENGINE CLEARS IT deliberately: the worktree has
+		// no branch and is validated against its own fresh HEAD, so the row's verdict
+		// is about that isolated tree, not about this pull request's head. Treating it
+		// as an objection against the head makes it an objection against EVERY head,
+		// which no push can ever clear -
+		// TestPolicyMergeGateHeadlessIntegrationObjectionDoesNotMatchEveryHead is the
+		// pre-existing test that holds this line, and the first version of this block
+		// failed it by including every headless row indiscriminately.
+		if isIntegrationWorktreeReview(review.payload) {
+			continue
+		}
+		if effectiveReviewDecisionForPayload(review.payload, request.ReviewBlockingSeverity) != "changes_requested" {
+			continue
+		}
+		// IDENTITY IS AGENT-OR-ROLE, NOT AGENT ALONE, and reading it from job.Agent
+		// only was a P1 deadlock of my own making (#1950 F2). OpenExternalJob supports
+		// ActingOrgRole IN PLACE OF an agent and persists Agent="" with
+		// ActingOrgRole=<role> (session_job.go, mailbox.go:665). With an empty agent
+		// the supersession scan below was skipped entirely, so a role's objection
+		// could NEVER be answered by that same role's later approval - a block with no
+		// operator move available - and the refusal text named nobody at all.
+		//
+		// The precedent is already in this file: collectGateImplementerAttribution
+		// resolves the same identity with NormalizeActingOrgRole (merge_gate.go:1564),
+		// so this uses that rather than inventing a second rule. Both SIDES of the
+		// comparison resolve identically, or a role could still never supersede itself.
+		reviewer := effectiveReviewerIdentityName(review.job, review.payload)
+		superseded := false
+		if reviewer != "" {
+			for _, candidate := range taskReviews {
+				// A HEAD-BEARING CANDIDATE MUST MATCH THE EVALUATED HEAD, and omitting
+				// this was a merge-integrity BYPASS in the first version of this arm
+				// (#1950 F5, escalated to P1). The three tests below - identity, a
+				// replacement decision, recency - never asked WHICH HEAD the candidate
+				// described. A production session objection carries neither head nor
+				// round; a later same-reviewer CLI-shaped approval naming a STALE head
+				// is also roundless, so reviewRoundKeyForJob falls back to timestamps,
+				// the stale approval won recency and retired the objection. With an
+				// independent at-head approval present, Evaluate MERGED - measured at
+				// one external merge call in each of three runs.
+				//
+				// EMPTY-OR-EQUAL, DELIBERATELY NOT EMPTY-ONLY. A replacement rendered AT
+				// the evaluated head legitimately answers a headless objection, which is
+				// the ordinary way a reviewer withdraws one; requiring the candidate to
+				// be headless too would deadlock every objection answered by
+				// re-reviewing the current head. The "replaced it at the evaluated head"
+				// arm pins that direction, and the mutant dropping this condition kills
+				// only the stale-head regression.
+				//
+				// A row's authority is the FULL TUPLE - identity, decision class,
+				// recency, and applicable head. Five rounds of this fix each decided it
+				// from a subset: the writer, then the attempt, then the message prefix,
+				// then the identity source, and now the head.
+				// ADMISSIBILITY IS DEFAULT-DENY (#1950 F6). Three rounds found this loop
+				// admitting rows it should not - an unscoped head, then unusable states,
+				// then an explicit non-verdict - because each round removed one shape and
+				// left the default OPEN. reviewRowCanRetireAnObjection inverts that: a
+				// row must positively qualify, so an unenumerated kind produces a false
+				// BLOCK rather than a false MERGE. A deadlock is visible; a merge is not.
+				if !reviewRowCanRetireAnObjection(candidate.job, candidate.payload, headSHA) {
+					continue
+				}
+				// The remaining tests are RELATIONAL - they compare two rows rather than
+				// describe one - so they stay out of the predicate.
+				if effectiveReviewerIdentityName(candidate.job, candidate.payload) == reviewer &&
+					isReviewReplacementDecision(candidate.payload.Result.Decision) &&
+					reviewJobSupersedes(candidate.job, candidate.payload, review.job, review.payload) {
+					superseded = true
+					break
+				}
+			}
+		}
+		if superseded {
+			continue
+		}
+		key := reviewRoundKeyForJob(review.job, review.payload)
+		if headlessObjection == nil || reviewRoundKeyAfter(key, headlessObjectionKey) {
+			headlessObjection = &taskReviews[i]
+			headlessObjectionKey = key
+		}
+	}
+	if headlessObjection != nil {
+		// Name the AGENT-OR-ROLE, never the bare agent: an acting-role session review
+		// has no agent, and the first version of this rendered "objection from  "
+		// with an empty name, which tells an operator nothing about who to go to.
+		author := effectiveReviewerIdentityName(headlessObjection.job, headlessObjection.payload)
+		if author == "" {
+			author = "an unattributed reviewer"
+		}
+		return mergeBlocked{reason: fmt.Sprintf(
+			"unanswered review objection from %s (job %s) carries no evaluated head; answer or supersede that row, or re-render the verdict against this head",
+			author, headlessObjection.job.ID)}
 	}
 	if len(activeAtHead) > 0 {
 		var selfApprovalReason string
@@ -967,7 +1190,12 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		var acceptedJob db.Job
 		var acceptedPayload JobPayload
 		for _, review := range activeAtHead {
-			reviewer := strings.TrimSpace(review.job.Agent)
+			// THE THIRD SITE OF THE SAME IDENTITY RULE (#1950 F4, ruling 126350).
+			// Reading job.Agent alone classified a ROLE-AUTHORED approval as
+			// unattributed and refused it BEFORE the independence check ever ran, so a
+			// role could never approve anything - and the role's own self-approval was
+			// never even tested for. Agent still wins whenever present.
+			reviewer := effectiveReviewerIdentityName(review.job, review.payload)
 			if JobState(review.job.State) != JobSucceeded {
 				return fmt.Errorf("reviewer %s at evaluated head has unusable job state %s (job %s)", reviewer, review.job.State, review.job.ID)
 			}
@@ -1080,7 +1308,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			continue
 		}
 		if effectiveReviewDecisionForPayload(payload, request.ReviewBlockingSeverity) == "approved" {
-			reviewerAgent := strings.TrimSpace(job.Agent)
+			// Same rule, same helper (#1950 F4): the latest-round arm resolved identity
+			// separately, which is the fourth copy that ruling 126350 removes.
+			reviewerAgent := effectiveReviewerIdentityName(job, payload)
 			switch {
 			case reviewerAgent == "":
 				if unattributedReviewerReason == "" {
@@ -1106,7 +1336,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	for _, review := range eligible {
 		job := review.job
 		payload := review.payload
-		if err := g.ensureReviewMatchesHead(payload, headSHA, job.Agent); err != nil {
+		if err := g.ensureReviewMatchesHead(payload, headSHA, effectiveReviewerIdentityName(job, payload)); err != nil {
 			if reason := reviewAuthorshipFailureReason(selfApprovalReason, unknownImplementerReason, unattributedReviewerReason); reason != "" {
 				return errors.New(reason)
 			}
@@ -1119,7 +1349,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			children := delegationChildrenByParent[job.ID]
 			if len(children) == 0 {
 				undispatchedFanOuts = append(undispatchedFanOuts, fmt.Sprintf(
-					"%s (job %s, %d declared)", job.Agent, job.ID, len(payload.Result.Delegations)))
+					"%s (job %s, %d declared)", effectiveReviewerIdentityName(job, payload), job.ID, len(payload.Result.Delegations)))
 				continue
 			}
 			// Decided as "approved" by the single evidence call in the arm below.
@@ -1139,7 +1369,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			// (mergeBlocked), distinct from the transient/process review errors below
 			// (missing approval, not-yet-captured), so the trace-harvester scores only
 			// this one as a negative (#465 INFRA-NOISE-FILTERED).
-			return mergeBlocked{reason: fmt.Sprintf("latest review round has blocking result from %s", job.Agent)}
+			return mergeBlocked{reason: fmt.Sprintf("latest review round has blocking result from %s", effectiveReviewerIdentityName(job, payload))}
 		}
 	}
 	if !approved {
@@ -1419,18 +1649,20 @@ func collectImplementerAttributionMatching(jobs []db.Job, current JobPayload,
 		if !matches(current, payload) {
 			continue
 		}
-		agent := strings.TrimSpace(job.Agent)
-		role := NormalizeActingOrgRole(payload.ActingOrgRole)
+		// Identity DERIVATION is shared with the headless scan through
+		// effectiveReviewerIdentity (#1950 F4); the branch semantics below remain
+		// this collector's own.
+		name, fromActingRole := effectiveReviewerIdentity(job, payload)
 		switch {
-		case agent != "":
+		case name != "" && !fromActingRole:
 			// AN AGENT COLUMN ALWAYS WINS OVER A ROLE, and the order is load-bearing
 			// rather than cosmetic. Ordinary dispatched implement jobs carry the
 			// DISPATCHING coordinator's role in this same payload, so reading the role
 			// first would attribute every agent's work to its coordinator, make that
 			// coordinator an implementer of everything, and then disqualify it from
 			// reviewing anything.
-			evidence.agents[agent] = implementerIdentity{Name: agent}
-		case role != "":
+			evidence.agents[name] = implementerIdentity{Name: name}
+		case name != "":
 			// A ROLE NEVER DOWNGRADES AN AGENT ALREADY RECORDED UNDER THE SAME NAME,
 			// AND THAT IS WHY THIS IS A CONDITIONAL WRITE RATHER THAN A PLAIN ONE.
 			// The first version of this switch applied the agent-wins rule WITHIN one
@@ -1440,12 +1672,12 @@ func collectImplementerAttributionMatching(jobs []db.Job, current JobPayload,
 			// could report no dispatchable implementer while the agent row sat right
 			// there - routing decided by job-id order. Found in review, and it is the
 			// same rule I had already written one scope too narrow.
-			if existing, recorded := evidence.agents[role]; recorded && !existing.FromActingRole {
+			if existing, recorded := evidence.agents[name]; recorded && !existing.FromActingRole {
 				continue
 			}
 			// The #1916 shape: implemented in session by an org role, no agent to
 			// name. Attributable, and still subject to the independence check.
-			evidence.agents[role] = implementerIdentity{Name: role, FromActingRole: true}
+			evidence.agents[name] = implementerIdentity{Name: name, FromActingRole: true}
 		default:
 			evidence.sawEmptyAgent = true
 		}
@@ -1777,6 +2009,150 @@ func (g PolicyMergeGate) ensureReviewMatchesHead(payload JobPayload, headSHA str
 // allocated worktree path). The engine clears the inherited HeadSHA for exactly
 // these children so they validate against their isolated worktree HEAD, mirroring
 // isDelegationWorktreeChild in the daemon's checkout validation.
+// effectiveReviewerIdentityName resolves a review row's author: the agent when
+// the row records one, otherwise the normalized ActingOrgRole. OpenExternalJob
+// supports a role IN PLACE OF an agent (mailbox.go persists the normalized role
+// and leaves the job's Agent empty), so keying on job.Agent alone made a role's
+// objection unanswerable by that same role (#1950 F2) and rendered diagnostics
+// with a blank author.
+//
+// SCOPE OF THIS HELPER, STATED WITHOUT A COUNT ON PURPOSE (#1950 F5). Every
+// reviewer-identity read IN THIS FILE resolves through it - supersession at the
+// evaluated head and for headless rows, the at-head and latest-round approval
+// arms, implementer attribution, and every author-bearing diagnostic and durable
+// approval-evidence event. Earlier versions of this comment claimed "all three
+// sites", then all five; each count was wrong within a round, and quoting one
+// here is the habit those rounds should have ended.
+//
+// IT IS NOT THE WHOLE REPOSITORY, and two consumers outside this file are known
+// NOT to use it, deliberately left for routing rather than silently swept in:
+//   - review_loop.go's FindRepeatedReviewers drops a role-authored verdict,
+//     because db.SucceededReviewVerdict carries only Agent and would need the
+//     role plumbed through awaited_facts.go's query first;
+//   - proof/project.go reports a role-authored review as not comparable, so its
+//     independence attribute stays unknown rather than being computed. That is
+//     conservative - it emits no false independence claim - but incomplete.
+//
+// reviewRowCanRetireAnObjection reports whether a row may supersede a live
+// changes_requested objection. It is DEFAULT-DENY by construction: every clause
+// returns false and the final true is reachable only by a row that positively
+// qualifies as an authoritative verdict about the evaluated head.
+//
+// The shape is the point (#1950 F6). Rounds 5, 7 and 8 are one defect class - the
+// candidate set admitting rows it should not - and each round narrowed a denylist
+// that still admitted by default, so the next probe found the next shape: a stale
+// head, then blocked and failed rows, then an approved fan-out announcement. Under
+// default-deny an unenumerated row kind cannot retire an objection at all, so the
+// failure direction is a visible block rather than a silent merge.
+//
+// EVERY CLAUSE HERE IS MEASURED, and the list is deliberately no longer than that.
+// A speculative clause would be a claim rather than a guard, and it is also the
+// direction that starts refusing valid merges:
+//   - SUCCEEDED: a blocked or failed row is not a verdict, and it is itself absent
+//     from the blocking population, so admitting it retires an objection and
+//     leaves nothing behind to block.
+//   - a non-nil, NON-FAN-OUT result: #1685 excludes an announcement as a verdict
+//     for exactly the same reason.
+//   - HEAD APPLICABILITY, empty-or-equal: a row naming a different head describes
+//     different code (#1950 F5). Empty is admitted deliberately, because a headless
+//     replacement is the same class as a headless objection and must be able to
+//     answer it.
+//
+// reviewRowIsVerdictAboutHead is the ONE question both sides of supersession
+// share: is this row a verdict about THIS head at all? It is deliberately a
+// one-row test. Identity, decision class and recency are RELATIONAL - properties
+// of a PAIR of rows - so they cannot live here and stay at the callers.
+//
+// Extracted because #1950 P1-B was a claim, not a mechanism: the previous round
+// reported "the same predicate governs the objection side" while the helper had
+// ONE call site and the at-head loop still tested a bare Result != nil. The
+// call-site count is now asserted by a test that reads this file, so the property
+// is checkable by someone who does not trust the comment.
+func reviewRowIsVerdictAboutHead(job db.Job, payload JobPayload, headSHA string) bool {
+	return reviewRowCanRetireAnObjection(job, payload, headSHA)
+}
+
+func reviewRowCanRetireAnObjection(job db.Job, payload JobPayload, headSHA string) bool {
+	if JobState(job.State) != JobSucceeded {
+		return false
+	}
+	if payload.Result == nil || reviewRowIsFanOut(payload.Result) {
+		return false
+	}
+	if head := strings.TrimSpace(payload.HeadSHA); head != "" && head != headSHA {
+		return false
+	}
+	// ATTRIBUTABLE PROVENANCE, REQUIRED ONLY OF A HEADLESS ROW (#1950 F5, second
+	// instance). The clause exists because a probe MERGED: an engine-inserted row
+	// with neither head nor round satisfied every clause above, retired a live
+	// session objection, and was then itself excluded from the blocking population
+	// as the unattributable remnant it is.
+	//
+	// But requiring it of EVERY row over-blocked the most ordinary supported shape
+	// there is. A CLI review carries a HeadSHA - agent_dispatch resolves it from the
+	// PR and hard-errors without one - and carries NEITHER a round nor
+	// ExternallyDriven, which is set only by CreateExternallyDrivenJobWithEvent
+	// (internal/db/store_jobs.go:184). So the first version of this clause refused a
+	// succeeded CLI approval at the evaluated head, deadlocking a PR that a human
+	// had legitimately re-reviewed. I had measured "CLI review: head always, round
+	// never" earlier in this same campaign and did not apply it here.
+	//
+	// The head clause above forces a non-empty head to EQUAL the evaluated head, so
+	// such a row is attributable BY ITS HEAD: it demonstrably speaks about this
+	// exact commit. Only a HEADLESS row needs a second source of attribution, which
+	// is exactly the remnant the probe found. Guarding the narrow case rather than
+	// the general one is the whole difference between the two.
+	if strings.TrimSpace(payload.HeadSHA) == "" &&
+		!job.ExternallyDriven && strings.TrimSpace(payload.ReviewRound) == "" {
+		return false
+	}
+	// LINKAGE, AND THIS IS THE CLAUSE MY OWN ROUND-9 PROBE TALKED ME OUT OF (#1950
+	// F6). A delegation child's verdict is accounted through its PARENT's fan-out
+	// evidence (ensureDelegatedReviewEvidence), never as a standalone verdict about
+	// this head - which is exactly why the objection scan already excludes it. Not
+	// excluding it HERE made the two sides asymmetric: such a row was admitted as a
+	// superseding candidate, retired a live session objection, and was then absent
+	// from the blocking population, so it cleared a block it could never impose and
+	// the PR merged.
+	//
+	// Round 9 probed a delegation-child candidate, measured that it needed no
+	// clause, and reported that. The probe carried an explicit ROUND, so what
+	// refused it was reviewRoundKey declining to order a round against a roundless
+	// objection - not the linkage. A ROUNDLESS externally-driven child is ordered by
+	// timestamp instead and nothing refused it. One shape of a thing is not the
+	// class, and "measured, no clause needed" is only as wide as the shape measured.
+	if isDelegationChild(job) {
+		return false
+	}
+	return true
+}
+
+func effectiveReviewerIdentityName(job db.Job, payload JobPayload) string {
+	name, _ := effectiveReviewerIdentity(job, payload)
+	return name
+}
+
+// effectiveReviewerIdentity is THE Agent-first/normalized-role rule, in ONE
+// place. It reports the resolved identity and whether it came from the acting
+// role, because the attribution collector needs that distinction while the
+// headless scan does not.
+//
+// It exists because the policy was written TWICE - once here and once inline in
+// collectImplementerAttributionMatching - and #1950 F4 is the observation that
+// two copies of a rule can drift even while they currently agree. The collector
+// keeps its own conditional-write semantics (a role must not downgrade an agent
+// already recorded under the same name); what it no longer keeps is a second copy
+// of how an identity is DERIVED.
+func effectiveReviewerIdentity(job db.Job, payload JobPayload) (string, bool) {
+	if agent := strings.TrimSpace(job.Agent); agent != "" {
+		return agent, false
+	}
+	if role := NormalizeActingOrgRole(payload.ActingOrgRole); role != "" {
+		return role, true
+	}
+	return "", false
+}
+
 func isIntegrationWorktreeReview(payload JobPayload) bool {
 	return strings.TrimSpace(payload.DelegationID) != "" && strings.TrimSpace(payload.WorktreePath) != ""
 }
