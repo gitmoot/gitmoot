@@ -144,7 +144,7 @@ func TestAllocateAndEnqueueDelegationRoutesVerifyToIntegrationWorktree(t *testin
 		}},
 	}
 	verify := Delegation{ID: "verify", Agent: "checker", Action: "review", Prompt: "verify the combined work", Deps: []string{"legA", "legB"}}
-	request := engine.delegationRequest(parentJob, parentPayload, verify)
+	request := engine.delegationRequest(context.Background(), parentJob, parentPayload, verify)
 
 	if err := engine.allocateAndEnqueueDelegation(ctx, parentJob, parentPayload, verify, request, taskRefFromPayload(parentPayload)); err != nil {
 		t.Fatalf("allocateAndEnqueueDelegation returned error: %v", err)
@@ -189,7 +189,7 @@ func TestAllocateAndEnqueueDelegationAllowsImplementDepAlreadyOnBase(t *testing.
 		}},
 	}
 	verify := Delegation{ID: "verify", Agent: "checker", Action: "review", Prompt: "verify the base work", Deps: []string{"legA"}}
-	request := engine.delegationRequest(parentJob, parentPayload, verify)
+	request := engine.delegationRequest(context.Background(), parentJob, parentPayload, verify)
 
 	if err := engine.allocateAndEnqueueDelegation(ctx, parentJob, parentPayload, verify, request, taskRefFromPayload(parentPayload)); err != nil {
 		t.Fatalf("allocateAndEnqueueDelegation returned error: %v", err)
@@ -240,7 +240,7 @@ func TestAllocateAndEnqueueDelegationBlocksWhenImplementLegUnresolved(t *testing
 		}},
 	}
 	verify := Delegation{ID: "verify", Agent: "checker", Action: "review", Prompt: "verify", Deps: []string{"legA"}}
-	request := engine.delegationRequest(parentJob, parentPayload, verify)
+	request := engine.delegationRequest(context.Background(), parentJob, parentPayload, verify)
 
 	err := engine.allocateAndEnqueueDelegation(ctx, parentJob, parentPayload, verify, request, taskRefFromPayload(parentPayload))
 	var blocked BlockedError
@@ -279,7 +279,7 @@ func TestAllocateAndEnqueueDelegationBlocksWhenAnyImplementLegUnresolved(t *test
 		}},
 	}
 	verify := Delegation{ID: "verify", Agent: "checker", Action: "review", Prompt: "verify the combined work", Deps: []string{"legA", "legB"}}
-	request := engine.delegationRequest(parentJob, parentPayload, verify)
+	request := engine.delegationRequest(context.Background(), parentJob, parentPayload, verify)
 
 	err := engine.allocateAndEnqueueDelegation(ctx, parentJob, parentPayload, verify, request, taskRefFromPayload(parentPayload))
 	var blocked BlockedError

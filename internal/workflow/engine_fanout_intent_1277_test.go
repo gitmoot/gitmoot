@@ -26,7 +26,7 @@ func TestDelegationChildInheritsSkipNativeReviewFanout(t *testing.T) {
 		SkipNativeReviewFanout: true,
 	}
 
-	child := engine.delegationRequest(parent, payload, Delegation{
+	child := engine.delegationRequest(context.Background(), parent, payload, Delegation{
 		ID:     "leg-1",
 		Agent:  "impl",
 		Action: "implement",
