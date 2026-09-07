@@ -574,7 +574,9 @@ func TestDirectiveWakeDrainDoesNotCoalesceDifferentObligations(t *testing.T) {
 		// #1980: the first-delivery prompt no longer asks for a receipt, so the
 		// two phases are told apart by their own wording rather than by which
 		// receipt command they carry.
-		case strings.Contains(prompt, fmt.Sprintf("gitmoot workflow show-note %d", unread.ID)):
+		// #1981: the first-delivery prompt CARRIES the directive text, so the
+		// phase is recognised by the deliverable rather than by a fetch command.
+		case strings.Contains(prompt, fmt.Sprintf("gitmoot directive %d for worker: start", unread.ID)):
 			acknowledgmentPrompt = prompt
 		}
 	}

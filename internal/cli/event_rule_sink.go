@@ -636,9 +636,17 @@ func eventRuleWakePrompt(kind string, event events.Event) string {
 			// prompt lands, so the seat is told what it OWES, not asked to
 			// confirm what delivery already proved. The only remaining receipt
 			// a seat can add information to is completion.
+			//
+			// #1981: and the prompt CARRIES the directive rather than naming its
+			// row. Measured on this fleet, a directive body has a 2,782
+			// character median and a 10,187 character maximum, so it is bounded
+			// here rather than assumed short, and an over-long body says how
+			// much was omitted instead of stopping mid-clause.
 			return fmt.Sprintf(
-				"gitmoot directive %s for %s; read it with: gitmoot workflow show-note %s, then record completion with: gitmoot org directive done %s --by %s",
-				directiveID, event.WakeTargetRole, directiveID, directiveID, event.WakeTargetRole,
+				"gitmoot directive %s for %s: %s -- record completion with: gitmoot org directive done %s --by %s",
+				directiveID, event.WakeTargetRole,
+				directiveWakeBody(strings.TrimSpace(event.Detail), directiveID),
+				directiveID, event.WakeTargetRole,
 			)
 		}
 	}
@@ -674,4 +682,34 @@ func truncateForWake(s string, max int) string {
 		cut--
 	}
 	return s[:cut] + "…"
+}
+
+// directiveWakeBodyMaxBytes bounds the directive text carried in a pane prompt.
+// Measured over 2,911 directives on this fleet: median 2,782 bytes, p75 4,794,
+// max 10,187. Four thousand carries about two thirds of them whole and keeps a
+// single interrupt from becoming a ten-kilobyte wall (#1981).
+const directiveWakeBodyMaxBytes = 4000
+
+// directiveWakeBody renders a directive body for delivery. An over-long body is
+// cut at a WORD boundary and says how much was omitted plus how to read the
+// rest, because the failure this replaces was a body that stopped mid-clause
+// and a reader that could not recover the omitted instruction.
+//
+// `show-note --json` is named rather than the plain view even though the plain
+// view no longer truncates: json is the form a seat can pipe.
+func directiveWakeBody(body, directiveID string) string {
+	if len(body) <= directiveWakeBodyMaxBytes {
+		return body
+	}
+	cut := directiveWakeBodyMaxBytes
+	for cut > 0 && !utf8.RuneStart(body[cut]) {
+		cut--
+	}
+	if space := strings.LastIndexAny(body[:cut], " \t\n"); space > directiveWakeBodyMaxBytes/2 {
+		cut = space
+	}
+	return fmt.Sprintf(
+		"%s [%d of %d characters omitted; read the whole directive with: gitmoot workflow show-note %s --json]",
+		strings.TrimRight(body[:cut], " \t\n"), len(body)-cut, len(body), directiveID,
+	)
 }

@@ -83,6 +83,13 @@ SELECT id, source_kind, source_id, target_role, coalesce_key, state,
 					)
 			) THEN 'completion'
 			ELSE 'acknowledgment'
+		END,
+		CASE
+			WHEN source_kind != 'workflow_note' OR coalesce_key NOT LIKE 'directive:%' THEN ''
+			ELSE COALESCE((
+				SELECT d.body FROM workflow_notes d
+				WHERE d.id = CAST(wake_outbox.source_id AS INTEGER)
+			), '')
 		END
 FROM wake_outbox
 WHERE state = ? OR (state = ? AND attempted_at IS NOT NULL AND attempted_at <= ?)

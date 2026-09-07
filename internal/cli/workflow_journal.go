@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
-	"unicode/utf8"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -392,9 +391,21 @@ const workflowTextLineMaxRunes = 512
 // characters other than tab to spaces, and caps each rendered field to one
 // bounded terminal line.
 func terminalSafeWorkflowText(value string) string {
+	return scrubWorkflowText(value, workflowTextLineMaxRunes)
+}
+
+// scrubWorkflowText is the shared scrubber. maxRunes <= 0 means NO CAP, which
+// the single-note view needs (#1981): scrubbing is a safety property and the
+// cap is a layout one, and conflating them made `show-note` withhold 97% of a
+// directive body it was asked to display.
+func scrubWorkflowText(value string, maxRunes int) string {
 	runes := []rune(value)
-	out := make([]rune, 0, min(len(runes), workflowTextLineMaxRunes))
-	for i := 0; i < len(runes) && len(out) < workflowTextLineMaxRunes; i++ {
+	capacity := len(runes)
+	if maxRunes > 0 && maxRunes < capacity {
+		capacity = maxRunes
+	}
+	out := make([]rune, 0, capacity)
+	for i := 0; i < len(runes) && (maxRunes <= 0 || len(out) < maxRunes); i++ {
 		r := runes[i]
 		if r == 0x1b {
 			if i+1 >= len(runes) {
@@ -431,12 +442,18 @@ func terminalSafeWorkflowText(value string) string {
 	return string(out)
 }
 
-func terminalSafeWorkflowBody(value string) string {
-	rendered := terminalSafeWorkflowText(value)
-	if utf8.RuneCountInString(value) > workflowTextLineMaxRunes {
-		return rendered + " [truncated; use --json for the full body]"
-	}
-	return rendered
+// terminalSafeWorkflowFullBody scrubs a body for terminal display WITHOUT
+// truncating it (#1981). show-note exists to read ONE note, so a cap there
+// defeated the command's only purpose: measured over 2,911 directives on this
+// fleet, only 2.7% fit inside the 512-rune line cap, so the view cut 97% of
+// them, and the transport's own prompt pointed seats at this command to
+// recover a body it then withheld. The cap remains where it belongs, on
+// timeline and list lines, via terminalSafeWorkflowText.
+//
+// Scrubbing is NOT truncation and stays: control bytes and ANSI escapes from a
+// note body must never reach a terminal unfiltered.
+func terminalSafeWorkflowFullBody(value string) string {
+	return scrubWorkflowText(value, 0)
 }
 
 func mergeWorkflowTimeline(jobs []db.Job, notes []db.WorkflowNote) []workflowTimelineEntry {
@@ -527,7 +544,7 @@ func runWorkflowNoteShow(args []string, stdout, stderr io.Writer) int {
 		writeLine(stdout, "repo: %s", terminalSafeWorkflowText(note.Repo))
 	}
 	writeLine(stdout, "created: %s", note.CreatedAt)
-	writeLine(stdout, "body: %s", terminalSafeWorkflowBody(note.Body))
+	writeLine(stdout, "body: %s", terminalSafeWorkflowFullBody(note.Body))
 	return 0
 }
 
