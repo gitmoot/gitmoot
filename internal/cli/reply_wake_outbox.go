@@ -419,7 +419,22 @@ func wakeOutboxEvent(batch []db.WakeOutboxObligation, now time.Time) (events.Eve
 	switch oldest.SourceKind {
 	case db.WakeOutboxSourceWorkflowNote:
 		if wakeKind == db.WakeOutboxKindDirective {
-			detail := fmt.Sprintf("directive id %s for %s", oldest.SourceID, role)
+			// #1981: the DELIVERABLE travels with the wake. Naming the row and
+			// leaving the seat to fetch it costs another turn, and the reader it
+			// was pointed at truncated the body anyway. The prompt renderer
+			// bounds this; nothing is cut here.
+			//
+			// The marker header (`[org:directive to=... from=... wf=...]`) is
+			// machine addressing the prompt already states, so the seat gets the
+			// directive TEXT. An unparseable body falls back to the raw note
+			// rather than to silence.
+			detail := strings.TrimSpace(oldest.DirectiveBody)
+			if _, _, _, text, ok := workflow.ParseOrgDirectiveNote(detail); ok && strings.TrimSpace(text) != "" {
+				detail = strings.TrimSpace(text)
+			}
+			if detail == "" {
+				detail = fmt.Sprintf("directive id %s for %s", oldest.SourceID, role)
+			}
 			event = events.NewEvent(
 				events.EventOrgDirective,
 				"org-directive:"+role,

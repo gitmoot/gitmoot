@@ -105,6 +105,11 @@ type WakeOutboxObligation struct {
 	CoalesceKey    string
 	CreatedAt      string
 	DirectivePhase string
+	// DirectiveBody is the directive's own actionable text, projected from the
+	// same query that derives the phase (#1981). A prompt that names a row
+	// instead of carrying its body forces the seat to fetch, and the fetch is
+	// another turn; carrying it is the whole point of the delivery.
+	DirectiveBody string
 }
 
 // WakeOutboxObligationProjection exposes decisions, not persisted states.
@@ -339,11 +344,12 @@ func listWakeOutboxObligations(
 	for rows.Next() {
 		var entry WakeOutboxEntry
 		var directivePhase string
+		var directiveBody string
 		if err := rows.Scan(
 			&entry.ID, &entry.SourceKind, &entry.SourceID, &entry.TargetRole,
 			&entry.CoalesceKey, &entry.State, &entry.AttemptCount,
 			&entry.LastError, &entry.CreatedAt, &entry.AttemptedAt,
-			&entry.FinishedAt, &entry.UpdatedAt, &directivePhase,
+			&entry.FinishedAt, &entry.UpdatedAt, &directivePhase, &directiveBody,
 		); err != nil {
 			return WakeOutboxObligationProjection{}, err
 		}
@@ -351,6 +357,7 @@ func listWakeOutboxObligations(
 			ID: entry.ID, SourceKind: entry.SourceKind, SourceID: entry.SourceID,
 			TargetRole: entry.TargetRole, CoalesceKey: entry.CoalesceKey,
 			CreatedAt: entry.CreatedAt, DirectivePhase: directivePhase,
+			DirectiveBody: directiveBody,
 		}
 		interpretation, ok := interpretWakeOutboxState(entry.State)
 		if !ok {
@@ -404,6 +411,13 @@ SELECT id, source_kind, source_id, target_role, coalesce_key, state,
 					)
 			) THEN 'completion'
 			ELSE 'acknowledgment'
+		END,
+		CASE
+			WHEN source_kind != 'workflow_note' OR coalesce_key NOT LIKE 'directive:%' THEN ''
+			ELSE COALESCE((
+				SELECT d.body FROM workflow_notes d
+				WHERE d.id = CAST(wake_outbox.source_id AS INTEGER)
+			), '')
 		END
 FROM wake_outbox
 WHERE ` + predicate + `
