@@ -6294,3 +6294,138 @@ func TestPolicyMergeGateRefusesWhenAStaleHeadApprovalWouldRetireASessionObjectio
 		t.Fatalf("task=%+v err=%v, want the task state unclaimed and unchanged", task, taskErr)
 	}
 }
+
+// TestPolicyMergeGateRefusesNonVerdictCandidatesRetiringAnObjection is #1950 F6.
+// The candidate loop checked head, identity, decision spelling and recency but
+// never whether the candidate was a VERDICT AT ALL, so a later blocked review,
+// failed review, or approved fan-out announcement from the same reviewer retired
+// a live changes_requested session objection - and each of those rows is then
+// itself absent from the blocking population, so an independent at-head approval
+// merged.
+//
+// The objection is built through the production session writers, because that is
+// what caught F6; a helper-level assertion cannot observe the merge.
+//
+// The last two arms are PROBES rather than reported findings: a delegation-child
+// candidate and an engine-inserted roundless remnant both satisfy the measured
+// floor (succeeded, non-fan-out, headless), so they are executed here to find out
+// whether the floor is sufficient or whether those kinds need admitting clauses
+// of their own. Whatever they show is reported as measured, not asserted.
+func TestPolicyMergeGateRefusesNonVerdictCandidatesRetiringAnObjection(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		seed func(t *testing.T, store *db.Store)
+	}{
+		{
+			name: "a later BLOCKED review from the same reviewer is not a verdict",
+			seed: func(t *testing.T, store *db.Store) {
+				seedHeadlessCandidate(t, store, "later-blocked", "session-reviewer", JobBlocked, "approved", nil)
+			},
+		},
+		{
+			name: "a later FAILED review from the same reviewer is not a verdict",
+			seed: func(t *testing.T, store *db.Store) {
+				seedHeadlessCandidate(t, store, "later-failed", "session-reviewer", JobFailed, "approved", nil)
+			},
+		},
+		{
+			name: "a later APPROVED FAN-OUT announcement is a dispatch record, not a verdict",
+			seed: func(t *testing.T, store *db.Store) {
+				seedHeadlessCandidate(t, store, "later-fanout", "session-reviewer", JobSucceeded, "approved",
+					[]Delegation{{ID: "lens-a", Agent: "lens-a", Action: "review", Prompt: "look"}})
+			},
+		},
+		{
+			name: "a delegation-child candidate is already refused by round ordering (probe needed NO clause)",
+			seed: func(t *testing.T, store *db.Store) {
+				encoded, err := marshalPayload(JobPayload{
+					Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", ReviewRound: "review-2",
+					Result: &AgentResult{Decision: "approved", Summary: "child approval"},
+				})
+				if err != nil {
+					t.Fatalf("marshalPayload: %v", err)
+				}
+				if err := store.CreateJobWithEvent(context.Background(), db.Job{
+					ID: "later-child", Agent: "session-reviewer", Type: "review",
+					State: string(JobSucceeded), Payload: encoded,
+					ParentJobID: "implement-job", DelegationID: "verify",
+				}, db.JobEvent{Kind: string(JobSucceeded), Message: "child"}); err != nil {
+					t.Fatalf("CreateJobWithEvent: %v", err)
+				}
+				setMergeGateJobTimestamps(t, store, "later-child", "2026-09-01T18:00:00Z")
+			},
+		},
+		{
+			name: "an engine-inserted roundless remnant is not attributable (probe MERGED before the clause)",
+			seed: func(t *testing.T, store *db.Store) {
+				insertCompletedJob(t, store, db.Job{ID: "later-remnant", Agent: "session-reviewer", Type: "review"}, JobPayload{
+					Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+					Result: &AgentResult{Decision: "approved", Summary: "roundless remnant"},
+				})
+				setMergeGateJobTimestamps(t, store, "later-remnant", "2026-09-01T18:00:00Z")
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, gh, gate, request := newMergeGateQuorumScenario(t)
+			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+				id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
+			})
+			openSessionReviewObjection(t, store, "session-objection", "session-reviewer", "", "changes_requested", reviewseverity.P1)
+			setMergeGateJobTimestamps(t, store, "session-objection", "2026-09-01T10:00:00Z")
+			tt.seed(t, store)
+			if err := store.UpsertTask(ctx, db.Task{
+				ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
+				State: string(TaskReadyToMerge),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			request.Reviewer = "audit"
+			request.ExpectedTaskState = string(TaskReadyToMerge)
+
+			decision, err := gate.Evaluate(ctx, request)
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if decision.Merged || len(gh.merges) != 0 {
+				t.Fatalf("decision=%+v merges=%d, want NO merge and ZERO external merge calls: this candidate is not an authoritative verdict and must not retire a live objection (#1950 F6)",
+					decision, len(gh.merges))
+			}
+			if task, taskErr := store.GetTask(ctx, "task-9"); taskErr != nil || task.State != string(TaskReadyToMerge) {
+				t.Fatalf("task=%+v err=%v, want the task state unclaimed", task, taskErr)
+			}
+		})
+	}
+}
+
+// seedHeadlessCandidate inserts a supersession candidate in the ONLY shape that
+// can actually reach the state and fan-out clauses, which took two wrong fixtures
+// to find and both wrong versions PASSED at the previous head:
+//
+//   - HEADLESS. A candidate carrying the evaluated head enters reviewsAtHead,
+//     where a blocked or failed row is refused as a CRASHED REVIEWER - a different
+//     guard entirely.
+//   - ROUNDLESS. The objection is a session row with no round, and reviewRoundKey
+//     deliberately refuses to order an explicit round against an empty one, so a
+//     candidate carrying a round supersedes NOTHING and the arm proves nothing.
+//   - EXTERNALLY DRIVEN, via CreateExternallyDrivenJobWithEvent, because roundless
+//     alone is refused by the attributable-provenance clause. This is what leaves
+//     recency as the only remaining discriminator, so state and fan-out are the
+//     properties actually under test.
+func seedHeadlessCandidate(t *testing.T, store *db.Store, id, agent string, state JobState, decision string, delegations []Delegation) {
+	t.Helper()
+	encoded, err := marshalPayload(JobPayload{
+		Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+		Result: &AgentResult{Decision: decision, Summary: "later candidate", Delegations: delegations},
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.CreateExternallyDrivenJobWithEvent(context.Background(), db.Job{
+		ID: id, Agent: agent, Type: "review", State: string(state), Payload: encoded,
+	}, db.JobEvent{Kind: string(state), Message: "candidate"}); err != nil {
+		t.Fatalf("CreateExternallyDrivenJobWithEvent(%s): %v", id, err)
+	}
+	setMergeGateJobTimestamps(t, store, id, "2026-09-01T18:00:00Z")
+}

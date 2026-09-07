@@ -1125,11 +1125,18 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 				// recency, and applicable head. Five rounds of this fix each decided it
 				// from a subset: the writer, then the attempt, then the message prefix,
 				// then the identity source, and now the head.
-				if candidateHead := strings.TrimSpace(candidate.payload.HeadSHA); candidateHead != "" && candidateHead != headSHA {
+				// ADMISSIBILITY IS DEFAULT-DENY (#1950 F6). Three rounds found this loop
+				// admitting rows it should not - an unscoped head, then unusable states,
+				// then an explicit non-verdict - because each round removed one shape and
+				// left the default OPEN. reviewRowCanRetireAnObjection inverts that: a
+				// row must positively qualify, so an unenumerated kind produces a false
+				// BLOCK rather than a false MERGE. A deadlock is visible; a merge is not.
+				if !reviewRowCanRetireAnObjection(candidate.job, candidate.payload, headSHA) {
 					continue
 				}
-				if candidate.payload.Result != nil &&
-					effectiveReviewerIdentityName(candidate.job, candidate.payload) == reviewer &&
+				// The remaining tests are RELATIONAL - they compare two rows rather than
+				// describe one - so they stay out of the predicate.
+				if effectiveReviewerIdentityName(candidate.job, candidate.payload) == reviewer &&
 					isReviewReplacementDecision(candidate.payload.Result.Decision) &&
 					reviewJobSupersedes(candidate.job, candidate.payload, review.job, review.payload) {
 					superseded = true
@@ -2009,6 +2016,65 @@ func (g PolicyMergeGate) ensureReviewMatchesHead(payload JobPayload, headSHA str
 //   - proof/project.go reports a role-authored review as not comparable, so its
 //     independence attribute stays unknown rather than being computed. That is
 //     conservative - it emits no false independence claim - but incomplete.
+//
+// reviewRowCanRetireAnObjection reports whether a row may supersede a live
+// changes_requested objection. It is DEFAULT-DENY by construction: every clause
+// returns false and the final true is reachable only by a row that positively
+// qualifies as an authoritative verdict about the evaluated head.
+//
+// The shape is the point (#1950 F6). Rounds 5, 7 and 8 are one defect class - the
+// candidate set admitting rows it should not - and each round narrowed a denylist
+// that still admitted by default, so the next probe found the next shape: a stale
+// head, then blocked and failed rows, then an approved fan-out announcement. Under
+// default-deny an unenumerated row kind cannot retire an objection at all, so the
+// failure direction is a visible block rather than a silent merge.
+//
+// EVERY CLAUSE HERE IS MEASURED, and the list is deliberately no longer than that.
+// A speculative clause would be a claim rather than a guard, and it is also the
+// direction that starts refusing valid merges:
+//   - SUCCEEDED: a blocked or failed row is not a verdict, and it is itself absent
+//     from the blocking population, so admitting it retires an objection and
+//     leaves nothing behind to block.
+//   - a non-nil, NON-FAN-OUT result: #1685 excludes an announcement as a verdict
+//     for exactly the same reason.
+//   - HEAD APPLICABILITY, empty-or-equal: a row naming a different head describes
+//     different code (#1950 F5). Empty is admitted deliberately, because a headless
+//     replacement is the same class as a headless objection and must be able to
+//     answer it.
+func reviewRowCanRetireAnObjection(job db.Job, payload JobPayload, headSHA string) bool {
+	if JobState(job.State) != JobSucceeded {
+		return false
+	}
+	if payload.Result == nil || reviewRowIsFanOut(payload.Result) {
+		return false
+	}
+	if head := strings.TrimSpace(payload.HeadSHA); head != "" && head != headSHA {
+		return false
+	}
+	// ATTRIBUTABLE PROVENANCE, and this clause is here because a PROBE MERGED, not
+	// because it completed a symmetry argument. An engine-inserted row with neither
+	// head nor round satisfied every clause above - succeeded, non-fan-out, headless
+	// - retired a live session objection, and was then itself excluded from the
+	// blocking population as the unattributable remnant it is, so the merge
+	// completed. Same shape as F6, one row kind further out.
+	//
+	// ExternallyDriven is set only by CreateExternallyDrivenJobWithEvent and every
+	// other insert leaves it at 0 (internal/db/store_jobs.go:184), so a session
+	// review is positively identified rather than inferred; a round is the other
+	// provenance an engine-dispatched review carries. This mirrors the objection
+	// side exactly, which is the property that keeps the two from diverging.
+	//
+	// A sibling probe is NOT reflected here on purpose: a delegation-child candidate
+	// also satisfies the floor, yet it already fails to supersede because an
+	// explicit round cannot be ordered against a roundless objection, so the
+	// existing reviewRoundKey machinery refuses it. Adding a clause for it would
+	// have been an unpinned claim, so it is reported and omitted.
+	if !job.ExternallyDriven && strings.TrimSpace(payload.ReviewRound) == "" {
+		return false
+	}
+	return true
+}
+
 func effectiveReviewerIdentityName(job db.Job, payload JobPayload) string {
 	name, _ := effectiveReviewerIdentity(job, payload)
 	return name
