@@ -36,6 +36,13 @@ type RoutingTelemetry struct {
 	// Approved mirrors the engine's approving-outcome test (approved|implemented|
 	// succeeded) so the summary can report an approval rate without re-deriving it.
 	Approved bool
+	// FanOut marks a row whose Decision is a coordinator's DISPATCH RECORD rather
+	// than a judgement about code (#1972). The engine already draws this line:
+	// ResultIsFanOut keeps a fan-out's decision out of the merge gate's verdict
+	// population. A verdict-rate query that does not exclude these is comparing
+	// announcements with judgements, which is how #1972's 81%-to-17% finding was
+	// produced from 70 announcements.
+	FanOut bool
 	// TestsRun is len(result.tests_run) — a coarse "did the agent exercise tests"
 	// signal. It is NOT a pass/fail count (the agent reports the tests it ran, not
 	// their verdicts); the job state/decision carry the real outcome.
@@ -62,15 +69,19 @@ func (s *Store) InsertRoutingTelemetry(ctx context.Context, t RoutingTelemetry) 
 	if t.Approved {
 		approved = 1
 	}
+	fanOut := 0
+	if t.FanOut {
+		fanOut = 1
+	}
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO routing_telemetry(
 	job_id, repo, action, phase, runtime, model, agent,
 	template_id, template_commit, job_state, decision, approved,
-	tests_run, duration_ms, input_tokens, output_tokens
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	tests_run, duration_ms, input_tokens, output_tokens, fan_out
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.JobID, t.Repo, t.Action, t.Phase, t.Runtime, t.Model, t.Agent,
 		t.TemplateID, t.TemplateCommit, t.JobState, t.Decision, approved,
-		t.TestsRun, t.DurationMS, t.InputTokens, t.OutputTokens)
+		t.TestsRun, t.DurationMS, t.InputTokens, t.OutputTokens, fanOut)
 	return err
 }
 
@@ -82,7 +93,7 @@ func (s *Store) ListRoutingTelemetry(ctx context.Context, filter RoutingTelemetr
 	query := `
 SELECT id, job_id, repo, action, phase, runtime, model, agent,
 	template_id, template_commit, job_state, decision, approved,
-	tests_run, duration_ms, input_tokens, output_tokens, created_at
+	tests_run, duration_ms, input_tokens, output_tokens, created_at, fan_out
 FROM routing_telemetry`
 	var conds []string
 	var args []any
@@ -115,13 +126,18 @@ FROM routing_telemetry`
 	var out []RoutingTelemetry
 	for rows.Next() {
 		var t RoutingTelemetry
-		var approved int
+		var approved, fanOut int
 		if err := rows.Scan(&t.ID, &t.JobID, &t.Repo, &t.Action, &t.Phase, &t.Runtime, &t.Model, &t.Agent,
 			&t.TemplateID, &t.TemplateCommit, &t.JobState, &t.Decision, &approved,
-			&t.TestsRun, &t.DurationMS, &t.InputTokens, &t.OutputTokens, &t.CreatedAt); err != nil {
+			&t.TestsRun, &t.DurationMS, &t.InputTokens, &t.OutputTokens, &t.CreatedAt, &fanOut); err != nil {
 			return nil, err
 		}
 		t.Approved = approved != 0
+		// #1972: a fan-out row is an announcement, not a verdict. Reading it back
+		// is what lets a caller exclude it instead of re-deriving the distinction
+		// from the payload, which is the step every wrong verdict-rate query
+		// skipped.
+		t.FanOut = fanOut != 0
 		out = append(out, t)
 	}
 	return out, rows.Err()

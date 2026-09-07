@@ -2749,4 +2749,31 @@ CREATE INDEX IF NOT EXISTS idx_jobs_dispatched_by ON jobs(dispatched_by) WHERE d
 ALTER TABLE job_events ADD COLUMN runtime TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_job_events_runtime ON job_events(job_id, id) WHERE runtime != '';
 	`,
+	// #1972 fan-out marker on routing telemetry.
+	//
+	// routing_telemetry counted a fan-out COORDINATOR's decision as a verdict
+	// about code. The engine already refuses to: ResultIsFanOut exists precisely
+	// because "a FAN-OUT is a coordinator's dispatch record, not an answer about
+	// the code" (review_threshold.go), and the merge gate excludes those rows
+	// from the verdict population. The telemetry did not, so the one table the
+	// fleet uses to compare reviewer configurations was mixing announcements
+	// with judgements.
+	//
+	// It produced a concrete wrong conclusion. #1972 was filed on the finding
+	// that the review-panel template moves codex from 81% changes_requested to
+	// 17%. Measured: of 93 review-panel rows, 76 were approvals and 70 of those
+	// declared delegations, i.e. announcements. Excluding them leaves 22 real
+	// verdicts at 72.7%, and the panel's own lens children at 77.8%, neither
+	// distinguishable from the untemplated 81.5%. The whole effect was the
+	// artifact.
+	//
+	// DEFAULT 0 preserves every existing row, and existing rows stay unmarked
+	// rather than being guessed at: whether a historical row was an announcement
+	// is recoverable from its payload but not from this column, and back-filling
+	// a judgement call into an evidence table is worse than an honest default.
+	// Append-only tail; migrations are positional.
+	`
+ALTER TABLE routing_telemetry ADD COLUMN fan_out INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_routing_telemetry_fan_out ON routing_telemetry(action, fan_out);
+	`,
 }
