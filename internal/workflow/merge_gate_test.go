@@ -5948,7 +5948,7 @@ func TestPolicyMergeGateAllowsAnActingRoleSessionObjectionToBeSuperseded(t *test
 			// neither agent nor acting role - can never be superseded by anyone, so it
 			// must still BLOCK rather than be skipped. Under-blocking is how F1
 			// happened; this arm is what stops the identity fix from re-introducing it.
-			name: "no usable identity at all still blocks", noIdentity: true, wantMerge: false,
+			name: "DEFENSIVE INVARIANT (no supported writer produces this): a row with no usable identity still blocks", noIdentity: true, wantMerge: false,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
