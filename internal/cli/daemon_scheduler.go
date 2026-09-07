@@ -1746,11 +1746,27 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 }
 
 func drainFleetReplyWakeOutbox(ctx context.Context, store *db.Store, worker jobWorker, now time.Time) (replyWakeOutboxHealth, error) {
-	health, err := drainReplyWakeOutboxWithHealth(ctx, store, now, worker.replyWakeDelivery)
+	health, err := drainReplyWakeOutboxWithHealth(ctx, store, now, workerWakeCoalesceHold(worker), worker.replyWakeDelivery)
 	if err != nil {
 		return health, fmt.Errorf("reply wake outbox drain failed: %w", err)
 	}
 	return health, nil
+}
+
+// workerWakeCoalesceHold reads [org].wake_coalesce_hold for this daemon's home.
+// An absent or unreadable config keeps the default hold: a config read failure
+// must not change wake cadence, only role bindings, which the sink already
+// fails closed on.
+func workerWakeCoalesceHold(worker jobWorker) time.Duration {
+	configFile := resolveConfigFile(worker.workflowHome())
+	if configFile == "" {
+		return config.DefaultWakeCoalesceHold
+	}
+	orgConfig, err := config.LoadOrg(config.Paths{ConfigFile: configFile})
+	if err != nil {
+		return config.DefaultWakeCoalesceHold
+	}
+	return orgConfig.WakeCoalesceHold()
 }
 
 func jobStateCanRetryAdvancement(state string) bool {

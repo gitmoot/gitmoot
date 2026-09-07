@@ -1918,7 +1918,8 @@ over the pane's last `idle` or `working` activity status.
 rows commit atomically with their source note.
 Blocked and escalation rows are persisted synchronously by the event sink after
 the source transition; an insert failure is logged but cannot roll back the
-emitting job. The daemon holds each pending group for five seconds after its
+emitting job. The daemon holds each pending group for `[org].wake_coalesce_hold`
+(default `5m`) after its
 oldest row, then delivers every due pending row for that event kind and role as
 one wake, bounded at ten rows per wake. Reply prompts carry `N new items,
 oldest id X` and a retrieval command for each collapsed row; blocked and

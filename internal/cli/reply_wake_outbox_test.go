@@ -227,13 +227,15 @@ func TestWakeOutboxTickHealthIncludesBlockedAndEscalation(t *testing.T) {
 		ctx,
 		store,
 		now.Add(-replyWakeAttemptedUnknownAfter),
+		now.Add(replyWakeCoalescingWindow+time.Second),
+		replyWakeCoalescingWindow,
 		func(ctx context.Context) (replyWakeDelivery, error) {
 			rules, err := store.ListEventRules(ctx)
 			return replyWakeDelivery{rules: rules}, err
 		},
 	)
 	if err == nil || health.pending != 2 || health.inert != 0 ||
-		!strings.Contains(err.Error(), "pending=2 inert=0 route_removed=0 aged_attempted=0") {
+		!strings.Contains(err.Error(), "pending=2 held=0 inert=0 route_removed=0 aged_attempted=0") {
 		t.Fatalf("tick health = %s err=%v, want two routable outstanding obligations", health, err)
 	}
 }
@@ -261,12 +263,14 @@ func TestWakeOutboxHealthDistinguishesRemovedRouteFromNeverConfigured(t *testing
 		ctx,
 		store,
 		time.Now().UTC().Add(-replyWakeAttemptedUnknownAfter),
+		time.Now().UTC().Add(replyWakeCoalescingWindow+time.Second),
+		replyWakeCoalescingWindow,
 		func(context.Context) (replyWakeDelivery, error) {
 			return replyWakeDelivery{}, nil
 		},
 	)
 	if err == nil || health.pending != 0 || health.inert != 1 || health.routeRemoved != 1 ||
-		!strings.Contains(err.Error(), "pending=0 inert=1 route_removed=1 aged_attempted=0") {
+		!strings.Contains(err.Error(), "pending=0 held=0 inert=1 route_removed=1 aged_attempted=0") {
 		t.Fatalf("route-history health = %s err=%v", health, err)
 	}
 }
@@ -310,12 +314,14 @@ func TestWakeOutboxHealthBoundsDeletedRuleLookupToPendingRoutes(t *testing.T) {
 		ctx,
 		store,
 		time.Now().UTC().Add(-replyWakeAttemptedUnknownAfter),
+		time.Now().UTC().Add(replyWakeCoalescingWindow+time.Second),
+		replyWakeCoalescingWindow,
 		func(context.Context) (replyWakeDelivery, error) {
 			return replyWakeDelivery{}, nil
 		},
 	)
 	if err == nil || health.routeRemoved != 1 || health.inert != 0 || health.pending != 0 ||
-		!strings.Contains(err.Error(), "pending=0 inert=0 route_removed=1 aged_attempted=0") {
+		!strings.Contains(err.Error(), "pending=0 held=0 inert=0 route_removed=1 aged_attempted=0") {
 		t.Fatalf("bounded route-history health = %s err=%v, want one relevant tombstone from 101 total", health, err)
 	}
 }
@@ -368,12 +374,20 @@ func TestReplyWakeOutboxDrainFailureDoesNotAbortRepoWork(t *testing.T) {
 		ID: "job-after-unhealthy-wake", Agent: "audit", Action: "ask",
 		Repo: "owner/repo", Branch: "main", PullRequest: 1,
 	})
-	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+	note, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
 		WorkflowID: "release/drain-isolation", Author: "worker", Body: "matching route without a delivery sink",
 		AddressedTarget: "owner",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+	// The row must be PAST its coalescing hold: a row still inside the hold is
+	// held rather than outstanding, so the drain would be healthy and this test
+	// would assert on a fault it never provoked (#1978).
+	setWakeOutboxCreatedAt(
+		t, store.DatabasePath(), fmt.Sprint(note.ID),
+		time.Now().UTC().Add(-2*replyWakeCoalescingWindow),
+	)
 	if err := store.AddEventRule(context.Background(), db.EventRule{
 		ID: "reply-owner", OnKind: "reply", WakeRole: "owner", Enabled: true,
 	}); err != nil {
@@ -462,7 +476,7 @@ func TestReplyWakeOutboxInertHealthDoesNotEscalateSingleRepoLoop(t *testing.T) {
 		t.Fatalf("inert reply wake health reached escalation ladder: %q", stdout.String())
 	}
 	if strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") ||
-		!strings.Contains(stdout.String(), "pending=0 inert=1 route_removed=0 aged_attempted=0") {
+		!strings.Contains(stdout.String(), "pending=0 held=0 inert=1 route_removed=0 aged_attempted=0") {
 		t.Fatalf("inert reply wake health log = %q", stdout.String())
 	}
 }
@@ -637,7 +651,7 @@ func TestReplyWakeOutboxCollapsesDuePendingRowsBeyondTheWindow(t *testing.T) {
 	setWakeOutboxCreatedAt(t, store.DatabasePath(), fmt.Sprint(second.ID), base.Add(6*replyWakeCoalescingWindow))
 
 	if _, err := drainReplyWakeOutboxWithHealth(
-		ctx, store, base.Add(7*replyWakeCoalescingWindow), replyWakeTestDeliveryResolver(sink),
+		ctx, store, base.Add(7*replyWakeCoalescingWindow), replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(sink),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -676,6 +690,47 @@ func TestReplyWakeOutboxCollapsesDuePendingRowsBeyondTheWindow(t *testing.T) {
 	}
 }
 
+// TestReplyWakeOutboxHonorsConfiguredHold pins that the hold is a parameter and
+// not the constant: with a two-minute hold, a group whose oldest row is 90s old
+// is not delivered, and the same group is delivered as one wake at 121s. A
+// drain that ignored the configured value would wake the seat at 90s.
+func TestReplyWakeOutboxHonorsConfiguredHold(t *testing.T) {
+	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
+	ctx := context.Background()
+	const hold = 2 * time.Minute
+	base := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	for index := range 2 {
+		note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID: "release/hold", Author: "worker",
+			Body: fmt.Sprint(index), AddressedTarget: "owner",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		setWakeOutboxCreatedAt(
+			t, store.DatabasePath(), fmt.Sprint(note.ID),
+			base.Add(time.Duration(index)*30*time.Second),
+		)
+	}
+	health, err := drainReplyWakeOutboxWithHealth(
+		ctx, store, base.Add(90*time.Second), hold, replyWakeTestDeliveryResolver(sink),
+	)
+	if err != nil || health.held != 2 || health.pending != 0 {
+		t.Fatalf("held drain health = %s err = %v, want two rows held inside the hold and no fault", health, err)
+	}
+	if wake.promptCalls != 0 {
+		t.Fatalf("configured hold ignored: woke at 90s with a %s hold; prompts=%v", hold, wake.prompts)
+	}
+	if _, err := drainReplyWakeOutboxWithHealth(
+		ctx, store, base.Add(hold+time.Second), hold, replyWakeTestDeliveryResolver(sink),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if wake.promptCalls != 1 || !strings.Contains(wake.prompt, "2 new items, oldest id ") {
+		t.Fatalf("post-hold wake = calls=%d prompt=%q", wake.promptCalls, wake.prompt)
+	}
+}
+
 func TestReplyWakeOutboxFleetDrainRunsWithZeroEnabledRepos(t *testing.T) {
 	store, sink, wake, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
 	ctx := context.Background()
@@ -695,9 +750,10 @@ func TestReplyWakeOutboxFleetDrainRunsWithZeroEnabledRepos(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = drainReplyWakeOutboxWithHealth(ctx, store, oldestAt.Add(replyWakeCoalescingWindow-time.Millisecond), replyWakeTestDeliveryResolver(sink))
-	if err == nil || !strings.Contains(err.Error(), "outstanding obligations: pending=4") {
-		t.Fatalf("pre-window drain health = %v, want four pending obligations", err)
+	health, err := drainReplyWakeOutboxWithHealth(ctx, store, oldestAt.Add(replyWakeCoalescingWindow-time.Millisecond), replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(sink))
+	// A row inside its hold is waiting, not outstanding, so the tick is healthy.
+	if err != nil || health.held != 4 || health.pending != 0 {
+		t.Fatalf("pre-hold drain health = %s err = %v, want four held rows", health, err)
 	}
 	if wake.promptCalls != 0 {
 		t.Fatalf("tail woke before window closed: %v", wake.prompts)
@@ -858,7 +914,7 @@ func TestReplyWakeOutboxZeroRulesReportsInertWithoutUnhealthy(t *testing.T) {
 	if tickErr != nil {
 		t.Fatalf("fleet tick aborted on inert pending-obligation health: %v", tickErr)
 	}
-	if !strings.Contains(stdout.String(), "reply wake outbox drain health: pending=0 inert=1 route_removed=0 aged_attempted=0") ||
+	if !strings.Contains(stdout.String(), "reply wake outbox drain health: pending=0 held=0 inert=1 route_removed=0 aged_attempted=0") ||
 		strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") {
 		t.Fatalf("fleet tick log = %q, want visible inert-only health", stdout.String())
 	}
@@ -911,7 +967,7 @@ func TestReplyWakeOutboxUnrelatedEnabledRuleReportsPendingObligationInert(t *tes
 	if tickErr != nil {
 		t.Fatalf("fleet tick aborted on inert pending-obligation health: %v", tickErr)
 	}
-	if !strings.Contains(stdout.String(), "reply wake outbox drain health: pending=0 inert=1 route_removed=0 aged_attempted=0") ||
+	if !strings.Contains(stdout.String(), "reply wake outbox drain health: pending=0 held=0 inert=1 route_removed=0 aged_attempted=0") ||
 		strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") {
 		t.Fatalf("fleet tick log = %q, want visible inert-only health", stdout.String())
 	}
@@ -1021,7 +1077,7 @@ func TestReplyWakeOutboxRuleDeletedMidDrainRefusesLaterBatch(t *testing.T) {
 		t.Fatalf("fleet tick aborted on later batch refusal: %v", tickErr)
 	}
 	if !strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") ||
-		!strings.Contains(stdout.String(), "pending=0 inert=0 route_removed=1 aged_attempted=0") {
+		!strings.Contains(stdout.String(), "pending=0 held=0 inert=0 route_removed=1 aged_attempted=0") {
 		t.Fatalf("fleet tick log = %q, want later batch refusal", stdout.String())
 	}
 	if wake.promptCalls != 1 {
@@ -1049,7 +1105,7 @@ func TestReplyWakeOutboxRuleDeletedMidDrainRefusesLaterBatch(t *testing.T) {
 		t.Fatalf("second fleet tick aborted on durable route removal: %v", tickErr)
 	}
 	if !strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") ||
-		!strings.Contains(stdout.String(), "pending=0 inert=0 route_removed=1 aged_attempted=0") {
+		!strings.Contains(stdout.String(), "pending=0 held=0 inert=0 route_removed=1 aged_attempted=0") {
 		t.Fatalf("second fleet tick log = %q, want durable later-batch refusal", stdout.String())
 	}
 	if wake.promptCalls != 1 {
@@ -1297,7 +1353,7 @@ func drainReplyWakeAfterAllRowsAreDueResult(t *testing.T, store *db.Store, sink 
 			latest = createdAt
 		}
 	}
-	_, drainErr := drainReplyWakeOutboxWithHealth(context.Background(), store, latest.Add(replyWakeCoalescingWindow+time.Second), replyWakeTestDeliveryResolver(sink))
+	_, drainErr := drainReplyWakeOutboxWithHealth(context.Background(), store, latest.Add(replyWakeCoalescingWindow+time.Second), replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(sink))
 	return drainErr
 }
 
@@ -1403,7 +1459,7 @@ func TestReplyWakeOutboxDrainProjectsOnceWhenNothingIsClaimed(t *testing.T) {
 
 	// This row is deliverable, so the drain claims it and must re-read.
 	claiming := &countingWakeOutboxStore{inner: store}
-	if _, err := drainReplyWakeOutboxWithHealth(ctx, claiming, due, replyWakeTestDeliveryResolver(sink)); err != nil {
+	if _, err := drainReplyWakeOutboxWithHealth(ctx, claiming, due, replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(sink)); err != nil {
 		t.Fatalf("claiming drain: %v", err)
 	}
 	if claiming.claims == 0 {
@@ -1415,7 +1471,7 @@ func TestReplyWakeOutboxDrainProjectsOnceWhenNothingIsClaimed(t *testing.T) {
 
 	// Nothing left to claim: one projection for the whole drain.
 	idle := &countingWakeOutboxStore{inner: store}
-	if _, err := drainReplyWakeOutboxWithHealth(ctx, idle, due, replyWakeTestDeliveryResolver(sink)); err != nil {
+	if _, err := drainReplyWakeOutboxWithHealth(ctx, idle, due, replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(sink)); err != nil {
 		t.Fatalf("idle drain: %v", err)
 	}
 	if idle.claims != 0 {
@@ -1449,11 +1505,11 @@ func TestReplyWakeOutboxReusedProjectionGradesIdentically(t *testing.T) {
 	attemptedBefore := due.UTC().Add(-replyWakeAttemptedUnknownAfter)
 
 	counted := &countingWakeOutboxStore{inner: store}
-	reused, reusedErr := drainReplyWakeOutboxWithHealth(ctx, counted, due, replyWakeTestDeliveryResolver(sink))
+	reused, reusedErr := drainReplyWakeOutboxWithHealth(ctx, counted, due, replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(sink))
 	if counted.claims != 0 || counted.projections != 1 {
 		t.Fatalf("claims=%d projections=%d, want the reuse path (0 and 1)", counted.claims, counted.projections)
 	}
-	fresh, freshErr := wakeOutboxObligationHealth(ctx, store, attemptedBefore, replyWakeTestDeliveryResolver(sink))
+	fresh, freshErr := wakeOutboxObligationHealth(ctx, store, attemptedBefore, due, replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(sink))
 	if reused != fresh {
 		t.Fatalf("reused health %s != freshly read health %s", reused, fresh)
 	}

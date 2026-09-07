@@ -223,7 +223,8 @@ and reply obligation upward to an ancestor or downward to a descendant. Upward
 questions remain escalations; downward questions are asks. Same-role questions
 are invalid, and peers are refused by a safe command-level default because no
 configurable peer-question policy exists. The daemon holds each pending group
-for five seconds after its OLDEST row, then delivers every due pending row for
+for `[org].wake_coalesce_hold` (default `5m`) after its OLDEST row, then
+delivers every due pending row for
 that event kind and role as ONE wake, bounded at ten rows per wake, so a
 blocked event and a reply for the same role remain separate but two notes for
 the same role are one interrupt however far apart they arrived. The one row the
@@ -233,8 +234,11 @@ wakes stay readable and countable rather than each reporting a delivery of its
 own.
 Pending, attempted, delivered, superseded, stalled, failed, and
 `delivery_unknown` remain queryable per outbox row, and outstanding obligations
-contribute to daemon tick
-health. A quiet burst tail is flushed by a later daemon tick; it does not require
+contribute to daemon tick health. A deliverable row still inside its hold is
+reported as `held` rather than `pending` and is NOT an outstanding obligation:
+it is waiting by design, so a hold longer than the tick interval does not make
+every tick read as unhealthy.
+A quiet burst tail is flushed by a later daemon tick; it does not require
 another event. If the outbox or its delivery rules cannot be queried, or an
 outbox row cannot be parsed or claimed, the drain is logged as unhealthy and
 retried on a later tick without aborting unrelated repository work.

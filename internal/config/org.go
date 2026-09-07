@@ -10,6 +10,13 @@ import (
 	"unicode"
 )
 
+// DefaultWakeCoalesceHold is 300s by OWNER DECISION on 2026-09-07, relayed by
+// phobos: up to five minutes of added wake latency in exchange for the measured
+// interrupt reduction on this fleet's own arrival history, which is 21.8% at
+// 120s and 32.1% at 300s against 7.1% at the previous 5s (#1978). It stays
+// configurable through [org].wake_coalesce_hold.
+const DefaultWakeCoalesceHold = 5 * time.Minute
+
 // OrgRole is one role in the local organization registry. MergeRule is
 // deliberately advisory in phase 1a; scope is enforced at dispatch.
 type OrgRole struct {
@@ -34,6 +41,7 @@ type OrgConfig struct {
 	directiveAckTTL    time.Duration
 	directiveDoneTTL   time.Duration
 	directiveMaxNudges int
+	wakeCoalesceHold   time.Duration
 	roles              map[string]OrgRole
 }
 
@@ -81,6 +89,18 @@ func (c OrgConfig) DirectiveMaxNudges() int {
 		return 3
 	}
 	return c.directiveMaxNudges
+}
+
+// WakeCoalesceHold is how long the daemon holds a pending wake group after its
+// OLDEST row before delivering every due row for that role and kind as one
+// wake. Raising it trades wake latency for fewer interrupts: measured on this
+// fleet's own arrival history, 5s collapses 7.1% of wakes, 120s collapses
+// 21.8% and 300s collapses 32.1% (#1978).
+func (c OrgConfig) WakeCoalesceHold() time.Duration {
+	if c.wakeCoalesceHold <= 0 {
+		return DefaultWakeCoalesceHold
+	}
+	return c.wakeCoalesceHold
 }
 
 // Ancestors returns name's parent chain, nearest parent first. The cycle guard
@@ -186,6 +206,7 @@ func parseOrgContent(content []byte) (OrgConfig, error) {
 	seenDirectiveAckTTL := false
 	seenDirectiveDoneTTL := false
 	seenDirectiveMaxNudges := false
+	seenWakeCoalesceHold := false
 	current := ""
 	inOrg := false
 	lines := strings.Split(string(content), "\n")
@@ -243,7 +264,8 @@ func parseOrgContent(content []byte) (OrgConfig, error) {
 			// Recycle fields are binary-first: binaries predating this allowlist
 			// fail closed on a config that uses either field.
 			if key != "enforce" && key != "recycle_after" && key != "recycle_enforce" &&
-				key != "directive_ack_ttl" && key != "directive_done_ttl" && key != "directive_max_nudges" {
+				key != "directive_ack_ttl" && key != "directive_done_ttl" &&
+				key != "directive_max_nudges" && key != "wake_coalesce_hold" {
 				return OrgConfig{}, fmt.Errorf("unknown [org] field %q", key)
 			}
 			switch key {
@@ -313,6 +335,19 @@ func parseOrgContent(content []byte) (OrgConfig, error) {
 					return OrgConfig{}, fmt.Errorf("org directive_max_nudges must be positive")
 				}
 				cfg.directiveMaxNudges = v
+			case "wake_coalesce_hold":
+				if seenWakeCoalesceHold {
+					return OrgConfig{}, fmt.Errorf("duplicate [org].wake_coalesce_hold")
+				}
+				seenWakeCoalesceHold = true
+				v, err := parseOrgDuration(value)
+				if err != nil {
+					return OrgConfig{}, fmt.Errorf("parse [org].wake_coalesce_hold: %w", err)
+				}
+				if v <= 0 {
+					return OrgConfig{}, fmt.Errorf("org wake_coalesce_hold must be positive")
+				}
+				cfg.wakeCoalesceHold = v
 			}
 			continue
 		}
@@ -490,6 +525,9 @@ func ValidateOrg(cfg OrgConfig) error {
 	if cfg.Enforce() != "block" && cfg.Enforce() != "warn" {
 		return fmt.Errorf("org enforce must be \"block\" or \"warn\"")
 	}
+	if mode := cfg.RecycleEnforce(); mode != "off" && mode != "warn" && mode != "block" {
+		return fmt.Errorf("org recycle_enforce must be \"off\", \"warn\", or \"block\"")
+	}
 	if cfg.recycleAfter < 0 {
 		return fmt.Errorf("org recycle_after must not be negative")
 	}
@@ -502,8 +540,8 @@ func ValidateOrg(cfg OrgConfig) error {
 	if cfg.directiveMaxNudges < 0 {
 		return fmt.Errorf("org directive_max_nudges must not be negative")
 	}
-	if mode := cfg.RecycleEnforce(); mode != "off" && mode != "warn" && mode != "block" {
-		return fmt.Errorf("org recycle_enforce must be \"off\", \"warn\", or \"block\"")
+	if cfg.wakeCoalesceHold < 0 {
+		return fmt.Errorf("org wake_coalesce_hold must not be negative")
 	}
 	// Validate in sorted, structural passes so malformed registries return the
 	// same error regardless of Go map iteration order. Root naming deliberately
