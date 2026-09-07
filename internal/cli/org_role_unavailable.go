@@ -284,15 +284,48 @@ func refuseUnavailableOrgRole(ctx context.Context, store *db.Store, role, select
 // onto the agent at enqueue for exactly this reason. A dispatch refusal is an
 // execute-path decision.
 func selectedJobDispatchRuntime(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload) string {
-	if payload.Ephemeral != nil {
-		return applyJobRuntimeOverride(runtime.Agent{Runtime: payload.Ephemeral.Runtime}, payload).Runtime
+	agent, ok := selectedJobRuntimeAgent(ctx, store, job, payload)
+	if !ok {
+		return ""
+	}
+	return agent.Runtime
+}
+
+// selectedJobRuntimeAgent resolves the runtime.Agent a QUEUED job will actually
+// run as, and is the ONE place the precedence override > ephemeral spec >
+// registered row is expressed. Every execute-path decision about a queued job —
+// refuse, hold, probe, reserve, serialize — must resolve through here, because
+// the whole #1641/#1952 defect class is a consumer that derived a runtime from
+// the agents table while the job ran on something else.
+//
+// For an ephemeral job the spec is reconstructed with the same fields
+// startEphemeralWorker materializes, so a caller that needs more than the
+// runtime name (an auth probe needs the autonomy policy and template; a resource
+// key needs the runtime) sees the agent the worker will build rather than a
+// runtime string in a hollow struct.
+//
+// ok=false means UNRESOLVABLE, never "some other runtime": callers must fail
+// closed on it, and each one keeps the conservative fallback it already had.
+func selectedJobRuntimeAgent(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload) (runtime.Agent, bool) {
+	if spec := payload.Ephemeral; spec != nil {
+		return applyJobRuntimeOverride(runtime.Agent{
+			Name:           job.Agent,
+			Role:           firstNonEmpty(strings.TrimSpace(spec.Role), strings.TrimSpace(job.Type), "worker"),
+			Runtime:        spec.Runtime,
+			Model:          spec.Model,
+			Effort:         spec.Effort,
+			TemplateID:     spec.Template,
+			Capabilities:   spec.Capabilities,
+			AutonomyPolicy: spec.AutonomyPolicy,
+			RepoScope:      payload.Repo,
+		}, payload), true
 	}
 	if store == nil {
-		return ""
+		return runtime.Agent{}, false
 	}
 	agent, err := store.GetAgent(ctx, job.Agent)
 	if err != nil {
-		return ""
+		return runtime.Agent{}, false
 	}
-	return applyJobRuntimeOverride(runtimeAgent(agent), payload).Runtime
+	return applyJobRuntimeOverride(runtimeAgent(agent), payload), true
 }

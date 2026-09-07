@@ -3039,6 +3039,33 @@ func queuedJobRuntimeResourceKey(ctx context.Context, store *db.Store, job db.Jo
 		}
 		return key
 	}
+	// #1952: an EPHEMERAL job has no agents-table session to schedule under — the
+	// worker materializes the spec and starts a FRESH session, so no row exists
+	// pre-materialization and a stale same-name row yields the wrong key. Either
+	// way this returned "", and admission then read a real session as
+	// not-session-counted (perJobAdmissionEstimate treats "" as no session).
+	//
+	// This key is a SERIALIZATION key — runtimeResourceLocked, inflightRuntimes —
+	// so it must agree with what the worker actually LOCKS, not merely be
+	// non-empty. jobWorker.run rewrites a fresh ref to runtime.FreshRefForJob(job.ID)
+	// before taking the lock, so building the key from that same formula makes the
+	// gate and the acquisition byte-identical, which is the invariant
+	// runtime_override.go documents. It is also job-unique, so two ephemeral jobs
+	// never falsely serialize.
+	if payload, err := daemonJobPayload(job); err == nil && payload.Ephemeral != nil {
+		agent, ok := selectedJobRuntimeAgent(ctx, store, job, payload)
+		if !ok {
+			return ""
+		}
+		agent.RuntimeRef = runtime.FreshRefForJob(job.ID)
+		key, keyed := runtimeSessionResourceKey(agent)
+		if !keyed {
+			// A non-resumable spec runtime (shell) takes no session lock, exactly
+			// as a non-resumable registered agent does not.
+			return ""
+		}
+		return key
+	}
 	agent, err := store.GetAgent(ctx, job.Agent)
 	if err != nil {
 		return ""
