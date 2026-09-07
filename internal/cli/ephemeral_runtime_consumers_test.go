@@ -341,11 +341,30 @@ func TestSelectorSelectsTwoDistinctEphemeralJobsInOnePass(t *testing.T) {
 	}
 }
 
-// TestQueuedDispatchRunsTwoDistinctEphemeralJobsInOnePass is the same property
-// one level up, at the behaviour an operator would notice: two independent
-// ephemeral workers run in one dispatch pass rather than one waiting on the
-// other's session.
-func TestQueuedDispatchRunsTwoDistinctEphemeralJobsInOnePass(t *testing.T) {
+// TestQueuedDispatchEventuallyRunsBothDistinctEphemeralJobs asserts EVENTUAL
+// EXECUTION of both jobs despite distinct keying — deliberately NOT overlap.
+//
+// THE PRODUCTION CONTRACT, read from runQueuedJobsForRepo
+// (daemon_scheduler.go:1859-1909): the dispatcher loops while work remains; each
+// pass selects up to `limit` runnable jobs, admits them, launches each in its own
+// goroutine and joins them with ONE wg.Wait before the next pass. So jobs
+// co-selected in a pass do overlap, but passes are strictly SERIAL, and whether
+// two particular jobs share a pass is decided by the selector. There is no
+// independent guarantee that any two given jobs run in one pass.
+//
+// Hence this test cannot prove overlap: a second job serialized into a later
+// pass still finishes, so the assertion below holds either way. Its earlier name
+// claimed "InOnePass" and was wrong — the review found that under mutant M14 the
+// direct selector guard correctly fails while this test still passes. That guard
+// (TestSelectorSelectsTwoDistinctEphemeralJobsInOnePass, above) is the
+// discriminating regression for keying; this one only rules out the coarser
+// failure where a job never runs at all.
+//
+// No overlap assertion was added instead, because a barrier test would only
+// re-prove co-selection — which the selector guard already pins directly — while
+// adding a deadlock-on-regression failure mode. Naming a parallelism guarantee
+// production does not make would be worse than documenting eventual dispatch.
+func TestQueuedDispatchEventuallyRunsBothDistinctEphemeralJobs(t *testing.T) {
 	ctx := context.Background()
 	store, home := ephemeralConsumerStore(t)
 	seedTwoEphemeralJobs(t, store, runtime.ClaudeRuntime)
@@ -370,7 +389,7 @@ func TestQueuedDispatchRunsTwoDistinctEphemeralJobsInOnePass(t *testing.T) {
 		}
 	}
 	if len(stillQueued) != 0 {
-		t.Fatalf("jobs still queued after a 2-slot pass: %v — one ephemeral job waited on the other's session", stillQueued)
+		t.Fatalf("jobs still queued after the dispatcher drained: %v — a distinctly-keyed ephemeral job never ran at all (this asserts eventual execution, not overlap)", stillQueued)
 	}
 }
 
