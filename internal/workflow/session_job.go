@@ -100,6 +100,20 @@ func (m Mailbox) OpenExternalJob(ctx context.Context, request JobRequest) (db.Jo
 		// was previously dropped here, which is why a recorded session job could
 		// only ever be attributed to an agent.
 		ActingOrgRole: NormalizeActingOrgRole(request.ActingOrgRole),
+		// #1990: THIS IS A FOURTH INSERT PATH AROUND prepareEnqueue, and that is
+		// why two unrelated-looking fields were both missing from it.
+		//
+		// #1967 resolved the dispatcher at Mailbox.Enqueue and argued that a
+		// chokepoint fixes the whole class. A session job never reaches that
+		// chokepoint: OpenExternalJob builds its own payload and inserts through
+		// CreateExternallyDrivenJobWithEvent. So every session row carried an
+		// empty dispatched_by, and #1967's PR body overclaimed. Measured on the
+		// live store: session-review-gm-staged-18d31434c33800ec has
+		// acting_org_role=gm-staged, head_sha NULL and dispatched_by empty, all
+		// on one row.
+		//
+		// Resolved with the SAME function the chokepoint uses, not a second rule.
+		DispatchedBy: dispatcherIdentity(request),
 	})
 	if err != nil {
 		return db.Job{}, err
@@ -119,6 +133,27 @@ func (m Mailbox) OpenExternalJob(ctx context.Context, request JobRequest) (db.Jo
 		Kind:    string(JobRunning),
 		Message: "job started (externally driven session)",
 	}}
+	// THE HEAD IS DELIBERATELY NOT PAYLOAD, and #1990 is what happens when that
+	// is true in the code and invisible at the CLI.
+	//
+	// A supplied head comes from the caller, not from anything the engine
+	// observed, so persisting it would make a CLI assertion into merge evidence:
+	// an operator could claim an approval at any head and the exact-head gate
+	// would count it. This repo already quarantines caller-asserted authority
+	// for the same reason - review_findings.go refuses a caller-supplied
+	// observed_at as an ordering authority. See SessionJobDisplayEventKind.
+	//
+	// THE ASYMMETRY IS REAL AND WORTH KNOWING BEFORE YOU CHANGE THIS.
+	// CloseExternalJobWithUsage takes prOverride, headSHAOverride and
+	// branchOverride from the same caller in the same call, and it PERSISTS the
+	// first and third to the payload while quarantining only the second. That is
+	// defensible - a claimed pull request or branch does not let anybody satisfy
+	// an exact-head review requirement, and a claimed head does - but it was
+	// undocumented, so the three arguments looked alike and were not.
+	//
+	// What #1990 fixed is not the quarantine. It is that `job record` accepted
+	// --head-sha, echoed it back in its own --json, and stored nothing, so the
+	// operator saw their own input reflected and read it as recorded.
 	if displayEvent, ok := sessionJobDisplayEvent(job.ID, request.HeadSHA); ok {
 		events = append(events, displayEvent)
 	}

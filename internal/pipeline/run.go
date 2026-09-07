@@ -137,7 +137,29 @@ type PipelineStagePRBinding struct {
 	LeadAgent   string
 }
 
+// PipelineStageJobRequest stamps the dispatcher on every stage request, then
+// delegates the per-kind construction below.
+//
+// #1990: THIS IS THE #1967 ARGUMENT ONE LEVEL DOWN, and I needed it because I
+// got the shallow version wrong first. #1967 set DispatchedBy in ONE of the five
+// JobRequest literals in pipelineStageJobRequest - the read-only agent branch -
+// and left orchestrate, produce, implement and shell alone. Measured in
+// production after the deploy: five real prun-* stage jobs recorded
+// dispatched_by "pipeline", the Sender channel, rather than the pipeline that
+// ordered them. The enqueue chokepoint saved them from being EMPTY, which is
+// what #1967 was for, but the more specific value was missing from four stage
+// kinds out of five.
+//
+// So it is stamped at this function's single exit instead of in its branches. A
+// sixth stage kind inherits it without its author knowing this rule exists,
+// which is the only version of this that stays true.
 func PipelineStageJobRequest(rec db.Pipeline, stage Stage, run db.PipelineRun, attempt int, upstreamContext string, binding PipelineStagePRBinding, skipNativeReviewFanout bool) workflow.JobRequest {
+	request := pipelineStageJobRequest(rec, stage, run, attempt, upstreamContext, binding, skipNativeReviewFanout)
+	request.DispatchedBy = "pipeline:" + rec.Name
+	return request
+}
+
+func pipelineStageJobRequest(rec db.Pipeline, stage Stage, run db.PipelineRun, attempt int, upstreamContext string, binding PipelineStagePRBinding, skipNativeReviewFanout bool) workflow.JobRequest {
 	// Service input is schema-validated and delivered exclusively through the
 	// dedicated PipelineInputEnv field. Never project a service run's payload into
 	// an agent prompt; Pass 2 will attach the typed env after loading its service

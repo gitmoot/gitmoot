@@ -35,6 +35,13 @@ type jobSessionOutput struct {
 	Summary          string `json:"summary,omitempty"`
 	PullRequest      int    `json:"pull_request,omitempty"`
 	HeadSHA          string `json:"head_sha,omitempty"`
+	// HeadSHAPlane names which plane HeadSHA above came from, because the two are
+	// not interchangeable and printing the value alone is what made #1990
+	// invisible for three days. "display" means the value lives in a
+	// session_job_display event and NOT in the job payload: no merge policy reads
+	// it, and it cannot satisfy an exact-head review requirement. It is emitted
+	// only when a head was supplied, so a record without one is unchanged.
+	HeadSHAPlane string `json:"head_sha_plane,omitempty"`
 }
 
 func runJobOpen(args []string, stdout, stderr io.Writer) int {
@@ -48,7 +55,7 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 	task := fs.String("task", "", "optional task id to associate")
 	parentJobID := fs.String("parent-job-id", "", "optional existing parent job id")
 	pr := fs.Int("pr", 0, "optional pull request number")
-	headSHA := fs.String("head-sha", "", "optional pull request head SHA")
+	headSHA := fs.String("head-sha", "", "optional caller-asserted head SHA, recorded as display metadata only: it is NOT stored in the job payload and no merge policy reads it (#1990)")
 	workflowID := fs.String("workflow", "", "external-coordinator workflow label")
 	jsonOutput := fs.Bool("json", false, "print the created job as JSON")
 	if err := fs.Parse(args); err != nil {
@@ -131,7 +138,7 @@ func runJobClose(args []string, stdout, stderr io.Writer) int {
 	severity := fs.String("severity", "", "review severity: "+strings.Join(workflow.ReviewSeverities, "|"))
 	summary := fs.String("summary", "", "optional result summary")
 	pr := fs.Int("pr", 0, "optional pull request number to record")
-	headSHA := fs.String("head-sha", "", "optional pull request head SHA to record")
+	headSHA := fs.String("head-sha", "", "optional caller-asserted head SHA, recorded as display metadata only: it is NOT stored in the job payload and no merge policy reads it (#1990)")
 	branch := fs.String("branch", "", "optional branch to record")
 	model := fs.String("model", "", "optional model used for the session work")
 	inputTokens := fs.Int("input-tokens", 0, "input tokens used by the session work")
@@ -188,6 +195,9 @@ func runJobClose(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return err
 		}
+		// #1990: same rule as `job record` above - report the STORED row, never
+		// the flags. `job close` had the identical echo, and leaving one verb
+		// honest and its sibling lying is how the defect comes back.
 		payload, _ := workflow.ParseJobPayload(job.Payload)
 		out = jobSessionOutput{
 			JobID:            job.ID,
@@ -196,11 +206,16 @@ func runJobClose(args []string, stdout, stderr io.Writer) int {
 			Type:             job.Type,
 			Repo:             payload.Repo,
 			ExternallyDriven: job.ExternallyDriven,
-			Decision:         *decision,
-			Severity:         strings.TrimSpace(*severity),
-			Summary:          strings.TrimSpace(*summary),
 			PullRequest:      payload.PullRequest,
-			HeadSHA:          loadSessionJobDisplayHeadSHA(context.Background(), store, job.ID),
+		}
+		if payload.Result != nil {
+			out.Decision = payload.Result.Decision
+			out.Severity = payload.Result.Severity
+			out.Summary = payload.Result.Summary
+		}
+		if head := loadSessionJobDisplayHeadSHA(context.Background(), store, job.ID); strings.TrimSpace(head) != "" {
+			out.HeadSHA = head
+			out.HeadSHAPlane = "display"
 		}
 		return nil
 	}); err != nil {
@@ -226,7 +241,7 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 	task := fs.String("task", "", "optional task id to associate")
 	parentJobID := fs.String("parent-job-id", "", "optional existing parent job id")
 	pr := fs.Int("pr", 0, "optional pull request number")
-	headSHA := fs.String("head-sha", "", "optional pull request head SHA")
+	headSHA := fs.String("head-sha", "", "optional caller-asserted head SHA, recorded as display metadata only: it is NOT stored in the job payload and no merge policy reads it (#1990)")
 	branch := fs.String("branch", "", "optional branch to record")
 	model := fs.String("model", "", "optional model used for the session work")
 	inputTokens := fs.Int("input-tokens", 0, "input tokens used by the session work")
@@ -310,7 +325,31 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return err
 		}
+		// #1990: REPORT WHAT WAS STORED, NEVER WHAT WAS GIVEN.
+		//
+		// This is the reason the defect survived: --head-sha was accepted, echoed
+		// here, and stored nowhere in the payload, so the operator read their own
+		// input back as confirmation. gm-staged found it on their own verdict row
+		// and named the right test for it - assert the output equals the stored
+		// record, not that a field is non-empty, because the second passes with
+		// the echo still in place.
+		//
+		// The echo was wider than the head. Decision, Severity and Summary were
+		// all printed from the FLAG values too, so any normalisation or refusal
+		// applied between here and the store would have been invisible in exactly
+		// the same way. Every field below now comes from the stored row.
 		payload, _ := workflow.ParseJobPayload(job.Payload)
+		storedDecision, storedSeverity, storedSummary := "", "", ""
+		if payload.Result != nil {
+			storedDecision = payload.Result.Decision
+			storedSeverity = payload.Result.Severity
+			storedSummary = payload.Result.Summary
+		}
+		displayHead := loadSessionJobDisplayHeadSHA(context.Background(), store, job.ID)
+		headPlane := ""
+		if strings.TrimSpace(displayHead) != "" {
+			headPlane = "display"
+		}
 		out = jobSessionOutput{
 			JobID:            job.ID,
 			State:            job.State,
@@ -318,11 +357,12 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 			Type:             job.Type,
 			Repo:             fullName,
 			ExternallyDriven: job.ExternallyDriven,
-			Decision:         *decision,
-			Severity:         strings.TrimSpace(*severity),
-			Summary:          strings.TrimSpace(*summary),
+			Decision:         storedDecision,
+			Severity:         storedSeverity,
+			Summary:          storedSummary,
 			PullRequest:      payload.PullRequest,
-			HeadSHA:          loadSessionJobDisplayHeadSHA(context.Background(), store, job.ID),
+			HeadSHA:          displayHead,
+			HeadSHAPlane:     headPlane,
 		}
 		return nil
 	}); err != nil {
