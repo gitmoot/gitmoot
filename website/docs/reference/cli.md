@@ -828,6 +828,25 @@ and dispatch refuses before Task mutation when the Gitmoot filesystem has less
 than 5 GiB free or free-space measurement is unavailable. The prior verdict is
 escalation evidence only and is never served as the new result.
 
+A review dispatch is also bound to its own head by its PROMPT. Before the
+read-only worktree is allocated and before any job row exists, Gitmoot resolves
+every commit-shaped token in a review's instructions and classifies it against
+the dispatch head: the head itself, an ancestor of it (which covers prior heads
+on the branch and the branch base), a head this pull request recorded at some
+earlier dispatch, or none of those. Only the last refuses, with a non-zero exit
+naming both SHAs and, when the store knows it, the pull request whose head the
+cited commit actually is. `--allow-prompt-head-mismatch` dispatches such a
+request deliberately.
+
+Three arms allow on purpose, because a prompt naming another commit is usually
+how it states provenance. The recorded-head arm reads an append-only store fact
+rather than git, so a legitimate prior head still passes after a force push has
+left it unreachable. A citation whose relationship cannot be established at all,
+because the dispatching checkout resolves neither commit, also dispatches: that
+is a fact about the checkout rather than about the citation. The pre-existing
+`prompt_head_warning` job event is unchanged and still records every non-head
+citation, including the ones that are allowed.
+
 This exact `(repo, PR, head_sha, decision)` evidence key is intentional: the
 #1419 review panel rejected round counters and other instruments, so this guard
 does not infer a loop from a numeric threshold. Direct PR-comment review ingress

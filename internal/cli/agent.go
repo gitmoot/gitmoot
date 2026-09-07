@@ -92,7 +92,7 @@ func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime codex|claude|kimi|omp --repo owner/repo [--path .] [--template <template-id>] [--model model] [--effort effort] [--start-daemon]")
 	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--lead implementer] [--head-sha sha] [--base ref] [--branch branch] [--background] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
-	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--lead implementer] [--head-sha sha] [--branch branch] [--background] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--lead implementer] [--head-sha sha] [--branch branch] [--background] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--allow-prompt-head-mismatch] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--base ref] [--head-sha sha] [--branch branch] [--background] [--type type] [--action implement] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
 	printAgentRuntimeOverrideHelp(w)
 	fmt.Fprintln(w, "  gitmoot agent type list|show|set ...")
@@ -368,31 +368,32 @@ func printAgentRuntimeOverrideHelp(w io.Writer) {
 }
 
 type agentRunOptions struct {
-	home                   string
-	repo                   string
-	jsonOutput             bool
-	background             bool
-	typeName               string
-	action                 string
-	model                  string
-	effort                 string
-	workflowID             string
-	workflowSet            bool
-	orgRole                string
-	runtime                string
-	session                string
-	taskID                 string
-	prNumber               int
-	pullRequestReady       bool
-	pullRequestMode        string
-	headSHA                string
-	base                   string
-	branch                 string
-	lead                   string
-	agent                  string
-	message                string
-	skipNativeReviewFanout bool
-	recipe                 string
+	home                    string
+	repo                    string
+	jsonOutput              bool
+	background              bool
+	typeName                string
+	action                  string
+	model                   string
+	effort                  string
+	workflowID              string
+	workflowSet             bool
+	orgRole                 string
+	runtime                 string
+	session                 string
+	taskID                  string
+	prNumber                int
+	pullRequestReady        bool
+	pullRequestMode         string
+	headSHA                 string
+	base                    string
+	branch                  string
+	lead                    string
+	agent                   string
+	message                 string
+	skipNativeReviewFanout  bool
+	allowPromptHeadMismatch bool
+	recipe                  string
 }
 
 func runAgentRun(args []string, stdout, stderr io.Writer) int {
@@ -601,32 +602,33 @@ func dispatchAgentCommand(options agentRunOptions, action string, reason string,
 
 func localAgentDispatchRequestFromOptions(options agentRunOptions, action, reason, executionPath string) localAgentDispatchRequest {
 	return localAgentDispatchRequest{
-		RepoFlag:               options.repo,
-		Agent:                  options.agent,
-		Action:                 action,
-		Instructions:           options.message,
-		Background:             options.background,
-		Type:                   options.typeName,
-		Model:                  options.model,
-		Effort:                 options.effort,
-		WorkflowID:             options.workflowID,
-		ActingOrgRole:          options.orgRole,
-		OperatorOrigin:         true,
-		Runtime:                options.runtime,
-		RuntimeSession:         options.session,
-		Home:                   options.home,
-		TaskID:                 options.taskID,
-		PullRequest:            options.prNumber,
-		PullRequestReady:       options.pullRequestReady,
-		HeadSHA:                options.headSHA,
-		ImplementBase:          options.base,
-		Branch:                 options.branch,
-		LeadAgent:              options.lead,
-		SkipNativeReviewFanout: options.skipNativeReviewFanout,
-		Recipe:                 options.recipe,
-		SelectedAction:         action,
-		SelectedActionReason:   reason,
-		ExecutionPath:          executionPath,
+		RepoFlag:                options.repo,
+		Agent:                   options.agent,
+		Action:                  action,
+		Instructions:            options.message,
+		Background:              options.background,
+		Type:                    options.typeName,
+		Model:                   options.model,
+		Effort:                  options.effort,
+		WorkflowID:              options.workflowID,
+		ActingOrgRole:           options.orgRole,
+		OperatorOrigin:          true,
+		Runtime:                 options.runtime,
+		RuntimeSession:          options.session,
+		Home:                    options.home,
+		TaskID:                  options.taskID,
+		PullRequest:             options.prNumber,
+		PullRequestReady:        options.pullRequestReady,
+		HeadSHA:                 options.headSHA,
+		ImplementBase:           options.base,
+		Branch:                  options.branch,
+		LeadAgent:               options.lead,
+		SkipNativeReviewFanout:  options.skipNativeReviewFanout,
+		AllowPromptHeadMismatch: options.allowPromptHeadMismatch,
+		Recipe:                  options.recipe,
+		SelectedAction:          action,
+		SelectedActionReason:    reason,
+		ExecutionPath:           executionPath,
 	}
 }
 
@@ -670,6 +672,8 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			options.jsonOutput = true
 		case arg == "--skip-native-review-fanout":
 			options.skipNativeReviewFanout = true
+		case arg == "--allow-prompt-head-mismatch":
+			options.allowPromptHeadMismatch = true
 		case arg == "--draft" || arg == "--ready":
 			mode := strings.TrimPrefix(arg, "--")
 			if options.pullRequestMode != "" && options.pullRequestMode != mode {

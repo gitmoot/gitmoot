@@ -102,6 +102,16 @@ type localAgentDispatchRequest struct {
 	// production path that forgets it degrades to the pre-#1817 late failure,
 	// which is the safe way to be wrong.
 	ExecsDeclaredBinary bool
+	// AllowPromptHeadMismatch is #1819's explicit escape. A review dispatch whose
+	// prompt cites a commit outside this pull request's history is refused before
+	// any job row exists; this flag dispatches it deliberately.
+	//
+	// The escape has to exist, and naming it in the refusal is part of the fix.
+	// The alternative move available to a blocked operator is to stop passing
+	// --head-sha, which removes exactly the binding this guard protects. A
+	// deliberate override is a recorded decision; an unpinned dispatch is a
+	// silent one.
+	AllowPromptHeadMismatch bool
 	// Runtime, when non-empty, is the per-job runtime override (#531): this one
 	// job runs through the named runtime while the agent's registered default
 	// runtime (and its session) stays untouched. RuntimeSession optionally names
@@ -404,6 +414,22 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		// committed-tip worktree clears that head. Only review scans its newly
 		// allocated exact-head checkout below.
 		promptHeadWarnings = dispatchPromptHeadContradictionWarnings(ctx, jobGitClient(checkoutPath, localDispatchJobRunner(request)), request.Instructions, request.HeadSHA)
+	}
+	// #1819: REFUSE A REVIEW WHOSE PROMPT NAMES A DIFFERENT REVIEW TARGET, and
+	// refuse it HERE - before the read-only worktree is allocated and before the
+	// job row exists, which is what the issue's acceptance requires.
+	//
+	// It runs on the CANONICAL checkout rather than the exact-head worktree
+	// allocated below. That checkout can resolve the head by construction (the
+	// worktree is created at that commit from it), and scanning before allocation
+	// is what keeps the refusal from having to unwind a worktree it created. The
+	// warning scan below is left exactly as it was, on the allocated worktree.
+	if request.Action == "review" && !request.AllowPromptHeadMismatch {
+		citations := classifyPromptCommitCitations(ctx, jobGitClient(record.CheckoutPath, localDispatchJobRunner(request)),
+			store, request.Instructions, request.HeadSHA, repo.FullName(), request.PullRequest)
+		if err := reviewPromptTargetMismatchError(citations, request.HeadSHA); err != nil {
+			return localAgentJobOutput{}, err
+		}
 	}
 	// A --recipe routes this coordinator to a named built-in recipe template's
 	// prompt (resolved from the installed-template store) without rebinding the
