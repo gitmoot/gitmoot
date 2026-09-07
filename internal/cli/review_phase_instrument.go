@@ -435,8 +435,19 @@ func scanInterpreterOptions(interpreter string, tokens []shellToken) (interprete
 				case effectErrexit:
 					errexit = enabling
 				case effectRestricted:
-					// `+r` is not valid bash at all, so either sign refuses.
-					restricted = true
+					// `+r` IS VALID BASH while restricted mode is still clear,
+					// and does not enable it: `bash +r -c "go version"` and
+					// `bash +r -n -e +n +e -c "false; go version"` both run Go.
+					// Bash rejects `+r` only AFTER `-r`/`--restricted`, because
+					// a restricted shell cannot be unrestricted - `bash -r +r`
+					// exits 2. I previously generalised that one measurement
+					// into "+r is invalid", which my own tests then pinned
+					// (#1930 round-18 finding 2).
+					if enabling {
+						restricted = true
+					} else if restricted {
+						return interpreterUndeclared, 0
+					}
 				}
 			}
 			if commandString {
@@ -695,7 +706,9 @@ type wrapperGrammar struct {
 }
 
 func isSignalOperand(value string) bool {
-	name := strings.TrimPrefix(strings.ToUpper(strings.TrimSpace(value)), "SIG")
+	// NO WHITESPACE TRIM. Measured: `-s " KILL "` exits 125, so trimming here
+	// manufactured a validity the binary does not have (#1930 round-18).
+	name := strings.TrimPrefix(strings.ToUpper(value), "SIG")
 	switch name {
 	case "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE", "KILL",
 		"USR1", "SEGV", "USR2", "PIPE", "ALRM", "TERM", "STKFLT", "CHLD",
@@ -703,10 +716,11 @@ func isSignalOperand(value string) bool {
 		"VTALRM", "PROF", "WINCH", "IO", "PWR", "SYS":
 		return true
 	}
-	if name == "" || !isAllDigitsOrDot(name) || strings.Contains(name, ".") {
+	if !isAllDigits(name) {
 		return false
 	}
-	// A numeric signal must be a real one: `-s -999` exits 125.
+	// A numeric signal must be a real one: `-s -999` and `-s 65` exit 125,
+	// while `-s 0`, `-s 9` and `-s 64` run.
 	number := 0
 	for _, digit := range name {
 		number = number*10 + int(digit-'0')
@@ -714,7 +728,7 @@ func isSignalOperand(value string) bool {
 			return false
 		}
 	}
-	return number >= 1 && number <= 64
+	return number <= 64
 }
 
 var wrapperGrammars = map[string]wrapperGrammar{
@@ -737,22 +751,29 @@ var wrapperGrammars = map[string]wrapperGrammar{
 		"-U": {takesValue: true}, "-E": {}, "--preserve-env": {}, "-n": {},
 		"--non-interactive": {}, "-H": {}, "-i": {}, "-s": {},
 	}},
+	// MEASURED DOMAINS. Each previously had a broad numeric predicate or none,
+	// so `nice -n .`, `nice -n 1.5`, `ionice -c 999`, `xargs -n nope` and
+	// `stdbuf -o nope` were classified `test` although the real binary exits
+	// before running anything (#1930 round-18 finding 1).
 	"nice": {declared: true, options: map[string]wrapperOption{
-		"-n":           {takesValue: true, valueDomain: isAllDigitsOrDot},
-		"--adjustment": {takesValue: true, valueDomain: isAllDigitsOrDot},
+		"-n":           {takesValue: true, valueDomain: isSignedInteger},
+		"--adjustment": {takesValue: true, valueDomain: isSignedInteger},
 	}},
 	"ionice": {declared: true, options: map[string]wrapperOption{
-		"-c": {takesValue: true, valueDomain: isAllDigitsOrDot},
-		"-n": {takesValue: true, valueDomain: isAllDigitsOrDot},
+		"-c": {takesValue: true, valueDomain: boundedInteger(0, 3)},
+		"-n": {takesValue: true, valueDomain: boundedInteger(0, 8)},
 		"-t": {},
 	}},
 	"xargs": {declared: true, options: map[string]wrapperOption{
-		"-n": {takesValue: true}, "-P": {takesValue: true},
+		"-n": {takesValue: true, valueDomain: isPositiveInteger},
+		"-P": {takesValue: true, valueDomain: isPositiveInteger},
 		"-I": {takesValue: true}, "-d": {takesValue: true},
 		"-0": {}, "--null": {}, "-r": {}, "--no-run-if-empty": {},
 	}},
 	"stdbuf": {declared: true, options: map[string]wrapperOption{
-		"-i": {takesValue: true}, "-o": {takesValue: true}, "-e": {takesValue: true},
+		"-i": {takesValue: true, valueDomain: isBufferingMode},
+		"-o": {takesValue: true, valueDomain: isBufferingMode},
+		"-e": {takesValue: true, valueDomain: isBufferingMode},
 	}},
 	"time": {declared: true, options: map[string]wrapperOption{
 		"-f": {takesValue: true}, "--format": {takesValue: true},
@@ -782,6 +803,15 @@ func scanWrapperArguments(wrapper string, tokens []shellToken) (wrapperOutcome, 
 	index := 0
 	for index < len(tokens) {
 		text := tokens[index].text()
+		if text == "--" {
+			// THE TERMINATOR IS VALID IN OPTION POSITION and this arm was
+			// missing, so valid `timeout -- 1s go test` was refused. Measured:
+			// `timeout -- 1s go version` and `timeout -s KILL -- 1s go version`
+			// both run Go, while `timeout -- go version` exits 125 because the
+			// duration is then missing (#1930 round-18 finding 1, converse arm).
+			index++
+			break
+		}
 		if !strings.HasPrefix(text, "-") || text == "-" {
 			break
 		}
@@ -841,14 +871,82 @@ func scanWrapperArguments(wrapper string, tokens []shellToken) (wrapperOutcome, 
 }
 
 func isDurationOperand(token string) bool {
-	if token == "" {
-		return false
+	// MEASURED against GNU coreutils 9.4, and the previous TrimRight predicate
+	// accepted every invalid one of these: `1ms`, `1ss`, `1sm`, `.` and `.s`
+	// all exit 125 without launching anything, while `1s`, `600`, `25m`, `1.5`,
+	// `0.5s`, `1h` and `2d` run. The grammar is digits, an optional fractional
+	// part, and AT MOST ONE suffix - with at least one digit before the point
+	// (#1930 round-18 finding 1).
+	body := token
+	if last := len(body) - 1; last >= 0 {
+		switch body[last] {
+		case 's', 'm', 'h', 'd':
+			body = body[:last]
+		}
 	}
-	body := strings.TrimRight(token, "smhd")
 	if body == "" {
 		return false
 	}
-	return isAllDigitsOrDot(body)
+	whole, fraction, hasFraction := strings.Cut(body, ".")
+	if whole == "" || !isAllDigits(whole) {
+		return false
+	}
+	if hasFraction && (fraction == "" || !isAllDigits(fraction)) {
+		return false
+	}
+	return true
+}
+
+// isSignedInteger accepts `10`, `-5` and `+5` but not `.`, `1.5` or `nope`.
+// Measured: nice -n takes those three and rejects the others (exit 125).
+func isSignedInteger(token string) bool {
+	if token == "" {
+		return false
+	}
+	if token[0] == '-' || token[0] == '+' {
+		token = token[1:]
+	}
+	return isAllDigits(token)
+}
+
+// boundedInteger returns a domain accepting whole numbers in [low, high].
+// Measured: ionice -c takes 0-3 and rejects 4 and 999; ionice -n takes 7 and 8.
+func boundedInteger(low, high int) func(string) bool {
+	return func(token string) bool {
+		if !isAllDigits(token) {
+			return false
+		}
+		value := 0
+		for _, digit := range token {
+			value = value*10 + int(digit-'0')
+			if value > high {
+				return false
+			}
+		}
+		return value >= low
+	}
+}
+
+// isPositiveInteger is xargs's -n and -P domain: `1` and `2` run, `nope` and
+// `1.5` exit 1.
+func isPositiveInteger(token string) bool {
+	return isAllDigits(token) && strings.Trim(token, "0") != ""
+}
+
+// isBufferingMode is stdbuf's -i/-o/-e domain. Measured: `L`, `0`, `4096` and
+// `4K` are accepted; `nope` exits 125.
+func isBufferingMode(token string) bool {
+	if token == "L" || token == "0" {
+		return true
+	}
+	body := token
+	if last := len(body) - 1; last >= 0 {
+		switch body[last] {
+		case 'K', 'M', 'G', 'k', 'm', 'g':
+			body = body[:last]
+		}
+	}
+	return isAllDigits(body)
 }
 
 func isAllDigitsOrDot(token string) bool {

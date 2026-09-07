@@ -2116,7 +2116,15 @@ func TestPhaseInstrumentHonoursConditionalBashEffects(t *testing.T) {
 		{"restricted refuses", `bash -r -c "/root/go/bin/go test ./internal/transcript"`, phaseBucketUnknown},
 		{"restricted refuses even when it would run", `bash -r -c "go test ./..."`, phaseBucketUnknown},
 		{"long restricted refuses", `bash --restricted -c "go test ./..."`, phaseBucketUnknown},
-		{"plus r is not valid bash", `bash +r -c "go test ./..."`, phaseBucketUnknown},
+		// CORRECTED IN ROUND 18: THIS ARM PINNED A FALSE PREMISE OF MINE.
+		// I measured only `bash -r +r` (exit 2) and generalised it to "+r is
+		// not valid bash". It is valid while restricted mode is still clear,
+		// and does not enable it: `bash +r -c "go version"` exits 0 and RUNS
+		// Go. Bash rejects `+r` only AFTER -r/--restricted, which is the row
+		// below. Assertions fixed rather than the code around them, as
+		// directive 126869 required.
+		{"plus r alone is valid and runs", `bash +r -c "go test ./..."`, phaseBucketTest},
+		{"plus r after restricted refuses", `bash -r +r -c "go test ./..."`, phaseBucketUnknown},
 		{"set -o restricted refuses", `bash -o restricted -c "go test ./..."`, phaseBucketUnknown},
 		{"errexit chain refuses", `bash -e -c "false; go test ./internal/transcript"`, phaseBucketUnknown},
 		{"errexit chain refuses under sh", `sh -e -c "false; go test ./..."`, phaseBucketUnknown},
@@ -2142,9 +2150,124 @@ func TestPhaseInstrumentWrapperAndEffectSplitWrites(t *testing.T) {
 		{"timeout invalid signal", `timeout -s -999 1s go test ./internal/transcript`, phaseBucketUnknown},
 		{"timeout control", `timeout 1s go test ./internal/transcript`, phaseBucketTest},
 		{"restricted", `bash -r -c "/root/go/bin/go test ./internal/transcript"`, phaseBucketUnknown},
+		{"plus r alone", `bash +r -c "go test ./internal/transcript"`, phaseBucketTest},
 		{"restricted control", `bash -c "/root/go/bin/go test ./internal/transcript"`, phaseBucketTest},
 		{"errexit chain", `bash -e -c "false; go test ./internal/transcript"`, phaseBucketUnknown},
 		{"errexit control", `bash -e -c "go test ./internal/transcript"`, phaseBucketTest},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughSplitWrites(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentWrapperValueDomainsMatchTheBinaries is #1930 round-18
+// finding 1. The declared grammar had domains that were too broad or missing,
+// so values the real binary rejects were classified `test`. Every row is a
+// measurement, and the SHOULD-SUCCEED CONTROL for each rule was written first,
+// because every round of this campaign has ended with a bound that rejects
+// valid input.
+//
+// GNU coreutils 9.4 durations: 1s 600 25m 1.5 0.5s 1h 2d RUN; 1ms 1ss 1sm . .s
+// exit 125. Signals: KILL kill SIGKILL 9 0 64 RUN; " KILL " nope -999 65 exit
+// 125. nice -n: 10 -5 +5 RUN; . 1.5 nope exit 125. ionice -c: 0..3 RUN, 4 and
+// 999 exit 1. xargs -n/-P: 1 2 RUN; nope 1.5 exit 1. stdbuf -o: L 0 4096 4K
+// RUN; nope exits 125.
+func TestPhaseInstrumentWrapperValueDomainsMatchTheBinaries(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		// CONTROLS FIRST.
+		{"duration seconds", "timeout 1s go test ./...", phaseBucketTest},
+		{"duration bare number", "timeout 600 go test ./...", phaseBucketTest},
+		{"duration fractional", "timeout 1.5 go test ./...", phaseBucketTest},
+		{"duration fractional with suffix", "timeout 0.5s go test ./...", phaseBucketTest},
+		{"duration hours", "timeout 1h go test ./...", phaseBucketTest},
+		{"duration days", "timeout 2d go test ./...", phaseBucketTest},
+		{"signal name", "timeout -s KILL 1s go test ./...", phaseBucketTest},
+		{"signal lowercase", "timeout -s kill 1s go test ./...", phaseBucketTest},
+		{"signal with prefix", "timeout -s SIGKILL 1s go test ./...", phaseBucketTest},
+		{"signal number", "timeout -s 9 1s go test ./...", phaseBucketTest},
+		{"signal upper bound", "timeout -s 64 1s go test ./...", phaseBucketTest},
+		{"nice negative", "nice -n -5 go test ./...", phaseBucketTest},
+		{"nice positive sign", "nice -n +5 go test ./...", phaseBucketTest},
+		{"nice plain", "nice -n 10 go test ./...", phaseBucketTest},
+		{"ionice class low", "ionice -c 0 go test ./...", phaseBucketTest},
+		{"ionice class high", "ionice -c 3 go test ./...", phaseBucketTest},
+		{"ionice level", "ionice -n 7 go test ./...", phaseBucketTest},
+		{"xargs count", "xargs -n 1 go test ./...", phaseBucketTest},
+		{"xargs parallel", "xargs -P 2 go test ./...", phaseBucketTest},
+		{"stdbuf line mode", "stdbuf -o L go test ./...", phaseBucketTest},
+		{"stdbuf unbuffered", "stdbuf -o 0 go test ./...", phaseBucketTest},
+		{"stdbuf size", "stdbuf -o 4096 go test ./...", phaseBucketTest},
+		{"stdbuf suffixed size", "stdbuf -o 4K go test ./...", phaseBucketTest},
+		// THEN THE REJECTIONS, every one a reviewer witness.
+		{"duration millisecond suffix", "timeout 1ms go test ./...", phaseBucketUnknown},
+		{"duration doubled suffix", "timeout 1ss go test ./...", phaseBucketUnknown},
+		{"duration mixed suffix", "timeout 1sm go test ./...", phaseBucketUnknown},
+		{"duration bare dot", "timeout . go test ./...", phaseBucketUnknown},
+		{"duration dot suffix", "timeout .s go test ./...", phaseBucketUnknown},
+		{"signal padded with spaces", `timeout -s " KILL " 1s go test ./...`, phaseBucketUnknown},
+		{"signal name unknown", "timeout -s nope 1s go test ./...", phaseBucketUnknown},
+		{"signal out of range", "timeout -s 65 1s go test ./...", phaseBucketUnknown},
+		{"nice bare dot", "nice -n . go test ./...", phaseBucketUnknown},
+		{"nice decimal", "nice -n 1.5 go test ./...", phaseBucketUnknown},
+		{"nice word", "nice -n nope go test ./...", phaseBucketUnknown},
+		{"ionice class out of range", "ionice -c 999 go test ./...", phaseBucketUnknown},
+		{"ionice class word", "ionice -c nope go test ./...", phaseBucketUnknown},
+		{"xargs count word", "xargs -n nope go test ./...", phaseBucketUnknown},
+		{"xargs count decimal", "xargs -n 1.5 go test ./...", phaseBucketUnknown},
+		{"stdbuf mode word", "stdbuf -o nope go test ./...", phaseBucketUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentAcceptsTheOptionTerminator is the converse arm of finding
+// 1: I refused a form the binary accepts. `--` is valid in OPTION position,
+// before the duration. Measured: `timeout -- 1s go version` and
+// `timeout -s KILL -- 1s go version` both run Go, while `timeout -- go version`
+// exits 125 because the duration is then missing. That is distinct from `--`
+// AFTER the duration, where GNU exits 127 and the clap clone on PATH runs it,
+// so that one stays unknown on the implementations-disagree rule.
+func TestPhaseInstrumentAcceptsTheOptionTerminator(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"terminator before duration runs", "timeout -- 1s go test ./...", phaseBucketTest},
+		{"terminator after options runs", "timeout -s KILL -- 1s go test ./...", phaseBucketTest},
+		{"terminator without a duration refuses", "timeout -- go test ./...", phaseBucketUnknown},
+		{"terminator after duration still refuses", "timeout 1s -- go test ./...", phaseBucketUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentRestrictedIsSignAndOrderSensitive is finding 2. `+r` is
+// valid while restricted is clear and does not enable it; bash rejects it only
+// after -r/--restricted. Ordering decides which applies.
+func TestPhaseInstrumentRestrictedIsSignAndOrderSensitive(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"plus r alone runs", `bash +r -c "go test ./..."`, phaseBucketTest},
+		{"plus r among cleared options runs", `bash +r -n -e +n +e -c "false; go test ./..."`, phaseBucketMixed},
+		{"minus r then plus r refuses", `bash -r +r -c "go test ./..."`, phaseBucketUnknown},
+		{"long restricted then plus r refuses", `bash --restricted +r -c "go test ./..."`, phaseBucketUnknown},
+		{"minus r alone refuses", `bash -r -c "go test ./..."`, phaseBucketUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) { classifyThroughBothProductionPaths(t, tc.command, tc.want) })
+	}
+}
+
+// TestPhaseInstrumentRound18SplitWrites runs the witnesses and their controls
+// through the seven-byte split-write path.
+func TestPhaseInstrumentRound18SplitWrites(t *testing.T) {
+	for _, tc := range []struct{ name, command, want string }{
+		{"duration witness", "timeout 1ms go test ./...", phaseBucketUnknown},
+		{"duration control", "timeout 1.5 go test ./...", phaseBucketTest},
+		{"signal witness", `timeout -s " KILL " 1s go test ./...`, phaseBucketUnknown},
+		{"signal control", "timeout -s KILL 1s go test ./...", phaseBucketTest},
+		{"nice witness", "nice -n 1.5 go test ./...", phaseBucketUnknown},
+		{"nice control", "nice -n -5 go test ./...", phaseBucketTest},
+		{"ionice witness", "ionice -c 999 go test ./...", phaseBucketUnknown},
+		{"ionice control", "ionice -c 2 go test ./...", phaseBucketTest},
+		{"stdbuf witness", "stdbuf -o nope go test ./...", phaseBucketUnknown},
+		{"stdbuf control", "stdbuf -o L go test ./...", phaseBucketTest},
+		{"terminator control", "timeout -- 1s go test ./...", phaseBucketTest},
+		{"plus r control", `bash +r -c "go test ./..."`, phaseBucketTest},
 	} {
 		t.Run(tc.name, func(t *testing.T) { classifyThroughSplitWrites(t, tc.command, tc.want) })
 	}

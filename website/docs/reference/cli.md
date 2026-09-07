@@ -2146,8 +2146,12 @@ the bare `--` terminator is exempt. Anything outside a measured table is
 `unknown`.
 
 WRAPPERS have declared grammars too, one per wrapper: options are matched by
-exact token with their own value domains, and `timeout`'s duration operand is
-checked, so `timeout --definitely-invalid 1s ...`, `timeout -s -999 1s ...` and
+exact token with value domains measured against the installed binaries - a
+timeout duration is digits with an optional fraction and at most one s/m/h/d
+suffix, a signal is an exact name or 1-64 with no whitespace padding, `nice -n`
+is a signed integer, `ionice -c` is 0-3, `xargs -n` is a positive integer and
+`stdbuf -o` is L, 0 or a size - and the `--` terminator is accepted in option
+position before the duration, so `timeout --definitely-invalid 1s ...`, `timeout -s -999 1s ...` and
 `timeout 1x ...` are refused rather than stripped. The token after the duration
 is the COMMAND even when it is dash-prefixed. THE CLAIM IS DELIBERATELY NARROW
 in two further places. Where two installed implementations of a wrapper
@@ -2155,8 +2159,11 @@ disagree - GNU coreutils exits 127 on `timeout <dur> -- cmd` while another
 `timeout` on PATH runs it - the result is `unknown`, because measured-twice-with-
 different-answers admits no confident bucket. And where a shell option's effect
 depends on runtime state rather than on the option, classification fails closed:
-bash restricted mode (`-r`, `--restricted`, `-o restricted`) always reports
-`unknown` because what it blocks depends on the command text, and an errexit
+bash restricted mode reports `unknown` because what it blocks depends on the
+command text - but only where it is actually ENABLED: `-r`, `--restricted` and
+`-o restricted` refuse, and so does `+r` AFTER one of them, since bash exits 2
+on that. A bare `+r` is valid, leaves the shell unrestricted and classifies
+normally, and an errexit
 command string (`-e`, `-o errexit`) reports `unknown` when it has more than one
 segment, since which segment runs depends on an exit status no lexer can know.
 A single-segment errexit command still classifies normally.
