@@ -81,3 +81,40 @@ func TestSkipNativeReviewFanoutIsAnImplementControlNotAReviewOne(t *testing.T) {
 		})
 	}
 }
+
+// The documentation states one propagation path that DOES carry the flag past a
+// review job: every delegation child inherits it, for any parent job type,
+// because the intent is an operator command about the whole tree (#1236). A
+// review parent that delegates an implement leg therefore produces a child that
+// does consume it.
+//
+// TestDelegationChildInheritsSkipNativeReviewFanout already pins this for an
+// `ask` parent. This arm pins it for a REVIEW parent specifically, because that
+// is the sentence the CLI documentation now makes, and a doc claim about review
+// should not rest on a fixture about ask.
+func TestReviewParentStillPropagatesTheFlagToADelegationChild(t *testing.T) {
+	store := openEngineStore(t)
+	engine := testEngine(store)
+
+	parent := db.Job{ID: "review-parent-1654", Agent: "auditor", Type: "review"}
+	payload := JobPayload{
+		Repo:                   "gitmoot/gitmoot",
+		Branch:                 "task-1654-delegating-review",
+		TaskID:                 "task-1654-delegating-review",
+		LeadAgent:              "lead",
+		SkipNativeReviewFanout: true,
+	}
+
+	child := engine.delegationRequest(context.Background(), parent, payload, Delegation{
+		ID:     "fix-leg",
+		Agent:  "lead",
+		Action: "implement",
+		Prompt: "fix what the review found",
+	})
+
+	if !child.SkipNativeReviewFanout {
+		t.Fatalf("a review parent's delegation child dropped SkipNativeReviewFanout. " +
+			"CLI.md and website/docs/reference/cli.md state that delegation children inherit it " +
+			"regardless of parent type; if that propagation was removed deliberately, update both docs")
+	}
+}
