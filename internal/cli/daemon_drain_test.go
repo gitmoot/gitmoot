@@ -139,19 +139,28 @@ func TestDrainAbandonsPastItsBudgetAndSaysSo(t *testing.T) {
 		<-release // deaf to cancellation, on purpose
 	}()
 
+	// The budget is derived FROM drainCancelGrace rather than written as a
+	// literal, so widening the grace cannot silently invalidate this bound the
+	// way a hard-coded margin would. A budget well under the grace is also the
+	// interesting case: it forces the reserve-out-of-budget arithmetic to clamp.
+	budget := drainCancelGrace / 100
 	var out bytes.Buffer
 	start := time.Now()
-	tracker.drain(&out, 50*time.Millisecond)
+	tracker.drain(&out, budget)
 	elapsed := time.Since(start)
 	close(release)
 
 	// The invariant is that drain's TOTAL wall time fits the caller's budget:
 	// the post-cancel grace is reserved out of it, never added on top, so one
-	// number bounds daemon stop. A generous slack keeps this from being a
-	// scheduler-timing test while still failing an additive grace, which would
-	// land at seconds against this 50ms budget.
-	if elapsed > time.Second {
-		t.Fatalf("drain took %s against a 50ms budget; the grace is being ADDED to the budget instead of reserved out of it", elapsed)
+	// number bounds daemon stop.
+	//
+	// The slack direction matters (the stall lesson): a scheduling gap makes
+	// elapsed LARGER, so this assertion degrades toward a FALSE FAILURE rather
+	// than a false pass. The slack is therefore generous enough to absorb a
+	// stall, while still far below the grace itself, which is where an additive
+	// grace would land.
+	if limit := budget + drainCancelGrace/5; elapsed > limit {
+		t.Fatalf("drain took %s against a %s budget (limit %s); the grace is being ADDED to the budget instead of reserved out of it", elapsed, budget, limit)
 	}
 	if !strings.Contains(out.String(), "abandoning 1 in-flight job") {
 		t.Fatalf("drain did not report what it abandoned: %q", out.String())

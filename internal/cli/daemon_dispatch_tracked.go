@@ -78,11 +78,11 @@ import (
 // NOT SUFFICIENT: systemd truncates it to TimeoutStopSec, and under
 // KillMode=control-group the children are signalled at t=0 and this never runs
 // at all. Both are operator changes.
-var daemonShutdownDrainTimeout = 900 * time.Second
+const daemonShutdownDrainTimeout = 900 * time.Second
 
 // drainCancelGrace bounds how long a TRUNCATED drain waits after cancelling,
 // so an abandoned job's death is recorded rather than lost to process exit.
-var drainCancelGrace = 5 * time.Second
+const drainCancelGrace = 5 * time.Second
 
 // heldBackLogInterval throttles the per-job "held back" observability lines
 // (#562 point 5): a job that stays excluded for the same reason re-logs at most
