@@ -57,9 +57,9 @@ func HeadBoundExclusion(externallyDriven bool, headSHA string) (string, bool) {
 //
 // THE MESSAGE MUST STAY STABLE. ClaimJobEvent is at-most-once on the EXACT
 // (job_id, kind, message) triple, so a message carrying anything variable - the
-// evaluated head, a timestamp, a count of siblings - defeats the guarantee and
-// appends one row per call. advanceReviewingPullRequest runs on every daemon
-// poll tick, so that is not a slow leak: it is the mechanism that grew
+// evaluated head, a timestamp, a count of siblings - defeats the guarantee
+// and appends one row per call. reconcileReviewingPullRequest runs on every
+// daemon poll tick, so that is not a slow leak: it is the mechanism that grew
 // job_events to over a million rows. Consumer name and reason only.
 //
 // IT MUST NOT WRITE A HEAD, AND THAT IS THE WHOLE TRAP OF THIS CAMPAIGN. Making
