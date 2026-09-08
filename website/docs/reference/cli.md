@@ -442,6 +442,16 @@ jobs, no environment re-inheritance. Values pinned by explicit launch flags win
 over the re-read config. Prefer SIGHUP over a restart when only tuning
 throughput.
 
+`gitmoot daemon reload` is the supported way to send it: it reads the recorded
+daemon pid and signals **that process only**. Do **not** use
+`systemctl --user kill -s HUP gitmoot-daemon`: `--kill-whom` defaults to `all`
+(systemd's own documentation, and reproduced on a throwaway unit), so the signal
+reaches every dispatched runtime binary as well. Those are external processes
+with SIGHUP at the default disposition, so they die with `exit status 129` while
+the daemon survives, which is the opposite of a warm reload (#1820). The
+shutdown drain cannot save them: it runs on supervisor-context cancellation and
+SIGHUP deliberately never triggers that.
+
 The default-on `[disk_guard]` section pauses normal queued-job dispatch when the
 filesystem holding the Gitmoot home and worktrees has less than either
 `min_free_bytes` (default `2147483648`, 2 GiB) or `min_free_percent` (default
