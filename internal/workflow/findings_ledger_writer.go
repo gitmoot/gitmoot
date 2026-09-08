@@ -490,17 +490,24 @@ func (e Engine) ReviewObligationBrief(ctx context.Context, repo string, pullRequ
 // place the producer is already listening, so it is where the accepted set
 // belongs. A reviewer whose text was dropped can now see why in the same event
 // that reports the drop, instead of the next reader being written for them.
-// MEASURED, ONE KEY AT A TIME, NOT ASSUMED. Each of these ALONE rescues a
-// finding. `rationale` is deliberately NOT here even though it is finding text
-// and the store's own ErrFindingNoConcern names it: obs.Rationale is copied only
-// on the STATIC arm, which requires a `file`, so a rationale by itself reaches
-// the store empty and is refused for having no rationale. Advertising it would
-// send a reviewer to a key that does not work on its own - the precise failure
-// this change exists to stop.
+// MEASURED, ONE KEY AT A TIME, NOT ASSUMED. Four of these rescue a finding on
+// their own. `rationale` is real finding text but CONDITIONAL: obs.Rationale is
+// copied only on the STATIC arm, which needs a locator, so a rationale alone
+// reaches the store empty and is refused for having no rationale. Measured:
+// rationale alone REFUSED, rationale plus file RECORDED.
+//
+// It is advertised WITH that condition rather than hidden. An earlier revision
+// of this change simply dropped it, which made the sentence true and the advice
+// worse - a reviewer whose rationale was the right way to say it would have been
+// steered off a key that works.
 var ledgerContentKeys = []string{"title", "summary", "detail", "body"}
 
+// ledgerConditionalContentKeys carry finding text only alongside a locator.
+var ledgerConditionalContentKeys = []string{"rationale"}
+
 func ledgerContentKeyList() string {
-	return strings.Join(ledgerContentKeys, ", ")
+	return strings.Join(ledgerContentKeys, ", ") +
+		" (or " + strings.Join(ledgerConditionalContentKeys, ", ") + " together with a file)"
 }
 
 func (e Engine) recordLedgerContentRefusal(ctx context.Context, jobID string, index int, severity string, raw json.RawMessage) {

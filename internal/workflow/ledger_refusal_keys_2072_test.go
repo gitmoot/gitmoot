@@ -89,7 +89,7 @@ func TestAdvertisedKeysExistOnTheWire(t *testing.T) {
 			tags[name] = true
 		}
 	}
-	for _, key := range ledgerContentKeys {
+	for _, key := range append(append([]string{}, ledgerContentKeys...), ledgerConditionalContentKeys...) {
 		if !tags[key] {
 			t.Fatalf("refusal advertises %q, which is not a json tag on reviewFindingWire; "+
 				"the message would send reviewers to a key the reader ignores", key)
@@ -115,11 +115,7 @@ func TestFindingWithContentIsNotRefused(t *testing.T) {
 var ledgerNonContentKeys = []string{
 	"id", "severity", "file", "continues_uid", "state", "disposition",
 	"evidence_kind", "evidence_locator", "locator", "location", "withdraw_reason",
-	// rationale IS finding text, but it cannot rescue a finding on its own: it is
-	// copied only on the STATIC arm, which needs a file. Listed here so the
-	// classification test passes for the right reason and the refusal never
-	// advertises it.
-	"rationale",
+
 	"evidence", "lens",
 }
 
@@ -135,7 +131,8 @@ var ledgerNonContentKeys = []string{
 // until somebody decides whether it carries finding text.
 func TestEveryWireStringFieldIsClassified(t *testing.T) {
 	classified := map[string]bool{}
-	for _, key := range append(append([]string{}, ledgerContentKeys...), ledgerNonContentKeys...) {
+	for _, key := range append(append(append([]string{}, ledgerContentKeys...),
+		ledgerConditionalContentKeys...), ledgerNonContentKeys...) {
 		classified[key] = true
 	}
 	wire := reflect.TypeOf(reviewFindingWire{})
@@ -174,4 +171,29 @@ func TestEveryAdvertisedKeyAloneRescuesAFinding(t *testing.T) {
 			}
 		})
 	}
+}
+
+// THE CONDITIONAL KEY, PINNED IN BOTH DIRECTIONS. `rationale` is advertised only
+// alongside a file, because that is exactly what the writer requires: it is
+// copied on the STATIC arm, which needs a locator. Both arms matter - the first
+// is why the qualification exists, the second is why the key is still offered
+// instead of hidden.
+func TestRationaleRescuesOnlyWithALocator(t *testing.T) {
+	alone := refuseContentlessFinding(t, json.RawMessage(`{"severity":"P3","rationale":"the boundary check is inverted"}`))
+	if refusalPresent(alone) != true {
+		t.Fatal("a rationale-only finding was recorded; the qualification in the refusal is now wrong")
+	}
+	withFile := refuseContentlessFinding(t, json.RawMessage(`{"severity":"P3","file":"internal/x.go","rationale":"the boundary check is inverted"}`))
+	if refusalPresent(withFile) {
+		t.Fatal("a rationale WITH a file was refused; the refusal advertises a combination that does not work")
+	}
+}
+
+func refusalPresent(events []db.JobEvent) bool {
+	for _, event := range events {
+		if event.Kind == "findings_ledger_refused" {
+			return true
+		}
+	}
+	return false
 }
