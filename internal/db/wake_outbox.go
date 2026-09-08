@@ -33,6 +33,32 @@ const (
 	// log line nobody reads.
 	WakeOutboxDeliveryFailedEventKind = "wake_delivery_failed"
 
+	// WakeOutboxUnroutableEventKind records a wake addressed to a role that
+	// CANNOT RECEIVE IT, because no enabled event rule exists for that role and
+	// kind. Such a row is not wrong and is not retried: it waits, correctly, for
+	// a rule that may never come. What was missing is that it waited SILENTLY,
+	// so 49 awaited-fact obligations sat pending from 2026-08-02 and ten
+	// escalations addressed to a retired coordinator dead-ended unobserved.
+	//
+	// Owner decision of 2026-09-08, relayed by phobos, chose making the
+	// dead-end LOUD over rerouting it: rerouting would rebuild the coordinator
+	// layer that was just retired. This event is the loudness, and it wakes
+	// nobody.
+	WakeOutboxUnroutableEventKind = "wake_unroutable"
+	// WakeOutboxUnroutableRouteRemoved marks a role whose route once existed and
+	// was deleted after the row was created: a RETIRED seat, which is usually
+	// correct and needs no remedy.
+	WakeOutboxUnroutableRouteRemoved = "route_removed"
+	// WakeOutboxUnroutableNeverConfigured marks a role with no recorded route
+	// history for this kind at all: the 2026-08-02 gap, where the remedy is a
+	// route. The two are separated because the remedy differs.
+	//
+	// LIMIT OF THE DISTINCTION, stated because it is not visible from the
+	// record: it rests on the event_rule_deletions tombstones, and that table
+	// has no rows before 2026-08-30. A role retired before then reads as
+	// never-configured.
+	WakeOutboxUnroutableNeverConfigured = "never_configured"
+
 	WakeOutboxKindReply      = "reply"
 	WakeOutboxKindBlocked    = "blocked"
 	WakeOutboxKindEscalation = "escalation"

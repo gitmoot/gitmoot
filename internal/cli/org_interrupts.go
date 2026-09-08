@@ -47,16 +47,21 @@ type orgInterruptSeat struct {
 }
 
 type orgInterruptReport struct {
-	WindowStart        string             `json:"window_start"`
-	WindowEnd          string             `json:"window_end"`
-	WindowHours        float64            `json:"window_hours"`
-	ShortGapSeconds    float64            `json:"short_gap_threshold_seconds"`
-	Wakes              int                `json:"wakes"`
-	Collapsed          int                `json:"collapsed"`
-	Unproven           int                `json:"unproven"`
-	RoutelessPending   int                `json:"routeless_pending"`
-	Seats              []orgInterruptSeat `json:"seats"`
-	RoutelessByKindLbl map[string]int     `json:"routeless_pending_by_kind,omitempty"`
+	WindowStart      string             `json:"window_start"`
+	WindowEnd        string             `json:"window_end"`
+	WindowHours      float64            `json:"window_hours"`
+	ShortGapSeconds  float64            `json:"short_gap_threshold_seconds"`
+	Wakes            int                `json:"wakes"`
+	Collapsed        int                `json:"collapsed"`
+	Unproven         int                `json:"unproven"`
+	RoutelessPending int                `json:"routeless_pending"`
+	Seats            []orgInterruptSeat `json:"seats"`
+	// RouteHistoryStart is the oldest recorded route deletion. Anything before
+	// it has no route history, so an unroutable row from that era reads as
+	// never-configured even if its seat was retired. Empty means NO route
+	// history is recorded at all.
+	RouteHistoryStart  string         `json:"route_history_start,omitempty"`
+	RoutelessByKindLbl map[string]int `json:"routeless_pending_by_kind,omitempty"`
 }
 
 func runOrgInterrupts(args []string, stdout, stderr io.Writer) int {
@@ -95,7 +100,12 @@ func runOrgInterrupts(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return err
 		}
+		historyStart, err := store.EarliestEventRuleDeletion(ctx)
+		if err != nil {
+			return err
+		}
 		report = buildOrgInterruptReport(activity, nudges, rules, since, now, span)
+		report.RouteHistoryStart = historyStart
 		return nil
 	}); err != nil {
 		fmt.Fprintf(stderr, "org interrupts: %v\n", err)
@@ -333,10 +343,31 @@ func writeOrgInterruptText(stdout io.Writer, report orgInterruptReport) {
 		)
 	}
 	_ = tw.Flush()
+	routeless := false
 	for _, seat := range report.Seats {
 		if seat.Routeless > 0 {
+			routeless = true
 			fmt.Fprintf(stdout, "\n%s has %d pending wake(s) with no enabled route, oldest %s\n",
 				seat.Role, seat.Routeless, seat.OldestRLAt)
+		}
+	}
+	if routeless {
+		// PRINTED WITH THE ROWS, not left in a PR body. Each unroutable row
+		// records a `wake_unroutable` job event whose `condition` says whether
+		// the route was removed (a retired seat) or never configured (a gap).
+		// That categorisation reads the deletion tombstones, and they do not go
+		// back far enough, so history is miscategorised in one direction. A
+		// reader deciding whether these wakes were load-bearing needs to know
+		// that before trusting the split.
+		boundary := report.RouteHistoryStart
+		if boundary == "" {
+			fmt.Fprintf(stdout,
+				"\nNo route deletions are recorded at all, so every unroutable row above reads as %q in its wake_unroutable event whether or not its seat was retired.\n",
+				db.WakeOutboxUnroutableNeverConfigured)
+		} else {
+			fmt.Fprintf(stdout,
+				"\nRoute history begins %s; a role retired before then reads as %q rather than %q in its wake_unroutable event.\n",
+				boundary, db.WakeOutboxUnroutableNeverConfigured, db.WakeOutboxUnroutableRouteRemoved)
 		}
 	}
 }
