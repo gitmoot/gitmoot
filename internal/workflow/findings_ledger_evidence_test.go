@@ -65,7 +65,7 @@ func TestAdvanceJobRefusesToRecordStaticOnlyAsExecuted(t *testing.T) {
 				"grep -rn Foo internal/ -> 3 hits",
 				"go build -> COULD NOT RUN: permission denied",
 			},
-			Findings: []json.RawMessage{json.RawMessage(`{"id":"F1","severity":"P1","file":"internal/run.go","title":"prior defect","continues_uid":"` + uid + `","state":"answered"}`)},
+			Findings: []json.RawMessage{json.RawMessage(`{"id":"F1","severity":"P1","file":"internal/run.go","title":"prior defect","continues_uid":"` + uid + `","state":"answered","rationale":"read internal/run.go at this head and the guard is present"}`)},
 		},
 	})
 	if err := engine.AdvanceJob(ctx, "review-static"); err != nil {
@@ -160,7 +160,7 @@ func TestAdvanceJobStillRecordsExecutedForAnExecutedVerdict(t *testing.T) {
 			Decision: "approved", Summary: "executed re-review",
 			Evidence: EvidenceExecuted,
 			TestsRun: []string{"go test ./internal/ -> ok", "go vet ./internal/... -> clean"},
-			Findings: []json.RawMessage{json.RawMessage(`{"id":"F1","severity":"P1","file":"internal/run.go","title":"prior defect","continues_uid":"` + uid + `","state":"answered"}`)},
+			Findings: []json.RawMessage{json.RawMessage(`{"id":"F1","severity":"P1","file":"internal/run.go","title":"prior defect","continues_uid":"` + uid + `","state":"answered","rationale":"read internal/run.go at this head and the guard is present"}`)},
 		},
 	})
 	if err := engine.AdvanceJob(ctx, "review-exec"); err != nil {

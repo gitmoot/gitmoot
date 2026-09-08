@@ -353,3 +353,121 @@ func TestAdvanceJobPreservesASupersededRoundsFindings(t *testing.T) {
 		t.Fatal("the stale round's observation discharged the obligation at the CURRENT head")
 	}
 }
+
+// TestAdvanceJobKeepsProseFromEveryObservedFindingSchema pins the defect measured
+// on 2026-09-05, THROUGH THE PRODUCTION PATH: AdvanceJob -> the writer -> the
+// store, then reads the persisted rows back.
+//
+// IT DELIBERATELY DOES NOT CALL ledgerObservationFor. An earlier version of this
+// test did, and a review made the point that decided this shape: a routing mutant
+// that leaves every real verdict on another path still passes a test that pins the
+// helper. The only way to defend the persisted row is to enter where production
+// enters and assert what production stored.
+//
+// EVERY FIXTURE IS A REAL VERDICT SHAPE recorded that evening, not an invented
+// one. Three reviewers used three schemas and each silently dropped a different
+// column, because the writer read only title/detail/file:
+//
+//	#1930 round 1  {title, body}                -> detail EMPTY
+//	#1921 round 3  {title, evidence}            -> detail EMPTY
+//	#1930 round 3  {summary, detail, location}   -> title and file EMPTY
+//
+// WHAT THIS IS NOT, stated because the first diagnosis was wrong and was ruled on
+// in directive 122197: it is NOT a gate bypass and not the #1928 severity defect.
+// reviewseverity.Blocks fails closed on an unknown severity and
+// LedgerObligationsAtHead keys on STATE rather than severity, so an empty column
+// never turned a blocking row into a passing one. The damage is auditability: the
+// gate names each obligation by uid, severity and title, so a row with an empty
+// title tells the next reviewer nothing about what it must answer, and the prose
+// survives only inside the job payload where no ledger reader looks.
+func TestAdvanceJobKeepsProseFromEveryObservedFindingSchema(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "g7-review", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	head := strings.Repeat("b", 40)
+
+	insertCompletedJob(t, store, db.Job{ID: "review-schemas", Agent: "g7-review", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-schema", PullRequest: 1931, HeadSHA: head,
+		TaskID: "task-schema", ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "changes_requested", Severity: "P1", Summary: "three reviewer schemas",
+			Evidence: EvidenceExecuted,
+			TestsRun: []string{"go test ./internal/workflow/ -> ok"},
+			Findings: []json.RawMessage{
+				json.RawMessage(`{"id":"C1","severity":"P1","file":"internal/sandbox/exec_linux.go","line":274,"title":"canonical title","detail":"canonical detail"}`),
+				json.RawMessage(`{"id":"B1","severity":"P1","file":"internal/cli/review_phase_instrument.go","line":280,"title":"FIFO pairing loses identity","body":"The profiler discards translator tool IDs and pairs results with commands FIFO."}`),
+				json.RawMessage(`{"id":"E1","severity":"P1","title":"markers still let a profile buy a grant","evidence":"internal/sandbox/exec_linux.go:274 - isPackageInstallRoot only requires a node_modules segment and a regular package.json."}`),
+				json.RawMessage(`{"id":"S1","severity":"P2","location":"internal/db/dashboard_store.go:201","summary":"The trailing phase_profile event replaces blocked-review reasons.","detail":"ListDashboardBlockedJobs falls back to the newest event without filtering its kind."}`),
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "review-schemas"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+
+	observations, err := store.ListReviewFindingObservations(ctx, "gitmoot/gitmoot", 1931)
+	if err != nil {
+		t.Fatalf("ListReviewFindingObservations returned error: %v", err)
+	}
+	if len(observations) != 4 {
+		t.Fatalf("ledger holds %d row(s) for a verdict reporting 4 findings; the production writer is not on the advance path", len(observations))
+	}
+
+	// Keyed by round label, which the writer preserves for humans, so a failure
+	// names WHICH schema lost its prose rather than only that one did.
+	byLabel := map[string]db.ReviewFindingObservation{}
+	for _, obs := range observations {
+		byLabel[obs.RoundLabel] = obs
+	}
+	for _, want := range []struct {
+		label  string
+		title  string
+		detail string
+		file   string
+	}{
+		{
+			label:  "C1",
+			title:  "canonical title",
+			detail: "canonical detail",
+			file:   "internal/sandbox/exec_linux.go",
+		},
+		{
+			label:  "B1",
+			title:  "FIFO pairing loses identity",
+			detail: "The profiler discards translator tool IDs and pairs results with commands FIFO.",
+			file:   "internal/cli/review_phase_instrument.go",
+		},
+		{
+			label:  "E1",
+			title:  "markers still let a profile buy a grant",
+			detail: "internal/sandbox/exec_linux.go:274 - isPackageInstallRoot only requires a node_modules segment and a regular package.json.",
+			file:   "internal/sandbox/exec_linux.go",
+		},
+		{
+			label:  "S1",
+			title:  "The trailing phase_profile event replaces blocked-review reasons.",
+			detail: "ListDashboardBlockedJobs falls back to the newest event without filtering its kind.",
+			file:   "internal/db/dashboard_store.go",
+		},
+	} {
+		obs, ok := byLabel[want.label]
+		if !ok {
+			t.Errorf("no persisted row carries round label %q, so this reviewer's finding was not recorded at all", want.label)
+			continue
+		}
+		if obs.Title != want.title {
+			t.Errorf("[%s] persisted title = %q, want %q.\nThe reviewer's own words never reached the store, so the gate's obligation line names this finding with an empty title.", want.label, obs.Title, want.title)
+		}
+		if obs.Detail != want.detail {
+			t.Errorf("[%s] persisted detail = %q, want %q.\nThe prose exists only in the job payload, which no ledger reader consults, so nobody can disposition this row later.", want.label, obs.Detail, want.detail)
+		}
+		if obs.File != want.file {
+			t.Errorf("[%s] persisted file = %q, want %q.\nWithout a locator the ledger's relevance half cannot re-arm this finding when the cited path changes.", want.label, obs.File, want.file)
+		}
+		if obs.HeadSHA != head {
+			t.Errorf("[%s] persisted head = %q, want the review's exact head %q", want.label, obs.HeadSHA, head)
+		}
+	}
+}
