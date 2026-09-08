@@ -91,7 +91,23 @@ func TestEphemeralAgentDoesNotResolveWithoutItsJob(t *testing.T) {
 func TestUnregisteredPlainNameStillDoesNotResolve(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	insertCompletedJob(t, store, db.Job{ID: "job-plain", Agent: "gm-omp-nag", Type: "implement"}, JobPayload{})
+	// DELIBERATELY NOT insertCompletedJob: that helper registers a fixture agent
+	// (#2004), which would register the very agent this control needs absent and
+	// turn the assertion vacuous. The failure mode is the point of the control, so
+	// it must not be fed by the helper that defeats it.
+	encoded, err := marshalPayload(JobPayload{})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: "job-plain", Agent: "gm-omp-nag", Type: "implement",
+		State: string(JobSucceeded), Payload: encoded,
+	}, db.JobEvent{Kind: string(JobSucceeded), Message: "done"}); err != nil {
+		t.Fatalf("CreateJobWithEvent: %v", err)
+	}
+	if _, err := store.GetAgent(ctx, "gm-omp-nag"); err == nil {
+		t.Fatal("gm-omp-nag is registered; this control cannot detect a resolver that invents a family")
+	}
 
 	family, ok, err := ResolveRuntimeFamily(ctx, store, "job-plain", "gm-omp-nag", "")
 	if err != nil {
@@ -117,5 +133,32 @@ func TestParentWalkTerminatesOnASelfParent(t *testing.T) {
 	}
 	if ok {
 		t.Fatalf("self-parent resolved to %q, want no family and a terminating walk", family)
+	}
+}
+
+// The chained shape, and the reason splitTempAgentName returns the suffix job id
+// rather than only the parent agent: a temp worker forked from an ephemeral
+// delegation child needs TWO hops. Hop one resolves the temp name's parent agent
+// by name, but that agent is itself synthetic and unregistered; hop two can only
+// continue because the temp name's suffix gave the walk a job row to read a
+// parent_job_id from. Drop the suffix and this resolves to nothing while the
+// single-hop tests stay green, which is why the bound needed its own case.
+func TestParentWalkResolvesATempWorkerForkedFromAnEphemeralChild(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedReviewLoopAgent(t, store, "coordinator", "kimi", "k2")
+
+	insertCompletedJob(t, store, db.Job{ID: "job-coord", Agent: "coordinator", Type: "review"}, JobPayload{})
+	ephemeral := ephemeralAgentName("lens-chain", "job-coord")
+	insertCompletedJob(t, store, db.Job{ID: "job-eph", Agent: ephemeral, Type: "review", ParentJobID: "job-coord"}, JobPayload{})
+	tempOfEphemeral := ephemeral + "-temp-" + "job-eph"
+	insertCompletedJob(t, store, db.Job{ID: "job-temp-chain", Agent: tempOfEphemeral, Type: "review"}, JobPayload{})
+
+	family, ok, err := ResolveRuntimeFamily(ctx, store, "job-temp-chain", tempOfEphemeral, "")
+	if err != nil {
+		t.Fatalf("ResolveRuntimeFamily: %v", err)
+	}
+	if !ok || family != "kimi" {
+		t.Fatalf("chained temp-of-ephemeral resolved to (%q, %v), want (\"kimi\", true)", family, ok)
 	}
 }

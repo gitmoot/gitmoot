@@ -115,16 +115,21 @@ const (
 // splitTempAgentName recovers the parent agent from a temp worker's name.
 // It splits at the FIRST infix because the prefix is a registered agent name
 // and the suffix is a job id, which is where a second "-temp-" could appear.
-func splitTempAgentName(name string) (parentAgent string, ok bool) {
+func splitTempAgentName(name string) (parentAgent string, parentJobID string, ok bool) {
 	index := strings.Index(name, tempAgentInfix)
 	if index <= 0 {
-		return "", false
+		return "", "", false
 	}
 	parent := strings.TrimSpace(name[:index])
 	if parent == "" || parent == name {
-		return "", false
+		return "", "", false
 	}
-	return parent, true
+	// The suffix is the parent JOB id, and carrying it matters for the chained
+	// case: a temp worker forked from an ephemeral delegation child resolves its
+	// parent agent by name, but that agent is itself synthetic and its own parent
+	// lives in a job row. Dropping the suffix here would strand that second hop
+	// with no job to read, so the documented two-hop path would not exist.
+	return parent, strings.TrimSpace(name[index+len(tempAgentInfix):]), true
 }
 
 // resolveRuntimeFamilyViaParent walks up from a synthetic agent to one that can
@@ -139,8 +144,22 @@ func resolveRuntimeFamilyViaParent(ctx context.Context, store *db.Store, jobID s
 	currentJobID := strings.TrimSpace(jobID)
 	for range maxSyntheticParentHops {
 		parentAgent, parentJobID := "", ""
-		if parent, ok := splitTempAgentName(name); ok {
+		if parent, parentJob, ok := splitTempAgentName(name); ok {
 			parentAgent = parent
+			// Resolve the parent agent by name, but keep the parent JOB for the next
+			// hop and for its own recorded runtime. A job id that names no row simply
+			// leaves the walk on the name-only path.
+			if parentJob != "" {
+				if _, err := store.GetJob(ctx, parentJob); err == nil {
+					currentJobID = parentJob
+				} else if !errors.Is(err, sql.ErrNoRows) {
+					return "", false, err
+				} else {
+					currentJobID = ""
+				}
+			} else {
+				currentJobID = ""
+			}
 		} else if strings.Contains(name, ephemeralAgentInfix) && currentJobID != "" {
 			job, err := store.GetJob(ctx, currentJobID)
 			if err != nil {
@@ -170,10 +189,6 @@ func resolveRuntimeFamilyViaParent(ctx context.Context, store *db.Store, jobID s
 			}
 			parentAgent = strings.TrimSpace(parent.Agent)
 			currentJobID = parentJobID
-		} else {
-			// A temp name identifies its parent agent but not a parent job whose
-			// own recorded runtime we may read, so the next hop is name-only.
-			currentJobID = ""
 		}
 		if parentAgent == "" {
 			return "", false, nil
