@@ -83,3 +83,49 @@ func TestReadOnlyMatchIsCaseInsensitive(t *testing.T) {
 		}
 	}
 }
+
+// The two tests below close the P1 findings from PR #2043's review. Both are
+// negative arms: they assert the predicate does NOT fire, which is the
+// direction that costs work when it is wrong.
+
+// P1-2. Gitmoot confines a read-only SEAT itself, through Landlock grants built
+// by wrapReadOnlySandboxAdapter, so the boundary is real even when the runtime's
+// own argv carries no policy flag. Refusing those jobs blocked work that was
+// already confined - on kimi and shell among others - which is the
+// guard-blocks-valid-work failure this predicate's negative arm exists to
+// prevent, arriving through the ENFORCER rather than through the policy.
+func TestReadOnlySeatIsNeverRefusedBecauseGitmootConfinesIt(t *testing.T) {
+	for _, runtimeName := range []string{"kimi", "shell", "omp", "claude", "codex"} {
+		agent := runtime.Agent{
+			Name:           "seat-" + runtimeName,
+			Runtime:        runtimeName,
+			AutonomyPolicy: "read-only",
+			ReadOnlySeat:   true,
+		}
+		// The adapter declares it applied NOTHING, which is exactly the input
+		// that used to trigger the refusal.
+		reason, refuse := UnenforceablePolicyRefusal(agent, StaticProvider{Property: runtime.PermissionPolicyNotApplied})
+		if refuse {
+			t.Fatalf("a read-only SEAT on %s was refused although Gitmoot confines it: %s", runtimeName, reason)
+		}
+	}
+}
+
+// And the positive arm must survive that change: a read-only agent that is NOT
+// a seat still has no enforcer at all, so it is still refused. Without this,
+// the fix above could be over-applied into "never refuse anything".
+func TestANonSeatReadOnlyAgentIsStillRefused(t *testing.T) {
+	agent := runtime.Agent{
+		Name:           "unconfined",
+		Runtime:        "omp",
+		AutonomyPolicy: "read-only",
+		ReadOnlySeat:   false,
+	}
+	reason, refuse := UnenforceablePolicyRefusal(agent, StaticProvider{Property: runtime.PermissionPolicyNotApplied})
+	if !refuse {
+		t.Fatal("a read-only agent with no seat confinement and no runtime mapping was allowed to run")
+	}
+	if !strings.Contains(reason, "read-only") || !strings.Contains(reason, "omp") {
+		t.Fatalf("refusal does not name the policy and the runtime: %q", reason)
+	}
+}

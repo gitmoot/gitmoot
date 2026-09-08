@@ -17,6 +17,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/permissionpolicy"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/sandbox"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
@@ -731,6 +732,22 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	adapter, err := foregroundAdapterFactory(request.Home, effectiveAgent, checkoutPath)
 	if err != nil {
 		return localAgentJobOutput{}, err
+	}
+	// #1721, second production call site. Review of PR #2043 found as a P1 that
+	// the refusal existed ONLY on the daemon claim path, so a FOREGROUND dispatch
+	// still executed a read-only policy nothing applies. A predicate installed at
+	// one of two entry points is a predicate the other entry point disproves.
+	//
+	// Placed immediately after the adapter is built, for the same reason the
+	// daemon check sits where it does: the declaration is adapter-owned and an
+	// adapter's answer can depend on its Dir, so it cannot be resolved earlier.
+	// This runs BEFORE any delivery, so no model is invoked and no tokens spend.
+	//
+	// A foreground refusal is an ERROR rather than a blocked row: there is no
+	// daemon to re-dispatch it, and the caller is a human at a terminal who needs
+	// the reason and the remedy, not a job to inspect later.
+	if reason, refuse := permissionpolicy.UnenforceablePolicyRefusal(effectiveAgent, adapter); refuse {
+		return localAgentJobOutput{}, errors.New(reason)
 	}
 	if stateAdapter, ok := adapter.(readOnlyRuntimeAdapter); ok {
 		defer func() {

@@ -47,14 +47,32 @@ import (
 const readOnlyPolicy = "read-only"
 
 // UnenforceablePolicyRefusal reports whether a job must be refused because the
-// agent declared a read-only policy that its runtime declares it did not apply,
-// and returns the reason.
+// agent declared a read-only policy that NOTHING enforces, and returns the
+// reason.
 //
 // It asks the ADAPTER rather than consulting a runtime-name roster, which is the
 // design ResolvePermissionPolicyApplication states: a future adapter that gains
 // a mapping changes its declaration and every consumer follows.
+//
+// TWO ENFORCERS EXIST AND ONLY ONE IS THE RUNTIME. This predicate originally
+// asked whether the RUNTIME applies the policy and refused when it did not,
+// which was wrong and was caught in review of PR #2043 as a P1: Gitmoot confines
+// a read-only seat ITSELF. `wrapReadOnlySandboxAdapter` builds Landlock grants
+// for any agent with ReadOnlySeat set, so the boundary is real even when the
+// runtime's own argv carries no flag - and refusing those jobs blocked work that
+// was already confined, on kimi and shell among others. That is precisely the
+// guard-blocks-valid-work failure this predicate's negative arm was written to
+// avoid, arriving through the enforcer rather than through the policy.
+//
+// A ReadOnlySeat is therefore never refused here. That is not a weaker boundary:
+// Gitmoot's sandbox is deliberately strict with no BestEffort downgrade, so if
+// the required Landlock ABI is unavailable the runtime does not start at all.
+// Enforced or loudly failed, never silently unconfined.
 func UnenforceablePolicyRefusal(agent runtime.Agent, adapter any) (string, bool) {
 	if !strings.EqualFold(strings.TrimSpace(agent.AutonomyPolicy), readOnlyPolicy) {
+		return "", false
+	}
+	if agent.ReadOnlySeat {
 		return "", false
 	}
 	switch Resolve(adapter, agent) {
