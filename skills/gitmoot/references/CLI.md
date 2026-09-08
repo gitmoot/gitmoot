@@ -613,6 +613,16 @@ cannot be established or a floor is breached. The guard applies only to normal
 agent-job dispatch; daemon maintenance/reconciliation remains runnable so an
 internal reclaim pass can free space.
 
+A queued job that the dispatcher examined and could not claim records a
+`dispatch_held_back` job event naming the reason: an admission-budget refusal
+(including the never-fit case, which names the cap), a checkout key held by an
+in-flight job, a runtime session lock with its holder and lease expiry, or - when
+the pass cannot attribute the wait - the bare fact that the job was not selected
+this pass. Before this the reason reached daemon stdout only, so
+`gitmoot job events <job-id>` could not distinguish a job waiting two hours from
+one about to start. The event is throttled to one row per job per distinct reason
+every five minutes, matching the log line it accompanies.
+
 Claude runtime auth is independent of daemon restarts. Use `gitmoot auth set
 claude` to rotate the owner-only `runtime-auth.env`; the next delivery observes
 it. Use `gitmoot auth unset claude` to write the explicit-empty state. Do not
