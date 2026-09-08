@@ -67,7 +67,16 @@ type reviewFindingWire struct {
 	// field, so before this the key set came out EMPTY and such a finding could
 	// never be re-armed by relevance once answered (#1850 round 2 F4).
 	Evidence string `json:"evidence"`
-	Lens     string `json:"lens"`
+	// UID and Disposition are the shape reviewers actually emit (#2059).
+	// Measured on PR #1930, job local-review-gm-review-opus-18d34115868c7f44: 20
+	// findings, every one carrying uid + severity + disposition + evidence, not
+	// one carrying id, state, title or detail. All 20 declared answered; all 20
+	// were recorded as NEW OPEN findings under freshly minted uids f36-f55,
+	// leaving f1-f33 unobserved. A review that answered twenty findings re-opened
+	// twenty.
+	UID         string `json:"uid"`
+	Disposition string `json:"disposition"`
+	Lens        string `json:"lens"`
 	// ALTERNATE PROSE KEYS, MEASURED FROM REAL VERDICTS (#1928). Findings ride as
 	// free-form json.RawMessage, so a reviewer that names its prose differently
 	// silently loses it: the row is written with an EMPTY title or detail and the
@@ -265,9 +274,10 @@ func (e Engine) ledgerObservationWithDeclaredState(job db.Job, payload JobPayloa
 			// only yields "" here and still lands in QUOTED, now with an event.
 			pathFromLensEvidence(wire.locator()),
 		),
-		Line:           int64(wire.Line),
-		RelevanceKeys:  wire.RelevanceKeys,
-		ContinuesUID:   strings.TrimSpace(wire.ContinuesUID),
+		Line:          int64(wire.Line),
+		RelevanceKeys: wire.RelevanceKeys,
+		// ContinuesUID is assigned below, once `declared` exists: whether a uid
+		// names a finding being ANSWERED or one being minted depends on it (#2059).
 		WithdrawReason: strings.TrimSpace(wire.WithdrawReason),
 		SourceJob:      job.ID,
 	}
@@ -298,7 +308,13 @@ func (e Engine) ledgerObservationWithDeclaredState(job db.Job, payload JobPayloa
 	// verified that in source. It predates this PR, affects file-based STATIC
 	// rows identically, and lives outside this lane's file boundary, so it is
 	// reported rather than patched here.
-	declared := db.FindingState(strings.ToLower(strings.TrimSpace(wire.State)))
+	// `disposition` is read as an alternate spelling of `state` (#2059). The wire
+	// already accepts alternates for prose (#1928) and locators (#1936); state and
+	// identity were the last two fields with exactly one accepted spelling, and
+	// they are the two that decide whether an answer counts as one.
+	declared := db.FindingState(strings.ToLower(firstNonEmptyLedgerText(
+		strings.TrimSpace(wire.State), strings.TrimSpace(wire.Disposition))))
+	obs.ContinuesUID = continuationUID(wire, declared)
 	switch declared {
 	case db.FindingAnswered:
 		obs.State = db.FindingAnswered
@@ -705,4 +721,30 @@ func unstructuredLocatorText(locator string) string {
 		return ""
 	}
 	return locator
+}
+
+// continuationUID decides whether a reviewer's `uid` names a finding it is
+// ANSWERING or one it is minting (#2059).
+//
+// It routes uid into continues_uid ONLY for a terminal disposition. That
+// asymmetry is the whole safety argument: a reviewer declaring answered,
+// withdrawn or superseded is necessarily talking about a finding that already
+// exists, so the uid must resolve - and if it does not, the store refuses the
+// row with ErrFindingUnknownContinues, loudly. A finding declared OPEN that
+// carries a uid is minting, so routing it would refuse every new finding an
+// agent numbers itself.
+//
+// Without this, the measured #1930 case recorded twenty answered findings as
+// twenty NEW open ones under fresh uids, because continues_uid was empty and
+// mint-by-default is the documented fail-safe.
+func continuationUID(wire reviewFindingWire, declared db.FindingState) string {
+	if explicit := strings.TrimSpace(wire.ContinuesUID); explicit != "" {
+		return explicit
+	}
+	switch declared {
+	case db.FindingAnswered, db.FindingWithdrawn, db.FindingSuperseded:
+		return strings.TrimSpace(wire.UID)
+	default:
+		return ""
+	}
 }
