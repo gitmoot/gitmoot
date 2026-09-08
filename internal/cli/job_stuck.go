@@ -22,6 +22,7 @@ var authWordRe = regexp.MustCompile(`\bauth\b`)
 // row keeps its existing shape.
 var stuckReasonEventKinds = []string{
 	blockerDeferredEventKind,
+	blockerBlockedEventKind,
 	"runtime_lock_wait",
 	"advance_blocked",
 	"advance_awaiting_human",

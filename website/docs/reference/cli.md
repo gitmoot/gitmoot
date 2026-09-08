@@ -2445,6 +2445,18 @@ until the earliest retry time. `gitmoot job show --json` carries the
 [event stream](event-stream.md)). A job that "failed then reappeared as queued"
 is the deferral working, not a bug.
 
+A **capability refusal is the one class that does not retry** (#1821). When a
+delivery fails because the runtime could not be executed at all - its binary is
+absent from the seat's `PATH`, or resolves to a published unavailable shim that
+exits 126, or the sandbox could not resolve the target - the job terminates
+**`blocked`** with class `runtime_unavailable` and a
+`blocker_runtime_unavailable` event carrying the remedy, and it records **no**
+retry instant or attempt count. It is the only operational class whose
+condition does not clear on its own: the others wait out a provider window, an
+outage or a lock, while a missing executable waits for an operator, so
+re-dispatching it walks into the same wall. List them with `gitmoot job list
+--state blocked`.
+
 When a runtime session ends **without** producing a `gitmoot_result` envelope —
 the CLI process crashed, exited non-zero, was signal-killed, or completed but
 never emitted a valid envelope even after repair attempts — the job records

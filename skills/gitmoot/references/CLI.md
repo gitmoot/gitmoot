@@ -2837,6 +2837,20 @@ a retry. So a job that "failed then reappeared as queued" is the deferral
 working, not a bug. Product failures (the agent answered with a `gitmoot_result`,
 including `decision=failed`) are never auto-retried.
 
+A **capability refusal is the one class that does not retry** (#1821). When a
+delivery fails because the runtime could not be executed at all - its binary is
+absent from the seat's `PATH`, or resolves to a published unavailable shim that
+exits 126, or the sandbox could not resolve the target - the job terminates
+**`blocked`** with class `runtime_unavailable`, a
+`blocker_runtime_unavailable` event carrying the remedy, and **no** retry
+instant or attempt count. It is the only operational class whose condition does
+not clear on its own: the other four wait out a provider window, an outage or a
+lock, while a missing executable waits for an operator. Measured before it was
+built: 29 refusal deaths in this store, zero recorded `blocked`, and 25 of the
+29 belonged to an agent dispatched into the same wall more than once - one of
+them eleven times. `failed` invited that; `blocked` does not. Find them with
+`gitmoot job list --state blocked`.
+
 When a runtime session ends **without** producing a `gitmoot_result` envelope —
 the CLI process crashed, exited non-zero, was signal-killed, or completed but
 never emitted a valid envelope even after repair attempts — the job records
