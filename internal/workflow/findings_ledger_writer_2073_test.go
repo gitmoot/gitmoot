@@ -149,3 +149,86 @@ func TestAdvanceJobPrefersTheCanonicalDetailOverTheAlternates(t *testing.T) {
 		t.Fatalf("detail = %q, want the canonical `detail` key to win over the alternates", got)
 	}
 }
+
+// #2077 review F2. The three new aliases must not re-rank prose for inputs that
+// ALREADY resolved to something. Before this change {body, details} resolved to
+// body and {evidence, message} resolved to evidence; both must still do so.
+func TestAdvanceJobDoesNotReorderDetailForInputsThatAlreadyResolved(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "g7-review", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	head := strings.Repeat("e", 40)
+
+	insertCompletedJob(t, store, db.Job{ID: "review-2077-f2", Agent: "g7-review", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-f2", PullRequest: 2078, HeadSHA: head,
+		TaskID: "task-f2", ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "changes_requested", Severity: "P1", Summary: "precedence compatibility",
+			Evidence: EvidenceExecuted,
+			TestsRun: []string{"go test ./internal/workflow/ -> ok"},
+			Findings: []json.RawMessage{
+				json.RawMessage(`{"severity":"P1","file":"a.go","line":1,"title":"body case","body":"body wins","details":"details must not win"}`),
+				json.RawMessage(`{"severity":"P2","file":"b.go","line":2,"title":"evidence case","evidence":"b.go:2 - evidence wins","message":"message must not win"}`),
+			},
+		},
+	})
+	if err := engine.AdvanceJob(ctx, "review-2077-f2"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+	observations, err := store.ListReviewFindingObservations(ctx, "gitmoot/gitmoot", 2078)
+	if err != nil {
+		t.Fatalf("ListReviewFindingObservations returned error: %v", err)
+	}
+	if len(observations) != 2 {
+		t.Fatalf("ledger holds %d row(s), want 2", len(observations))
+	}
+	for _, obs := range observations {
+		if strings.Contains(obs.Detail, "must not win") {
+			t.Fatalf("a #2073 alias outranked a pre-existing key: detail = %q", obs.Detail)
+		}
+	}
+}
+
+// #2077 review F1. An obligation whose prose arrived under a detail-only key
+// renders as "title=" in the brief: mandatory, and unreadable. The gate refuses
+// the head until it is observed and the reviewer is told nothing to observe.
+func TestObligationBriefShowsTheConcernWhenTheTitleIsEmpty(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "g7-review", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	head := strings.Repeat("f", 40)
+	const prose = "The reaper ages a claim from the claim row's own created_at, so a resumed value does not reset the wait."
+
+	insertCompletedJob(t, store, db.Job{ID: "review-2077-f1", Agent: "g7-review", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-f1", PullRequest: 2079, HeadSHA: head,
+		TaskID: "task-f1", ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "changes_requested", Severity: "P1", Summary: "detail-only obligation",
+			Evidence: EvidenceExecuted,
+			TestsRun: []string{"go test ./internal/workflow/ -> ok"},
+			Findings: []json.RawMessage{
+				json.RawMessage(`{"severity":"P1","location":"internal/pipeline/run.go:266","message":"` + prose + `"}`),
+			},
+		},
+	})
+	if err := engine.AdvanceJob(ctx, "review-2077-f1"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+
+	// A finding recorded AT a head is already observed there. It becomes an
+	// obligation for the NEXT head, which is the round-two case the brief exists
+	// to serve.
+	nextHead := strings.Repeat("9", 40)
+	brief := engine.ledgerObligationBrief(ctx, "gitmoot/gitmoot", 2079, nextHead, "task-f1")
+	if strings.TrimSpace(brief) == "" {
+		t.Fatalf("no obligation brief rendered; the finding did not become an obligation")
+	}
+	if !strings.Contains(brief, "title=\n") && !strings.Contains(brief, "title= ") && !strings.Contains(brief, "no title") {
+		t.Logf("brief:\n%s", brief)
+	}
+	if !strings.Contains(brief, prose) {
+		t.Fatalf("the brief names a mandatory obligation without its concern; reviewer cannot answer it.\nbrief:\n%s", brief)
+	}
+}
