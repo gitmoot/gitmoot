@@ -107,3 +107,45 @@ func TestFindingWithContentIsNotRefused(t *testing.T) {
 		}
 	}
 }
+
+// ledgerNonContentKeys are the wire's string fields that are NOT finding text:
+// identity, classification, and locators. Named explicitly so the classification
+// test below is a decision rather than a filter.
+var ledgerNonContentKeys = []string{
+	"id", "severity", "file", "continues_uid", "state", "disposition",
+	"evidence_kind", "evidence_locator", "locator", "location", "withdraw_reason",
+	"evidence", "lens",
+}
+
+// THE REVERSE DRIFT, which the advertised-keys test alone does not catch.
+//
+// TestAdvertisedKeysExistOnTheWire proves the message never names a key the
+// reader ignores. It cannot prove the opposite: that a NEW content field gets
+// advertised. A future `description` field read for prose but absent from
+// ledgerContentKeys would reintroduce exactly #2072 - the reader takes a
+// spelling the refusal never mentions.
+//
+// So every string field on the wire must be classified. Adding one fails here
+// until somebody decides whether it carries finding text.
+func TestEveryWireStringFieldIsClassified(t *testing.T) {
+	classified := map[string]bool{}
+	for _, key := range append(append([]string{}, ledgerContentKeys...), ledgerNonContentKeys...) {
+		classified[key] = true
+	}
+	wire := reflect.TypeOf(reviewFindingWire{})
+	for i := range wire.NumField() {
+		field := wire.Field(i)
+		if field.Type.Kind() != reflect.String {
+			continue
+		}
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		if name == "" || name == "-" {
+			continue
+		}
+		if !classified[name] {
+			t.Fatalf("reviewFindingWire field %q (json %q) is neither in ledgerContentKeys nor "+
+				"ledgerNonContentKeys. If the reader takes finding text from it, the refusal must "+
+				"advertise it or #2072 returns; if not, list it as non-content.", field.Name, name)
+		}
+	}
+}

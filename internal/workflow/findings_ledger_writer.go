@@ -474,6 +474,14 @@ func (e Engine) ReviewObligationBrief(ctx context.Context, repo string, pullRequ
 // ledgerContentKeys names every JSON key this reader will take finding text
 // from, in the order firstNonEmptyLedgerText consults them.
 //
+// IT IS A HAND-WRITTEN LIST, NOT A DERIVED ONE, and that is a hazard rather than
+// a convenience: a list that drifts from the parser would send reviewers to a
+// key the reader ignores, which is a worse failure than the silence this
+// replaces. Two tests hold it: one asserts every advertised key is a real json
+// tag, and one asserts every string field on the wire is CLASSIFIED as content
+// or not - so adding a field to reviewFindingWire fails the suite until somebody
+// decides which it is.
+//
 // WHY THE REFUSAL HAS TO SAY THIS (#2072). Four producers have now emitted four
 // spellings - uid/disposition (#2059), bare prose (#2072), an inline [P1]
 // (#2057), and description/location (#2069 f1) - and each was repaired by
