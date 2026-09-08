@@ -1,6 +1,9 @@
 package workflow
 
 import (
+	"context"
+	"fmt"
+	"sort"
 	"strings"
 	"testing"
 
@@ -245,5 +248,139 @@ func TestRelocationCountFallsBackToTheJobWhenTheRoundIsUnknown(t *testing.T) {
 	}
 	if got := ledgerRelocationBrief(mixedPop, map[string]string{"lens-1": "review-9", "lens-2": "review-9"}); got != "" {
 		t.Fatalf("one fanned-out round plus one unknown-round job is two rounds, not three:\n%s", got)
+	}
+}
+
+// #2066 ROUND THREE. THE ROUND STRING ALONE IS NOT A PR-WIDE IDENTITY.
+// nextReviewRound mints review-1, review-2 and so on after filtering by
+// sameTask, so the numbering RESTARTS PER TASK. Keying on the bare string
+// collapsed task-A/review-1 and task-B/review-1 - two genuinely separate rounds -
+// which is the deflation defect this predicate has now produced from two
+// different keys.
+func TestRelocationCountKeepsTwoTasksRoundsApart(t *testing.T) {
+	sameNumberDifferentTasks := []db.ReviewFindingObservation{
+		obs("internal/cli/a.go", "job-a", "F1"),
+		obs("internal/cli/a.go", "job-b", "F1"),
+		obs("internal/cli/a.go", "job-c", "F1"),
+	}
+	// What the resolver now returns: the task and the round, composed.
+	perTask := map[string]string{
+		"job-a": "task-A\x00review-1",
+		"job-b": "task-B\x00review-1",
+		"job-c": "task-C\x00review-1",
+	}
+	got := ledgerRelocationBrief(sameNumberDifferentTasks, perTask)
+	if !strings.Contains(got, "rounds=3") {
+		t.Fatalf("three tasks each at review-1 are three rounds, not one:\n%s", got)
+	}
+
+	// And within ONE task the collapse must still happen, or the fix has simply
+	// disabled the previous round's correction.
+	oneTaskFanOut := map[string]string{
+		"job-a": "task-A\x00review-1",
+		"job-b": "task-A\x00review-1",
+		"job-c": "task-A\x00review-1",
+	}
+	if got := ledgerRelocationBrief(sameNumberDifferentTasks, oneTaskFanOut); got != "" {
+		t.Fatalf("one task's fan-out at review-1 must still count once:\n%s", got)
+	}
+}
+
+// The separator must not be forgeable. A task id or round label containing the
+// composition character would otherwise let one pair impersonate another.
+func TestRelocationCountRoundIdentityIsNotForgeable(t *testing.T) {
+	rows := []db.ReviewFindingObservation{
+		obs("internal/cli/a.go", "job-a", "F1"),
+		obs("internal/cli/a.go", "job-b", "F1"),
+		obs("internal/cli/a.go", "job-c", "F1"),
+	}
+	// "task-A" + "\x00review-1" must not equal "task" + "\x00" + "A\x00review-1"
+	// after composition; distinct pairs stay distinct.
+	crafted := map[string]string{
+		"job-a": "task-A\x00review-1",
+		"job-b": "task\x00A" + "\x00review-1",
+		"job-c": "task-A\x00review-2",
+	}
+	if got := ledgerRelocationBrief(rows, crafted); !strings.Contains(got, "rounds=3") {
+		t.Fatalf("crafted identities collapsed into fewer rounds:\n%s", got)
+	}
+}
+
+// The resolver's own behaviour, which the brief cannot show: what it composes
+// and that it refuses to scan without limit (#2066 round three).
+func TestReviewRoundResolutionComposesTaskAndRoundAndIsBounded(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := Engine{Store: store}
+
+	seed := func(id, task, round string) db.ReviewFindingObservation {
+		insertCompletedJob(t, store, db.Job{ID: id, Agent: "reviewer", Type: "review"}, JobPayload{
+			Repo: "gitmoot/gitmoot", PullRequest: 2066, TaskID: task, ReviewRound: round,
+			Result: &AgentResult{Decision: "approved", Summary: "ok"},
+		})
+		return obs("internal/cli/a.go", id, "F1")
+	}
+
+	// Same round number, different tasks: the composed values must differ, which
+	// is the whole point of the pair.
+	rows := []db.ReviewFindingObservation{
+		seed("job-task-a", "task-A", "review-1"),
+		seed("job-task-b", "task-B", "review-1"),
+	}
+	resolved := engine.reviewRoundsForObservations(ctx, rows)
+	if resolved["job-task-a"] == resolved["job-task-b"] {
+		t.Fatalf("two tasks at review-1 resolved to the same identity %q", resolved["job-task-a"])
+	}
+	if !strings.Contains(resolved["job-task-a"], "task-A") || !strings.Contains(resolved["job-task-a"], "review-1") {
+		t.Fatalf("resolved identity must carry both task and round, got %q", resolved["job-task-a"])
+	}
+
+	// A job carrying NO round yields no entry, so the caller falls back to job
+	// keying rather than folding it in with every other roundless job.
+	rows = append(rows, seed("job-no-round", "task-C", ""))
+	resolved = engine.reviewRoundsForObservations(ctx, rows)
+	if _, present := resolved["job-no-round"]; present {
+		t.Fatal("a job with no review round produced an entry, which would fold roundless jobs together")
+	}
+
+	// THE SCAN IS BOUNDED. The previous version had no maximum and justified it
+	// with a measurement of one store. Past the cap the count degrades to job
+	// keying, which over-counts a fan-out rather than hiding a relocation.
+	// OBSERVATIONS ARRIVE IN DESCENDING ID ORDER ON PURPOSE. jobs is built by
+	// walking the observation SLICE, so a fixture that already supplies sorted
+	// ids cannot tell a sorted prefix from an unsorted one - and it let the
+	// dropped-sort mutant survive twice. Reversed input makes the two answers
+	// disjoint: unsorted takes the HIGHEST ids, sorted takes the lowest.
+	var many []db.ReviewFindingObservation
+	for i := ledgerRoundResolutionCap + 11; i >= 0; i-- {
+		many = append(many, seed(fmt.Sprintf("job-bulk-%03d", i), "task-bulk", fmt.Sprintf("review-%d", i)))
+	}
+	bounded := engine.reviewRoundsForObservations(ctx, many)
+	if len(bounded) > ledgerRoundResolutionCap {
+		t.Fatalf("resolution returned %d entries, above the cap of %d", len(bounded), ledgerRoundResolutionCap)
+	}
+	// THE SUBSET IS THE SORTED PREFIX, ASSERTED AS A SET. Checking only that one
+	// early id is present passed roughly five times in six by luck under map
+	// iteration - flaky rather than merely weak - and it let an unsorted mutant
+	// survive. The exact expected set is the only assertion that pins
+	// determinism.
+	var ids []string
+	for _, row := range many {
+		ids = append(ids, row.ObserverJob)
+	}
+	sort.Strings(ids)
+	want := map[string]struct{}{}
+	for _, id := range ids[:ledgerRoundResolutionCap] {
+		want[id] = struct{}{}
+	}
+	for id := range bounded {
+		if _, expected := want[id]; !expected {
+			t.Fatalf("resolved %q, which is outside the sorted prefix: the subset is not deterministic", id)
+		}
+	}
+	for id := range want {
+		if _, resolved := bounded[id]; !resolved {
+			t.Fatalf("sorted-prefix job %q was not resolved: the subset is not the prefix", id)
+		}
 	}
 }

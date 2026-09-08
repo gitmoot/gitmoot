@@ -625,28 +625,55 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 	return b.String() + relocations
 }
 
-// reviewRoundsForObservations maps each observing job to its logical ReviewRound
-// (#2066 round two). It is BEST EFFORT by design: an unreadable or absent job
-// yields no entry, and the caller then counts that observation by its job id,
-// which is the pre-existing behaviour rather than a silent loss.
+// reviewRoundsForObservations maps each observing job to its logical review
+// round (#2066 round two), keyed so that two different tasks cannot share one
+// round identity (#2066 round three).
 //
-// The read is bounded by the number of DISTINCT observing jobs on one pull
-// request - nine at the maximum in this store - not by observations, so a PR
-// with many findings per round costs one lookup per round rather than per row.
+// THE ROUND STRING ALONE IS NOT A PR-WIDE IDENTITY. nextReviewRound mints
+// "review-1", "review-2" and so on after filtering by sameTask
+// (engine_pr_lifecycle.go), so the numbering restarts PER TASK. Keying on the
+// bare string therefore collapsed task-A/review-1 and task-B/review-1 - two
+// genuinely separate rounds - into one, which is the deflation defect this
+// predicate has now produced twice from two different keys. The identity is the
+// PAIR, and it is composed with a NUL separator so no task id or round label
+// containing the separator can forge another pair's key.
+//
+// It is BEST EFFORT by design: an unreadable or absent job, or a job carrying no
+// round, yields no entry, and the caller then counts that observation by its job
+// id, which is the pre-existing behaviour rather than a silent loss.
+//
+// THE SCAN IS BOUNDED (#2066 round three). The previous version issued one
+// GetJob per distinct observing job with no maximum, and justified it with a
+// measurement - "nine at the maximum in this store" - which is an observation
+// about today, not a bound. Observations and independent review jobs on one pull
+// request can grow without limit, and this runs synchronously while building
+// every review brief, so a long-lived PR could force an arbitrary number of
+// serial queries before its next dispatch. Jobs are visited in sorted order so
+// the subset resolved is deterministic rather than map-iteration dependent, and
+// anything past the cap falls back to job keying.
 func (e Engine) reviewRoundsForObservations(ctx context.Context, observations []db.ReviewFindingObservation) map[string]string {
 	if e.Store == nil {
 		return nil
 	}
-	rounds := make(map[string]string)
+	seen := make(map[string]struct{})
+	var jobs []string
 	for _, obs := range observations {
 		job := strings.TrimSpace(obs.ObserverJob)
 		if job == "" {
 			continue
 		}
-		if _, seen := rounds[job]; seen {
+		if _, dup := seen[job]; dup {
 			continue
 		}
-		rounds[job] = ""
+		seen[job] = struct{}{}
+		jobs = append(jobs, job)
+	}
+	sort.Strings(jobs)
+	if len(jobs) > ledgerRoundResolutionCap {
+		jobs = jobs[:ledgerRoundResolutionCap]
+	}
+	rounds := make(map[string]string, len(jobs))
+	for _, job := range jobs {
 		row, err := e.Store.GetJob(ctx, job)
 		if err != nil {
 			continue
@@ -655,10 +682,22 @@ func (e Engine) reviewRoundsForObservations(ctx context.Context, observations []
 		if err != nil {
 			continue
 		}
-		rounds[job] = strings.TrimSpace(payload.ReviewRound)
+		round := strings.TrimSpace(payload.ReviewRound)
+		if round == "" {
+			continue
+		}
+		rounds[job] = strings.TrimSpace(payload.TaskID) + "\x00" + round
 	}
 	return rounds
 }
+
+// ledgerRoundResolutionCap bounds the per-brief round lookups (#2066 round
+// three). It is a REFUSAL TO SCAN without limit, not a tuned value: past it the
+// count degrades to job keying, which over-counts a fan-out rather than hiding a
+// relocation, so the failure direction is the reportable one. Sixty-four is
+// comfortably above the largest round count observed on any pull request here
+// (nine) while keeping the worst case a fixed cost.
+const ledgerRoundResolutionCap = 64
 
 // ledgerRelocationThreshold is the round count at which a file stops looking
 // like progress and starts looking like a defect being chased.

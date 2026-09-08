@@ -3526,3 +3526,32 @@ context_enabled = true   # inject the advisory table into top-level coordinator 
 
 The injected block carries the same "not a benchmark" disclaimer, is added only to
 top-level (coordinator) jobs, and never forces a route — routing stays advisory.
+
+## Defect relocation count in the review brief
+
+A review prompt that already carries prior-findings obligations (#1822) also
+carries a **defect relocation count** when one file on the pull request has
+attracted findings across several distinct review rounds (#1419).
+
+```
+DEFECT RELOCATION COUNT ON THIS PR (#1419).
+  internal/cli/review_phase_instrument.go  rounds=6  (labels F1 F2 L01 L03 ...)
+```
+
+Three things it deliberately is not:
+
+- **Not a block.** It never refuses a verdict and never gates a merge. The
+  judgement it informs - stop patching and state a contract - is a design
+  decision a human makes with the number.
+- **Not a finding count.** The unit is a distinct review round, so several
+  findings in one round is thoroughness rather than relocation. A round that
+  fans out to several reviewers or lens children counts once.
+- **Not a claim that the defects are the same defect.** The count is rounds
+  carrying findings against one file, which is a proxy: unrelated defects in one
+  file across three rounds report as three.
+
+The labels are shown so a human can recognise which rounds are meant; they are
+never what is counted, because a reviewer restarts finding numbers at 1 each
+round. The threshold is three rounds. The count is derived only from rows the
+findings ledger holds, so a pull request whose earlier rounds predate the
+ledger's writer reports a floor rather than a total.
