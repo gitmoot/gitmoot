@@ -2351,3 +2351,39 @@ func newEventRuleID() (string, error) {
 	}
 	return "event-rule-" + hex.EncodeToString(raw[:]), nil
 }
+
+// knownOrgRoleName resolves a role to its canonical registry spelling, or fails
+// if the registry is disabled or the role is unknown (#2063).
+//
+// IT DELIBERATELY DOES NOT TOUCH PRESENCE OR ENFORCE RECYCLING, which is what
+// separates it from validateAndTouchActingOrgRole. That ingress answers "is this
+// role acting right now", so recording presence and refusing an idle role are
+// both correct there. `--lead` answers a different question - "who implemented
+// this" - and the answer is a historical fact about work already done.
+//
+// Touching presence for a lead would mark a role recently-seen because somebody
+// ELSE dispatched a review of its earlier work (#2067 review, P3), and enforcing
+// recycling would refuse that dispatch because the implementer has since gone
+// idle - which says nothing about whether they implemented it.
+func knownOrgRoleName(home, role string) (string, error) {
+	role = strings.TrimSpace(role)
+	if role == "" {
+		return "", errors.New("empty org role")
+	}
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		return "", err
+	}
+	cfg, err := config.LoadOrg(paths)
+	if err != nil {
+		return "", fmt.Errorf("load org registry: %w", err)
+	}
+	if !cfg.Enabled() {
+		return "", errors.New("organization registry is not enabled; run `gitmoot org init`")
+	}
+	configured, ok := cfg.Role(role)
+	if !ok {
+		return "", fmt.Errorf("unknown org role %q", role)
+	}
+	return configured.Name, nil
+}

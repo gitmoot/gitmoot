@@ -81,8 +81,12 @@ dispatches. Gitmoot loads that lead from the agents database before creating the
 review job and requires repo access, `implement` capability, and a
 write-granting autonomy policy. A `changes_requested` verdict then creates its
 fix job for the lead while the review job remains assigned to the reviewer.
-Without `--lead`, the reviewer is checked as the fallback lead, so a review-only
-agent must be paired explicitly with a separate implementer.
+`--lead` is REQUIRED and has no fallback. Omitting it used to check the reviewer
+as the lead, which recorded the reviewer as its own implementer; a dispatch that
+names no implementer is now refused instead. `--lead` accepts a registered agent
+or an **org role**, so a seat that implements in session can name itself rather
+than borrowing a registered agent that did no work. A role is validated against
+the org registry; an unknown value is refused naming both possibilities.
 
 Transcript retention is opt-in through `[transcripts] enabled = true` with a
 default `retain = "168h"` and `max_total_bytes = 2147483648`. It captures

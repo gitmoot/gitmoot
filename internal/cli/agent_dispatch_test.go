@@ -9,12 +9,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/github/githubtest"
+	"github.com/gitmoot/gitmoot/internal/org"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -840,5 +842,75 @@ func assertReviewLeadHardRefusal(t *testing.T, store *db.Store, checkout string,
 	}
 	if adapter.calls != 0 {
 		t.Fatalf("adapter calls = %d, want zero after hard refusal", adapter.calls)
+	}
+}
+
+// #2067 review, P2: no test exercised the NEW capability. The suite covered the
+// refusal when --lead is omitted and the error when it names nothing known -
+// both negatives - while the thing #2063 adds, a lead named by ORG ROLE, had no
+// coverage at all. A feature tested only through its refusals is a feature
+// nobody has run.
+func TestDispatchReviewAcceptsAnOrgRoleAsLead(t *testing.T) {
+	fixture := reviewLeadRefusalStore(t)
+	store := fixture.store
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true",
+		[]string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	installReviewLeadTestAdapter(t, "")
+
+	originalRunner := orgDoctorRunner
+	orgDoctorRunner = orgFixtureRunner{version: "herdr 0.7.5\n"}
+	t.Cleanup(func() { orgDoctorRunner = originalRunner })
+	withOrgProvider(t, orgFixtureProvider{snapshot: org.Snapshot{
+		States:     map[string]org.RoleLiveState{"owner": {State: org.StateUnknown}},
+		ObservedAt: time.Now().UTC(), ProviderVersion: "0.7.5",
+	}})
+	var out, errBuf bytes.Buffer
+	if code := Run([]string{"org", "init", "--home", fixture.home}, &out, &errBuf); code != 0 {
+		t.Fatalf("org init code = %d stderr=%s", code, errBuf.String())
+	}
+	cfg, err := config.LoadOrg(config.PathsForHome(fixture.home))
+	if err != nil || !cfg.Enabled() {
+		t.Fatalf("org registry not enabled: %+v err=%v", cfg, err)
+	}
+	const roleName = "owner"
+	if _, ok := cfg.Role(roleName); !ok {
+		t.Fatalf("org init did not create role %q; the happy path cannot be exercised", roleName)
+	}
+
+	request := localAgentDispatchRequest{
+		RepoFlag: "owner/repo", Agent: "reviewer", Action: "review", PullRequest: 7,
+		HeadSHA: fixture.head, Branch: "feature/review", Home: fixture.home,
+		LeadAgent: roleName,
+	}
+	got, err := validateLocalReviewLeadAtDispatch(context.Background(), store, request, "owner/repo")
+	if err != nil {
+		t.Fatalf("org-role lead was refused: %v; a seat that implements in session must be nameable", err)
+	}
+	if got.LeadAgent != workflow.NormalizeActingOrgRole(roleName) {
+		t.Fatalf("LeadAgent = %q, want the normalized role %q", got.LeadAgent, workflow.NormalizeActingOrgRole(roleName))
+	}
+
+	// GM-TRANSPORT'S #2064 GAP, CHECKED HERE RATHER THAN REASONED ABOUT. On their
+	// path, clearing the lead at validation did nothing because enqueue restored it
+	// through firstNonEmpty(request.LeadAgent, agent.Name) - so a review-only
+	// dispatch persisted THE REVIEWER as lead_agent and a changes_requested verdict
+	// would have routed its fix to the agent that produced the verdict. This path
+	// sets a NON-EMPTY lead, so firstNonEmpty keeps it, but that is exactly the kind
+	// of reasoning their cycle-two review falsified, so it is asserted.
+	if got.LeadAgent == request.Agent {
+		t.Fatalf("LeadAgent resolved to the REVIEWER %q; that is the independence violation the lead requirement exists to prevent", got.LeadAgent)
+	}
+	if firstNonEmpty(got.LeadAgent, request.Agent) != workflow.NormalizeActingOrgRole(roleName) {
+		t.Fatalf("firstNonEmpty(%q, %q) = %q, want the role to survive enqueue's fallback",
+			got.LeadAgent, request.Agent, firstNonEmpty(got.LeadAgent, request.Agent))
+	}
+
+	// #2067 review, P3: a lead is a historical fact, so validating one must NOT
+	// record the role as currently present. Without this the dispatch would mark a
+	// role recently-seen because somebody else reviewed its earlier work.
+	if _, found, presenceErr := store.GetOrgRolePresence(context.Background(), roleName); presenceErr != nil {
+		t.Fatalf("GetOrgRolePresence: %v", presenceErr)
+	} else if found {
+		t.Fatalf("validating an org-role lead recorded presence for %q; a lead names who implemented, not who is acting", roleName)
 	}
 }

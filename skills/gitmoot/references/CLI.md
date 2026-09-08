@@ -1181,9 +1181,12 @@ fix job to that lead, not to the reviewer. Before creating a review job or
 starting its runtime session, Gitmoot loads the lead from the agents database
 and requires that it exist, can access the repository, has `implement`
 capability, and uses a write-granting policy (`workspace-write` or
-`danger-full-access`). Without `--lead`, the reviewer is the fallback lead and
-must pass the same checks; a strict review-only agent therefore needs an
-explicit implementer. Managed-type review dispatches also require an explicit
+`danger-full-access`). `--lead` also accepts an **org role**, validated against
+the org registry, so a seat that implements in session can name itself instead of
+borrowing a registered agent that did no work; a role lead skips the agent
+capability checks because it is not an agent, and is not recorded as present.
+Omitting `--lead` is REFUSED rather than falling back to the reviewer: that
+fallback recorded the reviewer as its own implementer. Managed-type review dispatches also require an explicit
 DB-backed lead. `--lead` is rejected when `agent run` resolves to ask or
 implement, and is not accepted by `agent implement` or `orchestrate`.
 

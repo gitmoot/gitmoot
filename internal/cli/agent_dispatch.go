@@ -1071,8 +1071,14 @@ func validateLocalReviewLeadAtDispatch(ctx context.Context, store *db.Store, req
 			// engine_types.go already reads payload.LeadAgent through
 			// NormalizeActingOrgRole when resolving a wake target, so a role in this
 			// field is a shape the engine understands rather than a new one.
-			if roleErr := validateAndTouchActingOrgRole(ctx, store, request.Home, leadName, "agent review --lead"); roleErr == nil {
-				request.LeadAgent = workflow.NormalizeActingOrgRole(leadName)
+			// knownOrgRoleName, NOT validateAndTouchActingOrgRole (#2067 review, P3):
+			// that ingress also records presence and enforces recycling, which are
+			// right for "who is acting now" and wrong for "who implemented this". A
+			// lead is a historical fact, so marking its role recently-seen because
+			// somebody else dispatched a review would falsify presence, and refusing
+			// because the implementer has since gone idle would refuse a true answer.
+			if canonical, roleErr := knownOrgRoleName(request.Home, leadName); roleErr == nil {
+				request.LeadAgent = workflow.NormalizeActingOrgRole(canonical)
 				return request, nil
 			}
 			return localAgentDispatchRequest{}, fmt.Errorf(
