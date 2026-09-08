@@ -200,9 +200,22 @@ func TestMergeGateStillUpdatesWhenMergeabilityIsUnknown(t *testing.T) {
 // as before - the new guard must not reject valid input, and must not spend an
 // API call it does not need.
 func TestMergeGateMergesUpToDateBranchUnchanged(t *testing.T) {
-	for _, status := range []string{"identical", "ahead", ""} {
+	// #2074 round two, P2: the blank status is GONE from this ACCEPTANCE table.
+	// GitHub's compare status enum is diverged/ahead/behind/identical, so "" is
+	// not a production shape, and an acceptance test on an unreachable input can
+	// stay green through a real regression. The empty and unrecognised cases are
+	// still covered deliberately, as ROBUSTNESS, by
+	// TestMergeGateTreatsNumericBehindAsBehindWhateverTheStatusString below.
+	for _, status := range []string{"identical", "ahead"} {
 		t.Run("status="+status, func(t *testing.T) {
-			gh := behindMergeGateClient(github.CompareResult{Status: status})
+			// A real "ahead" response carries ahead_by > 0; "identical" carries
+			// zero on both axes, and passing AheadBy here would itself be a shape
+			// production cannot emit. So it is set per status rather than blanket.
+			compare := github.CompareResult{Status: status}
+			if status == "ahead" {
+				compare.AheadBy = 3
+			}
+			gh := behindMergeGateClient(compare)
 			gh.strictKnown = true
 			gh.strictBase = true // must be irrelevant when not behind
 
@@ -285,7 +298,7 @@ func TestMergeGateTreatsNumericBehindAsBehindWhateverTheStatusString(t *testing.
 func TestMergeGateWaitsWhenMergeabilityIsUnknownOnAnUpToDateHead(t *testing.T) {
 	for _, status := range []string{"ahead", "identical"} {
 		t.Run("status="+status, func(t *testing.T) {
-			gh := behindMergeGateClient(github.CompareResult{Status: status})
+			gh := behindMergeGateClient(github.CompareResult{Status: status, AheadBy: 2})
 			gh.pr.Mergeable = nil
 			gh.strictKnown = true
 			gh.strictBase = true
@@ -298,11 +311,27 @@ func TestMergeGateWaitsWhenMergeabilityIsUnknownOnAnUpToDateHead(t *testing.T) {
 			if len(gh.merges) != 0 {
 				t.Fatalf("the native merge was reached: %+v", gh.merges)
 			}
-			// PENDING, not blocked: GitHub computes this asynchronously and it
-			// resolves on the next poll. A block would make an ordinary race an
-			// operator ticket, which is the distinction PipelineAutoMerger makes.
 			if !strings.Contains(decision.Reason.Render(), "has not determined") {
 				t.Fatalf("decision must say mergeability is undetermined, got %q", decision.Reason.Render())
+			}
+			// PENDING, NOT BLOCKED, ASSERTED ON THE LIFECYCLE RATHER THAN THE PROSE
+			// (#2074 round two, P2). The reviewer changed the production nil arm to
+			// g.block with the IDENTICAL reason string and this test still passed,
+			// because it only checked that no merge happened and that the reason
+			// mentioned undetermined mergeability. Both are true of a block.
+			//
+			// The inversion matters: a blocked row publishes a FAILURE status and
+			// moves the task out of its automatic retry path, turning a race that
+			// resolves on the next poll into an operator ticket. So the three
+			// distinguishers are asserted directly.
+			if !decision.Ready {
+				t.Fatal("nil mergeability produced a BLOCK, not a pending: Ready is false, so the task leaves its automatic retry path")
+			}
+			if decision.BlockClass != 0 {
+				t.Fatalf("a pending decision must carry no block class, got %d", decision.BlockClass)
+			}
+			if !hasStatus(gh.statuses, GitmootMergeGateContext, "pending") {
+				t.Fatalf("the published commit status must be pending, got %+v", gh.statuses)
 			}
 		})
 	}
@@ -311,7 +340,7 @@ func TestMergeGateWaitsWhenMergeabilityIsUnknownOnAnUpToDateHead(t *testing.T) {
 // The explicit false case must stay a BLOCK, so the nil arm above cannot be
 // implemented by softening a real conflict into a wait.
 func TestMergeGateBlocksAnExplicitlyUnmergeableHead(t *testing.T) {
-	gh := behindMergeGateClient(github.CompareResult{Status: "ahead"})
+	gh := behindMergeGateClient(github.CompareResult{Status: "ahead", AheadBy: 2})
 	conflicting := false
 	gh.pr.Mergeable = &conflicting
 	gh.strictKnown = true
@@ -324,5 +353,14 @@ func TestMergeGateBlocksAnExplicitlyUnmergeableHead(t *testing.T) {
 	}
 	if !strings.Contains(decision.Reason.Render(), "not mergeable") {
 		t.Fatalf("decision must name the conflict, got %q", decision.Reason.Render())
+	}
+	// The opposite lifecycle from the nil case above. Without this the pair could
+	// both be satisfied by one behaviour, which is exactly how the nil test came
+	// to accept a block.
+	if decision.Ready {
+		t.Fatal("an explicit conflict must BLOCK, not wait: Ready is true, so it would keep retrying a merge GitHub has refused")
+	}
+	if !hasStatus(gh.statuses, GitmootMergeGateContext, "failure") {
+		t.Fatalf("a blocked decision must publish a failure status, got %+v", gh.statuses)
 	}
 }
