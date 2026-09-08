@@ -2242,6 +2242,17 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 		policy = config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue}
 	}
 
+	// ctx is the SIGNAL context and governs this pass's own accept/requery loop:
+	// on shutdown it must stop selecting, querying and dispatching promptly.
+	//
+	// deliveryCtx governs the JOBS this pass dispatches, and must SURVIVE the
+	// shutdown signal so in-flight work can finish while the tracker's drain
+	// waits for it. Only the two runPoolJobRecovered calls below may use it.
+	//
+	// A nil tracker returns ctx unchanged, which is what keeps the untracked
+	// runQueuedJobsForRepoPool byte-identical to the historical pool.
+	deliveryCtx := tracker.jobContext(ctx)
+
 	type finished struct {
 		jobID        string
 		checkoutKey  string
@@ -2359,8 +2370,9 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 		}
 
 		// Stop dispatching promptly on cancellation rather than relying on the next
-		// store query to observe it; in-flight workers return as their own ctx is
-		// cancelled (parity with the barrier's wg.Wait()), then we drain and exit.
+		// store query to observe it. In-flight workers do NOT return here: they run
+		// on deliveryCtx, which survives the signal, so this loop stops accepting
+		// and then waits for them below while the tracker's drain bounds the wait.
 		if firstErr == nil && ctx.Err() != nil {
 			firstErr = ctx.Err()
 		}
@@ -2472,7 +2484,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					running++
 					dispatched++
 					go func() {
-						done <- finished{jobID: job.ID, checkoutKey: checkoutKey, runtimeKey: runtimeKey, err: runPoolJobRecovered(ctx, worker, job)}
+						done <- finished{jobID: job.ID, checkoutKey: checkoutKey, runtimeKey: runtimeKey, err: runPoolJobRecovered(deliveryCtx, worker, job)}
 					}()
 				}
 				// #394 part 2: a read-only job left blocked ONLY by a contended same-repo
@@ -2605,7 +2617,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					running++
 					dispatched++
 					go func() {
-						done <- finished{jobID: iso.job.ID, checkoutKey: iso.checkoutKey, runtimeKey: iso.runtimeKey, worktreePath: iso.worktreePath, repoCheckout: iso.repoCheckout, runner: iso.runner, payloadBeforeIsolation: payloadBeforeIsolation, err: runPoolJobRecovered(ctx, worker, iso.job)}
+						done <- finished{jobID: iso.job.ID, checkoutKey: iso.checkoutKey, runtimeKey: iso.runtimeKey, worktreePath: iso.worktreePath, repoCheckout: iso.repoCheckout, runner: iso.runner, payloadBeforeIsolation: payloadBeforeIsolation, err: runPoolJobRecovered(deliveryCtx, worker, iso.job)}
 					}()
 				}
 			}
