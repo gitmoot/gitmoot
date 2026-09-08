@@ -572,6 +572,31 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
 	}
+	// #1721: refuse a READ-ONLY policy the runtime declares it did not apply,
+	// BEFORE any delivery. Terminates BLOCKED rather than failed, per #2022:
+	// nothing is wrong with the job, and `failed` invites the identical
+	// re-dispatch into the same unenforced boundary.
+	//
+	// PLACEMENT, and it is a compromise stated rather than hidden. The ideal is
+	// a dispatch-time refusal before this job is ever claimed. It cannot go
+	// there: the declaration is ADAPTER-owned by design
+	// (ResolvePermissionPolicyApplication asks the adapter rather than keeping a
+	// runtime roster beside it), and an adapter's answer can depend on its Dir -
+	// the codex adapter derives it from codexSandboxArgs(agent, a.Dir). So the
+	// earliest point where the answer is TRUSTWORTHY is here, once the adapter
+	// exists, which is after the checkout at :532.
+	//
+	// The cost is one checkout, and it is bounded rather than leaked: measured on
+	// this store (#2036), a BLOCKED job's read-only worktree is removed 7 of 7
+	// times, against 39 of 377 for a failed one. No model runs, no tokens are
+	// spent and the agent writes nothing, because Deliver is never reached.
+	if reason, refuse := permissionpolicy.UnenforceablePolicyRefusal(agent, adapter); refuse {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, errors.New(reason)); finishErr != nil {
+			return finishErr
+		}
+		writeLine(w.Stdout, "job %s blocked: %s", job.ID, reason)
+		return nil
+	}
 	warningRecorded, warningErr := permissionpolicy.RecordWarning(ctx, w.Store, job, agent, adapter, time.Now())
 	if warningErr != nil {
 		writeLine(w.Stdout, "job %s permission-policy observation failed: %v", job.ID, warningErr)
