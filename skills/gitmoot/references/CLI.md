@@ -368,9 +368,23 @@ marker, and the isolated ledger contains zero remote execution attempts.
 
 `agent review` accepts `--skip-native-review-fanout` as well, and always did:
 the review verb shares implement's argument parser. Until #1654 the review usage
-line omitted it, so the escape hatch was undiscoverable rather than absent - pass
-it when dispatching an adversarial panel on one PR, where one fix job per
-completed review would otherwise race to push the same branch.
+line omitted it, so the flag was undiscoverable rather than absent.
+
+**On `agent review` the flag is recorded and not consumed, so it does not
+prevent the per-review fix-job race.** The parser sets
+`skip_native_review_fanout` on the review job's payload, and the review-advance
+path never reads it: in `internal/workflow/engine_run_budgets.go` the flag is
+read only inside `case "implement":`, where it writes the branch lock and rides
+onto the PR-open event, while `case "review":` begins after that block and does
+not consult it. `dispatchFix` builds a parentless implement request that does
+not inherit it either.
+
+The flag is therefore a real control on the **implement** side, not an escape
+hatch on the review side. Same-head safety for an adversarial panel comes from
+the per-head and per-branch coalescing guards, not from passing this flag to
+`agent review`. To suppress native fan-out for a branch, pass it on the
+implement dispatch (or `orchestrate`/`run`), which is where it takes effect and
+where it persists onto the branch lock.
 
 ## Transcript Retention
 
