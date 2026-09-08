@@ -210,7 +210,11 @@ type reviewVerdictPayload struct {
 	// report-only and is therefore never re-interpreted against repository
 	// severity policy.
 	Sender string `json:"sender"`
-	Result *struct {
+	// ActingOrgRole is read so a session review authored by a role rather than an
+	// agent survives to the caller, which resolves the two into one identity
+	// (#2008). Folding stays in workflow.ReviewerIdentity, not here.
+	ActingOrgRole string `json:"acting_org_role"`
+	Result        *struct {
 		Decision string `json:"decision"`
 		Severity string `json:"severity,omitempty"`
 		// Delegations and FanOut are the canonical fan-out classification, decoded
@@ -249,6 +253,12 @@ type SucceededReviewVerdict struct {
 	// recorded it (#1528). Empty for jobs that predate that recording; callers
 	// resolving a runtime family fall back to the agent registry default.
 	EffectiveRuntime string
+	// ActingOrgRole is the role an externally driven session review recorded IN
+	// PLACE OF an agent. It is carried RAW and deliberately not folded here:
+	// workflow depends on db and never the reverse, so the Agent-first rule lives
+	// in workflow.ReviewerIdentity and this layer must not keep a second copy of
+	// it (#2008). A caller reading Agent alone silently drops such a row.
+	ActingOrgRole string
 }
 
 // SucceededReviewVerdicts returns stable approved or changes-requested review
@@ -302,6 +312,7 @@ ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 			Decision:         decision,
 			Severity:         strings.ToUpper(strings.TrimSpace(decoded.Result.Severity)),
 			EffectiveRuntime: strings.ToLower(strings.TrimSpace(decoded.EffectiveRuntime)),
+			ActingOrgRole:    strings.TrimSpace(decoded.ActingOrgRole),
 		})
 	}
 	if err := rows.Err(); err != nil {
