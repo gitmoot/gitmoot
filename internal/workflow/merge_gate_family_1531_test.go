@@ -107,14 +107,22 @@ func TestMergeGateRecordsAnUnresolvableFamilyRatherThanClaimingAClean(t *testing
 	})
 	gate := PolicyMergeGate{Store: store}
 
-	// The reviewer is an ephemeral agent: not in the registry, no recorded runtime.
-	same, _, err := gate.sameRuntimeFamilyAsImplementer(ctx, "review-job", "lens-ephemeral-abc", "",
+	// The reviewer is an ephemeral agent with no parent recorded: not in the
+	// registry, no recorded runtime, and nothing for #2004's parent recovery to
+	// walk to. #1531 shipped this falling THROUGH to the name check because
+	// refusing then would have blocked the native review fanout. #2004 removed
+	// that objection by making the fanout's own ephemeral legs resolvable, so what
+	// remains here is a genuinely unknown family, and the gate now refuses it.
+	same, reason, err := gate.sameRuntimeFamilyAsImplementer(ctx, "review-job", "lens-ephemeral-abc", "",
 		map[string]implementerIdentity{"wave-impl": {Name: "wave-impl", RecordedRuntime: "codex"}})
 	if err != nil {
 		t.Fatalf("sameRuntimeFamilyAsImplementer: %v", err)
 	}
-	if same {
-		t.Fatal("an unresolvable family was reported as a same-family match; absence is not evidence")
+	if !same {
+		t.Fatal("an unresolvable family did not block; independence that cannot be shown must not be assumed")
+	}
+	if !strings.Contains(reason, "lens-ephemeral-abc") {
+		t.Fatalf("block reason = %q, want the unresolvable reviewer named", reason)
 	}
 	events, err := store.ListJobEvents(ctx, "review-job")
 	if err != nil {

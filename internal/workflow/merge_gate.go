@@ -2634,21 +2634,25 @@ func parseRepoFullName(value string) (github.Repository, error) {
 // falls back to the agent registry default, so an override-run job attributes
 // correctly even after its agent's default later changes.
 //
-// UNRESOLVABLE IS NOT SILENTLY CLEAN, AND IT IS ALSO NOT A BLOCK. This is the
-// tension #1531's own comment warns about: "doing (2) without (1) produces a
-// gate that silently passes whenever the field is absent". Re-measured on jobs
-// since 2026-08-25, resolution now covers 1335 of 1432 reviews and 427 of 449
-// implement jobs once the registry fallback is counted - 93 to 95 percent, up
-// from the 11 percent that made the issue defer this. The residue is dominated
-// by EPHEMERAL and TEMP agents, which are deliberately absent from the registry,
-// plus rows with an empty agent column.
+// UNRESOLVABLE NOW BLOCKS (#2004). #1531 shipped this falling through to the
+// name check, because refusing then would have blocked the native review
+// fanout: its lens legs are ephemeral by construction and ephemeral agents are
+// deliberately absent from the registry. #2004 removed that objection by
+// teaching the shared resolver to recover a synthetic agent's family from its
+// parent, so the residue no longer contains the thing the fall-through was
+// protecting.
 //
-// Refusing on that residue would block the native review fanout, whose lens legs
-// are ephemeral by construction, so an unresolved family falls through to the
-// name check exactly as before AND records why it could not be compared. That
-// keeps the gate's behaviour unchanged where it cannot see, while never claiming
-// a check it did not perform. Making the residue resolvable - temp agent names
-// embed their parent - is the follow-up that would let this fail closed.
+// Measured on review and implement jobs since 2026-08-25, after parent
+// recovery: 17 of 1,903 rows resolve to no family. Eleven have an empty agent
+// column and CANNOT REACH THIS FUNCTION - collectImplementerAttributionMatching
+// routes them to sawEmptyAgent and its own attribution reason - so the exposure
+// is the six rows naming an agent that is simply not registered, all implement
+// rows, none of them on an open pull request.
+//
+// Blocking is the honest answer for those six: the gate's property is that the
+// approver did not share a runtime family with an implementer, and an agent
+// whose runtime nothing records cannot be shown not to. The observation row is
+// still written, so the reason survives past the decision.
 func (g PolicyMergeGate) sameRuntimeFamilyAsImplementer(ctx context.Context, reviewJobID string, reviewer string,
 	reviewerRuntime string, implementers map[string]implementerIdentity) (bool, string, error) {
 	if g.Store == nil || strings.TrimSpace(reviewer) == "" || len(implementers) == 0 {
@@ -2659,9 +2663,11 @@ func (g PolicyMergeGate) sameRuntimeFamilyAsImplementer(ctx context.Context, rev
 		return false, "", err
 	}
 	if !ok {
-		g.recordFamilyUnresolved(ctx, reviewJobID, fmt.Sprintf(
-			"runtime family unresolved for reviewer %q; independence was decided on agent name alone", reviewer))
-		return false, "", nil
+		reason := fmt.Sprintf(
+			"runtime family unresolved for reviewer %q, so cross-family independence cannot be shown; register the agent with a runtime, or re-run the review on an agent whose runtime is recorded",
+			reviewer)
+		g.recordFamilyUnresolved(ctx, reviewJobID, reason)
+		return true, reason, nil
 	}
 	names := make([]string, 0, len(implementers))
 	for name := range implementers {
@@ -2675,9 +2681,11 @@ func (g PolicyMergeGate) sameRuntimeFamilyAsImplementer(ctx context.Context, rev
 			return false, "", err
 		}
 		if !ok {
-			g.recordFamilyUnresolved(ctx, reviewJobID, fmt.Sprintf(
-				"runtime family unresolved for implementer %q; independence was decided on agent name alone", name))
-			continue
+			reason := fmt.Sprintf(
+				"runtime family unresolved for implementer %q, so cross-family independence cannot be shown; register the agent with a runtime, or record the runtime the implement job ran on",
+				name)
+			g.recordFamilyUnresolved(ctx, reviewJobID, reason)
+			return true, reason, nil
 		}
 		if family == reviewerFamily {
 			return true, fmt.Sprintf(

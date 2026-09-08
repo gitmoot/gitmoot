@@ -19,6 +19,7 @@ import (
 
 func insertIndependentMergeGateReview(t *testing.T, store *db.Store, reviewJob db.Job, reviewPayload JobPayload) {
 	t.Helper()
+	seedMergeGateFixtureAgent(t, store, reviewJob.Agent)
 	implementingAgent := "implementer"
 	if strings.TrimSpace(reviewJob.Agent) == implementingAgent {
 		implementingAgent = "different-implementer"
@@ -26,6 +27,7 @@ func insertIndependentMergeGateReview(t *testing.T, store *db.Store, reviewJob d
 	implementPayload := reviewPayload
 	implementPayload.ReviewRound = ""
 	implementPayload.Result = &AgentResult{Decision: "implemented", Summary: "implemented"}
+	seedMergeGateFixtureAgent(t, store, implementingAgent)
 	insertCompletedJob(t, store, db.Job{
 		ID:    reviewJob.ID + "-implement-author",
 		Agent: implementingAgent,
@@ -77,8 +79,47 @@ func newMergeGateQuorumScenario(t *testing.T) (*db.Store, *fakeMergeGateGitHub, 
 	return store, gh, gate, request
 }
 
+// seedMergeGateFixtureAgent registers a fixture agent on a runtime family OF ITS
+// OWN (#2004). These tests were written against a gate that compared agent
+// NAMES, so they implicitly assume two differently-named agents are independent.
+// Once the gate resolves families and fails closed on an unresolvable one, that
+// assumption has to be stated rather than implied: one family per name preserves
+// every existing expectation, while an unregistered agent would now block.
+//
+// Deliberately idempotent and name-derived, so a test that wants a SHARED family
+// still gets one by upserting the two agents onto the same runtime itself.
+func seedMergeGateFixtureAgent(t *testing.T, store *db.Store, name string) {
+	t.Helper()
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return
+	}
+	// Never register a SYNTHETIC agent. Temp and ephemeral agents are absent from
+	// the production registry by design, and #2004's parent recovery is the thing
+	// that resolves them; a fixture that registers one resolves it directly and
+	// silently stops exercising the walk.
+	if _, isTemp := splitTempAgentName(name); isTemp || strings.Contains(name, ephemeralAgentInfix) {
+		return
+	}
+	if _, err := store.GetAgent(context.Background(), name); err == nil {
+		return
+	}
+	if err := store.UpsertAgent(context.Background(), db.Agent{
+		Name:           name,
+		Role:           "agent",
+		Runtime:        "rt-" + name,
+		RepoScope:      "gitmoot/gitmoot",
+		Capabilities:   []string{"review", "implement"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent(%s) returned error: %v", name, err)
+	}
+}
+
 func insertMergeGateReviewFixture(t *testing.T, store *db.Store, fixture mergeGateReviewFixture) {
 	t.Helper()
+	seedMergeGateFixtureAgent(t, store, fixture.agent)
 	state := fixture.state
 	if state == "" {
 		state = JobSucceeded
@@ -6497,6 +6538,8 @@ func TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut(t *testing.T) {
 			id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
 		})
 		mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+		// #2004: the gate resolves a runtime family for this reviewer.
+		seedMergeGateFixtureAgent(t, store, "returning-reviewer")
 		if _, err := mailbox.OpenExternalJob(ctx, JobRequest{
 			ID: "cli-session-objection", Agent: "returning-reviewer", Action: "review",
 			Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", Sender: "session",
@@ -6629,6 +6672,8 @@ func TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut(t *testing.T) {
 			id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
 		})
 		mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+		// #2004: the gate resolves a runtime family for this reviewer.
+		seedMergeGateFixtureAgent(t, store, "asym-reviewer")
 		if _, err := mailbox.OpenExternalJob(ctx, JobRequest{
 			ID: "asym-objection", Agent: "asym-reviewer", Action: "review",
 			Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", Sender: "session",
@@ -6774,6 +6819,8 @@ func TestPolicyMergeGateProvenanceScopeMatrix(t *testing.T) {
 				id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
 			})
 			mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+			// #2004: the gate resolves a runtime family for this reviewer.
+			seedMergeGateFixtureAgent(t, store, "matrix-reviewer")
 			if _, err := mailbox.OpenExternalJob(ctx, JobRequest{
 				ID: "matrix-objection", Agent: "matrix-reviewer", Action: "review",
 				Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", Sender: "session",
