@@ -3,7 +3,6 @@ package workflow
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -125,55 +124,5 @@ func TestDelegatedReviewOfAReviewParentKeepsTheInheritedHead(t *testing.T) {
 	}
 	if len(resolver.calls) != 0 {
 		t.Fatalf("a review parent's child resolved a branch tip it should not have: %v", resolver.calls)
-	}
-}
-
-// When the branch cannot be resolved the stale head must be DROPPED rather than
-// recorded. An unbound verdict is worse than a correct one and better than a
-// wrongly-bound one, because a wrong head looks bound - and the event has to say
-// which happened, or the drop is indistinguishable from a job that never had a
-// head.
-func TestDelegatedReviewDropsAnUnresolvableHeadAndSaysSo(t *testing.T) {
-	ctx := context.Background()
-	resolver := &fakeHeadResolver{err: errors.New("git: unknown revision")}
-	engine, store := newDelegatedReviewFixture(t, resolver)
-
-	parent := db.Job{ID: "impl-1730b", Agent: "appkit-omp", Type: "implement", State: string(JobSucceeded)}
-	payload := JobPayload{Repo: "themartianapp/appkit", Branch: "gone-branch", HeadSHA: staleImplementHead, TaskID: "t"}
-	request := JobRequest{
-		ID:   "impl-1730b/delegation/round2-review",
-		Repo: payload.Repo, Branch: payload.Branch, Action: "review", Agent: "reviewer2",
-		HeadSHA: payload.HeadSHA, DelegationID: "round2-review",
-	}
-	seedMergeGateFixtureAgent(t, store, "reviewer2")
-	if err := engine.allocateAndEnqueueDelegationInner(ctx, parent, payload, Delegation{ID: "round2-review", Action: "review"}, request, taskRef{}); err != nil {
-		t.Fatalf("allocateAndEnqueueDelegationInner: %v", err)
-	}
-	child, err := store.GetJob(ctx, "impl-1730b/delegation/round2-review")
-	if err != nil {
-		t.Fatalf("child job not enqueued: %v", err)
-	}
-	childPayload, err := unmarshalPayload(child.Payload)
-	if err != nil {
-		t.Fatalf("unmarshalPayload: %v", err)
-	}
-	if strings.TrimSpace(childPayload.HeadSHA) != "" {
-		t.Fatalf("an unresolvable branch kept a head known to be stale: %q", childPayload.HeadSHA)
-	}
-	events, err := store.ListJobEvents(ctx, parent.ID)
-	if err != nil {
-		t.Fatalf("ListJobEvents: %v", err)
-	}
-	var found string
-	for _, event := range events {
-		if event.Kind == "delegation_review_head_unbound" {
-			found = event.Message
-		}
-	}
-	if found == "" {
-		t.Fatal("dropping the head recorded no event, so an unbound child is indistinguishable from one that never had a head")
-	}
-	if !strings.Contains(found, shortHead(staleImplementHead)) {
-		t.Fatalf("the event does not name the head that was dropped: %q", found)
 	}
 }

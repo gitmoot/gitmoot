@@ -695,6 +695,39 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			return nil
 		}
 	}
+	// #2057 (review of the #1730 fix). A TASK-BACKED IMPLEMENTATION IS FINALIZED
+	// BEFORE ITS DELEGATIONS ARE DISPATCHED, because until the finalizer runs the
+	// produced work is NOT COMMITTED: the worktree HEAD is still the inherited
+	// pre-change commit, and a delegated review inheriting it is bound to a
+	// commit nobody produced. That is the #1730 class, and resolving the head at
+	// dispatch time cannot fix it - there is nothing to resolve yet.
+	//
+	// The finalizer is the right source rather than a git read here because it
+	// ALREADY writes the produced head: every path through
+	// daemonImplementationFinalizer sets payload.HeadSHA (commit-and-push, adopt,
+	// and existing-PR), along with Branch and PullRequest. So dispatching from
+	// the finalized payload needs no resolver at all.
+	//
+	// ORDERING CONSEQUENCE, deliberate: a finalizer that fails now prevents the
+	// delegations instead of following them. That is the safer direction - the
+	// work whose review was being delegated does not exist - and it is the same
+	// judgement the blocked/failed early-return above already makes.
+	finalizedBeforeDelegations := false
+	if job.Type == "implement" && payload.Result != nil && payload.Result.Decision == "implemented" && e.implementationNeedsFinalizer(ctx, payload) {
+		finalized, err := e.ImplementationFinalizer.FinalizeImplementation(ctx, job, payload)
+		if err != nil {
+			return err
+		}
+		encoded, err := marshalPayload(finalized)
+		if err != nil {
+			return err
+		}
+		if err := e.Store.UpdateJobPayload(ctx, job.ID, encoded); err != nil {
+			return err
+		}
+		payload = finalized
+		finalizedBeforeDelegations = true
+	}
 	if err := e.dispatchDelegations(ctx, job, payload, ref); err != nil {
 		return err
 	}
@@ -704,8 +737,13 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		if payload.Result.Decision != "implemented" {
 			return nil
 		}
-		finalizerRan := false
-		if e.implementationNeedsFinalizer(ctx, payload) {
+		// The finalizer is NOT run twice. It commits, pushes and opens or adopts a
+		// pull request, so a second call is not a harmless repeat. When the
+		// pre-delegation block above already ran it, `finalizerRan` still reports
+		// true here, because every consumer below asks "was this implementation
+		// finalized", never "was it finalized at this line".
+		finalizerRan := finalizedBeforeDelegations
+		if !finalizedBeforeDelegations && e.implementationNeedsFinalizer(ctx, payload) {
 			finalizerRan = true
 			finalized, err := e.ImplementationFinalizer.FinalizeImplementation(ctx, job, payload)
 			if err != nil {

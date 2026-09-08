@@ -710,10 +710,20 @@ func (e Engine) allocateAndEnqueueDelegationInner(ctx context.Context, job db.Jo
 	//
 	// IT WRITES A HEAD RATHER THAN CLEARING ONE. The head the child will actually
 	// review is the tip of the parent's branch, which is where that parent's work
-	// landed, so it is resolved here and recorded. Clearing would leave the
-	// verdict UNBOUND, and an unbound verdict is not the fix for a wrongly-bound
-	// one - though it IS the safer failure, so an unresolvable branch clears and
-	// says so rather than keeping a head known to be stale.
+	// landed, so it is resolved here and recorded.
+	//
+	// #2057: THE DROP ARM IS GONE, and the reorder in AdvanceJob is why. A
+	// task-backed implementation is now finalized BEFORE its delegations are
+	// dispatched, and the finalizer writes payload.HeadSHA to the produced head on
+	// every path. So an inherited head is normally CORRECT here, and an
+	// unresolvable branch no longer implies it is stale - dropping one would
+	// unbind the common case to protect the rare one, which is the wrong trade
+	// now that the common case is right.
+	//
+	// The rebind arm stays because it still has work: an implement job with NO
+	// task worktree runs no finalizer, so its payload head is still the
+	// pre-change commit, and resolving the branch tip corrects it. When the
+	// finalizer did run, resolved and inherited agree and this is a no-op.
 	if request.Action == "review" && strings.EqualFold(strings.TrimSpace(job.Type), "implement") {
 		inherited := strings.TrimSpace(request.HeadSHA)
 		resolved := ""
@@ -723,22 +733,13 @@ func (e Engine) allocateAndEnqueueDelegationInner(ctx context.Context, job db.Jo
 				resolved = strings.TrimSpace(sha)
 			}
 		}
-		switch {
-		case resolved != "" && resolved != inherited:
+		if resolved != "" && resolved != inherited {
 			request.HeadSHA = resolved
 			_ = e.recordEffectEvent(ctx, db.JobEvent{
 				JobID: job.ID,
 				Kind:  "delegation_review_head_rebound",
 				Message: fmt.Sprintf("delegation %q reviews branch %s: bound to its tip %s instead of the implement parent's dispatch head %s (#1730)",
 					request.DelegationID, branch, shortHead(resolved), shortHead(inherited)),
-			})
-		case resolved == "" && inherited != "":
-			request.HeadSHA = ""
-			_ = e.recordEffectEvent(ctx, db.JobEvent{
-				JobID: job.ID,
-				Kind:  "delegation_review_head_unbound",
-				Message: fmt.Sprintf("delegation %q could not resolve branch %q, so the implement parent's dispatch head %s was DROPPED rather than recorded as reviewed (#1730)",
-					request.DelegationID, branch, shortHead(inherited)),
 			})
 		}
 	}
