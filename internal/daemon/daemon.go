@@ -2247,6 +2247,15 @@ func (d Daemon) reconcileReviewingPullRequest(ctx context.Context, pull github.P
 			continue
 		}
 		if strings.TrimSpace(payload.HeadSHA) != pull.HeadSHA {
+			// BEHAVIOUR UNCHANGED and no head is written. A headless review
+			// still does not set hasCurrentReview, correctly: it names no head
+			// to be current AT. Until now it also left no trace of why the poll
+			// passed over it, on a path that runs every tick (#2008).
+			if reason, excluded := workflow.HeadBoundExclusion(job.ExternallyDriven, payload.HeadSHA); excluded {
+				if err := workflow.RecordHeadBoundExclusion(ctx, d.Store, job.ID, "daemon.reconcileReviewingPullRequest", reason); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 		hasCurrentReview = true
