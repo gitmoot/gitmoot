@@ -84,6 +84,18 @@ func FindRepeatedReviewers(ctx context.Context, store *db.Store, repo string, pu
 	if headSHA != "" {
 		for _, verdict := range verdicts {
 			if verdict.HeadSHA != headSHA {
+				// BEHAVIOUR IS UNCHANGED: the row is still excluded, and no head is
+				// written to it. Only the SILENCE changes. A headless verdict
+				// vanished from this index with no trace, so a reader counting
+				// at-head verdicts could not tell an absent row from an excluded
+				// one (#2008). A row at a DIFFERENT head is not this class - it has
+				// an engine-observed head and simply is not this one - so only the
+				// headless case is recorded.
+				if reason, excluded := HeadBoundExclusion(verdict.ExternallyDriven, verdict.HeadSHA); excluded {
+					if err := RecordHeadBoundExclusion(ctx, store, verdict.JobID, "review_loop.FindRepeatedReviewers", reason); err != nil {
+						return nil, err
+					}
+				}
 				continue
 			}
 			// A session review persists ActingOrgRole IN PLACE OF an agent, so the

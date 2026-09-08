@@ -259,6 +259,14 @@ type SucceededReviewVerdict struct {
 	// in workflow.ReviewerIdentity and this layer must not keep a second copy of
 	// it (#2008). A caller reading Agent alone silently drops such a row.
 	ActingOrgRole string
+	// ExternallyDriven is carried RAW for the same reason and with a sharper one:
+	// HEADLESS DOES NOT IMPLY SESSION. Measured on this box, 211 review rows have
+	// no head - 41 externally driven, 156 failed, 10 cancelled, and 4 ephemeral
+	// ask-delegation children (#1962, #1895). A consumer that reports every
+	// headless row as a self-rooted session row would commit an over-attribution
+	// while trying to improve honesty, so the distinction must reach the caller
+	// that phrases the exclusion (#2008).
+	ExternallyDriven bool
 }
 
 // SucceededReviewVerdicts returns stable approved or changes-requested review
@@ -276,7 +284,7 @@ func (s *Store) SucceededReviewVerdicts(ctx context.Context, repo string, pullRe
 		return nil, errors.New("review verdict pull request must be positive")
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, agent, payload
+SELECT id, agent, payload, externally_driven
 FROM jobs
 WHERE type = 'review' AND state = 'succeeded' AND lower(repo) = ? AND pull_request = ?
 ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
@@ -288,7 +296,8 @@ ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 	verdicts := make([]SucceededReviewVerdict, 0)
 	for rows.Next() {
 		var jobID, agent, payload string
-		if err := rows.Scan(&jobID, &agent, &payload); err != nil {
+		var externallyDriven bool
+		if err := rows.Scan(&jobID, &agent, &payload, &externallyDriven); err != nil {
 			return nil, err
 		}
 		var decoded reviewVerdictPayload
@@ -313,6 +322,7 @@ ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 			Severity:         strings.ToUpper(strings.TrimSpace(decoded.Result.Severity)),
 			EffectiveRuntime: strings.ToLower(strings.TrimSpace(decoded.EffectiveRuntime)),
 			ActingOrgRole:    strings.TrimSpace(decoded.ActingOrgRole),
+			ExternallyDriven: externallyDriven,
 		})
 	}
 	if err := rows.Err(); err != nil {
