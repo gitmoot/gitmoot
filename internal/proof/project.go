@@ -216,6 +216,20 @@ func (p *projector) factNodes(job db.Job, projection payloadProjection, result *
 	}
 	receipt := p.receipts[prKey(repo, prNumber)]
 	headSHA := firstNonBlank(projection.HeadSHA, receipt.HeadSHA)
+	if job.Type == "review" {
+		// A REVIEW ROW MAY NOT BORROW THE RECEIPT'S HEAD FOR ANY EVIDENCE NODE
+		// (#2008). The receipt fallback is legitimate for a job that CONTRIBUTED
+		// the change the pull request landed; a review contributed nothing, so a
+		// head it never recorded is not evidence about it, it is an invention.
+		//
+		// Applied to the whole local rather than only to reviewed_ref, because
+		// the commit node below is fed by the same value: fixing one and not the
+		// other would leave one manifest reporting two different heads for one
+		// row, and this change is what would have created that divergence.
+		//
+		// This is the head SOURCE only. What a commit node means is unchanged.
+		headSHA = strings.TrimSpace(projection.HeadSHA)
+	}
 
 	if result != nil && (len(result.ChangesMade) > 0 || job.ResultHash != "" || headSHA != "") {
 		attrs := map[string]string{"job_id": job.ID, "as_of": job.UpdatedAt}
@@ -586,6 +600,24 @@ func (p *projector) indexImplementers() {
 	}
 }
 
+// reviewedRef reports the ref a review row actually examined.
+//
+// IT MUST BE GIVEN A HEAD THE ROW ITSELF RECORDED (#2008). factNodes now
+// refuses the receipt fallback for review rows before this is called, so the
+// value it receives is already the row's own.
+// That local is firstNonBlank(projection.HeadSHA, receipt.HeadSHA), so for a
+// review row carrying no head it resolves to the PULL REQUEST RECEIPT's head -
+// a commit the row never recorded - and this attribute then asserted that the
+// review examined it. That is an over-attribution: the other nine head-keyed
+// consumers in #2008 OMIT a headless row, and this one INVENTED a fact about it.
+//
+// The distinction matters more than the count. A missing fact makes a reader ask
+// a question; a false one makes them stop asking, and a proof manifest is the
+// artifact people cite when they want to know what was verified.
+//
+// The receipt fallback stays legitimate for the commit node above, which is
+// evidence about the change that landed rather than a claim about what a
+// reviewer looked at.
 func (p *projector) reviewedRef(job db.Job, headSHA string) string {
 	if headSHA != "" {
 		return headSHA
