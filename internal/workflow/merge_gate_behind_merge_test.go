@@ -298,7 +298,17 @@ func TestMergeGateTreatsNumericBehindAsBehindWhateverTheStatusString(t *testing.
 func TestMergeGateWaitsWhenMergeabilityIsUnknownOnAnUpToDateHead(t *testing.T) {
 	for _, status := range []string{"ahead", "identical"} {
 		t.Run("status="+status, func(t *testing.T) {
-			gh := behindMergeGateClient(github.CompareResult{Status: status, AheadBy: 2})
+			// #2074 round three, P2: AheadBy is set PER STATUS. "identical" reports
+			// ahead_by=0 and behind_by=0 - confirmed against an exact-commit
+			// comparison - so a blanket positive value here is a tuple the API
+			// cannot emit. The adjacent acceptance test already did this
+			// conditionally and I wrote the blanket version anyway, in the same
+			// file, one round later.
+			compare := github.CompareResult{Status: status}
+			if status == "ahead" {
+				compare.AheadBy = 2
+			}
+			gh := behindMergeGateClient(compare)
 			gh.pr.Mergeable = nil
 			gh.strictKnown = true
 			gh.strictBase = true
