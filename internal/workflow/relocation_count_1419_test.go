@@ -39,7 +39,7 @@ func TestRelocationCountCountsRoundsNotFindings(t *testing.T) {
 		obs("internal/cli/a.go", "job-1", "F3"),
 		obs("internal/cli/a.go", "job-1", "F4"),
 	}
-	if got := ledgerRelocationBrief(thorough); got != "" {
+	if got := ledgerRelocationBrief(thorough, nil); got != "" {
 		t.Fatalf("four findings in ONE round were reported as relocations:\n%s", got)
 	}
 
@@ -48,7 +48,7 @@ func TestRelocationCountCountsRoundsNotFindings(t *testing.T) {
 		obs("internal/cli/a.go", "job-2", "F1"),
 		obs("internal/cli/a.go", "job-3", "F1"),
 	}
-	got := ledgerRelocationBrief(relocating)
+	got := ledgerRelocationBrief(relocating, nil)
 	if got == "" {
 		t.Fatal("three rounds that all labelled their finding F1 were not counted as three")
 	}
@@ -78,7 +78,7 @@ func TestRelocationCountIgnoresLabelsWhenCountingRounds(t *testing.T) {
 		obs("internal/cli/a.go", "job-2", "F1"),
 		obs("internal/cli/a.go", "job-3", "F1"),
 	}
-	got := ledgerRelocationBrief(repeatedLabel)
+	got := ledgerRelocationBrief(repeatedLabel, nil)
 	if !strings.Contains(got, "rounds=3") {
 		t.Fatalf("one label reused across three jobs must count as three rounds:\n%s", got)
 	}
@@ -90,7 +90,7 @@ func TestRelocationCountIgnoresLabelsWhenCountingRounds(t *testing.T) {
 		obs("internal/cli/b.go", "job-9", "L07"),
 		obs("internal/cli/b.go", "job-9", "F1"),
 	}
-	if got := ledgerRelocationBrief(oneLensRun); got != "" {
+	if got := ledgerRelocationBrief(oneLensRun, nil); got != "" {
 		t.Fatalf("five labels from ONE job were counted as five rounds:\n%s", got)
 	}
 }
@@ -103,7 +103,7 @@ func TestRelocationCountShowsLabelsWithoutCountingThem(t *testing.T) {
 		obs("internal/cli/a.go", "job-1", "F1"),
 		obs("internal/cli/a.go", "job-2", "F1"),
 		obs("internal/cli/a.go", "job-3", "F2"),
-	})
+	}, nil)
 	if !strings.Contains(got, "rounds=3") {
 		t.Fatalf("count must come from jobs:\n%s", got)
 	}
@@ -123,7 +123,7 @@ func TestRelocationCountCountsUnlabelledRounds(t *testing.T) {
 		obs("internal/cli/a.go", "job-1", ""),
 		obs("internal/cli/a.go", "job-2", ""),
 		obs("internal/cli/a.go", "job-3", ""),
-	})
+	}, nil)
 	if !strings.Contains(got, "rounds=3") {
 		t.Fatalf("three unlabelled jobs must count as three rounds:\n%s", got)
 	}
@@ -140,7 +140,7 @@ func TestRelocationCountStaysSilentBelowTheThreshold(t *testing.T) {
 		obs("internal/cli/a.go", "job-1", "F1"),
 		obs("internal/cli/a.go", "job-2", "F2"),
 	}
-	if got := ledgerRelocationBrief(two); got != "" {
+	if got := ledgerRelocationBrief(two, nil); got != "" {
 		t.Fatalf("two rounds triggered a relocation warning:\n%s", got)
 	}
 }
@@ -154,7 +154,7 @@ func TestRelocationCountAttributesPerFileAndSkipsUnattributableRows(t *testing.T
 		obs("internal/cli/b.go", "job-2", "F1"),
 		obs("internal/cli/c.go", "job-3", "F1"),
 	}
-	if got := ledgerRelocationBrief(spread); got != "" {
+	if got := ledgerRelocationBrief(spread, nil); got != "" {
 		t.Fatalf("three rounds across three DIFFERENT files were reported as relocation in one:\n%s", got)
 	}
 
@@ -165,7 +165,7 @@ func TestRelocationCountAttributesPerFileAndSkipsUnattributableRows(t *testing.T
 		obs("internal/cli/a.go", "job-1", "F1"),
 		obs("internal/cli/a.go", "job-2", "F2"),
 	}
-	if got := ledgerRelocationBrief(fileless); got != "" {
+	if got := ledgerRelocationBrief(fileless, nil); got != "" {
 		t.Fatalf("fileless rows pushed a two-round file over the threshold:\n%s", got)
 	}
 
@@ -179,7 +179,71 @@ func TestRelocationCountAttributesPerFileAndSkipsUnattributableRows(t *testing.T
 		obs("internal/cli/a.go", "job-2", "F2"),
 		obs("internal/cli/a.go", "", "F3"),
 	}
-	if got := ledgerRelocationBrief(joblessBesideReal); got != "" {
+	if got := ledgerRelocationBrief(joblessBesideReal, nil); got != "" {
 		t.Fatalf("a row with no observing job pushed two real rounds over the threshold:\n%s", got)
+	}
+}
+
+// #2066 round two. A REVIEW ROUND THAT FANS OUT IS ONE ROUND. Routine dispatch to
+// several reviewers, and a high-risk lens splitting into children, give every job
+// the SAME ReviewRound. Counting jobs would render rounds=3 for a single round.
+func TestRelocationCountCollapsesFanOutWithinOneReviewRound(t *testing.T) {
+	fanOut := []db.ReviewFindingObservation{
+		obs("internal/cli/a.go", "lens-1", "F1"),
+		obs("internal/cli/a.go", "lens-2", "F2"),
+		obs("internal/cli/a.go", "lens-3", "F3"),
+	}
+	rounds := map[string]string{"lens-1": "review-1", "lens-2": "review-1", "lens-3": "review-1"}
+	if got := ledgerRelocationBrief(fanOut, rounds); got != "" {
+		t.Fatalf("three fan-out jobs in ONE review round were counted as three rounds:\n%s", got)
+	}
+
+	// Three ROUNDS, each fanned out to two jobs, is still three relocations: the
+	// collapse must be per round, not a blanket de-duplication.
+	threeRounds := []db.ReviewFindingObservation{
+		obs("internal/cli/a.go", "j1a", "F1"), obs("internal/cli/a.go", "j1b", "F2"),
+		obs("internal/cli/a.go", "j2a", "F1"), obs("internal/cli/a.go", "j2b", "F2"),
+		obs("internal/cli/a.go", "j3a", "F1"), obs("internal/cli/a.go", "j3b", "F2"),
+	}
+	spread := map[string]string{
+		"j1a": "review-1", "j1b": "review-1",
+		"j2a": "review-2", "j2b": "review-2",
+		"j3a": "review-3", "j3b": "review-3",
+	}
+	got := ledgerRelocationBrief(threeRounds, spread)
+	if !strings.Contains(got, "rounds=3") {
+		t.Fatalf("three fanned-out rounds must count as three:\n%s", got)
+	}
+}
+
+// THE FALLBACK MUST NOT COLLAPSE UNKNOWN ROUNDS TOGETHER. Measured on this store,
+// zero of 198 observing jobs carry a ReviewRound, so keying on the round alone
+// would put every observation in one empty bucket and hide every relocation.
+func TestRelocationCountFallsBackToTheJobWhenTheRoundIsUnknown(t *testing.T) {
+	unknown := []db.ReviewFindingObservation{
+		obs("internal/cli/a.go", "job-1", "F1"),
+		obs("internal/cli/a.go", "job-2", "F1"),
+		obs("internal/cli/a.go", "job-3", "F1"),
+	}
+	for _, rounds := range []map[string]string{
+		nil,
+		{"job-1": "", "job-2": "", "job-3": ""},
+		{"job-1": "   ", "job-2": "", "job-3": ""},
+	} {
+		got := ledgerRelocationBrief(unknown, rounds)
+		if !strings.Contains(got, "rounds=3") {
+			t.Fatalf("an unknown round collapsed three separate rounds into one (rounds=%v):\n%s", rounds, got)
+		}
+	}
+
+	// A MIXED population is the real store: some jobs carry a round, some do not.
+	// The known ones collapse, the unknown ones stay distinct, and the total is 2.
+	mixedPop := []db.ReviewFindingObservation{
+		obs("internal/cli/b.go", "lens-1", "F1"),
+		obs("internal/cli/b.go", "lens-2", "F2"),
+		obs("internal/cli/b.go", "solo", "F1"),
+	}
+	if got := ledgerRelocationBrief(mixedPop, map[string]string{"lens-1": "review-9", "lens-2": "review-9"}); got != "" {
+		t.Fatalf("one fanned-out round plus one unknown-round job is two rounds, not three:\n%s", got)
 	}
 }

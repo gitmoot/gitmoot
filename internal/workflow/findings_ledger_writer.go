@@ -580,7 +580,7 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 	// that returned early on an empty obligation list would hide exactly the case
 	// the issue is about - a lane converging on nothing while every round looks
 	// like progress.
-	relocations := ledgerRelocationBrief(observations)
+	relocations := ledgerRelocationBrief(observations, e.reviewRoundsForObservations(ctx, observations))
 	if len(pending) == 0 {
 		return relocations
 	}
@@ -625,6 +625,41 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 	return b.String() + relocations
 }
 
+// reviewRoundsForObservations maps each observing job to its logical ReviewRound
+// (#2066 round two). It is BEST EFFORT by design: an unreadable or absent job
+// yields no entry, and the caller then counts that observation by its job id,
+// which is the pre-existing behaviour rather than a silent loss.
+//
+// The read is bounded by the number of DISTINCT observing jobs on one pull
+// request - nine at the maximum in this store - not by observations, so a PR
+// with many findings per round costs one lookup per round rather than per row.
+func (e Engine) reviewRoundsForObservations(ctx context.Context, observations []db.ReviewFindingObservation) map[string]string {
+	if e.Store == nil {
+		return nil
+	}
+	rounds := make(map[string]string)
+	for _, obs := range observations {
+		job := strings.TrimSpace(obs.ObserverJob)
+		if job == "" {
+			continue
+		}
+		if _, seen := rounds[job]; seen {
+			continue
+		}
+		rounds[job] = ""
+		row, err := e.Store.GetJob(ctx, job)
+		if err != nil {
+			continue
+		}
+		payload, err := unmarshalPayload(row.Payload)
+		if err != nil {
+			continue
+		}
+		rounds[job] = strings.TrimSpace(payload.ReviewRound)
+	}
+	return rounds
+}
+
 // ledgerRelocationThreshold is the round count at which a file stops looking
 // like progress and starts looking like a defect being chased.
 //
@@ -654,7 +689,7 @@ const ledgerRelocationThreshold = 3
 // It reports and never blocks. The issue asks for the count to exist, and the
 // judgement it informs - stop patching and state a contract - is a design
 // decision a human makes with it, not one a gate can take.
-func ledgerRelocationBrief(observations []db.ReviewFindingObservation) string {
+func ledgerRelocationBrief(observations []db.ReviewFindingObservation, roundOf map[string]string) string {
 	// THE ROUND IS THE OBSERVING JOB, NOT THE REVIEWER'S LABEL (#2066 review of
 	// #1419). review_findings.go:20-26 states the invariant this originally
 	// broke: reviewers number findings PER ROUND starting at 1, so RoundLabel
@@ -684,6 +719,31 @@ func ledgerRelocationBrief(observations []db.ReviewFindingObservation) string {
 			continue
 		}
 		job := strings.TrimSpace(obs.ObserverJob)
+		// #2066 round two. THE COUNTING KEY IS THE LOGICAL ROUND WHEN ONE IS
+		// KNOWN, and the observing job only when it is not. A review round can
+		// fan out - routine dispatch to several reviewers, or a high-risk lens
+		// splitting into two or three children - and every one of those jobs
+		// carries the SAME ReviewRound. Keyed on the job alone, three lenses
+		// reporting on one file in review-1 would render rounds=3 before any
+		// second round existed, which is the false positive this brief is
+		// designed not to produce.
+		//
+		// Measured on this store before choosing the fallback, because the
+		// remedy has to work on the data that exists: ZERO of 198 observing jobs
+		// carry a non-empty ReviewRound, so keying on the round ALONE would put
+		// every observation in one empty bucket and collapse every genuine round
+		// into one - the deflation defect of the first version, at maximum. And
+		// the hazard has no instance here yet: across 115 consecutive
+		// job-to-job gaps on multi-job files, NONE is under 15 minutes and the
+		// smallest is 16.7, so today's multi-job files are separated rounds
+		// rather than fan-out.
+		//
+		// So the round wins when present and the job is the fallback. Today that
+		// is exactly the previous behaviour; the moment ReviewRound is populated,
+		// fan-out collapses correctly with no further change.
+		if round := strings.TrimSpace(roundOf[job]); round != "" {
+			job = round
+		}
 		if job == "" {
 			// No attributable round. Counting it as its own would let unattributed
 			// rows manufacture relocations; folding it into a shared bucket would
