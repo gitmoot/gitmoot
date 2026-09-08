@@ -97,11 +97,22 @@ func LoadStagedReview(paths Paths) ([]StagedReview, error) {
 // StagedReviewVerdictAgent reports the declared verdict-stage agent for a repo
 // and whether one was declared at all.
 //
-// The bool is the whole point: a caller must be able to tell "declared nothing"
-// from "declared an empty string", because the first is a refusal with a clear
-// remedy and the second is a config error. Both return declared=false here, and
-// LoadStagedReview drops the empty case so they arrive identically - but the
-// caller still has to branch on the bool rather than on emptiness, or an
+// THE BOOL MEANS "a usable agent name was declared", and nothing finer. An
+// absent declaration and an explicitly empty one BOTH return declared=false,
+// deliberately: LoadStagedReview drops the empty case, so the two are
+// indistinguishable by the time a caller sees them.
+//
+// That collapse is the fail-safe direction - staging is off by default and an
+// empty name cannot dispatch anything, so treating it as undeclared refuses
+// rather than half-configures. The cost is that a typo which empties the value
+// reads as "never configured".
+//
+// #2026's review raised this as a P3: the prior version of this comment claimed
+// the bool separated those two cases and called the second a config error, which
+// the implementation does not do. THE COMMENT WAS WRONG, NOT THE CODE, and it is
+// corrected here rather than the behaviour changed.
+//
+// Callers must still branch on the bool rather than on emptiness, or an
 // undeclared repo silently becomes a repo with an unnamed agent.
 func StagedReviewVerdictAgent(paths Paths, repo string) (string, bool, error) {
 	wanted := strings.TrimSpace(repo)
