@@ -1227,7 +1227,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			// unattributed and refused it BEFORE the independence check ever ran, so a
 			// role could never approve anything - and the role's own self-approval was
 			// never even tested for. Agent still wins whenever present.
-			reviewer := effectiveReviewerIdentityName(review.job, review.payload)
+			reviewer, reviewerFromRole := effectiveReviewerIdentity(review.job, review.payload)
 			if JobState(review.job.State) != JobSucceeded {
 				return fmt.Errorf("reviewer %s at evaluated head has unusable job state %s (job %s)", reviewer, review.job.State, review.job.ID)
 			}
@@ -1274,7 +1274,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 						selfApprovalReason = fmt.Sprintf("latest review round's approval was authored by %s, the implementing agent; an independent reviewer is required", reviewer)
 					}
 					if selfApprovalReason == "" {
-						sameFamily, familyReason, err := g.sameRuntimeFamilyAsImplementer(ctx, review.job.ID, reviewer, review.payload.EffectiveRuntime, implementingAgents)
+						sameFamily, familyReason, err := g.sameRuntimeFamilyAsImplementer(ctx, review.job.ID, reviewer, reviewerFromRole, review.payload.EffectiveRuntime, implementingAgents)
 						if err != nil {
 							return err
 						}
@@ -1351,7 +1351,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if effectiveReviewDecisionForPayload(payload, request.ReviewBlockingSeverity) == "approved" {
 			// Same rule, same helper (#1950 F4): the latest-round arm resolved identity
 			// separately, which is the fourth copy that ruling 126350 removes.
-			reviewerAgent := effectiveReviewerIdentityName(job, payload)
+			reviewerAgent, reviewerFromRole := effectiveReviewerIdentity(job, payload)
 			switch {
 			case reviewerAgent == "":
 				if unattributedReviewerReason == "" {
@@ -1370,7 +1370,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 					}
 					continue
 				}
-				sameFamily, familyReason, err := g.sameRuntimeFamilyAsImplementer(ctx, job.ID, reviewerAgent, payload.EffectiveRuntime, implementingAgents)
+				sameFamily, familyReason, err := g.sameRuntimeFamilyAsImplementer(ctx, job.ID, reviewerAgent, reviewerFromRole, payload.EffectiveRuntime, implementingAgents)
 				if err != nil {
 					return err
 				}
@@ -2654,8 +2654,25 @@ func parseRepoFullName(value string) (github.Repository, error) {
 // whose runtime nothing records cannot be shown not to. The observation row is
 // still written, so the reason survives past the decision.
 func (g PolicyMergeGate) sameRuntimeFamilyAsImplementer(ctx context.Context, reviewJobID string, reviewer string,
-	reviewerRuntime string, implementers map[string]implementerIdentity) (bool, string, error) {
+	reviewerFromActingRole bool, reviewerRuntime string, implementers map[string]implementerIdentity) (bool, string, error) {
 	if g.Store == nil || strings.TrimSpace(reviewer) == "" || len(implementers) == 0 {
+		return false, "", nil
+	}
+	// A ROLE IS OUTSIDE THIS PREDICATE'S DOMAIN, NOT AN UNRESOLVED VALUE WITHIN IT
+	// (#2004). A role-authored review is a human session (#1916): there is no
+	// runtime family to share with anyone, so comparing families is a category
+	// error rather than a missing measurement.
+	//
+	// THE FLAG IS PLUMBED EXPLICITLY AND IS NEVER INFERRED FROM AN EMPTY FAMILY.
+	// An unregistered AGENT also resolves to no family, and that case must keep
+	// failing closed; deciding this on "the family came back empty" would collapse
+	// the two and reopen the hole this change closes.
+	//
+	// This is a domain exclusion rather than an exemption because every other
+	// independence check still binds a role: the caller tests
+	// implementingAgents[reviewer] BEFORE reaching here, so a role approving its
+	// own implementation is still refused on identity. That arm has its own test.
+	if reviewerFromActingRole {
 		return false, "", nil
 	}
 	reviewerFamily, ok, err := ResolveRuntimeFamily(ctx, g.Store, reviewJobID, reviewer, reviewerRuntime)

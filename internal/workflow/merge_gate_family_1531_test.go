@@ -36,7 +36,7 @@ func TestMergeGateRefusesASameFamilyApprovalWithADifferentAgentName(t *testing.T
 	implementers := map[string]implementerIdentity{
 		"wave-impl": {Name: "wave-impl", RecordedRuntime: "codex"},
 	}
-	same, reason, err := gate.sameRuntimeFamilyAsImplementer(ctx, "review-job", "g7-review", "codex", implementers)
+	same, reason, err := gate.sameRuntimeFamilyAsImplementer(ctx, "review-job", "g7-review", false, "codex", implementers)
 	if err != nil {
 		t.Fatalf("sameRuntimeFamilyAsImplementer: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestMergeGateAcceptsACrossFamilyApproval(t *testing.T) {
 	seedFamilyAgent(t, store, "gm-review-opus", "claude")
 	gate := PolicyMergeGate{Store: store}
 
-	same, reason, err := gate.sameRuntimeFamilyAsImplementer(ctx, "review-job", "gm-review-opus", "claude",
+	same, reason, err := gate.sameRuntimeFamilyAsImplementer(ctx, "review-job", "gm-review-opus", false, "claude",
 		map[string]implementerIdentity{"wave-impl": {Name: "wave-impl", RecordedRuntime: "codex"}})
 	if err != nil {
 		t.Fatalf("sameRuntimeFamilyAsImplementer: %v", err)
@@ -80,7 +80,7 @@ func TestMergeGateUsesTheRuntimeAJobActuallyRanOn(t *testing.T) {
 	seedFamilyAgent(t, store, "g7-review", "codex")
 	gate := PolicyMergeGate{Store: store}
 
-	same, _, err := gate.sameRuntimeFamilyAsImplementer(ctx, "review-job", "g7-review", "kimi",
+	same, _, err := gate.sameRuntimeFamilyAsImplementer(ctx, "review-job", "g7-review", false, "kimi",
 		map[string]implementerIdentity{"wave-impl": {Name: "wave-impl", RecordedRuntime: "codex"}})
 	if err != nil {
 		t.Fatalf("sameRuntimeFamilyAsImplementer: %v", err)
@@ -113,7 +113,7 @@ func TestMergeGateRecordsAnUnresolvableFamilyRatherThanClaimingAClean(t *testing
 	// refusing then would have blocked the native review fanout. #2004 removed
 	// that objection by making the fanout's own ephemeral legs resolvable, so what
 	// remains here is a genuinely unknown family, and the gate now refuses it.
-	same, reason, err := gate.sameRuntimeFamilyAsImplementer(ctx, "review-job", "lens-ephemeral-abc", "",
+	same, reason, err := gate.sameRuntimeFamilyAsImplementer(ctx, "review-job", "lens-ephemeral-abc", false, "",
 		map[string]implementerIdentity{"wave-impl": {Name: "wave-impl", RecordedRuntime: "codex"}})
 	if err != nil {
 		t.Fatalf("sameRuntimeFamilyAsImplementer: %v", err)
