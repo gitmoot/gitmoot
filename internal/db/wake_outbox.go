@@ -460,13 +460,17 @@ ORDER BY created_at, id`, args
 // them. Each transition and its audit event share one transaction, so a crash
 // cannot silently resolve the obligation without recording the policy outcome.
 func (s *Store) ExpireAgedWakeOutbox(ctx context.Context, attemptedBefore, at time.Time) ([]WakeOutboxEntry, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	// #1911: a transaction's contended waits are its first write and its COMMIT,
+	// so its budget is two acquisitions, not one.
+	writeCtx, cancel := s.durableWriteContext(ctx, 2)
+	defer cancel()
+	tx, err := s.db.BeginTx(writeCtx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	rows, err := tx.QueryContext(ctx, `
+	rows, err := tx.QueryContext(writeCtx, `
 SELECT id, source_kind, source_id, target_role, coalesce_key, state,
 	attempt_count, last_error, created_at, COALESCE(attempted_at, ''),
 	COALESCE(finished_at, ''), updated_at
@@ -523,7 +527,7 @@ ORDER BY attempted_at, id`,
 		} else {
 			seenSurvivor[group] = entry.ID
 		}
-		result, err := tx.ExecContext(ctx, `
+		result, err := tx.ExecContext(writeCtx, `
 UPDATE wake_outbox
 SET state = ?, last_error = ?, finished_at = ?, updated_at = ?
 WHERE id = ? AND state = 'attempted' AND attempted_at <= ?`,
@@ -549,7 +553,7 @@ WHERE id = ? AND state = 'attempted' AND attempted_at <= ?`,
 			"source=%s:%s target_role=%s attempted_at=%s policy=expire_without_retry",
 			entry.SourceKind, entry.SourceID, entry.TargetRole, entry.AttemptedAt,
 		)
-		if _, err := tx.ExecContext(ctx,
+		if _, err := tx.ExecContext(writeCtx,
 			`INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`,
 			fmt.Sprintf("wake-outbox:%d", entry.ID),
 			WakeOutboxDeliveryUnknownEventKind,
@@ -588,12 +592,16 @@ WHERE state = 'pending' AND id IN (`, ids, at)
 	if err != nil {
 		return false, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	// #1911: a transaction's contended waits are its first write and its COMMIT,
+	// so its budget is two acquisitions, not one.
+	writeCtx, cancel := s.durableWriteContext(ctx, 2)
+	defer cancel()
+	tx, err := s.db.BeginTx(writeCtx, nil)
 	if err != nil {
 		return false, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	result, err := tx.ExecContext(ctx, query, args...)
+	result, err := tx.ExecContext(writeCtx, query, args...)
 	if err != nil {
 		return false, err
 	}
@@ -633,13 +641,17 @@ func (s *Store) FinishOrRetryWakeOutbox(
 	if len(ids) == 0 {
 		return false, 0, errors.New("wake outbox outcome requires at least one id")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	// #1911: a transaction's contended waits are its first write and its COMMIT,
+	// so its budget is two acquisitions, not one.
+	writeCtx, cancel := s.durableWriteContext(ctx, 2)
+	defer cancel()
+	tx, err := s.db.BeginTx(writeCtx, nil)
 	if err != nil {
 		return false, 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
 	var role string
-	if err := tx.QueryRowContext(ctx,
+	if err := tx.QueryRowContext(writeCtx,
 		`SELECT attempt_count, target_role FROM wake_outbox WHERE id = ?`, ids[0],
 	).Scan(&attempts, &role); err != nil {
 		return false, 0, err
@@ -676,7 +688,7 @@ WHERE state = 'attempted' AND id IN (`, ids, at, state, strings.TrimSpace(cause)
 		role, strings.TrimSpace(cause), attempts, state,
 	)
 	for _, id := range ids {
-		if _, err := tx.ExecContext(ctx,
+		if _, err := tx.ExecContext(writeCtx,
 			`INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`,
 			fmt.Sprintf("wake-outbox:%d", id),
 			WakeOutboxDeliveryFailedEventKind,
@@ -731,15 +743,53 @@ func (s *Store) FinishWakeOutbox(ctx context.Context, ids []int64, state, detail
 		return fmt.Errorf("invalid terminal wake outbox state %q", state)
 	}
 	if state == WakeOutboxStateDelivered && len(ids) > 1 {
-		if err := s.finishWakeOutboxRows(ctx, ids[1:], WakeOutboxStateSuperseded, WakeOutboxCoalescedDetail(ids[0]), at); err != nil {
+		// ONE TRANSACTION, for two independent reasons that happen to share a
+		// remedy (#1911).
+		//
+		// Correctness: as two separate statements, a survivor write that did
+		// not land left the collapsed rows `superseded` naming a row that was
+		// never delivered - wakes dropped with nothing carrying their
+		// obligation, which is exactly what #1978 promised could not happen.
+		//
+		// Budget: two statements are two contended lock acquisitions, and
+		// DurableWriteBudget covers one. A transaction takes the lock at its
+		// first write and holds it to COMMIT, so the contended waits are the
+		// first statement and the commit rather than one per statement.
+		writeCtx, cancel := s.durableWriteContext(ctx, 2)
+		defer cancel()
+		tx, err := s.db.BeginTx(writeCtx, nil)
+		if err != nil {
 			return err
 		}
-		return s.finishWakeOutboxRows(ctx, ids[:1], state, detail, at)
+		defer func() { _ = tx.Rollback() }()
+		if err := finishWakeOutboxRowsTx(writeCtx, tx, ids[1:], WakeOutboxStateSuperseded, WakeOutboxCoalescedDetail(ids[0]), at); err != nil {
+			return err
+		}
+		if err := finishWakeOutboxRowsTx(writeCtx, tx, ids[:1], state, detail, at); err != nil {
+			return err
+		}
+		return tx.Commit()
 	}
 	return s.finishWakeOutboxRows(ctx, ids, state, detail, at)
 }
 
 func (s *Store) finishWakeOutboxRows(ctx context.Context, ids []int64, state, detail string, at time.Time) error {
+	writeCtx, cancel := s.durableWriteContext(ctx, 1)
+	defer cancel()
+	return finishWakeOutboxRowsExec(writeCtx, s.db, ids, state, detail, at)
+}
+
+func finishWakeOutboxRowsTx(ctx context.Context, tx *sql.Tx, ids []int64, state, detail string, at time.Time) error {
+	return finishWakeOutboxRowsExec(ctx, tx, ids, state, detail, at)
+}
+
+// wakeOutboxExecer is the shared shape of *sql.DB and *sql.Tx, so the finish
+// statement has ONE definition whether or not it runs inside a transaction.
+type wakeOutboxExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func finishWakeOutboxRowsExec(ctx context.Context, execer wakeOutboxExecer, ids []int64, state, detail string, at time.Time) error {
 	query, args, err := wakeOutboxIDUpdate(`
 UPDATE wake_outbox
 SET state = ?, last_error = ?, finished_at = ?, updated_at = ?
@@ -747,7 +797,7 @@ WHERE state = 'attempted' AND id IN (`, ids, at, state, strings.TrimSpace(detail
 	if err != nil {
 		return err
 	}
-	result, err := s.db.ExecContext(ctx, query, args...)
+	result, err := execer.ExecContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
