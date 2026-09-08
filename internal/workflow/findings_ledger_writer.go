@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -573,8 +574,15 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 		return ""
 	}
 	pending := LedgerObligationsAtHead(ctx, observations, head, e.ledgerScopeFor(repo, pullRequest, taskID))
+	// #1419: the relocation count is computed from the FULL observation history
+	// and rendered even when nothing is pending. Six rounds that were each
+	// correctly fixed and fully discharged are still six relocations, so a brief
+	// that returned early on an empty obligation list would hide exactly the case
+	// the issue is about - a lane converging on nothing while every round looks
+	// like progress.
+	relocations := ledgerRelocationBrief(observations)
 	if len(pending) == 0 {
-		return ""
+		return relocations
 	}
 	var b strings.Builder
 	b.WriteString("\n\nPRIOR FINDINGS ON THIS PR THAT YOU MUST OBSERVE AT THIS HEAD (#1822 findings ledger).\n")
@@ -614,6 +622,84 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 			b.WriteString("    (that row predates the severity requirement and carries none; treat it as unranked and blocking until you observe it)\n")
 		}
 	}
+	return b.String() + relocations
+}
+
+// ledgerRelocationThreshold is the round count at which a file stops looking
+// like progress and starts looking like a defect being chased.
+//
+// Three comes from the incident #1419 records: the coordinator had a written
+// "stop at three relocations" rule and it fired at SIX, because noticing was
+// left to a human counting across rounds while every success signal fired
+// normally. The number is the one that was already agreed and never enforced.
+const ledgerRelocationThreshold = 3
+
+// ledgerRelocationBrief counts, per file, how many DISTINCT review rounds have
+// recorded a finding against it on this pull request, and renders a warning for
+// any file at or past the threshold.
+//
+// #1419: "Gitmoot counts rounds of work. It does not count how many times the
+// same defect came back." The data was already here - review_finding_observations
+// carries repo, pull_request, file and round_label - and nothing read it that
+// way, so the most expensive failure mode in a review loop was structurally
+// invisible. Measured on this store: 26 (repo, pr, file) groups carry findings
+// across more than one round, and the worst is 16 distinct rounds on
+// internal/cli/review_phase_instrument.go alone - the issue's own instance was six.
+//
+// A DISTINCT ROUND is the unit, not a finding count: three findings in one round
+// is a thorough review, and one finding in each of three rounds is a defect that
+// keeps coming back. Collapsing those would report a careful reviewer as a
+// relocation problem.
+//
+// It reports and never blocks. The issue asks for the count to exist, and the
+// judgement it informs - stop patching and state a contract - is a design
+// decision a human makes with it, not one a gate can take.
+func ledgerRelocationBrief(observations []db.ReviewFindingObservation) string {
+	rounds := map[string]map[string]struct{}{}
+	for _, obs := range observations {
+		file := strings.TrimSpace(obs.File)
+		if file == "" {
+			// A finding with no file cannot be attributed to a vessel, so it cannot
+			// evidence relocation WITHIN one. Counting it would inflate every file.
+			continue
+		}
+		label := strings.TrimSpace(obs.RoundLabel)
+		if label == "" {
+			label = "(unlabelled)"
+		}
+		if rounds[file] == nil {
+			rounds[file] = map[string]struct{}{}
+		}
+		rounds[file][label] = struct{}{}
+	}
+	var files []string
+	for file, labels := range rounds {
+		if len(labels) >= ledgerRelocationThreshold {
+			files = append(files, file)
+		}
+	}
+	if len(files) == 0 {
+		return ""
+	}
+	sort.Strings(files)
+	var b strings.Builder
+	b.WriteString("\n\nDEFECT RELOCATION COUNT ON THIS PR (#1419).\n")
+	b.WriteString("Each line is a file that has carried findings across SEVERAL DISTINCT ROUNDS. That is not the\n")
+	b.WriteString("same as a thorough review: three findings in one round is thoroughness, one finding in each of\n")
+	b.WriteString("three rounds is a defect that keeps coming back somewhere else in the same file.\n")
+	for _, file := range files {
+		labels := make([]string, 0, len(rounds[file]))
+		for label := range rounds[file] {
+			labels = append(labels, label)
+		}
+		sort.Strings(labels)
+		b.WriteString(fmt.Sprintf("  %s  rounds=%d  [%s]\n", file, len(labels), strings.Join(labels, " ")))
+	}
+	b.WriteString("At this count, WEIGH STATING A CONTRACT over patching again: ask what invariant the code is\n")
+	b.WriteString("hand-approximating, and whether the next divergence comes from an unbounded set. A fix that\n")
+	b.WriteString("closes one divergence out of many is a ladder with no top, and a defect appearing in the\n")
+	b.WriteString("OPPOSITE direction - a false refusal after a false acceptance - is the signal the vessel is\n")
+	b.WriteString("wrong rather than the code. This is a report, not a block: nothing here refuses your verdict.\n")
 	return b.String()
 }
 
