@@ -187,6 +187,17 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 			e.recordLedgerDowngrade(ctx, job.ID, index, declared, obs.State, reason)
 			downgrades++
 		}
+		// #2069 f1: TWO ANSWERS THAT DISAGREE ARE NOW AUDIBLE TOO. `state` still
+		// wins over `disposition` - the precedence is unchanged and defensible -
+		// but it used to win SILENTLY, which made this the one reversal in this
+		// file a reviewer could not learn about from the ledger. The sibling
+		// event above (#1936) set the standard; this closes the last case that
+		// did not meet it.
+		if wireState, wireDisposition := strings.TrimSpace(wire.State), strings.TrimSpace(wire.Disposition); wireState != "" &&
+			wireDisposition != "" &&
+			!strings.EqualFold(wireState, wireDisposition) {
+			e.recordLedgerStateConflict(ctx, job.ID, index, wireState, wireDisposition)
+		}
 	}
 	// THE SUMMARY EVENT IS BEST-EFFORT AND ITS FAILURE MUST NOT FAIL THE REVIEW.
 	// Returning it would hand AdvanceJob an error, and AdvanceJob's caller treats
@@ -612,6 +623,22 @@ func ledgerStateDowngrade(declared db.FindingState, obs db.ReviewFindingObservat
 	default:
 		return true, "recorded state differs from the declared one"
 	}
+}
+
+// recordLedgerStateConflict makes a two-answer disagreement audible (#2069 f1).
+// It does NOT change which answer wins: `state` still takes precedence. It
+// removes the case where the losing answer vanished with no trace, which is the
+// one shape a reviewer cannot debug from the ledger alone.
+func (e Engine) recordLedgerStateConflict(ctx context.Context, jobID string, index int, state string, disposition string) {
+	if e.Store == nil {
+		return
+	}
+	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID: jobID,
+		Kind:  "findings_ledger_state_conflict",
+		Message: fmt.Sprintf("finding[%d] declared state %q and disposition %q; state wins",
+			index, state, disposition),
+	})
 }
 
 func (e Engine) recordLedgerDowngrade(ctx context.Context, jobID string, index int, declared db.FindingState, recorded db.FindingState, reason string) {
