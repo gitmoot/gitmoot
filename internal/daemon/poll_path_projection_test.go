@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -35,6 +36,10 @@ func seedLargeNonReviewJob(t *testing.T, store *db.Store) {
 
 func seedReviewJob(t *testing.T, store *db.Store, repo, id, headSHA string, state workflow.JobState, result *workflow.AgentResult) {
 	t.Helper()
+	// #2004: see the note in dbtest.SeedGateFixtureAgent - the merge gate now
+	// needs a resolvable runtime family for the agents a fixture names.
+	dbtest.SeedGateFixtureAgent(t, store, "audit")
+	dbtest.SeedGateFixtureAgent(t, store, "lead")
 	payload, err := json.Marshal(workflow.JobPayload{
 		Repo:        repo,
 		Branch:      "task-7",

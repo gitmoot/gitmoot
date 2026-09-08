@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -317,6 +318,11 @@ func runBranchlessQueuedMergeTerminalPolls(t *testing.T, terminal github.PullReq
 		AutoMerge: true, Store: store, GitHub: client, Git: postMergeGit,
 		Worktrees: worktrees, NextTasks: nextTasks,
 	}
+	// #2004: the merge gate resolves a runtime FAMILY and fails closed when it
+	// cannot. Seeded here rather than at testStore, because a package-wide seed
+	// also registers agents for tests that model an ABSENT or unscoped one -
+	// measured: it turned four unrelated poll tests red.
+	dbtest.SeedGateFixtureAgent(t, store, "reviewer")
 	engine := workflow.Engine{Store: store, MergeGate: gate, RequiredReviewers: []string{"reviewer"}}
 	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
 

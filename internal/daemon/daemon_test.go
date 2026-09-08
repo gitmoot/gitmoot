@@ -1734,6 +1734,13 @@ func newSkippedFanoutPendingGateDaemon(t *testing.T, initialState workflow.TaskS
 	t.Helper()
 	ctx := context.Background()
 	store := testStore(t)
+	// #2004: the merge gate resolves a runtime FAMILY for the reviewer and every
+	// recorded implementer and fails closed when it cannot. This fixture names an
+	// agent and never registered one, which is a shape production does not have.
+	// Seeded here rather than at testStore, because a package-wide seed also
+	// registers agents for tests that deliberately model an ABSENT or unscoped
+	// one - measured: it turned four unrelated poll tests red.
+	dbtest.SeedGateFixtureAgent(t, store, "audit")
 	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
 	if err := store.UpsertTask(ctx, db.Task{
 		ID:           "task-7",

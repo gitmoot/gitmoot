@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
@@ -79,42 +80,14 @@ func newMergeGateQuorumScenario(t *testing.T) (*db.Store, *fakeMergeGateGitHub, 
 	return store, gh, gate, request
 }
 
-// seedMergeGateFixtureAgent registers a fixture agent on a runtime family OF ITS
-// OWN (#2004). These tests were written against a gate that compared agent
-// NAMES, so they implicitly assume two differently-named agents are independent.
-// Once the gate resolves families and fails closed on an unresolvable one, that
-// assumption has to be stated rather than implied: one family per name preserves
-// every existing expectation, while an unregistered agent would now block.
-//
-// Deliberately idempotent and name-derived, so a test that wants a SHARED family
-// still gets one by upserting the two agents onto the same runtime itself.
+// seedMergeGateFixtureAgent delegates to the SHARED helper (#2004). It stays as
+// a one-line wrapper only because this package's fixtures call it in a dozen
+// places; the rule itself - one family per name, and never register a synthetic
+// agent - lives in dbtest, so internal/cli and internal/daemon get the same one
+// instead of a third copy that drifts.
 func seedMergeGateFixtureAgent(t *testing.T, store *db.Store, name string) {
 	t.Helper()
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return
-	}
-	// Never register a SYNTHETIC agent. Temp and ephemeral agents are absent from
-	// the production registry by design, and #2004's parent recovery is the thing
-	// that resolves them; a fixture that registers one resolves it directly and
-	// silently stops exercising the walk.
-	if _, _, isTemp := splitTempAgentName(name); isTemp || strings.Contains(name, ephemeralAgentInfix) {
-		return
-	}
-	if _, err := store.GetAgent(context.Background(), name); err == nil {
-		return
-	}
-	if err := store.UpsertAgent(context.Background(), db.Agent{
-		Name:           name,
-		Role:           "agent",
-		Runtime:        "rt-" + name,
-		RepoScope:      "gitmoot/gitmoot",
-		Capabilities:   []string{"review", "implement"},
-		AutonomyPolicy: "auto",
-		HealthStatus:   "ok",
-	}); err != nil {
-		t.Fatalf("UpsertAgent(%s) returned error: %v", name, err)
-	}
+	dbtest.SeedGateFixtureAgent(t, store, name)
 }
 
 func insertMergeGateReviewFixture(t *testing.T, store *db.Store, fixture mergeGateReviewFixture) {
