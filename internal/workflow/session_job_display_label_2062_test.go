@@ -154,8 +154,14 @@ func TestLabellingDoesNotPromoteTheHeadIntoThePayload(t *testing.T) {
 // while two existed. Each regexp repair bought one shape; this buys the class.
 //
 // Parsing also removes the reader/writer confusion a text scan cannot make:
-// merge_gate.go and job_review_status.go legitimately COMPARE this constant, and
+// internal/cli/job_review_status.go legitimately COMPARES this constant, and
 // only an assignment or a struct-literal field is a write.
+//
+// #2070 f4: that sentence used to name merge_gate.go as well. It does not
+// reference this constant at all - measured with grep over non-test files, which
+// returns job_review_status.go and session_job.go and nothing else. A comment
+// citing a file that does not participate is the same defect class as a record
+// asserting what it cannot evidence, in the cheapest possible place.
 func writesTheDisplayKind(t *testing.T, path string, source []byte) bool {
 	t.Helper()
 	file, err := parser.ParseFile(token.NewFileSet(), path, source, 0)
