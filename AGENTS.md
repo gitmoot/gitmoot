@@ -55,19 +55,42 @@ infrastructure rather than the documented boundary they are:
   sandbox denies the C header above. Its absence from a review verdict is not a
   regression, and the boundary is the `ReadOnlySeat` marker, not the kind of
   clone you hold. Do not trust an enumeration of the sites, including one written
-  here: get it from
-  `git grep -n 'ReadOnlySeat.*true' origin/main -- 'internal/*/*.go'`, and note
-  that the pattern matches two different things - the dispatch sites that SET the
-  marker on a request, payload or agent, and `applyReadOnlySeat`, which applies it
-  to a session. Under that marker the daemon computes read-only sandbox grants
-  through `readOnlyRuntimeSandboxGrants`, which resolves the isolated tool cache
-  and the staged toolchain; the sandboxing itself is applied by the runtime layer
-  and is not this function's job. A session that is **not** a `ReadOnlySeat`, is
+  here:
+
+  ```sh
+  git grep -n 'ReadOnlySeat.*true' origin/main -- 'internal/*/*.go' ':!*_test.go'
+  ```
+
+  Nine hits on `7a63a37e`, and read them rather than counting them: the pattern
+  matches sites that SET the marker on a request, payload or agent, the
+  `applyReadOnlySeat` call that applies it to a session, and one COMMENT
+  (`internal/cli/daemon_worker.go:1642`) that names isolated shell pipeline stages
+  as carriers. Dropping `':!*_test.go'` returns 67, which is the fixtures talking.
+  Under the marker the daemon assembles the read-only grant environment in
+  `readOnlyRuntimeSandboxGrants` and enforcement is installed separately, by
+  `landlockRuntimeRunner` wrapping the job's runner in a
+  `subprocess.WrappingRunner` that carries the readable, writable and
+  read-only-workdir values. Read those two functions; a summary of what they grant
+  is exactly the kind of enumeration this bullet just told you not to trust. A session that is **not** a `ReadOnlySeat`, is
   permitted to run Bash by its autonomy policy, and has the C toolchain and
   headers available can execute race-enabled tests: measured on this host,
   `CGO_ENABLED=1 go test -race ./internal/db/` returns `ok`. Owning a checkout is
   not the predicate and neither is being "a seat"; a restrictive autonomy policy
   blocks Bash regardless.
+
+When a seat's plain `go` returns 126, no usable toolchain was staged. The command
+is an engine-owned failure stub, never a fallthrough to the operator's `go`.
+An absent `go` on the daemon `PATH` is silent; an unpinned source, copy failure,
+or unsafe path prints `gitmoot: read-only seat toolchain:` on daemon stderr,
+never in job events. `/opt`, `/usr/local`, `/nix/store`, `/snap`, and profile
+installations all take the same daemon-owned copy path; none retains a recursive
+host-root grant. See `docs/troubleshooting.md`, "`Permission denied`, exit 126,
+running Go".
+
+**Race runs on this host, for any session, not only a seat.** These two rules are
+general and a read-only review seat cannot act on either, which is why they sit
+outside the list above:
+
 - **A local race run is a scoped PROBE, never the lane.** The lane is the
   partitioned recipe below, and reproducing it takes `-tags e2e` (see the race
   block): without the tag the compile silently drops 33 tagged `internal/cli`
@@ -88,15 +111,6 @@ infrastructure rather than the documented boundary they are:
   each observes. No experiment here establishes a direction for that effect, so
   treat it as an unquantified risk to an assurance run rather than as a proven
   false-clean mechanism. Check for a live `-race` binary before starting one.
-
-When a seat's plain `go` returns 126, no usable toolchain was staged. The command
-is an engine-owned failure stub, never a fallthrough to the operator's `go`.
-An absent `go` on the daemon `PATH` is silent; an unpinned source, copy failure,
-or unsafe path prints `gitmoot: read-only seat toolchain:` on daemon stderr,
-never in job events. `/opt`, `/usr/local`, `/nix/store`, `/snap`, and profile
-installations all take the same daemon-owned copy path; none retains a recursive
-host-root grant. See `docs/troubleshooting.md`, "`Permission denied`, exit 126,
-running Go".
 
 Run from the repo root and make these pass before committing — they mirror the CI
 gate in `.github/workflows/ci.yml`:
