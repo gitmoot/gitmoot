@@ -490,7 +490,14 @@ func (e Engine) ReviewObligationBrief(ctx context.Context, repo string, pullRequ
 // place the producer is already listening, so it is where the accepted set
 // belongs. A reviewer whose text was dropped can now see why in the same event
 // that reports the drop, instead of the next reader being written for them.
-var ledgerContentKeys = []string{"title", "summary", "detail", "body", "rationale"}
+// MEASURED, ONE KEY AT A TIME, NOT ASSUMED. Each of these ALONE rescues a
+// finding. `rationale` is deliberately NOT here even though it is finding text
+// and the store's own ErrFindingNoConcern names it: obs.Rationale is copied only
+// on the STATIC arm, which requires a `file`, so a rationale by itself reaches
+// the store empty and is refused for having no rationale. Advertising it would
+// send a reviewer to a key that does not work on its own - the precise failure
+// this change exists to stop.
+var ledgerContentKeys = []string{"title", "summary", "detail", "body"}
 
 func ledgerContentKeyList() string {
 	return strings.Join(ledgerContentKeys, ", ")

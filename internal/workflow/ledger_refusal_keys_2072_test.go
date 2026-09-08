@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -114,6 +115,11 @@ func TestFindingWithContentIsNotRefused(t *testing.T) {
 var ledgerNonContentKeys = []string{
 	"id", "severity", "file", "continues_uid", "state", "disposition",
 	"evidence_kind", "evidence_locator", "locator", "location", "withdraw_reason",
+	// rationale IS finding text, but it cannot rescue a finding on its own: it is
+	// copied only on the STATIC arm, which needs a file. Listed here so the
+	// classification test passes for the right reason and the refusal never
+	// advertises it.
+	"rationale",
 	"evidence", "lens",
 }
 
@@ -147,5 +153,25 @@ func TestEveryWireStringFieldIsClassified(t *testing.T) {
 				"ledgerNonContentKeys. If the reader takes finding text from it, the refusal must "+
 				"advertise it or #2072 returns; if not, list it as non-content.", field.Name, name)
 		}
+	}
+}
+
+// THE ADVERTISEMENT MUST BE TRUE OF EACH KEY ALONE.
+//
+// This is the test that caught the bug in my own fix: the first version
+// advertised `rationale`, and a rationale-only finding is REFUSED, because
+// obs.Rationale is copied only on the STATIC arm (which requires a file). A
+// refusal that names a key which does not work is worse than the silence it
+// replaced - it sends the reviewer to a second failure.
+func TestEveryAdvertisedKeyAloneRescuesAFinding(t *testing.T) {
+	for _, key := range ledgerContentKeys {
+		t.Run(key, func(t *testing.T) {
+			raw := json.RawMessage(fmt.Sprintf(`{"severity":"P3","%s":"the boundary check is inverted"}`, key))
+			for _, event := range refuseContentlessFinding(t, raw) {
+				if event.Kind == "findings_ledger_refused" {
+					t.Fatalf("the refusal advertises %q, but a finding carrying only %q was refused: %s", key, key, event.Message)
+				}
+			}
+		})
 	}
 }
