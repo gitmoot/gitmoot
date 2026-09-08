@@ -89,10 +89,23 @@ func TestAdvertisedKeysExistOnTheWire(t *testing.T) {
 			tags[name] = true
 		}
 	}
-	for _, key := range append(append([]string{}, ledgerContentKeys...), ledgerConditionalContentKeys...) {
+	// #2078 f3: EVERY CLASSIFIED KEY, not only the advertised ones. This test
+	// used to check the content keys alone, so a PHANTOM entry in the non-content
+	// list was invisible - and there was one: "disposition", which is a real wire
+	// field on the #2069 branch and does not exist here. A classification list
+	// naming a field that does not exist gives false confidence in exactly the
+	// direction this file is about: it looks like a decision was made about a
+	// field, and no such field was ever there.
+	//
+	// The three directions now all hold: every tag is classified (below), every
+	// classified key is a tag (here), and every advertised key rescues a finding.
+	all := append(append(append([]string{}, ledgerContentKeys...),
+		ledgerConditionalContentKeys...), ledgerNonContentKeys...)
+	for _, key := range all {
 		if !tags[key] {
-			t.Fatalf("refusal advertises %q, which is not a json tag on reviewFindingWire; "+
-				"the message would send reviewers to a key the reader ignores", key)
+			t.Fatalf("%q is classified but is not a json tag on reviewFindingWire; either the "+
+				"refusal would send reviewers to a key the reader ignores, or the classification "+
+				"records a decision about a field that does not exist", key)
 		}
 	}
 }
@@ -113,7 +126,7 @@ func TestFindingWithContentIsNotRefused(t *testing.T) {
 // identity, classification, and locators. Named explicitly so the classification
 // test below is a decision rather than a filter.
 var ledgerNonContentKeys = []string{
-	"id", "severity", "file", "continues_uid", "state", "disposition", "evidence_kind", "evidence_locator", "locator", "location", "withdraw_reason", "line", "relevance_keys", "lens", "evidence",
+	"id", "severity", "file", "continues_uid", "state", "evidence_kind", "evidence_locator", "locator", "location", "withdraw_reason", "line", "relevance_keys", "lens", "evidence",
 }
 
 // THE REVERSE DRIFT, which the advertised-keys test alone does not catch.
