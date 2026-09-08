@@ -31,6 +31,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
 
 permissions:
   contents: read
@@ -58,6 +59,7 @@ jobs:
       - name: Classify
         id: diff
         run: |
+          # A merge_group entry takes this branch DELIBERATELY (queue tests the merged result, so no lane may skip); no merge_group case is missing below.
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "push to main — full gate"
