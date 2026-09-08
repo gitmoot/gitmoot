@@ -195,11 +195,27 @@ func (s *Store) ListDashboardUnlabeledJobs(ctx context.Context, since string) ([
 	return out, rows.Err()
 }
 
+// PhaseProfileEventKind is the diagnostic job event carrying a review's
+// command-phase accounting (#1824). It lives here rather than in internal/cli
+// because the operator-facing fallbacks that must EXCLUDE it are SQL in this
+// package: a diagnostic row appended after a job's terminal event would
+// otherwise be shown to an operator as the reason a job is blocked.
+const PhaseProfileEventKind = "phase_profile"
+
+// diagnosticJobEventKinds are event kinds that describe a job's MEASUREMENT
+// rather than its state. Any query that shows an operator "the latest thing
+// that happened" must exclude them, or accounting JSON is displayed where an
+// actionable blocker belongs (#1824 review F6: a blocked-review probe returned
+// the profile JSON as the Needs You card's reason).
+const diagnosticJobEventKinds = `('` + PhaseProfileEventKind + `')`
+
 func (s *Store) ListDashboardBlockedJobs(ctx context.Context) ([]DashboardJobRow, error) {
 	out, err := queryList(ctx, s.db, `SELECT j.id, j.agent, j.state, j.workflow_id, j.repo,
 		j.payload, j.created_at, j.updated_at,
 		COALESCE(NULLIF(j.blocker_suggested_action, ''),
-			(SELECT e.message FROM job_events e WHERE e.job_id = j.id ORDER BY e.id DESC LIMIT 1), '')
+			(SELECT e.message FROM job_events e WHERE e.job_id = j.id
+				AND e.kind NOT IN `+diagnosticJobEventKinds+`
+				ORDER BY e.id DESC LIMIT 1), '')
 	FROM jobs j WHERE j.state = 'blocked' ORDER BY j.updated_at DESC, j.id`, nil,
 		func(row rowScanner) (DashboardJobRow, error) {
 			var item DashboardJobRow

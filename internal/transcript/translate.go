@@ -127,7 +127,7 @@ func (t *codexTranslator) Translate(line string) []Event {
 		case "":
 			return rawEvent(line)
 		default:
-			return []Event{{Kind: KindToolCall, Name: event.ItemType, InputDigest: compactJSON(event.ItemRaw)}}
+			return []Event{{Kind: KindToolCall, ToolID: event.ItemID, Name: event.ItemType, InputDigest: compactJSON(event.ItemRaw)}}
 		}
 	case "turn.completed":
 		duration := elapsed(t.turnStarted, t.now())
@@ -147,7 +147,7 @@ func (*codexTranslator) Flush() []Event { return nil }
 func (t *codexTranslator) startTool(id, name, input string) Event {
 	presentation := classifyTool(name)
 	t.tools[id] = pendingTool{name: name, presentation: presentation, started: t.now()}
-	return toolCallEvent(name, input, presentation)
+	return toolCallEvent(id, name, input, presentation)
 }
 
 func (t *codexTranslator) finishTool(id, fallbackName, status, output string) Event {
@@ -157,7 +157,7 @@ func (t *codexTranslator) finishTool(id, fallbackName, status, output string) Ev
 	} else {
 		pending = pendingTool{name: fallbackName, presentation: classifyTool(fallbackName)}
 	}
-	return toolResultEvent(pending, status, output, t.now())
+	return toolResultEvent(id, pending, status, output, t.now())
 }
 
 type kimiTranslator struct {
@@ -184,7 +184,7 @@ func (t *kimiTranslator) Translate(line string) []Event {
 			if call.Type == "function" {
 				presentation := classifyTool(call.Function.Name)
 				t.tools[call.ID] = pendingTool{name: call.Function.Name, presentation: presentation, started: t.now()}
-				events = append(events, toolCallEvent(call.Function.Name, call.Function.Arguments, presentation))
+				events = append(events, toolCallEvent(call.ID, call.Function.Name, call.Function.Arguments, presentation))
 			}
 		}
 		if event.ContentText != "" {
@@ -197,7 +197,7 @@ func (t *kimiTranslator) Translate(line string) []Event {
 		} else {
 			pending = pendingTool{name: "tool", presentation: classifyTool("tool")}
 		}
-		events = append(events, toolResultEvent(pending, "tool", event.ContentText, t.now()))
+		events = append(events, toolResultEvent(event.ToolCallID, pending, "tool", event.ContentText, t.now()))
 	case "meta":
 		if event.Type == "session.resume_hint" {
 			events = append(events, Event{Kind: KindLifecycle, Phase: "session", Detail: "resume hint reported"})
@@ -246,13 +246,14 @@ func (t *claudeTranslator) Flush() []Event {
 	return events
 }
 
-func toolCallEvent(name, input string, presentation toolPresentation) Event {
-	return Event{Kind: KindToolCall, Name: name, ToolIcon: presentation.icon, Preview: presentation.preview, PreviewLines: presentation.previewLines, InputDigest: input}
+func toolCallEvent(id, name, input string, presentation toolPresentation) Event {
+	return Event{Kind: KindToolCall, ToolID: id, Name: name, ToolIcon: presentation.icon, Preview: presentation.preview, PreviewLines: presentation.previewLines, InputDigest: input}
 }
 
-func toolResultEvent(tool pendingTool, status, output string, now time.Time) Event {
+func toolResultEvent(id string, tool pendingTool, status, output string, now time.Time) Event {
 	return Event{
 		Kind:         KindToolResult,
+		ToolID:       id,
 		Name:         tool.name,
 		ToolIcon:     tool.presentation.icon,
 		Preview:      tool.presentation.preview,
