@@ -203,3 +203,93 @@ func TestFailedFinalizerOnADelegationChildAdvancesNoParent(t *testing.T) {
 		t.Fatalf("the failed finalizer still enqueued %d job(s) through the parent DAG: before=%d after=%d", len(after)-len(before), len(before), len(after))
 	}
 }
+
+// #2057 ROUND THREE, P1. THE FINALIZER DECISION IS DURABLE, so a retry of
+// AdvanceJob after any later failure does not run it again. It commits, pushes
+// and opens or adopts a pull request; a second run is not a harmless repeat.
+func TestFinalizedImplementationIsNotFinalizedAgainOnRetry(t *testing.T) {
+	ctx := context.Background()
+	engine, store := newOrderingFixture(t)
+
+	finalized := orderingParentPayload()
+	finalized.HeadSHA = orderingProducedHead
+	counter := &countingFinalizer{payload: finalized}
+	engine.ImplementationFinalizer = counter
+
+	insertCompletedJob(t, store, db.Job{ID: "impl-retry", Agent: "lead", Type: "implement"}, orderingParentPayload())
+	if err := engine.AdvanceJob(ctx, "impl-retry"); err != nil {
+		t.Fatalf("first AdvanceJob: %v", err)
+	}
+	if counter.calls != 1 {
+		t.Fatalf("first advance called the finalizer %d times, want 1", counter.calls)
+	}
+
+	// The marker must have been PERSISTED, not merely held in the local variable.
+	row, err := store.GetJob(ctx, "impl-retry")
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	stored, err := unmarshalPayload(row.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload: %v", err)
+	}
+	if !stored.ImplementationFinalized {
+		t.Fatal("the finalized marker was not persisted, so a retry cannot know the work is already committed and pushed")
+	}
+
+	// Re-advance, as the daemon does after a later transient failure.
+	if err := engine.AdvanceJob(ctx, "impl-retry"); err != nil {
+		t.Fatalf("re-advance: %v", err)
+	}
+	if counter.calls != 1 {
+		t.Fatalf("the finalizer ran %d times across two advances: it commits, pushes and opens a PR, so the repeat is not harmless", counter.calls)
+	}
+}
+
+// FAIL CLOSED ON AN UNREADABLE TASK, AND ONLY THERE. implementationNeedsFinalizer
+// used to turn EVERY task lookup error into "no finalizer needed", so a transient
+// failure let the parent DAG and the delegations advance from work that was never
+// committed, and repeated failures ran the finalizer zero times.
+//
+// The two error cases are different facts and are asserted separately. A missing
+// row ANSWERS the question - this job is not task-backed - while a failed query
+// answers nothing. My first fix conflated them and three pre-existing tests
+// caught it, because it made every ad-hoc implement job attempt a finalizer.
+func TestUnreadableTaskDoesNotReadAsNeedingNoFinalizer(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a query that fails answers nothing, so fail closed", func(t *testing.T) {
+		engine, store := newOrderingFixture(t)
+		engine.ImplementationFinalizer = fakeImplementationFinalizer{}
+		// A CLOSED store is the smallest real transient failure: GetTask returns an
+		// error that is not ErrNoRows. A nonexistent task id cannot express this -
+		// it is the missing-row case - which is why my first version of this test
+		// asserted the wrong thing and passed.
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+		if !engine.implementationNeedsFinalizer(ctx, orderingParentPayload()) {
+			t.Fatal("an unreadable task read as needing no finalizer: the parent DAG and delegations would advance from uncommitted work")
+		}
+	})
+
+	t.Run("a missing task row answers the question, so stay false", func(t *testing.T) {
+		engine, _ := newOrderingFixture(t)
+		engine.ImplementationFinalizer = fakeImplementationFinalizer{}
+		payload := orderingParentPayload()
+		payload.TaskID = "task-that-does-not-exist"
+		if engine.implementationNeedsFinalizer(ctx, payload) {
+			t.Fatal("an absent task row was treated as a lookup failure, so every ad-hoc implement job would attempt a finalizer")
+		}
+	})
+
+	t.Run("no task at all is not task-backed", func(t *testing.T) {
+		engine, _ := newOrderingFixture(t)
+		engine.ImplementationFinalizer = fakeImplementationFinalizer{}
+		payload := orderingParentPayload()
+		payload.TaskID = ""
+		if engine.implementationNeedsFinalizer(ctx, payload) {
+			t.Fatal("a job with no TaskID was treated as task-backed")
+		}
+	})
+}

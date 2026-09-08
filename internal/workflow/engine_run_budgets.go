@@ -603,12 +603,25 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	// delegations instead of following them. That is the safer direction - the
 	// work whose review was being delegated does not exist - and it is the same
 	// judgement the blocked/failed early-return above already makes.
-	finalizedBeforeDelegations := false
-	if job.Type == "implement" && payload.Result != nil && payload.Result.Decision == "implemented" && e.implementationNeedsFinalizer(ctx, payload) {
+	// #2057 round three, P1: THE DECISION IS MADE ONCE AND RECORDED. Eligibility
+	// used to be re-derived at three separate sites from a task lookup that can
+	// fail independently at each one, so a failure after a SUCCESSFUL finalizer
+	// could classify the payload as never finalized and drop the head the
+	// finalizer had just produced, and a retry after any later failure ran the
+	// finalizer again - it commits, pushes and opens a pull request, so a second
+	// run is not a harmless repeat.
+	//
+	// payload.ImplementationFinalized is the durable answer. It is persisted with
+	// the finalized payload in the same UpdateJobPayload write, so a retry reads
+	// it rather than re-deriving it.
+	finalizedBeforeDelegations := payload.ImplementationFinalized
+	if job.Type == "implement" && payload.Result != nil && payload.Result.Decision == "implemented" &&
+		!payload.ImplementationFinalized && e.implementationNeedsFinalizer(ctx, payload) {
 		finalized, err := e.ImplementationFinalizer.FinalizeImplementation(ctx, job, payload)
 		if err != nil {
 			return err
 		}
+		finalized.ImplementationFinalized = true
 		encoded, err := marshalPayload(finalized)
 		if err != nil {
 			return err
@@ -755,13 +768,14 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		// pre-delegation block above already ran it, `finalizerRan` still reports
 		// true here, because every consumer below asks "was this implementation
 		// finalized", never "was it finalized at this line".
-		finalizerRan := finalizedBeforeDelegations
-		if !finalizedBeforeDelegations && e.implementationNeedsFinalizer(ctx, payload) {
+		finalizerRan := finalizedBeforeDelegations || payload.ImplementationFinalized
+		if !finalizerRan && e.implementationNeedsFinalizer(ctx, payload) {
 			finalizerRan = true
 			finalized, err := e.ImplementationFinalizer.FinalizeImplementation(ctx, job, payload)
 			if err != nil {
 				return err
 			}
+			finalized.ImplementationFinalized = true
 			encoded, err := marshalPayload(finalized)
 			if err != nil {
 				return err

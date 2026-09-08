@@ -194,7 +194,12 @@ func TestDelegatedReviewKeepsTheFinalizedHeadWhenTheBranchWillNotResolve(t *test
 	engine.ImplementationFinalizer = fakeImplementationFinalizer{}
 
 	parent := db.Job{ID: "impl-fin", Agent: "appkit-omp", Type: "implement", State: string(JobSucceeded)}
-	payload := JobPayload{Repo: "themartianapp/appkit", Branch: "adhoc-fin", HeadSHA: producedHead, TaskID: "task-fin"}
+	// #2057 round three: "the finalizer produced this head" is now DURABLE STATE
+	// on the payload rather than something re-derived from a task lookup at read
+	// time. This fixture previously relied on that re-derivation, which is
+	// exactly the coupling the finding removed.
+	payload := JobPayload{Repo: "themartianapp/appkit", Branch: "adhoc-fin", HeadSHA: producedHead, TaskID: "task-fin",
+		ImplementationFinalized: true}
 	request := JobRequest{
 		ID: "impl-fin/delegation/round2-review", Repo: payload.Repo, Branch: payload.Branch,
 		Action: "review", Agent: "reviewer", HeadSHA: payload.HeadSHA, DelegationID: "round2-review",
@@ -214,5 +219,74 @@ func TestDelegatedReviewKeepsTheFinalizedHeadWhenTheBranchWillNotResolve(t *test
 	}
 	if childPayload.HeadSHA != producedHead {
 		t.Fatalf("child head = %q, want the finalizer's produced head %q kept", childPayload.HeadSHA, producedHead)
+	}
+}
+
+// #2057 round three, P1. AN UNCHANGED RESOLVE IS NOT A RESOLVE on the
+// no-finalizer path. RevParse succeeding and returning the SAME sha left both
+// arms silent - nonempty so not dropped, equal so not rebound - so the row kept
+// the pre-change commit this path documents. The earlier regression covered only
+// resolver FAILURE.
+func TestDelegatedReviewDropsAnUnchangedHeadOnTheNoFinalizerPath(t *testing.T) {
+	ctx := context.Background()
+	resolver := &fakeHeadResolver{heads: map[string]string{"adhoc-same": staleImplementHead}}
+	engine, store := newDelegatedReviewFixture(t, resolver)
+
+	parent := db.Job{ID: "impl-same", Agent: "appkit-omp", Type: "implement", State: string(JobSucceeded)}
+	payload := JobPayload{Repo: "themartianapp/appkit", Branch: "adhoc-same", HeadSHA: staleImplementHead}
+	request := JobRequest{
+		ID: "impl-same/delegation/round2-review", Repo: payload.Repo, Branch: payload.Branch,
+		Action: "review", Agent: "reviewer", HeadSHA: payload.HeadSHA, DelegationID: "round2-review",
+	}
+	seedMergeGateFixtureAgent(t, store, "reviewer")
+	if err := engine.allocateAndEnqueueDelegationInner(ctx, parent, payload, Delegation{ID: "round2-review", Action: "review"}, request, taskRef{}); err != nil {
+		t.Fatalf("allocateAndEnqueueDelegationInner: %v", err)
+	}
+
+	child, err := store.GetJob(ctx, "impl-same/delegation/round2-review")
+	if err != nil {
+		t.Fatalf("child job not enqueued: %v", err)
+	}
+	childPayload, err := unmarshalPayload(child.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload: %v", err)
+	}
+	if childPayload.HeadSHA == staleImplementHead {
+		t.Fatal("a resolve that returned the inherited sha left the pre-change head recorded as reviewed")
+	}
+	if childPayload.HeadSHA != "" {
+		t.Fatalf("child head = %q, want it dropped", childPayload.HeadSHA)
+	}
+}
+
+// The equality case must NOT drop when a finalizer produced the head: there the
+// branch tip and the produced head agreeing is the CORRECT outcome, not evidence
+// of staleness.
+func TestDelegatedReviewKeepsAnUnchangedHeadWhenAFinalizerProducedIt(t *testing.T) {
+	ctx := context.Background()
+	resolver := &fakeHeadResolver{heads: map[string]string{"adhoc-fin2": producedHead}}
+	engine, store := newDelegatedReviewFixture(t, resolver)
+
+	parent := db.Job{ID: "impl-fin2", Agent: "appkit-omp", Type: "implement", State: string(JobSucceeded)}
+	payload := JobPayload{Repo: "themartianapp/appkit", Branch: "adhoc-fin2", HeadSHA: producedHead,
+		TaskID: "task-fin2", ImplementationFinalized: true}
+	request := JobRequest{
+		ID: "impl-fin2/delegation/round2-review", Repo: payload.Repo, Branch: payload.Branch,
+		Action: "review", Agent: "reviewer", HeadSHA: payload.HeadSHA, DelegationID: "round2-review",
+	}
+	seedMergeGateFixtureAgent(t, store, "reviewer")
+	if err := engine.allocateAndEnqueueDelegationInner(ctx, parent, payload, Delegation{ID: "round2-review", Action: "review"}, request, taskRef{}); err != nil {
+		t.Fatalf("allocateAndEnqueueDelegationInner: %v", err)
+	}
+	child, err := store.GetJob(ctx, "impl-fin2/delegation/round2-review")
+	if err != nil {
+		t.Fatalf("child job not enqueued: %v", err)
+	}
+	childPayload, err := unmarshalPayload(child.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload: %v", err)
+	}
+	if childPayload.HeadSHA != producedHead {
+		t.Fatalf("child head = %q, want the produced head %q kept", childPayload.HeadSHA, producedHead)
 	}
 }

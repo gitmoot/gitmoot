@@ -744,7 +744,11 @@ func (e Engine) allocateAndEnqueueDelegationInner(ctx context.Context, job db.Jo
 		//
 		// The discriminator is the same predicate the engine uses to decide
 		// whether to finalize at all, so the two halves cannot disagree.
-		producedByFinalizer := e.implementationNeedsFinalizer(ctx, payload)
+		// #2057 round three, P1: READ THE DURABLE MARKER. Re-deriving eligibility
+		// here meant a task lookup failing at THIS moment could classify a payload
+		// the finalizer had already produced as unfinalized, and then drop the
+		// produced head as if it were the pre-change one.
+		producedByFinalizer := payload.ImplementationFinalized
 		switch {
 		case resolved != "" && resolved != inherited:
 			request.HeadSHA = resolved
@@ -754,7 +758,15 @@ func (e Engine) allocateAndEnqueueDelegationInner(ctx context.Context, job db.Jo
 				Message: fmt.Sprintf("delegation %q reviews branch %s: bound to its tip %s instead of the implement parent's dispatch head %s (#1730)",
 					request.DelegationID, branch, shortHead(resolved), shortHead(inherited)),
 			})
-		case resolved == "" && inherited != "" && !producedByFinalizer:
+		// #2057 round three, P1: AN UNCHANGED RESOLVE IS NOT A RESOLVE on this
+		// path. When RevParse succeeded and returned the SAME sha as the inherited
+		// one, neither arm used to fire: nonempty so not dropped, equal so not
+		// rebound. The head stayed the pre-change commit this path documents, and
+		// a lone review child - which allocates no worktree, because the fan-out
+		// branch needs two or more siblings - reads the shared checkout while the
+		// row records an ancestor. Equality is therefore treated as unresolved
+		// unless a finalizer produced the head.
+		case (resolved == "" || resolved == inherited) && inherited != "" && !producedByFinalizer:
 			request.HeadSHA = ""
 			_ = e.recordEffectEvent(ctx, db.JobEvent{
 				JobID: job.ID,
