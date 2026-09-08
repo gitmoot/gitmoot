@@ -1707,6 +1707,11 @@ have no enabled rule is reported as `NO ROUTE` with its oldest timestamp, which
 is how a fleet discovers obligations that are waiting on configuration rather
 than on a tick.
 
+A pending row whose kind and role have no enabled rule additionally records a
+`wake_unroutable` job event once per row, naming role, kind, source and whether
+the route was removed (a retired seat) or never configured (a gap a route would
+close), so `NO ROUTE` here has a durable, queryable counterpart.
+
 Event-rule wakes are separately opt-in:
 
 ```sh

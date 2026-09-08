@@ -952,6 +952,155 @@ func TestReplyWakeOutboxReadFailureLogsUnhealthyWithoutAbortingFleetTick(t *test
 	}
 }
 
+// TestUnroutableWakeIsRecordedOncePerRow covers the owner decision of
+// 2026-09-08: a wake addressed to a role that cannot receive it must be
+// findable in one query rather than sitting silently queued. On the live fleet
+// that silence hid 49 awaited-fact obligations from 2026-08-02 and ten
+// escalations addressed to a coordinator whose wake routes had been removed.
+//
+// Rerouting was deliberately NOT the remedy chosen: it would rebuild the
+// coordinator layer that was just retired. This records, and wakes nobody.
+func TestUnroutableWakeIsRecordedOncePerRow(t *testing.T) {
+	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{
+		{"owner", "w1:p1"},
+		{"stranded", "w1:p2"},
+	})
+	ctx := context.Background()
+	// The harness gives every role a reply rule, so removing this one leaves a
+	// role that is configured, paned, and unreachable for `reply`.
+	if err := store.DeleteEventRule(ctx, "reply-1"); err != nil {
+		t.Fatal(err)
+	}
+	note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "release/unroutable", Author: "worker", Body: "nobody can receive this",
+		AddressedTarget: "stranded",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending = %+v, err=%v", pending, err)
+	}
+	rowID := pending[0].ID
+	// STAMPED, not left to wall-clock ordering. workflow_notes.created_at has
+	// millisecond precision while event_rule_deletions.deleted_at has
+	// nanosecond precision, so a rule deleted microseconds BEFORE this row can
+	// still compare as deleted after it and read as a retirement. Production
+	// separates the two by seconds or days; a test has to say which it means.
+	setWakeOutboxCreatedAt(t, store.DatabasePath(), fmt.Sprint(note.ID), time.Now().UTC().Add(time.Minute))
+
+	// Two drains: the condition is re-observed every tick, and the record must
+	// not grow with the ticks. A per-tick append is what took job_events past a
+	// million rows.
+	// An INERT row is deliberately not a drain fault (#1758: inert is permanent,
+	// logged once, and an operator adding a rule later resolves it). That is
+	// exactly why it needed a durable record: the tick is healthy and the
+	// obligation is invisible.
+	for range 2 {
+		if err := drainReplyWakeAfterAllRowsAreDueResult(t, store, sink); err != nil {
+			t.Fatalf("inert drain = %v, want a healthy tick; inert is not a fault", err)
+		}
+	}
+	if wake.promptCalls != 0 {
+		t.Fatalf("an unroutable wake reached a pane: %v", wake.prompts)
+	}
+
+	events, err := store.ListJobEvents(ctx, fmt.Sprintf("wake-outbox:%d", rowID))
+	if err != nil || len(events) != 1 {
+		t.Fatalf("unroutable events = %+v, err=%v, want exactly one after two drains", events, err)
+	}
+	if events[0].Kind != db.WakeOutboxUnroutableEventKind {
+		t.Fatalf("event kind = %q, want %q", events[0].Kind, db.WakeOutboxUnroutableEventKind)
+	}
+	for _, want := range []string{
+		"role=stranded",
+		"kind=" + db.WakeOutboxKindReply,
+		fmt.Sprintf("source=%s:%d", db.WakeOutboxSourceWorkflowNote, note.ID),
+		"condition=" + db.WakeOutboxUnroutableNeverConfigured,
+	} {
+		if !strings.Contains(events[0].Message, want) {
+			t.Fatalf("event %q does not name %q", events[0].Message, want)
+		}
+	}
+
+	// The row is NOT failed. A wake nobody can receive is not a wake that is
+	// wrong, and a rule added later must still deliver it (#1983's refusal).
+	stillPending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
+	if err != nil || len(stillPending) != 1 || stillPending[0].ID != rowID || stillPending[0].AttemptCount != 0 {
+		t.Fatalf("row after two drains = %+v, err=%v, want it still pending and unattempted", stillPending, err)
+	}
+}
+
+// TestUnroutableWakeDistinguishesARetiredRoleFromAGap pins the distinction the
+// remedy depends on: a role whose route was DELETED after the row existed is a
+// retired seat and usually needs nothing, while a role with no route history
+// at all is the 2026-08-02 gap and needs a route.
+func TestUnroutableWakeDistinguishesARetiredRoleFromAGap(t *testing.T) {
+	store, sink, _, _ := replyWakeTestHarness(t, []replyWakeTestRole{
+		{"owner", "w1:p1"},
+		{"retired", "w1:p2"},
+	})
+	ctx := context.Background()
+	note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "release/retired", Author: "worker", Body: "addressed before the seat retired",
+		AddressedTarget: "retired",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
+	if err != nil || len(pending) != 1 || pending[0].SourceID != fmt.Sprint(note.ID) {
+		t.Fatalf("pending = %+v, err=%v", pending, err)
+	}
+	// The route existed while the row was created and is removed afterwards,
+	// which is exactly the retirement ordering.
+	if err := store.DeleteEventRule(ctx, "reply-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := drainReplyWakeAfterAllRowsAreDueResult(t, store, sink); err == nil {
+		t.Fatal("drain reported healthy while an obligation was unroutable")
+	}
+	events, err := store.ListJobEvents(ctx, fmt.Sprintf("wake-outbox:%d", pending[0].ID))
+	if err != nil || len(events) != 1 {
+		t.Fatalf("events = %+v, err=%v", events, err)
+	}
+	if !strings.Contains(events[0].Message, "condition="+db.WakeOutboxUnroutableRouteRemoved) {
+		t.Fatalf("event %q, want the retired condition rather than the never-configured gap", events[0].Message)
+	}
+}
+
+// TestRoutableWakeRecordsNoUnroutableEvent is the control. Without it, a
+// recorder that fired for every pending row would pass the tests above and
+// make the new query useless by filling it with rows that are simply waiting.
+func TestRoutableWakeRecordsNoUnroutableEvent(t *testing.T) {
+	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
+	ctx := context.Background()
+	if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "release/routable", Author: "worker", Body: "deliverable",
+		AddressedTarget: "owner",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending = %+v, err=%v", pending, err)
+	}
+	drainReplyWakeAfterAllRowsAreDue(t, store, sink)
+	if wake.promptCalls != 1 {
+		t.Fatalf("routable wake calls = %d, want 1", wake.promptCalls)
+	}
+	events, err := store.ListJobEvents(ctx, fmt.Sprintf("wake-outbox:%d", pending[0].ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Kind == db.WakeOutboxUnroutableEventKind {
+			t.Fatalf("a deliverable wake was recorded unroutable: %q", event.Message)
+		}
+	}
+}
+
 func TestReplyWakeOutboxHealthFailsClosedWhenEventRulesAreUnreadable(t *testing.T) {
 	store, _, _, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
 	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
@@ -1531,6 +1680,10 @@ func (s *countingWakeOutboxStore) ListWakeOutboxObligations(ctx context.Context,
 
 func (s *countingWakeOutboxStore) ExpireAgedWakeOutbox(ctx context.Context, attemptedBefore, now time.Time) ([]db.WakeOutboxEntry, error) {
 	return s.inner.ExpireAgedWakeOutbox(ctx, attemptedBefore, now)
+}
+
+func (s *countingWakeOutboxStore) AddJobEventIfAbsent(ctx context.Context, event db.JobEvent) error {
+	return s.inner.AddJobEventIfAbsent(ctx, event)
 }
 
 func (s *countingWakeOutboxStore) ClaimWakeOutbox(ctx context.Context, surviving int64, coalesced []int64, now time.Time) (bool, error) {
