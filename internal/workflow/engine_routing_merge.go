@@ -539,10 +539,22 @@ func (e Engine) approvalSupersedesChangesRequested(ctx context.Context, payload 
 		// Only an objection AT THE CURRENT HEAD can block: by here the approving
 		// head IS the current head, and an objection at any other head is one the
 		// current head supersedes. No ordering is needed or attempted.
-		if strings.TrimSpace(jobPayload.HeadSHA) == approvingHead {
+		objectionHead := strings.TrimSpace(jobPayload.HeadSHA)
+		if objectionHead == approvingHead {
 			return false, fmt.Sprintf(
 				"a review at head %s requested changes, so the objection stands even though this review approved the same head",
 				approvingHead), false, nil
+		}
+		// A HEADLESS objection can never equal the approving head, so it never
+		// keeps an approval from clearing - correctly, because it names no head to
+		// be current at. It did so silently (#2008). Behaviour is unchanged and no
+		// head is written; a row at another head is not this class and is not
+		// recorded.
+		if reason, excluded := HeadBoundExclusion(job.ExternallyDriven, objectionHead); excluded {
+			if err := RecordHeadBoundExclusion(ctx, e.Store, job.ID,
+				"engine_routing_merge.approvalSupersedesChangesRequested", reason); err != nil {
+				return false, "", false, err
+			}
 		}
 	}
 	return true, "", false, nil
@@ -613,7 +625,17 @@ func (e Engine) dispatchFixWhenHeadHasSettled(ctx context.Context, job db.Job, p
 		if !sameTask(payload, candidatePayload) {
 			continue
 		}
-		if strings.TrimSpace(candidatePayload.HeadSHA) != head {
+		if candidateHead := strings.TrimSpace(candidatePayload.HeadSHA); candidateHead != head {
+			// Same rule as everywhere in #2008: a headless row is not a settled or
+			// pending leg at this head, and saying so is the only change.
+			if candidate.Type == "review" {
+				if reason, excluded := HeadBoundExclusion(candidate.ExternallyDriven, candidateHead); excluded {
+					if err := RecordHeadBoundExclusion(ctx, e.Store, candidate.ID,
+						"engine_routing_merge.dispatchFixWhenHeadHasSettled", reason); err != nil {
+						return err
+					}
+				}
+			}
 			continue
 		}
 		switch candidate.Type {

@@ -560,6 +560,21 @@ repo's in-flight jobs (`0` or unset = use the global worker count), and an
 optional `scheduler = "pool"|"barrier"` overrides that repo's scheduler. The
 keys are re-read every tick, so edits apply live.
 
+`org chart` and `org status` render the provider's last completed **turn**
+alongside `seen=` (#1702). `org status --json` carries it as `last_turn`.
+
+The turn measures PROGRESS; `seen=` measures RECENCY, and they answer different
+questions - a seat can be inside one long turn with a stale note age and be
+perfectly healthy. Measured on one host, two seats read 27h and 45h by note age
+while each had completed a turn minutes earlier.
+
+`last_turn` is ABSENT rather than zero when the provider reported no turn
+activity, and the text surfaces render `-` for that case. A reported turn of `0`
+is a real value and renders as `0`; a rendered `0` for silence would invent a
+stalled seat. An unavailable role keeps its reported turn, because an
+unavailability incident says whether a role may be dispatched to, not whether
+the provider reported anything.
+
 Job kill deadlines are independent from stale-running detection. Configure the
 daemon defaults with:
 
@@ -2081,6 +2096,12 @@ and an `agent_blocked` pane are **transient**: the claimed rows return to
 bounded at three attempts. Any other cause, and an exhausted budget, end the
 rows terminally and record a `wake_delivery_failed` job event on
 `wake-outbox:<id>` naming the role, cause and attempts.
+An aged row whose delivery the store can PROVE is recorded `delivered` with a
+`wake_delivered` job event carrying `policy=resolved_by_destination_evidence`,
+rather than `delivery_unknown`. The proof is a note in the directive's own
+workflow acknowledging it (`[org:directive-ack id=<id> ...]`) or recording its
+delivery (`[org:directive-delivered id=<id> ...]`), naming that row's directive;
+a reply-class row has no equivalent marker and keeps the unknown outcome.
 `attention`, `guard`, `job-terminal`, `review-verdict`, `recycle-overdue`, and
 `pane_input_pending` wakes remain best-effort. With no rule rows this path is
 off. Task episodes due in one evaluator pass produce one oldest-first digest

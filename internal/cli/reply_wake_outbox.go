@@ -119,10 +119,26 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 		if err != nil {
 			return replyWakeOutboxHealth{}, fmt.Errorf("expire aged attempted wake outbox: %w", err)
 		}
+		// A PROVEN DELIVERY IS NOT AN UNKNOWN ONE (#1958). The sweep now resolves
+		// an aged row against destination evidence and returns the state it
+		// wrote, so only the rows it genuinely could not explain belong in this
+		// diagnostic. Counting every expired row here reported a false unknown
+		// delivery for each proven one AND drove both supervisors to log the
+		// drain unhealthy - the store-side fix stopped at the store, and this is
+		// the caller that still spoke for it.
 		if len(expired) > 0 {
+			mutated = true
+		}
+		unknown := 0
+		for _, entry := range expired {
+			if entry.State == db.WakeOutboxStateDeliveryUnknown {
+				unknown++
+			}
+		}
+		if unknown > 0 {
 			return replyWakeOutboxHealth{}, fmt.Errorf(
 				"wake outbox delivery unknown: expired %d aged attempted rows without retry",
-				len(expired),
+				unknown,
 			)
 		}
 	}
