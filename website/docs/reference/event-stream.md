@@ -253,6 +253,18 @@ unexplained non-delivery), the batch becomes terminal AND a
 `wake_delivery_failed` job event is recorded on `wake-outbox:<id>` naming the
 target role, the cause and the attempts spent, so an undelivered obligation is
 attributable from the store rather than only from a daemon log line.
+An aged-out row whose delivery the store can PROVE is recorded as `delivered`
+rather than `delivery_unknown`, with a `wake_delivered` job event on
+`wake-outbox:<id>` carrying `policy=resolved_by_destination_evidence`. The proof
+is DESTINATION EVIDENCE: a note in the directive's own workflow that
+acknowledges it (`[org:directive-ack id=<id> ...]`) or records its delivery
+(`[org:directive-delivered id=<id> ...]`). Without that check the sweep recorded
+a negative the store could disprove: a directive acknowledged two minutes after
+its row was created was still flagged undelivered 78 minutes later, and every
+instrument built on `state` and `attempt_count` then reported delivered work as
+an outstanding obligation. The evidence must name THAT row's directive and live
+in the directive's own workflow; a reply-class row has no equivalent marker, so
+it keeps the unknown outcome rather than being laundered by an absent check.
 A wake addressed to a role that CANNOT receive it, because no enabled rule
 exists for that role and kind, records a `wake_unroutable` job event on
 `wake-outbox:<id>` naming the role, the kind, the source and WHICH condition it

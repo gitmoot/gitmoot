@@ -31,12 +31,22 @@ const (
 // openRetainedTranscriptLog is side-effect-free when capture is explicitly
 // disabled. Enabled logs are canonical, private, and append-only across retries.
 // openRetainedTranscriptLog opens the append-only transcript for a job. It
-// returns only the file: every production caller writes through the handle and
-// none of them needs the path, so returning one would be a value with no
-// production reader (#1787 review F5). Tests that assert the on-disk location
-// derive it from transcript.JobLogPath, which is the same authority this
-// function uses, rather than being handed it back.
-func openRetainedTranscriptLog(home, jobID string) (*os.File, error) {
+// returns only the handle: every production caller writes through it and none
+// of them needs the path, so returning one would be a value with no production
+// reader (#1787 review F5). Tests that assert the on-disk location derive it
+// from transcript.JobLogPath, which is the same authority this function uses,
+// rather than being handed it back.
+//
+// The handle also carries #1824's phase instrument. Wrapping HERE instruments
+// every production caller at one seam, and a nil store (tests, capture paths
+// with no daemon store) leaves behavior byte-identical to a bare file.
+//
+// runtimeName is passed IN rather than resolved here: every caller already
+// holds the effective agent, and an earlier form queried the store at open
+// time, which put a DB read on the job-dispatch path purely for
+// instrumentation. An instrument must not add contention to the path it
+// measures.
+func openRetainedTranscriptLog(home, jobID, jobType, runtimeName string, attempt int64, store *db.Store) (*retainedTranscript, error) {
 	paths, err := pathsFromFlag(home)
 	if err != nil {
 		return nil, err
@@ -60,7 +70,7 @@ func openRetainedTranscriptLog(home, jobID string) (*os.File, error) {
 		_ = file.Close()
 		return nil, err
 	}
-	return file, nil
+	return newRetainedTranscript(file, jobID, jobType, runtimeName, attempt, store), nil
 }
 
 // appendDeliveryAdapterOutput adds a writer at the existing runner base instead
