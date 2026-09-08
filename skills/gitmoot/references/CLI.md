@@ -366,6 +366,12 @@ GID, workspace, start/end timestamps, and visible markers. The gate passes only
 when peak overlap is N, workspace paths are distinct, each leg sees only its own
 marker, and the isolated ledger contains zero remote execution attempts.
 
+`agent review` accepts `--skip-native-review-fanout` as well, and always did:
+the review verb shares implement's argument parser. Until #1654 the review usage
+line omitted it, so the escape hatch was undiscoverable rather than absent - pass
+it when dispatching an adversarial panel on one PR, where one fix job per
+completed review would otherwise race to push the same branch.
+
 ## Transcript Retention
 
 Runtime transcript retention is default-on. Every engine delivery appends its

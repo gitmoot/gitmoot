@@ -1016,6 +1016,12 @@ implement-advance and the daemon's GitHub PR-watcher — so a PR opened either w
 stays free of native review fan-out. The flag defaults off; leave it off for the
 full native review fan-out, which is byte-identical to prior behavior.
 
+`agent review` accepts `--skip-native-review-fanout` as well, and always did:
+the review verb shares implement's argument parser. Until #1654 the review usage
+line omitted it, so the escape hatch was undiscoverable rather than absent - pass
+it when dispatching an adversarial panel on one PR, where one fix job per
+completed review would otherwise race to push the same branch.
+
 When a synchronous `agent implement`/`run`/`ask`/`review`/`orchestrate` job
 delivers and **succeeds terminally** but a benign *post-success* advancement step
 errors — for example a merge-gate block on the freshly-opened PR, or a 422
