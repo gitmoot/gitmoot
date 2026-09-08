@@ -1215,7 +1215,12 @@ type orgStatusOutput struct {
 	// says a nil activity means the provider did not report a turn, and callers
 	// "must not treat that as a zero-valued or stale turn". Rendering nil as 0
 	// would invent a stalled seat.
-	LastTurn          *int64             `json:"last_turn,omitempty"`
+	LastTurn *int64 `json:"last_turn,omitempty"`
+	// LastTurnAge is how long ago that turn COMPLETED, which for a working seat
+	// is how long the current turn has been running. It is the half that makes
+	// the number a verdict rather than a fact, and it needs no stored prior:
+	// the provider reports the completion time itself.
+	LastTurnAge       string             `json:"last_turn_age,omitempty"`
 	LastCommand       string             `json:"last_command,omitempty"`
 	ProviderState     org.LifecycleState `json:"provider_state"`
 	ProviderDetail    string             `json:"provider_detail,omitempty"`
@@ -1371,13 +1376,13 @@ func runOrgOverview(command string, args []string, stdout, stderr io.Writer) int
 	}
 	if command == "chart" {
 		for _, row := range rows {
-			fmt.Fprintf(stdout, "%s%s · %s%s · scope=%s · merge=%s · model=%s · turn=%s · seen=%s%s\n", strings.Repeat("  ", row.Depth), row.Role, row.ProviderState, orgUnavailableFlag(row), strings.Join(row.Scope, ","), dash(row.MergeRule), dash(row.Model), orgTurnText(row.LastTurn), dash(row.LastSeenAge), orgMissedWakeFlag(row))
+			fmt.Fprintf(stdout, "%s%s · %s%s · scope=%s · merge=%s · model=%s · turn=%s/%s · seen=%s%s\n", strings.Repeat("  ", row.Depth), row.Role, row.ProviderState, orgUnavailableFlag(row), strings.Join(row.Scope, ","), dash(row.MergeRule), dash(row.Model), orgTurnText(row.LastTurn), dash(row.LastTurnAge), dash(row.LastSeenAge), orgMissedWakeFlag(row))
 		}
 		return 0
 	}
-	fmt.Fprintln(stdout, "ROLE\tSTATE\tTURN\tLAST SEEN\tAGE\tLAST COMMAND\tDETAIL\tRECYCLE")
+	fmt.Fprintln(stdout, "ROLE\tSTATE\tTURN\tTURN AGE\tLAST SEEN\tAGE\tLAST COMMAND\tDETAIL\tRECYCLE")
 	for _, row := range rows {
-		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t%s\t%s\trecycle=%s%s\n", row.Role, row.ProviderState, orgTurnText(row.LastTurn), dash(row.LastSeenAt), dash(row.LastSeenAge), dash(row.LastCommand), dash(row.ProviderDetail), firstNonEmpty(row.RecycleStatus, "off"), orgMissedWakeFlag(row))
+		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\trecycle=%s%s\n", row.Role, row.ProviderState, orgTurnText(row.LastTurn), dash(row.LastTurnAge), dash(row.LastSeenAt), dash(row.LastSeenAge), dash(row.LastCommand), dash(row.ProviderDetail), firstNonEmpty(row.RecycleStatus, "off"), orgMissedWakeFlag(row))
 	}
 	return 0
 }
