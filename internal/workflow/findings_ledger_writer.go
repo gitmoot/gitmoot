@@ -725,8 +725,8 @@ func reviewShapedResult(result *AgentResult) bool {
 	case "":
 		// No decision at all: findings are the only signal that a review happened.
 		return len(result.Findings) > 0
-	case "blocked":
-		// A BLOCKED REVIEWER THAT NAMED DEFECTS STILL REVIEWED (#2061 review, P2).
+	case "blocked", "failed":
+		// A REVIEWER THAT NAMED DEFECTS STILL REVIEWED (#2061 review, P2).
 		// review_loop.go's followUpReviewScopes treats exactly this - decision
 		// "blocked" WITH findings - as a real verdict, and refuses it without
 		// them. Matching that predicate here rather than inventing a second one
@@ -743,12 +743,17 @@ func reviewShapedResult(result *AgentResult) bool {
 	// rather than by running it, which is why no test caught it: every fixture I
 	// wrote used a review-shaped decision.
 	//
-	// "failed" IS DELIBERATELY NOT HERE, which is NARROWER THAN THE REVIEW ASKED
-	// FOR. They proposed blocked OR failed. review_loop.go names only "blocked",
-	// and every "failed" decision I can find is ENGINE-GENERATED rather than
-	// reviewer-authored - engine_run_budgets.go:104 constructs one. Admitting it
-	// would promote an engine-authored terminal state to a review verdict, which
-	// is the same manufacture the P3 above removed.
+	// "failed" IS HERE BECAUSE THE REVIEWER OVERTURNED MY EXCLUSION WITH EVIDENCE
+	// I ASKED FOR. I had excluded it, arguing every "failed" I could find was
+	// engine-generated. They showed it is REVIEWER-AUTHORABLE and documented as
+	// such: ResultDecisions (result.go:38) is ONE closed set validated identically
+	// for every job type, and resultContractShape - the literal prompt text
+	// delivered to every agent, prompts/contract_generated.go:10 - offers "failed"
+	// alongside "blocked" with no reviewer exclusion. An agent told it may return
+	// "failed" will, and a reviewer that did so after naming defects reviewed.
+	//
+	// The findings requirement is what keeps this safe: an engine-generated
+	// "failed" carries no findings and is still not a verdict.
 	return false
 }
 

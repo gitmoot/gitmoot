@@ -242,15 +242,24 @@ func TestBlockedWithoutFindingsIsNotAReviewVerdict(t *testing.T) {
 	}
 }
 
-// "failed" IS NOT A REVIEW VERDICT, and this pins the place I went NARROWER
-// than the review asked. engine_run_budgets.go constructs "failed" itself, so
-// admitting it would promote an engine-authored terminal state to a reviewer's
-// verdict - the manufacture the P3 arm removed.
-func TestFailedWithFindingsIsNotAReviewVerdict(t *testing.T) {
-	if reviewShapedResult(&AgentResult{
+// "failed" WITH FINDINGS IS A VERDICT, and this arm replaces the one that pinned
+// my exclusion. The reviewer overturned it with the evidence I asked for: the
+// result contract delivered to every agent offers "failed" with no reviewer
+// exclusion, so a reviewer-authored "failed" is expressible and documented.
+func TestFailedWithFindingsIsAReviewVerdict(t *testing.T) {
+	if !reviewShapedResult(&AgentResult{
 		Decision: "failed",
 		Findings: []json.RawMessage{json.RawMessage(`{"id":"F1","severity":"P1","title":"t"}`)},
 	}) {
-		t.Fatal("an engine-authored \"failed\" decision was treated as a review verdict")
+		t.Fatal("a failed reviewer that named defects was not treated as a review verdict")
+	}
+}
+
+// THE GUARD THAT KEEPS IT SAFE: an ENGINE-generated "failed" carries no
+// findings, so it is still not a verdict. Without this, admitting "failed"
+// would promote every engine terminal state to a review.
+func TestFailedWithoutFindingsIsNotAReviewVerdict(t *testing.T) {
+	if reviewShapedResult(&AgentResult{Decision: "failed", Summary: "worker crashed"}) {
+		t.Fatal("an engine-authored \"failed\" with no findings was treated as a review verdict")
 	}
 }
