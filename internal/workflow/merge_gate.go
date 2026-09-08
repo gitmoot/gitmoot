@@ -1953,12 +1953,31 @@ func (g PolicyMergeGate) ensureBranchFresh(ctx context.Context, repo github.Repo
 	}
 	status := strings.ToLower(strings.TrimSpace(compare.Status))
 	if compare.BehindBy > 0 || status == "behind" || status == "diverged" {
-		if status != "diverged" && g.baseAllowsBehindMerge(ctx, repo, base) {
-			// #1865: merely behind, and GitHub does not require an up-to-date
-			// head here. Requesting the update at this point would create a
-			// merge commit and supersede the head the verdict is bound to
-			// within seconds, buying a fresh paid review round. Merge the
+		if mergeableWithoutConflict(pr) && g.baseAllowsBehindMerge(ctx, repo, base) {
+			// #1865: the base has moved, and GitHub does not require an
+			// up-to-date head here. Requesting the update at this point would
+			// create a merge commit and supersede the head the verdict is bound
+			// to within seconds, buying a fresh paid review round. Merge the
 			// reviewed head instead.
+			//
+			// #2068: THE DISCRIMINATOR IS CONFLICT, NOT COMPARE STATUS. This
+			// read `status != "diverged"` and so could not fire for any pull
+			// request: GitHub reports "diverged" for any branch carrying its own
+			// commits, and "behind" requires ahead_by == 0, which is not a PR.
+			// Measured 2026-09-08 on this repo, five of five open PRs reported
+			// diverged (behind_by 2..9, ahead_by 1..5) and zero reported behind,
+			// so the exemption was unreachable and every base move re-entered
+			// the update path - the churn #1865 exists to prevent.
+			//
+			// "diverged" answers "do both refs have unique commits", which is
+			// true of every open PR the moment its base moves. It does NOT mean
+			// the merge conflicts: PR #2062 was diverged and CLEAN at the same
+			// time. GitHub answers conflict separately, in `mergeable`, which
+			// this gate already reads a few frames up.
+			//
+			// Unknown mergeability FAILS CLOSED to the update, matching
+			// baseAllowsBehindMerge: a merge GitHub has not finished computing
+			// and one it cannot compute are indistinguishable from here.
 			return MergeDecision{}, false, nil
 		}
 		_, err := g.GitHub.UpdatePullRequestBranch(ctx, github.UpdatePullRequestBranchInput{
@@ -1992,6 +2011,22 @@ func (g PolicyMergeGate) ensureBranchFresh(ctx context.Context, repo github.Repo
 		return decision, true, err
 	}
 	return MergeDecision{}, false, nil
+}
+
+// mergeableWithoutConflict reports whether GitHub has COMPUTED this pull
+// request's mergeability and says the merge does not conflict (#2068).
+//
+// This is the question the behind-merge exemption actually asks. `compare.status`
+// answers a different one - whether both refs carry unique commits - and is
+// "diverged" for every open pull request whose base has moved, conflicting or
+// not.
+//
+// A nil Mergeable is UNKNOWN, never "fine": GitHub computes mergeability
+// asynchronously, so a PR read moments after a base move legitimately returns
+// nil, and a token that cannot see it returns nil too. Both must keep the
+// mandatory branch update, which is the pre-#1865 behaviour.
+func mergeableWithoutConflict(pr github.PullRequest) bool {
+	return pr.Mergeable != nil && *pr.Mergeable
 }
 
 // baseAllowsBehindMerge reports whether a head that is merely BEHIND base may be

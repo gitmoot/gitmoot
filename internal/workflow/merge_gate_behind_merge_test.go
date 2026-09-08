@@ -136,23 +136,76 @@ func TestMergeGateFailsClosedWhenProtectionIsUndetermined(t *testing.T) {
 	}
 }
 
-// A diverged branch is not merely behind: merging it can conflict, so the
-// update stays mandatory there even when protection allows behind merges.
-func TestMergeGateStillUpdatesDivergedBranch(t *testing.T) {
-	gh := behindMergeGateClient(github.CompareResult{Status: "diverged", BehindBy: 1, AheadBy: 1})
+// #2068. THE SHAPE BELOW IS THE ONE PRODUCTION EMITS, AND THE FIXTURES ABOVE
+// ARE NOT.
+//
+// Every other case in this file constructs `Status: "behind"`. Measured against
+// the live API on 2026-09-08 with the gate's own call - CompareCommits, which
+// issues `GET repos/{owner}/{repo}/compare/{base}...{head}` (client.go
+// CompareCommits) - five of five open pull requests on this repository reported
+// `status=diverged` with `behind_by` 2..9 and `ahead_by` 1..5, and NONE reported
+// `behind`. That is structural, not incidental: `behind` requires `ahead_by ==
+// 0`, a branch with no commits of its own, which is not a pull request.
+//
+// The shape here is copied from one of those responses, #2057's head against
+// main: `{"status":"diverged","ahead_by":1,"behind_by":4,"total_commits":1}`.
+//
+// So the pre-#2068 guard (`status != "diverged"`) could not fire for a real PR,
+// and every base move re-entered the update path that #1865 exists to avoid,
+// while this file stayed green.
+func TestMergeGateMergesDivergedMergeableHeadWhenBaseAllowsIt(t *testing.T) {
+	gh := behindMergeGateClient(github.CompareResult{Status: "diverged", BehindBy: 4, AheadBy: 1})
+	gh.strictKnown = true
+	gh.strictBase = false
+
+	decision := evaluateBehindMergeGate(t, gh)
+
+	if !decision.Merged {
+		t.Fatalf("a diverged but mergeable head must merge without an update: %+v", decision)
+	}
+	if len(gh.updates) != 0 {
+		t.Fatalf("the reviewed head was superseded by an update: %+v", gh.updates)
+	}
+}
+
+// Conflict is the real reason to update, and it is reported by `mergeable`, not
+// by the compare status. A diverged head that GitHub says does not merge keeps
+// the mandatory update - the pre-#1865 behaviour - because merging the reviewed
+// head is not available.
+func TestMergeGateStillUpdatesDivergedConflictingBranch(t *testing.T) {
+	gh := behindMergeGateClient(github.CompareResult{Status: "diverged", BehindBy: 4, AheadBy: 1})
+	conflicting := false
+	gh.pr.Mergeable = &conflicting
 	gh.strictKnown = true
 	gh.strictBase = false
 
 	decision := evaluateBehindMergeGate(t, gh)
 
 	if decision.Merged {
-		t.Fatalf("diverged branch must not merge without an update: %+v", decision)
+		t.Fatalf("a conflicting head must not merge: %+v", decision)
 	}
 	if len(gh.updates) != 1 {
 		t.Fatalf("update inputs = %+v", gh.updates)
 	}
-	if gh.strictCalls != 0 {
-		t.Fatalf("diverged must not even consult protection: calls = %d", gh.strictCalls)
+}
+
+// UNKNOWN MERGEABILITY FAILS CLOSED. GitHub computes mergeability
+// asynchronously, so a PR read moments after a base move returns null, and a
+// token that cannot see it returns null too. Treating null as "fine" would merge
+// on the strength of a value GitHub has not produced.
+func TestMergeGateStillUpdatesWhenMergeabilityIsUnknown(t *testing.T) {
+	gh := behindMergeGateClient(github.CompareResult{Status: "diverged", BehindBy: 4, AheadBy: 1})
+	gh.pr.Mergeable = nil
+	gh.strictKnown = true
+	gh.strictBase = false
+
+	decision := evaluateBehindMergeGate(t, gh)
+
+	if decision.Merged {
+		t.Fatalf("unknown mergeability must not merge: %+v", decision)
+	}
+	if len(gh.updates) != 1 {
+		t.Fatalf("update inputs = %+v", gh.updates)
 	}
 }
 
