@@ -3,6 +3,9 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -117,5 +120,63 @@ func TestLabellingDoesNotPromoteTheHeadIntoThePayload(t *testing.T) {
 	}
 	if labelled != 1 {
 		t.Fatalf("labelled display events = %d, want exactly 1; the head must be recorded once, on the display plane", labelled)
+	}
+}
+
+// THE INVARIANT THE LABEL DEPENDS ON, pinned by census (#2070 review).
+//
+// `source=caller_asserted` is only true because this event has exactly ONE
+// writer, and ParseSessionJobDisplayEvent fills that value in for legacy rows on
+// that basis. A future writer constructing the event elsewhere - especially by
+// literal-stringing the kind - would make the label a claim rather than a fact,
+// and every legacy row would then be back-filled with an assertion nobody
+// verified.
+//
+// The reviewer named the precedent: merge_gate_test.go counts guard call sites in
+// source for the same reason. A census is the only instrument that catches a
+// SITE THAT DOES NOT EXIST YET, which no runtime test can do.
+func TestSessionDisplayEventHasExactlyOneWriter(t *testing.T) {
+	root := filepath.Join("..", "..", "internal")
+	var literalSites, constructionSites []string
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		source, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		text := string(source)
+		// The kind spelled as a literal anywhere but its own const declaration
+		// bypasses every guarantee attached to the constant.
+		for _, line := range strings.Split(text, "\n") {
+			if !strings.Contains(line, `"session_job_display"`) {
+				continue
+			}
+			if strings.Contains(line, "const SessionJobDisplayEventKind") {
+				continue
+			}
+			literalSites = append(literalSites, path+": "+strings.TrimSpace(line))
+		}
+		// A db.JobEvent whose Kind is this event, built outside session_job.go.
+		if strings.Contains(text, "Kind:    SessionJobDisplayEventKind") ||
+			strings.Contains(text, "Kind: SessionJobDisplayEventKind") {
+			if filepath.Base(path) != "session_job.go" {
+				constructionSites = append(constructionSites, path)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if len(literalSites) != 0 {
+		t.Fatalf("the kind is spelled as a literal outside its const: %v; that bypasses the single-writer invariant the caller_asserted label rests on", literalSites)
+	}
+	if len(constructionSites) != 0 {
+		t.Fatalf("session_job_display events are constructed outside session_job.go: %v; a second writer makes source=caller_asserted a claim rather than a fact", constructionSites)
 	}
 }
