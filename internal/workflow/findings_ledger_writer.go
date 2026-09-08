@@ -721,9 +721,24 @@ func reviewShapedResult(result *AgentResult) bool {
 	}
 	switch strings.ToLower(strings.TrimSpace(result.Decision)) {
 	case "approved", "changes_requested":
-		return true
+		// FINDINGS ARE REQUIRED HERE TOO (#2061 CI, three race shards and the
+		// tagged e2e). "approved" alone was treated as a review verdict, so an
+		// ORDINARY ask that returns {"decision":"approved","findings":[]} - the
+		// shape the shipped result contract puts in front of every agent, and the
+		// literal payload of runtimeOverrideShellScript - emitted
+		// review_verdict_unrecordable about work that was never a review.
+		// TestLocalExecutionBackendAllowsNonImplement caught it as an event kind
+		// absent from the main baseline.
+		//
+		// This is the same defect the reviewer's P3 named, surviving the fix I
+		// made for it: I required a review-SHAPED DECISION, and "approved" is one.
+		// The decision was never the discriminator. An ask that reviewed
+		// something SAYS WHAT IT FOUND; an ask that merely answers does not.
+		return len(result.Findings) > 0
 	case "":
 		// No decision at all: findings are the only signal that a review happened.
+		// Every arm now agrees on this, which is the point - findings are the
+		// discriminator and the decision only says which KIND of verdict it is.
 		return len(result.Findings) > 0
 	case "blocked", "failed":
 		// A REVIEWER THAT NAMED DEFECTS STILL REVIEWED (#2061 review, P2).

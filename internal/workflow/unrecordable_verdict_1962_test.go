@@ -165,8 +165,21 @@ func TestOrdinaryAskRecordsNoUnrecordableVerdict(t *testing.T) {
 	if reviewShapedResult(nil) {
 		t.Fatal("a nil result was treated as a review verdict")
 	}
-	if !reviewShapedResult(&AgentResult{Decision: "APPROVED "}) {
+	// Normalisation still matters, but it is tested WITH findings now: this arm
+	// used to assert that a bare "APPROVED " was a verdict, which encoded the very
+	// behaviour CI later refuted (#2061, three race shards plus the tagged e2e).
+	if !reviewShapedResult(&AgentResult{
+		Decision: "APPROVED ",
+		Findings: rawFindings(t, `{"uid":"#1-f1","severity":"P3","title":"t"}`),
+	}) {
 		t.Fatal("a review decision was missed on case and whitespace")
+	}
+	// AN ORDINARY ASK APPROVES NOTHING. This is the unit-level statement of what
+	// TestLocalExecutionBackendAllowsNonImplement measured end to end: the shipped
+	// result contract puts {"decision":"approved","findings":[]} in front of every
+	// agent, so that shape is the ORDINARY ask answer, not a review verdict.
+	if reviewShapedResult(&AgentResult{Decision: "approved", Summary: "ran on shell override"}) {
+		t.Fatal("an ordinary ask that approved nothing was treated as a review verdict")
 	}
 }
 
