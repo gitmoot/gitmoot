@@ -3,10 +3,12 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
 
@@ -136,9 +138,69 @@ func TestLabellingDoesNotPromoteTheHeadIntoThePayload(t *testing.T) {
 // The reviewer named the precedent: merge_gate_test.go counts guard call sites in
 // source for the same reason. A census is the only instrument that catches a
 // SITE THAT DOES NOT EXIST YET, which no runtime test can do.
-// kindFieldPattern matches the struct-literal field regardless of gofmt's
-// alignment padding, which varies with the number of fields in the literal.
-var kindFieldPattern = regexp.MustCompile(`Kind:[ \t]*SessionJobDisplayEventKind\b`)
+// writesTheDisplayKind reports whether a file WRITES the display kind, as
+// opposed to reading or comparing it.
+//
+// #2070 f3: THE TEXT SCAN COULD ONLY SEE ONE SHAPE. It began as two literal
+// substrings, which missed any gofmt alignment but its own; widening that to a
+// whitespace-insensitive pattern fixed the padding assumption and left the
+// LITERAL-SHAPE assumption untouched. A writer that builds the event through an
+// intermediate -
+//
+//	event := db.JobEvent{JobID: id}
+//	event.Kind = SessionJobDisplayEventKind
+//
+// - never matches "Kind:" at all, so the census would have reported one writer
+// while two existed. Each regexp repair bought one shape; this buys the class.
+//
+// Parsing also removes the reader/writer confusion a text scan cannot make:
+// merge_gate.go and job_review_status.go legitimately COMPARE this constant, and
+// only an assignment or a struct-literal field is a write.
+func writesTheDisplayKind(t *testing.T, path string, source []byte) bool {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), path, source, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	mentionsKind := func(node ast.Node) bool {
+		found := false
+		ast.Inspect(node, func(n ast.Node) bool {
+			ident, ok := n.(*ast.Ident)
+			if ok && ident.Name == "SessionJobDisplayEventKind" {
+				found = true
+			}
+			return !found
+		})
+		return found
+	}
+	writes := false
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.CompositeLit:
+			for _, element := range node.Elts {
+				kv, ok := element.(*ast.KeyValueExpr)
+				if !ok {
+					continue
+				}
+				if key, ok := kv.Key.(*ast.Ident); ok && key.Name == "Kind" && mentionsKind(kv.Value) {
+					writes = true
+				}
+			}
+		case *ast.AssignStmt:
+			for i, lhs := range node.Lhs {
+				selector, ok := lhs.(*ast.SelectorExpr)
+				if !ok || selector.Sel.Name != "Kind" || i >= len(node.Rhs) {
+					continue
+				}
+				if mentionsKind(node.Rhs[i]) {
+					writes = true
+				}
+			}
+		}
+		return !writes
+	})
+	return writes
+}
 
 func TestSessionDisplayEventHasExactlyOneWriter(t *testing.T) {
 	root := filepath.Join("..", "..", "internal")
@@ -176,7 +238,7 @@ func TestSessionDisplayEventHasExactlyOneWriter(t *testing.T) {
 		// neither pattern, so a genuine second writer would have passed this
 		// census silently. A census whose sensitivity depends on how many OTHER
 		// fields the writer happened to set is not a census.
-		if kindFieldPattern.MatchString(text) {
+		if writesTheDisplayKind(t, path, source) {
 			if filepath.Base(path) != "session_job.go" {
 				constructionSites = append(constructionSites, path)
 			}
