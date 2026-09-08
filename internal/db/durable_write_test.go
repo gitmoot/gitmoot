@@ -17,6 +17,17 @@ import (
 // make every test below pass for the wrong reason (#1911's own lesson, and the
 // fleet rule about asserting your instrument's shape before comparing).
 func holdWriteLock(t *testing.T, path string, hold time.Duration) func() {
+	return holdWriteLockThen(t, path, hold, true)
+}
+
+// holdWriteLockThen holds the write lock and either COMMITS or ROLLS BACK.
+//
+// The distinction is load-bearing, not tidiness. A committing holder moves the
+// WAL, so a transaction that already took a read snapshot fails its write
+// upgrade with plain SQLITE_BUSY however long its budget is - a different
+// mechanism. A rolling-back holder blocks the write for exactly as long without
+// invalidating anyone's snapshot, which isolates the DEADLINE being tested.
+func holdWriteLockThen(t *testing.T, path string, hold time.Duration, commit bool) func() {
 	t.Helper()
 	holder, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(15000)")
 	if err != nil {
@@ -55,7 +66,11 @@ func holdWriteLock(t *testing.T, path string, hold time.Duration) func() {
 	done := make(chan struct{})
 	go func() {
 		time.Sleep(hold)
-		_ = tx.Commit()
+		if commit {
+			_ = tx.Commit()
+		} else {
+			_ = tx.Rollback()
+		}
 		_ = holder.Close()
 		close(done)
 	}()
@@ -216,4 +231,81 @@ VALUES ('workflow_note', ?, 'worker', 'reply:worker', ?, 1, ?, ?)`,
 	if len(rows) != 0 {
 		t.Fatalf("collapsed rows were superseded by a finish that failed: %+v", rows)
 	}
+}
+
+// TestTransactionalWakeWritesOutlastAShortCallerDeadline drives the DEADLINE
+// PATH of the transactional writers, which nothing did before.
+//
+// Every statement inside these transactions must run on the write's own floor,
+// not the caller's context. Flooring only BeginTx leaves the inner statements
+// bounded by the caller, which is the same half-applied fix this issue is
+// about - and it happened inside FinishOrRetryWakeOutbox, where two calls still
+// passed `ctx` after BeginTx had been converted. A review caught it; no test
+// did, so here is the test.
+func TestTransactionalWakeWritesOutlastAShortCallerDeadline(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		call func(store *Store, ctx context.Context, ids []int64, at time.Time) error
+	}{
+		{name: "claim", call: func(store *Store, ctx context.Context, ids []int64, at time.Time) error {
+			_, err := store.ClaimWakeOutbox(ctx, ids[0], ids[1:], at)
+			return err
+		}},
+		{name: "delivered-coalesced-finish", call: func(store *Store, ctx context.Context, ids []int64, at time.Time) error {
+			return store.FinishWakeOutbox(ctx, ids, WakeOutboxStateDelivered, "", at)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "gitmoot.db")
+			store, err := openCachedTestStore(t, path)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			t.Cleanup(func() { _ = store.Close() })
+			now := time.Now().UTC()
+			state := "attempted"
+			if test.name == "claim" {
+				state = "pending"
+			}
+			ids := seedWakeOutboxRows(t, store, state, 2)
+
+			hold := DurableWriteBudget / 18
+			callerBudget := hold / 5
+			wait := holdWriteLock(t, path, hold)
+			defer wait()
+
+			ctx, cancel := context.WithTimeout(context.Background(), callerBudget)
+			defer cancel()
+			if err := test.call(store, ctx, ids, now); err != nil {
+				t.Fatalf("%s under %s contention with a %s caller deadline: %v",
+					test.name, hold, callerBudget, err)
+			}
+		})
+	}
+}
+
+func seedWakeOutboxRows(t *testing.T, store *Store, state string, count int) []int64 {
+	t.Helper()
+	now := time.Now().UTC().Format(BlockedEpisodeTimeLayout)
+	attempted := "NULL"
+	if state == "attempted" {
+		attempted = "'" + now + "'"
+	}
+	var ids []int64
+	for index := 0; index < count; index++ {
+		res, err := store.db.ExecContext(context.Background(), `
+INSERT INTO wake_outbox(source_kind, source_id, target_role, coalesce_key, state,
+	attempt_count, created_at, updated_at, attempted_at)
+VALUES ('workflow_note', ?, 'worker', 'reply:worker', ?, 1, ?, ?, `+attempted+`)`,
+			fmt.Sprint(index+1), state, now, now)
+		if err != nil {
+			t.Fatalf("seed row %d: %v", index, err)
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			t.Fatalf("seed id %d: %v", index, err)
+		}
+		ids = append(ids, id)
+	}
+	return ids
 }

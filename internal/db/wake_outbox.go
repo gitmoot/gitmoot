@@ -665,7 +665,7 @@ WHERE state = 'attempted' AND id IN (`, ids, at, 1, strings.TrimSpace(cause))
 		if err != nil {
 			return false, attempts, err
 		}
-		if err := execWakeOutboxRowUpdate(ctx, tx, query, args, len(ids), "requeue"); err != nil {
+		if err := execWakeOutboxRowUpdate(writeCtx, tx, query, args, len(ids), "requeue"); err != nil {
 			return false, attempts, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -680,7 +680,7 @@ WHERE state = 'attempted' AND id IN (`, ids, at, state, strings.TrimSpace(cause)
 	if err != nil {
 		return false, attempts, err
 	}
-	if err := execWakeOutboxRowUpdate(ctx, tx, query, args, len(ids), "finish"); err != nil {
+	if err := execWakeOutboxRowUpdate(writeCtx, tx, query, args, len(ids), "finish"); err != nil {
 		return false, attempts, err
 	}
 	message := fmt.Sprintf(
