@@ -226,7 +226,11 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 	// and re-fired it every poll. Skipping on identity is the idempotent answer.
 	// FindRepeatedReviewers cannot serve this: it queries succeeded verdicts only, so
 	// it never sees a queued, running or failed leg.
-	if existing := reviewLegsAtHead(reviewJobs, event, reviewRound); len(existing) > 0 {
+	existing, err := e.reviewLegsAtHead(ctx, reviewJobs, event, reviewRound)
+	if err != nil {
+		return err
+	}
+	if len(existing) > 0 {
 		remaining := make([]string, 0, len(reviewers))
 		for _, reviewer := range reviewers {
 			if _, dispatched := existing[strings.ToLower(strings.TrimSpace(reviewer))]; !dispatched {

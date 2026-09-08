@@ -366,18 +366,18 @@ func TestReviewLegsAtHeadKeysOnIdentity(t *testing.T) {
 	}
 	for _, state := range []JobState{JobQueued, JobRunning, JobFailed, JobSucceeded, JobCancelled, JobBlocked} {
 		jobs := []db.Job{{ID: "leg", Agent: "audit", Type: "review", State: string(state), Payload: string(payload)}}
-		if _, held := reviewLegsAtHead(jobs, event, "review-2")["audit"]; !held {
+		if _, held := legsAtHeadForTest(t, jobs, event, "review-2")["audit"]; !held {
 			t.Fatalf("state %s: leg not recognised at this head and round", state)
 		}
 	}
 	jobs := []db.Job{{ID: "leg", Agent: "audit", Type: "review", State: string(JobQueued), Payload: string(payload)}}
 	// A different round at the same head is different work.
-	if _, held := reviewLegsAtHead(jobs, event, "review-3")["audit"]; held {
+	if _, held := legsAtHeadForTest(t, jobs, event, "review-3")["audit"]; held {
 		t.Fatal("a leg from another round was treated as this round's work")
 	}
 	// A different head in the same round is different work.
 	otherHead := reviewRefanoutEvent("head-three")
-	if _, held := reviewLegsAtHead(jobs, otherHead, "review-2")["audit"]; held {
+	if _, held := legsAtHeadForTest(t, jobs, otherHead, "review-2")["audit"]; held {
 		t.Fatal("a leg at another head was treated as this head's work")
 	}
 }
