@@ -2205,10 +2205,29 @@ func effectiveReviewerIdentityName(job db.Job, payload JobPayload) string {
 // already recorded under the same name); what it no longer keeps is a second copy
 // of how an identity is DERIVED.
 func effectiveReviewerIdentity(job db.Job, payload JobPayload) (string, bool) {
-	if agent := strings.TrimSpace(job.Agent); agent != "" {
-		return agent, false
+	return ReviewerIdentity(job.Agent, payload.ActingOrgRole)
+}
+
+// ReviewerIdentity is that same rule as a pure function of the two STORED
+// fields, exported so consumers outside this package resolve an identity the
+// same way instead of keeping a third copy (#2008).
+//
+// It exists because the comment above this function already named two consumers
+// that were deliberately left on bare job.Agent for routing: review_loop.go's
+// FindRepeatedReviewers, which could not see a role because db.SucceededReviewVerdict
+// carried only Agent, and internal/proof, which had zero ActingOrgRole references
+// and therefore reported a role-authored review as not comparable. Both now call
+// this, so the count in that comment is no longer two and is deliberately not
+// restated here - quoting a count is the habit #1950 F5 ended.
+//
+// The db layer does NOT call this and must not: workflow depends on db and never
+// the reverse, so db.SucceededReviewVerdict carries the role RAW and the folding
+// happens here. That keeps one rule rather than one rule and one lowercase.
+func ReviewerIdentity(agent, actingOrgRole string) (string, bool) {
+	if trimmed := strings.TrimSpace(agent); trimmed != "" {
+		return trimmed, false
 	}
-	if role := NormalizeActingOrgRole(payload.ActingOrgRole); role != "" {
+	if role := NormalizeActingOrgRole(actingOrgRole); role != "" {
 		return role, true
 	}
 	return "", false

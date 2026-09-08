@@ -14,6 +14,15 @@ import (
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
+// reviewDecisionAgent resolves the identity a review row's decision is credited
+// to. It is the funnel for three of #2008's agent-keyed consumers -
+// reviewLegsAtHead, followUpReviewScopes and the approval scan below - which is
+// why the fallback lives here rather than at each of those call sites.
+//
+// The re-delegation case stays FIRST and stays ahead of the identity rule: a
+// runtime_session_busy hand-off records the delegate in job.Agent, so resolving
+// the stored fields first would still return that delegate and credit the leg to
+// it rather than to the agent whose slot it fills.
 func reviewDecisionAgent(job db.Job, payload JobPayload) string {
 	if job.Type == "review" &&
 		payload.DelegationReason == "runtime_session_busy" &&
@@ -21,7 +30,11 @@ func reviewDecisionAgent(job db.Job, payload JobPayload) string {
 		strings.TrimSpace(payload.OriginalAgent) != "" {
 		return payload.OriginalAgent
 	}
-	return job.Agent
+	// An externally driven session review persists ActingOrgRole IN PLACE OF an
+	// agent, so bare job.Agent returned "" and every caller's non-empty check then
+	// dropped the row from the legs, scopes and approvals it belonged in.
+	name, _ := ReviewerIdentity(job.Agent, payload.ActingOrgRole)
+	return name
 }
 
 func (e Engine) jobPayload(ctx context.Context, jobID string) (db.Job, JobPayload, error) {
