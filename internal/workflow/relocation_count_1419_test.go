@@ -240,7 +240,7 @@ func TestRelocationCountFallsBackToTheJobWhenTheRoundIsUnknown(t *testing.T) {
 	}
 
 	// A MIXED population is the real store: some jobs carry a round, some do not.
-	// The known ones collapse, the unknown ones stay distinct, and the total is 2.
+	// The known ones collapse, the parentless unknown ones stay distinct, total 2.
 	mixedPop := []db.ReviewFindingObservation{
 		obs("internal/cli/b.go", "lens-1", "F1"),
 		obs("internal/cli/b.go", "lens-2", "F2"),
@@ -382,5 +382,116 @@ func TestReviewRoundResolutionComposesTaskAndRoundAndIsBounded(t *testing.T) {
 		if _, resolved := bounded[id]; !resolved {
 			t.Fatalf("sorted-prefix job %q was not resolved: the subset is not the prefix", id)
 		}
+	}
+}
+
+// #2066 ROUND FOUR, P1. A ROUNDLESS FAN-OUT IS STILL ONE ROUND. Local
+// agent-review coordinators persist no ReviewRound and delegationRequest passes
+// that blank value to every review child, so a supported review-panel fan-out
+// arrives roundless - and the previous fallback counted its children as separate
+// rounds, which is the inflation the round before had asked me to fix.
+//
+// I had measured ReviewRound as empty on all 198 observing jobs and concluded
+// the fan-out hazard was theoretical. Empty is EXACTLY when the fallback fires,
+// so the measurement that justified the fallback was the same fact that made it
+// wrong.
+func TestRelocationCountCollapsesARoundlessFanOutByItsCoordinator(t *testing.T) {
+	fanOut := []db.ReviewFindingObservation{
+		obs("internal/cli/a.go", "panel-1", "F1"),
+		obs("internal/cli/a.go", "panel-2", "F2"),
+		obs("internal/cli/a.go", "panel-3", "F3"),
+	}
+	// What the resolver returns for a roundless fan-out: the shared coordinator.
+	sharedParent := map[string]string{
+		"panel-1": "parent\x00coordinator-9",
+		"panel-2": "parent\x00coordinator-9",
+		"panel-3": "parent\x00coordinator-9",
+	}
+	if got := ledgerRelocationBrief(fanOut, sharedParent); got != "" {
+		t.Fatalf("three roundless children of ONE coordinator counted as three rounds:\n%s", got)
+	}
+
+	// Three separate coordinators are three genuine rounds.
+	distinctParents := map[string]string{
+		"panel-1": "parent\x00coordinator-1",
+		"panel-2": "parent\x00coordinator-2",
+		"panel-3": "parent\x00coordinator-3",
+	}
+	if got := ledgerRelocationBrief(fanOut, distinctParents); !strings.Contains(got, "rounds=3") {
+		t.Fatalf("three separate coordinators must count as three rounds:\n%s", got)
+	}
+
+	// A round identity and a parent identity must never collide, or a coordinator
+	// id equal to a task id would fold two different groupings together.
+	mixed := map[string]string{
+		"panel-1": "round\x00task-A\x00review-1",
+		"panel-2": "parent\x00task-A",
+		"panel-3": "parent\x00coordinator-9",
+	}
+	if got := ledgerRelocationBrief(fanOut, mixed); !strings.Contains(got, "rounds=3") {
+		t.Fatalf("round-keyed and parent-keyed identities collided:\n%s", got)
+	}
+}
+
+// #2066 ROUND FOUR, P2. The rendered text must not name a unit the code does not
+// use: it said "counted by observing job" while the implementation collapses a
+// fan-out through a logical identity, so a three-job fan-out reading as one round
+// contradicted the brief a reviewer was reading.
+func TestRelocationBriefDescribesTheUnitItActuallyCounts(t *testing.T) {
+	got := ledgerRelocationBrief([]db.ReviewFindingObservation{
+		obs("internal/cli/a.go", "job-1", "F1"),
+		obs("internal/cli/a.go", "job-2", "F1"),
+		obs("internal/cli/a.go", "job-3", "F1"),
+	}, nil)
+	if strings.Contains(got, "counted\nby observing job") || strings.Contains(got, "counted by observing job") {
+		t.Fatalf("the brief still claims the count is by observing job:\n%s", got)
+	}
+	for _, want := range []string{"review round when one is recorded", "coordinator that", "only otherwise by the individual reviewing job"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("the brief does not describe the identity ladder (%q):\n%s", want, got)
+		}
+	}
+}
+
+// The resolver's ladder, end to end against a real store (#2066 round four).
+func TestReviewRoundResolutionFallsBackToTheCoordinator(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := Engine{Store: store}
+
+	seedChild := func(id, parent, round string) db.ReviewFindingObservation {
+		insertCompletedJob(t, store, db.Job{ID: id, Agent: "reviewer", Type: "review"}, JobPayload{
+			Repo: "gitmoot/gitmoot", PullRequest: 2066, ParentJobID: parent, ReviewRound: round,
+			Result: &AgentResult{Decision: "approved", Summary: "ok"},
+		})
+		return obs("internal/cli/a.go", id, "F1")
+	}
+
+	// A roundless fan-out: no ReviewRound anywhere, one shared coordinator.
+	rows := []db.ReviewFindingObservation{
+		seedChild("panel-a", "coordinator-9", ""),
+		seedChild("panel-b", "coordinator-9", ""),
+	}
+	resolved := engine.reviewRoundsForObservations(ctx, rows)
+	if resolved["panel-a"] == "" || resolved["panel-a"] != resolved["panel-b"] {
+		t.Fatalf("roundless siblings must share one identity, got %q and %q", resolved["panel-a"], resolved["panel-b"])
+	}
+	if !strings.Contains(resolved["panel-a"], "coordinator-9") {
+		t.Fatalf("the fallback identity must name the coordinator, got %q", resolved["panel-a"])
+	}
+
+	// A recorded round WINS over the parent, because it is the logical identity
+	// and a coordinator can dispatch more than one round.
+	rows = append(rows, seedChild("panel-c", "coordinator-9", "review-2"))
+	resolved = engine.reviewRoundsForObservations(ctx, rows)
+	if resolved["panel-c"] == resolved["panel-a"] {
+		t.Fatal("a child with its own review round was folded into its coordinator's roundless group")
+	}
+
+	// Neither round nor parent: no entry, so the caller counts by job id.
+	rows = append(rows, seedChild("solo", "", ""))
+	resolved = engine.reviewRoundsForObservations(ctx, rows)
+	if _, present := resolved["solo"]; present {
+		t.Fatal("a job with neither round nor parent produced an identity, which would fold unrelated jobs together")
 	}
 }
