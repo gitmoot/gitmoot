@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -135,6 +136,10 @@ func TestLabellingDoesNotPromoteTheHeadIntoThePayload(t *testing.T) {
 // The reviewer named the precedent: merge_gate_test.go counts guard call sites in
 // source for the same reason. A census is the only instrument that catches a
 // SITE THAT DOES NOT EXIST YET, which no runtime test can do.
+// kindFieldPattern matches the struct-literal field regardless of gofmt's
+// alignment padding, which varies with the number of fields in the literal.
+var kindFieldPattern = regexp.MustCompile(`Kind:[ \t]*SessionJobDisplayEventKind\b`)
+
 func TestSessionDisplayEventHasExactlyOneWriter(t *testing.T) {
 	root := filepath.Join("..", "..", "internal")
 	var literalSites, constructionSites []string
@@ -162,8 +167,16 @@ func TestSessionDisplayEventHasExactlyOneWriter(t *testing.T) {
 			literalSites = append(literalSites, path+": "+strings.TrimSpace(line))
 		}
 		// A db.JobEvent whose Kind is this event, built outside session_job.go.
-		if strings.Contains(text, "Kind:    SessionJobDisplayEventKind") ||
-			strings.Contains(text, "Kind: SessionJobDisplayEventKind") {
+		//
+		// WHITESPACE-INSENSITIVE ON PURPOSE (#2070 review). The first version
+		// matched two literal substrings, "Kind:    " and "Kind: ", both derived
+		// from gofmt's alignment of the ONE 3-field literal in session_job.go.
+		// The reviewer demonstrated the hole rather than arguing it: a 2-field
+		// db.JobEvent{JobID, Kind} gofmts to "Kind:  " - two spaces - matching
+		// neither pattern, so a genuine second writer would have passed this
+		// census silently. A census whose sensitivity depends on how many OTHER
+		// fields the writer happened to set is not a census.
+		if kindFieldPattern.MatchString(text) {
 			if filepath.Base(path) != "session_job.go" {
 				constructionSites = append(constructionSites, path)
 			}
