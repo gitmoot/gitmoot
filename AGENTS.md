@@ -50,9 +50,18 @@ infrastructure rather than the documented boundary they are:
   includes the repo-wide gate and `./cmd/gitmoot`. A pure-Go package still builds
   and tests with default cgo, so a passing single-package run proves nothing about
   the gate.
-- **`-race` is unreachable in a seat**, because race requires cgo (`go: -race
-  requires cgo; enable cgo by setting CGO_ENABLED=1`). It is covered by CI's race
-  shards only, and its absence from a seat verdict is not a regression.
+- **`-race` is unreachable from a read-only review seat**, because race requires
+  cgo (`go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`) and the
+  sandbox denies the C header above. Its absence from a review verdict is not a
+  regression. It is **not** unreachable from a full seat with its own clone:
+  measured on this host, `CGO_ENABLED=1 go test -race ./internal/db/` returns
+  `ok` from `/root/gm-transport`, so a seat that owns a checkout can run the
+  lane locally when CI cannot. Two limits on doing so. A race result is
+  timing-sensitive, so a clean local run is weaker evidence than a clean CI run
+  rather than equal to it, and it must never be reported as the lane passing.
+  And two concurrent `-race` workloads on one host perturb the scheduling each
+  is measuring, with a false clean on both the likely outcome, so the lane takes
+  one runner at a time: check for a live `-race` binary before starting one.
 
 When a seat's plain `go` returns 126, no usable toolchain was staged. The command
 is an engine-owned failure stub, never a fallthrough to the operator's `go`.
