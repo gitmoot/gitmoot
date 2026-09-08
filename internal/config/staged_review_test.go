@@ -83,14 +83,32 @@ func TestStagedReviewEmptyDeclarationIsNotADeclaration(t *testing.T) {
 	}
 }
 
-func TestStagedReviewMatchesRepoCaseInsensitively(t *testing.T) {
+// Repo matching is EXACT, matching every other [repos."owner/repo"] lookup in
+// this package (#2026 review, P3). This test pins the CONSISTENCY rather than
+// the rule: a case-differing section must not match, because the sibling
+// loaders do not match one either, and one loader with its own comparison gives
+// the same config section two behaviours depending on which key you read.
+//
+// If case-insensitive matching is adopted it should be adopted repo-wide, and
+// this test should fail loudly at that point rather than silently permitting a
+// divergence.
+func TestStagedReviewMatchesRepoExactlyLikeItsSiblings(t *testing.T) {
 	paths := writeStagedReviewConfig(t, "[repos.\"Gitmoot/Gitmoot\"]\nstaged_review_verdict_agent = \"g7-review\"\n")
 	agent, declared, err := StagedReviewVerdictAgent(paths, "gitmoot/gitmoot")
 	if err != nil {
 		t.Fatalf("StagedReviewVerdictAgent: %v", err)
 	}
-	if !declared || agent != "g7-review" {
-		t.Fatalf("case-differing repo did not match: declared=%v agent=%q", declared, agent)
+	if declared || agent != "" {
+		t.Fatalf("a case-differing repo matched (declared=%v agent=%q); this loader would then be the only "+
+			"one in the package matching case-insensitively", declared, agent)
+	}
+	// The exact spelling still matches, which is the should-succeed arm.
+	exact, declaredExact, err := StagedReviewVerdictAgent(paths, "Gitmoot/Gitmoot")
+	if err != nil {
+		t.Fatalf("StagedReviewVerdictAgent(exact): %v", err)
+	}
+	if !declaredExact || exact != "g7-review" {
+		t.Fatalf("the exact repo spelling did not match: declared=%v agent=%q", declaredExact, exact)
 	}
 }
 

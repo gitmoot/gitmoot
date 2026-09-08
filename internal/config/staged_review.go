@@ -113,7 +113,16 @@ func StagedReviewVerdictAgent(paths Paths, repo string) (string, bool, error) {
 		return "", false, err
 	}
 	for _, entry := range entries {
-		if strings.EqualFold(entry.Repo, wanted) {
+		// Exact comparison, matching every other [repos."owner/repo"] lookup in
+		// this package (#2026 review, P3). EqualFold here would be a SECOND
+		// convention for the same config section: RepoConcurrencyFor compares
+		// `entry.Repo == repo`, and the require-workflow, merge-gate and review
+		// loaders match exactly too. Case-insensitive repo matching may well be
+		// the better rule - a GitHub owner/repo is case-insensitive in practice -
+		// but changing it in ONE loader gives the same section two behaviours
+		// depending on which key you read, which is worse than either rule
+		// applied consistently. If it should change it should change repo-wide.
+		if entry.Repo == wanted {
 			return entry.VerdictAgent, true, nil
 		}
 	}
