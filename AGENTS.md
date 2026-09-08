@@ -54,15 +54,15 @@ infrastructure rather than the documented boundary they are:
   cgo (`go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`) and the
   sandbox denies the C header above. Its absence from a review verdict is not a
   regression, and the boundary is the `ReadOnlySeat` marker, not the kind of
-  clone you hold. Seven dispatch sites set it on `origin/main` - in
-  `internal/cli`: `daemon_checkout.go`, `daemon_scheduler.go`, `daemon_worker.go`,
-  `job_blocker_auth_probe.go`, `pipeline_enqueue.go`; in `internal/workflow`:
-  `engine_delegation.go`, `engine_pr_lifecycle.go` - so read the list from
-  `git grep -n 'ReadOnlySeat.*true' origin/main` rather than from a summary here.
-  Under that marker the daemon computes read-only sandbox grants through
-  `readOnlyRuntimeSandboxGrants`, which resolves the isolated tool cache and the
-  staged toolchain; the sandboxing itself is applied by the runtime layer and is
-  not this function's job. A session that is **not** a `ReadOnlySeat`, is
+  clone you hold. Do not trust an enumeration of the sites, including one written
+  here: get it from
+  `git grep -n 'ReadOnlySeat.*true' origin/main -- 'internal/*/*.go'`, and note
+  that the pattern matches two different things - the dispatch sites that SET the
+  marker on a request, payload or agent, and `applyReadOnlySeat`, which applies it
+  to a session. Under that marker the daemon computes read-only sandbox grants
+  through `readOnlyRuntimeSandboxGrants`, which resolves the isolated tool cache
+  and the staged toolchain; the sandboxing itself is applied by the runtime layer
+  and is not this function's job. A session that is **not** a `ReadOnlySeat`, is
   permitted to run Bash by its autonomy policy, and has the C toolchain and
   headers available can execute race-enabled tests: measured on this host,
   `CGO_ENABLED=1 go test -race ./internal/db/` returns `ok`. Owning a checkout is
