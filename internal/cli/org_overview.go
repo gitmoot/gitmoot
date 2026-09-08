@@ -228,9 +228,16 @@ func buildOrgStatusRows(ctx context.Context, shared *orgSharedState, src orgLive
 		if incident, unavailable := shared.unavailable[role.Name]; unavailable {
 			unavailableReason = incident.Reason
 			unavailableUntil = formatOrgRoleUnavailableUntil(incident.Until)
+			// #2042 review P2: the overlay replaced `live` WHOLESALE, which dropped
+			// Activity and made a provider-reported turn vanish from the row. An
+			// unavailability incident is a statement about whether the role may be
+			// dispatched to; it is NOT evidence that the provider reported nothing.
+			// Erasing the turn there is the same class as rendering nil as zero -
+			// inventing an absence - so the reported activity is carried across.
 			live = org.RoleLiveState{
-				State:  org.StateUnavailable,
-				Detail: fmt.Sprintf("⚠ UNAVAILABLE reason=%s until=%s", incident.Reason, unavailableUntil),
+				State:    org.StateUnavailable,
+				Detail:   fmt.Sprintf("⚠ UNAVAILABLE reason=%s until=%s", incident.Reason, unavailableUntil),
+				Activity: live.Activity,
 			}
 		}
 		seen := shared.Presence[role.Name]

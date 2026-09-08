@@ -411,6 +411,21 @@ One repo's concurrency can also be capped **from config, without any relaunch**,
 via a `[repos."owner/repo"]` section with `max_parallel = N` (#576) — see
 [Cap one repo's parallelism from config](../workflows/parallel-jobs-workflow.md#cap-one-repos-parallelism-from-config).
 
+`org chart` and `org status` render the provider's last completed **turn**
+alongside `seen=` (#1702). `org status --json` carries it as `last_turn`.
+
+The turn measures PROGRESS; `seen=` measures RECENCY, and they answer different
+questions - a seat can be inside one long turn with a stale note age and be
+perfectly healthy. Measured on one host, two seats read 27h and 45h by note age
+while each had completed a turn minutes earlier.
+
+`last_turn` is ABSENT rather than zero when the provider reported no turn
+activity, and the text surfaces render `-` for that case. A reported turn of `0`
+is a real value and renders as `0`; a rendered `0` for silence would invent a
+stalled seat. An unavailable role keeps its reported turn, because an
+unavailability incident says whether a role may be dispatched to, not whether
+the provider reported anything.
+
 Job kill deadlines are independent from stale-running detection. Configure the
 daemon defaults with:
 
