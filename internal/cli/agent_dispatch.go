@@ -172,6 +172,17 @@ func localDispatchJobRunner(request localAgentDispatchRequest) subprocess.Runner
 	return subprocess.ExecRunner{}
 }
 
+// promptHeadWarningFormat is SINGLE-SOURCED because two functions depend on its
+// shape: the producer below writes it, and retainUnjudgedPromptHeadWarnings
+// anchors on its citation clause to decide which warning belongs to which
+// citation. A silent divergence between them re-opens the retention leak that
+// review finding P3 on #2064 measured, so the format and its prefix live here
+// together rather than as two string literals in two files.
+const (
+	promptHeadWarningCitationPrefix = "prompt references commit "
+	promptHeadWarningFormat         = promptHeadWarningCitationPrefix + "%s, but the dispatch head is %s; Gitmoot will use dispatch head %s"
+)
+
 var promptCommitTokenRE = regexp.MustCompile(`\b[0-9a-fA-F]{7,64}\b`)
 
 type localAgentJobOutput struct {
@@ -950,7 +961,7 @@ func promptHeadContradictionWarnings(ctx context.Context, git gitutil.Client, pr
 		if strings.EqualFold(resolvedToken, resolvedHead) {
 			continue
 		}
-		warnings = append(warnings, fmt.Sprintf("prompt references commit %s, but the dispatch head is %s; Gitmoot will use dispatch head %s", token, resolvedHead, resolvedHead))
+		warnings = append(warnings, fmt.Sprintf(promptHeadWarningFormat, token, resolvedHead, resolvedHead))
 	}
 	return warnings
 }

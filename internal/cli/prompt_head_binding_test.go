@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gitmoot/gitmoot/internal/subprocess"
+
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -218,6 +220,47 @@ func TestReviewDispatchBindsThePromptsTargetToTheDispatchHead(t *testing.T) {
 // is both resolvable and unjudged, because foreign is refused before enqueue.
 // The refusal carries the wrong-head signal; the warning had nothing left to
 // say. Ask and implement keep theirs - see the boundary test below.
+// TestUnjudgedTokenCannotRetainAnotherCitationsWarning is review finding P3 on
+// #2064 cycle five, and it is a RETENTION LEAK rather than a wording problem.
+//
+// Every warning names the dispatch head twice in its own text. The filter used
+// to keep a warning when any unjudged token appeared ANYWHERE in it, so a
+// non-resolving token that happens to be a 7-hex run from the middle of the
+// dispatch sha classified as promptCommitUnresolved, went into the unjudged set,
+// and then matched inside the dispatch-head text of an ANCESTOR's warning -
+// retaining a warning the filter exists to drop, about a citation nobody
+// complained about.
+//
+// It survived an earlier hand probe of mine for a reason worth recording: that
+// probe's prompt contained no stray token, so the leak had nothing to fire on. A
+// negative result from an input that cannot express the defect is not evidence.
+func TestUnjudgedTokenCannotRetainAnotherCitationsWarning(t *testing.T) {
+	ctx := context.Background()
+	checkout, _, base, head, _ := promptHeadBindingCheckout(t)
+	store, _ := blockerE2EHome(t)
+	client := jobGitClient(checkout, subprocess.ExecRunner{})
+
+	// A 7-hex run lifted from the MIDDLE of the dispatch head, which no object
+	// resolves: this is the unjudged token that used to leak.
+	stray := head[8:15]
+	if _, err := client.RevParse(ctx, stray+"^{commit}"); err == nil {
+		t.Skipf("fixture stray token %q unexpectedly resolves", stray)
+	}
+	// base is an ANCESTOR of head, so its warning must be dropped.
+	prompt := "review " + base + " and also " + stray
+
+	warnings := dispatchPromptHeadContradictionWarnings(ctx, client, prompt, head)
+	if len(warnings) == 0 {
+		t.Fatalf("fixture produced no warnings to filter; the ancestor citation must warn before filtering")
+	}
+	kept := retainUnjudgedPromptHeadWarnings(ctx, client, store, prompt, head, "owner/repo", 12, warnings)
+	for _, warning := range kept {
+		if strings.Contains(warning, base) {
+			t.Fatalf("an unjudged stray token retained the ANCESTOR citation's warning: %q\nkept=%v", warning, kept)
+		}
+	}
+}
+
 func TestReviewDispatchWarnsOnlyOnCitationsNobodyHasJudged(t *testing.T) {
 	checkout, base, firstHead, head, staleTarget := promptHeadBindingCheckout(t)
 	const unresolvable = "0123456789abcdef0123456789abcdef01234567"

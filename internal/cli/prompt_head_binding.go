@@ -286,10 +286,21 @@ func retainUnjudgedPromptHeadWarnings(
 	if len(unjudged) == 0 {
 		return nil
 	}
+	// ANCHOR ON THE CITATION CLAUSE, never a bare substring. Every warning names
+	// the DISPATCH HEAD twice in its own text, so a substring test let an
+	// unjudged token retain a DIFFERENT citation's warning whenever that token
+	// occurred inside the dispatch sha - and a prompt only has to contain a
+	// non-resolving 7-hex run taken from the middle of that sha for the leak to
+	// fire, which is why it survived a probe whose prompt happened not to have
+	// one. Matching the leading "prompt references commit <token>," ties a
+	// warning to the one citation it is about.
 	kept := make([]string, 0, len(warnings))
 	for _, warning := range warnings {
 		for _, token := range unjudged {
-			if strings.TrimSpace(token) != "" && strings.Contains(warning, token) {
+			if strings.TrimSpace(token) == "" {
+				continue
+			}
+			if strings.HasPrefix(warning, promptHeadWarningCitationPrefix+token+",") {
 				kept = append(kept, warning)
 				break
 			}

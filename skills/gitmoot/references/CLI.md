@@ -1162,8 +1162,16 @@ retains. That arm is an INSTRUMENT FAILURE rather than a statement about the
 prompt, and it is deliberately reachable - when the classifier cannot judge a
 citation, nobody has judged it.
 
-Two things are silent. A token the scan itself could not resolve never reaches
-the filter at all, because `dispatchPromptHeadContradictionWarnings` discards it
+Retention is PER CITATION: a warning is kept only when the retained relation is
+the one that warning is about, matched on its leading
+`prompt references commit <token>,` clause. That is what makes the two relations
+above exhaustive - an earlier version tested for the token anywhere in the
+warning text, and since every warning names the dispatch head twice, an unjudged
+token that happened to be a hex run from inside that sha could retain a
+DIFFERENT citation's warning.
+
+Two things are silent. A token the scan itself could not resolve produces no
+warning of its own, because `dispatchPromptHeadContradictionWarnings` discards it
 before any classification. And on the resolvable path ancestry is checked BEFORE
 the recorded-head arm, so a commit that is both a prior head and an ancestor is
 silent - the ordinary scoped re-review, citing its own previous head.
