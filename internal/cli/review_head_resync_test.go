@@ -949,6 +949,8 @@ func TestRunAgentReviewRequeuesQueuedJobWhenRuntimeSessionBusy(t *testing.T) {
 		"agent", "review", "reviewer", "Please review",
 		"--home", home,
 		"--repo", "owner/repo",
+		// #2063: --lead is explicit now; this test is about requeue-on-busy.
+		"--lead", "reviewer",
 		"--pr", "1",
 		"--head-sha", head,
 		"--branch", "feat/x",

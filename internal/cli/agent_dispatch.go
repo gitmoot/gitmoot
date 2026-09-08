@@ -1044,15 +1044,39 @@ func validateLocalReviewLeadAtDispatch(ctx context.Context, store *db.Store, req
 		if typeName != "" {
 			return localAgentDispatchRequest{}, fmt.Errorf("review dispatch through managed type %q requires --lead naming a registered implementer", typeName)
 		}
-		leadName = strings.TrimSpace(request.Agent)
+		// OMITTING --lead NO LONGER SELF-ATTRIBUTES (#2063). This line used to read
+		// `leadName = request.Agent`, making the REVIEWER its own implementer -
+		// silently destroying the very independence a review dispatch exists to
+		// establish, and writing a false attribution row while doing it.
+		//
+		// Phobos measured the consequence: all ten bound reviews dispatched after
+		// 14:40 on 2026-09-08 carry a lead_agent that implemented none of them.
+		// Refusing is the only option that cannot produce a wrong record: a
+		// dispatch that names no implementer is a question the caller must answer,
+		// not one this function may answer on their behalf.
+		return localAgentDispatchRequest{}, errors.New(
+			"review dispatch requires --lead naming the implementer: a registered agent, or --lead <org-role> for in-session work; " +
+				"it no longer defaults to the reviewer, because that recorded the reviewer as its own implementer")
 	}
 	lead, err := store.GetAgent(ctx, leadName)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			if strings.TrimSpace(request.LeadAgent) == "" {
-				return localAgentDispatchRequest{}, fmt.Errorf("agent %q not found; review dispatch requires --lead naming a registered implementer", leadName)
+			// AN ORG ROLE IS A LEGITIMATE IMPLEMENTER (#2063). A seat implements in
+			// session and is deliberately not a registered agent, so before this the
+			// true implementer was inexpressible and every seat named a registered
+			// agent that had done nothing. The role is validated against the org
+			// chart by the same ingress --org-role uses, so this replaces a false
+			// registered agent with a CHECKED identity rather than a free string.
+			//
+			// engine_types.go already reads payload.LeadAgent through
+			// NormalizeActingOrgRole when resolving a wake target, so a role in this
+			// field is a shape the engine understands rather than a new one.
+			if roleErr := validateAndTouchActingOrgRole(ctx, store, request.Home, leadName, "agent review --lead"); roleErr == nil {
+				request.LeadAgent = workflow.NormalizeActingOrgRole(leadName)
+				return request, nil
 			}
-			return localAgentDispatchRequest{}, fmt.Errorf("review lead %q is not subscribed; --lead must name a registered implementer", leadName)
+			return localAgentDispatchRequest{}, fmt.Errorf(
+				"review lead %q is neither a registered implementer nor a known org role; --lead must name one of them", leadName)
 		}
 		return localAgentDispatchRequest{}, err
 	}

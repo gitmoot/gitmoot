@@ -325,6 +325,10 @@ func TestCLIReviewLoopRefusesBothHeadResolutionBranches(t *testing.T) {
 			request := localAgentDispatchRequest{
 				RepoFlag: "owner/repo", Agent: "reviewer", Action: "review", PullRequest: 227,
 				Instructions: "Review unchanged head.", Home: fixture.home,
+				// #2063: --lead is explicit now. This test's subject is loop
+				// detection, so it states a lead rather than relying on the removed
+				// self-attributing default.
+				LeadAgent: "reviewer",
 			}
 			if tc.resolved {
 				previous := newAgentDispatchGitHubClient
@@ -447,6 +451,11 @@ func TestCLIReviewLoopHerdres227Shape(t *testing.T) {
 	request := localAgentDispatchRequest{
 		RepoFlag: "owner/repo", Agent: "reviewer", Action: "review", PullRequest: 227,
 		Branch: "main", HeadSHA: "2da08", Instructions: "Review unchanged head.", Home: fixture.home,
+		// #2063: --lead is now explicit. Naming the reviewer here is still allowed -
+		// what changed is that the CALLER must assert it, because the silent default
+		// recorded the reviewer as its own implementer. This test's subject is loop
+		// detection, so it states the lead and keeps its own subject.
+		LeadAgent: "reviewer",
 	}
 	for attempt := 2; attempt <= 319; attempt++ {
 		if _, err := dispatchLocalAgentJob(context.Background(), fixture.store, request); err == nil || !strings.Contains(err.Error(), "review loop detected") {
@@ -538,7 +547,12 @@ func TestDispatchReviewWithoutLeadRejectsReviewOnlyAgentBeforeEnqueue(t *testing
 		RepoFlag: "owner/repo", Agent: "reviewer", Action: "review", PullRequest: 7,
 		HeadSHA: fixture.head, Branch: "feature/review", Home: fixture.home,
 	})
-	if err == nil || !strings.Contains(err.Error(), `review lead "reviewer" lacks implement capability`) {
+	// #2063 RE-PINNED: omitting --lead no longer falls back to the reviewer, so
+	// the dispatch is refused BEFORE the capability check it used to reach. The
+	// property this test guards - a review-only agent never gets enqueued as its
+	// own implementer - is unchanged and is now enforced one step earlier and for
+	// a stronger reason: the caller never said who implemented.
+	if err == nil || !strings.Contains(err.Error(), "requires --lead naming the implementer") {
 		t.Fatalf("dispatch error = %v", err)
 	}
 	assertReviewLeadHardRefusal(t, store, fixture.checkout, adapter)
@@ -556,7 +570,7 @@ func TestDispatchReviewRejectsUnknownLeadBeforeEnqueue(t *testing.T) {
 		RepoFlag: "owner/repo", Agent: "reviewer", Action: "review", PullRequest: 7, LeadAgent: "missing",
 		HeadSHA: fixture.head, Branch: "feature/review", Home: fixture.home,
 	})
-	if err == nil || !strings.Contains(err.Error(), `review lead "missing" is not subscribed`) {
+	if err == nil || !strings.Contains(err.Error(), `review lead "missing" is neither a registered implementer nor a known org role`) {
 		t.Fatalf("dispatch error = %v", err)
 	}
 	assertReviewLeadHardRefusal(t, store, fixture.checkout, adapter)

@@ -1700,8 +1700,13 @@ func TestDispatchForegroundReviewToManagedTypeStillErrors(t *testing.T) {
 		Instructions: "Review the PR foreground.",
 		Home:         home,
 	})
-	if err == nil || !strings.Contains(err.Error(), `agent "planner" not found`) {
-		t.Fatalf("review-to-type dispatch err = %v, want \"agent not found\"", err)
+	// #2063 RE-PINNED: the refusal now fires on the missing --lead, one step
+	// before the reviewer-existence check it used to reach, because omitting
+	// --lead no longer self-attributes to the reviewer. The property this test
+	// exists for is the assertion BELOW - a review dispatch to a managed type must
+	// spin no instance - and that is unchanged.
+	if err == nil || !strings.Contains(err.Error(), "requires --lead naming the implementer") {
+		t.Fatalf("review-to-type dispatch err = %v, want the missing-lead refusal", err)
 	}
 	instances, err := store.ListAgentInstances(context.Background())
 	if err != nil {
