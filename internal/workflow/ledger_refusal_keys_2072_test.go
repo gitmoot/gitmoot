@@ -153,8 +153,23 @@ func TestEveryWireStringFieldIsClassified(t *testing.T) {
 		// silently, which is the drift this test exists to stop.
 		field := wire.Field(i)
 		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
-		if name == "" || name == "-" {
+		// #2078 f4: AN ABSENT TAG IS NOT AN EXCLUSION DECISION. `json:"-"` is one -
+		// somebody wrote it. A MISSING tag is silence, and encoding/json does not
+		// read silence as "ignore this": it matches an untagged exported field by
+		// NAME, case-insensitively. So a content field added without a tag would be
+		// decoded from reviewer payloads and skip this guard entirely.
+		//
+		// The two cases are now distinguished: `-` is honoured as the decision it
+		// is, and an untagged exported field must be classified under the key
+		// encoding/json would actually use.
+		if name == "-" {
 			continue
+		}
+		if name == "" {
+			if !field.IsExported() {
+				continue
+			}
+			name = strings.ToLower(field.Name)
 		}
 		if !classified[name] {
 			t.Fatalf("reviewFindingWire field %q (json %q) is neither in ledgerContentKeys nor "+
