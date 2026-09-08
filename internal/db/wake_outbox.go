@@ -26,6 +26,11 @@ const (
 
 const (
 	WakeOutboxDeliveryUnknownEventKind = "wake_delivery_unknown"
+	// WakeOutboxDeliveredEventKind records an aged row whose delivery the store
+	// could PROVE from destination evidence rather than infer from its columns
+	// (#1958 item 3). It is a distinct kind because an operator reading the
+	// stream must be able to tell a resolved obligation from an unknown one.
+	WakeOutboxDeliveredEventKind = "wake_delivered"
 	// WakeOutboxDeliveryFailedEventKind records a wake that will NOT be retried
 	// again: either its cause is not transient or its attempt budget is spent
 	// (#1982). It exists so an undelivered obligation is attributable from the
@@ -414,6 +419,37 @@ func listWakeOutboxObligations(
 	return out, nil
 }
 
+// wakeOutboxDestinationEvidenceExists is the ONE definition of DESTINATION
+// EVIDENCE for a directive-class wake row: a note in the directive's own
+// workflow that acknowledges it or records its delivery. It is a fact about the
+// world - the wake reached the seat - so both readers of that fact share this
+// definition rather than keeping a copy each.
+//
+// #1958 item 3 is what a second copy cost. The obligation projection consulted
+// this evidence to pick a directive's phase, and ExpireAgedWakeOutbox - the
+// function immediately below it - wrote `delivery_unknown` without ever asking.
+// #1911 measured the consequence: directive 126123 was acknowledged about two
+// minutes after its row was created and 78 minutes before that row was flagged
+// as undelivered.
+//
+// It references wake_outbox.source_id, so it is valid in any statement whose
+// subject is wake_outbox, SELECT or UPDATE alike.
+const wakeOutboxDestinationEvidenceExists = `EXISTS (
+				SELECT 1
+				FROM workflow_notes d
+				JOIN workflow_notes r ON r.workflow_id = d.workflow_id
+				WHERE d.id = CAST(wake_outbox.source_id AS INTEGER)
+					AND (
+						substr(r.body, 1, length('[org:directive-ack id=' || wake_outbox.source_id || ' ')) = '[org:directive-ack id=' || wake_outbox.source_id || ' '
+						OR substr(r.body, 1, length('[org:directive-delivered id=' || wake_outbox.source_id || ' ')) = '[org:directive-delivered id=' || wake_outbox.source_id || ' '
+					)
+			)`
+
+// wakeOutboxDirectiveClass restricts a predicate to the rows destination
+// evidence can exist for. A reply-class row has no equivalent marker, so it
+// keeps the unknown outcome rather than being laundered by an absent check.
+const wakeOutboxDirectiveClass = `source_kind = 'workflow_note' AND coalesce_key LIKE 'directive:%'`
+
 func wakeOutboxObligationQuery(attemptedBefore time.Time) (string, []any) {
 	predicate, args := wakeOutboxObligationPredicate(attemptedBefore)
 	return `
@@ -432,16 +468,7 @@ SELECT id, source_kind, source_id, target_role, coalesce_key, state,
 						OR substr(r.body, 1, length('[org:directive-done id=' || wake_outbox.source_id || ' ')) = '[org:directive-done id=' || wake_outbox.source_id || ' '
 					)
 			) THEN 'terminal'
-			WHEN EXISTS (
-				SELECT 1
-				FROM workflow_notes d
-				JOIN workflow_notes r ON r.workflow_id = d.workflow_id
-				WHERE d.id = CAST(wake_outbox.source_id AS INTEGER)
-					AND (
-						substr(r.body, 1, length('[org:directive-ack id=' || wake_outbox.source_id || ' ')) = '[org:directive-ack id=' || wake_outbox.source_id || ' '
-						OR substr(r.body, 1, length('[org:directive-delivered id=' || wake_outbox.source_id || ' ')) = '[org:directive-delivered id=' || wake_outbox.source_id || ' '
-					)
-			) THEN 'completion'
+			WHEN ` + wakeOutboxDestinationEvidenceExists + ` THEN 'completion'
 			ELSE 'acknowledgment'
 		END,
 		CASE
@@ -537,6 +564,7 @@ ORDER BY attempted_at, id`,
 
 	stamp := at.UTC().Format(BlockedEpisodeTimeLayout)
 	const detail = "delivery outcome unknown after attempted wake aged out; not retried"
+	const deliveredByEvidenceDetail = "delivery proven by destination evidence after attempted wake aged out; the directive was acknowledged"
 	// A CLAIMED BATCH IS ONE WAKE, AND THIS SWEEP IS THE SIBLING SEAM THAT DID
 	// NOT KNOW IT. #1982 moved the coalescing collapse from claim time to
 	// outcome time, which left a whole batch `attempted` until its outcome; this
@@ -549,11 +577,41 @@ ORDER BY attempted_at, id`,
 	// and the rows it collapsed are superseded into it: the same accounting a
 	// delivered or failed batch already uses. Rows are ordered by attempted_at
 	// then id, so the first row of each claim group is its survivor.
+	// DESTINATION EVIDENCE BEFORE THE WRITE-OFF (#1958 item 3). A row whose
+	// directive was acknowledged demonstrably reached its seat, so calling it
+	// `delivery_unknown` records a negative that the store can disprove. One
+	// query for the whole aged set, inside this transaction and after the write
+	// lock is already held, so it costs no extra contention.
+	delivered := map[int64]struct{}{}
+	evidenceRows, err := tx.QueryContext(writeCtx, `
+SELECT id FROM wake_outbox
+WHERE state = 'attempted' AND attempted_at IS NOT NULL AND attempted_at <= ?
+	AND `+wakeOutboxDirectiveClass+`
+	AND `+wakeOutboxDestinationEvidenceExists,
+		attemptedBefore.UTC().Format(BlockedEpisodeTimeLayout))
+	if err != nil {
+		return nil, err
+	}
+	for evidenceRows.Next() {
+		var id int64
+		if err := evidenceRows.Scan(&id); err != nil {
+			_ = evidenceRows.Close()
+			return nil, err
+		}
+		delivered[id] = struct{}{}
+	}
+	if err := evidenceRows.Close(); err != nil {
+		return nil, err
+	}
+
 	seenSurvivor := map[string]int64{}
-	for _, entry := range entries {
+	for index, entry := range entries {
 		group := strings.ToLower(strings.TrimSpace(entry.TargetRole)) + "\x00" +
 			entry.CoalesceKey + "\x00" + entry.AttemptedAt
 		state, rowDetail := WakeOutboxStateDeliveryUnknown, detail
+		if _, proven := delivered[entry.ID]; proven {
+			state, rowDetail = WakeOutboxStateDelivered, deliveredByEvidenceDetail
+		}
 		survivor, collapsed := seenSurvivor[group]
 		if collapsed {
 			state, rowDetail = WakeOutboxStateSuperseded, WakeOutboxCoalescedDetail(survivor)
@@ -576,20 +634,36 @@ WHERE id = ? AND state = 'attempted' AND attempted_at <= ?`,
 		if affected != 1 {
 			return nil, fmt.Errorf("expire wake outbox row %d updated %d rows, want 1", entry.ID, affected)
 		}
+		// THE RETURN DESCRIBES WHAT THIS SWEEP DECIDED, not the row it read
+		// (#1958). The caller partitions on it to tell a PROVEN delivery from a
+		// genuinely unknown one, and returning the pre-update `attempted` state
+		// made every resolution indistinguishable from an unknown - which is how
+		// a proven delivery still produced an unknown-delivery diagnostic and
+		// drove the drain unhealthy.
+		entries[index].State = state
+		entries[index].LastError = rowDetail
+		entries[index].FinishedAt = stamp
+		entries[index].UpdatedAt = stamp
 		if collapsed {
 			// The audit event belongs to the obligation, not to every row it
 			// carried: N events for one undelivered wake is the same
 			// over-counting in the job-event stream.
 			continue
 		}
+		kind, policy := WakeOutboxDeliveryUnknownEventKind, "expire_without_retry"
+		if state == WakeOutboxStateDelivered {
+			// A resolved obligation is not an unknown one, and an event stream
+			// that records it as unknown reproduces the defect downstream.
+			kind, policy = WakeOutboxDeliveredEventKind, "resolved_by_destination_evidence"
+		}
 		message := fmt.Sprintf(
-			"source=%s:%s target_role=%s attempted_at=%s policy=expire_without_retry",
-			entry.SourceKind, entry.SourceID, entry.TargetRole, entry.AttemptedAt,
+			"source=%s:%s target_role=%s attempted_at=%s policy=%s",
+			entry.SourceKind, entry.SourceID, entry.TargetRole, entry.AttemptedAt, policy,
 		)
 		if _, err := tx.ExecContext(writeCtx,
 			`INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`,
 			fmt.Sprintf("wake-outbox:%d", entry.ID),
-			WakeOutboxDeliveryUnknownEventKind,
+			kind,
 			message,
 		); err != nil {
 			return nil, err

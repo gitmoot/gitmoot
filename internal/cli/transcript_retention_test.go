@@ -196,7 +196,7 @@ func TestRetainedTranscriptLogAppendPermissionsDisabledAndOpenFailure(t *testing
 	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+"\n[transcripts]\nenabled = false\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if file, err := openRetainedTranscriptLog(home, "disabled"); err != nil || file != nil {
+	if file, err := openRetainedTranscriptLog(home, "disabled", "review", "codex", 0, nil); err != nil || file != nil {
 		t.Fatalf("disabled open = file %v err %v, want no file and no error", file, err)
 	}
 	if _, err := os.Stat(filepath.Join(paths.Logs, "jobs")); !errors.Is(err, os.ErrNotExist) {
@@ -206,20 +206,20 @@ func TestRetainedTranscriptLogAppendPermissionsDisabledAndOpenFailure(t *testing
 	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	first, err := openRetainedTranscriptLog(home, "retry/id")
+	first, err := openRetainedTranscriptLog(home, "retry/id", "review", "codex", 0, nil)
 	path := retainedTranscriptLogPathForTest(t, home, "retry/id")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := first.WriteString("attempt-one\n"); err != nil {
+	if _, err := first.Write([]byte("attempt-one\n")); err != nil {
 		t.Fatal(err)
 	}
 	_ = first.Close()
-	second, err := openRetainedTranscriptLog(home, "retry/id")
+	second, err := openRetainedTranscriptLog(home, "retry/id", "review", "codex", 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := second.WriteString("attempt-two\n"); err != nil {
+	if _, err := second.Write([]byte("attempt-two\n")); err != nil {
 		t.Fatal(err)
 	}
 	_ = second.Close()
@@ -234,7 +234,7 @@ func TestRetainedTranscriptLogAppendPermissionsDisabledAndOpenFailure(t *testing
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("mode = %v, want 0600", info.Mode().Perm())
 	}
-	if file, err := openRetainedTranscriptLog(home, strings.Repeat("x", 5000)); err == nil || file != nil {
+	if file, err := openRetainedTranscriptLog(home, strings.Repeat("x", 5000), "review", "codex", 0, nil); err == nil || file != nil {
 		t.Fatalf("oversized filename open = file %v err %v, want fail-open signal", file, err)
 	}
 }
@@ -245,7 +245,7 @@ func TestRetainedTranscriptLogDefaultOn(t *testing.T) {
 	if err := config.Initialize(paths); err != nil {
 		t.Fatal(err)
 	}
-	file, err := openRetainedTranscriptLog(home, "default-on")
+	file, err := openRetainedTranscriptLog(home, "default-on", "review", "codex", 0, nil)
 	path := retainedTranscriptLogPathForTest(t, home, "default-on")
 	if err != nil {
 		t.Fatal(err)
@@ -253,7 +253,7 @@ func TestRetainedTranscriptLogDefaultOn(t *testing.T) {
 	if file == nil || path != transcript.JobLogPath(paths.Logs, "default-on") {
 		t.Fatalf("default-on log = path %q file %v", path, file)
 	}
-	if _, err := file.WriteString("stdout and stderr stream\n"); err != nil {
+	if _, err := file.Write([]byte("stdout and stderr stream\n")); err != nil {
 		t.Fatal(err)
 	}
 	if err := file.Close(); err != nil {
