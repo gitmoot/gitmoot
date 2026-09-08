@@ -1555,11 +1555,30 @@ func (s *Store) ReleaseJobEventClaim(ctx context.Context, event JobEvent) (bool,
 	if err != nil {
 		return false, err
 	}
+
 	affected, err := result.RowsAffected()
 	if err != nil {
 		return false, err
 	}
 	return affected > 0, nil
+}
+
+// RecordJobEventOnce writes an annotation at most once and reports ONLY whether
+// the write failed. It wraps ClaimJobEvent and discards the claimed bool HERE,
+// at the wrapper, rather than at the call site.
+//
+// THE DISCARD IS THE POINT, and it is why this exists rather than the caller
+// simply ignoring ClaimJobEvent's return. That bool says "I was first", which is
+// a fact about global state a decision could branch on. A method that cannot
+// return it makes the leak UNREPRESENTABLE instead of merely unwise, so no
+// future author has to remember a promise (#2008).
+//
+// This is what lets the merge gate annotate a row it excluded without gaining a
+// way to read anything. Widen a firewall with a method that cannot carry
+// decision input, never with one where the caller promises not to look.
+func (s *Store) RecordJobEventOnce(ctx context.Context, event JobEvent) error {
+	_, err := s.ClaimJobEvent(ctx, event)
+	return err
 }
 
 // UpsertLatestJobEvent keeps one mutable latest-only row for a job/event kind.

@@ -70,16 +70,35 @@ func HeadBoundExclusion(externallyDriven bool, headSHA string) (string, bool) {
 // #1990 established must never happen. This function records an EVENT beside the
 // row and touches no payload.
 func RecordHeadBoundExclusion(ctx context.Context, store *db.Store, jobID, consumer, reason string) error {
+	event, ok := HeadBoundExclusionEvent(jobID, consumer, reason)
+	if !ok || store == nil {
+		return nil
+	}
+	_, err := store.ClaimJobEvent(ctx, event)
+	return err
+}
+
+// HeadBoundExclusionEvent builds the annotation without writing it, so the
+// MESSAGE has exactly one definition while its WRITE has two call shapes.
+//
+// The merge gate cannot use RecordHeadBoundExclusion above: it sits behind the
+// store allowlist that TestMergeGateStoreAccessSurface enforces, and it must
+// call a permitted method on g.Store DIRECTLY. Passing g.Store to a helper would
+// compile and the surface test would not notice - see #2038 - but routing around
+// a firewall through a shape its test cannot see is worse than widening it.
+//
+// So the gate calls g.Store.RecordJobEventOnce with this event, which the test
+// DOES see, and the content stays single-sourced here.
+func HeadBoundExclusionEvent(jobID, consumer, reason string) (db.JobEvent, bool) {
 	jobID = strings.TrimSpace(jobID)
 	consumer = strings.TrimSpace(consumer)
 	reason = strings.TrimSpace(reason)
-	if store == nil || jobID == "" || consumer == "" || reason == "" {
-		return nil
+	if jobID == "" || consumer == "" || reason == "" {
+		return db.JobEvent{}, false
 	}
-	_, err := store.ClaimJobEvent(ctx, db.JobEvent{
+	return db.JobEvent{
 		JobID:   jobID,
 		Kind:    HeadBoundExclusionEventKind,
 		Message: fmt.Sprintf("%s: excluded from a head-bound decision (%s)", consumer, reason),
-	})
-	return err
+	}, true
 }
