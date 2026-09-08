@@ -449,7 +449,16 @@ strong reviewer that cannot be identified must never degrade to *the cheap stage
 approved it*, so the reviewer is an operator's decision per repo rather than a
 constant in the Gitmoot source.
 
-Job kill deadlines are independent from stale-running detection. Configure the
+Job kill deadlines are independent from stale-running detection.
+
+A review dispatched at a pinned head also receives a **dispatch-time CI evidence**
+block naming what the repository's own gate already established at that exact
+commit (#1824). When every check succeeded the reviewer is told not to re-run the
+full suite to re-establish it, and told to keep whatever baseline its own
+verification needs as a control - mutation testing is not reduced. A failing head
+is never described as green, a pending rollup is reported as no evidence yet, and
+the block is absent entirely when GitHub cannot be read, so the prompt is
+byte-identical rather than guessed. Configure the
 daemon defaults with:
 
 ```toml
