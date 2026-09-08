@@ -411,6 +411,21 @@ One repo's concurrency can also be capped **from config, without any relaunch**,
 via a `[repos."owner/repo"]` section with `max_parallel = N` (#576) — see
 [Cap one repo's parallelism from config](../workflows/parallel-jobs-workflow.md#cap-one-repos-parallelism-from-config).
 
+`org chart` and `org status` render the provider's last completed **turn**
+alongside `seen=` (#1702). `org status --json` carries it as `last_turn`.
+
+The turn measures PROGRESS; `seen=` measures RECENCY, and they answer different
+questions - a seat can be inside one long turn with a stale note age and be
+perfectly healthy. Measured on one host, two seats read 27h and 45h by note age
+while each had completed a turn minutes earlier.
+
+`last_turn` is ABSENT rather than zero when the provider reported no turn
+activity, and the text surfaces render `-` for that case. A reported turn of `0`
+is a real value and renders as `0`; a rendered `0` for silence would invent a
+stalled seat. An unavailable role keeps its reported turn, because an
+unavailability incident says whether a role may be dispatched to, not whether
+the provider reported anything.
+
 Job kill deadlines are independent from stale-running detection. Configure the
 daemon defaults with:
 
@@ -1805,6 +1820,13 @@ and attempts. `attention`, `guard`, `job-terminal`,
 `review-verdict`, `recycle-overdue`, and `pane_input_pending` wakes remain
 best-effort; zero rules leaves the feature off.
 
+An aged row whose delivery the store can PROVE is recorded `delivered` with a
+`wake_delivered` job event carrying `policy=resolved_by_destination_evidence`,
+rather than `delivery_unknown`. The proof is a note in the directive's own
+workflow acknowledging it (`[org:directive-ack id=<id> ...]`) or recording its
+delivery (`[org:directive-delivered id=<id> ...]`), naming that row's directive;
+a reply-class row has no equivalent marker and keeps the unknown outcome.
+
 ```sh
 gitmoot orchestrate planner "Coordinate the dashboard wave." --repo owner/repo --workflow fable/dashboard-redesign
 gitmoot job list --workflow fable/dashboard-redesign
@@ -2181,6 +2203,153 @@ follow-up. Usage is labeled
 `latest reported usage` because resumed Codex counts can be session-cumulative.
 Malformed or unknown lines degrade individually to redacted capped raw output
 without stopping later lines.
+
+### Where a review's wall time went (`phase_profile`)
+
+Every **review** job with a retained transcript emits one `phase_profile` job
+event per attempt, visible in `gitmoot job events <job-id>`. Other job types
+are deliberately untouched: the profile is appended after a job's terminal
+events, so emitting it everywhere would change the observable event sequence of
+jobs this measurement has no business affecting.
+
+The transcript records *what* ran, not *when* — the runtime streams carry no
+event timestamps, and snapshot replay deliberately refuses to invent elapsed
+time from parser speed — so the timing is recorded live or not at all.
+
+Two identities, and the difference between them is the finding. Commands can
+run concurrently, so their durations do not partition anything on their own:
+
+```
+covered_ms + residual_ms == wall_ms
+sum(bucket_ms)           == covered_ms + overlap_ms
+```
+
+- `covered_ms` — wall time with at least one command in flight (the **union**
+  of command intervals).
+- `residual_ms` — wall time with **no command in flight**; non-negative by
+  construction because it is `wall - covered`, never `wall - sum`.
+- `overlap_ms` — concurrent command time, reported rather than absorbed.
+- `bucket_ms` / `bucket_count` — per-command measured time classified as
+  `test`, `build`, `vcs`, `mixed`, `unknown` or `other`. Classification reads
+  every segment and consumes wrapper arguments, so `timeout 25m go test ./...`
+  is `test` and `git commit -m "go test is slow"` is `vcs`.
+- `unknown` is a **refusal, not a leftover**. The classifier is a cheap lexer
+  with a declared grammar (quoting, escapes, sequencing operators and redirect
+  forms, comments, wrapper prefixes); anything outside it — substitutions,
+  backquotes, process substitution, subshells, arithmetic commands, heredocs,
+  `;;`, an unterminated quote or a trailing line continuation — yields
+  `unknown` rather than a confident bucket. Its time still counts in
+  `covered_ms`. `other` means "understood, matched no phase"; `unknown` means
+  "not classifiable by this lexer".
+- `commands`, `in_flight` (still running at close — their time is counted),
+  `unpaired` (a result whose call id was never opened), `tool_events`
+  (non-shell tool activity such as `file_change`), `id_collisions`, and
+  `dropped_bytes` (from a capped over-long unterminated line).
+- `attempt` — the job's lifecycle generation, because `job retry` re-delivers
+  the same job id.
+- `coverage` — **read this before the buckets.** `decomposed` means the runtime
+  emits per-tool events (Codex, Kimi). `opaque_runtime` means it does not:
+  Claude reports one final envelope and no tool events, so an opaque row has
+  zero commands however long the job took. That is a blind spot, not a
+  measurement that the job spent its time outside commands.
+
+**The grammar is an ACCEPTOR with per-character provenance.** A command is
+classified only if every token positively matches the declared shapes:
+assignments (whose NAME characters are unquoted and form an identifier),
+redirections (whose OPERATOR characters are unquoted, with a validated operand),
+a plain command word, and arguments carrying no UNQUOTED `{ } * ? [ ] ~ < > | &`.
+Quoting is tracked per character, because a quote around one fragment does not
+disable expansion in the rest: `go test ./internal/"cli"*` still globs and
+returns `unknown`, while `go test "./internal/cli*"` is literal and returns
+`test`. A redirection and its operand are validated as ONE unit, so
+`go >probe* test` and `go > "" test` refuse, while `go 2>"out file" test` and
+`go 2>&"1" test` classify normally. Backslashes follow bash: inside double
+quotes a backslash is literal unless it precedes `$`, a backquote, `"` or `\`,
+and an unquoted backslash-newline is a line continuation. `env` consumes its own
+assignments, so `env PROBE=1 go test` is `test`.
+
+Wrapper handling follows each wrapper's real semantics: only `env` consumes
+variable assignments, so `env PROBE=1 go test ./...` is a test while
+`bash PROBE=1 go test ./...` is not - bash, sh, zsh and nohup take that word as
+their script or command operand, and really do exit without invoking Go.
+
+Shell INTERPRETERS are not executable wrappers. `bash`, `sh` and `zsh` unwrap
+only when a command-string option is present (`-c`, `-lc`, `-ce`, and other
+short bundles containing `c`; long options never qualify). Without one, the
+operand is a SCRIPT FILE - `bash go test ./...` runs a script named `go` and
+never invokes the Go toolchain, so it is not reported as a test. Executable
+wrappers (`nohup`, `env`, `timeout`, `sudo`, ...) do exec their operand and
+keep unwrapping.
+
+Interpreter OPTION STATE is honoured, not guessed from token shape: `--` ends
+option parsing (so `bash -- -c cmd` runs a script named `-c`), value-taking
+options consume their argument (`--rcfile FILE`, `-O NAME`, `-o NAME`), and an
+option outside the declared set - an invalid bundle such as `-zc`, or an
+ambiguous value letter in mid-cluster - is reported as `unknown` rather than
+given a bucket, because the shell aborts or the parse is ambiguous. A `-c` is
+honoured only when it belongs to an interpreter: `nohup -c cmd` execs a command
+named `-c`.
+
+The implemented boundary, stated exactly. After `-c`, exactly ONE operand is the
+command string; following words are positional parameters, so
+`bash -c "go" test ./...` is not a Go test. Options that parse or print instead
+of executing - `-n`, `-D`, `--help`, `--version` - mean the command string never
+runs. Option grammars are PER INTERPRETER: POSIX sh rejects `--noprofile`, `-O`
+and `-o` here, boolean long options take no inline value (`--noprofile=x`
+aborts), and zsh is UNMEASURED on this box, so only `-c` and `--` are declared
+for it and every other zsh option is reported `unknown`. Anything outside a
+declared grammar is `unknown`, never a bucket.
+
+Option POLARITY and per-interpreter VALIDITY are modelled as data, not shared
+logic. `-x` sets and `+x` clears, and the last setting wins: `bash -n +n -c cmd`
+runs the command while `bash +n -n -c cmd` does not. Tables are measured against
+the interpreters installed on the machine - bash accepts `-h`, the installed
+dash does not and has NO long options at all, and `--pretty-print` runs the
+command rather than suppressing it. zsh is unmeasured here, so only `-c` and
+`--` are declared for it and even `+c` refuses, although `+c` does introduce a
+command string in bash and dash.
+
+Options are modelled PER OPTION on four axes, each measured against the
+installed interpreters. EXECUTION EFFECT distinguishes clearable noexec (`-n`,
+`+n`, `-o noexec`) from sticky terminal forms (`-D`, `+D`, `--help`,
+`--version`, `--dump-strings`, `--dump-po-strings`) that print or dump and are
+never restored by a later `+n`. ARGUMENT FORM: long options take a separate
+value only, so `--rcfile=/dev/null` is refused while `--rcfile /dev/null` runs.
+VALUE DOMAIN: `-o`/`-O` values are checked against the shell's own `set -o` and
+`shopt` names, which differ per interpreter - `sh -o pipefail` is refused
+because dash does not have it, and dash has no `shopt` at all. ORDERING: a named
+long option after a short cluster is refused, matching the real shells, while
+the bare `--` terminator is exempt. Anything outside a measured table is
+`unknown`.
+
+WRAPPERS have declared grammars too, one per wrapper: options are matched by
+exact token with value domains measured against the installed binaries - a
+timeout duration is any number the shell's own parser accepts (including `.5s`,
+`1.s`, `+1s`, `1e3` and `inf`) with at most one lowercase s/m/h/d suffix and no
+leading minus; a signal is an exact name - the full `kill -l` set including the
+RTMIN/RTMAX family and the IOT/CLD/POLL aliases - or 0-64, with no whitespace
+padding; `nice -n` is a signed integer; `ionice -c` is 0-3 OR a class name
+(`none`, `realtime`, `best-effort`, `idle`) and `ionice -n` has no small upper
+bound; `xargs -n` is at least 1 and `-P` allows 0, both with an optional `+`;
+and stdbuf's THREE STREAMS DO NOT SHARE A DOMAIN - `-o` and `-e` take `L`, `-i`
+does not, and all three take 0 or a size with a unit suffix - and the `--` terminator is accepted in option
+position before the duration, so `timeout --definitely-invalid 1s ...`, `timeout -s -999 1s ...` and
+`timeout 1x ...` are refused rather than stripped. The token after the duration
+is the COMMAND even when it is dash-prefixed. THE CLAIM IS DELIBERATELY NARROW
+in two further places. Where two installed implementations of a wrapper
+disagree - GNU coreutils exits 127 on `timeout <dur> -- cmd` while another
+`timeout` on PATH runs it - the result is `unknown`, because measured-twice-with-
+different-answers admits no confident bucket. And where a shell option's effect
+depends on runtime state rather than on the option, classification fails closed:
+bash restricted mode reports `unknown` because what it blocks depends on the
+command text - but only where it is actually ENABLED: `-r`, `--restricted` and
+`-o restricted` refuse, and so does `+r` AFTER one of them, since bash exits 2
+on that. A bare `+r` is valid, leaves the shell unrestricted and classifies
+normally, and an errexit
+command string (`-e`, `-o errexit`) reports `unknown` when it has more than one
+segment, since which segment runs depends on an exit status no lexer can know.
+A single-segment errexit command still classifies normally.
+
 
 `job transcript <job-id> --export md` remains the deterministic, ANSI-free
 Markdown snapshot. `--export jsonl` emits schema-versioned, self-contained

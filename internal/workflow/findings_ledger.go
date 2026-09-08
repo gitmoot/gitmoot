@@ -156,6 +156,25 @@ func dischargedAtHead(observations []db.ReviewFindingObservation, head string) m
 		if obs.EvidenceKind == db.EvidenceQuoted {
 			continue
 		}
+		// #1941 f4, P1. STATIC ROWS DO NOT SHORT-CIRCUIT HERE. This function ran
+		// BEFORE answeredIsMandatory and skipped any same-head non-QUOTED row, so
+		// a discharge recorded at the head being judged was accepted without its
+		// locator ever being resolved: a reviewer probe continued a mandatory P1
+		// citing does/not/exist.go, AdvanceJob persisted it STATIC/answered,
+		// EnsureLedgerObligationsObserved accepted it, and PathExistsAtHead ran
+		// ZERO times.
+		//
+		// STATIC is the ONLY kind whose locator existence is re-checked, so a
+		// STATIC row must reach answeredIsMandatory and be judged there - at the
+		// same head or a later one. EXECUTED rows keep the short-circuit: they
+		// carry executed commands and have no locator to resolve.
+		//
+		// The fix is the ORDER, not another writer-side compensation: the writer
+		// cannot know whether a path exists (it has no tree) and every attempt to
+		// compensate for that in the writer produced a new invention.
+		if obs.EvidenceKind == db.EvidenceStatic {
+			continue
+		}
 		seen[obs.FindingUID] = true
 	}
 	return seen
