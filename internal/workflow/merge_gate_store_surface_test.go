@@ -43,6 +43,7 @@ func TestMergeGateStoreAccessSurface(t *testing.T) {
 		"ReleaseRetainedTaskStateClaim",
 		"ReleaseLockWithEvent",
 		"ReleaseResourceLock",
+		"RecordJobEventOnce",
 		"ReleaseTaskStateClaim",
 		"RenewTaskStateClaim",
 		"RetainTaskStateClaim",
