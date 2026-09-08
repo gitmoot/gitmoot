@@ -18,7 +18,28 @@ const SessionJobDisplayEventKind = "session_job_display"
 
 type SessionJobDisplayEvent struct {
 	HeadSHA string `json:"head_sha"`
+	// Plane and Source LABEL THE ROW, because until #2062 the quarantine existed
+	// only in Go comments and in one line of CLI stdout at record time. The
+	// stored event proved a head had been ASSERTED and said nothing about whether
+	// it had been accepted as evidence or held apart from it, so a reader coming
+	// to the row later - which is every reader - could not tell.
+	//
+	// That cost three seats an hour on 2026-09-08: each read the payload plane,
+	// found no head, and reported the value missing when it was sitting here.
+	// Two of the three then proposed remedies for a defect that did not exist.
+	// A row that cannot say which plane it is on invites exactly that.
+	Plane  string `json:"plane,omitempty"`
+	Source string `json:"source,omitempty"`
 }
+
+const (
+	// SessionJobDisplayPlane names the non-evidence plane in the row itself.
+	SessionJobDisplayPlane = "display"
+	// SessionJobDisplayHeadSource records WHERE the head came from. Caller
+	// asserted is the only possible answer here: the CLI takes it from --head-sha
+	// and nothing verifies it, which is why #1990 keeps it out of JobPayload.
+	SessionJobDisplayHeadSource = "caller_asserted"
+)
 
 // ExternalJobUsage is caller-reported evidence for externally driven work. Zero
 // values preserve the historical empty-model, zero-token session row exactly;
@@ -34,7 +55,11 @@ func sessionJobDisplayEvent(jobID, headSHA string) (db.JobEvent, bool) {
 	if headSHA == "" {
 		return db.JobEvent{}, false
 	}
-	message, err := json.Marshal(SessionJobDisplayEvent{HeadSHA: headSHA})
+	message, err := json.Marshal(SessionJobDisplayEvent{
+		HeadSHA: headSHA,
+		Plane:   SessionJobDisplayPlane,
+		Source:  SessionJobDisplayHeadSource,
+	})
 	if err != nil {
 		return db.JobEvent{}, false
 	}
@@ -56,6 +81,18 @@ func ParseSessionJobDisplayEvent(event db.JobEvent) (SessionJobDisplayEvent, boo
 		return SessionJobDisplayEvent{}, false
 	}
 	display.HeadSHA = strings.TrimSpace(display.HeadSHA)
+	// ROWS WRITTEN BEFORE THE LABEL EXISTED ARE STILL DISPLAY-PLANE ROWS, and are
+	// filled in rather than rejected: 13 such rows exist on this host and every
+	// one of them is caller-asserted by construction, because this event has only
+	// ever been written from --head-sha. Refusing them would delete the very
+	// evidence the label was added to make legible, and leaving the fields empty
+	// would let a reader infer that an unlabelled row might be evidence-grade.
+	if strings.TrimSpace(display.Plane) == "" {
+		display.Plane = SessionJobDisplayPlane
+	}
+	if strings.TrimSpace(display.Source) == "" {
+		display.Source = SessionJobDisplayHeadSource
+	}
 	return display, true
 }
 

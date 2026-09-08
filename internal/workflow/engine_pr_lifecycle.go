@@ -910,6 +910,16 @@ func (e Engine) nextReviewRound(ctx context.Context, event PullRequestEvent) (st
 		}
 		if payload.HeadSHA != "" && payload.HeadSHA == event.HeadSHA {
 			existingHeadRound = round
+		} else if reason, excluded := HeadBoundExclusion(job.ExternallyDriven, payload.HeadSHA); excluded {
+			// A headless row can never be the round already open at this head, so
+			// it neither advances the round counter through this arm nor prevents a
+			// new round. Correct, and previously silent (#2008). Its ReviewRound
+			// still counts toward maxReviewRound above: that is round-keyed and is
+			// not this slice.
+			if err := RecordHeadBoundExclusion(ctx, e.Store, job.ID,
+				"engine_pr_lifecycle.nextReviewRound", reason); err != nil {
+				return "", nil, err
+			}
 		}
 	}
 	if existingHeadRound != "" {

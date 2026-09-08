@@ -892,6 +892,23 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	for _, review := range taskReviews {
 		reviewHead := strings.TrimSpace(review.payload.HeadSHA)
 		if reviewHead == "" || reviewHead != headSHA {
+			// BEHAVIOUR UNCHANGED and no head is written. A headless review still
+			// cannot enter reviewsAtHead and still cannot satisfy a reviewer slot;
+			// a verdict's head must be engine-observed (#1990). Only the silence
+			// goes (#2008).
+			//
+			// RecordJobEventOnce is called DIRECTLY on g.Store, not through the
+			// package recorder, because this function is inside the store
+			// allowlist and the surface test only sees direct calls. Handing
+			// g.Store to a helper would work and go unnoticed (#2038); doing that
+			// would be evading the firewall rather than widening it.
+			if reason, excluded := HeadBoundExclusion(review.job.ExternallyDriven, reviewHead); excluded {
+				if event, ok := HeadBoundExclusionEvent(review.job.ID, "merge_gate.ensureFinalReviewCaptured", reason); ok {
+					if err := g.Store.RecordJobEventOnce(ctx, event); err != nil {
+						return err
+					}
+				}
+			}
 			continue
 		}
 		reviewsAtHead = append(reviewsAtHead, review)

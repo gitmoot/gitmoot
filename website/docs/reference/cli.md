@@ -868,9 +868,56 @@ how it states provenance. The recorded-head arm reads an append-only store fact
 rather than git, so a legitimate prior head still passes after a force push has
 left it unreachable. A citation whose relationship cannot be established at all,
 because the dispatching checkout resolves neither commit, also dispatches: that
-is a fact about the checkout rather than about the citation. The pre-existing
-`prompt_head_warning` job event is unchanged and still records every non-head
-citation, including the ones that are allowed.
+is a fact about the checkout rather than about the citation.
+
+`prompt_head_warning` IS still emitted for a review, for two relations rather
+than one. The normal-path relation is a RECORDED PRIOR HEAD THAT IS NOT AN
+ANCESTOR. The second is a citation whose ancestry the classifier could not
+establish: `promptCitationAncestry` returns `known=false` when `IsAncestor`
+errors, and that lands on `promptCommitUnresolved`, which the filter also
+retains. That arm is an INSTRUMENT FAILURE rather than a statement about the
+prompt, and it is deliberately reachable - when the classifier cannot judge a
+citation, nobody has judged it.
+
+Retention is PER CITATION: a warning is kept only when the retained relation is
+the one that warning is about, matched on its leading
+`prompt references commit <token>,` clause. That is what makes the two relations
+above exhaustive - an earlier version tested for the token anywhere in the
+warning text, and since every warning names the dispatch head twice, an unjudged
+token that happened to be a hex run from inside that sha could retain a
+DIFFERENT citation's warning.
+
+Two things are silent. A token the scan itself could not resolve produces no
+warning of its own, because `dispatchPromptHeadContradictionWarnings` discards it
+before any classification. And on the resolvable path ancestry is checked BEFORE
+the recorded-head arm, so a commit that is both a prior head and an ancestor is
+silent - the ordinary scoped re-review, citing its own previous head.
+Ancestor provenance is silent, because naming the branch base is how a prompt
+states where the work sits. The prior-head arm is the force-push shape - the
+commit really was a head of this pull request and no longer is - so a prompt
+naming it as its target is reviewing a tree that is gone, and that is worth one
+line to its operator even though the dispatch proceeds. Ask and implement keep
+the blanket warning, because no refusal runs in front of them and it is their
+only head check.
+
+`--head-sha` must be the FULL 40 hex characters for a review. An abbreviated
+value used to dispatch and then be cancelled by the daemon's staleness check,
+which compared it against the pull request's full head and reported the same
+commit as a move; it is now refused at dispatch, before the read-only worktree,
+the review task row and the job row. The refusal rejects EVERY non-empty value
+that is not exactly 40 hex characters, including a revision expression such as
+`<sha>^` or `<sha>~1`: the daemon binds this value by EQUALITY against the pull
+request's head, so no other shape can bind whatever it looks like. It runs after
+the review-loop and reviewer-identity refusals, so those still name their own
+preconditions first, and before the review task is upserted, so a refused
+dispatch leaves no durable state behind.
+
+`--no-fix-target` dispatches a REVIEW-ONLY review: the reviewer need not be able
+to implement and no `--lead` is required. The lead exists so a
+`changes_requested` verdict has an implementer to route to, so declining one is
+a decision, and it is recorded as a `review_no_fix_target` job event stating
+that the dispatching operator owns the follow-up. An UNSTATED absence still
+refuses, and `--no-fix-target` with `--lead` is refused as mutually exclusive.
 
 This exact `(repo, PR, head_sha, decision)` evidence key is intentional: the
 #1419 review panel rejected round counters and other instruments, so this guard
@@ -884,10 +931,18 @@ starting its runtime session, Gitmoot loads the lead from the agents database
 and requires that it exist, can access the repository, has `implement`
 capability, and uses a write-granting policy (`workspace-write` or
 `danger-full-access`). Without `--lead`, the reviewer is the fallback lead and
-must pass the same checks; a strict review-only agent therefore needs an
-explicit implementer. Managed-type review dispatches also require an explicit
-DB-backed lead. `--lead` is rejected when `agent run` resolves to ask or
+must pass the same checks. Managed-type review dispatches also require an
+explicit DB-backed lead. `--lead` is rejected when `agent run` resolves to ask or
 implement, and is not accepted by `agent implement` or `orchestrate`.
+
+A strict review-only agent therefore needs either an explicit implementer or
+`--no-fix-target`, which declares that this review has NO fix target and the
+dispatching operator owns the follow-up. That declaration is carried on the job
+payload, not only as an event, because advancement is what decides whether a
+`changes_requested` verdict dispatches a fix at all: such a verdict records
+`auto_fix_skipped_no_fix_target` and leaves its findings open in the ledger
+rather than routing a fix to the reviewer that produced it. `--no-fix-target`
+is rejected outside review and is mutually exclusive with `--lead`.
 
 This dispatch-time lead validation applies only to local CLI reviews started by
 `gitmoot agent review` or review-resolved `gitmoot agent run`. Reviews routed

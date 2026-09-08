@@ -50,9 +50,33 @@ infrastructure rather than the documented boundary they are:
   includes the repo-wide gate and `./cmd/gitmoot`. A pure-Go package still builds
   and tests with default cgo, so a passing single-package run proves nothing about
   the gate.
-- **`-race` is unreachable in a seat**, because race requires cgo (`go: -race
-  requires cgo; enable cgo by setting CGO_ENABLED=1`). It is covered by CI's race
-  shards only, and its absence from a seat verdict is not a regression.
+- **`-race` is unreachable from a read-only review seat**, because race requires
+  cgo (`go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`) and the
+  sandbox denies the C header above. Its absence from a review verdict is not a
+  regression, and the boundary is the `ReadOnlySeat` marker, not the kind of
+  clone you hold. Do not trust an enumeration of the sites, including one written
+  here:
+
+  ```sh
+  git grep -n 'ReadOnlySeat.*true' origin/main -- 'internal/*/*.go' ':!*_test.go'
+  ```
+
+  Nine hits on `7a63a37e`, and read them rather than counting them: the pattern
+  matches sites that SET the marker on a request, payload or agent, the
+  `applyReadOnlySeat` call that applies it to a session, and one COMMENT
+  (`internal/cli/daemon_worker.go:1642`) that names isolated shell pipeline stages
+  as carriers. Dropping `':!*_test.go'` returns 67, which is the fixtures talking.
+  Under the marker the daemon assembles the read-only grant environment in
+  `readOnlyRuntimeSandboxGrants` and enforcement is installed separately, by
+  `landlockRuntimeRunner` wrapping the job's runner in a
+  `subprocess.WrappingRunner` that carries the readable, writable and
+  read-only-workdir values. Read those two functions; a summary of what they grant
+  is exactly the kind of enumeration this bullet just told you not to trust. A session that is **not** a `ReadOnlySeat`, is
+  permitted to run Bash by its autonomy policy, and has the C toolchain and
+  headers available can execute race-enabled tests: measured on this host,
+  `CGO_ENABLED=1 go test -race ./internal/db/` returns `ok`. Owning a checkout is
+  not the predicate and neither is being "a seat"; a restrictive autonomy policy
+  blocks Bash regardless.
 
 When a seat's plain `go` returns 126, no usable toolchain was staged. The command
 is an engine-owned failure stub, never a fallthrough to the operator's `go`.
@@ -62,6 +86,31 @@ never in job events. `/opt`, `/usr/local`, `/nix/store`, `/snap`, and profile
 installations all take the same daemon-owned copy path; none retains a recursive
 host-root grant. See `docs/troubleshooting.md`, "`Permission denied`, exit 126,
 running Go".
+
+**Race runs on this host, for any session, not only a seat.** These two rules are
+general and a read-only review seat cannot act on either, which is why they sit
+outside the list above:
+
+- **A local race run is a scoped PROBE, never the lane.** The lane is the
+  partitioned recipe below, and reproducing it takes `-tags e2e` (see the race
+  block): without the tag the compile silently drops 33 tagged `internal/cli`
+  files, 2 in `workflow` and 1 in `daemon`, and the shard plan derived from
+  `-test.list` shrinks to match with nothing failing. Measured on this host,
+  `internal/cli` LISTS **2236** tests with the tag and **2108** without it, so an
+  untagged binary carries 128 fewer tests to run. That is a count from
+  `-test.list` on both binaries; neither was executed to completion here, so the
+  claim is about what the shard plan can select, not about a passing run. `internal/db` lists 402 either way,
+  which is the trap: probing that package proves a race binary can be built and
+  run and says nothing about the lane. A probe that omits the tag cannot answer
+  "does the lane pass". Report what you ran. A race result is also
+  timing-sensitive, so a clean local run is weaker evidence than a clean CI run
+  rather than equal to it.
+- **Do not run two race workloads on this host at once.** This is a precaution,
+  not a measurement: detection depends on the interleavings a run actually
+  executes, and two competing full-repo race workloads change the scheduling
+  each observes. No experiment here establishes a direction for that effect, so
+  treat it as an unquantified risk to an assurance run rather than as a proven
+  false-clean mechanism. Check for a live `-race` binary before starting one.
 
 Run from the repo root and make these pass before committing — they mirror the CI
 gate in `.github/workflows/ci.yml`:
@@ -84,7 +133,11 @@ go test -timeout 25m ./...
     shards="${spec##*:}"
     bundle="$race_dir/$package"
     mkdir -p "$bundle/partitions"
-    go test -c -race -o "$bundle/$package.test" "./internal/$package/"
+    # -tags e2e is REQUIRED, matching ci.yml: without it this compile silently
+    # drops the 33 tagged internal/cli files (plus 2 in workflow and 1 in
+    # daemon), and the shard plan derived from -test.list shrinks to match with
+    # nothing failing.
+    go test -c -race -tags e2e -o "$bundle/$package.test" "./internal/$package/"
     (
       cd "internal/$package"
       "$bundle/$package.test" -test.list '.*'

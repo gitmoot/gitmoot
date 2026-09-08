@@ -443,10 +443,15 @@ func TestCLIReviewLoopAllowsNewHeadAndMixedDecisions(t *testing.T) {
 // count enforcement, and non-idempotent event emission.
 func TestCLIReviewLoopHerdres227Shape(t *testing.T) {
 	fixture := newCLIReviewLoopFixture(t)
-	seedCLIReviewLoopVerdict(t, fixture.store, "herdres-227-first", "2da08", "changes_requested")
+	// A FULL sha, because #2054 now refuses a sha-shaped abbreviation at
+	// dispatch and this test's subject is the review-loop refusal, not head
+	// formatting. The token is arbitrary and shared with the seeded verdict; its
+	// LENGTH was never load-bearing here.
+	const herdres227Head = "2da08e1f4c7b6a5d3e2f1908a7b6c5d4e3f21098"
+	seedCLIReviewLoopVerdict(t, fixture.store, "herdres-227-first", herdres227Head, "changes_requested")
 	request := localAgentDispatchRequest{
 		RepoFlag: "owner/repo", Agent: "reviewer", Action: "review", PullRequest: 227,
-		Branch: "main", HeadSHA: "2da08", Instructions: "Review unchanged head.", Home: fixture.home,
+		Branch: "main", HeadSHA: herdres227Head, Instructions: "Review unchanged head.", Home: fixture.home,
 	}
 	for attempt := 2; attempt <= 319; attempt++ {
 		if _, err := dispatchLocalAgentJob(context.Background(), fixture.store, request); err == nil || !strings.Contains(err.Error(), "review loop detected") {
@@ -540,6 +545,195 @@ func TestDispatchReviewWithoutLeadRejectsReviewOnlyAgentBeforeEnqueue(t *testing
 	})
 	if err == nil || !strings.Contains(err.Error(), `review lead "reviewer" lacks implement capability`) {
 		t.Fatalf("dispatch error = %v", err)
+	}
+	assertReviewLeadHardRefusal(t, store, fixture.checkout, adapter)
+}
+
+// TestDispatchReviewRejectsAbbreviatedHeadSHABeforeEnqueue is #2054 defect 1.
+//
+// An abbreviated --head-sha was ACCEPTED at dispatch and then cancelled by the
+// daemon's staleness check, which compared the 8-character value against the
+// PR's 40-character head and reported `superseded_stale_head: PR #N moved from
+// head "7e4b39d0" to "7e4b39d0ef82…"`. Those are the same commit. The review
+// never ran, and the event sent its operator to look for a push that never
+// happened.
+//
+// Measured contrast on 2026-09-08: the review of #2035 that SUCCEEDED carries a
+// 40-character head_sha; the #2047 job that died carries 8. Same dispatcher,
+// same reviewer, same day.
+//
+// A refusal that arrives AFTER the job exists is the wrong shape regardless of
+// its message, so this asserts the refusal happens where the other pre-enqueue
+// refusals do: no job row, no task, no worktree.
+func TestDispatchReviewRejectsAbbreviatedHeadSHABeforeEnqueue(t *testing.T) {
+	ctx := context.Background()
+	checkout, _, _, head, _ := promptHeadBindingCheckout(t)
+	store, home := blockerE2EHome(t)
+	seedReviewDispatchFixture(t, store, checkout)
+	if len(head) != 40 {
+		t.Fatalf("fixture head is %d characters, want 40: the abbreviation under test must be a real prefix", len(head))
+	}
+
+	before, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasksBefore, err := store.ListTasks(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := reviewDispatchRequest(home, head[:8])
+	_, dispatchErr := dispatchLocalAgentJob(ctx, store, request)
+	if dispatchErr == nil {
+		t.Fatal("dispatch accepted an abbreviated --head-sha; the daemon would cancel it later as a stale head")
+	}
+	// The message must name the EXPECTED LENGTH, because the operator's next
+	// action is to re-run with a full sha and "invalid head" does not say how.
+	for _, want := range []string{"40", head[:8]} {
+		if !strings.Contains(dispatchErr.Error(), want) {
+			t.Fatalf("dispatch error = %v, want it to name %q", dispatchErr, want)
+		}
+	}
+	// No job row: a refusal that arrives after the row exists has already spent
+	// a worktree and a queue slot.
+	after, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("job rows went from %d to %d; the refusal created a row", len(before), len(after))
+	}
+	// NO TASK EITHER, and this arm is review finding F3 on cycle two: the guard
+	// used to run one call too late, after prepareLocalReviewDispatchRequest had
+	// ended in prepareLocalReviewTask, whose UpsertTaskUnlessStates INSERTS OR
+	// UPDATES the review Task. The comment above this test promised "no job, no
+	// task, no worktree" while only the job was checked, so the durable half of
+	// the promise was unasserted and the regression was invisible.
+	tasks, err := store.ListTasks(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != len(tasksBefore) {
+		t.Fatalf("task rows went from %d to %d; the refusal left durable task state behind for a review that never ran", len(tasksBefore), len(tasks))
+	}
+}
+
+// A REVISION EXPRESSION is the same defect wearing different characters, and the
+// first version of this guard let it through: review finding F3. The daemon
+// compares this value to the pull request's head by equality, so `<sha>^` can no
+// more bind than `<sha8>` can.
+func TestDispatchReviewRejectsARevisionExpressionHead(t *testing.T) {
+	ctx := context.Background()
+	checkout, _, _, head, _ := promptHeadBindingCheckout(t)
+	store, home := blockerE2EHome(t)
+	seedReviewDispatchFixture(t, store, checkout)
+
+	for _, expression := range []string{head + "^", head[:8] + "~1", "HEAD"} {
+		t.Run(expression, func(t *testing.T) {
+			request := reviewDispatchRequest(home, expression)
+			if _, err := dispatchLocalAgentJob(ctx, store, request); err == nil {
+				t.Fatalf("dispatch accepted %q as a head", expression)
+			} else if !strings.Contains(err.Error(), "40") {
+				t.Fatalf("refusal for %q = %v, want it to name the expected length", expression, err)
+			}
+		})
+	}
+}
+
+// A FULL head sha is the same dispatch and must not be refused: without this the
+// length check could reject everything and both tests above would still pass.
+func TestDispatchReviewAcceptsFullHeadSHA(t *testing.T) {
+	fixture := reviewLeadRefusalStore(t)
+	store := fixture.store
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "lead", runtime.ShellRuntime, "true", []string{"implement", "review"}, "owner/repo", runtime.AutonomyPolicyDangerFullAccess)
+	installReviewLeadTestAdapter(t, "")
+
+	_, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
+		RepoFlag: "owner/repo", Agent: "reviewer", Action: "review", PullRequest: 7, LeadAgent: "lead",
+		HeadSHA: fixture.head, Branch: "feature/review", Home: fixture.home, Background: true,
+	})
+	if err != nil && strings.Contains(err.Error(), "head") {
+		t.Fatalf("a full 40-character head sha was refused by the head guard: %v", err)
+	}
+}
+
+// TestDispatchReviewOnlyNeedsNoImplementCapableLead is #2054 defect 2.
+//
+// `agent review <reviewer>` refused when the reviewer could not implement,
+// because a changes_requested verdict needs somewhere to go. The documented
+// fallback, `agent ask`, has no --head-sha and cannot bind a verdict to a head
+// at all - so on 2026-09-08 that pair sent every seat needing an exact-head
+// review onto ask, and one dispatch bound to a DIFFERENT pull request's merge
+// commit.
+//
+// The requirement is kept and made stateable: --no-fix-target declares the
+// operator owns the follow-up. An UNSTATED absence must still refuse, which
+// TestDispatchReviewWithoutLeadRejectsReviewOnlyAgentBeforeEnqueue pins.
+func TestDispatchReviewOnlyNeedsNoImplementCapableLead(t *testing.T) {
+	ctx := context.Background()
+	checkout, _, _, head, _ := promptHeadBindingCheckout(t)
+	store, home := blockerE2EHome(t)
+	seedReviewDispatchFixture(t, store, checkout)
+
+	request := reviewDispatchRequest(home, head)
+	// The reviewer cannot implement, and no lead is named: exactly the dispatch
+	// that refused all day and pushed every seat onto `agent ask`.
+	request.LeadAgent = ""
+	request.NoFixTarget = true
+
+	out, err := dispatchLocalAgentJob(ctx, store, request)
+	if err != nil {
+		t.Fatalf("a review-only dispatch was refused: %v", err)
+	}
+	// THE DECISION MUST REACH THE PAYLOAD, not only a job event. Review found
+	// that clearing the lead was not enough: enqueue restored the reviewer
+	// through firstNonEmpty, so a changes_requested verdict would have routed
+	// its fix to the agent that produced the verdict, and advancement had no
+	// field to read the declaration from.
+	job, err := store.GetJob(ctx, out.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !payload.NoFixTarget {
+		t.Fatalf("payload.NoFixTarget = false; advancement cannot honour a declaration it cannot read: %s", job.Payload)
+	}
+	if strings.TrimSpace(payload.LeadAgent) != "" {
+		t.Fatalf("payload.LeadAgent = %q, want empty: a review-only dispatch must not fall back to the reviewer", payload.LeadAgent)
+	}
+	events, err := store.ListJobEvents(ctx, out.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Kind == "review_no_fix_target" {
+			return
+		}
+	}
+	t.Fatalf("no review_no_fix_target event: %+v", events)
+}
+
+// --no-fix-target and --lead answer the same question in opposite directions, so
+// accepting both would leave which one wins undefined.
+func TestDispatchReviewOnlyRejectsAnExplicitLead(t *testing.T) {
+	fixture := reviewLeadRefusalStore(t)
+	store := fixture.store
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "lead", runtime.ShellRuntime, "true", []string{"implement", "review"}, "owner/repo", runtime.AutonomyPolicyDangerFullAccess)
+	adapter := installReviewLeadTestAdapter(t, "")
+
+	_, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
+		RepoFlag: "owner/repo", Agent: "reviewer", Action: "review", PullRequest: 7, LeadAgent: "lead",
+		HeadSHA: fixture.head, Branch: "feature/review", Home: fixture.home, NoFixTarget: true,
+	})
+	// This refusal must precede the capacity and worktree work, like the other
+	// lead refusals, which is why it stays on the refusal fixture.
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("dispatch error = %v, want a mutual-exclusion refusal", err)
 	}
 	assertReviewLeadHardRefusal(t, store, fixture.checkout, adapter)
 }
