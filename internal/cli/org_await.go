@@ -14,6 +14,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 func runOrgAwait(args []string, stdout, stderr io.Writer) int {
@@ -85,11 +86,32 @@ func runOrgAwaitReview(args []string, stdout, stderr io.Writer) int {
 	var fact db.AwaitedFact
 	err = withStore(*home, func(store *db.Store) error {
 		var subscribeErr error
-		fact, subscribeErr = store.SubscribeAwaitedFact(context.Background(), db.AwaitedFactSubscription{
+		var skipped []db.HeadlessReviewSkip
+		fact, skipped, subscribeErr = store.SubscribeAwaitedFact(context.Background(), db.AwaitedFactSubscription{
 			WaiterRole: role, SubjectKind: db.AwaitedFactSubjectReviewVerdict,
 			SubjectKey: key, Deadline: time.Now().UTC().Add(*ttl),
 		})
-		return subscribeErr
+		if subscribeErr != nil {
+			return subscribeErr
+		}
+		// BEHAVIOUR UNCHANGED and no row gains a head. A headless review still
+		// cannot satisfy a review_verdict awaited fact, because it names no head
+		// to satisfy it at. Saying so is the only change (#2008).
+		//
+		// The decision happens HERE rather than in db: the store reports the
+		// skipped rows raw, and the Agent-first/reason vocabulary lives in
+		// workflow, which db cannot import.
+		for _, skip := range skipped {
+			reason, excluded := workflow.HeadBoundExclusion(skip.ExternallyDriven, "")
+			if !excluded {
+				continue
+			}
+			if err := workflow.RecordHeadBoundExclusion(context.Background(), store, skip.JobID,
+				"awaited_facts.reviewVerdict", reason); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "org await review: %v\n", err)

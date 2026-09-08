@@ -12,6 +12,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 func TestAwaitedFactExpiryRemainsQueryableAndAddressesParent(t *testing.T) {
@@ -42,7 +43,7 @@ scope=["*"]
 		t.Fatalf("ReviewVerdictSubjectKey: %v", err)
 	}
 	deadline := time.Now().UTC().Add(time.Minute)
-	fact, err := store.SubscribeAwaitedFact(context.Background(), db.AwaitedFactSubscription{
+	fact, _, err := store.SubscribeAwaitedFact(context.Background(), db.AwaitedFactSubscription{
 		WaiterRole: "lane", SubjectKind: db.AwaitedFactSubjectReviewVerdict,
 		SubjectKey: key, Deadline: deadline,
 	})
@@ -118,7 +119,7 @@ func TestAwaitedFactExpiryTerminatesWhenWaiterRoleWasRemoved(t *testing.T) {
 		t.Fatalf("ReviewVerdictSubjectKey: %v", err)
 	}
 	deadline := time.Now().UTC().Add(time.Minute)
-	fact, err := store.SubscribeAwaitedFact(context.Background(), db.AwaitedFactSubscription{
+	fact, _, err := store.SubscribeAwaitedFact(context.Background(), db.AwaitedFactSubscription{
 		WaiterRole: "removed-lane", SubjectKind: db.AwaitedFactSubjectReviewVerdict,
 		SubjectKey: key, Deadline: deadline,
 	})
@@ -179,5 +180,65 @@ func TestOrgAwaitReviewAndList(t *testing.T) {
 	code = runOrg([]string{"events", "rule", "add", "--home", home, "--on", "fact", "--wake", "lane"}, &stdout, &stderr)
 	if code != 0 || !strings.Contains(stdout.String(), "added event-rule-") {
 		t.Fatalf("org events fact rule code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+// TestOrgAwaitReviewRecordsAHeadlessExclusion closes the end-to-end boundary of
+// #2008's awaited-fact consumer: db reports the skipped row RAW, and this is the
+// side that turns it into a stated reason.
+//
+// Without this the slice's coverage stops at the store, and the recording loop -
+// the only part that knows the reason vocabulary - would be untested.
+func TestOrgAwaitReviewRecordsAHeadlessExclusion(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\n[org.roles.\"lane\"]\nparent=\"owner\"\nscope=[\"*\"]\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	ctx := context.Background()
+	// A session review: no head, externally driven, which is the 41-of-41 class.
+	if err := store.CreateExternallyDrivenJobWithEvent(ctx, db.Job{
+		ID: "session-await-review", Agent: "reviewer", Type: "review", State: "succeeded",
+		Payload: `{"repo":"acme/widget","pull_request":47,"head_sha":"","result":{"decision":"approved","summary":"session"}}`,
+	}, db.JobEvent{Kind: "succeeded", Message: "approved"}); err != nil {
+		t.Fatalf("CreateExternallyDrivenJobWithEvent: %v", err)
+	}
+	store.Close()
+
+	var stdout, stderr bytes.Buffer
+	if code := runOrg([]string{"await", "review", "--home", home, "--role", "lane", "--repo", "acme/widget", "--pr", "47", "--head", "head-cli", "--ttl", "10m"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("org await review code=%d err=%q", code, stderr.String())
+	}
+
+	verify, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer verify.Close()
+	events, err := verify.ListJobEvents(ctx, "session-await-review")
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	var recorded []string
+	for _, event := range events {
+		if event.Kind == workflow.HeadBoundExclusionEventKind {
+			recorded = append(recorded, event.Message)
+		}
+	}
+	if len(recorded) != 1 {
+		t.Fatalf("exclusion events = %d (%v), want 1: the headless row was passed over silently", len(recorded), recorded)
+	}
+	if !strings.Contains(recorded[0], workflow.HeadBoundExclusionSessionRow) {
+		t.Errorf("message = %q, want the session reason", recorded[0])
+	}
+	if !strings.Contains(recorded[0], "awaited_facts.reviewVerdict") {
+		t.Errorf("message = %q, want it to name the consumer", recorded[0])
 	}
 }
