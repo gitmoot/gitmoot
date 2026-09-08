@@ -118,13 +118,41 @@ const blockerBlockedEventKind = "blocker_runtime_unavailable"
 //     target binary cannot be resolved inside the seat.
 //   - "runtime unavailable" is the daemon's staging refusal.
 //
+// The last three close a gap found in review of this change (#2022 P2): a
+// refusal that happens AFTER execLookPath already resolved the target is not
+// an unresolved-target failure and matched none of the first four. The sandbox
+// ends in a bare `syscall.Exec` (internal/sandbox/exec_linux.go), which returns
+// an UNWRAPPED errno, so these are the renderings that reach the delivery seam:
+//
+//   - "exec format error" is ENOEXEC: the target resolved and is not
+//     executable - a truncated or corrupt shim, or a text file where a binary
+//     was expected.
+//   - "apply strict landlock ruleset" and "landlock abi" are the sandbox's own
+//     wrapped refusals to start at all. Deliberately strict with no BestEffort
+//     downgrade, so they are capability facts rather than warnings.
+//
+// TWO RENDERINGS ARE DELIBERATELY REFUSED, and the reason is the same one that
+// excludes a bare "126": "permission denied" (EACCES) and "no such file or
+// directory" (ENOENT) also reach this seam from a genuine capability refusal,
+// and they ALSO reach it from an agent's own file operations, a denied cache
+// directory, a missing repository path. This predicate decides a TERMINAL
+// state, so a signature that is right about the cause only some of the time is
+// worse than a miss: a miss keeps today's behaviour, a false positive blocks
+// work that would have succeeded on retry. Those two cases stay UNCOVERED and
+// TestRuntimeUnavailableRefusesAmbiguousErrnoText pins that, so a later reader
+// closing "the rest of the gap" has to argue with a test rather than a comment.
+//
 // A bare "126" is deliberately NOT a signature: it appears in SHAs, job ids and
-// token counts, and this predicate decides a terminal state.
+// token counts, and measured store-wide a loose "%126%" match returns 234
+// events against 13 for "exit status 126", an 18x inflation.
 var runtimeUnavailableSignatures = []string{
 	"exit status 126",
 	"executable file not found in $path",
 	"resolve sandbox target",
 	"runtime unavailable",
+	"exec format error",
+	"apply strict landlock ruleset",
+	"landlock abi",
 }
 
 // isRuntimeUnavailableMessage reports whether text names a capability refusal.
@@ -633,8 +661,25 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 func (w jobWorker) blockOnRuntimeUnavailable(ctx context.Context, jobID string, payload workflow.JobPayload, classification blockerClassification) (bool, error) {
 	payload.BlockerClass = string(classification.Class)
 	payload.BlockerSuggestedAction = classification.SuggestedAction
-	// No RetryAt and no attempt increment: nothing is going to retry this, and a
-	// recorded retry instant would be a promise the engine does not keep.
+	// No RetryAt and no attempt increment: the OPERATIONAL-BLOCKER actuator will
+	// not re-dispatch this job, and a recorded retry instant would be a promise
+	// this layer does not keep.
+	//
+	// THAT CLAIM IS SCOPED TO THIS LAYER, and review of this change (#2022)
+	// established the boundary rather than letting the comment overstate it: for
+	// a DELEGATION CHILD, requeueDelegation gates purely on the delegation
+	// edge's own d.Retry against the child's RetryCount
+	// (internal/workflow/engine_delegation.go) with zero awareness of blocker
+	// class, and JobBlocked has been a settled state since #632. So a blocked
+	// child on an edge declaring Retry > 0 CAN be re-dispatched by the DAG, into
+	// the same wall, up to that edge's budget.
+	//
+	// Not fixed here, deliberately: teaching requeueDelegation about blocker
+	// class is a change to the delegation engine, not to this classifier, and it
+	// would be the wrong thing to smuggle into a slice whose subject is the
+	// terminal state. What this layer guarantees is that the job is BLOCKED with
+	// a recorded cause and a remedy, which is what makes the DAG's retry visible
+	// as a repeat rather than a first attempt.
 	payload.BlockerRetryAt = ""
 	payload.BlockerPreDelivery = false
 	encoded, err := json.Marshal(payload)

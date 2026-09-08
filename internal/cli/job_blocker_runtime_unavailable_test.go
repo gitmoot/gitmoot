@@ -47,6 +47,48 @@ func TestClassifyRuntimeUnavailableRecognisesTheRenderingsThatActuallyOccur(t *t
 	}
 }
 
+// These four close the gap review found in this change (#2022 P2): a refusal
+// that happens AFTER execLookPath resolved the target. The sandbox ends in a
+// bare syscall.Exec, so the errno reaches the delivery seam unwrapped.
+func TestClassifyRuntimeUnavailableCoversPostResolutionRefusals(t *testing.T) {
+	now := time.Now().UTC()
+	for _, text := range []string{
+		"delivery failed: exec format error",
+		"delivery failed: apply strict Landlock ruleset: invalid argument",
+		"delivery failed: Landlock ABI v2 is unavailable; v3 or newer is required",
+	} {
+		got, ok := classifyOperationalBlocker(workflow.DeliveryError{Err: errors.New(text)}, now)
+		if !ok || got.Class != blockerClassRuntimeUnavailable {
+			t.Fatalf("a post-resolution capability refusal was classified as %q (ok=%v): %q", got.Class, ok, text)
+		}
+	}
+}
+
+// TestRuntimeUnavailableRefusesAmbiguousErrnoText pins a DELIBERATE gap.
+//
+// EACCES and ENOENT reach this seam from a genuine capability refusal AND from
+// an agent's own file operations, a denied cache directory, a missing
+// repository path. This predicate decides a TERMINAL state, so a signature
+// right only some of the time is worse than a miss: a miss keeps today's
+// behaviour, a false positive blocks work that would have succeeded.
+//
+// This test exists so that closing "the rest of the gap" means arguing with a
+// test rather than editing a comment.
+func TestRuntimeUnavailableRefusesAmbiguousErrnoText(t *testing.T) {
+	now := time.Now().UTC()
+	for _, text := range []string{
+		"delivery failed: permission denied",
+		"delivery failed: open /tmp/gitmoot-go-build-cache: permission denied",
+		"delivery failed: no such file or directory",
+		"delivery failed: stat /root/repo/missing.go: no such file or directory",
+	} {
+		got, ok := classifyOperationalBlocker(workflow.DeliveryError{Err: errors.New(text)}, now)
+		if ok && got.Class == blockerClassRuntimeUnavailable {
+			t.Fatalf("ambiguous errno text was read as a capability refusal, which would BLOCK work that may succeed on retry: %q", text)
+		}
+	}
+}
+
 // The specific classes must not be able to steal each other's text. Ordering is
 // a property here, not an implementation detail: an auth or quota failure that
 // happens to mention an exit code keeps its own, more actionable class.
