@@ -720,9 +720,25 @@ func reviewShapedResult(result *AgentResult) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(result.Decision)) {
-	case "approved", "changes_requested":
-		// FINDINGS ARE REQUIRED HERE TOO (#2061 CI, three race shards and the
-		// tagged e2e). "approved" alone was treated as a review verdict, so an
+	case "changes_requested":
+		// AN OBJECTION WITH NO FINDINGS ARRAY IS STILL AN OBJECTION (#2061 review,
+		// P2, found by EXECUTING the predicate rather than reading it).
+		//
+		// Requiring findings on every arm was right for "approved" and wrong here,
+		// and the asymmetry is not a special case: review_loop.go's
+		// namedReviewFindings already promotes a changes_requested SUMMARY to a
+		// finding when the array is empty. This mirrors that rule rather than
+		// inventing a second one - the same reason the "blocked" arm matches
+		// followUpReviewScopes.
+		//
+		// The two decisions differ in what silence MEANS. An approval carrying
+		// nothing has nothing to record. A changes_requested carrying a summary is
+		// a live objection, and losing it silently is precisely the class #1962
+		// exists to close.
+		return len(result.Findings) > 0 || strings.TrimSpace(result.Summary) != ""
+	case "approved":
+		// FINDINGS ARE REQUIRED FOR AN APPROVAL (#2061 CI, three race shards and
+		// the tagged e2e). "approved" alone was treated as a review verdict, so an
 		// ORDINARY ask that returns {"decision":"approved","findings":[]} - the
 		// shape the shipped result contract puts in front of every agent, and the
 		// literal payload of runtimeOverrideShellScript - emitted

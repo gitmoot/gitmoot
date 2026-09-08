@@ -276,3 +276,29 @@ func TestFailedWithoutFindingsIsNotAReviewVerdict(t *testing.T) {
 		t.Fatal("an engine-authored \"failed\" with no findings was treated as a review verdict")
 	}
 }
+
+// #2061 review, P2, found by EXECUTING the predicate: a changes_requested that
+// carries only a Summary is a live objection, and requiring findings on every
+// arm silently lost it. review_loop.go's namedReviewFindings already promotes
+// that summary to a finding; this mirrors the rule rather than inventing one.
+func TestChangesRequestedWithSummaryOnlyIsAReviewVerdict(t *testing.T) {
+	if !reviewShapedResult(&AgentResult{
+		Decision: "changes_requested",
+		Summary:  "the boundary check is inverted and the fix must precede merge",
+	}) {
+		t.Fatal("an objection carrying only a summary was not treated as a review verdict")
+	}
+}
+
+// THE ASYMMETRY IS THE POINT, so it is pinned. An approval carrying nothing has
+// nothing to record; an objection carrying a summary does. Without this arm a
+// later simplification would "tidy" the two decisions back into one rule and
+// reintroduce the e2e failure at #2061 (three race shards plus the tagged e2e).
+func TestApprovedWithSummaryOnlyIsNotAReviewVerdict(t *testing.T) {
+	if reviewShapedResult(&AgentResult{
+		Decision: "approved",
+		Summary:  "ran on shell override",
+	}) {
+		t.Fatal("an ordinary ask that approved with only a summary was treated as a review verdict")
+	}
+}
