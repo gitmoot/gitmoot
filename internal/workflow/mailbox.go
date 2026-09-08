@@ -338,6 +338,17 @@ type JobRequest struct {
 	// and the dashboard can explain an escalation. Empty (the default) for every
 	// job outside the opt-in risk-tiered path.
 	RiskTier string
+	// InheritedEvidence carries a STAGED review's preflight verdict about what
+	// could actually be executed (#1821) from the parent stage into its verdict
+	// child. It is one of the declared evidence values, normally
+	// EvidenceStaticOnly, and it is a CEILING: a child cannot claim it executed
+	// work its own preflight already found unrunnable in the same worktree.
+	//
+	// Empty for every non-staged job, so the enqueued payload is byte-identical
+	// by default. It exists because the parent-to-child boundary already carries
+	// repo, pull_request, head_sha, task_id and the review scope, and this was
+	// the one field a staged review needs that no delegation carried.
+	InheritedEvidence string
 	// OrchestrateStage marks a #758 pipeline orchestrate stage job: the stage's agent
 	// runs as a bounded sub-tree COORDINATOR, so its delegations[] are NOT stripped by
 	// the pipeline-sender leaf strip (they fan out as children owned by this stage
@@ -536,6 +547,15 @@ type JobPayload struct {
 	// byte-identically. It is stamped on a high-risk review coordinator and
 	// inherited by its lens children for explainable escalation.
 	RiskTier string `json:"risk_tier,omitempty"`
+	// InheritedEvidence is the staged-review preflight ceiling (#1821) this job
+	// was dispatched under: one of the declared evidence values, carried from the
+	// parent stage. A verdict stage cannot report EXECUTED evidence when the
+	// preflight that shared its worktree recorded static_only, because nothing
+	// about the worktree changed between the stages.
+	//
+	// Additive/omitempty, so every job outside a staged review serializes
+	// byte-identically.
+	InheritedEvidence string `json:"inherited_evidence,omitempty"`
 	// Operational-blocker deferral context (#532, additive — all omitempty, so a
 	// job that never hit a classified blocker serializes byte-identically).
 	// BlockerClass is the last classified blocker (e.g. "runtime_auth",
@@ -774,6 +794,7 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		Ephemeral:              request.Ephemeral,
 		HumanAnswer:            request.HumanAnswer,
 		RiskTier:               strings.TrimSpace(request.RiskTier),
+		InheritedEvidence:      normalizeInheritedEvidence(request.InheritedEvidence),
 		OrchestrateStage:       request.OrchestrateStage,
 		WritablePaths:          compactStrings(request.WritablePaths),
 		ReadablePaths:          compactStrings(request.ReadablePaths),
@@ -1503,6 +1524,16 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		// and a child is a non-pipeline-sender job (Sender = the coordinator agent,
 		// ParentJobID = this stage job), so this strip never touches it.
 		result.HumanQuestions = nil
+	}
+	// #1821: clamp a staged verdict to what its preflight found runnable, BEFORE
+	// the result is stored, so no consumer ever reads the unclamped claim. The
+	// event is the audit trail: an overruled producer is a different thing from
+	// one that declared static_only itself, and a merge decision that later
+	// leans on this evidence should be able to tell them apart.
+	if ApplyInheritedEvidenceCeiling(&result, payload.InheritedEvidence) {
+		_ = m.addEvent(ctx, job.ID, InheritedEvidenceClampedEvent, fmt.Sprintf(
+			"declared %s evidence was clamped to %s: the preflight stage sharing this worktree and head recorded %s, so nothing here could have run",
+			EvidenceExecuted, EvidenceStaticOnly, EvidenceStaticOnly))
 	}
 	payload.Result = &result
 	if strings.EqualFold(strings.TrimSpace(job.Type), "implement") {

@@ -53,6 +53,17 @@ refused `static_only` would today refuse 93% of all reviews**, almost none of
 which made the claim. Declaring the field is what makes your verdict
 distinguishable from silence, so declare it.
 
+**A staged review's verdict cannot exceed its own preflight (#1821).** When a
+review runs as two stages sharing one worktree and one head, the preflight
+stage's evidence is carried to the verdict stage as a **ceiling**. If the
+preflight recorded `static_only`, a verdict declaring `executed` is clamped back
+to `static_only` before it is stored, and an `inherited_evidence_clamped` event
+records that the producer was overruled rather than silent. Nothing between the
+stages can make an unrunnable command runnable, so the clamp is a fact about the
+tree, not a penalty. The ceiling only ever moves evidence **downward**: a
+preflight that executed does not license the verdict stage to claim execution,
+and an honest `static_only` verdict stays `static_only`.
+
 **No check fails a static-only review.** The distinction a merge decision needs
 is carried by the stored field, not by refusing the verdict. An earlier version
 of this feature failed every static-only review, which under

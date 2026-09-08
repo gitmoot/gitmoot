@@ -1206,6 +1206,11 @@ func (e Engine) delegationRequest(ctx context.Context, job db.Job, payload JobPa
 		// Inherit the coordinator's resolved risk tier (#650) so a high-risk lens
 		// child carries it for explainable escalation. Empty for every non-risk tree.
 		RiskTier: strings.TrimSpace(payload.RiskTier),
+		// #1821: a staged review's verdict child inherits the preflight's evidence
+		// as a CEILING. Prefer the parent's own recorded result, which is the
+		// preflight finding; fall back to the parent's own inherited ceiling so a
+		// deeper chain cannot launder the constraint by adding a hop.
+		InheritedEvidence: delegationInheritedEvidence(payload),
 		// #1277: inherit the skip-native-review-fanout intent. Without this the
 		// intent survived exactly one hop — the dispatched coordinator — and died
 		// at the first engine-initiated hop, so a coordinator dispatched with
@@ -1217,6 +1222,28 @@ func (e Engine) delegationRequest(ctx context.Context, job db.Job, payload JobPa
 		// job that happened to receive the flag.
 		SkipNativeReviewFanout: payload.SkipNativeReviewFanout,
 	}
+}
+
+// delegationInheritedEvidence resolves the evidence ceiling a delegation child
+// inherits (#1821).
+//
+// The parent's OWN result wins when it declared one, because that is the
+// preflight finding this child is being dispatched under. When the parent
+// declared nothing, the parent's own inherited ceiling carries forward: without
+// that fallback a chain could launder the constraint by inserting one silent
+// hop between the preflight and the verdict, which is the same
+// survives-exactly-one-hop defect #1277 fixed for the review-fanout intent.
+//
+// A parent that declared EXECUTED imposes no ceiling: normalizeInheritedEvidence
+// keeps the value, and ApplyInheritedEvidenceCeiling only ever clamps downward
+// from static_only.
+func delegationInheritedEvidence(payload JobPayload) string {
+	if payload.Result != nil && EvidenceWasDeclared(*payload.Result) {
+		if declared := normalizeInheritedEvidence(payload.Result.Evidence); declared != "" {
+			return declared
+		}
+	}
+	return normalizeInheritedEvidence(payload.InheritedEvidence)
 }
 
 // delegationHeadSHA resolves the head a delegated REVIEW child will be pinned

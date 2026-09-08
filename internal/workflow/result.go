@@ -448,6 +448,62 @@ func EvidenceWasDeclared(r AgentResult) bool {
 	return r.EvidenceDeclared
 }
 
+// InheritedEvidenceClampedEvent records that a staged verdict's EXECUTED claim
+// was overruled by its own preflight stage (#1821). It is the audit trail for a
+// clamp, because a producer that was overruled and one that declared
+// static_only itself are different facts with the same stored value.
+const InheritedEvidenceClampedEvent = "inherited_evidence_clamped"
+
+// normalizeInheritedEvidence keeps only a DECLARED evidence value as a ceiling.
+// Anything unrecognised - including the empty string every non-staged job
+// carries - normalizes away, so a staged review is the only shape that can
+// constrain its child and no other job's payload changes.
+func normalizeInheritedEvidence(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if !ValidEvidence(trimmed) {
+		return ""
+	}
+	return trimmed
+}
+
+// ApplyInheritedEvidenceCeiling clamps a verdict stage's declared evidence to
+// what its preflight stage found runnable (#1821), and reports whether it
+// clamped.
+//
+// WHY THIS IS SOUND, and it rests on a property of the shape rather than on
+// trust: the two stages share one worktree and one head, asserted at child
+// dispatch. So the preflight's finding that a declared verification command
+// cannot execute is a fact about the tree the child is looking at, not a
+// pessimistic guess about a different one. Nothing between the stages can make
+// an unrunnable command runnable.
+//
+// It only ever moves evidence DOWNWARD. A preflight that executed does not
+// license a child to claim execution: a static_only child under an executed
+// preflight keeps its own more modest claim, because the child is the row whose
+// verdict the gate consumes and its own honesty about itself is the point.
+//
+// This is the #1823 condition "a declared verification command cannot execute"
+// made mechanical. Without it the preflight is decoration: stage 1 could find
+// nothing runnable and stage 2 could still return an executed verdict that the
+// merge gate consumes as proof work ran.
+func ApplyInheritedEvidenceCeiling(result *AgentResult, inherited string) bool {
+	if result == nil {
+		return false
+	}
+	ceiling := normalizeInheritedEvidence(inherited)
+	if ceiling != EvidenceStaticOnly {
+		return false
+	}
+	if strings.TrimSpace(result.Evidence) != EvidenceExecuted {
+		return false
+	}
+	result.Evidence = EvidenceStaticOnly
+	// The producer DID declare a value; it was overruled rather than defaulted,
+	// and #1817's declared flag must keep meaning "the producer spoke".
+	result.EvidenceDeclared = true
+	return true
+}
+
 // authorityGrantingResultFields are AgentResult fields an agent may NEVER supply,
 // because setting them GRANTS the job authority it would not otherwise have (#1673).
 //
