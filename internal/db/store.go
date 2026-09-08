@@ -87,6 +87,49 @@ const sqliteBusyTimeoutMillis = 15000
 // execute the write it just won the lock for.
 const DurableWriteBudget = sqliteBusyTimeoutMillis*time.Millisecond + 3*time.Second
 
+// DurableWriteBudgetFor is DurableWriteBudget for a write that takes the write
+// lock more than once.
+//
+// WHY THIS EXISTS (#1911). DurableWriteBudget covers ONE contended lock
+// acquisition. Nothing said so, and nothing checked it, so callers grew that
+// acquire the lock repeatedly under the same ceiling: a coalesced delivered
+// finish issued two independent UPDATE statements, and a retry-or-fail write
+// runs a transaction whose first statement and whose COMMIT can each wait. Two
+// legitimate 15s waits do not fit in an 18s budget, so contention that the
+// store was still handling correctly surfaced as `context deadline exceeded`
+// and the write was lost.
+//
+// TestDurableWriteBudgetExceedsBusyTimeout pins the two CONSTANTS' order;
+// TestDurableWriteBudgetCoversEveryLockAcquisition pins this, which is the
+// invariant the constants' order does not imply.
+func DurableWriteBudgetFor(acquisitions int) time.Duration {
+	if acquisitions < 1 {
+		acquisitions = 1
+	}
+	return time.Duration(acquisitions)*sqliteBusyTimeoutMillis*time.Millisecond + 3*time.Second
+}
+
+// durableWriteContext gives a durability write its OWN floor instead of
+// trusting the caller's deadline.
+//
+// #1836 fixed one caller by widening the deadline at the call site, and the
+// three neighbours in that same file were never fixed: they still bound a
+// SQLite write with a constant documented for herdr subprocess probes. A floor
+// enforced at the write cannot be got wrong by the next call site, which is the
+// difference between fixing an instance and fixing the class.
+//
+// The caller's cancellation is deliberately detached, matching what the call
+// sites already did explicitly: a bookkeeping write that records a delivery
+// that ALREADY HAPPENED must not be abandoned because the wake path moved on.
+// A caller that already allows more than the floor keeps its own deadline.
+func (s *Store) durableWriteContext(ctx context.Context, acquisitions int) (context.Context, context.CancelFunc) {
+	floor := DurableWriteBudgetFor(acquisitions)
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) >= floor {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), floor)
+}
+
 func Open(path string) (*Store, error) {
 	store, err := openWritable(path)
 	if err != nil {

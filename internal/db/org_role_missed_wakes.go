@@ -18,7 +18,13 @@ func (s *Store) IncrementRoleMissedWake(ctx context.Context, role string, at tim
 	if role == "" {
 		return errors.New("org role is required")
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO org_role_missed_wakes(role, consecutive, updated_at)
+	// #1911: three call sites bounded this write at eventRuleProbeTimeout (5s),
+	// a constant documented for herdr SUBPROCESS PROBES, while the driver waits
+	// 15s for the write lock. The floor belongs here, where no future caller can
+	// get it wrong, rather than at each call site.
+	writeCtx, cancel := s.durableWriteContext(ctx, 1)
+	defer cancel()
+	_, err := s.db.ExecContext(writeCtx, `INSERT INTO org_role_missed_wakes(role, consecutive, updated_at)
 		VALUES (?, 1, ?)
 		ON CONFLICT(role) DO UPDATE SET
 			consecutive = consecutive + 1,
@@ -31,7 +37,9 @@ func (s *Store) ResetRoleMissedWake(ctx context.Context, role string) error {
 	if role == "" {
 		return errors.New("org role is required")
 	}
-	_, err := s.db.ExecContext(ctx, `DELETE FROM org_role_missed_wakes WHERE role = ?`, role)
+	writeCtx, cancel := s.durableWriteContext(ctx, 1)
+	defer cancel()
+	_, err := s.db.ExecContext(writeCtx, `DELETE FROM org_role_missed_wakes WHERE role = ?`, role)
 	return err
 }
 
