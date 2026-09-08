@@ -15,6 +15,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/github/githubtest"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
@@ -743,6 +744,11 @@ func daemonMergeGateActiveJobFixture(t *testing.T, seedReview ...bool) (*db.Stor
 
 func seedDaemonMergeGateJob(t *testing.T, store *db.Store, job db.Job, payload workflow.JobPayload) {
 	t.Helper()
+	// #2004: the gate resolves a runtime family for the reviewer and every
+	// recorded implementer and fails closed when it cannot. These fixtures name
+	// an agent and never registered one, because nothing read a registration
+	// before. Production always has it.
+	dbtest.SeedGateFixtureAgent(t, store, job.Agent)
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatal(err)

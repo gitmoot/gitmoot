@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -186,4 +187,64 @@ func copyTemplateSnapshotIfMissing(snapshot []byte, path string) error {
 	}
 	complete = true
 	return nil
+}
+
+// gate fixture agents (#2004)
+//
+// The merge gate resolves a runtime FAMILY for the reviewer and every recorded
+// implementer, and fails closed when it cannot. Fixtures written before that
+// check existed name an agent and never register one, because nothing read a
+// registration. Production does not have that shape: a dispatched job's agent is
+// registered, or is a temp/ephemeral name derived from one that is.
+//
+// THIS LIVES HERE RATHER THAN IN EACH PACKAGE'S TEST FILES because internal/cli,
+// internal/daemon and internal/workflow all drive PolicyMergeGate and all three
+// already import dbtest. Three package-local copies would make the next change
+// to this contract cost three edits, and the third one gets missed - which is
+// the defect class the #1520 campaign exists to remove, arriving in test
+// infrastructure instead of production code.
+const (
+	tempAgentInfix      = "-temp-"
+	ephemeralAgentInfix = "-ephemeral-"
+)
+
+// SeedGateFixtureAgent registers a fixture agent on a runtime family of its own,
+// which is what every name-only gate expectation already assumed: two
+// differently-named agents are independent.
+//
+// It REFUSES synthetic names, because production refuses them. Temp workers
+// (`<parent>-temp-<job>`, minted in the daemon worker) and ephemeral delegation
+// agents (`<slug>-ephemeral-<hash>`, minted in the workflow result path) are
+// deliberately absent from the registry and resolve through their parent
+// instead. Registering one here resolves it directly and silently retires the
+// parent-walk tests that cover that path.
+//
+// Idempotent, so a fixture that wants two agents to SHARE a family can upsert
+// them onto one runtime itself and this will not overwrite it.
+func SeedGateFixtureAgent(t *testing.T, store *db.Store, name string) {
+	t.Helper()
+	name = strings.TrimSpace(name)
+	if name == "" || store == nil {
+		return
+	}
+	if index := strings.Index(name, tempAgentInfix); index > 0 {
+		return
+	}
+	if strings.Contains(name, ephemeralAgentInfix) {
+		return
+	}
+	if _, err := store.GetAgent(context.Background(), name); err == nil {
+		return
+	}
+	if err := store.UpsertAgent(context.Background(), db.Agent{
+		Name:           name,
+		Role:           "agent",
+		Runtime:        "rt-" + name,
+		RepoScope:      "gitmoot/gitmoot",
+		Capabilities:   []string{"review", "implement"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("SeedGateFixtureAgent(%s): %v", name, err)
+	}
 }

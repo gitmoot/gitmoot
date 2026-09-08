@@ -1227,7 +1227,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			// unattributed and refused it BEFORE the independence check ever ran, so a
 			// role could never approve anything - and the role's own self-approval was
 			// never even tested for. Agent still wins whenever present.
-			reviewer := effectiveReviewerIdentityName(review.job, review.payload)
+			reviewer, reviewerFromRole := effectiveReviewerIdentity(review.job, review.payload)
 			if JobState(review.job.State) != JobSucceeded {
 				return fmt.Errorf("reviewer %s at evaluated head has unusable job state %s (job %s)", reviewer, review.job.State, review.job.ID)
 			}
@@ -1274,7 +1274,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 						selfApprovalReason = fmt.Sprintf("latest review round's approval was authored by %s, the implementing agent; an independent reviewer is required", reviewer)
 					}
 					if selfApprovalReason == "" {
-						sameFamily, familyReason, err := g.sameRuntimeFamilyAsImplementer(ctx, review.job.ID, reviewer, review.payload.EffectiveRuntime, implementingAgents)
+						sameFamily, familyReason, err := g.sameRuntimeFamilyAsImplementer(ctx, review.job.ID, reviewer, reviewerFromRole, review.payload.EffectiveRuntime, implementingAgents)
 						if err != nil {
 							return err
 						}
@@ -1351,7 +1351,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if effectiveReviewDecisionForPayload(payload, request.ReviewBlockingSeverity) == "approved" {
 			// Same rule, same helper (#1950 F4): the latest-round arm resolved identity
 			// separately, which is the fourth copy that ruling 126350 removes.
-			reviewerAgent := effectiveReviewerIdentityName(job, payload)
+			reviewerAgent, reviewerFromRole := effectiveReviewerIdentity(job, payload)
 			switch {
 			case reviewerAgent == "":
 				if unattributedReviewerReason == "" {
@@ -1370,7 +1370,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 					}
 					continue
 				}
-				sameFamily, familyReason, err := g.sameRuntimeFamilyAsImplementer(ctx, job.ID, reviewerAgent, payload.EffectiveRuntime, implementingAgents)
+				sameFamily, familyReason, err := g.sameRuntimeFamilyAsImplementer(ctx, job.ID, reviewerAgent, reviewerFromRole, payload.EffectiveRuntime, implementingAgents)
 				if err != nil {
 					return err
 				}
@@ -2634,24 +2634,45 @@ func parseRepoFullName(value string) (github.Repository, error) {
 // falls back to the agent registry default, so an override-run job attributes
 // correctly even after its agent's default later changes.
 //
-// UNRESOLVABLE IS NOT SILENTLY CLEAN, AND IT IS ALSO NOT A BLOCK. This is the
-// tension #1531's own comment warns about: "doing (2) without (1) produces a
-// gate that silently passes whenever the field is absent". Re-measured on jobs
-// since 2026-08-25, resolution now covers 1335 of 1432 reviews and 427 of 449
-// implement jobs once the registry fallback is counted - 93 to 95 percent, up
-// from the 11 percent that made the issue defer this. The residue is dominated
-// by EPHEMERAL and TEMP agents, which are deliberately absent from the registry,
-// plus rows with an empty agent column.
+// UNRESOLVABLE NOW BLOCKS (#2004). #1531 shipped this falling through to the
+// name check, because refusing then would have blocked the native review
+// fanout: its lens legs are ephemeral by construction and ephemeral agents are
+// deliberately absent from the registry. #2004 removed that objection by
+// teaching the shared resolver to recover a synthetic agent's family from its
+// parent, so the residue no longer contains the thing the fall-through was
+// protecting.
 //
-// Refusing on that residue would block the native review fanout, whose lens legs
-// are ephemeral by construction, so an unresolved family falls through to the
-// name check exactly as before AND records why it could not be compared. That
-// keeps the gate's behaviour unchanged where it cannot see, while never claiming
-// a check it did not perform. Making the residue resolvable - temp agent names
-// embed their parent - is the follow-up that would let this fail closed.
+// Measured on review and implement jobs since 2026-08-25, after parent
+// recovery: 17 of 1,903 rows resolve to no family. Eleven have an empty agent
+// column and CANNOT REACH THIS FUNCTION - collectImplementerAttributionMatching
+// routes them to sawEmptyAgent and its own attribution reason - so the exposure
+// is the six rows naming an agent that is simply not registered, all implement
+// rows, none of them on an open pull request.
+//
+// Blocking is the honest answer for those six: the gate's property is that the
+// approver did not share a runtime family with an implementer, and an agent
+// whose runtime nothing records cannot be shown not to. The observation row is
+// still written, so the reason survives past the decision.
 func (g PolicyMergeGate) sameRuntimeFamilyAsImplementer(ctx context.Context, reviewJobID string, reviewer string,
-	reviewerRuntime string, implementers map[string]implementerIdentity) (bool, string, error) {
+	reviewerFromActingRole bool, reviewerRuntime string, implementers map[string]implementerIdentity) (bool, string, error) {
 	if g.Store == nil || strings.TrimSpace(reviewer) == "" || len(implementers) == 0 {
+		return false, "", nil
+	}
+	// A ROLE IS OUTSIDE THIS PREDICATE'S DOMAIN, NOT AN UNRESOLVED VALUE WITHIN IT
+	// (#2004). A role-authored review is a human session (#1916): there is no
+	// runtime family to share with anyone, so comparing families is a category
+	// error rather than a missing measurement.
+	//
+	// THE FLAG IS PLUMBED EXPLICITLY AND IS NEVER INFERRED FROM AN EMPTY FAMILY.
+	// An unregistered AGENT also resolves to no family, and that case must keep
+	// failing closed; deciding this on "the family came back empty" would collapse
+	// the two and reopen the hole this change closes.
+	//
+	// This is a domain exclusion rather than an exemption because every other
+	// independence check still binds a role: the caller tests
+	// implementingAgents[reviewer] BEFORE reaching here, so a role approving its
+	// own implementation is still refused on identity. That arm has its own test.
+	if reviewerFromActingRole {
 		return false, "", nil
 	}
 	reviewerFamily, ok, err := ResolveRuntimeFamily(ctx, g.Store, reviewJobID, reviewer, reviewerRuntime)
@@ -2659,9 +2680,11 @@ func (g PolicyMergeGate) sameRuntimeFamilyAsImplementer(ctx context.Context, rev
 		return false, "", err
 	}
 	if !ok {
-		g.recordFamilyUnresolved(ctx, reviewJobID, fmt.Sprintf(
-			"runtime family unresolved for reviewer %q; independence was decided on agent name alone", reviewer))
-		return false, "", nil
+		reason := fmt.Sprintf(
+			"runtime family unresolved for reviewer %q, so cross-family independence cannot be shown; register the agent with a runtime, or re-run the review on an agent whose runtime is recorded",
+			reviewer)
+		g.recordFamilyUnresolved(ctx, reviewJobID, reason)
+		return true, reason, nil
 	}
 	names := make([]string, 0, len(implementers))
 	for name := range implementers {
@@ -2670,14 +2693,29 @@ func (g PolicyMergeGate) sameRuntimeFamilyAsImplementer(ctx context.Context, rev
 	sort.Strings(names)
 	for _, name := range names {
 		identity := implementers[name]
+		// THE SAME DOMAIN EXCLUSION, ON THE IMPLEMENTER SIDE. A role-attributed
+		// implementer (#1916) is a human session, not a runtime agent, so it has no
+		// family to share and comparing one is the same category error as on the
+		// reviewer side. Keyed on the recorded flag, never on an empty family,
+		// because an unregistered AGENT implementer looks identical and must keep
+		// failing closed.
+		//
+		// A role that implemented and then approved its own work is still refused:
+		// the caller tests implementingAgents[reviewer] by name before reaching
+		// here, and both sides normalize to the same role string.
+		if identity.FromActingRole {
+			continue
+		}
 		family, ok, err := ResolveRuntimeFamily(ctx, g.Store, identity.JobID, name, identity.RecordedRuntime)
 		if err != nil {
 			return false, "", err
 		}
 		if !ok {
-			g.recordFamilyUnresolved(ctx, reviewJobID, fmt.Sprintf(
-				"runtime family unresolved for implementer %q; independence was decided on agent name alone", name))
-			continue
+			reason := fmt.Sprintf(
+				"runtime family unresolved for implementer %q, so cross-family independence cannot be shown; register the agent with a runtime, or record the runtime the implement job ran on",
+				name)
+			g.recordFamilyUnresolved(ctx, reviewJobID, reason)
+			return true, reason, nil
 		}
 		if family == reviewerFamily {
 			return true, fmt.Sprintf(

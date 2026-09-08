@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/reviewseverity"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
@@ -19,6 +20,7 @@ import (
 
 func insertIndependentMergeGateReview(t *testing.T, store *db.Store, reviewJob db.Job, reviewPayload JobPayload) {
 	t.Helper()
+	seedMergeGateFixtureAgent(t, store, reviewJob.Agent)
 	implementingAgent := "implementer"
 	if strings.TrimSpace(reviewJob.Agent) == implementingAgent {
 		implementingAgent = "different-implementer"
@@ -26,6 +28,7 @@ func insertIndependentMergeGateReview(t *testing.T, store *db.Store, reviewJob d
 	implementPayload := reviewPayload
 	implementPayload.ReviewRound = ""
 	implementPayload.Result = &AgentResult{Decision: "implemented", Summary: "implemented"}
+	seedMergeGateFixtureAgent(t, store, implementingAgent)
 	insertCompletedJob(t, store, db.Job{
 		ID:    reviewJob.ID + "-implement-author",
 		Agent: implementingAgent,
@@ -77,8 +80,19 @@ func newMergeGateQuorumScenario(t *testing.T) (*db.Store, *fakeMergeGateGitHub, 
 	return store, gh, gate, request
 }
 
+// seedMergeGateFixtureAgent delegates to the SHARED helper (#2004). It stays as
+// a one-line wrapper only because this package's fixtures call it in a dozen
+// places; the rule itself - one family per name, and never register a synthetic
+// agent - lives in dbtest, so internal/cli and internal/daemon get the same one
+// instead of a third copy that drifts.
+func seedMergeGateFixtureAgent(t *testing.T, store *db.Store, name string) {
+	t.Helper()
+	dbtest.SeedGateFixtureAgent(t, store, name)
+}
+
 func insertMergeGateReviewFixture(t *testing.T, store *db.Store, fixture mergeGateReviewFixture) {
 	t.Helper()
+	seedMergeGateFixtureAgent(t, store, fixture.agent)
 	state := fixture.state
 	if state == "" {
 		state = JobSucceeded
@@ -6497,6 +6511,8 @@ func TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut(t *testing.T) {
 			id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
 		})
 		mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+		// #2004: the gate resolves a runtime family for this reviewer.
+		seedMergeGateFixtureAgent(t, store, "returning-reviewer")
 		if _, err := mailbox.OpenExternalJob(ctx, JobRequest{
 			ID: "cli-session-objection", Agent: "returning-reviewer", Action: "review",
 			Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", Sender: "session",
@@ -6629,6 +6645,8 @@ func TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut(t *testing.T) {
 			id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
 		})
 		mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+		// #2004: the gate resolves a runtime family for this reviewer.
+		seedMergeGateFixtureAgent(t, store, "asym-reviewer")
 		if _, err := mailbox.OpenExternalJob(ctx, JobRequest{
 			ID: "asym-objection", Agent: "asym-reviewer", Action: "review",
 			Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", Sender: "session",
@@ -6774,6 +6792,8 @@ func TestPolicyMergeGateProvenanceScopeMatrix(t *testing.T) {
 				id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
 			})
 			mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+			// #2004: the gate resolves a runtime family for this reviewer.
+			seedMergeGateFixtureAgent(t, store, "matrix-reviewer")
 			if _, err := mailbox.OpenExternalJob(ctx, JobRequest{
 				ID: "matrix-objection", Agent: "matrix-reviewer", Action: "review",
 				Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", Sender: "session",

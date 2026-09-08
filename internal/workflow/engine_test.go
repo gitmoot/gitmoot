@@ -3427,6 +3427,13 @@ func enableAutoFix(t *testing.T, store *db.Store, pullRequest int) {
 
 func insertCompletedJob(t *testing.T, store *db.Store, job db.Job, payload JobPayload) {
 	t.Helper()
+	// #2004: the merge gate now resolves a runtime FAMILY and fails closed when it
+	// cannot. These fixtures predate that and name agents without registering
+	// them, which is a shape production does not have - a dispatched job's agent
+	// is registered, or is a temp/ephemeral name derived from one that is.
+	// Registering each on a family of its own preserves what every name-only
+	// expectation in this suite already assumed.
+	seedMergeGateFixtureAgent(t, store, job.Agent)
 	encoded, err := marshalPayload(payload)
 	if err != nil {
 		t.Fatalf("marshalPayload returned error: %v", err)

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -48,6 +49,15 @@ func seedBlockedReviewTask(t *testing.T, store *db.Store, repo github.Repository
 
 func seedBlockedReviewTaskAttributed(t *testing.T, store *db.Store, repo github.Repository, class workflow.MergeBlockClass, reason string, attribute bool) github.PullRequest {
 	t.Helper()
+	// #2004: the merge gate resolves a runtime FAMILY for the reviewer and every
+	// recorded implementer and fails closed when it cannot. This fixture names an
+	// agent and never registered one, a shape production does not have. Seeded at
+	// the fixture rather than at testStore: a package-wide seed also registers
+	// agents for tests that model an ABSENT or unscoped one, measured as four
+	// unrelated poll tests turning red.
+	for _, name := range []string{"audit", "reviewer", "implementer"} {
+		dbtest.SeedGateFixtureAgent(t, store, name)
+	}
 	ctx := context.Background()
 	if err := store.UpsertTask(ctx, db.Task{
 		ID:           "review-pr-1699-3f3a1026",

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/github"
 )
 
@@ -83,6 +84,9 @@ func seedWedgedTask(t *testing.T, store *db.Store) {
 
 func seedReviewJob(t *testing.T, store *db.Store, id, agent, head, decision string, state JobState) {
 	t.Helper()
+	// #2004: the gate resolves a runtime family for this reviewer and fails closed
+	// when it cannot. This fixture names an agent and never registered one.
+	dbtest.SeedGateFixtureAgent(t, store, agent)
 	payload := JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		Branch:      "task-9",
