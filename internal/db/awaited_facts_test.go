@@ -44,7 +44,7 @@ func subscribeReviewFact(t *testing.T, store *Store, role, repo string, pullRequ
 	if err != nil {
 		t.Fatalf("ReviewVerdictSubjectKey: %v", err)
 	}
-	fact, err := store.SubscribeAwaitedFact(context.Background(), AwaitedFactSubscription{
+	fact, _, err := store.SubscribeAwaitedFact(context.Background(), AwaitedFactSubscription{
 		WaiterRole: role, SubjectKind: AwaitedFactSubjectReviewVerdict,
 		SubjectKey: key, Deadline: time.Now().UTC().Add(time.Hour),
 	})
@@ -94,7 +94,7 @@ VALUES ('review-race', 'reviewer', 'review', 'succeeded', ?, 'review-race', 'rev
 			}{err: keyErr}
 			return
 		}
-		fact, subscribeErr := subscriberStore.SubscribeAwaitedFact(ctx, AwaitedFactSubscription{
+		fact, _, subscribeErr := subscriberStore.SubscribeAwaitedFact(ctx, AwaitedFactSubscription{
 			WaiterRole: "lane", SubjectKind: AwaitedFactSubjectReviewVerdict,
 			SubjectKey: key, Deadline: time.Now().UTC().Add(time.Hour),
 		})

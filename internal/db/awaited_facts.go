@@ -125,14 +125,17 @@ func normalizeAwaitedFactSubscription(request AwaitedFactSubscription) (AwaitedF
 // state before commit. SQLite serializes a concurrent producer against this
 // write transaction: either its fact is visible to the recheck, or its commit
 // runs afterward and resolves the newly committed waiting row.
-func (s *Store) SubscribeAwaitedFact(ctx context.Context, request AwaitedFactSubscription) (AwaitedFact, error) {
+// SubscribeAwaitedFact also returns the headless review rows the resolver passed
+// over, so the caller - which can reach workflow, as this package cannot - can
+// state each exclusion instead of leaving the row silently invisible (#2008).
+func (s *Store) SubscribeAwaitedFact(ctx context.Context, request AwaitedFactSubscription) (AwaitedFact, []HeadlessReviewSkip, error) {
 	request, err := normalizeAwaitedFactSubscription(request)
 	if err != nil {
-		return AwaitedFact{}, err
+		return AwaitedFact{}, nil, err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return AwaitedFact{}, err
+		return AwaitedFact{}, nil, err
 	}
 	defer tx.Rollback()
 
@@ -140,39 +143,56 @@ func (s *Store) SubscribeAwaitedFact(ctx context.Context, request AwaitedFactSub
 INSERT INTO awaited_facts(waiter_role, subject_kind, subject_key, deadline)
 VALUES (?, ?, ?, ?)`, request.WaiterRole, request.SubjectKind, request.SubjectKey, request.Deadline.Format(time.RFC3339Nano))
 	if err != nil {
-		return AwaitedFact{}, err
+		return AwaitedFact{}, nil, err
 	}
 	id, err := result.LastInsertId()
 	if err != nil {
-		return AwaitedFact{}, err
+		return AwaitedFact{}, nil, err
 	}
-	if detail, ok, err := canonicalAwaitedFactTx(ctx, tx, request.SubjectKind, request.SubjectKey, s.blockingSeverityFor); err != nil {
-		return AwaitedFact{}, err
-	} else if ok {
+	detail, ok, skipped, err := canonicalAwaitedFactTx(ctx, tx, request.SubjectKind, request.SubjectKey, s.blockingSeverityFor)
+	if err != nil {
+		return AwaitedFact{}, nil, err
+	}
+	if ok {
 		if _, err := satisfyAwaitedFactTx(ctx, tx, id, request.WaiterRole, request.SubjectKind, request.SubjectKey, detail, time.Now().UTC()); err != nil {
-			return AwaitedFact{}, err
+			return AwaitedFact{}, nil, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return AwaitedFact{}, err
+		return AwaitedFact{}, nil, err
 	}
-	return s.GetAwaitedFact(ctx, id)
+	fact, err := s.GetAwaitedFact(ctx, id)
+	return fact, skipped, err
 }
 
-func canonicalAwaitedFactTx(ctx context.Context, tx *sql.Tx, kind, key string, blockingSeverity func(repo string) string) (string, bool, error) {
+// HeadlessReviewSkip is a succeeded review row a head-keyed resolver passed over
+// because it records no head. It is carried RAW - the id and the flag, nothing
+// interpreted - because the rule that turns those into a stated reason lives in
+// workflow, and workflow depends on db and never the reverse (#2008). A copy of
+// that vocabulary here would be the second definition this campaign exists to
+// remove.
+type HeadlessReviewSkip struct {
+	JobID            string
+	ExternallyDriven bool
+}
+
+// canonicalAwaitedFactTx also reports the headless review rows it passed over,
+// so the caller can say it excluded them. It does NOT report rows at a different
+// head: those carry an engine-observed head and are simply not this one.
+func canonicalAwaitedFactTx(ctx context.Context, tx *sql.Tx, kind, key string, blockingSeverity func(repo string) string) (string, bool, []HeadlessReviewSkip, error) {
 	switch kind {
 	case AwaitedFactSubjectReviewVerdict:
 		repo, pullRequest, headSHA, err := parseReviewVerdictSubjectKey(key)
 		if err != nil {
-			return "", false, err
+			return "", false, nil, err
 		}
 		rows, err := tx.QueryContext(ctx, `
-SELECT id, agent, payload
+SELECT id, agent, payload, externally_driven
 FROM jobs
 WHERE type = 'review' AND state = 'succeeded' AND lower(repo) = ? AND pull_request = ?
 ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 		if err != nil {
-			return "", false, err
+			return "", false, nil, err
 		}
 		defer rows.Close()
 		// The scan is keyed to ONE repo, but reviewVerdictFact consults the resolver
@@ -182,19 +202,36 @@ ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 		// transaction, which is the same freshness the single-row producer path gets.
 		scanSeverity := blockingSeverity(repo)
 		memoized := func(string) string { return scanSeverity }
+		var skipped []HeadlessReviewSkip
 		for rows.Next() {
 			var jobID, agent, payload string
-			if err := rows.Scan(&jobID, &agent, &payload); err != nil {
-				return "", false, err
+			var externallyDriven bool
+			if err := rows.Scan(&jobID, &agent, &payload, &externallyDriven); err != nil {
+				return "", false, nil, err
+			}
+			// The headless case is captured BEFORE reviewVerdictFact, because that
+			// helper folds an empty head in with three unrelated rejections and
+			// returns a bare false, so a row skipped for want of a head is
+			// indistinguishable there from malformed junk. It is deliberately not
+			// loosened: its job is to decide whether a row IS a verdict.
+			//
+			// This uses the package's own decode and isFanOut rather than
+			// re-stating their conditions, so it adds no second copy of that rule.
+			var decoded reviewVerdictPayload
+			if err := json.Unmarshal([]byte(payload), &decoded); err == nil &&
+				decoded.Result != nil && !decoded.isFanOut() &&
+				decoded.Repo != "" && decoded.PullRequest > 0 &&
+				strings.TrimSpace(decoded.HeadSHA) == "" {
+				skipped = append(skipped, HeadlessReviewSkip{JobID: jobID, ExternallyDriven: externallyDriven})
 			}
 			fact, ok := reviewVerdictFact(jobID, agent, "succeeded", payload, memoized)
 			if ok && fact.headSHA == headSHA {
-				return fact.detail, true, nil
+				return fact.detail, true, skipped, nil
 			}
 		}
-		return "", false, rows.Err()
+		return "", false, skipped, rows.Err()
 	default:
-		return "", false, fmt.Errorf("unsupported awaited fact subject kind %q", kind)
+		return "", false, nil, fmt.Errorf("unsupported awaited fact subject kind %q", kind)
 	}
 }
 
