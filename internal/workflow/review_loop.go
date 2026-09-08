@@ -264,7 +264,11 @@ func (e Engine) reviewScopeUnavailableRecorded(ctx context.Context, taskID strin
 // Re-attempting a HELD leg is the worker's path — the row stays queued and is
 // re-dispatched — and nothing here silently retries a terminal verdict, which is the
 // pre-existing contract.
-func reviewLegsAtHead(jobs []db.Job, event PullRequestEvent, round string) map[string]string {
+//
+// IT IS AN ENGINE METHOD RATHER THAN A PURE FUNCTION so it can record why it
+// dropped a row (#2008). The alternative was to re-derive the dropped set in the
+// caller, which would be a second copy of this filter and would drift from it.
+func (e Engine) reviewLegsAtHead(ctx context.Context, jobs []db.Job, event PullRequestEvent, round string) (map[string]string, error) {
 	current := JobPayload{Repo: event.Repo, PullRequest: event.PullRequest, TaskID: event.TaskID}
 	head := strings.TrimSpace(event.HeadSHA)
 	round = strings.TrimSpace(round)
@@ -283,13 +287,22 @@ func reviewLegsAtHead(jobs []db.Job, event PullRequestEvent, round string) map[s
 			continue
 		}
 		if strings.TrimSpace(payload.HeadSHA) != head || strings.TrimSpace(payload.ReviewRound) != round {
+			// BEHAVIOUR UNCHANGED, and no head is written. Only the head-keyed
+			// reason is recorded: a row at a DIFFERENT head has an engine-observed
+			// head and is simply not this one. A row that is also roundless stays a
+			// round-keyed matter, which is a separate slice.
+			if reason, excluded := HeadBoundExclusion(job.ExternallyDriven, payload.HeadSHA); excluded {
+				if err := RecordHeadBoundExclusion(ctx, e.Store, job.ID, "review_loop.reviewLegsAtHead", reason); err != nil {
+					return nil, err
+				}
+			}
 			continue
 		}
 		if agent := strings.ToLower(strings.TrimSpace(reviewDecisionAgent(job, payload))); agent != "" {
 			legs[agent] = job.State
 		}
 	}
-	return legs
+	return legs, nil
 }
 
 // reviewScopeForRoutine resolves the scope for a ROUTINE (non-lens) round. It reads
@@ -398,6 +411,18 @@ func (e Engine) followUpReviewScopes(ctx context.Context, event PullRequestEvent
 		}
 		previousHead := strings.TrimSpace(payload.HeadSHA)
 		if previousHead == "" || previousHead == strings.TrimSpace(event.HeadSHA) {
+			// Same split as reviewLegsAtHead, and the split is enforced by the
+			// SHARED PREDICATE rather than by a local guard here. An earlier
+			// version wrapped this in `if previousHead == ""`, which was dead
+			// code: HeadBoundExclusion already refuses a non-empty head. It was
+			// found by its own test having no mutant that could kill it, and it
+			// is worth removing rather than keeping, because a second copy of a
+			// rule that currently agrees is what this whole campaign is about.
+			if reason, excluded := HeadBoundExclusion(job.ExternallyDriven, previousHead); excluded {
+				if err := RecordHeadBoundExclusion(ctx, e.Store, job.ID, "review_loop.followUpReviewScopes", reason); err != nil {
+					return nil, err
+				}
+			}
 			continue
 		}
 		findings := namedReviewFindings(*payload.Result)
