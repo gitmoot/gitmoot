@@ -1021,7 +1021,25 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		switch JobState(review.job.State) {
 		case JobQueued, JobRunning:
 			return mergePending{reason: fmt.Sprintf("waiting for reviewer %s at evaluated head (job %s is %s)", effectiveReviewerIdentityName(review.job, review.payload), review.job.ID, review.job.State)}
-		case JobFailed, JobCancelled:
+		case JobCancelled:
+			// #1799. An EXPLICIT CANCELLATION IS NOT A CRASH, and calling it one sends
+			// an operator to the wrong remedy. Measured in this store: 534 cancelled
+			// review jobs would have been reported as crashed reviewers, 346 of them
+			// carrying the discriminator in their own events - "cancel requested from
+			// queued" 196, "from running" 92, "from blocked" 59.
+			//
+			// Directive 108042 recorded two in one hour: a duplicate cancelled on
+			// purpose, and one cancelled after sixteen minutes with the intent
+			// pre-declared in a workflow note. Both were escalated as crashed
+			// reviewers asking for a requeue or merge bridge; neither reviewer crashed.
+			//
+			// STILL FAIL-CLOSED, and deliberately: a cancelled slot at the evaluated
+			// head is not a verdict, so it still refuses. Only the DIAGNOSIS changes,
+			// because "retry the crashed job" and "this slot was cancelled on purpose,
+			// so decide whether it should be re-dispatched at all" are different
+			// operator actions.
+			return fmt.Errorf("cancelled review slot for reviewer %s at evaluated head (job %s was cancelled, not crashed); a cancellation is not a verdict, so decide whether this slot should be re-dispatched at that head or superseded by a new head. Reassigning the review to a different agent cannot clear this reviewer's slot", effectiveReviewerIdentityName(review.job, review.payload), review.job.ID)
+		case JobFailed:
 			return fmt.Errorf("crashed reviewer %s at evaluated head (job %s is %s); retry or settle that same job, or push a new head. Reassigning the review to a different agent cannot clear this reviewer's slot", effectiveReviewerIdentityName(review.job, review.payload), review.job.ID, review.job.State)
 		}
 	}
@@ -1517,6 +1535,10 @@ func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job, declared []
 	var blocking []string
 	var active []string
 	var crashed []string
+	// #1799: cancelled children are reported separately from crashed ones. A
+	// reader deciding whether to retry, re-dispatch or leave a slot alone needs
+	// the distinction; folding them together sent operators to the wrong remedy.
+	var cancelled []string
 	var abstaining []string
 	var parked []string
 	var unrecognized []string
@@ -1563,7 +1585,12 @@ func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job, declared []
 			default:
 				unrecognized = append(unrecognized, fmt.Sprintf("%s (unrecognized decision %q)", childID, decision))
 			}
-		case JobFailed, JobCancelled:
+		case JobCancelled:
+			// #1799: a cancelled lens child is not a crashed one. Same bucket-mixing
+			// as the slot classification above, in the fan-out summary a reader uses
+			// to decide what to do next.
+			cancelled = append(cancelled, fmt.Sprintf("%s (%s)", childID, child.State))
+		case JobFailed:
 			crashed = append(crashed, fmt.Sprintf("%s (%s)", childID, child.State))
 		case JobBlocked:
 			parked = append(parked, fmt.Sprintf("%s (%s)", childID, child.State))
@@ -1574,6 +1601,7 @@ func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job, declared []
 	sort.Strings(blocking)
 	sort.Strings(active)
 	sort.Strings(crashed)
+	sort.Strings(cancelled)
 	sort.Strings(abstaining)
 	sort.Strings(parked)
 	sort.Strings(unrecognized)
@@ -1589,6 +1617,9 @@ func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job, declared []
 	}
 	if len(crashed) > 0 {
 		details = append(details, "crashed children: "+strings.Join(crashed, ", "))
+	}
+	if len(cancelled) > 0 {
+		details = append(details, "cancelled children: "+strings.Join(cancelled, ", "))
 	}
 	if len(abstaining) > 0 {
 		details = append(details, "abstaining children: "+strings.Join(abstaining, ", "))
@@ -1623,6 +1654,19 @@ func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job, declared []
 	if len(crashed) > 0 {
 		return fmt.Errorf(
 			"delegated review parent %s has crashed delegation children (%s); rerun or repair the delegated review",
+			parent.ID,
+			reasonDetails,
+		)
+	}
+	// #1799: BEHAVIOUR-PRESERVING BY CONSTRUCTION. Before this change a cancelled
+	// child sat in `crashed`, so a fan-out of only-cancelled children refused
+	// here. Splitting the bucket without this arm would have let that case fall
+	// through to `abstaining` - or past every arm - and stop refusing, which is a
+	// gate weakening dressed as a message fix. It still refuses; only the
+	// diagnosis and the remedy differ.
+	if len(cancelled) > 0 {
+		return fmt.Errorf(
+			"delegated review parent %s has CANCELLED delegation children (%s); a cancellation is not a verdict and not a crash, so decide whether those slots should be re-dispatched rather than repaired",
 			parent.ID,
 			reasonDetails,
 		)
