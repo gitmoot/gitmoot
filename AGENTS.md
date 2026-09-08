@@ -53,13 +53,18 @@ infrastructure rather than the documented boundary they are:
 - **`-race` is unreachable from a read-only review seat**, because race requires
   cgo (`go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`) and the
   sandbox denies the C header above. Its absence from a review verdict is not a
-  regression, and the boundary is `ReadOnlySeat`, not the kind of clone you hold:
-  `readOnlyRuntimeSandboxGrants` stages the toolchain and applies Landlock for
-  jobs whose payload carries that marker, which includes native reviews,
-  ask/review delegation children, and pipeline worktrees, ephemeral workers
-  among them. A session that is **not** a `ReadOnlySeat`, is permitted to run
-  Bash by its autonomy policy, and has the C toolchain and headers available can
-  execute race-enabled tests: measured on this host,
+  regression, and the boundary is the `ReadOnlySeat` marker, not the kind of
+  clone you hold. Seven dispatch sites set it on `origin/main` - in
+  `internal/cli`: `daemon_checkout.go`, `daemon_scheduler.go`, `daemon_worker.go`,
+  `job_blocker_auth_probe.go`, `pipeline_enqueue.go`; in `internal/workflow`:
+  `engine_delegation.go`, `engine_pr_lifecycle.go` - so read the list from
+  `git grep -n 'ReadOnlySeat.*true' origin/main` rather than from a summary here.
+  Under that marker the daemon computes read-only sandbox grants through
+  `readOnlyRuntimeSandboxGrants`, which resolves the isolated tool cache and the
+  staged toolchain; the sandboxing itself is applied by the runtime layer and is
+  not this function's job. A session that is **not** a `ReadOnlySeat`, is
+  permitted to run Bash by its autonomy policy, and has the C toolchain and
+  headers available can execute race-enabled tests: measured on this host,
   `CGO_ENABLED=1 go test -race ./internal/db/` returns `ok`. Owning a checkout is
   not the predicate and neither is being "a seat"; a restrictive autonomy policy
   blocks Bash regardless.
@@ -68,8 +73,10 @@ infrastructure rather than the documented boundary they are:
   block): without the tag the compile silently drops 33 tagged `internal/cli`
   files, 2 in `workflow` and 1 in `daemon`, and the shard plan derived from
   `-test.list` shrinks to match with nothing failing. Measured on this host,
-  `internal/cli` lists **2236** tests with the tag and **2108** without it, so an
-  untagged run omits 128 and reports success. `internal/db` lists 402 either way,
+  `internal/cli` LISTS **2236** tests with the tag and **2108** without it, so an
+  untagged binary carries 128 fewer tests to run. That is a count from
+  `-test.list` on both binaries; neither was executed to completion here, so the
+  claim is about what the shard plan can select, not about a passing run. `internal/db` lists 402 either way,
   which is the trap: probing that package proves a race binary can be built and
   run and says nothing about the lane. A probe that omits the tag cannot answer
   "does the lane pass". Report what you ran. A race result is also
