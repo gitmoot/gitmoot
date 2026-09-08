@@ -379,8 +379,20 @@ onto the PR-open event, while `case "review":` begins after that block and does
 not consult it. `dispatchFix` builds a parentless implement request that does
 not inherit it either.
 
-The flag is therefore a real control on the **implement** side, not an escape
-hatch on the review side. Same-head safety for an adversarial panel comes from
+One propagation path does carry it further, and it is deliberate. Every
+delegation child inherits the bit: `delegationRequest` in
+`internal/workflow/engine_run_budgets.go` copies `SkipNativeReviewFanout` from
+the parent payload for any job type, because the intent is an operator command
+about how the whole tree is reviewed rather than about one job (#1236). So a
+review job that delegates an **implement** leg produces a child that does
+consume the flag, on the implement path described above. What does not happen is
+the review's own advance acting on it, and `dispatchFix` is parentless, so the
+fix jobs the race is about do not inherit it.
+
+**The consumer is implement-only; the scope is the tree.** Those are different
+claims and only the first one is about `agent review`. The flag is a real
+control whose effect lands on implement work, not an escape hatch on the review
+side. Same-head safety for an adversarial panel comes from
 the per-head and per-branch coalescing guards, not from passing this flag to
 `agent review`. To suppress native fan-out for a branch, pass it on the
 implement dispatch (or `orchestrate`/`run`), which is where it takes effect and
