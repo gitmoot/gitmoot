@@ -443,10 +443,15 @@ func TestCLIReviewLoopAllowsNewHeadAndMixedDecisions(t *testing.T) {
 // count enforcement, and non-idempotent event emission.
 func TestCLIReviewLoopHerdres227Shape(t *testing.T) {
 	fixture := newCLIReviewLoopFixture(t)
-	seedCLIReviewLoopVerdict(t, fixture.store, "herdres-227-first", "2da08", "changes_requested")
+	// A FULL sha, because #2054 now refuses a sha-shaped abbreviation at
+	// dispatch and this test's subject is the review-loop refusal, not head
+	// formatting. The token is arbitrary and shared with the seeded verdict; its
+	// LENGTH was never load-bearing here.
+	const herdres227Head = "2da08e1f4c7b6a5d3e2f1908a7b6c5d4e3f21098"
+	seedCLIReviewLoopVerdict(t, fixture.store, "herdres-227-first", herdres227Head, "changes_requested")
 	request := localAgentDispatchRequest{
 		RepoFlag: "owner/repo", Agent: "reviewer", Action: "review", PullRequest: 227,
-		Branch: "main", HeadSHA: "2da08", Instructions: "Review unchanged head.", Home: fixture.home,
+		Branch: "main", HeadSHA: herdres227Head, Instructions: "Review unchanged head.", Home: fixture.home,
 	}
 	for attempt := 2; attempt <= 319; attempt++ {
 		if _, err := dispatchLocalAgentJob(context.Background(), fixture.store, request); err == nil || !strings.Contains(err.Error(), "review loop detected") {
@@ -542,6 +547,67 @@ func TestDispatchReviewWithoutLeadRejectsReviewOnlyAgentBeforeEnqueue(t *testing
 		t.Fatalf("dispatch error = %v", err)
 	}
 	assertReviewLeadHardRefusal(t, store, fixture.checkout, adapter)
+}
+
+// TestDispatchReviewRejectsAbbreviatedHeadSHABeforeEnqueue is #2054 defect 1.
+//
+// An abbreviated --head-sha was ACCEPTED at dispatch and then cancelled by the
+// daemon's staleness check, which compared the 8-character value against the
+// PR's 40-character head and reported `superseded_stale_head: PR #N moved from
+// head "7e4b39d0" to "7e4b39d0ef82…"`. Those are the same commit. The review
+// never ran, and the event sent its operator to look for a push that never
+// happened.
+//
+// Measured contrast on 2026-09-08: the review of #2035 that SUCCEEDED carries a
+// 40-character head_sha; the #2047 job that died carries 8. Same dispatcher,
+// same reviewer, same day.
+//
+// A refusal that arrives AFTER the job exists is the wrong shape regardless of
+// its message, so this asserts the refusal happens where the other pre-enqueue
+// refusals do: no job row, no task, no worktree.
+func TestDispatchReviewRejectsAbbreviatedHeadSHABeforeEnqueue(t *testing.T) {
+	fixture := reviewLeadRefusalStore(t)
+	store := fixture.store
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "lead", runtime.ShellRuntime, "true", []string{"implement", "review"}, "owner/repo", runtime.AutonomyPolicyDangerFullAccess)
+	adapter := installReviewLeadTestAdapter(t, "")
+
+	if len(fixture.head) != 40 {
+		t.Fatalf("fixture head is %d characters, want 40: the abbreviation under test must be a real prefix", len(fixture.head))
+	}
+	_, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
+		RepoFlag: "owner/repo", Agent: "reviewer", Action: "review", PullRequest: 7, LeadAgent: "lead",
+		HeadSHA: fixture.head[:8], Branch: "feature/review", Home: fixture.home,
+	})
+	if err == nil {
+		t.Fatal("dispatch accepted an abbreviated --head-sha; the daemon would cancel it later as a stale head")
+	}
+	// The message must name the EXPECTED LENGTH, because the operator's next
+	// action is to re-run with a full sha and "invalid head" does not say how.
+	for _, want := range []string{"40", fixture.head[:8]} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("dispatch error = %v, want it to name %q", err, want)
+		}
+	}
+	assertReviewLeadHardRefusal(t, store, fixture.checkout, adapter)
+}
+
+// A FULL head sha is the same dispatch and must not be refused: without this the
+// length check could reject everything and both tests above would still pass.
+func TestDispatchReviewAcceptsFullHeadSHA(t *testing.T) {
+	fixture := reviewLeadRefusalStore(t)
+	store := fixture.store
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "lead", runtime.ShellRuntime, "true", []string{"implement", "review"}, "owner/repo", runtime.AutonomyPolicyDangerFullAccess)
+	installReviewLeadTestAdapter(t, "")
+
+	_, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
+		RepoFlag: "owner/repo", Agent: "reviewer", Action: "review", PullRequest: 7, LeadAgent: "lead",
+		HeadSHA: fixture.head, Branch: "feature/review", Home: fixture.home, Background: true,
+	})
+	if err != nil && strings.Contains(err.Error(), "head") {
+		t.Fatalf("a full 40-character head sha was refused by the head guard: %v", err)
+	}
 }
 
 // Kills a missing-existence-check mutant and a mutant that silently falls back

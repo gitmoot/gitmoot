@@ -199,6 +199,120 @@ func TestReviewDispatchBindsThePromptsTargetToTheDispatchHead(t *testing.T) {
 	}
 }
 
+// TestReviewDispatchWarnsOnlyOnCitationsNobodyHasJudged is #2054 finding 3.
+//
+// The identity-based scan warned on ANY cited commit that was not the dispatch
+// head. For a review that fires on cases the refusal above has ALREADY accepted:
+// a foreign citation never reaches the warning stage, so every warning was about
+// the head's own ancestor, a recorded head of this pull request, or an
+// unresolvable sha. The first two are what a prompt says deliberately - a scoped
+// re-review MUST name the previous round's head to say what it is re-reviewing.
+//
+// A warning that fires on the routine case teaches its reader to ignore it, and
+// that cost was paid: this warning was used to attribute job ownership on
+// 2026-09-08 and then raised against a scoped re-review citing its own prior
+// head correctly.
+//
+// The result is that a review emits NO prompt_head_warning at all, and that is
+// the finding rather than a side effect: the scan cannot report a relation that
+// is both resolvable and unjudged, because foreign is refused before enqueue.
+// The refusal carries the wrong-head signal; the warning had nothing left to
+// say. Ask and implement keep theirs - see the boundary test below.
+func TestReviewDispatchWarnsOnlyOnCitationsNobodyHasJudged(t *testing.T) {
+	checkout, base, firstHead, head, _ := promptHeadBindingCheckout(t)
+	const unresolvable = "0123456789abcdef0123456789abcdef01234567"
+
+	for _, tt := range []struct {
+		name     string
+		cited    string
+		wantWarn bool
+	}{
+		{name: "a prior head on the reviewed branch is silent: this is the scoped re-review case", cited: firstHead},
+		{name: "the branch base is silent: a prompt states what the branch sits on", cited: base},
+		{name: "the dispatch head itself is silent", cited: head},
+		// The scan SKIPS a token it cannot resolve, so an unresolvable citation
+		// never produced a warning here either - my first version of this test
+		// asserted it did, and that expectation was wrong about the existing
+		// scanner rather than about the change.
+		{name: "an unresolvable sha is silent too, because the scan never resolved it to warn about", cited: unresolvable},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, home := blockerE2EHome(t)
+			seedReviewDispatchFixture(t, store, checkout)
+
+			request := reviewDispatchRequest(home, head)
+			request.Instructions = "Review this exact head. Round history: commit " + tt.cited + " for context."
+			out, err := dispatchLocalAgentJob(ctx, store, request)
+			if err != nil {
+				t.Fatalf("dispatch was refused: %v", err)
+			}
+			events, err := store.ListJobEvents(ctx, out.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			warned := 0
+			for _, event := range events {
+				if event.Kind == "prompt_head_warning" {
+					warned++
+				}
+			}
+			if tt.wantWarn && warned == 0 {
+				t.Fatalf("no prompt_head_warning for an unresolvable citation: events=%+v", events)
+			}
+			if !tt.wantWarn && warned != 0 {
+				t.Fatalf("prompt_head_warning fired on a citation the refusal already accepted (%s); "+
+					"a warning on the routine case teaches its reader to ignore it", tt.cited)
+			}
+		})
+	}
+}
+
+// TestAskDispatchKeepsItsBlanketPromptHeadWarning pins the BOUNDARY of #2054
+// finding 3, which a mutant switching ask onto the review scope survived
+// without it.
+//
+// Narrowing the warning is only safe where a refusal already judged the
+// citation. Ask and implement have NO refusal in front of them - the #1819
+// guard is review-only - so for them the identity-based warning is the entire
+// head check, and silencing it there would remove the check rather than
+// de-duplicate it. Same change, opposite correctness, decided by whether
+// something else already looked.
+func TestAskDispatchKeepsItsBlanketPromptHeadWarning(t *testing.T) {
+	ctx := context.Background()
+	checkout, base, _, head, _ := promptHeadBindingCheckout(t)
+	store, home := blockerE2EHome(t)
+	seedReviewDispatchFixture(t, store, checkout)
+
+	// An ask needs an ask-capable agent; the shared fixture seeds review and
+	// implement only.
+	seedDaemonWorkerAgentWithPolicy(t, store, "asker", runtime.ShellRuntime, "true", []string{"ask"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	request := reviewDispatchRequest(home, head)
+	request.Agent = "asker"
+	request.LeadAgent = ""
+	request.Action = "ask"
+	request.PullRequest = 0
+	// The BASE is an ancestor of the dispatch head, so the review path is now
+	// deliberately silent about it. Ask must not be.
+	request.Instructions = "Answer against commit " + base + " for context."
+
+	out, err := dispatchLocalAgentJob(ctx, store, request)
+	if err != nil {
+		t.Fatalf("ask dispatch was refused: %v", err)
+	}
+	events, err := store.ListJobEvents(ctx, out.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Kind == "prompt_head_warning" {
+			return
+		}
+	}
+	t.Fatalf("ask lost its prompt_head_warning for a non-head citation: events=%+v; "+
+		"ask has no refusal in front of it, so this warning is its only head check", events)
+}
+
 // TestReviewDispatchRefusalLeavesNoWorktreeBehind pins the ORDERING, separately
 // from the refusal itself.
 //

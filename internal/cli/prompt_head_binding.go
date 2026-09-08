@@ -246,3 +246,50 @@ func reviewPromptTargetMismatchError(citations []promptCommitCitation, dispatchH
 		"review prompt names a commit outside this pull request's history, so the instructions and the dispatch head describe different changes: %s; the dispatch head is %s. A review's instructions are its specification, so this is refused before any job row exists. Cite a prior head of this pull request, its base, or the head itself; or pass --allow-prompt-head-mismatch to dispatch it deliberately",
 		strings.Join(described, "; "), strings.TrimSpace(dispatchHead))
 }
+
+// retainUnjudgedPromptHeadWarnings drops the warnings a review's own refusal
+// has already judged (#2054).
+//
+// It filters rather than replaces the scan, so the scan keeps happening on the
+// allocated exact-head worktree where it is documented to happen, and only the
+// EMISSION narrows. A warning survives when its cited commit could not be
+// classified at all: nobody has judged that one, so the operator is the last
+// check. Every other relation - the head, an ancestor of it, a recorded head of
+// this pull request - is what a prompt states deliberately, and a warning on the
+// routine case teaches its reader to ignore it.
+func retainUnjudgedPromptHeadWarnings(
+	ctx context.Context,
+	git gitutil.Client,
+	heads recordedPullRequestHeadSource,
+	prompt string,
+	dispatchHead string,
+	repo string,
+	pullRequest int,
+	warnings []string,
+) []string {
+	if len(warnings) == 0 {
+		return warnings
+	}
+	unjudged := make([]string, 0, len(warnings))
+	for _, citation := range classifyPromptCommitCitations(ctx, git, heads, prompt, dispatchHead, repo, pullRequest) {
+		if citation.relation == promptCommitUnresolved {
+			unjudged = append(unjudged, citation.token, citation.resolved)
+		}
+	}
+	if len(unjudged) == 0 {
+		return nil
+	}
+	kept := make([]string, 0, len(warnings))
+	for _, warning := range warnings {
+		for _, token := range unjudged {
+			if strings.TrimSpace(token) != "" && strings.Contains(warning, token) {
+				kept = append(kept, warning)
+				break
+			}
+		}
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	return kept
+}

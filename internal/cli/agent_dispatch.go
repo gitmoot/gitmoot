@@ -253,6 +253,34 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			return localAgentJobOutput{}, err
 		}
 	}
+	// #2054: REFUSE AN ABBREVIATED --head-sha before any durable state.
+	//
+	// An abbreviated value used to be accepted and then CANCELLED by the daemon's
+	// staleness check, which compares the recorded head against the pull
+	// request's: `superseded_stale_head: PR #N moved from head "7e4b39d0" to
+	// "7e4b39d0ef82…"`. Those are the same commit. The review never ran, and the
+	// event's wording sent its operator to look for a push that never happened.
+	//
+	// Measured contrast on 2026-09-08: the #2035 review that SUCCEEDED carries a
+	// 40-character head_sha; the #2047 job that died carries 8. Same dispatcher,
+	// same reviewer, same day.
+	//
+	// It fires only on a SHA-SHAPED value - hex of the wrong length, or 40
+	// characters that are not hex. A value that is not sha-shaped at all is not
+	// an abbreviation; it is something the review-loop and reviewer-identity
+	// refusals name far better than a format check can, and preempting them
+	// would answer a question nobody asked.
+	//
+	// It refuses at DISPATCH rather than at the staleness check because a
+	// refusal that arrives after the job row exists has already spent a
+	// worktree, a queue slot and an operator's attention - and, as the same
+	// pattern showed elsewhere, a command that reports a refusal while leaving
+	// work behind is the harder failure to see.
+	if request.Action == "review" {
+		if err := dispatchHeadSHAError(request.HeadSHA); err != nil {
+			return localAgentJobOutput{}, err
+		}
+	}
 	// A review that may return changes_requested must name a fix target that can
 	// actually implement before Gitmoot spends a review session. Validate the
 	// agents-table row here, before repo/task/worktree mutation, managed-agent
@@ -464,7 +492,26 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	}
 	if request.Action == "review" {
 		checkoutPath = readOnlyWorktreePath
+		// #2054: WARN ONLY ON A CITATION THIS PATH HAS NOT ALREADY JUDGED.
+		//
+		// The identity-based scan is right for ask and implement, which have no
+		// refusal in front of them. For a REVIEW it fires on cases the #1819
+		// classifier above has already accepted: refusal happens before enqueue
+		// for a FOREIGN citation, so by the time this runs the citation is the
+		// head, an ancestor of it, a recorded head of this pull request, or
+		// unresolvable. Every one of those is what a prompt does deliberately -
+		// a scoped re-review MUST name the previous round's head to say what it
+		// is re-reviewing - so warning on them fires on the routine case, and a
+		// warning that fires on the routine case teaches its reader to ignore
+		// it. That cost is not hypothetical: this warning was used to attribute
+		// job ownership on 2026-09-08 and then raised against a scoped
+		// re-review that was citing its own prior head correctly.
+		//
+		// Only UNRESOLVABLE survives as worth saying: the classifier could not
+		// establish the relationship, so nobody has judged that citation.
 		promptHeadWarnings = dispatchPromptHeadContradictionWarnings(ctx, jobGitClient(checkoutPath, localDispatchJobRunner(request)), request.Instructions, request.HeadSHA)
+		promptHeadWarnings = retainUnjudgedPromptHeadWarnings(ctx, jobGitClient(record.CheckoutPath, localDispatchJobRunner(request)),
+			store, request.Instructions, request.HeadSHA, repo.FullName(), request.PullRequest, promptHeadWarnings)
 	}
 	// Locking stays on the agent's REGISTERED session (see the same split in
 	// jobWorker.run): a read-only seat isolates DELIVERY, not serialization, so
@@ -1026,6 +1073,49 @@ func routeSelectedMessage(request localAgentDispatchRequest) string {
 		message += fmt.Sprintf("; runtime override: %s", override)
 	}
 	return message
+}
+
+// dispatchHeadSHAError rejects a head that cannot be compared to a pull
+// request's head without resolving it (#2054).
+//
+// An EMPTY head stays legal: --head-sha is optional and its absence means "do
+// not bind", which is a different decision from binding badly. What is refused
+// is a value that LOOKS bound and is not comparable - the shape that produced a
+// confident, specific, wrong "stale head" cancellation.
+//
+// The message names the expected length and echoes the value, because the
+// operator's next action is to re-run with the full sha and "invalid head sha"
+// does not say how long it should be.
+func dispatchHeadSHAError(headSHA string) error {
+	head := strings.TrimSpace(headSHA)
+	if head == "" {
+		return nil
+	}
+	shaShaped := isHexString(head) || len(head) == gitCommitSHALength
+	if shaShaped && (len(head) != gitCommitSHALength || !isHexString(head)) {
+		return fmt.Errorf(
+			"--head-sha %q is not a full commit sha: pass all %d hex characters, "+
+				"because an abbreviated value is accepted here and then cancelled as a stale head when it is compared to the pull request's full head (#2054)",
+			head, gitCommitSHALength,
+		)
+	}
+	return nil
+}
+
+// gitCommitSHALength is the length of a full hex object id.
+const gitCommitSHALength = 40
+
+func isHexString(value string) bool {
+	for _, r := range value {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'f':
+		case r >= 'A' && r <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func validateLocalReviewLeadAtDispatch(ctx context.Context, store *db.Store, request localAgentDispatchRequest, repo string) (localAgentDispatchRequest, error) {
