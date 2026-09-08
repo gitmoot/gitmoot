@@ -706,6 +706,7 @@ func unstructuredLocatorText(locator string) string {
 	}
 	return locator
 }
+
 // reviewShapedResult reports whether a result is a review verdict regardless of
 // the job TYPE that produced it (#1962). An `agent ask` dispatched as "review
 // this PR at this head" returns exactly this shape - a review decision, usually
