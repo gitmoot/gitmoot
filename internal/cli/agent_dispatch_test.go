@@ -578,6 +578,10 @@ func TestDispatchReviewRejectsAbbreviatedHeadSHABeforeEnqueue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	tasksBefore, err := store.ListTasks(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	request := reviewDispatchRequest(home, head[:8])
 	_, dispatchErr := dispatchLocalAgentJob(ctx, store, request)
 	if dispatchErr == nil {
@@ -598,6 +602,19 @@ func TestDispatchReviewRejectsAbbreviatedHeadSHABeforeEnqueue(t *testing.T) {
 	}
 	if len(after) != len(before) {
 		t.Fatalf("job rows went from %d to %d; the refusal created a row", len(before), len(after))
+	}
+	// NO TASK EITHER, and this arm is review finding F3 on cycle two: the guard
+	// used to run one call too late, after prepareLocalReviewDispatchRequest had
+	// ended in prepareLocalReviewTask, whose UpsertTaskUnlessStates INSERTS OR
+	// UPDATES the review Task. The comment above this test promised "no job, no
+	// task, no worktree" while only the job was checked, so the durable half of
+	// the promise was unasserted and the regression was invisible.
+	tasks, err := store.ListTasks(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != len(tasksBefore) {
+		t.Fatalf("task rows went from %d to %d; the refusal left durable task state behind for a review that never ran", len(tasksBefore), len(tasks))
 	}
 }
 

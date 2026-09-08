@@ -687,7 +687,17 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 	// leaves the request exactly as the caller built it.
 	skipNativeReviewFanout := request.SkipNativeReviewFanout
 	pullRequestReady := request.PullRequestReady
-	if (!skipNativeReviewFanout || !pullRequestReady) && strings.TrimSpace(request.ParentJobID) != "" {
+	// #2054 review finding: a review-only declaration MUST be inherited too. A
+	// delegated review child is built by delegationRequest, which copies the
+	// review context (LeadAgent, Reviewers, ReviewRound) and did NOT copy
+	// NoFixTarget, so a child returning changes_requested advanced through its own
+	// native review path and dispatchFix never took the skip. With auto-fix
+	// enabled a review-only TREE could still enqueue an implement leg - the
+	// declaration held at the root and leaked one level down. Inheriting it here
+	// rather than at delegationRequest is deliberate: this is the seam every
+	// review-creating request already passes through.
+	noFixTarget := request.NoFixTarget
+	if (!skipNativeReviewFanout || !pullRequestReady || !noFixTarget) && strings.TrimSpace(request.ParentJobID) != "" {
 		if parent, parentErr := m.store.GetJob(ctx, strings.TrimSpace(request.ParentJobID)); parentErr == nil {
 			if parentPayload, parseErr := unmarshalPayload(parent.Payload); parseErr == nil {
 				if parentPayload.SkipNativeReviewFanout {
@@ -695,6 +705,9 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 				}
 				if parentPayload.PullRequestReady {
 					pullRequestReady = true
+				}
+				if parentPayload.NoFixTarget {
+					noFixTarget = true
 				}
 			}
 		}
@@ -778,7 +791,7 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		SkipNativeReviewFanout: skipNativeReviewFanout,
 		// #2054: carried onto the payload because AdvanceJob is what decides
 		// whether a changes_requested verdict dispatches a fix at all.
-		NoFixTarget:          request.NoFixTarget,
+		NoFixTarget:          noFixTarget,
 		ValidatedPullRequest: request.ValidatedPullRequest,
 		Ephemeral:            request.Ephemeral,
 		HumanAnswer:          request.HumanAnswer,

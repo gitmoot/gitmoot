@@ -1151,21 +1151,29 @@ how it states provenance. The recorded-head arm reads an append-only store fact
 rather than git, so a legitimate prior head still passes after a force push has
 left it unreachable. A citation whose relationship cannot be established at all,
 because the dispatching checkout resolves neither commit, also dispatches: that
-is a fact about the checkout rather than about the citation. `prompt_head_warning` is no longer
-emitted for a review at all, and that is the consequence of the classification
-above rather than a separate decision: the scan skips a token it cannot resolve,
-and every relation it CAN report is either refused here or stated deliberately,
-so a warning about one taught its reader to ignore the event. Ask and implement
-keep the warning, because no refusal runs in front of them and it is their only
-head check.
+is a fact about the checkout rather than about the citation.
+
+`prompt_head_warning` IS still emitted for a review, for exactly the two allowed
+relations nobody has judged: a RECORDED PRIOR HEAD and an UNRESOLVABLE citation.
+Ancestor provenance is silent, because naming the branch base is how a prompt
+states where the work sits. The prior-head arm is the force-push shape - the
+commit really was a head of this pull request and no longer is - so a prompt
+naming it as its target is reviewing a tree that is gone, and that is worth one
+line to its operator even though the dispatch proceeds. Ask and implement keep
+the blanket warning, because no refusal runs in front of them and it is their
+only head check.
 
 `--head-sha` must be the FULL 40 hex characters for a review. An abbreviated
 value used to dispatch and then be cancelled by the daemon's staleness check,
 which compared it against the pull request's full head and reported the same
-commit as a move; it is now refused at dispatch, before the read-only worktree
-and the job row. The refusal fires only on a sha-shaped value, so a placeholder
-that is not a sha still reaches the review-loop and reviewer-identity refusals
-that name it better.
+commit as a move; it is now refused at dispatch, before the read-only worktree,
+the review task row and the job row. The refusal rejects EVERY non-empty value
+that is not exactly 40 hex characters, including a revision expression such as
+`<sha>^` or `<sha>~1`: the daemon binds this value by EQUALITY against the pull
+request's head, so no other shape can bind whatever it looks like. It runs after
+the review-loop and reviewer-identity refusals, so those still name their own
+preconditions first, and before the review task is upserted, so a refused
+dispatch leaves no durable state behind.
 
 `--no-fix-target` dispatches a REVIEW-ONLY review: the reviewer need not be able
 to implement and no `--lead` is required. The lead exists so a

@@ -433,19 +433,17 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	//
 	// It runs AFTER the review-loop and reviewer-identity refusals so those
 	// still name their own preconditions first - a format complaint that
-	// preempts a semantic one answers a question nobody asked - and still
-	// before the read-only worktree and the job row.
+	// preempts a semantic one answers a question nobody asked - and BEFORE
+	// prepareLocalReviewTask, which is where it now lives. Cycle two of #2064
+	// found it here instead, one call too late: prepareLocalReviewDispatchRequest
+	// ends in prepareLocalReviewTask, whose UpsertTaskUnlessStates INSERTS OR
+	// UPDATES the review Task, so the refusal arrived after durable state existed.
 	//
 	// It refuses at DISPATCH rather than at the staleness check because a
 	// refusal that arrives after the job row exists has already spent a
 	// worktree, a queue slot and an operator's attention - and, as the same
 	// pattern showed elsewhere, a command that reports a refusal while leaving
 	// work behind is the harder failure to see.
-	if request.Action == "review" {
-		if err := dispatchHeadSHAError(request.HeadSHA); err != nil {
-			return localAgentJobOutput{}, err
-		}
-	}
 	var promptHeadWarnings []string
 	if request.Action != "review" {
 		// Keep ask and implement on the pre-allocation scanner seam: ask must scan
@@ -1245,6 +1243,13 @@ func prepareLocalReviewDispatchRequest(ctx context.Context, store *db.Store, rec
 		return localAgentDispatchRequest{}, err
 	} else if detected {
 		return localAgentDispatchRequest{}, errors.New(match.Reason())
+	}
+	// #2064 cycle two, F3: refuse a head that cannot bind BEFORE the task upsert
+	// below. The head is resolved by this point - it may have just come from the
+	// pull request above - and prepareLocalReviewTask writes durable state, so a
+	// refusal placed after it leaves a Task behind for a review that never ran.
+	if err := dispatchHeadSHAError(request.HeadSHA); err != nil {
+		return localAgentDispatchRequest{}, err
 	}
 	return prepareLocalReviewTask(ctx, store, repo, request)
 }
