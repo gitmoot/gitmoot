@@ -1948,3 +1948,40 @@ func ParseRepository(value string) (Repository, error) {
 	}
 	return Repository{Owner: parts[0], Name: parts[1]}, nil
 }
+
+// CheckPending and CheckPassed classify a PullRequestCheck. They live here, on
+// the package that owns the type, because more than one consumer must reach the
+// SAME verdict about the same check: the merge gate decides whether a head may
+// merge, and a review dispatch tells a reviewer whether CI already established
+// this tree (#1824). A second copy of these rules would let the gate demand one
+// thing while a prompt discloses another - the failure #1850 R3-F1 named for
+// obligations, applied to CI.
+//
+// The bucket field is authoritative when present: it is GitHub's own rollup and
+// it distinguishes "skipping" from a failure, which the raw state does not
+// always do. State is the fallback for payloads that carry no bucket.
+func CheckPending(check PullRequestCheck) bool {
+	bucket := strings.ToLower(strings.TrimSpace(check.Bucket))
+	if bucket != "" {
+		return bucket == "pending"
+	}
+	switch strings.ToLower(strings.TrimSpace(check.State)) {
+	case "pending", "queued", "in_progress", "waiting", "requested":
+		return true
+	default:
+		return false
+	}
+}
+
+// CheckPassed reports whether a check is a non-blocking outcome. A SKIPPED or
+// NEUTRAL check counts as passed deliberately: a conditional job that did not
+// run has nothing to say about the head, and treating it as a failure would
+// make a head with a skipped job permanently unmergeable.
+func CheckPassed(check PullRequestCheck) bool {
+	bucket := strings.ToLower(strings.TrimSpace(check.Bucket))
+	if bucket != "" {
+		return bucket == "pass" || bucket == "skipping"
+	}
+	state := strings.ToLower(strings.TrimSpace(check.State))
+	return state == "success" || state == "skipped" || state == "neutral"
+}
