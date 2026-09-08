@@ -733,13 +733,34 @@ func (e Engine) allocateAndEnqueueDelegationInner(ctx context.Context, job db.Jo
 				resolved = strings.TrimSpace(sha)
 			}
 		}
-		if resolved != "" && resolved != inherited {
+		// #2057 ROUND TWO. THE DROP ARM IS BACK, SCOPED TO THE PATH THAT NEEDS IT.
+		// Removing it wholesale was wrong: my justification held only for the
+		// FINALIZER path, where the inherited head is the head the finalizer just
+		// produced. On the NO-FINALIZER path this function's own comment says the
+		// inherited head is the pre-change commit, so when the branch will not
+		// resolve there is no correct head to record and keeping the stale one
+		// attests a verdict against a commit nobody reviewed - the #1730 defect
+		// itself.
+		//
+		// The discriminator is the same predicate the engine uses to decide
+		// whether to finalize at all, so the two halves cannot disagree.
+		producedByFinalizer := e.implementationNeedsFinalizer(ctx, payload)
+		switch {
+		case resolved != "" && resolved != inherited:
 			request.HeadSHA = resolved
 			_ = e.recordEffectEvent(ctx, db.JobEvent{
 				JobID: job.ID,
 				Kind:  "delegation_review_head_rebound",
 				Message: fmt.Sprintf("delegation %q reviews branch %s: bound to its tip %s instead of the implement parent's dispatch head %s (#1730)",
 					request.DelegationID, branch, shortHead(resolved), shortHead(inherited)),
+			})
+		case resolved == "" && inherited != "" && !producedByFinalizer:
+			request.HeadSHA = ""
+			_ = e.recordEffectEvent(ctx, db.JobEvent{
+				JobID: job.ID,
+				Kind:  "delegation_review_head_unbound",
+				Message: fmt.Sprintf("delegation %q could not resolve branch %q and its implement parent runs no finalizer, so the pre-change dispatch head %s was DROPPED rather than recorded as reviewed (#1730, #2057)",
+					request.DelegationID, branch, shortHead(inherited)),
 			})
 		}
 	}

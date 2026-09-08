@@ -574,6 +574,52 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		}
 	}
 
+	// #2057 ROUND TWO. THIS SITS ABOVE THE PARENT-DAG ADVANCE, not merely above
+	// dispatchDelegations. An implement job that is ITSELF a delegation child
+	// reaches advanceParentForTerminalChild below, which can enqueue a ready
+	// dependent sibling or the coordinator continuation. Finalizing after that
+	// meant a failed finalizer left those jobs enqueued from work that was never
+	// committed or pushed - the same defect as the delegation case, one level up,
+	// and the first fix's failing-finalizer test used a TOP-LEVEL job so it could
+	// not see this path.
+	//
+	// Advancing the parent from the FINALIZED payload is also the more correct
+	// input: siblings and the continuation then read the produced head and pull
+	// request rather than the pre-change ones.
+	// #2057 (review of the #1730 fix). A TASK-BACKED IMPLEMENTATION IS FINALIZED
+	// BEFORE ITS DELEGATIONS ARE DISPATCHED, because until the finalizer runs the
+	// produced work is NOT COMMITTED: the worktree HEAD is still the inherited
+	// pre-change commit, and a delegated review inheriting it is bound to a
+	// commit nobody produced. That is the #1730 class, and resolving the head at
+	// dispatch time cannot fix it - there is nothing to resolve yet.
+	//
+	// The finalizer is the right source rather than a git read here because it
+	// ALREADY writes the produced head: every path through
+	// daemonImplementationFinalizer sets payload.HeadSHA (commit-and-push, adopt,
+	// and existing-PR), along with Branch and PullRequest. So dispatching from
+	// the finalized payload needs no resolver at all.
+	//
+	// ORDERING CONSEQUENCE, deliberate: a finalizer that fails now prevents the
+	// delegations instead of following them. That is the safer direction - the
+	// work whose review was being delegated does not exist - and it is the same
+	// judgement the blocked/failed early-return above already makes.
+	finalizedBeforeDelegations := false
+	if job.Type == "implement" && payload.Result != nil && payload.Result.Decision == "implemented" && e.implementationNeedsFinalizer(ctx, payload) {
+		finalized, err := e.ImplementationFinalizer.FinalizeImplementation(ctx, job, payload)
+		if err != nil {
+			return err
+		}
+		encoded, err := marshalPayload(finalized)
+		if err != nil {
+			return err
+		}
+		if err := e.Store.UpdateJobPayload(ctx, job.ID, encoded); err != nil {
+			return err
+		}
+		payload = finalized
+		finalizedBeforeDelegations = true
+	}
+
 	// When a delegated child job finishes, advance its parent's delegation DAG
 	// before running the child's own advancement: enqueue any now-ready
 	// dependent siblings, apply the failed delegation's failure_policy, and
@@ -694,39 +740,6 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		if done {
 			return nil
 		}
-	}
-	// #2057 (review of the #1730 fix). A TASK-BACKED IMPLEMENTATION IS FINALIZED
-	// BEFORE ITS DELEGATIONS ARE DISPATCHED, because until the finalizer runs the
-	// produced work is NOT COMMITTED: the worktree HEAD is still the inherited
-	// pre-change commit, and a delegated review inheriting it is bound to a
-	// commit nobody produced. That is the #1730 class, and resolving the head at
-	// dispatch time cannot fix it - there is nothing to resolve yet.
-	//
-	// The finalizer is the right source rather than a git read here because it
-	// ALREADY writes the produced head: every path through
-	// daemonImplementationFinalizer sets payload.HeadSHA (commit-and-push, adopt,
-	// and existing-PR), along with Branch and PullRequest. So dispatching from
-	// the finalized payload needs no resolver at all.
-	//
-	// ORDERING CONSEQUENCE, deliberate: a finalizer that fails now prevents the
-	// delegations instead of following them. That is the safer direction - the
-	// work whose review was being delegated does not exist - and it is the same
-	// judgement the blocked/failed early-return above already makes.
-	finalizedBeforeDelegations := false
-	if job.Type == "implement" && payload.Result != nil && payload.Result.Decision == "implemented" && e.implementationNeedsFinalizer(ctx, payload) {
-		finalized, err := e.ImplementationFinalizer.FinalizeImplementation(ctx, job, payload)
-		if err != nil {
-			return err
-		}
-		encoded, err := marshalPayload(finalized)
-		if err != nil {
-			return err
-		}
-		if err := e.Store.UpdateJobPayload(ctx, job.ID, encoded); err != nil {
-			return err
-		}
-		payload = finalized
-		finalizedBeforeDelegations = true
 	}
 	if err := e.dispatchDelegations(ctx, job, payload, ref); err != nil {
 		return err

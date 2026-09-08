@@ -165,3 +165,41 @@ func (c *countingFinalizer) FinalizeImplementation(context.Context, db.Job, JobP
 	c.calls++
 	return c.payload, nil
 }
+
+// #2057 ROUND TWO, P1-A. An implement job that is ITSELF a delegation child
+// advances its parent's DAG, which can enqueue a ready dependent sibling or the
+// coordinator continuation. Finalizing after that left those jobs enqueued from
+// work that was never committed. Round one's failing-finalizer test used a
+// TOP-LEVEL job, so it could not reach this path - the finalizer must sit above
+// the parent advance, not merely above dispatchDelegations.
+func TestFailedFinalizerOnADelegationChildAdvancesNoParent(t *testing.T) {
+	ctx := context.Background()
+	engine, store := newOrderingFixture(t)
+	engine.ImplementationFinalizer = fakeImplementationFinalizer{err: errors.New("push implementation branch failed")}
+
+	parentPayload := orderingParentPayload()
+	insertCompletedJob(t, store, db.Job{ID: "coordinator-2057", Agent: "lead", Type: "implement"}, parentPayload)
+
+	// The child is an implement job WITH a parent, which is the shape round one
+	// could not express.
+	childPayload := orderingParentPayload()
+	childPayload.ParentJobID = "coordinator-2057"
+	insertCompletedJob(t, store, db.Job{ID: "child-2057", Agent: "lead", Type: "implement"}, childPayload)
+
+	before, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+
+	if err := engine.AdvanceJob(ctx, "child-2057"); err == nil {
+		t.Fatal("AdvanceJob must surface the finalizer failure")
+	}
+
+	after, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("the failed finalizer still enqueued %d job(s) through the parent DAG: before=%d after=%d", len(after)-len(before), len(before), len(after))
+	}
+}

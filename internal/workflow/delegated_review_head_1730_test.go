@@ -126,3 +126,93 @@ func TestDelegatedReviewOfAReviewParentKeepsTheInheritedHead(t *testing.T) {
 		t.Fatalf("a review parent's child resolved a branch tip it should not have: %v", resolver.calls)
 	}
 }
+
+// #2057 ROUND TWO, P1-B. On the NO-FINALIZER path the inherited head is the
+// pre-change commit, so an unresolvable branch must DROP it rather than attest a
+// verdict against a commit nobody reviewed. Round one removed this arm
+// wholesale; the justification only ever held for the finalizer path.
+func TestDelegatedReviewDropsAnUnresolvableHeadOnTheNoFinalizerPath(t *testing.T) {
+	ctx := context.Background()
+	resolver := &fakeHeadResolver{err: errors.New("git: unknown revision")}
+	engine, store := newDelegatedReviewFixture(t, resolver)
+
+	parent := db.Job{ID: "impl-nofin", Agent: "appkit-omp", Type: "implement", State: string(JobSucceeded)}
+	// No TaskID, so implementationNeedsFinalizer is false: nothing produced this
+	// head, and it is therefore the pre-change commit.
+	payload := JobPayload{Repo: "themartianapp/appkit", Branch: "adhoc-nofin", HeadSHA: staleImplementHead}
+	request := JobRequest{
+		ID: "impl-nofin/delegation/round2-review", Repo: payload.Repo, Branch: payload.Branch,
+		Action: "review", Agent: "reviewer", HeadSHA: payload.HeadSHA, DelegationID: "round2-review",
+	}
+	seedMergeGateFixtureAgent(t, store, "reviewer")
+	if err := engine.allocateAndEnqueueDelegationInner(ctx, parent, payload, Delegation{ID: "round2-review", Action: "review"}, request, taskRef{}); err != nil {
+		t.Fatalf("allocateAndEnqueueDelegationInner: %v", err)
+	}
+
+	child, err := store.GetJob(ctx, "impl-nofin/delegation/round2-review")
+	if err != nil {
+		t.Fatalf("child job not enqueued: %v", err)
+	}
+	childPayload, err := unmarshalPayload(child.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload: %v", err)
+	}
+	if childPayload.HeadSHA == staleImplementHead {
+		t.Fatal("an unresolvable branch on the no-finalizer path kept the pre-change head, so the row would attest a verdict at a commit nobody reviewed")
+	}
+	if childPayload.HeadSHA != "" {
+		t.Fatalf("child head = %q, want it dropped", childPayload.HeadSHA)
+	}
+	events, err := store.ListJobEvents(ctx, parent.ID)
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	var found bool
+	for _, ev := range events {
+		if ev.Kind == "delegation_review_head_unbound" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("dropping the head was not recorded, so the loss is silent")
+	}
+}
+
+// And the finalizer path must NOT drop: there the inherited head is the head the
+// finalizer produced, so an unresolvable branch is not evidence it is stale.
+func TestDelegatedReviewKeepsTheFinalizedHeadWhenTheBranchWillNotResolve(t *testing.T) {
+	ctx := context.Background()
+	resolver := &fakeHeadResolver{err: errors.New("git: unknown revision")}
+	engine, store := newDelegatedReviewFixture(t, resolver)
+
+	if err := store.UpsertTask(ctx, db.Task{
+		ID: "task-fin", RepoFullName: "themartianapp/appkit", Title: "Fin",
+		State: string(TaskImplementing), Branch: "adhoc-fin", WorktreePath: "/tmp/gitmoot-task-fin",
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	engine.ImplementationFinalizer = fakeImplementationFinalizer{}
+
+	parent := db.Job{ID: "impl-fin", Agent: "appkit-omp", Type: "implement", State: string(JobSucceeded)}
+	payload := JobPayload{Repo: "themartianapp/appkit", Branch: "adhoc-fin", HeadSHA: producedHead, TaskID: "task-fin"}
+	request := JobRequest{
+		ID: "impl-fin/delegation/round2-review", Repo: payload.Repo, Branch: payload.Branch,
+		Action: "review", Agent: "reviewer", HeadSHA: payload.HeadSHA, DelegationID: "round2-review",
+	}
+	seedMergeGateFixtureAgent(t, store, "reviewer")
+	if err := engine.allocateAndEnqueueDelegationInner(ctx, parent, payload, Delegation{ID: "round2-review", Action: "review"}, request, taskRef{}); err != nil {
+		t.Fatalf("allocateAndEnqueueDelegationInner: %v", err)
+	}
+
+	child, err := store.GetJob(ctx, "impl-fin/delegation/round2-review")
+	if err != nil {
+		t.Fatalf("child job not enqueued: %v", err)
+	}
+	childPayload, err := unmarshalPayload(child.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload: %v", err)
+	}
+	if childPayload.HeadSHA != producedHead {
+		t.Fatalf("child head = %q, want the finalizer's produced head %q kept", childPayload.HeadSHA, producedHead)
+	}
+}
