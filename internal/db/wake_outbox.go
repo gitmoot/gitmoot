@@ -605,7 +605,7 @@ WHERE state = 'attempted' AND attempted_at IS NOT NULL AND attempted_at <= ?
 	}
 
 	seenSurvivor := map[string]int64{}
-	for _, entry := range entries {
+	for index, entry := range entries {
 		group := strings.ToLower(strings.TrimSpace(entry.TargetRole)) + "\x00" +
 			entry.CoalesceKey + "\x00" + entry.AttemptedAt
 		state, rowDetail := WakeOutboxStateDeliveryUnknown, detail
@@ -634,6 +634,16 @@ WHERE id = ? AND state = 'attempted' AND attempted_at <= ?`,
 		if affected != 1 {
 			return nil, fmt.Errorf("expire wake outbox row %d updated %d rows, want 1", entry.ID, affected)
 		}
+		// THE RETURN DESCRIBES WHAT THIS SWEEP DECIDED, not the row it read
+		// (#1958). The caller partitions on it to tell a PROVEN delivery from a
+		// genuinely unknown one, and returning the pre-update `attempted` state
+		// made every resolution indistinguishable from an unknown - which is how
+		// a proven delivery still produced an unknown-delivery diagnostic and
+		// drove the drain unhealthy.
+		entries[index].State = state
+		entries[index].LastError = rowDetail
+		entries[index].FinishedAt = stamp
+		entries[index].UpdatedAt = stamp
 		if collapsed {
 			// The audit event belongs to the obligation, not to every row it
 			// carried: N events for one undelivered wake is the same
