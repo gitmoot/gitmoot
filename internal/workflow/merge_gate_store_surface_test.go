@@ -38,6 +38,23 @@ func TestMergeGateStoreAccessSurface(t *testing.T) {
 		"GetBranchLock",
 		"GetNoCIObservation",
 		"GetTask",
+		// JobIDsWithEventKind is a READ, added for #1713, and the guard demands its
+		// authority implications be stated rather than assumed:
+		//
+		//   - it reads the DECISION plane, not the display plane. The kind it asks
+		//     for is "running", a lifecycle fact about whether a job executed, in
+		//     the same job_events table the gate already writes an annotation to.
+		//     It carries no verdict, no findings and no narrative, so it cannot
+		//     smuggle display evidence into a merge decision. The forbidden list
+		//     below still refuses ListJobEvents, which returns bodies.
+		//   - it can only NARROW attribution, never widen authority. It removes
+		//     implement legs that never ran from the implementer set, which makes
+		//     more agents eligible as independent reviewers - so the guard against
+		//     it going wrong is the fail-closed default at the call site: a read
+		//     error yields a nil predicate and every leg is attributed exactly as
+		//     before, because the one error this must not make is letting an agent
+		//     that DID implement the change review it.
+		"JobIDsWithEventKind",
 		"ListJobs",
 		"RecoverClaimedTaskState",
 		"ReleaseRetainedTaskStateClaim",
