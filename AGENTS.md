@@ -53,15 +53,34 @@ infrastructure rather than the documented boundary they are:
 - **`-race` is unreachable from a read-only review seat**, because race requires
   cgo (`go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`) and the
   sandbox denies the C header above. Its absence from a review verdict is not a
-  regression. It is **not** unreachable from a full seat with its own clone:
-  measured on this host, `CGO_ENABLED=1 go test -race ./internal/db/` returns
-  `ok` from `/root/gm-transport`, so a seat that owns a checkout can run the
-  lane locally when CI cannot. Two limits on doing so. A race result is
+  regression, and the boundary is `ReadOnlySeat`, not the kind of clone you hold:
+  `readOnlyRuntimeSandboxGrants` stages the toolchain and applies Landlock for
+  jobs whose payload carries that marker, which includes native reviews,
+  ask/review delegation children, and pipeline worktrees, ephemeral workers
+  among them. A session that is **not** a `ReadOnlySeat`, is permitted to run
+  Bash by its autonomy policy, and has the C toolchain and headers available can
+  execute race-enabled tests: measured on this host,
+  `CGO_ENABLED=1 go test -race ./internal/db/` returns `ok`. Owning a checkout is
+  not the predicate and neither is being "a seat"; a restrictive autonomy policy
+  blocks Bash regardless.
+- **A local race run is a scoped PROBE, never the lane.** The lane is the
+  partitioned recipe below, and reproducing it takes `-tags e2e` (see the race
+  block): without the tag the compile silently drops 33 tagged `internal/cli`
+  files, 2 in `workflow` and 1 in `daemon`, and the shard plan derived from
+  `-test.list` shrinks to match with nothing failing. Measured on this host,
+  `internal/cli` lists **2236** tests with the tag and **2108** without it, so an
+  untagged run omits 128 and reports success. `internal/db` lists 402 either way,
+  which is the trap: probing that package proves a race binary can be built and
+  run and says nothing about the lane. A probe that omits the tag cannot answer
+  "does the lane pass". Report what you ran. A race result is also
   timing-sensitive, so a clean local run is weaker evidence than a clean CI run
-  rather than equal to it, and it must never be reported as the lane passing.
-  And two concurrent `-race` workloads on one host perturb the scheduling each
-  is measuring, with a false clean on both the likely outcome, so the lane takes
-  one runner at a time: check for a live `-race` binary before starting one.
+  rather than equal to it.
+- **Do not run two race workloads on this host at once.** This is a precaution,
+  not a measurement: detection depends on the interleavings a run actually
+  executes, and two competing full-repo race workloads change the scheduling
+  each observes. No experiment here establishes a direction for that effect, so
+  treat it as an unquantified risk to an assurance run rather than as a proven
+  false-clean mechanism. Check for a live `-race` binary before starting one.
 
 When a seat's plain `go` returns 126, no usable toolchain was staged. The command
 is an engine-owned failure stub, never a fallthrough to the operator's `go`.
@@ -93,7 +112,11 @@ go test -timeout 25m ./...
     shards="${spec##*:}"
     bundle="$race_dir/$package"
     mkdir -p "$bundle/partitions"
-    go test -c -race -o "$bundle/$package.test" "./internal/$package/"
+    # -tags e2e is REQUIRED, matching ci.yml: without it this compile silently
+    # drops the 33 tagged internal/cli files (plus 2 in workflow and 1 in
+    # daemon), and the shard plan derived from -test.list shrinks to match with
+    # nothing failing.
+    go test -c -race -tags e2e -o "$bundle/$package.test" "./internal/$package/"
     (
       cd "internal/$package"
       "$bundle/$package.test" -test.list '.*'
