@@ -85,6 +85,25 @@ type reviewFindingWire struct {
 	Body     string `json:"body"`
 	Summary  string `json:"summary"`
 	Location string `json:"location"`
+	// THREE MORE, MEASURED THE SAME WAY (#2073). A shape census over every
+	// finding element in this store found prose riding under keys nothing read.
+	// In the ledger's own lifetime: `details` 58 occurrences, `message` 11,
+	// `finding` 2, against 655 finding objects. All-time they are 426, 85 and
+	// 618, and the all-time figures are NOT the ones that sized this fix -
+	// most of those elements predate the ledger, so they were never dropped by
+	// it. Quoting them would repeat #2071's error of a long-lived numerator
+	// over a three-day denominator.
+	//
+	//   {details, file, line, severity, summary} -> detail EMPTY, title survives
+	//   {location, message, severity}            -> title AND detail EMPTY
+	//   {file, finding, line}                    -> title, detail, severity all EMPTY
+	//
+	// All three are DETAIL-class. None of them feeds Title, because a title
+	// distilled from a paragraph would be invented structure, and the rule here
+	// has always been to read what reviewers write and invent nothing.
+	Details string `json:"details"`
+	Message string `json:"message"`
+	Finding string `json:"finding"`
 }
 
 // pathFromLensEvidence extracts the leading repo-relative path from a lens
@@ -240,7 +259,13 @@ func (e Engine) ledgerObservationWithDeclaredState(job db.Job, payload JobPayloa
 		// only unique content, the path, is already captured in File.
 		Detail: firstNonEmptyLedgerText(
 			strings.TrimSpace(wire.Detail),
+			// `details` is a near-synonym of the canonical key and sits directly
+			// behind it; the other two are whole-finding prose and rank after the
+			// narrower alternates (#2073).
+			strings.TrimSpace(wire.Details),
 			strings.TrimSpace(wire.Body),
+			strings.TrimSpace(wire.Finding),
+			strings.TrimSpace(wire.Message),
 			strings.TrimSpace(wire.Evidence),
 			unstructuredLocatorText(wire.locator()),
 		),
