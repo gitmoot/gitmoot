@@ -655,6 +655,33 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			return err
 		}
 	}
+	// AN ASK THAT REVIEWED SOMETHING LOSES ITS FINDINGS SILENTLY (#1962). Both
+	// RecordReviewFindingsToLedger call sites above are inside `job.Type ==
+	// "review"`, so for an ask the writer is never CALLED - its own internal
+	// type guard is defence in depth and its recordLedgerSkip can never fire.
+	// The verdict is real and the loss leaves no trace anywhere.
+	//
+	// Measured on 2026-09-08: 15 succeeded gm-review-opus ask jobs, all 15
+	// carrying a decision and 11 carrying findings, produced ZERO ledger rows and
+	// ZERO events explaining it. Positive control on that zero: the same join
+	// over review-TYPE jobs the same day returns 28 jobs and 80 rows. Of the 15
+	// decisions, 6 were changes_requested, and one of those - PR #2029 at
+	// 8bdf8f54 - is an objection at that PR's CURRENT head, invisible to every
+	// PR-keyed surface.
+	//
+	// THIS RECORDS THE LOSS; IT DOES NOT CLOSE IT, and writing a row here would
+	// be worse than the gap. An observation with no pull request and no head
+	// cannot be keyed to anything a reader can query, and inventing a key is the
+	// #2054 class. So the honest outcome for an unbound verdict is a RECORDED
+	// skip rather than a silent one or a fabricated row.
+	//
+	// Making a BOUND ask write real observations is deliberately not attempted
+	// here: that path inherits #2059's field-name mismatch, where the wire reads
+	// id/title/state while reviewers emit uid/evidence/disposition, and it would
+	// convert these silent losses into empty OPEN findings. #2059 first.
+	if job.Type != "review" && reviewShapedResult(payload.Result) {
+		e.recordUnboundReviewVerdict(ctx, job, payload)
+	}
 	if payload.Result.Decision == "blocked" || payload.Result.Decision == "failed" {
 		return e.block(ctx, ref, payload.Result.Summary)
 	}

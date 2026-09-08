@@ -706,3 +706,80 @@ func unstructuredLocatorText(locator string) string {
 	}
 	return locator
 }
+// reviewShapedResult reports whether a result is a review verdict regardless of
+// the job TYPE that produced it (#1962). An `agent ask` dispatched as "review
+// this PR at this head" returns exactly this shape - a review decision, usually
+// with findings - and the ledger writer never sees it because both of its call
+// sites are keyed on job.Type.
+//
+// It tests the RESULT rather than the prompt, because the prompt is not a
+// durable field and a classifier over prose is the thing #1534 forbids.
+func reviewShapedResult(result *AgentResult) bool {
+	if result == nil {
+		return false
+	}
+	if len(result.Findings) > 0 {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(result.Decision)) {
+	case "approved", "changes_requested":
+		return true
+	}
+	return false
+}
+
+// recordUnboundReviewVerdict makes an unrecordable review verdict FINDABLE
+// without inventing the binding it lacks (#1962).
+//
+// It writes no ledger observation on purpose. review_finding_observations is
+// keyed by repo + pull_request + head_sha; a row missing all three answers no
+// query anyone can write, and a synthesised key would be a record asserting a
+// binding nobody established. The gap stays open here - this only stops it being
+// invisible, which is the difference between a defect someone can find and one
+// that is indistinguishable from a review that reported nothing.
+//
+// Best effort by the same reasoning as the writer's summary event: a real
+// verdict must never be discarded over an audit row.
+func (e Engine) recordUnboundReviewVerdict(ctx context.Context, job db.Job, payload JobPayload) {
+	if e.Store == nil || payload.Result == nil {
+		return
+	}
+	missing := make([]string, 0, 3)
+	if payload.PullRequest <= 0 {
+		missing = append(missing, "pull_request")
+	}
+	if strings.TrimSpace(payload.HeadSHA) == "" {
+		missing = append(missing, "head_sha")
+	}
+	if strings.TrimSpace(payload.Repo) == "" {
+		missing = append(missing, "repo")
+	}
+	if len(missing) == 0 {
+		// Bound, and still not written, because this job's type keeps it away from
+		// the writer. Naming that separately matters: it is a different defect from
+		// an unbound dispatch and it is the case #2059 must land before anyone
+		// makes writable.
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID: job.ID,
+			Kind:  unboundReviewVerdictEventKind,
+			Message: fmt.Sprintf(
+				"%s job returned a review verdict (decision %q, %d finding(s)) bound to %s#%d at %s, but only job type \"review\" reaches the #1822 ledger writer, so nothing was recorded",
+				job.Type, strings.TrimSpace(payload.Result.Decision), len(payload.Result.Findings),
+				strings.TrimSpace(payload.Repo), payload.PullRequest, strings.TrimSpace(payload.HeadSHA)),
+		})
+		return
+	}
+	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID: job.ID,
+		Kind:  unboundReviewVerdictEventKind,
+		Message: fmt.Sprintf(
+			"%s job returned a review verdict (decision %q, %d finding(s)) with no %s, so it cannot be keyed to a pull request or head and no #1822 ledger row was written; re-dispatch with --pr and --head-sha to make it recordable",
+			job.Type, strings.TrimSpace(payload.Result.Decision), len(payload.Result.Findings),
+			strings.Join(missing, " and ")),
+	})
+}
+
+// unboundReviewVerdictEventKind marks a review verdict the ledger cannot key.
+// Its presence is what distinguishes a lost verdict from a review that genuinely
+// found nothing - before it, those two were the same absence.
+const unboundReviewVerdictEventKind = "review_verdict_unrecordable"
