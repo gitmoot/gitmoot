@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gitmoot/gitmoot/internal/subprocess"
+
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -197,6 +199,170 @@ func TestReviewDispatchBindsThePromptsTargetToTheDispatchHead(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestReviewDispatchWarnsOnlyOnCitationsNobodyHasJudged is #2054 finding 3.
+//
+// The identity-based scan warned on ANY cited commit that was not the dispatch
+// head. For a review that fires on cases the refusal above has ALREADY accepted:
+// a foreign citation never reaches the warning stage, so every warning was about
+// the head's own ancestor, a recorded head of this pull request, or an
+// unresolvable sha. The first two are what a prompt says deliberately - a scoped
+// re-review MUST name the previous round's head to say what it is re-reviewing.
+//
+// A warning that fires on the routine case teaches its reader to ignore it, and
+// that cost was paid: this warning was used to attribute job ownership on
+// 2026-09-08 and then raised against a scoped re-review citing its own prior
+// head correctly.
+//
+// The result is that a review emits NO prompt_head_warning at all, and that is
+// the finding rather than a side effect: the scan cannot report a relation that
+// is both resolvable and unjudged, because foreign is refused before enqueue.
+// The refusal carries the wrong-head signal; the warning had nothing left to
+// say. Ask and implement keep theirs - see the boundary test below.
+// TestUnjudgedTokenCannotRetainAnotherCitationsWarning is review finding P3 on
+// #2064 cycle five, and it is a RETENTION LEAK rather than a wording problem.
+//
+// Every warning names the dispatch head twice in its own text. The filter used
+// to keep a warning when any unjudged token appeared ANYWHERE in it, so a
+// non-resolving token that happens to be a 7-hex run from the middle of the
+// dispatch sha classified as promptCommitUnresolved, went into the unjudged set,
+// and then matched inside the dispatch-head text of an ANCESTOR's warning -
+// retaining a warning the filter exists to drop, about a citation nobody
+// complained about.
+//
+// It survived an earlier hand probe of mine for a reason worth recording: that
+// probe's prompt contained no stray token, so the leak had nothing to fire on. A
+// negative result from an input that cannot express the defect is not evidence.
+func TestUnjudgedTokenCannotRetainAnotherCitationsWarning(t *testing.T) {
+	ctx := context.Background()
+	checkout, _, base, head, _ := promptHeadBindingCheckout(t)
+	store, _ := blockerE2EHome(t)
+	client := jobGitClient(checkout, subprocess.ExecRunner{})
+
+	// A 7-hex run lifted from the MIDDLE of the dispatch head, which no object
+	// resolves: this is the unjudged token that used to leak.
+	stray := head[8:15]
+	if _, err := client.RevParse(ctx, stray+"^{commit}"); err == nil {
+		t.Skipf("fixture stray token %q unexpectedly resolves", stray)
+	}
+	// base is an ANCESTOR of head, so its warning must be dropped.
+	prompt := "review " + base + " and also " + stray
+
+	warnings := dispatchPromptHeadContradictionWarnings(ctx, client, prompt, head)
+	if len(warnings) == 0 {
+		t.Fatalf("fixture produced no warnings to filter; the ancestor citation must warn before filtering")
+	}
+	kept := retainUnjudgedPromptHeadWarnings(ctx, client, store, prompt, head, "owner/repo", 12, warnings)
+	for _, warning := range kept {
+		if strings.Contains(warning, base) {
+			t.Fatalf("an unjudged stray token retained the ANCESTOR citation's warning: %q\nkept=%v", warning, kept)
+		}
+	}
+}
+
+func TestReviewDispatchWarnsOnlyOnCitationsNobodyHasJudged(t *testing.T) {
+	checkout, base, firstHead, head, staleTarget := promptHeadBindingCheckout(t)
+	const unresolvable = "0123456789abcdef0123456789abcdef01234567"
+
+	for _, tt := range []struct {
+		name     string
+		cited    string
+		recordAs int
+		wantWarn bool
+	}{
+		{name: "a prior head on the reviewed branch is silent: this is the scoped re-review case", cited: firstHead},
+		{name: "the branch base is silent: a prompt states what the branch sits on", cited: base},
+		{name: "the dispatch head itself is silent", cited: head},
+		// The scan SKIPS a token it cannot resolve, so an unresolvable citation
+		// never produced a warning here either - my first version of this test
+		// asserted it did, and that expectation was wrong about the existing
+		// scanner rather than about the change.
+		{name: "an unresolvable sha is silent too, because the scan never resolved it to warn about", cited: unresolvable},
+		// F4: a RECORDED head of this pull request that is NOT an ancestor is the
+		// force-push shape - the commit really was a head and no longer is - so a
+		// prompt naming it as its target is reviewing something that is gone.
+		// The first version of this filter could not tell that from provenance.
+		{name: "a recorded head that is NOT an ancestor warns: that is a stale review target", cited: staleTarget, recordAs: 12, wantWarn: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store, home := blockerE2EHome(t)
+			seedReviewDispatchFixture(t, store, checkout)
+			if tt.recordAs != 0 {
+				seedRecordedReviewHead(t, store, "recorded-head-fixture", tt.recordAs, tt.cited)
+			}
+
+			request := reviewDispatchRequest(home, head)
+			request.Instructions = "Review this exact head. Round history: commit " + tt.cited + " for context."
+			out, err := dispatchLocalAgentJob(ctx, store, request)
+			if err != nil {
+				t.Fatalf("dispatch was refused: %v", err)
+			}
+			events, err := store.ListJobEvents(ctx, out.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			warned := 0
+			for _, event := range events {
+				if event.Kind == "prompt_head_warning" {
+					warned++
+				}
+			}
+			if tt.wantWarn && warned == 0 {
+				t.Fatalf("no prompt_head_warning for an unresolvable citation: events=%+v", events)
+			}
+			if !tt.wantWarn && warned != 0 {
+				t.Fatalf("prompt_head_warning fired on a citation the refusal already accepted (%s); "+
+					"a warning on the routine case teaches its reader to ignore it", tt.cited)
+			}
+		})
+	}
+}
+
+// TestAskDispatchKeepsItsBlanketPromptHeadWarning pins the BOUNDARY of #2054
+// finding 3, which a mutant switching ask onto the review scope survived
+// without it.
+//
+// Narrowing the warning is only safe where a refusal already judged the
+// citation. Ask and implement have NO refusal in front of them - the #1819
+// guard is review-only - so for them the identity-based warning is the entire
+// head check, and silencing it there would remove the check rather than
+// de-duplicate it. Same change, opposite correctness, decided by whether
+// something else already looked.
+func TestAskDispatchKeepsItsBlanketPromptHeadWarning(t *testing.T) {
+	ctx := context.Background()
+	checkout, base, _, head, _ := promptHeadBindingCheckout(t)
+	store, home := blockerE2EHome(t)
+	seedReviewDispatchFixture(t, store, checkout)
+
+	// An ask needs an ask-capable agent; the shared fixture seeds review and
+	// implement only.
+	seedDaemonWorkerAgentWithPolicy(t, store, "asker", runtime.ShellRuntime, "true", []string{"ask"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	request := reviewDispatchRequest(home, head)
+	request.Agent = "asker"
+	request.LeadAgent = ""
+	request.Action = "ask"
+	request.PullRequest = 0
+	// The BASE is an ancestor of the dispatch head, so the review path is now
+	// deliberately silent about it. Ask must not be.
+	request.Instructions = "Answer against commit " + base + " for context."
+
+	out, err := dispatchLocalAgentJob(ctx, store, request)
+	if err != nil {
+		t.Fatalf("ask dispatch was refused: %v", err)
+	}
+	events, err := store.ListJobEvents(ctx, out.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Kind == "prompt_head_warning" {
+			return
+		}
+	}
+	t.Fatalf("ask lost its prompt_head_warning for a non-head citation: events=%+v; "+
+		"ask has no refusal in front of it, so this warning is its only head check", events)
 }
 
 // TestReviewDispatchRefusalLeavesNoWorktreeBehind pins the ORDERING, separately

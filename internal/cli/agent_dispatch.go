@@ -131,13 +131,16 @@ type localAgentDispatchRequest struct {
 	// ImplementBase is the CLI/config worktree base for implement dispatches.
 	// Before the request can enqueue, it is resolved to a commit SHA and
 	// ImplementBaseResolved is set so allocation uses that exact commit.
-	ImplementBase          string
-	ImplementBaseResolved  bool
-	ImplementPRValidated   bool
-	Branch                 string
-	GoalID                 string
-	TaskTitle              string
-	LeadAgent              string
+	ImplementBase         string
+	ImplementBaseResolved bool
+	ImplementPRValidated  bool
+	Branch                string
+	GoalID                string
+	TaskTitle             string
+	LeadAgent             string
+	// NoFixTarget states that this review has NO implementer to route a
+	// changes_requested verdict to (#2054). It is the review-only dispatch.
+	NoFixTarget            bool
 	Reviewers              []string
 	SkipNativeReviewFanout bool
 	Recipe                 string
@@ -168,6 +171,17 @@ func localDispatchJobRunner(request localAgentDispatchRequest) subprocess.Runner
 	// before reaching these helpers.
 	return subprocess.ExecRunner{}
 }
+
+// promptHeadWarningFormat is SINGLE-SOURCED because two functions depend on its
+// shape: the producer below writes it, and retainUnjudgedPromptHeadWarnings
+// anchors on its citation clause to decide which warning belongs to which
+// citation. A silent divergence between them re-opens the retention leak that
+// review finding P3 on #2064 measured, so the format and its prefix live here
+// together rather than as two string literals in two files.
+const (
+	promptHeadWarningCitationPrefix = "prompt references commit "
+	promptHeadWarningFormat         = promptHeadWarningCitationPrefix + "%s, but the dispatch head is %s; Gitmoot will use dispatch head %s"
+)
 
 var promptCommitTokenRE = regexp.MustCompile(`\b[0-9a-fA-F]{7,64}\b`)
 
@@ -408,6 +422,39 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			checkoutPath = task.WorktreePath
 		}
 	}
+	// #2054: REFUSE AN ABBREVIATED --head-sha before any durable state.
+	//
+	// An abbreviated value used to be accepted and then CANCELLED by the daemon's
+	// staleness check, which compares the recorded head against the pull
+	// request's: `superseded_stale_head: PR #N moved from head "7e4b39d0" to
+	// "7e4b39d0ef82…"`. Those are the same commit. The review never ran, and the
+	// event's wording sent its operator to look for a push that never happened.
+	//
+	// Measured contrast on 2026-09-08: the #2035 review that SUCCEEDED carries a
+	// 40-character head_sha; the #2047 job that died carries 8. Same dispatcher,
+	// same reviewer, same day.
+	//
+	// IT REFUSES ANYTHING THAT IS NOT EXACTLY 40 HEX CHARACTERS, and review
+	// finding F3 is why the earlier "sha-shaped" predicate was wrong: a
+	// REVISION EXPRESSION like `cc6ae8d8^` or `abc1234~1` is not hex, so it fell
+	// through and reached the same doomed comparison the guard exists to
+	// prevent. The daemon compares this value to the pull request's head by
+	// EQUALITY, so every non-sha value is equally unable to bind, whatever its
+	// shape.
+	//
+	// It runs AFTER the review-loop and reviewer-identity refusals so those
+	// still name their own preconditions first - a format complaint that
+	// preempts a semantic one answers a question nobody asked - and BEFORE
+	// prepareLocalReviewTask, which is where it now lives. Cycle two of #2064
+	// found it here instead, one call too late: prepareLocalReviewDispatchRequest
+	// ends in prepareLocalReviewTask, whose UpsertTaskUnlessStates INSERTS OR
+	// UPDATES the review Task, so the refusal arrived after durable state existed.
+	//
+	// It refuses at DISPATCH rather than at the staleness check because a
+	// refusal that arrives after the job row exists has already spent a
+	// worktree, a queue slot and an operator's attention - and, as the same
+	// pattern showed elsewhere, a command that reports a refusal while leaving
+	// work behind is the harder failure to see.
 	var promptHeadWarnings []string
 	if request.Action != "review" {
 		// Keep ask and implement on the pre-allocation scanner seam: ask must scan
@@ -464,7 +511,26 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	}
 	if request.Action == "review" {
 		checkoutPath = readOnlyWorktreePath
+		// #2054: WARN ONLY ON A CITATION THIS PATH HAS NOT ALREADY JUDGED.
+		//
+		// The identity-based scan is right for ask and implement, which have no
+		// refusal in front of them. For a REVIEW it fires on cases the #1819
+		// classifier above has already accepted: refusal happens before enqueue
+		// for a FOREIGN citation, so by the time this runs the citation is the
+		// head, an ancestor of it, a recorded head of this pull request, or
+		// unresolvable. Every one of those is what a prompt does deliberately -
+		// a scoped re-review MUST name the previous round's head to say what it
+		// is re-reviewing - so warning on them fires on the routine case, and a
+		// warning that fires on the routine case teaches its reader to ignore
+		// it. That cost is not hypothetical: this warning was used to attribute
+		// job ownership on 2026-09-08 and then raised against a scoped
+		// re-review that was citing its own prior head correctly.
+		//
+		// Only UNRESOLVABLE survives as worth saying: the classifier could not
+		// establish the relationship, so nobody has judged that citation.
 		promptHeadWarnings = dispatchPromptHeadContradictionWarnings(ctx, jobGitClient(checkoutPath, localDispatchJobRunner(request)), request.Instructions, request.HeadSHA)
+		promptHeadWarnings = retainUnjudgedPromptHeadWarnings(ctx, jobGitClient(record.CheckoutPath, localDispatchJobRunner(request)),
+			store, request.Instructions, request.HeadSHA, repo.FullName(), request.PullRequest, promptHeadWarnings)
 	}
 	// Locking stays on the agent's REGISTERED session (see the same split in
 	// jobWorker.run): a read-only seat isolates DELIVERY, not serialization, so
@@ -571,18 +637,22 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(request.Home)
 	mailbox.OrgPolicy = orgPolicy
 	job, err := mailbox.Enqueue(ctx, workflow.JobRequest{
-		ID:                     jobID,
-		Agent:                  agent.Name,
-		Action:                 request.Action,
-		Repo:                   repo.FullName(),
-		Branch:                 firstNonEmpty(request.Branch, record.DefaultBranch),
-		PullRequest:            request.PullRequest,
-		PullRequestReady:       request.PullRequestReady,
-		HeadSHA:                request.HeadSHA,
-		GoalID:                 request.GoalID,
-		TaskID:                 request.TaskID,
-		TaskTitle:              request.TaskTitle,
-		LeadAgent:              firstNonEmpty(request.LeadAgent, agent.Name),
+		ID:               jobID,
+		Agent:            agent.Name,
+		Action:           request.Action,
+		Repo:             repo.FullName(),
+		Branch:           firstNonEmpty(request.Branch, record.DefaultBranch),
+		PullRequest:      request.PullRequest,
+		PullRequestReady: request.PullRequestReady,
+		HeadSHA:          request.HeadSHA,
+		GoalID:           request.GoalID,
+		TaskID:           request.TaskID,
+		TaskTitle:        request.TaskTitle,
+		// #2054: a review-only dispatch must NOT fall back to the reviewer here.
+		// firstNonEmpty restored agent.Name after validation had cleared it, which
+		// would route a changes_requested fix to the reviewer that produced it -
+		// the exact independence violation the lead requirement exists to prevent.
+		LeadAgent:              reviewLeadForEnqueue(request, agent.Name),
 		Reviewers:              request.Reviewers,
 		Sender:                 "local",
 		ActingOrgRole:          request.ActingOrgRole,
@@ -597,6 +667,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		EffectiveRuntime:       effectiveRuntimeAtEnqueue,
 		RequiredEvents:         requiredEvents,
 		SkipNativeReviewFanout: request.SkipNativeReviewFanout,
+		NoFixTarget:            request.NoFixTarget,
 		ValidatedPullRequest:   request.ImplementPRValidated,
 		TemplateOverride:       recipeTemplate,
 		WorktreePath:           readOnlyWorktreePath,
@@ -626,6 +697,14 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		if request.DispatchWarning != nil {
 			request.DispatchWarning(warning)
 		}
+	}
+	if request.NoFixTarget {
+		// The absence of a fix target is a DECISION, so it is on the record next
+		// to the route rather than inferable from an empty lead field (#2054). A
+		// changes_requested verdict on this job has nowhere to route by design,
+		// and whoever reads it later needs to see that it was chosen.
+		_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "review_no_fix_target",
+			Message: "dispatched --no-fix-target: this review has no implementer for a changes_requested verdict; the dispatching operator owns the follow-up"})
 	}
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "route_selected", Message: routeSelectedMessage(request)}); err != nil {
 		return localAgentJobOutput{}, err
@@ -882,7 +961,7 @@ func promptHeadContradictionWarnings(ctx context.Context, git gitutil.Client, pr
 		if strings.EqualFold(resolvedToken, resolvedHead) {
 			continue
 		}
-		warnings = append(warnings, fmt.Sprintf("prompt references commit %s, but the dispatch head is %s; Gitmoot will use dispatch head %s", token, resolvedHead, resolvedHead))
+		warnings = append(warnings, fmt.Sprintf(promptHeadWarningFormat, token, resolvedHead, resolvedHead))
 	}
 	return warnings
 }
@@ -1028,6 +1107,62 @@ func routeSelectedMessage(request localAgentDispatchRequest) string {
 	return message
 }
 
+// dispatchHeadSHAError rejects a head that cannot be compared to a pull
+// request's head without resolving it (#2054).
+//
+// An EMPTY head stays legal: --head-sha is optional and its absence means "do
+// not bind", which is a different decision from binding badly. What is refused
+// is a value that LOOKS bound and is not comparable - the shape that produced a
+// confident, specific, wrong "stale head" cancellation.
+//
+// The message names the expected length and echoes the value, because the
+// operator's next action is to re-run with the full sha and "invalid head sha"
+// does not say how long it should be.
+// reviewLeadForEnqueue resolves the lead recorded on the job payload.
+//
+// The default is the dispatching agent, which is what firstNonEmpty gave for
+// every job before #2054. A review-only dispatch is the exception and must
+// resolve to EMPTY: its validation deliberately cleared the lead, and restoring
+// the reviewer here would make a changes_requested verdict route its fix to the
+// agent that produced the verdict.
+func reviewLeadForEnqueue(request localAgentDispatchRequest, agentName string) string {
+	if request.NoFixTarget {
+		return ""
+	}
+	return firstNonEmpty(request.LeadAgent, agentName)
+}
+
+func dispatchHeadSHAError(headSHA string) error {
+	head := strings.TrimSpace(headSHA)
+	if head == "" {
+		return nil
+	}
+	if len(head) != gitCommitSHALength || !isHexString(head) {
+		return fmt.Errorf(
+			"--head-sha %q is not a full commit sha: pass all %d hex characters, "+
+				"because an abbreviated value is accepted here and then cancelled as a stale head when it is compared to the pull request's full head (#2054)",
+			head, gitCommitSHALength,
+		)
+	}
+	return nil
+}
+
+// gitCommitSHALength is the length of a full hex object id.
+const gitCommitSHALength = 40
+
+func isHexString(value string) bool {
+	for _, r := range value {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'f':
+		case r >= 'A' && r <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func validateLocalReviewLeadAtDispatch(ctx context.Context, store *db.Store, request localAgentDispatchRequest, repo string) (localAgentDispatchRequest, error) {
 	typeName := strings.TrimSpace(request.Type)
 	if typeName != "" {
@@ -1038,6 +1173,28 @@ func validateLocalReviewLeadAtDispatch(ctx context.Context, store *db.Store, req
 		if !exists {
 			return localAgentDispatchRequest{}, forcedManagedAgentTypeNotFoundError(typeName)
 		}
+	}
+	// #2054: A REVIEW-ONLY DISPATCH HAS NO FIX TARGET, AND SAYS SO.
+	//
+	// The lead exists so a changes_requested verdict has somewhere to go, which
+	// is why it must be able to implement. But requiring one made a review-only
+	// dispatch impossible: `gitmoot agent review <reviewer>` refuses when the
+	// reviewer cannot implement, and the documented fallback - `agent ask` - has
+	// no --head-sha, so it cannot bind a verdict to a head at all. On
+	// 2026-09-08 that pair sent every seat needing an exact-head review onto
+	// ask, where one dispatch bound to a DIFFERENT pull request's merge commit.
+	//
+	// So the requirement is kept and made STATEABLE rather than removed: with
+	// --no-fix-target the operator declares they own the follow-up, and the
+	// choice is recorded on the job so a later changes_requested is attributable
+	// to a decision instead of looking like a missing lead. An unstated absence
+	// still refuses.
+	if request.NoFixTarget {
+		if strings.TrimSpace(request.LeadAgent) != "" {
+			return localAgentDispatchRequest{}, errors.New("--no-fix-target and --lead are mutually exclusive: one declares there is no implementer for a changes_requested verdict, the other names it")
+		}
+		request.LeadAgent = ""
+		return request, nil
 	}
 	leadName := strings.TrimSpace(request.LeadAgent)
 	if leadName == "" {
@@ -1097,6 +1254,13 @@ func prepareLocalReviewDispatchRequest(ctx context.Context, store *db.Store, rec
 		return localAgentDispatchRequest{}, err
 	} else if detected {
 		return localAgentDispatchRequest{}, errors.New(match.Reason())
+	}
+	// #2064 cycle two, F3: refuse a head that cannot bind BEFORE the task upsert
+	// below. The head is resolved by this point - it may have just come from the
+	// pull request above - and prepareLocalReviewTask writes durable state, so a
+	// refusal placed after it leaves a Task behind for a review that never ran.
+	if err := dispatchHeadSHAError(request.HeadSHA); err != nil {
+		return localAgentDispatchRequest{}, err
 	}
 	return prepareLocalReviewTask(ctx, store, repo, request)
 }
