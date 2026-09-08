@@ -219,12 +219,13 @@ func TestReviewDispatchBindsThePromptsTargetToTheDispatchHead(t *testing.T) {
 // The refusal carries the wrong-head signal; the warning had nothing left to
 // say. Ask and implement keep theirs - see the boundary test below.
 func TestReviewDispatchWarnsOnlyOnCitationsNobodyHasJudged(t *testing.T) {
-	checkout, base, firstHead, head, _ := promptHeadBindingCheckout(t)
+	checkout, base, firstHead, head, staleTarget := promptHeadBindingCheckout(t)
 	const unresolvable = "0123456789abcdef0123456789abcdef01234567"
 
 	for _, tt := range []struct {
 		name     string
 		cited    string
+		recordAs int
 		wantWarn bool
 	}{
 		{name: "a prior head on the reviewed branch is silent: this is the scoped re-review case", cited: firstHead},
@@ -235,11 +236,19 @@ func TestReviewDispatchWarnsOnlyOnCitationsNobodyHasJudged(t *testing.T) {
 		// asserted it did, and that expectation was wrong about the existing
 		// scanner rather than about the change.
 		{name: "an unresolvable sha is silent too, because the scan never resolved it to warn about", cited: unresolvable},
+		// F4: a RECORDED head of this pull request that is NOT an ancestor is the
+		// force-push shape - the commit really was a head and no longer is - so a
+		// prompt naming it as its target is reviewing something that is gone.
+		// The first version of this filter could not tell that from provenance.
+		{name: "a recorded head that is NOT an ancestor warns: that is a stale review target", cited: staleTarget, recordAs: 12, wantWarn: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
 			store, home := blockerE2EHome(t)
 			seedReviewDispatchFixture(t, store, checkout)
+			if tt.recordAs != 0 {
+				seedRecordedReviewHead(t, store, "recorded-head-fixture", tt.recordAs, tt.cited)
+			}
 
 			request := reviewDispatchRequest(home, head)
 			request.Instructions = "Review this exact head. Round history: commit " + tt.cited + " for context."

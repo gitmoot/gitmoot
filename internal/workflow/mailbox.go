@@ -327,8 +327,13 @@ type JobRequest struct {
 	ShellUpstreamContext   string
 	Phase                  string
 	SkipNativeReviewFanout bool
-	ValidatedPullRequest   bool
-	Ephemeral              *EphemeralSpec
+	// NoFixTarget carries a review dispatched with --no-fix-target (#2054): it
+	// has NO implementer for a changes_requested verdict, and advancement must
+	// not invent one. It has to live on the payload rather than only in a job
+	// event, because AdvanceJob is what decides whether to dispatch a fix.
+	NoFixTarget          bool
+	ValidatedPullRequest bool
+	Ephemeral            *EphemeralSpec
 	// HumanAnswer carries the rendered ask-gate answer block (#445) into the
 	// coordinator continuation enqueued by the `answer` resume verb. Empty for
 	// every other job, so the stored payload is byte-identical by default.
@@ -479,6 +484,7 @@ type JobPayload struct {
 	ShellUpstreamContext   string              `json:"shell_upstream_context,omitempty"`
 	Phase                  string              `json:"phase,omitempty"`
 	SkipNativeReviewFanout bool                `json:"skip_native_review_fanout,omitempty"`
+	NoFixTarget            bool                `json:"no_fix_target,omitempty"`
 	ValidatedPullRequest   bool                `json:"validated_pull_request,omitempty"`
 	Ephemeral              *EphemeralSpec      `json:"ephemeral,omitempty"`
 	HumanAnswer            string              `json:"human_answer,omitempty"`
@@ -770,16 +776,19 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		ShellUpstreamContext:   request.ShellUpstreamContext,
 		Phase:                  request.Phase,
 		SkipNativeReviewFanout: skipNativeReviewFanout,
-		ValidatedPullRequest:   request.ValidatedPullRequest,
-		Ephemeral:              request.Ephemeral,
-		HumanAnswer:            request.HumanAnswer,
-		RiskTier:               strings.TrimSpace(request.RiskTier),
-		OrchestrateStage:       request.OrchestrateStage,
-		WritablePaths:          compactStrings(request.WritablePaths),
-		ReadablePaths:          compactStrings(request.ReadablePaths),
-		Network:                request.Network,
-		Check:                  strings.TrimSpace(request.Check),
-		CheckRetries:           request.CheckRetries,
+		// #2054: carried onto the payload because AdvanceJob is what decides
+		// whether a changes_requested verdict dispatches a fix at all.
+		NoFixTarget:          request.NoFixTarget,
+		ValidatedPullRequest: request.ValidatedPullRequest,
+		Ephemeral:            request.Ephemeral,
+		HumanAnswer:          request.HumanAnswer,
+		RiskTier:             strings.TrimSpace(request.RiskTier),
+		OrchestrateStage:     request.OrchestrateStage,
+		WritablePaths:        compactStrings(request.WritablePaths),
+		ReadablePaths:        compactStrings(request.ReadablePaths),
+		Network:              request.Network,
+		Check:                strings.TrimSpace(request.Check),
+		CheckRetries:         request.CheckRetries,
 	})
 	if err != nil {
 		return db.Job{}, nil, err

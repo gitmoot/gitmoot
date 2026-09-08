@@ -272,7 +272,14 @@ func retainUnjudgedPromptHeadWarnings(
 	}
 	unjudged := make([]string, 0, len(warnings))
 	for _, citation := range classifyPromptCommitCitations(ctx, git, heads, prompt, dispatchHead, repo, pullRequest) {
-		if citation.relation == promptCommitUnresolved {
+		// F4: a RECORDED HEAD THAT IS NOT AN ANCESTOR is the stale-target case,
+		// and it is the one relation worth warning about. It means the prompt
+		// names a head this pull request really had, which a force push or a
+		// reset left off the current history - so a prompt citing it as its
+		// review TARGET is reviewing something that is no longer there. An
+		// ancestor is different: a scoped re-review cites its own prior head,
+		// and that head's content is still under the dispatch head.
+		if citation.relation == promptCommitIsPriorHead || citation.relation == promptCommitUnresolved {
 			unjudged = append(unjudged, citation.token, citation.resolved)
 		}
 	}

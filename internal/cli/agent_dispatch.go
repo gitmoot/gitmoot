@@ -256,34 +256,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			return localAgentJobOutput{}, err
 		}
 	}
-	// #2054: REFUSE AN ABBREVIATED --head-sha before any durable state.
-	//
-	// An abbreviated value used to be accepted and then CANCELLED by the daemon's
-	// staleness check, which compares the recorded head against the pull
-	// request's: `superseded_stale_head: PR #N moved from head "7e4b39d0" to
-	// "7e4b39d0ef82…"`. Those are the same commit. The review never ran, and the
-	// event's wording sent its operator to look for a push that never happened.
-	//
-	// Measured contrast on 2026-09-08: the #2035 review that SUCCEEDED carries a
-	// 40-character head_sha; the #2047 job that died carries 8. Same dispatcher,
-	// same reviewer, same day.
-	//
-	// It fires only on a SHA-SHAPED value - hex of the wrong length, or 40
-	// characters that are not hex. A value that is not sha-shaped at all is not
-	// an abbreviation; it is something the review-loop and reviewer-identity
-	// refusals name far better than a format check can, and preempting them
-	// would answer a question nobody asked.
-	//
-	// It refuses at DISPATCH rather than at the staleness check because a
-	// refusal that arrives after the job row exists has already spent a
-	// worktree, a queue slot and an operator's attention - and, as the same
-	// pattern showed elsewhere, a command that reports a refusal while leaving
-	// work behind is the harder failure to see.
-	if request.Action == "review" {
-		if err := dispatchHeadSHAError(request.HeadSHA); err != nil {
-			return localAgentJobOutput{}, err
-		}
-	}
 	// A review that may return changes_requested must name a fix target that can
 	// actually implement before Gitmoot spends a review session. Validate the
 	// agents-table row here, before repo/task/worktree mutation, managed-agent
@@ -437,6 +409,41 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		}
 		if strings.TrimSpace(task.WorktreePath) != "" {
 			checkoutPath = task.WorktreePath
+		}
+	}
+	// #2054: REFUSE AN ABBREVIATED --head-sha before any durable state.
+	//
+	// An abbreviated value used to be accepted and then CANCELLED by the daemon's
+	// staleness check, which compares the recorded head against the pull
+	// request's: `superseded_stale_head: PR #N moved from head "7e4b39d0" to
+	// "7e4b39d0ef82…"`. Those are the same commit. The review never ran, and the
+	// event's wording sent its operator to look for a push that never happened.
+	//
+	// Measured contrast on 2026-09-08: the #2035 review that SUCCEEDED carries a
+	// 40-character head_sha; the #2047 job that died carries 8. Same dispatcher,
+	// same reviewer, same day.
+	//
+	// IT REFUSES ANYTHING THAT IS NOT EXACTLY 40 HEX CHARACTERS, and review
+	// finding F3 is why the earlier "sha-shaped" predicate was wrong: a
+	// REVISION EXPRESSION like `cc6ae8d8^` or `abc1234~1` is not hex, so it fell
+	// through and reached the same doomed comparison the guard exists to
+	// prevent. The daemon compares this value to the pull request's head by
+	// EQUALITY, so every non-sha value is equally unable to bind, whatever its
+	// shape.
+	//
+	// It runs AFTER the review-loop and reviewer-identity refusals so those
+	// still name their own preconditions first - a format complaint that
+	// preempts a semantic one answers a question nobody asked - and still
+	// before the read-only worktree and the job row.
+	//
+	// It refuses at DISPATCH rather than at the staleness check because a
+	// refusal that arrives after the job row exists has already spent a
+	// worktree, a queue slot and an operator's attention - and, as the same
+	// pattern showed elsewhere, a command that reports a refusal while leaving
+	// work behind is the harder failure to see.
+	if request.Action == "review" {
+		if err := dispatchHeadSHAError(request.HeadSHA); err != nil {
+			return localAgentJobOutput{}, err
 		}
 	}
 	var promptHeadWarnings []string
@@ -621,18 +628,22 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(request.Home)
 	mailbox.OrgPolicy = orgPolicy
 	job, err := mailbox.Enqueue(ctx, workflow.JobRequest{
-		ID:                     jobID,
-		Agent:                  agent.Name,
-		Action:                 request.Action,
-		Repo:                   repo.FullName(),
-		Branch:                 firstNonEmpty(request.Branch, record.DefaultBranch),
-		PullRequest:            request.PullRequest,
-		PullRequestReady:       request.PullRequestReady,
-		HeadSHA:                request.HeadSHA,
-		GoalID:                 request.GoalID,
-		TaskID:                 request.TaskID,
-		TaskTitle:              request.TaskTitle,
-		LeadAgent:              firstNonEmpty(request.LeadAgent, agent.Name),
+		ID:               jobID,
+		Agent:            agent.Name,
+		Action:           request.Action,
+		Repo:             repo.FullName(),
+		Branch:           firstNonEmpty(request.Branch, record.DefaultBranch),
+		PullRequest:      request.PullRequest,
+		PullRequestReady: request.PullRequestReady,
+		HeadSHA:          request.HeadSHA,
+		GoalID:           request.GoalID,
+		TaskID:           request.TaskID,
+		TaskTitle:        request.TaskTitle,
+		// #2054: a review-only dispatch must NOT fall back to the reviewer here.
+		// firstNonEmpty restored agent.Name after validation had cleared it, which
+		// would route a changes_requested fix to the reviewer that produced it -
+		// the exact independence violation the lead requirement exists to prevent.
+		LeadAgent:              reviewLeadForEnqueue(request, agent.Name),
 		Reviewers:              request.Reviewers,
 		Sender:                 "local",
 		ActingOrgRole:          request.ActingOrgRole,
@@ -647,6 +658,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		EffectiveRuntime:       effectiveRuntimeAtEnqueue,
 		RequiredEvents:         requiredEvents,
 		SkipNativeReviewFanout: request.SkipNativeReviewFanout,
+		NoFixTarget:            request.NoFixTarget,
 		ValidatedPullRequest:   request.ImplementPRValidated,
 		TemplateOverride:       recipeTemplate,
 		WorktreePath:           readOnlyWorktreePath,
@@ -1097,13 +1109,26 @@ func routeSelectedMessage(request localAgentDispatchRequest) string {
 // The message names the expected length and echoes the value, because the
 // operator's next action is to re-run with the full sha and "invalid head sha"
 // does not say how long it should be.
+// reviewLeadForEnqueue resolves the lead recorded on the job payload.
+//
+// The default is the dispatching agent, which is what firstNonEmpty gave for
+// every job before #2054. A review-only dispatch is the exception and must
+// resolve to EMPTY: its validation deliberately cleared the lead, and restoring
+// the reviewer here would make a changes_requested verdict route its fix to the
+// agent that produced the verdict.
+func reviewLeadForEnqueue(request localAgentDispatchRequest, agentName string) string {
+	if request.NoFixTarget {
+		return ""
+	}
+	return firstNonEmpty(request.LeadAgent, agentName)
+}
+
 func dispatchHeadSHAError(headSHA string) error {
 	head := strings.TrimSpace(headSHA)
 	if head == "" {
 		return nil
 	}
-	shaShaped := isHexString(head) || len(head) == gitCommitSHALength
-	if shaShaped && (len(head) != gitCommitSHALength || !isHexString(head)) {
+	if len(head) != gitCommitSHALength || !isHexString(head) {
 		return fmt.Errorf(
 			"--head-sha %q is not a full commit sha: pass all %d hex characters, "+
 				"because an abbreviated value is accepted here and then cancelled as a stale head when it is compared to the pull request's full head (#2054)",

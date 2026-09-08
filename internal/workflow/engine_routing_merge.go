@@ -102,6 +102,28 @@ func (e Engine) dispatchFix(ctx context.Context, verdictJob db.Job, reviewer str
 	// them against the head the in-flight leg is about to push. A dropped dispatch
 	// costs one round; a lost race costs a completed leg's work and leaves the
 	// finding open anyway.
+	// #2054: A REVIEW-ONLY VERDICT HAS NO FIX TARGET, BY DECLARATION.
+	//
+	// --no-fix-target dispatches a review whose reviewer cannot implement and
+	// which names no lead, because the operator owns the follow-up. Honouring
+	// that has to happen HERE, not only at dispatch: clearing the lead alone
+	// left this path to resolve one anyway, and the resolution it reaches is the
+	// reviewer - so the fix for a verdict would go to the agent that produced
+	// it, which is the independence violation the lead requirement exists to
+	// prevent.
+	//
+	// SKIP AND RECORD, in the shape the active-leg branch already uses: the
+	// findings stay open in the ledger, so nothing is lost by not dispatching,
+	// and the event says the omission was chosen rather than failed.
+	if payload.NoFixTarget {
+		return e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID: verdictJob.ID,
+			Kind:  "auto_fix_skipped_no_fix_target",
+			Message: fmt.Sprintf(
+				"auto-fix leg not dispatched for %s pull request #%d: this review was dispatched --no-fix-target, so it has no implementer and the dispatching operator owns the follow-up. The findings stay open in the ledger",
+				payload.Repo, payload.PullRequest),
+		})
+	}
 	if active, found, err := e.activeImplementLegOnBranch(ctx, payload); err != nil {
 		return err
 	} else if found {

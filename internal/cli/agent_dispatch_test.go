@@ -566,30 +566,61 @@ func TestDispatchReviewWithoutLeadRejectsReviewOnlyAgentBeforeEnqueue(t *testing
 // its message, so this asserts the refusal happens where the other pre-enqueue
 // refusals do: no job row, no task, no worktree.
 func TestDispatchReviewRejectsAbbreviatedHeadSHABeforeEnqueue(t *testing.T) {
-	fixture := reviewLeadRefusalStore(t)
-	store := fixture.store
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
-	seedDaemonWorkerAgentWithPolicy(t, store, "lead", runtime.ShellRuntime, "true", []string{"implement", "review"}, "owner/repo", runtime.AutonomyPolicyDangerFullAccess)
-	adapter := installReviewLeadTestAdapter(t, "")
-
-	if len(fixture.head) != 40 {
-		t.Fatalf("fixture head is %d characters, want 40: the abbreviation under test must be a real prefix", len(fixture.head))
+	ctx := context.Background()
+	checkout, _, _, head, _ := promptHeadBindingCheckout(t)
+	store, home := blockerE2EHome(t)
+	seedReviewDispatchFixture(t, store, checkout)
+	if len(head) != 40 {
+		t.Fatalf("fixture head is %d characters, want 40: the abbreviation under test must be a real prefix", len(head))
 	}
-	_, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
-		RepoFlag: "owner/repo", Agent: "reviewer", Action: "review", PullRequest: 7, LeadAgent: "lead",
-		HeadSHA: fixture.head[:8], Branch: "feature/review", Home: fixture.home,
-	})
-	if err == nil {
+
+	before, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := reviewDispatchRequest(home, head[:8])
+	_, dispatchErr := dispatchLocalAgentJob(ctx, store, request)
+	if dispatchErr == nil {
 		t.Fatal("dispatch accepted an abbreviated --head-sha; the daemon would cancel it later as a stale head")
 	}
 	// The message must name the EXPECTED LENGTH, because the operator's next
 	// action is to re-run with a full sha and "invalid head" does not say how.
-	for _, want := range []string{"40", fixture.head[:8]} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("dispatch error = %v, want it to name %q", err, want)
+	for _, want := range []string{"40", head[:8]} {
+		if !strings.Contains(dispatchErr.Error(), want) {
+			t.Fatalf("dispatch error = %v, want it to name %q", dispatchErr, want)
 		}
 	}
-	assertReviewLeadHardRefusal(t, store, fixture.checkout, adapter)
+	// No job row: a refusal that arrives after the row exists has already spent
+	// a worktree and a queue slot.
+	after, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("job rows went from %d to %d; the refusal created a row", len(before), len(after))
+	}
+}
+
+// A REVISION EXPRESSION is the same defect wearing different characters, and the
+// first version of this guard let it through: review finding F3. The daemon
+// compares this value to the pull request's head by equality, so `<sha>^` can no
+// more bind than `<sha8>` can.
+func TestDispatchReviewRejectsARevisionExpressionHead(t *testing.T) {
+	ctx := context.Background()
+	checkout, _, _, head, _ := promptHeadBindingCheckout(t)
+	store, home := blockerE2EHome(t)
+	seedReviewDispatchFixture(t, store, checkout)
+
+	for _, expression := range []string{head + "^", head[:8] + "~1", "HEAD"} {
+		t.Run(expression, func(t *testing.T) {
+			request := reviewDispatchRequest(home, expression)
+			if _, err := dispatchLocalAgentJob(ctx, store, request); err == nil {
+				t.Fatalf("dispatch accepted %q as a head", expression)
+			} else if !strings.Contains(err.Error(), "40") {
+				t.Fatalf("refusal for %q = %v, want it to name the expected length", expression, err)
+			}
+		})
+	}
 }
 
 // A FULL head sha is the same dispatch and must not be refused: without this the
@@ -638,8 +669,25 @@ func TestDispatchReviewOnlyNeedsNoImplementCapableLead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a review-only dispatch was refused: %v", err)
 	}
-	// The decision must be ON THE RECORD, not inferable from an empty lead: a
-	// changes_requested verdict here has nowhere to route BY DESIGN.
+	// THE DECISION MUST REACH THE PAYLOAD, not only a job event. Review found
+	// that clearing the lead was not enough: enqueue restored the reviewer
+	// through firstNonEmpty, so a changes_requested verdict would have routed
+	// its fix to the agent that produced the verdict, and advancement had no
+	// field to read the declaration from.
+	job, err := store.GetJob(ctx, out.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !payload.NoFixTarget {
+		t.Fatalf("payload.NoFixTarget = false; advancement cannot honour a declaration it cannot read: %s", job.Payload)
+	}
+	if strings.TrimSpace(payload.LeadAgent) != "" {
+		t.Fatalf("payload.LeadAgent = %q, want empty: a review-only dispatch must not fall back to the reviewer", payload.LeadAgent)
+	}
 	events, err := store.ListJobEvents(ctx, out.JobID)
 	if err != nil {
 		t.Fatal(err)

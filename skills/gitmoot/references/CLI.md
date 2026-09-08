@@ -1186,10 +1186,18 @@ starting its runtime session, Gitmoot loads the lead from the agents database
 and requires that it exist, can access the repository, has `implement`
 capability, and uses a write-granting policy (`workspace-write` or
 `danger-full-access`). Without `--lead`, the reviewer is the fallback lead and
-must pass the same checks; a strict review-only agent therefore needs an
-explicit implementer. Managed-type review dispatches also require an explicit
-DB-backed lead. `--lead` is rejected when `agent run` resolves to ask or
+must pass the same checks. Managed-type review dispatches also require an
+explicit DB-backed lead. `--lead` is rejected when `agent run` resolves to ask or
 implement, and is not accepted by `agent implement` or `orchestrate`.
+
+A strict review-only agent therefore needs either an explicit implementer or
+`--no-fix-target`, which declares that this review has NO fix target and the
+dispatching operator owns the follow-up. That declaration is carried on the job
+payload, not only as an event, because advancement is what decides whether a
+`changes_requested` verdict dispatches a fix at all: such a verdict records
+`auto_fix_skipped_no_fix_target` and leaves its findings open in the ledger
+rather than routing a fix to the reviewer that produced it. `--no-fix-target`
+is rejected outside review and is mutually exclusive with `--lead`.
 
 This dispatch-time lead validation applies only to local CLI reviews started by
 `gitmoot agent review` or review-resolved `gitmoot agent run`. Reviews routed

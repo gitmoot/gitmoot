@@ -542,6 +542,10 @@ func dispatchAgentCommand(options agentRunOptions, action string, reason string,
 	if executionPath == "orchestrate" {
 		errLabel = "orchestrate"
 	}
+	if options.noFixTarget && action != "review" {
+		fmt.Fprintf(stderr, "%s: --no-fix-target is only supported when routing to review\n", errLabel)
+		return localAgentJobOutput{}, 2
+	}
 	if strings.TrimSpace(options.lead) != "" && action != "review" {
 		fmt.Fprintf(stderr, "%s: --lead is only supported when routing to review\n", errLabel)
 		return localAgentJobOutput{}, 2
@@ -676,7 +680,6 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			options.skipNativeReviewFanout = true
 		case arg == "--no-fix-target":
 			options.noFixTarget = true
-			index++
 		case arg == "--allow-prompt-head-mismatch":
 			options.allowPromptHeadMismatch = true
 		case arg == "--draft" || arg == "--ready":

@@ -3718,6 +3718,48 @@ func replaceAgentDoctorRunner(runner subprocess.Runner) func() {
 	}
 }
 
+// TestParseAgentRunOptionsNoFixTargetDoesNotEatTheNextArgument is review
+// finding F2 on #2064, and it is the cheapest kind of bug to ship: a boolean
+// flag that increments the argument index, in a loop that already increments.
+//
+// Every sibling boolean here - --background, --json,
+// --skip-native-review-fanout, --allow-prompt-head-mismatch - does NOT
+// increment, which is exactly why the extra line looked harmless. The symptom
+// is silent: the NEXT flag disappears, so the failure surfaces as a missing
+// --org-role or an unbound head rather than as a parse error.
+func TestParseAgentRunOptionsNoFixTargetDoesNotEatTheNextArgument(t *testing.T) {
+	var stderr bytes.Buffer
+	options, ok := parseAgentRunOptions("review", []string{
+		"reviewer", "review this", "--no-fix-target", "--org-role", "gm-transport", "--pr", "7",
+	}, &stderr)
+	if !ok {
+		t.Fatalf("parseAgentRunOptions failed: %q", stderr.String())
+	}
+	if !options.noFixTarget {
+		t.Fatal("noFixTarget = false")
+	}
+	// The flags AFTER it must survive. Before the fix --org-role was consumed as
+	// this flag's value and every later flag shifted by one.
+	if options.orgRole != "gm-transport" {
+		t.Fatalf("orgRole = %q, want gm-transport: the boolean consumed the following argument", options.orgRole)
+	}
+	if options.prNumber != 7 {
+		t.Fatalf("prNumber = %d, want 7", options.prNumber)
+	}
+}
+
+// --no-fix-target answers a question only review asks, so it is refused
+// elsewhere exactly as --lead is.
+func TestNoFixTargetIsReviewOnly(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := runAgentRun([]string{"planner", "do the work", "--no-fix-target", "--action", "ask"}, &stdout, &stderr); code == 0 {
+		t.Fatalf("ask accepted --no-fix-target: exit 0, stderr=%q", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "--no-fix-target is only supported when routing to review") {
+		t.Fatalf("stderr = %q, want the review-only refusal", stderr.String())
+	}
+}
+
 func TestParseAgentRunOptionsCapturesModel(t *testing.T) {
 	tests := []struct {
 		name string
