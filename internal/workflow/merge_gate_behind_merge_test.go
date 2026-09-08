@@ -56,8 +56,27 @@ func evaluateBehindMergeGate(t *testing.T, gh *fakeMergeGateGitHub) MergeDecisio
 
 // Acceptance 1: the verdict's own head is what merges. No update is requested,
 // so nothing supersedes the reviewed head.
+//
+// #2074 review, P2. THE SHAPE HERE IS THE ONE PRODUCTION EMITS. This and the two
+// acceptance cases below previously constructed `Status: "behind"`, which GitHub
+// cannot report for an open pull request: `behind` requires `ahead_by == 0`, a
+// branch with no commits of its own. Measured with the gate's own call
+// (CompareCommits -> GET repos/{owner}/{repo}/compare/{base}...{head}) across
+// five open PRs on this repo: five `diverged` with `behind_by` 2..9 and
+// `ahead_by` 1..5, zero `behind`.
+//
+// The shape below is copied from one of those responses, #2057's head against
+// main: {"status":"diverged","ahead_by":1,"behind_by":4,"total_commits":1}.
+//
+// The first fix for this converted only the fixture in the test that changed
+// behaviour and argued these three could stay, on the grounds that the literal
+// `behind` arm of the `||` is still live code. The reviewer rejected that and was
+// right: these are PRODUCTION-PATH ACCEPTANCE tests, and the string arm is
+// covered deliberately and separately by the unknown-status robustness cases at
+// the end of this file. An acceptance test on an unreachable input can stay green
+// through a real regression.
 func TestMergeGateMergesBehindHeadWhenBaseAllowsIt(t *testing.T) {
-	gh := behindMergeGateClient(github.CompareResult{Status: "behind", BehindBy: 1})
+	gh := behindMergeGateClient(github.CompareResult{Status: "diverged", BehindBy: 4, AheadBy: 1})
 	gh.strictKnown = true
 	gh.strictBase = false
 
@@ -88,7 +107,7 @@ func TestMergeGateMergesBehindHeadWhenBaseAllowsIt(t *testing.T) {
 // Acceptance 1, other arm: where GitHub does require an up-to-date head, the
 // update is still the only way to merge, so the pre-#1865 path must survive.
 func TestMergeGateStillUpdatesWhenBaseRequiresUpToDateHead(t *testing.T) {
-	gh := behindMergeGateClient(github.CompareResult{Status: "behind", BehindBy: 1})
+	gh := behindMergeGateClient(github.CompareResult{Status: "diverged", BehindBy: 4, AheadBy: 1})
 	gh.strictKnown = true
 	gh.strictBase = true
 
@@ -121,7 +140,7 @@ func TestMergeGateFailsClosedWhenProtectionIsUndetermined(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			gh := behindMergeGateClient(github.CompareResult{Status: "behind", BehindBy: 1})
+			gh := behindMergeGateClient(github.CompareResult{Status: "diverged", BehindBy: 4, AheadBy: 1})
 			tc.set(gh)
 
 			decision := evaluateBehindMergeGate(t, gh)
@@ -133,38 +152,6 @@ func TestMergeGateFailsClosedWhenProtectionIsUndetermined(t *testing.T) {
 				t.Fatalf("update inputs = %+v", gh.updates)
 			}
 		})
-	}
-}
-
-// #2068. THE SHAPE BELOW IS THE ONE PRODUCTION EMITS, AND THE FIXTURES ABOVE
-// ARE NOT.
-//
-// Every other case in this file constructs `Status: "behind"`. Measured against
-// the live API on 2026-09-08 with the gate's own call - CompareCommits, which
-// issues `GET repos/{owner}/{repo}/compare/{base}...{head}` (client.go
-// CompareCommits) - five of five open pull requests on this repository reported
-// `status=diverged` with `behind_by` 2..9 and `ahead_by` 1..5, and NONE reported
-// `behind`. That is structural, not incidental: `behind` requires `ahead_by ==
-// 0`, a branch with no commits of its own, which is not a pull request.
-//
-// The shape here is copied from one of those responses, #2057's head against
-// main: `{"status":"diverged","ahead_by":1,"behind_by":4,"total_commits":1}`.
-//
-// So the pre-#2068 guard (`status != "diverged"`) could not fire for a real PR,
-// and every base move re-entered the update path that #1865 exists to avoid,
-// while this file stayed green.
-func TestMergeGateMergesDivergedMergeableHeadWhenBaseAllowsIt(t *testing.T) {
-	gh := behindMergeGateClient(github.CompareResult{Status: "diverged", BehindBy: 4, AheadBy: 1})
-	gh.strictKnown = true
-	gh.strictBase = false
-
-	decision := evaluateBehindMergeGate(t, gh)
-
-	if !decision.Merged {
-		t.Fatalf("a diverged but mergeable head must merge without an update: %+v", decision)
-	}
-	if len(gh.updates) != 0 {
-		t.Fatalf("the reviewed head was superseded by an update: %+v", gh.updates)
 	}
 }
 
@@ -284,5 +271,58 @@ func TestMergeGateTreatsNumericBehindAsBehindWhateverTheStatusString(t *testing.
 				}
 			})
 		})
+	}
+}
+
+// #2074 review, P1. UNKNOWN MERGEABILITY MUST NOT REACH THE NATIVE MERGE, and
+// the hole was outside the behind branch entirely: for an already up-to-date
+// comparison ensureBranchFresh returns unhandled, so the behind-branch guard
+// never runs, and the old test `Mergeable != nil && !*Mergeable` was false for
+// nil. Evaluate then merged on mergeability GitHub had not computed.
+//
+// This drives Evaluate with the shape that exposes it - up to date AND nil -
+// which no fixture in this file previously produced.
+func TestMergeGateWaitsWhenMergeabilityIsUnknownOnAnUpToDateHead(t *testing.T) {
+	for _, status := range []string{"ahead", "identical"} {
+		t.Run("status="+status, func(t *testing.T) {
+			gh := behindMergeGateClient(github.CompareResult{Status: status})
+			gh.pr.Mergeable = nil
+			gh.strictKnown = true
+			gh.strictBase = true
+
+			decision := evaluateBehindMergeGate(t, gh)
+
+			if decision.Merged {
+				t.Fatalf("merged with mergeability GitHub has not determined: %+v", decision)
+			}
+			if len(gh.merges) != 0 {
+				t.Fatalf("the native merge was reached: %+v", gh.merges)
+			}
+			// PENDING, not blocked: GitHub computes this asynchronously and it
+			// resolves on the next poll. A block would make an ordinary race an
+			// operator ticket, which is the distinction PipelineAutoMerger makes.
+			if !strings.Contains(decision.Reason.Render(), "has not determined") {
+				t.Fatalf("decision must say mergeability is undetermined, got %q", decision.Reason.Render())
+			}
+		})
+	}
+}
+
+// The explicit false case must stay a BLOCK, so the nil arm above cannot be
+// implemented by softening a real conflict into a wait.
+func TestMergeGateBlocksAnExplicitlyUnmergeableHead(t *testing.T) {
+	gh := behindMergeGateClient(github.CompareResult{Status: "ahead"})
+	conflicting := false
+	gh.pr.Mergeable = &conflicting
+	gh.strictKnown = true
+	gh.strictBase = true
+
+	decision := evaluateBehindMergeGate(t, gh)
+
+	if decision.Merged || len(gh.merges) != 0 {
+		t.Fatalf("a conflicting head must not merge: %+v", decision)
+	}
+	if !strings.Contains(decision.Reason.Render(), "not mergeable") {
+		t.Fatalf("decision must name the conflict, got %q", decision.Reason.Render())
 	}
 }

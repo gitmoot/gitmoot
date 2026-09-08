@@ -393,7 +393,25 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	} else if handled {
 		return decision, nil
 	}
-	if pr.Mergeable != nil && !*pr.Mergeable {
+	// #2074 review, P1. THE GATE REQUIRES MERGEABILITY POSITIVELY, and nil is not
+	// a weak no - it is NOT YET KNOWN. The previous test refused only an explicit
+	// false, so a pull request whose comparison was already up to date - status
+	// "ahead" or "identical", where ensureBranchFresh returns unhandled and the
+	// new behind-branch guard never runs - reached
+	// executePullRequestMergeFenced with mergeability GitHub had not computed.
+	//
+	// The two cases are answered differently, mirroring PipelineAutoMerger
+	// (pipeline_auto_merge.go:121-129), which is the same decision made by the
+	// other merge path in this package:
+	//
+	//   nil   -> PENDING. GitHub computes mergeability asynchronously, so this is
+	//            normal moments after a base move and resolves on the next poll.
+	//            Blocking would turn an ordinary race into an operator ticket.
+	//   false -> BLOCK. A real conflict, transient because a push can fix it.
+	if pr.Mergeable == nil {
+		return g.pending(ctx, request, headSHA, "GitHub has not determined pull request mergeability yet; daemon will retry")
+	}
+	if !*pr.Mergeable {
 		return g.block(ctx, request, headSHA, "pull request is not mergeable; rebase or update the branch", MergeBlockTransient)
 	}
 	if required, reconciled, hold, err := ensureWorkloadModeReconciled(ctx, g.Store, g.GitHub, repo, int64(request.PullRequest), headSHA); err != nil {
