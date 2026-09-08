@@ -82,10 +82,15 @@ if [[ -s "$unexpected" ]]; then
   sed 's/^/  /' "$unexpected" >&2
   exit 1
 fi
+# Benchmarks are EXCLUDED BY DESIGN, not silently skipped. `-test.run` cannot
+# select a benchmark at all (that needs `-bench`), so a benchmark in the list is
+# not the hazard this guard exists for - an unselected TEST is. Refusing here
+# instead forbade the repo from holding any benchmark in a race-lane package,
+# which #1824 hit the moment it added the first one to internal/cli. They are
+# reported and dropped from the run set.
 if [[ -s "$benchmarks" ]]; then
-  echo "partition-race-tests: benchmarks are not selected by -test.run:" >&2
+  echo "partition-race-tests: benchmarks excluded from the run set (-test.run cannot select them):" >&2
   sed 's/^/  /' "$benchmarks" >&2
-  exit 1
 fi
 
 sorted_tests="$work_dir/current-tests.sorted"

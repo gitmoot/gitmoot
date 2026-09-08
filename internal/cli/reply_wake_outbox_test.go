@@ -1296,6 +1296,79 @@ func TestReplyWakeOutboxAgedAttemptedExpiresDeliveryUnknownWithoutDuplicateWake(
 	}
 }
 
+// TestReplyWakeOutboxProvenAgedDeliveryDoesNotReportUnknown is the review
+// finding on #2047, and it is the sibling seam ONE LAYER UP from the fix.
+//
+// #1958 item 3 taught the STORE to resolve an aged row against destination
+// evidence, and the store did. Its only production caller still treated every
+// nonempty expiry result as `wake outbox delivery unknown: expired N aged
+// attempted rows without retry`, which drove both supervisors to log the drain
+// unhealthy - so a delivery the store had just PROVEN still produced an
+// operator-facing unknown-delivery diagnostic. The fix stopped at the store and
+// this is the caller that spoke for it.
+//
+// The whole point is the DIFFERENCE from the test above: identical crash-residue
+// setup, plus an acknowledgment, and the health line must flip.
+func TestReplyWakeOutboxProvenAgedDeliveryDoesNotReportUnknown(t *testing.T) {
+	store, sink, wake, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
+	ctx := context.Background()
+	directive, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "release/directives", Author: "coordinator",
+		Body: "[org:directive to=owner] do the thing", AddressedTarget: "owner",
+		// DIRECTIVE-CLASS on purpose: destination evidence exists only for a
+		// directive, and the store's guard correctly ignores it for a reply row.
+		// My first version of this fixture omitted this and the test failed for
+		// the RIGHT reason - a reply-class row must stay unknown - which is the
+		// guard doing its job rather than the fix failing.
+		AddressedWakeKind: db.WakeOutboxKindDirective,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("pending = %+v, err=%v", pending, err)
+	}
+	// DESTINATION EVIDENCE: the seat acknowledged the directive, so its wake
+	// demonstrably landed however the row's own columns read.
+	if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		WorkflowID: "release/directives", Author: "owner",
+		Body: fmt.Sprintf("[org:directive-ack id=%d by=owner]", directive.ID),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	attemptedAt := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	claimed, err := store.ClaimWakeOutbox(ctx, pending[0].ID, nil, attemptedAt)
+	if err != nil || !claimed {
+		t.Fatalf("simulate pre-crash claim = %v, err=%v", claimed, err)
+	}
+
+	worker := defaultJobWorker(store, io.Discard, home)
+	installReplyWakeProductionSink(t, worker, sink.sink)
+	var stdout bytes.Buffer
+	if err := runEnabledRepoWorkerTicksTracked(
+		context.Background(), store, worker, 0, "", &stdout,
+		attemptedAt.Add(replyWakeAttemptedUnknownAfter), nil, nil,
+	); err != nil {
+		t.Fatalf("tick aborted: %v", err)
+	}
+	if strings.Contains(stdout.String(), "delivery unknown") {
+		t.Fatalf("a PROVEN delivery was reported as unknown: %q", stdout.String())
+	}
+	delivered, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateDelivered)
+	if err != nil || len(delivered) != 1 || delivered[0].ID != pending[0].ID {
+		t.Fatalf("delivered rows = %+v, err=%v", delivered, err)
+	}
+	if wake.promptCalls != 0 {
+		t.Fatalf("a resolved row was re-emitted: calls=%d prompts=%v", wake.promptCalls, wake.prompts)
+	}
+	events, err := store.ListJobEvents(ctx, fmt.Sprintf("wake-outbox:%d", pending[0].ID))
+	if err != nil || len(events) != 1 || events[0].Kind != db.WakeOutboxDeliveredEventKind {
+		t.Fatalf("events = %+v, err=%v; want exactly one %q", events, err, db.WakeOutboxDeliveredEventKind)
+	}
+}
+
 func TestReplyWakeOutboxRuleDeletedMidDrainRefusesLaterBatch(t *testing.T) {
 	store, sink, wake, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
 	ctx := context.Background()
