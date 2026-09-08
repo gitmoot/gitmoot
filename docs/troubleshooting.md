@@ -387,6 +387,15 @@ gitmoot daemon status
 gitmoot agent list
 ```
 
+A queued job that is waiting rather than starting records
+`dispatch_held_back` (#1553). Every dispatch pass that examines the job and
+declines to claim it writes one, naming the reason: an admission-budget
+refusal, a checkout held by an in-flight job, a runtime session lock and its
+holder, or - when the pass cannot attribute the wait - the bare fact that the
+job was not selected this pass. That reason previously reached daemon stdout
+only, so `gitmoot job events` could not distinguish a long wait from an
+imminent start. One row per job per distinct reason every five minutes.
+
 Fixes:
 
 - Check `[parallel_sessions]`. The default is `same_session = "fork_temp_session"`,

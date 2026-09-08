@@ -288,6 +288,17 @@ gitmoot agent show <agent>
 gitmoot lock list --repo owner/repo
 ```
 
+A job that is simply WAITING now says so in its own record (#1553). Every
+dispatch pass that examines a queued job and declines to claim it writes a
+`dispatch_held_back` event naming the reason: an admission-budget refusal, a
+checkout held by an in-flight job, a runtime session lock and its holder, or -
+when the pass cannot attribute the wait - the bare fact that the job was not
+selected this pass. Before this, that reason went only to daemon stdout, so
+`gitmoot job events` could not tell a job waiting two hours from one about to
+start. The event is throttled to one row per job per distinct reason every five
+minutes, so a long wait produces a readable handful of rows rather than one per
+tick.
+
 `gitmoot job list` appends a `WHY:` column and `gitmoot job show` prints a
 `why_stuck:` line for queued/blocked jobs (#552) — e.g. a runtime-session lock
 wait (naming the holder), `blocked: awaiting human`, `auth failing: …`,
