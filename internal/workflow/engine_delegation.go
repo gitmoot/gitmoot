@@ -679,7 +679,69 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 	return err
 }
 
+// delegationHeadResolver resolves a ref to a SHA. It is the same RevParse the
+// writable lineage manager already exposes; asserted narrowly here so a
+// manager that cannot resolve refs degrades to the unbound arm rather than
+// failing the dispatch (#1730).
+type delegationHeadResolver interface {
+	RevParse(ctx context.Context, rev string) (string, error)
+}
+
 func (e Engine) allocateAndEnqueueDelegationInner(ctx context.Context, job db.Job, payload JobPayload, d Delegation, request JobRequest, ref taskRef) error {
+	// #1730. A review child inherits the parent's HeadSHA, and that is CORRECT
+	// when the coordinator is itself a review: a lens fan-out reviews the same
+	// commit its parent was dispatched against, which is 27 of the 28
+	// parent-delegated reviews in this store.
+	//
+	// IT IS WRONG WHEN THE PARENT IS AN IMPLEMENT JOB. An implement job's payload
+	// head is the commit BEFORE its change, and that payload is not updated by
+	// the time its delegations are enqueued. Measured on the single instance:
+	// parent local-implement-appkit-omp-18d0db287156c2ba enqueued `round2-review`
+	// in the SAME SECOND it succeeded (10:22:43), the child recorded head
+	// 0e2ce4f1, and the reviewer's own summary named 0c175d03 as "== HEAD". The
+	// row attested an approval at an ANCESTOR of the reviewed tree while the only
+	// correct record was free text - which inverts the reason head-binding exists.
+	//
+	// THIS SITS BEFORE THE ALLOCATION CHAIN BECAUSE THE REPRODUCED CASE HAS ONE
+	// CHILD. readOnlyFanoutNeedsWorktree requires TWO OR MORE read-only siblings
+	// (worktree.go:941, `count >= 2`), so a lone review child never reaches the
+	// read-only worktree branch at all. A fix placed there would have been
+	// unexercised by the very job that motivated it.
+	//
+	// IT WRITES A HEAD RATHER THAN CLEARING ONE. The head the child will actually
+	// review is the tip of the parent's branch, which is where that parent's work
+	// landed, so it is resolved here and recorded. Clearing would leave the
+	// verdict UNBOUND, and an unbound verdict is not the fix for a wrongly-bound
+	// one - though it IS the safer failure, so an unresolvable branch clears and
+	// says so rather than keeping a head known to be stale.
+	if request.Action == "review" && strings.EqualFold(strings.TrimSpace(job.Type), "implement") {
+		inherited := strings.TrimSpace(request.HeadSHA)
+		resolved := ""
+		branch := strings.TrimSpace(payload.Branch)
+		if resolver, ok := e.DelegationWorktrees.(delegationHeadResolver); ok && branch != "" {
+			if sha, resolveErr := resolver.RevParse(ctx, branch); resolveErr == nil {
+				resolved = strings.TrimSpace(sha)
+			}
+		}
+		switch {
+		case resolved != "" && resolved != inherited:
+			request.HeadSHA = resolved
+			_ = e.recordEffectEvent(ctx, db.JobEvent{
+				JobID: job.ID,
+				Kind:  "delegation_review_head_rebound",
+				Message: fmt.Sprintf("delegation %q reviews branch %s: bound to its tip %s instead of the implement parent's dispatch head %s (#1730)",
+					request.DelegationID, branch, shortHead(resolved), shortHead(inherited)),
+			})
+		case resolved == "" && inherited != "":
+			request.HeadSHA = ""
+			_ = e.recordEffectEvent(ctx, db.JobEvent{
+				JobID: job.ID,
+				Kind:  "delegation_review_head_unbound",
+				Message: fmt.Sprintf("delegation %q could not resolve branch %q, so the implement parent's dispatch head %s was DROPPED rather than recorded as reviewed (#1730)",
+					request.DelegationID, branch, shortHead(inherited)),
+			})
+		}
+	}
 	if request.Action == "implement" {
 		if e.DelegationWorktrees == nil || strings.TrimSpace(e.Home) == "" {
 			// No per-delegation worktree isolation is available (the engine lacks a
