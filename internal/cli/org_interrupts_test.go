@@ -153,6 +153,35 @@ func TestOrgInterruptsCommandReportsFromTheStore(t *testing.T) {
 	if report.Collapsed != 2 {
 		t.Fatalf("report collapsed = %d, want 2", report.Collapsed)
 	}
+
+	// WIRING, not just arithmetic. A mutant that computed the route-history
+	// boundary and never assigned it to the report survived until this existed:
+	// the caveat test set the field by hand, so nothing proved the COMMAND
+	// populates it from the store. Same shape as the #1938 tests that all
+	// passed with the production fix deleted.
+	if err := store.AddEventRule(ctx, db.EventRule{
+		ID: "reply-doomed", OnKind: db.WakeOutboxKindReply, WakeRole: "owner", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteEventRule(ctx, "reply-doomed"); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := runOrg([]string{"interrupts", "--home", home, "--window", "24h", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("json code=%d err=%q", code, stderr.String())
+	}
+	var withHistory orgInterruptReport
+	if err := json.Unmarshal(stdout.Bytes(), &withHistory); err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(withHistory.RouteHistoryStart) == "" {
+		t.Fatal("command did not carry the recorded route-history boundary into the report")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, withHistory.RouteHistoryStart); err != nil {
+		t.Fatalf("route_history_start = %q, want an RFC3339 timestamp: %v", withHistory.RouteHistoryStart, err)
+	}
 }
 
 func TestOrgInterruptWindowParsing(t *testing.T) {
@@ -181,5 +210,62 @@ func TestOrgInterruptWindowParsing(t *testing.T) {
 		if err != nil || got != test.want {
 			t.Fatalf("window %q = %s, %v; want %s", test.value, got, err, test.want)
 		}
+	}
+}
+
+// TestOrgInterruptTextStatesItsOwnRouteHistoryLimit puts the limitation in the
+// OUTPUT, not only in a PR body (phobos, on gm-integrity's framing: a
+// limitation in a report instead of a record is the same defect class as
+// recording nothing).
+//
+// The retired-versus-gap split in each row's `wake_unroutable` event reads the
+// deletion tombstones. On this fleet they begin 2026-08-30, so every role
+// retired earlier reads as never-configured, including the seven roles with
+// delivered escalations and no current route, which are exactly the rows the
+// question is about.
+func TestOrgInterruptTextStatesItsOwnRouteHistoryLimit(t *testing.T) {
+	base := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	activity := []db.WakeOutboxActivity{{
+		ID: 1, TargetRole: "stranded", SourceKind: db.WakeOutboxSourceAwaitedFact,
+		CoalesceKey: "fact:stranded", State: db.WakeOutboxStatePending,
+		CreatedAt: base.Format(time.RFC3339Nano),
+	}}
+	report := buildOrgInterruptReport(activity, nil, nil, base, base.Add(time.Hour), time.Hour)
+	if report.RoutelessPending != 1 {
+		t.Fatalf("routeless = %d, want the unrouted row", report.RoutelessPending)
+	}
+
+	report.RouteHistoryStart = "2026-08-30T17:27:04Z"
+	var withHistory bytes.Buffer
+	writeOrgInterruptText(&withHistory, report)
+	if !strings.Contains(withHistory.String(), "Route history begins 2026-08-30T17:27:04Z") ||
+		!strings.Contains(withHistory.String(), db.WakeOutboxUnroutableNeverConfigured) {
+		t.Fatalf("report does not state its categorisation limit: %q", withHistory.String())
+	}
+
+	// No tombstones at all is a STRONGER limit, not a missing one: every row
+	// reads as never-configured whatever actually happened.
+	report.RouteHistoryStart = ""
+	var noHistory bytes.Buffer
+	writeOrgInterruptText(&noHistory, report)
+	if !strings.Contains(noHistory.String(), "No route deletions are recorded at all") {
+		t.Fatalf("report with no route history does not say so: %q", noHistory.String())
+	}
+
+	// And the caveat is attached to the rows it qualifies, not printed
+	// unconditionally: a fleet with every route in place should not be told
+	// about a limit that cannot affect it.
+	clean := buildOrgInterruptReport([]db.WakeOutboxActivity{{
+		ID: 2, TargetRole: "owner", SourceKind: db.WakeOutboxSourceWorkflowNote,
+		CoalesceKey: "reply:owner", State: db.WakeOutboxStateDelivered,
+		CreatedAt: base.Format(time.RFC3339Nano),
+	}}, nil, []db.EventRule{{
+		ID: "reply-owner", OnKind: db.WakeOutboxKindReply, WakeRole: "owner", Enabled: true,
+	}}, base, base.Add(time.Hour), time.Hour)
+	clean.RouteHistoryStart = "2026-08-30T17:27:04Z"
+	var cleanOut bytes.Buffer
+	writeOrgInterruptText(&cleanOut, clean)
+	if strings.Contains(cleanOut.String(), "Route history begins") {
+		t.Fatalf("caveat printed with no routeless rows to qualify: %q", cleanOut.String())
 	}
 }
