@@ -217,3 +217,40 @@ func TestAdvanceJobRecordsAnUnrecordableAskVerdict(t *testing.T) {
 		t.Fatalf("ledger rows = %d, want 0; an unbound verdict must never be keyed", n)
 	}
 }
+
+// #2061 review, P2: A BLOCKED REVIEWER THAT NAMED DEFECTS STILL REVIEWED.
+//
+// review_loop.go's followUpReviewScopes treats decision "blocked" WITH findings
+// as a real verdict and refuses it without them. reviewShapedResult did not,
+// so an ask dispatched as a review that blocked after finding defects was lost
+// silently - the exact class #1962 closes. The reviewer found it by READING the
+// predicate; no fixture here used a non-success decision, in either direction.
+func TestBlockedWithFindingsIsAReviewVerdict(t *testing.T) {
+	if !reviewShapedResult(&AgentResult{
+		Decision: "blocked",
+		Findings: []json.RawMessage{json.RawMessage(`{"id":"F1","severity":"P1","title":"t"}`)},
+	}) {
+		t.Fatal("a blocked reviewer that named defects was not treated as a review verdict")
+	}
+}
+
+// THE OTHER DIRECTION, which is what makes the arm above non-vacuous: blocked
+// with NO findings is not a verdict, matching followUpReviewScopes exactly.
+func TestBlockedWithoutFindingsIsNotAReviewVerdict(t *testing.T) {
+	if reviewShapedResult(&AgentResult{Decision: "blocked"}) {
+		t.Fatal("a blocked job that named nothing was treated as a review verdict")
+	}
+}
+
+// "failed" IS NOT A REVIEW VERDICT, and this pins the place I went NARROWER
+// than the review asked. engine_run_budgets.go constructs "failed" itself, so
+// admitting it would promote an engine-authored terminal state to a reviewer's
+// verdict - the manufacture the P3 arm removed.
+func TestFailedWithFindingsIsNotAReviewVerdict(t *testing.T) {
+	if reviewShapedResult(&AgentResult{
+		Decision: "failed",
+		Findings: []json.RawMessage{json.RawMessage(`{"id":"F1","severity":"P1","title":"t"}`)},
+	}) {
+		t.Fatal("an engine-authored \"failed\" decision was treated as a review verdict")
+	}
+}

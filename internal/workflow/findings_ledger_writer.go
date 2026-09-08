@@ -725,6 +725,15 @@ func reviewShapedResult(result *AgentResult) bool {
 	case "":
 		// No decision at all: findings are the only signal that a review happened.
 		return len(result.Findings) > 0
+	case "blocked":
+		// A BLOCKED REVIEWER THAT NAMED DEFECTS STILL REVIEWED (#2061 review, P2).
+		// review_loop.go's followUpReviewScopes treats exactly this - decision
+		// "blocked" WITH findings - as a real verdict, and refuses it without
+		// them. Matching that predicate here rather than inventing a second one
+		// is the point: an ask dispatched as a review that blocks after finding
+		// defects would otherwise be lost silently, which is the class #1962
+		// exists to close.
+		return len(result.Findings) > 0
 	}
 	// A DECISION THAT IS NOT A REVIEW DECISION SETTLES IT, even with findings
 	// attached (#2061 review, P3). The first version returned true on findings
@@ -733,6 +742,13 @@ func reviewShapedResult(result *AgentResult) bool {
 	// that was never a review. The reviewer found that by reading the predicate
 	// rather than by running it, which is why no test caught it: every fixture I
 	// wrote used a review-shaped decision.
+	//
+	// "failed" IS DELIBERATELY NOT HERE, which is NARROWER THAN THE REVIEW ASKED
+	// FOR. They proposed blocked OR failed. review_loop.go names only "blocked",
+	// and every "failed" decision I can find is ENGINE-GENERATED rather than
+	// reviewer-authored - engine_run_budgets.go:104 constructs one. Admitting it
+	// would promote an engine-authored terminal state to a review verdict, which
+	// is the same manufacture the P3 above removed.
 	return false
 }
 
