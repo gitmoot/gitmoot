@@ -113,11 +113,7 @@ func TestFindingWithContentIsNotRefused(t *testing.T) {
 // identity, classification, and locators. Named explicitly so the classification
 // test below is a decision rather than a filter.
 var ledgerNonContentKeys = []string{
-	"id", "severity", "file", "continues_uid", "state", "disposition",
-	"evidence_kind", "evidence_locator", "locator", "location", "withdraw_reason",
-	"line", "relevance_keys", "lens",
-
-	"evidence", "lens",
+	"id", "severity", "file", "continues_uid", "state", "disposition", "evidence_kind", "evidence_locator", "locator", "location", "withdraw_reason", "line", "relevance_keys", "lens", "evidence",
 }
 
 // THE REVERSE DRIFT, which the advertised-keys test alone does not catch.
