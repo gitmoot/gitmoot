@@ -470,6 +470,39 @@ func (s *Store) ExpireAgedWakeOutbox(ctx context.Context, attemptedBefore, at ti
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// WRITE-FIRST BY CONSTRUCTION (#2028), in two statements rather than one,
+	// both on the write's own budget (#1911).
+	//
+	// This transaction used to open with the SELECT below, which took a read
+	// lock and left the write to UPGRADE into one - and SQLite will not run the
+	// busy handler for a write attempted inside a transaction that already
+	// holds a read lock, because waiting there could deadlock. Measured under a
+	// held write lock: a write-first transaction waits 14.50s, a read-then-write
+	// transaction is refused at 0s. So the sweep forfeited its wait entirely and
+	// no context budget could help it: #1911's floor was correct here and inert.
+	//
+	// The obvious single-statement form, UPDATE ... RETURNING, was tried and
+	// REJECTED: RETURNING has no defined row order, while the survivor
+	// selection below depends on `ORDER BY attempted_at, id` - and no test can
+	// discriminate that, because the grouping key contains attempted_at, so
+	// intra-group order is by id and RETURNING happens to emit rowid order. A
+	// correctness property that only holds by coincidence of the query plan, with
+	// no test able to catch its loss, is worse than an extra statement.
+	//
+	// So the lock is taken by a stamping UPDATE and the read stays exactly the
+	// ordered SELECT it was. Stamping updated_at is a real change, not a no-op
+	// to grab the lock: these rows are being processed now, and each one this
+	// transaction returns gets its terminal state below. The second statement
+	// costs nothing in contention terms - the write lock is already held.
+	if _, err := tx.ExecContext(writeCtx, `
+UPDATE wake_outbox
+SET updated_at = ?
+WHERE state = 'attempted' AND attempted_at IS NOT NULL AND attempted_at <= ?`,
+		at.UTC().Format(BlockedEpisodeTimeLayout),
+		attemptedBefore.UTC().Format(BlockedEpisodeTimeLayout),
+	); err != nil {
+		return nil, err
+	}
 	rows, err := tx.QueryContext(writeCtx, `
 SELECT id, source_kind, source_id, target_role, coalesce_key, state,
 	attempt_count, last_error, created_at, COALESCE(attempted_at, ''),
@@ -650,9 +683,23 @@ func (s *Store) FinishOrRetryWakeOutbox(
 		return false, 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// WRITE-FIRST BY CONSTRUCTION (#2028). This read decides the outcome and
+	// must stay inside the same transaction as the write - that is the invariant
+	// documented above, so two daemons cannot both see budget remaining. But as
+	// a SELECT it took a read lock first, and SQLite will not run the busy
+	// handler for a write attempted inside a transaction that already holds one,
+	// so this transaction forfeited its wait entirely: measured under a held
+	// write lock, write-first waits 14.50s while read-then-write is refused at
+	// 0s. Reading through an UPDATE ... RETURNING keeps the read in the
+	// transaction AND takes the write lock with the first statement.
+	//
+	// Stamping updated_at is a real change: this row's outcome is being decided
+	// now, and every path below writes it again in the same transaction.
 	var role string
 	if err := tx.QueryRowContext(writeCtx,
-		`SELECT attempt_count, target_role FROM wake_outbox WHERE id = ?`, ids[0],
+		`UPDATE wake_outbox SET updated_at = ? WHERE id = ?
+RETURNING attempt_count, target_role`,
+		at.UTC().Format(BlockedEpisodeTimeLayout), ids[0],
 	).Scan(&attempts, &role); err != nil {
 		return false, 0, err
 	}
