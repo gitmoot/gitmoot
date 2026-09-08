@@ -98,7 +98,7 @@ func seedMergeGateFixtureAgent(t *testing.T, store *db.Store, name string) {
 	// the production registry by design, and #2004's parent recovery is the thing
 	// that resolves them; a fixture that registers one resolves it directly and
 	// silently stops exercising the walk.
-	if _, isTemp := splitTempAgentName(name); isTemp || strings.Contains(name, ephemeralAgentInfix) {
+	if _, _, isTemp := splitTempAgentName(name); isTemp || strings.Contains(name, ephemeralAgentInfix) {
 		return
 	}
 	if _, err := store.GetAgent(context.Background(), name); err == nil {
