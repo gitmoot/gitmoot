@@ -719,13 +719,20 @@ func reviewShapedResult(result *AgentResult) bool {
 	if result == nil {
 		return false
 	}
-	if len(result.Findings) > 0 {
-		return true
-	}
 	switch strings.ToLower(strings.TrimSpace(result.Decision)) {
 	case "approved", "changes_requested":
 		return true
+	case "":
+		// No decision at all: findings are the only signal that a review happened.
+		return len(result.Findings) > 0
 	}
+	// A DECISION THAT IS NOT A REVIEW DECISION SETTLES IT, even with findings
+	// attached (#2061 review, P3). The first version returned true on findings
+	// ALONE, so an implement job that populated Findings - which the result shape
+	// permits - would have emitted a review_verdict_unrecordable event about work
+	// that was never a review. The reviewer found that by reading the predicate
+	// rather than by running it, which is why no test caught it: every fixture I
+	// wrote used a review-shaped decision.
 	return false
 }
 

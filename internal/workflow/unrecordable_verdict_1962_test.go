@@ -144,6 +144,21 @@ func TestOrdinaryAskRecordsNoUnrecordableVerdict(t *testing.T) {
 	if reviewShapedResult(&AgentResult{Decision: "implemented", Summary: "did the thing"}) {
 		t.Fatal("an implement-shaped result was treated as a review verdict")
 	}
+	// #2061 review, P3: findings ALONE used to be sufficient, so an implement job
+	// that populated Findings - which the result shape permits - emitted an event
+	// about work that was never a review. Found by reading the predicate; every
+	// fixture here used a review-shaped decision, so no test could have caught it.
+	if reviewShapedResult(&AgentResult{
+		Decision: "implemented",
+		Findings: rawFindings(t, `{"uid":"#1-f1","severity":"P2","evidence":"a.go:1 - note"}`),
+	}) {
+		t.Fatal("an implement result carrying findings was treated as a review verdict")
+	}
+	// A verdict with findings and NO decision is still a review: findings are the
+	// only signal there is.
+	if !reviewShapedResult(&AgentResult{Findings: rawFindings(t, `{"severity":"P1"}`)}) {
+		t.Fatal("findings with no decision were not treated as a review verdict")
+	}
 	if reviewShapedResult(&AgentResult{Decision: "", Summary: "answered a question"}) {
 		t.Fatal("a plain ask answer was treated as a review verdict")
 	}
