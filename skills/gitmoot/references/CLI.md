@@ -2081,6 +2081,12 @@ and an `agent_blocked` pane are **transient**: the claimed rows return to
 bounded at three attempts. Any other cause, and an exhausted budget, end the
 rows terminally and record a `wake_delivery_failed` job event on
 `wake-outbox:<id>` naming the role, cause and attempts.
+An aged row whose delivery the store can PROVE is recorded `delivered` with a
+`wake_delivered` job event carrying `policy=resolved_by_destination_evidence`,
+rather than `delivery_unknown`. The proof is a note in the directive's own
+workflow acknowledging it (`[org:directive-ack id=<id> ...]`) or recording its
+delivery (`[org:directive-delivered id=<id> ...]`), naming that row's directive;
+a reply-class row has no equivalent marker and keeps the unknown outcome.
 `attention`, `guard`, `job-terminal`, `review-verdict`, `recycle-overdue`, and
 `pane_input_pending` wakes remain best-effort. With no rule rows this path is
 off. Task episodes due in one evaluator pass produce one oldest-first digest

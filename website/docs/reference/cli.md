@@ -1805,6 +1805,13 @@ and attempts. `attention`, `guard`, `job-terminal`,
 `review-verdict`, `recycle-overdue`, and `pane_input_pending` wakes remain
 best-effort; zero rules leaves the feature off.
 
+An aged row whose delivery the store can PROVE is recorded `delivered` with a
+`wake_delivered` job event carrying `policy=resolved_by_destination_evidence`,
+rather than `delivery_unknown`. The proof is a note in the directive's own
+workflow acknowledging it (`[org:directive-ack id=<id> ...]`) or recording its
+delivery (`[org:directive-delivered id=<id> ...]`), naming that row's directive;
+a reply-class row has no equivalent marker and keeps the unknown outcome.
+
 ```sh
 gitmoot orchestrate planner "Coordinate the dashboard wave." --repo owner/repo --workflow fable/dashboard-redesign
 gitmoot job list --workflow fable/dashboard-redesign
