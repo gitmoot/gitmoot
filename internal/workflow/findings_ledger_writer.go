@@ -526,7 +526,8 @@ func (e Engine) recordLedgerContentRefusal(ctx context.Context, jobID string, in
 		JobID: jobID,
 		Kind:  "findings_ledger_refused",
 		Message: fmt.Sprintf(
-			"finding[%d] at claimed severity %s was REFUSED, not recorded: it carries no title, detail or rationale, "+
+			"finding[%d] at claimed severity %s was REFUSED, not recorded: it carries no finding text this reader "+
+				"can read, "+
 				"so it names no defect that can be evaluated or discharged. The verdict's own severity still blocks the "+
 				"merge, so nothing is unblocked by this refusal. Restate the concern using one of the keys this "+
 				"reader accepts for finding text: %s. Reviewer's finding verbatim: %s",
@@ -585,7 +586,16 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 	b.WriteString("EVERY finding you emit needs an explicit \"severity\" of P0, P1, P2 or P3. A finding with none is\n")
 	b.WriteString("REFUSED rather than stored, because a row with no severity is an obligation no severity policy\n")
 	b.WriteString("can ever disposition, and it is not the same thing as P3 (#1928).\n")
-	b.WriteString("EVERY finding also needs an articulated concern: a \"title\", a \"detail\" or a \"rationale\". A file\n")
+	// #2078 review, P2: THIS SENTENCE IS READ BEFORE THE REVIEWER WRITES, which
+	// makes it the more consequential of the two places that described the
+	// content rule. It used to offer a bare "rationale", and a rationale alone is
+	// REFUSED - obs.Rationale is copied only on the STATIC arm, which needs a
+	// locator. The refusal already carried the condition after this PR; the
+	// instruction did not, so a reviewer could follow the brief exactly and lose
+	// the finding.
+	b.WriteString("EVERY finding also needs an articulated concern: a \"title\", a \"detail\", or a \"rationale\"\n")
+	b.WriteString("TOGETHER WITH a \"file\" - a rationale ALONE is refused, because it is recorded only alongside a\n")
+	b.WriteString("locator. A file\n")
 	b.WriteString("and line alone is REFUSED rather than stored (#1968), because a bare locator says where to look\n")
 	b.WriteString("and nothing about what is wrong there, so no later round can evaluate or discharge it. Return\n")
 	b.WriteString("fewer findings rather than empty ones; a refusal is reported back against your job.\n")

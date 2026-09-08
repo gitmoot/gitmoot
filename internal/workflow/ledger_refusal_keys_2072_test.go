@@ -115,6 +115,7 @@ func TestFindingWithContentIsNotRefused(t *testing.T) {
 var ledgerNonContentKeys = []string{
 	"id", "severity", "file", "continues_uid", "state", "disposition",
 	"evidence_kind", "evidence_locator", "locator", "location", "withdraw_reason",
+	"line", "relevance_keys", "lens",
 
 	"evidence", "lens",
 }
@@ -137,10 +138,11 @@ func TestEveryWireStringFieldIsClassified(t *testing.T) {
 	}
 	wire := reflect.TypeOf(reviewFindingWire{})
 	for i := range wire.NumField() {
+		// #2078 review, P3: EVERY TAGGED FIELD, not only strings. The first
+		// version skipped non-string kinds, so a future content-bearing field of
+		// another type - a []string of notes, say - would have slipped the guard
+		// silently, which is the drift this test exists to stop.
 		field := wire.Field(i)
-		if field.Type.Kind() != reflect.String {
-			continue
-		}
 		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
 		if name == "" || name == "-" {
 			continue
