@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -255,6 +256,11 @@ func buildOrgStatusRows(ctx context.Context, shared *orgSharedState, src orgLive
 		rows = append(rows, orgStatusOutput{
 			Role: role.Name, Parent: role.Parent, Pane: role.Pane, Depth: len(shared.Config.Path(role.Name)) - 1,
 			Scope: role.Scope, MergeRule: role.MergeRule, Model: role.Model, ActiveJobs: activeJobs, LastSeenAt: seen.LastSeenAt, LastSeenAge: orgPresenceAge(seen.LastSeenAt, observedNow), LastCommand: seen.LastCommand,
+			// #1702: live.Activity was already on this line and unread. The turn
+			// counter is the only field that distinguishes a seat INSIDE a long turn
+			// from one that stopped after a short one; LastSeenAge cannot, because an
+			// age conflates the two. Nil stays nil - see LastTurn's contract.
+			LastTurn:      orgLastTurn(live),
 			ProviderState: live.State, ProviderDetail: live.Detail, ObservedAt: observedAt, ProviderVersion: providerVersion,
 			RecycleStatus: recycleStatus, RecycleAfter: recycleAfterText,
 			MissedWakes: consecutive, Flagged: flagged, FlagReason: flagReason,
@@ -277,4 +283,30 @@ func formatOrgRoleUnavailableUntil(value string) string {
 		return strings.TrimSpace(value)
 	}
 	return until.UTC().Format(time.RFC3339)
+}
+
+// orgLastTurn extracts the provider's last completed turn, preserving the
+// difference between "not reported" and any numeric value (#1702).
+//
+// org.RoleActivity's own comment is the contract this honours: "A nil
+// *RoleActivity means the provider did not report turn activity; callers must
+// not treat that as a zero-valued or stale turn." So a nil activity yields a
+// nil turn and the surfaces render it as absent, never as 0 - a rendered 0
+// would invent a stalled seat out of a silent provider.
+func orgLastTurn(live org.RoleLiveState) *int64 {
+	if live.Activity == nil {
+		return nil
+	}
+	turn := live.Activity.Turn
+	return &turn
+}
+
+// orgTurnText renders a turn for the human surfaces. Absent is a dash, which is
+// the same rendering every other unreported column uses, so a reader does not
+// have to learn a second convention for missing data.
+func orgTurnText(turn *int64) string {
+	if turn == nil {
+		return "-"
+	}
+	return strconv.FormatInt(*turn, 10)
 }
