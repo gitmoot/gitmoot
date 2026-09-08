@@ -131,13 +131,16 @@ type localAgentDispatchRequest struct {
 	// ImplementBase is the CLI/config worktree base for implement dispatches.
 	// Before the request can enqueue, it is resolved to a commit SHA and
 	// ImplementBaseResolved is set so allocation uses that exact commit.
-	ImplementBase          string
-	ImplementBaseResolved  bool
-	ImplementPRValidated   bool
-	Branch                 string
-	GoalID                 string
-	TaskTitle              string
-	LeadAgent              string
+	ImplementBase         string
+	ImplementBaseResolved bool
+	ImplementPRValidated  bool
+	Branch                string
+	GoalID                string
+	TaskTitle             string
+	LeadAgent             string
+	// NoFixTarget states that this review has NO implementer to route a
+	// changes_requested verdict to (#2054). It is the review-only dispatch.
+	NoFixTarget            bool
 	Reviewers              []string
 	SkipNativeReviewFanout bool
 	Recipe                 string
@@ -674,6 +677,14 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			request.DispatchWarning(warning)
 		}
 	}
+	if request.NoFixTarget {
+		// The absence of a fix target is a DECISION, so it is on the record next
+		// to the route rather than inferable from an empty lead field (#2054). A
+		// changes_requested verdict on this job has nowhere to route by design,
+		// and whoever reads it later needs to see that it was chosen.
+		_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "review_no_fix_target",
+			Message: "dispatched --no-fix-target: this review has no implementer for a changes_requested verdict; the dispatching operator owns the follow-up"})
+	}
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "route_selected", Message: routeSelectedMessage(request)}); err != nil {
 		return localAgentJobOutput{}, err
 	}
@@ -1128,6 +1139,28 @@ func validateLocalReviewLeadAtDispatch(ctx context.Context, store *db.Store, req
 		if !exists {
 			return localAgentDispatchRequest{}, forcedManagedAgentTypeNotFoundError(typeName)
 		}
+	}
+	// #2054: A REVIEW-ONLY DISPATCH HAS NO FIX TARGET, AND SAYS SO.
+	//
+	// The lead exists so a changes_requested verdict has somewhere to go, which
+	// is why it must be able to implement. But requiring one made a review-only
+	// dispatch impossible: `gitmoot agent review <reviewer>` refuses when the
+	// reviewer cannot implement, and the documented fallback - `agent ask` - has
+	// no --head-sha, so it cannot bind a verdict to a head at all. On
+	// 2026-09-08 that pair sent every seat needing an exact-head review onto
+	// ask, where one dispatch bound to a DIFFERENT pull request's merge commit.
+	//
+	// So the requirement is kept and made STATEABLE rather than removed: with
+	// --no-fix-target the operator declares they own the follow-up, and the
+	// choice is recorded on the job so a later changes_requested is attributable
+	// to a decision instead of looking like a missing lead. An unstated absence
+	// still refuses.
+	if request.NoFixTarget {
+		if strings.TrimSpace(request.LeadAgent) != "" {
+			return localAgentDispatchRequest{}, errors.New("--no-fix-target and --lead are mutually exclusive: one declares there is no implementer for a changes_requested verdict, the other names it")
+		}
+		request.LeadAgent = ""
+		return request, nil
 	}
 	leadName := strings.TrimSpace(request.LeadAgent)
 	if leadName == "" {

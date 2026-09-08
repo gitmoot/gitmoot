@@ -853,9 +853,28 @@ how it states provenance. The recorded-head arm reads an append-only store fact
 rather than git, so a legitimate prior head still passes after a force push has
 left it unreachable. A citation whose relationship cannot be established at all,
 because the dispatching checkout resolves neither commit, also dispatches: that
-is a fact about the checkout rather than about the citation. The pre-existing
-`prompt_head_warning` job event is unchanged and still records every non-head
-citation, including the ones that are allowed.
+is a fact about the checkout rather than about the citation. `prompt_head_warning` is no longer
+emitted for a review at all, and that is the consequence of the classification
+above rather than a separate decision: the scan skips a token it cannot resolve,
+and every relation it CAN report is either refused here or stated deliberately,
+so a warning about one taught its reader to ignore the event. Ask and implement
+keep the warning, because no refusal runs in front of them and it is their only
+head check.
+
+`--head-sha` must be the FULL 40 hex characters for a review. An abbreviated
+value used to dispatch and then be cancelled by the daemon's staleness check,
+which compared it against the pull request's full head and reported the same
+commit as a move; it is now refused at dispatch, before the read-only worktree
+and the job row. The refusal fires only on a sha-shaped value, so a placeholder
+that is not a sha still reaches the review-loop and reviewer-identity refusals
+that name it better.
+
+`--no-fix-target` dispatches a REVIEW-ONLY review: the reviewer need not be able
+to implement and no `--lead` is required. The lead exists so a
+`changes_requested` verdict has an implementer to route to, so declining one is
+a decision, and it is recorded as a `review_no_fix_target` job event stating
+that the dispatching operator owns the follow-up. An UNSTATED absence still
+refuses, and `--no-fix-target` with `--lead` is refused as mutually exclusive.
 
 This exact `(repo, PR, head_sha, decision)` evidence key is intentional: the
 #1419 review panel rejected round counters and other instruments, so this guard

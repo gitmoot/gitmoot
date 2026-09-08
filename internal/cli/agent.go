@@ -92,7 +92,7 @@ func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime codex|claude|kimi|omp --repo owner/repo [--path .] [--template <template-id>] [--model model] [--effort effort] [--start-daemon]")
 	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--lead implementer] [--head-sha sha] [--base ref] [--branch branch] [--background] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
-	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--lead implementer] [--head-sha sha] [--branch branch] [--background] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--allow-prompt-head-mismatch] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--lead implementer] [--head-sha sha] [--branch branch] [--background] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--allow-prompt-head-mismatch] [--no-fix-target] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--base ref] [--head-sha sha] [--branch branch] [--background] [--type type] [--action implement] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
 	printAgentRuntimeOverrideHelp(w)
 	fmt.Fprintln(w, "  gitmoot agent type list|show|set ...")
@@ -393,6 +393,7 @@ type agentRunOptions struct {
 	message                 string
 	skipNativeReviewFanout  bool
 	allowPromptHeadMismatch bool
+	noFixTarget             bool
 	recipe                  string
 }
 
@@ -625,6 +626,7 @@ func localAgentDispatchRequestFromOptions(options agentRunOptions, action, reaso
 		LeadAgent:               options.lead,
 		SkipNativeReviewFanout:  options.skipNativeReviewFanout,
 		AllowPromptHeadMismatch: options.allowPromptHeadMismatch,
+		NoFixTarget:             options.noFixTarget,
 		Recipe:                  options.recipe,
 		SelectedAction:          action,
 		SelectedActionReason:    reason,
@@ -672,6 +674,9 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			options.jsonOutput = true
 		case arg == "--skip-native-review-fanout":
 			options.skipNativeReviewFanout = true
+		case arg == "--no-fix-target":
+			options.noFixTarget = true
+			index++
 		case arg == "--allow-prompt-head-mismatch":
 			options.allowPromptHeadMismatch = true
 		case arg == "--draft" || arg == "--ready":

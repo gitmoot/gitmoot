@@ -610,6 +610,69 @@ func TestDispatchReviewAcceptsFullHeadSHA(t *testing.T) {
 	}
 }
 
+// TestDispatchReviewOnlyNeedsNoImplementCapableLead is #2054 defect 2.
+//
+// `agent review <reviewer>` refused when the reviewer could not implement,
+// because a changes_requested verdict needs somewhere to go. The documented
+// fallback, `agent ask`, has no --head-sha and cannot bind a verdict to a head
+// at all - so on 2026-09-08 that pair sent every seat needing an exact-head
+// review onto ask, and one dispatch bound to a DIFFERENT pull request's merge
+// commit.
+//
+// The requirement is kept and made stateable: --no-fix-target declares the
+// operator owns the follow-up. An UNSTATED absence must still refuse, which
+// TestDispatchReviewWithoutLeadRejectsReviewOnlyAgentBeforeEnqueue pins.
+func TestDispatchReviewOnlyNeedsNoImplementCapableLead(t *testing.T) {
+	ctx := context.Background()
+	checkout, _, _, head, _ := promptHeadBindingCheckout(t)
+	store, home := blockerE2EHome(t)
+	seedReviewDispatchFixture(t, store, checkout)
+
+	request := reviewDispatchRequest(home, head)
+	// The reviewer cannot implement, and no lead is named: exactly the dispatch
+	// that refused all day and pushed every seat onto `agent ask`.
+	request.LeadAgent = ""
+	request.NoFixTarget = true
+
+	out, err := dispatchLocalAgentJob(ctx, store, request)
+	if err != nil {
+		t.Fatalf("a review-only dispatch was refused: %v", err)
+	}
+	// The decision must be ON THE RECORD, not inferable from an empty lead: a
+	// changes_requested verdict here has nowhere to route BY DESIGN.
+	events, err := store.ListJobEvents(ctx, out.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Kind == "review_no_fix_target" {
+			return
+		}
+	}
+	t.Fatalf("no review_no_fix_target event: %+v", events)
+}
+
+// --no-fix-target and --lead answer the same question in opposite directions, so
+// accepting both would leave which one wins undefined.
+func TestDispatchReviewOnlyRejectsAnExplicitLead(t *testing.T) {
+	fixture := reviewLeadRefusalStore(t)
+	store := fixture.store
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "lead", runtime.ShellRuntime, "true", []string{"implement", "review"}, "owner/repo", runtime.AutonomyPolicyDangerFullAccess)
+	adapter := installReviewLeadTestAdapter(t, "")
+
+	_, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
+		RepoFlag: "owner/repo", Agent: "reviewer", Action: "review", PullRequest: 7, LeadAgent: "lead",
+		HeadSHA: fixture.head, Branch: "feature/review", Home: fixture.home, NoFixTarget: true,
+	})
+	// This refusal must precede the capacity and worktree work, like the other
+	// lead refusals, which is why it stays on the refusal fixture.
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("dispatch error = %v, want a mutual-exclusion refusal", err)
+	}
+	assertReviewLeadHardRefusal(t, store, fixture.checkout, adapter)
+}
+
 // Kills a missing-existence-check mutant and a mutant that silently falls back
 // to the reviewer when an explicit lead does not exist.
 func TestDispatchReviewRejectsUnknownLeadBeforeEnqueue(t *testing.T) {
