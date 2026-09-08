@@ -473,7 +473,7 @@ func TestWithStoreInstallsReviewBlockingSeverity(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		fact, err := store.SubscribeAwaitedFact(ctx, db.AwaitedFactSubscription{
+		fact, _, err := store.SubscribeAwaitedFact(ctx, db.AwaitedFactSubscription{
 			WaiterRole: "lane", SubjectKind: db.AwaitedFactSubjectReviewVerdict,
 			SubjectKey: key, Deadline: time.Now().UTC().Add(time.Hour),
 		})
