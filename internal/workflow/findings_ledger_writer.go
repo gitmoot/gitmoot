@@ -471,6 +471,23 @@ func (e Engine) ReviewObligationBrief(ctx context.Context, repo string, pullRequ
 // severity, and the reviewer's own bytes - and it says what to do about it. The
 // raw JSON is bounded because a finding can carry a large evidence blob and a
 // job event is not a place to store one.
+// ledgerContentKeys names every JSON key this reader will take finding text
+// from, in the order firstNonEmptyLedgerText consults them.
+//
+// WHY THE REFUSAL HAS TO SAY THIS (#2072). Four producers have now emitted four
+// spellings - uid/disposition (#2059), bare prose (#2072), an inline [P1]
+// (#2057), and description/location (#2069 f1) - and each was repaired by
+// teaching the reader one more spelling. That does not converge: the set of key
+// names a competent reviewer might choose is not closed. The refusal is the one
+// place the producer is already listening, so it is where the accepted set
+// belongs. A reviewer whose text was dropped can now see why in the same event
+// that reports the drop, instead of the next reader being written for them.
+var ledgerContentKeys = []string{"title", "summary", "detail", "body", "rationale"}
+
+func ledgerContentKeyList() string {
+	return strings.Join(ledgerContentKeys, ", ")
+}
+
 func (e Engine) recordLedgerContentRefusal(ctx context.Context, jobID string, index int, severity string, raw json.RawMessage) {
 	if e.Store == nil {
 		return
@@ -489,9 +506,9 @@ func (e Engine) recordLedgerContentRefusal(ctx context.Context, jobID string, in
 		Message: fmt.Sprintf(
 			"finding[%d] at claimed severity %s was REFUSED, not recorded: it carries no title, detail or rationale, "+
 				"so it names no defect that can be evaluated or discharged. The verdict's own severity still blocks the "+
-				"merge, so nothing is unblocked by this refusal. Restate the concern with a title and a detail. "+
-				"Reviewer's finding verbatim: %s",
-			index, claimed, quoted),
+				"merge, so nothing is unblocked by this refusal. Restate the concern using one of the keys this "+
+				"reader accepts for finding text: %s. Reviewer's finding verbatim: %s",
+			index, claimed, ledgerContentKeyList(), quoted),
 	})
 }
 
