@@ -1969,6 +1969,25 @@ removed role as its exact address, leaving delivery failure observable instead
 of making the wait immortal. Fact wakes are delivery only: they require a `fact`
 event rule but create no acknowledgment or completion ceremony.
 
+`gitmoot org interrupts [--window 24h|7d|0] [--json] [--home <dir>]` reports
+**how often each seat is interrupted** (#1983). Per seat, over the window:
+wakes, wakes per day, median gap, share of gaps under five minutes, a breakdown
+by source (`workflow_note`, `escalation`, `blocked`, `awaited_fact`), delivered
+versus unproven, wakes **collapsed** by coalescing, pending wakes with **no
+enabled route** and the oldest such timestamp, and completion nags recorded
+against the seat's directives. `--window` takes a Go duration, `<n>d`, or
+`0`/`all`; default `7d`.
+
+A collapsed row counts as an interrupt that did NOT happen, never as a wake, so
+the coalescing saving is readable here rather than by hand-written SQL. A
+`pending` row whose kind and role have no enabled rule is an obligation waiting
+on configuration rather than on a tick.
+
+A pending row whose kind and role have no enabled rule additionally records a
+`wake_unroutable` job event once per row, naming role, kind, source and whether
+the route was removed (a retired seat) or never configured (a gap a route would
+close), so `NO ROUTE` here has a durable, queryable counterpart.
+
 Event-rule wakes are separately opt-in:
 
 ```sh
@@ -2046,7 +2065,12 @@ literal pane id. The daemon calls `herdr agent prompt <pane> <text> --wait --tim
 8000` and treats delivered (`result.type = "agent_prompted"`, or a post-delivery
 `error.code = "timeout"`) apart from stalled (`error.code =
 "agent_prompt_stalled"`). Stalls increment the role's consecutive missed-wake
-counter and delivery resets it; transport failures leave it unchanged.
+counter and delivery resets it; transport failures leave it unchanged. A stall
+and an `agent_blocked` pane are **transient**: the claimed rows return to
+`pending` with the cause recorded and are re-delivered as one coalesced wake,
+bounded at three attempts. Any other cause, and an exhausted budget, end the
+rows terminally and record a `wake_delivery_failed` job event on
+`wake-outbox:<id>` naming the role, cause and attempts.
 `attention`, `guard`, `job-terminal`, `review-verdict`, `recycle-overdue`, and
 `pane_input_pending` wakes remain best-effort. With no rule rows this path is
 off. Task episodes due in one evaluator pass produce one oldest-first digest

@@ -26,6 +26,38 @@ const (
 
 const (
 	WakeOutboxDeliveryUnknownEventKind = "wake_delivery_unknown"
+	// WakeOutboxDeliveryFailedEventKind records a wake that will NOT be retried
+	// again: either its cause is not transient or its attempt budget is spent
+	// (#1982). It exists so an undelivered obligation is attributable from the
+	// store, naming role, cause and attempts, rather than only from a daemon
+	// log line nobody reads.
+	WakeOutboxDeliveryFailedEventKind = "wake_delivery_failed"
+
+	// WakeOutboxUnroutableEventKind records a wake addressed to a role that
+	// CANNOT RECEIVE IT, because no enabled event rule exists for that role and
+	// kind. Such a row is not wrong and is not retried: it waits, correctly, for
+	// a rule that may never come. What was missing is that it waited SILENTLY,
+	// so 49 awaited-fact obligations sat pending from 2026-08-02 and ten
+	// escalations addressed to a retired coordinator dead-ended unobserved.
+	//
+	// Owner decision of 2026-09-08, relayed by phobos, chose making the
+	// dead-end LOUD over rerouting it: rerouting would rebuild the coordinator
+	// layer that was just retired. This event is the loudness, and it wakes
+	// nobody.
+	WakeOutboxUnroutableEventKind = "wake_unroutable"
+	// WakeOutboxUnroutableRouteRemoved marks a role whose route once existed and
+	// was deleted after the row was created: a RETIRED seat, which is usually
+	// correct and needs no remedy.
+	WakeOutboxUnroutableRouteRemoved = "route_removed"
+	// WakeOutboxUnroutableNeverConfigured marks a role with no recorded route
+	// history for this kind at all: the 2026-08-02 gap, where the remedy is a
+	// route. The two are separated because the remedy differs.
+	//
+	// LIMIT OF THE DISTINCTION, stated because it is not visible from the
+	// record: it rests on the event_rule_deletions tombstones, and that table
+	// has no rows before 2026-08-30. A role retired before then reads as
+	// never-configured.
+	WakeOutboxUnroutableNeverConfigured = "never_configured"
 
 	WakeOutboxKindReply      = "reply"
 	WakeOutboxKindBlocked    = "blocked"
@@ -468,12 +500,34 @@ ORDER BY attempted_at, id`,
 
 	stamp := at.UTC().Format(BlockedEpisodeTimeLayout)
 	const detail = "delivery outcome unknown after attempted wake aged out; not retried"
+	// A CLAIMED BATCH IS ONE WAKE, AND THIS SWEEP IS THE SIBLING SEAM THAT DID
+	// NOT KNOW IT. #1982 moved the coalescing collapse from claim time to
+	// outcome time, which left a whole batch `attempted` until its outcome; this
+	// function is the other writer of a terminal state, so a crashed batch aged
+	// out as N independent `delivery_unknown` rows. One undelivered wake then
+	// counted as N unproven obligations and the record that they were a single
+	// wake was lost.
+	//
+	// The surviving row takes the unknown outcome, because the wake was its own,
+	// and the rows it collapsed are superseded into it: the same accounting a
+	// delivered or failed batch already uses. Rows are ordered by attempted_at
+	// then id, so the first row of each claim group is its survivor.
+	seenSurvivor := map[string]int64{}
 	for _, entry := range entries {
+		group := strings.ToLower(strings.TrimSpace(entry.TargetRole)) + "\x00" +
+			entry.CoalesceKey + "\x00" + entry.AttemptedAt
+		state, rowDetail := WakeOutboxStateDeliveryUnknown, detail
+		survivor, collapsed := seenSurvivor[group]
+		if collapsed {
+			state, rowDetail = WakeOutboxStateSuperseded, WakeOutboxCoalescedDetail(survivor)
+		} else {
+			seenSurvivor[group] = entry.ID
+		}
 		result, err := tx.ExecContext(ctx, `
 UPDATE wake_outbox
 SET state = ?, last_error = ?, finished_at = ?, updated_at = ?
 WHERE id = ? AND state = 'attempted' AND attempted_at <= ?`,
-			WakeOutboxStateDeliveryUnknown, detail, stamp, stamp, entry.ID,
+			state, rowDetail, stamp, stamp, entry.ID,
 			attemptedBefore.UTC().Format(BlockedEpisodeTimeLayout))
 		if err != nil {
 			return nil, err
@@ -484,6 +538,12 @@ WHERE id = ? AND state = 'attempted' AND attempted_at <= ?`,
 		}
 		if affected != 1 {
 			return nil, fmt.Errorf("expire wake outbox row %d updated %d rows, want 1", entry.ID, affected)
+		}
+		if collapsed {
+			// The audit event belongs to the obligation, not to every row it
+			// carried: N events for one undelivered wake is the same
+			// over-counting in the job-event stream.
+			continue
 		}
 		message := fmt.Sprintf(
 			"source=%s:%s target_role=%s attempted_at=%s policy=expire_without_retry",
@@ -508,20 +568,14 @@ WHERE id = ? AND state = 'attempted' AND attempted_at <= ?`,
 // longer pending, none are claimed; this is the cross-daemon mark-before-emit
 // dedup guard.
 //
-// THE BATCH LEAVES THIS CALL AS ONE OBLIGATION, NOT AS N (#1978). `surviving`
-// is the row the emitted wake identifies, and it alone stays `attempted` so
-// that the delivery outcome recorded against it is a real observation. Every
-// `coalesced` row is recorded `superseded`, naming the survivor, because the
-// wake that carries it is the survivor's. Marking them `delivered` instead,
-// which is what happened before this change, reported N deliveries for one
-// delivered wake: 8,806 live rows carried only 250 `superseded` rows and all
-// 250 of those came from directive receipts rather than from coalescing.
-//
-// Superseding here rather than after delivery costs nothing recoverable: every
-// terminal state is terminal, so no wake outbox row is ever re-emitted, and a
-// batch whose delivery then fails records ONE failed obligation, which is the
-// truth. The suppressed rows remain readable and each names the row that
-// carried it.
+// THE BATCH LEAVES THIS CALL AS ONE OBLIGATION, NOT AS N (#1978), but the
+// collapse is recorded at DELIVERY time, not here (#1982). I originally
+// superseded the coalesced rows inside this claim and argued it cost nothing
+// because every terminal state was terminal and no row was ever re-emitted.
+// Retry made that argument false: a stalled batch is now re-attempted, and a
+// row already marked `superseded` could not rejoin the retry, so the notes it
+// carried would vanish from the next wake. The rows therefore stay `attempted`
+// together and FinishWakeOutbox decides their fate from the observed outcome.
 func (s *Store) ClaimWakeOutbox(ctx context.Context, surviving int64, coalesced []int64, at time.Time) (bool, error) {
 	ids := make([]int64, 0, len(coalesced)+1)
 	ids = append(ids, surviving)
@@ -550,48 +604,142 @@ WHERE state = 'pending' AND id IN (`, ids, at)
 	if affected != int64(len(ids)) {
 		return false, tx.Rollback()
 	}
-	if len(coalesced) > 0 {
-		supersede, supersedeArgs, err := wakeOutboxIDUpdate(`
-UPDATE wake_outbox
-SET state = 'superseded', last_error = ?, finished_at = ?, updated_at = ?
-WHERE state = 'attempted' AND id IN (`, coalesced, at, WakeOutboxCoalescedDetail(surviving))
-		if err != nil {
-			return false, err
-		}
-		supersedeResult, err := tx.ExecContext(ctx, supersede, supersedeArgs...)
-		if err != nil {
-			return false, err
-		}
-		supersededRows, err := supersedeResult.RowsAffected()
-		if err != nil {
-			return false, err
-		}
-		if supersededRows != int64(len(coalesced)) {
-			return false, fmt.Errorf(
-				"supersede coalesced wake outbox updated %d rows, want %d", supersededRows, len(coalesced),
-			)
-		}
-	}
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
+// FinishOrRetryWakeOutbox records a NON-delivered outcome for one attempted
+// batch (#1982). While `retryBudget` attempts remain and the cause is one the
+// caller judged transient, the batch returns to `pending` with its cause
+// recorded; otherwise it becomes terminal in `state` and the failure is
+// written as a durable, attributable job event naming the target role, the
+// cause and the attempts spent.
+//
+// The decision reads attempt_count inside the same transaction as the write,
+// so two daemons cannot both see budget remaining and re-pend the same batch.
+func (s *Store) FinishOrRetryWakeOutbox(
+	ctx context.Context,
+	ids []int64,
+	state, cause string,
+	retryBudget int,
+	at time.Time,
+) (retried bool, attempts int, err error) {
+	interpretation, ok := interpretWakeOutboxState(state)
+	if !ok || interpretation != wakeOutboxStateTerminal {
+		return false, 0, fmt.Errorf("invalid terminal wake outbox state %q", state)
+	}
+	if len(ids) == 0 {
+		return false, 0, errors.New("wake outbox outcome requires at least one id")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var role string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT attempt_count, target_role FROM wake_outbox WHERE id = ?`, ids[0],
+	).Scan(&attempts, &role); err != nil {
+		return false, 0, err
+	}
+	if attempts < retryBudget {
+		query, args, err := wakeOutboxIDUpdateStamps(`
+UPDATE wake_outbox
+SET state = 'pending', last_error = ?, attempted_at = NULL, finished_at = NULL,
+	updated_at = ?
+WHERE state = 'attempted' AND id IN (`, ids, at, 1, strings.TrimSpace(cause))
+		if err != nil {
+			return false, attempts, err
+		}
+		if err := execWakeOutboxRowUpdate(ctx, tx, query, args, len(ids), "requeue"); err != nil {
+			return false, attempts, err
+		}
+		if err := tx.Commit(); err != nil {
+			return false, attempts, err
+		}
+		return true, attempts, nil
+	}
+	query, args, err := wakeOutboxIDUpdate(`
+UPDATE wake_outbox
+SET state = ?, last_error = ?, finished_at = ?, updated_at = ?
+WHERE state = 'attempted' AND id IN (`, ids, at, state, strings.TrimSpace(cause))
+	if err != nil {
+		return false, attempts, err
+	}
+	if err := execWakeOutboxRowUpdate(ctx, tx, query, args, len(ids), "finish"); err != nil {
+		return false, attempts, err
+	}
+	message := fmt.Sprintf(
+		"wake delivery failed for %s: %s (attempts=%d, state=%s)",
+		role, strings.TrimSpace(cause), attempts, state,
+	)
+	for _, id := range ids {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`,
+			fmt.Sprintf("wake-outbox:%d", id),
+			WakeOutboxDeliveryFailedEventKind,
+			message,
+		); err != nil {
+			return false, attempts, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, attempts, err
+	}
+	return false, attempts, nil
+}
+
+func execWakeOutboxRowUpdate(ctx context.Context, tx *sql.Tx, query string, args []any, want int, op string) error {
+	result, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != int64(want) {
+		return fmt.Errorf("%s wake outbox updated %d rows, want %d", op, affected, want)
+	}
+	return nil
+}
+
 // WakeOutboxCoalescedDetail is the audit text a suppressed wake carries. It
 // names the row that delivered on its behalf, so the saving is countable:
 // `SELECT count(*) FROM wake_outbox WHERE last_error LIKE 'coalesced into%'`.
 func WakeOutboxCoalescedDetail(surviving int64) string {
-	return "coalesced into wake outbox row " + strconv.FormatInt(surviving, 10)
+	return wakeOutboxCoalescedPrefix + strconv.FormatInt(surviving, 10)
 }
 
-// FinishWakeOutbox records the existing event-rule delivery classification for
-// every row in one attempted batch.
+// wakeOutboxCoalescedPrefix is the stable prefix a report matches on to count
+// suppressed wakes without re-deriving the sentence (#1983).
+const wakeOutboxCoalescedPrefix = "coalesced into wake outbox row "
+
+// FinishWakeOutbox records the observed delivery outcome for one attempted
+// batch. ids[0] is the SURVIVING row, the one the emitted wake identifies.
+//
+// On a DELIVERED outcome the survivor is delivered and every row it collapsed
+// is recorded `superseded` naming it, so one delivered wake reports exactly
+// one delivery and the coalescing saving stays countable (#1978). On any other
+// terminal outcome the whole batch carries that outcome, because nothing was
+// delivered on anyone's behalf (#1982).
 func (s *Store) FinishWakeOutbox(ctx context.Context, ids []int64, state, detail string, at time.Time) error {
 	interpretation, ok := interpretWakeOutboxState(state)
 	if !ok || interpretation != wakeOutboxStateTerminal {
 		return fmt.Errorf("invalid terminal wake outbox state %q", state)
 	}
+	if state == WakeOutboxStateDelivered && len(ids) > 1 {
+		if err := s.finishWakeOutboxRows(ctx, ids[1:], WakeOutboxStateSuperseded, WakeOutboxCoalescedDetail(ids[0]), at); err != nil {
+			return err
+		}
+		return s.finishWakeOutboxRows(ctx, ids[:1], state, detail, at)
+	}
+	return s.finishWakeOutboxRows(ctx, ids, state, detail, at)
+}
+
+func (s *Store) finishWakeOutboxRows(ctx context.Context, ids []int64, state, detail string, at time.Time) error {
 	query, args, err := wakeOutboxIDUpdate(`
 UPDATE wake_outbox
 SET state = ?, last_error = ?, finished_at = ?, updated_at = ?
@@ -647,9 +795,24 @@ func wakeOutboxObligationPredicate(attemptedBefore time.Time) (string, []any) {
 	return strings.Join(clauses, " OR "), args
 }
 
+// wakeOutboxIDUpdate builds an `id IN (...)` update whose SET clause takes the
+// `leading` values followed by exactly TWO timestamp placeholders.
 func wakeOutboxIDUpdate(prefix string, ids []int64, at time.Time, leading ...string) (string, []any, error) {
+	return wakeOutboxIDUpdateStamps(prefix, ids, at, 2, leading...)
+}
+
+// wakeOutboxIDUpdateStamps is the same builder with an EXPLICIT number of
+// timestamp placeholders. The count is a parameter because it silently has to
+// match the statement: a SET clause with one stamp and a builder supplying two
+// shifts the id arguments by one, so `id IN (?)` binds a timestamp, the update
+// matches zero rows, and the caller reports "updated 0 rows" for a row that is
+// sitting in exactly the state it asked for (#1982, found by that symptom).
+func wakeOutboxIDUpdateStamps(prefix string, ids []int64, at time.Time, stamps int, leading ...string) (string, []any, error) {
 	if len(ids) == 0 {
 		return "", nil, errors.New("wake outbox update requires at least one id")
+	}
+	if stamps < 0 {
+		return "", nil, fmt.Errorf("invalid wake outbox stamp count %d", stamps)
 	}
 	seen := make(map[int64]struct{}, len(ids))
 	for _, id := range ids {
@@ -662,11 +825,13 @@ func wakeOutboxIDUpdate(prefix string, ids []int64, at time.Time, leading ...str
 		seen[id] = struct{}{}
 	}
 	stamp := at.UTC().Format(BlockedEpisodeTimeLayout)
-	args := make([]any, 0, len(leading)+2+len(ids))
+	args := make([]any, 0, len(leading)+stamps+len(ids))
 	for _, value := range leading {
 		args = append(args, value)
 	}
-	args = append(args, stamp, stamp)
+	for range stamps {
+		args = append(args, stamp)
+	}
 	placeholders := make([]string, 0, len(ids))
 	for _, id := range ids {
 		placeholders = append(placeholders, "?")

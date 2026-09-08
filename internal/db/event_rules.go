@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -165,6 +166,28 @@ func (s *Store) ListEventRules(ctx context.Context) ([]EventRule, error) {
 		rules = append(rules, rule)
 	}
 	return rules, rows.Err()
+}
+
+// EarliestEventRuleDeletion returns the oldest recorded route deletion, or an
+// empty string when none is recorded.
+//
+// It exists so a report can state the LIMIT OF ITS OWN CATEGORISATION rather
+// than implying route history it does not have. Anything that classifies an
+// unroutable wake as "retired" versus "never configured" reads these
+// tombstones, so a role retired before the oldest one reads as
+// never-configured. On this fleet that boundary is 2026-08-30, which
+// miscategorises every role retired in the month before it.
+func (s *Store) EarliestEventRuleDeletion(ctx context.Context) (string, error) {
+	var earliest sql.NullString
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT MIN(deleted_at) FROM event_rule_deletions`,
+	).Scan(&earliest); err != nil {
+		return "", err
+	}
+	if !earliest.Valid {
+		return "", nil
+	}
+	return strings.TrimSpace(earliest.String), nil
 }
 
 // ListDeletedEventRulesForRoutes returns enabled tombstones for the exact

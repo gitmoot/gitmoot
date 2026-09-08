@@ -9,6 +9,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
@@ -510,6 +511,38 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	//
 	// It is additive and fails open: a review with no PR, no head, or no prior
 	// obligations at that head gets a byte-identical prompt.
+	// ORDERING IS LOAD-BEARING AND NOTHING ELSE IN THE TREE RECORDS IT.
+	//
+	// This append MUST stay AFTER dispatchPromptHeadContradictionWarnings above.
+	// #1819 (PR #1991) scans the prompt for commit-shaped tokens that contradict
+	// the dispatch head; promptCommitTokenRE matches 7 to 64 hex characters. This
+	// brief can INJECT such a token: LedgerObligationsAtHead renders
+	// shortHead(obs.HeadSHA) into its reason strings (findings_ledger.go), which
+	// is a 12-character prefix of a PRIOR head, and a finding's own title
+	// routinely cites a commit too.
+	//
+	// The two changes landed within an hour of each other, by different authors,
+	// in the same function, with no textual conflict, so git merged them and CI
+	// never validated the integrated tree. The order that resulted is the safe
+	// one, but it was correct by accident.
+	//
+	// REVERSED, THE COST DEPENDS ON WHOSE HEAD THE BRIEF CITES, and the second
+	// case is much worse than the first. #1819's author confirmed both arms
+	// against origin/main:
+	//
+	//   - A head recorded for THIS pull request, the common case for a re-armed
+	//     finding: the classifier's recorded-head arm allows it, so the result is
+	//     a FALSE "prompt references commit X, but the dispatch head is Y"
+	//     warning against a head no operator wrote. Noisy and misleading.
+	//   - A head belonging to ANOTHER pull request, which happens when a finding
+	//     is re-armed across PRs: that is the FOREIGN arm, and it REFUSES THE
+	//     DISPATCH non-zero, before the job row exists. Every review carrying
+	//     such a brief would fail to dispatch at all.
+	//
+	// "False warning" undersells it, which is why both are named here: a reader
+	// weighing whether this order matters would otherwise weigh the wrong cost.
+	//
+	// TestReviewBriefDoesNotTripTheHeadContradictionScan is the guard.
 	if request.Action == "review" && request.PullRequest > 0 && strings.TrimSpace(request.HeadSHA) != "" {
 		briefEngine := workflow.Engine{
 			Store:           store,
@@ -1916,9 +1949,30 @@ func ensureLocalAgentAccess(ctx context.Context, store *db.Store, agent db.Agent
 	return nil
 }
 
+// localAgentJobID mints a dispatch id for a locally dispatched job.
+//
+// THE TIME COMPONENT IS NOT SUFFICIENT ON ITS OWN (#1559). Two dispatches for
+// the same agent and action can read the same UnixNano - clock resolution is not
+// guaranteed to be a nanosecond, and the observed collision came from four
+// reviews claimed inside one second under [parallel_sessions] - and the insert
+// then fails with SQLITE_CONSTRAINT_PRIMARYKEY, so the job is silently not
+// written while the caller holds an id it believes exists.
+//
+// A PER-PROCESS COUNTER, NOT RANDOMNESS. It makes a same-instant collision
+// UNREACHABLE within a process rather than merely unlikely, and ids stay sortable
+// by their time component, which several operator queries rely on. Randomness
+// would only have made the collision rarer, which is the failure mode this
+// campaign keeps finding: a defect made invisible instead of impossible.
+//
+// Cross-process collision remains possible in principle and is bounded by the
+// same nanosecond clock; it is not addressed here, and the insert now names the
+// id it failed to write so such a case is diagnosable in one step.
 func localAgentJobID(action string, agent string) string {
-	return fmt.Sprintf("local-%s-%s-%x", action, agent, time.Now().UTC().UnixNano())
+	return fmt.Sprintf("local-%s-%s-%x-%x", action, agent, time.Now().UTC().UnixNano(), localAgentJobSequence.Add(1))
 }
+
+// localAgentJobSequence is monotonic for the life of the process.
+var localAgentJobSequence atomic.Uint64
 
 // dispatchReadOnlyWorktreeEligible reports whether a dispatch should allocate a
 // dedicated detached committed-tip worktree for read-only isolation (#739). It is

@@ -1689,6 +1689,29 @@ removed role as its exact address, leaving delivery failure observable instead
 of making the wait immortal. Fact wakes are delivery only: they require a `fact`
 event rule but create no acknowledgment or completion ceremony.
 
+`gitmoot org interrupts [--window 24h|7d|0] [--json] [--home <dir>]` reports
+**how often each seat is interrupted**, which is the variable that best
+predicted completed work in the transport campaign (#1983). Per seat, over the
+window: wakes, wakes per day, median gap between wakes, the share of gaps under
+five minutes, a breakdown by source (`workflow_note`, `escalation`, `blocked`,
+`awaited_fact`), delivered versus unproven, wakes **collapsed** by coalescing,
+pending wakes with **no enabled route**, and completion nags recorded against
+the seat's directives. `--window` accepts a Go duration, a `<n>d` day count, or
+`0`/`all` for every recorded wake; it defaults to `7d`. `--json` emits the same
+report, including per-kind routeless totals.
+
+Two properties make it a regression check rather than a dashboard. A collapsed
+row is counted as an interrupt that did **not** happen, never as a wake, so the
+coalescing saving is readable directly. And a `pending` row whose kind and role
+have no enabled rule is reported as `NO ROUTE` with its oldest timestamp, which
+is how a fleet discovers obligations that are waiting on configuration rather
+than on a tick.
+
+A pending row whose kind and role have no enabled rule additionally records a
+`wake_unroutable` job event once per row, naming role, kind, source and whether
+the route was removed (a retired seat) or never configured (a gap a route would
+close), so `NO ROUTE` here has a durable, queryable counterpart.
+
 Event-rule wakes are separately opt-in:
 
 ```sh
@@ -1763,7 +1786,12 @@ Pass only one of `--match` and `--repo`. The wake role must exist and set
 `pane = "<herdr-pane>"`; Gitmoot resolves that value as an exact pane label first
 and otherwise treats it as a literal pane id.
 Delivery is verified with Herdr's `agent_prompted` versus
-`agent_prompt_stalled` result. `attention`, `guard`, `job-terminal`,
+`agent_prompt_stalled` result. A stall, and an `agent_blocked` pane, are
+**transient**: the claimed rows return to `pending` with the cause recorded and
+are re-delivered as one coalesced wake, bounded at three attempts. Anything
+else, and an exhausted budget, ends the rows terminally and records a
+`wake_delivery_failed` job event on `wake-outbox:<id>` naming the role, cause
+and attempts. `attention`, `guard`, `job-terminal`,
 `review-verdict`, `recycle-overdue`, and `pane_input_pending` wakes remain
 best-effort; zero rules leaves the feature off.
 

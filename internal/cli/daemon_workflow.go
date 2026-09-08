@@ -365,20 +365,56 @@ func implementationFinalizationTargetForRunner(ctx context.Context, store *db.St
 		))
 	}
 	git := jobGitClient(worktreePath, runner)
+	// THE REMEDY IS BUILT ONCE FOR BOTH CHECKOUT-IDENTITY REFUSALS (#1525).
+	//
+	// PR #1521 established the invariant the hard way: a refusal's printed remedy
+	// must be able to CLEAR the refusal it prints. Three defects on that one PR
+	// were variants of violating it. These two refusals - detached HEAD and wrong
+	// branch - were the last of six that ended with no recovery path at all, and
+	// a rule applied to four of six is not yet a rule.
+	//
+	// A CHECKOUT, NOT A RESET. The stale/divergent refusal further down prints
+	// `fetch` plus `reset --hard`, which is right there because the worktree is
+	// behind. Printing it here would be wrong twice over: this refusal fires in
+	// the AFTER-RUN phase too, where a hard reset destroys the work the model just
+	// produced, and the condition is a wrong REF rather than wrong CONTENT. The
+	// dirty-worktree refusal above already returned for an unclean tree, so by
+	// here the checkout is clean and a checkout cannot lose anything.
+	//
+	// WITHOUT A DISPATCH HEAD THERE IS NO REMEDY TO PRINT, AND MY FIRST VERSION
+	// PRINTED ONE ANYWAY. It said `git checkout <branch>`, which fails outright
+	// when the branch does not exist locally - the acceptance test executed it and
+	// it exited 1, which is exactly the defect class #1525 is about, committed
+	// inside #1525's own fix. The tempting repair, `checkout -B <branch> HEAD`,
+	// is worse than useless: it would rebrand whatever commit is sitting there as
+	// the expected branch and clear the refusal by defeating the guard. So the
+	// honest form is the second option the issue allows, the one the
+	// missing-dispatch-head refusal below already uses: say that no verifiable
+	// in-place recovery exists and name the re-dispatch.
+	checkoutRemedy := fmt.Sprintf(
+		"the dispatch head is unknown, so no in-place checkout can be verified; dispatch a new implement job for task %s against the branch's current head",
+		task.ID,
+	)
+	if head := strings.TrimSpace(payload.HeadSHA); head != "" {
+		// With a dispatch head the remedy is exact: it creates or moves the branch
+		// to the commit this job was dispatched against, which is what the head
+		// check further down will then demand.
+		checkoutRemedy = fmt.Sprintf("run `git -C %q checkout -B %s %s` before retrying", worktreePath, branchName, head)
+	}
 	currentBranch, err := git.CurrentBranch(ctx)
 	if err != nil {
 		if phase == implementationFinalizationAfterRun {
 			return implementationFinalizationTarget{}, fmt.Errorf("resolve implementation branch: %w", err)
 		}
 		return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
-			"implementation task %s worktree %q has no usable current branch (%v); expected branch %s; refusing to run or deliver from an unverifiable checkout",
-			task.ID, worktreePath, err, branchName,
+			"implementation task %s worktree %q has no usable current branch (%v); expected branch %s; refusing to run or deliver from an unverifiable checkout; %s",
+			task.ID, worktreePath, err, branchName, checkoutRemedy,
 		))
 	}
 	if currentBranch != branchName {
 		return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
-			"implementation task %s worktree %q is on branch %s, not %s; refusing to run or deliver from the wrong checkout",
-			task.ID, worktreePath, currentBranch, branchName,
+			"implementation task %s worktree %q is on branch %s, not %s; refusing to run or deliver from the wrong checkout; %s",
+			task.ID, worktreePath, currentBranch, branchName, checkoutRemedy,
 		))
 	}
 	if phase == implementationFinalizationBeforeRun {

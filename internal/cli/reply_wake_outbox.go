@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -80,6 +81,9 @@ type wakeOutboxStore interface {
 	ExpireAgedWakeOutbox(ctx context.Context, attemptedBefore time.Time, now time.Time) ([]db.WakeOutboxEntry, error)
 	ClaimWakeOutbox(ctx context.Context, surviving int64, coalesced []int64, now time.Time) (bool, error)
 	ListDeletedEventRulesForRoutes(ctx context.Context, routes []db.EventRuleRoute) ([]db.DeletedEventRule, error)
+	// AddJobEventIfAbsent records the unroutable-wake condition at most once per
+	// row, keyed on (job_id, kind) by the store (owner decision 2026-09-08).
+	AddJobEventIfAbsent(ctx context.Context, event db.JobEvent) error
 }
 
 // drainReplyWakeOutboxWithHealth is a store-global daemon operation. It
@@ -191,16 +195,18 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 				ids = append(ids, entry.ID)
 			}
 			// The oldest row SURVIVES as the delivered obligation: it is the one
-			// wakeOutboxEvent identifies as `oldest id`. The rest are recorded
-			// superseded into it rather than each reporting an independent
-			// delivery they never had (#1978).
+			// wakeOutboxEvent identifies as `oldest id`, and ids[0] is that row.
+			// The WHOLE batch travels to the outcome (#1982): a delivered wake
+			// supersedes the rest into the survivor, while a retryable failure
+			// returns them all to pending so the next attempt re-coalesces every
+			// note instead of losing the ones a survivor carried.
 			claimed, err := store.ClaimWakeOutbox(ctx, ids[0], ids[1:], now)
 			if err != nil {
 				return replyWakeOutboxHealth{}, err
 			}
 			if claimed {
 				mutated = true
-				event.WakeOutboxIDs = ids[:1]
+				event.WakeOutboxIDs = ids
 				if err := emitReplyWakeOutboxEvent(ctx, delivery.sink, event, matchingRules); err != nil {
 					return replyWakeOutboxHealth{}, fmt.Errorf("emit claimed %s wake: %w", event.WakeKind, err)
 				}
@@ -261,8 +267,11 @@ func classifyWakeOutboxObligations(
 		return replyWakeOutboxHealth{}, fmt.Errorf("classify wake outbox obligations: %w", err)
 	}
 	type unmatchedWakeObligation struct {
-		event     events.Event
-		createdAt time.Time
+		id         int64
+		sourceKind string
+		sourceID   string
+		event      events.Event
+		createdAt  time.Time
 	}
 	unmatched := make([]unmatchedWakeObligation, 0, len(obligations.Pending))
 	routes := make([]db.EventRuleRoute, 0, len(obligations.Pending))
@@ -291,7 +300,10 @@ func classifyWakeOutboxObligations(
 		if err != nil {
 			return replyWakeOutboxHealth{}, fmt.Errorf("parse wake outbox created_at for row %d: %w", obligation.ID, err)
 		}
-		unmatched = append(unmatched, unmatchedWakeObligation{event: event, createdAt: createdAt})
+		unmatched = append(unmatched, unmatchedWakeObligation{
+			id: obligation.ID, sourceKind: obligation.SourceKind, sourceID: obligation.SourceID,
+			event: event, createdAt: createdAt,
+		})
 		key := wakeRuleRouteKey(event.WakeTargetRole, event.WakeKind)
 		if _, ok := seenRoutes[key]; !ok {
 			seenRoutes[key] = struct{}{}
@@ -308,16 +320,72 @@ func classifyWakeOutboxObligations(
 	}
 	for _, obligation := range unmatched {
 		deletions := deletedRulesAt[wakeRuleRouteKey(obligation.event.WakeTargetRole, obligation.event.WakeKind)]
+		condition := db.WakeOutboxUnroutableNeverConfigured
 		if matchesDeletedWakeRule(deletions, obligation.event, obligation.createdAt) {
+			condition = db.WakeOutboxUnroutableRouteRemoved
 			health.routeRemoved++
-			continue
+		} else {
+			health.inert++
 		}
-		health.inert++
+		recordUnroutableWake(ctx, store, obligation.id, obligation.sourceKind, obligation.sourceID, obligation.event, condition)
 	}
 	if health.pending == 0 && health.routeRemoved == 0 && health.agedAttempted == 0 {
 		return health, nil
 	}
 	return health, fmt.Errorf("wake outbox has outstanding obligations: %s", health)
+}
+
+// recordUnroutableWake makes a dead-ended wake visible in ONE query instead of
+// silently queued (owner decision 2026-09-08, relayed by phobos).
+//
+// It records nothing new about the row's fate: an unroutable row stays pending
+// and is deliberately NOT failed, because a wake nobody can receive is not a
+// wake that is wrong, and a rule added later can still deliver it. What changes
+// is that the condition is attributable: role, kind, source and WHICH condition
+// it is, since a retired seat needs no remedy while a never-configured one
+// needs a route.
+//
+// ONCE PER WAKE, NOT PER TICK. AddJobEventIfAbsent keys on (job_id, kind), and
+// the drain re-classifies every tick, so an unconditional append would add a
+// row per unroutable obligation per tick forever: the mechanism that grew
+// job_events past a million rows.
+//
+// BEST EFFORT. An audit write that fails must not change the drain's verdict,
+// so the failure is logged and the classification stands.
+func recordUnroutableWake(
+	ctx context.Context,
+	store wakeOutboxStore,
+	rowID int64,
+	sourceKind, sourceID string,
+	event events.Event,
+	condition string,
+) {
+	if store == nil || rowID <= 0 {
+		return
+	}
+	source := strings.TrimSpace(sourceKind)
+	// A blocked, escalation or fact source id is a serialized event payload, so
+	// only a workflow-note id is worth rendering into an operator-facing record.
+	if source == db.WakeOutboxSourceWorkflowNote {
+		source += ":" + strings.TrimSpace(sourceID)
+	}
+	message := fmt.Sprintf(
+		"role=%s kind=%s source=%s condition=%s",
+		strings.TrimSpace(event.WakeTargetRole),
+		strings.TrimSpace(event.WakeKind),
+		source,
+		condition,
+	)
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), db.DurableWriteBudget)
+	defer cancel()
+	if err := store.AddJobEventIfAbsent(writeCtx, db.JobEvent{
+		JobID:   fmt.Sprintf("wake-outbox:%d", rowID),
+		Kind:    db.WakeOutboxUnroutableEventKind,
+		Message: message,
+	}); err != nil {
+		slog.Warn("unroutable wake record failed",
+			"wake_outbox_row", rowID, "role", event.WakeTargetRole, "kind", event.WakeKind, "error", err)
+	}
 }
 
 type deletedWakeRule struct {

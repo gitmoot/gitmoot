@@ -242,6 +242,33 @@ A quiet burst tail is flushed by a later daemon tick; it does not require
 another event. If the outbox or its delivery rules cannot be queried, or an
 outbox row cannot be parsed or claimed, the drain is logged as unhealthy and
 retried on a later tick without aborting unrelated repository work.
+A TRANSIENT delivery failure is retried against the same coalesced rows rather
+than dropped: `agent_prompt_stalled` (the pane did not take the prompt) and
+`agent_blocked` (an interactive dialog holds the pane) return the whole claimed
+batch to `pending` with the cause recorded, keeping the attempt count, so the
+next due tick re-coalesces every note into one wake. Delivery is bounded at
+three attempts. When the budget is spent, or when the cause is not transient
+(an unresolved pane binding, `agent_not_found`, a Herdr outage, or an
+unexplained non-delivery), the batch becomes terminal AND a
+`wake_delivery_failed` job event is recorded on `wake-outbox:<id>` naming the
+target role, the cause and the attempts spent, so an undelivered obligation is
+attributable from the store rather than only from a daemon log line.
+A wake addressed to a role that CANNOT receive it, because no enabled rule
+exists for that role and kind, records a `wake_unroutable` job event on
+`wake-outbox:<id>` naming the role, the kind, the source and WHICH condition it
+is: `condition=route_removed` when a durable tombstone shows the route was
+deleted after the row existed, which is a retired seat and usually needs no
+remedy, or `condition=never_configured` when no route history exists for that
+role and kind at all, which is the case a route would fix. The record is written
+at most once per row rather than once per tick, because the drain re-classifies
+every tick and a per-tick append is what grows `job_events` without bound. The
+row itself is NOT failed and NOT retried: a wake nobody can receive is not a
+wake that is wrong, and a rule added later still delivers it. The distinction
+rests on the deletion tombstones, so a role retired before that table existed
+reads as never-configured.
+`delivery_unknown` remains terminal and is still never retried: a row aged out
+of `attempted` may in fact have been delivered before its outcome write was
+lost, so re-emitting it would risk a duplicate interrupt to prove a negative.
 The wake role's config sets `pane = "<pane-id-or-label>"`: a `wX:pY` value must
 name a currently live pane, while any other value is a unique pane label
 resolved to the current id at wake time (so a recycled pane is still reached).

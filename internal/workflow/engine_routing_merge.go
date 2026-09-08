@@ -1020,6 +1020,7 @@ func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string,
 		Reviewer:                reviewer,
 		ReviewOptional:          !reviewRequired,
 		ReviewBlockingSeverity:  e.reviewBlockingSeverity(payload.Repo),
+		FindingsAdvisory:        e.findingsAdvisory(payload.Repo),
 		ExpectedTaskState:       expectedTaskState,
 		HumanMergeRequested:     humanMergeRequested,
 	})

@@ -282,6 +282,13 @@ type Engine struct {
 	// ReviewBlockingSeverity resolves the least severe review finding that may
 	// restart the fix loop for a repository. Nil preserves block-all behavior.
 	ReviewBlockingSeverity func(repo string) string
+	// FindingsAdvisory resolves the repository's #1969 findings-consumption
+	// declaration. nil, or false, means the repository is undeclared or
+	// consuming and unobserved obligations keep holding the merge. It mirrors
+	// ReviewBlockingSeverity's shape deliberately: one resolver per repository
+	// policy, installed by the same wiring, so the two cannot be configured
+	// through different paths and disagree.
+	FindingsAdvisory func(repo string) bool
 	// RiskTiersEnabled gates the opt-in risk-tiered adaptive review (#650). When
 	// false (the default), HandlePullRequestOpened NEVER classifies a PR and runs
 	// the single-review fan-out byte-identically. When true, a PR opened event is

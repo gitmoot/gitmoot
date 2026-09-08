@@ -79,6 +79,14 @@ func (m Mailbox) recordRoutingTelemetry(ctx context.Context, job db.Job, agent r
 		DurationMS:     durationMS,
 		InputTokens:    inTok,
 		OutputTokens:   outTok,
+		// #1972: mark the announcement so a verdict-rate query can exclude it.
+		// ResultIsFanOut is the SAME predicate the merge gate uses to keep a
+		// coordinator's dispatch record out of its verdict population, so the
+		// telemetry and the gate now agree about what counts as an answer. The
+		// alternative was leaving every consumer to re-derive it from the payload,
+		// which is exactly the step that produced #1972's 81%-to-17% artifact from
+		// 70 coordinator announcements.
+		FanOut: ResultIsFanOut(&result),
 	})
 }
 

@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -41,11 +43,90 @@ type eventWakeClient interface {
 // eventRuleSink decorates the existing outbound sink. Durable event families
 // persist their obligations before Emit returns; remaining rule work is detached
 // and timeout-bounded so delivery failures cannot fail the emitting job.
+//
+// DETACHED IS NOT UNOWNED (#1938). The detached work reads event rules from the
+// SAME store the emitting command owns, and a one-shot CLI closes that store as
+// soon as its command function returns. Nothing used to join those goroutines,
+// so `gitmoot job record` closed the store underneath an outstanding
+// ListEventRules: the row committed, the command printed success and exited 0,
+// and the only trace was `org event rules list failed ... sql: database is
+// closed` - on a SUCCESS path. The wake that read was supposed to decide never
+// happened either, so a subscribed role waited forever in front of a green
+// command. pending lets a command wait for its own rule work before releasing
+// the store; the daemon, whose store outlives every emit, simply never waits.
 type eventRuleSink struct {
 	inner events.Sink
 	store *db.Store
 	home  string
 	wake  eventWakeClient
+
+	// pending counts detached rule goroutines spawned by Emit. It is NOT a
+	// substitute for the goroutines' own timeouts: each herdr call stays bounded,
+	// and waitForPendingRuleWork bounds the join itself, so a hung wake delays a
+	// command by at most that bound rather than pinning it to herdr's liveness.
+	pending sync.WaitGroup
+
+	// progress counts rules whose wake attempt has finished. The join watches it
+	// instead of trusting a single wall-clock budget, because evaluateRules
+	// processes matching rules SERIALLY and each one may spend its own probe plus
+	// prompt: a bound sized for one sequence expires mid-config the moment a
+	// second observer rule matches (#1942 review, P2). Watching progress makes the
+	// join scale with the work actually outstanding rather than with a guess about
+	// how much work a supported config contains.
+	progress atomic.Uint64
+
+	// released records that the store owner has stopped waiting and is about to
+	// close the store. Rule work checks it before every store access, so residual
+	// work reports "abandoned" instead of reaching a closed handle - the failure
+	// mode this whole change exists to remove, one layer out.
+	released atomic.Bool
+}
+
+// waitForPendingRuleWork blocks until every detached rule goroutine spawned by
+// Emit has returned, and reports whether that happened before it gave up.
+//
+// It is a PROGRESS watchdog, not a total budget. perRuleBound sizes ONE rule's
+// worst case - herdr probe plus one prompt plus the bounded counter write - and
+// the wait extends for as long as rules keep completing. A supported multi-rule
+// config therefore finishes with the store still open, while genuinely wedged
+// work is abandoned after one idle bound instead of holding a one-shot command
+// open for as many multiples of that bound as someone happened to configure.
+//
+// Giving up MARKS THE STORE RELEASED before returning. Cancelling the work would
+// not be enough on its own: an in-flight iteration can already be past its
+// cancellation check and about to touch the store, which would convert the
+// closed-store warning into a cancelled-context one rather than removing it. The
+// flag is what makes residual work stop asking the store anything at all.
+func (s *eventRuleSink) waitForPendingRuleWork(perRuleBound time.Duration) bool {
+	if s == nil {
+		return true
+	}
+	done := make(chan struct{})
+	go func() {
+		s.pending.Wait()
+		close(done)
+	}()
+	for {
+		before := s.progress.Load()
+		select {
+		case <-done:
+			return true
+		case <-time.After(perRuleBound):
+			if s.progress.Load() != before {
+				// A rule completed inside the window, so the work is advancing and
+				// the store is still needed. Extend rather than abandon it.
+				continue
+			}
+			s.released.Store(true)
+			return false
+		}
+	}
+}
+
+// storeReleased reports whether the store owner has stopped waiting. Rule work
+// must consult it immediately before any store access on the detached path.
+func (s *eventRuleSink) storeReleased() bool {
+	return s != nil && s.released.Load()
 }
 
 func (s *eventRuleSink) Emit(ctx context.Context, event events.Event) {
@@ -110,7 +191,9 @@ func (s *eventRuleSink) Emit(ctx context.Context, event events.Event) {
 			return
 		}
 		base := context.WithoutCancel(ctx)
+		s.pending.Add(1)
 		go func() {
+			defer s.pending.Done()
 			if err := s.evaluateSafely(base, event, remainingRules); err != nil {
 				slog.Warn("org event wake failed", "job_id", event.JobID, "error", err)
 			}
@@ -124,7 +207,9 @@ func (s *eventRuleSink) Emit(ctx context.Context, event events.Event) {
 	// wake) with NO deadline of its own: each herdr call below bounds itself, so a
 	// slow earlier rule cannot starve a later rule's wake.
 	base := context.WithoutCancel(ctx)
+	s.pending.Add(1)
 	go func() {
+		defer s.pending.Done()
 		if err := s.evaluateSafely(base, event, nil); err != nil {
 			slog.Warn("org event wake failed", "job_id", event.JobID, "error", err)
 		}
@@ -231,6 +316,14 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 	replyHandled := false
 	addressedReplyHandled := false
 	for _, rule := range rules {
+		// #1942 review P2: rules are processed SERIALLY, each spending its own
+		// probe/prompt budget, so a command that has stopped waiting can release the
+		// store while later rules are still to come. Stop before touching it rather
+		// than discovering it closed inside a counter write.
+		if s.storeReleased() {
+			slog.Warn("org event wake abandoned", "job_id", event.JobID, "reason", "store released before this rule was evaluated")
+			return nil
+		}
 		if !rule.Enabled || !containsEventRuleKind(kinds, rule.OnKind) || !eventRuleMatches(rule.MatchFilter, event) || !eventRuleMatchesAddressee(rule, event) {
 			continue
 		}
@@ -282,14 +375,31 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 				slog.Warn("org event wake counter increment failed", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "error", incrementErr)
 			}
 			ccancel()
-			slog.Info("org event wake stalled", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "delivered", false)
-			if err := s.finishWakeOutbox(ctx, event, db.WakeOutboxStateStalled, "agent_prompt_stalled"); err != nil {
+			// #1982: a stall is herdr reporting that the pane did not take the
+			// prompt, which is transient by construction, so it earns another
+			// attempt against the same coalesced rows rather than dropping the
+			// obligation. Every one of the 674 undelivered rows measured on the
+			// live store had attempt_count = 1.
+			if err := s.retryOrFailWakeOutbox(
+				ctx, event, rule.WakeRole, db.WakeOutboxStateStalled, "agent_prompt_stalled", wakeDeliveryMaxAttempts,
+			); err != nil {
 				return err
 			}
 		case err != nil:
 			// A Herdr outage is infrastructure failure, not a role ignoring a wake;
 			// it must not falsely increment every role's missed-wake counter.
 			slog.Warn("org event wake failed", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "error", err)
+			// A pane blocked by an open dialog is the other transient cause: it
+			// clears when the dialog is answered, and 60 of the 108 failed rows
+			// on the live store carry `agent_blocked`.
+			if wakeFailureIsTransient(err) {
+				if retryErr := s.retryOrFailWakeOutbox(
+					ctx, event, rule.WakeRole, db.WakeOutboxStateFailed, err.Error(), wakeDeliveryMaxAttempts,
+				); retryErr != nil {
+					return errors.Join(err, retryErr)
+				}
+				continue
+			}
 			return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, err.Error(), err)
 		default:
 			// An odd non-delivery is not proof that the role ignored a delivered
@@ -297,6 +407,10 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 			slog.Info("org event wake not delivered", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "delivered", false)
 			return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, "agent prompt was not delivered", errors.New("agent prompt was not delivered"))
 		}
+		// One rule's wake attempt is finished. The join watches this counter, so
+		// recording it here is what lets a multi-rule config extend the wait
+		// instead of being abandoned on a bound sized for a single rule.
+		s.progress.Add(1)
 		// A coalesced reply batch still gives its addressed target one attempt per
 		// window. Observer rules are independent copies and do not consume that
 		// target attempt.
@@ -450,6 +564,62 @@ func (s *eventRuleSink) finishWakeOutbox(ctx context.Context, event events.Event
 		slog.Warn("wake outbox state update failed", "job_id", event.JobID, "state", state, "error", err)
 		return fmt.Errorf("finish wake outbox as %s: %w", state, err)
 	}
+	return nil
+}
+
+// wakeDeliveryMaxAttempts bounds re-delivery of a transient failure (#1982).
+// Three attempts across daemon ticks span roughly seven minutes at the
+// observed 143-second median tick gap, which covers a dialog being answered
+// or a pane settling, without turning an unread pane into a permanent
+// retry source.
+const wakeDeliveryMaxAttempts = 3
+
+// wakeFailureIsTransient reports whether a herdr delivery error names a
+// condition that CLEARS ON ITS OWN. Only `agent_blocked` qualifies: the pane
+// exists and holds an interactive dialog, so the same prompt can land once the
+// dialog is answered.
+//
+// Everything else stays terminal on purpose. `agent_not_found` and an
+// unresolved pane binding are configuration, not weather, and retrying them
+// only spends the budget. `agent_prompt_unsubmitted` is deliberately excluded
+// even though it looks transient: the prompt text may already be sitting in
+// the composer, so a re-attempt risks delivering it twice.
+func wakeFailureIsTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "agent_blocked")
+}
+
+// retryOrFailWakeOutbox records a non-delivered outcome for the claimed batch,
+// re-pending it while its budget remains. A row with no outbox ids is an
+// ordinary (non-durable) event and keeps its existing best-effort behaviour.
+func (s *eventRuleSink) retryOrFailWakeOutbox(
+	ctx context.Context,
+	event events.Event,
+	role, state, cause string,
+	budget int,
+) error {
+	if s == nil || s.store == nil || len(event.WakeOutboxIDs) == 0 {
+		return nil
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), db.DurableWriteBudget)
+	defer cancel()
+	retried, attempts, err := s.store.FinishOrRetryWakeOutbox(
+		writeCtx, event.WakeOutboxIDs, state, cause, budget, time.Now().UTC(),
+	)
+	if err != nil {
+		slog.Warn("wake outbox outcome update failed",
+			"job_id", event.JobID, "role", role, "state", state, "error", err)
+		return fmt.Errorf("record wake outbox outcome %s: %w", state, err)
+	}
+	if retried {
+		slog.Info("org event wake retryable",
+			"job_id", event.JobID, "role", role, "cause", cause, "attempts", attempts)
+		return nil
+	}
+	slog.Warn("org event wake undelivered",
+		"job_id", event.JobID, "role", role, "cause", cause, "attempts", attempts, "state", state)
 	return nil
 }
 

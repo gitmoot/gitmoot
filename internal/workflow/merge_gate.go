@@ -260,7 +260,17 @@ type workflowAwareGitHub interface {
 // pins the gate's *db.Store surface as a firewall, and an audit note is not
 // worth widening it.
 func (g PolicyMergeGate) ledgerScope(request MergeRequest) LedgerScope {
-	return g.LedgerResolvers.ScopeFor(request.Repo, request.PullRequest, request.TaskID)
+	scope := g.LedgerResolvers.ScopeFor(request.Repo, request.PullRequest, request.TaskID)
+	// #1969: the declaration travels as DATA on the scope, and the LEDGER does
+	// the writing, because the gate's *db.Store surface is a deliberate firewall
+	// pinned by TestMergeGateStoreAccessSurface. My first version called
+	// AddTaskEvent from the gate and that test caught it: the allowlist exists so
+	// display-plane evidence cannot decide merges, and adding a write to it
+	// casually is how that erodes. The scope already carries TaskID and Degraded
+	// for exactly this reason.
+	scope.FindingsAdvisory = request.FindingsAdvisory
+	scope.Repo = request.Repo
+	return scope
 }
 
 func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (MergeDecision, error) {
@@ -902,6 +912,17 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	// or failing resolver DEGRADES with a recorded note rather than either
 	// pretending or blocking.
 	if err := EnsureLedgerObligationsObserved(ctx, g.Store, request.Repo, int64(request.PullRequest), headSHA, g.ledgerScope(request)); err != nil {
+		// #1969: an ADVISORY repository records its findings and does not merge
+		// on them. The refusal is not discarded, it is DEMOTED to a recorded
+		// note, because "advisory" has to mean stated rather than silent - the
+		// whole issue was 211 findings nobody consumed and nothing surfacing it.
+		//
+		// This is the ONLY relaxation, and it is opt-in per repository: an
+		// undeclared repository keeps refusing. The gate is live, not
+		// theoretical - it refused 16 times across 5 repositories on this box,
+		// including one pull request wedged on 37 prior findings all still open,
+		// which is the guard-rejects-valid-input shape the ledger's own header
+		// predicts when the write half runs without the read half.
 		return err
 	}
 	// Supersession is resolved BEFORE any state or verdict scan, and it covers a
