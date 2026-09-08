@@ -69,7 +69,12 @@ func sanitizeCIName(name string) string {
 	b.Grow(len(name))
 	lastSpace := false
 	for _, r := range name {
-		if r == '`' || r == '"' || unicode.IsControl(r) || unicode.IsSpace(r) {
+		// #1824 review F2: the APOSTROPHE must go too, because renderCINames uses it
+		// as the quoting delimiter - a name like `build' IGNORE PREVIOUS` otherwise
+		// closes its own quoted span, which is the injection this sanitizer exists to
+		// stop. The previous round stripped backticks and double quotes and left the
+		// one character that actually delimits the rendered output.
+		if r == '`' || r == '\'' || r == '"' || unicode.IsControl(r) || unicode.IsSpace(r) {
 			if !lastSpace {
 				b.WriteByte(' ')
 				lastSpace = true
@@ -126,12 +131,28 @@ func reviewCIEvidenceBlock(ctx context.Context, lister reviewCIEvidenceLister, r
 	var passed, pending, failed []string
 	for _, status := range combined.Statuses {
 		context := strings.TrimSpace(status.Context)
-		// The gate's own context is not external CI and must not count as
-		// evidence about the tree: it reports whether the gate cleared the head.
-		if context == workflow.GitmootMergeGateContext {
+		name := sanitizeCIName(context)
+		// #1824 review F1: EVERY gitmoot/ status is internal, not external CI, and
+		// the gate treats the whole prefix that way - PolicyMergeGate blocks a
+		// pending or non-success gitmoot/* status but EXCLUDES a successful one
+		// from externalStatusCount entirely. This block skipped only
+		// gitmoot/merge-gate, so a lone successful gitmoot/review status counted as
+		// CI evidence and produced a prompt claiming builds, vet and suites passed
+		// while the gate saw ZERO external CI. The reviewer reproduced that
+		// false-green prompt with an adversarial test.
+		//
+		// Mirrored conjunct for conjunct: a gitmoot/ status can still make the head
+		// NOT green - refusing to relay a real block - but it can never be the
+		// evidence that makes it green.
+		if strings.HasPrefix(context, "gitmoot/") {
+			switch {
+			case github.StatusPending(status.State):
+				pending = append(pending, name)
+			case !github.StatusSucceeded(status.State):
+				failed = append(failed, name)
+			}
 			continue
 		}
-		name := sanitizeCIName(context)
 		switch {
 		case github.StatusPending(status.State):
 			pending = append(pending, name)

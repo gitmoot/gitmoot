@@ -2006,9 +2006,17 @@ func StatusPending(state string) bool {
 	}
 }
 
-// StatusSucceeded reports whether a legacy commit status is a success. The gate
-// compares against "success" exactly, so this does too rather than inventing a
-// wider notion of acceptable.
+// StatusSucceeded reports whether a legacy commit status is a success.
+//
+// #1824 review F3: this claimed to compare exactly as the gate does and then
+// lowercased and trimmed, so a noncanonical "SUCCESS" or " success" read as
+// green here while PolicyMergeGate.evaluateStatuses - which compares
+// `item.State != "success"` on the raw value - blocks it. The comment described
+// the intent and the code did something wider, which is the same defect class
+// as F2 in the round before this one.
+//
+// It is now the byte-exact comparison the gate makes. If the gate ever
+// normalises, both move together because both read this function.
 func StatusSucceeded(state string) bool {
-	return strings.ToLower(strings.TrimSpace(state)) == "success"
+	return state == "success"
 }
