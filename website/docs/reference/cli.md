@@ -855,13 +855,20 @@ left it unreachable. A citation whose relationship cannot be established at all,
 because the dispatching checkout resolves neither commit, also dispatches: that
 is a fact about the checkout rather than about the citation.
 
-`prompt_head_warning` IS still emitted for a review, and for exactly ONE
-relation: a RECORDED PRIOR HEAD THAT IS NOT AN ANCESTOR. An unresolvable citation
-is silent, and the reason is one layer up rather than in the filter: the scan
-discards any token `rev-parse` cannot resolve, so no warning about it ever
-reaches the filter to be retained. Ancestry is checked BEFORE the recorded-head
-arm, so a commit that is both a prior head and an ancestor is silent - which is
-the ordinary scoped re-review, citing its own previous head.
+`prompt_head_warning` IS still emitted for a review, for two relations rather
+than one. The normal-path relation is a RECORDED PRIOR HEAD THAT IS NOT AN
+ANCESTOR. The second is a citation whose ancestry the classifier could not
+establish: `promptCitationAncestry` returns `known=false` when `IsAncestor`
+errors, and that lands on `promptCommitUnresolved`, which the filter also
+retains. That arm is an INSTRUMENT FAILURE rather than a statement about the
+prompt, and it is deliberately reachable - when the classifier cannot judge a
+citation, nobody has judged it.
+
+Two things are silent. A token the scan itself could not resolve never reaches
+the filter at all, because `dispatchPromptHeadContradictionWarnings` discards it
+before any classification. And on the resolvable path ancestry is checked BEFORE
+the recorded-head arm, so a commit that is both a prior head and an ancestor is
+silent - the ordinary scoped re-review, citing its own previous head.
 Ancestor provenance is silent, because naming the branch base is how a prompt
 states where the work sits. The prior-head arm is the force-push shape - the
 commit really was a head of this pull request and no longer is - so a prompt
