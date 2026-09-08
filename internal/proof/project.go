@@ -27,14 +27,19 @@ type PRReceipt struct {
 }
 
 type payloadProjection struct {
-	Repo               string                      `json:"repo"`
-	PullRequest        int                         `json:"pull_request"`
-	HeadSHA            string                      `json:"head_sha"`
-	WorkflowID         string                      `json:"workflow_id"`
-	RuntimeOverride    string                      `json:"runtime_override"`
-	RuntimeOverrideRef string                      `json:"runtime_override_ref"`
-	Result             *workflow.AgentResult       `json:"result"`
-	ResultObservation  *workflow.ResultObservation `json:"result_observation"`
+	Repo               string `json:"repo"`
+	PullRequest        int    `json:"pull_request"`
+	HeadSHA            string `json:"head_sha"`
+	WorkflowID         string `json:"workflow_id"`
+	RuntimeOverride    string `json:"runtime_override"`
+	RuntimeOverrideRef string `json:"runtime_override_ref"`
+	// ActingOrgRole is the role an externally driven session job records IN PLACE
+	// OF an agent. internal/proof previously had zero references to it and read
+	// bare job.Agent, so a role-authored review rendered its author as "-" and its
+	// independence stayed unknown rather than being computed (#2008).
+	ActingOrgRole     string                      `json:"acting_org_role"`
+	Result            *workflow.AgentResult       `json:"result"`
+	ResultObservation *workflow.ResultObservation `json:"result_observation"`
 }
 
 type projector struct {
@@ -149,8 +154,15 @@ func (p *projector) buildSession(jobID string) string {
 	defer delete(p.visiting, jobID)
 
 	projection, payloadParseable := parsePayloadWithStatus(job.Payload)
+	// Resolved by the same rule as the review node below, and NOT left bare, for
+	// consistency WITHIN one manifest: the review node reports its implementer as
+	// a resolved identity, so leaving this one on the raw column would render the
+	// same job's author two different ways in the same document. Measured on this
+	// box: 11 rows carry a role with no agent (10 implement, 1 ask), which is the
+	// implementer side of exactly that comparison (#2008).
+	authorName, _ := workflow.ReviewerIdentity(job.Agent, projection.ActingOrgRole)
 	attrs := map[string]string{
-		"agent": job.Agent, "job_type": job.Type, "state": job.State,
+		"agent": authorName, "job_type": job.Type, "state": job.State,
 		"input_tokens":  strconv.Itoa(job.InputTokens),
 		"output_tokens": strconv.Itoa(job.OutputTokens),
 		"as_of":         job.UpdatedAt,
@@ -245,8 +257,9 @@ func (p *projector) factNodes(job db.Job, projection payloadProjection, result *
 	}
 
 	if job.Type == "review" {
+		reviewerName, _ := workflow.ReviewerIdentity(job.Agent, projection.ActingOrgRole)
 		attrs := map[string]string{
-			"job_id": job.ID, "agent": job.Agent, "as_of": job.UpdatedAt,
+			"job_id": job.ID, "agent": reviewerName, "as_of": job.UpdatedAt,
 			"reviewed_ref": emptyDash(p.reviewedRef(job, headSHA)),
 		}
 		claims := []Claim{}
@@ -257,12 +270,17 @@ func (p *projector) factNodes(job db.Job, projection payloadProjection, result *
 				claims = append(claims, reportedClaim("review.decision", job, job.UpdatedAt))
 			}
 			implementer, known := p.implementer[job.ID]
-			implementerAgent := strings.TrimSpace(implementer.Agent)
-			reviewerAgent := strings.TrimSpace(job.Agent)
-			comparable := known && implementerAgent != "" && reviewerAgent != ""
-			independent := comparable && implementerAgent != reviewerAgent
+			// BOTH SIDES resolve through the same rule the merge gate uses, because an
+			// independence claim comparing a resolved name against a bare column is
+			// comparing two different things. The gate records a role implementer and
+			// holds it "still subject to the independence check", so reporting that
+			// pair as not comparable was incomplete rather than conservative (#2008).
+			implementerProjection, _ := parsePayloadWithStatus(implementer.Payload)
+			implementerAgent, _ := workflow.ReviewerIdentity(implementer.Agent, implementerProjection.ActingOrgRole)
+			comparable := known && implementerAgent != "" && reviewerName != ""
+			independent := comparable && implementerAgent != reviewerName
 			if known {
-				attrs["implementer_agent"] = implementer.Agent
+				attrs["implementer_agent"] = implementerAgent
 			}
 			if comparable {
 				attrs["independent"] = strconv.FormatBool(independent)

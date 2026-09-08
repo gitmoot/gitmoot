@@ -86,7 +86,13 @@ func FindRepeatedReviewers(ctx context.Context, store *db.Store, repo string, pu
 			if verdict.HeadSHA != headSHA {
 				continue
 			}
-			agent := strings.ToLower(strings.TrimSpace(verdict.Agent))
+			// A session review persists ActingOrgRole IN PLACE OF an agent, so the
+			// bare Agent column indexed it under "" and this check then dropped it.
+			// That made a role's own verdict unmatchable by a requester named for
+			// that same role (#1950 F2, #2008). The verdict carries the role RAW and
+			// the fold stays in one place.
+			name, _ := ReviewerIdentity(verdict.Agent, verdict.ActingOrgRole)
+			agent := strings.ToLower(name)
 			if agent == "" {
 				continue
 			}
@@ -119,9 +125,12 @@ func FindRepeatedReviewers(ctx context.Context, store *db.Store, repo string, pu
 				continue
 			}
 		}
+		// Reported as the RESOLVED identity for the same reason it is indexed as
+		// one: a match whose author renders empty names nobody.
+		evidenceAgent, _ := ReviewerIdentity(evidence.Agent, evidence.ActingOrgRole)
 		match := ReviewLoopMatch{
 			JobID:       evidence.JobID,
-			Agent:       evidence.Agent,
+			Agent:       evidenceAgent,
 			Repo:        repo,
 			PullRequest: pullRequest,
 			HeadSHA:     headSHA,
