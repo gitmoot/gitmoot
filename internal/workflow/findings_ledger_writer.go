@@ -259,15 +259,21 @@ func (e Engine) ledgerObservationWithDeclaredState(job db.Job, payload JobPayloa
 		// only unique content, the path, is already captured in File.
 		Detail: firstNonEmptyLedgerText(
 			strings.TrimSpace(wire.Detail),
-			// `details` is a near-synonym of the canonical key and sits directly
-			// behind it; the other two are whole-finding prose and rank after the
-			// narrower alternates (#2073).
-			strings.TrimSpace(wire.Details),
 			strings.TrimSpace(wire.Body),
-			strings.TrimSpace(wire.Finding),
-			strings.TrimSpace(wire.Message),
 			strings.TrimSpace(wire.Evidence),
 			unstructuredLocatorText(wire.locator()),
+			// #2073 alternates go AFTER the whole pre-existing chain, not beside
+			// their nearest synonym. Ranking `details` next to `detail` reads
+			// better and silently CHANGES already-resolved rows: {body, details}
+			// resolved to body before and would resolve to details after, and
+			// {evidence, message} likewise. Those inputs already produced a
+			// non-empty detail, so re-ranking them is a compatibility change
+			// this PR has no reason to make. Appending makes the new keys reach
+			// only rows that resolved to NOTHING, which is the defect being
+			// fixed (#2077 review F2).
+			strings.TrimSpace(wire.Details),
+			strings.TrimSpace(wire.Finding),
+			strings.TrimSpace(wire.Message),
 		),
 		File: firstNonEmptyLedgerText(
 			strings.TrimSpace(wire.File),
@@ -637,6 +643,19 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 			// reads as "unset, therefore minor", which is the inference #1928
 			// exists to stop. It is named for what it is instead.
 			b.WriteString("    (that row predates the severity requirement and carries none; treat it as unranked and blocking until you observe it)\n")
+		}
+		if strings.TrimSpace(obligation.Title) == "" {
+			// SAME SHAPE AS THE SEVERITY LINE ABOVE, for the same reason. An
+			// obligation printed as "title=" is mandatory and says nothing: the
+			// gate refuses this head until the reviewer observes it, and the
+			// line gives them nothing to observe. The prose exists on the row -
+			// it just arrived under a key that does not populate Title - so it
+			// is printed rather than distilled into an invented title (#2077
+			// review F1). Newlines are collapsed so one obligation stays one
+			// readable unit in the brief.
+			if concern := strings.Join(strings.Fields(obligation.Detail), " "); concern != "" {
+				b.WriteString(fmt.Sprintf("    (that row carries no title; its recorded concern is: %s)\n", concern))
+			}
 		}
 	}
 	return b.String()

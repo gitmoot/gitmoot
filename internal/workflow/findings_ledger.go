@@ -36,6 +36,15 @@ type LedgerObligation struct {
 	RoundLabel string
 	Severity   string
 	Title      string
+	// Detail is carried because the BRIEF is the consumer, not the row. A
+	// finding whose prose arrived under a detail-only key lands with an empty
+	// Title, and an obligation rendered as "title=" is mandatory and unreadable:
+	// the gate refuses the head until it is observed, and the reviewer is told
+	// nothing about what to observe. Measured on this store: 160 of 678 rows
+	// carry no title (#2073, #2077 review F1). Distilling a title from a
+	// paragraph would invent structure the reviewer never sent; carrying the
+	// prose it did send does not.
+	Detail string
 	// Reason is why this finding is mandatory: either it is still open, or it was
 	// answered earlier and the current diff touches one of its relevance keys.
 	Reason string
@@ -254,6 +263,7 @@ func LedgerObligationsAtHead(ctx context.Context, observations []db.ReviewFindin
 			RoundLabel: obs.RoundLabel,
 			Severity:   obs.Severity,
 			Title:      obs.Title,
+			Detail:     obs.Detail,
 			Reason:     reason,
 		})
 	}
