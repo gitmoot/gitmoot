@@ -682,11 +682,32 @@ func (e Engine) reviewRoundsForObservations(ctx context.Context, observations []
 		if err != nil {
 			continue
 		}
-		round := strings.TrimSpace(payload.ReviewRound)
-		if round == "" {
+		// #2066 round four, P1. AN IDENTITY LADDER, because the round is BLANK on
+		// exactly the shape that needed collapsing. Local agent-review
+		// coordinators persist no ReviewRound and delegationRequest passes that
+		// blank value to every review child, so a supported review-panel fan-out
+		// arrives roundless - and my previous fallback then counted its three
+		// children as three rounds, which is the inflation the round before had
+		// asked me to fix. I measured the field as empty and concluded the hazard
+		// was theoretical; empty is precisely when the fallback fires.
+		//
+		//  1. (task, round) when a round exists - the logical identity, scoped by
+		//     task because numbering restarts per task;
+		//  2. otherwise the PARENT job - fan-out siblings share one coordinator,
+		//     which is one dispatch and therefore one round, whether or not
+		//     anything recorded a round string;
+		//  3. otherwise nothing, and the caller counts by job id.
+		//
+		// The parent is a tighter grouping than the delegation ROOT, which can
+		// span several rounds of one tree and would collapse genuine relocations.
+		if round := strings.TrimSpace(payload.ReviewRound); round != "" {
+			rounds[job] = "round\x00" + strings.TrimSpace(payload.TaskID) + "\x00" + round
 			continue
 		}
-		rounds[job] = strings.TrimSpace(payload.TaskID) + "\x00" + round
+		if parent := strings.TrimSpace(payload.ParentJobID); parent != "" {
+			rounds[job] = "parent\x00" + parent
+			continue
+		}
 	}
 	return rounds
 }
@@ -813,8 +834,10 @@ func ledgerRelocationBrief(observations []db.ReviewFindingObservation, roundOf m
 	sort.Strings(files)
 	var b strings.Builder
 	b.WriteString("\n\nDEFECT RELOCATION COUNT ON THIS PR (#1419).\n")
-	b.WriteString("Each line is a file that has carried findings across SEVERAL DISTINCT REVIEW ROUNDS, counted\n")
-	b.WriteString("by observing job. That is not the same as a thorough review: several findings in ONE round is\n")
+	b.WriteString("Each line is a file that has carried findings across SEVERAL DISTINCT REVIEW ROUNDS. A round\n")
+	b.WriteString("is identified by its review round when one is recorded, otherwise by the coordinator that\n")
+	b.WriteString("dispatched it, and only otherwise by the individual reviewing job. That is not the same as a\n")
+	b.WriteString("thorough review: several findings in ONE round is\n")
 	b.WriteString("thoroughness, one finding in each of three rounds is a defect that keeps coming back somewhere\n")
 	b.WriteString("else in the same file. The labels are shown to help you recognise the rounds; they are not what\n")
 	b.WriteString("is counted, because a reviewer restarts numbering at 1 each round.\n")
