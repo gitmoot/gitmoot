@@ -2693,6 +2693,19 @@ func (g PolicyMergeGate) sameRuntimeFamilyAsImplementer(ctx context.Context, rev
 	sort.Strings(names)
 	for _, name := range names {
 		identity := implementers[name]
+		// THE SAME DOMAIN EXCLUSION, ON THE IMPLEMENTER SIDE. A role-attributed
+		// implementer (#1916) is a human session, not a runtime agent, so it has no
+		// family to share and comparing one is the same category error as on the
+		// reviewer side. Keyed on the recorded flag, never on an empty family,
+		// because an unregistered AGENT implementer looks identical and must keep
+		// failing closed.
+		//
+		// A role that implemented and then approved its own work is still refused:
+		// the caller tests implementingAgents[reviewer] by name before reaching
+		// here, and both sides normalize to the same role string.
+		if identity.FromActingRole {
+			continue
+		}
 		family, ok, err := ResolveRuntimeFamily(ctx, g.Store, identity.JobID, name, identity.RecordedRuntime)
 		if err != nil {
 			return false, "", err

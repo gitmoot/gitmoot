@@ -83,3 +83,45 @@ func TestUnregisteredAgentReviewerStillFailsClosed(t *testing.T) {
 		t.Fatalf("block reason = %q, want the unresolvable reviewer named", reason)
 	}
 }
+
+// The implementer side of arm 1, which CI found and my filtered run could not:
+// TestRoleImplementedTaskIsAttributable lives outside every pattern I ran. A
+// role-attributed implementer (#1916) is a human session with no runtime family,
+// so an agent reviewing its work is independent and must not be blocked.
+func TestRoleAttributedImplementerIsOutsideTheFamilyCheck(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedFamilyAgent(t, store, "g7-review", "codex")
+	gate := PolicyMergeGate{Store: store}
+
+	same, reason, err := gate.sameRuntimeFamilyAsImplementer(ctx, "review-job", "g7-review", false, "codex",
+		map[string]implementerIdentity{"gitmoot": {Name: "gitmoot", FromActingRole: true}})
+	if err != nil {
+		t.Fatalf("sameRuntimeFamilyAsImplementer: %v", err)
+	}
+	if same {
+		t.Fatalf("an agent reviewer was blocked against a ROLE implementer: %q; a role has no family to share", reason)
+	}
+}
+
+// And its control: an implementer that is an unregistered AGENT, not a role,
+// produces the identical empty family and must still fail closed. Without this
+// the arm above is satisfied by skipping every unresolvable implementer.
+func TestUnregisteredAgentImplementerStillFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedFamilyAgent(t, store, "g7-review", "codex")
+	gate := PolicyMergeGate{Store: store}
+
+	same, reason, err := gate.sameRuntimeFamilyAsImplementer(ctx, "review-job", "g7-review", false, "codex",
+		map[string]implementerIdentity{"gm-omp-nag": {Name: "gm-omp-nag"}})
+	if err != nil {
+		t.Fatalf("sameRuntimeFamilyAsImplementer: %v", err)
+	}
+	if !same {
+		t.Fatal("an unregistered agent implementer did not fail closed; it is not a role and its family is unknown")
+	}
+	if !strings.Contains(reason, "gm-omp-nag") {
+		t.Fatalf("block reason = %q, want the unresolvable implementer named", reason)
+	}
+}
