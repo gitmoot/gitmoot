@@ -69,6 +69,26 @@ const (
 	// exponential backoff) or a dirty/wrong-head checkout (usually needs a human;
 	// defers with a suggested_action surfaced through the #552 stuck surface).
 	blockerClassCheckoutContention blockerClass = "checkout_contention"
+	// blockerClassRuntimeUnavailable (#1821, #1823) classifies a CAPABILITY
+	// refusal: the runtime the job needs could not be executed at all, because
+	// its binary is absent from the seat's PATH, or resolves to a published
+	// unavailable shim that exits 126, or the sandbox could not resolve the
+	// target.
+	//
+	// It is the ONLY class that does not defer, because it is the only one whose
+	// condition does not clear on its own. The other four wait out a provider
+	// window, an outage or a lock; a missing executable waits for an operator.
+	// Re-dispatching it walks into the same wall: measured over this store's
+	// history, 29 refusal deaths, ZERO recorded blocked, and 25 of the 29 belong
+	// to an agent hit more than once - gm-review-opus eleven times.
+	//
+	// So it terminates the job BLOCKED. Nothing was wrong with the job, which is
+	// why `failed` was the wrong state: `failed` invites the identical
+	// re-dispatch, and eleven of them happened. This is the same judgement as
+	// #1817's dispatch-time refusal (e16875b3), applied at the delivery seam
+	// that #1817 cannot see - a published 126 shim RESOLVES on PATH, so an
+	// absent-binary predicate at dispatch is silent about it.
+	blockerClassRuntimeUnavailable blockerClass = "runtime_unavailable"
 )
 
 // blockerDeferredEventKind is the job_event kind recorded when a failed job is
@@ -80,6 +100,71 @@ const blockerDeferredEventKind = "blocker_deferred"
 // the auto-retry budget is spent; the job stays terminally failed and this event
 // documents why no further auto-retry happened.
 const blockerExhaustedEventKind = "blocker_retries_exhausted"
+
+// blockerBlockedEventKind is recorded when a capability refusal terminates a job
+// BLOCKED instead of failed. A #552 stuck-reason kind, so `job list`/`job show`
+// explain a job an operator has to unblock rather than retry.
+const blockerBlockedEventKind = "blocker_runtime_unavailable"
+
+// runtimeUnavailableSignatures are the renderings a capability refusal actually
+// produces on this host. Measured, not guessed - every one of them appears in
+// this store's job_events:
+//
+//   - "exit status 126" is POSIX "found but not executable", and is what a
+//     published unavailable shim returns by design (#1974).
+//   - "executable file not found in $PATH" is exec.LookPath's wording, which
+//     killed two #1910 review legs.
+//   - "resolve sandbox target" is the sandbox wrapper's own failure when the
+//     target binary cannot be resolved inside the seat.
+//   - "runtime unavailable" is the daemon's staging refusal.
+//
+// The last three close a gap found in review of this change (#2022 P2): a
+// refusal that happens AFTER execLookPath already resolved the target is not
+// an unresolved-target failure and matched none of the first four. The sandbox
+// ends in a bare `syscall.Exec` (internal/sandbox/exec_linux.go), which returns
+// an UNWRAPPED errno, so these are the renderings that reach the delivery seam:
+//
+//   - "exec format error" is ENOEXEC: the target resolved and is not
+//     executable - a truncated or corrupt shim, or a text file where a binary
+//     was expected.
+//   - "apply strict landlock ruleset" and "landlock abi" are the sandbox's own
+//     wrapped refusals to start at all. Deliberately strict with no BestEffort
+//     downgrade, so they are capability facts rather than warnings.
+//
+// TWO RENDERINGS ARE DELIBERATELY REFUSED, and the reason is the same one that
+// excludes a bare "126": "permission denied" (EACCES) and "no such file or
+// directory" (ENOENT) also reach this seam from a genuine capability refusal,
+// and they ALSO reach it from an agent's own file operations, a denied cache
+// directory, a missing repository path. This predicate decides a TERMINAL
+// state, so a signature that is right about the cause only some of the time is
+// worse than a miss: a miss keeps today's behaviour, a false positive blocks
+// work that would have succeeded on retry. Those two cases stay UNCOVERED and
+// TestRuntimeUnavailableRefusesAmbiguousErrnoText pins that, so a later reader
+// closing "the rest of the gap" has to argue with a test rather than a comment.
+//
+// A bare "126" is deliberately NOT a signature: it appears in SHAs, job ids and
+// token counts, and measured store-wide a loose "%126%" match returns 234
+// events against 13 for "exit status 126", an 18x inflation.
+var runtimeUnavailableSignatures = []string{
+	"exit status 126",
+	"executable file not found in $path",
+	"resolve sandbox target",
+	"runtime unavailable",
+	"exec format error",
+	"apply strict landlock ruleset",
+	"landlock abi",
+}
+
+// isRuntimeUnavailableMessage reports whether text names a capability refusal.
+// Case-folded once by the caller.
+func isRuntimeUnavailableMessage(text string) bool {
+	for _, sig := range runtimeUnavailableSignatures {
+		if strings.Contains(text, sig) {
+			return true
+		}
+	}
+	return false
+}
 
 // maxOperationalBlockerRetries hard-bounds automatic re-dispatches per job. It
 // counts classified deferrals over the job's lifetime (persisted in the payload
@@ -188,6 +273,23 @@ func classifyOperationalBlocker(cause error, now time.Time) (blockerClassificati
 		}, true
 	case "auth failing":
 		return blockerClassification{Class: blockerClassRuntimeAuth, RetryAt: now.Add(authBlockerRetryDelay), Detail: detail}, true
+	}
+	// CAPABILITY refusal (#1821): the runtime could not be executed at all.
+	// Checked AFTER auth/quota so a 401/429 keeps its more specific class, and
+	// BEFORE the network arm because neither predicate should be able to claim
+	// the other's text.
+	//
+	// RetryAt is deliberately ZERO. Every other class returns an instant to wait
+	// until; this one has nothing to wait for, and the zero value is what
+	// deferOperationalBlockerPreTerminal reads to route it to a terminal block
+	// instead of a re-queue.
+	if isRuntimeUnavailableMessage(strings.ToLower(text)) {
+		return blockerClassification{
+			Class:  blockerClassRuntimeUnavailable,
+			Detail: detail,
+			SuggestedAction: "the runtime this job needs is not executable in the seat: install or re-stage it, " +
+				"or dispatch to an agent on a runtime that is. Retrying this job unchanged will hit the same wall.",
+		}, true
 	}
 	// Network / GitHub outage that surfaced through the delivery seam: the agent's
 	// own `gh` subprocess printed a transport/DNS/5xx signature to stderr (which
@@ -458,6 +560,31 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 	if !ok {
 		return false, nil
 	}
+	// CAPABILITY REFUSAL (#1821): terminate BLOCKED instead of re-queueing.
+	//
+	// Placed BEFORE the retry guards below on purpose, and the difference is not
+	// cosmetic. Those guards exist to protect an at-least-once RE-RUN: a stored
+	// result, a delegation child owned by the DAG's retry policy, persisted raw
+	// outputs proving side effects. This path re-runs NOTHING, so none of those
+	// hazards apply to it.
+	//
+	// A delegation child in particular MUST reach this branch. A child that
+	// cannot execute its runtime is precisely the staged-review failure #1823
+	// names, and a blocked child lands in the merge gate's parked arm, where
+	// ensureDelegatedReviewEvidence already refuses the parent. That is the
+	// non-fallback clause - strong reviewer unavailable must never degrade to
+	// cheap reviewer approved - enforced by the row's STATE rather than by a
+	// rule anyone has to remember.
+	//
+	// The one guard that does apply is a stored Result: if the agent answered,
+	// this is a product outcome and the runtime plainly executed, whatever the
+	// error text says.
+	if classification.Class == blockerClassRuntimeUnavailable {
+		if payload.Result != nil {
+			return false, nil
+		}
+		return w.blockOnRuntimeUnavailable(ctx, jobID, payload, classification)
+	}
 	// A stored result means the agent answered: decision=failed is a PRODUCT
 	// failure and is never auto-retried. Delegation children keep the DAG's own
 	// retry/failure-policy path (#409 machinery), untouched by this slice.
@@ -518,6 +645,60 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 		// directly, with no preceding failed→deferred flap. Best-effort and nil-safe
 		// when [events] is OFF, mirroring the daemon's other emits.
 		emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, jobID, daemonTerminalDeferred, string(workflow.JobQueued), message)
+	}
+	return transitioned, nil
+}
+
+// blockOnRuntimeUnavailable terminates a RUNNING job BLOCKED because the runtime
+// it needs could not be executed. It is the capability-refusal arm of
+// deferOperationalBlockerPreTerminal and returns the same (tookOwnership, err)
+// contract, so Mailbox.Run skips m.fail and no job.failed is emitted first.
+//
+// It writes the payload BEFORE the transition, in one call, for the reason the
+// deferral path documents: a crash between the two would otherwise leave a
+// blocked job with no recorded reason, which is the silent row this whole slice
+// exists to abolish.
+func (w jobWorker) blockOnRuntimeUnavailable(ctx context.Context, jobID string, payload workflow.JobPayload, classification blockerClassification) (bool, error) {
+	payload.BlockerClass = string(classification.Class)
+	payload.BlockerSuggestedAction = classification.SuggestedAction
+	// No RetryAt and no attempt increment: the OPERATIONAL-BLOCKER actuator will
+	// not re-dispatch this job, and a recorded retry instant would be a promise
+	// this layer does not keep.
+	//
+	// THAT CLAIM IS SCOPED TO THIS LAYER, and review of this change (#2022)
+	// established the boundary rather than letting the comment overstate it: for
+	// a DELEGATION CHILD, requeueDelegation gates purely on the delegation
+	// edge's own d.Retry against the child's RetryCount
+	// (internal/workflow/engine_delegation.go) with zero awareness of blocker
+	// class, and JobBlocked has been a settled state since #632. So a blocked
+	// child on an edge declaring Retry > 0 CAN be re-dispatched by the DAG, into
+	// the same wall, up to that edge's budget.
+	//
+	// Not fixed here, deliberately: teaching requeueDelegation about blocker
+	// class is a change to the delegation engine, not to this classifier, and it
+	// would be the wrong thing to smuggle into a slice whose subject is the
+	// terminal state. What this layer guarantees is that the job is BLOCKED with
+	// a recorded cause and a remedy, which is what makes the DAG's retry visible
+	// as a repeat rather than a first attempt.
+	payload.BlockerRetryAt = ""
+	payload.BlockerPreDelivery = false
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return false, err
+	}
+	message := fmt.Sprintf("%s: %s (no automatic retry; the condition does not clear on its own): %s",
+		classification.Class, classification.SuggestedAction, classification.Detail)
+	transitioned, err := w.Store.TransitionJobStatePayloadWithEvent(ctx, jobID,
+		string(workflow.JobRunning), string(workflow.JobBlocked), string(encoded), db.JobEvent{
+			JobID:   jobID,
+			Kind:    blockerBlockedEventKind,
+			Message: message,
+		})
+	if err != nil {
+		return false, err
+	}
+	if transitioned {
+		emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, jobID, daemonTerminalBlocked, string(workflow.JobBlocked), message)
 	}
 	return transitioned, nil
 }

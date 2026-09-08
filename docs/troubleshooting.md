@@ -437,6 +437,18 @@ Fixes:
   (a failing probe extends the hold without spending a retry). Over `[events]`
   the deferral is a first-class `job.deferred` emitted instead of `job.failed`.
   Only act when the retry budget is spent and the job stays failed.
+- A job `blocked` with class `runtime_unavailable` will NOT recover on its own
+  (#1821). That class means the runtime could not be executed at all: its
+  binary is absent from the seat's `PATH`, or resolves to a published
+  unavailable shim that exits 126 (#1974), or the sandbox could not resolve the
+  target. It is the only operational class that does not defer, because it is
+  the only one whose condition does not clear without an operator. The job
+  records a `blocker_runtime_unavailable` event carrying the remedy and no
+  retry instant. **Do not retry it unchanged** - fix or re-stage the runtime, or
+  dispatch to an agent on a runtime that works. Before this existed the same
+  condition recorded `failed`, and 25 of 29 measured refusal deaths were
+  re-dispatched into the identical wall, one agent eleven times. Find them with
+  `gitmoot job list --state blocked`.
 - A read-only seat (every `review`/`ask` job under the read-only autonomy
   policy) does NOT authenticate with the ambient credential: it stages a
   SNAPSHOT of its runtime config dir (`payload.runtime_config_dir`, else the
