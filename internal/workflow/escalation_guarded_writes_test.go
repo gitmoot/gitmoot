@@ -342,6 +342,29 @@ func TestOwnershipLostBeforeRenewalAppliesNothing(t *testing.T) {
 	}
 }
 
+// shortRecoveryLeaseTTL is the lease the heartbeat tests below shorten to, and every
+// hold and margin in those tests is expressed as a FRACTION OF IT rather than as its own
+// literal. Scattered literals are what let the relationship drift out of view.
+//
+// #2017: at 300ms the derived margins were 150ms to 200ms, which is smaller than the
+// scheduling stall a contended CI runner produces, so these tests passed on a quiet box
+// and failed on a loaded one. Measured by injecting 250ms SIGSTOP/SIGCONT stalls into
+// the test process, 5 runs each: KeepsOwnershipAcrossASlowPreEffect 5 failures,
+// RenewalErrorsCancelAtTheConfirmedExpiry 5, RenewalErrorsAfterSuccessesStillCompleteTheRun
+// 5, ExpiryIsReArmedAfterEachConfirmedRenewal 1.
+//
+// THE DEFECT WAS NEVER THE CONSTANT, it was the relationship between the lease and the
+// work held against it. Four other tests in this file shorten the same lease and hold
+// work past it, and survived the identical stalls without a single failure, because what
+// they assert is the outcome a DELAY MAKES MORE LIKELY - an expiry that must already have
+// happened, or a cancellation with seconds of budget. CancelsThePassOnAuthoritativeLoss,
+// LateRenewalDoesNotExtendAuthorityPastThePersistedExpiry,
+// StalledRenewalStopsPreEffectsAtThePersistedExpiry and StalledRenewalDoesNotStallTheResolution
+// are therefore deliberately left at their own values: widening them would buy nothing and
+// would only cost wall time. Sharing a constant is not the defect; the direction the
+// assertion leans under load is.
+const shortRecoveryLeaseTTL = 1500 * time.Millisecond
+
 // TestHeartbeatKeepsOwnershipAcrossASlowPreEffect is the test the round-3 verdict said
 // did not exist: nothing shrank escalationRecoveryLeaseTTL, so the ticker (TTL/3 = 40s)
 // never fired in any checked-in test, and deleting the heartbeat loop left them all
@@ -361,7 +384,8 @@ func TestHeartbeatKeepsOwnershipAcrossASlowPreEffect(t *testing.T) {
 	manager := pausedImplementEscalation(t, store, &engine)
 
 	originalTTL := escalationRecoveryLeaseTTL
-	escalationRecoveryLeaseTTL = 300 * time.Millisecond
+	escalationRecoveryLeaseTTL = shortRecoveryLeaseTTL
+	ttl := escalationRecoveryLeaseTTL
 	t.Cleanup(func() { escalationRecoveryLeaseTTL = originalTTL })
 
 	round, ok := unsettledRound(t, store, "parent-job")
@@ -373,7 +397,7 @@ func TestHeartbeatKeepsOwnershipAcrossASlowPreEffect(t *testing.T) {
 	// keep this pass's ownership alive.
 	var competitorTook atomic.Bool
 	manager.onAdd = func() {
-		time.Sleep(900 * time.Millisecond)
+		time.Sleep(3 * ttl)
 		now := time.Now().UTC()
 		taken, err := store.AcquireEscalationRecoveryLease(context.Background(), "parent-job", round.RoundID,
 			"competitor", now.Add(time.Minute), now)
@@ -540,7 +564,7 @@ func TestRenewalErrorsCancelAtTheConfirmedExpiry(t *testing.T) {
 	manager := pausedImplementEscalation(t, store, &engine)
 
 	originalTTL := escalationRecoveryLeaseTTL
-	escalationRecoveryLeaseTTL = 300 * time.Millisecond
+	escalationRecoveryLeaseTTL = shortRecoveryLeaseTTL
 	// ttl is captured for use inside the hooks below. They run on the heartbeat's own
 	// goroutine, which can outlive this test body now that shutdown is bounded, so a
 	// closure reading the package var would race this cleanup.
@@ -567,7 +591,7 @@ func TestRenewalErrorsCancelAtTheConfirmedExpiry(t *testing.T) {
 		select {
 		case <-effectCtx.Done():
 			// (a) cancelled, and cancelled no later than the confirmed expiry.
-			if !time.Now().UTC().After(deadline.Add(150 * time.Millisecond)) {
+			if !time.Now().UTC().After(deadline.Add(ttl / 2)) {
 				cancelledBeforeExpiry.Store(true)
 			}
 		case <-time.After(3 * time.Second):
@@ -619,7 +643,8 @@ func TestRenewalErrorsAfterSuccessesStillCompleteTheRun(t *testing.T) {
 	manager := pausedImplementEscalation(t, store, &engine)
 
 	originalTTL := escalationRecoveryLeaseTTL
-	escalationRecoveryLeaseTTL = 300 * time.Millisecond
+	escalationRecoveryLeaseTTL = shortRecoveryLeaseTTL
+	ttl := escalationRecoveryLeaseTTL
 	t.Cleanup(func() { escalationRecoveryLeaseTTL = originalTTL })
 
 	// The first two renewals succeed - each advancing the confirmed expiry - and only
@@ -633,7 +658,7 @@ func TestRenewalErrorsAfterSuccessesStillCompleteTheRun(t *testing.T) {
 	t.Cleanup(func() { escalationRenewFaultHook = nil })
 
 	// Work that spans several ticks, so the late errors are genuinely reached.
-	manager.onAdd = func() { time.Sleep(450 * time.Millisecond) }
+	manager.onAdd = func() { time.Sleep(3 * ttl / 2) }
 
 	if err := engine.ResolveEscalation(ctx, "parent-job", ResumeRetry, ""); err != nil {
 		t.Fatalf("ResolveEscalation: %v", err)
@@ -817,7 +842,7 @@ func TestExpiryIsReArmedAfterEachConfirmedRenewal(t *testing.T) {
 	manager := pausedImplementEscalation(t, store, &engine)
 
 	originalTTL := escalationRecoveryLeaseTTL
-	escalationRecoveryLeaseTTL = 300 * time.Millisecond
+	escalationRecoveryLeaseTTL = shortRecoveryLeaseTTL
 	// ttl is captured for use inside the hooks below. They run on the heartbeat's own
 	// goroutine, which can outlive this test body now that shutdown is bounded, so a
 	// closure reading the package var would race this cleanup.
@@ -843,7 +868,7 @@ func TestExpiryIsReArmedAfterEachConfirmedRenewal(t *testing.T) {
 	var cancelledEventually atomic.Bool
 	manager.onAddCtx = func(effectCtx context.Context) {
 		// Past the ORIGINAL expiry, the pass must still be alive: renewals were healthy.
-		time.Sleep(ttl + 60*time.Millisecond)
+		time.Sleep(ttl + ttl/3)
 		if effectCtx.Err() == nil {
 			survivedFirstExpiry.Store(true)
 		}
