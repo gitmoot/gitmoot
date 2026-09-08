@@ -655,7 +655,27 @@ const ledgerRelocationThreshold = 3
 // judgement it informs - stop patching and state a contract - is a design
 // decision a human makes with it, not one a gate can take.
 func ledgerRelocationBrief(observations []db.ReviewFindingObservation) string {
+	// THE ROUND IS THE OBSERVING JOB, NOT THE REVIEWER'S LABEL (#2066 review of
+	// #1419). review_findings.go:20-26 states the invariant this originally
+	// broke: reviewers number findings PER ROUND starting at 1, so RoundLabel
+	// "is NEVER used for matching by any consumer". Keying on it was wrong in
+	// BOTH directions, measured on this store's 675 rows:
+	//
+	//   - IT DEFLATED. 52 of 239 (pr, file, label) groups were recorded by more
+	//     than one observing job, so genuinely different rounds collapsed into
+	//     one. 8 files reached the threshold on jobs while their label count was
+	//     1, including one at 6 real rounds counted as a single round - the exact
+	//     defect this brief exists to surface, silently missed.
+	//   - IT INFLATED. internal/cli/review_phase_instrument.go on #1930 carried
+	//     6 observing jobs and 16 labels, because ONE lens run emitted 14 labels
+	//     (L01..L29) while "F1" recurred across 4 separate jobs. The real count
+	//     is 6.
+	//
+	// ObserverJob is store-written and sound as the unit: never empty (0 of 675
+	// rows) and never spanning two pull requests (0 jobs), so one job is exactly
+	// one round on one PR.
 	rounds := map[string]map[string]struct{}{}
+	labels := map[string]map[string]struct{}{}
 	for _, obs := range observations {
 		file := strings.TrimSpace(obs.File)
 		if file == "" {
@@ -663,18 +683,28 @@ func ledgerRelocationBrief(observations []db.ReviewFindingObservation) string {
 			// evidence relocation WITHIN one. Counting it would inflate every file.
 			continue
 		}
-		label := strings.TrimSpace(obs.RoundLabel)
-		if label == "" {
-			label = "(unlabelled)"
+		job := strings.TrimSpace(obs.ObserverJob)
+		if job == "" {
+			// No attributable round. Counting it as its own would let unattributed
+			// rows manufacture relocations; folding it into a shared bucket would
+			// let many of them read as one. Neither is evidence, so it is skipped
+			// and the count stays a floor.
+			continue
 		}
 		if rounds[file] == nil {
 			rounds[file] = map[string]struct{}{}
+			labels[file] = map[string]struct{}{}
 		}
-		rounds[file][label] = struct{}{}
+		rounds[file][job] = struct{}{}
+		if label := strings.TrimSpace(obs.RoundLabel); label != "" {
+			// Displayed for a human to recognise the rounds, never counted. That
+			// is precisely the role review_findings.go reserves for the label.
+			labels[file][label] = struct{}{}
+		}
 	}
 	var files []string
-	for file, labels := range rounds {
-		if len(labels) >= ledgerRelocationThreshold {
+	for file, jobs := range rounds {
+		if len(jobs) >= ledgerRelocationThreshold {
 			files = append(files, file)
 		}
 	}
@@ -684,16 +714,22 @@ func ledgerRelocationBrief(observations []db.ReviewFindingObservation) string {
 	sort.Strings(files)
 	var b strings.Builder
 	b.WriteString("\n\nDEFECT RELOCATION COUNT ON THIS PR (#1419).\n")
-	b.WriteString("Each line is a file that has carried findings across SEVERAL DISTINCT ROUNDS. That is not the\n")
-	b.WriteString("same as a thorough review: three findings in one round is thoroughness, one finding in each of\n")
-	b.WriteString("three rounds is a defect that keeps coming back somewhere else in the same file.\n")
+	b.WriteString("Each line is a file that has carried findings across SEVERAL DISTINCT REVIEW ROUNDS, counted\n")
+	b.WriteString("by observing job. That is not the same as a thorough review: several findings in ONE round is\n")
+	b.WriteString("thoroughness, one finding in each of three rounds is a defect that keeps coming back somewhere\n")
+	b.WriteString("else in the same file. The labels are shown to help you recognise the rounds; they are not what\n")
+	b.WriteString("is counted, because a reviewer restarts numbering at 1 each round.\n")
 	for _, file := range files {
-		labels := make([]string, 0, len(rounds[file]))
-		for label := range rounds[file] {
-			labels = append(labels, label)
+		shown := make([]string, 0, len(labels[file]))
+		for label := range labels[file] {
+			shown = append(shown, label)
 		}
-		sort.Strings(labels)
-		b.WriteString(fmt.Sprintf("  %s  rounds=%d  [%s]\n", file, len(labels), strings.Join(labels, " ")))
+		sort.Strings(shown)
+		detail := "labels not recorded"
+		if len(shown) > 0 {
+			detail = "labels " + strings.Join(shown, " ")
+		}
+		b.WriteString(fmt.Sprintf("  %s  rounds=%d  (%s)\n", file, len(rounds[file]), detail))
 	}
 	b.WriteString("At this count, WEIGH STATING A CONTRACT over patching again: ask what invariant the code is\n")
 	b.WriteString("hand-approximating, and whether the next divergence comes from an unbounded set. A fix that\n")
