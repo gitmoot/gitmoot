@@ -2333,7 +2333,7 @@ func (g PolicyMergeGate) evaluateStatuses(ctx context.Context, repo github.Repos
 			if item.Context == GitmootMergeGateContext {
 				continue
 			}
-			if statusPending(item.State) {
+			if github.StatusPending(item.State) {
 				return 0, mergePending{reason: fmt.Sprintf("gitmoot status %q is pending", item.Context)}
 			}
 			if item.State != "success" {
@@ -2342,7 +2342,7 @@ func (g PolicyMergeGate) evaluateStatuses(ctx context.Context, repo github.Repos
 			continue
 		}
 		externalStatusCount++
-		if statusPending(item.State) {
+		if github.StatusPending(item.State) {
 			return 0, mergePending{reason: "external commit status " + item.Context + " is pending"}
 		}
 		if item.State != "success" {
@@ -2628,15 +2628,6 @@ func (e mergeBlocked) Error() string {
 
 func (e mergePending) Error() string {
 	return e.reason
-}
-
-func statusPending(state string) bool {
-	switch strings.ToLower(strings.TrimSpace(state)) {
-	case "pending", "queued", "in_progress", "waiting", "requested":
-		return true
-	default:
-		return false
-	}
 }
 
 func pullRequestMerged(pr github.PullRequest) bool {

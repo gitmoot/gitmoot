@@ -1985,3 +1985,30 @@ func CheckPassed(check PullRequestCheck) bool {
 	state := strings.ToLower(strings.TrimSpace(check.State))
 	return state == "success" || state == "skipped" || state == "neutral"
 }
+
+// StatusPending classifies a legacy commit-status state, alongside CheckPending
+// and CheckPassed above and for the same reason: the merge gate and a review
+// dispatch must reach the SAME verdict about the same status.
+//
+// #1824 review F2: the first version of the dispatch-time CI block read only
+// check runs, while PolicyMergeGate.evaluateStatuses evaluates the COMBINED
+// STATUS first and blocks on a pending or failing one before it ever looks at
+// check runs. A head with a green check-run rollup and a failing legacy status
+// would therefore have been described to a reviewer as established while the
+// gate refused it - the exact contradiction the shared predicates exist to
+// prevent.
+func StatusPending(state string) bool {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "pending", "queued", "in_progress", "waiting", "requested":
+		return true
+	default:
+		return false
+	}
+}
+
+// StatusSucceeded reports whether a legacy commit status is a success. The gate
+// compares against "success" exactly, so this does too rather than inventing a
+// wider notion of acceptable.
+func StatusSucceeded(state string) bool {
+	return strings.ToLower(strings.TrimSpace(state)) == "success"
+}
