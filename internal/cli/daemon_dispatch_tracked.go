@@ -634,7 +634,33 @@ var (
 // warnJobHeldBack emits ONE throttled line explaining why a queued job was not
 // dispatched this tick (#562 point 5: these exclusions used to be silent). The
 // wording reuses the #552 why-stuck vocabulary where it applies.
-func warnJobHeldBack(stdout io.Writer, jobID string, reason string) {
+// warnJobHeldBack records that a queued job could not be claimed, and why.
+//
+// IT WRITES TO job_events AS WELL AS THE LOG (#1553). A job that is
+// queued-and-unclaimable was indistinguishable from one that is
+// queued-and-about-to-run: measured on jobs since 2026-08-15, 395 waited more
+// than ten minutes between being queued and starting, 99 waited more than
+// thirty, and the worst waited 120.2 minutes. 366 of the 395 carried no event of
+// any deferral, refusal, quota or admission kind, so nothing an operator can
+// read said why.
+//
+// The reason existed the whole time and went only to daemon stdout, which is not
+// where anyone looks: `gitmoot job events <id>` showed the four-to-eight rows
+// written at the instant of dispatch and nothing about the interval before it.
+// So this is not new instrumentation, it is the existing reason reaching the
+// record. The engine already proves the shape is wanted - runtime_lock_wait and
+// dispatch_refused_disk_guard both record a wait against the job that is waiting.
+//
+// THE THROTTLE IS THE EXISTING ONE, DELIBERATELY. The event is written only past
+// the same job+reason guard that gates the log line, so its volume equals the
+// log's: at most one row per job per distinct reason per heldBackLogInterval,
+// five minutes. Writing it unthrottled is the mistake the pool's own comments
+// already record twice - an unbounded skip row became one every two seconds per
+// blocked job, and job_events reached ~1.8M rows.
+//
+// Recording is best-effort: a job held back is already a degraded path and
+// failing to describe it must not change the dispatch decision.
+func warnJobHeldBack(ctx context.Context, store *db.Store, stdout io.Writer, jobID string, reason string) {
 	if strings.TrimSpace(reason) == "" {
 		return
 	}
@@ -658,7 +684,19 @@ func warnJobHeldBack(stdout io.Writer, jobID string, reason string) {
 	heldBackWarnByJob[jobID] = heldBackWarnState{reason: reason, at: now}
 	heldBackWarnMu.Unlock()
 	writeLine(stdout, "job %s held back: %s", jobID, reason)
+	if store != nil && strings.TrimSpace(jobID) != "" {
+		_ = store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   jobID,
+			Kind:    dispatchHeldBackEventKind,
+			Message: reason,
+		})
+	}
 }
+
+// dispatchHeldBackEventKind marks a queued job the dispatcher looked at and
+// could not claim. Its presence is what distinguishes a job that is waiting from
+// one that is about to run.
+const dispatchHeldBackEventKind = "dispatch_held_back"
 
 // admissionSkipReason describes an admission-budget refusal (#365) for the
 // held-back log, distinguishing a transient "does not fit right now" from a
@@ -682,14 +720,11 @@ func explainHeldBackJobs(ctx context.Context, worker jobWorker, tracker *infligh
 	for _, job := range remaining {
 		checkoutKey := queuedJobCheckoutKey(ctx, worker.Store, job)
 		if holder := tracker.holderOf(checkoutKey); holder != "" && holder != job.ID {
-			warnJobHeldBack(worker.Stdout, job.ID, fmt.Sprintf("waiting on checkout %s (held by in-flight job %s)", checkoutKey, holder))
+			warnJobHeldBack(ctx, worker.Store, worker.Stdout, job.ID, fmt.Sprintf("waiting on checkout %s (held by in-flight job %s)", checkoutKey, holder))
 			continue
 		}
 		runtimeKey := queuedJobRuntimeResourceKey(ctx, worker.Store, job)
-		if runtimeKey == "" {
-			continue
-		}
-		if lock, err := worker.Store.GetResourceLock(ctx, runtimeKey); err == nil {
+		if lock, err := worker.Store.GetResourceLock(ctx, runtimeKey); runtimeKey != "" && err == nil {
 			reason := fmt.Sprintf("waiting on runtime session lock %s", runtimeKey)
 			if owner := strings.TrimSpace(lock.OwnerJobID); owner != "" && owner != job.ID {
 				reason += fmt.Sprintf(" (held by job %s)", owner)
@@ -697,8 +732,22 @@ func explainHeldBackJobs(ctx context.Context, worker jobWorker, tracker *infligh
 			if expires := strings.TrimSpace(lock.ExpiresAt); expires != "" {
 				reason += fmt.Sprintf(", lease expires %s", expires)
 			}
-			warnJobHeldBack(worker.Stdout, job.ID, reason)
+			warnJobHeldBack(ctx, worker.Store, worker.Stdout, job.ID, reason)
+			continue
 		}
+		// THE TWO BARE `continue`s THIS REPLACES ARE #1553 (no runtime key at all,
+		// and a runtime key with no readable lock row). Both left a job that the
+		// selector had just declined with nothing recorded anywhere, which is the
+		// silence the issue is about: measured on jobs since 2026-08-15, 398 waited
+		// over ten minutes between enqueue and first `running`, 99 over thirty, worst
+		// 120.2, and 363 of the 398 carried no event of any deferral, refusal, quota,
+		// admission or wait kind.
+		//
+		// A job reaching here is still queued after a pass that examined it, so the
+		// fact of the wait is certain even when the cause is not. Saying that beats
+		// saying nothing: the reader's question is "is this job waiting or about to
+		// run", and only the specific cause was ever missing, not the answer.
+		warnJobHeldBack(ctx, worker.Store, worker.Stdout, job.ID, "queued and not selected this dispatch pass (no checkout or runtime holder identified)")
 	}
 }
 
@@ -797,7 +846,7 @@ func dispatchQueuedJobsTracked(ctx context.Context, worker jobWorker, limit int,
 	for _, job := range queued {
 		job := job
 		if !worker.Admission.Reserve(job.ID, func() admissionEstimate { return worker.admissionEstimate(ctx, job) }) {
-			warnJobHeldBack(worker.Stdout, job.ID, admissionSkipReason(worker.Admission, worker.admissionEstimate(ctx, job)))
+			warnJobHeldBack(ctx, worker.Store, worker.Stdout, job.ID, admissionSkipReason(worker.Admission, worker.admissionEstimate(ctx, job)))
 			continue
 		}
 		checkoutKey := queuedJobCheckoutKey(ctx, worker.Store, job)

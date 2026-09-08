@@ -2464,7 +2464,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					// failed/dropped. A nil budget always admits ⇒ byte-identical default.
 					if !worker.Admission.Reserve(job.ID, func() admissionEstimate { return worker.admissionEstimate(ctx, job) }) {
 						if tracker != nil {
-							warnJobHeldBack(worker.Stdout, job.ID, admissionSkipReason(worker.Admission, worker.admissionEstimate(ctx, job)))
+							warnJobHeldBack(ctx, worker.Store, worker.Stdout, job.ID, admissionSkipReason(worker.Admission, worker.admissionEstimate(ctx, job)))
 						}
 						continue
 					}
@@ -2534,7 +2534,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					// isolation worktree so a deferred job leaves no orphan worktree behind.
 					if !worker.Admission.Reserve(job.ID, func() admissionEstimate { return worker.admissionEstimate(ctx, job) }) {
 						if tracker != nil {
-							warnJobHeldBack(worker.Stdout, job.ID, admissionSkipReason(worker.Admission, worker.admissionEstimate(ctx, job)))
+							warnJobHeldBack(ctx, worker.Store, worker.Stdout, job.ID, admissionSkipReason(worker.Admission, worker.admissionEstimate(ctx, job)))
 						}
 						continue
 					}
