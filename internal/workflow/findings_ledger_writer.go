@@ -602,7 +602,29 @@ const (
 // orphan byte, so the invalid sequence reaches the runtime, where the reviewer
 // text is silently mangled rather than loudly refused.
 func truncateAtRune(s string, max int) (string, int) {
-	if max <= 0 || len(s) <= max {
+	// COERCE BEFORE MEASURING, and the order is the whole correctness argument
+	// (#2077 review F6). The store accepts invalid UTF-8, and utf8.RuneStart
+	// treats an invalid leading byte such as 0xff as a rune start, so a stored
+	// Detail of `a 0xff b` passed through untouched and the whole brief was
+	// invalid UTF-8 before any truncation happened. The earlier regression only
+	// covered corruption this function INTRODUCES; inherited corruption reached
+	// the prompt unchanged.
+	//
+	// Coercion LENGTHENS: each invalid byte becomes a 3-byte replacement rune. So
+	// it must happen before the bound is applied, or the bound stops holding on
+	// exactly the input that needed it.
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "\uFFFD")
+	}
+	// A NONPOSITIVE MAX MEANS NOTHING FITS, not "no limit" (#2077 review F5).
+	// Returning the input unchanged contradicted the helper's own at-most-max
+	// contract: truncateAtRune("abc", 0) returned three bytes. No caller passes
+	// a nonpositive constant today, which is exactly why the contract has to
+	// hold rather than the exception be documented.
+	if max <= 0 {
+		return "", len(s)
+	}
+	if len(s) <= max {
 		return s, 0
 	}
 	cut := max
