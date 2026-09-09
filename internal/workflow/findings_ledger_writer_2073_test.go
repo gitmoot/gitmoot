@@ -50,9 +50,12 @@ func TestAdvanceJobKeepsProseFromTheThreeUnreadKeys(t *testing.T) {
 				// {file, finding, line}: title, detail and severity all lost.
 				json.RawMessage(`{"file":"herdres_connector/source_sync.py","line":7105,"finding":"` + findingProse + `"}`),
 				// {severity, file, line, description}: the sixth shape. Measured in
-				// the ledger's lifetime, 51 of 806 finding objects carry
-				// `description` and in ALL 51 it is the only prose key, so every one
-				// recorded an empty detail.
+				// the ledger's lifetime, 51 of 814 finding objects carry
+				// `description`, and in SIXTEEN of those it is the only prose key,
+				// so those sixteen recorded an empty detail. (The 51-of-806 figure
+				// this comment first carried counted title+description findings as
+				// description-only, because the query omitted `title` and `summary`
+				// from its own list of prose keys.)
 				json.RawMessage(`{"severity":"P2","file":"docs/local-workflow.md","line":84,"description":"` + descriptionProse + `"}`),
 			},
 		},
@@ -611,6 +614,7 @@ func TestTruncationMarkerCountsNormalisedBytesNotStoredBytes(t *testing.T) {
 	// length is a different, larger-gap number; asserting the coerced one is what
 	// kills the "bytes on the row" wording.
 	rendered := 0
+	keptText := ""
 	for _, line := range strings.Split(brief, "\n") {
 		if idx := strings.Index(line, "[truncated, "); idx >= 0 {
 			rest := line[idx+len("[truncated, "):]
@@ -626,19 +630,45 @@ func TestTruncationMarkerCountsNormalisedBytesNotStoredBytes(t *testing.T) {
 			if !strings.Contains(line, "more bytes of normalised text") {
 				t.Fatalf("marker must name the text it measured; got %q", line)
 			}
+			// The bytes the brief ACTUALLY retained, read off the rendered line
+			// rather than derived from the number under test.
+			titleAt := strings.Index(line, "  title=")
+			if titleAt < 0 {
+				t.Fatalf("brief line carries no title field: %q", line)
+			}
+			// The marker is appended as " [truncated, ...", so the byte before it
+			// is the separator space and is not part of the retained title.
+			if idx == 0 || line[idx-1] != ' ' {
+				t.Fatalf("marker is not space-separated from the title, so this slice would miscount: %q", line)
+			}
+			keptText = line[titleAt+len("  title=") : idx-1]
 		}
 	}
 	if rendered == 0 {
 		t.Fatalf("no truncation marker found in brief")
 	}
 
-	kept := len(coerced) - rendered
+	kept := len(keptText)
 	if kept <= 0 || kept >= len(coerced) {
-		t.Fatalf("marker reports %d dropped of a %d-byte coerced title, which is not a cut", rendered, len(coerced))
+		t.Fatalf("brief retained %d bytes of a %d-byte coerced title, which is not a cut", kept, len(coerced))
 	}
-	// The decisive assertion: the same cut measured against the STORED bytes
-	// yields a different number, so a marker claiming "bytes on the row" would be
-	// stating a figure this brief never computed.
+
+	// THE ASSERTION IS AGAINST THE BYTES ON THE PAGE (#2077 review F11). The
+	// first version of this test derived `kept` as len(coerced)-rendered and then
+	// checked len(stored)-kept != rendered, which reduces by substitution to
+	// len(stored) != len(coerced) - a fact the fixture already asserts above. It
+	// never compared the marker to anything the brief produced, so any wrong
+	// count survived it.
+	//
+	// `kept` is now read off the rendered line, so the marker is checked against
+	// the text it accompanies.
+	if want := len(coerced) - kept; rendered != want {
+		t.Fatalf("marker reports %d dropped, but the brief retained %d of %d coerced bytes, so %d were dropped",
+			rendered, kept, len(coerced), want)
+	}
+	// And the same arithmetic against the STORED bytes gives a different number,
+	// so a marker claiming "bytes on the row" would be stating a figure this
+	// brief never computed.
 	if onTheRow := len(stored) - kept; onTheRow == rendered {
 		t.Fatalf("stored and coerced counts coincide (%d), so this fixture cannot discriminate the two wordings", rendered)
 	}
