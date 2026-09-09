@@ -347,30 +347,23 @@ func TestMergeGateWaitsWhenMergeabilityIsUnknownOnAnUpToDateHead(t *testing.T) {
 	}
 }
 
-// The explicit false case must stay a BLOCK, so the nil arm above cannot be
-// implemented by softening a real conflict into a wait.
-func TestMergeGateBlocksAnExplicitlyUnmergeableHead(t *testing.T) {
-	gh := behindMergeGateClient(github.CompareResult{Status: "ahead", AheadBy: 2})
-	conflicting := false
-	gh.pr.Mergeable = &conflicting
-	gh.strictKnown = true
-	gh.strictBase = true
-
-	decision := evaluateBehindMergeGate(t, gh)
-
-	if decision.Merged || len(gh.merges) != 0 {
-		t.Fatalf("a conflicting head must not merge: %+v", decision)
-	}
-	if !strings.Contains(decision.Reason.Render(), "not mergeable") {
-		t.Fatalf("decision must name the conflict, got %q", decision.Reason.Render())
-	}
-	// The opposite lifecycle from the nil case above. Without this the pair could
-	// both be satisfied by one behaviour, which is exactly how the nil test came
-	// to accept a block.
-	if decision.Ready {
-		t.Fatal("an explicit conflict must BLOCK, not wait: Ready is true, so it would keep retrying a merge GitHub has refused")
-	}
-	if !hasStatus(gh.statuses, GitmootMergeGateContext, "failure") {
-		t.Fatalf("a blocked decision must publish a failure status, got %+v", gh.statuses)
-	}
-}
+// #2074 round four, P2: THE EXPLICIT-FALSE TEST AT AN UP-TO-DATE HEAD IS DELETED
+// BECAUSE THE STATE IT MODELLED CANNOT OCCUR.
+//
+// It constructed Status:"ahead" with Mergeable=false and called that a real
+// conflict. Those cannot describe one pull request: `ahead` means the base is an
+// ancestor of the head, so there is nothing to conflict WITH, and GitHub sets
+// mergeable=false for merge conflicts, which require divergence.
+//
+// Making the tuple coherent - diverged plus false - moves the case into
+// ensureBranchFresh, which handles it BEFORE the post-freshness mergeability
+// guard: that is TestMergeGateStillUpdatesDivergedConflictingBranch above, which
+// already covers the reachable conflict path.
+//
+// So the `!*pr.Mergeable` block after ensureBranchFresh is DEFENSIVE and is not
+// reachable through any compare status the API emits: conflicts arrive diverged
+// and are answered earlier. It stays, because a guard that costs one comparison
+// and refuses an impossible input is cheaper than proving the impossibility holds
+// forever - but it is defensive rather than test-defended, and pretending
+// otherwise required a fixture the API cannot produce. Same call as the surviving
+// eligibility mutant on #2057.
