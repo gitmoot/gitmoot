@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // #1207, bounded half: a deploy must not need an idle window that never arrives.
@@ -123,18 +124,39 @@ func TestDaemonDrainCommandSetsAndClearsTheSentinel(t *testing.T) {
 // that lost, cancelled or mutated queued jobs would be worse than the restart it
 // replaces, and nothing else in this file would notice.
 func TestDrainLeavesQueuedWorkUntouched(t *testing.T) {
+	ctx := context.Background()
 	home := t.TempDir()
 	store := openCLIJobStore(t, home)
 	seedDaemonWorkerAgent(t, store, "worker", "shell", "printf ok", []string{"review"}, "owner/repo")
 
-	before := queuedJobSnapshot(t, store)
-	if len(before) == 0 {
-		t.Skip("fixture produced no queued jobs; nothing to protect")
+	// SEEDED EXPLICITLY, AND A MISSING FIXTURE IS A FAILURE RATHER THAN A SKIP.
+	// The first version of this test called t.Skip here, and the agent fixture
+	// creates no jobs - so the "guarantee that matters" asserted NOTHING and
+	// reported PASS. That is this campaign's own defect class (a record that
+	// cannot evidence what it claims) inside the test defending against it.
+	// Found in review (#2096).
+	for _, id := range []string{"queued-alpha", "queued-beta"} {
+		if err := store.CreateJobWithEvent(ctx, db.Job{
+			ID: id, Agent: "worker", Type: "review", State: string(workflow.JobQueued),
+			Repo: "owner/repo", Payload: "{}",
+		}, db.JobEvent{Kind: string(workflow.JobQueued), Message: "seed"}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
 	}
 
-	if err := setDaemonDrain(home, true); err != nil {
-		t.Fatalf("set drain: %v", err)
+	before := queuedJobSnapshot(t, store)
+	if len(before) != 2 {
+		t.Fatalf("fixture must produce the queued jobs this test protects; got %d", len(before))
 	}
+
+	// THE COMMAND, NOT THE HELPER. setDaemonDrain only writes a file, so driving
+	// it here would leave every line of runDaemonDrain untested and a drain that
+	// cancelled queued work would still pass.
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"daemon", "drain", "--home", home, "--timeout", "5s"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("daemon drain exit = %d, stderr=%s", code, stderr.String())
+	}
+
 	after := queuedJobSnapshot(t, store)
 	if len(after) != len(before) {
 		t.Fatalf("queued job count changed across a drain: %d -> %d", len(before), len(after))
@@ -183,9 +205,6 @@ func TestDrainStopsTheDispatchPathFromSelectingWork(t *testing.T) {
 		t.Fatal("fixture offered no eligible work, so this test could not detect a drain")
 	}
 
-	original := daemonDrainHome
-	daemonDrainHome = worker.ConfigHome
-	t.Cleanup(func() { daemonDrainHome = original })
 	if err := setDaemonDrain(worker.ConfigHome, true); err != nil {
 		t.Fatalf("set drain: %v", err)
 	}

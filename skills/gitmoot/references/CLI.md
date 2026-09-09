@@ -3282,6 +3282,15 @@ likely to be waiting.
 **`--clear` is required after the restart.** The sentinel outlives the process;
 a new daemon started while it exists will claim nothing.
 
+`gitmoot job run <id>` is **intentionally not gated by drain**. It calls the
+worker directly rather than going through the scheduler's queued-job selection,
+so it is the one path that starts work on a drained daemon. That is deliberate:
+it is a manual, explicit, single-job operator command, and an operator who types
+it during a drain means it. A job it starts is still counted by an in-progress
+`daemon drain` wait, because the job transitions to `running`; the only gap is
+the ordinary race where it is invoked after a drain has already reported success
+and exited.
+
 ## Findings Ledger
 
 `gitmoot findings` reports the #1822 findings ledger. Two shapes:

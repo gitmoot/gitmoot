@@ -52,14 +52,17 @@ func daemonDrainSentinelPath(configHome string) (string, error) {
 // case and is not an error. Any OTHER stat error returns the error rather than
 // false: failing open would resume dispatch during a deploy, which is the one
 // outcome drain exists to prevent.
-func daemonDrainActive(_ context.Context, _ *db.Store) (bool, error) {
-	return daemonDrainActiveForHome(daemonDrainHome)
+// daemonDrainActive reports whether the operator has drained this daemon.
+//
+// THE HOME IS A PARAMETER, NOT A PACKAGE GLOBAL. The first version stored it in
+// a var set once at daemon start, which made the guard INERT for any caller
+// reaching the scheduler outside a started daemon and forced tests into a
+// save/restore dance around shared state. Two reviewers found it independently
+// (#2096 review; gm-staged reading the branch). The single call site already
+// has the worker in scope, so the global bought nothing.
+func daemonDrainActive(configHome string) (bool, error) {
+	return daemonDrainActiveForHome(configHome)
 }
-
-// daemonDrainHome is set once at daemon start so the scheduler's guard can find
-// the sentinel without threading the home through every call site. Empty means
-// no daemon has started in this process, in which case nothing is draining.
-var daemonDrainHome string
 
 func daemonDrainActiveForHome(configHome string) (bool, error) {
 	if strings.TrimSpace(configHome) == "" {
@@ -109,7 +112,13 @@ func setDaemonDrain(configHome string, on bool) error {
 // that defeats the purpose.
 func engineDispatchedInFlight(ctx context.Context, store *db.Store) ([]db.Job, error) {
 	var inFlight []db.Job
-	for _, state := range []string{"running", "claimed"} {
+	// ONLY "running". An earlier version also scanned "claimed", which is NOT a
+	// member of workflow.JobState and which no row has ever carried (measured:
+	// zero of 14,917 job rows). It could only ever return empty - via a FULL
+	// UNINDEXED SCAN of jobs, because the partial indexes cover running/queued/
+	// blocked and nothing else. Every 5s, against exactly the contended store
+	// the file sentinel exists to avoid depending on. Found in review (#2096).
+	for _, state := range []string{"running"} {
 		jobs, err := store.ListJobsByState(ctx, state)
 		if err != nil {
 			return nil, err

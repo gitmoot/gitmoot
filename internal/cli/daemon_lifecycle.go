@@ -107,6 +107,20 @@ func runDaemonStartWithWorkDirRestart(args []string, workDir string, _ bool, _ b
 		return 1
 	}
 	writeLine(stdout, "daemon started pid %d", started.PID)
+	// THE --clear-AFTER-RESTART FOOTGUN, MADE VISIBLE (#2096 review).
+	//
+	// The sentinel deliberately outlives the process, so a daemon started after a
+	// deploy claims NOTHING until an operator clears it. That is fail-closed on
+	// purpose - a TTL would be the wrong fix, because it could silently resume
+	// intake mid-incident. But silence here means the operator learns it from an
+	// empty queue. A stat failure is not worth failing a start over, so an
+	// unreadable sentinel says so rather than being swallowed.
+	if drained, err := daemonDrainActiveForHome(cfg.Home); err != nil {
+		writeLine(stdout, "warning: could not read the drain sentinel: %v", err)
+	} else if drained {
+		writeLine(stdout, "WARNING: drain is ACTIVE - this daemon will not claim queued work.")
+		writeLine(stdout, "         run `gitmoot daemon drain --clear` to resume claiming.")
+	}
 	writeLine(stdout, "log: %s", state.LogFile)
 	return 0
 }

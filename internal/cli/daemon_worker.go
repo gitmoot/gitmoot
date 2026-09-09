@@ -193,7 +193,6 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 	}
 	// #1207: the scheduler's drain guard stats a sentinel under this home, so it
 	// is recorded once here rather than threaded through every eligibility call.
-	daemonDrainHome = configHome
 	worker := jobWorker{Store: store, Stdout: serializeWrites(stdout), ConfigHome: configHome, ConfigHomeExplicit: configHomeExplicit}
 	// PRODUCTION assigns through the setter so the factory and the claim that it
 	// execs the declared binary are written together (#1926-f5).
