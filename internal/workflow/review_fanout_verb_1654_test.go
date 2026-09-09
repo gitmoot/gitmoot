@@ -158,15 +158,23 @@ func TestSkipNativeReviewFanoutIsAnImplementControlNotAReviewOne(t *testing.T) {
 					t.Fatalf("ListJobsByType returned error: %v", listErr)
 				}
 				var fix *db.Job
+				candidates := 0
 				for i := range implementJobs {
 					// The seeded implementer satisfies the ownership gate; the fix
 					// job is the one dispatchFix created.
 					if implementJobs[i].ID != "implement-for-"+tc.branch {
 						fix = &implementJobs[i]
+						candidates++
 					}
 				}
 				if fix == nil {
 					t.Fatalf("no fix job was dispatched: dispatchFixWhenHeadHasSettled did not run, so this arm proves nothing about what a review dispatches")
+				}
+				// IDENTIFICATION BY EXCLUSION IS ONLY SOUND IF EXACTLY ONE REMAINS.
+				// With more than one, the loop silently kept the last and the
+				// assertions below would describe an arbitrary job.
+				if candidates != 1 {
+					t.Fatalf("expected exactly one dispatched fix job, found %d: identification by exclusion is not sound here", candidates)
 				}
 				var fixPayload JobPayload
 				if err := json.Unmarshal([]byte(fix.Payload), &fixPayload); err != nil {
@@ -177,6 +185,22 @@ func TestSkipNativeReviewFanoutIsAnImplementControlNotAReviewOne(t *testing.T) {
 				// a review-dispatched fix would suppress native fan-out on the
 				// branch, which is precisely the effect the docs say review cannot
 				// have.
+				// PARENTLESSNESS ASSERTED DIRECTLY (#2055 review round 4). The
+				// documentation says dispatchFix builds a PARENTLESS implement
+				// request; a false fanout bit only shows the bit is false, which is
+				// also true of a parented request that simply did not inherit. The
+				// distinction matters because inheritance at the enqueue chokepoint
+				// REQUIRES a parent, so parentlessness is the mechanism the doc
+				// names, not the symptom.
+				if strings.TrimSpace(fix.ParentJobID) != "" {
+					t.Fatalf("the fix job %q carries ParentJobID %q; the documentation states dispatchFix builds a PARENTLESS request, and a parented one would inherit the bit at the enqueue chokepoint", fix.ID, fix.ParentJobID)
+				}
+				// The dispatched fix must target the pull request under review.
+				// Dropping PullRequest from dispatchFix's JobRequest still enqueues
+				// a job whose fanout bit is false, so the bit alone cannot see it.
+				if fixPayload.PullRequest != pr {
+					t.Fatalf("the fix job targets pull request %d, want %d: the dispatch lost the PR it was fixing", fixPayload.PullRequest, pr)
+				}
 				if fixPayload.SkipNativeReviewFanout {
 					t.Fatalf("the fix job %q inherited SkipNativeReviewFanout from the review payload. "+
 						"CLI.md and website/docs/reference/cli.md state that dispatchFix does not inherit it; "+
