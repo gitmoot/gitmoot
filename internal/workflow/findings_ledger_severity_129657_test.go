@@ -182,9 +182,26 @@ func TestANonBlockingP3IsStillReported(t *testing.T) {
 	}
 }
 
-// A CALLER-SUPPLIED DEGRADED SINK IS NOT A REPORTING CHANNEL EITHER. The CLI
-// supplies one to collect genuine instrument failures; a non-blocking P3 must
-// not arrive there and be rendered as "degraded:", because it is not.
+// A CALLER-SUPPLIED DEGRADED SINK IS NOT A REPORTING CHANNEL EITHER.
+//
+// THE ATTRIBUTION HERE HAS BEEN WRONG IN BOTH DIRECTIONS IN ONE AFTERNOON, so
+// it is dated rather than asserted.
+//
+// I first wrote that "the CLI supplies one". The #2102 reviewer checked main and
+// found no production caller assigning Degraded - the only LedgerScope
+// constructor was LedgerResolvers.ScopeFor, which never does - so the claim
+// described gm-findings' then-unmerged PR #2099 while reading as a statement
+// about main. Correct finding.
+//
+// It stopped being correct at 15:39:11Z, when #2099 merged as 9c892237.
+// internal/cli/findings.go:365 now assigns scope.Degraded to collect genuine
+// instrument failures for `gitmoot findings --at-head`, so the caller this test
+// defends against is real and on main.
+//
+// THE TEST DID NOT CHANGE, and that is the point worth keeping: it pinned the
+// contract while the caller was still someone else's unmerged branch, and the
+// contract held when the caller arrived. A non-blocking P3 must not reach that
+// sink and be rendered as "degraded:", because it is not a degradation.
 func TestANonBlockingP3DoesNotReachACallerDegradedSink(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -268,5 +285,36 @@ func TestALegacyBlankSeverityRowBlocksThroughTheStore(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "F-1") {
 		t.Fatalf("the refusal does not name the legacy obligation: %v", err)
+	}
+}
+
+// A BLOCKING-ONLY REFUSAL REPORTS NOTHING. The guard is `if len(reported) > 0`,
+// and the #2102 reviewer showed that replacing it with `if true` compiles and
+// passes the ENTIRE internal/workflow suite - no test asserted the absence of a
+// spurious event. Production was correct; the coverage was not, and a future
+// regression would have emitted "0 finding(s) ... do not hold the merge" on
+// every P1/P2 refusal.
+//
+// That is this campaign's own class one more time: a record asserting something
+// it cannot evidence, here a report of an empty set.
+func TestABlockingOnlyRefusalEmitsNoReportedEvent(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	oldHead, head := strings.Repeat("7", 40), strings.Repeat("e", 40)
+	seedFinding(t, store, 7011, oldHead, "F-1", "P1")
+	seedFinding(t, store, 7011, oldHead, "F-2", "P2")
+
+	if err := EnsureLedgerObligationsObserved(ctx, store, "gitmoot/gitmoot", 7011, head, LedgerScope{TaskID: "task-7011"}); err == nil {
+		t.Fatal("premise broken: a P1 and a P2 did not block")
+	}
+
+	events, err := store.ListTaskEvents(ctx, "task-7011")
+	if err != nil {
+		t.Fatalf("ListTaskEvents: %v", err)
+	}
+	for _, event := range events {
+		if event.Kind == "findings_ledger_reported_not_blocking" {
+			t.Fatalf("a blocking-only refusal emitted a non-blocking report: %q", event.Reason)
+		}
 	}
 }
