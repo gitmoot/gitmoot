@@ -88,7 +88,7 @@ func runFindings(args []string, stdout, stderr io.Writer) int {
 	// This is the only clause of #1971 that does not depend on the merge path: a
 	// stricter gate would have stopped none of them, and a report would have
 	// surfaced all of them.
-	mergedUnresolved := fs.Bool("merged-unresolved", false, "list merged pull requests whose findings the merge gate would still have demanded")
+	mergedUnresolved := fs.Bool("merged-unresolved", false, "list merged pull requests that still carried unresolved findings at their branch head (gate obligations plus findings open at that exact head)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -649,7 +649,16 @@ func runFindingsMergedUnresolved(repoFilter string, home string, jsonOutput bool
 			return 1
 		}
 		fmt.Fprintln(stdout)
-		fmt.Fprintln(stdout, "These merged with obligations the gate would have demanded at their branch head.")
+		// #2106 f3: THE REPORT IS A UNION AND SAYING OTHERWISE IS NOW FALSE.
+		// The f1 fix deliberately adds rows LedgerObligationsAtHead excludes, so
+		// this line can no longer claim every item is an obligation the gate
+		// would demand. The disagreement is one-directional and by design: the
+		// report is a superset, never a subset, of what the gate asks for.
+		fmt.Fprintln(stdout, "These merged while still carrying unresolved findings at their branch head.")
+		fmt.Fprintln(stdout, "Rows are the UNION of two sets: obligations the gate would have demanded, and")
+		fmt.Fprintln(stdout, "findings still open at that exact head, which the gate discharges. The second")
+		fmt.Fprintln(stdout, "kind carries the reason \"still open at the merged head\", so this report is a")
+		fmt.Fprintln(stdout, "deliberate superset of the gate rather than the same predicate.")
 		// #2106 f2: THIS COLUMN IS TODAY'S POLICY, NOT A HISTORICAL AUTHORISATION.
 		// It is read from the CURRENT review configuration, so saying it proves the
 		// gate let a past merge through by declaration reverses history whenever

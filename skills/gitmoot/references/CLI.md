@@ -3363,10 +3363,21 @@ gitmoot findings --merged-unresolved --repo owner/repo
 gitmoot findings --merged-unresolved --json
 ```
 
-Lists pull requests that **merged** while carrying obligations the merge gate
-would still have demanded at their branch head. It is the same predicate the
-`--at-head` mode uses, applied to every pull request the ledger has observed,
-so the report and the gate cannot disagree.
+Lists pull requests that **merged** while still carrying unresolved findings at
+their branch head. The report is the **union of two sets**, and they are not the
+same question:
+
+1. the obligations `LedgerObligationsAtHead` would demand, the gate's own predicate;
+2. findings whose **latest observation at that exact head is still open**, which
+   the gate's `dischargedAtHead` step deliberately removes.
+
+The second set exists because the gate asks "what must a **new** review at this
+head still observe", and a row already recorded there has been observed. That is
+correct for the gate and wrong for this report, which asks what was unresolved
+**when the pull request merged** - the case where a P1 sits at the exact head
+that merged. Those rows are labelled `still open at the merged head` so the two
+sets stay distinguishable. **The report and the gate can therefore disagree, by
+design, and only in that direction:** the report is a superset.
 
 **It keys on the branch head, never the merge commit.** Every merge in this
 repository is a squash, so the merge commit is a commit no reviewer ever
@@ -3384,9 +3395,11 @@ instrument failure wearing a success message.
 
 A pull request the forge cannot answer for is reported as a `degraded:` line
 rather than skipped: an outage must not render every merged pull request as
-resolved. `WAIVED true` means the repository declares
-`findings_consumption = advisory`, so the gate let those obligations through by
-declaration rather than by accident.
+resolved. `WAIVED` reflects the repository's **current** `findings_consumption` setting,
+read at report time. It is **not** evidence about the merge: the setting may have
+changed since, and no durable merge-time record of it exists, so reading it as
+"the gate let this through by declaration" reverses history whenever the config
+moved after the merge.
 
 `--merged-unresolved` accepts `--repo` alone to narrow the scan and takes
 neither `--pr` nor `--at-head`, and the refusal names that combination.
