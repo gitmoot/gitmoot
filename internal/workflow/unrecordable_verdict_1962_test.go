@@ -302,3 +302,79 @@ func TestApprovedWithSummaryOnlyIsNotAReviewVerdict(t *testing.T) {
 		t.Fatal("an ordinary ask that approved with only a summary was treated as a review verdict")
 	}
 }
+
+// #2061 f3, filed OPEN by the verdict that approved this PR: the two arms above
+// call reviewShapedResult DIRECTLY, so they would pass against a branch where
+// the predicate is correct and the call site never reaches the summary-only
+// case. That is the same gap the comment on
+// TestAdvanceJobRecordsAnUnrecordableAskVerdict warns about for its own
+// predecessors, reappearing in the tests I added to close a predicate hole.
+//
+// This is the production-path arm for it: no findings array at all, only a
+// Summary, driven through AdvanceJob.
+func TestAdvanceJobRecordsASummaryOnlyObjection(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "gm-review-opus", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+
+	insertCompletedJob(t, store, db.Job{ID: "ask-summary-only", Agent: "gm-review-opus", Type: "ask"}, JobPayload{
+		Repo: "gitmoot/gitmoot", TaskID: "task-ask-summary",
+		Result: &AgentResult{
+			Decision: "changes_requested", Severity: "P1",
+			Summary:  "the boundary check is inverted and must be fixed before merge",
+			Evidence: EvidenceExecuted,
+			TestsRun: []string{"go test ./internal/workflow/ -> ok"},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "ask-summary-only"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+
+	events, err := store.ListJobEvents(ctx, "ask-summary-only")
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	found := 0
+	for _, event := range events {
+		if event.Kind == "review_verdict_unrecordable" {
+			found++
+		}
+	}
+	if found != 1 {
+		t.Fatalf("review_verdict_unrecordable events = %d, want 1; an objection carrying only a "+
+			"summary must not vanish through the production path. events=%+v", found, events)
+	}
+}
+
+// THE ASYMMETRY, ALSO THROUGH THE PRODUCTION PATH. An ordinary ask that approves
+// with only a summary emits NOTHING. Without this arm, a later change could make
+// every summary-bearing ask a verdict and the arm above would still pass - which
+// is how the CI failure at #2061 happened in the first place.
+func TestAdvanceJobIgnoresASummaryOnlyApproval(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "gm-review-opus", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+
+	insertCompletedJob(t, store, db.Job{ID: "ask-plain-approve", Agent: "gm-review-opus", Type: "ask"}, JobPayload{
+		Repo: "gitmoot/gitmoot", TaskID: "task-ask-approve",
+		Result: &AgentResult{Decision: "approved", Summary: "ran on shell override"},
+	})
+
+	if err := engine.AdvanceJob(ctx, "ask-plain-approve"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+
+	events, err := store.ListJobEvents(ctx, "ask-plain-approve")
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	for _, event := range events {
+		if event.Kind == "review_verdict_unrecordable" {
+			t.Fatalf("an ordinary ask that approved nothing emitted %q; this is the event whose "+
+				"spurious emission failed three race shards and the tagged e2e", event.Kind)
+		}
+	}
+}
