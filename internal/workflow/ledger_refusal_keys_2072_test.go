@@ -72,16 +72,29 @@ func TestContentRefusalNamesTheAcceptedKeys(t *testing.T) {
 		// The filler is now drawn only from ledgerNonContentKeys, which is what a
 		// genuinely contentless finding looks like. This comment is the reverse
 		// drift the block below predicted, arriving from the direction it named.
-		`{"severity":"P3","location":"internal/workflow/findings_ledger_writer.go","file":"internal/workflow/findings_ledger_writer.go"}`))
+		//
+		// The location carries a SENTINEL rather than a real path. The echo
+		// assertion below needs a token that can ONLY have come from the verbatim
+		// echo: any real key name now appears in the message as an ADVERTISED key
+		// too, so asserting on one proves nothing about echoing (#2077 review F6).
+		`{"severity":"P3","location":"echo-sentinel-2072/only-here.go","file":"echo-sentinel-2072/only-here.go"}`))
 	message := refusalMessage(t, events)
 	for _, key := range ledgerContentKeys {
 		if !strings.Contains(message, key) {
 			t.Fatalf("refusal does not name accepted key %q, so the producer cannot learn it: %s", key, message)
 		}
 	}
-	// The rejected spelling must still be echoed, or the reviewer cannot tell
-	// which of their findings was dropped.
-	if !strings.Contains(message, "description") {
+	// The reviewer's own finding must still be echoed, or they cannot tell which
+	// of their findings was dropped.
+	//
+	// ASSERTED ON A SENTINEL, NOT A KEY NAME. This previously checked for
+	// "description", which was then a key nothing read, so its presence in the
+	// message could only have come from the echo. Now that the reader accepts
+	// `description`, the refusal names it in its ADVERTISED-KEYS list and the
+	// assertion would pass whether or not anything was echoed - and the loop above
+	// already covers advertisement. The sentinel appears nowhere but the raw
+	// finding.
+	if !strings.Contains(message, "echo-sentinel-2072/only-here.go") {
 		t.Fatalf("refusal dropped the reviewer's own text: %s", message)
 	}
 }

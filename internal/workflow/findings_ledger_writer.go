@@ -608,6 +608,14 @@ const (
 // truncateAtRune cuts s to at most max BYTES without splitting a rune, and
 // reports how many bytes were dropped.
 //
+// THE DROPPED COUNT IS OF THE NORMALISED TEXT, NOT OF THE STORED ROW (#2077
+// review F7). Coercion runs first and can change the length, so the two differ
+// exactly when a row held undecodable bytes: strings.Repeat("a\xff", 100) is 200
+// stored bytes and 400 after replacement, and a 200-byte cap reports 200 dropped
+// while only 100 original bytes lie beyond the displayed prefix. Callers must not
+// describe this number as bytes remaining ON THE ROW; the markers say
+// "of normalised text" for that reason.
+//
 // A NAIVE s[:max] CORRUPTS THE WHOLE BRIEF, not just the finding it cuts
 // (#2077 review F4). Reviewer prose is arbitrary UTF-8: "x" followed by 1,024
 // copies of U+00E9 is 2,049 valid bytes, and slicing at 2,048 keeps the first
@@ -736,7 +744,7 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 		}
 		title, titleCut, titleCoerced := truncateAtRune(obligation.Title, maxObligationTitleBytes)
 		if titleCut > 0 {
-			title += fmt.Sprintf(" [truncated, %d more bytes on the row]", titleCut)
+			title += fmt.Sprintf(" [truncated, %d more bytes of normalised text; read the row for the original]", titleCut)
 		}
 		if titleCoerced {
 			title += " [row held undecodable bytes; they were replaced]"
@@ -777,7 +785,7 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 			if concern != "" {
 				concern, cut, concernCoerced := truncateAtRune(concern, maxObligationConcernBytes)
 				if cut > 0 {
-					concern += fmt.Sprintf(" [truncated, %d more bytes on the row]", cut)
+					concern += fmt.Sprintf(" [truncated, %d more bytes of normalised text; read the row for the original]", cut)
 				}
 				if concernCoerced {
 					concern += " [row held undecodable bytes; they were replaced]"
