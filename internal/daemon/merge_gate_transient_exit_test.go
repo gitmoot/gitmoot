@@ -101,14 +101,29 @@ func seedBlockedReviewTaskAttributed(t *testing.T, store *db.Store, repo github.
 			t.Fatalf("AddTaskEvent(merge_gate_blocked) returned error: %v", err)
 		}
 	}
+	// #2074: MERGEABILITY IS STATED, because the omission modelled a state
+	// production does not reach. GitHub's `mergeable` is null only while it is
+	// still COMPUTING, and it never merges a pull request whose mergeability it
+	// has not computed - so a fixture that omits the field and then expects a
+	// merge describes an unreachable scenario, not a scenario the gate should
+	// support. `pipeline_auto_merge.go:121` already treated nil as WAITING before
+	// this gate did, and two sibling fixtures in this same package state the
+	// field explicitly (`daemon_test.go:1827`,
+	// `external_merge_reconcile_test.go:251`). The omission here was an oversight.
+	//
+	// The nil case is not lost with it: TestTransientMergeGateDoesNotMerge
+	// WhenMergeabilityIsUnknown below pins nil to pending directly, so the behaviour
+	// this fixture used to exercise by accident is now asserted on purpose.
+	mergeable := true
 	return github.PullRequest{
-		Number:  1699,
-		Title:   "Review PR #1699",
-		State:   "open",
-		URL:     "https://github.com/gitmoot/gitmoot/pull/1699",
-		HeadRef: "task-1699",
-		BaseRef: "main",
-		HeadSHA: "3f3a1026",
+		Number:    1699,
+		Title:     "Review PR #1699",
+		State:     "open",
+		URL:       "https://github.com/gitmoot/gitmoot/pull/1699",
+		HeadRef:   "task-1699",
+		BaseRef:   "main",
+		HeadSHA:   "3f3a1026",
+		Mergeable: &mergeable,
 	}
 }
 
@@ -837,5 +852,92 @@ func TestMergeGateBlockClassSurvivesTheBlockingCallStack(t *testing.T) {
 	}
 	if gate.BlockClass != int(workflow.MergeBlockNone) {
 		t.Fatalf("pending row block class = %d, want MergeBlockNone", gate.BlockClass)
+	}
+}
+
+// #2074. UNKNOWN MERGEABILITY MUST NOT MERGE, ASSERTED IN THE PACKAGE THAT
+// DRIVES THE GATE.
+//
+// THIS MIRRORS THE TEST ABOVE EXACTLY AND CHANGES ONE FIELD: Mergeable is nil.
+// That is deliberate and it is the second version of this test. My first version
+// built its own shorter fixture and asserted only "not merged" - which is true
+// under the fix AND under the mutant that removes it, because the shorter setup
+// never reached a merge at all. It passed while pinning nothing, and the mutant
+// run is what exposed it.
+//
+// Mirroring the passing sequence makes the comparison exact: the test above
+// reaches ONE merge with mergeability stated, so reaching ZERO here can only be
+// the mergeability guard.
+func TestTransientMergeGateDoesNotMergeWhenMergeabilityIsUnknown(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	pull := seedBlockedReviewTask(t, store, repo, workflow.MergeBlockTransient, "local worktree is not clean")
+	// THE ONE DIFFERENCE from the passing case.
+	pull.Mergeable = nil
+	initialTask, err := store.GetTask(ctx, "review-pr-1699-3f3a1026")
+	if err != nil {
+		t.Fatal(err)
+	}
+	implementPayload, err := json.Marshal(workflow.JobPayload{
+		Repo: repo.FullName(), Branch: pull.HeadRef, PullRequest: int(pull.Number),
+		HeadSHA: pull.HeadSHA, TaskID: initialTask.ID,
+		Result: &workflow.AgentResult{Decision: "implemented", Summary: "implemented current head"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "implement-current-1699", Agent: "implementer", Type: "implement",
+		State: string(workflow.JobSucceeded), Payload: string(implementPayload),
+	}); err != nil {
+		t.Fatalf("CreateJob(implement-current-1699) returned error: %v", err)
+	}
+	client := &mergeGateRaceGitHub{
+		fakeGitHub: &fakeGitHub{
+			pulls:    []github.PullRequest{pull},
+			comments: map[int64][]github.IssueComment{pull.Number: {}},
+		},
+		checks: []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+		statuses: []github.CommitStatusInput{{
+			Repo: repo, SHA: pull.HeadSHA, State: "success", Context: "ci",
+		}},
+		statusSucceeded: []bool{true},
+	}
+	git := &delayedClearanceMergeGateGit{}
+	gate := &workflow.PolicyMergeGate{AutoMerge: true, Store: store, GitHub: client, Git: git}
+	engine := workflow.Engine{Store: store, MergeGate: gate}
+	now := time.Now().UTC().Add(time.Hour)
+	daemon := Daemon{
+		Repo: repo, Store: store, GitHub: client, Workflow: &engine,
+		Now: func() time.Time { return now },
+	}
+	poll := func(label string) {
+		t.Helper()
+		pollErr := daemon.PollOnce(ctx)
+		var blocked workflow.BlockedError
+		if pollErr != nil && !errors.As(pollErr, &blocked) {
+			t.Fatalf("%s: %v", label, pollErr)
+		}
+	}
+	for attempt := 1; attempt <= 3; attempt++ {
+		poll(fmt.Sprintf("release %d", attempt))
+		poll(fmt.Sprintf("dirty evaluation %d", attempt))
+		now = now.Add(transientMergeGateRetryInterval + time.Second)
+	}
+	git.clean = true
+	poll("release after real condition clearance")
+	poll("evaluate after real condition clearance")
+
+	task, err := store.GetTask(ctx, initialTask.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// THE DISCRIMINATOR. The mirrored test above reaches exactly one merge here.
+	if len(client.merges) != 0 {
+		t.Fatalf("merged with mergeability GitHub has not computed: merges=%+v task=%+v", client.merges, task)
+	}
+	if task.State == string(workflow.TaskMerged) {
+		t.Fatalf("task reached merged with unknown mergeability: %+v", task)
 	}
 }
