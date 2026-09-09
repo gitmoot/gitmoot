@@ -227,11 +227,22 @@ progress, a hang and a deadlock all stop at the same boundary with the same
 duration. Verified by running `go test -timeout 3s ./internal/cli/`, which
 produced exactly this shape at `3.012s`.
 
-So the number tells you which instrument fired, and the **`running tests:` list
-and goroutine dump** tell you why. Read those before concluding anything: if the
-listed tests are ones you expect to be slow, pass `-timeout 25m` and move on; if
-one is blocked on a channel or lock in the dump, you have a real hang that the
-longer deadline will only postpone.
+So the number tells you which instrument fired, and the **`running tests:` list**
+tells you what was still in flight. Start there: if those tests are ones you
+expect to be slow, pass `-timeout 25m` and move on.
+
+**A blocked frame in the goroutine dump is NOT evidence of a hang**, and reading
+it as one is the easy mistake. The dump is an instantaneous snapshot, and a Go
+test binary always contains legitimate waiters: in the run above, `goroutine 1`
+sat in `[chan receive]` inside `testing.(*T).Run`, which is simply a parent
+waiting for the subtest it started. Measured: a parent found in exactly that
+state, `TestPrepareLocalImplementFixPassPreservesWorktreeSafetyChecks`, then
+passed on its own in **0.54s**.
+
+To tell slow from stuck, look at the **active leaf** rather than any waiting
+frame, and prefer **two observations over one**: run the suspect test alone, or
+dump twice and see whether the leaf moved. A goroutine that is still on the same
+line across two samples is stuck; one that has advanced was only slow.
 
 The CLI entrypoint lives under `cmd/gitmoot/`. The CI gate is Go-only — it does
 **not** build the website or run the live multi-runtime (codex/claude/kimi) E2E
