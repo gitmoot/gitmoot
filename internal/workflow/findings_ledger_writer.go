@@ -616,8 +616,12 @@ func truncateAtRune(s string, max int) (string, int) {
 	// covered corruption this function INTRODUCES; inherited corruption reached
 	// the prompt unchanged.
 	//
-	// Coercion LENGTHENS: each invalid byte becomes a 3-byte replacement rune. So
-	// it must happen before the bound is applied, or the bound stops holding on
+	// Coercion LENGTHENS: strings.ToValidUTF8 replaces each contiguous RUN of
+	// invalid bytes with ONE 3-byte replacement rune, so growth depends on how the
+	// invalid bytes are DISTRIBUTED, not how many there are. A hundred consecutive
+	// 0xff collapse to three bytes; a hundred interleaved ones become three
+	// hundred. Either way it can grow, so the coercion
+	// must happen before the bound is applied, or the bound stops holding on
 	// exactly the input that needed it.
 	if !utf8.ValidString(s) {
 		s = strings.ToValidUTF8(s, "\uFFFD")
