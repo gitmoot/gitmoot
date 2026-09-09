@@ -54,14 +54,15 @@ func daemonDrainSentinelPath(configHome string) (string, error) {
 // outcome drain exists to prevent.
 // daemonDrainActive reports whether the operator has drained this daemon.
 //
-// THE HOME IS A PARAMETER, NOT A PACKAGE GLOBAL. The first version stored it in
-// a var set once at daemon start, which made the guard INERT for any caller
-// reaching the scheduler outside a started daemon and forced tests into a
-// save/restore dance around shared state. Two reviewers found it independently
-// (#2096 review; gm-staged reading the branch). The single call site already
-// has the worker in scope, so the global bought nothing.
-func daemonDrainActive(configHome string) (bool, error) {
-	return daemonDrainActiveForHome(configHome)
+// IT TAKES A RESOLVED PATH AND DOES ONE STAT. No home resolution, no syscall
+// beyond the stat, nothing that can fail in a way that stalls dispatch.
+func daemonDrainActive(sentinelPath string) (bool, error) {
+	if sentinelPath == "" {
+		// Resolution failed at construction and was announced there. Claiming is
+		// the lesser evil versus refusing every job; see defaultJobWorker.
+		return false, nil
+	}
+	return drainSentinelPresent(sentinelPath)
 }
 
 func daemonDrainActiveForHome(configHome string) (bool, error) {
@@ -82,6 +83,12 @@ func daemonDrainActiveForHome(configHome string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	return drainSentinelPresent(path)
+}
+
+// drainSentinelPresent is the ONE stat, shared by the hot path and the CLI so
+// they cannot drift on what "present" or "unreadable" means.
+func drainSentinelPresent(path string) (bool, error) {
 	switch _, statErr := os.Stat(path); {
 	case statErr == nil:
 		return true, nil

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -356,5 +357,83 @@ func TestDrainHomeResolvesExactlyOnce(t *testing.T) {
 	}
 	if paths.Home == raw {
 		t.Fatal("resolution is a no-op in this fixture, so this test proves nothing")
+	}
+}
+
+// THE HOT PATH RESOLVES NOTHING: the sentinel path is fixed at construction.
+//
+// Owner ruling on #2096 round 3: resolving the home on every eligibility call
+// put os.UserHomeDir() on the dispatch path, where a failure aborts
+// listPendingQueuedJobs and stalls EVERY job - a strictly larger blast radius
+// than the no-op it replaced.
+//
+// PROVED BY MOVING HOME AFTER CONSTRUCTION. If the guard still resolved per
+// call it would follow the new HOME and see nothing; because the path was fixed
+// at construction it keeps watching the home the daemon actually started with.
+// That is the difference between "resolved once" and "resolved every time",
+// and it is not visible from reading the call site.
+func TestDrainSentinelPathIsFixedAtWorkerConstruction(t *testing.T) {
+	started := t.TempDir()
+	t.Setenv("HOME", started)
+
+	store := openCLIJobStore(t, started)
+	worker := defaultJobWorker(store, io.Discard)
+	if worker.DrainSentinelPath == "" {
+		t.Fatal("worker carries no sentinel path; the guard is inert")
+	}
+	if !strings.HasPrefix(worker.DrainSentinelPath, started) {
+		t.Fatalf("sentinel path %q is not under the started home %q", worker.DrainSentinelPath, started)
+	}
+
+	// The operator drains the daemon that is running.
+	if err := setDaemonDrain("", true); err != nil {
+		t.Fatalf("setDaemonDrain: %v", err)
+	}
+
+	// HOME moves underneath the running process. A per-call resolver would now
+	// look in the wrong place and report not-draining.
+	moved := t.TempDir()
+	t.Setenv("HOME", moved)
+
+	on, err := daemonDrainActive(worker.DrainSentinelPath)
+	if err != nil {
+		t.Fatalf("guard: %v", err)
+	}
+	if !on {
+		t.Fatal("the guard lost the drain when HOME moved; the path is being resolved per call, not carried")
+	}
+}
+
+// THE SCHEDULER CONSULTS THE CARRIED PATH, NOT THE HOME - AT THE PRODUCTION PATH.
+//
+// TestDrainSentinelPathIsFixedAtWorkerConstruction proves the field is right;
+// it calls the guard directly, so it CANNOT tell whether listPendingQueuedJobs
+// actually uses it. Measured: reverting the scheduler to per-call resolution
+// SURVIVED every other test in this file, because the two agree whenever the
+// home is stable. This test makes them disagree.
+//
+// After construction the worker's ConfigHome is repointed somewhere with no
+// sentinel. A per-call resolver follows ConfigHome, finds nothing and DISPATCHES
+// THROUGH A DRAIN. The carried path keeps watching the home the daemon started
+// with, which is the whole point of resolving once.
+func TestDispatchUsesTheCarriedSentinelPathNotTheCurrentHome(t *testing.T) {
+	ctx, _, _, worker := diskGuardDispatchFixture(t)
+
+	if err := setDaemonDrain(worker.ConfigHome, true); err != nil {
+		t.Fatalf("set drain: %v", err)
+	}
+	if worker.DrainSentinelPath == "" {
+		t.Fatal("fixture worker carries no sentinel path, so this test cannot discriminate")
+	}
+
+	// The home moves; the running daemon's sentinel does not.
+	worker.ConfigHome = t.TempDir()
+
+	during, err := listPendingQueuedJobs(ctx, worker, "owner/repo", "", true)
+	if err != nil {
+		t.Fatalf("listPendingQueuedJobs while draining: %v", err)
+	}
+	if len(during) != 0 {
+		t.Fatalf("dispatch selected %d jobs while draining: the scheduler resolved the CURRENT home instead of the carried path", len(during))
 	}
 }

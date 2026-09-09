@@ -2085,7 +2085,7 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 	// and restart into a real idle window - which is the half that needs no FD
 	// preservation and no owner-scale design decision.
 	if forDispatch {
-		draining, err := daemonDrainActive(worker.ConfigHome)
+		draining, err := daemonDrainActive(worker.DrainSentinelPath)
 		if err != nil {
 			return nil, err
 		}
