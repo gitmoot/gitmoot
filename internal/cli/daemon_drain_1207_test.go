@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -208,5 +209,45 @@ func TestDrainStopsTheDispatchPathFromSelectingWork(t *testing.T) {
 	}
 	if len(after) != len(before) {
 		t.Fatalf("after clearing drain %d jobs are eligible, want the original %d", len(after), len(before))
+	}
+}
+
+// A STAT ERROR THAT IS NOT "MISSING" MUST NOT READ AS "NOT DRAINING".
+//
+// The guard's default arm returns an error, and the caller aborts the listing on
+// it - so an unreadable sentinel pauses dispatch rather than resuming it. That
+// branch had no test, and it is the one a mutant survives.
+//
+// THE FIXTURE SHAPE IS gm-staged's, FROM THEIR OWN MISTAKE: their version of
+// this test made the marker path a DIRECTORY. A directory STATS FINE, so the
+// test reached the ordinary present branch, asserted the right conclusion for
+// the wrong reason, and a mutant flipping the error arm survived it. Making the
+// marker's PARENT a regular file yields ENOTDIR, which is a real stat failure,
+// and the assertion checks the error is NEITHER nil NOR IsNotExist before
+// concluding anything.
+func TestDrainStatFailureIsAnErrorNotAQuietResume(t *testing.T) {
+	home := t.TempDir()
+	path, err := daemonDrainSentinelPath(home)
+	if err != nil {
+		t.Fatalf("sentinel path: %v", err)
+	}
+	parent := filepath.Dir(path)
+	if err := os.RemoveAll(parent); err != nil {
+		t.Fatalf("clear parent: %v", err)
+	}
+	// The parent is now a FILE, so stat of a path beneath it fails ENOTDIR.
+	if err := os.WriteFile(parent, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("make parent a file: %v", err)
+	}
+
+	on, statErr := daemonDrainActiveForHome(home)
+	if statErr == nil {
+		t.Fatal("an unreadable sentinel returned no error; dispatch would resume during a deploy")
+	}
+	if errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("ENOTDIR was classified as missing, which resumes claiming: %v", statErr)
+	}
+	if on {
+		t.Fatal("the guard reported draining AND an error; the caller must decide on the error alone")
 	}
 }
