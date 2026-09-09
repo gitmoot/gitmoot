@@ -280,6 +280,11 @@ type findingsObligationsReport struct {
 	Head         string               `json:"head"`
 	Obligations  []findingsObligation `json:"obligations"`
 	Degradations []string             `json:"degradations,omitempty"`
+	// Advisory carries the repository's #1969 findings-consumption declaration.
+	// When true the obligations below are RECORDED AND NOT HELD: the merge gate
+	// waives them. A consumer that ignores this field will report an advisory
+	// repository as blocked.
+	Advisory bool `json:"advisory"`
 }
 
 // runFindingsObligations answers "what would the merge gate still demand at this
@@ -306,10 +311,20 @@ func runFindingsObligations(repo string, pullRequest int, head string, home stri
 		}
 		// A missing checkout is a DEGRADATION, not a failure: the predicate still
 		// answers for open findings, which are mandatory unconditionally.
+		//
+		// #2099 f2: THE NOTE STATES THE FACT, NOT ITS ASSUMED CONSEQUENCE. The
+		// first version said "answered findings are advisory" here, which is a
+		// claim about the RESOLVERS - and it was often false, because
+		// github.NewClient("") is non-nil and daemonLedgerChangedFiles still
+		// installs the compare-API fallback. An answered finding could then be
+		// correctly re-armed and printed while the note said it could not be.
+		//
+		// So this reports only what it knows: the checkout is missing. What that
+		// costs is derived below, from the resolvers that actually exist.
 		checkout, err = mergeGateCheckout(ctx, store, repo, "")
 		if err != nil {
 			report.Degradations = append(report.Degradations,
-				fmt.Sprintf("no checkout for %s, so answered findings are advisory and locators are unverified: %v", repo, err))
+				fmt.Sprintf("no registered checkout for %s: %v", repo, err))
 			checkout = ""
 		}
 		return nil
@@ -320,6 +335,33 @@ func runFindingsObligations(repo string, pullRequest int, head string, home stri
 
 	resolvers := daemonLedgerResolvers(github.NewClient(checkout), checkout, subprocess.ExecRunner{})
 	scope := resolvers.ScopeFor(repo, pullRequest, "")
+	// #2099 f1: CARRY THE REPOSITORY'S DECLARATION, BECAUSE THE GATE DOES.
+	//
+	// The production path resolves findings_consumption into
+	// MergeRequest.FindingsAdvisory, copies it onto the LedgerScope, and
+	// EnsureLedgerObligationsObserved then returns nil for exactly these pending
+	// obligations when the repository is advisory. Printing them without the
+	// declaration reports an advisory repository as blocked by obligations its
+	// own gate waives - which is the CLI answering differently from the thing
+	// that blocks, the one property this command exists to guarantee.
+	//
+	// The obligations are still LISTED, because advisory means recorded and not
+	// held, never invisible (#1969). What changes is the sentence beside them.
+	// DERIVED FROM THE RESOLVERS THAT EXIST, not from what produced them. Each
+	// missing half has a different, specific consequence, and naming the wrong
+	// one is what #2099 f2 caught.
+	if resolvers.ChangedSince == nil {
+		report.Degradations = append(report.Degradations,
+			"no changed-file resolver, so an ANSWERED finding cannot be re-armed by relevance and will not appear here")
+	}
+	if resolvers.PathExistsAtHead == nil {
+		report.Degradations = append(report.Degradations,
+			"no locator resolver, so a STATIC answer citing a deleted path still counts as an answer")
+	}
+	advisory := loadReviewConfig(home).For(repo).FindingsAreAdvisory()
+	report.Advisory = advisory
+	scope.FindingsAdvisory = advisory
+	scope.Repo = repo
 	scope.Degraded = func(note string) {
 		report.Degradations = append(report.Degradations, note)
 	}
@@ -344,7 +386,11 @@ func runFindingsObligations(repo string, pullRequest int, head string, home stri
 
 	if len(report.Obligations) == 0 {
 		fmt.Fprintf(stdout, "no obligations for %s#%d at %s\n", repo, pullRequest, shortFindingsHead(head))
-	} else {
+	} else if advisory {
+		fmt.Fprintf(stdout, "%s declares findings_consumption = advisory: the merge gate WAIVES these and does not hold the merge.\n", repo)
+		fmt.Fprintln(stdout, "They are listed because advisory means recorded, not invisible.")
+	}
+	if len(report.Obligations) > 0 {
 		writer := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(writer, "UID\tSEV\tROUND\tREASON")
 		for _, obligation := range report.Obligations {
