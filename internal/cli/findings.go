@@ -78,6 +78,17 @@ func runFindings(args []string, stdout, stderr io.Writer) int {
 	// predicate, through the same LedgerResolvers the daemon and the merge gate
 	// hold, so the CLI cannot answer differently from the thing that blocks.
 	atHead := fs.String("at-head", "", "with --repo and --pr, list the obligations the merge gate would still demand at this head")
+	// #1971: THE CLASS GREW FROM 198 FINDINGS TO 288 IN TWO DAYS WITH NOTHING
+	// REPORTING IT. Merged pull requests carrying unresolved obligations are
+	// invisible: the merge is done, the PR is closed, and the ledger rows sit
+	// there. Of 28 such pull requests measured on this box, 23 had NO merge_gates
+	// row at all - gitmoot's gate was never asked, because main carries no branch
+	// protection - and zero of the 288 findings were ever refused.
+	//
+	// This is the only clause of #1971 that does not depend on the merge path: a
+	// stricter gate would have stopped none of them, and a report would have
+	// surfaced all of them.
+	mergedUnresolved := fs.Bool("merged-unresolved", false, "list merged pull requests whose findings the merge gate would still have demanded")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -94,7 +105,7 @@ func runFindings(args []string, stdout, stderr io.Writer) int {
 	// repository full of them. Measured: that is exactly what the first version
 	// of this command did. Refusing beats a listing that is empty for the wrong
 	// reason, which is the failure this whole finding is about.
-	if (strings.TrimSpace(*repo) == "") != (*pullRequest == 0) {
+	if !*mergedUnresolved && (strings.TrimSpace(*repo) == "") != (*pullRequest == 0) {
 		fmt.Fprintln(stderr, "findings: --repo and --pr must be given together; a finding UID is unique only within one repository's pull request")
 		return 2
 	}
@@ -104,6 +115,13 @@ func runFindings(args []string, stdout, stderr io.Writer) int {
 	if strings.TrimSpace(*atHead) != "" && strings.TrimSpace(*repo) == "" {
 		fmt.Fprintln(stderr, "findings: --at-head requires --repo and --pr; obligations are computed for one pull request at one head")
 		return 2
+	}
+	if *mergedUnresolved {
+		if strings.TrimSpace(*atHead) != "" || *pullRequest != 0 {
+			fmt.Fprintln(stderr, "findings: --merged-unresolved scans every merged pull request; it accepts --repo alone to narrow the scan, and neither --pr nor --at-head")
+			return 2
+		}
+		return runFindingsMergedUnresolved(strings.TrimSpace(*repo), *home, *jsonOutput, stdout, stderr)
 	}
 	if strings.TrimSpace(*atHead) != "" {
 		return runFindingsObligations(strings.TrimSpace(*repo), *pullRequest, strings.TrimSpace(*atHead), *home, *jsonOutput, stdout, stderr)
@@ -422,4 +440,199 @@ func shortFindingsHead(head string) string {
 		return head[:8]
 	}
 	return head
+}
+
+// findingsMergedUnresolved is one merged pull request that still carries
+// obligations the merge gate would have demanded.
+type findingsMergedUnresolved struct {
+	Repo        string               `json:"repo"`
+	PullRequest int64                `json:"pull_request"`
+	HeadSHA     string               `json:"head_sha"`
+	MergedAt    string               `json:"merged_at,omitempty"`
+	Advisory    bool                 `json:"advisory"`
+	Obligations []findingsObligation `json:"obligations"`
+}
+
+// findingsMergedUnresolvedReport carries the rows plus what the scan covered and
+// what it could not resolve.
+//
+// SCANNED IS PART OF THE ANSWER. An empty list from a scan of seven
+// repositories and an empty list from a scan of zero read identically, and the
+// second is an instrument failure wearing a success message. That defect
+// shipped once in this command already (#2086 f3), so the counts are reported
+// rather than left for a reader to assume.
+type findingsMergedUnresolvedReport struct {
+	ScannedRepos        int                        `json:"scanned_repos"`
+	ScannedPullRequests int                        `json:"scanned_pull_requests"`
+	Merged              int                        `json:"merged_pull_requests"`
+	Unresolved          []findingsMergedUnresolved `json:"unresolved"`
+	Degradations        []string                   `json:"degradations,omitempty"`
+}
+
+// runFindingsMergedUnresolved reports merged pull requests whose obligations the
+// merge gate would still have demanded (#1971 clause 3).
+//
+// IT KEYS ON THE BRANCH HEAD, NEVER THE MERGE COMMIT, and that is not a
+// preference. Every merge in this repository is a SQUASH, so the merge commit is
+// a commit no reviewer ever observed: measured across 28 merged pull requests
+// carrying findings, the ledger holds 19 with an observation at the branch head
+// and ZERO at the merge commit, with the two SHAs never equal.
+//
+// The failure is silent in both directions depending on how the caller assembles
+// its input. Filter observations to the merge sha first and the predicate sees
+// an empty input and reports a clean list forever. Pass the merge sha as the
+// head instead, and dischargedAtHead - which discharges only on an exact head
+// match - never discharges anything, so every answered row reappears as an
+// obligation. Empty or inflated, and neither announces itself.
+func runFindingsMergedUnresolved(repoFilter string, home string, jsonOutput bool, stdout, stderr io.Writer) int {
+	ctx := context.Background()
+	report := findingsMergedUnresolvedReport{Unresolved: []findingsMergedUnresolved{}}
+
+	var pairs []db.ReviewFindingPullRequest
+	observations := map[string][]db.ReviewFindingObservation{}
+	checkouts := map[string]string{}
+	if err := withStoreAndPaths(home, func(_ config.Paths, store *db.Store) error {
+		var err error
+		pairs, err = store.ListReviewFindingPullRequests(ctx)
+		if err != nil {
+			return err
+		}
+		repos := map[string]bool{}
+		for _, pair := range pairs {
+			if repoFilter != "" && !strings.EqualFold(pair.Repo, repoFilter) {
+				continue
+			}
+			repos[pair.Repo] = true
+			rows, listErr := store.ListReviewFindingObservations(ctx, pair.Repo, pair.PullRequest)
+			if listErr != nil {
+				return listErr
+			}
+			observations[findingsPairKey(pair)] = rows
+		}
+		for repo := range repos {
+			checkout, checkoutErr := mergeGateCheckout(ctx, store, repo, "")
+			if checkoutErr != nil {
+				report.Degradations = append(report.Degradations,
+					fmt.Sprintf("no registered checkout for %s: %v", repo, checkoutErr))
+				continue
+			}
+			checkouts[repo] = checkout
+		}
+		return nil
+	}); err != nil {
+		fmt.Fprintf(stderr, "findings: %v\n", err)
+		return 1
+	}
+
+	reviewCfg := loadReviewConfig(home)
+	seenRepos := map[string]bool{}
+	for _, pair := range pairs {
+		if repoFilter != "" && !strings.EqualFold(pair.Repo, repoFilter) {
+			continue
+		}
+		seenRepos[pair.Repo] = true
+		report.ScannedPullRequests++
+
+		owner, name, ok := strings.Cut(pair.Repo, "/")
+		if !ok {
+			report.Degradations = append(report.Degradations, fmt.Sprintf("unparseable repo %q, skipped", pair.Repo))
+			continue
+		}
+		checkout := checkouts[pair.Repo]
+		pull, err := newFindingsGitHubClient(checkout).GetPullRequest(ctx, github.Repository{Owner: owner, Name: name}, pair.PullRequest)
+		if err != nil {
+			// A pull request the forge cannot answer for is UNKNOWN, not clean.
+			report.Degradations = append(report.Degradations,
+				fmt.Sprintf("%s#%d could not be read from the forge, so it is neither included nor cleared: %v", pair.Repo, pair.PullRequest, err))
+			continue
+		}
+		if !pull.Merged && strings.TrimSpace(pull.MergedAt) == "" {
+			continue
+		}
+		report.Merged++
+
+		head := strings.TrimSpace(pull.HeadSHA)
+		if head == "" {
+			report.Degradations = append(report.Degradations,
+				fmt.Sprintf("%s#%d reports no head sha, so its obligations cannot be evaluated", pair.Repo, pair.PullRequest))
+			continue
+		}
+
+		resolvers := daemonLedgerResolvers(github.NewClient(checkout), checkout, subprocess.ExecRunner{})
+		scope := resolvers.ScopeFor(pair.Repo, int(pair.PullRequest), "")
+		scope.Repo = pair.Repo
+		scope.FindingsAdvisory = reviewCfg.For(pair.Repo).FindingsAreAdvisory()
+		scope.Degraded = func(note string) {
+			report.Degradations = append(report.Degradations, fmt.Sprintf("%s#%d: %s", pair.Repo, pair.PullRequest, note))
+		}
+
+		var obligations []findingsObligation
+		for _, obligation := range workflow.LedgerObligationsAtHead(ctx, observations[findingsPairKey(pair)], head, scope) {
+			obligations = append(obligations, findingsObligation{
+				FindingUID: obligation.FindingUID,
+				RoundLabel: obligation.RoundLabel,
+				Severity:   obligation.Severity,
+				Reason:     obligation.Reason,
+			})
+		}
+		if len(obligations) == 0 {
+			continue
+		}
+		report.Unresolved = append(report.Unresolved, findingsMergedUnresolved{
+			Repo: pair.Repo, PullRequest: pair.PullRequest, HeadSHA: head,
+			MergedAt: strings.TrimSpace(pull.MergedAt),
+			Advisory: scope.FindingsAdvisory, Obligations: obligations,
+		})
+	}
+	report.ScannedRepos = len(seenRepos)
+
+	if jsonOutput {
+		encoded, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			fmt.Fprintf(stderr, "findings: %v\n", err)
+			return 1
+		}
+		fmt.Fprintln(stdout, string(encoded))
+		return 0
+	}
+
+	fmt.Fprintf(stdout, "scanned %d repositor%s, %d pull request(s) with findings, %d merged\n",
+		report.ScannedRepos, map[bool]string{true: "y", false: "ies"}[report.ScannedRepos == 1],
+		report.ScannedPullRequests, report.Merged)
+	if len(report.Unresolved) == 0 {
+		fmt.Fprintln(stdout, "no merged pull request carries an unresolved obligation")
+	} else {
+		writer := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(writer, "PR\tHEAD\tMERGED\tWAIVED\tUID\tSEV\tREASON")
+		for _, row := range report.Unresolved {
+			for _, obligation := range row.Obligations {
+				fmt.Fprintf(writer, "%s#%d\t%s\t%s\t%t\t%s\t%s\t%s\n",
+					row.Repo, row.PullRequest, shortFindingsHead(row.HeadSHA), row.MergedAt,
+					row.Advisory, obligation.FindingUID, obligation.Severity, obligation.Reason)
+			}
+		}
+		if err := writer.Flush(); err != nil {
+			fmt.Fprintf(stderr, "findings: %v\n", err)
+			return 1
+		}
+		fmt.Fprintln(stdout)
+		fmt.Fprintln(stdout, "These merged with obligations the gate would have demanded at their branch head.")
+		fmt.Fprintln(stdout, "WAIVED true means the repository declares findings_consumption = advisory, so the")
+		fmt.Fprintln(stdout, "gate let them through by declaration rather than by accident.")
+	}
+	for _, note := range report.Degradations {
+		fmt.Fprintf(stdout, "degraded: %s\n", note)
+	}
+	return 0
+}
+
+func findingsPairKey(pair db.ReviewFindingPullRequest) string {
+	return fmt.Sprintf("%s#%d", pair.Repo, pair.PullRequest)
+}
+
+// newFindingsGitHubClient is the forge seam for the merged-unresolved scan,
+// following the convention agent_dispatch.go:26 already uses in this package
+// rather than introducing a second one.
+var newFindingsGitHubClient = func(checkout string) github.Client {
+	return github.NewClient(checkout)
 }

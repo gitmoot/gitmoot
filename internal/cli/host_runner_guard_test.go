@@ -35,6 +35,10 @@ var hostRunnerAllowlist = map[string]hostRunnerAllowance{
 		execRunners: 1,
 		reason:      "operator and test helper fallback; admitted jobs install the resolved backend runner before dispatch",
 	},
+	"internal/cli/findings.go:runFindingsMergedUnresolved": {
+		execRunners: 1,
+		reason:      "operator-side ledger scan; it reads each registered host checkout to resolve obligations at merged heads and dispatches no job, so there is no resolved backend runner to inherit",
+	},
 	"internal/cli/findings.go:runFindingsObligations": {
 		execRunners: 1,
 		reason:      "operator-side ledger query; it reads the registered host checkout to resolve obligations and dispatches no job, so there is no resolved backend runner to inherit",

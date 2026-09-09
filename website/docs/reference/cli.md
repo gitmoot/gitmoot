@@ -2951,6 +2951,43 @@ those as task events; this command has no task, so it prints them as
 `degraded: ...` lines. An empty obligation list and an instrument that could not
 look otherwise read identically, and the empty one reads as good news.
 
+
+### Finding merged pull requests that still carry obligations
+
+```bash
+gitmoot findings --merged-unresolved
+gitmoot findings --merged-unresolved --repo owner/repo
+gitmoot findings --merged-unresolved --json
+```
+
+Lists pull requests that **merged** while carrying obligations the merge gate
+would still have demanded at their branch head. It is the same predicate the
+`--at-head` mode uses, applied to every pull request the ledger has observed,
+so the report and the gate cannot disagree.
+
+**It keys on the branch head, never the merge commit.** Every merge in this
+repository is a squash, so the merge commit is a commit no reviewer ever
+observed: measured across 28 merged pull requests carrying findings, the ledger
+holds 19 observations at branch heads and **zero** at merge commits, and the two
+SHAs are never equal. Keying on the merge commit fails silently in both
+directions - filter the observations to it and the report is empty forever;
+pass it as the head and nothing is ever discharged, so every answered row
+reappears.
+
+**It reports what it scanned.** `scanned 7 repositories, 40 pull requests with
+findings, 26 merged` - because an empty list from a scan of seven and an empty
+list from a scan of zero read identically otherwise, and the second is an
+instrument failure wearing a success message.
+
+A pull request the forge cannot answer for is reported as a `degraded:` line
+rather than skipped: an outage must not render every merged pull request as
+resolved. `WAIVED true` means the repository declares
+`findings_consumption = advisory`, so the gate let those obligations through by
+declaration rather than by accident.
+
+`--merged-unresolved` accepts `--repo` alone to narrow the scan and takes
+neither `--pr` nor `--at-head`, and the refusal names that combination.
+
 ## Result Checks
 
 After a daemon-run job's `gitmoot_result` is parsed, Gitmoot runs a set of
