@@ -212,12 +212,26 @@ completes in well under 10 minutes on its runners), so this was a
 local-only gap — but a command documented as "run this before committing"
 has to actually be able to finish.
 
-**What that failure LOOKS like, because two seats misread it as a hang within one
-hour:** omit the flag and the run dies with `panic: test timed out after 10m0s`
-followed by `FAIL github.com/gitmoot/gitmoot/internal/cli 600.02s`, with no failing
-test named. A wall time of 600.0xx seconds IS the default deadline, not a stall
-and not a deadlock: the suite was still working when Go killed it. Read the
-number before debugging the package: a real hang does not stop at exactly 600s.
+**What that failure LOOKS like, because two seats misread it within one hour:**
+omit the flag and the run dies with `panic: test timed out after 10m0s`, then a
+`running tests:` list, then a full goroutine dump, then
+`FAIL	github.com/gitmoot/gitmoot/internal/cli	600.025s` (Go prints three
+decimals). **No FAILED test is named** - the panic attributes nothing to a
+failing assertion - so the output reads like a broken package, which is what both
+seats started debugging.
+
+A wall time of `600.0xx` seconds identifies **enforcement of Go's default
+per-package deadline, and nothing more**. It does NOT tell you the suite was
+healthy: Go's alarm fires whenever the binary exceeds the duration, so slow
+progress, a hang and a deadlock all stop at the same boundary with the same
+duration. Verified by running `go test -timeout 3s ./internal/cli/`, which
+produced exactly this shape at `3.012s`.
+
+So the number tells you which instrument fired, and the **`running tests:` list
+and goroutine dump** tell you why. Read those before concluding anything: if the
+listed tests are ones you expect to be slow, pass `-timeout 25m` and move on; if
+one is blocked on a channel or lock in the dump, you have a real hang that the
+longer deadline will only postpone.
 
 The CLI entrypoint lives under `cmd/gitmoot/`. The CI gate is Go-only — it does
 **not** build the website or run the live multi-runtime (codex/claude/kimi) E2E
