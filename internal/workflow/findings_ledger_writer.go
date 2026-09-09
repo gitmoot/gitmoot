@@ -471,6 +471,45 @@ func (e Engine) ReviewObligationBrief(ctx context.Context, repo string, pullRequ
 // severity, and the reviewer's own bytes - and it says what to do about it. The
 // raw JSON is bounded because a finding can carry a large evidence blob and a
 // job event is not a place to store one.
+// ledgerContentKeys names every JSON key this reader will take finding text
+// from, in the order firstNonEmptyLedgerText consults them.
+//
+// IT IS A HAND-WRITTEN LIST, NOT A DERIVED ONE, and that is a hazard rather than
+// a convenience: a list that drifts from the parser would send reviewers to a
+// key the reader ignores, which is a worse failure than the silence this
+// replaces. Two tests hold it: one asserts every advertised key is a real json
+// tag, and one asserts every string field on the wire is CLASSIFIED as content
+// or not - so adding a field to reviewFindingWire fails the suite until somebody
+// decides which it is.
+//
+// WHY THE REFUSAL HAS TO SAY THIS (#2072). Four producers have now emitted four
+// spellings - uid/disposition (#2059), bare prose (#2072), an inline [P1]
+// (#2057), and description/location (#2069 f1) - and each was repaired by
+// teaching the reader one more spelling. That does not converge: the set of key
+// names a competent reviewer might choose is not closed. The refusal is the one
+// place the producer is already listening, so it is where the accepted set
+// belongs. A reviewer whose text was dropped can now see why in the same event
+// that reports the drop, instead of the next reader being written for them.
+// MEASURED, ONE KEY AT A TIME, NOT ASSUMED. Five of these rescue a finding on
+// their own. `rationale` is real finding text but CONDITIONAL: obs.Rationale is
+// copied only on the STATIC arm, which needs a locator, so a rationale alone
+// reaches the store empty and is refused for having no rationale. Measured:
+// rationale alone REFUSED, rationale plus file RECORDED.
+//
+// It is advertised WITH that condition rather than hidden. An earlier revision
+// of this change simply dropped it, which made the sentence true and the advice
+// worse - a reviewer whose rationale was the right way to say it would have been
+// steered off a key that works.
+var ledgerContentKeys = []string{"title", "summary", "detail", "body", "evidence"}
+
+// ledgerConditionalContentKeys carry finding text only alongside a locator.
+var ledgerConditionalContentKeys = []string{"rationale"}
+
+func ledgerContentKeyList() string {
+	return strings.Join(ledgerContentKeys, ", ") +
+		" (or " + strings.Join(ledgerConditionalContentKeys, ", ") + " together with a file)"
+}
+
 func (e Engine) recordLedgerContentRefusal(ctx context.Context, jobID string, index int, severity string, raw json.RawMessage) {
 	if e.Store == nil {
 		return
@@ -487,11 +526,12 @@ func (e Engine) recordLedgerContentRefusal(ctx context.Context, jobID string, in
 		JobID: jobID,
 		Kind:  "findings_ledger_refused",
 		Message: fmt.Sprintf(
-			"finding[%d] at claimed severity %s was REFUSED, not recorded: it carries no title, detail or rationale, "+
+			"finding[%d] at claimed severity %s was REFUSED, not recorded: it carries no finding text this reader "+
+				"can read, "+
 				"so it names no defect that can be evaluated or discharged. The verdict's own severity still blocks the "+
-				"merge, so nothing is unblocked by this refusal. Restate the concern with a title and a detail. "+
-				"Reviewer's finding verbatim: %s",
-			index, claimed, quoted),
+				"merge, so nothing is unblocked by this refusal. Restate the concern using one of the keys this "+
+				"reader accepts for finding text: %s. Reviewer's finding verbatim: %s",
+			index, claimed, ledgerContentKeyList(), quoted),
 	})
 }
 
@@ -546,7 +586,16 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 	b.WriteString("EVERY finding you emit needs an explicit \"severity\" of P0, P1, P2 or P3. A finding with none is\n")
 	b.WriteString("REFUSED rather than stored, because a row with no severity is an obligation no severity policy\n")
 	b.WriteString("can ever disposition, and it is not the same thing as P3 (#1928).\n")
-	b.WriteString("EVERY finding also needs an articulated concern: a \"title\", a \"detail\" or a \"rationale\". A file\n")
+	// #2078 review, P2: THIS SENTENCE IS READ BEFORE THE REVIEWER WRITES, which
+	// makes it the more consequential of the two places that described the
+	// content rule. It used to offer a bare "rationale", and a rationale alone is
+	// REFUSED - obs.Rationale is copied only on the STATIC arm, which needs a
+	// locator. The refusal already carried the condition after this PR; the
+	// instruction did not, so a reviewer could follow the brief exactly and lose
+	// the finding.
+	b.WriteString("EVERY finding also needs an articulated concern: a \"title\", a \"detail\", or a \"rationale\"\n")
+	b.WriteString("TOGETHER WITH a \"file\" - a rationale ALONE is refused, because it is recorded only alongside a\n")
+	b.WriteString("locator. A file\n")
 	b.WriteString("and line alone is REFUSED rather than stored (#1968), because a bare locator says where to look\n")
 	b.WriteString("and nothing about what is wrong there, so no later round can evaluate or discharge it. Return\n")
 	b.WriteString("fewer findings rather than empty ones; a refusal is reported back against your job.\n")
