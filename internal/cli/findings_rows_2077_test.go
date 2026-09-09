@@ -224,3 +224,34 @@ func TestFindingsJSONOutputIsAlsoFolded(t *testing.T) {
 		t.Fatalf("--json row state = %q, want the latest observation", rows[0].State)
 	}
 }
+
+// THE PRINTED RULE MUST MATCH THE GATE'S RULE (note 129657, #2102 f8).
+//
+// THE FIFTH COPY OF THE PRE-129657 RULE WAS THIS ONE, AND IT IS THE ONLY ONE A
+// USER SEES. Four earlier copies were code comments; this is stdout. It said
+// "OPEN findings block a merge at every later head" with no severity carve-out,
+// so a reader following the tool's own explanation would have concluded a P3
+// holds their merge.
+//
+// It had no test, which is why it survived four rounds of fixing the comments.
+// A sentence a command PRINTS is a contract with its reader; this pins it.
+func TestFindingsSummaryStatesTheSeverityRule(t *testing.T) {
+	// The explanation prints beneath the table, so a repository with no findings
+	// returns before it. Seed one.
+	home := seedRowsFixture(t)
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"findings", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("findings exit = %d, stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "OPEN P1 and P2 findings block a merge") {
+		t.Fatalf("the summary does not name the blocking set:\n%s", out)
+	}
+	if !strings.Contains(out, "does not hold the merge") {
+		t.Fatalf("the summary does not say a P3 cannot block:\n%s", out)
+	}
+	// AND IT MUST NOT READ AS "A P3 NEEDS NO ANSWER".
+	if !strings.Contains(out, "still wants an answer") {
+		t.Fatalf("the summary retires the P3 instead of reporting it:\n%s", out)
+	}
+}

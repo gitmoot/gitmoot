@@ -153,8 +153,10 @@ func runFindings(args []string, stdout, stderr io.Writer) int {
 	// with findings and zero answered is the #1969 shape; a large AT EARLIER HEAD
 	// column is the #1970 shape. Neither column is inert.
 	fmt.Fprintln(stdout)
-	fmt.Fprintln(stdout, "OPEN findings block a merge at every later head until a reviewer answers or withdraws them,")
-	fmt.Fprintln(stdout, "so AT EARLIER HEAD is a backlog nobody has looked at, not a set that has expired.")
+	fmt.Fprintln(stdout, "OPEN P1 and P2 findings block a merge at every later head until a reviewer answers or")
+	fmt.Fprintln(stdout, "withdraws them; a P3 is reported and does not hold the merge (note 129657), though it is")
+	fmt.Fprintln(stdout, "still an obligation and still wants an answer.")
+	fmt.Fprintln(stdout, "So AT EARLIER HEAD is a backlog nobody has looked at, not a set that has expired.")
 	fmt.Fprintln(stdout, "A repository with findings and ANSWERED 0 is recording obligations nothing consumes.")
 	fmt.Fprintln(stdout, "DECLARED undeclared means nobody has decided whether this repository consumes findings;")
 	fmt.Fprintln(stdout, "it behaves as consuming. advisory records and reports findings without holding the merge.")
