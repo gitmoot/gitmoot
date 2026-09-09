@@ -574,6 +574,33 @@ is a real value and renders as `0`; a rendered `0` for silence would invent a
 stalled seat. An unavailable role keeps its reported turn, because an
 unavailability incident says whether a role may be dispatched to, not whether
 the provider reported anything.
+The same `[repos."owner/repo"]` section declares a repo's **staged review**
+verdict agent (#1821):
+
+```toml
+[repos."owner/repo"]
+staged_review_verdict_agent = "gm-review-opus"
+```
+
+A staged review splits one review into a cheap preflight stage that answers
+*can this review be performed here* and a **verdict** stage whose result is the
+review. `staged_review_verdict_agent` names the agent that would run the
+verdict stage.
+
+**This key is a declaration, not yet a dispatcher.** At this commit nothing
+reads it outside its own tests: the staged dispatch is a separate change, and
+until it lands no repo dispatches a staged review whether it declared an agent
+or not. The key lands first because a dispatcher cannot be told which agent to
+use before there is a place to say so.
+
+It is **off by default** and there is deliberately **no default and no fallback
+list**. A repo that has not declared one cannot have a staged review dispatched
+to it once the dispatcher exists, and having a `[repos.*]` section for some
+other key is **not** a declaration. That is the campaign's non-fallback rule
+applied to the choice of reviewer itself - a strong reviewer that cannot be
+identified must never degrade to *the cheap stage approved it* - so the
+reviewer is an operator's decision per repo rather than a constant in the
+Gitmoot source.
 
 Job kill deadlines are independent from stale-running detection. Configure the
 daemon defaults with:
@@ -3288,6 +3315,44 @@ consult the ledger, and until this command could print rows there was no support
 way to do that: the summary reports counts, and a read-only review seat has no
 database access. Cite a UID verbatim as `continues_uid` to continue a finding -
 typing its label mints a new one instead.
+
+
+### Asking what the gate still demands
+
+`--at-head` answers a different question from the row listing, and the difference
+is the reason it exists (#2097).
+
+```bash
+gitmoot findings --repo owner/repo --pr 12 --at-head <sha>
+gitmoot findings --repo owner/repo --pr 12 --at-head <sha> --json
+```
+
+The rows above print `STATE`, the last recorded observation. `--at-head` prints
+the **obligations the merge gate would still demand at that head**, which is not
+derivable from any state column and differs in both directions:
+
+- an **open** finding recorded at an earlier head is still an obligation at a
+  later one, so filtering rows to "open at this head" reports a clean pull
+  request that the gate will refuse;
+- an **answered** finding becomes mandatory again when the diff since the answer
+  touches its relevance keys, so a state filter is blind to exactly that row.
+
+It is not a reimplementation. It calls `LedgerObligationsAtHead` through
+`LedgerResolvers.ScopeFor`, which the type documents as the only production path
+to a `LedgerScope`, built by the same constructor the review brief and the merge
+gate already share. The command therefore cannot answer differently from the
+thing that blocks.
+
+`--at-head` requires `--repo` and `--pr`: obligations are computed for one pull
+request at one head, and the refusal names that combination rather than only
+calling the input invalid.
+
+**Degradations are printed, including beside an empty list.** `LedgerScope`
+degrades rather than failing: without a changed-file resolver, answered findings
+stay advisory and simply do not appear, which under-reports. The engine records
+those as task events; this command has no task, so it prints them as
+`degraded: ...` lines. An empty obligation list and an instrument that could not
+look otherwise read identically, and the empty one reads as good news.
 
 ## Result Checks
 

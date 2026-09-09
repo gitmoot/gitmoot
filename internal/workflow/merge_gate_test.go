@@ -3055,7 +3055,7 @@ func TestPolicyMergeGateUpdatesStaleBranchAndStaysPending(t *testing.T) {
 	gh := &fakeMergeGateGitHub{
 		pr:      github.PullRequest{Number: 9, HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123", Mergeable: &mergeable},
 		status:  github.CombinedStatus{State: "success"},
-		compare: github.CompareResult{Status: "behind", BehindBy: 1},
+		compare: github.CompareResult{Status: "diverged", BehindBy: 4, AheadBy: 1},
 	}
 	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
 
@@ -3093,7 +3093,7 @@ func TestPolicyMergeGateBlocksStaleBranchUpdateConflict(t *testing.T) {
 	gh := &fakeMergeGateGitHub{
 		pr:        github.PullRequest{Number: 9, HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123", Mergeable: &mergeable},
 		status:    github.CombinedStatus{State: "success"},
-		compare:   github.CompareResult{Status: "behind", BehindBy: 1},
+		compare:   github.CompareResult{Status: "diverged", BehindBy: 4, AheadBy: 1},
 		updateErr: github.UpdatePullRequestBranchError{Kind: github.UpdatePullRequestBranchErrorConflict, Detail: "conflict"},
 	}
 	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
@@ -3132,7 +3132,7 @@ func TestPolicyMergeGateKeepsStaleHeadRacePending(t *testing.T) {
 	gh := &fakeMergeGateGitHub{
 		pr:        github.PullRequest{Number: 9, HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123", Mergeable: &mergeable},
 		status:    github.CombinedStatus{State: "success"},
-		compare:   github.CompareResult{Status: "behind", BehindBy: 1},
+		compare:   github.CompareResult{Status: "diverged", BehindBy: 4, AheadBy: 1},
 		updateErr: github.UpdatePullRequestBranchError{Kind: github.UpdatePullRequestBranchErrorStaleHead, Detail: "stale head"},
 	}
 	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
