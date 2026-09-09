@@ -401,6 +401,18 @@ func EnsureLedgerObligationsObserved(ctx context.Context, store *db.Store, repo 
 	}
 
 	// STATED, NOT SILENT - the same rule the advisory path below already keeps.
+	//
+	// ONE EVENT, AND NOT scope.degrade (#2102 review, P2). The first version also
+	// called degrade() for the reported set. In production scope.Degraded starts
+	// nil and is AUTO-WIRED below to write a findings_ledger_scope_degraded task
+	// event whenever TaskID is set - and the real merge-gate path never supplies
+	// its own sink - so every non-blocking P3 wrote TWO events, the second one
+	// labelled as an instrument failure.
+	//
+	// THAT IS WORSE THAN NOISE. degrade()'s other call sites all mean "a resolver
+	// is missing or failed, this evaluation may be wrong". A routine, successful
+	// classification borrowing that channel corrupts the one signal that tells an
+	// operator the ledger could not trust its own answer.
 	// A P3 that stops blocking must not also stop being visible, or the next
 	// reviewer learns that filing one costs a round and buys nothing, and stops
 	// filing. Two real P3s tonight - an orphaned comment and an unpinned map
@@ -414,8 +426,6 @@ func EnsureLedgerObligationsObserved(ctx context.Context, store *db.Store, repo 
 					len(reported), shortHead(headSHA), namedObligations(reported)),
 			})
 		}
-		scope.degrade("findings ledger: %d non-blocking finding(s) outstanding at %s: %s",
-			len(reported), shortHead(headSHA), namedObligations(reported))
 	}
 
 	if len(blocking) == 0 {

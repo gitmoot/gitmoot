@@ -131,27 +131,75 @@ func TestP3ExemptionToleratesCaseAndSpace(t *testing.T) {
 	}
 }
 
-// REPORTED, NOT SILENT. The half that makes the change safe: a P3 that no longer
-// blocks must still be stated, or filing one becomes free to ignore and seats
-// stop filing. Asserted through the scope's own degradation sink, which is the
-// operator-facing channel the ledger already uses.
+// REPORTED, NOT SILENT - ASSERTED IN THE PRODUCTION SHAPE, ON THE PRODUCTION
+// CHANNEL.
+//
+// THE FIRST VERSION OF THIS TEST SUPPLIED ITS OWN scope.Degraded SINK AND
+// ASSERTED ON THAT. Production never does: scope.Degraded starts nil and is
+// auto-wired to a findings_ledger_scope_degraded task event, and the merge-gate
+// path never supplies a sink. So the test asserted a channel the production
+// caller does not use, and the #2102 reviewer proved the gap by DELETING the
+// dedicated AddTaskEvent call - all nine tests still passed.
+//
+// It now runs with TaskID set and Degraded nil, exactly as the gate does, and
+// asserts the durable record an operator would actually find.
 func TestANonBlockingP3IsStillReported(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	oldHead, head := strings.Repeat("5", 40), strings.Repeat("6", 40)
 	seedFinding(t, store, 7006, oldHead, "F-1", "P3")
 
-	var notes []string
-	scope := LedgerScope{TaskID: "task-7006", Degraded: func(note string) { notes = append(notes, note) }}
-	if err := EnsureLedgerObligationsObserved(ctx, store, "gitmoot/gitmoot", 7006, head, scope); err != nil {
+	if err := EnsureLedgerObligationsObserved(ctx, store, "gitmoot/gitmoot", 7006, head, LedgerScope{TaskID: "task-7006"}); err != nil {
 		t.Fatalf("P3 blocked: %v", err)
 	}
-	if len(notes) == 0 {
-		t.Fatal("a P3 stopped blocking AND stopped being reported; the next reviewer learns not to file one")
+
+	events, err := store.ListTaskEvents(ctx, "task-7006")
+	if err != nil {
+		t.Fatalf("ListTaskEvents: %v", err)
 	}
-	joined := strings.Join(notes, " | ")
-	if !strings.Contains(joined, "F-1") {
-		t.Fatalf("the report does not name the finding it is reporting: %q", joined)
+	var reported, degraded int
+	var reason string
+	for _, event := range events {
+		switch event.Kind {
+		case "findings_ledger_reported_not_blocking":
+			reported++
+			reason = event.Reason
+		case "findings_ledger_scope_degraded":
+			degraded++
+		}
+	}
+	if reported != 1 {
+		t.Fatalf("got %d findings_ledger_reported_not_blocking event(s), want exactly 1; a P3 that stops blocking must not stop being recorded", reported)
+	}
+	if !strings.Contains(reason, "F-1") {
+		t.Fatalf("the recorded report does not name the finding: %q", reason)
+	}
+	// AND NOT ON THE DEGRADATION CHANNEL. A routine classification labelled as a
+	// resolver failure corrupts the signal that tells an operator the ledger
+	// could not trust its own answer.
+	if degraded != 0 {
+		t.Fatalf("got %d findings_ledger_scope_degraded event(s) for a successful classification, want 0", degraded)
+	}
+}
+
+// A CALLER-SUPPLIED DEGRADED SINK IS NOT A REPORTING CHANNEL EITHER. The CLI
+// supplies one to collect genuine instrument failures; a non-blocking P3 must
+// not arrive there and be rendered as "degraded:", because it is not.
+func TestANonBlockingP3DoesNotReachACallerDegradedSink(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	oldHead, head := strings.Repeat("a", 40), strings.Repeat("d", 40)
+	seedFinding(t, store, 7010, oldHead, "F-1", "P3")
+
+	var notes []string
+	scope := LedgerScope{TaskID: "task-7010", Degraded: func(note string) { notes = append(notes, note) }}
+	if err := EnsureLedgerObligationsObserved(ctx, store, "gitmoot/gitmoot", 7010, head, scope); err != nil {
+		t.Fatalf("P3 blocked: %v", err)
+	}
+	for _, note := range notes {
+		if strings.Contains(note, "F-1") {
+			t.Fatalf("a non-blocking P3 was reported as a degradation: %q", note)
+		}
 	}
 }
 
