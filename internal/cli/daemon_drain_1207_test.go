@@ -270,3 +270,51 @@ func TestDrainStatFailureIsAnErrorNotAQuietResume(t *testing.T) {
 		t.Fatal("the guard reported draining AND an error; the caller must decide on the error alone")
 	}
 }
+
+// THE HOME IS RESOLVED EXACTLY ONCE, AND THE WARNING AGREES WITH THE GUARD.
+//
+// Three call sites now pass a home to the drain guard: the scheduler
+// (worker.ConfigHome), the command (--home), and the startup warning
+// (cfg.Home). ALL THREE ARE THE RAW FLAG, and daemonDrainSentinelPath resolves
+// through pathsFromFlag exactly once. Passing an ALREADY-RESOLVED root instead
+// would append ".gitmoot" a second time and the guard would silently answer
+// "not draining" for a daemon that IS drained - the #446/#459 class, and the
+// worst possible direction for a deploy guard to be wrong in.
+//
+// A reviewer suggested passing the resolved paths value at the startup site.
+// This test is why that is refused: it pins BOTH directions, so the suggestion
+// fails here rather than in an incident.
+func TestDrainHomeResolvesExactlyOnce(t *testing.T) {
+	raw := t.TempDir()
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"daemon", "drain", "--home", raw}, &stdout, &stderr); code != 0 {
+		t.Fatalf("daemon drain exit = %d, stderr=%s", code, stderr.String())
+	}
+
+	// The RAW home is what every production caller passes.
+	on, err := daemonDrainActiveForHome(raw)
+	if err != nil {
+		t.Fatalf("guard on the raw home: %v", err)
+	}
+	if !on {
+		t.Fatal("the guard did not see a sentinel the command just wrote for this home")
+	}
+
+	// The RESOLVED root must NOT be accepted as a home: that is the double
+	// resolution, and it reads as not-draining, which resumes claiming.
+	paths, err := pathsFromFlag(raw)
+	if err != nil {
+		t.Fatalf("pathsFromFlag: %v", err)
+	}
+	doubled, err := daemonDrainActiveForHome(paths.Home)
+	if err != nil {
+		t.Fatalf("guard on the resolved root: %v", err)
+	}
+	if doubled {
+		t.Fatal("the resolved root ALSO answered draining; the two paths are indistinguishable and the invariant is untestable")
+	}
+	if paths.Home == raw {
+		t.Fatal("resolution is a no-op in this fixture, so this test proves nothing")
+	}
+}
