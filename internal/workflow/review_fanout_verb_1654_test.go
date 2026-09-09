@@ -198,6 +198,14 @@ func TestSkipNativeReviewFanoutIsAnImplementControlNotAReviewOne(t *testing.T) {
 				// The dispatched fix must target the pull request under review.
 				// Dropping PullRequest from dispatchFix's JobRequest still enqueues
 				// a job whose fanout bit is false, so the bit alone cannot see it.
+				// THE REVIEWED HEAD TRAVELS WITH THE FIX (#2055 review round 5). Removing
+				// `HeadSHA: payload.HeadSHA` from dispatchFix's request left this test
+				// and the entire internal/workflow package green, so a fix could be
+				// dispatched against no head at all: it would run wherever the branch
+				// happened to be rather than at the head whose review demanded it.
+				if strings.TrimSpace(fixPayload.HeadSHA) != strings.Repeat("d", 40) {
+					t.Fatalf("the fix job carries head %q, want the reviewed head: a fix dispatched without its head fixes whatever the branch has drifted to", fixPayload.HeadSHA)
+				}
 				if fixPayload.PullRequest != pr {
 					t.Fatalf("the fix job targets pull request %d, want %d: the dispatch lost the PR it was fixing", fixPayload.PullRequest, pr)
 				}
