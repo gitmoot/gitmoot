@@ -425,6 +425,29 @@ is a real value and renders as `0`; a rendered `0` for silence would invent a
 stalled seat. An unavailable role keeps its reported turn, because an
 unavailability incident says whether a role may be dispatched to, not whether
 the provider reported anything.
+The same `[repos."owner/repo"]` section declares a repo's **staged review**
+verdict agent (#1821):
+
+```toml
+[repos."owner/repo"]
+staged_review_verdict_agent = "gm-review-opus"
+```
+
+A staged review splits one review into a cheap preflight stage that answers
+*can this review be performed here* and a **verdict** stage whose result is the
+review. `staged_review_verdict_agent` names the agent that would run the
+verdict stage.
+
+**This key is a declaration, not yet a dispatcher.** Nothing reads it outside
+its own tests at the commit that introduced it; the staged dispatch is a
+separate change.
+
+It is **off by default** with deliberately **no default and no fallback list**.
+A repo that has not declared one cannot have a staged review dispatched to it,
+and having a `[repos.*]` section for some other key is **not** a declaration. A
+strong reviewer that cannot be identified must never degrade to *the cheap stage
+approved it*, so the reviewer is an operator's decision per repo rather than a
+constant in the Gitmoot source.
 
 Job kill deadlines are independent from stale-running detection. Configure the
 daemon defaults with:
