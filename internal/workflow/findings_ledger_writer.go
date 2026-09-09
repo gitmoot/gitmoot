@@ -1033,6 +1033,16 @@ func ledgerRelocationBrief(observations []db.ReviewFindingObservation, roundOf m
 	b.WriteString("thoroughness, one finding in each of three rounds is a defect that keeps coming back somewhere\n")
 	b.WriteString("else in the same file. The labels are shown to help you recognise the rounds; they are not what\n")
 	b.WriteString("is counted, because a reviewer restarts numbering at 1 each round.\n")
+	// #2066 round eleven: THE COUNT'S OWN LIMIT IS PART OF WHAT THE SYSTEM OWES A
+	// REVIEWER. A line-qualified locator is grouped with other spellings of its
+	// file only when the tree at THAT OBSERVATION'S head can settle whether the
+	// trailing number is a line. When it cannot, the raw locator is kept and the
+	// count is a FLOOR - so a reviewer who reads a count of 2 must not conclude
+	// there were only two. Saying the ladder without saying the floor tells a
+	// reviewer the number is more exact than it is.
+	b.WriteString("This count is a FLOOR, not a total: a `path:line` locator joins its file only when the tree\n")
+	b.WriteString("at that observation's own head can prove the trailing number is a line, so unresolvable\n")
+	b.WriteString("locators stay in separate buckets and UNDER-count rather than risk folding two real files.\n")
 	for _, file := range files {
 		shown := make([]string, 0, len(labels[file]))
 		for label := range labels[file] {
