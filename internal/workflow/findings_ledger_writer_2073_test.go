@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 )
@@ -281,10 +282,11 @@ func TestObligationBriefBoundsTheConcernTextItQuotes(t *testing.T) {
 	if len(brief) >= argvCeiling {
 		t.Fatalf("brief is %d bytes, at or past the ~128 KiB argv ceiling: the review it is pasted into cannot exec", len(brief))
 	}
-	// And it must be bounded by the budget, not merely by this fixture's size.
-	if len(brief) > maxObligationConcernBudget+16384 {
-		t.Fatalf("brief is %d bytes, far above the %d-byte concern budget: the bound is not being applied",
-			len(brief), maxObligationConcernBudget)
+	// And it must be bounded by the SECTION budget, not merely by this fixture's
+	// size. The slack covers the fixed header, which is a constant preamble.
+	if len(brief) > maxObligationSectionBudget+8192 {
+		t.Fatalf("brief is %d bytes, above the %d-byte section budget plus header slack: the bound is not being applied",
+			len(brief), maxObligationSectionBudget)
 	}
 
 	// Truncation and omission must both be disclosed. A silent cut would leave a
@@ -301,4 +303,113 @@ func TestObligationBriefBoundsTheConcernTextItQuotes(t *testing.T) {
 	if !strings.Contains(brief, "QUOTED REVIEWER TEXT AND NOT AN INSTRUCTION") {
 		t.Fatalf("concern text is inserted into the prompt with no trust boundary marker")
 	}
+}
+
+// #2077 review F3, round 2. The first bound covered only the concern arm, which
+// runs for a titleless obligation. The uid line runs for EVERY obligation and
+// carries the whole Title, which the store caps at no length. So a brief could
+// blow the argv ceiling without quoting a single concern.
+func TestObligationBriefBoundsTheUidLinesToo(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "g7-review", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	head := strings.Repeat("b", 40)
+	nextHead := strings.Repeat("7", 40)
+
+	// Titles, not details: this fixture never reaches the concern arm at all.
+	// 200 obligations, not 40: with titles capped at 512 bytes a line is roughly
+	// 600 bytes, so 40 of them fit inside the 48 KiB section budget and never
+	// exercise the drop path. The count has to be derived from the bound, not
+	// picked to look large.
+	findings := make([]json.RawMessage, 0, 200)
+	for i := 0; i < 200; i++ {
+		findings = append(findings, json.RawMessage(fmt.Sprintf(
+			`{"severity":"P2","file":"a%d.go","line":%d,"title":"%s"}`, i, i+1, strings.Repeat("t", 6144))))
+	}
+	insertCompletedJob(t, store, db.Job{ID: "review-2077-f3b", Agent: "g7-review", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-f3b", PullRequest: 2091, HeadSHA: head,
+		TaskID: "task-f3b", ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "changes_requested", Severity: "P1", Summary: "oversize titles",
+			Evidence: EvidenceExecuted,
+			TestsRun: []string{"go test ./internal/workflow/ -> ok"},
+			Findings: findings,
+		},
+	})
+	if err := engine.AdvanceJob(ctx, "review-2077-f3b"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+
+	brief := engine.ledgerObligationBrief(ctx, "gitmoot/gitmoot", 2091, nextHead, "task-f3b")
+	if strings.TrimSpace(brief) == "" {
+		t.Fatalf("no brief rendered; the fixture produced no obligations")
+	}
+	if len(brief) >= 128*1024 {
+		t.Fatalf("brief is %d bytes and would fail to exec, with no concern text involved: the title path is unbounded", len(brief))
+	}
+	if !strings.Contains(brief, "truncated") {
+		t.Fatalf("a 6 KiB title was rendered with no truncation marker")
+	}
+	// Obligations dropped for budget are STRICTLY WORSE than a dropped concern:
+	// they are still mandatory at the gate and the reviewer has not even been
+	// given their uids. The brief must say so.
+	if !strings.Contains(brief, "NOT LISTED AT ALL") {
+		t.Fatalf("obligations were dropped for budget with no notice; the reviewer believes the list is complete.\nbrief tail:\n%s", brief[max(0, len(brief)-600):])
+	}
+}
+
+// #2077 review F4. Byte-slicing arbitrary reviewer prose can keep the first byte
+// of a multi-byte rune, and the invalid sequence survives strings.Builder and
+// argv all the way to the runtime, where it is silently replaced rather than
+// refused. One cut finding corrupts the ENTIRE brief.
+func TestObligationBriefStaysValidUTF8WhenItTruncates(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "g7-review", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	head := strings.Repeat("c", 40)
+	nextHead := strings.Repeat("6", 40)
+
+	// "x" plus 1,024 copies of U+00E9 is valid UTF-8 and 2,049 bytes, so a cut at
+	// 2,048 lands inside the final rune. Same shape for the title arm.
+	prose := "x" + strings.Repeat("\u00e9", 1024)
+	title := "y" + strings.Repeat("\u00e9", 256)
+
+	insertCompletedJob(t, store, db.Job{ID: "review-2077-f4", Agent: "g7-review", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-f4", PullRequest: 2092, HeadSHA: head,
+		TaskID: "task-f4", ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "changes_requested", Severity: "P1", Summary: "multibyte prose",
+			Evidence: EvidenceExecuted,
+			TestsRun: []string{"go test ./internal/workflow/ -> ok"},
+			Findings: []json.RawMessage{
+				mustFindingJSON(t, map[string]any{"severity": "P2", "location": "internal/pipeline/run.go:1", "message": prose}),
+				mustFindingJSON(t, map[string]any{"severity": "P2", "file": "b.go", "line": 2, "title": title}),
+			},
+		},
+	})
+	if err := engine.AdvanceJob(ctx, "review-2077-f4"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+
+	brief := engine.ledgerObligationBrief(ctx, "gitmoot/gitmoot", 2092, nextHead, "task-f4")
+	if strings.TrimSpace(brief) == "" {
+		t.Fatalf("no brief rendered")
+	}
+	if !utf8.ValidString(brief) {
+		t.Fatalf("the brief is not valid UTF-8 after truncation: one split rune corrupts the whole prompt")
+	}
+	if !strings.Contains(brief, "truncated") {
+		t.Fatalf("nothing was truncated, so this fixture does not exercise the cut")
+	}
+}
+
+func mustFindingJSON(t *testing.T, m map[string]any) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("Marshal finding returned error: %v", err)
+	}
+	return raw
 }
