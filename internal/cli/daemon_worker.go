@@ -43,7 +43,13 @@ type jobWorker struct {
 	// are side-effect-free (no config.Initialize), so even a mistaken resolved-root
 	// ConfigHome can never MkdirAll the phantom — but every construction site must
 	// still pass the raw --home so the config is actually found.
-	ConfigHome         string
+	ConfigHome string
+
+	// DrainSentinelPath is the RESOLVED absolute path of the #1207 drain
+	// sentinel, computed once at construction. Empty means resolution FAILED and
+	// was announced at start; it never means "no home", because an empty
+	// ConfigHome resolves to the default home like any other.
+	DrainSentinelPath  string
 	ConfigHomeExplicit bool
 	AgentLookup        func(context.Context, string) (db.Agent, error)
 	AdapterFactory     func(runtime.Agent, string) (workflow.DeliveryAdapter, error)
@@ -191,7 +197,24 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 		configHome = home[0]
 		configHomeExplicit = true
 	}
+	// #1207: the scheduler's drain guard stats a sentinel under this home.
+	//
+	// THE PATH IS RESOLVED ONCE, HERE, AND CARRIED. The first version resolved it
+	// on EVERY eligibility call, which put os.UserHomeDir() on the dispatch hot
+	// path: a resolution error would abort listPendingQueuedJobs and stall EVERY
+	// job on the box. That is a strictly larger blast radius than the bug it
+	// replaced, and it is the same argument that chose a file sentinel over a
+	// store row - a guard must not depend on the thing it is protecting.
+	// Owner-ruled (#2096 round 3): resolve at start or degrade non-fatally.
 	worker := jobWorker{Store: store, Stdout: serializeWrites(stdout), ConfigHome: configHome, ConfigHomeExplicit: configHomeExplicit}
+	if sentinel, err := daemonDrainSentinelPath(configHome); err != nil {
+		// NON-FATAL AND ANNOUNCED. A daemon that cannot resolve its own home is
+		// already broken, but refusing all dispatch here would be the larger
+		// failure. Say so once, loudly, at start.
+		fmt.Fprintf(worker.Stdout, "warning: drain guard unavailable (%v); this daemon will keep claiming through a drain\n", err)
+	} else {
+		worker.DrainSentinelPath = sentinel
+	}
 	// PRODUCTION assigns through the setter so the factory and the claim that it
 	// execs the declared binary are written together (#1926-f5).
 	worker.setRealAdapterFactory(worker.defaultAdapter)

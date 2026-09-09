@@ -23,6 +23,8 @@ func runDaemon(args []string, stdout, stderr io.Writer) int {
 		return runDaemonStatus(args[1:], stdout, stderr)
 	case "logs":
 		return runDaemonLogs(args[1:], stdout, stderr)
+	case "drain":
+		return runDaemonDrain(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown daemon command %q\n\n", args[0])
 		printDaemonUsage(stderr)
@@ -37,6 +39,7 @@ func printDaemonUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot daemon stop")
 	fmt.Fprintln(w, "  gitmoot daemon restart")
 	fmt.Fprintln(w, "  gitmoot daemon status")
+	fmt.Fprintln(w, "  gitmoot daemon drain [--timeout 15m] [--clear]")
 	fmt.Fprintln(w, "  gitmoot daemon logs")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "  --repo owner/repo SCOPES the daemon to a SINGLE repo: it polls only that repo's PRs and")
