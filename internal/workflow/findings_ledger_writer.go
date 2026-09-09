@@ -490,7 +490,7 @@ func (e Engine) ReviewObligationBrief(ctx context.Context, repo string, pullRequ
 // place the producer is already listening, so it is where the accepted set
 // belongs. A reviewer whose text was dropped can now see why in the same event
 // that reports the drop, instead of the next reader being written for them.
-// MEASURED, ONE KEY AT A TIME, NOT ASSUMED. Four of these rescue a finding on
+// MEASURED, ONE KEY AT A TIME, NOT ASSUMED. Five of these rescue a finding on
 // their own. `rationale` is real finding text but CONDITIONAL: obs.Rationale is
 // copied only on the STATIC arm, which needs a locator, so a rationale alone
 // reaches the store empty and is refused for having no rationale. Measured:
@@ -500,7 +500,7 @@ func (e Engine) ReviewObligationBrief(ctx context.Context, repo string, pullRequ
 // of this change simply dropped it, which made the sentence true and the advice
 // worse - a reviewer whose rationale was the right way to say it would have been
 // steered off a key that works.
-var ledgerContentKeys = []string{"title", "summary", "detail", "body"}
+var ledgerContentKeys = []string{"title", "summary", "detail", "body", "evidence"}
 
 // ledgerConditionalContentKeys carry finding text only alongside a locator.
 var ledgerConditionalContentKeys = []string{"rationale"}

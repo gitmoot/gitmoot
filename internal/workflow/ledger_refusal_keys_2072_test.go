@@ -126,7 +126,7 @@ func TestFindingWithContentIsNotRefused(t *testing.T) {
 // identity, classification, and locators. Named explicitly so the classification
 // test below is a decision rather than a filter.
 var ledgerNonContentKeys = []string{
-	"id", "severity", "file", "continues_uid", "state", "evidence_kind", "evidence_locator", "locator", "location", "withdraw_reason", "line", "relevance_keys", "lens", "evidence",
+	"id", "severity", "file", "continues_uid", "state", "evidence_kind", "evidence_locator", "locator", "location", "withdraw_reason", "line", "relevance_keys", "lens",
 }
 
 // THE REVERSE DRIFT, which the advertised-keys test alone does not catch.
@@ -222,4 +222,49 @@ func refusalPresent(events []db.JobEvent) bool {
 		}
 	}
 	return false
+}
+
+// nonContentProbeValues gives every non-content key a TYPE-CORRECT value. The
+// first version of this probe sent a string for every key, which put a string in
+// `line` (int) and `relevance_keys` ([]string) and DUPLICATED `severity` - all
+// malformed JSON, which then rescued through the bare-prose path and reported
+// FIVE false misclassifications beside the one real one. The map is exhaustive
+// by assertion so a new key cannot silently reintroduce that.
+var nonContentProbeValues = map[string]string{
+	"id": `"F1"`, "file": `"internal/x.go"`, "continues_uid": `"gitmoot/gitmoot#1-f1"`,
+	"state": `"open"`, "evidence_kind": `"EXECUTED"`, "evidence_locator": `"internal/x.go:1"`,
+	"locator": `"internal/x.go:1"`, "location": `"internal/x.go:1"`,
+	"withdraw_reason": `"no longer applies"`, "line": `42`,
+	"relevance_keys": `["k"]`, "lens": `"security"`, "severity": `"P3"`,
+}
+
+// THE FIFTH DIRECTION (#2078 f5). Every previous guard ran advertised -> works.
+// None ran works -> advertised, so a key that RESCUES while classified
+// non-content was invisible: `evidence` is an unconditional source of Detail
+// prose (findings_ledger_writer.go:241-246), so {"evidence":"..."} alone is
+// recorded, and the refusal never told anyone it would be.
+func TestNoNonContentKeyRescuesAFindingAlone(t *testing.T) {
+	for _, key := range ledgerNonContentKeys {
+		value, ok := nonContentProbeValues[key]
+		if !ok {
+			t.Fatalf("no typed probe value for %q; a string default would send malformed JSON "+
+				"and rescue through the bare-prose path, reporting a misclassification that is not one", key)
+		}
+		if key == "severity" {
+			continue // present in the base payload; duplicating it is malformed
+		}
+		t.Run(key, func(t *testing.T) {
+			raw := json.RawMessage(`{"severity":"P3","` + key + `":` + value + `}`)
+			refused := false
+			for _, event := range refuseContentlessFinding(t, raw) {
+				if event.Kind == "findings_ledger_refused" {
+					refused = true
+				}
+			}
+			if !refused {
+				t.Fatalf("%q is classified non-content but a finding carrying only %q is RECORDED, "+
+					"so the refusal hides a key that works", key, key)
+			}
+		})
+	}
 }
