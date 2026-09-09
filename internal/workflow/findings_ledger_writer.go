@@ -102,9 +102,15 @@ type reviewFindingWire struct {
 	// All three are DETAIL-class. None of them feeds Title, because a title
 	// distilled from a paragraph would be invented structure, and the rule here
 	// has always been to read what reviewers write and invent nothing.
-	Details string `json:"details"`
-	Message string `json:"message"`
-	Finding string `json:"finding"`
+	// A SIXTH SHAPE, measured after the first three landed (#2073). In the
+	// ledger's own lifetime 51 of 806 finding objects carry `description`, and in
+	// ALL 51 it is the ONLY prose key present, so every one recorded a row with an
+	// empty detail. It is the largest single identifiable cause of the
+	// empty-detail population, which reached 49 percent of findings in one evening.
+	Description string `json:"description"`
+	Details     string `json:"details"`
+	Message     string `json:"message"`
+	Finding     string `json:"finding"`
 }
 
 // pathFromLensEvidence extracts the leading repo-relative path from a lens
@@ -275,6 +281,7 @@ func (e Engine) ledgerObservationWithDeclaredState(job db.Job, payload JobPayloa
 			strings.TrimSpace(wire.Details),
 			strings.TrimSpace(wire.Finding),
 			strings.TrimSpace(wire.Message),
+			strings.TrimSpace(wire.Description),
 		),
 		File: firstNonEmptyLedgerText(
 			strings.TrimSpace(wire.File),
@@ -538,7 +545,7 @@ func (e Engine) ReviewObligationBrief(ctx context.Context, repo string, pullRequ
 // rescue a finding ON ITS OWN - a row carrying only severity, a locator and that
 // key is recorded rather than refused - so all three are content, not
 // non-content.
-var ledgerContentKeys = []string{"title", "summary", "detail", "body", "evidence", "details", "finding", "message"}
+var ledgerContentKeys = []string{"title", "summary", "detail", "body", "evidence", "details", "finding", "message", "description"}
 
 // ledgerConditionalContentKeys carry finding text only alongside a locator.
 var ledgerConditionalContentKeys = []string{"rationale"}

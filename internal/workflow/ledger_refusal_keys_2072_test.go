@@ -63,7 +63,16 @@ func refusalMessage(t *testing.T, events []db.JobEvent) string {
 // f1's exact shape, verbatim keys.
 func TestContentRefusalNamesTheAcceptedKeys(t *testing.T) {
 	events := refuseContentlessFinding(t, json.RawMessage(
-		`{"severity":"P3","description":"state silently beats disposition","location":"internal/workflow/findings_ledger_writer.go"}`))
+		// `description` USED TO BE THE CONTENTLESS FILLER HERE, chosen because
+		// nothing read it. #2073 now reads it: measured in the ledger's lifetime,
+		// 51 of 806 finding objects carry `description` and in ALL 51 it is the
+		// ONLY prose key, so every one of them recorded an empty detail. Keeping
+		// it here would have asserted that real concerns must be refused.
+		//
+		// The filler is now drawn only from ledgerNonContentKeys, which is what a
+		// genuinely contentless finding looks like. This comment is the reverse
+		// drift the block below predicted, arriving from the direction it named.
+		`{"severity":"P3","location":"internal/workflow/findings_ledger_writer.go","file":"internal/workflow/findings_ledger_writer.go"}`))
 	message := refusalMessage(t, events)
 	for _, key := range ledgerContentKeys {
 		if !strings.Contains(message, key) {
