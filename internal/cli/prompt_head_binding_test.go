@@ -236,29 +236,95 @@ func TestReviewDispatchBindsThePromptsTargetToTheDispatchHead(t *testing.T) {
 // negative result from an input that cannot express the defect is not evidence.
 func TestUnjudgedTokenCannotRetainAnotherCitationsWarning(t *testing.T) {
 	ctx := context.Background()
-	checkout, _, base, head, _ := promptHeadBindingCheckout(t)
+	scanCheckout, _, ancestor, head, foreign := promptHeadBindingCheckout(t)
 	store, _ := blockerE2EHome(t)
-	client := jobGitClient(checkout, subprocess.ExecRunner{})
 
-	// A 7-hex run lifted from the MIDDLE of the dispatch head, which no object
-	// resolves: this is the unjudged token that used to leak.
+	// TWO CLIENTS, BECAUSE PRODUCTION PASSES TWO. agent_dispatch.go hands the
+	// SCAN a client rooted at the allocated exact-head worktree and the FILTER a
+	// client rooted at record.CheckoutPath - the canonical checkout. An earlier
+	// version of this test passed ONE client to both, so it could not detect any
+	// defect arising from their divergence, INCLUDING the divergence I had
+	// already flagged as a hazard before writing it.
+	scan := jobGitClient(scanCheckout, subprocess.ExecRunner{})
+	filterCheckout := canonicalCheckoutMissingSiblingBranch(t, scanCheckout)
+	filter := jobGitClient(filterCheckout, subprocess.ExecRunner{})
+
+	// THE DIVERGENCE HAS TO BE LOAD-BEARING AND NOT VACUOUS. If the filter's
+	// checkout cannot resolve the DISPATCH HEAD, classifyPromptCommitCitations
+	// returns nil on its head guard, the filter returns nil, and every assertion
+	// below passes for the wrong reason. So the canonical clone carries the
+	// review branch - head and its ancestors resolve there - and lacks only the
+	// SIBLING branch, which is the one citation the two clients disagree about.
+	if _, err := filter.RevParse(ctx, head+"^{commit}"); err != nil {
+		t.Fatalf("filter checkout cannot resolve the dispatch head, so the filter would refuse for the wrong reason: %v", err)
+	}
+	if _, err := filter.RevParse(ctx, foreign+"^{commit}"); err == nil {
+		t.Fatalf("filter checkout resolves the sibling commit %s, so the two clients do not diverge and this test is back to one seam", foreign)
+	}
+	if _, err := scan.RevParse(ctx, foreign+"^{commit}"); err != nil {
+		t.Fatalf("scan checkout cannot resolve the sibling commit %s, so no warning about it is produced: %v", foreign, err)
+	}
+
+	// THE STRAY TOKEN MUST STAY, and its absence is a defect I introduced while
+	// widening this fixture: a 7-hex run lifted from the MIDDLE of the dispatch
+	// head is the ONLY input that expresses the leak, because the leak fired
+	// when an unjudged token occurred inside the dispatch-head text that every
+	// warning carries. Replacing it with the sibling sha removed the defect from
+	// the input and both mutants survived - a negative result from an input that
+	// cannot express the defect, committed while fixing exactly that error.
 	stray := head[8:15]
-	if _, err := client.RevParse(ctx, stray+"^{commit}"); err == nil {
+	if _, err := scan.RevParse(ctx, stray+"^{commit}"); err == nil {
 		t.Skipf("fixture stray token %q unexpectedly resolves", stray)
 	}
-	// base is an ANCESTOR of head, so its warning must be dropped.
-	prompt := "review " + base + " and also " + stray
 
-	warnings := dispatchPromptHeadContradictionWarnings(ctx, client, prompt, head)
-	if len(warnings) == 0 {
-		t.Fatalf("fixture produced no warnings to filter; the ancestor citation must warn before filtering")
+	// The prompt cites an ANCESTOR of the dispatch head, whose warning the
+	// filter must drop; the SIBLING commit, which the filter's checkout cannot
+	// resolve and therefore cannot judge; and the STRAY run, which nothing
+	// resolves in either checkout.
+	prompt := "review " + ancestor + " and also " + foreign + " and " + stray
+
+	warnings := dispatchPromptHeadContradictionWarnings(ctx, scan, prompt, head)
+	if len(warnings) < 2 {
+		t.Fatalf("scan produced %d warnings, want both citations warned before filtering: %v", len(warnings), warnings)
 	}
-	kept := retainUnjudgedPromptHeadWarnings(ctx, client, store, prompt, head, "owner/repo", 12, warnings)
+	kept := retainUnjudgedPromptHeadWarnings(ctx, filter, store, prompt, head, "owner/repo", 12, warnings)
+
+	// The unjudged set must be NON-EMPTY, or the leak has nothing to fire on and
+	// a clean result proves nothing - the same vacuity that let an earlier hand
+	// probe of mine return KEPT=0 against a prompt with no stray token.
+	var keptForeign bool
 	for _, warning := range kept {
-		if strings.Contains(warning, base) {
-			t.Fatalf("an unjudged stray token retained the ANCESTOR citation's warning: %q\nkept=%v", warning, kept)
+		if strings.Contains(warning, foreign) {
+			keptForeign = true
+		}
+		if strings.Contains(warning, ancestor) {
+			t.Fatalf("an unjudged citation retained the ANCESTOR citation's warning: %q\nkept=%v", warning, kept)
 		}
 	}
+	if !keptForeign {
+		t.Fatalf("the unresolvable sibling citation was not retained, so nothing was unjudged and the drop above is vacuous: kept=%v", kept)
+	}
+}
+
+// canonicalCheckoutMissingSiblingBranch clones the review branch ALONE, so the
+// clone resolves the dispatch head and its ancestors but not the sibling
+// pull request's commit. That asymmetry is what production has and what a
+// single-client fixture cannot represent.
+func canonicalCheckoutMissingSiblingBranch(t *testing.T, source string) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "canonical")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("create canonical checkout dir: %v", err)
+	}
+	// FETCH ONE REF RATHER THAN CLONE. A local clone copies the whole object
+	// store even with --single-branch --no-hardlinks, so the sibling commit
+	// remains resolvable and the two clients do not actually diverge - the
+	// guard in the caller caught exactly that. A fetch transfers only what is
+	// reachable from the named ref.
+	runGit(t, dir, "init", "--quiet")
+	runGit(t, dir, "fetch", "--quiet", "--no-tags", source, "refs/heads/feature/review:refs/heads/feature/review")
+	runGit(t, dir, "checkout", "--quiet", "feature/review")
+	return dir
 }
 
 func TestReviewDispatchWarnsOnlyOnCitationsNobodyHasJudged(t *testing.T) {
