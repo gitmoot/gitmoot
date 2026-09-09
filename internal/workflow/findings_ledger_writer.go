@@ -625,6 +625,35 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 	return b.String() + relocations
 }
 
+// relocationFileKey returns the repository-relative path an observation is
+// about, using the row's recorded Line to decide whether a trailing ":<n>" is a
+// line qualifier or part of the filename (#2066 round six).
+//
+// Text alone cannot decide it: "pkg:10" is a valid filename AND a valid
+// path:line. The row is not ambiguous, because Line was parsed and stored
+// separately when the observation was written, so the suffix is stripped only
+// when it MATCHES that value.
+//
+// An observation with no recorded line keeps its locator whole, which is the
+// conservative direction: it can leave two spellings of one file in separate
+// buckets and under-report, and it can never fold two different files together
+// and invent a relocation.
+func relocationFileKey(obs db.ReviewFindingObservation) string {
+	file := strings.TrimSpace(obs.File)
+	if file == "" || obs.Line <= 0 {
+		return file
+	}
+	idx := strings.LastIndex(file, ":")
+	if idx <= 0 {
+		return file
+	}
+	number, err := strconv.Atoi(strings.TrimSpace(file[idx+1:]))
+	if err != nil || int64(number) != obs.Line {
+		return file
+	}
+	return strings.TrimSpace(file[:idx])
+}
+
 // reviewRoundsForObservations maps each observing job to its logical review
 // round (#2066 round two), keyed so that two different tasks cannot share one
 // round identity (#2066 round three).
@@ -700,12 +729,24 @@ func (e Engine) reviewRoundsForObservations(ctx context.Context, observations []
 		//
 		// The parent is a tighter grouping than the delegation ROOT, which can
 		// span several rounds of one tree and would collapse genuine relocations.
+		// #2066 round six, P1: THE REVIEWED HEAD IS PART OF THE IDENTITY. Both
+		// rungs omitted it, so two children of ONE coordinator that reviewed
+		// DIFFERENT heads collapsed into a single round - a coordinator may
+		// declare dependent review legs, deferred legs are enqueued after their
+		// dependencies settle, and delegationHeadSHA resolves the then-current PR
+		// mirror, so a push between those dispatches gives them different heads.
+		// That undercounts genuine review/fix cycles, which is the defect this
+		// brief exists to surface.
+		//
+		// Same-head siblings still collapse, because the head is equal for them;
+		// only a head change separates them, which is exactly a new round.
+		head := strings.TrimSpace(payload.HeadSHA)
 		if round := strings.TrimSpace(payload.ReviewRound); round != "" {
-			rounds[job] = "round\x00" + strings.TrimSpace(payload.TaskID) + "\x00" + round
+			rounds[job] = "round\x00" + strings.TrimSpace(payload.TaskID) + "\x00" + round + "\x00" + head
 			continue
 		}
 		if parent := strings.TrimSpace(payload.ParentJobID); parent != "" {
-			rounds[job] = "parent\x00" + parent
+			rounds[job] = "parent\x00" + parent + "\x00" + head
 			continue
 		}
 	}
@@ -772,21 +813,23 @@ func ledgerRelocationBrief(observations []db.ReviewFindingObservation, roundOf m
 	rounds := map[string]map[string]struct{}{}
 	labels := map[string]map[string]struct{}{}
 	for _, obs := range observations {
-		// #2066 round five, P1: THE GROUPING KEY IS THE PATH, NOT THE LOCATOR. The
-		// ledger accepts this repo's documented `path:line` convention and
-		// PRESERVES it in File - it splits the line only when deriving relevance
-		// keys. Keyed on the raw value, three rounds recorded as a.go:10, a.go:20
-		// and a.go:30 became three one-round buckets and emitted no warning, which
-		// is the deflation defect again from a fourth direction: not the wrong unit
-		// this time, but the wrong SUBJECT.
+		// #2066 round six, P1: THE OBSERVATION'S OWN Line DISAMBIGUATES ITS
+		// LOCATOR. Round five reused splitLocator, which cuts at the FIRST colon,
+		// and that is wrong in both directions for the paths this store accepts:
 		//
-		// splitLocator is the package's existing reader for that convention, reused
-		// rather than reimplemented: a second colon-splitting rule here could
-		// disagree with the one the obligations path uses, and it already declines
-		// to split when the suffix is not a number, so a path containing a colon is
-		// left intact.
-		file, _, _ := splitLocator(obs.File)
-		file = strings.TrimSpace(file)
+		//   pkg:a.go:10  -> cut at the first colon leaves "a.go:10", Atoi fails,
+		//                   so the whole raw locator is kept and three rounds on
+		//                   one file stay three buckets;
+		//   pkg:10       -> cut at the first colon leaves "10", Atoi succeeds, so
+		//                   a real FILENAME "pkg:10" is folded to "pkg".
+		//
+		// Cutting at the LAST colon fixes the first and keeps the second wrong,
+		// because "pkg:10" is genuinely ambiguous as text. It is not ambiguous in
+		// the ROW: the observation records its own Line. So the suffix is stripped
+		// only when it matches the recorded line, which also absorbs the
+		// whitespace shape ("a.go: 10") that db.splitPathLine trims and
+		// splitLocator does not - the parser disagreement the review names.
+		file := relocationFileKey(obs)
 		if file == "" {
 			// A finding with no file cannot be attributed to a vessel, so it cannot
 			// evidence relocation WITHIN one. Counting it would inflate every file.
