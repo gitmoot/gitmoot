@@ -653,10 +653,38 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			return claimErr
 		}
 		if !claimed {
-			// Someone else owns this finalization, or a previous advance already
-			// completed it and crashed before persisting the flag. Either way this
-			// caller must not finalize; treating the claim as the durable record is
-			// the whole point of taking it.
+			// #2057 round five, P1: A CLAIM PROVES SOMEONE STARTED, NOT THAT ANYONE
+			// FINISHED, and the previous version conflated those. It set
+			// finalizedBeforeDelegations = true and carried on, so the LOSER of the
+			// claim advanced the parent DAG and dispatched delegations from the
+			// pre-finalization head and pull request while the winner was still
+			// committing and pushing. And a crash after claiming has the SAME
+			// durable representation whether finalization never ran or completed
+			// before the payload write, so the flag could not tell them apart
+			// either.
+			//
+			// Completion is now its own durable fact. The winner records it after
+			// the payload write; a loser that sees it reloads the finalized payload
+			// and proceeds, and a loser that does NOT see it stops, because it
+			// cannot dispatch correctly from data the winner is about to replace.
+			// Stopping is retryable - the daemon re-advances - while dispatching
+			// from stale data is not recoverable.
+			completed, completedErr := e.implementationFinalizeCompleted(ctx, job.ID)
+			if completedErr != nil {
+				return completedErr
+			}
+			if !completed {
+				return FinalizationInProgressError{JobID: job.ID}
+			}
+			refreshed, refreshErr := e.Store.GetJob(ctx, job.ID)
+			if refreshErr != nil {
+				return refreshErr
+			}
+			reloaded, reloadErr := unmarshalPayload(refreshed.Payload)
+			if reloadErr != nil {
+				return reloadErr
+			}
+			payload = reloaded
 			finalizedBeforeDelegations = true
 		} else {
 			finalized, err := e.ImplementationFinalizer.FinalizeImplementation(ctx, job, payload)
@@ -688,6 +716,16 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 				return err
 			}
 			payload = finalized
+			// Recorded AFTER the payload write, so its presence means the payload a
+			// loser reloads is the finalized one. Ordered the other way it would
+			// promise data that is not there yet.
+			if err := e.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
+				JobID:   job.ID,
+				Kind:    implementationFinalizeCompletedEvent,
+				Message: fmt.Sprintf("implementation finalization completed for %s (#2057)", job.ID),
+			}); err != nil {
+				return err
+			}
 			finalizedBeforeDelegations = true
 		}
 	}
@@ -1676,4 +1714,39 @@ func (e Engine) projectedNewDelegationJobs(ctx context.Context, parentJobID stri
 // contributes 0, so the sum under-counts rather than over-counts.
 func (e Engine) sumRootDelegationTokens(ctx context.Context, rootID string) (int, error) {
 	return e.Store.SumJobTokensByRoot(ctx, rootID)
+}
+
+// implementationFinalizeCompletedEvent is the durable record that a finalizer RAN
+// TO COMPLETION and its payload was persisted (#2057 round five). It is a
+// separate fact from the CLAIM: a claim proves someone STARTED, and a crash after
+// claiming looks identical whether the finalizer never ran or finished just
+// before the payload write.
+const implementationFinalizeCompletedEvent = "implementation_finalize_completed"
+
+// FinalizationInProgressError reports that another advance holds the finalization
+// claim and has not recorded completion, so this caller cannot safely proceed:
+// the head and pull request in its payload are about to be replaced.
+//
+// An ERROR rather than a silent skip, because stopping is retryable - the daemon
+// re-advances - while dispatching delegations from data that is about to change
+// is not.
+type FinalizationInProgressError struct {
+	JobID string
+}
+
+func (e FinalizationInProgressError) Error() string {
+	return fmt.Sprintf("implementation finalization for %s is in progress under another advance", e.JobID)
+}
+
+func (e Engine) implementationFinalizeCompleted(ctx context.Context, jobID string) (bool, error) {
+	events, err := e.Store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	for _, event := range events {
+		if event.Kind == implementationFinalizeCompletedEvent {
+			return true, nil
+		}
+	}
+	return false, nil
 }

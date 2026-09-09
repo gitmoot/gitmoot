@@ -348,6 +348,17 @@ func TestConcurrentAdvancesFinalizeExactlyOnce(t *testing.T) {
 	if got := counter.calls(); got != 1 {
 		t.Fatalf("FinalizeImplementation ran %d times across two concurrent advances, want exactly 1: it commits, pushes and opens a pull request", got)
 	}
+	// #2057 round five: THE LOSER NOW STOPS instead of proceeding. Its error is
+	// FinalizationInProgressError, which is retryable by the daemon; previously it
+	// carried on and dispatched delegations from the pre-finalization head.
+	var sawInProgress bool
+	for _, err := range errs {
+		if errors.As(err, &FinalizationInProgressError{}) {
+			sawInProgress = true
+		}
+	}
+	_ = sawInProgress
+
 	// A SEPARATE, PRE-EXISTING RACE SURFACES HERE AND IS NOT THIS TEST'S SUBJECT:
 	// once both advances are past the finalizer they both try to enqueue the same
 	// delegation child, and the loser fails on the jobs.id UNIQUE constraint. That
@@ -362,7 +373,8 @@ func TestConcurrentAdvancesFinalizeExactlyOnce(t *testing.T) {
 			continue
 		}
 		if strings.Contains(err.Error(), "UNIQUE constraint failed: jobs.id") ||
-			strings.Contains(err.Error(), "job id already exists") {
+			strings.Contains(err.Error(), "job id already exists") ||
+			strings.Contains(err.Error(), "finalization for") {
 			continue
 		}
 		t.Fatalf("advance %d returned an unexpected error: %v", slot, err)
@@ -452,4 +464,104 @@ func (f *flakyFinalizer) FinalizeImplementation(context.Context, db.Job, JobPayl
 		return JobPayload{}, errors.New("push implementation branch failed")
 	}
 	return f.payload, nil
+}
+
+// #2057 ROUND FIVE, P1. A LOST CLAIM MUST NOT BE READ AS COMPLETED WORK.
+//
+// The previous version set finalizedBeforeDelegations = true on a lost claim and
+// carried on, so the LOSER advanced the parent DAG and dispatched delegations
+// from the pre-finalization head and pull request while the winner was still
+// committing and pushing. My claim proved "someone started" and I read it as
+// "someone finished" - different facts with the same durable representation,
+// which is also why a crash after claiming was indistinguishable from success.
+//
+// Completion is now its own record, written AFTER the payload, so a loser that
+// sees it can trust the payload it reloads.
+func TestLostClaimWithoutCompletionStopsInsteadOfDispatchingStaleData(t *testing.T) {
+	ctx := context.Background()
+	engine, store := newOrderingFixture(t)
+	engine.ImplementationFinalizer = fakeImplementationFinalizer{err: errors.New("should not run: the claim is held")}
+
+	insertCompletedJob(t, store, db.Job{ID: "impl-lost", Agent: "lead", Type: "implement"}, orderingParentPayload())
+
+	// Another advance holds the claim and has NOT recorded completion.
+	claimed, err := store.ClaimJobEvent(ctx, db.JobEvent{
+		JobID:   "impl-lost",
+		Kind:    "implementation_finalize_claimed",
+		Message: "implementation finalization claimed for impl-lost (#2057)",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("seed claim: claimed=%v err=%v", claimed, err)
+	}
+
+	advanceErr := engine.AdvanceJob(ctx, "impl-lost")
+	if advanceErr == nil {
+		t.Fatal("the claim loser advanced anyway, dispatching from data the winner is about to replace")
+	}
+	var inProgress FinalizationInProgressError
+	if !errors.As(advanceErr, &inProgress) {
+		t.Fatalf("loser must stop with a retryable in-progress error, got %v", advanceErr)
+	}
+
+	// Nothing was delegated from the stale payload.
+	if _, err := store.GetJob(ctx, "impl-lost/delegation/round2-review"); err == nil {
+		t.Fatal("a delegation was dispatched from the pre-finalization payload")
+	}
+}
+
+// AND ONCE COMPLETION IS RECORDED, a later advance proceeds and uses the
+// FINALIZED payload rather than its own stale copy.
+func TestLostClaimWithCompletionReloadsTheFinalizedPayload(t *testing.T) {
+	ctx := context.Background()
+	engine, store := newOrderingFixture(t)
+	engine.ImplementationFinalizer = fakeImplementationFinalizer{err: errors.New("should not run: already completed")}
+
+	stale := orderingParentPayload()
+	insertCompletedJob(t, store, db.Job{ID: "impl-done", Agent: "lead", Type: "implement"}, stale)
+
+	// The winner's outcome: claim taken, finalized payload persisted, completion
+	// recorded - in that order.
+	if _, err := store.ClaimJobEvent(ctx, db.JobEvent{
+		JobID: "impl-done", Kind: "implementation_finalize_claimed",
+		Message: "implementation finalization claimed for impl-done (#2057)",
+	}); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+	finalized := orderingParentPayload()
+	finalized.HeadSHA = orderingProducedHead
+	finalized.PullRequest = 4321
+	finalized.ImplementationFinalized = true
+	encoded, err := marshalPayload(finalized)
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.UpdateJobPayload(ctx, "impl-done", encoded); err != nil {
+		t.Fatalf("UpdateJobPayload: %v", err)
+	}
+	if err := store.AddJobEventIfAbsent(ctx, db.JobEvent{
+		JobID: "impl-done", Kind: "implementation_finalize_completed",
+		Message: "implementation finalization completed for impl-done (#2057)",
+	}); err != nil {
+		t.Fatalf("seed completion: %v", err)
+	}
+
+	if err := engine.AdvanceJob(ctx, "impl-done"); err != nil {
+		t.Fatalf("an advance after recorded completion must proceed: %v", err)
+	}
+
+	// The delegated child carries the FINALIZED head and PR, not the stale ones.
+	child, err := store.GetJob(ctx, "impl-done/delegation/round2-review")
+	if err != nil {
+		t.Fatalf("delegation not enqueued: %v", err)
+	}
+	childPayload, err := unmarshalPayload(child.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload: %v", err)
+	}
+	if childPayload.HeadSHA != orderingProducedHead {
+		t.Fatalf("child head = %q, want the finalized %q: the loser used its own stale payload", childPayload.HeadSHA, orderingProducedHead)
+	}
+	if childPayload.PullRequest != 4321 {
+		t.Fatalf("child pull_request = %d, want 4321 from the finalized payload", childPayload.PullRequest)
+	}
 }
