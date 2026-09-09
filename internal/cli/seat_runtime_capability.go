@@ -16,6 +16,9 @@ type readOnlySeatSetup struct {
 	// runtimeUnavailable is why the seat's own runtime resolves to the
 	// engine's exit-126 unavailable command, or "" when it staged normally.
 	runtimeUnavailable string
+	// toolchainUnavailable is why the seat's `go` resolves to the engine's
+	// exit-126 unavailable command, or "" when the toolchain staged normally.
+	toolchainUnavailable string
 }
 
 // seatRuntimeUnavailableEvent records that a job was refused because the
@@ -49,5 +52,36 @@ func (e *seatRuntimeCapabilityError) Error() string {
 	return fmt.Sprintf(
 		"read-only seat capability preflight blocked agent %q: runtime %q is published unavailable to seats, so every command this job dispatches would exit 126 without running (%s); remedy: restore the daemon-staged %s artifact, or dispatch this job to an agent whose runtime stages",
 		e.agentName, e.runtimeName, cause, e.runtimeName,
+	)
+}
+
+// seatToolchainUnavailableEvent records that a REVIEW job was refused because
+// the seat cannot run `go`. Scoped to review for the reason the staging miss
+// was left un-evented in the first place (daemon_worker.go): a job's event
+// sequence must not depend on the host's toolchain and disk state, and
+// TestExecBackendLocalDefaultDaemonE2E pins an exact baseline for an `ask`
+// job. A review is the one action whose contract is to execute the
+// repository's gate, so for review - and only review - the absence is a fact
+// about the job's outcome rather than about the host.
+const seatToolchainUnavailableEvent = "seat_toolchain_unavailable"
+
+// seatToolchainCapabilityError is the #1817 capability refusal for a review
+// seat whose Go toolchain is published unavailable. BLOCKED rather than
+// FAILED, for the same reason as its runtime sibling: nothing was wrong with
+// the job, the capability it needs is absent, and `failed` reads as "this
+// reviewer tried" and invites the identical re-dispatch.
+type seatToolchainCapabilityError struct {
+	agentName string
+	cause     string
+}
+
+func (e *seatToolchainCapabilityError) Error() string {
+	cause := strings.TrimSpace(e.cause)
+	if cause == "" {
+		cause = "no daemon-staged Go toolchain exists"
+	}
+	return fmt.Sprintf(
+		"read-only seat capability preflight blocked review agent %q: the seat's Go toolchain is published unavailable, so `go build`, `go vet` and `go test` would each exit 126 without running (%s); a verdict from this seat could not have executed the repository's gate; remedy: restore the daemon-staged Go artifact, or dispatch this review to a host whose toolchain stages",
+		e.agentName, cause,
 	)
 }
