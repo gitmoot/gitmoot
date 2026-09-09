@@ -178,3 +178,47 @@ func TestTheObligationSetStillContainsNonBlockingFindings(t *testing.T) {
 		t.Fatalf("obligation severity = %q, want P3", obligations[0].Severity)
 	}
 }
+
+// AND A LEGACY BLANK ROW BLOCKS END TO END, NOT JUST AT THE PREDICATE.
+//
+// The predicate test above proves CLASSIFICATION. It does not prove that
+// EnsureLedgerObligationsObserved receives such a row from the store and
+// refuses on it, which is the property that actually protects the 43 open
+// blank-severity obligations in the live ledger.
+//
+// The gap was real and I first documented it as unreachable, because
+// RecordReviewFindingObservation rejects a blank severity. It is reachable:
+// db.Store.ExecForTest inserts the row the way the pre-validator writer did.
+// A limitation worth documenting is worth one more look for a way around it.
+func TestALegacyBlankSeverityRowBlocksThroughTheStore(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	oldHead, head := strings.Repeat("b", 40), strings.Repeat("c", 40)
+
+	if err := store.ExecForTest(ctx,
+		`INSERT INTO review_finding_observations
+		   (finding_uid, repo, pull_request, head_sha, observer_job, state, severity, round_label, title, evidence_kind)
+		 VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		"gitmoot/gitmoot#7009-f1", "gitmoot/gitmoot", 7009, oldHead, "review-legacy",
+		string(db.FindingOpen), "", "F-1", "a finding written before the severity validator", string(db.EvidenceExecuted),
+	); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+
+	// The premise: this row could not be written through the current writer.
+	if _, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
+		Repo: "gitmoot/gitmoot", PullRequest: 7009, HeadSHA: oldHead, ObserverJob: "review-2",
+		State: db.FindingOpen, Severity: "", RoundLabel: "F-2", Title: "rejected",
+		EvidenceKind: db.EvidenceExecuted, ExecutedCommands: []string{"x"}, ExecutedCount: 1,
+	}); err == nil {
+		t.Fatal("premise broken: the writer now accepts a blank severity, so this fixture no longer represents legacy data")
+	}
+
+	err := EnsureLedgerObligationsObserved(ctx, store, "gitmoot/gitmoot", 7009, head, LedgerScope{TaskID: "task-7009"})
+	if err == nil {
+		t.Fatal("a stored blank-severity obligation did not block; 43 live rows would have been silently retired")
+	}
+	if !strings.Contains(err.Error(), "F-1") {
+		t.Fatalf("the refusal does not name the legacy obligation: %v", err)
+	}
+}
