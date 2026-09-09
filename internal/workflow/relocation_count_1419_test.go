@@ -452,7 +452,8 @@ func TestRelocationBriefDescribesTheUnitItActuallyCounts(t *testing.T) {
 	for _, want := range []string{
 		"review round when one is recorded", "coordinator that",
 		"only otherwise by the individual reviewing job",
-		"ALSO by", "the exact head that was reviewed", "a fan-out at ONE head is one",
+		"INCLUDING the job fallback", "the exact head that was reviewed",
+		"a fan-out at ONE head is one",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("the brief does not describe the identity ladder (%q):\n%s", want, got)
@@ -731,15 +732,76 @@ func TestRelocationCountGroupsQualifiedLocatorsWithNoRecordedLine(t *testing.T) 
 		t.Fatalf("three line-qualified spellings with no recorded Line stayed in separate buckets:\n%s", got)
 	}
 
-	// An extensionless path is still path-SHAPED when it carries a separator,
-	// which is the other real spelling in the store.
+	// ROUND EIGHT REVERSED THIS CASE ON PURPOSE. Round seven folded an
+	// extensionless path because it carried a separator, and that reasoning is
+	// what round eight refuted: a separator proves the value is a path and says
+	// nothing about whether the trailing number belongs to the NAME. This real
+	// spelling from the store is therefore left in separate buckets, which
+	// UNDER-reports rather than risking a manufactured relocation.
 	separatorOnly := []db.ReviewFindingObservation{
 		at("apps/web/public/_landing:372", "job-1"),
 		at("apps/web/public/_landing:373", "job-2"),
 		at("apps/web/public/_landing:374", "job-3"),
 	}
-	if got := ledgerRelocationBrief(separatorOnly, nil); !strings.Contains(got, "apps/web/public/_landing  rounds=3") {
-		t.Fatalf("a separator-bearing extensionless path was not recognised:\n%s", got)
+	if got := ledgerRelocationBrief(separatorOnly, nil); got != "" {
+		t.Fatalf("an extensionless name was folded on path shape alone:\n%s", got)
+	}
+
+	// #2066 ROUND EIGHT, P1: THE COUNTER-EXAMPLE THAT KILLED PATH SHAPE. The
+	// store accepts these locators and nothing in the text says the suffix is a
+	// line, so folding them would invent rounds=3 from three different files.
+	pathShapedButNamed := []db.ReviewFindingObservation{
+		at("dir/pkg:10", "job-1"),
+		at("dir/pkg:20", "job-2"),
+		at("dir/pkg:30", "job-3"),
+	}
+	if got := ledgerRelocationBrief(pathShapedButNamed, nil); got != "" {
+		t.Fatalf("three separator-bearing names with numeric suffixes were folded:\n%s", got)
+	}
+
+	// An extension on the last segment IS about the name, so a dotted root file
+	// still groups: "go.mod:3" is a line-qualified locator by any convention.
+	dottedRoot := []db.ReviewFindingObservation{
+		at("go.mod:3", "job-1"),
+		at("go.mod:9", "job-2"),
+		at("go.mod:14", "job-3"),
+	}
+	if got := ledgerRelocationBrief(dottedRoot, nil); !strings.Contains(got, "go.mod  rounds=3") {
+		t.Fatalf("an extension-bearing root file did not group:\n%s", got)
+	}
+
+	// A LEADING DOT IS A PREFIX, NOT AN EXTENSION. ".env" is the whole name, so
+	// ".env:10" is declined and stays a floor. Deciding it the other way would
+	// fold any dotfile whose name ends in a number.
+	dotfile := []db.ReviewFindingObservation{
+		at(".env:10", "job-1"),
+		at(".env:20", "job-2"),
+		at(".env:30", "job-3"),
+	}
+	if got := ledgerRelocationBrief(dotfile, nil); got != "" {
+		t.Fatalf("a leading dot was read as an extension separator:\n%s", got)
+	}
+
+	// A TRAILING DOT IS NOT AN EXTENSION EITHER: there is nothing after it to be
+	// one.
+	trailingDot := []db.ReviewFindingObservation{
+		at("pkg.:10", "job-1"),
+		at("pkg.:20", "job-2"),
+		at("pkg.:30", "job-3"),
+	}
+	if got := ledgerRelocationBrief(trailingDot, nil); got != "" {
+		t.Fatalf("a trailing dot was accepted as an extension:\n%s", got)
+	}
+
+	// A DOT IN A PARENT DIRECTORY IS NOT AN EXTENSION ON THE FILE. Only the last
+	// segment is inspected, so "v1.2/pkg:10" keeps its whole value.
+	dottedDirectory := []db.ReviewFindingObservation{
+		at("v1.2/pkg:10", "job-1"),
+		at("v1.2/pkg:20", "job-2"),
+		at("v1.2/pkg:30", "job-3"),
+	}
+	if got := ledgerRelocationBrief(dottedDirectory, nil); got != "" {
+		t.Fatalf("a dot in a PARENT directory was read as the file's extension:\n%s", got)
 	}
 
 	// AND THE FALSE FOLD THE OLD RULE TOOK: a real filename "pkg:10" whose
@@ -752,5 +814,68 @@ func TestRelocationCountGroupsQualifiedLocatorsWithNoRecordedLine(t *testing.T) 
 	}
 	if got := ledgerRelocationBrief(coincidence, nil); got != "" {
 		t.Fatalf("three files whose names end in a matching number were folded into one:\n%s", got)
+	}
+}
+
+// #2066 ROUND EIGHT, P1. THE JOB FALLBACK NEEDS THE HEAD TOO. Round seven
+// appended the observation's head only inside the resolved-base branch, so a
+// retried job with NO ReviewRound and NO ParentJobID keyed its observations by
+// the reused job ID alone and reported one round. That is the ORDINARY shape for
+// a local review enqueue on a top-level job, not a corner case.
+//
+// Round seven's own regression seeded ReviewRound="review-1", so it never
+// reached this path: the fix and its test agreed with each other and not with
+// production. This one seeds neither field.
+func TestRelocationCountSeparatesHeadsOnTheJobFallback(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := Engine{Store: store}
+
+	// A top-level job: no ReviewRound, no ParentJobID, so the resolver yields
+	// nothing and the identity falls back to the job id.
+	insertCompletedJob(t, store, db.Job{ID: "solo-retried", Agent: "reviewer", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", PullRequest: 2066,
+		HeadSHA: "cccccccccccccccccccccccccccccccccccccccc",
+		Result:  &AgentResult{Decision: "changes_requested", Summary: "ok"},
+	})
+	at := func(head string) db.ReviewFindingObservation {
+		return db.ReviewFindingObservation{
+			File: "internal/cli/a.go", ObserverJob: "solo-retried", RoundLabel: "F1", HeadSHA: head,
+		}
+	}
+	resolved := engine.reviewRoundsForObservations(ctx, []db.ReviewFindingObservation{at("x")})
+	if base := resolved["solo-retried"]; base != "" {
+		t.Fatalf("this fixture must exercise the FALLBACK, but the resolver returned %q", base)
+	}
+
+	rows := []db.ReviewFindingObservation{
+		at("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		at("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+		at("cccccccccccccccccccccccccccccccccccccccc"),
+	}
+	got := ledgerRelocationBrief(rows, engine.reviewRoundsForObservations(ctx, rows))
+	if !strings.Contains(got, "rounds=3") {
+		t.Fatalf("three heads under one unattributed retried job collapsed:\n%s", got)
+	}
+
+	// One head is still one round on the fallback path too.
+	same := []db.ReviewFindingObservation{
+		at("cccccccccccccccccccccccccccccccccccccccc"),
+		at("cccccccccccccccccccccccccccccccccccccccc"),
+		at("cccccccccccccccccccccccccccccccccccccccc"),
+	}
+	if got := ledgerRelocationBrief(same, engine.reviewRoundsForObservations(ctx, same)); got != "" {
+		t.Fatalf("three findings at one head on the fallback path were counted as three rounds:\n%s", got)
+	}
+
+	// AND AN UNATTRIBUTABLE ROW MUST STAY UNATTRIBUTABLE. A row with no observer
+	// job is skipped; it must not become countable by acquiring a head.
+	headless := []db.ReviewFindingObservation{
+		{File: "internal/cli/b.go", RoundLabel: "F1", HeadSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		{File: "internal/cli/b.go", RoundLabel: "F1", HeadSHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		{File: "internal/cli/b.go", RoundLabel: "F1", HeadSHA: "cccccccccccccccccccccccccccccccccccccccc"},
+	}
+	if got := ledgerRelocationBrief(headless, nil); got != "" {
+		t.Fatalf("rows with no observing job manufactured rounds from their heads:\n%s", got)
 	}
 }
