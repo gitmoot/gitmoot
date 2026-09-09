@@ -254,8 +254,9 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 			instructions = scopedReviewInstructions(event, scope)
 		}
 		// DISCLOSE THE LEDGER'S OBLIGATIONS IN THE BRIEF (#1850 review F1's other
-		// half). The gate refuses a verdict at this head while a prior finding
-		// carries no observation, and an obligation is dischargeable only by
+		// half). The gate refuses a verdict at this head while a prior P1 or P2
+		// carries no observation - a P3 is reported and does not hold the merge
+		// (note 129657) - and an obligation is dischargeable only by
 		// citing its uid - a value obtainable ONLY by being told it. Writing the
 		// ledger without disclosing it would convert the inert feature into a
 		// guard that blocks legitimate merges, which is strictly worse. Empty
