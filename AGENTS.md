@@ -212,6 +212,13 @@ completes in well under 10 minutes on its runners), so this was a
 local-only gap — but a command documented as "run this before committing"
 has to actually be able to finish.
 
+**What that failure LOOKS like, because two seats misread it as a hang within one
+hour:** omit the flag and the run dies with `panic: test timed out after 10m0s`
+followed by `FAIL github.com/gitmoot/gitmoot/internal/cli 600.02s`, with no failing
+test named. A wall time of 600.0xx seconds IS the default deadline, not a stall
+and not a deadlock: the suite was still working when Go killed it. Read the
+number before debugging the package: a real hang does not stop at exactly 600s.
+
 The CLI entrypoint lives under `cmd/gitmoot/`. The CI gate is Go-only — it does
 **not** build the website or run the live multi-runtime (codex/claude/kimi) E2E
 (those need a Node build / runtime auth and stay manual).
