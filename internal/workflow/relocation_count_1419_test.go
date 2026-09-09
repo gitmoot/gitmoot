@@ -507,59 +507,133 @@ func TestReviewRoundResolutionFallsBackToTheCoordinator(t *testing.T) {
 // focused and full suites could not exercise the production-supported shape.
 // #2076's class, fifth instance, and the fourth of them in my own tests.
 func TestRelocationCountGroupsLineQualifiedLocatorsByFile(t *testing.T) {
+	// The store writes File AND Line together, so a fixture that sets only File
+	// models a row the writer does not produce - and the recorded Line is exactly
+	// what makes an ambiguous locator decidable.
+	at := func(file string, line int64, job string) db.ReviewFindingObservation {
+		return db.ReviewFindingObservation{File: file, Line: line, ObserverJob: job, RoundLabel: "F1"}
+	}
+
 	lineQualified := []db.ReviewFindingObservation{
-		{File: "internal/workflow/a.go:10", ObserverJob: "job-1", RoundLabel: "F1"},
-		{File: "internal/workflow/a.go:20", ObserverJob: "job-2", RoundLabel: "F1"},
-		{File: "internal/workflow/a.go:30", ObserverJob: "job-3", RoundLabel: "F1"},
+		at("internal/workflow/a.go:10", 10, "job-1"),
+		at("internal/workflow/a.go:20", 20, "job-2"),
+		at("internal/workflow/a.go:30", 30, "job-3"),
 	}
 	got := ledgerRelocationBrief(lineQualified, nil)
-	if got == "" {
-		t.Fatal("three rounds on one file at different lines produced no relocation warning")
-	}
 	if !strings.Contains(got, "rounds=3") {
 		t.Fatalf("line-qualified locators split the file into separate buckets:\n%s", got)
 	}
-	// The rendered line names the FILE, not one arbitrary locator.
 	if !strings.Contains(got, "internal/workflow/a.go  rounds=3") {
 		t.Fatalf("the brief must name the canonical path:\n%s", got)
 	}
 
-	// MIXED bare and qualified locators are one file too - the real store holds
-	// both, because the convention is a reviewer's choice per finding.
+	// MIXED bare and qualified locators are one file: the convention is a
+	// reviewer's choice per finding, so the real store holds both.
 	mixed := []db.ReviewFindingObservation{
-		{File: "internal/workflow/a.go", ObserverJob: "job-1", RoundLabel: "F1"},
-		{File: "internal/workflow/a.go:20", ObserverJob: "job-2", RoundLabel: "F1"},
-		{File: " internal/workflow/a.go:30 ", ObserverJob: "job-3", RoundLabel: "F1"},
+		at("internal/workflow/a.go", 0, "job-1"),
+		at("internal/workflow/a.go:20", 20, "job-2"),
+		at(" internal/workflow/a.go: 30 ", 30, "job-3"),
 	}
 	if got := ledgerRelocationBrief(mixed, nil); !strings.Contains(got, "rounds=3") {
-		t.Fatalf("bare and line-qualified locators for one file were counted separately:\n%s", got)
+		t.Fatalf("bare, qualified and whitespace-qualified spellings were counted separately:\n%s", got)
 	}
 
-	// A NON-NUMERIC SUFFIX IS PART OF THE PATH, NOT A LINE, which is precisely
-	// what splitLocator's Atoi check protects and what a naive last-colon split
-	// would destroy. Two different files sharing a colon-prefix must stay two
-	// files: stripping at the last colon folds both into "pkg" and manufactures a
-	// three-round warning on a name that is not a file.
-	//
-	// A last-colon mutant survived until this case existed, because every other
-	// fixture used either a bare path or a numeric suffix.
-	colonPaths := []db.ReviewFindingObservation{
-		{File: "pkg:a.go", ObserverJob: "job-1", RoundLabel: "F1"},
-		{File: "pkg:a.go", ObserverJob: "job-2", RoundLabel: "F1"},
-		{File: "pkg:b.go", ObserverJob: "job-3", RoundLabel: "F1"},
+	// #2066 ROUND SIX: A COLON-BEARING PATH WITH A LINE QUALIFIER. splitLocator
+	// cut at the FIRST colon, so "pkg:a.go:10" failed Atoi on "a.go:10" and kept
+	// the raw locator - three rounds, three buckets, no warning.
+	colonWithLine := []db.ReviewFindingObservation{
+		at("pkg:a.go:10", 10, "job-1"),
+		at("pkg:a.go:20", 20, "job-2"),
+		at("pkg:a.go:30", 30, "job-3"),
 	}
-	if got := ledgerRelocationBrief(colonPaths, nil); got != "" {
-		t.Fatalf("a non-numeric suffix was treated as a line, folding two files into one bucket:\n%s", got)
+	if got := ledgerRelocationBrief(colonWithLine, nil); !strings.Contains(got, "pkg:a.go  rounds=3") {
+		t.Fatalf("a colon-bearing path with a line qualifier split across buckets:\n%s", got)
 	}
 
-	// DIFFERENT files must stay different, or the canonicalisation has simply
-	// collapsed everything.
+	// AND THE OPPOSITE DIRECTION, which cutting at the last colon gets wrong on
+	// text alone: "pkg:10" is a real FILENAME here, and its row records no line.
+	// Folding it to "pkg" would merge two different files and invent a
+	// relocation.
+	filenameLooksLikeLine := []db.ReviewFindingObservation{
+		at("pkg:10", 0, "job-1"),
+		at("pkg:20", 0, "job-2"),
+		at("pkg:30", 0, "job-3"),
+	}
+	if got := ledgerRelocationBrief(filenameLooksLikeLine, nil); got != "" {
+		t.Fatalf("three different files whose names end in a number were folded into one:\n%s", got)
+	}
+
+	// A trailing number that does NOT match the recorded line is part of the name.
+	mismatched := []db.ReviewFindingObservation{
+		at("pkg:10", 99, "job-1"),
+		at("pkg:20", 99, "job-2"),
+		at("pkg:30", 99, "job-3"),
+	}
+	if got := ledgerRelocationBrief(mismatched, nil); got != "" {
+		t.Fatalf("a suffix that does not match the recorded line was stripped anyway:\n%s", got)
+	}
+
+	// DIFFERENT files must stay different, or the canonicalisation has collapsed
+	// everything.
 	distinct := []db.ReviewFindingObservation{
-		{File: "internal/workflow/a.go:10", ObserverJob: "job-1", RoundLabel: "F1"},
-		{File: "internal/workflow/b.go:10", ObserverJob: "job-2", RoundLabel: "F1"},
-		{File: "internal/workflow/c.go:10", ObserverJob: "job-3", RoundLabel: "F1"},
+		at("internal/workflow/a.go:10", 10, "job-1"),
+		at("internal/workflow/b.go:10", 10, "job-2"),
+		at("internal/workflow/c.go:10", 10, "job-3"),
 	}
 	if got := ledgerRelocationBrief(distinct, nil); got != "" {
 		t.Fatalf("three different files were folded into one bucket:\n%s", got)
+	}
+}
+
+// #2066 ROUND SIX, P1. TWO CHILDREN OF ONE COORDINATOR THAT REVIEWED DIFFERENT
+// HEADS ARE TWO ROUNDS. Both identity rungs omitted the reviewed head, so a
+// coordinator's dependent review legs - deferred legs are enqueued after their
+// dependencies settle, and delegationHeadSHA resolves the then-current PR mirror
+// - collapsed into one round if a push landed between their dispatches. That
+// undercounts genuine review/fix cycles, which is the defect this brief exists to
+// surface.
+func TestReviewRoundResolutionSeparatesDifferentReviewedHeads(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := Engine{Store: store}
+
+	seed := func(id, parent, round, head string) db.ReviewFindingObservation {
+		insertCompletedJob(t, store, db.Job{ID: id, Agent: "reviewer", Type: "review"}, JobPayload{
+			Repo: "gitmoot/gitmoot", PullRequest: 2066, ParentJobID: parent, ReviewRound: round, HeadSHA: head,
+			Result: &AgentResult{Decision: "approved", Summary: "ok"},
+		})
+		return db.ReviewFindingObservation{File: "internal/cli/a.go", ObserverJob: id, RoundLabel: "F1"}
+	}
+
+	// Roundless siblings of ONE coordinator at DIFFERENT heads: two rounds.
+	differentHeads := []db.ReviewFindingObservation{
+		seed("leg-h1", "coordinator-9", "", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		seed("leg-h2", "coordinator-9", "", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+	}
+	resolved := engine.reviewRoundsForObservations(ctx, differentHeads)
+	if resolved["leg-h1"] == resolved["leg-h2"] {
+		t.Fatalf("two legs that reviewed different heads share one identity %q", resolved["leg-h1"])
+	}
+
+	// SAME head still collapses - that is the fan-out case the previous round
+	// fixed, and separating heads must not undo it.
+	sameHead := []db.ReviewFindingObservation{
+		seed("panel-a", "coordinator-7", "", "cccccccccccccccccccccccccccccccccccccccc"),
+		seed("panel-b", "coordinator-7", "", "cccccccccccccccccccccccccccccccccccccccc"),
+	}
+	resolved = engine.reviewRoundsForObservations(ctx, sameHead)
+	if resolved["panel-a"] != resolved["panel-b"] || resolved["panel-a"] == "" {
+		t.Fatalf("same-head siblings no longer collapse: %q vs %q", resolved["panel-a"], resolved["panel-b"])
+	}
+
+	// A RECORDED ROUND is separated by head too: fan-out members can be resynced
+	// across a push, which is a new round by any reading.
+	roundAcrossHeads := []db.ReviewFindingObservation{
+		seed("r1-h1", "coordinator-5", "review-1", "dddddddddddddddddddddddddddddddddddddddd"),
+		seed("r1-h2", "coordinator-5", "review-1", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+	}
+	resolved = engine.reviewRoundsForObservations(ctx, roundAcrossHeads)
+	if resolved["r1-h1"] == resolved["r1-h2"] {
+		t.Fatalf("one recorded round across two heads shares an identity %q", resolved["r1-h1"])
 	}
 }
