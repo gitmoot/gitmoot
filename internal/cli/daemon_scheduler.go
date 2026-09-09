@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -437,6 +438,16 @@ func recordDispatchDecline(ctx context.Context, store *db.Store, job db.Job, cla
 		return
 	}
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "dispatch_declined", Message: detail}); err != nil {
+		// A VISIBILITY FEATURE MUST NOT FAIL INVISIBLY. Retry-next-tick is the
+		// intended design - the episode stays closed, so the next pass re-attempts -
+		// but a SUSTAINED write failure would then retry forever per declining job
+		// with no operator-visible signal at all, which is the exact blindness this
+		// change exists to remove. Logged per failed attempt rather than deduped:
+		// suppressing the log would recreate the invisibility, and a store that
+		// cannot accept a job event is a fleet-level fault where this volume is the
+		// least of the problems. Matches event_rule_sink.go's precedent for a
+		// best-effort store write in a path with no stdout.
+		slog.Warn("dispatch decline event write failed", "job_id", job.ID, "clause", clause, "error", err)
 		return
 	}
 	markDispatchDeclineEpisode(key)

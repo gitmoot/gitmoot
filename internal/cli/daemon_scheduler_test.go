@@ -5961,3 +5961,83 @@ func TestDispatchDeclineDedupsOnTheClauseNotTheOperand(t *testing.T) {
 		}
 	}
 }
+
+// TestDispatchDeclineClauseLabelsMatchTheirBranch closes the gap #2118's reviewer
+// found by injecting the mutant that proves it: MISLABELLING a branch's clause
+// string - the limit branch returning "checkout", say - compiles, leaves admission
+// and the message text untouched, and SURVIVED all three of the other tests. It is
+// not a live bug today; production's labels are distinct and correct. It is a
+// latent one, and the failure mode is specific: the clause is the DEDUP KEY, so two
+// branches sharing a label collide into one episode and the second reason is
+// silently suppressed for the whole TTL.
+//
+// So this asserts the correspondence directly rather than through the event: each
+// branch must return ITS OWN label alongside the detail that names its operand.
+func TestDispatchDeclineClauseLabelsMatchTheirBranch(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	uniq := t.Name()
+	seedDaemonWorkerAgent(t, store, "lead-"+uniq, runtime.CodexRuntime, "session-1", []string{"implement"}, "owner/repo")
+	task := "task-" + uniq
+	if err := store.UpsertTask(ctx, db.Task{ID: task, RepoFullName: "owner/repo", State: string(workflow.TaskImplementing), Branch: task, WorktreePath: "/tmp/gitmoot/" + task}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-" + uniq, Agent: "lead-" + uniq, Action: "implement", Repo: "owner/repo", Branch: task, TaskID: task})
+	jobs, err := store.ListQueuedJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListQueuedJobs: %v", err)
+	}
+	job := jobs[0]
+
+	checkoutKey := queuedJobCheckoutKey(ctx, store, job)
+	runtimeKey := queuedJobRuntimeResourceKey(ctx, store, job)
+
+	for _, tt := range []struct {
+		name       string
+		selector   queuedJobResourceSelector
+		selected   int
+		wantClause string
+		wantInMsg  string
+	}{
+		{
+			// The limit branch, reached by having already admitted its whole budget.
+			name:       "limit",
+			selector:   queuedJobResourceSelector{limit: 1, checkouts: map[string]bool{}, runtimes: map[string]bool{}, tempReservations: map[string]int{}},
+			selected:   1,
+			wantClause: "limit",
+			wantInMsg:  "selected=1 limit=1",
+		},
+		{
+			// The checkout branch, reached by pre-seeding this job's own key.
+			name:       "checkout",
+			selector:   queuedJobResourceSelector{limit: 8, checkouts: map[string]bool{checkoutKey: true}, runtimes: map[string]bool{}, tempReservations: map[string]int{}},
+			wantClause: "checkout",
+			wantInMsg:  checkoutKey,
+		},
+		{
+			// The runtime branch, reached by pre-seeding the runtime key with a
+			// serializing policy so no temp session can rescue it.
+			name:       "runtime",
+			selector:   queuedJobResourceSelector{limit: 8, policy: config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue}, checkouts: map[string]bool{}, runtimes: map[string]bool{runtimeKey: true}, tempReservations: map[string]int{}},
+			wantClause: "runtime",
+			wantInMsg:  runtimeKey,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			admitted, clause, detail := tt.selector.selects(ctx, store, job, tt.selected)
+			if admitted {
+				t.Fatalf("%s branch admitted the job, so this row tests nothing", tt.name)
+			}
+			// THE LABEL IS THE DEDUP KEY. A branch returning another branch's label
+			// collides two reasons into one episode and suppresses the second.
+			if clause != tt.wantClause {
+				t.Fatalf("%s branch returned clause %q, want %q; a mislabelled clause collides two decline reasons under one dedup key", tt.name, clause, tt.wantClause)
+			}
+			// And the operand must still be the one THIS branch tested, so a label
+			// swap cannot be repaired by a matching message swap.
+			if !strings.Contains(detail, tt.wantInMsg) {
+				t.Fatalf("%s branch detail %q does not carry %q", tt.name, detail, tt.wantInMsg)
+			}
+		})
+	}
+}
