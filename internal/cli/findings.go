@@ -155,10 +155,23 @@ func runFindingsRows(repo string, pullRequest int, home string, jsonOutput bool,
 		return 1
 	}
 
-	// FOLD BEFORE EVERY OUTPUT PATH (#2086 review). The first fix put this after
-	// the JSON branch, so --json still returned the raw append-only log - the
-	// worse half, because JSON is what a dispatch path consumes and a human at
-	// least sees the duplicate UIDs.
+	// FOLD BEFORE EVERY OUTPUT PATH (#2086 f1, and its comment lived twelve lines
+	// too low until #2086 f4).
+	//
+	// The store is APPEND-ONLY and its doc comment says so: it returns every
+	// observation and does not fold, so a caller folds. The first version printed
+	// the raw log, one line per observation, showing a finding as "open" at an old
+	// head beside its own "answered" row at a newer one - four lines for one
+	// finding on PR #2077. A reviewer sent here by a budgeted brief is asking
+	// WHICH OBLIGATIONS ARE OPEN, and a stale open row answers that wrongly using
+	// the ledger's own data.
+	//
+	// The second version folded AFTER the JSON branch, so --json still returned
+	// the raw log - the worse half, because JSON is what a dispatch path consumes
+	// and a human at least sees the duplicate UIDs and can wonder.
+	//
+	// The rule is the engine's, not a new one: workflow.LatestObservationsInOrder,
+	// including its QUOTED guard.
 	rows = workflow.LatestObservationsInOrder(rows)
 
 	if jsonOutput {
@@ -170,20 +183,6 @@ func runFindingsRows(repo string, pullRequest int, home string, jsonOutput bool,
 		fmt.Fprintln(stdout, string(encoded))
 		return 0
 	}
-
-	// FOLD TO LATEST PER FINDING (#2086 f1). The store is APPEND-ONLY and its own
-	// doc comment says so: it returns every observation and does not fold, so a
-	// caller folds. The first version printed the raw log, one line per
-	// observation, showing a finding as "open" at an old head beside its own
-	// "answered" row at a newer one - four lines for one finding on PR #2077.
-	//
-	// That is worse than the gap it was fixing. A reviewer sent here by a
-	// budgeted brief is asking WHICH OBLIGATIONS ARE OPEN, and a stale open row
-	// answers that wrongly using the ledger's own data. I read that exact output
-	// in my own smoke test and saw history rather than a defect.
-	//
-	// The fold rule is the engine's, not a new one: latestObservation in
-	// findings_ledger.go, including its QUOTED guard.
 
 	if len(rows) == 0 {
 		// NAME BOTH REASONS. A reviewer sent here by a brief needs to know whether
