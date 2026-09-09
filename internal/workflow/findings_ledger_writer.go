@@ -532,7 +532,13 @@ func (e Engine) ReviewObligationBrief(ctx context.Context, repo string, pullRequ
 // of this change simply dropped it, which made the sentence true and the advice
 // worse - a reviewer whose rationale was the right way to say it would have been
 // steered off a key that works.
-var ledgerContentKeys = []string{"title", "summary", "detail", "body", "evidence"}
+// #2073 adds three readers, so the refusal must advertise them or #2072 returns
+// in the opposite direction: a reader that accepts a key the refusal calls
+// unsupported teaches the next reviewer to stop sending it. Each was measured to
+// rescue a finding ON ITS OWN - a row carrying only severity, a locator and that
+// key is recorded rather than refused - so all three are content, not
+// non-content.
+var ledgerContentKeys = []string{"title", "summary", "detail", "body", "evidence", "details", "finding", "message"}
 
 // ledgerConditionalContentKeys carry finding text only alongside a locator.
 var ledgerConditionalContentKeys = []string{"rationale"}

@@ -494,3 +494,34 @@ func TestObligationBriefSanitisesInvalidUTF8AlreadyInTheStore(t *testing.T) {
 		t.Fatalf("the raw invalid byte reached the prompt")
 	}
 }
+
+// The ORDER of coercion and truncation is the correctness argument for F6, and a
+// test written after the fact passes either way. This one cannot: the input is
+// valid-length before coercion and over-budget after it, because each invalid
+// byte becomes a 3-byte replacement rune. Truncating first would satisfy the
+// bound and emit invalid UTF-8; coercing first and not re-checking would emit
+// valid UTF-8 over the bound. Only coerce-then-truncate satisfies both.
+func TestTruncateAtRuneCoercesBeforeItMeasures(t *testing.T) {
+	// EACH INVALID BYTE MUST BE ITS OWN RUN. strings.ToValidUTF8 replaces a RUN of
+	// invalid bytes with ONE replacement rune, so 100 consecutive 0xff collapse to
+	// 3 bytes and never cross any budget. Interleaved, each 0xff is a separate run:
+	// 100 x "a\xff" is 200 bytes raw and 400 coerced.
+	//
+	// The growth factor therefore depends on the DISTRIBUTION of invalid bytes, not
+	// their count, which is the detail that made the first version of this test
+	// pass for the wrong reason.
+	in := strings.Repeat("a\xff", 100)
+	const max = 200
+
+	got, dropped := truncateAtRune(in, max)
+
+	if !utf8.ValidString(got) {
+		t.Fatalf("result is not valid UTF-8: coercion did not happen, or happened after the cut")
+	}
+	if len(got) > max {
+		t.Fatalf("result is %d bytes for a %d-byte limit: the bound was applied BEFORE coercion, so coercion then grew it past the limit", len(got), max)
+	}
+	if dropped == 0 {
+		t.Fatalf("nothing reported dropped, but a 100-byte input coerces to 300 bytes and cannot fit in %d", max)
+	}
+}
