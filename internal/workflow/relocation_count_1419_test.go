@@ -495,3 +495,71 @@ func TestReviewRoundResolutionFallsBackToTheCoordinator(t *testing.T) {
 		t.Fatal("a job with neither round nor parent produced an identity, which would fold unrelated jobs together")
 	}
 }
+
+// #2066 ROUND FIVE, P1. A LINE-QUALIFIED LOCATOR MUST NOT SPLIT ONE FILE INTO
+// SEPARATE BUCKETS. The ledger accepts the repo's documented path:line
+// convention and preserves it in File, so three rounds recorded against
+// a.go:10, a.go:20 and a.go:30 were three one-round buckets emitting no
+// warning - the deflation defect from a fourth direction: not the wrong unit,
+// the wrong SUBJECT.
+//
+// Every relocation test before this one used bare paths exclusively, so the
+// focused and full suites could not exercise the production-supported shape.
+// #2076's class, fifth instance, and the fourth of them in my own tests.
+func TestRelocationCountGroupsLineQualifiedLocatorsByFile(t *testing.T) {
+	lineQualified := []db.ReviewFindingObservation{
+		{File: "internal/workflow/a.go:10", ObserverJob: "job-1", RoundLabel: "F1"},
+		{File: "internal/workflow/a.go:20", ObserverJob: "job-2", RoundLabel: "F1"},
+		{File: "internal/workflow/a.go:30", ObserverJob: "job-3", RoundLabel: "F1"},
+	}
+	got := ledgerRelocationBrief(lineQualified, nil)
+	if got == "" {
+		t.Fatal("three rounds on one file at different lines produced no relocation warning")
+	}
+	if !strings.Contains(got, "rounds=3") {
+		t.Fatalf("line-qualified locators split the file into separate buckets:\n%s", got)
+	}
+	// The rendered line names the FILE, not one arbitrary locator.
+	if !strings.Contains(got, "internal/workflow/a.go  rounds=3") {
+		t.Fatalf("the brief must name the canonical path:\n%s", got)
+	}
+
+	// MIXED bare and qualified locators are one file too - the real store holds
+	// both, because the convention is a reviewer's choice per finding.
+	mixed := []db.ReviewFindingObservation{
+		{File: "internal/workflow/a.go", ObserverJob: "job-1", RoundLabel: "F1"},
+		{File: "internal/workflow/a.go:20", ObserverJob: "job-2", RoundLabel: "F1"},
+		{File: " internal/workflow/a.go:30 ", ObserverJob: "job-3", RoundLabel: "F1"},
+	}
+	if got := ledgerRelocationBrief(mixed, nil); !strings.Contains(got, "rounds=3") {
+		t.Fatalf("bare and line-qualified locators for one file were counted separately:\n%s", got)
+	}
+
+	// A NON-NUMERIC SUFFIX IS PART OF THE PATH, NOT A LINE, which is precisely
+	// what splitLocator's Atoi check protects and what a naive last-colon split
+	// would destroy. Two different files sharing a colon-prefix must stay two
+	// files: stripping at the last colon folds both into "pkg" and manufactures a
+	// three-round warning on a name that is not a file.
+	//
+	// A last-colon mutant survived until this case existed, because every other
+	// fixture used either a bare path or a numeric suffix.
+	colonPaths := []db.ReviewFindingObservation{
+		{File: "pkg:a.go", ObserverJob: "job-1", RoundLabel: "F1"},
+		{File: "pkg:a.go", ObserverJob: "job-2", RoundLabel: "F1"},
+		{File: "pkg:b.go", ObserverJob: "job-3", RoundLabel: "F1"},
+	}
+	if got := ledgerRelocationBrief(colonPaths, nil); got != "" {
+		t.Fatalf("a non-numeric suffix was treated as a line, folding two files into one bucket:\n%s", got)
+	}
+
+	// DIFFERENT files must stay different, or the canonicalisation has simply
+	// collapsed everything.
+	distinct := []db.ReviewFindingObservation{
+		{File: "internal/workflow/a.go:10", ObserverJob: "job-1", RoundLabel: "F1"},
+		{File: "internal/workflow/b.go:10", ObserverJob: "job-2", RoundLabel: "F1"},
+		{File: "internal/workflow/c.go:10", ObserverJob: "job-3", RoundLabel: "F1"},
+	}
+	if got := ledgerRelocationBrief(distinct, nil); got != "" {
+		t.Fatalf("three different files were folded into one bucket:\n%s", got)
+	}
+}

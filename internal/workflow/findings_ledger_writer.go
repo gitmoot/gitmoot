@@ -772,7 +772,21 @@ func ledgerRelocationBrief(observations []db.ReviewFindingObservation, roundOf m
 	rounds := map[string]map[string]struct{}{}
 	labels := map[string]map[string]struct{}{}
 	for _, obs := range observations {
-		file := strings.TrimSpace(obs.File)
+		// #2066 round five, P1: THE GROUPING KEY IS THE PATH, NOT THE LOCATOR. The
+		// ledger accepts this repo's documented `path:line` convention and
+		// PRESERVES it in File - it splits the line only when deriving relevance
+		// keys. Keyed on the raw value, three rounds recorded as a.go:10, a.go:20
+		// and a.go:30 became three one-round buckets and emitted no warning, which
+		// is the deflation defect again from a fourth direction: not the wrong unit
+		// this time, but the wrong SUBJECT.
+		//
+		// splitLocator is the package's existing reader for that convention, reused
+		// rather than reimplemented: a second colon-splitting rule here could
+		// disagree with the one the obligations path uses, and it already declines
+		// to split when the suffix is not a number, so a path containing a colon is
+		// left intact.
+		file, _, _ := splitLocator(obs.File)
+		file = strings.TrimSpace(file)
 		if file == "" {
 			// A finding with no file cannot be attributed to a vessel, so it cannot
 			// evidence relocation WITHIN one. Counting it would inflate every file.
