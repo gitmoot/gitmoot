@@ -1884,7 +1884,12 @@ func (f *mergeGateRaceGitHub) CreateCommitStatus(_ context.Context, input github
 }
 
 func (f *mergeGateRaceGitHub) CompareCommits(context.Context, github.Repository, string, string) (github.CompareResult, error) {
-	return github.CompareResult{Status: "ahead"}, nil
+	// #2074 round four, P2: AHEAD CARRIES A POSITIVE ahead_by. GitHub's producer
+	// does not emit status=ahead with ahead_by=0 - the exact PR ancestry probe on
+	// this repo returned status=ahead, ahead_by=5, behind_by=0 - so the zero left
+	// this fake describing a tuple the API cannot produce. `identical` is the
+	// status that carries zero on both axes.
+	return github.CompareResult{Status: "ahead", AheadBy: 3}, nil
 }
 
 func (f *mergeGateRaceGitHub) MergePullRequest(_ context.Context, input github.MergePullRequestInput) (github.MergeResult, error) {
