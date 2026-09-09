@@ -445,10 +445,12 @@ func shortFindingsHead(head string) string {
 // findingsMergedUnresolved is one merged pull request that still carries
 // obligations the merge gate would have demanded.
 type findingsMergedUnresolved struct {
-	Repo        string               `json:"repo"`
-	PullRequest int64                `json:"pull_request"`
-	HeadSHA     string               `json:"head_sha"`
-	MergedAt    string               `json:"merged_at,omitempty"`
+	Repo        string `json:"repo"`
+	PullRequest int64  `json:"pull_request"`
+	HeadSHA     string `json:"head_sha"`
+	MergedAt    string `json:"merged_at,omitempty"`
+	// Advisory is the repository's CURRENT findings_consumption setting, read at
+	// report time. It is NOT a record of what was true when the PR merged.
 	Advisory    bool                 `json:"advisory"`
 	Obligations []findingsObligation `json:"obligations"`
 }
@@ -566,13 +568,44 @@ func runFindingsMergedUnresolved(repoFilter string, home string, jsonOutput bool
 			report.Degradations = append(report.Degradations, fmt.Sprintf("%s#%d: %s", pair.Repo, pair.PullRequest, note))
 		}
 
+		rows := observations[findingsPairKey(pair)]
 		var obligations []findingsObligation
-		for _, obligation := range workflow.LedgerObligationsAtHead(ctx, observations[findingsPairKey(pair)], head, scope) {
+		seen := map[string]bool{}
+		for _, obligation := range workflow.LedgerObligationsAtHead(ctx, rows, head, scope) {
+			seen[obligation.FindingUID] = true
 			obligations = append(obligations, findingsObligation{
 				FindingUID: obligation.FindingUID,
 				RoundLabel: obligation.RoundLabel,
 				Severity:   obligation.Severity,
 				Reason:     obligation.Reason,
+			})
+		}
+		// #2106 f1: A FINDING OPEN AT THE MERGE HEAD IS THE MOST DAMNING CASE AND
+		// THE GATE'S PREDICATE DISCHARGES IT.
+		//
+		// dischargedAtHead removes any finding observed AT the head being judged,
+		// because the gate asks "what must a NEW review at this head still
+		// observe" - and a row already recorded there has been observed. That is
+		// correct for the gate and WRONG FOR THIS REPORT, which asks the opposite
+		// question: "what was still unresolved when this merged". A P1 recorded at
+		// the exact head that merged produced Merged:1 and Unresolved:[].
+		//
+		// THIS IS NOT A SECOND CONVENTION. The obligation predicate stays the sole
+		// authority on obligations; this adds the disjoint set it deliberately
+		// excludes - findings whose LATEST observation at this head is still OPEN -
+		// and labels them distinctly so a reader can tell the two apart.
+		for _, row := range workflow.LatestObservationsInOrder(rows) {
+			if seen[row.FindingUID] || row.State != db.FindingOpen {
+				continue
+			}
+			if !strings.EqualFold(strings.TrimSpace(row.HeadSHA), head) {
+				continue
+			}
+			obligations = append(obligations, findingsObligation{
+				FindingUID: row.FindingUID,
+				RoundLabel: row.RoundLabel,
+				Severity:   row.Severity,
+				Reason:     "still open at the merged head",
 			})
 		}
 		if len(obligations) == 0 {
@@ -617,8 +650,15 @@ func runFindingsMergedUnresolved(repoFilter string, home string, jsonOutput bool
 		}
 		fmt.Fprintln(stdout)
 		fmt.Fprintln(stdout, "These merged with obligations the gate would have demanded at their branch head.")
-		fmt.Fprintln(stdout, "WAIVED true means the repository declares findings_consumption = advisory, so the")
-		fmt.Fprintln(stdout, "gate let them through by declaration rather than by accident.")
+		// #2106 f2: THIS COLUMN IS TODAY'S POLICY, NOT A HISTORICAL AUTHORISATION.
+		// It is read from the CURRENT review configuration, so saying it proves the
+		// gate let a past merge through by declaration reverses history whenever
+		// findings_consumption has changed since: an accidental bypass reads as
+		// authorized, or an authorized one as accidental. Stated as current policy,
+		// with no causal claim about the merge that already happened.
+		fmt.Fprintln(stdout, "WAIVED reflects the repository's CURRENT findings_consumption setting, read now.")
+		fmt.Fprintln(stdout, "It is not evidence about the merge: the setting may have changed since, and no")
+		fmt.Fprintln(stdout, "durable merge-time record of it exists.")
 	}
 	for _, note := range report.Degradations {
 		fmt.Fprintf(stdout, "degraded: %s\n", note)
