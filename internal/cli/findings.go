@@ -50,6 +50,19 @@ func runFindings(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	jsonOutput := fs.Bool("json", false, "print the report as JSON")
+	// #2077 f3: THE BRIEF POINTS HERE AND THIS COULD NOT ANSWER.
+	//
+	// ledgerObligationBrief is byte-bounded, so once the budget is exhausted it
+	// omits mandatory UIDs and tells the reviewer to consult the findings ledger.
+	// This command was the ledger's only supported reader and it printed
+	// per-repository COUNTS - no rows, no UIDs - while a read-only review seat
+	// has no database access at all. The instruction was correct and the
+	// destination could not satisfy it.
+	//
+	// That is why the finding survived three rounds of bounding work: every fix
+	// was in the writer, and the missing half was here.
+	repo := fs.String("repo", "", "with --pr, list individual findings for this owner/repo instead of the per-repository summary")
+	pullRequest := fs.Int("pr", 0, "with --repo, the pull request whose findings to list")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -59,6 +72,19 @@ func runFindings(args []string, stdout, stderr io.Writer) int {
 	if fs.NArg() != 0 {
 		fmt.Fprintln(stderr, "findings does not accept positional arguments")
 		return 2
+	}
+	// BOTH OR NEITHER. A UID is unique only within a repository, and the store's
+	// reader is keyed on (repo, pull_request) - so a repo without a PR would have
+	// silently listed the pull_request=0 rows and reported "no findings" for a
+	// repository full of them. Measured: that is exactly what the first version
+	// of this command did. Refusing beats a listing that is empty for the wrong
+	// reason, which is the failure this whole finding is about.
+	if (strings.TrimSpace(*repo) == "") != (*pullRequest == 0) {
+		fmt.Fprintln(stderr, "findings: --repo and --pr must be given together; a finding UID is unique only within one repository's pull request")
+		return 2
+	}
+	if strings.TrimSpace(*repo) != "" {
+		return runFindingsRows(strings.TrimSpace(*repo), *pullRequest, *home, *jsonOutput, stdout, stderr)
 	}
 
 	reviewCfg := loadReviewConfig(*home)
@@ -107,5 +133,70 @@ func runFindings(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintln(stdout, "A repository with findings and ANSWERED 0 is recording obligations nothing consumes.")
 	fmt.Fprintln(stdout, "DECLARED undeclared means nobody has decided whether this repository consumes findings;")
 	fmt.Fprintln(stdout, "it behaves as consuming. advisory records and reports findings without holding the merge.")
+	return 0
+}
+
+// runFindingsRows lists individual ledger rows, which is what the obligation
+// brief tells a reviewer to consult (#2077 f3).
+//
+// It prints the UID first because that is the only thing a reviewer can act on:
+// continuing a prior finding requires citing its uid exactly, and typing its old
+// label mints a new finding instead. A budgeted brief omits UIDs; this is where
+// they are recoverable.
+func runFindingsRows(repo string, pullRequest int, home string, jsonOutput bool, stdout, stderr io.Writer) int {
+	var rows []db.ReviewFindingObservation
+	if err := withStoreAndPaths(home, func(_ config.Paths, store *db.Store) error {
+		var err error
+		rows, err = store.ListReviewFindingObservations(context.Background(), repo, int64(pullRequest))
+		return err
+	}); err != nil {
+		fmt.Fprintf(stderr, "findings: %v\n", err)
+		return 1
+	}
+
+	if jsonOutput {
+		encoded, err := json.MarshalIndent(rows, "", "  ")
+		if err != nil {
+			fmt.Fprintf(stderr, "findings: %v\n", err)
+			return 1
+		}
+		fmt.Fprintln(stdout, string(encoded))
+		return 0
+	}
+
+	if len(rows) == 0 {
+		// NAME BOTH REASONS. A reviewer sent here by a brief needs to know whether
+		// the ledger is empty or their filter missed, and those are different
+		// problems with different next steps.
+		if pullRequest > 0 {
+			fmt.Fprintf(stdout, "no findings recorded for %s#%d\n", repo, pullRequest)
+		} else {
+			fmt.Fprintf(stdout, "no findings recorded for %s\n", repo)
+		}
+		return 0
+	}
+
+	writer := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(writer, "UID\tSEV\tSTATE\tPR\tHEAD\tTITLE")
+	for _, row := range rows {
+		head := row.HeadSHA
+		if len(head) > 8 {
+			head = head[:8]
+		}
+		title := strings.TrimSpace(row.Title)
+		if title == "" {
+			// A row with no title is the #2072 shape and the reviewer needs to see
+			// that it exists rather than a blank line they cannot cite.
+			title = "(no title recorded)"
+		}
+		fmt.Fprintf(writer, "%s\t%s\t%s\t%d\t%s\t%s\n",
+			row.FindingUID, row.Severity, row.State, row.PullRequest, head, title)
+	}
+	if err := writer.Flush(); err != nil {
+		fmt.Fprintf(stderr, "findings: %v\n", err)
+		return 1
+	}
+	fmt.Fprintln(stdout)
+	fmt.Fprintln(stdout, "Cite a UID verbatim as \"continues_uid\" to continue a finding; typing its label mints a new one.")
 	return 0
 }

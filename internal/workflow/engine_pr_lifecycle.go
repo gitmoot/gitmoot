@@ -317,6 +317,36 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 			})
 		}
 	}
+	// #1419: SAY HOW MANY TIMES THIS HAS COME BACK.
+	//
+	// The count already existed and nothing ever read it: nextReviewRound derives
+	// maxReviewRound to build the label, and reviewRoundCount turns it into a
+	// memory-harvest score. Neither tells the people in the loop. Every round
+	// looks identical to the first - a job, a review, a verdict, green CI - so a
+	// lane converging on a fix and a lane chasing one defect around a file emit
+	// the same success signals.
+	//
+	// The threshold is 3 because that is where a written "stop at three
+	// relocations" rule was meant to fire and did not, having been left to a human
+	// counting across rounds (#1419's measured instance reached six).
+	//
+	// This warns and does not block. A high round count is evidence that the
+	// VESSEL may be wrong, not proof of it: some PRs legitimately take four
+	// rounds. Refusing dispatch would turn a hint into a wedge, and the failure
+	// this addresses is invisibility, not permission.
+	roundJobIDs := make([]string, 0, len(requests))
+	for _, request := range requests {
+		// The id is assigned inside enqueue, so it is derived the same
+		// deterministic way rather than read off a field still empty here.
+		jobID := strings.TrimSpace(request.ID)
+		if jobID == "" {
+			jobID = e.jobID(request)
+		}
+		roundJobIDs = append(roundJobIDs, jobID)
+	}
+	if err := e.recordReviewRoundThreshold(ctx, reviewRound, roundJobIDs); err != nil {
+		return err
+	}
 	if err := e.setTaskState(ctx, ref, TaskReviewing); err != nil {
 		return err
 	}
@@ -532,6 +562,19 @@ func (e Engine) dispatchHighRiskReview(ctx context.Context, event PullRequestEve
 		Kind:    "risk_tier_resolved",
 		Message: fmt.Sprintf("risk tier %q (%s): %s", classification.Tier, classification.Source, classification.Reason),
 	}); err != nil {
+		return err
+	}
+
+	// #2087 review, P1: THE HIGH-RISK PATH RETURNED BEFORE THE RECORDER.
+	// dispatchHighRiskReview is entered when risk tiers are enabled and the tier
+	// is HIGH, and it returns before the native reviewer loop - so the lens
+	// fan-out, the path a hard problem takes, was the one path that never said
+	// how many rounds it had taken. The reviewer proved it by driving four rounds
+	// of a single relocating finding through it and scanning every job's events.
+	//
+	// Recorded against the coordinator job because that is the row this path
+	// creates and the one an operator reads for the round.
+	if err := e.recordReviewRoundThreshold(ctx, round, []string{coordID}); err != nil {
 		return err
 	}
 	if err := e.dispatchDelegations(ctx, coordJob, coordPayload, ref); err != nil {
@@ -880,6 +923,69 @@ func (e Engine) recordPullRequestBaseline(ctx context.Context, event PullRequest
 		HeadSHA:      event.HeadSHA,
 		State:        "open",
 	})
+}
+
+// ReviewRoundRelocationThreshold is the round at which the engine starts saying
+// how many times a defect has come back (#1419).
+//
+// SIX, FROM THE DISTRIBUTION RATHER THAN FROM THE ISSUE. #1419 proposed three
+// because a coordinator had written that rule; the reviewer's P3 objected that
+// the number was issue-derived and unmeasured, and it does not survive the data.
+//
+// Round counts across all 145 gitmoot/gitmoot PRs with at least one
+// changes_requested, from the job store:
+//
+//	rounds 1: 51   2: 25   3: 16   4: 10   5: 12   6: 7   7: 4   8: 3
+//	9: 1   10: 3   then a tail at 13, 15, 16, 17, 18, 20, 22, 28, 29
+//	and one PR at FIFTY-ONE.
+//
+//	threshold 3 fires on 69 of 145 = 48%
+//	threshold 6 fires on 31 of 145 = 21%
+//
+// A warning that fires on half of everything is trained to be ignored before it
+// ever reaches the case it exists for - the same way an over-firing head warning
+// became background noise. Six sits at the visible knee: rounds 1-2 hold 76 PRs,
+// 3-5 hold 38, and six-and-above hold 31, capturing every pathological case
+// including the 51-round outlier.
+//
+// It would also have fired on NOTHING this campaign produced, and on the
+// historical cases the issue was written about.
+const ReviewRoundRelocationThreshold = 6
+
+// recordReviewRoundThreshold writes one event per review job at or past the
+// threshold, naming the count.
+//
+// PER JOB, not once per round, because the job row is the only surface a
+// reviewer and an operator both already read. A round-level record with no job
+// to hang on would be a fact nobody encounters - the failure this campaign keeps
+// finding, installed by the fix for it.
+func (e Engine) recordReviewRoundThreshold(ctx context.Context, reviewRound string, jobIDs []string) error {
+	if e.Store == nil {
+		return nil
+	}
+	round, ok := reviewRoundNumber(strings.TrimSpace(reviewRound))
+	if !ok || round < ReviewRoundRelocationThreshold {
+		return nil
+	}
+	for _, jobID := range jobIDs {
+		jobID = strings.TrimSpace(jobID)
+		if jobID == "" {
+			continue
+		}
+		if err := e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID: jobID,
+			Kind:  "review_round_threshold",
+			Message: fmt.Sprintf(
+				"review round %d on this pull request: the same defect returning is indistinguishable "+
+					"from progress unless somebody counts. Before fixing again, state what NO version of "+
+					"this code may be able to do - if that sentence is hard to write, the fix is a design "+
+					"round rather than another patch (#1419).",
+				round),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (e Engine) nextReviewRound(ctx context.Context, event PullRequestEvent) (string, []db.Job, error) {
