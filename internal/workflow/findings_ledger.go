@@ -12,8 +12,14 @@ import (
 
 // The #1822 findings-ledger acceptance invariant.
 //
-// A VERDICT AT HEAD H IS ACCEPTABLE ONLY IF EVERY MANDATORY LEDGER FINDING FOR
-// THAT PR CARRIES AN OBSERVATION AT H. The direction matters: a ledger hit ADDS
+// A VERDICT AT HEAD H IS ACCEPTABLE ONLY IF EVERY MANDATORY LEDGER FINDING OF
+// SEVERITY P1 OR P2 FOR THAT PR CARRIES AN OBSERVATION AT H. A P3 obligation is
+// still computed, still reported and still worth answering, but it does not hold
+// the merge (owner decision, note 129657). Only the BLOCKING half moved: what
+// counts as an obligation is unchanged, and EnsureLedgerObligationsObserved is
+// the single place the severity split is applied.
+//
+// The direction matters: a ledger hit ADDS
 // an obligation rather than removing one, so a ledger with six prior findings
 // makes the round more expensive, not cheaper. That is what stops the ledger
 // becoming a reviewer's only input, which is the delta-sign-off failure this
