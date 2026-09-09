@@ -65,9 +65,19 @@ func daemonDrainActive(configHome string) (bool, error) {
 }
 
 func daemonDrainActiveForHome(configHome string) (bool, error) {
-	if strings.TrimSpace(configHome) == "" {
-		return false, nil
-	}
+	// NO EMPTY-HOME SHORTCUT. "" IS THE DEFAULT HOME, NOT THE ABSENCE OF ONE.
+	//
+	// P1 found in review (#2096). worker.ConfigHome and cfg.Home are EMPTY for
+	// the documented no-flag invocation - daemonChildArgs drops --home from the
+	// spawned child when home == "" (daemon_lifecycle.go:1598). Meanwhile
+	// setDaemonDrain("") writes the sentinel through pathsFromFlag("") ->
+	// config.DefaultPaths(). So the WRITER resolved the default and the READER
+	// returned early, and `gitmoot daemon drain` against a default-started
+	// daemon printed "stopped claiming new work" while the daemon kept claiming.
+	// Drain was a NO-OP in exactly the configuration the docs describe.
+	//
+	// The reader now takes the same path as the writer, so the two cannot
+	// disagree. daemonDrainSentinelPath already routes "" to DefaultPaths.
 	path, err := daemonDrainSentinelPath(configHome)
 	if err != nil {
 		return false, err

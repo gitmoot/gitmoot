@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -79,13 +80,52 @@ func TestDrainHoldsWithAnUnreadableBody(t *testing.T) {
 // AN UNRESOLVABLE HOME IS NOT A DRAIN. Reporting true would wedge every daemon
 // whose home cannot be resolved; reporting false is correct because no operator
 // asked for a drain there.
-func TestDrainIsInactiveWithoutAHome(t *testing.T) {
+// AN EMPTY HOME IS THE DEFAULT HOME, AND THE WRITER AND READER MUST AGREE ON IT.
+//
+// THIS TEST PREVIOUSLY ASSERTED THE DEFECT. It called daemonDrainActiveForHome("")
+// and required FALSE, which is what the guard's empty-home shortcut returned -
+// so it ratified a drain that was a no-op for every default-configured daemon
+// and reported PASS while doing it. The reviewer found the P1 (#2096) by tracing
+// what "" actually means: daemonChildArgs drops --home when it is empty, so the
+// real daemon runs with ConfigHome == "".
+//
+// HOME IS REDIRECTED so config.DefaultPaths() resolves inside the test's own
+// tree. Without this the test would read and write /root/.gitmoot, which is
+// forbidden.
+func TestDrainWithNoHomeFlagUsesTheDefaultHomeForBothSides(t *testing.T) {
+	fake := t.TempDir()
+	t.Setenv("HOME", fake)
+
+	// Guard against the redirect silently failing: if DefaultPaths does not land
+	// inside the fixture, this test would touch the real home and must not run.
+	paths, err := config.DefaultPaths()
+	if err != nil {
+		t.Fatalf("DefaultPaths: %v", err)
+	}
+	if !strings.HasPrefix(paths.Home, fake) {
+		t.Fatalf("HOME redirect did not take: DefaultPaths resolved to %q, outside %q", paths.Home, fake)
+	}
+
 	on, err := daemonDrainActiveForHome("")
 	if err != nil {
-		t.Fatalf("empty home: %v", err)
+		t.Fatalf("empty home before draining: %v", err)
 	}
 	if on {
-		t.Fatal("an empty home reported draining")
+		t.Fatal("reported draining before anything wrote a sentinel")
+	}
+
+	// What `gitmoot daemon drain` with no --home does.
+	if err := setDaemonDrain("", true); err != nil {
+		t.Fatalf("setDaemonDrain(\"\"): %v", err)
+	}
+
+	// What the scheduler asks, with worker.ConfigHome == "".
+	on, err = daemonDrainActiveForHome("")
+	if err != nil {
+		t.Fatalf("empty home after draining: %v", err)
+	}
+	if !on {
+		t.Fatal("THE P1: the command wrote the default sentinel and the guard did not see it; the daemon would keep claiming through a deploy")
 	}
 }
 
