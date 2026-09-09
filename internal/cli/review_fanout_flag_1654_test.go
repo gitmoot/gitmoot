@@ -87,12 +87,27 @@ func TestAgentReviewFanoutFlagReachesTheOption(t *testing.T) {
 // The DISCOVERABILITY arm, which is what #1654 actually found. Asserting the one
 // token rather than the whole usage sentence: pinning the sentence would be
 // pinning prose.
+//
+// EACH VERB IS CHECKED THROUGH THE RENDERER IT ACTUALLY USES. The first version
+// called printAgentRunUsage for all four, including orchestrate - but
+// runOrchestrate handles --help through printOrchestrateUsage (agent.go:433), so
+// the test passed while `gitmoot orchestrate --help` omitted the flag entirely.
+// A discoverability test that renders help the command never renders is the same
+// defect it was written to catch, one layer down (#2055 review F4).
 func TestAgentReviewUsageDocumentsTheFanoutFlag(t *testing.T) {
-	for _, command := range []string{"review", "implement", "run", "orchestrate"} {
+	for _, tc := range []struct {
+		command string
+		render  func(w *bytes.Buffer)
+	}{
+		{"review", func(w *bytes.Buffer) { printAgentRunUsage(w, "review") }},
+		{"implement", func(w *bytes.Buffer) { printAgentRunUsage(w, "implement") }},
+		{"run", func(w *bytes.Buffer) { printAgentRunUsage(w, "run") }},
+		{"orchestrate", func(w *bytes.Buffer) { printOrchestrateUsage(w) }},
+	} {
 		var out bytes.Buffer
-		printAgentRunUsage(&out, command)
+		tc.render(&out)
 		if !strings.Contains(out.String(), "--skip-native-review-fanout") {
-			t.Fatalf("%s usage omits --skip-native-review-fanout, so an operator cannot find it:\n%s", command, out.String())
+			t.Fatalf("%s help omits --skip-native-review-fanout, so an operator cannot find it:\n%s", tc.command, out.String())
 		}
 	}
 }

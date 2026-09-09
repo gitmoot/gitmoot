@@ -2,6 +2,8 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -29,7 +31,7 @@ func TestSkipNativeReviewFanoutIsAnImplementControlNotAReviewOne(t *testing.T) {
 		wantOnLock bool
 	}{
 		{"implement consumes it", "implement", "task-1654-impl", "implemented", true},
-		{"review records it and does not", "review", "task-1654-review", "approved", false},
+		{"review records it and does not", "review", "task-1654-review", "changes_requested", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -48,11 +50,28 @@ func TestSkipNativeReviewFanoutIsAnImplementControlNotAReviewOne(t *testing.T) {
 			if tc.jobType == "review" {
 				agent = "auditor"
 			}
+			// THE REVIEW ARM MUST REACH REVIEW ADVANCEMENT. With PullRequest=0 it
+			// exited at engine_run_budgets.go:817 through advance_skipped_no_pr,
+			// before any review machinery ran, so the arm proved only that an
+			// early return writes no lock (#2055 review F2). The review arm now
+			// carries a real pull request and a changes_requested decision, which
+			// is the path that reaches reviewDecisionAgent and dispatchFix.
+			pr := 0
+			if tc.jobType == "review" {
+				pr = 1654
+				if err := store.UpsertPullRequest(ctx, db.PullRequest{
+					RepoFullName: "gitmoot/gitmoot", Number: int64(pr), HeadBranch: tc.branch,
+					BaseBranch: "main", HeadSHA: strings.Repeat("d", 40), State: "open",
+				}); err != nil {
+					t.Fatalf("UpsertPullRequest returned error: %v", err)
+				}
+			}
 			jobID := tc.jobType + "-1654"
 			insertCompletedJob(t, store, db.Job{ID: jobID, Agent: agent, Type: tc.jobType}, JobPayload{
 				Repo:                   "gitmoot/gitmoot",
 				Branch:                 tc.branch,
-				PullRequest:            0,
+				PullRequest:            pr,
+				HeadSHA:                strings.Repeat("d", 40),
 				TaskID:                 tc.branch,
 				TaskTitle:              "fanout verb",
 				LeadAgent:              "lead",
@@ -64,6 +83,22 @@ func TestSkipNativeReviewFanoutIsAnImplementControlNotAReviewOne(t *testing.T) {
 			// A review advance may legitimately return an error in this bare
 			// fixture; what is being measured is the branch lock, not the advance.
 			_ = engine.AdvanceJob(ctx, jobID)
+
+			// CONTROL for #2055 review F2: prove the review arm did not exit early
+			// again. advance_skipped_no_pr is the guard that used to make this arm
+			// vacuous, so its ABSENCE is what makes the assertion below mean
+			// anything.
+			if tc.jobType == "review" {
+				events, evErr := store.ListJobEvents(ctx, jobID)
+				if evErr != nil {
+					t.Fatalf("ListJobEvents returned error: %v", evErr)
+				}
+				for _, event := range events {
+					if event.Kind == "advance_skipped_no_pr" {
+						t.Fatalf("the review arm exited through advance_skipped_no_pr and never reached review advancement, so it proves nothing about the review case")
+					}
+				}
+			}
 
 			lock, err := store.GetBranchLock(ctx, "gitmoot/gitmoot", tc.branch)
 			if err != nil {
@@ -116,5 +151,59 @@ func TestReviewParentStillPropagatesTheFlagToADelegationChild(t *testing.T) {
 		t.Fatalf("a review parent's delegation child dropped SkipNativeReviewFanout. " +
 			"CLI.md and website/docs/reference/cli.md state that delegation children inherit it " +
 			"regardless of parent type; if that propagation was removed deliberately, update both docs")
+	}
+}
+
+// #2055 review F3. The constructor test above checks delegationRequest's return
+// value, which is not what the child actually gets: Mailbox.prepareEnqueue
+// independently inherits the bit from the STORED parent
+// (internal/workflow/mailbox.go:682-688). Removing the constructor assignment
+// could leave real behaviour intact while failing that test, and passing it
+// proves nothing about an enqueued child.
+//
+// This asserts the observable thing: a child enqueued under a stored REVIEW
+// parent carries the bit in its persisted payload.
+func TestEnqueuedChildOfAReviewParentCarriesTheFanoutBit(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "auditor", []string{"review"}, "gitmoot/gitmoot")
+
+	parentPayload := JobPayload{
+		Repo:                   "gitmoot/gitmoot",
+		Branch:                 "task-1654-enqueue",
+		TaskID:                 "task-1654-enqueue",
+		LeadAgent:              "lead",
+		SkipNativeReviewFanout: true,
+	}
+	insertCompletedJob(t, store, db.Job{ID: "review-parent-enqueue", Agent: "auditor", Type: "review"}, parentPayload)
+
+	mailbox := NewMailbox(store, UnavailableDeliveryWorktreeResolver("test"))
+	child, err := mailbox.Enqueue(ctx, JobRequest{
+		ID:           "review-parent-enqueue/delegation/fix-leg",
+		Agent:        "lead",
+		Action:       "implement",
+		Repo:         "gitmoot/gitmoot",
+		Branch:       "task-1654-enqueue",
+		TaskID:       "task-1654-enqueue",
+		ParentJobID:  "review-parent-enqueue",
+		Instructions: "fix what the review found",
+	})
+	if err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+
+	stored, err := store.GetJob(ctx, child.ID)
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	var got JobPayload
+	if err := json.Unmarshal([]byte(stored.Payload), &got); err != nil {
+		t.Fatalf("Unmarshal child payload returned error: %v", err)
+	}
+	if !got.SkipNativeReviewFanout {
+		t.Fatalf("a child enqueued under a review parent did not persist SkipNativeReviewFanout. " +
+			"CLI.md and website/docs/reference/cli.md state that delegation children inherit it " +
+			"regardless of parent type; if that changed deliberately, update both docs")
 	}
 }
