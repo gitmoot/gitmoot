@@ -442,8 +442,13 @@ func shortFindingsHead(head string) string {
 	return head
 }
 
-// findingsMergedUnresolved is one merged pull request that still carries
-// obligations the merge gate would have demanded.
+// findingsMergedUnresolved is one merged pull request that still carried
+// unresolved findings at its branch head. Its Obligations are the UNION of the
+// gate's own LedgerObligationsAtHead set and findings whose latest observation
+// at that exact head is still open, which the gate's dischargedAtHead step
+// removes. It is deliberately a SUPERSET of what the gate would demand, never
+// an equal, so this comment must not be shortened back to "obligations the gate
+// would have demanded" (#2106 f3 was exactly that sentence, twice).
 type findingsMergedUnresolved struct {
 	Repo        string `json:"repo"`
 	PullRequest int64  `json:"pull_request"`
@@ -471,8 +476,10 @@ type findingsMergedUnresolvedReport struct {
 	Degradations        []string                   `json:"degradations,omitempty"`
 }
 
-// runFindingsMergedUnresolved reports merged pull requests whose obligations the
-// merge gate would still have demanded (#1971 clause 3).
+// runFindingsMergedUnresolved reports merged pull requests that still carried
+// unresolved findings at their branch head (#1971 clause 3). The reported set is
+// the UNION described on findingsMergedUnresolved: gate obligations plus
+// findings still open at that exact head.
 //
 // IT KEYS ON THE BRANCH HEAD, NEVER THE MERGE COMMIT, and that is not a
 // preference. Every merge in this repository is a SQUASH, so the merge commit is
