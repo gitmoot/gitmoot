@@ -144,7 +144,23 @@ func TestFindingsReportSaysStaleOpenFindingsStillBlock(t *testing.T) {
 	if !strings.Contains(output, "AT EARLIER HEAD") {
 		t.Fatalf("report has no head-currency column:\n%s", output)
 	}
-	if !strings.Contains(output, "block a merge at every later head") {
-		t.Fatalf("report does not say a stale open finding still blocks, so its largest column reads as expired:\n%s", output)
+	// THE DISCRIMINATING CLAUSE, NOT A SHARED FRAGMENT (#2102 f8 follow-up).
+	//
+	// This assertion used to read Contains("block a merge at every later head"),
+	// which is the UNCHANGED MIDDLE of the sentence. When note 129657 inverted the
+	// rule for P3 - from "all open findings block" to "a P3 is reported and does
+	// not hold the merge" - THE TEST STAYED GREEN IN BOTH WORLDS, while its own
+	// failure message claimed to defend the property it could not detect.
+	//
+	// That is why four rounds of fixing this rule's other copies walked past this
+	// file: a green test beside a sentence is a reason not to read the sentence.
+	//
+	// It now asserts the part that DIFFERS between the two rules. Re-pinning the
+	// new full sentence would reproduce the defect one wording later.
+	if !strings.Contains(output, "OPEN P1 and P2 findings block a merge at every later head") {
+		t.Fatalf("report does not say a stale open P1/P2 still blocks, so its largest column reads as expired:\n%s", output)
+	}
+	if !strings.Contains(output, "does not hold the merge") {
+		t.Fatalf("report does not distinguish a non-blocking P3, so every row reads as blocking:\n%s", output)
 	}
 }

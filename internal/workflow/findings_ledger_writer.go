@@ -749,8 +749,16 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 	}
 	var b strings.Builder
 	b.WriteString("\n\nPRIOR FINDINGS ON THIS PR THAT YOU MUST OBSERVE AT THIS HEAD (#1822 findings ledger).\n")
+	// SEVERITY-ACCURATE SINCE note 129657. This sentence is read BEFORE the
+	// reviewer writes, so it is the most consequential place the gate's rule is
+	// stated - and it said the gate refuses until EVERY obligation is observed,
+	// which stopped being true when P1/P2 became the blocking set. A brief that
+	// overstates the gate teaches reviewers a rule the gate does not enforce, and
+	// the first one to discover the gap learns that the brief cannot be trusted.
 	b.WriteString("Each line is a finding an earlier round recorded. The merge gate REFUSES a verdict at this head\n")
-	b.WriteString("until every one carries an observation here, so silence is not an answer. To continue a prior\n")
+	b.WriteString("until every P1 and P2 carries an observation here, so silence is not an answer on those. A P3 is\n")
+	b.WriteString("REPORTED and does not hold the merge (note 129657) - it is still an obligation and still worth\n")
+	b.WriteString("answering, it just cannot block. To continue a prior\n")
 	b.WriteString("finding, emit a finding object citing its uid as \"continues_uid\" - typing its old label is naming,\n")
 	b.WriteString("not reference, and mints a NEW finding instead. Set \"state\": \"answered\" only if you CHECKED it at\n")
 	b.WriteString("this head, and say what you ran; \"withdrawn\" requires \"withdraw_reason\" and is refused without one.\n")

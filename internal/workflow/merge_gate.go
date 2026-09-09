@@ -947,10 +947,12 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		}
 		reviewsAtHead = append(reviewsAtHead, review)
 	}
-	// #1822 findings ledger. A prior finding that carries no observation at THIS
+	// #1822 findings ledger. A prior P1 or P2 that carries no observation at THIS
 	// head blocks acceptance, so a ledger hit ADDS an obligation rather than
 	// removing one. That is what keeps the ledger from becoming a reviewer's only
-	// input: a round cannot trade a ledger read for a diff read.
+	// input: a round cannot trade a ledger read for a diff read. A P3 obligation
+	// is REPORTED and does not hold the merge (note 129657); the callee
+	// EnsureLedgerObligationsObserved owns that split.
 	//
 	// THE SCOPE IS SUPPLIED, NOT DEFERRED (#1850 review F4/A, both verdicts). The
 	// previous comment here promised that the relevance half was "enforced by the
