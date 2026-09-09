@@ -209,6 +209,26 @@ func TestSkipNativeReviewFanoutIsAnImplementControlNotAReviewOne(t *testing.T) {
 				if fixPayload.PullRequest != pr {
 					t.Fatalf("the fix job targets pull request %d, want %d: the dispatch lost the PR it was fixing", fixPayload.PullRequest, pr)
 				}
+				// THE REVIEWER ROSTER TRAVELS WITH THE FIX (#2055 review round 6).
+				// Deleting `Reviewers: e.requiredReviewers(payload)` from dispatchFix
+				// left this test and the whole package green: the fixture supplied
+				// reviewer "auditor" and never checked that the fix carried it, so a
+				// fix could be dispatched with an EMPTY roster. That matters because
+				// allRequiredReviewersApproved reads the same field to decide when the
+				// fix is done; an empty roster is not "nobody must approve" by
+				// accident, it is a different completion rule.
+				//
+				// The engine here sets no RequiredReviewers, so the roster can only
+				// have come from the review payload. Asserting that precondition too,
+				// or a global fallback would satisfy this without any propagation.
+				if len(engine.RequiredReviewers) != 0 {
+					t.Fatalf("the engine has a global reviewer fallback %v, so this assertion cannot prove the roster propagated",
+						engine.RequiredReviewers)
+				}
+				if len(fixPayload.Reviewers) != 1 || fixPayload.Reviewers[0] != "auditor" {
+					t.Fatalf("the fix job carries reviewers %v, want [auditor]: the dispatch lost the roster that decides when the fix is complete",
+						fixPayload.Reviewers)
+				}
 				if fixPayload.SkipNativeReviewFanout {
 					t.Fatalf("the fix job %q inherited SkipNativeReviewFanout from the review payload. "+
 						"CLI.md and website/docs/reference/cli.md state that dispatchFix does not inherit it; "+
