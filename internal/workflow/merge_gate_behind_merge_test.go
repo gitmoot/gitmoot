@@ -56,8 +56,27 @@ func evaluateBehindMergeGate(t *testing.T, gh *fakeMergeGateGitHub) MergeDecisio
 
 // Acceptance 1: the verdict's own head is what merges. No update is requested,
 // so nothing supersedes the reviewed head.
+//
+// #2074 review, P2. THE SHAPE HERE IS THE ONE PRODUCTION EMITS. This and the two
+// acceptance cases below previously constructed `Status: "behind"`, which GitHub
+// cannot report for an open pull request: `behind` requires `ahead_by == 0`, a
+// branch with no commits of its own. Measured with the gate's own call
+// (CompareCommits -> GET repos/{owner}/{repo}/compare/{base}...{head}) across
+// five open PRs on this repo: five `diverged` with `behind_by` 2..9 and
+// `ahead_by` 1..5, zero `behind`.
+//
+// The shape below is copied from one of those responses, #2057's head against
+// main: {"status":"diverged","ahead_by":1,"behind_by":4,"total_commits":1}.
+//
+// The first fix for this converted only the fixture in the test that changed
+// behaviour and argued these three could stay, on the grounds that the literal
+// `behind` arm of the `||` is still live code. The reviewer rejected that and was
+// right: these are PRODUCTION-PATH ACCEPTANCE tests, and the string arm is
+// covered deliberately and separately by the unknown-status robustness cases at
+// the end of this file. An acceptance test on an unreachable input can stay green
+// through a real regression.
 func TestMergeGateMergesBehindHeadWhenBaseAllowsIt(t *testing.T) {
-	gh := behindMergeGateClient(github.CompareResult{Status: "behind", BehindBy: 1})
+	gh := behindMergeGateClient(github.CompareResult{Status: "diverged", BehindBy: 4, AheadBy: 1})
 	gh.strictKnown = true
 	gh.strictBase = false
 
@@ -88,7 +107,7 @@ func TestMergeGateMergesBehindHeadWhenBaseAllowsIt(t *testing.T) {
 // Acceptance 1, other arm: where GitHub does require an up-to-date head, the
 // update is still the only way to merge, so the pre-#1865 path must survive.
 func TestMergeGateStillUpdatesWhenBaseRequiresUpToDateHead(t *testing.T) {
-	gh := behindMergeGateClient(github.CompareResult{Status: "behind", BehindBy: 1})
+	gh := behindMergeGateClient(github.CompareResult{Status: "diverged", BehindBy: 4, AheadBy: 1})
 	gh.strictKnown = true
 	gh.strictBase = true
 
@@ -121,7 +140,7 @@ func TestMergeGateFailsClosedWhenProtectionIsUndetermined(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			gh := behindMergeGateClient(github.CompareResult{Status: "behind", BehindBy: 1})
+			gh := behindMergeGateClient(github.CompareResult{Status: "diverged", BehindBy: 4, AheadBy: 1})
 			tc.set(gh)
 
 			decision := evaluateBehindMergeGate(t, gh)
@@ -136,23 +155,44 @@ func TestMergeGateFailsClosedWhenProtectionIsUndetermined(t *testing.T) {
 	}
 }
 
-// A diverged branch is not merely behind: merging it can conflict, so the
-// update stays mandatory there even when protection allows behind merges.
-func TestMergeGateStillUpdatesDivergedBranch(t *testing.T) {
-	gh := behindMergeGateClient(github.CompareResult{Status: "diverged", BehindBy: 1, AheadBy: 1})
+// Conflict is the real reason to update, and it is reported by `mergeable`, not
+// by the compare status. A diverged head that GitHub says does not merge keeps
+// the mandatory update - the pre-#1865 behaviour - because merging the reviewed
+// head is not available.
+func TestMergeGateStillUpdatesDivergedConflictingBranch(t *testing.T) {
+	gh := behindMergeGateClient(github.CompareResult{Status: "diverged", BehindBy: 4, AheadBy: 1})
+	conflicting := false
+	gh.pr.Mergeable = &conflicting
 	gh.strictKnown = true
 	gh.strictBase = false
 
 	decision := evaluateBehindMergeGate(t, gh)
 
 	if decision.Merged {
-		t.Fatalf("diverged branch must not merge without an update: %+v", decision)
+		t.Fatalf("a conflicting head must not merge: %+v", decision)
 	}
 	if len(gh.updates) != 1 {
 		t.Fatalf("update inputs = %+v", gh.updates)
 	}
-	if gh.strictCalls != 0 {
-		t.Fatalf("diverged must not even consult protection: calls = %d", gh.strictCalls)
+}
+
+// UNKNOWN MERGEABILITY FAILS CLOSED. GitHub computes mergeability
+// asynchronously, so a PR read moments after a base move returns null, and a
+// token that cannot see it returns null too. Treating null as "fine" would merge
+// on the strength of a value GitHub has not produced.
+func TestMergeGateStillUpdatesWhenMergeabilityIsUnknown(t *testing.T) {
+	gh := behindMergeGateClient(github.CompareResult{Status: "diverged", BehindBy: 4, AheadBy: 1})
+	gh.pr.Mergeable = nil
+	gh.strictKnown = true
+	gh.strictBase = false
+
+	decision := evaluateBehindMergeGate(t, gh)
+
+	if decision.Merged {
+		t.Fatalf("unknown mergeability must not merge: %+v", decision)
+	}
+	if len(gh.updates) != 1 {
+		t.Fatalf("update inputs = %+v", gh.updates)
 	}
 }
 
@@ -160,9 +200,22 @@ func TestMergeGateStillUpdatesDivergedBranch(t *testing.T) {
 // as before - the new guard must not reject valid input, and must not spend an
 // API call it does not need.
 func TestMergeGateMergesUpToDateBranchUnchanged(t *testing.T) {
-	for _, status := range []string{"identical", "ahead", ""} {
+	// #2074 round two, P2: the blank status is GONE from this ACCEPTANCE table.
+	// GitHub's compare status enum is diverged/ahead/behind/identical, so "" is
+	// not a production shape, and an acceptance test on an unreachable input can
+	// stay green through a real regression. The empty and unrecognised cases are
+	// still covered deliberately, as ROBUSTNESS, by
+	// TestMergeGateTreatsNumericBehindAsBehindWhateverTheStatusString below.
+	for _, status := range []string{"identical", "ahead"} {
 		t.Run("status="+status, func(t *testing.T) {
-			gh := behindMergeGateClient(github.CompareResult{Status: status})
+			// A real "ahead" response carries ahead_by > 0; "identical" carries
+			// zero on both axes, and passing AheadBy here would itself be a shape
+			// production cannot emit. So it is set per status rather than blanket.
+			compare := github.CompareResult{Status: status}
+			if status == "ahead" {
+				compare.AheadBy = 3
+			}
+			gh := behindMergeGateClient(compare)
 			gh.strictKnown = true
 			gh.strictBase = true // must be irrelevant when not behind
 
@@ -233,3 +286,84 @@ func TestMergeGateTreatsNumericBehindAsBehindWhateverTheStatusString(t *testing.
 		})
 	}
 }
+
+// #2074 review, P1. UNKNOWN MERGEABILITY MUST NOT REACH THE NATIVE MERGE, and
+// the hole was outside the behind branch entirely: for an already up-to-date
+// comparison ensureBranchFresh returns unhandled, so the behind-branch guard
+// never runs, and the old test `Mergeable != nil && !*Mergeable` was false for
+// nil. Evaluate then merged on mergeability GitHub had not computed.
+//
+// This drives Evaluate with the shape that exposes it - up to date AND nil -
+// which no fixture in this file previously produced.
+func TestMergeGateWaitsWhenMergeabilityIsUnknownOnAnUpToDateHead(t *testing.T) {
+	for _, status := range []string{"ahead", "identical"} {
+		t.Run("status="+status, func(t *testing.T) {
+			// #2074 round three, P2: AheadBy is set PER STATUS. "identical" reports
+			// ahead_by=0 and behind_by=0 - confirmed against an exact-commit
+			// comparison - so a blanket positive value here is a tuple the API
+			// cannot emit. The adjacent acceptance test already did this
+			// conditionally and I wrote the blanket version anyway, in the same
+			// file, one round later.
+			compare := github.CompareResult{Status: status}
+			if status == "ahead" {
+				compare.AheadBy = 2
+			}
+			gh := behindMergeGateClient(compare)
+			gh.pr.Mergeable = nil
+			gh.strictKnown = true
+			gh.strictBase = true
+
+			decision := evaluateBehindMergeGate(t, gh)
+
+			if decision.Merged {
+				t.Fatalf("merged with mergeability GitHub has not determined: %+v", decision)
+			}
+			if len(gh.merges) != 0 {
+				t.Fatalf("the native merge was reached: %+v", gh.merges)
+			}
+			if !strings.Contains(decision.Reason.Render(), "has not determined") {
+				t.Fatalf("decision must say mergeability is undetermined, got %q", decision.Reason.Render())
+			}
+			// PENDING, NOT BLOCKED, ASSERTED ON THE LIFECYCLE RATHER THAN THE PROSE
+			// (#2074 round two, P2). The reviewer changed the production nil arm to
+			// g.block with the IDENTICAL reason string and this test still passed,
+			// because it only checked that no merge happened and that the reason
+			// mentioned undetermined mergeability. Both are true of a block.
+			//
+			// The inversion matters: a blocked row publishes a FAILURE status and
+			// moves the task out of its automatic retry path, turning a race that
+			// resolves on the next poll into an operator ticket. So the three
+			// distinguishers are asserted directly.
+			if !decision.Ready {
+				t.Fatal("nil mergeability produced a BLOCK, not a pending: Ready is false, so the task leaves its automatic retry path")
+			}
+			if decision.BlockClass != 0 {
+				t.Fatalf("a pending decision must carry no block class, got %d", decision.BlockClass)
+			}
+			if !hasStatus(gh.statuses, GitmootMergeGateContext, "pending") {
+				t.Fatalf("the published commit status must be pending, got %+v", gh.statuses)
+			}
+		})
+	}
+}
+
+// #2074 round four, P2: THE EXPLICIT-FALSE TEST AT AN UP-TO-DATE HEAD IS DELETED
+// BECAUSE THE STATE IT MODELLED CANNOT OCCUR.
+//
+// It constructed Status:"ahead" with Mergeable=false and called that a real
+// conflict. Those cannot describe one pull request: `ahead` means the base is an
+// ancestor of the head, so there is nothing to conflict WITH, and GitHub sets
+// mergeable=false for merge conflicts, which require divergence.
+//
+// Making the tuple coherent - diverged plus false - moves the case into
+// ensureBranchFresh, which handles it BEFORE the post-freshness mergeability
+// guard: that is TestMergeGateStillUpdatesDivergedConflictingBranch above, which
+// already covers the reachable conflict path.
+//
+// So the `!*pr.Mergeable` block after ensureBranchFresh is DEFENSIVE and is not
+// reachable through any compare status the API emits: conflicts arrive diverged
+// and are answered earlier. It stays, because a guard that costs one comparison
+// and refuses an impossible input is cheaper than proving the impossibility holds
+// forever - but it is defensive rather than test-defended, and pretending
+// otherwise required a fixture the API cannot produce. Same call as the surviving
+// eligibility mutant on #2057.
