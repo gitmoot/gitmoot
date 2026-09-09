@@ -3553,11 +3553,14 @@ Three things it deliberately is not:
   recorded findings at several heads, which a retried job does.
 
   A line-qualified locator (`path/file.go:32`) is grouped with other spellings
-  of the same file, but only when the name ends in a file extension. A locator
-  such as `dir/pkg:10` keeps its whole value, because nothing in the text
-  proves the trailing number is a line rather than part of the name, and
-  counting two different files as one would invent a relocation. The count is a
-  floor in that direction on purpose.
+  of the same file, and whether a trailing `:<n>` is a line is decided by the
+  **tracked tree at the reviewed head**, never by the text. If the full locator
+  exists as a file it keeps its whole name; if only the prefix exists the suffix
+  was a line; if neither can be confirmed, or no tree is available, the raw
+  locator is kept and the count under-reports. Two text rules were tried and
+  both were wrong, because `dir/pkg:10` and `dir/pkg.go:10` are legal filenames:
+  no property of the string can decide it, so the count is a floor whenever the
+  tree cannot answer.
 - **Not a claim that the defects are the same defect.** The count is rounds
   carrying findings against one file, which is a proxy: unrelated defects in one
   file across three rounds report as three.

@@ -8,7 +8,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"unicode"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/reviewseverity"
@@ -581,7 +580,8 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 	// that returned early on an empty obligation list would hide exactly the case
 	// the issue is about - a lane converging on nothing while every round looks
 	// like progress.
-	relocations := ledgerRelocationBrief(observations, e.reviewRoundsForObservations(ctx, observations))
+	relocations := ledgerRelocationBrief(observations, e.reviewRoundsForObservations(ctx, observations),
+		e.relocationPathChecker(ctx, head))
 	if len(pending) == 0 {
 		return relocations
 	}
@@ -627,32 +627,36 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 }
 
 // relocationFileKey returns the repository-relative path an observation is
-// about, stripping a trailing ":<n>" line qualifier when what precedes it is
-// PATH-SHAPED (#2066 round seven).
+// about, deciding a trailing ":<n>" from THE TRACKED TREE rather than from the
+// text (#2066 round nine).
 //
-// Text alone cannot decide it in general: "pkg:10" is a valid filename AND a
-// valid path:line. Round six decided it from the row's recorded Line, stripping
-// only when the suffix MATCHED. MEASURED AGAINST THE REAL STORE, that rule
-// answers nothing: of 907 observation rows, 9 carry a colon in File and ALL 9
-// have NO recorded Line, so the field the rule consulted is empty in exactly
-// the rows where the ambiguity arises. It also folded a genuine "pkg:10" whose
-// finding happened to be at line 10, which is the one direction this key must
-// never take.
+// TWO TEXT RULES WERE REFUTED IN TWO ROUNDS, and the second refutation is what
+// settles the approach rather than the rule. Round six keyed on the row's
+// recorded Line: measured against the live store, 9 of 907 observation rows
+// carry a colon in File and ALL NINE record no Line, so the field decided
+// nothing where the ambiguity occurs. Round seven keyed on the prefix's path
+// SHAPE: a separator proves the value is a path and says nothing about the
+// NAME, so "dir/pkg:10" folded. Round eight narrowed that to a final-segment
+// EXTENSION, and the reviewer folded "dir/pkg.go:10" with the identical
+// argument one round later.
 //
-// Round SEVEN then keyed on the prefix's path SHAPE, which round eight refuted:
-// a separator proves the value is a path and says nothing about whether the
-// trailing number belongs to the NAME, so "dir/pkg:10" and "dir/pkg:20" folded
-// together and could manufacture a relocation from two different files.
+// The pattern is the finding: NO PROPERTY OF THE STRING CAN DECIDE WHETHER ITS
+// LAST NUMBER IS A LINE, because both readings are legal filenames. Nor can the
+// row: re-measured at this head, 0 of 9 colon-bearing rows carry a Line and none
+// of their prefixes appears as a bare File on the same pull request.
 //
-// What survives is narrower and is about the NAME: the suffix is stripped only
-// when the last path segment ends in a file EXTENSION (see
-// relocationPathEndsInExtension). It folds the one measured real group and
-// declines every case it cannot argue for, so the residual error is always the
-// UNDER-report direction, which the brief documents as a floor; it can never
-// fold two different files together and invent a relocation.
-func relocationFileKey(obs db.ReviewFindingObservation) string {
+// So this asks the tree, which is the only thing that knows:
+//
+//   - the FULL locator exists at the head: it is a filename, keep it whole;
+//   - otherwise the PREFIX exists: the suffix was a line qualifier, strip it;
+//   - neither is provable: keep the raw locator.
+//
+// The third case is the floor the brief already documents, and it is also what
+// happens with no resolver wired (every caller outside the daemon), so the brief
+// degrades to under-reporting rather than to guessing.
+func relocationFileKey(obs db.ReviewFindingObservation, pathExists func(string) bool) string {
 	file := strings.TrimSpace(obs.File)
-	if file == "" {
+	if file == "" || pathExists == nil {
 		return file
 	}
 	idx := strings.LastIndex(file, ":")
@@ -662,56 +666,42 @@ func relocationFileKey(obs db.ReviewFindingObservation) string {
 	if _, err := strconv.Atoi(strings.TrimSpace(file[idx+1:])); err != nil {
 		return file
 	}
-	path := strings.TrimSpace(file[:idx])
-	if !relocationPathEndsInExtension(path) {
+	if pathExists(file) {
+		// A tracked file whose name really ends in ":<n>".
 		return file
 	}
-	return path
+	path := strings.TrimSpace(file[:idx])
+	if path != "" && pathExists(path) {
+		return path
+	}
+	return file
 }
 
-// relocationPathEndsInExtension reports whether path's LAST SEGMENT ends in a
-// file extension: a dot followed by 1 to 8 alphanumerics, with something before
-// the dot (#2066 round eight, P1).
+// relocationPathChecker binds the ledger's own PathExistsAtHead resolver to this
+// head, memoised because one brief asks about the same few paths repeatedly.
 //
-// ROUND EIGHT'S FINDING IS THAT PATH SHAPE IS NOT EVIDENCE. Round seven stripped
-// a numeric suffix whenever the prefix held a separator or a dot anywhere, which
-// folds "dir/pkg:10", "dir/pkg:20" and "dir/pkg:30" - three locators the store
-// accepts and which may be three genuinely different files - into one bucket,
-// manufacturing rounds=3. A separator says the value is a path; it says nothing
-// about whether the trailing number belongs to the NAME.
-//
-// An extension on the final segment is narrower and is about the name itself: a
-// tracked file whose name ends "....go" followed by ":32" is a line-qualified
-// locator under every convention this repository uses, and "dir/pkg" is not. It
-// folds the one measured real group (PR 1910's three spellings of
-// resolver_refusal_log_test.go) and REFUSES the counter-example above.
-//
-// STATED PLAINLY: this is still a heuristic, not proof. It cannot be, because
-// the ambiguity lives in the text and the row's Line is empty in all 9
-// colon-bearing rows this store holds. What changed is the DIRECTION of its
-// residual error: every case it now declines to fold stays in separate buckets
-// and UNDER-reports, which the brief documents as a floor, and no case it folds
-// lacks an extension on the file it names. "apps/web/public/_landing:372" is
-// such a decline, and is left as a floor deliberately.
-func relocationPathEndsInExtension(path string) bool {
-	segment := path
-	if cut := strings.LastIndexAny(segment, `/\`); cut >= 0 {
-		segment = segment[cut+1:]
+// A NIL RESOLVER YIELDS NIL, not a permissive stub: with no way to consult the
+// tree the key must keep raw locators and under-report, which is the documented
+// floor. A stub answering "yes" would silently restore the guessing this round
+// removed. A resolver ERROR is treated as "does not exist" for that path, which
+// keeps the raw locator rather than folding on a failed lookup.
+func (e Engine) relocationPathChecker(ctx context.Context, head string) func(string) bool {
+	resolver := e.LedgerResolvers.PathExistsAtHead
+	if resolver == nil || strings.TrimSpace(head) == "" {
+		return nil
 	}
-	dot := strings.LastIndex(segment, ".")
-	if dot <= 0 || dot == len(segment)-1 {
-		return false
-	}
-	ext := segment[dot+1:]
-	if len(ext) > 8 {
-		return false
-	}
-	for _, r := range ext {
-		if !unicode.IsLetter(r) && !unicode.IsDigit(r) {
-			return false
+	cache := map[string]bool{}
+	return func(path string) bool {
+		if cached, ok := cache[path]; ok {
+			return cached
 		}
+		exists, err := resolver(ctx, head, path)
+		if err != nil {
+			exists = false
+		}
+		cache[path] = exists
+		return exists
 	}
-	return true
 }
 
 // reviewRoundsForObservations maps each observing job to its logical review
@@ -856,7 +846,7 @@ const ledgerRelocationThreshold = 3
 // It reports and never blocks. The issue asks for the count to exist, and the
 // judgement it informs - stop patching and state a contract - is a design
 // decision a human makes with it, not one a gate can take.
-func ledgerRelocationBrief(observations []db.ReviewFindingObservation, roundOf map[string]string) string {
+func ledgerRelocationBrief(observations []db.ReviewFindingObservation, roundOf map[string]string, pathExists func(string) bool) string {
 	// THE ROUND IS THE OBSERVING JOB, NOT THE REVIEWER'S LABEL (#2066 review of
 	// #1419). review_findings.go:20-26 states the invariant this originally
 	// broke: reviewers number findings PER ROUND starting at 1, so RoundLabel
@@ -895,7 +885,7 @@ func ledgerRelocationBrief(observations []db.ReviewFindingObservation, roundOf m
 		// only when it matches the recorded line, which also absorbs the
 		// whitespace shape ("a.go: 10") that db.splitPathLine trims and
 		// splitLocator does not - the parser disagreement the review names.
-		file := relocationFileKey(obs)
+		file := relocationFileKey(obs, pathExists)
 		if file == "" {
 			// A finding with no file cannot be attributed to a vessel, so it cannot
 			// evidence relocation WITHIN one. Counting it would inflate every file.

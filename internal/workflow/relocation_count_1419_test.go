@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -42,7 +43,7 @@ func TestRelocationCountCountsRoundsNotFindings(t *testing.T) {
 		obs("internal/cli/a.go", "job-1", "F3"),
 		obs("internal/cli/a.go", "job-1", "F4"),
 	}
-	if got := ledgerRelocationBrief(thorough, nil); got != "" {
+	if got := ledgerRelocationBrief(thorough, nil, relocationTestTree); got != "" {
 		t.Fatalf("four findings in ONE round were reported as relocations:\n%s", got)
 	}
 
@@ -51,7 +52,7 @@ func TestRelocationCountCountsRoundsNotFindings(t *testing.T) {
 		obs("internal/cli/a.go", "job-2", "F1"),
 		obs("internal/cli/a.go", "job-3", "F1"),
 	}
-	got := ledgerRelocationBrief(relocating, nil)
+	got := ledgerRelocationBrief(relocating, nil, relocationTestTree)
 	if got == "" {
 		t.Fatal("three rounds that all labelled their finding F1 were not counted as three")
 	}
@@ -81,7 +82,7 @@ func TestRelocationCountIgnoresLabelsWhenCountingRounds(t *testing.T) {
 		obs("internal/cli/a.go", "job-2", "F1"),
 		obs("internal/cli/a.go", "job-3", "F1"),
 	}
-	got := ledgerRelocationBrief(repeatedLabel, nil)
+	got := ledgerRelocationBrief(repeatedLabel, nil, relocationTestTree)
 	if !strings.Contains(got, "rounds=3") {
 		t.Fatalf("one label reused across three jobs must count as three rounds:\n%s", got)
 	}
@@ -93,7 +94,7 @@ func TestRelocationCountIgnoresLabelsWhenCountingRounds(t *testing.T) {
 		obs("internal/cli/b.go", "job-9", "L07"),
 		obs("internal/cli/b.go", "job-9", "F1"),
 	}
-	if got := ledgerRelocationBrief(oneLensRun, nil); got != "" {
+	if got := ledgerRelocationBrief(oneLensRun, nil, relocationTestTree); got != "" {
 		t.Fatalf("five labels from ONE job were counted as five rounds:\n%s", got)
 	}
 }
@@ -106,7 +107,7 @@ func TestRelocationCountShowsLabelsWithoutCountingThem(t *testing.T) {
 		obs("internal/cli/a.go", "job-1", "F1"),
 		obs("internal/cli/a.go", "job-2", "F1"),
 		obs("internal/cli/a.go", "job-3", "F2"),
-	}, nil)
+	}, nil, relocationTestTree)
 	if !strings.Contains(got, "rounds=3") {
 		t.Fatalf("count must come from jobs:\n%s", got)
 	}
@@ -126,7 +127,7 @@ func TestRelocationCountCountsUnlabelledRounds(t *testing.T) {
 		obs("internal/cli/a.go", "job-1", ""),
 		obs("internal/cli/a.go", "job-2", ""),
 		obs("internal/cli/a.go", "job-3", ""),
-	}, nil)
+	}, nil, relocationTestTree)
 	if !strings.Contains(got, "rounds=3") {
 		t.Fatalf("three unlabelled jobs must count as three rounds:\n%s", got)
 	}
@@ -143,7 +144,7 @@ func TestRelocationCountStaysSilentBelowTheThreshold(t *testing.T) {
 		obs("internal/cli/a.go", "job-1", "F1"),
 		obs("internal/cli/a.go", "job-2", "F2"),
 	}
-	if got := ledgerRelocationBrief(two, nil); got != "" {
+	if got := ledgerRelocationBrief(two, nil, relocationTestTree); got != "" {
 		t.Fatalf("two rounds triggered a relocation warning:\n%s", got)
 	}
 }
@@ -157,7 +158,7 @@ func TestRelocationCountAttributesPerFileAndSkipsUnattributableRows(t *testing.T
 		obs("internal/cli/b.go", "job-2", "F1"),
 		obs("internal/cli/c.go", "job-3", "F1"),
 	}
-	if got := ledgerRelocationBrief(spread, nil); got != "" {
+	if got := ledgerRelocationBrief(spread, nil, relocationTestTree); got != "" {
 		t.Fatalf("three rounds across three DIFFERENT files were reported as relocation in one:\n%s", got)
 	}
 
@@ -168,7 +169,7 @@ func TestRelocationCountAttributesPerFileAndSkipsUnattributableRows(t *testing.T
 		obs("internal/cli/a.go", "job-1", "F1"),
 		obs("internal/cli/a.go", "job-2", "F2"),
 	}
-	if got := ledgerRelocationBrief(fileless, nil); got != "" {
+	if got := ledgerRelocationBrief(fileless, nil, relocationTestTree); got != "" {
 		t.Fatalf("fileless rows pushed a two-round file over the threshold:\n%s", got)
 	}
 
@@ -182,7 +183,7 @@ func TestRelocationCountAttributesPerFileAndSkipsUnattributableRows(t *testing.T
 		obs("internal/cli/a.go", "job-2", "F2"),
 		obs("internal/cli/a.go", "", "F3"),
 	}
-	if got := ledgerRelocationBrief(joblessBesideReal, nil); got != "" {
+	if got := ledgerRelocationBrief(joblessBesideReal, nil, relocationTestTree); got != "" {
 		t.Fatalf("a row with no observing job pushed two real rounds over the threshold:\n%s", got)
 	}
 }
@@ -197,7 +198,7 @@ func TestRelocationCountCollapsesFanOutWithinOneReviewRound(t *testing.T) {
 		obs("internal/cli/a.go", "lens-3", "F3"),
 	}
 	rounds := map[string]string{"lens-1": "review-1", "lens-2": "review-1", "lens-3": "review-1"}
-	if got := ledgerRelocationBrief(fanOut, rounds); got != "" {
+	if got := ledgerRelocationBrief(fanOut, rounds, relocationTestTree); got != "" {
 		t.Fatalf("three fan-out jobs in ONE review round were counted as three rounds:\n%s", got)
 	}
 
@@ -213,7 +214,7 @@ func TestRelocationCountCollapsesFanOutWithinOneReviewRound(t *testing.T) {
 		"j2a": "review-2", "j2b": "review-2",
 		"j3a": "review-3", "j3b": "review-3",
 	}
-	got := ledgerRelocationBrief(threeRounds, spread)
+	got := ledgerRelocationBrief(threeRounds, spread, relocationTestTree)
 	if !strings.Contains(got, "rounds=3") {
 		t.Fatalf("three fanned-out rounds must count as three:\n%s", got)
 	}
@@ -233,7 +234,7 @@ func TestRelocationCountFallsBackToTheJobWhenTheRoundIsUnknown(t *testing.T) {
 		{"job-1": "", "job-2": "", "job-3": ""},
 		{"job-1": "   ", "job-2": "", "job-3": ""},
 	} {
-		got := ledgerRelocationBrief(unknown, rounds)
+		got := ledgerRelocationBrief(unknown, rounds, relocationTestTree)
 		if !strings.Contains(got, "rounds=3") {
 			t.Fatalf("an unknown round collapsed three separate rounds into one (rounds=%v):\n%s", rounds, got)
 		}
@@ -246,7 +247,7 @@ func TestRelocationCountFallsBackToTheJobWhenTheRoundIsUnknown(t *testing.T) {
 		obs("internal/cli/b.go", "lens-2", "F2"),
 		obs("internal/cli/b.go", "solo", "F1"),
 	}
-	if got := ledgerRelocationBrief(mixedPop, map[string]string{"lens-1": "review-9", "lens-2": "review-9"}); got != "" {
+	if got := ledgerRelocationBrief(mixedPop, map[string]string{"lens-1": "review-9", "lens-2": "review-9"}, relocationTestTree); got != "" {
 		t.Fatalf("one fanned-out round plus one unknown-round job is two rounds, not three:\n%s", got)
 	}
 }
@@ -269,7 +270,7 @@ func TestRelocationCountKeepsTwoTasksRoundsApart(t *testing.T) {
 		"job-b": "task-B\x00review-1",
 		"job-c": "task-C\x00review-1",
 	}
-	got := ledgerRelocationBrief(sameNumberDifferentTasks, perTask)
+	got := ledgerRelocationBrief(sameNumberDifferentTasks, perTask, relocationTestTree)
 	if !strings.Contains(got, "rounds=3") {
 		t.Fatalf("three tasks each at review-1 are three rounds, not one:\n%s", got)
 	}
@@ -281,7 +282,7 @@ func TestRelocationCountKeepsTwoTasksRoundsApart(t *testing.T) {
 		"job-b": "task-A\x00review-1",
 		"job-c": "task-A\x00review-1",
 	}
-	if got := ledgerRelocationBrief(sameNumberDifferentTasks, oneTaskFanOut); got != "" {
+	if got := ledgerRelocationBrief(sameNumberDifferentTasks, oneTaskFanOut, relocationTestTree); got != "" {
 		t.Fatalf("one task's fan-out at review-1 must still count once:\n%s", got)
 	}
 }
@@ -301,7 +302,7 @@ func TestRelocationCountRoundIdentityIsNotForgeable(t *testing.T) {
 		"job-b": "task\x00A" + "\x00review-1",
 		"job-c": "task-A\x00review-2",
 	}
-	if got := ledgerRelocationBrief(rows, crafted); !strings.Contains(got, "rounds=3") {
+	if got := ledgerRelocationBrief(rows, crafted, relocationTestTree); !strings.Contains(got, "rounds=3") {
 		t.Fatalf("crafted identities collapsed into fewer rounds:\n%s", got)
 	}
 }
@@ -407,7 +408,7 @@ func TestRelocationCountCollapsesARoundlessFanOutByItsCoordinator(t *testing.T) 
 		"panel-2": "parent\x00coordinator-9",
 		"panel-3": "parent\x00coordinator-9",
 	}
-	if got := ledgerRelocationBrief(fanOut, sharedParent); got != "" {
+	if got := ledgerRelocationBrief(fanOut, sharedParent, relocationTestTree); got != "" {
 		t.Fatalf("three roundless children of ONE coordinator counted as three rounds:\n%s", got)
 	}
 
@@ -417,7 +418,7 @@ func TestRelocationCountCollapsesARoundlessFanOutByItsCoordinator(t *testing.T) 
 		"panel-2": "parent\x00coordinator-2",
 		"panel-3": "parent\x00coordinator-3",
 	}
-	if got := ledgerRelocationBrief(fanOut, distinctParents); !strings.Contains(got, "rounds=3") {
+	if got := ledgerRelocationBrief(fanOut, distinctParents, relocationTestTree); !strings.Contains(got, "rounds=3") {
 		t.Fatalf("three separate coordinators must count as three rounds:\n%s", got)
 	}
 
@@ -428,7 +429,7 @@ func TestRelocationCountCollapsesARoundlessFanOutByItsCoordinator(t *testing.T) 
 		"panel-2": "parent\x00task-A",
 		"panel-3": "parent\x00coordinator-9",
 	}
-	if got := ledgerRelocationBrief(fanOut, mixed); !strings.Contains(got, "rounds=3") {
+	if got := ledgerRelocationBrief(fanOut, mixed, relocationTestTree); !strings.Contains(got, "rounds=3") {
 		t.Fatalf("round-keyed and parent-keyed identities collided:\n%s", got)
 	}
 }
@@ -442,7 +443,7 @@ func TestRelocationBriefDescribesTheUnitItActuallyCounts(t *testing.T) {
 		obs("internal/cli/a.go", "job-1", "F1"),
 		obs("internal/cli/a.go", "job-2", "F1"),
 		obs("internal/cli/a.go", "job-3", "F1"),
-	}, nil)
+	}, nil, relocationTestTree)
 	if strings.Contains(got, "counted\nby observing job") || strings.Contains(got, "counted by observing job") {
 		t.Fatalf("the brief still claims the count is by observing job:\n%s", got)
 	}
@@ -527,7 +528,7 @@ func TestRelocationCountGroupsLineQualifiedLocatorsByFile(t *testing.T) {
 		at("internal/workflow/a.go:20", 20, "job-2"),
 		at("internal/workflow/a.go:30", 30, "job-3"),
 	}
-	got := ledgerRelocationBrief(lineQualified, nil)
+	got := ledgerRelocationBrief(lineQualified, nil, relocationTestTree)
 	if !strings.Contains(got, "rounds=3") {
 		t.Fatalf("line-qualified locators split the file into separate buckets:\n%s", got)
 	}
@@ -542,7 +543,7 @@ func TestRelocationCountGroupsLineQualifiedLocatorsByFile(t *testing.T) {
 		at("internal/workflow/a.go:20", 20, "job-2"),
 		at(" internal/workflow/a.go: 30 ", 30, "job-3"),
 	}
-	if got := ledgerRelocationBrief(mixed, nil); !strings.Contains(got, "rounds=3") {
+	if got := ledgerRelocationBrief(mixed, nil, relocationTestTree); !strings.Contains(got, "rounds=3") {
 		t.Fatalf("bare, qualified and whitespace-qualified spellings were counted separately:\n%s", got)
 	}
 
@@ -554,7 +555,7 @@ func TestRelocationCountGroupsLineQualifiedLocatorsByFile(t *testing.T) {
 		at("pkg:a.go:20", 20, "job-2"),
 		at("pkg:a.go:30", 30, "job-3"),
 	}
-	if got := ledgerRelocationBrief(colonWithLine, nil); !strings.Contains(got, "pkg:a.go  rounds=3") {
+	if got := ledgerRelocationBrief(colonWithLine, nil, relocationTestTree); !strings.Contains(got, "pkg:a.go  rounds=3") {
 		t.Fatalf("a colon-bearing path with a line qualifier split across buckets:\n%s", got)
 	}
 
@@ -567,7 +568,7 @@ func TestRelocationCountGroupsLineQualifiedLocatorsByFile(t *testing.T) {
 		at("pkg:20", 0, "job-2"),
 		at("pkg:30", 0, "job-3"),
 	}
-	if got := ledgerRelocationBrief(filenameLooksLikeLine, nil); got != "" {
+	if got := ledgerRelocationBrief(filenameLooksLikeLine, nil, relocationTestTree); got != "" {
 		t.Fatalf("three different files whose names end in a number were folded into one:\n%s", got)
 	}
 
@@ -577,7 +578,7 @@ func TestRelocationCountGroupsLineQualifiedLocatorsByFile(t *testing.T) {
 		at("pkg:20", 99, "job-2"),
 		at("pkg:30", 99, "job-3"),
 	}
-	if got := ledgerRelocationBrief(mismatched, nil); got != "" {
+	if got := ledgerRelocationBrief(mismatched, nil, relocationTestTree); got != "" {
 		t.Fatalf("a suffix that does not match the recorded line was stripped anyway:\n%s", got)
 	}
 
@@ -588,7 +589,7 @@ func TestRelocationCountGroupsLineQualifiedLocatorsByFile(t *testing.T) {
 		at("internal/workflow/b.go:10", 10, "job-2"),
 		at("internal/workflow/c.go:10", 10, "job-3"),
 	}
-	if got := ledgerRelocationBrief(distinct, nil); got != "" {
+	if got := ledgerRelocationBrief(distinct, nil, relocationTestTree); got != "" {
 		t.Fatalf("three different files were folded into one bucket:\n%s", got)
 	}
 }
@@ -623,7 +624,7 @@ func TestRelocationCountSeparatesDifferentReviewedHeads(t *testing.T) {
 	}
 
 	brief := func(rows []db.ReviewFindingObservation) string {
-		return ledgerRelocationBrief(rows, engine.reviewRoundsForObservations(ctx, rows))
+		return ledgerRelocationBrief(rows, engine.reviewRoundsForObservations(ctx, rows), relocationTestTree)
 	}
 
 	// Roundless siblings of ONE coordinator at THREE different heads: three
@@ -687,7 +688,7 @@ func TestRelocationCountSeparatesOneJobsObservationsByRecordedHead(t *testing.T)
 		}
 	}
 	brief := func(rows []db.ReviewFindingObservation) string {
-		return ledgerRelocationBrief(rows, engine.reviewRoundsForObservations(ctx, rows))
+		return ledgerRelocationBrief(rows, engine.reviewRoundsForObservations(ctx, rows), relocationTestTree)
 	}
 
 	rows := []db.ReviewFindingObservation{
@@ -728,23 +729,23 @@ func TestRelocationCountGroupsQualifiedLocatorsWithNoRecordedLine(t *testing.T) 
 		at("internal/daemon/resolver_refusal_log_test.go:53", "job-2"),
 		at("internal/daemon/resolver_refusal_log_test.go:248", "job-3"),
 	}
-	if got := ledgerRelocationBrief(measured, nil); !strings.Contains(got, "internal/daemon/resolver_refusal_log_test.go  rounds=3") {
+	if got := ledgerRelocationBrief(measured, nil, relocationTestTree); !strings.Contains(got, "internal/daemon/resolver_refusal_log_test.go  rounds=3") {
 		t.Fatalf("three line-qualified spellings with no recorded Line stayed in separate buckets:\n%s", got)
 	}
 
-	// ROUND EIGHT REVERSED THIS CASE ON PURPOSE. Round seven folded an
-	// extensionless path because it carried a separator, and that reasoning is
-	// what round eight refuted: a separator proves the value is a path and says
-	// nothing about whether the trailing number belongs to the NAME. This real
-	// spelling from the store is therefore left in separate buckets, which
-	// UNDER-reports rather than risking a manufactured relocation.
+	// THIS CASE HAS NOW BEEN DECIDED THREE WAYS, and the third is the only one
+	// with evidence behind it. Round seven folded it because the prefix held a
+	// separator. Round eight refused to, because a separator says nothing about
+	// the NAME. Round nine folds it again - but for a different reason: the
+	// TREE says "apps/web/public/_landing" exists and the full locator does not.
+	// Shape was a guess in both directions; existence is an observation.
 	separatorOnly := []db.ReviewFindingObservation{
 		at("apps/web/public/_landing:372", "job-1"),
 		at("apps/web/public/_landing:373", "job-2"),
 		at("apps/web/public/_landing:374", "job-3"),
 	}
-	if got := ledgerRelocationBrief(separatorOnly, nil); got != "" {
-		t.Fatalf("an extensionless name was folded on path shape alone:\n%s", got)
+	if got := ledgerRelocationBrief(separatorOnly, nil, relocationTestTree); !strings.Contains(got, "apps/web/public/_landing  rounds=3") {
+		t.Fatalf("an extensionless path the tree confirms was not grouped:\n%s", got)
 	}
 
 	// #2066 ROUND EIGHT, P1: THE COUNTER-EXAMPLE THAT KILLED PATH SHAPE. The
@@ -755,7 +756,7 @@ func TestRelocationCountGroupsQualifiedLocatorsWithNoRecordedLine(t *testing.T) 
 		at("dir/pkg:20", "job-2"),
 		at("dir/pkg:30", "job-3"),
 	}
-	if got := ledgerRelocationBrief(pathShapedButNamed, nil); got != "" {
+	if got := ledgerRelocationBrief(pathShapedButNamed, nil, relocationTestTree); got != "" {
 		t.Fatalf("three separator-bearing names with numeric suffixes were folded:\n%s", got)
 	}
 
@@ -766,7 +767,7 @@ func TestRelocationCountGroupsQualifiedLocatorsWithNoRecordedLine(t *testing.T) 
 		at("go.mod:9", "job-2"),
 		at("go.mod:14", "job-3"),
 	}
-	if got := ledgerRelocationBrief(dottedRoot, nil); !strings.Contains(got, "go.mod  rounds=3") {
+	if got := ledgerRelocationBrief(dottedRoot, nil, relocationTestTree); !strings.Contains(got, "go.mod  rounds=3") {
 		t.Fatalf("an extension-bearing root file did not group:\n%s", got)
 	}
 
@@ -778,7 +779,7 @@ func TestRelocationCountGroupsQualifiedLocatorsWithNoRecordedLine(t *testing.T) 
 		at(".env:20", "job-2"),
 		at(".env:30", "job-3"),
 	}
-	if got := ledgerRelocationBrief(dotfile, nil); got != "" {
+	if got := ledgerRelocationBrief(dotfile, nil, relocationTestTree); got != "" {
 		t.Fatalf("a leading dot was read as an extension separator:\n%s", got)
 	}
 
@@ -789,7 +790,7 @@ func TestRelocationCountGroupsQualifiedLocatorsWithNoRecordedLine(t *testing.T) 
 		at("pkg.:20", "job-2"),
 		at("pkg.:30", "job-3"),
 	}
-	if got := ledgerRelocationBrief(trailingDot, nil); got != "" {
+	if got := ledgerRelocationBrief(trailingDot, nil, relocationTestTree); got != "" {
 		t.Fatalf("a trailing dot was accepted as an extension:\n%s", got)
 	}
 
@@ -800,7 +801,7 @@ func TestRelocationCountGroupsQualifiedLocatorsWithNoRecordedLine(t *testing.T) 
 		at("v1.2/pkg:20", "job-2"),
 		at("v1.2/pkg:30", "job-3"),
 	}
-	if got := ledgerRelocationBrief(dottedDirectory, nil); got != "" {
+	if got := ledgerRelocationBrief(dottedDirectory, nil, relocationTestTree); got != "" {
 		t.Fatalf("a dot in a PARENT directory was read as the file's extension:\n%s", got)
 	}
 
@@ -812,7 +813,7 @@ func TestRelocationCountGroupsQualifiedLocatorsWithNoRecordedLine(t *testing.T) 
 		{File: "pkg:20", Line: 20, ObserverJob: "job-2", RoundLabel: "F1"},
 		{File: "pkg:30", Line: 30, ObserverJob: "job-3", RoundLabel: "F1"},
 	}
-	if got := ledgerRelocationBrief(coincidence, nil); got != "" {
+	if got := ledgerRelocationBrief(coincidence, nil, relocationTestTree); got != "" {
 		t.Fatalf("three files whose names end in a matching number were folded into one:\n%s", got)
 	}
 }
@@ -853,7 +854,7 @@ func TestRelocationCountSeparatesHeadsOnTheJobFallback(t *testing.T) {
 		at("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
 		at("cccccccccccccccccccccccccccccccccccccccc"),
 	}
-	got := ledgerRelocationBrief(rows, engine.reviewRoundsForObservations(ctx, rows))
+	got := ledgerRelocationBrief(rows, engine.reviewRoundsForObservations(ctx, rows), relocationTestTree)
 	if !strings.Contains(got, "rounds=3") {
 		t.Fatalf("three heads under one unattributed retried job collapsed:\n%s", got)
 	}
@@ -864,7 +865,7 @@ func TestRelocationCountSeparatesHeadsOnTheJobFallback(t *testing.T) {
 		at("cccccccccccccccccccccccccccccccccccccccc"),
 		at("cccccccccccccccccccccccccccccccccccccccc"),
 	}
-	if got := ledgerRelocationBrief(same, engine.reviewRoundsForObservations(ctx, same)); got != "" {
+	if got := ledgerRelocationBrief(same, engine.reviewRoundsForObservations(ctx, same), relocationTestTree); got != "" {
 		t.Fatalf("three findings at one head on the fallback path were counted as three rounds:\n%s", got)
 	}
 
@@ -875,7 +876,126 @@ func TestRelocationCountSeparatesHeadsOnTheJobFallback(t *testing.T) {
 		{File: "internal/cli/b.go", RoundLabel: "F1", HeadSHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
 		{File: "internal/cli/b.go", RoundLabel: "F1", HeadSHA: "cccccccccccccccccccccccccccccccccccccccc"},
 	}
-	if got := ledgerRelocationBrief(headless, nil); got != "" {
+	if got := ledgerRelocationBrief(headless, nil, relocationTestTree); got != "" {
 		t.Fatalf("rows with no observing job manufactured rounds from their heads:\n%s", got)
+	}
+}
+
+// relocationTestTree stands in for PathExistsAtHead. It answers for the paths
+// the fixtures name, and it is deliberately EXPLICIT rather than permissive: a
+// stub returning true for everything would keep every locator whole and make
+// the grouping assertions vacuous, while one returning false for everything
+// would fold nothing. Each entry states which spelling the tree really holds.
+func relocationTestTree(path string) bool {
+	switch path {
+	// Real files, so a line-qualified locator naming them must GROUP.
+	case "internal/cli/a.go", "internal/cli/b.go", "internal/workflow/a.go",
+		"internal/workflow/b.go", "internal/workflow/c.go",
+		"internal/daemon/resolver_refusal_log_test.go", "pkg:a.go",
+		"apps/web/public/_landing", "go.mod", "pkg", "v1.2/pkg", "dir":
+		return true
+	// Files whose NAMES end in a number, so their locators must stay WHOLE.
+	case "pkg:10", "pkg:20", "pkg:30",
+		"dir/pkg:10", "dir/pkg:20", "dir/pkg:30",
+		"dir/pkg.go:10", "dir/pkg.go:20", "dir/pkg.go:30",
+		"v1.2/pkg:10", "v1.2/pkg:20", "v1.2/pkg:30",
+		".env:10", ".env:20", ".env:30",
+		"pkg.:10", "pkg.:20", "pkg.:30":
+		return true
+	default:
+		return false
+	}
+}
+
+// #2066 ROUND NINE, P1: THE REVIEWER'S COUNTER-EXAMPLE, WHICH THE EXTENSION RULE
+// FOLDED. Three tracked files whose names end in ":<n>" and which happen to
+// carry a final-segment extension. The tree confirms each full name exists, so
+// each keeps its whole locator and no relocation is manufactured.
+func TestRelocationCountKeepsExtensionBearingNamesThatEndInNumbers(t *testing.T) {
+	at := func(file, job string) db.ReviewFindingObservation {
+		return db.ReviewFindingObservation{File: file, ObserverJob: job, RoundLabel: "F1"}
+	}
+	named := []db.ReviewFindingObservation{
+		at("dir/pkg.go:10", "job-1"),
+		at("dir/pkg.go:20", "job-2"),
+		at("dir/pkg.go:30", "job-3"),
+	}
+	if got := ledgerRelocationBrief(named, nil, relocationTestTree); got != "" {
+		t.Fatalf("three tracked files whose names end in a number were folded:\n%s", got)
+	}
+
+	// AND THE SAME SPELLING GROUPS when the tree says the PREFIX is the file and
+	// the full locator is not. Identical text, opposite answer, decided by
+	// evidence rather than by the string: this is the pair that shows the key is
+	// no longer guessing.
+	qualified := []db.ReviewFindingObservation{
+		at("internal/workflow/a.go:10", "job-1"),
+		at("internal/workflow/a.go:20", "job-2"),
+		at("internal/workflow/a.go:30", "job-3"),
+	}
+	if got := ledgerRelocationBrief(qualified, nil, relocationTestTree); !strings.Contains(got, "internal/workflow/a.go  rounds=3") {
+		t.Fatalf("a line-qualified locator the tree resolves was not grouped:\n%s", got)
+	}
+}
+
+// WITH NO RESOLVER THE KEY MUST NOT GUESS. Every caller outside the daemon has
+// no tree, and the brief must then under-report rather than fold on text. This
+// is the floor the brief documents, and it is also what makes the nil case safe
+// to leave wired in production paths that have no checkout.
+func TestRelocationCountWithoutATreeKeepsRawLocators(t *testing.T) {
+	at := func(file, job string) db.ReviewFindingObservation {
+		return db.ReviewFindingObservation{File: file, ObserverJob: job, RoundLabel: "F1"}
+	}
+	rows := []db.ReviewFindingObservation{
+		at("internal/workflow/a.go:10", "job-1"),
+		at("internal/workflow/a.go:20", "job-2"),
+		at("internal/workflow/a.go:30", "job-3"),
+	}
+	if got := ledgerRelocationBrief(rows, nil, nil); got != "" {
+		t.Fatalf("with no tree resolver the key folded on text anyway:\n%s", got)
+	}
+}
+
+// NEITHER SPELLING TRACKED MEANS KEEP THE RAW LOCATOR. A finding can cite a path
+// that no longer exists at this head - a deleted file, a typo, a path from
+// another repository - and then the tree cannot decide anything. Stripping on a
+// prefix nobody confirmed is round seven's guess with extra steps, so the key
+// must under-report instead.
+func TestRelocationCountKeepsLocatorsTheTreeCannotResolve(t *testing.T) {
+	at := func(file, job string) db.ReviewFindingObservation {
+		return db.ReviewFindingObservation{File: file, ObserverJob: job, RoundLabel: "F1"}
+	}
+	unknown := []db.ReviewFindingObservation{
+		at("deleted/gone.go:10", "job-1"),
+		at("deleted/gone.go:20", "job-2"),
+		at("deleted/gone.go:30", "job-3"),
+	}
+	if got := ledgerRelocationBrief(unknown, nil, relocationTestTree); got != "" {
+		t.Fatalf("locators the tree cannot resolve were folded on their prefix:\n%s", got)
+	}
+}
+
+// A RESOLVER ERROR IS NOT AN ANSWER, and it must not read as existence. An
+// errored lookup on a PREFIX would otherwise strip the suffix and fold two
+// files on a failed git call - a defect that would appear only when the
+// checkout was unavailable, which is exactly when nobody is watching.
+func TestRelocationPathCheckerTreatsAnErrorAsUnresolved(t *testing.T) {
+	engine := Engine{LedgerResolvers: LedgerResolvers{
+		PathExistsAtHead: func(_ context.Context, _ string, _ string) (bool, error) {
+			return true, errors.New("git cat-file failed")
+		},
+	}}
+	checker := engine.relocationPathChecker(context.Background(), "cafebabecafebabecafebabecafebabecafebabe")
+	if checker == nil {
+		t.Fatal("a wired resolver produced no checker")
+	}
+	if checker("internal/workflow/a.go") {
+		t.Fatal("an errored lookup reported the path as existing, so a failed git call folds files")
+	}
+
+	// AND NO RESOLVER YIELDS NO CHECKER, so the caller keeps raw locators rather
+	// than receiving a stub that answers.
+	if (Engine{}).relocationPathChecker(context.Background(), "cafebabecafebabecafebabecafebabecafebabe") != nil {
+		t.Fatal("an unwired resolver produced a checker, which would answer questions it cannot")
 	}
 }
