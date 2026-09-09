@@ -849,8 +849,21 @@ func TestClaimMessageStaysStableAcrossABinaryChange(t *testing.T) {
 	_, store := newOrderingFixture(t)
 	insertCompletedJob(t, store, db.Job{ID: "impl-deploy", Agent: "lead", Type: "implement"}, orderingParentPayload())
 
-	// The OLD binary's claim: message with no owner in it, and no owner row.
-	seedFinalizeClaim(t, store, "impl-deploy", "")
+	// THE OLD BINARY'S MESSAGE IS A LITERAL, not a call to the current helper.
+	// Round eight's reviewer caught that: seeding both sides through
+	// implementationFinalizeClaimMessage made the test tautological, so changing
+	// the helper to a v2 string left it GREEN while the deploy contract it
+	// claims to protect was broken. This literal is the string the deployed
+	// b592f556, 9b88aca6 and b47bf3fc binaries all emit.
+	const deployed = "implementation finalization claimed for impl-deploy (#2057)"
+	if got := implementationFinalizeClaimMessage("impl-deploy"); got != deployed {
+		t.Fatalf("the claim message CHANGED: %q, want the deployed %q - a running finalization would no longer be excluded", got, deployed)
+	}
+	if claimed, err := store.ClaimJobEvent(ctx, db.JobEvent{
+		JobID: "impl-deploy", Kind: implementationFinalizeClaimedEvent, Message: deployed,
+	}); err != nil || !claimed {
+		t.Fatalf("seed the old binary's claim: claimed=%v err=%v", claimed, err)
+	}
 
 	// The NEW binary tries to claim the same finalization. It must LOSE.
 	claimed, err := store.ClaimJobEvent(ctx, db.JobEvent{
@@ -951,5 +964,146 @@ func TestConcurrentRecoveriesFinalizeAtMostOnce(t *testing.T) {
 	}
 	if recoveries > 1 {
 		t.Fatalf("recorded %d recoveries of one claim, want at most 1", recoveries)
+	}
+}
+
+// #2057 ROUND EIGHT, P1. RELEASING A CLAIM MUST TAKE ITS OWNER ROW WITH IT.
+//
+// Round seven released the claim on the payload-write arm and left the owner row
+// behind, so a LATER holder inherited a dead identity: the abandonment reader
+// found the prior boot's owner beside the new claim, called it abandoned, and
+// recovered a LIVE finalizer. The reviewer reproduced that.
+//
+// This drives the production helper both arms now use, and then asserts the
+// property that actually matters - that a release-then-reclaim cycle leaves
+// exactly ONE owner row, naming the CURRENT holder.
+func TestReleasingAClaimRemovesItsOwnerRow(t *testing.T) {
+	ctx := context.Background()
+	engine, store := newOrderingFixture(t)
+	insertCompletedJob(t, store, db.Job{ID: "impl-pair", Agent: "lead", Type: "implement"}, orderingParentPayload())
+
+	seedFinalizeClaim(t, store, "impl-pair", implementationFinalizeClaimOwnerMessage("impl-pair"))
+	if err := engine.releaseFinalizeClaim(ctx, "impl-pair"); err != nil {
+		t.Fatalf("releaseFinalizeClaim: %v", err)
+	}
+	claims, owners := finalizeClaimRowCounts(t, store, "impl-pair")
+	if claims != 0 || owners != 0 {
+		t.Fatalf("after release: claims=%d owners=%d, want 0 and 0 (a surviving owner row is the defect)", claims, owners)
+	}
+
+	// RECLAIM, which is the scenario that turned the leftover row into a live
+	// recovery: a new holder must not find a second, older owner beside its own.
+	seedFinalizeClaim(t, store, "impl-pair", implementationFinalizeClaimOwnerMessage("impl-pair"))
+	claims, owners = finalizeClaimRowCounts(t, store, "impl-pair")
+	if claims != 1 || owners != 1 {
+		t.Fatalf("after reclaim: claims=%d owners=%d, want exactly 1 and 1", claims, owners)
+	}
+	abandoned, owner, err := engine.implementationFinalizeClaimAbandoned(ctx, "impl-pair")
+	if err != nil {
+		t.Fatalf("abandonment check: %v", err)
+	}
+	if abandoned {
+		t.Fatalf("the reclaimed live holder was reported abandoned via a surviving row: owner=%+v", owner)
+	}
+}
+
+// THE STALE-OWNER STATE ITSELF, asserted as the thing recovery must refuse when
+// it cannot be prevented: a claim accompanied by a FOREIGN owner row is what the
+// leftover row produced. It is reported abandoned by design - which is exactly
+// why the release must never leave one behind. This test pins the direction so a
+// future reader cannot mistake the reader for the defect.
+func TestAForeignOwnerBesideAClaimIsWhatTheReleaseMustPrevent(t *testing.T) {
+	ctx := context.Background()
+	engine, store := newOrderingFixture(t)
+	insertCompletedJob(t, store, db.Job{ID: "impl-stale", Agent: "lead", Type: "implement"}, orderingParentPayload())
+	seedFinalizeClaim(t, store, "impl-stale", foreignOwnerMessage("impl-stale"))
+
+	abandoned, _, err := engine.implementationFinalizeClaimAbandoned(ctx, "impl-stale")
+	if err != nil {
+		t.Fatalf("abandonment check: %v", err)
+	}
+	if !abandoned {
+		t.Fatal("a foreign owner beside a claim was NOT reported abandoned, so foreign-boot recovery is broken")
+	}
+	// And the release removes exactly that pairing, so the state cannot persist
+	// into a later holder's lifetime.
+	if err := engine.releaseFinalizeClaim(ctx, "impl-stale"); err != nil {
+		// The foreign owner's message differs from this process's, so the helper
+		// cannot match it: that is a REAL limitation and it is asserted, not
+		// hidden. A foreign row is cleaned by the recovery path, not by a
+		// holder's own release.
+		t.Fatalf("releaseFinalizeClaim returned an error: %v", err)
+	}
+	_, owners := finalizeClaimRowCounts(t, store, "impl-stale")
+	if owners != 1 {
+		t.Fatalf("owners=%d; a holder's release matches only ITS OWN owner message, so a foreign row must survive here and be removed by recovery", owners)
+	}
+}
+
+func finalizeClaimRowCounts(t *testing.T, store *db.Store, jobID string) (int, int) {
+	t.Helper()
+	events, err := store.ListJobEvents(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	var claims, owners int
+	for _, event := range events {
+		switch event.Kind {
+		case implementationFinalizeClaimedEvent:
+			claims++
+		case implementationFinalizeClaimOwnerEvent:
+			owners++
+		}
+	}
+	return claims, owners
+}
+
+// #2057 ROUND EIGHT, THE INVARIANT ITSELF: A CLAIM MUST NOT SURVIVE A FAILED
+// OWNER WRITE.
+//
+// The mutant that made the owner write best-effort again survived every other
+// test in this file, because nothing exercised the failure. There is no
+// interface seam to inject one (#2093: Engine.Store is a concrete *db.Store), so
+// this uses the same technique the reviewer used - a SQLite TRIGGER that rejects
+// exactly the owner insert - which injects the fault into the PRODUCTION path
+// rather than around it.
+func TestAClaimIsReleasedWhenItsOwnerRowCannotBeWritten(t *testing.T) {
+	ctx := context.Background()
+	engine, store := newOrderingFixture(t)
+	finalizer := &countingImplementationFinalizer{}
+	engine.ImplementationFinalizer = finalizer
+	insertCompletedJob(t, store, db.Job{ID: "impl-noowner", Agent: "lead", Type: "implement"}, orderingParentPayload())
+
+	rejectJobEventKind(t, store, implementationFinalizeClaimOwnerEvent)
+
+	err := engine.AdvanceJob(ctx, "impl-noowner")
+	if err == nil {
+		t.Fatal("the advance succeeded while the owner row could not be written, so a claim exists that nothing can attribute")
+	}
+	// The finalizer must NOT have run: the claim is surrendered before any
+	// external work, so a retry is a clean retry rather than a second run.
+	if finalizer.calls != 0 {
+		t.Fatalf("the finalizer ran %d times despite an unattributable claim", finalizer.calls)
+	}
+	claims, owners := finalizeClaimRowCounts(t, store, "impl-noowner")
+	if claims != 0 {
+		t.Fatalf("claims=%d owners=%d: the claim survived a failed owner write, which is the state that lets a later holder inherit a dead identity", claims, owners)
+	}
+}
+
+// rejectJobEventKind installs a trigger that fails inserts of one job_event
+// kind, so a production write path can be made to fail without a code seam.
+func rejectJobEventKind(t *testing.T, store *db.Store, kind string) {
+	t.Helper()
+	conn, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer conn.Close()
+	stmt := `CREATE TRIGGER reject_kind BEFORE INSERT ON job_events
+	         WHEN NEW.kind = '` + kind + `'
+	         BEGIN SELECT RAISE(ABORT, 'injected: owner row rejected'); END;`
+	if _, err := conn.Exec(stmt); err != nil {
+		t.Fatalf("create trigger: %v", err)
 	}
 }

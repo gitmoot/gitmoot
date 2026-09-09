@@ -655,16 +655,27 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			return claimErr
 		}
 		if claimed {
-			// STAMP THE OWNER IMMEDIATELY, and best effort: losing this write
-			// costs recoverability (an unattributable claim is treated as live
-			// forever and needs an operator), never correctness. Failing the
-			// finalization because a diagnostic row did not land would trade a
-			// recoverable stall for a certain one.
-			_ = e.recordEffectEvent(ctx, db.JobEvent{
+			// A CLAIM WITHOUT ITS OWNER ROW IS NOT ALLOWED TO EXIST (#2057 round
+			// eight). Round seven wrote this best-effort, and the reviewer showed
+			// what that buys: a later winner whose owner write fails leaves the
+			// PRIOR holder's owner row as the newest one, so the abandonment
+			// reader attributes the live claim to a dead boot and recovers it.
+			//
+			// The invariant closes that by construction rather than by another
+			// guard: if the owner cannot be recorded, the claim is released and
+			// the advance returns retryably, so no claim is ever attributable to
+			// an identity that does not own it. The cost is a retry, which is the
+			// same cost every other failure on this path already pays.
+			if ownerErr := e.recordEffectEvent(ctx, db.JobEvent{
 				JobID:   job.ID,
 				Kind:    implementationFinalizeClaimOwnerEvent,
 				Message: implementationFinalizeClaimOwnerMessage(job.ID),
-			})
+			}); ownerErr != nil {
+				if releaseErr := e.releaseFinalizeClaim(ctx, job.ID); releaseErr != nil {
+					return errors.Join(ownerErr, releaseErr)
+				}
+				return FinalizationInProgressError{JobID: job.ID}
+			}
 		}
 		if !claimed {
 			// #2057 round five, P1: A CLAIM PROVES SOMEONE STARTED, NOT THAT ANYONE
@@ -776,25 +787,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 				// failure path, while the success path becomes strictly safe. Making a
 				// FAILED finalizer idempotent is a separate problem and is not
 				// attempted here.
-				// Drop this holder's owner row with its claim, so no dead
-				// identity outlives the claim it described.
-				_, _ = e.Store.ReleaseJobEventClaim(ctx, db.JobEvent{
-					JobID:   job.ID,
-					Kind:    implementationFinalizeClaimOwnerEvent,
-					Message: implementationFinalizeClaimOwnerMessage(job.ID),
-				})
-				// Drop this holder's owner row with its claim, so no dead
-				// identity outlives the claim it described.
-				_, _ = e.Store.ReleaseJobEventClaim(ctx, db.JobEvent{
-					JobID:   job.ID,
-					Kind:    implementationFinalizeClaimOwnerEvent,
-					Message: implementationFinalizeClaimOwnerMessage(job.ID),
-				})
-				_, releaseErr := e.Store.ReleaseJobEventClaim(ctx, db.JobEvent{
-					JobID:   job.ID,
-					Kind:    implementationFinalizeClaimedEvent,
-					Message: implementationFinalizeClaimMessage(job.ID),
-				})
+				releaseErr := e.releaseFinalizeClaim(ctx, job.ID)
 				if releaseErr != nil {
 					return errors.Join(err, releaseErr)
 				}
@@ -823,11 +816,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 				// marker is already durable by then, and the claim block is guarded
 				// on it, so a retry never consults the claim
 				// (TestFinalizedPayloadWithoutCompletionStillAdvances).
-				_, releaseErr := e.Store.ReleaseJobEventClaim(ctx, db.JobEvent{
-					JobID:   job.ID,
-					Kind:    implementationFinalizeClaimedEvent,
-					Message: implementationFinalizeClaimMessage(job.ID),
-				})
+				releaseErr := e.releaseFinalizeClaim(ctx, job.ID)
 				if releaseErr != nil {
 					return errors.Join(err, releaseErr)
 				}
@@ -1927,6 +1916,36 @@ type FinalizationInProgressError struct {
 
 func (e FinalizationInProgressError) Error() string {
 	return fmt.Sprintf("implementation finalization for %s is in progress under another advance", e.JobID)
+}
+
+// releaseFinalizeClaim drops a holder's OWNER row and then its claim, in that
+// order, as one operation (#2057 round eight).
+//
+// ONE HELPER BECAUSE THE ARMS DRIFTED. Round seven added the owner cleanup with a
+// scripted edit that inserted it TWICE into the finalizer-failure arm and NOT AT
+// ALL into the payload-write arm, and the reviewer found the consequence: that
+// arm released the claim and left its owner row, so a later winner whose own
+// best-effort owner write failed inherited a DEAD owner and had its LIVE claim
+// recovered. Two call sites that must stay identical are one call site.
+//
+// OWNER FIRST, CLAIM SECOND. A claim with no owner reads as unattributable and
+// therefore LIVE, which is a safe transient. A claim released while its stale
+// owner survives is the unsafe one, because the next reader attributes the new
+// claim to the dead identity.
+func (e Engine) releaseFinalizeClaim(ctx context.Context, jobID string) error {
+	if _, err := e.Store.ReleaseJobEventClaim(ctx, db.JobEvent{
+		JobID:   jobID,
+		Kind:    implementationFinalizeClaimOwnerEvent,
+		Message: implementationFinalizeClaimOwnerMessage(jobID),
+	}); err != nil {
+		return err
+	}
+	_, err := e.Store.ReleaseJobEventClaim(ctx, db.JobEvent{
+		JobID:   jobID,
+		Kind:    implementationFinalizeClaimedEvent,
+		Message: implementationFinalizeClaimMessage(jobID),
+	})
+	return err
 }
 
 // implementationFinalizeClaimAbandoned reports whether the finalization claim on
