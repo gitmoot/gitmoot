@@ -28,7 +28,7 @@ import (
 // because a single lens run emitted 14 of them.
 
 func obs(file, job, round string) db.ReviewFindingObservation {
-	return db.ReviewFindingObservation{File: file, ObserverJob: job, RoundLabel: round}
+	return db.ReviewFindingObservation{File: file, ObserverJob: job, RoundLabel: round, HeadSHA: relocationFixtureHead}
 }
 
 // THE UNIT IS A DISTINCT OBSERVING JOB, NOT A FINDING COUNT. Several findings in
@@ -520,7 +520,7 @@ func TestRelocationCountGroupsLineQualifiedLocatorsByFile(t *testing.T) {
 	// models a row the writer does not produce - and the recorded Line is exactly
 	// what makes an ambiguous locator decidable.
 	at := func(file string, line int64, job string) db.ReviewFindingObservation {
-		return db.ReviewFindingObservation{File: file, Line: line, ObserverJob: job, RoundLabel: "F1"}
+		return db.ReviewFindingObservation{File: file, Line: line, ObserverJob: job, RoundLabel: "F1", HeadSHA: relocationFixtureHead}
 	}
 
 	lineQualified := []db.ReviewFindingObservation{
@@ -720,7 +720,7 @@ func TestRelocationCountSeparatesOneJobsObservationsByRecordedHead(t *testing.T)
 // test file at lines 32, 53 and 248, which sat in three separate buckets.
 func TestRelocationCountGroupsQualifiedLocatorsWithNoRecordedLine(t *testing.T) {
 	at := func(file string, job string) db.ReviewFindingObservation {
-		return db.ReviewFindingObservation{File: file, ObserverJob: job, RoundLabel: "F1"}
+		return db.ReviewFindingObservation{File: file, ObserverJob: job, RoundLabel: "F1", HeadSHA: relocationFixtureHead}
 	}
 
 	// The measured shape from PR 1910, Line unset on every row.
@@ -886,7 +886,16 @@ func TestRelocationCountSeparatesHeadsOnTheJobFallback(t *testing.T) {
 // stub returning true for everything would keep every locator whole and make
 // the grouping assertions vacuous, while one returning false for everything
 // would fold nothing. Each entry states which spelling the tree really holds.
-func relocationTestTree(path string) bool {
+func relocationTestTree(head string, path string) (bool, bool) {
+	if strings.TrimSpace(head) == "" {
+		// A fixture row with no head cannot be resolved, which is the production
+		// floor rather than a licence to guess.
+		return false, false
+	}
+	return relocationTestTreeHas(path), true
+}
+
+func relocationTestTreeHas(path string) bool {
 	switch path {
 	// Real files, so a line-qualified locator naming them must GROUP.
 	case "internal/cli/a.go", "internal/cli/b.go", "internal/workflow/a.go",
@@ -913,7 +922,7 @@ func relocationTestTree(path string) bool {
 // each keeps its whole locator and no relocation is manufactured.
 func TestRelocationCountKeepsExtensionBearingNamesThatEndInNumbers(t *testing.T) {
 	at := func(file, job string) db.ReviewFindingObservation {
-		return db.ReviewFindingObservation{File: file, ObserverJob: job, RoundLabel: "F1"}
+		return db.ReviewFindingObservation{File: file, ObserverJob: job, RoundLabel: "F1", HeadSHA: relocationFixtureHead}
 	}
 	named := []db.ReviewFindingObservation{
 		at("dir/pkg.go:10", "job-1"),
@@ -944,7 +953,7 @@ func TestRelocationCountKeepsExtensionBearingNamesThatEndInNumbers(t *testing.T)
 // to leave wired in production paths that have no checkout.
 func TestRelocationCountWithoutATreeKeepsRawLocators(t *testing.T) {
 	at := func(file, job string) db.ReviewFindingObservation {
-		return db.ReviewFindingObservation{File: file, ObserverJob: job, RoundLabel: "F1"}
+		return db.ReviewFindingObservation{File: file, ObserverJob: job, RoundLabel: "F1", HeadSHA: relocationFixtureHead}
 	}
 	rows := []db.ReviewFindingObservation{
 		at("internal/workflow/a.go:10", "job-1"),
@@ -963,7 +972,7 @@ func TestRelocationCountWithoutATreeKeepsRawLocators(t *testing.T) {
 // must under-report instead.
 func TestRelocationCountKeepsLocatorsTheTreeCannotResolve(t *testing.T) {
 	at := func(file, job string) db.ReviewFindingObservation {
-		return db.ReviewFindingObservation{File: file, ObserverJob: job, RoundLabel: "F1"}
+		return db.ReviewFindingObservation{File: file, ObserverJob: job, RoundLabel: "F1", HeadSHA: relocationFixtureHead}
 	}
 	unknown := []db.ReviewFindingObservation{
 		at("deleted/gone.go:10", "job-1"),
@@ -975,27 +984,196 @@ func TestRelocationCountKeepsLocatorsTheTreeCannotResolve(t *testing.T) {
 	}
 }
 
-// A RESOLVER ERROR IS NOT AN ANSWER, and it must not read as existence. An
-// errored lookup on a PREFIX would otherwise strip the suffix and fold two
-// files on a failed git call - a defect that would appear only when the
-// checkout was unavailable, which is exactly when nobody is watching.
-func TestRelocationPathCheckerTreatsAnErrorAsUnresolved(t *testing.T) {
+// A RESOLVER ERROR IS NOT AN ANSWER, and the tri-state is what lets the caller
+// tell it from an absence. Round nine collapsed both to false, so an errored
+// probe of the full locator read as "absent" and a successful prefix probe then
+// stripped the suffix - folding files on a failed git call, which happens
+// exactly when no checkout is available.
+func TestRelocationPathCheckerTreatsAnErrorAsUnknown(t *testing.T) {
+	head := strings.Repeat("c", 40)
+	var calls int
 	engine := Engine{LedgerResolvers: LedgerResolvers{
 		PathExistsAtHead: func(_ context.Context, _ string, _ string) (bool, error) {
+			calls++
 			return true, errors.New("git cat-file failed")
 		},
 	}}
-	checker := engine.relocationPathChecker(context.Background(), "cafebabecafebabecafebabecafebabecafebabe")
+	checker := engine.relocationPathChecker(context.Background())
 	if checker == nil {
 		t.Fatal("a wired resolver produced no checker")
 	}
-	if checker("internal/workflow/a.go") {
-		t.Fatal("an errored lookup reported the path as existing, so a failed git call folds files")
+	exists, known := checker(head, "internal/workflow/a.go")
+	if known {
+		t.Fatalf("an errored lookup reported a KNOWN answer (exists=%v), so a failed git call decides a fold", exists)
+	}
+
+	// AN ERROR IS NOT MEMOISED, or one transient git failure becomes this
+	// brief's permanent answer for that path.
+	if _, _ = checker(head, "internal/workflow/a.go"); calls != 2 {
+		t.Fatalf("resolver calls = %d after two probes of one path, want 2: an error was cached", calls)
+	}
+
+	// AN EMPTY HEAD IS UNANSWERABLE, not an absence. Round nine's checker was
+	// built with the brief's head and could not represent this at all.
+	if _, known := checker("", "internal/workflow/a.go"); known {
+		t.Fatal("a lookup with no head returned a known answer")
 	}
 
 	// AND NO RESOLVER YIELDS NO CHECKER, so the caller keeps raw locators rather
 	// than receiving a stub that answers.
-	if (Engine{}).relocationPathChecker(context.Background(), "cafebabecafebabecafebabecafebabecafebabe") != nil {
+	if (Engine{}).relocationPathChecker(context.Background()) != nil {
 		t.Fatal("an unwired resolver produced a checker, which would answer questions it cannot")
+	}
+}
+
+// relocationFixtureHead is the head every fixture observation carries, because
+// the store REFUSES an observation without a 40-character head
+// (db.ErrFindingHeadSHA). A headless fixture row models something the writer
+// cannot produce, and round ten's head-aware key made that visible: those rows
+// resolved to "unknown" and kept their raw locators.
+const relocationFixtureHead = "cccccccccccccccccccccccccccccccccccccccc"
+
+// #2066 ROUND TEN, P1. EACH LOCATOR IS RESOLVED AGAINST ITS OWN OBSERVATION
+// HEAD, not the head being reviewed.
+//
+// The reviewer built a git fixture where "dir/pkg.go:10", ":20" and ":30" were
+// three DISTINCT tracked files at the observation head and absent at a later
+// one. Round nine asked today's tree about yesterday's rows, so all three folded
+// into "dir/pkg.go" and manufactured rounds=3 from three separate files.
+func TestRelocationCountResolvesEachLocatorAtItsOwnHead(t *testing.T) {
+	oldHead := strings.Repeat("a", 40)
+	newHead := strings.Repeat("b", 40)
+	// The tree DIFFERS between the two heads, which is the whole point: at
+	// oldHead the numbered names are real files; at newHead only the prefix is.
+	tracked := func(head string, path string) (bool, bool) {
+		switch head {
+		case oldHead:
+			return strings.HasPrefix(path, "dir/pkg.go:"), true
+		case newHead:
+			return path == "dir/pkg.go", true
+		default:
+			return false, false
+		}
+	}
+	at := func(file, job, head string) db.ReviewFindingObservation {
+		return db.ReviewFindingObservation{File: file, ObserverJob: job, RoundLabel: "F1", HeadSHA: head}
+	}
+
+	// Recorded at oldHead, where each numbered name IS a tracked file: three
+	// distinct files, so no relocation.
+	historical := []db.ReviewFindingObservation{
+		at("dir/pkg.go:10", "job-1", oldHead),
+		at("dir/pkg.go:20", "job-2", oldHead),
+		at("dir/pkg.go:30", "job-3", oldHead),
+	}
+	if got := ledgerRelocationBrief(historical, nil, tracked); got != "" {
+		t.Fatalf("three files tracked at THEIR OWN head were folded using a later tree:\n%s", got)
+	}
+
+	// The identical text recorded at newHead, where only the prefix exists:
+	// line-qualified locators, so they group. Same strings, opposite answer,
+	// decided by each row's own head.
+	current := []db.ReviewFindingObservation{
+		at("dir/pkg.go:10", "job-1", newHead),
+		at("dir/pkg.go:20", "job-2", newHead),
+		at("dir/pkg.go:30", "job-3", newHead),
+	}
+	if got := ledgerRelocationBrief(current, nil, tracked); !strings.Contains(got, "dir/pkg.go  rounds=3") {
+		t.Fatalf("line-qualified locators at their own head did not group:\n%s", got)
+	}
+
+	// AND THE MEMO MUST NOT LEAK ACROSS HEADS. One brief carrying both heads
+	// must answer each row separately rather than reusing the first answer.
+	mixed := append(append([]db.ReviewFindingObservation{}, historical...), current...)
+	got := ledgerRelocationBrief(mixed, nil, tracked)
+	if !strings.Contains(got, "dir/pkg.go  rounds=3") {
+		t.Fatalf("the newHead rows lost their grouping when mixed with older rows:\n%s", got)
+	}
+	if strings.Contains(got, "dir/pkg.go:10") {
+		t.Fatalf("an oldHead row was folded by a newHead answer:\n%s", got)
+	}
+}
+
+// #2066 ROUND TEN, P1, second half: AN ERRORED FULL-LOCATOR PROBE IS NOT AN
+// ABSENCE. Round nine collapsed error and false, so an errored probe of
+// "dir/pkg.go:10" read as absent, the prefix probe succeeded, and the suffix was
+// stripped although absence was never established.
+func TestRelocationCountKeepsALocatorWhoseProbeErrored(t *testing.T) {
+	head := strings.Repeat("d", 40)
+	tracked := func(_ string, path string) (bool, bool) {
+		if strings.Contains(path, ":") {
+			return false, false // the full locator cannot be resolved
+		}
+		return true, true // the prefix definitely exists
+	}
+	at := func(file, job string) db.ReviewFindingObservation {
+		return db.ReviewFindingObservation{File: file, ObserverJob: job, RoundLabel: "F1", HeadSHA: head}
+	}
+	rows := []db.ReviewFindingObservation{
+		at("dir/pkg.go:10", "job-1"),
+		at("dir/pkg.go:20", "job-2"),
+		at("dir/pkg.go:30", "job-3"),
+	}
+	if got := ledgerRelocationBrief(rows, nil, tracked); got != "" {
+		t.Fatalf("locators whose own probe was UNKNOWN were stripped because the prefix existed:\n%s", got)
+	}
+
+	// THE OTHER SIDE OF THE TRI-STATE, and it is a distinct branch: the full
+	// locator is KNOWN ABSENT while the PREFIX probe is unknown. Stripping then
+	// asserts a prefix nobody confirmed, which is round seven's guess wearing a
+	// tree lookup. A mutant that ignored prefixKnown survived until this case
+	// existed.
+	prefixUnknown := func(_ string, path string) (bool, bool) {
+		if strings.Contains(path, ":") {
+			return false, true // definitely not a tracked filename
+		}
+		return false, false // and the prefix cannot be resolved
+	}
+	if got := ledgerRelocationBrief(rows, nil, prefixUnknown); got != "" {
+		t.Fatalf("locators were folded onto a prefix whose own probe was UNKNOWN:\n%s", got)
+	}
+}
+
+// #2066 ROUND TEN: THE MEMO IS KEYED BY (HEAD, PATH), and this test exists
+// because the brief-level tests CANNOT see it.
+//
+// Those tests pass a raw stub into ledgerRelocationBrief, so they exercise the
+// KEY's logic and never the CHECKER's cache - a mutant keying the memo by path
+// alone survived every one of them. That is the wrong-seam class (entry 129734):
+// a fixture written from the function's signature rather than from the
+// production call site, which passes e.relocationPathChecker(ctx).
+//
+// So this drives the real checker and asserts the property directly: one path,
+// two heads, two different answers, and both resolver calls actually made.
+func TestRelocationPathCheckerKeysItsMemoByHeadAndPath(t *testing.T) {
+	oldHead := strings.Repeat("a", 40)
+	newHead := strings.Repeat("b", 40)
+	var calls []string
+	engine := Engine{LedgerResolvers: LedgerResolvers{
+		PathExistsAtHead: func(_ context.Context, head string, path string) (bool, error) {
+			calls = append(calls, head[:1]+":"+path)
+			// The same path exists at oldHead and NOT at newHead.
+			return head == oldHead, nil
+		},
+	}}
+	checker := engine.relocationPathChecker(context.Background())
+
+	if exists, known := checker(oldHead, "dir/pkg.go:10"); !known || !exists {
+		t.Fatalf("oldHead: exists=%v known=%v, want true and true", exists, known)
+	}
+	if exists, known := checker(newHead, "dir/pkg.go:10"); !known || exists {
+		t.Fatalf("newHead: exists=%v known=%v, want FALSE and true - a path-keyed memo returns oldHead's answer here", exists, known)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("resolver calls = %v, want one per (head,path): a path-only memo makes the second a cache hit", calls)
+	}
+
+	// And the memo DOES work within one head, so the cost of correctness is not
+	// a probe per observation.
+	if _, known := checker(oldHead, "dir/pkg.go:10"); !known {
+		t.Fatal("a repeated (head,path) probe lost its answer")
+	}
+	if len(calls) != 2 {
+		t.Fatalf("resolver calls = %v after a repeat of a known (head,path), want still 2", calls)
 	}
 }
