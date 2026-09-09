@@ -3554,13 +3554,17 @@ Three things it deliberately is not:
 
   A line-qualified locator (`path/file.go:32`) is grouped with other spellings
   of the same file, and whether a trailing `:<n>` is a line is decided by the
-  **tracked tree at the reviewed head**, never by the text. If the full locator
-  exists as a file it keeps its whole name; if only the prefix exists the suffix
-  was a line; if neither can be confirmed, or no tree is available, the raw
-  locator is kept and the count under-reports. Two text rules were tried and
-  both were wrong, because `dir/pkg:10` and `dir/pkg.go:10` are legal filenames:
-  no property of the string can decide it, so the count is a floor whenever the
-  tree cannot answer.
+  **tracked tree at that observation's own head**, never by the text and never
+  by the head being reviewed. If the full locator exists as a file it keeps its
+  whole name; if only the prefix exists the suffix was a line; if either lookup
+  cannot be resolved, or no tree is available, the raw locator is kept and the
+  count under-reports.
+  Two text rules were tried and both were wrong, because `dir/pkg:10` and
+  `dir/pkg.go:10` are legal filenames: no property of the string can decide it.
+  Resolving against the CURRENT head was wrong too, for a different reason: an
+  observation names a file as it existed when the finding was recorded, so three
+  distinct files tracked at an older head could be folded into one by today's
+  tree. The count is a floor whenever a head cannot be resolved.
 - **Not a claim that the defects are the same defect.** The count is rounds
   carrying findings against one file, which is a proxy: unrelated defects in one
   file across three rounds report as three.

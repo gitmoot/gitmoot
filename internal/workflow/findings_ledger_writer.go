@@ -581,7 +581,7 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 	// the issue is about - a lane converging on nothing while every round looks
 	// like progress.
 	relocations := ledgerRelocationBrief(observations, e.reviewRoundsForObservations(ctx, observations),
-		e.relocationPathChecker(ctx, head))
+		e.relocationPathChecker(ctx))
 	if len(pending) == 0 {
 		return relocations
 	}
@@ -654,9 +654,9 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 // The third case is the floor the brief already documents, and it is also what
 // happens with no resolver wired (every caller outside the daemon), so the brief
 // degrades to under-reporting rather than to guessing.
-func relocationFileKey(obs db.ReviewFindingObservation, pathExists func(string) bool) string {
+func relocationFileKey(obs db.ReviewFindingObservation, tracked relocationTracked) string {
 	file := strings.TrimSpace(obs.File)
-	if file == "" || pathExists == nil {
+	if file == "" || tracked == nil {
 		return file
 	}
 	idx := strings.LastIndex(file, ":")
@@ -666,15 +666,35 @@ func relocationFileKey(obs db.ReviewFindingObservation, pathExists func(string) 
 	if _, err := strconv.Atoi(strings.TrimSpace(file[idx+1:])); err != nil {
 		return file
 	}
-	if pathExists(file) {
+	// THE OBSERVATION'S OWN HEAD, never the brief's: this row is a claim about
+	// the tree as it was when the finding was recorded.
+	head := strings.TrimSpace(obs.HeadSHA)
+	fullExists, fullKnown := tracked(head, file)
+	if !fullKnown {
+		return file
+	}
+	if fullExists {
 		// A tracked file whose name really ends in ":<n>".
 		return file
 	}
 	path := strings.TrimSpace(file[:idx])
-	if path != "" && pathExists(path) {
-		return path
+	if path == "" {
+		return file
 	}
-	return file
+	// Only existence is tested here, because the contract above guarantees an
+	// unknown answer arrives as false. Testing prefixKnown too would be an
+	// UNREACHABLE branch: no mutation of it can change an outcome, which is how
+	// this was found - the mutant that dropped it survived every test, and the
+	// honest resolution is to delete dead code rather than to pin it.
+	//
+	// The FULL-locator probe above still needs its own known check, and that
+	// branch IS reachable: there, known=false and exists=false must be told
+	// apart from a proven absence, because only the latter may continue.
+	prefixExists, _ := tracked(head, path)
+	if !prefixExists {
+		return file
+	}
+	return path
 }
 
 // relocationPathChecker binds the ledger's own PathExistsAtHead resolver to this
@@ -685,22 +705,63 @@ func relocationFileKey(obs db.ReviewFindingObservation, pathExists func(string) 
 // floor. A stub answering "yes" would silently restore the guessing this round
 // removed. A resolver ERROR is treated as "does not exist" for that path, which
 // keeps the raw locator rather than folding on a failed lookup.
-func (e Engine) relocationPathChecker(ctx context.Context, head string) func(string) bool {
+// relocationTracked reports whether a path exists at a head, and whether the
+// answer is KNOWN at all (#2066 round ten).
+//
+// TWO P1s MADE THIS TRI-STATE AND HEAD-AWARE, and both were failures of the same
+// kind: a decision taken from a value that could not carry the question.
+//
+//  1. THE HEAD. Round nine bound one checker to the head being reviewed and
+//     applied it to the WHOLE observation history. An observation recorded at an
+//     older head names a file as it existed THEN; resolving it against today's
+//     tree answers a different question. The reviewer built a git fixture where
+//     "dir/pkg.go:10", ":20" and ":30" were three distinct tracked files at their
+//     observation head and absent at a later one, and the brief folded all three
+//     into "dir/pkg.go" - manufacturing rounds=3 from three separate files.
+//
+//  2. THE ERROR. Round nine collapsed (false, nil) and any resolver error to the
+//     same false. So an errored probe of the FULL locator read as "absent", the
+//     prefix probe then succeeded, and the suffix was stripped although absence
+//     was never established. A failed git call folded files, precisely when no
+//     checkout was available and nobody was watching.
+//
+// Both are closed by carrying more information rather than by another rule: the
+// answer is (exists, known), the lookup takes the OBSERVATION's head, and the
+// memo is keyed by (head, path) so one head's answer can never be reused for
+// another's.
+// CONTRACT, and relocationFileKey depends on it: known=false ALWAYS carries
+// exists=false. An implementation must never report an existence it could not
+// establish, because the key's prefix branch tests existence alone - a
+// (true, false) answer would fold files on an unresolved probe. relocationPath
+// Checker upholds this at every return; a future implementation must too.
+type relocationTracked func(head string, path string) (exists bool, known bool)
+
+func (e Engine) relocationPathChecker(ctx context.Context) relocationTracked {
 	resolver := e.LedgerResolvers.PathExistsAtHead
-	if resolver == nil || strings.TrimSpace(head) == "" {
+	if resolver == nil {
 		return nil
 	}
-	cache := map[string]bool{}
-	return func(path string) bool {
-		if cached, ok := cache[path]; ok {
-			return cached
+	type memoKey struct{ head, path string }
+	cache := map[memoKey]bool{}
+	return func(head string, path string) (bool, bool) {
+		head = strings.TrimSpace(head)
+		if head == "" || strings.TrimSpace(path) == "" {
+			// No head to ask about is not an absence; it is an unanswerable
+			// question, and the caller must keep the raw locator.
+			return false, false
+		}
+		key := memoKey{head: head, path: path}
+		if cached, ok := cache[key]; ok {
+			return cached, true
 		}
 		exists, err := resolver(ctx, head, path)
 		if err != nil {
-			exists = false
+			// UNKNOWN, and deliberately NOT cached: a transient git failure must
+			// not become this brief's permanent answer for that path.
+			return false, false
 		}
-		cache[path] = exists
-		return exists
+		cache[key] = exists
+		return exists, true
 	}
 }
 
@@ -846,7 +907,7 @@ const ledgerRelocationThreshold = 3
 // It reports and never blocks. The issue asks for the count to exist, and the
 // judgement it informs - stop patching and state a contract - is a design
 // decision a human makes with it, not one a gate can take.
-func ledgerRelocationBrief(observations []db.ReviewFindingObservation, roundOf map[string]string, pathExists func(string) bool) string {
+func ledgerRelocationBrief(observations []db.ReviewFindingObservation, roundOf map[string]string, tracked relocationTracked) string {
 	// THE ROUND IS THE OBSERVING JOB, NOT THE REVIEWER'S LABEL (#2066 review of
 	// #1419). review_findings.go:20-26 states the invariant this originally
 	// broke: reviewers number findings PER ROUND starting at 1, so RoundLabel
@@ -885,7 +946,7 @@ func ledgerRelocationBrief(observations []db.ReviewFindingObservation, roundOf m
 		// only when it matches the recorded line, which also absorbs the
 		// whitespace shape ("a.go: 10") that db.splitPathLine trims and
 		// splitLocator does not - the parser disagreement the review names.
-		file := relocationFileKey(obs, pathExists)
+		file := relocationFileKey(obs, tracked)
 		if file == "" {
 			// A finding with no file cannot be attributed to a vessel, so it cannot
 			// evidence relocation WITHIN one. Counting it would inflate every file.
