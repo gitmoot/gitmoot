@@ -3,10 +3,13 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // #2077 f3: THE OBLIGATION BRIEF POINTS AT THIS COMMAND AND IT COULD NOT ANSWER.
@@ -171,7 +174,7 @@ func TestFindingsFoldsObservationsToCurrentState(t *testing.T) {
 // real executed evidence, or a listing would report an obligation as discharged
 // on the strength of a row that discharges nothing.
 func TestFindingsFoldKeepsExecutedEvidenceOverALaterQuotedRow(t *testing.T) {
-	folded := foldLatestObservations([]db.ReviewFindingObservation{
+	folded := workflow.LatestObservationsInOrder([]db.ReviewFindingObservation{
 		{FindingUID: "u1", State: db.FindingAnswered, EvidenceKind: db.EvidenceExecuted, Title: "executed"},
 		{FindingUID: "u1", State: db.FindingOpen, EvidenceKind: db.EvidenceQuoted, Title: "quoted"},
 	})
@@ -180,5 +183,44 @@ func TestFindingsFoldKeepsExecutedEvidenceOverALaterQuotedRow(t *testing.T) {
 	}
 	if folded[0].EvidenceKind != db.EvidenceExecuted {
 		t.Fatalf("a later QUOTED row displaced EXECUTED evidence; the listing would disagree with the gate")
+	}
+}
+
+// #2086 review: --json MUST fold too. The first fix folded after the JSON
+// branch, so the machine-readable output - the one a dispatch path consumes -
+// still returned the raw append-only log while the human table was correct.
+func TestFindingsJSONOutputIsAlsoFolded(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	for i, spec := range []struct {
+		head      string
+		state     db.FindingState
+		continues string
+	}{{strings.Repeat("a", 40), db.FindingOpen, ""}, {strings.Repeat("b", 40), db.FindingAnswered, "owner/repo#7-f1"}} {
+		obs := db.ReviewFindingObservation{
+			ContinuesUID: spec.continues,
+			FindingUID:   "owner/repo#7-f1", Repo: "owner/repo", PullRequest: 7, HeadSHA: spec.head,
+			ObserverJob: "local-review-r" + strconv.Itoa(i), State: spec.state, Severity: "P1",
+			Title: "the boundary check is inverted", File: "internal/a.go",
+			EvidenceKind: db.EvidenceExecuted, ExecutedCommands: []string{"go test ./..."}, ExecutedCount: 1,
+		}
+		if _, err := store.RecordReviewFindingObservation(ctx, obs); err != nil {
+			t.Fatalf("RecordReviewFindingObservation: %v", err)
+		}
+	}
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"findings", "--home", home, "--repo", "owner/repo", "--pr", "7", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("findings --json exit = %d, stderr=%s", code, stderr.String())
+	}
+	var rows []db.ReviewFindingObservation
+	if err := json.Unmarshal(stdout.Bytes(), &rows); err != nil {
+		t.Fatalf("decode json: %v\n%s", err, stdout.String())
+	}
+	if len(rows) != 1 {
+		t.Fatalf("--json returned %d rows, want 1; the machine-readable path returned the raw log", len(rows))
+	}
+	if rows[0].State != db.FindingAnswered {
+		t.Fatalf("--json row state = %q, want the latest observation", rows[0].State)
 	}
 }

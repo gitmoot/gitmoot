@@ -12,6 +12,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // findingsDeclaration renders a repository's #1969 findings-consumption
@@ -154,6 +155,12 @@ func runFindingsRows(repo string, pullRequest int, home string, jsonOutput bool,
 		return 1
 	}
 
+	// FOLD BEFORE EVERY OUTPUT PATH (#2086 review). The first fix put this after
+	// the JSON branch, so --json still returned the raw append-only log - the
+	// worse half, because JSON is what a dispatch path consumes and a human at
+	// least sees the duplicate UIDs.
+	rows = workflow.LatestObservationsInOrder(rows)
+
 	if jsonOutput {
 		encoded, err := json.MarshalIndent(rows, "", "  ")
 		if err != nil {
@@ -177,7 +184,6 @@ func runFindingsRows(repo string, pullRequest int, home string, jsonOutput bool,
 	//
 	// The fold rule is the engine's, not a new one: latestObservation in
 	// findings_ledger.go, including its QUOTED guard.
-	rows = foldLatestObservations(rows)
 
 	if len(rows) == 0 {
 		// NAME BOTH REASONS. A reviewer sent here by a brief needs to know whether
@@ -222,31 +228,4 @@ func runFindingsRows(repo string, pullRequest int, home string, jsonOutput bool,
 	fmt.Fprintln(stdout, "STATE is the last recorded observation. An answered finding can still be MANDATORY at a")
 	fmt.Fprintln(stdout, "later head if the files it names changed again, which only the merge gate can decide.")
 	return 0
-}
-
-// foldLatestObservations mirrors internal/workflow's latestObservation: the last
-// observation wins per finding UID, except that a QUOTED row never displaces one
-// that already carried EXECUTED or STATIC evidence.
-//
-// Kept identical on purpose. A listing that folded by a different rule than the
-// gate would disagree with it about which obligations are open, which relocates
-// the failure this command exists to remove instead of removing it.
-func foldLatestObservations(rows []db.ReviewFindingObservation) []db.ReviewFindingObservation {
-	latest := make(map[string]db.ReviewFindingObservation, len(rows))
-	order := make([]string, 0, len(rows))
-	for _, obs := range rows {
-		previous, seen := latest[obs.FindingUID]
-		if !seen {
-			order = append(order, obs.FindingUID)
-		}
-		if seen && obs.EvidenceKind == db.EvidenceQuoted && previous.EvidenceKind != db.EvidenceQuoted {
-			continue
-		}
-		latest[obs.FindingUID] = obs
-	}
-	folded := make([]db.ReviewFindingObservation, 0, len(order))
-	for _, uid := range order {
-		folded = append(folded, latest[uid])
-	}
-	return folded
 }

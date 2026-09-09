@@ -129,6 +129,28 @@ func (s LedgerScope) degrade(format string, args ...any) {
 // the write path. A QUOTED row is still recorded and is still the fold for a
 // finding that has no other observation, which keeps a quoted-only mention
 // exactly as weak as it should be.
+// LatestObservationsInOrder folds an append-only observation list to the latest
+// row per finding UID, preserving first-appearance order.
+//
+// EXPORTED SO THERE IS ONE IMPLEMENTATION (#2086 review, P2). internal/cli had a
+// copy for the findings listing, and two copies of a fold rule is the drift
+// shape this campaign keeps finding: a listing that folded differently from the
+// gate would disagree with it about which obligations are open. A test that they
+// stay in sync would only detect that drift; sharing the function prevents it.
+func LatestObservationsInOrder(observations []db.ReviewFindingObservation) []db.ReviewFindingObservation {
+	latest := latestObservation(observations)
+	seen := make(map[string]bool, len(latest))
+	folded := make([]db.ReviewFindingObservation, 0, len(latest))
+	for _, obs := range observations {
+		if seen[obs.FindingUID] {
+			continue
+		}
+		seen[obs.FindingUID] = true
+		folded = append(folded, latest[obs.FindingUID])
+	}
+	return folded
+}
+
 func latestObservation(observations []db.ReviewFindingObservation) map[string]db.ReviewFindingObservation {
 	latest := map[string]db.ReviewFindingObservation{}
 	for _, obs := range observations {
