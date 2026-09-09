@@ -63,19 +63,63 @@ func refusalMessage(t *testing.T, events []db.JobEvent) string {
 // f1's exact shape, verbatim keys.
 func TestContentRefusalNamesTheAcceptedKeys(t *testing.T) {
 	events := refuseContentlessFinding(t, json.RawMessage(
-		`{"severity":"P3","description":"state silently beats disposition","location":"internal/workflow/findings_ledger_writer.go"}`))
+		// `description` USED TO BE THE CONTENTLESS FILLER HERE, chosen because
+		// nothing read it. #2073 now reads it: of 51 in-era findings carrying
+		// `description`, SIXTEEN carry it as their only prose key and so recorded
+		// an empty detail. Keeping it here would have asserted that a real,
+		// content-bearing reviewer shape must be refused.
+		//
+		// The 51-of-51 figure this comment first carried was wrong: the query
+		// behind it omitted `title` and `summary` from its own list of prose keys.
+		//
+		// The filler is now drawn only from ledgerNonContentKeys, which is what a
+		// genuinely contentless finding looks like. This comment is the reverse
+		// drift the block below predicted, arriving from the direction it named.
+		//
+		// The location carries a SENTINEL rather than a real path. The echo
+		// assertion below needs a token that can ONLY have come from the verbatim
+		// echo: any real key name now appears in the message as an ADVERTISED key
+		// too, so asserting on one proves nothing about echoing (#2077 review F6).
+		refusalEchoFixture))
 	message := refusalMessage(t, events)
 	for _, key := range ledgerContentKeys {
 		if !strings.Contains(message, key) {
 			t.Fatalf("refusal does not name accepted key %q, so the producer cannot learn it: %s", key, message)
 		}
 	}
-	// The rejected spelling must still be echoed, or the reviewer cannot tell
-	// which of their findings was dropped.
-	if !strings.Contains(message, "description") {
-		t.Fatalf("refusal dropped the reviewer's own text: %s", message)
+	// The reviewer's own finding must still be echoed, or they cannot tell which
+	// of their findings was dropped.
+	//
+	// ASSERTED ON A SENTINEL, NOT A KEY NAME. This previously checked for
+	// "description", which was then a key nothing read, so its presence in the
+	// message could only have come from the echo. Now that the reader accepts
+	// `description`, the refusal names it in its ADVERTISED-KEYS list and the
+	// assertion would pass whether or not anything was echoed - and the loop above
+	// already covers advertisement. The sentinel appears nowhere but the raw
+	// finding.
+	//
+	// #2077 review F8: A DECODED FIELD IS NOT AN ECHO. The sentinel used to sit in
+	// both `location` and `file`, so a mutant that echoed only the DECODED `file`
+	// value still contained it and the assertion passed - the test could not tell
+	// a verbatim echo from one reconstructed field. The contract is the whole
+	// reviewer object, so the assertion is now the whole raw object: JSON keys,
+	// quotes and separators included. No decoded single value can produce that.
+	if !strings.Contains(message, refusalEchoFixture) {
+		t.Fatalf("refusal did not echo the reviewer's finding VERBATIM.\nwant substring: %s\ngot: %s",
+			refusalEchoFixture, message)
+	}
+	// Guard the guard: the fixture must not be reconstructible from any single
+	// decoded value, or the assertion above is satisfiable without an echo.
+	for _, decoded := range []string{"P3", "echo-sentinel-2072/only-here.go"} {
+		if strings.Contains(decoded, refusalEchoFixture) {
+			t.Fatalf("fixture %q is a single decoded value, so it cannot discriminate an echo", refusalEchoFixture)
+		}
 	}
 }
+
+// refusalEchoFixture is asserted VERBATIM, so it is a const rather than an
+// inline literal: the assertion and the input cannot drift apart.
+const refusalEchoFixture = `{"severity":"P3","location":"echo-sentinel-2072/only-here.go","file":"echo-sentinel-2072/only-here.go"}`
 
 // THE LIST MUST DESCRIBE THE PARSER, NOT A COMMENT ABOUT IT. Every name in
 // ledgerContentKeys has to be a real json tag on reviewFindingWire, so the
