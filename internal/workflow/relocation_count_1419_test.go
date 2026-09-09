@@ -453,6 +453,12 @@ func TestRelocationBriefDescribesTheUnitItActuallyCounts(t *testing.T) {
 	for _, want := range []string{
 		"review round when one is recorded", "coordinator that",
 		"only otherwise by the individual reviewing job",
+		// #2066 round eleven: the brief must disclose its own FLOOR. Prose the
+		// system hands a reviewer is read BEFORE the reviewer writes, so a
+		// count presented as exact shapes every verdict after it.
+		"This count is a FLOOR, not a total",
+		"that observation's own head",
+		"UNDER-count rather than risk folding two real files",
 		"INCLUDING the job fallback", "the exact head that was reviewed",
 		"a fan-out at ONE head is one",
 	} {
