@@ -257,7 +257,8 @@ than the stack. It narrows the question; it does not close it, because an
 isolated pass says only that this invocation finished, not why another was
 waiting.
 
-**Observed timings for this package, which are a floor and not a bound.**
+**Observed timings for this package, which are samples and not a bound in
+either direction.**
 Measured by gm-findings on this host, idle, twice: `716s` and `805s`, both
 passing under `-timeout 25m`. A third run under 12-way load with 166 competing
 `go test` processes took `1500s` and timed out, with goroutines parked 16 minutes
@@ -270,8 +271,9 @@ exceeded the 600s default.** What they do NOT establish: that it cannot pass
 inside 600s on a faster machine, a warm cache, or a smaller future suite. Two
 idle samples are a distribution, not a lower bound.
 
-So pass `-timeout 25m` locally because it is necessary on the machines this
-repository is actually developed on, and read a `600.0xx` failure as **the
+So pass `-timeout 25m` locally because every run observed here exceeded the
+600s default and a firing deadline discards the whole package's result, and
+read a `600.0xx` failure as **the
 deadline firing** rather than as a verdict on the code - while remembering that
 the deadline firing and the code being slow are not exclusive.
 
