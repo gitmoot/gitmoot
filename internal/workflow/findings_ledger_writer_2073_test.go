@@ -437,7 +437,7 @@ func TestTruncateAtRuneHonoursItsContract(t *testing.T) {
 		{"one rune wider than the limit", "\u00e9", 1, "", 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, dropped := truncateAtRune(tc.in, tc.max)
+			got, dropped, _ := truncateAtRune(tc.in, tc.max)
 			if got != tc.want || dropped != tc.wantDrop {
 				t.Fatalf("truncateAtRune(%q, %d) = (%q, %d), want (%q, %d)",
 					tc.in, tc.max, got, dropped, tc.want, tc.wantDrop)
@@ -453,34 +453,45 @@ func TestTruncateAtRuneHonoursItsContract(t *testing.T) {
 }
 
 // F6 end to end: invalid UTF-8 that is ALREADY IN THE STORE must not reach the
-// prompt. The earlier regression only covered corruption introduced by cutting
-// valid input, so a stored `a 0xff b` passed straight through.
+// prompt, and the rewrite must be disclosed (#2077 review F4 and F6).
+//
+// THE FIRST VERSION OF THIS TEST COULD NOT FAIL. It built the finding with
+// json.Marshal, and Go's JSON encoder replaces invalid UTF-8 with U+FFFD on the
+// way in - so the stored Detail was already valid and the "invalid stored bytes"
+// case was never constructed. It asserted validity of a brief that had no
+// invalid bytes to survive. The only way to put a raw 0xff in the ledger is to
+// write the observation directly, which is also the only way the store can
+// really acquire one.
 func TestObligationBriefSanitisesInvalidUTF8AlreadyInTheStore(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	seedAgent(t, store, "g7-review", []string{"review"}, "gitmoot/gitmoot")
 	engine := testEngine(store)
 	head := strings.Repeat("e", 40)
 	nextHead := strings.Repeat("5", 40)
 
-	// Short enough that no truncation happens: the point is that the brief is
-	// valid even when nothing is cut.
 	bad := "a\xffb concern that was stored with an invalid byte"
+	if utf8.ValidString(bad) {
+		t.Fatalf("fixture is not invalid UTF-8, so this test cannot exercise the case")
+	}
 
-	insertCompletedJob(t, store, db.Job{ID: "review-2077-f6", Agent: "g7-review", Type: "review"}, JobPayload{
-		Repo: "gitmoot/gitmoot", Branch: "task-f6", PullRequest: 2093, HeadSHA: head,
-		TaskID: "task-f6", ReviewRound: "review-1",
-		Result: &AgentResult{
-			Decision: "changes_requested", Severity: "P1", Summary: "invalid stored bytes",
-			Evidence: EvidenceExecuted,
-			TestsRun: []string{"go test ./internal/workflow/ -> ok"},
-			Findings: []json.RawMessage{
-				mustFindingJSON(t, map[string]any{"severity": "P2", "location": "internal/pipeline/run.go:1", "message": bad}),
-			},
-		},
-	})
-	if err := engine.AdvanceJob(ctx, "review-2077-f6"); err != nil {
-		t.Fatalf("AdvanceJob returned error: %v", err)
+	if _, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
+		Repo: "gitmoot/gitmoot", PullRequest: 2093, HeadSHA: head,
+		ObserverJob: "review-2077-f6", State: db.FindingOpen, Severity: "P2",
+		RoundLabel: "F-1", Detail: bad, File: "internal/pipeline/run.go", Line: 1,
+		EvidenceKind: db.EvidenceExecuted, ExecutedCommands: []string{"go test ./internal/workflow/"}, ExecutedCount: 1,
+	}); err != nil {
+		t.Fatalf("RecordReviewFindingObservation returned error: %v", err)
+	}
+
+	stored, err := store.ListReviewFindingObservations(ctx, "gitmoot/gitmoot", 2093)
+	if err != nil {
+		t.Fatalf("ListReviewFindingObservations returned error: %v", err)
+	}
+	if len(stored) != 1 {
+		t.Fatalf("stored %d rows, want 1", len(stored))
+	}
+	if utf8.ValidString(stored[0].Detail) {
+		t.Fatalf("the store sanitised the byte on write, so the brief cannot be what fixes it")
 	}
 
 	brief := engine.ledgerObligationBrief(ctx, "gitmoot/gitmoot", 2093, nextHead, "task-f6")
@@ -492,6 +503,13 @@ func TestObligationBriefSanitisesInvalidUTF8AlreadyInTheStore(t *testing.T) {
 	}
 	if strings.Contains(brief, "\xff") {
 		t.Fatalf("the raw invalid byte reached the prompt")
+	}
+	// Coercion must be DISCLOSED. A long invalid run collapses to one replacement
+	// rune and can then fit the budget, so it reports zero bytes dropped and emits
+	// no truncation marker. Without a separate signal the reviewer reads silently
+	// rewritten prose as if it were what was recorded.
+	if !strings.Contains(brief, "undecodable bytes") {
+		t.Fatalf("prose was rewritten with U+FFFD and the brief said nothing.\nbrief:\n%s", brief)
 	}
 }
 
@@ -513,7 +531,7 @@ func TestTruncateAtRuneCoercesBeforeItMeasures(t *testing.T) {
 	in := strings.Repeat("a\xff", 100)
 	const max = 200
 
-	got, dropped := truncateAtRune(in, max)
+	got, dropped, _ := truncateAtRune(in, max)
 
 	if !utf8.ValidString(got) {
 		t.Fatalf("result is not valid UTF-8: coercion did not happen, or happened after the cut")
@@ -522,6 +540,7 @@ func TestTruncateAtRuneCoercesBeforeItMeasures(t *testing.T) {
 		t.Fatalf("result is %d bytes for a %d-byte limit: the bound was applied BEFORE coercion, so coercion then grew it past the limit", len(got), max)
 	}
 	if dropped == 0 {
-		t.Fatalf("nothing reported dropped, but a 100-byte input coerces to 300 bytes and cannot fit in %d", max)
+		t.Fatalf("nothing reported dropped, but this 200-byte input has 100 SEPARATED invalid runs and so coerces to 400 bytes, which cannot fit in %d. "+
+			"Note the arithmetic: growth is per invalid RUN, not per invalid byte", max)
 	}
 }
