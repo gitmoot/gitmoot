@@ -317,6 +317,26 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 			})
 		}
 	}
+	// #1419: SAY HOW MANY TIMES THIS HAS COME BACK.
+	//
+	// The count already existed and nothing ever read it: nextReviewRound derives
+	// maxReviewRound to build the label, and reviewRoundCount turns it into a
+	// memory-harvest score. Neither tells the people in the loop. Every round
+	// looks identical to the first - a job, a review, a verdict, green CI - so a
+	// lane converging on a fix and a lane chasing one defect around a file emit
+	// the same success signals.
+	//
+	// The threshold is 3 because that is where a written "stop at three
+	// relocations" rule was meant to fire and did not, having been left to a human
+	// counting across rounds (#1419's measured instance reached six).
+	//
+	// This warns and does not block. A high round count is evidence that the
+	// VESSEL may be wrong, not proof of it: some PRs legitimately take four
+	// rounds. Refusing dispatch would turn a hint into a wedge, and the failure
+	// this addresses is invisibility, not permission.
+	if err := e.recordReviewRoundThreshold(ctx, reviewRound, requests); err != nil {
+		return err
+	}
 	if err := e.setTaskState(ctx, ref, TaskReviewing); err != nil {
 		return err
 	}
@@ -880,6 +900,58 @@ func (e Engine) recordPullRequestBaseline(ctx context.Context, event PullRequest
 		HeadSHA:      event.HeadSHA,
 		State:        "open",
 	})
+}
+
+// ReviewRoundRelocationThreshold is the round at which the engine starts saying
+// how many times a defect has come back (#1419).
+//
+// Three, because that is where the rule a coordinator had already written was
+// meant to fire. On the measured instance it fired at SIX, not because the rule
+// was wrong but because noticing was left to a human counting across rounds
+// while every round produced identical success signals.
+const ReviewRoundRelocationThreshold = 3
+
+// recordReviewRoundThreshold writes one event per review job at or past the
+// threshold, naming the count.
+//
+// PER JOB, not once per round, because the job row is the only surface a
+// reviewer and an operator both already read. A round-level record with no job
+// to hang on would be a fact nobody encounters - the failure this campaign keeps
+// finding, installed by the fix for it.
+func (e Engine) recordReviewRoundThreshold(ctx context.Context, reviewRound string, requests []JobRequest) error {
+	if e.Store == nil {
+		return nil
+	}
+	round, ok := reviewRoundNumber(strings.TrimSpace(reviewRound))
+	if !ok || round < ReviewRoundRelocationThreshold {
+		return nil
+	}
+	for _, request := range requests {
+		// The id is assigned inside enqueue, so it is derived here the same
+		// deterministic way rather than read off a field that is still empty at
+		// this point - which is how the first version of this recorder wrote
+		// nothing at all while every test around it passed.
+		jobID := strings.TrimSpace(request.ID)
+		if jobID == "" {
+			jobID = e.jobID(request)
+		}
+		if jobID == "" {
+			continue
+		}
+		if err := e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID: jobID,
+			Kind:  "review_round_threshold",
+			Message: fmt.Sprintf(
+				"review round %d on this pull request: the same defect returning is indistinguishable "+
+					"from progress unless somebody counts. Before fixing again, state what NO version of "+
+					"this code may be able to do - if that sentence is hard to write, the fix is a design "+
+					"round rather than another patch (#1419).",
+				round),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (e Engine) nextReviewRound(ctx context.Context, event PullRequestEvent) (string, []db.Job, error) {
