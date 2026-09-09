@@ -5865,3 +5865,99 @@ func TestDispatchDeclineDedupsPerReasonRatherThanPerPass(t *testing.T) {
 		t.Fatalf("dispatch_declined events after three identical passes = %d, want exactly 1; a row per pass is the #598 flood", count)
 	}
 }
+
+// TestDispatchDeclineDedupsOnTheClauseNotTheOperand pins the volume contract
+// against the defect that the first #2117 implementation actually had: the
+// episode key included the FORMATTED DETAIL, and the detail carries operands
+// that move between passes - selected= changes with how many jobs were admitted
+// earlier in the same pass. So every distinct operand value opened a NEW episode
+// and wrote another row, which is #598's flood wearing a dedup key. The comments
+// claimed per-clause dedup while the code keyed per-detail, and nothing failed.
+//
+// Two passes at DIFFERENT limits make the same job decline on the same clause
+// with two different operands. The contract is one row, and the operands must
+// still be present in it.
+func TestDispatchDeclineDedupsOnTheClauseNotTheOperand(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	uniq := t.Name()
+	// Distinct sessions so the runtime clause never fires: this test is about the
+	// limit clause, and a runtime decline would mask it.
+	for index, session := range []string{"session-1", "session-2", "session-3"} {
+		agent := fmt.Sprintf("lead-%d-%s", index, uniq)
+		task := fmt.Sprintf("task-%d-%s", index, uniq)
+		seedDaemonWorkerAgent(t, store, agent, runtime.CodexRuntime, session, []string{"implement"}, "owner/repo")
+		if err := store.UpsertTask(ctx, db.Task{ID: task, RepoFullName: "owner/repo", State: string(workflow.TaskImplementing), Branch: task, WorktreePath: "/tmp/gitmoot/" + task}); err != nil {
+			t.Fatalf("UpsertTask %s: %v", task, err)
+		}
+		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: fmt.Sprintf("job-%d-%s", index, uniq), Agent: agent, Action: "implement", Repo: "owner/repo", Branch: task, TaskID: task})
+	}
+	jobs, err := store.ListQueuedJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListQueuedJobs: %v", err)
+	}
+	if len(jobs) != 3 {
+		t.Fatalf("queued jobs = %d, want three", len(jobs))
+	}
+	policy := config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue}
+	last := jobs[2].ID
+
+	// Two ticks at different limits. ADMISSION OUTPUT IS ASSERTED TOO: this change
+	// must not alter which jobs run, only what is recorded about the ones that did not.
+	for _, pass := range []struct {
+		limit      int
+		wantQueued int
+	}{{limit: 2, wantQueued: 2}, {limit: 1, wantQueued: 1}} {
+		queued, remaining := selectRunnableQueuedJobsWithPolicy(ctx, store, jobs, pass.limit, policy)
+		if len(queued) != pass.wantQueued || len(queued)+len(remaining) != len(jobs) {
+			t.Fatalf("limit=%d admitted %d (remaining %d), want %d admitted and every job accounted for", pass.limit, len(queued), len(remaining), pass.wantQueued)
+		}
+		if remaining[len(remaining)-1].ID != last {
+			t.Fatalf("limit=%d last remaining=%s, want %s declined in both passes", pass.limit, remaining[len(remaining)-1].ID, last)
+		}
+	}
+
+	events, err := store.ListJobEvents(ctx, last)
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	var limitRows []string
+	for _, event := range events {
+		if event.Kind == "dispatch_declined" && strings.Contains(event.Message, "limit") {
+			limitRows = append(limitRows, event.Message)
+		}
+	}
+	// Two passes, two different operand values, ONE row. Keying on the detail
+	// yields two here, which is the bug this test exists for.
+	if len(limitRows) != 1 {
+		t.Fatalf("limit-clause declines for %s = %d %v, want exactly one across two passes at different limits", last, len(limitRows), limitRows)
+	}
+	// And the surviving row still answers the question in one line.
+	if !strings.Contains(limitRows[0], "selected=") || !strings.Contains(limitRows[0], "limit=") {
+		t.Fatalf("decline detail %q lost its operands; a clause name without the value it tested is another thing to investigate", limitRows[0])
+	}
+
+	// The limit<=0 caller path declines EVERY pending job, so it is the highest
+	// volume branch of the four and needs the same bound.
+	for pass := 0; pass < 2; pass++ {
+		queued, remaining := selectRunnableQueuedJobsWithPolicy(ctx, store, jobs, 0, policy)
+		if len(queued) != 0 || len(remaining) != len(jobs) {
+			t.Fatalf("limit=0 pass %d admitted %d and left %d, want zero admitted and every job pending", pass, len(queued), len(remaining))
+		}
+	}
+	for _, job := range jobs {
+		slotRows := 0
+		rows, err := store.ListJobEvents(ctx, job.ID)
+		if err != nil {
+			t.Fatalf("ListJobEvents %s: %v", job.ID, err)
+		}
+		for _, event := range rows {
+			if event.Kind == "dispatch_declined" && strings.Contains(event.Message, "no dispatch slots") {
+				slotRows++
+			}
+		}
+		if slotRows != 1 {
+			t.Fatalf("no-slots declines for %s = %d, want exactly one across two passes", job.ID, slotRows)
+		}
+	}
+}

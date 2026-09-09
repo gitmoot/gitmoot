@@ -379,8 +379,10 @@ var (
 // immediately instead of being suppressed by the old one. That is the whole
 // diagnostic value: the transition is the interesting event.
 //
-// Volume is bounded by construction: at most one row per (job, reason) per TTL,
-// so a job stalled 46 minutes on one clause writes 4 rows, not 2760.
+// Volume is bounded by construction: at most one row per (job, CLAUSE) per TTL,
+// so a job stalled 46 minutes on one clause writes 4 rows, not 2760 - and the
+// bound holds even though the recorded operands change between passes, because
+// the key is the clause and only the message carries the values.
 const (
 	dispatchDeclineEpisodeTTL = 15 * time.Minute
 	dispatchDeclineEpisodeMax = 512
@@ -420,11 +422,17 @@ func markDispatchDeclineEpisode(key string) {
 // episode. detail MUST carry the value the clause tested, not just its name: a
 // reason without its operand is another thing to investigate, which is the defect
 // this instrumentation exists to remove.
-func recordDispatchDecline(ctx context.Context, store *db.Store, job db.Job, detail string) {
-	if store == nil || strings.TrimSpace(detail) == "" {
+func recordDispatchDecline(ctx context.Context, store *db.Store, job db.Job, clause string, detail string) {
+	if store == nil || strings.TrimSpace(clause) == "" || strings.TrimSpace(detail) == "" {
 		return
 	}
-	key := job.ID + "\x00" + detail
+	// KEY ON THE CLAUSE, NOT ON THE DETAIL. The detail carries operands that move
+	// between passes - selected= changes with how many jobs were admitted earlier
+	// in the same pass, active= changes as instances come and go - so keying on it
+	// opens a NEW episode per distinct value and emits a row per operand change.
+	// That is the #598 flood wearing a dedup key, and it would have silently
+	// broken the bound this whole design exists to hold.
+	key := job.ID + "\x00" + clause
 	if dispatchDeclineEpisodeOpen(key) {
 		return
 	}
@@ -2863,7 +2871,7 @@ func selectRunnableQueuedJobsSeeded(ctx context.Context, store *db.Store, pendin
 		// no slots every queued job is declined and nothing recorded why. A repo
 		// whose scheduler resolves to zero looks identical to an idle one.
 		for _, job := range pending {
-			recordDispatchDecline(ctx, store, job, fmt.Sprintf("no dispatch slots: limit=%d", limit))
+			recordDispatchDecline(ctx, store, job, "slots", fmt.Sprintf("no dispatch slots: limit=%d", limit))
 		}
 		return nil, pending
 	}
@@ -2877,12 +2885,12 @@ func selectRunnableQueuedJobsSeeded(ctx context.Context, store *db.Store, pendin
 	queued := make([]db.Job, 0, min(limit, len(pending)))
 	remaining := make([]db.Job, 0, len(pending))
 	for _, job := range pending {
-		admitted, detail := selector.selects(ctx, store, job, len(queued))
+		admitted, clause, detail := selector.selects(ctx, store, job, len(queued))
 		if admitted {
 			queued = append(queued, job)
 			continue
 		}
-		recordDispatchDecline(ctx, store, job, detail)
+		recordDispatchDecline(ctx, store, job, clause, detail)
 		remaining = append(remaining, job)
 	}
 	return queued, remaining
@@ -2948,27 +2956,27 @@ func memoizedRuntimeResourceKey(ctx context.Context, store *db.Store, job db.Job
 // the product: "declined: limit" is nearly worthless, "selected=32 limit=32"
 // answers the question in one line. Admission behaviour is unchanged - every
 // return value is the same bool as before.
-func (s queuedJobResourceSelector) selects(ctx context.Context, store *db.Store, job db.Job, selected int) (bool, string) {
+func (s queuedJobResourceSelector) selects(ctx context.Context, store *db.Store, job db.Job, selected int) (admitted bool, clause string, detail string) {
 	if selected >= s.limit {
-		return false, fmt.Sprintf("dispatch limit reached: selected=%d limit=%d", selected, s.limit)
+		return false, "limit", fmt.Sprintf("dispatch limit reached: selected=%d limit=%d", selected, s.limit)
 	}
 	checkoutKey := queuedJobCheckoutKey(ctx, store, job)
 	runtimeKey := queuedJobRuntimeResourceKey(ctx, store, job)
 	if s.checkouts[checkoutKey] {
-		return false, fmt.Sprintf("checkout already taken this pass: checkout=%s", checkoutKey)
+		return false, "checkout", fmt.Sprintf("checkout already taken this pass: checkout=%s", checkoutKey)
 	}
 	runtimeAlreadySelected := runtimeKey != "" && s.runtimes[runtimeKey]
 	runtimeAlreadyLocked := runtimeKey != "" && !runtimeAlreadySelected && runtimeResourceLocked(ctx, store, runtimeKey)
 	if runtimeAlreadySelected || runtimeAlreadyLocked {
 		if ok, tempDetail := s.canUseTempWorker(ctx, store, job); !ok && runtimeAlreadySelected {
-			return false, fmt.Sprintf("runtime already taken this pass and no temp session: runtime=%s; %s", runtimeKey, tempDetail)
+			return false, "runtime", fmt.Sprintf("runtime already taken this pass and no temp session: runtime=%s; %s", runtimeKey, tempDetail)
 		}
 	}
 	s.checkouts[checkoutKey] = true
 	if runtimeKey != "" {
 		s.runtimes[runtimeKey] = true
 	}
-	return true, ""
+	return true, "", ""
 }
 
 func runtimeResourceLocked(ctx context.Context, store *db.Store, runtimeKey string) bool {
