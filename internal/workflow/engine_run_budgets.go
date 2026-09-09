@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -646,11 +648,23 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		// cannot.
 		claimed, claimErr := e.Store.ClaimJobEvent(ctx, db.JobEvent{
 			JobID:   job.ID,
-			Kind:    "implementation_finalize_claimed",
-			Message: fmt.Sprintf("implementation finalization claimed for %s (#2057)", job.ID),
+			Kind:    implementationFinalizeClaimedEvent,
+			Message: implementationFinalizeClaimMessage(job.ID),
 		})
 		if claimErr != nil {
 			return claimErr
+		}
+		if claimed {
+			// STAMP THE OWNER IMMEDIATELY, and best effort: losing this write
+			// costs recoverability (an unattributable claim is treated as live
+			// forever and needs an operator), never correctness. Failing the
+			// finalization because a diagnostic row did not land would trade a
+			// recoverable stall for a certain one.
+			_ = e.recordEffectEvent(ctx, db.JobEvent{
+				JobID:   job.ID,
+				Kind:    implementationFinalizeClaimOwnerEvent,
+				Message: implementationFinalizeClaimOwnerMessage(job.ID),
+			})
 		}
 		if !claimed {
 			// #2057 round five, P1: A CLAIM PROVES SOMEONE STARTED, NOT THAT ANYONE
@@ -694,17 +708,38 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 				// permanent stop is worse than a possible duplicate, because the
 				// duplicate is visible and recoverable and the stop is neither. The
 				// bound is what keeps it from being taken while a winner is alive.
-				abandoned, age, abandonedErr := e.implementationFinalizeClaimAbandoned(ctx, job.ID)
+				abandoned, owner, abandonedErr := e.implementationFinalizeClaimAbandoned(ctx, job.ID)
 				if abandonedErr != nil {
 					return abandonedErr
 				}
 				if !abandoned {
 					return FinalizationInProgressError{JobID: job.ID}
 				}
+				// THE OWNER ROW IS THE RECOVERY TOKEN, and releasing it FIRST is
+				// what closes the ABA race. ReleaseJobEventClaim is at-most-once
+				// on the exact (job, kind, message) tuple, so of two recoverers
+				// that both observed this dead owner exactly ONE deletes it; the
+				// loser sees released=false and stops without ever touching the
+				// claim. Releasing the claim first would let the loser delete a
+				// live successor's claim, because the claim's message is stable
+				// by design and therefore identical for every holder.
+				wonRecovery, ownerErr := e.Store.ReleaseJobEventClaim(ctx, db.JobEvent{
+					JobID:   job.ID,
+					Kind:    implementationFinalizeClaimOwnerEvent,
+					Message: owner.Message,
+				})
+				if ownerErr != nil {
+					return ownerErr
+				}
+				if !wonRecovery {
+					// Another recoverer got there first. Its release of the claim
+					// is the one that counts.
+					return FinalizationInProgressError{JobID: job.ID}
+				}
 				released, releaseErr := e.Store.ReleaseJobEventClaim(ctx, db.JobEvent{
 					JobID:   job.ID,
-					Kind:    "implementation_finalize_claimed",
-					Message: fmt.Sprintf("implementation finalization claimed for %s (#2057)", job.ID),
+					Kind:    implementationFinalizeClaimedEvent,
+					Message: implementationFinalizeClaimMessage(job.ID),
 				})
 				if releaseErr != nil {
 					return releaseErr
@@ -714,8 +749,8 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 						JobID: job.ID,
 						Kind:  implementationFinalizeClaimRecoveredEvent,
 						Message: fmt.Sprintf(
-							"implementation finalization claim for %s held %s with no completion; released for retry (#2057)",
-							job.ID, age.Round(time.Second)),
+							"implementation finalization claim for %s was held by boot %s pid %d, which is gone; released for retry (#2057)",
+							job.ID, owner.BootID, owner.PID),
 					})
 				}
 				return FinalizationInProgressError{JobID: job.ID}
@@ -741,10 +776,24 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 				// failure path, while the success path becomes strictly safe. Making a
 				// FAILED finalizer idempotent is a separate problem and is not
 				// attempted here.
+				// Drop this holder's owner row with its claim, so no dead
+				// identity outlives the claim it described.
+				_, _ = e.Store.ReleaseJobEventClaim(ctx, db.JobEvent{
+					JobID:   job.ID,
+					Kind:    implementationFinalizeClaimOwnerEvent,
+					Message: implementationFinalizeClaimOwnerMessage(job.ID),
+				})
+				// Drop this holder's owner row with its claim, so no dead
+				// identity outlives the claim it described.
+				_, _ = e.Store.ReleaseJobEventClaim(ctx, db.JobEvent{
+					JobID:   job.ID,
+					Kind:    implementationFinalizeClaimOwnerEvent,
+					Message: implementationFinalizeClaimOwnerMessage(job.ID),
+				})
 				_, releaseErr := e.Store.ReleaseJobEventClaim(ctx, db.JobEvent{
 					JobID:   job.ID,
-					Kind:    "implementation_finalize_claimed",
-					Message: fmt.Sprintf("implementation finalization claimed for %s (#2057)", job.ID),
+					Kind:    implementationFinalizeClaimedEvent,
+					Message: implementationFinalizeClaimMessage(job.ID),
 				})
 				if releaseErr != nil {
 					return errors.Join(err, releaseErr)
@@ -776,8 +825,8 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 				// (TestFinalizedPayloadWithoutCompletionStillAdvances).
 				_, releaseErr := e.Store.ReleaseJobEventClaim(ctx, db.JobEvent{
 					JobID:   job.ID,
-					Kind:    "implementation_finalize_claimed",
-					Message: fmt.Sprintf("implementation finalization claimed for %s (#2057)", job.ID),
+					Kind:    implementationFinalizeClaimedEvent,
+					Message: implementationFinalizeClaimMessage(job.ID),
 				})
 				if releaseErr != nil {
 					return errors.Join(err, releaseErr)
@@ -1792,17 +1841,78 @@ func (e Engine) sumRootDelegationTokens(ctx context.Context, rootID string) (int
 // before the payload write.
 const implementationFinalizeCompletedEvent = "implementation_finalize_completed"
 
+// implementationFinalizeClaimedEvent is the claim row's kind, named once so the
+// claim, the releases and the recovery reader cannot drift apart.
+const implementationFinalizeClaimedEvent = "implementation_finalize_claimed"
+
+// implementationFinalizeClaimOwnerEvent records the identity holding the claim.
+const implementationFinalizeClaimOwnerEvent = "implementation_finalize_claim_owner"
+
 // implementationFinalizeClaimRecoveredEvent records that an abandoned
 // finalization claim was released for retry (#2057 round six).
 const implementationFinalizeClaimRecoveredEvent = "implementation_finalize_claim_recovered"
 
-// implementationFinalizeClaimGrace is how long a finalization claim may be held
-// with no completion event before a later advance treats it as abandoned and
-// releases it. It is a REFUSAL TO WAIT FOREVER, not a tuned value: it matches
-// the 15 minutes the pipeline auto-merge claim already uses for the same
-// question, and it must exceed the longest plausible finalizer run so a live
-// winner is never stolen from.
-const implementationFinalizeClaimGrace = 15 * time.Minute
+// implementationFinalizeClaimMessage stamps a claim with the OWNER that holds
+// it, so a later reader can ask whether that owner still exists (#2057 round
+// seven).
+//
+// WHY THE OWNER AND NOT A CLOCK. Round six recovered a claim held longer than
+// 15 minutes. The reviewer instrumented it and observed the failure directly:
+// the winning FinalizeImplementation stayed live, the clock passed the grace, a
+// losing advance released the claim, and a third advance entered the SAME
+// finalizer concurrently. No constant fixes that. Finalization has no ceiling
+// below the job context, which defaults to four hours and reaches eight, and
+// GitHub throttling alone can wait 30 minutes - so any grace short enough to
+// recover a dead owner promptly is also short enough to steal a live one, and
+// the replacement can then be recovered again on the same rule, which loops.
+//
+// Liveness is not derivable from age. It IS derivable from identity: a claim
+// stamped with a boot id and a pid can be tested against the boot we are in and
+// the process table. That is the same discriminator ListRunningJobIDsFromForeign
+// Boot already uses for abandoned runners, so this is one convention rather than
+// a second.
+//
+// THE MESSAGE IS ALSO THE ABA FIX. ClaimJobEvent and ReleaseJobEventClaim key on
+// the exact (job, kind, message) tuple. Round six used a CONSTANT message, so
+// two stale recoverers could both read the old claim, one release it, a new
+// winner acquire an identical row, and the second recoverer release the NEW
+// winner's claim. An owner-stamped message makes those rows distinct, so a
+// release built from the observed claim cannot match a successor's.
+func implementationFinalizeClaimMessage(jobID string) string {
+	return fmt.Sprintf("implementation finalization claimed for %s (#2057)", jobID)
+}
+
+// implementationFinalizeClaimOwnerMessage stamps WHO holds the claim, written as
+// a SEPARATE event immediately after the claim is won.
+//
+// WHY NOT IN THE CLAIM ITSELF. Round seven's first attempt put the owner in the
+// claim's message, and a pre-existing test caught the consequence at once:
+// ClaimJobEvent's at-most-once check keys on (job, kind, MESSAGE), so a claim
+// written by the old binary no longer excludes a claimer using the new format.
+// A deploy with an in-flight finalization would have run a SECOND finalizer
+// beside the first - the exact double-execution this whole guard exists to
+// prevent, introduced by the fix for it. The claim message must therefore stay
+// byte-stable forever.
+//
+// The owner event carries the identity instead, and it doubles as the recovery
+// token: ReleaseJobEventClaim on the OWNER row is at-most-once, so of two
+// recoverers observing the same dead owner exactly one proceeds to release the
+// claim. That is what closes the ABA race without making the claim's own message
+// vary.
+func implementationFinalizeClaimOwnerMessage(jobID string) string {
+	return fmt.Sprintf("implementation finalization for %s is held by boot %s pid %d (#2057)",
+		jobID, db.BootID(), os.Getpid())
+}
+
+// implementationFinalizeClaimOwner is the identity parsed back out of a claim.
+type implementationFinalizeClaimOwner struct {
+	BootID  string
+	PID     int
+	Message string
+}
+
+var implementationFinalizeClaimOwnerPattern = regexp.MustCompile(
+	`^implementation finalization for (?:.+) is held by boot (\S*) pid (\d+) \(#2057\)$`)
 
 // FinalizationInProgressError reports that another advance holds the finalization
 // claim and has not recorded completion, so this caller cannot safely proceed:
@@ -1820,36 +1930,82 @@ func (e FinalizationInProgressError) Error() string {
 }
 
 // implementationFinalizeClaimAbandoned reports whether the finalization claim on
-// jobID has been held past implementationFinalizeClaimGrace with no completion
-// event, and how long it has been held (#2057 round six).
+// jobID is held by an owner that no longer exists, and returns the claim's own
+// message so a release can target that exact row (#2057 round seven).
 //
-// UNPARSEABLE OR MISSING TIMESTAMPS ARE NOT ABANDONMENT. A claim whose
-// created_at cannot be read cannot be aged, so it is reported as live: stealing
-// on an unreadable clock would let one bad row re-run a finalizer immediately,
-// which is the failure this bound exists to avoid.
-func (e Engine) implementationFinalizeClaimAbandoned(ctx context.Context, jobID string) (bool, time.Duration, error) {
+// ABANDONED MEANS THE OWNER IS GONE, not that time has passed:
+//
+//   - a claim from a DIFFERENT boot cannot have a live holder, because no
+//     process from a previous boot is still running;
+//   - a claim from THIS boot is abandoned only if its pid is gone from the
+//     process table.
+//
+// EVERY UNCERTAINTY REPORTS LIVE. An unparseable message, an empty boot id on
+// either side, or a signal error that is not ESRCH all mean "cannot prove the
+// owner is gone", and the answer then must be no: recovering wrongly re-enters
+// a running finalizer, which is the failure the reviewer reproduced, while
+// declining wrongly leaves a job for an operator to retry.
+func (e Engine) implementationFinalizeClaimAbandoned(ctx context.Context, jobID string) (bool, implementationFinalizeClaimOwner, error) {
 	events, err := e.Store.ListJobEvents(ctx, jobID)
 	if err != nil {
-		return false, 0, err
+		return false, implementationFinalizeClaimOwner{}, err
 	}
-	var claimedAt time.Time
+	var owner implementationFinalizeClaimOwner
 	var found bool
 	for _, event := range events {
 		switch event.Kind {
 		case implementationFinalizeCompletedEvent:
-			// Completed: not abandoned, whatever the claim's age.
-			return false, 0, nil
-		case "implementation_finalize_claimed":
-			if at, ok := parseStoredJobTime(event.CreatedAt); ok {
-				claimedAt, found = at, true
+			// Completed: not abandoned, whatever its owner.
+			return false, implementationFinalizeClaimOwner{}, nil
+		case implementationFinalizeClaimOwnerEvent:
+			match := implementationFinalizeClaimOwnerPattern.FindStringSubmatch(strings.TrimSpace(event.Message))
+			if len(match) != 3 {
+				// An unparseable owner cannot be attributed, so it is live.
+				return false, implementationFinalizeClaimOwner{}, nil
 			}
+			pid, convErr := strconv.Atoi(match[2])
+			if convErr != nil || pid <= 0 {
+				return false, implementationFinalizeClaimOwner{}, nil
+			}
+			owner = implementationFinalizeClaimOwner{BootID: match[1], PID: pid, Message: strings.TrimSpace(event.Message)}
+			found = true
 		}
 	}
 	if !found {
-		return false, 0, nil
+		// NO OWNER ROW AT ALL, which is every claim written before this change.
+		// Live by default: a legacy claim is unattributable, and recovering it
+		// would re-enter a finalizer on no evidence.
+		return false, implementationFinalizeClaimOwner{}, nil
 	}
-	age := e.now().UTC().Sub(claimedAt)
-	return age >= implementationFinalizeClaimGrace, age, nil
+	current := db.BootID()
+	if current == "" || owner.BootID == "" {
+		// Without both boot ids the comparison is meaningless, and a pid alone
+		// can collide across boots. Unprovable, so live.
+		return false, owner, nil
+	}
+	if owner.BootID != current {
+		return true, owner, nil
+	}
+	return !processIsAlive(owner.PID), owner, nil
+}
+
+// processIsAlive reports whether pid exists, using signal 0 the way
+// stopDaemonPID already interprets ESRCH. UNKNOWN COUNTS AS ALIVE: EPERM means a
+// process exists that we may not signal, and any other error leaves the question
+// open, so both answer yes.
+func processIsAlive(pid int) bool {
+	if pid <= 0 {
+		return true
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return true
+	}
+	err = process.Signal(syscall.Signal(0))
+	if err == nil {
+		return true
+	}
+	return !(errors.Is(err, syscall.ESRCH) || errors.Is(err, os.ErrProcessDone))
 }
 
 func (e Engine) implementationFinalizeCompleted(ctx context.Context, jobID string) (bool, error) {

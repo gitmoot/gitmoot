@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -603,58 +604,66 @@ func TestFinalizedPayloadWithoutCompletionStillAdvances(t *testing.T) {
 	}
 }
 
-// #2057 ROUND SIX, P1. AN ABANDONED CLAIM MUST NOT STRAND THE JOB FOREVER. The
-// claim carries no owner, lease or generation, so a daemon that exits between
-// ClaimJobEvent and the payload write leaves ImplementationFinalized=false, a
-// claim, and no completion. Before this fix every later advance lost the claim,
-// saw no completion, and returned FinalizationInProgressError with no path out.
-func TestAbandonedFinalizeClaimIsRecoveredAfterTheGrace(t *testing.T) {
+// #2057 ROUND SEVEN, P1. A LIVE FINALIZER'S CLAIM MUST NEVER BE RECOVERED, AND
+// AGE CANNOT ESTABLISH THAT. Round six recovered any claim older than 15
+// minutes; the reviewer instrumented it and saw the winning finalizer stay live
+// while a losing advance released its claim and a third advance entered the same
+// finalizer concurrently. There is no safe constant: finalization is bounded
+// only by the job context, four hours by default and eight at most.
+//
+// Recovery is now keyed on the OWNER stamped into the claim. This test never
+// advances a clock, because the implementation no longer reads one.
+func TestLiveFinalizeClaimOwnerIsNeverRecovered(t *testing.T) {
 	ctx := context.Background()
 	engine, store := newOrderingFixture(t)
 	finalizer := &countingImplementationFinalizer{}
 	engine.ImplementationFinalizer = finalizer
 
-	insertCompletedJob(t, store, db.Job{ID: "impl-abandoned", Agent: "lead", Type: "implement"}, orderingParentPayload())
-	claimed, err := store.ClaimJobEvent(ctx, db.JobEvent{
-		JobID:   "impl-abandoned",
-		Kind:    "implementation_finalize_claimed",
-		Message: "implementation finalization claimed for impl-abandoned (#2057)",
-	})
-	if err != nil || !claimed {
-		t.Fatalf("seed claim: claimed=%v err=%v", claimed, err)
-	}
+	insertCompletedJob(t, store, db.Job{ID: "impl-live", Agent: "lead", Type: "implement"}, orderingParentPayload())
+	// A claim owned by THIS boot and THIS process: provably alive.
+	seedFinalizeClaim(t, store, "impl-live", implementationFinalizeClaimOwnerMessage("impl-live"))
 
-	// WITHIN the grace the claim is presumed live: a quiet retry, no recovery,
-	// and above all no second finalizer run beside a winner that may be working.
-	engine.Now = func() time.Time { return time.Now().UTC().Add(implementationFinalizeClaimGrace - time.Minute) }
-	if err := engine.AdvanceJob(ctx, "impl-abandoned"); !errors.As(err, &FinalizationInProgressError{}) {
-		t.Fatalf("a fresh claim must stay a retryable stop, got %v", err)
+	abandoned, owner, err := engine.implementationFinalizeClaimAbandoned(ctx, "impl-live")
+	if err != nil {
+		t.Fatalf("abandonment check: %v", err)
+	}
+	if abandoned {
+		t.Fatalf("a claim held by a LIVE process was reported abandoned (owner=%+v)", owner)
+	}
+	if err := engine.AdvanceJob(ctx, "impl-live"); !errors.As(err, &FinalizationInProgressError{}) {
+		t.Fatalf("a live claim must stay a retryable stop, got %v", err)
 	}
 	if finalizer.calls != 0 {
-		t.Fatalf("the finalizer ran %d times beside a live claim", finalizer.calls)
+		t.Fatalf("the finalizer ran %d times beside a live owner, which is the reproduced defect", finalizer.calls)
 	}
-	if recovered, _ := claimRecoveryRecorded(t, store, "impl-abandoned"); recovered {
-		t.Fatal("a claim inside its grace was recorded as recovered")
-	}
+}
 
-	// PAST the grace the claim is released and the recovery recorded, so the
-	// stop becomes bounded rather than permanent.
-	engine.Now = func() time.Time { return time.Now().UTC().Add(implementationFinalizeClaimGrace + time.Minute) }
-	if err := engine.AdvanceJob(ctx, "impl-abandoned"); !errors.As(err, &FinalizationInProgressError{}) {
+// A CLAIM FROM A PREVIOUS BOOT CANNOT HAVE A LIVE HOLDER, so it is recovered and
+// the next advance finalizes. This is the case round six was trying to serve,
+// now decided by identity instead of elapsed time.
+func TestFinalizeClaimFromAForeignBootIsRecovered(t *testing.T) {
+	ctx := context.Background()
+	engine, store := newOrderingFixture(t)
+	finalizer := &countingImplementationFinalizer{}
+	engine.ImplementationFinalizer = finalizer
+
+	insertCompletedJob(t, store, db.Job{ID: "impl-foreign", Agent: "lead", Type: "implement"}, orderingParentPayload())
+	seedFinalizeClaim(t, store, "impl-foreign", foreignOwnerMessage("impl-foreign"))
+
+	if err := engine.AdvanceJob(ctx, "impl-foreign"); !errors.As(err, &FinalizationInProgressError{}) {
 		t.Fatalf("the recovering advance must still be a retryable stop, got %v", err)
 	}
-	recovered, message := claimRecoveryRecorded(t, store, "impl-abandoned")
+	recovered, message := claimRecoveryRecorded(t, store, "impl-foreign")
 	if !recovered {
-		t.Fatal("an abandoned claim was neither released nor recorded, so the job is stranded")
+		t.Fatal("a claim from a dead boot was neither released nor recorded, so the job is stranded")
 	}
-	if !strings.Contains(message, "no completion") {
-		t.Fatalf("the recovery event does not say why it fired: %q", message)
+	if !strings.Contains(message, "is gone") || !strings.Contains(message, "424242") {
+		t.Fatalf("the recovery event does not name the owner it removed: %q", message)
 	}
 
-	// AND THE NEXT ADVANCE ACTUALLY FINALIZES, which is the property that makes
-	// the recovery worth anything: releasing without a subsequent finalize would
-	// only move the stall.
-	if err := engine.AdvanceJob(ctx, "impl-abandoned"); err != nil {
+	// THE PROPERTY THAT MAKES RECOVERY WORTH ANYTHING: the next advance actually
+	// finalizes. Releasing without a subsequent finalize would only move the stall.
+	if err := engine.AdvanceJob(ctx, "impl-foreign"); err != nil {
 		t.Fatalf("the advance after recovery must finalize, got %v", err)
 	}
 	if finalizer.calls != 1 {
@@ -662,40 +671,76 @@ func TestAbandonedFinalizeClaimIsRecoveredAfterTheGrace(t *testing.T) {
 	}
 }
 
-// An UNREADABLE claim timestamp cannot be aged, so it must read as LIVE. Stealing
-// on an unreadable clock would let one bad row re-run a finalizer immediately,
-// which is the failure the bound exists to prevent.
-func TestFinalizeClaimWithUnreadableTimestampIsNotRecovered(t *testing.T) {
+// THE ABA RACE THE REVIEWER NAMED. Two stale recoverers can both observe the old
+// claim; one releases it and a new winner acquires. The second must NOT be able
+// to release the successor's claim. It cannot, because the release is built from
+// the OBSERVED message and the successor's carries a different owner.
+func TestStaleRecovererCannotReleaseASuccessorsClaim(t *testing.T) {
+	ctx := context.Background()
+	engine, store := newOrderingFixture(t)
+	engine.ImplementationFinalizer = &countingImplementationFinalizer{}
+
+	insertCompletedJob(t, store, db.Job{ID: "impl-aba", Agent: "lead", Type: "implement"}, orderingParentPayload())
+	seedFinalizeClaim(t, store, "impl-aba", foreignOwnerMessage("impl-aba"))
+
+	// Both recoverers observe the stale claim.
+	_, firstOwner, err := engine.implementationFinalizeClaimAbandoned(ctx, "impl-aba")
+	if err != nil {
+		t.Fatalf("first observation: %v", err)
+	}
+	_, secondOwner, err := engine.implementationFinalizeClaimAbandoned(ctx, "impl-aba")
+	if err != nil {
+		t.Fatalf("second observation: %v", err)
+	}
+
+	// The first recoverer wins the OWNER token, which is the recovery right.
+	if won, err := store.ReleaseJobEventClaim(ctx, db.JobEvent{
+		JobID: "impl-aba", Kind: implementationFinalizeClaimOwnerEvent, Message: firstOwner.Message,
+	}); err != nil || !won {
+		t.Fatalf("first recoverer must win the owner token: won=%v err=%v", won, err)
+	}
+
+	// The SECOND, holding the same observed owner, must LOSE it. That is the
+	// mutual exclusion: it stops before it can touch any claim.
+	released, err := store.ReleaseJobEventClaim(ctx, db.JobEvent{
+		JobID: "impl-aba", Kind: implementationFinalizeClaimOwnerEvent, Message: secondOwner.Message,
+	})
+	if err != nil {
+		t.Fatalf("second recoverer: %v", err)
+	}
+	if released {
+		t.Fatal("two recoverers both won the owner token, so both may release a claim: the ABA race is open")
+	}
+}
+
+// AN UNATTRIBUTABLE CLAIM IS LIVE. A message that does not parse cannot be tied
+// to an owner, and recovering it would re-enter a finalizer on no evidence.
+func TestUnattributableFinalizeClaimIsNotRecovered(t *testing.T) {
 	ctx := context.Background()
 	engine, store := newOrderingFixture(t)
 	finalizer := &countingImplementationFinalizer{}
 	engine.ImplementationFinalizer = finalizer
 
-	insertCompletedJob(t, store, db.Job{ID: "impl-badclock", Agent: "lead", Type: "implement"}, orderingParentPayload())
-	if _, err := store.ClaimJobEvent(ctx, db.JobEvent{
-		JobID:   "impl-badclock",
-		Kind:    "implementation_finalize_claimed",
-		Message: "implementation finalization claimed for impl-badclock (#2057)",
-	}); err != nil {
-		t.Fatalf("seed claim: %v", err)
+	insertCompletedJob(t, store, db.Job{ID: "impl-opaque", Agent: "lead", Type: "implement"}, orderingParentPayload())
+	// A LEGACY claim: written before owner rows existed, so it has none.
+	seedFinalizeClaim(t, store, "impl-opaque", "")
+	abandoned, _, err := engine.implementationFinalizeClaimAbandoned(ctx, "impl-opaque")
+	if err != nil {
+		t.Fatalf("abandonment check: %v", err)
 	}
-	corruptJobEventTimestamp(t, store, "impl-badclock", "implementation_finalize_claimed", "not-a-time")
-
-	engine.Now = func() time.Time { return time.Now().UTC().Add(100 * implementationFinalizeClaimGrace) }
-	if err := engine.AdvanceJob(ctx, "impl-badclock"); !errors.As(err, &FinalizationInProgressError{}) {
-		t.Fatalf("an unaged claim must stay a retryable stop, got %v", err)
+	if abandoned {
+		t.Fatal("an unparseable claim was recovered, so a legacy row re-enters the finalizer")
+	}
+	if err := engine.AdvanceJob(ctx, "impl-opaque"); !errors.As(err, &FinalizationInProgressError{}) {
+		t.Fatalf("want a retryable stop, got %v", err)
 	}
 	if finalizer.calls != 0 {
-		t.Fatalf("the finalizer ran %d times on an unreadable claim clock", finalizer.calls)
-	}
-	if recovered, _ := claimRecoveryRecorded(t, store, "impl-badclock"); recovered {
-		t.Fatal("a claim with an unreadable timestamp was recovered anyway")
+		t.Fatalf("the finalizer ran %d times on an unattributable claim", finalizer.calls)
 	}
 }
 
-// A COMPLETED claim is never abandoned, whatever its age: the loser reloads the
-// finalized payload and proceeds, which is the round-five behaviour and must not
-// regress into a recovery.
+// A COMPLETED claim is never abandoned, whatever its owner: the loser reloads the
+// finalized payload and proceeds, which is round five's behaviour.
 func TestCompletedFinalizeClaimIsNeverRecovered(t *testing.T) {
 	ctx := context.Background()
 	engine, store := newOrderingFixture(t)
@@ -704,12 +749,7 @@ func TestCompletedFinalizeClaimIsNeverRecovered(t *testing.T) {
 	payload := orderingParentPayload()
 	payload.ImplementationFinalized = true
 	insertCompletedJob(t, store, db.Job{ID: "impl-done", Agent: "lead", Type: "implement"}, payload)
-	if _, err := store.ClaimJobEvent(ctx, db.JobEvent{
-		JobID: "impl-done", Kind: "implementation_finalize_claimed",
-		Message: "implementation finalization claimed for impl-done (#2057)",
-	}); err != nil {
-		t.Fatalf("seed claim: %v", err)
-	}
+	seedFinalizeClaim(t, store, "impl-done", foreignOwnerMessage("impl-done"))
 	if err := store.AddJobEvent(ctx, db.JobEvent{
 		JobID: "impl-done", Kind: implementationFinalizeCompletedEvent,
 		Message: "implementation finalization completed for impl-done (#2057)",
@@ -717,7 +757,6 @@ func TestCompletedFinalizeClaimIsNeverRecovered(t *testing.T) {
 		t.Fatalf("seed completion: %v", err)
 	}
 
-	engine.Now = func() time.Time { return time.Now().UTC().Add(100 * implementationFinalizeClaimGrace) }
 	abandoned, _, err := engine.implementationFinalizeClaimAbandoned(ctx, "impl-done")
 	if err != nil {
 		t.Fatalf("abandonment check: %v", err)
@@ -765,5 +804,152 @@ func corruptJobEventTimestamp(t *testing.T, store *db.Store, jobID, kind, value 
 	}
 	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
 		t.Fatalf("updated rows = %d err=%v, want 1", changed, err)
+	}
+}
+
+// seedFinalizeClaim writes a claim AND its owner row, which is the pair
+// production always writes together. A fixture with only one of them models a
+// state the winner cannot produce.
+func seedFinalizeClaim(t *testing.T, store *db.Store, jobID, ownerMessage string) {
+	t.Helper()
+	ctx := context.Background()
+	claimed, err := store.ClaimJobEvent(ctx, db.JobEvent{
+		JobID: jobID, Kind: implementationFinalizeClaimedEvent,
+		Message: implementationFinalizeClaimMessage(jobID),
+	})
+	if err != nil || !claimed {
+		t.Fatalf("seed claim %s: claimed=%v err=%v", jobID, claimed, err)
+	}
+	if strings.TrimSpace(ownerMessage) == "" {
+		return
+	}
+	if err := store.AddJobEvent(ctx, db.JobEvent{
+		JobID: jobID, Kind: implementationFinalizeClaimOwnerEvent, Message: ownerMessage,
+	}); err != nil {
+		t.Fatalf("seed owner %s: %v", jobID, err)
+	}
+}
+
+func foreignOwnerMessage(jobID string) string {
+	return "implementation finalization for " + jobID + " is held by boot 00000000-dead-dead-dead-000000000000 pid 424242 (#2057)"
+}
+
+// THE CLAIM MESSAGE IS A DEPLOY CONTRACT, and this pins it because round seven
+// broke it once. ClaimJobEvent's at-most-once check keys on (job, kind,
+// MESSAGE), so a claim written by an older binary must still exclude a claimer
+// running the newer one. My first attempt put the owner identity INTO the claim
+// message, and a deploy with an in-flight finalization would then have run a
+// SECOND finalizer beside the first: the exact double-execution the claim
+// exists to prevent, introduced by the fix for it.
+//
+// A pre-existing round-five test caught it. This one states it directly, so the
+// next person to reach for a richer claim message sees the cost first.
+func TestClaimMessageStaysStableAcrossABinaryChange(t *testing.T) {
+	ctx := context.Background()
+	_, store := newOrderingFixture(t)
+	insertCompletedJob(t, store, db.Job{ID: "impl-deploy", Agent: "lead", Type: "implement"}, orderingParentPayload())
+
+	// The OLD binary's claim: message with no owner in it, and no owner row.
+	seedFinalizeClaim(t, store, "impl-deploy", "")
+
+	// The NEW binary tries to claim the same finalization. It must LOSE.
+	claimed, err := store.ClaimJobEvent(ctx, db.JobEvent{
+		JobID:   "impl-deploy",
+		Kind:    implementationFinalizeClaimedEvent,
+		Message: implementationFinalizeClaimMessage("impl-deploy"),
+	})
+	if err != nil {
+		t.Fatalf("ClaimJobEvent: %v", err)
+	}
+	if claimed {
+		t.Fatal("a new binary claimed a finalization already held by an older one: two finalizers would run")
+	}
+}
+
+// A MALFORMED OWNER ROW IS LIVE, and this is a DIFFERENT case from a missing
+// one. The legacy test above has no owner row at all, so it returns before the
+// parse is ever attempted: a mutant making an unparseable owner "abandoned"
+// survived it. This fixture writes an owner row that does not match the
+// pattern, so the parse branch itself is under test.
+func TestMalformedFinalizeClaimOwnerIsNotRecovered(t *testing.T) {
+	ctx := context.Background()
+	engine, store := newOrderingFixture(t)
+	finalizer := &countingImplementationFinalizer{}
+	engine.ImplementationFinalizer = finalizer
+
+	for index, owner := range []string{
+		"implementation finalization for impl-bad is held by boot  pid  (#2057)",
+		"implementation finalization for impl-bad is held by boot abc pid notanumber (#2057)",
+		"some entirely different sentence",
+		"implementation finalization for impl-bad is held by boot abc pid -3 (#2057)",
+	} {
+		t.Run(fmt.Sprintf("case%d", index), func(t *testing.T) {
+			jobID := fmt.Sprintf("impl-bad-%d", index)
+			insertCompletedJob(t, store, db.Job{ID: jobID, Agent: "lead", Type: "implement"}, orderingParentPayload())
+			seedFinalizeClaim(t, store, jobID, strings.Replace(owner, "impl-bad", jobID, 1))
+
+			abandoned, _, err := engine.implementationFinalizeClaimAbandoned(ctx, jobID)
+			if err != nil {
+				t.Fatalf("abandonment check: %v", err)
+			}
+			if abandoned {
+				t.Fatalf("an owner row that does not parse (%q) was recovered anyway", owner)
+			}
+		})
+	}
+	if finalizer.calls != 0 {
+		t.Fatalf("the finalizer ran %d times on unparseable owner rows", finalizer.calls)
+	}
+}
+
+// TWO CONCURRENT RECOVERIES MUST PRODUCE ONE FINALIZER, and this drives the
+// ENGINE rather than the store primitive.
+//
+// The ABA test above asserts that ReleaseJobEventClaim is at-most-once, which is
+// a fact about the store. A mutant removing the engine's `if !wonRecovery` guard
+// survived it, because nothing checked that the engine CONSULTS that result.
+// This test races two advances against one abandoned claim: exactly one may win
+// the owner token and go on to release the claim, so the finalizer can run at
+// most once no matter how the two interleave.
+func TestConcurrentRecoveriesFinalizeAtMostOnce(t *testing.T) {
+	ctx := context.Background()
+	engine, store := newOrderingFixture(t)
+	finalizer := &countingImplementationFinalizer{}
+	engine.ImplementationFinalizer = finalizer
+
+	insertCompletedJob(t, store, db.Job{ID: "impl-race", Agent: "lead", Type: "implement"}, orderingParentPayload())
+	seedFinalizeClaim(t, store, "impl-race", foreignOwnerMessage("impl-race"))
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_ = engine.AdvanceJob(ctx, "impl-race")
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	// At most one recovery may have happened, so at most one finalizer call.
+	if finalizer.calls > 1 {
+		t.Fatalf("the finalizer ran %d times: two recoverers both released the claim", finalizer.calls)
+	}
+	// And exactly one recovery event, never two, because the owner token is the
+	// mutual exclusion.
+	events, err := store.ListJobEvents(ctx, "impl-race")
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	recoveries := 0
+	for _, event := range events {
+		if event.Kind == implementationFinalizeClaimRecoveredEvent {
+			recoveries++
+		}
+	}
+	if recoveries > 1 {
+		t.Fatalf("recorded %d recoveries of one claim, want at most 1", recoveries)
 	}
 }
