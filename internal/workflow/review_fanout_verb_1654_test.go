@@ -145,6 +145,45 @@ func TestSkipNativeReviewFanoutIsAnImplementControlNotAReviewOne(t *testing.T) {
 				}
 			}
 
+			// THE FIX JOB ITSELF MUST BE ASSERTED (#2055 review round 3). Reaching
+			// dispatchFixWhenHeadHasSettled is not the same as proving what it
+			// dispatched: stopping at TaskChangesRequested plus an unchanged lock
+			// left two mutants alive - deleting the dispatch call, and making
+			// dispatchFix copy the review payload's SkipNativeReviewFanout into its
+			// parentless implement request. Both are exactly the documented
+			// behaviour, so both must be pinned.
+			if tc.jobType == "review" {
+				implementJobs, listErr := store.ListJobsByType(ctx, "implement")
+				if listErr != nil {
+					t.Fatalf("ListJobsByType returned error: %v", listErr)
+				}
+				var fix *db.Job
+				for i := range implementJobs {
+					// The seeded implementer satisfies the ownership gate; the fix
+					// job is the one dispatchFix created.
+					if implementJobs[i].ID != "implement-for-"+tc.branch {
+						fix = &implementJobs[i]
+					}
+				}
+				if fix == nil {
+					t.Fatalf("no fix job was dispatched: dispatchFixWhenHeadHasSettled did not run, so this arm proves nothing about what a review dispatches")
+				}
+				var fixPayload JobPayload
+				if err := json.Unmarshal([]byte(fix.Payload), &fixPayload); err != nil {
+					t.Fatalf("Unmarshal fix payload returned error: %v", err)
+				}
+				// The documentation states dispatchFix builds a PARENTLESS implement
+				// request that does not inherit the bit. If it ever does inherit it,
+				// a review-dispatched fix would suppress native fan-out on the
+				// branch, which is precisely the effect the docs say review cannot
+				// have.
+				if fixPayload.SkipNativeReviewFanout {
+					t.Fatalf("the fix job %q inherited SkipNativeReviewFanout from the review payload. "+
+						"CLI.md and website/docs/reference/cli.md state that dispatchFix does not inherit it; "+
+						"if that changed deliberately, update both docs", fix.ID)
+				}
+			}
+
 			lock, err := store.GetBranchLock(ctx, "gitmoot/gitmoot", tc.branch)
 			if err != nil {
 				t.Fatalf("GetBranchLock returned error: %v", err)
