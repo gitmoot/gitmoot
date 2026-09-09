@@ -413,3 +413,84 @@ func mustFindingJSON(t *testing.T, m map[string]any) json.RawMessage {
 	}
 	return raw
 }
+
+// #2077 review F5 and F6, as unit properties of the helper. The brief-level
+// tests above cover the paths production uses; these pin the contract itself,
+// because both findings are about inputs no current caller produces and a
+// contract that only holds for today's callers is not a contract.
+func TestTruncateAtRuneHonoursItsContract(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		in       string
+		max      int
+		want     string
+		wantDrop int
+	}{
+		// F5: nonpositive means NOTHING fits, not "no limit". The old code
+		// returned the input unchanged and reported zero dropped.
+		{"zero max drops everything", "abc", 0, "", 3},
+		{"negative max drops everything", "abc", -1, "", 3},
+		{"exact fit is untouched", "abc", 3, "abc", 0},
+		{"cut at a rune start", "ab\u00e9", 2, "ab", 2},
+		// A single rune longer than the limit yields the empty string rather
+		// than half a rune.
+		{"one rune wider than the limit", "\u00e9", 1, "", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, dropped := truncateAtRune(tc.in, tc.max)
+			if got != tc.want || dropped != tc.wantDrop {
+				t.Fatalf("truncateAtRune(%q, %d) = (%q, %d), want (%q, %d)",
+					tc.in, tc.max, got, dropped, tc.want, tc.wantDrop)
+			}
+			if tc.max > 0 && len(got) > tc.max {
+				t.Fatalf("returned %d bytes for a %d-byte limit", len(got), tc.max)
+			}
+			if !utf8.ValidString(got) {
+				t.Fatalf("returned invalid UTF-8: %q", got)
+			}
+		})
+	}
+}
+
+// F6 end to end: invalid UTF-8 that is ALREADY IN THE STORE must not reach the
+// prompt. The earlier regression only covered corruption introduced by cutting
+// valid input, so a stored `a 0xff b` passed straight through.
+func TestObligationBriefSanitisesInvalidUTF8AlreadyInTheStore(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "g7-review", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	head := strings.Repeat("e", 40)
+	nextHead := strings.Repeat("5", 40)
+
+	// Short enough that no truncation happens: the point is that the brief is
+	// valid even when nothing is cut.
+	bad := "a\xffb concern that was stored with an invalid byte"
+
+	insertCompletedJob(t, store, db.Job{ID: "review-2077-f6", Agent: "g7-review", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", Branch: "task-f6", PullRequest: 2093, HeadSHA: head,
+		TaskID: "task-f6", ReviewRound: "review-1",
+		Result: &AgentResult{
+			Decision: "changes_requested", Severity: "P1", Summary: "invalid stored bytes",
+			Evidence: EvidenceExecuted,
+			TestsRun: []string{"go test ./internal/workflow/ -> ok"},
+			Findings: []json.RawMessage{
+				mustFindingJSON(t, map[string]any{"severity": "P2", "location": "internal/pipeline/run.go:1", "message": bad}),
+			},
+		},
+	})
+	if err := engine.AdvanceJob(ctx, "review-2077-f6"); err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
+	}
+
+	brief := engine.ledgerObligationBrief(ctx, "gitmoot/gitmoot", 2093, nextHead, "task-f6")
+	if strings.TrimSpace(brief) == "" {
+		t.Fatalf("no brief rendered")
+	}
+	if !utf8.ValidString(brief) {
+		t.Fatalf("the brief carries invalid UTF-8 inherited from the store, with no truncation involved")
+	}
+	if strings.Contains(brief, "\xff") {
+		t.Fatalf("the raw invalid byte reached the prompt")
+	}
+}
