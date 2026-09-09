@@ -27,9 +27,10 @@ func TestAdvanceJobKeepsProseFromTheThreeUnreadKeys(t *testing.T) {
 	head := strings.Repeat("c", 40)
 
 	const (
-		detailsProse = "ListJobsByType selects jobColumns, so externally_driven is carried; a narrower list would take the weaker reason."
-		messageProse = "The reaper ages a claim from the claim row's own created_at, so a resumed value does not reset the wait."
-		findingProse = "An unresolved hold is keyed by turn_id plus content_hash, so changing content on the same turn bypasses it."
+		detailsProse     = "ListJobsByType selects jobColumns, so externally_driven is carried; a narrower list would take the weaker reason."
+		messageProse     = "The reaper ages a claim from the claim row's own created_at, so a resumed value does not reset the wait."
+		findingProse     = "An unresolved hold is keyed by turn_id plus content_hash, so changing content on the same turn bypasses it."
+		descriptionProse = "Doc still states the reviewer is checked as the fallback lead, which is the exact behaviour this change removes."
 	)
 
 	insertCompletedJob(t, store, db.Job{ID: "review-2073", Agent: "g7-review", Type: "review"}, JobPayload{
@@ -47,6 +48,11 @@ func TestAdvanceJobKeepsProseFromTheThreeUnreadKeys(t *testing.T) {
 				json.RawMessage(`{"severity":"P2","location":"internal/pipeline/run.go:266","message":"` + messageProse + `"}`),
 				// {file, finding, line}: title, detail and severity all lost.
 				json.RawMessage(`{"file":"herdres_connector/source_sync.py","line":7105,"finding":"` + findingProse + `"}`),
+				// {severity, file, line, description}: the sixth shape. Measured in
+				// the ledger's lifetime, 51 of 806 finding objects carry
+				// `description` and in ALL 51 it is the only prose key, so every one
+				// recorded an empty detail.
+				json.RawMessage(`{"severity":"P2","file":"docs/local-workflow.md","line":84,"description":"` + descriptionProse + `"}`),
 			},
 		},
 	})
@@ -67,8 +73,8 @@ func TestAdvanceJobKeepsProseFromTheThreeUnreadKeys(t *testing.T) {
 	// minting a severity for it would be the invention this writer exists to
 	// avoid. The refusal is recorded rather than silent, which is the property
 	// worth pinning.
-	if len(observations) != 2 {
-		t.Fatalf("ledger holds %d row(s); want the two severity-bearing findings", len(observations))
+	if len(observations) != 3 {
+		t.Fatalf("ledger holds %d row(s); want the three severity-bearing findings", len(observations))
 	}
 
 	details := make([]string, 0, len(observations))
@@ -83,6 +89,7 @@ func TestAdvanceJobKeepsProseFromTheThreeUnreadKeys(t *testing.T) {
 	}{
 		{"details", detailsProse},
 		{"message", messageProse},
+		{"description", descriptionProse},
 	} {
 		if !strings.Contains(joined, want.prose) {
 			t.Fatalf("prose sent under %q never reached the ledger; details column held:\n%s", want.key, joined)
