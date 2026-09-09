@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -549,5 +550,96 @@ func TestTruncateAtRuneCoercesBeforeItMeasures(t *testing.T) {
 	if dropped == 0 {
 		t.Fatalf("nothing reported dropped, but this 200-byte input has 100 SEPARATED invalid runs and so coerces to 400 bytes, which cannot fit in %d. "+
 			"Note the arithmetic: growth is per invalid RUN, not per invalid byte", max)
+	}
+}
+
+// #2077 review F7. The truncation marker says "bytes of normalised text" rather
+// than "bytes on the row" because the count is measured AFTER coercion, and the
+// two differ whenever coercion changed the length. Every existing truncation
+// test asserted only strings.Contains(brief, "truncated"), so the reviewer
+// restored the disproven "bytes on the row" wording in an isolated archive of
+// this head and the whole package stayed green.
+//
+// This fixture makes the two wordings SAY DIFFERENT NUMBERS: the stored title is
+// invalid UTF-8, so coercion lengthens it, and the marker's count is then only
+// correct for the normalised text. Asserting the arithmetic pins the wording to
+// the thing that makes it true, rather than pinning the sentence.
+func TestTruncationMarkerCountsNormalisedBytesNotStoredBytes(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	head := strings.Repeat("7", 40)
+
+	// The invalid bytes must be INTERLEAVED, not contiguous: ToValidUTF8 collapses
+	// each contiguous run of invalid bytes into ONE replacement rune, so 900
+	// consecutive 0xff coerce to 3 bytes and SHORTEN the title. Interleaved, each
+	// 1-byte 0xff becomes a 3-byte U+FFFD and the coerced title is strictly
+	// longer, which is what makes a count "on the row" differ from a count of the
+	// normalised text. (This fixture caught its own author making that error.)
+	stored := strings.Repeat("a\xff", 450) + " title"
+	if utf8.ValidString(stored) {
+		t.Fatalf("fixture is valid UTF-8, so coercion cannot change its length")
+	}
+	coerced := strings.ToValidUTF8(stored, "\uFFFD")
+	if len(coerced) <= len(stored) {
+		t.Fatalf("coercion did not lengthen the title (%d -> %d), so this fixture cannot tell the two counts apart",
+			len(stored), len(coerced))
+	}
+
+	if _, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
+		Repo: "gitmoot/gitmoot", PullRequest: 2094, HeadSHA: head,
+		ObserverJob: "review-2077-f7", State: db.FindingOpen, Severity: "P2",
+		RoundLabel: "F-7", Title: stored, Detail: "a detail that is present",
+		File: "internal/workflow/findings_ledger_writer.go", Line: 756,
+		EvidenceKind: db.EvidenceExecuted, ExecutedCommands: []string{"go test ./internal/workflow/"}, ExecutedCount: 1,
+	}); err != nil {
+		t.Fatalf("RecordReviewFindingObservation returned error: %v", err)
+	}
+
+	// A finding recorded at `head` becomes an obligation when a LATER head is
+	// reviewed; asking at the same head renders an empty brief.
+	nextHead := strings.Repeat("8", 40)
+	brief := engine.ledgerObligationBrief(ctx, "gitmoot/gitmoot", 2094, nextHead, "task-2077-f7")
+	if strings.TrimSpace(brief) == "" {
+		t.Fatalf("no brief rendered, so this fixture cannot exercise the marker")
+	}
+	if !strings.Contains(brief, "truncated") {
+		t.Fatalf("nothing was truncated, so this fixture does not exercise the marker")
+	}
+
+	// The marker must report the bytes dropped from the COERCED text. The stored
+	// length is a different, larger-gap number; asserting the coerced one is what
+	// kills the "bytes on the row" wording.
+	rendered := 0
+	for _, line := range strings.Split(brief, "\n") {
+		if idx := strings.Index(line, "[truncated, "); idx >= 0 {
+			rest := line[idx+len("[truncated, "):]
+			end := strings.Index(rest, " more bytes")
+			if end < 0 {
+				t.Fatalf("marker does not carry a byte count: %q", line)
+			}
+			n, convErr := strconv.Atoi(rest[:end])
+			if convErr != nil {
+				t.Fatalf("marker byte count %q is not a number: %v", rest[:end], convErr)
+			}
+			rendered = n
+			if !strings.Contains(line, "more bytes of normalised text") {
+				t.Fatalf("marker must name the text it measured; got %q", line)
+			}
+		}
+	}
+	if rendered == 0 {
+		t.Fatalf("no truncation marker found in brief")
+	}
+
+	kept := len(coerced) - rendered
+	if kept <= 0 || kept >= len(coerced) {
+		t.Fatalf("marker reports %d dropped of a %d-byte coerced title, which is not a cut", rendered, len(coerced))
+	}
+	// The decisive assertion: the same cut measured against the STORED bytes
+	// yields a different number, so a marker claiming "bytes on the row" would be
+	// stating a figure this brief never computed.
+	if onTheRow := len(stored) - kept; onTheRow == rendered {
+		t.Fatalf("stored and coerced counts coincide (%d), so this fixture cannot discriminate the two wordings", rendered)
 	}
 }

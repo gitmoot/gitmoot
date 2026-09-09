@@ -102,11 +102,20 @@ type reviewFindingWire struct {
 	// All three are DETAIL-class. None of them feeds Title, because a title
 	// distilled from a paragraph would be invented structure, and the rule here
 	// has always been to read what reviewers write and invent nothing.
-	// A SIXTH SHAPE, measured after the first three landed (#2073). In the
-	// ledger's own lifetime 51 of 806 finding objects carry `description`, and in
-	// ALL 51 it is the ONLY prose key present, so every one recorded a row with an
-	// empty detail. It is the largest single identifiable cause of the
-	// empty-detail population, which reached 49 percent of findings in one evening.
+	// A SIXTH SHAPE (#2073). In the ledger's lifetime 51 of 814 finding objects
+	// carry `description`, and in SIXTEEN of those it is the ONLY prose key, so
+	// those sixteen recorded a row with an empty detail.
+	//
+	// THE FIRST VERSION OF THIS COMMENT SAID 51 OF 51 AND CALLED IT THE LARGEST
+	// EMPTY-DETAIL CAUSE. Both were wrong. The query behind them coalesced
+	// detail/details/body/message/finding/evidence/rationale and OMITTED `title`
+	// and `summary` - two prose keys this very reader accepts - so any finding
+	// carrying title+description counted as description-only. 35 of the 51 are
+	// that shape and recorded a detail perfectly well.
+	//
+	// The empty-detail population is dominated by TITLE-ONLY findings, where the
+	// reader worked and the verdict emitted one field; that is #2089 and is not a
+	// wire-key problem. Sixteen rows is what reading this key recovers.
 	Description string `json:"description"`
 	Details     string `json:"details"`
 	Message     string `json:"message"`
