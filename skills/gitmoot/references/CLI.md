@@ -3272,6 +3272,16 @@ rendered: an earlier revision accepted `--repo` alone, silently listed the
 `pull_request = 0` rows, and printed `no findings recorded` for a repository full
 of them.
 
+Rows are folded to the **latest observation per finding**, using the engine's own
+rule (`latestObservation`), so the listing shows current state rather than the
+append-only log. A listing that folded differently from the gate would disagree
+with it about which obligations are open.
+
+`STATE` is the last recorded observation and is not the same question as "does this
+still block": an answered finding can still be mandatory at a later head if the
+files its relevance keys name changed again. Only the merge gate decides that, and
+the command says so in its own output.
+
 The row listing exists because the **obligation brief is byte-bounded**. Once its
 budget is exhausted the brief omits mandatory UIDs and tells the reviewer to
 consult the ledger, and until this command could print rows there was no supported

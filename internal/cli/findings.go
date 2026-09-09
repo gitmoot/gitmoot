@@ -164,6 +164,21 @@ func runFindingsRows(repo string, pullRequest int, home string, jsonOutput bool,
 		return 0
 	}
 
+	// FOLD TO LATEST PER FINDING (#2086 f1). The store is APPEND-ONLY and its own
+	// doc comment says so: it returns every observation and does not fold, so a
+	// caller folds. The first version printed the raw log, one line per
+	// observation, showing a finding as "open" at an old head beside its own
+	// "answered" row at a newer one - four lines for one finding on PR #2077.
+	//
+	// That is worse than the gap it was fixing. A reviewer sent here by a
+	// budgeted brief is asking WHICH OBLIGATIONS ARE OPEN, and a stale open row
+	// answers that wrongly using the ledger's own data. I read that exact output
+	// in my own smoke test and saw history rather than a defect.
+	//
+	// The fold rule is the engine's, not a new one: latestObservation in
+	// findings_ledger.go, including its QUOTED guard.
+	rows = foldLatestObservations(rows)
+
 	if len(rows) == 0 {
 		// NAME BOTH REASONS. A reviewer sent here by a brief needs to know whether
 		// the ledger is empty or their filter missed, and those are different
@@ -198,5 +213,40 @@ func runFindingsRows(repo string, pullRequest int, home string, jsonOutput bool,
 	}
 	fmt.Fprintln(stdout)
 	fmt.Fprintln(stdout, "Cite a UID verbatim as \"continues_uid\" to continue a finding; typing its label mints a new one.")
+	// #2086 f2: STATE IS NOT THE SAME QUESTION AS "DOES THIS STILL BLOCK".
+	// LedgerObligationsAtHead can treat an ANSWERED finding as still mandatory
+	// when the files its relevance keys name were touched again after the answer.
+	// No column over the raw ledger can show that - it is a function of the head
+	// under review, not of the row - so the limit is printed rather than left for
+	// a reader to discover by trusting STATE and being wrong.
+	fmt.Fprintln(stdout, "STATE is the last recorded observation. An answered finding can still be MANDATORY at a")
+	fmt.Fprintln(stdout, "later head if the files it names changed again, which only the merge gate can decide.")
 	return 0
+}
+
+// foldLatestObservations mirrors internal/workflow's latestObservation: the last
+// observation wins per finding UID, except that a QUOTED row never displaces one
+// that already carried EXECUTED or STATIC evidence.
+//
+// Kept identical on purpose. A listing that folded by a different rule than the
+// gate would disagree with it about which obligations are open, which relocates
+// the failure this command exists to remove instead of removing it.
+func foldLatestObservations(rows []db.ReviewFindingObservation) []db.ReviewFindingObservation {
+	latest := make(map[string]db.ReviewFindingObservation, len(rows))
+	order := make([]string, 0, len(rows))
+	for _, obs := range rows {
+		previous, seen := latest[obs.FindingUID]
+		if !seen {
+			order = append(order, obs.FindingUID)
+		}
+		if seen && obs.EvidenceKind == db.EvidenceQuoted && previous.EvidenceKind != db.EvidenceQuoted {
+			continue
+		}
+		latest[obs.FindingUID] = obs
+	}
+	folded := make([]db.ReviewFindingObservation, 0, len(order))
+	for _, uid := range order {
+		folded = append(folded, latest[uid])
+	}
+	return folded
 }

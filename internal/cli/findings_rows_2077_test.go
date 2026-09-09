@@ -110,3 +110,75 @@ func TestFindingsRefusesEitherFlagAlone(t *testing.T) {
 		}
 	}
 }
+
+// #2086 f1: THE LISTING MUST SHOW CURRENT STATE, NOT THE APPEND-ONLY LOG.
+//
+// The store returns every observation and does not fold - its own doc comment
+// says a caller folds. The first version printed one line per observation, so a
+// finding appeared as "open" at an old head beside its own "answered" row at a
+// newer one. A reviewer sent here by a budgeted brief is asking WHICH
+// OBLIGATIONS ARE OPEN, and a stale open row answers that wrongly using the
+// ledger's own data - worse than the gap the command was added to close.
+func TestFindingsFoldsObservationsToCurrentState(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+
+	// A SECOND OBSERVATION OF ONE FINDING NEEDS ContinuesUID. Supplying the same
+	// FindingUID does NOT continue it - the store mints a fresh uid, which is how
+	// the first version of this fixture silently created two DIFFERENT findings
+	// and made the fold look broken when it was the fixture that was wrong.
+	record := func(head string, state db.FindingState, kind db.EvidenceKind, continues string) {
+		t.Helper()
+		obs := db.ReviewFindingObservation{
+			ContinuesUID: continues,
+			FindingUID:   "owner/repo#7-f1", Repo: "owner/repo", PullRequest: 7, HeadSHA: head,
+			ObserverJob: "local-review-" + head[:4], State: state, Severity: "P1",
+			Title: "the boundary check is inverted", File: "internal/a.go",
+			EvidenceKind: kind, ExecutedCommands: []string{"go test ./..."}, ExecutedCount: 1,
+		}
+		if kind != db.EvidenceExecuted {
+			obs.ExecutedCommands, obs.ExecutedCount = nil, 0
+			obs.Rationale = "checked by reading"
+		}
+		if _, err := store.RecordReviewFindingObservation(ctx, obs); err != nil {
+			t.Fatalf("RecordReviewFindingObservation(%s): %v", head, err)
+		}
+	}
+	record(strings.Repeat("a", 40), db.FindingOpen, db.EvidenceExecuted, "")
+	record(strings.Repeat("b", 40), db.FindingAnswered, db.EvidenceExecuted, "owner/repo#7-f1")
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"findings", "--home", home, "--repo", "owner/repo", "--pr", "7"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("findings exit = %d, stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+	if n := strings.Count(out, "owner/repo#7-f1"); n != 1 {
+		t.Fatalf("finding appears %d times, want 1; the raw observation log is not current state:\n%s", n, out)
+	}
+	if !strings.Contains(out, "answered") {
+		t.Fatalf("listing shows a state other than the latest:\n%s", out)
+	}
+	// The stale OPEN row must be gone, not merely outnumbered: its presence is
+	// what would send a reviewer to re-answer a discharged obligation.
+	if strings.Contains(out, "open") {
+		t.Fatalf("a superseded open observation survived the fold:\n%s", out)
+	}
+}
+
+// THE QUOTED GUARD, which is why the fold reuses the engine's rule rather than
+// "last row wins": a later QUOTED observation must not displace one that carried
+// real executed evidence, or a listing would report an obligation as discharged
+// on the strength of a row that discharges nothing.
+func TestFindingsFoldKeepsExecutedEvidenceOverALaterQuotedRow(t *testing.T) {
+	folded := foldLatestObservations([]db.ReviewFindingObservation{
+		{FindingUID: "u1", State: db.FindingAnswered, EvidenceKind: db.EvidenceExecuted, Title: "executed"},
+		{FindingUID: "u1", State: db.FindingOpen, EvidenceKind: db.EvidenceQuoted, Title: "quoted"},
+	})
+	if len(folded) != 1 {
+		t.Fatalf("fold produced %d rows, want 1", len(folded))
+	}
+	if folded[0].EvidenceKind != db.EvidenceExecuted {
+		t.Fatalf("a later QUOTED row displaced EXECUTED evidence; the listing would disagree with the gate")
+	}
+}
