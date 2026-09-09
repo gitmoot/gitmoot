@@ -2852,6 +2852,44 @@ system owns the merge decision, set `GITMOOT_DISABLE_NATIVE_MERGE_GATE=1`
 gate — fail-closed, it never merges gatelessly; the external gate makes the
 call.
 
+## Findings Ledger
+
+`gitmoot findings` reports the #1822 findings ledger. Two shapes:
+
+```bash
+# Per-repository summary: who is recording obligations and who is answering them.
+gitmoot findings
+gitmoot findings --json
+
+# Individual rows for one pull request, with the UIDs a reviewer must cite.
+gitmoot findings --repo owner/repo --pr 12
+gitmoot findings --repo owner/repo --pr 12 --json
+```
+
+`--repo` and `--pr` are given **together or not at all**. The store keys findings
+on `(repo, pull_request)` and a finding UID is unique only within one repository's
+pull request, so an unpaired flag cannot identify a set. It is refused rather than
+rendered: an earlier revision accepted `--repo` alone, silently listed the
+`pull_request = 0` rows, and printed `no findings recorded` for a repository full
+of them.
+
+Rows are folded to the **latest observation per finding**, using the engine's own
+rule (`latestObservation`), so the listing shows current state rather than the
+append-only log. A listing that folded differently from the gate would disagree
+with it about which obligations are open.
+
+`STATE` is the last recorded observation and is not the same question as "does this
+still block": an answered finding can still be mandatory at a later head if the
+files its relevance keys name changed again. Only the merge gate decides that, and
+the command says so in its own output.
+
+The row listing exists because the **obligation brief is byte-bounded**. Once its
+budget is exhausted the brief omits mandatory UIDs and tells the reviewer to
+consult the ledger, and until this command could print rows there was no supported
+way to do that: the summary reports counts, and a read-only review seat has no
+database access. Cite a UID verbatim as `continues_uid` to continue a finding -
+typing its label mints a new one instead.
+
 ## Result Checks
 
 After a daemon-run job's `gitmoot_result` is parsed, Gitmoot runs a set of
