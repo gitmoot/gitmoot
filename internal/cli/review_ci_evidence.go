@@ -130,8 +130,12 @@ func reviewCIEvidenceBlock(ctx context.Context, lister reviewCIEvidenceLister, r
 
 	var passed, pending, failed []string
 	for _, status := range combined.Statuses {
-		context := strings.TrimSpace(status.Context)
-		name := sanitizeCIName(context)
+		// #2051 review P1: classify the RAW Context, exactly as the gate does
+		// (merge_gate.go:2262 tests strings.HasPrefix(item.Context, ...) with no
+		// trim). Trimming first reclassified " gitmoot/x" as internal while the
+		// gate counts it as EXTERNAL CI, so a green head reported no evidence.
+		// Trimming is for the DISPLAY name only.
+		name := sanitizeCIName(strings.TrimSpace(status.Context))
 		// #1824 review F1: EVERY gitmoot/ status is internal, not external CI, and
 		// the gate treats the whole prefix that way - PolicyMergeGate blocks a
 		// pending or non-success gitmoot/* status but EXCLUDES a successful one
@@ -144,7 +148,19 @@ func reviewCIEvidenceBlock(ctx context.Context, lister reviewCIEvidenceLister, r
 		// Mirrored conjunct for conjunct: a gitmoot/ status can still make the head
 		// NOT green - refusing to relay a real block - but it can never be the
 		// evidence that makes it green.
-		if strings.HasPrefix(context, "gitmoot/") {
+		if strings.HasPrefix(status.Context, "gitmoot/") {
+			// #2051 review P1: the gate SKIPS its own context unconditionally,
+			// before any state check (merge_gate.go:2263, and again at :2290 for
+			// check runs). Its own stamp is the OUTCOME of gate evaluation, never
+			// an input to it: merge_gate_test.go:276-286 merges a head carrying
+			// gitmoot/merge-gate=failure plus a FAILURE check of the same name. It
+			// is pending for the whole time a review is open and can retain an
+			// earlier failure, so classifying it by state made dispatch report NOT
+			// green for the common case and suppressed this feature exactly when
+			// the reviewer needed it.
+			if status.Context == workflow.GitmootMergeGateContext {
+				continue
+			}
 			switch {
 			case github.StatusPending(status.State):
 				pending = append(pending, name)

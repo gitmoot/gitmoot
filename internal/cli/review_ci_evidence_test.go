@@ -267,3 +267,58 @@ func TestStatusSucceededMatchesTheGateByteExactly(t *testing.T) {
 		}
 	}
 }
+
+// #2051 review P1, THE GATE'S OWN STATUS IS NOT A CI RESULT. Input copied from
+// the gate's own merge test (merge_gate_test.go:276-286), which proves that head
+// MERGES: PolicyMergeGate skips gitmoot/merge-gate UNCONDITIONALLY, before any
+// state check, in both its status loop and its check loop. This block classified
+// the merge-gate status by state, so the gate's own pending or retained-failure
+// stamp made dispatch report NOT green for a head the gate was merging. That is
+// the common case, not an edge: the gate POSTS that status itself.
+func TestReviewCIEvidenceIgnoresTheGatesOwnStatusState(t *testing.T) {
+	for _, state := range []string{"failure", "pending", "error"} {
+		t.Run(state, func(t *testing.T) {
+			lister := &fakeCheckLister{
+				statuses: []github.CommitStatus{
+					{Context: workflow.GitmootMergeGateContext, State: state},
+				},
+				checks: []github.PullRequestCheck{
+					{Name: workflow.GitmootMergeGateContext, Bucket: "fail", State: "FAILURE"},
+					{Name: "ci", Bucket: "pass", State: "SUCCESS"},
+				},
+			}
+			block := reviewCIEvidenceBlock(context.Background(), lister, ciEvidenceRepo, ciEvidenceHead)
+			if strings.Contains(block, "NOT green") || strings.Contains(block, "Not yet established") {
+				t.Fatalf("merge-gate state %q made dispatch withhold green from a head the gate merges:\n%s", state, block)
+			}
+			// The all-green branch deliberately does not list the passing names,
+			// so the COUNT is the assertion: exactly one result survives, which
+			// proves both that the real check was kept and that the gate's own
+			// status AND its identically named FAILURE check-run were dropped.
+			if !strings.Contains(block, "1 status/check results: 1 successful, 0 pending, 0 not successful") {
+				t.Fatalf("merge-gate state %q did not leave exactly the one real check:\n%s", state, block)
+			}
+			if strings.Contains(block, workflow.GitmootMergeGateContext) {
+				t.Fatalf("merge-gate state %q named the gate's own status as CI:\n%s", state, block)
+			}
+		})
+	}
+}
+
+// #2051 review P1, second half: the gate tests the RAW Context for the gitmoot/
+// prefix, so a leading-space context is EXTERNAL CI to the gate and counts
+// toward its external total. Trimming before classification silently reclassified
+// it as internal and dropped it from the evidence, so the gate saw green external
+// CI and the prompt reported none.
+func TestReviewCIEvidenceClassifiesTheRawContextLikeTheGate(t *testing.T) {
+	lister := &fakeCheckLister{
+		statuses: []github.CommitStatus{{Context: " gitmoot/looks-internal", State: "success"}},
+	}
+	block := reviewCIEvidenceBlock(context.Background(), lister, ciEvidenceRepo, ciEvidenceHead)
+	if block == "" {
+		t.Fatal("a leading-space context is external CI to the gate; dispatch reported nothing")
+	}
+	if !strings.Contains(block, "1 successful") {
+		t.Fatalf("raw-context status was not counted as the gate counts it:\n%s", block)
+	}
+}
