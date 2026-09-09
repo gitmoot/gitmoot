@@ -65,6 +65,32 @@ func TestSkipNativeReviewFanoutIsAnImplementControlNotAReviewOne(t *testing.T) {
 				}); err != nil {
 					t.Fatalf("UpsertPullRequest returned error: %v", err)
 				}
+				if err := store.UpsertTask(ctx, db.Task{
+					ID: tc.branch, RepoFullName: "gitmoot/gitmoot", GoalID: "goal-1",
+					Title: "fanout verb", State: string(TaskReviewing), Branch: tc.branch,
+				}); err != nil {
+					t.Fatalf("UpsertTask returned error: %v", err)
+				}
+				// THE ARM MUST REACH dispatchFix, not stop at the report-only
+				// default (#2055 review round 2, F1). engine_run_budgets.go:849-861
+				// only calls dispatchFixWhenHeadHasSettled when a policy is
+				// CONFIGURED and not disabled, so without this opt-in the fixture
+				// exercised the shortest possible path through the review arm and
+				// the branch-lock assertion could pass because nothing ran.
+				if err := store.SetPullRequestAutoFixPolicy(ctx, "gitmoot/gitmoot", pr, false, "gm-findings", "test opts into the unattended chain"); err != nil {
+					t.Fatalf("SetPullRequestAutoFixPolicy returned error: %v", err)
+				}
+				// dispatchFix resolves auto-fix OWNERSHIP, and with no implement job
+				// recorded for the task it blocks on the attribution gap rather than
+				// running. Seeding the implementer is what lets the arm reach the
+				// dispatch it is meant to exercise - and reaching that gate at all is
+				// the proof the fixture now travels the real path.
+				insertCompletedJob(t, store, db.Job{ID: "implement-for-" + tc.branch, Agent: "lead", Type: "implement"}, JobPayload{
+					Repo: "gitmoot/gitmoot", Branch: tc.branch, PullRequest: pr,
+					HeadSHA: strings.Repeat("d", 40), TaskID: tc.branch, TaskTitle: "fanout verb",
+					LeadAgent: "lead",
+					Result:    &AgentResult{Decision: "implemented", Summary: "implemented"},
+				})
 			}
 			jobID := tc.jobType + "-1654"
 			insertCompletedJob(t, store, db.Job{ID: jobID, Agent: agent, Type: tc.jobType}, JobPayload{
@@ -80,9 +106,28 @@ func TestSkipNativeReviewFanoutIsAnImplementControlNotAReviewOne(t *testing.T) {
 				Result:                 &AgentResult{Decision: tc.decision, Summary: "done"},
 			})
 
-			// A review advance may legitimately return an error in this bare
-			// fixture; what is being measured is the branch lock, not the advance.
-			_ = engine.AdvanceJob(ctx, jobID)
+			// THE ERROR IS NOT DISCARDED (#2055 review round 2, F1). Swallowing it
+			// let an errored advance satisfy the branch-lock assertion for a reason
+			// that has nothing to do with the review case.
+			if err := engine.AdvanceJob(ctx, jobID); err != nil {
+				t.Fatalf("AdvanceJob returned error: %v", err)
+			}
+
+			// POSITIVE PROOF that review advancement ran, not merely the absence of
+			// one early-return event. setTaskState(TaskChangesRequested) happens
+			// inside the changes_requested arm before the auto-fix policy check, so
+			// the task's state is a marker only that path can set. Checking for the
+			// ABSENCE of advance_skipped_no_pr cannot distinguish "ran" from "took a
+			// different early return"; this can.
+			if tc.jobType == "review" {
+				task, taskErr := store.GetTask(ctx, tc.branch)
+				if taskErr != nil {
+					t.Fatalf("GetTask returned error: %v", taskErr)
+				}
+				if task.State != string(TaskChangesRequested) {
+					t.Fatalf("task state = %q, want changes_requested: the review arm did not reach the decision switch, so the branch-lock assertion below proves nothing", task.State)
+				}
+			}
 
 			// CONTROL for #2055 review F2: prove the review arm did not exit early
 			// again. advance_skipped_no_pr is the guard that used to make this arm
