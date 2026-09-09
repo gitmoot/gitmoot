@@ -597,7 +597,7 @@ const ledgerRefusalQuoteLimit = 2000
 
 // Bounds on the concern text the obligation brief quotes (#2077 review F3).
 // The text is reviewer-authored, the store caps neither its length nor the
-// number of obligations, and codex and kimi pass the whole prompt as ONE argv
+// number of obligations, and codex and claude pass the whole prompt as ONE argv
 // element against ~128 KiB MAX_ARG_STRLEN. An unbounded brief does not degrade
 // gracefully: the required review fails to exec and the merge gate then waits
 // forever for an observation that can never be produced.
@@ -647,6 +647,31 @@ func truncateAtRune(s string, max int) (string, int, bool) {
 	// hundred. Either way it can grow, so the coercion
 	// must happen before the bound is applied, or the bound stops holding on
 	// exactly the input that needed it.
+	// A NUL IS VALID UTF-8 AND IT STOPS THE REVIEW FROM STARTING (#2100 f1).
+	//
+	// ToValidUTF8 does not touch U+0000, so a finding carrying `message:
+	// "before\u0000after"` is stored, rendered into the obligation brief intact,
+	// and then handed to a runtime as an argv element. Go's
+	// syscall.SlicePtrFromStrings REJECTS an argument containing NUL, so the
+	// process never starts: one malformed finding prevents the review that would
+	// have judged it. That is a strictly worse failure than a corrupted prompt,
+	// because nothing runs to report it.
+	//
+	// The other C0 controls are replaced for the same reason in weaker form: a
+	// bare ESC or CR in a prompt corrupts terminal rendering and log capture.
+	// TAB and NEWLINE are kept - they are ordinary prose in a finding.
+	//
+	// BEFORE THE BOUND, like the coercion below and for the same reason: each
+	// replacement is 3 bytes where the control was 1, so this can only grow the
+	// string, and a bound applied first would stop holding.
+	if strings.ContainsFunc(s, isPromptHostileControl) {
+		s = strings.Map(func(r rune) rune {
+			if isPromptHostileControl(r) {
+				return '\uFFFD'
+			}
+			return r
+		}, s)
+	}
 	coerced := false
 	if !utf8.ValidString(s) {
 		// REPORTED, not just performed (#2077 review F4). A long invalid run
@@ -1104,3 +1129,16 @@ func (e Engine) recordUnboundReviewVerdict(ctx context.Context, job db.Job, payl
 // Its presence is what distinguishes a lost verdict from a review that genuinely
 // found nothing - before it, those two were the same absence.
 const unboundReviewVerdictEventKind = "review_verdict_unrecordable"
+
+// isPromptHostileControl reports whether a rune cannot safely reach a runtime as
+// part of an argv element or a captured log line.
+//
+// NUL is the load-bearing case: it is valid UTF-8, so no UTF-8 repair touches
+// it, and it makes execve reject the argument outright. TAB and NEWLINE are
+// excluded because reviewers legitimately write both inside a finding.
+func isPromptHostileControl(r rune) bool {
+	if r == '\t' || r == '\n' {
+		return false
+	}
+	return r < 0x20 || r == 0x7f
+}

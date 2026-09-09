@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
@@ -247,7 +248,7 @@ func TestObligationBriefShowsTheConcernWhenTheTitleIsEmpty(t *testing.T) {
 }
 
 // #2077 review F3. The concern text is reviewer-authored and unbounded at the
-// source, while codex and kimi pass the whole prompt as ONE argv element against
+// source, while codex and claude pass the whole prompt as ONE argv element against
 // ~128 KiB MAX_ARG_STRLEN. An oversize brief does not degrade: the required
 // review fails to exec and the gate waits forever for an observation that can
 // never arrive. So the brief must bound what it quotes, and must SAY that it
@@ -671,5 +672,67 @@ func TestTruncationMarkerCountsNormalisedBytesNotStoredBytes(t *testing.T) {
 	// brief never computed.
 	if onTheRow := len(stored) - kept; onTheRow == rendered {
 		t.Fatalf("stored and coerced counts coincide (%d), so this fixture cannot discriminate the two wordings", rendered)
+	}
+}
+
+// #2100 f1. A NUL IN A FINDING PREVENTS THE REVIEW FROM STARTING AT ALL.
+//
+// U+0000 is valid UTF-8, so every UTF-8 repair in this file passes it through.
+// The brief is handed to a runtime as an argv element, and Go's
+// syscall.SlicePtrFromStrings rejects an argument containing NUL - so one
+// malformed finding stops the process that would have judged it. That is worse
+// than a corrupted prompt: nothing runs to report the problem.
+//
+// THE ASSERTION IS THAT THE BRIEF CAN ACTUALLY BE EXECVE'D, not that a byte
+// changed. Checking for the absence of "\x00" would pass on a fix that dropped
+// the whole title, and would not notice a different control byte with the same
+// effect. exec.Cmd.Start is the consumer's own rejection path.
+func TestObligationBriefCanBePassedToARuntime(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	head := strings.Repeat("9", 40)
+	nextHead := strings.Repeat("f", 40)
+
+	hostile := "before\x00after and an escape \x1b[31m and a carriage \r return"
+	if !strings.ContainsRune(hostile, 0) {
+		t.Fatalf("fixture carries no NUL, so it cannot exercise the case")
+	}
+	if _, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
+		Repo: "gitmoot/gitmoot", PullRequest: 2100, HeadSHA: head,
+		ObserverJob: "review-2100-f1", State: db.FindingOpen, Severity: "P1",
+		RoundLabel: "f1", Title: hostile, Detail: "a detail carrying " + hostile,
+		File: "internal/workflow/findings_ledger_writer.go", Line: 1,
+		EvidenceKind: db.EvidenceExecuted, ExecutedCommands: []string{"go test ./internal/workflow/"}, ExecutedCount: 1,
+	}); err != nil {
+		t.Fatalf("RecordReviewFindingObservation returned error: %v", err)
+	}
+	// PRECONDITION: the store must have kept the NUL, or the brief is not what
+	// fixes this and the test proves nothing.
+	stored, err := store.ListReviewFindingObservations(ctx, "gitmoot/gitmoot", 2100)
+	if err != nil {
+		t.Fatalf("ListReviewFindingObservations returned error: %v", err)
+	}
+	if len(stored) != 1 || !strings.ContainsRune(stored[0].Title, 0) {
+		t.Fatalf("the store stripped the NUL on write, so the brief cannot be what fixes it: %+v", stored)
+	}
+
+	brief := engine.ledgerObligationBrief(ctx, "gitmoot/gitmoot", 2100, nextHead, "task-2100")
+	if strings.TrimSpace(brief) == "" {
+		t.Fatalf("no brief rendered, so this fixture cannot exercise the case")
+	}
+
+	// THE REAL CONSUMER'S REJECTION PATH. exec.Cmd.Start fails with
+	// "invalid argument" when any argv element contains a NUL.
+	cmd := exec.CommandContext(ctx, "/bin/true", brief)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("the obligation brief cannot be passed to a runtime as argv, so the review it belongs to would never start: %v", err)
+	}
+	_ = cmd.Wait()
+
+	// And the reviewer must be able to see that something was rewritten, rather
+	// than reading silently altered prose.
+	if !strings.Contains(brief, "\uFFFD") {
+		t.Fatalf("the hostile bytes vanished without a replacement marker; a reviewer cannot tell their text was changed:\n%s", brief)
 	}
 }
