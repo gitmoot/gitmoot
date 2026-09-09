@@ -204,6 +204,9 @@ func TestBuildOrgStatusRowsKeepsTheTurnForAnUnavailableRole(t *testing.T) {
 		if *row.LastTurn != 17 {
 			t.Fatalf("unavailable row last_turn = %d, want 17", *row.LastTurn)
 		}
+	}
+}
+
 // TestOrgTurnAgeSeparatesAStuckSeatFromABusyOne is the reading NEITHER existing
 // column produced.
 //
@@ -238,5 +241,17 @@ func TestOrgTurnAgeSeparatesAStuckSeatFromABusyOne(t *testing.T) {
 	skewed := org.RoleLiveState{State: org.StateWorking, Activity: &org.RoleActivity{Turn: 9, CompletedAt: now.Add(5 * time.Minute)}}
 	if got := orgTurnAge(skewed, now); got != "0s" {
 		t.Fatalf("clock-skewed completion rendered %q, want 0s", got)
+	}
+	// A REPORTED TURN WITH NO COMPLETION TIME MUST RENDER ABSENT, and this arm
+	// exists because the guard shipped unexercised. Mutation-tested on adoption:
+	// deleting `|| live.Activity.CompletedAt.IsZero()` from orgTurnAge SURVIVED
+	// the whole file, so a provider that reports a turn without a completion
+	// stamp would have rendered the age since the zero time - a ~2026-year
+	// duration presented as a stuck seat. An earlier note on #1702 recorded this
+	// mutant as pinned; it was not, and re-measuring on adoption is the only
+	// reason it is pinned now.
+	unstamped := org.RoleLiveState{State: org.StateWorking, Activity: &org.RoleActivity{Turn: 3}}
+	if got := orgTurnAge(unstamped, now); got != "" {
+		t.Fatalf("a turn with no completion stamp rendered %q, want the empty string", got)
 	}
 }
