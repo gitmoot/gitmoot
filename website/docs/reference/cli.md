@@ -2852,6 +2852,37 @@ system owns the merge decision, set `GITMOOT_DISABLE_NATIVE_MERGE_GATE=1`
 gate — fail-closed, it never merges gatelessly; the external gate makes the
 call.
 
+### Draining before a deploy
+
+`gitmoot daemon drain` stops the daemon claiming new work so a busy fleet can
+reach the idle window the deploy recipe requires (#1207):
+
+```bash
+gitmoot daemon drain                 # stop claiming, wait up to 15m for in-flight jobs
+gitmoot daemon drain --timeout 30m   # wait longer
+gitmoot daemon drain --clear         # resume claiming, AFTER the restart
+```
+
+**Queued work is not lost.** Draining pauses selection at the same choke point the
+disk guard uses, so queued jobs stay queued and resume when the drain clears.
+
+The command exits **0** only when no engine-dispatched job is in flight - that is
+the point at which a restart is safe. If jobs remain past the deadline it exits
+**1** and NAMES them rather than killing or parking them: a CLI cannot see the
+state of work it did not start, and terminating it is the loss drain exists to
+prevent. Drain stays active meanwhile, so the set can only shrink.
+
+Session-recorded jobs (`session-*`) are excluded from the wait. They run outside
+the daemon process, hold no lease, and may legitimately stay running for hours -
+counting them would make the drain never finish.
+
+**The drain sentinel is a file under the gitmoot home, not a database row**, so it
+still reads when the store is contended - which is exactly when a deploy is
+likely to be waiting.
+
+**`--clear` is required after the restart.** The sentinel outlives the process;
+a new daemon started while it exists will claim nothing.
+
 ## Findings Ledger
 
 `gitmoot findings` reports the #1822 findings ledger. Two shapes:

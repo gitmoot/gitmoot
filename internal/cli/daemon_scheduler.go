@@ -2071,6 +2071,28 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 	if forDispatch && !diskGuardAllowsQueuedDispatch(ctx, worker, jobs, repoFilter, rootFilter) {
 		return nil, nil
 	}
+	// #1207 (bounded half): A DRAINING DAEMON STOPS CLAIMING AND LOSES NOTHING.
+	//
+	// Placed beside the disk guard because it is the same shape and the same
+	// choke point: every scheduler, barrier and continuous-pool alike, passes
+	// through this call immediately before selecting work, and returning an empty
+	// eligible set pauses dispatch WITHOUT changing job state. Queued work stays
+	// queued and resumes by itself when drain clears.
+	//
+	// This is deliberately NOT the re-exec handoff the issue also describes. Drain
+	// makes the existing "restart at idle" precondition satisfiable by
+	// construction - an operator can stop the intake, watch in-flight work finish,
+	// and restart into a real idle window - which is the half that needs no FD
+	// preservation and no owner-scale design decision.
+	if forDispatch {
+		draining, err := daemonDrainActive(ctx, worker.Store)
+		if err != nil {
+			return nil, err
+		}
+		if draining {
+			return nil, nil
+		}
+	}
 	unavailableRows, err := worker.Store.ListActiveOrgRolesUnavailable(ctx, time.Now().UTC())
 	if err != nil {
 		return nil, err
