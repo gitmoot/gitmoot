@@ -346,6 +346,14 @@ func ompJSONString(value string) string {
 // runtime tables in adapter_test.go.
 var ompStreamOK = ompHeaderLine(ompFixtureSessionID) + ompAssistantEnd("done", 10, 5) + ompAgentEnd()
 
+// ompTestAgent is the shared argv fixture. Its policy is DANGER-FULL-ACCESS on
+// purpose: every test built on it asserts argv SHAPE - token counts, plan-mode
+// orthogonality, prompt tokenization - and yolo is the argv those assertions
+// were written against. The policy was read-only here until #1721 gave
+// --approval-mode a real mapping, at which point 19 shape assertions were
+// silently also asserting that a READ-ONLY agent runs unrestricted. The
+// mapping has its own test (TestOmpApprovalModeFollowsTheStoredPolicy); this
+// fixture must not be the place it is decided.
 func ompTestAgent() Agent {
 	return Agent{
 		Name:           "reviewer",
@@ -353,7 +361,7 @@ func ompTestAgent() Agent {
 		Runtime:        OmpRuntime,
 		RuntimeRef:     ompFixtureSessionID,
 		RepoScope:      "gitmoot/gitmoot",
-		AutonomyPolicy: AutonomyPolicyReadOnly,
+		AutonomyPolicy: AutonomyPolicyDangerFullAccess,
 	}
 }
 
@@ -3068,36 +3076,45 @@ func TestOmpSummaryIsFinalAssistantTextNotEnvelope(t *testing.T) {
 	}
 }
 
-// TestOmpPolicyArgs: every autonomy policy produces the SAME explicit
-// --approval-mode=yolo. Kills: mapping read-only onto always-ask, and dropping
-// the flag (which inherits the host's tools.approvalMode). The flag is pinned for
-// DETERMINISM, not because always-ask would break omp — that claim was measured
-// and refuted (see the ompRuntimeContract comment: read/grep succeed, only
-// bash/write are refused, exit 0 with a full agent_end). Read-only is enforced
-// Gitmoot-side, not by omp's approval tier.
+// TestOmpPolicyArgs: the approval flag is ALWAYS present and its value follows
+// the stored policy, asserted through Deliver so it is the argv the subprocess
+// actually receives rather than ompArgs in isolation.
+//
+// THIS TEST PREVIOUSLY ASSERTED THE OPPOSITE - one fixed `--approval-mode=yolo`
+// for every policy - and its stated reason was "read-only is enforced
+// Gitmoot-side, not by omp's approval tier". That reason does not hold for the
+// dispatch #1721 is about. Gitmoot-side enforcement on omp is exactly two
+// things: readOnlyImplementationBlocked, which covers IMPLEMENT jobs only, and
+// the read-only SEAT arm of wrapReadOnlyAdapterRunner, which refuses omp
+// outright ("read-only seats cannot use omp without an isolated credential
+// broker"). Neither reaches a non-seat read-only ask or review, which ran with
+// unrestricted tools. Dropping the flag entirely is still refused, because an
+// absent flag inherits the host's tools.approvalMode.
 func TestOmpPolicyArgs(t *testing.T) {
-	policies := []string{
-		AutonomyPolicyAuto,
-		AutonomyPolicyReadOnly,
-		AutonomyPolicyWorkspaceWrite,
-		AutonomyPolicyDangerFullAccess,
-	}
-	wantArgv := []string{"omp", "-p", "--mode=json", "--approval-mode=yolo", "--no-session", "--", "work"}
-	for _, policy := range policies {
-		t.Run(policy, func(t *testing.T) {
+	for _, tc := range []struct {
+		policy string
+		want   string
+	}{
+		{AutonomyPolicyAuto, "--approval-mode=yolo"},
+		{AutonomyPolicyReadOnly, "--approval-mode=always-ask"},
+		{AutonomyPolicyWorkspaceWrite, "--approval-mode=yolo"},
+		{AutonomyPolicyDangerFullAccess, "--approval-mode=yolo"},
+	} {
+		t.Run(tc.policy, func(t *testing.T) {
 			runner := &fakeRunner{results: []subprocess.Result{{Stdout: ompStreamOK}}}
 			adapter := OmpAdapter{Runner: runner, Dir: "/repo"}
 			agent := ompTestAgent()
-			agent.AutonomyPolicy = policy
+			agent.AutonomyPolicy = tc.policy
 			if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "work"}); err != nil {
 				t.Fatalf("Deliver: %v", err)
 			}
+			wantArgv := []string{"omp", "-p", "--mode=json", tc.want, "--no-session", "--", "work"}
 			if !reflect.DeepEqual(runner.calls[0], wantArgv) {
 				t.Fatalf("argv = %v, want %v", runner.calls[0], wantArgv)
 			}
 			for _, arg := range runner.calls[0] {
-				if strings.HasPrefix(arg, "--approval-mode") && arg != "--approval-mode=yolo" {
-					t.Fatalf("policy %q produced approval flag %q", policy, arg)
+				if strings.HasPrefix(arg, "--approval-mode") && arg != tc.want {
+					t.Fatalf("policy %q produced approval flag %q, want %q", tc.policy, arg, tc.want)
 				}
 			}
 		})
@@ -3726,5 +3743,72 @@ func TestOmpPlanTargetPreservesRoleAlias(t *testing.T) {
 	}
 	if result.PlanMode != "plan-into:@smol" {
 		t.Fatalf("Result.PlanMode = %q, want %q", result.PlanMode, "plan-into:@smol")
+	}
+}
+
+// TestOmpApprovalModeFollowsTheStoredPolicy is the #1721 regression. Before the
+// mapping, `ompArgs` began with a literal `--approval-mode=yolo` for EVERY
+// policy, so an agent stored read-only dispatched with unrestricted tool
+// access, and `PermissionPolicyApplication` reported not-applied for all four.
+//
+// The argv and the declaration are asserted TOGETHER because they are the two
+// halves a consumer sees: the flag is what the subprocess gets, and the
+// property is what the merge gate and the observation event read. A mapping
+// that changed one without the other would satisfy either assertion alone.
+func TestOmpApprovalModeFollowsTheStoredPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		policy       string
+		wantFlag     string
+		wantProperty PermissionPolicyApplication
+	}{
+		// The defect: read-only is the one policy whose argv changes.
+		{AutonomyPolicyReadOnly, "--approval-mode=always-ask", PermissionPolicyApplied},
+		// Full access IS yolo, so the declaration is honest at `applied`.
+		{AutonomyPolicyDangerFullAccess, "--approval-mode=yolo", PermissionPolicyApplied},
+		// yolo grants more than either of these asked for. `widened` is the
+		// only truthful declaration; `applied` would claim a confinement no
+		// argv performs, and not-applied would hide that a flag was passed.
+		{AutonomyPolicyWorkspaceWrite, "--approval-mode=yolo", PermissionPolicyWidened},
+		{AutonomyPolicyAuto, "--approval-mode=yolo", PermissionPolicyWidened},
+		// An unset policy normalizes to auto, NOT to read-only, so it must not
+		// inherit the restricted argv. This arm is what caught the mapping
+		// keying on the wrong default.
+		{"", "--approval-mode=yolo", PermissionPolicyWidened},
+	} {
+		t.Run("policy="+tc.policy, func(t *testing.T) {
+			agent := ompTestAgent()
+			agent.AutonomyPolicy = tc.policy
+
+			argv := ompArgs(agent, "", "", "", false, "", nil, "work")
+			if got := ompCountToken(argv, tc.wantFlag); got != 1 {
+				t.Fatalf("%q appears %d times, want exactly 1: %v", tc.wantFlag, got, argv)
+			}
+			// Exactly one approval flag, whatever its value: a second one would
+			// let omp's own last-wins parsing decide the policy.
+			approvals := 0
+			for _, arg := range argv {
+				if strings.HasPrefix(arg, "--approval-mode") {
+					approvals++
+				}
+			}
+			if approvals != 1 {
+				t.Fatalf("argv carries %d --approval-mode flags, want 1: %v", approvals, argv)
+			}
+			if got := (OmpAdapter{}).PermissionPolicyApplication(agent); got != tc.wantProperty {
+				t.Errorf("PermissionPolicyApplication = %q, want %q: the declaration must match the argv this policy produced", got, tc.wantProperty)
+			}
+		})
+	}
+}
+
+// TestOmpReadOnlyPolicyIsDeclaredThroughTheResolver drives the seam consumers
+// actually use. `ResolvePermissionPolicyApplication` defaults an adapter with
+// no declaration to not-applied, so an adapter that stopped implementing the
+// interface would still read as "no mapping" and this arm would catch it.
+func TestOmpReadOnlyPolicyIsDeclaredThroughTheResolver(t *testing.T) {
+	agent := ompTestAgent()
+	agent.AutonomyPolicy = AutonomyPolicyReadOnly
+	if got := ResolvePermissionPolicyApplication(OmpAdapter{}, agent); got != PermissionPolicyApplied {
+		t.Fatalf("ResolvePermissionPolicyApplication = %q, want %q", got, PermissionPolicyApplied)
 	}
 }

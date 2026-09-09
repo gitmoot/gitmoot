@@ -122,7 +122,7 @@ omp (oh-my-pi) startup and every later job run the SAME argument vector — one
 builder, so no flag can appear on one path and go missing on the other:
 
 ```sh
-omp -p --mode=json --approval-mode=yolo --no-session \
+omp -p --mode=json --approval-mode=<policy> --no-session \
     [--add-dir <path>]… [--model <M>] [--thinking <level>] [--max-time <s>] \
     [--plan-yolo [--plan-yolo-into <M>]] \
     [@<staged>/prompt.md] -- '<single prompt token>'
@@ -132,7 +132,9 @@ omp -p --mode=json --approval-mode=yolo --no-session \
 `plan_into` on the job payload), with `--plan-yolo-into` pinning the model the
 execution phase runs on. `plan_into` must be one non-flag model selector with no
 internal whitespace or control characters. It is orthogonal to
-`--approval-mode`, which stays `yolo` for every job, plan or not. `plan_into`
+`--approval-mode`, whose value comes from the agent's autonomy policy
+(`read-only` maps to `always-ask`, every other policy to `yolo`) and is
+unchanged by plan mode. `plan_into`
 without `plan`, malformed targets, and a plan request routed to any non-omp
 runtime are refused before dispatch — a plan-gated brief never silently
 degrades into an ordinary implementation. Runtime preflight requires the two
