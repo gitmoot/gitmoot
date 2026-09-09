@@ -3316,6 +3316,44 @@ way to do that: the summary reports counts, and a read-only review seat has no
 database access. Cite a UID verbatim as `continues_uid` to continue a finding -
 typing its label mints a new one instead.
 
+
+### Asking what the gate still demands
+
+`--at-head` answers a different question from the row listing, and the difference
+is the reason it exists (#2097).
+
+```bash
+gitmoot findings --repo owner/repo --pr 12 --at-head <sha>
+gitmoot findings --repo owner/repo --pr 12 --at-head <sha> --json
+```
+
+The rows above print `STATE`, the last recorded observation. `--at-head` prints
+the **obligations the merge gate would still demand at that head**, which is not
+derivable from any state column and differs in both directions:
+
+- an **open** finding recorded at an earlier head is still an obligation at a
+  later one, so filtering rows to "open at this head" reports a clean pull
+  request that the gate will refuse;
+- an **answered** finding becomes mandatory again when the diff since the answer
+  touches its relevance keys, so a state filter is blind to exactly that row.
+
+It is not a reimplementation. It calls `LedgerObligationsAtHead` through
+`LedgerResolvers.ScopeFor`, which the type documents as the only production path
+to a `LedgerScope`, built by the same constructor the review brief and the merge
+gate already share. The command therefore cannot answer differently from the
+thing that blocks.
+
+`--at-head` requires `--repo` and `--pr`: obligations are computed for one pull
+request at one head, and the refusal names that combination rather than only
+calling the input invalid.
+
+**Degradations are printed, including beside an empty list.** `LedgerScope`
+degrades rather than failing: without a changed-file resolver, answered findings
+stay advisory and simply do not appear, which under-reports. The engine records
+those as task events; this command has no task, so it prints them as
+`degraded: ...` lines. An empty obligation list and an instrument that could not
+look otherwise read identically, and the empty one reads as good news.
+
 ## Result Checks
 
 After a daemon-run job's `gitmoot_result` is parsed, Gitmoot runs a set of

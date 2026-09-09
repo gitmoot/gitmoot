@@ -12,6 +12,8 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -64,6 +66,18 @@ func runFindings(args []string, stdout, stderr io.Writer) int {
 	// was in the writer, and the missing half was here.
 	repo := fs.String("repo", "", "with --pr, list individual findings for this owner/repo instead of the per-repository summary")
 	pullRequest := fs.Int("pr", 0, "with --repo, the pull request whose findings to list")
+	// #2097: STATE IS NOT "DOES THIS STILL BLOCK", AND THE DIFFERENCE IS A HEAD.
+	//
+	// The rows this command already prints carry STATE, which is the last recorded
+	// observation. The question a merge asks is different: at THIS head, what does
+	// the gate still demand? LedgerObligationsAtHead answers it, and its answer is
+	// not derivable from any state column - an ANSWERED finding is mandatory again
+	// when the diff since the answer touches its relevance keys.
+	//
+	// So this flag does not filter the rows below. It asks the gate's own
+	// predicate, through the same LedgerResolvers the daemon and the merge gate
+	// hold, so the CLI cannot answer differently from the thing that blocks.
+	atHead := fs.String("at-head", "", "with --repo and --pr, list the obligations the merge gate would still demand at this head")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -83,6 +97,16 @@ func runFindings(args []string, stdout, stderr io.Writer) int {
 	if (strings.TrimSpace(*repo) == "") != (*pullRequest == 0) {
 		fmt.Fprintln(stderr, "findings: --repo and --pr must be given together; a finding UID is unique only within one repository's pull request")
 		return 2
+	}
+	// NAME THE ACCEPTED COMBINATION, NOT THE INVALID ONE (#2086 f3's lesson,
+	// applied to the flag this change adds). A refusal that says only "invalid"
+	// leaves the caller to guess which of four flags to move.
+	if strings.TrimSpace(*atHead) != "" && strings.TrimSpace(*repo) == "" {
+		fmt.Fprintln(stderr, "findings: --at-head requires --repo and --pr; obligations are computed for one pull request at one head")
+		return 2
+	}
+	if strings.TrimSpace(*atHead) != "" {
+		return runFindingsObligations(strings.TrimSpace(*repo), *pullRequest, strings.TrimSpace(*atHead), *home, *jsonOutput, stdout, stderr)
 	}
 	if strings.TrimSpace(*repo) != "" {
 		return runFindingsRows(strings.TrimSpace(*repo), *pullRequest, *home, *jsonOutput, stdout, stderr)
@@ -227,4 +251,129 @@ func runFindingsRows(repo string, pullRequest int, home string, jsonOutput bool,
 	fmt.Fprintln(stdout, "STATE is the last recorded observation. An answered finding can still be MANDATORY at a")
 	fmt.Fprintln(stdout, "later head if the files it names changed again, which only the merge gate can decide.")
 	return 0
+}
+
+// findingsObligation is the printable form of one obligation the merge gate
+// would still demand. It exists so --json has a stable shape that is NOT
+// db.ReviewFindingObservation: an obligation is a question about a head, and
+// serialising the row would invite a consumer to read STATE off it and reach the
+// opposite conclusion.
+type findingsObligation struct {
+	FindingUID string `json:"finding_uid"`
+	RoundLabel string `json:"round_label,omitempty"`
+	Severity   string `json:"severity"`
+	Reason     string `json:"reason"`
+}
+
+// findingsObligationsReport carries the obligations plus what could not be
+// resolved while computing them.
+//
+// DEGRADATIONS ARE PART OF THE ANSWER, NOT A LOG LINE. LedgerScope degrades
+// rather than rejecting: with no changed-file resolver, answered findings stay
+// ADVISORY and simply do not appear. That under-reports, and a caller reading an
+// empty list has no way to tell "nothing is demanded" from "the instrument could
+// not look". The engine already emits these as task events; a CLI has no task,
+// so they are collected and printed.
+type findingsObligationsReport struct {
+	Repo         string               `json:"repo"`
+	PullRequest  int                  `json:"pull_request"`
+	Head         string               `json:"head"`
+	Obligations  []findingsObligation `json:"obligations"`
+	Degradations []string             `json:"degradations,omitempty"`
+}
+
+// runFindingsObligations answers "what would the merge gate still demand at this
+// head" for one pull request (#2097).
+//
+// IT CALLS THE GATE'S OWN PREDICATE THROUGH THE GATE'S OWN CONSTRUCTOR.
+// workflow.LedgerResolvers.ScopeFor is documented as the only production path to
+// a LedgerScope, and daemonLedgerResolvers is the single place this binary builds
+// one - the same value the daemon hands to both the review brief and the merge
+// gate. Reimplementing the predicate here, or hand-building a scope, would
+// create the second convention #2097 exists to prevent: the CLI would answer a
+// question the gate does not ask.
+func runFindingsObligations(repo string, pullRequest int, head string, home string, jsonOutput bool, stdout, stderr io.Writer) int {
+	ctx := context.Background()
+	report := findingsObligationsReport{Repo: repo, PullRequest: pullRequest, Head: head, Obligations: []findingsObligation{}}
+
+	var rows []db.ReviewFindingObservation
+	var checkout string
+	if err := withStoreAndPaths(home, func(_ config.Paths, store *db.Store) error {
+		var err error
+		rows, err = store.ListReviewFindingObservations(ctx, repo, int64(pullRequest))
+		if err != nil {
+			return err
+		}
+		// A missing checkout is a DEGRADATION, not a failure: the predicate still
+		// answers for open findings, which are mandatory unconditionally.
+		checkout, err = mergeGateCheckout(ctx, store, repo, "")
+		if err != nil {
+			report.Degradations = append(report.Degradations,
+				fmt.Sprintf("no checkout for %s, so answered findings are advisory and locators are unverified: %v", repo, err))
+			checkout = ""
+		}
+		return nil
+	}); err != nil {
+		fmt.Fprintf(stderr, "findings: %v\n", err)
+		return 1
+	}
+
+	resolvers := daemonLedgerResolvers(github.NewClient(checkout), checkout, subprocess.ExecRunner{})
+	scope := resolvers.ScopeFor(repo, pullRequest, "")
+	scope.Degraded = func(note string) {
+		report.Degradations = append(report.Degradations, note)
+	}
+	for _, obligation := range workflow.LedgerObligationsAtHead(ctx, rows, head, scope) {
+		report.Obligations = append(report.Obligations, findingsObligation{
+			FindingUID: obligation.FindingUID,
+			RoundLabel: obligation.RoundLabel,
+			Severity:   obligation.Severity,
+			Reason:     obligation.Reason,
+		})
+	}
+
+	if jsonOutput {
+		encoded, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			fmt.Fprintf(stderr, "findings: %v\n", err)
+			return 1
+		}
+		fmt.Fprintln(stdout, string(encoded))
+		return 0
+	}
+
+	if len(report.Obligations) == 0 {
+		fmt.Fprintf(stdout, "no obligations for %s#%d at %s\n", repo, pullRequest, shortFindingsHead(head))
+	} else {
+		writer := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(writer, "UID\tSEV\tROUND\tREASON")
+		for _, obligation := range report.Obligations {
+			round := obligation.RoundLabel
+			if strings.TrimSpace(round) == "" {
+				round = "(unlabelled)"
+			}
+			fmt.Fprintf(writer, "%s\t%s\t%s\t%s\n", obligation.FindingUID, obligation.Severity, round, obligation.Reason)
+		}
+		if err := writer.Flush(); err != nil {
+			fmt.Fprintf(stderr, "findings: %v\n", err)
+			return 1
+		}
+	}
+	// PRINT WHAT COULD NOT BE RESOLVED, ALWAYS, INCLUDING BESIDE AN EMPTY LIST.
+	// An empty obligation list and an unresolvable instrument read identically
+	// otherwise, and the empty one reads as good news.
+	for _, note := range report.Degradations {
+		fmt.Fprintf(stdout, "degraded: %s\n", note)
+	}
+	return 0
+}
+
+// shortFindingsHead abbreviates a head for human output without hiding a value
+// that is not a sha at all.
+func shortFindingsHead(head string) string {
+	head = strings.TrimSpace(head)
+	if len(head) > 8 {
+		return head[:8]
+	}
+	return head
 }
