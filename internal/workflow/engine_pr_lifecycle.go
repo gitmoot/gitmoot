@@ -928,11 +928,29 @@ func (e Engine) recordPullRequestBaseline(ctx context.Context, event PullRequest
 // ReviewRoundRelocationThreshold is the round at which the engine starts saying
 // how many times a defect has come back (#1419).
 //
-// Three, because that is where the rule a coordinator had already written was
-// meant to fire. On the measured instance it fired at SIX, not because the rule
-// was wrong but because noticing was left to a human counting across rounds
-// while every round produced identical success signals.
-const ReviewRoundRelocationThreshold = 3
+// SIX, FROM THE DISTRIBUTION RATHER THAN FROM THE ISSUE. #1419 proposed three
+// because a coordinator had written that rule; the reviewer's P3 objected that
+// the number was issue-derived and unmeasured, and it does not survive the data.
+//
+// Round counts across all 145 gitmoot/gitmoot PRs with at least one
+// changes_requested, from the job store:
+//
+//	rounds 1: 51   2: 25   3: 16   4: 10   5: 12   6: 7   7: 4   8: 3
+//	9: 1   10: 3   then a tail at 13, 15, 16, 17, 18, 20, 22, 28, 29
+//	and one PR at FIFTY-ONE.
+//
+//	threshold 3 fires on 69 of 145 = 48%
+//	threshold 6 fires on 31 of 145 = 21%
+//
+// A warning that fires on half of everything is trained to be ignored before it
+// ever reaches the case it exists for - the same way an over-firing head warning
+// became background noise. Six sits at the visible knee: rounds 1-2 hold 76 PRs,
+// 3-5 hold 38, and six-and-above hold 31, capturing every pathological case
+// including the 51-round outlier.
+//
+// It would also have fired on NOTHING this campaign produced, and on the
+// historical cases the issue was written about.
+const ReviewRoundRelocationThreshold = 6
 
 // recordReviewRoundThreshold writes one event per review job at or past the
 // threshold, naming the count.
