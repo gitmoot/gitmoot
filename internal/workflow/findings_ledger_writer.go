@@ -755,3 +755,140 @@ func unstructuredLocatorText(locator string) string {
 	}
 	return locator
 }
+
+// reviewShapedResult reports whether a result is a review verdict regardless of
+// the job TYPE that produced it (#1962). An `agent ask` dispatched as "review
+// this PR at this head" returns exactly this shape - a review decision, usually
+// with findings - and the ledger writer never sees it because both of its call
+// sites are keyed on job.Type.
+//
+// It tests the RESULT rather than the prompt, because the prompt is not a
+// durable field and a classifier over prose is the thing #1534 forbids.
+func reviewShapedResult(result *AgentResult) bool {
+	if result == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(result.Decision)) {
+	case "changes_requested":
+		// AN OBJECTION WITH NO FINDINGS ARRAY IS STILL AN OBJECTION (#2061 review,
+		// P2, found by EXECUTING the predicate rather than reading it).
+		//
+		// Requiring findings on every arm was right for "approved" and wrong here,
+		// and the asymmetry is not a special case: review_loop.go's
+		// namedReviewFindings already promotes a changes_requested SUMMARY to a
+		// finding when the array is empty. This mirrors that rule rather than
+		// inventing a second one - the same reason the "blocked" arm matches
+		// followUpReviewScopes.
+		//
+		// The two decisions differ in what silence MEANS. An approval carrying
+		// nothing has nothing to record. A changes_requested carrying a summary is
+		// a live objection, and losing it silently is precisely the class #1962
+		// exists to close.
+		return len(result.Findings) > 0 || strings.TrimSpace(result.Summary) != ""
+	case "approved":
+		// FINDINGS ARE REQUIRED FOR AN APPROVAL (#2061 CI, three race shards and
+		// the tagged e2e). "approved" alone was treated as a review verdict, so an
+		// ORDINARY ask that returns {"decision":"approved","findings":[]} - the
+		// shape the shipped result contract puts in front of every agent, and the
+		// literal payload of runtimeOverrideShellScript - emitted
+		// review_verdict_unrecordable about work that was never a review.
+		// TestLocalExecutionBackendAllowsNonImplement caught it as an event kind
+		// absent from the main baseline.
+		//
+		// This is the same defect the reviewer's P3 named, surviving the fix I
+		// made for it: I required a review-SHAPED DECISION, and "approved" is one.
+		// The decision was never the discriminator. An ask that reviewed
+		// something SAYS WHAT IT FOUND; an ask that merely answers does not.
+		return len(result.Findings) > 0
+	case "":
+		// No decision at all: findings are the only signal that a review happened.
+		// Every arm now agrees on this, which is the point - findings are the
+		// discriminator and the decision only says which KIND of verdict it is.
+		return len(result.Findings) > 0
+	case "blocked", "failed":
+		// A REVIEWER THAT NAMED DEFECTS STILL REVIEWED (#2061 review, P2).
+		// review_loop.go's followUpReviewScopes treats exactly this - decision
+		// "blocked" WITH findings - as a real verdict, and refuses it without
+		// them. Matching that predicate here rather than inventing a second one
+		// is the point: an ask dispatched as a review that blocks after finding
+		// defects would otherwise be lost silently, which is the class #1962
+		// exists to close.
+		return len(result.Findings) > 0
+	}
+	// A DECISION THAT IS NOT A REVIEW DECISION SETTLES IT, even with findings
+	// attached (#2061 review, P3). The first version returned true on findings
+	// ALONE, so an implement job that populated Findings - which the result shape
+	// permits - would have emitted a review_verdict_unrecordable event about work
+	// that was never a review. The reviewer found that by reading the predicate
+	// rather than by running it, which is why no test caught it: every fixture I
+	// wrote used a review-shaped decision.
+	//
+	// "failed" IS HERE BECAUSE THE REVIEWER OVERTURNED MY EXCLUSION WITH EVIDENCE
+	// I ASKED FOR. I had excluded it, arguing every "failed" I could find was
+	// engine-generated. They showed it is REVIEWER-AUTHORABLE and documented as
+	// such: ResultDecisions (result.go:38) is ONE closed set validated identically
+	// for every job type, and resultContractShape - the literal prompt text
+	// delivered to every agent, prompts/contract_generated.go:10 - offers "failed"
+	// alongside "blocked" with no reviewer exclusion. An agent told it may return
+	// "failed" will, and a reviewer that did so after naming defects reviewed.
+	//
+	// The findings requirement is what keeps this safe: an engine-generated
+	// "failed" carries no findings and is still not a verdict.
+	return false
+}
+
+// recordUnboundReviewVerdict makes an unrecordable review verdict FINDABLE
+// without inventing the binding it lacks (#1962).
+//
+// It writes no ledger observation on purpose. review_finding_observations is
+// keyed by repo + pull_request + head_sha; a row missing all three answers no
+// query anyone can write, and a synthesised key would be a record asserting a
+// binding nobody established. The gap stays open here - this only stops it being
+// invisible, which is the difference between a defect someone can find and one
+// that is indistinguishable from a review that reported nothing.
+//
+// Best effort by the same reasoning as the writer's summary event: a real
+// verdict must never be discarded over an audit row.
+func (e Engine) recordUnboundReviewVerdict(ctx context.Context, job db.Job, payload JobPayload) {
+	if e.Store == nil || payload.Result == nil {
+		return
+	}
+	missing := make([]string, 0, 3)
+	if payload.PullRequest <= 0 {
+		missing = append(missing, "pull_request")
+	}
+	if strings.TrimSpace(payload.HeadSHA) == "" {
+		missing = append(missing, "head_sha")
+	}
+	if strings.TrimSpace(payload.Repo) == "" {
+		missing = append(missing, "repo")
+	}
+	if len(missing) == 0 {
+		// Bound, and still not written, because this job's type keeps it away from
+		// the writer. Naming that separately matters: it is a different defect from
+		// an unbound dispatch and it is the case #2059 must land before anyone
+		// makes writable.
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID: job.ID,
+			Kind:  unboundReviewVerdictEventKind,
+			Message: fmt.Sprintf(
+				"%s job returned a review verdict (decision %q, %d finding(s)) bound to %s#%d at %s, but only job type \"review\" reaches the #1822 ledger writer, so nothing was recorded",
+				job.Type, strings.TrimSpace(payload.Result.Decision), len(payload.Result.Findings),
+				strings.TrimSpace(payload.Repo), payload.PullRequest, strings.TrimSpace(payload.HeadSHA)),
+		})
+		return
+	}
+	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID: job.ID,
+		Kind:  unboundReviewVerdictEventKind,
+		Message: fmt.Sprintf(
+			"%s job returned a review verdict (decision %q, %d finding(s)) with no %s, so it cannot be keyed to a pull request or head and no #1822 ledger row was written; re-dispatch with --pr and --head-sha to make it recordable",
+			job.Type, strings.TrimSpace(payload.Result.Decision), len(payload.Result.Findings),
+			strings.Join(missing, " and ")),
+	})
+}
+
+// unboundReviewVerdictEventKind marks a review verdict the ledger cannot key.
+// Its presence is what distinguishes a lost verdict from a review that genuinely
+// found nothing - before it, those two were the same absence.
+const unboundReviewVerdictEventKind = "review_verdict_unrecordable"
