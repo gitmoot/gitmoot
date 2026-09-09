@@ -674,6 +674,50 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 				return completedErr
 			}
 			if !completed {
+				// #2057 round six, P1: A CLAIM WITH NO COMPLETION IS NOT PROOF THAT
+				// ANYONE IS STILL WORKING. The claim carries no owner, lease or
+				// generation, so a daemon that exits between claiming and the payload
+				// write - or one whose payload write AND release both fail - leaves
+				// ImplementationFinalized=false, a claim, and no completion. Every
+				// later advance then loses the claim, sees no completion, and returns
+				// this error FOREVER: stranded, not retried.
+				//
+				// Recovered by AGE, from the claim row's own created_at, which is the
+				// shape the pipeline auto-merge claim already uses for the same
+				// question. Under the bound this stays a quiet retry, because a live
+				// winner is the overwhelmingly likely explanation. Past it the claim
+				// is released and the recovery recorded, so the NEXT advance claims
+				// cleanly and finalizes.
+				//
+				// This accepts a possible duplicate of the finalizer's external work,
+				// which is the trade already taken on both failure paths above: a
+				// permanent stop is worse than a possible duplicate, because the
+				// duplicate is visible and recoverable and the stop is neither. The
+				// bound is what keeps it from being taken while a winner is alive.
+				abandoned, age, abandonedErr := e.implementationFinalizeClaimAbandoned(ctx, job.ID)
+				if abandonedErr != nil {
+					return abandonedErr
+				}
+				if !abandoned {
+					return FinalizationInProgressError{JobID: job.ID}
+				}
+				released, releaseErr := e.Store.ReleaseJobEventClaim(ctx, db.JobEvent{
+					JobID:   job.ID,
+					Kind:    "implementation_finalize_claimed",
+					Message: fmt.Sprintf("implementation finalization claimed for %s (#2057)", job.ID),
+				})
+				if releaseErr != nil {
+					return releaseErr
+				}
+				if released {
+					_ = e.recordEffectEvent(ctx, db.JobEvent{
+						JobID: job.ID,
+						Kind:  implementationFinalizeClaimRecoveredEvent,
+						Message: fmt.Sprintf(
+							"implementation finalization claim for %s held %s with no completion; released for retry (#2057)",
+							job.ID, age.Round(time.Second)),
+					})
+				}
 				return FinalizationInProgressError{JobID: job.ID}
 			}
 			refreshed, refreshErr := e.Store.GetJob(ctx, job.ID)
@@ -1748,6 +1792,18 @@ func (e Engine) sumRootDelegationTokens(ctx context.Context, rootID string) (int
 // before the payload write.
 const implementationFinalizeCompletedEvent = "implementation_finalize_completed"
 
+// implementationFinalizeClaimRecoveredEvent records that an abandoned
+// finalization claim was released for retry (#2057 round six).
+const implementationFinalizeClaimRecoveredEvent = "implementation_finalize_claim_recovered"
+
+// implementationFinalizeClaimGrace is how long a finalization claim may be held
+// with no completion event before a later advance treats it as abandoned and
+// releases it. It is a REFUSAL TO WAIT FOREVER, not a tuned value: it matches
+// the 15 minutes the pipeline auto-merge claim already uses for the same
+// question, and it must exceed the longest plausible finalizer run so a live
+// winner is never stolen from.
+const implementationFinalizeClaimGrace = 15 * time.Minute
+
 // FinalizationInProgressError reports that another advance holds the finalization
 // claim and has not recorded completion, so this caller cannot safely proceed:
 // the head and pull request in its payload are about to be replaced.
@@ -1761,6 +1817,39 @@ type FinalizationInProgressError struct {
 
 func (e FinalizationInProgressError) Error() string {
 	return fmt.Sprintf("implementation finalization for %s is in progress under another advance", e.JobID)
+}
+
+// implementationFinalizeClaimAbandoned reports whether the finalization claim on
+// jobID has been held past implementationFinalizeClaimGrace with no completion
+// event, and how long it has been held (#2057 round six).
+//
+// UNPARSEABLE OR MISSING TIMESTAMPS ARE NOT ABANDONMENT. A claim whose
+// created_at cannot be read cannot be aged, so it is reported as live: stealing
+// on an unreadable clock would let one bad row re-run a finalizer immediately,
+// which is the failure this bound exists to avoid.
+func (e Engine) implementationFinalizeClaimAbandoned(ctx context.Context, jobID string) (bool, time.Duration, error) {
+	events, err := e.Store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		return false, 0, err
+	}
+	var claimedAt time.Time
+	var found bool
+	for _, event := range events {
+		switch event.Kind {
+		case implementationFinalizeCompletedEvent:
+			// Completed: not abandoned, whatever the claim's age.
+			return false, 0, nil
+		case "implementation_finalize_claimed":
+			if at, ok := parseStoredJobTime(event.CreatedAt); ok {
+				claimedAt, found = at, true
+			}
+		}
+	}
+	if !found {
+		return false, 0, nil
+	}
+	age := e.now().UTC().Sub(claimedAt)
+	return age >= implementationFinalizeClaimGrace, age, nil
 }
 
 func (e Engine) implementationFinalizeCompleted(ctx context.Context, jobID string) (bool, error) {

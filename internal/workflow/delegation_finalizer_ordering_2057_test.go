@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"sync"
@@ -599,5 +600,170 @@ func TestFinalizedPayloadWithoutCompletionStillAdvances(t *testing.T) {
 	}
 	if _, err := store.GetJob(ctx, "impl-nocomp/delegation/round2-review"); err != nil {
 		t.Fatalf("delegation was not dispatched: %v", err)
+	}
+}
+
+// #2057 ROUND SIX, P1. AN ABANDONED CLAIM MUST NOT STRAND THE JOB FOREVER. The
+// claim carries no owner, lease or generation, so a daemon that exits between
+// ClaimJobEvent and the payload write leaves ImplementationFinalized=false, a
+// claim, and no completion. Before this fix every later advance lost the claim,
+// saw no completion, and returned FinalizationInProgressError with no path out.
+func TestAbandonedFinalizeClaimIsRecoveredAfterTheGrace(t *testing.T) {
+	ctx := context.Background()
+	engine, store := newOrderingFixture(t)
+	finalizer := &countingImplementationFinalizer{}
+	engine.ImplementationFinalizer = finalizer
+
+	insertCompletedJob(t, store, db.Job{ID: "impl-abandoned", Agent: "lead", Type: "implement"}, orderingParentPayload())
+	claimed, err := store.ClaimJobEvent(ctx, db.JobEvent{
+		JobID:   "impl-abandoned",
+		Kind:    "implementation_finalize_claimed",
+		Message: "implementation finalization claimed for impl-abandoned (#2057)",
+	})
+	if err != nil || !claimed {
+		t.Fatalf("seed claim: claimed=%v err=%v", claimed, err)
+	}
+
+	// WITHIN the grace the claim is presumed live: a quiet retry, no recovery,
+	// and above all no second finalizer run beside a winner that may be working.
+	engine.Now = func() time.Time { return time.Now().UTC().Add(implementationFinalizeClaimGrace - time.Minute) }
+	if err := engine.AdvanceJob(ctx, "impl-abandoned"); !errors.As(err, &FinalizationInProgressError{}) {
+		t.Fatalf("a fresh claim must stay a retryable stop, got %v", err)
+	}
+	if finalizer.calls != 0 {
+		t.Fatalf("the finalizer ran %d times beside a live claim", finalizer.calls)
+	}
+	if recovered, _ := claimRecoveryRecorded(t, store, "impl-abandoned"); recovered {
+		t.Fatal("a claim inside its grace was recorded as recovered")
+	}
+
+	// PAST the grace the claim is released and the recovery recorded, so the
+	// stop becomes bounded rather than permanent.
+	engine.Now = func() time.Time { return time.Now().UTC().Add(implementationFinalizeClaimGrace + time.Minute) }
+	if err := engine.AdvanceJob(ctx, "impl-abandoned"); !errors.As(err, &FinalizationInProgressError{}) {
+		t.Fatalf("the recovering advance must still be a retryable stop, got %v", err)
+	}
+	recovered, message := claimRecoveryRecorded(t, store, "impl-abandoned")
+	if !recovered {
+		t.Fatal("an abandoned claim was neither released nor recorded, so the job is stranded")
+	}
+	if !strings.Contains(message, "no completion") {
+		t.Fatalf("the recovery event does not say why it fired: %q", message)
+	}
+
+	// AND THE NEXT ADVANCE ACTUALLY FINALIZES, which is the property that makes
+	// the recovery worth anything: releasing without a subsequent finalize would
+	// only move the stall.
+	if err := engine.AdvanceJob(ctx, "impl-abandoned"); err != nil {
+		t.Fatalf("the advance after recovery must finalize, got %v", err)
+	}
+	if finalizer.calls != 1 {
+		t.Fatalf("the finalizer ran %d times after recovery, want exactly 1", finalizer.calls)
+	}
+}
+
+// An UNREADABLE claim timestamp cannot be aged, so it must read as LIVE. Stealing
+// on an unreadable clock would let one bad row re-run a finalizer immediately,
+// which is the failure the bound exists to prevent.
+func TestFinalizeClaimWithUnreadableTimestampIsNotRecovered(t *testing.T) {
+	ctx := context.Background()
+	engine, store := newOrderingFixture(t)
+	finalizer := &countingImplementationFinalizer{}
+	engine.ImplementationFinalizer = finalizer
+
+	insertCompletedJob(t, store, db.Job{ID: "impl-badclock", Agent: "lead", Type: "implement"}, orderingParentPayload())
+	if _, err := store.ClaimJobEvent(ctx, db.JobEvent{
+		JobID:   "impl-badclock",
+		Kind:    "implementation_finalize_claimed",
+		Message: "implementation finalization claimed for impl-badclock (#2057)",
+	}); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+	corruptJobEventTimestamp(t, store, "impl-badclock", "implementation_finalize_claimed", "not-a-time")
+
+	engine.Now = func() time.Time { return time.Now().UTC().Add(100 * implementationFinalizeClaimGrace) }
+	if err := engine.AdvanceJob(ctx, "impl-badclock"); !errors.As(err, &FinalizationInProgressError{}) {
+		t.Fatalf("an unaged claim must stay a retryable stop, got %v", err)
+	}
+	if finalizer.calls != 0 {
+		t.Fatalf("the finalizer ran %d times on an unreadable claim clock", finalizer.calls)
+	}
+	if recovered, _ := claimRecoveryRecorded(t, store, "impl-badclock"); recovered {
+		t.Fatal("a claim with an unreadable timestamp was recovered anyway")
+	}
+}
+
+// A COMPLETED claim is never abandoned, whatever its age: the loser reloads the
+// finalized payload and proceeds, which is the round-five behaviour and must not
+// regress into a recovery.
+func TestCompletedFinalizeClaimIsNeverRecovered(t *testing.T) {
+	ctx := context.Background()
+	engine, store := newOrderingFixture(t)
+	engine.ImplementationFinalizer = fakeImplementationFinalizer{err: errors.New("should not run: already completed")}
+
+	payload := orderingParentPayload()
+	payload.ImplementationFinalized = true
+	insertCompletedJob(t, store, db.Job{ID: "impl-done", Agent: "lead", Type: "implement"}, payload)
+	if _, err := store.ClaimJobEvent(ctx, db.JobEvent{
+		JobID: "impl-done", Kind: "implementation_finalize_claimed",
+		Message: "implementation finalization claimed for impl-done (#2057)",
+	}); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+	if err := store.AddJobEvent(ctx, db.JobEvent{
+		JobID: "impl-done", Kind: implementationFinalizeCompletedEvent,
+		Message: "implementation finalization completed for impl-done (#2057)",
+	}); err != nil {
+		t.Fatalf("seed completion: %v", err)
+	}
+
+	engine.Now = func() time.Time { return time.Now().UTC().Add(100 * implementationFinalizeClaimGrace) }
+	abandoned, _, err := engine.implementationFinalizeClaimAbandoned(ctx, "impl-done")
+	if err != nil {
+		t.Fatalf("abandonment check: %v", err)
+	}
+	if abandoned {
+		t.Fatal("a completed finalization was reported abandoned, which would re-run the finalizer")
+	}
+}
+
+type countingImplementationFinalizer struct {
+	calls int
+}
+
+func (f *countingImplementationFinalizer) FinalizeImplementation(_ context.Context, _ db.Job, payload JobPayload) (JobPayload, error) {
+	f.calls++
+	return payload, nil
+}
+
+func claimRecoveryRecorded(t *testing.T, store *db.Store, jobID string) (bool, string) {
+	t.Helper()
+	events, err := store.ListJobEvents(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	for _, event := range events {
+		if event.Kind == implementationFinalizeClaimRecoveredEvent {
+			return true, event.Message
+		}
+	}
+	return false, ""
+}
+
+// corruptJobEventTimestamp makes a claim's created_at unparseable, which is the
+// only way to exercise the unaged branch: the store writes a valid timestamp.
+func corruptJobEventTimestamp(t *testing.T, store *db.Store, jobID, kind, value string) {
+	t.Helper()
+	conn, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer conn.Close()
+	result, err := conn.Exec(`UPDATE job_events SET created_at = ? WHERE job_id = ? AND kind = ?`, value, jobID, kind)
+	if err != nil {
+		t.Fatalf("UPDATE job event time: %v", err)
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		t.Fatalf("updated rows = %d err=%v, want 1", changed, err)
 	}
 }
