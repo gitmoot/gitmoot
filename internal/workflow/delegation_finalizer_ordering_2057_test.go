@@ -3,7 +3,10 @@ package workflow
 import (
 	"context"
 	"errors"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 )
@@ -292,4 +295,161 @@ func TestUnreadableTaskDoesNotReadAsNeedingNoFinalizer(t *testing.T) {
 			t.Fatal("a job with no TaskID was treated as task-backed")
 		}
 	})
+}
+
+// #2057 ROUND FOUR, P1. TWO CONCURRENT ADVANCES MUST FINALIZE ONCE.
+//
+// WHY THE SEQUENTIAL TEST ABOVE IS INSUFFICIENT, stated because the next person
+// will otherwise simplify this back to it: TestFinalizedImplementationIsNot
+// FinalizedAgainOnRetry advances twice IN SEQUENCE, so the first advance has
+// already persisted ImplementationFinalized before the second one reads it. That
+// pins the RETRY case and cannot see the CLAIM case, because the window the
+// defect lives in - read false, call the finalizer, write true - is only open
+// while two callers overlap inside it. The reviewer found it by reading the code;
+// no sequential fixture can fail on it.
+//
+// The finalizer commits, pushes and opens or adopts a pull request, so a second
+// invocation is a duplicate external mutation rather than a repeated no-op.
+func TestConcurrentAdvancesFinalizeExactlyOnce(t *testing.T) {
+	ctx := context.Background()
+	engine, store := newOrderingFixture(t)
+
+	finalized := orderingParentPayload()
+	finalized.HeadSHA = orderingProducedHead
+	// The finalizer BLOCKS until both advances are inside it, which is what
+	// forces the overlap a real race only reaches occasionally.
+	gate := make(chan struct{})
+	counter := &blockingFinalizer{payload: finalized, entered: make(chan struct{}, 4), release: gate}
+	engine.ImplementationFinalizer = counter
+
+	insertCompletedJob(t, store, db.Job{ID: "impl-concurrent", Agent: "lead", Type: "implement"}, orderingParentPayload())
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := range errs {
+		wg.Add(1)
+		go func(slot int) {
+			defer wg.Done()
+			errs[slot] = engine.AdvanceJob(ctx, "impl-concurrent")
+		}(i)
+	}
+	// Let whichever advance won the claim reach the finalizer, then release it.
+	// The loser must never arrive, so waiting for ONE entry is the assertion.
+	select {
+	case <-counter.entered:
+	case <-time.After(10 * time.Second):
+		close(gate)
+		wg.Wait()
+		t.Fatal("no advance reached the finalizer")
+	}
+	close(gate)
+	wg.Wait()
+
+	if got := counter.calls(); got != 1 {
+		t.Fatalf("FinalizeImplementation ran %d times across two concurrent advances, want exactly 1: it commits, pushes and opens a pull request", got)
+	}
+	// A SEPARATE, PRE-EXISTING RACE SURFACES HERE AND IS NOT THIS TEST'S SUBJECT:
+	// once both advances are past the finalizer they both try to enqueue the same
+	// delegation child, and the loser fails on the jobs.id UNIQUE constraint. That
+	// is not caused by the claim - without it BOTH callers would still reach the
+	// enqueue - and one caller losing a uniqueness race is a survivable outcome
+	// rather than a corruption.
+	//
+	// It is tolerated NARROWLY, by cause, so this test cannot silently pass on a
+	// different error. Reported separately rather than pinned as desirable.
+	for slot, err := range errs {
+		if err == nil {
+			continue
+		}
+		if strings.Contains(err.Error(), "UNIQUE constraint failed: jobs.id") ||
+			strings.Contains(err.Error(), "job id already exists") {
+			continue
+		}
+		t.Fatalf("advance %d returned an unexpected error: %v", slot, err)
+	}
+}
+
+type blockingFinalizer struct {
+	payload JobPayload
+	entered chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	n       int
+}
+
+func (b *blockingFinalizer) FinalizeImplementation(context.Context, db.Job, JobPayload) (JobPayload, error) {
+	b.mu.Lock()
+	b.n++
+	b.mu.Unlock()
+	b.entered <- struct{}{}
+	<-b.release
+	return b.payload, nil
+}
+
+func (b *blockingFinalizer) calls() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.n
+}
+
+// #2057 ROUND FOUR. A FAILED FINALIZER MUST NOT STRAND FINALIZATION. Claiming
+// before the call makes the success path safe; if the claim were kept after a
+// FAILURE, the next advance would see it taken, skip the finalizer, and the work
+// would never be committed or pushed - a transient error becoming permanent.
+//
+// This test exists because a mutant that keeps the claim on failure survived
+// every other test in this file: nothing retried after a failure and then
+// checked that finalization could still happen.
+func TestFailedFinalizerCanBeRetried(t *testing.T) {
+	ctx := context.Background()
+	engine, store := newOrderingFixture(t)
+
+	finalized := orderingParentPayload()
+	finalized.HeadSHA = orderingProducedHead
+	flaky := &flakyFinalizer{payload: finalized, failFirst: true}
+	engine.ImplementationFinalizer = flaky
+
+	insertCompletedJob(t, store, db.Job{ID: "impl-flaky", Agent: "lead", Type: "implement"}, orderingParentPayload())
+
+	if err := engine.AdvanceJob(ctx, "impl-flaky"); err == nil {
+		t.Fatal("the first advance must surface the finalizer failure")
+	}
+	if flaky.calls != 1 {
+		t.Fatalf("first advance called the finalizer %d times, want 1", flaky.calls)
+	}
+
+	// The retry must be able to finalize. With the claim kept after a failure it
+	// cannot, and the implementation is stranded uncommitted.
+	if err := engine.AdvanceJob(ctx, "impl-flaky"); err != nil {
+		t.Fatalf("retry after a failed finalizer: %v", err)
+	}
+	if flaky.calls != 2 {
+		t.Fatalf("the finalizer ran %d times, want 2: a transient failure stranded finalization permanently", flaky.calls)
+	}
+
+	row, err := store.GetJob(ctx, "impl-flaky")
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	stored, err := unmarshalPayload(row.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload: %v", err)
+	}
+	if !stored.ImplementationFinalized {
+		t.Fatal("the successful retry did not record the finalized marker")
+	}
+}
+
+type flakyFinalizer struct {
+	payload   JobPayload
+	failFirst bool
+	calls     int
+}
+
+func (f *flakyFinalizer) FinalizeImplementation(context.Context, db.Job, JobPayload) (JobPayload, error) {
+	f.calls++
+	if f.failFirst && f.calls == 1 {
+		return JobPayload{}, errors.New("push implementation branch failed")
+	}
+	return f.payload, nil
 }

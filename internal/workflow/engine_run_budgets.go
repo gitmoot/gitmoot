@@ -560,7 +560,19 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	// leg that *triggered* the integration would not yet be on its branch and its
 	// work would be missing from the merge. The task/PR finalizer path commits its
 	// own way, so this only covers PR-less delegation legs; it is a no-op otherwise.
-	if job.Type == "implement" && payload.Result.Decision == "implemented" && !e.implementationNeedsFinalizer(ctx, payload) {
+	// #2057 round four, P1: ONE ELIGIBILITY DECISION PER ADVANCE. It used to be
+	// read independently at three sites, from a task lookup that can fail at each
+	// one, so a transient failure at the first read (mapping to true, skipping
+	// commitDelegationLeg) followed by a recovery to sql.ErrNoRows at the next
+	// (mapping to false, skipping the finalizer) let the parent DAG and the
+	// delegations advance with NEITHER having run. The inverse order - false, then
+	// true - permitted dispatch before a late finalization.
+	//
+	// Computed once here, before the first consumer, and threaded. A single read
+	// can still fail, and it fails closed as before; what it can no longer do is
+	// disagree with itself inside one advance.
+	needsFinalizer := job.Type == "implement" && e.implementationNeedsFinalizer(ctx, payload)
+	if job.Type == "implement" && payload.Result.Decision == "implemented" && !needsFinalizer {
 		if err := e.commitDelegationLeg(ctx, job, payload); err != nil {
 			return err
 		}
@@ -616,21 +628,68 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	// it rather than re-deriving it.
 	finalizedBeforeDelegations := payload.ImplementationFinalized
 	if job.Type == "implement" && payload.Result != nil && payload.Result.Decision == "implemented" &&
-		!payload.ImplementationFinalized && e.implementationNeedsFinalizer(ctx, payload) {
-		finalized, err := e.ImplementationFinalizer.FinalizeImplementation(ctx, job, payload)
-		if err != nil {
-			return err
+		!payload.ImplementationFinalized && needsFinalizer {
+		// #2057 round four, P1: THE FINALIZATION IS CLAIMED BEFORE IT RUNS.
+		// payload.ImplementationFinalized alone left an unclaimed
+		// read-then-finalize-then-write window: two concurrent AdvanceJob callers
+		// could both load false and both invoke FinalizeImplementation, which
+		// commits, pushes and opens or adopts a pull request - so the second one
+		// is a duplicate external mutation, not a repeated no-op. And a crash or
+		// UpdateJobPayload failure after the finalizer SUCCEEDED left false
+		// durable, so the next retry finalized again.
+		//
+		// ClaimJobEvent is the same at-most-once primitive the pipeline auto-merge
+		// gate uses for its own external write: the NOT EXISTS guard and the
+		// insert share one statement, so there is no check-then-act window. The
+		// claim, not the payload flag, is what makes the success path safe - it
+		// survives a crash before the payload write, which the flag by definition
+		// cannot.
+		claimed, claimErr := e.Store.ClaimJobEvent(ctx, db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "implementation_finalize_claimed",
+			Message: fmt.Sprintf("implementation finalization claimed for %s (#2057)", job.ID),
+		})
+		if claimErr != nil {
+			return claimErr
 		}
-		finalized.ImplementationFinalized = true
-		encoded, err := marshalPayload(finalized)
-		if err != nil {
-			return err
+		if !claimed {
+			// Someone else owns this finalization, or a previous advance already
+			// completed it and crashed before persisting the flag. Either way this
+			// caller must not finalize; treating the claim as the durable record is
+			// the whole point of taking it.
+			finalizedBeforeDelegations = true
+		} else {
+			finalized, err := e.ImplementationFinalizer.FinalizeImplementation(ctx, job, payload)
+			if err != nil {
+				// RELEASED ON FAILURE, and the scope of that is stated because it is
+				// the one thing this fix does NOT make safe. A failed finalizer may
+				// have committed or pushed before failing, so a retry can repeat part
+				// of its work - which is exactly what happens TODAY, with no claim at
+				// all. Releasing is therefore no worse than current behaviour on the
+				// failure path, while the success path becomes strictly safe. Making a
+				// FAILED finalizer idempotent is a separate problem and is not
+				// attempted here.
+				_, releaseErr := e.Store.ReleaseJobEventClaim(ctx, db.JobEvent{
+					JobID:   job.ID,
+					Kind:    "implementation_finalize_claimed",
+					Message: fmt.Sprintf("implementation finalization claimed for %s (#2057)", job.ID),
+				})
+				if releaseErr != nil {
+					return errors.Join(err, releaseErr)
+				}
+				return err
+			}
+			finalized.ImplementationFinalized = true
+			encoded, err := marshalPayload(finalized)
+			if err != nil {
+				return err
+			}
+			if err := e.Store.UpdateJobPayload(ctx, job.ID, encoded); err != nil {
+				return err
+			}
+			payload = finalized
+			finalizedBeforeDelegations = true
 		}
-		if err := e.Store.UpdateJobPayload(ctx, job.ID, encoded); err != nil {
-			return err
-		}
-		payload = finalized
-		finalizedBeforeDelegations = true
 	}
 
 	// When a delegated child job finishes, advance its parent's delegation DAG
@@ -769,7 +828,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		// true here, because every consumer below asks "was this implementation
 		// finalized", never "was it finalized at this line".
 		finalizerRan := finalizedBeforeDelegations || payload.ImplementationFinalized
-		if !finalizerRan && e.implementationNeedsFinalizer(ctx, payload) {
+		if !finalizerRan && needsFinalizer {
 			finalizerRan = true
 			finalized, err := e.ImplementationFinalizer.FinalizeImplementation(ctx, job, payload)
 			if err != nil {
