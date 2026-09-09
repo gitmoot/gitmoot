@@ -2,11 +2,13 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -236,94 +238,92 @@ func TestReviewDispatchBindsThePromptsTargetToTheDispatchHead(t *testing.T) {
 // negative result from an input that cannot express the defect is not evidence.
 func TestUnjudgedTokenCannotRetainAnotherCitationsWarning(t *testing.T) {
 	ctx := context.Background()
-	scanCheckout, _, ancestor, head, foreign := promptHeadBindingCheckout(t)
+	canonical, _, ancestor, head, foreign := promptHeadBindingCheckout(t)
 	store, _ := blockerE2EHome(t)
 
-	// TWO CLIENTS, BECAUSE PRODUCTION PASSES TWO. agent_dispatch.go hands the
-	// SCAN a client rooted at the allocated exact-head worktree and the FILTER a
-	// client rooted at record.CheckoutPath - the canonical checkout. An earlier
-	// version of this test passed ONE client to both, so it could not detect any
-	// defect arising from their divergence, INCLUDING the divergence I had
-	// already flagged as a hazard before writing it.
+	// TWO CLIENTS, BUILT THE WAY PRODUCTION BUILDS THEM. agent_dispatch.go hands
+	// the SCAN a client rooted at the ALLOCATED exact-head worktree and the FILTER
+	// a client rooted at record.CheckoutPath - the canonical checkout - and the
+	// allocation is a `git worktree add --detach` FROM that canonical checkout.
+	// An earlier version of this test passed ONE client to both and so could not
+	// detect any defect arising from their divergence.
+	//
+	// A LATER VERSION OVERCORRECTED, and review caught it: it built the filter's
+	// client as an INDEPENDENT repository so the sibling commit was unresolvable
+	// there, and then made that unresolvability load-bearing. Production cannot
+	// be in that state. A linked worktree shares the canonical object database
+	// and refs, so if the scan resolves an object the filter resolves it too.
+	// A fixture that models an impossible state teaches a false model of
+	// production, so the split is gone and the shared store is asserted below.
+	scanCheckout := linkedWorktreeAtHead(t, canonical, head)
 	scan := jobGitClient(scanCheckout, subprocess.ExecRunner{})
-	filterCheckout := canonicalCheckoutMissingSiblingBranch(t, scanCheckout)
-	filter := jobGitClient(filterCheckout, subprocess.ExecRunner{})
+	filter := jobGitClient(canonical, subprocess.ExecRunner{})
 
-	// THE DIVERGENCE HAS TO BE LOAD-BEARING AND NOT VACUOUS. If the filter's
-	// checkout cannot resolve the DISPATCH HEAD, classifyPromptCommitCitations
-	// returns nil on its head guard, the filter returns nil, and every assertion
-	// below passes for the wrong reason. So the canonical clone carries the
-	// review branch - head and its ancestors resolve there - and lacks only the
-	// SIBLING branch, which is the one citation the two clients disagree about.
-	if _, err := filter.RevParse(ctx, head+"^{commit}"); err != nil {
-		t.Fatalf("filter checkout cannot resolve the dispatch head, so the filter would refuse for the wrong reason: %v", err)
-	}
-	if _, err := filter.RevParse(ctx, foreign+"^{commit}"); err == nil {
-		t.Fatalf("filter checkout resolves the sibling commit %s, so the two clients do not diverge and this test is back to one seam", foreign)
-	}
-	if _, err := scan.RevParse(ctx, foreign+"^{commit}"); err != nil {
-		t.Fatalf("scan checkout cannot resolve the sibling commit %s, so no warning about it is produced: %v", foreign, err)
+	// The shared store is the production property, so it is a POSITIVE CONTROL
+	// rather than an assumption: both clients resolve the head and the sibling.
+	for name, client := range map[string]gitutil.Client{"scan": scan, "filter": filter} {
+		for _, ref := range []string{head, foreign, ancestor} {
+			if _, err := client.RevParse(ctx, ref+"^{commit}"); err != nil {
+				t.Fatalf("%s client cannot resolve %s, so the two clients do not share one object store as production's pair does: %v", name, ref, err)
+			}
+		}
 	}
 
-	// THE STRAY TOKEN MUST STAY, and its absence is a defect I introduced while
-	// widening this fixture: a 7-hex run lifted from the MIDDLE of the dispatch
-	// head is the ONLY input that expresses the leak, because the leak fired
-	// when an unjudged token occurred inside the dispatch-head text that every
-	// warning carries. Replacing it with the sibling sha removed the defect from
-	// the input and both mutants survived - a negative result from an input that
-	// cannot express the defect, committed while fixing exactly that error.
+	// THE STRAY TOKEN IS THE ONLY INPUT THAT EXPRESSES THE LEAK: a 7-hex run
+	// lifted from the MIDDLE of the dispatch head, which nothing resolves. The
+	// leak fired when an unjudged token occurred inside the dispatch-head text
+	// that every warning carries. Replacing it with the sibling sha removed the
+	// defect from the input and both mutants survived - a negative result from an
+	// input that cannot express the defect.
 	stray := head[8:15]
+	// FAIL, NEVER SKIP. This used to t.Skipf, which silently withdraws the whole
+	// regression the one time the fixture stops expressing the defect - a skip is
+	// indistinguishable from coverage in every report anyone reads.
 	if _, err := scan.RevParse(ctx, stray+"^{commit}"); err == nil {
-		t.Skipf("fixture stray token %q unexpectedly resolves", stray)
+		t.Fatalf("fixture stray token %q resolves, so it cannot be unjudged and this test cannot express the leak", stray)
 	}
 
-	// The prompt cites an ANCESTOR of the dispatch head, whose warning the
-	// filter must drop; the SIBLING commit, which the filter's checkout cannot
-	// resolve and therefore cannot judge; and the STRAY run, which nothing
-	// resolves in either checkout.
 	prompt := "review " + ancestor + " and also " + foreign + " and " + stray
+	// The stray's PRESENCE IN THE PROMPT is the precondition, and deleting it
+	// from the prompt used to pass while making the leak mutant survive.
+	if !strings.Contains(prompt, stray) {
+		t.Fatalf("prompt %q lost the stray token %q, so nothing lands in the unjudged set", prompt, stray)
+	}
 
 	warnings := dispatchPromptHeadContradictionWarnings(ctx, scan, prompt, head)
 	if len(warnings) < 2 {
-		t.Fatalf("scan produced %d warnings, want both citations warned before filtering: %v", len(warnings), warnings)
+		t.Fatalf("scan produced %d warnings, want both resolvable citations warned before filtering: %v", len(warnings), warnings)
 	}
-	kept := retainUnjudgedPromptHeadWarnings(ctx, filter, store, prompt, head, "owner/repo", 12, warnings)
 
-	// The unjudged set must be NON-EMPTY, or the leak has nothing to fire on and
-	// a clean result proves nothing - the same vacuity that let an earlier hand
-	// probe of mine return KEPT=0 against a prompt with no stray token.
-	var keptForeign bool
-	for _, warning := range kept {
-		if strings.Contains(warning, foreign) {
-			keptForeign = true
-		}
-		if strings.Contains(warning, ancestor) {
-			t.Fatalf("an unjudged citation retained the ANCESTOR citation's warning: %q\nkept=%v", warning, kept)
-		}
+	kept := retainUnjudgedPromptHeadWarnings(ctx, filter, store, prompt, head, "owner/repo", 12, warnings)
+	// NOTHING MAY BE KEPT. The ancestor is judged, the sibling resolves and is no
+	// recorded head, and the stray has no warning of its own - so no warning here
+	// is about an unjudged citation. The leak retained them anyway, because the
+	// stray occurs inside the dispatch-head text every warning repeats.
+	if len(kept) != 0 {
+		t.Fatalf("an unjudged token retained %d warning(s) that are not about it: %v", len(kept), kept)
 	}
-	if !keptForeign {
-		t.Fatalf("the unresolvable sibling citation was not retained, so nothing was unjudged and the drop above is vacuous: kept=%v", kept)
+
+	// POSITIVE CONTROL FOR THAT EMPTY RESULT, because retainUnjudged returns nil
+	// when the unjudged set is EMPTY and that nil is indistinguishable from the
+	// decision above. The same call keeps a warning that really is about the
+	// stray, which proves the stray reached the unjudged set.
+	control := retainUnjudgedPromptHeadWarnings(ctx, filter, store, prompt, head, "owner/repo", 12,
+		[]string{fmt.Sprintf(promptHeadWarningFormat, stray, head, head)})
+	if len(control) != 1 {
+		t.Fatalf("control kept %d warnings, want the stray's own warning retained; the empty result above would then be vacuous: %v", len(control), control)
 	}
 }
 
-// canonicalCheckoutMissingSiblingBranch clones the review branch ALONE, so the
-// clone resolves the dispatch head and its ancestors but not the sibling
-// pull request's commit. That asymmetry is what production has and what a
-// single-client fixture cannot represent.
-func canonicalCheckoutMissingSiblingBranch(t *testing.T, source string) string {
+// linkedWorktreeAtHead mirrors how production allocates the scan client's
+// checkout: `git worktree add --detach` from the canonical checkout, so the two
+// clients share one object database and one set of refs. Verified on this host:
+// a detached linked worktree and its canonical checkout report the same
+// --git-common-dir and both resolve every object the other can.
+func linkedWorktreeAtHead(t *testing.T, canonical string, head string) string {
 	t.Helper()
-	dir := filepath.Join(t.TempDir(), "canonical")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("create canonical checkout dir: %v", err)
-	}
-	// FETCH ONE REF RATHER THAN CLONE. A local clone copies the whole object
-	// store even with --single-branch --no-hardlinks, so the sibling commit
-	// remains resolvable and the two clients do not actually diverge - the
-	// guard in the caller caught exactly that. A fetch transfers only what is
-	// reachable from the named ref.
-	runGit(t, dir, "init", "--quiet")
-	runGit(t, dir, "fetch", "--quiet", "--no-tags", source, "refs/heads/feature/review:refs/heads/feature/review")
-	runGit(t, dir, "checkout", "--quiet", "feature/review")
+	dir := filepath.Join(t.TempDir(), "readonly-seat")
+	runGit(t, canonical, "worktree", "add", "--detach", dir, head)
 	return dir
 }
 
