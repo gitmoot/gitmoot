@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
 	"strconv"
 	"strings"
 	"testing"
@@ -122,4 +123,80 @@ func TestRoundsPastTheThresholdKeepWarning(t *testing.T) {
 	if events := roundThresholdEvents(t, store, ids[3]); len(events) != 1 {
 		t.Fatalf("round 4 emitted %d warnings, want 1; the threshold is a floor, not a one-shot", len(events))
 	}
+}
+
+// #2087 review, P1: THE HIGH-RISK PATH RETURNED BEFORE THE RECORDER.
+//
+// dispatchHighRiskReview is entered when risk tiers are enabled and the tier is
+// HIGH, and it returns before the native reviewer loop - so the lens fan-out,
+// which is the path a HARD problem takes, was the one path that never said how
+// many rounds it had taken. The reviewer found it by driving four rounds of one
+// relocating finding through it and scanning every job for the event.
+//
+// That is the worst possible place for this gap: a PR that keeps relocating a
+// defect is exactly a PR likely to be classified high risk.
+func TestHighRiskReviewAlsoWarnsPastTheThreshold(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "sec", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	engine.RiskTiersEnabled = true
+	engine.ReviewChangedFiles = func(_ context.Context, _ string, _ int, _ string, _ string) ([]string, error) {
+		return []string{"internal/auth/session.go"}, nil
+	}
+
+	// FOUR REAL ROUNDS THROUGH THE PRODUCTION PATH, not a direct call to the
+	// recorder. An earlier draft of this test invoked recordReviewRoundThreshold
+	// itself for round 3 - the same helper-only shape #2061 f3 filed against me
+	// hours ago, reappearing in the test for the fix that finding prompted.
+	//
+	// Each round: open at a new head, then close the round's lens jobs with
+	// changes_requested on the SAME finding id, which is the relocation shape
+	// #1419 targets.
+	seen := map[string]int{}
+	for round := 1; round <= 4; round++ {
+		event := highRiskEvent()
+		event.HeadSHA = strings.Repeat(string(rune('a'+round-1)), 40)
+		if err := engine.HandlePullRequestOpened(ctx, event); err != nil {
+			t.Fatalf("HandlePullRequestOpened(round %d): %v", round, err)
+		}
+		coordID := "review-coordinator/task-7/review-" + strconv.Itoa(round)
+		if _, err := store.GetJob(ctx, coordID); err != nil {
+			t.Fatalf("round %d produced no coordinator %q: %v", round, coordID, err)
+		}
+		seen[coordID] = countJobEvents(t, store, coordID, "review_round_threshold")
+
+		for _, lens := range []string{LensCorrectness, LensSecurity} {
+			id := coordID + "/delegation/" + lens
+			job, err := store.GetJob(ctx, id)
+			if err != nil {
+				continue
+			}
+			payload, err := unmarshalPayload(job.Payload)
+			if err != nil {
+				t.Fatalf("unmarshal %s: %v", id, err)
+			}
+			completeQueuedReview(t, store, job, payload, AgentResult{
+				Decision: "changes_requested", Severity: "P1", Summary: "the same defect, relocated",
+				Findings: []json.RawMessage{json.RawMessage(`{"uid":"F-1","severity":"P1","title":"one defect, moving"}`)},
+			})
+		}
+	}
+
+	for round := 1; round <= 2; round++ {
+		id := "review-coordinator/task-7/review-" + strconv.Itoa(round)
+		if seen[id] != 0 {
+			t.Fatalf("round %d warned %d times; a warning on every round is noise", round, seen[id])
+		}
+	}
+	for round := 3; round <= 4; round++ {
+		id := "review-coordinator/task-7/review-" + strconv.Itoa(round)
+		if seen[id] != 1 {
+			t.Fatalf("round %d on the HIGH-RISK path emitted %d warnings, want 1; "+
+				"the lens fan-out is the path a hard problem takes", round, seen[id])
+		}
+	}
+
 }

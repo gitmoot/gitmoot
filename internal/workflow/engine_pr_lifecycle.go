@@ -334,7 +334,17 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 	// VESSEL may be wrong, not proof of it: some PRs legitimately take four
 	// rounds. Refusing dispatch would turn a hint into a wedge, and the failure
 	// this addresses is invisibility, not permission.
-	if err := e.recordReviewRoundThreshold(ctx, reviewRound, requests); err != nil {
+	roundJobIDs := make([]string, 0, len(requests))
+	for _, request := range requests {
+		// The id is assigned inside enqueue, so it is derived the same
+		// deterministic way rather than read off a field still empty here.
+		jobID := strings.TrimSpace(request.ID)
+		if jobID == "" {
+			jobID = e.jobID(request)
+		}
+		roundJobIDs = append(roundJobIDs, jobID)
+	}
+	if err := e.recordReviewRoundThreshold(ctx, reviewRound, roundJobIDs); err != nil {
 		return err
 	}
 	if err := e.setTaskState(ctx, ref, TaskReviewing); err != nil {
@@ -552,6 +562,19 @@ func (e Engine) dispatchHighRiskReview(ctx context.Context, event PullRequestEve
 		Kind:    "risk_tier_resolved",
 		Message: fmt.Sprintf("risk tier %q (%s): %s", classification.Tier, classification.Source, classification.Reason),
 	}); err != nil {
+		return err
+	}
+
+	// #2087 review, P1: THE HIGH-RISK PATH RETURNED BEFORE THE RECORDER.
+	// dispatchHighRiskReview is entered when risk tiers are enabled and the tier
+	// is HIGH, and it returns before the native reviewer loop - so the lens
+	// fan-out, the path a hard problem takes, was the one path that never said
+	// how many rounds it had taken. The reviewer proved it by driving four rounds
+	// of a single relocating finding through it and scanning every job's events.
+	//
+	// Recorded against the coordinator job because that is the row this path
+	// creates and the one an operator reads for the round.
+	if err := e.recordReviewRoundThreshold(ctx, round, []string{coordID}); err != nil {
 		return err
 	}
 	if err := e.dispatchDelegations(ctx, coordJob, coordPayload, ref); err != nil {
@@ -918,7 +941,7 @@ const ReviewRoundRelocationThreshold = 3
 // reviewer and an operator both already read. A round-level record with no job
 // to hang on would be a fact nobody encounters - the failure this campaign keeps
 // finding, installed by the fix for it.
-func (e Engine) recordReviewRoundThreshold(ctx context.Context, reviewRound string, requests []JobRequest) error {
+func (e Engine) recordReviewRoundThreshold(ctx context.Context, reviewRound string, jobIDs []string) error {
 	if e.Store == nil {
 		return nil
 	}
@@ -926,15 +949,8 @@ func (e Engine) recordReviewRoundThreshold(ctx context.Context, reviewRound stri
 	if !ok || round < ReviewRoundRelocationThreshold {
 		return nil
 	}
-	for _, request := range requests {
-		// The id is assigned inside enqueue, so it is derived here the same
-		// deterministic way rather than read off a field that is still empty at
-		// this point - which is how the first version of this recorder wrote
-		// nothing at all while every test around it passed.
-		jobID := strings.TrimSpace(request.ID)
-		if jobID == "" {
-			jobID = e.jobID(request)
-		}
+	for _, jobID := range jobIDs {
+		jobID = strings.TrimSpace(jobID)
 		if jobID == "" {
 			continue
 		}
