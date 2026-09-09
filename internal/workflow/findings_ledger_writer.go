@@ -664,6 +664,19 @@ func truncateAtRune(s string, max int) (string, int, bool) {
 	// BEFORE THE BOUND, like the coercion below and for the same reason: each
 	// replacement is 3 bytes where the control was 1, so this can only grow the
 	// string, and a bound applied first would stop holding.
+	// MEASURE VALIDITY BEFORE THE CONTROL MAP, NOT AFTER (#2100 f3).
+	//
+	// strings.Map decodes each byte, and an INVALID byte decodes to
+	// utf8.RuneError - which Map then writes out as a real U+FFFD. So a title
+	// carrying both a control and an invalid byte came out of the map already
+	// valid, utf8.ValidString below returned true, `coerced` stayed false, and
+	// the brief omitted "[row held undecodable bytes; they were replaced]". The
+	// bytes were rewritten and the reviewer was not told - which is exactly the
+	// disclosure #2077 F4 added, defeated by a repair added later for a different
+	// reason.
+	//
+	// Two repairs on one string need their reporting decided before either runs.
+	coerced := !utf8.ValidString(s)
 	if strings.ContainsFunc(s, isPromptHostileControl) {
 		s = strings.Map(func(r rune) rune {
 			if isPromptHostileControl(r) {
@@ -672,7 +685,6 @@ func truncateAtRune(s string, max int) (string, int, bool) {
 			return r
 		}, s)
 	}
-	coerced := false
 	if !utf8.ValidString(s) {
 		// REPORTED, not just performed (#2077 review F4). A long invalid run
 		// collapses to one replacement rune and can then FIT, so it reports zero

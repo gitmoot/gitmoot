@@ -736,3 +736,50 @@ func TestObligationBriefCanBePassedToARuntime(t *testing.T) {
 		t.Fatalf("the hostile bytes vanished without a replacement marker; a reviewer cannot tell their text was changed:\n%s", brief)
 	}
 }
+
+// #2100 f3. TWO REPAIRS ON ONE STRING, AND THE SECOND HID THE FIRST.
+//
+// A title carrying BOTH a hostile control and an invalid byte was fully repaired
+// by the control map - strings.Map decodes an invalid byte as utf8.RuneError and
+// writes a real U+FFFD - so the validity check that follows saw a clean string,
+// `coerced` stayed false, and the brief omitted the undecodable-bytes
+// disclosure. The bytes were rewritten and the reviewer was not told.
+//
+// The single-defect fixtures could not catch this: one has a control and no
+// invalid byte, the other an invalid byte and no control. It takes both.
+func TestObligationBriefDisclosesCoercionWhenAControlIsAlsoPresent(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	head := strings.Repeat("3", 40)
+	nextHead := strings.Repeat("4", 40)
+
+	mixed := "before\x00after and an undecodable \xff byte"
+	if !strings.ContainsRune(mixed, 0) || utf8.ValidString(mixed) {
+		t.Fatalf("fixture must carry BOTH a control and invalid UTF-8, or it cannot exercise the interaction")
+	}
+	if _, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
+		Repo: "gitmoot/gitmoot", PullRequest: 2103, HeadSHA: head,
+		ObserverJob: "review-2100-f3", State: db.FindingOpen, Severity: "P2",
+		RoundLabel: "f3", Title: mixed, Detail: "a detail",
+		File: "internal/workflow/findings_ledger_writer.go", Line: 1,
+		EvidenceKind: db.EvidenceExecuted, ExecutedCommands: []string{"go test ./internal/workflow/"}, ExecutedCount: 1,
+	}); err != nil {
+		t.Fatalf("RecordReviewFindingObservation returned error: %v", err)
+	}
+	stored, err := store.ListReviewFindingObservations(ctx, "gitmoot/gitmoot", 2103)
+	if err != nil {
+		t.Fatalf("ListReviewFindingObservations returned error: %v", err)
+	}
+	if len(stored) != 1 || utf8.ValidString(stored[0].Title) {
+		t.Fatalf("the store repaired the title on write, so the brief cannot be what fixes this: %+v", stored)
+	}
+
+	brief := engine.ledgerObligationBrief(ctx, "gitmoot/gitmoot", 2103, nextHead, "task-2103")
+	if strings.TrimSpace(brief) == "" {
+		t.Fatalf("no brief rendered")
+	}
+	if !strings.Contains(brief, "row held undecodable bytes") {
+		t.Fatalf("the row's invalid bytes were rewritten with no disclosure, because the control repair got there first:\n%s", brief)
+	}
+}
