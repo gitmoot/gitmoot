@@ -182,16 +182,61 @@ func runDaemonDrain(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	// NOT KILLED, NOT PARKED SILENTLY. The issue requires that a job exceeding the
-	// deadline be handled explicitly; the honest handling at this layer is to
-	// NAME it and refuse to claim the window is safe. Parking someone else's
-	// running job from a CLI would terminate work this command cannot see the
-	// state of, which is the loss drain exists to prevent.
+	// RECORDED, NOT KILLED, AND DELIBERATELY NOT PARKED.
+	//
+	// #1207's acceptance says an overdue job must be "parked with a recorded
+	// reason, never killed silently". This delivers the RECORD and declines the
+	// PARK, and the split is a deliberate scope decision rather than an omission.
+	//
+	// The record is the half that matters and is now durable: each straggler gets
+	// a daemon_drain_deadline_exceeded event naming the deadline, so the reason
+	// survives the terminal this command printed to.
+	//
+	// The park is declined because parking is a STATE TRANSITION on a running job
+	// this command cannot see inside. It holds a lease, a subprocess and possibly
+	// a worktree; moving it to parked from a CLI would strand or terminate work
+	// whose progress is invisible here, which is precisely the loss drain exists
+	// to prevent. An operator who decides a job should stop has `gitmoot job
+	// cancel`, which is explicit and attributable. Doing it implicitly on a
+	// timeout would make a deadline into a killer.
+	if err := recordDrainDeadlineExceeded(*home, remaining, *timeout); err != nil {
+		fmt.Fprintf(stderr, "daemon drain: record deadline: %v\n", err)
+		return 1
+	}
 	fmt.Fprintf(stdout, "\nstill in flight after %s - the restart is NOT safe yet:\n", *timeout)
 	for _, job := range remaining {
 		fmt.Fprintf(stdout, "  %s  %s  %s\n", job.ID, job.Type, job.Agent)
 	}
+	fmt.Fprintln(stdout, "\nEach is recorded with a daemon_drain_deadline_exceeded event; none was parked or killed.")
 	fmt.Fprintln(stdout, "\nDrain remains ACTIVE, so nothing new is being claimed and the set can only shrink.")
 	fmt.Fprintln(stdout, "Wait and re-run, or decide about these jobs explicitly before restarting.")
 	return 1
+}
+
+// recordDrainDeadlineExceeded writes the reason an operator will need later.
+//
+// Best-effort per job is NOT acceptable here - a partially recorded deadline is
+// the shape this campaign keeps finding, where a report reads complete and the
+// store holds less. Any failure is returned so the command exits non-zero and
+// the operator knows the record is incomplete.
+func recordDrainDeadlineExceeded(configHome string, jobs []db.Job, timeout time.Duration) error {
+	if len(jobs) == 0 {
+		return nil
+	}
+	return withStoreAndPaths(configHome, func(_ config.Paths, store *db.Store) error {
+		for _, job := range jobs {
+			if err := store.AddJobEvent(context.Background(), db.JobEvent{
+				JobID: job.ID,
+				Kind:  "daemon_drain_deadline_exceeded",
+				Message: fmt.Sprintf(
+					"still in flight when a %s drain deadline elapsed; NOT parked and NOT killed - "+
+						"drain remains active so nothing new is claimed, and this job was left to finish. "+
+						"Stopping it is an explicit operator decision (gitmoot job cancel), never a timeout's.",
+					timeout),
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
