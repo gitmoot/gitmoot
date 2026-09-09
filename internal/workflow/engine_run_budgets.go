@@ -713,6 +713,31 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 				return err
 			}
 			if err := e.Store.UpdateJobPayload(ctx, job.ID, encoded); err != nil {
+				// #2057 round five: A PAYLOAD WRITE THAT FAILS AFTER A SUCCESSFUL
+				// FINALIZER MUST RELEASE THE CLAIM. Otherwise nothing durable
+				// records the finalization - the marker is unwritten and completion
+				// is unreached - while the claim is held, so every later advance
+				// returns FinalizationInProgressError FOREVER and the job is
+				// stranded rather than retried.
+				//
+				// Releasing accepts that a retry may repeat part of the finalizer's
+				// external work, which is the same trade already taken on the
+				// finalizer-failure path and is what happens today with no claim at
+				// all. A permanent stop is worse than a possible duplicate, because
+				// the duplicate is visible and recoverable and the stop is neither.
+				//
+				// The COMPLETION-write failure below needs no release: the payload
+				// marker is already durable by then, and the claim block is guarded
+				// on it, so a retry never consults the claim
+				// (TestFinalizedPayloadWithoutCompletionStillAdvances).
+				_, releaseErr := e.Store.ReleaseJobEventClaim(ctx, db.JobEvent{
+					JobID:   job.ID,
+					Kind:    "implementation_finalize_claimed",
+					Message: fmt.Sprintf("implementation finalization claimed for %s (#2057)", job.ID),
+				})
+				if releaseErr != nil {
+					return errors.Join(err, releaseErr)
+				}
 				return err
 			}
 			payload = finalized

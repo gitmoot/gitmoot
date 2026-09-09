@@ -565,3 +565,39 @@ func TestLostClaimWithCompletionReloadsTheFinalizedPayload(t *testing.T) {
 		t.Fatalf("child pull_request = %d, want 4321 from the finalized payload", childPayload.PullRequest)
 	}
 }
+
+// #2057 round five, THE COMPLETION-WRITE FAILURE WINDOW. If the finalizer
+// succeeds, the payload write succeeds, and then the completion event write
+// FAILS, the claim is held with no completion recorded. The concern is that every
+// retry then reports in-progress forever.
+//
+// It does not, and the payload marker is why: the claim block is guarded by
+// !payload.ImplementationFinalized, so a retry that loads the finalized payload
+// never reaches the claim check at all. Asserted here rather than reasoned about,
+// because "the guard upstream covers it" is exactly the kind of claim that is
+// true until someone reorders the guard.
+func TestFinalizedPayloadWithoutCompletionStillAdvances(t *testing.T) {
+	ctx := context.Background()
+	engine, store := newOrderingFixture(t)
+	engine.ImplementationFinalizer = fakeImplementationFinalizer{err: errors.New("must not run: already finalized")}
+
+	// The state left behind when the completion write is the only thing that
+	// failed: claim held, payload finalized, NO completion event.
+	finalized := orderingParentPayload()
+	finalized.HeadSHA = orderingProducedHead
+	finalized.ImplementationFinalized = true
+	insertCompletedJob(t, store, db.Job{ID: "impl-nocomp", Agent: "lead", Type: "implement"}, finalized)
+	if _, err := store.ClaimJobEvent(ctx, db.JobEvent{
+		JobID: "impl-nocomp", Kind: "implementation_finalize_claimed",
+		Message: "implementation finalization claimed for impl-nocomp (#2057)",
+	}); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+
+	if err := engine.AdvanceJob(ctx, "impl-nocomp"); err != nil {
+		t.Fatalf("a finalized payload with no completion event must still advance, got %v", err)
+	}
+	if _, err := store.GetJob(ctx, "impl-nocomp/delegation/round2-review"); err != nil {
+		t.Fatalf("delegation was not dispatched: %v", err)
+	}
+}
