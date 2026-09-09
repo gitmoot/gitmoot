@@ -4691,11 +4691,18 @@ Three things it deliberately is not:
 - **Not a finding count.** The unit is a distinct review round, so several
   findings in one round is thoroughness rather than relocation. A round that
   fans out to several reviewers or lens children counts once **at one head**.
-  The exact reviewed head is part of the identity at every rung, so one review
-  round or one coordinator whose legs reviewed **different** heads counts more
-  than once: a push between two dispatches is a new round by any reading. One
-  observing job also counts more than once if it recorded findings at several
-  heads, which a retried job does.
+  The exact reviewed head is part of the identity at **every** rung, including
+  the job fallback, so one review round or one coordinator whose legs reviewed
+  **different** heads counts more than once: a push between two dispatches is a
+  new round by any reading. One observing job also counts more than once if it
+  recorded findings at several heads, which a retried job does.
+
+  A line-qualified locator (`path/file.go:32`) is grouped with other spellings
+  of the same file, but only when the name ends in a file extension. A locator
+  such as `dir/pkg:10` keeps its whole value, because nothing in the text
+  proves the trailing number is a line rather than part of the name, and
+  counting two different files as one would invent a relocation. The count is a
+  floor in that direction on purpose.
 - **Not a claim that the defects are the same defect.** The count is rounds
   carrying findings against one file, which is a proxy: unrelated defects in one
   file across three rounds report as three.

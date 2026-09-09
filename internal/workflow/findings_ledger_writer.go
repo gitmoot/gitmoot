@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/reviewseverity"
@@ -638,17 +639,17 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 // finding happened to be at line 10, which is the one direction this key must
 // never take.
 //
-// The prefix's SHAPE does decide it, on every row this store holds: a path
-// contains a separator or an extension dot. All 9 real locators qualify
-// ("internal/cli/auth.go:20", "go.mod:3", "apps/web/public/_landing:372"), and
-// "pkg" does not, so a file genuinely named "pkg:10" keeps its whole name
-// whatever its line.
+// Round SEVEN then keyed on the prefix's path SHAPE, which round eight refuted:
+// a separator proves the value is a path and says nothing about whether the
+// trailing number belongs to the NAME, so "dir/pkg:10" and "dir/pkg:20" folded
+// together and could manufacture a relocation from two different files.
 //
-// The residual error is an extensionless, separator-free filename with a
-// numeric suffix ("Makefile:10" at repository root), which keeps its locator
-// whole and can leave two spellings of one file in separate buckets. That is
-// the UNDER-report direction, which the brief documents as a floor; it can
-// never fold two different files together and invent a relocation.
+// What survives is narrower and is about the NAME: the suffix is stripped only
+// when the last path segment ends in a file EXTENSION (see
+// relocationPathEndsInExtension). It folds the one measured real group and
+// declines every case it cannot argue for, so the residual error is always the
+// UNDER-report direction, which the brief documents as a floor; it can never
+// fold two different files together and invent a relocation.
 func relocationFileKey(obs db.ReviewFindingObservation) string {
 	file := strings.TrimSpace(obs.File)
 	if file == "" {
@@ -662,11 +663,55 @@ func relocationFileKey(obs db.ReviewFindingObservation) string {
 		return file
 	}
 	path := strings.TrimSpace(file[:idx])
-	if !strings.ContainsAny(path, `/\`) && !strings.Contains(path, ".") {
-		// Not path-shaped, so the suffix is part of the name.
+	if !relocationPathEndsInExtension(path) {
 		return file
 	}
 	return path
+}
+
+// relocationPathEndsInExtension reports whether path's LAST SEGMENT ends in a
+// file extension: a dot followed by 1 to 8 alphanumerics, with something before
+// the dot (#2066 round eight, P1).
+//
+// ROUND EIGHT'S FINDING IS THAT PATH SHAPE IS NOT EVIDENCE. Round seven stripped
+// a numeric suffix whenever the prefix held a separator or a dot anywhere, which
+// folds "dir/pkg:10", "dir/pkg:20" and "dir/pkg:30" - three locators the store
+// accepts and which may be three genuinely different files - into one bucket,
+// manufacturing rounds=3. A separator says the value is a path; it says nothing
+// about whether the trailing number belongs to the NAME.
+//
+// An extension on the final segment is narrower and is about the name itself: a
+// tracked file whose name ends "....go" followed by ":32" is a line-qualified
+// locator under every convention this repository uses, and "dir/pkg" is not. It
+// folds the one measured real group (PR 1910's three spellings of
+// resolver_refusal_log_test.go) and REFUSES the counter-example above.
+//
+// STATED PLAINLY: this is still a heuristic, not proof. It cannot be, because
+// the ambiguity lives in the text and the row's Line is empty in all 9
+// colon-bearing rows this store holds. What changed is the DIRECTION of its
+// residual error: every case it now declines to fold stays in separate buckets
+// and UNDER-reports, which the brief documents as a floor, and no case it folds
+// lacks an extension on the file it names. "apps/web/public/_landing:372" is
+// such a decline, and is left as a floor deliberately.
+func relocationPathEndsInExtension(path string) bool {
+	segment := path
+	if cut := strings.LastIndexAny(segment, `/\`); cut >= 0 {
+		segment = segment[cut+1:]
+	}
+	dot := strings.LastIndex(segment, ".")
+	if dot <= 0 || dot == len(segment)-1 {
+		return false
+	}
+	ext := segment[dot+1:]
+	if len(ext) > 8 {
+		return false
+	}
+	for _, r := range ext {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // reviewRoundsForObservations maps each observing job to its logical review
@@ -880,14 +925,7 @@ func ledgerRelocationBrief(observations []db.ReviewFindingObservation, roundOf m
 		// is exactly the previous behaviour; the moment ReviewRound is populated,
 		// fan-out collapses correctly with no further change.
 		if base := strings.TrimSpace(roundOf[job]); base != "" {
-			// #2066 round seven, P1: THE HEAD COMES FROM THIS OBSERVATION, not from
-			// the job. A job's payload holds one head, its current target, while a
-			// retried job (RetryJob reuses the ID, clears the result and may
-			// retarget) records observations at several. Qualifying from the
-			// payload stamped them all with the latest head and collapsed genuine
-			// rounds. No fallback: the store REFUSES an observation without a
-			// 40-character head (db.ErrFindingHeadSHA), so this is never blank.
-			job = base + "\x00" + strings.TrimSpace(obs.HeadSHA)
+			job = base
 		}
 		if job == "" {
 			// No attributable round. Counting it as its own would let unattributed
@@ -896,6 +934,21 @@ func ledgerRelocationBrief(observations []db.ReviewFindingObservation, roundOf m
 			// and the count stays a floor.
 			continue
 		}
+		// #2066 round eight, P1: THE HEAD QUALIFIES EVERY RUNG, INCLUDING THE JOB
+		// FALLBACK. Round seven appended it only inside the resolved-base branch,
+		// so a retried job with NO ReviewRound and NO ParentJobID - which is the
+		// ordinary shape for a local review enqueue on a top-level job - keyed its
+		// H1, H2 and H3 observations by the reused job ID alone and reported ONE
+		// round. Round seven's own regression seeded a ReviewRound, so it never
+		// reached this path: the fix and its test agreed with each other and not
+		// with production.
+		//
+		// Applied AFTER the empty check, so an unattributable row is still skipped
+		// rather than becoming attributable by acquiring a head.
+		//
+		// The store REFUSES an observation without a 40-character head
+		// (db.ErrFindingHeadSHA), so this suffix is never blank.
+		job += "\x00" + strings.TrimSpace(obs.HeadSHA)
 		if rounds[file] == nil {
 			rounds[file] = map[string]struct{}{}
 			labels[file] = map[string]struct{}{}
@@ -921,7 +974,8 @@ func ledgerRelocationBrief(observations []db.ReviewFindingObservation, roundOf m
 	b.WriteString("\n\nDEFECT RELOCATION COUNT ON THIS PR (#1419).\n")
 	b.WriteString("Each line is a file that has carried findings across SEVERAL DISTINCT REVIEW ROUNDS. A round\n")
 	b.WriteString("is identified by its review round when one is recorded, otherwise by the coordinator that\n")
-	b.WriteString("dispatched it, and only otherwise by the individual reviewing job - and in EVERY case ALSO by\n")
+	b.WriteString("dispatched it, and only otherwise by the individual reviewing job - and in every one of those\n")
+	b.WriteString("cases, INCLUDING the job fallback, ALSO by\n")
 	b.WriteString("the exact head that was reviewed, so one review round or one coordinator spanning two heads is\n")
 	b.WriteString("two rounds, while a fan-out at ONE head is one. That is not the same as a\n")
 	b.WriteString("thorough review: several findings in ONE round is\n")
