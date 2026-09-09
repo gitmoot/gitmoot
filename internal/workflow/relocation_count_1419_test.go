@@ -446,7 +446,14 @@ func TestRelocationBriefDescribesTheUnitItActuallyCounts(t *testing.T) {
 	if strings.Contains(got, "counted\nby observing job") || strings.Contains(got, "counted by observing job") {
 		t.Fatalf("the brief still claims the count is by observing job:\n%s", got)
 	}
-	for _, want := range []string{"review round when one is recorded", "coordinator that", "only otherwise by the individual reviewing job"} {
+	// #2066 round seven, P2: the head is part of every rung, so the brief must
+	// say so - a reader who believes one coordinator counts once cannot interpret
+	// a count that separated its legs by head.
+	for _, want := range []string{
+		"review round when one is recorded", "coordinator that",
+		"only otherwise by the individual reviewing job",
+		"ALSO by", "the exact head that was reviewed", "a fan-out at ONE head is one",
+	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("the brief does not describe the identity ladder (%q):\n%s", want, got)
 		}
@@ -586,13 +593,19 @@ func TestRelocationCountGroupsLineQualifiedLocatorsByFile(t *testing.T) {
 }
 
 // #2066 ROUND SIX, P1. TWO CHILDREN OF ONE COORDINATOR THAT REVIEWED DIFFERENT
-// HEADS ARE TWO ROUNDS. Both identity rungs omitted the reviewed head, so a
-// coordinator's dependent review legs - deferred legs are enqueued after their
-// dependencies settle, and delegationHeadSHA resolves the then-current PR mirror
-// - collapsed into one round if a push landed between their dispatches. That
-// undercounts genuine review/fix cycles, which is the defect this brief exists to
-// surface.
-func TestReviewRoundResolutionSeparatesDifferentReviewedHeads(t *testing.T) {
+// HEADS ARE TWO ROUNDS. A coordinator's dependent review legs - deferred legs
+// are enqueued after their dependencies settle, and delegationHeadSHA resolves
+// the then-current PR mirror - collapsed into one round if a push landed between
+// their dispatches. That undercounts genuine review/fix cycles, which is the
+// defect this brief exists to surface.
+//
+// ROUND SEVEN MOVED WHERE THIS IS DECIDED, so the assertion moved with it. The
+// head is no longer part of the job's resolved identity, because one job can
+// record observations at several heads; it is appended per OBSERVATION. The
+// resolver can therefore no longer separate these legs, and asserting that it
+// does would pin the defect the round-seven reviewer found. The separation is
+// asserted where it now happens: the rendered count.
+func TestRelocationCountSeparatesDifferentReviewedHeads(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	engine := Engine{Store: store}
@@ -602,28 +615,36 @@ func TestReviewRoundResolutionSeparatesDifferentReviewedHeads(t *testing.T) {
 			Repo: "gitmoot/gitmoot", PullRequest: 2066, ParentJobID: parent, ReviewRound: round, HeadSHA: head,
 			Result: &AgentResult{Decision: "approved", Summary: "ok"},
 		})
-		return db.ReviewFindingObservation{File: "internal/cli/a.go", ObserverJob: id, RoundLabel: "F1"}
+		// The store stamps every observation with its own 40-character head and
+		// REFUSES one without it, so a fixture that omits it models a row the
+		// writer cannot produce.
+		return db.ReviewFindingObservation{File: "internal/cli/a.go", ObserverJob: id, RoundLabel: "F1", HeadSHA: head}
 	}
 
-	// Roundless siblings of ONE coordinator at DIFFERENT heads: two rounds.
+	brief := func(rows []db.ReviewFindingObservation) string {
+		return ledgerRelocationBrief(rows, engine.reviewRoundsForObservations(ctx, rows))
+	}
+
+	// Roundless siblings of ONE coordinator at THREE different heads: three
+	// rounds, which is what the warning exists to say.
 	differentHeads := []db.ReviewFindingObservation{
 		seed("leg-h1", "coordinator-9", "", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
 		seed("leg-h2", "coordinator-9", "", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+		seed("leg-h3", "coordinator-9", "", "ffffffffffffffffffffffffffffffffffffffff"),
 	}
-	resolved := engine.reviewRoundsForObservations(ctx, differentHeads)
-	if resolved["leg-h1"] == resolved["leg-h2"] {
-		t.Fatalf("two legs that reviewed different heads share one identity %q", resolved["leg-h1"])
+	if got := brief(differentHeads); !strings.Contains(got, "rounds=3") {
+		t.Fatalf("three legs that reviewed different heads collapsed:\n%s", got)
 	}
 
-	// SAME head still collapses - that is the fan-out case the previous round
-	// fixed, and separating heads must not undo it.
+	// SAME head still collapses - that is the fan-out case round five fixed, and
+	// separating heads must not undo it.
 	sameHead := []db.ReviewFindingObservation{
 		seed("panel-a", "coordinator-7", "", "cccccccccccccccccccccccccccccccccccccccc"),
 		seed("panel-b", "coordinator-7", "", "cccccccccccccccccccccccccccccccccccccccc"),
+		seed("panel-c", "coordinator-7", "", "cccccccccccccccccccccccccccccccccccccccc"),
 	}
-	resolved = engine.reviewRoundsForObservations(ctx, sameHead)
-	if resolved["panel-a"] != resolved["panel-b"] || resolved["panel-a"] == "" {
-		t.Fatalf("same-head siblings no longer collapse: %q vs %q", resolved["panel-a"], resolved["panel-b"])
+	if got := brief(sameHead); got != "" {
+		t.Fatalf("a three-member fan-out at ONE head was counted as three rounds:\n%s", got)
 	}
 
 	// A RECORDED ROUND is separated by head too: fan-out members can be resynced
@@ -631,9 +652,105 @@ func TestReviewRoundResolutionSeparatesDifferentReviewedHeads(t *testing.T) {
 	roundAcrossHeads := []db.ReviewFindingObservation{
 		seed("r1-h1", "coordinator-5", "review-1", "dddddddddddddddddddddddddddddddddddddddd"),
 		seed("r1-h2", "coordinator-5", "review-1", "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+		seed("r1-h3", "coordinator-5", "review-1", "1111111111111111111111111111111111111111"),
 	}
-	resolved = engine.reviewRoundsForObservations(ctx, roundAcrossHeads)
-	if resolved["r1-h1"] == resolved["r1-h2"] {
-		t.Fatalf("one recorded round across two heads shares an identity %q", resolved["r1-h1"])
+	if got := brief(roundAcrossHeads); !strings.Contains(got, "rounds=3") {
+		t.Fatalf("one recorded round across three heads collapsed:\n%s", got)
+	}
+}
+
+// #2066 ROUND SEVEN, P1. ONE OBSERVER JOB CAN CARRY OBSERVATIONS AT SEVERAL
+// HEADS. RetryJob reuses the job ID, clears the result and may retarget the
+// head, and findings are recorded before advancement returns, so a retried
+// reviewer records at H1 and then at H2 under ONE job id. The payload holds only
+// the job's CURRENT head, so qualifying the identity from the payload stamped
+// every observation with the latest head and collapsed genuine rounds.
+//
+// The prior round's test could not see this: it used DISTINCT job ids and left
+// each observation's HeadSHA empty, which is exactly the shape the defect hides
+// behind.
+func TestRelocationCountSeparatesOneJobsObservationsByRecordedHead(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := Engine{Store: store}
+
+	// ONE job, whose payload names only its latest head.
+	insertCompletedJob(t, store, db.Job{ID: "retried", Agent: "reviewer", Type: "review"}, JobPayload{
+		Repo: "gitmoot/gitmoot", PullRequest: 2066, ReviewRound: "review-1", TaskID: "task-1",
+		HeadSHA: "cccccccccccccccccccccccccccccccccccccccc",
+		Result:  &AgentResult{Decision: "changes_requested", Summary: "ok"},
+	})
+	at := func(head string) db.ReviewFindingObservation {
+		return db.ReviewFindingObservation{
+			File: "internal/cli/a.go", ObserverJob: "retried", RoundLabel: "F1", HeadSHA: head,
+		}
+	}
+	brief := func(rows []db.ReviewFindingObservation) string {
+		return ledgerRelocationBrief(rows, engine.reviewRoundsForObservations(ctx, rows))
+	}
+
+	rows := []db.ReviewFindingObservation{
+		at("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		at("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+		at("cccccccccccccccccccccccccccccccccccccccc"),
+	}
+	if got := brief(rows); !strings.Contains(got, "rounds=3") {
+		t.Fatalf("three recorded heads under one retried job collapsed:\n%s", got)
+	}
+
+	// The SAME head under one job is still ONE round: a reviewer recording three
+	// findings in a single pass has not relocated anything.
+	same := []db.ReviewFindingObservation{
+		at("cccccccccccccccccccccccccccccccccccccccc"),
+		at("cccccccccccccccccccccccccccccccccccccccc"),
+		at("cccccccccccccccccccccccccccccccccccccccc"),
+	}
+	if got := brief(same); got != "" {
+		t.Fatalf("three findings in one pass at one head were counted as three rounds:\n%s", got)
+	}
+}
+
+// #2066 ROUND SEVEN, P1, second half: THE DECIDING FIELD WAS EMPTY IN EVERY REAL
+// ROW. Round six stripped a ":<n>" suffix only when it matched the row's
+// recorded Line. Measured against the live store: 9 of 907 observation rows
+// carry a colon in File and ALL 9 record NO Line, so that rule never fired where
+// the ambiguity actually occurs. One real PR (1910) holds three spellings of one
+// test file at lines 32, 53 and 248, which sat in three separate buckets.
+func TestRelocationCountGroupsQualifiedLocatorsWithNoRecordedLine(t *testing.T) {
+	at := func(file string, job string) db.ReviewFindingObservation {
+		return db.ReviewFindingObservation{File: file, ObserverJob: job, RoundLabel: "F1"}
+	}
+
+	// The measured shape from PR 1910, Line unset on every row.
+	measured := []db.ReviewFindingObservation{
+		at("internal/daemon/resolver_refusal_log_test.go:32", "job-1"),
+		at("internal/daemon/resolver_refusal_log_test.go:53", "job-2"),
+		at("internal/daemon/resolver_refusal_log_test.go:248", "job-3"),
+	}
+	if got := ledgerRelocationBrief(measured, nil); !strings.Contains(got, "internal/daemon/resolver_refusal_log_test.go  rounds=3") {
+		t.Fatalf("three line-qualified spellings with no recorded Line stayed in separate buckets:\n%s", got)
+	}
+
+	// An extensionless path is still path-SHAPED when it carries a separator,
+	// which is the other real spelling in the store.
+	separatorOnly := []db.ReviewFindingObservation{
+		at("apps/web/public/_landing:372", "job-1"),
+		at("apps/web/public/_landing:373", "job-2"),
+		at("apps/web/public/_landing:374", "job-3"),
+	}
+	if got := ledgerRelocationBrief(separatorOnly, nil); !strings.Contains(got, "apps/web/public/_landing  rounds=3") {
+		t.Fatalf("a separator-bearing extensionless path was not recognised:\n%s", got)
+	}
+
+	// AND THE FALSE FOLD THE OLD RULE TOOK: a real filename "pkg:10" whose
+	// finding happens to be AT line 10 was stripped to "pkg", merging different
+	// files and inventing a relocation. Not path-shaped, so it keeps its name.
+	coincidence := []db.ReviewFindingObservation{
+		{File: "pkg:10", Line: 10, ObserverJob: "job-1", RoundLabel: "F1"},
+		{File: "pkg:20", Line: 20, ObserverJob: "job-2", RoundLabel: "F1"},
+		{File: "pkg:30", Line: 30, ObserverJob: "job-3", RoundLabel: "F1"},
+	}
+	if got := ledgerRelocationBrief(coincidence, nil); got != "" {
+		t.Fatalf("three files whose names end in a matching number were folded into one:\n%s", got)
 	}
 }

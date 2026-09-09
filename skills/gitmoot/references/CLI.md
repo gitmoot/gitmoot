@@ -4690,7 +4690,12 @@ Three things it deliberately is not:
   decision a human makes with the number.
 - **Not a finding count.** The unit is a distinct review round, so several
   findings in one round is thoroughness rather than relocation. A round that
-  fans out to several reviewers or lens children counts once.
+  fans out to several reviewers or lens children counts once **at one head**.
+  The exact reviewed head is part of the identity at every rung, so one review
+  round or one coordinator whose legs reviewed **different** heads counts more
+  than once: a push between two dispatches is a new round by any reading. One
+  observing job also counts more than once if it recorded findings at several
+  heads, which a retried job does.
 - **Not a claim that the defects are the same defect.** The count is rounds
   carrying findings against one file, which is a proxy: unrelated defects in one
   file across three rounds report as three.

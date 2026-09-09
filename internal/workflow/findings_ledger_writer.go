@@ -626,32 +626,47 @@ func (e Engine) ledgerObligationBrief(ctx context.Context, repo string, pullRequ
 }
 
 // relocationFileKey returns the repository-relative path an observation is
-// about, using the row's recorded Line to decide whether a trailing ":<n>" is a
-// line qualifier or part of the filename (#2066 round six).
+// about, stripping a trailing ":<n>" line qualifier when what precedes it is
+// PATH-SHAPED (#2066 round seven).
 //
-// Text alone cannot decide it: "pkg:10" is a valid filename AND a valid
-// path:line. The row is not ambiguous, because Line was parsed and stored
-// separately when the observation was written, so the suffix is stripped only
-// when it MATCHES that value.
+// Text alone cannot decide it in general: "pkg:10" is a valid filename AND a
+// valid path:line. Round six decided it from the row's recorded Line, stripping
+// only when the suffix MATCHED. MEASURED AGAINST THE REAL STORE, that rule
+// answers nothing: of 907 observation rows, 9 carry a colon in File and ALL 9
+// have NO recorded Line, so the field the rule consulted is empty in exactly
+// the rows where the ambiguity arises. It also folded a genuine "pkg:10" whose
+// finding happened to be at line 10, which is the one direction this key must
+// never take.
 //
-// An observation with no recorded line keeps its locator whole, which is the
-// conservative direction: it can leave two spellings of one file in separate
-// buckets and under-report, and it can never fold two different files together
-// and invent a relocation.
+// The prefix's SHAPE does decide it, on every row this store holds: a path
+// contains a separator or an extension dot. All 9 real locators qualify
+// ("internal/cli/auth.go:20", "go.mod:3", "apps/web/public/_landing:372"), and
+// "pkg" does not, so a file genuinely named "pkg:10" keeps its whole name
+// whatever its line.
+//
+// The residual error is an extensionless, separator-free filename with a
+// numeric suffix ("Makefile:10" at repository root), which keeps its locator
+// whole and can leave two spellings of one file in separate buckets. That is
+// the UNDER-report direction, which the brief documents as a floor; it can
+// never fold two different files together and invent a relocation.
 func relocationFileKey(obs db.ReviewFindingObservation) string {
 	file := strings.TrimSpace(obs.File)
-	if file == "" || obs.Line <= 0 {
+	if file == "" {
 		return file
 	}
 	idx := strings.LastIndex(file, ":")
 	if idx <= 0 {
 		return file
 	}
-	number, err := strconv.Atoi(strings.TrimSpace(file[idx+1:]))
-	if err != nil || int64(number) != obs.Line {
+	if _, err := strconv.Atoi(strings.TrimSpace(file[idx+1:])); err != nil {
 		return file
 	}
-	return strings.TrimSpace(file[:idx])
+	path := strings.TrimSpace(file[:idx])
+	if !strings.ContainsAny(path, `/\`) && !strings.Contains(path, ".") {
+		// Not path-shaped, so the suffix is part of the name.
+		return file
+	}
+	return path
 }
 
 // reviewRoundsForObservations maps each observing job to its logical review
@@ -740,13 +755,19 @@ func (e Engine) reviewRoundsForObservations(ctx context.Context, observations []
 		//
 		// Same-head siblings still collapse, because the head is equal for them;
 		// only a head change separates them, which is exactly a new round.
-		head := strings.TrimSpace(payload.HeadSHA)
+		//
+		// #2066 ROUND SEVEN, P1: THE HEAD IS NO LONGER PART OF THIS IDENTITY. It
+		// is appended per OBSERVATION by ledgerRelocationBrief, from the row's own
+		// immutable HeadSHA, because ONE job can record observations at several
+		// heads: RetryJob reuses the job ID, clears the result and may retarget
+		// it. Taking the head from the payload stamped a retried job's earlier
+		// observations with its latest head and collapsed genuine rounds.
 		if round := strings.TrimSpace(payload.ReviewRound); round != "" {
-			rounds[job] = "round\x00" + strings.TrimSpace(payload.TaskID) + "\x00" + round + "\x00" + head
+			rounds[job] = "round\x00" + strings.TrimSpace(payload.TaskID) + "\x00" + round
 			continue
 		}
 		if parent := strings.TrimSpace(payload.ParentJobID); parent != "" {
-			rounds[job] = "parent\x00" + parent + "\x00" + head
+			rounds[job] = "parent\x00" + parent
 			continue
 		}
 	}
@@ -858,8 +879,15 @@ func ledgerRelocationBrief(observations []db.ReviewFindingObservation, roundOf m
 		// So the round wins when present and the job is the fallback. Today that
 		// is exactly the previous behaviour; the moment ReviewRound is populated,
 		// fan-out collapses correctly with no further change.
-		if round := strings.TrimSpace(roundOf[job]); round != "" {
-			job = round
+		if base := strings.TrimSpace(roundOf[job]); base != "" {
+			// #2066 round seven, P1: THE HEAD COMES FROM THIS OBSERVATION, not from
+			// the job. A job's payload holds one head, its current target, while a
+			// retried job (RetryJob reuses the ID, clears the result and may
+			// retarget) records observations at several. Qualifying from the
+			// payload stamped them all with the latest head and collapsed genuine
+			// rounds. No fallback: the store REFUSES an observation without a
+			// 40-character head (db.ErrFindingHeadSHA), so this is never blank.
+			job = base + "\x00" + strings.TrimSpace(obs.HeadSHA)
 		}
 		if job == "" {
 			// No attributable round. Counting it as its own would let unattributed
@@ -893,7 +921,9 @@ func ledgerRelocationBrief(observations []db.ReviewFindingObservation, roundOf m
 	b.WriteString("\n\nDEFECT RELOCATION COUNT ON THIS PR (#1419).\n")
 	b.WriteString("Each line is a file that has carried findings across SEVERAL DISTINCT REVIEW ROUNDS. A round\n")
 	b.WriteString("is identified by its review round when one is recorded, otherwise by the coordinator that\n")
-	b.WriteString("dispatched it, and only otherwise by the individual reviewing job. That is not the same as a\n")
+	b.WriteString("dispatched it, and only otherwise by the individual reviewing job - and in EVERY case ALSO by\n")
+	b.WriteString("the exact head that was reviewed, so one review round or one coordinator spanning two heads is\n")
+	b.WriteString("two rounds, while a fan-out at ONE head is one. That is not the same as a\n")
 	b.WriteString("thorough review: several findings in ONE round is\n")
 	b.WriteString("thoroughness, one finding in each of three rounds is a defect that keeps coming back somewhere\n")
 	b.WriteString("else in the same file. The labels are shown to help you recognise the rounds; they are not what\n")
