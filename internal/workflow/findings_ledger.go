@@ -382,16 +382,47 @@ func EnsureLedgerObligationsObserved(ctx context.Context, store *db.Store, repo 
 	if len(pending) == 0 {
 		return nil
 	}
-	var named []string
+	// SEVERITY DECIDES WHETHER AN OBLIGATION HOLDS THE MERGE, NOT WHETHER IT
+	// EXISTS (owner decision, workflow note 129657). P1 and P2 hold. P3 is
+	// REPORTED and does not hold.
+	//
+	// The split is here, at the blocking boundary, and NOT in
+	// LedgerObligationsAtHead - so `gitmoot findings` and every other reader
+	// still sees the whole obligation set. Filtering the predicate would have
+	// deleted P3 from the ledger's answer to "what is outstanding", which is a
+	// different and worse change than the one that was ruled.
+	var blocking, reported []LedgerObligation
 	for _, obligation := range pending {
-		label := obligation.RoundLabel
-		if strings.TrimSpace(label) == "" {
-			label = "(unlabelled)"
+		if obligationSeverityBlocks(obligation.Severity) {
+			blocking = append(blocking, obligation)
+			continue
 		}
-		named = append(named, fmt.Sprintf("%s [%s %s: %s]", obligation.FindingUID, label, obligation.Severity, obligation.Reason))
+		reported = append(reported, obligation)
+	}
+
+	// STATED, NOT SILENT - the same rule the advisory path below already keeps.
+	// A P3 that stops blocking must not also stop being visible, or the next
+	// reviewer learns that filing one costs a round and buys nothing, and stops
+	// filing. Two real P3s tonight - an orphaned comment and an unpinned map
+	// ordering - were found that way.
+	if len(reported) > 0 {
+		if taskID := strings.TrimSpace(scope.TaskID); taskID != "" {
+			_ = store.AddTaskEvent(ctx, db.TaskEvent{
+				TaskID: taskID,
+				Kind:   "findings_ledger_reported_not_blocking",
+				Reason: fmt.Sprintf("%d finding(s) at head %s do not hold the merge under note 129657: %s",
+					len(reported), shortHead(headSHA), namedObligations(reported)),
+			})
+		}
+		scope.degrade("findings ledger: %d non-blocking finding(s) outstanding at %s: %s",
+			len(reported), shortHead(headSHA), namedObligations(reported))
+	}
+
+	if len(blocking) == 0 {
+		return nil
 	}
 	refusal := fmt.Errorf("findings ledger: %d prior finding(s) carry no observation at head %s: %s",
-		len(pending), shortHead(headSHA), strings.Join(named, "; "))
+		len(blocking), shortHead(headSHA), namedObligations(blocking))
 	if !scope.FindingsAdvisory {
 		return refusal
 	}
@@ -421,4 +452,45 @@ func shortHead(head string) string {
 		return head[:12]
 	}
 	return head
+}
+
+// obligationSeverityBlocks decides whether an outstanding obligation HOLDS the
+// merge. Owner decision, workflow note 129657: P1 and P2 hold, P3 does not.
+//
+// DEFAULT-DENY, AND THE STORE IS WHY RATHER THAN THE PRINCIPLE. 44 of the 1,015
+// recorded observations carry an EMPTY severity. If "not P1 and not P2" meant
+// "does not block", every one of those would become a free pass, and so would
+// any future typo or new label - a merge bypass created by a spelling. Only a
+// severity that is RECOGNISED and RANKED BELOW P2 stops holding the merge;
+// everything else, including the unrecognised and the blank, still blocks.
+//
+// ONLY "P3" IS EXEMPT, AND P4/P5 ARE DELIBERATELY NOT. An earlier draft exempted
+// them too; neither exists in the store (the vocabulary is P1 318, P2 414,
+// P3 239, empty 44) and the ruling named P3. Exempting a label nobody uses is a
+// bypass waiting for someone to start using it.
+//
+// AND THE BLANKS ARE LEFT BLOCKING ON PURPOSE. Reading "P1 and P2 only" as
+// "nothing else blocks" would silently RELAX 44 existing rows, which is a wider
+// change than the one ruled and in the direction that loses obligations. The
+// ruling's subject was P3, so P3 is what changed.
+func obligationSeverityBlocks(severity string) bool {
+	switch strings.ToUpper(strings.TrimSpace(severity)) {
+	case "P3":
+		return false
+	default:
+		return true
+	}
+}
+
+// namedObligations renders obligations for an operator-facing line.
+func namedObligations(obligations []LedgerObligation) string {
+	var named []string
+	for _, obligation := range obligations {
+		label := obligation.RoundLabel
+		if strings.TrimSpace(label) == "" {
+			label = "(unlabelled)"
+		}
+		named = append(named, fmt.Sprintf("%s [%s %s: %s]", obligation.FindingUID, label, obligation.Severity, obligation.Reason))
+	}
+	return strings.Join(named, "; ")
 }
