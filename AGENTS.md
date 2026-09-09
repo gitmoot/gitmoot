@@ -239,10 +239,30 @@ waiting for the subtest it started. Measured: a parent found in exactly that
 state, `TestPrepareLocalImplementFixPassPreservesWorktreeSafetyChecks`, then
 passed on its own in **0.54s**.
 
-To tell slow from stuck, look at the **active leaf** rather than any waiting
-frame, and prefer **two observations over one**: run the suspect test alone, or
-dump twice and see whether the leaf moved. A goroutine that is still on the same
-line across two samples is stuck; one that has advanced was only slow.
+**No dump proves either answer, and this paragraph deliberately no longer claims
+one.** Look at the **active leaf** rather than any waiting frame, and prefer two
+observations to one: run the suspect test alone, or sample twice. Then read them
+as evidence, not verdicts.
+
+- **Same line in both samples** raises suspicion; it does not establish stuck. A
+  legitimate long channel wait, a syscall, or a blocking `git`/network call sits
+  on one source line for as long as it takes.
+- **Movement between samples** shows only that the goroutine progressed during
+  that interval. It does not rule out a deadlock or livelock later in the run.
+
+The one instrument that settles it is an **expectation**: run the named test
+alone and compare against how long it SHOULD take. That is what made the
+`0.54s` measurement above conclusive, and it is why the running-test list
+matters more than the stack.
+
+**And for this repository the expectation is already known: `internal/cli`
+cannot finish inside the default deadline at all.** Measured by gm-findings on
+an idle box, twice: `716s` and `805s`, both passing under `-timeout 25m`. A
+third run under load (12-way, 166 competing `go test` processes) took `1500s`
+and timed out, with goroutines parked 16 minutes in `testing.(*T).Parallel`
+waiting for slots - contention presenting exactly as a hang would. So the flag
+is not padding for a bad day: **without it this package cannot pass**, and a
+`600.0xx` failure there says nothing about the code.
 
 The CLI entrypoint lives under `cmd/gitmoot/`. The CI gate is Go-only — it does
 **not** build the website or run the live multi-runtime (codex/claude/kimi) E2E
