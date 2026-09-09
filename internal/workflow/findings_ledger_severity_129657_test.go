@@ -193,10 +193,16 @@ func TestANonBlockingP3IsStillReported(t *testing.T) {
 // described gm-findings' then-unmerged PR #2099 while reading as a statement
 // about main. Correct finding.
 //
-// It stopped being correct at 15:39:11Z, when #2099 merged as 9c892237.
-// internal/cli/findings.go:365 now assigns scope.Degraded to collect genuine
-// instrument failures for `gitmoot findings --at-head`, so the caller this test
-// defends against is real and on main.
+// It stopped being correct at 15:39:11Z, when #2099 merged as 9c892237, which
+// added a production caller assigning scope.Degraded for
+// `gitmoot findings --at-head`. So the caller this test defends against is real
+// and on main.
+//
+// CITED BY COMMIT, NOT BY LINE NUMBER (#2102 f4). An earlier version named
+// internal/cli/findings.go:365 - a location this branch's tree does not contain,
+// so a reviewer in a single-branch checkout cannot check it and a later edit
+// silently invalidates it. A commit SHA is checkable from anywhere and cannot
+// drift.
 //
 // THE TEST DID NOT CHANGE, and that is the point worth keeping: it pinned the
 // contract while the caller was still someone else's unmerged branch, and the
@@ -316,5 +322,39 @@ func TestABlockingOnlyRefusalEmitsNoReportedEvent(t *testing.T) {
 		if event.Kind == "findings_ledger_reported_not_blocking" {
 			t.Fatalf("a blocking-only refusal emitted a non-blocking report: %q", event.Reason)
 		}
+	}
+}
+
+// THE BRIEF MUST STATE THE RULE THE GATE ENFORCES, NOT A STRICTER ONE.
+//
+// ledgerObligationBrief is read BEFORE a reviewer writes, so it is the most
+// consequential statement of the gate's rule anywhere. It said the gate refuses
+// "until every one carries an observation", which stopped being true the moment
+// P1/P2 became the blocking set - and NO TEST PINNED THAT SENTENCE, so it would
+// have drifted out of truth silently and stayed there.
+//
+// A brief that overstates the gate teaches reviewers a rule the gate does not
+// enforce; the first reviewer to notice learns the brief cannot be trusted,
+// which costs more than the sentence saved.
+func TestTheObligationBriefStatesTheSeverityRule(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	engine := testEngine(store)
+	oldHead, head := strings.Repeat("c", 40), strings.Repeat("f", 40)
+	seedFinding(t, store, 7012, oldHead, "F-1", "P3")
+
+	brief := engine.ledgerObligationBrief(ctx, "gitmoot/gitmoot", 7012, head, "task-7012")
+	if strings.TrimSpace(brief) == "" {
+		t.Fatal("no brief produced, so this test cannot check what it says")
+	}
+	if !strings.Contains(brief, "every P1 and P2") {
+		t.Fatalf("the brief does not name the blocking set, so a reviewer cannot know what holds the merge:\n%s", brief)
+	}
+	if !strings.Contains(brief, "does not hold the merge") {
+		t.Fatalf("the brief does not say a P3 cannot block, which is the rule the gate now enforces:\n%s", brief)
+	}
+	// AND IT MUST NOT TELL THEM A P3 IS FREE TO IGNORE.
+	if !strings.Contains(brief, "still worth") {
+		t.Fatalf("the brief stops asking for P3 answers entirely; reported-not-blocking is not the same as retired:\n%s", brief)
 	}
 }
