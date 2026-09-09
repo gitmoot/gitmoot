@@ -250,19 +250,30 @@ as evidence, not verdicts.
 - **Movement between samples** shows only that the goroutine progressed during
   that interval. It does not rule out a deadlock or livelock later in the run.
 
-The one instrument that settles it is an **expectation**: run the named test
-alone and compare against how long it SHOULD take. That is what made the
-`0.54s` measurement above conclusive, and it is why the running-test list
-matters more than the stack.
+An **expectation** is what turns those clues into a diagnosis: run the named test
+alone and compare against how long it SHOULD take. That is why the `0.54s`
+measurement above was worth taking, and why the running-test list matters more
+than the stack. It narrows the question; it does not close it, because an
+isolated pass says only that this invocation finished, not why another was
+waiting.
 
-**And for this repository the expectation is already known: `internal/cli`
-cannot finish inside the default deadline at all.** Measured by gm-findings on
-an idle box, twice: `716s` and `805s`, both passing under `-timeout 25m`. A
-third run under load (12-way, 166 competing `go test` processes) took `1500s`
-and timed out, with goroutines parked 16 minutes in `testing.(*T).Parallel`
-waiting for slots - contention presenting exactly as a hang would. So the flag
-is not padding for a bad day: **without it this package cannot pass**, and a
-`600.0xx` failure there says nothing about the code.
+**Observed timings for this package, which are a floor and not a bound.**
+Measured by gm-findings on this host, idle, twice: `716s` and `805s`, both
+passing under `-timeout 25m`. A third run under 12-way load with 166 competing
+`go test` processes took `1500s` and timed out, with goroutines parked 16 minutes
+in `testing.(*T).Parallel` waiting for slots - contention presenting exactly as a
+hang would, which is the sharpest available example of why a blocked frame is not
+evidence.
+
+What those runs establish: **on this host, every observed run of `internal/cli`
+exceeded the 600s default.** What they do NOT establish: that it cannot pass
+inside 600s on a faster machine, a warm cache, or a smaller future suite. Two
+idle samples are a distribution, not a lower bound.
+
+So pass `-timeout 25m` locally because it is necessary on the machines this
+repository is actually developed on, and read a `600.0xx` failure as **the
+deadline firing** rather than as a verdict on the code - while remembering that
+the deadline firing and the code being slow are not exclusive.
 
 The CLI entrypoint lives under `cmd/gitmoot/`. The CI gate is Go-only — it does
 **not** build the website or run the live multi-runtime (codex/claude/kimi) E2E
