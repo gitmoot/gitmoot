@@ -17,6 +17,11 @@ import (
 )
 
 const (
+	// jobRunningEventKind is the durable marker that a job REACHED execution
+	// (#1713). Sound on this store's history: zero of 1447 succeeded implement
+	// jobs lack it, while effective_runtime is absent on 83.3% of them.
+	jobRunningEventKind = "running"
+
 	// GitmootMergeGateContext is the canonical commit-status context for the
 	// native merge gate and every observer of its current-head verdict.
 	GitmootMergeGateContext = "gitmoot/merge-gate"
@@ -847,7 +852,18 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		PullRequest: request.PullRequest,
 		TaskID:      request.TaskID,
 	}
-	implementerAttribution := collectGateImplementerAttribution(jobs, current)
+	// #1713: durable run evidence for the attribution below. A read failure
+	// yields a nil predicate, which attributes every leg exactly as before -
+	// fail-closed, because the error this must never make is letting an agent
+	// that DID implement the change review it.
+	var implementRan func(string) bool
+	if ranIDs, ranErr := g.Store.JobIDsWithEventKind(ctx, jobRunningEventKind); ranErr == nil {
+		implementRan = func(jobID string) bool {
+			_, ok := ranIDs[jobID]
+			return ok
+		}
+	}
+	implementerAttribution := collectGateImplementerAttribution(jobs, current, implementRan)
 	implementingAgents := implementerAttribution.agents
 	missingImplementerReason := implementerAttribution.failureReason()
 	// One row per (parent, delegation): the LATEST attempt, exactly as continuation
@@ -1709,7 +1725,10 @@ type implementerAttributionEvidence struct {
 // asked for the latter. #1929's review caught the collector being shared and the
 // widening leaking through it.
 func collectImplementerAttribution(jobs []db.Job, current JobPayload) implementerAttributionEvidence {
-	return collectImplementerAttributionMatching(jobs, current, sameTask)
+	// Ownership routing deliberately passes NO run evidence: its question is who
+	// owns the task, which a queued leg answers. Only the gate's question - who
+	// implemented the tree in front of me - needs execution.
+	return collectImplementerAttributionMatching(jobs, current, sameTask, nil)
 }
 
 // collectGateImplementerAttribution is the merge gate's own collector. It
@@ -1717,18 +1736,61 @@ func collectImplementerAttribution(jobs []db.Job, current JobPayload) implemente
 // gate's question is "who implemented the PR in front of me" and its answer
 // authorises nothing by itself: independence is then decided on the recorded
 // agent identities, and a self-approval still refuses.
-func collectGateImplementerAttribution(jobs []db.Job, current JobPayload) implementerAttributionEvidence {
-	return collectImplementerAttributionMatching(jobs, current, sameCorrelatedTask)
+//
+// ran reports durable evidence that a job REACHED execution (#1713). A nil ran
+// means no evidence was available, and every leg is then attributed exactly as
+// before - fail-closed, because the dangerous direction here is letting an agent
+// that did implement the change review it.
+func collectGateImplementerAttribution(jobs []db.Job, current JobPayload, ran func(jobID string) bool) implementerAttributionEvidence {
+	return collectImplementerAttributionMatching(jobs, current, sameCorrelatedTask, ran)
+}
+
+// implementLegRan reports whether an implement job demonstrably executed.
+//
+// #1713. Attribution counted matching implement jobs without asking whether they
+// ever ran, so a leg CANCELLED OR FAILED BEFORE EXECUTION permanently
+// disqualified its assigned agent from reviewing that pull request. Measured in
+// this store: 747 of 2504 implement jobs (29.8%) have no `running` event, 693 of
+// them carry a pull request, and on gitmoot/gitmoot alone six PRs had their
+// reviewer pool narrowed by a leg that never executed - wave-impl on #1231,
+// #1411, #1412 and #1532, gm-omp-impl on #1682 and #1705.
+//
+// THE INSTRUMENT MATTERS AND THE OBVIOUS ONE IS WRONG. `effective_runtime` looks
+// like a start marker and is not: 83.3% of SUCCEEDED implement jobs carry no
+// such event, because it is recorded only on some paths, so using it would have
+// declared most successful implementations never-run. The `running` job event is
+// sound on the same population - zero of 1447 succeeded legs lack it.
+//
+// SUCCESS IMPLIES EXECUTION regardless of events, and that floor is deliberate:
+// a succeeded implement job produced the change, so if its event were ever
+// missing - pruned, or written by an older build - excluding it would let the
+// implementing agent review its own work. That is the one error this predicate
+// must not make, so terminal success wins over absent evidence.
+func implementLegRan(job db.Job, ran func(jobID string) bool) bool {
+	if strings.EqualFold(strings.TrimSpace(job.State), string(JobSucceeded)) {
+		return true
+	}
+	if ran == nil {
+		return true
+	}
+	return ran(job.ID)
 }
 
 func collectImplementerAttributionMatching(jobs []db.Job, current JobPayload,
-	matches func(current JobPayload, payload JobPayload) bool) implementerAttributionEvidence {
+	matches func(current JobPayload, payload JobPayload) bool, ran func(jobID string) bool) implementerAttributionEvidence {
 	evidence := implementerAttributionEvidence{agents: make(map[string]implementerIdentity)}
 	for _, job := range jobs {
 		if job.Type != "implement" {
 			continue
 		}
+		// sawImplementJob is set BEFORE the run filter on purpose: it drives the
+		// "no implement job at all" diagnosis, and a dispatched-then-cancelled leg
+		// is evidence that implementation was attempted. Only ATTRIBUTION is
+		// withheld, never the observation.
 		evidence.sawImplementJob = true
+		if !implementLegRan(job, ran) {
+			continue
+		}
 		payload, err := unmarshalPayload(job.Payload)
 		if err != nil {
 			evidence.sawMalformedPayload = true

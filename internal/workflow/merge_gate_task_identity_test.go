@@ -279,7 +279,7 @@ func TestImplementerAttributionCollectorsDisagreeOnMigratedIdentity(t *testing.T
 		t.Fatal("strict collector reported no failure reason, so autoFixOwner would not fail closed")
 	}
 
-	gated := collectGateImplementerAttribution(jobs, current)
+	gated := collectGateImplementerAttribution(jobs, current, nil)
 	if _, ok := gated.agents["wave-impl"]; !ok || len(gated.agents) != 1 {
 		t.Fatalf("gate collector resolved %v, want exactly wave-impl: the independence check must see the implementer", gated.agents)
 	}
