@@ -1126,9 +1126,21 @@ ORDER BY d.created_at ASC, d.id ASC`, targetRole, targetRole, targetRole)
 //
 // The substr calls are NOT the cost: one linear pass over all 30,141 notes
 // doing the same prefix tests measures 0.042s. The CORRELATION is the cost.
-// Materializing the marker set once and anti-joining measures 0.079s for the
-// same answer - 215x - and was proven set-EQUAL in both directions over all
-// 2,887 live candidates before it shipped, rather than compared by count.
+// Materializing the marker set once and anti-joining was proven set-EQUAL in
+// both directions over all 2,887 live candidates before it shipped, rather than
+// compared by count.
+//
+// THE SPEEDUP IS 24x, AND WHICH ENGINE MEASURED IT MATTERS. Through the shipped
+// modernc pure-Go driver, running these methods against a snapshot of the live
+// store: 38.1s -> 1.58s per sweep pass. The same SQL through the C sqlite3 CLI
+// measures 0.079s, which is 215x - and 215x was published before anyone noticed
+// the benchmark was not the engine that ships. Quote 24x.
+//
+// The explicit `INDEXED BY idx_workflow_notes_directive_oldest` hint on the LIST
+// query was DROPPED here, because the two added LEFT JOINs make the hint a
+// constraint on a plan it no longer describes. Review verified the planner still
+// auto-selects that partial index for the WHERE plus ORDER BY on a synthetic
+// dataset shaped like the live store's cardinality, so the plan is unchanged.
 //
 // Two details are load-bearing rather than incidental:
 //
