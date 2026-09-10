@@ -82,13 +82,41 @@ func (s *Store) UpdateAgentRuntimeRef(ctx context.Context, name, ref string) err
 // including its not-registered error, so the two single-column writers stay
 // identical in behaviour.
 func (s *Store) UpdateAgentAutonomyPolicy(ctx context.Context, name, policy string) error {
+	name = strings.TrimSpace(name)
+	policy = strings.TrimSpace(policy)
 	result, err := s.db.ExecContext(ctx,
 		`UPDATE agents SET autonomy_policy = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?`,
-		strings.TrimSpace(policy), strings.TrimSpace(name))
+		policy, name)
 	if err != nil {
 		return err
 	}
 	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected > 0 {
+		return nil
+	}
+
+	// #2134 F2: THERE IS A THIRD PLANE AND GetAgent READS IT.
+	//
+	// GetAgent falls back to agent_instances when no agents row exists (:108),
+	// and dispatch resolves through GetAgent - so an instance-only agent IS
+	// dispatchable and its policy comes from that table. Writing only `agents`
+	// left that population with no in-place writer at all: GetAgent resolved
+	// the agent while this function refused it as unregistered.
+	//
+	// MUST MIRROR GetAgent'S PRECEDENCE, NOT MERELY COVER BOTH TABLES. The row
+	// wins when both exist, so this updates `agents` first and only falls
+	// through on zero rows affected. Writing both unconditionally would move a
+	// plane dispatch is not reading for that agent.
+	result, err = s.db.ExecContext(ctx,
+		`UPDATE agent_instances SET autonomy_policy = ? WHERE name = ?`,
+		policy, name)
+	if err != nil {
+		return err
+	}
+	affected, err = result.RowsAffected()
 	if err != nil {
 		return err
 	}

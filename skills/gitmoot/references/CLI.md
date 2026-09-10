@@ -1111,6 +1111,44 @@ gitmoot agent restart reviewer
 gitmoot agent remove reviewer
 ```
 
+### `agent policy`: change a registered agent's autonomy policy in place
+
+```
+gitmoot agent policy <name> --policy auto|read-only|workspace-write|danger-full-access
+```
+
+**This writes the plane dispatch reads.** `agent type set --policy` writes the
+config plane only, and most registered agents have no config section at all, so
+for them it refuses outright. `agent start` and `agent subscribe` carry
+`--policy` but mean re-registration, which replaces the runtime session.
+
+Dispatch resolves a registered agent through `GetAgent`, which reads **the
+`agents` row if one exists and otherwise the `agent_instances` row**. This verb
+mirrors that precedence: it updates `agents`, and falls back to
+`agent_instances` only when no row was affected, so it never writes a plane
+dispatch is not reading for that agent.
+
+**When a config type also exists, both planes are written**, and the command
+reports each:
+
+```
+agent: appkit-omp
+policy: workspace-write -> danger-full-access
+config_type: danger-full-access          # or: none (registry-only agent; nothing to keep in step)
+```
+
+**Failure semantics are all-or-nothing.** The config plane is proven writable
+*before* the row moves, because there is no transaction spanning a SQLite table
+and a TOML file. A failure therefore leaves both planes untouched, and the
+command never returns non-zero after a permission has already changed. If the
+row write fails after config succeeded, the error names exactly which plane
+moved.
+
+`agent type show` returns **non-zero** when a registered agent's policy differs
+between planes, or when the effective policy cannot be determined; it prints
+`policy_effective:` alongside the config `policy:` so neither a human nor a
+stdout parser can read the config value as the effective one.
+
 `gitmoot agent show <name>` keeps the existing `runtime_ref: <id>` line unchanged
 and makes concrete session pinning explicit on a separate
 `runtime_session: pinned (last successful use: <age>)` line. The extra line is

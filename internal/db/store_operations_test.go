@@ -170,3 +170,75 @@ func TestAgentActiveJobCountCountsQueuedAndRunning(t *testing.T) {
 		t.Fatalf("AgentActiveJobCount = %d err=%v, want 0: another agent's queued job is not this agent's busy work", got, err)
 	}
 }
+
+// TestUpdateAgentAutonomyPolicyReachesTheInstancePlane covers #2134 F2, the
+// finding that corrected the model this change was designed against.
+//
+// GetAgent falls back to agent_instances when no agents row exists, and
+// dispatch resolves through GetAgent - so an instance-only agent IS
+// dispatchable and its policy comes from that table. The first version wrote
+// only `agents`, so GetAgent resolved such an agent happily while the updater
+// refused it as "not registered".
+//
+// Also pins the PRECEDENCE, which a fix could get wrong while passing the
+// obvious test: when both planes exist the row wins, so the instance must be
+// left alone.
+func TestUpdateAgentAutonomyPolicyReachesTheInstancePlane(t *testing.T) {
+	store := openStoreOperationsTestStore(t)
+	ctx := context.Background()
+
+	if err := store.UpsertAgentInstance(ctx, AgentInstance{
+		Name: "ephemeral", Type: "worker", Runtime: "codex", RuntimeRef: "ref-1",
+		RepoFullName: "gitmoot/gitmoot", Role: "worker", AutonomyPolicy: "read-only", State: "idle",
+	}); err != nil {
+		t.Fatalf("UpsertAgentInstance: %v", err)
+	}
+	got, err := store.GetAgent(ctx, "ephemeral")
+	if err != nil {
+		t.Fatalf("GetAgent(instance-only): %v", err)
+	}
+	if got.AutonomyPolicy != "read-only" {
+		t.Fatalf("precondition policy = %q, want read-only", got.AutonomyPolicy)
+	}
+
+	if err := store.UpdateAgentAutonomyPolicy(ctx, "ephemeral", "danger-full-access"); err != nil {
+		t.Fatalf("UpdateAgentAutonomyPolicy refused a dispatchable instance-only agent: %v", err)
+	}
+	after, err := store.GetAgent(ctx, "ephemeral")
+	if err != nil {
+		t.Fatalf("GetAgent after update: %v", err)
+	}
+	if after.AutonomyPolicy != "danger-full-access" {
+		t.Errorf("policy = %q after update, want danger-full-access", after.AutonomyPolicy)
+	}
+
+	// PRECEDENCE: with both planes present the ROW wins, so the row moves and
+	// the instance must NOT. Writing both would move a plane dispatch is not
+	// reading for this agent.
+	if err := store.UpsertAgent(ctx, Agent{
+		Name: "both", Role: "worker", Runtime: "codex", RuntimeRef: "ref-2",
+		AutonomyPolicy: "workspace-write", HealthStatus: "idle",
+	}); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+	if err := store.UpsertAgentInstance(ctx, AgentInstance{
+		Name: "both", Type: "worker", Runtime: "codex", RuntimeRef: "ref-2",
+		RepoFullName: "gitmoot/gitmoot", Role: "worker", AutonomyPolicy: "read-only", State: "idle",
+	}); err != nil {
+		t.Fatalf("UpsertAgentInstance(both): %v", err)
+	}
+	if err := store.UpdateAgentAutonomyPolicy(ctx, "both", "danger-full-access"); err != nil {
+		t.Fatalf("UpdateAgentAutonomyPolicy(both): %v", err)
+	}
+	instance, err := store.GetAgentInstance(ctx, "both")
+	if err != nil {
+		t.Fatalf("GetAgentInstance(both): %v", err)
+	}
+	if instance.AutonomyPolicy != "read-only" {
+		t.Errorf("instance policy = %q, want read-only untouched: the row wins, so only it should move", instance.AutonomyPolicy)
+	}
+
+	if err := store.UpdateAgentAutonomyPolicy(ctx, "nosuch", "auto"); err == nil {
+		t.Error("UpdateAgentAutonomyPolicy accepted an agent present in neither plane")
+	}
+}

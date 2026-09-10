@@ -4154,8 +4154,15 @@ func TestAgentTypeShowSurfacesPolicyDivergence(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"agent", "type", "show", "split", "--home", home}, &stdout, &stderr); code != 0 {
-		t.Fatalf("agent type show exit = %d, want 0 so the verb still works", code)
+	// #2134 F3 CHANGED THIS CONTRACT DELIBERATELY. This test previously asserted
+	// rc=0 on a known divergence; the reviewer's point is that an audit gating
+	// on exit status was then still fooled, because the primary `policy:` line
+	// carries the config value. Non-zero is now correct here, and
+	// TestAgentTypeShowIsNonZeroOnDivergence owns that assertion. Re-pinned
+	// rather than deleted, because the stdout and stderr content below is still
+	// the property this test was written for.
+	if code := Run([]string{"agent", "type", "show", "split", "--home", home}, &stdout, &stderr); code == 0 {
+		t.Fatalf("agent type show returned 0 on a known divergence")
 	}
 	if out := stdout.String(); !strings.Contains(out, "policy_effective: danger-full-access") {
 		t.Errorf("stdout = %q, want the effective policy printed", out)
@@ -4240,5 +4247,148 @@ func TestAgentPolicySyncsTheConfigPlaneWhenOneExists(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), "differs between planes") {
 		t.Errorf("planes diverged after an in-place update: %s", stderr.String())
+	}
+}
+
+// TestAgentPolicyLeavesBothPlanesUntouchedWhenConfigIsUnwritable covers #2134 F1.
+//
+// The first version committed the row and then synced config, so an unwritable
+// config.toml returned rc=1 AFTER the effective dispatch permission had already
+// changed. The operator reads failure; the grant is live. This is #2132
+// inverted, and for a verb whose job is making permission legible it is
+// disqualifying rather than a rough edge.
+//
+// The property asserted is the one that matters: on failure NEITHER plane moved.
+func TestAgentPolicyLeavesBothPlanesUntouchedWhenConfigIsUnwritable(t *testing.T) {
+	home := t.TempDir()
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"agent", "type", "set", "locked", "--home", home,
+		"--runtime", "codex", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("agent type set exit = %d, stderr=%s", code, stderr.String())
+	}
+	registerPolicyTestAgent(t, home, "locked", "read-only")
+
+	// Make the config file unwritable, which is what the reviewer's probe did.
+	paths, _, err := loadAgentTypeConfigWithPaths(home)
+	if err != nil {
+		t.Fatalf("resolve config paths: %v", err)
+	}
+	// Mode bits do not work here: every seat in this fleet runs as uid 0 and
+	// root ignores them, so a 0400 file is still writable and the arm would
+	// silently never fire. Make the path unwritable STRUCTURALLY instead -
+	// replacing the file with a directory fails the write for root too.
+	if err := os.Remove(paths.ConfigFile); err != nil {
+		t.Fatalf("remove config file: %v", err)
+	}
+	if err := os.Mkdir(paths.ConfigFile, 0o755); err != nil {
+		t.Fatalf("replace config with a directory: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code := Run([]string{"agent", "policy", "locked", "--home", home, "--policy", "danger-full-access"}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("agent policy succeeded with an unwritable config plane: %s", stdout.String())
+	}
+	// THE ROW MUST NOT HAVE MOVED. This is the whole finding, and it is read
+	// from the store rather than through another CLI verb so the assertion does
+	// not depend on the config path this test just broke.
+	if err := withStore(home, func(store *db.Store) error {
+		agent, err := store.GetAgent(context.Background(), "locked")
+		if err != nil {
+			return err
+		}
+		if got := runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy); got != "read-only" {
+			t.Errorf("row policy = %q after a FAILED command, want read-only unchanged", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read the row back: %v", err)
+	}
+}
+
+// TestAgentTypeShowIsNonZeroOnDivergence covers #2134 F3's first half: rc=0 on a
+// known divergence let a pipeline gate on exit status and be confidently wrong,
+// because the primary `policy:` line still carries the config value.
+func TestAgentTypeShowIsNonZeroOnDivergence(t *testing.T) {
+	home := t.TempDir()
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"agent", "type", "set", "rcsplit", "--home", home,
+		"--runtime", "codex", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("agent type set exit = %d, stderr=%s", code, stderr.String())
+	}
+	registerPolicyTestAgent(t, home, "rcsplit", "danger-full-access")
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"agent", "type", "show", "rcsplit", "--home", home}, &stdout, &stderr); code == 0 {
+		t.Error("agent type show returned 0 on a KNOWN divergence, so an exit-status gate is still fooled")
+	}
+	if out := stdout.String(); !strings.Contains(out, "policy_effective: danger-full-access") {
+		t.Errorf("stdout = %q, want the effective policy", out)
+	}
+
+	// Control: a type with NO registered agent must stay rc=0, or this change
+	// breaks the verb for the majority case it exists to serve.
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"agent", "type", "set", "lonely", "--home", home,
+		"--runtime", "codex", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("agent type set exit = %d", code)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"agent", "type", "show", "lonely", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Errorf("agent type show on a type with no registered agent = %d, want 0", code)
+	}
+}
+
+// TestAgentTypeShowReportsUnknownWhenTheStoreCannotBeRead covers #2134 F3's
+// second half, and it exists because its mutant SURVIVED: deleting the
+// unknown-path report left every other test green.
+//
+// The reviewer's probe made the database unreadable and got rc=0 with only the
+// CONFIG policy printed, no warning, and no effective value - the original
+// confident-wrong-answer reached by a different route. "I could not determine
+// it" and "the planes agree" must never render identically.
+func TestAgentTypeShowReportsUnknownWhenTheStoreCannotBeRead(t *testing.T) {
+	home := t.TempDir()
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"agent", "type", "set", "unreadable", "--home", home,
+		"--runtime", "codex", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("agent type set exit = %d, stderr=%s", code, stderr.String())
+	}
+	registerPolicyTestAgent(t, home, "unreadable", "danger-full-access")
+
+	// Break the store STRUCTURALLY rather than with mode bits: every seat here
+	// runs as uid 0 and root ignores 0000, so a permissions-based arm would
+	// silently never fire. Replacing the file with a directory fails the open
+	// for root too.
+	paths, _, err := loadAgentTypeConfigWithPaths(home)
+	if err != nil {
+		t.Fatalf("resolve paths: %v", err)
+	}
+	dbPath := paths.Database
+	if err := os.Remove(dbPath); err != nil {
+		t.Fatalf("remove store: %v", err)
+	}
+	if err := os.Mkdir(dbPath, 0o755); err != nil {
+		t.Fatalf("replace store with a directory: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code := Run([]string{"agent", "type", "show", "unreadable", "--home", home}, &stdout, &stderr)
+	if code == 0 {
+		t.Errorf("agent type show returned 0 with an unreadable store: stdout=%q", stdout.String())
+	}
+	if out := stdout.String(); !strings.Contains(out, "policy_effective: unknown") {
+		t.Errorf("stdout = %q, want policy_effective: unknown rather than silence", out)
+	}
+	if msg := stderr.String(); !strings.Contains(msg, "cannot determine") {
+		t.Errorf("stderr = %q, want it to say the effective policy could not be determined", msg)
 	}
 }
