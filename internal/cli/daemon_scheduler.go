@@ -1801,6 +1801,10 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 	enabled := 0
 	failed := 0
 	var lastErr error
+	// Repos whose consecutive-skip streak has earned a GUARANTEED turn. They are
+	// collected during the sweep and served after it, so a blocking acquisition
+	// never sits in front of a repo that could have dispatched immediately.
+	var forced []db.Repo
 	for _, repo := range repos {
 		if !repo.Enabled {
 			continue
@@ -1825,21 +1829,30 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 		lock := locks.For(repo.FullName())
 		held := false
 		if lock != nil {
-			if forced := skippedRepoTickNeedsLock(repo.FullName()); forced {
-				// STARVATION VALVE. A repo that loses the race every sweep would be
-				// silently late forever while the fleet looked healthy - strictly
-				// worse than the visible fleet-wide lateness this fix removes. After
-				// repoTickSkipForceAfter consecutive skips this repo waits, so it is
-				// delayed at most that many sweeps rather than indefinitely.
-				lock.Lock()
-				held = true
-			} else if lock.TryLock() {
+			if skippedRepoTickNeedsLock(repo.FullName()) {
+				// STARVATION VALVE, DEFERRED RATHER THAN IN PLACE. A repo that loses
+				// the race every sweep would be silently late forever while the fleet
+				// looked healthy - worse than the visible lateness this fix removes,
+				// because today's version is at least reproducible. So after
+				// repoTickSkipForceAfter consecutive skips the repo gets a GUARANTEED
+				// turn with a blocking acquisition.
+				//
+				// Taking that block HERE would reintroduce head-of-line blocking at a
+				// 1-in-N duty cycle: every repo behind this one would wait exactly as
+				// it does today, once every Nth contended sweep. Deferring it to the
+				// end of the sweep keeps the guarantee and removes the residual
+				// entirely - every other repo dispatches first, then the starved repo
+				// waits as long as it must.
+				forced = append(forced, repo)
+				continue
+			}
+			if lock.TryLock() {
 				held = true
 			}
 		}
 		if lock != nil && !held {
 			skipped := recordRepoTickSkip(repo.FullName())
-			writeLine(stdout, "%s: worker tick skipped, checkout busy (consecutive skips %d of %d before forcing)", repo.FullName(), skipped, repoTickSkipForceAfter)
+			writeLine(stdout, "%s: worker tick skipped, checkout busy (consecutive skips %d of %d before a forced turn)", repo.FullName(), skipped, repoTickSkipForceAfter)
 			continue
 		}
 		clearRepoTickSkip(repo.FullName())
@@ -1851,6 +1864,28 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 			// A cancellation observed mid-sweep is a clean shutdown, not a repo
 			// fault: propagate it immediately so the supervisor treats it as such
 			// (and it never counts toward or masks the escalation streak).
+			if errors.Is(tickErr, context.Canceled) || ctx.Err() != nil {
+				return tickErr
+			}
+			failed++
+			lastErr = tickErr
+			writeLine(stdout, "%s: worker tick error: %v", repo.FullName(), tickErr)
+		}
+	}
+	// THE DEFERRED FORCED TURNS. Served only after every other repo has had its
+	// chance, so the blocking acquisition below can delay nothing but itself.
+	for _, repo := range forced {
+		lock := locks.For(repo.FullName())
+		if lock != nil {
+			lock.Lock()
+		}
+		writeLine(stdout, "%s: worker tick taking a forced turn after %d consecutive skips", repo.FullName(), repoTickSkipForceAfter)
+		clearRepoTickSkip(repo.FullName())
+		tickErr := runDaemonWorkerTickTracked(ctx, store, worker, workers, false, repo.FullName(), rootFilter, stdout, now, tracker, cand)
+		if lock != nil {
+			lock.Unlock()
+		}
+		if tickErr != nil {
 			if errors.Is(tickErr, context.Canceled) || ctx.Err() != nil {
 				return tickErr
 			}
