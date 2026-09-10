@@ -89,6 +89,24 @@ func reconcileExecBackendInventory(ctx context.Context, worker jobWorker, stdout
 	if err != nil {
 		return fmt.Errorf("resolve execution backend for reconciliation: %w", err)
 	}
+	// THE CADENCE KEY IS THE BACKEND, AND THAT IS DELIBERATE ON TWO AXES.
+	//
+	// Across REPOS: runDaemonWorkerTickTracked runs per repo, so several ticks
+	// share one cadence entry - which is correct rather than starvation, because
+	// reconciliation is provider-global by construction.
+	// ListRecoverableExecBackendAttempts filters on `provider = ?` ALONE and the
+	// execbackend_attempts table has NO repo column, so one pass already covers
+	// every repo's attempts. Keying per repo would multiply identical provider
+	// inventory reads by the repo count for no added coverage.
+	//
+	// Across PROVIDER TARGETS: the construction guard keys finer -
+	// `backend|root` for local and `backend|baseURL|sha256(apiKey)` for remote -
+	// because it also runs from non-daemon callers. Within one daemon those
+	// dimensions are PROCESS CONSTANTS: RemoteExecConfig is loaded per home
+	// (config.LoadRemoteExecConfig(paths)) and a daemon has one home, so its
+	// local root and its E2B base URL and key cannot vary between ticks. If a
+	// daemon ever serves multiple homes or accounts, this key must gain those
+	// dimensions or one target will suppress another's pass.
 	key := string(backend)
 	if !execBackendReconcileState.due(key, now) {
 		return nil
