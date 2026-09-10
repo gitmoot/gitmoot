@@ -36,7 +36,7 @@ func stageCleanFixtureRuns(t *testing.T) {
 	t.Helper()
 	home := t.TempDir()
 	_, entrypoint := stagedPackageFixture(t)
-	launcher, err := StageRuntime(home, "tool", entrypoint)
+	launcher, _, err := StageRuntime(home, "tool", entrypoint)
 	if err != nil {
 		t.Fatalf("a clean package boundary was refused: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestStageRefusesATreeWithAPrivateAncestor(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	launcher, err := StageRuntime(home, "tool", entrypoint)
+	launcher, _, err := StageRuntime(home, "tool", entrypoint)
 	if !errors.Is(err, ErrRuntimeNotStageable) {
 		t.Fatalf("a tree containing a 0700 directory staged anyway: launcher=%q err=%v", launcher, err)
 	}
@@ -85,7 +85,7 @@ func TestStageRefusesANonWorldReadableMember(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := StageRuntime(home, "tool", entrypoint); !errors.Is(err, ErrRuntimeNotStageable) {
+	if _, _, err := StageRuntime(home, "tool", entrypoint); !errors.Is(err, ErrRuntimeNotStageable) {
 		t.Fatalf("a tree containing a mode-0600 member staged anyway: %v", err)
 	}
 	assertNoStagedBytes(t, home, "seat-must-not-read-this")
@@ -103,7 +103,7 @@ func TestStageRefusesASymlinkedMember(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := StageRuntime(home, "tool", entrypoint); !errors.Is(err, ErrRuntimeNotStageable) {
+	if _, _, err := StageRuntime(home, "tool", entrypoint); !errors.Is(err, ErrRuntimeNotStageable) {
 		t.Fatalf("a tree containing an in-root symlink staged anyway: %v", err)
 	}
 	assertNoStagedBytes(t, home, "seat-must-not-read-this")
@@ -150,7 +150,7 @@ func TestStageRefusesASymlinkSwappedBetweenEnumerationAndOpen(t *testing.T) {
 	}
 	t.Cleanup(func() { swapBarrier = nil })
 
-	_, err := StageRuntime(home, "tool", entrypoint)
+	_, _, err := StageRuntime(home, "tool", entrypoint)
 	if !swapped {
 		t.Fatal("the barrier never fired, so this test did not exercise the substitution window")
 	}
@@ -178,7 +178,7 @@ func TestStageRefusesASymlinkSwappedBetweenEnumerationAndOpen(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	launcher, controlErr := StageRuntime(controlHome, "tool", controlEntry)
+	launcher, _, controlErr := StageRuntime(controlHome, "tool", controlEntry)
 	if !replaced {
 		t.Fatal("the control barrier never fired")
 	}
@@ -197,13 +197,13 @@ func TestStageRefusesReuseWhenPublishedContentChanged(t *testing.T) {
 	if err := os.WriteFile(source, []byte("#!/bin/sh\nprintf 'v1\\n'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	launcher, err := StageRuntime(home, "tool", source)
+	launcher, _, err := StageRuntime(home, "tool", source)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// CONTROL FIRST: an untouched published tree is reused and returns the same
 	// launcher, so the refusal below cannot mean "never reuses anything".
-	reused, err := StageRuntime(home, "tool", source)
+	reused, _, err := StageRuntime(home, "tool", source)
 	if err != nil {
 		t.Fatalf("an untouched published tree was not reused: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestStageRefusesReuseWhenPublishedContentChanged(t *testing.T) {
 	if err := os.WriteFile(entrypoint, []byte("#!/bin/sh\nprintf 'substituted\\n'\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := StageRuntime(home, "tool", source); !errors.Is(err, ErrRuntimeNotStageable) {
+	if _, _, err := StageRuntime(home, "tool", source); !errors.Is(err, ErrRuntimeNotStageable) {
 		t.Fatalf("reuse of a published tree whose bytes changed returned %v, want ErrRuntimeNotStageable", err)
 	}
 }

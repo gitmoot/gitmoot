@@ -41,7 +41,7 @@ func TestStageRuntimeStagesASelfContainedExecutableWithoutItsProfile(t *testing.
 		t.Fatal(err)
 	}
 
-	staged, err := StageRuntime(home, "kimi", executable)
+	staged, _, err := StageRuntime(home, "kimi", executable)
 	if err != nil {
 		t.Fatalf("StageRuntime: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestStageRuntimeStagesANodePackageBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	staged, err := StageRuntime(home, "codex", executable)
+	staged, _, err := StageRuntime(home, "codex", executable)
 	if err != nil {
 		t.Fatalf("StageRuntime: %v", err)
 	}
@@ -154,14 +154,14 @@ func TestStageRuntimeRepublishesWhenTheSourceChanges(t *testing.T) {
 	if err := os.WriteFile(executable, []byte("#!/bin/sh\nprintf 'v1\\n'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	first, err := StageRuntime(home, "claude", executable)
+	first, _, err := StageRuntime(home, "claude", executable)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(executable, []byte("#!/bin/sh\nprintf 'v2\\n'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	second, err := StageRuntime(home, "claude", executable)
+	second, _, err := StageRuntime(home, "claude", executable)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +201,7 @@ func TestStageRuntimeStagesTheResolvedTargetOfASymlinkedPathEntry(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	staged, err := StageRuntime(home, "claude", link)
+	staged, _, err := StageRuntime(home, "claude", link)
 	if err != nil {
 		t.Fatalf("StageRuntime on a symlinked PATH entry: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestStageRuntimeRefusesCorruptedPublishedCopy(t *testing.T) {
 	if err := os.WriteFile(source, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	staged, err := StageRuntime(home, "claude", source)
+	staged, _, err := StageRuntime(home, "claude", source)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +257,7 @@ func TestStageRuntimeRefusesCorruptedPublishedCopy(t *testing.T) {
 	if err := os.Remove(filepath.Join(published, "claude")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := StageRuntime(home, "claude", source); !errors.Is(err, ErrRuntimeNotStageable) {
+	if _, _, err := StageRuntime(home, "claude", source); !errors.Is(err, ErrRuntimeNotStageable) {
 		t.Fatalf("restaging a corrupted published copy returned %v, want ErrRuntimeNotStageable", err)
 	}
 }
@@ -285,7 +285,7 @@ func TestStageRuntimeReusesAPublishedBinaryRuntime(t *testing.T) {
 	if err := os.WriteFile(source, []byte("\x7fELF\x02\x01\x01 not a script\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	first, err := StageRuntime(home, "claude", source)
+	first, _, err := StageRuntime(home, "claude", source)
 	if err != nil {
 		t.Fatalf("first StageRuntime: %v", err)
 	}
@@ -298,7 +298,7 @@ func TestStageRuntimeReusesAPublishedBinaryRuntime(t *testing.T) {
 	if info.Mode()&os.ModeSymlink == 0 {
 		t.Fatalf("launcher %q has mode %s, want a symlink: this regression covers the symlink-launcher reuse path and a regular launcher no longer exercises it", first, info.Mode())
 	}
-	second, err := StageRuntime(home, "claude", source)
+	second, _, err := StageRuntime(home, "claude", source)
 	if err != nil {
 		t.Fatalf("reusing the published binary runtime: %v", err)
 	}
@@ -335,7 +335,7 @@ func TestStageRuntimeDigestCoversANestedLauncherDirectory(t *testing.T) {
 	if err := os.WriteFile(source, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	staged, err := StageRuntime(home, "codex", source)
+	staged, _, err := StageRuntime(home, "codex", source)
 	if err != nil {
 		t.Fatalf("StageRuntime: %v", err)
 	}
@@ -347,7 +347,7 @@ func TestStageRuntimeDigestCoversANestedLauncherDirectory(t *testing.T) {
 	if _, err := os.Stat(publishedHelper); err != nil {
 		t.Fatalf("a nested %s member was not staged, so the packaged runtime is incomplete: %v", launcherDirName, err)
 	}
-	if _, err := StageRuntime(home, "codex", source); err != nil {
+	if _, _, err := StageRuntime(home, "codex", source); err != nil {
 		t.Fatalf("reusing a package that contains a nested %s directory: %v", launcherDirName, err)
 	}
 	// The engine tree is published read-only, so the tamper needs the directory
@@ -358,7 +358,7 @@ func TestStageRuntimeDigestCoversANestedLauncherDirectory(t *testing.T) {
 	if err := os.Remove(publishedHelper); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := StageRuntime(home, "codex", source); !errors.Is(err, ErrRuntimeNotStageable) {
+	if _, _, err := StageRuntime(home, "codex", source); !errors.Is(err, ErrRuntimeNotStageable) {
 		t.Fatalf("removing a nested %s member left the published digest valid (err = %v); the launcher exclusion must apply to the top level only", launcherDirName, err)
 	}
 }

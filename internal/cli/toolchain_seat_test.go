@@ -417,7 +417,7 @@ func TestStageSeatRuntimesCopiesInstalledAndShadowsAbsentRuntimes(t *testing.T) 
 	t.Setenv("PATH", strings.Join(pathEntries, string(os.PathListSeparator)))
 
 	paths := config.PathsForHome(t.TempDir())
-	commands, diagnostics, err := stageSeatRuntimes(paths)
+	commands, _, diagnostics, err := stageSeatRuntimes(paths)
 	if err != nil {
 		t.Fatal(err)
 	}

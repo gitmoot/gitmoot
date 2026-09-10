@@ -67,14 +67,20 @@ func RuntimeRoot(gitmootHome string) string {
 // no component of any source path can be a symlink and nothing resolves outside
 // the boundary. The digest and the copy read the SAME descriptors, so the
 // published name describes the published bytes by construction.
-func StageRuntime(gitmootHome string, name string, executable string) (string, error) {
+// It returns the staged launcher AND the staged launcher of the interpreter
+// that launcher execs, which is "" for a native binary. THE SECOND VALUE IS THE
+// EXEC CLOSURE AND CALLERS THAT SANDBOX A SEAT MUST GRANT IT (#2141): the
+// launcher is a two-line script that execs the interpreter's own published
+// tree, a SIBLING published root, so a caller granting only this launcher's
+// root has granted a command it cannot run.
+func StageRuntime(gitmootHome string, name string, executable string) (string, string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" || strings.ContainsAny(name, `/\`) || name == "." || name == ".." {
-		return "", fmt.Errorf("%w: %q is not usable as one path component", ErrRuntimeNotStageable, name)
+		return "", "", fmt.Errorf("%w: %q is not usable as one path component", ErrRuntimeNotStageable, name)
 	}
 	executable = strings.TrimSpace(executable)
 	if executable == "" || !filepath.IsAbs(executable) {
-		return "", fmt.Errorf("%w: executable %q must be an absolute path", ErrRuntimeNotStageable, executable)
+		return "", "", fmt.Errorf("%w: executable %q must be an absolute path", ErrRuntimeNotStageable, executable)
 	}
 	// The RESOLVED target is what runs, and it is what must be copied: a PATH
 	// entry is frequently a symlink into a versioned directory (claude ships
@@ -82,18 +88,18 @@ func StageRuntime(gitmootHome string, name string, executable string) (string, e
 	// copying the link would stage something unrunnable.
 	resolved, err := filepath.EvalSymlinks(executable)
 	if err != nil {
-		return "", fmt.Errorf("%w: resolve %q: %v", ErrRuntimeNotStageable, executable, err)
+		return "", "", fmt.Errorf("%w: resolve %q: %v", ErrRuntimeNotStageable, executable, err)
 	}
 	boundary, relative, packaged := runtimeBoundary(resolved)
 	source, err := openStageSource(boundary, relative, packaged)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer source.close()
 
 	fingerprint, err := source.digest()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	// THE INTERPRETER IS PART OF THE IDENTITY. A script runtime that cannot run
@@ -102,7 +108,7 @@ func StageRuntime(gitmootHome string, name string, executable string) (string, e
 	// stale launcher can never point at a retired interpreter tree.
 	interpreter, err := source.stageInterpreter(gitmootHome)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if interpreter != "" {
 		fingerprint = shortDigest(fingerprint + "\x00" + interpreter)
@@ -119,14 +125,14 @@ func StageRuntime(gitmootHome string, name string, executable string) (string, e
 
 	if _, err := os.Lstat(published); err == nil {
 		if err := validatePublished(published, name, relative, fingerprint); err != nil {
-			return "", err
+			return "", "", err
 		}
-		return launcher, nil
+		return launcher, interpreter, nil
 	}
 	if err := source.publish(root, publishedName, name, relative, interpreter, fingerprint); err != nil {
-		return "", err
+		return "", "", err
 	}
-	return launcher, nil
+	return launcher, interpreter, nil
 }
 
 // RuntimeInterpreter reports the interpreter a staged entrypoint needs, and the
@@ -325,6 +331,22 @@ func StagedRuntimeRoot(gitmootHome string, shim string) (string, error) {
 		return "", fmt.Errorf("%w: runtime shim %q is outside engine runtime root %q", ErrRuntimeNotStageable, shim, RuntimeRoot(gitmootHome))
 	}
 	return root, nil
+}
+
+// StagedUnderRuntimeRoot reports whether path is a launcher the engine
+// published under its own runtime root.
+//
+// IT EXISTS TO SEPARATE THE TWO KINDS OF INTERPRETER StageRuntime CAN REPORT.
+// A packaged script runtime's interpreter is COPIED and published, so its root
+// must be granted to a sandboxed seat. A SYSTEM interpreter (/bin/sh) is
+// returned verbatim and never copied, because "the sandbox grants those roots
+// unconditionally" - asking for its staged root is a category error and fails
+// with "not inside a .bin directory". Callers building grants use this to skip
+// the second kind rather than to swallow the error, which would also hide a
+// genuine containment failure.
+func StagedUnderRuntimeRoot(gitmootHome string, path string) bool {
+	_, err := StagedRuntimeRoot(gitmootHome, path)
+	return err == nil
 }
 
 // runtimeBoundary decides what must be copied for a resolved executable.

@@ -97,7 +97,8 @@ func (s *stageSource) stageInterpreter(gitmootHome string) (string, error) {
 	if systemInterpreterRoots(absolute) {
 		return absolute, nil
 	}
-	return StageRuntime(gitmootHome, filepath.Base(candidate), absolute)
+	launcher, _, err := StageRuntime(gitmootHome, filepath.Base(candidate), absolute)
+	return launcher, err
 }
 
 // publish copies the accepted members into the engine root and publishes them by

@@ -121,8 +121,14 @@ var seatRuntimeNames = []string{"claude", "kimi", "codex"}
 // narrowed: the engine copies each runtime's own artifact into a tree it created
 // and grants that. A daemon-owned tree has no operator-writable descendants to
 // appear later, which closes the class rather than its two known instances.
-func stageSeatRuntimes(paths config.Paths) ([]string, []string, error) {
+// It returns the launchers a seat may exec, THE EXEC-CLOSURE ROOTS those
+// launchers additionally require, and diagnostics. The closure is separate from
+// the launcher list on purpose: a launcher belongs on the seat's PATH and an
+// interpreter must NOT, because a seat that can resolve `node` by name gets a
+// second way to run code that no dispatch decision chose (#2141).
+func stageSeatRuntimes(paths config.Paths) ([]string, []string, []string, error) {
 	var staged []string
+	var interpreters []string
 	var diagnostics []string
 	for _, name := range seatRuntimeNames {
 		if resolved, lookupErr := exec.LookPath(name); lookupErr == nil {
@@ -139,20 +145,27 @@ func stageSeatRuntimes(paths config.Paths) ([]string, []string, error) {
 			// as the exit-126 command below rather than leaving it
 			// host-resolvable. That is the whole point: an explicit
 			// unavailability instead of a silent fallback.
-			launcher, stageErr := toolchain.StageRuntime(paths.Home, name, resolved)
+			launcher, interpreter, stageErr := toolchain.StageRuntime(paths.Home, name, resolved)
 			if stageErr == nil {
 				staged = append(staged, launcher)
+				// Only ENGINE-PUBLISHED interpreters need a grant. A system
+				// interpreter is returned as its host path and its root is
+				// already granted, so passing it on would fail containment
+				// resolution for a runtime that is working correctly.
+				if interpreter != "" && toolchain.StagedUnderRuntimeRoot(paths.Home, interpreter) {
+					interpreters = append(interpreters, interpreter)
+				}
 				continue
 			}
 			diagnostics = append(diagnostics, fmt.Sprintf("runtime %s could not be staged, so it is published unavailable rather than left host-resolvable: %v", name, stageErr))
 		}
 		unavailable, err := toolchain.StageUnavailableRuntime(paths.Home, name)
 		if err != nil {
-			return nil, diagnostics, fmt.Errorf("publish unavailable runtime %s: %w", name, err)
+			return nil, nil, diagnostics, fmt.Errorf("publish unavailable runtime %s: %w", name, err)
 		}
 		staged = append(staged, unavailable)
 	}
-	return staged, diagnostics, nil
+	return staged, interpreters, diagnostics, nil
 }
 
 // seatRuntimeUnavailable reports WHY the runtime a seat is about to execute was
