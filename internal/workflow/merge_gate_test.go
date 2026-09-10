@@ -2121,7 +2121,10 @@ func TestPolicyMergeGateUndecidedRoundOrderNeverHidesUnfinishedReviewer(t *testi
 		{name: "queued", state: JobQueued, wantReason: "waiting for reviewer audit", wantPending: true},
 		{name: "running", state: JobRunning, wantReason: "waiting for reviewer audit", wantPending: true},
 		{name: "failed", state: JobFailed, wantReason: "crashed reviewer audit"},
-		{name: "cancelled", state: JobCancelled, wantReason: "crashed reviewer audit"},
+		// #1799: a cancellation is diagnosed as a cancellation. The `failed` row
+		// above still expects "crashed reviewer", which is what keeps this table
+		// asserting the DISTINCTION rather than one label for both states.
+		{name: "cancelled", state: JobCancelled, wantReason: "cancelled review slot for reviewer audit"},
 	} {
 		for _, order := range []struct {
 			name       string
@@ -3770,9 +3773,15 @@ func TestPolicyMergeGateParksCancelledReviewerAtEvaluatedHead(t *testing.T) {
 	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 		t.Fatalf("decision = %+v, want cancelled reviewer parked", decision)
 	}
-	if !strings.Contains(decision.Reason.Render(), "crashed reviewer reviewer-b") ||
+	// #1799: this assertion pinned the DEFECT - it required a cancelled job to be
+	// reported as a crashed reviewer. The park itself is the behaviour worth
+	// keeping and is unchanged above; only the diagnosis is corrected here.
+	if !strings.Contains(decision.Reason.Render(), "cancelled review slot for reviewer reviewer-b") ||
 		!strings.Contains(decision.Reason.Render(), "review-cancelled") {
-		t.Fatalf("decision reason = %q, want crashed reviewer and cancelled job", decision.Reason)
+		t.Fatalf("decision reason = %q, want a cancelled slot naming the cancelled job", decision.Reason)
+	}
+	if strings.Contains(decision.Reason.Render(), "crashed reviewer") {
+		t.Fatalf("a cancelled reviewer is still called crashed: %q", decision.Reason)
 	}
 	if len(gh.merges) != 0 {
 		t.Fatalf("merge calls = %+v, want none", gh.merges)
@@ -4053,8 +4062,10 @@ func TestPolicyMergeGateCLIReviewResolvesOnlySettledNonVerdictEngineRound(t *tes
 			cliRecorded: "2026-07-31 12:02:00", wantReason: "crashed reviewer audit",
 		},
 		{
+			// #1799: still BLOCKING, which is the property this row exists for; the
+			// diagnosis is now a cancellation rather than a crash.
 			name: "cancelled row keeps blocking", state: JobCancelled,
-			cliRecorded: "2026-07-31 12:02:00", wantReason: "crashed reviewer audit",
+			cliRecorded: "2026-07-31 12:02:00", wantReason: "cancelled review slot for reviewer audit",
 		},
 		{
 			name: "queued row keeps waiting", state: JobQueued,
@@ -4632,10 +4643,13 @@ func TestPolicyMergeGateWinningDelegationOutcomeNamesSubordinateObligations(t *t
 func TestPolicyMergeGateDelegatedReviewEvidenceEnumeration(t *testing.T) {
 	type outcome string
 	const (
-		satisfies        outcome = "SAT"
-		waits            outcome = "WAIT"
-		blocks           outcome = "BLOCK"
-		parksCrashed     outcome = "PARK_C"
+		satisfies    outcome = "SAT"
+		waits        outcome = "WAIT"
+		blocks       outcome = "BLOCK"
+		parksCrashed outcome = "PARK_C"
+		// #1799: a cancelled child parks in its OWN class. Folding it into PARK_C
+		// is the mislabel this matrix would otherwise keep asserting.
+		parksCancelled   outcome = "PARK_X"
 		parksAbstaining  outcome = "PARK_A"
 		parksUnknown     outcome = "PARK_U"
 		parksCouldNotRun outcome = "PARK_STATE_BLOCKED_COULD_NOT_RUN"
@@ -4692,7 +4706,7 @@ func TestPolicyMergeGateDelegatedReviewEvidenceEnumeration(t *testing.T) {
 		{id: "H11_NIL_RESULT", children: []childFixture{{label: "nil-result", state: JobSucceeded, nilResult: true}}, want: parksUnknown},
 		{id: "H12_MALFORMED_PAYLOAD", children: []childFixture{{label: "malformed-payload", state: JobSucceeded, malformed: true}}, want: parksUnknown},
 		{id: "H13_STATE_FAILED_CRASHED", children: []childFixture{crashed("state-failed-crashed")}, want: parksCrashed},
-		{id: "H14_STATE_CANCELLED_CRASHED", children: []childFixture{child("state-cancelled-crashed", JobCancelled, "")}, want: parksCrashed},
+		{id: "H14_STATE_CANCELLED", children: []childFixture{child("state-cancelled", JobCancelled, "")}, want: parksCancelled},
 		{id: "H15_STATE_BLOCKED_COULD_NOT_RUN", children: []childFixture{couldNotRun("state-blocked-could-not-run")}, want: parksCouldNotRun},
 		{id: "H16_UNRECOGNIZED_STATE", children: []childFixture{child("unrecognized-state", JobState("paused"), "")}, want: parksUnknown},
 
@@ -4824,6 +4838,11 @@ func TestPolicyMergeGateDelegatedReviewEvidenceEnumeration(t *testing.T) {
 						if decision.Merged || !decision.LeaveOpen || !decision.Reason.IsGateMiss() ||
 							!strings.Contains(decision.Reason.Render(), "crashed delegation children") {
 							t.Fatalf("decision = %+v, want PARK-C", decision)
+						}
+					case parksCancelled:
+						if decision.Merged || !decision.LeaveOpen || !decision.Reason.IsGateMiss() ||
+							!strings.Contains(decision.Reason.Render(), "CANCELLED delegation children") {
+							t.Fatalf("decision = %+v, want PARK-X", decision)
 						}
 					case parksAbstaining:
 						if decision.Merged || !decision.LeaveOpen || !decision.Reason.IsGateMiss() ||
@@ -6862,7 +6881,10 @@ func TestPolicyMergeGateAtHeadStateGuardAdmitsNothingUnsucceeded(t *testing.T) {
 		{JobQueued, "waiting for reviewer", "crashed-reviewer switch, pending arm"},
 		{JobRunning, "waiting for reviewer", "crashed-reviewer switch, pending arm"},
 		{JobFailed, "crashed reviewer", "crashed-reviewer switch, error arm"},
-		{JobCancelled, "crashed reviewer", "crashed-reviewer switch, error arm"},
+		// #1799: the mechanism is now its OWN arm, which is the point of this table -
+		// it attributes each state's refusal to a named mechanism, and cancelled and
+		// failed no longer share one.
+		{JobCancelled, "cancelled review slot", "cancelled-slot switch, error arm"},
 		{JobBlocked, "has unusable job state", "unusable-state guard in the slot scan, NOT the switch"},
 	} {
 		t.Run(string(tt.state), func(t *testing.T) {
