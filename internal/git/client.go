@@ -560,6 +560,43 @@ func (c Client) OriginRemote(ctx context.Context) (string, error) {
 	return remote, nil
 }
 
+// RemoteDefaultBranch returns the branch the ORIGIN REMOTE names as its own
+// default, read from the `refs/remotes/origin/HEAD` symbolic ref that clone and
+// `git remote set-head` maintain.
+//
+// It exists because the default branch was previously taken from CurrentBranch
+// (#2145), which is the branch the local worktree happens to have checked out.
+// That is never the repository's default branch except by coincidence: on this
+// host `jerryfane/herdr` had recorded `fix/lan-address-portability` while GitHub
+// reported `master`, and the recorded value is consumed as the BASE BRANCH for
+// advancement and dispatch.
+//
+// An UNSET origin/HEAD is reported as an error rather than guessed. A guess here
+// would be written into the base-branch field, and a wrong base is worse than an
+// absent one: callers preserve the previously stored value when this yields
+// nothing, whereas a fabricated "main" would silently overwrite a correct record
+// on any repository that uses a different default.
+func (c Client) RemoteDefaultBranch(ctx context.Context) (string, error) {
+	result, err := c.run(ctx, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+	if err != nil {
+		return "", err
+	}
+	ref := strings.TrimSpace(result.Stdout)
+	// Defensive, and UNREACHABLE via git: measured, `symbolic-ref --short
+	// refs/remotes/origin/HEAD` exits 128 both when the repository has no origin
+	// and after `git remote set-head origin --delete`, so the error return above
+	// fires and this branch cannot be entered. It is kept for consistency with
+	// OriginRemote and OriginRemoteConfigured, which carry the same check. A
+	// mutant replacing it with a guessed default therefore survives by design.
+	if ref == "" {
+		return "", errors.New("origin default branch is empty")
+	}
+	// `--short` yields `origin/master`; the stored field holds a branch name.
+	// Only the leading remote name is removed, so a branch whose own name
+	// contains `origin/` survives intact.
+	return strings.TrimPrefix(ref, "origin/"), nil
+}
+
 // OriginRemoteConfigured returns the literal configured origin URL without Git's
 // url.*.insteadOf rewrite. A disposable clone must preserve the forge-facing URL
 // in its own config even when the source checkout rewrites transport locally.

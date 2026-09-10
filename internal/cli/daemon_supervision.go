@@ -15,6 +15,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
+	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -1276,6 +1277,25 @@ func (p registeredRepoPoller) pollRepo(ctx context.Context, repoRecord db.Repo, 
 		message := fmt.Sprintf("registered repo checkout path is unavailable: %s", repoRecord.CheckoutPath)
 		writeLine(p.Stdout, "%s: %s", repoRecord.FullName(), message)
 		return registeredRepoPollResult{LastError: message}, store.UpdateRepoPollResult(ctx, repoRecord.FullName(), lastPollAt, message)
+	}
+	// Self-heal the cached default branch (#2145). The stored value is consumed
+	// as the BASE BRANCH, and it was previously written from the worktree's
+	// CURRENT branch, so existing records can name a feature branch that no
+	// amount of correct writing afterwards would fix - the bad value is already
+	// durable. Reconciling here means a wrong record corrects itself on the next
+	// successful poll instead of requiring a manual store edit.
+	//
+	// Deliberately BEFORE the dry-run return and OUTSIDE the checkout lock: it
+	// only reads a symbolic ref and writes one column, so it must not wait on a
+	// lock held by a running job, and a dry run should still not be silently
+	// operating against a base branch it knows is wrong.
+	if branch, branchErr := gitutil.NewHostClient(repoRecord.CheckoutPath).RemoteDefaultBranch(ctx); branchErr == nil {
+		if changed, updateErr := store.UpdateRepoDefaultBranch(ctx, repoRecord.FullName(), branch); updateErr != nil {
+			writeLine(p.Stdout, "%s: default branch reconcile failed: %v", repoRecord.FullName(), updateErr)
+		} else if changed {
+			writeLine(p.Stdout, "%s: default branch reconciled to %s (was %s)", repoRecord.FullName(), branch, repoRecord.DefaultBranch)
+			repoRecord.DefaultBranch = branch
+		}
 	}
 	// `Workers` is a fleet-wide flag echoed here, not a per-repo pool: no such
 	// pool exists, so printing it as one only misleads (#1758).

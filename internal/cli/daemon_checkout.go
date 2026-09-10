@@ -788,8 +788,19 @@ func repoRecordForCheckout(ctx context.Context, repo github.Repository, client g
 	if remoteRepo.String() != repo.FullName() {
 		return db.Repo{}, fmt.Errorf("current checkout origin is %s, not %s", remoteRepo.String(), repo.FullName())
 	}
+	// THE REMOTE'S DEFAULT, NEVER THE LOCAL HEAD (#2145). This read used
+	// CurrentBranch, so whichever branch the worktree happened to have checked
+	// out when the record was written became the repository's recorded default -
+	// and that field is consumed as the BASE BRANCH by daemon_workflow.go and as
+	// the dispatch branch default by agent_dispatch.go. On this host it had
+	// recorded `fix/lan-address-portability` for a repository whose default is
+	// `master`.
+	//
+	// Left EMPTY when origin/HEAD is unset: UpsertRepo preserves the stored value
+	// against an empty one, so an unreadable remote default keeps whatever was
+	// already recorded instead of overwriting it with a worktree artifact.
 	defaultBranch := ""
-	if branch, err := client.CurrentBranch(ctx); err == nil {
+	if branch, err := client.RemoteDefaultBranch(ctx); err == nil {
 		defaultBranch = branch
 	}
 	return db.Repo{
