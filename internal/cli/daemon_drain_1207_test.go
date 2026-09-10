@@ -1,0 +1,439 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/workflow"
+)
+
+// #1207, bounded half: a deploy must not need an idle window that never arrives.
+//
+// The guarantee under test is narrow and load-bearing: while draining, the
+// daemon claims nothing, and QUEUED WORK IS NOT LOST. A drain that dropped or
+// failed queued jobs would be worse than the restart it replaces.
+
+func TestDrainSentinelStartsAbsentAndTogglesBothWays(t *testing.T) {
+	home := t.TempDir()
+
+	on, err := daemonDrainActiveForHome(home)
+	if err != nil {
+		t.Fatalf("initial read: %v", err)
+	}
+	if on {
+		t.Fatal("a fresh home reports draining; the daemon would claim nothing on first start")
+	}
+
+	if err := setDaemonDrain(home, true); err != nil {
+		t.Fatalf("set drain: %v", err)
+	}
+	if on, err = daemonDrainActiveForHome(home); err != nil || !on {
+		t.Fatalf("after set: draining=%v err=%v, want true", on, err)
+	}
+
+	if err := setDaemonDrain(home, false); err != nil {
+		t.Fatalf("clear drain: %v", err)
+	}
+	if on, err = daemonDrainActiveForHome(home); err != nil || on {
+		t.Fatalf("after clear: draining=%v err=%v, want false", on, err)
+	}
+
+	// Clearing an already-clear drain is not an error: an operator re-running
+	// --clear after a restart must not see a failure that looks like a problem.
+	if err := setDaemonDrain(home, false); err != nil {
+		t.Fatalf("second clear should be a no-op, got %v", err)
+	}
+}
+
+// THE FLAG IS THE FILE'S EXISTENCE, NOT ITS CONTENTS. A truncated or garbled
+// body must still drain, because anything that parses the body can fail open -
+// and failing open resumes dispatch during a deploy, which is the single
+// outcome drain exists to prevent.
+func TestDrainHoldsWithAnUnreadableBody(t *testing.T) {
+	home := t.TempDir()
+	if err := setDaemonDrain(home, true); err != nil {
+		t.Fatalf("set drain: %v", err)
+	}
+	path, err := daemonDrainSentinelPath(home)
+	if err != nil {
+		t.Fatalf("sentinel path: %v", err)
+	}
+	if err := os.WriteFile(path, []byte{0xff, 0x00, 0xff}, 0o600); err != nil {
+		t.Fatalf("corrupt sentinel: %v", err)
+	}
+	on, err := daemonDrainActiveForHome(home)
+	if err != nil {
+		t.Fatalf("read corrupted sentinel: %v", err)
+	}
+	if !on {
+		t.Fatal("a corrupted sentinel stopped draining; the flag must be existence, not content")
+	}
+}
+
+// AN UNRESOLVABLE HOME IS NOT A DRAIN. Reporting true would wedge every daemon
+// whose home cannot be resolved; reporting false is correct because no operator
+// asked for a drain there.
+// AN EMPTY HOME IS THE DEFAULT HOME, AND THE WRITER AND READER MUST AGREE ON IT.
+//
+// THIS TEST PREVIOUSLY ASSERTED THE DEFECT. It called daemonDrainActiveForHome("")
+// and required FALSE, which is what the guard's empty-home shortcut returned -
+// so it ratified a drain that was a no-op for every default-configured daemon
+// and reported PASS while doing it. The reviewer found the P1 (#2096) by tracing
+// what "" actually means: daemonChildArgs drops --home when it is empty, so the
+// real daemon runs with ConfigHome == "".
+//
+// HOME IS REDIRECTED so config.DefaultPaths() resolves inside the test's own
+// tree. Without this the test would read and write /root/.gitmoot, which is
+// forbidden.
+func TestDrainWithNoHomeFlagUsesTheDefaultHomeForBothSides(t *testing.T) {
+	fake := t.TempDir()
+	t.Setenv("HOME", fake)
+
+	// Guard against the redirect silently failing: if DefaultPaths does not land
+	// inside the fixture, this test would touch the real home and must not run.
+	paths, err := config.DefaultPaths()
+	if err != nil {
+		t.Fatalf("DefaultPaths: %v", err)
+	}
+	if !strings.HasPrefix(paths.Home, fake) {
+		t.Fatalf("HOME redirect did not take: DefaultPaths resolved to %q, outside %q", paths.Home, fake)
+	}
+
+	on, err := daemonDrainActiveForHome("")
+	if err != nil {
+		t.Fatalf("empty home before draining: %v", err)
+	}
+	if on {
+		t.Fatal("reported draining before anything wrote a sentinel")
+	}
+
+	// What `gitmoot daemon drain` with no --home does.
+	if err := setDaemonDrain("", true); err != nil {
+		t.Fatalf("setDaemonDrain(\"\"): %v", err)
+	}
+
+	// What the scheduler asks, with worker.ConfigHome == "".
+	on, err = daemonDrainActiveForHome("")
+	if err != nil {
+		t.Fatalf("empty home after draining: %v", err)
+	}
+	if !on {
+		t.Fatal("THE P1: the command wrote the default sentinel and the guard did not see it; the daemon would keep claiming through a deploy")
+	}
+}
+
+// THE CLI CONTRACT, both directions, through Run rather than the helpers - the
+// helper-only shape is the defect #2061 f3 filed against this seat, and a
+// command that never wires its subcommand would pass a helper test.
+func TestDaemonDrainCommandSetsAndClearsTheSentinel(t *testing.T) {
+	home := t.TempDir()
+
+	var stdout, stderr bytes.Buffer
+	// --timeout 0 so the wait loop reports immediately rather than sleeping: the
+	// subject here is the sentinel and the wiring, not the wait.
+	code := Run([]string{"daemon", "drain", "--home", home, "--timeout", "0"}, &stdout, &stderr)
+	if code != 0 && code != 1 {
+		t.Fatalf("daemon drain exit = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "stopped claiming") {
+		t.Fatalf("drain did not report that claiming stopped:\n%s", stdout.String())
+	}
+	on, err := daemonDrainActiveForHome(home)
+	if err != nil || !on {
+		t.Fatalf("command did not set the sentinel: draining=%v err=%v", on, err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"daemon", "drain", "--home", home, "--clear"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("daemon drain --clear exit = %d, stderr=%s", code, stderr.String())
+	}
+	if on, err = daemonDrainActiveForHome(home); err != nil || on {
+		t.Fatalf("command did not clear the sentinel: draining=%v err=%v", on, err)
+	}
+}
+
+// THE GUARANTEE THAT MATTERS: queued work survives a drain untouched. A drain
+// that lost, cancelled or mutated queued jobs would be worse than the restart it
+// replaces, and nothing else in this file would notice.
+func TestDrainLeavesQueuedWorkUntouched(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	seedDaemonWorkerAgent(t, store, "worker", "shell", "printf ok", []string{"review"}, "owner/repo")
+
+	// SEEDED EXPLICITLY, AND A MISSING FIXTURE IS A FAILURE RATHER THAN A SKIP.
+	// The first version of this test called t.Skip here, and the agent fixture
+	// creates no jobs - so the "guarantee that matters" asserted NOTHING and
+	// reported PASS. That is this campaign's own defect class (a record that
+	// cannot evidence what it claims) inside the test defending against it.
+	// Found in review (#2096).
+	for _, id := range []string{"queued-alpha", "queued-beta"} {
+		if err := store.CreateJobWithEvent(ctx, db.Job{
+			ID: id, Agent: "worker", Type: "review", State: string(workflow.JobQueued),
+			Repo: "owner/repo", Payload: "{}",
+		}, db.JobEvent{Kind: string(workflow.JobQueued), Message: "seed"}); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+
+	before := queuedJobSnapshot(t, store)
+	if len(before) != 2 {
+		t.Fatalf("fixture must produce the queued jobs this test protects; got %d", len(before))
+	}
+
+	// THE COMMAND, NOT THE HELPER. setDaemonDrain only writes a file, so driving
+	// it here would leave every line of runDaemonDrain untested and a drain that
+	// cancelled queued work would still pass.
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"daemon", "drain", "--home", home, "--timeout", "5s"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("daemon drain exit = %d, stderr=%s", code, stderr.String())
+	}
+
+	after := queuedJobSnapshot(t, store)
+	if len(after) != len(before) {
+		t.Fatalf("queued job count changed across a drain: %d -> %d", len(before), len(after))
+	}
+	for id, state := range before {
+		if after[id] != state {
+			t.Fatalf("queued job %s changed state across a drain: %q -> %q", id, state, after[id])
+		}
+	}
+	// And the sentinel lives inside the resolved gitmoot home, not beside it -
+	// re-resolving a home is the #446/#459 bug class.
+	path, err := daemonDrainSentinelPath(home)
+	if err != nil {
+		t.Fatalf("sentinel path: %v", err)
+	}
+	if strings.Contains(filepath.ToSlash(path), ".gitmoot/.gitmoot") {
+		t.Fatalf("sentinel path double-resolved the home: %s", path)
+	}
+}
+
+func queuedJobSnapshot(t *testing.T, store *db.Store) map[string]string {
+	t.Helper()
+	jobs, err := store.ListQueuedJobs(context.Background())
+	if err != nil {
+		t.Fatalf("snapshot queued jobs: %v", err)
+	}
+	snap := make(map[string]string, len(jobs))
+	for _, job := range jobs {
+		snap[job.ID] = job.State
+	}
+	return snap
+}
+
+// THE PRODUCTION PATH. listPendingQueuedJobs is the choke every scheduler passes
+// immediately before selecting work, so this is where drain has to bite. The
+// helper tests above would all pass against a build where the guard was never
+// wired into it - the exact shape #2061 f3 filed against this seat.
+func TestDrainStopsTheDispatchPathFromSelectingWork(t *testing.T) {
+	ctx, _, _, worker := diskGuardDispatchFixture(t)
+
+	before, err := listPendingQueuedJobs(ctx, worker, "owner/repo", "", true)
+	if err != nil {
+		t.Fatalf("listPendingQueuedJobs: %v", err)
+	}
+	if len(before) == 0 {
+		t.Fatal("fixture offered no eligible work, so this test could not detect a drain")
+	}
+
+	if err := setDaemonDrain(worker.ConfigHome, true); err != nil {
+		t.Fatalf("set drain: %v", err)
+	}
+
+	during, err := listPendingQueuedJobs(ctx, worker, "owner/repo", "", true)
+	if err != nil {
+		t.Fatalf("listPendingQueuedJobs while draining: %v", err)
+	}
+	if len(during) != 0 {
+		t.Fatalf("dispatch selected %d jobs while draining; the daemon would claim during a deploy", len(during))
+	}
+
+	// AND IT RESUMES. A drain that could not be lifted would be an outage with a
+	// friendlier name.
+	if err := setDaemonDrain(worker.ConfigHome, false); err != nil {
+		t.Fatalf("clear drain: %v", err)
+	}
+	after, err := listPendingQueuedJobs(ctx, worker, "owner/repo", "", true)
+	if err != nil {
+		t.Fatalf("listPendingQueuedJobs after clearing: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("after clearing drain %d jobs are eligible, want the original %d", len(after), len(before))
+	}
+}
+
+// A STAT ERROR THAT IS NOT "MISSING" MUST NOT READ AS "NOT DRAINING".
+//
+// The guard's default arm returns an error, and the caller aborts the listing on
+// it - so an unreadable sentinel pauses dispatch rather than resuming it. That
+// branch had no test, and it is the one a mutant survives.
+//
+// THE FIXTURE SHAPE IS gm-staged's, FROM THEIR OWN MISTAKE: their version of
+// this test made the marker path a DIRECTORY. A directory STATS FINE, so the
+// test reached the ordinary present branch, asserted the right conclusion for
+// the wrong reason, and a mutant flipping the error arm survived it. Making the
+// marker's PARENT a regular file yields ENOTDIR, which is a real stat failure,
+// and the assertion checks the error is NEITHER nil NOR IsNotExist before
+// concluding anything.
+func TestDrainStatFailureIsAnErrorNotAQuietResume(t *testing.T) {
+	home := t.TempDir()
+	path, err := daemonDrainSentinelPath(home)
+	if err != nil {
+		t.Fatalf("sentinel path: %v", err)
+	}
+	parent := filepath.Dir(path)
+	if err := os.RemoveAll(parent); err != nil {
+		t.Fatalf("clear parent: %v", err)
+	}
+	// The parent is now a FILE, so stat of a path beneath it fails ENOTDIR.
+	if err := os.WriteFile(parent, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("make parent a file: %v", err)
+	}
+
+	on, statErr := daemonDrainActiveForHome(home)
+	if statErr == nil {
+		t.Fatal("an unreadable sentinel returned no error; dispatch would resume during a deploy")
+	}
+	if errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("ENOTDIR was classified as missing, which resumes claiming: %v", statErr)
+	}
+	if on {
+		t.Fatal("the guard reported draining AND an error; the caller must decide on the error alone")
+	}
+}
+
+// THE HOME IS RESOLVED EXACTLY ONCE, AND THE WARNING AGREES WITH THE GUARD.
+//
+// Three call sites now pass a home to the drain guard: the scheduler
+// (worker.ConfigHome), the command (--home), and the startup warning
+// (cfg.Home). ALL THREE ARE THE RAW FLAG, and daemonDrainSentinelPath resolves
+// through pathsFromFlag exactly once. Passing an ALREADY-RESOLVED root instead
+// would append ".gitmoot" a second time and the guard would silently answer
+// "not draining" for a daemon that IS drained - the #446/#459 class, and the
+// worst possible direction for a deploy guard to be wrong in.
+//
+// A reviewer suggested passing the resolved paths value at the startup site.
+// This test is why that is refused: it pins BOTH directions, so the suggestion
+// fails here rather than in an incident.
+func TestDrainHomeResolvesExactlyOnce(t *testing.T) {
+	raw := t.TempDir()
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"daemon", "drain", "--home", raw}, &stdout, &stderr); code != 0 {
+		t.Fatalf("daemon drain exit = %d, stderr=%s", code, stderr.String())
+	}
+
+	// The RAW home is what every production caller passes.
+	on, err := daemonDrainActiveForHome(raw)
+	if err != nil {
+		t.Fatalf("guard on the raw home: %v", err)
+	}
+	if !on {
+		t.Fatal("the guard did not see a sentinel the command just wrote for this home")
+	}
+
+	// The RESOLVED root must NOT be accepted as a home: that is the double
+	// resolution, and it reads as not-draining, which resumes claiming.
+	paths, err := pathsFromFlag(raw)
+	if err != nil {
+		t.Fatalf("pathsFromFlag: %v", err)
+	}
+	doubled, err := daemonDrainActiveForHome(paths.Home)
+	if err != nil {
+		t.Fatalf("guard on the resolved root: %v", err)
+	}
+	if doubled {
+		t.Fatal("the resolved root ALSO answered draining; the two paths are indistinguishable and the invariant is untestable")
+	}
+	if paths.Home == raw {
+		t.Fatal("resolution is a no-op in this fixture, so this test proves nothing")
+	}
+}
+
+// THE HOT PATH RESOLVES NOTHING: the sentinel path is fixed at construction.
+//
+// Owner ruling on #2096 round 3: resolving the home on every eligibility call
+// put os.UserHomeDir() on the dispatch path, where a failure aborts
+// listPendingQueuedJobs and stalls EVERY job - a strictly larger blast radius
+// than the no-op it replaced.
+//
+// PROVED BY MOVING HOME AFTER CONSTRUCTION. If the guard still resolved per
+// call it would follow the new HOME and see nothing; because the path was fixed
+// at construction it keeps watching the home the daemon actually started with.
+// That is the difference between "resolved once" and "resolved every time",
+// and it is not visible from reading the call site.
+func TestDrainSentinelPathIsFixedAtWorkerConstruction(t *testing.T) {
+	started := t.TempDir()
+	t.Setenv("HOME", started)
+
+	store := openCLIJobStore(t, started)
+	worker := defaultJobWorker(store, io.Discard)
+	if worker.DrainSentinelPath == "" {
+		t.Fatal("worker carries no sentinel path; the guard is inert")
+	}
+	if !strings.HasPrefix(worker.DrainSentinelPath, started) {
+		t.Fatalf("sentinel path %q is not under the started home %q", worker.DrainSentinelPath, started)
+	}
+
+	// The operator drains the daemon that is running.
+	if err := setDaemonDrain("", true); err != nil {
+		t.Fatalf("setDaemonDrain: %v", err)
+	}
+
+	// HOME moves underneath the running process. A per-call resolver would now
+	// look in the wrong place and report not-draining.
+	moved := t.TempDir()
+	t.Setenv("HOME", moved)
+
+	on, err := daemonDrainActive(worker.DrainSentinelPath)
+	if err != nil {
+		t.Fatalf("guard: %v", err)
+	}
+	if !on {
+		t.Fatal("the guard lost the drain when HOME moved; the path is being resolved per call, not carried")
+	}
+}
+
+// THE SCHEDULER CONSULTS THE CARRIED PATH, NOT THE HOME - AT THE PRODUCTION PATH.
+//
+// TestDrainSentinelPathIsFixedAtWorkerConstruction proves the field is right;
+// it calls the guard directly, so it CANNOT tell whether listPendingQueuedJobs
+// actually uses it. Measured: reverting the scheduler to per-call resolution
+// SURVIVED every other test in this file, because the two agree whenever the
+// home is stable. This test makes them disagree.
+//
+// After construction the worker's ConfigHome is repointed somewhere with no
+// sentinel. A per-call resolver follows ConfigHome, finds nothing and DISPATCHES
+// THROUGH A DRAIN. The carried path keeps watching the home the daemon started
+// with, which is the whole point of resolving once.
+func TestDispatchUsesTheCarriedSentinelPathNotTheCurrentHome(t *testing.T) {
+	ctx, _, _, worker := diskGuardDispatchFixture(t)
+
+	if err := setDaemonDrain(worker.ConfigHome, true); err != nil {
+		t.Fatalf("set drain: %v", err)
+	}
+	if worker.DrainSentinelPath == "" {
+		t.Fatal("fixture worker carries no sentinel path, so this test cannot discriminate")
+	}
+
+	// The home moves; the running daemon's sentinel does not.
+	worker.ConfigHome = t.TempDir()
+
+	during, err := listPendingQueuedJobs(ctx, worker, "owner/repo", "", true)
+	if err != nil {
+		t.Fatalf("listPendingQueuedJobs while draining: %v", err)
+	}
+	if len(during) != 0 {
+		t.Fatalf("dispatch selected %d jobs while draining: the scheduler resolved the CURRENT home instead of the carried path", len(during))
+	}
+}

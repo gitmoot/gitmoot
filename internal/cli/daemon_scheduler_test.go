@@ -5739,3 +5739,305 @@ func assertCursorCacheWiredForBothKinds(t *testing.T, drive func(context.Context
 		t.Fatalf("cursor reads = %d, want at least one per gated query per tick", got)
 	}
 }
+
+// TestDispatchDeclineRecordsTheValueTheClauseTested is #2117. A job left queued
+// by the selector produced NO artifact of any kind: selects returned a bare false
+// and the caller dropped the job into `remaining` with no event and no log line.
+// Six independent candidate mechanisms were eliminated against a live stall
+// without ever being able to read which clause had declined the job, because
+// nothing recorded it.
+//
+// The contract is not that a message exists. It is that the OPERAND the clause
+// tested is recoverable: "declined on the limit" is another thing to investigate,
+// "selected=2 limit=2" answers the question. So this asserts the operand's
+// presence - the contended runtime key, and the cap arithmetic - and never the
+// phrasing around it.
+func TestDispatchDeclineRecordsTheValueTheClauseTested(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	// Episode dedup is package-level, so fixture ids MUST be unique per test or a
+	// sibling test's open episode suppresses this one's event and the assertion
+	// sees zero - indistinguishable from the feature being broken.
+	uniq := t.Name()
+	// Two agents on ONE runtime session: the second job is declined for the
+	// runtime clause, which is the clause tonight's stall implicated.
+	seedDaemonWorkerAgent(t, store, "lead-a-"+uniq, runtime.CodexRuntime, "session-1", []string{"implement"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "lead-b-"+uniq, runtime.CodexRuntime, "session-1", []string{"implement"}, "owner/repo")
+	for _, id := range []string{"task-a-" + uniq, "task-b-" + uniq} {
+		if err := store.UpsertTask(ctx, db.Task{ID: id, RepoFullName: "owner/repo", State: string(workflow.TaskImplementing), Branch: id, WorktreePath: "/tmp/gitmoot/" + id}); err != nil {
+			t.Fatalf("UpsertTask %s: %v", id, err)
+		}
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a-" + uniq, Agent: "lead-a-" + uniq, Action: "implement", Repo: "owner/repo", Branch: "task-a-" + uniq, TaskID: "task-a-" + uniq})
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-b-" + uniq, Agent: "lead-b-" + uniq, Action: "implement", Repo: "owner/repo", Branch: "task-b-" + uniq, TaskID: "task-b-" + uniq})
+	jobs, err := store.ListQueuedJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListQueuedJobs: %v", err)
+	}
+
+	selected, remaining := selectRunnableQueuedJobsWithPolicy(ctx, store, jobs, 2, config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue})
+	if len(selected) != 1 || len(remaining) != 1 {
+		t.Fatalf("selected=%d remaining=%d, want one admitted and one declined on the shared runtime", len(selected), len(remaining))
+	}
+
+	declined := remaining[0].ID
+	events, err := store.ListJobEvents(ctx, declined)
+	if err != nil {
+		t.Fatalf("ListJobEvents(%s): %v", declined, err)
+	}
+	var messages []string
+	for _, event := range events {
+		if event.Kind == "dispatch_declined" {
+			messages = append(messages, event.Message)
+		}
+	}
+	if len(messages) != 1 {
+		t.Fatalf("dispatch_declined events for the declined job = %d, want exactly one; events=%+v", len(messages), events)
+	}
+	// The runtime key is the operand of the clause that declined it. Without the
+	// key an operator cannot tell WHICH session was contended, which is the whole
+	// question a stall poses.
+	runtimeKey := queuedJobRuntimeResourceKey(ctx, store, remaining[0])
+	if runtimeKey == "" {
+		t.Fatal("fixture produced no runtime key, so the runtime clause cannot be the one under test")
+	}
+	if !strings.Contains(messages[0], runtimeKey) {
+		t.Fatalf("decline detail %q does not carry the contended runtime key %q", messages[0], runtimeKey)
+	}
+	// The temp-session arithmetic is the second operand: a reader must be able to
+	// see the cap it was compared against, which is what #2116 could not be
+	// measured against after the fact.
+	if !strings.Contains(messages[0], "cap=") && !strings.Contains(messages[0], "reason=") {
+		t.Fatalf("decline detail %q carries no temp-session operand: neither the cap it tested nor the ineligibility reason", messages[0])
+	}
+}
+
+// TestDispatchDeclineDedupsPerReasonRatherThanPerPass pins the volume bound. The
+// selector runs every second, per repo, per queued job, so one row per decline
+// reproduces #598's flood - 76k rows, 56% of job_events - on a different clause.
+// A guard nobody can leave on is worse than none.
+// The job ids here MUST differ from the test above: the episode map is
+// package-level and persists across tests in one process, so reusing an id
+// inherits that test's OPEN episode and this test silently observes zero
+// events - which is what it looks like when the feature is broken.
+func TestDispatchDeclineDedupsPerReasonRatherThanPerPass(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	// Episode dedup is package-level, so fixture ids MUST be unique per test or a
+	// sibling test's open episode suppresses this one's event and the assertion
+	// sees zero - indistinguishable from the feature being broken.
+	uniq := t.Name()
+	seedDaemonWorkerAgent(t, store, "lead-c-"+uniq, runtime.CodexRuntime, "session-1", []string{"implement"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "lead-d-"+uniq, runtime.CodexRuntime, "session-1", []string{"implement"}, "owner/repo")
+	for _, id := range []string{"task-c-" + uniq, "task-d-" + uniq} {
+		if err := store.UpsertTask(ctx, db.Task{ID: id, RepoFullName: "owner/repo", State: string(workflow.TaskImplementing), Branch: id, WorktreePath: "/tmp/gitmoot/" + id}); err != nil {
+			t.Fatalf("UpsertTask %s: %v", id, err)
+		}
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-c-" + uniq, Agent: "lead-c-" + uniq, Action: "implement", Repo: "owner/repo", Branch: "task-c-" + uniq, TaskID: "task-c-" + uniq})
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-d-" + uniq, Agent: "lead-d-" + uniq, Action: "implement", Repo: "owner/repo", Branch: "task-d-" + uniq, TaskID: "task-d-" + uniq})
+	jobs, err := store.ListQueuedJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListQueuedJobs: %v", err)
+	}
+
+	// Three passes, as three consecutive dispatcher ticks would.
+	var declined string
+	for pass := 0; pass < 3; pass++ {
+		_, remaining := selectRunnableQueuedJobsWithPolicy(ctx, store, jobs, 2, config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue})
+		if len(remaining) != 1 {
+			t.Fatalf("pass %d remaining=%d, want one", pass, len(remaining))
+		}
+		declined = remaining[0].ID
+	}
+
+	events, err := store.ListJobEvents(ctx, declined)
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	count := 0
+	for _, event := range events {
+		if event.Kind == "dispatch_declined" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("dispatch_declined events after three identical passes = %d, want exactly 1; a row per pass is the #598 flood", count)
+	}
+}
+
+// TestDispatchDeclineDedupsOnTheClauseNotTheOperand pins the volume contract
+// against the defect that the first #2117 implementation actually had: the
+// episode key included the FORMATTED DETAIL, and the detail carries operands
+// that move between passes - selected= changes with how many jobs were admitted
+// earlier in the same pass. So every distinct operand value opened a NEW episode
+// and wrote another row, which is #598's flood wearing a dedup key. The comments
+// claimed per-clause dedup while the code keyed per-detail, and nothing failed.
+//
+// Two passes at DIFFERENT limits make the same job decline on the same clause
+// with two different operands. The contract is one row, and the operands must
+// still be present in it.
+func TestDispatchDeclineDedupsOnTheClauseNotTheOperand(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	uniq := t.Name()
+	// Distinct sessions so the runtime clause never fires: this test is about the
+	// limit clause, and a runtime decline would mask it.
+	for index, session := range []string{"session-1", "session-2", "session-3"} {
+		agent := fmt.Sprintf("lead-%d-%s", index, uniq)
+		task := fmt.Sprintf("task-%d-%s", index, uniq)
+		seedDaemonWorkerAgent(t, store, agent, runtime.CodexRuntime, session, []string{"implement"}, "owner/repo")
+		if err := store.UpsertTask(ctx, db.Task{ID: task, RepoFullName: "owner/repo", State: string(workflow.TaskImplementing), Branch: task, WorktreePath: "/tmp/gitmoot/" + task}); err != nil {
+			t.Fatalf("UpsertTask %s: %v", task, err)
+		}
+		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: fmt.Sprintf("job-%d-%s", index, uniq), Agent: agent, Action: "implement", Repo: "owner/repo", Branch: task, TaskID: task})
+	}
+	jobs, err := store.ListQueuedJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListQueuedJobs: %v", err)
+	}
+	if len(jobs) != 3 {
+		t.Fatalf("queued jobs = %d, want three", len(jobs))
+	}
+	policy := config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue}
+	last := jobs[2].ID
+
+	// Two ticks at different limits. ADMISSION OUTPUT IS ASSERTED TOO: this change
+	// must not alter which jobs run, only what is recorded about the ones that did not.
+	for _, pass := range []struct {
+		limit      int
+		wantQueued int
+	}{{limit: 2, wantQueued: 2}, {limit: 1, wantQueued: 1}} {
+		queued, remaining := selectRunnableQueuedJobsWithPolicy(ctx, store, jobs, pass.limit, policy)
+		if len(queued) != pass.wantQueued || len(queued)+len(remaining) != len(jobs) {
+			t.Fatalf("limit=%d admitted %d (remaining %d), want %d admitted and every job accounted for", pass.limit, len(queued), len(remaining), pass.wantQueued)
+		}
+		if remaining[len(remaining)-1].ID != last {
+			t.Fatalf("limit=%d last remaining=%s, want %s declined in both passes", pass.limit, remaining[len(remaining)-1].ID, last)
+		}
+	}
+
+	events, err := store.ListJobEvents(ctx, last)
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	var limitRows []string
+	for _, event := range events {
+		if event.Kind == "dispatch_declined" && strings.Contains(event.Message, "limit") {
+			limitRows = append(limitRows, event.Message)
+		}
+	}
+	// Two passes, two different operand values, ONE row. Keying on the detail
+	// yields two here, which is the bug this test exists for.
+	if len(limitRows) != 1 {
+		t.Fatalf("limit-clause declines for %s = %d %v, want exactly one across two passes at different limits", last, len(limitRows), limitRows)
+	}
+	// And the surviving row still answers the question in one line.
+	if !strings.Contains(limitRows[0], "selected=") || !strings.Contains(limitRows[0], "limit=") {
+		t.Fatalf("decline detail %q lost its operands; a clause name without the value it tested is another thing to investigate", limitRows[0])
+	}
+
+	// The limit<=0 caller path declines EVERY pending job, so it is the highest
+	// volume branch of the four and needs the same bound.
+	for pass := 0; pass < 2; pass++ {
+		queued, remaining := selectRunnableQueuedJobsWithPolicy(ctx, store, jobs, 0, policy)
+		if len(queued) != 0 || len(remaining) != len(jobs) {
+			t.Fatalf("limit=0 pass %d admitted %d and left %d, want zero admitted and every job pending", pass, len(queued), len(remaining))
+		}
+	}
+	for _, job := range jobs {
+		slotRows := 0
+		rows, err := store.ListJobEvents(ctx, job.ID)
+		if err != nil {
+			t.Fatalf("ListJobEvents %s: %v", job.ID, err)
+		}
+		for _, event := range rows {
+			if event.Kind == "dispatch_declined" && strings.Contains(event.Message, "no dispatch slots") {
+				slotRows++
+			}
+		}
+		if slotRows != 1 {
+			t.Fatalf("no-slots declines for %s = %d, want exactly one across two passes", job.ID, slotRows)
+		}
+	}
+}
+
+// TestDispatchDeclineClauseLabelsMatchTheirBranch closes the gap #2118's reviewer
+// found by injecting the mutant that proves it: MISLABELLING a branch's clause
+// string - the limit branch returning "checkout", say - compiles, leaves admission
+// and the message text untouched, and SURVIVED all three of the other tests. It is
+// not a live bug today; production's labels are distinct and correct. It is a
+// latent one, and the failure mode is specific: the clause is the DEDUP KEY, so two
+// branches sharing a label collide into one episode and the second reason is
+// silently suppressed for the whole TTL.
+//
+// So this asserts the correspondence directly rather than through the event: each
+// branch must return ITS OWN label alongside the detail that names its operand.
+func TestDispatchDeclineClauseLabelsMatchTheirBranch(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	uniq := t.Name()
+	seedDaemonWorkerAgent(t, store, "lead-"+uniq, runtime.CodexRuntime, "session-1", []string{"implement"}, "owner/repo")
+	task := "task-" + uniq
+	if err := store.UpsertTask(ctx, db.Task{ID: task, RepoFullName: "owner/repo", State: string(workflow.TaskImplementing), Branch: task, WorktreePath: "/tmp/gitmoot/" + task}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-" + uniq, Agent: "lead-" + uniq, Action: "implement", Repo: "owner/repo", Branch: task, TaskID: task})
+	jobs, err := store.ListQueuedJobs(ctx)
+	if err != nil {
+		t.Fatalf("ListQueuedJobs: %v", err)
+	}
+	job := jobs[0]
+
+	checkoutKey := queuedJobCheckoutKey(ctx, store, job)
+	runtimeKey := queuedJobRuntimeResourceKey(ctx, store, job)
+
+	for _, tt := range []struct {
+		name       string
+		selector   queuedJobResourceSelector
+		selected   int
+		wantClause string
+		wantInMsg  string
+	}{
+		{
+			// The limit branch, reached by having already admitted its whole budget.
+			name:       "limit",
+			selector:   queuedJobResourceSelector{limit: 1, checkouts: map[string]bool{}, runtimes: map[string]bool{}, tempReservations: map[string]int{}},
+			selected:   1,
+			wantClause: "limit",
+			wantInMsg:  "selected=1 limit=1",
+		},
+		{
+			// The checkout branch, reached by pre-seeding this job's own key.
+			name:       "checkout",
+			selector:   queuedJobResourceSelector{limit: 8, checkouts: map[string]bool{checkoutKey: true}, runtimes: map[string]bool{}, tempReservations: map[string]int{}},
+			wantClause: "checkout",
+			wantInMsg:  checkoutKey,
+		},
+		{
+			// The runtime branch, reached by pre-seeding the runtime key with a
+			// serializing policy so no temp session can rescue it.
+			name:       "runtime",
+			selector:   queuedJobResourceSelector{limit: 8, policy: config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue}, checkouts: map[string]bool{}, runtimes: map[string]bool{runtimeKey: true}, tempReservations: map[string]int{}},
+			wantClause: "runtime",
+			wantInMsg:  runtimeKey,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			admitted, clause, detail := tt.selector.selects(ctx, store, job, tt.selected)
+			if admitted {
+				t.Fatalf("%s branch admitted the job, so this row tests nothing", tt.name)
+			}
+			// THE LABEL IS THE DEDUP KEY. A branch returning another branch's label
+			// collides two reasons into one episode and suppresses the second.
+			if clause != tt.wantClause {
+				t.Fatalf("%s branch returned clause %q, want %q; a mislabelled clause collides two decline reasons under one dedup key", tt.name, clause, tt.wantClause)
+			}
+			// And the operand must still be the one THIS branch tested, so a label
+			// swap cannot be repaired by a matching message swap.
+			if !strings.Contains(detail, tt.wantInMsg) {
+				t.Fatalf("%s branch detail %q does not carry %q", tt.name, detail, tt.wantInMsg)
+			}
+		})
+	}
+}

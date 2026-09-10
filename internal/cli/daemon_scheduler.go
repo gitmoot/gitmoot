@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -369,6 +370,88 @@ var (
 	runtimeLockWaitMu       sync.Mutex
 	runtimeLockWaitEpisodes = map[string]time.Time{}
 )
+
+// dispatchDeclineEpisodes dedups the dispatch_declined job_event exactly as
+// runtimeLockWaitEpisodes dedups runtime_lock_wait, and for the same measured
+// reason: selects runs EVERY SECOND, PER REPO, PER QUEUED JOB, so one row per
+// decline would reproduce #598's flood (76k rows, 56% of job_events) on a
+// different clause. The key is jobID + reason, so a job whose decline REASON
+// CHANGES - limit today, contended runtime tomorrow - records the new reason
+// immediately instead of being suppressed by the old one. That is the whole
+// diagnostic value: the transition is the interesting event.
+//
+// Volume is bounded by construction: at most one row per (job, CLAUSE) per TTL,
+// so a job stalled 46 minutes on one clause writes 4 rows, not 2760 - and the
+// bound holds even though the recorded operands change between passes, because
+// the key is the clause and only the message carries the values.
+const (
+	dispatchDeclineEpisodeTTL = 15 * time.Minute
+	dispatchDeclineEpisodeMax = 512
+)
+
+var (
+	dispatchDeclineMu       sync.Mutex
+	dispatchDeclineEpisodes = map[string]time.Time{}
+)
+
+// dispatchDeclineEpisodeOpen is READ-ONLY, like runtimeLockWaitEpisodeOpen: a
+// failed event write leaves the episode closed so the next pass re-attempts it.
+func dispatchDeclineEpisodeOpen(key string) bool {
+	dispatchDeclineMu.Lock()
+	defer dispatchDeclineMu.Unlock()
+	emitted, ok := dispatchDeclineEpisodes[key]
+	if !ok {
+		return false
+	}
+	return time.Since(emitted) < dispatchDeclineEpisodeTTL
+}
+
+func markDispatchDeclineEpisode(key string) {
+	dispatchDeclineMu.Lock()
+	defer dispatchDeclineMu.Unlock()
+	dispatchDeclineEpisodes[key] = time.Now()
+	if len(dispatchDeclineEpisodes) > dispatchDeclineEpisodeMax {
+		for k, at := range dispatchDeclineEpisodes {
+			if time.Since(at) >= dispatchDeclineEpisodeTTL {
+				delete(dispatchDeclineEpisodes, k)
+			}
+		}
+	}
+}
+
+// recordDispatchDecline writes ONE dispatch_declined event per (job, reason) per
+// episode. detail MUST carry the value the clause tested, not just its name: a
+// reason without its operand is another thing to investigate, which is the defect
+// this instrumentation exists to remove.
+func recordDispatchDecline(ctx context.Context, store *db.Store, job db.Job, clause string, detail string) {
+	if store == nil || strings.TrimSpace(clause) == "" || strings.TrimSpace(detail) == "" {
+		return
+	}
+	// KEY ON THE CLAUSE, NOT ON THE DETAIL. The detail carries operands that move
+	// between passes - selected= changes with how many jobs were admitted earlier
+	// in the same pass, active= changes as instances come and go - so keying on it
+	// opens a NEW episode per distinct value and emits a row per operand change.
+	// That is the #598 flood wearing a dedup key, and it would have silently
+	// broken the bound this whole design exists to hold.
+	key := job.ID + "\x00" + clause
+	if dispatchDeclineEpisodeOpen(key) {
+		return
+	}
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "dispatch_declined", Message: detail}); err != nil {
+		// A VISIBILITY FEATURE MUST NOT FAIL INVISIBLY. Retry-next-tick is the
+		// intended design - the episode stays closed, so the next pass re-attempts -
+		// but a SUSTAINED write failure would then retry forever per declining job
+		// with no operator-visible signal at all, which is the exact blindness this
+		// change exists to remove. Logged per failed attempt rather than deduped:
+		// suppressing the log would recreate the invisibility, and a store that
+		// cannot accept a job event is a fleet-level fault where this volume is the
+		// least of the problems. Matches event_rule_sink.go's precedent for a
+		// best-effort store write in a path with no stdout.
+		slog.Warn("dispatch decline event write failed", "job_id", job.ID, "clause", clause, "error", err)
+		return
+	}
+	markDispatchDeclineEpisode(key)
+}
 
 // runtimeLockWaitEpisodeOpen reports whether jobID currently has an open, already-
 // emitted wait episode: an entry exists AND its event was emitted within the last
@@ -2071,6 +2154,28 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 	if forDispatch && !diskGuardAllowsQueuedDispatch(ctx, worker, jobs, repoFilter, rootFilter) {
 		return nil, nil
 	}
+	// #1207 (bounded half): A DRAINING DAEMON STOPS CLAIMING AND LOSES NOTHING.
+	//
+	// Placed beside the disk guard because it is the same shape and the same
+	// choke point: every scheduler, barrier and continuous-pool alike, passes
+	// through this call immediately before selecting work, and returning an empty
+	// eligible set pauses dispatch WITHOUT changing job state. Queued work stays
+	// queued and resumes by itself when drain clears.
+	//
+	// This is deliberately NOT the re-exec handoff the issue also describes. Drain
+	// makes the existing "restart at idle" precondition satisfiable by
+	// construction - an operator can stop the intake, watch in-flight work finish,
+	// and restart into a real idle window - which is the half that needs no FD
+	// preservation and no owner-scale design decision.
+	if forDispatch {
+		draining, err := daemonDrainActive(worker.DrainSentinelPath)
+		if err != nil {
+			return nil, err
+		}
+		if draining {
+			return nil, nil
+		}
+	}
 	unavailableRows, err := worker.Store.ListActiveOrgRolesUnavailable(ctx, time.Now().UTC())
 	if err != nil {
 		return nil, err
@@ -2795,6 +2900,12 @@ func selectRunnableQueuedJobsWithPolicy(ctx context.Context, store *db.Store, pe
 // held by a running job is not selected. The seed maps are copied, never mutated.
 func selectRunnableQueuedJobsSeeded(ctx context.Context, store *db.Store, pending []db.Job, limit int, policy config.ParallelSessionPolicy, seedCheckouts map[string]bool, seedRuntimes map[string]bool) ([]db.Job, []db.Job) {
 	if limit <= 0 {
+		// A FOURTH DECLINE POINT, outside selects and not in the issue's list: with
+		// no slots every queued job is declined and nothing recorded why. A repo
+		// whose scheduler resolves to zero looks identical to an idle one.
+		for _, job := range pending {
+			recordDispatchDecline(ctx, store, job, "slots", fmt.Sprintf("no dispatch slots: limit=%d", limit))
+		}
 		return nil, pending
 	}
 	selector := queuedJobResourceSelector{
@@ -2807,10 +2918,12 @@ func selectRunnableQueuedJobsSeeded(ctx context.Context, store *db.Store, pendin
 	queued := make([]db.Job, 0, min(limit, len(pending)))
 	remaining := make([]db.Job, 0, len(pending))
 	for _, job := range pending {
-		if selector.selects(ctx, store, job, len(queued)) {
+		admitted, clause, detail := selector.selects(ctx, store, job, len(queued))
+		if admitted {
 			queued = append(queued, job)
 			continue
 		}
+		recordDispatchDecline(ctx, store, job, clause, detail)
 		remaining = append(remaining, job)
 	}
 	return queued, remaining
@@ -2871,27 +2984,32 @@ func memoizedRuntimeResourceKey(ctx context.Context, store *db.Store, job db.Job
 	return key
 }
 
-func (s queuedJobResourceSelector) selects(ctx context.Context, store *db.Store, job db.Job, selected int) bool {
+// selects reports whether the job is admitted, and when it is NOT, returns the
+// clause that declined it WITH THE VALUE THAT CLAUSE TESTED (#2117). The detail is
+// the product: "declined: limit" is nearly worthless, "selected=32 limit=32"
+// answers the question in one line. Admission behaviour is unchanged - every
+// return value is the same bool as before.
+func (s queuedJobResourceSelector) selects(ctx context.Context, store *db.Store, job db.Job, selected int) (admitted bool, clause string, detail string) {
 	if selected >= s.limit {
-		return false
+		return false, "limit", fmt.Sprintf("dispatch limit reached: selected=%d limit=%d", selected, s.limit)
 	}
 	checkoutKey := queuedJobCheckoutKey(ctx, store, job)
 	runtimeKey := queuedJobRuntimeResourceKey(ctx, store, job)
 	if s.checkouts[checkoutKey] {
-		return false
+		return false, "checkout", fmt.Sprintf("checkout already taken this pass: checkout=%s", checkoutKey)
 	}
 	runtimeAlreadySelected := runtimeKey != "" && s.runtimes[runtimeKey]
 	runtimeAlreadyLocked := runtimeKey != "" && !runtimeAlreadySelected && runtimeResourceLocked(ctx, store, runtimeKey)
 	if runtimeAlreadySelected || runtimeAlreadyLocked {
-		if !s.canUseTempWorker(ctx, store, job) && runtimeAlreadySelected {
-			return false
+		if ok, tempDetail := s.canUseTempWorker(ctx, store, job); !ok && runtimeAlreadySelected {
+			return false, "runtime", fmt.Sprintf("runtime already taken this pass and no temp session: runtime=%s; %s", runtimeKey, tempDetail)
 		}
 	}
 	s.checkouts[checkoutKey] = true
 	if runtimeKey != "" {
 		s.runtimes[runtimeKey] = true
 	}
-	return true
+	return true, "", ""
 }
 
 func runtimeResourceLocked(ctx context.Context, store *db.Store, runtimeKey string) bool {
@@ -2902,33 +3020,36 @@ func runtimeResourceLocked(ctx context.Context, store *db.Store, runtimeKey stri
 	return err == nil
 }
 
-func (s queuedJobResourceSelector) canUseTempWorker(ctx context.Context, store *db.Store, job db.Job) bool {
+// canUseTempWorker reports eligibility and, when refused, WHY - including the
+// temp-session numerator it tested (#2117). Behaviour is unchanged: every refusal
+// returns false exactly where it did before.
+func (s queuedJobResourceSelector) canUseTempWorker(ctx context.Context, store *db.Store, job db.Job) (bool, string) {
 	if store == nil {
-		return false
+		return false, "temp session unavailable: no store"
 	}
 	payload, err := daemonJobPayload(job)
 	if err != nil {
-		return false
+		return false, fmt.Sprintf("temp session unavailable: unreadable payload: %v", err)
 	}
 	dbAgent, err := store.GetAgent(ctx, job.Agent)
 	if err != nil {
-		return false
+		return false, fmt.Sprintf("temp session unavailable: agent %q not readable: %v", job.Agent, err)
 	}
 	agent := runtimeAgent(dbAgent)
 	typ := tempWorkerAgentType(agent.Name)
 	count, err := store.CountActiveAgentInstances(ctx, typ, agent.AutonomyPolicy, time.Now().UTC())
 	if err != nil {
-		return false
+		return false, fmt.Sprintf("temp session unavailable: count active instances for %q: %v", typ, err)
 	}
 	if count+s.tempReservations[typ] >= s.policy.MaxTempSessionsPerAgent {
-		return false
+		return false, fmt.Sprintf("temp sessions exhausted: type=%s active=%d reserved=%d cap=%d", typ, count, s.tempReservations[typ], s.policy.MaxTempSessionsPerAgent)
 	}
 	eligible := tempWorkerEligible(ctx, store, job, payload, agent, s.policy, time.Now().UTC())
 	if !eligible.Eligible {
-		return false
+		return false, fmt.Sprintf("temp session ineligible: type=%s reason=%s", typ, eligible.Reason)
 	}
 	s.tempReservations[typ]++
-	return true
+	return true, ""
 }
 
 func queuedJobMatchesRepo(job db.Job, repoFilter string) bool {
