@@ -134,3 +134,89 @@ func TestSeatGrantsCoverTheInterpreterAScriptRuntimeExecs(t *testing.T) {
 		}
 	}
 }
+
+// TestSeatGrantsCoverATRANSITIVEInterpreterChain pins the P1 from #2141's
+// review: an interpreter can ITSELF be a script needing a further interpreter.
+//
+// The first version of this fix returned only the IMMEDIATE interpreter, so a
+// three-link chain granted two roots out of three and the seat still exited
+// 126 on the third. The reviewer reproduced that with an executed test rather
+// than arguing it. StageRuntime now returns the full transitive closure.
+//
+// The chain built here is runtime -> mid (a script) -> base (a real binary),
+// which is the shape a packaged interpreter takes when it ships as a wrapper.
+func TestSeatGrantsCoverATRANSITIVEInterpreterChain(t *testing.T) {
+	baseDir := t.TempDir()
+	base := filepath.Join(baseDir, "probebase")
+	if err := os.WriteFile(base, []byte("#!/bin/sh\nprintf 'base ran %s\\n' \"$1\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// mid is a SCRIPT interpreter: it needs probebase to run, so staging mid
+	// must in turn stage probebase.
+	midDir := t.TempDir()
+	mid := filepath.Join(midDir, "probemid")
+	if err := os.WriteFile(mid, []byte("#!/usr/bin/env probebase\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pkg := filepath.Join(t.TempDir(), "lib", "node_modules", "@openai", "codex")
+	pkgBin := filepath.Join(pkg, "bin")
+	if err := os.MkdirAll(pkgBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pkg, "package.json"), []byte(`{"name":"@openai/codex"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	entrypoint := filepath.Join(pkgBin, "codex.js")
+	if err := os.WriteFile(entrypoint, []byte("#!/usr/bin/env probemid\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	launcherDir := t.TempDir()
+	if err := os.Symlink(entrypoint, filepath.Join(launcherDir, "codex")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", strings.Join([]string{launcherDir, midDir, baseDir, "/usr/bin", "/bin"}, string(os.PathListSeparator)))
+
+	home := t.TempDir()
+	grants, err := readOnlyRuntimeSandboxGrants(home, runtime.Agent{
+		Name: "gm-review-codex", Runtime: runtime.CodexRuntime, ReadOnlySeat: true,
+	}, seatFixtureCheckout(t), "gitmoot/gitmoot", true)
+	if err != nil {
+		t.Fatalf("seat setup: %v", err)
+	}
+	seatPaths, err := pathsFromFlag(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeRoot := toolchain.RuntimeRoot(seatPaths.Home)
+	entries, err := os.ReadDir(runtimeRoot)
+	if err != nil {
+		t.Fatalf("read staged runtime root: %v", err)
+	}
+	want := map[string]string{"codex-": "", "probemid-": "", "probebase-": ""}
+	for _, entry := range entries {
+		for prefix := range want {
+			if strings.HasPrefix(entry.Name(), prefix) {
+				want[prefix] = filepath.Join(runtimeRoot, entry.Name())
+			}
+		}
+	}
+	for prefix, root := range want {
+		if root == "" {
+			t.Fatalf("the fixture did not stage a %s* root under %s; the three-link chain this test exists for was not produced (staged: %v)",
+				prefix, runtimeRoot, entries)
+		}
+	}
+	granted := func(root string) bool {
+		for _, read := range grants.reads {
+			if read == root {
+				return true
+			}
+		}
+		return false
+	}
+	for prefix, root := range want {
+		if !granted(root) {
+			t.Errorf("root %s (%s) is NOT granted, so the seat cannot exec the chain the engine staged: granted reads %v", prefix, root, grants.reads)
+		}
+	}
+}

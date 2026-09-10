@@ -36,7 +36,23 @@ func shortDigest(value string) string {
 //   - missing or unreadable shebang: required-but-unstageable, which the caller
 //     turns into an exit-126 command.
 //   - no shebang at all (an ELF binary such as claude or kimi): no interpreter.
-func (s *stageSource) stageInterpreter(gitmootHome string) (string, error) {
+//
+// It returns the interpreter, whether that interpreter was STAGED by this
+// engine, and the interpreter's own transitive closure.
+//
+// THE staged BOOL IS REPORTED BY THE PRODUCER, NOT RE-DERIVED BY THE CALLER
+// (#2141 review, P3). An earlier form had the caller ask
+// StagedUnderRuntimeRoot (SINCE REMOVED - a grep for that name now finds
+// only this sentence), a bool that collapsed two unrelated causes: the
+// EXPECTED "this is a system path, it has no staged root" and a real
+// containment escape. Only this function knows which branch it took, so it
+// says so, and a containment error from the recursive stage now propagates as
+// an error instead of being flattened into false.
+//
+// The closure is transitive because an interpreter can itself be a script:
+// returning only the immediate one leaves a third root ungranted and the seat
+// still exits 126.
+func (s *stageSource) stageInterpreter(gitmootHome string) (string, bool, []string, error) {
 	var entrypoint *os.File
 	for _, member := range s.members {
 		if member.relative == s.entrypoint {
@@ -44,20 +60,20 @@ func (s *stageSource) stageInterpreter(gitmootHome string) (string, error) {
 		}
 	}
 	if entrypoint == nil {
-		return "", fmt.Errorf("%w: entrypoint %q is not among the accepted members", ErrRuntimeNotStageable, s.entrypoint)
+		return "", false, nil, fmt.Errorf("%w: entrypoint %q is not among the accepted members", ErrRuntimeNotStageable, s.entrypoint)
 	}
 	if _, err := entrypoint.Seek(0, io.SeekStart); err != nil {
-		return "", fmt.Errorf("%w: rewind entrypoint: %v", ErrRuntimeNotStageable, err)
+		return "", false, nil, fmt.Errorf("%w: rewind entrypoint: %v", ErrRuntimeNotStageable, err)
 	}
 	header := make([]byte, 256)
 	read, err := entrypoint.Read(header)
 	if err != nil && read == 0 && !errors.Is(err, io.EOF) {
-		return "", fmt.Errorf("%w: read entrypoint header: %v", ErrRuntimeNotStageable, err)
+		return "", false, nil, fmt.Errorf("%w: read entrypoint header: %v", ErrRuntimeNotStageable, err)
 	}
 	header = header[:read]
 	if !strings.HasPrefix(string(header), "#!") {
 		// A binary. Nothing to stage, and the launcher will be a direct link.
-		return "", nil
+		return "", false, nil, nil
 	}
 	line := string(header[2:])
 	if end := strings.IndexAny(line, "\r\n"); end >= 0 {
@@ -65,16 +81,16 @@ func (s *stageSource) stageInterpreter(gitmootHome string) (string, error) {
 	} else if read == len(header) {
 		// The shebang did not terminate inside the header we read, so we cannot
 		// know what it names. Refusing beats guessing.
-		return "", fmt.Errorf("%w: entrypoint shebang exceeds %d bytes and cannot be read completely", ErrRuntimeNotStageable, len(header))
+		return "", false, nil, fmt.Errorf("%w: entrypoint shebang exceeds %d bytes and cannot be read completely", ErrRuntimeNotStageable, len(header))
 	}
 	fields := strings.Fields(line)
 	if len(fields) == 0 {
-		return "", fmt.Errorf("%w: entrypoint declares an empty shebang", ErrRuntimeNotStageable)
+		return "", false, nil, fmt.Errorf("%w: entrypoint declares an empty shebang", ErrRuntimeNotStageable)
 	}
 	candidate := fields[0]
 	if filepath.Base(candidate) == "env" {
 		if len(fields) < 2 {
-			return "", fmt.Errorf("%w: entrypoint shebang %q names no interpreter", ErrRuntimeNotStageable, line)
+			return "", false, nil, fmt.Errorf("%w: entrypoint shebang %q names no interpreter", ErrRuntimeNotStageable, line)
 		}
 		candidate = fields[1]
 	}
@@ -83,22 +99,29 @@ func (s *stageSource) stageInterpreter(gitmootHome string) (string, error) {
 	if !filepath.IsAbs(target) {
 		located, lookErr := exec.LookPath(candidate)
 		if lookErr != nil {
-			return "", fmt.Errorf("%w: entrypoint needs interpreter %q, which cannot be resolved: %v", ErrRuntimeNotStageable, candidate, lookErr)
+			return "", false, nil, fmt.Errorf("%w: entrypoint needs interpreter %q, which cannot be resolved: %v", ErrRuntimeNotStageable, candidate, lookErr)
 		}
 		target = located
 	}
 	absolute, err := filepath.Abs(target)
 	if err != nil {
-		return "", fmt.Errorf("%w: interpreter %q: %v", ErrRuntimeNotStageable, target, err)
+		return "", false, nil, fmt.Errorf("%w: interpreter %q: %v", ErrRuntimeNotStageable, target, err)
 	}
 	// A SYSTEM INTERPRETER STILL GETS AN EXPLICIT LAUNCHER, but no copy: the
 	// sandbox grants those roots unconditionally, and copying /bin/sh would put
 	// an engine copy of the shell ahead of the real one for no gain.
 	if systemInterpreterRoots(absolute) {
-		return absolute, nil
+		// A system interpreter is NOT staged and needs no grant. This is the
+		// arm the collapsed bool used to be asked about.
+		return absolute, false, nil, nil
 	}
-	launcher, _, err := StageRuntime(gitmootHome, filepath.Base(candidate), absolute)
-	return launcher, err
+	// The recursion is what makes the closure transitive: this interpreter's
+	// own interpreters come back here and are propagated to the caller.
+	launcher, nested, err := StageRuntime(gitmootHome, filepath.Base(candidate), absolute)
+	if err != nil {
+		return "", false, nil, err
+	}
+	return launcher, true, nested, nil
 }
 
 // publish copies the accepted members into the engine root and publishes them by

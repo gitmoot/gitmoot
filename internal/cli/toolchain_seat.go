@@ -145,16 +145,14 @@ func stageSeatRuntimes(paths config.Paths) ([]string, []string, []string, error)
 			// as the exit-126 command below rather than leaving it
 			// host-resolvable. That is the whole point: an explicit
 			// unavailability instead of a silent fallback.
-			launcher, interpreter, stageErr := toolchain.StageRuntime(paths.Home, name, resolved)
+			launcher, closure, stageErr := toolchain.StageRuntime(paths.Home, name, resolved)
 			if stageErr == nil {
 				staged = append(staged, launcher)
-				// Only ENGINE-PUBLISHED interpreters need a grant. A system
-				// interpreter is returned as its host path and its root is
-				// already granted, so passing it on would fail containment
-				// resolution for a runtime that is working correctly.
-				if interpreter != "" && toolchain.StagedUnderRuntimeRoot(paths.Home, interpreter) {
-					interpreters = append(interpreters, interpreter)
-				}
+				// The FULL closure, not the immediate interpreter: an
+				// interpreter can itself be a script needing another. StageRuntime
+				// already filters out system interpreters, whose roots the
+				// sandbox grants unconditionally and which have no staged root.
+				interpreters = append(interpreters, closure...)
 				continue
 			}
 			diagnostics = append(diagnostics, fmt.Sprintf("runtime %s could not be staged, so it is published unavailable rather than left host-resolvable: %v", name, stageErr))
