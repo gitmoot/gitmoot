@@ -3394,6 +3394,59 @@ those as task events; this command has no task, so it prints them as
 `degraded: ...` lines. An empty obligation list and an instrument that could not
 look otherwise read identically, and the empty one reads as good news.
 
+
+### Finding merged pull requests that still carry obligations
+
+```bash
+gitmoot findings --merged-unresolved
+gitmoot findings --merged-unresolved --repo owner/repo
+gitmoot findings --merged-unresolved --json
+```
+
+Lists pull requests that **merged** while still carrying unresolved findings at
+their branch head. The report is the **union of two sets**, and they are not the
+same question:
+
+1. the obligations `LedgerObligationsAtHead` would demand, the gate's own predicate;
+2. findings whose **latest observation at that exact head is still open**, which
+   the gate's `dischargedAtHead` step deliberately removes.
+
+The second set exists because the gate asks "what must a **new** review at this
+head still observe", and a row already recorded there has been observed. That is
+correct for the gate and wrong for this report, which asks what was unresolved
+**when the pull request merged** - the case where a P1 sits at the exact head
+that merged. Those rows are labelled `still open at the merged head` so the two
+sets stay distinguishable. **The report and the gate can therefore disagree, by
+design, and only in that direction:** the report **contains every gate
+obligation and may add exact-head-open findings**. When no finding's latest
+observation sits at the merged head the second set is empty and the two
+coincide.
+
+**It keys on the branch head, never the merge commit.** Every merge in this
+repository is a squash, so the merge commit is a commit no reviewer ever
+observed: measured across 28 merged pull requests carrying findings, the ledger
+holds 19 observations at branch heads and **zero** at merge commits, and the two
+SHAs are never equal. Keying on the merge commit fails silently in both
+directions - filter the observations to it and the report is empty forever;
+pass it as the head and nothing is ever discharged, so every answered row
+reappears.
+
+**It reports what it scanned.** `scanned 7 repositories, 40 pull requests with
+findings, 26 merged` - because an empty list from a scan of seven and an empty
+list from a scan of zero read identically otherwise, and the second is an
+instrument failure wearing a success message.
+
+A pull request the forge cannot answer for is reported as a `degraded:` line
+rather than skipped: an outage must not render every merged pull request as
+resolved. `WAIVED` reflects the repository's **current** `findings_consumption` setting,
+read at report time. It is **not** evidence about the merge: the setting may have
+changed since, and no durable merge-time record of it exists, so reading it as
+"the gate let this through by declaration" reverses history whenever the config
+moved after the merge.
+
+`--merged-unresolved` accepts `--repo` alone to narrow the scan and takes
+neither `--pr` nor `--at-head`, and the refusal names that combination.
+
 ## Result Checks
 
 After a daemon-run job's `gitmoot_result` is parsed, Gitmoot runs a set of

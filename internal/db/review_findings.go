@@ -621,6 +621,41 @@ ORDER BY f.repo`)
 // caller-supplied and the fold takes the last row per uid as authoritative, so
 // ordering by it let a round pin its own observation as permanently latest.
 // rowid is assigned by the database in insertion order; no caller can set it.
+// ListReviewFindingPullRequests returns every (repo, pull_request) pair the
+// ledger holds an observation for, ordered so a report over them is stable.
+//
+// IT DOES NOT FILTER BY STATE, deliberately. "Which pull requests have findings"
+// and "which findings still block" are different questions, and the second is
+// answered per head by workflow.LedgerObligationsAtHead - never by a state
+// column here. A reader that filtered to state='open' would miss an ANSWERED
+// finding that its relevance keys re-arm at a later head, which is the whole
+// distinction #2097 exists to preserve.
+func (s *Store) ListReviewFindingPullRequests(ctx context.Context) ([]ReviewFindingPullRequest, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT repo, pull_request
+		FROM review_finding_observations
+		WHERE TRIM(COALESCE(repo,'')) <> '' AND pull_request > 0
+		ORDER BY repo, pull_request`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ReviewFindingPullRequest
+	for rows.Next() {
+		var item ReviewFindingPullRequest
+		if err := rows.Scan(&item.Repo, &item.PullRequest); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+// ReviewFindingPullRequest names one pull request the ledger has observed.
+type ReviewFindingPullRequest struct {
+	Repo        string
+	PullRequest int64
+}
+
 func (s *Store) ListReviewFindingObservations(ctx context.Context, repo string, pullRequest int64) ([]ReviewFindingObservation, error) {
 	return queryList(ctx, s.db, `SELECT finding_uid, repo, pull_request, head_sha, observed_at,
 	observer_job, state, severity, round_label, label_absent, title, detail, file, line,
