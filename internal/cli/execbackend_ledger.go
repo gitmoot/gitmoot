@@ -281,8 +281,15 @@ func (b *ledgeredExecutionBackend) reconcileInventory(ctx context.Context, repor
 		}
 		id := *attempt.SandboxID
 		if _, ok := destroyed[id]; ok {
-			if changed, markErr := b.store.MarkExecBackendAttemptOrphaned(ctx, key); markErr != nil || !changed {
-				reconcileErrs = append(reconcileErrs, errors.Join(fmt.Errorf("mark reaped execution backend attempt %+v orphaned", key), markErr))
+			// THE PROVIDER CONFIRMED THIS ONE IS GONE, so it is destroyed, not
+			// orphaned (#2147). This branch previously recorded an orphan while
+			// its own log line said "reaped" - and orphaned bills against the
+			// compute cap and is terminal-unreachable, so the reservation was
+			// held forever. costActualUSD is 0 because a reconciled destroy has
+			// no cost figure we observed: teardown passes 0 for the same reason,
+			// and inventing one would put a fabricated number in a cost ledger.
+			if changed, markErr := b.store.MarkExecBackendAttemptReconciledDestroyed(context.WithoutCancel(ctx), key, 0); markErr != nil || !changed {
+				reconcileErrs = append(reconcileErrs, errors.Join(fmt.Errorf("mark reaped execution backend attempt %+v destroyed", key), markErr))
 			}
 			continue
 		}

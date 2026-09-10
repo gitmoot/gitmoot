@@ -234,6 +234,43 @@ func (s *Store) MarkExecBackendAttemptDestroyed(ctx context.Context, key ExecBac
 	return exactlyOneExecBackendAttemptChanged(result)
 }
 
+// MarkExecBackendAttemptReconciledDestroyed records a destroy THE ENGINE DID NOT
+// PERFORM: the provider's inventory reports the sandbox gone, from any live
+// state, without the collecting -> destroying walk teardown makes.
+//
+// IT IS A SEPARATE FUNCTION RATHER THAN A WIDENED GUARD (#2147). Teardown's
+// MarkExecBackendAttemptDestroyed admits exactly `destroying`, and that single
+// source is load-bearing: teardown genuinely walks collecting -> destroying ->
+// destroyed and must keep being refused from anywhere else. Relaxing its WHERE
+// clause to serve the reconciler would silently widen teardown's guard too.
+//
+// AND IT IS ONE WRITE, NOT THREE. Walking the row through collecting and
+// destroying would record two phases that never happened for a sandbox that was
+// already gone, and would not be atomic.
+//
+// The defect this exists for: reconcileInventory could only reach `orphaned`
+// from a live state, because that was the only terminal transition admitting
+// one. So a provider-CONFIRMED destroy was recorded as an orphan - and orphaned
+// is both a billing state for the compute cap and terminal-unreachable, so the
+// reservation was held forever with no repair path.
+func (s *Store) MarkExecBackendAttemptReconciledDestroyed(ctx context.Context, key ExecBackendAttemptKey, costActualUSD float64) (bool, error) {
+	if costActualUSD < 0 {
+		return false, errors.New("execution backend actual cost must be non-negative")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE execbackend_attempts
+		SET state = ?, cost_actual_usd = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE job_id = ? AND attempt = ? AND lifecycle_generation = ?
+			AND state IN (?, ?, ?, ?, ?)`,
+		ExecBackendAttemptStateDestroyed, costActualUSD, key.JobID, key.Attempt, key.LifecycleGeneration,
+		ExecBackendAttemptStateReserved, ExecBackendAttemptStateProvisioning,
+		ExecBackendAttemptStateRunning, ExecBackendAttemptStateCollecting,
+		ExecBackendAttemptStateDestroying)
+	if err != nil {
+		return false, err
+	}
+	return exactlyOneExecBackendAttemptChanged(result)
+}
+
 // MarkExecBackendAttemptOrphaned persists the reaper's conclusion explicitly.
 // An orphan is terminal evidence, not a state callers should have to infer from
 // a missing provider handle or an expired TTL.
