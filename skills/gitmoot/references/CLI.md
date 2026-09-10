@@ -1137,12 +1137,22 @@ policy: workspace-write -> danger-full-access
 config_type: danger-full-access          # or: none (registry-only agent; nothing to keep in step)
 ```
 
-**Failure semantics are all-or-nothing.** The config plane is proven writable
-*before* the row moves, because there is no transaction spanning a SQLite table
-and a TOML file. A failure therefore leaves both planes untouched, and the
-command never returns non-zero after a permission has already changed. If the
-row write fails after config succeeded, the error names exactly which plane
-moved.
+**Failure semantics are all-or-nothing, enforced by a held transaction.** Both
+the agents row and the config type can authorise dispatch on their own: explicit
+managed-type routing never consults the row. So no ordering is safe, because
+whichever plane is written first is already live before the second can fail. The
+database transaction is the coordinator instead. The rows are updated, the
+config write runs as a barrier inside that still-open transaction, and the
+commit lands only if the config write succeeded. A config failure rolls the rows
+back, so nothing moved on any plane. If the commit itself fails after config
+succeeded, the config write is rolled back too and the command reports that
+nothing changed; only if that rollback also fails does it report the planes as
+inconsistent, naming both values so you know what to correct.
+
+**Every plane that can become effective is written**, not only the one that
+decides today: a same-name `agent_instances` row is updated alongside the
+`agents` row, because `agent remove` deletes only the latter and a surviving
+instance would otherwise silently re-widen an agent you had tightened.
 
 `agent type show` returns **non-zero** when a registered agent's policy differs
 between planes, or when the effective policy cannot be determined; it prints

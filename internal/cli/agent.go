@@ -1230,14 +1230,17 @@ func runAgentTypeShow(args []string, stdout, stderr io.Writer) int {
 // Printing both, and naming which one decides, is the only option that leaves
 // the reader unable to be confidently wrong.
 //
-// It stays rc=0 deliberately: divergence is a real and sometimes intended
-// state, and a non-zero exit here would break every caller that shows a type
-// for a registered agent. The guarantee is that the answer cannot be read
-// wrongly, not that the command fails.
+// #2134 F3: IT EXITS NON-ZERO on a known divergence and when the effective
+// policy cannot be determined. The earlier rc=0 was kept on the reasoning that
+// divergence is sometimes intended, but it left a pipeline gating on exit
+// status still fooled while the primary `policy:` line carried the config
+// value. An unreadable store is reported as `policy_effective: unknown` and is
+// likewise non-zero, because "I could not determine it" and "the planes agree"
+// must never render identically.
 //
-// Best-effort by construction: an unreadable store, an unregistered name, or a
-// missing row leaves the output exactly as it was. This must never turn
-// `agent type show` into a command that needs a store.
+// rc=0 remains the answer for a type with NO registered agent and for planes
+// that agree, so the verb still works for the majority case and does not
+// become a command that requires a store to succeed.
 func warnAgentTypePolicyDivergence(stdout, stderr io.Writer, home, name string, entry config.AgentType) int {
 	configPolicy := runtime.NormalizeStoredAutonomyPolicy(entry.AutonomyPolicy)
 	status := 0
@@ -2133,27 +2136,32 @@ func runAgentPolicy(args []string, stdout, stderr io.Writer) int {
 			}
 			return err
 		}
-		// #2134 F1: PROVE THE CONFIG PLANE IS WRITABLE BEFORE TOUCHING THE ROW.
+		// #2134 F1 round three: A HELD TRANSACTION, NOT AN ORDERING.
 		//
-		// The first version committed the row and then synced config, so an
-		// unwritable config.toml produced rc=1 AFTER the effective dispatch
-		// permission had already changed - the operator reads failure and the
-		// grant is live. That is #2132 inverted: there a success wrote nothing,
-		// here a failure wrote something, and both leave the operator's belief
-		// and the store disagreeing.
+		// Round two proved the config plane writable first and moved the row
+		// after, on the premise that the row is what decides. Review disproved
+		// the premise with an executed probe: explicit managed-type routing
+		// never calls GetAgent (agent_dispatch.go:1689) and builds the runtime
+		// agent straight from config (:1828, :2029). Config is an INDEPENDENT
+		// dispatch authority, so writing it first meant a command that returned
+		// rc=1 had already widened a live grant - #2132 inverted, which is the
+		// exact defect this verb exists to remove.
 		//
-		// EITHER APPLIED AND REPORTED APPLIED, OR NOT APPLIED. No cross-store
-		// transaction exists - one plane is SQLite, the other a TOML file - so
-		// ordering carries the property instead: the fallible non-transactional
-		// plane is proven writable FIRST, and the row that decides moves only
-		// after. A failure here leaves BOTH planes untouched.
-		if err := syncAgentTypePolicy(*home, name, normalized); err != nil {
-			return fmt.Errorf("config plane not written, so the agents row was left unchanged: %w", err)
+		// With BOTH planes authorising, no ordering is safe, because whichever
+		// is written first is live before the second can fail. The database
+		// transaction becomes the coordinator instead: rows update, the config
+		// write runs as the barrier, and the commit lands only if it succeeded.
+		//
+		// Capture the config value FIRST so the one remaining window can be
+		// compensated rather than merely reported.
+		previousConfig, hadConfig, err := agentTypePolicyValue(*home, name)
+		if err != nil {
+			return err
 		}
-		if err := store.UpdateAgentAutonomyPolicy(ctx, name, normalized); err != nil {
-			// Config moved and the row did not. Name exactly that: the planes
-			// now disagree and the operator must know which to correct.
-			return fmt.Errorf("config plane was updated to %q but the agents row was NOT: %w", normalized, err)
+		if err := store.UpdateAgentAutonomyPolicy(ctx, name, normalized, func() error {
+			return syncAgentTypePolicy(*home, name, normalized)
+		}); err != nil {
+			return compensatePolicyWriteFailure(*home, name, normalized, previousConfig, hadConfig, err)
 		}
 		// Read the row back rather than echoing what we wrote: the whole defect
 		// this closes is a command reporting a value it did not persist.
@@ -2871,4 +2879,54 @@ func (f *repeatedFlag) String() string {
 func (f *repeatedFlag) Set(value string) error {
 	*f = append(*f, value)
 	return nil
+}
+
+// agentTypePolicyValue reads the config plane's current policy for an agent so
+// a failed cross-plane write can be COMPENSATED rather than merely described.
+// The bool distinguishes "no config section" from "a section reading empty":
+// only the former means there is nothing to roll back, because
+// syncAgentTypePolicy never creates a section.
+func agentTypePolicyValue(home, name string) (string, bool, error) {
+	types, err := loadAgentTypeConfig(home)
+	if err != nil {
+		return "", false, err
+	}
+	entry, ok := types[name]
+	if !ok {
+		return "", false, nil
+	}
+	return runtime.NormalizeStoredAutonomyPolicy(entry.AutonomyPolicy), true, nil
+}
+
+// compensatePolicyWriteFailure turns a cross-plane write failure into a state
+// the operator can act on (#2134 F1).
+//
+// Extracted rather than left inline because the commit-failure branch is the
+// one window the protocol cannot prevent, and inline it was UNREACHABLE from a
+// test: forcing a SQLite COMMIT to fail is not something a test can arrange
+// reliably. Its mutants survived while it was inline. This is the real
+// function the command calls, not a test double.
+func compensatePolicyWriteFailure(home, name, attempted, previousConfig string, hadConfig bool, err error) error {
+	switch {
+	case errors.Is(err, db.ErrAgentPolicyBarrier):
+		// The barrier failed, so the transaction rolled back and the config
+		// write is what failed in the first place. Nothing moved anywhere.
+		return fmt.Errorf("no plane was changed: %w", err)
+	case errors.Is(err, db.ErrAgentPolicyCommit):
+		// The only partial-write window the protocol leaves: config moved and
+		// the rows did not. COMPENSATE rather than report a split state.
+		if !hadConfig {
+			// syncAgentTypePolicy never creates a section, so there is nothing
+			// to undo.
+			return fmt.Errorf("no plane was changed: %w", err)
+		}
+		if restoreErr := syncAgentTypePolicy(home, name, previousConfig); restoreErr != nil {
+			return fmt.Errorf(
+				"PLANES LEFT INCONSISTENT: rows unchanged, config left at %q and could NOT be restored to %q: %v (%w)",
+				attempted, previousConfig, restoreErr, err)
+		}
+		return fmt.Errorf("no plane was changed: config was rolled back to %q: %w", previousConfig, err)
+	default:
+		return err
+	}
 }

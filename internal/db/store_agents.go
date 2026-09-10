@@ -67,61 +67,93 @@ func (s *Store) UpdateAgentRuntimeRef(ctx context.Context, name, ref string) err
 	return nil
 }
 
+// ErrAgentPolicyBarrier reports that the caller's cross-plane barrier failed,
+// so the transaction was rolled back and NO plane changed.
+var ErrAgentPolicyBarrier = errors.New("agent policy barrier failed")
+
+// ErrAgentPolicyCommit reports that the barrier succeeded but the commit did
+// not. The caller's plane has moved and the database has not, so the caller
+// MUST compensate.
+var ErrAgentPolicyCommit = errors.New("agent policy commit failed")
+
 // UpdateAgentAutonomyPolicy writes a REGISTERED agent's autonomy policy in
 // place, without re-registering it (#2132).
 //
-// This is the plane dispatch reads: agent_dispatch.go resolves a registered
-// agent through runtimeAgent(db.Agent), so the row - not the config type - is
-// what decides. `agent type set --policy` writes the config plane, and for an
-// agent with no config section it cannot write anything at all, which is why an
-// in-place row update has to exist separately.
-//
 // Deliberately targeted rather than an UpsertAgent round trip: re-registration
 // replaces the runtime session, and the agents this exists for have live
-// sessions and hundreds of completed jobs. Shaped after UpdateAgentRuntimeRef,
-// including its not-registered error, so the two single-column writers stay
-// identical in behaviour.
-func (s *Store) UpdateAgentAutonomyPolicy(ctx context.Context, name, policy string) error {
+// sessions and hundreds of completed jobs.
+//
+// #2134 F2 round two: WRITES EVERY PLANE THAT CAN BECOME EFFECTIVE, NOT ONLY
+// THE ONE THAT DECIDES TODAY.
+//
+// Round two mirrored GetAgent's precedence instead - agents first, instances
+// only on zero rows affected - on the reasoning that writing a plane dispatch
+// is not reading is worse than leaving it stale. Review disproved that with an
+// executed probe: RemoveAgent (:170) deletes agent_repos, keychain_grants and
+// agents, but NOT agent_instances. So tightening an agent to read-only moved
+// only the row, removing the agent then deleted that row, and GetAgent
+// resolved the surviving instance at its untouched danger-full-access. The
+// stale plane became authoritative later and SILENTLY RE-WIDENED an agent an
+// operator had deliberately tightened.
+//
+// A stale plane that can outlive the winning one is not inert, so consistency
+// across planes is the invariant, not minimality of writes. Both rows move, in
+// one transaction, and only a name present in NEITHER is unregistered.
+//
+// #2134 F1 round two: beforeCommit IS A CROSS-PLANE BARRIER.
+//
+// The config plane is a TOML file, so no SQL transaction can span it, and
+// review showed ordering alone cannot fix that: config is an INDEPENDENT
+// dispatch authority, because explicit managed-type routing skips GetAgent
+// entirely (agent_dispatch.go:1689) and builds the runtime agent from config
+// (:1828, :2029). Writing config first therefore made a FAILED command widen a
+// live authority - the same defect as writing the row first, pointed the other
+// way.
+//
+// A held transaction is the coordinator instead. Rows update, beforeCommit
+// writes the non-SQL plane, and the commit lands only if it succeeded. The
+// barrier failing rolls back, so nothing moved anywhere. Only a commit failure
+// after a successful barrier leaves the caller's plane ahead, and that is
+// reported distinctly as ErrAgentPolicyCommit so the caller can compensate,
+// rather than folded into a generic error it can only print.
+func (s *Store) UpdateAgentAutonomyPolicy(ctx context.Context, name, policy string, beforeCommit func() error) error {
 	name = strings.TrimSpace(name)
 	policy = strings.TrimSpace(policy)
-	result, err := s.db.ExecContext(ctx,
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	total := int64(0)
+	for _, statement := range []string{
 		`UPDATE agents SET autonomy_policy = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?`,
-		policy, name)
-	if err != nil {
-		return err
+		`UPDATE agent_instances SET autonomy_policy = ? WHERE name = ?`,
+	} {
+		result, err := tx.ExecContext(ctx, statement, policy, name)
+		if err != nil {
+			return err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		total += affected
 	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if affected > 0 {
-		return nil
+	if total == 0 {
+		return fmt.Errorf("agent %q is not registered", name)
 	}
 
-	// #2134 F2: THERE IS A THIRD PLANE AND GetAgent READS IT.
-	//
-	// GetAgent falls back to agent_instances when no agents row exists (:108),
-	// and dispatch resolves through GetAgent - so an instance-only agent IS
-	// dispatchable and its policy comes from that table. Writing only `agents`
-	// left that population with no in-place writer at all: GetAgent resolved
-	// the agent while this function refused it as unregistered.
-	//
-	// MUST MIRROR GetAgent'S PRECEDENCE, NOT MERELY COVER BOTH TABLES. The row
-	// wins when both exist, so this updates `agents` first and only falls
-	// through on zero rows affected. Writing both unconditionally would move a
-	// plane dispatch is not reading for that agent.
-	result, err = s.db.ExecContext(ctx,
-		`UPDATE agent_instances SET autonomy_policy = ? WHERE name = ?`,
-		policy, name)
-	if err != nil {
-		return err
+	if beforeCommit != nil {
+		if err := beforeCommit(); err != nil {
+			// Rollback is the deferred call: returning here leaves every plane
+			// exactly as it was, which is the whole point of the barrier.
+			return fmt.Errorf("%w: %w", ErrAgentPolicyBarrier, err)
+		}
 	}
-	affected, err = result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if affected == 0 {
-		return fmt.Errorf("agent %q is not registered", name)
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("%w: %w", ErrAgentPolicyCommit, err)
 	}
 	return nil
 }

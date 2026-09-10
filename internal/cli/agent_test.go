@@ -4392,3 +4392,145 @@ func TestAgentTypeShowReportsUnknownWhenTheStoreCannotBeRead(t *testing.T) {
 		t.Errorf("stderr = %q, want it to say the effective policy could not be determined", msg)
 	}
 }
+
+// TestAgentPolicyLeavesBothPlanesUntouchedWhenTheRowCannotBeWritten is the
+// review probe that disproved round two's F1 fix, kept as a regression test.
+//
+// Round two proved the config plane writable and then moved the row, on the
+// premise that the row is the only dispatch authority. It is not: explicit
+// managed-type routing never calls GetAgent and builds the runtime agent from
+// config, so a command that failed at the row had ALREADY widened a live
+// grant. Under that code this test observes rc=1 with config sitting at
+// danger-full-access; under the held transaction nothing moves at all.
+func TestAgentPolicyLeavesBothPlanesUntouchedWhenTheRowCannotBeWritten(t *testing.T) {
+	home := t.TempDir()
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"agent", "type", "set", "blocked", "--home", home,
+		"--runtime", "codex", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("agent type set exit = %d, stderr=%s", code, stderr.String())
+	}
+	registerPolicyTestAgent(t, home, "blocked", "read-only")
+
+	paths, _, err := loadAgentTypeConfigWithPaths(home)
+	if err != nil {
+		t.Fatalf("resolve paths: %v", err)
+	}
+	// Force the row write to fail the way the reviewer did: a trigger, not a
+	// mode bit. Root ignores mode bits, and this also fails INSIDE the
+	// transaction, which is the boundary under test.
+	raw, err := sql.Open("sqlite", paths.Database)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if _, err := raw.Exec(`CREATE TRIGGER block_policy BEFORE UPDATE OF autonomy_policy ON agents
+		BEGIN SELECT RAISE(ABORT, 'forced row failure'); END;`); err != nil {
+		raw.Close()
+		t.Fatalf("install trigger: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"agent", "policy", "blocked", "--home", home,
+		"--policy", "danger-full-access"}, &stdout, &stderr); code == 0 {
+		t.Fatalf("agent policy returned 0 with an unwritable row: stdout=%q", stdout.String())
+	}
+
+	// THE ASSERTION THAT FAILS ON ROUND TWO'S CODE: a failed command must not
+	// have widened the config plane, because config authorises dispatch on its
+	// own.
+	// Read the CONFIG plane specifically. `agent show` reports the row, which
+	// is unchanged under both the old and new code, so asserting on it cannot
+	// see the defect at all - the first version of this test did exactly that
+	// and its mutant survived.
+	if got := agentTypeConfigPolicy(t, home, "blocked"); got != "read-only" {
+		t.Errorf("config policy = %q after a failed command, want read-only: "+
+			"a command that reported failure widened a live dispatch authority", got)
+	}
+	if got := agentShowPolicy(t, home, "blocked"); got != "read-only" {
+		t.Errorf("row policy = %q after a failed command, want read-only", got)
+	}
+}
+
+// agentTypeConfigPolicy reads the CONFIG plane directly, which `agent show`
+// cannot do: that command reports the row. Any test about which plane moved
+// needs to name the plane it is reading.
+func agentTypeConfigPolicy(t *testing.T, home, name string) string {
+	t.Helper()
+	types, err := loadAgentTypeConfig(home)
+	if err != nil {
+		t.Fatalf("load agent types: %v", err)
+	}
+	entry, ok := types[name]
+	if !ok {
+		t.Fatalf("no config type for %q", name)
+	}
+	return runtime.NormalizeStoredAutonomyPolicy(entry.AutonomyPolicy)
+}
+
+// TestCompensatePolicyWriteFailureRollsConfigBack covers the one window the
+// cross-plane protocol cannot prevent: the barrier succeeded, so the config
+// plane moved, and then the commit failed, so the rows did not.
+//
+// This branch is unreachable end to end - a test cannot reliably force a
+// SQLite COMMIT to fail - and while it was inline its mutants SURVIVED. The
+// seam exists so the behaviour is pinned rather than assumed.
+func TestCompensatePolicyWriteFailureRollsConfigBack(t *testing.T) {
+	t.Run("commit failure restores the config plane", func(t *testing.T) {
+		home := t.TempDir()
+		var stdout, stderr bytes.Buffer
+		if code := Run([]string{"agent", "type", "set", "widened", "--home", home,
+			"--runtime", "codex", "--role", "worker", "--policy", "danger-full-access"}, &stdout, &stderr); code != 0 {
+			t.Fatalf("agent type set exit = %d, stderr=%s", code, stderr.String())
+		}
+		// The state after a successful barrier: config already carries the new
+		// wide value, the rows do not.
+		commitErr := fmt.Errorf("%w: disk", db.ErrAgentPolicyCommit)
+
+		err := compensatePolicyWriteFailure(home, "widened", "danger-full-access", "read-only", true, commitErr)
+		if err == nil {
+			t.Fatal("compensate returned nil; the command must still fail")
+		}
+		if !errors.Is(err, db.ErrAgentPolicyCommit) {
+			t.Errorf("error = %v, want the commit cause preserved", err)
+		}
+		if got := agentTypeConfigPolicy(t, home, "widened"); got != "read-only" {
+			t.Errorf("config policy = %q, want read-only: a failed command must not leave a widened grant", got)
+		}
+		if msg := err.Error(); !strings.Contains(msg, "no plane was changed") {
+			t.Errorf("error = %q, want it to say no plane was changed once config is rolled back", msg)
+		}
+	})
+
+	t.Run("barrier failure reports no change and touches nothing", func(t *testing.T) {
+		home := t.TempDir()
+		var stdout, stderr bytes.Buffer
+		if code := Run([]string{"agent", "type", "set", "untouched", "--home", home,
+			"--runtime", "codex", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
+			t.Fatalf("agent type set exit = %d", code)
+		}
+		barrierErr := fmt.Errorf("%w: unwritable", db.ErrAgentPolicyBarrier)
+		err := compensatePolicyWriteFailure(home, "untouched", "danger-full-access", "read-only", true, barrierErr)
+		if err == nil || !errors.Is(err, db.ErrAgentPolicyBarrier) {
+			t.Fatalf("error = %v, want the barrier cause preserved", err)
+		}
+		if got := agentTypeConfigPolicy(t, home, "untouched"); got != "read-only" {
+			t.Errorf("config policy = %q, want read-only", got)
+		}
+	})
+
+	t.Run("no config section means nothing to roll back", func(t *testing.T) {
+		home := t.TempDir()
+		commitErr := fmt.Errorf("%w: disk", db.ErrAgentPolicyCommit)
+		err := compensatePolicyWriteFailure(home, "registry-only", "danger-full-access", "", false, commitErr)
+		if err == nil || !errors.Is(err, db.ErrAgentPolicyCommit) {
+			t.Fatalf("error = %v, want the commit cause preserved", err)
+		}
+		if !strings.Contains(err.Error(), "no plane was changed") {
+			t.Errorf("error = %q, want it to report no change", err.Error())
+		}
+	})
+}
