@@ -105,8 +105,38 @@ type OmpAdapter struct {
 
 func (a OmpAdapter) Name() string { return OmpRuntime }
 
-func (a OmpAdapter) PermissionPolicyApplication(Agent) PermissionPolicyApplication {
-	return PermissionPolicyNotApplied
+func (a OmpAdapter) PermissionPolicyApplication(agent Agent) PermissionPolicyApplication {
+	_, property := ompApprovalArgs(agent)
+	return property
+}
+
+// ompApprovalArgs maps the stored autonomy policy onto omp's --approval-mode,
+// mirroring codexSandboxArgs and claudePermissionArgs: one function owns both
+// the argv and the declaration, so the two cannot drift (#1721).
+//
+// THE MAPPING IS MEASURED, NOT ASSUMED. Against the pinned CLI (omp 17.2.4,
+// headless, stdin closed, no host pre-approvals), always-ask returns
+// isError:false for read, grep and read-on-a-directory, returns isError:true
+// with "requires approval but no interactive UI available" for bash and write
+// WITHOUT the write landing, and still exits 0 with a full agent_end envelope
+// this adapter parses. So always-ask restricts omp to read-only tools and
+// terminates cleanly, which is what a read-only autonomy policy asks for.
+//
+// EVERY OTHER POLICY KEEPS TODAY'S yolo ARGV, byte-identical, because this
+// change closes a least-privilege gap and is not a re-tuning of the runtime.
+// The DECLARATION still differs by policy, because yolo is unrestricted: it is
+// `applied` only for danger-full-access, and `widened` where the stored policy
+// asked for less than yolo grants. Reporting `applied` there would claim a
+// confinement no argv performs.
+func ompApprovalArgs(agent Agent) (string, PermissionPolicyApplication) {
+	switch NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {
+	case AutonomyPolicyReadOnly:
+		return "--approval-mode=always-ask", PermissionPolicyApplied
+	case AutonomyPolicyDangerFullAccess:
+		return "--approval-mode=yolo", PermissionPolicyApplied
+	default:
+		return "--approval-mode=yolo", PermissionPolicyWidened
+	}
 }
 
 func (a OmpAdapter) Start(ctx context.Context, request StartRequest) (StartResult, error) {
@@ -371,7 +401,7 @@ func (a OmpAdapter) preflight() error {
 // for this runtime — Start and Deliver share it — so no flag can appear on one
 // path and go missing on the other. Shape (asserted byte-for-byte in tests):
 //
-//	omp -p --mode=json --approval-mode=yolo --no-session [--add-dir <p>]…
+//	omp -p --mode=json --approval-mode=<policy> --no-session [--add-dir <p>]…
 //	    [--model <M>] [--thinking <lvl>] [--max-time <s>]
 //	    [--plan-yolo [--plan-yolo-into <M>]] [@<staged>/prompt.md]
 //	    -- <single prompt token>
@@ -380,27 +410,23 @@ func (a OmpAdapter) preflight() error {
 //
 //   - `-p --mode=json` selects print mode with the NDJSON envelope this adapter
 //     parses; without --mode=json omp prints prose and every job fails extraction.
-//   - `--approval-mode=yolo` is passed EXPLICITLY for every autonomy policy, for
-//     DETERMINISM, not because a policy mapping is impossible. Omitting the flag
-//     would inherit whatever tools.approvalMode the host config carries, which is
-//     not deterministic across machines.
-//     A previous version of this comment claimed always-ask would "brick the
-//     runtime" because read/grep/ls declare no tier and every headless call
-//     throws. That was WRONG and is corrected here against a measurement of the
-//     pinned CLI (omp 17.2.4, headless, stdin closed, no host pre-approvals):
-//     read, grep and read-on-a-directory all return isError:false and SUCCEED;
-//     bash and write return isError:true with "requires approval but no
-//     interactive UI available" and the write does not land; the process still
-//     exits 0 with a full agent_end envelope this adapter parses. So always-ask
-//     RESTRICTS omp to read-only tools and terminates cleanly — which is exactly
-//     what a read-only autonomy policy wants. omp 17.2.4 has no `ls` tool at all.
-//     Mapping autonomy policy onto --approval-mode is therefore a live option for
-//     #1479's dispatch-surface question, not a foreclosed one; it is simply not
-//     done here, and this comment must not be cited as a reason it cannot be.
-//     Today read-only stays enforced Gitmoot-side by readOnlyImplementationBlocked
-//     (the kimi precedent) and by NOTHING ELSE: the Landlock wrapper selects by
-//     runtime NAME and wraps only claude/kimi (both call sites in
-//     cli/daemon_worker.go), so no omp process is ever confined.
+//   - `--approval-mode` is ALWAYS present, for DETERMINISM: omitting it inherits
+//     whatever tools.approvalMode the host config carries, which is not
+//     deterministic across machines. Its VALUE now comes from the stored
+//     autonomy policy via ompApprovalArgs (#1721); it was a fixed `yolo` for
+//     every policy until then, so a read-only omp agent ran unrestricted.
+//     Read-only maps to always-ask on the measurement recorded at
+//     ompApprovalArgs; every other policy keeps `yolo` byte-identically.
+//     TWO CLAIMS THIS COMMENT USED TO CARRY WERE WRONG AND ARE CORRECTED
+//     AGAINST THE CODE, because a stale rationale is cited as a reason:
+//     the read-only Landlock wrapper does NOT select only claude and kimi -
+//     wrapReadOnlyAdapterRunner in cli/daemon_worker.go wraps claude, codex,
+//     kimi and shell - and it is not true that "no omp process is ever
+//     confined": that switch has an explicit omp arm which REFUSES a read-only
+//     seat outright ("read-only seats cannot use omp without an isolated
+//     credential broker") rather than running it unconfined. The gap this flag
+//     now closes is the case the seat path never reaches: a non-seat omp
+//     dispatch whose stored policy asked for less than yolo.
 //   - `--no-session` keeps the run in memory: no per-worktree session .jsonl
 //     accretion, and nothing to accidentally resume (v1 never resumes).
 //   - the prompt is exactly ONE token after `--`: multiple positionals become
@@ -476,7 +502,8 @@ func ompPlanTarget(model string, planInto string) string {
 }
 
 func ompArgs(agent Agent, model string, thinking string, maxTime string, plan bool, planInto string, attachArgs []string, prompt string) []string {
-	args := []string{"-p", "--mode=json", "--approval-mode=yolo", "--no-session"}
+	approval, _ := ompApprovalArgs(agent)
+	args := []string{"-p", "--mode=json", approval, "--no-session"}
 	args = append(args, ompWorkspaceArgs(agent)...)
 	if model != "" {
 		args = append(args, "--model", model)

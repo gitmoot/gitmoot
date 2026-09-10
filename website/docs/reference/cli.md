@@ -750,16 +750,16 @@ the daemon runs under. What that changes in practice:
   mid-work** — by the `--max-time` deadline or the provider's output cap, where
   the envelope is complete and only the final answer is missing — fails loudly
   rather than reporting an empty success.
-- **All four `--policy` values pass the same explicit `--approval-mode=yolo`,**
-  for **determinism** — omitting the flag would inherit whatever
-  `tools.approvalMode` the host config carries. It is *not* because `always-ask`
-  is unusable: measured on omp 17.2.4 headless, `read`/`grep`/`glob` succeed and
-  only `bash`/`write` are refused, and the process exits 0 with a full
-  `agent_end`, so `always-ask` **restricts** omp rather than breaking it. Mapping
-  autonomy policy onto the approval mode therefore remains an open option
-  (gitmoot#1479); it is simply not what the adapter does today. Read-only stays
-  enforced Gitmoot-side (the same fail-closed implement refusal Kimi uses), not by
-  the runtime flag.
+- **`--policy` selects the `--approval-mode` value,** and the flag is always
+  present for **determinism** - omitting it would inherit whatever
+  `tools.approvalMode` the host config carries. `read-only` maps to
+  `always-ask`; `auto`, `workspace-write` and `danger-full-access` all map to
+  `yolo`. Measured on omp 17.2.4 headless, `always-ask` lets `read`/`grep`/`glob`
+  succeed and refuses only `bash`/`write`, with the process exiting 0 and a full
+  `agent_end`, so it **restricts** omp rather than breaking it (#1721). The
+  adapter declares the relationship it produced: `applied` for `read-only` and
+  `danger-full-access`, `widened` for the two policies that asked for less than
+  `yolo` grants.
 - **omp is in no cross-family group.** An omp implement job's cross-family
   review is refused *loudly* (a `cross_family_review_failed` job event) instead
   of silently skipped, because scoring an opaque router as a model family would

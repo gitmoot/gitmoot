@@ -54,7 +54,7 @@ adapter contract.
 Every delivery — and `agent start` — builds one argument vector:
 
 ```sh
-omp -p --mode=json --approval-mode=yolo --no-session \
+omp -p --mode=json --approval-mode=<policy> --no-session \
     [--add-dir <path>]… [--model <M>] [--thinking <level>] [--max-time <s>] \
     [--plan-yolo [--plan-yolo-into <M>]] \
     [@<staged>/prompt.md] -- '<single prompt token>'
@@ -231,15 +231,17 @@ have been billed for a message whose `message_end` never reached stdout.
 
 | `--policy` | omp argument | Effect |
 |---|---|---|
-| `read-only` | `--approval-mode=yolo` | advisory only at the runtime layer |
-| `workspace-write` | `--approval-mode=yolo` | same |
-| `danger-full-access` | `--approval-mode=yolo` | same |
-| `auto` (default) | `--approval-mode=yolo` | same |
+| `read-only` | `--approval-mode=always-ask` | restricts omp to read tools; declared `applied` |
+| `workspace-write` | `--approval-mode=yolo` | declared `widened`: yolo grants more than asked |
+| `danger-full-access` | `--approval-mode=yolo` | declared `applied` |
+| `auto` (default) | `--approval-mode=yolo` | declared `widened` |
 
-Every policy passes the **same explicit** `--approval-mode=yolo`, and that is
-deliberate — for **determinism**, not because a policy mapping is impossible.
-Omitting the flag would inherit whatever approval mode the host config carries,
-which is not deterministic across machines.
+The flag is **always present** for **determinism**: omitting it would inherit
+whatever approval mode the host config carries, which is not deterministic
+across machines. Its VALUE follows the stored autonomy policy
+([#1721](https://github.com/gitmoot/gitmoot/issues/1721)). Until that mapping
+landed, all four policies passed `yolo`, so an agent stored `read-only` ran with
+unrestricted tools on every non-seat dispatch.
 
 :::caution Corrected
 An earlier version of this page claimed that `always-ask` "would brick the runtime
@@ -251,10 +253,8 @@ and read-on-a-directory all succeed (`isError:false`); `bash` and `write` return
 write does not land; the process still exits `0` with a full `agent_end` envelope
 the adapter parses. So `always-ask` **restricts** omp to read-only tools and
 terminates cleanly — which is what a read-only policy wants. omp 17.2.4 has no
-`ls` tool at all. Mapping autonomy policy onto `--approval-mode` remains an open
-option for [#1479](https://github.com/gitmoot/gitmoot/issues/1479); it is simply
-not what the adapter does today, and this page must not be cited as a reason it
-cannot be.
+`ls` tool at all. That measurement is what the mapping is built on: `read-only`
+now passes `always-ask`.
 :::
 
 Read-only therefore stays enforced **Gitmoot-side**, exactly as it is for Kimi:
@@ -292,7 +292,8 @@ On `omp/17.2.4`, `omp --version && omp --help` declares that `--plan-yolo` start
 in read-only plan mode, auto-approves the model's plan on its first resolve call,
 then executes it, and that `--plan-yolo-into` selects the execution model. That is
 omp's versioned CLI declaration; the tool-set behavior above is what its source
-actually does. `--approval-mode` stays `yolo` for plan and non-plan runs alike.
+actually does. the approval mode is unchanged by plan mode: a plan run and an ordinary run
+of the same policy carry the same `--approval-mode` value.
 
 **The execution phase is a model switch.** Left unset, omp resolves
 `--plan-yolo-into` to its cheap `@smol` role, so the job's model would plan and a
