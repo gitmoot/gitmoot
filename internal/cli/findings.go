@@ -448,12 +448,15 @@ func shortFindingsHead(head string) string {
 // at that exact head is still open, which the gate's dischargedAtHead step
 // removes.
 //
-// It is a SUPERSET of what the gate would demand, and MAY BE A PROPER ONE. It
-// is NOT always proper: the exact-head addend is empty whenever no finding's
-// latest observation sits at the merged head, and then the union equals the
-// gate set exactly - TestMergedUnresolvedKeysOnTheBranchHeadNotTheMergeCommit
-// is that case, its only finding being at an earlier head (#2106 f4 corrected
-// an earlier version of this comment that claimed equality was impossible).
+// IT CONTAINS EVERY GATE OBLIGATION AND MAY ADD EXACT-HEAD-OPEN FINDINGS. That
+// is the whole relationship, stated without set-theory vocabulary on purpose:
+// two rounds of #2106 findings went to "superset, never an equal" and then
+// "superset, never a subset, not always proper", and both were wrong - the
+// first denied the equal case the code produces, the second contradicted
+// itself, because equality makes the report a subset too. When no finding's
+// latest observation sits at the merged head the addend is empty and the two
+// sets coincide; TestMergedUnresolvedKeysOnTheBranchHeadNotTheMergeCommit is
+// that case.
 //
 // What must NOT come back is the reduction to "obligations the merge gate would
 // have demanded" (#2106 f3 was exactly that sentence, twice): the report can
@@ -669,15 +672,13 @@ func runFindingsMergedUnresolved(repoFilter string, home string, jsonOutput bool
 		// The f1 fix deliberately adds rows LedgerObligationsAtHead excludes, so
 		// this line can no longer claim every item is an obligation the gate
 		// would demand. The disagreement is one-directional and by design: the
-		// report is a superset of what the gate asks for and never a subset. It
-		// is not always a PROPER superset: with no exact-head-open findings the
-		// two sets coincide (#2106 f4).
+		// report contains every gate obligation and may add exact-head-open
+		// findings. With none of those the two sets coincide (#2106 f4).
 		fmt.Fprintln(stdout, "These merged while still carrying unresolved findings at their branch head.")
 		fmt.Fprintln(stdout, "Rows are the UNION of two sets: obligations the gate would have demanded, and")
 		fmt.Fprintln(stdout, "findings still open at that exact head, which the gate discharges. The second")
 		fmt.Fprintln(stdout, "kind carries the reason \"still open at the merged head\", so this report is a")
-		fmt.Fprintln(stdout, "superset of the gate rather than the same predicate. With no findings of the")
-		fmt.Fprintln(stdout, "second kind the two coincide.")
+		fmt.Fprintln(stdout, "report contains every gate obligation and may add findings of the second kind.")
 		// #2106 f2: THIS COLUMN IS TODAY'S POLICY, NOT A HISTORICAL AUTHORISATION.
 		// It is read from the CURRENT review configuration, so saying it proves the
 		// gate let a past merge through by declaration reverses history whenever

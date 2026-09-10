@@ -2974,8 +2974,8 @@ correct for the gate and wrong for this report, which asks what was unresolved
 **when the pull request merged** - the case where a P1 sits at the exact head
 that merged. Those rows are labelled `still open at the merged head` so the two
 sets stay distinguishable. **The report and the gate can therefore disagree, by
-design, and only in that direction:** the report is a superset, and never a
-subset. It is not always a *proper* superset - when no finding's latest
+design, and only in that direction:** the report **contains every gate
+obligation and may add exact-head-open findings**. When no finding's latest
 observation sits at the merged head the second set is empty and the two
 coincide.
 
