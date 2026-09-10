@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -168,5 +169,183 @@ func TestAgentActiveJobCountCountsQueuedAndRunning(t *testing.T) {
 	}
 	if got, err := store.AgentActiveJobCount(ctx, "worker"); err != nil || got != 0 {
 		t.Fatalf("AgentActiveJobCount = %d err=%v, want 0: another agent's queued job is not this agent's busy work", got, err)
+	}
+}
+
+// TestUpdateAgentAutonomyPolicyMovesEveryPlaneThatCanBecomeEffective covers
+// #2134 F2 across two review rounds.
+//
+// Round one wrote only `agents`, so instance-only agents - which GetAgent
+// resolves at store_agents.go:108 and dispatch therefore uses - had no
+// in-place writer at all.
+//
+// Round two wrote the instance only when no row matched, mirroring GetAgent's
+// precedence, on the reasoning that touching a plane dispatch is not reading
+// is worse than leaving it stale. Review disproved that with an executed
+// probe, reproduced here as the third arm: RemoveAgent deletes `agents` and
+// not `agent_instances`, so a stale instance OUTLIVES the row that outranked
+// it and then becomes authoritative, silently re-widening a tightened agent.
+func TestUpdateAgentAutonomyPolicyMovesEveryPlaneThatCanBecomeEffective(t *testing.T) {
+	store := openStoreOperationsTestStore(t)
+	ctx := context.Background()
+
+	// INSTANCE-ONLY: dispatchable through GetAgent's fallback, so it must be
+	// writable in place.
+	if err := store.UpsertAgentInstance(ctx, AgentInstance{
+		Name: "ephemeral", Type: "worker", Runtime: "codex", RuntimeRef: "ref-1",
+		RepoFullName: "gitmoot/gitmoot", Role: "worker", AutonomyPolicy: "read-only", State: "idle",
+	}); err != nil {
+		t.Fatalf("UpsertAgentInstance: %v", err)
+	}
+	if err := store.UpdateAgentAutonomyPolicy(ctx, "ephemeral", "danger-full-access", nil); err != nil {
+		t.Fatalf("refused a dispatchable instance-only agent: %v", err)
+	}
+	got, err := store.GetAgent(ctx, "ephemeral")
+	if err != nil {
+		t.Fatalf("GetAgent: %v", err)
+	}
+	if got.AutonomyPolicy != "danger-full-access" {
+		t.Errorf("instance-only policy = %q, want danger-full-access", got.AutonomyPolicy)
+	}
+
+	// BOTH PLANES PRESENT: both must move. Start them WIDE and tighten, so a
+	// missed plane leaves a permission granted rather than merely stale.
+	for _, seed := range []func() error{
+		func() error {
+			return store.UpsertAgent(ctx, Agent{
+				Name: "both", Role: "worker", Runtime: "codex", RuntimeRef: "ref-2",
+				AutonomyPolicy: "danger-full-access", HealthStatus: "idle",
+			})
+		},
+		func() error {
+			return store.UpsertAgentInstance(ctx, AgentInstance{
+				Name: "both", Type: "worker", Runtime: "codex", RuntimeRef: "ref-2",
+				RepoFullName: "gitmoot/gitmoot", Role: "worker",
+				AutonomyPolicy: "danger-full-access", State: "idle",
+			})
+		},
+	} {
+		if err := seed(); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	if err := store.UpdateAgentAutonomyPolicy(ctx, "both", "read-only", nil); err != nil {
+		t.Fatalf("UpdateAgentAutonomyPolicy(both): %v", err)
+	}
+	instance, err := store.GetAgentInstance(ctx, "both")
+	if err != nil {
+		t.Fatalf("GetAgentInstance: %v", err)
+	}
+	if instance.AutonomyPolicy != "read-only" {
+		t.Errorf("instance policy = %q, want read-only: a plane left wide can become effective later", instance.AutonomyPolicy)
+	}
+
+	// THE PROBE THAT DISPROVED ROUND TWO, through the real production path:
+	// remove the winning row and see what dispatch would now resolve.
+	removed, err := store.RemoveAgent(ctx, "both")
+	if err != nil {
+		t.Fatalf("RemoveAgent: %v", err)
+	}
+	if !removed {
+		t.Fatal("RemoveAgent reported nothing removed")
+	}
+	survivor, err := store.GetAgent(ctx, "both")
+	if err != nil {
+		t.Fatalf("GetAgent after remove: %v", err)
+	}
+	if survivor.AutonomyPolicy != "read-only" {
+		t.Errorf("after removing the agents row GetAgent resolves %q, want read-only: "+
+			"the surviving instance silently re-widened an agent that was tightened",
+			survivor.AutonomyPolicy)
+	}
+
+	if err := store.UpdateAgentAutonomyPolicy(ctx, "nosuch", "auto", nil); err == nil {
+		t.Error("accepted an agent present in neither plane")
+	}
+}
+
+// TestUpdateAgentAutonomyPolicyBarrierRollsBackEveryPlane covers #2134 F1's
+// cross-plane protocol at the store boundary: a barrier failure must leave the
+// rows exactly as they were, because the caller's other plane did not move
+// either.
+func TestUpdateAgentAutonomyPolicyBarrierRollsBackEveryPlane(t *testing.T) {
+	store := openStoreOperationsTestStore(t)
+	ctx := context.Background()
+	if err := store.UpsertAgent(ctx, Agent{
+		Name: "guarded", Role: "worker", Runtime: "codex", RuntimeRef: "ref-3",
+		AutonomyPolicy: "read-only", HealthStatus: "idle",
+	}); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+
+	barrier := errors.New("config plane unwritable")
+	err := store.UpdateAgentAutonomyPolicy(ctx, "guarded", "danger-full-access", func() error {
+		return barrier
+	})
+	if !errors.Is(err, ErrAgentPolicyBarrier) {
+		t.Errorf("error = %v, want it to wrap ErrAgentPolicyBarrier so the caller can tell rollback from a split write", err)
+	}
+	if !errors.Is(err, barrier) {
+		t.Errorf("error = %v, want the barrier's own cause preserved", err)
+	}
+	after, err := store.GetAgent(ctx, "guarded")
+	if err != nil {
+		t.Fatalf("GetAgent: %v", err)
+	}
+	if after.AutonomyPolicy != "read-only" {
+		t.Errorf("policy = %q after a failed barrier, want read-only: the transaction must roll back", after.AutonomyPolicy)
+	}
+}
+
+// TestUpdateAgentAutonomyPolicyReportsACommitFailureDistinctly pins the one
+// thing the caller's compensation depends on: a commit that fails AFTER a
+// successful barrier must be distinguishable from a barrier failure. They
+// demand opposite responses - a barrier failure means nothing moved, a commit
+// failure means the caller's plane moved and must be rolled back - so a
+// collapsed sentinel silently turns a partial write into a silent one.
+//
+// SCOPE, because review measured this precisely and the distinction matters:
+// cancelling the transaction's context reaches UpdateAgentAutonomyPolicy's real
+// tx.Commit error arm after a successful barrier, which is the branch the
+// caller's compensation depends on. It does NOT exercise a driver-level SQLite
+// COMMIT failure: Go's database/sql checks the transaction context first and
+// returns context.Canceled before calling the driver's Commit. A driver-level
+// commit fault would need a fault-injecting driver seam, which does not exist
+// here. Closing the pool does not work at all, because the transaction holds
+// its own connection.
+func TestUpdateAgentAutonomyPolicyReportsACommitFailureDistinctly(t *testing.T) {
+	store := openStoreOperationsTestStore(t)
+	ctx := context.Background()
+	if err := store.UpsertAgent(ctx, Agent{
+		Name: "doomed", Role: "worker", Runtime: "codex", RuntimeRef: "ref-9",
+		AutonomyPolicy: "read-only", HealthStatus: "idle",
+	}); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+
+	// Cancelling the transaction's own context is what makes the commit fail:
+	// closing the pool does not, because the transaction holds its connection.
+	txCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	barrierRan := false
+	err := store.UpdateAgentAutonomyPolicy(txCtx, "doomed", "danger-full-access", func() error {
+		barrierRan = true
+		// The barrier SUCCEEDS - this is the caller's other plane being
+		// written - and only then is the commit made impossible.
+		cancel()
+		return nil
+	})
+	if !barrierRan {
+		t.Fatal("barrier never ran, so this test is not exercising the commit path")
+	}
+	if err == nil {
+		t.Fatal("commit failure reported success")
+	}
+	if !errors.Is(err, ErrAgentPolicyCommit) {
+		t.Errorf("error = %v, want ErrAgentPolicyCommit", err)
+	}
+	if errors.Is(err, ErrAgentPolicyBarrier) {
+		t.Errorf("error = %v, must NOT read as a barrier failure: the caller would then skip compensation "+
+			"and leave its own plane silently widened", err)
 	}
 }

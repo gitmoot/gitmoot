@@ -809,6 +809,57 @@ gitmoot agent restart reviewer
 gitmoot agent remove reviewer
 ```
 
+### `agent policy`: change a registered agent's autonomy policy in place
+
+```
+gitmoot agent policy <name> --policy auto|read-only|workspace-write|danger-full-access
+```
+
+**This writes the plane dispatch reads.** `agent type set --policy` writes the
+config plane only, and most registered agents have no config section at all, so
+for them it refuses outright. `agent start` and `agent subscribe` carry
+`--policy` but mean re-registration, which replaces the runtime session.
+
+Dispatch resolves a registered agent through `GetAgent`, which reads **the
+`agents` row if one exists and otherwise the `agent_instances` row**. This verb
+updates **both** rows in one transaction rather than only the one that outranks
+the other today. A same-name `agent_instances` row can OUTLIVE the `agents` row
+that outranked it, because `agent remove` deletes `agents` and not
+`agent_instances`; a stale instance left behind would then become authoritative
+and silently re-widen an agent you had tightened. Only a name present in
+neither plane is unregistered.
+
+**When a config type also exists, both planes are written**, and the command
+reports each:
+
+```
+agent: appkit-omp
+policy: workspace-write -> danger-full-access
+config_type: danger-full-access          # or: none (registry-only agent; nothing to keep in step)
+```
+
+**Failure semantics are all-or-nothing, enforced by a held transaction.** Both
+the agents row and the config type can authorise dispatch on their own: explicit
+managed-type routing never consults the row. So no ordering is safe, because
+whichever plane is written first is already live before the second can fail. The
+database transaction is the coordinator instead. The rows are updated, the
+config write runs as a barrier inside that still-open transaction, and the
+commit lands only if the config write succeeded. A config failure rolls the rows
+back, so nothing moved on any plane. If the commit itself fails after config
+succeeded, the config write is rolled back too and the command reports that
+nothing changed; only if that rollback also fails does it report the planes as
+inconsistent, naming both values so you know what to correct.
+
+**Every plane that can become effective is written**, not only the one that
+decides today: a same-name `agent_instances` row is updated alongside the
+`agents` row, because `agent remove` deletes only the latter and a surviving
+instance would otherwise silently re-widen an agent you had tightened.
+
+`agent type show` returns **non-zero** when a registered agent's policy differs
+between planes, or when the effective policy cannot be determined; it prints
+`policy_effective:` alongside the config `policy:` so neither a human nor a
+stdout parser can read the config value as the effective one.
+
 `gitmoot agent show <name>` keeps the existing `runtime_ref: <id>` line unchanged
 and makes concrete session pinning explicit on a separate
 `runtime_session: pinned (last successful use: <age>)` line. The extra line is

@@ -66,6 +66,8 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 		return runAgentSubscribe(args[1:], stdout, stderr)
 	case "show":
 		return runAgentShow(args[1:], stdout, stderr)
+	case "policy":
+		return runAgentPolicy(args[1:], stdout, stderr)
 	case "list":
 		return runAgentList(args[1:], stdout, stderr)
 	case "remove":
@@ -106,6 +108,7 @@ func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot agent deny <name> --repo owner/repo")
 	fmt.Fprintln(w, "  gitmoot agent repos <name>")
 	fmt.Fprintln(w, "  gitmoot agent show <name> [--json]")
+	fmt.Fprintln(w, "  gitmoot agent policy <name> --policy auto|read-only|workspace-write|danger-full-access [--home path]")
 	fmt.Fprintln(w, "  gitmoot agent list")
 	fmt.Fprintln(w, "  gitmoot agent remove <name>")
 	fmt.Fprintln(w, "  gitmoot agent restart <name>      # abandon + replace the runtime session (finish in-flight asks first)")
@@ -1207,7 +1210,75 @@ func runAgentTypeShow(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	printAgentType(stdout, entry)
-	return 0
+	// #2134 F3: a KNOWN divergence, or an inability to determine the effective
+	// policy, is NON-ZERO. rc=0 is reserved for "this config type is the whole
+	// answer" - no registered agent, or planes that agree. An audit gating on
+	// exit status then cannot be confidently wrong, which stdout parsing alone
+	// could not guarantee.
+	return warnAgentTypePolicyDivergence(stdout, stderr, *home, strings.TrimSpace(name), entry)
+}
+
+// warnAgentTypePolicyDivergence surfaces the #2132 defect: `agent type show`
+// prints the CONFIG plane, dispatch resolves a registered agent through the
+// agents ROW, and nothing reconciled them - so a permission audit run through
+// the natural verb could return a confident wrong answer at rc=0.
+//
+// WARN RATHER THAN REFUSE OR SILENTLY MERGE, and the reasons are specific.
+// Refusing breaks a verb that legitimately describes types with no registered
+// agent at all, which is most of them. Silently printing the row instead would
+// hide that two planes exist, which is the thing an auditor needs to know.
+// Printing both, and naming which one decides, is the only option that leaves
+// the reader unable to be confidently wrong.
+//
+// #2134 F3: IT EXITS NON-ZERO on a known divergence and when the effective
+// policy cannot be determined. The earlier rc=0 was kept on the reasoning that
+// divergence is sometimes intended, but it left a pipeline gating on exit
+// status still fooled while the primary `policy:` line carried the config
+// value. An unreadable store is reported as `policy_effective: unknown` and is
+// likewise non-zero, because "I could not determine it" and "the planes agree"
+// must never render identically.
+//
+// rc=0 remains the answer for a type with NO registered agent and for planes
+// that agree, so the verb still works for the majority case and does not
+// become a command that requires a store to succeed.
+func warnAgentTypePolicyDivergence(stdout, stderr io.Writer, home, name string, entry config.AgentType) int {
+	configPolicy := runtime.NormalizeStoredAutonomyPolicy(entry.AutonomyPolicy)
+	status := 0
+	if err := withStore(home, func(store *db.Store) error {
+		agent, err := store.GetAgent(context.Background(), name)
+		if errors.Is(err, sql.ErrNoRows) {
+			// A type with no registered agent is the NORMAL case and the one
+			// this verb exists for. Nothing to reconcile, nothing to report.
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		rowPolicy := runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy)
+		if rowPolicy == configPolicy {
+			return nil
+		}
+		writeLine(stdout, "policy_effective: %s", rowPolicy)
+		fmt.Fprintf(stderr, "error: agent %q is REGISTERED and its policy differs between planes: "+
+			"this config type says %q, the agents row says %q. DISPATCH READS THE ROW, so the "+
+			"effective policy is %q. Use `gitmoot agent policy %s --policy <value>` to change the "+
+			"row in place, or `gitmoot agent show %s` to read it directly (#2132).\n",
+			name, configPolicy, rowPolicy, rowPolicy, name, name)
+		status = 1
+		return nil
+	}); err != nil {
+		// #2134 F3, second half: the first version SWALLOWED every store error,
+		// so an unreadable database printed the config policy at rc=0 with no
+		// warning - the confident-wrong-answer this exists to prevent, reached
+		// by another route. "I could not determine it" and "they agree" must
+		// never render identically.
+		writeLine(stdout, "policy_effective: unknown")
+		fmt.Fprintf(stderr, "error: cannot determine agent %q's effective policy, so the %q above "+
+			"is the CONFIG plane only and may not be what dispatch reads: %v\n",
+			name, configPolicy, err)
+		status = 1
+	}
+	return status
 }
 
 func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
@@ -1618,7 +1689,7 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	if persistType {
-		if err := config.SaveAgentTypeAtomic(paths, entry); err != nil {
+		if err := config.SaveAgentType(paths, entry); err != nil {
 			fmt.Fprintf(stderr, "agent start: persist memory enrollment: %v\n", err)
 			return 1
 		}
@@ -2002,6 +2073,165 @@ type agentShowOutput struct {
 	HealthStatus                string   `json:"health_status"`
 	RepoScope                   string   `json:"repo_scope,omitempty"`
 	AllowedRepos                []string `json:"allowed_repos"`
+}
+
+// runAgentPolicy updates a REGISTERED agent's autonomy policy in place (#2132).
+//
+// It exists because no verb wrote the plane dispatch reads. `agent type set
+// --policy` writes the CONFIG plane, and 7 of the 8 agents in #2132's audit are
+// registry-only with no config section, so for them it cannot write anything -
+// it refuses with "requires --runtime for new type". The verbs that do carry
+// --policy for a registered agent (`agent start`, `agent subscribe`) mean
+// RE-REGISTRATION, which replaces the runtime session; one affected agent had
+// 106 completed implements and a live session.
+//
+// So this writes every plane that can make a policy effective - the agents row,
+// any same-name agent_instances row, and the config type when one exists - and
+// prints the before and after so the change is verifiable from the command's
+// own output rather than only by a follow-up read. The database rows move in
+// one transaction with the config write as its barrier, so a failure cannot
+// leave one plane granting what another refuses.
+func runAgentPolicy(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("agent policy", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	policy := fs.String("policy", "", "agent autonomy policy: auto, read-only, workspace-write, or danger-full-access")
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		fmt.Fprintln(stderr, "Usage:")
+		fmt.Fprintln(stderr, "  gitmoot agent policy <name> --policy auto|read-only|workspace-write|danger-full-access [--home path]")
+		if len(args) == 0 {
+			fmt.Fprintln(stderr, "agent policy requires exactly one agent")
+			return 2
+		}
+		return 0
+	}
+	name := strings.TrimSpace(args[0])
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 || name == "" {
+		fmt.Fprintln(stderr, "agent policy requires exactly one agent")
+		return 2
+	}
+	if strings.TrimSpace(*policy) == "" {
+		fmt.Fprintln(stderr, "agent policy requires --policy")
+		return 2
+	}
+	normalized, err := runtime.NormalizeAutonomyPolicy(*policy)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid policy: %v\n", err)
+		return 2
+	}
+	if err := withStore(*home, func(store *db.Store) error {
+		ctx := context.Background()
+		before, err := store.GetAgent(ctx, name)
+		if err != nil {
+			// Caught by this change's own smoke test: GetAgent surfaces the raw
+			// sql.ErrNoRows here, so an unregistered name reported "sql: no rows
+			// in result set" - which names the storage layer rather than the
+			// mistake. UpdateAgentAutonomyPolicy already phrases this correctly,
+			// so match it rather than inventing a second wording.
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("agent %q is not registered", name)
+			}
+			return err
+		}
+		// #2134 F1 round three: A HELD TRANSACTION, NOT AN ORDERING.
+		//
+		// Round two proved the config plane writable first and moved the row
+		// after, on the premise that the row is what decides. Review disproved
+		// the premise with an executed probe: explicit managed-type routing
+		// never calls GetAgent (agent_dispatch.go:1689) and builds the runtime
+		// agent straight from config (:1828, :2029). Config is an INDEPENDENT
+		// dispatch authority, so writing it first meant a command that returned
+		// rc=1 had already widened a live grant - #2132 inverted, which is the
+		// exact defect this verb exists to remove.
+		//
+		// With BOTH planes authorising, no ordering is safe, because whichever
+		// is written first is live before the second can fail. The database
+		// transaction becomes the coordinator instead: rows update, the config
+		// write runs as the barrier, and the commit lands only if it succeeded.
+		//
+		// Capture the config value FIRST so the one remaining window can be
+		// compensated rather than merely reported.
+		previousConfig, hadConfig, err := agentTypePolicyValue(*home, name)
+		if err != nil {
+			return err
+		}
+		if err := store.UpdateAgentAutonomyPolicy(ctx, name, normalized, func() error {
+			return syncAgentTypePolicy(*home, name, normalized)
+		}); err != nil {
+			return compensatePolicyWriteFailure(*home, name, normalized, previousConfig, hadConfig, err)
+		}
+		// Read the row back rather than echoing what we wrote: the whole defect
+		// this closes is a command reporting a value it did not persist.
+		after, err := store.GetAgent(ctx, name)
+		if err != nil {
+			return err
+		}
+		writeLine(stdout, "agent: %s", after.Name)
+		writeLine(stdout, "policy: %s -> %s",
+			runtime.NormalizeStoredAutonomyPolicy(before.AutonomyPolicy),
+			runtime.NormalizeStoredAutonomyPolicy(after.AutonomyPolicy))
+
+		// WRITE THE CONFIG PLANE TOO WHEN ONE EXISTS, or this verb reproduces
+		// #2132 MIRRORED: the row would move, `agent type show` would keep
+		// printing the old value, and the next auditor gets a confident wrong
+		// answer from the other direction. Only 1 of the 8 agents in #2132's
+		// audit had a config section, so this is the minority path - which is
+		// exactly why it would have gone untested.
+		//
+		// Absent config is the NORMAL case for a registry-only agent and is not
+		// an error: there is nothing to keep in step. Reported either way so the
+		// operator knows which planes moved rather than inferring it.
+		writeLine(stdout, "config_type: %s", agentTypePolicyState(*home, name, normalized))
+		return nil
+	}); err != nil {
+		fmt.Fprintf(stderr, "agent policy: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// syncAgentTypePolicy keeps the config plane in step with the row when a config
+// type exists for this agent (#2132). A missing type is not an error - most
+// registered agents have none - and nothing is created, because inventing a
+// config section would change how the type/ephemeral path resolves this name.
+func syncAgentTypePolicy(home, name, policy string) error {
+	paths, types, err := loadAgentTypeConfigWithPaths(home)
+	if err != nil {
+		return err
+	}
+	entry, ok := types[name]
+	if !ok {
+		return nil
+	}
+	if runtime.NormalizeStoredAutonomyPolicy(entry.AutonomyPolicy) == policy {
+		return nil
+	}
+	entry.AutonomyPolicy = policy
+	return config.SaveAgentType(paths, entry)
+}
+
+// agentTypePolicyState describes what happened to the config plane, so the
+// command's own output answers "which planes moved" instead of leaving it to a
+// follow-up read.
+func agentTypePolicyState(home, name, policy string) string {
+	types, err := loadAgentTypeConfig(home)
+	if err != nil {
+		return "unreadable: " + err.Error()
+	}
+	entry, ok := types[name]
+	if !ok {
+		return "none (registry-only agent; nothing to keep in step)"
+	}
+	if got := runtime.NormalizeStoredAutonomyPolicy(entry.AutonomyPolicy); got != policy {
+		return "STALE: " + got
+	}
+	return policy
 }
 
 func runAgentShow(args []string, stdout, stderr io.Writer) int {
@@ -2652,4 +2882,54 @@ func (f *repeatedFlag) String() string {
 func (f *repeatedFlag) Set(value string) error {
 	*f = append(*f, value)
 	return nil
+}
+
+// agentTypePolicyValue reads the config plane's current policy for an agent so
+// a failed cross-plane write can be COMPENSATED rather than merely described.
+// The bool distinguishes "no config section" from "a section reading empty":
+// only the former means there is nothing to roll back, because
+// syncAgentTypePolicy never creates a section.
+func agentTypePolicyValue(home, name string) (string, bool, error) {
+	types, err := loadAgentTypeConfig(home)
+	if err != nil {
+		return "", false, err
+	}
+	entry, ok := types[name]
+	if !ok {
+		return "", false, nil
+	}
+	return runtime.NormalizeStoredAutonomyPolicy(entry.AutonomyPolicy), true, nil
+}
+
+// compensatePolicyWriteFailure turns a cross-plane write failure into a state
+// the operator can act on (#2134 F1).
+//
+// Extracted rather than left inline because the commit-failure branch is the
+// one window the protocol cannot prevent, and inline it was UNREACHABLE from a
+// test: forcing a SQLite COMMIT to fail is not something a test can arrange
+// reliably. Its mutants survived while it was inline. This is the real
+// function the command calls, not a test double.
+func compensatePolicyWriteFailure(home, name, attempted, previousConfig string, hadConfig bool, err error) error {
+	switch {
+	case errors.Is(err, db.ErrAgentPolicyBarrier):
+		// The barrier failed, so the transaction rolled back and the config
+		// write is what failed in the first place. Nothing moved anywhere.
+		return fmt.Errorf("no plane was changed: %w", err)
+	case errors.Is(err, db.ErrAgentPolicyCommit):
+		// The only partial-write window the protocol leaves: config moved and
+		// the rows did not. COMPENSATE rather than report a split state.
+		if !hadConfig {
+			// syncAgentTypePolicy never creates a section, so there is nothing
+			// to undo.
+			return fmt.Errorf("no plane was changed: %w", err)
+		}
+		if restoreErr := syncAgentTypePolicy(home, name, previousConfig); restoreErr != nil {
+			return fmt.Errorf(
+				"PLANES LEFT INCONSISTENT: rows unchanged, config left at %q and could NOT be restored to %q: %v (%w)",
+				attempted, previousConfig, restoreErr, err)
+		}
+		return fmt.Errorf("no plane was changed: config was rolled back to %q: %w", previousConfig, err)
+	default:
+		return err
+	}
 }
