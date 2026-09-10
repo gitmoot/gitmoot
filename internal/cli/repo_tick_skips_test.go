@@ -113,9 +113,10 @@ func TestWorkerSweepReachesTheSelectorOnRepoBehindABusyRepo(t *testing.T) {
 		}
 	}
 	uniq := t.Name()
-	// Two jobs on the FREE repo sharing one runtime session, so the second is
-	// declined rather than admitted - a decline is the observable, and it needs
-	// the selector to have run.
+	// Two jobs on the FREE repo. They are ADMITTED and then fail downstream on a
+	// checkout precondition, which is what makes the state transition off `queued`
+	// the observable - see the note at the assertion. The point is only that the
+	// selector had to RUN for this repo for either job to move at all.
 	for i := 0; i < 2; i++ {
 		agent := fmt.Sprintf("lead-%d-%s", i, uniq)
 		task := fmt.Sprintf("task-%d-%s", i, uniq)
@@ -184,6 +185,18 @@ func TestWorkerSweepDefersTheForcedTurnToTheEnd(t *testing.T) {
 			t.Fatalf("UpsertRepo %s: %v", name, err)
 		}
 	}
+	// The free repo needs an OBSERVABLE tick: a clean tick logs nothing, so a
+	// queued job is seeded to produce a per-job dispatch line whose position in
+	// the output can be compared against the forced turn's.
+	uniq := t.Name()
+	agent := "lead-" + uniq
+	task := "task-" + uniq
+	seedDaemonWorkerAgent(t, store, agent, runtime.CodexRuntime, "session-"+uniq, []string{"implement"}, "owner/zzz-free")
+	if err := store.UpsertTask(ctx, db.Task{ID: task, RepoFullName: "owner/zzz-free", State: string(workflow.TaskImplementing), Branch: task, WorktreePath: "/tmp/gitmoot/" + task}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-" + uniq, Agent: agent, Action: "implement", Repo: "owner/zzz-free", Branch: task, TaskID: task})
+
 	locks := &repoCheckoutLocks{}
 	busy := locks.For("owner/aaa-busy")
 	busy.Lock()
@@ -217,7 +230,20 @@ func TestWorkerSweepDefersTheForcedTurnToTheEnd(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("sweep did not finish after the forced repo's lock was released")
 	}
-	if !strings.Contains(out.String(), "owner/aaa-busy: worker tick taking a forced turn") {
-		t.Fatalf("forced turn was not reported, so a starving repo's guaranteed turn is invisible; output=%q", out.String())
+	logged := out.String()
+	forcedAt := strings.Index(logged, "owner/aaa-busy: worker tick taking a forced turn")
+	if forcedAt < 0 {
+		t.Fatalf("forced turn was not reported, so a starving repo's guaranteed turn is invisible; output=%q", logged)
+	}
+	// THE ORDERING IS THE POINT, not merely that the forced turn happened. A
+	// mutant that serves forced repos FIRST still waits and still logs, so only
+	// the position distinguishes deferral from in-place forcing - and in-place
+	// forcing is what reintroduces head-of-line blocking at a 1-in-N duty cycle.
+	freeAt := strings.Index(logged, "job "+"job-"+uniq)
+	if freeAt < 0 {
+		t.Fatalf("the free repo produced no dispatch line, so this test cannot order anything; output=%q", logged)
+	}
+	if freeAt > forcedAt {
+		t.Fatalf("the forced turn was served BEFORE the free repo's dispatch (forced at %d, free at %d): the blocking acquisition is sitting in front of a repo that could have dispatched immediately, which is the head-of-line blocking this fix removes; output=%q", forcedAt, freeAt, logged)
 	}
 }
