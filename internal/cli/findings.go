@@ -677,8 +677,8 @@ func runFindingsMergedUnresolved(repoFilter string, home string, jsonOutput bool
 		fmt.Fprintln(stdout, "These merged while still carrying unresolved findings at their branch head.")
 		fmt.Fprintln(stdout, "Rows are the UNION of two sets: obligations the gate would have demanded, and")
 		fmt.Fprintln(stdout, "findings still open at that exact head, which the gate discharges. The second")
-		fmt.Fprintln(stdout, "kind carries the reason \"still open at the merged head\", so this report is a")
-		fmt.Fprintln(stdout, "report contains every gate obligation and may add findings of the second kind.")
+		fmt.Fprintln(stdout, "kind carries the reason \"still open at the merged head\". This report contains")
+		fmt.Fprintln(stdout, "every gate obligation and may add findings of the second kind.")
 		// #2106 f2: THIS COLUMN IS TODAY'S POLICY, NOT A HISTORICAL AUTHORISATION.
 		// It is read from the CURRENT review configuration, so saying it proves the
 		// gate let a past merge through by declaration reverses history whenever
