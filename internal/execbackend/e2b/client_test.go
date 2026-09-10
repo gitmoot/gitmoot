@@ -922,3 +922,108 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return fn(request)
 }
+
+// The four tests below exercise guards that #1650 measured as INERT: each guard
+// is correct code that no test reached, so deleting it left the suite green.
+// Each test is written against the mutant that survived, not against the guard's
+// text, so it fails if the guard is removed and passes only when it fires.
+
+// TestNewClientRejectsUnusableBaseURL covers the #1650 M10 mutant: deleting the
+// scheme/host/query/fragment check left the suite green.
+//
+// The four rejected shapes are the four disjuncts of that check, one each, so a
+// partial weakening is caught rather than only wholesale deletion. The accepted
+// case is the control: without it a guard that rejected EVERYTHING would pass.
+func TestNewClientRejectsUnusableBaseURL(t *testing.T) {
+	t.Parallel()
+
+	for _, base := range []string{
+		"ftp://example.invalid",        // scheme
+		"https://",                     // host
+		"https://example.invalid?a=b",  // query
+		"https://example.invalid#frag", // fragment
+	} {
+		if _, err := NewClient(testAPIKey, Options{BaseURL: base}); err == nil {
+			t.Errorf("NewClient(BaseURL=%q) succeeded, want rejection", base)
+		}
+	}
+	if _, err := NewClient(testAPIKey, Options{BaseURL: "https://example.invalid/api/"}); err != nil {
+		t.Errorf("NewClient with a usable base URL failed: %v", err)
+	}
+}
+
+// TestNewClientRejectsNegativeRequestTimeout covers the #1650 M11 mutant.
+//
+// Zero is NOT an error - it selects DefaultRequestTimeout - so the negative case
+// is the only one that reaches the guard, and asserting zero succeeds keeps a
+// future "timeout <= 0" from passing this test while breaking the default.
+func TestNewClientRejectsNegativeRequestTimeout(t *testing.T) {
+	t.Parallel()
+
+	if _, err := NewClient(testAPIKey, Options{RequestTimeout: -time.Second}); err == nil {
+		t.Error("NewClient(RequestTimeout=-1s) succeeded, want rejection")
+	}
+	if _, err := NewClient(testAPIKey, Options{RequestTimeout: 0}); err != nil {
+		t.Errorf("NewClient(RequestTimeout=0) failed, want the default: %v", err)
+	}
+}
+
+// TestCreateRejectsMalformedCreateResponse covers the #1650 M8 mutant: a 201
+// whose body omits sandboxID. Deleting the guard left the suite green because
+// every existing Create test returns a well-formed body.
+//
+// A 201 is the point: the transport succeeded and the status is success, so
+// nothing but this guard stands between a malformed body and a Sandbox with an
+// empty ID flowing on to callers.
+func TestCreateRejectsMalformedCreateResponse(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"templateID":"template-a","clientID":"c1"}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(testAPIKey, Options{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("NewClient returned error: %v", err)
+	}
+	sandbox, _, err := client.Create(context.Background(), "template-a", time.Minute, CreateOptions{})
+	if err == nil {
+		t.Fatalf("Create accepted a 201 with no sandboxID, returning %+v", sandbox)
+	}
+	if !strings.Contains(err.Error(), "missing sandboxID") {
+		t.Errorf("Create error = %v, want it to name the missing sandboxID", err)
+	}
+}
+
+// TestResponseTotalRunningRejectsDuplicateHeaders covers the #1650 M9 mutant,
+// the cardinality arm of the X-Total-Running check.
+//
+// Duplicate headers are the untested arm: with two values the pre-mutation code
+// refuses, while the mutant silently reads the FIRST and discards the second -
+// so a provider sending two different counts would be believed. The single-value
+// and absent cases are controls that keep this from passing a guard that refuses
+// everything.
+func TestResponseTotalRunningRejectsDuplicateHeaders(t *testing.T) {
+	t.Parallel()
+
+	duplicated := http.Header{}
+	duplicated.Add("X-Total-Running", "3")
+	duplicated.Add("X-Total-Running", "9")
+	if _, _, err := responseTotalRunning(duplicated); err == nil {
+		t.Error("responseTotalRunning accepted duplicate X-Total-Running headers")
+	}
+
+	single := http.Header{}
+	single.Add("X-Total-Running", "3")
+	total, ok, err := responseTotalRunning(single)
+	if err != nil || !ok || total != 3 {
+		t.Errorf("responseTotalRunning(single) = (%d, %v, %v), want (3, true, nil)", total, ok, err)
+	}
+
+	if total, ok, err := responseTotalRunning(http.Header{}); err != nil || ok || total != 0 {
+		t.Errorf("responseTotalRunning(absent) = (%d, %v, %v), want (0, false, nil)", total, ok, err)
+	}
+}
