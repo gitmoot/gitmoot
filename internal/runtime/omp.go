@@ -114,24 +114,42 @@ func (a OmpAdapter) PermissionPolicyApplication(agent Agent) PermissionPolicyApp
 // mirroring codexSandboxArgs and claudePermissionArgs: one function owns both
 // the argv and the declaration, so the two cannot drift (#1721).
 //
-// THE MAPPING IS MEASURED, NOT ASSUMED. Against the pinned CLI (omp 17.2.4,
-// headless, stdin closed, no host pre-approvals), always-ask returns
-// isError:false for read, grep and read-on-a-directory, returns isError:true
-// with "requires approval but no interactive UI available" for bash and write
-// WITHOUT the write landing, and still exits 0 with a full agent_end envelope
-// this adapter parses. So always-ask restricts omp to read-only tools and
-// terminates cleanly, which is what a read-only autonomy policy asks for.
+// THE MAPPING IS MEASURED, NOT ASSUMED. Against the installed CLI (omp 18.1.15,
+// headless, stdin closed, no host pre-approvals), with the decider being the
+// FILESYSTEM rather than the transcript:
 //
-// EVERY OTHER POLICY KEEPS TODAY'S yolo ARGV, byte-identical, because this
-// change closes a least-privilege gap and is not a re-tuning of the runtime.
-// The DECLARATION still differs by policy, because yolo is unrestricted: it is
-// `applied` only for danger-full-access, and `widened` where the stored policy
-// asked for less than yolo grants. Reporting `applied` there would claim a
-// confinement no argv performs.
+//	mode         in-dir write (tool)  shell command  write outside cwd
+//	always-ask   refused              -              -
+//	write        landed               REFUSED        REFUSED
+//	yolo         landed               landed         landed
+//	(no flag)    -                    landed         landed
+//
+// always-ask returns isError:true with "requires approval but no interactive UI
+// available" for bash and write WITHOUT the write landing, and still exits 0
+// with a full agent_end envelope this adapter parses, so it restricts omp to
+// read-only tools and terminates cleanly - what a read-only policy asks for.
+//
+// write is the value that matches workspace-write, on TWO axes rather than one:
+// it permits editing tools while refusing shell execution AND refusing writes to
+// absolute paths outside the working directory. Under write the CLI made nine
+// bash tool calls and left zero markers on disk. That is the same confinement
+// the sibling runtimes give this policy - claude maps workspace-write to
+// --permission-mode acceptEdits, which does not unblock Bash, and codex to
+// --sandbox workspace-write - so yolo here granted strictly more than the policy
+// names, and a truthful `widened` declaration did not make the grant narrower.
+//
+// auto AND the stored-empty case KEEP yolo, deliberately. Their honest analogue
+// would be omitting the flag entirely, the way claude passes no permission-mode
+// for auto, and the measured no-flag row above shows that permits shell and
+// out-of-cwd writes on this host: it reads tools.approvalMode from operator
+// config, so its confinement is a host property this adapter cannot state. That
+// is a separate decision with its own blast radius, and it is not made here.
 func ompApprovalArgs(agent Agent) (string, PermissionPolicyApplication) {
 	switch NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {
 	case AutonomyPolicyReadOnly:
 		return "--approval-mode=always-ask", PermissionPolicyApplied
+	case AutonomyPolicyWorkspaceWrite:
+		return "--approval-mode=write", PermissionPolicyApplied
 	case AutonomyPolicyDangerFullAccess:
 		return "--approval-mode=yolo", PermissionPolicyApplied
 	default:
