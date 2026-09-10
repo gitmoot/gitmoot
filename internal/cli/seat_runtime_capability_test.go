@@ -282,3 +282,121 @@ func TestSeatRuntimeUnavailableIgnoresAnUnrelatedPublishedRoot(t *testing.T) {
 		t.Errorf("cause %q borrowed another runtime's diagnostic or lost the runtime name", cause)
 	}
 }
+
+// unstageableGoFixture is a `go` whose PATH entry is not inside a bin/ or
+// sbin/ installation, which stageSeatToolchain classifies as unavailable
+// (toolchain_seat.go:51). Deterministic on a host with or without a real Go
+// installed, and unlike the ELOOP that produced the live instance it needs no
+// pre-published launcher.
+const unstageableGoFixture = "#!/bin/sh\nexit 0\n"
+
+// seedUnavailableToolchainReviewSeat is the measured #1817 shape that the
+// runtime arm cannot see: the seat's OWN runtime stages fine, so
+// runtimeUnavailable stays empty, while `go` resolves to the engine's exit-126
+// command. That is the live instance, job
+// local-review-gm-review-opus-18d3b8e6790b3231-1: gitmoot/gitmoot#2066
+// reviewed at its exact head, decision APPROVED, whole tests_run reading
+// "could not run ... `go` is a stub that exits 126".
+func seedUnavailableToolchainReviewSeat(t *testing.T, jobID string, action string) (*db.Store, string, string) {
+	t.Helper()
+	hostBin := t.TempDir()
+	// The POSITIVE CONTROL rides inside the fixture: claude stages, so a
+	// failure here can only come from the toolchain predicate.
+	writeRuntimeFixture(t, hostBin, "claude", stageableRuntimeFixture)
+	writeRuntimeFixture(t, hostBin, "go", unstageableGoFixture)
+	prependRuntimeFixturePath(t, hostBin)
+
+	store, home := blockerE2EHome(t)
+	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	sourceDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(sourceDir, ".credentials.json"),
+		[]byte(`{"claudeAiOauth":{"accessToken":"fixture-token"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seedDaemonWorkerAgentWithPolicy(t, store, "gm-review-opus", runtime.ClaudeRuntime,
+		"550e8400-e29b-41d4-a716-446655440000", []string{"review", "ask"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: jobID, Agent: "gm-review-opus", Action: action, Repo: "owner/repo",
+		WorktreePath: checkout, ReadOnlySeat: true, RuntimeConfigDir: sourceDir,
+	})
+	return store, home, checkout
+}
+
+func runUnavailableToolchainSeatJob(t *testing.T, store *db.Store, home string, checkout string, jobID string) []db.JobEvent {
+	t.Helper()
+	ctx := context.Background()
+	// NO AdapterFactory override: the production factory is the caller that
+	// would actually exec `go` inside the seat.
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return checkout, nil
+	}
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.run(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return events
+}
+
+// TestSeatToolchainUnavailableEndsAReviewBlockedNotVerdicted is the arm that
+// fails before the fix: the job ran to a verdict with nothing executed, and no
+// event named the missing capability.
+func TestSeatToolchainUnavailableEndsAReviewBlockedNotVerdicted(t *testing.T) {
+	ctx := context.Background()
+	store, home, checkout := seedUnavailableToolchainReviewSeat(t, "seat-toolchain-unavailable", "review")
+	events := runUnavailableToolchainSeatJob(t, store, home, checkout, "seat-toolchain-unavailable")
+
+	settled, err := store.GetJob(ctx, "seat-toolchain-unavailable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settled.State != string(workflow.JobBlocked) {
+		t.Fatalf("job state = %q, want %q: a reviewer that cannot run `go` must come back blocked with the failing check named, never with a verdict a consumer reads as review evidence", settled.State, workflow.JobBlocked)
+	}
+	var refusal string
+	for _, event := range events {
+		if event.Kind == seatToolchainUnavailableEvent {
+			refusal = event.Message
+		}
+		// The sibling arm must stay silent, or this test would pass on the
+		// wrong predicate: the fixture's claude stages successfully.
+		if event.Kind == seatRuntimeUnavailableEvent {
+			t.Fatalf("%q fired on a seat whose own runtime staged: %s", seatRuntimeUnavailableEvent, event.Message)
+		}
+	}
+	if refusal == "" {
+		t.Fatalf("no %q event: the failing check is not readable from the job's own event stream. events=%+v", seatToolchainUnavailableEvent, events)
+	}
+	// The AGENT is who a coordinator re-dispatches away from, and the CAUSE is
+	// what an operator repairs.
+	for _, want := range []string{"gm-review-opus", "bin/ or sbin/"} {
+		if !strings.Contains(refusal, want) {
+			t.Errorf("%q event %q does not name %q", seatToolchainUnavailableEvent, refusal, want)
+		}
+	}
+}
+
+// TestSeatToolchainUnavailableDoesNotRefuseANonReviewSeat is the
+// over-rejection control, and it defends a DOCUMENTED choice rather than a
+// preference: the staging miss is deliberately un-evented because a job's
+// event sequence must not depend on host disk state, and
+// TestExecBackendLocalDefaultDaemonE2E pins an exact baseline for an `ask`
+// job. Only review's contract requires executing the repository's gate.
+func TestSeatToolchainUnavailableDoesNotRefuseANonReviewSeat(t *testing.T) {
+	store, home, checkout := seedUnavailableToolchainReviewSeat(t, "seat-toolchain-ask", "ask")
+	events := runUnavailableToolchainSeatJob(t, store, home, checkout, "seat-toolchain-ask")
+
+	for _, event := range events {
+		if event.Kind == seatToolchainUnavailableEvent {
+			t.Fatalf("%q fired on an %q job: the un-evented staging miss is deliberate for every action whose contract does not require running the gate. message=%s", seatToolchainUnavailableEvent, "ask", event.Message)
+		}
+	}
+}

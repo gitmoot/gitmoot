@@ -883,6 +883,30 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, refusal)
 		return nil
 	}
+	// #1817: THE SAME QUESTION FOR THE TOOL A REVIEW ACTUALLY RUNS. Measured
+	// instance: local-review-gm-review-opus-18d3b8e6790b3231-1 reviewed
+	// gitmoot/gitmoot#2066 at its exact head, returned APPROVED, and its whole
+	// tests_run read "go test ./internal/workflow (attempted): could not run
+	// ... `go` is a stub that exits 126". The seat's own runtime staged fine,
+	// so the sibling arm above stayed silent, no event named the failure, and
+	// the verdict satisfied an exact-head review gate having executed nothing.
+	//
+	// SCOPED TO REVIEW, not to every seat, because the un-evented staging miss
+	// is a deliberate choice with a named cost: an event here would make a
+	// job's event sequence depend on host disk state. That reason holds for
+	// ask, implement and produce; it does not hold for the one action whose
+	// contract IS to execute the repository's gate.
+	if job.Type == "review" && seatSetup.toolchainUnavailable != "" && w.adapterIsDeclaredReal() {
+		refusal := error(&seatToolchainCapabilityError{agentName: agent.Name, cause: seatSetup.toolchainUnavailable})
+		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: seatToolchainUnavailableEvent, Message: refusal.Error()}); eventErr != nil {
+			writeLine(w.Stdout, "job %s %s event failed: %v", job.ID, seatToolchainUnavailableEvent, eventErr)
+		}
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, refusal); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, refusal)
+		return nil
+	}
 	var readOnlyState *readOnlyRuntimeAdapter
 	readOnlyStateCleaned := false
 	if stateAdapter, ok := adapter.(readOnlyRuntimeAdapter); ok {
@@ -1502,6 +1526,12 @@ type readOnlySandboxGrants struct {
 	// anything, and it would refuse every claude seat in CI, where no runtime
 	// CLI is installed at all.
 	runtimeUnavailable string
+	// toolchainUnavailable names why the seat's staged Go toolchain is absent,
+	// or "" when it staged normally. Same reporting rule as the field above and
+	// the same reason: seat setup does not know whether this job's contract
+	// requires executing anything, and the staging miss is an operator-visible
+	// fact about the host rather than a defect in the job.
+	toolchainUnavailable string
 }
 
 type readOnlyRuntimeAdapter struct {
@@ -1559,7 +1589,7 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 	if err != nil {
 		return nil, readOnlySeatSetup{}, err
 	}
-	setup := readOnlySeatSetup{dropped: grants.dropped, runtimeUnavailable: grants.runtimeUnavailable}
+	setup := readOnlySeatSetup{dropped: grants.dropped, runtimeUnavailable: grants.runtimeUnavailable, toolchainUnavailable: grants.toolchainUnavailable}
 	wrap := func(runner subprocess.Runner) subprocess.Runner {
 		baseEnv := readOnlyRuntimeBaseEnv(agent.Runtime, os.Environ(), filepath.Join(grants.cacheRoot, "gh"))
 		curated := graftRuntimeBaseRunner(runner, subprocess.CuratedGroupRunner{
@@ -1950,6 +1980,19 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	}
 	if diagnostic != "" {
 		fmt.Fprintf(os.Stderr, "gitmoot: read-only seat toolchain: %s\n", diagnostic)
+	}
+	// #1817: WHETHER THE SEAT CAN RUN `go` AT ALL, recorded beside the sibling
+	// runtime answer. The diagnostic above cannot carry this: the `go` absent
+	// arm passes "" (toolchain_seat.go:39), so a host with no Go on the daemon
+	// PATH publishes the exit-126 shim and reports nothing. The ROOT is the
+	// fact - stageSeatToolchain returns the published-unavailable root in every
+	// failure arm - so key on it and use the diagnostic only to sharpen the
+	// cause when one exists.
+	if staged != "" && filepath.Base(staged) == "go"+toolchain.UnavailableRuntimeSuffix {
+		grants.toolchainUnavailable = strings.TrimSpace(diagnostic)
+		if grants.toolchainUnavailable == "" {
+			grants.toolchainUnavailable = "no Go installation resolved on the daemon PATH, so the seat's `go` is the engine's exit-126 unavailable command"
+		}
 	}
 	if staged != "" {
 		if err := validateStagedToolchainPlacement(staged, grants.writes); err != nil {
