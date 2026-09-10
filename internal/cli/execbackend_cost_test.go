@@ -163,3 +163,31 @@ func TestZeroDeniesExplicitlyRatherThanByFallthrough(t *testing.T) {
 		t.Fatalf("the zero refusal does not distinguish itself from the house idiom: %v", err)
 	}
 }
+
+// TestLocalBackendProvisionsWithNoCapConfigured pins the boundary of this gate:
+// #1540 denies CLOUD provision without a cap, while local-first remains the
+// default and must be unaffected. The cap ships unset (owner decision,
+// 2026-09-10), so if it reached the local path every local job on every
+// deployment would stop.
+//
+// The structural reason it cannot: the cap is enforced inside
+// ReserveExecBackendAttempt, that row is written only by the ledgered decorator,
+// and the ledger is constructed only in the remote branch of the backend
+// factory. internal/execbackend does not import internal/db at all, so
+// LocalBackend has no path to a reservation even in principle.
+func TestLocalBackendProvisionsWithNoCapConfigured(t *testing.T) {
+	if unset := execBackendStoreCap(config.ExecBackendCostConfig{}); unset.Configured {
+		t.Fatalf("precondition: the empty configuration is not a deny (%+v)", unset)
+	}
+	local, err := execbackend.NewLocalBackend(t.TempDir(), nil)
+	if err != nil {
+		t.Fatalf("NewLocalBackend: %v", err)
+	}
+	instance, err := local.Provision(context.Background(), execbackend.JobScope{JobID: "local-job", Attempt: 1, TTL: time.Minute})
+	if err != nil {
+		t.Fatalf("local provision refused while the compute-dollar cap is unset: %v", err)
+	}
+	if instance == nil || instance.ID == "" {
+		t.Fatal("local provision returned no instance")
+	}
+}
