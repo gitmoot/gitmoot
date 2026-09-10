@@ -1806,12 +1806,45 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 			continue
 		}
 		enabled++
+		// SYMMETRIC ACQUISITION (#2135). The poller takes this same per-repo lock
+		// with TryLock and degrades to a recovery-only poll rather than waiting
+		// (daemon_supervision.go:1289). This loop used a BLOCKING Lock(), so the
+		// politeness was one-directional: a poll in progress on repo A stalled this
+		// SEQUENTIAL sweep at A, and every repo behind A got no dispatch at all -
+		// their queued jobs emitted no dispatch_declined event either, because the
+		// selector was never reached.
+		//
+		// Bounding the poll is NOT the remedy and was already tried: #555 bounds it
+		// at daemonPollTimeout (2m) and documents this exact stall. 35 repos x 2m
+		// sequential is ~70 minutes, so shrinking the bound only moves the number.
+		//
+		// The lock's invariant is unchanged - whoever holds it still has exclusive
+		// access to that checkout. What changes is that a LOSER SKIPS instead of
+		// waiting, so contention costs one repo one sweep instead of costing every
+		// repo behind it.
 		lock := locks.For(repo.FullName())
+		held := false
 		if lock != nil {
-			lock.Lock()
+			if forced := skippedRepoTickNeedsLock(repo.FullName()); forced {
+				// STARVATION VALVE. A repo that loses the race every sweep would be
+				// silently late forever while the fleet looked healthy - strictly
+				// worse than the visible fleet-wide lateness this fix removes. After
+				// repoTickSkipForceAfter consecutive skips this repo waits, so it is
+				// delayed at most that many sweeps rather than indefinitely.
+				lock.Lock()
+				held = true
+			} else if lock.TryLock() {
+				held = true
+			}
 		}
+		if lock != nil && !held {
+			skipped := recordRepoTickSkip(repo.FullName())
+			writeLine(stdout, "%s: worker tick skipped, checkout busy (consecutive skips %d of %d before forcing)", repo.FullName(), skipped, repoTickSkipForceAfter)
+			continue
+		}
+		clearRepoTickSkip(repo.FullName())
 		tickErr := runDaemonWorkerTickTracked(ctx, store, worker, workers, false, repo.FullName(), rootFilter, stdout, now, tracker, cand)
-		if lock != nil {
+		if lock != nil && held {
 			lock.Unlock()
 		}
 		if tickErr != nil {
