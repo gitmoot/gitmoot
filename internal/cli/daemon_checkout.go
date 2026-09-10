@@ -788,19 +788,33 @@ func repoRecordForCheckout(ctx context.Context, repo github.Repository, client g
 	if remoteRepo.String() != repo.FullName() {
 		return db.Repo{}, fmt.Errorf("current checkout origin is %s, not %s", remoteRepo.String(), repo.FullName())
 	}
-	// THE REMOTE'S DEFAULT, NEVER THE LOCAL HEAD (#2145). This read used
-	// CurrentBranch, so whichever branch the worktree happened to have checked
-	// out when the record was written became the repository's recorded default -
-	// and that field is consumed as the BASE BRANCH by daemon_workflow.go and as
-	// the dispatch branch default by agent_dispatch.go. On this host it had
-	// recorded `fix/lan-address-portability` for a repository whose default is
-	// `master`.
+	// PREFER THE REMOTE'S DEFAULT OVER THE LOCAL HEAD (#2145).
 	//
-	// Left EMPTY when origin/HEAD is unset: UpsertRepo preserves the stored value
-	// against an empty one, so an unreadable remote default keeps whatever was
-	// already recorded instead of overwriting it with a worktree artifact.
+	// This read was CurrentBranch alone, so whichever branch the worktree
+	// happened to have checked out when the record was written became the
+	// repository's recorded default - and that field is consumed as the BASE
+	// BRANCH by daemon_workflow.go and as the dispatch branch default by
+	// agent_dispatch.go. On this host it had recorded
+	// `fix/lan-address-portability` for a repository whose default is `master`,
+	// while the worktree was on a third branch entirely.
+	//
+	// The defect was recording the local HEAD WHEN THE REMOTE DEFAULT WAS
+	// KNOWABLE, so the fix is precedence, not removal: origin/HEAD when it
+	// resolves, the checked-out branch only when it does not.
+	//
+	// The fallback is deliberate and its residual is real. A checkout with an
+	// origin but no origin/HEAD ref - `git init` plus `git remote add`, or a
+	// clone whose head ref was deleted - cannot reveal the remote default
+	// offline, and dropping the value there is worse than an imperfect one:
+	// `gitmoot repo add` would register a repo with no base branch at all, which
+	// `repo doctor` reports as a missing branch and dispatch reads as an empty
+	// default. Such a record keeps a possibly-wrong local branch exactly as
+	// before this change, and pollRepo upgrades it the moment origin/HEAD becomes
+	// resolvable, so the wrong value is now transient rather than permanent.
 	defaultBranch := ""
 	if branch, err := client.RemoteDefaultBranch(ctx); err == nil {
+		defaultBranch = branch
+	} else if branch, err := client.CurrentBranch(ctx); err == nil {
 		defaultBranch = branch
 	}
 	return db.Repo{

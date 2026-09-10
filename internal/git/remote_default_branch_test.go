@@ -102,3 +102,58 @@ func TestRemoteDefaultBranchErrorsWhenOriginHeadIsUnset(t *testing.T) {
 		t.Fatalf("RemoteDefaultBranch = %q on error, want empty", branch)
 	}
 }
+
+// PRECEDENCE, which is the actual contract (#2145): the remote default wins when
+// origin/HEAD resolves, and the checked-out branch is used only when it does
+// not. Recording the local HEAD *while the remote default was knowable* was the
+// defect; refusing to record anything at all in the unresolvable case was a
+// regression this test also pins, because it left `gitmoot repo add` registering
+// a repository with no base branch, which repo doctor reports as missing.
+func TestRemoteDefaultBranchPrecedenceOverCheckedOutBranch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	for _, test := range []struct {
+		name         string
+		deleteHead   bool
+		wantRemote   bool
+		wantFallback string
+	}{
+		{name: "origin/HEAD resolves so the remote default wins", wantRemote: true},
+		{name: "origin/HEAD unset so the checked-out branch is the only source", deleteHead: true, wantFallback: "fix/lan-address-portability"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			origin := t.TempDir()
+			runGit(t, origin, "init", "-b", "master")
+			runGit(t, origin, "config", "user.email", "gitmoot@example.com")
+			runGit(t, origin, "config", "user.name", "Gitmoot")
+			if err := os.WriteFile(filepath.Join(origin, "README.md"), []byte("# origin\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			runGit(t, origin, "add", "README.md")
+			runGit(t, origin, "commit", "-m", "init")
+			clone := filepath.Join(t.TempDir(), "clone")
+			runGit(t, t.TempDir(), "clone", origin, clone)
+			runGit(t, clone, "checkout", "-b", "fix/lan-address-portability")
+			if test.deleteHead {
+				runGit(t, clone, "remote", "set-head", "origin", "--delete")
+			}
+
+			client := NewHostClient(clone)
+			remote, remoteErr := client.RemoteDefaultBranch(context.Background())
+			if test.wantRemote {
+				if remoteErr != nil || remote != "master" {
+					t.Fatalf("RemoteDefaultBranch = %q err=%v, want master", remote, remoteErr)
+				}
+				return
+			}
+			if remoteErr == nil {
+				t.Fatalf("RemoteDefaultBranch = %q, want an error with origin/HEAD deleted", remote)
+			}
+			current, err := client.CurrentBranch(context.Background())
+			if err != nil || current != test.wantFallback {
+				t.Fatalf("CurrentBranch = %q err=%v, want %q as the only available source", current, err, test.wantFallback)
+			}
+		})
+	}
+}
