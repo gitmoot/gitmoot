@@ -67,6 +67,37 @@ func (s *Store) UpdateAgentRuntimeRef(ctx context.Context, name, ref string) err
 	return nil
 }
 
+// UpdateAgentAutonomyPolicy writes a REGISTERED agent's autonomy policy in
+// place, without re-registering it (#2132).
+//
+// This is the plane dispatch reads: agent_dispatch.go resolves a registered
+// agent through runtimeAgent(db.Agent), so the row - not the config type - is
+// what decides. `agent type set --policy` writes the config plane, and for an
+// agent with no config section it cannot write anything at all, which is why an
+// in-place row update has to exist separately.
+//
+// Deliberately targeted rather than an UpsertAgent round trip: re-registration
+// replaces the runtime session, and the agents this exists for have live
+// sessions and hundreds of completed jobs. Shaped after UpdateAgentRuntimeRef,
+// including its not-registered error, so the two single-column writers stay
+// identical in behaviour.
+func (s *Store) UpdateAgentAutonomyPolicy(ctx context.Context, name, policy string) error {
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE agents SET autonomy_policy = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?`,
+		strings.TrimSpace(policy), strings.TrimSpace(name))
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return fmt.Errorf("agent %q is not registered", name)
+	}
+	return nil
+}
+
 func (s *Store) GetAgent(ctx context.Context, name string) (Agent, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, template_id, model, effort, capabilities_json, autonomy_policy, health_status
 		FROM agents WHERE name = ?`, name)
