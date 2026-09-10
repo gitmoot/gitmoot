@@ -1670,6 +1670,17 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	if err := sweepBlockedTaskWakeEvents(ctx, store, workflowHome, repoFilter, cand.config.blockedRoleWakeAfter(workflowHome), stdout, now); err != nil {
 		writeLine(stdout, "blocked_since task sweep failed: %v", err)
 	}
+	// Periodic off-box reconciliation (#1539). Before this, reconciliation ran
+	// ONCE PER PROCESS at backend construction, so an instance orphaned while a
+	// long-lived daemon kept running was not reconciled until the next restart -
+	// an unbounded window with only the provider-side TTL underneath it. Failure
+	// is LOGGED AND SWALLOWED like the sweeps above, and the pass carries its own
+	// advance-on-success back-off so a failing provider is polled less rather
+	// than every tick. The construction-time reap stays FAIL-CLOSED on purpose;
+	// the reason is recorded in execbackend_reconcile.go.
+	if err := reconcileExecBackendInventory(ctx, worker, stdout, now); err != nil {
+		writeLine(stdout, "execution backend reconciliation failed: %v", err)
+	}
 	// Checkout-mutating maintenance (advancement/merge retries, delegation
 	// worktree reclaims) is gated on the ACTUAL mutation hazard — each
 	// candidate is skipped while an in-flight job holds the checkout key the
