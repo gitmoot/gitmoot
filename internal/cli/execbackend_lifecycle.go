@@ -99,7 +99,7 @@ func (w jobWorker) defaultExecutionBackend(backend execbackend.Backend, cfg conf
 		if err != nil {
 			return nil, fmt.Errorf("create execution backend daemon fencing token: %w", err)
 		}
-		ledgeredBackend, err := newLedgeredExecutionBackend(w.Store, remoteBackend, e2bAttemptProvider, fencingToken, db.BootID(), w.Stdout)
+		ledgeredBackend, err := newLedgeredExecutionBackend(w.Store, remoteBackend, e2bAttemptProvider, fencingToken, db.BootID(), w.Stdout, execBackendStoreCap(cfg.ExecBackendCost))
 		if err != nil {
 			return nil, err
 		}

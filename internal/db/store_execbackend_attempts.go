@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -68,7 +69,16 @@ const execBackendAttemptColumns = `job_id, attempt, lifecycle_generation, provid
 // explicitly NULL at this point. Both daemon_fencing_token and boot_id are
 // recorded because a daemon restart within one host boot reuses boot_id and must
 // still fence the previous daemon incarnation.
-func (s *Store) ReserveExecBackendAttempt(ctx context.Context, reservation ExecBackendAttemptReservation) error {
+//
+// THE COMPUTE-DOLLAR CAP IS ENFORCED IN THIS STATEMENT (#1540). The predicate
+// rides the INSERT rather than preceding it, because a read-then-insert lets N
+// parallel legs each sum the same total, each see room and each insert - the
+// exact contention this reservation exists to serialise. Zero rows affected IS
+// the refusal. This is also why the gate lives here rather than at a Provision
+// call site: a caller cannot spend without a reserved row and cannot obtain one
+// without passing this predicate, so the population it guards is every future
+// provisioning path rather than the ones that exist today.
+func (s *Store) ReserveExecBackendAttempt(ctx context.Context, reservation ExecBackendAttemptReservation, policy ExecBackendCostCap) error {
 	reservation.JobID = strings.TrimSpace(reservation.JobID)
 	reservation.Provider = strings.TrimSpace(reservation.Provider)
 	reservation.DaemonFencingToken = strings.TrimSpace(reservation.DaemonFencingToken)
@@ -98,16 +108,79 @@ func (s *Store) ReserveExecBackendAttempt(ctx context.Context, reservation ExecB
 		return errors.New("execution backend reserved cost must be non-negative")
 	}
 
-	_, err := s.db.ExecContext(ctx, `INSERT INTO execbackend_attempts(
-		job_id, attempt, lifecycle_generation, provider, sandbox_id,
-		daemon_fencing_token, boot_id, ttl_expires_at, state,
-		cost_reserved_usd, cost_actual_usd
-	) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, NULL)`,
+	// No configured cap denies, and does so before any statement runs.
+	// THE UNSET ARM IS THE SHIPPING STATE, not an edge case. Each of the four
+	// ways a cap can be missing - absent, malformed, partially set, and
+	// explicitly zero - denies here, and zero denies EXPLICITLY rather than by
+	// falling through, because zero is exactly the value this codebase's other
+	// budgets read as "unlimited".
+	if !policy.Configured {
+		return &ExecBackendCapRefusal{Clause: "unconfigured", RequestUSD: reservation.CostReservedUSD, DenyReason: policy.DenyReason}
+	}
+	if policy.MaxReservedUSD == 0 || policy.PerAttemptUSD == 0 {
+		return &ExecBackendCapRefusal{Clause: "unconfigured", RequestUSD: reservation.CostReservedUSD,
+			DenyReason: "an execution backend cost cap of exactly 0 denies. Unlike the model-token budget, 0 here does not mean unlimited. Set [remote_exec].cost_max_reserved_usd and [remote_exec].cost_per_attempt_usd to positive values in config.toml."}
+	}
+	if policy.MaxReservedUSD < 0 || policy.PerAttemptUSD < 0 {
+		return &ExecBackendCapRefusal{Clause: "unconfigured", RequestUSD: reservation.CostReservedUSD,
+			DenyReason: "a negative execution backend cost cap denies. Set [remote_exec].cost_max_reserved_usd and [remote_exec].cost_per_attempt_usd to positive values in config.toml."}
+	}
+
+	marks, stateArgs := billingStatePlaceholders()
+	// One statement: both cap clauses and the insert. The concurrency clause is
+	// skipped only when MaxConcurrent <= 0; the dollar clause never is.
+	concurrency := "1=1"
+	args := []any{
 		reservation.JobID, reservation.Attempt, reservation.LifecycleGeneration,
 		reservation.Provider, reservation.DaemonFencingToken, reservation.BootID,
 		reservation.TTLExpiresAt.UTC().Format(time.RFC3339Nano),
-		ExecBackendAttemptStateReserved, reservation.CostReservedUSD)
-	return err
+		ExecBackendAttemptStateReserved, reservation.CostReservedUSD,
+	}
+	args = append(args, stateArgs...)
+	args = append(args, reservation.CostReservedUSD, policy.MaxReservedUSD)
+	if policy.MaxConcurrent > 0 {
+		concurrency = `(SELECT COUNT(*) FROM execbackend_attempts WHERE state IN (` + marks + `)) + 1 <= ?`
+		args = append(args, stateArgs...)
+		args = append(args, policy.MaxConcurrent)
+	}
+	result, err := s.db.ExecContext(ctx, `INSERT INTO execbackend_attempts(
+		job_id, attempt, lifecycle_generation, provider, sandbox_id,
+		daemon_fencing_token, boot_id, ttl_expires_at, state,
+		cost_reserved_usd, cost_actual_usd
+	) SELECT ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, NULL
+	WHERE (SELECT COALESCE(SUM(cost_reserved_usd), 0) FROM execbackend_attempts
+		WHERE state IN (`+marks+`)) + ? <= ?
+	  AND `+concurrency, args...)
+	if err != nil {
+		// An unreadable meter refuses. The statement that reads the meter is the
+		// statement that writes the row, so a failure here cannot have admitted.
+		return fmt.Errorf("execution backend cost cap could not be evaluated, refusing provision: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("execution backend cost cap could not confirm admission, refusing provision: %w", err)
+	}
+	if affected == 1 {
+		return nil
+	}
+	refusal := &ExecBackendCapRefusal{
+		Clause:         "dollar",
+		RequestUSD:     reservation.CostReservedUSD,
+		MaxReservedUSD: policy.MaxReservedUSD,
+		MaxConcurrent:  policy.MaxConcurrent,
+	}
+	s.describeBillingLoad(ctx, refusal)
+	for _, n := range refusal.ByState {
+		refusal.LiveCount += n
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(cost_reserved_usd), 0)
+		FROM execbackend_attempts WHERE state IN (`+marks+`)`, stateArgs...).Scan(&refusal.ReservedUSD); err != nil && refusal.OperandsErr == nil {
+		refusal.OperandsErr = err
+	}
+	if policy.MaxConcurrent > 0 && refusal.LiveCount+1 > policy.MaxConcurrent {
+		refusal.Clause = "concurrency"
+	}
+	return refusal
 }
 
 // MarkExecBackendAttemptProvisioning claims a reserved row for provider setup.

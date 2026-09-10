@@ -24,12 +24,15 @@ type ledgeredExecutionBackend struct {
 	bootID          string
 	stdout          io.Writer
 	now             func() time.Time
+	// cost is the compute-dollar admission policy (#1540). Its zero value denies,
+	// so a backend constructed without one cannot provision cloud compute.
+	cost db.ExecBackendCostCap
 
 	mu      sync.Mutex
 	attempt map[string]db.ExecBackendAttemptKey
 }
 
-func newLedgeredExecutionBackend(store *db.Store, inner execbackend.ExecutionBackend, provider, fencingToken, bootID string, stdout io.Writer) (*ledgeredExecutionBackend, error) {
+func newLedgeredExecutionBackend(store *db.Store, inner execbackend.ExecutionBackend, provider, fencingToken, bootID string, stdout io.Writer, cost db.ExecBackendCostCap) (*ledgeredExecutionBackend, error) {
 	if store == nil {
 		return nil, errors.New("execution backend attempt ledger store is required")
 	}
@@ -60,6 +63,7 @@ func newLedgeredExecutionBackend(store *db.Store, inner execbackend.ExecutionBac
 		fencingToken:    fencingToken,
 		bootID:          bootID,
 		stdout:          stdout,
+		cost:            cost,
 		now:             time.Now,
 		attempt:         make(map[string]db.ExecBackendAttemptKey),
 	}, nil
@@ -85,8 +89,12 @@ func (b *ledgeredExecutionBackend) Provision(ctx context.Context, scope execback
 		DaemonFencingToken:    b.fencingToken,
 		BootID:                b.bootID,
 		TTLExpiresAt:          b.now().UTC().Add(scope.TTL),
-		CostReservedUSD:       0,
-	}); err != nil {
+		// The WORST-CASE cost of this attempt, reserved before the provider is
+		// called. It is deliberately not an estimate refined later: the whole
+		// point of reserving before provisioning is that parallel legs contend
+		// on a bound that is already pessimistic.
+		CostReservedUSD: b.cost.PerAttemptUSD,
+	}, b.cost); err != nil {
 		return nil, fmt.Errorf("reserve execution backend attempt: %w", err)
 	}
 	changed, err := b.store.MarkExecBackendAttemptProvisioning(ctx, key)
