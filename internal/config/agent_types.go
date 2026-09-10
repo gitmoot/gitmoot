@@ -83,17 +83,23 @@ func LoadAgentTypes(paths Paths) (map[string]AgentType, error) {
 	return types, nil
 }
 
+// SaveAgentType persists the complete agent-type registry through a
+// same-directory temporary file and rename, so a failed write cannot leave a
+// truncated config behind.
+//
+// #2134 F1 round three: this used plain os.WriteFile, which truncates the live
+// file BEFORE writing and can return after a short write. Review demonstrated
+// it: with a 64 KiB file-size limit imposed on a 123,395-byte config, the
+// command returned rc=1 and reported that no plane had changed while
+// config.toml was left at 65,536 bytes and no longer parsed. Every caller that
+// treats a returned error as "nothing was written" was wrong, including this
+// change's own cross-plane barrier, whose entire guarantee rests on that.
+//
+// An atomic variant already existed alongside it and only one of three callers
+// used it. A writer whose failure corrupts the file is not a variant worth
+// choosing between, so the pair is collapsed rather than the safe one being
+// selected at each call site.
 func SaveAgentType(paths Paths, entry AgentType) error {
-	return saveAgentType(paths, entry, func(path string, content []byte) error {
-		return os.WriteFile(path, content, 0o600)
-	})
-}
-
-// SaveAgentTypeAtomic persists the complete agent-type registry through a
-// same-directory temporary file and rename. Manual `agent start` uses this only
-// after the runtime session and DB registration have succeeded, so a partial
-// config write can never leave a truncated [agents.<name>] enrollment block.
-func SaveAgentTypeAtomic(paths Paths, entry AgentType) error {
 	return saveAgentType(paths, entry, writeConfigAtomic)
 }
 

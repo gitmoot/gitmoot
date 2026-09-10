@@ -1,8 +1,12 @@
 package config
 
 import (
+	"bytes"
+	"fmt"
 	"os"
+	"os/exec"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -228,5 +232,83 @@ autonomy_policy = "read_only"
 	_, err := LoadAgentTypes(paths)
 	if err == nil || !strings.Contains(err.Error(), "unsupported autonomy policy") {
 		t.Fatalf("LoadAgentTypes error = %v, want unsupported autonomy policy", err)
+	}
+}
+
+// TestSaveAgentTypePreservesTheOriginalWhenTheWriteIsCutShort is the review
+// probe for #2134 F1, kept as a regression test.
+//
+// SaveAgentType used plain os.WriteFile, which truncates the live file before
+// writing and can return after a short write. With a file-size limit imposed,
+// the command returned an error while config.toml had already been cut in half
+// and no longer parsed. Every caller that reads a returned error as "nothing
+// was written" was wrong, and this change's cross-plane barrier rests entirely
+// on that reading.
+//
+// RLIMIT_FSIZE is process-wide, so the failing write runs in a re-executed
+// child of this test binary rather than in the test process.
+func TestSaveAgentTypePreservesTheOriginalWhenTheWriteIsCutShort(t *testing.T) {
+	const limit = 64 << 10
+
+	if home := os.Getenv("GITMOOT_SHORT_WRITE_HOME"); home != "" {
+		// Child. Cap the file size, then attempt a save larger than the cap.
+		var rlim syscall.Rlimit
+		rlim.Cur = limit
+		rlim.Max = limit
+		if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &rlim); err != nil {
+			fmt.Fprintf(os.Stderr, "setrlimit: %v\n", err)
+			os.Exit(3)
+		}
+		err := SaveAgentType(PathsForHome(home), AgentType{
+			Name: "victim", Runtime: "codex", Role: "worker", AutonomyPolicy: "read-only",
+		})
+		if err == nil {
+			fmt.Fprintln(os.Stderr, "save unexpectedly succeeded under the file-size limit")
+			os.Exit(4)
+		}
+		os.Exit(0)
+	}
+
+	home := t.TempDir()
+	paths := PathsForHome(home)
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	// A config comfortably larger than the limit, so the rewrite cannot fit.
+	var builder strings.Builder
+	builder.WriteString(DefaultConfig(paths))
+	for i := 0; i < 900; i++ {
+		fmt.Fprintf(&builder, "\n[agents.filler%03d]\nruntime = \"codex\"\nrole = \"worker\"\nautonomy_policy = \"read-only\"\ntemplate = \"padding-%03d\"\n", i, i)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(builder.String()), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	original, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if len(original) <= limit {
+		t.Fatalf("fixture config is %d bytes, must exceed the %d byte limit or the write would succeed",
+			len(original), limit)
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run", "^"+t.Name()+"$")
+	cmd.Env = append(os.Environ(), "GITMOOT_SHORT_WRITE_HOME="+home)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("child failed: %v\n%s", err, out)
+	}
+
+	after, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		t.Fatalf("read config after: %v", err)
+	}
+	if !bytes.Equal(original, after) {
+		t.Errorf("config changed after a failed write: %d bytes before, %d after; "+
+			"a write that reports failure must leave the live plane untouched",
+			len(original), len(after))
+	}
+	if _, err := LoadAgentTypes(paths); err != nil {
+		t.Errorf("config no longer parses after a failed write: %v", err)
 	}
 }

@@ -822,9 +822,12 @@ for them it refuses outright. `agent start` and `agent subscribe` carry
 
 Dispatch resolves a registered agent through `GetAgent`, which reads **the
 `agents` row if one exists and otherwise the `agent_instances` row**. This verb
-mirrors that precedence: it updates `agents`, and falls back to
-`agent_instances` only when no row was affected, so it never writes a plane
-dispatch is not reading for that agent.
+updates **both** rows in one transaction rather than only the one that outranks
+the other today. A same-name `agent_instances` row can OUTLIVE the `agents` row
+that outranked it, because `agent remove` deletes `agents` and not
+`agent_instances`; a stale instance left behind would then become authoritative
+and silently re-widen an agent you had tightened. Only a name present in
+neither plane is unregistered.
 
 **When a config type also exists, both planes are written**, and the command
 reports each:

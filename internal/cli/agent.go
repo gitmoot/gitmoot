@@ -1689,7 +1689,7 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	if persistType {
-		if err := config.SaveAgentTypeAtomic(paths, entry); err != nil {
+		if err := config.SaveAgentType(paths, entry); err != nil {
 			fmt.Fprintf(stderr, "agent start: persist memory enrollment: %v\n", err)
 			return 1
 		}
@@ -2085,9 +2085,12 @@ type agentShowOutput struct {
 // RE-REGISTRATION, which replaces the runtime session; one affected agent had
 // 106 completed implements and a live session.
 //
-// So this writes the row, touches nothing else, and prints the before and after
-// so the change is verifiable from the command's own output rather than only by
-// a follow-up read.
+// So this writes every plane that can make a policy effective - the agents row,
+// any same-name agent_instances row, and the config type when one exists - and
+// prints the before and after so the change is verifiable from the command's
+// own output rather than only by a follow-up read. The database rows move in
+// one transaction with the config write as its barrier, so a failure cannot
+// leave one plane granting what another refuses.
 func runAgentPolicy(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("agent policy", flag.ContinueOnError)
 	fs.SetOutput(stderr)

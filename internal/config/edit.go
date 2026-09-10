@@ -154,6 +154,13 @@ func writeConfigAtomic(path string, contents []byte) error {
 		tmp.Close()
 		return err
 	}
+	// Flush before the rename: a rename is atomic with respect to readers, but
+	// without this the renamed file can still be short or empty after a crash,
+	// which is the same truncation class the rename exists to prevent.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}

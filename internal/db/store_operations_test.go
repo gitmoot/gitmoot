@@ -304,9 +304,15 @@ func TestUpdateAgentAutonomyPolicyBarrierRollsBackEveryPlane(t *testing.T) {
 // failure means the caller's plane moved and must be rolled back - so a
 // collapsed sentinel silently turns a partial write into a silent one.
 //
-// The commit is forced to fail by closing the pool from inside the barrier,
-// which is the only way found to reach this branch through the real function
-// rather than a synthesized error.
+// SCOPE, because review measured this precisely and the distinction matters:
+// cancelling the transaction's context reaches UpdateAgentAutonomyPolicy's real
+// tx.Commit error arm after a successful barrier, which is the branch the
+// caller's compensation depends on. It does NOT exercise a driver-level SQLite
+// COMMIT failure: Go's database/sql checks the transaction context first and
+// returns context.Canceled before calling the driver's Commit. A driver-level
+// commit fault would need a fault-injecting driver seam, which does not exist
+// here. Closing the pool does not work at all, because the transaction holds
+// its own connection.
 func TestUpdateAgentAutonomyPolicyReportsACommitFailureDistinctly(t *testing.T) {
 	store := openStoreOperationsTestStore(t)
 	ctx := context.Background()
