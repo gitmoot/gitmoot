@@ -108,40 +108,10 @@ func TestStagedToolchainIsNeverInsideASeatWriteGrant(t *testing.T) {
 	}
 }
 
-// TestToolchainInstallRootAcceptsEveryInstallationPrefix is ruling 122157's
-// ownership cutover: /opt, /usr/local, /nix/store and /snap are now STAGED and
-// the recursive host-root grant is deleted. A test that still refused these
-// paths would protect the defect the ruling removed.
-func TestToolchainInstallRootAcceptsEveryInstallationPrefix(t *testing.T) {
-	for path, want := range map[string]string{
-		"/opt/go/bin/go":                          "/opt/go",
-		"/opt/nested/deeper/go/bin/go":            "/opt/nested/deeper/go",
-		"/usr/local/go/bin/go":                    "/usr/local/go",
-		"/usr/local/bin/go":                       "/usr/local",
-		"/nix/store/abc-go-1.26.4/bin/go":         "/nix/store/abc-go-1.26.4",
-		"/snap/go/current/bin/go":                 "/snap/go/current",
-		"/root/.local/toolchains/go1.26.4/bin/go": "/root/.local/toolchains/go1.26.4",
-		"/home/op/sdk/go1.26.4/bin/go":            "/home/op/sdk/go1.26.4",
-		"/opt-not-a-prefix/go/bin/go":             "/opt-not-a-prefix/go",
-		"/usr/localish/go/bin/go":                 "/usr/localish/go",
-	} {
-		root, ok := toolchainInstallRoot(path)
-		if !ok || root != want {
-			t.Errorf("toolchainInstallRoot(%q) = %q,%v; want %q,true. Refusing a system prefix leaves that operator root for the recursive host grant this change deletes.", path, root, ok, want)
-		}
-	}
-
-	// CONTROL: a path that is not an installation layout is still refused, so
-	// accepting the prefixes above did not turn this into filepath.Dir twice.
-	if _, ok := toolchainInstallRoot("/somewhere/go"); ok {
-		t.Fatal("a go executable not under bin/ or sbin/ was accepted as an installation")
-	}
-}
-
 func TestStageSeatToolchainShadowsMissingGo(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
 	paths := config.PathsForHome(t.TempDir())
-	root, env, diagnostic, err := stageSeatToolchain(paths)
+	root, env, diagnostic, err := stageSeatToolchain(paths, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -517,5 +487,126 @@ func TestSeatPathRefusesAStagedPathHoldingAListSeparator(t *testing.T) {
 	}
 	if ordinary == "" {
 		t.Error("a separator-free staged path produced no PATH")
+	}
+}
+
+// writeSeatToolchainFixture builds a minimal Go installation: selection reads
+// only bin/go and VERSION.
+func writeSeatToolchainFixture(t *testing.T, root, version string) string {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(root, "bin"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "bin", "go"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write go: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "VERSION"), []byte(version+"\n"), 0o644); err != nil {
+		t.Fatalf("write VERSION: %v", err)
+	}
+	return root
+}
+
+// TestStageSeatToolchainStagesWhatTheWorkspaceNeeds is #2143's production
+// shape at the seat boundary.
+//
+// The launcher is FIRST on PATH and does not satisfy the workspace, which is
+// exactly the host that produced the defect: exec.LookPath returned the 1.22
+// launcher, staging copied it, and the seat could not build a go.mod saying
+// 1.26. The ordering is load-bearing - a fixture where the first PATH entry
+// already satisfies go.mod passes without exercising anything, which is the
+// population failure this repository has repeatedly shipped.
+func TestStageSeatToolchainStagesWhatTheWorkspaceNeeds(t *testing.T) {
+	base := t.TempDir()
+	launcher := writeSeatToolchainFixture(t, filepath.Join(base, "distro"), "go1.22.2")
+	satisfying := writeSeatToolchainFixture(t, filepath.Join(base, "pinned"), "go1.26.4")
+
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "go.mod"), []byte("module x\n\ngo 1.26\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	t.Setenv("PATH", strings.Join([]string{
+		filepath.Join(launcher, "bin"),
+		filepath.Join(satisfying, "bin"),
+	}, string(os.PathListSeparator)))
+
+	paths := config.PathsForHome(t.TempDir())
+	staged, env, diagnostic, err := stageSeatToolchain(paths, workspace)
+	if err != nil {
+		t.Fatalf("stageSeatToolchain: %v", err)
+	}
+	if diagnostic != "" {
+		t.Fatalf("diagnostic = %q, want none", diagnostic)
+	}
+	if !strings.Contains(filepath.Base(staged), "go1.26.4") {
+		t.Errorf("staged %q, want the go1.26.4 tree: the first PATH entry must not decide", staged)
+	}
+	var sawGoroot, sawSelector bool
+	for _, entry := range env {
+		if entry == "GOROOT="+staged {
+			sawGoroot = true
+		}
+		if entry == "GOTOOLCHAIN=local" {
+			sawSelector = true
+		}
+	}
+	if !sawGoroot {
+		t.Errorf("env = %q, want GOROOT pointing at the staged copy", env)
+	}
+	if !sawSelector {
+		t.Error("GOTOOLCHAIN=local missing: a seat that downloads a compiler mid-review is worse than one that fails")
+	}
+}
+
+// TestStageSeatToolchainRefusesWhenNothingSatisfiesTheWorkspace pins the loud
+// failure. A seat that cannot run the gate must publish the exit-126 shim so
+// the capability preflight blocks the review; the outcome that must never
+// return is a silent downgrade to a toolchain too old to build the repository,
+// which surfaces later as "go.mod requires go >= 1.26" and reads as a
+// repository problem rather than a staging one.
+func TestStageSeatToolchainRefusesWhenNothingSatisfiesTheWorkspace(t *testing.T) {
+	launcher := writeSeatToolchainFixture(t, filepath.Join(t.TempDir(), "distro"), "go1.22.2")
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "go.mod"), []byte("module x\n\ngo 1.26\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	t.Setenv("PATH", filepath.Join(launcher, "bin"))
+
+	paths := config.PathsForHome(t.TempDir())
+	staged, _, diagnostic, err := stageSeatToolchain(paths, workspace)
+	if err != nil {
+		t.Fatalf("stageSeatToolchain: %v", err)
+	}
+	if !strings.HasSuffix(filepath.Base(staged), toolchain.UnavailableRuntimeSuffix) {
+		t.Errorf("staged %q, want the published-unavailable command so the preflight blocks the review", staged)
+	}
+	for _, want := range []string{"go1.26", launcher, "go1.22.2"} {
+		if !strings.Contains(diagnostic, want) {
+			t.Errorf("diagnostic = %q, want it to name %q", diagnostic, want)
+		}
+	}
+}
+
+// TestStageSeatToolchainWithoutAWorkspaceTakesTheNewest covers a seat with no
+// module context, which must still stage rather than refuse: not every
+// repository a seat reviews is a Go module.
+func TestStageSeatToolchainWithoutAWorkspaceTakesTheNewest(t *testing.T) {
+	base := t.TempDir()
+	older := writeSeatToolchainFixture(t, filepath.Join(base, "older"), "go1.22.2")
+	newer := writeSeatToolchainFixture(t, filepath.Join(base, "newer"), "go1.26.4")
+	t.Setenv("PATH", strings.Join([]string{
+		filepath.Join(older, "bin"),
+		filepath.Join(newer, "bin"),
+	}, string(os.PathListSeparator)))
+
+	paths := config.PathsForHome(t.TempDir())
+	staged, _, diagnostic, err := stageSeatToolchain(paths, "")
+	if err != nil {
+		t.Fatalf("stageSeatToolchain: %v", err)
+	}
+	if diagnostic != "" {
+		t.Fatalf("diagnostic = %q, want none", diagnostic)
+	}
+	if !strings.Contains(filepath.Base(staged), "go1.26.4") {
+		t.Errorf("staged %q, want the newest installation when no module asks for one", staged)
 	}
 }

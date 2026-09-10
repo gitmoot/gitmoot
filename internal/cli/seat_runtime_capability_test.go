@@ -284,10 +284,19 @@ func TestSeatRuntimeUnavailableIgnoresAnUnrelatedPublishedRoot(t *testing.T) {
 }
 
 // unstageableGoFixture is a `go` whose PATH entry is not inside a bin/ or
-// sbin/ installation, which stageSeatToolchain classifies as unavailable
-// (toolchain_seat.go:51). Deterministic on a host with or without a real Go
-// installed, and unlike the ELOOP that produced the live instance it needs no
-// pre-published launcher.
+// sbin/ installation, so no installation can be derived from it.
+//
+// IT NO LONGER MAKES THE TOOLCHAIN UNAVAILABLE BY ITSELF (#2143), and that is
+// the fix working rather than a fixture defect. This fixture is PREPENDED to
+// the host PATH, so it used to win purely because exec.LookPath stops at the
+// first match. Selection now considers every entry, so a host with a real Go
+// further down PATH gets that one - which is exactly the defect #2143
+// removed: a junk entry in front must not deny a seat a toolchain that is
+// installed.
+//
+// The unavailability is therefore forced by the WORKSPACE instead, below, so
+// the test states its own precondition rather than borrowing PATH order from
+// the host.
 const unstageableGoFixture = "#!/bin/sh\nexit 0\n"
 
 // seedUnavailableToolchainReviewSeat is the measured #1817 shape that the
@@ -308,6 +317,21 @@ func seedUnavailableToolchainReviewSeat(t *testing.T, jobID string, action strin
 
 	store, home := blockerE2EHome(t)
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
+	// FORCE THE PRECONDITION IN THE WORKSPACE, not in PATH order (#2143).
+	// A module requiring a Go release no host has cannot be satisfied by any
+	// installation, here or on a runner, so the seat's toolchain is genuinely
+	// unavailable and stays that way as hosts change.
+	//
+	// COMMITTED, not merely written: the seat reviews an allocated read-only
+	// git worktree of this repository, where an untracked file does not
+	// exist. An earlier attempt only wrote it, the preflight never fired, and
+	// the workspace the seat actually staged against had no go.mod at all.
+	if err := os.WriteFile(filepath.Join(checkout, "go.mod"),
+		[]byte("module fixture\n\ngo 99.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, checkout, "add", "go.mod")
+	runGit(t, checkout, "commit", "-m", "require a Go release no host has")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 	sourceDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(sourceDir, ".credentials.json"),
@@ -377,7 +401,11 @@ func TestSeatToolchainUnavailableEndsAReviewBlockedNotVerdicted(t *testing.T) {
 	}
 	// The AGENT is who a coordinator re-dispatches away from, and the CAUSE is
 	// what an operator repairs.
-	for _, want := range []string{"gm-review-opus", "bin/ or sbin/"} {
+	// The AGENT a coordinator re-dispatches away from, the REQUIREMENT that
+	// could not be met, and the tree that was rejected for it. The last two
+	// replace the old "bin/ or sbin/" substring, which named a cause that no
+	// longer denies a toolchain on its own.
+	for _, want := range []string{"gm-review-opus", "go99.0"} {
 		if !strings.Contains(refusal, want) {
 			t.Errorf("%q event %q does not name %q", seatToolchainUnavailableEvent, refusal, want)
 		}

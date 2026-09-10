@@ -34,27 +34,49 @@ import (
 // engine-owned exit-126 command shadows any later host PATH entry. Failure to
 // publish that command aborts seat setup: falling through to the host copy would
 // silently restore the grant class this cutover removes.
-func stageSeatToolchain(paths config.Paths) (string, []string, string, error) {
-	resolved, err := exec.LookPath("go")
-	if err != nil {
+// WHICH TOOLCHAIN (#2143). The source is the installation that satisfies the
+// WORKSPACE, chosen from every Go on PATH, not the installation that owns the
+// first `go` PATH happens to resolve.
+//
+// exec.LookPath answers "who owns the first go on PATH", which is a different
+// question from "which toolchain would build this repository", and on a host
+// whose PATH leads with a distro launcher the two differ every time
+// GOTOOLCHAIN would resolve upward. Measured on the host that produced #2143:
+// PATH led to go1.22.2 while go.mod said go 1.26, so the seat staged 1.22 and
+// then could not build the repository it was reviewing.
+//
+// An empty workspace means no module context, and selection then takes the
+// newest installation rather than refusing.
+func stageSeatToolchain(paths config.Paths, workspace string) (string, []string, string, error) {
+	candidates := toolchain.InstallationsOnPath(os.Getenv("PATH"))
+	if len(candidates) == 0 {
+		// TWO DIFFERENT HOSTS, TWO DIFFERENT REPAIRS, so they must not collapse
+		// into one message. "No Go at all" is reported with an empty
+		// diagnostic, which the caller turns into its own absent-Go wording.
+		// A `go` that EXISTS but does not sit in an installation layout is a
+		// different fact and the operator can act on it, so it keeps saying so.
+		//
+		// Caught by TestSeatToolchainUnavailableEndsAReviewBlockedNotVerdicted:
+		// the first version of this cutover skipped a non-layout `go` silently
+		// while enumerating, and a host with an unstageable `go` on PATH
+		// started reporting that no Go was found at all.
+		if _, err := exec.LookPath("go"); err == nil {
+			return unavailableSeatToolchain(paths, "resolved Go executable is not inside a bin/ or sbin/ installation; host copy is shadowed")
+		}
 		return unavailableSeatToolchain(paths, "")
 	}
-	// RESOLVE THE SYMLINK BEFORE CLASSIFYING. A PATH entry is frequently a link
-	// into the real installation: /usr/bin/go on this host points at
-	// /usr/lib/go-1.22/bin/go. Classifying the RAW path yields the install root
-	// "/usr", so staging would try to copy the entire system tree instead of a
-	// toolchain - StageRuntime already resolves for exactly this reason.
-	if target, linkErr := filepath.EvalSymlinks(resolved); linkErr == nil {
-		resolved = target
+	selected, err := toolchain.SelectInstallation(candidates, toolchain.ModuleGoDirective(workspace))
+	if err != nil {
+		// Reported at STAGING time, naming the requirement and every rejected
+		// tree. The alternative is what this replaces: stage something too old
+		// and let the seat emit "go.mod requires go >= 1.26" later, which reads
+		// as a repository problem rather than a staging one.
+		return unavailableSeatToolchain(paths, fmt.Sprintf("%v; host copy is shadowed", err))
 	}
-	source, ok := toolchainInstallRoot(resolved)
-	if !ok {
-		return unavailableSeatToolchain(paths, "resolved Go executable is not inside a bin/ or sbin/ installation; host copy is shadowed")
-	}
-	staged, err := toolchain.Stage(paths.Home, source)
+	staged, err := toolchain.Stage(paths.Home, selected.Root)
 	if err != nil {
 		if errors.Is(err, toolchain.ErrNotPinned) {
-			return unavailableSeatToolchain(paths, "resolved Go installation is not pinned; host copy is shadowed")
+			return unavailableSeatToolchain(paths, fmt.Sprintf("selected Go installation is not pinned; host copy is shadowed: %v", err))
 		}
 		return unavailableSeatToolchain(paths, fmt.Sprintf("staged toolchain unavailable; host copy is shadowed: %v", err))
 	}
@@ -68,7 +90,9 @@ func stageSeatToolchain(paths config.Paths) (string, []string, string, error) {
 		// The staged copy is the only toolchain the seat can BUILD with — it is
 		// first on PATH and the only Go tree under a read grant — so pin the
 		// selector too: an empty GOTOOLCHAIN invites the auto-download a
-		// sandboxed seat cannot complete.
+		// sandboxed seat cannot complete. #2143 changed WHICH toolchain is
+		// pinned, never that one is pinned: a seat that downloads a compiler
+		// mid-review is worse than a seat that fails.
 		"GOTOOLCHAIN=local",
 	}, "", nil
 }
@@ -326,25 +350,6 @@ func seatPath(staged string) (string, string) {
 		return stagedBin + ":/usr/local/bin:/usr/bin:/bin", ""
 	}
 	return stagedBin + string(os.PathListSeparator) + inherited, ""
-}
-
-// toolchainInstallRoot reports the installation root containing a Go
-// executable. Every root is staged — including /opt, /usr/local, /nix/store and
-// /snap — because ruling 122157 removed the split ownership that previously
-// handed those prefixes to optionalSystemToolchainRoot.
-//
-// THE OLD SYSTEM-PREFIX EXCLUSION WAS THE SAME DEFECT AT A DIFFERENT SITE. It
-// left the operator's root in place and compensated with a recursive read grant.
-// Review round 3 proved that no inspection can make such a grant safe: the
-// root's shape says nothing about who can create a descendant after setup.
-// Returning every installation layout here does not TRUST the root; it makes the
-// daemon COPY it before the seat sees it.
-func toolchainInstallRoot(goExecutable string) (string, bool) {
-	binDir := filepath.Dir(filepath.Clean(goExecutable))
-	if base := filepath.Base(binDir); base != "bin" && base != "sbin" {
-		return "", false
-	}
-	return filepath.Dir(binDir), true
 }
 
 // validateStagedToolchainPlacement is this shape's P1 expressed as code.

@@ -166,15 +166,39 @@ func TestInstallationVersionReadsARealTree(t *testing.T) {
 	}
 }
 
-// TestInstallationRootRejectsAnExecutableOutsideABinDirectory pins the guard
-// that stops a stray PATH entry from nominating the whole system tree: on the
-// #2143 host, classifying /usr/bin/go without resolving it first yields "/usr".
-func TestInstallationRootRejectsAnExecutableOutsideABinDirectory(t *testing.T) {
-	if root, ok := InstallationRoot("/usr/lib/go-1.22/bin/go"); !ok || root != "/usr/lib/go-1.22" {
-		t.Errorf("InstallationRoot = (%q, %v), want (/usr/lib/go-1.22, true)", root, ok)
+// TestInstallationRootAcceptsEveryInstallationPrefix carries ruling 122157's
+// coverage, moved here with the function it tests (#2143 deleted the cli copy
+// rather than leaving two implementations).
+//
+// /opt, /usr/local, /nix/store and /snap are all STAGED, so a test that
+// refused them would protect the defect that ruling removed. The bin/ guard
+// still matters for a different reason, kept as the control below: on the
+// #2143 host, classifying /usr/bin/go without resolving the symlink first
+// yields "/usr", and staging would copy the system tree.
+func TestInstallationRootAcceptsEveryInstallationPrefix(t *testing.T) {
+	for path, want := range map[string]string{
+		"/opt/go/bin/go":                          "/opt/go",
+		"/opt/nested/deeper/go/bin/go":            "/opt/nested/deeper/go",
+		"/usr/local/go/bin/go":                    "/usr/local/go",
+		"/usr/local/bin/go":                       "/usr/local",
+		"/nix/store/abc-go-1.26.4/bin/go":         "/nix/store/abc-go-1.26.4",
+		"/snap/go/current/bin/go":                 "/snap/go/current",
+		"/root/.local/toolchains/go1.26.4/bin/go": "/root/.local/toolchains/go1.26.4",
+		"/home/op/sdk/go1.26.4/bin/go":            "/home/op/sdk/go1.26.4",
+		"/opt-not-a-prefix/go/bin/go":             "/opt-not-a-prefix/go",
+		"/usr/localish/go/bin/go":                 "/usr/localish/go",
+		"/usr/lib/go-1.22/bin/go":                 "/usr/lib/go-1.22",
+	} {
+		root, ok := InstallationRoot(path)
+		if !ok || root != want {
+			t.Errorf("InstallationRoot(%q) = %q,%v; want %q,true. Refusing a system prefix leaves that operator root for the recursive host grant that cutover deleted.", path, root, ok, want)
+		}
 	}
-	if root, ok := InstallationRoot("/opt/weird/go"); ok {
-		t.Errorf("InstallationRoot = (%q, true), want refusal: the parent is not bin/ or sbin/", root)
+
+	// CONTROL: a path that is not an installation layout is still refused, so
+	// accepting the prefixes above did not turn this into filepath.Dir twice.
+	if _, ok := InstallationRoot("/somewhere/go"); ok {
+		t.Fatal("a go executable not under bin/ or sbin/ was accepted as an installation")
 	}
 }
 

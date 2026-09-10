@@ -2070,7 +2070,7 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	//
 	// Failure publishes an engine-owned exit-126 command; inability to publish
 	// that fail-closed path aborts setup rather than exposing the host copy.
-	staged, stagedEnv, diagnostic, err := stageSeatToolchain(paths)
+	staged, stagedEnv, diagnostic, err := stageSeatToolchain(paths, checkout)
 	if err != nil {
 		return grants, err
 	}
