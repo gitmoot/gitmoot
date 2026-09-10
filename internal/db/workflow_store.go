@@ -1111,6 +1111,108 @@ ORDER BY d.created_at ASC, d.id ASC`, targetRole, targetRole, targetRole)
 	return notes, rows.Err()
 }
 
+// The open-directive predicate, UNCORRELATED (#2138).
+//
+// The obvious spelling - NOT EXISTS whose marker text is built from d.id - is
+// what shipped, and it forces SQLite to rescan every same-workflow sibling note
+// for every candidate, because the comparison literal differs per outer row and
+// no index can serve it. The plan LOOKS indexed (`SEARCH r USING
+// idx_workflow_notes_wid`) and narrows almost nothing: note workflow_id
+// cardinality is 443 distinct over 30,141 rows on the live store, and the
+// largest bucket holds 8,007 - including every open directive. Measured there:
+// 2,887 candidates x 8,007 siblings = 46,232,418 substr evaluations, 16.96s to
+// return the number 4, and the sweep runs this predicate TWICE per pass on a
+// one-minute ticker, so passes overlap and the daemon burns a core forever.
+//
+// The substr calls are NOT the cost: one linear pass over all 30,141 notes
+// doing the same prefix tests measures 0.042s. The CORRELATION is the cost.
+// Materializing the marker set once and anti-joining measures 0.079s for the
+// same answer - 215x - and was proven set-EQUAL in both directions over all
+// 2,887 live candidates before it shipped, rather than compared by count.
+//
+// Two details are load-bearing rather than incidental:
+//
+//   - `wid` is carried and joined. The predicate this replaces required the
+//     marker to live in the SAME workflow_id, so dropping it would retire a
+//     directive on a FOREIGN marker. A first draft did exactly that.
+//   - the target is compared AS TEXT. The old predicate compared
+//     '<prefix>' || d.id || ' ', so 'id=007 ' never matched directive 7 and
+//     still must not; and the instr() guard leaves a marker with no space after
+//     its id unmatched, for the same reason.
+//
+// Cost is now LINEAR in total notes rather than quadratic: 79ms at 30k notes,
+// roughly 0.8s at 10x. That trade was taken deliberately over stamping a
+// terminal column at write time, because there is no Go writer of these markers
+// at all - they arrive as ordinary note bodies - so a write-time stamp would
+// have to infer the same thing from the same text in a place where nothing
+// checks it, and a missed path would be silent and permanent. See #2139.
+const directiveTerminalMarkersCTE = `markers AS MATERIALIZED (
+	SELECT m.workflow_id AS wid,
+		substr(m.body, length('[org:directive-cancel id=') + 1,
+			instr(substr(m.body, length('[org:directive-cancel id=') + 1), ' ') - 1) AS target
+	FROM workflow_notes m
+	WHERE substr(m.body, 1, length('[org:directive-cancel id=')) = '[org:directive-cancel id='
+		AND instr(substr(m.body, length('[org:directive-cancel id=') + 1), ' ') > 1
+	UNION ALL
+	SELECT m.workflow_id,
+		substr(m.body, length('[org:directive-done id=') + 1,
+			instr(substr(m.body, length('[org:directive-done id=') + 1), ' ') - 1)
+	FROM workflow_notes m
+	WHERE substr(m.body, 1, length('[org:directive-done id=')) = '[org:directive-done id='
+		AND instr(substr(m.body, length('[org:directive-done id=') + 1), ' ') > 1
+)`
+
+// directiveAckMarkersCTE is the same rewrite for the ack timestamp the sweep
+// reads alongside the open set. It was a correlated MIN() per candidate row,
+// which is why the LIST half measured 21.16s against the COUNT half's 16.96s.
+const directiveAckMarkersCTE = `acks AS MATERIALIZED (
+	SELECT wid, target, MIN(created_at) AS acked_at FROM (
+		SELECT a.workflow_id AS wid,
+			substr(a.body, length('[org:directive-ack id=') + 1,
+				instr(substr(a.body, length('[org:directive-ack id=') + 1), ' ') - 1) AS target,
+			a.created_at
+		FROM workflow_notes a
+		WHERE substr(a.body, 1, length('[org:directive-ack id=')) = '[org:directive-ack id='
+			AND instr(substr(a.body, length('[org:directive-ack id=') + 1), ' ') > 1
+		UNION ALL
+		SELECT a.workflow_id,
+			substr(a.body, length('[org:directive-delivered id=') + 1,
+				instr(substr(a.body, length('[org:directive-delivered id=') + 1), ' ') - 1),
+			a.created_at
+		FROM workflow_notes a
+		WHERE substr(a.body, 1, length('[org:directive-delivered id=')) = '[org:directive-delivered id='
+			AND instr(substr(a.body, length('[org:directive-delivered id=') + 1), ' ') > 1
+	) GROUP BY wid, target
+)`
+
+// countOpenOrgDirectiveObligationsSQL and listOpenOrgDirectiveObligationsSQL are
+// named so a test can EXPLAIN the SHIPPED text. Asserting on a copy of a query
+// proves nothing about the query that runs (#2138).
+const countOpenOrgDirectiveObligationsSQL = `
+WITH ` + directiveTerminalMarkersCTE + `
+SELECT COUNT(*)
+FROM workflow_notes d
+LEFT JOIN markers k ON k.wid = d.workflow_id AND k.target = CAST(d.id AS TEXT)
+WHERE substr(d.body, 1, length('[org:directive ')) = '[org:directive '
+	AND TRIM(d.directive_parked_at) = ''
+	AND k.target IS NULL`
+
+const listOpenOrgDirectiveObligationsSQL = `
+WITH ` + directiveTerminalMarkersCTE + `,
+` + directiveAckMarkersCTE + `
+SELECT d.id, d.workflow_id, d.author, d.body, d.repo, d.memory_observation_id, d.created_at,
+	d.directive_nudge_count, d.directive_last_nudged_at, d.directive_done_ttl_seconds,
+	d.directive_done_nudge_count, d.directive_exhausted_at,
+	COALESCE(a.acked_at, '')
+FROM workflow_notes d
+LEFT JOIN markers k ON k.wid = d.workflow_id AND k.target = CAST(d.id AS TEXT)
+LEFT JOIN acks a ON a.wid = d.workflow_id AND a.target = CAST(d.id AS TEXT)
+WHERE substr(d.body, 1, length('[org:directive ')) = '[org:directive '
+	AND TRIM(d.directive_parked_at) = ''
+	AND k.target IS NULL
+ORDER BY d.created_at ASC, d.id ASC
+LIMIT ?`
+
 // CountOpenOrgDirectiveObligations returns how many directives are currently
 // open, using the SAME open-predicate as ListOpenOrgDirectiveObligations.
 //
@@ -1120,18 +1222,7 @@ ORDER BY d.created_at ASC, d.id ASC`, targetRole, targetRole, targetRole)
 // second, different mechanism would be worse than reusing the one that works.
 func (s *Store) CountOpenOrgDirectiveObligations(ctx context.Context) (int, error) {
 	var count int
-	err := s.db.QueryRowContext(ctx, `
-SELECT COUNT(*)
-FROM workflow_notes d
-WHERE substr(d.body, 1, length('[org:directive ')) = '[org:directive '
-	AND TRIM(d.directive_parked_at) = ''
-	AND NOT EXISTS (
-		SELECT 1 FROM workflow_notes r
-		WHERE r.workflow_id = d.workflow_id AND (
-			substr(r.body, 1, length('[org:directive-cancel id=' || d.id || ' ')) = '[org:directive-cancel id=' || d.id || ' '
-			OR substr(r.body, 1, length('[org:directive-done id=' || d.id || ' ')) = '[org:directive-done id=' || d.id || ' '
-		)
-	)`).Scan(&count)
+	err := s.db.QueryRowContext(ctx, countOpenOrgDirectiveObligationsSQL).Scan(&count)
 	return count, err
 }
 
@@ -1151,30 +1242,7 @@ func (s *Store) ListOpenOrgDirectiveObligations(ctx context.Context, limit int) 
 	if limit <= 0 {
 		limit = directiveSweepCeiling
 	}
-	rows, err := s.db.QueryContext(ctx, `
-SELECT d.id, d.workflow_id, d.author, d.body, d.repo, d.memory_observation_id, d.created_at,
-	d.directive_nudge_count, d.directive_last_nudged_at, d.directive_done_ttl_seconds,
-	d.directive_done_nudge_count, d.directive_exhausted_at,
-	COALESCE((
-		SELECT MIN(a.created_at) FROM workflow_notes a
-		WHERE a.workflow_id = d.workflow_id
-			AND (
-				substr(a.body, 1, length('[org:directive-ack id=' || d.id || ' ')) = '[org:directive-ack id=' || d.id || ' '
-				OR substr(a.body, 1, length('[org:directive-delivered id=' || d.id || ' ')) = '[org:directive-delivered id=' || d.id || ' '
-			)
-	), '')
-FROM workflow_notes d INDEXED BY idx_workflow_notes_directive_oldest
-WHERE substr(d.body, 1, length('[org:directive ')) = '[org:directive '
-	AND TRIM(d.directive_parked_at) = ''
-	AND NOT EXISTS (
-		SELECT 1 FROM workflow_notes r
-		WHERE r.workflow_id = d.workflow_id AND (
-			substr(r.body, 1, length('[org:directive-cancel id=' || d.id || ' ')) = '[org:directive-cancel id=' || d.id || ' '
-			OR substr(r.body, 1, length('[org:directive-done id=' || d.id || ' ')) = '[org:directive-done id=' || d.id || ' '
-		)
-	)
-ORDER BY d.created_at ASC, d.id ASC
-LIMIT ?`, limit)
+	rows, err := s.db.QueryContext(ctx, listOpenOrgDirectiveObligationsSQL, limit)
 	if err != nil {
 		return nil, err
 	}
