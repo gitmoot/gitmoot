@@ -1216,11 +1216,19 @@ type orgStatusOutput struct {
 	// "must not treat that as a zero-valued or stale turn". Rendering nil as 0
 	// would invent a stalled seat.
 	LastTurn *int64 `json:"last_turn,omitempty"`
-	// LastTurnAge is how long ago that turn COMPLETED, which for a working seat
-	// is how long the current turn has been running. It is the half that makes
-	// the number a verdict rather than a fact, and it needs no stored prior:
+	// LastTurnAge is how long ago that turn COMPLETED. What that measures depends
+	// on the provider state, and the state alone does not say so, which is why
+	// LastTurnAgeBasis travels beside it (#1702 review, P3): for a seat still
+	// inside a turn the age is a lower bound on the CURRENT turn's runtime; for
+	// any other state it is time since the last completed turn and carries no
+	// claim about what the seat is doing now. It needs no stored prior, because
 	// the provider reports the completion time itself.
-	LastTurnAge       string             `json:"last_turn_age,omitempty"`
+	LastTurnAge string `json:"last_turn_age,omitempty"`
+	// LastTurnAgeBasis mirrors the dashboard's already-shipped answer to this
+	// same ambiguity on this same field (dashboard_web_org_activity.go:283-291,
+	// current_inferred / last_completed) rather than inventing a second
+	// vocabulary for one reading.
+	LastTurnAgeBasis  string             `json:"last_turn_age_basis,omitempty"`
 	LastCommand       string             `json:"last_command,omitempty"`
 	ProviderState     org.LifecycleState `json:"provider_state"`
 	ProviderDetail    string             `json:"provider_detail,omitempty"`

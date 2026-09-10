@@ -207,34 +207,38 @@ func TestBuildOrgStatusRowsKeepsTheTurnForAnUnavailableRole(t *testing.T) {
 	}
 }
 
-// TestOrgTurnAgeSeparatesAStuckSeatFromABusyOne is the reading NEITHER existing
-// column produced.
+// TestOrgTurnAgeIsIndependentOfTheTurnNumber pins the reading NEITHER existing
+// column produced, and pins ONLY that.
 //
 //	numbra  working  turn=14   turn_age=18h9m59s  seen=21h43m7s
 //	deimos  working  turn=117  turn_age=9m29s     seen=27h34m4s
 //
-// Same state. numbra is the real suspect and nothing on that surface singled it
-// out: a low turn number is normal for a young seat, and its 21h note age is
-// unremarkable beside seats that are healthy at 27h and 45h. What separates them
-// is not the turn NUMBER but how long ago that turn completed - and for a
-// WORKING seat that is how long the current turn has been running.
+// Same state, and neither the turn NUMBER nor the note age separates them: a low
+// number is normal for a young seat, and 21h is unremarkable beside seats that
+// are healthy at 27h and 45h. What differs is how long ago the turn completed,
+// so the number and the age must be independent values.
 //
-// The number and the age must therefore be independent: a HIGH turn with an old
-// age is stuck, and a LOW turn with a fresh age is fine.
-func TestOrgTurnAgeSeparatesAStuckSeatFromABusyOne(t *testing.T) {
+// WHAT THIS TEST DELIBERATELY DOES NOT ASSERT, and the earlier version of it
+// did: that an old age on a WORKING seat means stuck. That is the exact false
+// claim #1702 is about - a runtime completing one turn per prompt reports
+// WORKING with an arbitrarily old turn age when nothing is wrong, because no new
+// prompt has arrived. A permanent test naming the 18h row "stuck" would pin the
+// defect as the contract. The age is a measurement; the verdict needs the basis
+// beside it, which TestOrgTurnAgeBasisRefusesToClaimLiveness covers.
+func TestOrgTurnAgeIsIndependentOfTheTurnNumber(t *testing.T) {
 	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
-	stuck := org.RoleLiveState{State: org.StateWorking, Activity: &org.RoleActivity{Turn: 14, CompletedAt: now.Add(-18*time.Hour - 9*time.Minute - 59*time.Second)}}
-	busy := org.RoleLiveState{State: org.StateWorking, Activity: &org.RoleActivity{Turn: 117, CompletedAt: now.Add(-9*time.Minute - 29*time.Second)}}
-	if got := orgTurnAge(stuck, now); got != "18h9m59s" {
-		t.Fatalf("stuck seat turn age = %q, want 18h9m59s", got)
+	oldTurn := org.RoleLiveState{State: org.StateWorking, Activity: &org.RoleActivity{Turn: 14, CompletedAt: now.Add(-18*time.Hour - 9*time.Minute - 59*time.Second)}}
+	freshTurn := org.RoleLiveState{State: org.StateWorking, Activity: &org.RoleActivity{Turn: 117, CompletedAt: now.Add(-9*time.Minute - 29*time.Second)}}
+	if got := orgTurnAge(oldTurn, now); got != "18h9m59s" {
+		t.Fatalf("old-turn seat age = %q, want 18h9m59s", got)
 	}
-	if got := orgTurnAge(busy, now); got != "9m29s" {
-		t.Fatalf("busy seat turn age = %q, want 9m29s", got)
+	if got := orgTurnAge(freshTurn, now); got != "9m29s" {
+		t.Fatalf("fresh-turn seat age = %q, want 9m29s", got)
 	}
-	// The LOWER turn number is the stuck one, which is why the number alone
-	// cannot produce this verdict.
-	if *orgLastTurn(stuck) >= *orgLastTurn(busy) {
-		t.Fatalf("test setup lost the inversion: stuck=%d busy=%d", *orgLastTurn(stuck), *orgLastTurn(busy))
+	// The LOWER turn number carries the OLDER age, which is why the number alone
+	// cannot produce this reading.
+	if *orgLastTurn(oldTurn) >= *orgLastTurn(freshTurn) {
+		t.Fatalf("test setup lost the inversion: old=%d fresh=%d", *orgLastTurn(oldTurn), *orgLastTurn(freshTurn))
 	}
 	// A completion time in the future (clock skew between hosts) must clamp to
 	// zero rather than print a negative duration.
@@ -253,5 +257,60 @@ func TestOrgTurnAgeSeparatesAStuckSeatFromABusyOne(t *testing.T) {
 	unstamped := org.RoleLiveState{State: org.StateWorking, Activity: &org.RoleActivity{Turn: 3}}
 	if got := orgTurnAge(unstamped, now); got != "" {
 		t.Fatalf("a turn with no completion stamp rendered %q, want the empty string", got)
+	}
+}
+
+// TestOrgTurnAgeBasisRefusesToClaimLiveness covers the case the #1702 review
+// asked for and the first version of this file could not express: an idle seat
+// and a wedged seat rendering the SAME turn age.
+//
+// Both rows below carry an identical 18h9m59s age from an identical completion
+// stamp. Nothing about the age separates them, and that is the point - the
+// surface must not present the number as though it did. What separates them is
+// the basis, and only the basis:
+//
+//	working  ->  current_inferred   the age is a lower bound on a RUNNING turn
+//	idle     ->  last_completed     the age is time since a FINISHED turn
+//
+// On a one-turn-per-prompt runtime the working row is the false-alarm case: an
+// old age there means no prompt has arrived, not that the seat is wedged. So the
+// discriminating assertion is that the two bases DIFFER on identical ages; a
+// test that only checked the age would pass with the qualifier deleted.
+func TestOrgTurnAgeBasisRefusesToClaimLiveness(t *testing.T) {
+	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	completed := now.Add(-18*time.Hour - 9*time.Minute - 59*time.Second)
+	inTurn := org.RoleLiveState{State: org.StateWorking, Activity: &org.RoleActivity{Turn: 14, CompletedAt: completed}}
+	betweenTurns := org.RoleLiveState{State: org.StateIdle, Activity: &org.RoleActivity{Turn: 14, CompletedAt: completed}}
+	inTurnAge, betweenAge := orgTurnAge(inTurn, now), orgTurnAge(betweenTurns, now)
+	if inTurnAge != betweenAge {
+		t.Fatalf("setup lost the point of the test: ages must be identical, got %q and %q", inTurnAge, betweenAge)
+	}
+	if got := orgTurnAgeBasis(inTurn, inTurnAge); got != "current_inferred" {
+		t.Fatalf("a seat inside a turn reported basis %q, want current_inferred", got)
+	}
+	if got := orgTurnAgeBasis(betweenTurns, betweenAge); got != "last_completed" {
+		t.Fatalf("a seat between turns reported basis %q, want last_completed", got)
+	}
+	// blocked and input_pending are inside a turn too: the seat is waiting, not
+	// finished, so the age still bounds the current turn.
+	for _, state := range []org.LifecycleState{org.StateBlocked, org.StateInputPending} {
+		live := org.RoleLiveState{State: state, Activity: &org.RoleActivity{Turn: 14, CompletedAt: completed}}
+		if got := orgTurnAgeBasis(live, orgTurnAge(live, now)); got != "current_inferred" {
+			t.Fatalf("state %q reported basis %q, want current_inferred", state, got)
+		}
+	}
+	// done, unavailable and unknown are NOT inside a turn, and an unknown state
+	// must not inherit the stronger claim by default.
+	for _, state := range []org.LifecycleState{org.StateDone, org.StateUnavailable, org.StateUnknown} {
+		live := org.RoleLiveState{State: state, Activity: &org.RoleActivity{Turn: 14, CompletedAt: completed}}
+		if got := orgTurnAgeBasis(live, orgTurnAge(live, now)); got != "last_completed" {
+			t.Fatalf("state %q reported basis %q, want last_completed", state, got)
+		}
+	}
+	// NO AGE MEANS NO BASIS. A basis beside an absent value would claim a
+	// reading the surface never rendered.
+	unstamped := org.RoleLiveState{State: org.StateWorking, Activity: &org.RoleActivity{Turn: 3}}
+	if got := orgTurnAgeBasis(unstamped, orgTurnAge(unstamped, now)); got != "" {
+		t.Fatalf("an absent age carried basis %q, want the empty string", got)
 	}
 }
