@@ -3097,7 +3097,7 @@ func TestOmpPolicyArgs(t *testing.T) {
 	}{
 		{AutonomyPolicyAuto, "--approval-mode=yolo"},
 		{AutonomyPolicyReadOnly, "--approval-mode=always-ask"},
-		{AutonomyPolicyWorkspaceWrite, "--approval-mode=yolo"},
+		{AutonomyPolicyWorkspaceWrite, "--approval-mode=write"},
 		{AutonomyPolicyDangerFullAccess, "--approval-mode=yolo"},
 	} {
 		t.Run(tc.policy, func(t *testing.T) {
@@ -3765,10 +3765,16 @@ func TestOmpApprovalModeFollowsTheStoredPolicy(t *testing.T) {
 		{AutonomyPolicyReadOnly, "--approval-mode=always-ask", PermissionPolicyApplied},
 		// Full access IS yolo, so the declaration is honest at `applied`.
 		{AutonomyPolicyDangerFullAccess, "--approval-mode=yolo", PermissionPolicyApplied},
-		// yolo grants more than either of these asked for. `widened` is the
-		// only truthful declaration; `applied` would claim a confinement no
+		// workspace-write maps to write, MEASURED against omp 18.1.15 with the
+		// filesystem as the decider: write lands an editing tool's file, refuses
+		// a shell command (nine bash tool calls, zero markers on disk) and
+		// refuses a write to an absolute path outside the working directory.
+		// That is what this policy asks for and what the sibling runtimes give
+		// it, so `applied` is honest here rather than `widened`.
+		{AutonomyPolicyWorkspaceWrite, "--approval-mode=write", PermissionPolicyApplied},
+		// auto KEEPS yolo, which grants more than it asked for, so `widened` is
+		// the only truthful declaration: `applied` would claim a confinement no
 		// argv performs, and not-applied would hide that a flag was passed.
-		{AutonomyPolicyWorkspaceWrite, "--approval-mode=yolo", PermissionPolicyWidened},
 		{AutonomyPolicyAuto, "--approval-mode=yolo", PermissionPolicyWidened},
 		// An unset policy normalizes to auto, NOT to read-only, so it must not
 		// inherit the restricted argv. This arm is what caught the mapping
