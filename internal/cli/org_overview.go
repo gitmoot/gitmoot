@@ -260,15 +260,30 @@ func buildOrgStatusRows(ctx context.Context, shared *orgSharedState, src orgLive
 				}
 			}
 		}
+		turnAge := orgTurnAge(live, observedNow)
 		rows = append(rows, orgStatusOutput{
 			Role: role.Name, Parent: role.Parent, Pane: role.Pane, Depth: len(shared.Config.Path(role.Name)) - 1,
 			Scope: role.Scope, MergeRule: role.MergeRule, Model: role.Model, ActiveJobs: activeJobs, LastSeenAt: seen.LastSeenAt, LastSeenAge: orgPresenceAge(seen.LastSeenAt, observedNow), LastCommand: seen.LastCommand,
 			// #1702: live.Activity was already on this line and unread. The turn
-			// counter is the only field that distinguishes a seat INSIDE a long turn
-			// from one that stopped after a short one; LastSeenAge cannot, because an
-			// age conflates the two. Nil stays nil - see LastTurn's contract.
-			LastTurn:      orgLastTurn(live),
-			ProviderState: live.State, ProviderDetail: live.Detail, ObservedAt: observedAt, ProviderVersion: providerVersion,
+			// counter distinguishes a seat INSIDE a long turn from one that stopped
+			// after a short one; LastSeenAge cannot, because a note age conflates the
+			// two - measured on this host, two seats read 27h and 45h by age while
+			// their last turn had completed 7 and 4 minutes earlier.
+			//
+			// LastTurnAge is the half that turns the number into a reading, and
+			// LastTurnAgeBasis says WHICH reading: inside a turn it is a lower bound
+			// on the current turn's runtime, otherwise it is time since the last
+			// completion and claims nothing about now. A runtime that completes one
+			// turn per prompt reports WORKING with an old age when nothing is wrong,
+			// so the unqualified number is exactly the false liveness claim #1702 is
+			// about. Neither needs a stored prior: the provider reports the
+			// completion time itself (org.RoleActivity.CompletedAt, required by the
+			// cockpit parser). Movement BETWEEN gitmoot observations is the separate
+			// reading that does need storage, and it is deliberately not built here.
+			LastTurn:         orgLastTurn(live),
+			LastTurnAge:      turnAge,
+			LastTurnAgeBasis: orgTurnAgeBasis(live, turnAge),
+			ProviderState:    live.State, ProviderDetail: live.Detail, ObservedAt: observedAt, ProviderVersion: providerVersion,
 			RecycleStatus: recycleStatus, RecycleAfter: recycleAfterText,
 			MissedWakes: consecutive, Flagged: flagged, FlagReason: flagReason,
 			UnavailableReason: unavailableReason, UnavailableUntil: unavailableUntil,
@@ -316,4 +331,69 @@ func orgTurnText(turn *int64) string {
 		return "-"
 	}
 	return strconv.FormatInt(*turn, 10)
+}
+
+// orgTurnAge reports how long ago the provider's last turn COMPLETED, which for
+// a working seat is how long its current turn has been running (#1702).
+//
+// This is the half that makes the turn number actionable. Measured on this host,
+// with the number and the age side by side:
+//
+//	deimos            working  turn=117  turn_age=7m   seen=27h32m
+//	among-friends-omp done     turn=54   turn_age=4m   seen=45h36m
+//	numbra            working  turn=14   turn_age=18h  seen=21h41m
+//
+// The first two look long dead by note age and are minutes old. numbra is the
+// real suspect and NEITHER a low turn number nor a 21h age singles it out: a
+// seat reporting WORKING whose last turn completed 18 hours ago. The pair
+// produces that reading; neither field alone does.
+//
+// No stored prior is needed: org.RoleActivity carries CompletedAt and the
+// cockpit parser REQUIRES it (a missing completion time yields a nil activity,
+// herdr_org.go:180-183), so this is another already-present fact. Detecting
+// movement BETWEEN gitmoot observations is the separate reading that needs
+// storage, and it stays out of scope.
+func orgTurnAge(live org.RoleLiveState, now time.Time) string {
+	if live.Activity == nil || live.Activity.CompletedAt.IsZero() {
+		return ""
+	}
+	age := now.Sub(live.Activity.CompletedAt.UTC())
+	if age < 0 {
+		age = 0
+	}
+	return age.Round(time.Second).String()
+}
+
+// orgTurnAgeBasis says what orgTurnAge's number MEASURES, which the number and
+// the provider state do not say between them (#1702 review, P3).
+//
+// The distinction is load-bearing for the class this issue is about: a runtime
+// that completes one turn per prompt reports WORKING with an old turn age when
+// nothing is wrong, because no new prompt has arrived. Reading that age as
+// current-turn runtime is the false liveness claim; reading it as time since the
+// last completion is the true one. The two differ only by state, so the basis
+// has to travel with the value.
+//
+// The vocabulary is deliberately the dashboard's, already shipped for this same
+// field (dashboard_web_org_activity.go:283-291):
+//
+//	current_inferred  the seat is inside a turn, so the age is a LOWER BOUND on
+//	                  the current turn's runtime. Herdr exposes no
+//	                  current_turn_started stamp, so the preceding completion is
+//	                  the best available bound, never an exact start.
+//	last_completed    the seat is not inside a turn, so the age is time since the
+//	                  last completed turn and implies nothing about now.
+//
+// Empty when there is no age to qualify, so the JSON surface never carries a
+// basis for a value it did not render.
+func orgTurnAgeBasis(live org.RoleLiveState, age string) string {
+	if strings.TrimSpace(age) == "" {
+		return ""
+	}
+	switch live.State {
+	case org.StateWorking, org.StateBlocked, org.StateInputPending:
+		return "current_inferred"
+	default:
+		return "last_completed"
+	}
 }
