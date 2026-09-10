@@ -49,6 +49,15 @@ func (w jobWorker) defaultExecutionBackend(backend execbackend.Backend, cfg conf
 		// Reap once per resolved root in this process. A restarted daemon has a
 		// fresh map and therefore reconciles the prior process's instances before
 		// provisioning its first new job.
+		//
+		// THIS PATH IS FAIL-CLOSED ON PURPOSE and must stay that way: a reap
+		// failure below aborts backend construction, and therefore the dispatch
+		// that triggered it. Double-running a job against a live instance the
+		// previous process left behind is unrecoverable; refusing one dispatch is
+		// not. The PERIODIC pass in execbackend_reconcile.go has the OPPOSITE
+		// polarity - log-and-continue - because there the risk is a provider
+		// outage becoming a gitmoot outage, and the restart invariant is already
+		// held here (#1539). Do not align one with the other.
 		rootKey := string(backend) + "|" + root
 		if _, loaded := reapedExecutionBackendRoots.LoadOrStore(rootKey, struct{}{}); !loaded {
 			var reaper execbackend.Reaper = local
