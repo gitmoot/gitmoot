@@ -90,7 +90,7 @@ func TestMarkExecBackendAttemptDestroyedAdmitsOnlyDestroying(t *testing.T) {
 				ExecBackendAttemptKey: key, Provider: "e2b",
 				DaemonFencingToken: "fence", BootID: "boot",
 				TTLExpiresAt: time.Now().Add(time.Minute),
-			}); err != nil {
+			}, testExecBackendUncappedPolicy()); err != nil {
 				t.Fatal(err)
 			}
 			must := func(changed bool, err error) {
