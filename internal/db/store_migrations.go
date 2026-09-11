@@ -2776,4 +2776,12 @@ CREATE INDEX IF NOT EXISTS idx_job_events_runtime ON job_events(job_id, id) WHER
 ALTER TABLE routing_telemetry ADD COLUMN fan_out INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_routing_telemetry_fan_out ON routing_telemetry(action, fan_out);
 	`,
+	// Execution-grounded OMP upstream-provider evidence. The column lives on the
+	// append-only event ledger beside runtime so mutable payload/model fields can
+	// never manufacture cross-family independence. Existing rows remain unknown
+	// and therefore fail closed when an OMP family must be proved.
+	`
+ALTER TABLE job_events ADD COLUMN provider TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_job_events_provider ON job_events(job_id, id) WHERE provider != '';
+	`,
 }

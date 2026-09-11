@@ -3082,14 +3082,13 @@ func TestOmpSummaryIsFinalAssistantTextNotEnvelope(t *testing.T) {
 //
 // THIS TEST PREVIOUSLY ASSERTED THE OPPOSITE - one fixed `--approval-mode=yolo`
 // for every policy - and its stated reason was "read-only is enforced
-// Gitmoot-side, not by omp's approval tier". That reason does not hold for the
-// dispatch #1721 is about. Gitmoot-side enforcement on omp is exactly two
-// things: readOnlyImplementationBlocked, which covers IMPLEMENT jobs only, and
-// the read-only SEAT arm of wrapReadOnlyAdapterRunner, which refuses omp
-// outright ("read-only seats cannot use omp without an isolated credential
-// broker"). Neither reaches a non-seat read-only ask or review, which ran with
-// unrestricted tools. Dropping the flag entirely is still refused, because an
-// absent flag inherits the host's tools.approvalMode.
+// Gitmoot-side, not by omp's approval tier". Gitmoot-side enforcement depends on
+// the dispatch path: readOnlyImplementationBlocked refuses read-only
+// implementation jobs, and a broker-backed read-only seat receives the
+// Landlock wrapper from wrapReadOnlyAdapterRunner. A non-seat read-only ask or
+// review reaches neither boundary, so it needs `always-ask` to restrict OMP's
+// own tools. Dropping the flag entirely is still refused because an absent flag
+// inherits the host's tools.approvalMode.
 func TestOmpPolicyArgs(t *testing.T) {
 	for _, tc := range []struct {
 		policy string
@@ -3816,5 +3815,90 @@ func TestOmpReadOnlyPolicyIsDeclaredThroughTheResolver(t *testing.T) {
 	agent.AutonomyPolicy = AutonomyPolicyReadOnly
 	if got := ResolvePermissionPolicyApplication(OmpAdapter{}, agent); got != PermissionPolicyApplied {
 		t.Fatalf("ResolvePermissionPolicyApplication = %q, want %q", got, PermissionPolicyApplied)
+	}
+}
+
+func TestOmpProviderEvidenceComesFromSuccessfulRuntimeOutput(t *testing.T) {
+	t.Run("runtime provider wins over requested model", func(t *testing.T) {
+		runner := &fakeRunner{results: []subprocess.Result{{Stdout: ompStreamOK}}}
+		result, err := (OmpAdapter{Runner: runner}).Deliver(context.Background(), ompTestAgent(), Job{
+			Prompt: "review", Model: "devin/swe-2",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.UpstreamProvider != "anthropic" {
+			t.Fatalf("provider = %q, want runtime-reported anthropic instead of requested devin", result.UpstreamProvider)
+		}
+	})
+	t.Run("gateway reports actual upstream provider", func(t *testing.T) {
+		stream := strings.Replace(ompStreamOK,
+			`"provider":"anthropic","model":"claude-opus-4"`,
+			`"provider":"openrouter","model":"gpt-5.6","upstreamProvider":"OpenAI"`, 1)
+		runner := &fakeRunner{results: []subprocess.Result{{Stdout: stream}}}
+		result, err := (OmpAdapter{Runner: runner}).Deliver(context.Background(), ompTestAgent(), Job{
+			Prompt: "review", Model: "openrouter/openai/gpt-5.6",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.UpstreamProvider != "OpenAI" {
+			t.Fatalf("provider = %q, want response-reported OpenAI instead of gateway openrouter", result.UpstreamProvider)
+		}
+	})
+
+	t.Run("plan execution reports its actual provider", func(t *testing.T) {
+		stream := strings.Replace(ompStreamOK,
+			`"provider":"anthropic","model":"claude-opus-4"`,
+			`"provider":"kimi-code","model":"k3"`, 1)
+		runner := &fakeRunner{results: []subprocess.Result{{Stdout: stream}}}
+		result, err := (OmpAdapter{Runner: runner}).Deliver(context.Background(), ompTestAgent(), Job{
+			Prompt: "implement", Model: "openai-codex/gpt-5.6-sol", Plan: true, PlanInto: "kimi-code/k3",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.UpstreamProvider != "kimi-code" {
+			t.Fatalf("provider = %q, want runtime-reported kimi-code", result.UpstreamProvider)
+		}
+	})
+
+	t.Run("requested model alone remains unverified", func(t *testing.T) {
+		stream := ompHeaderLine(ompFixtureSessionID) + ompAssistantEndNoUsage("done") + ompAgentEnd()
+		runner := &fakeRunner{results: []subprocess.Result{{Stdout: stream}}}
+		result, err := (OmpAdapter{Runner: runner}).Deliver(context.Background(), ompTestAgent(), Job{
+			Prompt: "review", Model: "devin/swe-2",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.UpstreamProvider != "" {
+			t.Fatalf("requested model manufactured provider %q without runtime metadata", result.UpstreamProvider)
+		}
+	})
+
+	t.Run("failed stream never proves provider", func(t *testing.T) {
+		runner := &fakeRunner{results: []subprocess.Result{{Stdout: "not-json\\n"}}}
+		result, err := (OmpAdapter{Runner: runner}).Deliver(context.Background(), ompTestAgent(), Job{
+			Prompt: "review", Model: "devin/swe-2",
+		})
+		if err == nil {
+			t.Fatal("Deliver succeeded on malformed stream")
+		}
+		if result.UpstreamProvider != "" {
+			t.Fatalf("failed run manufactured provider %q", result.UpstreamProvider)
+		}
+	})
+}
+
+func TestOmpModelProvider(t *testing.T) {
+	provider, err := OmpModelProvider("  kimi-code/k3  ")
+	if err != nil || provider != "kimi-code" {
+		t.Fatalf("OmpModelProvider = %q, %v; want kimi-code", provider, err)
+	}
+	for _, model := range []string{"", "@smol", "devin/", "/swe-2", "bad provider/model"} {
+		if provider, err := OmpModelProvider(model); err == nil || provider != "" {
+			t.Fatalf("OmpModelProvider(%q) = %q, %v; want unresolved error", model, provider, err)
+		}
 	}
 }

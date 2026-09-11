@@ -1753,6 +1753,22 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 	// argv. Written before the error branch: a plan run that failed is still a plan
 	// run, and that is exactly when the evidence matters.
 	payload.PlanMode = result.PlanMode
+	if err == nil && agent.Runtime == runtime.OmpRuntime {
+		// Every successful OMP delivery appends an evidence row, including an
+		// empty-provider tombstone. A retry that succeeds without provider metadata
+		// must invalidate an older attempt's provider instead of inheriting it.
+		provider := strings.TrimSpace(result.UpstreamProvider)
+		message := "successful OMP delivery did not report an upstream provider"
+		if provider != "" {
+			message = "successful OMP delivery verified upstream provider"
+		}
+		if eventErr := m.store.AddJobEvent(ctx, db.JobEvent{
+			JobID: job.ID, Kind: ompProviderVerifiedEventKind, Message: message,
+			Runtime: runtime.OmpRuntime, Provider: provider,
+		}); eventErr != nil {
+			return "", "", false, nil, fmt.Errorf("persist OMP upstream-provider evidence: %w", eventErr)
+		}
+	}
 	// Preserve the last runtime identity while the job remains running. The
 	// liveness sweep needs the exact process that produced the retained transcript;
 	// terminal transitions clear it atomically with settlement below.

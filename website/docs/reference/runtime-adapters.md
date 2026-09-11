@@ -324,22 +324,24 @@ it is proven would turn an unknown into a silent stage failure.
 
 ### Cross-family review
 
-**omp joins no model family, on purpose.** A routing harness's resolved provider
-is opaque, so mapping omp to a family would manufacture diversity the merge gate
-would then trust. The consequence is stated out loud rather than hidden: an omp
-implement job's cross-family review is **refused loudly** — the engine records a
-`cross_family_review_failed` job event naming the runtime and both real remedies
-— instead of silently skipping, which used to look identical to "no reviewer was
-authenticated". No review row is written either way.
+OMP remains the runtime wrapper, but it is no longer treated as one model
+family. After an OMP CLI process succeeds and its structured stream proves a
+complete run, the adapter records the provider reported with the final
+assistant message in the append-only job-event ledger.
 
-The exclusion is **symmetric**. A registered omp seat that declares the `review`
-capability is dropped from the reviewer candidate set too, so it is never
-returned as another runtime's cross-family reviewer: refusing omp as an
-implementer while selecting it as a reviewer would manufacture the same false
-diversity from the other direction. Selection falls through to the family
-rotation, and then to the same-family fallback (tagged so it weights below a
-genuine cross-family review). Per-seat provider declaration is the sound fix and
-is tracked as issue #1436.
+The merge gate compares upstream families, not wrappers. OMP routes through
+`openai` or `openai-codex` are the native Codex family, `anthropic` is the
+native Claude family, and `kimi-code` is the native Kimi family. A provider
+without a native adapter stays namespaced, such as `omp:devin`. Different
+models or agent names using one provider remain one family.
+
+Requested model text is not evidence. A failed run, a successful stream without
+provider/model metadata, an older OMP job without a provider event, or a
+role-only in-session implementation with no successful provider record cannot
+establish cross-family independence and blocks the gate. Native fan-out cannot
+prove an OMP provider before execution, so it skips those reviewers; use an
+explicit `agent review` dispatch to run one and record evidence. Native runtime
+behavior is unchanged.
 
 ### Transcripts
 

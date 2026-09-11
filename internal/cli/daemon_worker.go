@@ -1542,7 +1542,7 @@ type readOnlyOmpBrokerSession struct {
 }
 
 func (s *readOnlyOmpBrokerSession) prepare(model string) (string, error) {
-	provider, err := readOnlyOmpProvider(model)
+	provider, err := runtime.OmpModelProvider(model)
 	if err != nil {
 		return "", err
 	}
@@ -1589,12 +1589,12 @@ func (a readOnlyRuntimeAdapter) PermissionPolicyApplication(agent runtime.Agent)
 func (a readOnlyRuntimeAdapter) Deliver(ctx context.Context, agent runtime.Agent, job runtime.Job) (runtime.Result, error) {
 	if a.ompSession != nil {
 		model := runtime.EffectiveModel(agent, job)
-		provider, err := readOnlyOmpProvider(model)
+		provider, err := runtime.OmpModelProvider(model)
 		if err != nil {
 			return runtime.Result{}, err
 		}
 		if job.Plan {
-			planProvider, err := readOnlyOmpProvider(job.PlanInto)
+			planProvider, err := runtime.OmpModelProvider(job.PlanInto)
 			if err != nil {
 				return runtime.Result{}, fmt.Errorf("read-only omp plan execution model: %w", err)
 			}

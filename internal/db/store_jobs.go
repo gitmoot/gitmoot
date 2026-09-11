@@ -119,12 +119,12 @@ func createJobWithEventTx(ctx context.Context, tx *sql.Tx, s *Store, job Job, ev
 	// a job together with its runtime-selection event would have lost the
 	// structured value and fallen back to the registry default, which is the
 	// misattribution #1534 exists to stop.
-	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message, runtime) VALUES (?, ?, ?, ?)`, event.JobID, event.Kind, event.Message, event.Runtime); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message, runtime, provider) VALUES (?, ?, ?, ?, ?)`, event.JobID, event.Kind, event.Message, event.Runtime, event.Provider); err != nil {
 		return err
 	}
 	for _, additional := range additionalEvents {
 		additional.JobID = job.ID
-		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message, runtime) VALUES (?, ?, ?, ?)`, additional.JobID, additional.Kind, additional.Message, additional.Runtime); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message, runtime, provider) VALUES (?, ?, ?, ?, ?)`, additional.JobID, additional.Kind, additional.Message, additional.Runtime, additional.Provider); err != nil {
 			return err
 		}
 	}
@@ -1504,8 +1504,8 @@ func (s *Store) RecordRuntimeSessionUsageDelta(ctx context.Context, sessionKey s
 }
 
 func (s *Store) AddJobEvent(ctx context.Context, event JobEvent) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message, runtime) VALUES (?, ?, ?, ?)`,
-		event.JobID, event.Kind, event.Message, event.Runtime)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message, runtime, provider) VALUES (?, ?, ?, ?, ?)`,
+		event.JobID, event.Kind, event.Message, event.Runtime, event.Provider)
 	return err
 }
 
@@ -1513,11 +1513,11 @@ func (s *Store) AddJobEvent(ctx context.Context, event JobEvent) error {
 // existence check and insert share one SQLite statement, so concurrent callers
 // cannot both pass a check-then-insert window.
 func (s *Store) AddJobEventIfAbsent(ctx context.Context, event JobEvent) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message, runtime)
-		SELECT ?, ?, ?, ?
+	_, err := s.db.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message, runtime, provider)
+		SELECT ?, ?, ?, ?, ?
 		WHERE NOT EXISTS (
 			SELECT 1 FROM job_events WHERE job_id = ? AND kind = ?
-		)`, event.JobID, event.Kind, event.Message, event.Runtime, event.JobID, event.Kind)
+		)`, event.JobID, event.Kind, event.Message, event.Runtime, event.Provider, event.JobID, event.Kind)
 	return err
 }
 
@@ -1733,7 +1733,7 @@ func (s *Store) jobEventsByKindExtreme(ctx context.Context, jobIDs []string, kin
 			args = append(args, jobID)
 		}
 	}
-	query := `SELECT job_id, kind, message, created_at, runtime FROM job_events
+	query := `SELECT job_id, kind, message, created_at, runtime, provider FROM job_events
 		WHERE kind = ? AND job_id IN (` + placeholders + `)
 		  AND id IN (SELECT ` + string(pick) + `(id) FROM job_events
 			WHERE kind = ? AND job_id IN (` + placeholders + `) GROUP BY job_id)`
@@ -1744,7 +1744,7 @@ func (s *Store) jobEventsByKindExtreme(ctx context.Context, jobIDs []string, kin
 	defer rows.Close()
 	for rows.Next() {
 		var event JobEvent
-		if err := rows.Scan(&event.JobID, &event.Kind, &event.Message, &event.CreatedAt, &event.Runtime); err != nil {
+		if err := rows.Scan(&event.JobID, &event.Kind, &event.Message, &event.CreatedAt, &event.Runtime, &event.Provider); err != nil {
 			return nil, err
 		}
 		out[event.JobID] = event
@@ -1753,7 +1753,7 @@ func (s *Store) jobEventsByKindExtreme(ctx context.Context, jobIDs []string, kin
 }
 
 func (s *Store) ListJobEvents(ctx context.Context, jobID string) ([]JobEvent, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT job_id, kind, message, created_at, runtime FROM job_events WHERE job_id = ? ORDER BY id`, jobID)
+	rows, err := s.db.QueryContext(ctx, `SELECT job_id, kind, message, created_at, runtime, provider FROM job_events WHERE job_id = ? ORDER BY id`, jobID)
 	if err != nil {
 		return nil, err
 	}
@@ -1762,7 +1762,7 @@ func (s *Store) ListJobEvents(ctx context.Context, jobID string) ([]JobEvent, er
 	var events []JobEvent
 	for rows.Next() {
 		var event JobEvent
-		if err := rows.Scan(&event.JobID, &event.Kind, &event.Message, &event.CreatedAt, &event.Runtime); err != nil {
+		if err := rows.Scan(&event.JobID, &event.Kind, &event.Message, &event.CreatedAt, &event.Runtime, &event.Provider); err != nil {
 			return nil, err
 		}
 		events = append(events, event)
@@ -2571,6 +2571,32 @@ func (s *Store) JobRecordedRuntime(ctx context.Context, jobID string, agentName 
 	err := s.db.QueryRowContext(ctx, `SELECT e.runtime FROM job_events e
 		JOIN jobs j ON j.id = e.job_id
 		WHERE e.job_id = ? AND e.runtime != '' AND j.agent = ?
+		ORDER BY e.id DESC LIMIT 1`, id, agent).Scan(&recorded)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(recorded), nil
+}
+
+// JobRecordedProvider returns the provider recorded by the latest successful
+// OMP delivery for this exact agent's succeeded job. Every successful delivery
+// appends a row, including an empty-provider tombstone, so a retry cannot inherit
+// stale provider evidence from an earlier attempt. The value comes from the
+// append-only event column, never from caller-controlled model or payload text.
+func (s *Store) JobRecordedProvider(ctx context.Context, jobID string, agentName string) (string, error) {
+	id := strings.TrimSpace(jobID)
+	agent := strings.TrimSpace(agentName)
+	if id == "" || agent == "" {
+		return "", nil
+	}
+	var recorded string
+	err := s.db.QueryRowContext(ctx, `SELECT e.provider FROM job_events e
+		JOIN jobs j ON j.id = e.job_id
+		WHERE e.job_id = ? AND e.kind = 'omp_provider_verified'
+		  AND e.runtime = 'omp' AND j.agent = ? AND j.state = 'succeeded'
 		ORDER BY e.id DESC LIMIT 1`, id, agent).Scan(&recorded)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil

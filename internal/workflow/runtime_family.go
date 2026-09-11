@@ -7,11 +7,15 @@ import (
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
+const ompProviderVerifiedEventKind = "omp_provider_verified"
+
 // ResolveRuntimeFamily resolves the runtime family an agent's job ran on — or,
-// for a job not yet dispatched, would run on. This is the ONE resolver shared
-// by the review-loop guard (#1528) and, in a later round, the merge gate's
+// for a native job not yet dispatched, would run on. Prospective OMP jobs remain
+// unresolved because their provider is known only after execution. This is the
+// ONE resolver shared by the review-loop guard (#1528) and merge gate's
 // independence check (#1531); do not grow a second copy.
 //
 // Precedence: a runtime recorded on the job itself (payload effective_runtime)
@@ -20,11 +24,11 @@ import (
 // registry default (agents.runtime, with GetAgent's agent_instances fallback)
 // covers jobs that predate the #1528 recording.
 //
-// ok is false when neither source can name a family (agent absent from the
-// registry with nothing recorded, or an empty registry runtime). Callers
-// protecting a safety property MUST treat !ok as fail-closed: an unknown
-// family that silently counted as "new" would convert the guard into a way to
-// add unlimited reviews.
+// ok is false when no trusted source can name a family: an absent/unregistered
+// agent, an empty native runtime, or an OMP job without successful provider
+// evidence. Callers protecting a safety property MUST treat !ok as fail-closed:
+// an unknown family that silently counted as "new" would convert the guard into
+// a way to add unlimited reviews.
 //
 // SYNTHETIC AGENTS RESOLVE THROUGH THEIR PARENT (#2004). Temp and ephemeral
 // agents are deliberately absent from the registry, so the three tiers above
@@ -37,35 +41,68 @@ import (
 // 6 naming agents that are simply not registered, neither of which has a parent
 // to recover.
 func ResolveRuntimeFamily(ctx context.Context, store *db.Store, jobID string, agentName string, recordedRuntime string) (family string, ok bool, err error) {
-	family, ok, err = resolveRuntimeFamilyDirect(ctx, store, jobID, agentName, recordedRuntime)
-	if ok || err != nil {
+	family, ok, resolvedRuntime, err := resolveRuntimeFamilyDirect(ctx, store, jobID, agentName, recordedRuntime)
+	if ok || err != nil || resolvedRuntime {
 		return family, ok, err
 	}
 	return resolveRuntimeFamilyViaParent(ctx, store, jobID, agentName)
 }
 
-// resolveRuntimeFamilyDirect is the three-tier resolution that does not leave
-// the job it is asked about.
-func resolveRuntimeFamilyDirect(ctx context.Context, store *db.Store, jobID string, agentName string, recordedRuntime string) (family string, ok bool, err error) {
+// resolveRuntimeFamilyDirect resolves only the job it is asked about.
+// resolvedRuntime distinguishes "no runtime evidence; parent recovery may help"
+// from "OMP ran, but its successful upstream-provider evidence is missing".
+// The latter is terminal: inheriting a parent's provider would manufacture
+// execution evidence for a different job.
+func resolveRuntimeFamilyDirect(ctx context.Context, store *db.Store, jobID string, agentName string, recordedRuntime string) (family string, ok bool, resolvedRuntime bool, err error) {
+	runtimeName, ok, err := resolveRuntimeNameDirect(ctx, store, jobID, agentName, recordedRuntime)
+	if err != nil || !ok {
+		return "", false, false, err
+	}
+	if runtimeName != runtime.OmpRuntime {
+		return runtimeName, true, true, nil
+	}
+	if strings.TrimSpace(jobID) == "" {
+		// A prospective OMP dispatch has only registry/runtime and requested-model
+		// data. Neither proves which provider will execute, so native fan-out must
+		// leave it unresolved; an explicit review can run and record real evidence.
+		return "", false, true, nil
+	}
+	if store == nil || strings.TrimSpace(agentName) == "" {
+		return "", false, true, nil
+	}
+	provider, err := store.JobRecordedProvider(ctx, jobID, agentName)
+	if err != nil {
+		return "", false, true, err
+	}
+	provider = normalizeRuntimeFamily(provider)
+	if provider == "" {
+		return "", false, true, nil
+	}
+	return ompProviderRuntimeFamily(provider), true, true, nil
+}
+
+// ompProviderRuntimeFamily preserves the native family for OMP routes that use
+// the same upstream provider as a native adapter. The wrapper is still recorded
+// as effective_runtime=omp; only the independence comparison is canonicalized.
+// Unknown providers stay namespaced so an unrelated native runtime name cannot
+// collide with an operator-defined OMP provider.
+func ompProviderRuntimeFamily(provider string) string {
+	switch provider = normalizeRuntimeFamily(provider); provider {
+	case "anthropic":
+		return runtime.ClaudeRuntime
+	case "kimi-code":
+		return runtime.KimiRuntime
+	case "openai", "openai-codex":
+		return runtime.CodexRuntime
+	default:
+		return runtime.OmpRuntime + ":" + provider
+	}
+}
+
+func resolveRuntimeNameDirect(ctx context.Context, store *db.Store, jobID string, agentName string, recordedRuntime string) (runtimeName string, ok bool, err error) {
 	if recorded := normalizeRuntimeFamily(recordedRuntime); recorded != "" {
 		return recorded, true, nil
 	}
-	// THE APPEND-ONLY TIER (#1534), consulted before the registry default and
-	// after the payload field.
-	//
-	// Ordered that way on purpose. The payload field, when present, is written by
-	// the same run-phase step that writes the event, so the two agree and reading
-	// the payload first costs no query. When the payload field is ABSENT - 1,813
-	// jobs on the live store carry a runtime event and no payload field - the
-	// registry default is a GUESS about what the agent usually runs, and it is
-	// measurably wrong: 56 review and implement jobs have an override event whose
-	// runtime differs from their agent's registered default, so resolving them
-	// through the registry attributes the execution to a family that did not run
-	// it. Agent `lead` defaults to claude; several of those ran on codex.
-	//
-	// It reads the event COLUMN, never the message. #1534 forbids parsing the
-	// prose, and this campaign has already filed a defect about a pattern that
-	// silently matched nothing.
 	name := strings.TrimSpace(agentName)
 	if jobID != "" && name != "" && store != nil {
 		recorded, readErr := store.JobRecordedRuntime(ctx, jobID, name)
@@ -76,7 +113,7 @@ func resolveRuntimeFamilyDirect(ctx context.Context, store *db.Store, jobID stri
 			return family, true, nil
 		}
 	}
-	if name == "" {
+	if name == "" || store == nil {
 		return "", false, nil
 	}
 	agent, err := store.GetAgent(ctx, name)
@@ -193,12 +230,15 @@ func resolveRuntimeFamilyViaParent(ctx context.Context, store *db.Store, jobID s
 		if parentAgent == "" {
 			return "", false, nil
 		}
-		family, ok, err := resolveRuntimeFamilyDirect(ctx, store, currentJobID, parentAgent, "")
+		family, ok, resolvedRuntime, err := resolveRuntimeFamilyDirect(ctx, store, currentJobID, parentAgent, "")
 		if err != nil {
 			return "", false, err
 		}
 		if ok {
 			return family, true, nil
+		}
+		if resolvedRuntime {
+			return "", false, nil
 		}
 		name = parentAgent
 	}

@@ -14,6 +14,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
 const (
@@ -2859,11 +2860,16 @@ func (g PolicyMergeGate) sameRuntimeFamilyAsImplementer(ctx context.Context, rev
 	}
 	if !ok {
 		reason := fmt.Sprintf(
-			"runtime family unresolved for reviewer %q, so cross-family independence cannot be shown; register the agent with a runtime, or re-run the review on an agent whose runtime is recorded",
+			"runtime or verified upstream-provider family unresolved for reviewer %q, so cross-family independence cannot be shown; register the agent with a runtime, or re-run the review through a job that records successful execution evidence",
 			reviewer)
 		g.recordFamilyUnresolved(ctx, reviewJobID, reason)
 		return true, reason, nil
 	}
+	reviewerRuntimeName, reviewerRuntimeOK, err := resolveRuntimeNameDirect(ctx, g.Store, reviewJobID, reviewer, reviewerRuntime)
+	if err != nil {
+		return false, "", err
+	}
+	reviewerRanOnOmp := reviewerRuntimeOK && reviewerRuntimeName == runtime.OmpRuntime
 	names := make([]string, 0, len(implementers))
 	for name := range implementers {
 		names = append(names, name)
@@ -2871,17 +2877,20 @@ func (g PolicyMergeGate) sameRuntimeFamilyAsImplementer(ctx context.Context, rev
 	sort.Strings(names)
 	for _, name := range names {
 		identity := implementers[name]
-		// THE SAME DOMAIN EXCLUSION, ON THE IMPLEMENTER SIDE. A role-attributed
-		// implementer (#1916) is a human session, not a runtime agent, so it has no
-		// family to share and comparing one is the same category error as on the
-		// reviewer side. Keyed on the recorded flag, never on an empty family,
-		// because an unregistered AGENT implementer looks identical and must keep
-		// failing closed.
-		//
-		// A role that implemented and then approved its own work is still refused:
-		// the caller tests implementingAgents[reviewer] by name before reaching
-		// here, and both sides normalize to the same role string.
+		// Native reviewer behavior stays unchanged for in-session attribution:
+		// roles are not runtime agents. An OMP-routed approval is different because
+		// its independence claim is specifically about the upstream provider. A
+		// role-only implementation row carries no successful runtime/provider
+		// evidence, so accepting it would let an unrecorded same-provider
+		// implementation self-ratify.
 		if identity.FromActingRole {
+			if reviewerRanOnOmp {
+				reason := fmt.Sprintf(
+					"verified upstream-provider family is unavailable for in-session implementer %q, so OMP reviewer %s cannot prove cross-family independence",
+					name, reviewer)
+				g.recordFamilyUnresolved(ctx, reviewJobID, reason)
+				return true, reason, nil
+			}
 			continue
 		}
 		family, ok, err := ResolveRuntimeFamily(ctx, g.Store, identity.JobID, name, identity.RecordedRuntime)
@@ -2890,7 +2899,7 @@ func (g PolicyMergeGate) sameRuntimeFamilyAsImplementer(ctx context.Context, rev
 		}
 		if !ok {
 			reason := fmt.Sprintf(
-				"runtime family unresolved for implementer %q, so cross-family independence cannot be shown; register the agent with a runtime, or record the runtime the implement job ran on",
+				"runtime or verified upstream-provider family unresolved for implementer %q, so cross-family independence cannot be shown; register the agent with a runtime, or record successful execution evidence for the implement job",
 				name)
 			g.recordFamilyUnresolved(ctx, reviewJobID, reason)
 			return true, reason, nil

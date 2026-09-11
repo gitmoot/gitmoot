@@ -2012,6 +2012,7 @@ type fakeDelivery struct {
 	inputTokens           []int
 	outputTokens          []int
 	cumulative            []bool
+	providers             []string
 	prompts               []string
 	models                []string
 	efforts               []string
@@ -2082,6 +2083,9 @@ func (f *fakeDelivery) Deliver(_ context.Context, agent runtime.Agent, job runti
 	}
 	if index < len(f.cumulative) {
 		result.CumulativeUsage = f.cumulative[index]
+	}
+	if index < len(f.providers) {
+		result.UpstreamProvider = f.providers[index]
 	}
 	return result, nil
 }
