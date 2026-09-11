@@ -1657,8 +1657,16 @@ func wrapReadOnlyAdapterRunner(runtimeName string, adapter workflow.DeliveryAdap
 	case *runtime.KimiAdapter:
 		a.Runner = wrap(a.Runner)
 		return a, nil
-	case runtime.OmpAdapter, *runtime.OmpAdapter:
-		return nil, errors.New("read-only seats cannot use omp without an isolated credential broker")
+	case runtime.OmpAdapter:
+		// #1817: omp was the only runtime refused here. The sandbox wrap is the
+		// same for it as for its siblings; what omp needed was a state policy
+		// that stages NO credential and a broker-mode precondition, which
+		// readOnlyOmpSeatStatePolicy now enforces before a seat is built.
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	case *runtime.OmpAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
 	case runtime.ShellAdapter:
 		a.Runner = wrap(a.Runner)
 		return a, nil
@@ -2211,7 +2219,15 @@ func readOnlySeatStatePolicyForRuntime(runtimeName string, userHome string, gate
 	case runtime.ShellRuntime:
 		return readOnlySeatStatePolicy{}, false, nil
 	case runtime.OmpRuntime:
-		return readOnlySeatStatePolicy{}, false, errors.New("read-only seats cannot use omp without an isolated credential broker")
+		// #1817. The refusal that used to live here named a broker as the missing
+		// prerequisite; readOnlyOmpSeatStatePolicy requires exactly that and
+		// stages no credential, so a read-only omp seat is now possible and an
+		// unconfigured one still refuses - with a remedy in the message.
+		policy, err := readOnlyOmpSeatStatePolicy(userHome, ompBrokerEnvLookup)
+		if err != nil {
+			return readOnlySeatStatePolicy{}, false, err
+		}
+		return policy, true, nil
 	default:
 		return readOnlySeatStatePolicy{}, false, fmt.Errorf("read-only seat runtime %q has no isolated state policy", runtimeName)
 	}
@@ -2576,6 +2592,19 @@ func readOnlyRuntimeBaseEnv(runtimeName string, environ []string, githubDir stri
 		allowed["CLAUDE_CONFIG_DIR"] = struct{}{}
 	case runtime.CodexRuntime:
 		allowed["CODEX_HOME"] = struct{}{}
+	case runtime.OmpRuntime:
+		// #1817: omp authenticates through its broker, and the pair is what a
+		// read-only seat is allowed to carry INSTEAD of a credential. This is
+		// the per-runtime env site the policy comment names, so the broker
+		// bearer reaches the seat the same way CLAUDE_CONFIG_DIR does, and the
+		// claude runtime-auth overlay stays claude-only by policy.
+		//
+		// The pair passes through from the daemon environment rather than being
+		// synthesised here: the operator exports it once, readOnlyOmpSeatStatePolicy
+		// refuses the dispatch when it is absent, and nothing in the seat's env
+		// carries a provider key.
+		allowed[ompAuthBrokerURLEnv] = struct{}{}
+		allowed[ompAuthBrokerTokenEnv] = struct{}{}
 	}
 	base := make([]string, 0, len(environ)+2)
 	for _, entry := range environ {

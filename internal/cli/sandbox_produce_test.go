@@ -951,15 +951,38 @@ func TestStageReadOnlyRuntimeCredentialCopiesOnlyProviderSection(t *testing.T) {
 	}
 }
 
-func TestWrapReadOnlySandboxAdapterRejectsOmpWithoutCredentialBroker(t *testing.T) {
+// TestWrapReadOnlySandboxAdapterOmpRequiresBrokerMode replaces the test that
+// pinned omp's categorical refusal (#1817). The old assertion said a read-only
+// omp seat is rejected, full stop; that was the defect, not the contract. What
+// survives is the fail-closed half, so both arms are asserted here: refused
+// without broker mode, built with it.
+func TestWrapReadOnlySandboxAdapterOmpRequiresBrokerMode(t *testing.T) {
 	checkout := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	agent := runtime.Agent{Runtime: runtime.OmpRuntime, ReadOnlySeat: true}
+
+	restore := ompBrokerEnvLookup
+	t.Cleanup(func() { ompBrokerEnvLookup = restore })
+
+	ompBrokerEnvLookup = func(string) (string, bool) { return "", false }
 	_, _, err := wrapReadOnlySandboxAdapter(t.TempDir(), agent, checkout, "", runtime.OmpAdapter{})
-	if err == nil || !strings.Contains(err.Error(), "isolated credential broker") {
-		t.Fatalf("omp read-only seat error = %v", err)
+	if err == nil || !strings.Contains(err.Error(), ompAuthBrokerURLEnv) {
+		t.Fatalf("omp read-only seat without broker mode = %v, want a refusal naming %s", err, ompAuthBrokerURLEnv)
+	}
+
+	ompBrokerEnvLookup = func(name string) (string, bool) {
+		switch name {
+		case ompAuthBrokerURLEnv:
+			return "http://127.0.0.1:8765", true
+		case ompAuthBrokerTokenEnv:
+			return "broker-bearer", true
+		}
+		return "", false
+	}
+	if _, _, err := wrapReadOnlySandboxAdapter(t.TempDir(), agent, checkout, "", runtime.OmpAdapter{}); err != nil {
+		t.Fatalf("omp read-only seat WITH broker mode = %v; the seat must build", err)
 	}
 }
 
