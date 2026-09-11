@@ -45,6 +45,10 @@ type RemoteExecConfig struct {
 	// used only for opt-in broker material, never for the provider control key.
 	CredentialGatewayListen string
 	CredentialGatewayURL    string
+	// ExecBackendCost is the compute-dollar cap (#1540). Its zero value denies
+	// every cloud provision, which is why it needs no default: a [remote_exec]
+	// section that sets backend = "remote" without cost keys provisions nothing.
+	ExecBackendCost ExecBackendCostConfig
 }
 
 // DefaultRemoteExecConfig preserves today's behaviour: the local backend.
@@ -126,6 +130,22 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 			case "credential_gateway_url":
 				cfg.CredentialGatewayURL = parsed
 			}
+		case "cost_max_reserved_usd", "cost_per_attempt_usd":
+			parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+			if err != nil {
+				return RemoteExecConfig{}, fmt.Errorf("parse [remote_exec].%s: expected a number: %w", key, err)
+			}
+			if key == "cost_max_reserved_usd" {
+				cfg.ExecBackendCost.MaxReservedUSD = parsed
+			} else {
+				cfg.ExecBackendCost.PerAttemptUSD = parsed
+			}
+		case "cost_max_concurrent":
+			parsed, err := strconv.Atoi(strings.TrimSpace(value))
+			if err != nil {
+				return RemoteExecConfig{}, fmt.Errorf("parse [remote_exec].cost_max_concurrent: expected an integer: %w", err)
+			}
+			cfg.ExecBackendCost.MaxConcurrent = parsed
 		default:
 			// Ignore unknown keys so the section remains forward-compatible.
 		}
@@ -137,6 +157,9 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 }
 
 func validateRemoteExecConfig(cfg RemoteExecConfig) error {
+	if err := cfg.ExecBackendCost.Validate(); err != nil {
+		return err
+	}
 	backend, err := execbackend.ParseImplemented(cfg.Backend)
 	if err != nil {
 		return fmt.Errorf("unsupported [remote_exec].backend: %w", err)

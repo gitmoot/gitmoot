@@ -67,14 +67,49 @@ func RuntimeRoot(gitmootHome string) string {
 // no component of any source path can be a symlink and nothing resolves outside
 // the boundary. The digest and the copy read the SAME descriptors, so the
 // published name describes the published bytes by construction.
-func StageRuntime(gitmootHome string, name string, executable string) (string, error) {
+// It returns the staged launcher AND THE FULL TRANSITIVE EXEC CLOSURE: every
+// staged launcher this one reaches by exec, nearest first. Callers that sandbox
+// a seat MUST grant every root in that closure (#2141).
+//
+// TRANSITIVE, NOT IMMEDIATE. The launcher is a two-line script that execs the
+// interpreter's own published tree, a SIBLING published root - and that
+// interpreter can itself be a script needing a third. Returning only the
+// immediate interpreter grants two roots out of three and the seat still exits
+// 126, which is what the #2141 review reproduced with an executed test. The
+// slice is empty for a native binary and for a system interpreter, whose roots
+// the sandbox already grants unconditionally.
+func StageRuntime(gitmootHome string, name string, executable string) (string, []string, error) {
+	return stageRuntimeBounded(gitmootHome, name, executable, nil)
+}
+
+// maxInterpreterChain bounds the interpreter recursion. A real chain is one or
+// two links (a script run by node, or by a wrapper that is itself a script);
+// eight is far past anything a runtime ships and still small enough that the
+// refusal is obviously a defect in the artifact rather than a limit anyone hits.
+const maxInterpreterChain = 8
+
+// stageRuntimeBounded carries the chain of executables already being staged, so
+// the interpreter recursion cannot run forever.
+//
+// WHY THIS EXISTS (#2141 review, P2). The recursion had no visited set and no
+// depth bound. A self-referential shebang, or two scripts naming each other,
+// recursed until Go's stack overflowed - and a stack overflow is a FATAL error
+// that kills the whole process, so one malformed runtime on disk would take
+// down the daemon and every job running in it, not just the seat that staged
+// it. The reviewer reproduced both shapes against this source with a timeout
+// guard; neither returned.
+//
+// The cycle check is keyed on the RESOLVED executable path, which is what the
+// recursion actually revisits: two different names can resolve to one file, and
+// that is exactly the self-loop case.
+func stageRuntimeBounded(gitmootHome string, name string, executable string, chain []string) (string, []string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" || strings.ContainsAny(name, `/\`) || name == "." || name == ".." {
-		return "", fmt.Errorf("%w: %q is not usable as one path component", ErrRuntimeNotStageable, name)
+		return "", nil, fmt.Errorf("%w: %q is not usable as one path component", ErrRuntimeNotStageable, name)
 	}
 	executable = strings.TrimSpace(executable)
 	if executable == "" || !filepath.IsAbs(executable) {
-		return "", fmt.Errorf("%w: executable %q must be an absolute path", ErrRuntimeNotStageable, executable)
+		return "", nil, fmt.Errorf("%w: executable %q must be an absolute path", ErrRuntimeNotStageable, executable)
 	}
 	// The RESOLVED target is what runs, and it is what must be copied: a PATH
 	// entry is frequently a symlink into a versioned directory (claude ships
@@ -82,30 +117,44 @@ func StageRuntime(gitmootHome string, name string, executable string) (string, e
 	// copying the link would stage something unrunnable.
 	resolved, err := filepath.EvalSymlinks(executable)
 	if err != nil {
-		return "", fmt.Errorf("%w: resolve %q: %v", ErrRuntimeNotStageable, executable, err)
+		return "", nil, fmt.Errorf("%w: resolve %q: %v", ErrRuntimeNotStageable, executable, err)
 	}
+	for _, seen := range chain {
+		if seen == resolved {
+			return "", nil, fmt.Errorf("%w: interpreter chain revisits %q, so it cannot terminate", ErrRuntimeNotStageable, resolved)
+		}
+	}
+	if len(chain) >= maxInterpreterChain {
+		return "", nil, fmt.Errorf("%w: interpreter chain for %q exceeds %d links", ErrRuntimeNotStageable, resolved, maxInterpreterChain)
+	}
+	chain = append(append([]string(nil), chain...), resolved)
 	boundary, relative, packaged := runtimeBoundary(resolved)
 	source, err := openStageSource(boundary, relative, packaged)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	defer source.close()
 
 	fingerprint, err := source.digest()
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	// THE INTERPRETER IS PART OF THE IDENTITY. A script runtime that cannot run
 	// without node is a different artifact when node changes, so the staged
 	// interpreter's own published directory folds into this fingerprint - a
 	// stale launcher can never point at a retired interpreter tree.
-	interpreter, err := source.stageInterpreter(gitmootHome)
+	interpreter, interpreterStaged, nested, err := source.stageInterpreter(gitmootHome, chain)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
+	var closure []string
 	if interpreter != "" {
 		fingerprint = shortDigest(fingerprint + "\x00" + interpreter)
+		if interpreterStaged {
+			closure = append(closure, interpreter)
+		}
+		closure = append(closure, nested...)
 	}
 
 	root := RuntimeRoot(gitmootHome)
@@ -119,14 +168,14 @@ func StageRuntime(gitmootHome string, name string, executable string) (string, e
 
 	if _, err := os.Lstat(published); err == nil {
 		if err := validatePublished(published, name, relative, fingerprint); err != nil {
-			return "", err
+			return "", nil, err
 		}
-		return launcher, nil
+		return launcher, closure, nil
 	}
 	if err := source.publish(root, publishedName, name, relative, interpreter, fingerprint); err != nil {
-		return "", err
+		return "", nil, err
 	}
-	return launcher, nil
+	return launcher, closure, nil
 }
 
 // RuntimeInterpreter reports the interpreter a staged entrypoint needs, and the

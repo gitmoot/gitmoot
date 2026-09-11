@@ -28,7 +28,7 @@ func TestCollectDoesNotRemoveStagedRuntimes(t *testing.T) {
 	if err := os.WriteFile(source, []byte("#!/bin/sh\nprintf 'tool-ran\\n'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	staged, err := StageRuntime(home, "tool", source)
+	staged, _, err := StageRuntime(home, "tool", source)
 	if err != nil {
 		t.Fatal(err)
 	}

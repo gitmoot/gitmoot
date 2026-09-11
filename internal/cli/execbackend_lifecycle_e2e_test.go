@@ -1102,7 +1102,11 @@ func writeRemoteLifecycleConfig(t *testing.T, paths config.Paths, baseURL string
 	if err != nil {
 		t.Fatal(err)
 	}
-	content := fmt.Sprintf("\n[remote_exec]\nbackend = \"remote\"\ne2b_api_key_file = %q\ne2b_template = \"template-GITMOOT-IMPL\"\n", keyFile)
+	// A cost cap is now REQUIRED for any remote provision (#1540): an unset cap
+	// denies rather than permitting unlimited spend, so this E2E must name one
+	// the way a real deployment enabling cloud has to. The values are a
+	// disposable ceiling for the fake provider, not a spend authorisation.
+	content := fmt.Sprintf("\n[remote_exec]\nbackend = \"remote\"\ne2b_api_key_file = %q\ne2b_template = \"template-GITMOOT-IMPL\"\ncost_max_reserved_usd = 25.0\ncost_per_attempt_usd = 0.5\n", keyFile)
 	if baseURL != "" {
 		content += fmt.Sprintf("e2b_base_url = %q\n", baseURL)
 	}

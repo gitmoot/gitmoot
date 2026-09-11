@@ -2012,7 +2012,7 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	// Runtime executables are staged beside the Go toolchain and exposed by
 	// fingerprint-local shims. Grant the PUBLISHED roots the daemon owns, never
 	// the operator PATH roots they were copied from (#1921, ruling 122157).
-	stagedRuntimes, runtimeDiagnostics, err := stageSeatRuntimes(paths)
+	stagedRuntimes, runtimeInterpreters, runtimeDiagnostics, err := stageSeatRuntimes(paths)
 	if err != nil {
 		return grants, err
 	}
@@ -2041,6 +2041,30 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	grants.runtimeUnavailable = seatRuntimeUnavailable(agent.Runtime, stagedRuntimes, runtimeDiagnostics)
 	for _, shim := range stagedRuntimes {
 		root, err := toolchain.StagedRuntimeRoot(paths.Home, shim)
+		if err != nil {
+			return grants, err
+		}
+		if err := validateStagedToolchainPlacement(root, grants.writes); err != nil {
+			return grants, err
+		}
+		grants.reads = append(grants.reads, root)
+	}
+	// THE EXEC CLOSURE, NOT THE DISPATCH LIST (#2141). seatRuntimeNames
+	// enumerates what the engine can DISPATCH - claude, kimi, codex - and its
+	// own comment says so: "derived from what the engine can start". A script
+	// runtime is not started, it is EXEC'd by an interpreter, and staging
+	// publishes that interpreter into a SIBLING root. The loop above grants
+	// each launcher's own root, so before this the codex launcher was granted
+	// and the node tree it execs was not: the seat received an engine-staged
+	// command it was forbidden to run, and reported exit 126 with no finding.
+	//
+	// Granting RuntimeRoot(paths.Home) wholesale would also fix it and is
+	// refused: that hands a seat exec over every staged runtime including the
+	// ones no dispatch decision chose, which is the widening #1878 and #1921
+	// spent three rounds narrowing away from. Grant exactly what the launcher
+	// execs.
+	for _, interpreter := range runtimeInterpreters {
+		root, err := toolchain.StagedRuntimeRoot(paths.Home, interpreter)
 		if err != nil {
 			return grants, err
 		}

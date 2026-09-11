@@ -57,7 +57,7 @@ func TestStageSeatRuntimesStagesAScriptRuntimesInterpreter(t *testing.T) {
 	t.Setenv("PATH", strings.Join([]string{launcherDir, interpreterDir, "/usr/bin", "/bin"}, string(os.PathListSeparator)))
 
 	paths := config.PathsForHome(t.TempDir())
-	commands, diagnostics, err := stageSeatRuntimes(paths)
+	commands, _, diagnostics, err := stageSeatRuntimes(paths)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestStageSeatRuntimesLeavesSystemInterpretersAlone(t *testing.T) {
 	t.Setenv("PATH", strings.Join([]string{launcherDir, "/usr/bin", "/bin"}, string(os.PathListSeparator)))
 
 	paths := config.PathsForHome(t.TempDir())
-	commands, diagnostics, err := stageSeatRuntimes(paths)
+	commands, _, diagnostics, err := stageSeatRuntimes(paths)
 	if err != nil {
 		t.Fatal(err)
 	}
