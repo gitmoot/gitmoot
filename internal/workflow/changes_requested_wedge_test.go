@@ -175,16 +175,20 @@ func TestApprovalAtSupersededHeadLeavesChangesRequested(t *testing.T) {
 	// A re-review is already open at the newer head; it has not reported yet.
 	seedReviewJob(t, store, "review-pending", "auditor", "head-new", "", JobRunning)
 
-	if err := engine.AdvanceJob(ctx, "review-stale"); err != nil {
-		t.Fatalf("AdvanceJob returned error: %v", err)
+	// The hold is now RETRYABLE (#2150), so it surfaces as an error and writes no
+	// review_advance_held row: the caller's recordAdvanceRetryOnce carries the
+	// message on a single deduped advance_retry marker instead. What must not
+	// change is the DECISION - the objection stands and nothing merges.
+	err := engine.AdvanceJob(ctx, "review-stale")
+	if err == nil {
+		t.Fatal("AdvanceJob returned nil; a head mismatch must be held as retryable rather than settled, or a stale observed head wedges a current approval forever")
+	}
+	if !strings.Contains(err.Error(), "superseded head") {
+		t.Fatalf("hold error = %v, want it to name the superseded head; a silent no-op is what hid #1834", err)
 	}
 	assertTaskState(t, store, "task-9", TaskChangesRequested)
 	if len(gh.merges) != 0 {
 		t.Fatalf("merge calls = %d, want 0: a superseded approval must not merge", len(gh.merges))
-	}
-	reason := heldReason(t, store, "review-stale")
-	if !strings.Contains(reason, "superseded head") {
-		t.Fatalf("held reason = %q, want it to name the superseded head; a silent no-op is what hid #1834", reason)
 	}
 }
 

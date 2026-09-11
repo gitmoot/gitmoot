@@ -957,9 +957,16 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 					// a row per tick is what grew job_events to ~1.8M rows once before.
 					return fmt.Errorf("review approval held: %s", held)
 				}
-				// TERMINAL: a superseded head or a live objection at the current head.
-				// Nothing will change without a new review or a new head, so settle it
-				// with a durable reason instead of retrying forever.
+				// TERMINAL: a live objection at the current head, or an approval with
+				// no head at all. Nothing will change without a new review, so settle
+				// it with a durable reason instead of retrying forever.
+				//
+				// A HEAD MISMATCH IS NO LONGER TERMINAL (#2150). It used to be settled
+				// here, which wedged approvals whose head was actually CURRENT while
+				// the observed row still held the previous one - the normal ordering
+				// when a review finishes inside one poll interval. It is retryable
+				// above now, and a genuinely superseded approval still never admits,
+				// because the head comparison runs again on each re-evaluation.
 				return e.Store.AddJobEvent(ctx, db.JobEvent{
 					JobID:   job.ID,
 					Kind:    "review_advance_held",

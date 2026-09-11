@@ -535,9 +535,35 @@ func (e Engine) approvalSupersedesChangesRequested(ctx context.Context, payload 
 			payload.Repo, payload.PullRequest), true, nil
 	}
 	if approvingHead != currentHead {
+		// RETRYABLE, NOT SETTLED (#2150). The comparison is sound; the INPUT can be
+		// stale, and settling a stale answer is what wedged two consecutive
+		// approvals on gitmoot/gitmoot#2146.
+		//
+		// `pull_requests.head_sha` is maintained by the repo poll, so a review that
+		// finishes before its repo's next poll sees the PREVIOUS head here. Measured
+		// on that PR, twice in a row: round three approved 946b49de while this read
+		// b5317e68, and round four approved 1c1e0793 while this read 946b49de. Both
+		// times the approving head was the CURRENT one and the cached head was the
+		// superseded one - the comparison was effectively inverted.
+		//
+		// Settling wrote `advance_completed`, and retryPendingJobAdvancements only
+		// re-fires jobs whose latest marker is `advance_retry`, so nothing ever
+		// re-evaluated: the task stayed `changes_requested` across two approvals,
+		// its head kept a pending gitmoot/merge-gate status, and the pull request
+		// reported `mergeable_state: unstable` on green checks with no exit. On this
+		// fleet a review routinely completes inside one poll interval, so that is
+		// the normal ordering rather than a rare race.
+		//
+		// This is the SAME reasoning the missing-row hold above already applies, and
+		// the same shape: a hold that is correct at this instant and wrong to commit
+		// to. A genuinely superseded approval is unaffected - the head comparison
+		// runs again on every retry and still refuses, so it can never approve the
+		// wrong head; it simply re-reads one row per tick instead of being recorded
+		// as finished. recordAdvanceRetryOnce keeps a single `advance_retry` row and
+		// refreshes its message, so retries do not grow the event log.
 		return false, fmt.Sprintf(
-			"approval is bound to head %s but the pull request's current head is %s; an approval at a superseded head does not clear changes_requested",
-			approvingHead, currentHead), false, nil
+			"approval is bound to head %s but the observed pull request head is %s; holding until the observed head catches up, because an approval at a genuinely superseded head must not clear changes_requested",
+			approvingHead, currentHead), true, nil
 	}
 	jobs, err := e.Store.ListJobs(ctx)
 	if err != nil {
