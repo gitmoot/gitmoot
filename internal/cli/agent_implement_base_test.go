@@ -413,7 +413,7 @@ func TestResolveLocalAgentRepoPreservesRegisteredDefaultBranch(t *testing.T) {
 	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: checkout, PollInterval: "30s"}); err != nil {
 		t.Fatalf("UpsertRepo: %v", err)
 	}
-	_, record, err := resolveLocalAgentRepo(ctx, store, "owner/repo")
+	_, record, _, _, err := resolveLocalAgentRepo(ctx, store, "owner/repo", subprocess.ExecRunner{})
 	if err != nil {
 		t.Fatalf("resolveLocalAgentRepo: %v", err)
 	}
@@ -422,6 +422,124 @@ func TestResolveLocalAgentRepoPreservesRegisteredDefaultBranch(t *testing.T) {
 	}
 	if branch, err := (gitutil.NewHostClient(checkout)).CurrentBranch(ctx); err != nil || branch != "feature/stale" {
 		t.Fatalf("checkout branch = %q err=%v, want feature/stale", branch, err)
+	}
+}
+
+func TestResolveLocalAgentRepoWithoutFlagUsesCheckoutBranchWithoutChangingRegisteredDefault(t *testing.T) {
+	ctx := context.Background()
+	checkout := t.TempDir()
+	runGit(t, checkout, "init")
+	runGit(t, checkout, "config", "user.email", "gitmoot@example.com")
+	runGit(t, checkout, "config", "user.name", "Gitmoot Test")
+	writeFile(t, filepath.Join(checkout, "README.md"), "main\n")
+	runGit(t, checkout, "add", "README.md")
+	runGit(t, checkout, "commit", "-m", "initial")
+	runGit(t, checkout, "branch", "-m", "main")
+	runGit(t, checkout, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	runGit(t, checkout, "update-ref", "refs/remotes/origin/main", "HEAD")
+	runGit(t, checkout, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+	runGit(t, checkout, "switch", "-c", "feature/local")
+	store := openCLIJobStore(t, t.TempDir())
+	defer store.Close()
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: checkout}); err != nil {
+		t.Fatalf("UpsertRepo: %v", err)
+	}
+	t.Chdir(checkout)
+
+	_, record, dispatchBranch, persistDefaultBranch, err := resolveLocalAgentRepo(ctx, store, "", subprocess.ExecRunner{})
+	if err != nil {
+		t.Fatalf("resolveLocalAgentRepo: %v", err)
+	}
+	if dispatchBranch != "feature/local" {
+		t.Fatalf("dispatch branch = %q, want current checkout branch feature/local", dispatchBranch)
+	}
+	if record.DefaultBranch != "main" {
+		t.Fatalf("resolved repo-wide default branch = %q, want main", record.DefaultBranch)
+	}
+	if err := upsertLocalAgentRepo(ctx, store, record, persistDefaultBranch); err != nil {
+		t.Fatalf("upsertLocalAgentRepo: %v", err)
+	}
+	stored, err := store.GetRepo(ctx, "owner/repo")
+	if err != nil || stored.DefaultBranch != "main" {
+		t.Fatalf("stored default branch = %q, err=%v, want main", stored.DefaultBranch, err)
+	}
+}
+
+func TestResolveLocalAgentRepoWithoutFlagPersistsRemoteDefaultForUnregisteredRepo(t *testing.T) {
+	ctx := context.Background()
+	checkout := t.TempDir()
+	runGit(t, checkout, "init")
+	runGit(t, checkout, "config", "user.email", "gitmoot@example.com")
+	runGit(t, checkout, "config", "user.name", "Gitmoot Test")
+	writeFile(t, filepath.Join(checkout, "README.md"), "main\n")
+	runGit(t, checkout, "add", "README.md")
+	runGit(t, checkout, "commit", "-m", "initial")
+	runGit(t, checkout, "branch", "-m", "main")
+	runGit(t, checkout, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	runGit(t, checkout, "update-ref", "refs/remotes/origin/main", "HEAD")
+	runGit(t, checkout, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+	runGit(t, checkout, "switch", "-c", "feature/local")
+	store := openCLIJobStore(t, t.TempDir())
+	defer store.Close()
+	t.Chdir(checkout)
+
+	_, record, dispatchBranch, persistDefaultBranch, err := resolveLocalAgentRepo(ctx, store, "", subprocess.ExecRunner{})
+	if err != nil {
+		t.Fatalf("resolveLocalAgentRepo: %v", err)
+	}
+	if dispatchBranch != "feature/local" {
+		t.Fatalf("dispatch branch = %q, want current checkout branch feature/local", dispatchBranch)
+	}
+	if record.DefaultBranch != "main" {
+		t.Fatalf("resolved repo-wide default branch = %q, want remote main", record.DefaultBranch)
+	}
+	if !persistDefaultBranch {
+		t.Fatal("remote-derived default branch was marked unsafe to persist")
+	}
+	if err := upsertLocalAgentRepo(ctx, store, record, persistDefaultBranch); err != nil {
+		t.Fatalf("upsertLocalAgentRepo: %v", err)
+	}
+	stored, err := store.GetRepo(ctx, "owner/repo")
+	if err != nil || stored.DefaultBranch != "main" {
+		t.Fatalf("stored default branch = %q, err=%v, want remote main", stored.DefaultBranch, err)
+	}
+}
+
+func TestResolveLocalAgentRepoWithoutFlagDoesNotPersistCheckoutFallback(t *testing.T) {
+	ctx := context.Background()
+	checkout := t.TempDir()
+	runGit(t, checkout, "init")
+	runGit(t, checkout, "config", "user.email", "gitmoot@example.com")
+	runGit(t, checkout, "config", "user.name", "Gitmoot Test")
+	writeFile(t, filepath.Join(checkout, "README.md"), "main\n")
+	runGit(t, checkout, "add", "README.md")
+	runGit(t, checkout, "commit", "-m", "initial")
+	runGit(t, checkout, "branch", "-m", "main")
+	runGit(t, checkout, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	runGit(t, checkout, "switch", "-c", "feature/local")
+	store := openCLIJobStore(t, t.TempDir())
+	defer store.Close()
+	t.Chdir(checkout)
+
+	_, record, dispatchBranch, persistDefaultBranch, err := resolveLocalAgentRepo(ctx, store, "", subprocess.ExecRunner{})
+	if err != nil {
+		t.Fatalf("resolveLocalAgentRepo: %v", err)
+	}
+	if dispatchBranch != "feature/local" {
+		t.Fatalf("dispatch branch = %q, want current checkout branch feature/local", dispatchBranch)
+	}
+	if record.DefaultBranch != "feature/local" {
+		t.Fatalf("resolved fallback branch = %q, want feature/local", record.DefaultBranch)
+	}
+	if persistDefaultBranch {
+		t.Fatal("current-branch fallback was marked safe to persist")
+	}
+	if err := upsertLocalAgentRepo(ctx, store, record, persistDefaultBranch); err != nil {
+		t.Fatalf("upsertLocalAgentRepo: %v", err)
+	}
+	stored, err := store.GetRepo(ctx, "owner/repo")
+	if err != nil || stored.DefaultBranch != "" {
+		t.Fatalf("stored default branch = %q, err=%v, want empty", stored.DefaultBranch, err)
 	}
 }
 
@@ -439,7 +557,7 @@ func TestResolveLocalAgentRepoSelfHealsDanglingCheckoutForImplementBase(t *testi
 	}
 	runGit(t, primary, "worktree", "remove", "--force", linked)
 
-	_, record, err := resolveLocalAgentRepo(ctx, store, "owner/repo")
+	_, record, _, _, err := resolveLocalAgentRepo(ctx, store, "owner/repo", subprocess.ExecRunner{})
 	if err != nil {
 		t.Fatalf("resolveLocalAgentRepo: %v", err)
 	}
@@ -474,7 +592,7 @@ func TestResolveLocalAgentRepoSelfHealsNonGitCheckout(t *testing.T) {
 		t.Fatalf("recreate non-git checkout directory: %v", err)
 	}
 
-	_, record, err := resolveLocalAgentRepo(ctx, store, "owner/repo")
+	_, record, _, _, err := resolveLocalAgentRepo(ctx, store, "owner/repo", subprocess.ExecRunner{})
 	if err != nil {
 		t.Fatalf("resolveLocalAgentRepo: %v", err)
 	}
@@ -500,7 +618,7 @@ func TestResolveLocalAgentRepoLeavesValidLinkedCheckoutRegistered(t *testing.T) 
 		t.Fatalf("UpsertRepoForce: %v", err)
 	}
 
-	_, record, err := resolveLocalAgentRepo(ctx, store, "owner/repo")
+	_, record, _, _, err := resolveLocalAgentRepo(ctx, store, "owner/repo", subprocess.ExecRunner{})
 	if err != nil {
 		t.Fatalf("resolveLocalAgentRepo: %v", err)
 	}

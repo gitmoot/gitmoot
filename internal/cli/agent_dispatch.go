@@ -240,7 +240,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if err := validateAndTouchActingOrgRole(ctx, store, request.Home, request.ActingOrgRole, request.ExecutionPath); err != nil {
 		return localAgentJobOutput{}, err
 	}
-	repo, record, err := resolveLocalAgentRepo(ctx, store, request.RepoFlag)
+	repo, record, dispatchBranch, persistDefaultBranch, err := resolveLocalAgentRepo(ctx, store, request.RepoFlag, localDispatchJobRunner(request))
 	if err != nil {
 		return localAgentJobOutput{}, err
 	}
@@ -309,7 +309,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			request.ImplementPRValidated = true
 		}
 	}
-	if err := store.UpsertRepo(ctx, record); err != nil {
+	if err := upsertLocalAgentRepo(ctx, store, record, persistDefaultBranch); err != nil {
 		return localAgentJobOutput{}, err
 	}
 	var checkoutPath string
@@ -317,7 +317,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if agent, blocked, err := readOnlyManagedImplementationBlock(ctx, store, request, repo.FullName()); err != nil {
 		return localAgentJobOutput{}, err
 	} else if blocked {
-		return enqueuePermissionBlockedLocalAgentJob(ctx, store, request, repo.FullName(), record.DefaultBranch, agent.Name, overrideRuntime, overrideRef, orgPolicy)
+		return enqueuePermissionBlockedLocalAgentJob(ctx, store, request, repo.FullName(), dispatchBranch, agent.Name, overrideRuntime, overrideRef, orgPolicy)
 	}
 	agent, releaseAgentReservation, err := resolveLocalDispatchAgent(ctx, store, request, repo.FullName(), record)
 	if err != nil {
@@ -369,7 +369,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		effectiveAgent.ExecBackend = string(execBackend)
 	}
 	if readOnlyImplementationBlocked(request.Action, effectiveAgent) {
-		return enqueuePermissionBlockedLocalAgentJob(ctx, store, request, repo.FullName(), record.DefaultBranch, agent.Name, overrideRuntime, overrideRef, orgPolicy)
+		return enqueuePermissionBlockedLocalAgentJob(ctx, store, request, repo.FullName(), dispatchBranch, agent.Name, overrideRuntime, overrideRef, orgPolicy)
 	}
 	var foregroundContract *runtime.RuntimeContractResult
 	if !request.Background {
@@ -641,7 +641,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		Agent:            agent.Name,
 		Action:           request.Action,
 		Repo:             repo.FullName(),
-		Branch:           firstNonEmpty(request.Branch, record.DefaultBranch),
+		Branch:           firstNonEmpty(request.Branch, dispatchBranch),
 		PullRequest:      request.PullRequest,
 		PullRequestReady: request.PullRequestReady,
 		HeadSHA:          request.HeadSHA,
@@ -2049,32 +2049,45 @@ func formatManagedAgentTime(value time.Time) string {
 	return value.UTC().Format("2006-01-02T15:04:05.000000000Z")
 }
 
-func resolveLocalAgentRepo(ctx context.Context, store *db.Store, repoFlag string) (github.Repository, db.Repo, error) {
-	repo, err := localAgentTargetRepo(ctx, repoFlag)
+func resolveLocalAgentRepo(ctx context.Context, store *db.Store, repoFlag string, runner subprocess.Runner) (github.Repository, db.Repo, string, bool, error) {
+	repo, err := localAgentTargetRepo(ctx, repoFlag, runner)
 	if err != nil {
-		return github.Repository{}, db.Repo{}, err
+		return github.Repository{}, db.Repo{}, "", false, err
 	}
-	record, err := resolveRepoRecord(ctx, store, repo, ".")
+	record, defaultBranchFromRemote, err := resolveRepoRecordWithDefaultSource(ctx, store, repo, ".", runner)
 	if err != nil {
-		return github.Repository{}, db.Repo{}, err
+		return github.Repository{}, db.Repo{}, "", false, err
 	}
+	dispatchBranch := record.DefaultBranch
+	implicitRepo := strings.TrimSpace(repoFlag) == ""
 	// Without --repo, preserve the historical current-checkout branch selection
 	// for the job payload while retaining the registered/stable checkout path.
-	// This prevents an ephemeral cwd from becoming repo.CheckoutPath without
-	// silently rebasing local ask/review behavior onto the stored default branch.
-	if strings.TrimSpace(repoFlag) == "" {
-		if cwdRecord, _, cwdErr := repoRecordForCheckout(ctx, repo, gitutil.NewHostClient(".")); cwdErr == nil {
-			record.DefaultBranch = cwdRecord.DefaultBranch
+	if implicitRepo {
+		if branch, branchErr := jobGitClient(".", runner).CurrentBranch(ctx); branchErr == nil {
+			dispatchBranch = branch
 		}
 	}
-	return repo, record, nil
+	// Explicit repo selection keeps its established fallback behavior. For an
+	// implicit repo, only an origin/HEAD-derived default is safe to persist:
+	// the separately selected current checkout branch belongs to this job.
+	persistDefaultBranch := !implicitRepo || defaultBranchFromRemote
+	return repo, record, dispatchBranch, persistDefaultBranch, nil
 }
 
-func localAgentTargetRepo(ctx context.Context, repoFlag string) (github.Repository, error) {
+// upsertLocalAgentRepo persists checkout metadata while omitting a
+// current-branch fallback that is not authoritative repository-wide.
+func upsertLocalAgentRepo(ctx context.Context, store *db.Store, record db.Repo, persistDefaultBranch bool) error {
+	if !persistDefaultBranch {
+		record.DefaultBranch = ""
+	}
+	return store.UpsertRepo(ctx, record)
+}
+
+func localAgentTargetRepo(ctx context.Context, repoFlag string, runner subprocess.Runner) (github.Repository, error) {
 	if strings.TrimSpace(repoFlag) != "" {
 		return github.ParseRepository(repoFlag)
 	}
-	remote, err := (gitutil.NewHostClient(".")).OriginRemote(ctx)
+	remote, err := jobGitClient(".", runner).OriginRemote(ctx)
 	if err != nil {
 		return github.Repository{}, fmt.Errorf("infer repo from current checkout: %w", err)
 	}

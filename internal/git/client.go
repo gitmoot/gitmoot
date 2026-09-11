@@ -576,6 +576,11 @@ func (c Client) OriginRemote(ctx context.Context) (string, error) {
 // absent one: callers preserve the previously stored value when this yields
 // nothing, whereas a fabricated "main" would silently overwrite a correct record
 // on any repository that uses a different default.
+//
+// The symbolic ref is a LOCAL cache. Git does not update it when the upstream
+// repository renames its default branch; operators must run
+// `git remote set-head origin -a` in the registered checkout. Until then this
+// method deliberately returns the stale cached name rather than guessing.
 func (c Client) RemoteDefaultBranch(ctx context.Context) (string, error) {
 	result, err := c.run(ctx, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
 	if err != nil {

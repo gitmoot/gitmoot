@@ -1417,6 +1417,13 @@ that is behind `origin/<default>`. The error reports the branch and behind
 count and offers both explicit choices: `--base origin/<default>` or
 `--base HEAD`.
 
+The repository-wide default comes from the registered checkout's local
+`origin/HEAD` symbolic ref. Git does not refresh that ref when the upstream
+repository renames its default branch. Run `git remote set-head origin -a` in
+the registered checkout after such a rename; until then Gitmoot treats the
+cached ref as authoritative and may reconcile `repos.default_branch` back to
+the stale name.
+
 `gitmoot agent run`, `ask`, `implement`, and `review` (and `orchestrate`) accept
 an optional `--model <name>` flag that pins the runtime model for that one job,
 overriding the agent's configured default. It is a free-form, runtime-scoped
