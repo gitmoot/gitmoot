@@ -177,13 +177,25 @@ func TestQueuedJobRuntimeResourceKeyReadOnlySeat(t *testing.T) {
 // a policy fails here rather than at dispatch.
 func TestReadOnlySeatStatePolicyCoversEveryRegisteredRuntime(t *testing.T) {
 	userHome := t.TempDir()
+	restore := ompBrokerEnvLookup
+	t.Cleanup(func() { ompBrokerEnvLookup = restore })
+	ompBrokerEnvLookup = ompBrokerLookup(map[string]string{
+		ompAuthBrokerURLEnv:   "http://127.0.0.1:8765",
+		ompAuthBrokerTokenEnv: "broker-bearer",
+	})
 	for _, name := range runtime.SupportedRuntimes() {
 		t.Run(name, func(t *testing.T) {
 			policy, needsState, err := readOnlySeatStatePolicyFor(name, userHome, false)
 			switch name {
 			case runtime.OmpRuntime:
-				if err == nil {
-					t.Fatal("omp must be refused: it has no isolated credential broker")
+				if err != nil || !needsState {
+					t.Fatalf("omp needsState=%v err=%v, want a broker-backed isolated state policy", needsState, err)
+				}
+				if policy.relativeState != filepath.Join("home", ".omp") {
+					t.Fatalf("omp relativeState=%q, want %q", policy.relativeState, filepath.Join("home", ".omp"))
+				}
+				if policy.credentialFile != "" || len(policy.requiredInputs) != 0 || len(policy.optionalInputs) != 0 {
+					t.Fatalf("omp policy stages owner material: credential=%q required=%v optional=%v", policy.credentialFile, policy.requiredInputs, policy.optionalInputs)
 				}
 				return
 			case runtime.ShellRuntime:

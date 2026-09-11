@@ -430,21 +430,18 @@ func (a OmpAdapter) preflight() error {
 //     parses; without --mode=json omp prints prose and every job fails extraction.
 //   - `--approval-mode` is ALWAYS present, for DETERMINISM: omitting it inherits
 //     whatever tools.approvalMode the host config carries, which is not
-//     deterministic across machines. Its VALUE now comes from the stored
-//     autonomy policy via ompApprovalArgs (#1721); it was a fixed `yolo` for
-//     every policy until then, so a read-only omp agent ran unrestricted.
-//     Read-only maps to always-ask on the measurement recorded at
-//     ompApprovalArgs; every other policy keeps `yolo` byte-identically.
-//     TWO CLAIMS THIS COMMENT USED TO CARRY WERE WRONG AND ARE CORRECTED
-//     AGAINST THE CODE, because a stale rationale is cited as a reason:
-//     the read-only Landlock wrapper does NOT select only claude and kimi -
-//     wrapReadOnlyAdapterRunner in cli/daemon_worker.go wraps claude, codex,
-//     kimi and shell - and it is not true that "no omp process is ever
-//     confined": that switch has an explicit omp arm which REFUSES a read-only
-//     seat outright ("read-only seats cannot use omp without an isolated
-//     credential broker") rather than running it unconfined. The gap this flag
-//     now closes is the case the seat path never reaches: a non-seat omp
-//     dispatch whose stored policy asked for less than yolo.
+//     deterministic across machines. Its VALUE comes from the stored autonomy
+//     policy via ompApprovalArgs (#1721): read-only maps to `always-ask`,
+//     workspace-write maps to `write`, danger-full-access maps to `yolo`, and
+//     auto or an empty stored policy keeps the historical `yolo` behavior.
+//     Gitmoot-side confinement still differs by dispatch path.
+//     readOnlyImplementationBlocked refuses read-only implementation jobs;
+//     broker-backed read-only seats run through wrapReadOnlyAdapterRunner's
+//     Landlock wrapper after their state policy verifies the broker pair and
+//     stages no owner credential material. A non-seat read-only ask or review
+//     reaches neither boundary, so `always-ask` is its direct tool restriction.
+//     Keeping the flag explicit also prevents any path from inheriting the
+//     host's tools.approvalMode.
 //   - `--no-session` keeps the run in memory: no per-worktree session .jsonl
 //     accretion, and nothing to accidentally resume (v1 never resumes).
 //   - the prompt is exactly ONE token after `--`: multiple positionals become

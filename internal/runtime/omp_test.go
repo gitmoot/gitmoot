@@ -3082,14 +3082,13 @@ func TestOmpSummaryIsFinalAssistantTextNotEnvelope(t *testing.T) {
 //
 // THIS TEST PREVIOUSLY ASSERTED THE OPPOSITE - one fixed `--approval-mode=yolo`
 // for every policy - and its stated reason was "read-only is enforced
-// Gitmoot-side, not by omp's approval tier". That reason does not hold for the
-// dispatch #1721 is about. Gitmoot-side enforcement on omp is exactly two
-// things: readOnlyImplementationBlocked, which covers IMPLEMENT jobs only, and
-// the read-only SEAT arm of wrapReadOnlyAdapterRunner, which refuses omp
-// outright ("read-only seats cannot use omp without an isolated credential
-// broker"). Neither reaches a non-seat read-only ask or review, which ran with
-// unrestricted tools. Dropping the flag entirely is still refused, because an
-// absent flag inherits the host's tools.approvalMode.
+// Gitmoot-side, not by omp's approval tier". Gitmoot-side enforcement depends on
+// the dispatch path: readOnlyImplementationBlocked refuses read-only
+// implementation jobs, and a broker-backed read-only seat receives the
+// Landlock wrapper from wrapReadOnlyAdapterRunner. A non-seat read-only ask or
+// review reaches neither boundary, so it needs `always-ask` to restrict OMP's
+// own tools. Dropping the flag entirely is still refused because an absent flag
+// inherits the host's tools.approvalMode.
 func TestOmpPolicyArgs(t *testing.T) {
 	for _, tc := range []struct {
 		policy string
