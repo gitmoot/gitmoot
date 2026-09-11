@@ -156,3 +156,61 @@ func TestReadOnlySeatPolicyForOmpIsReachable(t *testing.T) {
 		t.Fatal("production arm accepted omp with no broker configured")
 	}
 }
+
+// TestReadOnlySeatBaseEnvCarriesTheBrokerPairForOmpOnly drives the function the
+// production seat env is actually built from - readOnlyRuntimeBaseEnv, called at
+// daemon_worker.go:1594 and job_blocker_auth_probe.go:239 with os.Environ().
+//
+// This is the arm a review asked for, and it is the one that would catch the
+// mistake I made first: wiring the pair into readOnlySeatRuntimeAuthEnv, whose
+// outer function returns nil for every non-claude runtime, so the overlay would
+// never have reached the seat. Asserting the POLICY is returned proves nothing
+// about the environment the child process gets.
+//
+// Three properties, and the third is the safety one: the curated allowlist must
+// pass the broker pair for omp, must NOT pass it for another runtime, and must
+// drop provider keys for both.
+func TestReadOnlySeatBaseEnvCarriesTheBrokerPairForOmpOnly(t *testing.T) {
+	environ := []string{
+		"PATH=/usr/bin",
+		"HOME=/home/seat",
+		ompAuthBrokerURLEnv + "=http://127.0.0.1:8765",
+		ompAuthBrokerTokenEnv + "=broker-bearer",
+		"ANTHROPIC_API_KEY=sk-owner-key",
+		"OPENAI_API_KEY=sk-owner-openai",
+	}
+	has := func(entries []string, want string) bool {
+		for _, entry := range entries {
+			if entry == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	ompEnv := readOnlyRuntimeBaseEnv(runtime.OmpRuntime, environ, "/seat/gh")
+	if !has(ompEnv, ompAuthBrokerURLEnv+"=http://127.0.0.1:8765") {
+		t.Errorf("omp seat env lost %s: %v", ompAuthBrokerURLEnv, ompEnv)
+	}
+	if !has(ompEnv, ompAuthBrokerTokenEnv+"=broker-bearer") {
+		t.Errorf("omp seat env lost %s: %v", ompAuthBrokerTokenEnv, ompEnv)
+	}
+
+	// A different runtime must not inherit omp's broker bearer. The allowlist is
+	// per-runtime for exactly this reason.
+	kimiEnv := readOnlyRuntimeBaseEnv(runtime.KimiRuntime, environ, "/seat/gh")
+	if has(kimiEnv, ompAuthBrokerTokenEnv+"=broker-bearer") {
+		t.Errorf("kimi seat env inherited omp's broker token: %v", kimiEnv)
+	}
+
+	// Neither seat may receive a provider key, which is the material the broker
+	// exists to keep off the seat.
+	for name, env := range map[string][]string{"omp": ompEnv, "kimi": kimiEnv} {
+		joined := strings.Join(env, " ")
+		for _, forbidden := range []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "sk-owner"} {
+			if strings.Contains(joined, forbidden) {
+				t.Errorf("%s seat env leaks %q: %v", name, forbidden, env)
+			}
+		}
+	}
+}
