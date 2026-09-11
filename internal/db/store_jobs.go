@@ -2630,23 +2630,40 @@ func annotateJobInsertConflict(jobID string, err error) error {
 	return fmt.Errorf("%w: %q was not written: %v", ErrJobIDConflict, jobID, err)
 }
 
-// listJobWorktreeRefsSQL is one const so the plan assertion tests the query
-// that actually runs. The expression MUST match idx_jobs_worktree_path
-// character for character, or SQLite silently falls back to a full scan that
-// re-parses every payload, which is exactly the cost #2149 removes. A silent
-// fallback is why the test asserts the PLAN and not a duration.
-const listJobWorktreeRefsSQL = `SELECT id, state, updated_at, created_at,
-	CASE WHEN json_valid(payload) THEN json_extract(payload, '$.worktree_path') END
-	FROM jobs
-	WHERE CASE WHEN json_valid(payload) THEN json_extract(payload, '$.worktree_path') END IS NOT NULL
-	  AND CASE WHEN json_valid(payload) THEN json_extract(payload, '$.worktree_path') END <> ''`
-
-// JobWorktreeRef is the minimum needed to answer "does another job still hold
-// this worktree path": identity, finality, and age. Deliberately NOT a Job.
+// listJobWorktreeRefsSQL selects a SUPERSET of the rows whose payload carries
+// a worktree path, using a text prefilter rather than SQL JSON extraction.
 //
-// #2149: the caller used to take whole Jobs and decode every payload to read
-// one string. Returning a narrow row makes that impossible to reintroduce by
-// accident - there is no payload here to decode.
+// #2149 round two: json_extract IS NOT encoding/json, and review proved the
+// difference is a safety bug rather than a curiosity. With
+// {"worktree_path":"","worktree_path":"/live/path"} Go returns "/live/path"
+// (last duplicate wins) while json_extract returns "". With
+// {"WORKTREE_PATH":"/live/path"} Go returns "/live/path" (field matching is
+// case-insensitive) while json_extract returns NULL. Both payloads are valid
+// JSON. A WHERE clause built on json_extract therefore HIDES rows the old
+// decoder saw, and a hidden row is a live co-owner whose worktree gets
+// reclaimed underneath it.
+//
+// So SQL no longer decides what the path IS. It only drops rows that cannot
+// possibly carry one, and the decode below is plain encoding/json, which is
+// the same package and therefore the same duplicate-key and case-folding
+// rules as ParseJobPayload by construction rather than by agreement.
+//
+// LIKE is case-insensitive for ASCII in SQLite, so a key in any case is
+// caught. Measured on the live store the prefilter selects 4,831 of 15,320
+// rows, which is 69 MORE than the json_extract predicate returned - those 69
+// are exactly the rows the previous version would have dropped.
+//
+// THE ONE GAP, stated rather than hidden: a payload whose KEY is written with
+// JSON escapes, "\u0077orktree_path", would be matched by encoding/json and
+// missed by this prefilter. No writer can produce it - every payload in this
+// table is marshalled by encoding/json, which never escapes a plain ASCII key
+// - and the live store contains zero such rows. If a foreign writer ever
+// appears, this prefilter is where it breaks.
+const listJobWorktreeRefsSQL = `SELECT id, state, updated_at, created_at, payload
+	FROM jobs WHERE payload LIKE '%worktree_path%'`
+
+// JobWorktreeRef is the minimum the reclaim guard needs about another job:
+// identity, finality, and age, plus the path itself.
 type JobWorktreeRef struct {
 	ID           string
 	State        string
@@ -2655,22 +2672,14 @@ type JobWorktreeRef struct {
 	WorktreePath string
 }
 
-// ListJobWorktreeRefs returns every job that records a worktree path, with the
-// path extracted in SQL and no payload read.
+// ListJobWorktreeRefs returns every job that records a non-empty worktree
+// path, decoded with the same rules the caller used to apply itself.
 //
-// WHY EVERY PATH-BEARING ROW RATHER THAN AN EXACT MATCH (#2149). An exact SQL
-// comparison would be a single indexed lookup, but the caller compares
-// filepath.Clean of both sides, so two spellings of one path must match. Every
-// worktree path stored on the profiled host is already clean - measured, 4,763
-// values with zero double slashes, trailing slashes, dot segments or untrimmed
-// values - but "clean today" is a property of the data, not of the schema, and
-// this guard exists to stop an aged row reclaiming a path a live owner still
-// holds. Getting that wrong reclaims someone's worktree, so the comparison
-// stays in Go where Clean applies and SQL only removes rows that can never
-// match: the 69% with no path at all.
-//
-// idx_jobs_worktree_path makes this query covering, so it reads the index and
-// never touches a payload.
+// #2149: the caller loaded every job and decoded every payload to read one
+// field - 15,320 decodes per call on the profiled host, 81% of the daemon's
+// CPU, to build a candidate set that was empty by construction. The decode
+// still happens, but only for rows that mention the key at all, and the
+// caller never sees a payload it might decode again.
 func (s *Store) ListJobWorktreeRefs(ctx context.Context) ([]JobWorktreeRef, error) {
 	rows, err := s.db.QueryContext(ctx, listJobWorktreeRefsSQL)
 	if err != nil {
@@ -2680,9 +2689,23 @@ func (s *Store) ListJobWorktreeRefs(ctx context.Context) ([]JobWorktreeRef, erro
 	var refs []JobWorktreeRef
 	for rows.Next() {
 		var ref JobWorktreeRef
-		if err := rows.Scan(&ref.ID, &ref.State, &ref.UpdatedAt, &ref.CreatedAt, &ref.WorktreePath); err != nil {
+		var payload string
+		if err := rows.Scan(&ref.ID, &ref.State, &ref.UpdatedAt, &ref.CreatedAt, &payload); err != nil {
 			return nil, err
 		}
+		// A payload that does not parse is SKIPPED, matching what the caller
+		// did with a ParseJobPayload error. Silence is correct here: an
+		// unparseable payload records no worktree path to protect.
+		var decoded struct {
+			WorktreePath string `json:"worktree_path"`
+		}
+		if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+			continue
+		}
+		if strings.TrimSpace(decoded.WorktreePath) == "" {
+			continue
+		}
+		ref.WorktreePath = decoded.WorktreePath
 		refs = append(refs, ref)
 	}
 	return refs, rows.Err()
