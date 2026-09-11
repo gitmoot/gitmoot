@@ -2783,5 +2783,38 @@ CREATE INDEX IF NOT EXISTS idx_routing_telemetry_fan_out ON routing_telemetry(ac
 	`
 ALTER TABLE job_events ADD COLUMN provider TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_job_events_provider ON job_events(job_id, id) WHERE provider != '';
+	// #2149: the worktree-path question, answered without reading payloads.
+	//
+	// ReclaimAgedTerminalDelegationWorktreeOutcome asked "does any other job
+	// hold this worktree path" by loading EVERY job row and JSON-decoding
+	// EVERY payload to read one field. On the host that produced the profile
+	// that was 15,320 decodes per call and 81% of the daemon's CPU, to build a
+	// candidate set that is empty by construction: 4,762 distinct paths with a
+	// maximum of ONE row per path.
+	//
+	// The extra columns make the index COVERING for that query, which is the
+	// whole point rather than a micro-optimisation: without them SQLite has
+	// the path but must still visit each row for state and the timestamps, and
+	// measured on live-shaped data that is 53ms against 8.5ms. With them the
+	// query never touches a payload at all.
+	//
+	// json_valid GUARDS THE EXPRESSION, and it is not defensive decoration: an
+	// expression index is evaluated ON WRITE, so a bare json_extract turns a
+	// payload that is not JSON into a failed INSERT. The Go code this replaces
+	// tolerated exactly that - ParseJobPayload returned an error and the row
+	// was skipped - so without the guard this index converts a tolerable data
+	// oddity into a write outage. Caught by a test that inserted a non-JSON
+	// payload, not by review: the live table has zero invalid payloads, so
+	// nothing on this host would have shown it.
+	//
+	// Expression index, not a generated column: no table rewrite on a 400MB
+	// database, and nothing outside SQLite needs to maintain it. It is a plain
+	// json_extract expression, so the sqlite3 CLI can still write this table -
+	// an index over a custom function would have made the database unusable by
+	// any tool that had not registered it.
+	`
+CREATE INDEX IF NOT EXISTS idx_jobs_worktree_path
+	ON jobs(CASE WHEN json_valid(payload) THEN json_extract(payload, '$.worktree_path') END,
+		state, updated_at, created_at, id);
 	`,
 }

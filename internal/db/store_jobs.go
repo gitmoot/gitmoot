@@ -2629,3 +2629,61 @@ func annotateJobInsertConflict(jobID string, err error) error {
 	}
 	return fmt.Errorf("%w: %q was not written: %v", ErrJobIDConflict, jobID, err)
 }
+
+// listJobWorktreeRefsSQL is one const so the plan assertion tests the query
+// that actually runs. The expression MUST match idx_jobs_worktree_path
+// character for character, or SQLite silently falls back to a full scan that
+// re-parses every payload, which is exactly the cost #2149 removes. A silent
+// fallback is why the test asserts the PLAN and not a duration.
+const listJobWorktreeRefsSQL = `SELECT id, state, updated_at, created_at,
+	CASE WHEN json_valid(payload) THEN json_extract(payload, '$.worktree_path') END
+	FROM jobs
+	WHERE CASE WHEN json_valid(payload) THEN json_extract(payload, '$.worktree_path') END IS NOT NULL
+	  AND CASE WHEN json_valid(payload) THEN json_extract(payload, '$.worktree_path') END <> ''`
+
+// JobWorktreeRef is the minimum needed to answer "does another job still hold
+// this worktree path": identity, finality, and age. Deliberately NOT a Job.
+//
+// #2149: the caller used to take whole Jobs and decode every payload to read
+// one string. Returning a narrow row makes that impossible to reintroduce by
+// accident - there is no payload here to decode.
+type JobWorktreeRef struct {
+	ID           string
+	State        string
+	UpdatedAt    string
+	CreatedAt    string
+	WorktreePath string
+}
+
+// ListJobWorktreeRefs returns every job that records a worktree path, with the
+// path extracted in SQL and no payload read.
+//
+// WHY EVERY PATH-BEARING ROW RATHER THAN AN EXACT MATCH (#2149). An exact SQL
+// comparison would be a single indexed lookup, but the caller compares
+// filepath.Clean of both sides, so two spellings of one path must match. Every
+// worktree path stored on the profiled host is already clean - measured, 4,763
+// values with zero double slashes, trailing slashes, dot segments or untrimmed
+// values - but "clean today" is a property of the data, not of the schema, and
+// this guard exists to stop an aged row reclaiming a path a live owner still
+// holds. Getting that wrong reclaims someone's worktree, so the comparison
+// stays in Go where Clean applies and SQL only removes rows that can never
+// match: the 69% with no path at all.
+//
+// idx_jobs_worktree_path makes this query covering, so it reads the index and
+// never touches a payload.
+func (s *Store) ListJobWorktreeRefs(ctx context.Context) ([]JobWorktreeRef, error) {
+	rows, err := s.db.QueryContext(ctx, listJobWorktreeRefsSQL)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var refs []JobWorktreeRef
+	for rows.Next() {
+		var ref JobWorktreeRef
+		if err := rows.Scan(&ref.ID, &ref.State, &ref.UpdatedAt, &ref.CreatedAt, &ref.WorktreePath); err != nil {
+			return nil, err
+		}
+		refs = append(refs, ref)
+	}
+	return refs, rows.Err()
+}
