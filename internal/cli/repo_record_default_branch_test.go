@@ -41,11 +41,16 @@ func TestRepoRecordForCheckoutPrefersRemoteDefaultOverCheckedOutBranch(t *testin
 	runGit(t, clone, "remote", "set-url", "origin", "https://github.com/jerryfane/herdr.git")
 	runGit(t, clone, "checkout", "-b", "fix/lan-address-portability")
 
-	record, err := repoRecordForCheckout(context.Background(),
+	record, fromRemote, err := repoRecordForCheckout(context.Background(),
 		github.Repository{Owner: "jerryfane", Name: "herdr"},
 		gitutil.NewHostClient(clone))
 	if err != nil {
 		t.Fatalf("repoRecordForCheckout returned error: %v", err)
+	}
+	// The provenance flag is what lets the caller overwrite a stored value, so a
+	// correct branch reported as a fallback is as broken as a wrong branch.
+	if !fromRemote {
+		t.Fatal("fromRemote = false with origin/HEAD resolvable; the caller would then refuse to correct a stored value")
 	}
 	if record.DefaultBranch != "master" {
 		t.Fatalf("DefaultBranch = %q, want master; the worktree is on fix/lan-address-portability and that must not be recorded as the default", record.DefaultBranch)
@@ -79,11 +84,14 @@ func TestRepoRecordForCheckoutFallsBackWhenOriginHeadIsUnset(t *testing.T) {
 	// An origin exists but was never cloned from, so origin/HEAD is absent.
 	runGit(t, dir, "remote", "add", "origin", "https://github.com/jerryfane/herdr.git")
 
-	record, err := repoRecordForCheckout(context.Background(),
+	record, fromRemote, err := repoRecordForCheckout(context.Background(),
 		github.Repository{Owner: "jerryfane", Name: "herdr"},
 		gitutil.NewHostClient(dir))
 	if err != nil {
 		t.Fatalf("repoRecordForCheckout returned error: %v", err)
+	}
+	if fromRemote {
+		t.Fatal("fromRemote = true with origin/HEAD unset; a fallback value must never be reported as remote-derived")
 	}
 	if record.DefaultBranch != "main" {
 		t.Fatalf("DefaultBranch = %q, want main from the fallback; an empty value registers a repo with no base branch", record.DefaultBranch)

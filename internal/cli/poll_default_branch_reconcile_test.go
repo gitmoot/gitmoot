@@ -121,16 +121,16 @@ func TestPollRepoDefaultBranchReconcileIsQuietWhenCorrect(t *testing.T) {
 func TestPreserveRegisteredRepoFieldsPrefersRemoteDefault(t *testing.T) {
 	existing := db.Repo{DefaultBranch: "fix/lan-address-portability", PollInterval: "30s", Enabled: true}
 	for _, test := range []struct {
-		name          string
-		resolved      db.Repo
-		remoteDefault string
-		want          string
+		name       string
+		resolved   db.Repo
+		fromRemote bool
+		want       string
 	}{
 		{
-			name:          "a remote-derived default overwrites the stored value",
-			resolved:      db.Repo{DefaultBranch: "master"},
-			remoteDefault: "master",
-			want:          "master",
+			name:       "a remote-derived default overwrites the stored value",
+			resolved:   db.Repo{DefaultBranch: "master"},
+			fromRemote: true,
+			want:       "master",
 		},
 		{
 			// origin/HEAD unresolvable: resolved carries the worktree's branch, and
@@ -150,7 +150,7 @@ func TestPreserveRegisteredRepoFieldsPrefersRemoteDefault(t *testing.T) {
 			if test.want == "main" {
 				from = db.Repo{PollInterval: "30s", Enabled: true}
 			}
-			got := preserveRegisteredRepoFields(test.resolved, from, test.remoteDefault)
+			got := preserveRegisteredRepoFields(test.resolved, from, test.fromRemote)
 			if got.DefaultBranch != test.want {
 				t.Fatalf("DefaultBranch = %q, want %q", got.DefaultBranch, test.want)
 			}

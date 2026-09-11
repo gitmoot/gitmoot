@@ -772,21 +772,21 @@ func resolveDaemonStartRepo(ctx context.Context, store *db.Store, repo github.Re
 	return resolveRepoRecord(ctx, store, repo, workDir)
 }
 
-func repoRecordForCheckout(ctx context.Context, repo github.Repository, client gitutil.Client) (db.Repo, error) {
+func repoRecordForCheckout(ctx context.Context, repo github.Repository, client gitutil.Client) (db.Repo, bool, error) {
 	root, err := client.Root(ctx)
 	if err != nil {
-		return db.Repo{}, fmt.Errorf("resolve repo checkout: %w", err)
+		return db.Repo{}, false, fmt.Errorf("resolve repo checkout: %w", err)
 	}
 	remote, err := client.OriginRemote(ctx)
 	if err != nil {
-		return db.Repo{}, fmt.Errorf("resolve repo checkout remote: %w", err)
+		return db.Repo{}, false, fmt.Errorf("resolve repo checkout remote: %w", err)
 	}
 	remoteRepo, err := gitutil.ParseGitHubRemote(remote)
 	if err != nil {
-		return db.Repo{}, err
+		return db.Repo{}, false, err
 	}
 	if remoteRepo.String() != repo.FullName() {
-		return db.Repo{}, fmt.Errorf("current checkout origin is %s, not %s", remoteRepo.String(), repo.FullName())
+		return db.Repo{}, false, fmt.Errorf("current checkout origin is %s, not %s", remoteRepo.String(), repo.FullName())
 	}
 	// PREFER THE REMOTE'S DEFAULT OVER THE LOCAL HEAD (#2145).
 	//
@@ -811,9 +811,17 @@ func repoRecordForCheckout(ctx context.Context, repo github.Repository, client g
 	// default. Such a record keeps a possibly-wrong local branch exactly as
 	// before this change, and pollRepo upgrades it the moment origin/HEAD becomes
 	// resolvable, so the wrong value is now transient rather than permanent.
+	// fromRemote is RETURNED rather than re-derived by callers (#2146 review, F2).
+	// An earlier revision had the caller call RemoteDefaultBranch a SECOND time to
+	// learn the provenance, which meant a transient failure of that second
+	// subprocess - git lock contention on an unlocked path, for instance - made a
+	// value that had just been read correctly look unknowable, and discarded it
+	// for that resolve cycle. One read, one answer.
 	defaultBranch := ""
+	fromRemote := false
 	if branch, err := client.RemoteDefaultBranch(ctx); err == nil {
 		defaultBranch = branch
+		fromRemote = true
 	} else if branch, err := client.CurrentBranch(ctx); err == nil {
 		defaultBranch = branch
 	}
@@ -823,5 +831,5 @@ func repoRecordForCheckout(ctx context.Context, repo github.Repository, client g
 		DefaultBranch: defaultBranch,
 		RemoteURL:     remote,
 		CheckoutPath:  root,
-	}, nil
+	}, fromRemote, nil
 }

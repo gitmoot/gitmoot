@@ -2063,7 +2063,7 @@ func resolveLocalAgentRepo(ctx context.Context, store *db.Store, repoFlag string
 	// This prevents an ephemeral cwd from becoming repo.CheckoutPath without
 	// silently rebasing local ask/review behavior onto the stored default branch.
 	if strings.TrimSpace(repoFlag) == "" {
-		if cwdRecord, cwdErr := repoRecordForCheckout(ctx, repo, gitutil.NewHostClient(".")); cwdErr == nil {
+		if cwdRecord, _, cwdErr := repoRecordForCheckout(ctx, repo, gitutil.NewHostClient(".")); cwdErr == nil {
 			record.DefaultBranch = cwdRecord.DefaultBranch
 		}
 	}

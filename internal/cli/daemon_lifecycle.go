@@ -1079,7 +1079,7 @@ func preflightDaemonRepoCheckout(ctx context.Context, repo github.Repository, wo
 }
 
 func preflightDaemonRepoCheckoutWithRunner(ctx context.Context, repo github.Repository, workDir string, runner subprocess.Runner) error {
-	_, err := repoRecordForCheckout(ctx, repo, jobGitClient(workDir, runner))
+	_, _, err := repoRecordForCheckout(ctx, repo, jobGitClient(workDir, runner))
 	return err
 }
 
