@@ -135,26 +135,27 @@ func TestCleanupObligationsRebuildPreservesLegacyRows(t *testing.T) {
 // test would pass on precisely the mutant it exists to kill.
 func TestMigrationsUpgradeFromPreviousReleasedVersion(t *testing.T) {
 	ctx := context.Background()
-	// The marker names THIS BRANCH's migration, and it has moved seven times as
-	// main advanced: the cleanup_obligations rebuild, #1766's SkillOpt/evals
-	// teardown, #1770's Activepieces trigger removal, #1731's escalation_rounds
-	// table, #1754's chat/moot teardown, #1756's preset-delivery removal,
-	// #1753's cockpit/interactive table drop and #1822's findings ledger (plus
-	// its #1850 rebuild) each joined the released prefix, leaving #1972's
-	// routing_telemetry.fan_out column appended last. Two branches cannot both be
-	// "last", and the ordering that matters is the one a deployed database sees,
-	// which is why this marker MUST be repointed on every branch that appends a
-	// migration, and why the failure reads as "not appended last" rather than as
-	// a merge conflict.
+	// The marker names THIS BRANCH's migration and must move whenever main gains
+	// another tail migration. Since this test was introduced, that included the
+	// cleanup_obligations rebuild, #1766's SkillOpt/evals teardown, #1770's
+	// Activepieces trigger removal, #1731's escalation_rounds table, #1754's
+	// chat/moot teardown, #1756's preset-delivery removal, #1753's
+	// cockpit/interactive table drop, and #1822's findings ledger plus its #1850
+	// rebuild. This branch's job_events.provider evidence column is now last.
+	//
+	// Two branches cannot both be "last", and the ordering that matters is the
+	// one a deployed database sees, which is why this marker MUST be repointed on
+	// every branch that appends a migration, and why the failure reads as "not
+	// appended last" rather than as a merge conflict.
 	//
 	// The marker must name THIS BRANCH'S LAST migration and must be UNIQUE. The
-	// index name is unique to #1972's migration; the bare ALTER would not be,
+	// index name is unique to this migration; the bare ALTER would not be,
 	// because the column name also appears in that migration's own prose.
 	//
 	// It is updated by every branch that appends a migration, which is the point:
 	// the test fails until the new migration is both last and named here, so two
 	// branches cannot each believe theirs is the tail.
-	const branchMigrationMarker = "idx_routing_telemetry_fan_out"
+	const branchMigrationMarker = "idx_job_events_provider"
 	branchIndex := -1
 	for index, migration := range migrations {
 		if strings.Contains(migration, branchMigrationMarker) {

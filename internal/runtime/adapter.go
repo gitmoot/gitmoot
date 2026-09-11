@@ -214,6 +214,11 @@ type Result struct {
 	// dispatch layer rejects the request before they are reached), and it is
 	// populated on failure returns too — a plan run that died is still a plan run.
 	PlanMode string
+	// UpstreamProvider is execution evidence emitted only after a routed runtime
+	// completed successfully. OMP sets it from provider/model metadata on the
+	// final successful runtime message; callers must not infer it from a requested
+	// model string or an agent default. Native runtimes leave it empty.
+	UpstreamProvider string
 	// SessionDiag carries process-level diagnostics for the runtime CLI run
 	// backing this delivery (#806). Adapters populate it best-effort on every
 	// Deliver return that actually ran a CLI process — success and failure alike —

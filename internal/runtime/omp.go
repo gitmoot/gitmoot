@@ -294,8 +294,9 @@ func (a OmpAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, 
 		return Result{}, err
 	}
 	defer cleanup()
-	// Evidence and argv resolve the SAME target through the same function, so the
-	// recorded plan_mode can never disagree with the model the run actually used.
+	// The requested model selects argv and PlanMode describes the requested
+	// execution target. Upstream-provider evidence does not trust either field;
+	// it comes from the final successful runtime message parsed below.
 	effModel := EffectiveModel(agent, job)
 	planMode := PlanModeDescriptor(job.Plan, ompPlanTarget(effModel, job.PlanInto))
 	args := ompArgs(agent, effModel, ompThinkingLevel(effectiveEffort(agent, job)), ompMaxTimeArg(ctx), job.Plan, job.PlanInto, attachArgs, promptArg)
@@ -309,9 +310,10 @@ func (a OmpAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, 
 	// deadline, and this parser would diagnose the empty stream as "ended without an
 	// agent_end event" — the wrong cause for a wiring bug.
 	result, err := runAgentCommand(ctx, a.runner(), a.Dir, job.AgentEnv, job.OnPID, "omp", args...)
-	// Parse before branching on err: the header id is worth capturing for the
-	// session diagnostics even when the process itself failed.
-	content, sessionID, usage, parseErr := parseOmpStreamJSON(result.Stdout)
+	// Parse before branching on err: the header id and runtime-reported provider
+	// are worth capturing. Only the complete-success path below publishes the
+	// provider as execution evidence.
+	content, sessionID, usage, upstreamProvider, parseErr := parseOmpStreamJSONWithProvider(result.Stdout)
 	// A FAILED RUN IS STILL BILLED, on this path as much as on the parse-error path
 	// below: a run that spent 400k tokens and then died on a non-zero exit (an OOM
 	// kill, a crashed Bun binary, a SIGKILLed process group) spent them for real, and
@@ -347,12 +349,13 @@ func (a OmpAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, 
 		}, ompCommandError(result, parseErr)
 	}
 	return Result{
-		Raw:          content,
-		Summary:      strings.TrimSpace(content),
-		InputTokens:  usage.InputTokens,
-		OutputTokens: usage.OutputTokens,
-		PlanMode:     planMode,
-		SessionDiag:  newSessionDiag(result, nil, sessionID),
+		Raw:              content,
+		Summary:          strings.TrimSpace(content),
+		InputTokens:      usage.InputTokens,
+		OutputTokens:     usage.OutputTokens,
+		PlanMode:         planMode,
+		UpstreamProvider: upstreamProvider,
+		SessionDiag:      newSessionDiag(result, nil, sessionID),
 	}, nil
 }
 
@@ -430,21 +433,18 @@ func (a OmpAdapter) preflight() error {
 //     parses; without --mode=json omp prints prose and every job fails extraction.
 //   - `--approval-mode` is ALWAYS present, for DETERMINISM: omitting it inherits
 //     whatever tools.approvalMode the host config carries, which is not
-//     deterministic across machines. Its VALUE now comes from the stored
-//     autonomy policy via ompApprovalArgs (#1721); it was a fixed `yolo` for
-//     every policy until then, so a read-only omp agent ran unrestricted.
-//     Read-only maps to always-ask on the measurement recorded at
-//     ompApprovalArgs; every other policy keeps `yolo` byte-identically.
-//     TWO CLAIMS THIS COMMENT USED TO CARRY WERE WRONG AND ARE CORRECTED
-//     AGAINST THE CODE, because a stale rationale is cited as a reason:
-//     the read-only Landlock wrapper does NOT select only claude and kimi -
-//     wrapReadOnlyAdapterRunner in cli/daemon_worker.go wraps claude, codex,
-//     kimi and shell - and it is not true that "no omp process is ever
-//     confined": that switch has an explicit omp arm which REFUSES a read-only
-//     seat outright ("read-only seats cannot use omp without an isolated
-//     credential broker") rather than running it unconfined. The gap this flag
-//     now closes is the case the seat path never reaches: a non-seat omp
-//     dispatch whose stored policy asked for less than yolo.
+//     deterministic across machines. Its VALUE comes from the stored autonomy
+//     policy via ompApprovalArgs (#1721): read-only maps to `always-ask`,
+//     workspace-write maps to `write`, danger-full-access maps to `yolo`, and
+//     auto or an empty stored policy keeps the historical `yolo` behavior.
+//     Gitmoot-side confinement still differs by dispatch path.
+//     readOnlyImplementationBlocked refuses read-only implementation jobs;
+//     broker-backed read-only seats run through wrapReadOnlyAdapterRunner's
+//     Landlock wrapper after their state policy verifies the broker pair and
+//     stages no owner credential material. A non-seat read-only ask or review
+//     reaches neither boundary, so `always-ask` is its direct tool restriction.
+//     Keeping the flag explicit also prevents any path from inheriting the
+//     host's tools.approvalMode.
 //   - `--no-session` keeps the run in memory: no per-worktree session .jsonl
 //     accretion, and nothing to accidentally resume (v1 never resumes).
 //   - the prompt is exactly ONE token after `--`: multiple positionals become
@@ -504,6 +504,19 @@ func ompValidatePlanTarget(target string) error {
 		return fmt.Errorf("omp plan target %q is invalid: the plan execution target must be one non-flag model selector without whitespace or control characters (for example @smol or provider/model). It is either the job's plan_into or, when that is unset, the job's effective model — correct whichever is set", into)
 	}
 	return nil
+}
+
+// OmpModelProvider returns the provider segment of a provider-qualified OMP
+// model selector. This is the single parser shared by execution attribution and
+// the read-only broker boundary, so the two cannot disagree about provider
+// identity. Aliases and unqualified models are intentionally unresolved.
+func OmpModelProvider(model string) (string, error) {
+	model = strings.TrimSpace(model)
+	provider, modelID, ok := strings.Cut(model, "/")
+	if !ok || provider == "" || modelID == "" || strings.ContainsAny(provider, " \t\r\n") {
+		return "", fmt.Errorf("OMP requires a provider-qualified model such as provider/model; got %q", model)
+	}
+	return provider, nil
 }
 
 // ompPlanTarget resolves the model the plan's EXECUTION phase runs on: an explicit
@@ -989,12 +1002,15 @@ type ompStreamEvent struct {
 // a number in omp today but is kept raw so a provider that reports it as a string
 // degrades the DETAIL of the error rather than making the whole line unparseable.
 type ompStreamMessage struct {
-	Role         string           `json:"role"`
-	Content      []ompContentPart `json:"content"`
-	Usage        *ompMessageUsage `json:"usage"`
-	StopReason   string           `json:"stopReason"`
-	ErrorMessage string           `json:"errorMessage"`
-	ErrorStatus  json.RawMessage  `json:"errorStatus"`
+	Role             string           `json:"role"`
+	Content          []ompContentPart `json:"content"`
+	Usage            *ompMessageUsage `json:"usage"`
+	Provider         string           `json:"provider"`
+	Model            string           `json:"model"`
+	UpstreamProvider string           `json:"upstreamProvider"`
+	StopReason       string           `json:"stopReason"`
+	ErrorMessage     string           `json:"errorMessage"`
+	ErrorStatus      json.RawMessage  `json:"errorStatus"`
 }
 
 type ompContentPart struct {
@@ -1206,6 +1222,14 @@ type ompTelemetryUsage struct {
 // ceiling, no per-line copy, and no scanner error path that could discard text and
 // usage already parsed.
 func parseOmpStreamJSON(output string) (string, string, ompUsage, error) {
+	text, sessionID, usage, _, err := parseOmpStreamJSONWithProvider(output)
+	return text, sessionID, usage, err
+}
+
+// parseOmpStreamJSONWithProvider returns the upstream provider reported on the
+// final successful assistant message. The provider is unavailable on every
+// failure path and when the runtime omits either provider or model metadata.
+func parseOmpStreamJSONWithProvider(output string) (string, string, ompUsage, string, error) {
 	var (
 		sessionID string
 		// finalText/finalStop describe the LAST assistant message_end on the wire —
@@ -1214,6 +1238,7 @@ func parseOmpStreamJSON(output string) (string, string, ompUsage, error) {
 		// from a run that never spoke at all when the failure is reported.
 		finalText     string
 		finalStop     string
+		finalProvider string
 		sawText       bool
 		summed        ompUsage
 		rollup        ompUsage
@@ -1334,6 +1359,14 @@ func parseOmpStreamJSON(output string) (string, string, ompUsage, error) {
 			}
 			finalText = content
 			finalStop = message.StopReason
+			finalProvider = ""
+			if provider, err := OmpModelProvider(message.Provider + "/" + message.Model); err == nil {
+				finalProvider = provider
+				if upstream := strings.TrimSpace(message.UpstreamProvider); upstream != "" &&
+					!strings.ContainsAny(upstream, "\t\r\n") {
+					finalProvider = upstream
+				}
+			}
 		case "auto_retry_start":
 			// The saga is now OPEN and stays open until omp closes it. Nothing else
 			// may clear this: a recovered assistant message is followed by the closing
@@ -1394,16 +1427,16 @@ func parseOmpStreamJSON(output string) (string, string, ompUsage, error) {
 	// that makes the other verdicts provisional — the unread row may itself have been
 	// the failure, the answer, or the terminal settle.
 	if unreadable != nil {
-		return "", sessionID, usage, unreadable
+		return "", sessionID, usage, "", unreadable
 	}
 	if turnFailed {
-		return "", sessionID, usage, firstErr
+		return "", sessionID, usage, "", firstErr
 	}
 	if agentEndCount == 0 {
-		return "", sessionID, usage, errors.New("omp stream ended without an agent_end event: the CLI died mid-stream or its --mode=json envelope changed")
+		return "", sessionID, usage, "", errors.New("omp stream ended without an agent_end event: the CLI died mid-stream or its --mode=json envelope changed")
 	}
 	if !lastTerminal {
-		return "", sessionID, usage, errors.New("omp stream ended on a non-terminal agent_end (isTerminal false): the run was scheduling a continuation (retry, model fallback or auto-compaction) and the stream stopped before it finished")
+		return "", sessionID, usage, "", errors.New("omp stream ended on a non-terminal agent_end (isTerminal false): the run was scheduling a continuation (retry, model fallback or auto-compaction) and the stream stopped before it finished")
 	}
 	// Envelope integrity is settled; the retry STATE MACHINE has to be settled too.
 	// omp closes every saga it opens, on both verdicts and from every dead end
@@ -1411,22 +1444,22 @@ func parseOmpStreamJSON(output string) (string, string, ompUsage, error) {
 	// with nothing after it means the process died mid-retry. Fail closed: a pending
 	// retry is a failure, never "the error was being handled".
 	if retryPending {
-		return "", sessionID, usage, errors.New("omp stream ended with a retry saga still open (an auto_retry_start with no auto_retry_end after it): the CLI died mid-retry, so the run neither recovered nor reported a verdict")
+		return "", sessionID, usage, "", errors.New("omp stream ended with a retry saga still open (an auto_retry_start with no auto_retry_end after it): the CLI died mid-retry, so the run neither recovered nor reported a verdict")
 	}
 	// The envelope and the retry state machine are settled; what is left is whether
 	// the run actually ANSWERED. Both checks below read the FINAL assistant message
 	// only: an earlier turn's sentence was written before the cut, so handing it back
 	// as the job's Summary is the stale-text false green (see TRUNCATION above).
 	if ompStopReasonIsTruncation(finalStop) {
-		return "", sessionID, usage, fmt.Errorf("omp run was TRUNCATED: its final assistant message stopped on %q instead of \"stop\", so the run was cut mid-work (Gitmoot's --max-time deadline for the job, or the provider's output cap) and never wrote a final answer", finalStop)
+		return "", sessionID, usage, "", fmt.Errorf("omp run was TRUNCATED: its final assistant message stopped on %q instead of \"stop\", so the run was cut mid-work (Gitmoot's --max-time deadline for the job, or the provider's output cap) and never wrote a final answer", finalStop)
 	}
 	if strings.TrimSpace(finalText) == "" {
 		if sawText {
-			return "", sessionID, usage, errors.New("omp run was TRUNCATED: its final assistant message carried no text (a tool call it never got to answer, or a content-less stop), so the only text on the stream was written BEFORE the run was cut — and that is not the run's answer")
+			return "", sessionID, usage, "", errors.New("omp run was TRUNCATED: its final assistant message carried no text (a tool call it never got to answer, or a content-less stop), so the only text on the stream was written BEFORE the run was cut — and that is not the run's answer")
 		}
-		return "", sessionID, usage, errors.New("omp stream carried no assistant text")
+		return "", sessionID, usage, "", errors.New("omp stream carried no assistant text")
 	}
-	return finalText, sessionID, usage, nil
+	return finalText, sessionID, usage, finalProvider, nil
 }
 
 // ompStopReasonIsTruncation reports whether a FINAL assistant stopReason means the

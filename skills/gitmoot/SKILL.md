@@ -223,12 +223,13 @@ effort as `--thinking <level>` when the value is one of
 Claude and Kimi ignore effort. The `omp` runtime is a multi-provider **routing
 harness**, so a few of its properties differ from the vendor CLIs and are worth
 saying out loud before routing work to it: it holds `review`/`implement`/`ask`
-but not `produce`, every job runs a fresh session (it never resumes), read-only
-is enforced Gitmoot-side rather than by the runtime's approval flag, and its
-implement jobs get a LOUD cross-family-review refusal instead of a silent skip
-because an opaque router has no model family (see CLI.md § Agent Setup). Use
-`gitmoot runtime list` to inspect each built-in runtime's resolved metadata:
-capabilities, default model/effort, known models, and the token-usage source.
+but not `produce`, every job runs a fresh session (it never resumes), and
+read-only seats use Gitmoot's broker-backed sandbox. Cross-family independence
+uses the upstream provider proved by a successful OMP delivery, not the `omp`
+wrapper or a requested model string; missing or failed provider evidence blocks
+the merge gate (see CLI.md § Agent Setup). Use `gitmoot runtime list` to inspect
+each built-in runtime's resolved metadata: capabilities, default model/effort,
+known models, and the token-usage source.
 Operators can override a built-in runtime's
 metadata without recompiling via a `[runtimes.<name>]` config section — `default_model`
 retargets delivery and `default_effort` selects Codex effort and omp's

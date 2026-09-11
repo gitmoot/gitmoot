@@ -276,6 +276,10 @@ type JobEvent struct {
 	// which is mutable and absent on many jobs, and because the alternative -
 	// parsing the event's prose message - is a fragility trade rather than a fix.
 	Runtime string
+	// Provider is the structured, append-only upstream provider proven by a
+	// successful routed runtime delivery. Only OMP provider-verification events
+	// set it; requested model strings and mutable job payload fields do not.
+	Provider string
 }
 
 // JobGate is one resumable gate row (#682): a single entry from a blocked job's

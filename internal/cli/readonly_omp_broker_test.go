@@ -145,11 +145,11 @@ func TestReadOnlyOmpBrokerPayloadFilteringFailsClosed(t *testing.T) {
 
 func TestReadOnlyOmpBrokerRequiresQualifiedAndStableEffectiveProvider(t *testing.T) {
 	for _, model := range []string{"", "k3", "/k3", "kimi-code/"} {
-		if _, err := readOnlyOmpProvider(model); err == nil {
+		if _, err := runtime.OmpModelProvider(model); err == nil {
 			t.Fatalf("model %q was accepted without a stable provider scope", model)
 		}
 	}
-	if provider, err := readOnlyOmpProvider("kimi-code/k3"); err != nil || provider != "kimi-code" {
+	if provider, err := runtime.OmpModelProvider("kimi-code/k3"); err != nil || provider != "kimi-code" {
 		t.Fatalf("qualified model provider=%q err=%v", provider, err)
 	}
 

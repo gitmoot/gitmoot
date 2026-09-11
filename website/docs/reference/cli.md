@@ -753,19 +753,27 @@ the daemon runs under. What that changes in practice:
 - **`--policy` selects the `--approval-mode` value,** and the flag is always
   present for **determinism** - omitting it would inherit whatever
   `tools.approvalMode` the host config carries. `read-only` maps to
-  `always-ask`; `auto`, `workspace-write` and `danger-full-access` all map to
-  `yolo`. Measured on omp 17.2.4 headless, `always-ask` lets `read`/`grep`/`glob`
-  succeed and refuses only `bash`/`write`, with the process exiting 0 and a full
-  `agent_end`, so it **restricts** omp rather than breaking it (#1721). The
-  adapter declares the relationship it produced: `applied` for `read-only` and
-  `danger-full-access`, `widened` for the two policies that asked for less than
-  `yolo` grants.
-- **omp is in no cross-family group.** An omp implement job's cross-family
-  review is refused *loudly* (a `cross_family_review_failed` job event) instead
-  of silently skipped, because scoring an opaque router as a model family would
-  manufacture diversity the merge gate would trust. The exclusion runs both ways:
-  a registered omp seat is never selected as another runtime's cross-family
-  reviewer either. Per-seat provider declaration is issue #1436.
+  `always-ask`, `workspace-write` maps to `write`, and `auto` plus
+  `danger-full-access` map to `yolo`. Measured on omp 17.2.4 headless,
+  `always-ask` lets `read`/`grep`/`glob` succeed and refuses
+  `bash`/`write`, with the process exiting 0 and a full `agent_end`, so it
+  **restricts** omp rather than breaking it (#1721). The adapter declares the
+  relationship it produced: `applied` for the three explicit policies and
+  `widened` for `auto`.
+- **OMP cross-family independence uses runtime-reported upstream-provider
+  evidence.** A successful delivery whose final runtime message identifies its
+  provider and model records that provider in the append-only event ledger; the
+  OMP wrapper remains `effective_runtime=omp`. Providers shared with native
+  adapters compare as the same family: `openai` and `openai-codex` map to
+  Codex, `anthropic` maps to Claude, and `kimi-code` maps to Kimi. Providers
+  without a native adapter stay namespaced, for example `omp:devin`. Different
+  models and agent names on one provider remain the same family, while different
+  proved providers qualify as cross-family. A requested model alone, a failed or
+  historical job without provider evidence, and an in-session implementation
+  row with no provider all fail closed. Native fan-out cannot prove an OMP
+  provider before execution, so it skips those reviewers; use an explicit
+  `agent review` dispatch to run one and record evidence. Native runtime behavior
+  is unchanged.
 - **Authentication is per profile.** Authenticate omp once interactively, export
   the provider key the daemon should use, or point it at an auth broker; then
   restart the Gitmoot daemon so it inherits the credential. The daemon must also
@@ -2908,9 +2916,7 @@ which is a different fact from "the reviewer implemented this", and it is the
 expected state for in-session (pane-driven) implementation, where no engine
 implement job exists. The approval is not disqualified. The remedy is runnable
 by the implementing lane and needs no coordinator: record the durable
-attribution row with `gitmoot job record --agent <implementing-agent> --repo
-<owner/repo> --type implement --decision implemented --task <task-id> --pr
-<number> --head-sha <sha>`, then re-evaluate. Session-recorded jobs (#657)
+attribution row with `gitmoot job record --agent <implementing-agent> --repo <owner/repo> --type implement --decision implemented --task <task-id> --pr <number> --head-sha <sha>`, then re-evaluate. Session-recorded jobs (#657)
 create rows with `Type == "implement"`, which is exactly what the gate reads. If the work was done in
 session by an org role that is not a registered agent, pass `--acting-role
 <role>` instead of `--agent`: attribution is then the role, validated against the

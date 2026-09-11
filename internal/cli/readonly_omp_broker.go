@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
 const (
@@ -130,17 +132,8 @@ func readOnlyOmpBrokerToken(path string) (string, error) {
 	return token, nil
 }
 
-func readOnlyOmpProvider(model string) (string, error) {
-	model = strings.TrimSpace(model)
-	provider, modelID, ok := strings.Cut(model, "/")
-	if !ok || provider == "" || modelID == "" || strings.ContainsAny(provider, " \t\r\n") {
-		return "", fmt.Errorf("read-only omp seat requires a provider-qualified model such as provider/model; got %q", model)
-	}
-	return provider, nil
-}
-
 func startReadOnlyOmpBrokerProxy(config readOnlyOmpBrokerConfig, model string) (*readOnlyOmpBrokerProxy, error) {
-	provider, err := readOnlyOmpProvider(model)
+	provider, err := runtime.OmpModelProvider(model)
 	if err != nil {
 		return nil, err
 	}

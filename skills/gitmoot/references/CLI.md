@@ -979,19 +979,27 @@ an omp seat:
 - **`--policy` selects the `--approval-mode` value,** and the flag is always
   present for **determinism** - omitting it would inherit whatever
   `tools.approvalMode` the host config carries. `read-only` maps to
-  `always-ask`; `auto`, `workspace-write` and `danger-full-access` all map to
-  `yolo`. Measured on omp 17.2.4 headless, `always-ask` lets `read`/`grep`/`glob`
-  succeed and refuses only `bash`/`write`, with the process exiting 0 and a full
-  `agent_end`, so it **restricts** omp rather than breaking it (#1721). The
-  adapter declares the relationship it produced: `applied` for `read-only` and
-  `danger-full-access`, `widened` for the two policies that asked for less than
-  `yolo` grants.
-- **omp is in no cross-family group.** An omp implement job's cross-family
-  review is *refused loudly* (a `cross_family_review_failed` job event) rather
-  than silently skipped, because scoring an opaque router as a family would
-  manufacture diversity the merge gate would trust. The exclusion is symmetric: a
-  registered omp seat is never picked as another runtime's cross-family reviewer
-  either. Per-seat provider declaration is issue #1436.
+  `always-ask`, `workspace-write` maps to `write`, and `auto` plus
+  `danger-full-access` map to `yolo`. Measured on omp 17.2.4 headless,
+  `always-ask` lets `read`/`grep`/`glob` succeed and refuses
+  `bash`/`write`, with the process exiting 0 and a full `agent_end`, so it
+  **restricts** omp rather than breaking it (#1721). The adapter declares the
+  relationship it produced: `applied` for the three explicit policies and
+  `widened` for `auto`.
+- **OMP cross-family independence uses runtime-reported upstream-provider
+  evidence.** A successful delivery whose final runtime message identifies its
+  provider and model records that provider in the append-only event ledger; the
+  OMP wrapper remains `effective_runtime=omp`. Providers shared with native
+  adapters compare as the same family: `openai` and `openai-codex` map to
+  Codex, `anthropic` maps to Claude, and `kimi-code` maps to Kimi. Providers
+  without a native adapter stay namespaced, for example `omp:devin`. Different
+  models and agent names on one provider remain the same family, while different
+  proved providers qualify as cross-family. A requested model alone, a failed or
+  historical job without provider evidence, and an in-session implementation
+  row with no provider all fail closed. Native fan-out cannot prove an OMP
+  provider before execution, so it skips those reviewers; use an explicit
+  `agent review` dispatch to run one and record evidence. Native runtime behavior
+  is unchanged.
 - **Authentication depends on the seat policy.** Ordinary omp jobs use the
   profile, provider keys, or auth broker visible to the daemon. Read-only review
   and ask seats require `OMP_AUTH_BROKER_URL` as an HTTPS or loopback HTTP
