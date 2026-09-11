@@ -890,6 +890,22 @@ func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumb
 					}
 					continue
 				}
+			} else if canonicalTask.State != string(workflow.TaskReadyToMerge) {
+				// An external merge can become uncertain while the canonical task
+				// is still reviewing. The fresh forge result is authoritative, so
+				// resolve any retained claim atomically before the ordinary merged
+				// transition; otherwise the claim's trigger rejects that transition
+				// on every poll and one old PR blocks the repository forever.
+				if _, recoveredState, recoverErr := d.Store.RecoverClaimedTaskState(ctx, canonicalTask.ID,
+					string(workflow.TaskMerged), "pull_request_merged",
+					fmt.Sprintf("recovered merged pull request #%d from retained task claim", group.number)); recoverErr != nil {
+					if firstErr == nil {
+						firstErr = recoverErr
+					}
+					continue
+				} else {
+					canonicalTask.State = recoveredState
+				}
 			}
 			if closeErr := d.Workflow.HandleReviewPullRequestClosed(ctx, event, true); closeErr != nil {
 				if firstErr == nil {
