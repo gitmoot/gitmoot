@@ -212,8 +212,13 @@ func TestExecBackendLedgerTeardownUpdatesEveryPath(t *testing.T) {
 		} else if !reflect.DeepEqual(reaped, []string{"sandbox-reap"}) {
 			t.Fatalf("reaped = %v", reaped)
 		}
-		if got := execBackendAttemptForTest(t, store, key).State; got != db.ExecBackendAttemptStateOrphaned {
-			t.Fatalf("startup-reaped state = %q, want orphaned", got)
+		// THE PROVIDER CONFIRMED THIS DESTROY - the fixture's ReapReport carries
+		// Destroyed: ["sandbox-reap"] - so the terminal state is destroyed, not
+		// orphaned (#2147). This assertion previously pinned orphaned, which was
+		// the defect: the reconciler could only reach orphaned from a live state,
+		// and orphaned bills against the compute cap and is terminal-unreachable.
+		if got := execBackendAttemptForTest(t, store, key).State; got != db.ExecBackendAttemptStateDestroyed {
+			t.Fatalf("startup-reaped state = %q, want destroyed: the provider confirmed this sandbox is gone, so recording it as an orphan holds its reservation forever", got)
 		}
 	})
 }
