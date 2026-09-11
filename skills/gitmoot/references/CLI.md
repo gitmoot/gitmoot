@@ -992,11 +992,22 @@ an omp seat:
   manufacture diversity the merge gate would trust. The exclusion is symmetric: a
   registered omp seat is never picked as another runtime's cross-family reviewer
   either. Per-seat provider declaration is issue #1436.
-- **Authentication is per profile.** Authenticate omp once interactively (or
-  export the provider key the daemon should use, or point it at an auth broker),
-  then restart the Gitmoot daemon so it inherits the credential. The daemon must
-  also see the binary: its `PATH` comes from the systemd EnvironmentFile, not a
-  login shell.
+- **Authentication depends on the seat policy.** Ordinary omp jobs use the
+  profile, provider keys, or auth broker visible to the daemon. Read-only review
+  and ask seats require `OMP_AUTH_BROKER_URL` as an HTTPS or loopback HTTP
+  origin, an owner-only token file named by `OMP_AUTH_BROKER_TOKEN_FILE`, and a
+  provider-qualified effective model such as `kimi-code/k3`. An upstream
+  `OMP_AUTH_BROKER_TOKEN` in the daemon environment
+  is refused because the runtime requires seat-readable `/proc`. Gitmoot writes
+  the random job-local token and loopback URL only into the seat's minimal
+  `config.yml`; no broker secret enters the child environment. The proxy exposes
+  only that provider, forwards credential refreshes, and keeps shared broker
+  writes out of reach. Gitmoot drops the operator profile and ambient provider
+  keys, runs a daemon-staged OMP binary, and supplies job-private
+  `PI_CONFIG_DIR` and `PI_CODING_AGENT_DIR` roots. Missing or unsafe broker
+  configuration refuses before runtime staging; an unqualified effective model
+  refuses before OMP launches. Restart the daemon after changing its broker
+  environment; its `PATH` also comes from the systemd EnvironmentFile.
 
 `agent start`, `agent subscribe`, and `agent type set` accept an optional
 `--model <name>` flag that sets the agent's default runtime model. It is a

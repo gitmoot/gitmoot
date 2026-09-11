@@ -458,19 +458,37 @@ Fixes:
   condition recorded `failed`, and 25 of 29 measured refusal deaths were
   re-dispatched into the identical wall, one agent eleven times. Find them with
   `gitmoot job list --state blocked`.
-- A read-only seat (every `review`/`ask` job under the read-only autonomy
-  policy) does NOT authenticate with the ambient credential: it stages a
-  SNAPSHOT of its runtime config dir (`payload.runtime_config_dir`, else the
-  daemon's `CLAUDE_CONFIG_DIR`, else `~/.claude`) and carries the resolved
-  `runtime-auth.env` overlay. When that snapshot is already expired the job
-  records one `readonly_seat_credential_expired` event naming the expiry, the
-  refresh-token state and whether an overlay was available — read it with
-  `gitmoot job events <job-id>` before treating the runtime's own "OAuth session
-  expired and could not be refreshed" wording as an account problem. It never
-  refuses the job. `gitmoot doctor` and `gitmoot auth probe claude` both report
-  that seat credential beside the ambient one, and doctor FAILS (non-zero exit)
-  when it is expired with no refresh token, since every read-only seat job on
-  that runtime will fail until the account is re-logged in.
+- A Claude read-only seat (every `review`/`ask` job under the read-only
+  autonomy policy) does not rely only on its staged credential snapshot. It
+  stages the runtime config dir (`payload.runtime_config_dir`,
+  else the daemon's `CLAUDE_CONFIG_DIR`, else `~/.claude`) and also carries the
+  resolved `runtime-auth.env` overlay. When that snapshot is already expired
+  the job records one `readonly_seat_credential_expired` event naming the
+  expiry, the refresh-token state and whether an overlay was available — read
+  it with `gitmoot job events <job-id>` before treating the runtime's own
+  "OAuth session expired and could not be refreshed" wording as an account
+  problem. It never refuses the job. `gitmoot doctor` and `gitmoot auth probe
+  claude` both report that seat credential beside the ambient one, and doctor
+  FAILS (non-zero exit) when it is expired with no refresh token, since every
+  read-only seat job on that runtime will fail until the account is re-logged
+  in.
+- An OMP read-only seat uses no operator profile or ambient provider key. Set
+  `OMP_AUTH_BROKER_URL` to an HTTPS or loopback HTTP origin and point
+  `OMP_AUTH_BROKER_TOKEN_FILE` at an owner-only regular file; the daemon refuses
+  `OMP_AUTH_BROKER_TOKEN` because every seat must read `/proc` for runtime
+  startup. The job's effective model must be provider-qualified, such as
+  `kimi-code/k3`. Gitmoot writes a random job-local token and loopback URL only
+  into the seat's minimal `config.yml`; no broker secret enters the child
+  environment. The proxy exposes only that provider, forwards refreshes only,
+  and keeps broker writes local to the disposable client. The daemon-staged OMP
+  binary receives job-private `PI_CONFIG_DIR` and `PI_CODING_AGENT_DIR` roots.
+  Missing or unsafe broker configuration refuses before staging; an unqualified
+  effective model refuses before OMP launches. The state and proxy are removed
+  at the job boundary.
+  When broker and clients share an OS account, run `auth-broker serve` with a
+  dedicated relative `PI_CONFIG_DIR` and point `OMP_AUTH_BROKER_TOKEN_FILE` at
+  that directory's `auth-broker.token`. Otherwise both roles use
+  `~/.omp/auth-broker.token`, so a client token can invalidate the service.
 - A kimi credential that goes blank mid-session is REPORTED, not repaired
   (#1856). Kimi's credential (`~/.kimi-code/credentials/kimi-code.json`) has
   been observed blanked IN PLACE after a failed refresh: still-valid JSON, 136

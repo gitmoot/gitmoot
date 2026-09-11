@@ -24,9 +24,9 @@ import (
 // survives into a path that never wrapped it. A read-only seat therefore ran
 // outside Landlock and outside this PR's staging policy.
 //
-// The observable is the staging the wrap performs: with the wrap in place the
-// seat's isolated runtime state exists on disk under the config home. Without
-// it, nothing is staged, because nothing on the fork path ever asks.
+// The observable is the fail-closed wrapper refusal. The fake delivery adapter
+// cannot be Landlock-wrapped, so reaching that refusal proves the fork path
+// applied the sandbox policy before any runtime launch.
 func TestTempWorkerForkStillSandboxesAReadOnlySeat(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()
@@ -129,8 +129,8 @@ func TestTempWorkerForkStillSandboxesAReadOnlySeat(t *testing.T) {
 	}
 
 	// The fake adapter cannot be Landlock-wrapped, so the wrap REFUSING it is
-	// itself proof the fork path now asks - and the staging below happens inside
-	// that same call, before the refusal.
+	// proof the fork path now asks. The private state is removed with the failed
+	// setup rather than left behind as a second, stale observable.
 	wrapAttempted := false
 	for _, event := range events {
 		if strings.Contains(event.Message, "read-only Landlock sandbox") {
@@ -140,34 +140,4 @@ func TestTempWorkerForkStillSandboxesAReadOnlySeat(t *testing.T) {
 	if !wrapAttempted {
 		t.Error("no evidence the fork path applied the read-only sandbox wrap")
 	}
-
-	staged := stagedSeatStateUnder(t, home)
-	if staged == "" {
-		t.Fatalf("the forked read-only seat staged no isolated runtime state under %q: it ran outside the sandbox and outside the staging policy", home)
-	}
-	contents, err := os.ReadFile(staged)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(contents), "gpt-5") {
-		t.Errorf("staged seat config = %q, want the host model setting", contents)
-	}
-}
-
-// stagedSeatStateUnder finds a staged seat config.toml anywhere under home. The
-// cache root is chosen by the isolated-tool-cache grant, so the test asks
-// whether staging HAPPENED rather than hard-coding where.
-func stagedSeatStateUnder(t *testing.T, home string) string {
-	t.Helper()
-	var found string
-	_ = filepath.WalkDir(home, func(path string, entry os.DirEntry, err error) error {
-		if err != nil || entry.IsDir() || found != "" {
-			return nil //nolint:nilerr // an unreadable subtree is not a result
-		}
-		if filepath.Base(path) == "config.toml" && strings.Contains(path, "runtime-state") {
-			found = path
-		}
-		return nil
-	})
-	return found
 }

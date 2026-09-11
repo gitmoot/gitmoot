@@ -417,7 +417,7 @@ func TestStageSeatRuntimesCopiesInstalledAndShadowsAbsentRuntimes(t *testing.T) 
 	t.Setenv("PATH", strings.Join(pathEntries, string(os.PathListSeparator)))
 
 	paths := config.PathsForHome(t.TempDir())
-	commands, _, diagnostics, err := stageSeatRuntimes(paths)
+	commands, _, diagnostics, err := stageSeatRuntimes(paths, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,6 +443,47 @@ func TestStageSeatRuntimesCopiesInstalledAndShadowsAbsentRuntimes(t *testing.T) 
 		if runErr != nil || strings.TrimSpace(string(output)) != name+"-ran" {
 			t.Errorf("installed runtime %q did not launch from its staged copy: err=%v output=%q", name, runErr, output)
 		}
+	}
+}
+
+func TestStageSeatRuntimesAddsOmpOnlyWhenSelected(t *testing.T) {
+	runtimeDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(runtimeDir, runtime.OmpRuntime), []byte("#!/bin/sh\nprintf 'omp-ran\\n'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", runtimeDir)
+
+	without, _, _, err := stageSeatRuntimes(config.PathsForHome(t.TempDir()), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range without {
+		if filepath.Base(command) == runtime.OmpRuntime {
+			t.Fatalf("unselected OMP was published to a provider seat: %v", without)
+		}
+	}
+
+	paths := config.PathsForHome(t.TempDir())
+	with, _, diagnostics, err := stageSeatRuntimes(paths, runtime.OmpRuntime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diagnostics) != 0 {
+		t.Fatalf("selected OMP staging diagnostics = %v", diagnostics)
+	}
+	var ompCommand string
+	for _, command := range with {
+		if filepath.Base(command) == runtime.OmpRuntime {
+			ompCommand = command
+			break
+		}
+	}
+	if ompCommand == "" || !pathWithin(ompCommand, toolchain.RuntimeRoot(paths.Home)) {
+		t.Fatalf("selected OMP command = %q, want daemon-owned staged path", ompCommand)
+	}
+	output, err := exec.Command(ompCommand).CombinedOutput()
+	if err != nil || strings.TrimSpace(string(output)) != "omp-ran" {
+		t.Fatalf("staged OMP command failed: err=%v output=%q", err, output)
 	}
 }
 

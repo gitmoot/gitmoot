@@ -1534,9 +1534,52 @@ type readOnlySandboxGrants struct {
 	toolchainUnavailable string
 }
 
+type readOnlyOmpBrokerSession struct {
+	mu       sync.Mutex
+	config   readOnlyOmpBrokerConfig
+	stateDir string
+	broker   *readOnlyOmpBrokerProxy
+}
+
+func (s *readOnlyOmpBrokerSession) prepare(model string) (string, error) {
+	provider, err := readOnlyOmpProvider(model)
+	if err != nil {
+		return "", err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.broker != nil {
+		if provider != s.broker.provider {
+			return "", fmt.Errorf("read-only omp job model provider %q is outside the broker scope %q", provider, s.broker.provider)
+		}
+		return provider, nil
+	}
+	broker, err := startReadOnlyOmpBrokerProxy(s.config, model)
+	if err != nil {
+		return "", err
+	}
+	if err := broker.writeConfig(s.stateDir); err != nil {
+		return "", errors.Join(err, broker.close())
+	}
+	s.broker = broker
+	return provider, nil
+}
+
+func (s *readOnlyOmpBrokerSession) close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.broker == nil {
+		return nil
+	}
+	err := s.broker.close()
+	s.broker = nil
+	return err
+}
+
 type readOnlyRuntimeAdapter struct {
 	runtime.Adapter
 	cleanupRoot string
+	ompSession  *readOnlyOmpBrokerSession
 }
 
 func (a readOnlyRuntimeAdapter) PermissionPolicyApplication(agent runtime.Agent) runtime.PermissionPolicyApplication {
@@ -1544,22 +1587,46 @@ func (a readOnlyRuntimeAdapter) PermissionPolicyApplication(agent runtime.Agent)
 }
 
 func (a readOnlyRuntimeAdapter) Deliver(ctx context.Context, agent runtime.Agent, job runtime.Job) (runtime.Result, error) {
+	if a.ompSession != nil {
+		model := runtime.EffectiveModel(agent, job)
+		provider, err := readOnlyOmpProvider(model)
+		if err != nil {
+			return runtime.Result{}, err
+		}
+		if job.Plan {
+			planProvider, err := readOnlyOmpProvider(job.PlanInto)
+			if err != nil {
+				return runtime.Result{}, fmt.Errorf("read-only omp plan execution model: %w", err)
+			}
+			if planProvider != provider {
+				return runtime.Result{}, fmt.Errorf("read-only omp plan execution provider %q is outside the broker scope %q", planProvider, provider)
+			}
+		}
+		if _, err := a.ompSession.prepare(model); err != nil {
+			return runtime.Result{}, err
+		}
+	}
 	// Mailbox repair turns reuse this adapter. Keep its isolated credentials and
 	// session state until RunJob returns; the worker owns job-boundary cleanup.
 	return a.Adapter.Deliver(ctx, agent, job)
 }
 
 func (a readOnlyRuntimeAdapter) cleanup() error {
+	var cleanupErrors []error
+	if a.ompSession != nil {
+		if err := a.ompSession.close(); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("stop read-only omp broker: %w", err))
+		}
+	}
 	// The prompt can move or rewrite anything under the job-private writable
 	// cache. Delete that entire root so renamed credentials cannot escape cleanup;
 	// never synchronize untrusted state back to the shared runtime profile.
-	if a.cleanupRoot == "" {
-		return nil
+	if a.cleanupRoot != "" {
+		if err := os.RemoveAll(a.cleanupRoot); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("remove read-only seat cache: %w", err))
+		}
 	}
-	if err := os.RemoveAll(a.cleanupRoot); err != nil {
-		return fmt.Errorf("remove read-only seat cache: %w", err)
-	}
-	return nil
+	return errors.Join(cleanupErrors...)
 }
 
 // reviewRepo is the repo of the JOB being run, which is what the seat's
@@ -1571,25 +1638,47 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 		return adapter, readOnlySeatSetup{}, nil
 	}
 	_, gatewayMode := adapter.(modelGatewayRuntimeAdapter)
+	// Resolve credentials before creating or publishing any seat state. Claude
+	// receives its authoritative overlay. OMP reads its upstream token from an
+	// owner-only file now, but starts its provider-filtered proxy only when
+	// Deliver has the job's effective model.
+	var (
+		seatAuthEnv []string
+		ompConfig   *readOnlyOmpBrokerConfig
+	)
+	var err error
+	if agent.Runtime == runtime.OmpRuntime {
+		config, configErr := readOnlySeatOmpBrokerConfig(os.Environ())
+		if configErr != nil {
+			return nil, readOnlySeatSetup{}, configErr
+		}
+		ompConfig = &config
+	} else {
+		seatAuthEnv, err = readOnlySeatRuntimeAuthEnv(home, agent.Runtime, gatewayMode)
+	}
+	if err != nil {
+		return nil, readOnlySeatSetup{}, err
+	}
 	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, reviewRepo, gatewayMode)
 	if err != nil {
 		return nil, readOnlySeatSetup{}, err
 	}
-	// A seat's env is rebuilt from scratch, which DROPPED the runtime auth the
-	// non-seat path injects (runtimeJobRunnerWithAuth appends
-	// runtimeAuthInjectionEnv onto the curated BaseEnv). The seat was therefore
-	// left with nothing but its staged credential snapshot, and once that
-	// snapshot expired every claude review failed with "OAuth session expired and
-	// could not be refreshed" while `gitmoot auth probe claude` stayed green,
-	// because the probe reads the resolved auth the seat never received. Inject
-	// the same overlay here so a seat authenticates exactly like every other job.
+	setup := readOnlySeatSetup{dropped: grants.dropped, runtimeUnavailable: grants.runtimeUnavailable, toolchainUnavailable: grants.toolchainUnavailable}
+	var ompSession *readOnlyOmpBrokerSession
+	if ompConfig != nil {
+		if grants.stateDir == "" {
+			cleanupErr := os.RemoveAll(grants.cacheRoot)
+			return nil, setup, errors.Join(errors.New("read-only omp broker requires isolated runtime state"), cleanupErr)
+		}
+		ompSession = &readOnlyOmpBrokerSession{config: *ompConfig, stateDir: grants.stateDir}
+	}
+	// A seat's env is rebuilt from scratch. Claude therefore needs the same
+	// resolved runtime-auth overlay as every other Claude job. OMP's proxy token
+	// exists only in its job-private config; its upstream bearer, operator
+	// profile, and ambient provider keys remain outside the child environment.
+	//
 	// Gateway mode is excluded: there the gateway holds the credential and the
 	// seat is deliberately given none.
-	seatAuthEnv, err := readOnlySeatRuntimeAuthEnv(home, agent.Runtime, gatewayMode)
-	if err != nil {
-		return nil, readOnlySeatSetup{}, err
-	}
-	setup := readOnlySeatSetup{dropped: grants.dropped, runtimeUnavailable: grants.runtimeUnavailable, toolchainUnavailable: grants.toolchainUnavailable}
 	wrap := func(runner subprocess.Runner) subprocess.Runner {
 		baseEnv := readOnlyRuntimeBaseEnv(agent.Runtime, os.Environ(), filepath.Join(grants.cacheRoot, "gh"))
 		curated := graftRuntimeBaseRunner(runner, subprocess.CuratedGroupRunner{
@@ -1607,7 +1696,8 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 	if err != nil {
 		// Staging and narrowing are already done at this point, so the
 		// withheld list is reported even though the wrap failed.
-		return nil, setup, err
+		cleanupErr := os.RemoveAll(grants.cacheRoot)
+		return nil, setup, errors.Join(err, cleanupErr)
 	}
 	if grants.stateDir == "" {
 		return wrapped, setup, nil
@@ -1617,11 +1707,13 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 		// The narrowing already happened, so report it even though delivery
 		// cannot be built: a withheld credential is news whether or not the
 		// wrap succeeds.
-		return nil, setup, fmt.Errorf("read-only Landlock sandbox returned incompatible %T adapter", wrapped)
+		cleanupErr := os.RemoveAll(grants.cacheRoot)
+		return nil, setup, errors.Join(fmt.Errorf("read-only Landlock sandbox returned incompatible %T adapter", wrapped), cleanupErr)
 	}
 	return readOnlyRuntimeAdapter{
 		Adapter:     runtimeAdapter,
 		cleanupRoot: grants.cacheRoot,
+		ompSession:  ompSession,
 	}, setup, nil
 }
 
@@ -1657,8 +1749,12 @@ func wrapReadOnlyAdapterRunner(runtimeName string, adapter workflow.DeliveryAdap
 	case *runtime.KimiAdapter:
 		a.Runner = wrap(a.Runner)
 		return a, nil
-	case runtime.OmpAdapter, *runtime.OmpAdapter:
-		return nil, errors.New("read-only seats cannot use omp without an isolated credential broker")
+	case runtime.OmpAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
+	case *runtime.OmpAdapter:
+		a.Runner = wrap(a.Runner)
+		return a, nil
 	case runtime.ShellAdapter:
 		a.Runner = wrap(a.Runner)
 		return a, nil
@@ -2004,7 +2100,7 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	// Runtime executables are staged beside the Go toolchain and exposed by
 	// fingerprint-local shims. Grant the PUBLISHED roots the daemon owns, never
 	// the operator PATH roots they were copied from (#1921, ruling 122157).
-	stagedRuntimes, runtimeInterpreters, runtimeDiagnostics, err := stageSeatRuntimes(paths)
+	stagedRuntimes, runtimeInterpreters, runtimeDiagnostics, err := stageSeatRuntimes(paths, agent.Runtime)
 	if err != nil {
 		return grants, err
 	}
@@ -2158,8 +2254,10 @@ type readOnlySeatStatePolicy struct {
 	// is only correct for a file that cannot carry a third-party credential.
 	inputNarrowers map[string]func([]byte) (narrowedConfig, error)
 	// stateEnv names the environment variable that points the runtime at the
-	// staged dir. Empty when the runtime finds it through HOME.
-	stateEnv string
+	// staged dir. stateRootEnv names a config-root variable whose value the
+	// runtime resolves relative to HOME. Empty when HOME alone locates state.
+	stateEnv     string
+	stateRootEnv string
 }
 
 // readOnlySeatStatePolicyFor returns the staging policy for a runtime. The
@@ -2235,7 +2333,15 @@ func readOnlySeatStatePolicyForRuntime(runtimeName string, userHome string, gate
 	case runtime.ShellRuntime:
 		return readOnlySeatStatePolicy{}, false, nil
 	case runtime.OmpRuntime:
-		return readOnlySeatStatePolicy{}, false, errors.New("read-only seats cannot use omp without an isolated credential broker")
+		// OMP authenticates only through the separately validated scoped proxy.
+		// Its writable config, database, snapshot cache and logs need fresh
+		// job-private roots, but no file from the operator's OMP profile is staged.
+		return readOnlySeatStatePolicy{
+			defaultSourceDir: filepath.Join(userHome, ".omp", "agent"),
+			relativeState:    filepath.Join(".omp", "agent"),
+			stateEnv:         "PI_CODING_AGENT_DIR",
+			stateRootEnv:     "PI_CONFIG_DIR",
+		}, true, nil
 	default:
 		return readOnlySeatStatePolicy{}, false, fmt.Errorf("read-only seat runtime %q has no isolated state policy", runtimeName)
 	}
@@ -2314,6 +2420,16 @@ func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string, gatewayM
 	var stateEnv []string
 	if policy.stateEnv != "" {
 		stateEnv = append(stateEnv, policy.stateEnv+"="+stateDir)
+	}
+	if policy.stateRootEnv != "" {
+		rootFromHome, err := filepath.Rel(filepath.Join(cacheRoot, "home"), filepath.Dir(stateDir))
+		if err != nil {
+			return "", nil, nil, fmt.Errorf("resolve isolated runtime config root: %w", err)
+		}
+		if filepath.IsAbs(rootFromHome) {
+			return "", nil, nil, errors.New("isolated runtime config root did not resolve relative to HOME")
+		}
+		stateEnv = append(stateEnv, policy.stateRootEnv+"="+rootFromHome)
 	}
 	return stateDir, stateEnv, dropped, nil
 }

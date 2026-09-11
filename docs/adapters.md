@@ -148,6 +148,21 @@ then executes it, and that `--plan-yolo-into` selects the execution model with
 the `smol` role as the default. Gitmoot verifies the installed flags and records
 the requested plan shape; it cannot verify omp's internal phase transitions.
 
+Read-only OMP review and ask seats do not inherit profile auth or ambient
+provider keys. They require `OMP_AUTH_BROKER_URL` as an HTTPS or loopback HTTP
+origin, an owner-only token file named by `OMP_AUTH_BROKER_TOKEN_FILE`, and a
+provider-qualified effective model.
+An upstream `OMP_AUTH_BROKER_TOKEN` in the daemon environment is refused
+because the runtime requires seat-readable `/proc`. Gitmoot writes a random
+job-local token and loopback URL only into the seat's minimal `config.yml`; no
+broker secret enters the child environment. The proxy filters credentials and
+usage to that provider, forwards only credential refreshes, and does not expose
+shared broker writes. The daemon-staged OMP binary runs under the normal
+read-only Landlock wrapper with job-private `PI_CONFIG_DIR` and
+`PI_CODING_AGENT_DIR` roots. Missing or unsafe broker configuration refuses
+before runtime staging; an unqualified effective model refuses before OMP
+launches. The proxy and state are removed after delivery.
+
 Startup stores the session id from the NDJSON header line, but delivery never
 uses it: omp is stateless in v1 and never passes `--resume`, `--continue`, or
 `--fork`. That is a correctness requirement, not a simplification —

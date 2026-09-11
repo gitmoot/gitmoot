@@ -6,11 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/credgw"
@@ -951,15 +954,162 @@ func TestStageReadOnlyRuntimeCredentialCopiesOnlyProviderSection(t *testing.T) {
 	}
 }
 
-func TestWrapReadOnlySandboxAdapterRejectsOmpWithoutCredentialBroker(t *testing.T) {
+func TestWrapReadOnlySandboxAdapterRejectsOmpBeforeStagingWithoutCredentialBroker(t *testing.T) {
 	checkout := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	agent := runtime.Agent{Runtime: runtime.OmpRuntime, ReadOnlySeat: true}
-	_, _, err := wrapReadOnlySandboxAdapter(t.TempDir(), agent, checkout, "", runtime.OmpAdapter{})
-	if err == nil || !strings.Contains(err.Error(), "isolated credential broker") {
+	t.Setenv("OMP_AUTH_BROKER_URL", "")
+	t.Setenv("OMP_AUTH_BROKER_TOKEN", "")
+	t.Setenv("OMP_AUTH_BROKER_TOKEN_FILE", "")
+	configHome := t.TempDir()
+	_, _, err := wrapReadOnlySandboxAdapter(configHome, runtime.Agent{
+		Runtime: runtime.OmpRuntime, ReadOnlySeat: true,
+	}, checkout, "", runtime.OmpAdapter{})
+	if err == nil ||
+		!strings.Contains(err.Error(), "OMP_AUTH_BROKER_URL") ||
+		!strings.Contains(err.Error(), "OMP_AUTH_BROKER_TOKEN_FILE") {
 		t.Fatalf("omp read-only seat error = %v", err)
+	}
+	entries, readErr := os.ReadDir(configHome)
+	if readErr != nil || len(entries) != 0 {
+		t.Fatalf("broker refusal staged state under %q: entries=%v err=%v", configHome, entries, readErr)
+	}
+}
+
+func TestWrapReadOnlySandboxAdapterUsesScopedBrokerAndPrivateOmpState(t *testing.T) {
+	configHome := t.TempDir()
+	checkout := filepath.Join(t.TempDir(), "review-worktree")
+	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	hostProfile := filepath.Join(t.TempDir(), "operator-omp")
+	if err := os.MkdirAll(hostProfile, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hostProfile, "agent.db"), []byte("host sessions and credentials"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runtimeDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(runtimeDir, runtime.OmpRuntime), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tokenFile := filepath.Join(t.TempDir(), "broker-token")
+	if err := os.WriteFile(tokenFile, []byte("seat-broker-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OMP_AUTH_BROKER_URL", "http://127.0.0.1:8765")
+	t.Setenv("OMP_AUTH_BROKER_TOKEN", "")
+	t.Setenv("OMP_AUTH_BROKER_TOKEN_FILE", tokenFile)
+	t.Setenv("OPENAI_API_KEY", "must-not-cross")
+	t.Setenv("ANTHROPIC_API_KEY", "must-not-cross")
+	t.Setenv("OMP_PROFILE", "operator")
+	t.Setenv("PI_PROFILE", "operator")
+	t.Setenv("PI_CODING_AGENT_DIR", hostProfile)
+
+	wrapped, _, err := wrapReadOnlySandboxAdapter(configHome, runtime.Agent{
+		Runtime: runtime.OmpRuntime, Model: "kimi-code/k3", ReadOnlySeat: true, RuntimeConfigDir: hostProfile,
+	}, checkout, "", runtime.OmpAdapter{Runner: subprocess.GroupRunner{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateAdapter, ok := wrapped.(readOnlyRuntimeAdapter)
+	if !ok {
+		t.Fatalf("wrapped adapter = %T, want readOnlyRuntimeAdapter", wrapped)
+	}
+	stateDir := filepath.Join(stateAdapter.cleanupRoot, "runtime-state", ".omp", "agent")
+	if entries, err := os.ReadDir(stateDir); err != nil || len(entries) != 0 {
+		t.Fatalf("isolated OMP state before delivery = %q entries=%v err=%v, want empty", stateDir, entries, err)
+	}
+	if _, err := stateAdapter.ompSession.prepare("kimi-code/k3"); err != nil {
+		t.Fatalf("prepare job-scoped OMP broker: %v", err)
+	}
+	entries, err := os.ReadDir(stateDir)
+	if err != nil || len(entries) != 1 || entries[0].Name() != "config.yml" {
+		t.Fatalf("isolated OMP state = %q entries=%v err=%v, want only scoped config", stateDir, entries, err)
+	}
+	brokerURL := "http://" + stateAdapter.ompSession.broker.listener.Addr().String()
+	brokerToken := stateAdapter.ompSession.broker.downstreamKey
+	configPath := filepath.Join(stateDir, "config.yml")
+	configData, err := os.ReadFile(configPath)
+	if err != nil ||
+		!strings.Contains(string(configData), brokerURL) ||
+		!strings.Contains(string(configData), brokerToken) ||
+		strings.Contains(string(configData), "seat-broker-token") ||
+		strings.Contains(string(configData), "127.0.0.1:8765") {
+		t.Fatalf("job-private OMP config did not contain only the scoped route: %q err=%v", configData, err)
+	}
+	if info, err := os.Stat(configPath); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("job-private OMP config mode = %v err=%v, want 0600", info, err)
+	}
+	ompAdapter, ok := stateAdapter.Adapter.(runtime.OmpAdapter)
+	if !ok {
+		t.Fatalf("inner adapter = %T, want runtime.OmpAdapter", stateAdapter.Adapter)
+	}
+	runner, ok := ompAdapter.Runner.(subprocess.WrappingRunner)
+	if !ok {
+		t.Fatalf("wrapped runner = %T, want subprocess.WrappingRunner", ompAdapter.Runner)
+	}
+	if !runner.ReadOnlyWorkdir || len(runner.WritablePaths) != 1 || runner.WritablePaths[0] != stateAdapter.cleanupRoot {
+		t.Fatalf("OMP sandbox workdir/write grants = readOnly:%v writes:%v", runner.ReadOnlyWorkdir, runner.WritablePaths)
+	}
+	if containsPath(runner.ReadablePaths, hostProfile) || containsPath(runner.ReadableFiles, filepath.Join(hostProfile, "agent.db")) {
+		t.Fatalf("OMP sandbox reads expose operator profile: dirs=%v files=%v", runner.ReadablePaths, runner.ReadableFiles)
+	}
+	if envValue(runner.Env, "PI_CODING_AGENT_DIR") != stateDir ||
+		envValue(runner.Env, "PI_CONFIG_DIR") != filepath.Join("..", "runtime-state", ".omp") {
+		t.Fatalf("OMP sandbox env lacks isolated state roots: %v", redactEnvNames(runner.Env))
+	}
+	for _, forbidden := range []string{
+		"OPENAI_API_KEY=", "ANTHROPIC_API_KEY=", "OMP_PROFILE=", "PI_PROFILE=",
+		"OMP_AUTH_BROKER_URL=", "OMP_AUTH_BROKER_TOKEN=", "OMP_AUTH_BROKER_TOKEN_FILE=",
+	} {
+		if containsEnvPrefix(runner.Env, forbidden) {
+			t.Fatalf("OMP sandbox env contains forbidden %s", strings.TrimSuffix(forbidden, "="))
+		}
+	}
+	base, ok := runner.Inner.(subprocess.CuratedGroupRunner)
+	if !ok {
+		t.Fatalf("sandbox inner = %T, want CuratedGroupRunner", runner.Inner)
+	}
+	for _, forbidden := range []string{"OMP_AUTH_BROKER_URL=", "OMP_AUTH_BROKER_TOKEN=", "OMP_AUTH_BROKER_TOKEN_FILE="} {
+		if containsEnvPrefix(base.BaseEnv, forbidden) {
+			t.Fatalf("OMP curated base exposes broker config: %v", redactEnvNames(base.BaseEnv))
+		}
+	}
+	if probe := sandbox.SandboxProbe(); probe.Supported {
+		for _, path := range []string{
+			tokenFile,
+			filepath.Join("/proc", strconv.Itoa(os.Getpid()), "root", tokenFile),
+		} {
+			readResult, readErr := runner.Run(context.Background(), checkout, "/usr/bin/cat", path)
+			if readErr == nil || strings.Contains(readResult.Stdout, "seat-broker-token") {
+				t.Fatalf("OMP sandbox read upstream broker token through %q: err=%v output=%q", path, readErr, readResult.Stdout)
+			}
+		}
+	}
+	var stagedOmp string
+	for _, dir := range filepath.SplitList(envValue(runner.Env, "PATH")) {
+		candidate := filepath.Join(dir, runtime.OmpRuntime)
+		if info, statErr := os.Stat(candidate); statErr == nil && info.Mode().IsRegular() {
+			stagedOmp = candidate
+			break
+		}
+	}
+	if stagedOmp == "" || pathWithin(stagedOmp, runtimeDir) {
+		t.Fatalf("OMP PATH did not resolve an engine-owned staged copy: %q", stagedOmp)
+	}
+	if err := stateAdapter.cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stateAdapter.cleanupRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("isolated OMP state survived cleanup: %v", err)
+	}
+	client := http.Client{Timeout: 250 * time.Millisecond}
+	response, requestErr := client.Get(brokerURL + "/v1/healthz")
+	if requestErr == nil {
+		response.Body.Close()
+		t.Fatal("job-local OMP broker remained reachable after cleanup")
 	}
 }
 
