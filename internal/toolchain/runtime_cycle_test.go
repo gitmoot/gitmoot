@@ -23,6 +23,25 @@ import (
 // mode being guarded against is non-termination: a plain call would hang the
 // suite rather than fail it, and a stack overflow would take the test binary
 // with it.
+//
+// WHAT THIS TEST DOES AND DOES NOT DISCRIMINATE, measured by isolating each
+// guard rather than asserted (#2142 review, P3):
+//
+//	delete ONLY the revisits loop, keep the depth bound -> PASS
+//	delete ONLY the depth bound, keep the revisits loop -> PASS
+//	delete BOTH                                         -> FAIL at the deadline
+//
+// EITHER GUARD ALONE TERMINATES EVERY CYCLE, so this test proves that the
+// recursion is bounded and does NOT prove that either guard individually is
+// load-bearing. An earlier version of this comment claimed the revisits loop
+// was killed on its own; the mutant behind that claim had deleted both guards,
+// and the reviewer caught it by static trace without running anything.
+//
+// Both are kept deliberately, and the reason is the message rather than
+// termination: the revisits loop stops at the FIRST repeat and says
+// "revisits %q, so it cannot terminate", which names the defect, where the
+// depth bound says "exceeds 8 links", which names the limit. This test accepts
+// either message, which is exactly why it cannot tell them apart.
 func TestStageRuntimeRefusesACyclicInterpreterChain(t *testing.T) {
 	tests := map[string]func(t *testing.T, dir string) string{
 		"self-referential shebang": func(t *testing.T, dir string) string {
