@@ -109,7 +109,7 @@ func TestExecBackendAttemptLifecycleGenerationEnforcedBySchema(t *testing.T) {
 		}
 	}
 	reservation := testExecBackendReservation(ExecBackendAttemptKey{JobID: "negative-generation", Attempt: 1, LifecycleGeneration: -1})
-	if err := store.ReserveExecBackendAttempt(ctx, reservation); err == nil {
+	if err := store.ReserveExecBackendAttempt(ctx, reservation, testExecBackendUncappedPolicy()); err == nil {
 		t.Fatal("negative lifecycle generation succeeded")
 	}
 }
@@ -133,7 +133,7 @@ func TestReserveExecBackendAttempt(t *testing.T) {
 		t.Fatalf("fencing identity = (%q, %q), want daemon token and boot id", attempt.DaemonFencingToken, attempt.BootID)
 	}
 
-	if err := store.ReserveExecBackendAttempt(context.Background(), testExecBackendReservation(key)); err == nil {
+	if err := store.ReserveExecBackendAttempt(context.Background(), testExecBackendReservation(key), testExecBackendUncappedPolicy()); err == nil {
 		t.Fatal("duplicate reservation unexpectedly succeeded")
 	}
 }
@@ -206,7 +206,7 @@ func TestMarkExecBackendAttemptFailed(t *testing.T) {
 func TestListExecBackendAttemptsWithoutSandboxID(t *testing.T) {
 	store, nullKey := reserveTestExecBackendAttempt(t, "null-sandbox")
 	runningKey := ExecBackendAttemptKey{JobID: "running-has-handle", Attempt: 1, LifecycleGeneration: 4}
-	if err := store.ReserveExecBackendAttempt(context.Background(), testExecBackendReservation(runningKey)); err != nil {
+	if err := store.ReserveExecBackendAttempt(context.Background(), testExecBackendReservation(runningKey), testExecBackendUncappedPolicy()); err != nil {
 		t.Fatalf("reserve running row: %v", err)
 	}
 	requireExecBackendTransition(t)(store.MarkExecBackendAttemptProvisioning(context.Background(), runningKey))
@@ -294,7 +294,7 @@ func reserveTestExecBackendAttempt(t *testing.T, jobID string) (*Store, ExecBack
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	key := ExecBackendAttemptKey{JobID: jobID, Attempt: 2, LifecycleGeneration: 4}
-	if err := store.ReserveExecBackendAttempt(context.Background(), testExecBackendReservation(key)); err != nil {
+	if err := store.ReserveExecBackendAttempt(context.Background(), testExecBackendReservation(key), testExecBackendUncappedPolicy()); err != nil {
 		t.Fatalf("ReserveExecBackendAttempt: %v", err)
 	}
 	return store, key
@@ -359,4 +359,11 @@ func requireExecBackendTransitionRejected(t *testing.T) func(bool, error) {
 			t.Fatal("transition changed a row from the wrong state")
 		}
 	}
+}
+
+// testExecBackendUncappedPolicy is a CONFIGURED policy with headroom, used by
+// tests that predate the cost cap and are not about it. It is deliberately not
+// the zero value: the zero value denies (#1540).
+func testExecBackendUncappedPolicy() ExecBackendCostCap {
+	return ExecBackendCostCap{Configured: true, MaxReservedUSD: 1e9, PerAttemptUSD: 0.01}
 }

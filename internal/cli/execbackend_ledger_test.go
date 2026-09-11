@@ -212,8 +212,13 @@ func TestExecBackendLedgerTeardownUpdatesEveryPath(t *testing.T) {
 		} else if !reflect.DeepEqual(reaped, []string{"sandbox-reap"}) {
 			t.Fatalf("reaped = %v", reaped)
 		}
-		if got := execBackendAttemptForTest(t, store, key).State; got != db.ExecBackendAttemptStateOrphaned {
-			t.Fatalf("startup-reaped state = %q, want orphaned", got)
+		// THE PROVIDER CONFIRMED THIS DESTROY - the fixture's ReapReport carries
+		// Destroyed: ["sandbox-reap"] - so the terminal state is destroyed, not
+		// orphaned (#2147). This assertion previously pinned orphaned, which was
+		// the defect: the reconciler could only reach orphaned from a live state,
+		// and orphaned bills against the compute cap and is terminal-unreachable.
+		if got := execBackendAttemptForTest(t, store, key).State; got != db.ExecBackendAttemptStateDestroyed {
+			t.Fatalf("startup-reaped state = %q, want destroyed: the provider confirmed this sandbox is gone, so recording it as an orphan holds its reservation forever", got)
 		}
 	})
 }
@@ -224,7 +229,7 @@ func TestExecBackendLedgerReconcilesBothInventoryDirections(t *testing.T) {
 	crashKey := db.ExecBackendAttemptKey{JobID: "job-crash", Attempt: 1, LifecycleGeneration: 8}
 	if err := store.ReserveExecBackendAttempt(context.Background(), db.ExecBackendAttemptReservation{
 		ExecBackendAttemptKey: crashKey, Provider: e2bAttemptProvider, DaemonFencingToken: "fence-crash", BootID: "boot-crash", TTLExpiresAt: time.Now().Add(time.Minute),
-	}); err != nil {
+	}, testCLIExecBackendUncappedPolicy()); err != nil {
 		t.Fatal(err)
 	}
 	if changed, err := store.MarkExecBackendAttemptProvisioning(context.Background(), crashKey); err != nil || !changed {
@@ -291,7 +296,7 @@ func openExecBackendLedgerTestStore(t *testing.T) *db.Store {
 
 func newExecBackendLedgerForTest(t *testing.T, store *db.Store, inner *ledgerTestBackend, output *bytes.Buffer, fencingToken, bootID string) *ledgeredExecutionBackend {
 	t.Helper()
-	backend, err := newLedgeredExecutionBackend(store, inner, e2bAttemptProvider, fencingToken, bootID, output)
+	backend, err := newLedgeredExecutionBackend(store, inner, e2bAttemptProvider, fencingToken, bootID, output, testCLIExecBackendUncappedPolicy())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,7 +308,7 @@ func seedRunningExecBackendAttempt(t *testing.T, store *db.Store, jobID, sandbox
 	key := db.ExecBackendAttemptKey{JobID: jobID, Attempt: 1, LifecycleGeneration: 3}
 	if err := store.ReserveExecBackendAttempt(context.Background(), db.ExecBackendAttemptReservation{
 		ExecBackendAttemptKey: key, Provider: e2bAttemptProvider, DaemonFencingToken: fencingToken, BootID: bootID, TTLExpiresAt: time.Now().Add(time.Minute),
-	}); err != nil {
+	}, testCLIExecBackendUncappedPolicy()); err != nil {
 		t.Fatal(err)
 	}
 	if changed, err := store.MarkExecBackendAttemptProvisioning(context.Background(), key); err != nil || !changed {
@@ -322,4 +327,10 @@ func execBackendAttemptForTest(t *testing.T, store *db.Store, key db.ExecBackend
 		t.Fatal(err)
 	}
 	return attempt
+}
+
+// testCLIExecBackendUncappedPolicy is a CONFIGURED policy with headroom for
+// ledger tests that predate the cost cap. The zero value denies (#1540).
+func testCLIExecBackendUncappedPolicy() db.ExecBackendCostCap {
+	return db.ExecBackendCostCap{Configured: true, MaxReservedUSD: 1e9, PerAttemptUSD: 0.01}
 }
