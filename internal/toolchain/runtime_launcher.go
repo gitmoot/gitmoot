@@ -52,7 +52,7 @@ func shortDigest(value string) string {
 // The closure is transitive because an interpreter can itself be a script:
 // returning only the immediate one leaves a third root ungranted and the seat
 // still exits 126.
-func (s *stageSource) stageInterpreter(gitmootHome string) (string, bool, []string, error) {
+func (s *stageSource) stageInterpreter(gitmootHome string, chain []string) (string, bool, []string, error) {
 	var entrypoint *os.File
 	for _, member := range s.members {
 		if member.relative == s.entrypoint {
@@ -117,7 +117,7 @@ func (s *stageSource) stageInterpreter(gitmootHome string) (string, bool, []stri
 	}
 	// The recursion is what makes the closure transitive: this interpreter's
 	// own interpreters come back here and are propagated to the caller.
-	launcher, nested, err := StageRuntime(gitmootHome, filepath.Base(candidate), absolute)
+	launcher, nested, err := stageRuntimeBounded(gitmootHome, filepath.Base(candidate), absolute, chain)
 	if err != nil {
 		return "", false, nil, err
 	}
