@@ -198,6 +198,27 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	if err := runForeignBootRecoveryOnce(ctx, store, stdout, startupNow, tracker); err != nil {
 		return err
 	}
+	// Reconcile the cached default branch here too (#2145 review, F1).
+	//
+	// pollRepo does this for the fleet, but THIS supervisor never calls pollRepo -
+	// single-repo mode runs startSingleRepoWorkerLoop instead - so without this a
+	// `daemon run --repo owner/repo` deployment could never correct a wrong base
+	// branch, and the claim that a wrong value is transient would be false for
+	// exactly the mode an operator uses to debug one repository.
+	//
+	// Startup-only rather than per tick: this loop ticks far more often than the
+	// fleet poll, the value changes about as often as a repository's default
+	// branch does, and every store call here contends for the daemon's single
+	// SQLite connection (#2145).
+	if record, recErr := store.GetRepo(ctx, d.Repo.FullName()); recErr == nil && strings.TrimSpace(record.CheckoutPath) != "" {
+		if branch, branchErr := gitutil.NewHostClient(record.CheckoutPath).RemoteDefaultBranch(ctx); branchErr == nil {
+			if changed, updateErr := store.UpdateRepoDefaultBranch(ctx, d.Repo.FullName(), branch); updateErr != nil {
+				writeLine(stdout, "%s: default branch reconcile failed: %v", d.Repo.FullName(), updateErr)
+			} else if changed {
+				writeLine(stdout, "%s: default branch reconciled to %s (was %s)", d.Repo.FullName(), branch, record.DefaultBranch)
+			}
+		}
+	}
 	if err := recoverRunningJobsForRepo(ctx, store, stdout, d.Repo.FullName(), rootFilter); err != nil {
 		return err
 	}

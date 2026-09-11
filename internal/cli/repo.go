@@ -578,7 +578,8 @@ func resolveRegisteredRepoRecordWithRunner(ctx context.Context, store *db.Store,
 				}
 			}
 			resolved.PrimaryCheckoutPath = primary
-			return preserveRegisteredRepoFields(resolved, existing), false, nil
+			remoteDefault, _ := jobGitClient(checkout, runner).RemoteDefaultBranch(ctx)
+			return preserveRegisteredRepoFields(resolved, existing, remoteDefault), false, nil
 		}
 		checkoutErr = err
 	} else {
@@ -604,7 +605,8 @@ func resolveRegisteredRepoRecordWithRunner(ctx context.Context, store *db.Store,
 		}
 	}
 	resolved.PrimaryCheckoutPath = primary
-	resolved = preserveRegisteredRepoFields(resolved, existing)
+	remoteDefault, _ := jobGitClient(primary, runner).RemoteDefaultBranch(ctx)
+	resolved = preserveRegisteredRepoFields(resolved, existing, remoteDefault)
 	healed, err := store.HealRepoCheckout(ctx, repo.FullName(), checkout, resolved.CheckoutPath, primary)
 	if err != nil {
 		return db.Repo{}, false, err
@@ -620,8 +622,27 @@ func resolveRegisteredRepoRecordWithRunner(ctx context.Context, store *db.Store,
 	return resolved, true, nil
 }
 
-func preserveRegisteredRepoFields(resolved, existing db.Repo) db.Repo {
-	if strings.TrimSpace(existing.DefaultBranch) != "" {
+// preserveRegisteredRepoFields keeps operator-owned fields across a re-resolve.
+//
+// remoteDefault is the branch origin/HEAD names, or "" when it could not be
+// read. It is passed EXPLICITLY rather than inferred from resolved, because the
+// decision needs the PROVENANCE of the value and not just the value: a branch
+// derived from the remote is authoritative and must overwrite a stored one,
+// while a branch that fell back to the worktree's current HEAD must never
+// overwrite a stored value that may have come from the remote earlier.
+//
+// This kept the stored DefaultBranch whenever it was non-empty (#2145 review,
+// F1). That was protective while the resolved value came from CurrentBranch - it
+// stopped a worktree artifact overwriting the record - but it also meant a
+// CORRECT remote-derived value could never replace a wrong stored one, so
+// `jerryfane/herdr` kept `fix/lan-address-portability` however often it was
+// re-resolved. THE PRESERVE RULE WAS A WORKAROUND FOR THE DEFECT THIS CHANGE
+// FIXES, and keeping both leaves the record permanently wrong.
+func preserveRegisteredRepoFields(resolved, existing db.Repo, remoteDefault string) db.Repo {
+	switch {
+	case strings.TrimSpace(remoteDefault) != "":
+		resolved.DefaultBranch = strings.TrimSpace(remoteDefault)
+	case strings.TrimSpace(existing.DefaultBranch) != "":
 		resolved.DefaultBranch = existing.DefaultBranch
 	}
 	resolved.PollInterval = existing.PollInterval
