@@ -890,6 +890,25 @@ func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumb
 					}
 					continue
 				}
+			} else if canonicalTask.State != string(workflow.TaskReadyToMerge) {
+				// An external merge can become uncertain while the canonical task
+				// is still reviewing. The fresh forge result is authoritative, so
+				// release only that retained claim before the ordinary merged
+				// transition. HandleReviewPullRequestClosed must own the transition:
+				// it also releases the branch lock and removes the task worktree.
+				_, currentState, releaseErr := d.Store.ReleaseRetainedTaskStateClaim(ctx,
+					canonicalTask.ID, canonicalTask.State, db.TaskStateClaimKindExternalMergeUncertain)
+				if releaseErr != nil {
+					if firstErr == nil {
+						firstErr = releaseErr
+					}
+					continue
+				}
+				if currentState != canonicalTask.State {
+					// A concurrent transition won the expected-state check. Re-read
+					// the task on the next poll instead of applying this stale branch.
+					continue
+				}
 			}
 			if closeErr := d.Workflow.HandleReviewPullRequestClosed(ctx, event, true); closeErr != nil {
 				if firstErr == nil {

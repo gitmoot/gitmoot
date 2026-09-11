@@ -52,6 +52,99 @@ func TestPollOnceReconcilesExternallyMergedLifecycleTasks(t *testing.T) {
 	}
 }
 
+func TestPollOnceRecoversRetainedClaimForExternallyMergedReviewTask(t *testing.T) {
+	ctx := context.Background()
+	repo := github.Repository{Owner: "owner", Name: "repo"}
+	store := testStore(t)
+	const (
+		taskID       = "review-pr-7-agent"
+		branch       = "feature/seven"
+		worktreePath = "/tmp/gitmoot-retained-review-worktree"
+	)
+	seedExternalMergeTask(t, store, repo, taskID, branch, workflow.TaskReviewing, 7)
+	task, err := store.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task.WorktreePath = worktreePath
+	if err := store.UpsertTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName: repo.FullName(), Branch: branch, Owner: "review-agent",
+	}); err != nil || !acquired {
+		t.Fatalf("AcquireLock = acquired %v err %v", acquired, err)
+	}
+
+	token, claimed, current, err := store.ClaimTaskState(ctx, taskID, string(workflow.TaskReviewing),
+		db.TaskStateClaimKindExternalMerge, time.Minute)
+	if err != nil || !claimed || current != string(workflow.TaskReviewing) {
+		t.Fatalf("ClaimTaskState = token %q claimed %v current %q err %v", token, claimed, current, err)
+	}
+	retained, err := store.RetainTaskStateClaim(ctx, taskID, token,
+		string(workflow.TaskReviewing), db.TaskStateClaimKindExternalMergeUncertain)
+	if err != nil || !retained {
+		t.Fatalf("RetainTaskStateClaim = retained %v err %v", retained, err)
+	}
+
+	client := &fakeGitHub{
+		pullsByState:  map[string][]github.PullRequest{"open": nil, "closed": nil},
+		pullsByNumber: map[int64]github.PullRequest{7: mergedPull(7, branch)},
+		comments:      map[int64][]github.IssueComment{},
+	}
+	worktrees := &retainedClaimWorktreeManager{}
+	engine := workflow.Engine{Store: store, DelegationWorktrees: worktrees}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce with retained merge claim: %v", err)
+	}
+	assertExternalMergeState(t, store, repo.FullName(), taskID, 7, workflow.TaskMerged, "merged")
+	if claimed, err := store.HasTaskStateClaim(ctx, taskID); err != nil || claimed {
+		t.Fatalf("retained claim after merged reconciliation = %v, err=%v; want cleared", claimed, err)
+	}
+	if _, err := store.GetBranchLock(ctx, repo.FullName(), branch); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("branch lock after merged reconciliation = %v, want absent", err)
+	}
+	task, err = store.GetTask(ctx, taskID)
+	if err != nil || task.WorktreePath != "" {
+		t.Fatalf("task after merged cleanup = %+v err=%v, want empty worktree", task, err)
+	}
+	if !reflect.DeepEqual(worktrees.removed, []string{worktreePath}) {
+		t.Fatalf("removed worktrees = %v, want [%s]", worktrees.removed, worktreePath)
+	}
+	reconciliation, err := store.BeginPullRequestTerminalReconciliation(ctx, db.PullRequestTerminalReconciliation{
+		RepoFullName: repo.FullName(), PullRequest: 7, HeadSHA: "head-7", OwnerTaskID: taskID,
+	}, []string{taskID})
+	if err != nil || !reconciliation.EffectsCompleted {
+		t.Fatalf("terminal reconciliation = %+v, err=%v; want completed effects", reconciliation, err)
+	}
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("second PollOnce after retained merge claim recovery: %v", err)
+	}
+	assertExternalMergeState(t, store, repo.FullName(), taskID, 7, workflow.TaskMerged, "merged")
+	if len(worktrees.removed) != 1 {
+		t.Fatalf("second poll removed worktrees=%v, want cleanup exactly once", worktrees.removed)
+	}
+}
+
+type retainedClaimWorktreeManager struct {
+	removed []string
+}
+
+func (*retainedClaimWorktreeManager) AddWorktree(context.Context, string, string, string) error {
+	return errors.New("unexpected AddWorktree")
+}
+
+func (*retainedClaimWorktreeManager) AddDetachedWorktree(context.Context, string, string) error {
+	return errors.New("unexpected AddDetachedWorktree")
+}
+
+func (m *retainedClaimWorktreeManager) RemoveWorktreeForce(_ context.Context, path string) error {
+	m.removed = append(m.removed, path)
+	return nil
+}
+
 func TestBlockedTaskExternalMergeReconcileE2E(t *testing.T) {
 	// PollOnce's reconcile path performs no runtime delivery; the fake GitHub
 	// client and t.TempDir-backed store make this a deterministic no-LLM E2E.
