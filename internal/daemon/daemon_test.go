@@ -1327,8 +1327,8 @@ func TestPollOnceAutoMergeDisabledDoesNotPublishMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetMergeGateStatusObservation returned error: %v", err)
 	}
-	if observation.HeadSHA != "abc123" || observation.Kind != mergeGateStatusInactive {
-		t.Fatalf("status observation = %+v, want inactive current head", observation)
+	if observation.HeadSHA != "abc123" || observation.Kind != mergeGateStatusCleared {
+		t.Fatalf("status observation = %+v, want cleared current head", observation)
 	}
 }
 
@@ -1347,7 +1347,7 @@ func TestPollOnceExternalMergeGateDoesNotPublishMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetMergeGateStatusObservation returned error: %v", err)
 	}
-	if observation.Kind != mergeGateStatusInactive {
+	if observation.Kind != mergeGateStatusCleared {
 		t.Fatalf("status observation = %+v, want inactive under an external gate", observation)
 	}
 }
@@ -1378,7 +1378,7 @@ func TestPollOnceExternalMergeGateClearsGenericMarker(t *testing.T) {
 	}
 }
 
-func TestPollOnceAwaitingHumanClearsOnlyGenericMarker(t *testing.T) {
+func TestPollOnceAwaitingHumanClearsTheGenericMarker(t *testing.T) {
 	ctx := context.Background()
 	store, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskAwaitingHumanMerge)
 	if _, err := client.CreateCommitStatus(ctx, github.CommitStatusInput{
@@ -1415,8 +1415,8 @@ func TestPollOnceAwaitingHumanClearsOnlyGenericMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetMergeGateStatusObservation returned error: %v", err)
 	}
-	if observation.Kind != mergeGateStatusInactive {
-		t.Fatalf("status observation = %+v, want inactive", observation)
+	if observation.Kind != mergeGateStatusCleared {
+		t.Fatalf("status observation = %+v, want cleared", observation)
 	}
 }
 
@@ -1443,8 +1443,8 @@ func TestPollOnceInactiveTaskPreservesRealGateVerdict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetMergeGateStatusObservation returned error: %v", err)
 	}
-	if observation.Kind != mergeGateStatusInactive {
-		t.Fatalf("status observation = %+v, want reconciled inactive head", observation)
+	if observation.Kind != mergeGateStatusCleared {
+		t.Fatalf("status observation = %+v, want reconciled cleared head", observation)
 	}
 }
 
@@ -3823,5 +3823,136 @@ func TestHandlePullRequestWorkflowAttributesFanoutChildrenFromBranchLock(t *test
 	}
 	if payload.ActingOrgRole != "gmc-fanout" {
 		t.Fatalf("daemon-trigger fanout child acting_org_role = %q, want %q; an unattributed fanout child has no owner to wake (#1347)", payload.ActingOrgRole, "gmc-fanout")
+	}
+}
+
+// A REASONED pending status must clear even when an `inactive` observation
+// already exists for that head (#2148).
+//
+// This is the exact production shape. Clearance matched one literal
+// description, so a status carrying a specific reason - here the text that
+// stranded jerryfane/herdr#185 - was not recognised as Gitmoot's own output. The
+// pass then recorded `inactive`, and the early return on `inactive` meant no
+// later pass looked at the head again, so the pending status was PERMANENT and
+// the pull request reported `mergeable_state: unstable` on green check-runs.
+//
+// Measured across this fleet before the fix: 4 OPEN pull requests in 4 separate
+// repositories, each with a different reason text, none of them clearable.
+//
+// Both halves have to hold for the test to mean anything: the status must be
+// rewritten, AND the observation must be upgraded past `inactive` so the head is
+// not re-probed forever.
+func TestPollOnceClearsReasonedPendingStatusDespiteInactiveObservation(t *testing.T) {
+	ctx := context.Background()
+	store, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskAwaitingHumanMerge)
+	const reasoned = `external CI check "check (macos-latest)" is pending`
+	if _, err := client.CreateCommitStatus(ctx, github.CommitStatusInput{
+		Repo:        daemon.Repo,
+		SHA:         "abc123",
+		State:       "pending",
+		Context:     workflow.GitmootMergeGateContext,
+		Description: reasoned,
+	}); err != nil {
+		t.Fatalf("seed CreateCommitStatus returned error: %v", err)
+	}
+	// The legacy short-circuit: a head already written off as inactive.
+	if err := store.UpsertMergeGateStatusObservation(ctx, db.MergeGateStatusObservation{
+		RepoFullName: "gitmoot/gitmoot",
+		PullRequest:  7,
+		HeadSHA:      "abc123",
+		Kind:         mergeGateStatusInactive,
+	}); err != nil {
+		t.Fatalf("UpsertMergeGateStatusObservation returned error: %v", err)
+	}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(client.statuses) != 2 {
+		t.Fatalf("statuses = %+v, want the reasoned pending status followed by a not-applied success", client.statuses)
+	}
+	cleared := client.statuses[1]
+	if cleared.State != "success" ||
+		cleared.Context != workflow.GitmootMergeGateContext ||
+		cleared.Description != mergeGateNotAppliedDescription {
+		t.Fatalf("clearance status = %+v, want not-applied success; a pending status in Gitmoot's own context is Gitmoot's to resolve whatever its reason text says", cleared)
+	}
+	observation, err := store.GetMergeGateStatusObservation(ctx, "gitmoot/gitmoot", 7)
+	if err != nil {
+		t.Fatalf("GetMergeGateStatusObservation returned error: %v", err)
+	}
+	if observation.Kind != mergeGateStatusCleared {
+		t.Fatalf("status observation = %+v, want cleared; leaving it inactive is what made the leftover status permanent", observation)
+	}
+}
+
+// CONTROL: with no status of Gitmoot's own on the head, the not-applicable pass
+// must write nothing and still record `cleared`.
+//
+// Without this, the test above could pass for the wrong reason - a change that
+// wrote a success status unconditionally would satisfy it while adding a status
+// to every head Gitmoot does not manage.
+func TestPollOnceRecordsClearedWithoutWritingWhenNoOwnedStatusExists(t *testing.T) {
+	ctx := context.Background()
+	store, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskAwaitingHumanMerge)
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(client.statuses) != 0 {
+		t.Fatalf("statuses = %+v, want none written when Gitmoot owns no status on the head", client.statuses)
+	}
+	observation, err := store.GetMergeGateStatusObservation(ctx, "gitmoot/gitmoot", 7)
+	if err != nil {
+		t.Fatalf("GetMergeGateStatusObservation returned error: %v", err)
+	}
+	if observation.Kind != mergeGateStatusCleared {
+		t.Fatalf("status observation = %+v, want cleared with nothing outstanding", observation)
+	}
+}
+
+// A FAILED clearance write must not be recorded as cleared (#2148).
+//
+// This exists because a mutant survived: recording `cleared` unconditionally
+// after the write attempt passed every other test in the package. That mutant
+// recreates the original defect in a new form - the head is short-circuited as
+// having nothing outstanding while a pending status Gitmoot owns is still live
+// on it, so no later pass ever looks again.
+//
+// The observation must therefore stay at its prior value so the next pass
+// retries, and the retry is the only thing standing between a transient GitHub
+// failure and a permanently blocked pull request.
+func TestPollOnceFailedClearanceIsNotRecordedAsCleared(t *testing.T) {
+	ctx := context.Background()
+	store, client, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskAwaitingHumanMerge)
+	if _, err := client.CreateCommitStatus(ctx, github.CommitStatusInput{
+		Repo:        daemon.Repo,
+		SHA:         "abc123",
+		State:       "pending",
+		Context:     workflow.GitmootMergeGateContext,
+		Description: `external CI check "check (macos-latest)" is pending`,
+	}); err != nil {
+		t.Fatalf("seed CreateCommitStatus returned error: %v", err)
+	}
+	if err := store.UpsertMergeGateStatusObservation(ctx, db.MergeGateStatusObservation{
+		RepoFullName: "gitmoot/gitmoot",
+		PullRequest:  7,
+		HeadSHA:      "abc123",
+		Kind:         mergeGateStatusInactive,
+	}); err != nil {
+		t.Fatalf("UpsertMergeGateStatusObservation returned error: %v", err)
+	}
+	// The clearance write is the next status call, and it fails.
+	client.statusErrs = []error{errors.New("status bookkeeping unavailable")}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	observation, err := store.GetMergeGateStatusObservation(ctx, "gitmoot/gitmoot", 7)
+	if err != nil {
+		t.Fatalf("GetMergeGateStatusObservation returned error: %v", err)
+	}
+	if observation.Kind == mergeGateStatusCleared {
+		t.Fatalf("status observation = %+v, want it NOT cleared: the pending status is still live, and recording cleared short-circuits every later pass", observation)
 	}
 }
