@@ -122,3 +122,115 @@ func TestMarkExecBackendAttemptDestroyedAdmitsOnlyDestroying(t *testing.T) {
 		})
 	}
 }
+
+// TestExecBackendLifecycleTransitionsRefuseNonAdjacentSources generalises the
+// guard above to EVERY single-source transition in the lifecycle.
+//
+// The #2129 review found that the gap fixed for MarkExecBackendAttemptDestroyed
+// was shared by its four siblings: their production guards are correctly narrow,
+// but their tests only assert that a REPEATED call from the already-reached
+// target state is rejected. That catches nothing, because a widened guard still
+// refuses the target state - it is the source state that stops being checked.
+// The reviewer reproduced it on MarkExecBackendAttemptCollecting.
+//
+// The table asserts both directions per transition: refusal from every
+// non-adjacent live source, AND acceptance from the one legal source. The
+// acceptance arm is what makes the refusals mean something; without it a
+// transition that refused everything would pass identically.
+func TestExecBackendLifecycleTransitionsRefuseNonAdjacentSources(t *testing.T) {
+	ctx := context.Background()
+	// walk advances a fresh row to the requested state through the legal path.
+	walk := func(t *testing.T, store *Store, key ExecBackendAttemptKey, to string) {
+		t.Helper()
+		steps := []struct {
+			state string
+			call  func() (bool, error)
+		}{
+			{ExecBackendAttemptStateProvisioning, func() (bool, error) { return store.MarkExecBackendAttemptProvisioning(ctx, key) }},
+			{ExecBackendAttemptStateRunning, func() (bool, error) {
+				return store.MarkExecBackendAttemptRunning(ctx, key, "sbx-"+key.JobID)
+			}},
+			{ExecBackendAttemptStateCollecting, func() (bool, error) { return store.MarkExecBackendAttemptCollecting(ctx, key) }},
+			{ExecBackendAttemptStateDestroying, func() (bool, error) { return store.MarkExecBackendAttemptDestroying(ctx, key) }},
+		}
+		for _, step := range steps {
+			if to == ExecBackendAttemptStateReserved {
+				return
+			}
+			changed, err := step.call()
+			if err != nil || !changed {
+				t.Fatalf("walking to %s: step %s changed=%v err=%v", to, step.state, changed, err)
+			}
+			if step.state == to {
+				return
+			}
+		}
+	}
+
+	transitions := []struct {
+		name      string
+		legalFrom string
+		call      func(store *Store, key ExecBackendAttemptKey) (bool, error)
+	}{
+		{"Provisioning", ExecBackendAttemptStateReserved, func(s *Store, k ExecBackendAttemptKey) (bool, error) {
+			return s.MarkExecBackendAttemptProvisioning(ctx, k)
+		}},
+		{"Running", ExecBackendAttemptStateProvisioning, func(s *Store, k ExecBackendAttemptKey) (bool, error) {
+			return s.MarkExecBackendAttemptRunning(ctx, k, "sbx-late")
+		}},
+		{"Collecting", ExecBackendAttemptStateRunning, func(s *Store, k ExecBackendAttemptKey) (bool, error) {
+			return s.MarkExecBackendAttemptCollecting(ctx, k)
+		}},
+		{"Destroying", ExecBackendAttemptStateCollecting, func(s *Store, k ExecBackendAttemptKey) (bool, error) {
+			return s.MarkExecBackendAttemptDestroying(ctx, k)
+		}},
+	}
+	liveStates := []string{
+		ExecBackendAttemptStateReserved, ExecBackendAttemptStateProvisioning,
+		ExecBackendAttemptStateRunning, ExecBackendAttemptStateCollecting,
+		ExecBackendAttemptStateDestroying,
+	}
+
+	for _, transition := range transitions {
+		for _, from := range liveStates {
+			if from == transition.legalFrom {
+				continue
+			}
+			t.Run(transition.name+"_refuses_"+from, func(t *testing.T) {
+				store := openCapTestStore(t)
+				key := ExecBackendAttemptKey{JobID: "job-" + transition.name + "-" + from, Attempt: 1, LifecycleGeneration: 1}
+				if err := store.ReserveExecBackendAttempt(ctx, ExecBackendAttemptReservation{
+					ExecBackendAttemptKey: key, Provider: "e2b", DaemonFencingToken: "fence", BootID: "boot",
+					TTLExpiresAt: time.Now().Add(time.Minute),
+				}, testExecBackendUncappedPolicy()); err != nil {
+					t.Fatal(err)
+				}
+				walk(t, store, key, from)
+				changed, err := transition.call(store, key)
+				if err != nil {
+					t.Fatalf("Mark...%s from %s: err=%v", transition.name, from, err)
+				}
+				if changed {
+					t.Fatalf("Mark...%s from %s: changed=true, want false; this transition admits only %s, and a widened guard would let the lifecycle skip phases",
+						transition.name, from, transition.legalFrom)
+				}
+			})
+		}
+		t.Run(transition.name+"_accepts_"+transition.legalFrom, func(t *testing.T) {
+			store := openCapTestStore(t)
+			key := ExecBackendAttemptKey{JobID: "job-ok-" + transition.name, Attempt: 1, LifecycleGeneration: 1}
+			if err := store.ReserveExecBackendAttempt(ctx, ExecBackendAttemptReservation{
+				ExecBackendAttemptKey: key, Provider: "e2b", DaemonFencingToken: "fence", BootID: "boot",
+				TTLExpiresAt: time.Now().Add(time.Minute),
+			}, testExecBackendUncappedPolicy()); err != nil {
+				t.Fatal(err)
+			}
+			walk(t, store, key, transition.legalFrom)
+			changed, err := transition.call(store, key)
+			if err != nil || !changed {
+				t.Fatalf("Mark...%s from its legal source %s: changed=%v err=%v; the refusal arms above prove nothing if this cannot pass",
+					transition.name, transition.legalFrom, changed, err)
+			}
+		})
+	}
+}
