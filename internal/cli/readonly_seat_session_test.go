@@ -182,8 +182,16 @@ func TestReadOnlySeatStatePolicyCoversEveryRegisteredRuntime(t *testing.T) {
 			policy, needsState, err := readOnlySeatStatePolicyFor(name, userHome, false)
 			switch name {
 			case runtime.OmpRuntime:
-				if err == nil {
-					t.Fatal("omp must be refused: it has no isolated credential broker")
+				if err != nil || !needsState {
+					t.Fatalf("omp needsState=%v err=%v, want isolated writable state", needsState, err)
+				}
+				if policy.relativeState != filepath.Join(".omp", "agent") ||
+					policy.stateEnv != "PI_CODING_AGENT_DIR" ||
+					policy.stateRootEnv != "PI_CONFIG_DIR" {
+					t.Fatalf("omp state policy = %+v, want job-private OMP state and config roots", policy)
+				}
+				if policy.credentialFile != "" || len(policy.requiredInputs) != 0 || len(policy.optionalInputs) != 0 {
+					t.Fatalf("omp policy stages operator profile inputs: %+v", policy)
 				}
 				return
 			case runtime.ShellRuntime:

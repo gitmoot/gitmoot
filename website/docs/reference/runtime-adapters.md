@@ -364,6 +364,22 @@ provider environment keys, and the binary's install path, because a daemon that
 cannot see the binary and a daemon that cannot see a credential are the two
 failure modes operators actually hit.
 
+Read-only OMP review and ask seats are stricter regardless of `env_curation`.
+They require `OMP_AUTH_BROKER_URL` as an HTTPS or loopback HTTP origin, an
+owner-only token file named by `OMP_AUTH_BROKER_TOKEN_FILE`, and a
+provider-qualified effective model such as `kimi-code/k3`. An upstream
+`OMP_AUTH_BROKER_TOKEN` in the daemon environment
+is refused because the runtime requires seat-readable `/proc`. Gitmoot writes
+the random job-local token and loopback URL only into the seat's minimal
+`config.yml`; no broker secret enters the child environment. The proxy filters
+credentials and usage to that provider, forwards only credential refreshes, and
+acknowledges disable/block/accounting writes locally rather than mutating the
+shared broker. The seat receives no upstream token, profile path, or ambient
+provider key. Its daemon-staged OMP binary uses job-private `PI_CONFIG_DIR` and
+`PI_CODING_AGENT_DIR` roots; the proxy and state are removed after delivery.
+Missing or unsafe broker configuration refuses before runtime staging; an
+unqualified effective model refuses before OMP launches.
+
 Child-environment curation is **off by default**, and with it off omp inherits
 the daemon's whole environment exactly like every other runtime. When
 `[credentials] env_curation = true` is enabled, omp's curated allowlist is

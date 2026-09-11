@@ -722,46 +722,115 @@ func TestSeatAuthProbeFailsOpenOnEveryUndecidableOutcome(t *testing.T) {
 	}
 }
 
-// The overlay is claude-only BY POLICY, not by "codex happens to be excluded".
-// Round 3 measured a mutant widening it to kimi surviving, because the test
-// named codex instead of enumerating the runtimes.
-func TestSeatRuntimeAuthOverlayIsClaudeOnlyAcrossEverySupportedRuntime(t *testing.T) {
+// Auth overlays are runtime-scoped BY POLICY, not because one neighboring
+// runtime happens to be excluded. Enumerate the registry so adding a runtime
+// cannot silently inherit Claude or OMP credentials.
+func TestSeatRuntimeAuthOverlayIsRuntimeScopedAcrossEverySupportedRuntime(t *testing.T) {
 	home := t.TempDir()
 	configured := t.TempDir()
 	writeClaudeCredential(t, configured, time.Now().Add(time.Hour).UnixMilli(), "refresh")
+	tokenFile := filepath.Join(t.TempDir(), "omp-broker-token")
+	if err := os.WriteFile(tokenFile, []byte("seat-broker-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("CLAUDE_CONFIG_DIR", configured)
 	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "seat-overlay-token")
+	t.Setenv("OMP_AUTH_BROKER_URL", "http://127.0.0.1:8765")
+	t.Setenv("OMP_AUTH_BROKER_TOKEN", "")
+	t.Setenv("OMP_AUTH_BROKER_TOKEN_FILE", tokenFile)
 	supported := runtime.SupportedRuntimes()
 	if len(supported) < 2 {
 		t.Fatalf("SupportedRuntimes() = %v, expected the full runtime set", supported)
 	}
 	sawClaude := false
+	sawOmp := false
 	for _, name := range supported {
 		env, err := readOnlySeatRuntimeAuthEnv(home, name, false)
 		if err != nil {
 			t.Fatalf("readOnlySeatRuntimeAuthEnv(%s): %v", name, err)
 		}
-		if name == runtime.ClaudeRuntime {
+		switch name {
+		case runtime.ClaudeRuntime:
 			sawClaude = true
-			if len(env) == 0 {
-				t.Fatalf("claude lost its runtime-auth overlay: %v", env)
+			if len(env) == 0 || containsEnvPrefix(env, "OMP_AUTH_BROKER_") {
+				t.Fatalf("claude runtime auth = %v, want only its resolved overlay", redactEnvNames(env))
 			}
-			continue
-		}
-		if len(env) != 0 {
-			t.Fatalf("runtime %q received a claude overlay (%d entries): the overlay is claude-only by policy", name, len(env))
+		case runtime.OmpRuntime:
+			sawOmp = true
+			if len(env) != 1 ||
+				!containsEnv(env, "OMP_AUTH_BROKER_URL=http://127.0.0.1:8765") ||
+				containsEnvPrefix(env, "OMP_AUTH_BROKER_TOKEN") ||
+				containsEnvPrefix(env, runtime.ClaudeOAuthTokenEnv+"=") {
+				t.Fatalf("omp runtime preflight = %v, want only the non-secret broker endpoint", redactEnvNames(env))
+			}
+		default:
+			if len(env) != 0 {
+				t.Fatalf("runtime %q received another runtime's auth: %v", name, redactEnvNames(env))
+			}
 		}
 	}
-	if !sawClaude {
-		t.Fatalf("SupportedRuntimes() = %v, missing claude; the policy assertion measured nothing", supported)
+	if !sawClaude || !sawOmp {
+		t.Fatalf("SupportedRuntimes() = %v, sawClaude=%v sawOmp=%v", supported, sawClaude, sawOmp)
 	}
-	// Gateway mode withholds it from claude too.
+	// Gateway mode withholds auth from the child process.
 	gatewayEnv, err := readOnlySeatRuntimeAuthEnv(home, runtime.ClaudeRuntime, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(gatewayEnv) != 0 {
 		t.Fatalf("gateway-mode claude seat received an overlay: %v", redactEnvNames(gatewayEnv))
+	}
+}
+
+func TestReadOnlySeatOmpBrokerEnvRequiresSecureTokenFile(t *testing.T) {
+	tokenFile := filepath.Join(t.TempDir(), "broker-token")
+	if err := os.WriteFile(tokenFile, []byte("broker-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name        string
+		environ     []string
+		wantMissing []string
+	}{
+		{name: "both missing", wantMissing: []string{"OMP_AUTH_BROKER_URL", "OMP_AUTH_BROKER_TOKEN_FILE"}},
+		{name: "URL missing", environ: []string{"OMP_AUTH_BROKER_TOKEN_FILE=" + tokenFile}, wantMissing: []string{"OMP_AUTH_BROKER_URL"}},
+		{name: "token file missing", environ: []string{"OMP_AUTH_BROKER_URL=http://127.0.0.1:8765"}, wantMissing: []string{"OMP_AUTH_BROKER_TOKEN_FILE"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := readOnlySeatOmpBrokerEnv(test.environ)
+			if err == nil {
+				t.Fatal("incomplete broker configuration was accepted")
+			}
+			for _, name := range test.wantMissing {
+				if !strings.Contains(err.Error(), name) {
+					t.Fatalf("error %q does not name missing %s", err, name)
+				}
+			}
+		})
+	}
+
+	if _, err := readOnlySeatOmpBrokerEnv([]string{
+		"OMP_AUTH_BROKER_URL=http://127.0.0.1:8765",
+		"OMP_AUTH_BROKER_TOKEN=must-not-enter-daemon-environ",
+		"OMP_AUTH_BROKER_TOKEN_FILE=" + tokenFile,
+	}); err == nil {
+		t.Fatal("ambient upstream token was accepted")
+	}
+	env, err := readOnlySeatOmpBrokerEnv([]string{
+		"OPENAI_API_KEY=must-not-cross",
+		"OMP_PROFILE=operator",
+		"OMP_AUTH_BROKER_URL=http://127.0.0.1:8765",
+		"OMP_AUTH_BROKER_TOKEN_FILE=" + tokenFile,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(env) != 1 ||
+		!containsEnv(env, "OMP_AUTH_BROKER_URL=http://127.0.0.1:8765") ||
+		containsEnvPrefix(env, "OMP_AUTH_BROKER_TOKEN") ||
+		containsEnvPrefix(env, "OPENAI_API_KEY=") ||
+		containsEnvPrefix(env, "OMP_PROFILE=") {
+		t.Fatalf("broker preflight env = %v, want only the non-secret endpoint", redactEnvNames(env))
 	}
 }
 

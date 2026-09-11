@@ -169,15 +169,23 @@ func readOnlySeatCredentialPreflight(agent runtime.Agent, sourceDir string, gate
 	)
 }
 
-// readOnlySeatRuntimeAuthEnv resolves the runtime auth a seat must carry: the
-// same overlay runtimeJobRunnerWithAuth injects for every other job, which the
-// seat path rebuilt its environment without.
+// readOnlySeatRuntimeAuthEnv resolves whether the daemon has the credential
+// route a seat needs. Claude receives the same authoritative overlay as every
+// other Claude job. OMP returns only its non-secret configured endpoint for the
+// preflight below; wrapReadOnlySandboxAdapter separately exchanges the token
+// file for a provider-scoped job token before constructing the child environment.
 //
-// It bootstraps first, exactly as runtimeJobRunnerWithAuth does. Reading
+// It bootstraps Claude first, exactly as runtimeJobRunnerWithAuth does. Reading
 // runtime-auth.env alone returned an empty overlay on a host that authenticates
 // from ambient credentials and had never written that file.
 func readOnlySeatRuntimeAuthEnv(home string, runtimeName string, gatewayMode bool) ([]string, error) {
-	if gatewayMode || runtimeName != runtime.ClaudeRuntime {
+	if gatewayMode {
+		return nil, nil
+	}
+	if runtimeName == runtime.OmpRuntime {
+		return readOnlySeatOmpBrokerEnv(os.Environ())
+	}
+	if runtimeName != runtime.ClaudeRuntime {
 		return nil, nil
 	}
 	paths, err := pathsFromFlag(home)
@@ -187,12 +195,26 @@ func readOnlySeatRuntimeAuthEnv(home string, runtimeName string, gatewayMode boo
 	return readOnlySeatRuntimeAuthEnvForPaths(paths, runtimeName, gatewayMode)
 }
 
+func readOnlySeatOmpBrokerEnv(environ []string) ([]string, error) {
+	config, err := readOnlySeatOmpBrokerConfig(environ)
+	if err != nil {
+		return nil, err
+	}
+	return []string{"OMP_AUTH_BROKER_URL=" + config.url}, nil
+}
+
 // readOnlySeatRuntimeAuthEnvForPaths is the same lookup for a caller that has
 // already resolved its paths. Handing paths.Home to the flag-taking variant
 // re-resolves a DIFFERENT home, which is the mistake that made the operator
 // checks read the wrong overlay (#1810 review, round 3).
 func readOnlySeatRuntimeAuthEnvForPaths(paths config.Paths, runtimeName string, gatewayMode bool) ([]string, error) {
-	if gatewayMode || runtimeName != runtime.ClaudeRuntime {
+	if gatewayMode {
+		return nil, nil
+	}
+	if runtimeName == runtime.OmpRuntime {
+		return readOnlySeatOmpBrokerEnv(os.Environ())
+	}
+	if runtimeName != runtime.ClaudeRuntime {
 		return nil, nil
 	}
 	if _, err := bootstrapRuntimeAuth(paths.Home, runtimeAuthEnvLookup, runtimeAuthLogf); err != nil {

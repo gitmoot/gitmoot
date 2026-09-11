@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/toolchain"
 )
 
@@ -88,22 +89,21 @@ func unavailableSeatToolchain(paths config.Paths, diagnostic string) (string, []
 	return root, env, diagnostic, nil
 }
 
-// seatRuntimeNames are the runtimes a read-only seat may need to LAUNCH. Each is
-// a runtime this engine dispatches jobs to, so the list is derived from what the
-// engine can start rather than from what happens to be installed on a host.
-var seatRuntimeNames = []string{"claude", "kimi", "codex"}
+// seatRuntimeNames are the provider CLIs every read-only seat may need as a
+// sibling runtime. OMP is different: it is a routing harness capable of
+// launching more agents, so it is staged only when OMP is the selected runtime.
+var seatRuntimeNames = []string{runtime.ClaudeRuntime, runtime.KimiRuntime, runtime.CodexRuntime}
 
-// stageSeatRuntimes materialises one engine-owned command for every runtime
-// class the engine can dispatch. Each INSTALLED runtime becomes a copied
-// artifact; each missing or unstageable one becomes an explicit exit-126 command
-// so inherited PATH entries cannot route around the policy.
+// stageSeatRuntimes materialises engine-owned commands for the provider runtime
+// set and, when selected, OMP. Each installed runtime becomes a copied artifact;
+// each missing or unstageable one becomes an explicit exit-126 command so
+// inherited PATH entries cannot route around the policy.
 //
-// EVERY INSTALLED RUNTIME IS STAGED, not only the seat's own. A seat's prompt
-// may legitimately invoke a sibling runtime, and contract item 5 of ruling
-// 122157 requires the actual installed Claude, Kimi and Codex to LAUNCH from
-// staged copies - "a design that merely turns all four into MISSING is not
-// accepted". Copies are content-addressed, so the second seat wanting the same
-// runtime reuses the first seat's tree instead of copying again.
+// EVERY INSTALLED PROVIDER RUNTIME IS STAGED, not only the seat's own. A seat's
+// prompt may legitimately invoke a sibling provider runtime, and contract item
+// 5 of ruling 122157 requires the actual installed Claude, Kimi and Codex to
+// LAUNCH from staged copies. Copies are content-addressed, so the second seat
+// wanting the same runtime reuses the first seat's tree instead of copying again.
 //
 // WHY COPIES AND NOT GRANTS (#1921 review rounds 1-3, ruling 122157). Three
 // rounds tried to make a recursive Landlock grant over the OPERATOR's install
@@ -126,11 +126,15 @@ var seatRuntimeNames = []string{"claude", "kimi", "codex"}
 // the launcher list on purpose: a launcher belongs on the seat's PATH and an
 // interpreter must NOT, because a seat that can resolve `node` by name gets a
 // second way to run code that no dispatch decision chose (#2141).
-func stageSeatRuntimes(paths config.Paths) ([]string, []string, []string, error) {
+func stageSeatRuntimes(paths config.Paths, selectedRuntime string) ([]string, []string, []string, error) {
+	names := seatRuntimeNames
+	if strings.TrimSpace(selectedRuntime) == runtime.OmpRuntime {
+		names = append(append([]string(nil), seatRuntimeNames...), runtime.OmpRuntime)
+	}
 	var staged []string
 	var interpreters []string
 	var diagnostics []string
-	for _, name := range seatRuntimeNames {
+	for _, name := range names {
 		if resolved, lookupErr := exec.LookPath(name); lookupErr == nil {
 			// STAGING NOW OWNS THE WHOLE ARTIFACT, INTERPRETER INCLUDED. The
 			// engine reads the entrypoint's shebang from the descriptor it will
