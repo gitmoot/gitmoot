@@ -557,6 +557,126 @@ func TestStageSeatToolchainStagesWhatTheWorkspaceNeeds(t *testing.T) {
 	}
 }
 
+func TestStageSeatToolchainFallsBackFromAnUnstageableSatisfyingInstallation(t *testing.T) {
+	base := t.TempDir()
+	broken := writeSeatToolchainFixture(t, filepath.Join(base, "broken"), "go1.26.0")
+	if err := os.MkdirAll(filepath.Join(broken, "pkg"), 0o755); err != nil {
+		t.Fatalf("mkdir broken pkg: %v", err)
+	}
+	if err := os.Symlink("outside", filepath.Join(broken, "pkg", "include")); err != nil {
+		t.Fatalf("symlink broken include: %v", err)
+	}
+	usable := writeSeatToolchainFixture(t, filepath.Join(base, "usable"), "go1.26.4")
+
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "go.mod"), []byte("module x\n\ngo 1.26\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	t.Setenv("PATH", strings.Join([]string{
+		filepath.Join(broken, "bin"),
+		filepath.Join(usable, "bin"),
+	}, string(os.PathListSeparator)))
+
+	paths := config.PathsForHome(t.TempDir())
+	staged, _, diagnostic, err := stageSeatToolchain(paths, workspace)
+	if err != nil {
+		t.Fatalf("stageSeatToolchain: %v", err)
+	}
+	if !strings.Contains(filepath.Base(staged), "go1.26.4") {
+		t.Errorf("staged %q, want the usable higher installation", staged)
+	}
+	for _, want := range []string{broken, "pkg/include"} {
+		if !strings.Contains(diagnostic, want) {
+			t.Errorf("diagnostic = %q, want refused lower installation detail %q", diagnostic, want)
+		}
+	}
+}
+
+func TestStageSeatToolchainAggregatesEverySatisfyingStagingRefusal(t *testing.T) {
+	base := t.TempDir()
+	first := writeSeatToolchainFixture(t, filepath.Join(base, "first"), "go1.26.0")
+	second := writeSeatToolchainFixture(t, filepath.Join(base, "second"), "go1.26.4")
+	for _, root := range []string{first, second} {
+		if err := os.MkdirAll(filepath.Join(root, "pkg"), 0o755); err != nil {
+			t.Fatalf("mkdir %s pkg: %v", root, err)
+		}
+		if err := os.Symlink("outside", filepath.Join(root, "pkg", "include")); err != nil {
+			t.Fatalf("symlink %s include: %v", root, err)
+		}
+	}
+
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "go.mod"), []byte("module x\n\ngo 1.26\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	t.Setenv("PATH", strings.Join([]string{
+		filepath.Join(first, "bin"),
+		filepath.Join(second, "bin"),
+	}, string(os.PathListSeparator)))
+
+	paths := config.PathsForHome(t.TempDir())
+	staged, _, diagnostic, err := stageSeatToolchain(paths, workspace)
+	if err != nil {
+		t.Fatalf("stageSeatToolchain: %v", err)
+	}
+	if !strings.HasSuffix(filepath.Base(staged), toolchain.UnavailableRuntimeSuffix) {
+		t.Errorf("staged %q, want the published-unavailable command", staged)
+	}
+	for _, want := range []string{first, second, "pkg/include"} {
+		if !strings.Contains(diagnostic, want) {
+			t.Errorf("diagnostic = %q, want refusal detail %q", diagnostic, want)
+		}
+	}
+}
+
+func TestStageSeatToolchainContainsWorkspaceGoModRead(t *testing.T) {
+	installation := writeSeatToolchainFixture(t, filepath.Join(t.TempDir(), "go"), "go1.26.4")
+	t.Setenv("PATH", filepath.Join(installation, "bin"))
+
+	tests := []struct {
+		name  string
+		setup func(*testing.T, string)
+	}{
+		{
+			name: "outside symlink",
+			setup: func(t *testing.T, workspace string) {
+				outside := filepath.Join(t.TempDir(), "outside.mod")
+				if err := os.WriteFile(outside, []byte("go 99.0\n"), 0o644); err != nil {
+					t.Fatalf("write outside go.mod: %v", err)
+				}
+				if err := os.Symlink(outside, filepath.Join(workspace, "go.mod")); err != nil {
+					t.Fatalf("symlink go.mod: %v", err)
+				}
+			},
+		},
+		{
+			name: "non regular",
+			setup: func(t *testing.T, workspace string) {
+				if err := os.Mkdir(filepath.Join(workspace, "go.mod"), 0o755); err != nil {
+					t.Fatalf("mkdir go.mod: %v", err)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			workspace := t.TempDir()
+			test.setup(t, workspace)
+			paths := config.PathsForHome(t.TempDir())
+			staged, _, diagnostic, err := stageSeatToolchain(paths, workspace)
+			if err != nil {
+				t.Fatalf("stageSeatToolchain: %v", err)
+			}
+			if strings.HasSuffix(filepath.Base(staged), toolchain.UnavailableRuntimeSuffix) {
+				t.Errorf("staged %q, want the safe local installation", staged)
+			}
+			if diagnostic != "" {
+				t.Errorf("diagnostic = %q, want none", diagnostic)
+			}
+		})
+	}
+}
+
 // TestStageSeatToolchainRefusesWhenNothingSatisfiesTheWorkspace pins the loud
 // failure. A seat that cannot run the gate must publish the exit-126 shim so
 // the capability preflight blocks the review; the outcome that must never

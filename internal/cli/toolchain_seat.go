@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -65,7 +64,8 @@ func stageSeatToolchain(paths config.Paths, workspace string) (string, []string,
 		}
 		return unavailableSeatToolchain(paths, "")
 	}
-	selected, err := toolchain.SelectInstallation(candidates, toolchain.ModuleGoDirective(workspace))
+	required := toolchain.ModuleGoDirective(workspace)
+	candidates, err := toolchain.SelectInstallations(candidates, required)
 	if err != nil {
 		// Reported at STAGING time, naming the requirement and every rejected
 		// tree. The alternative is what this replaces: stage something too old
@@ -73,28 +73,39 @@ func stageSeatToolchain(paths config.Paths, workspace string) (string, []string,
 		// as a repository problem rather than a staging one.
 		return unavailableSeatToolchain(paths, fmt.Sprintf("%v; host copy is shadowed", err))
 	}
-	staged, err := toolchain.Stage(paths.Home, selected.Root)
-	if err != nil {
-		if errors.Is(err, toolchain.ErrNotPinned) {
-			return unavailableSeatToolchain(paths, fmt.Sprintf("selected Go installation is not pinned; host copy is shadowed: %v", err))
+
+	var refused []string
+	for _, candidate := range candidates {
+		staged, stageErr := toolchain.Stage(paths.Home, candidate.Root)
+		if stageErr != nil {
+			refused = append(refused, fmt.Sprintf("%s (%s) could not be staged: %v",
+				candidate.Root, candidate.Version, stageErr))
+			continue
 		}
-		return unavailableSeatToolchain(paths, fmt.Sprintf("staged toolchain unavailable; host copy is shadowed: %v", err))
+		path, diagnostic := seatPath(staged)
+		if diagnostic != "" {
+			refused = append(refused, fmt.Sprintf("%s (%s) produced an unusable staged path: %s",
+				candidate.Root, candidate.Version, diagnostic))
+			continue
+		}
+		return staged, []string{
+			"GOROOT=" + staged,
+			"PATH=" + path,
+			// The staged copy is the only toolchain the seat can BUILD with —
+			// it is first on PATH and the only Go tree under a read grant — so
+			// pin the selector too. An empty GOTOOLCHAIN invites an auto-download
+			// a sandboxed seat cannot complete.
+			"GOTOOLCHAIN=local",
+		}, strings.Join(refused, "; "), nil
 	}
-	path, diagnostic := seatPath(staged)
-	if diagnostic != "" {
-		return unavailableSeatToolchain(paths, diagnostic)
+
+	requirement := "any version"
+	if strings.TrimSpace(required) != "" {
+		requirement = "go" + strings.TrimPrefix(strings.TrimSpace(required), "go")
 	}
-	return staged, []string{
-		"GOROOT=" + staged,
-		"PATH=" + path,
-		// The staged copy is the only toolchain the seat can BUILD with — it is
-		// first on PATH and the only Go tree under a read grant — so pin the
-		// selector too: an empty GOTOOLCHAIN invites the auto-download a
-		// sandboxed seat cannot complete. #2143 changed WHICH toolchain is
-		// pinned, never that one is pinned: a seat that downloads a compiler
-		// mid-review is worse than a seat that fails.
-		"GOTOOLCHAIN=local",
-	}, "", nil
+	return unavailableSeatToolchain(paths, fmt.Sprintf(
+		"no satisfying Go installation could be staged for %s: %s; host copy is shadowed",
+		requirement, strings.Join(refused, "; ")))
 }
 
 func unavailableSeatToolchain(paths config.Paths, diagnostic string) (string, []string, string, error) {

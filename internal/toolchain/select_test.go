@@ -27,6 +27,14 @@ func writeInstallation(t *testing.T, root, version string) string {
 	return root
 }
 
+func firstInstallation(candidates []GoInstallation, required string) (GoInstallation, error) {
+	ranked, err := SelectInstallations(candidates, required)
+	if err != nil {
+		return GoInstallation{}, err
+	}
+	return ranked[0], nil
+}
+
 // TestSelectInstallationPrefersTheVersionTheModuleNeeds is #2143's real shape,
 // and it is the arm that would have caught the production failure: a distro
 // launcher FIRST among the candidates, a newer toolchain also installed, and a
@@ -42,7 +50,7 @@ func TestSelectInstallationPrefersTheVersionTheModuleNeeds(t *testing.T) {
 	launcher := GoInstallation{Root: "/usr/lib/go-1.22", Version: "go1.22.2"}
 	pinned := GoInstallation{Root: "/root/.local/toolchains/go1.26.4", Version: "go1.26.4"}
 
-	selected, err := SelectInstallation([]GoInstallation{launcher, pinned}, "1.26")
+	selected, err := firstInstallation([]GoInstallation{launcher, pinned}, "1.26")
 	if err != nil {
 		t.Fatalf("SelectInstallation: %v", err)
 	}
@@ -61,7 +69,7 @@ func TestSelectInstallationTakesTheLowestSatisfyingRelease(t *testing.T) {
 		{Root: "/asked", Version: "go1.26.0"},
 		{Root: "/older", Version: "go1.22.2"},
 	}
-	selected, err := SelectInstallation(candidates, "go1.26")
+	selected, err := firstInstallation(candidates, "go1.26")
 	if err != nil {
 		t.Fatalf("SelectInstallation: %v", err)
 	}
@@ -69,13 +77,38 @@ func TestSelectInstallationTakesTheLowestSatisfyingRelease(t *testing.T) {
 		t.Errorf("selected %q, want /asked: a review must not silently move to a newer toolchain", selected.Root)
 	}
 
-	// 1.26 and 1.26.0 must compare equal, or an exact match reads as too old.
-	selected, err = SelectInstallation([]GoInstallation{{Root: "/exact", Version: "go1.26"}}, "1.26.0")
-	if err != nil {
-		t.Fatalf("SelectInstallation(exact): %v", err)
+	// Go distinguishes the language version from the first release: go1.26 is
+	// older than go1.26.0 and must not satisfy that exact release requirement.
+	_, err = firstInstallation([]GoInstallation{{Root: "/language", Version: "go1.26"}}, "1.26.0")
+	if !errors.Is(err, ErrNoSatisfyingToolchain) {
+		t.Fatalf("SelectInstallation(language version) error = %v, want ErrNoSatisfyingToolchain", err)
 	}
-	if selected.Root != "/exact" {
-		t.Errorf("selected %q, want /exact", selected.Root)
+}
+
+func TestSelectInstallationUsesGoVersionOrdering(t *testing.T) {
+	candidates := []GoInstallation{
+		{Root: "/release", Version: "go1.26.0"},
+		{Root: "/rc2", Version: "go1.26rc2"},
+		{Root: "/rc1", Version: "go1.26rc1"},
+	}
+	selected, err := firstInstallation(candidates, "1.26rc1")
+	if err != nil {
+		t.Fatalf("SelectInstallation: %v", err)
+	}
+	if selected.Root != "/rc1" {
+		t.Errorf("selected %q, want /rc1", selected.Root)
+	}
+	if _, err := firstInstallation(candidates[1:], "1.26.0"); !errors.Is(err, ErrNoSatisfyingToolchain) {
+		t.Errorf("release requirement error = %v, want ErrNoSatisfyingToolchain", err)
+	}
+
+	huge := "1." + strings.Repeat("9", 100)
+	selected, err = firstInstallation([]GoInstallation{{Root: "/huge", Version: "go" + huge}}, huge)
+	if err != nil {
+		t.Fatalf("SelectInstallation(large component): %v", err)
+	}
+	if selected.Root != "/huge" {
+		t.Errorf("selected %q, want /huge", selected.Root)
 	}
 }
 
@@ -85,7 +118,7 @@ func TestSelectInstallationTakesTheLowestSatisfyingRelease(t *testing.T) {
 // toolchain too old to build the repository, which surfaces later as
 // "go.mod requires go >= 1.26" and reads as a repository problem.
 func TestSelectInstallationFailsLoudlyWhenNothingSatisfies(t *testing.T) {
-	_, err := SelectInstallation([]GoInstallation{{Root: "/usr/lib/go-1.22", Version: "go1.22.2"}}, "1.26")
+	_, err := firstInstallation([]GoInstallation{{Root: "/usr/lib/go-1.22", Version: "go1.22.2"}}, "1.26")
 	if err == nil {
 		t.Fatal("SelectInstallation accepted a toolchain older than the module requires")
 	}
@@ -101,7 +134,7 @@ func TestSelectInstallationFailsLoudlyWhenNothingSatisfies(t *testing.T) {
 		}
 	}
 
-	_, err = SelectInstallation(nil, "1.26")
+	_, err = firstInstallation(nil, "1.26")
 	if err == nil || !strings.Contains(err.Error(), "no Go installation was found") {
 		t.Errorf("error = %v, want the empty-host case named distinctly", err)
 	}
@@ -115,7 +148,7 @@ func TestSelectInstallationWithNoRequirementTakesTheNewest(t *testing.T) {
 		{Root: "/old", Version: "go1.22.2"},
 		{Root: "/new", Version: "go1.26.4"},
 	}
-	selected, err := SelectInstallation(candidates, "")
+	selected, err := firstInstallation(candidates, "")
 	if err != nil {
 		t.Fatalf("SelectInstallation: %v", err)
 	}
@@ -131,7 +164,7 @@ func TestSelectInstallationSkipsUnreadableCandidates(t *testing.T) {
 		{Root: "/broken", Version: ""},
 		{Root: "/good", Version: "go1.26.4"},
 	}
-	selected, err := SelectInstallation(candidates, "1.26")
+	selected, err := firstInstallation(candidates, "1.26")
 	if err != nil {
 		t.Fatalf("SelectInstallation: %v", err)
 	}
@@ -139,7 +172,7 @@ func TestSelectInstallationSkipsUnreadableCandidates(t *testing.T) {
 		t.Errorf("selected %q, want /good", selected.Root)
 	}
 
-	_, err = SelectInstallation([]GoInstallation{{Root: "/broken", Version: ""}}, "1.26")
+	_, err = firstInstallation([]GoInstallation{{Root: "/broken", Version: ""}}, "1.26")
 	if err == nil {
 		t.Fatal("a single unreadable candidate was accepted")
 	}
@@ -230,7 +263,7 @@ func TestInstallationsOnPathConsidersEveryEntry(t *testing.T) {
 	}
 
 	// The end-to-end property: first on PATH does not win.
-	selected, err := SelectInstallation(found, "1.26")
+	selected, err := firstInstallation(found, "1.26")
 	if err != nil {
 		t.Fatalf("SelectInstallation: %v", err)
 	}
@@ -259,33 +292,67 @@ func TestInstallationsOnPathKeepsAnUnreadableTreeVisible(t *testing.T) {
 	if found[0].Version != "" {
 		t.Errorf("version = %q, want empty for an unreadable tree", found[0].Version)
 	}
-	if _, err := SelectInstallation(found, "1.26"); err == nil || !strings.Contains(err.Error(), broken) {
+	if _, err := firstInstallation(found, "1.26"); err == nil || !strings.Contains(err.Error(), broken) {
 		t.Errorf("error = %v, want the unreadable tree named", err)
 	}
 }
 
 // TestModuleGoDirectiveReadsTheRequirement covers the input that decides which
-// toolchain is correct, including the two arms that must NOT produce a
-// requirement: a non-module directory, and the toolchain line.
+// toolchain is correct, including accepted module whitespace and comments.
 func TestModuleGoDirectiveReadsTheRequirement(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "go.mod"),
-		[]byte("module example.com/x\n\ngo 1.26\n\ntoolchain go1.27.1\n"), 0o644); err != nil {
+		[]byte("module example.com/x\r\n\r\ngo\t1.26 // minimum\r\n\r\ntoolchain go1.27.1\r\n"), 0o644); err != nil {
 		t.Fatalf("write go.mod: %v", err)
 	}
 	if got := ModuleGoDirective(dir); got != "1.26" {
 		t.Errorf("directive = %q, want 1.26", got)
 	}
 
-	// No go.mod is not an error: a seat may review a repository that is not a
-	// Go module, and that must not refuse to stage a toolchain.
 	if got := ModuleGoDirective(t.TempDir()); got != "" {
 		t.Errorf("directive = %q, want empty for a non-module directory", got)
 	}
-
-	// The requirement drives selection: 1.26 must not be satisfied by 1.22.
-	if _, err := SelectInstallation([]GoInstallation{{Root: "/old", Version: "go1.22.2"}}, ModuleGoDirective(dir)); err == nil {
+	if _, err := firstInstallation([]GoInstallation{{Root: "/old", Version: "go1.22.2"}}, ModuleGoDirective(dir)); err == nil {
 		t.Error("a go 1.26 module accepted a go1.22.2 installation")
+	}
+
+	malformed := t.TempDir()
+	if err := os.WriteFile(filepath.Join(malformed, "go.mod"), []byte("module x\ngo 1.26 extra\n"), 0o644); err != nil {
+		t.Fatalf("write malformed go.mod: %v", err)
+	}
+	if got := ModuleGoDirective(malformed); got != "" {
+		t.Errorf("malformed directive = %q, want empty", got)
+	}
+}
+
+func TestModuleGoDirectiveContainsAndBoundsTheRead(t *testing.T) {
+	outside := filepath.Join(t.TempDir(), "outside.mod")
+	if err := os.WriteFile(outside, []byte("go 99.0\n"), 0o644); err != nil {
+		t.Fatalf("write outside go.mod: %v", err)
+	}
+	linked := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(linked, "go.mod")); err != nil {
+		t.Fatalf("symlink go.mod: %v", err)
+	}
+	if got := ModuleGoDirective(linked); got != "" {
+		t.Errorf("escaped symlink directive = %q, want empty", got)
+	}
+
+	nonRegular := t.TempDir()
+	if err := os.Mkdir(filepath.Join(nonRegular, "go.mod"), 0o755); err != nil {
+		t.Fatalf("mkdir go.mod: %v", err)
+	}
+	if got := ModuleGoDirective(nonRegular); got != "" {
+		t.Errorf("non-regular directive = %q, want empty", got)
+	}
+
+	oversized := t.TempDir()
+	contents := strings.Repeat("x", int(maxGoModBytes)) + "\ngo 99.0\n"
+	if err := os.WriteFile(filepath.Join(oversized, "go.mod"), []byte(contents), 0o644); err != nil {
+		t.Fatalf("write oversized go.mod: %v", err)
+	}
+	if got := ModuleGoDirective(oversized); got != "" {
+		t.Errorf("oversized directive = %q, want empty", got)
 	}
 }
 

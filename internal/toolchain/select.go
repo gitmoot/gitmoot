@@ -3,9 +3,11 @@ package toolchain
 import (
 	"errors"
 	"fmt"
+	"go/version"
+	"io"
 	"os"
 	"path/filepath"
-	"strconv"
+	"slices"
 	"strings"
 )
 
@@ -99,75 +101,82 @@ func InstallationVersion(root string) (string, error) {
 	return safeVersion(version)
 }
 
-// SelectInstallation picks the installation a seat should be staged from.
+// SelectInstallations returns every installation that satisfies a workspace's
+// Go requirement, in the order a seat should try to stage them.
 //
 // `required` is the module's go directive, e.g. "1.26" or "go1.26"; an empty
-// requirement means any installation will do and the newest is taken.
+// requirement means any installation will do and the newest is tried first.
 //
-// AMONG SATISFYING CANDIDATES THE LOWEST IS CHOSEN. This is a POLICY CHOICE,
-// not a reproduction of Go's rule, and the difference is worth stating because
-// an earlier draft of this comment claimed the latter and was wrong.
+// AMONG SATISFYING CANDIDATES THE LOWEST IS TRIED FIRST. This is a POLICY
+// CHOICE, not a reproduction of Go's rule. Go does not rank installations: it
+// keeps the invoked toolchain when that satisfies the module and otherwise
+// selects a newer one according to GOTOOLCHAIN. Ranking the installed set here
+// makes review seats deterministic without trusting PATH order.
 //
-// Go does not rank installations at all. Under GOTOOLCHAIN=auto it uses the
-// toolchain it was invoked as whenever that satisfies the module, and
-// otherwise fetches the minimum the directive names. Measured on the #2143
-// host: invoked as go1.26.4 against this repository's `go 1.26`, it builds
-// with 1.26.4 and performs no switch; invoked as go1.22.2 it tries to download
-// go1.26 and fails offline. So "what Go would do" is a function of which
-// binary you happen to run, which is precisely the input this selection exists
-// to stop trusting.
-//
-// Choosing the lowest satisfying release is therefore this package's own rule,
-// picked for determinism: the staged toolchain depends only on the module's
-// requirement and the set installed, so a seat does not silently move to a
-// newer compiler the moment an unrelated toolchain appears on the host. A
-// review is exactly where that drift is least welcome.
-//
-// ORDER ON PATH IS NOT AUTHORITY. Every candidate is considered, so a launcher
-// that happens to be first no longer decides. Candidates whose VERSION cannot
-// be read are skipped rather than failing the selection, because an unreadable
-// tree is one this package could not have staged anyway; the reason is
-// preserved and reported if NOTHING satisfies, so the failure still names what
-// was rejected and why.
-//
-// WITH NO REQUIREMENT THE NEWEST IS TAKEN, not the lowest. The lowest rule
-// exists to avoid drifting ABOVE what a module asked for; with nothing asked,
-// "lowest" would mean staging the oldest Go on the host, which is the original
-// defect wearing different clothes.
-func SelectInstallation(candidates []GoInstallation, required string) (GoInstallation, error) {
-	want, err := parseGoVersion(required)
-	if err != nil {
-		return GoInstallation{}, err
+// Selection does not establish that a tree is stageable. The caller must try
+// every returned installation in order: a structurally invalid lower release
+// must not mask a usable higher release.
+func SelectInstallations(candidates []GoInstallation, required string) ([]GoInstallation, error) {
+	required = strings.TrimSpace(required)
+	preferNewest := required == ""
+	var want string
+	if !preferNewest {
+		var err error
+		want, err = normalizedGoVersion(required)
+		if err != nil {
+			return nil, err
+		}
 	}
-	preferNewest := len(want) == 0
 
-	var (
-		best      GoInstallation
-		bestParts []int
-		found     bool
-	)
+	type rankedInstallation struct {
+		installation GoInstallation
+		version      string
+	}
+	ranked := make([]rankedInstallation, 0, len(candidates))
 	for _, candidate := range candidates {
-		parts, err := parseGoVersion(candidate.Version)
+		candidateVersion, err := normalizedGoVersion(candidate.Version)
 		if err != nil {
 			continue
 		}
-		if compareGoVersion(parts, want) < 0 {
+		if !preferNewest && version.Compare(candidateVersion, want) < 0 {
 			continue
 		}
-		if !found {
-			best, bestParts, found = candidate, parts, true
-			continue
-		}
-		order := compareGoVersion(parts, bestParts)
-		if (preferNewest && order > 0) || (!preferNewest && order < 0) {
-			best, bestParts = candidate, parts
-		}
+		ranked = append(ranked, rankedInstallation{
+			installation: candidate,
+			version:      candidateVersion,
+		})
 	}
-	if !found {
-		return GoInstallation{}, fmt.Errorf("%w %s: %s",
+	if len(ranked) == 0 {
+		return nil, fmt.Errorf("%w %s: %s",
 			ErrNoSatisfyingToolchain, describeRequirement(required), describeCandidates(candidates))
 	}
-	return best, nil
+	slices.SortStableFunc(ranked, func(left, right rankedInstallation) int {
+		order := version.Compare(left.version, right.version)
+		if order == 0 {
+			return strings.Compare(left.installation.Root, right.installation.Root)
+		}
+		if preferNewest {
+			return -order
+		}
+		return order
+	})
+
+	installations := make([]GoInstallation, len(ranked))
+	for index := range ranked {
+		installations[index] = ranked[index].installation
+	}
+	return installations, nil
+}
+
+func normalizedGoVersion(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "go") {
+		value = "go" + value
+	}
+	if !version.IsValid(value) {
+		return "", fmt.Errorf("%w: %q is not a Go version", ErrNotPinned, strings.TrimPrefix(value, "go"))
+	}
+	return value, nil
 }
 
 func describeRequirement(required string) string {
@@ -190,71 +199,6 @@ func describeCandidates(candidates []GoInstallation) string {
 		described = append(described, fmt.Sprintf("%s (%s)", candidate.Root, version))
 	}
 	return "found " + strings.Join(described, ", ")
-}
-
-// parseGoVersion turns "go1.26.4", "1.26" or "" into comparable components.
-//
-// Release suffixes are truncated rather than ordered: "go1.26rc1" parses as
-// 1.26, which treats a release candidate as its release. That is deliberate and
-// narrow - ordering prereleases correctly would matter only on a host whose
-// only satisfying toolchain is an rc, and treating it as satisfying is the
-// answer that lets that host work rather than refusing it.
-func parseGoVersion(version string) ([]int, error) {
-	version = strings.TrimSpace(version)
-	version = strings.TrimPrefix(version, "go")
-	if version == "" {
-		return nil, nil
-	}
-	parts := strings.Split(version, ".")
-	parsed := make([]int, 0, len(parts))
-	for _, part := range parts {
-		digits := part
-		for index, r := range part {
-			if r < '0' || r > '9' {
-				digits = part[:index]
-				break
-			}
-		}
-		if digits == "" {
-			if len(parsed) == 0 {
-				return nil, fmt.Errorf("%w: %q is not a Go version", ErrNotPinned, version)
-			}
-			break
-		}
-		value, err := strconv.Atoi(digits)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %q is not a Go version", ErrNotPinned, version)
-		}
-		parsed = append(parsed, value)
-		if digits != part {
-			break
-		}
-	}
-	if len(parsed) == 0 {
-		return nil, fmt.Errorf("%w: %q is not a Go version", ErrNotPinned, version)
-	}
-	return parsed, nil
-}
-
-// compareGoVersion orders two parsed versions, treating absent components as
-// zero so that 1.26 and 1.26.0 compare equal.
-func compareGoVersion(left, right []int) int {
-	for index := 0; index < len(left) || index < len(right); index++ {
-		var leftPart, rightPart int
-		if index < len(left) {
-			leftPart = left[index]
-		}
-		if index < len(right) {
-			rightPart = right[index]
-		}
-		if leftPart != rightPart {
-			if leftPart < rightPart {
-				return -1
-			}
-			return 1
-		}
-	}
-	return 0
 }
 
 // InstallationsOnPath lists every Go installation reachable through a PATH
@@ -303,37 +247,57 @@ func InstallationsOnPath(pathEnv string) []GoInstallation {
 	return installations
 }
 
+const maxGoModBytes int64 = 1 << 20
+
 // ModuleGoDirective reports the `go` directive of the module rooted at dir, or
-// "" when there is no go.mod to read.
+// "" when there is no safe, valid go.mod to read.
 //
-// Parsed directly rather than through golang.org/x/mod, because this runs in
-// the daemon on a path the operator controls and the directive is one token on
-// one line. An absent or unreadable go.mod is NOT an error: a seat may be
-// reviewing a repository that is not a Go module at all, and that must select
-// the newest installation rather than refuse.
+// The checkout is not sandboxed when this runs. OpenRoot keeps resolution
+// beneath the checkout; refusing links and non-regular files avoids blocking
+// on devices or pipes; the size checks bound both ordinary reads and a file
+// that grows after its initial stat.
 //
 // The `toolchain` line is deliberately ignored. It names a toolchain to
-// DOWNLOAD, and a seat runs with GOTOOLCHAIN=local precisely so that no
-// download happens mid-review; honouring it would either force a download or
-// produce a requirement no local installation can satisfy.
+// download, and a seat runs with GOTOOLCHAIN=local precisely so that no
+// download happens mid-review.
 func ModuleGoDirective(dir string) string {
-	contents, err := os.ReadFile(filepath.Join(dir, "go.mod"))
+	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return ""
 	}
+	defer root.Close()
+
+	info, err := root.Lstat("go.mod")
+	if err != nil || !info.Mode().IsRegular() || info.Size() > maxGoModBytes {
+		return ""
+	}
+	file, err := root.Open("go.mod")
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+	info, err = file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() > maxGoModBytes {
+		return ""
+	}
+	contents, err := io.ReadAll(io.LimitReader(file, maxGoModBytes+1))
+	if err != nil || int64(len(contents)) > maxGoModBytes {
+		return ""
+	}
+
 	for _, line := range strings.Split(string(contents), "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "go ") {
+		line, _, _ = strings.Cut(line, "//")
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != "go" {
 			continue
 		}
-		directive := strings.TrimSpace(strings.TrimPrefix(line, "go "))
-		if index := strings.IndexAny(directive, " \t/"); index >= 0 {
-			directive = directive[:index]
-		}
-		if _, err := parseGoVersion(directive); err != nil {
+		if len(fields) != 2 {
 			return ""
 		}
-		return directive
+		if _, err := normalizedGoVersion(fields[1]); err != nil {
+			return ""
+		}
+		return fields[1]
 	}
 	return ""
 }
