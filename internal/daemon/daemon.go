@@ -32,6 +32,22 @@ const (
 	mergeGateStatusMarker             = "marker"
 	mergeGateStatusObserved           = "observed"
 	mergeGateStatusInactive           = "inactive"
+	// mergeGateStatusCleared means the gate does not apply AND no pending status
+	// Gitmoot owns is left on the head (#2148).
+	//
+	// It is a separate kind from `inactive` on purpose, and the distinction is
+	// what heals existing rows. `inactive` was recorded whenever the gate stopped
+	// applying, including when a pending status Gitmoot had written was left
+	// behind - and the early return on `inactive` then meant no later pass ever
+	// looked at that head again, so the leftover status was permanent. Measured
+	// on this fleet: 4 OPEN pull requests across 4 repositories, each carrying a
+	// different reason text, all reading `mergeable_state: unstable` on green
+	// check-runs.
+	//
+	// Only `cleared` short-circuits now. A legacy `inactive` row is therefore
+	// re-examined exactly once, which costs one combined-status read per affected
+	// head and then upgrades it, instead of requiring a migration.
+	mergeGateStatusCleared = "cleared"
 )
 
 // issueCommentPollOverlap is subtracted from the persisted last-seen cursor when
@@ -1384,7 +1400,14 @@ func (d Daemon) ensureMergeGateStatus(ctx context.Context, pull github.PullReque
 		if applies && (observation.Kind == mergeGateStatusMarker || observation.Kind == mergeGateStatusObserved) {
 			return
 		}
-		if !applies && observation.Kind == mergeGateStatusInactive {
+		// ONLY `cleared` SHORT-CIRCUITS THE NOT-APPLICABLE CASE (#2148).
+		//
+		// `inactive` used to skip here, which is what made a leftover owned
+		// pending status permanent: the head was never looked at again, so the
+		// status Gitmoot itself had written could never be resolved. A legacy
+		// `inactive` row therefore falls through exactly once, costs one
+		// combined-status read, and is upgraded to `cleared` below.
+		if !applies && observation.Kind == mergeGateStatusCleared {
 			return
 		}
 	}
@@ -1418,7 +1441,24 @@ func (d Daemon) ensureMergeGateStatus(ctx context.Context, pull github.PullReque
 		return
 	}
 
-	if found && status.State == "pending" && status.Description == mergeGateUnclearedDescription {
+	// CLEAR ANY PENDING STATUS GITMOOT OWNS, WHATEVER IT SAYS (#2148).
+	//
+	// This matched one literal description, `mergeGateUnclearedDescription`. Every
+	// other pending status Gitmoot writes in this context carries a SPECIFIC
+	// reason - "external CI check ... is pending", "waiting to confirm no external
+	// CI at head ...", "repository has GitHub Actions workflows but no check run
+	// has ..." - and none of them matched, so the clearance branch did not
+	// recognise Gitmoot's own earlier output and fell through. The head then kept
+	// a pending status forever and reported `mergeable_state: unstable` on green
+	// check-runs. Measured before this change: 4 OPEN pull requests across 4
+	// repositories, each with a different reason text.
+	//
+	// Ownership of the context is the right predicate. latestMergeGateStatus only
+	// returns statuses whose context is GitmootMergeGateContext, so a pending one
+	// is ours by construction and ours to resolve once the gate no longer applies.
+	// Matching on message text meant every future reason was unclearable the day
+	// it was introduced.
+	if found && status.State == "pending" {
 		if _, err := d.GitHub.CreateCommitStatus(ctx, github.CommitStatusInput{
 			Repo:        d.Repo,
 			SHA:         headSHA,
@@ -1427,10 +1467,15 @@ func (d Daemon) ensureMergeGateStatus(ctx context.Context, pull github.PullReque
 			Description: mergeGateNotAppliedDescription,
 		}); err != nil {
 			d.logf("merge-gate marker clearance failed for %s#%d at %s: %v", d.Repo.FullName(), pull.Number, headSHA, err)
+			// NOT recorded as cleared: the pending status is still live, so a
+			// later pass must look again rather than short-circuit past it.
 			return
 		}
 	}
-	d.recordMergeGateStatusObservation(ctx, pull.Number, headSHA, mergeGateStatusInactive)
+	// `cleared` rather than `inactive`: reaching here means either there was no
+	// owned pending status, or the write above succeeded. Both are proof that
+	// nothing of ours is outstanding, which is what makes the short-circuit safe.
+	d.recordMergeGateStatusObservation(ctx, pull.Number, headSHA, mergeGateStatusCleared)
 }
 
 func mergeGateMarkerApplies(state string) bool {
