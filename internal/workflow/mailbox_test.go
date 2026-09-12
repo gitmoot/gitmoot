@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -175,7 +176,7 @@ func TestMailboxPersistsRuntimeIdentityUntilTerminal(t *testing.T) {
 	}
 }
 
-func TestMailboxKeepsRuntimePIDThroughProduceCheckUntilTerminal(t *testing.T) {
+func TestMailboxClearsRuntimePIDBeforeProduceCheck(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	dir := t.TempDir()
@@ -218,11 +219,8 @@ func TestMailboxKeepsRuntimePIDThroughProduceCheckUntilTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseJobPayload during produce check: %v", err)
 	}
-	if stored.State != string(JobRunning) || payload.RuntimePID != os.Getpid() || payload.RuntimePIDStartTime == "" {
-		t.Fatalf("produce check window = state %q pid %d start %q, want last runtime identity retained", stored.State, payload.RuntimePID, payload.RuntimePIDStartTime)
-	}
-	if live, known := RuntimeProcessLiveness(payload.RuntimePID, payload.RuntimePIDStartTime); !live || !known {
-		t.Fatalf("produce-check runtime liveness = (%v, %v), want retained live identity", live, known)
+	if stored.State != string(JobRunning) || payload.RuntimePID != 0 || payload.RuntimePIDStartTime != "" || payload.RuntimePGID != 0 {
+		t.Fatalf("produce check window = state %q pid %d pgid %d start %q, want running with completed runtime identity cleared", stored.State, payload.RuntimePID, payload.RuntimePGID, payload.RuntimePIDStartTime)
 	}
 	if err := os.WriteFile(release, []byte("go"), 0o600); err != nil {
 		t.Fatalf("release produce check: %v", err)
@@ -899,6 +897,37 @@ func TestMailboxDeliverDeltasCumulativeUsage(t *testing.T) {
 	}
 	if jobB.InputTokens != 500 || jobB.OutputTokens != 50 {
 		t.Fatalf("job-b usage = (%d, %d), want (500, 50) — only the per-session delta, not the 1500/150 cumulative", jobB.InputTokens, jobB.OutputTokens)
+	}
+}
+
+func TestMailboxDeliverRecordsPartialUsageFromFailedRuntime(t *testing.T) {
+	ctx := context.Background()
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	store := openTestStore(t)
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	agent := runtime.Agent{Name: "reviewer", Runtime: runtime.OmpRuntime, RuntimeRef: "fresh:runtime", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
+	crash := errors.New("runtime exited before agent_end")
+	adapter := &fakeDelivery{
+		err:         crash,
+		errorResult: runtime.Result{InputTokens: 8833, OutputTokens: 144, Raw: "partial transcript"},
+		onDeliver:   cancelRun,
+	}
+	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "failed-usage", Agent: "reviewer", Action: "review", Repo: "gitmoot/gitmoot"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := mailbox.Run(runCtx, "failed-usage", agent, adapter); err == nil {
+		t.Fatal("Run succeeded despite runtime crash")
+	}
+	job, err := store.GetJob(ctx, "failed-usage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.State != string(JobFailed) {
+		t.Fatalf("failed runtime job state = %q, want failed", job.State)
+	}
+	if job.InputTokens != 8833 || job.OutputTokens != 144 {
+		t.Fatalf("failed runtime usage = (%d, %d), want (8833, 144)", job.InputTokens, job.OutputTokens)
 	}
 }
 
@@ -2027,6 +2056,7 @@ type fakeDelivery struct {
 	onDeliver             func()
 	pid                   int
 	err                   error
+	errorResult           runtime.Result
 }
 
 func (f *fakeDelivery) Deliver(_ context.Context, agent runtime.Agent, job runtime.Job) (runtime.Result, error) {
@@ -2048,14 +2078,11 @@ func (f *fakeDelivery) Deliver(_ context.Context, agent runtime.Agent, job runti
 		f.onDeliver()
 	}
 	if f.err != nil {
-		// A REAL adapter populates plan evidence on its FAILURE returns too — omp
-		// sets Result.PlanMode on both the non-zero-exit and parse-error paths,
-		// because a plan run that died is still a plan run. Returning a zero Result
-		// here made the mailbox's write-before-the-error-branch behaviour
-		// unobservable, so a mutation that recorded evidence only on success could
-		// not be killed by any test. The double has to honour the contract it
-		// stands in for.
-		return runtime.Result{PlanMode: runtime.PlanModeDescriptor(job.Plan, job.PlanInto)}, f.err
+		// A REAL adapter returns partial usage and plan evidence on failure. OMP
+		// accumulates both before reporting a non-zero exit or truncated stream.
+		result := f.errorResult
+		result.PlanMode = runtime.PlanModeDescriptor(job.Plan, job.PlanInto)
+		return result, f.err
 	}
 	index := len(f.prompts) - 1
 	result := runtime.Result{}

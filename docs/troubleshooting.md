@@ -549,18 +549,19 @@ Fixes:
   writes nothing to the tasks table. Inspect it with `gitmoot job events
   <parent-job-id>` (`job events` has no `--json` flag). `gitmoot job show
   <parent-job-id> --json` is valid but does not include event history.
-- A job stuck in `running` is recovered automatically once it shows no lease
-  progress past the staleness window (default 30m; tune with the
-  `GITMOOT_STALE_RUNNING_AFTER` environment variable; the smallest honored value
-  is 1m — below-1m, malformed, or non-positive values are rejected in favor of
-  the 30m default rather than clamped, #560). This window is a same-boot crash
-  backstop, not a timeout: a job holding a runtime session lock whose lease has
-  not elapsed is left running regardless of the window (its real timeout has not
-  passed). After a **reboot** you do not wait it out at all — the kernel boot id
-  changes, so on its next startup and every tick the daemon immediately requeues
-  every job claimed on the previous boot and reclaims its stranded runtime session
-  lock, regardless of any unexpired lease (#651). Boot-aware recovery is Linux
-  only; elsewhere recovery falls back to the lease/age window above.
+- A job whose recorded runtime PID is dead is failed after the PID and job log
+  stay unchanged across two 30-second observations. Gitmoot then cancels only
+  that tracked delivery, which lets its normal runtime and worktree cleanup
+  finish without interrupting healthy sibling jobs. The terminal event retains
+  a redacted transcript tail; partial runtime usage is recorded when the adapter
+  reported it before exit.
+- Legacy running rows with no runtime PID still use the conservative stale-job
+  recovery path: no lease progress past the staleness window (default 30m,
+  configurable with `GITMOOT_STALE_RUNNING_AFTER`; minimum 1m) plus frozen log
+  evidence. This is a crash backstop, not a job timeout. After a **reboot**, the
+  kernel boot id changes, so the daemon immediately requeues jobs claimed on the
+  previous boot and reclaims their runtime-session locks (#651). Boot-aware
+  recovery is Linux-only.
 - A backlog of `blocked` jobs (each paused awaiting a human) never clears on its
   own. Dismiss one with `gitmoot job cancel <job-id>` (cancel now abandons a
   `blocked` job as well as a `queued`/`running` one; #631), or clear a stale

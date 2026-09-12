@@ -2429,13 +2429,10 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 	// ctx is the SIGNAL context and governs this pass's own accept/requery loop:
 	// on shutdown it must stop selecting, querying and dispatching promptly.
 	//
-	// deliveryCtx governs the JOBS this pass dispatches, and must SURVIVE the
-	// shutdown signal so in-flight work can finish while the tracker's drain
-	// waits for it. Only the two runPoolJobRecovered calls below may use it.
-	//
-	// A nil tracker returns ctx unchanged, which is what keeps the untracked
-	// runQueuedJobsForRepoPool byte-identical to the historical pool.
-	deliveryCtx := tracker.jobContext(ctx)
+	// Each dispatched job gets a child of the tracker's shutdown-surviving
+	// context after admission. That lets the liveness reaper interrupt one dead
+	// runtime without cancelling healthy siblings. A nil tracker falls back to
+	// ctx, preserving the historical untracked pool path.
 
 	type finished struct {
 		jobID        string
@@ -2661,6 +2658,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 						worker.Admission.Release(job.ID)
 						continue
 					}
+					deliveryCtx := tracker.trackedJobContext(job.ID, ctx)
 					inflightCheckouts[checkoutKey] = true
 					if runtimeKey != "" {
 						inflightRuntimes[runtimeKey] = true
@@ -2788,6 +2786,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 						_ = jobGitClient(iso.repoCheckout, iso.runner).RemoveWorktreeForce(context.WithoutCancel(ctx), iso.worktreePath)
 						continue
 					}
+					deliveryCtx := tracker.trackedJobContext(iso.job.ID, ctx)
 					inflightCheckouts[iso.checkoutKey] = true
 					if iso.runtimeKey != "" {
 						inflightRuntimes[iso.runtimeKey] = true
