@@ -2442,7 +2442,7 @@ func (g PolicyMergeGate) evaluateStatuses(ctx context.Context, repo github.Repos
 			if item.Context == GitmootMergeGateContext {
 				continue
 			}
-			if statusPending(item.State) {
+			if github.StatusPending(item.State) {
 				return 0, mergePending{reason: fmt.Sprintf("gitmoot status %q is pending", item.Context)}
 			}
 			if item.State != "success" {
@@ -2451,7 +2451,7 @@ func (g PolicyMergeGate) evaluateStatuses(ctx context.Context, repo github.Repos
 			continue
 		}
 		externalStatusCount++
-		if statusPending(item.State) {
+		if github.StatusPending(item.State) {
 			return 0, mergePending{reason: "external commit status " + item.Context + " is pending"}
 		}
 		if item.State != "success" {
@@ -2470,13 +2470,13 @@ func (g PolicyMergeGate) evaluateStatuses(ctx context.Context, repo github.Repos
 			continue
 		}
 		externalCheckCount++
-		if checkPending(check) {
+		if github.CheckPending(check) {
 			if name == "" {
 				name = "unnamed check"
 			}
 			return 0, mergePending{reason: fmt.Sprintf("external CI check %q is pending", name)}
 		}
-		if !checkPassed(check) {
+		if !github.CheckPassed(check) {
 			if name == "" {
 				name = "unnamed check"
 			}
@@ -2737,37 +2737,6 @@ func (e mergeBlocked) Error() string {
 
 func (e mergePending) Error() string {
 	return e.reason
-}
-
-func statusPending(state string) bool {
-	switch strings.ToLower(strings.TrimSpace(state)) {
-	case "pending", "queued", "in_progress", "waiting", "requested":
-		return true
-	default:
-		return false
-	}
-}
-
-func checkPending(check github.PullRequestCheck) bool {
-	bucket := strings.ToLower(strings.TrimSpace(check.Bucket))
-	if bucket != "" {
-		return bucket == "pending"
-	}
-	switch strings.ToLower(strings.TrimSpace(check.State)) {
-	case "pending", "queued", "in_progress", "waiting", "requested":
-		return true
-	default:
-		return false
-	}
-}
-
-func checkPassed(check github.PullRequestCheck) bool {
-	bucket := strings.ToLower(strings.TrimSpace(check.Bucket))
-	if bucket != "" {
-		return bucket == "pass" || bucket == "skipping"
-	}
-	state := strings.ToLower(strings.TrimSpace(check.State))
-	return state == "success" || state == "skipped" || state == "neutral"
 }
 
 func pullRequestMerged(pr github.PullRequest) bool {

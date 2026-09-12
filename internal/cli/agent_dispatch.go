@@ -617,6 +617,23 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		if brief := briefEngine.ReviewObligationBrief(ctx, repo.FullName(), request.PullRequest, request.HeadSHA, request.TaskID); brief != "" {
 			request.Instructions += brief
 		}
+		// #1824 criterion 1: tell the reviewer what CI already established at
+		// THIS head, so its budget goes to what CI cannot do.
+		//
+		// PLACED HERE FOR THE SAME REASON AS THE BRIEF ABOVE, and the reason is
+		// #1819's scan: this block writes the 40-character head SHA into the
+		// prompt, and promptCommitTokenRE matches 7 to 64 hex characters. Landing
+		// it BEFORE the scan would feed the scan a commit token, and although
+		// this one is the dispatch head itself - so the classifier's own head arm
+		// would allow it - the ordering must not depend on that being true. A
+		// future edit that adds a base SHA or a merge-ref SHA to this block would
+		// otherwise refuse every review dispatch on a repo that enabled it.
+		//
+		// Additive and fails open in three ways (nil client, read error, zero
+		// checks): each yields a byte-identical prompt.
+		if evidence := dispatchReviewCIEvidence(ctx, github.NewClient(record.CheckoutPath), repo, request.HeadSHA); evidence != "" {
+			request.Instructions += evidence
+		}
 	}
 	// A foreground dispatch already knows the runtime it will execute. Persist it
 	// in the initial job insert so recording cannot fail separately and leave a
