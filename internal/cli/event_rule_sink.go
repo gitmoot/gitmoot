@@ -313,8 +313,9 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 		return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, "organization registry unavailable", errors.New("organization registry unavailable"))
 	}
 	isAddressedNoteWake := event.Type == events.EventOrgReply || event.Type == events.EventOrgDirective || event.Type == events.EventOrgFact
+	deduplicateAddressedWake := isAddressedNoteWake || containsEventRuleKind(kinds, eventRuleKindReviewVerdict)
 	replyHandled := false
-	addressedReplyHandled := false
+	addressedWakeHandled := map[string]bool{}
 	for _, rule := range rules {
 		// #1942 review P2: rules are processed SERIALLY, each spending its own
 		// probe/prompt budget, so a command that has stopped waiting can release the
@@ -328,10 +329,11 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 			continue
 		}
 		observer := rule.Scope == db.EventRuleScopeObserver
-		// Preserve the existing one-attempt-per-target behavior for duplicate
-		// addressed reply rules while allowing every observer rule to see the
-		// directed event independently.
-		if isAddressedNoteWake && !observer && addressedReplyHandled {
+		// Addressed note and review-verdict rules notify a role once even when an
+		// operator already configured a route that overlaps a provisioned default.
+		// Observer rules remain independent copies.
+		wakeRole := strings.ToLower(strings.TrimSpace(rule.WakeRole))
+		if deduplicateAddressedWake && !observer && addressedWakeHandled[wakeRole] {
 			continue
 		}
 		pane, ok := s.resolveRolePane(ctx, cfg, rule.WakeRole)
@@ -411,14 +413,13 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 		// recording it here is what lets a multi-rule config extend the wait
 		// instead of being abandoned on a bound sized for a single rule.
 		s.progress.Add(1)
-		// A coalesced reply batch still gives its addressed target one attempt per
-		// window. Observer rules are independent copies and do not consume that
-		// target attempt.
+		// Coalesced addressed wakes give each target role one attempt per event.
+		// Observer rules are independent copies and do not consume that attempt.
 		if isAddressedNoteWake {
 			replyHandled = true
-			if !observer {
-				addressedReplyHandled = true
-			}
+		}
+		if deduplicateAddressedWake && !observer {
+			addressedWakeHandled[wakeRole] = true
 		}
 	}
 	if isAddressedNoteWake && !replyHandled {

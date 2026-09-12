@@ -1589,7 +1589,7 @@ those panes separately before forcing the removal. `--force` does not weaken
 anything else: a pane that DOES resolve is still refused when its branch check
 fails, and a provider error still fails closed rather than being forced through.
 
-The five provisioned routes are enabled, addressed, and have an empty match
+The six provisioned routes are enabled, addressed, and have an empty match
 filter. Remove one by its stable ID with `org events rule rm` to quiet that kind;
 this is destructive and re-running `seat add` recreates it. There is currently
 no non-destructive event-rule disable verb.

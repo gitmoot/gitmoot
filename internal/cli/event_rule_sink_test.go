@@ -965,6 +965,7 @@ pane="w1:p3"
 	for _, rule := range []db.EventRule{
 		{ID: "author", OnKind: eventRuleKindReviewVerdict, WakeRole: "author", Scope: db.EventRuleScopeAddressed, Enabled: true},
 		{ID: "requester", OnKind: eventRuleKindReviewVerdict, WakeRole: "requester", Scope: db.EventRuleScopeAddressed, Enabled: true},
+		{ID: "requester-duplicate", OnKind: eventRuleKindReviewVerdict, WakeRole: "requester", Scope: db.EventRuleScopeAddressed, Enabled: true},
 		{ID: "other", OnKind: eventRuleKindReviewVerdict, WakeRole: "other", Scope: db.EventRuleScopeAddressed, Enabled: true},
 		{ID: "auditor", OnKind: eventRuleKindReviewVerdict, WakeRole: "auditor", Scope: db.EventRuleScopeObserver, Enabled: true},
 	} {
