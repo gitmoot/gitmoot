@@ -1773,8 +1773,9 @@ claimed by any role; each failure includes category counts and a reason.
 
 `gitmoot org seat add <name> [--pane ID_OR_LABEL] [--parent ROLE]
 [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]` creates or
-repairs a role and installs addressed `reply`, `blocked`, `directive`,
-`escalation`, and `fact` routes with stable IDs `org-seat-<name>-<kind>`.
+repairs a role and installs addressed `reply`, `review-verdict`, `blocked`,
+`directive`, `escalation`, and `fact` routes with stable IDs
+`org-seat-<name>-<kind>`.
 
 With `--pane`, Gitmoot resolves a literal live pane id first, then a unique
 exact live label, and stores the resolved pane id. Existing label-based commands
@@ -1789,10 +1790,10 @@ resolving, for example after Herdr recreates a pane with a new id, the same
 command can rebind the role to a live unclaimed pane while preserving its policy
 and routes. A configured binding that still resolves is immutable. An ambiguous
 label binding must be disambiguated in Herdr before rebinding. Every successful
-add validates the affected role and five routes. Bound creation and repair also
+add validates the affected role and six routes. Bound creation and repair also
 validate the live binding without making unrelated intentionally unbound roles
 decide the exit code. Unbound creation reports the deferred bind command and an
-`ok role NAME unbound enabled_routes=5` verdict. The global `org validate` command
+`ok role NAME unbound enabled_routes=6` verdict. The global `org validate` command
 continues to report every unbound role until it is attached.
 
 For a new non-owner seat, the acting role comes from `GITMOOT_ORG_ROLE` and
@@ -1839,10 +1840,14 @@ those panes separately before forcing the removal. `--force` does not weaken
 anything else: a pane that DOES resolve is still refused when its branch check
 fails, and a provider error still fails closed rather than being forced through.
 
-The five provisioned routes are enabled, addressed, and have an empty match
+The six provisioned routes are enabled, addressed, and have an empty match
 filter. Remove one by its stable ID with `org events rule rm` to quiet that kind;
 this is destructive and re-running `seat add` recreates it. There is currently
 no non-destructive event-rule disable verb.
+
+After upgrading an existing installation, re-run `org seat add <role>` for each
+seat to provision default routes introduced by the new release, including
+`review-verdict`. The repair preserves the seat's existing policy and routes.
 
 The registry uses `[org] enforce = "warn"|"block"` and
 `[org.roles."name"]` entries with `parent`, `scope`, `merge_rule`, an optional
