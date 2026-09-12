@@ -113,7 +113,8 @@ func TestOrgSeatAddEndsGreenOnRealityValidation(t *testing.T) {
 		"route org-seat-worker-escalation created",
 		"route org-seat-worker-fact created",
 		"route org-seat-worker-reply created",
-		"ok role worker pane=w1:p2 enabled_routes=5",
+		"route org-seat-worker-review-verdict created",
+		"ok role worker pane=w1:p2 enabled_routes=6",
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("seat add output missing %q:\n%s", want, stdout.String())
@@ -128,8 +129,8 @@ func TestOrgSeatAddEndsGreenOnRealityValidation(t *testing.T) {
 		t.Fatalf("worker role = %+v, present=%t", worker, ok)
 	}
 	rules := listOrgSeatTestRules(t, paths)
-	if len(rules) != 6 {
-		t.Fatalf("event rules = %+v, want owner route plus five worker routes", rules)
+	if len(rules) != 7 {
+		t.Fatalf("event rules = %+v, want owner route plus six worker routes", rules)
 	}
 
 	// Re-running add is the repair path and must not duplicate owned routes.
@@ -137,11 +138,111 @@ func TestOrgSeatAddEndsGreenOnRealityValidation(t *testing.T) {
 	stderr.Reset()
 	code = runOrg([]string{"seat", "add", "worker", "--pane", "Worker", "--home", home}, &stdout, &stderr)
 	if code != 0 || !strings.Contains(stdout.String(), "route org-seat-worker-reply existed") ||
-		!strings.Contains(stdout.String(), "ok role worker pane=w1:p2 enabled_routes=5") {
+		!strings.Contains(stdout.String(), "ok role worker pane=w1:p2 enabled_routes=6") {
 		t.Fatalf("second seat add code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
-	if got := len(listOrgSeatTestRules(t, paths)); got != 6 {
-		t.Fatalf("event rules after repair = %d, want 6", got)
+	if got := len(listOrgSeatTestRules(t, paths)); got != 7 {
+		t.Fatalf("event rules after repair = %d, want 7", got)
+	}
+}
+
+func TestOrgSeatAddCleanDatabaseCreatesPersistentReviewVerdictRoute(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(`
+[org.roles."owner"]
+scope = ["*"]
+merge_rule = "owner"
+pane = "Owner"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	panes := []org.LivePane{
+		{PaneID: "w1:p1", Label: "Owner"},
+		{PaneID: "w1:p2", Label: "Worker"},
+	}
+	withOrgSeatFixtureProvider(t, &panes)
+
+	var stdout, stderr bytes.Buffer
+	if code := runOrg([]string{"seat", "add", "worker", "--pane", "Worker", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("seat add code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules, err := store.ListEventRules(context.Background())
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want := db.EventRule{
+		ID: "org-seat-worker-review-verdict", OnKind: "review-verdict", WakeRole: "worker",
+		Scope: db.EventRuleScopeAddressed, Enabled: true,
+	}
+	if !slices.ContainsFunc(rules, func(rule db.EventRule) bool { return sameOrgSeatRule(rule, want) }) {
+		t.Fatalf("review verdict route missing after database reopen: %+v", rules)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := runOrg([]string{"events", "rule", "rm", "--home", home, want.ID}, &stdout, &stderr); code != 0 {
+		t.Fatalf("remove review wake opt-out code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	store, err = dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules, err = store.ListEventRules(context.Background())
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if slices.ContainsFunc(rules, func(rule db.EventRule) bool { return rule.ID == want.ID }) {
+		t.Fatalf("review verdict route returned after explicit opt-out and database reopen: %+v", rules)
+	}
+}
+
+func TestOrgSeatAddRepairsMissingReviewVerdictRoute(t *testing.T) {
+	home, paths, panes := setupOrgSeatTestHome(t)
+	withOrgSeatFixtureProvider(t, &panes)
+
+	var stdout, stderr bytes.Buffer
+	if code := runOrg([]string{"seat", "add", "worker", "--pane", "Worker", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("initial seat add code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteEventRule(context.Background(), "org-seat-worker-review-verdict"); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := runOrg([]string{"seat", "add", "worker", "--pane", "Worker", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("repair seat add code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "route org-seat-worker-review-verdict created") {
+		t.Fatalf("repair output missing review route creation:\n%s", stdout.String())
+	}
+	if got := len(listOrgSeatTestRules(t, paths)); got != 7 {
+		t.Fatalf("event rules after review route repair = %d, want 7", got)
 	}
 }
 
@@ -255,7 +356,7 @@ func TestOrgSeatBindingSurvivesLabelRename(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	if code := runOrg([]string{"validate", "--home", home}, &stdout, &stderr); code != 0 ||
-		!strings.Contains(stdout.String(), "ok 2 roles, 2 live panes, 6 enabled routes") {
+		!strings.Contains(stdout.String(), "ok 2 roles, 2 live panes, 7 enabled routes") {
 		t.Fatalf("validate after rename code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 }
@@ -268,7 +369,7 @@ func TestOrgSeatAddCreatesUnboundThenBinds(t *testing.T) {
 	code := runOrg([]string{"seat", "add", "worker", "--home", home}, &stdout, &stderr)
 	if code != 0 || !strings.Contains(stdout.String(), `role worker created pane=""`) ||
 		!strings.Contains(stdout.String(), "role worker is unbound") ||
-		!strings.Contains(stdout.String(), "ok role worker unbound enabled_routes=5") {
+		!strings.Contains(stdout.String(), "ok role worker unbound enabled_routes=6") {
 		t.Fatalf("unbound seat add code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 	cfg, err := config.LoadOrg(paths)
@@ -279,8 +380,8 @@ func TestOrgSeatAddCreatesUnboundThenBinds(t *testing.T) {
 	if !ok || worker.Pane != "" {
 		t.Fatalf("unbound worker role = %+v, present=%t", worker, ok)
 	}
-	if got := len(listOrgSeatTestRules(t, paths)); got != 6 {
-		t.Fatalf("routes after unbound creation = %d, want 6", got)
+	if got := len(listOrgSeatTestRules(t, paths)); got != 7 {
+		t.Fatalf("routes after unbound creation = %d, want 7", got)
 	}
 	stdout.Reset()
 	stderr.Reset()
@@ -303,13 +404,13 @@ func TestOrgSeatAddCreatesUnboundThenBinds(t *testing.T) {
 	if !ok || worker.Pane != "w1:p2" {
 		t.Fatalf("bound worker role = %+v, present=%t", worker, ok)
 	}
-	if got := len(listOrgSeatTestRules(t, paths)); got != 6 {
-		t.Fatalf("routes after bind = %d, want 6", got)
+	if got := len(listOrgSeatTestRules(t, paths)); got != 7 {
+		t.Fatalf("routes after bind = %d, want 7", got)
 	}
 	stdout.Reset()
 	stderr.Reset()
 	if code := runOrg([]string{"validate", "--home", home}, &stdout, &stderr); code != 0 ||
-		!strings.Contains(stdout.String(), "ok 2 roles, 2 live panes, 6 enabled routes") {
+		!strings.Contains(stdout.String(), "ok 2 roles, 2 live panes, 7 enabled routes") {
 		t.Fatalf("validate bound seat code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 }
@@ -363,8 +464,8 @@ func TestOrgSeatAddRejectsPolicyChangesForExistingRole(t *testing.T) {
 			if !ok || worker.Pane != "" || len(worker.Scope) != 1 || worker.Scope[0] != "*" {
 				t.Fatalf("worker changed after rejected policy flag: %+v, present=%t", worker, ok)
 			}
-			if got := len(listOrgSeatTestRules(t, paths)); got != 6 {
-				t.Fatalf("routes after rejected policy flag = %d, want 6", got)
+			if got := len(listOrgSeatTestRules(t, paths)); got != 7 {
+				t.Fatalf("routes after rejected policy flag = %d, want 7", got)
 			}
 		})
 	}
@@ -396,8 +497,8 @@ func TestOrgSeatAddAcceptsMatchingPolicyFlagsForExistingRole(t *testing.T) {
 		worker.MergeRule != "none" || worker.Pane != "w1:p2" {
 		t.Fatalf("worker after matching retry = %+v, present=%t", worker, ok)
 	}
-	if got := len(listOrgSeatTestRules(t, paths)); got != 6 {
-		t.Fatalf("routes after matching retry = %d, want 6", got)
+	if got := len(listOrgSeatTestRules(t, paths)); got != 7 {
+		t.Fatalf("routes after matching retry = %d, want 7", got)
 	}
 }
 
@@ -488,7 +589,7 @@ func TestOrgSeatAddSucceedsWithAnotherUnboundRole(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	code := runOrg([]string{"seat", "add", "other", "--pane", "w1:p2", "--home", home}, &stdout, &stderr)
-	if code != 0 || !strings.Contains(stdout.String(), "ok role other pane=w1:p2 enabled_routes=5") {
+	if code != 0 || !strings.Contains(stdout.String(), "ok role other pane=w1:p2 enabled_routes=6") {
 		t.Fatalf("bound other add code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 	stdout.Reset()
@@ -528,8 +629,8 @@ func TestOrgSeatAddRebindsUnresolvedConfiguredPane(t *testing.T) {
 	if !ok || worker.Pane != "w1:p2" || worker.Parent != "owner" || worker.MergeRule != "owner" {
 		t.Fatalf("rebound worker = %+v, present=%t", worker, ok)
 	}
-	if got := len(listOrgSeatTestRules(t, paths)); got != 6 {
-		t.Fatalf("routes after rebind = %d, want 6", got)
+	if got := len(listOrgSeatTestRules(t, paths)); got != 7 {
+		t.Fatalf("routes after rebind = %d, want 7", got)
 	}
 }
 
@@ -554,7 +655,7 @@ func TestOrgSeatAddRejectsAmbiguousConfiguredPaneRebind(t *testing.T) {
 	if !ok || worker.Pane != "Worker" {
 		t.Fatalf("ambiguous rebind changed worker = %+v, present=%t", worker, ok)
 	}
-	if got := len(listOrgSeatTestRules(t, paths)); got != 6 {
+	if got := len(listOrgSeatTestRules(t, paths)); got != 7 {
 		t.Fatalf("ambiguous rebind changed routes: %d", got)
 	}
 }
@@ -791,7 +892,7 @@ func TestOrgSeatRemoveRefusesUnshippedBranchWork(t *testing.T) {
 	if _, ok := cfg.Role("worker"); !ok {
 		t.Fatal("branch-check mutant removed worker role")
 	}
-	if got := len(listOrgSeatTestRules(t, paths)); got != 6 {
+	if got := len(listOrgSeatTestRules(t, paths)); got != 7 {
 		t.Fatalf("branch refusal changed routes: %d", got)
 	}
 }
@@ -886,8 +987,8 @@ func TestOrgSeatRemoveStalePaneIDFailsClosed(t *testing.T) {
 	if !ok || worker.Pane != "w1:p9" {
 		t.Fatalf("stale worker changed after refused removal = %+v, present=%t", worker, ok)
 	}
-	if got := len(listOrgSeatTestRules(t, paths)); got != 6 {
-		t.Fatalf("routes after stale removal refusal = %d, want 6", got)
+	if got := len(listOrgSeatTestRules(t, paths)); got != 7 {
+		t.Fatalf("routes after stale removal refusal = %d, want 7", got)
 	}
 }
 
@@ -920,7 +1021,7 @@ func TestOrgSeatRemoveAmbiguousPaneLabelFailsClosed(t *testing.T) {
 	} else if _, ok := cfg.Role("worker"); !ok {
 		t.Fatal("ambiguous removal deleted worker")
 	}
-	if got := len(listOrgSeatTestRules(t, paths)); got != 6 {
+	if got := len(listOrgSeatTestRules(t, paths)); got != 7 {
 		t.Fatalf("ambiguous removal changed routes: %d", got)
 	}
 
@@ -981,7 +1082,7 @@ func TestOrgSeatRemoveConfiguredPaneProviderOutageFailsClosed(t *testing.T) {
 	} else if _, ok := cfg.Role("worker"); !ok {
 		t.Fatal("provider outage removal deleted worker")
 	}
-	if got := len(listOrgSeatTestRules(t, paths)); got != 6 {
+	if got := len(listOrgSeatTestRules(t, paths)); got != 7 {
 		t.Fatalf("provider outage removal changed routes: %d", got)
 	}
 }
@@ -1013,7 +1114,7 @@ func TestOrgSeatRemoveClosesPaneAndEndsWithValidation(t *testing.T) {
 	}
 	for _, want := range []string{
 		"pane w1:p2 closed",
-		"role worker removed with 5 wake routes",
+		"role worker removed with 6 wake routes",
 		"ok role worker absent owned_routes=0",
 	} {
 		if !strings.Contains(stdout.String(), want) {
@@ -1146,8 +1247,8 @@ func TestOrgSeatRemoveRestoresOwnedStateWhenPaneCloseFails(t *testing.T) {
 	if _, ok := cfg.Role("worker"); !ok {
 		t.Fatal("worker role was not restored after pane-close failure")
 	}
-	if got := len(listOrgSeatTestRules(t, paths)); got != 6 {
-		t.Fatalf("routes after pane-close rollback = %d, want 6", got)
+	if got := len(listOrgSeatTestRules(t, paths)); got != 7 {
+		t.Fatalf("routes after pane-close rollback = %d, want 7", got)
 	}
 }
 
@@ -1417,7 +1518,7 @@ func TestOrgSeatRemoveForceStillFailsClosedOnProviderOutage(t *testing.T) {
 	if _, ok := cfg.Role("worker"); !ok {
 		t.Fatal("a provider outage under --force removed the role anyway")
 	}
-	if got := len(listOrgSeatTestRules(t, paths)); got != 6 {
+	if got := len(listOrgSeatTestRules(t, paths)); got != 7 {
 		t.Fatalf("a provider outage under --force changed routes: %d", got)
 	}
 }

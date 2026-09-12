@@ -161,7 +161,7 @@ func printOrgUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org interrupts [--window 24h|7d|0] [--json] [--home DIR]")
 }
 
-var orgSeatDefaultRouteKinds = []string{"blocked", "directive", "escalation", "fact", "reply"}
+var orgSeatDefaultRouteKinds = []string{"blocked", "directive", "escalation", "fact", "reply", "review-verdict"}
 
 const orgSeatExternalTimeout = 10 * time.Second
 
