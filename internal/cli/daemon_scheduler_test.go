@@ -4318,7 +4318,7 @@ func TestDaemonWorkerTickRunsLivenessSweep(t *testing.T) {
 	tracker := newInflightJobTracker(ctx)
 	tracker.liveness.probe = func(int, string) runtimePIDState { return runtimePIDDead }
 
-	for _, at := range []time.Time{now, now.Add(daemonWorkerLoopInterval)} {
+	for _, at := range []time.Time{now, now.Add(daemonDeadRuntimeReapAfter)} {
 		if err := runDaemonWorkerTickTracked(ctx, store, worker, 0, false, "", "", io.Discard, at, tracker, nil); err != nil {
 			t.Fatalf("runDaemonWorkerTickTracked(%s): %v", at, err)
 		}

@@ -59,7 +59,7 @@ func livenessTestJob(t *testing.T, id string, pid int) (context.Context, config.
 
 func runLivenessSamples(t *testing.T, sweep *daemonLivenessSweep, ctx context.Context, store *db.Store, paths config.Paths, now time.Time, quiet time.Duration) {
 	t.Helper()
-	for _, at := range []time.Time{now, now.Add(daemonWorkerLoopInterval)} {
+	for _, at := range []time.Time{now, now.Add(daemonDeadRuntimeReapAfter)} {
 		if err := sweep.sweepRunningJobLiveness(ctx, store, io.Discard, paths, at, 30*time.Minute, quiet, "owner/repo", ""); err != nil {
 			t.Fatalf("sweep at %s: %v", at, err)
 		}
@@ -120,6 +120,70 @@ func TestDaemonLivenessSweepDeadPIDFrozenLogFails(t *testing.T) {
 	}
 }
 
+func TestDaemonLivenessSweepPromptlyCancelsOnlyDeadTrackedJob(t *testing.T) {
+	ctx, paths, store, _, quiet := livenessTestJob(t, "dead-recent", 4242)
+	now := time.Now().UTC().Add(2 * daemonDeadRuntimeReapAfter)
+	logPath := transcript.JobLogPath(paths.Logs, "dead-recent")
+	frozenAt := now.Add(-daemonDeadRuntimeReapAfter - time.Second)
+	if err := os.Chtimes(logPath, frozenAt, frozenAt); err != nil {
+		t.Fatal(err)
+	}
+
+	tracker := newInflightJobTracker(context.Background())
+	if !tracker.beginWithin(0, "dead-recent", "owner/repo", "dead-checkout", "dead-runtime") {
+		t.Fatal("dead job admission refused")
+	}
+	if !tracker.beginWithin(0, "healthy-sibling", "owner/other", "healthy-checkout", "healthy-runtime") {
+		t.Fatal("healthy sibling admission refused")
+	}
+	deadCtx := tracker.trackedJobContext("dead-recent", context.Background())
+	healthyCtx := tracker.trackedJobContext("healthy-sibling", context.Background())
+	cleaned := make(chan struct{})
+	go func() {
+		<-deadCtx.Done()
+		tracker.end("dead-recent")
+		close(cleaned)
+	}()
+	defer tracker.end("healthy-sibling")
+
+	sweep := tracker.liveness
+	sweep.probe = func(int, string) runtimePIDState { return runtimePIDDead }
+	for elapsed := time.Duration(0); elapsed < daemonDeadRuntimeReapAfter; elapsed += daemonWorkerLoopInterval {
+		if err := sweep.sweepRunningJobLiveness(ctx, store, io.Discard, paths, now.Add(elapsed), 30*time.Minute, quiet, "owner/repo", ""); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-deadCtx.Done():
+			t.Fatalf("dead job cancelled after %s, before the confirmation window", elapsed)
+		default:
+		}
+	}
+	if err := sweep.sweepRunningJobLiveness(ctx, store, io.Discard, paths, now.Add(daemonDeadRuntimeReapAfter), 30*time.Minute, quiet, "owner/repo", ""); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-cleaned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dead job context was not cancelled after recovery transition")
+	}
+	select {
+	case <-healthyCtx.Done():
+		t.Fatal("dead-job recovery cancelled a healthy sibling")
+	default:
+	}
+
+	job, err := store.GetJob(ctx, "dead-recent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.State != string(workflow.JobFailed) {
+		t.Fatalf("recent dead job state = %q, want failed", job.State)
+	}
+	if tracker.inflightJob("dead-recent") {
+		t.Fatal("dead job remained in tracker after cancellation cleanup")
+	}
+}
+
 func TestDaemonLivenessSweepLivePIDVetoesFrozenLog(t *testing.T) {
 	ctx, paths, store, now, quiet := livenessTestJob(t, "live", os.Getpid())
 	sweep := newDaemonLivenessSweep()
@@ -137,7 +201,7 @@ func TestDaemonLivenessSweepLivePIDVetoesFrozenLog(t *testing.T) {
 func TestDaemonLivenessSweepQuietThresholdVetoes(t *testing.T) {
 	ctx, paths, store, now, quiet := livenessTestJob(t, "recent", 4242)
 	path := transcript.JobLogPath(paths.Logs, "recent")
-	recent := now.Add(-quiet + time.Minute)
+	recent := now.Add(time.Second) // output arrives between the two dead-PID samples
 	if err := os.Chtimes(path, recent, recent); err != nil {
 		t.Fatal(err)
 	}

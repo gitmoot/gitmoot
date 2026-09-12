@@ -93,6 +93,8 @@ type inflightDispatch struct {
 	repo        string
 	checkoutKey string
 	runtimeKey  string
+	runCtx      context.Context
+	cancelRun   context.CancelFunc
 }
 
 // inflightJobTracker owns the cross-tick in-flight job accounting and
@@ -131,7 +133,7 @@ type inflightJobTracker struct {
 // finite.
 func newInflightJobTracker(ctx context.Context) *inflightJobTracker {
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	return &inflightJobTracker{
+	tracker := &inflightJobTracker{
 		runCtx:    runCtx,
 		cancelRun: cancel,
 		jobs:      map[string]inflightDispatch{},
@@ -140,8 +142,10 @@ func newInflightJobTracker(ctx context.Context) *inflightJobTracker {
 		perRepo:   map[string]int{},
 		poolRuns:  map[string]bool{},
 		errs:      map[string][]error{},
-		liveness:  newDaemonLivenessSweep(),
 	}
+	tracker.liveness = newDaemonLivenessSweep()
+	tracker.liveness.cancelJob = tracker.cancelJob
+	return tracker
 }
 
 // jobContext returns the context dispatched jobs must run on: cancelled ONLY
@@ -151,6 +155,21 @@ func newInflightJobTracker(ctx context.Context) *inflightJobTracker {
 func (t *inflightJobTracker) jobContext(fallback context.Context) context.Context {
 	if t == nil {
 		return fallback
+	}
+	return t.runCtx
+}
+
+// trackedJobContext returns one job's child context. The liveness reaper can
+// cancel this context without interrupting healthy siblings; drain still
+// cancels their shared parent when its shutdown budget expires.
+func (t *inflightJobTracker) trackedJobContext(jobID string, fallback context.Context) context.Context {
+	if t == nil {
+		return fallback
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if dispatch, ok := t.jobs[jobID]; ok && dispatch.runCtx != nil {
+		return dispatch.runCtx
 	}
 	return t.runCtx
 }
@@ -183,7 +202,8 @@ func (t *inflightJobTracker) beginWithin(hostCap int, jobID, repo, checkoutKey, 
 			return false
 		}
 	}
-	t.jobs[jobID] = inflightDispatch{repo: repo, checkoutKey: checkoutKey, runtimeKey: runtimeKey}
+	jobCtx, cancelJob := context.WithCancel(t.runCtx)
+	t.jobs[jobID] = inflightDispatch{repo: repo, checkoutKey: checkoutKey, runtimeKey: runtimeKey, runCtx: jobCtx, cancelRun: cancelJob}
 	if checkoutKey != "" {
 		t.checkouts[checkoutKey]++
 	}
@@ -192,6 +212,23 @@ func (t *inflightJobTracker) beginWithin(hostCap int, jobID, repo, checkoutKey, 
 	}
 	t.perRepo[repo]++
 	t.wg.Add(1)
+	return true
+}
+
+// cancelJob interrupts one tracked delivery after the durable liveness
+// transition wins. It does not release accounting: the worker's normal defer
+// owns that cleanup once cancellation unwinds the runtime and worktree.
+func (t *inflightJobTracker) cancelJob(jobID string) bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	dispatch, exists := t.jobs[jobID]
+	t.mu.Unlock()
+	if !exists || dispatch.cancelRun == nil {
+		return false
+	}
+	dispatch.cancelRun()
 	return true
 }
 
@@ -207,6 +244,9 @@ func (t *inflightJobTracker) end(jobID string) {
 		return
 	}
 	delete(t.jobs, jobID)
+	if dispatch.cancelRun != nil {
+		dispatch.cancelRun()
+	}
 	decrementCount(t.checkouts, dispatch.checkoutKey)
 	decrementCount(t.runtimes, dispatch.runtimeKey)
 	decrementCount(t.perRepo, dispatch.repo)
@@ -842,7 +882,6 @@ func dispatchQueuedJobsTracked(ctx context.Context, worker jobWorker, limit int,
 	seedCheckouts, seedRuntimes := tracker.seeds()
 	queued, remaining := selectRunnableQueuedJobsSeeded(ctx, worker.Store, eligible, slots, policy, seedCheckouts, seedRuntimes)
 	explainHeldBackJobs(ctx, worker, tracker, remaining)
-	runCtx := tracker.jobContext(ctx)
 	for _, job := range queued {
 		job := job
 		if !worker.Admission.Reserve(job.ID, func() admissionEstimate { return worker.admissionEstimate(ctx, job) }) {
@@ -858,6 +897,7 @@ func dispatchQueuedJobsTracked(ctx context.Context, worker jobWorker, limit int,
 			worker.Admission.Release(job.ID)
 			continue
 		}
+		runCtx := tracker.trackedJobContext(job.ID, ctx)
 		go func() {
 			defer tracker.end(job.ID)
 			defer worker.Admission.Release(job.ID)

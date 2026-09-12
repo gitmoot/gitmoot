@@ -28,6 +28,12 @@ const (
 	runtimePIDIdentityMismatch
 )
 
+// daemonDeadRuntimeReapAfter gives the normal worker settlement path its
+// bounded terminal-write window before recovery intervenes. A process proven
+// dead cannot resume work, so it must not inherit the 30m/45m silence policy
+// used for legacy rows with no process identity.
+const daemonDeadRuntimeReapAfter = 30 * time.Second
+
 type livenessLogSample struct {
 	size             int64
 	modified         time.Time
@@ -38,12 +44,13 @@ type livenessLogSample struct {
 // daemonLivenessSweep retains one prior transcript observation per candidate.
 // A single stat can never turn temporary silence into a terminal verdict.
 type daemonLivenessSweep struct {
-	mu       sync.Mutex
-	samples  map[string]livenessLogSample
-	stat     func(string) (os.FileInfo, error)
-	probe    func(int, string) runtimePIDState
-	identity func(int) string
-	signal   func(int, syscall.Signal) error
+	mu        sync.Mutex
+	samples   map[string]livenessLogSample
+	stat      func(string) (os.FileInfo, error)
+	probe     func(int, string) runtimePIDState
+	identity  func(int) string
+	signal    func(int, syscall.Signal) error
+	cancelJob func(string) bool
 }
 
 func newDaemonLivenessSweep() *daemonLivenessSweep {
@@ -116,13 +123,18 @@ func configuredDaemonQuietKillAfter(home string, stdout io.Writer) time.Duration
 }
 
 // sweepRunningJobLiveness is the recurring same-boot crash detector. Startup
-// and foreign-boot recovery stay separate: this path only fails a job after
-// age, byte-progress, and runtime-process evidence converge.
+// and foreign-boot recovery stay separate. Rows with a recorded dead PID use a
+// short, two-sample confirmation window; legacy rows still require the original
+// stale-age, byte-progress, and lease evidence.
 func (s *daemonLivenessSweep) sweepRunningJobLiveness(ctx context.Context, store *db.Store, stdout io.Writer, paths config.Paths, now time.Time, staleAfter, quietAfter time.Duration, repoFilter, rootFilter string) error {
 	if s == nil {
 		return nil
 	}
-	jobs, err := store.ListRunningJobsUpdatedBefore(ctx, now.Add(-staleAfter))
+	candidateAge := staleAfter
+	if candidateAge <= 0 || candidateAge > daemonDeadRuntimeReapAfter {
+		candidateAge = daemonDeadRuntimeReapAfter
+	}
+	jobs, err := store.ListRunningJobsUpdatedBefore(ctx, now.Add(-candidateAge))
 	if err != nil {
 		return err
 	}
@@ -134,7 +146,11 @@ func (s *daemonLivenessSweep) sweepRunningJobLiveness(ctx context.Context, store
 			return err
 		}
 	}
-	s.prune(now, 4*quietAfter)
+	pruneAfter := 4 * quietAfter
+	if minimum := 4 * daemonDeadRuntimeReapAfter; pruneAfter < minimum {
+		pruneAfter = minimum
+	}
+	s.prune(now, pruneAfter)
 	return nil
 }
 
@@ -148,26 +164,20 @@ func (s *daemonLivenessSweep) evaluate(ctx context.Context, store *db.Store, std
 		s.forget(job.ID)
 		return nil
 	}
-	requiredQuiet := quietAfter
+
 	legacy := payload.RuntimePID <= 0
+	requiredAge := staleAfter
+	requiredQuiet := quietAfter
+	stableFor := daemonWorkerLoopInterval
 	if legacy {
 		requiredQuiet = 2 * quietAfter
-	}
-	if now.Sub(info.ModTime()) < requiredQuiet {
-		s.remember(job.ID, livenessLogSample{size: info.Size(), modified: info.ModTime(), observed: now})
-		return nil
-	}
-
-	previous, stable := s.previousStable(job.ID, info, now)
-	if !stable {
-		return nil
-	}
-
-	if !legacy {
+	} else {
 		switch s.probe(payload.RuntimePID, payload.RuntimePIDStartTime) {
 		case runtimePIDLive:
+			s.forget(job.ID)
 			return nil // absolute veto: a quiet, thinking runtime remains live
 		case runtimePIDIdentityMismatch:
+			previous, _ := s.previousStable(job.ID, info, now, daemonWorkerLoopInterval)
 			if !previous.identityReported {
 				_ = store.AddJobEvent(ctx, db.JobEvent{
 					JobID: job.ID,
@@ -180,11 +190,30 @@ func (s *daemonLivenessSweep) evaluate(ctx context.Context, store *db.Store, std
 			}
 			return nil
 		case runtimePIDUnknown:
+			s.forget(job.ID)
 			return nil
 		case runtimePIDDead:
-			// All three required legs are named in the terminal event below.
+			requiredAge = daemonDeadRuntimeReapAfter
+			requiredQuiet = daemonDeadRuntimeReapAfter
+			stableFor = daemonDeadRuntimeReapAfter
 		}
-	} else {
+	}
+
+	updatedAt := parseJobTimeMillis(job.UpdatedAt)
+	if updatedAt == 0 {
+		updatedAt = parseJobTimeMillis(job.CreatedAt)
+	}
+	if updatedAt == 0 || now.Sub(time.UnixMilli(updatedAt)) < requiredAge {
+		s.forget(job.ID)
+		return nil
+	}
+
+	_, stable := s.previousStable(job.ID, info, now, stableFor)
+	if now.Sub(info.ModTime()) < requiredQuiet || !stable {
+		return nil
+	}
+
+	if legacy {
 		leaseHeld, leaseErr := runtimeOwnerLeaseHeld(ctx, store, job.ID, now)
 		if leaseErr != nil {
 			return leaseErr
@@ -199,14 +228,17 @@ func (s *daemonLivenessSweep) evaluate(ctx context.Context, store *db.Store, std
 	runtimePGID := payload.RuntimePGID
 	processLeg := "legacy row has no runtime PID and holds no runtime lease"
 	if !legacy {
-		processLeg = fmt.Sprintf("runtime pid %d is dead (recorded starttime %s)", runtimePID, runtimeStart)
+		processLeg = fmt.Sprintf("runtime pid %d is dead (recorded starttime %s) across two samples for %s", runtimePID, runtimeStart, stableFor)
 	}
-	message := fmt.Sprintf("liveness predicate satisfied: updated_at frozen past %s; job log byte-frozen for %s across two samples; %s", staleAfter, requiredQuiet, processLeg)
+	message := fmt.Sprintf("liveness predicate satisfied: updated_at frozen past %s; job log byte-frozen for %s across two samples; %s", requiredAge, requiredQuiet, processLeg)
 	transitioned, err := failRecoveredRunningJob(ctx, store, stdout, now, job, message)
 	if err != nil {
 		return err
 	}
 	if transitioned {
+		if s.cancelJob != nil {
+			s.cancelJob(job.ID)
+		}
 		if !legacy {
 			s.killRecordedRuntimeGroup(ctx, store, job.ID, runtimePID, runtimePGID, runtimeStart)
 		}
@@ -248,14 +280,17 @@ func (s *daemonLivenessSweep) killRecordedRuntimeGroup(ctx context.Context, stor
 	}
 }
 
-func (s *daemonLivenessSweep) previousStable(jobID string, info os.FileInfo, now time.Time) (livenessLogSample, bool) {
+func (s *daemonLivenessSweep) previousStable(jobID string, info os.FileInfo, now time.Time, stableFor time.Duration) (livenessLogSample, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	previous, ok := s.samples[jobID]
 	current := livenessLogSample{size: info.Size(), modified: info.ModTime(), observed: now, identityReported: previous.identityReported}
+	unchanged := ok && previous.size == current.size && previous.modified.Equal(current.modified)
+	if unchanged {
+		current.observed = previous.observed
+	}
 	s.samples[jobID] = current
-	stable := ok && previous.size == current.size && previous.modified.Equal(current.modified) && now.Sub(previous.observed) >= daemonWorkerLoopInterval
-	return current, stable
+	return current, unchanged && now.Sub(previous.observed) >= stableFor
 }
 
 func (s *daemonLivenessSweep) remember(jobID string, sample livenessLogSample) {

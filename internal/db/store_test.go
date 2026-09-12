@@ -3453,6 +3453,11 @@ func TestListRunningJobsUpdatedBeforeOrder(t *testing.T) {
 		t.Fatalf("ListRunningJobsUpdatedBefore returned error: %v", err)
 	}
 	wantIDs := []string{"job-2", "job-3", "job-1"}
+	wantUpdatedAt := map[string]string{
+		"job-1": "2026-01-30 00:00:00",
+		"job-2": "2026-01-10 00:00:00",
+		"job-3": "2026-01-20 00:00:00",
+	}
 	if len(got) != len(wantIDs) {
 		t.Fatalf("returned %d jobs, want %d: %+v", len(got), len(wantIDs), got)
 	}
@@ -3462,6 +3467,9 @@ func TestListRunningJobsUpdatedBeforeOrder(t *testing.T) {
 		}
 		if job.State != "running" {
 			t.Fatalf("job[%d].State = %q, want running only", i, job.State)
+		}
+		if job.CreatedAt == "" || job.UpdatedAt != wantUpdatedAt[job.ID] {
+			t.Fatalf("job[%d] timestamps = created %q updated %q, want populated created_at and updated_at %q", i, job.CreatedAt, job.UpdatedAt, wantUpdatedAt[job.ID])
 		}
 	}
 

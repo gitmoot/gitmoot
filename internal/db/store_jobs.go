@@ -731,7 +731,7 @@ func (s *Store) CountJobsByOrgRoleSince(ctx context.Context, since time.Time) (m
 // must never time it out and requeue it (which would try to Deliver work the
 // engine never owned). Engine-driven jobs default externally_driven = 0, so their
 // reaping is byte-identical.
-const listRunningJobsUpdatedBeforeSQL = `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens
+const listRunningJobsUpdatedBeforeSQL = `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, created_at, updated_at
 		FROM jobs WHERE state = 'running' AND externally_driven = 0 AND updated_at < ? ORDER BY updated_at`
 
 // ListRunningJobsUpdatedBefore returns the running jobs whose updated_at predates
@@ -743,9 +743,9 @@ const listRunningJobsUpdatedBeforeSQL = `SELECT id, agent, type, state, payload,
 // reason ListQueuedJobs inlines 'queued': SQLite only applies a partial index when
 // it can prove the query's WHERE implies the index's predicate, which a bound
 // `state = ?` prevents (EXPLAIN QUERY PLAN falls back to a scan + temp b-tree).
-// The sole caller (recoverRunningJobsBeforeForRepoSkipping) processes each row
-// independently and does not depend on the ordering; updated_at is fixed-width
-// 'YYYY-MM-DD HH:MM:SS' so lexical order equals chronological order.
+// Recovery callers process each row independently and do not depend on the
+// ordering. created_at and updated_at are returned because the liveness evaluator
+// applies a shorter age bound only when a recorded runtime PID is proven dead.
 func (s *Store) ListRunningJobsUpdatedBefore(ctx context.Context, before time.Time) ([]Job, error) {
 	rows, err := s.db.QueryContext(ctx, listRunningJobsUpdatedBeforeSQL, before.UTC().Format("2006-01-02 15:04:05"))
 	if err != nil {
@@ -756,7 +756,7 @@ func (s *Store) ListRunningJobsUpdatedBefore(ctx context.Context, before time.Ti
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.CreatedAt, &job.UpdatedAt); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
