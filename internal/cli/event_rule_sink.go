@@ -827,6 +827,12 @@ func eventRuleWakePrompt(kind string, event events.Event) string {
 	}
 	if strings.EqualFold(strings.TrimSpace(kind), db.WakeOutboxKindFact) {
 		detail := truncateForWake(strings.TrimSpace(event.Detail), 320)
+		if strings.HasPrefix(event.Cause, "awaited_fact_review_") {
+			return fmt.Sprintf(
+				"gitmoot awaited fact for %s: %s. Inspect current waits with: gitmoot org await list --role %s --state waiting. Retry the exact-head review; if no reviewer runtime works, record a blocker naming its owner and next trigger before idling",
+				event.WakeTargetRole, detail, event.WakeTargetRole,
+			)
+		}
 		return fmt.Sprintf("gitmoot awaited fact for %s: %s", event.WakeTargetRole, detail)
 	}
 	// event.Detail is already redacted and absolute-path-scrubbed by

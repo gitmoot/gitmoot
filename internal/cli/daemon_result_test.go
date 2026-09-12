@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -11,6 +12,55 @@ import (
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
+
+func TestFinishQueuedReviewFailureWakesExactHeadWaiter(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	key, err := db.ReviewVerdictSubjectKey("acme/widget", 2165, "head-preflight")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fact, _, err := store.SubscribeAwaitedFact(ctx, db.AwaitedFactSubscription{
+		WaiterRole: "lane", SubjectKind: db.AwaitedFactSubjectReviewVerdict,
+		SubjectKey: key, Deadline: time.Now().UTC().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := mustJobPayload(t, workflow.JobPayload{
+		Repo: "acme/widget", PullRequest: 2165, HeadSHA: "head-preflight",
+		WorkflowID: "preflight-review",
+	})
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: "review-preflight", Agent: "reviewer", Type: "review",
+		State: string(workflow.JobQueued), Payload: payload,
+	}, db.JobEvent{Kind: string(workflow.JobQueued), Message: "queued"}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.GetJob(ctx, "review-preflight")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := jobWorker{Store: store, Stdout: io.Discard}
+	if err := worker.finishQueuedJob(ctx, job, workflow.JobFailed, errors.New("adapter preflight failed")); err != nil {
+		t.Fatal(err)
+	}
+	gotFact, err := store.GetAwaitedFact(ctx, fact.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotFact.State != db.AwaitedFactStateWaiting {
+		t.Fatalf("awaited fact state = %q, want waiting", gotFact.State)
+	}
+	outbox, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outbox) != 1 || outbox[0].TargetRole != "lane" ||
+		!strings.Contains(outbox[0].SourceID, `"state":"review_failed"`) {
+		t.Fatalf("preflight failure wake = %+v", outbox)
+	}
+}
 
 type deadlineBlockingAdapter struct{}
 

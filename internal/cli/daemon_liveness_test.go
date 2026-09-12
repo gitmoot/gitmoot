@@ -120,6 +120,58 @@ func TestDaemonLivenessSweepDeadPIDFrozenLogFails(t *testing.T) {
 	}
 }
 
+func TestDaemonLivenessFailureWakesExactHeadReviewWaiter(t *testing.T) {
+	ctx, paths, store, now, quiet := livenessTestJob(t, "dead-review", 4242)
+	job, err := store.GetJob(ctx, "dead-review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload.PullRequest = 42
+	payload.HeadSHA = "head-dead"
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateJobPayload(ctx, job.ID, string(encoded)); err != nil {
+		t.Fatal(err)
+	}
+	key, err := db.ReviewVerdictSubjectKey("owner/repo", 42, "head-dead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fact, _, err := store.SubscribeAwaitedFact(ctx, db.AwaitedFactSubscription{
+		WaiterRole: "joltra", SubjectKind: db.AwaitedFactSubjectReviewVerdict,
+		SubjectKey: key, Deadline: now.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sweep := newDaemonLivenessSweep()
+	sweep.probe = func(int, string) runtimePIDState { return runtimePIDDead }
+	runLivenessSamples(t, sweep, ctx, store, paths, now, quiet)
+
+	got, err := store.GetAwaitedFact(ctx, fact.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != db.AwaitedFactStateWaiting {
+		t.Fatalf("fact state = %q, want waiting until a verdict lands", got.State)
+	}
+	outbox, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outbox) != 1 || outbox[0].TargetRole != "joltra" ||
+		!strings.Contains(outbox[0].SourceID, `"state":"review_failed"`) {
+		t.Fatalf("liveness failure wake = %+v", outbox)
+	}
+}
+
 func TestDaemonLivenessSweepPromptlyCancelsOnlyDeadTrackedJob(t *testing.T) {
 	ctx, paths, store, _, quiet := livenessTestJob(t, "dead-recent", 4242)
 	now := time.Now().UTC().Add(2 * daemonDeadRuntimeReapAfter)

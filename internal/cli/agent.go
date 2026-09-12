@@ -375,6 +375,7 @@ type agentRunOptions struct {
 	repo                    string
 	jsonOutput              bool
 	background              bool
+	foreground              bool
 	typeName                string
 	action                  string
 	model                   string
@@ -497,6 +498,9 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 	if options.prNumber <= 0 {
 		fmt.Fprintln(stderr, "agent review requires --pr number")
 		return 2
+	}
+	if strings.TrimSpace(options.orgRole) != "" && !options.foreground {
+		options.background = true
 	}
 	output, exit := dispatchAgentCommand(options, "review", "explicit agent review", "agent_review", stdout, stderr)
 	if exit != 0 {
@@ -677,6 +681,8 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			return agentRunOptions{}, false
 		case arg == "--background":
 			options.background = true
+		case arg == "--foreground":
+			options.foreground = true
 		case arg == "--json":
 			options.jsonOutput = true
 		case arg == "--skip-native-review-fanout":
@@ -761,6 +767,14 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 	}
 	if options.agent == "" || options.message == "" {
 		fmt.Fprintf(stderr, "%s requires exactly one agent and one message\n", label)
+		return agentRunOptions{}, false
+	}
+	if options.background && options.foreground {
+		fmt.Fprintf(stderr, "%s: --background and --foreground are mutually exclusive\n", label)
+		return agentRunOptions{}, false
+	}
+	if options.foreground && command != "review" {
+		fmt.Fprintf(stderr, "%s: --foreground is only supported for agent review\n", label)
 		return agentRunOptions{}, false
 	}
 	normalizedRecipe, err := validateRecipeID(options.recipe)
@@ -901,7 +915,8 @@ func printAgentRunUsage(w io.Writer, command string) {
 	case "orchestrate":
 		fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--draft|--ready] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--recipe id] [--skip-native-review-fanout] [--home path] [--json]")
 	case "review":
-		fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--lead implementer] [--head-sha sha] [--branch branch] [--background] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--home path] [--json]")
+		fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--lead implementer] [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--home path] [--json]")
+		fmt.Fprintln(w, "  Reviews attributed with --org-role queue for daemon ownership by default; --foreground keeps synchronous execution.")
 	case "implement":
 		fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--base ref] [--head-sha sha] [--branch branch] [--draft|--ready] [--background] [--type type] [--action implement] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--skip-native-review-fanout] [--home path] [--json]")
 	default:

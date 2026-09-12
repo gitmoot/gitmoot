@@ -19,6 +19,81 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
+func TestOrgRoleReviewCLIQueuesForDaemonOwnership(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString(`
+[org]
+enforce = "warn"
+[org.roles."owner"]
+scope = ["*"]
+[org.roles."joltra"]
+parent = "owner"
+scope = ["owner/repo"]
+`); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	checkout, _, head := readonlyReviewWorktreeGitCheckout(t)
+	seedReviewDispatchFixture(t, store, checkout)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
+	})
+	adapter := installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"looks good","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+	previousGitHubFactory := newAgentDispatchGitHubClient
+	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
+	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
+
+	args := []string{
+		"reviewer", "Review this exact head.", "--repo", "owner/repo", "--pr", "12",
+		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+		"--org-role", "joltra", "--home", home,
+	}
+	var stdout, stderr bytes.Buffer
+	code := runAgentReview(args, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("review exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	jobs, err := store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].State != string(workflow.JobQueued) {
+		t.Fatalf("jobs = %+v, want one daemon-owned queued review", jobs)
+	}
+	for _, want := range []string{"state: queued", "next: gitmoot job watch"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+		}
+	}
+	if adapter.calls != 0 {
+		t.Fatalf("background review invoked runtime %d times, want zero", adapter.calls)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = runAgentReview(append(args, "--foreground"), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("foreground review exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if adapter.calls != 1 {
+		t.Fatalf("explicit foreground review invoked runtime %d times, want one", adapter.calls)
+	}
+}
+
 // buildLocalAgentJobOutput must render a terminally-succeeded implement job into
 // the same populated output the success path returns, so the advance-error
 // recovery branch can surface the persisted result instead of discarding it.
