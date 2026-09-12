@@ -313,7 +313,9 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 		return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, "organization registry unavailable", errors.New("organization registry unavailable"))
 	}
 	isAddressedNoteWake := event.Type == events.EventOrgReply || event.Type == events.EventOrgDirective || event.Type == events.EventOrgFact
-	deduplicateAddressedWake := isAddressedNoteWake || containsEventRuleKind(kinds, eventRuleKindReviewVerdict)
+	// Addressed note events are coalesced across their matching routes. Verdict
+	// events only coalesce review-verdict routes; a job-terminal route remains a
+	// separate operator-requested notification with its own prompt.
 	replyHandled := false
 	addressedWakeHandled := map[string]bool{}
 	for _, rule := range rules {
@@ -329,9 +331,11 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 			continue
 		}
 		observer := rule.Scope == db.EventRuleScopeObserver
-		// Addressed note and review-verdict rules notify a role once even when an
-		// operator already configured a route that overlaps a provisioned default.
-		// Observer rules remain independent copies.
+		deduplicateAddressedWake := isAddressedNoteWake ||
+			strings.EqualFold(strings.TrimSpace(rule.OnKind), eventRuleKindReviewVerdict)
+		// Addressed note rules and duplicate review-verdict rules notify a role
+		// once. Other kinds matching the same verdict event and observer rules
+		// remain independent copies.
 		wakeRole := strings.ToLower(strings.TrimSpace(rule.WakeRole))
 		if deduplicateAddressedWake && !observer && addressedWakeHandled[wakeRole] {
 			continue

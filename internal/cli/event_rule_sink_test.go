@@ -963,6 +963,7 @@ pane="w1:p3"
 	}
 	defer store.Close()
 	for _, rule := range []db.EventRule{
+		{ID: "requester-terminal", OnKind: "job-terminal", WakeRole: "requester", Scope: db.EventRuleScopeAddressed, Enabled: true},
 		{ID: "author", OnKind: eventRuleKindReviewVerdict, WakeRole: "author", Scope: db.EventRuleScopeAddressed, Enabled: true},
 		{ID: "requester", OnKind: eventRuleKindReviewVerdict, WakeRole: "requester", Scope: db.EventRuleScopeAddressed, Enabled: true},
 		{ID: "requester-duplicate", OnKind: eventRuleKindReviewVerdict, WakeRole: "requester", Scope: db.EventRuleScopeAddressed, Enabled: true},
@@ -986,9 +987,27 @@ pane="w1:p3"
 		ReviewDecision:  "approved",
 	})
 
+	requesterPrompts := make([]string, 0, 2)
+	for i, pane := range wake.panes {
+		if pane == "w1:p4" {
+			requesterPrompts = append(requesterPrompts, wake.prompts[i])
+		}
+	}
 	sort.Strings(wake.panes)
-	if got, want := fmt.Sprint(wake.panes), "[w1:p1 w1:p3 w1:p4]"; got != want {
+	if got, want := fmt.Sprint(wake.panes), "[w1:p1 w1:p3 w1:p4 w1:p4]"; got != want {
 		t.Fatalf("woken panes = %s, want %s", got, want)
+	}
+	if len(requesterPrompts) != 2 {
+		t.Fatalf("requester prompts = %d, want generic and verdict-specific prompts", len(requesterPrompts))
+	}
+	hasVerdictPrompt := false
+	hasGenericPrompt := false
+	for _, prompt := range requesterPrompts {
+		hasVerdictPrompt = hasVerdictPrompt || strings.Contains(prompt, "review verdict approved")
+		hasGenericPrompt = hasGenericPrompt || strings.Contains(prompt, "job-terminal event")
+	}
+	if !hasVerdictPrompt || !hasGenericPrompt {
+		t.Fatalf("requester prompts = %q, want generic and verdict-specific prompts", requesterPrompts)
 	}
 }
 
