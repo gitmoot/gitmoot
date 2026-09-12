@@ -268,7 +268,10 @@ func mapHerdrAgentStatus(raw string) org.RoleLiveState {
 	case string(org.StateBlocked):
 		return org.RoleLiveState{State: org.StateBlocked}
 	case string(org.StateDone):
-		return org.RoleLiveState{State: org.StateDone}
+		// Herdr's "done" is an attention bit, not workflow completion: it means
+		// the pane is idle and its last completed turn has not been viewed. Gitmoot
+		// must not expose that as completion of the role's durable obligations.
+		return org.RoleLiveState{State: org.StateIdle, Detail: "Herdr pane is idle with an unseen completed turn"}
 	case "":
 		return org.RoleLiveState{State: org.StateUnknown, Detail: "Herdr pane has no agent_status"}
 	default:

@@ -152,6 +152,17 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 			// let role-level coalescing mark another directive delivered unseen.
 			key += "\x00" + entry.SourceID + "\x00" + entry.DirectivePhase
 		}
+		if entry.SourceKind == db.WakeOutboxSourceAwaitedFact {
+			var payload db.AwaitedFactWakePayload
+			if err := json.Unmarshal([]byte(entry.SourceID), &payload); err != nil {
+				return replyWakeOutboxHealth{}, fmt.Errorf("decode awaited fact wake outbox group for row %d: %w", entry.ID, err)
+			}
+			// Each awaited fact is its own obligation stream. Mixing distinct
+			// facts can truncate one action from the only prompt that carries it;
+			// keeping every lifecycle of one fact together also lets a later
+			// success suppress its earlier failed-attempt wake before delivery.
+			key += fmt.Sprintf("\x00fact:%d", payload.ID)
+		}
 		groups[key] = append(groups[key], entry)
 	}
 	if resolve == nil {
@@ -183,6 +194,9 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 			// only removes a later interrupt. The batch event still names every
 			// member's retrieval command, so collapsing loses no note.
 			end := min(start+replyWakeMaxCoalescedItems, len(items))
+			if items[start].SourceKind == db.WakeOutboxSourceAwaitedFact {
+				end = len(items)
+			}
 
 			batch := items[start:end]
 			event, err := wakeOutboxEvent(batch, now)
@@ -206,16 +220,23 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 				// later can deliver the same batch; nothing is silently erased.
 				break
 			}
-			ids := make([]int64, 0, len(batch))
-			for _, entry := range batch {
-				ids = append(ids, entry.ID)
+			survivor := 0
+			if batch[0].SourceKind == db.WakeOutboxSourceAwaitedFact {
+				survivor = len(batch) - 1
 			}
-			// The oldest row SURVIVES as the delivered obligation: it is the one
-			// wakeOutboxEvent identifies as `oldest id`, and ids[0] is that row.
-			// The WHOLE batch travels to the outcome (#1982): a delivered wake
-			// supersedes the rest into the survivor, while a retryable failure
-			// returns them all to pending so the next attempt re-coalesces every
-			// note instead of losing the ones a survivor carried.
+			ids := make([]int64, 0, len(batch))
+			ids = append(ids, batch[survivor].ID)
+			for index, entry := range batch {
+				if index != survivor {
+					ids = append(ids, entry.ID)
+				}
+			}
+			// Generic batches keep their oldest row as the delivered survivor.
+			// A single-fact batch instead survives on its newest lifecycle row,
+			// matching the current state wakeOutboxEvent rendered after reducing
+			// older attempts. The whole batch still travels to the outcome:
+			// delivery supersedes the rest, while retryable failure returns all
+			// rows to pending so the next attempt can reduce them again.
 			claimed, err := store.ClaimWakeOutbox(ctx, ids[0], ids[1:], now)
 			if err != nil {
 				return replyWakeOutboxHealth{}, err
@@ -569,14 +590,54 @@ func wakeOutboxEvent(batch []db.WakeOutboxObligation, now time.Time) (events.Eve
 			return events.Event{}, fmt.Errorf("decode escalation wake outbox event for row %d: %w", oldest.ID, err)
 		}
 	case db.WakeOutboxSourceAwaitedFact:
-		var payload db.AwaitedFactWakePayload
-		if err := json.Unmarshal([]byte(oldest.SourceID), &payload); err != nil {
-			return events.Event{}, fmt.Errorf("decode awaited fact wake outbox event for row %d: %w", oldest.ID, err)
+		payloads := make([]db.AwaitedFactWakePayload, 0, len(batch))
+		latestByFact := make(map[int64]int, len(batch))
+		for _, entry := range batch {
+			var payload db.AwaitedFactWakePayload
+			if err := json.Unmarshal([]byte(entry.SourceID), &payload); err != nil {
+				return events.Event{}, fmt.Errorf("decode awaited fact wake outbox event for row %d: %w", entry.ID, err)
+			}
+			payloads = append(payloads, payload)
+			latestByFact[payload.ID] = len(payloads) - 1
 		}
-		detail := fmt.Sprintf("awaited %s %s for %s is %s", payload.SubjectKind, payload.SubjectKey, payload.WaiterRole, payload.State)
-		if len(batch) > 1 {
-			detail = fmt.Sprintf("%d awaited facts ready; oldest: %s", len(batch), detail)
+		current := make([]db.AwaitedFactWakePayload, 0, len(payloads))
+		for index, payload := range payloads {
+			if latestByFact[payload.ID] == index {
+				current = append(current, payload)
+			}
 		}
+		actionable := -1
+		for index, payload := range current {
+			if strings.HasPrefix(payload.State, "review_") {
+				actionable = index
+				break
+			}
+		}
+		lead := 0
+		if actionable >= 0 {
+			lead = actionable
+		}
+		ordered := make([]db.AwaitedFactWakePayload, 0, len(current))
+		ordered = append(ordered, current[lead])
+		ordered = append(ordered, current[:lead]...)
+		ordered = append(ordered, current[lead+1:]...)
+		details := make([]string, 0, len(ordered))
+		for _, payload := range ordered {
+			detail := fmt.Sprintf("awaited %s %s for %s is %s", payload.SubjectKind, payload.SubjectKey, payload.WaiterRole, payload.State)
+			if extra := strings.TrimSpace(payload.Detail); extra != "" {
+				if strings.HasPrefix(payload.State, "review_") {
+					detail = extra + "; " + detail
+				} else {
+					detail += "; " + extra
+				}
+			}
+			details = append(details, detail)
+		}
+		detail := details[0]
+		if len(details) > 1 {
+			detail = fmt.Sprintf("%d awaited facts ready: %s", len(details), strings.Join(details, "; "))
+		}
+		payload := current[lead]
 		factID := fmt.Sprintf("awaited-fact:%d", payload.ID)
 		event = events.NewEvent(
 			events.EventOrgFact,

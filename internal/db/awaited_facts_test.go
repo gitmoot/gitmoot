@@ -138,6 +138,146 @@ func TestSubscribeAwaitedFactRecheckRejectsOldHead(t *testing.T) {
 	}
 }
 
+func TestFailedReviewWakesWaiterWithoutResolvingExactHeadFact(t *testing.T) {
+	store := openAwaitedFactTestStore(t)
+	ctx := context.Background()
+	fact := subscribeReviewFact(t, store, "lane", "acme/widget", 45, "head-failed")
+	payload := `{"repo":"acme/widget","pull_request":45,"head_sha":"head-failed"}`
+	if err := store.CreateJobWithEvent(ctx, Job{
+		ID: "review-crashed", Agent: "reviewer", Type: "review", State: "running",
+		Repo: "acme/widget", PullRequest: 45, Payload: payload,
+	}, JobEvent{Kind: "running", Message: "started"}); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := store.TransitionJobStatePayloadWithEvent(
+		ctx, "review-crashed", "running", "failed", payload,
+		JobEvent{Kind: "failed", Message: "runtime process died"},
+	)
+	if err != nil || !changed {
+		t.Fatalf("failed transition changed=%t err=%v", changed, err)
+	}
+	if state := awaitedFactState(t, store, fact.ID); state != AwaitedFactStateWaiting {
+		t.Fatalf("awaited fact state = %q, want waiting", state)
+	}
+	outbox, err := store.ListWakeOutbox(ctx, WakeOutboxStatePending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outbox) != 1 || outbox[0].TargetRole != "lane" || outbox[0].CoalesceKey != "fact:lane" {
+		t.Fatalf("failed review wake = %+v", outbox)
+	}
+	var wake AwaitedFactWakePayload
+	if err := json.Unmarshal([]byte(outbox[0].SourceID), &wake); err != nil {
+		t.Fatal(err)
+	}
+	if wake.ID != fact.ID || wake.State != "review_failed" || wake.JobID != "review-crashed" ||
+		!strings.Contains(wake.Detail, "without an exact-head verdict") {
+		t.Fatalf("failed review wake payload = %+v", wake)
+	}
+}
+
+func TestFailedReviewRetryCreatesDistinctWakePerLifecycle(t *testing.T) {
+	store := openAwaitedFactTestStore(t)
+	ctx := context.Background()
+	fact := subscribeReviewFact(t, store, "lane", "acme/widget", 45, "head-retry")
+	payload := `{"repo":"acme/widget","pull_request":45,"head_sha":"head-retry"}`
+	if err := store.CreateJobWithEvent(ctx, Job{
+		ID: "review-retry", Agent: "reviewer", Type: "review", State: "running",
+		Repo: "acme/widget", PullRequest: 45, Payload: payload,
+	}, JobEvent{Kind: "running", Message: "started"}); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := store.TransitionJobStatePayloadWithEvent(
+		ctx, "review-retry", "running", "failed", payload,
+		JobEvent{Kind: "failed", Message: "first runtime failure"},
+	)
+	if err != nil || !changed {
+		t.Fatalf("first failure changed=%t err=%v", changed, err)
+	}
+	changed, err = store.TransitionJobStateWithEvent(
+		ctx, "review-retry", "failed", "queued",
+		JobEvent{Kind: "retry", Message: "retrying"},
+	)
+	if err != nil || !changed {
+		t.Fatalf("retry changed=%t err=%v", changed, err)
+	}
+	retried, err := store.GetJob(ctx, "review-retry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err = store.TransitionJobStateWithEventAtGeneration(
+		ctx, "review-retry", "queued", retried.LifecycleGeneration, "failed",
+		JobEvent{Kind: "failed", Message: "preflight failed again"},
+	)
+	if err != nil || !changed {
+		t.Fatalf("second failure changed=%t err=%v", changed, err)
+	}
+	if state := awaitedFactState(t, store, fact.ID); state != AwaitedFactStateWaiting {
+		t.Fatalf("awaited fact state = %q, want waiting", state)
+	}
+	outbox, err := store.ListWakeOutbox(ctx, WakeOutboxStatePending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outbox) != 2 {
+		t.Fatalf("failed review wakes = %+v, want one per lifecycle", outbox)
+	}
+	generations := make(map[int64]bool, len(outbox))
+	for _, row := range outbox {
+		var wake AwaitedFactWakePayload
+		if err := json.Unmarshal([]byte(row.SourceID), &wake); err != nil {
+			t.Fatal(err)
+		}
+		generations[wake.LifecycleGeneration] = true
+	}
+	if !generations[0] || !generations[1] {
+		t.Fatalf("wake lifecycle generations = %+v, want 0 and 1", generations)
+	}
+}
+
+func TestFailedReviewWakeIsRetiredWhenFactExpiresToParent(t *testing.T) {
+	store := openAwaitedFactTestStore(t)
+	ctx := context.Background()
+	fact := subscribeReviewFact(t, store, "lane", "acme/widget", 45, "head-expired")
+	payload := `{"repo":"acme/widget","pull_request":45,"head_sha":"head-expired"}`
+	if err := store.CreateJobWithEvent(ctx, Job{
+		ID: "review-expired", Agent: "reviewer", Type: "review", State: "running",
+		Repo: "acme/widget", PullRequest: 45, Payload: payload,
+	}, JobEvent{Kind: "running", Message: "started"}); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := store.TransitionJobStatePayloadWithEvent(
+		ctx, "review-expired", "running", "failed", payload,
+		JobEvent{Kind: "failed", Message: "runtime failed"},
+	)
+	if err != nil || !changed {
+		t.Fatalf("failed transition changed=%t err=%v", changed, err)
+	}
+	expired, err := store.ExpireAwaitedFact(ctx, fact.ID, "owner", time.Now().UTC())
+	if err != nil || !expired {
+		t.Fatalf("expiry changed=%t err=%v", expired, err)
+	}
+	pending, err := store.ListWakeOutbox(ctx, WakeOutboxStatePending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].TargetRole != "owner" ||
+		!strings.Contains(pending[0].SourceID, `"state":"expired"`) {
+		t.Fatalf("pending wakes = %+v, want only parent expiry", pending)
+	}
+	superseded, err := store.ListWakeOutbox(ctx, WakeOutboxStateSuperseded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(superseded) != 1 || superseded[0].TargetRole != "lane" ||
+		!strings.Contains(superseded[0].SourceID, `"state":"review_failed"`) {
+		t.Fatalf("superseded wakes = %+v, want retired waiter failure", superseded)
+	}
+	if state := awaitedFactState(t, store, fact.ID); state != AwaitedFactStateExpired {
+		t.Fatalf("awaited fact state = %q, want expired", state)
+	}
+}
+
 func TestAwaitedFactProducerCommitSatisfiesExactHead(t *testing.T) {
 	store := openAwaitedFactTestStore(t)
 	ctx := context.Background()

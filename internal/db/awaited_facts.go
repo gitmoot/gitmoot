@@ -48,11 +48,14 @@ type AwaitedFactSubscription struct {
 // always produced by the same constructor used by subscriptions and review
 // producers; delivery never restates it from separate fields.
 type AwaitedFactWakePayload struct {
-	ID          int64  `json:"id"`
-	WaiterRole  string `json:"waiter_role"`
-	SubjectKind string `json:"subject_kind"`
-	SubjectKey  string `json:"subject_key"`
-	State       string `json:"state"`
+	ID                  int64  `json:"id"`
+	WaiterRole          string `json:"waiter_role"`
+	SubjectKind         string `json:"subject_kind"`
+	SubjectKey          string `json:"subject_key"`
+	State               string `json:"state"`
+	JobID               string `json:"job_id,omitempty"`
+	LifecycleGeneration int64  `json:"lifecycle_generation,omitempty"`
+	Detail              string `json:"detail,omitempty"`
 }
 
 // ReviewVerdictSubjectKey is the single source of truth for a review wait's
@@ -411,17 +414,58 @@ func reviewVerdictFact(jobID, agent, state, payload string, blockingSeverity fun
 	return reviewVerdictObservation{repo: decoded.Repo, pullRequest: decoded.PullRequest, headSHA: decoded.HeadSHA, detail: detail}, true
 }
 
-func resolveAwaitedReviewFactTx(ctx context.Context, tx *sql.Tx, jobID, agent, jobType, state, payload string, blockingSeverity func(repo string) string, now time.Time) error {
+func resolveStoredAwaitedReviewFactTx(ctx context.Context, tx *sql.Tx, jobID, state string, blockingSeverity func(repo string) string, now time.Time) error {
+	switch state {
+	case "succeeded", "failed", "blocked", "cancelled":
+	default:
+		return nil
+	}
+	var agent, jobType, payload string
+	var lifecycleGeneration int64
+	if err := tx.QueryRowContext(ctx, `
+SELECT agent, type, payload, lifecycle_generation
+FROM jobs
+WHERE id = ?`, jobID).Scan(&agent, &jobType, &payload, &lifecycleGeneration); err != nil {
+		return err
+	}
+	return resolveAwaitedReviewFactTx(
+		ctx, tx, jobID, agent, jobType, state, payload, lifecycleGeneration,
+		blockingSeverity, now,
+	)
+}
+
+func resolveAwaitedReviewFactTx(ctx context.Context, tx *sql.Tx, jobID, agent, jobType, state, payload string, lifecycleGeneration int64, blockingSeverity func(repo string) string, now time.Time) error {
 	if strings.TrimSpace(jobType) != "review" {
 		return nil
 	}
-	fact, ok := reviewVerdictFact(jobID, agent, state, payload, blockingSeverity)
-	if !ok {
+	var fact reviewVerdictObservation
+	noticeState := ""
+	var key string
+	switch state {
+	case "succeeded":
+		var ok bool
+		fact, ok = reviewVerdictFact(jobID, agent, state, payload, blockingSeverity)
+		if !ok {
+			return nil
+		}
+		var err error
+		key, err = ReviewVerdictSubjectKey(fact.repo, fact.pullRequest, fact.headSHA)
+		if err != nil {
+			return nil
+		}
+	case "failed", "blocked", "cancelled":
+		var decoded reviewVerdictPayload
+		if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+			return nil
+		}
+		var err error
+		key, err = ReviewVerdictSubjectKey(decoded.Repo, decoded.PullRequest, decoded.HeadSHA)
+		if err != nil {
+			return nil
+		}
+		noticeState = "review_" + state
+	default:
 		return nil
-	}
-	key, err := ReviewVerdictSubjectKey(fact.repo, fact.pullRequest, fact.headSHA)
-	if err != nil {
-		return err
 	}
 	rows, err := tx.QueryContext(ctx, `
 SELECT id, waiter_role
@@ -447,8 +491,28 @@ ORDER BY id`, AwaitedFactSubjectReviewVerdict, key)
 	if err := rows.Close(); err != nil {
 		return err
 	}
+	if len(targets) == 0 {
+		return nil
+	}
+
+	if state == "succeeded" {
+		for _, target := range targets {
+			if _, err := satisfyAwaitedFactTx(ctx, tx, target.id, target.role, AwaitedFactSubjectReviewVerdict, key, fact.detail, now); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	detail := fmt.Sprintf(
+		"review job %s %s without an exact-head verdict; the awaited fact remains unresolved",
+		strings.TrimSpace(jobID), state,
+	)
 	for _, target := range targets {
-		if _, err := satisfyAwaitedFactTx(ctx, tx, target.id, target.role, AwaitedFactSubjectReviewVerdict, key, fact.detail, now); err != nil {
+		if err := insertAwaitedFactNoticeWakeTx(
+			ctx, tx, target.id, target.role, target.role, AwaitedFactSubjectReviewVerdict, key,
+			noticeState, jobID, lifecycleGeneration, detail,
+		); err != nil {
 			return err
 		}
 	}
@@ -468,11 +532,63 @@ WHERE id = ? AND state = 'waiting'`, detail, stamp, stamp, id)
 	if err != nil || affected == 0 {
 		return false, err
 	}
+	if err := supersedePendingAwaitedFactWakesTx(ctx, tx, id, AwaitedFactStateSatisfied, now); err != nil {
+		return false, err
+	}
 	return true, insertAwaitedFactWakeTx(ctx, tx, id, waiterRole, waiterRole, subjectKind, subjectKey, AwaitedFactStateSatisfied)
 }
 
+func supersedePendingAwaitedFactWakesTx(ctx context.Context, tx *sql.Tx, factID int64, terminalState string, now time.Time) error {
+	rows, err := tx.QueryContext(ctx, `
+SELECT id, source_id
+FROM wake_outbox
+WHERE source_kind = ? AND state = ?`,
+		WakeOutboxSourceAwaitedFact, WakeOutboxStatePending,
+	)
+	if err != nil {
+		return err
+	}
+	var stale []int64
+	for rows.Next() {
+		var id int64
+		var sourceID string
+		if err := rows.Scan(&id, &sourceID); err != nil {
+			rows.Close()
+			return err
+		}
+		var payload AwaitedFactWakePayload
+		if json.Unmarshal([]byte(sourceID), &payload) == nil && payload.ID == factID {
+			stale = append(stale, id)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	stamp := now.UTC().Format(time.RFC3339Nano)
+	reason := fmt.Sprintf("awaited fact %d reached %s before wake delivery", factID, terminalState)
+	for _, id := range stale {
+		if _, err := tx.ExecContext(ctx, `
+UPDATE wake_outbox
+SET state = ?, last_error = ?, finished_at = ?, updated_at = ?
+WHERE id = ? AND state = ?`,
+			WakeOutboxStateSuperseded, reason, stamp, stamp, id, WakeOutboxStatePending,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func insertAwaitedFactWakeTx(ctx context.Context, tx *sql.Tx, id int64, waiterRole, targetRole, subjectKind, subjectKey, state string) error {
-	payload, err := json.Marshal(AwaitedFactWakePayload{ID: id, WaiterRole: waiterRole, SubjectKind: subjectKind, SubjectKey: subjectKey, State: state})
+	return insertAwaitedFactNoticeWakeTx(ctx, tx, id, waiterRole, targetRole, subjectKind, subjectKey, state, "", 0, "")
+}
+
+func insertAwaitedFactNoticeWakeTx(ctx context.Context, tx *sql.Tx, id int64, waiterRole, targetRole, subjectKind, subjectKey, state, jobID string, lifecycleGeneration int64, detail string) error {
+	payload, err := json.Marshal(AwaitedFactWakePayload{
+		ID: id, WaiterRole: waiterRole, SubjectKind: subjectKind, SubjectKey: subjectKey,
+		State: state, JobID: strings.TrimSpace(jobID), LifecycleGeneration: lifecycleGeneration,
+		Detail: strings.TrimSpace(detail),
+	})
 	if err != nil {
 		return err
 	}
@@ -568,6 +684,9 @@ WHERE id = ? AND state = 'waiting'`, stamp, stamp, id)
 	}
 	affected, err := result.RowsAffected()
 	if err != nil || affected == 0 {
+		return false, err
+	}
+	if err := supersedePendingAwaitedFactWakesTx(ctx, tx, id, AwaitedFactStateExpired, now); err != nil {
 		return false, err
 	}
 	if err := insertAwaitedFactWakeTx(ctx, tx, id, fact.WaiterRole, escalationRole, fact.SubjectKind, fact.SubjectKey, AwaitedFactStateExpired); err != nil {

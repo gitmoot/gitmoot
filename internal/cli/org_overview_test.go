@@ -78,6 +78,55 @@ func TestStoreOrgLiveSourcePersistedFreshness(t *testing.T) {
 	}
 }
 
+func TestOrgStatusShowsIdleRoleWithUnresolvedWaitAsBlocked(t *testing.T) {
+	_, paths := setupOrgHome(t)
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	key, err := db.ReviewVerdictSubjectKey("owner/repo", 42, "head-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().UTC().Add(2 * time.Hour)
+	if _, _, err := store.SubscribeAwaitedFact(ctx, db.AwaitedFactSubscription{
+		WaiterRole:  "review",
+		SubjectKind: db.AwaitedFactSubjectReviewVerdict,
+		SubjectKey:  key,
+		Deadline:    deadline,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	shared, err := loadOrgSharedState(ctx, paths, store, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := buildOrgStatusRows(ctx, &shared, func(context.Context, config.OrgConfig) (map[string]org.RoleLiveState, time.Time, string, error) {
+		return map[string]org.RoleLiveState{"review": {State: org.StateIdle}}, time.Now().UTC(), "test", nil
+	}, "chart", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.Role != "review" {
+			continue
+		}
+		if row.ProviderState != org.StateBlocked {
+			t.Fatalf("review state = %q, want blocked", row.ProviderState)
+		}
+		for _, want := range []string{"owner=review", "awaiting review_verdict", "next_trigger=satisfaction or deadline"} {
+			if !strings.Contains(row.ProviderDetail, want) {
+				t.Fatalf("review detail = %q, want %q", row.ProviderDetail, want)
+			}
+		}
+		return
+	}
+	t.Fatal("review role missing from status rows")
+}
+
 func TestLoadOrgSharedStateMissedWakeAgeOut(t *testing.T) {
 	_, paths := setupOrgHome(t)
 	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
@@ -207,8 +256,13 @@ recycle_after = "1ns"
 	if !foundRecyclable {
 		t.Fatal("recyclable role missing from rows")
 	}
-	if len(shared.Warnings) != 1 || !strings.Contains(shared.Warnings[0], "active-jobs counts unavailable") {
-		t.Fatalf("warnings = %+v, want one active-jobs warning", shared.Warnings)
+	if len(shared.Warnings) != 2 ||
+		!strings.Contains(shared.Warnings[0], "awaited-fact blockers unavailable") ||
+		!strings.Contains(shared.Warnings[1], "active-jobs counts unavailable") {
+		t.Fatalf("warnings = %+v, want awaited-fact and active-jobs warnings", shared.Warnings)
+	}
+	if shared.awaitedFactsErr == nil {
+		t.Fatal("awaited-fact failure was not cached")
 	}
 	cachedErr := shared.jobCountsErr
 	if cachedErr == nil {

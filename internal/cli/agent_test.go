@@ -4534,3 +4534,13 @@ func TestCompensatePolicyWriteFailureRollsConfigBack(t *testing.T) {
 		}
 	})
 }
+
+func TestReviewExecutionModeRejectsConflictingFlags(t *testing.T) {
+	var stderr bytes.Buffer
+	_, ok := parseAgentRunOptions("review", []string{
+		"reviewer", "review it", "--background", "--foreground", "--repo", "owner/repo", "--pr", "7",
+	}, &stderr)
+	if ok || !strings.Contains(stderr.String(), "mutually exclusive") {
+		t.Fatalf("ok=%t stderr=%q, want conflicting mode refusal", ok, stderr.String())
+	}
+}

@@ -36,6 +36,9 @@ type orgSharedState struct {
 	blockedLoaded   bool
 	livePresence    map[string]db.RoleLivePresence
 	liveLoaded      bool
+	awaitedFacts    map[string][]db.AwaitedFact
+	awaitedFactsErr error
+	awaitedLoaded   bool
 	unavailable     map[string]db.OrgRoleUnavailable
 }
 
@@ -193,6 +196,42 @@ func (shared *orgSharedState) loadBlockedEpisodes(ctx context.Context) ([]db.Blo
 	return episodes, nil
 }
 
+func (shared *orgSharedState) loadWaitingAwaitedFacts(ctx context.Context) (map[string][]db.AwaitedFact, error) {
+	if shared.awaitedLoaded {
+		return shared.awaitedFacts, shared.awaitedFactsErr
+	}
+	shared.awaitedLoaded = true
+	facts, err := shared.Store.ListAwaitedFacts(ctx, "", db.AwaitedFactStateWaiting)
+	if err != nil {
+		shared.awaitedFactsErr = err
+		shared.Warnings = append(shared.Warnings, fmt.Sprintf("awaited-fact blockers unavailable: %v", err))
+		return nil, err
+	}
+	shared.awaitedFacts = make(map[string][]db.AwaitedFact)
+	for _, fact := range facts {
+		role := strings.ToLower(strings.TrimSpace(fact.WaiterRole))
+		if role != "" {
+			shared.awaitedFacts[role] = append(shared.awaitedFacts[role], fact)
+		}
+	}
+	return shared.awaitedFacts, nil
+}
+
+func awaitedFactBlockerDetail(role string, facts []db.AwaitedFact) string {
+	if len(facts) == 0 {
+		return ""
+	}
+	fact := facts[0]
+	detail := fmt.Sprintf(
+		"owner=%s; awaiting %s %s; next_trigger=satisfaction or deadline %s",
+		role, fact.SubjectKind, fact.SubjectKey, fact.Deadline,
+	)
+	if len(facts) > 1 {
+		return fmt.Sprintf("%d unresolved waits; oldest: %s", len(facts), detail)
+	}
+	return detail
+}
+
 // loadJobCounts caches the indexed queued/running counts for one overview
 // projection. Presence and recycle enrichment share the same snapshot.
 func (shared *orgSharedState) loadJobCounts(ctx context.Context) (map[string]map[string]int, error) {
@@ -216,6 +255,7 @@ func buildOrgStatusRows(ctx context.Context, shared *orgSharedState, src orgLive
 		return nil, &orgLiveSourceError{err: err}
 	}
 	roles := loadOrgRoster(ctx, shared.Store, shared.Config).Members()
+	waitingByRole, _ := shared.loadWaitingAwaitedFacts(ctx)
 	rows := make([]orgStatusOutput, 0, len(roles))
 	observedNow := time.Now().UTC()
 	for _, role := range roles {
@@ -238,6 +278,18 @@ func buildOrgStatusRows(ctx context.Context, shared *orgSharedState, src orgLive
 				State:    org.StateUnavailable,
 				Detail:   fmt.Sprintf("⚠ UNAVAILABLE reason=%s until=%s", incident.Reason, unavailableUntil),
 				Activity: live.Activity,
+			}
+		}
+		if _, unavailable := shared.unavailable[role.Name]; !unavailable {
+			if facts := waitingByRole[role.Name]; len(facts) > 0 {
+				switch live.State {
+				case org.StateIdle, org.StateDone, org.StateUnknown:
+					live = org.RoleLiveState{
+						State:    org.StateBlocked,
+						Detail:   awaitedFactBlockerDetail(role.Name, facts),
+						Activity: live.Activity,
+					}
+				}
 			}
 		}
 		seen := shared.Presence[role.Name]

@@ -128,7 +128,7 @@ func createJobWithEventTx(ctx context.Context, tx *sql.Tx, s *Store, job Job, ev
 			return err
 		}
 	}
-	return resolveAwaitedReviewFactTx(ctx, tx, job.ID, job.Agent, job.Type, job.State, job.Payload, s.blockingSeverityFor, time.Now().UTC())
+	return resolveAwaitedReviewFactTx(ctx, tx, job.ID, job.Agent, job.Type, job.State, job.Payload, 0, s.blockingSeverityFor, time.Now().UTC())
 }
 
 // ErrAdvanceOwnershipLost is returned when an irreversible write is refused because
@@ -850,6 +850,9 @@ func (s *Store) TransitionJobStateWithEvent(ctx context.Context, id string, from
 	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
 		return false, err
 	}
+	if err := resolveStoredAwaitedReviewFactTx(ctx, tx, id, to, s.blockingSeverityFor, time.Now().UTC()); err != nil {
+		return false, err
+	}
 	return true, tx.Commit()
 }
 
@@ -903,6 +906,9 @@ func (s *Store) TransitionJobStateWithEventAtGeneration(ctx context.Context, id 
 			return false, err
 		}
 	}
+	if err := resolveStoredAwaitedReviewFactTx(ctx, tx, id, to, s.blockingSeverityFor, time.Now().UTC()); err != nil {
+		return false, err
+	}
 	return true, tx.Commit()
 }
 
@@ -949,11 +955,7 @@ func (s *Store) TransitionJobStatePayloadWithEventAtGeneration(ctx context.Conte
 			return false, err
 		}
 	}
-	var agent, jobType string
-	if err := tx.QueryRowContext(ctx, `SELECT agent, type FROM jobs WHERE id = ?`, id).Scan(&agent, &jobType); err != nil {
-		return false, err
-	}
-	if err := resolveAwaitedReviewFactTx(ctx, tx, id, agent, jobType, to, payload, s.blockingSeverityFor, time.Now().UTC()); err != nil {
+	if err := resolveStoredAwaitedReviewFactTx(ctx, tx, id, to, s.blockingSeverityFor, time.Now().UTC()); err != nil {
 		return false, err
 	}
 	return true, tx.Commit()
@@ -1118,11 +1120,7 @@ func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id strin
 			return false, err
 		}
 	}
-	var agent, jobType string
-	if err := tx.QueryRowContext(ctx, `SELECT agent, type FROM jobs WHERE id = ?`, id).Scan(&agent, &jobType); err != nil {
-		return false, err
-	}
-	if err := resolveAwaitedReviewFactTx(ctx, tx, id, agent, jobType, to, payload, s.blockingSeverityFor, time.Now().UTC()); err != nil {
+	if err := resolveStoredAwaitedReviewFactTx(ctx, tx, id, to, s.blockingSeverityFor, time.Now().UTC()); err != nil {
 		return false, err
 	}
 	return true, tx.Commit()
@@ -1177,11 +1175,7 @@ func (s *Store) TransitionJobStatePayloadUsageWithEvent(ctx context.Context, id 
 			return false, err
 		}
 	}
-	var agent, jobType string
-	if err := tx.QueryRowContext(ctx, `SELECT agent, type FROM jobs WHERE id = ?`, id).Scan(&agent, &jobType); err != nil {
-		return false, err
-	}
-	if err := resolveAwaitedReviewFactTx(ctx, tx, id, agent, jobType, to, payload, s.blockingSeverityFor, time.Now().UTC()); err != nil {
+	if err := resolveStoredAwaitedReviewFactTx(ctx, tx, id, to, s.blockingSeverityFor, time.Now().UTC()); err != nil {
 		return false, err
 	}
 	return true, tx.Commit()
@@ -1396,11 +1390,7 @@ func (s *Store) UpdateJobPayloadAndStateWithEvent(ctx context.Context, id string
 	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
 		return err
 	}
-	var agent, jobType string
-	if err := tx.QueryRowContext(ctx, `SELECT agent, type FROM jobs WHERE id = ?`, id).Scan(&agent, &jobType); err != nil {
-		return err
-	}
-	if err := resolveAwaitedReviewFactTx(ctx, tx, id, agent, jobType, state, payload, s.blockingSeverityFor, time.Now().UTC()); err != nil {
+	if err := resolveStoredAwaitedReviewFactTx(ctx, tx, id, state, s.blockingSeverityFor, time.Now().UTC()); err != nil {
 		return err
 	}
 	return tx.Commit()

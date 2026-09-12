@@ -49,7 +49,7 @@ func TestHerdrOrgProviderSnapshotMapping(t *testing.T) {
 		t.Fatalf("snapshot metadata = %+v", snapshot)
 	}
 	wants := map[string]org.LifecycleState{
-		"owner": org.StateWorking, "review": org.StateBlocked, "done": org.StateDone,
+		"owner": org.StateWorking, "review": org.StateBlocked, "done": org.StateIdle,
 		"idle": org.StateIdle, "future": org.StateUnknown, "duplicate": org.StateUnknown,
 		"missing": org.StateUnknown, "whitespace-label": org.StateUnknown, "whitespace-status": org.StateUnknown,
 		"pending-working": org.StateInputPending, "pending-idle": org.StateInputPending, "pending-unknown": org.StateInputPending,
@@ -139,7 +139,7 @@ func TestHerdrOrgProviderPresenceWakePaneBindingParity(t *testing.T) {
 		{name: "empty binding", binding: "", wantState: org.StateUnknown, wantDetail: "Herdr pane binding is unset"},
 		{name: "binding matching one label", binding: "unique-label", wantPane: "w1:p1", wantState: org.StateWorking, wantOK: true},
 		{name: "binding matching multiple labels", binding: "duplicate-label", wantState: org.StateUnknown, wantAmbiguous: true},
-		{name: "literal pane id", binding: "w1:p4", wantPane: "w1:p4", wantState: org.StateDone, wantOK: true},
+		{name: "literal pane id", binding: "w1:p4", wantPane: "w1:p4", wantState: org.StateIdle, wantOK: true},
 		{name: "literal pane id precedes duplicate labels", binding: "w1:p8", wantPane: "w1:p8", wantState: org.StateWorking, wantOK: true},
 		{name: "absent literal pane id", binding: "w9:p9", wantState: org.StateUnknown},
 		{name: "binding matching nothing", binding: "missing-label", wantState: org.StateUnknown},
@@ -208,7 +208,7 @@ func TestHerdrOrgProviderSnapshotPaneBindings(t *testing.T) {
 	}
 	wants := map[string]org.LifecycleState{
 		"idle-role": org.StateIdle, "working-role": org.StateWorking,
-		"blocked-role": org.StateBlocked, "done-role": org.StateDone,
+		"blocked-role": org.StateBlocked, "done-role": org.StateIdle,
 		"pending-role": org.StateInputPending,
 		"literal-role": org.StateWorking, "missing-role": org.StateUnknown,
 		"ambiguous-role": org.StateUnknown, "empty-id-role": org.StateUnknown,

@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +16,20 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
+
+func insertAwaitedFactWakeForTest(t *testing.T, store *db.Store, payload db.AwaitedFactWakePayload) {
+	t.Helper()
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertWakeOutbox(
+		context.Background(), db.WakeOutboxSourceAwaitedFact, string(encoded),
+		db.WakeOutboxKindFact, []string{payload.WaiterRole},
+	); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestAwaitedFactExpiryRemainsQueryableAndAddressesParent(t *testing.T) {
 	root := t.TempDir()
@@ -93,6 +109,167 @@ func TestAwaitedFactOutboxIsAddressedDeliveryWithoutReceiptCeremony(t *testing.T
 	prompt := eventRuleWakePrompt("fact", event)
 	if !strings.Contains(prompt, "awaited fact for lane") || strings.Contains(prompt, " ack ") || strings.Contains(prompt, " done ") {
 		t.Fatalf("fact prompt = %q, want delivery-only prompt without receipt ceremony", prompt)
+	}
+}
+
+func TestFailedReviewFactWakeRequiresRetryOrExplicitBlocker(t *testing.T) {
+	payload := `{"id":8,"waiter_role":"lane","subject_kind":"review_verdict","subject_key":"acme/widget#46@head","state":"review_failed","job_id":"review-8","detail":"review job review-8 failed without an exact-head verdict"}`
+	event, err := wakeOutboxEvent([]db.WakeOutboxObligation{{
+		ID: 2, SourceKind: db.WakeOutboxSourceAwaitedFact, SourceID: payload,
+		TargetRole: "lane", CoalesceKey: "fact:lane", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}}, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt := eventRuleWakePrompt("fact", event)
+	for _, want := range []string{"review-8 failed", "org await list --role lane --state waiting", "Retry the exact-head review", "record a blocker naming its owner and next trigger"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("failed-review prompt = %q, want %q", prompt, want)
+		}
+	}
+}
+
+func TestFactWakeBatchPrioritizesReviewFailureOverOlderCompletion(t *testing.T) {
+	now := time.Now().UTC()
+	event, err := wakeOutboxEvent([]db.WakeOutboxObligation{
+		{
+			ID: 2, SourceKind: db.WakeOutboxSourceAwaitedFact,
+			SourceID:   `{"id":8,"waiter_role":"lane","subject_kind":"review_verdict","subject_key":"acme/widget#45@old","state":"satisfied"}`,
+			TargetRole: "lane", CoalesceKey: "fact:lane", CreatedAt: now.Add(-time.Second).Format(time.RFC3339Nano),
+		},
+		{
+			ID: 3, SourceKind: db.WakeOutboxSourceAwaitedFact,
+			SourceID:   `{"id":9,"waiter_role":"lane","subject_kind":"review_verdict","subject_key":"acme/widget#46@head","state":"review_failed","job_id":"review-9","detail":"review job review-9 failed without an exact-head verdict"}`,
+			TargetRole: "lane", CoalesceKey: "fact:lane", CreatedAt: now.Format(time.RFC3339Nano),
+		},
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.JobID != "awaited-fact:9" || event.Cause != "awaited_fact_review_failed" {
+		t.Fatalf("fact event identity = %q cause=%q, want actionable failed fact", event.JobID, event.Cause)
+	}
+	prompt := eventRuleWakePrompt("fact", event)
+	for _, want := range []string{"review-9 failed", "is satisfied", "Retry the exact-head review"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("coalesced fact prompt = %q, want %q", prompt, want)
+		}
+	}
+}
+
+func TestFactWakeBatchSuppressesFailureSupersededBySuccess(t *testing.T) {
+	now := time.Now().UTC()
+	event, err := wakeOutboxEvent([]db.WakeOutboxObligation{
+		{
+			ID: 2, SourceKind: db.WakeOutboxSourceAwaitedFact,
+			SourceID:   `{"id":9,"waiter_role":"lane","subject_kind":"review_verdict","subject_key":"acme/widget#46@head","state":"review_failed","job_id":"review-9","lifecycle_generation":0,"detail":"review job review-9 failed without an exact-head verdict"}`,
+			TargetRole: "lane", CoalesceKey: "fact:lane", CreatedAt: now.Add(-time.Second).Format(time.RFC3339Nano),
+		},
+		{
+			ID: 3, SourceKind: db.WakeOutboxSourceAwaitedFact,
+			SourceID:   `{"id":9,"waiter_role":"lane","subject_kind":"review_verdict","subject_key":"acme/widget#46@head","state":"satisfied"}`,
+			TargetRole: "lane", CoalesceKey: "fact:lane", CreatedAt: now.Format(time.RFC3339Nano),
+		},
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.JobID != "awaited-fact:9" || event.Cause != "awaited_fact_satisfied" {
+		t.Fatalf("fact event identity = %q cause=%q, want latest satisfied fact", event.JobID, event.Cause)
+	}
+	prompt := eventRuleWakePrompt("fact", event)
+	if !strings.Contains(prompt, "is satisfied") || strings.Contains(prompt, "Retry the exact-head review") ||
+		strings.Contains(prompt, "review-9 failed") {
+		t.Fatalf("coalesced fact prompt = %q, want only the latest satisfied state", prompt)
+	}
+}
+
+func TestFactWakeDrainReducesOneFactAcrossBatchLimit(t *testing.T) {
+	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p0"}, {"lane", "w1:p1"}})
+	ctx := context.Background()
+	if err := store.AddEventRule(ctx, db.EventRule{
+		ID: "fact-lane", OnKind: db.WakeOutboxKindFact, WakeRole: "lane",
+		Scope: db.EventRuleScopeAddressed, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	insertAwaitedFactWakeForTest(t, store, db.AwaitedFactWakePayload{
+		ID: 9, WaiterRole: "lane", SubjectKind: db.AwaitedFactSubjectReviewVerdict,
+		SubjectKey: "acme/widget#46@head", State: "review_failed", JobID: "review-9",
+		Detail: "review job review-9 failed without an exact-head verdict",
+	})
+	for index := range replyWakeMaxCoalescedItems - 1 {
+		insertAwaitedFactWakeForTest(t, store, db.AwaitedFactWakePayload{
+			ID: int64(100 + index), WaiterRole: "lane", SubjectKind: db.AwaitedFactSubjectReviewVerdict,
+			SubjectKey: fmt.Sprintf("acme/widget#%d@head", 100+index), State: db.AwaitedFactStateSatisfied,
+		})
+	}
+	insertAwaitedFactWakeForTest(t, store, db.AwaitedFactWakePayload{
+		ID: 9, WaiterRole: "lane", SubjectKind: db.AwaitedFactSubjectReviewVerdict,
+		SubjectKey: "acme/widget#46@head", State: db.AwaitedFactStateSatisfied,
+	})
+
+	drainReplyWakeAfterAllRowsAreDue(t, store, sink)
+	if wake.promptCalls != replyWakeMaxCoalescedItems {
+		t.Fatalf("prompt calls = %d, want one per current fact (%d)", wake.promptCalls, replyWakeMaxCoalescedItems)
+	}
+	for _, prompt := range wake.prompts {
+		if strings.Contains(prompt, "Retry the exact-head review") || strings.Contains(prompt, "review-9 failed") {
+			t.Fatalf("stale failure escaped cross-batch reduction: %q", prompt)
+		}
+	}
+	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("pending fact wakes = %+v err=%v, want none", pending, err)
+	}
+	delivered, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateDelivered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentDelivered := false
+	for _, row := range delivered {
+		var payload db.AwaitedFactWakePayload
+		if err := json.Unmarshal([]byte(row.SourceID), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.ID == 9 {
+			currentDelivered = payload.State == db.AwaitedFactStateSatisfied
+		}
+	}
+	if !currentDelivered {
+		t.Fatalf("delivered fact rows = %+v, want fact 9's current satisfied lifecycle as survivor", delivered)
+	}
+}
+
+func TestFactWakeDrainDeliversDistinctFailuresSeparately(t *testing.T) {
+	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p0"}, {"lane", "w1:p1"}})
+	ctx := context.Background()
+	if err := store.AddEventRule(ctx, db.EventRule{
+		ID: "fact-lane", OnKind: db.WakeOutboxKindFact, WakeRole: "lane",
+		Scope: db.EventRuleScopeAddressed, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for index, jobID := range []string{"review-alpha", "review-beta"} {
+		insertAwaitedFactWakeForTest(t, store, db.AwaitedFactWakePayload{
+			ID: int64(index + 1), WaiterRole: "lane", SubjectKind: db.AwaitedFactSubjectReviewVerdict,
+			SubjectKey: fmt.Sprintf("acme/widget#%d@head", index+1), State: "review_failed", JobID: jobID,
+			Detail: fmt.Sprintf("review job %s failed without an exact-head verdict; %s", jobID, strings.Repeat("detail ", 60)),
+		})
+	}
+
+	drainReplyWakeAfterAllRowsAreDue(t, store, sink)
+	if wake.promptCalls != 2 {
+		t.Fatalf("prompt calls = %d, want one per unresolved failure", wake.promptCalls)
+	}
+	for _, jobID := range []string{"review-alpha", "review-beta"} {
+		found := false
+		for _, prompt := range wake.prompts {
+			found = found || strings.Contains(prompt, jobID)
+		}
+		if !found {
+			t.Fatalf("prompts = %+v, want distinct failure %s", wake.prompts, jobID)
+		}
 	}
 }
 
