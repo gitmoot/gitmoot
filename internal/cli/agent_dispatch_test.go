@@ -49,6 +49,7 @@ scope = ["owner/repo"]
 	defer store.Close()
 	checkout, _, head := readonlyReviewWorktreeGitCheckout(t)
 	seedReviewDispatchFixture(t, store, checkout)
+	seedDaemonWorkerAgentWithPolicy(t, store, "run-reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
 		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
 	})
@@ -83,6 +84,45 @@ scope = ["owner/repo"]
 		t.Fatalf("background review invoked runtime %d times, want zero", adapter.calls)
 	}
 
+	runArgs := append([]string{}, args...)
+	runArgs[0] = "run-reviewer"
+	runArgs = append(runArgs, "--action", "review")
+	stdout.Reset()
+	stderr.Reset()
+	code = runAgentRun(runArgs, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("agent run review exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	jobs, err = store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var runJob *db.Job
+	for index := range jobs {
+		if jobs[index].Agent == "run-reviewer" {
+			runJob = &jobs[index]
+			break
+		}
+	}
+	if runJob == nil || runJob.Type != "review" || runJob.State != string(workflow.JobQueued) {
+		t.Fatalf("agent run review job = %+v, want daemon-owned queued review", runJob)
+	}
+	runPayload, err := daemonJobPayload(*runJob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runPayload.ActingOrgRole != "joltra" {
+		t.Fatalf("agent run review acting role = %q, want joltra", runPayload.ActingOrgRole)
+	}
+	for _, want := range []string{"state: queued", "next: gitmoot job watch"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("agent run stdout = %q, want %q", stdout.String(), want)
+		}
+	}
+	if adapter.calls != 0 {
+		t.Fatalf("background agent run review invoked runtime %d times, want zero", adapter.calls)
+	}
+
 	stdout.Reset()
 	stderr.Reset()
 	code = runAgentReview(append(args, "--foreground"), &stdout, &stderr)
@@ -91,6 +131,16 @@ scope = ["owner/repo"]
 	}
 	if adapter.calls != 1 {
 		t.Fatalf("explicit foreground review invoked runtime %d times, want one", adapter.calls)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = runAgentRun(append(runArgs, "--foreground"), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("foreground agent run review exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if adapter.calls != 2 {
+		t.Fatalf("explicit foreground agent run review invoked runtime %d times, want two total", adapter.calls)
 	}
 }
 

@@ -4544,3 +4544,23 @@ func TestReviewExecutionModeRejectsConflictingFlags(t *testing.T) {
 		t.Fatalf("ok=%t stderr=%q, want conflicting mode refusal", ok, stderr.String())
 	}
 }
+
+func TestAgentRunForegroundRejectsNonReviewAction(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runAgentRun([]string{
+		"responder", "answer it", "--action", "ask", "--foreground",
+	}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "--foreground is only supported when routing to review") {
+		t.Fatalf("exit=%d stdout=%q stderr=%q, want selected-action refusal", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestOrchestrateRejectsForegroundReview(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runOrchestrate([]string{
+		"reviewer", "review it", "--action", "review", "--foreground", "--repo", "owner/repo", "--pr", "7",
+	}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "orchestrate always runs in background") {
+		t.Fatalf("exit=%d stdout=%q stderr=%q, want foreground refusal", code, stdout.String(), stderr.String())
+	}
+}

@@ -410,6 +410,10 @@ func runAgentRun(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	selected, reason := selectAgentRunAction(options)
+	if err := normalizeReviewExecutionMode(&options, selected); err != nil {
+		fmt.Fprintf(stderr, "agent run: %v\n", err)
+		return 2
+	}
 	output, exit := dispatchAgentCommand(options, selected, reason, "agent_run", stdout, stderr)
 	if exit != 0 {
 		return exit
@@ -447,8 +451,16 @@ func runOrchestrate(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	// Force the background run path: orchestrate always fans out delegations.
+	if options.foreground {
+		fmt.Fprintln(stderr, "orchestrate: --foreground is not supported; orchestrate always runs in background")
+		return 2
+	}
 	options.background = true
 	selected, reason := selectOrchestrateAction(options)
+	if err := normalizeReviewExecutionMode(&options, selected); err != nil {
+		fmt.Fprintf(stderr, "orchestrate: %v\n", err)
+		return 2
+	}
 	output, exit := dispatchAgentCommand(options, selected, reason, "orchestrate", stdout, stderr)
 	if exit != 0 {
 		return exit
@@ -499,8 +511,9 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "agent review requires --pr number")
 		return 2
 	}
-	if strings.TrimSpace(options.orgRole) != "" && !options.foreground {
-		options.background = true
+	if err := normalizeReviewExecutionMode(&options, "review"); err != nil {
+		fmt.Fprintf(stderr, "agent review: %v\n", err)
+		return 2
 	}
 	output, exit := dispatchAgentCommand(options, "review", "explicit agent review", "agent_review", stdout, stderr)
 	if exit != 0 {
@@ -526,6 +539,10 @@ func runAgentImplement(args []string, stdout, stderr io.Writer) int {
 		}
 		return 2
 	}
+	if err := normalizeReviewExecutionMode(&options, "implement"); err != nil {
+		fmt.Fprintf(stderr, "agent implement: %v\n", err)
+		return 2
+	}
 	output, exit := dispatchAgentCommand(options, "implement", "explicit agent implement", "agent_implement", stdout, stderr)
 	if exit != 0 {
 		return exit
@@ -540,6 +557,16 @@ func runAgentImplement(args []string, stdout, stderr io.Writer) int {
 	printLocalAgentJobOutput(stdout, output)
 	printQueuedDaemonHint(stdout, output, options.background, options.home)
 	return 0
+}
+
+func normalizeReviewExecutionMode(options *agentRunOptions, action string) error {
+	if options.foreground && action != "review" {
+		return errors.New("--foreground is only supported when routing to review")
+	}
+	if action == "review" && strings.TrimSpace(options.orgRole) != "" && !options.foreground {
+		options.background = true
+	}
+	return nil
 }
 
 func dispatchAgentCommand(options agentRunOptions, action string, reason string, executionPath string, stdout, stderr io.Writer) (localAgentJobOutput, int) {
@@ -773,10 +800,7 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 		fmt.Fprintf(stderr, "%s: --background and --foreground are mutually exclusive\n", label)
 		return agentRunOptions{}, false
 	}
-	if options.foreground && command != "review" {
-		fmt.Fprintf(stderr, "%s: --foreground is only supported for agent review\n", label)
-		return agentRunOptions{}, false
-	}
+
 	normalizedRecipe, err := validateRecipeID(options.recipe)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", label, err)
