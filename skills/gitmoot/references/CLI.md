@@ -4839,3 +4839,51 @@ keys, 32 KiB UTF-8 values without U+0000, and 48 KiB decoded keys+values. Invali
 payloads return 400, oversize 413, missing pipelines 404, and overlapping runs 409.
 Containers reach the host bridge at `http://host.docker.internal:8791`, or at
 the Docker bridge IP on Linux.
+
+## Defect relocation count in the review brief
+
+A review prompt that already carries prior-findings obligations (#1822) also
+carries a **defect relocation count** when one file on the pull request has
+attracted findings across several distinct review rounds (#1419).
+
+```
+DEFECT RELOCATION COUNT ON THIS PR (#1419).
+  internal/cli/review_phase_instrument.go  rounds=6  (labels F1 F2 L01 L03 ...)
+```
+
+Three things it deliberately is not:
+
+- **Not a block.** It never refuses a verdict and never gates a merge. The
+  judgement it informs - stop patching and state a contract - is a design
+  decision a human makes with the number.
+- **Not a finding count.** The unit is a distinct review round, so several
+  findings in one round is thoroughness rather than relocation. A round that
+  fans out to several reviewers or lens children counts once **at one head**.
+  The exact reviewed head is part of the identity at **every** rung, including
+  the job fallback, so one review round or one coordinator whose legs reviewed
+  **different** heads counts more than once: a push between two dispatches is a
+  new round by any reading. One observing job also counts more than once if it
+  recorded findings at several heads, which a retried job does.
+
+  A line-qualified locator (`path/file.go:32`) is grouped with other spellings
+  of the same file, and whether a trailing `:<n>` is a line is decided by the
+  **tracked tree at that observation's own head**, never by the text and never
+  by the head being reviewed. If the full locator exists as a file it keeps its
+  whole name; if only the prefix exists the suffix was a line; if either lookup
+  cannot be resolved, or no tree is available, the raw locator is kept and the
+  count under-reports.
+  Two text rules were tried and both were wrong, because `dir/pkg:10` and
+  `dir/pkg.go:10` are legal filenames: no property of the string can decide it.
+  Resolving against the CURRENT head was wrong too, for a different reason: an
+  observation names a file as it existed when the finding was recorded, so three
+  distinct files tracked at an older head could be folded into one by today's
+  tree. The count is a floor whenever a head cannot be resolved.
+- **Not a claim that the defects are the same defect.** The count is rounds
+  carrying findings against one file, which is a proxy: unrelated defects in one
+  file across three rounds report as three.
+
+The labels are shown so a human can recognise which rounds are meant; they are
+never what is counted, because a reviewer restarts finding numbers at 1 each
+round. The threshold is three rounds. The count is derived only from rows the
+findings ledger holds, so a pull request whose earlier rounds predate the
+ledger's writer reports a floor rather than a total.
