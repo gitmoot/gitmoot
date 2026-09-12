@@ -366,6 +366,38 @@ GID, workspace, start/end timestamps, and visible markers. The gate passes only
 when peak overlap is N, workspace paths are distinct, each leg sees only its own
 marker, and the isolated ledger contains zero remote execution attempts.
 
+`agent review` accepts `--skip-native-review-fanout` as well, and always did:
+the review verb shares implement's argument parser. Until #1654 the review usage
+line omitted it, so the flag was undiscoverable rather than absent.
+
+**On `agent review` the flag is recorded and not consumed, so it does not
+prevent the per-review fix-job race.** The parser sets
+`skip_native_review_fanout` on the review job's payload, and the review-advance
+path never reads it: in `internal/workflow/engine_run_budgets.go` the flag is
+read only inside `case "implement":`, where it writes the branch lock and rides
+onto the PR-open event, while `case "review":` begins after that block and does
+not consult it. `dispatchFix` builds a parentless implement request that does
+not inherit it either.
+
+One propagation path does carry it further, and it is deliberate. Every
+delegation child inherits the bit: `delegationRequest` in
+`internal/workflow/engine_run_budgets.go` copies `SkipNativeReviewFanout` from
+the parent payload for any job type, because the intent is an operator command
+about how the whole tree is reviewed rather than about one job (#1236). So a
+review job that delegates an **implement** leg produces a child that does
+consume the flag, on the implement path described above. What does not happen is
+the review's own advance acting on it, and `dispatchFix` is parentless, so the
+fix jobs the race is about do not inherit it.
+
+**The consumer is implement-only; the scope is the tree.** Those are different
+claims and only the first one is about `agent review`. The flag is a real
+control whose effect lands on implement work, not an escape hatch on the review
+side. Same-head safety for an adversarial panel comes from
+the per-head and per-branch coalescing guards, not from passing this flag to
+`agent review`. To suppress native fan-out for a branch, pass it on the
+implement dispatch (or `orchestrate`/`run`), which is where it takes effect and
+where it persists onto the branch lock.
+
 ## Transcript Retention
 
 Runtime transcript retention is default-on. Every engine delivery appends its
