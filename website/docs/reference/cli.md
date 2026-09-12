@@ -1594,6 +1594,10 @@ filter. Remove one by its stable ID with `org events rule rm` to quiet that kind
 this is destructive and re-running `seat add` recreates it. There is currently
 no non-destructive event-rule disable verb.
 
+After upgrading an existing installation, re-run `org seat add <role>` for each
+seat to provision default routes introduced by the new release, including
+`review-verdict`. The repair preserves the seat's existing policy and routes.
+
 `gitmoot org recycle <role> --kind <kind> --handoff "<note>" [--pane <id>]
 [--json] [--home <dir>]` journals a typed handoff in the role-lifecycle workflow
 `org/<role>`, builds the successor's boot prompt from `org brief` plus that
