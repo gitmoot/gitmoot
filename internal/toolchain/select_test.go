@@ -325,6 +325,39 @@ func TestModuleGoDirectiveReadsTheRequirement(t *testing.T) {
 	}
 }
 
+func TestWorkspaceGoRequirementHonorsGOWORK(t *testing.T) {
+	root := t.TempDir()
+	child := filepath.Join(root, "module")
+	if err := os.Mkdir(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(child, "go.mod"), []byte("module x\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootWork := filepath.Join(root, "go.work")
+	if err := os.WriteFile(rootWork, []byte("go 1.26\n\nuse ./module\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	version, effective := WorkspaceGoRequirement(child, "")
+	if version != "1.26" || effective != rootWork {
+		t.Fatalf("auto requirement = (%q, %q), want (1.26, %q)", version, effective, rootWork)
+	}
+	version, effective = WorkspaceGoRequirement(child, "off")
+	if version != "1.22" || effective != "off" {
+		t.Fatalf("disabled requirement = (%q, %q), want (1.22, off)", version, effective)
+	}
+
+	explicit := filepath.Join(t.TempDir(), "alternate.work")
+	if err := os.WriteFile(explicit, []byte("go 1.27\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	version, effective = WorkspaceGoRequirement(child, explicit)
+	if version != "1.27" || effective != explicit {
+		t.Fatalf("explicit requirement = (%q, %q), want (1.27, %q)", version, effective, explicit)
+	}
+}
+
 func TestModuleGoDirectiveContainsAndBoundsTheRead(t *testing.T) {
 	outside := filepath.Join(t.TempDir(), "outside.mod")
 	if err := os.WriteFile(outside, []byte("go 99.0\n"), 0o644); err != nil {

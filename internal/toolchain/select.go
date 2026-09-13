@@ -251,43 +251,107 @@ const maxGoModBytes int64 = 1 << 20
 
 // ModuleGoDirective reports the `go` directive of the module rooted at dir, or
 // "" when there is no safe, valid go.mod to read.
+func ModuleGoDirective(dir string) string {
+	directive, _ := goDirectiveAt(dir, "go.mod")
+	return directive
+}
+
+// WorkspaceGoRequirement resolves the minimum Go version that commands started
+// in dir must satisfy and the GOWORK value that pins those commands to the same
+// workspace decision. GOWORK=off disables workspace discovery; an explicit
+// absolute GOWORK names that file; an unset value searches dir and its parents.
 //
-// The checkout is not sandboxed when this runs. OpenRoot keeps resolution
-// beneath the checkout; refusing links and non-regular files avoids blocking
-// on devices or pipes; the size checks bound both ordinary reads and a file
-// that grows after its initial stat.
+// Returning an explicit file or "off" removes the staging-to-execution race in
+// which a parent go.work appears after selection and silently changes which
+// toolchain the pinned seat needs.
+func WorkspaceGoRequirement(dir, gowork string) (version, effectiveGOWORK string) {
+	module := ModuleGoDirective(dir)
+	gowork = strings.TrimSpace(gowork)
+	if gowork == "off" {
+		return module, "off"
+	}
+	if gowork != "" {
+		if !filepath.IsAbs(gowork) {
+			// The go command rejects a relative GOWORK. Preserve it so the seat
+			// reports that real configuration error rather than changing it.
+			return module, gowork
+		}
+		workspace, _ := goDirectiveAt(filepath.Dir(gowork), filepath.Base(gowork))
+		return laterGoDirective(module, workspace), gowork
+	}
+
+	current, err := filepath.Abs(dir)
+	if err != nil {
+		return module, "off"
+	}
+	for {
+		workspace, present := goDirectiveAt(current, "go.work")
+		if present {
+			return laterGoDirective(module, workspace), filepath.Join(current, "go.work")
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return module, "off"
+		}
+		current = parent
+	}
+}
+
+func laterGoDirective(first, second string) string {
+	if first == "" {
+		return second
+	}
+	if second == "" {
+		return first
+	}
+	left, leftErr := normalizedGoVersion(first)
+	right, rightErr := normalizedGoVersion(second)
+	if leftErr != nil || rightErr != nil || version.Compare(left, right) >= 0 {
+		return first
+	}
+	return second
+}
+
+// goDirectiveAt safely reads a go.mod or go.work directive. The checkout is not
+// sandboxed when this runs. OpenRoot keeps resolution beneath dir; refusing
+// links and non-regular files avoids blocking on devices or pipes; the size
+// checks bound both ordinary reads and a file that grows after its initial stat.
 //
 // The `toolchain` line is deliberately ignored. It names a toolchain to
 // download, and a seat runs with GOTOOLCHAIN=local precisely so that no
 // download happens mid-review.
 //
-// This is intentionally not a complete go.mod parser. Go rejects block
-// comments, so an invalid file that hides `go X` inside one may produce an
-// unavailable-toolchain diagnostic instead of a syntax diagnostic; no valid
-// module can be mis-selected by that divergence.
-func ModuleGoDirective(dir string) string {
+// This is intentionally not a complete parser. Go rejects block comments, so
+// an invalid file that hides `go X` inside one may produce an unavailable-
+// toolchain diagnostic instead of a syntax diagnostic; no valid workspace can
+// be mis-selected by that divergence. present distinguishes an absent go.work
+// (continue searching parents) from a present but invalid one (Go would stop).
+func goDirectiveAt(dir, name string) (directive string, present bool) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
-		return ""
+		return "", false
 	}
 	defer root.Close()
 
-	info, err := root.Lstat("go.mod")
-	if err != nil || !info.Mode().IsRegular() || info.Size() > maxGoModBytes {
-		return ""
-	}
-	file, err := root.Open("go.mod")
+	info, err := root.Lstat(name)
 	if err != nil {
-		return ""
+		return "", false
+	}
+	if !info.Mode().IsRegular() || info.Size() > maxGoModBytes {
+		return "", true
+	}
+	file, err := root.Open(name)
+	if err != nil {
+		return "", true
 	}
 	defer file.Close()
 	info, err = file.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Size() > maxGoModBytes {
-		return ""
+		return "", true
 	}
 	contents, err := io.ReadAll(io.LimitReader(file, maxGoModBytes+1))
 	if err != nil || int64(len(contents)) > maxGoModBytes {
-		return ""
+		return "", true
 	}
 
 	for _, line := range strings.Split(string(contents), "\n") {
@@ -297,12 +361,12 @@ func ModuleGoDirective(dir string) string {
 			continue
 		}
 		if len(fields) != 2 {
-			return ""
+			return "", true
 		}
 		if _, err := normalizedGoVersion(fields[1]); err != nil {
-			return ""
+			return "", true
 		}
-		return fields[1]
+		return fields[1], true
 	}
-	return ""
+	return "", true
 }

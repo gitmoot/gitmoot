@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -554,6 +555,42 @@ func TestStageSeatToolchainStagesWhatTheWorkspaceNeeds(t *testing.T) {
 	}
 	if !sawSelector {
 		t.Error("GOTOOLCHAIN=local missing: a seat that downloads a compiler mid-review is worse than one that fails")
+	}
+}
+
+// TestStageSeatToolchainHonorsWorkspaceGoRequirement is #2155's production-
+// boundary regression. A lower go.mod does not make an older toolchain usable
+// when the active go.work itself requires a newer Go release.
+func TestStageSeatToolchainHonorsWorkspaceGoRequirement(t *testing.T) {
+	base := t.TempDir()
+	older := writeSeatToolchainFixture(t, filepath.Join(base, "older"), "go1.22.9")
+	required := writeSeatToolchainFixture(t, filepath.Join(base, "required"), "go1.26.4")
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "go.mod"), []byte("module x\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	workFile := filepath.Join(workspace, "go.work")
+	if err := os.WriteFile(workFile, []byte("go 1.26\n\nuse .\n"), 0o644); err != nil {
+		t.Fatalf("write go.work: %v", err)
+	}
+	t.Setenv("GOWORK", "")
+	t.Setenv("PATH", strings.Join([]string{
+		filepath.Join(older, "bin"),
+		filepath.Join(required, "bin"),
+	}, string(os.PathListSeparator)))
+
+	staged, env, diagnostic, err := stageSeatToolchain(config.PathsForHome(t.TempDir()), workspace)
+	if err != nil {
+		t.Fatalf("stageSeatToolchain: %v", err)
+	}
+	if diagnostic != "" {
+		t.Fatalf("diagnostic = %q, want none", diagnostic)
+	}
+	if !strings.Contains(filepath.Base(staged), "go1.26.4") {
+		t.Fatalf("staged %q, want the go1.26.4 tree required by go.work", staged)
+	}
+	if !slices.Contains(env, "GOWORK="+workFile) {
+		t.Fatalf("env = %q, want GOWORK pinned to %s", env, workFile)
 	}
 }
 

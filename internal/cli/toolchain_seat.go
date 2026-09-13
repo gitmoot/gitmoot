@@ -64,7 +64,10 @@ func stageSeatToolchain(paths config.Paths, workspace string) (string, []string,
 		}
 		return unavailableSeatToolchain(paths, "")
 	}
-	required := toolchain.ModuleGoDirective(workspace)
+	required, effectiveGOWORK := "", "off"
+	if strings.TrimSpace(workspace) != "" {
+		required, effectiveGOWORK = toolchain.WorkspaceGoRequirement(workspace, os.Getenv("GOWORK"))
+	}
 	candidates, err := toolchain.SelectInstallations(candidates, required)
 	if err != nil {
 		// Reported at STAGING time, naming the requirement and every rejected
@@ -96,6 +99,10 @@ func stageSeatToolchain(paths config.Paths, workspace string) (string, []string,
 			// pin the selector too. An empty GOTOOLCHAIN invites an auto-download
 			// a sandboxed seat cannot complete.
 			"GOTOOLCHAIN=local",
+			// Pin workspace discovery to the same decision used above. Otherwise
+			// an ambient parent go.work can make execution require a newer Go
+			// release than staging selected.
+			"GOWORK=" + effectiveGOWORK,
 		}, strings.Join(refused, "; "), nil
 	}
 
