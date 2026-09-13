@@ -15,6 +15,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
+	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -196,6 +197,27 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	}
 	if err := runForeignBootRecoveryOnce(ctx, store, stdout, startupNow, tracker); err != nil {
 		return err
+	}
+	// Reconcile the cached default branch here too (#2145 review, F1).
+	//
+	// pollRepo does this for the fleet, but THIS supervisor never calls pollRepo -
+	// single-repo mode runs startSingleRepoWorkerLoop instead - so without this a
+	// `daemon run --repo owner/repo` deployment could never correct a wrong base
+	// branch, and the claim that a wrong value is transient would be false for
+	// exactly the mode an operator uses to debug one repository.
+	//
+	// Startup-only rather than per tick: this loop ticks far more often than the
+	// fleet poll, the value changes about as often as a repository's default
+	// branch does, and every store call here contends for the daemon's single
+	// SQLite connection (#2145).
+	if record, recErr := store.GetRepo(ctx, d.Repo.FullName()); recErr == nil && strings.TrimSpace(record.CheckoutPath) != "" {
+		if branch, branchErr := gitutil.NewHostClient(record.CheckoutPath).RemoteDefaultBranch(ctx); branchErr == nil {
+			if changed, updateErr := store.UpdateRepoDefaultBranch(ctx, d.Repo.FullName(), branch); updateErr != nil {
+				writeLine(stdout, "%s: default branch reconcile failed: %v", d.Repo.FullName(), updateErr)
+			} else if changed {
+				writeLine(stdout, "%s: default branch reconciled to %s (was %s)", d.Repo.FullName(), branch, record.DefaultBranch)
+			}
+		}
 	}
 	if err := recoverRunningJobsForRepo(ctx, store, stdout, d.Repo.FullName(), rootFilter); err != nil {
 		return err
@@ -1276,6 +1298,25 @@ func (p registeredRepoPoller) pollRepo(ctx context.Context, repoRecord db.Repo, 
 		message := fmt.Sprintf("registered repo checkout path is unavailable: %s", repoRecord.CheckoutPath)
 		writeLine(p.Stdout, "%s: %s", repoRecord.FullName(), message)
 		return registeredRepoPollResult{LastError: message}, store.UpdateRepoPollResult(ctx, repoRecord.FullName(), lastPollAt, message)
+	}
+	// Self-heal the cached default branch (#2145). The stored value is consumed
+	// as the BASE BRANCH, and it was previously written from the worktree's
+	// CURRENT branch, so existing records can name a feature branch that no
+	// amount of correct writing afterwards would fix - the bad value is already
+	// durable. Reconciling here means a wrong record corrects itself on the next
+	// successful poll instead of requiring a manual store edit.
+	//
+	// Deliberately BEFORE the dry-run return and OUTSIDE the checkout lock: it
+	// only reads a symbolic ref and writes one column, so it must not wait on a
+	// lock held by a running job, and a dry run should still not be silently
+	// operating against a base branch it knows is wrong.
+	if branch, branchErr := gitutil.NewHostClient(repoRecord.CheckoutPath).RemoteDefaultBranch(ctx); branchErr == nil {
+		if changed, updateErr := store.UpdateRepoDefaultBranch(ctx, repoRecord.FullName(), branch); updateErr != nil {
+			writeLine(p.Stdout, "%s: default branch reconcile failed: %v", repoRecord.FullName(), updateErr)
+		} else if changed {
+			writeLine(p.Stdout, "%s: default branch reconciled to %s (was %s)", repoRecord.FullName(), branch, repoRecord.DefaultBranch)
+			repoRecord.DefaultBranch = branch
+		}
 	}
 	// `Workers` is a fleet-wide flag echoed here, not a per-repo pool: no such
 	// pool exists, so printing it as one only misleads (#1758).

@@ -141,6 +141,31 @@ func (s *Store) UpdateRepoPollResult(ctx context.Context, fullName string, lastP
 	return requireAffected(result, "repo", fullName)
 }
 
+// UpdateRepoDefaultBranch corrects the cached default branch, reporting whether
+// the stored value actually changed so the caller can log a real correction
+// rather than one write per poll (#2145).
+//
+// An EMPTY branch is rejected instead of stored. The column is consumed as the
+// base branch, and blanking it would turn a wrong base into a missing one on
+// every repository whose origin/HEAD is momentarily unreadable.
+func (s *Store) UpdateRepoDefaultBranch(ctx context.Context, fullName string, branch string) (bool, error) {
+	fullName = strings.TrimSpace(fullName)
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return false, errors.New("default branch is required")
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE repos SET default_branch = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE full_name = ? AND default_branch <> ?`, branch, fullName, branch)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}
+
 func (s *Store) RemoveRepo(ctx context.Context, fullName string) (bool, error) {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM repos WHERE full_name = ?`, fullName)
 	if err != nil {

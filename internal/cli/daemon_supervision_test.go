@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
+	daemonpkg "github.com/gitmoot/gitmoot/internal/daemon"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/github"
@@ -892,5 +893,81 @@ func TestPollPassResetsConfigCache(t *testing.T) {
 	}
 	if poller.ConfigCache.memoryDone || poller.ConfigCache.memoryHome != "" {
 		t.Fatalf("config cache survived a poll pass: %+v", poller.ConfigCache)
+	}
+}
+
+type cancelOnTextWriter struct {
+	buffer bytes.Buffer
+	cancel context.CancelFunc
+	needle string
+}
+
+func (w *cancelOnTextWriter) Write(p []byte) (int, error) {
+	n, err := w.buffer.Write(p)
+	if strings.Contains(w.buffer.String(), w.needle) {
+		w.cancel()
+	}
+	return n, err
+}
+
+func TestRunSingleRepoSupervisorReconcilesDefaultBranchAtStartup(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	defer store.Close()
+
+	checkout := t.TempDir()
+	runGit(t, checkout, "init")
+	runGit(t, checkout, "config", "user.email", "gitmoot@example.com")
+	runGit(t, checkout, "config", "user.name", "Gitmoot Test")
+	writeFile(t, filepath.Join(checkout, "README.md"), "trunk\n")
+	runGit(t, checkout, "add", "README.md")
+	runGit(t, checkout, "commit", "-m", "initial")
+	runGit(t, checkout, "branch", "-m", "trunk")
+	runGit(t, checkout, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	runGit(t, checkout, "update-ref", "refs/remotes/origin/trunk", "HEAD")
+	runGit(t, checkout, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
+	if err := store.UpsertRepo(context.Background(), db.Repo{
+		Owner: "owner", Name: "repo", DefaultBranch: "wrong",
+		CheckoutPath: checkout, PollInterval: "1h",
+	}); err != nil {
+		t.Fatalf("UpsertRepo: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	output := &cancelOnTextWriter{cancel: cancel, needle: "default branch reconciled to trunk"}
+	done := make(chan error, 1)
+	go func() {
+		done <- runSingleRepoSupervisor(ctx, home, daemonpkg.Daemon{
+			Repo:         github.Repository{Owner: "owner", Name: "repo"},
+			PollInterval: time.Hour,
+			Store:        store,
+		}, store, newDaemonReloadableConfig(time.Hour, 1, false), "", output)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("runSingleRepoSupervisor: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("timed out waiting for startup default-branch reconciliation")
+	}
+	stored, err := store.GetRepo(context.Background(), "owner/repo")
+	if err != nil {
+		t.Fatalf("GetRepo: %v", err)
+	}
+	if stored.DefaultBranch != "trunk" {
+		t.Fatalf("stored default branch = %q, want trunk", stored.DefaultBranch)
+	}
+	if !strings.Contains(output.buffer.String(), "default branch reconciled to trunk (was wrong)") {
+		t.Fatalf("startup output = %q, want reconciliation message", output.buffer.String())
 	}
 }
