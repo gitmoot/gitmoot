@@ -448,6 +448,140 @@ func EvidenceWasDeclared(r AgentResult) bool {
 	return r.EvidenceDeclared
 }
 
+// InheritedEvidenceClampedEvent records that a staged verdict's EXECUTED claim
+// was overruled by its own preflight stage (#1821). It is the audit trail for a
+// clamp, because a producer that was overruled and one that declared
+// static_only itself are different facts with the same stored value.
+const InheritedEvidenceClampedEvent = "inherited_evidence_clamped"
+
+// normalizeInheritedEvidence keeps only a DECLARED evidence value as a ceiling.
+// Anything unrecognised - including the empty string every non-staged job
+// carries - normalizes away.
+func normalizeInheritedEvidence(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if !ValidEvidence(trimmed) {
+		return ""
+	}
+	return trimmed
+}
+
+// stagedPreflightNamedExecution reports whether a staged preflight's result
+// names anything it actually ran (#2029 review, P1).
+//
+// The bar is deliberately LOW - one non-empty entry in tests_run or
+// changes_made - because this is not a quality judgement about the preflight's
+// coverage. It separates "executed, and here is what" from "executed" asserted
+// against nothing, and only the second removes the ceiling dishonestly. Raising
+// the bar here would start refusing preflights that ran one real command, which
+// is a legitimate cheap-stage result.
+func stagedPreflightNamedExecution(result AgentResult) bool {
+	for _, entry := range result.TestsRun {
+		// REUSES THE SHARED EVIDENCE PREDICATE RATHER THAN RE-ASKING THE QUESTION
+		// (#2029 round four P1; narrowed in round five, see entryClaimsExecution). "any nonblank entry" accepted tests_run=["none run"]
+		// and ["could not run"] as proof of execution - entries stating the
+		// OPPOSITE of execution lifting the ceiling. The package already decides
+		// this exact question in reviewNamesSomethingItRan, whose helper requires
+		// a command- or path-shaped token, and TestExecutedClaimNeedsARunnableTarget
+		// already pins those very strings as rejections.
+		//
+		// A SECOND CONVENTION FOR ONE QUESTION IS HOW THE TWO HALVES COME TO
+		// DISAGREE, which is why this reuses the helper instead of adding a
+		// stricter test of its own. The staged SCOPE stays narrower on purpose -
+		// only tests_run, never changes_made - because a read-only preflight's
+		// changes_made is prose about what it would change.
+		if entryClaimsExecution(entry) {
+			return true
+		}
+	}
+	// #2029 round three, P1: CHANGES_MADE IS NOT EXECUTION EVIDENCE. It used to
+	// count, so evidence=executed with tests_run=[] and
+	// changes_made=["no changes"] returned the PERMISSIVE executed ceiling while
+	// naming no command and running nothing. A read-only preflight's changes_made
+	// is prose about what it would change; only tests_run identifies something it
+	// actually ran.
+	//
+	// That leaves tests_run as the single field, which is the point: the bar is
+	// one non-empty entry, and the question is whether the stage named an
+	// execution at all.
+	return false
+}
+
+// ApplyInheritedEvidenceCeiling clamps a staged verdict's declared evidence to
+// what its preflight stage found runnable (#1821), and reports whether it
+// clamped.
+//
+// THE SOUNDNESS ARGUMENT AND ITS EXACT SCOPE. This is sound only for a staged
+// preflight and the verdict child it named WHEN THEY SHARE AN EXECUTION
+// ENVIRONMENT AND A HEAD: the preflight's finding that a command cannot execute
+// is then a fact about the tree the child is looking at, and nothing between them
+// can make an unrunnable command runnable.
+//
+// THE HEAD IS SHARED. THE ENVIRONMENT IS NOT, and this sentence used to assert
+// both as fact (#2029 round three P2, #2082). delegationRequest transfers only
+// InheritedEvidence - not WorktreePath, ReadOnlySeat or RuntimeConfigDir - and a
+// staged preflight emits exactly ONE read-only child, so
+// readOnlyFanoutNeedsWorktree is false and the worker may allocate a different
+// exact-head worktree or resolve a shared checkout. The child can therefore run
+// in a different seat, with a different runtime and different credentials.
+//
+// #2029 rounds two and three: THE SHARED WORKTREE IS NEITHER ASSUMED NOR
+// PROVIDED, AND THAT IS AN OPEN DESIGN QUESTION RATHER THAN A SOLVED ONE.
+// The argument above was written as though it followed from the staged
+// relationship, and it did not: delegationRequest inherited no WorktreePath, and
+// because a staged preflight emits exactly ONE read-only child,
+// readOnlyFanoutNeedsWorktree is false (it needs two or more siblings), so the
+// worker was free to allocate a different exact-head worktree or resolve a
+// shared checkout. A different seat can have a different runtime and different
+// credentials, which makes "cannot execute here" not a fact about the child's
+// tree - and then a static_only ceiling can downgrade evidence the verdict agent
+// legitimately produced.
+//
+// Round two made the marked verdict child inherit the preflight's WorktreePath.
+// THAT WAS WITHDRAWN in round three: AdvanceJob has already deferred cleanup of
+// the parent-owned read-only worktree, so the parent's own advance force-removes
+// the very path the queued child was handed - the child would receive a missing
+// directory or race its removal, and it inherited neither the read-only seat nor
+// the runtime config directory that make the path usable. Handing over a path
+// that is about to be deleted is worse than not sharing one.
+//
+// So the argument above is currently NOT ESTABLISHED for the environment half.
+// The ceiling still holds on the halves that are established - same pull request,
+// same head, and a preflight that is the cheap stage of the same review - and it
+// can under-report when the verdict child's seat is richer than the preflight's.
+// Making it sound needs either worktree ownership transferred until the verdict
+// child is terminal, or a ceiling defined from observations valid in the child's
+// actual seat. Both are larger than a fix round and neither is chosen here; the
+// question is escalated rather than papered over.
+//
+// IT IS NOT SOUND FOR ANY OTHER PARENT AND CHILD, which is why the caller must
+// establish the staged relationship from the explicit marker rather than from
+// the parent having declared evidence. PR #2024 made that mistake: an honest
+// review COORDINATOR declares static_only for itself while its lens children
+// execute in their own worktrees, and inferring the relationship downgraded
+// every one of them - including the rows the merge gate reads as a fan-out's
+// only evidence. Reproduced, then closed.
+//
+// It only ever moves evidence DOWNWARD. A preflight that executed does not
+// license a child to claim execution: a static_only child under an executed
+// preflight keeps its own more modest claim, because the child is the row whose
+// verdict the gate consumes and its own honesty about itself is the point.
+func ApplyInheritedEvidenceCeiling(result *AgentResult, inherited string) bool {
+	if result == nil {
+		return false
+	}
+	if normalizeInheritedEvidence(inherited) != EvidenceStaticOnly {
+		return false
+	}
+	if strings.TrimSpace(result.Evidence) != EvidenceExecuted {
+		return false
+	}
+	result.Evidence = EvidenceStaticOnly
+	// The producer DID declare a value; it was overruled rather than defaulted,
+	// and #1817's declared flag must keep meaning "the producer spoke".
+	result.EvidenceDeclared = true
+	return true
+}
+
 // authorityGrantingResultFields are AgentResult fields an agent may NEVER supply,
 // because setting them GRANTS the job authority it would not otherwise have (#1673).
 //
