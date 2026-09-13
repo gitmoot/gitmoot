@@ -358,12 +358,18 @@ func reviewSubjectFromClaim(claim db.ReviewRequest) (reviewClaimSubject, bool) {
 	return reviewClaimSubject{repo: repo, pullRequest: pullRequest, headSHA: headSHA, purpose: purpose}, true
 }
 
-// answers reports whether a job's payload addresses this exact question. An
-// unparseable subject disables the check rather than refusing every job, which
-// keeps the failure direction the same as before the check existed.
+// answers reports whether a job's payload addresses this exact question.
+//
+// An UNKNOWN subject answers NOTHING. A claim key is always written by
+// ReviewRequestSubjectKey, so an unparseable one is corruption - and the #2176
+// lesson is that construction holds while corruption is undefended. Disabling
+// the check there would let any verdict in the tree keep the claim, which is
+// the permanent wedge this fix exists to remove. Failing toward release costs
+// at most one duplicate reviewer; the claim holder itself is exempt and keeps
+// its own claim either way.
 func (s reviewClaimSubject) answers(payload workflow.JobPayload) bool {
 	if s.repo == "" {
-		return true
+		return false
 	}
 	if !strings.EqualFold(strings.TrimSpace(payload.Repo), s.repo) || payload.PullRequest != s.pullRequest {
 		return false
