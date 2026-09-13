@@ -3040,3 +3040,131 @@ func gitPackVerifierForTest(t *testing.T) packIndexVerifier {
 	client := gitutil.NewHostClient(t.TempDir())
 	return client.VerifyPackIndex
 }
+
+// seedWorktreeOwner creates a job that records worktreePath, used to build the
+// "another row holds this path" situation the reclaim guard exists for.
+func seedWorktreeOwner(t *testing.T, store *db.Store, jobID, state, worktreePath string) {
+	t.Helper()
+	payload, err := marshalPayload(JobPayload{
+		Repo:         "owner/repo",
+		WorktreePath: worktreePath,
+		FixWorktree:  true,
+	})
+	if err != nil {
+		t.Fatalf("marshalPayload: %v", err)
+	}
+	if err := store.CreateJobWithEvent(context.Background(), db.Job{
+		ID:      jobID,
+		Agent:   "fixer",
+		Type:    "implement",
+		State:   state,
+		Repo:    "owner/repo",
+		Payload: payload,
+	}, db.JobEvent{Kind: state, Message: "seed"}); err != nil {
+		t.Fatalf("CreateJobWithEvent(%s): %v", jobID, err)
+	}
+}
+
+func TestEngineReclaimSkipsDegenerateWorktreePath(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedWorktreeOwner(t, store, "fix-degenerate", string(JobSucceeded), ".")
+
+	reclaimed, err := testEngine(store).ReclaimAgedTerminalDelegationWorktreeOutcome(
+		ctx, "fix-degenerate", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("degenerate candidate returned an operational error: %v", err)
+	}
+	if reclaimed {
+		t.Fatal("degenerate candidate reported a reclaimed worktree")
+	}
+}
+
+// TestEngineReclaimRefusesWhenAnotherJobStillHoldsThePath is the guard's whole
+// purpose, and it was UNTESTED: a mutant that ignored a non-final co-owner
+// survived the suite.
+//
+// A deterministic worktree path recurs across historical rows. If an aged
+// terminal row reclaims a path a live job still holds, it deletes a running
+// job's checkout. #2149 changed how the co-owners are FOUND - the payloads are
+// no longer decoded - so the property has to be pinned before that change can
+// be trusted, not after.
+func TestEngineReclaimRefusesWhenAnotherJobStillHoldsThePath(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	const agedID = "fix-aged"
+	path, err := FixWorktreePath(home, "owner/repo", agedID)
+	if err != nil {
+		t.Fatalf("FixWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	seedWorktreeOwner(t, store, agedID, string(JobSucceeded), path)
+	// The co-owner is RUNNING, so the aged row must not touch the path.
+	seedWorktreeOwner(t, store, "fix-live-owner", string(JobRunning), path)
+
+	engine := testEngine(store)
+	engine.Home = home
+	engine.WorktreeHasLiveProcess = nil
+	engine.WorktreeLiveness = func(string) (bool, bool) { return false, true }
+
+	reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, agedID, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
+	}
+	if reclaimed {
+		t.Fatal("reclaimed a worktree path another job is still running on")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("worktree of a live co-owner was removed: %v", err)
+	}
+}
+
+// TestEngineReclaimMatchesCoOwnersByCleanedPath pins the reason the comparison
+// stays in Go rather than becoming an indexed SQL equality (#2149).
+//
+// Two spellings of one path are the same path. SQL equality would treat them
+// as different and reclaim a live owner's worktree, so the extra rows returned
+// by the query exist precisely so filepath.Clean can decide here.
+func TestEngineReclaimMatchesCoOwnersByCleanedPath(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	home := t.TempDir()
+	const agedID = "fix-aged-clean"
+	path, err := FixWorktreePath(home, "owner/repo", agedID)
+	if err != nil {
+		t.Fatalf("FixWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	seedWorktreeOwner(t, store, agedID, string(JobSucceeded), path)
+	// Same path, different spelling. Textually unequal, semantically identical.
+	//
+	// Built by CONCATENATION on purpose: filepath.Join cleans its own result,
+	// so a fixture using it stores the identical string and proves nothing.
+	// The first version of this test did exactly that and its mutant survived.
+	unclean := path + "/sub/.."
+	if filepath.Clean(unclean) != path {
+		t.Fatalf("fixture is not an alternate spelling: Clean(%q) = %q, want %q", unclean, filepath.Clean(unclean), path)
+	}
+	if unclean == path {
+		t.Fatal("fixture spelling is identical, so this test cannot observe the defect")
+	}
+	seedWorktreeOwner(t, store, "fix-live-unclean", string(JobRunning), unclean)
+
+	engine := testEngine(store)
+	engine.Home = home
+	engine.WorktreeHasLiveProcess = nil
+	engine.WorktreeLiveness = func(string) (bool, bool) { return false, true }
+
+	reclaimed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, agedID, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("ReclaimAgedTerminalDelegationWorktreeOutcome: %v", err)
+	}
+	if reclaimed {
+		t.Fatal("a co-owner spelled differently was not recognised, and its worktree was reclaimed")
+	}
+}
