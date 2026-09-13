@@ -229,10 +229,10 @@ have been billed for a message whose `message_end` never reached stdout.
 
 ### Autonomy policies
 
-| `--policy` | omp argument | Effect |
+| `--policy` | ordinary omp argument | Effect |
 |---|---|---|
 | `read-only` | `--approval-mode=always-ask` | restricts omp to read tools; declared `applied` |
-| `workspace-write` | `--approval-mode=yolo` | declared `widened`: yolo grants more than asked |
+| `workspace-write` | `--approval-mode=write` | permits edit tools but refuses shell and out-of-worktree writes; declared `applied` |
 | `danger-full-access` | `--approval-mode=yolo` | declared `applied` |
 | `auto` (default) | `--approval-mode=yolo` | declared `widened` |
 
@@ -257,15 +257,18 @@ terminates cleanly — which is what a read-only policy wants. omp 17.2.4 has no
 now passes `always-ask`.
 :::
 
-Read-only therefore stays enforced **Gitmoot-side**, exactly as it is for Kimi:
-the `implement` **capability** is refused at `agent start` and `agent subscribe`
-when the agent carries `auto`/empty or `read-only`, and an implement **job** for
-such an agent is refused again at dispatch — both at CLI enqueue and in the
-daemon. Treat the runtime-level approval flag as advisory and the Gitmoot gate as
-the boundary. (Landlock is not a second layer here: the sandbox wrapper selects
-by runtime **name** and wraps only Claude and Kimi, so no omp process is ever
-confined by it. omp separately does not advertise `produce`, which is why it
-never reaches the produce-stage wrapper either.)
+For ordinary, non-seat deliveries, read-only stays enforced **Gitmoot-side** and
+by omp's `always-ask` mode. The `implement` **capability** is refused at
+`agent start` and `agent subscribe` when the agent carries `auto`/empty or
+`read-only`, and an implement **job** for such an agent is refused again at
+dispatch — both at CLI enqueue and in the daemon.
+
+A kernel-enforced `ReadOnlySeat` is the exception. Gitmoot wraps every such omp
+delivery in its Landlock sandbox and passes `--approval-mode=yolo`, declared
+`widened`, so headless shell and test tools can run. Landlock, rather than omp's
+interactive approval UI, is then the write boundary. Ordinary non-seat
+`read-only` deliveries retain `always-ask`; omp still does not advertise
+`produce`, so it never reaches the separate produce-stage wrapper.
 
 ### Plan mode
 

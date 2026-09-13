@@ -626,9 +626,11 @@ func TestTrackedTickMaintenanceNotStarvedByInFlightJobs(t *testing.T) {
 	mustCreateTerminalJob("job-comment", string(workflow.JobFailed),
 		workflow.JobPayload{Repo: "owner/repo", Branch: "main", PullRequest: 7},
 		db.JobEvent{Kind: "comment_post_failed", Message: "temporary github error"})
-	// Pending advancement keyed on its OWN worktree (free while job-live runs).
+	// Pending fix-worktree review advancement keyed on its OWN writable worktree
+	// (free while job-live runs). Ordinary read-only review retries now use the
+	// shared checkout because their detached worktree can already be gone.
 	mustCreateTerminalJob("job-adv-wt", string(workflow.JobSucceeded),
-		workflow.JobPayload{Repo: "owner/repo", Branch: "task-wt", PullRequest: 1, TaskID: "task-wt", WorktreePath: filepath.Join(t.TempDir(), "wt-adv"), Result: approved},
+		workflow.JobPayload{Repo: "owner/repo", Branch: "task-wt", PullRequest: 1, TaskID: "task-wt", WorktreePath: filepath.Join(t.TempDir(), "wt-adv"), FixWorktree: true, Result: approved},
 		db.JobEvent{Kind: "advance_started", Message: "workflow advancement started"})
 	// Pending advancement keyed on the SHARED repo checkout (held by job-live).
 	mustCreateTerminalJob("job-adv-repo", string(workflow.JobSucceeded),

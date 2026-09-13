@@ -2362,18 +2362,40 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context
 	if !readOnly && !implement && !fix {
 		return false, nil
 	}
+	path := strings.TrimSpace(payload.WorktreePath)
+	want := filepath.Clean(path)
+	if want == "." {
+		// Empty and degenerate relative spellings are not worktree resources.
+		// Candidate discovery is deliberately a text prefilter, so keep this
+		// filepath-aware rejection at the actuation boundary and skip quietly.
+		return false, nil
+	}
 	// A deterministic path can appear in more than one historical row. Never let
 	// an aged row reclaim it out from under a newer or resumable owner.
-	jobs, err := e.Store.ListJobs(ctx)
+	//
+	// #2149: THIS LOOP WAS 81% OF THE DAEMON'S CPU. It read every job row and
+	// JSON-decoded every payload to compare one field. On the profiled host
+	// that was 15,320 decodes per call, and the candidate set it was building
+	// was empty by construction: 4,762 distinct worktree paths, at most one
+	// row each. Now SQL drops the 69% of rows that record no path at all and
+	// returns the path itself, so no payload is decoded here.
+	//
+	// The COMPARISON DID NOT MOVE. filepath.Clean still decides, in Go, over
+	// every row that has a path, because two spellings of one path must match
+	// and this guard is what stops an aged row reclaiming a live owner's
+	// worktree. Pushing the equality into SQL would have been a single indexed
+	// lookup and measurably faster still; it is not done because SQL cannot
+	// apply Clean, and being wrong here destroys work rather than slowing it.
+	refs, err := e.Store.ListJobWorktreeRefs(ctx)
 	if err != nil {
 		return false, err
 	}
-	for _, other := range jobs {
+
+	for _, other := range refs {
 		if other.ID == job.ID {
 			continue
 		}
-		otherPayload, err := ParseJobPayload(other.Payload)
-		if err != nil || filepath.Clean(strings.TrimSpace(otherPayload.WorktreePath)) != filepath.Clean(strings.TrimSpace(payload.WorktreePath)) {
+		if filepath.Clean(strings.TrimSpace(other.WorktreePath)) != want {
 			continue
 		}
 		if !IsFinalJobState(other.State) {
@@ -2387,7 +2409,6 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context
 			return false, nil
 		}
 	}
-	path := strings.TrimSpace(payload.WorktreePath)
 	actuate, err := e.prepareDelegationCleanupObligation(ctx, jobID, job.Type, payload)
 	if err != nil {
 		return false, err

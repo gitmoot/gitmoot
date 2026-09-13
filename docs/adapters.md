@@ -131,14 +131,16 @@ omp -p --mode=json --approval-mode=<policy> --no-session \
 `--plan-yolo` appears if and only if the job asked for plan mode (`plan` /
 `plan_into` on the job payload), with `--plan-yolo-into` pinning the model the
 execution phase runs on. `plan_into` must be one non-flag model selector with no
-internal whitespace or control characters. It is orthogonal to
-`--approval-mode`, whose value comes from the agent's autonomy policy
-(`read-only` maps to `always-ask`, every other policy to `yolo`) and is
-unchanged by plan mode. `plan_into`
-without `plan`, malformed targets, and a plan request routed to any non-omp
-runtime are refused before dispatch — a plan-gated brief never silently
-degrades into an ordinary implementation. Runtime preflight requires the two
-plan flags only for plan requests; an ordinary omp job does not require them.
+internal whitespace or control characters. For ordinary non-seat deliveries,
+`--approval-mode` comes from the agent's autonomy policy (`read-only` maps to
+`always-ask`, `workspace-write` to `write`, and every other policy to `yolo`)
+and is unchanged by plan mode. A kernel-enforced `ReadOnlySeat` overrides that
+mapping with `yolo`, declared `widened`, so shell and test tools can run while
+the daemon's Landlock wrapper remains the write boundary. `plan_into` without
+`plan`, malformed targets, and a plan request routed to any non-omp runtime are
+refused before dispatch — a plan-gated brief never silently degrades into an
+ordinary implementation. Runtime preflight requires the two plan flags only for
+plan requests; an ordinary omp job does not require them.
 
 This behavior description is grounded in a versioned CLI declaration, not an
 internal transition Gitmoot can observe. On `omp/17.2.4`, run

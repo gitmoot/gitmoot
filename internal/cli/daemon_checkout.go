@@ -107,6 +107,32 @@ func (w jobWorker) defaultCheckoutForRunner(ctx context.Context, job db.Job, pay
 	return checkout, nil
 }
 
+// checkoutForPostDeliveryAdvance resolves the stable repository checkout for an
+// ordinary review (#1827/#1940). AdvanceJob defers removal of the review's
+// read-only worktree on every return path, including transient merge-gate failures.
+// A later retry must therefore not depend on that worktree still existing, and
+// would also race cleanup running concurrently in another worker. The persisted
+// result and exact head drive review advancement; the checkout supplies only the
+// validated repository context.
+//
+// Fix-worktree reviews retain the normal path because their writable clone can
+// hold changes needed by finalization. Injected validators also retain their
+// existing test and embedding contract.
+func (w jobWorker) checkoutForPostDeliveryAdvance(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent, runner subprocess.Runner) (string, error) {
+	if w.CheckoutValidator != nil {
+		return w.CheckoutValidator(ctx, job, payload, agent)
+	}
+	if reviewAdvanceUsesRegisteredCheckout(job, payload) {
+		checkout, _, err := w.resolveRegisteredRepoCheckoutForRunner(ctx, job, payload.Repo, runner)
+		return checkout, err
+	}
+	return w.defaultCheckoutForRunner(ctx, job, payload, agent, runner)
+}
+
+func reviewAdvanceUsesRegisteredCheckout(job db.Job, payload workflow.JobPayload) bool {
+	return job.Type == "review" && !payload.FixWorktree
+}
+
 // prepareNativeReviewWorktreeForRunner gives a native PR review leg that reached
 // the worker WITHOUT a dispatch-time worktree the same exact-head isolation as a
 // deliberate `agent review` dispatch. Since the engine hoisted the ROUTINE leg's
@@ -222,19 +248,8 @@ func (w jobWorker) resolveJobCheckoutForRunner(ctx context.Context, job db.Job, 
 		}
 		return checkout, nil
 	}
-	repoRecord, err := w.Store.GetRepo(ctx, payload.Repo)
+	checkout, repo, err := w.resolveRegisteredRepoCheckoutForRunner(ctx, job, payload.Repo, runner)
 	if err != nil {
-		return "", err
-	}
-	repo, err := github.ParseRepository(payload.Repo)
-	if err != nil {
-		return "", err
-	}
-	checkout, err := w.healRegisteredRepoCheckoutForRunner(ctx, job, repo, repoRecord, runner)
-	if err != nil {
-		return "", err
-	}
-	if err := preflightDaemonRepoCheckoutWithRunner(ctx, repo, checkout, runner); err != nil {
 		return "", err
 	}
 	taskCheckout, ok, err := w.taskWorktreeCheckout(ctx, payload)
@@ -248,6 +263,25 @@ func (w jobWorker) resolveJobCheckoutForRunner(ctx context.Context, job db.Job, 
 		}
 	}
 	return checkout, nil
+}
+
+func (w jobWorker) resolveRegisteredRepoCheckoutForRunner(ctx context.Context, job db.Job, repoFullName string, runner subprocess.Runner) (string, github.Repository, error) {
+	repoRecord, err := w.Store.GetRepo(ctx, repoFullName)
+	if err != nil {
+		return "", github.Repository{}, err
+	}
+	repo, err := github.ParseRepository(repoFullName)
+	if err != nil {
+		return "", github.Repository{}, err
+	}
+	checkout, err := w.healRegisteredRepoCheckoutForRunner(ctx, job, repo, repoRecord, runner)
+	if err != nil {
+		return "", github.Repository{}, err
+	}
+	if err := preflightDaemonRepoCheckoutWithRunner(ctx, repo, checkout, runner); err != nil {
+		return "", github.Repository{}, err
+	}
+	return checkout, repo, nil
 }
 
 func (w jobWorker) healRegisteredRepoCheckoutForRunner(ctx context.Context, job db.Job, repo github.Repository, record db.Repo, runner subprocess.Runner) (string, error) {
