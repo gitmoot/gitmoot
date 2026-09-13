@@ -407,40 +407,62 @@ func TestPolicyMergeGateKeepsRuntimeFamilyDiversityAdvisory(t *testing.T) {
 }
 
 func TestPolicyMergeGateRejectsDelegatedImplementerApprovals(t *testing.T) {
+	type childFixture struct {
+		id    string
+		agent string
+		role  string
+	}
 	for _, tc := range []struct {
 		name             string
 		implementerAgent string
 		implementerRole  string
-		childAgent       string
-		childRole        string
+		children         []childFixture
 		fallbackBranch   bool
 		wantMerge        bool
-		wantFamilyEvent  bool
+		wantFamilyEvent  string
 	}{
 		{
-			name:             "agent child is the implementer",
+			name:             "active-head agent child is the implementer",
 			implementerAgent: "implementer",
-			childAgent:       "implementer",
+			children:         []childFixture{{id: "lens", agent: "implementer"}},
 		},
 		{
-			name:            "acting-role child is the implementer",
+			name:            "fallback acting-role child is the implementer",
 			implementerRole: "gm-integrity",
-			childRole:       "gm-integrity",
+			children:        []childFixture{{id: "lens", role: "gm-integrity"}},
 			fallbackBranch:  true,
 		},
 		{
 			name:             "implementer parent with independent agent child",
 			implementerAgent: "panel-parent",
-			childAgent:       "lens-ephemeral-147330",
+			children:         []childFixture{{id: "lens", agent: "lens-ephemeral-147330"}},
 			wantMerge:        true,
-			wantFamilyEvent:  true,
+			wantFamilyEvent:  "lens",
 		},
 		{
-			name:             "independent acting-role child on fallback branch",
+			name:             "fallback independent acting-role child",
 			implementerAgent: "implementer",
-			childRole:        "gm-review",
+			children:         []childFixture{{id: "lens", role: "gm-review"}},
 			fallbackBranch:   true,
 			wantMerge:        true,
+		},
+		{
+			name:             "fallback mixed approvals with implementer first",
+			implementerAgent: "implementer",
+			children: []childFixture{
+				{id: "a-implementer", agent: "implementer"},
+				{id: "z-independent", agent: "independent-reviewer"},
+			},
+			fallbackBranch: true,
+		},
+		{
+			name:             "fallback mixed approvals with independent first",
+			implementerAgent: "implementer",
+			children: []childFixture{
+				{id: "a-independent", agent: "independent-reviewer"},
+				{id: "z-implementer", agent: "implementer"},
+			},
+			fallbackBranch: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -454,7 +476,7 @@ func TestPolicyMergeGateRejectsDelegatedImplementerApprovals(t *testing.T) {
 			implementPayload := basePayload
 			implementPayload.HeadSHA = ""
 			implementPayload.ActingOrgRole = tc.implementerRole
-			if tc.wantFamilyEvent {
+			if tc.wantFamilyEvent != "" {
 				implementPayload.EffectiveRuntime = "codex"
 			}
 			implementPayload.Result = &AgentResult{Decision: "implemented", Summary: "implemented"}
@@ -472,28 +494,37 @@ func TestPolicyMergeGateRejectsDelegatedImplementerApprovals(t *testing.T) {
 			parentPayload.Result = &AgentResult{
 				Decision: "approved",
 				Summary:  "delegating the substantive review",
-				Delegations: []Delegation{{
-					ID: "lens", Agent: "lens-reviewer", Action: "review",
-				}},
+			}
+			for _, child := range tc.children {
+				parentPayload.Result.Delegations = append(parentPayload.Result.Delegations, Delegation{
+					ID: child.id, Agent: "lens-reviewer", Action: "review",
+				})
 			}
 			insertCompletedJob(t, store, db.Job{
 				ID: "review-panel", Agent: "panel-parent", Type: "review",
 			}, parentPayload)
 
-			childPayload := basePayload
-			childPayload.ActingOrgRole = tc.childRole
-			if tc.wantFamilyEvent {
-				childPayload.EffectiveRuntime = "codex"
+			for _, child := range tc.children {
+				childPayload := basePayload
+				childPayload.ActingOrgRole = child.role
+				if tc.fallbackBranch {
+					childPayload.HeadSHA = ""
+					childPayload.DelegationID = child.id
+					childPayload.WorktreePath = "/tmp/gitmoot-integration-review/" + child.id
+				}
+				if child.id == tc.wantFamilyEvent {
+					childPayload.EffectiveRuntime = "codex"
+				}
+				childPayload.Result = &AgentResult{
+					Decision: "approved", Summary: "child approved",
+					Evidence: "executed", EvidenceDeclared: true,
+					TestsRun: []string{"focused delegated-review check"},
+				}
+				insertCompletedJob(t, store, db.Job{
+					ID: "review-panel/delegation/" + child.id, Agent: child.agent, Type: "review",
+					ParentJobID: "review-panel", DelegationID: child.id,
+				}, childPayload)
 			}
-			childPayload.Result = &AgentResult{
-				Decision: "approved", Summary: "child approved",
-				Evidence: "executed", EvidenceDeclared: true,
-				TestsRun: []string{"focused delegated-review check"},
-			}
-			insertCompletedJob(t, store, db.Job{
-				ID: "review-panel/delegation/lens", Agent: tc.childAgent, Type: "review",
-				ParentJobID: "review-panel", DelegationID: "lens",
-			}, childPayload)
 
 			mergeable := true
 			gh := &fakeMergeGateGitHub{
@@ -517,7 +548,11 @@ func TestPolicyMergeGateRejectsDelegatedImplementerApprovals(t *testing.T) {
 				t.Fatalf("delegated identity refusal reason = %q, want implementing agent", decision.Reason.Render())
 			}
 
-			events, err := store.ListJobEvents(ctx, "review-panel/delegation/lens")
+			if tc.wantFamilyEvent == "" {
+				return
+			}
+			jobID := "review-panel/delegation/" + tc.wantFamilyEvent
+			events, err := store.ListJobEvents(ctx, jobID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -527,8 +562,8 @@ func TestPolicyMergeGateRejectsDelegatedImplementerApprovals(t *testing.T) {
 					foundFamilyEvent = true
 				}
 			}
-			if foundFamilyEvent != tc.wantFamilyEvent {
-				t.Fatalf("delegated family event=%v, want %v; events=%+v", foundFamilyEvent, tc.wantFamilyEvent, events)
+			if !foundFamilyEvent {
+				t.Fatalf("no delegated family event on actual approver %s; events=%+v", jobID, events)
 			}
 		})
 	}

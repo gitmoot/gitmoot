@@ -1469,10 +1469,10 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			return mergeBlocked{reason: fmt.Sprintf("latest review round has blocking result from %s", effectiveReviewerIdentityName(job, payload))}
 		}
 	}
+	if reason := authorship.failureReason(); reason != "" {
+		return errors.New(reason)
+	}
 	if !approved {
-		if reason := authorship.failureReason(); reason != "" {
-			return errors.New(reason)
-		}
 		if len(undispatchedFanOuts) > 0 {
 			return fmt.Errorf(
 				"no review verdict in the latest round: %s declared delegations that never reported; a fan-out is a coordinator continuation, not a verdict",
