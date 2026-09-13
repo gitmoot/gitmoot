@@ -112,12 +112,30 @@ const blockerBlockedEventKind = "blocker_runtime_unavailable"
 // stays auditable without decoding payloads.
 const reviewModelFallbackEventKind = "review_model_fallback"
 
+// ompProviderTransportSignature is omp's rendering of a model provider that
+// stopped streaming mid-turn. Measured on this host (router smoke, PR #2167):
+// "omp turn failed (stopReason error): Provider stream stalled while waiting
+// for the next event". It carries no HTTP status, so neither the auth/quota nor
+// the GitHub transient matchers see it.
+const ompProviderTransportSignature = "provider stream stalled"
+
+func isOmpProviderTransportFailure(text string) bool {
+	return strings.Contains(strings.ToLower(text), ompProviderTransportSignature)
+}
+
 // nextReviewPoolModel returns the pool entry after the one currently in use.
-// Only quota and auth failures qualify: they are facts about one provider.
-// Network outages and checkout contention are not solved by a different model,
-// and a job with no pool (every non-router job) never reaches the fallback.
-func nextReviewPoolModel(payload workflow.JobPayload, class blockerClass) (string, bool) {
-	if class != blockerClassRuntimeQuota && class != blockerClassRuntimeAuth {
+// Quota, auth and a stalled provider stream qualify: each is a fact about ONE
+// provider that the next entry does not share. A GitHub/network outage or
+// checkout contention is not solved by a different model, and a job with no
+// pool (every non-router job) never reaches the fallback.
+func nextReviewPoolModel(payload workflow.JobPayload, classification blockerClassification) (string, bool) {
+	switch classification.Class {
+	case blockerClassRuntimeQuota, blockerClassRuntimeAuth:
+	case blockerClassNetworkOutage:
+		if !isOmpProviderTransportFailure(classification.Detail) {
+			return "", false
+		}
+	default:
 		return "", false
 	}
 	current := strings.TrimSpace(payload.Model)
@@ -318,8 +336,10 @@ func classifyOperationalBlocker(cause error, now time.Time) (blockerClassificati
 	// own `gh` subprocess printed a transport/DNS/5xx signature to stderr (which
 	// becomes DeliveryError text, never a TransientError value). Reuse the SAME
 	// internal/github signature set so both the typed and the delivery paths agree.
-	// Checked AFTER auth/quota so a 401/429 keeps its more specific class.
-	if github.IsTransientMessage(text) {
+	// Checked AFTER auth/quota so a 401/429 keeps its more specific class. An omp
+	// provider stream that stalls mid-turn is the same shape one hop further out:
+	// the model provider stopped answering before any verdict existed.
+	if github.IsTransientMessage(text) || isOmpProviderTransportFailure(text) {
 		return blockerClassification{Class: blockerClassNetworkOutage, RetryAt: now.Add(networkBlockerRetryDelay + blockerRetryJitter(networkBlockerRetryDelay)), Detail: detail}, true
 	}
 	return blockerClassification{}, false
@@ -643,7 +663,7 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 	// attempt budget above still bounds the whole sequence.
 	eventKind := blockerDeferredEventKind
 	previousModel := payload.Model
-	if next, ok := nextReviewPoolModel(payload, classification.Class); ok {
+	if next, ok := nextReviewPoolModel(payload, classification); ok {
 		payload.Model = next
 		retryAt = time.Now().UTC().Format(time.RFC3339Nano)
 		eventKind = reviewModelFallbackEventKind

@@ -296,16 +296,31 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 }
 
 // reviewJobStillAnswers reports whether an earlier claimed job can still answer
-// the request: it is queued or running, or it finished with a stored result.
-// A job that ended without a result answered nothing and must not block a
-// later requester.
+// the request: it is queued or running, it is blocked awaiting a human, or it
+// saved a verdict. A stored result is NOT enough on its own: the daemon's dead-
+// runtime recovery writes a synthetic `failed` result, and an agent may report
+// `failed` itself, and neither is an answer to "is this head acceptable". Such a
+// job answered nothing and must not block a later requester.
 func reviewJobStillAnswers(job db.Job) bool {
 	switch job.State {
-	case string(workflow.JobQueued), string(workflow.JobRunning):
+	case string(workflow.JobQueued), string(workflow.JobRunning), string(workflow.JobBlocked):
 		return true
 	}
 	payload, err := workflow.ParseJobPayload(job.Payload)
-	return err == nil && payload.Result != nil
+	return err == nil && reviewVerdictDecision(payload) != ""
+}
+
+// reviewVerdictDecision returns the saved verdict, or "" when the stored result
+// is not one (absent, fan-out announcement, failed, blocked, skipped).
+func reviewVerdictDecision(payload workflow.JobPayload) string {
+	if payload.Result == nil || workflow.ResultIsFanOut(payload.Result) {
+		return ""
+	}
+	switch decision := strings.ToLower(strings.TrimSpace(payload.Result.Decision)); decision {
+	case "approved", "changes_requested":
+		return decision
+	}
+	return ""
 }
 
 func finishReviewAttach(ctx context.Context, store *db.Store, output reviewRequestOutput, job db.Job, subjectKey string, opts reviewRequestOptions) (reviewRequestOutput, error) {
@@ -316,9 +331,9 @@ func finishReviewAttach(ctx context.Context, store *db.Store, output reviewReque
 	output.Model = job.Model
 	output.WatchCommand = jobWatchCommand(job.ID, opts.home)
 	if payload, err := workflow.ParseJobPayload(job.Payload); err == nil {
-		if payload.Result != nil {
+		if decision := reviewVerdictDecision(payload); decision != "" {
 			output.State = reviewRequestVerdictExists
-			output.Verdict = payload.Result.Decision
+			output.Verdict = decision
 		}
 		if len(payload.ReviewModelPool) > 0 {
 			output.ModelPool = payload.ReviewModelPool

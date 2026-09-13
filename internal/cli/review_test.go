@@ -138,8 +138,19 @@ func TestReviewRequestDeduplicatesOnExactHead(t *testing.T) {
 		t.Fatalf("security request = %+v, want its own dispatched job", security)
 	}
 
-	// The first review dies operationally with no result: the claim must yield.
-	if _, err := store.TransitionJobStateWithEvent(ctx, first.JobID, string(workflow.JobQueued), string(workflow.JobFailed), db.JobEvent{JobID: first.JobID, Kind: "failed", Message: "runtime crashed"}); err != nil {
+	// The first review dies the way the daemon's dead-runtime recovery records
+	// it: terminal failed WITH a synthetic `failed` result. That is not a
+	// verdict, so the claim must yield to the next requester.
+	deadPayload, err := workflow.ParseJobPayload(mustGetJob(t, store, first.JobID).Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadPayload.Result = &workflow.AgentResult{Decision: "failed", Summary: "daemon recovery: runtime pid is dead"}
+	deadEncoded, err := json.Marshal(deadPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TransitionJobStatePayloadWithEvent(ctx, first.JobID, string(workflow.JobQueued), string(workflow.JobFailed), string(deadEncoded), db.JobEvent{JobID: first.JobID, Kind: "failed", Message: "runtime crashed"}); err != nil {
 		t.Fatal(err)
 	}
 	third, failure := runReviewRequestJSON(t, base...)
@@ -222,9 +233,17 @@ func TestReviewModelPoolFallsBackBeforeTimedHold(t *testing.T) {
 	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
 		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
 	})
+	// First delivery: the measured omp provider-stall rendering (no HTTP status).
+	// Second delivery: a provider 429. Both are operational, so the first moves
+	// the job to the next pool entry and the second, with the pool exhausted,
+	// takes the ordinary timed hold.
 	script := fmt.Sprintf(`printf x >> %q
+if [ "$(wc -c < %q)" = "1" ]; then
+  echo "omp turn failed (stopReason error): Provider stream stalled while waiting for the next event" 1>&2
+  exit 1
+fi
 echo "HTTP 429 Too Many Requests: rate limit reached; try again in 3 seconds" 1>&2
-exit 1`, countFile)
+exit 1`, countFile, countFile)
 	seedDaemonWorkerAgent(t, store, "router-reviewer", runtime.ShellRuntime, script, []string{"review"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: "job-pool", Agent: "router-reviewer", Action: "review", Repo: "owner/repo",

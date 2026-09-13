@@ -544,7 +544,10 @@ WHERE id = ? AND state = 'waiting'`, detail, stamp, stamp, id)
 	if err := supersedePendingAwaitedFactWakesTx(ctx, tx, id, AwaitedFactStateSatisfied, now); err != nil {
 		return false, err
 	}
-	return true, insertAwaitedFactWakeTx(ctx, tx, id, waiterRole, waiterRole, subjectKind, subjectKey, AwaitedFactStateSatisfied)
+	// The satisfaction wake carries the resolution detail (verdict, findings
+	// count, executed-check count, evidence, job id): the woken requester reads
+	// the answer from the prompt rather than only learning that one exists.
+	return true, insertAwaitedFactNoticeWakeTx(ctx, tx, id, waiterRole, waiterRole, subjectKind, subjectKey, AwaitedFactStateSatisfied, "", 0, detail)
 }
 
 func supersedePendingAwaitedFactWakesTx(ctx context.Context, tx *sql.Tx, factID int64, terminalState string, now time.Time) error {
