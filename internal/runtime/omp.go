@@ -126,8 +126,8 @@ func (a OmpAdapter) PermissionPolicyApplication(agent Agent) PermissionPolicyApp
 //
 // always-ask returns isError:true with "requires approval but no interactive UI
 // available" for bash and write WITHOUT the write landing, and still exits 0
-// with a full agent_end envelope this adapter parses, so it restricts omp to
-// read-only tools and terminates cleanly - what a read-only policy asks for.
+// with a full agent_end envelope this adapter parses. That is required for
+// non-seat read-only jobs, which have no external filesystem boundary.
 //
 // write is the value that matches workspace-write, on TWO axes rather than one:
 // it permits editing tools while refusing shell execution AND refusing writes to
@@ -144,7 +144,16 @@ func (a OmpAdapter) PermissionPolicyApplication(agent Agent) PermissionPolicyApp
 // out-of-cwd writes on this host: it reads tools.approvalMode from operator
 // config, so its confinement is a host property this adapter cannot state. That
 // is a separate decision with its own blast radius, and it is not made here.
+//
+// A ReadOnlySeat is different: Gitmoot has already put the process inside its
+// kernel-enforced Landlock domain. OMP must use yolo there so headless shell and
+// test tools can execute; Landlock, not OMP's interactive approval UI, remains
+// the read-only boundary. Like the sibling adapters, report this as widened
+// because OMP itself is no longer applying the stored restriction.
 func ompApprovalArgs(agent Agent) (string, PermissionPolicyApplication) {
+	if agent.ReadOnlySeat {
+		return "--approval-mode=yolo", PermissionPolicyWidened
+	}
 	switch NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {
 	case AutonomyPolicyReadOnly:
 		return "--approval-mode=always-ask", PermissionPolicyApplied
