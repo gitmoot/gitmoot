@@ -986,20 +986,19 @@ an omp seat:
   **restricts** omp rather than breaking it (#1721). The adapter declares the
   relationship it produced: `applied` for the three explicit policies and
   `widened` for `auto`.
-- **OMP cross-family independence uses runtime-reported upstream-provider
+- **OMP runtime-family diversity uses runtime-reported upstream-provider
   evidence.** A successful delivery whose final runtime message identifies its
   provider and model records that provider in the append-only event ledger; the
   OMP wrapper remains `effective_runtime=omp`. Providers shared with native
   adapters compare as the same family: `openai` and `openai-codex` map to
   Codex, `anthropic` maps to Claude, and `kimi-code` maps to Kimi. Providers
   without a native adapter stay namespaced, for example `omp:devin`. Different
-  models and agent names on one provider remain the same family, while different
-  proved providers qualify as cross-family. A requested model alone, a failed or
-  historical job without provider evidence, and an in-session implementation
-  row with no provider all fail closed. Native fan-out cannot prove an OMP
-  provider before execution, so it skips those reviewers; use an explicit
-  `agent review` dispatch to run one and record evidence. Native runtime behavior
-  is unchanged.
+  models and agent names on one provider remain the same family. The comparison
+  is advisory, not an independence gate: same-family comparisons emit
+  `merge_gate_family_advisory`, while unresolved comparisons retain the
+  `merge_gate_family_unresolved` event; neither disqualifies a substantive
+  approval from a reviewer whose identity is not an implementer. Requested
+  model text alone and failed delivery are not provider evidence.
 - **Authentication depends on the seat policy.** Ordinary omp jobs use the
   profile, provider keys, or auth broker visible to the daemon. Read-only review
   and ask seats require `OMP_AUTH_BROKER_URL` as an HTTPS or loopback HTTP

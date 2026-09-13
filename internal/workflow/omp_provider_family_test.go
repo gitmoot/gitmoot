@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
@@ -182,7 +183,7 @@ func TestOmpProviderFamilyRequiresSuccessfulExecutionEvidence(t *testing.T) {
 	})
 }
 
-func TestOmpProviderFamiliesDriveMergeIndependence(t *testing.T) {
+func TestOmpProviderFamiliesInformMergeAdvisory(t *testing.T) {
 	ctx := context.Background()
 	for _, reviewerProvider := range []string{"kimi-code", "devin"} {
 		t.Run("openai versus "+reviewerProvider, func(t *testing.T) {
@@ -197,7 +198,7 @@ func TestOmpProviderFamiliesDriveMergeIndependence(t *testing.T) {
 				t.Fatal(err)
 			}
 			if same {
-				t.Fatalf("distinct proven providers were refused: %s", reason)
+				t.Fatalf("distinct proven providers produced a same-family advisory: %s", reason)
 			}
 		})
 	}
@@ -223,8 +224,8 @@ func TestOmpProviderFamiliesDriveMergeIndependence(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !same || !strings.Contains(reason, tc.nativeRuntime) {
-				t.Fatalf("OMP provider %q and native runtime %q were not one family: same=%v reason=%q", tc.ompProvider, tc.nativeRuntime, same, reason)
+			if !same || !strings.Contains(reason, tc.nativeRuntime) || !strings.Contains(reason, "advisory") {
+				t.Fatalf("OMP provider %q and native runtime %q did not produce a same-family advisory: same=%v reason=%q", tc.ompProvider, tc.nativeRuntime, same, reason)
 			}
 		})
 	}
@@ -240,12 +241,12 @@ func TestOmpProviderFamiliesDriveMergeIndependence(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !same || !strings.Contains(reason, "omp:devin") {
-			t.Fatalf("same Devin provider was not refused with evidence: same=%v reason=%q", same, reason)
+		if !same || !strings.Contains(reason, "omp:devin") || !strings.Contains(reason, "advisory") {
+			t.Fatalf("same Devin provider did not produce an advisory: same=%v reason=%q", same, reason)
 		}
 	})
 
-	t.Run("OMP reviewer cannot prove an in-session implementer provider", func(t *testing.T) {
+	t.Run("OMP reviewer reports unavailable in-session implementer provider", func(t *testing.T) {
 		store := openTestStore(t)
 		insertSucceededOmpProviderJob(t, store, "review-job", "reviewer", "review", "kimi-code/k3", "kimi-code")
 		gate := PolicyMergeGate{Store: store}
@@ -255,10 +256,154 @@ func TestOmpProviderFamiliesDriveMergeIndependence(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !same || !strings.Contains(reason, "in-session implementer") || !strings.Contains(reason, "provider") {
-			t.Fatalf("in-session provider gap did not fail closed: same=%v reason=%q", same, reason)
+		if !same || !strings.Contains(reason, "in-session implementer") || !strings.Contains(reason, "provider") || !strings.Contains(reason, "advisory") {
+			t.Fatalf("in-session provider gap did not produce an advisory: same=%v reason=%q", same, reason)
 		}
 	})
+}
+
+func TestPolicyMergeGateKeepsRuntimeFamilyDiversityAdvisory(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		implementerAgent string
+		implementerRole  string
+		implementerModel string
+		implementer      string
+		reviewerAgent    string
+		reviewerModel    string
+		reviewer         string
+		wantMerge        bool
+		wantEventKind    string
+	}{
+		{
+			name:            "OMP reviewer over acting-role implementer",
+			implementerRole: "gm-findings",
+			reviewerAgent:   "gm-review-opus",
+			reviewerModel:   "devin/swe-2",
+			reviewer:        "devin",
+			wantMerge:       true,
+			wantEventKind:   mergeGateFamilyUnresolvedEventKind,
+		},
+		{
+			name:             "reviewer is the implementer",
+			implementerAgent: "gm-review-opus",
+			implementerModel: "devin/swe-2",
+			implementer:      "devin",
+			reviewerAgent:    "gm-review-opus",
+			reviewerModel:    "devin/sonnet-4.6",
+			reviewer:         "devin",
+			wantMerge:        false,
+		},
+		{
+			name:             "same provider with independent identities",
+			implementerAgent: "gm-implementer",
+			implementerModel: "devin/swe-2",
+			implementer:      "devin",
+			reviewerAgent:    "gm-review-opus",
+			reviewerModel:    "devin/sonnet-4.6",
+			reviewer:         "devin",
+			wantMerge:        true,
+			wantEventKind:    mergeGateFamilyAdvisoryEventKind,
+		},
+		{
+			name:             "different providers with independent identities",
+			implementerAgent: "gm-implementer",
+			implementerModel: "openai-codex/gpt-5.6-sol",
+			implementer:      "openai-codex",
+			reviewerAgent:    "gm-review-opus",
+			reviewerModel:    "devin/swe-2",
+			reviewer:         "devin",
+			wantMerge:        true,
+		},
+		{
+			name:             "unresolved implementer family",
+			implementerAgent: "unregistered-implementer",
+			reviewerAgent:    "gm-review-opus",
+			reviewerModel:    "devin/swe-2",
+			reviewer:         "devin",
+			wantMerge:        true,
+			wantEventKind:    mergeGateFamilyUnresolvedEventKind,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			payload := JobPayload{
+				Repo: "gitmoot/gitmoot", Branch: "task-9", PullRequest: 9,
+				HeadSHA: "head123", TaskID: "task-9",
+			}
+
+			implementPayload := payload
+			implementPayload.HeadSHA = ""
+			implementPayload.ActingOrgRole = tc.implementerRole
+			implementPayload.EffectiveRuntime = runtime.OmpRuntime
+			implementPayload.Model = tc.implementerModel
+			implementPayload.Result = &AgentResult{Decision: "implemented", Summary: "implemented"}
+			insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: tc.implementerAgent, Type: "implement"}, implementPayload)
+			if tc.implementerAgent != "" && tc.implementer != "" {
+				seedFamilyAgent(t, store, tc.implementerAgent, runtime.OmpRuntime)
+				if err := store.AddJobEvent(ctx, db.JobEvent{
+					JobID: "implement-job", Kind: ompProviderVerifiedEventKind,
+					Runtime: runtime.OmpRuntime, Provider: tc.implementer,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			reviewPayload := payload
+			reviewPayload.ReviewRound = "review-1"
+			reviewPayload.EffectiveRuntime = runtime.OmpRuntime
+			reviewPayload.Model = tc.reviewerModel
+			reviewPayload.Result = &AgentResult{
+				Decision: "approved", Summary: "approved",
+				Evidence: "executed", EvidenceDeclared: true,
+				TestsRun: []string{"focused production-path check"},
+			}
+			insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: tc.reviewerAgent, Type: "review"}, reviewPayload)
+			seedFamilyAgent(t, store, tc.reviewerAgent, runtime.OmpRuntime)
+			if err := store.AddJobEvent(ctx, db.JobEvent{
+				JobID: "review-job", Kind: ompProviderVerifiedEventKind,
+				Runtime: runtime.OmpRuntime, Provider: tc.reviewer,
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			mergeable := true
+			gh := &fakeMergeGateGitHub{
+				pr: github.PullRequest{
+					Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+					HeadSHA: "head123", Mergeable: &mergeable,
+				},
+				status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+				checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+				mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+			}
+			gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+			decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if decision.Merged != tc.wantMerge || (len(gh.merges) == 1) != tc.wantMerge {
+				t.Fatalf("decision=%+v merges=%d, want merge=%v", decision, len(gh.merges), tc.wantMerge)
+			}
+			if !tc.wantMerge && !strings.Contains(decision.Reason.Render(), "implementing agent") {
+				t.Fatalf("identity refusal reason = %q, want implementing agent", decision.Reason.Render())
+			}
+			events, err := store.ListJobEvents(ctx, "review-job")
+			if err != nil {
+				t.Fatal(err)
+			}
+			foundFamilyEvent := ""
+			for _, event := range events {
+				if event.Kind == mergeGateFamilyAdvisoryEventKind || event.Kind == mergeGateFamilyUnresolvedEventKind {
+					foundFamilyEvent = event.Kind
+				}
+			}
+			if foundFamilyEvent != tc.wantEventKind {
+				t.Fatalf("family event=%q, want %q; events=%+v", foundFamilyEvent, tc.wantEventKind, events)
+			}
+		})
+	}
 }
 
 func insertSucceededNativeFamilyJob(t *testing.T, store *db.Store, jobID, agent, action, runtimeName string) {
