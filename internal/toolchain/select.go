@@ -267,7 +267,10 @@ func ModuleGoDirective(dir string) string {
 // safely and parsed is refused instead of selecting from go.mod and then running
 // under a different requirement.
 func WorkspaceGoRequirement(dir, gowork string) (version, effectiveGOWORK string, err error) {
-	module := ModuleGoDirective(dir)
+	module, modulePresent := goDirectiveAt(dir, "go.mod")
+	if modulePresent && module == "" {
+		return "", "off", fmt.Errorf("checkout go.mod is not a safe, valid regular module file with a go directive")
+	}
 	gowork = strings.TrimSpace(gowork)
 	if gowork == "off" {
 		return module, "off", nil

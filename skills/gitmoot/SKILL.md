@@ -365,8 +365,9 @@ installation selected from the daemon's `PATH` to satisfy the effective
 invoke a toolchain path directly or download Go into the seat cache; that
 workaround is retired. `CGO_ENABLED=0` is still required and `-race` remains
 unavailable. Exit 126 means no candidate could be safely staged or satisfy the
-workspace; the reason is on daemon stderr (`gitmoot: read-only seat toolchain:`),
-not in job events.
+workspace. A real review job records `seat.toolchain.unavailable` and blocks;
+host-specific staging detail is also written on daemon stderr as
+`gitmoot: read-only seat toolchain:`.
 
 
 Preserve existing behavior unless the job explicitly changes it. Keep work

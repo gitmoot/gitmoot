@@ -681,7 +681,7 @@ func TestStageSeatToolchainAggregatesEverySatisfyingStagingRefusal(t *testing.T)
 	}
 }
 
-func TestStageSeatToolchainContainsWorkspaceGoModRead(t *testing.T) {
+func TestStageSeatToolchainRefusesUnsafeWorkspaceGoMod(t *testing.T) {
 	installation := writeSeatToolchainFixture(t, filepath.Join(t.TempDir(), "go"), "go1.26.4")
 	t.Setenv("PATH", filepath.Join(installation, "bin"))
 
@@ -714,16 +714,15 @@ func TestStageSeatToolchainContainsWorkspaceGoModRead(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			workspace := t.TempDir()
 			test.setup(t, workspace)
-			paths := config.PathsForHome(t.TempDir())
-			staged, _, diagnostic, err := stageSeatToolchain(paths, workspace)
+			staged, _, diagnostic, err := stageSeatToolchain(config.PathsForHome(t.TempDir()), workspace)
 			if err != nil {
 				t.Fatalf("stageSeatToolchain: %v", err)
 			}
-			if strings.HasSuffix(filepath.Base(staged), toolchain.UnavailableRuntimeSuffix) {
-				t.Errorf("staged %q, want the safe local installation", staged)
+			if !strings.HasSuffix(filepath.Base(staged), toolchain.UnavailableRuntimeSuffix) {
+				t.Errorf("staged %q, want the published-unavailable command", staged)
 			}
-			if diagnostic != "" {
-				t.Errorf("diagnostic = %q, want none", diagnostic)
+			if !strings.Contains(diagnostic, "go.mod is not a safe, valid regular module file") {
+				t.Errorf("diagnostic = %q, want unsafe go.mod refusal", diagnostic)
 			}
 		})
 	}
