@@ -4401,7 +4401,7 @@ func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 	} else if ok {
 		payload = refreshed
 	}
-	checkout, err := w.checkoutForJob(ctx, job, payload, agent, jobRunner)
+	checkout, err := w.checkoutForPostDeliveryAdvance(ctx, job, payload, agent, jobRunner)
 	if err != nil {
 		// THE STRUCTURAL ROUTE (#1673). A child terminalized by the closed-PR sweep can
 		// never satisfy this preflight - the shared checkout is never on a dead PR's head

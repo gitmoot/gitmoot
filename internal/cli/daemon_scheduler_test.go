@@ -3246,6 +3246,150 @@ func TestRunQueuedJobsRecordsPostDeliveryWorkflowErrorForRetry(t *testing.T) {
 	}
 }
 
+// A terminal review's first advancement owns the real cleanup (#1827/#1940)
+// that removes its detached read-only worktree. If the merge gate returns a
+// transient error, the retry actuator must replay the persisted approval
+// through the stable registered checkout rather than chdir into the worktree
+// that the first attempt deleted.
+func TestReviewAdvancementRetrySurvivesReadOnlyWorktreeCleanup(t *testing.T) {
+	ctx := context.Background()
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
+	})
+	store := daemonWorkerStore(t)
+	registered := createDaemonWorkerGitCheckout(t, "main")
+	seedDaemonWorkerRepo(t, store, "owner/repo", registered)
+	seedDaemonWorkerAgent(t, store, "reviewer", runtime.ShellRuntime, "unused", []string{"review"}, "owner/repo")
+
+	client := gitutil.NewHostClient(registered)
+	head, err := client.HeadSHA(ctx)
+	if err != nil {
+		t.Fatalf("HeadSHA returned error: %v", err)
+	}
+	home := t.TempDir()
+	const jobID = "job-review-cleanup-retry"
+	worktree, err := workflow.DelegationWorktreePath(home, "owner/repo", jobID, "readonly-seat", 0)
+	if err != nil {
+		t.Fatalf("DelegationWorktreePath returned error: %v", err)
+	}
+	if err := client.AddDetachedWorktree(ctx, worktree, head); err != nil {
+		t.Fatalf("AddDetachedWorktree returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = client.RemoveWorktreeForce(context.Background(), worktree)
+	})
+
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID:               jobID,
+		Agent:            "reviewer",
+		Action:           "review",
+		Repo:             "owner/repo",
+		Branch:           "task-1",
+		PullRequest:      1,
+		TaskID:           "task-1",
+		HeadSHA:          head,
+		WorktreePath:     worktree,
+		ReadOnlyWorktree: true,
+	})
+	gate := &cliWorkerFakeMergeGate{err: errors.New("github unavailable")}
+	adapter := &cliWorkerFakeAdapter{
+		output: `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`,
+	}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return adapter, nil
+	}
+	var workflowCheckouts []string
+	worker.WorkflowFactory = func(checkout string) workflow.Engine {
+		workflowCheckouts = append(workflowCheckouts, checkout)
+		return workflow.Engine{
+			Store:               store,
+			MergeGate:           gate,
+			Home:                home,
+			DelegationCheckout:  registered,
+			DelegationWorktrees: client,
+		}
+	}
+
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
+		t.Fatalf("runQueuedJobs returned error: %v", err)
+	}
+	if _, err := os.Stat(worktree); !os.IsNotExist(err) {
+		events, eventsErr := store.ListJobEvents(ctx, jobID)
+		t.Fatalf("read-only worktree still exists after first advancement: stat=%v events=%+v events_err=%v", err, events, eventsErr)
+	}
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetJob returned error: %v", err)
+	}
+	if job.State != string(workflow.JobSucceeded) {
+		t.Fatalf("job state = %q, want succeeded approval preserved", job.State)
+	}
+	payload, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("ParseJobPayload returned error: %v", err)
+	}
+	if payload.Result == nil || payload.Result.Decision != "approved" || len(payload.Result.TestsRun) != 1 {
+		t.Fatalf("approval evidence after cleanup = %+v, want approved with one executed test", payload.Result)
+	}
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	for _, kind := range []string{"delegation_worktree_removed", "advance_retry"} {
+		if !daemonWorkerHasEvent(events, kind) {
+			t.Fatalf("events = %+v, want %s from real delivery/cleanup path", events, kind)
+		}
+	}
+
+	gate.err = nil
+	gate.decision = workflow.MergeDecision{Ready: true}
+	var heldKey string
+	if err := retryPendingJobAdvancements(ctx, worker, "", "", func(key string) bool {
+		heldKey = key
+		return true
+	}, newTickCandidates(store)); err != nil {
+		t.Fatalf("held retryPendingJobAdvancements returned error: %v", err)
+	}
+	if heldKey != "repo:owner/repo" {
+		t.Fatalf("retry checkout key = %q, want stable shared repo key", heldKey)
+	}
+	if gate.calls != 1 || len(workflowCheckouts) != 1 {
+		t.Fatalf("held shared checkout still advanced: gate calls=%d workflow checkouts=%v", gate.calls, workflowCheckouts)
+	}
+	if err := retryPendingJobAdvancements(ctx, worker, "", "", func(string) bool { return false }, newTickCandidates(store)); err != nil {
+		t.Fatalf("retryPendingJobAdvancements returned error: %v", err)
+	}
+	if adapter.calls != 1 {
+		t.Fatalf("adapter calls = %d, want persisted result replay without redelivery", adapter.calls)
+	}
+	if len(workflowCheckouts) != 2 || !sameCheckoutPath(workflowCheckouts[0], worktree) || !sameCheckoutPath(workflowCheckouts[1], registered) {
+		t.Fatalf("workflow checkouts = %v, want live delivery worktree then stable registered checkout", workflowCheckouts)
+	}
+	if len(gate.requests) != 2 {
+		t.Fatalf("merge gate requests = %d, want initial attempt and retry", len(gate.requests))
+	}
+	retried := gate.requests[1]
+	if retried.Repo != "owner/repo" || retried.Branch != "task-1" || retried.PullRequest != 1 ||
+		retried.HeadSHA != head || retried.TaskID != "task-1" || retried.Reviewer != "reviewer" {
+		t.Fatalf("merge gate retry context lost after cleanup: %+v", retried)
+	}
+	task, err := store.GetTask(ctx, "task-1")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	if task.State != string(workflow.TaskReadyToMerge) {
+		t.Fatalf("task state = %q, want ready_to_merge", task.State)
+	}
+	events, err = store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if !daemonWorkerHasEvent(events, "advance_retried") {
+		t.Fatalf("events = %+v, want completed advancement retry", events)
+	}
+}
+
 // TestRetryPendingJobAdvancementsDoesNotAccumulateAdvanceRetry guards the fix for
 // the unbounded job_events growth that pinned a daemon core: a job whose
 // post-delivery advancement keeps failing must NOT append a fresh advance_retry
