@@ -260,6 +260,11 @@ const maxGoModBytes int64 = 1 << 20
 // The `toolchain` line is deliberately ignored. It names a toolchain to
 // download, and a seat runs with GOTOOLCHAIN=local precisely so that no
 // download happens mid-review.
+//
+// This is intentionally not a complete go.mod parser. Go rejects block
+// comments, so an invalid file that hides `go X` inside one may produce an
+// unavailable-toolchain diagnostic instead of a syntax diagnostic; no valid
+// module can be mis-selected by that divergence.
 func ModuleGoDirective(dir string) string {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
