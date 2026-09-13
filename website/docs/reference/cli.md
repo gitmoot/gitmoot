@@ -1289,6 +1289,106 @@ instance of that name). Since **v0.5.1** a foreground `gitmoot agent ask <type>`
 forking use the **background** path. See [Running one agent's jobs
 concurrently](../concepts/agents-templates-jobs-locks.md#running-one-agents-jobs-concurrently).
 
+## Review Router
+
+`gitmoot review request` is the front door for asking for an independent review.
+The requester names the pull request; Gitmoot picks the reviewer, runtime and
+model, deduplicates on the exact head, and wakes the requester when the verdict
+is saved. It replaces hand-assembling `agent review ... --runtime omp --model
+... --no-fix-target` per seat; that lower-level form remains the engine
+underneath and is still valid for a deliberate manual dispatch.
+
+```sh
+gitmoot review request --pr 2170 [--repo owner/repo] [--purpose code|security|ui|architecture] \
+    [--head <40-hex>] [--branch <name>] [--role <org-role>] [--ttl 12h] [--reviewer <agent>] [--json]
+gitmoot review status --pr 2170 [--repo owner/repo] [--json]
+```
+
+What one request does, in order:
+
+1. Resolves the pull request's current head (or binds `--head`, which must be the
+   full 40 hex characters) and the requester role (`--role`, default
+   `GITMOOT_ORG_ROLE`; it must exist in the organization chart because it is the
+   notification destination).
+2. Claims `(repo, PR, head, purpose)` in `review_requests`. THE CLAIM ROW, NOT THE
+   JOB ROW, IS THE MUTUAL EXCLUSION: dispatch does real work (read-only worktree
+   allocation, runtime preflight, GitHub reads) before the job is enqueued, so
+   for a few seconds the winner holds a claim whose job id is not yet readable.
+   A requester arriving in that window returns `state: attached` with
+   `job_state: dispatching` rather than concluding the holder is dead. Takeover
+   asks LIVENESS, not elapsed time: the claim records the dispatching process
+   (pid, its `/proc` start-time identity, and the boot id), so a claim is taken
+   over when its job ended without a verdict, when that process is provably
+   gone, or when the claim was recorded on an earlier boot. A dispatch that is
+   merely slow — a cold PR-ref fetch, a stopped process — keeps its claim; a
+   time bound applies only where liveness cannot be evaluated at all. A
+   synthetic `failed` result, which the daemon's dead-runtime recovery writes,
+   is NOT a verdict, and neither is a verdict stored on a job that did not
+   succeed: the awaited fact is satisfied only from a succeeded transition, so
+   the router refuses to call anything else `verdict_exists`. A claim standing
+   on a real `approved`/`changes_requested` verdict returns
+   `state: verdict_exists` and spends nothing. A claim whose job DELEGATED the
+   answer — a staged-review preflight whose own result is a fan-out — is held
+   while its verdict child still runs. A different `--purpose` is a different
+   question and runs in parallel: review-loop detection matches PURPOSE as well
+   as agent and head, so a security request is not refused because a code
+   review already happened — including with one eligible reviewer or an
+   explicit `--reviewer`, where substituting a different agent is not an
+   option. A repeat of the SAME purpose by the same agent at the same head is
+   still refused, and everything outside the router carries no purpose on
+   either side, so its comparison is the historical one.
+3. Selects a registered agent with the `review` capability, WITHOUT `implement`,
+   scoped to the repository (omp-native agents first, then by name), or the
+   `--reviewer` you name. The job runs as a background review-only job on `omp`
+   with a fresh per-job session, `--no-fix-target` semantics, and the first
+   model of the purpose's pool; merge-gate independence rules apply unchanged.
+   Selection is PURPOSE-SCOPED: an agent holding a verdict of a different
+   purpose at this head is still eligible, and the refusal fires only when every
+   candidate already answered THIS purpose.
+4. Subscribes the requester to the exact-head verdict FOR THAT PURPOSE. The
+   subscription key is `owner/repo#N@sha|purpose`, so a `code` verdict cannot
+   terminally satisfy a `security` request at the same head — enforced on BOTH
+   doors: the producer resolves the purposed and bare keys in one transaction,
+   and the subscribe-time recheck matches purpose as well as head, so a waiter
+   registering after a different-purpose verdict is not satisfied by it.
+   `gitmoot org await review` keeps the bare `owner/repo#N@sha` key and its
+   any-purpose meaning, and a routed review inherits its purpose into REVIEW
+   delegation children so a staged review still answers the purposed wait —
+   scoped to review legs, because a non-review leg carrying a review purpose is
+   read by consumers keyed on review type. The wake fires from the reviewing job's own
+   state transition when the verdict is persisted, before and independently of
+   gate advancement, and it carries the decision, findings count, executed-check
+   count, evidence declaration and the `gitmoot job show <id>` command. A second
+   request by the same role keeps its original wait; two concurrent requests for
+   the same role and subject both ATTACH to the single live wait rather than one
+   failing. When the wait's `--ttl`
+   elapses it expires to the role's parent, as every awaited fact does.
+
+The request prints every hold it can see rather than leaving a requester to
+infer one: the daemon not running, the disk guard pausing dispatch, and any
+head-blind review that cannot satisfy an exact-head wait at all. `review status`
+lists each review job with head, model, verdict, evidence and the daemon's hold
+reason, and states the GATE's own capability in words — whether native
+auto-merge is enabled, or disabled by the operator kill switch, in which case
+the gate publishes status and merges nothing. An absent or not-applied gate
+marker is never an approval.
+
+Model pools are configured per purpose; an unconfigured purpose uses `code`:
+
+```toml
+[review_router]
+code         = ["devin/swe-2", "openai-codex/gpt-5.6-sol"]
+security     = ["anthropic/claude-opus-4-6", "devin/swe-2"]
+```
+
+Every entry is a provider-qualified omp model. When a delivery fails on a
+PROVIDER quota or auth error before any verdict, the daemon advances the job to
+the next pool entry and re-queues it immediately (event
+`review_model_fallback`) instead of waiting out the provider's window; with the
+pool exhausted the ordinary timed operational hold applies, and the shared
+attempt budget bounds the whole sequence. A verdict, a finding, or a product
+failure never changes the model: fallback exists for operational failure only.
+
 ## Agent Templates
 
 Install or refresh the built-in thermo review template:

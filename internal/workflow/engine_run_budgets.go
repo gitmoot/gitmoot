@@ -1264,6 +1264,19 @@ func (e Engine) delegationRequest(ctx context.Context, job db.Job, payload JobPa
 		// Inherit the coordinator's resolved risk tier (#650) so a high-risk lens
 		// child carries it for explainable escalation. Empty for every non-risk tree.
 		RiskTier: strings.TrimSpace(payload.RiskTier),
+		// #2171/#2172: the router's purpose and requester belong to the QUESTION,
+		// not to the job that happens to answer it. A staged review answers
+		// through a verdict CHILD, so a purpose that stops at the preflight
+		// leaves the purposed waiter unsatisfiable and the requester waits out
+		// its whole TTL for a verdict that was produced. Inheriting them is what
+		// makes the routed contract survive delegation.
+		// Round 3 narrowed this to review children only: the fields describe a
+		// review question, and on a non-review leg they were read by the
+		// type-blind claim walk and the model-pool fallback. Scoped by Action,
+		// the staged verdict child still inherits and nothing else does.
+		ReviewPurpose:   reviewScopedField(d.Action, payload.ReviewPurpose),
+		ReviewModelPool: reviewScopedPool(d.Action, payload.ReviewModelPool),
+		ReviewRequester: reviewScopedField(d.Action, payload.ReviewRequester),
 		// #1821: only the verdict child of a MARKED staged preflight inherits an
 		// evidence ceiling. Scoped to the marker rather than inferred from the
 		// parent's declared evidence - see stagedVerdictCeiling.
@@ -1671,4 +1684,27 @@ func (e Engine) projectedNewDelegationJobs(ctx context.Context, parentJobID stri
 // contributes 0, so the sum under-counts rather than over-counts.
 func (e Engine) sumRootDelegationTokens(ctx context.Context, rootID string) (int, error) {
 	return e.Store.SumJobTokensByRoot(ctx, rootID)
+}
+
+
+// reviewScopedField carries a review-question field into a delegation child
+// only when that child is itself a review. #2171 established that purpose and
+// requester belong to the question rather than to the job answering it; #2172
+// round 3 found that inheriting them onto non-review legs is broader than the
+// contract needs and is actively harmful to consumers keyed on review type.
+func reviewScopedField(action, value string) string {
+	if !strings.EqualFold(strings.TrimSpace(action), "review") {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}
+
+// reviewScopedPool is reviewScopedField for the model pool: a non-review child
+// must not inherit a reviewer pool, which the dispatch fallback would otherwise
+// apply to a leg that is not choosing a reviewer.
+func reviewScopedPool(action string, pool []string) []string {
+	if !strings.EqualFold(strings.TrimSpace(action), "review") {
+		return nil
+	}
+	return append([]string(nil), pool...)
 }

@@ -74,7 +74,7 @@ func TestFindRepeatedReviewersRecordsWhyItExcludedAHeadlessRow(t *testing.T) {
 	seedReviewLoopAgent(t, store, "g7-review", "codex", "gpt-5.6-sol")
 	seedHeadlessReviewVerdict(t, store, "session-review-1", "g7-review", true)
 
-	matches, err := FindRepeatedReviewers(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review"})
+	matches, err := FindRepeatedReviewers(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review"}, "")
 	if err != nil {
 		t.Fatalf("FindRepeatedReviewers: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestHeadBoundExclusionRecordDoesNotGrowPerCall(t *testing.T) {
 	seedHeadlessReviewVerdict(t, store, "session-review-1", "g7-review", true)
 
 	for i := range 5 {
-		if _, err := FindRepeatedReviewers(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review"}); err != nil {
+		if _, err := FindRepeatedReviewers(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review"}, ""); err != nil {
 			t.Fatalf("FindRepeatedReviewers call %d: %v", i, err)
 		}
 	}
@@ -137,7 +137,7 @@ func TestMakingTheExclusionLegibleNeverWritesAHead(t *testing.T) {
 	seedReviewLoopAgent(t, store, "g7-review", "codex", "gpt-5.6-sol")
 	seedHeadlessReviewVerdict(t, store, "session-review-1", "g7-review", true)
 
-	if _, err := FindRepeatedReviewers(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review"}); err != nil {
+	if _, err := FindRepeatedReviewers(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review"}, ""); err != nil {
 		t.Fatalf("FindRepeatedReviewers: %v", err)
 	}
 
@@ -175,7 +175,7 @@ func TestHeadlessNonSessionRowGetsTheWeakerReason(t *testing.T) {
 	seedReviewLoopAgent(t, store, "g7-review", "codex", "gpt-5.6-sol")
 	seedHeadlessReviewVerdict(t, store, "ordinary-review-1", "g7-review", false)
 
-	if _, err := FindRepeatedReviewers(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review"}); err != nil {
+	if _, err := FindRepeatedReviewers(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review"}, ""); err != nil {
 		t.Fatalf("FindRepeatedReviewers: %v", err)
 	}
 	messages := headBoundExclusionEvents(t, store, "ordinary-review-1")

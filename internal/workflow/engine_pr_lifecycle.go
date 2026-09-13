@@ -126,7 +126,7 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 		}
 		return e.recordPullRequestBaseline(ctx, event)
 	}
-	repeated, err := FindRepeatedReviewers(ctx, e.Store, event.Repo, event.PullRequest, event.HeadSHA, reviewers)
+	repeated, err := FindRepeatedReviewers(ctx, e.Store, event.Repo, event.PullRequest, event.HeadSHA, reviewers, "")
 	if err != nil {
 		return err
 	}

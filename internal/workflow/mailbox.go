@@ -343,6 +343,11 @@ type JobRequest struct {
 	// and the dashboard can explain an escalation. Empty (the default) for every
 	// job outside the opt-in risk-tiered path.
 	RiskTier string
+	// ReviewPurpose, ReviewModelPool and ReviewRequester are the #2171 router's
+	// selection record; see JobPayload for semantics.
+	ReviewPurpose   string
+	ReviewModelPool []string
+	ReviewRequester string
 	// StagedReviewVerdictAgent marks this job as the PREFLIGHT stage of a staged
 	// review and names the agent its verdict delegation must go to (#1821).
 	//
@@ -605,6 +610,16 @@ type JobPayload struct {
 	// selects the accurate recovery notice below instead of the generic operational
 	// retry reconciliation warning. Additive/omitempty when unset.
 	ResumedSelfDirtyWorktree bool `json:"resumed_self_dirty_worktree,omitempty"`
+	// ReviewPurpose and ReviewModelPool are written by `gitmoot review request`
+	// (#2171). The pool is the ordered provider/model list the router chose for
+	// this purpose; Model holds the entry currently in use. An operational
+	// blocker (quota/auth) advances Model to the next untried entry before the
+	// generic timed hold applies, so a verdict is never the trigger for fallback.
+	ReviewPurpose   string   `json:"review_purpose,omitempty"`
+	ReviewModelPool []string `json:"review_model_pool,omitempty"`
+	// ReviewRequester names the org role that asked for this review and is
+	// notified when the verdict is saved. Attribution only; never authorization.
+	ReviewRequester string `json:"review_requester,omitempty"`
 }
 
 // enqueuePreWriteHook fires between an anchored enqueue's ownership renewal and its
@@ -837,6 +852,9 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		Network:                  request.Network,
 		Check:                    strings.TrimSpace(request.Check),
 		CheckRetries:             request.CheckRetries,
+		ReviewPurpose:            strings.TrimSpace(request.ReviewPurpose),
+		ReviewModelPool:          compactStrings(request.ReviewModelPool),
+		ReviewRequester:          strings.TrimSpace(request.ReviewRequester),
 	})
 	if err != nil {
 		return db.Job{}, nil, err

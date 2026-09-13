@@ -106,6 +106,47 @@ const blockerExhaustedEventKind = "blocker_retries_exhausted"
 // explain a job an operator has to unblock rather than retry.
 const blockerBlockedEventKind = "blocker_runtime_unavailable"
 
+// reviewModelFallbackEventKind is recorded when a #2171 routed review advances
+// to the next model in its pool instead of waiting out a provider hold. The job
+// is re-queued immediately; the event names both models so the attempt history
+// stays auditable without decoding payloads.
+const reviewModelFallbackEventKind = "review_model_fallback"
+
+// ompProviderTransportSignature is omp's rendering of a model provider that
+// stopped streaming mid-turn. Measured on this host (router smoke, PR #2167):
+// "omp turn failed (stopReason error): Provider stream stalled while waiting
+// for the next event". It carries no HTTP status, so neither the auth/quota nor
+// the GitHub transient matchers see it.
+const ompProviderTransportSignature = "provider stream stalled"
+
+func isOmpProviderTransportFailure(text string) bool {
+	return strings.Contains(strings.ToLower(text), ompProviderTransportSignature)
+}
+
+// nextReviewPoolModel returns the pool entry after the one currently in use.
+// Quota, auth and a stalled provider stream qualify: each is a fact about ONE
+// provider that the next entry does not share. A GitHub/network outage or
+// checkout contention is not solved by a different model, and a job with no
+// pool (every non-router job) never reaches the fallback.
+func nextReviewPoolModel(payload workflow.JobPayload, classification blockerClassification) (string, bool) {
+	switch classification.Class {
+	case blockerClassRuntimeQuota, blockerClassRuntimeAuth:
+	case blockerClassNetworkOutage:
+		if !isOmpProviderTransportFailure(classification.Detail) {
+			return "", false
+		}
+	default:
+		return "", false
+	}
+	current := strings.TrimSpace(payload.Model)
+	for i, model := range payload.ReviewModelPool {
+		if model == current && i+1 < len(payload.ReviewModelPool) {
+			return payload.ReviewModelPool[i+1], true
+		}
+	}
+	return "", false
+}
+
 // runtimeUnavailableSignatures are the renderings a capability refusal actually
 // produces on this host. Measured, not guessed - every one of them appears in
 // this store's job_events:
@@ -295,8 +336,10 @@ func classifyOperationalBlocker(cause error, now time.Time) (blockerClassificati
 	// own `gh` subprocess printed a transport/DNS/5xx signature to stderr (which
 	// becomes DeliveryError text, never a TransientError value). Reuse the SAME
 	// internal/github signature set so both the typed and the delivery paths agree.
-	// Checked AFTER auth/quota so a 401/429 keeps its more specific class.
-	if github.IsTransientMessage(text) {
+	// Checked AFTER auth/quota so a 401/429 keeps its more specific class. An omp
+	// provider stream that stalls mid-turn is the same shape one hop further out:
+	// the model provider stopped answering before any verdict existed.
+	if github.IsTransientMessage(text) || isOmpProviderTransportFailure(text) {
 		return blockerClassification{Class: blockerClassNetworkOutage, RetryAt: now.Add(networkBlockerRetryDelay + blockerRetryJitter(networkBlockerRetryDelay)), Detail: detail}, true
 	}
 	return blockerClassification{}, false
@@ -611,8 +654,21 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 	retryAt := classification.RetryAt.Format(time.RFC3339Nano)
 	payload.BlockerClass = string(classification.Class)
 	payload.BlockerAttempts = attempt
-	payload.BlockerRetryAt = retryAt
 	payload.BlockerSuggestedAction = classification.SuggestedAction
+	// #2171 router fallback: a quota/auth failure on one pool entry is an
+	// operational fact about that provider, not about the review, so advance to
+	// the next untried model and re-queue immediately instead of waiting out the
+	// provider's window. Only pre-verdict operational classes qualify; the
+	// exhausted pool falls through to the timed hold unchanged, and the shared
+	// attempt budget above still bounds the whole sequence.
+	eventKind := blockerDeferredEventKind
+	previousModel := payload.Model
+	if next, ok := nextReviewPoolModel(payload, classification); ok {
+		payload.Model = next
+		retryAt = time.Now().UTC().Format(time.RFC3339Nano)
+		eventKind = reviewModelFallbackEventKind
+	}
+	payload.BlockerRetryAt = retryAt
 	// MID-DELIVERY (#532): the agent WAS delivered a prompt and may have executed side
 	// effects before the blocker cut it off, so this retry is at-least-once — clear any
 	// pre-delivery marker a prior checkout_contention hold left so Mailbox.Run still
@@ -630,9 +686,13 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 	}
 	message := fmt.Sprintf("%s: attempt %d/%d, retry at %s: %s",
 		classification.Class, attempt, maxOperationalBlockerRetries, retryAt, classification.Detail)
+	if eventKind == reviewModelFallbackEventKind {
+		message = fmt.Sprintf("%s on %s; falling back to review model %s (attempt %d/%d): %s",
+			classification.Class, previousModel, payload.Model, attempt, maxOperationalBlockerRetries, classification.Detail)
+	}
 	transitioned, err := w.Store.TransitionJobStateWithEvent(ctx, jobID, string(workflow.JobRunning), string(workflow.JobQueued), db.JobEvent{
 		JobID:   jobID,
-		Kind:    blockerDeferredEventKind,
+		Kind:    eventKind,
 		Message: message,
 	})
 	if err != nil {

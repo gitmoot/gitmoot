@@ -76,28 +76,67 @@ func ReviewVerdictSubjectKey(repo string, pullRequest int, headSHA string) (stri
 	return fmt.Sprintf("%s#%d@%s", repo, pullRequest, headSHA), nil
 }
 
+// parseReviewVerdictSubjectKey is the exact inverse of the two constructors
+// above: it accepts the bare repo#pr@head key and the purpose-scoped
+// repo#pr@head|purpose key the review router subscribes with.
 func parseReviewVerdictSubjectKey(key string) (repo string, pullRequest int, headSHA string, err error) {
 	key = strings.TrimSpace(key)
-	at := strings.LastIndexByte(key, '@')
+	base, purpose, scoped := strings.Cut(key, "|")
+	if scoped {
+		purpose = strings.ToLower(strings.TrimSpace(purpose))
+		if purpose == "" || strings.ContainsAny(purpose, "#@ \t\r\n") {
+			return "", 0, "", fmt.Errorf("invalid review verdict subject key %q", key)
+		}
+	}
+	at := strings.LastIndexByte(base, '@')
 	if at <= 0 {
 		return "", 0, "", fmt.Errorf("invalid review verdict subject key %q", key)
 	}
-	hash := strings.LastIndexByte(key[:at], '#')
+	hash := strings.LastIndexByte(base[:at], '#')
 	if hash <= 0 || hash >= at-1 {
 		return "", 0, "", fmt.Errorf("invalid review verdict subject key %q", key)
 	}
-	pullRequest, err = strconv.Atoi(key[hash+1 : at])
+	pullRequest, err = strconv.Atoi(base[hash+1 : at])
 	if err != nil {
 		return "", 0, "", fmt.Errorf("invalid review verdict subject key %q", key)
 	}
-	repo = key[:hash]
-	headSHA = key[at+1:]
+	repo = base[:hash]
+	headSHA = base[at+1:]
 	want, err := ReviewVerdictSubjectKey(repo, pullRequest, headSHA)
-	if err != nil || want != key {
+	if err != nil || want != base {
 		return "", 0, "", fmt.Errorf("invalid review verdict subject key %q", key)
 	}
 	return repo, pullRequest, headSHA, nil
 }
+
+// reviewVerdictKeyPurpose returns the purpose a subject key is scoped to, or ""
+// for the bare any-purpose key that `org await review` uses.
+func reviewVerdictKeyPurpose(key string) string {
+	_, purpose, scoped := strings.Cut(strings.TrimSpace(key), "|")
+	if !scoped {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(purpose))
+}
+
+// reviewPayloadServesPurpose reports whether a verdict answers the question a
+// waiter asked. A bare key accepts any purpose, preserving the historical
+// contract; a purposed key accepts only its own. A verdict that recorded no
+// purpose is treated as the default review purpose, so router waits and
+// pre-router verdicts still meet.
+func reviewPayloadServesPurpose(payload reviewVerdictPayload, want string) bool {
+	if want == "" {
+		return true
+	}
+	got := strings.ToLower(strings.TrimSpace(payload.ReviewPurpose))
+	if got == "" {
+		got = DefaultReviewPurpose
+	}
+	return got == want
+}
+
+// DefaultReviewPurpose is the purpose a review carries when none was recorded.
+const DefaultReviewPurpose = "code"
 
 func normalizeAwaitedFactSubscription(request AwaitedFactSubscription) (AwaitedFactSubscription, error) {
 	request.WaiterRole = strings.ToLower(strings.TrimSpace(request.WaiterRole))
@@ -142,14 +181,24 @@ func (s *Store) SubscribeAwaitedFact(ctx context.Context, request AwaitedFactSub
 	}
 	defer tx.Rollback()
 
-	result, err := tx.ExecContext(ctx, `
+	// One live wait per (role, subject) - idx_awaited_facts_live_subject. Callers
+	// dedup by reading the waiting rows first, but two concurrent requesters can
+	// both read empty and both insert. #2172 round 3: the loser surfaced the raw
+	// SQLite constraint error, which reads as a bug to the caller; the correct
+	// answer is the attach the dedup would have produced. ON CONFLICT keeps this
+	// one statement, so the resolution is atomic rather than a read-after-error
+	// that a third writer could invalidate.
+	row := tx.QueryRowContext(ctx, `
 INSERT INTO awaited_facts(waiter_role, subject_kind, subject_key, deadline)
-VALUES (?, ?, ?, ?)`, request.WaiterRole, request.SubjectKind, request.SubjectKey, request.Deadline.Format(time.RFC3339Nano))
-	if err != nil {
-		return AwaitedFact{}, nil, err
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
+VALUES (?, ?, ?, ?)
+ON CONFLICT(waiter_role, subject_kind, subject_key) WHERE state = 'waiting'
+DO UPDATE SET deadline = excluded.deadline
+RETURNING id`, request.WaiterRole, request.SubjectKind, request.SubjectKey, request.Deadline.Format(time.RFC3339Nano))
+	// RETURNING, not LastInsertId: SQLite leaves last_insert_rowid() untouched on
+	// the DO UPDATE arm, so the loser of the race would otherwise attach to some
+	// unrelated row this connection inserted earlier.
+	var id int64
+	if err := row.Scan(&id); err != nil {
 		return AwaitedFact{}, nil, err
 	}
 	detail, ok, skipped, err := canonicalAwaitedFactTx(ctx, tx, request.SubjectKind, request.SubjectKey, s.blockingSeverityFor)
@@ -189,6 +238,7 @@ func canonicalAwaitedFactTx(ctx context.Context, tx *sql.Tx, kind, key string, b
 		if err != nil {
 			return "", false, nil, err
 		}
+		wantPurpose := reviewVerdictKeyPurpose(key)
 		rows, err := tx.QueryContext(ctx, `
 SELECT id, agent, payload, externally_driven
 FROM jobs
@@ -228,7 +278,13 @@ ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 				skipped = append(skipped, HeadlessReviewSkip{JobID: jobID, ExternallyDriven: externallyDriven})
 			}
 			fact, ok := reviewVerdictFact(jobID, agent, "succeeded", payload, memoized)
-			if ok && fact.headSHA == headSHA {
+			// The recheck must answer the SAME question the subscription asks. A
+			// purpose-scoped key asks "reviewed for this purpose at this head",
+			// so matching the head alone lets a code verdict satisfy a security
+			// waiter that subscribes after it — the producer-side hole closed at
+			// resolveAwaitedReviewFactTx, reopened through the subscribe door
+			// (#2172 review round 2).
+			if ok && fact.headSHA == headSHA && reviewPayloadServesPurpose(decoded, wantPurpose) {
 				return fact.detail, true, skipped, nil
 			}
 		}
@@ -264,7 +320,17 @@ type reviewVerdictPayload struct {
 		// mailbox seam, where normalization records FanOut instead.
 		Delegations []json.RawMessage `json:"delegations"`
 		FanOut      bool              `json:"fan_out,omitempty"`
+		// Findings, TestsRun and Evidence feed the requester's wake (#2171) so a
+		// woken seat learns what the verdict rests on without a second lookup.
+		Findings []struct {
+			Severity string `json:"severity"`
+		} `json:"findings"`
+		TestsRun []string `json:"tests_run"`
+		Evidence string   `json:"evidence"`
 	} `json:"result"`
+	// ReviewPurpose scopes a #2171 router verdict to the question it answers, so
+	// a code review cannot satisfy a security waiter at the same head.
+	ReviewPurpose string `json:"review_purpose"`
 }
 
 // isFanOut reports whether a decoded review result is a coordinator announcement
@@ -289,6 +355,10 @@ type SucceededReviewVerdict struct {
 	HeadSHA  string
 	Decision string
 	Severity string
+	// ReviewPurpose is the question this verdict answered (#2171). Empty for
+	// every verdict that predates the router; consumers default it to
+	// DefaultReviewPurpose so a legacy verdict still answers a code request.
+	ReviewPurpose string
 	// EffectiveRuntime is the runtime the review job ran on, when the dispatch
 	// recorded it (#1528). Empty for jobs that predate that recording; callers
 	// resolving a runtime family fall back to the agent registry default.
@@ -357,6 +427,7 @@ ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 		verdicts = append(verdicts, SucceededReviewVerdict{
 			JobID:            strings.TrimSpace(jobID),
 			Agent:            strings.TrimSpace(agent),
+			ReviewPurpose:    strings.ToLower(strings.TrimSpace(decoded.ReviewPurpose)),
 			HeadSHA:          strings.ToLower(strings.TrimSpace(decoded.HeadSHA)),
 			Decision:         decision,
 			Severity:         strings.ToUpper(strings.TrimSpace(decoded.Result.Severity)),
@@ -410,7 +481,9 @@ func reviewVerdictFact(jobID, agent, state, payload string, blockingSeverity fun
 		!reviewseverity.Blocks(strings.ToUpper(strings.TrimSpace(decoded.Result.Severity)), blockingSeverity(decoded.Repo)) {
 		decision = "approved"
 	}
-	detail := fmt.Sprintf("review verdict %s from %s job %s at head %s", decision, strings.TrimSpace(agent), strings.TrimSpace(jobID), decoded.HeadSHA)
+	detail := fmt.Sprintf("review verdict %s from %s job %s at head %s; findings=%d executed_checks=%d evidence=%s; inspect with gitmoot job show %s",
+		decision, strings.TrimSpace(agent), strings.TrimSpace(jobID), decoded.HeadSHA,
+		len(decoded.Result.Findings), len(decoded.Result.TestsRun), firstNonEmptyString(strings.TrimSpace(decoded.Result.Evidence), "undeclared"), strings.TrimSpace(jobID))
 	return reviewVerdictObservation{repo: decoded.Repo, pullRequest: decoded.PullRequest, headSHA: decoded.HeadSHA, detail: detail}, true
 }
 
@@ -438,6 +511,10 @@ func resolveAwaitedReviewFactTx(ctx context.Context, tx *sql.Tx, jobID, agent, j
 	if strings.TrimSpace(jobType) != "review" {
 		return nil
 	}
+	var decoded reviewVerdictPayload
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		return nil
+	}
 	var fact reviewVerdictObservation
 	noticeState := ""
 	var key string
@@ -454,10 +531,6 @@ func resolveAwaitedReviewFactTx(ctx context.Context, tx *sql.Tx, jobID, agent, j
 			return nil
 		}
 	case "failed", "blocked", "cancelled":
-		var decoded reviewVerdictPayload
-		if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
-			return nil
-		}
 		var err error
 		key, err = ReviewVerdictSubjectKey(decoded.Repo, decoded.PullRequest, decoded.HeadSHA)
 		if err != nil {
@@ -467,22 +540,41 @@ func resolveAwaitedReviewFactTx(ctx context.Context, tx *sql.Tx, jobID, agent, j
 	default:
 		return nil
 	}
+	// TWO keys are resolved, and the distinction is the point. The BARE key is
+	// every historical waiter (`org await review`), which asks "is this head
+	// reviewed" and is answered by a verdict of any purpose. The PURPOSE-SCOPED
+	// key belongs to the #2171 review router, which asks "is this head reviewed
+	// FOR THIS PURPOSE": a code verdict must never terminally satisfy a security
+	// waiter, because the router deliberately runs those as separate reviews.
+	keys := []any{key}
+	purpose := strings.ToLower(strings.TrimSpace(decoded.ReviewPurpose))
+	if purpose == "" {
+		// A verdict that recorded no purpose answers the default one, matching
+		// reviewPayloadServesPurpose so the producer and the subscribe-time
+		// recheck cannot disagree about which waiters a verdict serves.
+		purpose = DefaultReviewPurpose
+	}
+	if purposed, purposeErr := ReviewRequestSubjectKey(decoded.Repo, decoded.PullRequest, decoded.HeadSHA, purpose); purposeErr == nil {
+		keys = append(keys, purposed)
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(keys)), ",")
 	rows, err := tx.QueryContext(ctx, `
-SELECT id, waiter_role
+SELECT id, waiter_role, subject_key
 FROM awaited_facts
-WHERE state = 'waiting' AND subject_kind = ? AND subject_key = ?
-ORDER BY id`, AwaitedFactSubjectReviewVerdict, key)
+WHERE state = 'waiting' AND subject_kind = ? AND subject_key IN (`+placeholders+`)
+ORDER BY id`, append([]any{AwaitedFactSubjectReviewVerdict}, keys...)...)
 	if err != nil {
 		return err
 	}
 	type target struct {
 		id   int64
 		role string
+		key  string
 	}
 	var targets []target
 	for rows.Next() {
 		var item target
-		if err := rows.Scan(&item.id, &item.role); err != nil {
+		if err := rows.Scan(&item.id, &item.role, &item.key); err != nil {
 			rows.Close()
 			return err
 		}
@@ -497,20 +589,31 @@ ORDER BY id`, AwaitedFactSubjectReviewVerdict, key)
 
 	if state == "succeeded" {
 		for _, target := range targets {
-			if _, err := satisfyAwaitedFactTx(ctx, tx, target.id, target.role, AwaitedFactSubjectReviewVerdict, key, fact.detail, now); err != nil {
+			if _, err := satisfyAwaitedFactTx(ctx, tx, target.id, target.role, AwaitedFactSubjectReviewVerdict, target.key, fact.detail, now); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 
+	// A terminal review that stored a verdict DID answer the question; only the
+	// advancement around it failed. Saying otherwise sent requesters chasing a
+	// verdict that was sitting in the payload.
 	detail := fmt.Sprintf(
 		"review job %s %s without an exact-head verdict; the awaited fact remains unresolved",
 		strings.TrimSpace(jobID), state,
 	)
+	if decoded.Result != nil {
+		if decision := strings.TrimSpace(decoded.Result.Decision); decision != "" && !decoded.isFanOut() {
+			detail = fmt.Sprintf(
+				"review job %s %s carrying verdict %s at head %s; the awaited fact remains unresolved because the job did not reach succeeded — inspect with gitmoot job show %s",
+				strings.TrimSpace(jobID), state, decision, decoded.HeadSHA, strings.TrimSpace(jobID),
+			)
+		}
+	}
 	for _, target := range targets {
 		if err := insertAwaitedFactNoticeWakeTx(
-			ctx, tx, target.id, target.role, target.role, AwaitedFactSubjectReviewVerdict, key,
+			ctx, tx, target.id, target.role, target.role, AwaitedFactSubjectReviewVerdict, target.key,
 			noticeState, jobID, lifecycleGeneration, detail,
 		); err != nil {
 			return err
@@ -535,7 +638,10 @@ WHERE id = ? AND state = 'waiting'`, detail, stamp, stamp, id)
 	if err := supersedePendingAwaitedFactWakesTx(ctx, tx, id, AwaitedFactStateSatisfied, now); err != nil {
 		return false, err
 	}
-	return true, insertAwaitedFactWakeTx(ctx, tx, id, waiterRole, waiterRole, subjectKind, subjectKey, AwaitedFactStateSatisfied)
+	// The satisfaction wake carries the resolution detail (verdict, findings
+	// count, executed-check count, evidence, job id): the woken requester reads
+	// the answer from the prompt rather than only learning that one exists.
+	return true, insertAwaitedFactNoticeWakeTx(ctx, tx, id, waiterRole, waiterRole, subjectKind, subjectKey, AwaitedFactStateSatisfied, "", 0, detail)
 }
 
 func supersedePendingAwaitedFactWakesTx(ctx context.Context, tx *sql.Tx, factID int64, terminalState string, now time.Time) error {

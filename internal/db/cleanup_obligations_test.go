@@ -149,13 +149,12 @@ func TestMigrationsUpgradeFromPreviousReleasedVersion(t *testing.T) {
 	// appended last" rather than as a merge conflict.
 	//
 	// The marker must name THIS BRANCH'S LAST migration and must be UNIQUE. The
-	// index name is unique to #2161's provider-evidence migration; the bare
-	// ALTER also appears in that migration's explanatory prose.
+	// index name is unique to #2171's review_requests claim table.
 	//
 	// It is updated by every branch that appends a migration, which is the point:
 	// the test fails until the new migration is both last and named here, so two
 	// branches cannot each believe theirs is the tail.
-	const branchMigrationMarker = "idx_job_events_provider"
+	const branchMigrationMarker = "idx_review_requests_job"
 	branchIndex := -1
 	for index, migration := range migrations {
 		if strings.Contains(migration, branchMigrationMarker) {

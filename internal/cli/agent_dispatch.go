@@ -163,7 +163,18 @@ type localAgentDispatchRequest struct {
 	// without the required audit. It is set by prepareLocalReviewTask and never
 	// persisted in the job payload.
 	ReviewTaskHeadDivergence string
-	jobRunner                subprocess.Runner
+	// JobID, when set, replaces the minted per-dispatch id. `gitmoot review
+	// request` (#2171) derives it from repo/PR/head/purpose so the jobs.id
+	// PRIMARY KEY insert is the atomic claim between concurrent requesters:
+	// exactly one caller's Enqueue succeeds; the others re-read that row and
+	// attach to it. Every other caller leaves it empty and keeps unique ids.
+	JobID string
+	// ReviewPurpose, ReviewModelPool and ReviewRequester are persisted on the
+	// payload for the router's fallback and notification; see workflow.JobPayload.
+	ReviewPurpose   string
+	ReviewModelPool []string
+	ReviewRequester string
+	jobRunner       subprocess.Runner
 }
 
 func localDispatchJobRunner(request localAgentDispatchRequest) subprocess.Runner {
@@ -526,7 +537,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	// Falling back to the shared checkout would silently drop that boundary, so
 	// allocation failure refuses both exact-head reviews and taskless background
 	// asks. Foreground and task-bearing asks keep their existing checkout policy.
-	jobID := localAgentJobID(request.Action, agent.Name)
+	jobID := firstNonEmpty(strings.TrimSpace(request.JobID), localAgentJobID(request.Action, agent.Name))
 	readOnlyWorktreePath, readOnlyWorktreeErr := maybeAllocateDispatchReadOnlyWorktree(ctx, store, request, repo.FullName(), record.CheckoutPath, jobID)
 	if dispatchReadOnlyWorktreeEligible(request) {
 		kind := "read-only ask"
@@ -727,6 +738,9 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		WorktreePath:             readOnlyWorktreePath,
 		ReadOnlyWorktree:         readOnlyWorktreePath != "",
 		ReadOnlySeat:             readOnlyWorktreePath != "",
+		ReviewPurpose:            request.ReviewPurpose,
+		ReviewModelPool:          request.ReviewModelPool,
+		ReviewRequester:          request.ReviewRequester,
 	})
 	if err != nil {
 		// #739: the read-only worktree is created on disk BEFORE Enqueue. If Enqueue
@@ -1304,7 +1318,7 @@ func prepareLocalReviewDispatchRequest(ctx context.Context, store *db.Store, rec
 			request.HeadSHA = pr.HeadSHA
 		}
 	}
-	if match, detected, err := workflow.DetectReviewLoop(ctx, store, repo.FullName(), request.PullRequest, request.HeadSHA, []string{request.Agent}); err != nil {
+	if match, detected, err := workflow.DetectReviewLoop(ctx, store, repo.FullName(), request.PullRequest, request.HeadSHA, []string{request.Agent}, request.ReviewPurpose); err != nil {
 		return localAgentDispatchRequest{}, err
 	} else if detected {
 		return localAgentDispatchRequest{}, errors.New(match.Reason())
