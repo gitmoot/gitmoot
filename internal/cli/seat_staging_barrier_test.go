@@ -30,7 +30,7 @@ import (
 func warmSeatStaging(t *testing.T, home string) {
 	t.Helper()
 	paths := config.PathsForHome(home)
-	if _, _, diagnostic, err := stageSeatToolchain(paths); err != nil {
+	if _, _, diagnostic, err := stageSeatToolchain(paths, ""); err != nil {
 		t.Logf("warmSeatStaging: toolchain not pre-staged (%v); the test window will pay the copy", err)
 	} else if diagnostic != "" {
 		t.Logf("warmSeatStaging: toolchain diagnostic: %s", diagnostic)

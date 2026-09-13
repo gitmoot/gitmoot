@@ -528,12 +528,14 @@ func (f *cliWorkerFakeAdapter) observedContextCancel() bool {
 
 type cliWorkerFakeMergeGate struct {
 	calls    int
+	requests []workflow.MergeRequest
 	decision workflow.MergeDecision
 	err      error
 }
 
-func (f *cliWorkerFakeMergeGate) Evaluate(context.Context, workflow.MergeRequest) (workflow.MergeDecision, error) {
+func (f *cliWorkerFakeMergeGate) Evaluate(_ context.Context, request workflow.MergeRequest) (workflow.MergeDecision, error) {
 	f.calls++
+	f.requests = append(f.requests, request)
 	if f.err != nil {
 		return workflow.MergeDecision{}, f.err
 	}

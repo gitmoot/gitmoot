@@ -3,6 +3,7 @@ package workflow
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -489,7 +490,7 @@ const minEvidenceTokenChars = 8
 func reviewNamesSomethingItRan(r AgentResult) bool {
 	for _, entries := range [][]string{r.TestsRun, r.ChangesMade} {
 		for _, entry := range entries {
-			if namesARunnableTarget(entry) {
+			if entryClaimsExecution(entry) {
 				return true
 			}
 		}
@@ -645,4 +646,211 @@ func explain(pass bool, why string) string {
 		return ""
 	}
 	return why
+}
+
+// executionDenials are the phrases with which an agent states that a command did
+// NOT run. They are matched on the whole entry, lowercased, so a target named
+// inside one of them cannot lift the evidence ceiling.
+//
+// THE LIST IS DELIBERATELY NARROW: only phrases that deny the command STARTED.
+// "failed" is absent, because "go test ./... -> FAIL" is a genuine execution
+// with a failing result, and clamping that would refuse a real finding. So is
+// "skipped", because a suite that ran with skips still ran.
+//
+// The false-positive direction is safe and the false-negative one is not: an
+// entry wrongly matched here keeps the CLAMPED ceiling, which understates a
+// preflight's evidence, while an entry wrongly accepted removes the ceiling on
+// the strength of a sentence saying nothing ran.
+// executionNegation matches a phrase with which a reviewer denies that something
+// ran. A clause containing one is not execution evidence, WHEREVER IT SITS.
+//
+// FOURTH ROUND, AND THE ORDERING RULE WAS THE SURFACE (#2029 round seven, P1).
+// The history is the argument for the shape:
+//
+//	round 5  a literal list         defeated by the passive "could not be executed"
+//	round 6  a 32-character window  defeated by a 41-character same clause
+//	round 7  first-verb anchoring   defeated by "go run /tmp/tool was not executed",
+//	                                where the FIRST verb is part of the COMMAND, so
+//	                                the prefix holds no negation and the later
+//	                                "executed" is never examined
+//
+// Each fix described the sentence more precisely and each was beaten by a
+// sentence it did not anticipate. A rule needing a fourth revision is not
+// converging on the right threshold; it is signalling that the property is not
+// positional at all. So position is gone: any denial phrase in the clause
+// disqualifies the clause.
+//
+// THE TRADEOFF IS DELIBERATE AND IT IS THE SAFE DIRECTION. "go test ./... ran,
+// though the linter did not run" is now clamped even though it reports a real
+// execution. A false positive KEEPS the evidence ceiling, costing a preflight
+// some permissiveness. A false negative REMOVES the ceiling on the strength of a
+// sentence saying nothing ran, which is the defect this predicate exists to stop.
+// Three rounds were spent buying back permissiveness with ordering rules, and
+// each purchase reopened the unsafe direction.
+//
+// "failed" AND "skipped" ARE PHRASES, NOT WORDS, and that distinction is what
+// keeps a failing run counted. "go test ./... -> FAIL" and "ok (3 skipped)" are
+// executions; "failed to run" and "skipped running" are denials. Matching the
+// bare words would clamp every failing suite in the store.
+// #2029 round eight. TWO CHANGES, BOTH DECIDED BY MEASURING THE LEDGER RATHER
+// THAN BY ARGUING ABOUT SENTENCES. 23,841 real tests_run entries on this box.
+//
+// ADDED, and the first is a REGRESSION I INTRODUCED. The literal list this regex
+// replaced carried "none run" and "nothing to run"; the regex dropped them,
+// because "none" does not contain "not". 129 entries in the ledger are denials
+// only those phrases catch, and they are the single most common denial shape a
+// read-only review seat writes: "NONE run in this seat - sandbox denies go".
+// Exactly 1 of the 129 is contaminated, and it is a build that DID run and
+// failed on a denied header, so the clamp there is conservative rather than
+// wrong.
+//
+// NOT ADDED, and this is the part worth reading before extending the list again.
+// The reviewer proposed "blocked", from "sandbox blocked go test ./... before
+// execution". Measured: "blocked" appears in 243 entries and would newly clamp
+// 164, and the overwhelming majority use it as the OUTCOME UNDER TEST - "stats
+// --gitmoot -> blocked JSON", "deploy --target r2 ... returned blocked Gitmoot
+// result". A repository whose product emits "blocked" as a result state cannot
+// use that word as a denial marker. Same for "prevented" and "before execution":
+// both are contaminated in this store by real passing entries.
+var executionNegation = regexp.MustCompile(
+	`\bnot\b|\bnever\b|n't\b|\bunable to\b|\bfailed to\b|\bskipp(?:ed|ing) (?:run|execut)` +
+		`|\bnone runn?(?:able)?\b|\bnothing to run\b|\bsandbox deni(?:es|ed)\b` +
+		// #2029 round nine. THE CONTEXTUAL PHRASE, NOT THE BARE WORD. Round eight
+		// refused "blocked" on measurement - 246 ledger entries carry it and 167
+		// would be newly clamped, overwhelmingly as the OUTCOME UNDER TEST. That
+		// census ruled out the WORD and never measured the PHRASE. Measured now:
+		// "sandbox blocked" appears in ZERO entries, so it clamps nothing that
+		// exists and cannot contaminate, while closing the reviewer's probe
+		// "sandbox blocked go test ./... before execution".
+		//
+		// The distinction is the reusable part: a word a product emits as a result
+		// state is unusable as a denial marker, and the same word in a phrase
+		// naming the SANDBOX as the actor is not.
+		// #2029 round ten. THE PASSIVE OF THE SAME SENTENCE, and the same lesson
+		// I drew about negation-versus-verb in round eight: ORDER IS NOT THE
+		// PROPERTY. "sandbox blocked go test ./..." and "go test ./... was blocked
+		// by the sandbox" are one claim in two voices, and round nine added only
+		// the active one.
+		//
+		// MEASURED BEFORE ADDING, and two cheaper generalisations were REJECTED on
+		// the numbers rather than on taste:
+		//
+		//   blocked+sandbox co-occurring anywhere: 11 newly clamped, several of
+		//   them real executions ("go build ./... -> rc=0 ... the cgo path is
+		//   blocked by the sandbox").
+		//
+		//   the same pair scoped to one CLAUSE: still 8, and one is a full test
+		//   run - "go test ... ./internal/cli/... -> fail, 4/~180 tests failing".
+		//   Clamping a real suite run is the expensive direction.
+		//
+		// The bounded phrase clamps exactly one further ledger entry, and that one
+		// is a genuine denial: "Initial probe of ... was blocked by this seat's
+		// sandbox".
+		//
+		// THE WINDOW IS A LENGTH BOUND ONLY. It was first written as
+		// [^.;:]{0,30}, to keep the two words inside one clause - and a mutant
+		// widening it to .{0,30} SURVIVED every fixture, because deniesExecution
+		// has already split the entry into clauses before this pattern runs. The
+		// character class could never fail, so it was removed rather than pinned
+		// by a test that would have asserted clause splitting while appearing to
+		// assert the window.
+		`|\bsandbox blocked\b|\bblocked by\b.{0,30}\bsandbox\b`)
+
+// THE LIST CANNOT BE COMPLETED, AND THE TWO OBVIOUS ESCAPES ARE MEASURABLY SHUT.
+//
+// Round five was a literal list, six a character window, seven first-verb
+// anchoring, eight this. Each round the reviewer supplied a sentence the rule
+// missed, which is the signature of an unbounded class. Both structural exits
+// were measured on the live ledger and both are closed:
+//
+//   REQUIRE A POSITIVE OUTCOME TOKEN instead of blacklisting denials. 10,568 of
+//   23,841 entries (45 percent) are bare commands - "python3 -m unittest
+//   discover -s tests", "bash scripts/check_parallel_demo.sh" - with no "ok",
+//   no "PASS", no count. Requiring an outcome refuses half of all genuine
+//   execution evidence.
+//
+//   USE THE STRUCTURED FIELDS instead of prose. AgentResult carries Evidence,
+//   and the ledger row carries ExecutedCommands and ExecutedCount. Of 3,828
+//   review results in this store, 393 set evidence and ZERO set either executed
+//   field. The structured channel exists and is unpopulated.
+//
+// So the honest statement of what this predicate is: a best-effort filter over
+// producer prose, complete for the shapes measured here and defeatable by a
+// sentence nobody has written yet. The durable fix is a PRODUCER-SIDE CONTRACT -
+// a stage declares execution in a field, not in a paragraph - which is a change
+// to every runtime and does not belong in this PR.
+
+// entryClaimsExecution reports whether ONE evidence entry is proof that a
+// command ran. It is the question both evidence callers actually ask, and it is
+// the composition of two separate facts: the entry names something runnable, and
+// it does not state that the thing was not run.
+//
+// WHY THIS IS NOT FOLDED INTO namesARunnableTarget (#2029 round five, P1).
+// The previous round reused that helper because it already answered "is this a
+// runnable target", and reusing it was right for the question it answers. The
+// reviewer then showed it does not answer the question the CALLERS need: a
+// string can name a perfectly real target inside a sentence saying the target
+// was not run - "could not run go test ./..." carries "./..." - so shape alone
+// accepted the exact entry a stage writes when it ran nothing.
+//
+// namesARunnableTarget stays correct and unchanged for its own question; the
+// evidence question is composed here, once, so the two callers cannot drift into
+// separate conventions.
+func entryClaimsExecution(entry string) bool {
+	return !deniesExecution(entry) && namesARunnableTarget(entry)
+}
+
+// deniesExecution reports whether an entry states that nothing ran.
+func deniesExecution(entry string) bool {
+	// THE DENIAL MUST SIT IN THE CLAUSE THAT NAMES THE TARGET. Checking any
+	// clause was too broad and the clause-boundary fixture caught it: in "this is
+	// not a regression; go test ./... run clean" the negation belongs to a clause
+	// that names nothing runnable, and the command after the boundary really did
+	// run.
+	//
+	// So the question is per clause, and an entry claims an execution when SOME
+	// clause names a runnable target with no denial in it.
+	for _, clause := range executionClauses(entry) {
+		if namesARunnableTarget(clause) && !executionNegation.MatchString(clause) {
+			return false
+		}
+	}
+	return true
+}
+
+// executionClauses normalises an entry and splits it into clauses.
+//
+// IT SPLITS ON TOKENS, NOT ON CHARACTERS, and the fixtures forced that twice.
+// Splitting on every '.' shatters "./..." - the very target the clause is about
+// - leaving a fragment that names a target with no negation in it, which reads
+// as an execution. Splitting on ". " does the same thing, because "./..." is
+// itself followed by a space. And splitting on ':' anywhere would cut
+// "internal/run.go:10" in half.
+//
+// A clause ends at a token that ENDS with '.', ';' or ':' and is otherwise
+// ordinary prose: no '/' and no interior '.'. "stage." ends a clause;
+// "./...", "internal/run.go:10" and "go1.26.4" do not.
+func executionClauses(entry string) []string {
+	var out []string
+	var clause []string
+	flush := func() {
+		if len(clause) > 0 {
+			out = append(out, strings.Join(clause, " "))
+			clause = nil
+		}
+	}
+	for _, field := range strings.Fields(strings.ToLower(entry)) {
+		clause = append(clause, field)
+		core := strings.TrimRight(field, ".;:")
+		if len(core) == len(field) {
+			continue
+		}
+		if strings.ContainsAny(core, "/.") {
+			// A path, package target or version - not a sentence ending.
+			continue
+		}
+		flush()
+	}
+	flush()
+	return out
 }

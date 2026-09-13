@@ -1240,7 +1240,7 @@ func retryPendingJobAdvancements(ctx context.Context, worker jobWorker, repoFilt
 		if !needsRetry {
 			continue
 		}
-		if checkoutHeld != nil && checkoutHeld(queuedJobCheckoutKey(ctx, worker.Store, job)) {
+		if checkoutHeld != nil && checkoutHeld(pendingAdvancementCheckoutKey(ctx, worker.Store, job)) {
 			continue
 		}
 		if err := worker.advanceJob(ctx, job); err != nil {
@@ -3237,6 +3237,18 @@ func queuedJobCheckoutKey(ctx context.Context, store *db.Store, job db.Job) stri
 		return "worktree:" + path
 	}
 	return "repo:" + payload.Repo
+}
+
+// pendingAdvancementCheckoutKey matches checkoutForPostDeliveryAdvance. Live
+// review delivery stays isolated under worktree:<path>; after delivery, an
+// ordinary review advances through the registered checkout and must serialize
+// against other users of that shared repository.
+func pendingAdvancementCheckoutKey(ctx context.Context, store *db.Store, job db.Job) string {
+	payload, err := daemonJobPayload(job)
+	if err == nil && strings.TrimSpace(payload.Repo) != "" && reviewAdvanceUsesRegisteredCheckout(job, payload) {
+		return "repo:" + payload.Repo
+	}
+	return queuedJobCheckoutKey(ctx, store, job)
 }
 
 func queuedJobTaskWorktreePath(ctx context.Context, store *db.Store, payload workflow.JobPayload) (string, bool) {

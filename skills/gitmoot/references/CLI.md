@@ -587,15 +587,17 @@ A staged review splits one review into a cheap preflight stage that answers
 review. `staged_review_verdict_agent` names the agent that would run the
 verdict stage.
 
-**This key is a declaration, not yet a dispatcher.** At this commit nothing
-reads it outside its own tests: the staged dispatch is a separate change, and
-until it lands no repo dispatches a staged review whether it declared an agent
-or not. The key lands first because a dispatcher cannot be told which agent to
-use before there is a place to say so.
+Local `agent review` and review-resolved `agent run` dispatch honor this key:
+they run the requested reviewer as a **preflight** parent. The parent checks
+whether the review can run and delegates exactly once to the configured verdict
+agent. The preflight is marked so its result cannot be consumed as the final
+review verdict. Daemon fanout, heartbeat, pipeline, comment-command, and
+externally recorded session reviews do not consult this key; they keep their
+ordinary review paths.
 
 It is **off by default** and there is deliberately **no default and no fallback
-list**. A repo that has not declared one cannot have a staged review dispatched
-to it once the dispatcher exists, and having a `[repos.*]` section for some
+list**. A repo that has not declared one uses the ordinary, unstaged review
+path, and having a `[repos.*]` section for some
 other key is **not** a declaration. That is the campaign's non-fallback rule
 applied to the choice of reviewer itself - a strong reviewer that cannot be
 identified must never degrade to *the cheap stage approved it* - so the
@@ -1051,16 +1053,19 @@ an omp seat:
   the run, the envelope is complete and only the final answer is missing, so the
   parser reads the FINAL assistant message rather than the last one that carried
   text — an earlier work note is never handed back as the job's answer.
-- **`--policy` selects the `--approval-mode` value,** and the flag is always
-  present for **determinism** - omitting it would inherit whatever
+- **`--policy` selects the ordinary `--approval-mode` value,** and the flag is
+  always present for **determinism** - omitting it would inherit whatever
   `tools.approvalMode` the host config carries. `read-only` maps to
   `always-ask`, `workspace-write` maps to `write`, and `auto` plus
   `danger-full-access` map to `yolo`. Measured on omp 17.2.4 headless,
   `always-ask` lets `read`/`grep`/`glob` succeed and refuses
   `bash`/`write`, with the process exiting 0 and a full `agent_end`, so it
-  **restricts** omp rather than breaking it (#1721). The adapter declares the
-  relationship it produced: `applied` for the three explicit policies and
-  `widened` for `auto`.
+  **restricts** omp rather than breaking it (#1721). A kernel-enforced
+  `ReadOnlySeat` is the exception: Gitmoot wraps the delivery in Landlock and
+  passes `yolo` so headless shell and test tools can run. The adapter declares
+  that override `widened`; Landlock remains the write boundary. Non-seat
+  `read-only` keeps `always-ask`. The other three explicit policy mappings are
+  declared `applied`, while `auto` is `widened`.
 - **OMP cross-family independence uses runtime-reported upstream-provider
   evidence.** A successful delivery whose final runtime message identifies its
   provider and model records that provider in the append-only event ledger; the
