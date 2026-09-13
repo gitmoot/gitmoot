@@ -72,7 +72,10 @@ func DetectReviewLoop(ctx context.Context, store *db.Store, repo string, pullReq
 }
 
 // FindRepeatedReviewers returns exact-head verdict evidence for each requesting
-// agent that has already reviewed the head. The result preserves requester
+// agent that has already reviewed the head FOR THE REQUESTED PURPOSE (#2171).
+// A verdict answering a different purpose is a different question and is not
+// loop evidence; an empty purpose on either side means DefaultReviewPurpose, so
+// every pre-router caller compares exactly as it did before. The result preserves requester
 // order and performs one verdict query for the whole native roster.
 func FindRepeatedReviewers(ctx context.Context, store *db.Store, repo string, pullRequest int, headSHA string, requestingAgents []string, purpose string) ([]ReviewLoopMatch, error) {
 	repo = strings.ToLower(strings.TrimSpace(repo))

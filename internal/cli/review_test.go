@@ -500,7 +500,7 @@ func TestReviewVerdictRequiresASucceededJob(t *testing.T) {
 	if decision := reviewVerdictDecision(job, stored); decision != "" {
 		t.Fatalf("verdict from a failed job = %q, want none: the awaited fact would never be satisfied", decision)
 	}
-	if reviewJobStillAnswers(ctx, store, job) {
+	if reviewJobStillAnswers(ctx, store, job, testClaimSubject(t, head), time.Now().UTC()) {
 		t.Fatal("a failed job with a stored verdict still pins the claim; a later requester can never dispatch")
 	}
 }
@@ -650,7 +650,7 @@ func stagedPreflightClaim(t *testing.T, store *db.Store, head string, childType 
 func TestStagedPreflightKeepsItsClaimWhileTheVerdictChildRuns(t *testing.T) {
 	_, store, head := reviewRouterHome(t)
 	job := stagedPreflightClaim(t, store, head, "review", string(workflow.JobRunning), "")
-	if !reviewJobStillAnswers(context.Background(), store, job) {
+	if !reviewJobStillAnswers(context.Background(), store, job, testClaimSubject(t, head), time.Now().UTC()) {
 		t.Fatal("a staged preflight with a running review child does not answer, so its claim is stealable; the fan-out tree walk is gone")
 	}
 }
@@ -661,7 +661,7 @@ func TestStagedPreflightKeepsItsClaimWhileTheVerdictChildRuns(t *testing.T) {
 func TestStagedPreflightIsAnsweredByItsVerdictChild(t *testing.T) {
 	_, store, head := reviewRouterHome(t)
 	job := stagedPreflightClaim(t, store, head, "review", string(workflow.JobSucceeded), "approved")
-	if !reviewJobStillAnswers(context.Background(), store, job) {
+	if !reviewJobStillAnswers(context.Background(), store, job, testClaimSubject(t, head), time.Now().UTC()) {
 		t.Fatal("a staged preflight whose review child saved a verdict does not answer; the tree is not being consulted")
 	}
 }
@@ -674,7 +674,7 @@ func TestStagedPreflightIsAnsweredByItsVerdictChild(t *testing.T) {
 func TestStagedPreflightNonReviewChildCannotPinTheClaim(t *testing.T) {
 	_, store, head := reviewRouterHome(t)
 	job := stagedPreflightClaim(t, store, head, "implement", string(workflow.JobRunning), "approved")
-	if reviewJobStillAnswers(context.Background(), store, job) {
+	if reviewJobStillAnswers(context.Background(), store, job, testClaimSubject(t, head), time.Now().UTC()) {
 		t.Fatal("a running implement child is answering a REVIEW question: the claim is pinned forever behind a leg that can never satisfy the verdict wait")
 	}
 }
@@ -764,7 +764,7 @@ func TestStagedPreflightWalkSurvivesACorruptedParentCycle(t *testing.T) {
 	makeJobAFanOutAnnouncement(t, store, job.ID+"/delegation/leg")
 	forgeParentCycle(t, store, job.ID, job.ID+"/delegation/leg")
 	done := make(chan bool, 1)
-	go func() { done <- reviewJobStillAnswers(ctx, store, job) }()
+	go func() { done <- reviewJobStillAnswers(ctx, store, job, testClaimSubject(t, head), time.Now().UTC()) }()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
@@ -905,7 +905,7 @@ func TestStagedPreflightSeesAReviewGrandchildUnderANonReviewChild(t *testing.T) 
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !reviewJobStillAnswers(ctx, store, job) {
+	if !reviewJobStillAnswers(ctx, store, job, testClaimSubject(t, head), time.Now().UTC()) {
 		t.Fatal("a RUNNING review grandchild under a non-review leg is invisible: the claim is stealable while the real reviewer works")
 	}
 }
@@ -930,7 +930,121 @@ func TestStagedPreflightWithNoChildrenYetIsNotFinished(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reviewJobStillAnswers(ctx, store, job) {
+	if !reviewJobStillAnswers(ctx, store, job, testClaimSubject(t, head), time.Now().UTC()) {
 		t.Fatal("a fan-out whose children are not enqueued yet reads as finished, so a duplicate reviewer is dispatched into live review capacity")
+	}
+}
+
+// testClaimSubject is the question the staged-preflight fixtures are minted
+// for: owner/repo#12 at this head, default purpose.
+func testClaimSubject(t *testing.T, head string) reviewClaimSubject {
+	t.Helper()
+	key, err := db.ReviewRequestSubjectKey("owner/repo", 12, head, db.DefaultReviewPurpose)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subject, ok := reviewSubjectFromClaim(db.ReviewRequest{SubjectKey: key, Purpose: db.DefaultReviewPurpose})
+	if !ok {
+		t.Fatalf("subject from claim key %q failed to parse", key)
+	}
+	return subject
+}
+
+// #2176 F2 (P2). The walk was subject-blind: a non-review leg may legitimately
+// delegate a review of a DIFFERENT pull request or head, and that verdict
+// counted as answering THIS claim. A stored verdict never stops answering, so
+// the claim pinned forever while its awaited fact - keyed to this exact head
+// and purpose - could never be satisfied by it.
+func TestClaimWalkIgnoresAForeignSubjectVerdictUnderANonReviewLeg(t *testing.T) {
+	_, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	job := stagedPreflightClaim(t, store, head, "implement", string(workflow.JobSucceeded), "approved")
+	middle := job.ID + "/delegation/leg"
+	makeJobAFanOutAnnouncement(t, store, middle)
+	foreign, err := json.Marshal(map[string]any{
+		"repo": "owner/repo", "pull_request": 99, "head_sha": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+		"review_purpose": "code",
+		"result":         map[string]any{"decision": "approved", "evidence": "executed"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: middle + "/delegation/foreign", Agent: "opus-reviewer", Type: "review",
+		State: string(workflow.JobSucceeded), Payload: string(foreign), Repo: "owner/repo", ParentJobID: middle,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if reviewJobStillAnswers(ctx, store, job, testClaimSubject(t, head), time.Now().UTC()) {
+		t.Fatal("a verdict for a DIFFERENT pull request and head is answering this claim: it pins forever while the awaited fact can never be satisfied")
+	}
+}
+
+// #2176 F1 (P2). The not-yet-enqueued grace had no release. A refused staged
+// preflight is rewritten to FAILED with its fan-out result kept verbatim, and
+// no child is ever enqueued - so the grace pinned the claim permanently. A
+// terminal-but-not-succeeded fan-out gets no grace at all.
+func TestChildlessFanOutOnAFailedJobGetsNoGrace(t *testing.T) {
+	_, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	announcement, err := json.Marshal(workflow.JobPayload{
+		Repo: "owner/repo", PullRequest: 12, HeadSHA: head, ReviewPurpose: "code",
+		Result: &workflow.AgentResult{Decision: "approved", FanOut: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "refused-preflight", Agent: "opus-reviewer", Type: "review", State: string(workflow.JobFailed), Payload: string(announcement), Repo: "owner/repo"}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.GetJob(ctx, "refused-preflight")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reviewJobStillAnswers(ctx, store, job, testClaimSubject(t, head), time.Now().UTC()) {
+		t.Fatal("a FAILED fan-out whose children can never arrive is holding the claim: nothing releases it, so every future review of this head is blocked")
+	}
+}
+
+// And the same grace must expire even on a succeeded job, or a permanently
+// refused advance pins the claim just as hard, one state over.
+func TestChildlessFanOutGraceExpiresWithTheDispatchWindow(t *testing.T) {
+	_, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	announcement, err := json.Marshal(workflow.JobPayload{
+		Repo: "owner/repo", PullRequest: 12, HeadSHA: head, ReviewPurpose: "code",
+		Result: &workflow.AgentResult{Decision: "approved", FanOut: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "stalled-preflight", Agent: "opus-reviewer", Type: "review", State: string(workflow.JobSucceeded), Payload: string(announcement), Repo: "owner/repo"}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.GetJob(ctx, "stalled-preflight")
+	if err != nil {
+		t.Fatal(err)
+	}
+	subject := testClaimSubject(t, head)
+	if !reviewJobStillAnswers(ctx, store, job, subject, time.Now().UTC()) {
+		t.Fatal("a fresh childless fan-out lost its grace: a duplicate reviewer is dispatched while children are seconds away")
+	}
+	late := time.Now().UTC().Add(2 * reviewRequestDispatchWindow)
+	if reviewJobStillAnswers(ctx, store, job, subject, late) {
+		t.Fatal("the grace never expires: a fan-out whose children never arrive holds the claim forever")
+	}
+}
+
+// #2176 F3 (P3). The not-yet-enqueued grace existed at depth 1 but not deeper,
+// so a nested fan-out under a non-review leg lost its review grandchild in the
+// window before dispatch inserts it - the exact defect F1 closed, one level down.
+func TestNestedFanOutUnderANonReviewLegKeepsTheNotYetEnqueuedGrace(t *testing.T) {
+	_, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	job := stagedPreflightClaim(t, store, head, "implement", string(workflow.JobSucceeded), "approved")
+	middle := job.ID + "/delegation/leg"
+	makeJobAFanOutAnnouncement(t, store, middle)
+	if !reviewJobStillAnswers(ctx, store, job, testClaimSubject(t, head), time.Now().UTC()) {
+		t.Fatal("a nested fan-out with no children yet reads as finished: takeover dispatches a duplicate while the review grandchild is seconds away")
 	}
 }

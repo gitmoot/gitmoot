@@ -87,3 +87,36 @@ func TestSubscribeAwaitedFactAttachKeepsTheLongerDeadline(t *testing.T) {
 		t.Fatalf("deadline shortened to %s, want the winner's %s: a joiner must not expire an existing wait early", got, long)
 	}
 }
+
+// #2176 F5. The deadline must also EXTEND, not merely refuse to shrink. The
+// reviewer proved this direction had zero protection: mutating the CASE to
+// "keep the existing deadline always" passed the entire suite, and that is the
+// behaviour a joiner asking for LONGER actually needs.
+func TestSubscribeAwaitedFactAttachExtendsAShorterDeadline(t *testing.T) {
+	store := openAwaitedFactTestStore(t)
+	ctx := context.Background()
+	key, err := ReviewRequestSubjectKey("owner/repo", 12, "6adc4db105adc8214cd3de09325f8f7d2289cea8", "code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	short := time.Now().UTC().Add(time.Minute)
+	first, _, err := store.SubscribeAwaitedFact(ctx, AwaitedFactSubscription{WaiterRole: "joltra", SubjectKind: AwaitedFactSubjectReviewVerdict, SubjectKey: key, Deadline: short})
+	if err != nil {
+		t.Fatal(err)
+	}
+	long := time.Now().UTC().Add(2 * time.Hour)
+	if _, _, err := store.SubscribeAwaitedFact(ctx, AwaitedFactSubscription{WaiterRole: "joltra", SubjectKind: AwaitedFactSubjectReviewVerdict, SubjectKey: key, Deadline: long}); err != nil {
+		t.Fatal(err)
+	}
+	var deadline string
+	if err := store.db.QueryRowContext(ctx, "SELECT deadline FROM awaited_facts WHERE id = ?", first.ID).Scan(&deadline); err != nil {
+		t.Fatal(err)
+	}
+	got, err := time.Parse(time.RFC3339Nano, deadline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Before(long.Add(-time.Second)) {
+		t.Fatalf("deadline = %s, want it extended to %s: a joiner asking for longer is expired at the first waiter's much earlier deadline", got, long)
+	}
+}

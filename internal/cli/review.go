@@ -333,8 +333,57 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 // eligible while the verdict child was still running and a second reviewer was
 // dispatched. The question is answered by the tree, so the tree is what must be
 // consulted.
-func reviewJobStillAnswers(ctx context.Context, store *db.Store, job db.Job) bool {
-	return reviewJobStillAnswersWithin(ctx, store, job, map[string]bool{})
+// reviewClaimSubject is the QUESTION a claim was minted for. #2176: the walk
+// was subject-blind, so a review job under a non-review leg answering a
+// DIFFERENT pull request or head counted as answering this claim - and because
+// a stored verdict never stops answering, the claim pinned forever while the
+// awaited fact, keyed to this exact head and purpose, could never be satisfied
+// by it. Scoping fix 2 to the subject is what keeps widening the walk safe.
+type reviewClaimSubject struct {
+	repo        string
+	pullRequest int
+	headSHA     string
+	purpose     string
+}
+
+func reviewSubjectFromClaim(claim db.ReviewRequest) (reviewClaimSubject, bool) {
+	repo, pullRequest, headSHA, err := db.ParseReviewVerdictSubjectKey(claim.SubjectKey)
+	if err != nil {
+		return reviewClaimSubject{}, false
+	}
+	purpose := strings.ToLower(strings.TrimSpace(claim.Purpose))
+	if purpose == "" {
+		purpose = db.ReviewVerdictKeyPurpose(claim.SubjectKey)
+	}
+	return reviewClaimSubject{repo: repo, pullRequest: pullRequest, headSHA: headSHA, purpose: purpose}, true
+}
+
+// answers reports whether a job's payload addresses this exact question. An
+// unparseable subject disables the check rather than refusing every job, which
+// keeps the failure direction the same as before the check existed.
+func (s reviewClaimSubject) answers(payload workflow.JobPayload) bool {
+	if s.repo == "" {
+		return true
+	}
+	if !strings.EqualFold(strings.TrimSpace(payload.Repo), s.repo) || payload.PullRequest != s.pullRequest {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(payload.HeadSHA), s.headSHA) {
+		return false
+	}
+	got := strings.ToLower(strings.TrimSpace(payload.ReviewPurpose))
+	if got == "" {
+		got = db.DefaultReviewPurpose
+	}
+	want := s.purpose
+	if want == "" {
+		want = db.DefaultReviewPurpose
+	}
+	return got == want
+}
+
+func reviewJobStillAnswers(ctx context.Context, store *db.Store, job db.Job, subject reviewClaimSubject, now time.Time) bool {
+	return reviewJobStillAnswersWithin(ctx, store, job, subject, now, map[string]bool{}, true)
 }
 
 // reviewJobStillAnswersWithin carries the visited set. Round 3 established the
@@ -343,17 +392,23 @@ func reviewJobStillAnswers(ctx context.Context, store *db.Store, job db.Job) boo
 // undefended, and a hand-edited parent_job_id cycle exhausted the stack. A
 // visited job is treated as no answer, which is the same direction the walk
 // already takes for a child that cannot answer.
-func reviewJobStillAnswersWithin(ctx context.Context, store *db.Store, job db.Job, seen map[string]bool) bool {
+func reviewJobStillAnswersWithin(ctx context.Context, store *db.Store, job db.Job, subject reviewClaimSubject, now time.Time, seen map[string]bool, isClaimHolder bool) bool {
 	if seen[job.ID] {
 		return false
 	}
 	seen[job.ID] = true
+	payload, payloadErr := workflow.ParseJobPayload(job.Payload)
+	// The claim holder IS this question by construction - the claim was minted
+	// for it. Every other job in the tree must prove it answers this subject
+	// before it is allowed to keep the claim alive (#2176).
+	if !isClaimHolder && payloadErr == nil && !subject.answers(payload) {
+		return false
+	}
 	switch job.State {
 	case string(workflow.JobQueued), string(workflow.JobRunning), string(workflow.JobBlocked):
 		return true
 	}
-	payload, err := workflow.ParseJobPayload(job.Payload)
-	if err != nil {
+	if payloadErr != nil {
 		return false
 	}
 	if reviewVerdictDecision(job, payload) != "" {
@@ -368,46 +423,60 @@ func reviewJobStillAnswersWithin(ctx context.Context, store *db.Store, job db.Jo
 		// re-run, failing open costs a duplicate reviewer.
 		return true
 	}
-	// A FAN-OUT THAT ANNOUNCED CHILDREN BUT HAS NONE YET IS NOT FINISHED
-	// (#2176). Dispatch inserts the parent's announcement before the children
-	// rows exist, so an empty list here means "too early to tell", not "the
-	// tree is done". Reading it as done let takeover dispatch a duplicate
-	// reviewer, which costs real review capacity.
 	if len(children) == 0 {
-		return true
+		return fanOutChildrenMayStillArrive(job, now)
 	}
 	for _, child := range children {
-		// #2172 round 3: only a REVIEW child can ANSWER a review question. A
-		// staged preflight may also delegate a non-review leg (implement, ask)
-		// whose result legitimately carries decision="approved"; counting it
-		// pinned the claim forever while the awaited fact - which only a review
-		// verdict can satisfy - stayed unsatisfiable.
-		//
-		// #2176: but it must still be WALKED THROUGH. Scoping the answer to
-		// review children also stopped the walk descending, so a review
-		// GRANDCHILD under a non-review leg became invisible and its claim was
-		// stealable while it worked. Answering and traversing are two different
-		// questions: a non-review job cannot answer, and can still be a parent
-		// of one that can.
 		if reviewTypedJob(child) {
-			if reviewJobStillAnswersWithin(ctx, store, child, seen) {
+			if reviewJobStillAnswersWithin(ctx, store, child, subject, now, seen, false) {
 				return true
 			}
 			continue
 		}
-		if reviewDescendantStillAnswers(ctx, store, child, seen) {
+		if reviewDescendantStillAnswers(ctx, store, child, subject, now, seen) {
 			return true
 		}
 	}
 	return false
 }
 
+// fanOutChildrenMayStillArrive bounds the not-yet-enqueued grace (#2176 F1).
+// Dispatch writes the parent's announcement before the children rows exist, so
+// an empty list can mean "too early to tell" - but granting that unconditionally
+// pinned the claim FOREVER for shapes where children never arrive at all: a
+// refused staged preflight is rewritten to failed with its fan-out result kept
+// verbatim, and a succeeded marked preflight whose advance is permanently
+// refused sits in the same state. Two bounds, both required:
+//
+//   - a FAILED or CANCELLED fan-out will never enqueue children, so it gets no
+//     grace at all;
+//   - a succeeded one gets the dispatch window, after which the claim releases.
+//     Failing open costs one duplicate reviewer; pinning forever costs every
+//     future review of that head, which is strictly worse.
+func fanOutChildrenMayStillArrive(job db.Job, now time.Time) bool {
+	if strings.TrimSpace(job.State) != string(workflow.JobSucceeded) {
+		return false
+	}
+	stamp := strings.TrimSpace(job.UpdatedAt)
+	if stamp == "" {
+		return false
+	}
+	updated, err := time.Parse(time.RFC3339Nano, stamp)
+	if err != nil {
+		updated, err = time.Parse("2006-01-02 15:04:05", stamp)
+		if err != nil {
+			return false
+		}
+	}
+	return now.Sub(updated) <= reviewRequestDispatchWindow
+}
+
 // reviewDescendantStillAnswers walks a NON-review subtree looking for a review
-// job that can still answer. The node itself is never evidence - that is the
-// #2172 type scoping - but its descendants may be, which is the blind spot
-// #2176 closed. The visited set is shared with the caller, so a corrupted cycle
-// terminates here exactly as it does above.
-func reviewDescendantStillAnswers(ctx context.Context, store *db.Store, job db.Job, seen map[string]bool) bool {
+// job that can still answer THIS subject. The node itself is never evidence -
+// that is the #2172 type scoping - but its descendants may be, which is the
+// blind spot #2176 closed. The visited set is shared with the caller, so a
+// corrupted cycle terminates here exactly as it does above.
+func reviewDescendantStillAnswers(ctx context.Context, store *db.Store, job db.Job, subject reviewClaimSubject, now time.Time, seen map[string]bool) bool {
 	if seen[job.ID] {
 		return false
 	}
@@ -416,14 +485,23 @@ func reviewDescendantStillAnswers(ctx context.Context, store *db.Store, job db.J
 	if err != nil {
 		return true
 	}
+	if len(children) == 0 {
+		// #2176 F3: the same not-yet-enqueued grace the top level has, or a
+		// nested fan-out under a non-review leg loses its review grandchild in
+		// the window before dispatch inserts it.
+		if payload, err := workflow.ParseJobPayload(job.Payload); err == nil && payload.Result != nil && workflow.ResultIsFanOut(payload.Result) {
+			return fanOutChildrenMayStillArrive(job, now)
+		}
+		return false
+	}
 	for _, child := range children {
 		if reviewTypedJob(child) {
-			if reviewJobStillAnswersWithin(ctx, store, child, seen) {
+			if reviewJobStillAnswersWithin(ctx, store, child, subject, now, seen, false) {
 				return true
 			}
 			continue
 		}
-		if reviewDescendantStillAnswers(ctx, store, child, seen) {
+		if reviewDescendantStillAnswers(ctx, store, child, subject, now, seen) {
 			return true
 		}
 	}
@@ -509,7 +587,8 @@ func resolveLostReviewClaim(ctx context.Context, store *db.Store, claim db.Revie
 	job, err := store.GetJob(ctx, claim.JobID)
 	switch {
 	case err == nil:
-		return job, !reviewJobStillAnswers(ctx, store, job), nil
+		subject, _ := reviewSubjectFromClaim(claim)
+		return job, !reviewJobStillAnswers(ctx, store, job, subject, now), nil
 	case !errors.Is(err, sql.ErrNoRows):
 		return db.Job{}, false, err
 	}

@@ -79,6 +79,20 @@ func ReviewVerdictSubjectKey(repo string, pullRequest int, headSHA string) (stri
 // parseReviewVerdictSubjectKey is the exact inverse of the two constructors
 // above: it accepts the bare repo#pr@head key and the purpose-scoped
 // repo#pr@head|purpose key the review router subscribes with.
+// ParseReviewVerdictSubjectKey exposes the subject a claim is keyed to, so the
+// router can check that a verdict it finds while walking a delegation tree
+// actually answers THIS question (#2176). Purpose is read separately with
+// ReviewVerdictKeyPurpose because the bare key carries none.
+func ParseReviewVerdictSubjectKey(key string) (repo string, pullRequest int, headSHA string, err error) {
+	return parseReviewVerdictSubjectKey(key)
+}
+
+// ReviewVerdictKeyPurpose is the exported form of the purpose a subject key is
+// scoped to, defaulting to DefaultReviewPurpose for a bare key.
+func ReviewVerdictKeyPurpose(key string) string {
+	return reviewVerdictKeyPurpose(key)
+}
+
 func parseReviewVerdictSubjectKey(key string) (repo string, pullRequest int, headSHA string, err error) {
 	key = strings.TrimSpace(key)
 	base, purpose, scoped := strings.Cut(key, "|")
