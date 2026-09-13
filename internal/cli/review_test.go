@@ -297,6 +297,50 @@ func TestReviewRequestVerdictDoesNotSatisfyAnotherPurpose(t *testing.T) {
 	}
 }
 
+// releaseUnenqueuedReviewClaim frees a claim ONLY when its job was never
+// enqueued. Two ways to get that wrong, both tested here because both hand the
+// subject to a second reviewer:
+//
+//  1. dispatch fails AFTER Mailbox.Enqueue commits — the job is live, so
+//     releasing would leave it running with no claim;
+//  2. the claim has since moved to another requester's job — the DELETE is
+//     CAS'd on job_id, so it must match nothing rather than delete a live claim.
+func TestReviewClaimReleaseOnlyFreesAnUnenqueuedJob(t *testing.T) {
+	_, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	subject := mustSubjectKey(t, head)
+
+	if _, won, err := store.ClaimReviewRequest(ctx, subject, "job-enqueued", "code", "joltra"); err != nil || !won {
+		t.Fatalf("seed claim: won=%v err=%v", won, err)
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "job-enqueued", Agent: "reviewer", Action: "review", Repo: "owner/repo",
+		Branch: "feature/review", PullRequest: 12, HeadSHA: head, NoFixTarget: true,
+	})
+	releaseUnenqueuedReviewClaim(ctx, store, subject, "job-enqueued")
+	if current, err := store.GetReviewRequest(ctx, subject); err != nil || current.JobID != "job-enqueued" {
+		t.Fatalf("claim after a post-enqueue failure = %+v (%v), want it held: the job is live", current, err)
+	}
+
+	// The interleaving that actually reaches the DELETE: this requester never
+	// enqueued (so the job-exists guard passes), and by the time its dispatch
+	// error unwinds the claim has already moved to another requester's job. The
+	// DELETE is CAS'd on job_id so it must match nothing; without that it frees
+	// a live claim and the subject is dispatched twice.
+	if _, won, err := store.ClaimReviewRequest(ctx, subject+"|second", "job-never-enqueued", "code", "joltra"); err != nil || !won {
+		t.Fatalf("seed second claim: won=%v err=%v", won, err)
+	}
+	moved, err := store.ReplaceReviewRequestJob(ctx, subject+"|second", "job-never-enqueued", "job-successor", "owner")
+	if err != nil || !moved {
+		t.Fatalf("move claim: moved=%v err=%v", moved, err)
+	}
+	releaseUnenqueuedReviewClaim(ctx, store, subject+"|second", "job-never-enqueued")
+	current, err := store.GetReviewRequest(ctx, subject+"|second")
+	if err != nil || current.JobID != "job-successor" {
+		t.Fatalf("claim after a stale release = %+v (%v), want it still held by job-successor", current, err)
+	}
+}
+
 func TestReviewRequestReleasesClaimWhenReviewerRefused(t *testing.T) {
 	home, store, head := reviewRouterHome(t)
 	var stdout, stderr bytes.Buffer
