@@ -343,6 +343,29 @@ type JobRequest struct {
 	// and the dashboard can explain an escalation. Empty (the default) for every
 	// job outside the opt-in risk-tiered path.
 	RiskTier string
+	// StagedReviewVerdictAgent marks this job as the PREFLIGHT stage of a staged
+	// review and names the agent its verdict delegation must go to (#1821).
+	//
+	// IT IS A MARKER SET AT DISPATCH, NEVER AN INFERENCE, and that is the whole
+	// point of it existing. The first attempt at the staged evidence ceiling
+	// inferred "this is a staged pair" from the parent having declared
+	// `evidence`, and a reviewer broke it with the case that inference misses: an
+	// honest review COORDINATOR also declares static_only for itself, because it
+	// orchestrates without executing, while its lens children genuinely do
+	// execute. That inference silently downgraded every lens child's evidence,
+	// including rows the merge gate depends on. PR #2024 was closed for it.
+	//
+	// So the staged relationship is stated by the dispatcher that creates it, and
+	// consumers ask this field rather than deducing the relationship from a
+	// property that other job shapes share.
+	//
+	// Empty for every job that is not a staged preflight, which is all of them
+	// unless a repo declares [repos."owner/repo"] staged_review_verdict_agent.
+	StagedReviewVerdictAgent string
+	// InheritedEvidence is the ceiling a staged review's VERDICT child inherits
+	// from its preflight (#1821). Set only for the child the preflight's marker
+	// names, never for any other delegation.
+	InheritedEvidence string
 	// OrchestrateStage marks a #758 pipeline orchestrate stage job: the stage's agent
 	// runs as a bounded sub-tree COORDINATOR, so its delegations[] are NOT stripped by
 	// the pipeline-sender leaf strip (they fan out as children owned by this stage
@@ -542,6 +565,16 @@ type JobPayload struct {
 	// byte-identically. It is stamped on a high-risk review coordinator and
 	// inherited by its lens children for explainable escalation.
 	RiskTier string `json:"risk_tier,omitempty"`
+	// StagedReviewVerdictAgent is the staged-review marker (#1821): non-empty
+	// only on the PREFLIGHT stage of a staged review, naming the agent its
+	// verdict delegation goes to. Set by the dispatch that creates the preflight,
+	// never inferred. Additive/omitempty, so every other job serializes
+	// byte-identically.
+	StagedReviewVerdictAgent string `json:"staged_review_verdict_agent,omitempty"`
+	// InheritedEvidence is the preflight ceiling this job was dispatched under
+	// (#1821), one of the declared evidence values. Non-empty only on the verdict
+	// child of a marked staged preflight. Additive/omitempty.
+	InheritedEvidence string `json:"inherited_evidence,omitempty"`
 	// Operational-blocker deferral context (#532, additive — all omitempty, so a
 	// job that never hit a classified blocker serializes byte-identically).
 	// BlockerClass is the last classified blocker (e.g. "runtime_auth",
@@ -791,17 +824,19 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		SkipNativeReviewFanout: skipNativeReviewFanout,
 		// #2054: carried onto the payload because AdvanceJob is what decides
 		// whether a changes_requested verdict dispatches a fix at all.
-		NoFixTarget:          noFixTarget,
-		ValidatedPullRequest: request.ValidatedPullRequest,
-		Ephemeral:            request.Ephemeral,
-		HumanAnswer:          request.HumanAnswer,
-		RiskTier:             strings.TrimSpace(request.RiskTier),
-		OrchestrateStage:     request.OrchestrateStage,
-		WritablePaths:        compactStrings(request.WritablePaths),
-		ReadablePaths:        compactStrings(request.ReadablePaths),
-		Network:              request.Network,
-		Check:                strings.TrimSpace(request.Check),
-		CheckRetries:         request.CheckRetries,
+		NoFixTarget:              noFixTarget,
+		ValidatedPullRequest:     request.ValidatedPullRequest,
+		Ephemeral:                request.Ephemeral,
+		HumanAnswer:              request.HumanAnswer,
+		RiskTier:                 strings.TrimSpace(request.RiskTier),
+		StagedReviewVerdictAgent: strings.TrimSpace(request.StagedReviewVerdictAgent),
+		InheritedEvidence:        normalizeInheritedEvidence(request.InheritedEvidence),
+		OrchestrateStage:         request.OrchestrateStage,
+		WritablePaths:            compactStrings(request.WritablePaths),
+		ReadablePaths:            compactStrings(request.ReadablePaths),
+		Network:                  request.Network,
+		Check:                    strings.TrimSpace(request.Check),
+		CheckRetries:             request.CheckRetries,
 	})
 	if err != nil {
 		return db.Job{}, nil, err
@@ -1526,6 +1561,20 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		// ParentJobID = this stage job), so this strip never touches it.
 		result.HumanQuestions = nil
 	}
+	// #1821: clamp a staged verdict to what its preflight found runnable, BEFORE
+	// the result is stored, so no consumer ever reads the unclamped claim. The
+	// event is the audit trail: an overruled producer is a different fact from
+	// one that declared static_only itself, and a merge decision leaning on this
+	// evidence should be able to tell them apart.
+	//
+	// payload.InheritedEvidence is non-empty ONLY on the verdict child of a
+	// marked staged preflight (stagedVerdictCeiling), so this cannot fire for a
+	// coordinator's lens children.
+	if ApplyInheritedEvidenceCeiling(&result, payload.InheritedEvidence) {
+		_ = m.addEvent(ctx, job.ID, InheritedEvidenceClampedEvent, fmt.Sprintf(
+			"declared %s evidence was clamped to %s: the preflight stage sharing this worktree and head recorded %s, so nothing here could have run",
+			EvidenceExecuted, EvidenceStaticOnly, EvidenceStaticOnly))
+	}
 	payload.Result = &result
 	if strings.EqualFold(strings.TrimSpace(job.Type), "implement") {
 		if deliveryWorktree.ExcludedSource != "" {
@@ -1938,6 +1987,29 @@ func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobS
 	writeCtx, cancel := terminalWriteContext(ctx)
 	defer cancel()
 	clearRuntimeIdentity(&payload)
+	// THE STAGED PREFLIGHT CONTRACT IS ENFORCED HERE, AT INGESTION, BECAUSE THIS
+	// IS WHERE A RESULT BECOMES CONSUMABLE (#2029 round four, P1).
+	//
+	// The enforcement used to live downstream and moved three times, each
+	// placement one layer further out than the consumer that had just been found
+	// beating it. It cannot win that way: emitTerminal is called from THIS
+	// function, and its review branch classifies a succeeded non-fan-out review
+	// result as a verdict and wakes the pull request's owner. A marked preflight
+	// returning approved with zero delegations is precisely that shape.
+	//
+	// Forcing the terminal state to FAILED is what makes the result
+	// unconsumable rather than merely late: emitTerminal's verdict branch is
+	// gated on JobSucceeded, the ledger write and task move are gated on the
+	// review decision, and none of them can read a failed job as a verdict.
+	//
+	// THE REVIEWER'S TEXT IS NOT REWRITTEN. Only the state changes; the result is
+	// stored verbatim so the refusal can be diagnosed from the row rather than
+	// from this message alone.
+	if reason := stagedPreflightVerdictRefusal(payload); reason != "" && state == JobSucceeded {
+		state = JobFailed
+		message = fmt.Sprintf("staged review preflight named verdict agent %q but %s (#1821, #2029)",
+			strings.TrimSpace(payload.StagedReviewVerdictAgent), reason)
+	}
 	message = terminalMessageWithDiagnostics(state, message, payload.FailureDiagnostics)
 	encoded, err := marshalPayload(payload)
 	if err != nil {

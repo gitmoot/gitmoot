@@ -12,6 +12,21 @@ import (
 )
 
 func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload JobPayload, ref taskRef) error {
+	// #2029 round two, P1: THE ZERO-DELEGATION CASE IS ENFORCED BEFORE THE EARLY
+	// RETURN, and my first fix put the check after it. A marked preflight that
+	// returns decision=approved with NO delegation left through here untouched,
+	// and because StagedReviewVerdictAgent is not part of ResultIsFanOut it was
+	// then treated as an ordinary review and could enter the native approval
+	// lifecycle - an approval with the configured verdict agent never running,
+	// which is the same hole the contract exists to close, reached by emitting
+	// nothing instead of emitting the wrong thing.
+	//
+	// My own subtest asserted the bypass as correct behaviour, which is what
+	// stopped me seeing it: I wrote "no delegations is the existing early return,
+	// not a refusal" and tested for exactly that.
+	// The staged contract is enforced at the TOP of AdvanceJob (#2029 round
+	// three), above every review-result consumer, so it is not re-checked here.
+	// One enforcement point, upstream of the consumers it protects.
 	if payload.Result == nil || len(payload.Result.Delegations) == 0 {
 		return nil
 	}
@@ -1225,4 +1240,181 @@ func (e Engine) advanceDelegations(ctx context.Context, parentJob db.Job, parent
 		}
 	}
 	return nil
+}
+
+// stagedPreflightVerdictRefusal is the PAYLOAD-ONLY half of the staged verdict
+// contract: every condition that can be decided from the result alone, with no
+// store and no job row.
+//
+// IT IS SEPARATE BECAUSE THE GUARD KEPT MOVING (#2029 round four, P1). The
+// enforcement lived in dispatchDelegations after the zero-delegation early
+// return, then above it, then at the top of AdvanceJob - each placement one
+// layer further out than the consumer that had just been found beating it.
+// Engine.RunJob calls Mailbox.Run BEFORE AdvanceJob, and Mailbox.finishWithPayload
+// invokes emitTerminal, whose review branch classifies a SUCCEEDED non-fan-out
+// review result as a verdict and wakes the pull request's owner. A marked
+// preflight returning approved with zero delegations is exactly that shape, so
+// it is not an edge case the classifier stumbles into: it is the shape the
+// classifier is built to recognise.
+//
+// THE PROPERTY IS NOT ABOUT ORDERING. "A marked preflight's result must never be
+// consumable as a review verdict by ANY consumer" cannot be secured by being
+// upstream of each consumer in turn, because that sequence has no fixed point
+// while consumers exist upstream. It is secured where the result becomes
+// consumable at all - the single result-bearing terminal chokepoint - which is
+// why this half is pure and callable from there.
+//
+// The store-dependent conditions (is the named agent registered, does it carry
+// review, can it reach the repo) stay in enforceStagedVerdictContract. They
+// cannot run at the chokepoint and they are not what the classifier reads.
+func stagedPreflightVerdictRefusal(payload JobPayload) string {
+	if strings.TrimSpace(payload.StagedReviewVerdictAgent) == "" {
+		return ""
+	}
+	marker := strings.TrimSpace(payload.StagedReviewVerdictAgent)
+	if payload.Result == nil {
+		return "returned no result at all"
+	}
+	// An explicitly blocked or failed preflight is not authoritative and is
+	// already terminal for the tree; it is not a verdict and must not be refused.
+	switch strings.ToLower(strings.TrimSpace(payload.Result.Decision)) {
+	case "blocked", "failed":
+		return ""
+	}
+	if !EvidenceWasDeclared(*payload.Result) {
+		return "declared no evidence, so its verdict child would inherit no ceiling"
+	}
+	if strings.EqualFold(strings.TrimSpace(payload.Result.Decision), "changes_requested") {
+		return "returned a changes_requested verdict of its own; a preflight answers whether the review can be performed, and the verdict belongs to the agent it names"
+	}
+	if len(payload.Result.Findings) > 0 {
+		return fmt.Sprintf("reported %d finding(s) of its own; a preflight's findings would enter the ledger before the configured reviewer ran", len(payload.Result.Findings))
+	}
+	delegations := payload.Result.Delegations
+	if len(delegations) != 1 {
+		return fmt.Sprintf("emitted %d delegation(s) instead of exactly one", len(delegations))
+	}
+	d := delegations[0]
+	if action := strings.TrimSpace(d.Action); !strings.EqualFold(action, "review") {
+		return fmt.Sprintf("emitted a %q delegation instead of a review", action)
+	}
+	if !strings.EqualFold(strings.TrimSpace(d.Agent), marker) {
+		return fmt.Sprintf("delegated to %q instead", strings.TrimSpace(d.Agent))
+	}
+	return ""
+}
+
+// enforceStagedVerdictContract refuses a marked staged preflight whose
+// delegations are not exactly the verdict stage the marker names (#2029 review,
+// P1).
+//
+// FIVE CONDITIONS, and each one is a way the hole was reachable:
+//
+//  1. EXACTLY ONE delegation. A second child is unconstrained by construction:
+//     stagedVerdictCeiling only clamps the delegation whose agent matches the
+//     marker, so any sibling runs with no ceiling at all.
+//  2. ACTION "review". An ask child satisfies ensureDelegatedReviewEvidence's
+//     succeeded-and-approved read while never performing a review.
+//  3. THE AGENT THE MARKER NAMES. This is the check whose absence let another
+//     registered agent supply the approval.
+//  4. THAT AGENT CARRIES "review". The dispatcher validated this when it set the
+//     marker, but the preflight's own result is untrusted input, and an agent
+//     can lose the capability between dispatch and advance.
+//  5. THAT AGENT CAN ACCESS THIS REPO. Without it an out-of-scope agent enters
+//     the generic unmarked path, which is the corrective-continuation route
+//     rather than a review.
+//
+// It applies ONLY to a marked preflight. An unmarked job's delegations are not
+// this function's business, and returning nil for them keeps every existing
+// tree byte-identical.
+func (e Engine) enforceStagedVerdictContract(ctx context.Context, job db.Job, payload JobPayload) error {
+	marker := strings.TrimSpace(payload.StagedReviewVerdictAgent)
+	if marker == "" {
+		return nil
+	}
+	refuse := func(reason string) error {
+		_ = e.recordEffectEvent(ctx, db.JobEvent{
+			JobID: job.ID,
+			Kind:  "staged_verdict_contract_refused",
+			Message: fmt.Sprintf("staged preflight named verdict agent %q but %s; refusing to dispatch its delegation(s) (#1821, #2029)",
+				marker, reason),
+		})
+		return fmt.Errorf("staged review preflight %s named verdict agent %q but %s", job.ID, marker, reason)
+	}
+	if reason := stagedPreflightVerdictRefusal(payload); reason != "" {
+		return refuse(reason)
+	}
+	if payload.Result == nil {
+		return refuse("returned no result at all")
+	}
+	// AN EXPLICITLY BLOCKED OR FAILED PREFLIGHT IS NOT AUTHORITATIVE AND MUST NOT
+	// BE REFUSED HERE. It emitted no verdict delegation because it could not
+	// perform the review, which is the honest cheap-stage answer and is already
+	// terminal for the tree; turning that into a dispatch error would convert a
+	// correct refusal into an engine failure.
+	switch strings.TrimSpace(payload.Result.Decision) {
+	case "blocked", "failed":
+		return nil
+	}
+	// #2029 round three, P1: A MARKED PREFLIGHT MUST DECLARE ITS EVIDENCE. Without
+	// a declaration stagedVerdictCeiling returns "" - NO ceiling at all - so a
+	// nominally correct single review delegation with omitted evidence removed the
+	// mechanism as effectively as naming the wrong agent. Shape and identity were
+	// checked; the one field the ceiling is computed FROM was not.
+	if !EvidenceWasDeclared(*payload.Result) {
+		return refuse("declared no evidence, so its verdict child would inherit no ceiling")
+	}
+	// A MARKED PREFLIGHT IS NOT AN ORDINARY REVIEWER. It answers "can this review
+	// be performed here"; a verdict about the change belongs to the stage it
+	// names. Letting the cheap stage request changes would put its findings in the
+	// ledger, move the task, and potentially trigger auto-fix - all before the
+	// configured reviewer had run.
+	if decision := strings.TrimSpace(payload.Result.Decision); strings.EqualFold(decision, "changes_requested") {
+		return refuse("returned a changes_requested verdict of its own; a preflight answers whether the review can be performed, and the verdict belongs to the agent it names")
+	}
+	if len(payload.Result.Findings) > 0 {
+		return refuse(fmt.Sprintf("reported %d finding(s) of its own; a preflight's findings would enter the ledger before the configured reviewer ran", len(payload.Result.Findings)))
+	}
+	delegations := payload.Result.Delegations
+	if len(delegations) != 1 {
+		return refuse(fmt.Sprintf("emitted %d delegation(s) instead of exactly one", len(delegations)))
+	}
+	d := delegations[0]
+	if action := strings.TrimSpace(d.Action); !strings.EqualFold(action, "review") {
+		return refuse(fmt.Sprintf("emitted a %q delegation instead of a review", action))
+	}
+	if !strings.EqualFold(strings.TrimSpace(d.Agent), marker) {
+		return refuse(fmt.Sprintf("delegated to %q instead", strings.TrimSpace(d.Agent)))
+	}
+	if e.Store == nil {
+		return refuse("the agent store is unavailable, so its identity cannot be checked")
+	}
+	agent, err := e.Store.GetAgent(ctx, marker)
+	if err != nil {
+		return refuse("that agent is not registered")
+	}
+	if !agentCarriesCapability(agent.Capabilities, "review") {
+		return refuse("that agent does not carry the review capability")
+	}
+	allowed, err := e.Store.AgentCanAccessRepo(ctx, marker, strings.TrimSpace(payload.Repo))
+	if err != nil {
+		return refuse("its repository access could not be determined")
+	}
+	if !allowed {
+		return refuse(fmt.Sprintf("that agent cannot access %s", strings.TrimSpace(payload.Repo)))
+	}
+	return nil
+}
+
+// agentCarriesCapability reports whether a registered agent's capability list
+// contains want. Comparison is trimmed and case-insensitive, matching how the
+// CLI resolver validated the same agent at dispatch time; a second convention
+// here would let the two halves disagree about the same agent.
+func agentCarriesCapability(capabilities []string, want string) bool {
+	for _, capability := range capabilities {
+		if strings.EqualFold(strings.TrimSpace(capability), want) {
+			return true
+		}
+	}
+	return false
 }
