@@ -254,15 +254,9 @@ type goDirectiveFileState uint8
 const (
 	goDirectiveAbsent goDirectiveFileState = iota
 	goDirectiveReadable
+	goDirectiveIgnored
 	goDirectiveUnsafe
 )
-
-// ModuleGoDirective reports the `go` directive of the module rooted at dir, or
-// "" when there is no safe, valid go.mod to read.
-func ModuleGoDirective(dir string) string {
-	directive, _ := goDirectiveAt(dir, "go.mod")
-	return directive
-}
 
 // WorkspaceGoRequirement resolves the minimum Go version that commands started
 // in dir must satisfy and the GOWORK value that pins those commands to the same
@@ -276,7 +270,7 @@ func ModuleGoDirective(dir string) string {
 // under a different requirement.
 func WorkspaceGoRequirement(dir, gowork string) (version, effectiveGOWORK string, err error) {
 	module, moduleState := goDirectiveAt(dir, "go.mod")
-	if moduleState == goDirectiveUnsafe {
+	if moduleState == goDirectiveIgnored || moduleState == goDirectiveUnsafe {
 		return "", "off", fmt.Errorf("checkout go.mod is not a safe, readable regular module file")
 	}
 	gowork = strings.TrimSpace(gowork)
@@ -342,33 +336,35 @@ func laterGoDirective(first, second string) string {
 // This is intentionally not a complete parser. Go rejects block comments, so
 // an invalid file that hides `go X` inside one may produce an unavailable-
 // toolchain diagnostic instead of a syntax diagnostic; no valid workspace can
-// be mis-selected by that divergence. The state distinguishes absence (continue
-// searching parents), a safely read file with no directive (valid and no minimum
-// to add), and an unsafe or malformed file (fail closed before execution).
+// be mis-selected by that divergence. The state distinguishes absence, a file
+// Go's automatic workspace search ignores, a safely read file with no directive,
+// and an unsafe or malformed file.
 func goDirectiveAt(dir, name string) (directive string, state goDirectiveFileState) {
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		return "", goDirectiveUnsafe
-	}
-	defer root.Close()
+	path := filepath.Join(dir, name)
+	info, err := os.Lstat(path)
 
-	info, err := root.Lstat(name)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return "", goDirectiveAbsent
 		}
+		return "", goDirectiveIgnored
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
 		return "", goDirectiveUnsafe
 	}
-	if !info.Mode().IsRegular() || info.Size() > maxGoModBytes {
+	if !info.Mode().IsRegular() {
+		return "", goDirectiveIgnored
+	}
+	if info.Size() > maxGoModBytes {
 		return "", goDirectiveUnsafe
 	}
-	file, err := root.Open(name)
+	file, err := os.Open(path)
 	if err != nil {
 		return "", goDirectiveUnsafe
 	}
 	defer file.Close()
-	info, err = file.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Size() > maxGoModBytes {
+	openedInfo, err := file.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) || openedInfo.Size() > maxGoModBytes {
 		return "", goDirectiveUnsafe
 	}
 	contents, err := io.ReadAll(io.LimitReader(file, maxGoModBytes+1))

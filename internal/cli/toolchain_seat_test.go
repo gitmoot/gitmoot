@@ -277,6 +277,7 @@ func TestReadOnlyGrantsStageTheToolchainThroughProduction(t *testing.T) {
 // not cost the toolchain pin, so `go` must still resolve INSIDE the staged copy
 // even though a different go sits earlier on the inherited PATH.
 func TestReadOnlySeatEnvKeepsRuntimeBinariesResolvable(t *testing.T) {
+	t.Setenv("GOWORK", "off")
 	home := t.TempDir()
 	live := config.PathsForHome(home)
 
@@ -532,6 +533,7 @@ func writeSeatToolchainFixture(t *testing.T, root, version string) string {
 // already satisfies go.mod passes without exercising anything, which is the
 // population failure this repository has repeatedly shipped.
 func TestStageSeatToolchainStagesWhatTheWorkspaceNeeds(t *testing.T) {
+	t.Setenv("GOWORK", "off")
 	base := t.TempDir()
 	launcher := writeSeatToolchainFixture(t, filepath.Join(base, "distro"), "go1.22.2")
 	satisfying := writeSeatToolchainFixture(t, filepath.Join(base, "pinned"), "go1.26.4")
@@ -610,6 +612,7 @@ func TestStageSeatToolchainHonorsWorkspaceGoRequirement(t *testing.T) {
 }
 
 func TestStageSeatToolchainFallsBackFromAnUnstageableSatisfyingInstallation(t *testing.T) {
+	t.Setenv("GOWORK", "off")
 	base := t.TempDir()
 	broken := writeSeatToolchainFixture(t, filepath.Join(base, "broken"), "go1.26.0")
 	if err := os.MkdirAll(filepath.Join(broken, "pkg"), 0o755); err != nil {
@@ -645,6 +648,7 @@ func TestStageSeatToolchainFallsBackFromAnUnstageableSatisfyingInstallation(t *t
 }
 
 func TestStageSeatToolchainAggregatesEverySatisfyingStagingRefusal(t *testing.T) {
+	t.Setenv("GOWORK", "off")
 	base := t.TempDir()
 	first := writeSeatToolchainFixture(t, filepath.Join(base, "first"), "go1.26.0")
 	second := writeSeatToolchainFixture(t, filepath.Join(base, "second"), "go1.26.4")
@@ -762,6 +766,7 @@ func TestStageSeatToolchainAllowsDirectiveLessWorkspaceFiles(t *testing.T) {
 // which surfaces later as "go.mod requires go >= 1.26" and reads as a
 // repository problem rather than a staging one.
 func TestStageSeatToolchainRefusesWhenNothingSatisfiesTheWorkspace(t *testing.T) {
+	t.Setenv("GOWORK", "off")
 	launcher := writeSeatToolchainFixture(t, filepath.Join(t.TempDir(), "distro"), "go1.22.2")
 	workspace := t.TempDir()
 	if err := os.WriteFile(filepath.Join(workspace, "go.mod"), []byte("module x\n\ngo 1.26\n"), 0o644); err != nil {

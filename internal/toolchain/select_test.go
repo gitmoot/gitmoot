@@ -297,22 +297,22 @@ func TestInstallationsOnPathKeepsAnUnreadableTreeVisible(t *testing.T) {
 	}
 }
 
-// TestModuleGoDirectiveReadsTheRequirement covers the input that decides which
-// toolchain is correct, including accepted module whitespace and comments.
-func TestModuleGoDirectiveReadsTheRequirement(t *testing.T) {
+// TestWorkspaceGoRequirementReadsModule covers the module input that decides
+// which toolchain is correct, including accepted whitespace and comments.
+func TestWorkspaceGoRequirementReadsModule(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "go.mod"),
 		[]byte("module example.com/x\r\n\r\ngo\t1.26 // minimum\r\n\r\ntoolchain go1.27.1\r\n"), 0o644); err != nil {
 		t.Fatalf("write go.mod: %v", err)
 	}
-	if got := ModuleGoDirective(dir); got != "1.26" {
-		t.Errorf("directive = %q, want 1.26", got)
+	requirement, effective, err := WorkspaceGoRequirement(dir, "off")
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	if got := ModuleGoDirective(t.TempDir()); got != "" {
-		t.Errorf("directive = %q, want empty for a non-module directory", got)
+	if requirement != "1.26" || effective != "off" {
+		t.Errorf("requirement = (%q, %q), want (1.26, off)", requirement, effective)
 	}
-	if _, err := firstInstallation([]GoInstallation{{Root: "/old", Version: "go1.22.2"}}, ModuleGoDirective(dir)); err == nil {
+	if _, err := firstInstallation([]GoInstallation{{Root: "/old", Version: "go1.22.2"}}, requirement); err == nil {
 		t.Error("a go 1.26 module accepted a go1.22.2 installation")
 	}
 
@@ -320,8 +320,8 @@ func TestModuleGoDirectiveReadsTheRequirement(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(malformed, "go.mod"), []byte("module x\ngo 1.26 extra\n"), 0o644); err != nil {
 		t.Fatalf("write malformed go.mod: %v", err)
 	}
-	if got := ModuleGoDirective(malformed); got != "" {
-		t.Errorf("malformed directive = %q, want empty", got)
+	if _, _, err := WorkspaceGoRequirement(malformed, "off"); err == nil {
+		t.Fatal("malformed module directive was accepted")
 	}
 }
 
@@ -387,6 +387,34 @@ func TestWorkspaceGoRequirementHonorsGOWORK(t *testing.T) {
 	if version != "" || effective != rootWork {
 		t.Fatalf("directive-less requirement = (%q, %q), want (empty, %q)", version, effective, rootWork)
 	}
+	if err := os.Chmod(root, 0o111); err != nil {
+		t.Fatal(err)
+	}
+	version, effective, err = WorkspaceGoRequirement(child, "auto")
+	if restoreErr := os.Chmod(root, 0o755); restoreErr != nil {
+		t.Fatal(restoreErr)
+	}
+	if err != nil {
+		t.Fatalf("workspace under search-only ancestor was refused: %v", err)
+	}
+	if version != "" || effective != rootWork {
+		t.Fatalf("search-only ancestor requirement = (%q, %q), want (empty, %q)", version, effective, rootWork)
+	}
+
+	ignoredWork := filepath.Join(child, "go.work")
+	if err := os.Mkdir(ignoredWork, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	version, effective, err = WorkspaceGoRequirement(child, "auto")
+	if err != nil {
+		t.Fatalf("non-file go.work was not ignored during automatic search: %v", err)
+	}
+	if version != "" || effective != rootWork {
+		t.Fatalf("ignored non-file requirement = (%q, %q), want (empty, %q)", version, effective, rootWork)
+	}
+	if err := os.Remove(ignoredWork); err != nil {
+		t.Fatal(err)
+	}
 
 	linkedRoot := t.TempDir()
 	if err := os.Symlink(explicit, filepath.Join(linkedRoot, "go.work")); err != nil {
@@ -397,7 +425,7 @@ func TestWorkspaceGoRequirementHonorsGOWORK(t *testing.T) {
 	}
 }
 
-func TestModuleGoDirectiveContainsAndBoundsTheRead(t *testing.T) {
+func TestWorkspaceGoRequirementContainsAndBoundsModuleRead(t *testing.T) {
 	outside := filepath.Join(t.TempDir(), "outside.mod")
 	if err := os.WriteFile(outside, []byte("go 99.0\n"), 0o644); err != nil {
 		t.Fatalf("write outside go.mod: %v", err)
@@ -406,16 +434,10 @@ func TestModuleGoDirectiveContainsAndBoundsTheRead(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(linked, "go.mod")); err != nil {
 		t.Fatalf("symlink go.mod: %v", err)
 	}
-	if got := ModuleGoDirective(linked); got != "" {
-		t.Errorf("escaped symlink directive = %q, want empty", got)
-	}
 
 	nonRegular := t.TempDir()
 	if err := os.Mkdir(filepath.Join(nonRegular, "go.mod"), 0o755); err != nil {
 		t.Fatalf("mkdir go.mod: %v", err)
-	}
-	if got := ModuleGoDirective(nonRegular); got != "" {
-		t.Errorf("non-regular directive = %q, want empty", got)
 	}
 
 	oversized := t.TempDir()
@@ -423,8 +445,17 @@ func TestModuleGoDirectiveContainsAndBoundsTheRead(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(oversized, "go.mod"), []byte(contents), 0o644); err != nil {
 		t.Fatalf("write oversized go.mod: %v", err)
 	}
-	if got := ModuleGoDirective(oversized); got != "" {
-		t.Errorf("oversized directive = %q, want empty", got)
+
+	for name, dir := range map[string]string{
+		"escaping symlink": linked,
+		"non-regular":      nonRegular,
+		"oversized":        oversized,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := WorkspaceGoRequirement(dir, "off"); err == nil {
+				t.Fatal("unsafe go.mod was accepted")
+			}
+		})
 	}
 }
 

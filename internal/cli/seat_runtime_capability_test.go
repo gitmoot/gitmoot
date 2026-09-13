@@ -374,6 +374,7 @@ func runUnavailableToolchainSeatJob(t *testing.T, store *db.Store, home string, 
 // fails before the fix: the job ran to a verdict with nothing executed, and no
 // event named the missing capability.
 func TestSeatToolchainUnavailableEndsAReviewBlockedNotVerdicted(t *testing.T) {
+	t.Setenv("GOWORK", "off")
 	ctx := context.Background()
 	store, home, checkout := seedUnavailableToolchainReviewSeat(t, "seat-toolchain-unavailable", "review")
 	events := runUnavailableToolchainSeatJob(t, store, home, checkout, "seat-toolchain-unavailable")
