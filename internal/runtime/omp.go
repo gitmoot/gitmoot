@@ -579,15 +579,17 @@ func ompArgs(agent Agent, model string, thinking string, maxTime string, plan bo
 // ompWorkspaceArgs grants the agent's produce paths as additional workspace roots,
 // writable first then readable — the same ordering kimi uses. These are
 // cooperative visibility hints for omp's own file layer and NOT an enforcement
-// boundary: --add-dir does not make the readable subset read-only, and omp gets no
-// Landlock confinement underneath either (that wrapper selects by runtime name and
-// wraps only claude/kimi). TWO gates keep a read-only omp agent from writing, and
-// they cover disjoint job shapes: readOnlyImplementationBlocked refuses an
-// implement-typed job (it returns false for every other type), and the mailbox
-// plan gate refuses a plan-mode job of ANY type. Before that second gate existed,
-// an `ask` job carrying plan was a write bypass on a read-only seat — plan mode
-// auto-executes and upstream adds the write tool — so if you add a third path that
-// can end in a write, it needs its own gate here; neither existing one will cover it.
+// boundary: --add-dir does not make the readable subset read-only. Ordinary
+// non-seat read-only deliveries rely on omp's always-ask mode. A ReadOnlySeat is
+// different: the daemon wraps omp in its kernel-enforced Landlock domain, and
+// ompApprovalArgs uses yolo so headless shell and test tools can run inside that
+// boundary. Two additional gates refuse write-shaped work for read-only agents:
+// readOnlyImplementationBlocked refuses an implement-typed job (it returns false
+// for every other type), and the mailbox plan gate refuses a plan-mode job of ANY
+// type. Before that second gate existed, an `ask` job carrying plan was a write
+// bypass — plan mode auto-executes and upstream adds the write tool — so if you
+// add a third path that can end in a write, it needs its own gate here; neither
+// existing one will cover it.
 func ompWorkspaceArgs(agent Agent) []string {
 	var args []string
 	for _, path := range agent.WritablePaths {
