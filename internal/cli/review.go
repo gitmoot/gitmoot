@@ -184,23 +184,25 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	if _, ok := orgConfig.Role(opts.role); !ok {
 		return reviewRequestOutput{}, fmt.Errorf("unknown organization role %q: the requester must be a registered role so the verdict can be delivered", opts.role)
 	}
-	repo, record, err := resolveLocalAgentRepo(ctx, store, opts.repo)
+	// One runner for the whole request, resolved from the configured execution
+	// backend before anything touches git: repo resolution now reads the remote
+	// (#2146), and probing it from this host under a remote backend would answer
+	// about the wrong machine.
+	execBackend, err := localAgentDispatchExecBackendFor(opts.home)
+	if err != nil {
+		return reviewRequestOutput{}, err
+	}
+	runner, err := jobSubprocessRunnerForBackend(execBackend)
+	if err != nil {
+		return reviewRequestOutput{}, err
+	}
+	repo, record, _, _, err := resolveLocalAgentRepo(ctx, store, opts.repo, runner)
 	if err != nil {
 		return reviewRequestOutput{}, err
 	}
 	head := strings.ToLower(strings.TrimSpace(opts.head))
 	branch := strings.TrimSpace(opts.branch)
 	if head == "" || branch == "" {
-		// The lookup runs under the same execution backend dispatch will use, so a
-		// remote/attached backend is never probed from this host by accident.
-		execBackend, err := localAgentDispatchExecBackendFor(opts.home)
-		if err != nil {
-			return reviewRequestOutput{}, err
-		}
-		runner, err := jobSubprocessRunnerForBackend(execBackend)
-		if err != nil {
-			return reviewRequestOutput{}, err
-		}
 		pr, err := jobGitHubClient(record.CheckoutPath, newAgentDispatchGitHubClient(record.CheckoutPath), runner).GetPullRequest(ctx, repo, int64(opts.pr))
 		if err != nil {
 			return reviewRequestOutput{}, fmt.Errorf("resolve pull request #%d: %w", opts.pr, err)
@@ -721,7 +723,15 @@ func runReviewStatus(args []string, stdout, stderr io.Writer) int {
 	var output reviewStatusOutput
 	err := withStore(*home, func(store *db.Store) error {
 		ctx := context.Background()
-		repo, _, err := resolveLocalAgentRepo(ctx, store, *repoFlag)
+		execBackend, err := localAgentDispatchExecBackendFor(*home)
+		if err != nil {
+			return err
+		}
+		runner, err := jobSubprocessRunnerForBackend(execBackend)
+		if err != nil {
+			return err
+		}
+		repo, _, _, _, err := resolveLocalAgentRepo(ctx, store, *repoFlag, runner)
 		if err != nil {
 			return err
 		}
