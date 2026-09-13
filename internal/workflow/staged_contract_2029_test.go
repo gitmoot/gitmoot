@@ -79,6 +79,16 @@ func TestStagedPreflightRefusesADelegationSetThatIsNotItsVerdictStage(t *testing
 			wantReason:  "delegated to \"some-other-agent\"",
 		},
 		{
+			name:        "a verdict model override",
+			delegations: []Delegation{{ID: "verdict", Action: "review", Agent: "gm-review-opus", Model: "cheap-model"}},
+			wantReason:  "overrode the configured verdict agent's model",
+		},
+		{
+			name:        "a verdict effort override",
+			delegations: []Delegation{{ID: "verdict", Action: "review", Agent: "gm-review-opus", Effort: "low"}},
+			wantReason:  "overrode the configured verdict agent's effort",
+		},
+		{
 			// #2029 round two, P1. THIS SUBTEST PREVIOUSLY ASSERTED THE BYPASS AS
 			// CORRECT: "no delegations is the existing early return, not a
 			// refusal". That expectation was the defect. A marked preflight that
@@ -132,6 +142,7 @@ func TestStagedPreflightRefusesAVerdictAgentThatCannotReviewThisRepo(t *testing.
 		wantReason   string
 	}{
 		{"no review capability", []string{"implement"}, []string{"gitmoot/gitmoot"}, "does not carry the review capability"},
+		{"noncanonical review capability", []string{" Review "}, []string{"gitmoot/gitmoot"}, "does not carry the review capability"},
 		{"cannot access the repo", []string{"review"}, []string{"other/repo"}, "cannot access gitmoot/gitmoot"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -252,6 +263,38 @@ func TestBlockedStagedPreflightIsNotRefusedForEmittingNothing(t *testing.T) {
 
 			if err := engine.enforceStagedVerdictContract(ctx, job, payload); err != nil {
 				t.Fatalf("a %s preflight that delegated nothing must not be refused: %v", decision, err)
+			}
+		})
+	}
+}
+
+func TestBlockedStagedPreflightCannotWriteFindingsToLedger(t *testing.T) {
+	ctx := context.Background()
+	for _, decision := range []string{"blocked", "failed"} {
+		t.Run(decision, func(t *testing.T) {
+			engine, store := stagedContractFixture(t, []string{"review"}, []string{"gitmoot/gitmoot"})
+			job, payload := stagedPreflight(nil)
+			job.ID += "-" + decision
+			payload.Result.Decision = decision
+			payload.Result.Findings = []json.RawMessage{
+				json.RawMessage(`{"severity":"P1","title":"cheap stage opinion","detail":"must not become an obligation"}`),
+			}
+			encoded, err := marshalPayload(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			job.Payload = encoded
+			if err := store.CreateJob(ctx, job); err != nil {
+				t.Fatal(err)
+			}
+
+			_ = engine.AdvanceJob(ctx, job.ID)
+			observations, err := store.ListReviewFindingObservations(ctx, payload.Repo, int64(payload.PullRequest))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(observations) != 0 {
+				t.Fatalf("%s preflight authored findings-ledger obligations: %+v", decision, observations)
 			}
 		})
 	}

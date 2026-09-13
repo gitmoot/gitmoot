@@ -273,8 +273,12 @@ func TestMailboxRunClampsAStagedVerdict(t *testing.T) {
 	}
 	var clamped bool
 	for _, e := range events {
-		if e.Kind == InheritedEvidenceClampedEvent {
-			clamped = true
+		if e.Kind != InheritedEvidenceClampedEvent {
+			continue
+		}
+		clamped = true
+		if strings.Contains(e.Message, "worktree") || !strings.Contains(e.Message, "exact head") {
+			t.Fatalf("clamp event overstates provenance: %q", e.Message)
 		}
 	}
 	if !clamped {

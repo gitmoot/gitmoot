@@ -438,10 +438,13 @@ A staged review splits one review into a cheap preflight stage that answers
 review. `staged_review_verdict_agent` names the agent that would run the
 verdict stage.
 
-When this key is set, review dispatch runs the requested reviewer as a
-**preflight** parent. The parent checks whether the review can run and delegates
-exactly once to the configured verdict agent. The preflight is marked so its
-result cannot be consumed as the final review verdict.
+Local `agent review` and review-resolved `agent run` dispatch honor this key:
+they run the requested reviewer as a **preflight** parent. The parent checks
+whether the review can run and delegates exactly once to the configured verdict
+agent. The preflight is marked so its result cannot be consumed as the final
+review verdict. Daemon fanout, heartbeat, pipeline, comment-command, and
+externally recorded session reviews do not consult this key; they keep their
+ordinary review paths.
 
 It is **off by default** with deliberately **no default and no fallback list**.
 A repo that has not declared one uses the ordinary, unstaged review path, and

@@ -1301,6 +1301,12 @@ func stagedPreflightVerdictRefusal(payload JobPayload) string {
 	if !strings.EqualFold(strings.TrimSpace(d.Agent), marker) {
 		return fmt.Sprintf("delegated to %q instead", strings.TrimSpace(d.Agent))
 	}
+	if model := strings.TrimSpace(d.Model); model != "" {
+		return fmt.Sprintf("overrode the configured verdict agent's model with %q", model)
+	}
+	if effort := strings.TrimSpace(d.Effort); effort != "" {
+		return fmt.Sprintf("overrode the configured verdict agent's effort with %q", effort)
+	}
 	return ""
 }
 
@@ -1308,7 +1314,7 @@ func stagedPreflightVerdictRefusal(payload JobPayload) string {
 // delegations are not exactly the verdict stage the marker names (#2029 review,
 // P1).
 //
-// FIVE CONDITIONS, and each one is a way the hole was reachable:
+// SEVEN CONDITIONS, and each one is a way the hole is reachable:
 //
 //  1. EXACTLY ONE delegation. A second child is unconstrained by construction:
 //     stagedVerdictCeiling only clamps the delegation whose agent matches the
@@ -1317,10 +1323,13 @@ func stagedPreflightVerdictRefusal(payload JobPayload) string {
 //     succeeded-and-approved read while never performing a review.
 //  3. THE AGENT THE MARKER NAMES. This is the check whose absence let another
 //     registered agent supply the approval.
-//  4. THAT AGENT CARRIES "review". The dispatcher validated this when it set the
+//  4. NO MODEL OVERRIDE. The registered verdict agent's model is part of the
+//     operator's reviewer choice; the cheap preflight cannot replace it.
+//  5. NO EFFORT OVERRIDE, for the same reason.
+//  6. THAT AGENT CARRIES "review". The dispatcher validated this when it set the
 //     marker, but the preflight's own result is untrusted input, and an agent
 //     can lose the capability between dispatch and advance.
-//  5. THAT AGENT CAN ACCESS THIS REPO. Without it an out-of-scope agent enters
+//  7. THAT AGENT CAN ACCESS THIS REPO. Without it an out-of-scope agent enters
 //     the generic unmarked path, which is the corrective-continuation route
 //     rather than a review.
 //
@@ -1406,13 +1415,12 @@ func (e Engine) enforceStagedVerdictContract(ctx context.Context, job db.Job, pa
 	return nil
 }
 
-// agentCarriesCapability reports whether a registered agent's capability list
-// contains want. Comparison is trimmed and case-insensitive, matching how the
-// CLI resolver validated the same agent at dispatch time; a second convention
-// here would let the two halves disagree about the same agent.
+// agentCarriesCapability uses the same exact comparison as the CLI and daemon
+// dispatchers. Capability values are registered identifiers, not user prose;
+// accepting a second spelling here would make advance disagree with dispatch.
 func agentCarriesCapability(capabilities []string, want string) bool {
 	for _, capability := range capabilities {
-		if strings.EqualFold(strings.TrimSpace(capability), want) {
+		if capability == want {
 			return true
 		}
 	}

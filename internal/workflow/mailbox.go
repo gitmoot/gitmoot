@@ -1572,7 +1572,7 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	// coordinator's lens children.
 	if ApplyInheritedEvidenceCeiling(&result, payload.InheritedEvidence) {
 		_ = m.addEvent(ctx, job.ID, InheritedEvidenceClampedEvent, fmt.Sprintf(
-			"declared %s evidence was clamped to %s: the preflight stage sharing this worktree and head recorded %s, so nothing here could have run",
+			"declared %s evidence was clamped to %s: the preflight stage for this exact head recorded %s, so nothing here could have run",
 			EvidenceExecuted, EvidenceStaticOnly, EvidenceStaticOnly))
 	}
 	payload.Result = &result
