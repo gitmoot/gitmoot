@@ -1218,10 +1218,11 @@ gitmoot agent run lead --repo owner/repo --effort xhigh "Implement this task."
 gitmoot job watch <job-id>
 ```
 
-`agent review` with `--org-role` queues the job for daemon ownership by default.
-This keeps a review running if the calling seat or its command runner exits.
-Use `--foreground` only when synchronous ownership is intentional. Unattributed
-reviews retain their synchronous default; `--background` remains accepted.
+`agent review` and review-resolved `agent run` with `--org-role` queue the job
+for daemon ownership by default. This keeps a review running if the calling
+seat or its command runner exits. Use `--foreground` only when synchronous
+ownership is intentional. Unattributed reviews retain their synchronous
+default; `--background` remains accepted.
 
 `agent run --action ask|review|implement` explicitly selects the job action and
 wins before the usual inference order (`--task` -> implement, then

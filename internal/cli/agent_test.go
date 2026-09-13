@@ -4544,3 +4544,51 @@ func TestReviewExecutionModeRejectsConflictingFlags(t *testing.T) {
 		t.Fatalf("ok=%t stderr=%q, want conflicting mode refusal", ok, stderr.String())
 	}
 }
+
+func TestAgentRunForegroundRejectsNonReviewAction(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runAgentRun([]string{
+		"responder", "answer it", "--action", "ask", "--foreground",
+	}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "--foreground is only supported when routing to review") {
+		t.Fatalf("exit=%d stdout=%q stderr=%q, want selected-action refusal", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestOrchestrateRejectsForegroundReview(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runOrchestrate([]string{
+		"reviewer", "review it", "--action", "review", "--foreground", "--repo", "owner/repo", "--pr", "7",
+	}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "orchestrate always runs in background") {
+		t.Fatalf("exit=%d stdout=%q stderr=%q, want foreground refusal", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestAgentHelpAdvertisesReviewForegroundModes(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := runAgent([]string{"--help"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("agent help exit=%d stderr=%q", code, stderr.String())
+	}
+	for _, command := range []string{"agent run", "agent review"} {
+		line := ""
+		for _, candidate := range strings.Split(stdout.String(), "\n") {
+			if strings.Contains(candidate, "gitmoot "+command+" ") {
+				line = candidate
+				break
+			}
+		}
+		if !strings.Contains(line, "[--background|--foreground]") {
+			t.Fatalf("%s help line = %q, want both execution modes", command, line)
+		}
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := runAgent([]string{"run", "--help"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("agent run help exit=%d stderr=%q", code, stderr.String())
+	}
+	if help := stdout.String() + stderr.String(); !strings.Contains(help, "[--background|--foreground]") {
+		t.Fatalf("agent run help = %q, want both execution modes", help)
+	}
+}

@@ -93,8 +93,8 @@ func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime codex|claude|kimi|omp --repo owner/repo [--path .] [--template <template-id>] [--model model] [--effort effort] [--start-daemon]")
 	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
-	fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--lead implementer] [--head-sha sha] [--base ref] [--branch branch] [--background] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
-	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--lead implementer] [--head-sha sha] [--branch branch] [--background] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--allow-prompt-head-mismatch] [--no-fix-target] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--lead implementer] [--head-sha sha] [--base ref] [--branch branch] [--background|--foreground] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--lead implementer] [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--allow-prompt-head-mismatch] [--no-fix-target] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--base ref] [--head-sha sha] [--branch branch] [--background] [--type type] [--action implement] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
 	printAgentRuntimeOverrideHelp(w)
 	fmt.Fprintln(w, "  gitmoot agent type list|show|set ...")
@@ -410,6 +410,10 @@ func runAgentRun(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	selected, reason := selectAgentRunAction(options)
+	if err := normalizeReviewExecutionMode(&options, selected); err != nil {
+		fmt.Fprintf(stderr, "agent run: %v\n", err)
+		return 2
+	}
 	output, exit := dispatchAgentCommand(options, selected, reason, "agent_run", stdout, stderr)
 	if exit != 0 {
 		return exit
@@ -447,8 +451,16 @@ func runOrchestrate(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	// Force the background run path: orchestrate always fans out delegations.
+	if options.foreground {
+		fmt.Fprintln(stderr, "orchestrate: --foreground is not supported; orchestrate always runs in background")
+		return 2
+	}
 	options.background = true
 	selected, reason := selectOrchestrateAction(options)
+	if err := normalizeReviewExecutionMode(&options, selected); err != nil {
+		fmt.Fprintf(stderr, "orchestrate: %v\n", err)
+		return 2
+	}
 	output, exit := dispatchAgentCommand(options, selected, reason, "orchestrate", stdout, stderr)
 	if exit != 0 {
 		return exit
@@ -499,8 +511,9 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "agent review requires --pr number")
 		return 2
 	}
-	if strings.TrimSpace(options.orgRole) != "" && !options.foreground {
-		options.background = true
+	if err := normalizeReviewExecutionMode(&options, "review"); err != nil {
+		fmt.Fprintf(stderr, "agent review: %v\n", err)
+		return 2
 	}
 	output, exit := dispatchAgentCommand(options, "review", "explicit agent review", "agent_review", stdout, stderr)
 	if exit != 0 {
@@ -526,6 +539,10 @@ func runAgentImplement(args []string, stdout, stderr io.Writer) int {
 		}
 		return 2
 	}
+	if err := normalizeReviewExecutionMode(&options, "implement"); err != nil {
+		fmt.Fprintf(stderr, "agent implement: %v\n", err)
+		return 2
+	}
 	output, exit := dispatchAgentCommand(options, "implement", "explicit agent implement", "agent_implement", stdout, stderr)
 	if exit != 0 {
 		return exit
@@ -540,6 +557,16 @@ func runAgentImplement(args []string, stdout, stderr io.Writer) int {
 	printLocalAgentJobOutput(stdout, output)
 	printQueuedDaemonHint(stdout, output, options.background, options.home)
 	return 0
+}
+
+func normalizeReviewExecutionMode(options *agentRunOptions, action string) error {
+	if options.foreground && action != "review" {
+		return errors.New("--foreground is only supported when routing to review")
+	}
+	if action == "review" && strings.TrimSpace(options.orgRole) != "" && !options.foreground {
+		options.background = true
+	}
+	return nil
 }
 
 func dispatchAgentCommand(options agentRunOptions, action string, reason string, executionPath string, stdout, stderr io.Writer) (localAgentJobOutput, int) {
@@ -773,10 +800,7 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 		fmt.Fprintf(stderr, "%s: --background and --foreground are mutually exclusive\n", label)
 		return agentRunOptions{}, false
 	}
-	if options.foreground && command != "review" {
-		fmt.Fprintf(stderr, "%s: --foreground is only supported for agent review\n", label)
-		return agentRunOptions{}, false
-	}
+
 	normalizedRecipe, err := validateRecipeID(options.recipe)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", label, err)
@@ -920,7 +944,7 @@ func printAgentRunUsage(w io.Writer, command string) {
 	case "implement":
 		fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--base ref] [--head-sha sha] [--branch branch] [--draft|--ready] [--background] [--type type] [--action implement] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--skip-native-review-fanout] [--home path] [--json]")
 	default:
-		fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--lead implementer] [--head-sha sha] [--base ref] [--branch branch] [--draft|--ready] [--background] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--recipe id] [--skip-native-review-fanout] [--home path] [--json]")
+		fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--lead implementer] [--head-sha sha] [--base ref] [--branch branch] [--draft|--ready] [--background|--foreground] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--recipe id] [--skip-native-review-fanout] [--home path] [--json]")
 	}
 	if command == "implement" || command == "run" {
 		fmt.Fprintln(w, "  --base <ref> selects the starting commit for implement worktrees; origin/* refs are fetched before resolution.")
