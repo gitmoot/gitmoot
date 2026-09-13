@@ -264,6 +264,13 @@ type reviewVerdictPayload struct {
 		// mailbox seam, where normalization records FanOut instead.
 		Delegations []json.RawMessage `json:"delegations"`
 		FanOut      bool              `json:"fan_out,omitempty"`
+		// Findings, TestsRun and Evidence feed the requester's wake (#2171) so a
+		// woken seat learns what the verdict rests on without a second lookup.
+		Findings []struct {
+			Severity string `json:"severity"`
+		} `json:"findings"`
+		TestsRun []string `json:"tests_run"`
+		Evidence string   `json:"evidence"`
 	} `json:"result"`
 }
 
@@ -410,7 +417,9 @@ func reviewVerdictFact(jobID, agent, state, payload string, blockingSeverity fun
 		!reviewseverity.Blocks(strings.ToUpper(strings.TrimSpace(decoded.Result.Severity)), blockingSeverity(decoded.Repo)) {
 		decision = "approved"
 	}
-	detail := fmt.Sprintf("review verdict %s from %s job %s at head %s", decision, strings.TrimSpace(agent), strings.TrimSpace(jobID), decoded.HeadSHA)
+	detail := fmt.Sprintf("review verdict %s from %s job %s at head %s; findings=%d executed_checks=%d evidence=%s; inspect with gitmoot job show %s",
+		decision, strings.TrimSpace(agent), strings.TrimSpace(jobID), decoded.HeadSHA,
+		len(decoded.Result.Findings), len(decoded.Result.TestsRun), firstNonEmptyString(strings.TrimSpace(decoded.Result.Evidence), "undeclared"), strings.TrimSpace(jobID))
 	return reviewVerdictObservation{repo: decoded.Repo, pullRequest: decoded.PullRequest, headSHA: decoded.HeadSHA, detail: detail}, true
 }
 

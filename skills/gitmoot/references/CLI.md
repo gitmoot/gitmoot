@@ -796,6 +796,68 @@ transition **instead of** `job.failed` (no preceding `job.failed`); the rule
 still holds and is forward-compatible with the older `job.failed`→`job.deferred`
 flap. See `docs/events.md` for the full contract.
 
+## Review Router
+
+`gitmoot review request` is the front door for asking for an independent review.
+The requester names the pull request; Gitmoot picks the reviewer, runtime and
+model, deduplicates on the exact head, and wakes the requester when the verdict
+is saved. It replaces hand-assembling `agent review ... --runtime omp --model
+... --no-fix-target` per seat; that lower-level form remains the engine
+underneath and is still valid for a deliberate manual dispatch.
+
+```sh
+gitmoot review request --pr 2170 [--repo owner/repo] [--purpose code|security|ui|architecture] \
+    [--head <40-hex>] [--branch <name>] [--role <org-role>] [--ttl 12h] [--reviewer <agent>] [--json]
+gitmoot review status --pr 2170 [--repo owner/repo] [--json]
+```
+
+What one request does, in order:
+
+1. Resolves the pull request's current head (or binds `--head`, which must be the
+   full 40 hex characters) and the requester role (`--role`, default
+   `GITMOOT_ORG_ROLE`; it must exist in the organization chart because it is the
+   notification destination).
+2. Claims `(repo, PR, head, purpose)` atomically in `review_requests`. Exactly one
+   concurrent requester wins and dispatches; every other returns `state:
+   attached` naming the same job. A claim standing on a job that ended WITHOUT a
+   result (crash, cancel, exhausted operational retries) is taken over, so an
+   operational failure never blocks a later request. A claim standing on a saved
+   verdict returns `state: verdict_exists` with the decision and spends nothing.
+   A different `--purpose` is a different question and runs in parallel.
+3. Selects a registered agent with the `review` capability, WITHOUT `implement`,
+   scoped to the repository (omp-native agents first, then by name), or the
+   `--reviewer` you name. The job runs as a background review-only job on `omp`
+   with a fresh per-job session, `--no-fix-target` semantics, and the first
+   model of the purpose's pool; merge-gate independence rules apply unchanged.
+4. Subscribes the requester to the exact-head verdict (`gitmoot org await
+   review` underneath). The wake fires from the reviewing job's own state
+   transition when the verdict is persisted, before and independently of gate
+   advancement, and it carries the decision, findings count, executed-check
+   count, evidence declaration and the `gitmoot job show <id>` command. A second
+   request by the same role keeps its original wait. When the wait's `--ttl`
+   elapses it expires to the role's parent, as every awaited fact does.
+
+The request prints any admission hold it can see at dispatch time (daemon not
+running, disk guard paused) so a held review is distinguishable from a slow one;
+`review status` lists every review job on the pull request with head, model,
+verdict, evidence and the daemon's current hold reason.
+
+Model pools are configured per purpose; an unconfigured purpose uses `code`:
+
+```toml
+[review_router]
+code         = ["devin/swe-2", "openai-codex/gpt-5.6-sol"]
+security     = ["anthropic/claude-opus-4-6", "devin/swe-2"]
+```
+
+Every entry is a provider-qualified omp model. When a delivery fails on a
+PROVIDER quota or auth error before any verdict, the daemon advances the job to
+the next pool entry and re-queues it immediately (event
+`review_model_fallback`) instead of waiting out the provider's window; with the
+pool exhausted the ordinary timed operational hold applies, and the shared
+attempt budget bounds the whole sequence. A verdict, a finding, or a product
+failure never changes the model: fallback exists for operational failure only.
+
 ## Review Policy
 
 Review severity controls whether a reported finding restarts the fix loop. The

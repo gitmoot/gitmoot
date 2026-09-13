@@ -38,6 +38,7 @@ var rootCommands = []command{
 	{name: "repo", summary: "manage watched repositories", run: runRepo},
 	{name: "daemon", summary: "run the local PR watcher", run: runDaemon},
 	{name: "agent", summary: "manage registered agents", run: runAgent},
+	{name: "review", summary: "request a routed independent review and follow its verdict", run: runReview},
 	{name: "runtime", summary: "inspect runtime metadata (models, capabilities, usage)", run: runRuntime},
 	{name: "sandbox", summary: "probe kernel-enforced runtime sandbox support", run: runSandbox},
 	{name: "orchestrate", summary: "Orchestrate work across agents (a coordinator that fans out delegations)", run: runOrchestrate},

@@ -106,6 +106,29 @@ const blockerExhaustedEventKind = "blocker_retries_exhausted"
 // explain a job an operator has to unblock rather than retry.
 const blockerBlockedEventKind = "blocker_runtime_unavailable"
 
+// reviewModelFallbackEventKind is recorded when a #2171 routed review advances
+// to the next model in its pool instead of waiting out a provider hold. The job
+// is re-queued immediately; the event names both models so the attempt history
+// stays auditable without decoding payloads.
+const reviewModelFallbackEventKind = "review_model_fallback"
+
+// nextReviewPoolModel returns the pool entry after the one currently in use.
+// Only quota and auth failures qualify: they are facts about one provider.
+// Network outages and checkout contention are not solved by a different model,
+// and a job with no pool (every non-router job) never reaches the fallback.
+func nextReviewPoolModel(payload workflow.JobPayload, class blockerClass) (string, bool) {
+	if class != blockerClassRuntimeQuota && class != blockerClassRuntimeAuth {
+		return "", false
+	}
+	current := strings.TrimSpace(payload.Model)
+	for i, model := range payload.ReviewModelPool {
+		if model == current && i+1 < len(payload.ReviewModelPool) {
+			return payload.ReviewModelPool[i+1], true
+		}
+	}
+	return "", false
+}
+
 // runtimeUnavailableSignatures are the renderings a capability refusal actually
 // produces on this host. Measured, not guessed - every one of them appears in
 // this store's job_events:
@@ -611,8 +634,21 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 	retryAt := classification.RetryAt.Format(time.RFC3339Nano)
 	payload.BlockerClass = string(classification.Class)
 	payload.BlockerAttempts = attempt
-	payload.BlockerRetryAt = retryAt
 	payload.BlockerSuggestedAction = classification.SuggestedAction
+	// #2171 router fallback: a quota/auth failure on one pool entry is an
+	// operational fact about that provider, not about the review, so advance to
+	// the next untried model and re-queue immediately instead of waiting out the
+	// provider's window. Only pre-verdict operational classes qualify; the
+	// exhausted pool falls through to the timed hold unchanged, and the shared
+	// attempt budget above still bounds the whole sequence.
+	eventKind := blockerDeferredEventKind
+	previousModel := payload.Model
+	if next, ok := nextReviewPoolModel(payload, classification.Class); ok {
+		payload.Model = next
+		retryAt = time.Now().UTC().Format(time.RFC3339Nano)
+		eventKind = reviewModelFallbackEventKind
+	}
+	payload.BlockerRetryAt = retryAt
 	// MID-DELIVERY (#532): the agent WAS delivered a prompt and may have executed side
 	// effects before the blocker cut it off, so this retry is at-least-once — clear any
 	// pre-delivery marker a prior checkout_contention hold left so Mailbox.Run still
@@ -630,9 +666,13 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 	}
 	message := fmt.Sprintf("%s: attempt %d/%d, retry at %s: %s",
 		classification.Class, attempt, maxOperationalBlockerRetries, retryAt, classification.Detail)
+	if eventKind == reviewModelFallbackEventKind {
+		message = fmt.Sprintf("%s on %s; falling back to review model %s (attempt %d/%d): %s",
+			classification.Class, previousModel, payload.Model, attempt, maxOperationalBlockerRetries, classification.Detail)
+	}
 	transitioned, err := w.Store.TransitionJobStateWithEvent(ctx, jobID, string(workflow.JobRunning), string(workflow.JobQueued), db.JobEvent{
 		JobID:   jobID,
-		Kind:    blockerDeferredEventKind,
+		Kind:    eventKind,
 		Message: message,
 	})
 	if err != nil {

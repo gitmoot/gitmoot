@@ -2784,4 +2784,21 @@ CREATE INDEX IF NOT EXISTS idx_routing_telemetry_fan_out ON routing_telemetry(ac
 ALTER TABLE job_events ADD COLUMN provider TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_job_events_provider ON job_events(job_id, id) WHERE provider != '';
 	`,
+	// #2171 review router. One row per (repo, PR, exact head, purpose): the
+	// PRIMARY KEY insert is the atomic claim that decides which concurrent
+	// requester dispatches and which attach. job_id is the reviewing job the
+	// claim currently stands on; it is replaced only when that job ended without
+	// a verdict, so an operational failure never blocks a later request and a
+	// saved verdict is never reviewed twice. Append-only tail; positional.
+	`
+CREATE TABLE IF NOT EXISTS review_requests (
+	subject_key TEXT PRIMARY KEY,
+	job_id TEXT NOT NULL,
+	purpose TEXT NOT NULL,
+	requester TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_requests_job ON review_requests(job_id);
+	`,
 }

@@ -470,6 +470,19 @@ func (s *Store) ListJobsByRepo(ctx context.Context, repo string) ([]Job, error) 
 	return scanJobs(rows)
 }
 
+// ListReviewJobsForPullRequest returns every review job recorded against one
+// pull request, newest first. It serves the #2171 router's dedup decision, so
+// it reads the indexed repo/pull_request projection rather than every payload.
+func (s *Store) ListReviewJobsForPullRequest(ctx context.Context, repo string, pullRequest int) ([]Job, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+jobColumns+` FROM jobs
+		WHERE type = 'review' AND lower(repo) = ? AND pull_request = ?
+		ORDER BY created_at DESC, id DESC`, strings.ToLower(strings.TrimSpace(repo)), pullRequest)
+	if err != nil {
+		return nil, err
+	}
+	return scanJobs(rows)
+}
+
 // ListJobsByParent returns the direct children of parentJobID (delegation
 // children and the coordinator continuation job), ordered by delegation_id then
 // id for a stable tree. It selects updated_at like ListJobs so callers can show

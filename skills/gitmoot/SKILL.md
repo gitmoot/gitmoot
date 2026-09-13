@@ -174,10 +174,14 @@ locks, commits, pushes, PRs, and workflow advancement. Add `--action
 ask|review|implement` when that job action must be explicit; `--type` is
 independent and selects a managed agent type, not an action. Use
 `gitmoot agent ask <agent> --repo owner/repo "..."` only for
-analysis, planning, or questions. Use `gitmoot agent review <reviewer> --repo
-owner/repo --pr <number> --lead <implementer> "..."` for PR review decisions;
-the lead must be a registered, repo-allowed agent with `implement` capability
-and a write-granting policy so requested changes can route to it. Use `gitmoot agent
+analysis, planning, or questions. To get an independent review of a pull
+request, use `gitmoot review request --pr <number>` and let Gitmoot choose the
+reviewer, runtime and model, deduplicate on the exact head, and wake your role
+when the verdict is saved (CLI.md § Review Router). Use `gitmoot agent review
+<reviewer> --repo owner/repo --pr <number> --lead <implementer> "..."` only for
+a deliberate manual dispatch; there the lead must be a registered, repo-allowed
+agent with `implement` capability and a write-granting policy so requested
+changes can route to it. Use `gitmoot agent
 implement <agent> --repo owner/repo --task <task-id> "..."` for file changes.
 For a fix pass on an existing open PR, use `agent implement --pr <number>` (or
 `agent run --action implement --pr <number>`); Gitmoot validates that the PR is
