@@ -48,7 +48,7 @@ func TestFindRepeatedReviewersSeesARoleAuthoredVerdict(t *testing.T) {
 	store := openEngineStore(t)
 	seedRoleAuthoredVerdict(t, store, "session-review-1", " GitMoot ", "head-a", "changes_requested")
 
-	matches, err := FindRepeatedReviewers(ctx, store, "owner/repo", 227, "head-a", []string{"gitmoot"})
+	matches, err := FindRepeatedReviewers(ctx, store, "owner/repo", 227, "head-a", []string{"gitmoot"}, "")
 	if err != nil {
 		t.Fatalf("FindRepeatedReviewers: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestFindRepeatedReviewersStillIgnoresAnUnrelatedRole(t *testing.T) {
 	store := openEngineStore(t)
 	seedRoleAuthoredVerdict(t, store, "session-review-1", "gitmoot", "head-a", "changes_requested")
 
-	matches, err := FindRepeatedReviewers(ctx, store, "owner/repo", 227, "head-a", []string{"phobos"})
+	matches, err := FindRepeatedReviewers(ctx, store, "owner/repo", 227, "head-a", []string{"phobos"}, "")
 	if err != nil {
 		t.Fatalf("FindRepeatedReviewers: %v", err)
 	}

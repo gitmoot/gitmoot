@@ -297,6 +297,52 @@ func TestReviewRequestVerdictDoesNotSatisfyAnotherPurpose(t *testing.T) {
 	}
 }
 
+// The parallel-purposes contract must hold where agent substitution CANNOT
+// help: one eligible reviewer, and an explicit --reviewer naming the agent that
+// already answered. DetectReviewLoop keys on agent and head, so unless it also
+// keys on PURPOSE the second request is refused as a loop — the documented
+// contract broken by the guard that protects a different property.
+func TestReviewRequestSecondPurposeSurvivesTheLoopGuardWithOneReviewer(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	seedDaemonWorkerAgentWithPolicy(t, store, "only-reviewer", runtime.ShellRuntime, "true", []string{"review", "ask"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	base := []string{"--repo", "owner/repo", "--pr", "12", "--head", head, "--branch", "feature/review", "--home", home, "--json", "--reviewer", "only-reviewer"}
+
+	code, failure := runReviewRequestJSON(t, append(append([]string{}, base...), "--role", "joltra")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	payload, err := workflow.ParseJobPayload(mustGetJob(t, store, code.JobID).Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload.Result = &workflow.AgentResult{Decision: "approved", Summary: "code clean", TestsRun: []string{"go test ./..."}, Evidence: "executed"}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TransitionJobStatePayloadWithEvent(ctx, code.JobID, string(workflow.JobQueued), string(workflow.JobSucceeded), string(encoded), db.JobEvent{JobID: code.JobID, Kind: "succeeded", Message: "job succeeded"}); err != nil {
+		t.Fatal(err)
+	}
+
+	security, failure := runReviewRequestJSON(t, append(append([]string{}, base...), "--role", "owner", "--purpose", "security")...)
+	if failure != "" {
+		t.Fatalf("a security request after a code verdict by the SAME agent was refused: %s", failure)
+	}
+	if security.State != reviewRequestDispatched || security.JobID == code.JobID {
+		t.Fatalf("security request = %+v, want its own dispatched review", security)
+	}
+
+	// The guard must still bite for a REPEAT of the same purpose by the same
+	// agent at the same head; purpose-awareness must not disable it.
+	var stdout, stderr bytes.Buffer
+	if exit := runReview(append([]string{"request"}, append(append([]string{}, base...), "--role", "joltra")...), &stdout, &stderr); exit == 0 {
+		if out := stdout.String(); !strings.Contains(out, reviewRequestVerdictExists) {
+			t.Fatalf("a repeated CODE request = %q, want the existing verdict rather than a fresh review", out)
+		}
+	}
+}
+
 // releaseUnenqueuedReviewClaim frees a claim ONLY when its job was never
 // enqueued. Two ways to get that wrong, both tested here because both hand the
 // subject to a second reviewer:

@@ -345,6 +345,10 @@ type SucceededReviewVerdict struct {
 	HeadSHA  string
 	Decision string
 	Severity string
+	// ReviewPurpose is the question this verdict answered (#2171). Empty for
+	// every verdict that predates the router; consumers default it to
+	// DefaultReviewPurpose so a legacy verdict still answers a code request.
+	ReviewPurpose string
 	// EffectiveRuntime is the runtime the review job ran on, when the dispatch
 	// recorded it (#1528). Empty for jobs that predate that recording; callers
 	// resolving a runtime family fall back to the agent registry default.
@@ -413,6 +417,7 @@ ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 		verdicts = append(verdicts, SucceededReviewVerdict{
 			JobID:            strings.TrimSpace(jobID),
 			Agent:            strings.TrimSpace(agent),
+			ReviewPurpose:    strings.ToLower(strings.TrimSpace(decoded.ReviewPurpose)),
 			HeadSHA:          strings.ToLower(strings.TrimSpace(decoded.HeadSHA)),
 			Decision:         decision,
 			Severity:         strings.ToUpper(strings.TrimSpace(decoded.Result.Severity)),

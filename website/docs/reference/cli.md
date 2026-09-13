@@ -1330,9 +1330,13 @@ What one request does, in order:
    `state: verdict_exists` and spends nothing. A claim whose job DELEGATED the
    answer — a staged-review preflight whose own result is a fan-out — is held
    while its verdict child still runs. A different `--purpose` is a different
-   question and runs in parallel, and the router picks a reviewer that has not
-   already answered at this head so the purpose-blind review-loop guard cannot
-   refuse the second purpose.
+   question and runs in parallel: review-loop detection matches PURPOSE as well
+   as agent and head, so a security request is not refused because a code
+   review already happened — including with one eligible reviewer or an
+   explicit `--reviewer`, where substituting a different agent is not an
+   option. A repeat of the SAME purpose by the same agent at the same head is
+   still refused, and everything outside the router carries no purpose on
+   either side, so its comparison is the historical one.
 3. Selects a registered agent with the `review` capability, WITHOUT `implement`,
    scoped to the repository (omp-native agents first, then by name), or the
    `--reviewer` you name. The job runs as a background review-only job on `omp`

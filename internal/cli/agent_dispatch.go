@@ -1318,7 +1318,7 @@ func prepareLocalReviewDispatchRequest(ctx context.Context, store *db.Store, rec
 			request.HeadSHA = pr.HeadSHA
 		}
 	}
-	if match, detected, err := workflow.DetectReviewLoop(ctx, store, repo.FullName(), request.PullRequest, request.HeadSHA, []string{request.Agent}); err != nil {
+	if match, detected, err := workflow.DetectReviewLoop(ctx, store, repo.FullName(), request.PullRequest, request.HeadSHA, []string{request.Agent}, request.ReviewPurpose); err != nil {
 		return localAgentDispatchRequest{}, err
 	} else if detected {
 		return localAgentDispatchRequest{}, errors.New(match.Reason())

@@ -54,8 +54,8 @@ func (m ReviewLoopMatch) Reason() string {
 //
 // On a match, the event is claimed against the matched succeeded job. No new
 // review job is created, and no prior result is returned to the caller.
-func DetectReviewLoop(ctx context.Context, store *db.Store, repo string, pullRequest int, headSHA string, requestingAgents []string) (ReviewLoopMatch, bool, error) {
-	matches, err := FindRepeatedReviewers(ctx, store, repo, pullRequest, headSHA, requestingAgents)
+func DetectReviewLoop(ctx context.Context, store *db.Store, repo string, pullRequest int, headSHA string, requestingAgents []string, purpose string) (ReviewLoopMatch, bool, error) {
+	matches, err := FindRepeatedReviewers(ctx, store, repo, pullRequest, headSHA, requestingAgents, purpose)
 	if err != nil {
 		return ReviewLoopMatch{}, false, err
 	}
@@ -68,7 +68,7 @@ func DetectReviewLoop(ctx context.Context, store *db.Store, repo string, pullReq
 // FindRepeatedReviewers returns exact-head verdict evidence for each requesting
 // agent that has already reviewed the head. The result preserves requester
 // order and performs one verdict query for the whole native roster.
-func FindRepeatedReviewers(ctx context.Context, store *db.Store, repo string, pullRequest int, headSHA string, requestingAgents []string) ([]ReviewLoopMatch, error) {
+func FindRepeatedReviewers(ctx context.Context, store *db.Store, repo string, pullRequest int, headSHA string, requestingAgents []string, purpose string) ([]ReviewLoopMatch, error) {
 	repo = strings.ToLower(strings.TrimSpace(repo))
 	headSHA = strings.ToLower(strings.TrimSpace(headSHA))
 	verdicts, err := store.SucceededReviewVerdicts(ctx, repo, pullRequest)
@@ -76,6 +76,33 @@ func FindRepeatedReviewers(ctx context.Context, store *db.Store, repo string, pu
 		return nil, err
 	}
 	if len(verdicts) == 0 || len(requestingAgents) == 0 {
+		return nil, nil
+	}
+
+	// A LOOP IS A REPEATED ANSWER TO THE SAME QUESTION (#2172 review round 2).
+	// Keyed on agent and head alone, a security request was refused because a
+	// code review had already happened at that head - flatly contradicting the
+	// documented parallel-purposes contract, and unavoidable by substituting a
+	// different agent when the pool holds one or --reviewer names it. Verdicts
+	// answering a DIFFERENT purpose are therefore not loop evidence. Everything
+	// outside the router carries no purpose on either side, so both default and
+	// the comparison is the historical one.
+	wantPurpose := strings.ToLower(strings.TrimSpace(purpose))
+	if wantPurpose == "" {
+		wantPurpose = db.DefaultReviewPurpose
+	}
+	filtered := verdicts[:0:0]
+	for _, verdict := range verdicts {
+		got := strings.ToLower(strings.TrimSpace(verdict.ReviewPurpose))
+		if got == "" {
+			got = db.DefaultReviewPurpose
+		}
+		if got == wantPurpose {
+			filtered = append(filtered, verdict)
+		}
+	}
+	verdicts = filtered
+	if len(verdicts) == 0 {
 		return nil, nil
 	}
 

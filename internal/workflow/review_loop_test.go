@@ -8,7 +8,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 )
 
-var _ func(context.Context, *db.Store, string, int, string, []string) (ReviewLoopMatch, bool, error) = DetectReviewLoop
+var _ func(context.Context, *db.Store, string, int, string, []string, string) (ReviewLoopMatch, bool, error) = DetectReviewLoop
 
 // Review-loop tests pin the agent-identity boundary. Runtime family is
 // deliberately not part of the refusal: a different agent of the same family
@@ -71,7 +71,7 @@ func TestDetectReviewLoopSameAgentSameHeadRefused(t *testing.T) {
 	seedReviewLoopAgent(t, store, "g7-review", "codex", "gpt-5.6-sol")
 	seedReviewLoopVerdict(t, store, "review-g7", "g7-review", "head-a", "approved", "codex")
 
-	match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review"})
+	match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review"}, "")
 	if err != nil {
 		t.Fatalf("DetectReviewLoop: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestDetectReviewLoopSkippedSameAgentSameHeadAllowed(t *testing.T) {
 	seedReviewLoopAgent(t, store, "g7-review", "codex", "gpt-5.6-sol")
 	seedReviewLoopVerdict(t, store, "review-g7-skipped", "g7-review", "head-a", "skipped", "codex")
 
-	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review"}); err != nil {
+	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review"}, ""); err != nil {
 		t.Fatalf("DetectReviewLoop skipped abstention: %v", err)
 	} else if detected {
 		t.Fatal("skipped is an abstention and must not suppress same-agent retry")
@@ -120,10 +120,10 @@ func TestDetectReviewLoopDifferentAgentSameFamilyAllowed(t *testing.T) {
 	seedReviewLoopAgent(t, store, "g6-review-sol", "codex", "gpt-5.6-sol")
 	seedReviewLoopVerdict(t, store, "review-g7", "g7-review", "head-a", "approved", "codex")
 
-	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review"}); err != nil || !detected {
+	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review"}, ""); err != nil || !detected {
 		t.Fatalf("control same-agent detection = %v, err=%v; want true", detected, err)
 	}
-	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"g6-review-sol"}); err != nil {
+	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"g6-review-sol"}, ""); err != nil {
 		t.Fatalf("DetectReviewLoop different agent: %v", err)
 	} else if detected {
 		t.Fatal("different agent in the same runtime family must remain eligible")
@@ -137,7 +137,7 @@ func TestFindRepeatedReviewersFiltersOnlyAgentsWithVerdicts(t *testing.T) {
 	seedReviewLoopAgent(t, store, "g6-review-sol", "codex", "gpt-5.6-sol")
 	seedReviewLoopVerdict(t, store, "review-g7", "g7-review", "head-a", "changes_requested", "codex")
 
-	matches, err := FindRepeatedReviewers(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review", "g6-review-sol"})
+	matches, err := FindRepeatedReviewers(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review", "g6-review-sol"}, "")
 	if err != nil {
 		t.Fatalf("FindRepeatedReviewers: %v", err)
 	}
@@ -152,10 +152,10 @@ func TestDetectReviewLoopSameAgentNewHeadAllowed(t *testing.T) {
 	seedReviewLoopAgent(t, store, "g7-review", "codex", "gpt-5.6-sol")
 	seedReviewLoopVerdict(t, store, "review-g7", "g7-review", "head-a", "approved", "codex")
 
-	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review"}); err != nil || !detected {
+	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review"}, ""); err != nil || !detected {
 		t.Fatalf("control same-head detection = %v, err=%v; want true", detected, err)
 	}
-	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-b", []string{"g7-review"}); err != nil {
+	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-b", []string{"g7-review"}, ""); err != nil {
 		t.Fatalf("DetectReviewLoop new head: %v", err)
 	} else if detected {
 		t.Fatal("a new head must permit the same reviewer")
@@ -167,13 +167,13 @@ func TestDetectReviewLoopEmptyHeadRule(t *testing.T) {
 	store := openEngineStore(t)
 	seedReviewLoopAgent(t, store, "g7-review", "codex", "gpt-5.6-sol")
 
-	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "", []string{"g7-review"}); err != nil {
+	if _, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "", []string{"g7-review"}, ""); err != nil {
 		t.Fatalf("DetectReviewLoop before history: %v", err)
 	} else if detected {
 		t.Fatal("empty head before any succeeded history must be allowed")
 	}
 	seedReviewLoopVerdict(t, store, "review-g7", "g7-review", "head-a", "approved", "codex")
-	match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "", []string{"g7-review"})
+	match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "", []string{"g7-review"}, "")
 	if err != nil {
 		t.Fatalf("DetectReviewLoop after history: %v", err)
 	}
