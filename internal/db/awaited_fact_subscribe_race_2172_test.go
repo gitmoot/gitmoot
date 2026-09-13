@@ -53,3 +53,37 @@ func TestSubscribeAwaitedFactAttachesInsteadOfRacingTheLiveSubjectIndex(t *testi
 		t.Fatalf("subscribers hold different waits: %d and %d, want one live wait attached twice", ids[0], ids[1])
 	}
 }
+
+// #2176: attaching must never SHORTEN the live wait. A joiner asking for a
+// minute could expire a winner that asked for an hour.
+func TestSubscribeAwaitedFactAttachKeepsTheLongerDeadline(t *testing.T) {
+	store := openAwaitedFactTestStore(t)
+	ctx := context.Background()
+	key, err := ReviewRequestSubjectKey("owner/repo", 12, "a151df794c3434b2bb113713f85f34d19b3cd0d3", "code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	long := time.Now().UTC().Add(time.Hour)
+	first, _, err := store.SubscribeAwaitedFact(ctx, AwaitedFactSubscription{WaiterRole: "joltra", SubjectKind: AwaitedFactSubjectReviewVerdict, SubjectKey: key, Deadline: long})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := store.SubscribeAwaitedFact(ctx, AwaitedFactSubscription{WaiterRole: "joltra", SubjectKind: AwaitedFactSubjectReviewVerdict, SubjectKey: key, Deadline: time.Now().UTC().Add(time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("second subscribe made a new wait %d, want the live one %d", second.ID, first.ID)
+	}
+	var deadline string
+	if err := store.db.QueryRowContext(ctx, "SELECT deadline FROM awaited_facts WHERE id = ?", first.ID).Scan(&deadline); err != nil {
+		t.Fatal(err)
+	}
+	got, err := time.Parse(time.RFC3339Nano, deadline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Before(long.Add(-time.Second)) {
+		t.Fatalf("deadline shortened to %s, want the winner's %s: a joiner must not expire an existing wait early", got, long)
+	}
+}

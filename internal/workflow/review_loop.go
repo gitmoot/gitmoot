@@ -35,18 +35,24 @@ type ReviewLoopMatch struct {
 	EmptyHead   bool
 }
 
-// Reason is the actionable refusal shown by both dispatch paths.
+// Reason is the actionable refusal shown by both dispatch paths. It names the
+// purpose scope (#2171) because the commonest way to hit this is asking the
+// same question twice, and the commonest way out is asking a different one.
 func (m ReviewLoopMatch) Reason() string {
 	if m.EmptyHead {
 		return fmt.Sprintf("review loop detected for %s pull request #%d: requested head SHA is empty after succeeded review job %s (%s); supply the current head SHA before retrying",
 			m.Repo, m.PullRequest, m.JobID, m.Decision)
 	}
-	return fmt.Sprintf("review loop detected for %s pull request #%d at head %s: agent %s already holds the stable %s decision at this head (succeeded review job %s); dispatch a different agent or push a new head before retrying",
+	return fmt.Sprintf("review loop detected for %s pull request #%d at head %s: agent %s already holds the stable %s decision at this head for this purpose (succeeded review job %s); dispatch a different agent, ask a different purpose, or push a new head before retrying",
 		m.Repo, m.PullRequest, m.HeadSHA, m.Agent, m.Decision, m.JobID)
 }
 
 // DetectReviewLoop refuses a dispatch when any requested agent already produced
-// a succeeded verdict at the exact requested head. Agent identity is the
+// a succeeded verdict at the exact requested head FOR THE SAME PURPOSE (#2171).
+// A loop is a repeated answer to the same question, and the question includes
+// the purpose: a security review at a head that already carries a code verdict
+// is a different question and must not be refused. An empty purpose on either
+// side means the default, so every pre-router caller compares as before. Agent identity is the
 // boundary: a different agent from the same runtime family is independent for
 // merge-gate purposes and remains eligible. An empty requested head proceeds
 // only before any succeeded history exists; afterward it fails closed because it

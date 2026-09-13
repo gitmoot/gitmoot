@@ -368,17 +368,62 @@ func reviewJobStillAnswersWithin(ctx context.Context, store *db.Store, job db.Jo
 		// re-run, failing open costs a duplicate reviewer.
 		return true
 	}
+	// A FAN-OUT THAT ANNOUNCED CHILDREN BUT HAS NONE YET IS NOT FINISHED
+	// (#2176). Dispatch inserts the parent's announcement before the children
+	// rows exist, so an empty list here means "too early to tell", not "the
+	// tree is done". Reading it as done let takeover dispatch a duplicate
+	// reviewer, which costs real review capacity.
+	if len(children) == 0 {
+		return true
+	}
 	for _, child := range children {
-		// #2172 round 3: only a REVIEW child can answer a review question. A
+		// #2172 round 3: only a REVIEW child can ANSWER a review question. A
 		// staged preflight may also delegate a non-review leg (implement, ask)
 		// whose result legitimately carries decision="approved"; counting it
 		// pinned the claim forever while the awaited fact - which only a review
-		// verdict can satisfy - stayed unsatisfiable. A non-review child is not
-		// evidence in either direction, so it is skipped rather than trusted.
-		if !reviewTypedJob(child) {
+		// verdict can satisfy - stayed unsatisfiable.
+		//
+		// #2176: but it must still be WALKED THROUGH. Scoping the answer to
+		// review children also stopped the walk descending, so a review
+		// GRANDCHILD under a non-review leg became invisible and its claim was
+		// stealable while it worked. Answering and traversing are two different
+		// questions: a non-review job cannot answer, and can still be a parent
+		// of one that can.
+		if reviewTypedJob(child) {
+			if reviewJobStillAnswersWithin(ctx, store, child, seen) {
+				return true
+			}
 			continue
 		}
-		if reviewJobStillAnswersWithin(ctx, store, child, seen) {
+		if reviewDescendantStillAnswers(ctx, store, child, seen) {
+			return true
+		}
+	}
+	return false
+}
+
+// reviewDescendantStillAnswers walks a NON-review subtree looking for a review
+// job that can still answer. The node itself is never evidence - that is the
+// #2172 type scoping - but its descendants may be, which is the blind spot
+// #2176 closed. The visited set is shared with the caller, so a corrupted cycle
+// terminates here exactly as it does above.
+func reviewDescendantStillAnswers(ctx context.Context, store *db.Store, job db.Job, seen map[string]bool) bool {
+	if seen[job.ID] {
+		return false
+	}
+	seen[job.ID] = true
+	children, err := store.ListJobsByParent(ctx, job.ID)
+	if err != nil {
+		return true
+	}
+	for _, child := range children {
+		if reviewTypedJob(child) {
+			if reviewJobStillAnswersWithin(ctx, store, child, seen) {
+				return true
+			}
+			continue
+		}
+		if reviewDescendantStillAnswers(ctx, store, child, seen) {
 			return true
 		}
 	}

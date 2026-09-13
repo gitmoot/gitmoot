@@ -884,3 +884,53 @@ func TestReviewRequestSurfacesAHeadlessReviewSkipAsAHold(t *testing.T) {
 	}
 	t.Fatalf("holds = %v, want the headless review named: the requester waits its whole TTL for a review that can never satisfy this exact-head wait", output.Holds)
 }
+
+// #2176, and the third time on this PR that a fix created its own defect: the
+// type filter that stopped a non-review child ANSWERING also stopped the walk
+// DESCENDING, so a review grandchild under a non-review leg was invisible and
+// its claim was stealable while it worked.
+func TestStagedPreflightSeesAReviewGrandchildUnderANonReviewChild(t *testing.T) {
+	_, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	job := stagedPreflightClaim(t, store, head, "implement", string(workflow.JobSucceeded), "approved")
+	middle := job.ID + "/delegation/leg"
+	makeJobAFanOutAnnouncement(t, store, middle)
+	payload, err := json.Marshal(map[string]any{"repo": "owner/repo", "pull_request": 12, "head_sha": head})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: middle + "/delegation/verdict", Agent: "opus-reviewer", Type: "review",
+		State: string(workflow.JobRunning), Payload: string(payload), Repo: "owner/repo", ParentJobID: middle,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !reviewJobStillAnswers(ctx, store, job) {
+		t.Fatal("a RUNNING review grandchild under a non-review leg is invisible: the claim is stealable while the real reviewer works")
+	}
+}
+
+// #2176: dispatch writes the parent's fan-out announcement before the children
+// rows exist. An empty child list means too early to tell, not finished - and
+// reading it as finished let takeover dispatch a duplicate reviewer.
+func TestStagedPreflightWithNoChildrenYetIsNotFinished(t *testing.T) {
+	_, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	announcement, err := json.Marshal(workflow.JobPayload{
+		Repo: "owner/repo", PullRequest: 12, HeadSHA: head, ReviewPurpose: "code",
+		Result: &workflow.AgentResult{Decision: "approved", FanOut: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "childless-preflight", Agent: "opus-reviewer", Type: "review", State: string(workflow.JobSucceeded), Payload: string(announcement), Repo: "owner/repo"}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.GetJob(ctx, "childless-preflight")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reviewJobStillAnswers(ctx, store, job) {
+		t.Fatal("a fan-out whose children are not enqueued yet reads as finished, so a duplicate reviewer is dispatched into live review capacity")
+	}
+}

@@ -188,11 +188,17 @@ func (s *Store) SubscribeAwaitedFact(ctx context.Context, request AwaitedFactSub
 	// answer is the attach the dedup would have produced. ON CONFLICT keeps this
 	// one statement, so the resolution is atomic rather than a read-after-error
 	// that a third writer could invalidate.
+	//
+	// #2176: the deadline only ever EXTENDS. Overwriting it with the joiner's
+	// shortened the winner's wait - a requester that asked for an hour could be
+	// expired early by a later requester asking for a minute.
 	row := tx.QueryRowContext(ctx, `
 INSERT INTO awaited_facts(waiter_role, subject_kind, subject_key, deadline)
 VALUES (?, ?, ?, ?)
 ON CONFLICT(waiter_role, subject_kind, subject_key) WHERE state = 'waiting'
-DO UPDATE SET deadline = excluded.deadline
+DO UPDATE SET deadline = CASE
+	WHEN excluded.deadline > awaited_facts.deadline THEN excluded.deadline
+	ELSE awaited_facts.deadline END
 RETURNING id`, request.WaiterRole, request.SubjectKind, request.SubjectKey, request.Deadline.Format(time.RFC3339Nano))
 	// RETURNING, not LastInsertId: SQLite leaves last_insert_rowid() untouched on
 	// the DO UPDATE arm, so the loser of the race would otherwise attach to some
