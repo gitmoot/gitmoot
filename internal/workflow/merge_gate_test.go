@@ -1545,16 +1545,17 @@ func TestDelegatedReviewEvidenceUsesBlockingSeverity(t *testing.T) {
 		ID: "child-review", Type: "review", State: string(JobSucceeded), Payload: string(encoded),
 	}}
 
-	if _, err := ensureDelegatedReviewEvidence(db.Job{ID: "parent-review"}, children, nil, reviewseverity.P1); err != nil {
+	childrenByParent := map[string][]db.Job{"parent-review": children}
+	if _, err := ensureDelegatedReviewEvidence(db.Job{ID: "parent-review"}, childrenByParent, nil, reviewseverity.P1); err != nil {
 		t.Fatalf("sub-threshold delegated review returned error: %v", err)
 	}
-	if _, err := ensureDelegatedReviewEvidence(db.Job{ID: "parent-review"}, children, nil, reviewseverity.P2); err == nil || !strings.Contains(err.Error(), "blocking") {
+	if _, err := ensureDelegatedReviewEvidence(db.Job{ID: "parent-review"}, childrenByParent, nil, reviewseverity.P2); err == nil || !strings.Contains(err.Error(), "blocking") {
 		t.Fatalf("at-threshold delegated review error = %v, want blocking evidence", err)
 	}
 	askChildren := []db.Job{{
 		ID: "child-ask", Type: "ask", State: string(JobSucceeded), Payload: string(encoded),
 	}}
-	if _, err := ensureDelegatedReviewEvidence(db.Job{ID: "parent-review"}, askChildren, nil, reviewseverity.P1); err == nil || !strings.Contains(err.Error(), "blocking") {
+	if _, err := ensureDelegatedReviewEvidence(db.Job{ID: "parent-review"}, map[string][]db.Job{"parent-review": askChildren}, nil, reviewseverity.P1); err == nil || !strings.Contains(err.Error(), "blocking") {
 		t.Fatalf("sub-threshold non-review child error = %v, want raw blocking decision", err)
 	}
 }

@@ -506,6 +506,31 @@ func TestReviewDelegationQuorumThresholdOnlyAppliesToReviewChildren(t *testing.T
 	}
 }
 
+func TestReviewDelegationQuorumRejectsFanOutAnnouncements(t *testing.T) {
+	delegations := []Delegation{{
+		ID: "review", Action: "review", SynthesisRule: "quorum", Quorum: 1,
+	}}
+	children := map[string]db.Job{
+		"review": {ID: "review", Type: "review", State: string(JobSucceeded)},
+	}
+	payloads := map[string]JobPayload{
+		"review": {Result: &AgentResult{
+			Decision: "approved",
+			Delegations: []Delegation{{
+				ID: "leaf", Action: "review",
+			}},
+		}},
+	}
+	if reviewDelegationQuorumSatisfied(delegations, children, payloads, 1, reviewseverity.P1) {
+		t.Fatal("a nested review fan-out announcement satisfied its parent's approval quorum")
+	}
+
+	payloads["review"].Result.Delegations = nil
+	if !reviewDelegationQuorumSatisfied(delegations, children, payloads, 1, reviewseverity.P1) {
+		t.Fatal("an ordinary approving review verdict did not satisfy quorum")
+	}
+}
+
 func TestDelegationVotePreservesSucceededStateContract(t *testing.T) {
 	delegations := []Delegation{{
 		ID: "verdict", Action: "ask", SynthesisRule: "vote",

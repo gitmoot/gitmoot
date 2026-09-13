@@ -838,11 +838,14 @@ Every surface that reads a review decision applies the same rule:
 - the **merge gate** excludes a fan-out row from the verdict population. It
   neither satisfies nor blocks the reviewer slot, so an independent verdict at
   the same head still decides the PR;
-- if the panel **reported**, the gate decides that slot on the delegates — at
-  least one approving child, no blocking, crashed, abstaining or still-running
-  child, and every declared delegation accounted for. Only the LATEST attempt of
-  each delegation counts, so an approved retry supersedes a failed original
-  instead of being poisoned by it;
+- if the panel **reported**, the gate walks nested fan-outs to their leaf
+  verdicts and decides that slot on those leaves — at least one approving leaf,
+  no blocking verdict, no crashed, abstaining or still-running node, and every
+  declared delegation accounted for. A coordinating child is still an
+  announcement, not a verdict. Identity, family and
+  `merge_gate_approval_evidence` records use the
+  actual approving leaves. Only the LATEST attempt of each delegation counts, so
+  an approved retry supersedes a failed original instead of being poisoned by it;
 - if the panel was announced and **never dispatched**, the gate reports
   `no review verdict at evaluated head: <agent> (job <id>, N declared) declared
   delegations that never reported` rather than merging or parking;

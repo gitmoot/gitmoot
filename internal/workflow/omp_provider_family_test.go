@@ -569,6 +569,151 @@ func TestPolicyMergeGateRejectsDelegatedImplementerApprovals(t *testing.T) {
 	}
 }
 
+func TestPolicyMergeGateEvaluatesNestedFanOutLeaves(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		leafAgent  string
+		seedLeaf   bool
+		wantMerge  bool
+		wantReason string
+	}{
+		{
+			name:       "nested implementer leaf is refused",
+			leafAgent:  "implementer",
+			seedLeaf:   true,
+			wantReason: "implementing agent",
+		},
+		{
+			name:       "nested announcement without a leaf stays pending",
+			leafAgent:  "independent-reviewer",
+			wantReason: "waiting for delegated review parent review-panel",
+		},
+		{
+			name:      "nested independent leaf approves and owns the audit event",
+			leafAgent: "independent-reviewer",
+			seedLeaf:  true,
+			wantMerge: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			basePayload := JobPayload{
+				Repo: "gitmoot/gitmoot", Branch: "task-9", PullRequest: 9,
+				HeadSHA: "head123", TaskID: "task-9",
+			}
+
+			implementPayload := basePayload
+			implementPayload.HeadSHA = ""
+			implementPayload.Result = &AgentResult{Decision: "implemented", Summary: "implemented"}
+			insertCompletedJob(t, store, db.Job{
+				ID: "implement-job", Agent: "implementer", Type: "implement",
+			}, implementPayload)
+
+			parentPayload := basePayload
+			parentPayload.HeadSHA = ""
+			parentPayload.DelegationID = "integration-parent"
+			parentPayload.WorktreePath = "/tmp/gitmoot-nested-review"
+			parentPayload.ReviewRound = "review-1"
+			parentPayload.Result = &AgentResult{
+				Decision: "approved",
+				Summary:  "delegating to a nested panel",
+				Delegations: []Delegation{{
+					ID: "middle", Agent: "middle-reviewer", Action: "review",
+				}},
+			}
+			insertCompletedJob(t, store, db.Job{
+				ID: "review-panel", Agent: "panel-parent", Type: "review",
+			}, parentPayload)
+
+			middlePayload := basePayload
+			middlePayload.HeadSHA = ""
+			middlePayload.DelegationID = "middle"
+			middlePayload.WorktreePath = "/tmp/gitmoot-nested-review/middle"
+			middlePayload.Result = &AgentResult{
+				Decision: "approved",
+				Summary:  "delegating to the leaf reviewer",
+				Delegations: []Delegation{{
+					ID: "leaf", Agent: tc.leafAgent, Action: "review",
+				}},
+			}
+			insertCompletedJob(t, store, db.Job{
+				ID: "review-panel/delegation/middle", Agent: "middle-reviewer", Type: "review",
+				ParentJobID: "review-panel", DelegationID: "middle",
+			}, middlePayload)
+
+			leafJobID := "review-panel/delegation/middle/delegation/leaf"
+			if tc.seedLeaf {
+				leafPayload := basePayload
+				leafPayload.HeadSHA = ""
+				leafPayload.DelegationID = "leaf"
+				leafPayload.WorktreePath = "/tmp/gitmoot-nested-review/middle/leaf"
+				leafPayload.Result = &AgentResult{
+					Decision: "approved", Summary: "leaf approved",
+					Evidence: "executed", EvidenceDeclared: true,
+					TestsRun: []string{"nested production-path check"},
+				}
+				insertCompletedJob(t, store, db.Job{
+					ID: leafJobID, Agent: tc.leafAgent, Type: "review",
+					ParentJobID: "review-panel/delegation/middle", DelegationID: "leaf",
+				}, leafPayload)
+			}
+
+			mergeable := true
+			gh := &fakeMergeGateGitHub{
+				pr: github.PullRequest{
+					Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+					HeadSHA: "head123", Mergeable: &mergeable,
+				},
+				status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+				checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+				mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+			}
+			gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+			decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if decision.Merged != tc.wantMerge || (len(gh.merges) == 1) != tc.wantMerge {
+				t.Fatalf("decision=%+v merges=%d, want merge=%v", decision, len(gh.merges), tc.wantMerge)
+			}
+			if tc.wantReason != "" && !strings.Contains(decision.Reason.Render(), tc.wantReason) {
+				t.Fatalf("decision reason=%q, want %q", decision.Reason.Render(), tc.wantReason)
+			}
+			if !tc.wantMerge {
+				return
+			}
+
+			leafEvents, err := store.ListJobEvents(ctx, leafJobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			foundLeafEvidence := false
+			for _, event := range leafEvents {
+				if event.Kind == mergeApprovalEvidenceEvent &&
+					strings.Contains(event.Message, "approval by independent-reviewer") &&
+					strings.Contains(event.Message, "evidence=executed") {
+					foundLeafEvidence = true
+				}
+			}
+			if !foundLeafEvidence {
+				t.Fatalf("leaf approval evidence missing or misattributed: events=%+v", leafEvents)
+			}
+			for _, jobID := range []string{"review-panel", "review-panel/delegation/middle"} {
+				events, err := store.ListJobEvents(ctx, jobID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, event := range events {
+					if event.Kind == mergeApprovalEvidenceEvent {
+						t.Fatalf("fan-out announcement %s received approval evidence: %+v", jobID, event)
+					}
+				}
+			}
+		})
+	}
+}
+
 func insertSucceededNativeFamilyJob(t *testing.T, store *db.Store, jobID, agent, action, runtimeName string) {
 	t.Helper()
 	insertCompletedJob(t, store, db.Job{ID: jobID, Agent: agent, Type: action}, JobPayload{

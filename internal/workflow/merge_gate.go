@@ -1290,8 +1290,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		var authorship reviewAuthorshipAssessment
 		var undispatchedFanOuts []string
 		satisfied := false
-		var acceptedJob db.Job
-		var acceptedPayload JobPayload
+		var acceptedApprovals []delegatedReviewApproval
 		for _, review := range activeAtHead {
 			// THE THIRD SITE OF THE SAME IDENTITY RULE (#1950 F4, ruling 126350).
 			// Reading job.Agent alone classified a ROLE-AUTHORED approval as
@@ -1326,7 +1325,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			switch decision {
 			case "approved":
 				approvals, err := ensureDelegatedReviewEvidence(
-					review.job, delegationChildrenByParent[review.job.ID], review.payload.Result.Delegations, request.ReviewBlockingSeverity,
+					review.job, delegationChildrenByParent, review.payload.Result.Delegations, request.ReviewBlockingSeverity,
 				)
 				if err != nil {
 					return err
@@ -1335,7 +1334,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 					approvals = []delegatedReviewApproval{{job: review.job, payload: review.payload}}
 				}
 				satisfied = true
-				acceptedJob, acceptedPayload = review.job, review.payload
+				acceptedApprovals = append(acceptedApprovals, approvals...)
 				for _, approval := range approvals {
 					assessment, err := g.assessReviewAuthor(ctx, approval.job, approval.payload, implementingAgents, missingImplementerReason)
 					if err != nil {
@@ -1362,7 +1361,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		// AFTER every refusal, never inside the loop: an approval the gate then
 		// rejects (self-approval, unknown implementer, an undispatched fan-out)
 		// must not leave a record saying it authorised anything.
-		g.recordApprovalEvidence(ctx, acceptedJob, acceptedPayload)
+		for _, approval := range acceptedApprovals {
+			g.recordApprovalEvidence(ctx, approval.job, approval.payload)
+		}
 		return nil
 	}
 	var latest reviewRoundKey
@@ -1384,8 +1385,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		return errors.New("final agent review is not captured")
 	}
 	approved := false
-	var acceptedJob db.Job
-	var acceptedPayload JobPayload
+	var acceptedApprovals []delegatedReviewApproval
 	var authorship reviewAuthorshipAssessment
 	var undispatchedFanOuts []string
 	type eligibleReview struct {
@@ -1445,7 +1445,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		switch decision {
 		case "approved":
 			approvals, err := ensureDelegatedReviewEvidence(
-				job, delegationChildrenByParent[job.ID], payload.Result.Delegations, request.ReviewBlockingSeverity,
+				job, delegationChildrenByParent, payload.Result.Delegations, request.ReviewBlockingSeverity,
 			)
 			if err != nil {
 				return err
@@ -1458,9 +1458,12 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 					}
 					authorship.absorb(assessment)
 				}
+			} else {
+				// Direct approvals were assessed while eligibility was built above.
+				approvals = []delegatedReviewApproval{{job: job, payload: payload}}
 			}
 			approved = true
-			acceptedJob, acceptedPayload = job, payload
+			acceptedApprovals = append(acceptedApprovals, approvals...)
 		case "changes_requested", "blocked", "failed":
 			// A captured blocking review is an authoritative template-quality rejection
 			// (mergeBlocked), distinct from the transient/process review errors below
@@ -1481,7 +1484,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		return errors.New("required reviewer approval is missing")
 	}
 	// AFTER every refusal: see the same call on the other acceptance path.
-	g.recordApprovalEvidence(ctx, acceptedJob, acceptedPayload)
+	for _, approval := range acceptedApprovals {
+		g.recordApprovalEvidence(ctx, approval.job, approval.payload)
+	}
 	return nil
 }
 
@@ -1520,15 +1525,17 @@ type delegatedReviewApproval struct {
 	payload JobPayload
 }
 
-// ensureDelegatedReviewEvidence decides a delegating review on its CHILDREN,
-// which are the only evidence a fan-out produces. declared is the parent's own
-// delegations[]: a delegation that was announced but has no child row has not
-// reported, and counting it as reported is how an announcement used to reach
-// merge eligibility.
-// A successful result returns the children whose verdicts actually approved so
-// callers apply identity and family policy to verdict authors, not the parent
-// announcement.
-func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job, declared []Delegation, blockingSeverity string) ([]delegatedReviewApproval, error) {
+// ensureDelegatedReviewEvidence decides a delegation tree on its LEAF verdicts,
+// which are the only evidence any fan-out produces. declared is the current
+// parent's own delegations[]: a delegation that was announced but has no child
+// row has not reported, and counting any nested announcement as reported would
+// reintroduce the same announcement-as-verdict defect one level down.
+//
+// A successful result returns every leaf whose verdict actually approved so
+// callers apply identity, family, and audit policy to verdict authors rather
+// than to any coordinator announcement.
+func ensureDelegatedReviewEvidence(parent db.Job, childrenByParent map[string][]db.Job, declared []Delegation, blockingSeverity string) ([]delegatedReviewApproval, error) {
+	children := childrenByParent[parent.ID]
 	if len(children) == 0 {
 		return nil, nil
 	}
@@ -1543,62 +1550,94 @@ func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job, declared []
 	var abstaining []string
 	var parked []string
 	var unrecognized []string
-	reported := make(map[string]struct{}, len(children))
-	for _, child := range children {
-		if id := strings.TrimSpace(child.DelegationID); id != "" {
-			reported[id] = struct{}{}
+	ancestors := make(map[string]struct{})
+	var collect func(db.Job, []Delegation)
+	collect = func(current db.Job, currentDeclared []Delegation) {
+		currentID := strings.TrimSpace(current.ID)
+		if _, cycle := ancestors[currentID]; cycle {
+			unrecognized = append(unrecognized, fmt.Sprintf("%s (delegation cycle)", currentID))
+			return
 		}
-	}
-	for _, delegation := range declared {
-		id := strings.TrimSpace(delegation.ID)
-		if id == "" {
-			continue
+		ancestors[currentID] = struct{}{}
+		defer delete(ancestors, currentID)
+
+		currentChildren := childrenByParent[current.ID]
+		if len(currentChildren) == 0 {
+			if len(currentDeclared) == 0 {
+				active = append(active, fmt.Sprintf("%s (fan-out, no child jobs)", currentID))
+				return
+			}
+			for _, delegation := range currentDeclared {
+				id := strings.TrimSpace(delegation.ID)
+				if id != "" {
+					active = append(active, fmt.Sprintf("%s/%s (declared, no job)", currentID, id))
+				}
+			}
+			return
 		}
-		if _, ok := reported[id]; !ok {
-			// Dispatch happened (children exist) but this delegate produced no row, so
-			// its evidence is still outstanding rather than absent.
-			active = append(active, fmt.Sprintf("%s (declared, no job)", id))
+
+		reported := make(map[string]struct{}, len(currentChildren))
+		for _, child := range currentChildren {
+			if id := strings.TrimSpace(child.DelegationID); id != "" {
+				reported[id] = struct{}{}
+			}
 		}
-	}
-	for _, child := range children {
-		childID := strings.TrimSpace(child.ID)
-		switch JobState(child.State) {
-		case JobQueued, JobRunning:
-			active = append(active, fmt.Sprintf("%s (%s)", childID, child.State))
-		case JobSucceeded:
-			payload, err := unmarshalPayload(child.Payload)
-			if err != nil {
-				unrecognized = append(unrecognized, fmt.Sprintf("%s (malformed result)", childID))
+		for _, delegation := range currentDeclared {
+			id := strings.TrimSpace(delegation.ID)
+			if id == "" {
 				continue
 			}
-			if payload.Result == nil {
-				unrecognized = append(unrecognized, fmt.Sprintf("%s (nil result)", childID))
-				continue
+			if _, ok := reported[id]; !ok {
+				// Dispatch happened (children exist) but this delegate produced no row,
+				// so its evidence is still outstanding rather than absent.
+				active = append(active, fmt.Sprintf("%s/%s (declared, no job)", currentID, id))
 			}
-			decision := effectiveDelegationDecision(payload.Result, child.Type, "", blockingSeverity)
-			switch decision {
-			case "approved":
-				approvals = append(approvals, delegatedReviewApproval{job: child, payload: payload})
-			case "changes_requested", "blocked", "failed":
-				blocking = append(blocking, fmt.Sprintf("%s (%s)", childID, decision))
-			case "skipped", "implemented":
-				abstaining = append(abstaining, fmt.Sprintf("%s (%s)", childID, decision))
+		}
+		for _, child := range currentChildren {
+			childID := strings.TrimSpace(child.ID)
+			switch JobState(child.State) {
+			case JobQueued, JobRunning:
+				active = append(active, fmt.Sprintf("%s (%s)", childID, child.State))
+			case JobSucceeded:
+				payload, err := unmarshalPayload(child.Payload)
+				if err != nil {
+					unrecognized = append(unrecognized, fmt.Sprintf("%s (malformed result)", childID))
+					continue
+				}
+				if payload.Result == nil {
+					unrecognized = append(unrecognized, fmt.Sprintf("%s (nil result)", childID))
+					continue
+				}
+				if ResultIsFanOut(payload.Result) {
+					collect(child, payload.Result.Delegations)
+					continue
+				}
+				decision := effectiveDelegationDecision(payload.Result, child.Type, "", blockingSeverity)
+				switch decision {
+				case "approved":
+					approvals = append(approvals, delegatedReviewApproval{job: child, payload: payload})
+				case "changes_requested", "blocked", "failed":
+					blocking = append(blocking, fmt.Sprintf("%s (%s)", childID, decision))
+				case "skipped", "implemented":
+					abstaining = append(abstaining, fmt.Sprintf("%s (%s)", childID, decision))
+				default:
+					unrecognized = append(unrecognized, fmt.Sprintf("%s (unrecognized decision %q)", childID, decision))
+				}
+			case JobCancelled:
+				// #1799: a cancelled lens child is not a crashed one. Same bucket-mixing
+				// as the slot classification above, in the fan-out summary a reader uses
+				// to decide what to do next.
+				cancelled = append(cancelled, fmt.Sprintf("%s (%s)", childID, child.State))
+			case JobFailed:
+				crashed = append(crashed, fmt.Sprintf("%s (%s)", childID, child.State))
+			case JobBlocked:
+				parked = append(parked, fmt.Sprintf("%s (%s)", childID, child.State))
 			default:
-				unrecognized = append(unrecognized, fmt.Sprintf("%s (unrecognized decision %q)", childID, decision))
+				unrecognized = append(unrecognized, fmt.Sprintf("%s (unrecognized state %q)", childID, child.State))
 			}
-		case JobCancelled:
-			// #1799: a cancelled lens child is not a crashed one. Same bucket-mixing
-			// as the slot classification above, in the fan-out summary a reader uses
-			// to decide what to do next.
-			cancelled = append(cancelled, fmt.Sprintf("%s (%s)", childID, child.State))
-		case JobFailed:
-			crashed = append(crashed, fmt.Sprintf("%s (%s)", childID, child.State))
-		case JobBlocked:
-			parked = append(parked, fmt.Sprintf("%s (%s)", childID, child.State))
-		default:
-			unrecognized = append(unrecognized, fmt.Sprintf("%s (unrecognized state %q)", childID, child.State))
 		}
 	}
+	collect(parent, declared)
 	sort.Strings(blocking)
 	sort.Strings(active)
 	sort.Strings(crashed)

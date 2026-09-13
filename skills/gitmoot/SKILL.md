@@ -229,9 +229,11 @@ uses the upstream provider proved by a successful OMP delivery, not the `omp`
 wrapper or requested model text. It is advisory: same-family comparisons emit
 `merge_gate_family_advisory` and unresolved comparisons emit
 `merge_gate_family_unresolved`; neither disqualifies a distinct reviewer with
-substantive evidence. For a review fan-out, the announcing parent is not a
-verdict; the gate applies identity and family checks to each approving child
-(see CLI.md § Agent Setup). Use `gitmoot runtime list` to inspect each built-in
+substantive evidence. For a review fan-out, every coordinating parent is an
+announcement rather than a verdict, including nested fan-outs; the gate applies
+identity and family checks to each approving leaf and records approval evidence
+on that leaf (see CLI.md § Agent Setup). Use `gitmoot runtime list` to inspect
+each built-in
 runtime's resolved metadata: capabilities, default model/effort,
 known models, and the token-usage source.
 Operators can override a built-in runtime's
