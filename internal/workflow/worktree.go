@@ -2362,6 +2362,14 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context
 	if !readOnly && !implement && !fix {
 		return false, nil
 	}
+	path := strings.TrimSpace(payload.WorktreePath)
+	want := filepath.Clean(path)
+	if want == "." {
+		// Empty and degenerate relative spellings are not worktree resources.
+		// Candidate discovery is deliberately a text prefilter, so keep this
+		// filepath-aware rejection at the actuation boundary and skip quietly.
+		return false, nil
+	}
 	// A deterministic path can appear in more than one historical row. Never let
 	// an aged row reclaim it out from under a newer or resumable owner.
 	//
@@ -2382,7 +2390,7 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context
 	if err != nil {
 		return false, err
 	}
-	want := filepath.Clean(strings.TrimSpace(payload.WorktreePath))
+
 	for _, other := range refs {
 		if other.ID == job.ID {
 			continue
@@ -2401,7 +2409,6 @@ func (e Engine) ReclaimAgedTerminalDelegationWorktreeOutcome(ctx context.Context
 			return false, nil
 		}
 	}
-	path := strings.TrimSpace(payload.WorktreePath)
 	actuate, err := e.prepareDelegationCleanupObligation(ctx, jobID, job.Type, payload)
 	if err != nil {
 		return false, err

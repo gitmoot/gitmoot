@@ -3065,6 +3065,21 @@ func seedWorktreeOwner(t *testing.T, store *db.Store, jobID, state, worktreePath
 	}
 }
 
+func TestEngineReclaimSkipsDegenerateWorktreePath(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedWorktreeOwner(t, store, "fix-degenerate", string(JobSucceeded), ".")
+
+	reclaimed, err := testEngine(store).ReclaimAgedTerminalDelegationWorktreeOutcome(
+		ctx, "fix-degenerate", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("degenerate candidate returned an operational error: %v", err)
+	}
+	if reclaimed {
+		t.Fatal("degenerate candidate reported a reclaimed worktree")
+	}
+}
+
 // TestEngineReclaimRefusesWhenAnotherJobStillHoldsThePath is the guard's whole
 // purpose, and it was UNTESTED: a mutant that ignored a non-final co-owner
 // survived the suite.
