@@ -12,14 +12,22 @@ import (
 // ReviewRequest is the durable claim behind one routed review (#2171). It is
 // keyed by repo/PR/exact head/purpose so concurrent requesters resolve to a
 // single reviewing job, and it outlives that job so a later requester can see
-// which job answered (or failed to answer) the same question.
 type ReviewRequest struct {
 	SubjectKey string
 	JobID      string
 	Purpose    string
 	Requester  string
-	CreatedAt  string
-	UpdatedAt  string
+	// OwnerPID, OwnerPIDStartTime and OwnerBootID identify the PROCESS holding
+	// this claim through its dispatch window, before its job row exists. They
+	// make takeover a liveness question rather than a timeout: a dispatch that
+	// is merely slow keeps its claim, and one whose process is provably gone
+	// releases it immediately. Empty for claims written by an older binary,
+	// which then fall back to the age bound.
+	OwnerPID          int
+	OwnerPIDStartTime string
+	OwnerBootID       string
+	CreatedAt         string
+	UpdatedAt         string
 }
 
 // ReviewRequestSubjectKey extends the review-verdict subject key with the
@@ -37,15 +45,24 @@ func ReviewRequestSubjectKey(repo string, pullRequest int, headSHA, purpose stri
 	return key + "|" + purpose, nil
 }
 
+// ReviewRequestOwner identifies the process taking a claim, so takeover can ask
+// whether the holder is ALIVE instead of whether enough time has passed.
+type ReviewRequestOwner struct {
+	PID          int
+	PIDStartTime string
+	BootID       string
+}
+
 // ClaimReviewRequest inserts the claim for subjectKey standing on jobID. It
 // returns the row that holds the claim after the call and whether this caller
 // won it. A lost claim is not an error: the caller attaches to the returned job.
-func (s *Store) ClaimReviewRequest(ctx context.Context, subjectKey, jobID, purpose, requester string) (ReviewRequest, bool, error) {
+func (s *Store) ClaimReviewRequest(ctx context.Context, subjectKey, jobID, purpose, requester string, owner ReviewRequestOwner) (ReviewRequest, bool, error) {
 	stamp := time.Now().UTC().Format(time.RFC3339Nano)
 	result, err := s.db.ExecContext(ctx, `
-INSERT INTO review_requests(subject_key, job_id, purpose, requester, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?)
-ON CONFLICT(subject_key) DO NOTHING`, subjectKey, jobID, strings.ToLower(strings.TrimSpace(purpose)), strings.TrimSpace(requester), stamp, stamp)
+INSERT INTO review_requests(subject_key, job_id, purpose, requester, owner_pid, owner_pid_start_time, owner_boot_id, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(subject_key) DO NOTHING`, subjectKey, jobID, strings.ToLower(strings.TrimSpace(purpose)), strings.TrimSpace(requester),
+		owner.PID, strings.TrimSpace(owner.PIDStartTime), strings.TrimSpace(owner.BootID), stamp, stamp)
 	if err != nil {
 		return ReviewRequest{}, false, err
 	}
@@ -63,11 +80,12 @@ ON CONFLICT(subject_key) DO NOTHING`, subjectKey, jobID, strings.ToLower(strings
 // ReplaceReviewRequestJob moves the claim from a job that ended without a
 // verdict onto a new job. The compare-and-set on the old job id means two
 // requesters that both observed the dead job cannot both dispatch.
-func (s *Store) ReplaceReviewRequestJob(ctx context.Context, subjectKey, fromJobID, toJobID, requester string) (bool, error) {
+func (s *Store) ReplaceReviewRequestJob(ctx context.Context, subjectKey, fromJobID, toJobID, requester string, owner ReviewRequestOwner) (bool, error) {
 	stamp := time.Now().UTC().Format(time.RFC3339Nano)
 	result, err := s.db.ExecContext(ctx, `
-UPDATE review_requests SET job_id = ?, requester = ?, updated_at = ?
-WHERE subject_key = ? AND job_id = ?`, toJobID, strings.TrimSpace(requester), stamp, subjectKey, fromJobID)
+UPDATE review_requests SET job_id = ?, requester = ?, owner_pid = ?, owner_pid_start_time = ?, owner_boot_id = ?, updated_at = ?
+WHERE subject_key = ? AND job_id = ?`, toJobID, strings.TrimSpace(requester),
+		owner.PID, strings.TrimSpace(owner.PIDStartTime), strings.TrimSpace(owner.BootID), stamp, subjectKey, fromJobID)
 	if err != nil {
 		return false, err
 	}
@@ -85,9 +103,10 @@ func (s *Store) ReleaseReviewRequest(ctx context.Context, subjectKey, jobID stri
 func (s *Store) GetReviewRequest(ctx context.Context, subjectKey string) (ReviewRequest, error) {
 	var request ReviewRequest
 	err := s.db.QueryRowContext(ctx, `
-SELECT subject_key, job_id, purpose, requester, created_at, updated_at
+SELECT subject_key, job_id, purpose, requester, owner_pid, owner_pid_start_time, owner_boot_id, created_at, updated_at
 FROM review_requests WHERE subject_key = ?`, subjectKey).Scan(
-		&request.SubjectKey, &request.JobID, &request.Purpose, &request.Requester, &request.CreatedAt, &request.UpdatedAt)
+		&request.SubjectKey, &request.JobID, &request.Purpose, &request.Requester,
+		&request.OwnerPID, &request.OwnerPIDStartTime, &request.OwnerBootID, &request.CreatedAt, &request.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ReviewRequest{}, sql.ErrNoRows
 	}

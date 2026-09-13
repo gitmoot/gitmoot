@@ -109,6 +109,35 @@ func parseReviewVerdictSubjectKey(key string) (repo string, pullRequest int, hea
 	return repo, pullRequest, headSHA, nil
 }
 
+// reviewVerdictKeyPurpose returns the purpose a subject key is scoped to, or ""
+// for the bare any-purpose key that `org await review` uses.
+func reviewVerdictKeyPurpose(key string) string {
+	_, purpose, scoped := strings.Cut(strings.TrimSpace(key), "|")
+	if !scoped {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(purpose))
+}
+
+// reviewPayloadServesPurpose reports whether a verdict answers the question a
+// waiter asked. A bare key accepts any purpose, preserving the historical
+// contract; a purposed key accepts only its own. A verdict that recorded no
+// purpose is treated as the default review purpose, so router waits and
+// pre-router verdicts still meet.
+func reviewPayloadServesPurpose(payload reviewVerdictPayload, want string) bool {
+	if want == "" {
+		return true
+	}
+	got := strings.ToLower(strings.TrimSpace(payload.ReviewPurpose))
+	if got == "" {
+		got = DefaultReviewPurpose
+	}
+	return got == want
+}
+
+// DefaultReviewPurpose is the purpose a review carries when none was recorded.
+const DefaultReviewPurpose = "code"
+
 func normalizeAwaitedFactSubscription(request AwaitedFactSubscription) (AwaitedFactSubscription, error) {
 	request.WaiterRole = strings.ToLower(strings.TrimSpace(request.WaiterRole))
 	request.SubjectKind = strings.ToLower(strings.TrimSpace(request.SubjectKind))
@@ -199,6 +228,7 @@ func canonicalAwaitedFactTx(ctx context.Context, tx *sql.Tx, kind, key string, b
 		if err != nil {
 			return "", false, nil, err
 		}
+		wantPurpose := reviewVerdictKeyPurpose(key)
 		rows, err := tx.QueryContext(ctx, `
 SELECT id, agent, payload, externally_driven
 FROM jobs
@@ -238,7 +268,13 @@ ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 				skipped = append(skipped, HeadlessReviewSkip{JobID: jobID, ExternallyDriven: externallyDriven})
 			}
 			fact, ok := reviewVerdictFact(jobID, agent, "succeeded", payload, memoized)
-			if ok && fact.headSHA == headSHA {
+			// The recheck must answer the SAME question the subscription asks. A
+			// purpose-scoped key asks "reviewed for this purpose at this head",
+			// so matching the head alone lets a code verdict satisfy a security
+			// waiter that subscribes after it — the producer-side hole closed at
+			// resolveAwaitedReviewFactTx, reopened through the subscribe door
+			// (#2172 review round 2).
+			if ok && fact.headSHA == headSHA && reviewPayloadServesPurpose(decoded, wantPurpose) {
 				return fact.detail, true, skipped, nil
 			}
 		}
@@ -496,7 +532,14 @@ func resolveAwaitedReviewFactTx(ctx context.Context, tx *sql.Tx, jobID, agent, j
 	// FOR THIS PURPOSE": a code verdict must never terminally satisfy a security
 	// waiter, because the router deliberately runs those as separate reviews.
 	keys := []any{key}
-	if purposed, purposeErr := ReviewRequestSubjectKey(decoded.Repo, decoded.PullRequest, decoded.HeadSHA, decoded.ReviewPurpose); purposeErr == nil {
+	purpose := strings.ToLower(strings.TrimSpace(decoded.ReviewPurpose))
+	if purpose == "" {
+		// A verdict that recorded no purpose answers the default one, matching
+		// reviewPayloadServesPurpose so the producer and the subscribe-time
+		// recheck cannot disagree about which waiters a verdict serves.
+		purpose = DefaultReviewPurpose
+	}
+	if purposed, purposeErr := ReviewRequestSubjectKey(decoded.Repo, decoded.PullRequest, decoded.HeadSHA, purpose); purposeErr == nil {
 		keys = append(keys, purposed)
 	}
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(keys)), ",")

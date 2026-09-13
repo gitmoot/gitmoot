@@ -825,13 +825,23 @@ What one request does, in order:
    for a few seconds the winner holds a claim whose job id is not yet readable.
    A requester arriving in that window returns `state: attached` with
    `job_state: dispatching` rather than concluding the holder is dead. Takeover
-   requires proof: the claimed job ended without a verdict, or it never enqueued
-   one and the claim has aged past a 10-minute dispatch window. A synthetic
-   `failed` result — the daemon's dead-runtime recovery writes one — is NOT a
-   verdict and does not hold the subject. A claim standing on a real
-   `approved`/`changes_requested` verdict returns `state: verdict_exists` and
-   spends nothing. A different `--purpose` is a different question and runs in
-   parallel.
+   asks LIVENESS, not elapsed time: the claim records the dispatching process
+   (pid, its `/proc` start-time identity, and the boot id), so a claim is taken
+   over when its job ended without a verdict, when that process is provably
+   gone, or when the claim was recorded on an earlier boot. A dispatch that is
+   merely slow — a cold PR-ref fetch, a stopped process — keeps its claim; a
+   time bound applies only where liveness cannot be evaluated at all. A
+   synthetic `failed` result, which the daemon's dead-runtime recovery writes,
+   is NOT a verdict, and neither is a verdict stored on a job that did not
+   succeed: the awaited fact is satisfied only from a succeeded transition, so
+   the router refuses to call anything else `verdict_exists`. A claim standing
+   on a real `approved`/`changes_requested` verdict returns
+   `state: verdict_exists` and spends nothing. A claim whose job DELEGATED the
+   answer — a staged-review preflight whose own result is a fan-out — is held
+   while its verdict child still runs. A different `--purpose` is a different
+   question and runs in parallel, and the router picks a reviewer that has not
+   already answered at this head so the purpose-blind review-loop guard cannot
+   refuse the second purpose.
 3. Selects a registered agent with the `review` capability, WITHOUT `implement`,
    scoped to the repository (omp-native agents first, then by name), or the
    `--reviewer` you name. The job runs as a background review-only job on `omp`
@@ -839,9 +849,13 @@ What one request does, in order:
    model of the purpose's pool; merge-gate independence rules apply unchanged.
 4. Subscribes the requester to the exact-head verdict FOR THAT PURPOSE. The
    subscription key is `owner/repo#N@sha|purpose`, so a `code` verdict cannot
-   terminally satisfy a `security` request at the same head; `gitmoot org await
-   review` keeps the bare `owner/repo#N@sha` key and its any-purpose meaning,
-   and a verdict resolves both. The wake fires from the reviewing job's own
+   terminally satisfy a `security` request at the same head — enforced on BOTH
+   doors: the producer resolves the purposed and bare keys in one transaction,
+   and the subscribe-time recheck matches purpose as well as head, so a waiter
+   registering after a different-purpose verdict is not satisfied by it.
+   `gitmoot org await review` keeps the bare `owner/repo#N@sha` key and its
+   any-purpose meaning, and a routed review inherits its purpose into
+   delegation children so a staged review still answers the purposed wait. The wake fires from the reviewing job's own
    state transition when the verdict is persisted, before and independently of
    gate advancement, and it carries the decision, findings count, executed-check
    count, evidence declaration and the `gitmoot job show <id>` command. A second

@@ -2789,13 +2789,25 @@ CREATE INDEX IF NOT EXISTS idx_job_events_provider ON job_events(job_id, id) WHE
 	// requester dispatches and which attach. job_id is the reviewing job the
 	// claim currently stands on; it is replaced only when that job ended without
 	// a verdict, so an operational failure never blocks a later request and a
-	// saved verdict is never reviewed twice. Append-only tail; positional.
+	// saved verdict is never reviewed twice.
+	//
+	// owner_pid/owner_pid_start_time/owner_boot_id identify the process holding
+	// the claim during its dispatch window, before its job row exists. They make
+	// takeover a LIVENESS question rather than a timeout: a dispatch that is
+	// merely slow keeps its claim, while one whose process is provably dead
+	// releases it at once. Same shape as the runtime-process identity the daemon
+	// already uses, because a starttime-qualified PID cannot be confused with a
+	// recycled one and a boot id cannot be confused across reboots.
+	// Append-only tail; positional.
 	`
 CREATE TABLE IF NOT EXISTS review_requests (
 	subject_key TEXT PRIMARY KEY,
 	job_id TEXT NOT NULL,
 	purpose TEXT NOT NULL,
 	requester TEXT NOT NULL DEFAULT '',
+	owner_pid INTEGER NOT NULL DEFAULT 0,
+	owner_pid_start_time TEXT NOT NULL DEFAULT '',
+	owner_boot_id TEXT NOT NULL DEFAULT '',
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
 );

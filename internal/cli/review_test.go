@@ -212,7 +212,7 @@ func TestReviewRequestClaimSurvivesTheDispatchWindow(t *testing.T) {
 
 	// Requester A has won the claim and is mid-dispatch: its job row does not
 	// exist yet, exactly as during worktree allocation and runtime preflight.
-	claim, won, err := store.ClaimReviewRequest(ctx, subject, "job-a-dispatching", "code", "joltra")
+	claim, won, err := store.ClaimReviewRequest(ctx, subject, "job-a-dispatching", "code", "joltra", db.ReviewRequestOwner{})
 	if err != nil || !won {
 		t.Fatalf("seed claim = %+v won=%v err=%v", claim, won, err)
 	}
@@ -310,7 +310,7 @@ func TestReviewClaimReleaseOnlyFreesAnUnenqueuedJob(t *testing.T) {
 	ctx := context.Background()
 	subject := mustSubjectKey(t, head)
 
-	if _, won, err := store.ClaimReviewRequest(ctx, subject, "job-enqueued", "code", "joltra"); err != nil || !won {
+	if _, won, err := store.ClaimReviewRequest(ctx, subject, "job-enqueued", "code", "joltra", db.ReviewRequestOwner{}); err != nil || !won {
 		t.Fatalf("seed claim: won=%v err=%v", won, err)
 	}
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
@@ -327,10 +327,10 @@ func TestReviewClaimReleaseOnlyFreesAnUnenqueuedJob(t *testing.T) {
 	// error unwinds the claim has already moved to another requester's job. The
 	// DELETE is CAS'd on job_id so it must match nothing; without that it frees
 	// a live claim and the subject is dispatched twice.
-	if _, won, err := store.ClaimReviewRequest(ctx, subject+"|second", "job-never-enqueued", "code", "joltra"); err != nil || !won {
+	if _, won, err := store.ClaimReviewRequest(ctx, subject+"|second", "job-never-enqueued", "code", "joltra", db.ReviewRequestOwner{}); err != nil || !won {
 		t.Fatalf("seed second claim: won=%v err=%v", won, err)
 	}
-	moved, err := store.ReplaceReviewRequestJob(ctx, subject+"|second", "job-never-enqueued", "job-successor", "owner")
+	moved, err := store.ReplaceReviewRequestJob(ctx, subject+"|second", "job-never-enqueued", "job-successor", "owner", db.ReviewRequestOwner{})
 	if err != nil || !moved {
 		t.Fatalf("move claim: moved=%v err=%v", moved, err)
 	}
@@ -338,6 +338,124 @@ func TestReviewClaimReleaseOnlyFreesAnUnenqueuedJob(t *testing.T) {
 	current, err := store.GetReviewRequest(ctx, subject+"|second")
 	if err != nil || current.JobID != "job-successor" {
 		t.Fatalf("claim after a stale release = %+v (%v), want it still held by job-successor", current, err)
+	}
+}
+
+// A STALLED dispatch is not a dead one. The window bound used to decide
+// takeover on elapsed time alone, so a requester hung on a cold PR-ref fetch or
+// stopped by a signal had its claim stolen and the subject was dispatched
+// twice — the original P1 with a clock in front of it. Takeover now asks
+// whether the holding PROCESS is alive.
+func TestReviewClaimTakeoverAsksLivenessNotAge(t *testing.T) {
+	_, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	subject := mustSubjectKey(t, head)
+	ancient := time.Now().UTC().Add(-6 * reviewRequestDispatchWindow)
+
+	// This process is alive and holds the claim; its dispatch has simply taken
+	// longer than the window. Its claim must survive.
+	live := reviewRequestOwner()
+	if _, won, err := store.ClaimReviewRequest(ctx, subject, "job-stalled", "code", "joltra", live); err != nil || !won {
+		t.Fatalf("seed live claim: won=%v err=%v", won, err)
+	}
+	stalled := db.ReviewRequest{JobID: "job-stalled", OwnerPID: live.PID, OwnerPIDStartTime: live.PIDStartTime, OwnerBootID: live.BootID, UpdatedAt: ancient.Format(time.RFC3339Nano)}
+	if _, takeover, err := resolveLostReviewClaim(ctx, store, stalled, time.Now().UTC()); err != nil || takeover {
+		t.Fatalf("stalled-but-live holder: takeover=%v err=%v, want the claim held", takeover, err)
+	}
+
+	// A holder whose process is provably gone releases immediately, without
+	// waiting out any window: pid 0 with a recorded identity cannot be alive.
+	dead := db.ReviewRequest{JobID: "job-dead", OwnerPID: 2147483646, OwnerPIDStartTime: "1", OwnerBootID: live.BootID, UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	if _, takeover, err := resolveLostReviewClaim(ctx, store, dead, time.Now().UTC()); err != nil || !takeover {
+		t.Fatalf("dead holder: takeover=%v err=%v, want takeover without waiting for the window", takeover, err)
+	}
+
+	// A claim recorded on a different boot cannot still be dispatching.
+	rebooted := db.ReviewRequest{JobID: "job-prior-boot", OwnerPID: live.PID, OwnerPIDStartTime: live.PIDStartTime, OwnerBootID: "0000-boot-that-is-not-this-one", UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	if _, takeover, err := resolveLostReviewClaim(ctx, store, rebooted, time.Now().UTC()); err != nil || !takeover {
+		t.Fatalf("claim from a prior boot: takeover=%v err=%v, want takeover", takeover, err)
+	}
+}
+
+// The producer-side purpose fix left the SUBSCRIBE door open: the canonical
+// recheck matched head only, so a purposed waiter subscribing AFTER a
+// different-purpose verdict was satisfied by it on insert.
+func TestReviewSubscribeRecheckRespectsPurpose(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	seedDaemonWorkerAgentWithPolicy(t, store, "opus-reviewer", runtime.ShellRuntime, "true", []string{"review", "ask"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	base := []string{"--repo", "owner/repo", "--pr", "12", "--head", head, "--branch", "feature/review", "--home", home, "--json"}
+
+	code, failure := runReviewRequestJSON(t, append(append([]string{}, base...), "--role", "joltra")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	payload, err := workflow.ParseJobPayload(mustGetJob(t, store, code.JobID).Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload.Result = &workflow.AgentResult{Decision: "approved", Summary: "code clean", TestsRun: []string{"go test ./..."}, Evidence: "executed"}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TransitionJobStatePayloadWithEvent(ctx, code.JobID, string(workflow.JobQueued), string(workflow.JobSucceeded), string(encoded), db.JobEvent{JobID: code.JobID, Kind: "succeeded", Message: "job succeeded"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The security request subscribes AFTER the code verdict already exists.
+	security, failure := runReviewRequestJSON(t, append(append([]string{}, base...), "--role", "owner", "--purpose", "security")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	fact, err := store.GetAwaitedFact(ctx, security.AwaitedFactID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fact.State != db.AwaitedFactStateWaiting {
+		t.Fatalf("security wait = %s (%q), want waiting: a code verdict is not a security answer", fact.State, fact.ResolutionDetail)
+	}
+	if security.State == reviewRequestVerdictExists {
+		t.Fatalf("security request = %+v, want its own review rather than the code verdict", security)
+	}
+}
+
+// A failed or cancelled job can carry a stored verdict. Honouring it pinned the
+// claim and reported verdict_exists while the awaited fact — satisfied only
+// from a SUCCEEDED transition — left the requester waiting out its TTL.
+func TestReviewVerdictRequiresASucceededJob(t *testing.T) {
+	_, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	subject := mustSubjectKey(t, head)
+	if _, won, err := store.ClaimReviewRequest(ctx, subject, "job-failed-with-verdict", "code", "joltra", reviewRequestOwner()); err != nil || !won {
+		t.Fatalf("seed claim: won=%v err=%v", won, err)
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "job-failed-with-verdict", Agent: "reviewer", Action: "review", Repo: "owner/repo",
+		Branch: "feature/review", PullRequest: 12, HeadSHA: head, NoFixTarget: true,
+	})
+	payload, err := workflow.ParseJobPayload(mustGetJob(t, store, "job-failed-with-verdict").Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload.Result = &workflow.AgentResult{Decision: "approved", Summary: "verdict stored on a job that then failed"}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TransitionJobStatePayloadWithEvent(ctx, "job-failed-with-verdict", string(workflow.JobQueued), string(workflow.JobFailed), string(encoded), db.JobEvent{JobID: "job-failed-with-verdict", Kind: "failed", Message: "failed after storing a result"}); err != nil {
+		t.Fatal(err)
+	}
+	job := mustGetJob(t, store, "job-failed-with-verdict")
+	stored, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision := reviewVerdictDecision(job, stored); decision != "" {
+		t.Fatalf("verdict from a failed job = %q, want none: the awaited fact would never be satisfied", decision)
+	}
+	if reviewJobStillAnswers(ctx, store, job) {
+		t.Fatal("a failed job with a stored verdict still pins the claim; a later requester can never dispatch")
 	}
 }
 

@@ -82,7 +82,7 @@ func runReview(args []string, stdout, stderr io.Writer) int {
 
 func printReviewUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--json] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot review status --pr NUMBER [--repo OWNER/REPO] [--json] [--home DIR]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "request routes one independent review of the pull request's current (or --head) commit.")
@@ -236,7 +236,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	// absent" as "claim is dead" steals the claim and both requesters dispatch,
 	// which is the duplicate this table exists to prevent.
 	jobID := localAgentJobID("review", "review-router")
-	claim, won, err := store.ClaimReviewRequest(ctx, subjectKey, jobID, opts.purpose, opts.role)
+	claim, won, err := store.ClaimReviewRequest(ctx, subjectKey, jobID, opts.purpose, opts.role, reviewRequestOwner())
 	if err != nil {
 		return reviewRequestOutput{}, err
 	}
@@ -252,7 +252,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		// never enqueued one and its claim has aged past the dispatch window.
 		// Move the claim; a concurrent requester that wins this CAS instead is
 		// the one that dispatches, and this caller attaches to its job.
-		moved, err := store.ReplaceReviewRequestJob(ctx, subjectKey, claim.JobID, jobID, opts.role)
+		moved, err := store.ReplaceReviewRequestJob(ctx, subjectKey, claim.JobID, jobID, opts.role, reviewRequestOwner())
 		if err != nil {
 			return reviewRequestOutput{}, err
 		}
@@ -268,7 +268,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 			return finishReviewAttach(ctx, store, output, attach, current, opts)
 		}
 	}
-	reviewer, err := selectReviewRouterAgent(ctx, store, repo.FullName(), opts.reviewer)
+	reviewer, err := selectReviewRouterAgent(ctx, store, repo.FullName(), opts.pr, head, opts.reviewer)
 	if err != nil {
 		releaseUnenqueuedReviewClaim(ctx, store, subjectKey, jobID)
 		return reviewRequestOutput{}, err
@@ -317,23 +317,62 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 }
 
 // reviewJobStillAnswers reports whether an earlier claimed job can still answer
-// the request: it is queued or running, it is blocked awaiting a human, or it
-// saved a verdict. A stored result is NOT enough on its own: the daemon's dead-
-// runtime recovery writes a synthetic `failed` result, and an agent may report
-// `failed` itself, and neither is an answer to "is this head acceptable". Such a
-// job answered nothing and must not block a later requester.
-func reviewJobStillAnswers(job db.Job) bool {
+// the request: it is queued or running, it is blocked awaiting a human, it
+// delegated the answer to children that have not finished, or it saved a
+// verdict. A stored result is NOT enough on its own: the daemon's dead-runtime
+// recovery writes a synthetic `failed` result, and an agent may report `failed`
+// itself, and neither answers "is this head acceptable".
+//
+// THE FAN-OUT ARM IS LOAD-BEARING ON A STAGED-REVIEW REPO (#2172 review round
+// 2, interacting with #2029 which merged the same day). Where
+// staged_review_verdict_agent is configured the routed job becomes a PREFLIGHT
+// whose own result is a fan-out announcement, not a verdict. Judged on its own
+// row it looks finished-without-a-verdict, so the claim became takeover-
+// eligible while the verdict child was still running and a second reviewer was
+// dispatched. The question is answered by the tree, so the tree is what must be
+// consulted.
+func reviewJobStillAnswers(ctx context.Context, store *db.Store, job db.Job) bool {
 	switch job.State {
 	case string(workflow.JobQueued), string(workflow.JobRunning), string(workflow.JobBlocked):
 		return true
 	}
 	payload, err := workflow.ParseJobPayload(job.Payload)
-	return err == nil && reviewVerdictDecision(payload) != ""
+	if err != nil {
+		return false
+	}
+	if reviewVerdictDecision(job, payload) != "" {
+		return true
+	}
+	if payload.Result == nil || !workflow.ResultIsFanOut(payload.Result) {
+		return false
+	}
+	children, err := store.ListJobsByParent(ctx, job.ID)
+	if err != nil {
+		// Unknown is not proof the tree is finished; failing closed costs a
+		// re-run, failing open costs a duplicate reviewer.
+		return true
+	}
+	for _, child := range children {
+		if reviewJobStillAnswers(ctx, store, child) {
+			return true
+		}
+	}
+	return false
 }
 
 // reviewVerdictDecision returns the saved verdict, or "" when the stored result
 // is not one (absent, fan-out announcement, failed, blocked, skipped).
-func reviewVerdictDecision(payload workflow.JobPayload) string {
+//
+// It also requires the JOB to have succeeded. A failed or cancelled job can
+// carry a stored verdict, and honouring it pinned the claim forever while
+// reporting verdict_exists to every later requester — yet the awaited fact is
+// only satisfied from a SUCCEEDED transition, so the waiter timed out against a
+// verdict the router said existed (#2172 review round 2). The two must agree,
+// and the producer's rule is the authority.
+func reviewVerdictDecision(job db.Job, payload workflow.JobPayload) string {
+	if strings.TrimSpace(job.State) != string(workflow.JobSucceeded) {
+		return ""
+	}
 	if payload.Result == nil || workflow.ResultIsFanOut(payload.Result) {
 		return ""
 	}
@@ -358,25 +397,51 @@ func releaseUnenqueuedReviewClaim(ctx context.Context, store *db.Store, subjectK
 	_ = store.ReleaseReviewRequest(ctx, subjectKey, jobID)
 }
 
+// reviewRequestOwner identifies this process as the claim holder.
+func reviewRequestOwner() db.ReviewRequestOwner {
+	pid := os.Getpid()
+	return db.ReviewRequestOwner{
+		PID:          pid,
+		PIDStartTime: workflow.RuntimeProcessIdentity(pid),
+		BootID:       db.BootID(),
+	}
+}
+
 // resolveLostReviewClaim answers what a requester that LOST the claim should do.
 // It returns the job to attach to (zero when the holder is still dispatching and
 // has no job row yet) and whether the claim may be taken over.
 //
-// Takeover requires PROOF the holder is gone, never an absence that a live
-// dispatch also produces:
+// Takeover requires PROOF the holder is gone, never an absence a live dispatch
+// also produces:
 //   - job row readable and still answering  -> attach, no takeover
 //   - job row readable and dead without a verdict -> takeover
-//   - job row absent, claim younger than the dispatch window -> attach to the
-//     claim: the holder is mid-dispatch and its Enqueue has not landed yet
-//   - job row absent, claim older than the window -> takeover: the dispatching
-//     process died before it ever enqueued, so nothing will ever appear
+//   - job row absent, holder process PROVABLY DEAD (same boot, recorded
+//     starttime identity gone) -> takeover
+//   - job row absent, holder recorded on a DIFFERENT boot -> takeover: the host
+//     restarted, so that dispatch cannot still be running
+//   - job row absent, holder alive or liveness unknowable -> attach, no takeover
+//
+// THE AGE BOUND IS A FALLBACK, NOT THE RULE (#2172 review round 2). A clock in
+// front of the original race is still that race: a dispatch stalled on a cold
+// PR-ref fetch, or stopped by a signal, is SLOW rather than dead, and stealing
+// its claim dispatches a second reviewer. The bound now applies only where
+// liveness cannot be evaluated at all — a claim written by a binary that
+// recorded no owner, or a host with no readable process table.
 func resolveLostReviewClaim(ctx context.Context, store *db.Store, claim db.ReviewRequest, now time.Time) (db.Job, bool, error) {
 	job, err := store.GetJob(ctx, claim.JobID)
 	switch {
 	case err == nil:
-		return job, !reviewJobStillAnswers(job), nil
+		return job, !reviewJobStillAnswers(ctx, store, job), nil
 	case !errors.Is(err, sql.ErrNoRows):
 		return db.Job{}, false, err
+	}
+	if boot, current := strings.TrimSpace(claim.OwnerBootID), db.BootID(); boot != "" && current != "" {
+		if boot != current {
+			return db.Job{}, true, nil
+		}
+		if live, known := workflow.RuntimeProcessLiveness(claim.OwnerPID, claim.OwnerPIDStartTime); known {
+			return db.Job{}, !live, nil
+		}
 	}
 	claimed, parseErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(claim.UpdatedAt))
 	if parseErr != nil {
@@ -400,7 +465,7 @@ func finishReviewAttach(ctx context.Context, store *db.Store, output reviewReque
 		output.JobState = "dispatching"
 	}
 	if payload, err := workflow.ParseJobPayload(job.Payload); err == nil {
-		if decision := reviewVerdictDecision(payload); decision != "" {
+		if decision := reviewVerdictDecision(job, payload); decision != "" {
 			output.State = reviewRequestVerdictExists
 			output.Verdict = decision
 		}
@@ -470,7 +535,7 @@ func subscribeReviewRequester(ctx context.Context, store *db.Store, output *revi
 // review. The agent supplies identity and repo access; runtime and model come
 // from the router, so any review-capable agent scoped to the repository will
 // do, and an omp-native one is preferred so the override changes nothing.
-func selectReviewRouterAgent(ctx context.Context, store *db.Store, repo, explicit string) (db.Agent, error) {
+func selectReviewRouterAgent(ctx context.Context, store *db.Store, repo string, pullRequest int, headSHA, explicit string) (db.Agent, error) {
 	if explicit = strings.TrimSpace(explicit); explicit != "" {
 		agent, err := store.GetAgent(ctx, explicit)
 		if err != nil {
@@ -501,13 +566,36 @@ func selectReviewRouterAgent(ctx context.Context, store *db.Store, repo, explici
 	if len(candidates) == 0 {
 		return db.Agent{}, fmt.Errorf("no review-only agent is registered for %s; register one with `gitmoot agent subscribe <name> --runtime omp --session fresh:<suffix> --role reviewer --repo %s --capability review` or pass --reviewer", repo, repo)
 	}
+	// A SECOND PURPOSE AT THE SAME HEAD MUST NOT BE REFUSED AS A LOOP (#2172
+	// review round 2). DetectReviewLoop keys on agent identity and head, and it
+	// is purpose-blind by design because it protects the engine's own re-review
+	// path. If the router hands it an agent that already holds a verdict here,
+	// a security request is refused because a code review happened — flatly
+	// contradicting the documented parallel-purposes contract. So prefer an
+	// agent that has not already answered at this head, and let the shared
+	// guard keep its meaning instead of weakening it for everyone.
+	answered := map[string]bool{}
+	if verdicts, err := store.SucceededReviewVerdicts(ctx, repo, pullRequest); err == nil {
+		for _, verdict := range verdicts {
+			if strings.EqualFold(verdict.HeadSHA, headSHA) {
+				answered[strings.ToLower(strings.TrimSpace(verdict.Agent))] = true
+			}
+		}
+	}
 	sort.SliceStable(candidates, func(i, j int) bool {
+		leftFree, rightFree := !answered[strings.ToLower(candidates[i].Name)], !answered[strings.ToLower(candidates[j].Name)]
+		if leftFree != rightFree {
+			return leftFree
+		}
 		left, right := candidates[i].Runtime == runtime.OmpRuntime, candidates[j].Runtime == runtime.OmpRuntime
 		if left != right {
 			return left
 		}
 		return candidates[i].Name < candidates[j].Name
 	})
+	if answered[strings.ToLower(candidates[0].Name)] {
+		return db.Agent{}, fmt.Errorf("every review-only agent for %s already holds a verdict at head %s, so a second purpose would be refused as a review loop; register another review-only agent or pass --reviewer", repo, headSHA)
+	}
 	return candidates[0], nil
 }
 

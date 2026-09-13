@@ -1264,6 +1264,15 @@ func (e Engine) delegationRequest(ctx context.Context, job db.Job, payload JobPa
 		// Inherit the coordinator's resolved risk tier (#650) so a high-risk lens
 		// child carries it for explainable escalation. Empty for every non-risk tree.
 		RiskTier: strings.TrimSpace(payload.RiskTier),
+		// #2171/#2172: the router's purpose and requester belong to the QUESTION,
+		// not to the job that happens to answer it. A staged review answers
+		// through a verdict CHILD, so a purpose that stops at the preflight
+		// leaves the purposed waiter unsatisfiable and the requester waits out
+		// its whole TTL for a verdict that was produced. Inheriting them is what
+		// makes the routed contract survive delegation.
+		ReviewPurpose:   strings.TrimSpace(payload.ReviewPurpose),
+		ReviewModelPool: append([]string(nil), payload.ReviewModelPool...),
+		ReviewRequester: strings.TrimSpace(payload.ReviewRequester),
 		// #1821: only the verdict child of a MARKED staged preflight inherits an
 		// evidence ceiling. Scoped to the marker rather than inferred from the
 		// parent's declared evidence - see stagedVerdictCeiling.
