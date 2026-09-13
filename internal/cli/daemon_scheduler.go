@@ -251,11 +251,18 @@ func deferDelegationCleanupContention(ctx context.Context, worker jobWorker, mod
 	return nil
 }
 
+func delegationCleanupPathUnavailable(path string) bool {
+	return filepath.Clean(strings.TrimSpace(path)) == "."
+}
+
 // deferDelegationCleanupSkip moves a selected-but-unattempted row behind the
 // bounded host window. The durable next_attempt_at is the fairness cursor: repo
 // filters, session filters, non-final state, and held checkouts must not leave the
 // same 256 rows monopolizing every tick after a daemon restart.
 func deferDelegationCleanupSkip(ctx context.Context, worker jobWorker, jobID, path string, reason db.CleanupObligationReason, now time.Time) error {
+	if delegationCleanupPathUnavailable(path) {
+		return nil
+	}
 	_, err := worker.Store.DeferCleanupObligation(
 		context.WithoutCancel(ctx), jobID, path, reason, now, now.Add(delegationCleanupRetryDelay),
 	)
@@ -284,7 +291,7 @@ func delegationCleanupTargetContained(worker jobWorker, job db.Job, obligation d
 
 func prepareDelegationCleanup(ctx context.Context, worker jobWorker, mode string, job db.Job, path string, now time.Time) (db.CleanupObligation, bool, error) {
 	path = strings.TrimSpace(path)
-	if filepath.Clean(path) == "." {
+	if delegationCleanupPathUnavailable(path) {
 		// Candidate discovery is a text prefilter and can return whitespace or
 		// relative spellings of no resource. Skip before obligation persistence:
 		// EnsureCleanupObligation correctly rejects them, but that rejection is
