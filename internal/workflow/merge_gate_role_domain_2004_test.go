@@ -8,17 +8,9 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 )
 
-// #2004 acceptance 3, ruling (b): a role-authored reviewer is OUTSIDE the
-// runtime-family predicate's domain rather than an unresolved value inside it.
-//
-// The three arms below are one property, and arm 2 is the one that earns arm 1.
-// An exclusion that switched off the family check would be indistinguishable
-// from an exemption if nothing else still bound a role. Arm 2 shows something
-// does: a role approving its own implementation is refused on IDENTITY, before
-// the family check is ever reached. Arm 3 shows the exclusion did not leak to
-// the case that must keep failing closed - an unregistered AGENT also resolves
-// to no family, and inferring the exclusion from an empty family rather than
-// from the plumbed flag would collapse the two.
+// A role-authored reviewer is outside runtime-family comparison because a human
+// session has no runtime family. Reviewer/implementer identity remains binding;
+// unresolved agent families are reported as advisories rather than merge bars.
 
 func seedRoleDomainImplementer(t *testing.T, store *db.Store, agent string, runtime string) {
 	t.Helper()
@@ -62,10 +54,8 @@ func TestRoleAuthoredApprovalIsOutsideTheFamilyCheck(t *testing.T) {
 // against a gate that let a role self-approve a merge. What matters is that the
 // pre-existing case still passes WITH the exclusion applied, and it does.
 
-// Arm 3: the exclusion is keyed on the plumbed flag, never on an empty family.
-// An unregistered AGENT produces exactly the same empty family and must keep
-// failing closed.
-func TestUnregisteredAgentReviewerStillFailsClosed(t *testing.T) {
+// An unregistered reviewer produces an unresolved-family advisory.
+func TestUnregisteredAgentReviewerProducesFamilyAdvisory(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedRoleDomainImplementer(t, store, "wave-impl", "codex")
@@ -77,18 +67,16 @@ func TestUnregisteredAgentReviewerStillFailsClosed(t *testing.T) {
 		t.Fatalf("sameRuntimeFamilyAsImplementer: %v", err)
 	}
 	if !same {
-		t.Fatal("an unregistered agent reviewer did not fail closed; its family is as empty as a role's and it is not a role")
+		t.Fatal("an unregistered agent reviewer did not produce a family advisory")
 	}
 	if !strings.Contains(reason, "gm-omp-nag") {
-		t.Fatalf("block reason = %q, want the unresolvable reviewer named", reason)
+		t.Fatalf("advisory reason = %q, want the unresolvable reviewer named", reason)
 	}
 }
 
-// The implementer side of arm 1, which CI found and my filtered run could not:
-// TestRoleImplementedTaskIsAttributable lives outside every pattern I ran. A
-// role-attributed implementer (#1916) is a human session with no runtime family,
-// so an agent reviewing its work is independent and must not be blocked.
-func TestRoleAttributedImplementerIsOutsideTheFamilyCheck(t *testing.T) {
+// A role-attributed implementer has no runtime family, so the reviewer remains
+// eligible on distinct identity and the unavailable comparison is disclosed.
+func TestRoleAttributedImplementerProducesFamilyAdvisory(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedFamilyAgent(t, store, "g7-review", "codex")
@@ -99,15 +87,14 @@ func TestRoleAttributedImplementerIsOutsideTheFamilyCheck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sameRuntimeFamilyAsImplementer: %v", err)
 	}
-	if same {
-		t.Fatalf("an agent reviewer was blocked against a ROLE implementer: %q; a role has no family to share", reason)
+	if !same || !strings.Contains(reason, "advisory") {
+		t.Fatalf("role-attributed implementer did not produce the family advisory: same=%v reason=%q", same, reason)
 	}
 }
 
-// And its control: an implementer that is an unregistered AGENT, not a role,
-// produces the identical empty family and must still fail closed. Without this
-// the arm above is satisfied by skipping every unresolvable implementer.
-func TestUnregisteredAgentImplementerStillFailsClosed(t *testing.T) {
+// An unregistered agent implementer also produces an advisory, but is not
+// confused with a role identity.
+func TestUnregisteredAgentImplementerProducesFamilyAdvisory(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedFamilyAgent(t, store, "g7-review", "codex")
@@ -119,9 +106,9 @@ func TestUnregisteredAgentImplementerStillFailsClosed(t *testing.T) {
 		t.Fatalf("sameRuntimeFamilyAsImplementer: %v", err)
 	}
 	if !same {
-		t.Fatal("an unregistered agent implementer did not fail closed; it is not a role and its family is unknown")
+		t.Fatal("an unregistered agent implementer did not produce a family advisory")
 	}
 	if !strings.Contains(reason, "gm-omp-nag") {
-		t.Fatalf("block reason = %q, want the unresolvable implementer named", reason)
+		t.Fatalf("advisory reason = %q, want the unresolvable implementer named", reason)
 	}
 }

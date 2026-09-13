@@ -840,11 +840,14 @@ Every surface that reads a review decision applies the same rule:
 - the **merge gate** excludes a fan-out row from the verdict population. It
   neither satisfies nor blocks the reviewer slot, so an independent verdict at
   the same head still decides the PR;
-- if the panel **reported**, the gate decides that slot on the delegates — at
-  least one approving child, no blocking, crashed, abstaining or still-running
-  child, and every declared delegation accounted for. Only the LATEST attempt of
-  each delegation counts, so an approved retry supersedes a failed original
-  instead of being poisoned by it;
+- if the panel **reported**, the gate walks nested fan-outs to their leaf
+  verdicts and decides that slot on those leaves — at least one approving leaf,
+  no blocking verdict, no crashed, abstaining or still-running node, and every
+  declared delegation accounted for. A coordinating child is still an
+  announcement, not a verdict. Identity, family and
+  `merge_gate_approval_evidence` records use the
+  actual approving leaves. Only the LATEST attempt of each delegation counts, so
+  an approved retry supersedes a failed original instead of being poisoned by it;
 - if the panel was announced and **never dispatched**, the gate reports
   `no review verdict at evaluated head: <agent> (job <id>, N declared) declared
   delegations that never reported` rather than merging or parking;
@@ -991,20 +994,22 @@ an omp seat:
   that override `widened`; Landlock remains the write boundary. Non-seat
   `read-only` keeps `always-ask`. The other three explicit policy mappings are
   declared `applied`, while `auto` is `widened`.
-- **OMP cross-family independence uses runtime-reported upstream-provider
+- **OMP runtime-family diversity uses runtime-reported upstream-provider
   evidence.** A successful delivery whose final runtime message identifies its
   provider and model records that provider in the append-only event ledger; the
   OMP wrapper remains `effective_runtime=omp`. Providers shared with native
   adapters compare as the same family: `openai` and `openai-codex` map to
   Codex, `anthropic` maps to Claude, and `kimi-code` maps to Kimi. Providers
   without a native adapter stay namespaced, for example `omp:devin`. Different
-  models and agent names on one provider remain the same family, while different
-  proved providers qualify as cross-family. A requested model alone, a failed or
-  historical job without provider evidence, and an in-session implementation
-  row with no provider all fail closed. Native fan-out cannot prove an OMP
-  provider before execution, so it skips those reviewers; use an explicit
-  `agent review` dispatch to run one and record evidence. Native runtime behavior
-  is unchanged.
+  models and agent names on one provider remain the same family. The comparison
+  is advisory, not an independence gate: same-family comparisons emit
+  `merge_gate_family_advisory`, while unresolved comparisons retain the
+  `merge_gate_family_unresolved` event; neither disqualifies a substantive
+  approval from a reviewer whose identity is not an implementer. For a review
+  fan-out, every coordinating parent is an announcement rather than a verdict,
+  including nested fan-outs. The gate applies identity and family checks to each
+  approving leaf and records approval evidence on that leaf. Requested model
+  text alone and failed delivery are not provider evidence.
 - **Authentication depends on the seat policy.** Ordinary omp jobs use the
   profile, provider keys, or auth broker visible to the daemon. Read-only review
   and ask seats require `OMP_AUTH_BROKER_URL` as an HTTPS or loopback HTTP

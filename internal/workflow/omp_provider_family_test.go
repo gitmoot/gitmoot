@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
@@ -182,7 +183,7 @@ func TestOmpProviderFamilyRequiresSuccessfulExecutionEvidence(t *testing.T) {
 	})
 }
 
-func TestOmpProviderFamiliesDriveMergeIndependence(t *testing.T) {
+func TestOmpProviderFamiliesInformMergeAdvisory(t *testing.T) {
 	ctx := context.Background()
 	for _, reviewerProvider := range []string{"kimi-code", "devin"} {
 		t.Run("openai versus "+reviewerProvider, func(t *testing.T) {
@@ -197,7 +198,7 @@ func TestOmpProviderFamiliesDriveMergeIndependence(t *testing.T) {
 				t.Fatal(err)
 			}
 			if same {
-				t.Fatalf("distinct proven providers were refused: %s", reason)
+				t.Fatalf("distinct proven providers produced a same-family advisory: %s", reason)
 			}
 		})
 	}
@@ -223,8 +224,8 @@ func TestOmpProviderFamiliesDriveMergeIndependence(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !same || !strings.Contains(reason, tc.nativeRuntime) {
-				t.Fatalf("OMP provider %q and native runtime %q were not one family: same=%v reason=%q", tc.ompProvider, tc.nativeRuntime, same, reason)
+			if !same || !strings.Contains(reason, tc.nativeRuntime) || !strings.Contains(reason, "advisory") {
+				t.Fatalf("OMP provider %q and native runtime %q did not produce a same-family advisory: same=%v reason=%q", tc.ompProvider, tc.nativeRuntime, same, reason)
 			}
 		})
 	}
@@ -240,12 +241,12 @@ func TestOmpProviderFamiliesDriveMergeIndependence(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !same || !strings.Contains(reason, "omp:devin") {
-			t.Fatalf("same Devin provider was not refused with evidence: same=%v reason=%q", same, reason)
+		if !same || !strings.Contains(reason, "omp:devin") || !strings.Contains(reason, "advisory") {
+			t.Fatalf("same Devin provider did not produce an advisory: same=%v reason=%q", same, reason)
 		}
 	})
 
-	t.Run("OMP reviewer cannot prove an in-session implementer provider", func(t *testing.T) {
+	t.Run("OMP reviewer reports unavailable in-session implementer provider", func(t *testing.T) {
 		store := openTestStore(t)
 		insertSucceededOmpProviderJob(t, store, "review-job", "reviewer", "review", "kimi-code/k3", "kimi-code")
 		gate := PolicyMergeGate{Store: store}
@@ -255,10 +256,462 @@ func TestOmpProviderFamiliesDriveMergeIndependence(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !same || !strings.Contains(reason, "in-session implementer") || !strings.Contains(reason, "provider") {
-			t.Fatalf("in-session provider gap did not fail closed: same=%v reason=%q", same, reason)
+		if !same || !strings.Contains(reason, "in-session implementer") || !strings.Contains(reason, "provider") || !strings.Contains(reason, "advisory") {
+			t.Fatalf("in-session provider gap did not produce an advisory: same=%v reason=%q", same, reason)
 		}
 	})
+}
+
+func TestPolicyMergeGateKeepsRuntimeFamilyDiversityAdvisory(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		implementerAgent string
+		implementerRole  string
+		implementerModel string
+		implementer      string
+		reviewerAgent    string
+		reviewerModel    string
+		reviewer         string
+		wantMerge        bool
+		wantEventKind    string
+	}{
+		{
+			name:            "OMP reviewer over acting-role implementer",
+			implementerRole: "gm-findings",
+			reviewerAgent:   "gm-review-opus",
+			reviewerModel:   "devin/swe-2",
+			reviewer:        "devin",
+			wantMerge:       true,
+			wantEventKind:   mergeGateFamilyUnresolvedEventKind,
+		},
+		{
+			name:             "reviewer is the implementer",
+			implementerAgent: "gm-review-opus",
+			implementerModel: "devin/swe-2",
+			implementer:      "devin",
+			reviewerAgent:    "gm-review-opus",
+			reviewerModel:    "devin/sonnet-4.6",
+			reviewer:         "devin",
+			wantMerge:        false,
+		},
+		{
+			name:             "same provider with independent identities",
+			implementerAgent: "gm-implementer",
+			implementerModel: "devin/swe-2",
+			implementer:      "devin",
+			reviewerAgent:    "gm-review-opus",
+			reviewerModel:    "devin/sonnet-4.6",
+			reviewer:         "devin",
+			wantMerge:        true,
+			wantEventKind:    mergeGateFamilyAdvisoryEventKind,
+		},
+		{
+			name:             "different providers with independent identities",
+			implementerAgent: "gm-implementer",
+			implementerModel: "openai-codex/gpt-5.6-sol",
+			implementer:      "openai-codex",
+			reviewerAgent:    "gm-review-opus",
+			reviewerModel:    "devin/swe-2",
+			reviewer:         "devin",
+			wantMerge:        true,
+		},
+		{
+			name:             "unresolved implementer family",
+			implementerAgent: "unregistered-implementer",
+			reviewerAgent:    "gm-review-opus",
+			reviewerModel:    "devin/swe-2",
+			reviewer:         "devin",
+			wantMerge:        true,
+			wantEventKind:    mergeGateFamilyUnresolvedEventKind,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			payload := JobPayload{
+				Repo: "gitmoot/gitmoot", Branch: "task-9", PullRequest: 9,
+				HeadSHA: "head123", TaskID: "task-9",
+			}
+
+			implementPayload := payload
+			implementPayload.HeadSHA = ""
+			implementPayload.ActingOrgRole = tc.implementerRole
+			implementPayload.EffectiveRuntime = runtime.OmpRuntime
+			implementPayload.Model = tc.implementerModel
+			implementPayload.Result = &AgentResult{Decision: "implemented", Summary: "implemented"}
+			insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: tc.implementerAgent, Type: "implement"}, implementPayload)
+			if tc.implementerAgent != "" && tc.implementer != "" {
+				seedFamilyAgent(t, store, tc.implementerAgent, runtime.OmpRuntime)
+				if err := store.AddJobEvent(ctx, db.JobEvent{
+					JobID: "implement-job", Kind: ompProviderVerifiedEventKind,
+					Runtime: runtime.OmpRuntime, Provider: tc.implementer,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			reviewPayload := payload
+			reviewPayload.ReviewRound = "review-1"
+			reviewPayload.EffectiveRuntime = runtime.OmpRuntime
+			reviewPayload.Model = tc.reviewerModel
+			reviewPayload.Result = &AgentResult{
+				Decision: "approved", Summary: "approved",
+				Evidence: "executed", EvidenceDeclared: true,
+				TestsRun: []string{"focused production-path check"},
+			}
+			insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: tc.reviewerAgent, Type: "review"}, reviewPayload)
+			seedFamilyAgent(t, store, tc.reviewerAgent, runtime.OmpRuntime)
+			if err := store.AddJobEvent(ctx, db.JobEvent{
+				JobID: "review-job", Kind: ompProviderVerifiedEventKind,
+				Runtime: runtime.OmpRuntime, Provider: tc.reviewer,
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			mergeable := true
+			gh := &fakeMergeGateGitHub{
+				pr: github.PullRequest{
+					Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+					HeadSHA: "head123", Mergeable: &mergeable,
+				},
+				status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+				checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+				mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+			}
+			gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+			decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if decision.Merged != tc.wantMerge || (len(gh.merges) == 1) != tc.wantMerge {
+				t.Fatalf("decision=%+v merges=%d, want merge=%v", decision, len(gh.merges), tc.wantMerge)
+			}
+			if !tc.wantMerge && !strings.Contains(decision.Reason.Render(), "implementing agent") {
+				t.Fatalf("identity refusal reason = %q, want implementing agent", decision.Reason.Render())
+			}
+			events, err := store.ListJobEvents(ctx, "review-job")
+			if err != nil {
+				t.Fatal(err)
+			}
+			foundFamilyEvent := ""
+			for _, event := range events {
+				if event.Kind == mergeGateFamilyAdvisoryEventKind || event.Kind == mergeGateFamilyUnresolvedEventKind {
+					foundFamilyEvent = event.Kind
+				}
+			}
+			if foundFamilyEvent != tc.wantEventKind {
+				t.Fatalf("family event=%q, want %q; events=%+v", foundFamilyEvent, tc.wantEventKind, events)
+			}
+		})
+	}
+}
+
+func TestPolicyMergeGateRejectsDelegatedImplementerApprovals(t *testing.T) {
+	type childFixture struct {
+		id    string
+		agent string
+		role  string
+	}
+	for _, tc := range []struct {
+		name             string
+		implementerAgent string
+		implementerRole  string
+		children         []childFixture
+		fallbackBranch   bool
+		wantMerge        bool
+		wantFamilyEvent  string
+	}{
+		{
+			name:             "active-head agent child is the implementer",
+			implementerAgent: "implementer",
+			children:         []childFixture{{id: "lens", agent: "implementer"}},
+		},
+		{
+			name:            "fallback acting-role child is the implementer",
+			implementerRole: "gm-integrity",
+			children:        []childFixture{{id: "lens", role: "gm-integrity"}},
+			fallbackBranch:  true,
+		},
+		{
+			name:             "implementer parent with independent agent child",
+			implementerAgent: "panel-parent",
+			children:         []childFixture{{id: "lens", agent: "lens-ephemeral-147330"}},
+			wantMerge:        true,
+			wantFamilyEvent:  "lens",
+		},
+		{
+			name:             "fallback independent acting-role child",
+			implementerAgent: "implementer",
+			children:         []childFixture{{id: "lens", role: "gm-review"}},
+			fallbackBranch:   true,
+			wantMerge:        true,
+		},
+		{
+			name:             "fallback mixed approvals with implementer first",
+			implementerAgent: "implementer",
+			children: []childFixture{
+				{id: "a-implementer", agent: "implementer"},
+				{id: "z-independent", agent: "independent-reviewer"},
+			},
+			fallbackBranch: true,
+		},
+		{
+			name:             "fallback mixed approvals with independent first",
+			implementerAgent: "implementer",
+			children: []childFixture{
+				{id: "a-independent", agent: "independent-reviewer"},
+				{id: "z-implementer", agent: "implementer"},
+			},
+			fallbackBranch: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			basePayload := JobPayload{
+				Repo: "gitmoot/gitmoot", Branch: "task-9", PullRequest: 9,
+				HeadSHA: "head123", TaskID: "task-9",
+			}
+
+			implementPayload := basePayload
+			implementPayload.HeadSHA = ""
+			implementPayload.ActingOrgRole = tc.implementerRole
+			if tc.wantFamilyEvent != "" {
+				implementPayload.EffectiveRuntime = "codex"
+			}
+			implementPayload.Result = &AgentResult{Decision: "implemented", Summary: "implemented"}
+			insertCompletedJob(t, store, db.Job{
+				ID: "implement-job", Agent: tc.implementerAgent, Type: "implement",
+			}, implementPayload)
+
+			parentPayload := basePayload
+			parentPayload.ReviewRound = "review-1"
+			if tc.fallbackBranch {
+				parentPayload.HeadSHA = ""
+				parentPayload.DelegationID = "integration-parent"
+				parentPayload.WorktreePath = "/tmp/gitmoot-integration-review"
+			}
+			parentPayload.Result = &AgentResult{
+				Decision: "approved",
+				Summary:  "delegating the substantive review",
+			}
+			for _, child := range tc.children {
+				parentPayload.Result.Delegations = append(parentPayload.Result.Delegations, Delegation{
+					ID: child.id, Agent: "lens-reviewer", Action: "review",
+				})
+			}
+			insertCompletedJob(t, store, db.Job{
+				ID: "review-panel", Agent: "panel-parent", Type: "review",
+			}, parentPayload)
+
+			for _, child := range tc.children {
+				childPayload := basePayload
+				childPayload.ActingOrgRole = child.role
+				if tc.fallbackBranch {
+					childPayload.HeadSHA = ""
+					childPayload.DelegationID = child.id
+					childPayload.WorktreePath = "/tmp/gitmoot-integration-review/" + child.id
+				}
+				if child.id == tc.wantFamilyEvent {
+					childPayload.EffectiveRuntime = "codex"
+				}
+				childPayload.Result = &AgentResult{
+					Decision: "approved", Summary: "child approved",
+					Evidence: "executed", EvidenceDeclared: true,
+					TestsRun: []string{"focused delegated-review check"},
+				}
+				insertCompletedJob(t, store, db.Job{
+					ID: "review-panel/delegation/" + child.id, Agent: child.agent, Type: "review",
+					ParentJobID: "review-panel", DelegationID: child.id,
+				}, childPayload)
+			}
+
+			mergeable := true
+			gh := &fakeMergeGateGitHub{
+				pr: github.PullRequest{
+					Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+					HeadSHA: "head123", Mergeable: &mergeable,
+				},
+				status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+				checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+				mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+			}
+			gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+			decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if decision.Merged != tc.wantMerge || (len(gh.merges) == 1) != tc.wantMerge {
+				t.Fatalf("decision=%+v merges=%d, want merge=%v", decision, len(gh.merges), tc.wantMerge)
+			}
+			if !tc.wantMerge && !strings.Contains(decision.Reason.Render(), "implementing agent") {
+				t.Fatalf("delegated identity refusal reason = %q, want implementing agent", decision.Reason.Render())
+			}
+
+			if tc.wantFamilyEvent == "" {
+				return
+			}
+			jobID := "review-panel/delegation/" + tc.wantFamilyEvent
+			events, err := store.ListJobEvents(ctx, jobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			foundFamilyEvent := false
+			for _, event := range events {
+				if event.Kind == mergeGateFamilyAdvisoryEventKind || event.Kind == mergeGateFamilyUnresolvedEventKind {
+					foundFamilyEvent = true
+				}
+			}
+			if !foundFamilyEvent {
+				t.Fatalf("no delegated family event on actual approver %s; events=%+v", jobID, events)
+			}
+		})
+	}
+}
+
+func TestPolicyMergeGateEvaluatesNestedFanOutLeaves(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		leafAgent  string
+		seedLeaf   bool
+		wantMerge  bool
+		wantReason string
+	}{
+		{
+			name:       "nested implementer leaf is refused",
+			leafAgent:  "implementer",
+			seedLeaf:   true,
+			wantReason: "implementing agent",
+		},
+		{
+			name:       "nested announcement without a leaf stays pending",
+			leafAgent:  "independent-reviewer",
+			wantReason: "waiting for delegated review parent review-panel",
+		},
+		{
+			name:      "nested independent leaf approves and owns the audit event",
+			leafAgent: "independent-reviewer",
+			seedLeaf:  true,
+			wantMerge: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			basePayload := JobPayload{
+				Repo: "gitmoot/gitmoot", Branch: "task-9", PullRequest: 9,
+				HeadSHA: "head123", TaskID: "task-9",
+			}
+
+			implementPayload := basePayload
+			implementPayload.HeadSHA = ""
+			implementPayload.Result = &AgentResult{Decision: "implemented", Summary: "implemented"}
+			insertCompletedJob(t, store, db.Job{
+				ID: "implement-job", Agent: "implementer", Type: "implement",
+			}, implementPayload)
+
+			parentPayload := basePayload
+			parentPayload.HeadSHA = ""
+			parentPayload.DelegationID = "integration-parent"
+			parentPayload.WorktreePath = "/tmp/gitmoot-nested-review"
+			parentPayload.ReviewRound = "review-1"
+			parentPayload.Result = &AgentResult{
+				Decision: "approved",
+				Summary:  "delegating to a nested panel",
+				Delegations: []Delegation{{
+					ID: "middle", Agent: "middle-reviewer", Action: "review",
+				}},
+			}
+			insertCompletedJob(t, store, db.Job{
+				ID: "review-panel", Agent: "panel-parent", Type: "review",
+			}, parentPayload)
+
+			middlePayload := basePayload
+			middlePayload.HeadSHA = ""
+			middlePayload.DelegationID = "middle"
+			middlePayload.WorktreePath = "/tmp/gitmoot-nested-review/middle"
+			middlePayload.Result = &AgentResult{
+				Decision: "approved",
+				Summary:  "delegating to the leaf reviewer",
+				Delegations: []Delegation{{
+					ID: "leaf", Agent: tc.leafAgent, Action: "review",
+				}},
+			}
+			insertCompletedJob(t, store, db.Job{
+				ID: "review-panel/delegation/middle", Agent: "middle-reviewer", Type: "review",
+				ParentJobID: "review-panel", DelegationID: "middle",
+			}, middlePayload)
+
+			leafJobID := "review-panel/delegation/middle/delegation/leaf"
+			if tc.seedLeaf {
+				leafPayload := basePayload
+				leafPayload.HeadSHA = ""
+				leafPayload.DelegationID = "leaf"
+				leafPayload.WorktreePath = "/tmp/gitmoot-nested-review/middle/leaf"
+				leafPayload.Result = &AgentResult{
+					Decision: "approved", Summary: "leaf approved",
+					Evidence: "executed", EvidenceDeclared: true,
+					TestsRun: []string{"nested production-path check"},
+				}
+				insertCompletedJob(t, store, db.Job{
+					ID: leafJobID, Agent: tc.leafAgent, Type: "review",
+					ParentJobID: "review-panel/delegation/middle", DelegationID: "leaf",
+				}, leafPayload)
+			}
+
+			mergeable := true
+			gh := &fakeMergeGateGitHub{
+				pr: github.PullRequest{
+					Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
+					HeadSHA: "head123", Mergeable: &mergeable,
+				},
+				status:      github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
+				checks:      []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
+				mergeResult: github.MergeResult{Merged: true, SHA: "merge123"},
+			}
+			gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+			decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if decision.Merged != tc.wantMerge || (len(gh.merges) == 1) != tc.wantMerge {
+				t.Fatalf("decision=%+v merges=%d, want merge=%v", decision, len(gh.merges), tc.wantMerge)
+			}
+			if tc.wantReason != "" && !strings.Contains(decision.Reason.Render(), tc.wantReason) {
+				t.Fatalf("decision reason=%q, want %q", decision.Reason.Render(), tc.wantReason)
+			}
+			if !tc.wantMerge {
+				return
+			}
+
+			leafEvents, err := store.ListJobEvents(ctx, leafJobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			foundLeafEvidence := false
+			for _, event := range leafEvents {
+				if event.Kind == mergeApprovalEvidenceEvent &&
+					strings.Contains(event.Message, "approval by independent-reviewer") &&
+					strings.Contains(event.Message, "evidence=executed") {
+					foundLeafEvidence = true
+				}
+			}
+			if !foundLeafEvidence {
+				t.Fatalf("leaf approval evidence missing or misattributed: events=%+v", leafEvents)
+			}
+			for _, jobID := range []string{"review-panel", "review-panel/delegation/middle"} {
+				events, err := store.ListJobEvents(ctx, jobID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, event := range events {
+					if event.Kind == mergeApprovalEvidenceEvent {
+						t.Fatalf("fan-out announcement %s received approval evidence: %+v", jobID, event)
+					}
+				}
+			}
+		})
+	}
 }
 
 func insertSucceededNativeFamilyJob(t *testing.T, store *db.Store, jobID, agent, action, runtimeName string) {
