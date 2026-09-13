@@ -283,6 +283,14 @@ func delegationCleanupTargetContained(worker jobWorker, job db.Job, obligation d
 }
 
 func prepareDelegationCleanup(ctx context.Context, worker jobWorker, mode string, job db.Job, path string, now time.Time) (db.CleanupObligation, bool, error) {
+	path = strings.TrimSpace(path)
+	if filepath.Clean(path) == "." {
+		// Candidate discovery is a text prefilter and can return whitespace or
+		// relative spellings of no resource. Skip before obligation persistence:
+		// EnsureCleanupObligation correctly rejects them, but that rejection is
+		// not an operational failure and must not wedge the whole reclaim pass.
+		return db.CleanupObligation{}, false, nil
+	}
 	obligation, err := worker.Store.EnsureCleanupObligation(context.WithoutCancel(ctx), job.ID, path, now)
 	if err != nil {
 		logDelegationReclaimFailure(worker.Stdout, mode, "obligation", job.ID, path, err)

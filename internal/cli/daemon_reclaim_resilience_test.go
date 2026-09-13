@@ -491,6 +491,23 @@ END;`); err != nil {
 	}
 }
 
+func TestPrepareDelegationCleanupSkipsDegeneratePath(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	job := db.Job{ID: "degenerate-cleanup", Type: "implement"}
+	worker := defaultJobWorker(store, io.Discard, home)
+
+	obligation, ok, err := prepareDelegationCleanup(
+		context.Background(), worker, "aged", job, ".", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("degenerate path became a reclaim-pass failure: %v", err)
+	}
+	if ok || obligation.ResourceID != "" {
+		t.Fatalf("degenerate path created a cleanup obligation: ok=%v obligation=%+v", ok, obligation)
+	}
+}
+
 type failingAgedReclaimManager struct {
 	fakeReclaimWorktreeManager
 	err error
