@@ -3120,6 +3120,38 @@ func TestOmpPolicyArgs(t *testing.T) {
 	}
 }
 
+// TestOmpDeliverReadOnlySeatDefersApprovalToLandlock drives the production
+// Deliver argv path. A read-only seat is already inside Gitmoot's kernel
+// sandbox, so OMP must not ask an unavailable interactive UI before running
+// shell/tests. Non-seat read-only delivery still relies on OMP for confinement.
+func TestOmpDeliverReadOnlySeatDefersApprovalToLandlock(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		readOnlySeat bool
+		wantFlag     string
+		wantProperty PermissionPolicyApplication
+	}{
+		{"kernel-enforced seat", true, "--approval-mode=yolo", PermissionPolicyWidened},
+		{"unsandboxed non-seat", false, "--approval-mode=always-ask", PermissionPolicyApplied},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &fakeRunner{results: []subprocess.Result{{Stdout: ompStreamOK}}}
+			adapter := OmpAdapter{Runner: runner, Dir: "/repo"}
+			agent := ompTestAgent()
+			agent.AutonomyPolicy = AutonomyPolicyReadOnly
+			agent.ReadOnlySeat = tc.readOnlySeat
+
+			if _, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "run the review checks"}); err != nil {
+				t.Fatalf("Deliver: %v", err)
+			}
+			runner.want(t, 0, "omp", "-p", "--mode=json", tc.wantFlag, "--no-session", "--", "run the review checks")
+			if got := adapter.PermissionPolicyApplication(agent); got != tc.wantProperty {
+				t.Fatalf("PermissionPolicyApplication = %q, want %q", got, tc.wantProperty)
+			}
+		})
+	}
+}
+
 // TestOmpPromptQuotingHazards: the prompt must land as ONE token immediately after
 // `--`, byte-identical, whatever it looks like. Kills the fleet's known scar
 // class: a prompt reparsed as a flag (leading `-` exits 2), as an attachment
