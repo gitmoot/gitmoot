@@ -322,12 +322,12 @@ path runs the runtime under Gitmoot's Landlock wrapper, and omp ships as a Bun
 binary whose sandbox interaction is unprobed. Advertising the capability before
 it is proven would turn an unknown into a silent stage failure.
 
-### Cross-family review
+### Runtime-family review signal
 
-OMP remains the runtime wrapper, but it is no longer treated as one model
-family. After an OMP CLI process succeeds and its structured stream proves a
-complete run, the adapter records the provider reported with the final
-assistant message in the append-only job-event ledger.
+OMP remains the runtime wrapper, but it is not treated as one model family.
+After an OMP CLI process succeeds and its structured stream proves a complete
+run, the adapter records the provider reported with the final assistant message
+in the append-only job-event ledger.
 
 The merge gate compares upstream families, not wrappers. OMP routes through
 `openai` or `openai-codex` are the native Codex family, `anthropic` is the
@@ -335,13 +335,12 @@ native Claude family, and `kimi-code` is the native Kimi family. A provider
 without a native adapter stays namespaced, such as `omp:devin`. Different
 models or agent names using one provider remain one family.
 
-Requested model text is not evidence. A failed run, a successful stream without
-provider/model metadata, an older OMP job without a provider event, or a
-role-only in-session implementation with no successful provider record cannot
-establish cross-family independence and blocks the gate. Native fan-out cannot
-prove an OMP provider before execution, so it skips those reviewers; use an
-explicit `agent review` dispatch to run one and record evidence. Native runtime
-behavior is unchanged.
+Family diversity is advisory. A same-family comparison emits
+`merge_gate_family_advisory`; missing successful provider evidence or a
+role-only in-session implementation with no recorded family emits
+`merge_gate_family_unresolved`. Neither event disqualifies an otherwise
+substantive approval from a reviewer whose identity is independent of every
+implementer.
 
 ### Transcripts
 

@@ -224,10 +224,13 @@ Claude and Kimi ignore effort. The `omp` runtime is a multi-provider **routing
 harness**, so a few of its properties differ from the vendor CLIs and are worth
 saying out loud before routing work to it: it holds `review`/`implement`/`ask`
 but not `produce`, every job runs a fresh session (it never resumes), and
-read-only seats use Gitmoot's broker-backed sandbox. Cross-family independence
+read-only seats use Gitmoot's broker-backed sandbox. Runtime-family diversity
 uses the upstream provider proved by a successful OMP delivery, not the `omp`
-wrapper or a requested model string; missing or failed provider evidence blocks
-the merge gate (see CLI.md § Agent Setup). Use `gitmoot runtime list` to inspect
+wrapper or requested model text. It is advisory: same-family comparisons emit
+`merge_gate_family_advisory` and unresolved comparisons emit
+`merge_gate_family_unresolved`; neither disqualifies a distinct reviewer with
+substantive evidence (see CLI.md § Agent Setup). Use `gitmoot runtime list` to
+inspect
 each built-in runtime's resolved metadata: capabilities, default model/effort,
 known models, and the token-usage source.
 Operators can override a built-in runtime's

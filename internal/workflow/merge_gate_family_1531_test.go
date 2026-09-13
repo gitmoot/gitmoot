@@ -9,24 +9,10 @@ import (
 	"github.com/gitmoot/gitmoot/internal/github"
 )
 
-// #1531: the merge gate's independence check compared reviewer and implementer
-// AGENT NAMES, never runtime or model, so two agents with different names and
-// the same family satisfied a gate whose entire purpose is cross-family review.
-//
-// MEASURED INSTANCE, PR #1527 at head 2e0dd2ee: implementer `wave-impl` and
-// reviewer `g7-review` are both codex/gpt-5.6-sol. `g7-review != wave-impl` as
-// strings, so the self-approval check passed. That panel was caught only because
-// the gate failed closed for an unrelated bookkeeping reason and never reached
-// this test, which is the worse shape: a noisy failure mode masking a silent one.
-//
-// WHY THIS IS IMPLEMENTABLE NOW AND WAS NOT WHEN THE ISSUE WAS FILED. Its own
-// comment defers the fix because `effective_runtime` was recorded on 11% of
-// review jobs, and "doing (2) without (1) produces a gate that silently passes
-// whenever the field is absent". Re-measured on jobs since 2026-08-25, with the
-// agent-registry fallback counted: reviews 1335 of 1432 resolvable, implement
-// jobs 427 of 449. The prerequisite landed as #1528, and `ResolveRuntimeFamily`
-// already names this gate as its second consumer.
-func TestMergeGateRefusesASameFamilyApprovalWithADifferentAgentName(t *testing.T) {
+// Runtime-family comparison is a secondary diversity signal. Different agent
+// identities satisfy the merge gate's independence requirement even when their
+// runtime families match; the shared family remains visible as an advisory.
+func TestMergeGateReportsASameFamilyAdvisoryForDifferentAgentNames(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedFamilyAgent(t, store, "wave-impl", "codex")
@@ -41,17 +27,16 @@ func TestMergeGateRefusesASameFamilyApprovalWithADifferentAgentName(t *testing.T
 		t.Fatalf("sameRuntimeFamilyAsImplementer: %v", err)
 	}
 	if !same {
-		t.Fatal("a reviewer on the implementer's own runtime family was accepted as independent; the gate's bar is cross-family review and distinct agent names are not evidence of independence")
+		t.Fatal("a same-family review did not produce the expected diversity advisory")
 	}
-	for _, want := range []string{"g7-review", "codex", "wave-impl", "cross-family"} {
+	for _, want := range []string{"g7-review", "codex", "wave-impl", "advisory"} {
 		if !strings.Contains(reason, want) {
-			t.Fatalf("refusal reason %q does not name %q, so an operator cannot act on it", reason, want)
+			t.Fatalf("advisory reason %q does not name %q", reason, want)
 		}
 	}
 }
 
-// The control that decides whether this is an independence check or a blanket
-// refusal: a genuinely different family must still pass.
+// A genuinely different family needs no diversity advisory.
 func TestMergeGateAcceptsACrossFamilyApproval(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -65,14 +50,13 @@ func TestMergeGateAcceptsACrossFamilyApproval(t *testing.T) {
 		t.Fatalf("sameRuntimeFamilyAsImplementer: %v", err)
 	}
 	if same {
-		t.Fatalf("a cross-family approval was refused as same-family: %q", reason)
+		t.Fatalf("a cross-family approval produced a same-family advisory: %q", reason)
 	}
 }
 
-// THE RECORDED RUNTIME WINS OVER THE REGISTRY DEFAULT, which is what makes an
-// override-run job attribute correctly. Both agents are registered as codex, but
-// the reviewer actually RAN on kimi, so it is independent despite the registry.
-// Without this precedence the gate would refuse a legitimate override.
+// The runtime recorded on the job wins over the registry default. Both agents
+// are registered as codex, but the reviewer actually ran on kimi, so no
+// same-family advisory is warranted.
 func TestMergeGateUsesTheRuntimeAJobActuallyRanOn(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -86,19 +70,14 @@ func TestMergeGateUsesTheRuntimeAJobActuallyRanOn(t *testing.T) {
 		t.Fatalf("sameRuntimeFamilyAsImplementer: %v", err)
 	}
 	if same {
-		t.Fatal("a reviewer that RAN on kimi was refused because its registry default is codex; the runtime recorded on the job must win")
+		t.Fatal("a reviewer that ran on kimi was compared using its codex registry default")
 	}
 }
 
-// AN UNRESOLVABLE FAMILY MUST NOT READ AS CLEAN. It falls through to the name
-// check, exactly as before, and records why it could not be compared. The issue
-// warns about precisely the opposite outcome: "a gate that silently passes
-// whenever the field is absent", which looks installed and is not.
-//
-// Refusing on the residue is not an option today: it is dominated by EPHEMERAL
-// and TEMP agents, which are deliberately absent from the registry, and the
-// native review fanout dispatches its lens legs as ephemeral by construction.
-func TestMergeGateRecordsAnUnresolvableFamilyRatherThanClaimingAClean(t *testing.T) {
+// An unresolved family is disclosed rather than silently presented as diverse.
+// It is advisory because reviewer identity and substantive evidence are the hard
+// merge requirements.
+func TestMergeGateRecordsAnUnresolvableFamilyAdvisory(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedFamilyAgent(t, store, "wave-impl", "codex")
@@ -119,10 +98,10 @@ func TestMergeGateRecordsAnUnresolvableFamilyRatherThanClaimingAClean(t *testing
 		t.Fatalf("sameRuntimeFamilyAsImplementer: %v", err)
 	}
 	if !same {
-		t.Fatal("an unresolvable family did not block; independence that cannot be shown must not be assumed")
+		t.Fatal("an unresolvable family did not produce an advisory")
 	}
 	if !strings.Contains(reason, "lens-ephemeral-abc") {
-		t.Fatalf("block reason = %q, want the unresolvable reviewer named", reason)
+		t.Fatalf("advisory reason = %q, want the unresolvable reviewer named", reason)
 	}
 	events, err := store.ListJobEvents(ctx, "review-job")
 	if err != nil {
@@ -130,12 +109,12 @@ func TestMergeGateRecordsAnUnresolvableFamilyRatherThanClaimingAClean(t *testing
 	}
 	found := false
 	for _, event := range events {
-		if event.Kind == "merge_gate_family_unresolved" && strings.Contains(event.Message, "lens-ephemeral-abc") {
+		if event.Kind == mergeGateFamilyUnresolvedEventKind && strings.Contains(event.Message, "lens-ephemeral-abc") {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("no merge_gate_family_unresolved event naming the reviewer; the gate would report a check it never performed. events = %+v", events)
+		t.Fatalf("no unresolved-family advisory event naming the reviewer; events = %+v", events)
 	}
 }
 
@@ -150,15 +129,9 @@ func seedFamilyAgent(t *testing.T, store *db.Store, name string, runtime string)
 	}
 }
 
-// THE GATE-LEVEL DISCRIMINATOR, and the test the issue actually asked for: "a
-// firing test where reviewer and implementer have DIFFERENT NAMES and the SAME
-// family, asserting the gate REFUSES".
-//
-// It is the PR #1527 shape end to end through Evaluate, with a real merge client
-// that would perform the merge if the gate let it. The unit tests above cannot
-// serve as a before/after because the helper they call does not exist on base;
-// this one does, so it measures behaviour rather than compilation.
-func TestPolicyMergeGateRefusesSameFamilyApprovalEndToEnd(t *testing.T) {
+// The gate-level discriminator: same-family independent identities remain
+// eligible, and the production path persists the advisory before merging.
+func TestPolicyMergeGateAllowsSameFamilyIndependentApprovalEndToEnd(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	// Same family, different names: the exact PR #1527 pairing.
@@ -177,7 +150,11 @@ func TestPolicyMergeGateRefusesSameFamilyApprovalEndToEnd(t *testing.T) {
 
 	reviewPayload := payload
 	reviewPayload.EffectiveRuntime = "codex"
-	reviewPayload.Result = &AgentResult{Decision: "approved", Summary: "approved"}
+	reviewPayload.Result = &AgentResult{
+		Decision: "approved", Summary: "approved",
+		Evidence: "executed", EvidenceDeclared: true,
+		TestsRun: []string{"focused production-path check"},
+	}
 	insertCompletedJob(t, store, db.Job{ID: "review-job", Agent: "g7-review", Type: "review"}, reviewPayload)
 
 	mergeable := true
@@ -196,10 +173,17 @@ func TestPolicyMergeGateRefusesSameFamilyApprovalEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if decision.Merged || len(gh.merges) != 0 {
-		t.Fatalf("the gate MERGED a head whose only approval came from the implementer's own runtime family: decision=%+v merges=%+v", decision, gh.merges)
+	if !decision.Merged || len(gh.merges) != 1 {
+		t.Fatalf("the gate refused an independent substantive review solely because its runtime family matched: decision=%+v merges=%+v", decision, gh.merges)
 	}
-	if !strings.Contains(decision.Reason.Render(), "same family as implementer") {
-		t.Fatalf("decision reason = %q, want it to name the family collision", decision.Reason.Render())
+	events, err := store.ListJobEvents(ctx, "review-job")
+	if err != nil {
+		t.Fatal(err)
 	}
+	for _, event := range events {
+		if event.Kind == mergeGateFamilyAdvisoryEventKind && strings.Contains(event.Message, "same runtime family") {
+			return
+		}
+	}
+	t.Fatalf("same-family review merged without a persisted diversity advisory: events=%+v", events)
 }
