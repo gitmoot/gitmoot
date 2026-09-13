@@ -976,16 +976,19 @@ an omp seat:
   the run, the envelope is complete and only the final answer is missing, so the
   parser reads the FINAL assistant message rather than the last one that carried
   text — an earlier work note is never handed back as the job's answer.
-- **`--policy` selects the `--approval-mode` value,** and the flag is always
-  present for **determinism** - omitting it would inherit whatever
+- **`--policy` selects the ordinary `--approval-mode` value,** and the flag is
+  always present for **determinism** - omitting it would inherit whatever
   `tools.approvalMode` the host config carries. `read-only` maps to
   `always-ask`, `workspace-write` maps to `write`, and `auto` plus
   `danger-full-access` map to `yolo`. Measured on omp 17.2.4 headless,
   `always-ask` lets `read`/`grep`/`glob` succeed and refuses
   `bash`/`write`, with the process exiting 0 and a full `agent_end`, so it
-  **restricts** omp rather than breaking it (#1721). The adapter declares the
-  relationship it produced: `applied` for the three explicit policies and
-  `widened` for `auto`.
+  **restricts** omp rather than breaking it (#1721). A kernel-enforced
+  `ReadOnlySeat` is the exception: Gitmoot wraps the delivery in Landlock and
+  passes `yolo` so headless shell and test tools can run. The adapter declares
+  that override `widened`; Landlock remains the write boundary. Non-seat
+  `read-only` keeps `always-ask`. The other three explicit policy mappings are
+  declared `applied`, while `auto` is `widened`.
 - **OMP cross-family independence uses runtime-reported upstream-provider
   evidence.** A successful delivery whose final runtime message identifies its
   provider and model records that provider in the append-only event ledger; the
