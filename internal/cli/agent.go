@@ -93,8 +93,8 @@ func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime codex|claude|kimi|omp --repo owner/repo [--path .] [--template <template-id>] [--model model] [--effort effort] [--start-daemon]")
 	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
-	fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--lead implementer] [--head-sha sha] [--base ref] [--branch branch] [--background] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
-	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--lead implementer] [--head-sha sha] [--branch branch] [--background] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--allow-prompt-head-mismatch] [--no-fix-target] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--lead implementer] [--head-sha sha] [--base ref] [--branch branch] [--background|--foreground] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--lead implementer] [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--allow-prompt-head-mismatch] [--no-fix-target] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--base ref] [--head-sha sha] [--branch branch] [--background] [--type type] [--action implement] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
 	printAgentRuntimeOverrideHelp(w)
 	fmt.Fprintln(w, "  gitmoot agent type list|show|set ...")
@@ -944,7 +944,7 @@ func printAgentRunUsage(w io.Writer, command string) {
 	case "implement":
 		fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--base ref] [--head-sha sha] [--branch branch] [--draft|--ready] [--background] [--type type] [--action implement] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--skip-native-review-fanout] [--home path] [--json]")
 	default:
-		fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--lead implementer] [--head-sha sha] [--base ref] [--branch branch] [--draft|--ready] [--background] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--recipe id] [--skip-native-review-fanout] [--home path] [--json]")
+		fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--lead implementer] [--head-sha sha] [--base ref] [--branch branch] [--draft|--ready] [--background|--foreground] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--recipe id] [--skip-native-review-fanout] [--home path] [--json]")
 	}
 	if command == "implement" || command == "run" {
 		fmt.Fprintln(w, "  --base <ref> selects the starting commit for implement worktrees; origin/* refs are fetched before resolution.")

@@ -4564,3 +4564,31 @@ func TestOrchestrateRejectsForegroundReview(t *testing.T) {
 		t.Fatalf("exit=%d stdout=%q stderr=%q, want foreground refusal", code, stdout.String(), stderr.String())
 	}
 }
+
+func TestAgentHelpAdvertisesReviewForegroundModes(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := runAgent([]string{"--help"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("agent help exit=%d stderr=%q", code, stderr.String())
+	}
+	for _, command := range []string{"agent run", "agent review"} {
+		line := ""
+		for _, candidate := range strings.Split(stdout.String(), "\n") {
+			if strings.Contains(candidate, "gitmoot "+command+" ") {
+				line = candidate
+				break
+			}
+		}
+		if !strings.Contains(line, "[--background|--foreground]") {
+			t.Fatalf("%s help line = %q, want both execution modes", command, line)
+		}
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := runAgent([]string{"run", "--help"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("agent run help exit=%d stderr=%q", code, stderr.String())
+	}
+	if help := stdout.String() + stderr.String(); !strings.Contains(help, "[--background|--foreground]") {
+		t.Fatalf("agent run help = %q, want both execution modes", help)
+	}
+}
