@@ -404,20 +404,27 @@ func reviewJobStillAnswersWithin(ctx context.Context, store *db.Store, job db.Jo
 	}
 	seen[job.ID] = true
 	payload, payloadErr := workflow.ParseJobPayload(job.Payload)
-	// The claim holder IS this question by construction - the claim was minted
-	// for it. Every other job in the tree must prove it answers this subject
-	// before it is allowed to keep the claim alive (#2176).
-	if !isClaimHolder && payloadErr == nil && !subject.answers(payload) {
-		return false
-	}
-	switch job.State {
-	case string(workflow.JobQueued), string(workflow.JobRunning), string(workflow.JobBlocked):
-		return true
+
+	// ANSWERING AND TRAVERSING ARE DIFFERENT QUESTIONS, and #2176 round 2 caught
+	// me applying that principle to non-review legs while denying it to review
+	// legs. A job may answer only if it is a REVIEW of THIS subject; the claim
+	// holder is exempt because the claim was minted for it. Everything else is
+	// still walked, because any job can be the parent of one that answers - a
+	// foreign review leg (another PR, another head) can fan out a child that
+	// reviews exactly this head, and pruning its subtree released the claim and
+	// dispatched a duplicate while that child worked.
+	canAnswer := isClaimHolder || (reviewTypedJob(job) && payloadErr == nil && subject.answers(payload))
+
+	if canAnswer {
+		switch job.State {
+		case string(workflow.JobQueued), string(workflow.JobRunning), string(workflow.JobBlocked):
+			return true
+		}
 	}
 	if payloadErr != nil {
 		return false
 	}
-	if reviewVerdictDecision(job, payload) != "" {
+	if canAnswer && reviewVerdictDecision(job, payload) != "" {
 		return true
 	}
 	if payload.Result == nil || !workflow.ResultIsFanOut(payload.Result) {
@@ -430,16 +437,14 @@ func reviewJobStillAnswersWithin(ctx context.Context, store *db.Store, job db.Jo
 		return true
 	}
 	if len(children) == 0 {
+		// The announcement exists and the children do not YET. Their subject is
+		// unknowable until they appear, so this grace is deliberately not
+		// subject-scoped - and it is bounded, so an announcement whose children
+		// never arrive releases instead of wedging the claim.
 		return fanOutChildrenMayStillArrive(job, now)
 	}
 	for _, child := range children {
-		if reviewTypedJob(child) {
-			if reviewJobStillAnswersWithin(ctx, store, child, subject, now, seen, false) {
-				return true
-			}
-			continue
-		}
-		if reviewDescendantStillAnswers(ctx, store, child, subject, now, seen) {
+		if reviewJobStillAnswersWithin(ctx, store, child, subject, now, seen, false) {
 			return true
 		}
 	}
@@ -454,7 +459,7 @@ func reviewJobStillAnswersWithin(ctx context.Context, store *db.Store, job db.Jo
 // verbatim, and a succeeded marked preflight whose advance is permanently
 // refused sits in the same state. Two bounds, both required:
 //
-//   - a FAILED or CANCELLED fan-out will never enqueue children, so it gets no
+//   - a fan-out that is not SUCCEEDED will never enqueue children, so it gets no
 //     grace at all;
 //   - a succeeded one gets the dispatch window, after which the claim releases.
 //     Failing open costs one duplicate reviewer; pinning forever costs every
@@ -475,43 +480,6 @@ func fanOutChildrenMayStillArrive(job db.Job, now time.Time) bool {
 		}
 	}
 	return now.Sub(updated) <= reviewRequestDispatchWindow
-}
-
-// reviewDescendantStillAnswers walks a NON-review subtree looking for a review
-// job that can still answer THIS subject. The node itself is never evidence -
-// that is the #2172 type scoping - but its descendants may be, which is the
-// blind spot #2176 closed. The visited set is shared with the caller, so a
-// corrupted cycle terminates here exactly as it does above.
-func reviewDescendantStillAnswers(ctx context.Context, store *db.Store, job db.Job, subject reviewClaimSubject, now time.Time, seen map[string]bool) bool {
-	if seen[job.ID] {
-		return false
-	}
-	seen[job.ID] = true
-	children, err := store.ListJobsByParent(ctx, job.ID)
-	if err != nil {
-		return true
-	}
-	if len(children) == 0 {
-		// #2176 F3: the same not-yet-enqueued grace the top level has, or a
-		// nested fan-out under a non-review leg loses its review grandchild in
-		// the window before dispatch inserts it.
-		if payload, err := workflow.ParseJobPayload(job.Payload); err == nil && payload.Result != nil && workflow.ResultIsFanOut(payload.Result) {
-			return fanOutChildrenMayStillArrive(job, now)
-		}
-		return false
-	}
-	for _, child := range children {
-		if reviewTypedJob(child) {
-			if reviewJobStillAnswersWithin(ctx, store, child, subject, now, seen, false) {
-				return true
-			}
-			continue
-		}
-		if reviewDescendantStillAnswers(ctx, store, child, subject, now, seen) {
-			return true
-		}
-	}
-	return false
 }
 
 // reviewTypedJob reports whether a job answers a REVIEW question. The job type

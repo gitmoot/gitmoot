@@ -1048,3 +1048,79 @@ func TestNestedFanOutUnderANonReviewLegKeepsTheNotYetEnqueuedGrace(t *testing.T)
 		t.Fatal("a nested fan-out with no children yet reads as finished: takeover dispatches a duplicate while the review grandchild is seconds away")
 	}
 }
+
+// #2176 f6 (P2). My subject check pruned a foreign REVIEW leg's whole subtree
+// before ever listing its children - applying "answering and traversing are
+// different questions" to non-review legs while denying it to review legs. A
+// foreign review job (another PR, another head) can fan out a child that
+// reviews exactly THIS head; pruning released the claim and dispatched a
+// duplicate while that child worked.
+func TestClaimWalkSeesAMatchingReviewUnderAForeignReviewLeg(t *testing.T) {
+	_, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	job := stagedPreflightClaim(t, store, head, "review", string(workflow.JobSucceeded), "")
+	foreignLeg := job.ID + "/delegation/leg"
+	foreign, err := json.Marshal(workflow.JobPayload{
+		Repo: "owner/repo", PullRequest: 99, HeadSHA: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+		ReviewPurpose: "code", Result: &workflow.AgentResult{Decision: "approved", FanOut: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ExecForTest(ctx, "UPDATE jobs SET payload = ?, type = 'review' WHERE id = ?", string(foreign), foreignLeg); err != nil {
+		t.Fatal(err)
+	}
+	matching, err := json.Marshal(workflow.JobPayload{Repo: "owner/repo", PullRequest: 12, HeadSHA: head, ReviewPurpose: "code"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: foreignLeg + "/delegation/matching", Agent: "opus-reviewer", Type: "review",
+		State: string(workflow.JobRunning), Payload: string(matching), Repo: "owner/repo", ParentJobID: foreignLeg,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !reviewJobStillAnswers(ctx, store, job, testClaimSubject(t, head), time.Now().UTC()) {
+		t.Fatal("a RUNNING review of this exact head is invisible because its parent reviews another PR: the claim releases and a duplicate reviewer is dispatched")
+	}
+}
+
+// #2176 f7 (P3), first half. The unknown-subject direction was the entire point
+// of the previous commit and shipped with no failing test: an unparseable claim
+// key must let NOTHING but the holder keep the claim, because "matches
+// everything" is the permanent wedge the subject check exists to remove.
+func TestUnparseableClaimSubjectAnswersNothing(t *testing.T) {
+	_, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	job := stagedPreflightClaim(t, store, head, "review", string(workflow.JobSucceeded), "approved")
+	unknown, ok := reviewSubjectFromClaim(db.ReviewRequest{SubjectKey: "not-a-subject-key", Purpose: "code"})
+	if ok {
+		t.Fatal("a malformed key parsed; this test no longer exercises the unknown-subject direction")
+	}
+	if reviewJobStillAnswers(ctx, store, job, unknown, time.Now().UTC()) {
+		t.Fatal("an unknown subject is matching every descendant verdict: the claim pins forever exactly as it did before the subject check")
+	}
+}
+
+// #2176 f7, second half. The holder exemption is what keeps a claim with a
+// drifted or unreadable payload from releasing under its own owner's feet.
+func TestClaimHolderKeepsItsOwnClaimDespiteAForeignPayload(t *testing.T) {
+	_, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	foreign, err := json.Marshal(workflow.JobPayload{
+		Repo: "owner/repo", PullRequest: 99, HeadSHA: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", ReviewPurpose: "code",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "drifted-holder", Agent: "opus-reviewer", Type: "review", State: string(workflow.JobRunning), Payload: string(foreign), Repo: "owner/repo"}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.GetJob(ctx, "drifted-holder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reviewJobStillAnswers(ctx, store, job, testClaimSubject(t, head), time.Now().UTC()) {
+		t.Fatal("the claim holder lost its own live claim because its payload names another subject: a running reviewer is displaced by a duplicate")
+	}
+}

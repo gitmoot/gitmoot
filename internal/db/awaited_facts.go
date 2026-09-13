@@ -88,7 +88,9 @@ func ParseReviewVerdictSubjectKey(key string) (repo string, pullRequest int, hea
 }
 
 // ReviewVerdictKeyPurpose is the exported form of the purpose a subject key is
-// scoped to, defaulting to DefaultReviewPurpose for a bare key.
+// scoped to. A BARE key returns "" - scoped to no purpose means ANY purpose,
+// not a shorthand for DefaultReviewPurpose; conflating the two would let a bare
+// `org await review` wait be satisfied only by code verdicts.
 func ReviewVerdictKeyPurpose(key string) string {
 	return reviewVerdictKeyPurpose(key)
 }
