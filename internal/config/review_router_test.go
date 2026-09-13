@@ -48,3 +48,28 @@ func TestReviewRouterRejectsInvalidPools(t *testing.T) {
 		})
 	}
 }
+
+// TestReviewRouterMalformedHeaderEndsSection pins this loader's sectionHeader
+// call site. A line that opens a bracket and never closes it is a BOUNDARY that
+// names no section, so the keys after it belong to nobody. Reverting the site to
+// the pre-#1759 two-bracket form makes `[oops` fall through to the key parser,
+// which either refuses the whole config or lands `security` in [review_router] —
+// both fail here.
+func TestReviewRouterMalformedHeaderEndsSection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[review_router]\ncode = [\"devin/swe-2\"]\n[oops\nsecurity = [\"anthropic/claude-opus-4-6\"]\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	settings, err := LoadReviewRouterSettings(Paths{ConfigFile: path})
+	if err != nil {
+		t.Fatalf("a malformed header must end the section, not fail the load: %v", err)
+	}
+	code, err := settings.Models("code")
+	if err != nil || !reflect.DeepEqual(code, []string{"devin/swe-2"}) {
+		t.Fatalf("code pool = %v, %v; keys BEFORE the malformed header must still apply", code, err)
+	}
+	security, err := settings.Models("security")
+	if err != nil || !reflect.DeepEqual(security, code) {
+		t.Fatalf("security pool = %v, %v; a key after the malformed header was attributed to [review_router]", security, err)
+	}
+}
