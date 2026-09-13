@@ -27,6 +27,13 @@ import (
 const (
 	reviewRequestExecutionPath = "review_request"
 	defaultReviewRequestTTL    = 12 * time.Hour
+	// reviewRequestDispatchWindow bounds how long a claim may hold no readable
+	// job row before another requester may take it over. Dispatch does real work
+	// (read-only worktree allocation, runtime preflight, GitHub reads) before
+	// Mailbox.Enqueue, so a claim younger than this is presumed live. It is a
+	// LIVENESS bound, not a timeout: exceeding it only permits takeover once the
+	// job row is still absent, which means Enqueue never happened.
+	reviewRequestDispatchWindow = 10 * time.Minute
 )
 
 // reviewRequestState names what the router did with one request. It is part
@@ -222,24 +229,29 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		NotifyBy:    "awaited fact wake to " + opts.role,
 		Holds:       reviewRequestHolds(paths, opts.home),
 	}
-	// The claim is taken on a job id minted here, so a lost claim costs nothing
-	// and a won claim binds exactly the job that dispatch will insert.
+	// The claim is taken on a job id minted here. The claim row — NOT the jobs
+	// row — is the mutual exclusion: dispatch takes seconds (worktree allocation,
+	// runtime preflight) before Mailbox.Enqueue inserts the job, so during that
+	// window the winner's job id is not readable. A loser that treats "job row
+	// absent" as "claim is dead" steals the claim and both requesters dispatch,
+	// which is the duplicate this table exists to prevent.
 	jobID := localAgentJobID("review", "review-router")
 	claim, won, err := store.ClaimReviewRequest(ctx, subjectKey, jobID, opts.purpose, opts.role)
 	if err != nil {
 		return reviewRequestOutput{}, err
 	}
 	if !won {
-		existing, err := store.GetJob(ctx, claim.JobID)
-		switch {
-		case err != nil && !errors.Is(err, sql.ErrNoRows):
+		attach, takeover, err := resolveLostReviewClaim(ctx, store, claim, time.Now().UTC())
+		if err != nil {
 			return reviewRequestOutput{}, err
-		case err == nil && reviewJobStillAnswers(existing):
-			return finishReviewAttach(ctx, store, output, existing, subjectKey, opts)
 		}
-		// The claimed job ended without a verdict (or was never inserted). Move
-		// the claim; a concurrent requester that wins this CAS instead is the one
-		// that dispatches, and this caller attaches to its job.
+		if !takeover {
+			return finishReviewAttach(ctx, store, output, attach, claim, opts)
+		}
+		// The holder is provably gone: its job ended without a verdict, or it
+		// never enqueued one and its claim has aged past the dispatch window.
+		// Move the claim; a concurrent requester that wins this CAS instead is
+		// the one that dispatches, and this caller attaches to its job.
 		moved, err := store.ReplaceReviewRequestJob(ctx, subjectKey, claim.JobID, jobID, opts.role)
 		if err != nil {
 			return reviewRequestOutput{}, err
@@ -249,16 +261,16 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 			if err != nil {
 				return reviewRequestOutput{}, err
 			}
-			existing, err := store.GetJob(ctx, current.JobID)
-			if err != nil {
-				return reviewRequestOutput{}, fmt.Errorf("review request for %s moved to job %s, which is not readable: %w", subjectKey, current.JobID, err)
+			attach, takeover, err := resolveLostReviewClaim(ctx, store, current, time.Now().UTC())
+			if err != nil || takeover {
+				return reviewRequestOutput{}, fmt.Errorf("review request for %s is contended: the claim moved to job %s while this request was resolving; re-run it", subjectKey, current.JobID)
 			}
-			return finishReviewAttach(ctx, store, output, existing, subjectKey, opts)
+			return finishReviewAttach(ctx, store, output, attach, current, opts)
 		}
 	}
 	reviewer, err := selectReviewRouterAgent(ctx, store, repo.FullName(), opts.reviewer)
 	if err != nil {
-		_ = store.ReleaseReviewRequest(ctx, subjectKey, jobID)
+		releaseUnenqueuedReviewClaim(ctx, store, subjectKey, jobID)
 		return reviewRequestOutput{}, err
 	}
 	request := localAgentDispatchRequest{
@@ -289,7 +301,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	}
 	dispatched, err := dispatchLocalAgentJobFromCLI(ctx, store, request)
 	if err != nil {
-		_ = store.ReleaseReviewRequest(ctx, subjectKey, jobID)
+		releaseUnenqueuedReviewClaim(ctx, store, subjectKey, jobID)
 		return reviewRequestOutput{}, err
 	}
 	output.State = reviewRequestDispatched
@@ -332,13 +344,61 @@ func reviewVerdictDecision(payload workflow.JobPayload) string {
 	return ""
 }
 
-func finishReviewAttach(ctx context.Context, store *db.Store, output reviewRequestOutput, job db.Job, subjectKey string, opts reviewRequestOptions) (reviewRequestOutput, error) {
+// releaseUnenqueuedReviewClaim frees a claim ONLY when its job was never
+// enqueued. dispatchLocalAgentJobFromCLI can fail AFTER Mailbox.Enqueue commits
+// — a post-enqueue step erroring on an already-queued review — and releasing
+// then would leave a live job with no claim, so the next requester dispatches a
+// second reviewer for the same head. Absence of the row is the only safe
+// evidence; any read error leaves the claim in place, costing at most one
+// dispatch-window wait.
+func releaseUnenqueuedReviewClaim(ctx context.Context, store *db.Store, subjectKey, jobID string) {
+	if _, err := store.GetJob(ctx, jobID); !errors.Is(err, sql.ErrNoRows) {
+		return
+	}
+	_ = store.ReleaseReviewRequest(ctx, subjectKey, jobID)
+}
+
+// resolveLostReviewClaim answers what a requester that LOST the claim should do.
+// It returns the job to attach to (zero when the holder is still dispatching and
+// has no job row yet) and whether the claim may be taken over.
+//
+// Takeover requires PROOF the holder is gone, never an absence that a live
+// dispatch also produces:
+//   - job row readable and still answering  -> attach, no takeover
+//   - job row readable and dead without a verdict -> takeover
+//   - job row absent, claim younger than the dispatch window -> attach to the
+//     claim: the holder is mid-dispatch and its Enqueue has not landed yet
+//   - job row absent, claim older than the window -> takeover: the dispatching
+//     process died before it ever enqueued, so nothing will ever appear
+func resolveLostReviewClaim(ctx context.Context, store *db.Store, claim db.ReviewRequest, now time.Time) (db.Job, bool, error) {
+	job, err := store.GetJob(ctx, claim.JobID)
+	switch {
+	case err == nil:
+		return job, !reviewJobStillAnswers(job), nil
+	case !errors.Is(err, sql.ErrNoRows):
+		return db.Job{}, false, err
+	}
+	claimed, parseErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(claim.UpdatedAt))
+	if parseErr != nil {
+		// An unreadable timestamp must not authorize a takeover: failing closed
+		// costs one re-run, failing open costs a duplicate reviewer.
+		return db.Job{}, false, nil
+	}
+	return db.Job{}, now.Sub(claimed) > reviewRequestDispatchWindow, nil
+}
+
+func finishReviewAttach(ctx context.Context, store *db.Store, output reviewRequestOutput, job db.Job, claim db.ReviewRequest, opts reviewRequestOptions) (reviewRequestOutput, error) {
 	output.State = reviewRequestAttached
-	output.JobID = job.ID
+	output.JobID = firstNonEmpty(job.ID, claim.JobID)
 	output.JobState = job.State
 	output.Reviewer = job.Agent
 	output.Model = job.Model
-	output.WatchCommand = jobWatchCommand(job.ID, opts.home)
+	output.WatchCommand = jobWatchCommand(output.JobID, opts.home)
+	if job.ID == "" {
+		// The holder is inside its dispatch window: the job is real and coming,
+		// it is simply not insertable-and-readable yet.
+		output.JobState = "dispatching"
+	}
 	if payload, err := workflow.ParseJobPayload(job.Payload); err == nil {
 		if decision := reviewVerdictDecision(payload); decision != "" {
 			output.State = reviewRequestVerdictExists
@@ -363,7 +423,11 @@ func finishReviewAttach(ctx context.Context, store *db.Store, output reviewReque
 // later wakes it from the job's own state transition — never from gate
 // advancement and never from a process that has to still be alive.
 func subscribeReviewRequester(ctx context.Context, store *db.Store, output *reviewRequestOutput, opts reviewRequestOptions) error {
-	verdictKey, err := db.ReviewVerdictSubjectKey(output.Repo, output.PullRequest, output.HeadSHA)
+	// The subscription is PURPOSE-SCOPED: a code verdict must not satisfy a
+	// security request at the same head, which is exactly what the bare verdict
+	// key does. `gitmoot org await review` keeps the bare key and its
+	// any-purpose semantics; the producer resolves both.
+	verdictKey, err := db.ReviewRequestSubjectKey(output.Repo, output.PullRequest, output.HeadSHA, output.Purpose)
 	if err != nil {
 		return err
 	}
@@ -379,7 +443,7 @@ func subscribeReviewRequester(ctx context.Context, store *db.Store, output *revi
 			return nil
 		}
 	}
-	fact, _, err := store.SubscribeAwaitedFact(ctx, db.AwaitedFactSubscription{
+	fact, skipped, err := store.SubscribeAwaitedFact(ctx, db.AwaitedFactSubscription{
 		WaiterRole:  opts.role,
 		SubjectKind: db.AwaitedFactSubjectReviewVerdict,
 		SubjectKey:  verdictKey,
@@ -387,6 +451,16 @@ func subscribeReviewRequester(ctx context.Context, store *db.Store, output *revi
 	})
 	if err != nil {
 		return fmt.Errorf("subscribe %s to the verdict: %w", opts.role, err)
+	}
+	// A head-blind review cannot satisfy an exact-head wait, so a requester that
+	// is never told about it waits the full TTL believing a review is coming.
+	// Say so at request time instead (#2130 makes this shape common).
+	for _, skip := range skipped {
+		hold := fmt.Sprintf("review job %s recorded no head, so it cannot satisfy this exact-head wait", skip.JobID)
+		if skip.ExternallyDriven {
+			hold += " (externally driven: its attribution row is not head-bound)"
+		}
+		output.Holds = append(output.Holds, hold)
 	}
 	output.AwaitedFactID = fact.ID
 	return nil
@@ -496,9 +570,31 @@ func printReviewRequestOutput(w io.Writer, output reviewRequestOutput) {
 	}
 }
 
+// reviewGateState renders the gate's own capability for this repo. It answers
+// the question a router surface must not leave to inference: if a merge does
+// not happen, is that the gate refusing, or the gate declining to decide?
+func reviewGateState(home, repo string) string {
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		return "unknown: " + err.Error()
+	}
+	gate, err := config.LoadMergeGatePolicy(paths)
+	if err != nil {
+		return "unknown: " + err.Error()
+	}
+	if gate.For(repo).AutoMerge {
+		return "native auto-merge enabled: an exact-head approval plus green CI can merge without a human"
+	}
+	return "native auto-merge disabled by operator kill switch: the gate publishes status but merges nothing, and a merge is a human decision"
+}
+
 type reviewStatusOutput struct {
 	Repo        string              `json:"repo"`
 	PullRequest int                 `json:"pull_request"`
+	// Gate states what the native merge gate can do for this repository, in
+	// words. A requester must never read an absent or kill-switched gate as an
+	// approval, and "not applied to this head" alone does not say which it is.
+	Gate        string              `json:"gate"`
 	Requests    []reviewStatusEntry `json:"requests"`
 }
 
@@ -545,7 +641,7 @@ func runReviewStatus(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return err
 		}
-		output = reviewStatusOutput{Repo: repo.FullName(), PullRequest: *pr, Requests: make([]reviewStatusEntry, 0, len(jobs))}
+		output = reviewStatusOutput{Repo: repo.FullName(), PullRequest: *pr, Gate: reviewGateState(*home, repo.FullName()), Requests: make([]reviewStatusEntry, 0, len(jobs))}
 		for _, job := range jobs {
 			entry := reviewStatusEntry{JobID: job.ID, State: job.State, Reviewer: job.Agent, Model: job.Model, UpdatedAt: job.UpdatedAt}
 			if payload, err := workflow.ParseJobPayload(job.Payload); err == nil {
@@ -579,7 +675,7 @@ func runReviewStatus(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	fmt.Fprintf(stdout, "%s#%d: %d review job(s)\n", output.Repo, output.PullRequest, len(output.Requests))
+	fmt.Fprintf(stdout, "%s#%d: %d review job(s)\ngate: %s\n", output.Repo, output.PullRequest, len(output.Requests), output.Gate)
 	for _, entry := range output.Requests {
 		line := fmt.Sprintf("  %s %s head=%s reviewer=%s", entry.JobID, entry.State, shortReviewHead(entry.HeadSHA), entry.Reviewer)
 		if entry.Model != "" {

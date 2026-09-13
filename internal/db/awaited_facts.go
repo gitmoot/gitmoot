@@ -76,24 +76,34 @@ func ReviewVerdictSubjectKey(repo string, pullRequest int, headSHA string) (stri
 	return fmt.Sprintf("%s#%d@%s", repo, pullRequest, headSHA), nil
 }
 
+// parseReviewVerdictSubjectKey is the exact inverse of the two constructors
+// above: it accepts the bare repo#pr@head key and the purpose-scoped
+// repo#pr@head|purpose key the review router subscribes with.
 func parseReviewVerdictSubjectKey(key string) (repo string, pullRequest int, headSHA string, err error) {
 	key = strings.TrimSpace(key)
-	at := strings.LastIndexByte(key, '@')
+	base, purpose, scoped := strings.Cut(key, "|")
+	if scoped {
+		purpose = strings.ToLower(strings.TrimSpace(purpose))
+		if purpose == "" || strings.ContainsAny(purpose, "#@ \t\r\n") {
+			return "", 0, "", fmt.Errorf("invalid review verdict subject key %q", key)
+		}
+	}
+	at := strings.LastIndexByte(base, '@')
 	if at <= 0 {
 		return "", 0, "", fmt.Errorf("invalid review verdict subject key %q", key)
 	}
-	hash := strings.LastIndexByte(key[:at], '#')
+	hash := strings.LastIndexByte(base[:at], '#')
 	if hash <= 0 || hash >= at-1 {
 		return "", 0, "", fmt.Errorf("invalid review verdict subject key %q", key)
 	}
-	pullRequest, err = strconv.Atoi(key[hash+1 : at])
+	pullRequest, err = strconv.Atoi(base[hash+1 : at])
 	if err != nil {
 		return "", 0, "", fmt.Errorf("invalid review verdict subject key %q", key)
 	}
-	repo = key[:hash]
-	headSHA = key[at+1:]
+	repo = base[:hash]
+	headSHA = base[at+1:]
 	want, err := ReviewVerdictSubjectKey(repo, pullRequest, headSHA)
-	if err != nil || want != key {
+	if err != nil || want != base {
 		return "", 0, "", fmt.Errorf("invalid review verdict subject key %q", key)
 	}
 	return repo, pullRequest, headSHA, nil
@@ -272,6 +282,9 @@ type reviewVerdictPayload struct {
 		TestsRun []string `json:"tests_run"`
 		Evidence string   `json:"evidence"`
 	} `json:"result"`
+	// ReviewPurpose scopes a #2171 router verdict to the question it answers, so
+	// a code review cannot satisfy a security waiter at the same head.
+	ReviewPurpose string `json:"review_purpose"`
 }
 
 // isFanOut reports whether a decoded review result is a coordinator announcement
@@ -447,6 +460,10 @@ func resolveAwaitedReviewFactTx(ctx context.Context, tx *sql.Tx, jobID, agent, j
 	if strings.TrimSpace(jobType) != "review" {
 		return nil
 	}
+	var decoded reviewVerdictPayload
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		return nil
+	}
 	var fact reviewVerdictObservation
 	noticeState := ""
 	var key string
@@ -463,10 +480,6 @@ func resolveAwaitedReviewFactTx(ctx context.Context, tx *sql.Tx, jobID, agent, j
 			return nil
 		}
 	case "failed", "blocked", "cancelled":
-		var decoded reviewVerdictPayload
-		if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
-			return nil
-		}
 		var err error
 		key, err = ReviewVerdictSubjectKey(decoded.Repo, decoded.PullRequest, decoded.HeadSHA)
 		if err != nil {
@@ -476,22 +489,34 @@ func resolveAwaitedReviewFactTx(ctx context.Context, tx *sql.Tx, jobID, agent, j
 	default:
 		return nil
 	}
+	// TWO keys are resolved, and the distinction is the point. The BARE key is
+	// every historical waiter (`org await review`), which asks "is this head
+	// reviewed" and is answered by a verdict of any purpose. The PURPOSE-SCOPED
+	// key belongs to the #2171 review router, which asks "is this head reviewed
+	// FOR THIS PURPOSE": a code verdict must never terminally satisfy a security
+	// waiter, because the router deliberately runs those as separate reviews.
+	keys := []any{key}
+	if purposed, purposeErr := ReviewRequestSubjectKey(decoded.Repo, decoded.PullRequest, decoded.HeadSHA, decoded.ReviewPurpose); purposeErr == nil {
+		keys = append(keys, purposed)
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(keys)), ",")
 	rows, err := tx.QueryContext(ctx, `
-SELECT id, waiter_role
+SELECT id, waiter_role, subject_key
 FROM awaited_facts
-WHERE state = 'waiting' AND subject_kind = ? AND subject_key = ?
-ORDER BY id`, AwaitedFactSubjectReviewVerdict, key)
+WHERE state = 'waiting' AND subject_kind = ? AND subject_key IN (`+placeholders+`)
+ORDER BY id`, append([]any{AwaitedFactSubjectReviewVerdict}, keys...)...)
 	if err != nil {
 		return err
 	}
 	type target struct {
 		id   int64
 		role string
+		key  string
 	}
 	var targets []target
 	for rows.Next() {
 		var item target
-		if err := rows.Scan(&item.id, &item.role); err != nil {
+		if err := rows.Scan(&item.id, &item.role, &item.key); err != nil {
 			rows.Close()
 			return err
 		}
@@ -506,20 +531,31 @@ ORDER BY id`, AwaitedFactSubjectReviewVerdict, key)
 
 	if state == "succeeded" {
 		for _, target := range targets {
-			if _, err := satisfyAwaitedFactTx(ctx, tx, target.id, target.role, AwaitedFactSubjectReviewVerdict, key, fact.detail, now); err != nil {
+			if _, err := satisfyAwaitedFactTx(ctx, tx, target.id, target.role, AwaitedFactSubjectReviewVerdict, target.key, fact.detail, now); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 
+	// A terminal review that stored a verdict DID answer the question; only the
+	// advancement around it failed. Saying otherwise sent requesters chasing a
+	// verdict that was sitting in the payload.
 	detail := fmt.Sprintf(
 		"review job %s %s without an exact-head verdict; the awaited fact remains unresolved",
 		strings.TrimSpace(jobID), state,
 	)
+	if decoded.Result != nil {
+		if decision := strings.TrimSpace(decoded.Result.Decision); decision != "" && !decoded.isFanOut() {
+			detail = fmt.Sprintf(
+				"review job %s %s carrying verdict %s at head %s; the awaited fact remains unresolved because the job did not reach succeeded — inspect with gitmoot job show %s",
+				strings.TrimSpace(jobID), state, decision, decoded.HeadSHA, strings.TrimSpace(jobID),
+			)
+		}
+	}
 	for _, target := range targets {
 		if err := insertAwaitedFactNoticeWakeTx(
-			ctx, tx, target.id, target.role, target.role, AwaitedFactSubjectReviewVerdict, key,
+			ctx, tx, target.id, target.role, target.role, AwaitedFactSubjectReviewVerdict, target.key,
 			noticeState, jobID, lifecycleGeneration, detail,
 		); err != nil {
 			return err

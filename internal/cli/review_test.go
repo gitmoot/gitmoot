@@ -199,6 +199,104 @@ func mustGetJob(t *testing.T, store *db.Store, id string) db.Job {
 	return job
 }
 
+// The claim, not the jobs row, is the mutual exclusion. Dispatch does seconds of
+// work before Mailbox.Enqueue, so a loser that reads "job row absent" must NOT
+// conclude the holder is dead and steal the claim: that dispatches a second
+// reviewer for one subject, the duplicate the table exists to prevent. Reverting
+// resolveLostReviewClaim to a bare GetJob check fails this test.
+func TestReviewRequestClaimSurvivesTheDispatchWindow(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	seedDaemonWorkerAgentWithPolicy(t, store, "opus-reviewer", runtime.ShellRuntime, "true", []string{"review", "ask"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	subject := mustSubjectKey(t, head)
+
+	// Requester A has won the claim and is mid-dispatch: its job row does not
+	// exist yet, exactly as during worktree allocation and runtime preflight.
+	claim, won, err := store.ClaimReviewRequest(ctx, subject, "job-a-dispatching", "code", "joltra")
+	if err != nil || !won {
+		t.Fatalf("seed claim = %+v won=%v err=%v", claim, won, err)
+	}
+	base := []string{"--repo", "owner/repo", "--pr", "12", "--head", head, "--branch", "feature/review", "--role", "joltra", "--home", home, "--json"}
+	loser, failure := runReviewRequestJSON(t, base...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	if loser.State != reviewRequestAttached || loser.JobID != "job-a-dispatching" {
+		t.Fatalf("request during another requester's dispatch window = %+v, want attachment to job-a-dispatching", loser)
+	}
+	if loser.JobState != "dispatching" {
+		t.Fatalf("job state = %q, want the in-flight dispatch reported honestly", loser.JobState)
+	}
+	jobs, err := store.ListReviewJobsForPullRequest(ctx, "owner/repo", 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("the losing requester dispatched %d review job(s); the claim holder owns this subject", len(jobs))
+	}
+	if current, err := store.GetReviewRequest(ctx, subject); err != nil || current.JobID != "job-a-dispatching" {
+		t.Fatalf("claim after the losing request = %+v (%v), want it still held by job-a-dispatching", current, err)
+	}
+
+	// A claim whose holder never enqueued and has aged past the dispatch window
+	// IS dead, and must be taken over rather than stranding the subject forever.
+	stale := db.ReviewRequest{JobID: "job-a-dispatching", UpdatedAt: time.Now().UTC().Add(-2 * reviewRequestDispatchWindow).Format(time.RFC3339Nano)}
+	if _, takeover, err := resolveLostReviewClaim(ctx, store, stale, time.Now().UTC()); err != nil || !takeover {
+		t.Fatalf("aged claim with no job row: takeover=%v err=%v, want takeover", takeover, err)
+	}
+}
+
+// A code verdict must not terminally satisfy a security requester at the same
+// head: the router runs different purposes as separate reviews and the docs
+// promise exactly that. Reverting the subscription to the bare verdict key, or
+// the producer to a single-key resolve, fails this test.
+func TestReviewRequestVerdictDoesNotSatisfyAnotherPurpose(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	seedDaemonWorkerAgentWithPolicy(t, store, "opus-reviewer", runtime.ShellRuntime, "true", []string{"review", "ask"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	base := []string{"--repo", "owner/repo", "--pr", "12", "--head", head, "--branch", "feature/review", "--home", home, "--json"}
+
+	code, failure := runReviewRequestJSON(t, append(append([]string{}, base...), "--role", "joltra")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	security, failure := runReviewRequestJSON(t, append(append([]string{}, base...), "--role", "owner", "--purpose", "security")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	if security.AwaitedFactID == code.AwaitedFactID {
+		t.Fatal("both purposes subscribed to the same fact; a code verdict would answer a security request")
+	}
+
+	payload, err := workflow.ParseJobPayload(mustGetJob(t, store, code.JobID).Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload.Result = &workflow.AgentResult{Decision: "approved", Summary: "code review clean", TestsRun: []string{"go test ./..."}, Evidence: "executed"}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TransitionJobStatePayloadWithEvent(ctx, code.JobID, string(workflow.JobQueued), string(workflow.JobSucceeded), string(encoded), db.JobEvent{JobID: code.JobID, Kind: "succeeded", Message: "job succeeded"}); err != nil {
+		t.Fatal(err)
+	}
+
+	codeFact, err := store.GetAwaitedFact(ctx, code.AwaitedFactID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if codeFact.State != db.AwaitedFactStateSatisfied {
+		t.Fatalf("code requester fact = %s, want satisfied by its own verdict", codeFact.State)
+	}
+	securityFact, err := store.GetAwaitedFact(ctx, security.AwaitedFactID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if securityFact.State != db.AwaitedFactStateWaiting {
+		t.Fatalf("security requester fact = %s (%q), want it still waiting for a security verdict", securityFact.State, securityFact.ResolutionDetail)
+	}
+}
+
 func TestReviewRequestReleasesClaimWhenReviewerRefused(t *testing.T) {
 	home, store, head := reviewRouterHome(t)
 	var stdout, stderr bytes.Buffer

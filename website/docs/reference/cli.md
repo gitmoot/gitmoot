@@ -1294,30 +1294,43 @@ What one request does, in order:
    full 40 hex characters) and the requester role (`--role`, default
    `GITMOOT_ORG_ROLE`; it must exist in the organization chart because it is the
    notification destination).
-2. Claims `(repo, PR, head, purpose)` atomically in `review_requests`. Exactly one
-   concurrent requester wins and dispatches; every other returns `state:
-   attached` naming the same job. A claim standing on a job that ended WITHOUT a
-   result (crash, cancel, exhausted operational retries) is taken over, so an
-   operational failure never blocks a later request. A claim standing on a saved
-   verdict returns `state: verdict_exists` with the decision and spends nothing.
-   A different `--purpose` is a different question and runs in parallel.
+2. Claims `(repo, PR, head, purpose)` in `review_requests`. THE CLAIM ROW, NOT THE
+   JOB ROW, IS THE MUTUAL EXCLUSION: dispatch does real work (read-only worktree
+   allocation, runtime preflight, GitHub reads) before the job is enqueued, so
+   for a few seconds the winner holds a claim whose job id is not yet readable.
+   A requester arriving in that window returns `state: attached` with
+   `job_state: dispatching` rather than concluding the holder is dead. Takeover
+   requires proof: the claimed job ended without a verdict, or it never enqueued
+   one and the claim has aged past a 10-minute dispatch window. A synthetic
+   `failed` result — the daemon's dead-runtime recovery writes one — is NOT a
+   verdict and does not hold the subject. A claim standing on a real
+   `approved`/`changes_requested` verdict returns `state: verdict_exists` and
+   spends nothing. A different `--purpose` is a different question and runs in
+   parallel.
 3. Selects a registered agent with the `review` capability, WITHOUT `implement`,
    scoped to the repository (omp-native agents first, then by name), or the
    `--reviewer` you name. The job runs as a background review-only job on `omp`
    with a fresh per-job session, `--no-fix-target` semantics, and the first
    model of the purpose's pool; merge-gate independence rules apply unchanged.
-4. Subscribes the requester to the exact-head verdict (`gitmoot org await
-   review` underneath). The wake fires from the reviewing job's own state
-   transition when the verdict is persisted, before and independently of gate
-   advancement, and it carries the decision, findings count, executed-check
+4. Subscribes the requester to the exact-head verdict FOR THAT PURPOSE. The
+   subscription key is `owner/repo#N@sha|purpose`, so a `code` verdict cannot
+   terminally satisfy a `security` request at the same head; `gitmoot org await
+   review` keeps the bare `owner/repo#N@sha` key and its any-purpose meaning,
+   and a verdict resolves both. The wake fires from the reviewing job's own
+   state transition when the verdict is persisted, before and independently of
+   gate advancement, and it carries the decision, findings count, executed-check
    count, evidence declaration and the `gitmoot job show <id>` command. A second
    request by the same role keeps its original wait. When the wait's `--ttl`
    elapses it expires to the role's parent, as every awaited fact does.
 
-The request prints any admission hold it can see at dispatch time (daemon not
-running, disk guard paused) so a held review is distinguishable from a slow one;
-`review status` lists every review job on the pull request with head, model,
-verdict, evidence and the daemon's current hold reason.
+The request prints every hold it can see rather than leaving a requester to
+infer one: the daemon not running, the disk guard pausing dispatch, and any
+head-blind review that cannot satisfy an exact-head wait at all. `review status`
+lists each review job with head, model, verdict, evidence and the daemon's hold
+reason, and states the GATE's own capability in words — whether native
+auto-merge is enabled, or disabled by the operator kill switch, in which case
+the gate publishes status and merges nothing. An absent or not-applied gate
+marker is never an approval.
 
 Model pools are configured per purpose; an unconfigured purpose uses `code`:
 
