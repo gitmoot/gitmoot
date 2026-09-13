@@ -181,7 +181,7 @@ func TestStageSeatToolchainResolvesASymlinkedSystemGo(t *testing.T) {
 	t.Setenv("PATH", strings.Join([]string{launcherDir, "/usr/bin", "/bin"}, string(os.PathListSeparator)))
 
 	paths := config.PathsForHome(t.TempDir())
-	staged, env, diagnostic, err := stageSeatToolchain(paths)
+	staged, env, diagnostic, err := stageSeatToolchain(paths, "")
 	if err != nil {
 		t.Fatal(err)
 	}
