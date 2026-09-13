@@ -419,6 +419,13 @@ type JobPayload struct {
 	// The clone owns its git directory, is attached to Branch, and remains visible
 	// to cleanup obligations and doctor until an operator removes it.
 	FixWorktree bool `json:"fix_worktree,omitempty"`
+	// ImplementationFinalized records that this implement job's work has been
+	// committed, pushed and had its pull request opened or adopted (#2057 round
+	// three). It is DURABLE STATE, not a cache: the finalizer is not idempotent,
+	// so a retry of AdvanceJob after a later failure must not run it twice, and a
+	// consumer deciding whether the payload's head was produced by a finalizer
+	// must not re-derive that from a task lookup that can fail independently.
+	ImplementationFinalized bool `json:"implementation_finalized,omitempty"`
 	// ReadOnlyWorktreeDiff durably preserves the bounded `git status --short` +
 	// `git diff HEAD` snapshot collected immediately before a terminal ask/review
 	// worktree is removed. Truncated is explicit when the snapshot exceeded the

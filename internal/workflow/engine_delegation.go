@@ -679,7 +679,103 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 	return err
 }
 
+// delegationHeadResolver resolves a ref to a SHA. It is the same RevParse the
+// writable lineage manager already exposes; asserted narrowly here so a
+// manager that cannot resolve refs degrades to the unbound arm rather than
+// failing the dispatch (#1730).
+type delegationHeadResolver interface {
+	RevParse(ctx context.Context, rev string) (string, error)
+}
+
 func (e Engine) allocateAndEnqueueDelegationInner(ctx context.Context, job db.Job, payload JobPayload, d Delegation, request JobRequest, ref taskRef) error {
+	// #1730. A review child inherits the parent's HeadSHA, and that is CORRECT
+	// when the coordinator is itself a review: a lens fan-out reviews the same
+	// commit its parent was dispatched against, which is 27 of the 28
+	// parent-delegated reviews in this store.
+	//
+	// IT IS WRONG WHEN THE PARENT IS AN IMPLEMENT JOB. An implement job's payload
+	// head is the commit BEFORE its change, and that payload is not updated by
+	// the time its delegations are enqueued. Measured on the single instance:
+	// parent local-implement-appkit-omp-18d0db287156c2ba enqueued `round2-review`
+	// in the SAME SECOND it succeeded (10:22:43), the child recorded head
+	// 0e2ce4f1, and the reviewer's own summary named 0c175d03 as "== HEAD". The
+	// row attested an approval at an ANCESTOR of the reviewed tree while the only
+	// correct record was free text - which inverts the reason head-binding exists.
+	//
+	// THIS SITS BEFORE THE ALLOCATION CHAIN BECAUSE THE REPRODUCED CASE HAS ONE
+	// CHILD. readOnlyFanoutNeedsWorktree requires TWO OR MORE read-only siblings
+	// (worktree.go:941, `count >= 2`), so a lone review child never reaches the
+	// read-only worktree branch at all. A fix placed there would have been
+	// unexercised by the very job that motivated it.
+	//
+	// IT WRITES A HEAD RATHER THAN CLEARING ONE. The head the child will actually
+	// review is the tip of the parent's branch, which is where that parent's work
+	// landed, so it is resolved here and recorded.
+	//
+	// #2057: THE DROP ARM IS GONE, and the reorder in AdvanceJob is why. A
+	// task-backed implementation is now finalized BEFORE its delegations are
+	// dispatched, and the finalizer writes payload.HeadSHA to the produced head on
+	// every path. So an inherited head is normally CORRECT here, and an
+	// unresolvable branch no longer implies it is stale - dropping one would
+	// unbind the common case to protect the rare one, which is the wrong trade
+	// now that the common case is right.
+	//
+	// The rebind arm stays because it still has work: an implement job with NO
+	// task worktree runs no finalizer, so its payload head is still the
+	// pre-change commit, and resolving the branch tip corrects it. When the
+	// finalizer did run, resolved and inherited agree and this is a no-op.
+	if request.Action == "review" && strings.EqualFold(strings.TrimSpace(job.Type), "implement") {
+		inherited := strings.TrimSpace(request.HeadSHA)
+		resolved := ""
+		branch := strings.TrimSpace(payload.Branch)
+		if resolver, ok := e.DelegationWorktrees.(delegationHeadResolver); ok && branch != "" {
+			if sha, resolveErr := resolver.RevParse(ctx, branch); resolveErr == nil {
+				resolved = strings.TrimSpace(sha)
+			}
+		}
+		// #2057 ROUND TWO. THE DROP ARM IS BACK, SCOPED TO THE PATH THAT NEEDS IT.
+		// Removing it wholesale was wrong: my justification held only for the
+		// FINALIZER path, where the inherited head is the head the finalizer just
+		// produced. On the NO-FINALIZER path this function's own comment says the
+		// inherited head is the pre-change commit, so when the branch will not
+		// resolve there is no correct head to record and keeping the stale one
+		// attests a verdict against a commit nobody reviewed - the #1730 defect
+		// itself.
+		//
+		// The discriminator is the same predicate the engine uses to decide
+		// whether to finalize at all, so the two halves cannot disagree.
+		// #2057 round three, P1: READ THE DURABLE MARKER. Re-deriving eligibility
+		// here meant a task lookup failing at THIS moment could classify a payload
+		// the finalizer had already produced as unfinalized, and then drop the
+		// produced head as if it were the pre-change one.
+		producedByFinalizer := payload.ImplementationFinalized
+		switch {
+		case resolved != "" && resolved != inherited:
+			request.HeadSHA = resolved
+			_ = e.recordEffectEvent(ctx, db.JobEvent{
+				JobID: job.ID,
+				Kind:  "delegation_review_head_rebound",
+				Message: fmt.Sprintf("delegation %q reviews branch %s: bound to its tip %s instead of the implement parent's dispatch head %s (#1730)",
+					request.DelegationID, branch, shortHead(resolved), shortHead(inherited)),
+			})
+		// #2057 round three, P1: AN UNCHANGED RESOLVE IS NOT A RESOLVE on this
+		// path. When RevParse succeeded and returned the SAME sha as the inherited
+		// one, neither arm used to fire: nonempty so not dropped, equal so not
+		// rebound. The head stayed the pre-change commit this path documents, and
+		// a lone review child - which allocates no worktree, because the fan-out
+		// branch needs two or more siblings - reads the shared checkout while the
+		// row records an ancestor. Equality is therefore treated as unresolved
+		// unless a finalizer produced the head.
+		case (resolved == "" || resolved == inherited) && inherited != "" && !producedByFinalizer:
+			request.HeadSHA = ""
+			_ = e.recordEffectEvent(ctx, db.JobEvent{
+				JobID: job.ID,
+				Kind:  "delegation_review_head_unbound",
+				Message: fmt.Sprintf("delegation %q could not resolve branch %q and its implement parent runs no finalizer, so the pre-change dispatch head %s was DROPPED rather than recorded as reviewed (#1730, #2057)",
+					request.DelegationID, branch, shortHead(inherited)),
+			})
+		}
+	}
 	if request.Action == "implement" {
 		if e.DelegationWorktrees == nil || strings.TrimSpace(e.Home) == "" {
 			// No per-delegation worktree isolation is available (the engine lacks a

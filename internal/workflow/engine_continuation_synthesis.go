@@ -1548,8 +1548,27 @@ func (e Engine) implementationNeedsFinalizer(ctx context.Context, payload JobPay
 		return false
 	}
 	task, err := e.Store.GetTask(ctx, taskID)
-	if err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
+		// The task genuinely does not exist, which is a DIFFERENT FACT from a
+		// lookup that failed. An absent row answers the question - this job is not
+		// task-backed - so there is nothing to fail closed about, and three
+		// pre-existing tests depend on that distinction. Conflating the two was
+		// the first version of this fix: it made every ad-hoc implement job
+		// attempt a finalizer.
 		return false
+	}
+	if err != nil {
+		// #2057 round three, P1: FAIL CLOSED. This used to return false, which
+		// reads as "this implementation needs no finalizer" - so a transient task
+		// lookup failure let the parent DAG and the delegations advance from work
+		// that was never committed, and repeated failures ran the finalizer ZERO
+		// times. A job carrying a TaskID is task-backed by construction; the only
+		// thing in doubt is whether the task row can be read right now.
+		//
+		// Returning true instead means the caller attempts the finalizer, which
+		// performs its own task lookup and returns the error, so AdvanceJob fails
+		// and is retried. Nothing advances on a guess.
+		return true
 	}
 	return strings.TrimSpace(task.WorktreePath) != "" ||
 		(payload.FixWorktree && strings.TrimSpace(payload.WorktreePath) != "")

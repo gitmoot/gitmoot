@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -560,7 +562,19 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	// leg that *triggered* the integration would not yet be on its branch and its
 	// work would be missing from the merge. The task/PR finalizer path commits its
 	// own way, so this only covers PR-less delegation legs; it is a no-op otherwise.
-	if job.Type == "implement" && payload.Result.Decision == "implemented" && !e.implementationNeedsFinalizer(ctx, payload) {
+	// #2057 round four, P1: ONE ELIGIBILITY DECISION PER ADVANCE. It used to be
+	// read independently at three sites, from a task lookup that can fail at each
+	// one, so a transient failure at the first read (mapping to true, skipping
+	// commitDelegationLeg) followed by a recovery to sql.ErrNoRows at the next
+	// (mapping to false, skipping the finalizer) let the parent DAG and the
+	// delegations advance with NEITHER having run. The inverse order - false, then
+	// true - permitted dispatch before a late finalization.
+	//
+	// Computed once here, before the first consumer, and threaded. A single read
+	// can still fail, and it fails closed as before; what it can no longer do is
+	// disagree with itself inside one advance.
+	needsFinalizer := job.Type == "implement" && e.implementationNeedsFinalizer(ctx, payload)
+	if job.Type == "implement" && payload.Result.Decision == "implemented" && !needsFinalizer {
 		if err := e.commitDelegationLeg(ctx, job, payload); err != nil {
 			return err
 		}
@@ -571,6 +585,255 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	if job.Type == "implement" && payload.Result.Decision != "implemented" && payload.PullRequest <= 0 {
 		if err := e.recordImplementNoPRAdvance(ctx, job.ID, payload.Result.Decision); err != nil {
 			return err
+		}
+	}
+
+	// #2057 ROUND TWO. THIS SITS ABOVE THE PARENT-DAG ADVANCE, not merely above
+	// dispatchDelegations. An implement job that is ITSELF a delegation child
+	// reaches advanceParentForTerminalChild below, which can enqueue a ready
+	// dependent sibling or the coordinator continuation. Finalizing after that
+	// meant a failed finalizer left those jobs enqueued from work that was never
+	// committed or pushed - the same defect as the delegation case, one level up,
+	// and the first fix's failing-finalizer test used a TOP-LEVEL job so it could
+	// not see this path.
+	//
+	// Advancing the parent from the FINALIZED payload is also the more correct
+	// input: siblings and the continuation then read the produced head and pull
+	// request rather than the pre-change ones.
+	// #2057 (review of the #1730 fix). A TASK-BACKED IMPLEMENTATION IS FINALIZED
+	// BEFORE ITS DELEGATIONS ARE DISPATCHED, because until the finalizer runs the
+	// produced work is NOT COMMITTED: the worktree HEAD is still the inherited
+	// pre-change commit, and a delegated review inheriting it is bound to a
+	// commit nobody produced. That is the #1730 class, and resolving the head at
+	// dispatch time cannot fix it - there is nothing to resolve yet.
+	//
+	// The finalizer is the right source rather than a git read here because it
+	// ALREADY writes the produced head: every path through
+	// daemonImplementationFinalizer sets payload.HeadSHA (commit-and-push, adopt,
+	// and existing-PR), along with Branch and PullRequest. So dispatching from
+	// the finalized payload needs no resolver at all.
+	//
+	// ORDERING CONSEQUENCE, deliberate: a finalizer that fails now prevents the
+	// delegations instead of following them. That is the safer direction - the
+	// work whose review was being delegated does not exist - and it is the same
+	// judgement the blocked/failed early-return above already makes.
+	// #2057 round three, P1: THE DECISION IS MADE ONCE AND RECORDED. Eligibility
+	// used to be re-derived at three separate sites from a task lookup that can
+	// fail independently at each one, so a failure after a SUCCESSFUL finalizer
+	// could classify the payload as never finalized and drop the head the
+	// finalizer had just produced, and a retry after any later failure ran the
+	// finalizer again - it commits, pushes and opens a pull request, so a second
+	// run is not a harmless repeat.
+	//
+	// payload.ImplementationFinalized is the durable answer. It is persisted with
+	// the finalized payload in the same UpdateJobPayload write, so a retry reads
+	// it rather than re-deriving it.
+	finalizedBeforeDelegations := payload.ImplementationFinalized
+	if job.Type == "implement" && payload.Result != nil && payload.Result.Decision == "implemented" &&
+		!payload.ImplementationFinalized && needsFinalizer {
+		// #2057 round four, P1: THE FINALIZATION IS CLAIMED BEFORE IT RUNS.
+		// payload.ImplementationFinalized alone left an unclaimed
+		// read-then-finalize-then-write window: two concurrent AdvanceJob callers
+		// could both load false and both invoke FinalizeImplementation, which
+		// commits, pushes and opens or adopts a pull request - so the second one
+		// is a duplicate external mutation, not a repeated no-op. And a crash or
+		// UpdateJobPayload failure after the finalizer SUCCEEDED left false
+		// durable, so the next retry finalized again.
+		//
+		// ClaimJobEvent is the same at-most-once primitive the pipeline auto-merge
+		// gate uses for its own external write: the NOT EXISTS guard and the
+		// insert share one statement, so there is no check-then-act window. The
+		// claim, not the payload flag, is what makes the success path safe - it
+		// survives a crash before the payload write, which the flag by definition
+		// cannot.
+		claimed, claimErr := e.Store.ClaimJobEvent(ctx, db.JobEvent{
+			JobID:   job.ID,
+			Kind:    implementationFinalizeClaimedEvent,
+			Message: implementationFinalizeClaimMessage(job.ID),
+		})
+		if claimErr != nil {
+			return claimErr
+		}
+		if claimed {
+			// A CLAIM WITHOUT ITS OWNER ROW IS NOT ALLOWED TO EXIST (#2057 round
+			// eight). Round seven wrote this best-effort, and the reviewer showed
+			// what that buys: a later winner whose owner write fails leaves the
+			// PRIOR holder's owner row as the newest one, so the abandonment
+			// reader attributes the live claim to a dead boot and recovers it.
+			//
+			// The invariant closes that by construction rather than by another
+			// guard: if the owner cannot be recorded, the claim is released and
+			// the advance returns retryably, so no claim is ever attributable to
+			// an identity that does not own it. The cost is a retry, which is the
+			// same cost every other failure on this path already pays.
+			if ownerErr := e.recordEffectEvent(ctx, db.JobEvent{
+				JobID:   job.ID,
+				Kind:    implementationFinalizeClaimOwnerEvent,
+				Message: implementationFinalizeClaimOwnerMessage(job.ID),
+			}); ownerErr != nil {
+				if releaseErr := e.releaseFinalizeClaim(ctx, job.ID); releaseErr != nil {
+					return errors.Join(ownerErr, releaseErr)
+				}
+				return FinalizationInProgressError{JobID: job.ID}
+			}
+		}
+		if !claimed {
+			// #2057 round five, P1: A CLAIM PROVES SOMEONE STARTED, NOT THAT ANYONE
+			// FINISHED, and the previous version conflated those. It set
+			// finalizedBeforeDelegations = true and carried on, so the LOSER of the
+			// claim advanced the parent DAG and dispatched delegations from the
+			// pre-finalization head and pull request while the winner was still
+			// committing and pushing. And a crash after claiming has the SAME
+			// durable representation whether finalization never ran or completed
+			// before the payload write, so the flag could not tell them apart
+			// either.
+			//
+			// Completion is now its own durable fact. The winner records it after
+			// the payload write; a loser that sees it reloads the finalized payload
+			// and proceeds, and a loser that does NOT see it stops, because it
+			// cannot dispatch correctly from data the winner is about to replace.
+			// Stopping is retryable - the daemon re-advances - while dispatching
+			// from stale data is not recoverable.
+			completed, completedErr := e.implementationFinalizeCompleted(ctx, job.ID)
+			if completedErr != nil {
+				return completedErr
+			}
+			if !completed {
+				// #2057 round six, P1: A CLAIM WITH NO COMPLETION IS NOT PROOF THAT
+				// ANYONE IS STILL WORKING. The claim carries no owner, lease or
+				// generation, so a daemon that exits between claiming and the payload
+				// write - or one whose payload write AND release both fail - leaves
+				// ImplementationFinalized=false, a claim, and no completion. Every
+				// later advance then loses the claim, sees no completion, and returns
+				// this error FOREVER: stranded, not retried.
+				//
+				// Recovered by AGE, from the claim row's own created_at, which is the
+				// shape the pipeline auto-merge claim already uses for the same
+				// question. Under the bound this stays a quiet retry, because a live
+				// winner is the overwhelmingly likely explanation. Past it the claim
+				// is released and the recovery recorded, so the NEXT advance claims
+				// cleanly and finalizes.
+				//
+				// This accepts a possible duplicate of the finalizer's external work,
+				// which is the trade already taken on both failure paths above: a
+				// permanent stop is worse than a possible duplicate, because the
+				// duplicate is visible and recoverable and the stop is neither. The
+				// bound is what keeps it from being taken while a winner is alive.
+				abandoned, owner, abandonedErr := e.implementationFinalizeClaimAbandoned(ctx, job.ID)
+				if abandonedErr != nil {
+					return abandonedErr
+				}
+				if !abandoned {
+					return FinalizationInProgressError{JobID: job.ID}
+				}
+				// THE OWNER ROW IS THE RECOVERY TOKEN, and releasing it FIRST is
+				// what closes the ABA race. ReleaseJobEventClaim is at-most-once
+				// on the exact (job, kind, message) tuple, so of two recoverers
+				// that both observed this dead owner exactly ONE deletes it; the
+				// loser sees released=false and stops without ever touching the
+				// claim. Releasing the claim first would let the loser delete a
+				// live successor's claim, because the claim's message is stable
+				// by design and therefore identical for every holder.
+				wonRecovery, ownerErr := e.Store.ReleaseJobEventClaim(ctx, db.JobEvent{
+					JobID:   job.ID,
+					Kind:    implementationFinalizeClaimOwnerEvent,
+					Message: owner.Message,
+				})
+				if ownerErr != nil {
+					return ownerErr
+				}
+				if !wonRecovery {
+					// Another recoverer got there first. Its release of the claim
+					// is the one that counts.
+					return FinalizationInProgressError{JobID: job.ID}
+				}
+				released, releaseErr := e.Store.ReleaseJobEventClaim(ctx, db.JobEvent{
+					JobID:   job.ID,
+					Kind:    implementationFinalizeClaimedEvent,
+					Message: implementationFinalizeClaimMessage(job.ID),
+				})
+				if releaseErr != nil {
+					return releaseErr
+				}
+				if released {
+					_ = e.recordEffectEvent(ctx, db.JobEvent{
+						JobID: job.ID,
+						Kind:  implementationFinalizeClaimRecoveredEvent,
+						Message: fmt.Sprintf(
+							"implementation finalization claim for %s was held by boot %s pid %d, which is gone; released for retry (#2057)",
+							job.ID, owner.BootID, owner.PID),
+					})
+				}
+				return FinalizationInProgressError{JobID: job.ID}
+			}
+			refreshed, refreshErr := e.Store.GetJob(ctx, job.ID)
+			if refreshErr != nil {
+				return refreshErr
+			}
+			reloaded, reloadErr := unmarshalPayload(refreshed.Payload)
+			if reloadErr != nil {
+				return reloadErr
+			}
+			payload = reloaded
+			finalizedBeforeDelegations = true
+		} else {
+			finalized, err := e.ImplementationFinalizer.FinalizeImplementation(ctx, job, payload)
+			if err != nil {
+				// RELEASED ON FAILURE, and the scope of that is stated because it is
+				// the one thing this fix does NOT make safe. A failed finalizer may
+				// have committed or pushed before failing, so a retry can repeat part
+				// of its work - which is exactly what happens TODAY, with no claim at
+				// all. Releasing is therefore no worse than current behaviour on the
+				// failure path, while the success path becomes strictly safe. Making a
+				// FAILED finalizer idempotent is a separate problem and is not
+				// attempted here.
+				releaseErr := e.releaseFinalizeClaim(ctx, job.ID)
+				if releaseErr != nil {
+					return errors.Join(err, releaseErr)
+				}
+				return err
+			}
+			finalized.ImplementationFinalized = true
+			encoded, err := marshalPayload(finalized)
+			if err != nil {
+				return err
+			}
+			if err := e.Store.UpdateJobPayload(ctx, job.ID, encoded); err != nil {
+				// #2057 round five: A PAYLOAD WRITE THAT FAILS AFTER A SUCCESSFUL
+				// FINALIZER MUST RELEASE THE CLAIM. Otherwise nothing durable
+				// records the finalization - the marker is unwritten and completion
+				// is unreached - while the claim is held, so every later advance
+				// returns FinalizationInProgressError FOREVER and the job is
+				// stranded rather than retried.
+				//
+				// Releasing accepts that a retry may repeat part of the finalizer's
+				// external work, which is the same trade already taken on the
+				// finalizer-failure path and is what happens today with no claim at
+				// all. A permanent stop is worse than a possible duplicate, because
+				// the duplicate is visible and recoverable and the stop is neither.
+				//
+				// The COMPLETION-write failure below needs no release: the payload
+				// marker is already durable by then, and the claim block is guarded
+				// on it, so a retry never consults the claim
+				// (TestFinalizedPayloadWithoutCompletionStillAdvances).
+				releaseErr := e.releaseFinalizeClaim(ctx, job.ID)
+				if releaseErr != nil {
+					return errors.Join(err, releaseErr)
+				}
+				return err
+			}
+			payload = finalized
+			// Recorded AFTER the payload write, so its presence means the payload a
+			// loser reloads is the finalized one. Ordered the other way it would
+			// promise data that is not there yet.
+			if err := e.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
+				JobID:   job.ID,
+				Kind:    implementationFinalizeCompletedEvent,
+				Message: fmt.Sprintf("implementation finalization completed for %s (#2057)", job.ID),
+			}); err != nil {
+				return err
+			}
+			finalizedBeforeDelegations = true
 		}
 	}
 
@@ -731,13 +994,19 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		if payload.Result.Decision != "implemented" {
 			return nil
 		}
-		finalizerRan := false
-		if e.implementationNeedsFinalizer(ctx, payload) {
+		// The finalizer is NOT run twice. It commits, pushes and opens or adopts a
+		// pull request, so a second call is not a harmless repeat. When the
+		// pre-delegation block above already ran it, `finalizerRan` still reports
+		// true here, because every consumer below asks "was this implementation
+		// finalized", never "was it finalized at this line".
+		finalizerRan := finalizedBeforeDelegations || payload.ImplementationFinalized
+		if !finalizerRan && needsFinalizer {
 			finalizerRan = true
 			finalized, err := e.ImplementationFinalizer.FinalizeImplementation(ctx, job, payload)
 			if err != nil {
 				return err
 			}
+			finalized.ImplementationFinalized = true
 			encoded, err := marshalPayload(finalized)
 			if err != nil {
 				return err
@@ -1586,4 +1855,221 @@ func (e Engine) projectedNewDelegationJobs(ctx context.Context, parentJobID stri
 // contributes 0, so the sum under-counts rather than over-counts.
 func (e Engine) sumRootDelegationTokens(ctx context.Context, rootID string) (int, error) {
 	return e.Store.SumJobTokensByRoot(ctx, rootID)
+}
+
+// implementationFinalizeCompletedEvent is the durable record that a finalizer RAN
+// TO COMPLETION and its payload was persisted (#2057 round five). It is a
+// separate fact from the CLAIM: a claim proves someone STARTED, and a crash after
+// claiming looks identical whether the finalizer never ran or finished just
+// before the payload write.
+const implementationFinalizeCompletedEvent = "implementation_finalize_completed"
+
+// implementationFinalizeClaimedEvent is the claim row's kind, named once so the
+// claim, the releases and the recovery reader cannot drift apart.
+const implementationFinalizeClaimedEvent = "implementation_finalize_claimed"
+
+// implementationFinalizeClaimOwnerEvent records the identity holding the claim.
+const implementationFinalizeClaimOwnerEvent = "implementation_finalize_claim_owner"
+
+// implementationFinalizeClaimRecoveredEvent records that an abandoned
+// finalization claim was released for retry (#2057 round six).
+const implementationFinalizeClaimRecoveredEvent = "implementation_finalize_claim_recovered"
+
+// implementationFinalizeClaimMessage stamps a claim with the OWNER that holds
+// it, so a later reader can ask whether that owner still exists (#2057 round
+// seven).
+//
+// WHY THE OWNER AND NOT A CLOCK. Round six recovered a claim held longer than
+// 15 minutes. The reviewer instrumented it and observed the failure directly:
+// the winning FinalizeImplementation stayed live, the clock passed the grace, a
+// losing advance released the claim, and a third advance entered the SAME
+// finalizer concurrently. No constant fixes that. Finalization has no ceiling
+// below the job context, which defaults to four hours and reaches eight, and
+// GitHub throttling alone can wait 30 minutes - so any grace short enough to
+// recover a dead owner promptly is also short enough to steal a live one, and
+// the replacement can then be recovered again on the same rule, which loops.
+//
+// Liveness is not derivable from age. It IS derivable from identity: a claim
+// stamped with a boot id and a pid can be tested against the boot we are in and
+// the process table. That is the same discriminator ListRunningJobIDsFromForeign
+// Boot already uses for abandoned runners, so this is one convention rather than
+// a second.
+//
+// THE MESSAGE IS ALSO THE ABA FIX. ClaimJobEvent and ReleaseJobEventClaim key on
+// the exact (job, kind, message) tuple. Round six used a CONSTANT message, so
+// two stale recoverers could both read the old claim, one release it, a new
+// winner acquire an identical row, and the second recoverer release the NEW
+// winner's claim. An owner-stamped message makes those rows distinct, so a
+// release built from the observed claim cannot match a successor's.
+func implementationFinalizeClaimMessage(jobID string) string {
+	return fmt.Sprintf("implementation finalization claimed for %s (#2057)", jobID)
+}
+
+// implementationFinalizeClaimOwnerMessage stamps WHO holds the claim, written as
+// a SEPARATE event immediately after the claim is won.
+//
+// WHY NOT IN THE CLAIM ITSELF. Round seven's first attempt put the owner in the
+// claim's message, and a pre-existing test caught the consequence at once:
+// ClaimJobEvent's at-most-once check keys on (job, kind, MESSAGE), so a claim
+// written by the old binary no longer excludes a claimer using the new format.
+// A deploy with an in-flight finalization would have run a SECOND finalizer
+// beside the first - the exact double-execution this whole guard exists to
+// prevent, introduced by the fix for it. The claim message must therefore stay
+// byte-stable forever.
+//
+// The owner event carries the identity instead, and it doubles as the recovery
+// token: ReleaseJobEventClaim on the OWNER row is at-most-once, so of two
+// recoverers observing the same dead owner exactly one proceeds to release the
+// claim. That is what closes the ABA race without making the claim's own message
+// vary.
+func implementationFinalizeClaimOwnerMessage(jobID string) string {
+	return fmt.Sprintf("implementation finalization for %s is held by boot %s pid %d (#2057)",
+		jobID, db.BootID(), os.Getpid())
+}
+
+// implementationFinalizeClaimOwner is the identity parsed back out of a claim.
+type implementationFinalizeClaimOwner struct {
+	BootID  string
+	PID     int
+	Message string
+}
+
+var implementationFinalizeClaimOwnerPattern = regexp.MustCompile(
+	`^implementation finalization for (?:.+) is held by boot (\S*) pid (\d+) \(#2057\)$`)
+
+// FinalizationInProgressError reports that another advance holds the finalization
+// claim and has not recorded completion, so this caller cannot safely proceed:
+// the head and pull request in its payload are about to be replaced.
+//
+// An ERROR rather than a silent skip, because stopping is retryable - the daemon
+// re-advances - while dispatching delegations from data that is about to change
+// is not.
+type FinalizationInProgressError struct {
+	JobID string
+}
+
+func (e FinalizationInProgressError) Error() string {
+	return fmt.Sprintf("implementation finalization for %s is in progress under another advance", e.JobID)
+}
+
+// releaseFinalizeClaim drops a holder's OWNER row and then its claim, in that
+// order, as one operation (#2057 round eight).
+//
+// ONE HELPER BECAUSE THE ARMS DRIFTED. Round seven added the owner cleanup with a
+// scripted edit that inserted it TWICE into the finalizer-failure arm and NOT AT
+// ALL into the payload-write arm, and the reviewer found the consequence: that
+// arm released the claim and left its owner row, so a later winner whose own
+// best-effort owner write failed inherited a DEAD owner and had its LIVE claim
+// recovered. Two call sites that must stay identical are one call site.
+//
+// OWNER FIRST, CLAIM SECOND. A claim with no owner reads as unattributable and
+// therefore LIVE, which is a safe transient. A claim released while its stale
+// owner survives is the unsafe one, because the next reader attributes the new
+// claim to the dead identity.
+func (e Engine) releaseFinalizeClaim(ctx context.Context, jobID string) error {
+	if _, err := e.Store.ReleaseJobEventClaim(ctx, db.JobEvent{
+		JobID:   jobID,
+		Kind:    implementationFinalizeClaimOwnerEvent,
+		Message: implementationFinalizeClaimOwnerMessage(jobID),
+	}); err != nil {
+		return err
+	}
+	_, err := e.Store.ReleaseJobEventClaim(ctx, db.JobEvent{
+		JobID:   jobID,
+		Kind:    implementationFinalizeClaimedEvent,
+		Message: implementationFinalizeClaimMessage(jobID),
+	})
+	return err
+}
+
+// implementationFinalizeClaimAbandoned reports whether the finalization claim on
+// jobID is held by an owner that no longer exists, and returns the claim's own
+// message so a release can target that exact row (#2057 round seven).
+//
+// ABANDONED MEANS THE OWNER IS GONE, not that time has passed:
+//
+//   - a claim from a DIFFERENT boot cannot have a live holder, because no
+//     process from a previous boot is still running;
+//   - a claim from THIS boot is abandoned only if its pid is gone from the
+//     process table.
+//
+// EVERY UNCERTAINTY REPORTS LIVE. An unparseable message, an empty boot id on
+// either side, or a signal error that is not ESRCH all mean "cannot prove the
+// owner is gone", and the answer then must be no: recovering wrongly re-enters
+// a running finalizer, which is the failure the reviewer reproduced, while
+// declining wrongly leaves a job for an operator to retry.
+func (e Engine) implementationFinalizeClaimAbandoned(ctx context.Context, jobID string) (bool, implementationFinalizeClaimOwner, error) {
+	events, err := e.Store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		return false, implementationFinalizeClaimOwner{}, err
+	}
+	var owner implementationFinalizeClaimOwner
+	var found bool
+	for _, event := range events {
+		switch event.Kind {
+		case implementationFinalizeCompletedEvent:
+			// Completed: not abandoned, whatever its owner.
+			return false, implementationFinalizeClaimOwner{}, nil
+		case implementationFinalizeClaimOwnerEvent:
+			match := implementationFinalizeClaimOwnerPattern.FindStringSubmatch(strings.TrimSpace(event.Message))
+			if len(match) != 3 {
+				// An unparseable owner cannot be attributed, so it is live.
+				return false, implementationFinalizeClaimOwner{}, nil
+			}
+			pid, convErr := strconv.Atoi(match[2])
+			if convErr != nil || pid <= 0 {
+				return false, implementationFinalizeClaimOwner{}, nil
+			}
+			owner = implementationFinalizeClaimOwner{BootID: match[1], PID: pid, Message: strings.TrimSpace(event.Message)}
+			found = true
+		}
+	}
+	if !found {
+		// NO OWNER ROW AT ALL, which is every claim written before this change.
+		// Live by default: a legacy claim is unattributable, and recovering it
+		// would re-enter a finalizer on no evidence.
+		return false, implementationFinalizeClaimOwner{}, nil
+	}
+	current := db.BootID()
+	if current == "" || owner.BootID == "" {
+		// Without both boot ids the comparison is meaningless, and a pid alone
+		// can collide across boots. Unprovable, so live.
+		return false, owner, nil
+	}
+	if owner.BootID != current {
+		return true, owner, nil
+	}
+	return !processIsAlive(owner.PID), owner, nil
+}
+
+// processIsAlive reports whether pid exists, using signal 0 the way
+// stopDaemonPID already interprets ESRCH. UNKNOWN COUNTS AS ALIVE: EPERM means a
+// process exists that we may not signal, and any other error leaves the question
+// open, so both answer yes.
+func processIsAlive(pid int) bool {
+	if pid <= 0 {
+		return true
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return true
+	}
+	err = process.Signal(syscall.Signal(0))
+	if err == nil {
+		return true
+	}
+	return !(errors.Is(err, syscall.ESRCH) || errors.Is(err, os.ErrProcessDone))
+}
+
+func (e Engine) implementationFinalizeCompleted(ctx context.Context, jobID string) (bool, error) {
+	events, err := e.Store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	for _, event := range events {
+		if event.Kind == implementationFinalizeCompletedEvent {
+			return true, nil
+		}
+	}
+	return false, nil
 }
