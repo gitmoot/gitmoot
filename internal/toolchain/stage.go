@@ -788,7 +788,14 @@ func Stage(gitmootHome, source string) (string, error) {
 
 	identity, err := identifyRoot(sourceRoot)
 	if err != nil {
-		return "", err
+		// NAME THE TREE (#2143). The member walk reports the path it refused
+		// RELATIVE to the installation, so a failure read
+		// "optional member pkg: symlink refused: pkg/include" and never said
+		// which installation. On a host with several Go trees that is not a
+		// cosmetic gap: it cost three agents an evening, each inspecting a
+		// different root, because the message they were reasoning about fit
+		// all of them equally well.
+		return "", fmt.Errorf("%s: %w", source, err)
 	}
 	root := Root(gitmootHome)
 	published := filepath.Join(root, identity.String())

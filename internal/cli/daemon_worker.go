@@ -2070,7 +2070,7 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	//
 	// Failure publishes an engine-owned exit-126 command; inability to publish
 	// that fail-closed path aborts setup rather than exposing the host copy.
-	staged, stagedEnv, diagnostic, err := stageSeatToolchain(paths)
+	staged, stagedEnv, diagnostic, err := stageSeatToolchain(paths, checkout)
 	if err != nil {
 		return grants, err
 	}
@@ -2096,6 +2096,15 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 		}
 		grants.reads = append(grants.reads, staged)
 		grants.env = append(grants.env, stagedEnv...)
+		// An explicit or enclosing workspace file can sit outside the checkout
+		// directory grant. WorkspaceGoRequirement validated one bounded regular
+		// file; grant that file only, never its parent directory.
+		for _, entry := range stagedEnv {
+			workFile, ok := strings.CutPrefix(entry, "GOWORK=")
+			if ok && filepath.IsAbs(workFile) {
+				grants.readFiles = append(grants.readFiles, workFile)
+			}
+		}
 	}
 	// Runtime executables are staged beside the Go toolchain and exposed by
 	// fingerprint-local shims. Grant the PUBLISHED roots the daemon owns, never
