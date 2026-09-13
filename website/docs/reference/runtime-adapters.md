@@ -341,6 +341,8 @@ role-only in-session implementation with no recorded family emits
 `merge_gate_family_unresolved`. Neither event disqualifies an otherwise
 substantive approval from a reviewer whose identity is independent of every
 implementer.
+For a review fan-out, the announcing parent is not a verdict; the gate applies
+identity and family checks to each approving child.
 
 ### Transcripts
 

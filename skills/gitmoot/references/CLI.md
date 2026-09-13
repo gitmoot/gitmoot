@@ -997,8 +997,10 @@ an omp seat:
   is advisory, not an independence gate: same-family comparisons emit
   `merge_gate_family_advisory`, while unresolved comparisons retain the
   `merge_gate_family_unresolved` event; neither disqualifies a substantive
-  approval from a reviewer whose identity is not an implementer. Requested
-  model text alone and failed delivery are not provider evidence.
+  approval from a reviewer whose identity is not an implementer. For a review
+  fan-out, the announcing parent is not a verdict; the gate applies identity
+  and family checks to each approving child. Requested model text alone and
+  failed delivery are not provider evidence.
 - **Authentication depends on the seat policy.** Ordinary omp jobs use the
   profile, provider keys, or auth broker visible to the daemon. Read-only review
   and ask seats require `OMP_AUTH_BROKER_URL` as an HTTPS or loopback HTTP

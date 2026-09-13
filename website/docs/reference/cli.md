@@ -771,8 +771,10 @@ the daemon runs under. What that changes in practice:
   is advisory, not an independence gate: same-family comparisons emit
   `merge_gate_family_advisory`, while unresolved comparisons retain the
   `merge_gate_family_unresolved` event; neither disqualifies a substantive
-  approval from a reviewer whose identity is not an implementer. Requested
-  model text alone and failed delivery are not provider evidence.
+  approval from a reviewer whose identity is not an implementer. For a review
+  fan-out, the announcing parent is not a verdict; the gate applies identity
+  and family checks to each approving child. Requested model text alone and
+  failed delivery are not provider evidence.
 - **Authentication is per profile.** Authenticate omp once interactively, export
   the provider key the daemon should use, or point it at an auth broker; then
   restart the Gitmoot daemon so it inherits the credential. The daemon must also
