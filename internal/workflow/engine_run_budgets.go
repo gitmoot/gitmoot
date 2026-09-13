@@ -474,6 +474,37 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		return blockedErr
 	}
 
+	// #2029 round three, P1: THE MARKED PREFLIGHT IS VALIDATED BEFORE ANY
+	// REVIEW-RESULT CONSUMER, not at dispatch time.
+	//
+	// The previous round moved enforcement above dispatchDelegations' early
+	// return, which closed the zero-delegation bypass but left it downstream of
+	// everything else this function does with a review result. So a marked
+	// preflight could still have its findings written to the #1822 ledger, move
+	// the task to changes_requested, and potentially trigger auto-fix - the CHEAP
+	// stage acting as an ordinary reviewer, before anything checked whether it
+	// was allowed to be one.
+	//
+	// Placed above the high-risk lens normalization for the same reason that
+	// block sits early: a refusal must precede the consumers, not race them.
+	// A read-only delegation child runs in a throwaway detached worktree; dispose
+	// it once the child is terminal. Deferred so it fires on every return path
+	// below (the delegation DAG early-returns for policy-handled failures and
+	// pending retries). No-op for jobs that did not allocate a read-only worktree.
+	//
+	// INSTALLED ABOVE THE STAGED CONTRACT REFUSAL (#2029 round four, P2). It used
+	// to sit below, so a refusal returned before the defer existed and its
+	// dispatch-allocated read-only worktree was left behind with no reclaim
+	// marker. Measured: with the defer below, the refusal records zero
+	// force-removes; above it, exactly one. Moving the guard earlier moved that
+	// leak with it, so the defer has to lead every refusal.
+	defer func() {
+		retErr = errors.Join(retErr, e.cleanupReadOnlyDelegationWorktree(ctx, jobID, job.Type, payload))
+	}()
+	if err := e.enforceStagedVerdictContract(ctx, job, payload); err != nil {
+		return err
+	}
+
 	// High-risk lens normalization (#650). A refutation lens may report a CRITICAL
 	// finding in AgentResult.Findings yet leave its OWN decision at
 	// approved/changes_requested — the documented convention (SynthesizeLensDecision)
@@ -506,13 +537,6 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		})
 	}
 
-	// A read-only delegation child runs in a throwaway detached worktree; dispose
-	// it once the child is terminal. Deferred so it fires on every return path
-	// below (the delegation DAG early-returns for policy-handled failures and
-	// pending retries). No-op for jobs that did not allocate a read-only worktree.
-	defer func() {
-		retErr = errors.Join(retErr, e.cleanupReadOnlyDelegationWorktree(ctx, jobID, job.Type, payload))
-	}()
 	// A review fix owns an independent writable clone, not a linked delegation
 	// worktree. Record it for operator cleanup only after SUCCESSFUL advancement;
 	// a finalizer or store error can leave the clone holding the only committed fix,
@@ -1240,6 +1264,10 @@ func (e Engine) delegationRequest(ctx context.Context, job db.Job, payload JobPa
 		// Inherit the coordinator's resolved risk tier (#650) so a high-risk lens
 		// child carries it for explainable escalation. Empty for every non-risk tree.
 		RiskTier: strings.TrimSpace(payload.RiskTier),
+		// #1821: only the verdict child of a MARKED staged preflight inherits an
+		// evidence ceiling. Scoped to the marker rather than inferred from the
+		// parent's declared evidence - see stagedVerdictCeiling.
+		InheritedEvidence: stagedVerdictCeiling(payload, d),
 		// #1277: inherit the skip-native-review-fanout intent. Without this the
 		// intent survived exactly one hop — the dispatched coordinator — and died
 		// at the first engine-initiated hop, so a coordinator dispatched with
@@ -1251,6 +1279,63 @@ func (e Engine) delegationRequest(ctx context.Context, job db.Job, payload JobPa
 		// job that happened to receive the flag.
 		SkipNativeReviewFanout: payload.SkipNativeReviewFanout,
 	}
+}
+
+// stagedVerdictCeiling resolves the evidence ceiling for ONE delegation of a
+// staged review's preflight stage (#1821), and returns "" for everything else.
+//
+// BOTH CONDITIONS ARE REQUIRED, and the second is the one PR #2024 lacked:
+//
+//  1. the parent must be a MARKED staged preflight - the marker is set by the
+//     dispatch that created it, never inferred from the parent's own result;
+//  2. this delegation must be the one the marker NAMES.
+//
+// Without (1) an honest review coordinator, which declares static_only for
+// itself while its lens children execute in their own worktrees, would impose a
+// ceiling on every child and downgrade exactly the rows
+// ensureDelegatedReviewEvidence reads as a fan-out's only evidence. Without (2)
+// a preflight that also delegated something else would constrain that too.
+//
+// THERE IS DELIBERATELY NO PROPAGATION. #2024 carried a fallback that passed a
+// parent's own inherited ceiling further down, to stop a chain "laundering" the
+// constraint by inserting a silent hop. With an explicit marker that hole does
+// not exist - only a marked preflight imposes anything - and the fallback was
+// the mechanism that spread the contamination. So a verdict child's own
+// children are unconstrained, and a test asserts that rather than leaving it to
+// be discovered.
+func stagedVerdictCeiling(payload JobPayload, d Delegation) string {
+	marker := strings.TrimSpace(payload.StagedReviewVerdictAgent)
+	if marker == "" || !strings.EqualFold(marker, strings.TrimSpace(d.Agent)) {
+		return ""
+	}
+	if payload.Result == nil || !EvidenceWasDeclared(*payload.Result) {
+		// A preflight that declared nothing imposes nothing. Silence is not a
+		// finding, and defaulting it to static_only here would clamp on the
+		// engine's own default rather than on the preflight's observation.
+		return ""
+	}
+	ceiling := normalizeInheritedEvidence(payload.Result.Evidence)
+	// #2029 review, P1. AN "EXECUTED" CLAIM THAT NAMES NO EXECUTION LIFTS THE
+	// CEILING ENTIRELY, so it has to be substantiated here.
+	//
+	// executed is the PERMISSIVE value: it clamps nothing. So a preflight that
+	// declares executed while listing no tests_run and no changes_made removes
+	// the whole mechanism, and does it through the honest-looking path rather
+	// than by tampering with the marker.
+	//
+	// The general substantiation check cannot cover this. It deliberately runs
+	// only when len(Delegations) == 0, because a review coordinator's execution
+	// happens in its children - which means a staged fan-out, whose defining
+	// shape is exactly one delegation, is exempt BY CONSTRUCTION. This check is
+	// the marked-preflight-specific one that exemption implies.
+	//
+	// It clamps to static_only rather than refusing: the preflight ran and its
+	// verdict child is still wanted, and static_only is the truthful reading of
+	// a stage that named nothing it executed.
+	if ceiling == EvidenceExecuted && !stagedPreflightNamedExecution(*payload.Result) {
+		return EvidenceStaticOnly
+	}
+	return ceiling
 }
 
 // delegationHeadSHA resolves the head a delegated REVIEW child will be pinned

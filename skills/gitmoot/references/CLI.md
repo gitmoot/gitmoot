@@ -587,15 +587,17 @@ A staged review splits one review into a cheap preflight stage that answers
 review. `staged_review_verdict_agent` names the agent that would run the
 verdict stage.
 
-**This key is a declaration, not yet a dispatcher.** At this commit nothing
-reads it outside its own tests: the staged dispatch is a separate change, and
-until it lands no repo dispatches a staged review whether it declared an agent
-or not. The key lands first because a dispatcher cannot be told which agent to
-use before there is a place to say so.
+Local `agent review` and review-resolved `agent run` dispatch honor this key:
+they run the requested reviewer as a **preflight** parent. The parent checks
+whether the review can run and delegates exactly once to the configured verdict
+agent. The preflight is marked so its result cannot be consumed as the final
+review verdict. Daemon fanout, heartbeat, pipeline, comment-command, and
+externally recorded session reviews do not consult this key; they keep their
+ordinary review paths.
 
 It is **off by default** and there is deliberately **no default and no fallback
-list**. A repo that has not declared one cannot have a staged review dispatched
-to it once the dispatcher exists, and having a `[repos.*]` section for some
+list**. A repo that has not declared one uses the ordinary, unstaged review
+path, and having a `[repos.*]` section for some
 other key is **not** a declaration. That is the campaign's non-fallback rule
 applied to the choice of reviewer itself - a strong reviewer that cannot be
 identified must never degrade to *the cheap stage approved it* - so the
