@@ -1,0 +1,55 @@
+package db
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+)
+
+// ROUND-3 P3. One live wait per (role, subject) is enforced by a partial unique
+// index, and callers dedup by reading the waiting rows first. Two concurrent
+// requesters for the same role and subject can both read empty and both insert:
+// the loser surfaced the raw SQLite constraint error, which reads to the caller
+// as a bug rather than as the attach the dedup would have produced.
+//
+// Both callers must come back holding the SAME live wait.
+func TestSubscribeAwaitedFactAttachesInsteadOfRacingTheLiveSubjectIndex(t *testing.T) {
+	store := openAwaitedFactTestStore(t)
+	ctx := context.Background()
+	key, err := ReviewRequestSubjectKey("owner/repo", 12, "0bd967c5ba8e506607bd3a9999a94a4db5b881b4", "code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	subscription := AwaitedFactSubscription{
+		WaiterRole:  "joltra",
+		SubjectKind: AwaitedFactSubjectReviewVerdict,
+		SubjectKey:  key,
+		Deadline:    time.Now().UTC().Add(time.Hour),
+	}
+
+	var wg sync.WaitGroup
+	ids := make([]int64, 2)
+	errs := make([]error, 2)
+	start := make(chan struct{})
+	for i := range ids {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			fact, _, err := store.SubscribeAwaitedFact(ctx, subscription)
+			ids[i], errs[i] = fact.ID, err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("subscriber %d failed instead of attaching: %v", i, err)
+		}
+	}
+	if ids[0] == 0 || ids[0] != ids[1] {
+		t.Fatalf("subscribers hold different waits: %d and %d, want one live wait attached twice", ids[0], ids[1])
+	}
+}

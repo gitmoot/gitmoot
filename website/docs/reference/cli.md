@@ -1349,12 +1349,16 @@ What one request does, in order:
    and the subscribe-time recheck matches purpose as well as head, so a waiter
    registering after a different-purpose verdict is not satisfied by it.
    `gitmoot org await review` keeps the bare `owner/repo#N@sha` key and its
-   any-purpose meaning, and a routed review inherits its purpose into
-   delegation children so a staged review still answers the purposed wait. The wake fires from the reviewing job's own
+   any-purpose meaning, and a routed review inherits its purpose into REVIEW
+   delegation children so a staged review still answers the purposed wait —
+   scoped to review legs, because a non-review leg carrying a review purpose is
+   read by consumers keyed on review type. The wake fires from the reviewing job's own
    state transition when the verdict is persisted, before and independently of
    gate advancement, and it carries the decision, findings count, executed-check
    count, evidence declaration and the `gitmoot job show <id>` command. A second
-   request by the same role keeps its original wait. When the wait's `--ttl`
+   request by the same role keeps its original wait; two concurrent requests for
+   the same role and subject both ATTACH to the single live wait rather than one
+   failing. When the wait's `--ttl`
    elapses it expires to the role's parent, as every awaited fact does.
 
 The request prints every hold it can see rather than leaving a requester to

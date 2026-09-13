@@ -181,14 +181,24 @@ func (s *Store) SubscribeAwaitedFact(ctx context.Context, request AwaitedFactSub
 	}
 	defer tx.Rollback()
 
-	result, err := tx.ExecContext(ctx, `
+	// One live wait per (role, subject) - idx_awaited_facts_live_subject. Callers
+	// dedup by reading the waiting rows first, but two concurrent requesters can
+	// both read empty and both insert. #2172 round 3: the loser surfaced the raw
+	// SQLite constraint error, which reads as a bug to the caller; the correct
+	// answer is the attach the dedup would have produced. ON CONFLICT keeps this
+	// one statement, so the resolution is atomic rather than a read-after-error
+	// that a third writer could invalidate.
+	row := tx.QueryRowContext(ctx, `
 INSERT INTO awaited_facts(waiter_role, subject_kind, subject_key, deadline)
-VALUES (?, ?, ?, ?)`, request.WaiterRole, request.SubjectKind, request.SubjectKey, request.Deadline.Format(time.RFC3339Nano))
-	if err != nil {
-		return AwaitedFact{}, nil, err
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
+VALUES (?, ?, ?, ?)
+ON CONFLICT(waiter_role, subject_kind, subject_key) WHERE state = 'waiting'
+DO UPDATE SET deadline = excluded.deadline
+RETURNING id`, request.WaiterRole, request.SubjectKind, request.SubjectKey, request.Deadline.Format(time.RFC3339Nano))
+	// RETURNING, not LastInsertId: SQLite leaves last_insert_rowid() untouched on
+	// the DO UPDATE arm, so the loser of the race would otherwise attach to some
+	// unrelated row this connection inserted earlier.
+	var id int64
+	if err := row.Scan(&id); err != nil {
 		return AwaitedFact{}, nil, err
 	}
 	detail, ok, skipped, err := canonicalAwaitedFactTx(ctx, tx, request.SubjectKind, request.SubjectKey, s.blockingSeverityFor)

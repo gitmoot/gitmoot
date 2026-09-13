@@ -355,11 +355,28 @@ func reviewJobStillAnswers(ctx context.Context, store *db.Store, job db.Job) boo
 		return true
 	}
 	for _, child := range children {
+		// #2172 round 3: only a REVIEW child can answer a review question. A
+		// staged preflight may also delegate a non-review leg (implement, ask)
+		// whose result legitimately carries decision="approved"; counting it
+		// pinned the claim forever while the awaited fact - which only a review
+		// verdict can satisfy - stayed unsatisfiable. A non-review child is not
+		// evidence in either direction, so it is skipped rather than trusted.
+		if !reviewTypedJob(child) {
+			continue
+		}
 		if reviewJobStillAnswers(ctx, store, child) {
 			return true
 		}
 	}
 	return false
+}
+
+// reviewTypedJob reports whether a job answers a REVIEW question. The job type
+// carries the delegation's Action verbatim (session_job.go), so this is the
+// same boundary the awaited-fact producer uses: anything else cannot satisfy a
+// review verdict subscription and must not be read as one.
+func reviewTypedJob(job db.Job) bool {
+	return strings.EqualFold(strings.TrimSpace(job.Type), "review")
 }
 
 // reviewVerdictDecision returns the saved verdict, or "" when the stored result
@@ -749,8 +766,14 @@ func runReviewStatus(args []string, stdout, stderr io.Writer) int {
 				if payload.Model != "" {
 					entry.Model = payload.Model
 				}
-				if payload.Result != nil {
-					entry.Verdict = payload.Result.Decision
+				// #1685: a fan-out announcement is NOT a verdict, and every
+				// consumer must refuse to render it as one. A staged preflight
+				// announces its children with decision="approved"; printing that
+				// as verdict=approved tells a requester the head was approved
+				// while the verdict child is still running. reviewVerdictDecision
+				// is the single place that distinguishes them.
+				entry.Verdict = reviewVerdictDecision(job, payload)
+				if entry.Verdict != "" {
 					entry.Evidence = payload.Result.Evidence
 					entry.Findings = len(payload.Result.Findings)
 				}

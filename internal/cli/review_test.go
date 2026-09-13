@@ -596,3 +596,109 @@ exit 1`, countFile, countFile)
 		t.Fatalf("exhausted-pool retry_at = %q (%v), want the provider's timed hold", payload.BlockerRetryAt, err)
 	}
 }
+
+// stagedPreflightClaim seeds the shape #2172 round 2 was built for and round 3
+// found untested: a routed review job whose own result is a FAN-OUT
+// announcement (not a verdict), plus one child of the given type and state.
+// Judged on its own row the parent looks finished-without-a-verdict, so the
+// claim it holds looks stealable while the tree is still working.
+func stagedPreflightClaim(t *testing.T, store *db.Store, head string, childType string, childState string, childDecision string) db.Job {
+	t.Helper()
+	ctx := context.Background()
+	parentID := "local-review-staged-parent"
+	announcement := workflow.JobPayload{
+		Repo: "owner/repo", PullRequest: 12, HeadSHA: head, ReviewPurpose: "code",
+		Result: &workflow.AgentResult{Decision: "approved", FanOut: true},
+	}
+	parentPayload, err := json.Marshal(announcement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := db.Job{ID: parentID, Agent: "opus-reviewer", Type: "review", State: string(workflow.JobSucceeded), Payload: string(parentPayload), Repo: "owner/repo"}
+	if err := store.CreateJob(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+	child := workflow.JobPayload{Repo: "owner/repo", PullRequest: 12, HeadSHA: head}
+	if childDecision != "" {
+		child.Result = &workflow.AgentResult{Decision: childDecision, Evidence: "executed"}
+	}
+	childPayload, err := json.Marshal(child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: parentID + "/delegation/leg", Agent: "opus-reviewer", Type: childType,
+		State: childState, Payload: string(childPayload), Repo: "owner/repo", ParentJobID: parentID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetJob(ctx, parentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+// THE ROUND-2 STAGED-REVIEW FIX, both halves, which round 3 caught me claiming
+// as mutation-proven when it had no coverage at all. Deleting the tree walk and
+// deleting the review-scoped inheritance both passed the entire suite.
+//
+// Half one: a preflight whose verdict child is still RUNNING must keep its
+// claim. Without the walk the parent's fan-out row reads as finished, the claim
+// becomes takeover-eligible, and a second reviewer is dispatched at the same
+// head while the first is still producing the answer.
+func TestStagedPreflightKeepsItsClaimWhileTheVerdictChildRuns(t *testing.T) {
+	_, store, head := reviewRouterHome(t)
+	job := stagedPreflightClaim(t, store, head, "review", string(workflow.JobRunning), "")
+	if !reviewJobStillAnswers(context.Background(), store, job) {
+		t.Fatal("a staged preflight with a running review child does not answer, so its claim is stealable; the fan-out tree walk is gone")
+	}
+}
+
+// Half two: the verdict child must be reachable as a REVIEW, which is what the
+// scoped inheritance preserves through the delegation. A finished review child
+// carrying the decision answers the question its parent only announced.
+func TestStagedPreflightIsAnsweredByItsVerdictChild(t *testing.T) {
+	_, store, head := reviewRouterHome(t)
+	job := stagedPreflightClaim(t, store, head, "review", string(workflow.JobSucceeded), "approved")
+	if !reviewJobStillAnswers(context.Background(), store, job) {
+		t.Fatal("a staged preflight whose review child saved a verdict does not answer; the tree is not being consulted")
+	}
+}
+
+// ROUND-3 P2: the walk was type-blind. A staged preflight may also delegate a
+// NON-review leg (implement, ask) whose result legitimately carries
+// decision="approved". Counting it pinned the claim forever - no takeover, ever
+// - while the awaited fact, which only a review verdict can satisfy, stayed
+// unsatisfiable. A non-review child is not evidence in either direction.
+func TestStagedPreflightNonReviewChildCannotPinTheClaim(t *testing.T) {
+	_, store, head := reviewRouterHome(t)
+	job := stagedPreflightClaim(t, store, head, "implement", string(workflow.JobRunning), "approved")
+	if reviewJobStillAnswers(context.Background(), store, job) {
+		t.Fatal("a running implement child is answering a REVIEW question: the claim is pinned forever behind a leg that can never satisfy the verdict wait")
+	}
+}
+
+// ROUND-3 P3, and #1685's rule that no consumer may render an announcement as a
+// verdict. `review status` printed payload.Result.Decision verbatim, so a
+// staged preflight - whose fan-out announcement carries decision="approved" -
+// was shown to the requester as verdict=approved while the verdict child was
+// still running. The row must show the job's state, not a decision it never made.
+func TestReviewStatusDoesNotRenderAFanOutAnnouncementAsAVerdict(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	stagedPreflightClaim(t, store, head, "review", string(workflow.JobRunning), "")
+
+	var stdout, stderr bytes.Buffer
+	if code := runReview([]string{"status", "--repo", "owner/repo", "--pr", "12", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("review status exit=%d stderr=%q", code, stderr.String())
+	}
+	var output reviewStatusOutput
+	if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
+		t.Fatalf("decode %q: %v", stdout.String(), err)
+	}
+	for _, entry := range output.Requests {
+		if entry.JobID == "local-review-staged-parent" && entry.Verdict != "" {
+			t.Fatalf("status rendered the fan-out announcement as verdict=%q: the requester reads an approval the reviewer never gave", entry.Verdict)
+		}
+	}
+}
