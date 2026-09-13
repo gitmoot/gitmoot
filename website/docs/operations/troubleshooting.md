@@ -675,10 +675,12 @@ wider grant to fix.
 ### `Permission denied`, exit 126, running Go
 
 **A read-only seat is now given a Go toolchain automatically, and the old
-bootstrap-and-download workaround is retired.** The daemon stages an immutable
-COPY of the operator-pinned installation into a directory it owns, under the
-gitmoot home, and grants the seat a read on that copy plus `GOROOT`, `PATH` and
-`GOTOOLCHAIN=local`. A seat should simply run `go`.
+bootstrap-and-download workaround is retired.** The daemon enumerates the Go
+installations on its `PATH`, resolves the effective `go.work` plus checkout-root
+`go.mod` requirement, and selects the lowest installed release that satisfies
+both. It stages an immutable copy under the gitmoot home and sets `GOROOT`,
+`PATH`, `GOTOOLCHAIN=local`, and a deterministic `GOWORK`. A seat should simply
+run `go`.
 
 The copy exists because a seat cannot be granted the operator's own installation
 safely: three review rounds on that shape each produced an escape, most recently
@@ -687,12 +689,16 @@ required. A copy the daemon owns has no outside root to contain.
 
 What to expect:
 
-- **`go version` works and reports the pinned release.** `GOTOOLCHAIN=local` is
-  correct here and more hermetic, because the staged copy already IS the required
-  release; there is nothing to fetch.
-- **The copy is per pinned version, materialised on first use, and reused.** It is
-  keyed on content, so an operator re-pinning the same version in place gets a new
-  copy rather than a stale compiler.
+- **`go version` works and reports the selected satisfying release.**
+  `GOTOOLCHAIN=local` is correct here because staging already selected a release
+  new enough for the active workspace and module; there is nothing to fetch.
+- **The copy is per selected installation, materialised on first use, and
+  reused.** It is keyed on content, so replacing one installed version in place
+  produces a new copy rather than a stale compiler.
+- **`GOWORK` matches selection.** `off` stays off; unset or `auto` searches from
+  the checkout; an explicit absolute path is honored. A selected workfile
+  outside the checkout receives a file-only read grant, never a parent-directory
+  grant.
 - **The staged copy is read-only to the seat, always.** If it were writable a seat
   could rewrite its own `go` binary, which is the defect the copy exists to remove.
 - **`CGO_ENABLED=0` is still required.** cgo reads `/usr/include`, which is outside
@@ -709,12 +715,17 @@ daemon's stderr rather than changing the job event stream.
 
 - **No Go installation is on the daemon's `PATH`.** This normal case has no
   daemon diagnostic, but invoking `go` still fails explicitly through the stub.
-- **The source is not a pinned Go installation.** It must have an executable
-  `bin/go` and a `VERSION` file naming a Go release, both real files rather than
-  symlinks.
+- **A candidate is not a recognizable Go installation.** It must have an
+  executable `bin/go` and a `VERSION` file naming a Go release, both real files
+  rather than symlinks.
 - **Every installation prefix is copied.** `/opt`, `/usr/local`, `/nix/store`,
   `/snap`, and profile paths follow the same staging path; none receives a
   recursive host-root grant.
+- **No installed release satisfies the active workspace and module.** The
+  diagnostic names the required release and every rejected candidate.
+- **The active `go.work` is unsafe or invalid.** Relative explicit `GOWORK`
+  values, symlinks, non-regular files, oversized files, and files without a valid
+  `go` directive fail closed before a mismatched compiler can run.
 - **Free space is below the floor.** Staging refuses up front rather than filling
   the filesystem, and the message names both the free bytes and the 4 GiB floor.
 - **The source contains a symlink.** A symlinked name is refused anywhere in the
@@ -730,8 +741,9 @@ change the file - it is the same underlying object - so replacing a source file
 with a hardlink to another file is **not** detected. Two things bound this rather
 than excuse it: with the kernel default `fs.protected_hardlinks=1`, creating such
 a link already requires read and write access to the target, so it gains nothing
-an attacker did not already have; and the operator-pinned toolchain is root-owned
-and not writable by a seat, so a seat cannot create one. Second, staging reads the source **twice**, once to
+an attacker did not already have; and the selected source installation is
+expected to be operator-owned and not writable by a seat, so a seat cannot
+create one. Second, staging reads the source **twice**, once to
 fingerprint it and once to copy it, and only executables are reconciled between
 those two reads: a non-executable that differs between them is not detected. Each
 read is internally consistent, so this is a gap between the passes rather than

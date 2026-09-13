@@ -259,39 +259,46 @@ func ModuleGoDirective(dir string) string {
 // WorkspaceGoRequirement resolves the minimum Go version that commands started
 // in dir must satisfy and the GOWORK value that pins those commands to the same
 // workspace decision. GOWORK=off disables workspace discovery; an explicit
-// absolute GOWORK names that file; an unset value searches dir and its parents.
+// absolute GOWORK names that file; unset or "auto" searches dir and its parents.
 //
 // Returning an explicit file or "off" removes the staging-to-execution race in
 // which a parent go.work appears after selection and silently changes which
-// toolchain the pinned seat needs.
-func WorkspaceGoRequirement(dir, gowork string) (version, effectiveGOWORK string) {
+// toolchain the pinned seat needs. A present workspace file that cannot be read
+// safely and parsed is refused instead of selecting from go.mod and then running
+// under a different requirement.
+func WorkspaceGoRequirement(dir, gowork string) (version, effectiveGOWORK string, err error) {
 	module := ModuleGoDirective(dir)
 	gowork = strings.TrimSpace(gowork)
 	if gowork == "off" {
-		return module, "off"
+		return module, "off", nil
 	}
-	if gowork != "" {
+	if gowork != "" && gowork != "auto" {
 		if !filepath.IsAbs(gowork) {
-			// The go command rejects a relative GOWORK. Preserve it so the seat
-			// reports that real configuration error rather than changing it.
-			return module, gowork
+			return "", gowork, fmt.Errorf("GOWORK %q is not an absolute path", gowork)
 		}
-		workspace, _ := goDirectiveAt(filepath.Dir(gowork), filepath.Base(gowork))
-		return laterGoDirective(module, workspace), gowork
+		workspace, present := goDirectiveAt(filepath.Dir(gowork), filepath.Base(gowork))
+		if !present || workspace == "" {
+			return "", gowork, fmt.Errorf("GOWORK %q is not a safe, valid regular workspace file with a go directive", gowork)
+		}
+		return laterGoDirective(module, workspace), gowork, nil
 	}
 
 	current, err := filepath.Abs(dir)
 	if err != nil {
-		return module, "off"
+		return "", "off", fmt.Errorf("resolve workspace directory: %w", err)
 	}
 	for {
+		workFile := filepath.Join(current, "go.work")
 		workspace, present := goDirectiveAt(current, "go.work")
 		if present {
-			return laterGoDirective(module, workspace), filepath.Join(current, "go.work")
+			if workspace == "" {
+				return "", workFile, fmt.Errorf("discovered GOWORK %q is not a safe, valid regular workspace file with a go directive", workFile)
+			}
+			return laterGoDirective(module, workspace), workFile, nil
 		}
 		parent := filepath.Dir(current)
 		if parent == current {
-			return module, "off"
+			return module, "off", nil
 		}
 		current = parent
 	}

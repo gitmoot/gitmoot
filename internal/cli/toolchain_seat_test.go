@@ -174,7 +174,16 @@ func TestReadOnlyGrantsStageTheToolchainThroughProduction(t *testing.T) {
 	// test; the production runtime wiring has its own small fixtures below.
 	t.Setenv("PATH", strings.Join([]string{binDir, "/usr/bin", "/bin"}, string(os.PathListSeparator)))
 
-	checkout := t.TempDir()
+	workspaceRoot := t.TempDir()
+	checkout := filepath.Join(workspaceRoot, "checkout")
+	if err := os.Mkdir(checkout, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	workFile := filepath.Join(workspaceRoot, "go.work")
+	if err := os.WriteFile(workFile, []byte("go 1.26\n\nuse ./checkout\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOWORK", "auto")
 	runGit(t, checkout, "init", "-b", "main")
 	runGit(t, checkout, "config", "user.email", "gitmoot@example.com")
 	runGit(t, checkout, "config", "user.name", "Gitmoot")
@@ -225,6 +234,12 @@ func TestReadOnlyGrantsStageTheToolchainThroughProduction(t *testing.T) {
 		if !containsString(grants.env, want) {
 			t.Errorf("env %v does not export %q, so the seat would not use the staged copy", grants.env, want)
 		}
+	}
+	if !containsString(grants.env, "GOWORK="+workFile) {
+		t.Errorf("env %v does not pin the enclosing workspace selected during staging", grants.env)
+	}
+	if !containsString(grants.readFiles, workFile) {
+		t.Errorf("read files %v do not grant the enclosing workspace used by GOWORK", grants.readFiles)
 	}
 	pathSet := false
 	for _, entry := range grants.env {

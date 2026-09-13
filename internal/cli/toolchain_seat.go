@@ -65,10 +65,14 @@ func stageSeatToolchain(paths config.Paths, workspace string) (string, []string,
 		return unavailableSeatToolchain(paths, "")
 	}
 	required, effectiveGOWORK := "", "off"
+	var err error
 	if strings.TrimSpace(workspace) != "" {
-		required, effectiveGOWORK = toolchain.WorkspaceGoRequirement(workspace, os.Getenv("GOWORK"))
+		required, effectiveGOWORK, err = toolchain.WorkspaceGoRequirement(workspace, os.Getenv("GOWORK"))
+		if err != nil {
+			return unavailableSeatToolchain(paths, fmt.Sprintf("%v; host copy is shadowed", err))
+		}
 	}
-	candidates, err := toolchain.SelectInstallations(candidates, required)
+	candidates, err = toolchain.SelectInstallations(candidates, required)
 	if err != nil {
 		// Reported at STAGING time, naming the requirement and every rejected
 		// tree. The alternative is what this replaces: stage something too old

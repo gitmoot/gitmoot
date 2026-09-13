@@ -358,13 +358,15 @@ For the required result shape and decision meanings, read
 [RESULT_CONTRACT.md](references/RESULT_CONTRACT.md).
 
 ## Safety Rules
-A read-only review seat is handed an immutable, daemon-owned COPY of the
-operator-pinned Go toolchain: run `go` normally, with `GOROOT`, `PATH` and
-`GOTOOLCHAIN=local` already set. Do NOT invoke a toolchain path directly and do
-not download Go into the seat cache; that workaround is retired. `CGO_ENABLED=0`
-is still required and `-race` is still unavailable in a seat. If `go` returns exit
-126 the copy was not staged, and the reason is on the daemon's stderr
-(`gitmoot: read-only seat toolchain:`) rather than in the job's events.
+A read-only review seat is handed an immutable, daemon-owned copy of a Go
+installation selected from the daemon's `PATH` to satisfy the effective
+`go.work` and checkout-root `go.mod`. Run `go` normally: `GOROOT`, `PATH`,
+`GOTOOLCHAIN=local`, and `GOWORK` are already pinned to that selection. Do not
+invoke a toolchain path directly or download Go into the seat cache; that
+workaround is retired. `CGO_ENABLED=0` is still required and `-race` remains
+unavailable. Exit 126 means no candidate could be safely staged or satisfy the
+workspace; the reason is on daemon stderr (`gitmoot: read-only seat toolchain:`),
+not in job events.
 
 
 Preserve existing behavior unless the job explicitly changes it. Keep work

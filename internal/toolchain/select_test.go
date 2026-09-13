@@ -339,11 +339,19 @@ func TestWorkspaceGoRequirementHonorsGOWORK(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	version, effective := WorkspaceGoRequirement(child, "")
-	if version != "1.26" || effective != rootWork {
-		t.Fatalf("auto requirement = (%q, %q), want (1.26, %q)", version, effective, rootWork)
+	for _, gowork := range []string{"", "auto"} {
+		version, effective, err := WorkspaceGoRequirement(child, gowork)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if version != "1.26" || effective != rootWork {
+			t.Fatalf("GOWORK=%q requirement = (%q, %q), want (1.26, %q)", gowork, version, effective, rootWork)
+		}
 	}
-	version, effective = WorkspaceGoRequirement(child, "off")
+	version, effective, err := WorkspaceGoRequirement(child, "off")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if version != "1.22" || effective != "off" {
 		t.Fatalf("disabled requirement = (%q, %q), want (1.22, off)", version, effective)
 	}
@@ -352,9 +360,20 @@ func TestWorkspaceGoRequirementHonorsGOWORK(t *testing.T) {
 	if err := os.WriteFile(explicit, []byte("go 1.27\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	version, effective = WorkspaceGoRequirement(child, explicit)
+	version, effective, err = WorkspaceGoRequirement(child, explicit)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if version != "1.27" || effective != explicit {
 		t.Fatalf("explicit requirement = (%q, %q), want (1.27, %q)", version, effective, explicit)
+	}
+
+	linkedRoot := t.TempDir()
+	if err := os.Symlink(explicit, filepath.Join(linkedRoot, "go.work")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := WorkspaceGoRequirement(linkedRoot, "auto"); err == nil {
+		t.Fatal("an escaping go.work symlink was silently parsed under different staging and execution rules")
 	}
 }
 
