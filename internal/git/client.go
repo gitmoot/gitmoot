@@ -582,12 +582,12 @@ func (c Client) OriginRemote(ctx context.Context) (string, error) {
 // `git remote set-head origin -a` in the registered checkout. Until then this
 // method deliberately returns the stale cached name rather than guessing.
 func (c Client) RemoteDefaultBranch(ctx context.Context) (string, error) {
-	result, err := c.run(ctx, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+	result, err := c.run(ctx, "symbolic-ref", "refs/remotes/origin/HEAD")
 	if err != nil {
 		return "", err
 	}
 	ref := strings.TrimSpace(result.Stdout)
-	// Defensive, and UNREACHABLE via git: measured, `symbolic-ref --short
+	// Defensive, and UNREACHABLE via git: measured, `symbolic-ref
 	// refs/remotes/origin/HEAD` exits 128 both when the repository has no origin
 	// and after `git remote set-head origin --delete`, so the error return above
 	// fires and this branch cannot be entered. It is kept for consistency with
@@ -596,10 +596,15 @@ func (c Client) RemoteDefaultBranch(ctx context.Context) (string, error) {
 	if ref == "" {
 		return "", errors.New("origin default branch is empty")
 	}
-	// `--short` yields `origin/master`; the stored field holds a branch name.
-	// Only the leading remote name is removed, so a branch whose own name
-	// contains `origin/` survives intact.
-	return strings.TrimPrefix(ref, "origin/"), nil
+	const originRefPrefix = "refs/remotes/origin/"
+	branch, ok := strings.CutPrefix(ref, originRefPrefix)
+	if !ok {
+		return "", fmt.Errorf("origin default branch ref %q is outside %s", ref, originRefPrefix)
+	}
+	if branch == "" {
+		return "", errors.New("origin default branch is empty")
+	}
+	return branch, nil
 }
 
 // OriginRemoteConfigured returns the literal configured origin URL without Git's

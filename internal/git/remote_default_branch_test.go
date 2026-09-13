@@ -55,6 +55,31 @@ func TestRemoteDefaultBranchIgnoresTheCheckedOutBranch(t *testing.T) {
 	}
 }
 
+// Git may lengthen a shortened remote-tracking ref when a local branch collides
+// with it. Reading and stripping the full ref must therefore still return only
+// the remote's branch name.
+func TestRemoteDefaultBranchHandlesShortRefCollision(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	runGit(t, dir, "init", "-b", "main")
+	runGit(t, dir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, dir, "config", "user.name", "Gitmoot")
+	runGit(t, dir, "commit", "--allow-empty", "-m", "init")
+	runGit(t, dir, "update-ref", "refs/remotes/origin/main", "HEAD")
+	runGit(t, dir, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+	runGit(t, dir, "branch", "origin/main")
+
+	branch, err := NewHostClient(dir).RemoteDefaultBranch(context.Background())
+	if err != nil {
+		t.Fatalf("RemoteDefaultBranch returned error: %v", err)
+	}
+	if branch != "main" {
+		t.Fatalf("RemoteDefaultBranch = %q, want main despite the colliding local ref", branch)
+	}
+}
+
 // An unset origin/HEAD must ERROR rather than guess. The caller stores the
 // result in the base-branch field and preserves the existing value on an empty
 // read, so a fabricated "main" would silently overwrite a correct record on any
