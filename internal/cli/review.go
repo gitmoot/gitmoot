@@ -15,7 +15,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
-	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -185,7 +184,17 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	head := strings.ToLower(strings.TrimSpace(opts.head))
 	branch := strings.TrimSpace(opts.branch)
 	if head == "" || branch == "" {
-		pr, err := jobGitHubClient(record.CheckoutPath, newAgentDispatchGitHubClient(record.CheckoutPath), subprocess.ExecRunner{}).GetPullRequest(ctx, repo, int64(opts.pr))
+		// The lookup runs under the same execution backend dispatch will use, so a
+		// remote/attached backend is never probed from this host by accident.
+		execBackend, err := localAgentDispatchExecBackendFor(opts.home)
+		if err != nil {
+			return reviewRequestOutput{}, err
+		}
+		runner, err := jobSubprocessRunnerForBackend(execBackend)
+		if err != nil {
+			return reviewRequestOutput{}, err
+		}
+		pr, err := jobGitHubClient(record.CheckoutPath, newAgentDispatchGitHubClient(record.CheckoutPath), runner).GetPullRequest(ctx, repo, int64(opts.pr))
 		if err != nil {
 			return reviewRequestOutput{}, fmt.Errorf("resolve pull request #%d: %w", opts.pr, err)
 		}
